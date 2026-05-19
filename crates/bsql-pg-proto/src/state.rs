@@ -6,10 +6,9 @@
 //! borrow / move checker forces every transition to handle the carried
 //! data explicitly.
 //!
-//! Phase 1a ships only the variants the Ping flow drives. Per reforge.md
-//! §3.5 / §4.6, manufactured variants ("ConnectingStartup", "InTransaction",
-//! "Closed", …) are forbidden until their entry/exit code lands in a
-//! later sub-phase.
+//! Per reforge.md §3.5 / §4.6, manufactured variants are forbidden
+//! until their entry/exit code lands — a variant whose transitions
+//! exist in the dispatcher is the only legal addition.
 //!
 //! [`ProtoState::Errored`] is the one terminal variant — entered via
 //! any classified failure in `feed_bytes` or `push_command`, never
@@ -29,41 +28,33 @@ use crate::reply_id::{
 use crate::scram::session::ScramSession;
 use crate::scram::types::SecretDigest;
 
-/// State-side counterpart to the public
-/// [`crate::action::DescribedRows<'r>`].
-///
-/// # Post-DEF-189 (architect 2026-04-25): externalised slot
+/// Where the protocol is right now.
 ///
 /// State variants do NOT carry a `RowDesc` payload. The schema, when
 /// present, lives in `PgProtocol::row_desc_slot` — populated by the
 /// `'T'` dispatch arm and read by terminal materialise via the
-/// protocol's `current_row_desc()` accessor. This enum is a slim
-/// Where the protocol is right now.
+/// protocol's `current_row_desc()` accessor.
 ///
 /// **Internal-use enum.** Not `#[non_exhaustive]`: exhaustive `match` in
 /// internal dispatch is the load-bearing tier-1 invariant — a missed
 /// (state, tag) combination is a build failure.
 ///
-/// # DEF-211 FAKE-16 (audit 2026-05-04, 5th-pass architect-agent):
-/// `#[derive(Default)]` removed
+/// # No `Default` impl
 ///
-/// Pre-FAKE-16 the enum derived `Default` (with `Idle` as the
-/// default arm), enabling `core::mem::take(&mut state)` to swap
-/// state out for an `Idle` placeholder. The convenience created a
-/// **latent hazard**: `mem::take` on an [`Errored`][ProtoState::Errored]
-/// variant would silently drop the stored [`StateErrorKind`] and
-/// replace it with `Idle`, re-opening the connection for commands
-/// (silent recovery from a terminal error). Every caller that
-/// used `mem::take` had to manually preserve the `Errored` case —
-/// a documented discipline, NOT a compile-time invariant.
+/// `#[derive(Default)]` would let `core::mem::take(&mut state)` swap
+/// state out for an `Idle` placeholder — convenient, but a latent
+/// hazard: `mem::take` on an `Errored` variant would silently drop
+/// the stored [`StateErrorKind`] and replace it with `Idle`,
+/// re-opening the connection for commands (silent recovery from a
+/// terminal error). Every caller that used `mem::take` would have to
+/// manually preserve the `Errored` case — a documented discipline,
+/// NOT a compile-time invariant.
 ///
-/// Post-FAKE-16 the derive is removed. All callsites use
-/// `core::mem::replace(&mut state, ProtoState::Idle)` explicitly,
-/// making the placeholder choice load-bearing at the call site.
-/// Audit (2026-05-04) confirmed zero existing `mem::take(state)`
-/// callsites in the crate; the derive was unused. Tier-1
-/// future-proof: a future contributor cannot accidentally invoke
-/// `mem::take(state)` because the trait impl no longer exists.
+/// Instead all callsites use `core::mem::replace(&mut state,
+/// ProtoState::Idle)` explicitly, making the placeholder choice
+/// load-bearing at the call site. Tier-1 future-proof: a future
+/// contributor cannot accidentally invoke `mem::take(state)`
+/// because the trait impl does not exist.
 // Deliberately **not** `Copy`: moving out of `PingAwaitingRfq(id)`
 // must consume the [`crate::ReplyId`] inline — the state-as-data
 // invariant (reforge.md §7.2). `ProtoState` inherits non-Copy from
@@ -85,31 +76,30 @@ pub enum ProtoState {
     PingAwaitingRfq(ReplyId<PingKind>),
 
     // ---------------------------------------------------------------
-    // Phase 1b: startup + auth handshake states (DEF-001..DEF-004)
+    // Startup + auth handshake states.
     // ---------------------------------------------------------------
 
     /// A `StartupMessage` was sent by a Trust-auth connection;
-    /// awaiting `AuthenticationOk`. DEF-001 + DEF-097.
+    /// awaiting `AuthenticationOk`.
     ///
     /// # Why split from the Scram variant
     ///
-    /// Before DEF-097 a single `ConnectingStartup { reply, credentials }`
-    /// variant carried the full [`crate::password::Credentials`] enum
-    /// until the server responded. Two consequences:
+    /// A single `ConnectingStartup { reply, credentials }` variant
+    /// carrying the full [`crate::password::Credentials`] enum until
+    /// the server responded would have two costs:
     ///
-    /// - ~1040 bytes of password buffer lived in state until the
-    ///   first frame arrived (Trust connections paid the Scram-sized
-    ///   stack footprint).
-    /// - The "server requested SASL on a Trust connection" case was
-    ///   classified at runtime (`UnsupportedAuthMethod`), not at
+    /// - ~1040 bytes of password buffer would live in state until the
+    ///   first frame arrived (Trust connections paying the
+    ///   Scram-sized stack footprint).
+    /// - The "server requested SASL on a Trust connection" case would
+    ///   be classified at runtime (`UnsupportedAuthMethod`), not at
     ///   compile time.
     ///
     /// The Trust/Scram split moves discrimination to
-    /// [`crate::PgProtocol::push_command`]. Each variant now only
-    /// carries what its authentication path needs. A server frame
-    /// of the wrong shape for the connection's credential type
-    /// becomes a per-variant dispatcher arm — a missed arm is a
-    /// build failure.
+    /// [`crate::PgProtocol::push_command`]. Each variant only carries
+    /// what its authentication path needs. A server frame of the
+    /// wrong shape for the connection's credential type becomes a
+    /// per-variant dispatcher arm — a missed arm is a build failure.
     ConnectingStartupTrust {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
@@ -117,7 +107,6 @@ pub enum ProtoState {
 
     /// A `StartupMessage` was sent by a cleartext-password connection;
     /// awaiting `AuthenticationCleartextPassword` (sub-code 3).
-    /// DEF-215 (2026-05-05).
     ///
     /// # Tier-1 — variant carries its data
     ///
@@ -159,7 +148,7 @@ pub enum ProtoState {
     },
 
     /// `PasswordMessage` was sent (cleartext bytes); awaiting
-    /// `AuthenticationOk` (sub-code 0). DEF-215 (2026-05-05).
+    /// `AuthenticationOk` (sub-code 0).
     ///
     /// Only `AuthOk` is legal here — any other auth code or frame
     /// is a protocol violation classified as `UnexpectedFrame`. The
@@ -171,7 +160,7 @@ pub enum ProtoState {
 
     /// A `StartupMessage` was sent by an MD5-password connection;
     /// awaiting `AuthenticationMD5Password` (sub-code 5) carrying
-    /// a 4-byte salt. DEF-216 (2026-05-05).
+    /// a 4-byte salt.
     ///
     /// # Why a single Box?
     ///
@@ -179,12 +168,12 @@ pub enum ProtoState {
     /// username at digest-construction time (the inner hash is
     /// `md5_hex(password || username)`). The username arrived in
     /// the `StartupMessage` and is otherwise not retained by the
-    /// state machine; we keep it bundled with the password until
-    /// the handshake completes. Both live inside one
+    /// state machine; it stays bundled with the password until the
+    /// handshake completes. Both live inside one
     /// [`Md5HandshakeState`] struct, heap-boxed once, mirroring the
-    /// `SCRAM` PERF-02 single-Box pattern. Per-handshake total: 1
-    /// alloc (StartupMd5 construction) + 1 free (PasswordMessage
-    /// dispatch transition).
+    /// SCRAM single-Box pattern. Per-handshake total: 1 alloc
+    /// (StartupMd5 construction) + 1 free (PasswordMessage dispatch
+    /// transition).
     ///
     /// # Tier-1 — variant carries its data
     ///
@@ -197,9 +186,9 @@ pub enum ProtoState {
     ///
     /// # Size pin
     ///
-    /// Pre-Box: `Ident` (~64 B) + `Sensitive<Password>` (~514 B)
-    /// would balloon the variant past the 80 B `ProtoState` size
-    /// pin. Post-Box: 8 B (Box ptr) + 8 B (ReplyId) + 1 B (disc)
+    /// Inline storage of `Ident` (~64 B) + `Sensitive<Password>`
+    /// (~514 B) would balloon the variant past the 80 B `ProtoState`
+    /// size pin. With Box: 8 B (Box ptr) + 8 B (ReplyId) + 1 B (disc)
     /// + align = ~24 B. Pin preserved.
     ConnectingStartupMd5 {
         /// Correlator for the Startup command.
@@ -211,7 +200,7 @@ pub enum ProtoState {
     },
 
     /// `PasswordMessage` was sent (MD5 digest bytes); awaiting
-    /// `AuthenticationOk` (sub-code 0). DEF-216 (2026-05-05).
+    /// `AuthenticationOk` (sub-code 0).
     ///
     /// Mirror of [`Self::ConnectingCleartextAwaitingAuthOk`]: only
     /// `AuthOk` is legal here, anything else is `UnexpectedFrame`.
@@ -222,7 +211,6 @@ pub enum ProtoState {
 
     /// A `StartupMessage` was sent by a SCRAM-auth connection;
     /// awaiting `AuthenticationSASL` offering SCRAM-SHA-256.
-    /// DEF-001 + DEF-097.
     ///
     /// # Tier-1 compile — variant carries its data
     ///
@@ -255,66 +243,59 @@ pub enum ProtoState {
         reply: ReplyId<StartupKind>,
         /// SCRAM session (the password the user provided), heap-boxed.
         ///
-        /// # DEF-187 (architect 2026-04-26): boxed
+        /// # Boxing rationale
         ///
-        /// Pre-DEF-187 the `ScramSession` (~520 B with full Password)
-        /// lived inline in the variant, dominating `ProtoState` size at
-        /// ~712 B and causing cache-locality damage on the per-row hot
-        /// path (iter_rows_per_row +110% regression vs pre-A10/B22).
+        /// Inline `ScramSession` (~520 B with full Password) would
+        /// dominate `ProtoState` size at ~712 B and cause cache-locality
+        /// damage on the per-row hot path (`iter_rows_per_row` regresses
+        /// +110% when measured against the inline-state variant).
         ///
-        /// Post-DEF-187: `Box<ScramSession>` reduces variant footprint
-        /// to 8 + 16 = 24 B. Tier-1 preserved — Box can't be None,
-        /// Box's Drop fires `ScramSession::Drop` (ZeroizeOnDrop) on
-        /// every exit path. Cost in this variant: one heap alloc.
+        /// `Box<ScramSession>` reduces variant footprint to 8 + 16 =
+        /// 24 B. Tier-1 preserved — Box can't be None, Box's Drop fires
+        /// `ScramSession::Drop` (ZeroizeOnDrop) on every exit path.
+        /// Cost in this variant: one heap alloc.
         ///
-        /// **Per-handshake total — DEF-210 SR-07 + REC-06 (audit
-        /// 2026-04-28).** Pre-REC-06 text claimed *"one heap alloc
-        /// per SCRAM connection"*, which described the Phase-1
-        /// constellation accurately but missed the Phase-2 reality:
-        /// the next variant
-        /// [`Self::ConnectingScramAwaitingServerFirst`] used to add
-        /// two further `Box<PodBytes<…>>` fields (three live `Box`
-        /// allocs during ServerFirst-await). REC-06 consolidated
-        /// those into a single `Box<ScramHandshakeState>` carried by
-        /// the next variant, restoring the literal *"one heap alloc"*
-        /// invariant: at any moment in a SCRAM handshake's lifecycle
-        /// at most ONE `Box` is live (transition `StartupScram → ServerFirst`
-        /// performs `*scram` deref-move + new `Box::new` of the
-        /// consolidated struct; the old Box is freed and the new one
-        /// is allocated atomically per the move semantics).
+        /// **Per-handshake total**: at any moment in a SCRAM handshake's
+        /// lifecycle at most ONE `Box` is live. Both
+        /// `ConnectingStartupScram` and
+        /// [`Self::ConnectingScramAwaitingServerFirst`] carry the same
+        /// `Box<ScramSession>` (`client_first_bare` and
+        /// `client_nonce_b64` are wire-public byte fields inside the
+        /// session with `#[zeroize(skip)]`, populated in place by
+        /// `dispatch::build_sasl_initial_response`). Per-handshake
+        /// allocator ops: 1 alloc + 1 free total.
+        ///
+        /// Drop chain: `Box::drop` → `ScramSession::drop` →
+        /// `ZeroizeOnDrop` of password (wire-public PodBytes fields
+        /// skip-zeroed by classification).
         scram: alloc::boxed::Box<ScramSession>,
     },
 
     /// SCRAM step 1 complete (client-first sent); awaiting
-    /// `AuthenticationSASLContinue` (server-first-message). DEF-002.
+    /// `AuthenticationSASLContinue` (server-first-message).
     ///
-    /// # DEF-210 REC-06 → PERF-02 (audits 2026-04-28 + 2026-05-04)
+    /// # Single-Box invariant
     ///
-    /// Pre-REC-06 this variant carried three separate
-    /// `Box<...>` fields (`scram`, `client_first_bare`,
-    /// `client_nonce_b64`) — 3 heap allocations live during the
-    /// ServerFirst-await phase, 3 drops on transition.
-    ///
-    /// REC-06 consolidated them into a single
-    /// `Box<ScramHandshakeState>` (one struct holding all three
-    /// fields). Allocator ops per handshake: 6 → 4. Half-measure:
-    /// the `StartupScram → ServerFirst` transition still incurred
-    /// 1 alloc + 1 free (free old `Box<ScramSession>` at deref-move,
+    /// A naive shape would carry three separate `Box<...>` fields
+    /// (`scram`, `client_first_bare`, `client_nonce_b64`) — three
+    /// heap allocations live during the ServerFirst-await phase,
+    /// three drops on transition. Consolidating them into a single
+    /// `Box<ScramHandshakeState>` cuts to one Box but the
+    /// `StartupScram → ServerFirst` transition still incurs 1 alloc
+    /// plus 1 free (free old `Box<ScramSession>` at deref-move,
     /// alloc new `Box<ScramHandshakeState>`).
     ///
-    /// PERF-02 (audit 2026-05-04 architect-agent finding) closes
-    /// the gap: `client_first_bare` + `client_nonce_b64` moved
-    /// INTO `ScramSession` itself (with `#[zeroize(skip)]` —
-    /// wire-public bytes per DEF-205 step 4 / DEF-206 audit).
-    /// Both `ConnectingStartupScram` and
+    /// Current shape closes the gap: `client_first_bare` +
+    /// `client_nonce_b64` live INSIDE `ScramSession` itself (with
+    /// `#[zeroize(skip)]` — wire-public bytes). Both
+    /// `ConnectingStartupScram` and
     /// `ConnectingScramAwaitingServerFirst` carry the **same**
     /// `Box<ScramSession>`; the transition is a state-discriminant
     /// flip + Box pointer copy-move (zero allocator ops).
-    /// Per-handshake total: 1 alloc + 1 free. The principal's
-    /// documented "one heap alloc per SCRAM connection" invariant
-    /// is now LITERALLY accurate.
+    /// Per-handshake total: 1 alloc + 1 free; "one heap alloc per
+    /// SCRAM connection" is literal.
     ///
-    /// Drop chain unchanged: `Box::drop` → `ScramSession::drop` →
+    /// Drop chain: `Box::drop` → `ScramSession::drop` →
     /// `ZeroizeOnDrop` of password (PodBytes fields skip-zeroed
     /// per wire-public classification).
     ConnectingScramAwaitingServerFirst {
@@ -325,13 +306,13 @@ pub enum ProtoState {
         /// `dispatch::build_sasl_initial_response` at the
         /// `ConnectingStartupScram` → `ConnectingScramAwaitingServerFirst`
         /// transition. **Same `Box` allocation** as
-        /// [`Self::ConnectingStartupScram`]'s `scram` field;
-        /// reused across both variants per PERF-02.
+        /// [`Self::ConnectingStartupScram`]'s `scram` field; reused
+        /// across both variants (no alloc on transition).
         scram: alloc::boxed::Box<ScramSession>,
     },
 
     /// SCRAM step 2 complete (client-final sent); awaiting
-    /// `AuthenticationSASLFinal` (server-final-message). DEF-002.
+    /// `AuthenticationSASLFinal` (server-final-message).
     ConnectingScramAwaitingServerFinal {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
@@ -340,21 +321,21 @@ pub enum ProtoState {
     },
 
     /// SCRAM step 3 complete (server signature verified); awaiting
-    /// `AuthenticationOk`. DEF-002.
+    /// `AuthenticationOk`.
     ConnectingScramAwaitingAuthOk(ReplyId<StartupKind>),
 
-    /// Authentication succeeded; waiting for `BackendKeyData`. DEF-003.
+    /// Authentication succeeded; waiting for `BackendKeyData`.
     ///
     /// `ParameterStatus` messages received in this state are recorded
     /// on [`crate::PgProtocol::session_params`] by the `feed_bytes`
     /// loop. `BackendKeyData` transitions to `ConnectingPostAuthHaveKey`.
     ConnectingPostAuthAwaitingKey(ReplyId<StartupKind>),
 
-    /// `BackendKeyData` received; waiting for `ReadyForQuery`. DEF-004.
+    /// `BackendKeyData` received; waiting for `ReadyForQuery`.
     ///
     /// Additional `ParameterStatus` messages may arrive before RFQ.
     ///
-    /// # DEF-189 Q8-C2 — secret_key wrapped in Sensitive<i32>
+    /// # secret_key wrapped in `Sensitive<i32>`
     ///
     /// `secret_key: Sensitive<i32>` — the PG backend's CancelRequest
     /// authenticator. A leaked `secret_key` enables query cancellation
@@ -365,18 +346,15 @@ pub enum ProtoState {
     ///   moves to Idle on the trailing RFQ, or to Errored on a fatal
     ///   frame), the inner `i32` is overwritten with zero before the
     ///   memory is reused by the next variant. Defense in depth
-    ///   alongside ReadBuf/WriteBuf P0-B/C zeroize-on-clear.
+    ///   alongside ReadBuf/WriteBuf zeroize-on-clear.
     /// - **Debug redaction**: any future Debug print of `ProtoState`
     ///   prints `<REDACTED>` for the secret_key.
     ///
-    /// Pre-DEF-189 (DEF-185 P2-C) was `secret_key: i32` (Copy); the
-    /// audit accepted the residue trade-off in exchange for the
-    /// `Sensitive` wrapper's `!Copy` cost cascading through
-    /// match-destructure in dispatch. DEF-189 commits to the wrapper:
-    /// the dispatch RFQ arm `match` extracts the inner via `.get()`
-    /// (returns `&i32`), then copy-derefs into the
-    /// `StartupCompletePayload` (which itself has manual Debug
-    /// redaction per P1-C). The wrapper drops at the
+    /// A naive `secret_key: i32` (Copy) would leave the value in the
+    /// state's stack-residue after transition. The dispatch RFQ arm
+    /// extracts the inner via `.get()` (returns `&i32`), then
+    /// copy-derefs into the `StartupCompletePayload` (which itself
+    /// has manual Debug redaction). The wrapper drops at the
     /// `mem::replace(state, Idle)` in dispatch, scrubbing the slot.
     ConnectingPostAuthHaveKey {
         /// Correlator for the Startup command.
@@ -391,7 +369,7 @@ pub enum ProtoState {
     },
 
     // ---------------------------------------------------------------
-    // Phase 1c-1b: Simple Query flow (PgCommand::SimpleQuery)
+    // Simple Query flow (PgCommand::SimpleQuery)
     // ---------------------------------------------------------------
 
     /// A `Query` frame was sent; awaiting the first response —
@@ -410,12 +388,12 @@ pub enum ProtoState {
     /// stay here; `CommandComplete` → [`Self::SimpleQueryAwaitingRfq`]
     /// with the parsed command tag.
     ///
-    /// DEF-189: variant carries no schema field. The schema lives in
-    /// `PgProtocol::row_desc_slot` (populated by the `'T'` arm BEFORE
-    /// the transition into this variant). The per-row hot-path reads
-    /// the desc via `proto.current_row_desc()` (single immutable
-    /// borrow projection from the slot) — no per-variant payload,
-    /// no per-row state match.
+    /// Variant carries no schema field. The schema lives in
+    /// `PgProtocol::row_desc_slot` (populated by the `'T'` arm
+    /// BEFORE the transition into this variant). The per-row hot-path
+    /// reads the desc via `proto.current_row_desc()` (single immutable
+    /// borrow projection from the slot) — no per-variant payload, no
+    /// per-row state match.
     SimpleQueryStreamingRows {
         /// Correlator for the in-flight query.
         reply: ReplyId<QueryKind>,
@@ -426,24 +404,22 @@ pub enum ProtoState {
     /// (empty for `EmptyQueryResponse`) ships in the final
     /// [`crate::Reply::QueryComplete`] payload.
     ///
-    /// # DEF-210 SR-01 Path C (audit 2026-04-28): `schema_present` deleted
+    /// # No `schema_present` discriminator
     ///
-    /// Pre-Path-C this variant carried `schema_present: bool` —
-    /// a duplicate of `PgProtocol::row_desc_slot.is_some()` kept
-    /// in lockstep by dispatch-arm discipline. The duplication was
-    /// **tier-2 structural** (same dispatch arm sets bool ↔
-    /// populates slot atomically) but architecturally fragile: a
-    /// future refactor that set `schema_present = true` without
-    /// populating the slot would silently produce
-    /// `Reply::QueryComplete.row_desc = None` for SELECTs ("DML
-    /// done" instead of rows — silent corruption).
+    /// A naive shape would carry `schema_present: bool` — a duplicate
+    /// of `PgProtocol::row_desc_slot.is_some()` kept in lockstep by
+    /// dispatch-arm discipline. The duplication is **tier-2
+    /// structural** (same dispatch arm sets bool ↔ populates slot
+    /// atomically) but architecturally fragile: a future refactor
+    /// that set `schema_present = true` without populating the slot
+    /// would silently produce `Reply::QueryComplete.row_desc = None`
+    /// for SELECTs ("DML done" instead of rows — silent corruption).
     ///
-    /// Path C eliminates the duplicate. The single source of truth
-    /// is `PgProtocol::row_desc_slot`; terminal materialise reads
-    /// the slot directly via `into_public`. A future Path C audit
-    /// can confirm: there is no second variable that can drift.
-    /// **Tier-1 by-construction** — the invariant is "the slot
-    /// equals itself", which is identity, not discipline.
+    /// The single source of truth is `PgProtocol::row_desc_slot`;
+    /// terminal materialise reads the slot directly via `into_public`.
+    /// There is no second variable that can drift. **Tier-1
+    /// by-construction** — the invariant is "the slot equals
+    /// itself", which is identity, not discipline.
     SimpleQueryAwaitingRfq {
         /// Correlator for the in-flight query.
         reply: ReplyId<QueryKind>,
@@ -462,7 +438,7 @@ pub enum ProtoState {
     DrainRfqAfterError,
 
     // ---------------------------------------------------------------
-    // Phase 1c-3a: Extended Query — Parse flow
+    // Extended Query — Parse flow
     // ---------------------------------------------------------------
 
     /// A `Parse` + `Sync` frame pair was sent; awaiting `ParseComplete`
@@ -481,7 +457,7 @@ pub enum ProtoState {
     ParseAwaitingRfq(ReplyId<ParseKind>),
 
     // ---------------------------------------------------------------
-    // Phase 1c-3b: Extended Query — Bind + Execute flow
+    // Extended Query — Bind + Execute flow
     // ---------------------------------------------------------------
     //
     // `push_bind_execute` emits `Bind` + `Execute` + `Sync` as one
@@ -489,17 +465,17 @@ pub enum ProtoState {
     //
     //   '2' (BindComplete)     — server accepted params
     //   ['T'] (RowDescription) — ONLY if a prior Describe ran;
-    //                            1c-3b doesn't auto-describe, so user-
-    //                            supplied row_desc is threaded from
-    //                            the push call
+    //                            push_bind_execute doesn't auto-
+    //                            describe, so user-supplied row_desc
+    //                            is threaded from the push call
     //   'D'* (DataRow)         — result rows (zero rows for DML)
     //   'C' (CommandComplete)  — result-set boundary
     //   'Z' (ReadyForQuery)    — sync boundary
     //
-    // The four state variants below mirror the SimpleQuery shape
-    // with a `BindComplete` prefix state. Schema (row_desc) is
-    // carried through state transitions same as F19 — no separate
-    // slot on PgProtocol.
+    // The variants below mirror the SimpleQuery shape with a
+    // `BindComplete` prefix state. Schema (row_desc) is threaded via
+    // the same `PgProtocol::row_desc_slot` used by SimpleQuery — no
+    // separate slot.
 
     // The BindExecute flow splits into TWO state families based on
     // whether the user provided a row_desc (SELECT with schema) or
@@ -579,7 +555,7 @@ pub enum ProtoState {
     },
 
     // ---------------------------------------------------------------
-    // Phase 1c-3c: Extended Query — Describe flow
+    // Extended Query — Describe flow
     // ---------------------------------------------------------------
     //
     // `push_command(PgCommand::DescribeStatement | DescribePortal)`
@@ -642,21 +618,23 @@ pub enum ProtoState {
     /// deliver [`crate::Reply::DescribeStatementComplete`] and
     /// transition to Idle.
     ///
-    /// # DEF-210 SR-01-D Path D (audit 2026-04-28)
+    /// # No `rows` discriminator
     ///
-    /// Pre-Path-D this variant carried a `rows: DescribedRowsStaged`
-    /// discriminator — exactly the same architectural shape as the
-    /// `schema_present: bool` removed by Path C from
-    /// `SimpleQueryAwaitingRfq`. The discriminator was a duplicate
-    /// of `PgProtocol::row_desc_slot.is_some()` (the `'T'` arm
-    /// populated the slot AND set `Rows`; the `'n'` arm did neither).
-    /// Materialise read the discriminator and projected from the slot
-    /// — but if the discriminator and slot drifted, the projection
-    /// silently swallowed the schema (manifested as a tier-3
-    /// `debug_assert!(false)` arm in production code, CREDO §V banned
-    /// pattern). Path D deletes the discriminator; materialise reads
-    /// `row_desc_slot.map(...)` directly. **Tier-1 by-construction**:
-    /// the slot equals itself (identity, not discipline).
+    /// A naive shape would carry a `rows: DescribedRowsStaged`
+    /// discriminator — same architectural shape as the
+    /// `schema_present: bool` rejected on `SimpleQueryAwaitingRfq`.
+    /// The discriminator would duplicate
+    /// `PgProtocol::row_desc_slot.is_some()` (the `'T'` arm populates
+    /// the slot AND sets `Rows`; the `'n'` arm does neither).
+    /// Materialise would read the discriminator and project from the
+    /// slot — but if the discriminator and slot drifted, the
+    /// projection would silently swallow the schema (manifesting as
+    /// a tier-3 `debug_assert!(false)` arm in production code, CREDO
+    /// §V banned pattern).
+    ///
+    /// Instead materialise reads `row_desc_slot.map(...)` directly.
+    /// **Tier-1 by-construction**: the slot equals itself (identity,
+    /// not discipline).
     DescribeStatementAwaitingRfq {
         /// Correlator for the Describe command.
         reply: ReplyId<DescribeStatementKind>,
@@ -677,9 +655,9 @@ pub enum ProtoState {
     /// → deliver [`crate::Reply::DescribePortalComplete`] and
     /// transition to Idle.
     ///
-    /// DEF-210 SR-01-D Path D: same as
-    /// [`Self::DescribeStatementAwaitingRfq`] — discriminator removed,
-    /// slot is the single source of truth.
+    /// No `rows` discriminator: same rationale as
+    /// [`Self::DescribeStatementAwaitingRfq`] — the slot is the
+    /// single source of truth.
     DescribePortalAwaitingRfq {
         /// Correlator for the Describe command.
         reply: ReplyId<DescribePortalKind>,
@@ -693,22 +671,23 @@ pub enum ProtoState {
     /// same call, so by the time the state is observable as `Errored`
     /// the wrapper has already received the diagnostic.
     ///
-    /// Never left. DEF-061 + DEF-142: carries [`StateErrorKind`]
-    /// (1 byte), the `AlreadyClosed`-free subset of
-    /// [`crate::error::ErrorKind`]. The full cause went out once in
-    /// the first `FailReply`; subsequent pushes get a compact
+    /// Never left. Carries [`StateErrorKind`] (1 byte), the
+    /// `AlreadyClosed`-free subset of [`crate::error::ErrorKind`].
+    /// The full cause went out once in the first `FailReply`;
+    /// subsequent pushes get a compact
     /// [`crate::error::ProtocolError::ConnectionAlreadyClosed`]
     /// carrying the `prior_kind` for diagnostic context.
     ///
     /// # Why `StateErrorKind` and not `ErrorKind`
     ///
-    /// DEF-142 (pass-#8 F-056) narrows the carried type from the
-    /// full `ErrorKind` to the `StateErrorKind` newtype. The
-    /// invariant "state never holds the `AlreadyClosed`
-    /// pseudo-kind" was previously tier-3 audit (maintained by the
-    /// `fail_inflight_and_close` early-return guard); now it's
-    /// tier-1 compile — constructing `Errored(AlreadyClosed)` is a
-    /// type error at the `StateErrorKind::try_from_kind` call site.
+    /// `StateErrorKind` is a newtype narrower than the full
+    /// `ErrorKind` — it excludes the `AlreadyClosed` pseudo-kind.
+    /// A naive `Errored(ErrorKind)` shape would let the
+    /// "state never holds `AlreadyClosed`" invariant rest on
+    /// tier-3 audit (maintained by the `fail_inflight_and_close`
+    /// early-return guard); the narrower newtype makes it tier-1
+    /// compile — constructing `Errored(AlreadyClosed)` is a type
+    /// error at the `StateErrorKind::try_from_kind` call site.
     Errored(StateErrorKind),
 }
 
@@ -718,7 +697,7 @@ impl ProtoState {
     /// reply is in flight ([`Self::Idle`], [`Self::DrainRfqAfterError`],
     /// [`Self::Errored`]).
     ///
-    /// # Naming convention — `take_` prefix (DEF-138)
+    /// # Naming convention — `take_` prefix
     ///
     /// The `take_` prefix follows Rust-stdlib convention for
     /// consuming-extraction methods (`Option::take`, `Vec::drain`,
@@ -737,26 +716,23 @@ impl ProtoState {
     /// one consume-site on the tear-down path" rule in one place —
     /// previously open-coded inside `fail_inflight_and_close`.
     ///
-    /// # 1c-5 blocker (audit2 A029)
+    /// # Pipelining
     ///
     /// The `Option<NonZeroU64>` return carries AT MOST ONE
     /// correlator. Single-inflight invariant holds today — every
     /// non-Idle variant carries exactly one `ReplyId<K>`. Pipelining
-    /// introduces multi-correlator states (multiple concurrent
-    /// replies over one connection): the return type must widen to
-    /// `heapless::Vec<NonZeroU64, N_INFLIGHT>` at 1c-5 time. Revisit
-    /// per H021 witness-guard session.
+    /// would introduce multi-correlator states (multiple concurrent
+    /// replies over one connection); the return type would have to
+    /// widen to `heapless::Vec<NonZeroU64, N_INFLIGHT>`.
     #[must_use]
     pub(crate) fn take_inflight_reply_raw_id(self) -> Option<core::num::NonZeroU64> {
-        // DEF-186 P1-6 (audit 2026-04-24): the `Errored(_) => None` arm
-        // is correct under single-inflight: an Errored variant carries
-        // only the StateErrorKind discriminator byte, no `ReplyId<K>`.
-        // At 1c-5 pipelining the return type widens to a Vec of
-        // correlators, and the Errored arm must enumerate any
-        // post-error in-flight replies that survived the transition.
-        // Until then this `None` is correct (no embedded reply to
-        // surface), but the trigger to re-audit is the type widening
-        // itself — H021 witness-guard session.
+        // The `Errored(_) => None` arm is correct under
+        // single-inflight: an Errored variant carries only the
+        // StateErrorKind discriminator byte, no `ReplyId<K>`. Under
+        // pipelining the return type would widen to a Vec of
+        // correlators, and the Errored arm would have to enumerate
+        // any post-error in-flight replies that survived the
+        // transition. Until then this `None` is correct.
         match self {
             Self::Idle | Self::DrainRfqAfterError | Self::Errored(_) => None,
             Self::PingAwaitingRfq(id) => Some(id.consume()),
@@ -792,16 +768,16 @@ impl ProtoState {
         }
     }
 
-    /// DEF-146: classify the current state for push-command dispatch.
+    /// Classify the current state for push-command dispatch.
     ///
-    /// Pre-DEF-146, each of the 7 `compute_push_*` helpers in
-    /// `protocol.rs` enumerated the same ~18 `ProtoState` variants in
-    /// or-patterns to group them into the failure classes a push
-    /// targets (CommandInProgress / StartupAlreadyInProgress). Adding
-    /// a new `ProtoState` variant required synchronised edits in all
-    /// 7 helpers.
+    /// A naive shape would enumerate the same ~18 `ProtoState`
+    /// variants in or-patterns inside each of the 7 `compute_push_*`
+    /// helpers in `protocol.rs` to group them into the failure
+    /// classes a push targets (CommandInProgress /
+    /// StartupAlreadyInProgress). Adding a new `ProtoState` variant
+    /// would require synchronised edits in all 7 helpers.
     ///
-    /// Post-DEF-146, the enumeration lives in ONE place (this method).
+    /// Instead the enumeration lives in ONE place (this method).
     /// Each `compute_push_*` matches the 5-variant [`StatePushClass`]
     /// exhaustively — no `_` fallback, so tier-1 compile shield
     /// preserved. Adding a new `ProtoState` variant requires exactly
@@ -830,7 +806,7 @@ impl ProtoState {
     /// Exhaustive match over every `ProtoState` variant — adding a
     /// variant without classifying it is a build error.
     ///
-    /// # DEF-178 (audit2 A038) — `#[inline]` hint
+    /// # `#[inline]` hint
     ///
     /// 7 hot call sites (compute_push_*) with a monomorphic ~25-line
     /// match body. `#[inline]` signals the inliner without forcing
@@ -877,42 +853,30 @@ impl ProtoState {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-279 Phase 1c Bundle (Commit 1 scaffolding, 2026-05-18) —
-// per-phase state enums.
+// Per-phase state enums.
 //
-// Per memo `/tmp/def-rethink-foundation-memo.md` Direction 2.B:
-// split `ProtoState` into per-phase enums that ConnectingInner,
-// ActiveInner, ErroredInner can each carry. This commit is PURE
-// ADDITIVE — the new types have no production callers; Commit 2
-// (dispatch split) wires them; Commit 3 (Inner migration) makes
-// them the storage type on per-phase Inner.
-//
-// **Why three types**: the wrapper-phase TYPE (`<ConnectingPhase>`)
-// must be paired with a state field whose variant set excludes
+// `ConnectingState`, `ActiveState`, and `ErroredState` partition the
+// full `ProtoState` variant set so the wrapping per-phase Inner type
+// can carry a state field whose variant set excludes
 // invalid-for-phase variants. `ConnectingInner.state: ConnectingState`
-// physically forbids holding `SimpleQueryStreamingRows` etc. —
+// physically forbids holding `SimpleQueryStreamingRows` —
 // tier-1 by-storage-absence on state-variant-in-wrong-phase.
 //
 // **Variant naming** — the redundant `Connecting`/`Active` prefix
-// is dropped here (architect Q1 verdict). The wrapping type carries
-// the phase context; `ConnectingState::ConnectingStartupTrust`
-// would stutter at every dispatch arm. Migration from
-// `ProtoState::ConnectingStartupTrust` to
-// `ConnectingState::StartupTrust` at Commit 2 is one textual
-// substitution per arm.
+// is dropped here. The wrapping type carries the phase context;
+// `ConnectingState::ConnectingStartupTrust` would stutter at every
+// dispatch arm.
 //
-// **Errored placement** — option (A): each phase enum has its own
-// `Errored(StateErrorKind)` variant (architect Q2 verdict). Reason:
-// during `<ConnectingPhase>`, state can transiently become Errored
-// (the wrapper-phase stays `<ConnectingPhase>` until `into_closed_if_errored`
-// lifts it to `<ClosedPhase>` — Phase 1b ClosedInner). A separate
-// `ErroredState` would force a wrapping `InnerState` enum with a
-// redundant discriminator. Each phase having its own Errored arm
+// **Errored placement** — each phase enum has its own
+// `Errored(StateErrorKind)` variant. During `<ConnectingPhase>`,
+// state can transiently become Errored (the wrapper-phase stays
+// `<ConnectingPhase>` until `into_closed_if_errored` lifts it to
+// `<ClosedPhase>`). A wrapping `InnerState` enum would add a
+// redundant discriminator; each phase having its own Errored arm
 // matches today's flow with zero runtime overhead.
 // ═════════════════════════════════════════════════════════════════════
 
-/// DEF-279 Phase 1c (Commit 1) — error wrapper for the per-phase
-/// `TryFrom` projection impls.
+/// Error wrapper for the per-phase `TryFrom` projection impls.
 ///
 /// **Why recover the value**: [`ProtoState`] is non-`Copy` and every
 /// non-`Idle` variant carries a `#[must_use]` [`ReplyId<K>`]. A
@@ -938,8 +902,8 @@ impl core::fmt::Debug for WrongPhase {
     }
 }
 
-/// DEF-279 Phase 1c (Commit 1) — terminal-phase state for
-/// [`crate::protocol::ClosedPhase`] / a future `ErroredPhase`.
+/// Terminal-phase state for [`crate::protocol::ClosedPhase`] / a
+/// future `ErroredPhase`.
 ///
 /// Mirrors [`ProtoState::Errored`] exactly. Lives as a single-variant
 /// enum (not a tuple struct) for shape parity with [`ConnectingState`]
@@ -950,12 +914,6 @@ impl core::fmt::Debug for WrongPhase {
 /// **Layout**: 1 B (`StateErrorKind` is 1 B `#[repr(transparent)]`
 /// over `ErrorKind` discriminator; single-variant enum has no extra
 /// discriminator byte under Rust's layout rules).
-///
-/// **`#[allow(missing_debug_implementations)]`**: scaffolding type
-/// with no production callers in Commit 1; manual `Debug` impl (with
-/// `StateErrorKind` formatting matching [`ProtoState::Errored`]'s
-/// manual Debug) lands in Commit 2 alongside the per-phase Inner
-/// migration.
 #[allow(missing_debug_implementations)]
 #[non_exhaustive]
 pub enum ErroredState {
@@ -964,18 +922,17 @@ pub enum ErroredState {
     Errored(StateErrorKind),
 }
 
-/// DEF-279 Phase 1c (Commit 1) — state space reachable from
-/// [`crate::protocol::ConnectingPhase`].
+/// State space reachable from [`crate::protocol::ConnectingPhase`].
 ///
 /// 11 handshake variants + 1 transient `Errored` (entered when
 /// `install_errored` fires during a Connecting state; wrapper stays
 /// `<ConnectingPhase>` until `into_closed_if_errored` lifts to
 /// `<ClosedPhase>`).
 ///
-/// **Tier-1 closure** (when wired in Commit 3): a future contributor
-/// CANNOT write `ConnectingInner.state = ConnectingState::SimpleQuery...`
-/// because the variant doesn't exist. State-variant-in-wrong-phase
-/// is impossible by-construction.
+/// **Tier-1 closure**: a future contributor CANNOT write
+/// `ConnectingInner.state = ConnectingState::SimpleQuery...` because
+/// the variant doesn't exist. State-variant-in-wrong-phase is
+/// impossible by-construction.
 ///
 /// **Naming**: the redundant `Connecting` prefix from
 /// [`ProtoState::ConnectingStartupTrust`] etc. is dropped here. The
@@ -996,13 +953,12 @@ pub enum ErroredState {
 /// already names the mirrored [`ProtoState`] variant via intra-doc
 /// link.
 ///
-/// **Manual `Debug` impl** (DEF-279 Phase 1c Bundle Commit 7,
-/// 2026-05-18) — Sensitive-redaction parity with
-/// [`ProtoState`]'s manual Debug. Variants carrying SCRAM /
-/// MD5 / Cleartext password material or `Sensitive<i32>` secret keys
-/// use `finish_non_exhaustive()` to elide the secret fields from
-/// the formatted output; non-sensitive variants print all fields
-/// via `finish()` / `write!`.
+/// **Manual `Debug` impl** — Sensitive-redaction parity with
+/// [`ProtoState`]'s manual Debug. Variants carrying SCRAM / MD5 /
+/// Cleartext password material or `Sensitive<i32>` secret keys use
+/// `finish_non_exhaustive()` to elide the secret fields from the
+/// formatted output; non-sensitive variants print all fields via
+/// `finish()` / `write!`.
 #[allow(missing_docs)]
 #[non_exhaustive]
 pub enum ConnectingState {
@@ -1049,18 +1005,18 @@ pub enum ConnectingState {
         pid: i32,
         secret_key: crate::sensitive::Sensitive<i32>,
     },
-    /// **DEF-279 Phase 1c Bundle Commit 3 — per-phase transition
-    /// signal**. The handshake's `(PostAuthHaveKey, RFQ)` dispatch
-    /// arm transitions `ProtoState` to `Idle` (post-handshake) AND
-    /// installs the backend-key cell. The shared dispatch body
-    /// operates on `ProtoState`; the per-phase `ConnectingInner`
-    /// wrapper lifts state into `ProtoState` before dispatch and
-    /// projects back via [`TryFrom`] after. The `ProtoState::Idle`
-    /// has no `ConnectingState` mirror, so `TryFrom` rejects it —
-    /// the rejection is caught at the per-phase `feed_bytes_impl`'s
-    /// epilogue and translated to **this variant** as the transition
-    /// signal. `<ConnectingPhase>::into_active` observes this variant
-    /// and lifts the wrapper to `<ActivePhase>` (the `BackendKeyCell`
+    /// **Per-phase transition signal**. The handshake's
+    /// `(PostAuthHaveKey, RFQ)` dispatch arm transitions `ProtoState`
+    /// to `Idle` (post-handshake) AND installs the backend-key cell.
+    /// The shared dispatch body operates on `ProtoState`; the
+    /// per-phase `ConnectingInner` wrapper lifts state into
+    /// `ProtoState` before dispatch and projects back via [`TryFrom`]
+    /// after. The `ProtoState::Idle` has no `ConnectingState` mirror,
+    /// so `TryFrom` rejects it — the rejection is caught at the
+    /// per-phase `feed_bytes_impl`'s epilogue and translated to
+    /// **this variant** as the transition signal.
+    /// `<ConnectingPhase>::into_active` observes this variant and
+    /// lifts the wrapper to `<ActivePhase>` (the `BackendKeyCell`
     /// install was already completed by the dispatch arm; into_active
     /// only needs to materialise the new `PgProtocolInner` wrapper).
     ///
@@ -1068,8 +1024,8 @@ pub enum ConnectingState {
     /// already lives in [`crate::protocol::ConnectingInner`]'s
     /// `backend_key` cell at this point (installed atomically with
     /// the dispatch arm's `*state = Idle` write). No retention
-    /// surface — Bundle D' tier elevation preserved by the cell's
-    /// existing zero-on-drop chain.
+    /// surface — tier elevation preserved by the cell's existing
+    /// zero-on-drop chain.
     ///
     /// **No `ProtoState` mirror** — `HandshakeReady` exists only in
     /// the per-phase `ConnectingState`. The
@@ -1087,9 +1043,8 @@ pub enum ConnectingState {
     Errored(StateErrorKind),
 }
 
-/// DEF-279 Phase 1c Bundle Commit 7 (2026-05-18) — manual `Debug`
-/// for [`ConnectingState`] with **Sensitive-redaction parity** with
-/// [`ProtoState`]'s manual Debug.
+/// Manual `Debug` for [`ConnectingState`] with **Sensitive-redaction
+/// parity** with [`ProtoState`]'s manual Debug.
 ///
 /// Variants carrying SCRAM `ScramSession` / `SecretDigest`, MD5
 /// `Md5HandshakeState`, cleartext `Sensitive<Password>`, or post-auth
@@ -1146,20 +1101,19 @@ impl core::fmt::Debug for ConnectingState {
     }
 }
 
-/// DEF-279 Phase 1c (Commit 1) — state space reachable from
-/// [`crate::protocol::ActivePhase`].
+/// State space reachable from [`crate::protocol::ActivePhase`].
 ///
 /// 19 post-handshake variants + 1 transient `Errored`. Includes
 /// `Idle`, `PingAwaitingRfq`, all SimpleQuery / Parse / BindExecute /
-/// Describe flow variants, and `DrainRfqAfterError` (architect Q4
-/// verified: only transitioned-into from Active variants).
+/// Describe flow variants, and `DrainRfqAfterError` (verified: only
+/// transitioned-into from Active variants).
 ///
-/// **Tier-1 closure** (when wired in Commit 3): a future contributor
-/// CANNOT write `ActiveInner.state = ActiveState::StartupTrust { ... }`
-/// because the variant doesn't exist.
+/// **Tier-1 closure**: a future contributor CANNOT write
+/// `ActiveInner.state = ActiveState::StartupTrust { ... }` because
+/// the variant doesn't exist.
 ///
-/// **Layout**: ~80 B (matches today's `ProtoState`). Largest variant
-/// is [`Self::DescribeStatementAwaitingRowDescOrNoData`] /
+/// **Layout**: ~80 B (matches `ProtoState`). Largest variant is
+/// [`Self::DescribeStatementAwaitingRowDescOrNoData`] /
 /// [`Self::DescribeStatementAwaitingRfq`] carrying
 /// `param_oids: ParamOids` (68 B inline) + `reply: ReplyId<…>` (8 B).
 ///
@@ -1168,12 +1122,11 @@ impl core::fmt::Debug for ConnectingState {
 /// the same-named [`ProtoState`] field; doc duplication creates
 /// drift surface.
 ///
-/// **Manual `Debug` impl** (DEF-279 Phase 2 Bundle Commit 9,
-/// 2026-05-18) — mirror of [`ProtoState`]'s manual Debug for the
-/// post-handshake variants. Active variants don't carry password /
-/// SCRAM secret material; `finish_non_exhaustive()` is used only
-/// for variants whose `param_oids` / streaming-mode bookkeeping the
-/// parent Debug elides per pre-DEF-279 convention.
+/// **Manual `Debug` impl** — mirror of [`ProtoState`]'s manual Debug
+/// for the post-handshake variants. Active variants don't carry
+/// password / SCRAM secret material; `finish_non_exhaustive()` is
+/// used only for variants whose `param_oids` / streaming-mode
+/// bookkeeping the parent Debug elides.
 #[allow(missing_docs)]
 #[non_exhaustive]
 pub enum ActiveState {
@@ -1306,14 +1259,14 @@ impl From<ConnectingState> for ProtoState {
                 pid,
                 secret_key,
             },
-            // DEF-279 Phase 1c Commit 3: HandshakeReady maps to Idle
-            // (the post-handshake ProtoState that dispatch produced
-            // before the per-phase wrapper translated it to this
-            // signal variant). Used at the `feed_bytes_impl` epilogue
-            // when re-lifting state for the SHARED dispatch path on
-            // a subsequent call (won't happen in practice — the next
-            // call goes through `into_active` first — but the
-            // conversion stays semantically correct).
+            // HandshakeReady maps to Idle (the post-handshake
+            // ProtoState that dispatch produced before the per-phase
+            // wrapper translated it to this signal variant). Used at
+            // the `feed_bytes_impl` epilogue when re-lifting state
+            // for the SHARED dispatch path on a subsequent call
+            // (won't happen in practice — the next call goes through
+            // `into_active` first — but the conversion stays
+            // semantically correct).
             ConnectingState::HandshakeReady => ProtoState::Idle,
             ConnectingState::Errored(k) => ProtoState::Errored(k),
         }
@@ -1387,12 +1340,12 @@ impl From<ActiveState> for ProtoState {
 
 // ─── Per-phase classifier methods ───
 
-#[allow(dead_code)] // Used in Commit 4+ (per-phase Inner migration). See deferred.md DEF-279.
+#[allow(dead_code)] // Per-phase Inner migration awaits wiring; the
+// surface is implemented additively here.
 impl ConnectingState {
-    /// DEF-279 Phase 1c Bundle Commit 3 — mirror of
-    /// [`ProtoState::take_inflight_reply_raw_id`] for the per-phase
-    /// enum. Consumes the variant's `ReplyId<K>` (if any) and
-    /// returns its raw [`core::num::NonZeroU64`].
+    /// Mirror of [`ProtoState::take_inflight_reply_raw_id`] for the
+    /// per-phase enum. Consumes the variant's `ReplyId<K>` (if any)
+    /// and returns its raw [`core::num::NonZeroU64`].
     ///
     /// **Exhaustive match** — adding a variant to [`ConnectingState`]
     /// that carries a `ReplyId<_>` without routing it here is a
@@ -1420,13 +1373,12 @@ impl ConnectingState {
         }
     }
 
-    /// DEF-279 Phase 1c Bundle Commit 3 — per-phase mirror of
-    /// [`ProtoState::push_class`]. Always returns either
-    /// [`StatePushClass::Connecting`] (handshake-in-flight variants)
-    /// or [`StatePushClass::Errored`] (the transient Errored signal).
-    /// `HandshakeReady` classifies as `Connecting` — the wrapper-
-    /// phase is still `<ConnectingPhase>` until `into_active` lifts
-    /// it.
+    /// Per-phase mirror of [`ProtoState::push_class`]. Always returns
+    /// either [`StatePushClass::Connecting`] (handshake-in-flight
+    /// variants) or [`StatePushClass::Errored`] (the transient
+    /// Errored signal). `HandshakeReady` classifies as `Connecting`
+    /// — the wrapper-phase is still `<ConnectingPhase>` until
+    /// `into_active` lifts it.
     #[inline]
     #[must_use]
     pub(crate) const fn push_class(&self) -> StatePushClass {
@@ -1448,8 +1400,7 @@ impl ConnectingState {
     }
 }
 
-/// DEF-279 Phase 2 Bundle Commit 9 (2026-05-18) — per-phase
-/// classifier surface for [`ActiveState`].
+/// Per-phase classifier surface for [`ActiveState`].
 #[allow(dead_code)]
 impl ActiveState {
     /// Per-phase mirror of [`ProtoState::take_inflight_reply_raw_id`].
@@ -1521,14 +1472,14 @@ impl ActiveState {
     }
 }
 
-/// DEF-279 Phase 2 Bundle Commit 9 (2026-05-18) — manual `Debug` for
-/// [`ActiveState`] mirroring [`ProtoState`]'s field rendering.
+/// Manual `Debug` for [`ActiveState`] mirroring [`ProtoState`]'s
+/// field rendering.
 ///
 /// Active variants don't carry SCRAM / MD5 / Cleartext password
 /// material (those secrets live only in [`ConnectingState`]).
 /// `finish_non_exhaustive()` is used only for variants whose
-/// `param_oids` / streaming-mode bookkeeping the parent Debug elides
-/// per pre-DEF-279 convention.
+/// `param_oids` / streaming-mode bookkeeping the parent Debug
+/// elides.
 impl core::fmt::Debug for ActiveState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -1741,8 +1692,7 @@ impl TryFrom<ProtoState> for ActiveState {
 
 // ─── Size pins ───
 
-// DEF-279 Phase 1c (Commit 1) — size pins for the per-phase state
-// enums. Adjusted from architect estimate after empirical measurement
+// Size pins for the per-phase state enums. Empirically anchored
 // (see verification in `_phase_state_size_pin_test` below).
 const _: () = assert!(
     core::mem::size_of::<ErroredState>() == 1,
@@ -1757,15 +1707,14 @@ const _: () = assert!(
     "ActiveState dominant variant: DescribeStatement*AwaitingRowDescOrNoData / AwaitingRfq (68 B ParamOids + 8 B ReplyId + alignment)",
 );
 
-/// DEF-210 SR-03 (audit 2026-04-28): classifier output for
-/// [`ProtoState::unsolicited_admit`]. Single source of truth for
-/// "is this state allowed to accept an unsolicited `ParameterStatus`
-/// or `NoticeResponse` frame?" — replaces the prior pair of
-/// independent exhaustive matches in `protocol.rs`
-/// (`allows_unsolicited_param_status` / `..._notice_response`)
-/// which had identical state-lists but no compile-level guarantee
-/// of synchronisation. With this struct, both bools come from one
-/// match arm — drift between classifiers is structurally impossible.
+/// Classifier output for [`ProtoState::unsolicited_admit`]. Single
+/// source of truth for "is this state allowed to accept an
+/// unsolicited `ParameterStatus` or `NoticeResponse` frame?" — a
+/// naive pair of independent exhaustive matches in `protocol.rs`
+/// (`allows_unsolicited_param_status` / `..._notice_response`) would
+/// have identical state-lists but no compile-level guarantee of
+/// synchronisation. With this struct, both bools come from one match
+/// arm — drift between classifiers is structurally impossible.
 ///
 /// Today the two bools always agree; the struct preserves the
 /// distinction so a future PG-spec divergence (e.g. allowing
@@ -1788,11 +1737,10 @@ pub(crate) struct UnsolicitedAdmit {
 }
 
 impl ProtoState {
-    /// DEF-210 SR-03: single exhaustive classifier for unsolicited
-    /// `ParameterStatus` / `NoticeResponse` admittance, replacing the
-    /// pair of identical exhaustive matches in `protocol.rs`. Adding
-    /// a new `ProtoState` variant fails the build here until the
-    /// contributor decides both bools.
+    /// Single exhaustive classifier for unsolicited
+    /// `ParameterStatus` / `NoticeResponse` admittance. Adding a new
+    /// `ProtoState` variant fails the build here until the contributor
+    /// decides both bools.
     #[inline]
     #[must_use]
     pub(crate) const fn unsolicited_admit(&self) -> UnsolicitedAdmit {
@@ -1847,18 +1795,18 @@ impl ProtoState {
     }
 }
 
-/// DEF-146: classifier output for [`ProtoState::push_class`].
+/// Classifier output for [`ProtoState::push_class`].
 ///
 /// Used by the 7 `compute_push_*` helpers in `protocol.rs` to decide
 /// what `FailReply.cause` to emit on a non-Idle push. Each helper's
-/// exhaustive match on `StatePushClass` replaces the pre-DEF-146
-/// per-variant or-patterns (B002).
+/// exhaustive match on `StatePushClass` replaces what would otherwise
+/// be 7 parallel per-variant or-pattern matches.
 ///
 /// Exhaustive variants — no `Other` / catch-all. Adding a new
 /// `ProtoState` variant requires classifying it inside
 /// [`ProtoState::push_class`] (build error if forgotten).
 ///
-/// # DEF-178 (audit2 A005) — classifier carries a payload asymmetry
+/// # Classifier carries a payload asymmetry
 ///
 /// `Errored(StateErrorKind)` is the one variant carrying a payload;
 /// the other four (Idle / Connecting / PingAwaiting / BusyQuery)
@@ -2011,8 +1959,8 @@ impl core::fmt::Debug for ProtoState {
 
 #[cfg(test)]
 mod push_class_tests {
-    //! DEF-169 (audit2 A003): per-variant pinning for the
-    //! [`ProtoState::push_class`] classifier introduced by DEF-146.
+    //! Per-variant pinning for the [`ProtoState::push_class`]
+    //! classifier.
     //!
     //! The exhaustive-match shield on `push_class` proves that every
     //! `ProtoState` variant is classified; it does NOT prove the
@@ -2075,8 +2023,8 @@ mod push_class_tests {
         consume_state(state);
     }
 
-    /// Invariant (tier-1 shield for DEF-146): every ProtoState variant
-    /// maps to exactly the StatePushClass declared here.
+    /// Invariant (tier-1 shield for `push_class`): every ProtoState
+    /// variant maps to exactly the StatePushClass declared here.
     #[test]
     fn every_variant_pinned() {
         // ─── Idle ───
@@ -2095,8 +2043,8 @@ mod push_class_tests {
             },
             StatePushClass::Connecting,
         );
-        // A10/B22 revert 2026-04-24: SCRAM variants carry inline
-        // data (tier-1 variant-carries-field restoration).
+        // SCRAM variants carry their handshake data via Box, but
+        // construction still flows through `from_password` here.
         if let Ok(pw) = Password::try_from_bytes(b"pw") {
             let scram = alloc::boxed::Box::new(ScramSession::from_password(Sensitive::new(pw)));
             pin(
@@ -2255,8 +2203,7 @@ mod push_class_tests {
 
 #[cfg(test)]
 mod per_phase_state_roundtrip_tests {
-    //! DEF-279 Phase 1c (Commit 1) — round-trip pins for the per-phase
-    //! state enum conversions.
+    //! Round-trip pins for the per-phase state enum conversions.
     //!
     //! Tier-3 verification of the From/TryFrom bijection between
     //! [`ProtoState`] and [`ConnectingState`] / [`ActiveState`] /

@@ -1,8 +1,8 @@
 //! Bounded POD string types for the PostgreSQL wire — one generic
 //! `FixedStr<N, Tag>` parameterised by a phantom-tag for nominal
-//! typing. DEF-096.
+//! typing.
 //!
-//! # Trait hierarchy overview (DEF-163 G016)
+//! # Trait hierarchy overview
 //!
 //! ```text
 //!                    ┌─────────────────────────┐
@@ -56,12 +56,12 @@
 //!
 //! # Why one generic type
 //!
-//! Before DEF-096 this module defined three near-identical newtypes
+//! A naive shape would define three near-identical newtypes
 //! (`Ident`, `DatabaseName`, `ApplicationName`) each wrapping a
 //! `heapless::Vec<u8, N>`, plus [`crate::error::BoundedStr<N>`] —
 //! a fourth, slightly different wrapper carrying a `[u8; N] + u16`
-//! form. The four shared ~300 LoC of validation, accessors, and
-//! `Debug`/`Display` impls.
+//! form. The four would share ~300 LoC of validation, accessors,
+//! and `Debug`/`Display` impls.
 //!
 //! [`FixedStr<const N: usize, Tag>`] consolidates all four behind a
 //! single POD layout (`[u8; N] + u16 len + PhantomData<Tag>`). The
@@ -70,14 +70,14 @@
 //! `FixedStr<63, DatabaseNameTag>` are distinct types despite
 //! identical runtime layout, so a function taking `&Ident` rejects
 //! `&DatabaseName` at the type system level — the call-site safety
-//! property that justified having three types in the first place.
+//! property that motivates having three types in the first place.
 //!
 //! # POD — Copy, no Drop
 //!
-//! Prior form (`heapless::Vec<u8, N>`-backed) carried a blanket
-//! `Drop` impl inherited from `heapless::Vec`. Even though the
-//! `u8` element type has an empty `Drop` body, `needs_drop::<Vec<u8, _>>()`
-//! returns `true`, which tripped Drop propagation all the way up
+//! A `heapless::Vec<u8, N>`-backed form would carry a blanket `Drop`
+//! impl inherited from `heapless::Vec`. Even though the `u8` element
+//! type has an empty `Drop` body, `needs_drop::<Vec<u8, _>>()`
+//! returns `true`, which would trip Drop propagation all the way up
 //! into `ProtoState`. POD form (`[u8; N] + u16`) makes
 //! `needs_drop::<FixedStr<_, _>>()` = `false`, giving `Ident`,
 //! `DatabaseName`, `ApplicationName`, and `BoundedStr<N>` all
@@ -110,9 +110,9 @@ pub const MAX_IDENT_LEN: usize = 63;
 /// like `myapp-worker-pod-abc123def456`.
 pub const MAX_APP_NAME_LEN: usize = 128;
 
-/// Maximum byte length for a SQL query text (Phase 1c). 2 KiB
-/// covers typical statements; anything longer is either a pathological
-/// generated query or a COPY command that uses a different path.
+/// Maximum byte length for a SQL query text. 2 KiB covers typical
+/// statements; anything longer is either a pathological generated
+/// query or a COPY command that uses a different path.
 /// Extension-statements (`CREATE EXTENSION …`) and multi-statement
 /// batch strings fit. If this cap is tightened, the `Sql` type's
 /// truncation semantics (via [`BoundedStr::from_str_truncating`])
@@ -128,7 +128,6 @@ pub const MAX_PG_NAME_LEN: usize = 63;
 /// Sealing module for [`FixedStrKind`] and [`Validated`]. Private
 /// to this module so external crates cannot impl the sealed
 /// supertrait — and thus cannot impl the public traits either.
-/// DEF-115 (escalation of DEF-096).
 ///
 /// Without sealing, a downstream crate could introduce its own tag:
 ///
@@ -138,16 +137,14 @@ pub const MAX_PG_NAME_LEN: usize = 63;
 /// impl bsql_pg_proto::ident::Validated for MyTag {}
 /// ```
 ///
-/// DEF-154 (R) P1-3: reclassified from `rust,ignore` to `text` —
-/// this is a NEGATIVE example (what the seal PREVENTS from
-/// compiling). A `compile_fail` trybuild harness would verify
-/// the seal is load-bearing; the docstring example is
-/// illustrative prose.
+/// (The block uses `text` — not `rust,ignore` — because it is a
+/// NEGATIVE example: what the seal PREVENTS from compiling.)
 ///
-/// and call the generic `try_from_str` with it. The set of tags was
-/// tier-4 in practice ("users happen not to") rather than tier-1
-/// compile. The sealed supertrait closes this hole: only types
-/// defined inside `bsql-pg-proto` can ever be valid tags.
+/// Without the seal, a downstream crate could call the generic
+/// `try_from_str` with its own tag. The set of tags would be tier-4
+/// in practice ("users happen not to") rather than tier-1 compile.
+/// The sealed supertrait closes this hole: only types defined inside
+/// `bsql-pg-proto` can ever be valid tags.
 mod sealed {
     /// Supertrait seal for [`super::FixedStrKind`]. Can only be
     /// impl'd from within the `ident` module.
@@ -164,19 +161,15 @@ mod sealed {
 /// `FixedStr<_, Tag>` uses this to render its own type name in
 /// `Debug`.
 ///
-/// **Sealed** (DEF-115): external crates cannot introduce new tags.
-/// The sealed supertrait [`sealed::FixedStrKindSealed`] is
-/// module-private, so no downstream impl compiles.
+/// **Sealed**: external crates cannot introduce new tags. The sealed
+/// supertrait [`sealed::FixedStrKindSealed`] is module-private, so no
+/// downstream impl compiles.
 ///
 /// `ALLOW_EMPTY` is consulted by validated-constructor impls.
-//
-// DEF-115 follow-up (rust-version 1.78 modernisation): structural
-// diagnostic. Sealed-bound failures need the candidate set in plain
-// text.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a `FixedStrKind` tag",
     label = "valid tags are the uninhabited enums `IdentTag`, `DatabaseNameTag`, `ApplicationNameTag`, `BoundedStrTag`, `SqlTag`, `StmtNameTag`, `PortalNameTag`",
-    note = "`FixedStrKind` is sealed (DEF-115) — the tag set is fixed at the crate boundary; downstream `impl FixedStrKind for ...` is forbidden by construction"
+    note = "`FixedStrKind` is sealed — the tag set is fixed at the crate boundary; downstream `impl FixedStrKind for ...` is forbidden by construction"
 )]
 pub trait FixedStrKind: sealed::FixedStrKindSealed {
     /// Human-readable type name used by `Debug`.
@@ -195,8 +188,7 @@ pub trait FixedStrKind: sealed::FixedStrKindSealed {
 /// *not* implement this trait — its truncating constructor lives on
 /// a separate impl block.
 ///
-/// **Sealed** (DEF-115): only the crate's own tags can be
-/// `Validated`.
+/// **Sealed**: only the crate's own tags can be `Validated`.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not opt into the validated constructor path",
     label = "tags that implement `Validated`: `IdentTag`, `DatabaseNameTag`, `ApplicationNameTag`, `StmtNameTag`, `PortalNameTag`",
@@ -211,7 +203,7 @@ pub trait Validated: FixedStrKind + sealed::ValidatedSealed {}
 /// (SQL, server error messages) where strict rejection would be
 /// hostile.
 ///
-/// **Sealed** (DEF-115).
+/// **Sealed**.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not opt into the truncating constructor path",
     label = "tags that implement `Truncating`: `BoundedStrTag`, `SqlTag`",
@@ -231,11 +223,11 @@ pub trait Truncating: FixedStrKind + sealed::TruncatingSealed {}
 /// happens to produce UTF-8) → tier-2 structural (tag must opt into
 /// `ValidUtf8` to earn `as_str`).
 ///
-/// **Sealed** (DEF-115): only the crate's own tags can be
-/// `ValidUtf8`. A downstream tag type cannot bypass the check.
+/// **Sealed**: only the crate's own tags can be `ValidUtf8`. A
+/// downstream tag type cannot bypass the check.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not assert UTF-8-validity of its stored bytes",
-    label = "all current crate tags implement `ValidUtf8` (DEF-115); only `as_str()` requires this bound",
+    label = "all current crate tags implement `ValidUtf8`; only `as_str()` requires this bound",
     note = "`ValidUtf8` is sealed — a downstream tag type cannot bypass the UTF-8 check; if you reach this error you're likely working in test code with a non-crate tag, which the `FixedStr` machinery deliberately rejects"
 )]
 pub trait ValidUtf8: FixedStrKind + sealed::ValidUtf8Sealed {}
@@ -307,14 +299,12 @@ impl ValidUtf8 for BoundedStrTag {}
 // supertrait makes this impossible externally anyway, but the
 // explicit omission documents the intent.
 
-// ───────────────── Phase 1c typed newtypes ────────────────────
+// ───────────────── Typed newtypes ───────────────────────────────
 //
 // Each PG-level identifier concept gets its own tag so the type
 // system rejects cross-use. A `fn execute(stmt: StmtName, portal:
 // PortalName)` with arguments swapped is a compile error. Parallels
-// the DEF-096 Ident/DatabaseName pattern.
-//
-// Round-4 finding #2 (2026-04-20). Sealed via DEF-115 seal.
+// the Ident / DatabaseName pattern.
 
 /// Tag for [`Sql`] — SQL query text, truncating on overflow.
 ///
@@ -414,18 +404,18 @@ where
     LenT: crate::bounded::BoundedLen<N>,
 {
     buf: [u8; N],
-    /// DEF-203 ext: typed length-storage parameter. Defaults to
-    /// `BoundedU16<N>` (2 B, NonZeroU16 niche). Type aliases for
-    /// small-N (≤ 254) types pick `BoundedU8<N>` (1 B + niche).
-    /// **Tier-2 by-construct** — out-of-range len values cannot
-    /// exist via `BoundedLen::try_new_usize`.
+    /// Typed length-storage parameter. Defaults to `BoundedU16<N>`
+    /// (2 B, NonZeroU16 niche). Type aliases for small-N (≤ 254)
+    /// types pick `BoundedU8<N>` (1 B + niche). **Tier-2 by-construct**
+    /// — out-of-range len values cannot exist via
+    /// `BoundedLen::try_new_usize`.
     len: LenT,
-    /// DEF-185 P2-D (audit 2026-04-24): flag indicating that
-    /// `from_bytes_lossy` coerced at least one non-ASCII-printable
-    /// byte to `b'?'`. Callers can query via [`Self::was_lossy`]
-    /// to distinguish legitimate `?` characters in server text
-    /// from our lossy fallback. False on every non-lossy
-    /// constructor (`new`, `from_str_truncating`, `Default`).
+    /// Flag indicating that `from_bytes_lossy` coerced at least one
+    /// non-ASCII-printable byte to `b'?'`. Callers can query via
+    /// [`Self::was_lossy`] to distinguish legitimate `?` characters
+    /// in server text from the lossy fallback. False on every
+    /// non-lossy constructor (`new`, `from_str_truncating`,
+    /// `Default`).
     ///
     /// Stored as `u8` (1 byte) rather than `bool` to keep the
     /// `#[repr(C)]` layout portable across platforms — Rust's
@@ -456,8 +446,8 @@ impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> PartialEq for Fix
 impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> Eq for FixedStr<N, Tag, LenT> {}
 
 /// A PostgreSQL user identifier (63-byte cap, non-empty, no NUL).
-/// **DEF-203 ext**: uses `BoundedU8<63>` LenT for the niche win on
-/// `Option<Ident>` (saves 3 B per Option vs the default BoundedU16).
+/// Uses `BoundedU8<63>` LenT for the niche win on `Option<Ident>`
+/// (saves 3 B per Option vs the default BoundedU16).
 pub type Ident = FixedStr<MAX_IDENT_LEN, IdentTag, crate::bounded::BoundedU8<MAX_IDENT_LEN>>;
 
 /// A PostgreSQL database name (63-byte cap, non-empty, no NUL).
@@ -492,65 +482,57 @@ pub type StmtName =
 /// A PG portal name (bound statement instance). Capacity and
 /// validation match [`StmtName`], but distinct compile-time type —
 /// a function expecting `StmtName` rejects `PortalName` at type-check.
-///
-/// Round-4 finding #2 — Phase 1c typed newtype.
 pub type PortalName =
     FixedStr<MAX_PG_NAME_LEN, PortalNameTag, crate::bounded::BoundedU8<MAX_PG_NAME_LEN>>;
 
-// ─── DEF-203 ext: Option<T> niche size pins ─────────────────────────
+// ─── Option<T> niche size pins ───────────────────────────────────
 //
-// Migrating `len: u16` → `len: BoundedU8<63>` (or `BoundedU16<N>`)
-// shrinks the type AND lets `Option<T>` absorb the discriminant via
-// the underlying `NonZero` niche. These const-asserts pin the win
-// exactly so a future regression that loses the niche fails the build.
+// `len: BoundedU8<63>` (or `BoundedU16<N>`) shrinks the type AND
+// lets `Option<T>` absorb the discriminant via the underlying
+// `NonZero` niche. These const-asserts pin the win exactly so a
+// future regression that loses the niche fails the build.
 //
-// Pre-DEF-203-ext layout for `FixedStr<63, _>` (all small-N validated
-// types): `buf: [u8; 63] (63 B) + pad (1 B) + len: u16 (2 B) +
-// was_lossy_flag: u8 (1 B) + tag (0 B) = 67 B aligned to 2 = 68 B`.
-// `Option<Self> = 68 + 1 disc + 1 pad = 70 B`.
-//
-// Post-DEF-203-ext: `buf (63 B) + len: BoundedU8<63> (1 B) +
-// was_lossy_flag (1 B) = 65 B aligned to 1 = 65 B`. `Option<Self> =
-// 65 B (NonZeroU8 niche absorbs the discriminant).` **Saving: 5 B
-// per type, 5 B per Option per site.**
+// Layout for `FixedStr<63, _>` (all small-N validated types):
+// `buf (63 B) + len: BoundedU8<63> (1 B) + was_lossy_flag (1 B) =
+// 65 B aligned to 1 = 65 B`. `Option<Self> = 65 B (NonZeroU8 niche
+// absorbs the discriminant).` A naive `len: u16` shape would be 68 B
+// (3 B larger) with `Option<Self>` at 70 B (5 B larger).
 
 const _: () = assert!(
     core::mem::size_of::<Ident>() == 65,
-    "Ident must be 65 B post-DEF-203 ext (was 68 B with u16 len). \
-     If this trips, BoundedU8 niche may have been lost.",
+    "Ident must be 65 B. If this trips, BoundedU8 niche may have been lost.",
 );
 const _: () = assert!(
     core::mem::size_of::<Option<Ident>>() == 65,
-    "Option<Ident> must be 65 B post-DEF-203 ext (NonZeroU8 niche). \
-     Pre-DEF-203-ext was 70 B. Saving: 5 B per Option<Ident>.",
+    "Option<Ident> must be 65 B (NonZeroU8 niche absorbs the discriminant).",
 );
 const _: () = assert!(
     core::mem::size_of::<DatabaseName>() == 65,
-    "DatabaseName must be 65 B post-DEF-203 ext (BoundedU8<63> len)",
+    "DatabaseName must be 65 B (BoundedU8<63> len)",
 );
 const _: () = assert!(
     core::mem::size_of::<Option<DatabaseName>>() == 65,
-    "Option<DatabaseName> must be 65 B post-DEF-203 ext (niche)",
+    "Option<DatabaseName> must be 65 B (niche)",
 );
 const _: () = assert!(
     core::mem::size_of::<ApplicationName>() == 130,
-    "ApplicationName must be 130 B post-DEF-203 ext (= 128 buf + 1 BoundedU8<128> len + 1 was_lossy)",
+    "ApplicationName must be 130 B (= 128 buf + 1 BoundedU8<128> len + 1 was_lossy)",
 );
 const _: () = assert!(
     core::mem::size_of::<Option<ApplicationName>>() == 130,
-    "Option<ApplicationName> must be 130 B post-DEF-203 ext (niche)",
+    "Option<ApplicationName> must be 130 B (niche)",
 );
 const _: () = assert!(
     core::mem::size_of::<StmtName>() == 65,
-    "StmtName must be 65 B post-DEF-203 ext (BoundedU8<63> len)",
+    "StmtName must be 65 B (BoundedU8<63> len)",
 );
 const _: () = assert!(
     core::mem::size_of::<PortalName>() == 65,
-    "PortalName must be 65 B post-DEF-203 ext (BoundedU8<63> len)",
+    "PortalName must be 65 B (BoundedU8<63> len)",
 );
 
 // ═════════════════════════════════════════════════════════════════
-// DEF-205 (2026-04-27): SecretBoundedStr — sensitive bounded string.
+// SecretBoundedStr — sensitive bounded string.
 //
 // Closes the staleness leak class for `Option<T> = None` and
 // `*self = Self::new()` patterns where `T` contains potentially
@@ -584,8 +566,8 @@ const _: () = assert!(
 /// **non-Copy** with a `Drop` impl that scrubs the buffer. By Rust
 /// language semantics, every overwrite (`field = new`, `*self = X`,
 /// `option.replace(new)`) fires `Drop` on the previous value before
-/// the new one is moved in — closing the staleness leak class
-/// described in DEF-205.
+/// the new one is moved in — closing the staleness leak class for
+/// long-lived state holding server-supplied bytes.
 ///
 /// # Tier-1 by Drop chain
 ///
@@ -608,8 +590,7 @@ const _: () = assert!(
 /// `Debug` prints `SecretBoundedStr<N>(<REDACTED, len=K>)` —
 /// content is hidden to defend against accidental log-leak when
 /// a containing struct is debug-printed (e.g., `eprintln!("{params:?}",
-/// params)`). Same precedent as [`crate::sensitive::Sensitive<T>`]
-/// (DEF-185 P1-C).
+/// params)`). Same precedent as [`crate::sensitive::Sensitive<T>`].
 #[repr(transparent)]
 pub struct SecretBoundedStr<const N: usize> {
     inner: BoundedStr<N>,
@@ -733,9 +714,9 @@ impl<const N: usize> zeroize::Zeroize for SecretBoundedStr<N> {
 }
 
 impl<const N: usize> Drop for SecretBoundedStr<N> {
-    /// DEF-205 tier-1 closure: scrub the buffer when the value is
-    /// dropped. By Rust language semantics this fires on every
-    /// overwrite (`field = new`, `*self = X`, `option.replace(new)`,
+    /// Tier-1 closure: scrub the buffer when the value is dropped.
+    /// By Rust language semantics this fires on every overwrite
+    /// (`field = new`, `*self = X`, `option.replace(new)`,
     /// `mem::take`, `mem::replace`) before the new value is moved in
     /// — the previous bytes can never silently persist past the
     /// assignment.
@@ -774,10 +755,10 @@ const _: fn() = || {
 // Tier-3 audit #46 (2026-05-19): `LossyText<'a>` typed boundary
 //
 // Wraps wire bytes that *may* require ASCII coercion at storage
-// time. Pre-audit, sites in `dispatch.rs::parse_error_response`
-// called `SecretBoundedStr::from_bytes_lossy(value_bytes)` directly:
-// the lossy contract was hidden in the function name, and the raw
-// pre-coercion bytes were unavailable to forensic callers.
+// time. A naive call like
+// `SecretBoundedStr::from_bytes_lossy(value_bytes)` hides the lossy
+// contract inside the function name and discards the raw pre-coercion
+// bytes — forensic callers cannot recover them.
 //
 // `LossyText<'a>` re-shapes the boundary:
 //   - construction is zero-cost (`#[repr(transparent)]` around the
@@ -791,11 +772,11 @@ const _: fn() = || {
 //     the bounded ASCII storage form (the coercion happens here,
 //     not at LossyText construction).
 //
-// Note: the audit's `as_str(&self) -> &str` shape is deliberately
-// *not* provided — it would require either pre-coercion (alloc on
-// every construction) or a degraded silent-empty fallback. Use
-// `display()` for zero-alloc rendering or `to_bounded::<N>()` for
-// owned storage instead. See LossyDisplay below.
+// Note: an `as_str(&self) -> &str` shape is deliberately *not*
+// provided — it would require either pre-coercion (alloc on every
+// construction) or a degraded silent-empty fallback. Use `display()`
+// for zero-alloc rendering or `to_bounded::<N>()` for owned storage.
+// See LossyDisplay below.
 // ═════════════════════════════════════════════════════════════════
 
 /// Typed wrapper around wire bytes that may need ASCII coercion at
@@ -932,7 +913,7 @@ const _: () = {
 };
 
 // ═════════════════════════════════════════════════════════════════
-// 1c-3c F12 (pass-#7 audit): sealed `DescribeName` trait
+// Sealed `DescribeName` trait.
 //
 // Narrows the `build_describe_message` builder's `name` parameter
 // from a raw `&[u8]` (tier-3 "caller promises to pass StmtName or
@@ -940,7 +921,7 @@ const _: () = {
 // "builder accepts only these two types, sealed against downstream
 // impls"). Catches the bug class where a refactor accidentally
 // passes a raw `&[u8]` containing an embedded NUL — the type system
-// now rejects it at compile time.
+// rejects it at compile time.
 //
 // The trait is sealed against downstream implementation via the
 // private `sealed::Sealed` supertrait — external crates cannot add
@@ -1012,10 +993,10 @@ impl DescribeName for PortalName {
 ///
 /// Identical to `FixedStr` minus the phantom tag: `{ buf: [u8; N],
 /// len: u16 }`. `Copy`, `Clone`, `PartialEq`, `Eq`, no `Drop`,
-/// `Default`. Replaces `heapless::Vec<u8, N>` in state fields where
-/// the blanket `Vec::drop` impl (empty body for `u8`, but
-/// `needs_drop = true`) propagated up into [`crate::state::ProtoState`]
-/// — DEF-099.
+/// `Default`. Used in state fields instead of `heapless::Vec<u8, N>`
+/// to avoid propagating the blanket `Vec::drop` (empty body for
+/// `u8`, but `needs_drop = true`) up into
+/// [`crate::state::ProtoState`].
 // Clone/Copy/PartialEq/Eq are impl'd manually for the LenT-generic
 // form below — derives don't mix well with generic-over-LenT bounds
 // when the trait bound itself constrains the field type.
@@ -1025,10 +1006,10 @@ where
     LenT: crate::bounded::BoundedLen<N>,
 {
     buf: [u8; N],
-    /// DEF-203 ext: typed length-storage (parallel to FixedStr's
-    /// LenT migration). Default `BoundedU16<N>` covers any N up to
-    /// 65_534. **Tier-2 by-construct** — out-of-range len cannot
-    /// exist via `BoundedLen::try_new_usize`.
+    /// Typed length-storage (parallel to FixedStr's LenT parameter).
+    /// Default `BoundedU16<N>` covers any N up to 65_534. **Tier-2
+    /// by-construct** — out-of-range len cannot exist via
+    /// `BoundedLen::try_new_usize`.
     len: LenT,
 }
 
@@ -1041,7 +1022,6 @@ pub struct PodBytesOverflow {
     pub max: usize,
 }
 
-// DEF-244 modernisation audit (rust-version 1.81): additive
 // `core::error::Error` impl on the PodBytes overflow sentinel.
 impl core::error::Error for PodBytesOverflow {}
 
@@ -1055,7 +1035,7 @@ impl fmt::Display for PodBytesOverflow {
     }
 }
 
-// ─── Concrete `const fn new` for default LenT (DEF-203 ext) ─────────
+// ─── Concrete `const fn new` for default LenT ───────────────────
 
 impl<const N: usize> PodBytes<N, crate::bounded::BoundedU16<N>> {
     /// Empty value. Compile-asserts `N ≤ 65_534` (BoundedU16 niche).
@@ -1086,8 +1066,8 @@ impl<const N: usize, LenT: crate::bounded::BoundedLen<N>> PodBytes<N, LenT> {
                 max: N,
             });
         }
-        // DEF-203 ext: tier-2 by-construct via BoundedLen::try_new_usize.
-        // Earlier `src.len() > N` guard makes this Err branch dead.
+        // Tier-2 by-construct via BoundedLen::try_new_usize. The
+        // `src.len() > N` guard above makes this Err branch dead.
         let len = LenT::try_new_usize(src.len()).ok_or(PodBytesOverflow {
             len: src.len(),
             max: N,
@@ -1162,7 +1142,7 @@ impl<const N: usize, LenT: crate::bounded::BoundedLen<N>> Eq for PodBytes<N, Len
 
 /// Errors from validated-tag [`FixedStr`] construction.
 ///
-/// # `#[non_exhaustive]` (DEF-256, audit 2026-05-08)
+/// # `#[non_exhaustive]`
 ///
 /// New rejection classes may land as additional [`FixedStr`] tags
 /// introduce new validation rules (e.g. UTF-8 normalisation
@@ -1188,7 +1168,6 @@ pub enum IdentError {
     },
 }
 
-// DEF-244 modernisation audit (rust-version 1.81): additive
 // `core::error::Error` impl on the public ident-validation error.
 impl core::error::Error for IdentError {}
 
@@ -1206,7 +1185,7 @@ impl fmt::Display for IdentError {
 
 // ───────────────────────── Shared impl block ──────────────────────────
 
-// ─── Concrete `const fn new` for default LenT (DEF-203 ext) ─────────
+// ─── Concrete `const fn new` for default LenT ───────────────────
 //
 // Generic `Self::new` would need `LenT::ZERO` (trait associated const)
 // in const context, which requires `const_trait_impl` (unstable).
@@ -1235,7 +1214,7 @@ impl<const N: usize, Tag> FixedStr<N, Tag, crate::bounded::BoundedU16<N>> {
     }
 }
 
-// ─── Generic methods over LenT (DEF-203 ext) ─────────────────────────
+// ─── Generic methods over LenT ──────────────────────────────────
 
 impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> FixedStr<N, Tag, LenT> {
     /// Populated byte length.
@@ -1276,19 +1255,19 @@ impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> FixedStr<N, Tag, 
     ///
     /// # Tier-4 Cluster D #54 (2026-05-19)
     ///
-    /// Pre-audit the body was
-    /// `self.buf.get(..self.len()).unwrap_or(&[])` — same effective
-    /// shape, but the `unwrap_or` form is the audit's "dead-fallback"
-    /// pattern flag. Migrated to `split_at_checked` + match — single
-    /// pattern across [`FixedStr::as_bytes`] and [`PodBytes::as_slice`]
-    /// (mirror site at line 1120). asm-diff: 0 codegen delta.
+    /// A naive `self.buf.get(..self.len()).unwrap_or(&[])` shape has
+    /// the same effective semantics, but the `unwrap_or` form is the
+    /// audit's "dead-fallback" pattern flag. The `split_at_checked +
+    /// match` form is a single pattern across
+    /// [`FixedStr::as_bytes`] and [`PodBytes::as_slice`] (mirror
+    /// site below). asm-diff: 0 codegen delta.
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        // F-061 (pass-#8): debug-builds assert the invariant
-        // `self.len ≤ N` so a constructor that violates the cap
-        // fails tests loudly instead of the dead `None` arm masking
-        // it to an empty slice.
+        // Debug-builds assert the invariant `self.len ≤ N` so a
+        // constructor that violates the cap fails tests loudly
+        // instead of the dead `None` arm masking it to an empty
+        // slice.
         debug_assert!(
             self.len() <= N,
             "FixedStr invariant: len ({}) must not exceed N ({N})",
@@ -1315,7 +1294,7 @@ impl<const N: usize, Tag: ValidUtf8, LenT: crate::bounded::BoundedLen<N>> FixedS
     /// runs an O(N) validation pass anyway because the crate's
     /// `#![forbid(unsafe_code)]` rules out `from_utf8_unchecked`.
     ///
-    /// # `unwrap_or("")` classification (DEF-184 audit-2 item-2)
+    /// # `unwrap_or("")` classification
     ///
     /// The `.unwrap_or("")` fallback is NOT a tier-4 silent
     /// fallback — the logical error (non-UTF-8 bytes) is rejected
@@ -1356,9 +1335,9 @@ impl<const N: usize, Tag: ValidUtf8, LenT: crate::bounded::BoundedLen<N>> FixedS
     #[must_use]
     pub fn as_str(&self) -> &str {
         let bytes = self.as_bytes();
-        // F-062 (pass-#8): debug-builds assert the `ValidUtf8` tag
-        // invariant — stored bytes must actually decode as UTF-8.
-        // The dead `unwrap_or("")` branch below would mask a future
+        // Debug-builds assert the `ValidUtf8` tag invariant —
+        // stored bytes must actually decode as UTF-8. The dead
+        // `unwrap_or("")` branch below would mask a future
         // constructor that forgot to enforce UTF-8; this shield
         // fails tests loudly instead.
         debug_assert!(
@@ -1384,8 +1363,8 @@ impl<const N: usize, Tag: ValidUtf8, LenT: crate::bounded::BoundedLen<N>> FixedS
 impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> Default for FixedStr<N, Tag, LenT> {
     #[inline]
     fn default() -> Self {
-        // DEF-203 ext: generic Default uses LenT::default() (non-const,
-        // trait method). Construct directly without calling Self::new
+        // Generic Default uses LenT::default() (non-const, trait
+        // method). Construct directly without calling Self::new
         // (which is per-concrete-LenT const fn).
         Self {
             buf: [0u8; N],
@@ -1396,10 +1375,10 @@ impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> Default for Fixed
     }
 }
 
-// F3: Debug + Display are gated on `ValidUtf8` — both render via
-// `as_str()` which requires UTF-8 validity. This is in practice
-// unchanged from pre-F3 (every current tag is ValidUtf8), but
-// future non-UTF-8 tags would need separate byte-based impls.
+// Debug + Display are gated on `ValidUtf8` — both render via
+// `as_str()` which requires UTF-8 validity. Every current tag is
+// `ValidUtf8`; future non-UTF-8 tags would need separate byte-based
+// impls.
 impl<const N: usize, Tag, LenT> fmt::Debug for FixedStr<N, Tag, LenT>
 where
     Tag: FixedStrKind + ValidUtf8,
@@ -1445,10 +1424,10 @@ impl<const N: usize, Tag: Validated, LenT: crate::bounded::BoundedLen<N>> FixedS
         }
         // `bytes.len() <= N <= 65_535` (const-asserted in `new`),
         // so the narrowing below is infallible.
-        // DEF-203 ext: tier-2 by-construct via BoundedLen::try_new_usize.
-        // The earlier `bytes.len() > N` guard rejects oversize inputs, so
-        // this Err arm is architecturally dead; classified to match the
-        // original IdentError::TooLong signature for API stability.
+        // Tier-2 by-construct via BoundedLen::try_new_usize. The
+        // earlier `bytes.len() > N` guard rejects oversize inputs, so
+        // this Err arm is architecturally dead; classified to match
+        // the IdentError::TooLong signature.
         let len = LenT::try_new_usize(bytes.len()).ok_or(IdentError::TooLong {
             len: bytes.len(),
             max: N,
@@ -1467,13 +1446,12 @@ impl<const N: usize, Tag: Validated, LenT: crate::bounded::BoundedLen<N>> FixedS
 impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> FixedStr<N, Tag, LenT> {
     /// UTF-8 ellipsis marker appended on overflow. 3 bytes.
     ///
-    /// # Why `"…"` and not `"~"` or `"..."` (DEF-126 investigation, 2026-04-21)
+    /// # Why `"…"` and not `"~"` or `"..."`
     ///
-    /// A periodic audit suggestion is "replace `…` with ASCII `~`
-    /// to save 2 bytes per truncated buffer and relax the F1
-    /// `N >= 3` bound to `N >= 1`". **Rejected** after frequency +
-    /// convention analysis — recorded here so future audits don't
-    /// re-litigate:
+    /// An audit-time suggestion is "replace `…` with ASCII `~` to
+    /// save 2 bytes per truncated buffer and relax the `N >= 3`
+    /// bound to `N >= 1`". **Rejected** after frequency + convention
+    /// analysis:
     ///
     /// - **Truncation is error-path only.** Happy paths (CommandComplete
     ///   tag, Sql, EncodingName) essentially never truncate. Only
@@ -1489,15 +1467,14 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
     ///   A reader seeing `"error: column \"foo\" does not exist~"`
     ///   would not instantly parse "truncated"; they'd wonder
     ///   what the tilde means.
-    /// - **F1's `N >= 3` bound is defensive, not constraining.**
-    ///   No `BoundedStr<2>` exists in the crate or is planned.
-    ///   Relaxing to `N >= 1` is theoretical tidy-up, not practical.
+    /// - **The `N >= 3` bound is defensive, not constraining.** No
+    ///   `BoundedStr<2>` exists in the crate or is planned. Relaxing
+    ///   to `N >= 1` is theoretical tidy-up, not practical.
     /// - **ASCII `"..."` alternative:** same 3 bytes, universal
     ///   convention, but the crate is fully UTF-8-aware so there's
     ///   no portability reason to pick ASCII over UTF-8.
     ///
-    /// Net: `"…"` is the Pareto-optimal choice. Full analysis
-    /// preserved in `deferred.md` DEF-126.
+    /// Net: `"…"` is the Pareto-optimal choice.
     const OVERFLOW_MARKER: &[u8] = "…".as_bytes();
 
     /// Compile-time floor for `N` on any `Truncating` tag.
@@ -1539,9 +1516,9 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
             if let Some(dst) = out.buf.get_mut(..src.len()) {
                 dst.copy_from_slice(src);
             }
-            // DEF-154 (T) P1-2 + Tier-4 Cluster D #56 (2026-05-19):
-            // narrow usize → LenT (BoundedU8 / BoundedU16) on the
-            // populated-len assignment. Invariants holding here:
+            // Tier-4 Cluster D #56 (2026-05-19): narrow usize → LenT
+            // (BoundedU8 / BoundedU16) on the populated-len
+            // assignment. Invariants holding here:
             //
             //   - `src.len() ≤ N` (gate above checks `src.len() > N`
             //     → returns early with PodBytesOverflow).
@@ -1549,20 +1526,19 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
             //
             // `try_new_usize(src.len())` therefore always returns
             // `Some` — the `None` arm is architecturally unreachable.
-            // `LenT::default()` (== 0) is the dead-arm fallback;
-            // pre-DEF-154 (T) this was `unwrap_or(0)` (silently
-            // empty string on invariant break) — same effective
-            // shape, more explicit attribution today.
+            // `LenT::default()` (== 0) is the dead-arm fallback (the
+            // same effective shape as the prior `unwrap_or(0)`, with
+            // the typed `LenT::try_new_usize` form making the
+            // narrowing explicit).
             //
             // Audit's recommendation (surface overflow as Result<(),
-            // IdentError::TooLong>) is structurally blocked: this
-            // is inside the INFALLIBLE `from_str_truncating`
-            // constructor whose API contract is "always succeed,
-            // truncate with marker on overflow". Returning Result
-            // would be a BREAKING constructor-API change rippling
-            // through every truncating call site (the audit's
-            // estimate is medium; the change touches ~40+ call
-            // sites). DEFER to a post-1.0 constructor-API redesign.
+            // IdentError::TooLong>) is structurally blocked: this is
+            // inside the INFALLIBLE `from_str_truncating` constructor
+            // whose API contract is "always succeed, truncate with
+            // marker on overflow". Returning Result would be a
+            // BREAKING constructor-API change rippling through every
+            // truncating call site (~40+). DEFER to a post-1.0
+            // constructor-API redesign.
             //
             // Structural lift via a `LenT::saturating_new_usize`
             // method that clamps without Option also blocked under
@@ -1589,23 +1565,24 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
         if let Some(dst) = out.buf.get_mut(fit_end..marker_end) {
             dst.copy_from_slice(Self::OVERFLOW_MARKER);
         }
-        // DEF-154 (T) + Tier-4 Cluster D #56 (2026-05-19): narrow
-        // marker_end (usize) → LenT. `marker_end = fit_end +
+        // Tier-4 Cluster D #56 (2026-05-19): narrow marker_end
+        // (usize) → LenT. `marker_end = fit_end +
         // OVERFLOW_MARKER.len()` where `fit_end ≤ budget ≤ N -
         // MARKER_LEN`, so `marker_end ≤ N ≤ u16::MAX` — try_new
         // always Some, default(=0) arm dead. See the centralised
-        // audit-#56 rationale block at line 1542+ for why the
-        // structural lift (Result return) is BREAKING-API blocked.
+        // audit-#56 rationale block above for why the structural
+        // lift (Result return) is BREAKING-API blocked.
         out.len = LenT::try_new_usize(marker_end).unwrap_or_default();
         // Tier-3 audit #48 (2026-05-19): length-overflow truncation
-        // is also a form of information loss — flag it. Pre-audit
-        // `was_lossy` only tripped on byte-coercion (slow path
-        // through `from_bytes_lossy`); truncation in the fast/slow
-        // path through `from_str_truncating` left was_lossy false
-        // despite the visible "…" marker. Programmatic detection of
-        // truncation (e.g. for CommandTag handlers that want to
-        // surface a "tag was longer than buffer" diagnostic) now
-        // works without parsing the buffer for the marker suffix.
+        // is also a form of information loss — flag it. A naive
+        // `was_lossy` that tripped only on byte-coercion (slow path
+        // through `from_bytes_lossy`) would leave was_lossy false
+        // for truncation in the fast/slow path through
+        // `from_str_truncating` despite the visible "…" marker.
+        // Programmatic detection of truncation (e.g. for CommandTag
+        // handlers that want to surface a "tag was longer than
+        // buffer" diagnostic) needs to work without parsing the
+        // buffer for the marker suffix.
         out.was_lossy_flag = 1;
         out
     }
@@ -1625,19 +1602,17 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
     /// PG ErrorResponse field values are encoded in the server's
     /// `client_encoding` setting, which is UTF-8 by default but CAN
     /// be Latin-1 or a legacy encoding on mis-configured servers.
-    /// Pre-F22 code used `core::str::from_utf8(..).unwrap_or("")`,
-    /// which silently collapsed the WHOLE field to empty on any
-    /// invalid byte — destroying forensic diagnostic info. This
-    /// method preserves the ASCII subset (most of every error
-    /// message) and visibly marks the rest.
+    /// A naive `core::str::from_utf8(..).unwrap_or("")` would
+    /// silently collapse the WHOLE field to empty on any invalid
+    /// byte — destroying forensic diagnostic info. This method
+    /// preserves the ASCII subset (most of every error message) and
+    /// visibly marks the rest.
     ///
-    /// # Tier elevation (F22)
+    /// # Tier
     ///
-    /// - Old: silent-empty-on-invalid-UTF-8 (tier-3 audit — nothing
-    ///   in the type system prevented the diagnostic loss).
-    /// - New: byte-by-byte ASCII coercion is a structural
-    ///   always-valid-UTF-8 guarantee. No information is silently
-    ///   dropped; over-length or invalid bytes are visibly marked.
+    /// Byte-by-byte ASCII coercion is a structural
+    /// always-valid-UTF-8 guarantee. No information is silently
+    /// dropped; over-length or invalid bytes are visibly marked.
     #[must_use]
     pub fn from_bytes_lossy(source: &[u8]) -> Self {
         let () = Self::_TRUNCATING_N_MIN;
@@ -1649,12 +1624,11 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
         let mut out = Self::default();
         let budget = N.saturating_sub(Self::OVERFLOW_MARKER.len());
         let mut written = 0usize;
-        // DEF-185 P2-D (audit 2026-04-24): track whether any lossy
-        // coercion actually happened. Entering the slow path means
-        // input had non-UTF-8 bytes SOMEWHERE, but individual byte-
-        // level ASCII-acceptability may preserve much of the content
-        // verbatim. `any_coerced` is true iff at least one byte was
-        // replaced with `b'?'`.
+        // Track whether any lossy coercion actually happened.
+        // Entering the slow path means input had non-UTF-8 bytes
+        // SOMEWHERE, but individual byte-level ASCII-acceptability
+        // may preserve much of the content verbatim. `any_coerced`
+        // is true iff at least one byte was replaced with `b'?'`.
         let mut any_coerced = false;
         for &b in source.iter() {
             if written >= budget {
@@ -1678,21 +1652,21 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
             if let Some(dst) = out.buf.get_mut(written..marker_end) {
                 dst.copy_from_slice(Self::OVERFLOW_MARKER);
             }
-            // DEF-154 (T) + Tier-4 Cluster D #56: marker_end ≤ N
-            // (see audit-#56 rationale block at line 1542+); dead-arm
-            // fallback is LenT::default()==0.
+            // Tier-4 Cluster D #56: marker_end ≤ N (see audit-#56
+            // rationale block above); dead-arm fallback is
+            // LenT::default()==0.
             out.len = LenT::try_new_usize(marker_end).unwrap_or_default();
             // Tier-3 audit #48: length-overflow truncation also
             // counts as lossy. See mirror block in
             // `from_str_truncating`'s slow path.
             out.was_lossy_flag = 1;
         } else {
-            // DEF-154 (T) + Tier-4 Cluster D #56: written ≤ budget ≤ N
-            // (the byte-by-byte loop above breaks when `written >=
+            // Tier-4 Cluster D #56: written ≤ budget ≤ N (the
+            // byte-by-byte loop above breaks when `written >=
             // budget`); dead-arm fallback is LenT::default()==0.
             out.len = LenT::try_new_usize(written).unwrap_or_default();
         }
-        // DEF-185 P2-D: surface the lossy flag.
+        // Surface the lossy flag.
         if any_coerced {
             out.was_lossy_flag = 1;
         }
@@ -1704,11 +1678,11 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
     ///
     /// Two trip conditions, both audit-anchored:
     ///
-    /// - **Byte-coercion** (DEF-185 P2-D): at least one source byte
-    ///   was outside `0x20..=0x7e` plus whitespace and got coerced to
-    ///   `b'?'` during [`Self::from_bytes_lossy`]'s slow path. Lets
+    /// - **Byte-coercion**: at least one source byte was outside
+    ///   `0x20..=0x7e` plus whitespace and got coerced to `b'?'`
+    ///   during [`Self::from_bytes_lossy`]'s slow path. Lets
     ///   operators distinguish legitimate `?` characters in server
-    ///   text from our lossy coercion.
+    ///   text from the lossy coercion.
     /// - **Length-overflow truncation** (Tier-3 audit #48,
     ///   2026-05-19): the source exceeded the buffer's capacity
     ///   minus the 3-byte `OVERFLOW_MARKER` (`"…"`) length, so the
@@ -1731,12 +1705,12 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
         self.was_lossy_flag != 0
     }
 
-    /// DEF-205 (2026-04-27): in-place zeroize hook for the
-    /// `SecretBoundedStr<N>` Drop chain. Crate-private — `FixedStr` itself
-    /// stays POD/Copy for non-sensitive uses (`Ident`, `StmtName`, `Sql`,
-    /// non-secret `BoundedStr` fields). The wrapper-type
-    /// `SecretBoundedStr<N>` calls this from its `Drop` to scrub bytes
-    /// before the inner value is moved/overwritten.
+    /// In-place zeroize hook for the `SecretBoundedStr<N>` Drop
+    /// chain. Crate-private — `FixedStr` itself stays POD/Copy for
+    /// non-sensitive uses (`Ident`, `StmtName`, `Sql`, non-secret
+    /// `BoundedStr` fields). The wrapper-type `SecretBoundedStr<N>`
+    /// calls this from its `Drop` to scrub bytes before the inner
+    /// value is moved/overwritten.
     ///
     /// # Tier-1 enabler
     ///
@@ -1745,7 +1719,7 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
     /// constructors / accessors. With the hook, `SecretBoundedStr<N>`
     /// is a thin wrapper that delegates everything except Drop — the
     /// Drop fires the zeroize chain that closes the staleness leak
-    /// class (see DEF-205 in `deferred.md`).
+    /// class for `SecretBoundedStr<N>`.
     ///
     /// # Why `pub(crate)` and not `pub`
     ///
@@ -1766,20 +1740,16 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
 
 #[cfg(test)]
 mod drop_witness_tests {
-    //! DEF-259 (2026-05-08): tier-1-by-construction Drop-fire witness
-    //! for [`SecretBoundedStr<N>`] via [`crate::drop_witness::DropCounter`].
+    //! Tier-1-by-construction Drop-fire witness for
+    //! [`SecretBoundedStr<N>`] via
+    //! [`crate::drop_witness::DropCounter`].
     //!
-    //! Pre-DEF-259: `SecretBoundedStr<N>` Drop was verified by the
-    //! `#[ignore]`-gated memory-probe test
-    //! `tests/secret_bounded_str_spec.rs`. Run only via
-    //! `cargo test -- --ignored` or `cargo miri test`.
-    //!
-    //! Post-DEF-259: this test runs deterministically on every
-    //! `cargo test` invocation. The `DropCounter<SecretBoundedStr<N>>`
-    //! wrapper observes that the manual `Drop` impl
-    //! (`ident.rs:711`) reaches its body via the counter increment;
-    //! the body calls `self.inner.zeroize_in_place()` which scrubs
-    //! the underlying `BoundedStr<N>::buf` array.
+    //! This test runs deterministically on every `cargo test`
+    //! invocation. The `DropCounter<SecretBoundedStr<N>>` wrapper
+    //! observes that the manual `Drop` impl reaches its body via the
+    //! counter increment; the body calls
+    //! `self.inner.zeroize_in_place()` which scrubs the underlying
+    //! `BoundedStr<N>::buf` array.
 
     use super::SecretBoundedStr;
     use crate::drop_witness::{DropCounter, DropProbe};
