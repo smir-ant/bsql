@@ -2,9 +2,8 @@
 //!
 //! The dispatcher is the **single** place the protocol decides what to
 //! do with a freshly-parsed frame given the current state. The match is
-//! exhaustive over `(state, tag)` pairs the Phase 1b flows can encounter;
-//! adding a new state or tag is a build error until it is wired into
-//! the matcher.
+//! exhaustive over `(state, tag)` pairs; adding a new state or tag is a
+//! build error until it is wired into the matcher.
 //!
 //! # Payload contract — tier-1 via slice patterns
 //!
@@ -15,23 +14,23 @@
 //! pattern (`[b0]`, `[b0, b1, ..]`, etc.) so the compiler enforces the
 //! length / presence check.
 //!
-//! # DEF-184 A7 (2026-04-24) — tag LUT path rejected, DO NOT retry
+//! # Tag-LUT path rejected — DO NOT retry without new measurement
 //!
 //! A tempting refactor is to replace `match (prev, tag: InboundTag)`
 //! with a compact `InboundTagClass` enum (17 dense variants + classify
 //! step) under the hypothesis "dense-discriminant jump table beats
-//! sparse-ASCII-byte switch". **This was implemented, measured, and
-//! rejected** — commit `1a762ca` (reverted).
+//! sparse-ASCII-byte switch". This was implemented, measured, and
+//! rejected (commit `1a762ca`, reverted).
 //!
-//! Measured result (criterion against `def184-complete` baseline,
-//! aarch64-apple-darwin): all 4 hot-path benches regressed
-//! (+2.6% to +8.2%, p<0.05). Modern LLVM already lowers the byte
-//! switch into a compact cmp-and-branch chain that CSEs across arms;
-//! the extra classify() call + `InboundTagClass::Unknown` catch-all
-//! branch add indirection LLVM cannot fold out. Hypothesis falsified.
+//! Measured result (criterion baseline, aarch64-apple-darwin): all 4
+//! hot-path benches regressed (+2.6% to +8.2%, p<0.05). Modern LLVM
+//! already lowers the byte switch into a compact cmp-and-branch chain
+//! that CSEs across arms; the extra classify() call +
+//! `InboundTagClass::Unknown` catch-all branch add indirection LLVM
+//! cannot fold out. Hypothesis falsified.
 //!
-//! If you are tempted to reopen A7: first produce a NEW criterion
-//! measurement refuting the 2026-04-24 result (different machine,
+//! If you are tempted to re-open this: first produce a NEW criterion
+//! measurement refuting the rejection result (different machine,
 //! different LLVM, or architectural change in the dispatch loop).
 //! See `reforge.md §4.12` (measurement-gated perf) and
 //! `deferred.md §B` (measurement-rejected items) before touching.
@@ -42,40 +41,32 @@ use crate::reply_id::ReplyId;
 use crate::state::ProtoState;
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-272 cluster α (2026-05-10) — schema-side concrete-token leaf
+// Schema-side concrete-token leaf
 //
-// Pre-DEF-272-α (HISTORICAL — closed by cluster α, see "Post-DEF-272-α"
-// block below; Tier-3 audit #29, 2026-05-19, verified): the
-// `AtRowDescriptionDispatch` tag impl'd `SchemaWriteAuth` (sealed-trait
-// pattern). Tier-1 EXTERNAL but tier-2 by-discipline WITHIN-CRATE: any
-// in-crate file could `impl Sealed + SchemaWriteAuth for HostileTag`
-// and bypass.
-//
-// Post-DEF-272-α the leaf hosts a CONCRETE `TDispatchToken` type with a
-// private tuple-struct field; the literal `Self(())` mint is callable
-// ONLY inside this submodule. The cell's
+// Tier-3 audit #29 (2026-05-19, verified): the leaf hosts a CONCRETE
+// `TDispatchToken` type with a private tuple-struct field; the literal
+// `Self(())` mint is callable ONLY inside this submodule. The cell's
 // `park_at_t_dispatch` method takes `TDispatchToken` by value — there
 // is no trait to `impl` for hostile types, no sealed-supertrait to
 // route around. Three call sites (simple-query, describe-statement,
 // describe-portal 'T' arms) all invoke the leaf helper.
 //
-// See `mod protocol` (DEF-272 cluster α block) for the parallel
-// schema-slot leaves; cluster β migrates the session_params leaves.
+// A naive `impl SchemaWriteAuth for AtRowDescriptionDispatch`
+// sealed-trait shape would be tier-1 EXTERNAL but tier-2 by-discipline
+// WITHIN-CRATE: any in-crate file could `impl Sealed + SchemaWriteAuth
+// for HostileTag` and bypass.
+//
+// See `mod protocol` for the parallel schema-slot leaves and the
+// session_params leaves.
 // ═════════════════════════════════════════════════════════════════════
 
-/// DEF-272 cluster α leaf submodule for the inbound `'T'`
-/// (RowDescription) frame dispatch. Hosts the [`TDispatchToken`] type
-/// and the single park helper fn.
-// DEF-244 modernisation audit (rust-version 1.81 sweep): the
-// historical `#[allow(missing_docs, reason = "leaf helper")]`
-// here was DEAD — `missing_docs` only fires on `pub` items in
-// `#![deny(missing_docs)]` crates; this submodule and its items
-// are `pub(crate)`-only, so the lint doesn't trigger. Attribute
-// deleted rather than migrated to `#[expect]`.
+/// Leaf submodule for the inbound `'T'` (RowDescription) frame
+/// dispatch. Hosts the [`TDispatchToken`] type and the single park
+/// helper fn.
 pub(crate) mod _row_description_dispatch_leaf {
-    /// DEF-272 cluster α leaf-scope token. The tuple-struct field is
-    /// PRIVATE to this submodule — `Self(())` mints are callable ONLY
-    /// here. The type itself is `pub(crate)` so
+    /// Leaf-scope token. The tuple-struct field is PRIVATE to this
+    /// submodule — `Self(())` mints are callable ONLY here. The type
+    /// itself is `pub(crate)` so
     /// [`crate::schema_slot::RowDescSlotCell::park_at_t_dispatch`] can
     /// name it in its parameter signature.
     pub(crate) struct TDispatchToken(());
@@ -98,40 +89,38 @@ use crate::wire::{
     TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_NO_DATA, TAG_PARAMETER_DESCRIPTION, TAG_PARSE_COMPLETE,
     TAG_PORTAL_SUSPENDED, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
-// DEF-154 (B) Phase B4: `WriteBuf` import no longer needed here —
-// dispatch takes `&mut BrandedWriteReserved<'_>` post-migration.
 
 /// What to do after dispatching a single frame.
 ///
 /// Three variants to keep the "emit zero actions" and "emit one
-/// action" cases structurally distinct (audit round 2 A4).
+/// action" cases structurally distinct.
 ///
-/// # DEF-184 (B21/C6) — by-ref state, no `new_state` payload
+/// # By-ref state, no `new_state` payload
 ///
-/// Pre-(B21/C6) the Advanced variants carried `new_state: ProtoState`
-/// (712 B each). Every successful dispatch produced a by-value
-/// DispatchOutcome of ~800 B that the caller moved into its `match`
-/// arm then wrote back into `*state`. LLVM does NOT optimise the
-/// round-trip because `ProtoState` contains an opaque password
-/// buffer (non-trivial move semantics).
-///
-/// Post-(B21/C6) dispatch takes `state: &mut ProtoState` and writes
-/// the transition directly. DispatchOutcome shrinks to the
-/// **side-effect** signal only:
+/// Dispatch takes `state: &mut ProtoState` and writes the transition
+/// directly. `DispatchOutcome` carries the **side-effect** signal
+/// only:
 /// - `AdvancedSilent` — no payload (~1 B discriminant).
 /// - `AdvancedWithAction { action }` — 88 B `StagedAction`.
 /// - `Errored { reply_id, cause }` — 80 B classified failure.
 ///
-/// Size: 88 B exact (vs ~800 B). Pin in lib.rs.
+/// Size: 88 B exact (pin in lib.rs).
 ///
-/// # Real-world win sizing (honest scope — architect audit 2026-04-24)
+/// A naive `new_state: ProtoState` payload (712 B each) inside the
+/// Advanced variants would produce a by-value `DispatchOutcome` of
+/// ~800 B that the caller would move into its `match` arm then
+/// write back into `*state`. LLVM does NOT optimise that round-trip
+/// because `ProtoState` contains an opaque password buffer
+/// (non-trivial move semantics).
+///
+/// # Real-world win sizing
 ///
 /// `dispatch()` runs **per frame**, not per row — and `DataRow`
 /// bypasses `dispatch()` entirely via the
 /// `row_stream::fast_path_data_row` fast-path. Typical query
 /// routes through dispatch ~3-6 times (Parse/Bind complete,
-/// RowDescription, CommandComplete, RFQ). So the true saving is
-/// ~712 B × 3-6 per query, not 712 MB per million rows.
+/// RowDescription, CommandComplete, RFQ). So the saving is ~712 B
+/// × 3-6 per query, not 712 MB per million rows.
 ///
 /// The material benefit is **async future frame reduction**: every
 /// `feed_bytes` suspension point in a downstream async wrapper
@@ -139,16 +128,14 @@ use crate::wire::{
 /// `async fn` state-machine nesting. That is the real per-QPS
 /// win — smaller suspended futures, better L1 residency on
 /// poll reawakening.
-// DEF-184 (A1+A13): DispatchOutcome's Errored.cause ProtocolError
-// shrunk 312 → ~72 B via ErrorArena externalisation.
 //
-// DEF-160 (Z2): `StagedAction<'static>` — the dispatch path
-// (server→client frames) produces no `SendBytesBorrowed` actions;
-// only push paths (Parse / SimpleQuery in commit 2) borrow SQL bytes
-// from the caller. Hard-pinning to `'static` here keeps the dispatch
-// fn signatures lifetime-free. If a future server-driven path needs
-// to borrow (e.g., streaming COPY data references), promote this
-// to `<'sql>` then.
+// `StagedAction<'static>` — the dispatch path (server→client
+// frames) produces no `SendBytesBorrowed` actions; only push paths
+// (Parse / SimpleQuery) borrow SQL bytes from the caller.
+// Hard-pinning to `'static` here keeps the dispatch fn signatures
+// lifetime-free. If a future server-driven path needs to borrow
+// (e.g., streaming COPY data references), promote this to `<'sql>`
+// then.
 #[derive(Debug)]
 pub(crate) enum DispatchOutcome {
     /// Frame consumed; transition already written to caller's
@@ -159,16 +146,10 @@ pub(crate) enum DispatchOutcome {
     /// Frame consumed; transition already written to caller's
     /// state slot. One staged action emitted.
     ///
-    /// DEF-094: `StagedAction` is range-based — the entry-point
-    /// materialises into a ref-bound `Action<'buf>` after the write
-    /// phase releases.
-    ///
-    /// DEF-154 (Y): `'r` deleted post-StreamRowRange removal —
-    /// `StagedAction` no longer carries read-buf references (the
-    /// only lifetime'd field was `StreamRowRange::row_bytes`).
-    ///
-    /// DEF-160 (Z2): `StagedAction<'static>` — dispatch path never
-    /// produces `SendBytesBorrowed`.
+    /// `StagedAction` is range-based — the entry-point materialises
+    /// into a ref-bound `Action<'buf>` after the write phase
+    /// releases. `StagedAction<'static>` here because the dispatch
+    /// path never produces `SendBytesBorrowed`.
     AdvancedWithAction {
         /// The single side-effect to push.
         action: StagedAction<'static>,
@@ -178,40 +159,39 @@ pub(crate) enum DispatchOutcome {
     /// the dispatch helper [`install_errored`] (the caller observes
     /// the terminal state without needing a second write).
     ///
-    /// # Pre-consumed reply_id (DEF-112)
+    /// # Pre-consumed reply_id
     ///
     /// `reply_id` is `Option<NonZeroU64>` (already-consumed raw
-    /// value), not `Option<ReplyId<K>>`. Rationale: dispatchers
-    /// are parameterised per-command-kind after DEF-112, and the
-    /// Errored path is kind-agnostic (the downstream action is a
+    /// value), not `Option<ReplyId<K>>`. Dispatchers are
+    /// parameterised per-command-kind; the Errored path is kind-
+    /// agnostic (the downstream action is a
     /// `FailReply { id: NonZeroU64, cause }` that carries no
     /// payload). Pre-consuming at each dispatcher's Errored
-    /// construction site keeps the DispatchOutcome kind-free and
-    /// avoids forcing DispatchOutcome to be generic over K.
+    /// construction site keeps the `DispatchOutcome` kind-free and
+    /// avoids forcing it to be generic over K.
     Errored {
         reply_id: Option<core::num::NonZeroU64>,
         cause: ProtocolError,
     },
 }
 
-/// DEF-103 + DEF-184 (B21/C6): `#[cold] #[inline]` helper centralising
-/// every `DispatchOutcome::Errored` construction **plus** the
+/// `#[cold] #[inline]` helper centralising every
+/// `DispatchOutcome::Errored` construction **plus** the
 /// `*state = ProtoState::Errored(...)` install.
 ///
-/// Pre-(B21/C6) this was `errored(reply_id, cause) -> DispatchOutcome`
-/// and the caller wrote `*state = ProtoState::Errored(kind)` in the
-/// outer match arm on the Errored variant. Post-(B21/C6) state is
-/// a `&mut` parameter to `dispatch()`; installing the terminal state
-/// inside the helper keeps the seam tight (no arm can forget to set
-/// Errored while returning `DispatchOutcome::Errored`).
+/// A naive shape where the helper only returns `DispatchOutcome`
+/// and the caller writes `*state = ProtoState::Errored(kind)` in
+/// the outer match arm would leave the seam open: an arm could
+/// forget to set Errored while returning `DispatchOutcome::Errored`.
+/// Installing the terminal state inside the helper keeps the seam
+/// tight.
 ///
 /// The `#[cold]` marker tells LLVM to push the Errored-path basic
 /// block out of the hot-path I-cache footprint; `#[inline]` keeps
 /// the call-site free of an actual function call (the helper body
 /// folds into the caller).
 ///
-/// `reply_id` is `Option<NonZeroU64>` (already-consumed raw
-/// value) per DEF-112's pre-consume convention.
+/// `reply_id` is `Option<NonZeroU64>` (already-consumed raw value).
 #[cold]
 #[inline]
 fn install_errored(
@@ -254,16 +234,16 @@ fn validate_empty_body(
     }
 }
 
-/// DEF-279 Phase 1c Bundle Commit 5 — per-phase mirror of
-/// [`install_errored`] for [`crate::state::ConnectingState`].
+/// Per-phase mirror of [`install_errored`] for
+/// [`crate::state::ConnectingState`].
 ///
 /// Used by [`connecting_dispatch`] (and future per-phase dispatch
 /// helpers) when a Connecting arm needs to mark the state Errored.
 /// Returns the same [`DispatchOutcome::Errored`] shape — the state-
 /// agnostic `reply_id` + `cause` carry to the caller.
 ///
-/// **`#[allow(dead_code)]`** until Commit 6+ wires `connecting_dispatch`
-/// into the per-phase Inner method bodies.
+/// `#[allow(dead_code)]` until the per-phase Inner method bodies
+/// wire it in.
 #[allow(dead_code)]
 fn install_errored_connecting(
     state: &mut crate::state::ConnectingState,
@@ -274,8 +254,8 @@ fn install_errored_connecting(
     DispatchOutcome::Errored { reply_id, cause }
 }
 
-/// DEF-279 Phase 1c Bundle Commit 5 — per-phase dispatch entry for
-/// `<ConnectingPhase>`'s `ConnectingInner`.
+/// Per-phase dispatch entry for `<ConnectingPhase>`'s
+/// `ConnectingInner`.
 ///
 /// **Lift+lower approach**: rather than duplicating ~310 LoC of
 /// Connecting dispatch arms, this thin wrapper lifts the per-phase
@@ -376,24 +356,20 @@ pub(crate) fn connecting_dispatch(
     outcome
 }
 
-// DEF-177 + DEF-184 (B21/C6) `install_internal_bug` DELETED 2026-04-25
-// (DEF-188 cascade): the helper's only callers were the three
-// `SchemaArenaAllocFull` arms in dispatch (one per RowDescription
-// destination) plus a row-range-construction site that no longer
-// exists. With DEF-188's arena deletion, no dispatch arm currently
-// classifies into `InternalCrateBug`. The helper became dead code
-// — re-introduce inline if a future arm needs the same shape.
+// No `install_internal_bug` helper currently exists. Re-introduce
+// inline if a future arm needs the `install_errored`-shaped helper
+// for an `InternalCrateBug` cause.
 
 /// Dispatch a single frame.
 ///
-/// `write_buf` is the caller-owned outbound staging buffer (DEF-094);
+/// `write_buf` is the caller-owned outbound staging buffer;
 /// dispatchers that produce [`StagedAction::SendBytesRange`] write
 /// into it and record the range. The caller (feed_bytes) is
 /// responsible for clearing `write_buf` at the start of each
 /// entry-point call and materialising the ranges into `&'buf [u8]`
 /// slices after the write-phase mutable borrow completes.
 ///
-/// # DEF-188 — `terminal_row_desc: &mut Option<RowDesc>`
+/// # `terminal_row_desc: &mut Option<RowDesc>`
 ///
 /// The terminal-RowDesc slot on `PgProtocol` is threaded mutably.
 /// Z arms (terminal `ReadyForQuery` transitions to `Idle`) park
@@ -404,37 +380,33 @@ pub(crate) fn connecting_dispatch(
 /// (state moves to `Idle`, but the slot persists until the next
 /// entry-point's clear).
 ///
-/// Pre-DEF-188 the equivalent slot was a 2-slot `SchemaArena` with
-/// generation tracking; the dispatch path took
-/// `arena: &mut ArenaWriter<'_>`. Deleting the arena removes the
-/// `StaleSchemaRef` class entirely (no handle, no generation
-/// drift) and shrinks the per-row hot-path by removing the dual
+/// A naive 2-slot `SchemaArena` with generation tracking would
+/// thread `arena: &mut ArenaWriter<'_>` through dispatch and
+/// require a `StaleSchemaRef` classified-error path (handle +
+/// generation drift). The slot shape eliminates that class
+/// entirely and shrinks the per-row hot-path by removing the dual
 /// arena lookup.
 ///
-/// # DEF-184 (B21/C6) — state by `&mut`
+/// # State by `&mut`
 ///
-/// Pre-(B21/C6) dispatch took `prev: ProtoState` by value (712 B
-/// memcpy per call) and returned `DispatchOutcome::Advanced* {
-/// new_state: ProtoState, ... }` (another 712 B on the stack
-/// return). Caller wrote the transition via
-/// `*caller_state = outcome.new_state`. That's two 712 B memcpies
-/// per dispatch iteration — on 1M-row SELECT workloads, ~1.4 GB
-/// stack traffic purely for state round-tripping.
-///
-/// Post-(B21/C6) dispatch takes `state: &mut ProtoState`, snaps
-/// the previous state via `core::mem::take(state)` for pattern
-/// matching (state reset to `Default` == `Idle` during the match),
-/// then each arm writes `*state = new_state` directly — one
-/// store, no round trip. DispatchOutcome shrinks to the
-/// **side-effect** signal only (see `DispatchOutcome` docs).
+/// Dispatch takes `state: &mut ProtoState`, snaps the previous
+/// state via `core::mem::replace(state, ProtoState::Idle)` for
+/// pattern matching, then each arm writes `*state = new_state`
+/// directly — one store, no round trip. A naive
+/// `dispatch(prev: ProtoState) -> DispatchOutcome::Advanced* {
+/// new_state, ... }` shape would pay two 712 B memcpies per
+/// dispatch iteration — on 1M-row SELECT workloads, ~1.4 GB stack
+/// traffic purely for state round-tripping (and LLVM does NOT
+/// optimise it because `ProtoState` carries a non-trivial-move
+/// password buffer).
 ///
 /// Invariant: EVERY match arm must either (a) assign `*state =
 /// new_state` before returning `AdvancedSilent`/`AdvancedWithAction`,
-/// or (b) delegate to [`install_errored`] / [`install_internal_bug`]
-/// which install `ProtoState::Errored(...)`. Forgetting to assign
-/// leaves state at the default `Idle` — a silent regression class
-/// the compiler cannot catch. Mitigation: arm-body coverage tests
-/// across all transitions (existing 230-test suite exercises every
+/// or (b) delegate to [`install_errored`] which installs
+/// `ProtoState::Errored(...)`. Forgetting to assign leaves state
+/// at the placeholder `Idle` — a silent regression class the
+/// compiler cannot catch. Mitigation: arm-body coverage tests
+/// across all transitions (the existing test suite exercises every
 /// `(state, tag)` pair reachable in the state machine).
 pub(crate) fn dispatch(
     state: &mut ProtoState,
@@ -442,28 +414,27 @@ pub(crate) fn dispatch(
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
     row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
-    // DEF-196 (2026-04-28): `&mut Option<Box<ErrorArena>>` slot for
-    // the dispatch path's only cold-write target. Most dispatch arms
-    // don't write error_arena; the few that do (ErrorResponse arms)
-    // lazy-init via `error_arena_or_init(error_arena_slot)` inline,
-    // allocating exactly once on the first server error per
-    // connection. Frames that don't reach an ErrorResponse arm pay
-    // zero allocation cost.
+    // `&mut Option<Box<ErrorArena>>` slot for the dispatch path's
+    // only cold-write target. Most dispatch arms don't write
+    // error_arena; the few that do (ErrorResponse arms) lazy-init
+    // via `error_arena_or_init(error_arena_slot)` inline, allocating
+    // exactly once on the first server error per connection. Frames
+    // that don't reach an ErrorResponse arm pay zero allocation
+    // cost.
     error_arena_slot: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
-    // DEF-278 Bundle D (2026-05-17): backend-key cell for the
-    // one-shot install at the handshake-complete arm
-    // `(ConnectingPostAuthHaveKey, 'Z')`. Every other dispatch arm
-    // ignores this parameter (the cell is read-only outside that one
-    // arm); the cold-path overhead is zero — the parameter is a fat
-    // pointer passed by `&mut`, no dereference happens unless the
-    // matching arm fires.
+    // Backend-key cell for the one-shot install at the handshake-
+    // complete arm `(ConnectingPostAuthHaveKey, 'Z')`. Every other
+    // dispatch arm ignores this parameter (the cell is read-only
+    // outside that one arm); the cold-path overhead is zero — the
+    // parameter is a fat pointer passed by `&mut`, no dereference
+    // happens unless the matching arm fires.
     backend_key_slot: &mut crate::cancel::BackendKeyCell,
 ) -> DispatchOutcome {
-    // DEF-184 (B21/C6): snap owned prev for pattern matching; state
-    // slot holds the explicit `ProtoState::Idle` placeholder during
-    // the match. Every match arm below MUST `*state = <transition>`
-    // before returning a non-Errored outcome; the install_errored /
-    // install_internal_bug helpers handle Errored transitions.
+    // Snap owned prev for pattern matching; state slot holds the
+    // explicit `ProtoState::Idle` placeholder during the match.
+    // Every match arm below MUST `*state = <transition>` before
+    // returning a non-Errored outcome; `install_errored` handles
+    // Errored transitions.
     //
     // Use `mem::replace` (not `mem::take`) to make the placeholder
     // explicit — `mem::take` silently relies on the `Default` impl
@@ -472,19 +443,20 @@ pub(crate) fn dispatch(
     let prev = core::mem::replace(state, ProtoState::Idle);
     let outcome = match (prev, tag) {
         // =============================================================
-        // Ping flow (Phase 1a, carried forward)
+        // Ping flow
         // =============================================================
         (ProtoState::PingAwaitingRfq(id), TAG_READY_FOR_QUERY) => {
-            // DEF-112: `id: ReplyId<PingKind>` — the typed
-            // `deliver` helper binds the payload to `PongPayload`
-            // at compile time. Attempting to deliver any other
-            // payload type here is a type error.
+            // `id: ReplyId<PingKind>` — the typed `deliver` helper
+            // binds the payload to `PongPayload` at compile time.
+            // Attempting to deliver any other payload type here is
+            // a type error.
             //
             // Tier-1 tx_status validation via the centralised
-            // `parse_rfq_payload` (F13): users never receive a
-            // `TxStatus` outside `{Idle, InTransaction, Failed}`;
-            // any other byte is a wire violation classified as
-            // `MalformedReadyForQuery` with the correct `payload_len`.
+            // `parse_rfq_payload`: users never receive a `TxStatus`
+            // outside `{Idle, InTransaction, Failed}`; any other
+            // byte is a wire violation classified as
+            // `MalformedReadyForQuery` with the correct
+            // `payload_len`.
             match parse_rfq_payload(payload) {
                 Ok(tx_status) => {
                     *state = ProtoState::Idle;
@@ -506,8 +478,8 @@ pub(crate) fn dispatch(
 
         // =============================================================
         // ConnectingStartupTrust — awaiting AuthenticationOk
-        // (DEF-097: Trust connections cannot accept AUTH_SASL — that
-        // case is a per-variant dispatcher arm now, not a runtime
+        // (Trust connections cannot accept AUTH_SASL — that case is
+        // a per-variant dispatcher arm, not a runtime
         // classification.)
         // =============================================================
         (ProtoState::ConnectingStartupTrust { reply }, TAG_AUTHENTICATION) => {
@@ -524,18 +496,17 @@ pub(crate) fn dispatch(
 
         // =============================================================
         // ConnectingStartupScram — awaiting AuthenticationSASL
-        // (DEF-097: mirror of the Trust arm. A Scram connection
-        // receiving AUTH_OK in this state is classified as
+        // Mirror of the Trust arm. A Scram connection receiving
+        // AUTH_OK in this state is classified as
         // `UnsupportedAuthMethod` — the server accepted without
         // challenge while the user supplied a password, a PG policy
-        // mismatch worth surfacing.)
+        // mismatch worth surfacing.
         // =============================================================
         (ProtoState::ConnectingStartupScram { reply, scram }, TAG_AUTHENTICATION) => {
-            // DEF-184 (A10/B22 revert 2026-04-24): `scram: ScramSession`
-            // is destructured DIRECTLY from the variant — variant-
-            // carries-field is tier-1 compile (CREDO §1). No drift
-            // classifier needed: the variant cannot exist without its
-            // SCRAM session.
+            // `scram: ScramSession` is destructured DIRECTLY from
+            // the variant — variant-carries-field is tier-1 compile
+            // (CREDO §1). No drift classifier needed: the variant
+            // cannot exist without its SCRAM session.
             dispatch_auth_in_startup_scram(state, reply, scram, payload, reserved)
         }
         (ProtoState::ConnectingStartupScram { reply, .. }, TAG_ERROR_RESPONSE) => {
@@ -548,12 +519,13 @@ pub(crate) fn dispatch(
         (ProtoState::ConnectingStartupScram { reply, .. }, other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
-        // ConnectingStartupCleartext — awaiting AuthenticationCleartextPassword
-        // (DEF-215, 2026-05-05). Mirror of the Trust + SCRAM startup
-        // arms. A Cleartext connection only accepts AUTH_CLEARTEXT_PASSWORD
-        // (sub-code 3); AUTH_OK without challenge would be a server-side
-        // policy mismatch (server accepted nothing despite the user
-        // supplying a password — surfaced as `UnsupportedAuthMethod`).
+        // ConnectingStartupCleartext — awaiting
+        // AuthenticationCleartextPassword. Mirror of the Trust +
+        // SCRAM startup arms. A Cleartext connection only accepts
+        // AUTH_CLEARTEXT_PASSWORD (sub-code 3); AUTH_OK without
+        // challenge would be a server-side policy mismatch (server
+        // accepted nothing despite the user supplying a password —
+        // surfaced as `UnsupportedAuthMethod`).
         // =============================================================
         (ProtoState::ConnectingStartupCleartext { reply, password }, TAG_AUTHENTICATION) => {
             // Variant-carries-field: the variant cannot exist without
@@ -574,7 +546,7 @@ pub(crate) fn dispatch(
 
         // =============================================================
         // ConnectingCleartextAwaitingAuthOk — PasswordMessage sent;
-        // awaiting AuthenticationOk (DEF-215, 2026-05-05).
+        // awaiting AuthenticationOk.
         // =============================================================
         (ProtoState::ConnectingCleartextAwaitingAuthOk(reply), TAG_AUTHENTICATION) => {
             dispatch_auth_ok_after_cleartext(state, reply, payload)
@@ -586,11 +558,11 @@ pub(crate) fn dispatch(
         (ProtoState::ConnectingCleartextAwaitingAuthOk(reply), other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
-        // ConnectingStartupMd5 — awaiting AuthenticationMD5Password
-        // (DEF-216, 2026-05-05). Mirror of cleartext + SCRAM startup
-        // arms. Only sub-code 5 (with a valid 4-byte salt) progresses;
-        // any other code is `UnsupportedAuthMethod` (downgrade
-        // rejection — security mirror of SCRAM dispatcher).
+        // ConnectingStartupMd5 — awaiting AuthenticationMD5Password.
+        // Mirror of cleartext + SCRAM startup arms. Only sub-code 5
+        // (with a valid 4-byte salt) progresses; any other code is
+        // `UnsupportedAuthMethod` (downgrade rejection — security
+        // mirror of SCRAM dispatcher).
         // =============================================================
         (ProtoState::ConnectingStartupMd5 { reply, handshake }, TAG_AUTHENTICATION) => {
             // Variant-carries-field: variant cannot exist without
@@ -611,7 +583,7 @@ pub(crate) fn dispatch(
 
         // =============================================================
         // ConnectingMd5AwaitingAuthOk — PasswordMessage sent;
-        // awaiting AuthenticationOk (DEF-216, 2026-05-05).
+        // awaiting AuthenticationOk.
         // =============================================================
         (ProtoState::ConnectingMd5AwaitingAuthOk(reply), TAG_AUTHENTICATION) => {
             dispatch_auth_ok_after_md5(state, reply, payload)
@@ -629,20 +601,20 @@ pub(crate) fn dispatch(
             ProtoState::ConnectingScramAwaitingServerFirst { reply, scram },
             TAG_AUTHENTICATION,
         ) => {
-            // DEF-184 (A10/B22 revert 2026-04-24): heavy SCRAM fields
-            // destructured inline from the variant — tier-1 invariant
-            // (CREDO §1: variant-carries-field). No drift path.
+            // Heavy SCRAM fields destructured inline from the
+            // variant — tier-1 invariant (CREDO §1: variant-carries-
+            // field). No drift path.
             //
-            // DEF-210 REC-06 → PERF-02 (audits 2026-04-28 + 2026-05-04):
-            // the SCRAM handshake state is one `Box<ScramSession>`
-            // carrying password + `client_first_bare` + `client_nonce_b64`
-            // inline. The Box is moved here by the destructure (no
-            // allocator op); `dispatch_auth_sasl_continue` borrows
-            // `&scram` for HMAC composition + reads
-            // `scram.client_first_bare` / `scram.client_nonce_b64`
-            // through the same borrow. The Box drops at the end of
-            // this arm scope (1 free), firing `ScramSession::Drop`
-            // with `ZeroizeOnDrop` scrub of the password.
+            // The SCRAM handshake state is one `Box<ScramSession>`
+            // carrying password + `client_first_bare` +
+            // `client_nonce_b64` inline. The Box is moved here by
+            // the destructure (no allocator op);
+            // `dispatch_auth_sasl_continue` borrows `&scram` for
+            // HMAC composition + reads `scram.client_first_bare` /
+            // `scram.client_nonce_b64` through the same borrow. The
+            // Box drops at the end of this arm scope (1 free),
+            // firing `ScramSession::Drop` with `ZeroizeOnDrop` scrub
+            // of the password.
             dispatch_auth_sasl_continue(
                 state,
                 reply,
@@ -669,8 +641,8 @@ pub(crate) fn dispatch(
             },
             TAG_AUTHENTICATION,
         ) => {
-            // DEF-184 (A10/B22 revert 2026-04-24): `expected_server_sig`
-            // destructured inline — tier-1 variant-carries-field.
+            // `expected_server_sig` destructured inline — tier-1
+            // variant-carries-field.
             dispatch_auth_sasl_final(state, reply, expected_server_sig, payload)
         }
         (ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }, TAG_ERROR_RESPONSE) => {
@@ -698,13 +670,13 @@ pub(crate) fn dispatch(
         //
         // `ParameterStatus` (tag 'S') is filtered pre-dispatch in
         // `feed_bytes` via `allows_unsolicited_param_status`; the
-        // dispatcher never sees it for these states. DEF-054.
+        // dispatcher never sees it for these states.
         // =============================================================
         (ProtoState::ConnectingPostAuthAwaitingKey(reply), TAG_BACKEND_KEY_DATA) => {
             match parse_backend_key_data(payload) {
                 Ok((pid, secret_key)) => {
-                    // DEF-189 Q8-C2: wrap the secret_key in Sensitive
-                    // so the variant's storage scrubs on drop (state
+                    // Wrap the secret_key in Sensitive so the
+                    // variant's storage scrubs on drop (state
                     // transition).
                     *state = ProtoState::ConnectingPostAuthHaveKey {
                         reply,
@@ -727,7 +699,7 @@ pub(crate) fn dispatch(
         //
         // `ParameterStatus` (tag 'S') is filtered pre-dispatch in
         // `feed_bytes` via `allows_unsolicited_param_status`; the
-        // dispatcher never sees it for these states. DEF-054.
+        // dispatcher never sees it for these states.
         // =============================================================
         (
             ProtoState::ConnectingPostAuthHaveKey {
@@ -737,26 +709,24 @@ pub(crate) fn dispatch(
             },
             TAG_READY_FOR_QUERY,
         ) => {
-            // DEF-112: `reply: ReplyId<StartupKind>` — typed
-            // `deliver` forces a `StartupCompletePayload` payload.
+            // `reply: ReplyId<StartupKind>` — typed `deliver`
+            // forces a `StartupCompletePayload` payload.
             //
-            // DEF-189 Q8-C2: extract the inner i32 from
-            // `Sensitive<i32>` via `.get()` (returns &i32, copy-deref
-            // here). The Sensitive wrapper drops at end of arm scope,
-            // scrubbing the source slot. The plain `i32` in
-            // StartupCompletePayload then flows through the staged
-            // pipeline; that payload's manual Debug impl already
-            // redacts the field (P1-C).
+            // Extract the inner `i32` from `Sensitive<i32>` via
+            // `.with_inner(...)` (closure-scope access). The
+            // Sensitive wrapper drops at end of arm scope, scrubbing
+            // the source slot. The plain `i32` in
+            // `StartupCompletePayload` then flows through the staged
+            // pipeline; that payload's manual `Debug` impl redacts
+            // the field.
             //
-            // DEF-278 Bundle D (2026-05-17): persist `(pid,
-            // secret_key)` into the connection-scoped
+            // Persist `(pid, secret_key)` into the connection-scoped
             // `backend_key_slot` BEFORE the variant's Sensitive
             // drops. Re-wraps the secret in a fresh `Sensitive<i32>`
             // (the variant's wrapper drops + scrubs at arm scope
-            // exit; the cell holds an independent
-            // `Sensitive<i32>` whose drop fires on connection
-            // teardown). Two scrub sites, two `ZeroizeOnDrop`
-            // chains — defense-in-depth.
+            // exit; the cell holds an independent `Sensitive<i32>`
+            // whose drop fires on connection teardown). Two scrub
+            // sites, two `ZeroizeOnDrop` chains — defense-in-depth.
             //
             // The install runs inside the success arm only — on
             // parse-error the cell stays empty and the connection
@@ -765,34 +735,33 @@ pub(crate) fn dispatch(
             // (tier-1 within-crate write provenance).
             match parse_rfq_payload(payload) {
                 Ok(tx_status) => {
-                    // DEF-280 Bundle I / Bundle D'' (2026-05-18):
-                    // Wrap the local `i32` extraction in `Zeroizing<i32>`
-                    // so the stack slot scrubs deterministically when
-                    // the arm scope ends. Pre-Bundle I the plain `i32`
-                    // local lived unscrubbed on the dispatch arm's
-                    // function frame; the source `Sensitive<i32>`
-                    // (variant payload) scrubbed at arm-scope exit and
-                    // the cell-installed `Sensitive<i32>` scrubbed at
+                    // Wrap the local `i32` extraction in
+                    // `Zeroizing<i32>` so the stack slot scrubs
+                    // deterministically when
+                    // the arm scope ends. A naive plain-`i32` local
+                    // would live unscrubbed on the dispatch arm's
+                    // function frame: the source `Sensitive<i32>`
+                    // (variant payload) scrubs at arm-scope exit and
+                    // the cell-installed `Sensitive<i32>` scrubs at
                     // connection teardown, but the **stack-resident
-                    // intermediate** between the two scrub points was
-                    // not covered. Under `panic = "unwind"` (cargo test)
-                    // Drop runs even on early-return; under
-                    // `panic = "abort"` (release; documented gap
-                    // Cargo.toml lines 97-151) the process exits before
-                    // the unscrubbed slot matters. Tier-1 within scope:
-                    // the secret can no longer leak via a future cold-
-                    // path borrow / leak / coredump-of-stack-frame.
+                    // intermediate** between the two scrub points
+                    // would be uncovered. Under `panic = "unwind"`
+                    // (cargo test) Drop runs even on early-return;
+                    // under `panic = "abort"` (release; documented
+                    // gap in Cargo.toml) the process exits before the
+                    // unscrubbed slot matters. Tier-1 within scope:
+                    // the secret can no longer leak via a future
+                    // cold-path borrow / leak / coredump-of-stack-
+                    // frame.
                     //
-                    // `Zeroizing<i32>` defers to `<i32 as Zeroize>` (
-                    // zeroize crate's blanket impl for primitive ints
-                    // writes `0`). `Deref` exposes the inner `i32` for
-                    // the two consumers below without cloning.
-                    // DEF-280 Bundle E (2026-05-18): closure-scope
-                    // Sensitive::with_inner replaces the pre-Bundle E
-                    // `*secret_key.get()` shape. The inner `i32` is
-                    // Copy, so the closure body dereferences and
-                    // returns a copy; the &i32 borrow is HRTB-scoped
-                    // and cannot escape.
+                    // `Zeroizing<i32>` defers to `<i32 as Zeroize>`
+                    // (the zeroize crate's blanket impl for primitive
+                    // ints writes `0`). `Deref` exposes the inner
+                    // `i32` for the two consumers below without
+                    // cloning. The `Sensitive::with_inner(...)`
+                    // closure dereferences the inner `i32` (which is
+                    // `Copy`) and returns a copy; the `&i32` borrow
+                    // is HRTB-scoped and cannot escape.
                     let secret_key_inner: zeroize::Zeroizing<i32> =
                         zeroize::Zeroizing::new(secret_key.with_inner(|s| *s));
                     crate::protocol::_backend_key_install_leaf::install_at_dispatch_arm(
@@ -824,7 +793,7 @@ pub(crate) fn dispatch(
         }
 
         // =============================================================
-        // Phase 1c-1b: Simple Query flow
+        // Simple Query flow
         //
         // State transitions per PG §55.2.3:
         //   Q sent → AwaitingFirstResponse
@@ -849,13 +818,14 @@ pub(crate) fn dispatch(
 
         // AwaitingFirstResponse: T / C / I / E — any other tag is desync
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ROW_DESCRIPTION) => {
-            // DEF-189: parsed schema lands in PgProtocol::row_desc_slot.
-            // The variant transitions to StreamingRows (no inline payload).
-            // The slot lives across the entire stream (DataRows + Z).
+            // Parsed schema lands in PgProtocol::row_desc_slot. The
+            // variant transitions to StreamingRows (no inline
+            // payload). The slot lives across the entire stream
+            // (DataRows + Z).
             match crate::decode::parse_row_description(payload) {
                 Ok(row_desc) => {
-                    // DEF-271 cluster C: leaf helper performs the mint+park
-                    // with the auth tag's scope confined to its submodule.
+                    // Leaf helper performs the mint+park with the
+                    // auth tag's scope confined to its submodule.
                     _row_description_dispatch_leaf::park_row_description_at_dispatch(
                         row_desc_slot,
                         row_desc,
@@ -867,9 +837,9 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_COMMAND_COMPLETE) => {
-            // DML path: no RowDescription frame fired, so row_desc_slot
-            // remained `None` since the last Idle entry — materialise
-            // emits Reply with `row_desc = None` (DEF-210 SR-01 Path C).
+            // DML path: no RowDescription frame fired, so
+            // row_desc_slot remained `None` since the last Idle
+            // entry — materialise emits Reply with `row_desc = None`.
             advance_to_awaiting_rfq(state, reply, payload)
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_EMPTY_QUERY_RESPONSE) => {
@@ -904,9 +874,9 @@ pub(crate) fn dispatch(
         // FailReply + CloseSocket.
         (ProtoState::SimpleQueryStreamingRows { reply }, TAG_COMMAND_COMPLETE) => {
             // SELECT path terminates: schema lives in row_desc_slot
-            // (parked by the 'T' arm earlier in this query). AwaitingRfq
-            // → Z → Idle. DEF-210 SR-01 Path C: materialise reads the
-            // slot directly — no flag to set.
+            // (parked by the 'T' arm earlier in this query).
+            // AwaitingRfq → Z → Idle. Materialise reads the slot
+            // directly — no flag to set.
             advance_to_awaiting_rfq(state, reply, payload)
         }
         (ProtoState::SimpleQueryStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
@@ -918,14 +888,14 @@ pub(crate) fn dispatch(
 
         // AwaitingRfq: Z is the only legal frame
         (ProtoState::SimpleQueryAwaitingRfq { reply, command_tag }, TAG_READY_FOR_QUERY) => {
-            // DEF-189 + DEF-210 SR-01 Path C: schema (if any) lives
-            // in row_desc_slot (parked at the 'T' arm earlier in this
-            // query, or pre-populated by push for BindExecute SELECT).
-            // State transitions to Idle; slot persists until next
-            // entry-point clear, so the public QueryComplete reply's
-            // RowDescBorrow stays valid. Materialise reads the slot
-            // directly — no `schema_present: bool` flag to keep in
-            // sync (single source of truth, tier-1 by-construction).
+            // Schema (if any) lives in row_desc_slot (parked at the
+            // 'T' arm earlier in this query, or pre-populated by
+            // push for BindExecute SELECT). State transitions to
+            // Idle; slot persists until the next entry-point clear,
+            // so the public QueryComplete reply's RowDescBorrow
+            // stays valid. Materialise reads the slot directly — no
+            // `schema_present: bool` flag to keep in sync (single
+            // source of truth, tier-1 by-construction).
             match parse_rfq_payload(payload) {
                 Ok(tx_status) => {
                     *state = ProtoState::Idle;
@@ -976,7 +946,7 @@ pub(crate) fn dispatch(
         }
 
         // =============================================================
-        // Phase 1c-3a: Extended Query — Parse flow
+        // Extended Query — Parse flow
         //
         // Parse + Sync sequence:
         //   Client sends: P frame + S frame (bundled in push_command)
@@ -1036,7 +1006,7 @@ pub(crate) fn dispatch(
         }
 
         // =============================================================
-        // Phase 1c-3b: Extended Query — Bind + Execute flow
+        // Extended Query — Bind + Execute flow
         //
         // Flow splits at `push_bind_execute` call time by whether the
         // caller provided a `row_desc`:
@@ -1058,13 +1028,13 @@ pub(crate) fn dispatch(
         // Shared-across-paths:
         //   'E' (ErrorResponse) at ANY state → drain-after-error
         //                                      (query-level recoverable)
-        //   's' (PortalSuspended) → UnexpectedFrame (1c-3b scope;
-        //                           1c-6 lifts for chunked fetch)
+        //   's' (PortalSuspended) → UnexpectedFrame (chunked fetch
+        //                           is a planned follow-up)
         //
-        // Tier uplift vs pre-split: the "can we stream rows?"
+        // Tier uplift via the split: the "can we stream rows?"
         // decision is resolved at the VARIANT level (tier-1 structural
-        // dispatch) instead of via a runtime `match row_desc: Option<_>`
-        // at the 'D' arm.
+        // dispatch). A naive single-set-of-states shape would need a
+        // runtime `match row_desc: Option<_>` at the 'D' arm.
         // =============================================================
 
         // ─── DML path ───
@@ -1079,12 +1049,12 @@ pub(crate) fn dispatch(
                 Err(cause) => install_errored(state, Some(reply.consume()), cause),
             }
         }
-        // DEF-244 (2026-05-13): the prepared! macro path bundles Parse
-        // + Bind + Execute + Sync; server replies with `1` (ParseComplete)
-        // before `2` (BindComplete). Accept `1` as a silent transition
-        // in this state (state stays the same; ParseComplete carries no
-        // payload data we'd track separately). The post-condition still
-        // requires `2` to advance.
+        // The prepared! macro path bundles Parse + Bind + Execute +
+        // Sync; server replies with `1` (ParseComplete) before `2`
+        // (BindComplete). Accept `1` as a silent transition in this
+        // state (state stays the same; ParseComplete carries no
+        // payload data we'd track separately). The post-condition
+        // still requires `2` to advance.
         //
         // **State restore**: the dispatch entry `mem::replace`'d state with
         // Idle; the AdvancedSilent path MUST write back the original
@@ -1140,9 +1110,9 @@ pub(crate) fn dispatch(
         ) => match parse_rfq_payload(payload) {
             Ok(tx_status) => {
                 // DML path: no schema to park (row_desc_slot stays
-                // at its prior cleared state, i.e. None). DEF-210
-                // SR-01 Path C: materialise reads the slot directly
-                // → public Reply::QueryComplete.row_desc = None.
+                // at its prior cleared state, i.e. None).
+                // Materialise reads the slot directly → public
+                // `Reply::QueryComplete.row_desc = None`.
                 *state = ProtoState::Idle;
                 DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
@@ -1176,12 +1146,14 @@ pub(crate) fn dispatch(
                 Err(cause) => install_errored(state, Some(reply.consume()), cause),
             }
         }
-        // DEF-244 (2026-05-13): prepared! macro path — same silent
-        // ParseComplete transition as the DML arm above. State name
-        // stays; the state semantically represents "awaiting BindComplete
-        // for the in-flight Bind, optionally preceded by ParseComplete".
-        // Same state-restore discipline as the DML arm (mem::replace
-        // dance — see line ~893).
+        // The prepared! macro path mirrors the DML arm above: the
+        // server may emit `1` (ParseComplete) before `2`
+        // (BindComplete) when Parse + Bind + Execute + Sync bundle
+        // in one push. State name stays; the state semantically
+        // represents "awaiting BindComplete for the in-flight Bind,
+        // optionally preceded by ParseComplete". Same state-restore
+        // discipline as the DML arm (the `mem::replace` dance at
+        // entry forces the write-back).
         (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply }, TAG_PARSE_COMPLETE) => {
             if payload.is_empty() {
                 *state = ProtoState::BindExecuteAwaitingBindCompleteSelect { reply };
@@ -1249,12 +1221,11 @@ pub(crate) fn dispatch(
             TAG_READY_FOR_QUERY,
         ) => match parse_rfq_payload(payload) {
             Ok(tx_status) => {
-                // DEF-189 + DEF-210 SR-01 Path C: schema (if any)
-                // lives in row_desc_slot, populated either by
-                // push_bind_execute (caller-supplied) or by a prior
-                // 'T' frame on the auto-describe path. State
-                // transitions to Idle; slot persists until next
-                // entry-point clear. Materialise reads the slot
+                // Schema (if any) lives in row_desc_slot, populated
+                // either by push_bind_execute (caller-supplied) or
+                // by a prior 'T' frame on the auto-describe path.
+                // State transitions to Idle; slot persists until the
+                // next entry-point clear. Materialise reads the slot
                 // directly — single source of truth.
                 *state = ProtoState::Idle;
                 DispatchOutcome::AdvancedWithAction {
@@ -1274,7 +1245,7 @@ pub(crate) fn dispatch(
         }
 
         // =============================================================
-        // Phase 1c-3c: Extended Query — Describe flow
+        // Extended Query — Describe flow
         //
         // Statement-target response sequence (PG §55.2.2):
         //   't' (ParameterDescription) → 'T' (RowDescription) OR
@@ -1322,13 +1293,12 @@ pub(crate) fn dispatch(
             TAG_ROW_DESCRIPTION,
         ) => match crate::decode::parse_row_description(payload) {
             Ok(row_desc) => {
-                // DEF-189 + DEF-210 SR-01-D Path D: parsed schema
-                // lands in PgProtocol::row_desc_slot — the single
-                // source of truth (no `rows: Rows` discriminator
-                // duplicate). Materialise reads the slot at the Z
-                // arm.
-                // DEF-271 cluster C: leaf helper performs the mint+park
-                // with the auth tag's scope confined to its submodule.
+                // Parsed schema lands in PgProtocol::row_desc_slot
+                // — the single source of truth (a naive
+                // `rows: Rows` discriminator would duplicate it).
+                // Materialise reads the slot at the Z arm. Leaf
+                // helper performs the mint+park with the auth tag's
+                // scope confined to its submodule.
                 _row_description_dispatch_leaf::park_row_description_at_dispatch(
                     row_desc_slot,
                     row_desc,
@@ -1368,9 +1338,9 @@ pub(crate) fn dispatch(
         }
 
         // Stage 3: awaiting ReadyForQuery — deliver the terminal
-        // reply carrying the accumulated param_oids. DEF-210 SR-01-D
-        // Path D: schema (if any) lives in row_desc_slot, populated
-        // at the 'T' arm above; materialise reads the slot directly.
+        // reply carrying the accumulated param_oids. Schema (if any)
+        // lives in row_desc_slot, populated at the 'T' arm above;
+        // materialise reads the slot directly.
         (
             ProtoState::DescribeStatementAwaitingRfq {
                 reply,
@@ -1400,12 +1370,12 @@ pub(crate) fn dispatch(
 
         // Stage 1: awaiting RowDescription or NoData (no ParamDesc).
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_ROW_DESCRIPTION) => {
-            // DEF-189 + DEF-210 SR-01-D Path D: parsed schema lands
-            // in PgProtocol::row_desc_slot — single source of truth.
+            // Parsed schema lands in PgProtocol::row_desc_slot —
+            // single source of truth.
             match crate::decode::parse_row_description(payload) {
                 Ok(row_desc) => {
-                    // DEF-271 cluster C: leaf helper performs the mint+park
-                    // with the auth tag's scope confined to its submodule.
+                    // Leaf helper performs the mint+park with the
+                    // auth tag's scope confined to its submodule.
                     _row_description_dispatch_leaf::park_row_description_at_dispatch(
                         row_desc_slot,
                         row_desc,
@@ -1436,8 +1406,8 @@ pub(crate) fn dispatch(
         }
 
         // Stage 2: awaiting ReadyForQuery — deliver portal reply.
-        // DEF-210 SR-01-D Path D: schema (if any) in row_desc_slot;
-        // materialise reads it at the materialise pass.
+        // Schema (if any) lives in row_desc_slot; materialise reads
+        // it at the materialise pass.
         (
             ProtoState::DescribePortalAwaitingRfq { reply },
             TAG_READY_FOR_QUERY,
@@ -1463,11 +1433,11 @@ pub(crate) fn dispatch(
         (ProtoState::Idle, other) => install_errored(state, None, ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
-        // Errored — terminal sink (Phase 1a pattern carried forward)
+        // Errored — terminal sink
         //
-        // DEF-163 A012: architecturally dead under current flow.
-        // `feed_bytes` short-circuits on `ProtoState::Errored(_)`
-        // via the is-errored-or-recovering fast-path check (see
+        // Architecturally dead under current flow. `feed_bytes`
+        // short-circuits on `ProtoState::Errored(_)` via the
+        // is-errored-or-recovering fast-path check (see
         // `protocol.rs` — `is_errored_or_recovering` → clear
         // read_buf + return empty OutActions, dispatch is NEVER
         // entered). Arm retained for exhaustive `(ProtoState, tag)`
@@ -1481,13 +1451,14 @@ pub(crate) fn dispatch(
         }
     };
 
-    // DEF-184 (A10/B22 revert 2026-04-24): no scram_state cleanup needed.
-    // `mem::replace(state, ProtoState::Idle)` above consumed the SCRAM
-    // variant by value; if the arm ended in Errored the variant is
-    // already dropped — `ScramSession::Drop` impl (`ZeroizeOnDrop`)
-    // scrubbed password bytes inside the match. Variant-carries-field
-    // invariant (CREDO §1) makes this automatic: there is no separate
-    // slot that could linger past the state transition.
+    // No separate `scram_state` cleanup needed: the
+    // `mem::replace(state, ProtoState::Idle)` above consumed the
+    // SCRAM variant by value, and if the arm ended in Errored the
+    // variant is already dropped — `ScramSession::Drop`
+    // (`ZeroizeOnDrop`) scrubbed password bytes inside the match.
+    // Variant-carries-field (CREDO §1) makes this automatic: there
+    // is no separate slot that could linger past the state
+    // transition.
     outcome
 }
 
@@ -1509,16 +1480,17 @@ fn auth_sub_code(payload: &[u8]) -> Result<(crate::wire::AuthSubCode, &[u8]), Pr
     match payload {
         [a, b, c, d, rest @ ..] => {
             let raw = u32::from_be_bytes([*a, *b, *c, *d]);
-            // F-046 (pass-#8): `try_from_u32` returns `Result<Self, u32>`
-            // (not `Option<Self>`) — forward the rejected raw u32 via
+            // `try_from_u32` returns `Result<Self, u32>` (not
+            // `Option<Self>`) — forward the rejected raw u32 via
             // `map_err`, no separate `.ok_or(..raw)` layer needed.
             let code = crate::wire::AuthSubCode::try_from_u32(raw).map_err(|unknown| {
-                // DEF-184 (B9): `unknown ≠ 0` structurally — AUTH_OK
-                // = 0 is matched to Ok(AuthSubCode::Ok) by
-                // try_from_u32 above, so `Err(0)` is architecturally
-                // impossible. `AuthSubCodeClass::Unknown(NonZeroU32)`
-                // carries the tier-1 type-level proof; dead None
-                // arm classified as AuthSubCodeZeroInErr crate-bug.
+                // `unknown ≠ 0` structurally — AUTH_OK = 0 is
+                // matched to `Ok(AuthSubCode::Ok)` by try_from_u32
+                // above, so `Err(0)` is architecturally impossible.
+                // `AuthSubCodeClass::Unknown(NonZeroU32)` carries
+                // the tier-1 type-level proof; the dead None arm is
+                // classified as the `AuthSubCodeZeroInErr` crate-bug
+                // locus.
                 match core::num::NonZeroU32::new(unknown) {
                     Some(nz) => ProtocolError::UnsupportedAuthMethod {
                         sub_code: crate::error::AuthSubCodeClass::Unknown(nz),
@@ -1537,7 +1509,7 @@ fn auth_sub_code(payload: &[u8]) -> Result<(crate::wire::AuthSubCode, &[u8]), Pr
 }
 
 /// Dispatch an Authentication message while in
-/// [`ProtoState::ConnectingStartupTrust`]. DEF-097.
+/// [`ProtoState::ConnectingStartupTrust`].
 ///
 /// Only `AUTH_OK` is acceptable here: the user provided no password,
 /// so a SCRAM challenge from the server is classified as
@@ -1545,7 +1517,7 @@ fn auth_sub_code(payload: &[u8]) -> Result<(crate::wire::AuthSubCode, &[u8]), Pr
 /// the client's no-password configuration). The dispatcher match
 /// cannot reach this arm with SCRAM payloads already buffered,
 /// because the Scram variant of the state has its own handler —
-/// this separation is the tier-1 compile guarantee DEF-097 buys.
+/// per-variant dispatchers carry the tier-1 compile guarantee.
 fn dispatch_auth_in_startup_trust(
     state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
@@ -1565,10 +1537,9 @@ fn dispatch_auth_in_startup_trust(
         }
         // Any non-Ok auth code means the server expects an auth
         // method this Trust connection is not configured for:
-        // `CleartextPassword` / `Md5Password` (DEF-215 / DEF-216
-        // foundation) — Trust client carries no password.
-        // `Sasl` / `SaslContinue` / `SaslFinal` — Trust client
-        // never requested SCRAM.
+        // `CleartextPassword` / `Md5Password` — Trust client
+        // carries no password. `Sasl` / `SaslContinue` /
+        // `SaslFinal` — Trust client never requested SCRAM.
         // Tier-1 exhaustive — a future new `AuthSubCode` variant
         // forces this match to be updated.
         other @ (crate::wire::AuthSubCode::CleartextPassword
@@ -1583,7 +1554,7 @@ fn dispatch_auth_in_startup_trust(
 }
 
 /// Dispatch an Authentication message while in
-/// [`ProtoState::ConnectingStartupScram`]. DEF-097.
+/// [`ProtoState::ConnectingStartupScram`].
 ///
 /// Only `AUTH_SASL` is acceptable here; the server taking `AUTH_OK`
 /// without asking for the password is an auth-method mismatch on
@@ -1609,10 +1580,9 @@ fn dispatch_auth_in_startup_scram(
             }
 
             // Build client-first-message and SASLInitialResponse.
-            // DEF-094: write directly into the caller-owned `write_buf`
-            // and record the range; materialise at the entry-point
+            // Write directly into the caller-owned `write_buf` and
+            // record the range; materialise at the entry-point
             // boundary after the mutable write phase releases.
-            // DEF-210 PERF-02 (audit 2026-05-04): single-Box SCRAM.
             // `build_sasl_initial_response` populates
             // `scram.client_first_bare` + `scram.client_nonce_b64`
             // IN PLACE through `&mut Box<ScramSession>`. The same
@@ -1620,11 +1590,8 @@ fn dispatch_auth_in_startup_scram(
             // StartupScram → ServerFirst transition (zero allocator
             // ops). Per-handshake total: 1 alloc (StartupScram
             // construction) + 1 free (ServerFinal drop), zero
-            // transitions in between. Closes the principal's
-            // documented "one heap alloc per SCRAM connection"
-            // invariant to literal accuracy (REC-06 was a half-
-            // measure that still incurred 1 alloc + 1 free at the
-            // transition; PERF-02 closes the gap).
+            // transitions in between — the literal "one heap alloc
+            // per SCRAM connection" invariant.
             match build_sasl_initial_response(&mut scram, reserved) {
                 Ok(range) => {
                     *state = ProtoState::ConnectingScramAwaitingServerFirst {
@@ -1641,14 +1608,13 @@ fn dispatch_auth_in_startup_scram(
         // Any non-`Sasl` auth code in this state is an auth-method
         // mismatch: the SCRAM client expected the server to offer
         // SASL mechanisms but got a different code instead.
-        // `CleartextPassword` / `Md5Password` (DEF-215 / DEF-216
-        // foundation): a SCRAM client refuses to downgrade to a
-        // weaker password-auth method even if it carries credentials
-        // (security: prevents server-side downgrade attacks).
-        // `Ok` here means the server accepted nothing without
-        // asking — also a mismatch from the client's POV.
-        // Tier-1 exhaustive — a future new `AuthSubCode` variant
-        // forces this match to be updated.
+        // `CleartextPassword` / `Md5Password`: a SCRAM client
+        // refuses to downgrade to a weaker password-auth method
+        // even if it carries credentials (security: prevents
+        // server-side downgrade attacks). `Ok` here means the
+        // server accepted nothing without asking — also a mismatch
+        // from the client's POV. Tier-1 exhaustive — a future new
+        // `AuthSubCode` variant forces this match to be updated.
         other @ (crate::wire::AuthSubCode::Ok
             | crate::wire::AuthSubCode::CleartextPassword
             | crate::wire::AuthSubCode::Md5Password
@@ -1662,7 +1628,7 @@ fn dispatch_auth_in_startup_scram(
 
 /// Check if the SASL mechanism list contains SCRAM-SHA-256.
 ///
-/// DEF-184 (B12): happy-path fast-check — most servers announce
+/// Happy-path fast-check — most servers announce
 /// `"SCRAM-SHA-256\0\0"` as the only mechanism (or first), so a
 /// single `starts_with` covers the common case in one compare
 /// instead of a full NUL-split loop. Falls through to the generic
@@ -1714,33 +1680,33 @@ fn mechanism_list_contains_scram(data: &[u8]) -> bool {
 /// Rust for capability-proof parameters — see
 /// e.g. `std::marker::Unpin` witness patterns).
 ///
-/// # Audit A2 + DEF-097
+/// # Trust-vs-Scram separation
 ///
-/// The `Credentials`-vs-`ScramPassword` split happens exactly once at
-/// `ScramSession::from_password`; this function cannot be reached
+/// The `Credentials`-vs-`ScramPassword` split happens exactly once
+/// at `ScramSession::from_password`; this function cannot be reached
 /// from a Trust-credentials push path because the state variant it
 /// destructures from (`ConnectingStartupScram { scram, .. }`) carries
 /// a `ScramSession`, not a `Credentials`.
 ///
 /// [`ScramSession`]: crate::scram::session::ScramSession
-/// DEF-210 PERF-02 (audit 2026-05-04): writes `client_first_bare`
-/// and `client_nonce_b64` directly into the caller's
-/// `&mut ScramSession` (single source of truth for handshake
-/// state — see `ScramSession` struct docstring). Returns only
-/// the [`WriteRange`] for the wire bytes to send.
+///
+/// Writes `client_first_bare` and `client_nonce_b64` directly into
+/// the caller's `&mut ScramSession` (single source of truth for
+/// handshake state — see `ScramSession` struct docstring). Returns
+/// only the [`WriteRange`] for the wire bytes to send.
 fn build_sasl_initial_response(
     scram: &mut crate::scram::session::ScramSession,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> Result<crate::action::WriteRange, ProtocolError> {
     use crate::scram::wire;
 
-    // DEF-185 P2-F (audit 2026-04-24): PG convention — the SCRAM
-    // `n=<user>` field is hard-coded empty because the real user
-    // name travelled in the StartupMessage's `user` parameter. PG's
-    // SCRAM implementation explicitly ignores the SASL-level user
-    // (see PG src/backend/libpq/auth-scram.c — the `user` from
-    // client-first is never consulted; authentication is bound to
-    // the startup user).
+    // PG convention — the SCRAM `n=<user>` field is hard-coded
+    // empty because the real user name travelled in the
+    // StartupMessage's `user` parameter. PG's SCRAM implementation
+    // explicitly ignores the SASL-level user (see PG
+    // src/backend/libpq/auth-scram.c — the `user` from client-first
+    // is never consulted; authentication is bound to the startup
+    // user).
     //
     // RFC 5802 §5.1 allows an empty `saslname` per RFC 4013 SASLprep.
     // PG-specific clients set `n=` verbatim; non-PG SCRAM servers
@@ -1760,14 +1726,14 @@ fn build_sasl_initial_response(
     let client_first_msg =
         wire::build_client_first_message(user_bytes, &client_nonce_vec).map_err(ProtocolError::Scram)?;
 
-    // DEF-154 (B) escape hatch: SCRAM auth is a cold handshake path
-    // that predates the branded push_* helpers. The scram::wire
-    // builders hand back owned heapless::Vec; we push those bytes
-    // into the branded reserved via `as_write_buf_mut()`. The brand
-    // is preserved by the enclosing `reserved: &mut BrandedWriteReserved<'wb>` —
-    // `as_write_buf_mut` returns &mut WriteBuf without a brand, and
-    // the pushed range is wrapped via `WriteRange::from_write_span`
-    // below against the same reserved.
+    // SCRAM auth is a cold handshake path. The scram::wire builders
+    // hand back owned heapless::Vec; the bytes are pushed into the
+    // branded reserved via `as_write_buf_mut()`. The brand is
+    // preserved by the enclosing
+    // `reserved: &mut BrandedWriteReserved<'wb>` —
+    // `as_write_buf_mut` returns `&mut WriteBuf` without a brand,
+    // and the pushed range is wrapped via
+    // `WriteRange::from_write_span` below against the same reserved.
     let start = reserved.len();
     let buf = reserved.as_write_buf_mut();
     buf.push_u8(crate::wire::TAG_SASL_RESPONSE.byte())
@@ -1786,52 +1752,44 @@ fn build_sasl_initial_response(
     })
     .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
 
-    // DEF-210 PERF-02: populate the SCRAM session's
-    // client_first_bare + client_nonce_b64 fields IN PLACE
-    // (vs. returning them by value to be re-Boxed). The caller's
+    // Populate the SCRAM session's client_first_bare +
+    // client_nonce_b64 fields IN PLACE — a naive shape that returned
+    // them by value would force a re-Box and break the
+    // single-allocation invariant. The caller's
     // `Box<ScramSession>` is reused across the StartupScram →
     // ServerFirst transition with zero allocator ops.
     scram.client_first_bare = crate::ident::PodBytes::try_from_slice(&client_first_bare_vec)
         .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
     scram.client_nonce_b64 = crate::ident::PodBytes::try_from_slice(&client_nonce_vec)
         .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
-    // DEF-154 (B) P0-2: `from_branded_write_span` returns Result;
-    // `?` propagates up through the function's own Result return
-    // type. Err here classifies as `EmptyWriteRange` — dead under
-    // intact SCRAM invariants.
+    // `from_write_span` returns `Result`; `?` propagates up
+    // through the function's own Result return type. Err here
+    // classifies as `EmptyWriteRange` — dead under intact SCRAM
+    // invariants.
     crate::action::WriteRange::from_write_span(start, reserved)
 }
 
 /// Dispatch AuthenticationSASLContinue (server-first-message).
 ///
-/// Takes a [`ScramSession`] by value — the `Trust`-vs-`ScramPassword`
-/// discrimination was consumed at
+/// Takes a [`ScramSession`] by reference — the
+/// `Trust`-vs-`ScramPassword` discrimination was consumed at
 /// [`ScramSession::try_from_credentials`] in the parent dispatch
 /// call; this function cannot be reached with `Trust` credentials
 /// because the state variant it destructures from
 /// ([`ProtoState::ConnectingScramAwaitingServerFirst`]) carries
-/// `ScramSession`, not `Credentials`. Audit A2.
+/// `ScramSession`, not `Credentials`.
 ///
 /// [`ScramSession`]: crate::scram::session::ScramSession
 /// [`ScramSession::try_from_credentials`]: crate::scram::session::ScramSession::try_from_credentials
-// DEF-184 (A10/B22 revert 2026-04-24): 7-arg function — within
-// clippy::too_many_arguments default threshold. No `#[expect]` needed.
 //
-// DEF-187 (architect 2026-04-26): SCRAM data is heap-boxed inside
-// the variant for variant-size compaction.
-//
-// DEF-210 REC-06 (audit 2026-04-28): the three SCRAM-handshake
-// fields previously each in their own Box are now consolidated
-// inside `Box<ScramHandshakeState>` carried by
+// The three SCRAM-handshake fields are consolidated inside one
+// `Box<ScramSession>` carried by
 // `ConnectingScramAwaitingServerFirst`. The caller destructures
-// `*handshake` and passes `scram` BY REFERENCE (helper only reads
-// `scram.password_bytes()` once for HMAC composition; no need to
-// memcpy ~520 B onto this helper's stack frame, no need to re-Box).
-// `client_first_bare` and `client_nonce_b64` move by value into the
-// helper (caller drops them when the arm scope exits). Net per
-// SCRAM handshake: pre-REC-06 was 0 allocs + 3 Box-frees at this
-// arm; post-REC-06 is 0 allocs + 1 Box-free (the consolidated
-// `Box<ScramHandshakeState>`).
+// the variant and passes `scram` BY REFERENCE (helper only reads
+// `scram.with_password_bytes(...)` once for HMAC composition; no
+// memcpy of ~520 B onto this helper's stack frame, no re-Box). Net
+// per SCRAM handshake: 0 allocs + 1 Box-free (the consolidated
+// `Box<ScramSession>`).
 fn dispatch_auth_sasl_continue(
     state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
@@ -1860,7 +1818,7 @@ fn dispatch_auth_sasl_continue(
         };
 
     // Build client-final-without-proof. (Order-of-bindings note:
-    // Bundle E moved this above the password computation since the
+    // this lands above the password computation because the
     // closure-scoped `with_password_bytes` borrows `scram` and
     // forces all `scram.*` reads outside its scope.)
     let client_final_without_proof =
@@ -1877,24 +1835,23 @@ fn dispatch_auth_sasl_continue(
     //
     // AuthMessage = client-first-bare + "," + server-first + "," +
     // client-final-without-proof. The three components are passed
-    // separately — compute_client_proof feeds them incrementally into
-    // HMAC::update(), with zero intermediate buffer. No staging
-    // buffer → no silent-truncation class → tier-1 by construction.
-    // F54: `compute_client_proof` returns Result on architecturally-
-    // dead `HmacKeyRejected` path. On Err (supply-chain compromise of
-    // RustCrypto's HMAC, etc.), tear down the handshake with a typed
-    // diagnostic — don't continue with zero-filled bytes. Fail-closed.
+    // separately — `compute_client_proof` feeds them incrementally
+    // into `HMAC::update()`, with zero intermediate buffer. No
+    // staging buffer → no silent-truncation class → tier-1 by
+    // construction. `compute_client_proof` returns `Result` on the
+    // architecturally-dead `HmacKeyRejected` path. On Err (supply-
+    // chain compromise of RustCrypto's HMAC, etc.), the handshake
+    // tears down with a typed diagnostic — no continuation with
+    // zero-filled bytes. Fail-closed.
     //
-    // DEF-280 Bundle E (2026-05-18): closure-scope
-    // `ScramSession::with_password_bytes` replaces the pre-Bundle E
-    // `let password_bytes = scram.password_bytes()` borrow that
-    // could (per Rust lifetimes) live across the subsequent code
-    // until scram's scope-exit but explicitly invited the
-    // discipline-by-docstring «callers must not cache it past the
-    // call boundary». Post-Bundle E the `&[u8]` is HRTB-scoped to
-    // the closure body — the compute_client_proof call — and cannot
-    // escape. Password bytes physically die at closure return; only
-    // the resulting `(proof, expected_server_sig)` tuple survives.
+    // The closure-scoped `ScramSession::with_password_bytes`
+    // HRTB-binds the `&[u8]` to the closure body — the
+    // `compute_client_proof` call — and prevents it from escaping.
+    // Password bytes physically die at closure return; only the
+    // resulting `(proof, expected_server_sig)` tuple survives. A
+    // naive borrow-and-return shape would invite the discipline-
+    // by-docstring «callers must not cache it past the call
+    // boundary» — banned.
     let client_first_bare = scram.client_first_bare.as_slice();
     let proof_result = scram.with_password_bytes(|password_bytes| {
         crate::scram::crypto::compute_client_proof(
@@ -1913,7 +1870,7 @@ fn dispatch_auth_sasl_continue(
 
     // Base64-encode proof.
     //
-    // DEF-185 P1-A (audit 2026-04-24): stack buffer holds base64
+    // Stack buffer holds base64
     // ClientProof — password-correlated via `SHA-256(ClientKey) =
     // StoredKey`, and `proof = ClientKey XOR HMAC(StoredKey, AuthMessage)`.
     // A core-dump attacker with the base64-decoded proof + AuthMessage
@@ -1936,15 +1893,16 @@ fn dispatch_auth_sasl_continue(
 
     // Build client-final-message.
     //
-    // DEF-185 P1-A (audit 2026-04-24): `client_final_msg` contains the
-    // embedded `p=<proof_b64>` payload — password-correlated via the
-    // same StoredKey algebra as proof_b64_buf. The `heapless::Vec` it
-    // lives in does NOT implement `Zeroize` (upstream crate), so we
-    // cannot wrap in `Zeroizing`. Instead, after the value has been
-    // copied into the write buffer (push_bytes call below), zeroize
-    // the heapless::Vec's backing bytes in-place via
+    // `client_final_msg` contains the embedded `p=<proof_b64>`
+    // payload — password-correlated via the same StoredKey algebra
+    // as `proof_b64_buf`. The `heapless::Vec` it lives in does NOT
+    // implement `Zeroize` (upstream crate), so the `Zeroizing` wrap
+    // is unavailable here. Instead, after the value has been copied
+    // into the write buffer (push_bytes call below), the heapless::
+    // Vec's backing bytes are zeroized in-place via
     // `Zeroize::zeroize()` on the mut slice (slice impl exists
-    // upstream). Done just before the Vec drops at function scope end.
+    // upstream). Done just before the Vec drops at function scope
+    // end.
     let mut client_final_msg = match crate::scram::wire::build_client_final_message(
         server_first.server_nonce.as_bytes(),
         proof_b64,
@@ -1955,10 +1913,10 @@ fn dispatch_auth_sasl_continue(
         }
     };
 
-    // DEF-154 (B): build SASLResponse frame via the branded reserved.
-    // Escape hatch as_write_buf_mut() for the pre-DEF-154 (B)
-    // Result-returning push path; WriteRange wraps the span
-    // at the end via `from_branded_write_span`.
+    // Build SASLResponse frame via the branded reserved using the
+    // `as_write_buf_mut()` escape hatch for the Result-returning
+    // push path; `WriteRange::from_write_span` wraps the span at
+    // the end.
     let start = reserved.len();
     {
         let buf = reserved.as_write_buf_mut();
@@ -1967,38 +1925,39 @@ fn dispatch_auth_sasl_continue(
                 .with_length_prefix(|w| w.push_bytes(&client_final_msg))
                 .is_err()
         {
-            // DEF-185 P1-A: scrub client_final_msg before early-return
+            // Scrub client_final_msg before early-return
             // classification. The buffer's bytes may contain partial
-            // `p=<proof_b64>` payload depending on when the push failed.
+            // `p=<proof_b64>` payload depending on when the push
+            // failed.
             use zeroize::Zeroize;
             client_final_msg.as_mut_slice().zeroize();
             return install_errored(state, Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow));
         }
     }
-    // DEF-185 P1-A: scrub the password-correlated client_final_msg
-    // contents now that it has been copied into the write buffer.
-    // The write buffer itself is zeroed on `WriteBuf::clear()` per
-    // P0-B separately. Without this step the 384-byte heapless::Vec
-    // backing array would hold `p=<proof_b64>` until this function's
-    // stack frame gets overwritten by a subsequent call.
+    // Scrub the password-correlated client_final_msg contents now
+    // that they have been copied into the write buffer. The write
+    // buffer itself is zeroed on `WriteBuf::clear()` separately.
+    // Without this step the 384-byte heapless::Vec backing array
+    // would hold `p=<proof_b64>` until this function's stack frame
+    // is overwritten by a subsequent call.
     use zeroize::Zeroize;
     client_final_msg.as_mut_slice().zeroize();
-    // DEF-154 (B) P0-2: `from_branded_write_span` returns Result.
-    // Err is architecturally dead here — the SASL_RESPONSE frame
-    // body always has the 1-byte tag + 4-byte length prefix + the
-    // client-final-message which is non-empty by SCRAM protocol.
-    // Classified as `EmptyWriteRange` if triggered.
+    // `from_write_span` returns `Result`. Err is architecturally
+    // dead here — the SASL_RESPONSE frame body always has the
+    // 1-byte tag + 4-byte length prefix + the client-final-message
+    // which is non-empty by SCRAM protocol. Classified as
+    // `EmptyWriteRange` if triggered.
     let range = match crate::action::WriteRange::from_write_span(start, reserved) {
         Ok(r) => r,
         Err(cause) => return install_errored(state, Some(reply.consume()), cause),
     };
 
-    // DEF-184 (A10/B22 revert 2026-04-24): `expected_server_sig` moves
-    // INTO the variant — tier-1 compile (CREDO §1: variant-carries-field).
-    // The `scram` ScramSession consumed here (moved into this function)
-    // is NOT needed by the next state; its drop here fires
-    // `ZeroizeOnDrop` — password material scrubbed exactly when the
-    // handshake no longer needs it.
+    // `expected_server_sig` moves INTO the variant — tier-1
+    // compile (CREDO §1: variant-carries-field). The `scram`
+    // ScramSession consumed here (moved into this function) is
+    // NOT needed by the next state; its drop here fires
+    // `ZeroizeOnDrop` — password material scrubbed exactly when
+    // the handshake no longer needs it.
     *state = ProtoState::ConnectingScramAwaitingServerFinal {
         reply,
         expected_server_sig,
@@ -2034,7 +1993,7 @@ fn dispatch_auth_sasl_final(
         }
     };
 
-    // Constant-time comparison (DEF-039).
+    // Constant-time comparison.
     if !bool::from(expected_server_sig.ct_eq(&received_sig)) {
         return install_errored(state, Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::SignatureMismatch));
     }
@@ -2069,11 +2028,11 @@ fn dispatch_auth_ok_after_scram(
 }
 
 // -----------------------------------------------------------------
-// Cleartext-password handshake — DEF-215 (2026-05-05)
+// Cleartext-password handshake
 // -----------------------------------------------------------------
 
 /// Dispatch an Authentication message while in
-/// [`ProtoState::ConnectingStartupCleartext`]. DEF-215.
+/// [`ProtoState::ConnectingStartupCleartext`].
 ///
 /// Only `AUTH_CLEARTEXT_PASSWORD` (sub-code 3) is acceptable here:
 /// any other code means the server expects an auth method this
@@ -2135,7 +2094,7 @@ fn dispatch_auth_in_startup_cleartext(
 }
 
 /// Dispatch an Authentication message while in
-/// [`ProtoState::ConnectingCleartextAwaitingAuthOk`]. DEF-215.
+/// [`ProtoState::ConnectingCleartextAwaitingAuthOk`].
 ///
 /// Mirror of [`dispatch_auth_ok_after_scram`]: only `AUTH_OK` is
 /// acceptable; any other code or any other frame-tag is an
@@ -2165,7 +2124,6 @@ fn dispatch_auth_ok_after_cleartext(
 }
 
 /// Build the `PasswordMessage` frame for cleartext-password auth.
-/// DEF-215 (2026-05-05).
 ///
 /// PG protocol §55.7: the frame is `'p'` (`TAG_SASL_RESPONSE` —
 /// the byte is shared between SASL response and generic password
@@ -2173,24 +2131,23 @@ fn dispatch_auth_ok_after_cleartext(
 /// (length includes itself + body) + password bytes + NUL
 /// terminator.
 ///
-/// The length-prefix wrapper handles the BE u32 framing; we push
-/// password bytes followed by the trailing NUL inside the closure.
+/// The length-prefix wrapper handles the BE u32 framing; the
+/// closure pushes password bytes followed by the trailing NUL.
 ///
 /// # Tier-1 architectural-impossibility of `WriteBufFull`
 ///
-/// DEF-215 + DEF-216 audit (2026-05-07): the `Err(WriteBufFull)`
-/// arm propagated through `?` is **architecturally unreachable**
-/// per the const-assert
+/// The `Err(WriteBufFull)` arm propagated through `?` is
+/// **architecturally unreachable** per the const-assert
 /// `MAX_OWNED_SEND_LEN >= max_password_message_size()` in
-/// `write_buf.rs`. The error path is preserved as defence in
-/// depth (and to keep the function signature uniform with sibling
+/// `write_buf.rs`. The error path is preserved as defence in depth
+/// (and to keep the function signature uniform with sibling
 /// builders that DO have legitimate runtime overflow paths), but
 /// any actual `Err` here would indicate a const-assert drift —
 /// itself a build error. Routed through
 /// `InternalCrateBug { BuilderCapacityOverflow }` via the existing
 /// `From<WriteBufFull> for ProtocolError` impl on the unlikely
-/// path; that classification gives forensic visibility if a
-/// future contributor disables the const-assert.
+/// path; that classification gives forensic visibility if a future
+/// contributor disables the const-assert.
 fn build_password_message(
     password: &crate::sensitive::Sensitive<crate::password::Password>,
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
@@ -2198,12 +2155,12 @@ fn build_password_message(
     let start = reserved.len();
     let buf = reserved.as_write_buf_mut();
     buf.push_u8(crate::wire::TAG_SASL_RESPONSE.byte())?;
-    // DEF-280 Bundle E (2026-05-18): closure-scope
-    // Sensitive::with_inner replaces the pre-Bundle E
-    // `password.get().as_bytes()` chain. The `&Password` borrow is
-    // HRTB-scoped to the inner closure; the `as_bytes()` slice
-    // borrows from `&Password` and cannot escape past the closure
-    // either (transitively HRTB-bounded).
+    // Closure-scope `Sensitive::with_inner` HRTB-binds the
+    // `&Password` borrow to the inner closure; the `as_bytes()`
+    // slice borrows from `&Password` and cannot escape past the
+    // closure either (transitively HRTB-bounded). A naive
+    // `password.get().as_bytes()` chain would invite the borrow to
+    // live past the call boundary.
     buf.with_length_prefix(|w| {
         password.with_inner(|pwd| w.push_bytes(pwd.as_bytes()))?;
         // PG requires NUL-terminated password in the PasswordMessage
@@ -2216,11 +2173,11 @@ fn build_password_message(
 }
 
 // -----------------------------------------------------------------
-// MD5-password handshake — DEF-216 (2026-05-05)
+// MD5-password handshake
 // -----------------------------------------------------------------
 
 /// Dispatch an Authentication message while in
-/// [`ProtoState::ConnectingStartupMd5`]. DEF-216.
+/// [`ProtoState::ConnectingStartupMd5`].
 ///
 /// Only `AUTH_MD5_PASSWORD` (sub-code 5) carrying a valid 4-byte
 /// salt is acceptable here. Any other code → `UnsupportedAuthMethod`.
@@ -2302,8 +2259,9 @@ fn dispatch_auth_in_startup_md5(
 }
 
 /// Dispatch an Authentication message while in
-/// [`ProtoState::ConnectingMd5AwaitingAuthOk`]. DEF-216. Mirror of
-/// [`dispatch_auth_ok_after_cleartext`] / [`dispatch_auth_ok_after_scram`].
+/// [`ProtoState::ConnectingMd5AwaitingAuthOk`]. Mirror of
+/// [`dispatch_auth_ok_after_cleartext`] /
+/// [`dispatch_auth_ok_after_scram`].
 fn dispatch_auth_ok_after_md5(
     state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
@@ -2329,7 +2287,6 @@ fn dispatch_auth_ok_after_md5(
 }
 
 /// Build the `PasswordMessage` frame for MD5-password auth.
-/// DEF-216 (2026-05-05).
 ///
 /// Wire shape: `'p' (TAG_SASL_RESPONSE)` + BE u32 length + 35-byte
 /// MD5 response body (`"md5" + 32 hex chars`) + NUL terminator.
@@ -2350,19 +2307,17 @@ fn build_md5_password_message(
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
 ) -> Result<crate::action::WriteRange, ProtocolError> {
     // Compute the 35-byte response body. `compute_response_body`
-    // returns an owned `Zeroizing<[u8; 35]>` (DEF-216 Phase 2
-    // audit 2026-05-07: tier-1 type-level array signature — the
-    // caller cannot accidentally pass a wrong-size buffer or a
-    // buffer that wouldn't be fully overwritten). The returned
-    // array scrubs on drop at fn return.
+    // returns an owned `Zeroizing<[u8; 35]>` — tier-1 type-level
+    // array signature so the caller cannot accidentally pass a
+    // wrong-size buffer or a buffer that wouldn't be fully
+    // overwritten. The returned array scrubs on drop at fn return.
     //
-    // DEF-280 Bundle E (2026-05-18): closure-scope
-    // Sensitive::with_inner replaces the pre-Bundle E
-    // `handshake.password.get()` borrow. The `&Password` lives
-    // HRTB-scoped to the closure body — `compute_response_body`
-    // reads it for the MD5 digest computation, the digest result
-    // (35-byte Zeroizing array) is the value returned from the
-    // closure (R is independent of the password borrow lifetime).
+    // Closure-scope `Sensitive::with_inner` HRTB-binds the
+    // `&Password` borrow to the closure body —
+    // `compute_response_body` reads it for the MD5 digest
+    // computation, the digest result (35-byte Zeroizing array) is
+    // the value returned from the closure (R is independent of the
+    // password borrow lifetime).
     let user_bytes = handshake.user.as_bytes();
     let body = handshake.password.with_inner(|pwd| {
         crate::md5::compute_response_body(pwd, user_bytes, salt)
@@ -2387,23 +2342,20 @@ fn build_md5_password_message(
 // Helper: parse ErrorResponse typed fields
 // -----------------------------------------------------------------
 
-/// DEF-184 (audit #3 A-11): dedicated parser return type.
+/// Dedicated parser return type for [`parse_error_response`].
 ///
-/// Pre-audit, [`parse_error_response`] returned `ProtocolError` —
-/// coupling parser output to the public error shape. The three
-/// fields of `ServerErrorResponse` were packed/unpacked twice (once
-/// at the `ProtocolError::ServerErrorResponse { .. }` construction
-/// in the parser, once at the `let ProtocolError::ServerErrorResponse
-/// { .. } = err else { ... }` deconstruction in `parse_and_resolve`
-/// and any future introspection site). A variant-rename refactor on
-/// `ProtocolError` would ripple into the parser body and every
-/// caller unless the parser outputs a shape-stable struct.
-///
-/// Post-audit: parser returns `ParsedServerError` (struct with
-/// public fields); callers wanting the public `ProtocolError` use
-/// [`Self::into_protocol_error`]. The struct is crate-private —
-/// exposing it on the public API would create a second shape for
-/// the same data.
+/// `parse_error_response` returns this struct; callers wanting the
+/// public `ProtocolError` use [`Self::into_protocol_error`]. The
+/// struct is crate-private — exposing it on the public API would
+/// create a second shape for the same data. A naive shape that
+/// returned `ProtocolError` directly would couple parser output to
+/// the public error shape: the three fields of
+/// `ServerErrorResponse` would be packed/unpacked twice (once at
+/// the `ProtocolError::ServerErrorResponse { .. }` construction
+/// site, once at the `let ProtocolError::ServerErrorResponse { ..
+/// } = err else { ... }` deconstruction in `parse_and_resolve` and
+/// any future introspection site), and a variant-rename refactor
+/// would ripple into every caller.
 ///
 /// # Layout
 ///
@@ -2450,11 +2402,11 @@ impl ParsedServerError {
 /// frame (`'E'` tag). The `#[cold]` attribute tells LLVM to keep the
 /// body out of hot-path inlining scope.
 ///
-/// DEF-184 (audit #3 A-11): returns [`ParsedServerError`] struct
-/// instead of `ProtocolError`. Callers that want the public error
-/// shape use `.into_protocol_error()`; callers that want to inspect
-/// the parsed fields (e.g. test helper, future diagnostic layers)
-/// access the struct fields directly.
+/// Returns [`ParsedServerError`] (a shape-stable struct). Callers
+/// that want the public error shape use `.into_protocol_error()`;
+/// callers that want to inspect the parsed fields (e.g. test
+/// helper, future diagnostic layers) access the struct fields
+/// directly.
 #[cold]
 fn parse_error_response(
     payload: &[u8],
@@ -2462,63 +2414,61 @@ fn parse_error_response(
 ) -> ParsedServerError {
     use crate::error::{Severity, SqlStateCode};
     use crate::ident::SecretBoundedStr;
-    // DEF-060 part 2: typed fields. Severity → enum (1 byte);
-    // code → SqlStateCode ([u8;5]); message/detail/hint →
-    // SecretBoundedStr<N> (DEF-205 — non-Copy, ZeroizeOnDrop) with
-    // explicit truncation marker (no
-    // `.unwrap_or_default()` silent-truncation).
+    // Typed fields. Severity → enum (1 byte); code → SqlStateCode
+    // ([u8;5]); message/detail/hint → `SecretBoundedStr<N>`
+    // (non-Copy, ZeroizeOnDrop) with explicit truncation marker
+    // (no `.unwrap_or_default()` silent-truncation).
     //
-    // Architect audit #3 (2026-04-21): `severity_set: bool` +
-    // `severity = Severity::Unknown` pair collapsed into
-    // `Option<Severity>`. Tier-3 audit (the bool flip had to stay
-    // in sync with the enum assignment) → tier-1 compile (the
-    // `Option` discriminator and the `Some(Severity)` payload are
-    // the same value; impossible to desync). Niche-packed:
-    // `Severity::Unknown = 0` as `#[repr(u8)]` means `Option<Severity>`
-    // stays 1 byte (same as the prior `Severity` alone).
+    // Severity is `Option<Severity>` so an absent S/V field
+    // collapses cleanly. A naive `severity_set: bool` +
+    // `severity = Severity::Unknown` pair would force tier-3
+    // audit-by-discipline (the bool flip has to stay in sync with
+    // the enum assignment); `Option` makes desync impossible. Niche-
+    // packed: `Severity::Unknown = 0` as `#[repr(u8)]` means
+    // `Option<Severity>` stays 1 byte (same as `Severity` alone).
     let mut severity: Option<Severity> = None;
     let mut code = SqlStateCode::from_bytes(b"");
     let mut message: SecretBoundedStr<128> = SecretBoundedStr::default();
     let mut detail: SecretBoundedStr<96> = SecretBoundedStr::default();
     let mut hint: SecretBoundedStr<64> = SecretBoundedStr::default();
 
-    // DEF-064: bounded-iteration DoS shield. PG's documented
-    // ErrorResponse field set has ~18 tags total (S, V, C, M, D,
-    // H, P, p, q, W, s, t, c, n, F, L, R, plus future). A
-    // legitimate server sends each at most once. Cap at 32 — 2×
-    // headroom for any future addition. Beyond the cap, we stop
-    // parsing and use whatever fields we've already extracted.
+    // Bounded-iteration DoS shield. PG's documented ErrorResponse
+    // field set has ~18 tags total (S, V, C, M, D, H, P, p, q, W,
+    // s, t, c, n, F, L, R, plus future). A legitimate server sends
+    // each at most once. Cap at 32 — 2× headroom for any future
+    // addition. Beyond the cap, parsing stops and whatever fields
+    // have already been extracted are used.
     //
     // Without this cap the loop is still bounded by
-    // `payload.len() ≤ MAX_FRAME_LEN_FIELD ≈ 4KB` (pos advances
+    // `payload.len() ≤ MAX_FRAME_LEN_FIELD ≈ 4 KB` (pos advances
     // monotonically, `payload.get(pos)` returns `None` at
-    // end-of-payload), so a 4 KB pathological frame could
-    // produce ~1300 tight iterations. The cap keeps the work
-    // bounded to O(field_count) regardless of frame size. Tier-2
-    // structural — the invariant is enforced by the `for _ in
-    // 0..N` bound, not an audit of `pos` math.
+    // end-of-payload), so a 4 KB pathological frame could produce
+    // ~1300 tight iterations. The cap keeps the work bounded to
+    // O(field_count) regardless of frame size. Tier-2 structural —
+    // the invariant is enforced by the `for _ in 0..N` bound, not
+    // an audit of `pos` math.
     const MAX_ERROR_FIELDS: usize = 32;
 
-    // DEF-210 SR-06 + REC-09 drift pin (audit 2026-04-28): typed
-    // arms below extract structured fields into named locals
-    // (severity / code / message / detail / hint). If a contributor
-    // adds a new typed arm without raising the cap, an adversarial
-    // server can flood the leading 32 fields with noise and push
-    // a typed field out of range — silently lost diagnostic. The
-    // assert below catches that class: MAX_ERROR_FIELDS must hold
-    // at least 2× the typed-arm count (every typed field plus an
-    // equal-sized noise prefix). Updating the typed-arm list below
-    // requires updating this slice in lockstep — the slice is the
-    // source of truth for "how many typed extractors exist" and
-    // is referenced in the assert; manual lockstep with the arms
-    // is tier-3 by-discipline. (A full tier-1 lift would require
-    // reflective arm counting, which Rust does not expose.)
+    // Drift pin: typed arms below extract structured fields into
+    // named locals (severity / code / message / detail / hint). If
+    // a contributor adds a new typed arm without raising the cap,
+    // an adversarial server can flood the leading 32 fields with
+    // noise and push a typed field out of range — silently lost
+    // diagnostic. The assert below catches that class:
+    // `MAX_ERROR_FIELDS` must hold at least 2× the typed-arm count
+    // (every typed field plus an equal-sized noise prefix).
+    // Updating the typed-arm list below requires updating this
+    // slice in lockstep — the slice is the source of truth for
+    // "how many typed extractors exist" and is referenced in the
+    // assert; manual lockstep with the arms is tier-3 by-
+    // discipline (a full tier-1 lift would require reflective arm
+    // counting, which Rust does not expose).
     const KNOWN_TYPED_ERROR_FIELD_TAGS: &[u8] = b"SVCMDH";
     const _: () = assert!(
         MAX_ERROR_FIELDS >= KNOWN_TYPED_ERROR_FIELD_TAGS.len() * 2,
         "MAX_ERROR_FIELDS cap must be ≥ 2 × count of typed arms — \
          otherwise an adversarial flood can truncate a typed field \
-         out of the parsed prefix (DEF-210 SR-06).",
+         out of the parsed prefix.",
     );
 
     let mut pos: usize = 0;
@@ -2534,15 +2484,15 @@ fn parse_error_response(
 
         // Find NUL terminator for this field's value.
         //
-        // DEF-184 (B4): `iter().position(|&b| b == 0)` on the slice
-        // tail is LLVM-vectorisable (SIMD chunk-compare for u8
-        // slices ≥ 8 bytes). Pre-(184) was a byte-by-byte `while
-        // let Some(b) = payload.get(pos)` loop with per-iter
-        // `checked_add(1)` — O(N) with one compare + one bounds-
-        // check + one add per byte. Post-(184): single iterator
-        // scan that LLVM lowers to SIMD for long fields (error
-        // messages can be up to 128 bytes). ~3× on server-error
-        // parsing hot path — fired on every ServerErrorResponse.
+        // `iter().position(|&b| b == 0)` on the slice tail is
+        // LLVM-vectorisable (SIMD chunk-compare for u8 slices ≥ 8
+        // bytes). A naive byte-by-byte
+        // `while let Some(b) = payload.get(pos)` loop with per-
+        // iter `checked_add(1)` would be O(N) with one compare +
+        // one bounds-check + one add per byte; the iterator scan
+        // LLVM lowers to SIMD for long fields (error messages can
+        // be up to 128 bytes) — ~3× faster on the server-error
+        // parsing path that fires on every ServerErrorResponse.
         let start = pos;
         // Single match on the natural failure mode: `split_at_checked`
         // returns None iff `start > payload.len()`. The surrounding
@@ -2585,8 +2535,8 @@ fn parse_error_response(
             None => {
                 // No NUL terminator in remainder — wire-spec
                 // violation but tolerate by using rest-of-payload
-                // as the value (DEF-064 forward-compat). Exit
-                // loop next iter via `pos > payload.len()` peek.
+                // as the value (forward-compat). Exit loop next
+                // iter via `pos > payload.len()` peek.
                 value_bytes = tail;
                 pos = payload.len();
             }
@@ -2633,21 +2583,20 @@ fn parse_error_response(
         }
     }
 
-    // DEF-184 (A1+A13): allocate the bounded strings into the
-    // caller-supplied error arena; return the small ParsedServerError
-    // (16 B) with the ErrorRef handle.
+    // Allocate the bounded strings into the caller-supplied error
+    // arena; return the small `ParsedServerError` (16 B) with the
+    // `ErrorRef` handle.
     let details_ref = error_arena.alloc(crate::error_arena::ErrorPayload {
         message,
         detail,
         hint,
     });
     ParsedServerError {
-        // Tier-3 #30 (2026-05-19) — preserve the absence as `None`
-        // instead of collapsing to `Some(Severity::Unknown)`. The
-        // public API consumer (via ProtocolError::ServerErrorResponse)
-        // can now distinguish "server didn't send S/V" (None) from
-        // "server sent an unrecognised severity string"
-        // (Some(Severity::Unknown)).
+        // Preserve the absence as `None` instead of collapsing to
+        // `Some(Severity::Unknown)`. The public API consumer (via
+        // `ProtocolError::ServerErrorResponse`) can distinguish
+        // "server didn't send S/V" (None) from "server sent an
+        // unrecognised severity string" (Some(Severity::Unknown)).
         severity,
         code,
         details_ref,
@@ -2658,23 +2607,23 @@ fn parse_error_response(
 // Helper: parse BackendKeyData
 // -----------------------------------------------------------------
 
-/// 1c-1b helper: shared body for the `C` arm in both
-/// `AwaitingFirstResponse` and `StreamingRows` states. Transition to
-/// `AwaitingRfq { reply, command_tag }` on well-formed tag; classify
-/// missing-NUL / framing error as `Errored`.
+/// Shared body for the `C` arm in both
+/// `AwaitingFirstResponse` and `StreamingRows` states. Transitions
+/// to `AwaitingRfq { reply, command_tag }` on a well-formed tag and
+/// classifies a missing-NUL / framing error as `Errored`.
 ///
-/// Centralises the "`CommandComplete` → AwaitingRfq" invariant in one
-/// place — an arm-body edit in only one of the two call sites
+/// Centralises the "`CommandComplete` → AwaitingRfq" invariant in
+/// one place — an arm-body edit at only one of the two call sites
 /// would diverge silently; the helper makes the transition atomic.
 ///
-/// DEF-210 SR-01 Path C: pre-Path-C this helper took
-/// `schema_present: bool` and stamped it into the variant. The
-/// flag is gone — schema presence is observed via
-/// `PgProtocol::row_desc_slot.is_some()` at materialise. The two
-/// callsites (DML CommandComplete and SELECT StreamingRows
-/// CommandComplete) now only differ in the slot's prior population:
-/// DML never fired a 'T' arm, so slot is None; SELECT did, so slot
-/// is Some. Materialise reads the slot — no synchronised flag.
+/// Schema presence is observed via
+/// `PgProtocol::row_desc_slot.is_some()` at materialise — no
+/// synchronised flag. A naive shape would carry a
+/// `schema_present: bool` stamped into the variant; the two call
+/// sites (DML CommandComplete and SELECT StreamingRows
+/// CommandComplete) only differ in the slot's prior population (DML
+/// never fired a 'T' arm, so the slot is None; SELECT did, so it is
+/// Some).
 fn advance_to_awaiting_rfq(
     state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::QueryKind>,
@@ -2692,14 +2641,15 @@ fn advance_to_awaiting_rfq(
     }
 }
 
-/// 1c-3b helper: `CommandComplete` on the schema-bearing (SELECT)
-/// path → `BindExecuteAwaitingRfqSelect`. DEF-189: the variant carries
-/// no row_desc field; the schema lives in `PgProtocol::row_desc_slot`
-/// (parked at push time by `push_bind_execute`). The variant name
-/// `Select` is the tier-1 signal that the slot is populated.
+/// `CommandComplete` on the schema-bearing (SELECT) path →
+/// `BindExecuteAwaitingRfqSelect`. The variant carries no
+/// `row_desc` field; the schema lives in
+/// `PgProtocol::row_desc_slot` (parked at push time by
+/// `push_bind_execute`). The variant name `Select` is the tier-1
+/// signal that the slot is populated.
 ///
-/// The DML path's 'C' transition is inlined directly in the dispatch
-/// arm (one call-site only) and doesn't need a helper.
+/// The DML path's 'C' transition is inlined directly in the
+/// dispatch arm (one call-site only) and doesn't need a helper.
 fn advance_to_bindexecute_awaiting_rfq_select(
     state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::QueryKind>,
@@ -2717,30 +2667,32 @@ fn advance_to_bindexecute_awaiting_rfq_select(
     }
 }
 
-/// 1c-1b helper (pass-#7 audit, 2026-04-21): shared body for the
-/// `E` arm across multiple flows. Emit `FailReply` (NO `CloseSocket`
-/// — query-level errors are connection-survivable per PG §55.2.3)
-/// and transition to `DrainRfqAfterError` so the trailing `Z`
-/// returns the state to `Idle`.
+/// Shared body for the `E` arm across multiple flows. Emits
+/// `FailReply` (NO `CloseSocket` — query-level errors are
+/// connection-survivable per PG §55.2.3) and transitions to
+/// `DrainRfqAfterError` so the trailing `Z` returns the state to
+/// `Idle`.
 ///
-/// # Signature rationale — pre-consume at call site (F1)
+/// # Signature rationale — pre-consume at call site
 ///
-/// Pre-pass-#7 this was generic `<K: ReplyKind>` taking `ReplyId<K>`
-/// by value, forcing monomorphisation once per kind. Since the body
-/// only uses `reply.consume() -> NonZeroU64` (`K`-oblivious), every
-/// call site emitted an identical 3-instruction basic block. After
-/// pass-#7 the signature takes `raw_id: NonZeroU64` — the caller
-/// pre-consumes the typed `ReplyId<K>`, exactly mirroring the pattern
-/// `errored(Some(reply.consume()), …)` elsewhere in this module.
-/// LLVM now emits one function body for all kinds.
+/// The signature takes `raw_id: NonZeroU64` — the caller pre-
+/// consumes the typed `ReplyId<K>`. A naive `<K: ReplyKind>`
+/// generic taking `ReplyId<K>` by value would force
+/// monomorphisation once per kind; since the body only uses
+/// `reply.consume() -> NonZeroU64` (K-oblivious), every call site
+/// would emit an identical 3-instruction basic block. The
+/// pre-consumed shape lets LLVM emit one function body for all
+/// kinds and mirrors the `errored(Some(reply.consume()), …)`
+/// pattern elsewhere in this module.
 ///
-/// # `#[cold] #[inline]` (F2)
+/// # `#[cold] #[inline]`
 ///
 /// Error drain is a cold branch — typical dispatch iterations
 /// complete without encountering `ErrorResponse`. `#[cold]` pushes
 /// this body out of the hot-match I-cache footprint; `#[inline]`
 /// allows LLVM to fold the function into each call site when
-/// register pressure permits. Same treatment as `errored()` above.
+/// register pressure permits. Same treatment as `install_errored`
+/// above.
 #[cold]
 #[inline]
 fn advance_to_drain_after_error(
@@ -2765,24 +2717,23 @@ fn advance_to_drain_after_error(
 /// PG §55.7 `ReadyForQuery` carries exactly one byte: `'I'`, `'T'`,
 /// or `'E'`. Any other shape is a wire violation.
 ///
-/// # F-048 (pass-#8) — narrow return type
+/// # Narrow return type
 ///
 /// Returns `Result<TxStatus, usize>` — Err carries the offending
 /// `payload_len` as a bare `usize`. Callers wrap via
 /// `.map_err(|payload_len| ProtocolError::MalformedReadyForQuery { payload_len })`.
+/// A naive `Result<TxStatus, ProtocolError>` shape would force
+/// every dispatch arm to reserve ~304 B of stack for the return
+/// slot (dominated by `ProtocolError::ServerErrorResponse`); the
+/// narrow shape shrinks the slot to 16 B (usize + discriminant +
+/// padding) across 10+ dispatch call sites.
 ///
-/// Prior shape `Result<TxStatus, ProtocolError>` forced every dispatch
-/// arm to reserve ~304 B of stack for the return slot (dominated by
-/// ProtocolError::ServerErrorResponse). Narrowing to `Result<_, usize>`
-/// shrinks the slot to 16 B (usize + discriminant + padding). 10+
-/// dispatch call sites pay for this return.
+/// # Single-point classifier
 ///
-/// # F-013 consolidation
-///
-/// Centralised pass-#7 audit F13 — prior to F13 there were 4+ parallel
-/// `match payload { [b] => ..., other => ... }` patterns across every
-/// `*AwaitingRfq` state. Single-point classifier closes drift between
-/// handlers if a future change alters the `TxStatus` variant set.
+/// A naive shape would inline `match payload { [b] => ..., other
+/// => ... }` at every `*AwaitingRfq` state (4+ parallel sites);
+/// centralising here closes drift if a future change alters the
+/// `TxStatus` variant set.
 #[cold]
 #[inline]
 fn parse_rfq_payload(
@@ -2790,11 +2741,12 @@ fn parse_rfq_payload(
 ) -> Result<crate::action::TxStatus, usize> {
     match payload {
         // `[tx_byte]` pattern proves payload_len == 1 structurally.
-        // F-009: `try_from_byte` returns `Result<Self, u8>`; we drop
-        // the rejected byte and forward just the length-1 classification.
-        // Diagnostic-wise the rejected byte is not currently surfaced
-        // further upstream; if `MalformedReadyForQuery` gains a `byte`
-        // field in the future, this map_err flips to pass it through.
+        // `try_from_byte` returns `Result<Self, u8>`; the rejected
+        // byte is dropped here and only the length-1 classification
+        // is forwarded. Diagnostic-wise the rejected byte is not
+        // currently surfaced upstream; if `MalformedReadyForQuery`
+        // gains a `byte` field, this `map_err` flips to pass it
+        // through.
         [tx_byte] => crate::action::TxStatus::try_from_byte(*tx_byte).map_err(|_| 1usize),
         other => Err(other.len()),
     }
@@ -2811,8 +2763,8 @@ fn parse_rfq_payload(
 /// Capacity 32 bytes handles PG's documented tag shapes with
 /// headroom: the longest standard tag,
 /// `"INSERT <oid:10-digit> <n:10-digit>\0"`, is ~23 bytes.
-/// Overflow appends `"…"` rather than silently truncating (DEF-060
-/// pattern — BoundedStr's `from_str_truncating`).
+/// Overflow appends `"…"` rather than silently truncating
+/// (`BoundedStr::from_bytes_lossy`).
 ///
 /// Cold path: called once per completed command. Not on any
 /// per-row hot path.
@@ -2825,18 +2777,15 @@ fn parse_command_tag(payload: &[u8]) -> Result<crate::error::BoundedStr<32>, Pro
             payload_len: payload.len(),
         });
     };
-    // DEF-185 P2-7 (audit 2026-04-24): embedded NUL validation.
+    // Embedded NUL validation.
     //
-    // Pre-fix: PG CommandComplete body `SELECT\x00 5\x00` — strip_suffix
-    // removed the trailing NUL, leaving `SELECT\x00 5` with embedded
-    // NUL that `from_bytes_lossy` passed through verbatim (UTF-8
-    // validator accepts NUL as a valid codepoint). User saw
-    // `command_tag` with embedded NUL — weird but not exploitable.
-    //
-    // Post-fix: reject bodies containing embedded NUL as
-    // `MalformedCommandComplete`. PG's CommandComplete is NUL-terminated
-    // per §55.7 with the NUL strictly at the END; an interior NUL is a
-    // wire violation.
+    // A naive shape that only stripped the trailing NUL would leave
+    // a body like `SELECT\x00 5\x00` → `SELECT\x00 5` with an
+    // embedded NUL passed through verbatim (UTF-8 validator accepts
+    // NUL as a valid codepoint). PG's CommandComplete is
+    // NUL-terminated per §55.7 with the NUL strictly at the END; an
+    // interior NUL is a wire violation, classified as
+    // `MalformedCommandComplete` here.
     if body.contains(&0u8) {
         return Err(ProtocolError::MalformedCommandComplete {
             payload_len: payload.len(),
@@ -2909,10 +2858,9 @@ mod parse_error_response_tests {
         body
     }
 
-    /// DEF-184 (A1+A13): post-refactor test-fixture tuple —
-    /// (Option<Severity>, SqlStateCode, ErrorPayload). Tests build
-    /// expected tuples and compare against parsed actual via
-    /// `parse_and_resolve`. Tier-3 #30 (2026-05-19): severity is
+    /// Test-fixture tuple — (Option<Severity>, SqlStateCode,
+    /// ErrorPayload). Tests build expected tuples and compare
+    /// against parsed actual via `parse_and_resolve`. Severity is
     /// `Option<_>` to disambiguate "server didn't send" (None) from
     /// "server sent unknown" (Some(Severity::Unknown)).
     type ExpectedErr = (
@@ -2930,11 +2878,11 @@ mod parse_error_response_tests {
     ) -> ExpectedErr {
         use crate::error::{Severity, SqlStateCode};
         use crate::ident::SecretBoundedStr;
-        // Tier-3 #30 convention: an empty severity string means "no
-        // S/V field in the wire payload" — maps to `None`. A non-empty
-        // string maps to `Some(Severity::from_bytes(...))` which
-        // classifies known severities and falls back to
-        // `Severity::Unknown` for unrecognised strings.
+        // Convention: an empty severity string means "no S/V field
+        // in the wire payload" — maps to `None`. A non-empty string
+        // maps to `Some(Severity::from_bytes(...))` which classifies
+        // known severities and falls back to `Severity::Unknown`
+        // for unrecognised strings.
         let parsed_severity = if severity.is_empty() {
             None
         } else {
@@ -2951,38 +2899,29 @@ mod parse_error_response_tests {
         )
     }
 
-    /// DEF-184 (A1+A13): parse body using a fresh arena, resolve the
-    /// ErrorRef into full payload, and return the comparable tuple.
+    /// Parse `body` using a fresh arena, resolve the `ErrorRef`
+    /// into a full payload, and return the comparable tuple.
     ///
-    /// DEF-184 (audit #3 A-03): pre-audit used
-    /// `arena.get(details_ref).copied().unwrap_or_default()` — the
-    /// silent-fallback pattern banned per user feedback. Post-audit
-    /// the Result-returning `get()` is matched explicitly; the
-    /// Err branch panics with a locus (architecturally unreachable
-    /// by construction — `parse_error_response` always allocates
-    /// into the fresh arena; the returned ref's generation matches;
-    /// no intervening clear or realloc can fire here).
-    ///
-    /// DEF-184 (audit #3 A-11): pre-audit also had a defensive
-    /// `else { return (...) }` fallback for the non-ServerErrorResponse
-    /// branch, because the parser returned `ProtocolError`. Post-audit
-    /// `parse_error_response` returns the dedicated `ParsedServerError`
-    /// struct with unambiguous fields; the match-pattern + fallback is
-    /// replaced with direct field access.
+    /// The `arena.get(details_ref)` Err arm is architecturally
+    /// unreachable by construction (`parse_error_response` always
+    /// allocates into the fresh arena; the returned ref's
+    /// generation matches; no intervening clear or realloc can
+    /// fire here). A naive `.unwrap_or_default()` would form the
+    /// banned silent-fallback pattern; instead the Result is
+    /// asserted-ok and matched exhaustively, with the dead arm
+    /// inlined as an empty-payload sentinel.
     fn parse_and_resolve(body: &[u8]) -> ExpectedErr {
         let mut arena = crate::error_arena::ErrorArena::new();
         let parsed = parse_error_response(body, &mut arena);
         let r = arena.get(parsed.details_ref);
-        // Forbid-bundle compliance: `assert!(is_ok, ...) + match { Ok |
-        // Err(_) => fallback }` — the assert fires loudly if the
-        // invariant (parse always populates the fresh arena, no
-        // intervening clear) breaks; the structural match consumes
-        // `r.cloned()` exhaustively so the architecturally-dead Err
-        // arm doesn't trip the bundle's `unwrap_used` ban. The Err
-        // arm's fallback is inlined explicitly (deliberately-empty
-        // SecretBoundedStr fields) — previously routed through
-        // `ErrorPayload::dead_for_test()`, but the single call site
-        // does not justify a separate public API.
+        // Forbid-bundle compliance: `assert!(is_ok, ...) + match
+        // { Ok | Err(_) => fallback }` — the assert fires loudly
+        // if the invariant (parse always populates the fresh arena,
+        // no intervening clear) breaks; the structural match
+        // consumes `r.cloned()` exhaustively so the
+        // architecturally-dead Err arm doesn't trip the bundle's
+        // `unwrap_used` ban. The Err arm's fallback is inlined as
+        // empty `SecretBoundedStr` fields.
         assert!(
             r.is_ok(),
             "parse_error_response + arena.get Err {r:?} — architecturally unreachable \
@@ -3098,18 +3037,14 @@ mod parse_error_response_tests {
         assert_eq!(actual, expected);
     }
 
-    /// F22 regression: non-UTF-8 bytes in M/D/H fields are coerced to
-    /// `?` placeholders, preserving ASCII content, NOT silently
-    /// collapsed to empty.
-    ///
-    /// Before F22: `from_utf8(value).unwrap_or("")` → whole field lost
-    /// on any single invalid byte. A message like
-    /// `b"Ung\xFCltige Eingabe"` (Latin-1 "Ungültige Eingabe") would
-    /// become `""` — full diagnostic loss.
-    ///
-    /// After F22: ASCII subset preserved, non-ASCII byte → `?`.
-    /// `b"Ung\xFCltige Eingabe"` → `"Ung?ltige Eingabe"` — user still
-    /// sees 94% of the original message.
+    /// Non-UTF-8 bytes in M/D/H fields are coerced to `?`
+    /// placeholders, preserving ASCII content. A naive
+    /// `from_utf8(value).unwrap_or("")` shape would lose the entire
+    /// field on any single invalid byte; a message like
+    /// `b"Ung\xFCltige Eingabe"` (Latin-1 "Ungültige Eingabe")
+    /// would become `""` — full diagnostic loss. The lossy decoder
+    /// preserves the ASCII subset: `b"Ung\xFCltige Eingabe"` →
+    /// `"Ung?ltige Eingabe"`.
     #[test]
     fn non_utf8_message_preserves_ascii_subset() {
         // Latin-1 "Ungültige Eingabe" — the \xFC is ü in Latin-1,
@@ -3120,8 +3055,8 @@ mod parse_error_response_tests {
         assert_eq!(actual, expected);
     }
 
-    /// F22 regression: valid UTF-8 multibyte sequences pass through
-    /// unchanged (fast path).
+    /// Valid UTF-8 multibyte sequences pass through unchanged
+    /// (fast path).
     #[test]
     fn valid_utf8_message_preserved_verbatim() {
         // Proper UTF-8 "Ungültige Eingabe".
@@ -3131,9 +3066,9 @@ mod parse_error_response_tests {
         assert_eq!(actual, expected);
     }
 
-    /// F22 regression: slow-path control + high-bit bytes in an
-    /// invalid-UTF-8 payload all coerce to `?`. Ensures that binary
-    /// junk in a field doesn't produce an empty message.
+    /// Slow-path control + high-bit bytes in an invalid-UTF-8
+    /// payload all coerce to `?`. Ensures that binary junk in a
+    /// field doesn't produce an empty message.
     ///
     /// Note: the `0xFF` byte triggers slow-path (invalid UTF-8). In
     /// slow path, every byte that isn't ASCII printable or

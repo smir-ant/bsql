@@ -1,29 +1,31 @@
-//! Row-schema + row-body decoding primitives. Phase 1c-2a.
+//! Row-schema + row-body decoding primitives.
 //!
 //! `bsql-pg-proto` owns the raw wire encoding of a result-set: the
-//! `RowDescription` frame tells us column count, type OIDs, and per-column
-//! format codes; each `DataRow` frame carries the column values. This
-//! module parses `RowDescription` into [`RowDesc`] (shared between
-//! [`crate::Action::StreamRow`] and [`crate::Reply::QueryComplete`]) and
-//! will host the `DataRow` body parser + typed decoders in 1c-2b/c.
+//! `RowDescription` frame tells us column count, type OIDs, and
+//! per-column format codes; each `DataRow` frame carries the column
+//! values. This module parses `RowDescription` into [`RowDesc`]
+//! (shared between [`crate::Action::StreamRow`] and
+//! [`crate::Reply::QueryComplete`]) and hosts the typed-decoder
+//! primitives that materialise column bytes into Rust types.
 //!
 //! # Why POD + bounded capacity
 //!
-//! The crate is `no_alloc`. `RowDesc` is a flat inline struct holding
-//! a `[ColumnDesc; MAX_ROW_COLUMNS]` array alongside a `u16` populated
-//! count — `Copy`, no `Drop`. Result-sets with more than
-//! [`MAX_ROW_COLUMNS`] columns land in
+//! The crate is `no_alloc`. `RowDesc` is a flat inline struct
+//! holding a `[ColumnDesc; MAX_ROW_COLUMNS]` array alongside a
+//! `u16` populated count — `Copy`, no `Drop`. Result-sets with
+//! more than [`MAX_ROW_COLUMNS`] columns land in
 //! [`crate::ProtocolError::TooManyColumns`] at parse time (tier-2
 //! structural — the bound is enforced at construction, no silent
 //! truncation).
 //!
 //! # Tier notes
 //!
-//! Schema ingest is **tier-2 structural**. The parser produces `RowDesc`
-//! only on well-formed payloads (`MalformedRowDescription` on framing
-//! errors, `UnexpectedFormatCode` on values outside `{0, 1}` — round-4
-//! finding #5). A malformed response tears the connection down via the
-//! usual `Errored` outcome.
+//! Schema ingest is **tier-2 structural**. The parser produces
+//! `RowDesc` only on well-formed payloads
+//! (`MalformedRowDescription` on framing errors,
+//! `UnexpectedFormatCode` on values outside `{0, 1}`). A malformed
+//! response tears the connection down via the usual `Errored`
+//! outcome.
 //!
 //! Schema access is **tier-1 compile** on pairing:
 //! `Action::StreamRow` carries `&'r RowDesc` — the `'r` lifetime
@@ -32,9 +34,9 @@
 
 use core::fmt;
 
-/// Maximum columns per result-set supported by 1c-2. Queries returning
-/// more columns classify as [`crate::ProtocolError::TooManyColumns`] —
-/// the connection stays alive (recoverable), the user retries with a
+/// Maximum columns per result-set. Queries returning more columns
+/// classify as [`crate::ProtocolError::TooManyColumns`] — the
+/// connection stays alive (recoverable), the user retries with a
 /// narrower projection.
 ///
 /// 32 covers typical application queries with headroom. Widening this
@@ -52,9 +54,9 @@ pub const MAX_ROW_COLUMNS: usize = 32;
 ///   per-column in Extended Query via the Bind frame.
 ///
 /// Any other wire value classifies as
-/// [`crate::ProtocolError::UnexpectedFormatCode`] (round-4 finding #5).
+/// [`crate::ProtocolError::UnexpectedFormatCode`].
 ///
-/// # NOT `#[non_exhaustive]` — DEF-256 audit (2026-05-08)
+/// # NOT `#[non_exhaustive]`
 ///
 /// PG §55.2.2 defines exactly two format codes (`0` text, `1` binary)
 /// and the wire-protocol enumeration is closed by spec. A third value
@@ -83,12 +85,12 @@ impl FormatCode {
     /// and returns the offending code in `Err` for the caller to wrap
     /// into [`ProtocolError::UnexpectedFormatCode`].
     ///
-    /// # F32 (2026-04-21)
+    /// # Single classifier
     ///
-    /// Centralises the `{0, 1}` classification so future extended-query
-    /// sub-phases (1c-3b Describe / 1c-3c BindExecute) that also parse
-    /// format codes don't each rewrite the same match. A new illegal
-    /// value surfaces with identical diagnostic across every callsite.
+    /// Centralises the `{0, 1}` classification so consumers (Bind,
+    /// Describe, BindExecute) that also parse format codes don't
+    /// each rewrite the same match. A new illegal value surfaces
+    /// with identical diagnostic across every callsite.
     #[inline]
     pub const fn try_from_wire_i16(code: i16) -> Result<Self, i16> {
         match code {
@@ -98,10 +100,11 @@ impl FormatCode {
         }
     }
 
-    /// DEF-154 (V) P2-5 helper: the wire i16 representation.
-    /// Centralises the `self as i16` coercion in a match — matches
-    /// the `try_from_wire_i16` literals exactly. A body-swap drift
-    /// is caught by the round-trip const-assert below.
+    /// The wire `i16` representation. Centralises what would
+    /// otherwise be `self as i16` (banned by the forbid bundle) in
+    /// a match whose arms match the `try_from_wire_i16` literals
+    /// exactly. A body-swap drift is caught by the round-trip
+    /// const-assert below.
     #[inline]
     #[must_use]
     pub const fn as_wire_i16(self) -> i16 {
@@ -112,7 +115,7 @@ impl FormatCode {
     }
 }
 
-// DEF-154 (V) P2-5: round-trip compile pin for FormatCode.
+// Round-trip compile pin for FormatCode.
 const _: () = {
     assert!(
         matches!(FormatCode::try_from_wire_i16(FormatCode::Text.as_wire_i16()), Ok(FormatCode::Text)),
@@ -128,15 +131,16 @@ const _: () = {
 /// result-set. Bit `i` is `1` if column `i` is [`FormatCode::Binary`],
 /// `0` otherwise (default = [`FormatCode::Text`]).
 ///
-/// # DEF-194 (2026-04-27): tier-1 size win
+/// # Tier-1 size win
 ///
-/// Replaces the pre-DEF-194 storage `[FormatCode; MAX_ROW_COLUMNS]`
-/// (32 bytes for the 32-column inline cap). Storage is one `u32`,
-/// exactly the bit-width of [`MAX_ROW_COLUMNS`] (= 32). Saves 28 bytes
-/// per [`RowDesc`] and removes the `[FormatCode; 32]` niche from the
-/// outer struct (the new u32 storage is non-niche, so
-/// `Option<RowDesc>` may grow by one discriminant byte +
-/// alignment — net per-Option saving is 24-28 B depending on layout).
+/// Storage is one `u32`, exactly the bit-width of
+/// [`MAX_ROW_COLUMNS`] (= 32). A naive
+/// `[FormatCode; MAX_ROW_COLUMNS]` shape would burn 32 bytes for
+/// the 32-column inline cap, and the bit-packed form removes the
+/// `[FormatCode; 32]` niche from the outer struct (the new u32
+/// storage is non-niche, so `Option<RowDesc>` may grow by one
+/// discriminant byte + alignment — net per-Option saving is
+/// 24-28 B depending on layout).
 ///
 /// # Tier
 ///
@@ -152,14 +156,14 @@ const _: () = {
 /// `size_of::<FormatCodeSet>() == 4` const-assert and the build
 /// would fail — adding a field is a decision point, not a silent
 /// regression.
-// DEF-194 follow-up 2026-04-27 — `Default` derive REMOVED to eliminate
-// the tier-3 `Default::default() == empty()` audit gap. `Default::default`
-// is not const-fn-callable (RU-01: const traits unstable), so the
-// identity could only be verified via runtime test — a tier-3 surface
-// where a custom-impl Default could silently diverge from `empty()`.
-// Callers use `FormatCodeSet::empty()` explicitly; production search
-// confirms zero `::default()` consumers in the crate. **Tier-1 by
-// removal** — no surface = no possibility of drift.
+// `Default` derive deliberately absent to eliminate the tier-3
+// `Default::default() == empty()` audit gap. `Default::default` is
+// not const-fn-callable (const traits unstable), so the identity
+// could only be verified via runtime test — a tier-3 surface where
+// a custom-impl `Default` could silently diverge from `empty()`.
+// Callers use `FormatCodeSet::empty()` explicitly; production
+// search confirms zero `::default()` consumers in the crate. **Tier-1
+// by removal** — no surface = no possibility of drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct FormatCodeSet {
@@ -184,10 +188,10 @@ pub struct OutOfRange {
     pub max: usize,
 }
 
-// DEF-244 modernisation audit (rust-version 1.81): additive
-// `core::error::Error` impl — `OutOfRange` is a small ZST-shape error
-// sentinel signalling format-code-index out of range, used by callers
-// to detect MAX_ROW_COLUMNS / per-column index overrun.
+// Additive `core::error::Error` impl — `OutOfRange` is a small
+// ZST-shape error sentinel signalling format-code-index out of
+// range, used by callers to detect `MAX_ROW_COLUMNS` / per-column
+// index overrun.
 impl core::error::Error for OutOfRange {}
 
 impl fmt::Display for OutOfRange {
@@ -216,7 +220,7 @@ const _: () = assert!(
     core::mem::size_of::<FormatCodeSet>() == 4,
     "FormatCodeSet must remain 4 bytes (single u32). repr(transparent) \
      pins the layout; adding any field would break this invariant and \
-     erode the DEF-194 size win.",
+     erode the bit-packed size win.",
 );
 
 impl FormatCodeSet {
@@ -232,15 +236,15 @@ impl FormatCodeSet {
     /// Compute the bit-mask for column index `idx`. Returns `None`
     /// for `idx >= MAX_ROW_COLUMNS`.
     ///
-    /// Implementation: repeated `wrapping_mul(2)` instead of a single
-    /// `checked_shl`. Both forms are `const fn` stable, but the
-    /// shift-by-usize form requires a usize → u32 conversion in const
-    /// context which is **not yet const-stable** (RU-01 in
-    /// `deferred.md` §C — `TryFrom<usize> for u32` const-trait gated
-    /// on rust-lang/rust#143874). Repeated multiplication sidesteps
+    /// Implementation: repeated `wrapping_mul(2)` instead of a
+    /// single `checked_shl`. Both forms are `const fn` stable, but
+    /// the shift-by-usize form requires a usize → u32 conversion
+    /// in const context which is **not yet const-stable**
+    /// (`TryFrom<usize> for u32` const-trait gated on
+    /// rust-lang/rust#143874). Repeated multiplication sidesteps
     /// the conversion entirely; the const-eval cost is `O(idx)` at
-    /// **compile time only** (runtime accessors don't call this — see
-    /// the inline note below).
+    /// **compile time only** (runtime accessors don't call this —
+    /// see the inline note below).
     ///
     /// # Tier-1 round-trip enabler
     ///
@@ -277,10 +281,10 @@ impl FormatCodeSet {
     /// accessor's bound shields against constructor / refactor drift
     /// independently.
     ///
-    /// # `const fn` (DEF-194 follow-up 2026-04-27)
+    /// # `const fn`
     ///
-    /// Promoted to `const fn` so the round-trip pin block below can
-    /// verify `set(i, code) → get(i) == code` at **compile time** —
+    /// `const fn` so the round-trip pin block below can verify
+    /// `set(i, code) → get(i) == code` at **compile time** —
     /// elevating round-trip from tier-3 runtime-test to tier-1
     /// const-assert.
     #[inline]
@@ -346,7 +350,7 @@ impl FormatCodeSet {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// DEF-194 follow-up 2026-04-27 — tier-1 round-trip compile pin.
+// Tier-1 round-trip compile pin.
 // ─────────────────────────────────────────────────────────────────
 //
 // Verifies at COMPILE TIME that for every (idx, code) pair where
@@ -444,24 +448,21 @@ const _: () = {
     }
 };
 
-// DEF-194 follow-up 2026-04-27 — tier-1 elevation of OutOfRange field
-// preservation.
+// Tier-1 elevation of `OutOfRange` field preservation.
 //
-// Pre-(this pin): `set(idx, _).err().idx == idx` was verified by the
-// runtime test `set_out_of_range_returns_err_with_idx_field_preserved`
-// (tier-3). A field-swap regression where `set` returned
-// `OutOfRange { idx: 0, max }` (or `idx: max` etc.) instead of
-// `idx: caller_idx` would compile, propagate to operator diagnostics,
-// and pass static analysis — only the runtime test would notice.
-//
-// Post-(this pin): const-eval verifies the `.idx` and `.max` field
-// surface is preserved exactly through `set`'s OOR path. Tier-3 →
-// tier-1.
+// Const-eval verifies the `.idx` and `.max` field surface is
+// preserved exactly through `set`'s OOR path. A naive shape would
+// leave this to a runtime test: a field-swap regression where
+// `set` returned `OutOfRange { idx: 0, max }` (or `idx: max` etc.)
+// instead of `idx: caller_idx` would compile, propagate to operator
+// diagnostics, and pass static analysis — only the runtime test
+// would notice.
 //
 // Pattern: `assert!(result.is_err(), …)` first (guarantees the Ok
 // arm is unreachable in const-eval), then `match` with an empty Ok
-// arm (architecturally dead under the prior assertion). This avoids
-// `assert!(false, …)` which clippy::assertions_on_constants rejects.
+// arm (architecturally dead under the prior assertion). This
+// avoids `assert!(false, …)` which `clippy::assertions_on_constants`
+// rejects.
 const _: () = {
     // Three offending indices spanning the typical range: just past
     // the boundary (32), well-beyond (99), and pathological (usize::MAX).
@@ -511,16 +512,15 @@ const _: () = {
     assert!(s_c.raw_bits() == 0xdead_beef, "Failed set leaves state");
 };
 
-// DEF-194 follow-up 2026-04-27 — tier-1 elevation of raw_bits round-trip.
+// Tier-1 elevation of `raw_bits` round-trip.
 //
-// Pre-(this pin): `from_raw_bits(x).raw_bits() == x` was verified by the
-// runtime test `raw_bits_round_trip` (tier-3). A hidden transformation
-// in either accessor (e.g. xor with constant, byte-swap) would compile
-// silently and only show on inspect-and-rebuild flows.
-//
-// Post-(this pin): const-eval verifies the round-trip on multiple
-// representative bit patterns (zero, all-ones, alternating, single
-// bits at low and high positions). Tier-3 → tier-1.
+// Const-eval verifies `from_raw_bits(x).raw_bits() == x` on
+// multiple representative bit patterns (zero, all-ones,
+// alternating, single bits at low and high positions). A naive
+// shape would leave this to a runtime test: a hidden
+// transformation in either accessor (e.g. xor with constant, byte-
+// swap) would compile silently and only show on inspect-and-
+// rebuild flows.
 const _: () = {
     // Pattern 1: zero (covers empty()-equivalent path).
     assert!(FormatCodeSet::from_raw_bits(0).raw_bits() == 0);
@@ -545,19 +545,21 @@ const _: () = {
 /// format code (which tells the decoder whether to parse text or
 /// binary representation).
 ///
-/// **Fields dropped vs PG spec**: `table_oid`, `attr_num`, `type_size`,
-/// `type_mod`, column name. Names can be restored in 1c-6 if
-/// runtime-reflection tooling requires them; the macro layer (Phase 2)
-/// resolves names at compile time and does not need the runtime copy.
+/// **Fields dropped vs PG spec**: `table_oid`, `attr_num`,
+/// `type_size`, `type_mod`, column name. Names can be restored if
+/// runtime-reflection tooling requires them; the typed-macro layer
+/// resolves names at compile time and does not need the runtime
+/// copy.
 ///
-/// # DEF-189 — derived projection, not stored representation
+/// # Derived projection, not stored representation
 ///
-/// Pre-DEF-189, [`RowDesc`] stored an inline `[ColumnDesc; 32]` array
-/// (8 B per slot, 256 B total + n_columns + padding = 264 B). Post-DEF-189,
-/// [`RowDesc`] uses a struct-of-arrays layout (`[u32; 32]` for OIDs,
-/// `[FormatCode; 32]` for format codes) — 162 B total, ~38% smaller.
-/// `ColumnDesc` is now produced on demand by [`RowDesc::get`] /
-/// [`RowDesc::columns`]; it is no longer the storage shape.
+/// `ColumnDesc` is produced on demand by [`RowDesc::get`] /
+/// [`RowDesc::columns`]; it is not the storage shape. A naive shape
+/// that stored an inline `[ColumnDesc; 32]` array (8 B per slot,
+/// 256 B total + n_columns + padding = 264 B) would balloon the
+/// per-result-set footprint. The current struct-of-arrays layout
+/// (`[u32; 32]` for OIDs + bit-packed `FormatCodeSet` for format
+/// codes) is 136 B (~48% smaller).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ColumnDesc {
     /// PostgreSQL type OID (e.g. `23` = `int4`, `25` = `text`). Match
@@ -569,71 +571,65 @@ pub struct ColumnDesc {
 
 /// Schema of a result-set's rows.
 ///
-/// # DEF-194 (2026-04-27): bit-packed format codes
+/// # Bit-packed format codes
 ///
-/// Format codes are now stored in a [`FormatCodeSet`] (one `u32`,
-/// 1 bit per column). Replaces the `[FormatCode; 32]` storage,
-/// saving 28 bytes per descriptor (164 → 136 B). The per-column
-/// accessor `format_code(idx)` reads `(packed >> idx) & 1` —
-/// branchless, single-instruction on every relevant ISA.
+/// Format codes are stored in a [`FormatCodeSet`] (one `u32`, 1
+/// bit per column). The per-column accessor `format_code(idx)`
+/// reads `(packed >> idx) & 1` — branchless, single-instruction
+/// on every relevant ISA. A naive `[FormatCode; 32]` shape would
+/// burn 32 B per descriptor; the bit-packed form is 4 B (saving
+/// 28 B per descriptor).
 ///
-/// # DEF-189 — struct-of-arrays (SoA) layout
+/// # Struct-of-arrays (SoA) layout
 ///
 /// POD layout: a parallel array of OIDs (one `u32` slot per column
 /// up to [`MAX_ROW_COLUMNS`]) + a bit-packed [`FormatCodeSet`] +
-/// a `u16` populated count. `Copy`, no `Drop`. Equality compares
+/// a 1-byte populated count. `Copy`, no `Drop`. Equality compares
 /// the full storage — trailing slots are zero-filled by every
 /// constructor and never mutated thereafter.
 ///
 /// ```text
-/// n_columns:    u16              [2 B]
-/// (padding to align u32)         [2 B]
+/// n_columns:    BoundedU8<32>    [1 B]
+/// (padding to align u32)         [3 B]
 /// type_oids:    [u32; 32]        [128 B]
-/// format_codes: FormatCodeSet    [4 B]   (DEF-194: was [FormatCode; 32] = 32 B)
-/// total:                         [136 B] (DEF-194: was 164 B)
+/// format_codes: FormatCodeSet    [4 B]
+/// total:                         [136 B]
 /// ```
 ///
-/// Pre-DEF-189 was an array of `(u32 + FormatCode)` rows = 8 B per slot
-/// = 264 B. Pre-DEF-194 SoA was 164 B. Post-DEF-194 SoA is 136 B.
-/// Combined saving vs the original AoS form: **128 B per descriptor**.
+/// A naive array-of-structs shape (`[(u32, FormatCode); 32]` = 8 B
+/// per slot = 264 B) would burn ~128 B more per descriptor.
 ///
 /// # Per-row hot-path access
 ///
-/// The streaming fast-path reads `desc.type_oid(i)` (single u32 array
-/// lookup) and `desc.format_code(i)` (bit-pack mask read on a u32 —
-/// fits one cache line shared with adjacent metadata). Both O(1),
-/// branchless on the happy path, no `&ColumnDesc` reconstruction
-/// needed for the hot path.
+/// The streaming fast-path reads `desc.type_oid(i)` (single u32
+/// array lookup) and `desc.format_code(i)` (bit-pack mask read on
+/// a u32 — fits one cache line shared with adjacent metadata).
+/// Both O(1), branchless on the happy path, no `&ColumnDesc`
+/// reconstruction needed for the hot path.
 #[derive(Debug, Clone, Copy)]
 #[repr(C, align(4))]
 pub struct RowDesc {
-    /// DEF-195: column count is `BoundedU8<MAX_ROW_COLUMNS>` (1 byte,
+    /// Column count is `BoundedU8<MAX_ROW_COLUMNS>` (1 byte,
     /// `NonZeroU8`-backed niche). Tier-2 by-construct: the parser
     /// rejects any wire `n_columns > MAX_ROW_COLUMNS` before
     /// constructing this field, so an out-of-bounds row descriptor
-    /// cannot exist in safe code. The niche absorbs the discriminant
-    /// of `Option<RowDesc>`, shrinking it from 140 → 136 B.
+    /// cannot exist in safe code. The niche absorbs the
+    /// discriminant of `Option<RowDesc>`.
     n_columns: crate::bounded::BoundedU8<MAX_ROW_COLUMNS>,
     /// Padding so `type_oids` is 4-byte aligned. Always zero
     /// (initialised by constructors).
     _pad: [u8; 3],
     type_oids: [u32; MAX_ROW_COLUMNS],
-    /// DEF-194: bit-packed (1 bit per column). Replaces the
-    /// pre-DEF-194 `[FormatCode; MAX_ROW_COLUMNS]` (32 B → 4 B).
+    /// Bit-packed (1 bit per column) — replaces a naive
+    /// `[FormatCode; MAX_ROW_COLUMNS]` shape (32 B → 4 B).
     format_codes: FormatCodeSet,
 }
-
-// DEF-203 unified: BoundedU8 now takes `const MAX: usize` directly,
-// so `BoundedU8<MAX_ROW_COLUMNS>` works without a `_U8` helper const.
 
 impl RowDesc {
     /// Empty descriptor (0 columns). Used as a test fixture and as
     /// the schema-less sentinel for empty-query / NoData paths.
-    ///
-    /// DEF-194: `format_codes: FormatCodeSet::empty()` zero-initialises
+    /// `format_codes: FormatCodeSet::empty()` zero-initialises
     /// every column position to [`FormatCode::Text`] (bit 0 = Text).
-    /// Semantically identical to the pre-DEF-194 array literal
-    /// `[FormatCode::Text; 32]`.
     pub const EMPTY: Self = Self {
         n_columns: crate::bounded::BoundedU8::ZERO,
         _pad: [0; 3],
@@ -652,11 +648,12 @@ impl RowDesc {
     }
 
     /// Number of populated columns as a `u16` — matches the wire
-    /// representation. Returns `u16` for backward-compat with the
-    /// pre-DEF-195 public API; internally `BoundedU8<32>` enforces
-    /// the range invariant.
+    /// representation; internally `BoundedU8<32>` enforces the
+    /// range invariant.
     ///
-    /// Non-const for the same reason as [`Self::len`] (RU-01).
+    /// Non-const for the same reason as [`Self::len`]
+    /// (`u16::from(u8)` is not const-trait-callable on stable Rust
+    /// yet).
     #[inline]
     #[must_use]
     pub fn n_columns(&self) -> u16 {
@@ -672,8 +669,9 @@ impl RowDesc {
 
     /// PG type OID for column `idx`, or `None` if out of range.
     ///
-    /// DEF-189: O(1) indexed lookup into `type_oids` SoA array. Hot-path
-    /// callers (per-column decode) get a single bounds-checked u32 read.
+    /// O(1) indexed lookup into the `type_oids` SoA array — hot-
+    /// path callers (per-column decode) get a single bounds-checked
+    /// u32 read.
     #[inline]
     #[must_use]
     pub fn type_oid(&self, idx: usize) -> Option<u32> {
@@ -685,7 +683,7 @@ impl RowDesc {
 
     /// Format code for column `idx`, or `None` if out of range.
     ///
-    /// DEF-189: O(1) indexed lookup; DEF-194 reads from the bit-packed
+    /// O(1) indexed lookup — reads from the bit-packed
     /// [`FormatCodeSet`] (single `u32` shift + mask). The
     /// `idx >= self.len()` gate is the populated-prefix bound; the
     /// inner `FormatCodeSet::get` carries an independent
@@ -701,12 +699,9 @@ impl RowDesc {
 
     /// Construct a `ColumnDesc` for column `idx`, or `None` if out
     /// of range. Reconstructs the AoS shape on demand from the SoA
-    /// storage.
-    ///
-    /// DEF-189: returns `Option<ColumnDesc>` (by value) instead of the
-    /// pre-DEF-189 `Option<&ColumnDesc>`. `ColumnDesc` is 8 B; on
-    /// 64-bit targets returning by value is identical in ABI cost to
-    /// returning by ref, with no pointer-stability surprise.
+    /// storage. Returns `Option<ColumnDesc>` (by value) — on 64-bit
+    /// targets a `ColumnDesc` (8 B) by-value is identical in ABI
+    /// cost to a `&ColumnDesc`, with no pointer-stability surprise.
     #[inline]
     #[must_use]
     pub fn get(&self, idx: usize) -> Option<ColumnDesc> {
@@ -732,20 +727,20 @@ impl RowDesc {
         }
     }
 
-    /// DEF-244 (2026-05-13): synthesise a `RowDesc` from a static
-    /// OID list with all-text format codes.
+    /// Synthesise a `RowDesc` from a static OID list with all-text
+    /// format codes.
     ///
     /// Used by the `prepared!` macro's runtime path
     /// ([`crate::protocol::compute_push_bind_prepared_idle_only`]):
-    /// the macro carries `row_oids: &'static [u32]`, but the server's
-    /// Parse+Bind+Execute pipeline does NOT emit a `RowDescription`
-    /// frame absent a prior `Describe`. The synthetic descriptor
-    /// satisfies the existing SELECT-path's `RowDescSlotCell::park_at_be_select`
-    /// contract without a server round-trip.
+    /// the macro carries `row_oids: &'static [u32]`, but the
+    /// server's Parse+Bind+Execute pipeline does NOT emit a
+    /// `RowDescription` frame absent a prior `Describe`. The
+    /// synthetic descriptor satisfies the SELECT-path's
+    /// `RowDescSlotCell::park_at_be_select` contract without a
+    /// server round-trip.
     ///
-    /// Format codes default to [`FormatCode::Text`] per memo §5.4
-    /// (v1 text format; DEF-228 binary track will conditionally use
-    /// `Binary` once the matrix coverage expands).
+    /// Format codes default to [`FormatCode::Text`] (v1 text
+    /// format; a binary track is a planned follow-up).
     ///
     /// # Errors
     ///
@@ -832,15 +827,13 @@ impl PartialEq for RowDesc {
 }
 impl Eq for RowDesc {}
 
-// DEF-194 size pin: 136 B post-bit-pack format_codes (vs 164 B pre-194).
+// RowDesc size pin: 136 B exact.
 // `MAX_ROW_COLUMNS = 32`: 4 (n_columns + pad) + 128 (type_oids) +
 // 4 (format_codes FormatCodeSet u32) = 136 B.
 const _: () = assert!(
     core::mem::size_of::<RowDesc>() == 136,
-    "RowDesc size pin: 136 B post-DEF-194 bit-pack format_codes. \
-     Pre-194 was 164 B (32 bytes [FormatCode; 32]); pre-DEF-189 was \
-     264 B (AoS [ColumnDesc; 32]). If MAX_ROW_COLUMNS bumps from 32, \
-     update both this pin AND `FormatCodeSet`'s storage type \
+    "RowDesc size pin: 136 B exact. If MAX_ROW_COLUMNS bumps from \
+     32, update both this pin AND `FormatCodeSet`'s storage type \
      (u32 → wider integer / array) AND the const-assert tying the \
      two together. New size = 4 + 4 * MAX_ROW_COLUMNS + \
      bytes_for(FormatCodeSet) rounded for alignment.",
@@ -851,39 +844,31 @@ const _: () = assert!(
      repr(C, align(4)) keeps the layout drift-pinned.",
 );
 
-// DEF-194 follow-up 2026-04-27 — Option<RowDesc> exact pin.
+// `Option<RowDesc>` exact pin.
 //
-// Glass-arch audit closure: pre-(this pin) `Option<RowDesc>` size was
-// claimed-but-not-verified (`row_desc_slot ~140` in lib.rs comment, no
-// const-assert). A future change that replaced FormatCodeSet with a
-// non-niche-friendly type, or added a non-Copy field to RowDesc, would
-// silently regress `Option<RowDesc>` size by 4-N bytes — invisible to
-// tests, observable only via PgProtocol-level size budget drift.
+// The Option niches through the `NonZeroU8` inside `n_columns` (the
+// first field), so the discriminant adds zero bytes. A naive shape
+// where `n_columns` was `u8` (non-niche) would force the Option to
+// add 1 discriminant byte + 3 alignment padding = +4 B per
+// `Option<RowDesc>` (cascading into `PgProtocol::row_desc_slot`).
 //
-// Exact pin at 140 B (aarch64-apple-darwin observed) makes the size
-// a build-time decision point. The Option niches NOT through a
-// FormatCode value (FormatCodeSet is non-niche u32 storage) but instead
-// uses a discriminant byte + 3 bytes alignment padding to align(4).
-//
-// Pre-DEF-194: Option<RowDesc> was ~168 B (164 B RowDesc + 1 disc + 3
-// padding); FormatCode niche was either unused or inadequate against
-// the [u32; 32] aligned layout. Post-DEF-194: 140 B exactly; saving
-// **28 B per Option<RowDesc>** (cascading into PgProtocol::row_desc_slot).
+// The exact-pin form makes any future change that loses the niche
+// (e.g. replacing `FormatCodeSet` with a non-niche-friendly type,
+// adding a non-Copy field that loses the leading-niche position)
+// a build-time decision point rather than a silent size regression.
 const _: () = assert!(
     core::mem::size_of::<Option<RowDesc>>() == 136,
-    "Option<RowDesc> exact pin: 136 B post-DEF-195 (= 136 RowDesc, niche \
-     absorbed via `BoundedU8<32>::NonZeroU8` in `n_columns` first field). \
-     Pre-195 was 140 B (= 136 + 1 discriminant + 3 align padding). Saving \
-     **4 B per Option<RowDesc>**, cascading into PgProtocol::row_desc_slot.",
+    "Option<RowDesc> exact pin: 136 B (= 136 RowDesc, niche absorbed \
+     via `BoundedU8<32>::NonZeroU8` in the `n_columns` first field).",
 );
 
-/// DEF-189: lifetime-bound borrow of a [`RowDesc`] living inside
+/// Lifetime-bound borrow of a [`RowDesc`] living inside
 /// [`crate::PgProtocol::row_desc_slot`].
 ///
-/// `RowDescBorrow<'r>` is the public read-only handle the user receives
-/// for SELECT-bearing replies and per-row events. It is `Copy` (8 B —
-/// just a `&RowDesc` reference) and ties its validity to the
-/// `&'r mut PgProtocol` borrow chain that produced it.
+/// `RowDescBorrow<'r>` is the public read-only handle the user
+/// receives for SELECT-bearing replies and per-row events. It is
+/// `Copy` (8 B — just a `&RowDesc` reference) and ties its validity
+/// to the `&'r mut PgProtocol` borrow chain that produced it.
 ///
 /// # Lifetime contract
 ///
@@ -899,17 +884,18 @@ const _: () = assert!(
 /// Three reasons:
 ///
 /// 1. **API stability**: the internal storage layout (currently a
-///    direct `Option<RowDesc>` slot, possibly future per-column SoA
-///    arrays addressed by an external buffer) is hidden behind this
-///    borrow. Users access via `n_columns()` / `type_oid(i)` /
-///    `format_code(i)` and don't depend on field projections.
+///    direct `Option<RowDesc>` slot, possibly future per-column
+///    SoA arrays addressed by an external buffer) is hidden
+///    behind this borrow. Users access via `n_columns()` /
+///    `type_oid(i)` / `format_code(i)` and don't depend on field
+///    projections.
 /// 2. **Implementation flexibility**: future versions may back the
-///    borrow with byte-range descriptors into a dedicated buffer
-///    (per the architect's DEF-189 lazy-borrow design alternative),
-///    or with rkyv-style zero-copy archives — without breaking user
-///    code.
+///    borrow with byte-range descriptors into a dedicated buffer,
+///    or with rkyv-style zero-copy archives — without breaking
+///    user code.
 /// 3. **Discoverability**: `RowDescBorrow::n_columns(&self)` chains
-///    fluently in user code; `(&'r RowDesc).len()` is less natural.
+///    fluently in user code; `(&'r RowDesc).len()` is less
+///    natural.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct RowDescBorrow<'r> {
@@ -927,8 +913,8 @@ impl<'r> RowDescBorrow<'r> {
 
     /// Number of populated columns.
     ///
-    /// Non-const after DEF-195: `u16::from(u8)` is not const-trait
-    /// stable yet (RU-01).
+    /// Non-const because `u16::from(u8)` is not const-trait-stable
+    /// yet.
     #[inline]
     #[must_use]
     pub fn n_columns(&self) -> u16 {
@@ -1006,7 +992,7 @@ impl fmt::Display for FormatCode {
 /// ```text
 ///   int16  column_count
 ///   for each column:
-///     cstring  name           (NUL-terminated; not stored — 1c-2 MVP)
+///     cstring  name           (NUL-terminated; not stored)
 ///     int32    table_oid      (dropped)
 ///     int16    attr_num       (dropped)
 ///     int32    type_oid       ← captured
@@ -1023,10 +1009,8 @@ impl fmt::Display for FormatCode {
 /// - [`crate::ProtocolError::TooManyColumns`] — column count exceeds
 ///   [`MAX_ROW_COLUMNS`] (result-set too wide for this crate's bounded
 ///   storage).
-/// - [`crate::ProtocolError::UnexpectedFormatCode`] — wire value not in
-///   `{0, 1}` (round-4 finding #5).
-// DEF-184 (A1+A13): Err is ProtocolError ~72 B, below 128 B
-// result_large_err threshold post-ErrorArena externalisation.
+/// - [`crate::ProtocolError::UnexpectedFormatCode`] — wire value
+///   not in `{0, 1}`.
 #[cold]
 pub(crate) fn parse_row_description(
     payload: &[u8],
@@ -1056,17 +1040,16 @@ pub(crate) fn parse_row_description(
         });
     }
 
-    // DEF-189: SoA per-column parse. Populated slots overwrite the
-    // zero-initialised array / bit-pack; trailing slots remain default.
-    // DEF-194: format_codes is now a bit-packed FormatCodeSet (u32);
-    // population is via `FormatCodeSet::set(idx, code)?` instead of
-    // an array slot write.
+    // SoA per-column parse. Populated slots overwrite the zero-
+    // initialised array / bit-pack; trailing slots remain default.
+    // `format_codes` is a bit-packed `FormatCodeSet` (u32);
+    // population is via `FormatCodeSet::set(idx, code)?`.
     let mut type_oids = [0u32; MAX_ROW_COLUMNS];
     let mut format_codes = FormatCodeSet::empty();
     for idx in 0..n_columns_usize {
-        // Name: cstring (NUL-terminated). We skip the bytes; round-4
-        // finding #2 typed-newtypes already covers identifier discipline
-        // elsewhere.
+        // Name: cstring (NUL-terminated). Bytes are skipped here —
+        // the typed-newtypes elsewhere already cover identifier
+        // discipline.
         let nul_pos = rest.iter().position(|&b| b == 0).ok_or_else(malformed)?;
         let name_end = nul_pos.saturating_add(1);
         let after_name = rest.get(name_end..).ok_or_else(malformed)?;
@@ -1099,10 +1082,10 @@ pub(crate) fn parse_row_description(
         // column (forbid-bundle no-panic discipline).
         let oid_slot = type_oids.get_mut(idx).ok_or_else(malformed)?;
         *oid_slot = type_oid;
-        // DEF-194: FormatCodeSet::set returns OutOfRange for
-        // idx >= MAX_ROW_COLUMNS; under the upstream gate this Err is
-        // dead. Map to malformed for surface uniformity with the
-        // type_oids slot write above.
+        // `FormatCodeSet::set` returns `OutOfRange` for
+        // `idx >= MAX_ROW_COLUMNS`; under the upstream gate this
+        // Err is dead. Map to `malformed` for surface uniformity
+        // with the type_oids slot write above.
         format_codes.set(idx, format_code).map_err(|_| malformed())?;
         rest = next_cursor;
     }
@@ -1113,10 +1096,11 @@ pub(crate) fn parse_row_description(
         return Err(malformed());
     }
 
-    // DEF-195/DEF-203: convert validated `n_columns` (u16, range-checked
-    // above against MAX_ROW_COLUMNS) to the `BoundedU8<MAX_ROW_COLUMNS>`
-    // niche-bearing type. Both narrowings have architecturally-dead
-    // Err paths (the upstream guard rejects any value > 32).
+    // Convert the validated `n_columns` (u16, range-checked above
+    // against `MAX_ROW_COLUMNS`) to the
+    // `BoundedU8<MAX_ROW_COLUMNS>` niche-bearing type. Both
+    // narrowings have architecturally-dead Err paths (the upstream
+    // guard rejects any value > 32).
     let n_columns_bounded = <crate::bounded::BoundedU8<MAX_ROW_COLUMNS>
         as crate::bounded::BoundedLen<MAX_ROW_COLUMNS>>::try_new_usize(n_columns_usize)
         .ok_or_else(malformed)?;
@@ -1128,9 +1112,9 @@ pub(crate) fn parse_row_description(
     })
 }
 
-/// Parse a `ParameterDescription` payload (body of the `'t'` frame,
-/// after the 5-byte header) into a [`crate::action::ParamOids`].
-/// 1c-3c.
+/// Parse a `ParameterDescription` payload (body of the `'t'`
+/// frame, after the 5-byte header) into a
+/// [`crate::action::ParamOids`].
 ///
 /// Wire layout (PG §55.2.2):
 /// ```text
@@ -1152,8 +1136,6 @@ pub(crate) fn parse_row_description(
 ///
 /// Cold path — called once per statement-level Describe reply.
 #[cold]
-// DEF-184 (A1+A13): Err is ProtocolError ~72 B, below 128 B
-// result_large_err threshold post-ErrorArena externalisation.
 pub(crate) fn parse_parameter_description(
     payload: &[u8],
 ) -> Result<crate::action::ParamOids, crate::error::ProtocolError> {
@@ -1193,13 +1175,12 @@ pub(crate) fn parse_parameter_description(
         return Err(malformed());
     }
 
-    // F7 (pass-#7 audit): `split_first_chunk::<4>()` returns typed
-    // `Option<(&[u8; 4], &[u8])>` — the typed fixed-array ref
-    // replaces the `chunks_exact(4)` + `[a,b,c,d]` slice-pattern
-    // approach. No dead `_ =>` fallback arm needed; the Option::None
-    // path is architecturally dead (body_len check above proves
-    // remaining bytes suffice) yet surfaces as `Err(malformed())`
-    // rather than `unreachable!()` (forbid-bundle).
+    // `split_first_chunk::<4>()` returns a typed
+    // `Option<(&[u8; 4], &[u8])>` — no dead `_ =>` fallback arm
+    // needed. The `Option::None` path is architecturally dead (the
+    // body-length check above proves remaining bytes suffice) yet
+    // surfaces as `Err(malformed())` rather than `unreachable!()`
+    // (forbid-bundle).
     let mut oids = [0u32; crate::params::MAX_PARAMS_ARITY];
     let mut cursor = rest;
     for slot in oids.iter_mut().take(n_params_usize) {
@@ -1212,7 +1193,7 @@ pub(crate) fn parse_parameter_description(
 }
 
 // ════════════════════════════════════════════════════════════════════
-// 1c-2b — DataRow parser + ColumnsIter
+// DataRow parser + ColumnsIter
 // ════════════════════════════════════════════════════════════════════
 
 /// Decode-time errors — classify malformed row bodies independently
@@ -1240,7 +1221,7 @@ pub enum DecodeError {
     /// signed value (PG §55.7 requires a non-negative i16). Wire
     /// protocol violation — servers never send this under spec
     /// compliance; arrival implies a bug / corruption / adversarial
-    /// frame. Pass-#8 F-041.
+    /// frame.
     ///
     /// Split from [`Self::TruncatedRow`]: the latter means "body too
     /// short"; this means "column count is signed-invalid." Different
@@ -1278,18 +1259,18 @@ pub enum DecodeError {
     },
     /// Column bytes are not valid UTF-8. Applies to text-format
     /// columns (including `&str` and all integer decoders, which
-    /// read ASCII digits). 1c-2c.
+    /// read ASCII digits).
     NonUtf8,
     /// Failed to parse a numeric text-format column into the target
     /// Rust integer type — bad digit, sign out of range, or
-    /// overflow. 1c-2c.
+    /// overflow.
     IntParse,
     /// Failed to parse a boolean — PG text format emits `"t"` / `"f"`;
-    /// anything else classifies here. 1c-2c.
+    /// anything else classifies here.
     BoolParse,
     /// A binary-format fixed-size column's byte length doesn't match
     /// the decoder's expectation (e.g. an `i32` decoder receiving 3
-    /// bytes, or 5). 1c-3b binary-path classification — separate from
+    /// bytes, or 5). Binary-path classification — separate from
     /// [`Self::TruncatedColumnData`] which reports row-scoped
     /// truncation with a column index. Binary decoders run per-column
     /// through [`FromPgBinary`] and don't know the column index at
@@ -1300,20 +1281,19 @@ pub enum DecodeError {
         /// Bytes actually received.
         actual_len: u16,
     },
-    /// DEF-244: server emitted SQL NULL (len = -1) for a column the
+    /// Server emitted SQL NULL (len = -1) for a column the
     /// `prepared!` row tuple typed as non-Option. The macro infers
-    /// non-NULL semantics from the Rust type (`i32` vs `Option<i32>`);
-    /// if the schema admits NULL, the user types `Option<T>` in the
-    /// row tuple. Wide-typed nullable support (`Option<T>` row impls)
-    /// tracks DEF-228.
+    /// non-NULL semantics from the Rust type (`i32` vs
+    /// `Option<i32>`); if the schema admits NULL, the user types
+    /// `Option<T>` in the row tuple. Wide-typed nullable support
+    /// (`Option<T>` row impls) is a planned follow-up.
     NullInNonNullColumn,
 }
 
-// DEF-244 modernisation audit (rust-version 1.81 — `core::error::Error`
-// stabilised). Additive impl; matches the project-wide policy of
-// implementing the canonical `core::error::Error` on every public
-// error type so downstream `bsql-driver-postgres` can `?`-propagate
-// through `Box<dyn Error>` boundaries.
+// Additive `core::error::Error` impl; matches the crate-wide
+// policy of implementing the canonical `core::error::Error` on
+// every public error type so downstream `bsql-driver-postgres`
+// can `?`-propagate through `Box<dyn Error>` boundaries.
 impl core::error::Error for DecodeError {}
 
 impl fmt::Display for DecodeError {
@@ -1371,13 +1351,13 @@ impl fmt::Display for DecodeError {
 pub struct DataRowRef<'a> {
     /// Body bytes AFTER the 2-byte column-count header.
     ///
-    /// DEF-154 (U) P2/P3: store the post-header slice directly
-    /// (stripped at `parse` time via `split_first_chunk::<2>()`).
-    /// Pre-(U) the full body was stored and `columns()` re-stripped
-    /// the header via `self.body.get(2..).unwrap_or(&[])` — silent
-    /// fallback pattern user banned. Post-(U) the column iterator
-    /// starts from the stored slice directly — tier-1 infallible,
-    /// no Option, no fallback.
+    /// Stores the post-header slice directly (stripped at `parse`
+    /// time via `split_first_chunk::<2>()`). The column iterator
+    /// starts from the stored slice — tier-1 infallible, no
+    /// Option, no fallback. A naive shape that stored the full
+    /// body and re-stripped the header via
+    /// `self.body.get(2..).unwrap_or(&[])` would form the banned
+    /// silent-fallback pattern.
     body_after_count: &'a [u8],
     /// Parsed column count.
     n_columns: u16,
@@ -1398,8 +1378,8 @@ impl<'a> DataRowRef<'a> {
             body.split_first_chunk::<2>().ok_or(DecodeError::TruncatedRow)?;
         let n_columns_i16 = i16::from_be_bytes(*count_bytes);
         if n_columns_i16 < 0 {
-            // Pass-#8 F-041: distinguish "body too short" (TruncatedRow)
-            // from "count header signed-invalid" (InvalidColumnCount).
+            // Distinguish "body too short" (TruncatedRow) from
+            // "count header signed-invalid" (InvalidColumnCount).
             // Different classes; different operator diagnostics.
             return Err(DecodeError::InvalidColumnCount { count: n_columns_i16 });
         }
@@ -1443,8 +1423,8 @@ impl<'a> DataRowRef<'a> {
     #[inline]
     #[must_use]
     pub fn columns(&self) -> ColumnsIter<'a> {
-        // DEF-154 (U): tier-1 — `body_after_count` is the
-        // post-header slice stored at parse time. No runtime
+        // Tier-1 — `body_after_count` is the post-header slice
+        // stored at parse time. No runtime
         // `.get(2..).unwrap_or(&[])` fallback.
         ColumnsIter {
             remaining: self.body_after_count,
@@ -1477,14 +1457,15 @@ pub struct ColumnsIter<'a> {
 }
 
 impl<'a> ColumnsIter<'a> {
-    /// F-042 (pass-#8): centralised fuse-and-error helper.
+    /// Centralised fuse-and-error helper.
     ///
-    /// Before F-042 the pattern `self.remaining = &[]; self.columns_left = 0;
-    /// return Some(Err(...))` appeared at 4 sites in `next`. A future
-    /// refactor adding a 5th error arm and forgetting the fuse would
-    /// let iteration continue past the error — drift-prone. This
-    /// helper makes the fuse+error path a single expression and
-    /// makes every new error arm structurally-fused by default.
+    /// A naive shape inlining `self.remaining = &[];
+    /// self.columns_left = 0; return Some(Err(...))` at every
+    /// error site (4+ in `next`) is drift-prone: a future refactor
+    /// adding a new error arm and forgetting the fuse would let
+    /// iteration continue past the error. This helper makes the
+    /// fuse+error path a single expression and makes every new
+    /// error arm structurally-fused by default.
     #[inline]
     fn fuse_and_error(&mut self, e: DecodeError) -> Option<Result<Option<&'a [u8]>, DecodeError>> {
         self.remaining = &[];
@@ -1511,21 +1492,21 @@ impl<'a> Iterator for ColumnsIter<'a> {
         };
         let len = i32::from_be_bytes(*len_bytes);
 
-        // DEF-184 (A5/B10): collapsed sign-path cascade.
-        //
-        // Pre-(184) had 3 sequential sign checks:
+        // Collapsed sign-path cascade. A naive shape would chain
+        // three sequential sign checks:
         //   if len == -1 { NULL }
         //   if len < 0 { NegativeColumnLength }
         //   usize::try_from(len) { ... Err → NegativeColumnLength }
         // Three comparisons per column × 32 max cols × 1M rows =
         // ~96M redundant compares on row-heavy workloads.
         //
-        // Post-(184): single NULL shortcut + fold the `< -1` case
-        // into `usize::try_from` Err branch (which also catches
-        // hypothetical i32→usize overflow on 16-bit targets, even
-        // though MSRV implicitly disallows those). Two compares:
-        // `len == -1` (null) and `usize::try_from` (non-negative).
-        // LLVM fuses the try_from sign check with the comparison.
+        // The collapsed form: single NULL shortcut + fold the
+        // `< -1` case into the `usize::try_from` Err branch (which
+        // also catches hypothetical i32→usize overflow on 16-bit
+        // targets, even though MSRV implicitly disallows those).
+        // Two compares: `len == -1` (null) and `usize::try_from`
+        // (non-negative). LLVM fuses the try_from sign check with
+        // the comparison.
         if len == -1 {
             // SQL NULL — no data bytes to consume.
             self.remaining = after_len;
@@ -1572,7 +1553,7 @@ impl ExactSizeIterator for ColumnsIter<'_> {}
 impl core::iter::FusedIterator for ColumnsIter<'_> {}
 
 // ════════════════════════════════════════════════════════════════════
-// 1c-2c — Text-format decoders
+// Text-format decoders
 // ════════════════════════════════════════════════════════════════════
 
 /// PostgreSQL **text-format** column decoder for a Rust type.
@@ -1590,8 +1571,8 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 ///
 /// # Usage
 ///
-/// DEF-140 (pass-#8 doc polish): the example models the crate's own
-/// discipline — no `unwrap()` / `panic!()` in the happy path.
+/// The example models the crate's own discipline — no `unwrap()`
+/// / `panic!()` in the happy path.
 /// `cols.next()` returns `Option<Result<Option<&[u8]>, DecodeError>>`
 /// and is matched structurally via `let Some(...) else`. Real user
 /// code can adapt to its own error strategy (`?` into custom errors,
@@ -1634,23 +1615,22 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 /// [`DecodeError::NonUtf8`] for non-UTF-8 bytes on decoders that
 /// genuinely require UTF-8 validation (`&str`, `Vec<u8>`).
 /// Type-specific parse errors:
-/// - integer types → [`DecodeError::IntParse`] (DEF-184 A6/B13:
-///   single-pass ASCII-digit parser treats non-digit bytes
-///   uniformly; non-ASCII/non-UTF-8 input classifies as IntParse,
-///   NOT NonUtf8, because UTF-8 validation is skipped as redundant
-///   for strict-ASCII integer grammar).
+/// - integer types → [`DecodeError::IntParse`] (single-pass
+///   ASCII-digit parser treats non-digit bytes uniformly;
+///   non-ASCII/non-UTF-8 input classifies as `IntParse`, NOT
+///   `NonUtf8`, because UTF-8 validation is skipped as redundant
+///   for the strict-ASCII integer grammar).
 /// - `bool` → [`DecodeError::BoolParse`]
 ///
 /// # Binary format
 ///
 /// For PG binary-format columns (selected via Bind in Extended
-/// Query, 1c-3), a parallel `FromPgBinary` trait lands alongside
-/// the binary codec. Text vs binary dispatch at the caller level
-/// via `ColumnDesc::format_code`.
+/// Query), the parallel [`FromPgBinary`] trait carries the binary
+/// codec. Text vs binary dispatch at the caller level via
+/// `ColumnDesc::format_code`.
 //
-// DEF-244 modernisation audit (rust-version 1.78 modernisation):
-// `FromPgText` is NOT sealed — downstream crates may implement it for
-// their own types (e.g. `chrono::DateTime`, `uuid::Uuid`). The
+// `FromPgText` is NOT sealed — downstream crates may implement it
+// for their own types (e.g. `chrono::DateTime`, `uuid::Uuid`). The
 // diagnostic still pays off: the bare bound failure routes a user
 // who tries `let row: (MyType,) = ...;` (where `MyType` lacks the
 // impl) to the standard extension contract.
@@ -1662,51 +1642,47 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 pub trait FromPgText<'a>: Sized {
     /// PG type OID this text decoder targets.
     ///
-    /// F-038 (pass-#8): parallel to [`FromPgBinary::OID`] and
-    /// [`EncodeBinary::OID`]. Enables the future `query!` macro
-    /// (Phase 2) to validate at compile time that a Rust type
-    /// chosen by the user matches the PG catalog OID the server
-    /// declared in `RowDescription` — independent of which
-    /// format (text/binary) the column uses. Symmetry-complete
-    /// three-trait family.
+    /// Parallel to [`FromPgBinary::OID`] and [`EncodeBinary::OID`].
+    /// Enables compile-time validation that a Rust type chosen by
+    /// the user matches the PG catalog OID the server declared in
+    /// `RowDescription` — independent of which format
+    /// (text/binary) the column uses.
     const OID: u32;
 
     /// Decode the column's text-format bytes.
     fn from_pg_text(bytes: &'a [u8]) -> Result<Self, DecodeError>;
 }
 
-// DEF-184 (A6/B13): dedicated ASCII-digit integer parser.
+// Dedicated ASCII-digit integer parser.
 //
-// Pre-(184) used stdlib `core::str::from_utf8(bytes)?.parse::<T>()`
-// — two sequential walks over the bytes:
-// 1. `from_utf8` SSE2-scans for non-UTF8.
-// 2. `str::parse` re-scans, validates digits, accumulates.
+// PG text-format integers are strictly `[-+]?[0-9]+` per PG §55.7
+// — always ASCII. A naive `core::str::from_utf8(bytes)?.parse::<T>()`
+// chain walks the bytes twice: `from_utf8` SSE2-scans for non-UTF8,
+// then `str::parse` re-scans, validates digits, accumulates. UTF-8
+// validation is redundant for strict-ASCII integer grammar (a
+// non-digit byte is already an `IntParse` error; a non-ASCII byte
+// is non-digit). The dedicated parser walks once with one
+// classification path — ~2× on int-heavy text SELECT workloads.
 //
-// PG text-format integers are strictly `[-+]?[0-9]+` per PG §55.7 —
-// always ASCII. UTF-8 validation is redundant (a non-digit byte is
-// already an IntParse error; a non-ASCII byte is non-digit). Skip
-// it: one walk, one classification path. ~2× on int-heavy text
-// SELECT workloads (analytics default).
+// Accumulates into the correct-sign arm to avoid `i*::MIN`
+// overflow (if it accumulated as positive then negated, `-32768`
+// on i16 would trip). Each step uses `checked_mul` /
+// `checked_add` / `checked_sub` per `clippy::arithmetic_side_effects`
+// forbid.
 //
-// Accumulates into correct-sign arm avoiding i*::MIN overflow (if
-// we accumulated as positive then negated, `-32768` on i16 would
-// trip). Each step uses `checked_mul` / `checked_add` / `checked_sub`
-// per `clippy::arithmetic_side_effects` forbid.
-//
-// DEF-207 (2026-05-07): for i16/i32 the digit loop now uses a
-// **wider accumulator** (`parse_pg_int_signed_widened!`) so the
-// per-digit `checked_mul + checked_add/sub` chain (2 overflow
-// branches per iteration) collapses to `wrapping_mul(10) +
-// wrapping_add(d)` (no per-digit overflow check). The pre-loop
-// length bound + a single end-of-loop `try_from` validate the
-// entire range. i64 stays on the original checked-arithmetic
-// macro because the next-wider native type (i128) compiles to
-// multi-instruction sequences on 64-bit targets, losing the win.
+// For i16/i32 the digit loop uses a **wider accumulator**
+// (`parse_pg_int_signed_widened!`) so the per-digit
+// `checked_mul + checked_add/sub` chain (2 overflow branches per
+// iteration) collapses to `wrapping_mul(10) + wrapping_add(d)`
+// (no per-digit overflow check). The pre-loop length bound + a
+// single end-of-loop `try_from` validate the entire range. `i64`
+// stays on the original checked-arithmetic macro because the
+// next-wider native type (i128) compiles to multi-instruction
+// sequences on 64-bit targets, losing the win.
 
 /// Parse a signed ASCII-digit integer with overflow checked at
-/// every digit. Original DEF-184 form. Used by `i64` (where the
-/// next-wider type would be i128 — non-native on 64-bit, slower
-/// than the checked path).
+/// every digit. Used by `i64` (where the next-wider type would be
+/// i128 — non-native on 64-bit, slower than the checked path).
 macro_rules! parse_pg_int_signed {
     ($bytes:expr, $t:ty) => {{
         let (is_neg, digits) = match $bytes.split_first() {
@@ -1737,8 +1713,8 @@ macro_rules! parse_pg_int_signed {
 }
 
 /// Parse a signed ASCII-digit integer using a **wider** accumulator
-/// type than the result. DEF-207 (2026-05-07) — branch-budget
-/// reduction for the i16/i32 hot loop on text-format integer
+/// type than the result. Branch-budget reduction for the i16/i32
+/// hot loop on text-format integer
 /// columns (the dominant cost on int-heavy SELECT analytics).
 ///
 /// # How it removes branches
@@ -1849,11 +1825,11 @@ macro_rules! parse_pg_int_unsigned {
 /// SWAR (SIMD-Within-A-Register) fast-path for ASCII-decimal short
 /// unsigned integers (0..=9999).
 ///
-/// DEF-250 Phase B (2026-05-08): pure scalar bit-trick over 4 packed
-/// ASCII bytes — no `unsafe`, no platform intrinsics, no SIMD
-/// instructions. On valid 1-4 ASCII-digit input, ~3× faster than the
-/// generic `parse_pg_int_signed_widened!` macro path. Caller invokes
-/// EXPLICITLY when SQL type knowledge says column is short.
+/// Pure scalar bit-trick over 4 packed ASCII bytes — no `unsafe`,
+/// no platform intrinsics, no SIMD instructions. On valid 1-4
+/// ASCII-digit input, ~3× faster than the generic
+/// `parse_pg_int_signed_widened!` macro path. Caller invokes
+/// EXPLICITLY when SQL type knowledge says the column is short.
 ///
 /// # When to use
 ///
@@ -1867,8 +1843,8 @@ macro_rules! parse_pg_int_unsigned {
 ///
 /// For general integer decoding without short-int knowledge,
 /// continue using `<T as FromPgText>::from_pg_text` — that path
-/// preserves the DEF-251 common-value cache and the DEF-207
-/// widened-accumulator digit loop.
+/// preserves the common-value cache and the widened-accumulator
+/// digit loop.
 ///
 /// # Returns
 ///
@@ -1878,24 +1854,22 @@ macro_rules! parse_pg_int_unsigned {
 ///
 /// # Why this is opt-in (architectural rationale)
 ///
-/// Two prior attempts (Phase A forensics, DEF-250 §B rejection
-/// notes) embedded this fast-path INSIDE `<i32 as FromPgText>::from_pg_text`:
+/// Two prior attempts embedded this fast-path INSIDE `<i32 as
+/// FromPgText>::from_pg_text`:
 ///
 /// - Attempt 1 (`#[inline(always)]`): 4-digit −38% but 8-digit
 ///   +5.2%, text +4-7% — icache pressure from the 252 B → 776 B
 ///   function-bloat blast radius.
 /// - Attempt 2 (purely additive prologue): 4-digit −37% but the
-///   DEF-251 `iter_5cols_decode_i32_common_values` bench regressed
-///   +31% (+3.3 ns/row on cache hit). LLVM's `SimplifyCFG` merged
-///   the SWAR length-dispatch with the common-value `match`,
+///   `iter_5cols_decode_i32_common_values` bench regressed +31%
+///   (+3.3 ns/row on cache hit). LLVM's `SimplifyCFG` merged the
+///   SWAR length-dispatch with the common-value `match`,
 ///   pessimising the cache-hit prologue.
 ///
-/// Forensic ASMs preserved at `/tmp/asm-attempt{1,2}-i32.s`.
 /// Decoupling SWAR placement from `from_pg_text`'s body size
 /// eliminates the LLVM heuristic shift entirely. `from_pg_text`
-/// stays byte-identical to HEAD `2f63897`; the helper is a separate
-/// symbol the caller invokes when type knowledge justifies the
-/// fast-path.
+/// stays byte-identical; the helper is a separate symbol the
+/// caller invokes when type knowledge justifies the fast-path.
 ///
 /// # Tier impact
 ///
@@ -1950,17 +1924,16 @@ pub fn parse_short_uint_swar(bytes: &[u8]) -> Option<u32> {
 }
 
 // ═════════════════════════════════════════════════════════════════
-// DEF-266 (β SWAR extension, 2026-05-11): three additional opt-in
-// helpers extending the DEF-250 Phase B precedent
-// (`parse_short_uint_swar` above). All caller-routed; NEVER embedded
-// in shared dispatch (avoids the LLVM heuristic shifts that doomed
-// DEF-250 attempts 1 + 2).
+// SWAR extension — three additional opt-in helpers extending the
+// `parse_short_uint_swar` precedent above. All caller-routed;
+// NEVER embedded in shared dispatch (avoids the LLVM heuristic
+// shifts that doomed earlier prologue-embedding attempts).
 //
-// Tier: caller-routed fast-paths. `Option::None` on invalid input is
-// runtime-classified (tier-3 inherent — arbitrary network bytes only
-// exist at runtime). Closure mechanism: exhaustive test grids over
-// the full validity domain for each helper, plus byte-position sweeps
-// covering rejection arms.
+// Tier: caller-routed fast-paths. `Option::None` on invalid input
+// is runtime-classified (tier-3 inherent — arbitrary network bytes
+// only exist at runtime). Closure mechanism: exhaustive test grids
+// over the full validity domain for each helper, plus byte-
+// position sweeps covering rejection arms.
 // ═════════════════════════════════════════════════════════════════
 
 /// SWAR-style parser for 5-19 digit ASCII-decimal unsigned integers.
@@ -2214,8 +2187,8 @@ pub fn validate_utf8_swar(bytes: &[u8]) -> Option<()> {
 /// of byte-string literals. LLVM lowers the four patterns to an
 /// optimal jump table on `bytes.len()` followed by a constant-cmp
 /// per arm. No SWAR math needed — the optimal code IS the simple
-/// `match`; the "_swar" suffix is per the DEF-250 Phase B opt-in
-/// naming convention (helpers outside the shared dispatch).
+/// `match`; the "_swar" suffix follows the SWAR opt-in naming
+/// convention for helpers outside the shared dispatch.
 #[must_use]
 pub fn parse_pg_bool_swar(bytes: &[u8]) -> Option<bool> {
     match bytes {
@@ -2225,8 +2198,7 @@ pub fn parse_pg_bool_swar(bytes: &[u8]) -> Option<bool> {
     }
 }
 
-// DEF-251 (audit 2026-05-08): common-literal fast-paths for i16/i32/i64
-// text decoders.
+// Common-literal fast-paths for i16/i32/i64 text decoders.
 //
 // # Why these three literals
 //
@@ -2269,20 +2241,20 @@ impl FromPgText<'_> for i16 {
     const OID: u32 = oids::INT2;
     #[inline]
     fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
-        // DEF-251 fast-paths: literal-byte equality bypasses digit
-        // loop on the three most-common values. Match-on-slice folds
-        // to a 3-arm jump table at -O2 / LTO=fat (workspace setting).
+        // Fast-paths: literal-byte equality bypasses digit loop on
+        // the three most-common values. Match-on-slice folds to a
+        // 3-arm jump table at -O2 / LTO=fat (workspace setting).
         match bytes {
             b"0" => return Ok(0),
             b"1" => return Ok(1),
             b"-1" => return Ok(-1),
             _ => {}
         }
-        // DEF-207 (2026-05-07): widened-accumulator path. i32
-        // accumulator + 5-digit cap (i16::MAX = 32767 = 5 digits).
-        // Max acc reach with 5 digits = 99_999 << i32::MAX ≈ 2.15B,
-        // so wrapping_mul(10).wrapping_add(9) cannot wrap during
-        // the loop. Single end-cast `i16::try_from` validates
+        // Widened-accumulator path. i32 accumulator + 5-digit cap
+        // (i16::MAX = 32767 = 5 digits). Max acc reach with 5
+        // digits = 99_999 << i32::MAX ≈ 2.15B, so
+        // wrapping_mul(10).wrapping_add(9) cannot wrap during the
+        // loop. Single end-cast `i16::try_from` validates
         // i16::MIN..=i16::MAX.
         parse_pg_int_signed_widened!(bytes, i16, i32, 5)
     }
@@ -2292,20 +2264,20 @@ impl FromPgText<'_> for i32 {
     const OID: u32 = oids::INT4;
     #[inline]
     fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
-        // DEF-251 fast-paths — see the family comment above i16's
-        // impl for rationale.
+        // Fast-paths — see the family comment above i16's impl for
+        // rationale.
         match bytes {
             b"0" => return Ok(0),
             b"1" => return Ok(1),
             b"-1" => return Ok(-1),
             _ => {}
         }
-        // DEF-207 (2026-05-07): widened-accumulator path. i64
-        // accumulator + 10-digit cap (i32::MAX = 2_147_483_647 =
-        // 10 digits). Max acc reach with 10 digits = 9_999_999_999
-        // << i64::MAX ≈ 9.22 × 10^18, so wrapping_mul(10) +
-        // wrapping_add(9) cannot wrap during the loop. Single
-        // end-cast `i32::try_from` validates i32::MIN..=i32::MAX.
+        // Widened-accumulator path. i64 accumulator + 10-digit cap
+        // (i32::MAX = 2_147_483_647 = 10 digits). Max acc reach
+        // with 10 digits = 9_999_999_999 << i64::MAX ≈ 9.22 ×
+        // 10^18, so wrapping_mul(10) + wrapping_add(9) cannot wrap
+        // during the loop. Single end-cast `i32::try_from`
+        // validates i32::MIN..=i32::MAX.
         parse_pg_int_signed_widened!(bytes, i32, i64, 10)
     }
 }
@@ -2314,21 +2286,21 @@ impl FromPgText<'_> for i64 {
     const OID: u32 = oids::INT8;
     #[inline]
     fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
-        // DEF-251 fast-paths — see the family comment above i16's
-        // impl for rationale.
+        // Fast-paths — see the family comment above i16's impl for
+        // rationale.
         match bytes {
             b"0" => return Ok(0),
             b"1" => return Ok(1),
             b"-1" => return Ok(-1),
             _ => {}
         }
-        // DEF-207 (2026-05-07): i64 stays on the original
-        // checked-arithmetic macro. The wider native accumulator
-        // (i128) compiles to multi-instruction sequences on
-        // 64-bit targets — losing the speed gain that motivates
-        // the widened-acc form for i16/i32. Capping at 18 digits
-        // (skipping i64::MAX) would be incorrect — `9_223_372_
-        // 036_854_775_807` is a valid 19-digit i64.
+        // `i64` stays on the original checked-arithmetic macro.
+        // The wider native accumulator (i128) compiles to multi-
+        // instruction sequences on 64-bit targets — losing the
+        // speed gain that motivates the widened-acc form for
+        // i16/i32. Capping at 18 digits (skipping `i64::MAX`)
+        // would be incorrect — `9_223_372_036_854_775_807` is a
+        // valid 19-digit i64.
         parse_pg_int_signed!(bytes, i64)
     }
 }
@@ -2359,31 +2331,33 @@ impl FromPgText<'_> for bool {
 /// Text column as `&str` — zero-copy, validates UTF-8 only.
 impl<'a> FromPgText<'a> for &'a str {
     const OID: u32 = oids::TEXT;
-    /// DEF-202 — SIMD-accelerated UTF-8 validation via `simdutf8`.
+    /// SIMD-accelerated UTF-8 validation via `simdutf8`.
     ///
     /// `core::str::from_utf8` is scalar bytewise (with an ASCII
     /// fast-path that aborts on the first non-ASCII byte; cheap on
     /// short ASCII, expensive on multi-byte UTF-8).
-    /// `simdutf8::basic::from_utf8` uses lane-wise vector shuffles +
-    /// masks via NEON on aarch64.
+    /// `simdutf8::basic::from_utf8` uses lane-wise vector shuffles
+    /// + masks via NEON on aarch64.
     ///
-    /// Bench evidence (aarch64-apple-darwin, criterion `pre-simdutf8`
-    /// vs `def202-simdutf8` baselines, 5-column rows):
-    /// * **Long ASCII** (~200 B, descriptive text): −49.9% (~2× faster).
-    ///   Realistic Postgres workload: log lines, descriptions, JSON.
-    /// * **Multi-byte UTF-8** (~78 B Cyrillic): −74.0% (~3.9× faster).
-    ///   Internationalised content: non-Latin names, free-form text.
+    /// Bench evidence (aarch64-apple-darwin, 5-column rows):
+    /// * **Long ASCII** (~200 B, descriptive text): −49.9% (~2×
+    ///   faster). Realistic Postgres workload: log lines,
+    ///   descriptions, JSON.
+    /// * **Multi-byte UTF-8** (~78 B Cyrillic): −74.0% (~3.9×
+    ///   faster). Internationalised content: non-Latin names,
+    ///   free-form text.
     /// * **Short ASCII** (17 B `alice@example.com`): +9.9%.
-    ///   Acceptable cost: 0.7 ns/col absolute regression on the cheapest
-    ///   case (where total time is already 8 ns/col). A length-threshold
-    ///   hybrid was tested and rejected — the dispatch branch costs
-    ///   ~1.5 ns/col, exceeding the savings on the short-ASCII path.
+    ///   Acceptable cost: 0.7 ns/col absolute regression on the
+    ///   cheapest case (where total time is already 8 ns/col). A
+    ///   length-threshold hybrid was tested and rejected — the
+    ///   dispatch branch costs ~1.5 ns/col, exceeding the savings
+    ///   on the short-ASCII path.
     ///
-    /// Behaviour is byte-identical to `core::str::from_utf8`: both
-    /// accept the same byte sequences, reject the same non-UTF-8
-    /// inputs, and produce the same `&str` for valid input.
-    /// `simdutf8::basic::Utf8Error` is discriminator-only; collapsed
-    /// to `DecodeError::NonUtf8` here, matching the pre-DEF-202 contract.
+    /// Behaviour is byte-identical to `core::str::from_utf8`:
+    /// both accept the same byte sequences, reject the same non-
+    /// UTF-8 inputs, and produce the same `&str` for valid input.
+    /// `simdutf8::basic::Utf8Error` is discriminator-only;
+    /// collapsed to `DecodeError::NonUtf8` here.
     #[inline]
     fn from_pg_text(bytes: &'a [u8]) -> Result<Self, DecodeError> {
         simdutf8::basic::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
@@ -2392,19 +2366,20 @@ impl<'a> FromPgText<'a> for &'a str {
 
 // ═════════════════════════════════════════════════════════════════
 // FromPgBinary — parallel to FromPgText for PG binary-format
-// columns (1c-3b: Bind-selected binary format per-parameter).
+// columns (Extended Query Bind-selected per-parameter).
 //
-// Binary format byte layout matches PG §55.7 — fixed-size ints are
-// big-endian two's complement, `bool` is a single byte 0/1, `text`
-// is raw UTF-8 bytes. Every impl's `OID` const is drift-pinned
-// against `oids::*` to catch type-mapping bugs at build time.
+// Binary format byte layout matches PG §55.7 — fixed-size ints
+// are big-endian two's complement, `bool` is a single byte 0/1,
+// `text` is raw UTF-8 bytes. Every impl's `OID` const is drift-
+// pinned against `oids::*` to catch type-mapping bugs at build
+// time.
 // ═════════════════════════════════════════════════════════════════
 
 /// Decode a column's binary-format bytes into a typed Rust value.
 ///
 /// Parallel to [`FromPgText`]; the caller dispatches between text
-/// and binary decoders based on [`ColumnDesc::format_code`]. Extended
-/// Query (1c-3b) selects binary via the Bind frame's per-param /
+/// and binary decoders based on [`ColumnDesc::format_code`].
+/// Extended Query selects binary via the Bind frame's per-param /
 /// per-result format-code arrays; Simple Query always uses text.
 ///
 /// # OID drift-pin
@@ -2419,14 +2394,14 @@ impl<'a> FromPgText<'a> for &'a str {
 /// # Sealed
 ///
 /// The [`sealed::FromPgBinarySealed`] supertrait is module-private
-/// (DEF-115-class seal). Downstream crates cannot impl the trait
-/// for their own Rust types — the binary-codec surface is a fixed
-/// set of primitives in 1c-3b; wider types land with their
-/// dedicated sub-phases (arrays 1c-6, uuid / timestamp Phase 2+).
+/// — downstream crates cannot impl the trait for their own Rust
+/// types. The binary-codec surface is a fixed set of primitives;
+/// wider types (arrays, uuid, timestamp) land with their dedicated
+/// follow-ups.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not implement `FromPgBinary` (cannot decode from PG binary format)",
     label = "supported binary-decode types are `i16`, `i32`, `i64`, `bool`, `&str`",
-    note = "`FromPgBinary` is sealed — extend by adding a `from_pg_binary_int!` invocation in `decode.rs`; downstream `impl FromPgBinary for ...` is forbidden by construction (DEF-115-class seal)"
+    note = "`FromPgBinary` is sealed — extend by adding a `from_pg_binary_int!` invocation in `decode.rs`; downstream `impl FromPgBinary for ...` is forbidden by the sealed supertrait"
 )]
 pub trait FromPgBinary<'a>: Sized + sealed::FromPgBinarySealed {
     /// PG type OID this decoder handles. Drift-pinned against
@@ -2537,9 +2512,9 @@ impl<'a> FromPgBinary<'a> for &'a str {
 // same Rust type MUST target the same PG type OID. A refactor that
 // breaks this breaks the build.
 //
-// F-038 (pass-#8): `FromPgText` now also carries `OID`; the three
-// traits (text / binary / encode) form a closed symmetry family.
-// Adding a new Rust type that impls any ONE of these forces matching
+// `FromPgText` carries `OID` too; the three traits
+// (text / binary / encode) form a closed symmetry family. Adding
+// a new Rust type that impls any ONE of these forces matching
 // impls + identical OIDs across all three, verified here.
 const _: () = {
     assert!(<i16 as FromPgBinary>::OID == oids::INT2);
@@ -2562,25 +2537,25 @@ const _: () = {
 };
 
 // ═════════════════════════════════════════════════════════════════
-// DEF-258 (2026-05-12): compile-time FormatCode × Type matrix.
+// Compile-time FormatCode × Type matrix.
 //
 // Type-level encoding of which (FormatCode, Rust-type) pairs are
 // valid for column decoding. Currently every primitive type
 // (i16/i32/i64/u32/bool/&str) implements BOTH text and binary
-// decoders — DEF-258 closes the runtime "is this (T, F) pair
+// decoders — the matrix closes the runtime "is this (T, F) pair
 // supported" classification at the type level so any future type
 // with text-only OR binary-only support automatically rejects the
 // missing-format dispatch at compile time.
 //
-// Tier impact: caller dispatch on (T, F) is **tier-1 by-construction**
-// — a static `DecodeFormat<F>` bound is the type-system check;
-// missing impl == compile error.
+// Tier impact: caller dispatch on (T, F) is **tier-1 by-
+// construction** — a static `DecodeFormat<F>` bound is the
+// type-system check; missing impl == compile error.
 //
 // Additive — does NOT replace [`FromPgText`] / [`FromPgBinary`].
-// Both legacy traits remain (caller can still invoke `T::from_pg_text`
-// or `T::from_pg_binary` directly). DecodeFormat is the new
-// generic-F-parameterised dispatch surface; impls forward to the
-// underlying legacy trait.
+// Both legacy traits remain (caller can still invoke
+// `T::from_pg_text` or `T::from_pg_binary` directly). DecodeFormat
+// is the new generic-F-parameterised dispatch surface; impls
+// forward to the underlying legacy trait.
 // ═════════════════════════════════════════════════════════════════
 
 mod format_marker_sealed {
@@ -2640,9 +2615,9 @@ impl FormatCodeMarker for BinaryFmt {
 /// Generic over `F: FormatCodeMarker` — the static format marker.
 /// Implemented for each (Rust type, wire format) pair the crate
 /// supports. Sealed via [`format_marker_sealed::DecodeFormatSealed`];
-/// downstream crates cannot add impls for their own types in the
-/// 1c-3a/3b phase. Wider type coverage (date, time, uuid, decimal)
-/// lands with the corresponding sub-phases.
+/// downstream crates cannot add impls for their own types. Wider
+/// type coverage (date, time, uuid, decimal) lands with future
+/// follow-ups.
 ///
 /// # Type-level pair check
 ///
@@ -2669,7 +2644,7 @@ impl FormatCodeMarker for BinaryFmt {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not implement `DecodeFormat<'_, {F}>`",
     label = "the (type, format) pair `({Self}, {F})` is not in the supported decode matrix",
-    note = "`DecodeFormat` is sealed — supported pairs are the cartesian product of `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}` (DEF-258 matrix). Extend by adding a `decode_format_impl!` invocation in `decode.rs`; downstream `impl DecodeFormat for ...` is forbidden by construction (DEF-115-class seal)"
+    note = "`DecodeFormat` is sealed — supported pairs are the cartesian product of `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}`. Extend by adding a `decode_format_impl!` invocation in `decode.rs`; downstream `impl DecodeFormat for ...` is forbidden by the sealed supertrait"
 )]
 pub trait DecodeFormat<'a, F: FormatCodeMarker>:
     Sized + format_marker_sealed::DecodeFormatSealed<F>
@@ -2687,8 +2662,8 @@ pub trait DecodeFormat<'a, F: FormatCodeMarker>:
     fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError>;
 }
 
-// DEF-258 impls — six primitive types × two format markers = 12 impls.
-// Macro avoids 12 copies of the same boilerplate.
+// DecodeFormat impls — six primitive types × two format markers
+// = 12 impls. Macro avoids 12 copies of the same boilerplate.
 macro_rules! impl_decode_format_text {
     ($($t:ty),+ $(,)?) => {
         $(
@@ -2742,10 +2717,10 @@ impl<'a> DecodeFormat<'a, BinaryFmt> for &'a str {
     }
 }
 
-// DEF-258: compile-time OID drift pin between DecodeFormat and the
-// legacy FromPgText/FromPgBinary traits. A future refactor that
-// touched one side without the other (or assigned a stale OID
-// constant to a new DecodeFormat impl) fails the build.
+// Compile-time OID drift pin between DecodeFormat and the legacy
+// FromPgText/FromPgBinary traits. A future refactor that touched
+// one side without the other (or assigned a stale OID constant to
+// a new DecodeFormat impl) fails the build.
 const _: () = {
     // Text-format OID pins.
     assert!(<i16 as DecodeFormat<TextFmt>>::OID == <i16 as FromPgText>::OID);
@@ -2775,7 +2750,7 @@ const _: () = {
 /// compile-time [`DecodeFormat`] dispatch surface. Requires `T`
 /// to implement **both** [`DecodeFormat<TextFmt>`] **and**
 /// [`DecodeFormat<BinaryFmt>`] — the common case for every
-/// primitive type in 1c-3a/3b.
+/// primitive type.
 ///
 /// A future type with only one format impl cannot be dispatched
 /// via this function (compile error at the trait-bound check),
@@ -2812,16 +2787,16 @@ where
 }
 
 // ═════════════════════════════════════════════════════════════════
-// EncodeBinary — PG binary format write path (mirror of FromPgBinary).
-// Used by ParamsWriter (1c-3b) to serialise parameter values into
-// the Bind frame's per-param length+bytes layout.
+// EncodeBinary — PG binary format write path (mirror of
+// `FromPgBinary`). Used by `ParamsWriter` to serialise parameter
+// values into the Bind frame's per-param length+bytes layout.
 // ═════════════════════════════════════════════════════════════════
 
 /// Encode a Rust value into PG binary format bytes, directly into
 /// a [`crate::write_buf::WriteBuf`].
 ///
 /// Parallel to [`FromPgBinary`] — the `OID` constants pair up
-/// across the two traits so the Phase 2 `query!` macro can check
+/// across the two traits so a future `query!` macro can check
 /// param-type OIDs against the `Parse`-time schema fingerprint at
 /// compile time.
 ///
@@ -2936,14 +2911,14 @@ const _: () = {
     assert!(<&str as EncodeBinary>::OID == <&str as FromPgBinary>::OID);
 };
 
-/// PostgreSQL built-in type OID constants for the subset 1c-2
+/// PostgreSQL built-in type OID constants for the subset the
 /// decoders cover. Full list at
 /// `https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat`.
 ///
 /// Callers match these against [`ColumnDesc::type_oid`] to
-/// dispatch the right [`FromPgText`] impl. The macro layer
-/// (Phase 2) consumes this mapping at compile time via
-/// `query!`-generated decoders.
+/// dispatch the right [`FromPgText`] impl. A future `query!`
+/// macro consumes this mapping at compile time via generated
+/// decoders.
 ///
 /// # Tier-1 compile drift-pin
 ///
@@ -3075,7 +3050,7 @@ mod parse_tests {
                 format_code: FormatCode::Text,
             },
         ];
-        // DEF-189: SoA storage; reconstruct AoS view via columns_iter().
+        // SoA storage; reconstruct AoS view via columns_iter().
         let actual: alloc::vec::Vec<ColumnDesc> = match &result {
             Ok(desc) => desc.columns_iter().collect(),
             Err(_) => alloc::vec::Vec::new(),
@@ -3339,11 +3314,12 @@ mod data_row_tests {
         }
     }
 
-    /// Invariant: negative column count (i.e. count header decodes to
-    /// a negative `i16`) is classified as `InvalidColumnCount { count }`
-    /// with the offending i16 preserved for diagnostics. Pass-#8 F-041
-    /// split this class out from the `TruncatedRow` "body too short"
-    /// bucket to give operators distinct root causes.
+    /// Invariant: negative column count (i.e. count header decodes
+    /// to a negative `i16`) is classified as
+    /// `InvalidColumnCount { count }` with the offending i16
+    /// preserved for diagnostics. Split out from the `TruncatedRow`
+    /// "body too short" bucket to give operators distinct root
+    /// causes.
     #[test]
     fn negative_column_count() {
         let mut body = alloc::vec::Vec::new();
@@ -3475,13 +3451,14 @@ mod from_pg_text_tests {
     /// An arm-body swap in my impl (e.g., returning `NonUtf8` for
     /// overflow) fails this table.
     ///
-    /// DEF-184 (A6/B13): non-ASCII/non-UTF-8 bytes now classify as
-    /// `IntParse` (not `NonUtf8`). Pre-(184) the decoder did a
-    /// redundant `from_utf8` walk before `str::parse`; post-(184)
-    /// the single-pass ASCII-digit parser treats ANY non-digit byte
-    /// uniformly as IntParse. The `NonUtf8` variant is preserved
+    /// Non-ASCII/non-UTF-8 bytes classify as `IntParse` (not
+    /// `NonUtf8`): the single-pass ASCII-digit parser treats ANY
+    /// non-digit byte uniformly. The `NonUtf8` variant is reserved
     /// for `&str` / `Vec<u8>` decoders that genuinely require
-    /// UTF-8 validation (arbitrary user text columns).
+    /// UTF-8 validation (arbitrary user text columns). A naive
+    /// shape that ran `from_utf8` before `str::parse` would
+    /// classify the same input as `NonUtf8` — duplicating work
+    /// and splitting the diagnostic class.
     #[test]
     fn i32_decoder_matrix() {
         // Happy paths.
@@ -3502,29 +3479,28 @@ mod from_pg_text_tests {
         assert!(matches!(i32::from_pg_text(b"12a"), Err(DecodeError::IntParse)));
         assert!(matches!(i32::from_pg_text(b" 12"), Err(DecodeError::IntParse)));
 
-        // DEF-184 (A6/B13): non-ASCII bytes → IntParse (single-pass
-        // ASCII-digit validator treats any non-digit byte uniformly).
-        // Pre-(184) this was NonUtf8 via upstream from_utf8 walk.
+        // Non-ASCII bytes → IntParse (single-pass ASCII-digit
+        // validator treats any non-digit byte uniformly).
         assert!(matches!(i32::from_pg_text(&[0xFF]), Err(DecodeError::IntParse)));
         assert!(matches!(i32::from_pg_text(&[0xC3, 0x28]), Err(DecodeError::IntParse)));
     }
 
-    /// DEF-251 (audit 2026-05-08): tier-3 closure for the common-value
-    /// fast-paths. The fast-path returns identical bytes to the macro
-    /// path on the three covered literals; this test pins that
-    /// equivalence so a future refactor that rewires fast-path to
-    /// produce a DIFFERENT result (e.g., `b"-1"` accidentally → `1`)
-    /// fails the build at test-time.
+    /// Tier-3 closure for the common-value fast-paths. The fast-
+    /// path returns identical bytes to the macro path on the three
+    /// covered literals; this test pins that equivalence so a
+    /// future refactor that rewires fast-path to produce a DIFFERENT
+    /// result (e.g., `b"-1"` accidentally → `1`) fails the build
+    /// at test-time.
     ///
-    /// **Why this is tier-3, not tier-1**: the fast-path and macro
-    /// path produce identical observable results — Rust's type system
-    /// cannot prove the equivalence statically (would need const-eval
-    /// of the macro body, which is non-const). This test exercises
-    /// the fast-path miss-then-hit interaction (each literal is the
-    /// exact byte sequence the fast-path matches), with the same
-    /// `Result<T, DecodeError>` contract.
+    /// **Why tier-3, not tier-1**: the fast-path and macro path
+    /// produce identical observable results — Rust's type system
+    /// cannot prove the equivalence statically (would need
+    /// const-eval of the macro body, which is non-const). This
+    /// test exercises the fast-path miss-then-hit interaction
+    /// (each literal is the exact byte sequence the fast-path
+    /// matches), with the same `Result<T, DecodeError>` contract.
     #[test]
-    fn def_251_common_value_fast_paths_pin_correctness() {
+    fn common_value_fast_paths_pin_correctness() {
         // i16 fast-paths.
         assert_eq!(i16::from_pg_text(b"0"), Ok(0i16));
         assert_eq!(i16::from_pg_text(b"1"), Ok(1i16));
@@ -3624,7 +3600,7 @@ mod from_pg_text_tests {
 
 #[cfg(test)]
 mod format_code_set_tests {
-    //! DEF-194: bit-packed [`FormatCodeSet`] semantic + invariant tests.
+    //! Bit-packed [`FormatCodeSet`] semantic + invariant tests.
     //!
     //! Every public-API surface is exercised. The 12 §7 axes (CREDO):
     //! - **Cardinality**: empty (0 cols), single, max (32), overflow (33+).
@@ -3647,50 +3623,16 @@ mod format_code_set_tests {
     use super::*;
     use alloc::format;
 
-    // ─────────────────────────────────────────────────────────
-    // DEF-194 follow-up 2026-04-27 — five tests REMOVED per CREDO §4.11.
+    // Round-trip / boundary / independence / OutOfRange-field-
+    // preservation / raw_bits round-trip are all verified at
+    // compile time by the `const _: () = { ... }` blocks above the
+    // test module (CREDO §4.11.1: tier-1 closure displaces
+    // redundant tier-3 runtime tests).
     //
-    // The const-assert blocks above (round-trip pin + boundary pin +
-    // independence pin) verify these properties at COMPILE TIME for
-    // every (idx ∈ 0..32, code ∈ {Text, Binary}) pair. Runtime
-    // duplicates are redundant by §4.11.1 algorithm:
-    //
-    //   - empty_resolves_every_index_to_text
-    //     → covered by round-trip pin step (1)
-    //   - set_then_get_round_trip_all_positions
-    //     → covered by round-trip pin steps (2)+(3)
-    //   - set_text_after_binary_clears_bit
-    //     → covered by round-trip pin steps (4)+(5)
-    //   - independent_columns_dont_alias
-    //     → covered by independence pin
-    //   - get_out_of_range_returns_none
-    //     → covered by boundary pin
-    //
-    // Tests retained below are tier-1-orthogonal — they cover surfaces
-    // const-asserts can't pin: OutOfRange `.idx` field surface,
-    // raw_bits round-trip API, Display impl, parser integration.
-    // ─────────────────────────────────────────────────────────
-
-    // ─────────────────────────────────────────────────────────
-    // DEF-194 follow-up 2026-04-27 — two MORE tests REMOVED
-    // (tier-3 → tier-1 elevation):
-    //
-    //   - set_out_of_range_returns_err_with_idx_field_preserved
-    //     → covered by OutOfRange field preservation pin (3 cases:
-    //        boundary MAX_ROW_COLUMNS, well-beyond 99, pathological
-    //        usize::MAX) + state-preservation assertion on each
-    //   - raw_bits_round_trip
-    //     → covered by raw_bits round-trip pin (7 patterns: zero,
-    //        all-ones, two alternating, low/high single bit, magic)
-    //
-    // Both elevations live as `const _: () = { ... }` blocks above
-    // the test module — verified at compile time, no runtime cycles.
-    // ─────────────────────────────────────────────────────────
-
-    // DEF-194 follow-up 2026-04-27 — `default_matches_empty` test
-    // removed alongside the `Default` derive (tier-3 → tier-1 by
-    // removal of the `default()` surface entirely; see the
-    // FormatCodeSet struct decl above for the rationale).
+    // Tests retained below are tier-1-orthogonal — they cover
+    // surfaces const-asserts can't pin: OutOfRange `.idx` field
+    // Display surface, parser integration, and the wide-RowDesc
+    // bit-pack round-trip.
 
     /// `OutOfRange::Display` carries the offending idx + max — used
     /// by future operator diagnostics. Pin the format so a body swap
@@ -3712,12 +3654,12 @@ mod format_code_set_tests {
         assert_eq!(core::mem::size_of::<FormatCodeSet>(), 4);
     }
 
-    /// DEF-194 follow-up 2026-04-27 — glass-arch wide-RowDesc test.
-    /// Pre-DEF-194 the storage was `[FormatCode; 32]` array; bit-pack
-    /// post-194 stores all 32 codes in a single u32. The narrow
-    /// 2-column test below covers ordinary parser integration; THIS
-    /// test pins the wide edge: 32 columns with alternating formats,
-    /// closing the §4.11.1 "tier-1 on paper, broken on max inputs" seam.
+    /// Wide-RowDesc bit-pack test. The bit-packed `FormatCodeSet`
+    /// stores all 32 codes in a single u32. The narrow 2-column
+    /// test below covers ordinary parser integration; THIS test
+    /// pins the wide edge: 32 columns with alternating formats,
+    /// closing the §4.11.1 "tier-1 on paper, broken on max inputs"
+    /// seam.
     ///
     /// Specifically pins:
     /// - **Bit ordering**: column N writes bit N (not bit 31-N or some
@@ -3731,7 +3673,7 @@ mod format_code_set_tests {
     ///   `mask_for_const(31) = 0x80000000` against future changes
     ///   that might accidentally use sign-flagged shift.
     #[test]
-    fn def194_wide_row_description_32_alternating_formats() {
+    fn wide_row_description_32_alternating_formats() {
         use alloc::vec::Vec;
         let mut frame: Vec<u8> = Vec::new();
         // MAX_ROW_COLUMNS = 32 fits i16 trivially; const-asserts in
@@ -3777,12 +3719,11 @@ mod format_code_set_tests {
         }
     }
 
-    /// `RowDesc` end-to-end: setting columns through the parser path
-    /// produces a descriptor whose `format_code(idx)` reflects the
-    /// stored bit-pack. Validates the integration of `RowDesc` ←
-    /// `FormatCodeSet` (pre-DEF-194 was direct array slot write;
-    /// post-194 is `FormatCodeSet::set`). Catches a parser-side
-    /// regression that mis-wires the `format_codes.set(...)` call.
+    /// `RowDesc` end-to-end: setting columns through the parser
+    /// path produces a descriptor whose `format_code(idx)` reflects
+    /// the stored bit-pack. Validates the integration of `RowDesc`
+    /// ← `FormatCodeSet::set`. Catches a parser-side regression
+    /// that mis-wires the `format_codes.set(...)` call.
     #[test]
     fn row_desc_format_code_via_parser() {
         // Build a RowDescription frame body with two columns:
@@ -3819,8 +3760,7 @@ mod format_code_set_tests {
 
 #[cfg(test)]
 mod parse_short_uint_swar_tests {
-    //! DEF-250 Phase B (2026-05-08): tier-3 closure for the
-    //! `parse_short_uint_swar` helper.
+    //! Tier-3 closure for the `parse_short_uint_swar` helper.
     //!
     //! `Option::None` on invalid input is a runtime classification
     //! (cannot be hoisted to tier-1 — invalid bytes only exist on
@@ -3843,7 +3783,7 @@ mod parse_short_uint_swar_tests {
     /// including all natural lengths (1-3 digits without the
     /// leading-zero pad).
     #[test]
-    fn def_250_swar_exhaustive_4digit_grid() {
+    fn swar_short_uint_exhaustive_4digit_grid() {
         for v in 0..=9999u32 {
             let s = format!("{v:04}"); // "0000" .. "9999"
             assert_eq!(
@@ -3884,7 +3824,7 @@ mod parse_short_uint_swar_tests {
     /// is what enforces the cap; a future refactor that flipped
     /// the cap (e.g. accepted len 5) would fail these.
     #[test]
-    fn def_250_swar_length_boundaries() {
+    fn swar_short_uint_length_boundaries() {
         assert_eq!(parse_short_uint_swar(b""), None, "empty");
         assert_eq!(parse_short_uint_swar(b"12345"), None, "5-digit (over cap)");
         assert_eq!(parse_short_uint_swar(b"99999"), None, "5-digit max");
@@ -3895,7 +3835,7 @@ mod parse_short_uint_swar_tests {
     /// because `b'-'` (0x2D) and `b'+'` (0x2B) both fall below
     /// `b'0'` (0x30), driving the high bit on `hi = 0x39 - byte`.
     #[test]
-    fn def_250_swar_rejects_leading_sign() {
+    fn swar_short_uint_rejects_leading_sign() {
         assert_eq!(parse_short_uint_swar(b"-1"), None);
         assert_eq!(parse_short_uint_swar(b"-100"), None);
         assert_eq!(parse_short_uint_swar(b"+1"), None);
@@ -3907,7 +3847,7 @@ mod parse_short_uint_swar_tests {
     /// this sweep proves the rejection has no positional weakness
     /// (e.g. a misplaced shift would leave one position unchecked).
     #[test]
-    fn def_250_swar_rejects_invalid_bytes_per_position() {
+    fn swar_short_uint_rejects_invalid_bytes_per_position() {
         let invalid_bytes: &[u8] = &[
             0x00,
             0x2F, // '/' — one below b'0'
@@ -3958,7 +3898,7 @@ mod parse_short_uint_swar_tests {
     /// 0..=9 range, no high bit set). An off-by-one in the mask
     /// constants (e.g. `0x39` → `0x38`) would break b'9' acceptance.
     #[test]
-    fn def_250_swar_boundary_digits() {
+    fn swar_short_uint_boundary_digits() {
         assert_eq!(parse_short_uint_swar(b"0"), Some(0));
         assert_eq!(parse_short_uint_swar(b"9"), Some(9));
         assert_eq!(parse_short_uint_swar(b"00"), Some(0));
@@ -3970,7 +3910,7 @@ mod parse_short_uint_swar_tests {
 
 #[cfg(test)]
 mod parse_long_uint_swar_tests {
-    //! DEF-266 β SWAR extension (2026-05-11): tier-3 closure for
+    //! SWAR extension — tier-3 closure for
     //! `parse_long_uint_swar` (5-19 digit u64-range parser).
     //!
     //! Strategy mirrors `parse_short_uint_swar_tests`:
@@ -4248,7 +4188,7 @@ mod parse_long_uint_swar_tests {
 
 #[cfg(test)]
 mod validate_utf8_swar_tests {
-    //! DEF-266 β SWAR extension (2026-05-11): tier-3 closure for
+    //! SWAR extension — tier-3 closure for
     //! `validate_utf8_swar` (all-ASCII fast-path detector).
     //!
     //! The helper's contract is one-sided: `Some(())` ⇒ pure ASCII
@@ -4400,7 +4340,7 @@ mod validate_utf8_swar_tests {
 
 #[cfg(test)]
 mod parse_pg_bool_swar_tests {
-    //! DEF-266 β SWAR extension (2026-05-11): tier-3 closure for
+    //! SWAR extension — tier-3 closure for
     //! `parse_pg_bool_swar` (4-form PG boolean cache-hit parser).
     //!
     //! Exhaustive — there are exactly four accepted shapes.
@@ -4490,8 +4430,8 @@ mod parse_pg_bool_swar_tests {
 
 #[cfg(test)]
 mod decode_format_tests {
-    //! DEF-258 (2026-05-12): type-level (T, F) pair dispatch via the
-    //! generic-F `DecodeFormat<F>` trait.
+    //! Type-level (T, F) pair dispatch via the generic-F
+    //! `DecodeFormat<F>` trait.
     //!
     //! Tests cover:
     //! - each `(T, F)` pair round-trips correctly (12 cases:
@@ -4507,13 +4447,13 @@ mod decode_format_tests {
     use super::*;
 
     #[test]
-    fn def_258_markers_wire_consts() {
+    fn markers_wire_consts() {
         assert_eq!(<TextFmt as FormatCodeMarker>::WIRE, FormatCode::Text);
         assert_eq!(<BinaryFmt as FormatCodeMarker>::WIRE, FormatCode::Binary);
     }
 
     #[test]
-    fn def_258_text_round_trips() {
+    fn text_round_trips() {
         assert_eq!(<i16 as DecodeFormat<TextFmt>>::decode(b"42"), Ok(42_i16));
         assert_eq!(<i32 as DecodeFormat<TextFmt>>::decode(b"-1234567"), Ok(-1_234_567_i32));
         assert_eq!(<i64 as DecodeFormat<TextFmt>>::decode(b"9223372036854775807"), Ok(9_223_372_036_854_775_807_i64));
@@ -4524,7 +4464,7 @@ mod decode_format_tests {
     }
 
     #[test]
-    fn def_258_binary_round_trips() {
+    fn binary_round_trips() {
         assert_eq!(<i16 as DecodeFormat<BinaryFmt>>::decode(&42_i16.to_be_bytes()), Ok(42_i16));
         assert_eq!(<i32 as DecodeFormat<BinaryFmt>>::decode(&(-1_234_567_i32).to_be_bytes()), Ok(-1_234_567_i32));
         assert_eq!(<i64 as DecodeFormat<BinaryFmt>>::decode(&i64::MAX.to_be_bytes()), Ok(i64::MAX));
@@ -4535,7 +4475,7 @@ mod decode_format_tests {
     }
 
     #[test]
-    fn def_258_oid_consistency_text() {
+    fn oid_consistency_text() {
         // Runtime double-check of the compile-time const-asserts.
         // Removing the assert block would not be caught by compile,
         // but THIS test would still fail.
@@ -4548,7 +4488,7 @@ mod decode_format_tests {
     }
 
     #[test]
-    fn def_258_oid_consistency_binary() {
+    fn oid_consistency_binary() {
         assert_eq!(<i16 as DecodeFormat<BinaryFmt>>::OID, <i16 as FromPgBinary>::OID);
         assert_eq!(<i32 as DecodeFormat<BinaryFmt>>::OID, <i32 as FromPgBinary>::OID);
         assert_eq!(<i64 as DecodeFormat<BinaryFmt>>::OID, <i64 as FromPgBinary>::OID);
@@ -4558,7 +4498,7 @@ mod decode_format_tests {
     }
 
     #[test]
-    fn def_258_oid_text_binary_symmetry() {
+    fn oid_text_binary_symmetry() {
         // Same Rust type → same PG type OID across text/binary.
         // (Already const-asserted on the legacy FromPgText/FromPgBinary
         // pair; mirrored here on the new DecodeFormat surface for
@@ -4591,7 +4531,7 @@ mod decode_format_tests {
     }
 
     #[test]
-    fn def_258_decode_with_format_dispatches_correctly() {
+    fn decode_with_format_dispatches_correctly() {
         // Text-side dispatch.
         let v: i32 = decode_with_format(b"42", FormatCode::Text).unwrap_or(0);
         assert_eq!(v, 42);
@@ -4611,7 +4551,7 @@ mod decode_format_tests {
     }
 
     #[test]
-    fn def_258_decode_with_format_propagates_errors() {
+    fn decode_with_format_propagates_errors() {
         // Invalid text bool — `from_pg_text` returns `BoolParse`.
         let r: Result<bool, _> = decode_with_format(b"yes", FormatCode::Text);
         assert!(matches!(r, Err(DecodeError::BoolParse)));
@@ -4621,7 +4561,7 @@ mod decode_format_tests {
     }
 
     #[test]
-    fn def_258_marker_zero_sized() {
+    fn marker_zero_sized() {
         // ZST property — markers carry zero runtime cost.
         assert_eq!(core::mem::size_of::<TextFmt>(), 0);
         assert_eq!(core::mem::size_of::<BinaryFmt>(), 0);

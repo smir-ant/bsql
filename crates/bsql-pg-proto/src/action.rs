@@ -7,7 +7,7 @@
 //! harness pattern-matches them directly. The protocol itself does
 //! neither.
 //!
-//! # DEF-094 — staged dispatch + lifetime-bound SendBytes
+//! # Staged dispatch + lifetime-bound SendBytes
 //!
 //! [`Action::SendBytes`] carries a `&'buf [u8]` reference into a
 //! **caller-owned** [`crate::write_buf::WriteBuf`] that is passed to
@@ -36,10 +36,11 @@
 //! Internally, dispatchers emit [`StagedAction`] values (range-based,
 //! no refs) during the write phase; the entry-point materialises them
 //! into ref-bound [`Action<'buf>`]s once the mutable write phase
-//! completes. This two-phase split sidesteps the borrow-checker
-//! conflict that had blocked an earlier DEF-094 attempt: holding
-//! `Action<'buf>::SendBytes(&'buf [u8])` while re-entering the
-//! dispatcher for the next frame in the same `feed_bytes` call.
+//! completes. A naive shape that emitted ref-bound `Action<'buf>`
+//! directly from the dispatcher hit a borrow-checker conflict: the
+//! dispatcher would hold `Action<'buf>::SendBytes(&'buf [u8])` while
+//! re-entering itself for the next frame in the same `feed_bytes`
+//! call. Two-phase staging sidesteps that conflict.
 
 use crate::error::ProtocolError;
 use crate::protocol::MAX_ACTIONS_PER_CALL;
@@ -64,7 +65,7 @@ use core::num::{NonZeroU16, NonZeroU64};
 /// compiler help and forgetting the `'E'` arm was a tier-3 audit
 /// seam.
 ///
-/// # NOT `#[non_exhaustive]` — DEF-256 audit (2026-05-08)
+/// # NOT `#[non_exhaustive]`
 ///
 /// PG §55.7 defines `{'I', 'T', 'E'}` and this set is closed by
 /// the wire protocol — a fourth status would require a major
@@ -91,7 +92,7 @@ impl TxStatus {
     /// Returns `Err(b)` carrying the offending byte when `b` is
     /// outside `{'I', 'T', 'E'}` — lets callers forward the actual
     /// rejected value to diagnostics if they choose. Mirrors the
-    /// `FormatCode::try_from_wire_i16` shape. F-009 (pass-#8).
+    /// `FormatCode::try_from_wire_i16` shape.
     #[inline]
     pub const fn try_from_byte(b: u8) -> Result<Self, u8> {
         match b {
@@ -119,11 +120,10 @@ impl TxStatus {
     }
 }
 
-// DEF-154 (V) P2-3: round-trip compile pin for TxStatus.
+// Round-trip compile pin for TxStatus.
 // `try_from_byte(byte(v)) == Ok(v)` must hold for every variant —
 // catches a body-swap drift (e.g. `Self::Idle => b'T'`) at build
-// time rather than in an integration test. Tier-3 audit → tier-1
-// compile.
+// time rather than in an integration test. Tier-1 compile.
 const _: () = {
     assert!(
         matches!(TxStatus::try_from_byte(TxStatus::Idle.byte()), Ok(TxStatus::Idle)),
@@ -140,8 +140,8 @@ const _: () = {
 };
 
 /// Typed non-empty range into a write buffer, replacing the raw
-/// `(start, end): (usize, usize)` pair on [`StagedAction::SendBytesRange`].
-/// DEF-100.
+/// `(start, end): (usize, usize)` pair on
+/// [`StagedAction::SendBytesRange`].
 ///
 /// # Invariants
 ///
@@ -153,12 +153,13 @@ const _: () = {
 /// - At construction, `start.saturating_add(len) ≤ bounds` is
 ///   checked; the constructor returns `None` otherwise.
 ///
-/// # Tier elevation
+/// # Tier
 ///
-/// Before DEF-100, `SendBytesRange { start, end }` carried two raw
-/// `usize`s with no proof of `start ≤ end` or `end ≤ write_buf.len()`.
-/// `materialise` fell back silently to `&[]` on any violation — a
-/// tier-3 audit-enforced seam. After DEF-100:
+/// A naive `SendBytesRange { start, end }` shape carrying two raw
+/// `usize`s with no proof of `start ≤ end` or `end ≤ write_buf.len()`
+/// would leave `materialise` to fall back silently to `&[]` on any
+/// violation — a tier-3 audit-enforced seam. The current shape is
+/// tighter:
 ///
 /// - `start ≤ end` is guaranteed by `len: NonZeroU16` built via
 ///   `end.checked_sub(start)?` — you cannot construct a range with
@@ -169,14 +170,14 @@ const _: () = {
 ///   `bounds` — architecturally the same buffer is used, so this
 ///   branch is dead at call-site level.
 ///
-/// # DEF-147 size narrowing
+/// # Size narrowing
 ///
-/// Storage narrowed from `usize + NonZeroUsize` (16 B on 64-bit) to
-/// `u16 + NonZeroU16` (4 B). Valid because all range endpoints
-/// originate in buffers bounded by `READ_BUF_CAP = 4096` or
-/// `MAX_OWNED_SEND_LEN = 2176`, both ≤ `u16::MAX = 65535`
-/// (const-asserted at `crate::buf::READ_BUF_CAP`). On a 1000-row
-/// SELECT, 12 KB of stack traffic saved.
+/// Storage is `u16 + NonZeroU16` (4 B). A naive `usize + NonZeroUsize`
+/// shape (16 B on 64-bit) would burn 12 B per range; on a 1000-row
+/// SELECT, 12 KB of stack traffic. The narrow form is valid because
+/// all range endpoints originate in buffers bounded by
+/// `READ_BUF_CAP = 4096` or `MAX_OWNED_SEND_LEN = 2176`, both ≤
+/// `u16::MAX = 65535` (const-asserted at `crate::buf::READ_BUF_CAP`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NonEmptyRange {
     start: u16,
@@ -188,11 +189,12 @@ impl NonEmptyRange {
     /// Returns `None` if `start > end`, `end > bounds`, or the range
     /// is empty (`start == end`).
     ///
-    /// DEF-147: signature stays `(usize, usize, usize)` for call-site
-    /// compat. The `u16::try_from` narrowing fallbacks are
-    /// architecturally dead for bounded buffer offsets
-    /// (≤ READ_BUF_CAP ≤ u16::MAX) but the explicit try-from satisfies
-    /// the forbid bundle's ban on `as` conversions.
+    /// Signature is `(usize, usize, usize)` for call-site compat
+    /// (callers carry `usize` offsets from indexing). The
+    /// `u16::try_from` narrowing fallbacks are architecturally dead
+    /// for bounded buffer offsets (≤ READ_BUF_CAP ≤ u16::MAX) but
+    /// the explicit try-from satisfies the forbid bundle's ban on
+    /// `as` conversions.
     #[inline]
     pub(crate) fn new(start: usize, end: usize, bounds: usize) -> Option<Self> {
         if end > bounds {
@@ -208,12 +210,6 @@ impl NonEmptyRange {
         let start_u16 = u16::try_from(start).ok()?;
         Some(Self { start: start_u16, len })
     }
-
-    // DEF-154 (B) Phase B4: `from_write_span` unbranded helper
-    // deleted. Production builders use
-    // `WriteRange::from_write_span` (branded equivalent
-    // with buffer-identity proof); no remaining caller needed the
-    // raw-buffer unbranded form.
 
     /// Test-only constant constructor for a unit-length range
     /// (`start=0`, `len=1`). Returns `Self` directly (not `Option<Self>`)
@@ -235,81 +231,51 @@ impl NonEmptyRange {
     }
 
     /// Resolve the range against a buffer, returning the slice or
-    /// `None` on bounds mismatch.
-    ///
-    /// DEF-154 (N): `debug_assert!(slice.is_some(), ...)` REMOVED.
-    /// The assert was the "debug loud + release silent" pattern
-    /// user banned. Callers (`WriteRange::apply`) now propagate the
-    /// None via their own Option return and materialise classifies
-    /// the mismatch via `CloseSocket` emission (no silent `&[]`,
-    /// no debug panic target).
+    /// `None` on bounds mismatch. A naive
+    /// `debug_assert!(slice.is_some(), ...)` would form the "debug
+    /// loud + release silent" pattern this crate bans; instead the
+    /// None is propagated through `WriteRange::apply` and classified
+    /// at materialise as a `CloseSocket` emission.
     #[inline]
     pub(crate) fn apply<'a>(&self, buf: &'a [u8]) -> Option<&'a [u8]> {
-        // DEF-147: widen u16 → usize via infallible usize::from before
-        // slice indexing.
+        // Widen u16 → usize via infallible usize::from before slice
+        // indexing.
         let start = usize::from(self.start);
         let end = start.checked_add(usize::from(self.len.get()))?;
         buf.get(start..end)
     }
 }
 
-// DEF-147 drift pin: NonEmptyRange packs u16 + NonZeroU16 = 4 B.
-// 1000-row SELECT: 12 KB of per-row stack traffic saved (vs the
-// pre-DEF-147 16 B form).
+// Drift pin: NonEmptyRange packs u16 + NonZeroU16 = 4 B. A naive
+// `usize + NonZeroUsize` form (16 B on 64-bit) would burn 12 KB of
+// per-row stack traffic on a 1000-row SELECT.
 const _: () = assert!(
     core::mem::size_of::<NonEmptyRange>() == 4,
-    "NonEmptyRange size regression — DEF-147 narrowed storage to \
-     u16 + NonZeroU16 = 4 B. Buffer offsets ≤ READ_BUF_CAP ≤ u16::MAX \
-     are const-asserted at crate::buf::READ_BUF_CAP.",
+    "NonEmptyRange size regression — must stay u16 + NonZeroU16 = 4 B. \
+     Buffer offsets ≤ READ_BUF_CAP ≤ u16::MAX are const-asserted at \
+     crate::buf::READ_BUF_CAP.",
 );
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-154 (B) Phase B3 — branded range newtypes
+// Range newtype wrappers
 // ═════════════════════════════════════════════════════════════════════
 //
-// `WriteRange` and `ReadRange<'brand>` wrap [`NonEmptyRange`]
-// with a generative brand lifetime tied to the buffer the range was
-// constructed against. Their `apply(BrandedBytes<'brand, '_>) -> &[u8]`
-// methods are INFALLIBLE — the brand-identity proof combined with
-// the `NonEmptyRange::new` construction-time bounds-check eliminates
-// the "buffer shorter than emission-time bounds" failure mode that
-// Phase B2's shielded `apply() -> Option<&[u8]>` retained at
-// tier-2 runtime.
-//
-// # Tier-1 soundness argument
-//
-// Given a `WriteRange` `r` and a `BrandedBytes<'brand, '_>`
-// `b`:
-//
-// 1. Same brand `'brand` ⇒ same generative-lifetime scope ⇒ same
-//    `with_branded` closure ⇒ same `BrandedWriteBuf` (invariant on
-//    `'brand` prevents cross-closure leakage).
-// 2. Inside the closure, [`crate::write_buf::BrandedWriteBuf`] exposes
-//    only `reserve()` and `as_bytes_branded()`; neither `clear()`
-//    nor any truncating op is reachable. The underlying `WriteBuf`
-//    cannot shrink between `r`'s construction and `b`'s production.
-// 3. `r`'s `start + len <= buf.len()` was validated at construction
-//    (via `NonEmptyRange::new` or `from_write_span`); combined with
-//    (2), `start + len <= buf.len() <= b.len()` holds at apply
-//    time.
-// 4. Therefore `b.as_slice().get(start..start + len)` is `Some` —
-//    the brand-pattern closes the class structurally, and
-//    `apply` returns `&[u8]` with no Option.
+// `WriteRange` wraps [`NonEmptyRange`] as a typed wrapper over a
+// caller-owned write buffer. A naive generative-brand shape (HRTB
+// closure threading a `'brand` lifetime to prove buffer identity)
+// was considered and rejected: the brand's deliverable was infallible
+// `apply`, but `apply` still has to return `Option<&[u8]>` for the
+// runtime mismatch arm (the brand cannot prove `start + len ≤
+// buf.len()` post-clear). With the brand's tier-1 deliverable gone,
+// the bare wrapper has the same tier-2-structural guarantee at lower
+// API surface.
 
 /// Range into an outbound [`crate::write_buf::WriteBuf`].
 ///
-/// DEF-154 (W): `'brand` phantom deleted. Pre-(W) this was
-/// `WriteRange` with a `PhantomData<fn(&'brand ()) ->
-/// &'brand ()>` field, claiming tier-1 infallible apply via
-/// buffer-identity proof. DEF-154 (N) reverted `apply` to return
-/// `Option<&[u8]>` — the brand's only tier-1 deliverable
-/// evaporated. Post-(W) bare `NonEmptyRange` wrapper; apply is
-/// runtime-checked and classified (not silent) on mismatch.
-///
-/// Tier today: tier-2 structural (construction validates
-/// `start + len <= buf.len()`; apply None is classified
-/// `CloseSocket` emission at materialise). API-narrow on
-/// `WriteReserved` prevents mid-scope truncation.
+/// Tier-2 structural — construction validates
+/// `start + len <= buf.len()`; apply `None` is classified as
+/// `CloseSocket` emission at materialise (no silent `&[]`).
+/// API narrowing on `WriteReserved` prevents mid-scope truncation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WriteRange {
     /// Underlying non-empty range — carries the validated
@@ -327,26 +293,17 @@ impl WriteRange {
         Self { inner }
     }
 
-    /// DEF-154 (B+W) — build a write range from the current span
-    /// of a `WriteReserved`. `start` is captured before builder
-    /// writes; `reserved.len()` after gives the post-state end.
+    /// Build a write range from the current span of a
+    /// `WriteReserved`. `start` is captured before builder writes;
+    /// `reserved.len()` after gives the post-state end.
     ///
-    /// # Err classification (P0-2 fix from architect audit)
+    /// # Err classification
     ///
     /// Returns `Err(InternalCrateBug { locus: EmptyWriteRange })`
     /// if `reserved.len() <= start` (builder emitted zero bytes
     /// since `start`). Architecturally dead under intact builders
     /// (every PG wire frame ≥ 5 bytes); classified via the crate-
-    /// bug locus rather than silently fabricating a fallback
-    /// range.
-    ///
-    /// DEF-154 (W) note: pre-(W) this was `from_branded_write_span`
-    /// taking `&BrandedWriteReserved<'_>`; the brand
-    /// phantom added zero tier-1 (apply returned Option anyway per
-    /// DEF-154 N). Renamed + unbranded post-(W).
-    // DEF-184 (A1+A13): ProtocolError shrunk 312 → ~72 B, below
-    // the `result_large_err` 128 B threshold; no longer needs
-    // #[expect].
+    /// bug locus rather than silently fabricating a fallback range.
     #[inline]
     pub(crate) fn from_write_span(
         start: usize,
@@ -361,19 +318,14 @@ impl WriteRange {
     }
 
     /// Apply the range to write-buffer bytes — returns `None` on
-    /// bounds mismatch. Materialise classifies None via
-    /// `CloseSocket` emission (not silent).
+    /// bounds mismatch. Materialise classifies `None` via
+    /// `CloseSocket` emission (not silent). A naive
+    /// `debug_assert + unwrap_or(&[])` shape would form the banned
+    /// "debug loud + release silent" pattern.
     ///
-    /// DEF-154 (N + W): apply signature is `Option<&[u8]>`. Pre-(N)
-    /// it was `&[u8]` with `debug_assert + unwrap_or(&[])` —
-    /// banned silent pattern. Pre-(W) it took
-    /// `BrandedBytes<'brand, 'a>`; post-(W) takes plain `&'a [u8]`
-    /// since the brand carried no additional guarantee (DEF-154 N
-    /// had already reduced apply to runtime-checked Option).
-    ///
-    /// None arm is architecturally dead under API-narrow
+    /// `None` arm is architecturally dead under API-narrow
     /// `WriteReserved` (no truncating ops between construction +
-    /// apply); materialise's CloseSocket emission is the
+    /// apply); materialise's `CloseSocket` emission is the
     /// tier-2 structural classifier.
     #[inline]
     #[must_use]
@@ -392,77 +344,46 @@ impl WriteRange {
     }
 }
 
-// DEF-154 (H): `ReadRange<'brand>` type + `BrandedReadBuf` +
-// `DualBrandInvariant` + the entire `'rb` brand scaffolding on
-// the read side DELETED. `StagedAction::StreamRowRange` now
-// carries `row_bytes: &'r [u8]` directly — slice is borrowed at
-// dispatch time from `read_buf.populated()`, stored in staged,
-// and passed through materialise unchanged (tier-1 identity apply).
-//
-// The `'rb` brand was introduced in (E) to prove "same buffer"
-// for `ReadRange::apply` bounds-safety. But Rust's borrow checker
-// already tracks slice lifetime — storing `&'r [u8]` directly is
-// strictly simpler and gives tier-1 apply "for free" (no Option,
-// no unwrap_or, no debug_assert). The only reason `(start, len)`
-// indirection was needed was to decouple stage-time borrow from
-// post-loop `advance_scope_local` mutation. DEF-154 (H) replaces
-// that mutation with `PgProtocol.pending_advance: u16` —
-// deferring the advance to the next feed_bytes call's entry —
-// which allows the stage-time slice to keep its shared borrow
-// through materialise without conflicting with a cursor move.
+// `StagedAction::StreamRowRange` carries `row_bytes: &'r [u8]`
+// directly — slice is borrowed at dispatch time from
+// `read_buf.populated()`, stored in staged, and passed through
+// materialise unchanged. A naive `ReadRange<'brand>` shape (start +
+// len + brand phantom) would require a runtime-checked apply and
+// gain nothing: Rust's borrow checker already tracks slice lifetime,
+// so `&'r [u8]` gives tier-1 apply "for free" (no Option, no
+// unwrap_or, no debug_assert).
 
-// Phase B3 drift pin: WriteRange must stay the same size as
-// the underlying `NonEmptyRange` (phantom is ZST).
+// Drift pin: WriteRange must stay the same size as the underlying
+// `NonEmptyRange`.
 const _: () = assert!(
     core::mem::size_of::<WriteRange>() == core::mem::size_of::<NonEmptyRange>(),
-    "WriteRange size regression — must equal NonEmptyRange (4 B) post DEF-154 (W) \
-     phantom deletion.",
+    "WriteRange size regression — must equal NonEmptyRange (4 B).",
 );
 
 #[cfg(test)]
-mod phase_b3_tests {
-    //! DEF-154 (B) Phase B3 — branded range newtype tests.
+mod range_newtype_tests {
+    //! Range newtype shape + infallible-apply tests.
     //!
-    //! Phase B3 covers the shape + infallible `apply` of the
-    //! branded ranges. Actual end-to-end builder → apply
-    //! round-tripping (pushing bytes into a buffer via a branded
-    //! reserved and applying the range against same-brand bytes)
-    //! requires push methods on `BrandedWriteReserved`, which land
-    //! in Phase B4 alongside builder migration. Phase B3 tests
-    //! what CAN be tested without that:
     //!   - Types are constructible via `from_raw`.
     //!   - `inner()` accessor round-trips.
-    //!   - Size is 4 B (phantom ZST).
-    //!   - `apply()` on a same-brand `BrandedBytes` returns
-    //!     `&[u8]` (not `Option<&[u8]>`) — tier-1 lift at the
-    //!     type level, infallibility verified by the
-    //!     construction-bounds + brand-identity argument in the
-    //!     module block.
+    //!   - Size is 4 B (no phantom; bare wrapper).
+    //!   - `apply()` round-trips bytes via a fresh `WriteBuf`.
     //!
-    //! Cross-brand rejection is a compile-time property and lands
-    //! in a future trybuild harness.
+    //! End-to-end builder → apply round-tripping through the
+    //! branded reserved type lives in
+    //! `crate::write_buf::branded_reserved_tests`.
     use super::*;
     use crate::write_buf::WriteBuf;
 
-    /// B3-1: happy-path apply — build a range whose `(start=0,
-    /// len=1)` fits the 1-byte populated buffer, apply it
-    /// same-branded, observe the expected single-byte slice with
-    /// no call-site `Option` unwrap.
-    ///
-    /// The byte is pushed BEFORE entering the branded scope
-    /// (Phase B3 doesn't yet migrate push methods onto
-    /// `BrandedWriteReserved` — that's Phase B4). Inside the
-    /// branded scope we use `as_bytes_branded()` directly from
-    /// `BrandedWriteBuf` (no `reserve()` call, since reserve's
-    /// `is_empty` debug_assert is designed for fresh buffers at
-    /// build-start, not for materialise-time read access).
+    /// Happy-path apply — build a range whose `(start=0, len=1)`
+    /// fits the 1-byte populated buffer, apply it, observe the
+    /// expected single-byte slice with no call-site `Option`
+    /// unwrap.
     #[test]
     fn write_range_apply_returns_infallible_slice() {
         let mut buf = WriteBuf::new();
         let push_ok = buf.push_u8(0x42);
         assert!(push_ok.is_ok(), "push_u8 must succeed on fresh buffer");
-        // DEF-154 (W): no more `with_branded` HRTB closure; direct
-        // access to the unbranded buffer.
         let bytes = buf.as_bytes();
         let raw = NonEmptyRange::test_unit();
         let range = WriteRange::from_raw(raw);
@@ -471,10 +392,10 @@ mod phase_b3_tests {
         assert_eq!(byte, 0x42, "WriteRange apply round-trips the pushed byte");
     }
 
-    /// B3-2 + DEF-154 (W): drift pin — WriteRange is 4 bytes
-    /// (post-(W) identical layout to `NonEmptyRange`; no phantom).
+    /// Drift pin — WriteRange is 4 bytes (identical layout to
+    /// `NonEmptyRange`; no phantom).
     #[test]
-    fn branded_range_sizes_match_raw() {
+    fn write_range_sizes_match_raw() {
         assert_eq!(core::mem::size_of::<WriteRange>(), 4);
         assert_eq!(
             core::mem::size_of::<Option<WriteRange>>(),
@@ -483,30 +404,30 @@ mod phase_b3_tests {
         );
     }
 
-    /// B3-3 + DEF-154 (W): `inner()` accessor round-trip.
+    /// `inner()` accessor round-trip.
     #[test]
-    fn branded_range_inner_roundtrip() {
+    fn write_range_inner_roundtrip() {
         let raw = NonEmptyRange::test_unit();
         let w = WriteRange::from_raw(raw);
         assert_eq!(w.inner(), raw);
     }
 
-    /// DEF-154 (B) Phase B4-W P0-2 + P2 + (W) closure: exercise
-    /// the classified Err path of `WriteRange::from_write_span`.
+    /// Exercise the classified Err path of
+    /// `WriteRange::from_write_span`.
     ///
     /// `NonEmptyRange::new(start, end, bounds)` returns `None` iff
     /// `end <= start` OR `end > bounds`. Post-builder,
     /// `end = reserved.len()` = `bounds`. So the only way to force
-    /// None is `start >= reserved.len()` — simulating a builder
+    /// `None` is `start >= reserved.len()` — simulating a builder
     /// that captured `start` post-push, skipped pushes, or
     /// overflowed the usize into the end field (all genuine
     /// builder-drift scenarios).
     ///
     /// The test forces `start > reserved.len()` by calling
-    /// `from_write_span(10, ...)` on a fresh (empty) reserved.
-    /// Err path fires with `CrateBugLocus::EmptyWriteRange` —
-    /// pre-P0-2 this silently returned a unit-length `WriteRange`,
-    /// a tier-4 0-byte Action::SendBytes on apply.
+    /// `from_write_span(10, ...)` on a fresh (empty) reserved. Err
+    /// path fires with `CrateBugLocus::EmptyWriteRange` — a naive
+    /// shape would silently return a unit-length `WriteRange`,
+    /// emitting a tier-4 0-byte `Action::SendBytes` on apply.
     #[test]
     fn from_write_span_err_classified_as_empty_write_range() {
         let mut buf = crate::write_buf::WriteBuf::new();
@@ -524,9 +445,9 @@ mod phase_b3_tests {
         });
         assert!(
             is_empty_write_range,
-            "from_branded_write_span must return Err(EmptyWriteRange) when \
-             start > reserved.len() — pre-P0-2 this silently fell back to a \
-             unit-length range (tier-4 0-byte Action::SendBytes).",
+            "from_write_span must return Err(EmptyWriteRange) when \
+             start > reserved.len() — a naive shape would silently fall \
+             back to a unit-length range (tier-4 0-byte Action::SendBytes).",
         );
     }
 }
@@ -552,21 +473,20 @@ mod phase_b3_tests {
 /// `Action<'buf>::SendBytes` is still alive, the caller cannot
 /// re-borrow `&mut WriteBuf` — the borrow checker refuses.
 ///
-/// `MAX_ACTIONS_PER_CALL` is intentionally tiny in Phase 1a — see
-/// its definition in `protocol.rs` for the per-method audit.
-/// Overflow handling is compile-enforced via the `emit_actions!`
-/// macro's `const _: () = assert!(MAX_ACTIONS_PER_CALL >= budget)`
-/// checks at every push site.
+/// `MAX_ACTIONS_PER_CALL` is intentionally tiny — see its
+/// definition in `protocol.rs` for the per-method budget. Overflow
+/// handling is compile-enforced via the `emit_actions!` macro's
+/// `const _: () = assert!(MAX_ACTIONS_PER_CALL >= budget)` checks
+/// at every push site.
 ///
-/// # DEF-184 (A2/B1/B8): `ManuallyDrop<heapless::Vec>` backing
+/// # `ManuallyDrop<heapless::Vec>` backing
 ///
-/// Pre-(184) used `[Action; MAX_ACTIONS_PER_CALL]` + `u8 len`
-/// with `Action::CloseSocket` sentinel-fill — every
-/// `OutActions::new()` paid **5008 B zero-fill/call** (16 × 312 B +
-/// pad). Post-(184): `ManuallyDrop<heapless::Vec<Action, N>>` —
-/// zero init writes via `heapless::Vec::new()`, wrapper suppresses
+/// `OutActions` is `ManuallyDrop<heapless::Vec<Action, N>>` — zero
+/// init writes via `heapless::Vec::new()`; the wrapper suppresses
 /// the Drop impl that would otherwise extend NLL borrows past
-/// last-use.
+/// last-use. A naive `[Action; MAX_ACTIONS_PER_CALL]` + `u8 len`
+/// shape with `Action::CloseSocket` sentinel-fill would pay
+/// **5008 B zero-fill/call** (16 × 312 B + pad).
 ///
 /// ## Why ManuallyDrop?
 ///
@@ -650,9 +570,10 @@ impl Default for OutActions<'_, '_> {
 impl<'w, 'r> OutActions<'w, 'r> {
     /// Construct an empty `OutActions`.
     ///
-    /// DEF-184 (A2/B1/B8): replaced `[Action::CloseSocket; N]`
-    /// eager fill (5008 B of writes) with `ManuallyDrop::new
-    /// (heapless::Vec::new())` (zero writes).
+    /// Backed by `ManuallyDrop::new(heapless::Vec::new())` — zero
+    /// writes at construction. A naive `[Action::CloseSocket; N]`
+    /// eager fill would write 5008 B every call on a fresh
+    /// `OutActions`.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
@@ -690,8 +611,6 @@ impl<'w, 'r> OutActions<'w, 'r> {
 
     /// Push an action. Returns `Err(action)` (mirrors heapless's
     /// convention) if the container is full.
-    // DEF-184 (A1+A13): Action shrunk Reply-bounded ~88 B; Err
-    // path no longer triggers `result_large_err`.
     #[inline]
     pub fn push(&mut self, action: Action<'w, 'r>) -> Result<(), Action<'w, 'r>> {
         self.items.push(action)
@@ -752,26 +671,22 @@ impl<'a, 'w, 'r> IntoIterator for &'a OutActions<'w, 'r> {
 /// Future "consistency" refactors must address all three points
 /// before proposing the change.
 ///
-/// **DEF-211 SAFE-01 / SAFE-01' REJECTED 2026-05-04** — see
-/// `deferred.md §B "Verified load-bearing"` entry for the full
-/// pre-implementation post-mortem of the proposed `InlineArr<T, N, L>`
-/// safe replacement. The Pareto-optimal analysis above was the exact
-/// blocker that emerged in measurement projection (per-call types ship
-/// ~700 B memset on every entry-point call → +30-50% on
-/// push_command/ping_amortised, violates Q2 bench gate). Cross-ref
-/// also at `lib.rs:160+` (DEF-211 SAFE-02 transitive-unsafe audit-trust
-/// commentary). Future audit re-opening requires new measurement
-/// evidence per the deferred.md §B reopen contract.
-// DEF-154 (L): staged container uses `MAX_STAGED_PER_CALL`
-// (dispatch-side cap); output uses `MAX_ACTIONS_PER_CALL` (fan-out).
+/// A proposed `InlineArr<T, N, L>` safe replacement of
+/// `heapless::Vec` was rejected: per-call types would ship ~700 B
+/// memset on every entry-point call (+30–50% on
+/// push_command/ping_amortised, violating the Q2 bench gate). The
+/// Pareto-optimal analysis above is the load-bearing reason; any
+/// future re-open requires new measurement evidence.
+// Staged container uses `MAX_STAGED_PER_CALL` (dispatch-side cap);
+// output uses `MAX_ACTIONS_PER_CALL` (fan-out).
 //
-// DEF-160 (Z2): `'sql` lifetime parameter carries the borrow of any
+// `'sql` lifetime parameter carries the borrow of any
 // `StagedAction::SendBytesBorrowed(&'sql [u8])` variant — caller's
 // SQL bytes referenced zero-copy via Parse / SimpleQuery push paths.
 // Elision rules let most consumers write `&mut StagedActions<'_>`;
-// only PushCommand impls that stage borrowed bytes (Parse, SimpleQuery)
-// need to propagate the lifetime explicitly to ensure the borrow
-// outlives the materialisation step.
+// only PushCommand impls that stage borrowed bytes (Parse,
+// SimpleQuery) need to propagate the lifetime explicitly to ensure
+// the borrow outlives the materialisation step.
 pub(crate) type StagedActions<'sql> = heapless::Vec<StagedAction<'sql>, { crate::protocol::MAX_STAGED_PER_CALL }>;
 
 /// A directive from the protocol to its host.
@@ -783,7 +698,7 @@ pub(crate) type StagedActions<'sql> = heapless::Vec<StagedAction<'sql>, { crate:
 /// into that `WriteBuf` (for runtime-built frames) or a static
 /// reference (for compile-time constants; `'static: 'buf`).
 ///
-/// # Two lifetimes (1c-1a)
+/// # Two lifetimes
 ///
 /// `'w` names bytes living in the caller's `WriteBuf` (outbound —
 /// `SendBytes`). `'r` names bytes living in the protocol's
@@ -792,17 +707,16 @@ pub(crate) type StagedActions<'sql> = heapless::Vec<StagedAction<'sql>, { crate:
 /// checker needs the information to enforce:
 ///
 /// - Next `&mut WriteBuf` call blocked while `SendBytes(&'w …)`
-///   alive (DEF-094 invariant).
+///   alive (caller-owned write-buffer invariant).
 /// - Next `&mut PgProtocol` call blocked while `StreamRow(&'r …)`
 ///   alive — the row slice is inside `self.read_buf`, so
 ///   `feed_bytes` takes `&'r mut self` and the output's `'r`
 ///   borrows back from `self`.
 ///
-/// `#[non_exhaustive]` because more variants land with later
-/// sub-phases. Internal `match` over `Action` is *not*
-/// `non_exhaustive`.
+/// `#[non_exhaustive]` reserves variant-addition headroom. Internal
+/// `match` over `Action` is *not* `non_exhaustive`.
 ///
-/// # DEF-163 B011: why two lifetimes (`'w` + `'r`)?
+/// # Why two lifetimes (`'w` + `'r`)?
 ///
 /// The two lifetimes are NOT cosmetic — they are load-bearing:
 /// - `'w` borrows `write_buf` on the **push path**. Entry-points
@@ -812,11 +726,12 @@ pub(crate) type StagedActions<'sql> = heapless::Vec<StagedAction<'sql>, { crate:
 ///   Action, releasing `'w`.
 /// - `'r` borrows `read_buf` + `terminal_row_desc` on the **feed
 ///   path**. `feed_bytes` parses inbound frames into `read_buf`;
-///   row-streaming actions like `StreamRow { desc: &'r RowDesc,
-///   row_bytes: &'r [u8] }` borrow directly from the populated
-///   region (zero-copy). Terminal `Reply::QueryComplete` payloads
-///   borrow the parked schema from `PgProtocol::terminal_row_desc`
-///   (DEF-188). Host reads + drops the Action, releasing `'r`.
+///   row-streaming actions like
+///   `StreamRow { desc: &'r RowDesc, row_bytes: &'r [u8] }` borrow
+///   directly from the populated region (zero-copy). Terminal
+///   `Reply::QueryComplete` payloads borrow the parked schema from
+///   `PgProtocol::terminal_row_desc`. Host reads + drops the
+///   Action, releasing `'r`.
 ///
 /// **Why can't we unify `'w = 'r`?** On the push path, produced
 /// `Action`s are all either `'static` (compile-time constant
@@ -832,7 +747,7 @@ pub(crate) type StagedActions<'sql> = heapless::Vec<StagedAction<'sql>, { crate:
 /// paths; unification would force either staging copies or an
 /// API split.
 ///
-/// # Variant ordering — DEF-254 (audit 2026-05-08)
+/// # Variant ordering
 ///
 /// Variants are in **production-frequency order**:
 ///
@@ -842,12 +757,9 @@ pub(crate) type StagedActions<'sql> = heapless::Vec<StagedAction<'sql>, { crate:
 /// - `DeliverReply` — emitted once per successful command cycle.
 /// - `FailReply` — emitted once per error.
 /// - `CloseSocket` — emitted once per fatal teardown.
-///
-/// Order verified optimal at this audit; no reorder needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
-// DEF-184 (A1+A13): Action is no longer large-enum-variant-warn-worthy post-ErrorArena cascade; removed #[expect(large_enum_variant)].
 pub enum Action<'w, 'r> {
     /// Send these bytes verbatim to the server.
     ///
@@ -881,8 +793,8 @@ pub enum Action<'w, 'r> {
         id: NonZeroU64,
         /// The typed payload.
         ///
-        /// DEF-119: `Reply<'r>` borrows schema data from the arena
-        /// via the `'r` lifetime (same as `StreamRow::row_bytes`).
+        /// `Reply<'r>` borrows schema data from the arena via the
+        /// `'r` lifetime (same as `StreamRow::row_bytes`).
         value: Reply<'r>,
     },
 
@@ -907,87 +819,88 @@ pub enum Action<'w, 'r> {
     CloseSocket,
 }
 
-/// DEF-212 (Alt Y', Phase 2, audit 2026-05-04): one-event-per-call
-/// feed signal.
+/// One-event-per-call feed signal.
 ///
-/// Per-call `Result<(), ()>` return type alternative to the batched
-/// `OutActions<'w, 'r>` — used by [`crate::PgProtocol::advance_one_frame`]
-/// to drive the protocol in single-event steps. Forward-compat anchor
-/// for the 1c-5 pipelining work (where multiple in-flight replies may
-/// resolve in one call cycle and the caller wants explicit control
-/// over event consumption).
+/// Per-call return type alternative to the batched
+/// `OutActions<'w, 'r>` — used by
+/// [`crate::PgProtocol::advance_one_frame`] to drive the protocol
+/// in single-event steps. Forward-compat anchor for pipelining
+/// work (where multiple in-flight replies may resolve in one call
+/// cycle and the caller wants explicit control over event
+/// consumption).
 ///
 /// # Variants
 ///
-/// - [`Self::Idle`] — state is `Idle` and read_buf is empty. No work
-///   to do; caller can push a next command.
-/// - [`Self::NeedMoreBytes`] — partial frame buffered (or empty buffer
-///   in a non-Idle state). Caller must feed more bytes via
+/// - [`Self::Idle`] — state is `Idle` and read_buf is empty. No
+///   work to do; caller can push a next command.
+/// - [`Self::NeedMoreBytes`] — partial frame buffered (or empty
+///   buffer in a non-Idle state). Caller must feed more bytes via
 ///   [`crate::PgProtocol::feed_inbound`] before the next call.
 /// - [`Self::StreamingRows`] — state entered the row-streaming
-///   territory (a `RowDescription` was parsed; the next inbound frames
-///   are `DataRow`s). Caller should switch to
+///   territory (a `RowDescription` was parsed; the next inbound
+///   frames are `DataRow`s). Caller should switch to
 ///   [`crate::PgProtocol::iter_rows`] for the per-row pull API.
-///   On stream completion (`CommandComplete` + `ReadyForQuery`) the
-///   protocol state returns to a non-streaming variant; subsequent
-///   `advance_one_frame` calls resume the normal flow.
+///   On stream completion (`CommandComplete` + `ReadyForQuery`)
+///   the protocol state returns to a non-streaming variant;
+///   subsequent `advance_one_frame` calls resume the normal flow.
 /// - [`Self::SendBytes`] — outbound bytes ready in the caller's
-///   `WriteBuf`. The slice borrows from `wb` (lifetime `'wb`). Caller
-///   drains the bytes to the socket BEFORE the next `advance_one_frame`
-///   call, since the next call may overwrite `wb`.
+///   `WriteBuf`. The slice borrows from `wb` (lifetime `'wb`).
+///   Caller drains the bytes to the socket BEFORE the next
+///   `advance_one_frame` call, since the next call may overwrite
+///   `wb`.
 /// - [`Self::Deliver`] — terminal reply for an in-flight command.
 ///   Caller routes via `id` to the user's `oneshot::Sender` and
 ///   forwards `value`.
-/// - [`Self::Fail`] — fatal failure for an in-flight command. Per M2
-///   (architect 2026-05-04): the variant **semantically implies socket
-///   close**. Caller MUST resolve the user's oneshot via `(id, cause)`
-///   AND close the socket. Connection is in `Errored` state post-event.
-/// - [`Self::Close`] — state→Errored without an in-flight reply (e.g.,
-///   adversarial frame in `Idle`, post-handshake fatal). Caller MUST
-///   close the socket.
+/// - [`Self::Fail`] — fatal failure for an in-flight command.
+///   The variant **semantically implies socket close**: caller
+///   MUST resolve the user's oneshot via `(id, cause)` AND close
+///   the socket. Connection is in `Errored` state post-event.
+/// - [`Self::Close`] — state→Errored without an in-flight reply
+///   (e.g. adversarial frame in `Idle`, post-handshake fatal).
+///   Caller MUST close the socket.
 ///
-/// # Lifetime contract (M3 — architect 2026-05-04)
+/// # Lifetime contract
 ///
-/// Two lifetimes preserved (mirror of [`OutActions<'w, 'r>`]):
+/// Two lifetimes (mirror of [`OutActions<'w, 'r>`]):
 ///
 /// - `'wb` for [`Self::SendBytes`] which borrows the caller's
-///   [`crate::write_buf::WriteBuf`]. Collapsing to a single lifetime
-///   would force `'wb = 'r` at use sites — breaks composable patterns
-///   where push-side and feed-side lifetimes diverge.
+///   [`crate::write_buf::WriteBuf`]. Collapsing to a single
+///   lifetime would force `'wb = 'r` at use sites — breaks
+///   composable patterns where push-side and feed-side lifetimes
+///   diverge.
 /// - `'r` for [`Self::Deliver`] which borrows from `PgProtocol`
-///   internals (specifically `row_desc_slot` for `Reply::QueryComplete`
-///   payloads). Tied to the `&'r mut self` of `advance_one_frame`.
+///   internals (specifically `row_desc_slot` for
+///   `Reply::QueryComplete` payloads). Tied to the `&'r mut self`
+///   of `advance_one_frame`.
 ///
-/// # Size pin (M4 — Phase 3 follow-up)
+/// # Size pin
 ///
-/// Projected `size_of::<FeedEvent<'static, 'static>>() == 88` exact:
-/// max variant is [`Self::Deliver`] = `NonZeroU64` (8 B) +
-/// `Reply<'r>` (80 B) = 88 B; discriminant niche-optimised via the
-/// payload's NonZero niche where possible. The exact `==` pin lands
-/// in `lib.rs` as part of Commit 3 (DEF-212 Phase 3) per CREDO §III
-/// no-permissive-ranges policy. Until then, drift is possible if
-/// `Reply` widens past 80 B; pre-Phase-3 reviewers should validate.
+/// `size_of::<FeedEvent<'static, 'static>>() == 88` exact: max
+/// variant is [`Self::Deliver`] = `NonZeroU64` (8 B) +
+/// `Reply<'r>` (80 B) = 88 B; discriminant niche-optimised via
+/// the payload's `NonZero` niche where possible. The exact `==`
+/// pin lives in `lib.rs` per CREDO §III no-permissive-ranges
+/// policy.
 ///
 /// # `#[must_use]` discipline
 ///
-/// Variants encode side-effect contracts (drain bytes, route reply,
-/// close socket). The struct attribute pins the discipline against
-/// `let _ = proto.advance_one_frame(...)` accidental discards. The
-/// `clippy::let_underscore_must_use` lint (DEF-211 SAFE-05, in the
-/// forbid bundle) makes ignoring without explicit `match`/`?` a
-/// build failure.
+/// Variants encode side-effect contracts (drain bytes, route
+/// reply, close socket). The struct attribute pins the discipline
+/// against `let _ = proto.advance_one_frame(...)` accidental
+/// discards. The forbid bundle's
+/// `clippy::let_underscore_must_use` lint makes ignoring without
+/// explicit `match`/`?` a build failure.
 ///
-/// # Variant ordering — DEF-254 (audit 2026-05-08)
+/// # Variant ordering
 ///
 /// Current declared order optimises for the polling pattern of an
 /// async driver loop: `Idle` (caller polls when idle), then
 /// `NeedMoreBytes` (caller awaits more network bytes), then
-/// progressively-more-eventful variants. `advance_one_frame` is
-/// forward-compat only (Phase 1c-5 pipelining) — no production hot
-/// path exists today, so reordering would be speculative without
-/// bench evidence. When pipelining benches arrive in 1c-5, revisit:
-/// if `Deliver` (terminal reply per response cycle) dominates,
-/// promote it to first.
+/// progressively-more-eventful variants. `advance_one_frame` is a
+/// forward-compat surface — no production hot path exists today,
+/// so reordering would be speculative without bench evidence.
+/// When pipelining benches arrive, revisit: if `Deliver` (terminal
+/// reply per response cycle) dominates, promote it to first.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 #[must_use = "FeedEvent variants carry side-effect contracts: \
@@ -1016,15 +929,19 @@ pub enum FeedEvent<'wb, 'r> {
     Close,
 }
 
-/// DEF-212 (Alt Y', architect-vetted impl plan, audit 2026-05-04):
-/// classified push-side failure — the bytes-only push API
+/// Classified push-side failure — the bytes-only push API
 /// (`ReadyGuard::push_<cmd>`) returns `Result<(), PushFailure>`.
 ///
-/// # Pre-DEF-212 history
+/// # Shape
 ///
-/// Pre-(212) push paths returned `OutActions<'w, 'a>` (800 B per call,
-/// `ManuallyDrop<heapless::Vec<Action, 9>>`). The caller iterated the
-/// action list to drive the I/O layer:
+/// Push paths write bytes directly into the caller's `WriteBuf`
+/// (caller drains via `wb.as_bytes()`); failure signals come back
+/// via `Result::Err(PushFailure)` — an ~80 B per-call return frame.
+///
+/// A naive shape returning the full `OutActions<'w, 'a>`
+/// (`ManuallyDrop<heapless::Vec<Action, 9>>`, ~800 B per call)
+/// would force callers to iterate the action list to drive the I/O
+/// layer:
 ///
 /// ```text
 /// let actions = ready.push_command(cmd, &mut wb);
@@ -1038,10 +955,8 @@ pub enum FeedEvent<'wb, 'r> {
 /// }
 /// ```
 ///
-/// Post-(212) bytes-only push: bytes are written directly into the
-/// caller's `WriteBuf` (caller drains via `wb.as_bytes()`); failure
-/// signals come back via `Result::Err(PushFailure)`. ~800 B → ~80 B
-/// per-call return frame.
+/// The classified-result form is ~10× smaller and lets the success
+/// path elide the iteration entirely.
 ///
 /// # Caller contract on `Err(PushFailure)`
 ///
@@ -1068,27 +983,23 @@ pub enum FeedEvent<'wb, 'r> {
 /// # `#[must_use]` discipline
 ///
 /// The struct attribute below pins points 1-4 against accidental
-/// `let _ = ready.push_command(...);` discards. The
-/// `clippy::let_underscore_must_use` and `let_underscore_drop` lints
-/// (DEF-211 SAFE-05, in the forbid bundle) make ignoring `Result`
-/// without explicit `match`/`?` a build failure.
+/// `let _ = ready.push_command(...);` discards. The forbid bundle's
+/// `clippy::let_underscore_must_use` and `let_underscore_drop`
+/// lints make ignoring `Result` without explicit `match`/`?` a
+/// build failure.
 ///
 /// # Field privacy
 ///
-/// `pub` fields per principal §12 Q1 decision (2026-05-04): `id` is a
-/// non-secret correlator (DEF-149 ReplyId discipline); `cause` is
-/// already a public `ProtocolError`. No encapsulation budget gained
-/// by accessor methods.
+/// `pub` fields: `id` is a non-secret correlator (ReplyId
+/// discipline guarantees uniqueness, not secrecy); `cause` is
+/// already a public `ProtocolError`. No encapsulation budget
+/// gained by accessor methods.
 ///
-/// # Size pin (DEF-212 M4 — pending Commit 3)
+/// # Size pin
 ///
-/// Projected `size_of::<PushFailure>() == 80` exact: `NonZeroU64`
-/// (8 B) + `ProtocolError` (72 B). Const-assert pin lands in
-/// `lib.rs` as part of Commit 3 (DEF-212 Phase 3) per CREDO §III
-/// no-permissive-ranges policy. Until the pin lands, drift is
-/// possible if `ProtocolError`'s 72 B exact pin (already in
-/// `lib.rs`) widens — pre-commit-3 reviewers should validate
-/// `size_of::<PushFailure>()` matches the projection.
+/// `size_of::<PushFailure>() == 80` exact: `NonZeroU64` (8 B) +
+/// `ProtocolError` (72 B). Const-assert pin lives in `lib.rs` per
+/// CREDO §III no-permissive-ranges policy.
 ///
 /// # Tier classification
 ///
@@ -1116,21 +1027,13 @@ pub struct PushFailure {
     pub cause: ProtocolError,
 }
 
-// DEF-244 modernisation audit (rust-version 1.81): additive Display +
-// `core::error::Error` impls on `PushFailure`. Pre-modernisation
-// `PushFailure` was Debug-only — downstream `?`-propagation into
-// `Box<dyn Error>` required a manual `From<PushFailure>` bridge in
-// every consumer. The Display delegates to the underlying typed
-// classification + correlator id; the Error impl exposes `cause` via
-// `source()` so downstream chain-walking utilities (anyhow's `Display`
-// chain, `Error::sources()` iterator on 1.82+) reach the typed
-// ProtocolError.
-//
-// API-surface note: this is purely additive — code that previously
-// only used the `Debug` derive continues to work. The brief disallows
-// public-API breakage; adding inherent trait impls is not a break
-// (inherent trait impl + Display/Error has no name collision potential
-// because both traits' methods are well-known).
+// Additive Display + `core::error::Error` impls on `PushFailure`.
+// Downstream `?`-propagation into `Box<dyn Error>` would otherwise
+// require a manual `From<PushFailure>` bridge in every consumer.
+// Display delegates to the underlying typed classification +
+// correlator id; the Error impl exposes `cause` via `source()` so
+// downstream chain-walking utilities (anyhow's `Display` chain,
+// `Error::sources()` iterator) reach the typed `ProtocolError`.
 impl core::fmt::Display for PushFailure {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "push command (id {}) failed: {}", self.id, self.cause)
@@ -1160,27 +1063,20 @@ impl core::error::Error for PushFailure {
 ///   constant (e.g. the 5-byte `Sync` wire payload); the
 ///   materialiser emits the static ref directly (zero write, zero
 ///   copy — `Sync` bypasses `write_buf` entirely).
-// DEF-184 (A1+A13): StagedAction no longer triggers
-// `large_enum_variant` post-ErrorArena cascade (FailReply.cause
-// ProtocolError shrunk from 312 B to ~72 B).
 //
-// DEF-160 (Z2): `'sql` lifetime parameter introduced for the new
-// [`StagedAction::SendBytesBorrowed`] variant. Other variants do not
-// reference `'sql` directly; the parameter is "phantom" for them and
-// erased at monomorphisation. Lifetime is named `'sql` (not the
-// generic `'a`) to make the borrow's origin explicit — caller's SQL
-// from Parse / SimpleQuery push paths.
+// `'sql` lifetime parameter exists for the
+// [`StagedAction::SendBytesBorrowed`] variant. Other variants do
+// not reference `'sql` directly; the parameter is "phantom" for
+// them and erased at monomorphisation. Lifetime is named `'sql`
+// (not the generic `'a`) to make the borrow's origin explicit —
+// caller's SQL from Parse / SimpleQuery push paths.
 #[derive(Debug)]
 pub(crate) enum StagedAction<'sql> {
     /// Bytes live at the range `[start..start+len]` in the
-    /// caller's `write_buf`. Non-zero length (DEF-100).
-    ///
-    /// DEF-154 (W): `'wb` brand phantom deleted. Pre-(W) this was
-    /// `WriteRange` — brand claimed tier-1 buffer-identity
-    /// proof, but DEF-154 (N) reduced `apply` to
-    /// `Option<&[u8]>` runtime-checked, the brand's only tier-1
-    /// deliverable. Post-(W) plain `WriteRange` — apply is
-    /// classified (None → `CloseSocket` at materialise).
+    /// caller's `write_buf`. Non-zero length (encoded by
+    /// `NonZeroU16` inside `WriteRange`). Apply is classified
+    /// (`None` → `CloseSocket` at materialise) — no silent
+    /// fallback.
     SendBytesRange(WriteRange),
     /// Bytes are a static compile-time constant. Materialiser passes
     /// through directly — no write, no copy.
@@ -1190,30 +1086,25 @@ pub(crate) enum StagedAction<'sql> {
     /// [`crate::push_command::SimpleQuery`]. The materialiser passes
     /// the slice through unchanged (zero-copy, zero-stage).
     ///
-    /// DEF-160 (Z2): introduced to take the SQL out of `WriteBuf`
-    /// staging. Pre-DEF-160 the SQL was copied into a fixed-size
-    /// `Sql = FixedStr<MAX_SQL_LEN, _>` (truncating at 2048 B with
-    /// "…" marker — silent semantic corruption on > 2048-byte
-    /// queries). Post-DEF-160 the SQL is borrowed end-to-end and
-    /// surfaces as this variant; no protocol cap on SQL size, no
-    /// truncation, tier-1 by-construction at the protocol layer.
+    /// SQL is borrowed end-to-end and surfaces as this variant — no
+    /// protocol cap on SQL size, no truncation, tier-1 by-construction
+    /// at the protocol layer. A naive shape that copied SQL into a
+    /// fixed-size `Sql = FixedStr<MAX_SQL_LEN, _>` (truncating at
+    /// 2048 B with "…" marker) would silently corrupt > 2048-byte
+    /// queries.
+    ///
     /// Caller responsibility: SQL must outlive the materialised
     /// `Action<'w, 'r>` (lifetime checked by the unified `'w` in
     /// `materialise` / `materialise_push`). For SQL containing
     /// secrets (e.g. passwords in `UPDATE` clauses), caller holds
     /// the SQL in `Zeroizing<String>` — zeroize-on-drop happens at
-    /// the caller, not in our `WriteBuf::clear()` (which only
-    /// scrubs inline bytes).
-    // DEF-244 modernisation audit (rust-version 1.81 sweep): the
-    // historical `#[allow(dead_code, ...)]` (DEF-160 commit-1 plumbing)
-    // is now dead — the variant has multiple construction sites
-    // (protocol.rs:4194/4466/5054). Lint no longer fires; attribute
-    // removed.
+    /// the caller, not in `WriteBuf::clear()` (which only scrubs
+    /// inline bytes).
     SendBytesBorrowed(&'sql [u8]),
     /// Map to [`Action::DeliverReply`]. Opaque [`DeliverReplyEntry`]
     /// — the only construction path is [`deliver`] (below), which
     /// enforces kind-payload pairing at compile time via
-    /// [`crate::reply_id::ReplyKind::Payload`]. DEF-112.
+    /// [`crate::reply_id::ReplyKind::Payload`].
     DeliverReply(DeliverReplyEntry),
     /// Map to [`Action::FailReply`].
     FailReply {
@@ -1228,21 +1119,22 @@ pub(crate) enum StagedAction<'sql> {
 
 /// Internal lifetime-free counterpart to the public [`Reply<'r>`].
 ///
-/// # DEF-188 rationale
+/// # Why a lifetime-free intermediate
 ///
 /// Dispatch runs BEFORE materialise. At dispatch time, the state
-/// machine carries `RowDesc` inline in its variants (post-DEF-188
-/// arena deletion). The dispatch Z arm parks the schema into
-/// `PgProtocol::terminal_row_desc` right before transitioning to
-/// `Idle`; materialise borrows from that slot to produce the
-/// lifetime-bound public `Reply<'r>`.
+/// machine carries `RowDesc` inline in its variants. The dispatch
+/// Z arm parks the schema into `PgProtocol::terminal_row_desc`
+/// right before transitioning to `Idle`; materialise borrows from
+/// that slot to produce the lifetime-bound public `Reply<'r>`.
 ///
 /// `StagedReply` is the lifetime-free intermediate carried inside
-/// `StagedAction::DeliverReply(DeliverReplyEntry)`. Schema-bearing
-/// variants once carried `schema_present: bool` flags as duplicates
-/// of `PgProtocol::row_desc_slot.is_some()`; DEF-210 SR-01 Path C
-/// (audit 2026-04-28) deleted those — materialise reads the slot
-/// directly via `into_public(row_desc_slot)`. Single source of truth.
+/// `StagedAction::DeliverReply(DeliverReplyEntry)`. A naive shape
+/// would have schema-bearing variants carry a `schema_present:
+/// bool` flag duplicating `PgProtocol::row_desc_slot.is_some()`,
+/// silently corrupting if a future dispatch refactor set the flag
+/// without populating the slot. Instead materialise reads the slot
+/// directly via `into_public(row_desc_slot)` — single source of
+/// truth.
 ///
 /// # Visibility
 ///
@@ -1269,18 +1161,14 @@ pub enum StagedReply {
 
 /// Lifetime-free staged counterpart to [`QueryCompletePayload<'r>`].
 ///
-/// # DEF-210 SR-01 Path C (audit 2026-04-28): `schema_present` deleted
+/// # Single source of truth for schema presence
 ///
-/// Pre-Path-C: carried `schema_present: bool` set by the dispatch Z
-/// arm iff the slot was populated. Materialise read the flag and
-/// projected from `PgProtocol::row_desc_slot` only when set.
-/// **Tier-2 by-discipline** — silent corruption risk if a future
-/// dispatch refactor set the flag without populating the slot.
-///
-/// Post-Path-C: the flag is gone. Materialise reads
-/// `row_desc_slot.map(...)` directly. The slot's own `is_some()`
-/// is the single source of truth — there is no duplicate to drift
-/// from. **Tier-1 by-construction**.
+/// Materialise reads `row_desc_slot.map(...)` directly. A naive
+/// shape would carry `schema_present: bool` set by the dispatch Z
+/// arm — **tier-2 by-discipline**, silently corrupting if a future
+/// dispatch refactor set the flag without populating the slot. The
+/// current shape is **tier-1 by-construction**: the slot's own
+/// `is_some()` is the single source of truth.
 ///
 /// `#[doc(hidden)] pub` — see [`StagedReply`] for visibility rationale.
 ///
@@ -1304,18 +1192,18 @@ pub struct StagedQueryCompletePayload {
 /// Lifetime-free staged counterpart to
 /// [`DescribeStatementCompletePayload<'r>`].
 ///
-/// # DEF-210 SR-01-D Path D (audit 2026-04-28)
+/// # Single source of truth for schema presence
 ///
-/// Pre-Path-D this struct carried `rows: DescribedRowsStagedSlim`
-/// (a `Rows | NoData` discriminator). That discriminator was a
-/// duplicate of `PgProtocol::row_desc_slot.is_some()` — the dispatch
-/// arm parked the schema into the slot AND set `Rows` in the same
-/// arm body (atomic-pair discipline). Path D deletes the duplicate;
-/// materialise reads `row_desc_slot.map(...)` directly. The
-/// helper `described_rows_slim_into_public` (which had a
-/// `debug_assert!(false)` arm for the architecturally-impossible
-/// `Rows`-without-slot mismatch — CREDO §V banned defensive-for-
-/// impossible) was deleted in the same closure. Tier-1 by-construction.
+/// Materialise reads `row_desc_slot.map(...)` directly. A naive
+/// shape would carry a `rows: DescribedRowsStagedSlim`
+/// (`Rows | NoData`) discriminator, duplicating
+/// `PgProtocol::row_desc_slot.is_some()` — the dispatch arm would
+/// have to park the schema into the slot AND set `Rows` in the
+/// same arm body (atomic-pair discipline), with a
+/// `debug_assert!(false)` helper arm for the architecturally-
+/// impossible `Rows`-without-slot mismatch (banned per CREDO §V
+/// "defensive-for-impossible"). Tier-1 by-construction.
+///
 /// Tier-4 Cluster B (2026-05-19): fields tightened to `pub(crate)`;
 /// see [`StagedQueryCompletePayload`] for the bypass-closure rationale.
 #[doc(hidden)]
@@ -1328,8 +1216,8 @@ pub struct StagedDescribeStatementCompletePayload {
 /// Lifetime-free staged counterpart to
 /// [`DescribePortalCompletePayload<'r>`].
 ///
-/// DEF-210 SR-01-D Path D — see the
-/// [`StagedDescribeStatementCompletePayload`] docstring.
+/// See [`StagedDescribeStatementCompletePayload`] for the
+/// single-source-of-truth rationale on schema presence.
 /// Tier-4 Cluster B (2026-05-19): field tightened to `pub(crate)`;
 /// see [`StagedQueryCompletePayload`] for the bypass-closure rationale.
 #[doc(hidden)]
@@ -1388,26 +1276,22 @@ impl StagedReply {
     /// Resolve this staged reply into the public [`Reply<'r>`] by
     /// borrowing into the protocol's parked terminal RowDesc slot.
     ///
-    /// # DEF-188 (architect 2026-04-25): inline state, parked slot
-    ///
-    /// Pre-DEF-188 `into_public` took `ArenaReader<'r>` and resolved
-    /// `SchemaRef` handles via `arena.get(ref)`. The arena was
-    /// deleted; state variants now carry `RowDesc` inline, and the
-    /// dispatch Z arm parks the schema into
-    /// `PgProtocol::terminal_row_desc` before transitioning to
-    /// `Idle`. This function takes `terminal_row_desc: Option<&'r
-    /// RowDesc>` directly — `Some(&desc)` if the parked slot is
-    /// populated, `None` if no schema was parked (DML / empty-query).
+    /// State variants carry `RowDesc` inline, and the dispatch Z
+    /// arm parks the schema into `PgProtocol::terminal_row_desc`
+    /// before transitioning to `Idle`. This function takes
+    /// `terminal_row_desc: Option<&'r RowDesc>` directly —
+    /// `Some(&desc)` if the parked slot is populated, `None` if no
+    /// schema was parked (DML / empty-query).
     ///
     /// # Tier-1 elevation: stale class architecturally impossible
     ///
-    /// The `StaleSchemaRef` classified-error path is gone — there
-    /// is no handle that can become stale. Either the slot holds a
-    /// `RowDesc` (because the C → Z transition parked it) or it
-    /// doesn't (because the path was DML / NoData). DEF-210 SR-01
-    /// Path C: the slot's `is_some()` IS the schema-presence fact —
-    /// no separate flag, no atomic-pair discipline, no drift surface.
-    ///
+    /// There is no handle that can become stale: either the slot
+    /// holds a `RowDesc` (because the C → Z transition parked it)
+    /// or it doesn't (because the path was DML / NoData). The
+    /// slot's `is_some()` IS the schema-presence fact — no separate
+    /// flag, no atomic-pair discipline, no drift surface. A naive
+    /// shape carrying handles + arena would require a
+    /// `StaleSchemaRef` classified-error path.
     #[inline]
     pub(crate) fn into_public<'r>(
         self,
@@ -1417,11 +1301,11 @@ impl StagedReply {
             Self::Pong(p) => Reply::Pong(p),
             Self::StartupComplete(p) => Reply::StartupComplete(p),
             Self::QueryComplete(staged) => {
-                // DEF-210 SR-01 Path C: the slot is the single source
-                // of truth for schema presence. `Some` ⇒ project to
-                // RowDescBorrow (SELECT path); `None` ⇒ no schema
-                // (DML / empty-query path). No bool flag to keep in
-                // sync; the slot equals itself by identity.
+                // The slot is the single source of truth for schema
+                // presence. `Some` ⇒ project to RowDescBorrow
+                // (SELECT path); `None` ⇒ no schema (DML /
+                // empty-query path). No bool flag to keep in sync;
+                // the slot equals itself by identity.
                 let row_desc = row_desc_slot.map(crate::decode::RowDescBorrow::from_ref);
                 Reply::QueryComplete(QueryCompletePayload {
                     command_tag: staged.command_tag,
@@ -1441,26 +1325,22 @@ impl StagedReply {
     }
 }
 
-/// DEF-210 SR-01-D Path D + re-audit perf-fix (audit 2026-04-28):
 /// `#[inline(never)]` extraction of the Describe-arm materialise
-/// body. Path D rewrote `into_public`'s describe arms to read
-/// `row_desc_slot.map(...)` directly (replacing the prior
-/// `DescribedRowsStagedSlim::Rows | NoData` discriminator + helper
-/// with `debug_assert!(false)` defensive arm). The new inline
-/// shape pushed `into_public`'s LTO-inlined body in
-/// `materialise` past LLVM's register-allocator quality threshold:
-/// `push_command/ping_amortised` showed +13% regression vs the
-/// pre-DEF-210 baseline because LLVM was spilling values that
-/// previously stayed in registers (visible in asm as 6-7 reloads
-/// from the same `ParamOids` u32 stack slots — `[sp, #240]`,
-/// `[sp, #256]`, `[sp, #264]`, …).
+/// body. The inline shape (Describe arms reading
+/// `row_desc_slot.map(...)` directly alongside Pong / QueryComplete)
+/// pushed `into_public`'s LTO-inlined body in `materialise` past
+/// LLVM's register-allocator quality threshold: bench showed +13%
+/// on `push_command/ping_amortised` because LLVM was spilling
+/// values that previously stayed in registers (visible in asm as
+/// 6-7 reloads from the same `ParamOids` u32 stack slots —
+/// `[sp, #240]`, `[sp, #256]`, `[sp, #264]`, …).
 ///
 /// Splitting the Describe arms into out-of-line helpers shrinks
 /// `into_public`'s body so `materialise`'s inlined hot path
-/// (Pong / QueryComplete) gets the same register pressure profile
-/// as pre-DEF-210. The Describe paths pay a function call but they
-/// are NOT the hot path — describe completion runs once per
-/// statement preparation, not per row or per push.
+/// (Pong / QueryComplete) keeps a tight register-pressure profile.
+/// The Describe paths pay a function call but they are NOT the hot
+/// path — describe completion runs once per statement preparation,
+/// not per row or per push.
 #[inline(never)]
 fn describe_statement_complete_into_public<'r>(
     staged: StagedDescribeStatementCompletePayload,
@@ -1501,7 +1381,7 @@ fn describe_rows_from_slot<'r>(
 }
 
 // ═════════════════════════════════════════════════════════════════
-// §2 / DEF-112 — typed DeliverReply gate
+// Typed DeliverReply gate
 //
 // The sole authority to construct a `StagedAction::DeliverReply` is
 // the `deliver()` function below, whose generic signature
@@ -1510,9 +1390,9 @@ fn describe_rows_from_slot<'r>(
 // match via the `ReplyKind::Payload` associated type.
 //
 // Passing a `ReplyId<PingKind>` with a `StartupCompletePayload` is
-// a compile error (mismatched associated type). The historical
-// runtime misroute class — dispatcher emits wrong `Reply` variant
-// for the kind — becomes a tier-1 compile invariant.
+// a compile error (mismatched associated type). The naive runtime-
+// misroute class — dispatcher emits the wrong `Reply` variant for
+// the kind — is a tier-1 compile invariant.
 //
 // The nested `mod deliver_entry_priv` wraps the struct so its
 // fields are module-private: even code inside `action.rs` (outside
@@ -1531,11 +1411,11 @@ mod deliver_entry_priv {
     /// visibility). The only constructor is `pub(super) fn new`,
     /// reachable exclusively from [`super::deliver`] — which in
     /// turn requires a typed [`crate::reply_id::ReplyId<K>`] and
-    /// its matching `K::StagedPayload`. DEF-112 + DEF-119.
+    /// its matching `K::StagedPayload`.
     ///
-    /// DEF-188: carries [`StagedReply`] (lifetime-free) rather than
-    /// the public [`super::Reply`] (which has a `'r` lifetime tied
-    /// to `PgProtocol::terminal_row_desc`). Materialise converts
+    /// Carries [`StagedReply`] (lifetime-free) rather than the
+    /// public [`super::Reply`] (which has a `'r` lifetime tied to
+    /// `PgProtocol::terminal_row_desc`). Materialise converts
     /// staged → public via `StagedReply::into_public(slot)` where
     /// `slot` is `Option<&'r RowDesc>` borrowed from the parked
     /// terminal slot.
@@ -1563,9 +1443,9 @@ mod deliver_entry_priv {
             self.id
         }
 
-        /// Read access for the materialiser. DEF-119: returns
-        /// `StagedReply` (not the lifetime-bound public `Reply<'r>`)
-        /// — materialise borrows the arena and converts.
+        /// Read access for the materialiser. Returns `StagedReply`
+        /// (not the lifetime-bound public `Reply<'r>`) — materialise
+        /// borrows the parked terminal RowDesc slot and converts.
         #[inline]
         pub(crate) const fn staged(&self) -> StagedReply {
             self.value
@@ -1583,17 +1463,16 @@ pub(crate) use deliver_entry_priv::DeliverReplyEntry;
 /// jointly enforce at the call site that the payload matches the
 /// reply id's kind. Passing a `ReplyId<PingKind>` with a
 /// `StartupCompletePayload` — or any other mismatch — fails to
-/// compile. DEF-112 tier-1 elevation of the "wrong payload per
-/// reply kind" class; preserved across DEF-119 via
-/// `ReplyKind::StagedPayload`.
+/// compile. Tier-1 elevation of the "wrong payload per reply kind"
+/// class.
 #[inline]
 #[must_use]
 pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
     id: crate::reply_id::ReplyId<K>,
     payload: K::StagedPayload,
 ) -> StagedAction<'static> {
-    // DEF-160 (Z2): `'static` because `DeliverReply` does not borrow
-    // any `'sql` data. `StagedAction<'static>` is a subtype of
+    // `'static` because `DeliverReply` does not borrow any `'sql`
+    // data. `StagedAction<'static>` is a subtype of
     // `StagedAction<'sql>` for any `'sql` (covariance via the
     // `&'sql [u8]` reference in `SendBytesBorrowed`), so callers in
     // any-`'sql` contexts can use this freely.
@@ -1606,42 +1485,37 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 /// payload IS the variant's inner. One source of truth: adding or
 /// renaming a field on `PongPayload` immediately changes what
 /// `Reply::Pong(..)` matches; no parallel field list to keep in
-/// sync (DEF-112 drift seam closed).
+/// sync. A naive shape with per-variant duplicated field lists
+/// would invite drift.
 ///
-/// `#[non_exhaustive]` because more variants (`BindComplete`,
-/// `BackendKeyData`, …) land in later sub-phases.
+/// `#[non_exhaustive]` reserves variant-addition headroom
+/// (`BindComplete`, `BackendKeyData`, …).
 ///
-/// # DEF-119 + DEF-188 — lifetime `'r`
+/// # Lifetime `'r`
 ///
-/// Schema-bearing payloads (`QueryComplete`, `DescribeStatementComplete`,
-/// `DescribePortalComplete`) previously owned a 260-byte `RowDesc`
-/// inline. DEF-119 externalised the schema into a 2-slot arena;
-/// DEF-188 deleted the arena and inlined the `RowDesc` back into
-/// state variants while parking the terminal-reply schema into
-/// `PgProtocol::terminal_row_desc` for the materialise borrow.
+/// Schema-bearing payloads (`QueryComplete`,
+/// `DescribeStatementComplete`, `DescribePortalComplete`) carry
+/// `&'r RowDesc` references into `PgProtocol::terminal_row_desc`
+/// (parked by the dispatch Z arm before transitioning to `Idle`).
 /// The `'r` lifetime ties the public payload's `&'r RowDesc` to
 /// the `&'r mut PgProtocol` that produced the reply — same
-/// lifetime as [`Action::StreamRow::row_bytes`], so both row bytes
-/// and row schema have identical validity windows.
+/// lifetime as `Action::StreamRow::row_bytes`, so both row bytes
+/// and row schema have identical validity windows. A naive
+/// owned-inline-`RowDesc` shape would bloat the payload to ~340 B
+/// per variant (RowDesc + ParamOids); the current `'r`-borrowed
+/// shape is ~96 B.
 ///
-/// **User code ergonomics unchanged**: pattern-match on the variant
-/// and access `payload.row_desc` / `payload.rows` as before; the
-/// only difference is the field type is `Option<&RowDesc>` /
-/// `DescribedRows<'r>` rather than owned.
+/// **User code ergonomics**: pattern-match on the variant and
+/// access `payload.row_desc` / `payload.rows` — the borrowed
+/// fields are `Option<&RowDesc>` / `DescribedRows<'r>`.
 ///
 /// **Lifetime-irrelevant variants** (Pong, StartupComplete,
-/// ParseComplete, CloseComplete) carry no schema; the `'r` parameter
-/// is phantom for them. Rust permits unused lifetime parameters on
-/// enums — only the schema-bearing variants constrain `'r`.
+/// ParseComplete, CloseComplete) carry no schema; the `'r`
+/// parameter is phantom for them. Rust permits unused lifetime
+/// parameters on enums — only the schema-bearing variants
+/// constrain `'r`.
 ///
-/// # Size impact
-///
-/// Pre-DEF-119: `Reply` ~340 B (dominated by DescribeStatementComplete's
-/// inline RowDesc + ParamOids).
-/// Post-DEF-119/DEF-188: `Reply<'r>` ~96 B (DescribeStatementComplete
-/// holds `&RowDesc` ref + ParamOids 68 + TxStatus = ~80 B).
-///
-/// # Variant ordering — DEF-254 (audit 2026-05-08)
+/// # Variant ordering
 ///
 /// Variants are declared in **production-frequency order**. LLVM
 /// lowers an exhaustive `match` on the discriminant to a cascade
@@ -1656,25 +1530,19 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 /// - `Describe*Complete` — pre-Bind schema introspection.
 /// - `Pong` — keep-alive Ping; rare in tight loops.
 /// - `StartupComplete` — exactly once per connection.
-///
-/// Pre-DEF-254 ordering (Pong, StartupComplete, QueryComplete, …)
-/// was Phase-1a historical (Ping was the only variant). Post-DEF-254
-/// the dominant operational case wins the cheapest dispatch slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Reply<'r> {
     /// A Query / BindExecute command completed. Delivered on the
     /// terminal `CommandComplete + ReadyForQuery` pair at the end
     /// of the result stream. Rows (if any) were emitted individually
-    /// via `Action::StreamRow` (sub-phase 1c-1). See
-    /// [`QueryCompletePayload`].
+    /// via `Action::StreamRow`. See [`QueryCompletePayload`].
     ///
-    /// **DEF-254**: ordered first — dominant variant in real
-    /// workloads.
+    /// Ordered first — dominant variant in real workloads.
     QueryComplete(QueryCompletePayload<'r>),
 
     /// A `Parse` command succeeded (server accepted the prepared
-    /// statement). See [`ParseCompletePayload`]. 1c-3a.
+    /// statement). See [`ParseCompletePayload`].
     ParseComplete(ParseCompletePayload),
 
     /// A `Close` of a prepared statement or portal succeeded.
@@ -1682,11 +1550,11 @@ pub enum Reply<'r> {
     CloseComplete(CloseCompletePayload),
 
     /// A statement-level `Describe` (`'D' 'S' name`) completed. See
-    /// [`DescribeStatementCompletePayload`]. 1c-3c.
+    /// [`DescribeStatementCompletePayload`].
     DescribeStatementComplete(DescribeStatementCompletePayload<'r>),
 
     /// A portal-level `Describe` (`'D' 'P' name`) completed. See
-    /// [`DescribePortalCompletePayload`]. 1c-3c.
+    /// [`DescribePortalCompletePayload`].
     DescribePortalComplete(DescribePortalCompletePayload<'r>),
 
     /// The server is alive and responsive. See [`PongPayload`].
@@ -1699,7 +1567,7 @@ pub enum Reply<'r> {
 }
 
 // ═════════════════════════════════════════════════════════════════
-// Typed per-kind payload structs (DEF-112)
+// Typed per-kind payload structs
 //
 // Each `ReplyKind` in `reply_id.rs` has an associated `Payload`
 // type. The `From<Payload> for Reply` impls tuple-wrap the payload
@@ -1736,27 +1604,25 @@ impl<'r> From<PongPayload> for Reply<'r> {
 /// handshake. Carries the backend process ID / secret key (for
 /// cancel requests) and the transaction-status byte.
 ///
-/// # DEF-185 P1-C (audit 2026-04-24): manual Debug redaction
+/// # Manual `Debug` redaction
 ///
 /// `secret_key` is the backend's **CancelRequest authenticator** —
-/// PG's cancel protocol (`pg_cancel_backend` server-side is gated by
-/// pg_hba.conf, but the client-side `CancelRequest` frame over TCP
-/// uses `(pid, secret_key)` as the only auth). A leaked `secret_key`
-/// in debug logs allows an attacker with network access to inject
-/// cancel-requests impersonating the client — capability-token-class
-/// leak, not password-class, but still worth redacting.
-///
-/// Pre-fix: `#[derive(Debug)]` printed `StartupCompletePayload {
-/// pid: 12345, secret_key: 67890, tx_status: Idle }` — operators
-/// logging `OutActions` for diagnostics would expose secret_key.
-/// Post-fix: manual `Debug` prints `<REDACTED>` for `secret_key`.
+/// the client-side `CancelRequest` frame over TCP uses
+/// `(pid, secret_key)` as the only auth. A leaked `secret_key` in
+/// debug logs allows an attacker with network access to inject
+/// cancel-requests impersonating the client — capability-token-
+/// class leak, not password-class, but still worth redacting.
+/// A naive `#[derive(Debug)]` would print
+/// `StartupCompletePayload { pid: 12345, secret_key: 67890,
+/// tx_status: Idle }`; manual `Debug` prints `<REDACTED>` for
+/// `secret_key`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct StartupCompletePayload {
     /// Backend process ID from the `BackendKeyData` frame.
     pub pid: i32,
     /// Backend secret key (for cancel requests).
     ///
-    /// Logged as `<REDACTED>` via manual Debug impl (DEF-185 P1-C).
+    /// Logged as `<REDACTED>` via the manual `Debug` impl.
     pub secret_key: i32,
     /// Transaction status from the final `ReadyForQuery`.
     pub tx_status: TxStatus,
@@ -1783,14 +1649,13 @@ impl<'r> From<StartupCompletePayload> for Reply<'r> {
 ///
 /// Delivered on `CommandComplete` at the end of a simple-query or
 /// extended-query result stream. `command_tag` is the raw ASCII
-/// tag PG returns (`"SELECT 5"`, `"INSERT 0 3"`, etc.) —
-/// sub-phase 1c-6 parses this into a typed `CommandTag` struct
-/// (round-4 finding #3).
+/// tag PG returns (`"SELECT 5"`, `"INSERT 0 3"`, etc.) — typed
+/// `CommandTag` parsing is a planned follow-up.
 ///
-/// DEF-119: `row_desc` borrows from `PgProtocol`'s schema arena via
-/// the `'r` lifetime. `Some(&desc)` for SELECT (including 0-row),
-/// `None` for DML / empty-query. The schema stays valid for the
-/// lifetime of the owning `OutActions<'w, 'r>`; the next
+/// `row_desc` borrows from the protocol's parked terminal schema
+/// slot via the `'r` lifetime. `Some(&desc)` for SELECT (including
+/// 0-row), `None` for DML / empty-query. The schema stays valid
+/// for the lifetime of the owning `OutActions<'w, 'r>`; the next
 /// `&mut PgProtocol` call is blocked by the borrow checker until
 /// the caller drops the actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1802,7 +1667,7 @@ pub struct QueryCompletePayload<'r> {
     /// Result-set schema, if any. `Some` for SELECT (including
     /// 0-row SELECTs), `None` for DML / empty-query.
     ///
-    /// DEF-189: borrowed via [`crate::decode::RowDescBorrow`] from
+    /// Borrowed via [`crate::decode::RowDescBorrow`] from
     /// `PgProtocol::row_desc_slot`. The borrow's `'r` lifetime
     /// matches the owning `OutActions<'_, 'r>` — the next
     /// `&mut PgProtocol` call is blocked while this borrow is live,
@@ -1819,10 +1684,10 @@ impl<'r> From<QueryCompletePayload<'r>> for Reply<'r> {
 
 /// Typed payload for [`crate::reply_id::ParseKind`] replies.
 ///
-/// Carries the transaction-status byte from the trailing RFQ —
-/// uniform with the other payloads. Was a ZST in 1c-2a; widened
-/// in 1c-3a to preserve the tx_status value the dispatcher
-/// already validates (architect-audit silent-discard fix).
+/// Carries the transaction-status byte from the trailing
+/// `ReadyForQuery` — uniform with the other payloads, preserving
+/// the tx_status value the dispatcher already validates. A naive
+/// ZST shape would silently discard it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseCompletePayload {
     /// Transaction-status indicator from the trailing `ReadyForQuery`.
@@ -1850,7 +1715,7 @@ impl<'r> From<CloseCompletePayload> for Reply<'r> {
 }
 
 // ═════════════════════════════════════════════════════════════════
-// 1c-3c — Describe command payloads + helper types
+// Describe command payloads + helper types
 //
 // Two payload types (statement / portal) instead of one payload
 // with `Option<ParamOids>`. Rationale: a user who called
@@ -1859,8 +1724,8 @@ impl<'r> From<CloseCompletePayload> for Reply<'r> {
 // TWO distinct `Reply` variants, so the `oneshot::Receiver<Reply>`
 // resolves with the payload shape that matches the command — no
 // runtime `match Option` + no surface-level "why is this None?"
-// ambiguity. DEF-112 kind-parameterisation carries the guarantee
-// all the way into the `Action::DeliverReply` construction site.
+// ambiguity. Kind-parameterisation carries the guarantee all the
+// way into the `Action::DeliverReply` construction site.
 // ═════════════════════════════════════════════════════════════════
 
 /// Rows-or-not result of a [`crate::PgCommand::DescribeStatement`]
@@ -1881,20 +1746,15 @@ impl<'r> From<CloseCompletePayload> for Reply<'r> {
 /// [`DescribedRows`] forces picking one of the two documented PG
 /// outcomes. Tier-1 clarity win.
 ///
-/// # DEF-119 — borrowed `&'r RowDesc`
+/// # Borrowed `&'r RowDesc`
 ///
-/// Prior to DEF-119 this enum embedded a 260-byte `RowDesc` inline
-/// in the `Rows` variant, triggering `clippy::large_enum_variant`.
-/// DEF-119 externalises the schema into `PgProtocol`'s schema
-/// arena; the `Rows` variant now holds a `&'r RowDesc` reference
-/// borrowed through the `'r` lifetime tied to the `&'r mut PgProtocol`
-/// borrow.
+/// The `Rows` variant holds a `&'r RowDesc` reference borrowed
+/// through the `'r` lifetime tied to the `&'r mut PgProtocol`
+/// borrow. Size: ~8 B (ref + discriminant). A naive inline-
+/// `RowDesc` shape would balloon to ~264 B and trigger
+/// `clippy::large_enum_variant`.
 ///
-/// Size: ~8 B (ref + discriminant) vs ~264 B pre-arena. The
-/// `large_enum_variant` expect can be dropped alongside this
-/// refactor.
-///
-/// # NOT `#[non_exhaustive]` — DEF-256 audit (2026-05-08)
+/// # NOT `#[non_exhaustive]`
 ///
 /// PG §55.7 defines exactly two outcomes for the post-Describe
 /// schema-presence reply: `RowDescription` (`'T'`) → result
@@ -1961,10 +1821,10 @@ impl<'r> DescribedRows<'r> {
 /// ParamOids (statement-describe only), we never need
 /// `Option<ParamOids>` — the type is always present at the API
 /// surface.
-// Layout pinned `#[repr(C, align(4))]` (pass-#7 F4):
+// Layout pinned `#[repr(C, align(4))]`:
 //
 // - `align(4)` matches the natural alignment of `[u32; _]` — no
-//   drift possible if future reorders the fields.
+//   drift possible if future code reorders the fields.
 // - `repr(C)` nails field order: `n_params: u16` at offset 0,
 //   2 bytes padding, `oids` at offset 4, no trailing pad (total
 //   = 4 + 16*4 = 68).
@@ -1997,11 +1857,10 @@ const _: () = assert!(
 );
 // SIMD-wide PartialEq pin: tail slots are constructor-filled with
 // 0 so full-array `self.oids == other.oids` is byte-equivalent to
-// a populated-prefix compare (Finding 5 — defensible full-array eq).
-// Requiring total array size ≤ 64 bytes keeps it within a single
-// AVX2 register. If `MAX_PARAMS_ARITY` grows past 16, revisit eq
-// strategy (populated-prefix might become cheaper than the wide
-// compare).
+// a populated-prefix compare. Requiring total array size ≤ 64
+// bytes keeps it within a single AVX2 register. If
+// `MAX_PARAMS_ARITY` grows past 16, revisit eq strategy
+// (populated-prefix might become cheaper than the wide compare).
 const _: () = assert!(
     4usize.saturating_mul(crate::params::MAX_PARAMS_ARITY) <= 64,
     "ParamOids eq is SIMD-wide (≤64 bytes). \
@@ -2051,12 +1910,12 @@ impl ParamOids {
     /// Borrow the populated OIDs as a slice — tail default-filled
     /// slots are not exposed.
     ///
-    /// DEF-154 (S) P1-1: explicit `split_at_checked` match.
+    /// Explicit `split_at_checked` match.
     /// `self.n_params ≤ MAX_PG_PARAMS ≤ self.oids.len()` by
-    /// construction; None architecturally unreachable. Empty-slice
-    /// sentinel on the dead arm (same observable as "zero params",
-    /// no corruption vector). Pre-(S) was `.unwrap_or(&[])` —
-    /// silent fallback pattern.
+    /// construction; the `None` arm is architecturally unreachable
+    /// (empty-slice sentinel — same observable as "zero params",
+    /// no corruption vector). A naive `.unwrap_or(&[])` would form
+    /// the banned silent-fallback pattern.
     #[inline]
     #[must_use]
     pub fn oids(&self) -> &[u32] {
@@ -2098,31 +1957,23 @@ impl ParamOids {
 // logical equality of populated-prefix semantics). Same pattern as
 // `RowDesc` in decode.rs.
 //
-// DEF-184 (B11 REJECTED): audit #2 proposed swapping to
-// `heapless::Vec<u32, 16>` to save the 60 B zero-filled tail on
-// common 0-3-param DescribeStatement replies. Rejected under
-// closer analysis:
+// A `heapless::Vec<u32, 16>` shape would save 60 B of zero-filled
+// tail on common 0-3-param DescribeStatement replies but is
+// rejected:
 // 1. **Copy cascade break.** `ParamOids: Copy` flows through
 //    `DescribeStatementCompletePayload` → `Reply` → `Action`. A
 //    heapless::Vec-backed ParamOids loses Copy; cascading Copy
 //    removal would ripple through the entire Action enum and
-//    require the DEF-184 A2/B1/B8 ManuallyDrop workaround at 3+
-//    more sites. Net code complexity > 60 B saved.
-// 2. **Hot-path not exercised.** Grep confirms `ParamOids::eq`
-//    is never called in hot paths; tests use `.oids()` slice view
-//    + `.len()`. The SIMD-wide Eq doc claim is future-proofing,
-//    not active optimisation.
+//    require the `ManuallyDrop` workaround at 3+ more sites. Net
+//    code complexity outweighs the 60 B saved.
+// 2. **Hot-path not exercised.** `ParamOids::eq` is never called
+//    in hot paths; tests use `.oids()` slice view + `.len()`. The
+//    SIMD-wide Eq doc claim is future-proofing, not active
+//    optimisation.
 // 3. **Size win marginal.** DescribeStatementComplete fires once
 //    per Parse round-trip — not per-row. 60 B × N describes is
-//    negligible vs OutActions 5 KB × per-feed_bytes (already
-//    addressed by A2/B1/B8).
-// 4. **Audit #2 self-flagged uncertainty** ("conflicts with A16?").
-//    Audit #1 A16 CONFIRMED-DONE after analysis; B11 adds no new
-//    argument, just an alternative that breaks Copy.
-//
-// CREDO §11 closure: (a) already closed by A16-class equivalent
-// (POD with justified full-array Eq). NOT skipped per §5 — actively
-// rejected with written analysis.
+//    negligible vs `OutActions` per-feed_bytes already-addressed
+//    overhead.
 impl PartialEq for ParamOids {
     fn eq(&self, other: &Self) -> bool {
         self.n_params == other.n_params && self.oids == other.oids
@@ -2145,7 +1996,7 @@ pub struct DescribeStatementCompletePayload<'r> {
     /// Parameter OIDs, in positional order (`$1`, `$2`, …).
     pub param_oids: ParamOids,
     /// Rows-or-no-data sum from the subsequent response frame.
-    /// DEF-119: `DescribedRows` now holds a `&'r RowDesc` borrow.
+    /// `DescribedRows` holds a `&'r RowDesc` borrow.
     pub rows: DescribedRows<'r>,
     /// Transaction status from the trailing `ReadyForQuery`.
     pub tx_status: TxStatus,
@@ -2173,7 +2024,7 @@ impl<'r> From<DescribeStatementCompletePayload<'r>> for Reply<'r> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DescribePortalCompletePayload<'r> {
     /// Rows-or-no-data sum from the response frame.
-    /// DEF-119: `DescribedRows` now holds a `&'r RowDesc` borrow.
+    /// `DescribedRows` holds a `&'r RowDesc` borrow.
     pub rows: DescribedRows<'r>,
     /// Transaction status from the trailing `ReadyForQuery`.
     pub tx_status: TxStatus,
