@@ -1,6 +1,6 @@
-//! **DEF-248 Sub-A (2026-05-12)** — behavioural tests for the
-//! closure-scoped pull-based [`RowStream`](bsql_pg_proto::RowStream)
-//! + [`ColEvent`](bsql_pg_proto::ColEvent) API.
+//! Behavioural tests for the closure-scoped pull-based
+//! [`RowStream`](bsql_pg_proto::RowStream) +
+//! [`ColEvent`](bsql_pg_proto::ColEvent) API.
 //!
 //! Every test here names the invariant it defends. Coverage mirrors
 //! the column-by-column + partial-frame split plus the full bad-path
@@ -590,12 +590,12 @@ fn rows_across_multiple_feed_calls() {
 // (K) DataRowRef round-trip.
 // ==================================================================
 
-/// Invariant: `Got` bytes round-trip through `DataRowRef::parse`+
+/// Invariant: `Got` bytes round-trip through `DataRowRef::parse` +
 /// `columns()` — the test relies on a Got bytes layout matching
-/// `DataRowRef` input (post-DEF-248 the `bytes` slice is just the
-/// column body, no col-count header; so we use the pre-Sub-A
-/// composite DataRowRef::parse only on the manually-constructed
-/// 2-col row body to validate the decoder's invariants).
+/// `DataRowRef` input (the `bytes` slice is just the column body,
+/// no col-count header; the composite `DataRowRef::parse` is used
+/// only on the manually-constructed 2-col row body to validate the
+/// decoder's invariants).
 ///
 /// Caller-side decoding from `Got { bytes }` per column is the
 /// canonical Sub-A path; this test pins that `Got::bytes` is the
@@ -655,8 +655,8 @@ fn got_bytes_decode_per_column() {
         assert!(col0_seen && null_seen && row_done, "all events emitted");
     });
 
-    // DataRowRef::parse still works on a manually-assembled row body
-    // — this is the decoder's existing pre-DEF-248 invariant.
+    // `DataRowRef::parse` works on a manually-assembled row body
+    // — the decoder's invariant is independent of the streaming API.
     let Ok(row) = DataRowRef::parse(&row_body) else {
         panic!("DataRowRef::parse must succeed");
     };
@@ -785,7 +785,7 @@ fn end_to_end_decode_typed_row() {
 // (M) Drop-mid-stream install.
 // ==================================================================
 
-/// **DEF-248 Sub-A** invariant: closure exits without reaching the
+/// Invariant: closure exits without reaching the
 /// terminal `EndQuery`; Drop installs Errored via the leaf-gated
 /// state setter. The subsequent operation on the connection observes
 /// the Errored state.
@@ -836,7 +836,7 @@ fn drop_mid_stream_installs_errored() {
 // (N) Drop on panic.
 // ==================================================================
 
-/// **DEF-248 Sub-A** invariant: closure panics; stack unwind fires
+/// Invariant: closure panics; stack unwind fires
 /// Drop; Drop installs Errored. The crate runs under `panic = "unwind"`
 /// (workspace default). Use `catch_unwind` to assert the post-state.
 #[test]
@@ -877,7 +877,7 @@ fn drop_on_closure_panic_installs_errored() {
 // (O) Partial-frame mode — single huge column body.
 // ==================================================================
 
-/// **DEF-248 Sub-A** invariant: a single DataRow frame whose body
+/// Invariant: a single DataRow frame whose body
 /// exceeds READ_BUF_CAP (4096 B) is streamed as a sequence of
 /// `Chunk` events followed by one `ChunkEnd`. Sum of all chunk
 /// bytes equals the column's declared length.
@@ -886,7 +886,7 @@ fn drop_on_closure_panic_installs_errored() {
 /// declared length field). Body is 4093 B (4 length-field + 2
 /// col_count + 4 col_len + 4083 col_body). The 4083 col_body cannot
 /// fit alongside the 2 col_count + 4 col_len in the 4091 inline-mode
-/// post-header headroom (post-DEF-265 INLINE_BUF_CAP=256, escape to
+/// post-header headroom (INLINE_BUF_CAP=256, escape to
 /// READ_BUF_CAP=4096 heap); confirms the chunked path activates and
 /// the entire body decodes correctly.
 #[test]

@@ -1,5 +1,4 @@
-//! DEF-185 P3-1 (audit 2026-04-24): Miri memory-probe tests for
-//! `ScramSession::Drop` zeroization.
+//! Miri memory-probe tests for `ScramSession::Drop` zeroization.
 //!
 //! # Scope
 //!
@@ -25,7 +24,7 @@
 //!
 //! - Under `panic = "abort"` (release profile), Drop doesn't run on
 //!   panic paths — this test validates the NORMAL-scope-exit path
-//!   only. See `Cargo.toml` DEF-185 P0-A commentary.
+//!   only. See `Cargo.toml` for the panic-abort policy commentary.
 //! - The test uses stack-local probing: we read the location where
 //!   a Password LIVED after it was consumed. If the compiler moved
 //!   the Password elsewhere before drop, the probe might not hit
@@ -65,7 +64,7 @@ unsafe fn read_bytes_at(ptr: *const u8, len: usize) -> Vec<u8> {
     out
 }
 
-/// DEF-185 P3-1: Dropping a Password zeros its backing buffer.
+/// Dropping a Password zeros its backing buffer.
 ///
 /// Under Miri: passes because Miri verifies the read of post-drop
 /// memory is legal under Rust's memory model + observes that all
@@ -116,7 +115,7 @@ fn password_drop_zeros_backing_buffer() {
     );
 }
 
-/// DEF-185 P3-1: Same invariant for `Sensitive<Password>`.
+/// Same invariant for `Sensitive<Password>`.
 #[test]
 fn sensitive_password_drop_zeros_backing_buffer() {
     const MAGIC: &[u8] = b"sensitive-zeroize-probe";
@@ -127,14 +126,13 @@ fn sensitive_password_drop_zeros_backing_buffer() {
             Err(_) => return,
         };
         let sensitive = Sensitive::new(pw);
-        // DEF-280 Bundle E (2026-05-18): closure-scope `with_inner`
-        // replaces the pre-Bundle E `sensitive.get().as_bytes()`
-        // chain. The address (`*const u8`) is captured as `R` from
-        // the closure return; `R` is independent of the inner
-        // borrow's lifetime, so the pointer survives the closure
-        // (the underlying buffer also survives because `sensitive`
-        // itself is still owned by the outer scope). The probe's
-        // post-Drop read is unchanged in semantics.
+        // Closure-scope `with_inner`: the address (`*const u8`) is
+        // captured as `R` from the closure return; `R` is
+        // independent of the inner borrow's lifetime, so the
+        // pointer survives the closure (the underlying buffer also
+        // survives because `sensitive` itself is still owned by the
+        // outer scope). The probe's post-Drop read is unchanged in
+        // semantics.
         let raw_ptr: *const u8 = sensitive.with_inner(|p| p.as_bytes().as_ptr());
         let len = sensitive.with_inner(|p| p.as_bytes().len());
         // Verify MAGIC is there.
@@ -150,9 +148,9 @@ fn sensitive_password_drop_zeros_backing_buffer() {
     );
 }
 
-/// DEF-185 P3-1: non-ignored smoke test — just verifies the
-/// `ZeroizeOnDrop` trait bound is present structurally without
-/// pointer probing. Always runs.
+/// Non-ignored smoke test — just verifies the `ZeroizeOnDrop`
+/// trait bound is present structurally without pointer probing.
+/// Always runs.
 #[test]
 fn password_needs_drop_is_true() {
     // `needs_drop::<T>()` returns true iff T's Drop glue does actual

@@ -1,13 +1,13 @@
-//! DEF-205 (2026-04-27): functional + memory-probe verification of
-//! `SecretBoundedStr<N>`'s tier-1 Drop-chain staleness closure.
+//! Functional + memory-probe verification of `SecretBoundedStr<N>`'s
+//! tier-1 Drop-chain staleness closure.
 //!
 //! # Scope
 //!
 //! `SecretBoundedStr<N>` is the foundation type for closing the
-//! staleness leak class in `ErrorPayload` (DEF-205 step 2) and
-//! `SessionParams` sensitive fields (step 3). Its Drop fires
-//! `BoundedStr::zeroize_in_place` which scrubs `buf + len +
-//! was_lossy_flag` to zero. This file pins:
+//! staleness-leak class in `ErrorPayload` + `SessionParams`
+//! sensitive fields. Its Drop fires `BoundedStr::zeroize_in_place`
+//! which scrubs `buf + len + was_lossy_flag` to zero. This file
+//! pins:
 //!
 //! 1. **Functional**: constructors / accessors mirror `BoundedStr<N>`'s
 //!    behaviour byte-for-byte. A migration from `BoundedStr<N>` to
@@ -16,7 +16,7 @@
 //!    exit OR overwrite via assignment), the backing buffer at its
 //!    stack address is physically zero — verified by raw-pointer
 //!    read after Drop fires. Sister to `scram_zeroize_miri_spec.rs`
-//!    (DEF-185 P3-1) and `buf_compact_staleness_spec.rs` (DEF-204).
+//!    and `buf_compact_staleness_spec.rs`.
 //!
 //! # Why unsafe here is acceptable
 //!
@@ -157,11 +157,10 @@ fn debug_redacts_content() {
 /// goes out of scope leaves its backing storage all-zero. Verified
 /// by raw-pointer probe of the stack frame after Drop fires.
 ///
-/// **Pre-DEF-205 equivalent path** (would be caught here): if the
-/// type were Copy or had no Drop, the buffer would retain its
-/// content past scope exit until the stack frame is reused.
+/// A naive Copy-or-no-Drop shape would retain content past scope
+/// exit until the stack frame is reused — caught here.
 #[test]
-fn def205_drop_zeroizes_buffer() {
+fn drop_zeroizes_buffer() {
     const MAGIC: &str = "zeroize-probe-MAGIC-XYZ-1234567890";
 
     // Capture a raw pointer to the buffer's start. Must outlive Drop.
@@ -176,12 +175,12 @@ fn def205_drop_zeroizes_buffer() {
         // s drops here — `Drop` fires `inner.zeroize_in_place()`.
     };
 
-    // Post-drop: probe the same address. With the DEF-205 fix
-    // (Drop calls zeroize_in_place), all bytes are zero.
+    // Post-drop: probe the same address. Drop calls
+    // `zeroize_in_place`, so all bytes must be zero.
     let post = unsafe { probe_bytes(ptr, len) };
     assert!(
         post.iter().all(|&b| b == 0),
-        "DEF-205: post-drop buffer must be all-zero. Found {} non-zero bytes \
+        "post-drop buffer must be all-zero. Found {} non-zero bytes \
          (first non-zero at offset {}).",
         post.iter().filter(|&&b| b != 0).count(),
         post.iter().position(|&b| b != 0).unwrap_or(0),
@@ -192,11 +191,11 @@ fn def205_drop_zeroizes_buffer() {
 /// a `SecretBoundedStr<N>` via `*field = new_value` fires Drop on
 /// the OLD value before moving the new one in. Verified by probe.
 ///
-/// This pins the specific DEF-205 closure for the
-/// `Option<T> = None` and `*self = Self::new()` patterns: the
-/// language semantics guarantee Drop firing on overwrite.
+/// Pins the closure for the `Option<T> = None` and
+/// `*self = Self::new()` patterns: the language semantics
+/// guarantee Drop firing on overwrite.
 #[test]
-fn def205_overwrite_zeroizes_old_value() {
+fn overwrite_zeroizes_old_value() {
     const FIRST: &str = "first-secret-MAGIC";
     const SECOND: &str = "second";
 
@@ -227,7 +226,7 @@ fn def205_overwrite_zeroizes_old_value() {
         let nonzero_count = post.iter().filter(|&&b| b != 0).count();
         assert_eq!(
             nonzero_count, 0,
-            "DEF-205: tail bytes from FIRST (beyond SECOND's len) must be \
+            "tail bytes from FIRST (beyond SECOND's len) must be \
              zero post-overwrite. Found {nonzero_count} non-zero bytes — \
              Drop didn't fire on the old value, or fired but didn't scrub.",
         );

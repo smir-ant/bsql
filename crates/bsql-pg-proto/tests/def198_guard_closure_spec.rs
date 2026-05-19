@@ -1,5 +1,5 @@
-//! DEF-198 — tier-1 closure verification for [`PgProtocol::as_ready`]
-//! and [`PgProtocol::connection_status`].
+//! Tier-1 closure verification for [`PgProtocol::as_ready`] and
+//! [`PgProtocol::connection_status`].
 //!
 //! # What this file proves
 //!
@@ -117,7 +117,7 @@ fn def198_ping_awaiting_classifies_busy() {
     assert!(matches!(proto.state(), ActiveState::PingAwaitingRfq(_)));
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready returns None during PingAwaitingRfq",
+        "as_ready returns None during PingAwaitingRfq",
     );
     assert_eq!(
         proto.connection_status(),
@@ -154,7 +154,7 @@ fn def198_simple_query_awaiting_classifies_busy() {
     ));
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready returns None during SimpleQuery in-flight",
+        "as_ready returns None during SimpleQuery in-flight",
     );
     assert_eq!(
         proto.connection_status(),
@@ -180,13 +180,13 @@ fn def198_simple_query_awaiting_classifies_busy() {
 
 #[test]
 fn def198_connecting_startup_classifies_handshaking() {
-    // DEF-246 Phase 2/3 (2026-05-16): the only path to a Connecting
-    // protocol is `<DisconnectedPhase>::push_startup(...)` consume-
-    // self. Use a fresh `<DisconnectedPhase>` and drive it through
-    // push_startup to land in `<ConnectingPhase>`; the `<ConnectingPhase>`
-    // accessors mirror the `<ActivePhase>` shape (`connection_status`,
-    // `state`, `as_ready` — the last always returns None during
-    // handshake by construction).
+    // The only path to a Connecting protocol is
+    // `<DisconnectedPhase>::push_startup(...)` consume-self. Use a
+    // fresh `<DisconnectedPhase>` and drive it through
+    // `push_startup` to land in `<ConnectingPhase>`; the
+    // `<ConnectingPhase>` accessors mirror the `<ActivePhase>`
+    // shape (`connection_status`, `state`, `as_ready` — the last
+    // always returns None during handshake by construction).
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
 
@@ -209,7 +209,7 @@ fn def198_connecting_startup_classifies_handshaking() {
     ));
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready returns None during Startup handshake",
+        "as_ready: as_ready returns None during Startup handshake",
     );
     assert_eq!(
         proto.connection_status(),
@@ -246,7 +246,7 @@ fn def198_errored_classifies_errored_with_kind() {
     assert!(matches!(proto.state(), ActiveState::Errored(_)));
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready returns None on Errored",
+        "as_ready: as_ready returns None on Errored",
     );
     match proto.connection_status() {
         ConnectionStatus::Errored(state_err_kind) => {
@@ -279,19 +279,19 @@ fn def198_ready_guard_consumes_on_push() {
     let reply = proto.next_reply_id::<PingKind>();
     // Acquire guard, push (consumes), state transitions to non-Idle.
     if let Some(guard) = proto.as_ready() {
-        // DEF-212: explicit Ok arm — Ping push from Idle is
-        // architecturally infallible (Ping body = pure const SYNC, no
-        // builder Err path). The match preserves the
-        // `clippy::let_underscore_must_use` discipline (DEF-211 SAFE-05)
-        // by handling both arms; pre-(212) `let _out = ...` was a
-        // bind-to-named-underscore which avoided the lint but left
-        // failures silently unobserved at the test layer.
+        // Explicit Ok arm — Ping push from Idle is architecturally
+        // infallible (Ping body = pure const SYNC, no builder Err
+        // path). The match preserves the
+        // `clippy::let_underscore_must_use` discipline by handling
+        // both arms; a naive `let _out = ...` bind-to-named-
+        // underscore would avoid the lint but leave failures
+        // silently unobserved at the test layer.
         match guard.push_command(bsql_pg_proto::push_command::Ping { reply }, &mut wb) {
-            // DEF-160 Z2 (2026-05-11): push API returns `OutActions` so
-            // callers can zero-copy-stream borrowed SQL chunks. Ping has
-            // no SQL — `OutActions` carries only the static Sync chunk,
-            // which the test doesn't need to inspect (state-transition
-            // assertion below covers the wire side).
+            // The push API returns `OutActions` so callers can
+            // zero-copy-stream borrowed SQL chunks. Ping has no SQL
+            // — `OutActions` carries only the static Sync chunk,
+            // which the test doesn't need to inspect (state-
+            // transition assertion below covers the wire side).
             Ok(_actions) => {}
             Err(failure) => panic!(
                 "Ping push from Idle must succeed (architecturally infallible); \
