@@ -4417,35 +4417,24 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_connecting<'w, 'r>(
 }
 
 
-/// DEF-279 Phase 1c Bundle Commit 7 (2026-05-18) — per-phase Inner
-/// API surface for `<ConnectingPhase>`.
+/// Per-phase Inner API surface for `<ConnectingPhase>`.
 ///
-/// All methods marked `#[allow(dead_code)]` — they become reachable
-/// in Commit 8 when `SealedPhase::Inner = ConnectingInner` flips
-/// and the `<ConnectingPhase>::*` delegate methods route through
-/// `self.inner.X` (where `self.inner: ConnectingInner`).
-///
-/// **Method shape parity with `PgProtocolInner`**: each method
-/// mirrors the same-named method on `PgProtocolInner` with two
-/// differences:
+/// **Method shape**: each method mirrors the same-named method on
+/// `ActiveInner` with two differences:
 /// 1. State writes go through `ConnectingState` not `ProtoState`
 ///    (`matches!(self.state, ConnectingState::Errored(_))` etc.)
-/// 2. Dispatch delegates route through the Commit 6 lift+lower
-///    wrappers (`feed_bytes_dispatch_connecting` /
-///    `advance_one_frame_dispatch_connecting`)
-#[allow(dead_code)]
+/// 2. Dispatch delegates route through the lift+lower wrappers
+///    (`feed_bytes_dispatch_connecting` /
+///    `advance_one_frame_dispatch_connecting`).
 impl ConnectingInner {
-    /// DEF-279 Phase 1c Bundle Commit 7 — per-phase saturation
-    /// classifier mutation surface. Mirror of
-    /// [`PgProtocolInner::install_errored_replyid_saturation`].
+    /// Per-phase saturation classifier mutation surface.
     ///
     /// Routes through the same token-gated
     /// [`_replyid_saturation_drain_leaf::drain`] via lift+lower
     /// (the drain expects `&mut ProtoState`; here state is
-    /// `ConnectingState`). The lift+lower preserves the cluster δ
-    /// token-gated tier-1 closure on construction of
-    /// `FeedStateSetter` — same leaf submodule, same token mint
-    /// guard.
+    /// `ConnectingState`). The lift+lower preserves the token-gated
+    /// tier-1 closure on construction of `FeedStateSetter` — same
+    /// leaf submodule, same token mint guard.
     #[cold]
     #[inline(never)]
     pub(crate) fn install_errored_replyid_saturation(&mut self) {
@@ -4485,12 +4474,13 @@ impl ConnectingInner {
         }
     }
 
-    /// DEF-279 Phase 1c Bundle Commit 7 — mint a fresh ReplyId during
-    /// Connecting. Mirror of [`PgProtocolInner::next_reply_id`].
+    /// Mint a fresh ReplyId during Connecting.
     ///
-    /// Body identical: shared static atomic counter
-    /// (`super::PROCESS_REPLY_ID_COUNTER`); cold saturation classifier
-    /// routes to [`Self::install_errored_replyid_saturation`].
+    /// Shares the static atomic counter
+    /// `super::PROCESS_REPLY_ID_COUNTER` with the other phases'
+    /// mint sites — process-global uniqueness. Cold saturation
+    /// classifier routes to
+    /// [`Self::install_errored_replyid_saturation`].
     #[inline]
     pub(crate) fn next_reply_id<K: crate::reply_id::ReplyKind>(
         &mut self,
@@ -4506,13 +4496,12 @@ impl ConnectingInner {
         crate::reply_id::ReplyId::from_raw(nz)
     }
 
-    /// DEF-279 Phase 1c Bundle Commit 7 — feed_bytes dispatch loop
-    /// for Connecting. Mirror of [`PgProtocolInner::feed_bytes_impl`].
+    /// feed_bytes dispatch loop for Connecting.
     ///
     /// Thin delegate to the free function
     /// [`feed_bytes_dispatch_connecting::<BOUNDED>`] (lift+lower
-    /// wrapper from Commit 6). Builds [`ConnectingDispatchContext`]
-    /// from `&mut self.<field>` via disjoint-field-borrow (Rust 2018+).
+    /// wrapper). Builds [`ConnectingDispatchContext`] from
+    /// `&mut self.<field>` via disjoint-field-borrow (Rust 2018+).
     /// LLVM inlines this delegate unconditionally.
     pub(crate) fn feed_bytes_impl<'w, 'r, const BOUNDED: bool>(
         &'r mut self,
@@ -4536,22 +4525,9 @@ impl ConnectingInner {
         )
     }
 
-    /// DEF-279 Phase 1c Bundle Commit 7 — frame-bounded feed_bytes
-    /// for Connecting. Mirror of [`PgProtocolInner::feed_bytes_bounded`].
-    #[inline]
-    pub(crate) fn feed_bytes_bounded<'w, 'r>(
-        &'r mut self,
-        bytes: &[u8],
-        write_buf: &'w mut WriteBuf,
-        max_dispatches: u16,
-    ) -> OutActions<'w, 'r> {
-        self.feed_bytes_impl::<true>(bytes, write_buf, max_dispatches)
-    }
-
-    /// DEF-279 Phase 1c Bundle Commit 7 — append inbound bytes
-    /// (no dispatch). Mirror of [`PgProtocolInner::feed_inbound`].
+    /// Append inbound bytes (no dispatch).
     ///
-    /// Body identical to PgProtocolInner's version with
+    /// Mirror of the Active-phase `feed_inbound` body with
     /// `ProtoState::Errored(k) => *k` replaced by
     /// `ConnectingState::Errored(k) => *k` in the
     /// `ConnectionAlreadyClosed { prior_kind }` reconstruction.
@@ -4593,8 +4569,7 @@ impl ConnectingInner {
         })
     }
 
-    /// DEF-279 Phase 1c Bundle Commit 7 — single-frame advance for
-    /// Connecting. Mirror of [`PgProtocolInner::advance_one_frame`].
+    /// Single-frame advance for Connecting.
     ///
     /// Thin delegate to [`advance_one_frame_dispatch_connecting`].
     #[must_use = "FeedEvent variants carry side-effect contracts: \
@@ -4619,14 +4594,12 @@ impl ConnectingInner {
     }
 }
 
-/// DEF-279 Phase 1c Bundle Commit 7 (2026-05-18) — manual Debug impl
-/// for `ConnectingInner`.
+/// Manual Debug impl for `ConnectingInner`.
 ///
-/// Same field set + same `finish_non_exhaustive()` as [`PgProtocolInner`]'s
-/// Debug — state / read_buf / session_params. Sensitive-redaction
-/// parity preserved (session_params' SecretBoundedStr Display redacts;
-/// state's SCRAM secret variants Display redact via state.rs's manual
-/// Debug arms).
+/// Sensitive-redaction surface: state / read_buf / session_params
+/// are emitted via `finish_non_exhaustive()`. session_params'
+/// SecretBoundedStr Display redacts; state's SCRAM secret variants
+/// Display redact via state.rs's manual Debug arms.
 impl core::fmt::Debug for ConnectingInner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         static EMPTY: SessionParams = SessionParams::new();
@@ -4642,21 +4615,12 @@ impl core::fmt::Debug for ConnectingInner {
     }
 }
 
-/// DEF-279 Phase 2 Bundle Commit 11 (2026-05-18) — per-phase Inner
-/// API surface for `<ActivePhase>`. Mirror of `impl ConnectingInner`
-/// from Phase 1c Commit 7.
-///
-/// All methods `#[allow(dead_code)]` — they become reachable in
-/// Commit 12 when `SealedPhase::Inner = ActiveInner` flips and the
-/// `<ActivePhase>::*` delegate methods route through `self.inner.X`
-/// (where `self.inner: ActiveInner`).
-#[allow(dead_code)]
+/// Per-phase Inner API surface for `<ActivePhase>`. Mirror of
+/// `impl ConnectingInner` with `state` typed `ActiveState`.
 impl ActiveInner {
-    /// DEF-279 Phase 2 Bundle Commit 11 — per-phase saturation
-    /// classifier. Mirror of
-    /// [`PgProtocolInner::install_errored_replyid_saturation`].
-    /// Routes through the same token-gated
-    /// [`_replyid_saturation_drain_leaf::drain`] via lift+lower.
+    /// Per-phase saturation classifier. Routes through the same
+    /// token-gated [`_replyid_saturation_drain_leaf::drain`] via
+    /// lift+lower as the Connecting mirror.
     #[cold]
     #[inline(never)]
     pub(crate) fn install_errored_replyid_saturation(&mut self) {
@@ -4693,10 +4657,10 @@ impl ActiveInner {
         }
     }
 
-    /// DEF-279 Phase 2 Bundle Commit 11 — mint a fresh ReplyId.
-    /// Mirror of `<ActivePhase>::next_reply_id` body but on the
-    /// Inner type. Uses the shared
-    /// `super::PROCESS_REPLY_ID_COUNTER` static atomic.
+    /// Mint a fresh ReplyId.
+    ///
+    /// Uses the shared `super::PROCESS_REPLY_ID_COUNTER` static
+    /// atomic — process-global uniqueness across all phases.
     #[inline]
     pub(crate) fn next_reply_id<K: crate::reply_id::ReplyKind>(
         &mut self,
@@ -4712,13 +4676,11 @@ impl ActiveInner {
         crate::reply_id::ReplyId::from_raw(nz)
     }
 
-    /// DEF-279 Phase 2 Bundle Commit 11 — feed_bytes dispatch loop
-    /// for Active. Thin delegate to
+    /// feed_bytes dispatch loop for Active. Thin delegate to
     /// [`feed_bytes_dispatch_active::<BOUNDED>`].
     ///
-    /// DEF-279 follow-up (2026-05-18, architect Interpretation B):
-    /// `row_desc_slot` HOISTED off `ActiveInner` to outer
-    /// `<ActivePhase>::Extras` — caller (PgProtocol<ActivePhase>
+    /// `row_desc_slot` lives on outer `<ActivePhase>::Extras`, not
+    /// on `ActiveInner`; the caller (`PgProtocol<ActivePhase>`
     /// method) sources from `&mut self.extras` via disjoint-field
     /// borrow and passes here.
     pub(crate) fn feed_bytes_impl<'w, 'r, const BOUNDED: bool>(
@@ -4745,7 +4707,7 @@ impl ActiveInner {
         )
     }
 
-    /// DEF-279 Phase 2 Bundle Commit 11 — frame-bounded feed_bytes.
+    /// Frame-bounded feed_bytes.
     #[inline]
     pub(crate) fn feed_bytes_bounded<'w, 'r>(
         &'r mut self,
@@ -4757,10 +4719,9 @@ impl ActiveInner {
         self.feed_bytes_impl::<true>(row_desc_slot, bytes, write_buf, max_dispatches)
     }
 
-    /// DEF-279 Phase 2 Bundle Commit 11 — append inbound bytes
-    /// (no dispatch). Mirror of `PgProtocolInner::feed_inbound`
-    /// with `ProtoState::Errored(k) => *k` replaced by
-    /// `ActiveState::Errored(k) => *k`.
+    /// Append inbound bytes (no dispatch). Mirror of the
+    /// Connecting variant with `ConnectingState::Errored(k) => *k`
+    /// replaced by `ActiveState::Errored(k) => *k`.
     pub(crate) fn feed_inbound(
         &mut self,
         bytes: &[u8],
@@ -4798,8 +4759,8 @@ impl ActiveInner {
         })
     }
 
-    /// DEF-279 Phase 2 Bundle Commit 11 — single-frame advance.
-    /// Thin delegate to [`advance_one_frame_dispatch_active`].
+    /// Single-frame advance. Thin delegate to
+    /// [`advance_one_frame_dispatch_active`].
     #[must_use = "FeedEvent variants carry side-effect contracts: \
                   SendBytes/Deliver MUST be processed; Fail/Close MUST \
                   trigger socket teardown"]
@@ -4823,17 +4784,17 @@ impl ActiveInner {
         )
     }
 
-    /// DEF-279 Phase 2 Bundle Commit 11 — per-phase residue clear.
-    /// Mirror of [`PgProtocolInner::clear_session_residue_for_class`].
-    /// Thin delegate to [`clear_session_residue_for_class_dispatch`]
-    /// — the helper is state-agnostic (operates only on the four
-    /// cell &muts + class). Same `#[inline]` for DEF-211 FAKE-01
-    /// const-class specialisation by the inliner.
+    /// Per-phase residue clear. Thin delegate to
+    /// [`clear_session_residue_for_class_dispatch`] — the helper
+    /// is state-agnostic (operates only on the four cell `&mut`s +
+    /// class). `#[inline]` so the inliner can specialise to a
+    /// const-class argument and elide the 5-arm dispatch when the
+    /// class is statically known at the call site.
     ///
-    /// DEF-279 follow-up (2026-05-18, architect Interpretation B):
-    /// `row_desc_slot` HOISTED off `ActiveInner`; this method now
-    /// takes the cell as a `&mut` parameter sourced from the outer
-    /// [`PgProtocol::extras`] by the caller.
+    /// `row_desc_slot` lives on outer `<ActivePhase>::Extras`, not
+    /// on `ActiveInner`; this method takes the cell as a `&mut`
+    /// parameter sourced from the outer [`PgProtocol::extras`] by
+    /// the caller.
     #[inline]
     pub(crate) fn clear_session_residue_for_class(
         &mut self,
@@ -4850,9 +4811,9 @@ impl ActiveInner {
     }
 }
 
-/// DEF-279 Phase 2 Bundle Commit 11 (2026-05-18) — manual Debug
-/// impl for `ActiveInner`. Mirror of `PgProtocolInner`'s Debug
-/// (3-field `finish_non_exhaustive`).
+/// Manual Debug impl for `ActiveInner`. Three-field
+/// `finish_non_exhaustive` (state / read_buf / session_params)
+/// matching the Connecting mirror.
 impl core::fmt::Debug for ActiveInner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         static EMPTY: SessionParams = SessionParams::new();
@@ -4868,11 +4829,11 @@ impl core::fmt::Debug for ActiveInner {
     }
 }
 
-// DEF-246 Option α (2026-05-16): re-open `impl PgProtocol<ActivePhase>`
-// for the remaining methods. The five methods moved to
-// `impl PgProtocolInner` above (feed_bytes_impl, feed_bytes_bounded,
+// `impl PgProtocol<ActivePhase>` re-opens here for the remaining
+// `<ActivePhase>`-only methods. The five methods that live on
+// `ActiveInner` above (feed_bytes_impl, feed_bytes_bounded,
 // feed_inbound, advance_one_frame, clear_session_residue_for_class)
-// are reached through delegates near the top of this impl + via
+// are reached through delegates earlier in this file + via
 // `self.inner.X` from in-crate sites (row_stream slow path,
 // cfg(test) integration tests, etc.).
 impl PgProtocol<ActivePhase> {
