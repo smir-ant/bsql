@@ -197,7 +197,7 @@ fn multi_row_select_end_to_end() {
                 }
                 ColEvent::NeedMore => continue,
                 ColEvent::EndQuery { id, outcome } => {
-                    assert_eq!(id, q_raw, "terminal id matches in-flight");
+                    assert_eq!(id, Some(q_raw), "terminal id matches in-flight");
                     let Ok(Reply::QueryComplete(p)) = outcome else {
                         panic!("expected Ok(QueryComplete), got {outcome:?}");
                     };
@@ -328,7 +328,7 @@ fn fast_path_empty_data_row_body_is_malformed() {
         }
         match stream.col_next() {
             ColEvent::EndQuery { id: fail_id, outcome: Err(cause) } => {
-                assert_eq!(fail_id, q_raw);
+                assert_eq!(fail_id, Some(q_raw));
                 assert!(
                     matches!(cause, ProtocolError::MalformedDataRow { .. }),
                     "cause must be MalformedDataRow, got {cause:?}",
@@ -397,7 +397,7 @@ fn server_error_response_surfaces_as_end_query_err() {
         for _ in 0..16 {
             match stream.col_next() {
                 ColEvent::EndQuery { id: fail_id, outcome: Err(cause) } => {
-                    assert_eq!(fail_id, q_raw);
+                    assert_eq!(fail_id, Some(q_raw));
                     assert!(
                         matches!(cause, ProtocolError::ServerErrorResponse { .. }),
                         "expected ServerErrorResponse, got {cause:?}",
@@ -446,7 +446,7 @@ fn rows_before_mid_stream_error_are_preserved() {
                 }
                 ColEvent::EndRow => {}
                 ColEvent::EndQuery { id: fail_id, outcome: Err(cause) } => {
-                    assert_eq!(fail_id, q_raw);
+                    assert_eq!(fail_id, Some(q_raw));
                     assert!(
                         matches!(cause, ProtocolError::ServerErrorResponse { .. }),
                         "cause must be ServerErrorResponse, got {cause:?}",
@@ -556,7 +556,7 @@ fn rows_across_multiple_feed_calls() {
                     }
                 }
                 ColEvent::EndQuery { id, outcome: Ok(_) } => {
-                    end_query_id = Some(id);
+                    end_query_id = id;
                     break;
                 }
                 other => panic!("unexpected event in batch1: {other:?}"),
@@ -573,8 +573,8 @@ fn rows_across_multiple_feed_calls() {
                 ColEvent::Got { .. } => {}
                 ColEvent::EndRow => rows = rows.saturating_add(1),
                 ColEvent::EndQuery { id, outcome: Ok(_) } => {
-                    assert_eq!(id, q_raw);
-                    end_query_id = Some(id);
+                    assert_eq!(id, Some(q_raw));
+                    end_query_id = id;
                     break;
                 }
                 ColEvent::NeedMore => continue,
