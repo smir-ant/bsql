@@ -5620,25 +5620,23 @@ pub(crate) enum IterRowsClass {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-154 (E) — field-level free functions for the fail path
+// Field-level free functions for the fail path
 // ═════════════════════════════════════════════════════════════════════
 //
-// `fail_inflight_and_close` + `replace_state_errored_and_drain` +
-// `fail_read_cursor_advance` historically took `&mut self` (full
-// PgProtocol). DEF-154 (E) wraps `feed_bytes`'s dispatch loop in a
-// `self.inner.read_buf.with_branded(|mut rb| { ... })` branded scope —
-// inside which `read_buf` is borrowed via `rb` (mut via
-// BrandedReadBuf::advance_scope_local / clear_scope_local; shared
-// otherwise). `&mut self` calls are incompatible with `rb`'s borrow.
+// `feed_bytes`'s dispatch loop runs inside a
+// `self.inner.read_buf.with_branded(|mut rb| { ... })` branded scope.
+// Inside that scope `read_buf` is borrowed via `rb` (mut via
+// `BrandedReadBuf::advance_scope_local` / `clear_scope_local`; shared
+// otherwise). A naive `&mut self` fail helper would conflict with
+// `rb`'s borrow at the type level.
 //
-// Fix: free-function form taking disjoint field refs
-// (`&mut ProtoState`, `&mut ReadBuf`, `&mut StagedActions`).
-// Callers can destructure `self` at the dispatch-scope entry and
-// thread the disjoint refs down. Instance methods below delegate
-// to these for non-branded call sites.
+// Free-function form below takes disjoint field refs
+// (`&mut ProtoState`, `&mut StagedActions`, `&mut u32`). Callers
+// destructure `self` at the dispatch-scope entry and thread the
+// disjoint refs down. Instance methods below delegate to these for
+// non-branded call sites.
 
-/// DEF-154 (E) — field-level fail helper used inside the branded
-/// read scope.
+/// Field-level fail helper used inside the branded read scope.
 ///
 /// Takes `&mut ProtoState` + `&mut StagedActions` only — DOES NOT
 /// take `&mut ReadBuf`, because inside `self.inner.read_buf.with_branded`
@@ -5646,7 +5644,7 @@ pub(crate) enum IterRowsClass {
 /// reborrowed. Callers inside the branded scope clear read_buf via
 /// `rb.clear_scope_local()` at an appropriate post-mutation point.
 ///
-/// DEF-149 atomic-terminus triple (state install + reply drain +
+/// The atomic-terminus triple (state install + reply drain +
 /// read_buf clear) is preserved by:
 /// 1. This fn installs `ProtoState::Errored(kind)` and drains the
 ///    inflight reply atomically (state-replace is one operation).
@@ -7206,72 +7204,62 @@ fn build_startup_message(
     crate::action::WriteRange::from_write_span(start, reserved)
 }
 
-// DEF-160 Z2 (2026-05-11): `materialise_push` removed. Pre-Z2 it was
-// the push-path counterpart to `materialise` — verifying staged ranges
-// resolve against `wb` and appending `SendBytesStatic` (Sync) bytes
-// INTO `wb`, returning `Result<(), PushFailure>`. Post-Z2 the push API
-// returns `OutActions` so callers can stream borrowed-SQL chunks via
-// `writev`; `push_command_internal` unifies push and feed materialisation
-// through the single `materialise` entry below (`terminal_row_desc:
-// None` for push — push never emits `DeliverReply`). The
-// `BrandedWriteReserved::as_bytes` helper that `materialise_push` used
-// for the M5 brand-roundtrip verification is also dead post-Z2.
-
 /// Phase-2 materialiser: convert the write-phase's
 /// [`StagedActions`] into [`OutActions<'w, 'r>`] with references
 /// into `write_buf_bytes` (`'w`) or `terminal_row_desc` (`'r`).
 ///
-/// DEF-094 + 1c-1a + DEF-188 lifetime plumbing: `write_buf_bytes`
-/// supplies `'w`; `terminal_row_desc: Option<&'r RowDesc>` supplies
-/// `'r` (the parking slot on `PgProtocol`). The borrow checker
-/// refuses any `&mut WriteBuf` re-borrow while the returned
-/// `OutActions<'w, 'r>` is alive, and any `&mut self` re-borrow
-/// on `PgProtocol` while `'r` is alive.
-// DEF-236 (audit 2026-05-05): NO `#[inline]`. ASM diff (revert vs
-// `#[inline]`): standalone symbol persists with `bl` calls at all
-// 4 call sites — LLVM rejects the hint. Body too large to inline at
-// 4 sites without net code bloat. Annotation would be ineffective
-// noise; LLVM heuristic is correct here.
-// DEF-160 (Z2): `staged: StagedActions<'w>` — the staged container's
-// `'sql` lifetime is unified with the WriteBuf's `'w`. This expresses
-// "any borrowed SQL bytes inside staged outlive the WriteBuf borrow",
-// which is the natural caller-side invariant: caller passes
-// `Parse<'a> { sql: &'a str }` AND `&mut WriteBuf` to the same
-// `push_command` call; the borrow checker enforces `'a >= 'w`. The
-// materialiser then emits `Action::SendBytes(&'w [u8])` for both
-// `SendBytesRange` (bytes from `write_bytes: &'w [u8]`) and
-// `SendBytesBorrowed` (bytes from caller's SQL, lifetime ≥ 'w by
-// the unified parameter).
+/// Lifetime plumbing: `write_buf_bytes` supplies `'w`;
+/// `terminal_row_desc: Option<&'r RowDesc>` supplies `'r` (the
+/// parking slot on `PgProtocol`). The borrow checker refuses any
+/// `&mut WriteBuf` re-borrow while the returned `OutActions<'w, 'r>`
+/// is alive, and any `&mut self` re-borrow on `PgProtocol` while
+/// `'r` is alive.
+//
+// No `#[inline]` attribute: an ASM diff confirmed the standalone
+// symbol persists with `bl` calls at all 4 call sites — LLVM
+// rejects the hint because the body is too large to inline at 4
+// sites without net code bloat. The annotation would be
+// ineffective noise; the LLVM heuristic is correct here.
+//
+// `staged: StagedActions<'w>` — the staged container's `'sql`
+// lifetime is unified with the WriteBuf's `'w`. This expresses
+// "any borrowed SQL bytes inside staged outlive the WriteBuf
+// borrow", which is the natural caller-side invariant: caller
+// passes `Parse<'a> { sql: &'a str }` AND `&mut WriteBuf` to the
+// same `push_command` call; the borrow checker enforces
+// `'a >= 'w`. The materialiser then emits
+// `Action::SendBytes(&'w [u8])` for both `SendBytesRange` (bytes
+// from `write_bytes: &'w [u8]`) and `SendBytesBorrowed` (bytes
+// from caller's SQL, lifetime ≥ 'w by the unified parameter).
 fn materialise<'w, 'r>(
     staged: StagedActions<'w>,
     write_bytes: &'w [u8],
     terminal_row_desc: Option<&'r crate::decode::RowDesc>,
 ) -> OutActions<'w, 'r> {
-    // DEF-154 (L) P0-1 invariant: `staged.len() ≤ MAX_STAGED_PER_CALL`
+    // Capacity invariant: `staged.len() ≤ MAX_STAGED_PER_CALL`
     // (heapless::Vec cap); each staged entry fans out to ≤
     // MAX_FANOUT_PER_STAGED actions. `out.push(a)` below is
     // architecturally infallible via the module-level
     // `const _: () = assert!(MAX_ACTIONS_PER_CALL >= MAX_STAGED_PER_CALL
-    // * MAX_FANOUT_PER_STAGED)`. The match-Err arms pre-(L) used
-    // `.unwrap_or(())` — a silent-drop pattern the user explicitly
-    // banned ("тихая эрозия"). Post-(L): explicit match on `push`
-    // result with the Err arm a documented dead branch.
+    // * MAX_FANOUT_PER_STAGED)`. A naive `.unwrap_or(())` on the
+    // match-Err arms would be silent-drop ("тихая эрозия") — banned.
+    // Form below: explicit match on `push` result with the Err arm
+    // a documented dead branch.
     let mut out = OutActions::new();
     for sa in staged {
-        // DEF-154 (Y): `StagedAction::StreamRowRange` deleted —
-        // DataRow flows via `iter_rows` fast-path (no staging).
-        // DEF-188: stale-ref class deleted — into_public is
-        // infallible.
+        // `StagedAction::StreamRowRange` does not exist — DataRow
+        // flows via the `iter_rows` fast-path (no staging). The
+        // stale-ref class was deleted; `into_public` is infallible.
         let a: Action<'w, 'r> = match sa {
             StagedAction::SendBytesRange(range) => {
-                // DEF-154 (N) P0-4: `WriteRange::apply` returns
-                // `Option<&[u8]>` post-(N) — None is architecturally
-                // unreachable under intact brand/bounds invariants
-                // (see action.rs::WriteRange::apply doc), but the
+                // `WriteRange::apply` returns `Option<&[u8]>` — None
+                // is architecturally unreachable under intact
+                // brand/bounds invariants (see
+                // `action.rs::WriteRange::apply` doc), but the
                 // Option makes the invariant-break explicit and
-                // classified HERE via `CloseSocket` emission instead
-                // of the pre-(N) silent `unwrap_or(&[])` fallback
-                // that shipped a zero-byte SendBytes to the wire.
+                // classified HERE via `CloseSocket` emission. A
+                // naive `unwrap_or(&[])` fallback would ship a
+                // zero-byte SendBytes to the wire silently.
                 match range.apply(write_bytes) {
                     Some(slice) => Action::SendBytes(slice),
                     None => {
@@ -7281,17 +7269,17 @@ fn materialise<'w, 'r>(
                 }
             }
             StagedAction::SendBytesStatic(s) => Action::SendBytes(s),
-            // DEF-112 + DEF-188 + DEF-210 SR-01 Path C/D:
-            // `DeliverReplyEntry` carries a lifetime-free `StagedReply`.
-            // Materialise reads `row_desc_slot` directly for ALL
-            // schema-bearing reply paths (QueryComplete, Describe*Complete)
-            // — single source of truth for "is there a schema?". Path C
-            // deleted the `schema_present: bool` duplicate from
-            // QueryComplete; Path D deleted the `DescribedRowsStaged*`
-            // duplicate enums from Describe*Complete. No defensive
-            // `debug_assert!(false)` arms left. The entry was constructed
-            // by the typed `action::deliver` path — kind-payload pairing
-            // enforced at dispatch time.
+            // `DeliverReplyEntry` carries a lifetime-free
+            // `StagedReply`. Materialise reads `row_desc_slot`
+            // directly for ALL schema-bearing reply paths
+            // (QueryComplete, Describe*Complete) — single source
+            // of truth for "is there a schema?". No
+            // `schema_present: bool` duplicate on QueryComplete;
+            // no `DescribedRowsStaged*` duplicate enums on
+            // Describe*Complete; no defensive
+            // `debug_assert!(false)` arms. The entry was
+            // constructed by the typed `action::deliver` path —
+            // kind-payload pairing enforced at dispatch time.
             StagedAction::DeliverReply(entry) => {
                 let entry_id = entry.id();
                 Action::DeliverReply {
@@ -7301,11 +7289,11 @@ fn materialise<'w, 'r>(
             }
             StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
             StagedAction::CloseSocket => Action::CloseSocket,
-            // DEF-160 (Z2): pass borrowed slice through unchanged.
-            // The `'sql: 'w` bound on `materialise` ensures the borrow
-            // is at least as long-lived as the WriteBuf's bytes — the
-            // returned `Action::SendBytes(&'w [u8])` carries the
-            // shorter lifetime safely.
+            // Pass borrowed slice through unchanged. The `'sql: 'w`
+            // bound on `materialise` ensures the borrow is at least
+            // as long-lived as the WriteBuf's bytes — the returned
+            // `Action::SendBytes(&'w [u8])` carries the shorter
+            // lifetime safely.
             StagedAction::SendBytesBorrowed(b) => Action::SendBytes(b),
         };
         push_within_fanout_budget(&mut out, a);
@@ -7313,23 +7301,22 @@ fn materialise<'w, 'r>(
     out
 }
 
-/// DEF-154 (L) P0-1 + DEF-184 (B3): push an action with
-/// classified dead-arm.
+/// Push an action with classified dead-arm.
 ///
-/// ## Infallibility proof (post-DEF-184 A15)
+/// ## Infallibility proof
 ///
 /// `MAX_ACTIONS_PER_CALL = MAX_STAGED_PER_CALL +
 /// MAX_FANOUT2_ENTRIES_PER_CALL × (MAX_FANOUT_PER_STAGED − 1)
-/// = 8 + 1 × 1 = 9` (const-asserted at MAX_ACTIONS_PER_CALL).
+/// = 8 + 1 × 1 = 9` (const-asserted at `MAX_ACTIONS_PER_CALL`).
 ///
 /// Each staged entry contributes ≤ `MAX_FANOUT_PER_STAGED = 2`
 /// calls to this helper (1-action variants: 1; DeliverReply
 /// stale-ref fanout: 2). With `MAX_FANOUT2_ENTRIES = 1` (at most
-/// one DeliverReply per call, per pre-1c-5 single-inflight
-/// invariant — see A15 proof), total calls ≤ 9 = out's capacity.
+/// one DeliverReply per call, per the single-inflight invariant),
+/// total calls ≤ 9 = `out`'s capacity.
 ///
 /// **Conclusion:** `out.push(a)` is architecturally infallible
-/// in the post-A15 capacity regime. The Err arm is dead.
+/// in this capacity regime. The Err arm is dead.
 ///
 /// ## Why not truly tier-1 infallible?
 ///
@@ -7341,14 +7328,14 @@ fn materialise<'w, 'r>(
 ///   Rust without `#![feature(generic_const_exprs)]`).
 ///
 /// We settle for tier-2 structural via const-asserted invariant
-/// alone. Post-DEF-280 Bundle G the `debug_assert!(false, …)` in
-/// the Err branch was removed as a CREDO §V glass pattern (dev
-/// loud + release silent fallthrough); the build-time const-assert
-/// at `MAX_ACTIONS_PER_CALL` is the actual safety proof, and the
+/// alone. A naive `debug_assert!(false, …)` in the Err branch
+/// would be a CREDO §V glass pattern (dev loud + release silent
+/// fallthrough); the build-time const-assert at
+/// `MAX_ACTIONS_PER_CALL` is the actual safety proof, and the
 /// runtime Err arm is `core::hint::cold_path()` + silent no-op
-/// (architecturally dead under intact invariant; a future refactor
-/// that breaks the capacity inequality without updating the const
-/// fails to compile rather than reaching this arm).
+/// (architecturally dead under intact invariant; a future
+/// refactor that breaks the capacity inequality without updating
+/// the const fails to compile rather than reaching this arm).
 ///
 /// ## Why the wrapper vs inline match?
 ///
@@ -7380,24 +7367,26 @@ fn push_within_fanout_budget<'w, 'r>(
     }
 }
 
-// DEF-246 Phase 2 (2026-05-16): `Default` impl moved from
-// `<ActivePhase>` to `<DisconnectedPhase>` — `PgProtocol::default()`
-// produces a fresh disconnected protocol (matches `PgProtocol::new()`).
+// `Default` lives on `<DisconnectedPhase>` only —
+// `PgProtocol::default()` produces a fresh disconnected protocol
+// (matches `PgProtocol::new()`). A naive blanket
+// `impl<P: SealedPhase> Default` would let a user mint a default
+// protocol in any phase, breaking the consume-self handshake
+// invariants.
 impl Default for PgProtocol<DisconnectedPhase> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// DEF-279 Phase 1a (2026-05-18): per-phase `Debug` impls. Pre-Bundle
-// a single blanket `impl<P: SealedPhase> Debug for PgProtocol<P>`
-// accessed inner fields directly (session_params/state/read_buf),
-// which compiled because every phase's Inner was PgProtocolInner.
-// Post-Bundle `<DisconnectedPhase>::Inner` is the ZST
-// `DisconnectedInner` (no fields); blanket access fails to compile.
-// Split into 4 phase-specific impls — DisconnectedPhase's output is
-// a phase-name marker (the storage IS the proof: nothing to show);
-// the other three keep the pre-Bundle body bit-identical.
+// Per-phase `Debug` impls. A naive blanket
+// `impl<P: SealedPhase> Debug for PgProtocol<P>` would access
+// inner fields directly (session_params/state/read_buf), but
+// `<DisconnectedPhase>::Inner` is the ZST `DisconnectedInner` (no
+// fields), so the blanket form fails to compile. Split into 4
+// phase-specific impls — `DisconnectedPhase`'s output is a
+// phase-name marker (the storage IS the proof: nothing to show);
+// the other three project their `Inner`'s derived Debug.
 
 impl core::fmt::Debug for PgProtocol<DisconnectedPhase> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -7418,9 +7407,9 @@ impl core::fmt::Debug for PgProtocol<ConnectingPhase> {
 
 impl core::fmt::Debug for PgProtocol<ActivePhase> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // DEF-279 follow-up (2026-05-18): `row_desc_slot` HOISTED to
-        // outer `extras`. Surface its populated/empty state alongside
-        // the inner's debug projection.
+        // `row_desc_slot` lives on the outer `extras` for
+        // `<ActivePhase>`. Surface its populated/empty state
+        // alongside the inner's debug projection.
         f.debug_struct("PgProtocol")
             .field("phase", &"ActivePhase")
             .field("row_desc_slot_present", &self.extras.as_ref().is_some())
@@ -7431,11 +7420,10 @@ impl core::fmt::Debug for PgProtocol<ActivePhase> {
 
 impl core::fmt::Debug for PgProtocol<ClosedPhase> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // DEF-279 Phase 1b (2026-05-18): `<ClosedPhase>::Inner =
-        // ClosedInner` (not PgProtocolInner) — delegates to
-        // `ClosedInner`'s derived Debug. The arena overwrite count
-        // is surfaced as a numeric diagnostic; state_kind is the
-        // terminal cause classifier.
+        // `<ClosedPhase>::Inner = ClosedInner` (16 B, no
+        // PgProtocolInner) — delegates to `ClosedInner`'s derived
+        // Debug. The arena overwrite count is surfaced as a numeric
+        // diagnostic; `state_kind` is the terminal cause classifier.
         f.debug_struct("PgProtocol")
             .field("phase", &"ClosedPhase")
             .field("state_kind", &self.inner.state_kind)
@@ -7446,12 +7434,12 @@ impl core::fmt::Debug for PgProtocol<ClosedPhase> {
 
 #[cfg(test)]
 mod allows_unsolicited_param_status_tests {
-    //! Seam-closing table for `allows_unsolicited_param_status`
-    //! (S1 / DEF-054). The function's exhaustive match returns `true`
-    //! for four variants and `false` for five. Swapping any variant
-    //! between arms compiles (both arms return `bool`); only a test
+    //! Seam-closing table for `allows_unsolicited_param_status`.
+    //! The function's exhaustive match returns `true` for four
+    //! variants and `false` for five. Swapping any variant between
+    //! arms compiles (both arms return `bool`); only a test
     //! enumerating every variant against its expected policy value
-    //! can catch the drift.
+    //! catches the drift.
     //!
     //! Category (1) per reforge.md §4.11.
 
@@ -7460,37 +7448,30 @@ mod allows_unsolicited_param_status_tests {
     use core::num::NonZeroU64;
 
     fn nz(n: u64) -> NonZeroU64 {
-        // DEF-145: nz(0) is a test bug — a zero raw correlator cannot
-        // be minted by a real ReplyId allocator (NonZeroU64 by type).
-        // Pre-DEF-145 the `unwrap_or(MIN)` fallback silently coerced
-        // `0 → 1`, potentially colliding with a concurrent nz(1).
-        // Assert fires loud; the `unwrap_or(MIN)` keeps the forbid-bundle
-        // happy (clippy::unwrap_used forbidden) on the assertion-proved
-        // dead branch.
+        // `nz(0)` is a test bug — a zero raw correlator cannot be
+        // minted by a real `ReplyId` allocator (NonZeroU64 by type).
+        // A naive `unwrap_or(MIN)` fallback alone would silently
+        // coerce `0 → 1`, potentially colliding with a concurrent
+        // `nz(1)`. The assert fires loud; the `unwrap_or(MIN)` keeps
+        // the forbid-bundle happy (clippy::unwrap_used forbidden) on
+        // the assertion-proved dead branch.
         assert!(n > 0, "nz(0) is a test bug — use nz(1..) for non-zero test correlators");
         NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
     }
 
-    /// Consume any ReplyId carried by a state so the Drop-guard does
-    /// not trip at end-of-scope.
+    /// Consume any ReplyId carried by a state so the Drop-guard
+    /// does not trip at end-of-scope.
     ///
-    /// # Pass-#7 F14: delegate to `ProtoState::take_inflight_reply_raw_id`
+    /// Delegates to `ProtoState::take_inflight_reply_raw_id` — the
+    /// authoritative exhaustive match over all `ProtoState`
+    /// variants lives in `state.rs`. A naive hand-rolled 20-line
+    /// match here would be a parallel drift surface (every new
+    /// variant would need updates in two places); the delegation
+    /// closes the drift to a single point.
     ///
-    /// Pre-pass-#7 this was a hand-rolled 20-line exhaustive match
-    /// over all ~22 `ProtoState` variants. State.rs has THE
-    /// authoritative version (`take_inflight_reply_raw_id`) which
-    /// (a) takes `self` by value → consumes the carried `ReplyId<_>`
-    /// via its `.consume()` method, (b) returns the raw
-    /// `Option<NonZeroU64>` which the test doesn't need.
-    ///
-    /// Drift surface closed: one exhaustive match in `state.rs`,
-    /// zero parallel matches here. Adding a new variant fails the
-    /// build in state.rs's authoritative site and automatically
-    /// flows through `consume_state` without touching this file.
-    ///
-    /// The return value is `Option<NonZeroU64>` — `Copy`, no `Drop`
-    /// — statement-discarded via `drop()` (explicit no-op, avoids
-    /// the forbid-bundle-banned `let _ = ...`). Reading the
+    /// The return value is `Option<NonZeroU64>` — `Copy`, no
+    /// `Drop` — discarded via a bare `match` arm (avoids the
+    /// forbid-bundle-banned `let _ = ...`). Reading the
     /// `Option::Some(u64)` payload here would add zero value.
     fn consume_state(state: ProtoState) {
         // Side-effect call: `take_inflight_reply_raw_id` consumes the
@@ -7540,12 +7521,11 @@ mod allows_unsolicited_param_status_tests {
         assert!(!allows_unsolicited_param_status(&startup_trust));
         consume_state(startup_trust);
 
-        // ConnectingStartupScram — DEF-097 typestate carrying
-        // ScramSession inline (DEF-184 A10/B22 revert 2026-04-24:
-        // tier-1 variant-carries-field restoration). The classification
-        // test only reads the variant tag, but the variant cannot be
-        // constructed without its required SCRAM data — that is the
-        // tier-1 invariant under test.
+        // `ConnectingStartupScram` carries its `ScramSession`
+        // inline as a tier-1 variant-carries-field invariant — the
+        // variant cannot be constructed without its required SCRAM
+        // data. The classification test only reads the variant tag,
+        // but the construction itself is the invariant under test.
         if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
             let scram = alloc::boxed::Box::new(
                 crate::scram::session::ScramSession::from_password(
@@ -7586,24 +7566,25 @@ mod allows_unsolicited_param_status_tests {
         consume_state(scram_authok);
 
         // Errored — rejecting (terminal; no traffic accepted).
-        // DEF-061 + DEF-142: Errored carries `StateErrorKind`
-        // (1 byte, AlreadyClosed-excluded newtype over ErrorKind).
+        // `Errored` carries `StateErrorKind` (1 byte,
+        // `AlreadyClosed`-excluded newtype over `ErrorKind`).
         let errored = ProtoState::Errored(crate::error::StateErrorKind::from_kind_or_internal(crate::error::ErrorKind::Framing));
         assert!(!allows_unsolicited_param_status(&errored));
         consume_state(errored);
 
-        // 1c-1b: simple-query states all accept unsolicited PS
-        // (server may emit ParameterStatus mid-query if an
-        // `ALTER SYSTEM` fires). Exhaustive enumeration pins the
+        // Simple-query states all accept unsolicited
+        // `ParameterStatus` — the server may emit one mid-query if
+        // an `ALTER SYSTEM` fires. Exhaustive enumeration pins the
         // policy row per-variant.
         let q_first = ProtoState::SimpleQueryAwaitingFirstResponse(ReplyId::from_raw(nz(8001)));
         assert!(allows_unsolicited_param_status(&q_first));
         consume_state(q_first);
 
-        // DEF-189: state variants no longer carry inline RowDesc;
-        // schema lives in PgProtocol::row_desc_slot. Test fixtures
-        // construct streaming variants directly without schema; the
-        // policy under test (`allows_unsolicited_param_status`) is
+        // Streaming-rows state variants do not carry inline
+        // `RowDesc`; the schema lives on the per-phase
+        // `row_desc_slot` extras cell. Test fixtures construct
+        // streaming variants directly without schema; the policy
+        // under test (`allows_unsolicited_param_status`) is
         // schema-agnostic.
         let q_rows = ProtoState::SimpleQueryStreamingRows {
             reply: ReplyId::from_raw(nz(8002)),
@@ -7626,34 +7607,37 @@ mod allows_unsolicited_param_status_tests {
 
 #[cfg(test)]
 mod residue_policy_per_class_tests {
-    //! DEF-210 NB-04 (audit 2026-04-28): per-`StatePushClass` pinning
-    //! of `clear_session_residue_if_idle_or_errored` arm bodies.
+    //! Per-`StatePushClass` pinning of
+    //! `clear_session_residue_for_class` arm bodies.
     //!
     //! The production function uses a wildcard `_ => {}` for the
     //! Connecting / PingAwaiting / BusyQuery preserve-residue arm
-    //! (the wildcard form compiles to a single discriminant compare
-    //! pair — explicit 25-variant or-pattern cost ~+2 ns, see
-    //! comment on `clear_session_residue_if_idle_or_errored`). The
-    //! wildcard is tier-2-by-discipline at the broad scope: a future
-    //! `ProtoState` variant inherits the wildcard "preserve" arm
-    //! silently, with no compile-time signal.
+    //! (the wildcard form compiles to a single discriminant
+    //! compare pair — an explicit 25-variant or-pattern would cost
+    //! ~+2 ns; see the comment on `clear_session_residue_for_class`).
+    //! The wildcard is tier-2-by-discipline at the broad scope: a
+    //! future `ProtoState` variant inherits the wildcard
+    //! "preserve" arm silently, with no compile-time signal.
     //!
-    //! These tests close the gap at the **`StatePushClass` granularity**
-    //! by pinning the per-class residue policy on observable state:
-    //! - **Idle** — `row_desc_slot` cleared; `session_params` preserved.
+    //! These tests close the gap at the **`StatePushClass`
+    //! granularity** by pinning the per-class residue policy on
+    //! observable state:
+    //! - **Idle** — `row_desc_slot` cleared; `session_params`
+    //!   preserved.
     //! - **Errored(_)** — `row_desc_slot` cleared; `session_params`
     //!   internally `clear()`-ed (verified via `is_pristine()`).
-    //! - **Connecting / PingAwaiting / BusyQuery** — every observable
-    //!   residue field preserved.
+    //! - **Connecting / PingAwaiting / BusyQuery** — every
+    //!   observable residue field preserved.
     //!
-    //! An arm-body swap (e.g. `Idle => clear session_params` instead
-    //! of preserve) trips one of these tests immediately. Adding a
-    //! new `StatePushClass` variant requires a new test arm here too
-    //! (the test for the new class would be missing — caught by
-    //! contributor discipline + code review, not compile-fail; this
-    //! is the residual tier-3 surface that integration-via-public-
-    //! API would close, but the public-API path requires real
-    //! server-frame fixtures that are outside this test's scope).
+    //! An arm-body swap (e.g. `Idle => clear session_params`
+    //! instead of preserve) trips one of these tests immediately.
+    //! Adding a new `StatePushClass` variant requires a new test
+    //! arm here too (the test for the new class would be missing —
+    //! caught by contributor discipline + code review, not
+    //! compile-fail; this is the residual tier-3 surface that
+    //! integration-via-public-API would close, but the public-API
+    //! path requires real server-frame fixtures that are outside
+    //! this test's scope).
     use super::*;
     use crate::decode::RowDesc;
     use crate::error::{ErrorKind, StateErrorKind};
@@ -7676,19 +7660,17 @@ mod residue_policy_per_class_tests {
         alloc::boxed::Box::new(params)
     }
 
-    /// DEF-279 Phase 1a (2026-05-18) — test-only constructor for an
-    /// `<ActivePhase>` proto. Pre-Bundle the residue tests called
-    /// `PgProtocol::new()` (which returned `<DisconnectedPhase>` with
-    /// a fully-allocated `PgProtocolInner` carrying empty cells).
-    /// Post-Bundle `<DisconnectedPhase>::Inner` is the ZST
-    /// `DisconnectedInner` — the tests need a phase whose Inner is
-    /// `PgProtocolInner` to exercise residue clear-paths. This helper
-    /// uses the leaf-private `_proto_init_leaf::fresh_inner()`
-    /// (callable from sibling tests within mod protocol) wrapped in
+    /// Test-only constructor for an `<ActivePhase>` proto. The
+    /// residue tests need a phase whose `Inner` is `ActiveInner`
+    /// (the ZST `DisconnectedInner` carries no residue fields to
+    /// exercise), and that without driving a real handshake. This
+    /// helper goes through the leaf-private
+    /// `_proto_init_leaf::fresh_active_inner()` (callable from
+    /// sibling tests within `mod protocol`) wrapped in
     /// `<ActivePhase>`. NOT a production bypass: leaf visibility
-    /// gates external access; `phase_marker` is ZST without external
-    /// construction; this `fn` is `#[cfg(test)]` private to the
-    /// test module.
+    /// gates external access; `phase_marker` is ZST without
+    /// external construction; this `fn` is `#[cfg(test)]` private
+    /// to the test module.
     fn fresh_active_proto() -> PgProtocol<ActivePhase> {
         PgProtocol {
             inner: _proto_init_leaf::fresh_active_inner(),
@@ -7698,16 +7680,14 @@ mod residue_policy_per_class_tests {
     }
 
     /// Populate every observable residue field on `proto`:
-    /// `row_desc_slot = Some(EMPTY)`, `session_params` non-pristine,
-    /// `error_arena` allocated. After the test we observe how each
-    /// arm of `clear_session_residue_*` mutated them.
+    /// `row_desc_slot = Some(EMPTY)`, `session_params`
+    /// non-pristine, `error_arena` allocated. After the test we
+    /// observe how each arm of `clear_session_residue_for_class`
+    /// mutated them.
     ///
-    /// DEF-279 follow-up (2026-05-18, architect Interpretation B):
-    /// `row_desc_slot` HOISTED to outer `<ActivePhase>::Extras`;
-    /// helpers tighten to `PgProtocol<ActivePhase>` (was generic
-    /// `<P: SealedPhase<Inner = ActiveInner>>`) — only `<ActivePhase>`
-    /// monomorphisation has both ActiveInner AND the
-    /// RowDescSlotCell extras.
+    /// Tightened to `PgProtocol<ActivePhase>` (not generic) because
+    /// only the `<ActivePhase>` monomorphisation carries both
+    /// `ActiveInner` AND the `RowDescSlotCell` extras.
     fn populate_residue(proto: &mut PgProtocol<ActivePhase>) {
         proto.extras._set_for_test(Some(RowDesc::EMPTY));
         proto.inner.session_params._set_for_test(Some(dirty_session_params()));
@@ -7716,9 +7696,9 @@ mod residue_policy_per_class_tests {
         ));
     }
 
-    /// Replace `proto.inner.state` with `Idle` so the destructor doesn't
-    /// trip the in-flight `ReplyId<_>` Drop-guard at scope end.
-    /// DEF-279 follow-up (2026-05-18): tightened to `PgProtocol<ActivePhase>`.
+    /// Replace `proto.inner.state` with `Idle` so the destructor
+    /// doesn't trip the in-flight `ReplyId<_>` Drop-guard at scope
+    /// end.
     fn quench_inflight(proto: &mut PgProtocol<ActivePhase>) {
         let prev = core::mem::replace(&mut proto.inner.state, ActiveState::Idle);
         match prev.take_inflight_reply_raw_id() {
@@ -7726,10 +7706,9 @@ mod residue_policy_per_class_tests {
         }
     }
 
-    /// DEF-279 follow-up (2026-05-18): tightened to `PgProtocol<ActivePhase>`.
     fn session_params_is_pristine(proto: &PgProtocol<ActivePhase>) -> bool {
-        // DEF-211 INNO-01 (2026-05-04): trait method via `Pristine` import.
-        // Inherent `__pristine_const` would also work but trait dispatch
+        // Trait method via `Pristine` import. The inherent
+        // `__pristine_const` would also work, but trait dispatch
         // here matches polymorphic intent (test helper takes any
         // `SessionParams`-like thing).
         use crate::pristine::Pristine as _;
@@ -7785,7 +7764,7 @@ mod residue_policy_per_class_tests {
         );
         assert!(
             session_params_is_pristine(&proto),
-            "Errored MUST clear session_params content (DEF-189 Q8-C3 forfeit on tear-down)",
+            "Errored MUST clear session_params content (forfeit on tear-down)",
         );
         // No state mutation back to Idle here — Errored is terminal.
         // Drop-guard for `Errored(StateErrorKind)` is fine: the kind
@@ -7794,13 +7773,12 @@ mod residue_policy_per_class_tests {
 
     #[test]
     fn connecting_preserves_all_residue() {
-        // DEF-279 Phase 2 Bundle Commit 12 (2026-05-18): post-flip
-        // an `<ActivePhase>` cannot hold a `ConnectingStartupTrust`
-        // state — variant doesn't exist in `ActiveState` (tier-1
-        // by storage absence). Test the class-arm directly via
-        // `StatePushClass::Connecting` constant, fed to
+        // `<ActivePhase>` cannot hold a `ConnectingStartupTrust`
+        // state — the variant doesn't exist in `ActiveState`
+        // (tier-1 by storage absence). Test the class-arm directly
+        // via the `StatePushClass::Connecting` constant fed to
         // `clear_session_residue_for_class`, with the state held
-        // at any legal ActiveState value (Idle here for shape).
+        // at any legal `ActiveState` value (`Idle` here for shape).
         let mut proto = fresh_active_proto();
         proto.inner.state = ActiveState::Idle;
         populate_residue(&mut proto);
@@ -7879,57 +7857,49 @@ mod residue_policy_per_class_tests {
 
 #[cfg(test)]
 mod compute_push_tests {
-    //! DEF-059 — seam-closing tests for the pure push-compute split.
+    //! Seam-closing tests for the pure push-compute split.
     //!
-    //! The push-path decision table is enumerated per `(cmd, state)`
-    //! pair; every arm of [`compute_push_ping`] and
-    //! [`compute_push_startup`] is exercised and its `(new_state,
-    //! actions)` output is pinned. Swapping any two arm bodies would
-    //! compile (identical return shape `ProtoState`, identical
-    //! `emit_actions!` budget), so the only shield for the policy
-    //! table is this enumeration.
+    //! The push-path decision table is enumerated per
+    //! `(cmd, state)` pair; every arm of [`compute_push_ping`] and
+    //! [`compute_push_startup_idle_only`] is exercised and its
+    //! `(new_state, actions)` output is pinned. Swapping any two
+    //! arm bodies would compile (identical return shape
+    //! `ProtoState`, identical `emit_actions!` budget), so the
+    //! only shield for the policy table is this enumeration.
     //!
     //! Category (1) per reforge.md §4.11 — exhaustive-match policy
     //! table. Companion to `allows_unsolicited_param_status_tests`
     //! above (same test style, same helpers).
     //!
-    //! These tests also stand as the DEF-059 proof that the pure
-    //! half is testable without constructing [`PgProtocol`]: every
-    //! test calls [`compute_push`] directly on a synthesised
+    //! These tests also stand as the proof that the pure half is
+    //! testable without constructing [`PgProtocol`]: every test
+    //! calls [`compute_push`] directly on a synthesised
     //! `(cmd, state)` pair.
     use super::*;
-    // DEF-246 Phase 2 (2026-05-16): `Credentials` import was used by
-    // the retired Startup cross-state tests; the new
-    // `<DisconnectedPhase>::push_startup` consumes Credentials via
-    // its own param, not via the cfg(test) dispatcher.
     use crate::reply_id::ReplyId;
     use core::num::NonZeroU64;
 
     fn nz(n: u64) -> NonZeroU64 {
-        // DEF-145: nz(0) is a test bug — a zero raw correlator cannot
-        // be minted by a real ReplyId allocator (NonZeroU64 by type).
-        // Pre-DEF-145 the `unwrap_or(MIN)` fallback silently coerced
-        // `0 → 1`, potentially colliding with a concurrent nz(1).
-        // Assert fires loud; the `unwrap_or(MIN)` keeps the forbid-bundle
-        // happy (clippy::unwrap_used forbidden) on the assertion-proved
-        // dead branch.
+        // `nz(0)` is a test bug — a zero raw correlator cannot be
+        // minted by a real `ReplyId` allocator (NonZeroU64 by type).
+        // A naive `unwrap_or(MIN)` fallback alone would silently
+        // coerce `0 → 1`, potentially colliding with a concurrent
+        // `nz(1)`. The assert fires loud; the `unwrap_or(MIN)` keeps
+        // the forbid-bundle happy (clippy::unwrap_used forbidden) on
+        // the assertion-proved dead branch.
         assert!(n > 0, "nz(0) is a test bug — use nz(1..) for non-zero test correlators");
         NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
     }
 
-    /// Consume any ReplyId carried by `state` so its Drop-guard does
-    /// not trip when the state drops at end of scope.
+    /// Consume any ReplyId carried by `state` so its Drop-guard
+    /// does not trip when the state drops at end of scope.
     ///
-    /// # Pass-#7 F14: delegate to `take_inflight_reply_raw_id`
-    ///
-    /// Pre-pass-#7 this was a hand-rolled 20-line match, documented
-    /// as "copy of the helper in `allows_unsolicited_param_status_tests`
-    /// — module privacy forbids re-use without cross-module exposure."
-    /// After pass-#7, `state.rs` exposes `take_inflight_reply_raw_id` as
-    /// `pub(crate)` — both test modules delegate to it, eliminating
-    /// the parallel-match drift surface. New variants categorised
-    /// once in `state.rs` automatically flow through all test
-    /// helpers.
+    /// Delegates to `ProtoState::take_inflight_reply_raw_id`
+    /// (exposed as `pub(crate)` in `state.rs`). Both this module
+    /// and `allows_unsolicited_param_status_tests` delegate to that
+    /// single authoritative match — new variants categorised once
+    /// in `state.rs` automatically flow through all test helpers,
+    /// eliminating parallel-match drift.
     fn consume_state(state: ProtoState) {
         // Side-effect call: `take_inflight_reply_raw_id` consumes the
         // carried `ReplyId<_>` via its internal `.consume()` (marks
@@ -7973,33 +7943,25 @@ mod compute_push_tests {
         }
     }
 
-    // DEF-246 Phase 2 (2026-05-16): `mk_user` was used by the
-    // retired Startup cross-state tests. The new
-    // `<DisconnectedPhase>::push_startup` consume-self entry point
-    // makes those tests structurally impossible; the helper is
-    // removed alongside them.
-
-    /// Test-only observation of a [`StagedAction`] — brand stripped,
-    /// range carried as `NonEmptyRange`. Tests compare against this
-    /// instead of `StagedAction` directly because `'wb` is
-    /// HRTB-fresh per call site (DEF-154 (B)) and cannot be named
+    /// Test-only observation of a [`StagedAction`] — brand
+    /// stripped, range carried as `NonEmptyRange`. Tests compare
+    /// against this instead of `StagedAction` directly because
+    /// `'wb` is HRTB-fresh per call site and cannot be named
     /// outside the branded closure that produced it.
     ///
-    /// `ProtocolError` is `Copy + Clone` (error.rs:231) so
-    /// `FailReply`'s full cause variant is preserved — tests match
-    /// specific causes like
-    /// `cause: ProtocolError::ConnectionAlreadyClosed { prior_kind }`.
+    /// `ProtocolError` is `Copy + Clone` so `FailReply`'s full
+    /// cause variant is preserved — tests match specific causes
+    /// like `cause: ProtocolError::ConnectionAlreadyClosed { prior_kind }`.
     ///
-    /// Variants covered are those `compute_push` produces.
-    /// `StreamRowRange` (only from `feed_bytes` DATA_ROW arm) is
-    /// represented as a distinct `StreamRowRangeUnexpected` variant
-    /// — if a future refactor ever makes compute_push emit a
-    /// StreamRowRange (an architectural bug), tests pattern-matching
-    /// on `StagedObs` will SEE a distinct variant instead of a
-    /// silent collapse to `CloseSocket` (pre-DEF-154 (P) behaviour
-    /// flagged as P0-6 by architect audit).
-    // DEF-184 (A1+A13): ProtocolError ~72 B post-ErrorArena; no
-    // longer triggers large_enum_variant.
+    /// Variants covered are those `compute_push` produces. A
+    /// naive collapse of an unexpected `StreamRowRange` (only
+    /// emitted from the `feed_bytes` DATA_ROW arm) into
+    /// `CloseSocket` would mask an architectural bug — instead,
+    /// such a path would be observed as a distinct variant by
+    /// pattern-matching tests rather than silently absorbed.
+    //
+    // `ProtocolError` is ~72 B post-`ErrorArena`, so this enum no
+    // longer triggers `clippy::large_enum_variant`.
     #[derive(Debug, Clone, Copy)]
     enum StagedObs {
         /// Unit variant — tests discriminate on variant kind, not
@@ -8027,12 +7989,12 @@ mod compute_push_tests {
                     Self::FailReply { id: *id, cause: *cause }
                 }
                 StagedAction::CloseSocket => Self::CloseSocket,
-                // DEF-160 (Z2): borrowed bytes don't appear in the
-                // legacy cfg(test) `PgCommand`-driven path (no Parse /
-                // SimpleQuery test fixtures route through this enum
-                // post-DEF-269-v2). Keep an explicit arm to fail the
-                // build if a future test introduces a borrowed-SQL
-                // path here without updating the observation type.
+                // Borrowed bytes don't appear in the cfg(test)
+                // `PgCommand`-driven path — no `Parse` /
+                // `SimpleQuery` test fixtures route through this
+                // enum. Keep an explicit arm to fail the build if a
+                // future test introduces a borrowed-SQL path here
+                // without updating the observation type.
                 StagedAction::SendBytesBorrowed(_) => Self::SendBytesStatic(b""),
             }
         }
@@ -8046,9 +8008,9 @@ mod compute_push_tests {
         cmd: PgCommand,
         state: ProtoState,
     ) -> (ProtoState, heapless::Vec<StagedObs, MAX_ACTIONS_PER_CALL>) {
-        // DEF-186 perf-recovery: compute_push takes &mut state now.
-        // Closure captures &mut state_var to mutate in place; returns
-        // the obs vec. After closure, state_var holds the post-push
+        // `compute_push` takes `&mut state`. Closure captures
+        // `&mut state_var` to mutate in place; returns the obs
+        // vec. After closure, `state_var` holds the post-push
         // state.
         let mut wb = WriteBuf::new();
         let mut state_var = state;
@@ -8078,8 +8040,9 @@ mod compute_push_tests {
         let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_id) };
         let (new_state, staged) = compute_staged(cmd, ProtoState::Idle);
 
-        // Action: exactly one SendBytes whose payload is SYNC_WIRE_BYTES.
-        // DEF-094: Ping from Idle emits the static SYNC const.
+        // Action: exactly one SendBytes whose payload is
+        // `SYNC_WIRE_BYTES` — Ping from Idle emits the static
+        // Sync wire-bytes const.
         assert_eq!(staged.len(), 1);
         assert!(
             matches!(
@@ -8095,13 +8058,12 @@ mod compute_push_tests {
 
     #[test]
     fn ping_from_errored_preserves_kind_and_fails_with_connection_already_closed() {
-        // DEF-061 semantic: on push against Errored, we emit a
-        // `ConnectionAlreadyClosed { prior_kind }` — the full original
-        // cause was surfaced in the earlier FailReply (when the
-        // connection was first torn down). The state retains only the
-        // kind (1-byte Copy).
-        // DEF-142 (pass-#8): prior_kind is now `StateErrorKind` — the
-        // AlreadyClosed-free newtype. Test constructs via helper.
+        // On push against `Errored`, the protocol emits a
+        // `ConnectionAlreadyClosed { prior_kind }` — the full
+        // original cause was surfaced in the earlier `FailReply`
+        // (when the connection was first torn down). The state
+        // retains only the kind (1-byte `StateErrorKind`,
+        // `AlreadyClosed`-free newtype over `ErrorKind`).
         use crate::error::ErrorKind;
         let raw_id = nz(102);
         let prior_kind_raw = ErrorKind::Framing;
@@ -8168,7 +8130,7 @@ mod compute_push_tests {
     /// green (exhaustive match still satisfied), runtime drifts.
     #[test]
     fn ping_from_any_connecting_state_fails_with_startup_in_progress() {
-        // ConnectingStartupTrust — no credentials payload (DEF-097).
+        // ConnectingStartupTrust — no credentials payload.
         {
             let raw_prev = nz(201);
             let raw_new = nz(202);
@@ -8191,10 +8153,10 @@ mod compute_push_tests {
             assert_eq!(take_connecting_startup_raw(new_state), Some(raw_prev));
         }
 
-        // ConnectingStartupScram — DEF-184 A10/B22 revert 2026-04-24:
-        // tier-1 variant-carries-field restored. `scram: ScramSession`
-        // lives INSIDE this variant — the variant cannot be constructed
-        // without it.
+        // ConnectingStartupScram — tier-1 variant-carries-field
+        // invariant: `scram: ScramSession` lives INSIDE this
+        // variant and the variant cannot be constructed without
+        // it.
         if let Ok(pw) = crate::password::Password::try_from_bytes(b"pw") {
             let raw_prev = nz(201_050);
             let raw_new = nz(201_051);
@@ -8368,80 +8330,69 @@ mod compute_push_tests {
     }
 
     // -----------------------------------------------------------------
-    // Startup — per-variant policy table  (DEF-246 Phase 2 RETIRED)
+    // Startup — per-variant policy table (structurally collapsed)
     //
-    // The 3 tests previously here
+    // The Startup push lives on `<DisconnectedPhase>::push_startup`
+    // (consume-self) and the type system physically forbids
+    // pushing Startup from any other state — pushing from a
+    // non-Disconnected phase is a method-absent E0599 compile
+    // error, not a `FailReply` runtime classification. So the
+    // 3 prior runtime tests
     // (`startup_from_idle_transitions_and_emits_startup_message`,
     //  `startup_from_errored_preserves_kind_and_fails_with_connection_already_closed`,
     //  `startup_from_non_idle_non_errored_fails_with_startup_in_progress`)
-    // defended the legacy `compute_push_startup` 5-arm dispatcher.
-    // Post-DEF-246 Phase 2 (2026-05-16) the Startup push lives on
-    // `<DisconnectedPhase>::push_startup` (consume-self) and the
-    // type system physically forbids pushing Startup from any other
-    // state — the 3 tests' invariants are STRUCTURALLY IMPOSSIBLE
-    // (`Closed`-state push is a method-absent E0599 compile error,
-    // not a FailReply runtime classification). Tests deleted.
+    // describe invariants that are now STRUCTURALLY IMPOSSIBLE and
+    // have been removed.
     //
-    // The Idle arm (which DID produce real wire-bytes) is preserved
-    // structurally: `<DisconnectedPhase>::push_startup` exercises the
-    // exact same `compute_push_startup_idle_only` body, so the wire
-    // shape is unchanged. Integration tests in
+    // The Idle arm (which DID produce real wire-bytes) is
+    // preserved structurally: `<DisconnectedPhase>::push_startup`
+    // exercises the exact same `compute_push_startup_idle_only`
+    // body, so the wire shape is unchanged. Integration tests in
     // `tests/startup_spec.rs` cover the wire-shape end-to-end.
     // -----------------------------------------------------------------
 
     #[test]
-    #[allow(dead_code, reason = "DEF-246 Phase 2: 3 tests retired (see comment block above). The cfg(test) `compute_push_startup` helper that drove the Idle/Errored/Connecting/PingAwaiting/BusyQuery decision table is also retired — the new typed entry point `<DisconnectedPhase>::push_startup` is consume-self, so non-Idle dispatches are E0599 at compile time.")]
-    fn _def246_phase2_startup_dispatch_table_retired_compile_anchor() {
-        // Placeholder test: exists only so a grep for `fn startup_from_`
-        // in protocol.rs lands here with the retired-block comment
-        // above. No body — empty test passes trivially.
+    #[allow(dead_code, reason = "Placeholder anchor: the 3 prior `startup_from_*` runtime tests defended the legacy `compute_push_startup` 5-arm dispatcher (Idle/Errored/Connecting/PingAwaiting/BusyQuery). The typed entry point `<DisconnectedPhase>::push_startup` is consume-self, so non-Idle dispatches are E0599 at compile time — the runtime tests would describe invariants that are now structurally impossible. This anchor exists so a grep for `fn startup_from_` in protocol.rs lands here with the explainer block above.")]
+    fn _startup_dispatch_table_collapsed_compile_anchor() {
+        // Empty body — the test exists only as a comment anchor.
     }
 
     // ═════════════════════════════════════════════════════════════
-    // DEF-154 (B) Phase B4-W P0-3 + P2 — ParamsWriterOverflow
-    // classified-Err end-to-end routing test
+    // ParamsWriterOverflow classified-Err end-to-end routing test
     // ═════════════════════════════════════════════════════════════
 
     /// A user-space `ParamsWriter` that always returns
-    /// `Err(WriteBufFull)` — simulating a buggy / adversarial impl
-    /// whose `write_params` overflows its advertised budget.
+    /// `Err(WriteBufFull)` — simulating a buggy / adversarial
+    /// impl whose `write_params` overflows its advertised budget.
     /// Exercises the classified-Err path: `build_bind_message` →
-    /// `CrateBugLocus::ParamsWriterOverflow` →
-    /// `try_builder!` macro → `FailReply + CloseSocket + Errored`.
+    /// `CrateBugLocus::ParamsWriterOverflow` → `try_builder!`
+    /// macro → `Result::Err(PushFailure)` + atomic transition to
+    /// `Errored`.
     ///
-    /// Pre-P0-3 the `Err` was silently discarded with
-    /// `debug_assert!(false, …)`, shipping a truncated Bind frame
-    /// with miscomputed length prefix in release — tier-4 silent
-    /// wire-level corruption. This test pins the classified
-    /// routing end-to-end: a failing ParamsWriter MUST produce
-    /// `Action::FailReply` + `Action::CloseSocket`, NOT a broken
+    /// A naive `debug_assert!(false, …)` in the Err arm would be
+    /// dev-loud + release-silent — it would ship a truncated Bind
+    /// frame with miscomputed length prefix to the wire (tier-4
+    /// silent wire-level corruption). This test pins the
+    /// classified routing end-to-end: a failing `ParamsWriter`
+    /// MUST surface as `Result::Err(PushFailure)` with the
+    /// connection transitioned to `Errored`, NOT a broken
     /// Bind/Execute/Sync triplet.
     #[test]
     fn bind_execute_params_overflow_routes_to_classified_failreply() {
         use crate::error::{CrateBugLocus, ProtocolError};
         use crate::params::OverflowParams;
 
-        // DEF-246 Phase 2 (2026-05-16): `PgProtocol::new()` produces
-        // `<DisconnectedPhase>` — for this test we want an
-        // `<ActivePhase>` so we can exercise `push_bind_execute`. The
-        // in-crate cfg(test) path constructs the Active wrapper
-        // directly from `<DisconnectedPhase>::new()` by re-tagging the
-        // phase marker. This is NOT a production bypass: external
-        // crates cannot reach the `inner` field (module-private to
-        // `mod protocol`) and the `phase_marker` is reachable only
-        // from sibling `cfg(test)` code (no `pub`).
-        // DEF-279 Phase 1a (2026-05-18): test-only phase bypass for
-        // `<ActivePhase>` setup without driving the handshake.
-        // Pre-Bundle this borrowed `proto_disconnected.inner` (a
-        // 536-B PgProtocolInner that lived on the Disconnected proto).
-        // Post-Bundle `<DisconnectedPhase>::Inner` is the ZST
-        // `DisconnectedInner` — no PgProtocolInner to extract.
-        // Phase 1c Bundle Commit 8b (2026-05-18): `<ActivePhase>::Inner`
-        // flipped to `ActiveInner`, so the construction goes through
-        // `_proto_init_leaf::fresh_active_inner()` (leaf-private,
-        // `pub(in crate::protocol)`). NOT a production bypass: external
-        // crates cannot reach `fresh_active_inner` (leaf visibility) and
-        // the `phase_marker` is ZST without external construction.
+        // `PgProtocol::new()` produces `<DisconnectedPhase>`, but
+        // this test wants `<ActivePhase>` to exercise
+        // `push_bind_execute`. The in-crate cfg(test) path
+        // constructs the Active wrapper directly through the
+        // leaf-private `_proto_init_leaf::fresh_active_inner()` /
+        // `fresh_active_row_desc_slot()` (`pub(in crate::protocol)`)
+        // with a re-tagged `phase_marker`. NOT a production
+        // bypass: external crates cannot reach the `inner` field
+        // (module-private to `mod protocol`), cannot reach
+        // `fresh_active_inner` (leaf visibility), and
+        // `phase_marker` is ZST without external construction.
         let mut proto: PgProtocol<ActivePhase> = PgProtocol {
             inner: _proto_init_leaf::fresh_active_inner(),
             extras: _proto_init_leaf::fresh_active_row_desc_slot(),
@@ -8449,20 +8400,19 @@ mod compute_push_tests {
         };
         let mut wb = WriteBuf::new();
         let reply_raw = nz(999);
-        // DEF-272 cluster γ: internal test goes through `ReadyGuard`
-        // (the only legitimate path that runtime-classifies state as
-        // Idle via `as_ready`). `push_command_internal` re-checks via
-        // `IdleState::try_from` typestate at entry; production
-        // callers always satisfy the check. Fresh proto is in `Idle`
-        // state so `as_ready()` returns `Some`. The architecturally-
-        // dead `None` arm early-returns to satisfy the lib-level
-        // `clippy::panic` forbid bundle.
+        // The test goes through `ReadyGuard` — the only
+        // legitimate path that runtime-classifies state as `Idle`
+        // via `as_ready`. `push_command_internal` re-checks via
+        // the `IdleState::try_from` typestate at entry; production
+        // callers always satisfy the check. A fresh proto is in
+        // `Idle` state so `as_ready()` returns `Some`. The
+        // architecturally-dead `None` arm early-returns to satisfy
+        // the lib-level `clippy::panic` forbid bundle.
         let Some(guard) = proto.as_ready() else { return };
-        // DEF-160 Z2 (2026-05-11): `push_bind_execute` borrows the
-        // identifier args for the `'w` lifetime that flows into the
-        // returned `OutActions`. Pre-Z2 the args were taken `&_` and
-        // didn't extend their lifetime past the call; post-Z2 named
-        // bindings are required to keep the borrows alive for the
+        // `push_bind_execute` borrows the identifier args for the
+        // `'w` lifetime that flows into the returned
+        // `Result<OutActions, PushFailure>`. Named bindings are
+        // required to keep the borrows alive past the call for the
         // `Result::is_err` inspection below.
         let portal = crate::ident::PortalName::default();
         let stmt = crate::ident::StmtName::default();
@@ -8476,22 +8426,22 @@ mod compute_push_tests {
             &mut wb,
         );
 
-        // DEF-212 (Alt Y'): classified Err routes through
-        // `Result::Err(PushFailure)` instead of pre-(212)'s 2-Action
-        // FailReply+CloseSocket bundle. The atomic state transition
-        // to `Errored` happens inside `push_bind_execute_internal` via
-        // `install_errored`; the caller learns of the failure via the
-        // typed `PushFailure { id, cause }` (~80 B) — no `OutActions`
-        // 800 B return frame, no per-call action iteration.
+        // Classified Err routes through
+        // `Result::Err(PushFailure)`. The atomic state transition
+        // to `Errored` happens inside `push_bind_execute_internal`
+        // via `install_errored`; the caller learns of the failure
+        // via the typed `PushFailure { id, cause }` (~80 B) — no
+        // `OutActions` 800-B return frame, no per-call action
+        // iteration.
         //
-        // Pre-P0-3 silent corruption would have shipped a truncated
-        // Bind frame on the wire (3-action bundle with miscomputed
-        // length-prefix); the post-(212) contract surfaces the
-        // classified failure at the type-system level.
+        // A naive silent-corruption path would have shipped a
+        // truncated Bind frame on the wire (3-action bundle with
+        // miscomputed length-prefix); the typed contract surfaces
+        // the classified failure at the type-system level.
         assert!(
             result.is_err(),
             "ParamsWriter Err must route to Result::Err(PushFailure); \
-             got Ok — pre-P0-3 silent-corruption regression?",
+             got Ok — silent-corruption regression?",
         );
         // Architecturally dead via the assert above; `let-else { return }`
         // is the forbid-bundle-clean dead-arm landing pad (no panic!,
@@ -8500,7 +8450,7 @@ mod compute_push_tests {
 
         assert_eq!(
             failure.id, reply_raw,
-            "PushFailure.id must echo the consumed correlator (DEF-149 ReplyId discipline)",
+            "PushFailure.id must echo the consumed correlator (ReplyId discipline)",
         );
         assert!(
             matches!(
@@ -8524,21 +8474,19 @@ mod compute_push_tests {
     }
 
     // ───────────────────────────────────────────────────────────────
-    // DEF-186 P1-2 (audit 2026-04-24): pin tests for all 5 remaining
-    // compute_push_* Idle-arm transitions.
+    // Pin tests for the remaining `compute_push_*` Idle-arm
+    // transitions.
     //
-    // Pre-DEF-186 the by-value `compute_push_*` signatures forced
-    // every arm to RETURN a ProtoState — a missing transition was a
-    // build error (tier-1 compile). Post-DEF-186 the `&mut state`
-    // signature only requires that the Idle arm WRITE *state =
-    // <next>; preserve arms simply leave state untouched. Adding a
-    // 6th compute_push_* helper that forgets `*state = ...` in the
-    // Idle arm would compile, leaving state unchanged. These pin
-    // tests catch that omission via runtime assertion on the
-    // post-Idle state's variant.
+    // The `&mut state` signatures only require that the Idle arm
+    // WRITE `*state = <next>`; preserve arms simply leave the
+    // state untouched. A naive 6th `compute_push_*` helper that
+    // forgot `*state = ...` in its Idle arm would compile,
+    // leaving state unchanged at runtime. These pin tests catch
+    // that omission via a runtime assertion on the post-Idle
+    // state's variant.
     //
-    // Ping + Startup already covered by tests above; these 5 close
-    // the rest of the surface.
+    // Ping + Startup are already covered by tests above; these
+    // close the rest of the surface.
     // ───────────────────────────────────────────────────────────────
 
     #[test]
@@ -8616,9 +8564,9 @@ mod compute_push_tests {
 
     #[test]
     fn preserve_arms_leave_state_untouched_simple_query() {
-        // DEF-186 P1-2: Errored / preserve arms MUST NOT write *state.
-        // Trip a SimpleQuery against Errored — state must remain at the
-        // EXACT same Errored(prior_kind) it was before.
+        // Errored / preserve arms MUST NOT write `*state`. Trip a
+        // SimpleQuery against `Errored` — state must remain at the
+        // EXACT same `Errored(prior_kind)` it held before.
         use crate::error::{ErrorKind, StateErrorKind};
         let prior_kind = StateErrorKind::from_kind_or_internal(ErrorKind::Framing);
         let raw_id = nz(186_005);
