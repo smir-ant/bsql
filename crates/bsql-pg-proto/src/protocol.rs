@@ -1802,9 +1802,18 @@ impl PgProtocol<DisconnectedPhase> {
         // architecturally distant + no inner.state to write Errored
         // into. The returned NonZeroU64::MIN sentinel is matched by
         // the next-push surface's saturation guard when push_startup
-        // attempts to consume the wrap-mintinted reply id.
+        // attempts to consume the wrap-minted reply id.
+        //
+        // Tier-3 audit #17 (2026-05-19): routed through the typed
+        // `mint_or_saturate` helper. `saturating_add(1)` of a `u64`
+        // has floor `1`, so the `Err(MintSaturated)` arm is
+        // architecturally unreachable — but the typed classifier
+        // captures the contract at type level. A future edit that
+        // swapped `saturating_add` for `wrapping_add` would surface
+        // the saturation case as a typed Err rather than silently
+        // coercing to MIN.
         let raw = raw_old.saturating_add(1);
-        let nz = core::num::NonZeroU64::new(raw)
+        let nz = crate::reply_id::mint_or_saturate(raw)
             .unwrap_or(core::num::NonZeroU64::MIN);
         crate::reply_id::ReplyId::from_raw(nz)
     }

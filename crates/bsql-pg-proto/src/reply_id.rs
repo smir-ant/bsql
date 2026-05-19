@@ -405,6 +405,53 @@ impl<K: ReplyKind> ReplyId<K> {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// Tier-3 audit #17 (2026-05-19) — typed mint helper
+// ═════════════════════════════════════════════════════════════════════
+
+/// Typed saturation classifier for `NonZeroU64` mint from a raw `u64`
+/// counter value.
+///
+/// Pre-audit, the call site at
+/// `protocol.rs::<DisconnectedPhase>::next_reply_id` used the form
+/// `NonZeroU64::new(raw).unwrap_or(NonZeroU64::MIN)` to satisfy
+/// `clippy::unwrap_used` (forbidden crate-wide) on an architecturally-
+/// dead `None` arm: `saturating_add(1)` of a `u64` is never `0`. The
+/// dead-fallback shape didn't surface the "counter saturation reached"
+/// case at type level — a future edit that swapped `saturating_add`
+/// for `wrapping_add` (or any operation that can produce `0`) would
+/// silently activate the dead arm, coercing every reply id to
+/// [`NonZeroU64::MIN`] and colliding with the real id `1`.
+///
+/// `MintSaturated` makes the saturation case classifiable at type
+/// level. The error is `Copy + Debug + PartialEq + Eq` — no
+/// `Display`, no allocation, no payload (the saturation *is* the
+/// state; there is no additional context to carry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MintSaturated;
+
+/// Mint a [`NonZeroU64`] from a raw `u64`, classifying `0` as a
+/// [`MintSaturated`] error (instead of silently coercing to a
+/// fallback sentinel).
+///
+/// # Architectural-deadness contract
+///
+/// The single production call site in `<DisconnectedPhase>::
+/// next_reply_id` (protocol.rs) feeds `raw =
+/// PROCESS_REPLY_ID_COUNTER.fetch_add(1).saturating_add(1)`. The
+/// `saturating_add(1)` floor is `1`, so the `Err(MintSaturated)` arm
+/// is architecturally unreachable in practice — but the typed
+/// classifier puts that contract in the type signature instead of
+/// relying on the caller to remember it.
+///
+/// The actual saturation pinch-point (u64 counter wrap at 2^64
+/// reply ids) is enforced upstream by `saturating_add` at the
+/// counter site, not by this mint helper.
+#[inline]
+pub(crate) fn mint_or_saturate(raw: u64) -> Result<NonZeroU64, MintSaturated> {
+    NonZeroU64::new(raw).ok_or(MintSaturated)
+}
+
 // DEF-154 (K): `Drop for ReplyId<K>` DELETED.
 //
 // Pre-(K), Drop contained a `assert!(self.delivered, ...)` safety
