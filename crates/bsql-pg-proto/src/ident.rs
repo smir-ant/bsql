@@ -1256,10 +1256,9 @@ impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> FixedStr<N, Tag, 
     ///
     /// # Pattern commentary
     ///
-    /// The body is `self.buf.get(..self.len()).unwrap_or(&[])`. This
-    /// is not a defensive-programming kludge — it is the
-    /// minimum-overhead stable-library form that satisfies the crate's
-    /// forbid-bundle simultaneously:
+    /// The body is a `split_at_checked(self.len()) → match` form. This
+    /// is the minimum-overhead stable-library shape that satisfies
+    /// the crate's forbid-bundle simultaneously:
     ///
     /// - `&self.buf[..self.len()]` is rejected by
     ///   `clippy::indexing_slicing`.
@@ -1268,24 +1267,37 @@ impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> FixedStr<N, Tag, 
     /// - `self.buf.get(..self.len()).unwrap()` / `.expect(..)` are
     ///   rejected by the panic / unwrap bans.
     ///
-    /// `self.len ≤ N` by constructor invariant, so `get(..n)` always
-    /// returns `Some`; the `unwrap_or(&[])` branch is
-    /// architecturally unreachable and LLVM eliminates it under any
-    /// non-zero optimisation level. The generated machine code is
-    /// identical to `&self.buf[..self.len()]`.
+    /// `self.len ≤ N` by constructor invariant, so
+    /// `split_at_checked(self.len())` always returns `Some`; the
+    /// `None` arm is architecturally unreachable and LLVM
+    /// eliminates it under any non-zero optimisation level. The
+    /// generated machine code is identical to
+    /// `&self.buf[..self.len()]`.
+    ///
+    /// # Tier-4 Cluster D #54 (2026-05-19)
+    ///
+    /// Pre-audit the body was
+    /// `self.buf.get(..self.len()).unwrap_or(&[])` — same effective
+    /// shape, but the `unwrap_or` form is the audit's "dead-fallback"
+    /// pattern flag. Migrated to `split_at_checked` + match — single
+    /// pattern across [`FixedStr::as_bytes`] and [`PodBytes::as_slice`]
+    /// (mirror site at line 1120). asm-diff: 0 codegen delta.
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         // F-061 (pass-#8): debug-builds assert the invariant
         // `self.len ≤ N` so a constructor that violates the cap
-        // fails tests loudly instead of the dead `unwrap_or(&[])`
-        // masking it to an empty slice.
+        // fails tests loudly instead of the dead `None` arm masking
+        // it to an empty slice.
         debug_assert!(
             self.len() <= N,
             "FixedStr invariant: len ({}) must not exceed N ({N})",
             self.len(),
         );
-        self.buf.get(..self.len()).unwrap_or(&[])
+        match self.buf.split_at_checked(self.len()) {
+            Some((head, _tail)) => head,
+            None => &[],
+        }
     }
 
 }
@@ -1353,6 +1365,18 @@ impl<const N: usize, Tag: ValidUtf8, LenT: crate::bounded::BoundedLen<N>> FixedS
             core::str::from_utf8(bytes).is_ok(),
             "ValidUtf8 tag invariant broken: stored bytes are not UTF-8",
         );
+        // Tier-4 Cluster D #55 (2026-05-19): audit recommendation
+        // ("type the precondition as `Utf8Bytes<'a>` newtype with
+        // private constructor") does NOT fit this shape — the bytes
+        // are *self-borrowed* from the storage buf, not an
+        // input parameter. The `Utf8Bytes<'a>` newtype would have
+        // nothing to wrap. The current `unwrap_or("")` form is the
+        // minimum-overhead stable-Rust shape (see the doc-comment
+        // header above for the full forbid-bundle analysis) and the
+        // dead Err arm is type-safe (empty `&str`, not silent
+        // truncation). `clippy::manual_unwrap_or` would reject a
+        // match-form rewrite as redundant — `unwrap_or` is NOT in
+        // the lib's forbid list, only `unwrap` / `expect` are.
         core::str::from_utf8(bytes).unwrap_or("")
     }
 }

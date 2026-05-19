@@ -4038,8 +4038,18 @@ mod parse_long_uint_swar_tests {
             assert_eq!(
                 parse_long_uint_swar(input),
                 Some(expected),
+                // Tier-4 Cluster D #82 (2026-05-19): pre-audit was
+                // `from_utf8(input).unwrap_or("?")` — fallback dead
+                // for ASCII-decimal test data, but the `"?"` literal
+                // obscured the diagnostic contract. `String::
+                // from_utf8_lossy` (alloc) returns `Cow<'_, str>`
+                // (Borrowed for valid UTF-8, no alloc; Owned with
+                // `U+FFFD` substitution for invalid bytes — stronger
+                // preservation than `"?"`). `core::str::from_utf8_lossy`
+                // doesn't exist (`from_utf8_lossy` is in alloc-only),
+                // so we go through `alloc::string::String`.
                 "input: {:?}",
-                core::str::from_utf8(input).unwrap_or("?"),
+                alloc::string::String::from_utf8_lossy(input),
             );
         }
     }
@@ -4136,7 +4146,32 @@ mod parse_long_uint_swar_tests {
     /// inclusive-range semantic at one of these endpoints.
     #[test]
     fn def_266_long_swar_boundary_digits() {
-        for len in 5..=19usize {
+        // Tier-4 Cluster D #83 (2026-05-19): pre-audit was
+        // `(10_u64).pow(u32::try_from(len).unwrap_or(0)).saturating_sub(1)`
+        // — three layered fallbacks (try_from(usize→u32) Err, pow overflow,
+        // sub overflow) where every Err arm is architecturally dead at
+        // len ≤ 19 but the call sequence obscures intent. Replaced with a
+        // compile-time table of explicit `(len, all-nines-value)` tuples
+        // — no `unwrap_or`, no `pow`, no `try_from`; each case is a literal
+        // pin that a future digit-grouping refactor cannot drift past.
+        let cases: &[(usize, u64)] = &[
+            (5, 99_999),
+            (6, 999_999),
+            (7, 9_999_999),
+            (8, 99_999_999),
+            (9, 999_999_999),
+            (10, 9_999_999_999),
+            (11, 99_999_999_999),
+            (12, 999_999_999_999),
+            (13, 9_999_999_999_999),
+            (14, 99_999_999_999_999),
+            (15, 999_999_999_999_999),
+            (16, 9_999_999_999_999_999),
+            (17, 99_999_999_999_999_999),
+            (18, 999_999_999_999_999_999),
+            (19, 9_999_999_999_999_999_999),
+        ];
+        for &(len, expected) in cases {
             // All-zeros input is valid; value is 0 regardless of length.
             let zeros = "0".repeat(len);
             assert_eq!(
@@ -4146,7 +4181,6 @@ mod parse_long_uint_swar_tests {
             );
             // All-nines input is valid; value = 10^len - 1.
             let nines = "9".repeat(len);
-            let expected: u64 = (10_u64).pow(u32::try_from(len).unwrap_or(0)).saturating_sub(1);
             assert_eq!(
                 parse_long_uint_swar(nines.as_bytes()),
                 Some(expected),

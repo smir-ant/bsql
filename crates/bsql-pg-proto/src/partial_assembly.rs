@@ -475,20 +475,22 @@ impl PartialAssemblyInner {
         // the prefix gets up to PREFIX_CAP - prefix_buf.len() of them.
         let prefix_headroom = PREFIX_CAP.saturating_sub(self.prefix_buf.len());
         let copy_take = core::cmp::min(take, prefix_headroom);
-        // DEF-280 sweep (2026-05-18): explicit bounds-check.
+        // DEF-280 sweep (2026-05-18) + Tier-4 Cluster D #58 (2026-05-19):
+        // single-shot bounds-check via `split_at_checked`.
         // `copy_take = min(take, prefix_headroom)` and `take <= bytes
         // .len()`, so `copy_take <= bytes.len()` by transitive
-        // min-bound; the None arm of `bytes.get(..copy_take)` is
-        // architecturally dead. Pre-Bundle the silent `.unwrap_or(&[])`
-        // masked a future regression on min-arithmetic contracts
-        // (silent prefix-byte loss without wire-desync). Post-Bundle
-        // the explicit pre-check + cold_path marker keeps the fallback
-        // syntactic but tier-1-by-construction-unreachable.
-        let copy_slice: &[u8] = if copy_take > bytes.len() {
-            core::hint::cold_path();
-            &[]
-        } else {
-            bytes.get(..copy_take).unwrap_or(&[])
+        // min-bound; the `None` arm of `split_at_checked(copy_take)` is
+        // architecturally dead. Pre-#58 the explicit `if copy_take >
+        // bytes.len()` + `unwrap_or(&[])` layered two dead checks; the
+        // `split_at_checked` form collapses them into one match while
+        // preserving the fail-closed semantic (no-op copy + counter
+        // still decrements → wire stays in sync) on the dead None arm.
+        let copy_slice: &[u8] = match bytes.split_at_checked(copy_take) {
+            Some((head, _tail)) => head,
+            None => {
+                core::hint::cold_path();
+                &[]
+            }
         };
         // `extend_from_slice` returns `Result<(), _>` on overflow of
         // the const-generic cap. The slicing above (`copy_take =
