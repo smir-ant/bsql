@@ -56,10 +56,14 @@
 //!
 //! Install happens **exactly once** per connection lifetime — at the
 //! dispatch arm that processes the first `ReadyForQuery` ('Z') frame
-//! after the server emits `BackendKeyData` ('K'). Mutation is
-//! token-gated via the leaf submodule
-//! [`crate::protocol::_backend_key_install_leaf::BackendKeyInstallToken`]
-//! (private tuple-struct field — mintable only inside the leaf).
+//! after the server emits `BackendKeyData` ('K'). The dispatch arm
+//! writes `(pid, secret_key)` into `ProtoState::HandshakeReady`
+//! directly; the post-RFQ payload is then consumed structurally by
+//! `<ConnectingPhase>::into_active` into `ActiveInner.backend_key`.
+//! Pre-Phase-1d.2 the install routed through a token-gated
+//! `BackendKeyCell::install_via_token` helper minted in a
+//! `_backend_key_install_leaf` submodule; Phase 1d.2 collapsed both
+//! into the variant payload itself (tier-1 storage-absence proof).
 //!
 //! # `BackendKey` cell payload
 //!
@@ -97,13 +101,15 @@
 
 use crate::sensitive::Sensitive;
 
-/// Cell-level storage for the `(pid, secret_key)` pair captured at
+/// Inline storage for the `(pid, secret_key)` pair captured at
 /// `BackendKeyData` receipt.
 ///
-/// Lives on [`crate::protocol::PgProtocolInner::backend_key`] wrapped
-/// in [`BackendKeyCell`]; installed exactly once per connection via
-/// the token-gated path inside the dispatch arm that processes
-/// `(ConnectingPostAuthHaveKey, 'Z')`. Read on-demand by
+/// Lives directly on [`crate::protocol::ActiveInner::backend_key`]
+/// (non-Option, inline). The dispatch arm at
+/// `(ConnectingPostAuthHaveKey, 'Z')` writes the pair into the
+/// `ProtoState::HandshakeReady { pid, secret_key }` payload;
+/// `<ConnectingPhase>::into_active` then consumes the variant
+/// structurally into this struct. Read on-demand by
 /// [`crate::PgProtocol::<crate::ActivePhase>::with_cancel_request`]
 /// to build the 16-byte wire frame on the function's stack inside a
 /// `Zeroizing<[u8; 16]>` guard.
@@ -116,9 +122,10 @@ use crate::sensitive::Sensitive;
 ///
 /// # Layout
 ///
-/// Inline `{ pid: i32, secret_key: Sensitive<i32> }` = 8 B. The cell's
-/// `Option<BackendKey>` adds a 1 B discriminant + alignment padding —
-/// total cell footprint ≈ 12 B with the discriminant niche.
+/// Inline `{ pid: i32, secret_key: Sensitive<i32> }` = 8 B on
+/// `ActiveInner`. Post-Phase-1d.2 there is no `Option` wrapper —
+/// storage-absence proof via the phase-transition gate makes
+/// "missing key on `<ActivePhase>`" by-type-impossible.
 ///
 /// # Debug
 ///
@@ -140,115 +147,6 @@ impl core::fmt::Debug for BackendKey {
             .field("pid", &self.pid)
             .field("secret_key", &self.secret_key)
             .finish()
-    }
-}
-
-/// `#[repr(transparent)]` newtype wrapper over `Option<BackendKey>`
-/// enforcing tier-1 within-crate write provenance.
-///
-/// Mirror of [`crate::schema_slot::RowDescSlotCell`] /
-/// [`crate::session_params_slot::SessionParamsCell`] /
-/// [`crate::partial_assembly::PartialAssemblyCell`] (token-gated
-/// cell family). The inner `Option<BackendKey>` is private to
-/// `mod cancel`; mutation routes through the token-gated
-/// [`Self::install_at_handshake`] method on a per-leaf concrete token
-/// minted inside
-/// [`crate::protocol::_backend_key_install_leaf`].
-///
-/// # Tier-1 closure
-///
-/// External crates cannot:
-/// - Name the inner `Option` (field privacy — `E0616` on direct
-///   field access).
-/// - Mint a [`crate::protocol::_backend_key_install_leaf::BackendKeyInstallToken`]
-///   (private tuple-struct field — `E0451` on struct literal).
-///
-/// Within-crate, mutations are confined to the dispatch arm that
-/// processes `(ConnectingPostAuthHaveKey, 'Z')`. Other dispatch arms
-/// cannot accidentally install or mutate the key without minting a
-/// token from the leaf.
-///
-/// # Layout
-///
-/// `#[repr(transparent)]` over `Option<BackendKey>`. Byte-identical
-/// to the bare Option; zero-cost wrapping.
-#[repr(transparent)]
-pub(crate) struct BackendKeyCell {
-    inner: Option<BackendKey>,
-}
-
-impl BackendKeyCell {
-    /// Construct an empty cell. Token-gated to the proto-init leaf
-    /// so a future caller cannot bypass the install-on-handshake
-    /// invariant by minting a pre-populated cell.
-    ///
-    /// Takes a [`crate::protocol::_proto_init_leaf::ProtoInitToken`]
-    /// — the same construction-gate used by all token-gated cells.
-    /// The token is field-private to its leaf submodule, so the only
-    /// call site is
-    /// [`crate::protocol::PgProtocol::<crate::DisconnectedPhase>::new`].
-    #[inline]
-    #[must_use]
-    pub(crate) const fn empty(
-        _token: crate::protocol::_proto_init_leaf::ProtoInitToken,
-    ) -> Self {
-        Self { inner: None }
-    }
-
-    /// Install `(pid, secret_key)` at the dispatch arm that processes
-    /// the first `ReadyForQuery` after `BackendKeyData`. Token-gated to
-    /// [`crate::protocol::_backend_key_install_leaf::BackendKeyInstallToken`]
-    /// so the install site is structurally confined to one leaf.
-    ///
-    /// # Pre-condition (caller-asserted via the token)
-    ///
-    /// The cell SHOULD be empty at install time — the handshake
-    /// passes through `BackendKeyData` exactly once per connection.
-    /// A second install (architecturally impossible) silently
-    /// overwrites; per CREDO §7 axis 4, we do not panic on this
-    /// architecturally-distant case.
-    ///
-    /// # Tier impact
-    ///
-    /// Tier-1 within-crate by token-gating: the only legal caller is
-    /// inside the leaf, which holds the sole token mint expression.
-    #[inline]
-    pub(crate) fn install_via_token(
-        &mut self,
-        _token: &crate::protocol::_backend_key_install_leaf::BackendKeyInstallToken,
-        key: BackendKey,
-    ) {
-        self.inner = Some(key);
-    }
-
-    /// Read-only access to the inner payload for the closure-scoped
-    /// public API
-    /// [`crate::PgProtocol::<crate::ActivePhase>::with_cancel_request`].
-    ///
-    /// Returns `None` before the handshake's `BackendKeyData`/`RFQ`
-    /// pair is processed; `Some` once the dispatch arm installed the
-    /// payload. On `<ActivePhase>`, the runtime invariant is "key is
-    /// always Some" because the only path from `<ConnectingPhase>` to
-    /// `<ActivePhase>` is `into_active(Ok)`, which requires the state
-    /// to be `Idle` — and that state is reached only after the
-    /// dispatch arm at `(ConnectingPostAuthHaveKey, 'Z')` runs the
-    /// install.
-    ///
-    /// **`None` returns** on `<ActivePhase>` are architecturally
-    /// distant: a non-standard PG fork that skipped the `K` frame
-    /// would land in `Idle` without an install. The public API
-    /// surface returns `Option<R>` from `with_cancel_request` so the
-    /// caller models this honestly without a panic.
-    #[inline]
-    #[must_use]
-    pub(crate) fn as_inner(&self) -> Option<&BackendKey> {
-        self.inner.as_ref()
-    }
-}
-
-impl core::fmt::Debug for BackendKeyCell {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_tuple("BackendKeyCell").field(&self.inner).finish()
     }
 }
 

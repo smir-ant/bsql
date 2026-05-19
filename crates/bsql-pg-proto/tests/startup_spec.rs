@@ -282,7 +282,7 @@ fn trust_auth_handshake_end_to_end() {
         }
         other => panic!("expected DeliverReply, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ConnectingState::HandshakeReady));
+    assert!(matches!(proto.state(), ConnectingState::HandshakeReady { .. }));
 
     // Verify session params were recorded.
     assert_eq!(
@@ -879,7 +879,7 @@ fn scram_sha256_handshake_end_to_end() {
         }
         other => panic!("expected DeliverReply(StartupComplete), got {other:?}"),
     }
-    assert!(matches!(proto.state(), ConnectingState::HandshakeReady));
+    assert!(matches!(proto.state(), ConnectingState::HandshakeReady { .. }));
 }
 
 /// Invariant (spec): SCRAM server signature mismatch → classified error.
@@ -1193,7 +1193,7 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
     _ = proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb);
     _ = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert!(
-        matches!(proto.state(), ConnectingState::HandshakeReady),
+        matches!(proto.state(), ConnectingState::HandshakeReady { .. }),
         "handshake should land in HandshakeReady, got {:?}",
         proto.state(),
     );
@@ -1205,7 +1205,7 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
     let out = proto.feed_bytes(&param_status_frame("TimeZone", "America/New_York"), &mut wb);
     assert_eq!(out.len(), 0, "unsolicited PS in Idle emits no actions");
     assert!(
-        matches!(proto.state(), ConnectingState::HandshakeReady),
+        matches!(proto.state(), ConnectingState::HandshakeReady { .. }),
         "state must remain HandshakeReady after unsolicited PS, got {:?}",
         proto.state(),
     );
@@ -1388,7 +1388,7 @@ fn param_status_missing_trailing_nul_classified_as_malformed() {
     let _ = proto.feed_bytes(&backend_key_data_frame(12345, 67890), &mut wb);
     let _ = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     assert!(
-        matches!(proto.state(), ConnectingState::HandshakeReady),
+        matches!(proto.state(), ConnectingState::HandshakeReady { .. }),
         "handshake must complete to HandshakeReady — got {:?}",
         proto.state(),
     );
@@ -1409,7 +1409,7 @@ fn param_status_missing_trailing_nul_classified_as_malformed() {
     // Classified silent-skip — no action emitted, state unchanged.
     assert_eq!(out.len(), 0, "malformed PS is silently dropped, not an action");
     assert!(
-        matches!(proto.state(), ConnectingState::HandshakeReady),
+        matches!(proto.state(), ConnectingState::HandshakeReady { .. }),
         "state preserved through malformed PS",
     );
     // Critical: server_version must remain None. Pre-(184) the
@@ -1580,7 +1580,7 @@ fn cleartext_auth_handshake_end_to_end() {
         }
         other => panic!("expected DeliverReply, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ConnectingState::HandshakeReady));
+    assert!(matches!(proto.state(), ConnectingState::HandshakeReady { .. }));
 }
 
 /// Spec conformance: ErrorResponse mid-cleartext-handshake → tier-3
@@ -1953,7 +1953,7 @@ fn md5_auth_handshake_end_to_end() {
         }
         other => panic!("expected DeliverReply, got {other:?}"),
     }
-    assert!(matches!(proto.state(), ConnectingState::HandshakeReady));
+    assert!(matches!(proto.state(), ConnectingState::HandshakeReady { .. }));
 }
 
 /// Wrong salt length (e.g. 3 bytes instead of 4) → tier-3

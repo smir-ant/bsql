@@ -493,13 +493,13 @@ pub(crate) fn error_arena_or_init(
 /// **Narrowed structure** — no `row_desc_slot` field (no
 /// `RowDescription` is reachable from any Connecting state; every
 /// dispatch arm writing `row_desc_slot` is gated on a
-/// non-Connecting state variant in `dispatch.rs`) and the
-/// `backend_key` cell install is deferred to `into_active` via
-/// [`crate::state::ConnectingState::HandshakeReady`] state-variant
-/// signal — the `(PostAuthHaveKey, RFQ)` dispatch arm parks
-/// `(pid, secret_key)` in the variant data, `into_active` extracts
-/// them and constructs the `BackendKeyCell` on the destination
-/// `ActiveInner`.
+/// non-Connecting state variant in `dispatch.rs`) and no
+/// `backend_key` field. The `(pid, secret_key)` material lives
+/// inline in [`crate::state::ConnectingState::HandshakeReady`]'s
+/// payload during the post-RFQ window: the `(PostAuthHaveKey, RFQ)`
+/// dispatch arm writes the pair into the variant, and `into_active`
+/// consumes the variant structurally to construct the inline
+/// `BackendKey` on the destination `ActiveInner`.
 ///
 /// **Tier-1 closure by storage absence**:
 /// - `<ConnectingPhase>` CANNOT physically hold a non-Connecting
@@ -531,9 +531,15 @@ pub(crate) fn error_arena_or_init(
 /// leaf-gated.
 pub struct ConnectingInner {
     /// State narrowed to [`crate::state::ConnectingState`] variants
-    /// (11 handshake states + transient Errored). **Tier-1 closure**:
+    /// (11 handshake states + `HandshakeReady` post-RFQ transition
+    /// signal + transient Errored). **Tier-1 closure**:
     /// state-variant-in-wrong-phase is impossible by type — Active
     /// variants don't exist in `ConnectingState`.
+    ///
+    /// The `(pid, secret_key)` cancel-key material lives inline in
+    /// `ConnectingState::HandshakeReady { pid, secret_key }` during
+    /// the post-RFQ window. `into_active` consumes the payload
+    /// structurally; there is no separate `backend_key` cell here.
     state: crate::state::ConnectingState,
     /// Inbound wire-byte staging for this connection.
     read_buf: ReadBuf,
@@ -549,11 +555,6 @@ pub struct ConnectingInner {
     /// Spill buffer for oversize ErrorResponse / NoticeResponse
     /// frames during handshake.
     partial_assembly: crate::partial_assembly::PartialAssemblyCell,
-    /// Cancel-key cell. Carried through Connecting so the
-    /// `(PostAuthHaveKey, RFQ)` dispatch arm can park
-    /// `(pid, secret_key)` for `into_active` to extract and
-    /// reconstruct on the destination `ActiveInner`.
-    backend_key: crate::cancel::BackendKeyCell,
     /// Count of malformed frames observed during handshake.
     malformed_frame_count: u32,
     /// `!Sync` witness — `PhantomData<Cell<()>>` makes the type
@@ -596,10 +597,15 @@ pub struct ActiveInner {
     /// Spill buffer for oversize ErrorResponse / NoticeResponse
     /// frames during query execution.
     partial_assembly: crate::partial_assembly::PartialAssemblyCell,
-    /// Cancel-key cell. Installed at handshake completion by
-    /// `<ConnectingPhase>::into_active` (extracted from the
-    /// per-phase Connecting cell during the phase transition).
-    backend_key: crate::cancel::BackendKeyCell,
+    /// Cancel-key payload, **inline non-Option**. Constructed at
+    /// handshake completion by `<ConnectingPhase>::into_active`
+    /// from the `ConnectingState::HandshakeReady { pid, secret_key }`
+    /// variant's payload. Storage-absence proof for tier-1 closure
+    /// on `with_cancel_request<R, F>(&self, f) -> R`: a
+    /// `<ActivePhase>` proto cannot be constructed without a valid
+    /// `BackendKey`, so the prior `Option<R>` return is now `R`
+    /// (infallible).
+    backend_key: crate::cancel::BackendKey,
     /// Count of malformed frames observed during query execution.
     malformed_frame_count: u32,
     /// `!Sync` witness — `PhantomData<Cell<()>>` makes the type
@@ -665,7 +671,6 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
         &'r mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
     pub(in crate::protocol) partial_assembly:
         &'r mut crate::partial_assembly::PartialAssemblyCell,
-    pub(in crate::protocol) backend_key: &'r mut crate::cancel::BackendKeyCell,
     pub(in crate::protocol) malformed_count: &'r mut u32,
 }
 
@@ -1440,7 +1445,6 @@ pub(crate) mod _proto_init_leaf {
             session_params: crate::session_params_slot::SessionParamsCell::empty(token),
             error_arena: None,
             partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
-            backend_key: crate::cancel::BackendKeyCell::empty(token),
             malformed_frame_count: 0,
             sync_marker: super::PhantomData,
         }
@@ -1503,7 +1507,17 @@ pub(crate) mod _proto_init_leaf {
             session_params: crate::session_params_slot::SessionParamsCell::empty(token),
             error_arena: None,
             partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
-            backend_key: crate::cancel::BackendKeyCell::empty(token),
+            // Placeholder backend_key for test-only fixture.
+            // Production construction goes through
+            // `<ConnectingPhase>::into_active` which extracts a real
+            // `(pid, secret_key)` from `ConnectingState::HandshakeReady`'s
+            // payload. The placeholder values here are inert (pid=0
+            // is not a wire-valid PID; the secret_key Sensitive
+            // payload Drop fires on test scope end).
+            backend_key: crate::cancel::BackendKey {
+                pid: 0,
+                secret_key: crate::sensitive::Sensitive::new(0_i32),
+            },
             malformed_frame_count: 0,
             sync_marker: super::PhantomData,
         }
@@ -1974,33 +1988,48 @@ impl PgProtocol<ConnectingPhase> {
                 phase_marker: PhantomData,
             }));
         }
-        if matches!(self.inner.state, ConnectingState::HandshakeReady) {
-            // Materialise ActiveInner from the consumed
-            // ConnectingInner. State opens at `ActiveState::Idle` —
-            // the natural post-handshake state the Connecting
-            // wrapper's `HandshakeReady` signal represents. All
-            // other fields move byte-identically.
-            //
-            // `row_desc_slot` lives on outer
-            // `<ActivePhase>::Extras`; ConnectingInner does not
-            // carry it. Mint a fresh cell via
-            // `_proto_init_leaf::fresh_active_row_desc_slot()` at
-            // this transition boundary — the
-            // cell-is-reset-on-transition invariant means a fresh
-            // empty mint is byte-identical to what a
-            // carry-forward-from-Connecting would have produced
-            // (Connecting LHS arms never write to row_desc_slot, so
-            // even a hypothetical carry-forward starts empty here).
+        // HandshakeReady carries (pid, secret_key) payload from the
+        // dispatch arm at `(PostAuthHaveKey, RFQ)`. Consume the
+        // payload at the phase-transition boundary and construct the
+        // inline `BackendKey` on `ActiveInner` — tier-1 storage-
+        // absence proof for the infallible `with_cancel_request`:
+        // a `<ActivePhase>` proto cannot be constructed without a
+        // valid `BackendKey`.
+        //
+        // `row_desc_slot` lives on outer `<ActivePhase>::Extras`;
+        // `ConnectingInner` does not carry it. Mint a fresh cell via
+        // `_proto_init_leaf::fresh_active_row_desc_slot()` at this
+        // transition boundary.
+        if let ConnectingState::HandshakeReady { .. } = self.inner.state {
             let ConnectingInner {
-                state: _,
+                state,
                 read_buf,
                 session_params,
                 error_arena,
                 partial_assembly,
-                backend_key,
                 malformed_frame_count,
                 sync_marker: _,
             } = self.inner;
+            // `if let` guarded the variant; the destructure here is
+            // architecturally infallible. Use a `let-else` form to
+            // keep the match exhaustive without panic/unwrap (clippy
+            // forbid-bundle bans both).
+            let ConnectingState::HandshakeReady { pid, secret_key } = state else {
+                // Architecturally dead per the outer `if let` proof.
+                // Falls back to an Internal-classified Closed wrapper
+                // — keeps the return type honest without panicking.
+                return Err(IntoActiveError::Closed(PgProtocol {
+                    inner: ClosedInner {
+                        sync_marker: PhantomData,
+                        state_kind: crate::error::StateErrorKind::from_kind_or_internal(
+                            crate::error::ErrorKind::Internal,
+                        ),
+                        error_arena: None,
+                    },
+                    extras: (),
+                    phase_marker: PhantomData,
+                }));
+            };
             return Ok(PgProtocol {
                 inner: ActiveInner {
                     state: crate::state::ActiveState::Idle,
@@ -2008,7 +2037,7 @@ impl PgProtocol<ConnectingPhase> {
                     session_params,
                     error_arena,
                     partial_assembly,
-                    backend_key,
+                    backend_key: crate::cancel::BackendKey { pid, secret_key },
                     malformed_frame_count,
                     sync_marker: PhantomData,
                 },
@@ -2047,11 +2076,12 @@ impl PgProtocol<ConnectingPhase> {
     ///
     /// Returns `true` iff `self.inner.state` is
     /// [`crate::state::ConnectingState::HandshakeReady`] — the
-    /// transition signal written by the per-phase dispatch wrapper
-    /// when the shared dispatch's `(PostAuthHaveKey, RFQ)` arm
-    /// produced post-handshake `ProtoState::Idle`. The
-    /// `BackendKeyCell` install completed atomically with that
-    /// transition.
+    /// payload-carrying transition variant written by the per-phase
+    /// dispatch wrapper when the shared dispatch's
+    /// `(PostAuthHaveKey, RFQ)` arm produced
+    /// `ProtoState::HandshakeReady { pid, secret_key }`. The
+    /// `(pid, secret_key)` material is captured in the variant
+    /// payload at the same moment.
     ///
     /// Future-proof against `ConnectingState` variant additions —
     /// adding a new variant cannot change what "ready" means.
@@ -2060,7 +2090,7 @@ impl PgProtocol<ConnectingPhase> {
     pub fn is_handshake_ready(&self) -> bool {
         matches!(
             self.inner.state,
-            crate::state::ConnectingState::HandshakeReady,
+            crate::state::ConnectingState::HandshakeReady { .. },
         )
     }
 
@@ -2447,86 +2477,6 @@ pub(crate) mod _stream_dropped_mid_stream_drain_leaf {
     }
 }
 
-// ═════════════════════════════════════════════════════════════════════
-// `_backend_key_install_leaf` — one-shot backend-key install.
-//
-// Per-call-site concrete-type token gating the one-shot install of
-// `(pid, secret_key)` into [`crate::cancel::BackendKeyCell`] at the
-// dispatch arm that processes `(ConnectingPostAuthHaveKey, 'Z')`.
-//
-// The tuple-struct field is PRIVATE to the leaf submodule (no
-// `pub(crate)` modifier on the inner `()`), so the `Self(())` literal
-// mint is callable ONLY inside this module. The `BackendKeyCell`
-// names the token type in its `install_via_token` parameter signature
-// but cannot mint a token of its own.
-//
-// Why a `&BackendKeyInstallToken` parameter (not a value): the token
-// is minted once per dispatch call (inside the leaf's
-// [`install_at_dispatch_arm`] helper) and the cell's
-// `install_via_token` borrows it for the duration of the write.
-//
-// Tier-1 within-crate by-construction: the only legal install path
-// is via [`install_at_dispatch_arm`]; no other code site can mint a
-// token to call `BackendKeyCell::install_via_token` directly.
-// ═════════════════════════════════════════════════════════════════════
-
-/// Leaf submodule for the one-shot backend-key install at the
-/// dispatch arm `(ConnectingPostAuthHaveKey, TAG_READY_FOR_QUERY)`.
-/// Hosts the concrete-type token + the helper fn that performs the
-/// install.
-pub(crate) mod _backend_key_install_leaf {
-    /// Leaf-scope token. Field private to the leaf (no `pub(crate)`
-    /// modifier on the inner `()`) — the `Self(())` literal mint is
-    /// callable ONLY inside this module. The type itself is
-    /// `pub(crate)` so
-    /// [`crate::cancel::BackendKeyCell::install_via_token`] can name
-    /// it in its parameter signature.
-    ///
-    /// # Why a separate leaf for one install site
-    ///
-    /// The one-shot install lives at a single dispatch arm, but a
-    /// separate leaf gives:
-    /// - **Tier-1 within-crate by-construction**: any future code
-    ///   trying to install a second key would need to either (a)
-    ///   call the leaf helper (which is fine — it's the legitimate
-    ///   entry point) or (b) mint its own token, which is rejected
-    ///   by the field-private tuple-struct payload at compile time
-    ///   (`E0451`).
-    /// - **Future-extensibility surface**: if a hypothetical follow-up
-    ///   ever needs to clear/re-install the key (e.g. an
-    ///   `<ErroredPhase>::into_disconnected_for_retry`), the leaf
-    ///   gains a second token + helper, keeping the surface tight.
-    pub(crate) struct BackendKeyInstallToken(());
-
-    /// Install `(pid, secret_key)` into the cell at the dispatch
-    /// arm that processes the handshake-complete `ReadyForQuery`
-    /// frame.
-    ///
-    /// Sole legitimate caller is the dispatch arm at
-    /// `(ConnectingPostAuthHaveKey, TAG_READY_FOR_QUERY)` in
-    /// `dispatch.rs`. Token is minted inline and consumed by the
-    /// cell's `install_via_token` method.
-    ///
-    /// # Tier-1 within-crate closure
-    ///
-    /// The leaf submodule path is `pub(crate)` so the dispatch
-    /// module can call it; the token field is leaf-private so no
-    /// outside-the-leaf code can mint one. The only write provenance
-    /// for the cell traces back through this helper.
-    #[inline]
-    pub(in crate) fn install_at_dispatch_arm(
-        cell: &mut crate::cancel::BackendKeyCell,
-        pid: i32,
-        secret_key: crate::sensitive::Sensitive<i32>,
-    ) {
-        let token = BackendKeyInstallToken(());
-        cell.install_via_token(
-            &token,
-            crate::cancel::BackendKey { pid, secret_key },
-        );
-    }
-}
-
 impl PgProtocol<ActivePhase> {
     /// Closure-scoped access to the PostgreSQL §55.2.7 CancelRequest
     /// wire frame.
@@ -2571,11 +2521,15 @@ impl PgProtocol<ActivePhase> {
     ///
     /// # Return semantics
     ///
-    /// - `Some(R)` — handshake-complete: cell holds the installed
-    ///   `(pid, secret_key)`; closure invoked, its `R` returned.
-    /// - `None` — architecturally-distant: a non-standard PG fork
-    ///   that skipped the `K` frame would land in `Idle` without an
-    ///   install. The closure is **not** invoked.
+    /// The accessor is **infallible** — `<ActivePhase>` carries
+    /// `BackendKey { pid, secret_key }` inline on `ActiveInner`,
+    /// constructed by `<ConnectingPhase>::into_active` from the
+    /// consumed `ConnectingState::HandshakeReady { pid, secret_key }`
+    /// payload. The closure is invoked exactly once and its `R` is
+    /// returned. A non-standard PG fork that skipped the `K` frame
+    /// could not reach `<ActivePhase>` (the transition gate requires
+    /// the `HandshakeReady` variant), so the prior `Option<R>` arm
+    /// is structurally unreachable and was removed.
     ///
     /// # Sans-I/O (CREDO §1)
     ///
@@ -2586,7 +2540,7 @@ impl PgProtocol<ActivePhase> {
     ///
     /// # Tier impact
     ///
-    /// - **`Some` arm**: build the array via the const-fn
+    /// - **Hot path**: build the array via the const-fn
     ///   `cancel_request_bytes` (zero alloc), move into Zeroizing
     ///   guard, invoke closure. ≤ 8 ns per `benches/hot_paths.rs`
     ///   floor.
@@ -2602,25 +2556,18 @@ impl PgProtocol<ActivePhase> {
     ///
     /// ```ignore
     /// // Synchronous side-channel write:
-    /// let wrote = active.with_cancel_request(|bytes, pid| {
+    /// active.with_cancel_request(|bytes, pid| {
     ///     log::info!("cancelling pid {pid}");
     ///     side_socket.write_all(bytes)
-    /// });
-    /// match wrote {
-    ///     Some(Ok(())) => {} // bytes scrubbed automatically.
-    ///     Some(Err(e)) => return Err(e.into()),
-    ///     None => return Err(PoolError::NoBackendKey),
-    /// }
+    /// })?; // bytes scrubbed automatically on return.
     /// drop(side_socket); // No response expected on cancel socket.
     ///
     /// // Async pattern (needs owned-copy across .await):
-    /// let owned: Option<[u8; 16]> = active.with_cancel_request(|bytes, _| *bytes);
-    /// if let Some(buf) = owned {
-    ///     side_socket.write_all(&buf).await?;
-    ///     // `buf` is caller-owned; explicit zeroize on drop
-    ///     // (e.g. wrap in `Zeroizing<[u8; 16]>` if scrubbing the
-    ///     // copy matters for the driver's threat model).
-    /// }
+    /// let buf: [u8; 16] = active.with_cancel_request(|bytes, _| *bytes);
+    /// side_socket.write_all(&buf).await?;
+    /// // `buf` is caller-owned; explicit zeroize on drop
+    /// // (e.g. wrap in `Zeroizing<[u8; 16]>` if scrubbing the
+    /// // copy matters for the driver's threat model).
     /// ```
     ///
     /// # Wire correctness
@@ -2656,12 +2603,15 @@ impl PgProtocol<ActivePhase> {
     pub fn with_cancel_request<R>(
         &self,
         f: impl FnOnce(&[u8; 16], i32) -> R,
-    ) -> Option<R> {
-        // Architectural-distant `None` case: standard PG always emits
-        // `K` before `Z`, but a non-standard fork could land here in
-        // `Idle` without an install. Honest modelling > runtime panic
-        // (CREDO §V).
-        let key: &crate::cancel::BackendKey = self.inner.backend_key.as_inner()?;
+    ) -> R {
+        // Tier-1 by storage absence: `<ActivePhase>` cannot be
+        // constructed without a valid `BackendKey` (the only path
+        // is `<ConnectingPhase>::into_active`, which consumes the
+        // `ConnectingState::HandshakeReady { pid, secret_key }`
+        // payload structurally). The `Option<R>` return that the
+        // pre-Phase-1d.2 shape had is gone — there is no None arm
+        // to model.
+        let key: &crate::cancel::BackendKey = &self.inner.backend_key;
         let pid: i32 = key.pid;
         // Copy the i32 out of the cell's Sensitive<i32> into a
         // `Zeroizing<i32>` guard so the stack slot scrubs
@@ -2709,7 +2659,7 @@ impl PgProtocol<ActivePhase> {
         // can prevent the guard's Drop short of `panic = "abort"`
         // (documented gap; the panic-abort hook the crate ships in
         // `crate::panic_hook` covers the documented sites).
-        Some(r)
+        r
     }
 
     /// Mint a fresh `ReplyId<K>` for an outbound command.
@@ -3561,7 +3511,6 @@ where
         session_params: session_params_slot,
         error_arena: error_arena_slot,
         partial_assembly: partial_assembly_slot,
-        backend_key: backend_key_slot,
         malformed_count: malformed_counter,
     } = ctx;
 
@@ -3756,7 +3705,6 @@ where
                 &mut reserved,
                 terminal_row_desc,
                 error_arena_slot,
-                backend_key_slot,
             );
             match outcome {
                 DispatchOutcome::AdvancedSilent => {
@@ -3931,7 +3879,6 @@ where
                         &mut reserved,
                         terminal_row_desc,
                         error_arena_slot,
-                        backend_key_slot,
                     );
                     match outcome {
                         DispatchOutcome::AdvancedSilent => {
@@ -4074,7 +4021,6 @@ pub(in crate::protocol) struct ConnectingDispatchContext<'state, 'r> {
         &'r mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
     pub(in crate::protocol) partial_assembly:
         &'r mut crate::partial_assembly::PartialAssemblyCell,
-    pub(in crate::protocol) backend_key: &'r mut crate::cancel::BackendKeyCell,
     pub(in crate::protocol) malformed_count: &'r mut u32,
 }
 
@@ -4137,7 +4083,6 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
         session_params,
         error_arena,
         partial_assembly,
-        backend_key,
         malformed_count,
     } = ctx;
 
@@ -4187,7 +4132,6 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
             session_params,
             error_arena,
             partial_assembly,
-            backend_key,
             malformed_count,
         },
         bytes,
@@ -4198,28 +4142,29 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
         },
     );
 
-    // Lower: project proto_state back to ConnectingState.
+    // Lower: project proto_state back to ConnectingState. The
+    // `TryFrom<ProtoState> for ConnectingState` impl handles
+    // `ProtoState::HandshakeReady { pid, secret_key }` directly
+    // (Ok arm) — the post-handshake transition signal flows through
+    // the standard projection now that the variant carries its
+    // payload.
     match ConnectingState::try_from(proto_state) {
         Ok(cs) => *state = cs,
-        Err(WrongPhase { recovered }) => match recovered {
-            // Legitimate `(PostAuthHaveKey, RFQ)` handshake success.
-            ProtoState::Idle => *state = ConnectingState::HandshakeReady,
+        Err(WrongPhase { recovered }) => {
             // Defensive arm — dispatch produced a state shape not
             // reachable from a Connecting LHS under current dispatch
             // arms. Drain any `ReplyId<K>` carried in the variant
             // (Drop-guard discipline; `match { Some(_) | None => {} }`
             // form per crate convention) and tear down to Errored.
-            other => {
-                match other.take_inflight_reply_raw_id() {
-                    Some(_) | None => {}
-                }
-                *state = ConnectingState::Errored(
-                    crate::error::StateErrorKind::from_kind_or_internal(
-                        crate::error::ErrorKind::Internal,
-                    ),
-                );
+            match recovered.take_inflight_reply_raw_id() {
+                Some(_) | None => {}
             }
-        },
+            *state = ConnectingState::Errored(
+                crate::error::StateErrorKind::from_kind_or_internal(
+                    crate::error::ErrorKind::Internal,
+                ),
+            );
+        }
     }
 
     actions
@@ -4253,7 +4198,6 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
         &'r mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
     pub(in crate::protocol) partial_assembly:
         &'r mut crate::partial_assembly::PartialAssemblyCell,
-    pub(in crate::protocol) backend_key: &'r mut crate::cancel::BackendKeyCell,
     pub(in crate::protocol) malformed_count: &'r mut u32,
 }
 
@@ -4289,7 +4233,6 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         session_params,
         error_arena,
         partial_assembly,
-        backend_key,
         malformed_count,
     } = ctx;
 
@@ -4312,7 +4255,6 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
             session_params,
             error_arena,
             partial_assembly,
-            backend_key,
             malformed_count,
         },
         bytes,
@@ -4423,7 +4365,7 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_connecting<'w, 'r>(
         return FeedEvent::Close;
     }
 
-    if matches!(*ctx.state, ConnectingState::HandshakeReady)
+    if matches!(*ctx.state, ConnectingState::HandshakeReady { .. })
         && ctx.read_buf.unread().is_empty()
     {
         return FeedEvent::Idle;
@@ -4539,7 +4481,6 @@ impl ConnectingInner {
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 partial_assembly: &mut self.partial_assembly,
-                backend_key: &mut self.backend_key,
                 malformed_count: &mut self.malformed_frame_count,
             },
             bytes,
@@ -4609,7 +4550,6 @@ impl ConnectingInner {
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 partial_assembly: &mut self.partial_assembly,
-                backend_key: &mut self.backend_key,
                 malformed_count: &mut self.malformed_frame_count,
             },
             write_buf,
@@ -4719,7 +4659,6 @@ impl ActiveInner {
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 partial_assembly: &mut self.partial_assembly,
-                backend_key: &mut self.backend_key,
                 malformed_count: &mut self.malformed_frame_count,
             },
             bytes,
@@ -4798,7 +4737,6 @@ impl ActiveInner {
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 partial_assembly: &mut self.partial_assembly,
-                backend_key: &mut self.backend_key,
                 malformed_count: &mut self.malformed_frame_count,
             },
             write_buf,

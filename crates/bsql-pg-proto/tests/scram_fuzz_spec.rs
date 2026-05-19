@@ -355,7 +355,7 @@ fn scram_arbitrary_bytes_never_panic() {
         // parsed) or Errored. Never HandshakeReady / post-auth
         // without going through a valid handshake.
         match proto.state() {
-            ConnectingState::HandshakeReady
+            ConnectingState::HandshakeReady { .. }
             | ConnectingState::PostAuthAwaitingKey(_)
             | ConnectingState::PostAuthHaveKey { .. } => {
                 panic!(

@@ -300,13 +300,6 @@ pub(crate) fn dispatch(
     // that don't reach an ErrorResponse arm pay zero allocation
     // cost.
     error_arena_slot: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
-    // Backend-key cell for the one-shot install at the handshake-
-    // complete arm `(ConnectingPostAuthHaveKey, 'Z')`. Every other
-    // dispatch arm ignores this parameter (the cell is read-only
-    // outside that one arm); the cold-path overhead is zero — the
-    // parameter is a fat pointer passed by `&mut`, no dereference
-    // happens unless the matching arm fires.
-    backend_key_slot: &mut crate::cancel::BackendKeyCell,
 ) -> DispatchOutcome {
     // Snap owned prev for pattern matching; state slot holds the
     // explicit `ProtoState::Idle` placeholder during the match.
@@ -598,19 +591,21 @@ pub(crate) fn dispatch(
             // pipeline; that payload's manual `Debug` impl redacts
             // the field.
             //
-            // Persist `(pid, secret_key)` into the connection-scoped
-            // `backend_key_slot` BEFORE the variant's Sensitive
-            // drops. Re-wraps the secret in a fresh `Sensitive<i32>`
-            // (the variant's wrapper drops + scrubs at arm scope
-            // exit; the cell holds an independent `Sensitive<i32>`
-            // whose drop fires on connection teardown). Two scrub
-            // sites, two `ZeroizeOnDrop` chains — defense-in-depth.
+            // Persist `(pid, secret_key)` directly into the
+            // payload of the post-RFQ transition variant
+            // `ProtoState::HandshakeReady { pid, secret_key }`.
+            // Re-wraps the secret in a fresh `Sensitive<i32>`
+            // (the source variant's `Sensitive<i32>` drops + scrubs
+            // at arm scope exit; the new wrapper inside
+            // `HandshakeReady` rides the state variant's drop glue
+            // forward to `BackendKey.secret_key` on
+            // `<ConnectingPhase>::into_active`). Two scrub sites,
+            // two `ZeroizeOnDrop` chains — defense-in-depth.
             //
             // The install runs inside the success arm only — on
-            // parse-error the cell stays empty and the connection
-            // tears down via `install_errored`. The
-            // `BackendKeyInstallToken` is minted by the leaf helper
-            // (tier-1 within-crate write provenance).
+            // parse-error the variant stays at PostAuthHaveKey-or-
+            // Errored and the connection tears down via
+            // `install_errored`.
             match parse_rfq_payload(payload) {
                 Ok(tx_status) => {
                     // Wrap the local `i32` extraction in
@@ -642,12 +637,27 @@ pub(crate) fn dispatch(
                     // is HRTB-scoped and cannot escape.
                     let secret_key_inner: zeroize::Zeroizing<i32> =
                         zeroize::Zeroizing::new(secret_key.with_inner(|s| *s));
-                    crate::protocol::_backend_key_install_leaf::install_at_dispatch_arm(
-                        backend_key_slot,
+                    // Write the post-handshake transition signal as
+                    // a payload-carrying `ProtoState::HandshakeReady`
+                    // variant. The per-phase Connecting wrapper's
+                    // lower-step projects this into
+                    // `ConnectingState::HandshakeReady { pid,
+                    // secret_key }`, which `into_active` then
+                    // consumes structurally to construct the inline
+                    // `BackendKey` on `ActiveInner` (tier-1 closure
+                    // by storage absence on `with_cancel_request`).
+                    //
+                    // Sensitive<i32> ownership chain: the
+                    // `secret_key_inner` Zeroizing<i32> guard scrubs
+                    // the stack slot at end of arm scope; the new
+                    // `Sensitive::new(...)` wraps a fresh i32 copy
+                    // and rides the state variant's drop glue
+                    // forward to `BackendKey.secret_key` at
+                    // `into_active` time.
+                    *state = ProtoState::HandshakeReady {
                         pid,
-                        crate::sensitive::Sensitive::new(*secret_key_inner),
-                    );
-                    *state = ProtoState::Idle;
+                        secret_key: crate::sensitive::Sensitive::new(*secret_key_inner),
+                    };
                     DispatchOutcome::AdvancedWithAction {
                         action: crate::action::deliver(
                             reply,
@@ -1309,6 +1319,28 @@ pub(crate) fn dispatch(
         // Idle — unsolicited frames are out-of-spec
         // =============================================================
         (ProtoState::Idle, other) => install_errored(state, None, ProtocolError::UnexpectedFrame { tag: other }),
+
+        // =============================================================
+        // HandshakeReady — transition-signal write target
+        //
+        // Architecturally dead at dispatch entry. The
+        // `(PostAuthHaveKey, RFQ)` arm above WRITES this variant
+        // as the post-handshake transition signal; the per-phase
+        // Connecting wrapper's lower-step then projects it to
+        // `ConnectingState::HandshakeReady { pid, secret_key }`
+        // and `into_active` consumes the payload structurally.
+        // Dispatch never re-enters with this variant under intact
+        // invariants — but the exhaustive match needs an arm to
+        // build.
+        // =============================================================
+        (ProtoState::HandshakeReady { pid, secret_key }, _) => {
+            // Preserve the variant verbatim — drop the payload only
+            // at the legitimate consumer (`into_active`). A defensive
+            // install_errored here would scrub the cancel-key
+            // material before the wrapper had a chance to surface it.
+            *state = ProtoState::HandshakeReady { pid, secret_key };
+            DispatchOutcome::AdvancedSilent
+        }
 
         // =============================================================
         // Errored — terminal sink

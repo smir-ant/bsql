@@ -368,6 +368,51 @@ pub enum ProtoState {
         secret_key: crate::sensitive::Sensitive<i32>,
     },
 
+    /// **Post-handshake transition signal**. The
+    /// `(ConnectingPostAuthHaveKey, RFQ)` dispatch arm writes this
+    /// variant carrying the `(pid, secret_key)` payload pulled out
+    /// of the consumed `ConnectingPostAuthHaveKey` variant. The
+    /// per-phase `ConnectingInner` wrapper's lower-step projects
+    /// this back into [`ConnectingState::HandshakeReady`] (the
+    /// per-phase signal variant — same payload shape).
+    ///
+    /// `<ConnectingPhase>::into_active` then consumes the
+    /// `ConnectingState::HandshakeReady` payload and constructs an
+    /// inline `BackendKey { pid, secret_key }` on `ActiveInner` —
+    /// closing the tier-3 `Option<R>` arm on
+    /// [`crate::PgProtocol::<crate::ActivePhase>::with_cancel_request`]
+    /// at construction time instead of at every call site.
+    ///
+    /// **Why a separate ProtoState variant**: the lift+lower path
+    /// for `ConnectingInner.feed_bytes_impl` widens
+    /// `ConnectingState → ProtoState` for the shared dispatch body.
+    /// Without this variant, the dispatch arm would have to write
+    /// `ProtoState::Idle` (the post-handshake state) and stash the
+    /// payload in a side-channel slot for the lower-step to read.
+    /// The dedicated variant threads the payload through `ProtoState`
+    /// itself, eliminating the side-channel.
+    ///
+    /// **Not reachable from `<ActivePhase>` dispatch**: the
+    /// `TryFrom<ProtoState> for ActiveState` arm returns
+    /// `Err(WrongPhase)` for this variant — Active dispatch never
+    /// writes it (handshake is already done by the time we're on
+    /// `<ActivePhase>`).
+    ///
+    /// Manual `Debug` impl redacts `secret_key` via
+    /// `Sensitive<i32>`'s `Debug`.
+    HandshakeReady {
+        /// The backend process ID (wire-public; safe to print).
+        pid: i32,
+        /// The backend secret key for cancel requests.
+        ///
+        /// Wrapped in [`crate::sensitive::Sensitive`] for
+        /// zero-on-drop scrub when this variant drops (e.g. when
+        /// the dispatch wrapper consumes it via `mem::replace`).
+        /// See variant docstring on
+        /// [`Self::ConnectingPostAuthHaveKey`].
+        secret_key: crate::sensitive::Sensitive<i32>,
+    },
+
     // ---------------------------------------------------------------
     // Simple Query flow (PgCommand::SimpleQuery)
     // ---------------------------------------------------------------
@@ -734,7 +779,10 @@ impl ProtoState {
         // any post-error in-flight replies that survived the
         // transition. Until then this `None` is correct.
         match self {
-            Self::Idle | Self::DrainRfqAfterError | Self::Errored(_) => None,
+            Self::Idle
+            | Self::DrainRfqAfterError
+            | Self::Errored(_)
+            | Self::HandshakeReady { .. } => None,
             Self::PingAwaitingRfq(id) => Some(id.consume()),
             Self::ConnectingStartupTrust { reply }
             | Self::ConnectingStartupScram { reply, .. }
@@ -829,7 +877,8 @@ impl ProtoState {
             | Self::ConnectingCleartextAwaitingAuthOk(_)
             | Self::ConnectingMd5AwaitingAuthOk(_)
             | Self::ConnectingPostAuthAwaitingKey(_)
-            | Self::ConnectingPostAuthHaveKey { .. } => StatePushClass::Connecting,
+            | Self::ConnectingPostAuthHaveKey { .. }
+            | Self::HandshakeReady { .. } => StatePushClass::Connecting,
             Self::SimpleQueryAwaitingFirstResponse(_)
             | Self::SimpleQueryStreamingRows { .. }
             | Self::SimpleQueryAwaitingRfq { .. }
@@ -1003,37 +1052,41 @@ pub enum ConnectingState {
         secret_key: crate::sensitive::Sensitive<i32>,
     },
     /// **Per-phase transition signal**. The handshake's
-    /// `(PostAuthHaveKey, RFQ)` dispatch arm transitions `ProtoState`
-    /// to `Idle` (post-handshake) AND installs the backend-key cell.
-    /// The shared dispatch body operates on `ProtoState`; the
-    /// per-phase `ConnectingInner` wrapper lifts state into
-    /// `ProtoState` before dispatch and projects back via [`TryFrom`]
-    /// after. The `ProtoState::Idle` has no `ConnectingState` mirror,
-    /// so `TryFrom` rejects it — the rejection is caught at the
-    /// per-phase `feed_bytes_impl`'s epilogue and translated to
-    /// **this variant** as the transition signal.
-    /// `<ConnectingPhase>::into_active` observes this variant and
-    /// lifts the wrapper to `<ActivePhase>` (the `BackendKeyCell`
-    /// install was already completed by the dispatch arm; into_active
-    /// only needs to materialise the new `PgProtocolInner` wrapper).
+    /// `(PostAuthHaveKey, RFQ)` dispatch arm writes
+    /// [`ProtoState::HandshakeReady`] carrying the `(pid, secret_key)`
+    /// payload extracted from the consumed `PostAuthHaveKey`. The
+    /// per-phase `ConnectingInner` wrapper's lower-step projects
+    /// the `ProtoState::HandshakeReady` outcome back into THIS
+    /// `ConnectingState::HandshakeReady` variant (same payload
+    /// shape; `TryFrom<ProtoState> for ConnectingState` does the
+    /// mapping).
     ///
-    /// **Unit variant — no payload**. The `(pid, secret_key)` material
-    /// already lives in [`crate::protocol::ConnectingInner`]'s
-    /// `backend_key` cell at this point (installed atomically with
-    /// the dispatch arm's `*state = Idle` write). No retention
-    /// surface — tier elevation preserved by the cell's existing
-    /// zero-on-drop chain.
+    /// `<ConnectingPhase>::into_active` consumes this variant's
+    /// payload and constructs an inline `BackendKey { pid,
+    /// secret_key }` on `ActiveInner` — closing the tier-3
+    /// `Option<R>` arm on
+    /// [`crate::PgProtocol::<crate::ActivePhase>::with_cancel_request`]
+    /// at construction time.
     ///
-    /// **No `ProtoState` mirror** — `HandshakeReady` exists only in
-    /// the per-phase `ConnectingState`. The
-    /// `From<ConnectingState> for ProtoState` impl's arm for this
-    /// variant maps to `ProtoState::Idle` (the post-handshake state
-    /// the dispatch body actually saw). The round-trip via TryFrom
-    /// then maps `ProtoState::Idle → ActiveState::Idle` (legitimate
-    /// — handshake DID complete) — which means the
-    /// roundtrip-via-ConnectingState test excludes this variant
-    /// (architecturally non-roundtripping).
-    HandshakeReady,
+    /// **Payload-carrying variant**. The `(pid, secret_key)`
+    /// material flows: dispatch arm → `ProtoState::HandshakeReady`
+    /// → `ConnectingState::HandshakeReady` (this variant) →
+    /// `ActiveInner.backend_key: BackendKey` (inline at
+    /// `into_active`). No `BackendKeyCell` exists post-Phase-1d.2
+    /// — the payload lives in the state variant during transition
+    /// and is consumed structurally at `into_active`.
+    HandshakeReady {
+        /// The backend process ID (wire-public; safe to print).
+        pid: i32,
+        /// The backend secret key for cancel requests.
+        ///
+        /// Wrapped in [`crate::sensitive::Sensitive`] for
+        /// zero-on-drop scrub when this variant drops (e.g. on
+        /// `mem::replace` during a state transition, or at
+        /// `into_active` when the payload is consumed into
+        /// `BackendKey`'s inline `secret_key` field).
+        secret_key: crate::sensitive::Sensitive<i32>,
+    },
     /// Transient `install_errored` write while wrapper is still
     /// `<ConnectingPhase>`. Lifted to `<ClosedPhase>` via
     /// `into_closed_if_errored`.
@@ -1092,7 +1145,11 @@ impl core::fmt::Debug for ConnectingState {
                 .field("reply", reply)
                 .field("pid", pid)
                 .finish_non_exhaustive(),
-            Self::HandshakeReady => f.write_str("HandshakeReady"),
+            Self::HandshakeReady { pid, secret_key } => f
+                .debug_struct("HandshakeReady")
+                .field("pid", pid)
+                .field("secret_key", secret_key)
+                .finish(),
             Self::Errored(kind) => write!(f, "Errored({kind:?})"),
         }
     }
@@ -1254,15 +1311,16 @@ impl From<ConnectingState> for ProtoState {
                 pid,
                 secret_key,
             },
-            // HandshakeReady maps to Idle (the post-handshake
-            // ProtoState that dispatch produced before the per-phase
-            // wrapper translated it to this signal variant). Used at
-            // the `feed_bytes_impl` epilogue when re-lifting state
-            // for the SHARED dispatch path on a subsequent call
-            // (won't happen in practice — the next call goes through
-            // `into_active` first — but the conversion stays
-            // semantically correct).
-            ConnectingState::HandshakeReady => ProtoState::Idle,
+            // `ConnectingState::HandshakeReady → ProtoState::HandshakeReady`:
+            // the same-named ProtoState signal variant carries the
+            // payload directly. Used at the `feed_bytes_impl`
+            // epilogue when re-lifting state for the SHARED dispatch
+            // path on a subsequent call (won't happen in practice —
+            // the next call goes through `into_active` first — but
+            // the conversion stays semantically correct).
+            ConnectingState::HandshakeReady { pid, secret_key } => {
+                ProtoState::HandshakeReady { pid, secret_key }
+            }
             ConnectingState::Errored(k) => ProtoState::Errored(k),
         }
     }
@@ -1346,8 +1404,9 @@ impl ConnectingState {
     /// exactly one consume-site on the tear-down path" rule.
     ///
     /// **HandshakeReady + Errored** return `None` — neither carries
-    /// a correlator (HandshakeReady is post-RFQ; the reply was
-    /// already consumed at the dispatch arm).
+    /// a `ReplyId`. `HandshakeReady` carries `(pid, secret_key)` but
+    /// the original handshake `ReplyId` was already consumed at the
+    /// dispatch arm that wrote this variant.
     #[allow(
         dead_code,
         reason = "exercised by `#[cfg(test)]` sibling tests; lib-only build sees no production caller — keep the allow until per-phase Inner dispatch wiring routes through this method"
@@ -1355,7 +1414,7 @@ impl ConnectingState {
     #[must_use]
     pub(crate) fn take_inflight_reply_raw_id(self) -> Option<core::num::NonZeroU64> {
         match self {
-            Self::HandshakeReady | Self::Errored(_) => None,
+            Self::HandshakeReady { .. } | Self::Errored(_) => None,
             Self::StartupTrust { reply }
             | Self::StartupScram { reply, .. }
             | Self::StartupCleartext { reply, .. }
@@ -1392,7 +1451,7 @@ impl ConnectingState {
             | Self::Md5AwaitingAuthOk(_)
             | Self::PostAuthAwaitingKey(_)
             | Self::PostAuthHaveKey { .. }
-            | Self::HandshakeReady => StatePushClass::Connecting,
+            | Self::HandshakeReady { .. } => StatePushClass::Connecting,
         }
     }
 }
@@ -1616,6 +1675,9 @@ impl TryFrom<ProtoState> for ConnectingState {
                 pid,
                 secret_key,
             }),
+            ProtoState::HandshakeReady { pid, secret_key } => {
+                Ok(ConnectingState::HandshakeReady { pid, secret_key })
+            }
             ProtoState::Errored(k) => Ok(ConnectingState::Errored(k)),
             other => Err(WrongPhase { recovered: other }),
         }
@@ -1757,6 +1819,7 @@ impl ProtoState {
             | Self::PingAwaitingRfq(_)
             | Self::ConnectingPostAuthAwaitingKey(_)
             | Self::ConnectingPostAuthHaveKey { .. }
+            | Self::HandshakeReady { .. }
             | Self::SimpleQueryAwaitingFirstResponse(_)
             | Self::SimpleQueryStreamingRows { .. }
             | Self::SimpleQueryAwaitingRfq { .. }
@@ -1952,6 +2015,11 @@ impl core::fmt::Debug for ProtoState {
                 .debug_struct("DescribePortalAwaitingRfq")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
+            Self::HandshakeReady { pid, secret_key } => f
+                .debug_struct("HandshakeReady")
+                .field("pid", pid)
+                .field("secret_key", secret_key)
+                .finish(),
             Self::Errored(kind) => write!(f, "Errored({kind:?})"),
         }
     }

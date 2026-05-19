@@ -156,7 +156,7 @@ fn with_cancel_request_lends_16_bytes_matching_pg_wire_spec() {
     // standalone `cancel_request_bytes` builder output for the same
     // inputs (single source of truth for the byte layout).
     let active = fresh_active_via_trust_handshake();
-    let owned: [u8; 16] = match active.with_cancel_request(|bytes, _pid| {
+    let owned: [u8; 16] = active.with_cancel_request(|bytes, _pid| {
         assert_eq!(
             bytes.len(),
             16,
@@ -165,13 +165,7 @@ fn with_cancel_request_lends_16_bytes_matching_pg_wire_spec() {
         // Copy bytes contents into caller-owned [u8; 16]. The borrow
         // does not escape — this is a memcpy, not a reference leak.
         *bytes
-    }) {
-        Some(b) => b,
-        None => panic!(
-            "post-Trust-handshake protocol must have backend_key installed; \
-             with_cancel_request returned None unexpectedly",
-        ),
-    };
+    });
     // Bit-identical to the standalone wire builder.
     assert_eq!(
         owned,
@@ -194,7 +188,7 @@ fn with_cancel_request_lends_big_endian_pid_at_bytes_8_12() {
     let pid: i32 = i32::from_be_bytes([0xAA, 0xBB, 0xCC, 0xDD]);
     let secret: i32 = i32::from_be_bytes([0x11, 0x22, 0x33, 0x44]);
     let active = fresh_active_with_backend_key(pid, secret);
-    let pid_slice_owned: [u8; 4] = match active.with_cancel_request(|bytes, _pid| {
+    let pid_slice_owned: [u8; 4] = active.with_cancel_request(|bytes, _pid| {
         let slice = bytes.get(8..12).unwrap_or(&[]);
         let mut buf = [0u8; 4];
         let arr: [u8; 4] = match slice.try_into() {
@@ -203,10 +197,7 @@ fn with_cancel_request_lends_big_endian_pid_at_bytes_8_12() {
         };
         buf.copy_from_slice(&arr);
         buf
-    }) {
-        Some(b) => b,
-        None => panic!("backend_key must be installed post-handshake"),
-    };
+    });
     assert_eq!(
         pid_slice_owned,
         [0xAA, 0xBB, 0xCC, 0xDD],
@@ -223,17 +214,14 @@ fn with_cancel_request_lends_big_endian_secret_key_at_bytes_12_16() {
     let pid: i32 = i32::from_be_bytes([0xAA, 0xBB, 0xCC, 0xDD]);
     let secret: i32 = i32::from_be_bytes([0x11, 0x22, 0x33, 0x44]);
     let active = fresh_active_with_backend_key(pid, secret);
-    let secret_slice_owned: [u8; 4] = match active.with_cancel_request(|bytes, _pid| {
+    let secret_slice_owned: [u8; 4] = active.with_cancel_request(|bytes, _pid| {
         let slice = bytes.get(12..16).unwrap_or(&[]);
         let arr: [u8; 4] = match slice.try_into() {
             Ok(a) => a,
             Err(_) => panic!("bytes[12..16] must be exactly 4 bytes — got {slice:?}"),
         };
         arr
-    }) {
-        Some(b) => b,
-        None => panic!("backend_key must be installed post-handshake"),
-    };
+    });
     assert_eq!(
         secret_slice_owned,
         [0x11, 0x22, 0x33, 0x44],
@@ -248,7 +236,7 @@ fn with_cancel_request_lends_big_endian_secret_key_at_bytes_12_16() {
 #[test]
 fn with_cancel_request_lends_magic_version_field_at_bytes_4_8() {
     let active = fresh_active_via_trust_handshake();
-    let magic_owned: u32 = match active.with_cancel_request(|bytes, _pid| {
+    let magic_owned: u32 = active.with_cancel_request(|bytes, _pid| {
         let slice = bytes.get(4..8).unwrap_or(&[]);
         let arr: [u8; 4] = match slice.try_into() {
             Ok(a) => a,
@@ -261,10 +249,7 @@ fn with_cancel_request_lends_magic_version_field_at_bytes_4_8() {
             "magic-version field must equal CANCEL_REQUEST_VERSION = 80877102 BE",
         );
         u32::from_be_bytes(arr)
-    }) {
-        Some(v) => v,
-        None => panic!("backend_key must be installed post-handshake"),
-    };
+    });
     assert_eq!(
         magic_owned,
         bsql_pg_proto::wire::CANCEL_REQUEST_VERSION,
@@ -279,17 +264,14 @@ fn with_cancel_request_lends_magic_version_field_at_bytes_4_8() {
 #[test]
 fn with_cancel_request_lends_length_field_16_at_bytes_0_4() {
     let active = fresh_active_via_trust_handshake();
-    let declared: u32 = match active.with_cancel_request(|bytes, _pid| {
+    let declared: u32 = active.with_cancel_request(|bytes, _pid| {
         let slice = bytes.get(0..4).unwrap_or(&[]);
         let arr: [u8; 4] = match slice.try_into() {
             Ok(a) => a,
             Err(_) => panic!("bytes[0..4] must be exactly 4 bytes — got {slice:?}"),
         };
         u32::from_be_bytes(arr)
-    }) {
-        Some(v) => v,
-        None => panic!("backend_key must be installed post-handshake"),
-    };
+    });
     assert_eq!(
         declared, 16,
         "length field must equal 16 (length includes self per PG protocol)",
@@ -355,14 +337,20 @@ fn zeroizing_guard_has_drop_glue() {
 #[test]
 fn with_cancel_request_invokes_closure_with_post_handshake_creds() {
     // The shared helper drives a synthetic Trust handshake with
-    // (12345, 67890). Post-handshake, the backend_key cell must be
-    // installed and `with_cancel_request` must invoke its closure.
+    // (12345, 67890). Post-handshake, `<ActivePhase>` carries
+    // `BackendKey` inline (storage-absence proof on `into_active`),
+    // so `with_cancel_request` is infallible — the call returning
+    // here is the proof the closure was invoked.
     let active = fresh_active_via_trust_handshake();
-    let invoked = active.with_cancel_request(|_bytes, _pid| ());
-    assert!(
-        invoked.is_some(),
-        "post-Trust-handshake protocol must have backend_key cell installed; \
-         with_cancel_request returned None",
+    let counter = core::cell::Cell::new(0_u32);
+    active.with_cancel_request(|_bytes, _pid| {
+        counter.set(counter.get() + 1);
+    });
+    assert_eq!(
+        counter.get(),
+        1,
+        "post-Trust-handshake `with_cancel_request` must invoke the \
+         closure exactly once (infallible accessor on ActivePhase)",
     );
 }
 
@@ -376,10 +364,7 @@ fn with_cancel_request_passes_handshake_pid_to_closure() {
     // the BackendKeyData frame; the closure's `pid` arg must be
     // exactly that value.
     let active = fresh_active_via_trust_handshake();
-    let pid_seen: i32 = match active.with_cancel_request(|_bytes, pid| pid) {
-        Some(p) => p,
-        None => panic!("backend_key must be installed post-handshake"),
-    };
+    let pid_seen: i32 = active.with_cancel_request(|_bytes, pid| pid);
     assert_eq!(
         pid_seen, 12345_i32,
         "with_cancel_request closure's `pid` arg must be the pid installed \
@@ -420,18 +405,9 @@ fn disconnected_protocol_starts_with_no_backend_key() {
 #[test]
 fn with_cancel_request_is_idempotent_across_calls() {
     let active = fresh_active_via_trust_handshake();
-    let first: [u8; 16] = match active.with_cancel_request(|bytes, _pid| *bytes) {
-        Some(b) => b,
-        None => panic!("backend_key must be installed post-handshake"),
-    };
-    let second: [u8; 16] = match active.with_cancel_request(|bytes, _pid| *bytes) {
-        Some(b) => b,
-        None => panic!("second read must succeed post-handshake — accessor takes &self"),
-    };
-    let third: [u8; 16] = match active.with_cancel_request(|bytes, _pid| *bytes) {
-        Some(b) => b,
-        None => panic!("third read must succeed post-handshake"),
-    };
+    let first: [u8; 16] = active.with_cancel_request(|bytes, _pid| *bytes);
+    let second: [u8; 16] = active.with_cancel_request(|bytes, _pid| *bytes);
+    let third: [u8; 16] = active.with_cancel_request(|bytes, _pid| *bytes);
     assert_eq!(
         first, second,
         "with_cancel_request must be pure — two consecutive calls produce identical bytes",
@@ -453,14 +429,8 @@ fn with_cancel_request_takes_shared_ref_does_not_consume_protocol() {
     // (the cell is read-only via this accessor; the underlying
     // backend_key persists across reads).
     let active = fresh_active_via_trust_handshake();
-    let first_pid: i32 = match active.with_cancel_request(|_b, pid| pid) {
-        Some(p) => p,
-        None => panic!("first read must succeed post-handshake"),
-    };
-    let second_pid: i32 = match active.with_cancel_request(|_b, pid| pid) {
-        Some(p) => p,
-        None => panic!("second read must succeed post-handshake — accessor takes &self"),
-    };
+    let first_pid: i32 = active.with_cancel_request(|_b, pid| pid);
+    let second_pid: i32 = active.with_cancel_request(|_b, pid| pid);
     assert_eq!(
         first_pid, second_pid,
         "pid must be stable across consecutive reads (cell is &self-stable)",
@@ -499,7 +469,7 @@ fn with_cancel_request_closure_panic_propagates_and_leaves_protocol_intact() {
     // panic would otherwise abort the test process under default
     // workspace test-link settings (panic = "unwind" enables this).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = active.with_cancel_request(|_bytes, _pid| {
+        active.with_cancel_request(|_bytes, _pid| {
             panic!("intentional test panic — Zeroizing guard must scrub on unwind");
         });
     }));
@@ -514,13 +484,7 @@ fn with_cancel_request_closure_panic_propagates_and_leaves_protocol_intact() {
     // succeed (the cell was not corrupted by the unwind because
     // the cell read happens BEFORE the closure runs; the unwind
     // only touches `with_cancel_request`'s stack frame).
-    let bytes_again: [u8; 16] = match active.with_cancel_request(|bytes, _pid| *bytes) {
-        Some(b) => b,
-        None => panic!(
-            "post-unwind protocol state must be unaffected; \
-             with_cancel_request on the same &active should still succeed",
-        ),
-    };
+    let bytes_again: [u8; 16] = active.with_cancel_request(|bytes, _pid| *bytes);
     // Same handshake (pid=12345, secret=67890) — must produce the
     // canonical bytes.
     assert_eq!(
@@ -552,14 +516,11 @@ fn with_cancel_request_caller_may_copy_bytes_contents() {
     // model requires it. The original Zeroizing guard's bytes
     // (inside `with_cancel_request`'s frame) are scrubbed on
     // closure return regardless.
-    let copied: [u8; 16] = match active.with_cancel_request(|bytes, _pid| {
+    let copied: [u8; 16] = active.with_cancel_request(|bytes, _pid| {
         let mut local = [0u8; 16];
         local.copy_from_slice(bytes);
         local
-    }) {
-        Some(b) => b,
-        None => panic!("backend_key must be installed post-handshake"),
-    };
+    });
     assert_eq!(
         copied,
         cancel_request_bytes(12345_i32, 67890_i32),

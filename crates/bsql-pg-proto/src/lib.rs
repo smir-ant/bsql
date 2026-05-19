@@ -233,9 +233,9 @@ pub mod buf;
 pub mod command;
 // PostgreSQL §55.2.7 CancelRequest mechanism. Public surface is
 // the closure-scoped `<ActivePhase>::with_cancel_request` accessor
-// (see `protocol.rs`); internal types (`BackendKey`,
-// `BackendKeyCell`) stay `pub(crate)` and have no public re-export
-// — the closure-scoped lend handles materialisation inline.
+// (see `protocol.rs`); the internal `BackendKey` type stays
+// `pub(crate)` and has no public re-export — the closure-scoped
+// lend handles materialisation inline.
 pub mod cancel;
 pub mod decode;
 mod dispatch;
@@ -420,11 +420,14 @@ pub use wire::cancel_request_bytes;
 // Closure-scoped CancelRequest API. The wire frame is lent
 // through `<ActivePhase>::with_cancel_request(|bytes, pid| ...)`,
 // materialised on the function's stack inside a `Zeroizing<[u8;
-// 16]>` guard. The `BackendKey` / `BackendKeyCell` cell-level
-// types stay `pub(crate)`; no public re-export from `mod cancel`.
-// Retention is structurally impossible (HRTB bounded borrow +
-// stack-local guard) — see `with_cancel_request` doc and the
-// `cancel.rs` module-level docs for the tier-elevation rationale.
+// 16]>` guard. The `BackendKey` cell-level type stays `pub(crate)`;
+// no public re-export from `mod cancel`. Retention is structurally
+// impossible (HRTB bounded borrow + stack-local guard) — see
+// `with_cancel_request` doc and the `cancel.rs` module-level docs
+// for the tier-elevation rationale. Since `<ActivePhase>` carries
+// `BackendKey` inline (constructed from the `HandshakeReady`
+// payload by `<ConnectingPhase>::into_active`), the accessor
+// returns `R` (not `Option<R>`).
 pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 
 // ---------------------------------------------------------------------
@@ -683,7 +686,7 @@ const _: () = assert!(
 //   session_params:             8 B (Option<Box<SessionParams>> niche)
 //   error_arena:                8 B (Option<Box<ErrorArena>> niche)
 //   partial_assembly:           8 B (Option<Box<...>> niche)
-//   backend_key:                8 B (BackendKeyCell over Option<{pid:i32, secret:Sensitive<i32>}>)
+//   backend_key:                8 B (inline BackendKey { pid:i32, secret:Sensitive<i32> } on ActiveInner)
 //   malformed_frame_count:      4 B (inline u32)
 //   sync_marker:                0 B (PhantomData)
 //   alignment padding:        ~16 B (to align(8))
@@ -697,14 +700,15 @@ const _: () = assert!(
 //   - First frame > 256 B:           1 alloc (Box<heapless::Vec<u8, 4096>>).
 //
 // `BackendKey` is `{ pid: i32, secret_key: Sensitive<i32> }` (8 B
-// inline); the cell wraps `Option<BackendKey>` with niche-packing
-// absorbing the Option discriminant into padding. The cell installs
-// once per connection at the dispatch arm
-// `(ConnectingPostAuthHaveKey, 'Z')`; reads are O(1) Option
-// projection. Public API surfaces the cell via the closure-scoped
-// `<ActivePhase>::with_cancel_request<R>(&self, f) -> Option<R>`
-// accessor: the wire-frame Zeroizing<[u8;16]> guard lives on the
-// function's stack, not on `PgProtocolInner` — secret-scrub
+// inline). `<ActivePhase>` carries it directly on `ActiveInner`
+// (non-Option) — construction is the structural consume of
+// `ConnectingState::HandshakeReady { pid, secret_key }` by
+// `<ConnectingPhase>::into_active`, so the storage-absence proof
+// makes a missing key by-type-impossible. Reads are O(1) field
+// projection. Public API surfaces the key via the closure-scoped
+// `<ActivePhase>::with_cancel_request<R>(&self, f) -> R` accessor
+// (infallible): the wire-frame Zeroizing<[u8;16]> guard lives on
+// the function's stack, not on `ActiveInner` — secret-scrub
 // retention is structurally impossible (HRTB closure bound +
 // stack-local guard).
 //
@@ -770,7 +774,7 @@ const _: () = assert!(
 // `ConnectingState` LHS writes it (Extras = ()). PgProtocol<P>
 // = Inner + Extras + ZST phase_marker.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 368,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 360,
     "PgProtocol<ConnectingPhase> layout drift — must equal \
      ConnectingInner (state ConnectingState 48 B + read_buf 264 B + \
      3 cells × 8 B + 1 u32 + alignment) PLUS Extras = () (ZST) PLUS \
