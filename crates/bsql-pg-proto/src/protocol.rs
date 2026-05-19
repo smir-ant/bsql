@@ -1512,7 +1512,7 @@ pub(crate) mod _proto_init_leaf {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-246 Phase 2/3/4 transition surfaces (2026-05-16)
+// Per-phase transition surfaces
 //
 // `<DisconnectedPhase>::push_startup`           consume-self → ConnectingPhase
 // `<ConnectingPhase>::feed_inbound`             1-line delegate to Inner
@@ -1522,15 +1522,14 @@ pub(crate) mod _proto_init_leaf {
 // `<ClosedPhase>::cause`                        accessor — reconstructed ProtocolError
 // `<ActivePhase>::into_closed_if_errored`       consume-self → ClosedPhase | ActivePhase (declared above)
 //
-// Tier elevations (Phase 2+3+4):
+// Tier elevations:
 //   #1: push-before-Startup            → method-absent E0599 on <DisconnectedPhase>::push_*
 //   #2: push-during-Connecting         → method-absent E0599 on <ConnectingPhase>::push_*
 //   #3: Closed absorbs no input        → method-absent E0599 on <ClosedPhase>::feed_*/push_*
 //   #4: feed_inbound surfaces typed err → Result<(), ProtocolError> across all phases that have feed_inbound
 // ═════════════════════════════════════════════════════════════════════
 
-/// DEF-246 Phase 3 (2026-05-16) — error returned by
-/// [`PgProtocol::<ConnectingPhase>::into_active`].
+/// Error returned by [`PgProtocol::<ConnectingPhase>::into_active`].
 ///
 /// The protocol is consumed by the transition; both arms carry the
 /// state needed for the caller to recover or terminate:
@@ -1551,21 +1550,19 @@ pub(crate) mod _proto_init_leaf {
 /// classifier returning the `Ok` arm.
 #[expect(
     missing_debug_implementations,
-    reason = "DEF-246 Phase 3: both variants carry PgProtocol wrappers with phase-typed markers; \
+    reason = "Both variants carry PgProtocol wrappers with phase-typed markers; \
               Debug is implemented blanket-style on `PgProtocol<P>`, so emitting one for the \
               enum would either redact (defeating purpose) or print the full inner state. \
               Deferred until a concrete diagnostic surface needs the trait."
 )]
 #[expect(
     clippy::large_enum_variant,
-    reason = "DEF-279 Phase 1b (2026-05-18): variant size asymmetry surfaces post-Bundle — \
-              `StillConnecting` carries the full 536-B `PgProtocol<ConnectingPhase>` while \
-              `Closed` shrinks to 32 B (16-B `ClosedInner` + 16-B alignment with phase marker). \
-              Pre-Bundle both were 536 B. Box-wrapping the larger variant would penalise the \
-              hot recovery path with an alloc on the StillConnecting branch (the typical \
-              mid-handshake retry case). Tracked clippy lint; the size asymmetry is a \
-              by-product of the foundation rethink's per-phase Inner shape, not a design \
-              regression."
+    reason = "Variant size asymmetry: `StillConnecting` carries the full 536-B \
+              `PgProtocol<ConnectingPhase>` while `Closed` shrinks to 32 B (16-B `ClosedInner` \
+              + 16-B alignment with phase marker). Box-wrapping the larger variant would \
+              penalise the hot recovery path with an alloc on the StillConnecting branch (the \
+              typical mid-handshake retry case). The size asymmetry is a by-product of the \
+              per-phase Inner shape, not a design regression."
 )]
 #[must_use = "IntoActiveError consumes the protocol — the caller must observe the variant \
               to recover the typed wrapper or terminate"]
@@ -1580,39 +1577,35 @@ pub enum IntoActiveError {
 }
 
 impl PgProtocol<DisconnectedPhase> {
-    /// DEF-279 Phase 1a (2026-05-18) — pre-Startup the protocol has
-    /// no storage at all (DisconnectedInner is ZST). The diagnostic
-    /// counter is always 0; pre-Bundle this read `inner.error_arena`
-    /// which was always None on a fresh protocol. Tier-1-by-storage-
+    /// `<DisconnectedPhase>` carries no storage (DisconnectedInner is
+    /// ZST), so the diagnostic counter is always 0. Tier-1-by-storage-
     /// absence: the error_arena slot doesn't exist on
-    /// `<DisconnectedPhase>::Inner`.
+    /// `<DisconnectedPhase>::Inner`. A naive shape would read a counter
+    /// field on the Inner — always 0 by state-machine reasoning on a
+    /// pre-Startup wrapper, but reachable via storage.
     #[inline]
     #[must_use]
     pub fn error_arena_overwrite_count(&self) -> u16 {
         0
     }
 
-    /// DEF-279 Phase 1a (2026-05-18) — `<DisconnectedPhase>` is
-    /// pre-Startup; the state is provably `Ready` by storage absence
-    /// (no `inner.state` field on `DisconnectedInner`). Pre-Bundle
-    /// this matched `inner.state.push_class()` which was always
-    /// `Idle → Ready` on a fresh protocol; post-Bundle the answer is
-    /// a compile-time const.
+    /// `<DisconnectedPhase>` is pre-Startup; the state is provably
+    /// `Ready` by storage absence (no `inner.state` field on
+    /// `DisconnectedInner`). The answer is a compile-time const — a
+    /// naive shape would match on `inner.state.push_class()` and
+    /// tautologically resolve to `Idle → Ready`.
     #[inline]
     #[must_use]
     pub fn connection_status(&self) -> crate::guard::ConnectionStatus {
         crate::guard::ConnectionStatus::Ready
     }
 
-    /// DEF-279 Phase 1a (2026-05-18) — `<DisconnectedPhase>::state()`
-    /// always returns `&ProtoState::Idle`. Pre-Bundle this read
-    /// `&self.inner.state` which was tautologically Idle on a fresh
-    /// protocol; post-Bundle the storage doesn't exist
-    /// (`DisconnectedInner` is ZST). The reference points to a
-    /// promoted-static const expression — same `&'static` lifetime
-    /// as the pre-Bundle accessor returned (`&self.inner.state` was
-    /// `&'_ ProtoState` tied to self's lifetime; this is strictly
-    /// longer-lived).
+    /// `<DisconnectedPhase>::state()` always returns
+    /// `&ProtoState::Idle`. The storage doesn't exist
+    /// (`DisconnectedInner` is ZST) — the reference points to a
+    /// promoted-static const expression with `&'static` lifetime
+    /// (strictly longer-lived than a self-borrowed accessor would
+    /// have been).
     #[inline]
     #[must_use]
     pub fn state(&self) -> &ProtoState {
@@ -1622,23 +1615,20 @@ impl PgProtocol<DisconnectedPhase> {
 
     /// Mint a fresh `ReplyId<K>` for the impending Startup push.
     ///
-    /// DEF-279 Phase 1a (2026-05-18): inlined here (was a 1-line
-    /// delegate to `inner.next_reply_id::<K>()`). Pre-Bundle the
-    /// inner had a method on `PgProtocolInner` that combined the
-    /// static AtomicU64 counter increment with a saturation-
-    /// classifier (writes `Errored(StateErrorKind::ReplyIdSaturation)`
-    /// into `inner.state`). On `<DisconnectedPhase>` there is no
-    /// `inner.state` to classify into — `DisconnectedInner` is ZST
-    /// post-Bundle. Saturation here is architecturally distant
-    /// (a connection that exhausted u64 reply ids during the
-    /// disconnect window — i.e., before the very first Startup —
-    /// would have been driven by ~10^19 next_reply_id calls without
-    /// ever calling push_startup, a non-physical workload).
+    /// On `<DisconnectedPhase>` there is no `inner.state` to
+    /// classify saturation into — `DisconnectedInner` is ZST. A
+    /// naive shape would route through a method on Inner that
+    /// combines the counter increment with a saturation-classifier
+    /// writing `Errored(StateErrorKind::ReplyIdSaturation)` into
+    /// `inner.state`; here saturation is architecturally distant (a
+    /// connection that exhausted u64 reply ids during the disconnect
+    /// window — i.e., before the very first Startup — would have
+    /// been driven by ~10^19 next_reply_id calls without ever
+    /// calling push_startup, a non-physical workload).
     ///
     /// **Shared counter pin**: `PROCESS_REPLY_ID_COUNTER` is the
-    /// crate-private static AtomicU64 shared with
-    /// [`PgProtocolInner::next_reply_id`] — process-global
-    /// uniqueness preserved.
+    /// crate-private static AtomicU64 shared with the other phases'
+    /// reply-id mint sites — process-global uniqueness preserved.
     #[inline]
     pub fn next_reply_id<K: crate::reply_id::ReplyKind>(
         &mut self,
@@ -1651,9 +1641,9 @@ impl PgProtocol<DisconnectedPhase> {
         // the next-push surface's saturation guard when push_startup
         // attempts to consume the wrap-minted reply id.
         //
-        // Tier-3 audit #17 (2026-05-19): routed through the typed
-        // `mint_or_saturate` helper. `saturating_add(1)` of a `u64`
-        // has floor `1`, so the `Err(MintSaturated)` arm is
+        // Tier-3 audit #17 (2026-05-19, verified): routed through the
+        // typed `mint_or_saturate` helper. `saturating_add(1)` of a
+        // `u64` has floor `1`, so the `Err(MintSaturated)` arm is
         // architecturally unreachable — but the typed classifier
         // captures the contract at type level. A future edit that
         // swapped `saturating_add` for `wrapping_add` would surface
@@ -1665,8 +1655,7 @@ impl PgProtocol<DisconnectedPhase> {
         crate::reply_id::ReplyId::from_raw(nz)
     }
 
-    /// DEF-246 Phase 2 elevation #1 (2026-05-16) — initiate the
-    /// PostgreSQL startup handshake.
+    /// Initiate the PostgreSQL startup handshake.
     ///
     /// Consume-self transition: the typed `<DisconnectedPhase>` is
     /// converted into `<ConnectingPhase>` on every success path
@@ -1675,15 +1664,6 @@ impl PgProtocol<DisconnectedPhase> {
     /// `advance_one_frame` → `FeedEvent::Close`, then
     /// `<ConnectingPhase>::into_active` returns
     /// `IntoActiveError::Closed`).
-    ///
-    /// # Pre-Phase-2 shape (deleted)
-    ///
-    /// Pre-DEF-246 Phase 2 the entry point was the
-    /// `push_command::Startup` per-command struct +
-    /// `impl PushCommand for Startup` on `<ActivePhase>` (via the
-    /// `ReadyGuard::push_command` typed dispatch). The struct + impl +
-    /// the legacy `PgCommand::Startup` enum variant are deleted in the
-    /// same commit; this method is the only path.
     ///
     /// # Tier-1 closure
     ///
@@ -1710,14 +1690,12 @@ impl PgProtocol<DisconnectedPhase> {
     /// and the build pipeline is const-asserted against the wire
     /// frame), the protocol is destroyed — `Err` carries no recovery
     /// surface. Caller logs the failure and drops the connection.
-    // DEF-246 Phase 2: argument count mirrors compute_push_startup_idle_only's
+    // Argument count mirrors compute_push_startup_idle_only's
     // signature 1:1. Splitting into a struct-arg would obscure the
     // consume-self framing and force an inline destructure at every
-    // callsite (which would defeat the migration ergonomics from the
-    // pre-DEF-246 `Startup { ... }` struct-literal shape). The
-    // returned `Result<_, PushFailure>` carries ~80 B in the Err arm
-    // (below the 128 B threshold); no `result_large_err` exception
-    // needed.
+    // callsite. The returned `Result<_, PushFailure>` carries ~80 B
+    // in the Err arm (below the 128 B threshold); no
+    // `result_large_err` exception needed.
     pub fn push_startup<'w>(
         self,
         user: crate::ident::Ident,
@@ -1733,28 +1711,27 @@ impl PgProtocol<DisconnectedPhase> {
         ),
         crate::action::PushFailure,
     > {
-        // DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): `self.inner`
-        // is the ZST `DisconnectedInner` — no protocol storage pre-
-        // Startup. We materialise a fresh `ConnectingInner` here (the
-        // post-transition per-phase storage). The setter machinery
-        // (`IdleState::try_from` + `idle.into_setter::<StartupPostInstall>()`)
-        // operates on `&mut ProtoState`, so we lift+lower: a local
+        // `self.inner` is the ZST `DisconnectedInner` — no protocol
+        // storage pre-Startup. Materialise a fresh `ConnectingInner`
+        // here (the post-transition per-phase storage). The setter
+        // machinery (`IdleState::try_from` +
+        // `idle.into_setter::<StartupPostInstall>()`) operates on
+        // `&mut ProtoState`, so we lift+lower: a local
         // `proto_state = ProtoState::Idle` provides the setter target;
         // after the setter writes one of the
         // `ConnectingStartup{Trust|Scram|Cleartext|Md5}` variants, we
         // lower the result back to `ConnectingState` and assign it to
         // `new_inner.state` before completing the transition.
         //
-        // `self` is consumed by-value per fn signature (ZST drop is trivial);
-        // structural ownership guarantee — no explicit discard needed.
+        // `self` is consumed by-value per fn signature (ZST drop is
+        // trivial); structural ownership guarantee — no explicit
+        // discard needed.
         let mut new_inner = _proto_init_leaf::fresh_connecting_inner();
 
         write_buf.clear();
-        // `clear_session_residue_for_class` is a no-op on a fresh
-        // ConnectingInner (all cells start empty). Skipped here for
-        // a fresh-inner — equivalent behaviour to the pre-flip
-        // PgProtocolInner version (which called the method as a no-op
-        // "for shape parity"). The method is not implemented on
+        // `clear_session_residue_for_class` is not invoked here: all
+        // cells on a fresh ConnectingInner start empty (the method
+        // would be a no-op). The method is not even implemented on
         // ConnectingInner because the only call site is push_startup
         // which constructs from `fresh_connecting_inner` and never
         // needs the residue clear.
@@ -1783,8 +1760,8 @@ impl PgProtocol<DisconnectedPhase> {
             }
         };
 
-        // DEF-160 Z2: single-pass materialise inside branded closure.
-        // The closure produces the final `Result<OutActions, PushFailure>`
+        // Single-pass materialise inside branded closure. The
+        // closure produces the final `Result<OutActions, PushFailure>`
         // directly — no intermediate StagedActions escape.
         let result: Result<
             crate::action::OutActions<'w, 'static>,
@@ -1854,20 +1831,19 @@ impl PgProtocol<DisconnectedPhase> {
                 },
             );
 
-        // DEF-279 follow-up (2026-05-18): row_desc_slot no longer
-        // exists on ConnectingInner (hoisted off; Extras = () for
-        // ConnectingPhase). The previous `consume_unused_witness`
-        // placeholder is gone — no slot to discharge.
+        // `row_desc_slot` does not exist on ConnectingInner (hoisted
+        // off; Extras = () for ConnectingPhase). No slot witness to
+        // discharge here.
         match result {
             Ok(out) => {
-                // DEF-279 Phase 1c Bundle Commit 8b: lower the lifted
-                // `proto_state` (now a ConnectingStartup{Trust|Scram|
-                // Cleartext|Md5} variant after the setter machinery
-                // wrote it) back to ConnectingState and install on
-                // new_inner. The `TryFrom` is total over the four
-                // ConnectingStartup* variants — they map 1:1 to
-                // ConnectingState::Startup{Trust|Scram|Cleartext|Md5}.
-                // Any other ProtoState here is a setter-machinery bug.
+                // Lower the lifted `proto_state` (now a
+                // ConnectingStartup{Trust|Scram|Cleartext|Md5} variant
+                // after the setter machinery wrote it) back to
+                // ConnectingState and install on new_inner. The
+                // `TryFrom` is total over the four ConnectingStartup*
+                // variants — they map 1:1 to ConnectingState::Startup{
+                // Trust|Scram|Cleartext|Md5}. Any other ProtoState
+                // here is a setter-machinery bug.
                 use crate::state::{ConnectingState, WrongPhase};
                 new_inner.state = match ConnectingState::try_from(proto_state) {
                     Ok(cs) => cs,
@@ -1900,11 +1876,11 @@ impl PgProtocol<DisconnectedPhase> {
 impl PgProtocol<ConnectingPhase> {
     /// Mint a fresh `ReplyId<K>` during the handshake window.
     ///
-    /// DEF-246 Phase 3 (2026-05-16): mirror of
-    /// `<ActivePhase>::next_reply_id`. Useful for pipelined drivers
-    /// that pre-mint correlators before observing `into_active()`'s
-    /// classifier (typically not used during the standard handshake
-    /// but available for advanced pipelined flows).
+    /// Mirror of `<ActivePhase>::next_reply_id`. Useful for
+    /// pipelined drivers that pre-mint correlators before observing
+    /// `into_active()`'s classifier (typically not used during the
+    /// standard handshake but available for advanced pipelined
+    /// flows).
     #[inline]
     pub fn next_reply_id<K: crate::reply_id::ReplyKind>(
         &mut self,
@@ -1912,10 +1888,9 @@ impl PgProtocol<ConnectingPhase> {
         self.inner.next_reply_id::<K>()
     }
 
-    /// DEF-246 Phase 3 elevation #2 (2026-05-16) — append inbound
-    /// auth-flow bytes during the startup handshake.
+    /// Append inbound auth-flow bytes during the startup handshake.
     ///
-    /// 1-line delegate to [`PgProtocolInner::feed_inbound`]. The
+    /// 1-line delegate to the Inner's feed-side body. The
     /// `<ActivePhase>::feed_inbound` mirror exists on
     /// [`PgProtocol<ActivePhase>`] for the post-handshake hot path.
     /// Both phases route through the same byte path.
@@ -1926,16 +1901,14 @@ impl PgProtocol<ConnectingPhase> {
         self.inner.feed_inbound(bytes)
     }
 
-    /// DEF-246 Phase 3 elevation #2 (2026-05-16) — per-event advance
-    /// during handshake.
+    /// Per-event advance during handshake.
     ///
-    /// 1-line delegate to [`PgProtocolInner::advance_one_frame`]
-    /// (same body as `<ActivePhase>::advance_one_frame`). During
-    /// handshake the caller drives this until either
-    /// `FeedEvent::Deliver` (StartupComplete reply) arrives or
-    /// `FeedEvent::Close` (Errored) terminates the connection. The
-    /// public consume-self [`Self::into_active`] then classifies the
-    /// outcome.
+    /// 1-line delegate to the Inner's advance body (same body as
+    /// `<ActivePhase>::advance_one_frame`). During handshake the
+    /// caller drives this until either `FeedEvent::Deliver`
+    /// (StartupComplete reply) arrives or `FeedEvent::Close`
+    /// (Errored) terminates the connection. The public consume-self
+    /// [`Self::into_active`] then classifies the outcome.
     #[must_use = "FeedEvent variants carry side-effect contracts: \
                   SendBytes/Deliver MUST be processed; Fail/Close MUST \
                   trigger socket teardown"]
@@ -1946,8 +1919,7 @@ impl PgProtocol<ConnectingPhase> {
         self.inner.advance_one_frame(write_buf)
     }
 
-    /// DEF-246 Phase 3 elevation #2 (2026-05-16) — batched
-    /// feed-and-dispatch during handshake.
+    /// Batched feed-and-dispatch during handshake.
     ///
     /// Mirror of `<ActivePhase>::feed_bytes` — useful for callers
     /// that prefer the batched OutActions surface over the per-event
@@ -1962,8 +1934,8 @@ impl PgProtocol<ConnectingPhase> {
         self.inner.feed_bytes_impl::<false>(bytes, write_buf, 0)
     }
 
-    /// DEF-246 Phase 3 (2026-05-16) — consume-self transition from
-    /// `<ConnectingPhase>` to `<ActivePhase>`.
+    /// Consume-self transition from `<ConnectingPhase>` to
+    /// `<ActivePhase>`.
     ///
     /// Returns `Ok(PgProtocol<ActivePhase>)` only when the runtime
     /// state is `ProtoState::Idle` (handshake completed via RFQ).
@@ -1987,15 +1959,14 @@ impl PgProtocol<ConnectingPhase> {
     pub fn into_active(mut self) -> Result<PgProtocol<ActivePhase>, IntoActiveError> {
         use crate::state::ConnectingState;
 
-        // DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): per-phase
-        // Inner means `self.inner: ConnectingInner` and
+        // Per-phase Inner means `self.inner: ConnectingInner` and
         // `self.inner.state: ConnectingState`. The Errored arm
-        // matches `ConnectingState::Errored(k)` (not `ProtoState::Errored`);
-        // the success arm observes `ConnectingState::HandshakeReady`
-        // (the per-phase transition signal — `ProtoState::Idle`
-        // mapped to HandshakeReady by the dispatch wrapper's
-        // lower step when the `(PostAuthHaveKey, RFQ)` arm produced
-        // post-handshake Idle).
+        // matches `ConnectingState::Errored(k)` (not
+        // `ProtoState::Errored`); the success arm observes
+        // `ConnectingState::HandshakeReady` (the per-phase transition
+        // signal — `ProtoState::Idle` mapped to HandshakeReady by the
+        // dispatch wrapper's lower step when the
+        // `(PostAuthHaveKey, RFQ)` arm produced post-handshake Idle).
         //
         // Closed arm materialises `ClosedInner` (~16 B) instead of
         // moving the full 504-B `ConnectingInner`. Extract state_kind
@@ -2015,18 +1986,20 @@ impl PgProtocol<ConnectingPhase> {
             }));
         }
         if matches!(self.inner.state, ConnectingState::HandshakeReady) {
-            // DEF-279 Phase 2 Bundle Commit 12: per-phase ActiveInner.
-            // State opens at `ActiveState::Idle` — the natural post-
-            // handshake state the Connecting wrapper's `HandshakeReady`
-            // signal represents. All other fields move byte-identically.
+            // Materialise ActiveInner from the consumed
+            // ConnectingInner. State opens at `ActiveState::Idle` —
+            // the natural post-handshake state the Connecting
+            // wrapper's `HandshakeReady` signal represents. All
+            // other fields move byte-identically.
             //
-            // DEF-279 follow-up (2026-05-18, architect Interpretation B):
-            // row_desc_slot HOISTED to outer `<ActivePhase>::Extras`;
-            // ConnectingInner no longer carries it. Mint a fresh cell
-            // via `_proto_init_leaf::fresh_active_row_desc_slot()` at
-            // this transition boundary — the cell-is-reset-on-transition
-            // invariant means a fresh empty mint is byte-identical to
-            // what a carry-forward-from-Connecting would have produced
+            // `row_desc_slot` lives on outer
+            // `<ActivePhase>::Extras`; ConnectingInner does not
+            // carry it. Mint a fresh cell via
+            // `_proto_init_leaf::fresh_active_row_desc_slot()` at
+            // this transition boundary — the
+            // cell-is-reset-on-transition invariant means a fresh
+            // empty mint is byte-identical to what a
+            // carry-forward-from-Connecting would have produced
             // (Connecting LHS arms never write to row_desc_slot, so
             // even a hypothetical carry-forward starts empty here).
             let ConnectingInner {
@@ -2057,19 +2030,17 @@ impl PgProtocol<ConnectingPhase> {
         Err(IntoActiveError::StillConnecting(self))
     }
 
-    /// DEF-279 Phase 1c Bundle Commit 8b (2026-05-18) — per-phase
-    /// state accessor for diagnostic logging.
+    /// Per-phase state accessor for diagnostic logging.
     ///
-    /// **Return type changed**: `&ProtoState` → `&ConnectingState`.
-    /// The per-phase enum carries only the handshake-reachable
-    /// variants — `ProtoState`'s post-handshake `Active*` variants
-    /// don't exist here. Callers that pattern-matched against
-    /// `ProtoState::Connecting{Startup,Scram,…}*` now match against
-    /// the same-meaning unprefixed `ConnectingState::{Startup,
-    /// Scram,…}*` variants; `ProtoState::Idle` on Connecting
-    /// becomes [`crate::state::ConnectingState::HandshakeReady`]
-    /// (the per-phase transition signal); `ProtoState::Errored(_)`
-    /// becomes `ConnectingState::Errored(_)`.
+    /// Returns `&ConnectingState` — the per-phase enum carries only
+    /// the handshake-reachable variants; `ProtoState`'s
+    /// post-handshake `Active*` variants don't exist here. The
+    /// transition signal `ConnectingState::HandshakeReady` represents
+    /// the post-RFQ "ready to enter Active" state (a naive shape
+    /// would surface this as `ProtoState::Idle` here, but
+    /// open-pattern matching on a wider ProtoState lets future
+    /// post-handshake variants silently slip through into Connecting-
+    /// state code paths).
     ///
     /// **For typed predicates**: callers should prefer
     /// [`Self::is_handshake_ready`] and [`Self::is_errored`] for the
@@ -2082,8 +2053,7 @@ impl PgProtocol<ConnectingPhase> {
         &self.inner.state
     }
 
-    /// DEF-279 Phase 1c Bundle Commit 8b (2026-05-18) — typed
-    /// predicate: handshake successfully completed, ready for
+    /// Typed predicate: handshake successfully completed, ready for
     /// [`Self::into_active`].
     ///
     /// Returns `true` iff `self.inner.state` is
@@ -2092,12 +2062,10 @@ impl PgProtocol<ConnectingPhase> {
     /// when the shared dispatch's `(PostAuthHaveKey, RFQ)` arm
     /// produced post-handshake `ProtoState::Idle`. The
     /// `BackendKeyCell` install completed atomically with that
-    /// transition (Bundle D' tier preservation).
+    /// transition.
     ///
-    /// **Mirrors the pre-Commit-8b pattern**
-    /// `matches!(proto.state(), ProtoState::Idle)`. Future-proof
-    /// against `ConnectingState` variant additions — adding a new
-    /// variant cannot change what "ready" means.
+    /// Future-proof against `ConnectingState` variant additions —
+    /// adding a new variant cannot change what "ready" means.
     #[inline]
     #[must_use]
     pub fn is_handshake_ready(&self) -> bool {
@@ -2107,8 +2075,7 @@ impl PgProtocol<ConnectingPhase> {
         )
     }
 
-    /// DEF-279 Phase 1c Bundle Commit 8b (2026-05-18) — typed
-    /// predicate: handshake failed, transition will route to
+    /// Typed predicate: handshake failed, transition will route to
     /// [`PgProtocol<ClosedPhase>`] via [`Self::into_active`].
     ///
     /// Returns `true` iff `self.inner.state` is
@@ -2125,17 +2092,16 @@ impl PgProtocol<ConnectingPhase> {
         )
     }
 
-    /// DEF-246 Phase 3 (2026-05-16) — session_params accessor during
-    /// handshake (mirrors `<ActivePhase>::session_params`). The
-    /// server's `ParameterStatus` frames during the handshake populate
-    /// these; callers may inspect mid-handshake values for diagnostic
+    /// session_params accessor during handshake (mirrors
+    /// `<ActivePhase>::session_params`). The server's
+    /// `ParameterStatus` frames during the handshake populate these;
+    /// callers may inspect mid-handshake values for diagnostic
     /// purposes.
     #[inline]
     #[must_use]
     pub fn session_params(&self) -> &SessionParams {
         // Mirror of `<ActivePhase>::cold_session_params`. The static
-        // empty fallback lives at the inner accessor (and matches
-        // `<ActivePhase>` byte-for-byte).
+        // empty fallback matches the Active accessor byte-for-byte.
         static EMPTY: SessionParams = SessionParams::new();
         match self.inner.session_params.as_deref() {
             Some(p) => p,
@@ -2143,13 +2109,12 @@ impl PgProtocol<ConnectingPhase> {
         }
     }
 
-    /// DEF-246 Phase 3 (2026-05-16) — server-error arena accessor
-    /// during handshake (mirrors `<ActivePhase>::get_server_error`).
-    /// Useful when handshake fails: `ErrorResponse` during startup
-    /// classifies as `ProtocolError::ServerErrorResponse
-    /// { details_ref, … }`; callers resolve via this method to
-    /// inspect the server's message before transitioning to
-    /// `<ClosedPhase>`.
+    /// Server-error arena accessor during handshake (mirrors
+    /// `<ActivePhase>::get_server_error`). Useful when handshake
+    /// fails: `ErrorResponse` during startup classifies as
+    /// `ProtocolError::ServerErrorResponse { details_ref, … }`;
+    /// callers resolve via this method to inspect the server's
+    /// message before transitioning to `<ClosedPhase>`.
     #[inline]
     pub fn get_server_error(
         &self,
@@ -2167,16 +2132,15 @@ impl PgProtocol<ConnectingPhase> {
         arena.get(r)
     }
 
-    /// DEF-246 Phase 3 (2026-05-16) — `as_ready` accessor during
-    /// handshake. ALWAYS returns `None` while in `<ConnectingPhase>`
-    /// because the phase classifier maps every `Connecting*` variant
-    /// to `ConnectionStatus::Handshaking` (not `Ready`). Exposed for
-    /// test compatibility with the pre-DEF-246 callsites that did
-    /// `proto.as_ready().is_none()` checks during a handshake.
+    /// `as_ready` accessor during handshake. ALWAYS returns `None`
+    /// while in `<ConnectingPhase>` because the phase classifier
+    /// maps every `Connecting*` variant to
+    /// `ConnectionStatus::Handshaking` (not `Ready`). Exposed for
+    /// test parity with the Active surface's `as_ready` predicate.
     ///
     /// **Type signature note:** returns `Option<()>` rather than
-    /// `Option<ReadyGuard>` — there is NO legitimate push path during
-    /// handshake (the only Connecting-state command would be
+    /// `Option<ReadyGuard>` — there is NO legitimate push path
+    /// during handshake (the only Connecting-state command would be
     /// re-Startup, which is also banned by `<DisconnectedPhase>`
     /// consume-self). The `()` return marks "handshaking, no push
     /// guard available" without exposing the ActivePhase-bound
@@ -2185,14 +2149,14 @@ impl PgProtocol<ConnectingPhase> {
     #[must_use]
     pub fn as_ready(&mut self) -> Option<()> {
         // `<ConnectingPhase>` always reports Handshaking; no Idle
-        // classification path exists during handshake (Idle here would
-        // imply RFQ-complete, at which point the caller must
+        // classification path exists during handshake (Idle here
+        // would imply RFQ-complete, at which point the caller must
         // `into_active()` to access the push surface).
         None
     }
 
-    /// DEF-246 Phase 3 (2026-05-16) — `connection_status` accessor
-    /// during handshake — mirrors `<ActivePhase>::connection_status`.
+    /// `connection_status` accessor during handshake — mirrors
+    /// `<ActivePhase>::connection_status`.
     #[inline]
     #[must_use]
     pub fn connection_status(&self) -> crate::guard::ConnectionStatus {
@@ -2208,29 +2172,27 @@ impl PgProtocol<ConnectingPhase> {
 }
 
 impl PgProtocol<ClosedPhase> {
-    /// DEF-246 Phase 4 (2026-05-16) — typed error accessor for a
-    /// terminally-Errored protocol.
+    /// Typed error accessor for a terminally-Errored protocol.
     ///
-    /// **DEF-279 Phase 1b (2026-05-18) — tier elevation**: pre-Bundle
-    /// the body matched `&self.inner.state` against `ProtoState::Errored(k)`,
+    /// **Tier-1 by storage absence**: `<ClosedPhase>::Inner =
+    /// ClosedInner` stores only `state_kind: StateErrorKind` —
+    /// there is no `ProtoState` at all on Closed. A naive shape
+    /// would match `&self.inner.state` against `ProtoState::Errored(k)`
     /// with an "architecturally unreachable" defensive arm
-    /// (`_ => ProtocolError::InternalCrateBug { locus:
-    /// CrateBugLocus::ReadCursorAdvance }`) for the impossible
-    /// non-Errored case. Post-Bundle `<ClosedPhase>::Inner = ClosedInner`
-    /// stores only `state_kind: StateErrorKind` — there is no
-    /// `ProtoState` at all on Closed. The defensive arm IS GONE
-    /// by storage absence (the type system cannot construct a Closed
-    /// protocol with non-Errored state since the variant simply
-    /// isn't there). Tier-3-by-state-machine-reasoning →
-    /// tier-1-by-storage-absence.
+    /// (`_ => ProtocolError::InternalCrateBug { … }`) for the
+    /// impossible non-Errored case — tier-3
+    /// by-state-machine-reasoning. The defensive arm is GONE by
+    /// storage absence here: the type system cannot construct a
+    /// Closed protocol with non-Errored state since the variant
+    /// simply isn't there.
     ///
     /// # Tier-1 closure
     ///
     /// `<ClosedPhase>` exposes ONLY `cause()`. No `push_command`, no
     /// `feed_inbound`, no `feed_bytes`, no `advance_one_frame`,
     /// no `into_active`. Calling any of those on a `<ClosedPhase>`
-    /// instance is method-absent E0599 (Phase 4 elevation #3 —
-    /// «Closed absorbs no input»). The protocol is terminal.
+    /// instance is method-absent E0599 («Closed absorbs no input»).
+    /// The protocol is terminal.
     #[inline]
     #[must_use = "the returned ProtocolError carries the terminal cause; observing it is the only \
                   legitimate operation on a Closed protocol"]
@@ -2240,14 +2202,13 @@ impl PgProtocol<ClosedPhase> {
         }
     }
 
-    /// DEF-279 Phase 1b (2026-05-18) — resolve a server `ErrorRef`
-    /// against the preserved arena. Mirror of
-    /// [`PgProtocol::<ActivePhase>::get_server_error`] — useful
-    /// when the wrapper layer stashed an `ErrorRef` from a
+    /// Resolve a server `ErrorRef` against the preserved arena.
+    /// Mirror of [`PgProtocol::<ActivePhase>::get_server_error`] —
+    /// useful when the wrapper layer stashed an `ErrorRef` from a
     /// `ServerErrorResponse` classified before the transition to
-    /// `<ClosedPhase>`. Returns `Stale` (arena's generation classifier)
-    /// if the arena was cleared or the ref is from a different
-    /// generation.
+    /// `<ClosedPhase>`. Returns `Stale` (arena's generation
+    /// classifier) if the arena was cleared or the ref is from a
+    /// different generation.
     #[inline]
     pub fn get_server_error(
         &self,
@@ -2262,9 +2223,8 @@ impl PgProtocol<ClosedPhase> {
         arena.get(r)
     }
 
-    /// DEF-279 Phase 1b (2026-05-18) — preserved diagnostic counter
-    /// from the arena. Returns 0 if no arena was buffered before the
-    /// transition.
+    /// Preserved diagnostic counter from the arena. Returns 0 if no
+    /// arena was buffered before the transition.
     #[inline]
     #[must_use]
     pub fn error_arena_overwrite_count(&self) -> u16 {
@@ -2276,26 +2236,24 @@ impl PgProtocol<ClosedPhase> {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-272 cluster δ (2026-05-10) — feed-side error-transition leaves
+// Feed-side error-transition leaves
 //
 // Per-call-site concrete-type tokens that gate
-// `crate::state_setter::drain_at_*` constructors. Each leaf submodule
-// hosts a token with PRIVATE field — the literal `Self(())` mint is
-// callable ONLY inside the submodule. The token is consumed by the
-// matching `drain_at_*` free fn in mod state_setter, which in turn
-// constructs `FeedStateSetter::new` (private to mod state_setter).
+// `crate::state_setter::drain_at_*` constructors. Each leaf
+// submodule hosts a token with PRIVATE field — the literal
+// `Self(())` mint is callable ONLY inside the submodule. The token
+// is consumed by the matching `drain_at_*` free fn in mod
+// state_setter, which in turn constructs `FeedStateSetter::new`
+// (private to mod state_setter).
 // ═════════════════════════════════════════════════════════════════════
 
-/// DEF-272 cluster δ leaf submodule for the `install_errored_replyid_saturation`
-/// transition. The saturation classifier (cluster D) fires from any
-/// state, hence the `drain_at_replyid_saturation` returns
+/// Leaf submodule for the `install_errored_replyid_saturation`
+/// transition. The saturation classifier fires from any state,
+/// hence the `drain_at_replyid_saturation` returns
 /// `Option<NonZeroU64>` (None for `Idle` / `DrainRfqAfterError` /
 /// `Errored` prior states).
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
-// `pub(crate)` items).
 pub(crate) mod _replyid_saturation_drain_leaf {
-    /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
+    /// Leaf-scope token. Field private to leaf.
     pub(crate) struct ReplyIdSaturationToken(());
 
     /// Mint a [`ReplyIdSaturationToken`] and route through
@@ -2314,15 +2272,12 @@ pub(crate) mod _replyid_saturation_drain_leaf {
     }
 }
 
-/// DEF-272 cluster δ leaf submodule for the
-/// `install_errored_read_cursor_advance` transition. Fires when the
-/// row-stream fast path detects a read-cursor advance failure
+/// Leaf submodule for the `install_errored_read_cursor_advance`
+/// transition. Fires when the row-stream fast path detects a
+/// read-cursor advance failure
 /// (`CrateBugLocus::ReadCursorAdvance`).
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
-// `pub(crate)` items).
 pub(crate) mod _read_cursor_advance_drain_leaf {
-    /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
+    /// Leaf-scope token. Field private to leaf.
     pub(crate) struct ReadCursorAdvanceToken(());
 
     /// Mint a [`ReadCursorAdvanceToken`] and route through
@@ -2338,13 +2293,13 @@ pub(crate) mod _read_cursor_advance_drain_leaf {
     }
 }
 
-/// DEF-280 Bundle K (2026-05-18) leaf submodule for the
-/// `install_errored_partial_mode_reentry` transition. Fires when
-/// [`crate::buf::ReadBuf::enter_partial_mode`] returns
-/// `Err(AlreadyInPartialMode)` — an internal classifier bug
-/// classified as [`crate::error::CrateBugLocus::PartialModeReentry`].
+/// Leaf submodule for the `install_errored_partial_mode_reentry`
+/// transition. Fires when [`crate::buf::ReadBuf::enter_partial_mode`]
+/// returns `Err(AlreadyInPartialMode)` — an internal classifier bug
+/// classified as
+/// [`crate::error::CrateBugLocus::PartialModeReentry`].
 pub(crate) mod _partial_mode_reentry_drain_leaf {
-    /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
+    /// Leaf-scope token. Field private to leaf.
     pub(crate) struct PartialModeReentryToken(());
 
     /// Mint a [`PartialModeReentryToken`] and route through
@@ -2360,7 +2315,7 @@ pub(crate) mod _partial_mode_reentry_drain_leaf {
     }
 }
 
-/// DEF-280 Bundle K-mirror (2026-05-18) leaf submodule for the
+/// Leaf submodule for the
 /// `install_errored_partial_mode_exit_undrained` transition. Fires
 /// when [`crate::buf::ReadBuf::exit_partial_mode`] returns
 /// `Err(PartialModeExitUndrained)` — an internal classifier bug OR
@@ -2368,7 +2323,7 @@ pub(crate) mod _partial_mode_reentry_drain_leaf {
 /// DataRow; classified as
 /// [`crate::error::CrateBugLocus::PartialModeExitUndrained`].
 pub(crate) mod _partial_mode_exit_undrained_drain_leaf {
-    /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
+    /// Leaf-scope token. Field private to leaf.
     pub(crate) struct PartialModeExitUndrainedToken(());
 
     /// Mint a [`PartialModeExitUndrainedToken`] and route through
@@ -2384,15 +2339,11 @@ pub(crate) mod _partial_mode_exit_undrained_drain_leaf {
     }
 }
 
-/// DEF-272 cluster δ leaf submodule for the
-/// `install_errored_malformed_data_row` transition. Fires from
-/// streaming variants when a DataRow body is malformed (zero-length,
-/// etc.).
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
-// `pub(crate)` items).
+/// Leaf submodule for the `install_errored_malformed_data_row`
+/// transition. Fires from streaming variants when a DataRow body is
+/// malformed (zero-length, etc.).
 pub(crate) mod _malformed_data_row_drain_leaf {
-    /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
+    /// Leaf-scope token. Field private to leaf.
     pub(crate) struct MalformedDataRowToken(());
 
     /// Mint a [`MalformedDataRowToken`] and route through
@@ -2408,15 +2359,11 @@ pub(crate) mod _malformed_data_row_drain_leaf {
     }
 }
 
-/// DEF-272 cluster δ leaf submodule for the
-/// `fail_inflight_no_readbuf` transition. Fires from dispatch when an
-/// in-flight error occurs and no read-buf state is available for
-/// payload preservation.
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
-// `pub(crate)` items).
+/// Leaf submodule for the `fail_inflight_no_readbuf` transition.
+/// Fires from dispatch when an in-flight error occurs and no
+/// read-buf state is available for payload preservation.
 pub(crate) mod _fail_inflight_no_readbuf_drain_leaf {
-    /// DEF-272 cluster δ leaf-scope token. Field private to leaf.
+    /// Leaf-scope token. Field private to leaf.
     pub(crate) struct FailInflightNoReadbufToken(());
 
     /// Mint a [`FailInflightNoReadbufToken`] and route through
@@ -2436,24 +2383,20 @@ pub(crate) mod _fail_inflight_no_readbuf_drain_leaf {
     }
 }
 
-/// DEF-248 Sub-A (2026-05-12) leaf submodule for the
-/// `install_errored_stream_dropped_mid_stream` transition. Fires from
-/// [`crate::row_stream::RowStream::drop`] when the stream is dropped
-/// with `drained == false` (closure exited mid-frame: normal early
-/// return, `?` propagation, panic unwind).
+/// Leaf submodule for the
+/// `install_errored_stream_dropped_mid_stream` transition. Fires
+/// from [`crate::row_stream::RowStream::drop`] when the stream is
+/// dropped with `drained == false` (closure exited mid-frame: normal
+/// early return, `?` propagation, panic unwind).
 ///
-/// Mirror of cluster δ leaves above (`_read_cursor_advance_drain_leaf`,
-/// `_malformed_data_row_drain_leaf`, …). The
-/// `StreamDroppedMidStreamToken` tuple-struct field is private to this
-/// submodule — `Self(())` mints are callable ONLY inside the leaf.
-/// Hostile in-crate attempts to call `drain_at_stream_dropped_mid_stream`
-/// from outside this leaf cannot construct the required token type;
-/// the type system rejects.
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
-// `pub(crate)` items).
+/// Mirror of the other drain leaves above. The
+/// `StreamDroppedMidStreamToken` tuple-struct field is private to
+/// this submodule — `Self(())` mints are callable ONLY inside the
+/// leaf. Hostile in-crate attempts to call
+/// `drain_at_stream_dropped_mid_stream` from outside this leaf
+/// cannot construct the required token type; the type system rejects.
 pub(crate) mod _stream_dropped_mid_stream_drain_leaf {
-    /// DEF-248 Sub-A leaf-scope token. Field private to leaf.
+    /// Leaf-scope token. Field private to leaf.
     pub(crate) struct StreamDroppedMidStreamToken(());
 
     /// Mint a [`StreamDroppedMidStreamToken`] and route through
@@ -2482,14 +2425,13 @@ pub(crate) mod _stream_dropped_mid_stream_drain_leaf {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-278 Bundle D (2026-05-17) — `_backend_key_install_leaf`
+// `_backend_key_install_leaf` — one-shot backend-key install.
 //
 // Per-call-site concrete-type token gating the one-shot install of
 // `(pid, secret_key)` into [`crate::cancel::BackendKeyCell`] at the
 // dispatch arm that processes `(ConnectingPostAuthHaveKey, 'Z')`.
 //
-// Mirror of DEF-272 cluster α/β/Sub-B leaf-token pattern. The
-// tuple-struct field is PRIVATE to the leaf submodule (no
+// The tuple-struct field is PRIVATE to the leaf submodule (no
 // `pub(crate)` modifier on the inner `()`), so the `Self(())` literal
 // mint is callable ONLY inside this module. The `BackendKeyCell`
 // names the token type in its `install_via_token` parameter signature
@@ -2498,33 +2440,29 @@ pub(crate) mod _stream_dropped_mid_stream_drain_leaf {
 // Why a `&BackendKeyInstallToken` parameter (not a value): the token
 // is minted once per dispatch call (inside the leaf's
 // [`install_at_dispatch_arm`] helper) and the cell's
-// `install_via_token` borrows it for the duration of the write. The
-// shared-ref shape matches DEF-272 cluster α `ClearResidueSchemaToken`
-// which is also passed by-value-of-`()` — both cost zero bytes (ZST)
-// and zero cycles (no register pressure beyond the token's ABI
-// no-op).
+// `install_via_token` borrows it for the duration of the write.
 //
 // Tier-1 within-crate by-construction: the only legal install path
 // is via [`install_at_dispatch_arm`]; no other code site can mint a
 // token to call `BackendKeyCell::install_via_token` directly.
 // ═════════════════════════════════════════════════════════════════════
 
-/// DEF-278 Bundle D leaf submodule for the one-shot backend-key
-/// install at the dispatch arm `(ConnectingPostAuthHaveKey,
-/// TAG_READY_FOR_QUERY)`. Hosts the concrete-type token + the helper
-/// fn that performs the install.
+/// Leaf submodule for the one-shot backend-key install at the
+/// dispatch arm `(ConnectingPostAuthHaveKey, TAG_READY_FOR_QUERY)`.
+/// Hosts the concrete-type token + the helper fn that performs the
+/// install.
 pub(crate) mod _backend_key_install_leaf {
-    /// DEF-278 Bundle D leaf-scope token. Field private to the leaf
-    /// (no `pub(crate)` modifier on the inner `()`) — the `Self(())`
-    /// literal mint is callable ONLY inside this module. The type
-    /// itself is `pub(crate)` so
+    /// Leaf-scope token. Field private to the leaf (no `pub(crate)`
+    /// modifier on the inner `()`) — the `Self(())` literal mint is
+    /// callable ONLY inside this module. The type itself is
+    /// `pub(crate)` so
     /// [`crate::cancel::BackendKeyCell::install_via_token`] can name
     /// it in its parameter signature.
     ///
     /// # Why a separate leaf for one install site
     ///
-    /// The one-shot install lives at a single dispatch arm
-    /// (`dispatch.rs:587-604`), but a separate leaf gives:
+    /// The one-shot install lives at a single dispatch arm, but a
+    /// separate leaf gives:
     /// - **Tier-1 within-crate by-construction**: any future code
     ///   trying to install a second key would need to either (a)
     ///   call the leaf helper (which is fine — it's the legitimate
@@ -2532,15 +2470,14 @@ pub(crate) mod _backend_key_install_leaf {
     ///   by the field-private tuple-struct payload at compile time
     ///   (`E0451`).
     /// - **Future-extensibility surface**: if a hypothetical follow-up
-    ///   ever needs to clear/re-install the key (e.g.
-    ///   `<ErroredPhase>::into_disconnected_for_retry` from Bundle A
-    ///   in DEF-278 — out of scope for Bundle D), the leaf gains a
-    ///   second token + helper, keeping the surface tight.
+    ///   ever needs to clear/re-install the key (e.g. an
+    ///   `<ErroredPhase>::into_disconnected_for_retry`), the leaf
+    ///   gains a second token + helper, keeping the surface tight.
     pub(crate) struct BackendKeyInstallToken(());
 
-    /// DEF-278 Bundle D — install `(pid, secret_key)` into the cell
-    /// at the dispatch arm that processes the handshake-complete
-    /// `ReadyForQuery` frame.
+    /// Install `(pid, secret_key)` into the cell at the dispatch
+    /// arm that processes the handshake-complete `ReadyForQuery`
+    /// frame.
     ///
     /// Sole legitimate caller is the dispatch arm at
     /// `(ConnectingPostAuthHaveKey, TAG_READY_FOR_QUERY)` in
@@ -2568,10 +2505,10 @@ pub(crate) mod _backend_key_install_leaf {
 }
 
 impl PgProtocol<ActivePhase> {
-    /// DEF-278 Bundle D' (2026-05-18) — closure-scoped access to the
-    /// PostgreSQL §55.2.7 CancelRequest wire frame.
+    /// Closure-scoped access to the PostgreSQL §55.2.7 CancelRequest
+    /// wire frame.
     ///
-    /// # Tier-1 against retention (Bundle D' elevation)
+    /// # Tier-1 against retention
     ///
     /// The 16-byte wire frame is materialised on THIS function's
     /// stack inside a [`zeroize::Zeroizing`]`<[u8; 16]>` guard. The
