@@ -23,8 +23,8 @@
 //!   `compute_push_simple_query`, etc.). Take `(cmd, state, ...)`
 //!   and return `(new_state, staged_actions)`. No I/O, no inbound
 //!   bytes — only side effect is building outbound frames into
-//!   `write_buf`. DEF-059 framing: push-side state transitions are
-//!   **pure compute over (current state × command)**.
+//!   `write_buf`. Push-side state transitions are **pure compute
+//!   over (current state × command)**.
 //!
 //! - **`dispatch`** — single entry point on the FEED path
 //!   (`dispatch::dispatch` in `dispatch.rs`). Takes
@@ -50,15 +50,13 @@
 
 use crate::action::{Action, OutActions, StagedAction, StagedActions};
 use crate::buf::{ReadBuf, ReadBufFull};
-// DEF-271 cluster A (2026-05-10): install_errored_* return drained
-// Option<NonZeroU64>; FeedStateSetter::drain_and_install_errored API.
 use core::num::NonZeroU64;
 // `PgCommand` enum is referenced only by the test-only 5-arm
-// `compute_push_*` dispatchers (the `compute_push_idle_only` slow-path
-// dispatcher + `impl PushCommand for PgCommand` blanket impl were
-// deleted at DEF-270 Phase 2 ship — real call sites were zero). The
-// `use` is `#[cfg(test)]`-gated to avoid an unused-import warning in
-// release builds.
+// `compute_push_*` dispatchers — no real call sites exist for a
+// runtime-polymorphic `compute_push_idle_only` slow-path dispatcher
+// nor for `impl PushCommand for PgCommand`. The `use` is
+// `#[cfg(test)]`-gated to avoid an unused-import warning in release
+// builds.
 #[cfg(test)]
 use crate::command::PgCommand;
 use crate::dispatch::{DispatchOutcome, dispatch};
@@ -75,7 +73,7 @@ use core::cell::Cell;
 use core::marker::PhantomData;
 
 // -----------------------------------------------------------------
-// emit_actions! — tier-1 per-site action-budget enforcement (DEF-045)
+// emit_actions! — tier-1 per-site action-budget enforcement
 // -----------------------------------------------------------------
 
 /// Count the number of expression arguments in a `macro_rules!` call.
@@ -96,23 +94,22 @@ macro_rules! count_exprs {
 /// Push 1..=N actions into `staged`, with compile-time enforcement
 /// of the per-site budget.
 ///
-/// # DEF-154 (Q) P1-6: infallible-only form
+/// # Infallible-only form
 ///
-/// Pre-(Q), `emit_actions!` had two forms: `on_overflow: break`
-/// (loop form — bailed the enclosing loop on Err) and no-bail
-/// (const-assert-proven fit). The former looked safe (gate
-/// reserved `WORST_CASE_PER_DISPATCH` slots before loop entry) but
-/// was a silent-loss footgun: if the gate ever drifted, terminal
-/// `FailReply + CloseSocket` could be dropped while state had
-/// ALREADY transitioned to `Errored` — caller sees state_errored
-/// but no Action delivery, orphaned oneshot receiver.
+/// Only the no-bail infallible form is offered. A naive shape would
+/// expose an additional `on_overflow: break` loop form that bailed the
+/// enclosing loop on Err — looking safe because the dispatch gate at
+/// `feed_bytes` reserves `WORST_CASE_PER_DISPATCH` slots before loop
+/// entry. That shape is a silent-loss footgun: if the gate ever
+/// drifted, terminal `FailReply + CloseSocket` could be dropped while
+/// state had ALREADY transitioned to `Errored` — caller sees
+/// state_errored but no Action delivery, orphaned oneshot receiver.
 ///
-/// Post-(Q) only the no-bail infallible form remains. The dispatch
-/// gate at feed_bytes reserves `WORST_CASE_PER_DISPATCH = 2` slots
-/// before entering any arm, so the Errored arm's 2-action emission
-/// always fits the staged cap. `match Ok(()) | Err(_) => {}` is
-/// explicit dead-arm handling (no `.unwrap_or(())` silent
-/// fallback, no debug_assert panic target).
+/// Instead the dispatch gate at feed_bytes reserves
+/// `WORST_CASE_PER_DISPATCH = 2` slots before entering any arm, so the
+/// Errored arm's 2-action emission always fits the staged cap.
+/// `match Ok(()) | Err(_) => {}` is explicit dead-arm handling (no
+/// `.unwrap_or(())` silent fallback, no debug_assert panic target).
 ///
 /// ```text
 /// emit_actions!(staged, budget: 1, [
@@ -126,8 +123,6 @@ macro_rules! count_exprs {
 ///    fits within the staged cap.
 /// 2. `budget >= count(actions)` — site does not push more than
 ///    its declared budget.
-///
-/// DEF-045. Form split + merge: DEF-055 + DEF-154 (Q).
 macro_rules! emit_actions {
     (
         $out:expr, budget: $budget:literal,
@@ -155,34 +150,35 @@ macro_rules! emit_actions {
     }};
 }
 
-/// DEF-154 (B) Phase B4-W P0-2 + P0-3 fix helper.
+/// Centralises the FailReply + CloseSocket + Errored cascade
+/// triggered by a builder Err.
 ///
 /// Every `build_*_message` returns `Result<WriteRange,
-/// ProtocolError>` post-audit. The Err path is architecturally
-/// cold (builder bug / const-drift / user ParamsWriter overflow)
-/// but classified — `compute_push_*` handles it via `FailReply +
-/// CloseSocket + Errored` state transition.
+/// ProtocolError>`. The Err path is architecturally cold (builder
+/// bug / const-drift / user ParamsWriter overflow) but classified —
+/// `compute_push_*` handles it via `FailReply + CloseSocket +
+/// Errored` state transition.
 ///
-/// This macro centralises that handling. Each `compute_push_*_idle_only`
-/// uses `let range = try_builder!(build_X(...), setter, reply, staged);`.
-/// On `Err(cause)`: derive `StateErrorKind` via `cause.state_kind()`
-/// (DEF-175/176 pattern), emit FailReply + CloseSocket into `staged`,
-/// consume `setter` via `install_errored(state_kind)`, and
-/// early-return from the enclosing `compute_push_*` function.
+/// Each `compute_push_*_idle_only` uses `let range =
+/// try_builder!(build_X(...), setter, reply, staged);`. On
+/// `Err(cause)`: derive `StateErrorKind` via `cause.state_kind()`,
+/// emit FailReply + CloseSocket into `staged`, consume `setter`
+/// via `install_errored(state_kind)`, and early-return from the
+/// enclosing `compute_push_*` function.
 ///
 /// The macro early-returns, so it must be used in a position
 /// where `return` is legal.
 ///
-/// # DEF-270 N-D (Phase 2, 2026-05-10): setter consumption
+/// # Setter consumption
 ///
-/// Pre-DEF-270-N-D the macro took `$state: &mut ProtoState` and
-/// wrote `*$state = ProtoState::Errored(state_kind)` directly. With
-/// raw `&mut ProtoState` no longer reachable from `execute()` (only
-/// via [`crate::state_setter::StateSetter`]), the macro now takes
-/// `$setter: StateSetter<'_, _>` and consumes it via
-/// [`StateSetter::install_errored`] on the Err path. The setter's
-/// `must_use` lint surfaces a missed install at the call site;
-/// previously the responsibility lived in a docstring discipline
+/// The macro takes `$setter: StateSetter<'_, _>` and consumes it
+/// via [`StateSetter::install_errored`] on the Err path. A naive
+/// alternative would take `$state: &mut ProtoState` and write
+/// `*$state = ProtoState::Errored(state_kind)` directly — but raw
+/// `&mut ProtoState` is no longer reachable from `execute()` (only
+/// via [`crate::state_setter::StateSetter`]), and the setter's
+/// `must_use` lint surfaces a missed install at the call site
+/// rather than leaving the responsibility to a docstring discipline
 /// note.
 ///
 /// **NLL conditional-move:** on the Ok arm `$setter` is not
@@ -194,21 +190,21 @@ macro_rules! emit_actions {
 /// using `try_builder!` (Ping skips since Sync is static-bytes
 /// infallible).
 ///
-/// **Idle-only contract** is now enforced by setter privacy:
+/// **Idle-only contract** is enforced by setter privacy:
 /// `StateSetter::new` is `pub(crate)`, callable only from
 /// `PgProtocol::push_command_internal` which asserts
-/// `matches!(state, Idle)` at entry. The pre-DEF-270-N-D macro
-/// debug_assert (defense-in-depth on the same invariant) is
-/// dropped — same invariant, single load-bearing assertion site.
+/// `matches!(state, Idle)` at entry. A defense-in-depth
+/// debug_assert on the same invariant would be redundant — same
+/// invariant, single load-bearing assertion site.
 macro_rules! try_builder {
     ($result:expr, $setter:expr, $reply:expr, $staged:expr) => {
         match $result {
             Ok(r) => r,
             Err(cause) => {
-                // DEF-154 (I): state_kind is total — no unwrap_or_else
-                // + debug_assert dance. Builders never return
-                // AlreadyClosed; the total projection fills any
-                // hypothetical AlreadyClosed with Internal honestly.
+                // state_kind is total — no unwrap_or_else + debug_assert
+                // dance. Builders never return AlreadyClosed; the total
+                // projection fills any hypothetical AlreadyClosed with
+                // Internal honestly.
                 let state_kind = cause.state_kind();
                 emit_actions!($staged, budget: 2, [
                     StagedAction::FailReply { id: $reply.consume(), cause },
@@ -225,7 +221,7 @@ macro_rules! try_builder {
 ///
 /// # Two-level guarantee
 ///
-/// - **Per emission site — tier 1 compile (DEF-045).** Each call to
+/// - **Per emission site — tier 1 compile.** Each call to
 ///   `emit_actions!` carries a `budget: N` literal and a `const _: () =
 ///   assert!(MAX_ACTIONS_PER_CALL >= N)` inside the macro expansion.
 ///   A site that declares a budget it cannot fit is a build error.
@@ -241,7 +237,7 @@ macro_rules! try_builder {
 ///   of frame count. Honest tier: not tier-1, per §3.4's ban on
 ///   "tier-1 runtime" labels for runtime-checked bounds.
 ///
-/// # Phase 1a + 1b budget audit
+/// # Budget audit
 ///
 /// - `push_command(Ping)` from `Idle` → 1 action (`SendBytes`).
 /// - `push_command(Ping)` from non-`Idle` → 1 action (`FailReply`).
@@ -254,42 +250,36 @@ macro_rules! try_builder {
 ///   budget check (below) gates entry; overflow is architecturally
 ///   unreachable.
 ///
-/// # 1c-1b bump: 4 → 8
+/// # Sizing rationale (= 8)
 ///
 /// Row streaming emits one `StreamRow` per `DataRow` frame. A single
 /// `feed_bytes` call receiving 7 rows + `CommandComplete` +
 /// `ReadyForQuery` produces 7 × `StreamRow` + 1 × `DeliverReply`.
-/// Keeping `MAX_ACTIONS_PER_CALL = 4` would force 2+ extra
-/// `feed_bytes` calls per batch; 8 covers realistic streaming
-/// density with single-digit call counts on typical row sizes.
+/// A 4-slot cap would force 2+ extra `feed_bytes` calls per batch;
+/// 8 covers realistic streaming density with single-digit call counts
+/// on typical row sizes.
 ///
-/// # DEF-154 (L) P0-1 + P0-2(a): staged / output split
+/// # Staged / output split
 ///
-/// Pre-(L), `MAX_ACTIONS_PER_CALL = 8` governed BOTH the staged
-/// (dispatch-side) and output (user-side) capacity. Materialise
-/// could emit up to 2 actions per staged entry on the
-/// `SendBytesRange.apply == None` fan-out path (`CloseSocket`) —
-/// a 16-action worst-case that did not fit the 8-slot output
-/// container, causing `.unwrap_or(())` to silently drop terminal
-/// actions.
+/// A naive shape would have a single constant govern BOTH the
+/// staged (dispatch-side) and output (user-side) capacity. That
+/// shape is unsafe: materialise can emit up to 2 actions per staged
+/// entry on the `SendBytesRange.apply == None` fan-out path
+/// (`CloseSocket`), so an 8-slot output container would silently
+/// drop terminal actions via `.unwrap_or(())` on a 16-action
+/// worst-case.
 ///
-/// Post-(L): `MAX_STAGED_PER_CALL = 8` bounds dispatch's stage
+/// Instead `MAX_STAGED_PER_CALL = 8` bounds dispatch's stage
 /// container; `MAX_ACTIONS_PER_CALL = MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED = 16`
 /// bounds the output container (compile-asserted below). Worst-case
-/// fanout is then ARCHITECTURALLY contained — the silent-drop
-/// class is closed at the type/capacity level, not at a runtime
-/// shield.
-///
-/// Also a 2× quick-win for the SELECT-large bottleneck: 15-row
-/// streaming density per call (vs 7 pre-(L)) halves feed_bytes
-/// round-trips on 1M-row queries. The full pull-based RowStream
-/// redesign (P0-2(c)) is the deeper fix.
+/// fanout is ARCHITECTURALLY contained — the silent-drop class is
+/// closed at the type/capacity level, not at a runtime shield.
 ///
 /// # Emission-site vs aggregate
 ///
 /// - **Per emission site — tier 1 compile**: `emit_actions!` asserts
 ///   budget ≤ `MAX_STAGED_PER_CALL` via `const _: () = assert!(...)`.
-/// - **Aggregate output — tier 1 compile (post-(L))**:
+/// - **Aggregate output — tier 1 compile**:
 ///   `const _: () = assert!(MAX_ACTIONS_PER_CALL >= MAX_STAGED_PER_CALL * MAX_FANOUT_PER_STAGED);`
 ///   guarantees `out.push(a)` during materialise cannot overflow,
 ///   so the `.unwrap_or(())` pattern is genuinely architecturally
@@ -306,13 +296,6 @@ pub const MAX_STAGED_PER_CALL: usize = 8;
 /// classified-via-CloseSocket sentinel, see `materialise`). Every
 /// other StagedAction variant maps 1:1 to Action.
 ///
-/// Post-DEF-188: the prior fanout-2 case was
-/// `StagedAction::DeliverReply` with a stale `SchemaRef` payload
-/// (`FailReply + CloseSocket`). DEF-188 deleted the schema arena
-/// and the stale-ref class entirely; the only remaining fanout-2
-/// site is `SendBytesRange.apply == None`, which inherits the same
-/// budget reservation.
-///
 /// # Why `+1` and not `× 2`?
 ///
 /// State-machine audit: at most ONE `DeliverReply` can fire per
@@ -322,52 +305,49 @@ pub const MAX_STAGED_PER_CALL: usize = 8;
 /// second reply in the same feed_bytes iteration. Therefore:
 /// 7 non-fanout staged + 1 fanout-2 staged = 7 + 2 = 9 actions.
 ///
-/// # 1c-5 pipelining regression trap
+/// # Pipelining regression trap
 ///
 /// If a future pipelining refactor emits 2+ DeliverReply per
-/// dispatch call (batched replies), bump the `+1` literal to match
-/// the max number of simultaneous fanout-2 staged entries.
+/// dispatch call (batched replies), bump
+/// [`MAX_FANOUT2_ENTRIES_PER_CALL`] to match the max number of
+/// simultaneous fanout-2 staged entries — the formula recomputes.
 ///
-/// # DEF-184 audit (2026-04-24) → DEF-210 SR-05 audit (2026-04-28)
+/// # Named constants vs magic literal
 ///
-/// Pre-DEF-184: 3-const formula (`MAX_FANOUT_PER_STAGED = 2`,
-/// `MAX_FANOUT2_ENTRIES_PER_CALL = 1`,
-/// `MAX_STAGED + FANOUT2 × (FANOUT − 1)`).
-///
-/// DEF-184 collapsed to `MAX_STAGED + 1` — "same value (9), half the
-/// cognitive load." That collapse silently turned the named topology
-/// terms into a magic `+1` literal (DEF-210 SR-05 finding): a 1c-5
+/// A naive shape would collapse the formula to `MAX_STAGED + 1` —
+/// "same value (9), half the cognitive load." That collapse turns
+/// the named topology terms into a magic `+1` literal: a future
 /// pipelining refactor that adds a SECOND fanout-2 staged entry
 /// would have to know to bump literal `+1` → `+2`, with the only
 /// hint being a comment. **Drift surface: a comment.**
 ///
-/// Path C from the audit: restore the named constants. The formula
+/// Instead the named constants stay. The formula
 /// `MAX_STAGED + MAX_FANOUT2_ENTRIES_PER_CALL × (MAX_FANOUT_PER_STAGED − 1)`
 /// is self-documenting; future pipelining work bumps a NAMED const
 /// (e.g. `MAX_FANOUT2_ENTRIES_PER_CALL = 2`) instead of editing a
 /// literal that requires reading docstrings to understand.
 ///
-/// # Bench impact (preserved through both transitions)
+/// # Bench impact
 ///
 /// `OutActions` stack reservation: `9 × 88 B = 792 B` vs the
 /// naive `MAX_STAGED × 2 = 16 × 88 B = 1408 B`. Saves 616 B per
-/// OutActions. Combined with A2/B1 `ManuallyDrop<heapless::Vec>`
-/// (0 B zero-fill), OutActions is a lean stack frame.
+/// OutActions. Combined with `ManuallyDrop<heapless::Vec>` (0 B
+/// zero-fill), OutActions is a lean stack frame.
 pub const MAX_ACTIONS_PER_CALL: usize =
     MAX_STAGED_PER_CALL + MAX_FANOUT2_ENTRIES_PER_CALL * (MAX_FANOUT_PER_STAGED - 1);
 
 /// Maximum fan-out factor of any single staged entry into emitted
 /// `Action`s. Today only `DeliverReply` is fanout-2 (it emits an
 /// extra `Action::FailReply` if the slot it targets has gone stale
-/// since staging — the materialise-side stale-ref protection from
-/// DEF-184 A1+A13). All other staged entries are fanout-1.
+/// since staging — the materialise-side stale-ref protection). All
+/// other staged entries are fanout-1.
 ///
-/// 1c-5 pipelining note: if a future refactor introduces a fanout-3
+/// Pipelining note: if a future refactor introduces a fanout-3
 /// staged entry, this constant rises and `MAX_ACTIONS_PER_CALL`
 /// recomputes from the formula automatically.
 ///
 /// `pub(crate)` — implementation-detail topology constant; external
-/// consumers have no use case for reading it. Bumping it in 1c-5
+/// consumers have no use case for reading it. Bumping it for
 /// pipelining must NOT be a public-API breaking change.
 pub(crate) const MAX_FANOUT_PER_STAGED: usize = 2;
 
@@ -379,11 +359,11 @@ pub(crate) const MAX_FANOUT_PER_STAGED: usize = 2;
 /// waiting-for-reply state, blocking a second reply in the same
 /// feed_bytes iteration.
 ///
-/// 1c-5 pipelining will lift this to ≥2 (multiple concurrent
-/// inflight replies resolvable in one feed_bytes iteration). Bump
-/// THIS constant — `MAX_ACTIONS_PER_CALL` recomputes from the
-/// formula. The `WORST_CASE_PER_DISPATCH` and `OutActions` budget
-/// math both compose from this single source.
+/// Pipelining will lift this to ≥2 (multiple concurrent inflight
+/// replies resolvable in one feed_bytes iteration). Bump THIS
+/// constant — `MAX_ACTIONS_PER_CALL` recomputes from the formula.
+/// The `WORST_CASE_PER_DISPATCH` and `OutActions` budget math both
+/// compose from this single source.
 ///
 /// `pub(crate)` — same rationale as `MAX_FANOUT_PER_STAGED`.
 pub(crate) const MAX_FANOUT2_ENTRIES_PER_CALL: usize = 1;
@@ -396,8 +376,8 @@ const _: () = assert!(
     MAX_ACTIONS_PER_CALL
         == MAX_STAGED_PER_CALL + MAX_FANOUT2_ENTRIES_PER_CALL * (MAX_FANOUT_PER_STAGED - 1),
     "MAX_ACTIONS_PER_CALL formula: MAX_STAGED + FANOUT2_ENTRIES × \
-     (FANOUT − 1). DEF-210 SR-05: named constants restored — \
-     pipelining work bumps a NAMED magnitude, not an unnamed literal.",
+     (FANOUT − 1). Named constants enforce that pipelining work \
+     bumps a NAMED magnitude, not an unnamed literal.",
 );
 const _: () = assert!(
     MAX_FANOUT_PER_STAGED >= 1,
@@ -410,18 +390,18 @@ const _: () = assert!(
 /// a loop iteration enters only if
 /// `staged.len() + WORST_CASE_PER_DISPATCH ≤ MAX_ACTIONS_PER_CALL`,
 /// so overflow inside the iteration is architecturally unreachable —
-/// no partial emission, no silent reply loss (1c-1b DEF-121).
+/// no partial emission, no silent reply loss.
 ///
 /// Current worst case: [`DispatchOutcome::Errored`] with `Some(reply_id)`
 /// emits `FailReply + CloseSocket` = 2. Bumping this to 3 would require
 /// a new 3-action dispatch outcome.
 ///
-/// 1c-5 blocker (audit2 A028): pipelining changes the topology — a
-/// single feed_bytes iteration might resolve multiple concurrent
-/// inflight replies (e.g., DataRow for query A + CommandComplete
-/// for query B). Worst case becomes ≥3; WORST_CASE_PER_DISPATCH and
-/// MAX_ACTIONS_PER_CALL both revisit at 1c-5 implementation time
-/// per H021 witness-guard session.
+/// Pipelining blocker: pipelining changes the topology — a single
+/// feed_bytes iteration might resolve multiple concurrent inflight
+/// replies (e.g., DataRow for query A + CommandComplete for query
+/// B). Worst case becomes ≥3; WORST_CASE_PER_DISPATCH and
+/// MAX_ACTIONS_PER_CALL both revisit at pipelining implementation
+/// time.
 const WORST_CASE_PER_DISPATCH: usize = 2;
 
 // Sanity asserts — the budget audit above demands at least
@@ -430,15 +410,15 @@ const WORST_CASE_PER_DISPATCH: usize = 2;
 const _: () = assert!(MAX_ACTIONS_PER_CALL >= WORST_CASE_PER_DISPATCH);
 const _: () = assert!(MAX_ACTIONS_PER_CALL >= 4, "practical batching needs ≥4 slots");
 
-// DEF-210 BS-11 + REC-08 (audit 2026-04-28): module-scope tier-1
-// pin that the `static EMPTY: SessionParams = SessionParams::new()`
-// referenced from `cold_session_params` carries no SecretBoundedStr
-// bytes — a `'static` value never drops, so its `ZeroizeOnDrop`
-// chain never fires; the only safe state for a static SessionParams
-// is fully pristine (every Option=None, every counter=0). A future
-// refactor of `SessionParams::new()` that initialises a
-// SecretBoundedStr field with a non-empty default would otherwise
-// leak the bytes into static memory for the program's lifetime.
+// Module-scope tier-1 pin: the `static EMPTY: SessionParams =
+// SessionParams::new()` referenced from `cold_session_params`
+// carries no SecretBoundedStr bytes — a `'static` value never
+// drops, so its `ZeroizeOnDrop` chain never fires; the only safe
+// state for a static SessionParams is fully pristine (every
+// Option=None, every counter=0). A future refactor of
+// `SessionParams::new()` that initialises a SecretBoundedStr field
+// with a non-empty default would otherwise leak the bytes into
+// static memory for the program's lifetime.
 //
 // Module scope so the const-eval is hoisted out of
 // `cold_session_params`'s body — keeps the inline hint on that
@@ -446,23 +426,20 @@ const _: () = assert!(MAX_ACTIONS_PER_CALL >= 4, "practical batching needs ≥4 
 // inside it that the optimizer might consider when deciding to
 // inline the outer function.
 static _BS11_EMPTY_SESSION_PARAMS: SessionParams = SessionParams::new();
-// DEF-211 INNO-01 (2026-05-04): use the auto-derived
-// `__pristine_const` inherent fn (const-callable) instead of the
-// removed manual `is_pristine` const fn. Runtime polymorphic
-// `<SessionParams as Pristine>::is_pristine` cannot be const-called
-// (trait methods aren't const on stable Rust as of MSRV 1.95).
+// Use the auto-derived `__pristine_const` inherent fn
+// (const-callable). Runtime polymorphic `<SessionParams as
+// Pristine>::is_pristine` cannot be const-called (trait methods
+// aren't const on stable Rust as of MSRV 1.95).
 const _BS11_EMPTY_SESSION_PARAMS_IS_PRISTINE: () = assert!(
     _BS11_EMPTY_SESSION_PARAMS.__pristine_const(),
     "static EMPTY: SessionParams must be pristine — see \
-     `crate::pristine` module + `#[derive(Pristine)]` on SessionParams \
-     (DEF-210 BS-11 + DEF-211 INNO-01)",
+     `crate::pristine` module + `#[derive(Pristine)]` on SessionParams",
 );
 
-// DEF-185 P1-H (audit 2026-04-24): drift pin coupling
-// `READ_BUF_CAP` to the `frames_consumed: u16` counter used in
-// `feed_bytes_impl`. `frames_consumed` accumulates `total_len` per
-// dispatched frame; each `total_len ≤ READ_BUF_CAP`. If
-// `READ_BUF_CAP` ever grew past `u16::MAX`, the counter would
+// Drift pin coupling `READ_BUF_CAP` to the `frames_consumed: u16`
+// counter used in `feed_bytes_impl`. `frames_consumed` accumulates
+// `total_len` per dispatched frame; each `total_len ≤ READ_BUF_CAP`.
+// If `READ_BUF_CAP` ever grew past `u16::MAX`, the counter would
 // silently saturate at 65535, breaking the subsequent
 // `read_buf.advance(usize::from(frames_consumed))` math. The
 // corresponding pin in `buf.rs` couples `READ_BUF_CAP` to
@@ -477,32 +454,25 @@ const _: () = assert!(
 
 /// PostgreSQL wire-protocol state machine.
 ///
-/// **Phase 1a scope:** ships only the Ping flow. The protocol starts
-/// in `Idle`; pushing a `Ping` emits a `Sync`; the matching
-/// `ReadyForQuery` reply transitions back to `Idle` and emits a
-/// `Pong`. See [crate-level docs](crate) for the full architectural
-/// picture.
-///
 /// `!Sync` by construction (`PhantomData<Cell<()>>` field). Concurrent
 /// access is impossible; a `&mut PgProtocol` is the only handle.
 ///
-/// # Size budget (DEF-188 post-arena-deletion 2026-04-25)
+/// # Size budget
 ///
 /// `size_of::<PgProtocol>()` is pinned in `lib.rs`. Budget composition:
 /// - `ReadBuf`            ~4096 B  (I/O staging, READ_BUF_CAP)
 /// - `state`              ~320 B  (ProtoState — RowDesc inline in
-///   streaming/AwaitingRfq variants per DEF-188; SCRAM Boxed per DEF-187)
+///   streaming/AwaitingRfq variants; SCRAM Boxed)
 /// - `session_params`     ~420 B
-/// - `terminal_row_desc`  ~268 B  (DEF-188 single-slot Option<RowDesc>)
-/// - `error_arena`        ~290 B  (DEF-184 A1+A13 single-slot)
+/// - `terminal_row_desc`  ~268 B  (single-slot Option<RowDesc>)
+/// - `error_arena`        ~290 B  (single-slot)
 /// - padding + flags      varies
 ///
 /// Any field addition or size growth must update the pin in
-/// `lib.rs` alongside the code change. See DEF-163 G012 for
-/// this cross-reference discipline.
-/// DEF-196: lazy-init helper for `Option<Box<ErrorArena>>`.
-/// Called by `dispatch.rs` ErrorResponse arms when a server error
-/// payload needs to be parsed and stored.
+/// `lib.rs` alongside the code change.
+/// Lazy-init helper for `Option<Box<ErrorArena>>`. Called by
+/// `dispatch.rs` ErrorResponse arms when a server error payload
+/// needs to be parsed and stored.
 #[inline]
 pub(crate) fn error_arena_or_init(
     slot: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
@@ -512,37 +482,24 @@ pub(crate) fn error_arena_or_init(
     })
 }
 
-// DEF-279 Phase 2 Bundle Commit 13 (2026-05-18) — `PgProtocolInner`
-// DELETED. Every `SealedPhase` now points at a per-phase Inner:
-// `<DisconnectedPhase>::Inner = DisconnectedInner` (ZST, DEF-279
-// Phase 1a), `<ConnectingPhase>::Inner = ConnectingInner` (Phase 1c
-// Bundle Commit 8b), `<ActivePhase>::Inner = ActiveInner` (Phase 2
-// Bundle Commit 12), `<ClosedPhase>::Inner = ClosedInner` (Phase 1b).
-// PgProtocolInner is fully vestigial post-Commit-12 — its struct +
-// impl + `_proto_init_leaf::fresh_inner` constructor +
-// `advance_one_frame_dispatch` free function all delete here.
-//
-// **Tier-1 closure by storage absence** is now complete across every
-// phase: a state-variant-in-wrong-phase write is impossible at the
-// type level. Adding a future variant to `ProtoState` requires the
-// contributor to ALSO route it into the appropriate per-phase enum
-// (`ConnectingState` / `ActiveState`) via the From/TryFrom bijection
-// — orphaned variants fail the build at the projection sites.
-
-
-/// DEF-279 Phase 1c Bundle Commit 2 (2026-05-18) — per-phase Inner
-/// for `<ConnectingPhase>`.
+/// Per-phase Inner for `<ConnectingPhase>`.
 ///
-/// **Narrowed vs [`PgProtocolInner`]** — drops `row_desc_slot` (140 B;
-/// no `RowDescription` reachable from any Connecting state — every
-/// dispatch arm writing `row_desc_slot` is gated on a non-Connecting
-/// state variant in `dispatch.rs`) and `backend_key` (12 B; cell
-/// install deferred to `into_active` via
+/// Every `SealedPhase` now points at a per-phase Inner:
+/// `<DisconnectedPhase>::Inner = DisconnectedInner` (ZST),
+/// `<ConnectingPhase>::Inner = ConnectingInner`,
+/// `<ActivePhase>::Inner = ActiveInner`,
+/// `<ClosedPhase>::Inner = ClosedInner`.
+///
+/// **Narrowed structure** — no `row_desc_slot` field (no
+/// `RowDescription` is reachable from any Connecting state; every
+/// dispatch arm writing `row_desc_slot` is gated on a
+/// non-Connecting state variant in `dispatch.rs`) and the
+/// `backend_key` cell install is deferred to `into_active` via
 /// [`crate::state::ConnectingState::HandshakeReady`] state-variant
-/// signal — `(PostAuthHaveKey, RFQ)` dispatch arm parks
+/// signal — the `(PostAuthHaveKey, RFQ)` dispatch arm parks
 /// `(pid, secret_key)` in the variant data, `into_active` extracts
 /// them and constructs the `BackendKeyCell` on the destination
-/// `PgProtocolInner` (`<ActivePhase>::Inner`)).
+/// `ActiveInner`.
 ///
 /// **Tier-1 closure by storage absence**:
 /// - `<ConnectingPhase>` CANNOT physically hold a non-Connecting
@@ -554,76 +511,62 @@ pub(crate) fn error_arena_or_init(
 ///   (the field doesn't exist; install happens at the phase
 ///   boundary in `into_active`)
 ///
-/// **Layout** (target): state ConnectingState (~48 B) + read_buf
-/// 264 B + 4× 8 B cells/slots + u32 + alignment ≈ **344 B**.
-/// vs PgProtocolInner 536 B → **-192 B per `<ConnectingPhase>`**.
-/// (Memo target was ~296 B based on smaller read_buf assumption;
-/// actual size depends on ReadBuf 264 B which can shrink later via
-/// DEF-058 ring-buffer migration.)
+/// Adding a future variant to `ProtoState` requires the contributor
+/// to ALSO route it into the appropriate per-phase enum
+/// (`ConnectingState` / `ActiveState`) via the From/TryFrom
+/// bijection — orphaned variants fail the build at the projection
+/// sites.
+///
+/// **Layout**: state ConnectingState (~48 B) + read_buf 264 B +
+/// 4× 8 B cells/slots + u32 + alignment ≈ **344 B**. ReadBuf 264 B
+/// can shrink later via a ring-buffer migration.
 ///
 /// **Construction**: only via
 /// [`_proto_init_leaf::fresh_connecting_inner`] (token-gated,
 /// leaf-private) called from `<DisconnectedPhase>::push_startup`.
 ///
-/// **Field visibility**: private. The same `pub` promotion applied
-/// to `PgProtocolInner`/`DisconnectedInner`/`ClosedInner` (E0446
-/// mitigation for the `SealedPhase::Inner` associated type) applies
-/// here — fields stay private, constructors stay leaf-gated.
-///
-/// **Scaffolding stage** (Commit 2): this type is defined but not
-/// yet used as `<ConnectingPhase>::Inner` (still `PgProtocolInner`
-/// in this commit). Commit 3 lands the SealedPhase migration plus
-/// the dispatch-side machinery (connecting_dispatch +
-/// feed_bytes_dispatch_connecting + ConnectingState::HandshakeReady
-/// state-variant signal + method body migration on all
-/// `<ConnectingPhase>::*` methods). Multi-hour work deferred to
-/// next session per CREDO §0 «no half-shipped tier elevations».
-///
-/// **`#[allow(dead_code)]`** justified by the explicit Commit-3
-/// purpose documented above + deferred.md queue entry tracking
-/// the migration as in-flight work.
-#[allow(dead_code, missing_debug_implementations)]
+/// **Field visibility**: private. The `pub` struct declaration is
+/// required to mention the type as an associated `SealedPhase::Inner`
+/// (E0446 mitigation); fields stay private, constructors stay
+/// leaf-gated.
+#[allow(missing_debug_implementations)]
 pub struct ConnectingInner {
     /// State narrowed to [`crate::state::ConnectingState`] variants
     /// (11 handshake states + transient Errored). **Tier-1 closure**:
     /// state-variant-in-wrong-phase is impossible by type — Active
     /// variants don't exist in `ConnectingState`.
     state: crate::state::ConnectingState,
-    /// Mirror of [`PgProtocolInner::read_buf`].
+    /// Inbound wire-byte staging for this connection.
     read_buf: ReadBuf,
-    /// Mirror of [`PgProtocolInner::session_params`]. Populated by
-    /// `ParameterStatus` / `NoticeResponse` filter arms during post-
-    /// auth Connecting states (ConnectingPostAuthAwaitingKey +
+    /// Session parameter accumulator. Populated by
+    /// `ParameterStatus` / `NoticeResponse` filter arms during
+    /// post-auth Connecting states (ConnectingPostAuthAwaitingKey +
     /// ConnectingPostAuthHaveKey).
     session_params: crate::session_params_slot::SessionParamsCell,
-    /// Mirror of [`PgProtocolInner::error_arena`]. Populated by
-    /// `TAG_ERROR_RESPONSE` arms during any Connecting state's
+    /// Lazy-init slot for server ErrorResponse payloads. Populated
+    /// by `TAG_ERROR_RESPONSE` arms during any Connecting state's
     /// `'E'`-frame handling.
     error_arena: Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
-    /// Mirror of [`PgProtocolInner::partial_assembly`]. Used for
-    /// oversize ErrorResponse / NoticeResponse frames during
-    /// handshake.
+    /// Spill buffer for oversize ErrorResponse / NoticeResponse
+    /// frames during handshake.
     partial_assembly: crate::partial_assembly::PartialAssemblyCell,
-    /// Mirror of [`PgProtocolInner::backend_key`].
-    ///
-    /// **Phase 1c Commit 3 (deferred)**: this field will be dropped
-    /// once the `ConnectingState::HandshakeReady` state-variant
-    /// signal lands — the backend-key install moves to
-    /// `into_active` (extracted from the state variant data).
-    /// Kept here in Commit 2 for the same reason as `row_desc_slot`.
+    /// Cancel-key cell. Carried through Connecting so the
+    /// `(PostAuthHaveKey, RFQ)` dispatch arm can park
+    /// `(pid, secret_key)` for `into_active` to extract and
+    /// reconstruct on the destination `ActiveInner`.
     backend_key: crate::cancel::BackendKeyCell,
-    /// Mirror of [`PgProtocolInner::malformed_frame_count`].
+    /// Count of malformed frames observed during handshake.
     malformed_frame_count: u32,
-    /// Mirror of [`PgProtocolInner::sync_marker`].
+    /// `!Sync` witness — `PhantomData<Cell<()>>` makes the type
+    /// non-Sync so a `&mut` is the only handle.
     sync_marker: PhantomData<Cell<()>>,
 }
 
-/// DEF-279 Phase 2 Bundle Commit 9 (2026-05-18) — per-phase Inner
-/// for `<ActivePhase>`.
+/// Per-phase Inner for `<ActivePhase>`.
 ///
-/// **Narrowed vs [`PgProtocolInner`]**: state field type narrows to
-/// [`crate::state::ActiveState`] (~80 B, same as ProtoState). The
-/// other seven fields are byte-identical to PgProtocolInner — no
+/// State field type narrows to [`crate::state::ActiveState`]
+/// (~80 B, same as ProtoState). The other seven fields are
+/// byte-identical to the carried Connecting cells — no
 /// post-handshake field can be physically dropped (every cell is
 /// reachable from at least one Active variant).
 ///
@@ -634,58 +577,49 @@ pub struct ConnectingInner {
 /// - State-variant-in-wrong-phase is impossible by-type.
 ///
 /// **Layout**: ~536 B (state ActiveState 80 B + read_buf 264 B +
-/// 4 cells 8 B each + u32 + alignment). Byte-identical to today's
-/// PgProtocolInner — the per-phase split delivers tier-1 closure
-/// without a footprint regression.
+/// 4 cells 8 B each + u32 + alignment). The per-phase split
+/// delivers tier-1 closure without a footprint regression.
 ///
 /// **Construction**: only via [`_proto_init_leaf::fresh_active_inner`]
-/// (Commit 12) called from `<ConnectingPhase>::into_active`.
-///
-/// **Scaffolding stage** (Commit 9): this type is defined but not
-/// yet used as `<ActivePhase>::Inner` (still `PgProtocolInner` in
-/// this commit). Commit 12 lands the SealedPhase flip plus the
-/// `<ConnectingPhase>::into_active` rebuild that produces an
-/// ActiveInner instead of PgProtocolInner.
-///
-/// **`#[allow(dead_code)]`** justified by the explicit Commit-12
-/// target purpose documented above + deferred.md queue entry.
-#[allow(dead_code, missing_debug_implementations)]
+/// called from `<ConnectingPhase>::into_active`.
+#[allow(missing_debug_implementations)]
 pub struct ActiveInner {
     /// State narrowed to [`crate::state::ActiveState`] variants
     /// (Idle + PingAwaitingRfq + all SimpleQuery/Parse/BindExecute/
     /// Describe flow variants + DrainRfqAfterError + transient
     /// Errored).
     state: crate::state::ActiveState,
-    /// Mirror of [`PgProtocolInner::read_buf`].
+    /// Inbound wire-byte staging for this connection.
     read_buf: ReadBuf,
-    /// Mirror of [`PgProtocolInner::session_params`].
+    /// Session parameter accumulator.
     session_params: crate::session_params_slot::SessionParamsCell,
-    /// Mirror of [`PgProtocolInner::error_arena`].
+    /// Lazy-init slot for server ErrorResponse payloads.
     error_arena: Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
-    /// Mirror of [`PgProtocolInner::partial_assembly`].
+    /// Spill buffer for oversize ErrorResponse / NoticeResponse
+    /// frames during query execution.
     partial_assembly: crate::partial_assembly::PartialAssemblyCell,
-    /// Mirror of [`PgProtocolInner::backend_key`]. Installed at
-    /// handshake completion by `<ConnectingPhase>::into_active`
-    /// (extracted from the per-phase Connecting cell during the
-    /// phase transition).
+    /// Cancel-key cell. Installed at handshake completion by
+    /// `<ConnectingPhase>::into_active` (extracted from the
+    /// per-phase Connecting cell during the phase transition).
     backend_key: crate::cancel::BackendKeyCell,
-    /// Mirror of [`PgProtocolInner::malformed_frame_count`].
+    /// Count of malformed frames observed during query execution.
     malformed_frame_count: u32,
-    /// Mirror of [`PgProtocolInner::sync_marker`].
+    /// `!Sync` witness — `PhantomData<Cell<()>>` makes the type
+    /// non-Sync so a `&mut` is the only handle.
     sync_marker: PhantomData<Cell<()>>,
 }
 
-/// DEF-279 Phase 1c prerequisite (2026-05-18) — dispatch-context bundle.
+/// Dispatch-context bundle.
 ///
-/// Captures the eight per-connection mutable references the dispatch
-/// path consumes inside a single struct, so the dispatch body lives
-/// as a **free function** (not a method on `PgProtocolInner`). Phase
-/// 1c introduces per-phase `Inner` types whose fields are a SUBSET
-/// of `PgProtocolInner`'s; the free-function form lets each phase's
-/// inherent method assemble its own `DispatchContext` (built from
-/// the fields IT carries) and forward to the same dispatch body
-/// without method-resolution forcing the body to live on a single
-/// concrete `Self`.
+/// Captures the eight per-connection mutable references the
+/// dispatch path consumes inside a single struct, so the dispatch
+/// body lives as a **free function** (not a method on any per-phase
+/// Inner). Per-phase `Inner` types carry SUBSETS of these fields;
+/// the free-function form lets each phase's inherent method
+/// assemble its own `DispatchContext` (built from the fields IT
+/// carries) and forward to the same dispatch body without
+/// method-resolution forcing the body to live on a single concrete
+/// `Self`.
 ///
 /// **Construction**: the disjoint-field-borrow rule (Rust 2018+)
 /// lets `DispatchContext { state: &mut self.state, ... }` build the
@@ -693,13 +627,13 @@ pub struct ActiveInner {
 /// struct literal — the borrow checker splits the borrow per-field.
 ///
 /// **Tier impact**: refactoring-only. The free function
-/// [`feed_bytes_dispatch`] body is bit-identical to the pre-refactor
-/// `PgProtocolInner::feed_bytes_impl` body (asm-diff verified);
-/// the eight `&mut` parameters compile down to register pressure
-/// equivalent to `&mut self` since each field's offset is a
-/// constant displacement from `self`. LLVM inlines the wrapper
-/// methods unconditionally (`#[inline]` not needed — single-call
-/// thin delegate with no other code).
+/// [`feed_bytes_dispatch`] body is bit-identical to a method on a
+/// monolithic Inner (asm-diff verified); the eight `&mut`
+/// parameters compile down to register pressure equivalent to
+/// `&mut self` since each field's offset is a constant displacement
+/// from `self`. LLVM inlines the wrapper methods unconditionally
+/// (`#[inline]` not needed — single-call thin delegate with no
+/// other code).
 ///
 /// **Why not a method on a per-phase trait?** A trait method bound
 /// `T: HasDispatchFields` would re-introduce the by-discipline gap
@@ -707,25 +641,22 @@ pub struct ActiveInner {
 /// dispatch body without `unsafe`). The free function takes the
 /// `DispatchContext` by value — only code that already has eight
 /// disjoint `&mut` refs to the right field types can call it. The
-/// phase-narrow `Inner` types in Phase 1c lack some of these fields
-/// (e.g. `DisconnectedInner` has no `state`/`read_buf`) and
-/// physically cannot construct a `DispatchContext` — tier-1 closure
-/// at the type level.
-/// DEF-279 Phase 1c Bundle Commit 5.5 (2026-05-18) — lifetime split.
+/// phase-narrow `Inner` types lack some of these fields (e.g.
+/// `DisconnectedInner` has no `state`/`read_buf`) and physically
+/// cannot construct a `DispatchContext` — tier-1 closure at the
+/// type level.
 ///
-/// `'state` covers the state `&mut` (lifted local in per-phase lift+lower
-/// wrappers). `'r` covers all other `&mut` refs that flow into
-/// [`OutActions<'_, 'r>`] via `materialise`. Independent lifetimes
-/// enable per-phase wrappers (Commit 6+) to provide a short-lived
-/// lifted `&mut ProtoState` (local owned `proto_state`) alongside
-/// outer-lifetime borrows for the data fields. Returns
+/// **Lifetimes**: `'state` covers the state `&mut` (lifted local in
+/// per-phase lift+lower wrappers). `'r` covers all other `&mut`
+/// refs that flow into [`OutActions<'_, 'r>`] via `materialise`.
+/// Independent lifetimes enable per-phase wrappers to provide a
+/// short-lived lifted `&mut ProtoState` (local owned `proto_state`)
+/// alongside outer-lifetime borrows for the data fields. Returns
 /// `OutActions<'w, 'r>` constrained only by `'r`, so the wrapper's
 /// projection of state back to per-phase form after the call does
-/// not constrain the return-borrow lifetime.
-///
-/// **Existing single-lifetime call sites** (`<ActivePhase>::feed_bytes`,
-/// `<ConnectingPhase>::feed_bytes`, etc.) infer `'state = 'r` from
-/// `&mut self` and compile unchanged.
+/// not constrain the return-borrow lifetime. Single-lifetime call
+/// sites (`<ActivePhase>::feed_bytes`, `<ConnectingPhase>::feed_bytes`,
+/// etc.) infer `'state = 'r` from `&mut self` and compile unchanged.
 pub(in crate::protocol) struct DispatchContext<'state, 'r> {
     pub(in crate::protocol) state: &'state mut ProtoState,
     pub(in crate::protocol) read_buf: &'r mut ReadBuf,
@@ -741,37 +672,26 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-246 Phase 1 — Branch-collapse typestate scaffolding (2026-05-16)
+// Branch-collapse typestate scaffolding
 //
 // `PgProtocol<P: SealedPhase>` is a `#[repr(transparent)]` wrapper
-// over `PgProtocolInner` + a ZST `PhantomData<fn() -> P>` phase
-// marker. Layout is byte-identical to pre-DEF-246 `PgProtocol`.
+// over a per-phase `Inner` + a ZST `PhantomData<fn() -> P>` phase
+// marker.
 //
-// Phase 1 deliverables (memo §7.7):
 // - 4 ZST phase markers: DisconnectedPhase / ConnectingPhase /
-//   ActivePhase / ClosedPhase (memo §1 phase taxonomy)
-// - `SealedPhase` super-trait via `_sealed_phase::Sealed` (mirrors
-//   DEF-244 sealed-trait pattern + DEF-272 leaf-token pattern)
+//   ActivePhase / ClosedPhase
+// - `SealedPhase` super-trait via `_sealed_phase::Sealed`
+//   (field-private tuple-struct seal — downstream code cannot
+//   extend the phase set)
 // - `PgProtocol<P: SealedPhase = ActivePhase>` outer wrapper
-// - `Deref` / `DerefMut` from `PgProtocol<P>` to `PgProtocolInner`
-//   (canonical zero-cost-wrapper idiom — `repr(transparent)` + Deref
-//   is the idiomatic Rust pair). Field access via `self.<field>`
-//   continues to work in existing methods without 78 manual
-//   substitutions; the deref coercion is structurally zero-cost
-//   (asm-diff confirms bit-identical hot paths).
-// - Default phase `P = ActivePhase` keeps every existing caller
-//   (`PgProtocol::new()`, type-name `PgProtocol` in tests/benches,
-//   `impl X for PgProtocol`) compiling without changes
-//
-// Tier impact: 0 elevations (scaffolding only). Phase 2-4 land the
-// 3 tier-elevations (push-before-Startup, push-during-Connecting,
-// Errored absorbs input) on top of this scaffolding. Phase 6 removes
-// the default phase parameter for final API stabilisation.
+// - Default phase `P = ActivePhase` keeps the call-site type name
+//   `PgProtocol` resolving to the post-handshake form without
+//   forcing every caller (`PgProtocol::new()`, `impl X for
+//   PgProtocol`, tests, benches) to spell the parameter out.
 // ═════════════════════════════════════════════════════════════════════
 
-/// DEF-246 Phase 1 sealed-trait seal for [`SealedPhase`]. Field-private
-/// tuple-struct pattern (mirror of DEF-272 leaf tokens) ensures
-/// downstream code cannot extend the phase set via
+/// Sealed-trait seal for [`SealedPhase`]. Field-private tuple-struct
+/// pattern ensures downstream code cannot extend the phase set via
 /// `impl SealedPhase for MyPhase`.
 pub(crate) mod _sealed_phase {
     /// Super-trait seal. Field-less marker. Implemented only for the
@@ -779,7 +699,7 @@ pub(crate) mod _sealed_phase {
     pub trait Sealed {}
 }
 
-/// DEF-246 Phase 1 sealed phase marker trait.
+/// Sealed phase marker trait.
 ///
 /// `P: SealedPhase` is the type-level proof that the runtime
 /// [`PgProtocol<P>`] is in phase `P`. The trait is sealed via
@@ -796,7 +716,7 @@ pub(crate) mod _sealed_phase {
     note = "the phase set is sealed by `_sealed_phase::Sealed`; downstream cannot add phases. Extend by editing `mod protocol` in the bsql-pg-proto crate."
 )]
 pub trait SealedPhase: _sealed_phase::Sealed + 'static {
-    /// DEF-279 Phase 1a (2026-05-18): per-phase Inner storage type.
+    /// Per-phase Inner storage type.
     ///
     /// The associated type is a non-GAT plain assoc-type (no lifetime
     /// parameters). Each phase's `Inner` carries only the fields that
@@ -805,38 +725,34 @@ pub trait SealedPhase: _sealed_phase::Sealed + 'static {
     /// other than `sync_marker: PhantomData<Cell<()>>` for `!Sync`
     /// propagation.
     ///
-    /// # Phase 1a scope
-    ///
-    /// Phase 1a (this commit) introduces the associated type and
-    /// SPLITS the Disconnected phase:
-    /// - [`DisconnectedPhase`]: `type Inner = DisconnectedInner` (ZST,
-    ///   0 B). The fields `state` / `read_buf` / `row_desc_slot` /
-    ///   `session_params` / `error_arena` / `partial_assembly` /
-    ///   `backend_key` are STORAGE-ABSENT pre-Startup; pre-Bundle they
-    ///   lived on a shared `PgProtocolInner` and were null/empty by
-    ///   discipline, tier-3-by-construction. Post-Bundle the storage
-    ///   physically does not exist on `<DisconnectedPhase>` —
+    /// Mapping:
+    /// - [`DisconnectedPhase`]: `type Inner = DisconnectedInner`
+    ///   (ZST, 0 B). A naive shape would carry `state` / `read_buf`
+    ///   / `session_params` / `error_arena` / `partial_assembly` /
+    ///   `backend_key` cells on a shared monolithic Inner with
+    ///   null/empty values pre-Startup — that's tier-3
+    ///   by-state-machine-reasoning. Instead the storage physically
+    ///   does not exist on `<DisconnectedPhase>` —
     ///   tier-1-by-storage-absence.
-    /// - [`ConnectingPhase`] / [`ActivePhase`] / [`ClosedPhase`]:
-    ///   `type Inner = PgProtocolInner` (536 B unchanged). Future
-    ///   Phase 1b/1c/1d will diverge `ClosedInner` (small) and
-    ///   `ConnectingInner` (medium), keeping `ActiveInner` at full
-    ///   weight per Direction 1.B memo §1 final recommendation.
+    /// - [`ConnectingPhase`]: `type Inner = ConnectingInner` (~344 B
+    ///   narrowed — no `row_desc_slot`, no `backend_key` until
+    ///   `into_active`).
+    /// - [`ActivePhase`]: `type Inner = ActiveInner` (~536 B full
+    ///   weight; every cell reachable from at least one Active
+    ///   variant).
+    /// - [`ClosedPhase`]: `type Inner = ClosedInner` (16 B —
+    ///   state_kind + error_arena Box only).
     ///
-    /// # Verification
-    ///
-    /// Layout pins in `lib.rs:868-893` assert per-phase size:
-    /// - `size_of::<PgProtocol<DisconnectedPhase>>() == 0` (Phase 1a).
-    /// - `size_of::<PgProtocol<{Connecting,Active,Closed}>>() == 536`
-    ///   (unchanged through Phase 1a; will diverge per phase).
+    /// Layout pins in `lib.rs` assert per-phase size; a regression
+    /// in any Inner mapping shifts the layout and trips the
+    /// `const _: () = assert!(…)` gates at compile time.
     type Inner;
 
-    /// DEF-279 follow-up (2026-05-18) — per-phase outer Extras storage.
+    /// Per-phase outer Extras storage.
     ///
     /// Holds cells whose write surface is reachable only from a SUBSET
     /// of phases — keeping such cells out of the broader phases' Inner
-    /// achieves tier-1 closure on the dispatch-arm-can't-write side
-    /// (Interpretation B per architect verdict).
+    /// achieves tier-1 closure on the dispatch-arm-can't-write side.
     ///
     /// # Mapping
     ///
@@ -861,7 +777,7 @@ pub trait SealedPhase: _sealed_phase::Sealed + 'static {
     /// on the outer monomorphisation. The doctest below pins this
     /// type-level invariant.
     ///
-    /// # Compile-fail probe (DEF-279 follow-up trybuild)
+    /// # Compile-fail probe
     ///
     /// **(i) `row_desc_slot` field does not exist on
     /// `PgProtocol<ConnectingPhase>`:**
@@ -887,51 +803,43 @@ pub trait SealedPhase: _sealed_phase::Sealed + 'static {
     type Extras;
 }
 
-/// DEF-246 Phase 1 — Disconnected phase marker.
+/// Disconnected phase marker.
 ///
 /// `PgProtocol<DisconnectedPhase>` represents a fresh protocol
 /// instance that has not yet sent the Startup message. The legal
-/// operation is `push_startup(...)` (Phase 2 will introduce this).
-/// Pushing a regular command from this phase will be a method-absent
-/// E0599 compile error.
-///
-/// Phase 1: marker only; no phase-conditional methods yet.
+/// operation is `push_startup(...)`. Pushing a regular command from
+/// this phase is a method-absent E0599 compile error.
 #[derive(Debug, Clone, Copy)]
 pub struct DisconnectedPhase;
 
-/// DEF-246 Phase 1 — Connecting phase marker.
+/// Connecting phase marker.
 ///
 /// `PgProtocol<ConnectingPhase>` represents the Startup → AuthOk
 /// handshake window. The legal operations are `feed_inbound` /
 /// `advance_one_frame` to consume server-driven auth-flow frames.
-/// Pushing a regular command from this phase will be a method-absent
-/// E0599 compile error (Phase 3 elevation).
-///
-/// Phase 1: marker only.
+/// Pushing a regular command from this phase is a method-absent
+/// E0599 compile error.
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectingPhase;
 
-/// DEF-246 Phase 1 — Active phase marker.
+/// Active phase marker.
 ///
 /// `PgProtocol<ActivePhase>` represents the post-handshake, ready
-/// state. This is the **default** phase parameter — every existing
-/// caller and impl block continues to compile unchanged because
-/// `PgProtocol` (no explicit phase) resolves to
-/// `PgProtocol<ActivePhase>`.
+/// state. This is the **default** phase parameter — every caller
+/// and impl block that writes `PgProtocol` (no explicit phase)
+/// resolves to `PgProtocol<ActivePhase>`.
 ///
-/// All existing methods (push, feed, materialise, etc.) live on
-/// `impl PgProtocol<ActivePhase>` in Phase 1.
+/// All command / feed / materialise methods live on
+/// `impl PgProtocol<ActivePhase>`.
 #[derive(Debug, Clone, Copy)]
 pub struct ActivePhase;
 
-/// DEF-246 Phase 1 — Closed phase marker.
+/// Closed phase marker.
 ///
-/// `PgProtocol<ClosedPhase>` represents a terminally-Errored protocol
-/// instance. The legal operation is `cause()` accessor (Phase 4 will
-/// introduce this). All push / feed paths are method-absent E0599
-/// compile errors (Phase 4 elevation — «Errored absorbs input»).
-///
-/// Phase 1: marker only.
+/// `PgProtocol<ClosedPhase>` represents a terminally-Errored
+/// protocol instance. The legal operation is `cause()` accessor;
+/// all push / feed paths are method-absent E0599 compile errors
+/// («Errored absorbs input»).
 #[derive(Debug, Clone, Copy)]
 pub struct ClosedPhase;
 
@@ -940,48 +848,37 @@ impl _sealed_phase::Sealed for ConnectingPhase {}
 impl _sealed_phase::Sealed for ActivePhase {}
 impl _sealed_phase::Sealed for ClosedPhase {}
 
-/// DEF-279 Phase 1a (2026-05-18) — process-global reply-id counter.
+/// Process-global reply-id counter.
 ///
 /// Shared across all four phases' `next_reply_id` mint sites.
-/// Pre-Bundle this was a function-local `static COUNTER` inside
-/// `PgProtocolInner::next_reply_id` (line ~3347); Disconnected
-/// delegated via `self.inner.next_reply_id::<K>()`. Post-Bundle
-/// `<DisconnectedPhase>::Inner` is the ZST `DisconnectedInner` with
-/// no `next_reply_id` method to delegate to — the counter must live
-/// at a layer reachable from BOTH `<DisconnectedPhase>` (via
-/// `super::PROCESS_REPLY_ID_COUNTER`) and `PgProtocolInner::
-/// next_reply_id` (the other three phases route through here).
+/// Lives at module scope so `<DisconnectedPhase>` (whose ZST Inner
+/// has no `next_reply_id` method to delegate to) can mint reply ids
+/// via `super::PROCESS_REPLY_ID_COUNTER` and the other three phases
+/// route through the same counter.
 ///
 /// **Process-global uniqueness** is the load-bearing invariant: a
 /// reply id minted on a Disconnected → push_startup path AND a
 /// reply id minted on a parallel `<ActivePhase>::push_command`
-/// on a different `PgProtocol` instance MUST never collide.
-/// `static AtomicU64` at module scope guarantees this; per-instance
-/// or per-phase counters would not.
+/// on a different `PgProtocol` instance MUST never collide. A naive
+/// per-instance or per-phase counter would not provide this.
+/// `static AtomicU64` at module scope does.
 pub(crate) static PROCESS_REPLY_ID_COUNTER: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// DEF-279 Phase 1a (2026-05-18) — Per-phase Inner for the Disconnected phase.
+/// Per-phase Inner for the Disconnected phase.
 ///
-/// **Tier-1 by storage absence**: pre-Bundle `<DisconnectedPhase>` shared
-/// the 536-B `PgProtocolInner` with all other phases (`state` /
-/// `read_buf` / `row_desc_slot` / `session_params` / `error_arena` /
-/// `partial_assembly` / `backend_key`). All of these were null/empty
-/// pre-Startup by construction (the state machine has no transition
-/// into Disconnected that populates them), but the storage existed
-/// for them — tier-3 by-state-machine-reasoning.
-///
-/// Post-Bundle the storage IS the proof: `DisconnectedInner` carries
-/// only `sync_marker: PhantomData<Cell<()>>` for `!Sync` auto-trait
-/// propagation. `size_of::<DisconnectedInner>() == 0` (ZST).
-///
-/// Forward to Phase 1b/1c: `ClosedInner` will be similarly narrowed
-/// (state_kind only); `ConnectingInner` will drop `row_desc_slot` /
-/// `backend_key`. `ActiveInner` stays at full weight in Phase 1.
-// DEF-279 Phase 1a (2026-05-18): struct visibility `pub` for the
-// same E0446 reason as `PgProtocolInner` (associated type can't leak
-// a crate-private type through the public `SealedPhase` trait
-// surface). Fields are private; construction is via
+/// **Tier-1 by storage absence**: `DisconnectedInner` carries only
+/// `sync_marker: PhantomData<Cell<()>>` for `!Sync` auto-trait
+/// propagation. `size_of::<DisconnectedInner>() == 0` (ZST). A
+/// naive shape would carry the full set of post-handshake cells
+/// (`state` / `read_buf` / `session_params` / `error_arena` /
+/// `partial_assembly` / `backend_key`) and rely on the state
+/// machine to leave them null/empty pre-Startup — tier-3
+/// by-state-machine-reasoning. Instead the storage physically does
+/// not exist on `<DisconnectedPhase>`.
+// Struct visibility `pub` for the E0446 reason (associated type
+// can't leak a crate-private type through the public `SealedPhase`
+// trait surface). Fields are private; construction is via
 // `<PgProtocol<DisconnectedPhase>>::new()` only — promoted name
 // visibility adds no new external capability.
 #[derive(Debug)]
@@ -990,49 +887,37 @@ pub(crate) static PROCESS_REPLY_ID_COUNTER: core::sync::atomic::AtomicU64 =
     reason = "DisconnectedInner is a ZST whose only field (PhantomData) is Copy-eligible, but PgProtocol<P> is intentionally !Copy by design: consume-self phase transitions (push_startup/into_active/into_closed) take self by-value, and a Copy wrapper would allow the caller to retain a stale duplicate post-transition (defeating the type-level proof that the phase has moved). The PhantomData<Cell<()>> sync_marker is the !Sync witness; non-Copy preserves the consume-self lifecycle."
 )]
 pub struct DisconnectedInner {
-    /// `!Sync` auto-trait propagation via `PhantomData<Cell<()>>` —
-    /// mirror of `PgProtocolInner::sync_marker`. Layout-zero, named
-    /// without leading underscore (user-feedback convention: structurally
+    /// `!Sync` auto-trait propagation via `PhantomData<Cell<()>>`.
+    /// Layout-zero, named without leading underscore (structurally
     /// load-bearing fields are not `_`-prefixed).
     sync_marker: PhantomData<core::cell::Cell<()>>,
 }
 
-/// DEF-279 Phase 1b (2026-05-18) — Per-phase Inner for the Closed
-/// (terminally-Errored) phase.
+/// Per-phase Inner for the Closed (terminally-Errored) phase.
 ///
-/// **Tier-1 by storage absence**: pre-Bundle `<ClosedPhase>` shared
-/// the 536-B `PgProtocolInner` with all other phases — but
-/// post-Errored only `state_kind` (carried in `inner.state =
-/// Errored(k)`) and `error_arena` (carried for follow-up server-error
-/// lookup) are reachable through the legitimate `<ClosedPhase>` API.
-/// The remaining ~512 B (read_buf, row_desc_slot, session_params,
-/// partial_assembly, backend_key, malformed_frame_count, sync_marker,
-/// full ProtoState union space) were architecturally dead post-transition
-/// but kept allocated until the protocol itself dropped.
-///
-/// Post-Bundle the storage IS the proof: `ClosedInner` carries only
-/// the cause + the arena handle. `into_closed_if_errored` and the
+/// **Tier-1 by storage absence**: post-Errored only `state_kind`
+/// and `error_arena` are reachable through the legitimate
+/// `<ClosedPhase>` API. A naive shape would keep the full 536-B
+/// post-handshake cell set allocated until the protocol itself
+/// dropped — architecturally dead but visible to any future API
+/// addition. Instead `into_closed_if_errored` and the
 /// `<ConnectingPhase>::into_active` Closed arm extract `state_kind`
-/// (Copy from `&inner.state`'s Errored arm) + `mem::take` the
-/// error_arena Box; the rest of PgProtocolInner Drops at the
-/// transition boundary, releasing ~520 B of stack + any heap behind
-/// the Box-niche cells.
+/// (Copy from the Errored arm) + `mem::take` the error_arena Box;
+/// the rest Drops at the transition boundary, releasing ~520 B of
+/// stack + any heap behind the Box-niche cells.
 ///
 /// `size_of::<ClosedInner>() == 16 B` (state_kind 1B + 7B pad +
-/// error_arena Option<Box> 8B). `<DisconnectedInner>` (Phase 1a)
-/// was 0 B; `<ClosedInner>` is the second-narrowest phase Inner.
-/// Phase 1c will narrow `<ConnectingInner>` (~296 B); Phase 1d
-/// the `<ActivePhase>` Cell collapse closes the bundle.
+/// error_arena Option<Box> 8B). `DisconnectedInner` is 0 B;
+/// `ClosedInner` is the second-narrowest phase Inner.
 #[derive(Debug)]
 pub struct ClosedInner {
-    /// `!Sync` auto-trait propagation; same role as
-    /// `PgProtocolInner::sync_marker`.
+    /// `!Sync` auto-trait propagation.
     sync_marker: PhantomData<core::cell::Cell<()>>,
-    /// Terminal cause classifier — extracted from
-    /// `PgProtocolInner::state.Errored(state_kind)` at the transition
-    /// boundary. The full `ProtoState` enum (80 B) is not retained
-    /// post-Bundle: the only legal Closed-state variant is `Errored(_)`
-    /// and `state_kind` IS the variant payload.
+    /// Terminal cause classifier — extracted from the transition
+    /// boundary's `Errored(state_kind)` variant. The full
+    /// `ProtoState` enum (80 B) is not retained: the only legal
+    /// Closed-state variant is `Errored(_)` and `state_kind` IS the
+    /// variant payload.
     state_kind: crate::error::StateErrorKind,
     /// Server-error arena handle — preserved across the transition
     /// for follow-up `ErrorRef → ErrorPayload` lookups (the wrapper
@@ -1049,34 +934,29 @@ impl SealedPhase for DisconnectedPhase {
     type Extras = ();
 }
 impl SealedPhase for ConnectingPhase {
-    // DEF-279 Phase 1c Bundle Commit 8b (2026-05-18): FLIPPED from
-    // `PgProtocolInner` to per-phase [`ConnectingInner`]. Tier-1
-    // closure on state-variant-in-wrong-phase by storage absence
-    // (`ConnectingInner.state: ConnectingState` — no Active variants
-    // exist in the per-phase enum).
+    // Tier-1 closure on state-variant-in-wrong-phase by storage
+    // absence (`ConnectingInner.state: ConnectingState` — no Active
+    // variants exist in the per-phase enum).
     //
-    // DEF-279 follow-up (2026-05-18, architect Interpretation B):
-    // `row_desc_slot` HOISTED off Inner — `<ConnectingPhase>::Extras
-    // = ()` (storage-absence at the outer). The `feed_bytes_dispatch_
-    // connecting` wrapper mints a stack-local transient
-    // RowDescSlotCell that the shared dispatch body can name; the
-    // transient is empty (Connecting LHS arms never write it), and
-    // drops with the wrapper's frame. Tier-1 closure on
-    // outer-level-can't-write-schema by storage absence.
+    // `row_desc_slot` lives off the Inner —
+    // `<ConnectingPhase>::Extras = ()` (storage-absence at the
+    // outer). The `feed_bytes_dispatch_connecting` wrapper mints a
+    // stack-local transient RowDescSlotCell that the shared
+    // dispatch body can name; the transient is empty (Connecting
+    // LHS arms never write it), and drops with the wrapper's frame.
+    // Tier-1 closure on outer-level-can't-write-schema by storage
+    // absence.
     type Inner = ConnectingInner;
     type Extras = ();
 }
 impl SealedPhase for ActivePhase {
-    // DEF-279 Phase 2 Bundle Commit 12 (2026-05-18): FLIPPED from
-    // `PgProtocolInner` to per-phase [`ActiveInner`]. Tier-1
-    // closure on state-variant-in-wrong-phase by storage absence
-    // (`ActiveInner.state: ActiveState` — no Connecting variants
-    // exist in the per-phase enum).
+    // Tier-1 closure on state-variant-in-wrong-phase by storage
+    // absence (`ActiveInner.state: ActiveState` — no Connecting
+    // variants exist in the per-phase enum).
     //
-    // DEF-279 follow-up (2026-05-18, architect Interpretation B):
-    // `row_desc_slot` HOISTED off Inner — `<ActivePhase>::Extras =
-    // RowDescSlotCell`. The cell lives on the outer for Active alone;
-    // the `feed_bytes_dispatch_active` wrapper borrows
+    // `row_desc_slot` lives on the outer for Active alone —
+    // `<ActivePhase>::Extras = RowDescSlotCell`. The
+    // `feed_bytes_dispatch_active` wrapper borrows
     // `&mut self.extras` and threads it into the shared dispatch
     // body's `DispatchContext`. Net footprint preserved (slot moved
     // from Inner → outer Extras for Active monomorphisation).
@@ -1084,34 +964,30 @@ impl SealedPhase for ActivePhase {
     type Extras = crate::schema_slot::RowDescSlotCell;
 }
 impl SealedPhase for ClosedPhase {
-    // DEF-279 Phase 1b (2026-05-18): switched from `PgProtocolInner`
-    // (536 B) to `ClosedInner` (~16 B). The transition sites
-    // (`<ActivePhase>::into_closed_if_errored` and
-    // `<ConnectingPhase>::into_active` Closed arm) materialise a
-    // fresh ClosedInner via `state_kind` extract + `mem::take` of
-    // the error_arena, letting the remaining PgProtocolInner fields
+    // The transition sites (`<ActivePhase>::into_closed_if_errored`
+    // and `<ConnectingPhase>::into_active` Closed arm) materialise
+    // a fresh ClosedInner via `state_kind` extract + `mem::take` of
+    // the error_arena, letting the remaining outgoing-Inner fields
     // Drop at the boundary.
     type Inner = ClosedInner;
     type Extras = ();
 }
 
-/// DEF-246 Phase 1 — Phase-typed wrapper over [`PgProtocolInner`].
+/// Phase-typed wrapper over the per-phase Inner storage.
 ///
-/// `#[repr(transparent)]` over a single non-ZST field
-/// (`inner: PgProtocolInner`) and a ZST
-/// [`PhantomData<fn() -> P>`] — layout is byte-identical to
-/// `PgProtocolInner` (and to pre-DEF-246 `PgProtocol`). The
-/// `fn() -> P` phantom shape gives covariant `P` + unconditional
-/// `Send + Sync` of the phantom itself (the wrapper's `!Sync`
-/// inherits from `inner.sync_marker: PhantomData<Cell<()>>` via
-/// `repr(transparent)` auto-trait propagation).
+/// `#[repr(transparent)]` over the per-phase `Inner` field plus a
+/// ZST [`PhantomData<fn() -> P>`]. The `fn() -> P` phantom shape
+/// gives covariant `P` + unconditional `Send + Sync` of the phantom
+/// itself (the wrapper's `!Sync` inherits from
+/// `inner.sync_marker: PhantomData<Cell<()>>` via `repr(transparent)`
+/// auto-trait propagation).
 ///
-/// **Default `P = ActivePhase`** — Phase 1 is purely additive: every
-/// existing `PgProtocol::new()`, `let proto: PgProtocol = ...`,
-/// `impl Trait for PgProtocol`, etc., resolves to
-/// `PgProtocol<ActivePhase>`. **No caller code changes in Phase 1.**
+/// **Default `P = ActivePhase`** — every `PgProtocol::new()`,
+/// `let proto: PgProtocol = ...`, `impl Trait for PgProtocol`, etc.,
+/// resolves to `PgProtocol<ActivePhase>` without spelling the
+/// parameter out.
 ///
-/// # Field-access discipline (foundation for Phase 2+)
+/// # Field-access discipline
 ///
 /// Methods inside `impl PgProtocol<P>` access inner fields via
 /// **explicit `self.inner.<field>`** — there is no [`Deref`] /
@@ -1121,16 +997,13 @@ impl SealedPhase for ClosedPhase {
 /// 1. **Phase transitions** (`fn into_connecting(self) -> PgProtocol<ConnectingPhase>`)
 ///    move `self.inner` into the new wrapper — the boundary is
 ///    visible at the call site, not hidden by deref coercion.
-/// 2. **Phase-conditional methods** (Phase 2+: `impl PgProtocol<DisconnectedPhase>`
-///    gets `push_startup`, `impl PgProtocol<ClosedPhase>` gets
-///    `cause()`-only surface) read `self.inner.<field>` — uniform
-///    access pattern across all phase impls regardless of which
-///    inner fields the phase touches.
-/// 3. **Future inner-state evolution** — if Phase 4 adds an
-///    error-tracking field on `PgProtocolInner`, the new field is
-///    accessible via the same `self.inner.<new_field>` pattern;
-///    deref-based access would need additional method shadowing
-///    discipline to handle phase-conditional inner fields.
+/// 2. **Phase-conditional methods** read `self.inner.<field>` —
+///    uniform access pattern across all phase impls regardless of
+///    which inner fields the phase touches.
+/// 3. **Future inner-state evolution** — a new field on a per-phase
+///    Inner is accessible via the same `self.inner.<new_field>`
+///    pattern; deref-based access would need additional method
+///    shadowing discipline to handle phase-conditional inner fields.
 ///
 /// The `inner` field is **module-private** (no visibility modifier),
 /// not `pub(crate)`. Sibling modules (`dispatch.rs`, `row_stream.rs`,
@@ -1139,9 +1012,9 @@ impl SealedPhase for ClosedPhase {
 /// `mod protocol` (and its leaf submodules per Rust submodule
 /// visibility rules).
 pub struct PgProtocol<P: SealedPhase = ActivePhase> {
-    // DEF-279 Phase 1a (2026-05-18): per-phase `Inner` storage via the
-    // associated type `<P as SealedPhase>::Inner`. Each monomorphisation
-    // has a concrete layout:
+    // Per-phase `Inner` storage via the associated type
+    // `<P as SealedPhase>::Inner`. Each monomorphisation has a
+    // concrete layout:
     //   PgProtocol<DisconnectedPhase> ≡ DisconnectedInner (ZST, 0 B)
     //                                 + Extras = () (ZST) → 0 B
     //   PgProtocol<ConnectingPhase>   ≡ ConnectingInner (narrowed, no slot)
@@ -1151,90 +1024,72 @@ pub struct PgProtocol<P: SealedPhase = ActivePhase> {
     //   PgProtocol<ClosedPhase>       ≡ ClosedInner (16 B)
     //                                 + Extras = () (ZST) → 16 B
     inner: <P as SealedPhase>::Inner,
-    /// DEF-279 follow-up (2026-05-18, architect Interpretation B) —
-    /// per-phase outer Extras storage. Hoisted from `Inner` for cells
-    /// whose write surface is phase-restricted; allows tier-1 closure
-    /// on `<P>` monomorphisations that semantically reject the cell
-    /// (e.g. `<ConnectingPhase>::Extras = ()` → no `row_desc_slot`
-    /// reachable on the outer). See [`SealedPhase::Extras`].
+    /// Per-phase outer Extras storage. Hoisted from `Inner` for
+    /// cells whose write surface is phase-restricted; allows tier-1
+    /// closure on `<P>` monomorphisations that semantically reject
+    /// the cell (e.g. `<ConnectingPhase>::Extras = ()` → no
+    /// `row_desc_slot` reachable on the outer). See
+    /// [`SealedPhase::Extras`].
     extras: <P as SealedPhase>::Extras,
     /// ZST phase marker. Load-bearing for the type-level phase
-    /// proof; named without leading-underscore per the user-feedback
-    /// convention that structurally-used fields must not be
-    /// `_`-prefixed (mirrors `sync_marker` renaming).
+    /// proof; named without leading-underscore (structurally-used
+    /// fields must not be `_`-prefixed).
     phase_marker: PhantomData<fn() -> P>,
 }
 
-// DEF-211 FAKE-19 (audit + ship 2026-05-04): bench-hooks feature
-// REMOVED ENTIRELY. Pre-FAKE-19 the crate exposed two `pub fn` hooks
-// gated `#[cfg(feature = "bench-hooks")]` + `#[doc(hidden)]`:
+// No `#[cfg(feature = "bench-hooks")]` raw-state hooks ship from
+// this crate. A naive shape would expose `bench_append_read_buf`
+// (raw append into `read_buf` bypassing dispatch) and
+// `reset_for_bench` (snap state to Idle bypassing Drop) under a
+// feature flag — tier-3 by-discipline closure since a downstream
+// consumer could enable the feature in their Cargo.toml and reach
+// the API in production. CREDO §1 demands tier-1 closure.
 //
-//   `bench_append_read_buf` — raw append into `read_buf` bypassing
-//                              dispatch (used by row-iter benches).
-//   `reset_for_bench`       — snap state to Idle bypassing Drop
-//                              (used by amortised push benches).
+// Benches instead use the public surface:
 //
-// Both hooks were tier-3 by-discipline: feature-gated + doc-hidden +
-// docstring warnings, but a downstream consumer who explicitly
-// enabled `bench-hooks` in their Cargo.toml would get the API in
-// production. CREDO §1 absolute-safety target = tier-1 closure.
+// 1. `feed_inbound(bytes) -> Result<(), ReadBufFull>` covers the
+//    raw-append role byte-for-byte — no duplication needed.
 //
-// **Replacement is structural**:
+// 2. criterion's `iter_batched(setup, routine, BatchSize)` covers
+//    the reset role: setup builds a fresh proto per iter
+//    (untimed), routine runs the timed measurement on it. Per-iter
+//    setup pays `PgProtocol::new()` init (~50 ns memset for 4 KB
+//    ReadBuf) but that cost is OUTSIDE the timed window —
+//    criterion reports the routine timing accurately. See
+//    `benches/hot_paths.rs` for patterns.
 //
-// 1. `bench_append_read_buf` was a strict duplicate of the public
-//    `feed_inbound(bytes) -> Result<(), ReadBufFull>` shipped in
-//    DEF-212 Phase 2 (commit 201f86a). Benches now call
-//    `feed_inbound` directly — same byte-for-byte semantics, no
-//    duplication, public-API surface stays the same.
-//
-// 2. `reset_for_bench` was a bench-only `state = Idle` mutation that
-//    bypassed Drop scrub for amortised iter perf. criterion's
-//    `iter_batched(setup, routine, BatchSize)` is the idiomatic
-//    replacement: setup builds a fresh proto per iter (untimed),
-//    routine runs the timed measurement on it. Per-iter setup pays
-//    PgProtocol::new() init (~50 ns memset for 4 KB ReadBuf) but
-//    that cost is OUTSIDE the timed window — criterion reports the
-//    routine timing accurately. See `benches/hot_paths.rs` post-
-//    refactor patterns.
-//
-// **Tier closure**: feature physically gone → no leak surface →
-// tier-1 by-elimination. Cannot enable from anywhere; the hooks
-// don't exist. CREDO §1 absolute-safety satisfied without
-// discipline reliance.
-//
-// **Trade-off accepted**: amortised push benches now include
-// per-iter `PgProtocol::new()` cost in their wall time (longer to
-// reach criterion's sample budget) but the reported per-iter
-// timing is correct. Relative-to-baseline regression detection is
-// preserved.
+// Tier closure: the feature physically does not exist → no leak
+// surface → tier-1 by-elimination. CREDO §1 absolute-safety
+// satisfied without discipline reliance. Trade-off: amortised push
+// benches include per-iter `PgProtocol::new()` cost in their wall
+// time (longer to reach criterion's sample budget) but the
+// reported per-iter timing is correct; relative-to-baseline
+// regression detection is preserved.
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-272 cluster α (2026-05-10) — schema-side concrete-token leaves
+// Schema-side concrete-token leaves
 //
-// Replaces the DEF-271 cluster C sealed-trait + auth-tag pattern with
-// per-leaf concrete-type tokens (private tuple-struct field). The
-// sealed-trait pattern was tier-1 EXTERNAL but tier-2 by-discipline
-// WITHIN-CRATE: any in-crate file could `impl Sealed for HostileTag` +
-// `impl SchemaWriteAuth for HostileTag` and bypass `from_field_with_auth`
-// via the hostile tag (architect's empirical hostile-probe verified).
-//
-// Post-DEF-272-α each leaf has a CONCRETE token type (`pub(crate) struct
+// Each leaf has a CONCRETE token type (`pub(crate) struct
 // XToken(())`); the `()` field is private to the leaf submodule, so
 // `XToken(())` literal is mintable ONLY inside the leaf. The
-// `RowDescSlotCell::*_at_*` write methods take the concrete token type
-// by value. There is no trait to `impl` for hostile types; bypass
-// requires constructing a token (impossible outside the leaf) or a
-// type-mismatched parameter (rejected by Rust's type system).
+// `RowDescSlotCell::*_at_*` write methods take the concrete token
+// type by value. There is no trait to `impl` for hostile types;
+// bypass requires constructing a token (impossible outside the
+// leaf) or a type-mismatched parameter (rejected by Rust's type
+// system).
 //
-// Cluster B-related leaves (`_parameter_status_admit_leaf`,
-// `_notice_response_admit_leaf`, the session_params side of
-// `_clear_residue_leaf`) still use the DEF-271 cluster B sealed-trait
-// pattern; cluster β (next subcluster) migrates them.
+// A naive shape would use a sealed-trait + auth-tag pattern (`impl
+// Sealed for Token` + `impl SchemaWriteAuth for Token` + a
+// `from_field_with_auth` constructor) — tier-1 EXTERNAL but tier-2
+// by-discipline WITHIN-CRATE: any in-crate file could `impl Sealed
+// for HostileTag` + `impl SchemaWriteAuth for HostileTag` and
+// bypass the constructor via the hostile tag.
 //
 // Cost: visibility-only; LLVM erases everything; 0 ns / 0 B.
 //
 // ─────────────────────────────────────────────────────────────────────
-// Tier-4 Cluster C audit (2026-05-19) — DEFERRED with rationale
+// Tier-4 Cluster C audit: by-value `_token: TokenType` parameters
+// kept, by-ref `token: &TokenType` REJECTED.
 //
 // Audit Cluster C proposed migrating every `_token: TokenType` leaf-
 // token consumer parameter to `token: &TokenType` (by-ref), motivated
@@ -1267,21 +1122,16 @@ pub struct PgProtocol<P: SealedPhase = ActivePhase> {
 // ─────────────────────────────────────────────────────────────────────
 // ═════════════════════════════════════════════════════════════════════
 
-/// DEF-272 cluster α leaf submodule for the BindExecute SELECT install
-/// transition. Hosts the [`BeSelectToken`] type and the single helper
-/// fn that mints+writes inline.
-//
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// `#[allow(missing_docs, ...)]` here was DEAD — `missing_docs` only
-// fires on `pub` items; this submodule is `pub(crate)`-only, so the
-// lint doesn't trigger. Attribute deleted.
+/// Leaf submodule for the BindExecute SELECT install transition.
+/// Hosts the [`BeSelectToken`] type and the single helper fn that
+/// mints+writes inline.
 pub(crate) mod _bind_execute_select_install_leaf {
-    /// DEF-272 cluster α leaf-scope token. The tuple-struct field is
-    /// PRIVATE to this submodule — `Self(())` mints are callable ONLY
-    /// here. The type itself is `pub(crate)` so
-    /// [`crate::schema_slot::RowDescSlotCell::park_at_be_select`] can
-    /// name it in its parameter signature; naming alone confers no
-    /// minting power.
+    /// Leaf-scope token. The tuple-struct field is PRIVATE to this
+    /// submodule — `Self(())` mints are callable ONLY here. The
+    /// type itself is `pub(crate)` so
+    /// [`crate::schema_slot::RowDescSlotCell::park_at_be_select`]
+    /// can name it in its parameter signature; naming alone confers
+    /// no minting power.
     pub(crate) struct BeSelectToken(());
 
     /// Mint a [`BeSelectToken`] and write `desc` into `slot` via
@@ -1297,29 +1147,25 @@ pub(crate) mod _bind_execute_select_install_leaf {
     }
 }
 
-/// DEF-272 cluster α + β leaf submodule for the clear-session-residue
-/// transitions on Idle/Errored entry. Hosts two concrete-type tokens
-/// (one per slot kind) and two helper fns — schema-side (cluster α)
-/// and session_params-side (cluster β).
-//
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
-// `pub(crate)` items).
+/// Leaf submodule for the clear-session-residue transitions on
+/// Idle/Errored entry. Hosts three concrete-type tokens (one per
+/// slot kind) and three helper fns — schema-side, session_params-
+/// side, and partial-assembly-side.
 pub(crate) mod _clear_residue_leaf {
-    /// DEF-272 cluster α leaf-scope token for the schema slot clear.
-    /// Field private to the leaf; type `pub(crate)` so the cell can
-    /// name it in its method signature.
+    /// Leaf-scope token for the schema slot clear. Field private to
+    /// the leaf; type `pub(crate)` so the cell can name it in its
+    /// method signature.
     pub(crate) struct ClearResidueSchemaToken(());
 
-    /// DEF-272 cluster β leaf-scope token for the session_params slot
-    /// clear. Field private to the leaf; type `pub(crate)` so the cell
-    /// can name it.
+    /// Leaf-scope token for the session_params slot clear. Field
+    /// private to the leaf; type `pub(crate)` so the cell can name
+    /// it.
     pub(crate) struct ClearResidueSessionToken(());
 
-    /// DEF-248 Sub-B (2026-05-12) leaf-scope token for the
-    /// partial-assembly slot clear at residue transitions. Field
-    /// private to the leaf; type `pub(crate)` so
-    /// [`crate::partial_assembly::PartialAssemblyCell`] can name it.
+    /// Leaf-scope token for the partial-assembly slot clear at
+    /// residue transitions. Field private to the leaf; type
+    /// `pub(crate)` so [`crate::partial_assembly::PartialAssemblyCell`]
+    /// can name it.
     pub(crate) struct ClearResiduePartialAssemblyToken(());
 
     /// Clear the schema slot via
@@ -1336,9 +1182,9 @@ pub(crate) mod _clear_residue_leaf {
     /// Clear the session-params via
     /// [`crate::session_params_slot::SessionParamsCell::clear_at_residue`]
     /// with the [`ClearResidueSessionToken`] minted inline. Used by
-    /// `clear_session_residue_for_class` Errored arm (per DEF-189
-    /// Q8-C3 + DEF-205 step 3 — session-state forfeit on tear-down;
-    /// the params' Drop chain scrubs `SecretBoundedStr` bytes).
+    /// `clear_session_residue_for_class` Errored arm — session-state
+    /// forfeit on tear-down; the params' Drop chain scrubs
+    /// `SecretBoundedStr` bytes.
     #[inline]
     pub(in crate::protocol) fn clear_session_params_residue(
         cell: &mut crate::session_params_slot::SessionParamsCell,
@@ -1346,11 +1192,11 @@ pub(crate) mod _clear_residue_leaf {
         cell.clear_at_residue(ClearResidueSessionToken(()));
     }
 
-    /// DEF-248 Sub-B (2026-05-12): clear the partial assembly cell via
+    /// Clear the partial assembly cell via
     /// [`crate::partial_assembly::PartialAssemblyCell::clear_at_residue`]
     /// with the [`ClearResiduePartialAssemblyToken`] minted inline.
-    /// Used by `clear_session_residue_for_class` Idle and Errored arms
-    /// — drops any in-flight assembly's Box on residue cleanup,
+    /// Used by `clear_session_residue_for_class` Idle and Errored
+    /// arms — drops any in-flight assembly's Box on residue cleanup,
     /// releasing its `heapless::Vec` allocation.
     ///
     /// Tier-1 by construction: the only way to release a partial
@@ -1365,39 +1211,35 @@ pub(crate) mod _clear_residue_leaf {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-248 Sub-B (2026-05-12) — partial-assembly dispatch leaf submodule
+// Partial-assembly dispatch leaf submodule
 //
 // Per-call-site concrete-type tokens that gate
 // [`crate::partial_assembly::PartialAssemblyCell`]'s `enter_at_dispatch`
-// / `absorb_at_dispatch` / `take_completed` mutating methods. Mirror of
-// DEF-272 cluster α/β/δ patterns: tuple-struct field is PRIVATE to the
-// leaf submodule, so the `Self(())` literal mint is callable ONLY here.
+// / `absorb_at_dispatch` / `take_completed` mutating methods. The
+// tuple-struct field is PRIVATE to the leaf submodule, so the
+// `Self(())` literal mint is callable ONLY here.
 //
-// Tier-1 within-crate by-construction. The leaf body is small enough to
-// review as a unit; see [`crate::partial_assembly`] for the cell + sink
-// design rationale.
+// Tier-1 within-crate by-construction. The leaf body is small enough
+// to review as a unit; see [`crate::partial_assembly`] for the cell
+// + sink design rationale.
 // ═════════════════════════════════════════════════════════════════════
 
-/// DEF-248 Sub-B leaf submodule for [`PgProtocol::feed_bytes_impl`]'s
-/// partial-assembly transitions. Hosts three concrete-type tokens and
-/// the matching helper fns.
-//
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
-// `pub(crate)` items).
+/// Leaf submodule for `feed_bytes_impl`'s partial-assembly
+/// transitions. Hosts three concrete-type tokens and the matching
+/// helper fns.
 pub(crate) mod _partial_assembly_dispatch_leaf {
-    /// DEF-248 Sub-B leaf-scope token for **entering** partial-assembly
-    /// mode. Field private to the leaf; type `pub(crate)` so
+    /// Leaf-scope token for **entering** partial-assembly mode.
+    /// Field private to the leaf; type `pub(crate)` so
     /// [`crate::partial_assembly::PartialAssemblyCell::enter_at_dispatch`]
     /// can name it in its parameter signature.
     pub(crate) struct PartialAssemblyEnterToken(());
 
-    /// DEF-248 Sub-B leaf-scope token for **absorbing** body bytes into
-    /// an active partial-assembly. Field private to the leaf.
+    /// Leaf-scope token for **absorbing** body bytes into an active
+    /// partial-assembly. Field private to the leaf.
     pub(crate) struct PartialAssemblyAbsorbToken(());
 
-    /// DEF-248 Sub-B leaf-scope token for **taking** a completed partial
-    /// assembly out of the cell for dispatch. Field private to the leaf.
+    /// Leaf-scope token for **taking** a completed partial assembly
+    /// out of the cell for dispatch. Field private to the leaf.
     pub(crate) struct PartialAssemblyTakeToken(());
 
     /// Enter partial-assembly mode via
@@ -1438,16 +1280,12 @@ pub(crate) mod _partial_assembly_dispatch_leaf {
     }
 }
 
-/// DEF-272 cluster β leaf submodule for the inbound `ParameterStatus`
-/// pre-dispatch filter. Hosts the [`ParamStatusToken`] type and the
-/// single admit helper fn that delegates to the cell's parse+record
-/// method.
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
-// `pub(crate)` items).
+/// Leaf submodule for the inbound `ParameterStatus` pre-dispatch
+/// filter. Hosts the [`ParamStatusToken`] type and the single admit
+/// helper fn that delegates to the cell's parse+record method.
 pub(crate) mod _parameter_status_admit_leaf {
-    /// DEF-272 cluster β leaf-scope token. Field private to the leaf;
-    /// type `pub(crate)` so
+    /// Leaf-scope token. Field private to the leaf; type
+    /// `pub(crate)` so
     /// [`crate::session_params_slot::SessionParamsCell::admit_at_param_status`]
     /// can name it.
     pub(crate) struct ParamStatusToken(());
@@ -1467,15 +1305,12 @@ pub(crate) mod _parameter_status_admit_leaf {
     }
 }
 
-/// DEF-272 cluster β leaf submodule for the inbound `NoticeResponse`
-/// pre-dispatch filter. Hosts the [`NoticeResponseToken`] type and
-/// the single admit helper fn.
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
-// `pub(crate)` items).
+/// Leaf submodule for the inbound `NoticeResponse` pre-dispatch
+/// filter. Hosts the [`NoticeResponseToken`] type and the single
+/// admit helper fn.
 pub(crate) mod _notice_response_admit_leaf {
-    /// DEF-272 cluster β leaf-scope token. Field private to the leaf;
-    /// type `pub(crate)` so
+    /// Leaf-scope token. Field private to the leaf; type
+    /// `pub(crate)` so
     /// [`crate::session_params_slot::SessionParamsCell::admit_at_notice_response`]
     /// can name it.
     pub(crate) struct NoticeResponseToken(());
@@ -1494,37 +1329,31 @@ pub(crate) mod _notice_response_admit_leaf {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-272 P6 closure (2026-05-10) — `_proto_init_leaf` submodule
+// `_proto_init_leaf` submodule — sole legitimate cell-construction
+// site.
 //
-// Architect hostile-probe (2026-05-10) confirmed that pre-this-leaf
-// `*cell = RowDescSlotCell::EMPTY` / `SessionParamsCell::EMPTY` was
-// callable from any in-crate file via the `pub(crate) const EMPTY`. The
-// straightforward fix `pub(in crate::protocol) const EMPTY` is invalid
-// (E0742: visibility path must be ancestor; mod schema_slot / mod
-// session_params_slot are siblings of mod protocol, not children). The
-// proper closure is the leaf-token pattern (mirrors DEF-272 cluster δ):
+// Cells expose `pub(crate) const fn empty(token: ProtoInitToken)`;
+// `ProtoInitToken` has a private tuple-struct field — `Self(())`
+// is mintable ONLY inside this submodule. `PgProtocol::new` lives
+// INSIDE `_proto_init_leaf` so it has access to
+// `ProtoInitToken::mint()`. Code outside the leaf cannot mint
+// tokens → cannot construct fresh cells → cannot wholesale-replace
+// `*pg.row_desc_slot = …` (no fresh value to assign).
 //
-//   - `_proto_init_leaf::ProtoInitToken` has a private tuple-struct
-//     field — `Self(())` mintable ONLY inside this submodule.
-//   - Cells expose `pub(crate) const fn empty(token: ProtoInitToken)`
-//     instead of `pub(crate) const EMPTY`. Fresh cell construction
-//     requires a token.
-//   - `PgProtocol::new` lives INSIDE `_proto_init_leaf` so it has
-//     access to `ProtoInitToken::mint()`. Code outside the leaf cannot
-//     mint tokens → cannot construct fresh cells → cannot wholesale-
-//     replace `*pg.row_desc_slot = …` (no fresh value to assign).
+// A naive shape would expose `pub(crate) const EMPTY: Cell` on each
+// cell — callable from any in-crate file, leaving wholesale
+// replacement gated only by `pub(crate)`. The narrower
+// `pub(in crate::protocol) const EMPTY` is invalid (E0742:
+// visibility path must be ancestor; cell modules are siblings of
+// mod protocol, not children).
 //
 // Wholesale-replacement is gated to this submodule by construction.
-// Tier-1 within-crate. The leaf body is the entire init logic — small
-// enough to review as a unit.
+// Tier-1 within-crate. The leaf body is the entire init logic —
+// small enough to review as a unit.
 // ═════════════════════════════════════════════════════════════════════
 
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// dead `#[allow(missing_docs, ...)]` removed (lint doesn't fire on
-// `pub(crate)` items). Original reason: submodule contains init-token
-// + sole legitimate cell-construction site (DEF-272 P6 closure).
 pub(crate) mod _proto_init_leaf {
-    /// DEF-272 P6 closure token (2026-05-10). Field private to leaf —
+    /// Init-leaf closure token. Field private to leaf —
     /// `Self(())` mintable ONLY inside this submodule via
     /// [`ProtoInitToken::mint`]. `pub(crate)` type signature so cell
     /// modules can name the type in their `empty(token)` parameter,
@@ -1545,23 +1374,18 @@ pub(crate) mod _proto_init_leaf {
         /// Construct a new protocol typed `PgProtocol<DisconnectedPhase>`
         /// — the only legal next step is [`Self::push_startup`].
         ///
-        /// **DEF-279 Phase 1a (2026-05-18):** `<DisconnectedPhase>::Inner`
-        /// is a ZST [`super::DisconnectedInner`]. Constructor allocates
-        /// ZERO bytes — `size_of::<PgProtocol<DisconnectedPhase>>() == 0`.
-        /// Pre-Bundle the constructor materialised a full 536-B
-        /// `PgProtocolInner` (state Idle, read_buf empty, four cells,
-        /// counter, sync marker), all of which were architecturally
-        /// dead until [`Self::push_startup`] consumed self. Post-Bundle
-        /// none of that storage exists pre-Startup; the materialisation
-        /// is deferred to [`super::_proto_init_leaf::fresh_inner`]
-        /// called inside `push_startup`.
+        /// `<DisconnectedPhase>::Inner` is a ZST
+        /// [`super::DisconnectedInner`]. Constructor allocates ZERO
+        /// bytes — `size_of::<PgProtocol<DisconnectedPhase>>() == 0`.
+        /// Cell materialisation is deferred to
+        /// [`super::_proto_init_leaf::fresh_connecting_inner`] called
+        /// inside `push_startup`. A naive shape would materialise a
+        /// full 536-B Inner at construction time (state Idle,
+        /// read_buf empty, four cells, counter, sync marker), all of
+        /// which would be architecturally dead until
+        /// [`Self::push_startup`] consumed self.
         ///
-        /// **DEF-246 Phase 2 (2026-05-16):** the constructor produces
-        /// `<DisconnectedPhase>` (pre-DEF-246 Phase 2 produced
-        /// `<ActivePhase>`). Tier-1 elevation #1: the
-        /// `PgCommand::Startup` enum + `push_command::Startup` struct +
-        /// `impl PushCommand for Startup` are deleted; the only path
-        /// into a connecting protocol is
+        /// The only path into a connecting protocol is
         /// `<DisconnectedPhase>::push_startup(...) ->
         /// PgProtocol<ConnectingPhase>` (consume-self transition).
         /// Pushing any other command from `<DisconnectedPhase>` is a
@@ -1570,11 +1394,11 @@ pub(crate) mod _proto_init_leaf {
         /// [`crate::push_command::PushCommand`] which is reachable
         /// only through `<ActivePhase>::push_command_internal`.
         ///
-        /// `<DisconnectedPhase>` has no cells, so the per-DEF-272 P6
+        /// `<DisconnectedPhase>` has no cells, so the
         /// [`ProtoInitToken`] is not needed at this constructor —
-        /// only [`super::_proto_init_leaf::fresh_inner`] (called when
-        /// `push_startup` materialises a fresh `PgProtocolInner` for
-        /// the `<ConnectingPhase>` transition) needs the token. The
+        /// only `fresh_connecting_inner` (called when `push_startup`
+        /// materialises a fresh `ConnectingInner` for the
+        /// `<ConnectingPhase>` transition) needs the token. The
         /// leaf-private mint stays inside `_proto_init_leaf`.
         #[must_use]
         pub const fn new() -> Self {
@@ -1588,15 +1412,13 @@ pub(crate) mod _proto_init_leaf {
         }
     }
 
-    /// DEF-279 Phase 1c Bundle Commit 8 (2026-05-18) — materialise a
-    /// fresh [`super::ConnectingInner`] for use by the
-    /// `<DisconnectedPhase>::push_startup` transition once Commit 8b
-    /// flips `<ConnectingPhase>::Inner = ConnectingInner`.
+    /// Materialise a fresh [`super::ConnectingInner`] for use by
+    /// the `<DisconnectedPhase>::push_startup` transition.
     ///
-    /// **Per-phase parity with [`fresh_inner`]**: cells start empty
-    /// via the same [`ProtoInitToken`]-gated constructors;
-    /// `read_buf` starts empty; `malformed_frame_count` starts 0;
-    /// `sync_marker` is `PhantomData`.
+    /// Cells start empty via the [`ProtoInitToken`]-gated
+    /// constructors; `read_buf` starts empty;
+    /// `malformed_frame_count` starts 0; `sync_marker` is
+    /// `PhantomData`.
     ///
     /// **State sentinel**: `ConnectingState::Errored(Framing)` — a
     /// transient placeholder kind. The `push_startup` body
@@ -1607,12 +1429,7 @@ pub(crate) mod _proto_init_leaf {
     /// reader sees the state between this constructor and the
     /// setter write. `Framing` kind is semantically meaningless
     /// here — the slot is always overwritten.
-    ///
-    /// **`#[allow(dead_code)]`** until Commit 8b flips
-    /// `<ConnectingPhase>::Inner = ConnectingInner` and migrates
-    /// push_startup to call this.
     #[must_use]
-    #[allow(dead_code)]
     pub(in crate::protocol) fn fresh_connecting_inner() -> super::ConnectingInner {
         let token = ProtoInitToken::mint();
         super::ConnectingInner {
@@ -1631,12 +1448,11 @@ pub(crate) mod _proto_init_leaf {
         }
     }
 
-    /// DEF-279 follow-up (2026-05-18, architect Interpretation B) —
-    /// mint the outer `<ActivePhase>::Extras = RowDescSlotCell` at the
-    /// `<ConnectingPhase>::into_active` transition boundary. Mirror
-    /// of the per-cell `empty(token)` mint pattern used by
-    /// [`fresh_active_inner`]; lives inside `_proto_init_leaf` so the
-    /// [`ProtoInitToken`] stays leaf-private (DEF-272 P6 closure).
+    /// Mint the outer `<ActivePhase>::Extras = RowDescSlotCell` at
+    /// the `<ConnectingPhase>::into_active` transition boundary.
+    /// Mirror of the per-cell `empty(token)` mint pattern used by
+    /// [`fresh_active_inner`]; lives inside `_proto_init_leaf` so
+    /// the [`ProtoInitToken`] stays leaf-private.
     #[must_use]
     pub(in crate::protocol) fn fresh_active_row_desc_slot()
     -> crate::schema_slot::RowDescSlotCell {
@@ -1644,8 +1460,7 @@ pub(crate) mod _proto_init_leaf {
         crate::schema_slot::RowDescSlotCell::empty(token)
     }
 
-    /// DEF-279 follow-up (2026-05-18, architect Z' verdict) — mint a
-    /// stack-local transient `RowDescSlotCell` for
+    /// Mint a stack-local transient `RowDescSlotCell` for
     /// [`super::feed_bytes_dispatch_connecting`]'s call into the
     /// shared dispatch body. The slot is empty (no Connecting LHS
     /// arm writes to it) and drops with the wrapper's frame.
@@ -1662,9 +1477,8 @@ pub(crate) mod _proto_init_leaf {
         crate::schema_slot::RowDescSlotCell::empty(token)
     }
 
-    /// DEF-279 Phase 2 Bundle Commit 12 (2026-05-18) — materialise
-    /// a fresh [`super::ActiveInner`] for use by transitions into
-    /// `<ActivePhase>`.
+    /// Materialise a fresh [`super::ActiveInner`] for use by
+    /// transitions into `<ActivePhase>`.
     ///
     /// **Sole production caller**:
     /// [`super::PgProtocol::<super::ConnectingPhase>::into_active`]
