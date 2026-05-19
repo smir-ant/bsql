@@ -47,9 +47,9 @@ mod common;
 use common::{PushOrPanic, fresh_active_via_trust_handshake, mint_reply};
 
 // =================================================================
-// S2 — DELETED (DEF-089). The seam no longer exists: `SendBuf` is a
-// single-shape newtype, not an enum. There is no `as_bytes` match
-// body to swap. The former test `send_buf_as_bytes_static_and_owned_round_trip`
+// S2 — deleted. The seam no longer exists: `SendBuf` is a single-
+// shape newtype, not an enum. There is no `as_bytes` match body to
+// swap. The former test `send_buf_as_bytes_static_and_owned_round_trip`
 // was removed in the same commit that collapsed the enum — surface
 // that could drift no longer exists, so no test is needed.
 //
@@ -84,7 +84,7 @@ fn session_params_set_key_routing_table() {
     // Each value must arrive in its dedicated field — a swap of any
     // two arms would land the wrong value in the wrong field.
     assert_eq!(p.server_version.as_ref().map(|s| s.as_str()), Some("17.2"));
-    // DEF-114: typed fields — Encoding/bool instead of strings.
+    // Typed fields — `Encoding` / `bool` instead of strings.
     assert_eq!(p.server_encoding, Some(bsql_pg_proto::session_params::Encoding::Utf8));
     assert_eq!(
         p.client_encoding,
@@ -131,8 +131,8 @@ fn session_params_set_non_utf8_is_lossy_not_silent_skip() {
     assert_eq!(p.server_version.as_ref().map(|s| s.as_str()), Some("?"));
 }
 
-/// DEF-153 (audit A003): a malformed bool value (anything other than
-/// PG's canonical `on`/`off`) leaves the field `None` AND bumps the
+/// A malformed bool value (anything other than PG's canonical
+/// `on`/`off`) leaves the field `None` AND bumps the
 /// `n_malformed_bool_dropped` counter — gives operators a diagnostic
 /// signal distinguishing "server never sent" from "server sent a
 /// value we couldn't parse".
@@ -160,8 +160,8 @@ fn session_params_set_malformed_bool_bumps_counter() {
     assert_eq!(p.n_unknown_dropped, 1);
 }
 
-/// DEF-153 companion: a WELL-FORMED bool value does NOT bump the
-/// malformed counter. Pins the negative side of the above test.
+/// A WELL-FORMED bool value does NOT bump the malformed counter.
+/// Pins the negative side of the above test.
 #[test]
 fn session_params_set_well_formed_bool_does_not_bump_counter() {
     let mut p = SessionParams::new();
@@ -207,8 +207,8 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (reply, _ping_raw) = mint_reply::<PingKind>(&mut proto);
-    // Push ping and feed a FrameTooLarge frame.
-    // DEF-212: push_or_panic returns (); bytes live in wb.
+    // Push ping and feed a FrameTooLarge frame. `push_or_panic`
+    // returns `()`; bytes live in `wb`.
     proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
     // Declared length = 0xDEAD (way above MAX_FRAME_LEN_FIELD=4095).
     let frame = [b'Z', 0x00, 0x00, 0xDE, 0xAD];
@@ -217,8 +217,8 @@ fn errored_cause_is_preserved_in_state_and_reply() {
 
     // First fatal: FailReply carries the FULL ProtocolError
     // (FrameTooLarge{declared: 0xDEAD}) and state transitions to
-    // Errored(ErrorKind::Framing) — DEF-061: state retains only the
-    // 1-byte kind classification, not the full cause.
+    // Errored(ErrorKind::Framing) — state retains only the 1-byte
+    // kind classification, not the full cause.
     use bsql_pg_proto::error::ErrorKind;
     match out.as_slice() {
         [
@@ -238,14 +238,14 @@ fn errored_cause_is_preserved_in_state_and_reply() {
         proto.state(),
     );
 
-    // DEF-198: subsequent push is structurally blocked at the public
-    // API. State is compact-Errored(Framing); ConnectionStatus exposes
+    // Subsequent push is structurally blocked at the public API.
+    // State is compact-Errored(Framing); `ConnectionStatus` exposes
     // the kind for caller-side recovery. The wrapper preserved the
     // original full cause (FrameTooLarge 0xDEAD) via the first
     // FailReply emitted at transition-to-Errored.
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None on Errored",
+        "as_ready must return None on Errored",
     );
     match proto.connection_status() {
         ConnectionStatus::Errored(state_err_kind) => {
@@ -267,21 +267,21 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     );
 }
 
-/// DEF-184 (A10/B22 revert 2026-04-24): pin that `push_startup` with
-/// SCRAM credentials lands in `ConnectingState::StartupScram`
-/// with the `ScramSession` carried INLINE in the variant — tier-1
-/// variant-carries-field invariant (CREDO §1: safety > tier-1 > perf).
+/// Pin that `push_startup` with SCRAM credentials lands in
+/// `ConnectingState::StartupScram` with the `ScramSession` carried
+/// INLINE in the variant — tier-1 variant-carries-field invariant
+/// (CREDO §1: safety > tier-1 > perf).
 ///
-/// Post-revert the variant cannot exist without SCRAM data: a future
-/// refactor that accidentally elided the `scram` field would fail the
-/// build at the variant-construction site. No classifier needed.
+/// The variant cannot exist without SCRAM data: a future refactor
+/// that accidentally elided the `scram` field would fail the build
+/// at the variant-construction site. No classifier needed.
 #[test]
 fn scram_push_startup_carries_scram_session_inline() {
     use bsql_pg_proto::{PgProtocol, WriteBuf};
     use bsql_pg_proto::ident::Ident;
     use bsql_pg_proto::password::{Credentials, Password};
     use bsql_pg_proto::sensitive::Sensitive;
-    // DEF-246 Phase 2 (2026-05-16): consume-self push_startup.
+    // Consume-self `push_startup`.
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     let Ok(user) = Ident::try_from_str("u") else {
@@ -368,7 +368,7 @@ fn feed_bytes_into_errored_preserves_kind_byte_exactly() {
 
 // =================================================================
 // DatabaseName / ApplicationName validation — mirror ident_validation
-// for the other two NUL-free newtypes (DEF-041).
+// for the other two NUL-free newtypes.
 // =================================================================
 
 /// Invariant (spec): `DatabaseName::try_from_str` has the same
@@ -447,8 +447,8 @@ fn application_name_validation_allows_empty() {
 /// the fallback `other` arm in `parse_backend_key_data`.
 #[test]
 fn backend_key_data_wrong_payload_size_is_classified() {
-    // DEF-246 Phase 2 (2026-05-16): consume-self push_startup to drive
-    // to ConnectingPostAuthAwaitingKey via the typed handshake.
+    // Consume-self `push_startup` to drive to
+    // `ConnectingPostAuthAwaitingKey` via the typed handshake.
     let mut proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let reply = proto.next_reply_id::<StartupKind>();

@@ -1,26 +1,26 @@
-//! DEF-205 step 2 (2026-04-27): memory-probe verification that
-//! `ErrorArena::clear()` now scrubs the previous `Some(ErrorPayload)`
-//! data bytes via the Drop chain.
+//! Memory-probe verification that `ErrorArena::clear()` scrubs the
+//! previous `Some(ErrorPayload)` data bytes via the Drop chain.
 //!
-//! # Pre-DEF-205 behaviour (would be caught here)
+//! # Current behaviour (verified here)
 //!
-//! `ErrorArena::clear()` did `self.slot = None`. For an `Option<T>`
-//! where `T: Copy`, this only writes the discriminant byte —
-//! the previous `Some(T)` data bytes physically persisted in the
-//! `Option`'s storage region until future `alloc()` overwrote them.
-//! Concrete leak vector: server error message containing query
-//! details (e.g. `'UPDATE users SET password=...'` echoed in a
-//! syntax error) would persist across the clear boundary and could
-//! be observed via memory dump for the connection's lifetime.
-//!
-//! # Post-DEF-205 behaviour (verified here)
-//!
-//! `ErrorPayload` is now non-Copy with three `SecretBoundedStr<N>`
+//! `ErrorPayload` is non-Copy with three `SecretBoundedStr<N>`
 //! fields, each `ZeroizeOnDrop`. Rust language semantics guarantee
 //! `self.slot = None` drops the old `Some(ErrorPayload)` BEFORE
 //! flipping the discriminant — the Drop chain fires on each
-//! `SecretBoundedStr<N>` field, scrubbing `buf + len + was_lossy_flag`
-//! to zero. **Tier-1 by compiler-enforced Drop**.
+//! `SecretBoundedStr<N>` field, scrubbing
+//! `buf + len + was_lossy_flag` to zero.
+//! **Tier-1 by compiler-enforced Drop**.
+//!
+//! # What this guards against
+//!
+//! A naive `Option<T>` where `T: Copy` shape would have
+//! `self.slot = None` write only the discriminant byte — the
+//! previous `Some(T)` data bytes would physically persist in the
+//! `Option`'s storage region until future `alloc()` overwrote them.
+//! Concrete leak vector: a server error message containing query
+//! details (e.g. `'UPDATE users SET password=...'` echoed in a
+//! syntax error) would persist across the clear boundary and could
+//! be observed via memory dump for the connection's lifetime.
 //!
 //! # Method
 //!
@@ -74,7 +74,7 @@ unsafe fn probe_bytes(ptr: *const u8, len: usize) -> Vec<u8> {
 /// generation bump in `clear()` IS the explicit signal, but we
 /// verify the pattern works end-to-end (no public-API leak).
 #[test]
-fn def205_error_payload_is_non_copy() {
+fn error_payload_is_non_copy() {
     // Compile-time witness: `ErrorPayload` is no longer Copy. If
     // the type accidentally re-derives Copy (which would mean its
     // fields are Copy-able, which means SecretBoundedStr lost its
@@ -98,7 +98,7 @@ fn def205_error_payload_is_non_copy() {
 /// Captures raw pointers to the message/detail/hint buffers,
 /// drops the payload, then probes memory. Post-Drop: all zeros.
 #[test]
-fn def205_error_payload_drop_zeroizes_all_fields() {
+fn error_payload_drop_zeroizes_all_fields() {
     const MAGIC_M: &str = "ERROR-MESSAGE-MAGIC-XYZ-1234";
     const MAGIC_D: &str = "DETAIL-MAGIC-ABCDEFGH";
     const MAGIC_H: &str = "HINT-MAGIC-IJKLMNOP";
@@ -134,17 +134,17 @@ fn def205_error_payload_drop_zeroizes_all_fields() {
 
     assert!(
         m_post.iter().all(|&b| b == 0),
-        "DEF-205: post-drop message buffer must be zero. \
+        "post-drop message buffer must be zero. \
          Found {} non-zero bytes.",
         m_post.iter().filter(|&&b| b != 0).count(),
     );
     assert!(
         d_post.iter().all(|&b| b == 0),
-        "DEF-205: post-drop detail buffer must be zero.",
+        "post-drop detail buffer must be zero.",
     );
     assert!(
         h_post.iter().all(|&b| b == 0),
-        "DEF-205: post-drop hint buffer must be zero.",
+        "post-drop hint buffer must be zero.",
     );
 }
 
@@ -152,11 +152,10 @@ fn def205_error_payload_drop_zeroizes_all_fields() {
 /// a new `ErrorPayload` over an existing one fires Drop on the OLD
 /// value before moving the new one in.
 ///
-/// This pins the specific DEF-205 closure for the
-/// `ErrorArena::alloc()` path: allocating a new payload over an
-/// existing slot invokes `Some(old) → Drop`.
+/// Pins the closure for the `ErrorArena::alloc()` path: allocating
+/// a new payload over an existing slot invokes `Some(old) → Drop`.
 #[test]
-fn def205_error_payload_overwrite_zeroizes_old_value() {
+fn error_payload_overwrite_zeroizes_old_value() {
     const FIRST: &str = "FIRST-MAGIC-XYZ";
     const SECOND: &str = "second";
 
@@ -184,8 +183,10 @@ fn def205_error_payload_overwrite_zeroizes_old_value() {
     // functionally pins the new content.
     assert_eq!(slot.message.as_str(), SECOND);
 
-    // Probe the tail beyond SECOND's content. Pre-fix: FIRST's
-    // tail bytes physically persist. Post-fix: zeroized by Drop.
+    // Probe the tail beyond SECOND's content — Drop on the old
+    // payload zeroizes FIRST's tail bytes. A naive Copy-payload
+    // shape would let FIRST's tail bytes physically persist past
+    // the reassignment.
     let beyond_second = SECOND.len();
     let probe_len = first_len.saturating_sub(beyond_second);
     if probe_len > 0 {
@@ -194,18 +195,16 @@ fn def205_error_payload_overwrite_zeroizes_old_value() {
         let nonzero_count = post.iter().filter(|&&b| b != 0).count();
         assert_eq!(
             nonzero_count, 0,
-            "DEF-205: tail bytes from FIRST (beyond SECOND's len) must be \
+            "tail bytes from FIRST (beyond SECOND's len) must be \
              zero post-overwrite. Found {nonzero_count} non-zero bytes — \
              Drop didn't fire on the old ErrorPayload.",
         );
     }
 }
 
-// DEF-244 modernisation audit (rust-version 1.81 sweep): historical
-// `#[allow(dead_code)]` here was DEAD — `_`-prefixed function names
-// historically suppress the `dead_code` lint by convention. Attribute
-// removed; the helper still binds `PgProtocol` so the import survives
-// dead-import checks for any future test-extension scope.
+// `_`-prefixed function names suppress the `dead_code` lint by
+// convention; the helper still binds `PgProtocol` so the import
+// survives dead-import checks for any future test-extension scope.
 fn _silence_unused_proto_import() -> Option<PgProtocol> {
     None
 }

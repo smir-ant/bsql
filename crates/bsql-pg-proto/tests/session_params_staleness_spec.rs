@@ -1,28 +1,26 @@
-//! DEF-205 step 3 (2026-04-27): memory-probe verification that
-//! `SessionParams::clear()` now scrubs the previous string-field
-//! data via the Drop chain.
+//! Memory-probe verification that `SessionParams::clear()` scrubs
+//! the previous string-field data via the Drop chain.
 //!
-//! # Pre-DEF-205 behaviour (would be caught here)
-//!
-//! `SessionParams::clear()` did `*self = Self::new()`. For the
-//! pre-fix shape (Option<BoundedStr<N>> with BoundedStr Copy),
-//! Rust's struct assignment is field-by-field. For Option<Copy>
-//! field assignment to None, the compiler may write only the
-//! discriminant; the Some-data region's bytes physically
-//! persisted. ~256 B of server-echoed config (server_version,
-//! application_name, session_authorization, date_style, time_zone)
-//! could leak across the clear boundary into a subsequent
-//! connection's diagnostics.
-//!
-//! # Post-DEF-205 behaviour (verified here)
+//! # Current behaviour (verified here)
 //!
 //! Sensitive string fields use `SecretBoundedStr<N>` (non-Copy,
 //! ZeroizeOnDrop). Rust language semantics guarantee
 //! `*self = Self::new()` drops the OLD self (which fires Drop on
-//! each `Option<SecretBoundedStr<N>>` field — Drop on Option<T>
-//! drops the inner T if Some, no-op if None — scrubbing the
-//! buf + len + was_lossy_flag of each populated field). Then
-//! Self::new() (all None) is moved in.
+//! each `Option<SecretBoundedStr<N>>` field — Drop on `Option<T>`
+//! drops the inner `T` if Some, no-op if None — scrubbing the
+//! `buf + len + was_lossy_flag` of each populated field). Then
+//! `Self::new()` (all None) is moved in.
+//!
+//! # What this guards against
+//!
+//! A naive `Option<BoundedStr<N>>` (Copy) shape would not fire any
+//! Drop on `clear()`'s field-by-field `*self = Self::new()`
+//! reassignment to `None` — the compiler may write only the
+//! discriminant, leaving the Some-data region's bytes physically
+//! intact. ~256 B of server-echoed config (`server_version`,
+//! `application_name`, `session_authorization`, `date_style`,
+//! `time_zone`) would leak across the clear boundary into a
+//! subsequent connection's diagnostics.
 //!
 //! **Tier-1 by compiler-enforced Drop**.
 
@@ -47,9 +45,9 @@ unsafe fn probe_bytes(ptr: *const u8, len: usize) -> Vec<u8> {
     out
 }
 
-/// Compile-time witness: `SessionParams` is non-Copy after DEF-205
-/// (its sensitive fields are `Option<SecretBoundedStr<N>>` which
-/// are non-Copy because SecretBoundedStr is non-Copy + Drop).
+/// Compile-time witness: `SessionParams` is non-Copy (its
+/// sensitive fields are `Option<SecretBoundedStr<N>>` which are
+/// non-Copy because `SecretBoundedStr` is non-Copy + Drop).
 ///
 /// If a future refactor accidentally re-derives Copy on
 /// SessionParams (e.g., by reverting the SecretBoundedStr fields
@@ -59,7 +57,7 @@ unsafe fn probe_bytes(ptr: *const u8, len: usize) -> Vec<u8> {
 /// Compile-fail is the negative-witness for non-Copy enforcement.
 /// Passes if file compiles AT ALL.
 #[test]
-fn def205_session_params_is_non_copy() {
+fn session_params_is_non_copy() {
     let mut src = SessionParams::default();
     src.set(b"application_name", b"deployment-tag-magic");
     let dup = src; // move — `src` consumed
@@ -80,7 +78,7 @@ fn def205_session_params_is_non_copy() {
 /// Verifies via raw-pointer probe that an `application_name`
 /// populated with magic bytes is zeroed after `clear()`.
 #[test]
-fn def205_clear_zeroizes_populated_fields() {
+fn clear_zeroizes_populated_fields() {
     const MAGIC_APP: &str = "DEPLOYMENT-MAGIC-APP-NAME-XYZ-1234567890";
     const MAGIC_VER: &str = "SERVER-VERSION-MAGIC";
 
@@ -132,13 +130,13 @@ fn def205_clear_zeroizes_populated_fields() {
     assert_ne!(
         &app_post[..],
         MAGIC_APP.as_bytes(),
-        "DEF-205: post-clear application_name buf must NOT match the \
+        "post-clear application_name buf must NOT match the \
          MAGIC_APP secret. Drop should have scrubbed them.",
     );
     assert_ne!(
         &ver_post[..],
         MAGIC_VER.as_bytes(),
-        "DEF-205: post-clear server_version buf must NOT match the \
+        "post-clear server_version buf must NOT match the \
          MAGIC_VER secret.",
     );
     // Stronger assertion: not even a substring match. If the secret
@@ -147,17 +145,17 @@ fn def205_clear_zeroizes_populated_fields() {
     let ver_post_str = String::from_utf8_lossy(&ver_post);
     assert!(
         !app_post_str.contains(MAGIC_APP),
-        "DEF-205: MAGIC_APP must not survive as substring post-clear. Got {app_post_str:?}",
+        "MAGIC_APP must not survive as substring post-clear. Got {app_post_str:?}",
     );
     assert!(
         !ver_post_str.contains(MAGIC_VER),
-        "DEF-205: MAGIC_VER must not survive as substring post-clear. Got {ver_post_str:?}",
+        "MAGIC_VER must not survive as substring post-clear. Got {ver_post_str:?}",
     );
 
     // Document: the post-state may contain compiler-determined bytes
     // from `Option::None`'s data region (unspecified per Rust spec).
     // This is the same compiler-dependent class as `mem::replace`
-    // padding, documented in deferred.md DEF-205 step 4.
+    // padding — outside the security invariant covered here.
 }
 
 /// **Tier-1 by Drop chain witness — `Option::set` overwrite path**:
@@ -169,7 +167,7 @@ fn def205_clear_zeroizes_populated_fields() {
 /// (server sends multiple `ParameterStatus` frames overwriting
 /// previously-cached values).
 #[test]
-fn def205_overwrite_zeroizes_old_value() {
+fn overwrite_zeroizes_old_value() {
     const FIRST: &str = "FIRST-APPLICATION-NAME-MAGIC-XYZ";
     const SECOND: &str = "second";
 
@@ -202,7 +200,7 @@ fn def205_overwrite_zeroizes_old_value() {
         let nonzero_count = post.iter().filter(|&&b| b != 0).count();
         assert_eq!(
             nonzero_count, 0,
-            "DEF-205: tail bytes from FIRST (beyond SECOND's len) must \
+            "tail bytes from FIRST (beyond SECOND's len) must \
              be zero post-overwrite. Found {nonzero_count} non-zero \
              bytes — Drop didn't fire on the old SecretBoundedStr.",
         );

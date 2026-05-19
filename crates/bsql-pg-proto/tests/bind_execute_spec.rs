@@ -1,5 +1,4 @@
-//! Phase 1c-3b — Extended Query `Bind + Execute + Sync` pipeline
-//! end-to-end.
+//! Extended Query `Bind + Execute + Sync` pipeline end-to-end.
 //!
 //! Covers the three-frame bundled pipeline:
 //! - DML happy path: Bind → BindComplete → CommandComplete → RFQ
@@ -127,8 +126,8 @@ fn bind_execute_emits_three_send_bytes_and_transitions() {
         &mut wb,
     );
 
-    // DEF-212: bytes live in wb (single concatenation drained by I/O
-    // layer in one socket write). Verify wire layout via structural split.
+    // Bytes live in `wb` (single concatenation drained by I/O layer
+    // in one socket write). Verify wire layout via structural split.
     let (bind, execute, sync) = split_bind_execute_sync(wb.as_bytes());
     assert_eq!(bind.first(), Some(&TAG_BIND.byte()), "first frame tag = 'B'");
     assert_eq!(execute.first(), Some(&TAG_EXECUTE.byte()), "second frame tag = 'E'");
@@ -365,11 +364,11 @@ fn portal_suspended_is_unexpected_frame_in_1c_3b() {
 // Push-state policy — in-flight / errored / wrong state
 // ═════════════════════════════════════════════════════════════════
 
-/// DEF-198 invariant: BindExecute from Errored state is structurally
+/// Invariant: BindExecute from Errored state is structurally
 /// blocked at the public API. `ConnectionStatus::Errored(kind)`
 /// exposes the underlying cause for caller recovery decisions.
 #[test]
-fn def198_bind_execute_from_errored_blocked_at_compile_time() {
+fn bind_execute_from_errored_blocked_at_compile_time() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
@@ -379,10 +378,10 @@ fn def198_bind_execute_from_errored_blocked_at_compile_time() {
     assert!(out.as_slice().iter().any(|a| matches!(a, Action::CloseSocket)));
     assert!(matches!(proto.state(), ActiveState::Errored(_)));
 
-    // DEF-198: as_ready returns None on Errored.
+    // as_ready returns None on Errored.
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None on Errored state",
+        "as_ready must return None on Errored state",
     );
     match proto.connection_status() {
         ConnectionStatus::Errored(_kind) => {
@@ -392,11 +391,11 @@ fn def198_bind_execute_from_errored_blocked_at_compile_time() {
     }
 }
 
-/// DEF-198 invariant: BindExecute while another BindExecute is in
-/// flight is structurally blocked at the public API. The in-flight
-/// state is preserved (caller must drive `feed_bytes` to drain).
+/// Invariant: BindExecute while another BindExecute is in flight
+/// is structurally blocked at the public API. The in-flight state
+/// is preserved (caller must drive `feed_bytes` to drain).
 #[test]
-fn def198_bind_execute_while_in_flight_blocked_at_compile_time() {
+fn bind_execute_while_in_flight_blocked_at_compile_time() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
@@ -416,10 +415,10 @@ fn def198_bind_execute_while_in_flight_blocked_at_compile_time() {
             | ActiveState::BindExecuteAwaitingBindCompleteSelect { .. }
     ));
 
-    // DEF-198: as_ready returns None during in-flight Bind+Execute.
+    // as_ready returns None during in-flight Bind+Execute.
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None during in-flight Bind+Execute",
+        "as_ready must return None during in-flight Bind+Execute",
     );
     assert_eq!(
         proto.connection_status(),
@@ -592,7 +591,7 @@ fn bind_frame_optional_mixed_with_some_and_none() {
         &mut wb,
     );
     let (bind_bytes, _execute, _sync) = split_bind_execute_sync(wb.as_bytes());
-    // Expected (DEF-184 A14 compact format-code block):
+    // Expected (compact format-code block):
     //   tag + len + NUL + NUL + 0x0001 nf + 0x0001 Binary +
     //   0x0002 np + [0x00000004 + i32=42] + [0xFFFFFFFF NULL] +
     //   0x0000 nr
@@ -603,11 +602,11 @@ fn bind_frame_optional_mixed_with_some_and_none() {
     //   = 26 bytes body; length field value = 26
     //   Total frame = 1 (tag) + 26 = 27 bytes
     //
-    // DEF-184 (A14): saves 2 B vs pre-(184) N=2 shape which sent
-    // `n_format_codes = 2, [1, 1]` — now sends `n_format_codes = 1,
-    // [1]` exploiting PG §55.7 Bind spec's "one format code applies
-    // to all parameters" compact form. Saving scales with N:
-    // 2 B for N=2, 4 B for N=3, ..., 30 B for N=16.
+    // The compact format-code block saves 2 B vs a naive N=2 shape
+    // (`n_format_codes = 2, [1, 1]`) by exploiting PG §55.7 Bind
+    // spec's "one format code applies to all parameters" form.
+    // Saving scales with N: 2 B for N=2, 4 B for N=3, ..., 30 B for
+    // N=16.
     assert_eq!(
         bind_bytes,
         &[
