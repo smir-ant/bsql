@@ -1,8 +1,7 @@
-//! DEF-212 Phase 2 (Alt Y', audit 2026-05-04) — `advance_one_frame` +
-//! `FeedEvent` per-event API spec.
+//! `advance_one_frame` + `FeedEvent` per-event API spec.
 //!
-//! Forward-compat anchor for 1c-5 pipelining: drives the protocol
-//! one user-observable event at a time, mapping to the typed
+//! Forward-compat anchor for pipelining: drives the protocol one
+//! user-observable event at a time, mapping to the typed
 //! [`FeedEvent`] enum.
 //!
 //! Coverage:
@@ -275,12 +274,12 @@ fn row_description_transitions_to_streaming_rows_event() {
 /// state and correlator delivery as `feed_bytes` in one call.
 #[test]
 fn advance_loop_equals_feed_bytes_on_ping_round_trip() {
-    // (a) feed_bytes path. DEF-270 (post-bisect 2026-05-09): mint
-    // counter is a static AtomicU64 (process-global), so each
-    // mint returns a different raw value; tests can no longer
-    // assume "fresh proto → raw=1". The equivalence between the
-    // two paths is observable on per-protocol routing — each
-    // path's minted id round-trips back through its own DeliverReply.
+    // (a) `feed_bytes` path. The mint counter is a static
+    // `AtomicU64` (process-global), so each mint returns a different
+    // raw value; tests cannot assume "fresh proto → raw=1". The
+    // equivalence between the two paths is observable on
+    // per-protocol routing — each path's minted id round-trips back
+    // through its own `DeliverReply`.
     let mut proto_a = fresh_active_via_trust_handshake();
     let mut wb_a = WriteBuf::new();
     let (reply_a, raw_a) = mint_reply::<PingKind>(&mut proto_a);
@@ -326,12 +325,12 @@ fn advance_loop_equals_feed_bytes_on_ping_round_trip() {
 // (G) feed_inbound on Errored surfaces typed ConnectionAlreadyClosed
 // ═══════════════════════════════════════════════════════════════════
 
-/// DEF-246 Phase 4 elevation #4 (2026-05-16). `feed_inbound` on
-/// Errored returns `Err(ProtocolError::ConnectionAlreadyClosed
-/// { prior_kind })` so the caller is notified rather than silently
-/// no-op'd. Pre-DEF-246 the return was `Ok(())` (silent no-op);
-/// the regression was tier-3 by-discipline (caller had to
-/// remember to `connection_status()` poll between feeds).
+/// `feed_inbound` on Errored returns
+/// `Err(ProtocolError::ConnectionAlreadyClosed { prior_kind })` so
+/// the caller is notified rather than silently no-op'd. A naive
+/// `Ok(())` (silent no-op) shape would be tier-3 by-discipline —
+/// the caller would have to remember to `connection_status()` poll
+/// between feeds.
 #[test]
 fn feed_inbound_on_errored_surfaces_connection_already_closed() {
     let mut proto = fresh_active_via_trust_handshake();

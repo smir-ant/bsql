@@ -1,4 +1,4 @@
-//! DEF-223 (2026-05-05) — `TERMINATE_WIRE_BYTES` public API spec.
+//! `TERMINATE_WIRE_BYTES` public API spec.
 //!
 //! Validates the `Terminate` ('X') frontend wire primitive from
 //! OUTSIDE the crate boundary. Internal `const _: () = assert!(...)`

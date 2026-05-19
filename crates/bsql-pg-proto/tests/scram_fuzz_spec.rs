@@ -1,12 +1,11 @@
-//! DEF-185 P3-5 (audit 2026-04-24): structured deterministic fuzz
-//! tests for the SCRAM wire parsers.
+//! Structured deterministic fuzz tests for the SCRAM wire parsers.
 //!
 //! # Scope
 //!
 //! Drives ~5K random adversarial payloads per parser through
-//! `PgProtocol::feed_bytes` + full state-machine flow. Pre-audit the
-//! SCRAM parsers had no randomized coverage — happy-path + a few
-//! hand-crafted negative vectors only.
+//! `PgProtocol::feed_bytes` + full state-machine flow. Covers the
+//! gap a happy-path + hand-crafted-negative-vectors suite alone
+//! cannot reach.
 //!
 //! # Methodology
 //!
@@ -33,9 +32,8 @@ use bsql_pg_proto::{
 };
 
 mod common;
-// DEF-246 Phase 2 (2026-05-16): `use common::PushOrPanic` deleted —
-// SCRAM-fuzz now drives push_startup directly (consume-self), the
-// PushOrPanic trait is no longer reached from this file.
+// SCRAM-fuzz drives `push_startup` directly (consume-self); the
+// `PushOrPanic` trait is not reached from this file.
 
 const SCRAM_FUZZ_ITERS: u32 = 5_000;
 
@@ -86,9 +84,9 @@ impl XorShift64 {
 // push_startup call. Returns (proto, wb) ready to receive
 // AUTHENTICATION frames.
 //
-// DEF-246 Phase 2/3 (2026-05-16): consume-self push_startup returns
-// `<ConnectingPhase>`; the protocol from a SCRAM init is mid-handshake
-// until the test drives the server-frame sequence.
+// Consume-self `push_startup` returns `<ConnectingPhase>`; the
+// protocol from a SCRAM init is mid-handshake until the test drives
+// the server-frame sequence.
 fn init_scram_protocol(
     _seed: u64,
 ) -> Option<(PgProtocol<bsql_pg_proto::ConnectingPhase>, WriteBuf)> {
@@ -245,7 +243,7 @@ fn scram_server_first_fuzz_never_panics_never_silent_pass() {
 // ───────────────────────────────────────────────────────────────────
 
 /// Feed a VALID server-first + RANDOM server-final. Tests the
-/// `parse_server_final` path (DEF-185 P1-B + P1-D).
+/// `parse_server_final` path.
 #[test]
 fn scram_server_final_fuzz_never_panics() {
     let mut rng = XorShift64::new(0xBEEF_0002);

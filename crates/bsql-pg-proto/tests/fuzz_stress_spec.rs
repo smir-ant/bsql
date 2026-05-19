@@ -1,4 +1,4 @@
-//! DEF-134 — fuzz / stress harness (stable-Rust, no nightly).
+//! Fuzz / stress harness (stable-Rust, no nightly).
 //!
 //! # Why property-style tests, not `cargo-fuzz`
 //!
@@ -39,8 +39,8 @@
 //! Keep a separate `fuzz/` subcrate outside the main workspace
 //! (so its nightly/unsafe dep doesn't leak into the main
 //! forbid-bundle). Fuzz harness would live in its own git
-//! subdirectory with its own CI job. Not blocking for Phase 1c/1e
-//! ship — this file covers the robustness class.
+//! subdirectory with its own CI job. Not required for v1.0 ship —
+//! this file covers the robustness class via property-style tests.
 
 use bsql_pg_proto::{
     frame::{parse_header, HeaderParse, READ_BUF_CAP},
@@ -272,9 +272,9 @@ fn push_ping_then_feed_random_bytes_terminates() {
         let mut proto = fresh_active_via_trust_handshake();
         let mut wb = WriteBuf::new();
         // Push Ping first — state transitions to PingAwaitingRfq.
-        // DEF-212: bytes live in wb; helper returns ().
-        // DEF-270: mint via proto.next_reply_id (fuzz aspect is the
-        // input bytes, not the reply IDs).
+        // Bytes live in `wb`; helper returns `()`. Mint via
+        // `proto.next_reply_id` (the fuzz aspect is the input
+        // bytes, not the reply IDs).
         let reply = proto.next_reply_id::<PingKind>();
         proto.push_or_panic(
             bsql_pg_proto::push_command::Ping { reply },

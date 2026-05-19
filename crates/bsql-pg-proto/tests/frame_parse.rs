@@ -1,4 +1,4 @@
-//! Phase 1a — frame-header parser spec-conformance.
+//! Frame-header parser spec-conformance.
 //!
 //! Per reforge.md §4.11, a test exists only if it pins:
 //!
@@ -94,9 +94,8 @@ fn one_to_four_bytes_yield_incomplete() {
 ///
 /// Invariant (spec): a well-formed header with `declared = 4` (header-
 /// only frame, empty payload) parses as `Ok` with `total_len = 5`,
-/// `tag` round-tripped. F-058 (pass-#8): `declared_len` field dropped
-/// from `HeaderParse::Ok` — derived from `total_len - 1` when tests
-/// need it.
+/// `tag` round-tripped. `HeaderParse::Ok` carries `total_len` only;
+/// tests derive `declared_len` as `total_len - 1` when needed.
 ///
 /// Ties together BE decode + the declared→total formula. Neither
 /// composes at the type level; the aggregate behaviour is observable
@@ -221,15 +220,13 @@ fn total_len_equals_one_plus_declared_len() {
         let header = [b'X', bytes[0], bytes[1], bytes[2], bytes[3]];
         match parse_header(&header) {
             HeaderParse::Ok { total_len, .. } => {
-                // F-058 (pass-#8): `declared_len` no longer returned —
-                // derive it from `total_len - 1` per the
-                // `total_len = 1 + declared` invariant. The
-                // formula itself is what this test was always
-                // exercising; dropping the redundant field just
-                // surfaces that fact.
-                // DEF-154 (G): total_len is now u16 (bounded by
-                // READ_BUF_CAP <= u16::MAX). Compare in usize to
-                // match the u32 declared value from the test vec.
+                // `HeaderParse::Ok` carries `total_len` only; derive
+                // `declared_len` as `total_len - 1` per the
+                // `total_len = 1 + declared` invariant. The formula
+                // is what this test was always exercising. `total_len`
+                // is `u16` (bounded by `READ_BUF_CAP <= u16::MAX`);
+                // compare in `usize` to match the `u32` declared
+                // value from the test vec.
                 let total_len_usize = usize::from(total_len);
                 let derived_declared = total_len_usize.saturating_sub(1);
                 let declared_usize = usize::try_from(declared).unwrap_or(0);

@@ -1,4 +1,4 @@
-//! DEF-221 (2026-05-07) — `cancel_request_bytes` public API spec.
+//! `cancel_request_bytes` public API spec.
 //!
 //! Validates the CancelRequest wire-builder and the magic-version
 //! family pin from OUTSIDE the crate boundary. Internal `const _:
@@ -193,9 +193,9 @@ fn cancel_request_pg_canonical_magic_decomposition() {
 fn cancel_request_magic_version_family_pin() {
     // The MAGIC_VERSION_HIGH_HALF const is the family marker
     // shared by SSL_REQUEST_VERSION + CANCEL_REQUEST_VERSION
-    // (and post-v1.0 GSSENC_REQUEST_VERSION = 1234<<16 | 5680,
-    // tracked under DEF-230). Verify the formula holds for both
-    // currently-defined family members from the consumer side.
+    // (and a future GSSENC_REQUEST_VERSION = 1234<<16 | 5680).
+    // Verify the formula holds for both currently-defined family
+    // members from the consumer side.
     let high = bsql_pg_proto::wire::MAGIC_VERSION_HIGH_HALF;
     assert_eq!(high, 1234, "magic-version family high half is 1234");
 

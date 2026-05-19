@@ -1,4 +1,4 @@
-//! DEF-214 (2026-05-05) — `SSL_REQUEST_WIRE_BYTES` public API spec.
+//! `SSL_REQUEST_WIRE_BYTES` public API spec.
 //!
 //! Validates the SSLRequest pre-startup wire primitive from OUTSIDE
 //! the crate boundary. Internal `const _: () = assert!(...)` drift-
@@ -154,10 +154,10 @@ fn ssl_request_pg_canonical_magic_decomposition() {
 }
 
 // ==================================================================
-// DEF-214 Phase 2: classify_ssl_response_byte typed-outcome tests
-// (2026-05-07): comprehensive coverage of the 1-byte SSL response
-// classifier — every defined byte, every undefined byte sample,
-// non-exhaustive guarantee, equality semantics.
+// classify_ssl_response_byte typed-outcome tests: comprehensive
+// coverage of the 1-byte SSL response classifier — every defined
+// byte, every undefined byte sample, non-exhaustive guarantee,
+// equality semantics.
 // ==================================================================
 
 /// `'S'` (0x53) → `Accepted`. Server accepts SSL; driver should

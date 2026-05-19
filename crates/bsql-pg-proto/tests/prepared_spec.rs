@@ -1,4 +1,4 @@
-//! DEF-244 — end-to-end spec test for `prepared!` macro path.
+//! End-to-end spec test for the `prepared!` macro path.
 //!
 //! Covers:
 //! - `prepared!` + `execute_prepared` → wire bytes.
@@ -317,7 +317,7 @@ fn e8_null_in_required_column_errors() {
 // compile time via ReadyGuard.
 //
 // Pin: `as_ready()` returns None when busy; tests cover this via
-// the guard typestate (DEF-198) — not a new property to prove here.
+// the guard typestate — not a new property to prove here.
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]

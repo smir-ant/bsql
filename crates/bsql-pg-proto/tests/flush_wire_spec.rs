@@ -1,4 +1,4 @@
-//! DEF-252 (audit 2026-05-08) — `FLUSH_WIRE_BYTES` public API spec.
+//! `FLUSH_WIRE_BYTES` public API spec.
 //!
 //! Validates the `Flush` ('H') frontend wire primitive from OUTSIDE
 //! the crate boundary. Internal `const _: () = assert!(...)` drift-pins
@@ -12,7 +12,7 @@
 //!
 //! # Why this file matters
 //!
-//! Phase 1c-5 pipelining drivers will consume `FLUSH_WIRE_BYTES`
+//! Pipelining drivers will consume `FLUSH_WIRE_BYTES`
 //! directly — they write the bytes to the socket mid-batch to
 //! extract intermediate responses without committing the implicit
 //! transaction. Internal drift-pins prove the literal is correct
