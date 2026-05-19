@@ -684,8 +684,8 @@ pub enum ProtoState {
     /// `ErrorKind` — it excludes the `AlreadyClosed` pseudo-kind.
     /// A naive `Errored(ErrorKind)` shape would let the
     /// "state never holds `AlreadyClosed`" invariant rest on
-    /// tier-3 audit (maintained by the `fail_inflight_and_close`
-    /// early-return guard); the narrower newtype makes it tier-1
+    /// review-discipline (maintained by an early-return guard on
+    /// the fail path); the narrower newtype makes it tier-1
     /// compile — constructing `Errored(AlreadyClosed)` is a type
     /// error at the `StateErrorKind::try_from_kind` call site.
     Errored(StateErrorKind),

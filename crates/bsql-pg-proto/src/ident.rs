@@ -216,12 +216,13 @@ pub trait Truncating: FixedStrKind + sealed::TruncatingSealed {}
 ///
 /// [`FixedStr::as_str`] is only available on `FixedStr<N, Tag>` where
 /// `Tag: ValidUtf8` — tags whose constructors don't guarantee UTF-8
-/// (none exist today — all crate tags take `&str` or coerce to ASCII
-/// via `from_bytes_lossy`) would be statically prevented from
-/// exposing their bytes as `&str`. F3: tier-3 audit pairing (the
-/// `as_str` fallback `""` is safe only because every current tag
-/// happens to produce UTF-8) → tier-2 structural (tag must opt into
-/// `ValidUtf8` to earn `as_str`).
+/// (none exist today — all crate tags take `&str` or coerce to
+/// ASCII via `from_bytes_lossy`) are statically prevented from
+/// exposing their bytes as `&str`. A naive pairing that left the
+/// "`as_str` fallback `""` is safe only because every current tag
+/// happens to produce UTF-8" invariant on review-discipline lifts
+/// here to tier-2 structural (a tag must opt into `ValidUtf8` to
+/// earn `as_str`).
 ///
 /// **Sealed**: only the crate's own tags can be `ValidUtf8`. A
 /// downstream tag type cannot bypass the check.

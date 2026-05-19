@@ -60,10 +60,10 @@ use core::num::{NonZeroU16, NonZeroU64};
 ///
 /// Exhaustive `match` on `TxStatus` catches every legal state at
 /// build time. A refactor that adds a new PG tx-status (future
-/// spec change) forces every consumer to handle it. Compare to
-/// the pre-uplift `tx_status: u8` form where a byte-match had no
-/// compiler help and forgetting the `'E'` arm was a tier-3 audit
-/// seam.
+/// spec change) forces every consumer to handle it. A naive
+/// `tx_status: u8` form has no compiler help for the byte-match
+/// — forgetting the `'E'` arm would be a tier-3
+/// review-discipline seam.
 ///
 /// # NOT `#[non_exhaustive]`
 ///
@@ -158,8 +158,8 @@ const _: () = {
 /// A naive `SendBytesRange { start, end }` shape carrying two raw
 /// `usize`s with no proof of `start ≤ end` or `end ≤ write_buf.len()`
 /// would leave `materialise` to fall back silently to `&[]` on any
-/// violation — a tier-3 audit-enforced seam. The current shape is
-/// tighter:
+/// violation — a tier-3 review-discipline seam. The current shape
+/// is tighter:
 ///
 /// - `start ≤ end` is guaranteed by `len: NonZeroU16` built via
 ///   `end.checked_sub(start)?` — you cannot construct a range with

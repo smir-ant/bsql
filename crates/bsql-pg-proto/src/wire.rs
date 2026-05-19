@@ -278,10 +278,10 @@ pub const TAG_DESCRIBE: OutboundTag = OutboundTag::from_byte(b'D');
 ///
 /// A `target: u8` parameter would compile cleanly for a call site
 /// passing `b'X'` and produce a server `ErrorResponse` at runtime
-/// (tier-3 audit seam). The typed enum moves discrimination to the
-/// call site: `DescribeTargetByte::Statement` / `::Portal` are the
-/// only paths to construct a value, and the `byte()` method folds
-/// to a single literal at the monomorphic call site.
+/// (a review-discipline seam). The typed enum moves discrimination
+/// to the call site: `DescribeTargetByte::Statement` / `::Portal`
+/// are the only paths to construct a value, and the `byte()`
+/// method folds to a single literal at the monomorphic call site.
 ///
 /// Const-asserts below pin the wire bytes to PG spec; an arm-body
 /// edit swapping the two values would fail the build.
