@@ -2526,7 +2526,8 @@ impl PgProtocol<ActivePhase> {
     ///   compile time: the HRTB on `FnOnce(&[u8; 16], i32) -> R`
     ///   quantifies the borrow's lifetime over `'a` so the reference
     ///   cannot escape the call. Pinned by trybuild probe
-    ///   `p_d278d_6` (`E0521` lifetime-may-not-live-long-enough).
+    ///   the trybuild probe in `tests/cancel_request_retention.rs`
+    ///   (`E0521` lifetime-may-not-live-long-enough).
     ///
     /// **What the caller CAN do — and the documented gap:** copying
     /// the bytes' *contents* into caller memory (e.g. `bytes.to_vec()`
@@ -2569,10 +2570,10 @@ impl PgProtocol<ActivePhase> {
     /// - **Method-absent on every other phase**: tier-1 by
     ///   visibility. `<DisconnectedPhase>` / `<ConnectingPhase>` /
     ///   `<ClosedPhase>` have no `with_cancel_request` method —
-    ///   calling produces `E0599`. Pinned by trybuild probes
-    ///   `p_d278d_1` / `_2` / `_3`.
-    /// - **Retention rejection**: tier-1 by HRTB lifetime quantification.
-    ///   Pinned by trybuild probe `p_d278d_6` (`E0521`).
+    ///   calling produces `E0599`. Pinned by per-phase trybuild
+    ///   probes.
+    /// - **Retention rejection**: tier-1 by HRTB lifetime
+    ///   quantification.
     ///
     /// # Driver pattern
     ///
@@ -2612,19 +2613,19 @@ impl PgProtocol<ActivePhase> {
     /// (`panic = "unwind"`; under `panic = "abort"` see the panic
     /// semantics note in [`crate::cancel`]).
     ///
-    /// # Decision §8.3 / §8.4 / §8.5 (DEF-278 Bundle D / D' sign-off)
+    /// # Design choices
     ///
-    /// - **§8.3 — `pid` exposed inside closure**: pid is wire-public;
+    /// - **`pid` exposed inside closure**: pid is wire-public —
     ///   matching the [`crate::StartupCompletePayload`] precedent.
     ///   Diagnostic value for operators.
-    /// - **§8.4 — Zeroize-on-drop via stack guard**: Bundle D' lifts
-    ///   the secret-scrub mechanism from a Sensitive<i32> field
-    ///   (tier-1 by-Drop-fire, suppressible by mem::forget /
-    ///   Box::leak / ManuallyDrop) to a stack-local Zeroizing
-    ///   guard (tier-1 by-closure-scope, retention structurally
-    ///   impossible).
-    /// - **§8.5 — method-absent on `<ConnectingPhase>`**: tier-1.
-    ///   A driver wanting to cancel mid-handshake must drop the
+    /// - **Zeroize-on-drop via stack guard**: A naive shape would
+    ///   keep the secret-scrub mechanism on a long-lived
+    ///   Sensitive<i32> field — tier-1 by-Drop-fire, suppressible
+    ///   by mem::forget / Box::leak / ManuallyDrop. Instead the
+    ///   stack-local Zeroizing guard is tier-1 by-closure-scope,
+    ///   with retention structurally impossible.
+    /// - **Method-absent on `<ConnectingPhase>`**: tier-1. A
+    ///   driver wanting to cancel mid-handshake must drop the
     ///   connection; there is no production scenario where a pool
     ///   cancels a mid-handshake connection (cost of opening a new
     ///   connection < cost of debugging cancel semantics).
@@ -2639,22 +2640,23 @@ impl PgProtocol<ActivePhase> {
         // (CREDO §V).
         let key: &crate::cancel::BackendKey = self.inner.backend_key.as_inner()?;
         let pid: i32 = key.pid;
-        // DEF-280 Bundle I / Bundle D'' (2026-05-18): Copy the i32
-        // out of the cell's Sensitive<i32> into a `Zeroizing<i32>`
-        // guard so the stack slot scrubs deterministically when the
-        // function frame ends. Pre-Bundle I the plain `i32` local
-        // lived unscrubbed on the function frame for the duration of
-        // the `cancel_request_bytes` build below; the encoded
-        // `[u8; 16]` was already wrapped in `Zeroizing` (covering
-        // BE bytes[12..16]), but the plain-i32 intermediate was not.
-        // Under `panic = "unwind"` (cargo test) Drop fires; under
+        // Copy the i32 out of the cell's Sensitive<i32> into a
+        // `Zeroizing<i32>` guard so the stack slot scrubs
+        // deterministically when the function frame ends. A naive
+        // shape would let the plain `i32` local live unscrubbed on
+        // the function frame for the duration of the
+        // `cancel_request_bytes` build below; the encoded `[u8; 16]`
+        // is already wrapped in `Zeroizing` (covering BE bytes[12..16]),
+        // but a plain-i32 intermediate would not be. Under
+        // `panic = "unwind"` (cargo test) Drop fires; under
         // `panic = "abort"` (release; documented gap) the process
         // exits before the unscrubbed slot matters. Tier-1 within
         // scope.
-        // DEF-280 Bundle E (2026-05-18): closure-scope
-        // Sensitive::with_inner replaces the pre-Bundle E
-        // `*key.secret_key.get()` shape. Same elevation as the
-        // dispatch.rs:636 sibling site.
+        //
+        // Closure-scope `Sensitive::with_inner` is the supported way
+        // to copy out a `Sensitive<i32>`'s payload — the same shape
+        // applied at the sibling site in dispatch.rs that builds the
+        // post-auth Sensitive's contents.
         let secret_key_guard: zeroize::Zeroizing<i32> =
             zeroize::Zeroizing::new(key.secret_key.with_inner(|s| *s));
         // Materialise the wire frame inside a Zeroizing guard. The
@@ -2682,38 +2684,40 @@ impl PgProtocol<ActivePhase> {
         // `Zeroize::zeroize` on the [u8; 16]. Tier-1 by
         // closure-scope: nothing inside or outside this function
         // can prevent the guard's Drop short of `panic = "abort"`
-        // (documented gap aligned with DEF-185 P0-A).
+        // (documented gap; the panic-abort hook the crate ships in
+        // `crate::panic_hook` covers the documented sites).
         Some(r)
     }
 
     /// Mint a fresh `ReplyId<K>` for an outbound command.
     ///
-    /// **DEF-270 cluster (U letter, 2026-05-09):** this is the sole
-    /// public mint surface for [`crate::ReplyId<K>`]. Pre-DEF-270
-    /// `ReplyId::from_raw(...)` was `pub` and external crates minted
-    /// their own IDs (tier-3 by-discipline — duplicate-ID risk).
-    /// Post-DEF-270 `from_raw` is `pub(crate)` and the only path to a
-    /// `ReplyId<K>` from outside the crate is this method.
+    /// The sole public mint surface for [`crate::ReplyId<K>`].
+    /// `ReplyId::from_raw(...)` is `pub(crate)` so the only path to
+    /// a `ReplyId<K>` from outside the crate is this method. A naive
+    /// shape would expose `from_raw` as `pub` and let external
+    /// crates mint their own IDs — tier-3 by-discipline with
+    /// duplicate-ID risk.
     ///
     /// # Why `&mut self` if mint is via static atomic
     ///
     /// The counter is a `static AtomicU64` (mod-private below) — NOT
-    /// a `PgProtocol` field. Bisect 2026-05-09 proved that adding an
-    /// inline `u64` field grew `PgProtocol` 520 → 528 B and shifted
-    /// LLVM whole-crate codegen heuristic, regressing the synthetic
-    /// `column_decode/iter_10cols` bench by +6%. Static-atomic mint
-    /// preserves PgProtocol size at 520 B (no codegen shift) AND
-    /// strengthens the invariant: globally-unique IDs across all
-    /// `PgProtocol` instances (per-protocol counter would only have
-    /// guaranteed per-instance uniqueness).
+    /// a `PgProtocol` field. A per-protocol counter would force an
+    /// inline `u64` field that grows `PgProtocol` 520 → 528 B and
+    /// shifts LLVM whole-crate codegen heuristic, regressing the
+    /// synthetic `column_decode/iter_10cols` bench by +6%
+    /// (bisect-confirmed). Static-atomic mint preserves PgProtocol
+    /// size at 520 B (no codegen shift) AND strengthens the
+    /// invariant: globally-unique IDs across all `PgProtocol`
+    /// instances (a per-protocol counter would only guarantee
+    /// per-instance uniqueness).
     ///
     /// `&mut self` is retained on the signature because: (a) it
-    /// keeps the API shape consistent with the prior per-protocol
-    /// design (forward-compat if we ever move back), and (b) the
-    /// borrow makes it obvious to callers that mint participates in
-    /// the protocol's mutation cycle (it is not a "look-only"
-    /// operation; the minted ID is correlator-bound to a future
-    /// push).
+    /// keeps the API shape consistent with a future per-protocol
+    /// design (forward-compat if a per-protocol counter ever
+    /// returns), and (b) the borrow makes it obvious to callers
+    /// that mint participates in the protocol's mutation cycle (it
+    /// is not a "look-only" operation; the minted ID is
+    /// correlator-bound to a future push).
     ///
     /// # Tier-1 / tier-2 closure
     ///
@@ -2734,8 +2738,8 @@ impl PgProtocol<ActivePhase> {
     /// `K: ReplyKind` — the typed reply-kind tag bound to the command
     /// being pushed. Caller writes `proto.next_reply_id::<PingKind>()`
     /// for a Ping reply, etc. The kind binds the payload type via
-    /// [`crate::ReplyKind::Payload`] (DEF-112) — passing the wrong
-    /// kind to a command's `reply` field is a type error.
+    /// [`crate::ReplyKind::Payload`] — passing the wrong kind to a
+    /// command's `reply` field is a type error.
     ///
     /// # Counter behaviour
     ///
@@ -2745,19 +2749,19 @@ impl PgProtocol<ActivePhase> {
     /// On saturation the counter parks at `u64::MAX` — every
     /// subsequent mint returns the same ID, surfacing as a
     /// duplicate-correlator failure at the wrapper's pending-replies
-    /// table (post-Phase-1c-5).
+    /// table.
     ///
-    /// Tier-3 audit #32 (2026-05-19): delegates to
+    /// Tier-3 audit #32 (2026-05-19, verified): delegates to
     /// [`ActiveInner::next_reply_id`] which mints from the shared
-    /// `PROCESS_REPLY_ID_COUNTER` static (see line 961 — process-
-    /// global uniqueness across all four phases). Pre-audit this
-    /// method maintained a SEPARATE local `static COUNTER` —
-    /// a process-global counter, but distinct from the one used by
-    /// Disconnected/Connecting/ActiveInner. Two PgProtocol instances
-    /// on the same process could therefore mint overlapping IDs
-    /// across phase boundaries (e.g. Disconnected ID 1 on instance A,
-    /// Active ID 1 on instance B). Now closed: every phase mints
-    /// from the same atomic — tier-1 by-construction.
+    /// `PROCESS_REPLY_ID_COUNTER` static (process-global uniqueness
+    /// across all four phases). A naive shape would maintain a
+    /// SEPARATE local `static COUNTER` on this `impl PgProtocol<ActivePhase>`
+    /// path — a process-global counter, but distinct from the one
+    /// used by Disconnected/Connecting/ActiveInner: two PgProtocol
+    /// instances on the same process could mint overlapping IDs
+    /// across phase boundaries (e.g. Disconnected ID 1 on instance
+    /// A, Active ID 1 on instance B). Tier-1 by-construction here:
+    /// every phase mints from the same atomic.
     #[inline]
     pub fn next_reply_id<K: crate::reply_id::ReplyKind>(
         &mut self,
@@ -2765,9 +2769,8 @@ impl PgProtocol<ActivePhase> {
         self.inner.next_reply_id::<K>()
     }
 
-    // DEF-196 (2026-04-28): three-field split. Each cold slot
-    // independently lazy-allocated; malformed_counter is inline
-    // (4 B, no Box).
+    // Three-field cold split. Each cold slot is independently
+    // lazy-allocated; malformed_counter is inline (4 B, no Box).
 
     /// Read-only accessor for `session_params`. Returns the boxed
     /// contents if allocated, else a `&'static` empty default
@@ -2806,8 +2809,8 @@ impl PgProtocol<ActivePhase> {
         self.inner.malformed_frame_count
     }
 
-    /// DEF-185 P2-9 (audit 2026-04-24): count of malformed-frame
-    /// events that triggered connection teardown.
+    /// Count of malformed-frame events that triggered connection
+    /// teardown.
     ///
     /// Every invocation of the internal `fail_inflight_no_readbuf`
     /// helper bumps this counter — once per fatal wire-level error
@@ -2820,38 +2823,32 @@ impl PgProtocol<ActivePhase> {
     /// the value to distinguish these cases.
     ///
     /// Saturates at `u32::MAX` (no wrap). Per connection lifetime.
-    /// DEF-186 P1-5 widened from u16 — see field doc.
-    ///
-    /// DEF-196: counter lives in `cold: Option<Box<ColdFields>>`;
-    /// returns 0 if cold hasn't been allocated (no malformed frames
-    /// have triggered teardown yet on this connection).
     #[inline]
     #[must_use]
     pub fn malformed_frame_count(&self) -> u32 {
         self.cold_malformed_frame_count()
     }
 
-    /// DEF-279 Phase 2 Bundle Commit 12 (2026-05-18) — per-phase
-    /// state accessor for diagnostic logging.
+    /// Per-phase state accessor for diagnostic logging.
     ///
-    /// **Return type changed**: `&ProtoState` → `&ActiveState`. The
-    /// per-phase enum carries only post-handshake variants —
-    /// `ProtoState`'s Connecting* variants don't exist here.
-    /// Callers that pattern-matched against `ProtoState::SimpleQuery*`
-    /// etc. now match the same-meaning `ActiveState::SimpleQuery*`;
-    /// `ProtoState::Idle` / `ProtoState::PingAwaitingRfq` /
-    /// `ProtoState::Errored(_)` map 1:1 to the same-named
-    /// `ActiveState` variants.
+    /// Returns `&ActiveState` — the per-phase enum carries only
+    /// post-handshake variants; `ProtoState`'s `Connecting*`
+    /// variants don't exist here. A naive shape would return
+    /// `&ProtoState` and let callers open-pattern over the wider
+    /// enum; instead callers pattern-match against the same-meaning
+    /// `ActiveState::SimpleQuery*` etc., with `ProtoState::Idle` /
+    /// `ProtoState::PingAwaitingRfq` / `ProtoState::Errored(_)`
+    /// mapping 1:1 to the same-named `ActiveState` variants.
     #[inline]
     #[must_use]
     pub const fn state(&self) -> &crate::state::ActiveState {
         &self.inner.state
     }
 
-    /// **DEF-248 Sub-B (2026-05-12)** — diagnostic predicate for the
-    /// partial-assembly cell. Returns `true` iff an oversize non-`'D'`
-    /// frame is currently mid-flight (body bytes accumulating across
-    /// multiple `feed_bytes` calls).
+    /// Diagnostic predicate for the partial-assembly cell. Returns
+    /// `true` iff an oversize non-`'D'` frame is currently
+    /// mid-flight (body bytes accumulating across multiple
+    /// `feed_bytes` calls).
     ///
     /// Read-only; no token needed. Used by Sub-B integration tests to
     /// pin lifecycle invariants (no orphaned Box across dispatch
@@ -2870,10 +2867,8 @@ impl PgProtocol<ActivePhase> {
     /// Borrow the accumulated session parameters.
     ///
     /// Populated during the startup handshake from `ParameterStatus`
-    /// messages. Empty until startup completes.
-    ///
-    /// DEF-196: session params live in `cold: Option<Box<ColdFields>>`.
-    /// Returns a `&'static` empty default if cold hasn't been
+    /// messages. Empty until startup completes. Returns a
+    /// `&'static` empty default when the lazy-init box has not been
     /// allocated yet (semantically identical to a fresh
     /// `SessionParams::new()`).
     #[inline]
@@ -2888,11 +2883,9 @@ impl PgProtocol<ActivePhase> {
     ///
     /// Returns the unread region of the read buffer.
     ///
-    /// Post-(DEF-154 H+V delete 2026-04-24): pending_advance logic
-    /// removed (dead after DEF-154 Y deleted StreamRowRange).
-    /// Cursor advance now happens in-scope inside `feed_bytes`, so
-    /// this method simply forwards to `ReadBuf::unread()` — the
-    /// caller always sees the current cursor state.
+    /// Cursor advance happens in-scope inside `feed_bytes`, so this
+    /// method simply forwards to `ReadBuf::unread()` — the caller
+    /// always sees the current cursor state.
     #[inline]
     #[must_use]
     pub fn unread(&self) -> &[u8] {
@@ -2900,7 +2893,7 @@ impl PgProtocol<ActivePhase> {
     }
 
     // ═════════════════════════════════════════════════════════════════
-    // DEF-198 — witness-guard typestate for client-initiated push.
+    // Witness-guard typestate for client-initiated push.
     // ═════════════════════════════════════════════════════════════════
 
     /// Acquire a [`crate::guard::ReadyGuard`] iff the protocol is in
@@ -2920,7 +2913,7 @@ impl PgProtocol<ActivePhase> {
     /// Dispatches on [`crate::state::ProtoState::push_class`] (5-variant
     /// exhaustive classifier). Adding a new state variant is a build
     /// failure that forces classification (transitive: state → push_class
-    /// → as_ready). Pinned by `tests/def198_guard_closure_spec.rs`.
+    /// → as_ready). Pinned by the guard-closure spec test suite.
     ///
     /// # Zero-cost
     ///
@@ -2951,7 +2944,7 @@ impl PgProtocol<ActivePhase> {
     ///
     /// Exhaustive match over `StatePushClass`'s 5 variants — adding a
     /// `StatePushClass` variant is a build failure here. Pinned by
-    /// `tests/def198_guard_closure_spec.rs`.
+    /// the guard-closure spec test suite.
     #[inline]
     #[must_use]
     pub fn connection_status(&self) -> crate::guard::ConnectionStatus {
@@ -2982,28 +2975,30 @@ impl PgProtocol<ActivePhase> {
     /// directly, no `PgProtocol` construction needed).
     ///
     /// Caller's `Idle` precondition is enforced uniformly at runtime by
-    /// `IdleState::try_from(&mut state)` (DEF-272 cluster γ typestate);
-    /// the `None` arm classifies via `CrateBugLocus::PushCommandInternalNonIdle`
-    /// PushFailure with `core::hint::cold_path()` (DEF-280 Bundle G
-    /// eliminated the pre-existing `debug_assert!(false, …)` dev-loud
-    /// branch as a CREDO §V glass pattern — the classified failure is
-    /// the safety net in both dev and release modes).
+    /// `IdleState::try_from(&mut state)` (the typestate IS the proof);
+    /// the `None` arm classifies via
+    /// `CrateBugLocus::PushCommandInternalNonIdle` PushFailure with
+    /// `core::hint::cold_path()`. A naive shape would add a loud
+    /// `debug_assert!(false, …)` dev branch — CREDO §V banned glass
+    /// pattern (dev-loud + release-silent); the classified failure
+    /// is the safety net in both dev and release modes.
     ///
-    /// # DEF-212 (Alt Y', architect-vetted impl plan, audit 2026-05-04)
+    /// # Return surface
     ///
-    /// Pre-(212) returned `OutActions<'w, 's>` (800 B; caller iterated
-    /// `Action::SendBytes`/`SendBytesStatic`/`FailReply`/`CloseSocket`).
-    /// Post-(212) returns `Result<(), PushFailure>` (~80 B). On Ok,
-    /// bytes (frame + optional trailing Sync) live in the caller's
-    /// [`WriteBuf`]; caller drains `wb.as_bytes()` to socket in a
-    /// single write. On Err, state has already transitioned to
-    /// `Errored`; caller resolves user's oneshot via `failure.id` +
-    /// `failure.cause` and closes the socket per the
-    /// [`crate::PushFailure`] `#[must_use]` contract.
-    /// DEF-269 v2 (T): generic over `C: PushCommand`. Caller passes a
-    /// per-command struct (e.g. [`crate::push_command::Ping`]) instead
-    /// of a `PgCommand` enum value. Each `C` is monomorphised — the
-    /// 2176-B-by-value enum dispatch is gone.
+    /// Returns `Result<OutActions<'w, 'static>, PushFailure>` (~88 B
+    /// plus the OutActions container in the Ok arm). On Ok, the
+    /// frame bytes live in the caller's [`WriteBuf`] and the
+    /// returned `OutActions` carries the `Action::SendBytes(&'w [u8])`
+    /// chunks for the caller's I/O layer. On Err, state has already
+    /// transitioned to `Errored`; caller resolves the user's oneshot
+    /// via the returned `failure.id` and `failure.cause` and closes
+    /// the socket per the [`crate::PushFailure`] `#[must_use]`
+    /// contract.
+    ///
+    /// Generic over `C: PushCommand`. Caller passes a per-command
+    /// struct (e.g. [`crate::push_command::Ping`]) — each `C` is
+    /// monomorphised, so there is no 2176-B-by-value enum dispatch
+    /// to thread through.
     #[must_use = "the returned Result carries OutActions on success (caller drains \
                   the multi-chunk frame: header range + borrowed SQL + trailer range \
                   + Sync) or the consumed-correlator + cause failure signal — both \
@@ -3013,55 +3008,44 @@ impl PgProtocol<ActivePhase> {
         cmd: C,
         write_buf: &'w mut WriteBuf,
     ) -> Result<crate::action::OutActions<'w, 'static>, crate::action::PushFailure> {
-        // DEF-160 Z2 (2026-05-11): push API now returns OutActions.
-        // Pre-Z2 contract was "caller drains wb.as_bytes() post-Ok" —
-        // viable when push only stages SendBytesRange + SendBytesStatic
-        // (everything sits inside wb). DEF-160 introduces
-        // SendBytesBorrowed for zero-copy SQL — the SQL bytes live in
-        // CALLER memory (Parse<'a>::sql / SimpleQuery<'a>::sql), not in
-        // wb. The full outbound frame is the ordered concatenation of:
+        // The full outbound frame is the ordered concatenation of:
         //   1. SendBytesRange (header bytes in wb)
         //   2. SendBytesBorrowed (caller's SQL — zero-copy)
         //   3. SendBytesRange (trailer bytes in wb)
         //   4. SendBytesStatic (Sync trailer for Parse — `&'static`)
         // OutActions surfaces these as `Action::SendBytes(&[u8])` per
-        // chunk (4 for Parse, 3 for SimpleQuery, 1 for Ping/Bind/etc).
-        // Under `writev` / IoSlice the caller collapses the chunks to
-        // a single socket syscall.
+        // chunk (4 for Parse, 3 for SimpleQuery, 1 for
+        // Ping/Bind/etc). Under `writev` / IoSlice the caller
+        // collapses the chunks to a single socket syscall.
         write_buf.clear();
 
-        // DEF-272 cluster γ (2026-05-10): the Idle precondition is
-        // enforced by [`crate::state_setter::IdleState::try_from`]
-        // below — the `Option<IdleState<'_>>` typestate IS the proof
-        // (replaces the pre-γ `IdleStateProof` witness param). The
+        // The Idle precondition is enforced by
+        // [`crate::state_setter::IdleState::try_from`] below — the
+        // `Option<IdleState<'_>>` typestate IS the proof. The
         // legitimate caller is `ReadyGuard::push_command` (which
         // performs `as_ready` Idle classification upstream); this
-        // re-check is the single load-bearing guard, eliminating the
-        // pre-γ "caller must promise + we debug_assert" surface.
-        // DEF-211 FAKE-01: pass `StatePushClass::Idle` as a STATIC
-        // const argument — LLVM specialises the inlined
-        // `clear_session_residue_for_class` body to the Idle arm only,
-        // eliding the 5-arm dispatch entirely.
+        // re-check is the single load-bearing guard. A naive shape
+        // would augment it with "caller must promise + we
+        // debug_assert" defensive surface.
         //
-        // DEF-246 Option α (2026-05-16):
-        // `clear_session_residue_for_class` lives on `PgProtocolInner`;
-        // route through `self.inner` directly.
+        // Pass `StatePushClass::Idle` as a STATIC const argument —
+        // LLVM specialises the inlined
+        // `clear_session_residue_for_class` body to the Idle arm
+        // only, eliding the 5-arm dispatch entirely.
         //
-        // DEF-279 follow-up (2026-05-18): `row_desc_slot` HOISTED to
-        // outer `<ActivePhase>::Extras` — pass `&mut self.extras` to
-        // the per-Inner residue method.
+        // `row_desc_slot` lives on outer `<ActivePhase>::Extras` —
+        // pass `&mut self.extras` to the per-Inner residue method.
         self.inner.clear_session_residue_for_class(
             &mut self.extras,
             crate::state::StatePushClass::Idle,
         );
 
-        // DEF-279 Phase 2 Bundle Commit 12 (2026-05-18): lift+lower
-        // for the IdleState setter machinery (which operates on
-        // `&mut ProtoState`). self.inner.state is now ActiveState;
-        // we mem::replace with the `Idle` sentinel (the natural
-        // value when ready), pass `&mut proto_state` to the setter,
-        // then lower the result back via `ActiveState::try_from`
-        // after the branded closure returns.
+        // Lift+lower for the IdleState setter machinery (which
+        // operates on `&mut ProtoState`). self.inner.state is now
+        // ActiveState; we mem::replace with the `Idle` sentinel
+        // (the natural value when ready), pass `&mut proto_state`
+        // to the setter, then lower the result back via
+        // `ActiveState::try_from` after the branded closure returns.
         let mut proto_state: ProtoState = core::mem::replace(
             &mut self.inner.state,
             crate::state::ActiveState::Idle,
@@ -3072,22 +3056,22 @@ impl PgProtocol<ActivePhase> {
         let idle = match crate::state_setter::IdleState::try_from(state) {
             Some(idle) => idle,
             None => {
-                // DEF-280 Bundle G (2026-05-18): debug_assert!(false, …)
-                // removed — CREDO §V banned glass pattern (dev loud +
-                // release silent fallthrough). The classified `PushFailure`
-                // below IS the safety net; the assert was misleading dev-
-                // noise on a path that's architecturally unreachable on
-                // production callers (ReadyGuard::push_command upstream
-                // classifies via `as_ready`'s runtime Idle check; the
-                // `&mut PgProtocol` borrow chain rules out interleaving
+                // The classified `PushFailure` below IS the safety
+                // net; a naive shape would add a `debug_assert!(false,
+                // …)` here — CREDO §V banned glass pattern (dev
+                // loud + release silent fallthrough). The path is
+                // architecturally unreachable on production callers
+                // (ReadyGuard::push_command upstream classifies via
+                // `as_ready`'s runtime Idle check; the `&mut
+                // PgProtocol` borrow chain rules out interleaving
                 // between as_ready and push_command_internal entry).
                 //
-                // DEF-280 Bundle J (2026-05-18): sentinel id is now the
-                // distinct `CRATE_BUG_REPLY_ID_SENTINEL` (NonZeroU64::MAX,
-                // see `reply_id.rs` docstring). Pre-Bundle J this site
-                // used `NonZeroU64::MIN` which collided with the
-                // legitimate first id minted by `next_reply_id` — the
-                // collision is now closed by-construction.
+                // The sentinel id is the distinct
+                // `CRATE_BUG_REPLY_ID_SENTINEL` (NonZeroU64::MAX,
+                // see `reply_id.rs` docstring). A naive shape would
+                // use `NonZeroU64::MIN` which collides with the
+                // legitimate first id minted by `next_reply_id` —
+                // closed by-construction by the distinct sentinel.
                 core::hint::cold_path();
                 return Err(crate::action::PushFailure {
                     id: crate::reply_id::CRATE_BUG_REPLY_ID_SENTINEL,
@@ -3098,33 +3082,33 @@ impl PgProtocol<ActivePhase> {
             }
         };
 
-        // DEF-160 Z2 (2026-05-11, post-bench-stable mitigation):
-        // single-pass materialise inside the branded closure. Earlier
-        // shape returned `StagedActions` from the closure (~700 B
-        // return frame), THEN scanned for `FailReply` in a `.iter()`
-        // pass, THEN passed `staged` by value to `materialise` for a
-        // second iteration producing `OutActions` (~800 B return).
-        // Three big stack moves + two iterations cost ≈+34 ns on
-        // `push_command/ping` per bench-stable vs `pre-def160`.
-        // Single-pass shape: stage, drain, classify-fail, emit
-        // `Action::SendBytes` chunks — all in one walk. Closure
-        // returns the final `Result<OutActions<'w, 'static>, _>`
-        // directly; no intermediate `StagedActions` escape. The
+        // Single-pass materialise inside the branded closure: stage,
+        // drain, classify-fail, emit `Action::SendBytes` chunks —
+        // all in one walk. Closure returns the final
+        // `Result<OutActions<'w, 'static>, _>` directly; no
+        // intermediate `StagedActions` escape.
+        //
+        // A naive shape would (1) return `StagedActions` from the
+        // closure (~700 B return frame), (2) scan for `FailReply`
+        // in a `.iter()` pass, (3) pass `staged` by value to
+        // `materialise` for a second iteration producing
+        // `OutActions` (~800 B return) — three big stack moves +
+        // two iterations cost ≈+34 ns on `push_command/ping`. The
         // feed-side `materialise` keeps its broader contract
         // (DeliverReply/FailReply → typed `Action` variants) for
         // dispatcher use; push is open-coded here for the perf-tier
         // closure on the hot path.
         //
-        // DEF-154 (B+H): write-side keeps its brand (`'wb`) for
-        // tier-1 `WriteRange::apply`; read side is unbranded.
-        // DEF-269 v2: row_desc_slot threaded through for BindExecute
-        // (other commands ignore it).
+        // Write-side keeps its brand (`'wb`) for tier-1
+        // `WriteRange::apply`; read side is unbranded. row_desc_slot
+        // is threaded through for BindExecute (other commands
+        // ignore it).
         let result = write_buf.with_branded(|mut wb| -> Result<crate::action::OutActions<'w, 'static>, crate::action::PushFailure> {
             let mut staged: StagedActions<'_> = StagedActions::new();
             {
                 let mut reserved = wb.reserve();
-                // DEF-272 cluster γ: setter is minted via the typestate
-                // (the only legitimate path — `StateSetter::new` is
+                // Setter is minted via the typestate (the only
+                // legitimate path — `StateSetter::new` is
                 // `pub(in crate::state_setter)`, callable only from
                 // [`IdleState::into_setter`]).
                 let setter = idle.into_setter::<C::PostState>();
@@ -3154,19 +3138,18 @@ impl PgProtocol<ActivePhase> {
                         }
                     }
                     StagedAction::SendBytesRange(range) => {
-                        // DEF-154 (N) P0-4: `apply == None` is
-                        // architecturally unreachable under intact brand
-                        // discipline; classify `CloseSocket` rather than
-                        // the pre-(N) silent zero-byte SendBytes.
+                        // `apply == None` is architecturally
+                        // unreachable under intact brand discipline;
+                        // classify `CloseSocket` rather than silently
+                        // emitting a zero-byte SendBytes.
                         let action = match range.apply(bytes) {
                             Some(slice) => crate::action::Action::SendBytes(slice),
                             None => {
-                                // DEF-280 Bundle G (2026-05-18):
-                                // debug_assert!(false, …) removed — CREDO §V
-                                // banned glass pattern. The classified
-                                // `CloseSocket` fallback IS the safety net;
-                                // architecturally impossible per intact brand
-                                // discipline (DEF-154 N+W).
+                                // The classified `CloseSocket`
+                                // fallback IS the safety net; a
+                                // naive shape would add a
+                                // `debug_assert!(false, …)` here —
+                                // CREDO §V banned glass pattern.
                                 core::hint::cold_path();
                                 crate::action::Action::CloseSocket
                             }
@@ -3176,11 +3159,12 @@ impl PgProtocol<ActivePhase> {
                     StagedAction::SendBytesStatic(s) => {
                         push_within_fanout_budget(&mut out, crate::action::Action::SendBytes(s));
                     }
-                    // DEF-160 Z2: borrowed bytes (caller's SQL via Parse /
-                    // SimpleQuery push paths) flow through unchanged. The
-                    // `'sql >= 'w` subtyping induced by the `Self: 'sql`
-                    // bound on `PushCommand::execute` coerces `&'sql [u8]`
-                    // to `&'w [u8]` for the emitted `Action::SendBytes`.
+                    // Borrowed bytes (caller's SQL via Parse /
+                    // SimpleQuery push paths) flow through unchanged.
+                    // The `'sql >= 'w` subtyping induced by the
+                    // `Self: 'sql` bound on `PushCommand::execute`
+                    // coerces `&'sql [u8]` to `&'w [u8]` for the
+                    // emitted `Action::SendBytes`.
                     StagedAction::SendBytesBorrowed(b) => {
                         push_within_fanout_budget(&mut out, crate::action::Action::SendBytes(b));
                     }
@@ -3188,24 +3172,21 @@ impl PgProtocol<ActivePhase> {
                         push_within_fanout_budget(&mut out, crate::action::Action::CloseSocket);
                     }
                     StagedAction::DeliverReply(_) => {
-                        // DEF-280 Bundle G (2026-05-18): tier-1 elevation.
-                        // Pre-Bundle G this arm silently dropped on release
-                        // (loud dev `debug_assert!(false, …)` + silent
-                        // fallthrough — CREDO §V glass pattern). Post-Bundle G
-                        // classified as `PushFailure` with `InternalCrateBug`
-                        // locus `PushEmittedDeliverReply`. Push paths never
-                        // emit DeliverReply (replies come from server via
-                        // feed_bytes only); architecturally dead per DEF-160
-                        // Z2 invariant.
+                        // Push paths never emit DeliverReply
+                        // (replies come from server via feed_bytes
+                        // only); architecturally dead. A naive shape
+                        // would silently drop this arm on release
+                        // with a loud-on-dev `debug_assert!(false, …)`
+                        // — CREDO §V banned glass pattern. Classify
+                        // as `PushFailure` with `InternalCrateBug`
+                        // locus `PushEmittedDeliverReply` instead.
                         //
-                        // DEF-280 Bundle J (2026-05-18): sentinel id is now
-                        // the distinct `CRATE_BUG_REPLY_ID_SENTINEL`
-                        // (NonZeroU64::MAX, see `reply_id.rs` docstring).
-                        // Mirrors the `PushCommandInternalNonIdle` site at
-                        // the entry of this same function. Pre-Bundle J both
-                        // sites used `NonZeroU64::MIN` which collided with
-                        // the legitimate first id minted by `next_reply_id`;
-                        // closed by-construction by the distinct sentinel.
+                        // The sentinel id is the distinct
+                        // `CRATE_BUG_REPLY_ID_SENTINEL`
+                        // (NonZeroU64::MAX, see `reply_id.rs`
+                        // docstring) — mirrors the
+                        // `PushCommandInternalNonIdle` site at the
+                        // entry of this same function.
                         core::hint::cold_path();
                         if failure.is_none() {
                             failure = Some(crate::action::PushFailure {
@@ -3224,11 +3205,10 @@ impl PgProtocol<ActivePhase> {
             }
         });
 
-        // DEF-279 Phase 2 Bundle Commit 12 lower: project the
-        // setter-mutated `proto_state` back to ActiveState and
-        // install on self.inner.state. The setter's terminal
-        // mutation set `proto_state` to one of the Active flow
-        // variants (SimpleQueryAwaitingFirstResponse,
+        // Project the setter-mutated `proto_state` back to
+        // ActiveState and install on self.inner.state. The setter's
+        // terminal mutation set `proto_state` to one of the Active
+        // flow variants (SimpleQueryAwaitingFirstResponse,
         // ParseAwaitingParseComplete, etc.) which all project
         // cleanly to ActiveState. Connecting outcomes are
         // architecturally impossible from an Idle setter (the
@@ -3252,23 +3232,20 @@ impl PgProtocol<ActivePhase> {
         result
     }
 
-    // DEF-269 v2 (T): push_bind_execute_internal removed; callers now
-    // build a `crate::push_command::BindExecute<P>` struct and dispatch
-    // through `push_command_internal::<BindExecute<P>>`. The 8-arg
-    // wire-shape contract is preserved by the struct's field layout
-    // (mirrors the PG Bind+Execute frame exactly).
+    // No `push_bind_execute_internal` ships from this impl. A naive
+    // shape would have an 8-arg wire-shape method; instead callers
+    // build a `crate::push_command::BindExecute<P>` struct and
+    // dispatch through `push_command_internal::<BindExecute<P>>`.
+    // The struct's field layout mirrors the PG Bind+Execute frame
+    // exactly.
 
     /// Append inbound wire bytes into the read buffer **without
-    /// dispatching**. Forward-compat anchor for 1c-5 pipelining where
-    /// the caller decouples byte-feeding from event-pulling.
+    /// dispatching**. Forward-compat anchor for pipelining where the
+    /// caller decouples byte-feeding from event-pulling.
     ///
-    /// # DEF-212 Phase 2 (Alt Y', audit 2026-05-04)
-    ///
-    /// Pre-(212) the only public path was [`Self::feed_bytes`] which
-    /// combined append + dispatch + materialise into one batched call.
-    /// `feed_inbound` exposes the append step as a separate operation
-    /// so callers can drive the protocol via [`Self::advance_one_frame`]
-    /// in a per-event loop:
+    /// `feed_inbound` exposes the append step as a separate
+    /// operation so callers can drive the protocol via
+    /// [`Self::advance_one_frame`] in a per-event loop:
     ///
     /// ```text
     /// proto.feed_inbound(socket_chunk)?;
@@ -3283,41 +3260,31 @@ impl PgProtocol<ActivePhase> {
     ///
     /// # Errored-state semantics
     ///
-    /// Calling on an `Errored` state silently no-ops (returns
-    /// `Ok(())` without appending). The protocol is terminal; further
-    /// inbound bytes are ignored. This matches the pre-(212)
-    /// `feed_bytes` shape (which routes Errored to the
-    /// `IngressClassification::AlreadyErrored` arm).
+    /// The signature returns `Result<(), ProtocolError>` so Errored
+    /// state surfaces to the caller as a typed error instead of
+    /// silently no-op'ing (`ReadBufFull` lifts into
+    /// `ProtocolError::ReadBufferFull { … }` — the same enum the
+    /// dispatch path uses). The protocol is terminal once Errored;
+    /// further inbound bytes are surfaced as the terminal cause.
     pub fn feed_inbound(&mut self, bytes: &[u8]) -> Result<(), crate::error::ProtocolError> {
-        // DEF-246 Phase 4 elevation #4: signature returns
-        // `Result<(), ProtocolError>` so Errored state surfaces to the
-        // caller as a typed error instead of silent no-op. The
-        // pre-existing `ReadBufFull` shape is lifted into
-        // `ProtocolError::ReadBufferFull { … }` (the same enum the
-        // dispatch path uses).
-        //
-        // DEF-246 Option α: dispatch machinery lives on `PgProtocolInner`;
-        // this method is a 1-line delegate so the same body executes
-        // identically from `<ActivePhase>`, `<ConnectingPhase>` (Phase 3
-        // elevation #2 — server-driven auth bytes during handshake).
-        // `<ClosedPhase>` does NOT have feed_inbound (Phase 4 elevation
-        // #3 — Errored/Closed terminal absorbs no input).
+        // 1-line delegate to the Inner. The same body executes
+        // identically from `<ActivePhase>` and `<ConnectingPhase>`
+        // (server-driven auth bytes during handshake).
+        // `<ClosedPhase>` does NOT have feed_inbound — Errored/Closed
+        // terminal absorbs no input.
         self.inner.feed_inbound(bytes)
     }
 
     /// Process at most one user-observable event and return it.
     ///
-    /// # DEF-212 Phase 2 (Alt Y', audit 2026-05-04)
-    ///
     /// Per-event alternative to the batched [`Self::feed_bytes`].
-    /// Forward-compat anchor for 1c-5 pipelining (where multiple
+    /// Forward-compat anchor for pipelining (where multiple
     /// concurrent in-flight replies may resolve in one cycle and the
     /// caller wants explicit event-by-event control).
     ///
     /// The implementation reuses [`Self::feed_bytes_bounded`] with
     /// `max_dispatches = 1` and an empty byte slice — single source
-    /// of truth for dispatch is preserved (Phase 2 is additive, not
-    /// a refactor of `feed_bytes`).
+    /// of truth for dispatch is preserved.
     ///
     /// # Returned event mapping
     ///
@@ -3331,11 +3298,11 @@ impl PgProtocol<ActivePhase> {
     ///   - `Action::SendBytes(b)` → [`FeedEvent::SendBytes(b)`]
     ///   - `Action::DeliverReply { id, value }` → [`FeedEvent::Deliver(id, value)`]
     ///   - `Action::FailReply { id, cause }` (paired with implicit
-    ///     `Action::CloseSocket` per M2) → [`FeedEvent::Fail(id, cause)`]
+    ///     `Action::CloseSocket`) → [`FeedEvent::Fail(id, cause)`]
     ///   - `Action::CloseSocket` alone (no in-flight reply id) →
     ///     [`FeedEvent::Close`]
     ///
-    /// # Lifetime contract (M3)
+    /// # Lifetime contract
     ///
     /// `FeedEvent<'wb, 'r>` carries two lifetimes:
     ///   - `'wb` ties [`FeedEvent::SendBytes`] to the caller's `write_buf`.
@@ -3356,23 +3323,21 @@ impl PgProtocol<ActivePhase> {
         &'r mut self,
         write_buf: &'w mut WriteBuf,
     ) -> crate::action::FeedEvent<'w, 'r> {
-        // DEF-246 Option α: dispatch machinery on `PgProtocolInner`;
-        // 1-line delegate so `<ConnectingPhase>` and `<ActivePhase>`
-        // share the same implementation (handshake-window callers also
-        // need per-event advance for server-driven auth chains).
-        //
-        // DEF-279 follow-up (2026-05-18): row_desc_slot HOISTED to
-        // outer Extras — pass via disjoint-field borrow.
+        // 1-line delegate to the Inner so `<ConnectingPhase>` and
+        // `<ActivePhase>` share the same implementation (handshake-
+        // window callers also need per-event advance for server-
+        // driven auth chains). row_desc_slot lives on outer
+        // `<ActivePhase>::Extras` — pass via disjoint-field borrow.
         self.inner.advance_one_frame(&mut self.extras, write_buf)
     }
 
     /// Feed inbound wire bytes.
     ///
     /// Returns the action list — bounded by [`MAX_ACTIONS_PER_CALL`].
-    /// DEF-094: caller-owned `write_buf` — see [`push_command`] for
-    /// the staged-dispatch architecture.
+    /// Caller-owned `write_buf` — see [`push_command`] for the
+    /// staged-dispatch architecture.
     ///
-    /// 1c-1a: `&'r mut self` — the row slices in `Action::StreamRow`
+    /// `&'r mut self` — the row slices in `Action::StreamRow`
     /// borrow from `self.inner.read_buf`. The `'r` lifetime propagates
     /// into `OutActions<'w, 'r>`; the borrow checker blocks
     /// subsequent `&mut self` calls (and thus the next `feed_bytes`)
@@ -3385,25 +3350,23 @@ impl PgProtocol<ActivePhase> {
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
     ) -> OutActions<'w, 'r> {
-        // DEF-184 (B6): `const BOUNDED = false` specialisation —
-        // monomorphised body with the per-iter bound check
-        // eliminated at compile time. Production hot path no longer
-        // pays `if dispatches_this_call >= max_dispatches` every
-        // frame (the pre-(184) shape supplied u16::MAX, which LLVM
-        // sometimes optimised away but only via inlining — not
-        // guaranteed on large functions).
+        // `const BOUNDED = false` specialisation — monomorphised
+        // body with the per-iter bound check eliminated at compile
+        // time. The production hot path does not pay
+        // `if dispatches_this_call >= max_dispatches` every frame.
+        // A naive shape would supply `u16::MAX` at runtime, which
+        // LLVM sometimes optimises away via inlining — not
+        // guaranteed on large functions.
         //
-        // DEF-246 Option α: dispatch machinery on `PgProtocolInner`;
-        // 1-line delegate. The `<ConnectingPhase>::feed_bytes` mirror
-        // (Phase 3) shares the identical inner-method dispatch — same
-        // const-generic specialisation, same hot-path codegen.
-        //
-        // DEF-279 follow-up (2026-05-18): row_desc_slot HOISTED to
-        // outer Extras — pass via disjoint-field borrow.
+        // 1-line delegate to the Inner. The
+        // `<ConnectingPhase>::feed_bytes` mirror shares the identical
+        // inner-method dispatch — same const-generic specialisation,
+        // same hot-path codegen. row_desc_slot lives on outer
+        // `<ActivePhase>::Extras` — pass via disjoint-field borrow.
         self.inner.feed_bytes_impl::<false>(&mut self.extras, bytes, write_buf, 0)
     }
 
-    /// DEF-154 (X) P0-2(c): frame-bounded variant of [`feed_bytes`].
+    /// Frame-bounded variant of [`feed_bytes`].
     ///
     /// Processes at most `max_dispatches` actionable dispatches
     /// from the read buffer, then breaks the inner loop. Silent
@@ -3425,86 +3388,65 @@ impl PgProtocol<ActivePhase> {
         write_buf: &'w mut WriteBuf,
         max_dispatches: u16,
     ) -> OutActions<'w, 'r> {
-        // DEF-246 Option α: 1-line delegate to `PgProtocolInner` mirror.
-        // `row_stream`'s slow-path call site (`self.proto.feed_bytes_bounded`)
-        // resolves through this delegate unchanged.
-        //
-        // DEF-279 follow-up (2026-05-18): row_desc_slot HOISTED to
-        // outer Extras — pass via disjoint-field borrow.
+        // 1-line delegate to the Inner mirror. `row_stream`'s
+        // slow-path call site (`self.proto.feed_bytes_bounded`)
+        // resolves through this delegate unchanged. row_desc_slot
+        // lives on outer `<ActivePhase>::Extras` — pass via
+        // disjoint-field borrow.
         self.inner.feed_bytes_bounded(&mut self.extras, bytes, write_buf, max_dispatches)
     }
 
-    // DEF-246 Option α (2026-05-16): dispatch machinery extracted to
-    // `impl PgProtocolInner` below. The next two large method bodies —
-    // `feed_bytes_impl<const BOUNDED>` and `clear_session_residue_for_class`
-    // — now live on `Inner` so `<ActivePhase>` (default phase) and
-    // `<ConnectingPhase>` (Phase 3 — server-driven auth bytes during
-    // handshake) reach the SAME implementation via 1-line delegates.
-    // The 4 surface-facing delegates above (`feed_inbound`,
-    // `advance_one_frame`, `feed_bytes`, `feed_bytes_bounded`,
+    // The two large method bodies — `feed_bytes_impl<const BOUNDED>`
+    // and `clear_session_residue_for_class` — live on each `Inner`
+    // so `<ActivePhase>` (default phase) and `<ConnectingPhase>`
+    // (server-driven auth bytes during handshake) reach the SAME
+    // implementation via 1-line delegates. The 4 surface-facing
+    // delegates above (`feed_inbound`, `advance_one_frame`,
+    // `feed_bytes`, `feed_bytes_bounded`,
     // `clear_session_residue_for_class`) close the bridge.
     //
-    // Re-opens `impl PgProtocol<ActivePhase>` BELOW the moved
-    // `feed_bytes_impl` so the remaining methods on `<ActivePhase>`
-    // (`get_server_error`, `read_buf_append`, `current_row_desc`,
-    // `iter_rows`, etc.) stay where they were before DEF-246. Caller
-    // surface unchanged.
+    // `impl PgProtocol<ActivePhase>` re-opens BELOW the
+    // dispatch-context section so the remaining
+    // `<ActivePhase>`-only methods (`get_server_error`,
+    // `read_buf_append`, `current_row_desc`, `iter_rows`, …)
+    // stay grouped with their kin.
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-279 Phase 1c prerequisite (2026-05-18) — dispatch path as free
-// functions over `DispatchContext`.
+// Dispatch path as free functions over `DispatchContext`.
 //
-// Pre-refactor: the dispatch body lived as methods on
-// `PgProtocolInner` (`feed_bytes_impl`, `advance_one_frame`,
-// `clear_session_residue_for_class`). Method resolution forced the
-// body to type-check against `&mut PgProtocolInner` (one concrete
-// `Self`), so a per-phase narrow `Inner` type with FEWER fields could
-// not reuse the same code without manual `self.X` rewrites or a
-// trait-bound `HasDispatchFields` (the latter re-introducing tier-2
-// by-discipline — any future phase impl could reach the dispatch
-// body).
-//
-// Post-refactor: the dispatch body lives as **free functions** over
-// `DispatchContext<'r>` (eight `&mut` field refs). `PgProtocolInner`
-// methods become thin delegates that build a `DispatchContext` from
+// The dispatch body lives as **free functions** over
+// `DispatchContext<'r>` (eight `&mut` field refs). Per-phase Inner
+// methods are thin delegates that build a `DispatchContext` from
 // `&mut self.<field>` and forward. The disjoint-field-borrow rule
 // (Rust 2018+) lets the struct-literal construction split the
 // `&mut self` borrow across eight fields in one expression.
 //
 // **Tier impact**: refactoring-only. LLVM inlines the thin delegate
 // unconditionally (single-call body, no other code); asm-diff is
-// bit-equivalent versus the pre-refactor method bodies. Bench
-// `feed_bytes/ping_amortised` and `push_command/ping_amortised`
-// target 0% delta.
+// bit-equivalent versus a monolithic `&mut self` method body.
 //
-// **Why free fn over trait method**: a trait method (`fn dispatch
-// (&mut self, ...)`) on a `HasDispatchFields` trait would require
-// `impl HasDispatchFields for PgProtocolInner` (legal today) AND
-// `impl HasDispatchFields for ConnectingInner / ActiveInner` once
-// Phase 1c lands. The trait surface is tier-2: discipline gates
+// **Why free fn over trait method**: a trait method
+// (`fn dispatch(&mut self, …)`) on a `HasDispatchFields` trait
+// would require `impl HasDispatchFields for ConnectingInner /
+// ActiveInner`. The trait surface is tier-2: discipline gates
 // "only the right `Inner` types impl it". The free-function form
 // is tier-1 — only code that already holds the eight specific `&mut
 // T` refs can build a `DispatchContext`, and those refs come from
-// the field types directly. Phase 1c's narrow `Inner` types (e.g.
+// the field types directly. Narrow `Inner` types (e.g.
 // `DisconnectedInner` with zero relevant fields) physically cannot
 // construct a `DispatchContext` at the type level.
 // ═════════════════════════════════════════════════════════════════════
 
-/// DEF-279 Phase 1c prerequisite (2026-05-18) — residue-clear body
-/// as a free function over four `&mut` field refs + a class.
+/// Residue-clear body as a free function over four `&mut` field
+/// refs + a class.
 ///
-/// Body extracted from the pre-refactor
-/// `PgProtocolInner::clear_session_residue_for_class` method.
-/// `self.row_desc_slot` → `row_desc_slot`, `self.error_arena` →
-/// `error_arena`, `self.session_params` → `session_params`,
-/// `self.partial_assembly` → `partial_assembly`. The exhaustive
-/// match on `StatePushClass` is unchanged — tier-1 closure preserved
-/// (a future variant fails the build here until its residue policy
-/// is decided).
+/// The exhaustive match on `StatePushClass` enforces tier-1 closure
+/// — a future variant fails the build here until its residue policy
+/// is decided.
 ///
-/// **Callers**: `PgProtocolInner::clear_session_residue_for_class`
-/// (delegate) and `feed_bytes_dispatch` (direct call BEFORE
+/// **Callers**: the per-Inner `clear_session_residue_for_class`
+/// delegate and `feed_bytes_dispatch` (direct call BEFORE
 /// destructuring the `DispatchContext` into local re-bindings).
 #[inline]
 pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
@@ -3527,12 +3469,11 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
             if let Some(arena) = error_arena.as_deref_mut() {
                 arena.clear();
             }
-            // DEF-189 Q8-C3 + DEF-205 step 3: session-state forfeit on
-            // tear-down; `SessionParams::clear`'s Drop chain scrubs
+            // Session-state forfeit on tear-down;
+            // `SessionParams::clear`'s Drop chain scrubs
             // `SecretBoundedStr` bytes.
             _clear_residue_leaf::clear_session_params_residue(session_params);
-            // DEF-248 Sub-B (2026-05-12): also clear partial assembly
-            // on Errored entry.
+            // Also clear partial assembly on Errored entry.
             _clear_residue_leaf::clear_partial_assembly_residue(partial_assembly);
         }
         crate::state::StatePushClass::Connecting
@@ -3541,32 +3482,22 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
     }
 }
 
-/// DEF-279 Phase 1c prerequisite (2026-05-18) — dispatch body as a
-/// free function over [`DispatchContext`].
+/// Dispatch body as a free function over [`DispatchContext`].
 ///
-/// Body extracted from the pre-refactor
-/// `PgProtocolInner::feed_bytes_impl::<BOUNDED>` method. The eight
-/// `self.<field>` field references became local re-bindings on the
-/// destructured `DispatchContext`; the `self.clear_session_residue_for_class`
-/// method call became a direct call to
-/// [`clear_session_residue_for_class_dispatch`] over four `&mut`
-/// reborrows.
-///
-/// **`const BOUNDED: bool` specialisation** preserved unchanged: in
-/// the `BOUNDED = false` monomorphisation LLVM eliminates the
+/// **`const BOUNDED: bool` specialisation**: in the
+/// `BOUNDED = false` monomorphisation LLVM eliminates the
 /// `if BOUNDED && dispatches_this_call >= max_dispatches { break; }`
 /// gate at compile time. Two monomorphised copies live in the
 /// binary; release profile (LTO fat + codegen-units=1) deduplicates
 /// common sub-expressions.
 ///
-/// **Tier impact**: refactoring-only. The method-form caller (the
-/// delegate on `PgProtocolInner`) inlines unconditionally — the
-/// emitted machine code at every existing call site (row_stream
-/// slow path, `<ActivePhase>::feed_bytes`, `<ConnectingPhase>::feed_bytes`)
-/// is bit-equivalent to the pre-refactor code (asm-diff verified
-/// gate).
-// DEF-279 follow-up (2026-05-18, architect Option Y verdict):
-// feed_bytes_dispatch now takes a `materialise_fn` closure for the
+/// **Tier impact**: refactoring-only. The per-Inner delegate
+/// inlines unconditionally — the emitted machine code at every
+/// existing call site (row_stream slow path, the per-phase
+/// `feed_bytes` mirrors) is bit-equivalent to a monolithic
+/// `&mut self` method body (asm-diff verified gate).
+//
+// `feed_bytes_dispatch` takes a `materialise_fn` closure for the
 // three terminal materialise call sites. The closure decouples the
 // `OutActions<'w, ?>` return-lifetime from the slot's `'r`:
 //
