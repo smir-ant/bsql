@@ -520,18 +520,12 @@ pub(crate) fn drain_at_stream_dropped_mid_stream(
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// IdleState lifetime-bound typestate
+// IdleState lifetime-bound typestate — tier-1 within-crate
+// by-construction.
 //
-// Anchor (HISTORICAL — closed by lifetime-bound typestate; Tier-3
-// audit #26, 2026-05-19, verified): pre-closure the proof was a ZST
-// with `pub(crate) const fn new()` — anyone in-crate could mint a
-// proof regardless of actual state, then pair it with a `&mut
-// ProtoState` for a different state. Pre-state was tier-2-by-
-// discipline within-crate.
-//
-// Current shape: the typestate IS the state borrow + the Idle proof,
-// inseparable. Construction via [`IdleState::try_from`] performs a
-// runtime `matches!(state, ProtoState::Idle)` check. The returned
+// The typestate IS the state borrow + the Idle proof, inseparable.
+// Construction via [`IdleState::try_from`] performs a runtime
+// `matches!(state, ProtoState::Idle)` check; the returned
 // `Option<Self>` is `None` for non-Idle states. The mut borrow
 // captured by [`IdleState`] cannot be paired with a different state
 // (lifetime ownership). [`IdleState::into_setter`] is the single
@@ -540,7 +534,10 @@ pub(crate) fn drain_at_stream_dropped_mid_stream(
 // (private), so no in-crate code outside this module can mint a
 // setter without first proving Idle via the typestate.
 //
-// Tier-1 within-crate by-construction.
+// A naive ZST proof with `pub(crate) const fn new()` would be
+// tier-2 within-crate: anyone in-crate could mint a proof
+// regardless of actual state, then pair it with a `&mut ProtoState`
+// for a different state.
 // ═════════════════════════════════════════════════════════════════════
 
 /// Tier-1 within-crate typestate proving `state == ProtoState::Idle`

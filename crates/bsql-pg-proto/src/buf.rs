@@ -973,17 +973,17 @@ impl ReadBuf {
         };
         if n > current {
             // Diagnostic-display saturation: `requested` and `available`
-            // are `usize` fields on AdvancePastEnd whose sole role is
+            // are `usize` fields on `AdvancePastEnd` whose sole role is
             // operator-visible error reporting. `try_from(u32) -> usize`
             // is infallible on every supported target (the crate-root
             // `usize::BITS >= 32` const-assert rejects 16-bit), so the
             // `unwrap_or(usize::MAX)` saturation arm is architecturally
-            // dead. Saturating to MAX is the correct loud signal if a
+            // dead. Saturating to `MAX` is the correct loud signal if a
             // future 16-bit target somehow slipped past the const-assert
-            // — "we lost the exact count" beats silent zero. This is the
-            // only `try_from(...).unwrap_or(_)` form retained as
-            // tier-3-diagnostic per audit #19; compute paths route
-            // through typed Result instead.
+            // — "we lost the exact count" beats silent zero. This is
+            // the only `try_from(...).unwrap_or(_)` form retained as a
+            // tier-3 diagnostic-display fallback; compute paths route
+            // through typed `Result` instead.
             return Err(AdvancePastEnd {
                 requested: usize::try_from(n).unwrap_or(usize::MAX),
                 available: usize::try_from(current).unwrap_or(usize::MAX),
