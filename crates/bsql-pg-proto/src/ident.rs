@@ -1539,13 +1539,36 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
             if let Some(dst) = out.buf.get_mut(..src.len()) {
                 dst.copy_from_slice(src);
             }
-            // DEF-154 (T) P1-2: narrow via `narrow_len_u16` helper.
-            // Invariants: `src.len() ≤ N` (gate above); `N ≤ u16::MAX`
-            // (const-asserted at struct decl). Pre-(T) was
-            // `.unwrap_or(0)` — silent "zero-length string" on
-            // invariant break. Post-(T) Err-arm fallback is N (cap)
-            // not 0, surfacing "full buffer" rather than silently
-            // empty if both invariants somehow broke simultaneously.
+            // DEF-154 (T) P1-2 + Tier-4 Cluster D #56 (2026-05-19):
+            // narrow usize → LenT (BoundedU8 / BoundedU16) on the
+            // populated-len assignment. Invariants holding here:
+            //
+            //   - `src.len() ≤ N` (gate above checks `src.len() > N`
+            //     → returns early with PodBytesOverflow).
+            //   - `N ≤ u16::MAX` (const-asserted at struct decl).
+            //
+            // `try_new_usize(src.len())` therefore always returns
+            // `Some` — the `None` arm is architecturally unreachable.
+            // `LenT::default()` (== 0) is the dead-arm fallback;
+            // pre-DEF-154 (T) this was `unwrap_or(0)` (silently
+            // empty string on invariant break) — same effective
+            // shape, more explicit attribution today.
+            //
+            // Audit's recommendation (surface overflow as Result<(),
+            // IdentError::TooLong>) is structurally blocked: this
+            // is inside the INFALLIBLE `from_str_truncating`
+            // constructor whose API contract is "always succeed,
+            // truncate with marker on overflow". Returning Result
+            // would be a BREAKING constructor-API change rippling
+            // through every truncating call site (the audit's
+            // estimate is medium; the change touches ~40+ call
+            // sites). DEFER to a post-1.0 constructor-API redesign.
+            //
+            // Structural lift via a `LenT::saturating_new_usize`
+            // method that clamps without Option also blocked under
+            // forbid-bundle — `usize → u8`/`u16` requires `as`
+            // (forbidden) or `try_from` (Result-returning, same
+            // shape under the hood).
             out.len = LenT::try_new_usize(src.len()).unwrap_or_default();
             return out;
         }
@@ -1566,7 +1589,13 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
         if let Some(dst) = out.buf.get_mut(fit_end..marker_end) {
             dst.copy_from_slice(Self::OVERFLOW_MARKER);
         }
-        // DEF-154 (T): narrow via helper; see `narrow_len_u16` docstring.
+        // DEF-154 (T) + Tier-4 Cluster D #56 (2026-05-19): narrow
+        // marker_end (usize) → LenT. `marker_end = fit_end +
+        // OVERFLOW_MARKER.len()` where `fit_end ≤ budget ≤ N -
+        // MARKER_LEN`, so `marker_end ≤ N ≤ u16::MAX` — try_new
+        // always Some, default(=0) arm dead. See the centralised
+        // audit-#56 rationale block at line 1542+ for why the
+        // structural lift (Result return) is BREAKING-API blocked.
         out.len = LenT::try_new_usize(marker_end).unwrap_or_default();
         // Tier-3 audit #48 (2026-05-19): length-overflow truncation
         // is also a form of information loss — flag it. Pre-audit
@@ -1649,13 +1678,18 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
             if let Some(dst) = out.buf.get_mut(written..marker_end) {
                 dst.copy_from_slice(Self::OVERFLOW_MARKER);
             }
-            // DEF-154 (T): see `narrow_len_u16` docstring.
+            // DEF-154 (T) + Tier-4 Cluster D #56: marker_end ≤ N
+            // (see audit-#56 rationale block at line 1542+); dead-arm
+            // fallback is LenT::default()==0.
             out.len = LenT::try_new_usize(marker_end).unwrap_or_default();
             // Tier-3 audit #48: length-overflow truncation also
             // counts as lossy. See mirror block in
             // `from_str_truncating`'s slow path.
             out.was_lossy_flag = 1;
         } else {
+            // DEF-154 (T) + Tier-4 Cluster D #56: written ≤ budget ≤ N
+            // (the byte-by-byte loop above breaks when `written >=
+            // budget`); dead-arm fallback is LenT::default()==0.
             out.len = LenT::try_new_usize(written).unwrap_or_default();
         }
         // DEF-185 P2-D: surface the lossy flag.
