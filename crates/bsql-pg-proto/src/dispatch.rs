@@ -31,9 +31,8 @@
 //!
 //! If you are tempted to re-open this: first produce a NEW criterion
 //! measurement refuting the rejection result (different machine,
-//! different LLVM, or architectural change in the dispatch loop).
-//! See `reforge.md §4.12` (measurement-gated perf) and
-//! `deferred.md §B` (measurement-rejected items) before touching.
+//! different LLVM, or architectural change in the dispatch loop) —
+//! the rejection is gated on measurement, not on opinion.
 
 use crate::action::StagedAction;
 use crate::error::ProtocolError;

@@ -59,21 +59,19 @@
 //! after the server emits `BackendKeyData` ('K'). The dispatch arm
 //! writes `(pid, secret_key)` into `ProtoState::HandshakeReady`
 //! directly; the post-RFQ payload is then consumed structurally by
-//! `<ConnectingPhase>::into_active` into `ActiveInner.backend_key`.
-//! Pre-Phase-1d.2 the install routed through a token-gated
-//! `BackendKeyCell::install_via_token` helper minted in a
-//! `_backend_key_install_leaf` submodule; Phase 1d.2 collapsed both
-//! into the variant payload itself (tier-1 storage-absence proof).
+//! `<ConnectingPhase>::into_active` into `ActiveInner.backend_key`
+//! (tier-1 storage-absence proof — a `<ActivePhase>` cannot be
+//! constructed without a valid `BackendKey`).
 //!
 //! # `BackendKey` cell payload
 //!
 //! [`BackendKey`] is the `pub(crate)` cell payload — the storage
-//! shape that lives on `PgProtocolInner`. Carries `Sensitive<i32>`
+//! shape that lives on `ActiveInner`. Carries `Sensitive<i32>`
 //! for the secret_key so the cell's drop chain scrubs the secret
-//! when the connection terminates. Bundle D' eliminated the public
-//! `CancelRequestCredentials` struct; the wire-frame materialisation
+//! when the connection terminates. The wire-frame materialisation
 //! happens inline inside `with_cancel_request` against a stack-local
-//! `Zeroizing<[u8; 16]>` guard.
+//! `Zeroizing<[u8; 16]>` guard — no long-lived
+//! `CancelRequestCredentials` struct surfaces in the public API.
 //!
 //! # Wire format (PG §55.2.7)
 //!

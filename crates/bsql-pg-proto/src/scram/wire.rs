@@ -13,9 +13,8 @@
 //!
 //! # Channel binding
 //!
-//! Phase 1b does not support channel binding (deferred to 1e as
-//! DEF-053). The GS2 header is always `n,,` and the channel binding
-//! data is always `biws` (base64 of `n,,`).
+//! Channel binding is not supported. The GS2 header is always `n,,`
+//! and the channel binding data is always `biws` (base64 of `n,,`).
 
 use crate::scram::types::{CappedServerNonce, SecretDigest};
 use core::fmt;
@@ -81,14 +80,14 @@ pub const MAX_SALT_LEN: usize = 64;
 /// SHA-256 produces 32 bytes. Base64 encoding with padding is
 /// `ceil(N / 3) * 4`; for `N = 32` that is `ceil(32/3) * 4 = 11 * 4 = 44`.
 ///
-/// DEF-184 (B28): derived via `usize::div_ceil` (which is method
-/// call, not `/` operator, so `clippy::integer_division` does not
-/// flag it). Formula: base64 encodes 3 bytes into 4 chars,
-/// unpadded length = `ceil(n/3) * 4`. For SHA-256 (32 bytes):
-/// `ceil(32/3) * 4 = 11 * 4 = 44` chars — matches the old hard-
-/// coded magic number. Drift pin: if `SHA256_DIGEST_LEN` ever
-/// changes (it won't — SHA-256 is forever 32 bytes per RFC 6234)
-/// or the formula is off, the static_assert below catches it.
+/// Derived via `usize::div_ceil` (a method call, not the `/`
+/// operator, so `clippy::integer_division` does not flag it).
+/// Formula: base64 encodes 3 bytes into 4 chars, unpadded length =
+/// `ceil(n/3) * 4`. For SHA-256 (32 bytes):
+/// `ceil(32/3) * 4 = 11 * 4 = 44` chars. Drift pin: if
+/// `SHA256_DIGEST_LEN` ever changes (it won't — SHA-256 is forever
+/// 32 bytes per RFC 6234) or the formula is off, the `static_assert`
+/// below catches it.
 const SHA256_DIGEST_LEN: usize = 32;
 const SHA256_PROOF_B64_LEN: usize = SHA256_DIGEST_LEN
     .div_ceil(3)
@@ -135,7 +134,7 @@ pub(crate) const fn sasl_response_frame_size() -> usize {
 }
 
 // -------------------------------------------------------------------
-// Drift guards (DEF-057)
+// Drift guards
 //
 // Each expected-size const fn below computes a worst-case size from
 // the underlying inputs (`MAX_IDENT_LEN`, `MAX_SERVER_NONCE_LEN`, ...).
@@ -287,8 +286,9 @@ pub enum ScramError {
     RandomnessUnavailable,
 }
 
-// DEF-244 modernisation audit (rust-version 1.81): additive
-// `core::error::Error` impl on the SCRAM-handshake error.
+// `core::error::Error` impl on the SCRAM-handshake error — lets
+// downstream consumers route this type through any `?`-bubbling
+// stack that bounds on `core::error::Error`.
 impl core::error::Error for ScramError {}
 
 impl fmt::Display for ScramError {
@@ -586,16 +586,14 @@ pub(crate) fn parse_server_final(msg: &[u8]) -> Result<SecretDigest, ScramError>
 
 /// Base64-encode into a stack buffer. Returns the length written.
 ///
-/// **DEF-102 (security).** Uses `base64ct::Base64` —
-/// RustCrypto's constant-time, branchless, `no_std` base64
-/// encoder. The prior `base64` v0.22 `STANDARD` engine is
-/// essentially constant-time in practice (cache-line-sized
-/// alphabet table) but does not formalise the property; this
-/// encoding step runs on the SCRAM `ClientProof`, which is
-/// derived from the user's password via HMAC. Switching to
-/// `base64ct` elevates this step's side-channel posture from
-/// tier-3 (audit "yeah the table is cache-line-sized so it's
-/// probably fine") to tier-1 (RustCrypto-audited constant-time).
+/// Uses `base64ct::Base64` — RustCrypto's constant-time, branchless,
+/// `no_std` base64 encoder. This step runs on the SCRAM
+/// `ClientProof`, which is derived from the user's password via
+/// HMAC, so a side-channel-resistant encoder is required.
+/// `base64ct` provides RustCrypto-audited constant-time semantics;
+/// the `base64` v0.22 `STANDARD` engine is essentially constant-time
+/// in practice (cache-line-sized alphabet table) but does not
+/// formalise the property.
 ///
 /// `Base64` is the standard-with-padding alphabet (RFC 4648 §4),
 /// matching what PG emits. `default-features = false` keeps the
@@ -620,9 +618,9 @@ pub(crate) fn base64_encode_to_buf(
 
 /// Base64-decode into a bounded heapless::Vec.
 ///
-/// DEF-102: same constant-time guarantees as the encoder, applied
-/// to the salt. (The salt is not secret per se — the server sends
-/// it cleartext — but consistency with the encode path keeps the
+/// Same constant-time guarantees as the encoder, applied to the
+/// salt. (The salt is not secret per se — the server sends it
+/// cleartext — but consistency with the encode path keeps the
 /// side-channel posture uniform across SCRAM wire parsing.)
 fn base64_decode_bounded(
     input: &[u8],

@@ -1254,14 +1254,14 @@ impl<const N: usize, Tag, LenT: crate::bounded::BoundedLen<N>> FixedStr<N, Tag, 
     /// generated machine code is identical to
     /// `&self.buf[..self.len()]`.
     ///
-    /// # Tier-4 Cluster D #54 (2026-05-19)
+    /// # Why `split_at_checked + match` over `get + unwrap_or`
     ///
     /// A naive `self.buf.get(..self.len()).unwrap_or(&[])` shape has
-    /// the same effective semantics, but the `unwrap_or` form is the
-    /// audit's "dead-fallback" pattern flag. The `split_at_checked +
-    /// match` form is a single pattern across
-    /// [`FixedStr::as_bytes`] and [`PodBytes::as_slice`] (mirror
-    /// site below). asm-diff: 0 codegen delta.
+    /// the same effective semantics, but the `unwrap_or` form is a
+    /// dead-fallback pattern. The `split_at_checked + match` form
+    /// reads as a single pattern across [`FixedStr::as_bytes`] and
+    /// [`PodBytes::as_slice`] (mirror site below). asm-diff: 0
+    /// codegen delta.
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -1345,18 +1345,17 @@ impl<const N: usize, Tag: ValidUtf8, LenT: crate::bounded::BoundedLen<N>> FixedS
             core::str::from_utf8(bytes).is_ok(),
             "ValidUtf8 tag invariant broken: stored bytes are not UTF-8",
         );
-        // Tier-4 Cluster D #55 (2026-05-19): audit recommendation
-        // ("type the precondition as `Utf8Bytes<'a>` newtype with
-        // private constructor") does NOT fit this shape — the bytes
-        // are *self-borrowed* from the storage buf, not an
-        // input parameter. The `Utf8Bytes<'a>` newtype would have
-        // nothing to wrap. The current `unwrap_or("")` form is the
-        // minimum-overhead stable-Rust shape (see the doc-comment
-        // header above for the full forbid-bundle analysis) and the
-        // dead Err arm is type-safe (empty `&str`, not silent
-        // truncation). `clippy::manual_unwrap_or` would reject a
-        // match-form rewrite as redundant — `unwrap_or` is NOT in
-        // the lib's forbid list, only `unwrap` / `expect` are.
+        // A `Utf8Bytes<'a>` newtype with a private constructor
+        // would not fit this shape — the bytes are *self-borrowed*
+        // from the storage buf, not an input parameter, so the
+        // newtype would have nothing to wrap. The current
+        // `unwrap_or("")` form is the minimum-overhead stable-Rust
+        // shape (see the doc-comment header above for the full
+        // forbid-bundle analysis); the dead Err arm is type-safe
+        // (empty `&str`, not silent truncation).
+        // `clippy::manual_unwrap_or` would reject a match-form
+        // rewrite as redundant — `unwrap_or` is NOT in the lib's
+        // forbid list, only `unwrap` / `expect` are.
         core::str::from_utf8(bytes).unwrap_or("")
     }
 }
@@ -1560,13 +1559,13 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
         if let Some(dst) = out.buf.get_mut(fit_end..marker_end) {
             dst.copy_from_slice(Self::OVERFLOW_MARKER);
         }
-        // Tier-4 Cluster D #56 (2026-05-19): narrow marker_end
-        // (usize) → LenT. `marker_end = fit_end +
-        // OVERFLOW_MARKER.len()` where `fit_end ≤ budget ≤ N -
-        // MARKER_LEN`, so `marker_end ≤ N ≤ u16::MAX` — try_new
-        // always Some, default(=0) arm dead. See the centralised
-        // audit-#56 rationale block above for why the structural
-        // lift (Result return) is BREAKING-API blocked.
+        // Narrow `marker_end` (usize) → LenT. `marker_end = fit_end
+        // + OVERFLOW_MARKER.len()` where `fit_end ≤ budget ≤
+        // N - MARKER_LEN`, so `marker_end ≤ N ≤ u16::MAX` —
+        // `try_new` always Some, `default()` (== 0) arm dead. See
+        // the centralised rationale block in `from_str_truncating`
+        // for why the structural lift (Result return) is blocked
+        // under the forbid-bundle.
         out.len = LenT::try_new_usize(marker_end).unwrap_or_default();
         // Length-overflow truncation is also a form of information
         // loss — flag it. A naive `was_lossy` that tripped only on
@@ -1646,18 +1645,18 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
             if let Some(dst) = out.buf.get_mut(written..marker_end) {
                 dst.copy_from_slice(Self::OVERFLOW_MARKER);
             }
-            // Tier-4 Cluster D #56: marker_end ≤ N (see audit-#56
-            // rationale block above); dead-arm fallback is
-            // LenT::default()==0.
+            // `marker_end ≤ N` (see the centralised narrowing
+            // rationale in `from_str_truncating`); dead-arm
+            // fallback is `LenT::default()` (== 0).
             out.len = LenT::try_new_usize(marker_end).unwrap_or_default();
             // Length-overflow truncation also counts as lossy.
             // Mirror of the equivalent block in
             // `from_str_truncating`'s slow path.
             out.was_lossy_flag = 1;
         } else {
-            // Tier-4 Cluster D #56: written ≤ budget ≤ N (the
-            // byte-by-byte loop above breaks when `written >=
-            // budget`); dead-arm fallback is LenT::default()==0.
+            // `written ≤ budget ≤ N` (the byte-by-byte loop above
+            // breaks when `written >= budget`); dead-arm fallback
+            // is `LenT::default()` (== 0).
             out.len = LenT::try_new_usize(written).unwrap_or_default();
         }
         // Surface the lossy flag.
