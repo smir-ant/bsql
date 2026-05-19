@@ -4838,23 +4838,22 @@ impl core::fmt::Debug for ActiveInner {
 // cfg(test) integration tests, etc.).
 impl PgProtocol<ActivePhase> {
 
-    /// DEF-246 Phase 4 transition surface (2026-05-16). Drives the
-    /// terminally-Errored protocol into a typed `PgProtocol<ClosedPhase>`
-    /// wrapper. Returns `Err(self)` when the protocol is NOT yet
-    /// Errored — caller continues using the `<ActivePhase>` instance.
+    /// Drive a terminally-Errored protocol into a typed
+    /// `PgProtocol<ClosedPhase>` wrapper. Returns `Err(self)` when
+    /// the protocol is NOT yet Errored — caller continues using
+    /// the `<ActivePhase>` instance.
     ///
     /// # Tier-1 closure
     ///
-    /// Pre-DEF-246 Phase 4: callers checked `connection_status()` and
-    /// kept driving an Errored `<ActivePhase>`; every `push_command`
-    /// classified through the existing `Errored` arm in
-    /// `compute_push_*`. Tier-3 by-discipline — a future refactor
-    /// could omit the Errored check.
-    ///
-    /// Post-Phase-4: the `<ClosedPhase>` ZST-marker physically lacks
-    /// `push_command`, `feed_bytes`, `feed_inbound`, `advance_one_frame`,
-    /// etc. (method-absent E0599 at compile time). The only operation
-    /// available on `<ClosedPhase>` is `cause()` accessor (Phase 4 #1).
+    /// The `<ClosedPhase>` ZST-marker physically lacks
+    /// `push_command`, `feed_bytes`, `feed_inbound`,
+    /// `advance_one_frame`, etc. (method-absent E0599 at compile
+    /// time). The only operation available on `<ClosedPhase>` is
+    /// the `cause()` accessor. A naive shape would let callers
+    /// keep driving an Errored `<ActivePhase>` and rely on every
+    /// `push_command`'s Errored-arm classification —
+    /// tier-3-by-discipline, because a future refactor could omit
+    /// the check.
     ///
     /// The transition is **consume-self** — moving the wrapper keeps
     /// the byte layout identical (`#[repr(transparent)]`) and the
@@ -4882,15 +4881,13 @@ impl PgProtocol<ActivePhase> {
     pub fn into_closed_if_errored(
         mut self,
     ) -> Result<PgProtocol<ClosedPhase>, PgProtocol<ActivePhase>> {
-        // DEF-279 Phase 1b (2026-05-18): Ok arm materialises
-        // `ClosedInner` (~16 B) instead of moving the full 536-B
-        // `PgProtocolInner` (Phase 2 Bundle Commit 12: now
-        // `ActiveInner`, same field shape).
-        // Same extract-and-drop shape as
-        // `<ConnectingPhase>::into_active`'s Closed arm: state_kind
-        // is Copy from `&state`; error_arena is mem::take'd; the
-        // remaining ActiveInner Drops at scope end, releasing
-        // ~520 B of stack + any heap behind the Box-niche cells.
+        // Ok arm materialises `ClosedInner` (~16 B) instead of
+        // moving the full 536-B `ActiveInner`. Same
+        // extract-and-drop shape as `<ConnectingPhase>::into_active`'s
+        // Closed arm: state_kind is Copy from `&state`; error_arena
+        // is mem::take'd; the remaining ActiveInner Drops at scope
+        // end, releasing ~520 B of stack + any heap behind the
+        // Box-niche cells.
         if let crate::state::ActiveState::Errored(state_kind) = &self.inner.state {
             let state_kind = *state_kind;
             let error_arena = core::mem::take(&mut self.inner.error_arena);
@@ -4908,14 +4905,14 @@ impl PgProtocol<ActivePhase> {
         }
     }
 
-    /// DEF-184 (A1+A13): resolve an [`crate::error_arena::ErrorRef`]
-    /// handle (carried by `ProtocolError::ServerErrorResponse
-    /// .details_ref`) to the full `ErrorPayload` containing the
-    /// server's message/detail/hint bounded strings.
+    /// Resolve an [`crate::error_arena::ErrorRef`] handle (carried
+    /// by `ProtocolError::ServerErrorResponse.details_ref`) to the
+    /// full `ErrorPayload` containing the server's
+    /// message/detail/hint bounded strings.
     ///
     /// # Return value
     ///
-    /// DEF-184 (audit #3 A-06): tier-3 classified `Result`:
+    /// Tier-3 classified `Result`:
     ///
     /// - `Ok(&ErrorPayload)` — ref resolves cleanly; generation
     ///   matches and slot is populated.
@@ -4958,18 +4955,17 @@ impl PgProtocol<ActivePhase> {
         &self,
         r: crate::error_arena::ErrorRef,
     ) -> Result<&crate::error_arena::ErrorPayload, crate::error_arena::ArenaError> {
-        // DEF-196: arena lives in `cold: Option<Box<ColdFields>>`.
         // The static-fallback `cold_error_arena()` returns an empty
-        // arena if cold hasn't been allocated; calling `get(r)` on the
-        // empty arena classifies as `ArenaError::Stale` (generation
-        // mismatch — the empty arena's generation is 0, any forged
-        // ErrorRef has a different generation). Same observable
-        // semantics as pre-DEF-196 inline arena.
+        // arena if the lazy-init slot has not been allocated;
+        // calling `get(r)` on the empty arena classifies as
+        // `ArenaError::Stale` (generation mismatch — the empty
+        // arena's generation is 0, any forged ErrorRef has a
+        // different generation). Same observable semantics as a
+        // freshly-init'd arena.
         self.cold_error_arena().get(r)
     }
 
-    /// DEF-185 P2-G (audit 2026-04-24): operator-facing canary for
-    /// ErrorArena slot-overwrite events.
+    /// Operator-facing canary for ErrorArena slot-overwrite events.
     ///
     /// Returns the number of times `parse_error_response` has alloc'd
     /// into the arena while the slot was already occupied — an
@@ -4981,30 +4977,33 @@ impl PgProtocol<ActivePhase> {
     /// A non-zero value on a live connection indicates a protocol-
     /// layer invariant break — wrappers surfacing this in their
     /// health checks get an early-warning signal for pipelining /
-    /// dispatch-refactor regressions. 1c-5 pipelining support is
+    /// dispatch-refactor regressions. Pipelining support is
     /// expected to replace the single-slot arena with a slab; this
     /// canary stays meaningful until that refactor lands.
     #[inline]
     #[must_use]
     pub fn error_arena_overwrite_count(&self) -> u16 {
-        // DEF-196: returns 0 when cold hasn't been allocated (no
-        // error path has fired yet on this connection — same
-        // semantics as pre-DEF-196 fresh arena).
+        // Returns 0 when the lazy-init slot has not been allocated
+        // (no error path has fired yet on this connection — same
+        // observable semantics as a freshly-init'd arena).
         self.cold_error_arena().overwrite_count()
     }
 
-    // DEF-184 (A10/B22 revert 2026-04-24): no test-only forge hooks.
-    // Post-revert the variant-carries-field invariant is tier-1 compile,
-    // so drift states simply cannot be constructed — tests exercise
-    // SCRAM flow via real wire bytes through the public API.
+    // No test-only forge hooks ship. The variant-carries-field
+    // invariant is tier-1 compile, so drift states simply cannot
+    // be constructed — tests exercise the SCRAM flow via real wire
+    // bytes through the public API. A naive shape would expose
+    // `forge_*` helpers under `#[cfg(test)]` to short-circuit the
+    // handshake; under the variant-carries-field rule those would
+    // not even compile.
 
-    /// DEF-184 (audit #3 A-02): Display adapter that resolves a
-    /// [`crate::error::ProtocolError`] with `ServerErrorResponse`-arena
-    /// strings inline.
+    /// Display adapter that resolves a
+    /// [`crate::error::ProtocolError`] with
+    /// `ServerErrorResponse`-arena strings inline.
     ///
-    /// Pre-(A-02) the `Display` impl for
-    /// `ProtocolError::ServerErrorResponse` rendered `"[details in
-    /// ErrorArena]"` — the cascade-size win (288 B → 8 B) regressed
+    /// A naive shape would render
+    /// `ProtocolError::ServerErrorResponse` as `"[details in
+    /// ErrorArena]"` — the cascade-size win (288 B → 8 B) regresses
     /// operator UX because `Display` has no access to the arena.
     /// Post-(A-02) callers with a protocol handle wrap the error:
     ///
@@ -5027,15 +5026,16 @@ impl PgProtocol<ActivePhase> {
         &'a self,
         err: &'a crate::error::ProtocolError,
     ) -> crate::error_arena::DisplayError<'a> {
-        // DEF-196: passes the boxed arena reference, or an
-        // &'static empty fallback if cold hasn't been allocated.
+        // Passes the boxed arena reference, or an &'static empty
+        // fallback if the lazy-init slot has not been allocated.
         // Display formatting of an unresolved ErrorRef classifies
-        // as `ArenaError::Stale` — same diagnostic surface as before.
+        // as `ArenaError::Stale` — same diagnostic surface as a
+        // populated arena's stale-ref path.
         crate::error_arena::DisplayError::new(err, self.cold_error_arena())
     }
 
     // ═════════════════════════════════════════════════════════════
-    // DEF-154 (X) P0-2(c): RowStream helpers
+    // RowStream helpers
     // ═════════════════════════════════════════════════════════════
     //
     // Thin crate-internal accessors exposing read_buf / state
@@ -5043,15 +5043,16 @@ impl PgProtocol<ActivePhase> {
     // field-level `pub(crate)` on the field directly. Each is a
     // single-line delegate — no logic added.
 
-    /// DEF-154 (X): append bytes to read_buf; Err on overflow.
+    /// Append bytes to read_buf; Err on overflow.
     ///
-    /// # DEF-248 Sub-B (2026-05-12) — partial-mode routing
+    /// # Partial-mode routing
     ///
     /// When the partial-assembly cell is active (an oversize non-`'D'`
     /// body is mid-flight), incoming bytes route to the assembly
     /// absorber FIRST. Up to `body_remaining` bytes are consumed
     /// (copied to the bounded prefix or counted-and-skipped beyond
-    /// the cap); only the leftover (next-frame bytes) flows to ReadBuf.
+    /// the cap); only the leftover (next-frame bytes) flows to
+    /// ReadBuf.
     ///
     /// Without this hook, a chunk completing a body > READ_BUF_CAP
     /// would fail with `ReadBufFull` since ReadBuf is capped at 4 KB
@@ -5059,11 +5060,11 @@ impl PgProtocol<ActivePhase> {
     /// through.
     #[inline]
     pub(crate) fn read_buf_append(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
-        // DEF-248 Sub-B (2026-05-12): partial-mode routing —
-        // `cold_path()` keeps the partial-mode body out of the hot
-        // I-cache footprint. RowStream's per-row fast path calls this
-        // function via `feed_inbound`-equivalent; the inactive arm
-        // is the hot path 99.99% of the time (real PG payloads ≤ 4 KB).
+        // Partial-mode routing — `cold_path()` keeps the partial-
+        // mode body out of the hot I-cache footprint. RowStream's
+        // per-row fast path calls this function via the
+        // `feed_inbound`-equivalent route; the inactive arm is the
+        // hot path 99.99% of the time (real PG payloads ≤ 4 KB).
         if self.inner.partial_assembly.is_active() {
             core::hint::cold_path();
             let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
@@ -5079,36 +5080,35 @@ impl PgProtocol<ActivePhase> {
         self.inner.read_buf.append(bytes)
     }
 
-    /// DEF-154 (X): shared view of the populated read_buf region.
+    /// Shared view of the populated read_buf region.
     ///
-    /// DEF-249 audit (2026-05-08): per-row hot path — called twice per
-    /// row from `RowStream::next_row_bytes` (header peek + row carve).
-    /// `#[inline]` already present (was added pre-DEF-249); audit
-    /// confirms the call chain `next_row_bytes → read_buf_populated →
-    /// ReadBufN::populated` is fully inlined under workspace
-    /// `lto = "fat"` + `codegen-units = 1`. Future heuristic shifts
-    /// in LLVM are pinned by the explicit hint here.
+    /// Per-row hot path — called twice per row from
+    /// `RowStream::next_row_bytes` (header peek + row carve). The
+    /// `#[inline]` hint pins the inlined call chain
+    /// `next_row_bytes → read_buf_populated → ReadBufN::populated`
+    /// against future heuristic shifts in LLVM (today fully inlined
+    /// under workspace `lto = "fat"` + `codegen-units = 1`).
     #[inline]
     #[must_use]
     pub(crate) fn read_buf_populated(&self) -> &[u8] {
         self.inner.read_buf.populated()
     }
 
-    /// DEF-154 (X): current read cursor (u16 storage).
+    /// Current read cursor (u16 storage).
     ///
-    /// DEF-249 audit (2026-05-08): per-row hot path — called once per
-    /// row from `RowStream::next_row_bytes` (cursor capture for row
-    /// carve coordinates). `#[inline]` already present; audit
-    /// confirms the call chain is fully inlined under workspace LTO.
+    /// Per-row hot path — called once per row from
+    /// `RowStream::next_row_bytes` (cursor capture for row carve
+    /// coordinates). `#[inline]` pins the fully-inlined call chain
+    /// against future heuristic shifts in LLVM.
     #[inline]
     #[must_use]
     pub(crate) fn read_buf_cursor_u16(&self) -> u16 {
         self.inner.read_buf.cursor_position_u16()
     }
 
-    /// DEF-154 (X): advance the read cursor. Err architecturally
-    /// dead on RowStream paths (frames gated by `parse_header`
-    /// length-check before advance).
+    /// Advance the read cursor. Err architecturally dead on
+    /// RowStream paths (frames gated by `parse_header` length-check
+    /// before advance).
     #[inline]
     pub(crate) fn read_buf_advance(
         &mut self,
@@ -5117,9 +5117,9 @@ impl PgProtocol<ActivePhase> {
         self.inner.read_buf.advance(n)
     }
 
-    /// DEF-248 Sub-A (2026-05-12): unread-region length accessor for
-    /// the row-stream state machine's chunk-vs-whole-col decision.
-    /// Re-export of [`crate::buf::ReadBuf::unread_len`].
+    /// Unread-region length accessor for the row-stream state
+    /// machine's chunk-vs-whole-col decision. Re-export of
+    /// [`crate::buf::ReadBuf::unread_len`].
     #[inline]
     #[must_use]
     pub(crate) fn read_buf_unread_len(&self) -> usize {
@@ -5127,22 +5127,20 @@ impl PgProtocol<ActivePhase> {
     }
 
 
-    /// DEF-248 Sub-A (2026-05-12): partial-mode entry point routed
-    /// through the leaf-gated [`crate::buf::ReadBuf::enter_partial_mode`]
-    /// accepting a `&PartialFrameToken`. The token mint is gated to
+    /// Partial-mode entry point routed through the leaf-gated
+    /// [`crate::buf::ReadBuf::enter_partial_mode`] accepting a
+    /// `&PartialFrameToken`. The token mint is gated to
     /// `crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher`,
     /// itself `pub(in crate::row_stream)` — so this entry point is
     /// only legitimately reachable from inside `mod row_stream`.
     ///
-    /// # DEF-280 Bundle K (2026-05-18)
-    ///
-    /// Now propagates the `Err(AlreadyInPartialMode)` from
-    /// [`crate::buf::ReadBuf::enter_partial_mode`]. Pre-Bundle K
-    /// callers received `()` and the re-entry condition was a silent
-    /// overwrite in release (debug-asserted in dev). Post-Bundle K
-    /// callers receive `Result` and route Err through
+    /// Propagates `Err(AlreadyInPartialMode)` from the inner call;
+    /// callers route Err through
     /// [`Self::install_errored_partial_mode_reentry`] +
-    /// `ColEvent::EndQuery::Err` (classifier-bug protocol).
+    /// `ColEvent::EndQuery::Err` (classifier-bug protocol). A naive
+    /// shape would return `()` and treat re-entry as a silent
+    /// overwrite in release (debug-asserted in dev) —
+    /// dev-loud/release-silent CREDO §V glass pattern.
     #[inline]
     pub(crate) fn enter_partial_mode_for_data_row(
         &mut self,
@@ -5152,21 +5150,18 @@ impl PgProtocol<ActivePhase> {
         self.inner.read_buf.enter_partial_mode(token, declared_body_len)
     }
 
-    /// DEF-248 Sub-A (2026-05-12): partial-mode exit point. Mirror
-    /// of [`Self::enter_partial_mode_for_data_row`].
+    /// Partial-mode exit point. Mirror of
+    /// [`Self::enter_partial_mode_for_data_row`].
     ///
-    /// # DEF-280 Bundle K-mirror (2026-05-18)
-    ///
-    /// Now propagates the `Err(PartialModeExitUndrained)` from
-    /// [`crate::buf::ReadBuf::exit_partial_mode`]. Pre-Bundle-K-mirror
-    /// callers received `()` and pre-checked `partial_remaining == 0`
-    /// upstream (tier-2 by-discipline); the silent-reset path in
-    /// release was wire-desync-class. Post-Bundle-K-mirror callers
-    /// receive `Result` and route Err through
+    /// Propagates `Err(PartialModeExitUndrained)` from the inner
+    /// call; callers route Err through
     /// [`Self::install_errored_partial_mode_exit_undrained`] +
-    /// `ColEvent::EndQuery::Err` (classifier-bug protocol).
-    /// Single source of truth: the function enforces the
-    /// `partial_remaining == 0` precondition.
+    /// `ColEvent::EndQuery::Err` (classifier-bug protocol). Single
+    /// source of truth: the function enforces the
+    /// `partial_remaining == 0` precondition. A naive shape would
+    /// return `()` and require callers to pre-check the counter
+    /// upstream — tier-2 by-discipline with a silent-reset path in
+    /// release that is wire-desync-class.
     #[inline]
     pub(crate) fn exit_partial_mode_for_row_stream(
         &mut self,
@@ -5175,8 +5170,8 @@ impl PgProtocol<ActivePhase> {
         self.inner.read_buf.exit_partial_mode(token)
     }
 
-    /// DEF-248 Sub-A (2026-05-12): drain `n` bytes from the
-    /// partial-mode counter. Returns Err on attempted underflow.
+    /// Drain `n` bytes from the partial-mode counter. Returns Err
+    /// on attempted underflow.
     #[inline]
     pub(crate) fn subtract_partial_for_row_stream(
         &mut self,
@@ -5186,31 +5181,28 @@ impl PgProtocol<ActivePhase> {
         self.inner.read_buf.subtract_partial_remaining(token, n)
     }
 
-    /// DEF-248 Sub-A (2026-05-12): partial-mode predicate. Used by
-    /// the row-stream state machine to decide whether the
-    /// `subtract_partial_*` bookkeeping is needed.
+    /// Partial-mode predicate. Used by the row-stream state machine
+    /// to decide whether the `subtract_partial_*` bookkeeping is
+    /// needed.
     #[inline]
     #[must_use]
     pub(crate) fn is_in_partial_mode_for_row_stream(&self) -> bool {
         self.inner.read_buf.is_in_partial_mode()
     }
 
-    // DEF-280 Bundle K-mirror (2026-05-18): `partial_remaining_for_row_stream`
-    // DELETED. Pre-Bundle-K-mirror this was used by `row_stream.rs`'s
-    // two `if self.proto.partial_remaining_for_row_stream() == 0 { exit }`
-    // discipline-checks before calling exit. Bundle K-mirror moved the
-    // precondition INTO `exit_partial_mode_for_row_stream` itself
-    // (Approach B — single source of truth: the function enforces the
-    // invariant via typed Err return). The accessor became dead with
-    // the upstream-check removal.
+    // No `partial_remaining_for_row_stream` accessor. The
+    // precondition `partial_remaining == 0` is enforced INSIDE
+    // [`Self::exit_partial_mode_for_row_stream`] via typed Err
+    // return — single source of truth. A naive shape would expose
+    // a counter accessor and require callers to pre-check it
+    // before calling exit — tier-2 discipline gap.
     //
-    // The underlying `ReadBuf::partial_remaining()` accessor is preserved
-    // because Bundle K's spec tests in `row_stream::bundle_k_spec_tests`
-    // assert the counter value directly on a `ReadBuf` fixture — that
-    // load-bearing use is via the field-accessor path, not the
-    // protocol-level wrapper this comment replaces.
+    // The underlying `ReadBuf::partial_remaining()` accessor is
+    // preserved because the row_stream partial-mode spec tests
+    // assert the counter value directly on a `ReadBuf` fixture
+    // (load-bearing use via the field-accessor path).
 
-    /// DEF-189: project the current row_desc_slot as a
+    /// Project the current row_desc_slot as a
     /// [`crate::decode::RowDescBorrow`], or `None` if no schema is
     /// parked.
     ///
@@ -5218,18 +5210,16 @@ impl PgProtocol<ActivePhase> {
     /// `Reply::QueryComplete::row_desc` and by the per-row fast-path
     /// to project the schema descriptor after `read_buf_advance`.
     ///
-    /// # DEF-189 perf win
+    /// # Perf rationale
     ///
-    /// Pre-DEF-188/-189 the per-row hot path did `match &self.inner.state`
-    /// twice: once for the streaming-variant gate (returning the
-    /// `reply_id`) and once after `read_buf_advance` to re-project
-    /// the schema field on the variant. Two enum matches per row.
-    ///
-    /// Post-DEF-189 the fast path is `match &self.inner.state` ONCE for
-    /// the gate (with the schema NOT in the variant) + a single
-    /// `Option::as_ref` projection here. The Option projection is
-    /// strictly cheaper than the enum match — one byte read for the
-    /// discriminant, one ptr-deref on Some.
+    /// The per-row hot path runs `match &self.inner.state` ONCE for
+    /// the streaming-variant gate (with the schema NOT in the
+    /// variant) plus a single `Option::as_ref` projection here. A
+    /// naive shape would keep the RowDesc inline in the streaming-
+    /// state variant and require a SECOND enum match per row to
+    /// re-project the schema after `read_buf_advance`. The Option
+    /// projection is strictly cheaper than the second enum match
+    /// — one byte read for the discriminant, one ptr-deref on Some.
     #[inline]
     #[must_use]
     pub fn current_row_desc(&self) -> Option<crate::decode::RowDescBorrow<'_>> {
@@ -5238,8 +5228,8 @@ impl PgProtocol<ActivePhase> {
             .map(crate::decode::RowDescBorrow::from_ref)
     }
 
-    /// DEF-189: fused state classification for the row-stream
-    /// fast-path entry. Single `match &self.inner.state` returns the
+    /// Fused state classification for the row-stream fast-path
+    /// entry. Single `match &self.inner.state` returns the
     /// classification needed by `RowStream::next_event`:
     ///
     /// - `Errored`: state is terminal — caller drains and emits
@@ -5250,20 +5240,19 @@ impl PgProtocol<ActivePhase> {
     /// - `Other`: any non-streaming, non-errored state — caller
     ///   delegates to `slow_path_once`.
     ///
-    /// Pre-DEF-189 the row_stream entry called separate
-    /// `state_is_errored()` + `streaming_reply_id()` accessors —
-    /// two enum matches per `next_event`. DEF-189 fuses them into
-    /// one match, observed once per `next_event` call. Saves one
-    /// enum-discriminant load per row (~1 ns at 3 GHz on
-    /// branch-predicted state) — the compiler did not reliably fuse
-    /// the two separate match calls because they were separated by
-    /// header-parse logic.
+    /// A naive shape would expose separate `state_is_errored()` +
+    /// `streaming_reply_id()` accessors — two enum matches per
+    /// `next_event`. Fusing them into one match (observed once per
+    /// `next_event` call) saves an enum-discriminant load per row
+    /// (~1 ns at 3 GHz on branch-predicted state); the compiler
+    /// does not reliably fuse two separate match calls because
+    /// they are separated by header-parse logic.
     ///
-    /// DEF-249 audit (2026-05-08): per-stream hot path — called once
-    /// per `next_event` / `next_row_bytes` invocation (cached in
+    /// Per-stream hot path — called once per `next_event` /
+    /// `next_row_bytes` invocation (cached in
     /// `RowStream::cached_reply_id` after first call). Amortised
-    /// cost is sub-1 ns. `#[inline]` already present; audit confirms
-    /// the call chain is fully inlined under workspace LTO.
+    /// cost is sub-1 ns. `#[inline]` pins the fully-inlined call
+    /// chain against future LLVM heuristic shifts.
     #[inline]
     #[must_use]
     pub(crate) fn classify_for_iter_rows(&self) -> IterRowsClass {
@@ -5279,25 +5268,23 @@ impl PgProtocol<ActivePhase> {
         }
     }
 
-    /// DEF-184 (B25): transition to `Errored(Internal)` for a
-    /// dead-branch read_buf advance Err. Used by RowStream's
-    /// fast-path when `read_buf_advance(total)` returns Err
-    /// — architecturally impossible (total pre-validated) but
-    /// tier-2 classification closes the drift surface at zero
-    /// runtime cost (branch is cold-path unreachable in practice).
+    /// Transition to `Errored(Internal)` for a dead-branch read_buf
+    /// advance Err. Used by RowStream's fast-path when
+    /// `read_buf_advance(total)` returns Err — architecturally
+    /// impossible (total pre-validated) but tier-2 classification
+    /// closes the drift surface at zero runtime cost (branch is
+    /// cold-path unreachable in practice).
     ///
-    /// # DEF-271 cluster A (2026-05-10): atomic drain via FeedStateSetter
+    /// # Atomic drain via FeedStateSetter
     ///
-    /// Pre-DEF-271 the helper wrote `*self.inner.state = Errored(...)`
-    /// directly; the in-flight reply id was peeked separately at the
-    /// dispatch site (tier-3 dual-source-of-truth). Post-DEF-271 the
-    /// drain and install are one `mem::replace` via
+    /// The drain and install fire as one `mem::replace` via
     /// [`crate::state_setter::FeedStateSetter::drain_and_install_errored`];
     /// the returned `Option<NonZeroU64>` is `#[must_use]` and the
     /// caller in `RowStream` uses it directly for
-    /// `StreamItem::FailReply { id, cause }`. The peek-then-write
-    /// dual-source-of-truth that previously existed at the
-    /// `classify_for_iter_rows` site collapses to a single source.
+    /// `StreamItem::FailReply { id, cause }`. A naive shape would
+    /// write `*self.inner.state = Errored(...)` directly and peek
+    /// the in-flight reply id separately at the dispatch site —
+    /// tier-3 dual-source-of-truth.
     #[inline]
     #[must_use = "the returned Option<NonZeroU64> is the in-flight reply id atomically \
                   drained by the Errored install. Caller MUST emit ColEvent::EndQuery \
@@ -5310,18 +5297,17 @@ impl PgProtocol<ActivePhase> {
         self.drain_via_leaf(cause.state_kind(), _read_cursor_advance_drain_leaf::drain)
     }
 
-    /// DEF-279 Phase 2 Bundle Commit 12 (2026-05-18) — per-phase
-    /// lift+lower wrapper for the cluster δ drain-and-install
+    /// Per-phase lift+lower wrapper for the drain-and-install
     /// pattern.
     ///
     /// Five `install_errored_*` sites (RowStream cold paths + Drop)
     /// need to drain the in-flight reply id and atomically install
-    /// `Errored(kind)`. The cluster δ drain leaves expect
-    /// `&mut ProtoState`; this helper provides the per-phase
-    /// `ActiveState → ProtoState` lift, calls the supplied `drain_fn`
-    /// (which mints its own per-call-site token internally — tier-1
-    /// closure on `FeedStateSetter::new` preserved), then lowers the
-    /// result.
+    /// `Errored(kind)`. The drain leaves expect `&mut ProtoState`;
+    /// this helper provides the per-phase
+    /// `ActiveState → ProtoState` lift, calls the supplied
+    /// `drain_fn` (which mints its own per-call-site token
+    /// internally — tier-1 closure on `FeedStateSetter::new`
+    /// preserved), then lowers the result.
     ///
     /// All 5 drain leaves produce `ProtoState::Errored(kind)` on
     /// success; the `ActiveState::try_from` lower-step projects this
@@ -5356,12 +5342,12 @@ impl PgProtocol<ActivePhase> {
         drained
     }
 
-    /// DEF-280 Bundle K (2026-05-18): transition to
-    /// `Errored(InternalCrateBug { locus: PartialModeReentry })` when
-    /// [`Self::enter_partial_mode_for_data_row`] returns Err. Routes
-    /// the drain through the cluster δ leaf shape mirroring
+    /// Transition to
+    /// `Errored(InternalCrateBug { locus: PartialModeReentry })`
+    /// when [`Self::enter_partial_mode_for_data_row`] returns Err.
+    /// Routes the drain through the leaf shape mirroring
     /// `install_errored_read_cursor_advance`; same atomic
-    /// drain-and-install discipline (DEF-271 cluster A).
+    /// drain-and-install discipline.
     ///
     /// Architecturally dead under intact callers — the streaming
     /// dispatcher in row_stream.rs's begin_partial_data_row
@@ -5380,12 +5366,12 @@ impl PgProtocol<ActivePhase> {
         self.drain_via_leaf(cause.state_kind(), _partial_mode_reentry_drain_leaf::drain)
     }
 
-    /// DEF-280 Bundle K-mirror (2026-05-18): transition to
+    /// Transition to
     /// `Errored(InternalCrateBug { locus: PartialModeExitUndrained })`
     /// when [`Self::exit_partial_mode_for_row_stream`] returns Err.
-    /// Routes the drain through the cluster δ leaf shape mirroring
+    /// Routes the drain through the leaf shape mirroring
     /// [`Self::install_errored_partial_mode_reentry`]; same atomic
-    /// drain-and-install discipline (DEF-271 cluster A).
+    /// drain-and-install discipline.
     ///
     /// Two paths reach this: (a) internal classifier bug in the
     /// dispatch loop (architecturally dead under intact callers); (b)
@@ -5409,22 +5395,18 @@ impl PgProtocol<ActivePhase> {
         )
     }
 
-    /// DEF-154 (X): transition to `Errored(Framing)` for a
-    /// malformed DataRow (empty body, server-side desync). Used
-    /// by RowStream's fast-path when `start == end`.
-    ///
-    /// # DEF-186 P1-1 (audit 2026-04-24)
+    /// Transition to `Errored(Framing)` for a malformed DataRow
+    /// (empty body, server-side desync). Used by RowStream's
+    /// fast-path when `start == end`.
     ///
     /// Takes `total_len: usize` matching the caller's
-    /// `ProtocolError::MalformedDataRow { total_len }` payload.
-    /// Pre-fix hardcoded `total_len: 0` for the state-kind derivation,
-    /// relying on the discriminator being payload-independent — correct
-    /// today but tier-4 fragility if a future `state_kind()` ever folds
-    /// on `total_len` (e.g. distinct kind for "0-byte body" vs other
-    /// malformed lengths). Pass-through closes the "mismatched twin
-    /// payloads" drift.
-    ///
-    /// # DEF-271 cluster A (2026-05-10): atomic drain via FeedStateSetter
+    /// `ProtocolError::MalformedDataRow { total_len }` payload —
+    /// single source of truth for the discriminator. A naive shape
+    /// would hardcode `total_len: 0` for the state-kind derivation
+    /// (correct today since the discriminator is payload-
+    /// independent, but tier-4 fragility if a future `state_kind()`
+    /// ever folds on `total_len`). Pass-through closes the
+    /// "mismatched twin payloads" drift.
     ///
     /// See [`Self::install_errored_read_cursor_advance`] for the
     /// drain-and-install rationale. Same pattern.
@@ -5441,16 +5423,16 @@ impl PgProtocol<ActivePhase> {
         self.drain_via_leaf(cause.state_kind(), _malformed_data_row_drain_leaf::drain)
     }
 
-    // DEF-188: install_errored_stale_schema_ref DELETED — there is
-    // no longer a SchemaRef type or generation drift class. State
-    // variants carry RowDesc inline; the fast-path reads
-    // `&self.inner.state.row_desc` directly. The "stale ref" bug class is
-    // architecturally impossible (no handle to be stale).
+    // No `install_errored_stale_schema_ref`. There is no SchemaRef
+    // type or generation drift class. State variants carry RowDesc
+    // inline; the fast-path reads `&self.inner.state.row_desc`
+    // directly. The "stale ref" bug class is architecturally
+    // impossible (no handle to be stale).
 
-    /// DEF-248 Sub-A (2026-05-12): transition to `Errored(Internal)`
-    /// when a [`crate::row_stream::RowStream`] is dropped mid-frame
-    /// (closure exited via early return / `?` / panic-unwind without
-    /// reaching a terminal `ColEvent::EndQuery`).
+    /// Transition to `Errored(Internal)` when a
+    /// [`crate::row_stream::RowStream`] is dropped mid-frame
+    /// (closure exited via early return / `?` / panic-unwind
+    /// without reaching a terminal `ColEvent::EndQuery`).
     ///
     /// # When this fires
     ///
@@ -5507,17 +5489,18 @@ impl PgProtocol<ActivePhase> {
         ) {
             Some(_) | None => {}
         }
-        // DEF-248 Sub-A: clear read_buf so a subsequent feed_bytes on
-        // the post-Errored connection does not classify mid-frame
-        // bytes as a fresh frame header. The state is already Errored
-        // — `feed_bytes_impl`'s `IngressClassification::AlreadyErrored`
-        // arm also calls `read_buf.clear()`, but doing it here keeps
-        // the post-Drop invariant tight without needing a follow-up
-        // feed_bytes to scrub.
+        // Clear read_buf so a subsequent feed_bytes on the
+        // post-Errored connection does not classify mid-frame bytes
+        // as a fresh frame header. The state is already Errored —
+        // `feed_bytes_impl`'s
+        // `IngressClassification::AlreadyErrored` arm also calls
+        // `read_buf.clear()`, but doing it here keeps the post-Drop
+        // invariant tight without needing a follow-up feed_bytes
+        // to scrub.
         self.inner.read_buf.clear();
     }
 
-    /// DEF-248 Sub-A (2026-05-12): closure-scoped row-stream API.
+    /// Closure-scoped row-stream API.
     ///
     /// Caller passes a closure that receives `&mut RowStream`. The
     /// `RowStream` value lives on this function's stack frame and is
@@ -5542,16 +5525,16 @@ impl PgProtocol<ActivePhase> {
     /// `panic = "abort"` is a binary-level setting outside the
     /// library's reach; on process death, the OS closes the TCP
     /// socket and the peer observes connection teardown — an
-    /// architectural boundary stronger than any library mechanism
-    /// (memo §3.3).
+    /// architectural boundary stronger than any library mechanism.
     ///
     /// # Hot-path cost
     ///
     /// `#[inline]` + closure monomorphisation produces machine code
-    /// identical to inlined cycle-1-style usage. The `&mut RowStream`
-    /// indirection is elided by LLVM's inliner. Drop call at scope
-    /// end is one `call` instruction — same as a caller-side `}`
-    /// scope close would have had on a by-value stream.
+    /// identical to a by-value stream returned to the caller. The
+    /// `&mut RowStream` indirection is elided by LLVM's inliner.
+    /// Drop call at scope end is one `call` instruction — same as
+    /// a caller-side `}` scope close would have had on a by-value
+    /// stream.
     ///
     /// # Caller pattern
     ///
@@ -5574,36 +5557,34 @@ impl PgProtocol<ActivePhase> {
     /// });
     /// ```
     ///
-    /// # Sub-A scope
+    /// # Scope
     ///
-    /// D-tag streaming-exposed only. Non-D frames > READ_BUF_CAP
-    /// continue to tear down with `FrameTooLarge` (Sub-B's concern).
-    /// Within-D, every wire-legal body size is handled via
-    /// partial-frame chunking — see [`crate::row_stream::ColEvent`].
+    /// D-tag streaming-exposed. Within-D, every wire-legal body
+    /// size is handled via partial-frame chunking — see
+    /// [`crate::row_stream::ColEvent`]. Non-D frames > READ_BUF_CAP
+    /// route through the partial-assembly cell separately (the
+    /// dispatch loop's FrameTooLarge arm for streaming-eligible
+    /// tags).
     #[inline]
     pub fn iter_rows<R, F>(&mut self, write_buf: &mut WriteBuf, f: F) -> R
     where
         F: for<'p, 'w> FnOnce(&mut crate::row_stream::RowStream<'p, 'w>) -> R,
     {
-        // Entry-point housekeeping mirrors feed_bytes:
+        // Entry-point housekeeping mirrors feed_bytes: cache the
+        // push class once before residue clear so the inliner can
+        // specialise the residue-helper body when entry_class is
+        // statically known at the call site. row_desc_slot lives on
+        // outer `<ActivePhase>::Extras` — pass via disjoint-field
+        // borrow.
         write_buf.clear();
-        // DEF-211 FAKE-01: cached classification (see feed_bytes for
-        // rationale).
-        //
-        // DEF-246 Option α (2026-05-16):
-        // `clear_session_residue_for_class` lives on `PgProtocolInner`;
-        // route through `self.inner` directly.
-        //
-        // DEF-279 follow-up (2026-05-18): `row_desc_slot` HOISTED to
-        // outer `<ActivePhase>::Extras`.
         let entry_class = self.inner.state.push_class();
         self.inner.clear_session_residue_for_class(&mut self.extras, entry_class);
 
         // The stream value lives here on `iter_rows`'s stack frame.
         // Caller's closure receives `&mut stream` — a borrow, not
         // the value. Drop fires at end of this function body, even
-        // on panic unwind (Rust spec). DEF-248 Sub-A `mem::forget`
-        // closure: caller has no value, only a borrow.
+        // on panic unwind (Rust spec). `mem::forget` of the closure-
+        // borrowed reference is a no-op against the underlying value.
         //
         // The HRTB `for<'p, 'w>` binds the closure to ANY lifetimes
         // `RowStream<'p, 'w>` carries; the actual lifetimes here are
@@ -5615,13 +5596,15 @@ impl PgProtocol<ActivePhase> {
     }
 }
 
-/// DEF-189 — classifier output for [`PgProtocol::classify_for_iter_rows`].
+/// Classifier output for [`PgProtocol::classify_for_iter_rows`].
 ///
 /// 3-variant enum (each ZST-discriminator except Streaming carrying
 /// `NonZeroU64`) selecting the row-stream fast-path entry behaviour.
-/// Returned by a single `match &self.inner.state` in
-/// `classify_for_iter_rows`, replacing the pre-DEF-189 separate
-/// `state_is_errored()` + `streaming_reply_id()` calls.
+/// Returned by a single `match &self.inner.state` so the row-stream
+/// entry does ONE enum match per `next_event` — a naive shape would
+/// expose separate `state_is_errored()` + `streaming_reply_id()`
+/// accessors and the compiler does not reliably fuse the two
+/// matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IterRowsClass {
     /// State is terminal `Errored(_)` — `RowStream` drains and emits
