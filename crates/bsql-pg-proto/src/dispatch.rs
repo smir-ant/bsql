@@ -921,17 +921,12 @@ pub(crate) fn dispatch(
             install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        // DrainRfqAfterError: consume Z → Idle, with full tx_status validation.
-        //
-        // DEF-185 P1-G (audit 2026-04-24): delegate to parse_rfq_payload
-        // for uniform validation. Pre-fix: accepted any 1-byte payload
-        // via `[_]` slice-pattern without validating the byte is one of
-        // `{I, T, E}`. Every OTHER RFQ arm (`PingAwaitingRfq`,
-        // `ParseAwaitingRfq`, `SimpleQueryAwaitingRfq`, etc.) used
-        // `parse_rfq_payload`; this one was an asymmetry — `drained`
-        // still succeeded but a malformed byte got silently accepted.
-        // Semantically low-stakes (we reach Idle either way), but tier-4
-        // uniformity drift nonetheless. Post-fix: consistent classification.
+        // DrainRfqAfterError: consume Z → Idle, with full tx_status
+        // validation. **Tier-3 classified**: malformed RFQ payload on
+        // this arm routes to `MalformedReadyForQuery` via
+        // `parse_rfq_payload`'s Err arm — same uniform classifier as
+        // every other RFQ arm (`PingAwaitingRfq`, `ParseAwaitingRfq`,
+        // `SimpleQueryAwaitingRfq`, etc.).
         (ProtoState::DrainRfqAfterError, TAG_READY_FOR_QUERY) => {
             // tx_status is unused on the drain path — we're returning
             // to Idle after a query-level error; the pre-error query's
@@ -2849,16 +2844,12 @@ fn parse_command_tag(payload: &[u8]) -> Result<crate::error::BoundedStr<32>, Pro
             payload_len: payload.len(),
         });
     }
-    // F-045 (pass-#8): use `from_bytes_lossy` — preserves ASCII subset,
-    // coerces non-ASCII / invalid UTF-8 to `?`. Prior
-    // `core::str::from_utf8(body).unwrap_or("")` silently dropped the
-    // entire tag on any single invalid byte (tier-4 silent-pass). Now a
-    // buggy proxy corrupting a tag byte leaves the rest readable and
-    // marks corruption with `?` in the Debug/Display output.
-    //
-    // Mirrors F22's treatment of ErrorResponse fields (message / detail
-    // / hint) — CommandComplete was missed in that pass; F-045 closes
-    // the class.
+    // **Tier-3 classified**: non-ASCII / invalid UTF-8 bytes coerce
+    // to `?` markers via `from_bytes_lossy` — a buggy proxy
+    // corrupting a tag byte leaves the rest readable; the `?`
+    // markers visibly surface corruption in Debug/Display output.
+    // Mirrors the matching treatment of ErrorResponse fields
+    // (message / detail / hint).
     Ok(BoundedStr::from_bytes_lossy(body))
 }
 

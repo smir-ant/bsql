@@ -1564,34 +1564,28 @@ impl fmt::Display for ProtocolError {
                 code,
                 ..
             } => {
-                // DEF-184 (A1+A13 + audit #3 A-02 + audit #4 P0-1):
-                // severity + code are inline; message / detail / hint
-                // live in `PgProtocol`'s ErrorArena. Built-in `Display`
-                // here cannot access the arena, so it prints ONLY the
-                // inline fields and a LOUD advisory tag pointing at
-                // `PgProtocol::display_error(&err)` for full text.
+                // `Display` for this variant emits inline severity +
+                // sqlstate + a LOUD `[use PgProtocol::display_error
+                // for message/detail/hint]` advisory directing the
+                // operator to the arena-aware adapter API for full
+                // text. The built-in `Display` cannot reach
+                // `PgProtocol`'s `ErrorArena`, so message / detail /
+                // hint are NOT rendered here — the advisory makes the
+                // absence explicit and grep-able in production logs.
                 //
-                // Pre-(P0-1) this emitted `"[details in ErrorArena]"`
-                // — mimicking content while silently losing diagnostic
-                // (tier-4 silent-degradation on non-adapter format
-                // sites: `format!("{err}")`, `log::error!("{err}")`,
-                // `err.to_string()`, panic via `{err:?}` + Display,
-                // `thiserror` source-chaining, etc.).
+                // **Tier classification**: tier-3 classified diagnostic
+                // (loud-advisory on non-adapter call sites:
+                // `format!("{err}")`, `log::error!("{err}")`,
+                // `err.to_string()`, `thiserror` source-chaining,
+                // etc.). The output never fabricates "details"
+                // content; absence of message/detail/hint is the
+                // explicit contract.
                 //
-                // Post-(P0-1): the explicit `[use PgProtocol::display_error
-                // for message/detail/hint]` advisory (a) renders the same
-                // regardless of whether arena resolved or not (no
-                // fabricated "details" content), (b) is grep-able in
-                // production logs, and (c) directs operators to the
-                // adapter API instead of silently hiding the regression.
-                //
-                // Tier-3 #30 (2026-05-19) — severity is now
-                // `Option<Severity>` to disambiguate "server didn't
-                // send the field" (`None`) from "server sent unknown
-                // string" (`Some(Severity::Unknown)`). Display renders
-                // `None` as the literal `[severity absent]` so log
-                // readers can distinguish without needing to consult
-                // the source structure.
+                // **Severity is `Option<Severity>`** (Tier-3 #30):
+                // `None` renders as `[severity absent]` to
+                // disambiguate "server didn't send the S/V field"
+                // from `Some(Severity::Unknown)` (server sent an
+                // unrecognised severity string).
                 match severity {
                     Some(s) => write!(
                         f,

@@ -6038,6 +6038,16 @@ fn fail_inflight_no_readbuf(
     // This fires on every classified fatal wire event — operator-facing
     // canary (exposed via `PgProtocol::malformed_frame_count`). Saturating
     // add keeps the counter pinned at u32::MAX on extreme flood.
+    //
+    // **Tier-3 #76 (audit 2026-05-19)**: the saturation policing happens
+    // at `MALFORMED_STORM_THRESHOLD = 10_000` below (tier-3 classified
+    // via `ErrorKind::MalformedStorm`), not at `u32::MAX`. Once the
+    // threshold fires, the connection transitions to `Errored`; subsequent
+    // increments still saturate the counter but no code path reads it
+    // past the Errored transition — the `u32::MAX` arm is architecturally
+    // dead (post-Errored short-circuit elsewhere). Promoting the type to
+    // `Saturating<u32>` or `MintSaturated`-classified panic would
+    // duplicate the policing already in place at the 10_000 boundary.
     *malformed_counter = malformed_counter.saturating_add(1);
     // DEF-189 Q8-C4: counter-storm classifier. If the counter has
     // accumulated past `MALFORMED_STORM_THRESHOLD` (10_000), the
