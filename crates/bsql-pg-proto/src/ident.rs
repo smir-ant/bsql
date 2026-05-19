@@ -1383,6 +1383,16 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
         }
         // DEF-154 (T): narrow via helper; see `narrow_len_u16` docstring.
         out.len = LenT::try_new_usize(marker_end).unwrap_or_default();
+        // Tier-3 audit #48 (2026-05-19): length-overflow truncation
+        // is also a form of information loss — flag it. Pre-audit
+        // `was_lossy` only tripped on byte-coercion (slow path
+        // through `from_bytes_lossy`); truncation in the fast/slow
+        // path through `from_str_truncating` left was_lossy false
+        // despite the visible "…" marker. Programmatic detection of
+        // truncation (e.g. for CommandTag handlers that want to
+        // surface a "tag was longer than buffer" diagnostic) now
+        // works without parsing the buffer for the marker suffix.
+        out.was_lossy_flag = 1;
         out
     }
 
@@ -1456,6 +1466,10 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
             }
             // DEF-154 (T): see `narrow_len_u16` docstring.
             out.len = LenT::try_new_usize(marker_end).unwrap_or_default();
+            // Tier-3 audit #48: length-overflow truncation also
+            // counts as lossy. See mirror block in
+            // `from_str_truncating`'s slow path.
+            out.was_lossy_flag = 1;
         } else {
             out.len = LenT::try_new_usize(written).unwrap_or_default();
         }
@@ -1466,17 +1480,32 @@ impl<const N: usize, Tag: Truncating, LenT: crate::bounded::BoundedLen<N>> Fixed
         out
     }
 
-    /// DEF-185 P2-D (audit 2026-04-24): `true` iff this value was
-    /// constructed via [`Self::from_bytes_lossy`] AND at least one
-    /// byte was coerced to `b'?'` (non-ASCII-printable, non-whitespace).
+    /// `true` iff this value lost information during construction —
+    /// either via byte-coercion or via length-overflow truncation.
     ///
-    /// Lets operators distinguish legitimate `?` characters in server
-    /// text from our lossy coercion. Useful when investigating
-    /// mis-encoded server error messages, proxy corruption, or
-    /// client_encoding mismatch.
+    /// Two trip conditions, both audit-anchored:
     ///
-    /// Returns `false` for values constructed via any other path
-    /// (`new`, `Default`, `from_str_truncating`, `try_from_*`).
+    /// - **Byte-coercion** (DEF-185 P2-D): at least one source byte
+    ///   was outside `0x20..=0x7e` plus whitespace and got coerced to
+    ///   `b'?'` during [`Self::from_bytes_lossy`]'s slow path. Lets
+    ///   operators distinguish legitimate `?` characters in server
+    ///   text from our lossy coercion.
+    /// - **Length-overflow truncation** (Tier-3 audit #48,
+    ///   2026-05-19): the source exceeded the buffer's capacity
+    ///   minus the 3-byte `OVERFLOW_MARKER` (`"…"`) length, so the
+    ///   constructor copied as much as fit and appended the marker.
+    ///   Tripped from BOTH [`Self::from_str_truncating`]'s slow path
+    ///   and [`Self::from_bytes_lossy`]'s slow path. Lets callers
+    ///   surface "tag was longer than buffer" diagnostics without
+    ///   parsing the buffer tail for the marker.
+    ///
+    /// Useful when investigating mis-encoded server error messages,
+    /// proxy corruption, client_encoding mismatch, or unexpectedly
+    /// long PostgreSQL CommandComplete tags.
+    ///
+    /// Returns `false` for values constructed via any non-truncating /
+    /// non-lossy path (`new`, `Default`, `try_from_*` when the source
+    /// fits verbatim).
     #[inline]
     #[must_use]
     pub const fn was_lossy(&self) -> bool {

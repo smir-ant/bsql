@@ -213,7 +213,17 @@ impl OtherEncoding {
     pub fn from_truncated_bytes(src: &[u8]) -> Self {
         const MARKER: &[u8] = "…".as_bytes(); // 3 bytes
         if src.len() <= MAX_ENCODING_NAME_LEN {
-            // Fast path — fits verbatim.
+            // Fast path — fits verbatim. `try_from_bytes` returns
+            // `Some` because the `src.len() <= MAX_ENCODING_NAME_LEN`
+            // precondition is exactly the bound `try_from_bytes`
+            // checks; the `unwrap_or_else(Self::empty)` Err arm is
+            // architecturally dead. The empty-fallback survives
+            // syntactically because the forbid-bundle bans `unwrap()`,
+            // `expect()`, and `unreachable!()` — `unwrap_or_else` is
+            // the only allowed discharge. Audit #86 (2026-05-19)
+            // verified: this is NOT the silent-empty production
+            // surfacing path the audit suspected; the bound shield is
+            // load-bearing.
             return Self::try_from_bytes(src).unwrap_or_else(Self::empty);
         }
         let budget = MAX_ENCODING_NAME_LEN.saturating_sub(MARKER.len());
