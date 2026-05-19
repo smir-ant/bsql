@@ -93,6 +93,41 @@ use crate::protocol::PgProtocol;
 use crate::wire::TAG_DATA_ROW;
 use crate::write_buf::WriteBuf;
 
+/// Tier-4 #59 audit (2026-05-19): single-source-of-truth sentinel
+/// reply-id for post-error terminal events emitted before any
+/// streaming state was ever observed (`cached_reply_id` is `None`).
+///
+/// # Why a sentinel is acceptable here
+///
+/// `ColEvent::EndQuery { id, outcome: Err(...) }` carries an `id`
+/// for downstream wrapper-layer routing. Pre-streaming Errored
+/// entries have no real cached id — we never reached the
+/// `IterRowsClass::Streaming(id)` arm that populates
+/// `cached_reply_id`. The wrapper layer matches on the
+/// `outcome::Err` *cause* (`ProtocolError::*`), NOT on `id`
+/// equality, so the sentinel is purely a typed placeholder for
+/// the carrier slot — not a silent fallback that could be
+/// confused with a real id.
+///
+/// `NonZeroU64::MAX` is the canonical choice: every real
+/// `ReplyId` is minted by `PROCESS_REPLY_ID_COUNTER.fetch_add(1)`
+/// starting at `1` and incrementing monotonically. Reaching
+/// `MAX` would require 2^64−1 reply ids on a single process —
+/// architecturally unreachable on any realistic deployment
+/// horizon. The sentinel cannot collide with a legitimate id.
+///
+/// # Why not lift to `Option<NonZeroU64>` in the ColEvent API
+///
+/// Audit Phase 3 proposed `ColEvent::EndQuery { id:
+/// Option<NonZeroU64>, ... }` — type-level None vs Some. Rejected
+/// for v1.0 as a BREAKING API change requiring every downstream
+/// consumer of the streaming API to migrate id-matching code.
+/// The 15+ sentinel sites collapse to one constant; the sentinel
+/// is type-system-clean (`NonZeroU64` by construction) and the
+/// rationale is anchored here so future refactors don't re-derive
+/// the analysis. Reopen path: post-1.0 API redesign sweep.
+pub(crate) const POST_ERROR_SENTINEL_REPLY_ID: NonZeroU64 = NonZeroU64::MAX;
+
 /// **Event yielded by [`RowStream::col_next`]** — column-by-column
 /// pull surface for in-flight PostgreSQL query replies.
 ///
@@ -655,7 +690,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             // NonZeroU64. The wrapper layer matches on the
             // EndQuery::Err *cause*, not on id equality, so this
             // sentinel is purely a placeholder.
-            let id = cached.unwrap_or(NonZeroU64::MAX);
+            let id = cached.unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
             return ColEvent::EndQuery {
                 id,
                 outcome: Err(ProtocolError::InternalCrateBug {
@@ -804,7 +839,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             self.drained = true;
             let drained = self.proto.install_errored_malformed_data_row(total);
             let cause = ProtocolError::MalformedDataRow { total_len: total };
-            let term_id = drained.or(Some(id)).unwrap_or(NonZeroU64::MAX);
+            let term_id = drained.or(Some(id)).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
             return ColEvent::EndQuery {
                 id: term_id,
                 outcome: Err(cause),
@@ -819,7 +854,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             let cause = ProtocolError::InternalCrateBug {
                 locus: crate::error::CrateBugLocus::ReadCursorAdvance,
             };
-            let term_id = drained.or(Some(id)).unwrap_or(NonZeroU64::MAX);
+            let term_id = drained.or(Some(id)).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
             return ColEvent::EndQuery {
                 id: term_id,
                 outcome: Err(cause),
@@ -832,7 +867,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             Err(cause) => {
                 self.drained = true;
                 let drained = self.proto.install_errored_malformed_data_row(total);
-                let term_id = drained.or(Some(id)).unwrap_or(NonZeroU64::MAX);
+                let term_id = drained.or(Some(id)).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
                 return ColEvent::EndQuery {
                     id: term_id,
                     outcome: Err(cause),
@@ -846,7 +881,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             let cause = ProtocolError::InternalCrateBug {
                 locus: crate::error::CrateBugLocus::ReadCursorAdvance,
             };
-            let term_id = drained.or(Some(id)).unwrap_or(NonZeroU64::MAX);
+            let term_id = drained.or(Some(id)).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
             return ColEvent::EndQuery {
                 id: term_id,
                 outcome: Err(cause),
@@ -873,7 +908,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
     fn begin_partial_data_row(&mut self, declared: u32) -> ColEvent<'_> {
         // Re-fetch the cached reply id (architecturally guaranteed
         // Some by the dispatch site's `cached_id.is_some()` check).
-        let cached_id = self.cached_reply_id.unwrap_or(NonZeroU64::MAX);
+        let cached_id = self.cached_reply_id.unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
 
         // Advance past the 5-byte frame header.
         if self.proto.read_buf_advance(HEADER_LEN).is_err() {
@@ -882,7 +917,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             let cause = ProtocolError::InternalCrateBug {
                 locus: crate::error::CrateBugLocus::ReadCursorAdvance,
             };
-            let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+            let term_id = drained.or(Some(cached_id)).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
             return ColEvent::EndQuery {
                 id: term_id,
                 outcome: Err(cause),
@@ -912,7 +947,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             let cause = ProtocolError::InternalCrateBug {
                 locus: crate::error::CrateBugLocus::PartialModeReentry,
             };
-            let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+            let term_id = drained.or(Some(cached_id)).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
             return ColEvent::EndQuery {
                 id: term_id,
                 outcome: Err(cause),
@@ -949,7 +984,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
                 self.drained = true;
                 let drained = self.proto.install_errored_malformed_data_row(0);
                 let cause = ProtocolError::MalformedDataRow { total_len: 0 };
-                let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+                let term_id = drained.or(Some(cached_id)).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
                 return ColEvent::EndQuery {
                     id: term_id,
                     outcome: Err(cause),
@@ -964,7 +999,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             let cause = ProtocolError::InternalCrateBug {
                 locus: crate::error::CrateBugLocus::ReadCursorAdvance,
             };
-            let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+            let term_id = drained.or(Some(cached_id)).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
             return ColEvent::EndQuery {
                 id: term_id,
                 outcome: Err(cause),
@@ -982,7 +1017,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             let cause = ProtocolError::InternalCrateBug {
                 locus: crate::error::CrateBugLocus::ReadCursorAdvance,
             };
-            let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+            let term_id = drained.or(Some(cached_id)).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
             return ColEvent::EndQuery {
                 id: term_id,
                 outcome: Err(cause),
@@ -1013,7 +1048,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
                 let cause = ProtocolError::InternalCrateBug {
                     locus: crate::error::CrateBugLocus::PartialModeExitUndrained,
                 };
-                let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+                let term_id = drained.or(Some(cached_id)).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
                 return ColEvent::EndQuery {
                     id: term_id,
                     outcome: Err(cause),
@@ -1071,8 +1106,8 @@ impl<'p, 'w> RowStream<'p, 'w> {
                     let cause = ProtocolError::InternalCrateBug {
                         locus: crate::error::CrateBugLocus::PartialModeExitUndrained,
                     };
-                    let cached_id = self.cached_reply_id.unwrap_or(NonZeroU64::MAX);
-                    let term_id = drained.or(Some(cached_id)).unwrap_or(NonZeroU64::MAX);
+                    let cached_id = self.cached_reply_id.unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
+                    let term_id = drained.or(Some(cached_id)).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
                     return ColEvent::EndQuery {
                         id: term_id,
                         outcome: Err(cause),
@@ -1358,7 +1393,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
                 // terminal carrying ConnectionAlreadyClosed-style
                 // semantics; the test suite expects a single terminal
                 // arm on iter_rows so we route through EndQuery::Err.
-                let id = cached_id.unwrap_or(NonZeroU64::MAX);
+                let id = cached_id.unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
                 ColEvent::EndQuery {
                     id,
                     outcome: Err(ProtocolError::InternalCrateBug {
@@ -1437,7 +1472,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
         self.drained = true;
         let drained = self.proto.install_errored_read_cursor_advance();
         let cached = self.cached_reply_id;
-        let id = drained.or(cached).unwrap_or(NonZeroU64::MAX);
+        let id = drained.or(cached).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
         ColEvent::EndQuery {
             id,
             outcome: Err(ProtocolError::InternalCrateBug {
@@ -1454,7 +1489,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
         self.drained = true;
         let drained = self.proto.install_errored_malformed_data_row(0);
         let cached = self.cached_reply_id;
-        let id = drained.or(cached).unwrap_or(NonZeroU64::MAX);
+        let id = drained.or(cached).unwrap_or(POST_ERROR_SENTINEL_REPLY_ID);
         ColEvent::EndQuery {
             id,
             outcome: Err(ProtocolError::MalformedDataRow { total_len: 0 }),
