@@ -1,18 +1,13 @@
-//! DEF-244 Phase 1 — narrow-scope SQL lexer for the `prepared!`
-//! macro.
+//! Narrow-scope SQL lexer for the `prepared!` macro.
 //!
-//! # Design memo cross-reference
+//! The lexer's job is intentionally narrow: it tokenises a static
+//! SQL string at proc-macro expansion time and produces a flat
+//! stream of `SqlToken`s pointing back to the source via byte
+//! offsets. `extract.rs` walks the stream to build `ParamSpec` /
+//! `ColumnSpec` lists; `typemap.rs` maps PG type names to Rust
+//! type tokens.
 //!
-//! Implements the lexer specified in `/tmp/def244-design-memo.md` §4
-//! (D2-c lexer-only strategy, accepted per principal review). The
-//! lexer's job is intentionally narrow: it tokenises a static SQL
-//! string at proc-macro expansion time and produces a flat stream of
-//! `SqlToken`s pointing back to the source via byte offsets. Phase 2
-//! (`extract.rs`) walks the stream to build `ParamSpec` /
-//! `ColumnSpec` lists; Phase 3 (`typemap.rs`) maps PG type names to
-//! Rust type tokens.
-//!
-//! # Tier discipline (CREDO §0 / memo §4.4)
+//! # Tier discipline (CREDO §0)
 //!
 //! - **Tier-1 by-compile**: every token-stream consumer
 //!   (`extract.rs`) matches on `SqlTokenKind` exhaustively. Adding a
@@ -21,24 +16,22 @@
 //!   (this crate is `proc-macro`, not `no_std`; `Vec` is the natural
 //!   container for the dynamic-length token list).
 //! - **Tier-3 by-test**: ~30 unit tests in `#[cfg(test)] mod tests`
-//!   below cover every SQL shape from memo §4.5 (string literals,
-//!   dollar-quoted strings, comments, quoted identifiers, casts).
+//!   below cover every SQL shape (string literals, dollar-quoted
+//!   strings, comments, quoted identifiers, casts).
 //!
 //! # Why hand-rolled vs `sqlparser-rs`
 //!
-//! Per memo §4.2/§4.4: pulling `sqlparser-rs` triples this
-//! proc-macro crate's dep graph for a feature we use ~3% of (find
-//! `$N` placeholders and `::TYPE` casts). The 300-line hand-rolled
-//! lexer is audit-readable in one sitting, every byte is ours, and
-//! diagnostics point at the exact offending source byte rather than
-//! travelling through a translation layer. CREDO §4.4 dep discipline
-//! wins; CREDO §11 policy 9 ("never hand-roll expert-domain code")
-//! targets production runtime decoders (JSON/YAML/full SQL for a SQL
-//! engine), not a build-time targeted lexer for our narrow grammar.
+//! Pulling `sqlparser-rs` triples this proc-macro crate's dep graph
+//! for a feature we use ~3% of (find `$N` placeholders and `::TYPE`
+//! casts). The 300-line hand-rolled lexer is audit-readable in one
+//! sitting, every byte is ours, and diagnostics point at the exact
+//! offending source byte rather than travelling through a
+//! translation layer. CREDO §4.4 dep discipline wins; CREDO §11
+//! policy 9 ("never hand-roll expert-domain code") targets
+//! production runtime decoders (JSON/YAML/full SQL for a SQL engine),
+//! not a build-time targeted lexer for our narrow grammar.
 //!
 //! # Grammar accepted
-//!
-//! Per memo §4.5:
 //! - String literals: `'foo'`, with `''` as escape for embedded
 //!   single-quote.
 //! - Dollar-quoted strings: `$tag$body$tag$` where `tag` is
@@ -59,7 +52,7 @@
 //! (typically `Ident` or `Punct`) so the extractor's walking logic
 //! can ignore them.
 
-#![allow(dead_code, reason = "DEF-244 Phase 1 plumbing — extract.rs (Phase 2) consumes these tokens; intermediate construction sites land in the same PR")]
+#![allow(dead_code, reason = "lexer plumbing — `extract.rs` consumes these tokens; intermediate construction sites are part of the same proc-macro pipeline")]
 
 use alloc::vec::Vec;
 
@@ -203,8 +196,8 @@ pub(crate) struct LexError {
 /// (index ≥ u8::MAX). Other classes of "SQL we don't understand"
 /// (non-ASCII identifiers, weird punctuation) are NOT errors at the
 /// lex level — they pass through as `Ident` or `Punct`. The
-/// extractor's validation step (memo §4.6) is what classifies
-/// "SQL shape we accept" vs "SQL shape we reject".
+/// extractor's validation step is what classifies "SQL shape we
+/// accept" vs "SQL shape we reject".
 pub(crate) fn tokenise(src: &str) -> Result<Vec<SqlToken>, LexError> {
     let bytes = src.as_bytes();
     // Initial capacity heuristic: average token length ~4 bytes (an
@@ -551,7 +544,7 @@ pub(crate) fn token_str<'s>(src: &'s str, tok: &SqlToken) -> &'s str {
 
 #[cfg(test)]
 mod tests {
-    //! Per-shape unit tests for memo §4.5 grammar.
+    //! Per-shape unit tests covering each accepted grammar form.
     //!
     //! Each test pins ONE invariant: comment handling, string
     //! escapes, dollar-quoting tag matching, placeholder index

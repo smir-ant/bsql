@@ -11,10 +11,9 @@
 //!
 //! - [`Pristine`] — derives `is_pristine()` invariant check. Required
 //!   for [`crate::pristine::Pristine`][bsql_pg_proto_pristine_link]
-//!   trait impl on types like `SessionParams`. See `DEF-211 INNO-01`
-//!   in `deferred.md` for the design rationale: lifts BS-11
-//!   broad-scope tier-3 to tier-1 by-construction (compiler emits the
-//!   field-by-field check; missing a new field is impossible).
+//!   trait impl on types like `SessionParams`. Lifts broad-scope
+//!   tier-3 to tier-1 by-construction: the compiler emits the
+//!   field-by-field check; missing a new field is impossible.
 //!
 //! [bsql_pg_proto_pristine_link]: https://docs.rs/bsql-pg-proto
 //!
@@ -54,12 +53,11 @@
 )]
 #![deny(unused_must_use, unused_lifetimes, missing_docs)]
 
-// DEF-244 (2026-05-13): `alloc` crate is implicitly available in
-// proc-macro context (proc-macro crates compile with full `std`),
-// but explicit `extern crate alloc;` keeps the lexer/extractor
-// modules' `use alloc::vec::Vec` path resolution stable across
-// rustc versions and makes the `no_std`-aware shape obvious to
-// auditors.
+// `alloc` crate is implicitly available in proc-macro context
+// (proc-macro crates compile with full `std`), but the explicit
+// `extern crate alloc;` keeps the lexer/extractor modules'
+// `use alloc::vec::Vec` path resolution stable across rustc
+// versions and makes the `no_std`-aware shape obvious to auditors.
 extern crate alloc;
 
 use proc_macro::TokenStream;
@@ -67,16 +65,14 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Field, Fields, Type};
 
-// DEF-244 modules — host the `prepared!` proc-macro pipeline.
+// `prepared!` proc-macro pipeline:
 //
-// Phase 1 — `sql_lexer`: narrow-scope SQL tokenizer (memo §4).
-// Phase 2 — `extract`: placeholder + cast extraction with V1-V5
-//   validation (memo §4.6).
-// Phase 3 — `typemap`: PG type-name → Rust type token mapping
-//   (memo §6.3 / §10.7).
+// - `sql_lexer`: narrow-scope SQL tokenizer.
+// - `extract`: placeholder + cast extraction with validation.
+// - `typemap`: PG type-name → Rust type token mapping.
 //
-// Phase 4's macro entry (`prepared(...)`) lives at the bottom of
-// this file, alongside the existing `#[proc_macro_derive(Pristine)]`.
+// The macro entry (`prepared(...)`) lives at the bottom of this
+// file, alongside the existing `#[proc_macro_derive(Pristine)]`.
 mod sql_lexer;
 mod extract;
 mod typemap;
@@ -428,17 +424,17 @@ fn is_phantom_data(ty: &Type) -> bool {
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// DEF-244 — `prepared!` proc-macro (function-like).
+// `prepared!` proc-macro (function-like).
 //
-// See `/tmp/def244-design-memo.md` for the full design. Closes the
-// SQL-injection class as a category that does not compile: the only
-// path to construct a `PreparedQuery<P, R>` is through this macro;
-// the only path to execute one is `ReadyGuard::execute_prepared`;
-// `PreparedQuery`'s fields are `pub(crate)` so direct struct
-// initialisation from external crates is impossible (E0451).
+// Closes the SQL-injection class as a category that does not compile:
+// the only path to construct a `PreparedQuery<P, R>` is through this
+// macro; the only path to execute one is
+// `ReadyGuard::execute_prepared`; `PreparedQuery`'s fields are
+// `pub(crate)` so direct struct initialisation from external crates
+// is impossible (E0451).
 //
-// Hostile-bypass probes P1-P12 enumerated in memo §7 are pinned via
-// `trybuild` files under `tests/prepared_macro_spec/`.
+// Hostile-bypass probes P1-P12 are pinned via `trybuild` files under
+// `tests/prepared_macro_spec/`.
 // ═════════════════════════════════════════════════════════════════════
 
 /// Compile-time prepared PostgreSQL query.
@@ -448,7 +444,7 @@ fn is_phantom_data(ty: &Type) -> bool {
 /// literal of `bsql_pg_proto::PreparedQuery` with parameter and
 /// row types pinned at the type level.
 ///
-/// # Tier-1 SQL-injection closure (memo §7)
+/// # Tier-1 SQL-injection closure
 ///
 /// The macro accepts only `syn::LitStr` input. A runtime string
 /// (`prepared!(some_var)`) is a different token-stream shape and is
@@ -484,12 +480,11 @@ fn is_phantom_data(ty: &Type) -> bool {
 ///
 /// Wider type coverage (`bytea`, `varchar`, `float4`, `float8`,
 /// `timestamp`, `timestamptz`, `date`, `time`, `numeric`, `uuid`,
-/// `jsonb`, `interval`, ...) tracks **DEF-228** in `deferred.md`.
-/// The restriction is honest engineering: only types with a
-/// `DecodeFormat<TextFmt>` + `EncodeBinary` impl in the runtime
-/// crate are accepted, so macro-expand-time rejection is the
-/// load-bearing tier-1 line. When DEF-228 lands the missing impls,
-/// the macro's type table grows in lockstep.
+/// `jsonb`, `interval`, ...) is gated on each type's
+/// `DecodeFormat<TextFmt>` + `EncodeBinary` impl landing in the
+/// runtime crate first. The restriction is honest engineering:
+/// macro-expand-time rejection is the load-bearing tier-1 line —
+/// the type table grows in lockstep with runtime-side impls.
 ///
 /// # Statement shapes
 ///
@@ -527,11 +522,10 @@ pub fn prepared(input: TokenStream) -> TokenStream {
 /// Inner implementation returning `syn::Result<TokenStream2>`. Each
 /// failure path emits `compile_error!` via the wrapper above.
 fn prepared_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
-    // P6 closure (memo §7 Probe P6): only accept a single string-
-    // literal token. Any other shape — including a const ident, a
-    // bare identifier, a function call — is rejected with a clear
-    // diagnostic. `concat!("...")` works because `concat!` expands
-    // to a `LitStr` at the macro-call site.
+    // Only accept a single string-literal token. Any other shape —
+    // including a const ident, a bare identifier, a function call —
+    // is rejected with a clear diagnostic. `concat!("...")` works
+    // because `concat!` expands to a `LitStr` at the macro-call site.
     let lit: syn::LitStr = syn::parse2(input).map_err(|_| {
         syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -599,7 +593,7 @@ fn prepared_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     // crate's `.rodata`; the struct literal references them via
     // `&Self::PARSE_TEMPLATE` patterns. To keep the names from
     // colliding with user identifiers we hide them under doubly-
-    // underscored names (per memo §10.6 hygiene rule).
+    // underscored names (hygiene convention for macro internals).
     let expanded = quote! {
         {
             #[doc(hidden)]
@@ -643,8 +637,8 @@ where
 }
 
 /// SHA-256 of the SQL bytes truncated to 96 bits → 24 hex chars →
-/// statement name `bsql_p_<24hex>`. 96-bit collision space matches
-/// the memo §7 P11 closure for content-addressed stmt-cache reuse.
+/// statement name `bsql_p_<24hex>`. 96-bit collision space supports
+/// content-addressed stmt-cache reuse (P11 hostile-bypass closure).
 fn sha256_96_stmt_name(sql: &str) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(sql.as_bytes());
@@ -740,7 +734,7 @@ fn build_parse_template_bytes(
 ///   trailing NUL.
 /// - `format-code-block` uses PG's compact form: for N=0 send
 ///   `n_format_codes=0`; for N≥1 send `n_format_codes=1, codes=[0]`
-///   (one Text code applied to all params; memo §5.4).
+///   (one Text code applied to all params, per PG §55.7 compact form).
 /// - `n_params_u16_be` is the parameter count.
 ///
 /// The runtime path is:

@@ -1,12 +1,8 @@
-//! DEF-244 Phase 3 — PG type-name → Rust type token mapping.
+//! PG type-name → Rust type token mapping.
 //!
-//! # Design memo cross-reference
-//!
-//! Implements the table specified in `/tmp/def244-design-memo.md`
-//! sections 6.3 / 10.7 with one adjustment from the HEAD-validation
-//! pass. The memo lists 19 OIDs, but bsql-pg-proto's actual
-//! DecodeFormat + EncodeBinary matrix today supports six types
-//! end-to-end (i16, i32, i64, u32, bool, &str). The macro maps:
+//! `bsql-pg-proto`'s `DecodeFormat + EncodeBinary` matrix supports
+//! six types end-to-end (`i16`, `i32`, `i64`, `u32`, `bool`, `&str`).
+//! The macro maps:
 //!
 //! | PG name in SQL cast | Rust type token   | OID const path                         |
 //! |---------------------|-------------------|----------------------------------------|
@@ -27,10 +23,10 @@
 //! macro instead emits `compile_error!` at expansion with a
 //! type-list pointing the user at supported names.
 //!
-//! Wider type coverage tracks DEF-228 (per principal directive in
-//! the implementation prompt). When `DecodeFormat<TextFmt>` impls
-//! for `&[u8]` / `f32` / `f64` / etc. ship, this table grows in
-//! lockstep — single source of truth for the type↔OID↔Rust mapping.
+//! Wider type coverage lands as `DecodeFormat<TextFmt>` impls for
+//! `&[u8]` / `f32` / `f64` / etc. ship in the runtime crate. This
+//! table grows in lockstep — single source of truth for the
+//! type↔OID↔Rust mapping.
 //!
 //! # Why static `&'static str` (and not `String` or owned)
 //!
@@ -51,11 +47,11 @@ pub(crate) struct TypeMapEntry {
     /// PG OID const path token (e.g., `quote!(::bsql_pg_proto::oids::INT4)`).
     /// Emitted into the consumer crate so a drift between `oids::*`
     /// and the literal `oid_value` would surface via the runtime
-    /// crate's const-asserts (post-DEF-258 / `pg_type.dat`).
+    /// crate's const-asserts against `pg_type.dat`.
     pub(crate) oid_path: TokenStream,
     /// Numeric OID value resolved at macro-expansion time. Used to
     /// bake the Parse-frame `n_param_types` body — Parse OIDs MUST
-    /// be in the static `.rodata` template (memo §5.3), so we need
+    /// be in the static `.rodata` template, so we need
     /// the integer at macro-expand time, not just the token-path.
     /// Drift-pinned: each branch's `oid_value` matches the path's
     /// PG-catalog constant (pinned in `bsql-pg-proto::decode::oids`
@@ -73,8 +69,8 @@ pub(crate) struct TypeMapEntry {
 ///
 /// # Case sensitivity
 ///
-/// Per memo §3.5 Q-D1-1 + principal's D1-a acceptance, v1 accepts
-/// **lowercase only**: `int4`, not `INT4`. The caller (extractor)
+/// v1 accepts **lowercase only**: `int4`, not `INT4`. The caller
+/// (extractor)
 /// is responsible for converting the source bytes to lowercase if
 /// it wants case-insensitive matching; this function does NOT fold
 /// — that ambiguity belongs in the extractor, not the type table.
@@ -118,9 +114,10 @@ pub(crate) fn lookup_pg_type(name_ascii_lower: &str, span: Span) -> syn::Result<
             quote! { ::bsql_pg_proto::oids::TEXT },
             25_u32,
         ),
-        // DEF-228 placeholder: decoder/encoder support pending.
-        // Once `DecodeFormat<TextFmt>` impls land for additional
-        // types in `bsql-pg-proto`, expand this table in lockstep.
+        // Decoder/encoder support for wider types is pending in the
+        // runtime crate. Once `DecodeFormat<TextFmt>` impls land for
+        // additional types in `bsql-pg-proto`, expand this table in
+        // lockstep.
         //
         // Diagnostic shape rationale:
         //   - Lead with the rejected type name in backticks so it
@@ -128,11 +125,8 @@ pub(crate) fn lookup_pg_type(name_ascii_lower: &str, span: Span) -> syn::Result<
         //   - Enumerate the v1.0 supported set with their Rust
         //     mapping in parentheses (the user wants to know "what
         //     CAN I use here?", not just "what failed").
-        //   - Group DEF-228-pending types into a single bracketed
-        //     line so the user sees the future-coverage scope at a
-        //     glance.
-        //   - End with the DEF-228 tracking reference for cross-
-        //     referencing the roadmap.
+        //   - Group future-coverage types into a single bracketed
+        //     line so the user sees the scope at a glance.
         other => {
             let mut msg = String::with_capacity(384);
             msg.push_str("prepared!: unsupported PG type `");
@@ -157,10 +151,10 @@ pub(crate) fn lookup_pg_type(name_ascii_lower: &str, span: Span) -> syn::Result<
                  Wider type coverage [bytea / varchar / bpchar / \
                  name / float4 / float8 / numeric / timestamp / \
                  timestamptz / date / time / uuid / jsonb / interval] \
-                 tracks DEF-228 in deferred.md. When DEF-228 lands the \
-                 missing `DecodeFormat<TextFmt>` impls, this table \
-                 grows in lockstep — single source of truth for the \
-                 type ↔ OID ↔ Rust-type mapping.",
+                 lands as the missing `DecodeFormat<TextFmt>` impls \
+                 ship in the runtime crate. This table grows in \
+                 lockstep — single source of truth for the type ↔ \
+                 OID ↔ Rust-type mapping.",
             );
             return Err(syn::Error::new(span, msg));
         }
@@ -184,7 +178,7 @@ mod tests {
         }
     }
 
-    /// Uppercase is NOT accepted (memo §3.5 Q-D1-1 — v1 lowercase-only).
+    /// Uppercase is NOT accepted (v1 lowercase-only).
     #[test]
     fn lookup_uppercase_rejected() {
         let span = Span::call_site();
@@ -192,7 +186,8 @@ mod tests {
         assert!(lookup_pg_type("Int4", span).is_err());
     }
 
-    /// DEF-228-pending types are rejected at expansion.
+    /// Future-coverage types are rejected at expansion until their
+    /// runtime decoder/encoder support lands.
     #[test]
     fn lookup_pending_types_rejected() {
         let span = Span::call_site();
@@ -200,7 +195,7 @@ mod tests {
                      "timestamp", "timestamptz", "uuid", "jsonb", "numeric", "char"] {
             assert!(
                 lookup_pg_type(name, span).is_err(),
-                "expected {name} to be rejected (DEF-228 pending)",
+                "expected {name} to be rejected (runtime support pending)",
             );
         }
     }

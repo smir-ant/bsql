@@ -1,9 +1,8 @@
-//! DEF-244 Phase 2 — placeholder and cast extraction from the SQL
-//! token stream produced by [`crate::sql_lexer`].
+//! Placeholder and cast extraction from the SQL token stream
+//! produced by [`crate::sql_lexer`].
 //!
-//! # Design memo cross-reference
+//! # Validation rules
 //!
-//! Implements memo §4.6 V1-V5 validation:
 //! - **V1**: placeholders are contiguous starting at `$1` (no skips).
 //! - **V2**: every `$N` carries a cast annotation (`::TYPE` or
 //!   enclosed in `CAST($N AS TYPE)`).
@@ -45,8 +44,8 @@ pub(crate) struct ParamSpec {
     pub(crate) rust_type: TokenStream,
     /// OID const path token (e.g., `quote!(::bsql_pg_proto::oids::INT4)`).
     pub(crate) oid_path: TokenStream,
-    /// Numeric OID value resolved at macro-expansion (memo §5.3 —
-    /// the Parse-template body must carry the literal OID bytes).
+    /// Numeric OID value resolved at macro-expansion (the
+    /// Parse-template body must carry the literal OID bytes).
     pub(crate) oid_value: u32,
 }
 
@@ -414,7 +413,7 @@ where
 /// Walk a comma-separated column list (at paren-depth 0) and extract
 /// the cast type of each column.
 ///
-/// Per memo §3.5 every column MUST carry an explicit cast (`expr::TYPE`)
+/// Every column MUST carry an explicit cast (`expr::TYPE`)
 /// or `CAST(expr AS TYPE)`. The walker finds the **last** `::Type` or
 /// `AS Type` token of each comma-separated chunk; this matches the
 /// PG semantic where `id::int4` casts `id` to `int4`, and the cast
