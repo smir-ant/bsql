@@ -1,8 +1,8 @@
-//! DEF-143 — criterion bench harness for `bsql-pg-proto` hot paths.
+//! Criterion bench harness for `bsql-pg-proto` hot paths.
 //!
 //! # Scope
 //!
-//! Targets the four hot paths identified in deferred.md §24 DEF-143:
+//! Targets the four hot paths on the wire-frame critical path:
 //!
 //! 1. **`parse_header`** — single-frame header parse. Runs once per
 //!    inbound frame; the only constant-work lookup on every byte of
@@ -52,25 +52,21 @@ use criterion::{
 mod common;
 use common::fresh_active_via_trust_handshake;
 
-// DEF-198 + DEF-212 — bench-side extension trait for the witness-guard
-// typestate.
+// Bench-side extension trait for the witness-guard typestate.
 //
-// Pre-DEF-198 benches called `proto.push_command(cmd, wb)` directly,
-// returning OutActions. DEF-198 routed via
-// `proto.as_ready().push_command(cmd, wb)` (Option<ReadyGuard>). DEF-212
-// (Alt Y') changed the typed-push return from `OutActions<'w, 'p>` (800 B)
-// to `Result<(), PushFailure>` (~80 B). The bench helper preserves both
-// guard-acquisition + Result discipline so the bench timing reflects the
-// production caller's cost.
+// Routes through `proto.as_ready().push_command(cmd, wb)` —
+// returning `Option<ReadyGuard>`, then `Result<(), PushFailure>`
+// from the typed push. The helper preserves both guard-acquisition
+// + Result discipline so the bench timing reflects the production
+// caller's cost.
 //
 // Benches always start from a fresh `PgProtocol::new()` (Idle state)
-// — either via `iter_batched`-style setup-per-iter or before-loop
-// hoisting. Post-DEF-211 FAKE-19 (audit 2026-05-04) the
-// `reset_for_bench` shortcut was eliminated; criterion's
-// `iter_batched` is the idiomatic pattern for stateful per-iter
-// setup, so the `None` guard arm is unreachable in correctly-built
-// benches — `panic!` surfaces a fixture bug as a loud bench failure
-// rather than silent wrong-data.
+// via `iter_batched`-style setup-per-iter or before-loop hoisting —
+// the `None` guard arm is unreachable in correctly-built benches,
+// so `panic!` surfaces a fixture bug as a loud bench failure rather
+// than silent wrong-data. A naive `reset_for_bench` cfg(bench) hook
+// would be a tier-3 by-discipline gap — `iter_batched` is the
+// idiomatic stable-Rust pattern for stateful per-iter setup.
 //
 // Cost: one branch on `state.push_class()` per call. On Idle the branch
 // is well-predicted, ~1 ns added to the timed path. Same overhead the
@@ -97,11 +93,12 @@ impl BenchPushOrPanic for PgProtocol {
         let Some(g) = self.as_ready() else {
             panic!("bench fixture: proto must be Idle for push (status = {status:?})");
         };
-        // DEF-160 Z2 (2026-05-11): `push_command` returns `OutActions` to
-        // surface borrowed-SQL chunks. The bench drops the iterator
-        // immediately — production drains it via `writev` to the socket,
-        // which the bench excludes (push path is the measurement target,
-        // not the kernel `writev` syscall). Drop is alloc-neutral.
+        // `push_command` returns `OutActions` to surface
+        // borrowed-SQL chunks. The bench drops the iterator
+        // immediately — production drains it via `writev` to the
+        // socket, which the bench excludes (push path is the
+        // measurement target, not the kernel `writev` syscall).
+        // Drop is alloc-neutral.
         g.push_command(cmd, wb).map(|_actions| ())
     }
 }
@@ -134,7 +131,7 @@ fn data_row_frame(len: u16) -> alloc::vec::Vec<u8> {
     out
 }
 
-// DEF-270: ReplyId::from_raw is now pub(crate). Benches mint via
+// `ReplyId::from_raw` is `pub(crate)`. Benches mint via
 // `proto.next_reply_id::<K>()` directly inside each iteration.
 
 // ---------------------------------------------------------------
@@ -178,14 +175,13 @@ fn bench_ping_round_trip(c: &mut Criterion) {
     let rfq = rfq_frame();
 
     group.bench_function("push_then_feed", |b| {
-        // DEF-246 Phase 2+3+4 (2026-05-16): `iter_batched_ref` is the
-        // correct primitive — Drop on `(PgProtocol, WriteBuf)` falls
-        // OUTSIDE the timed window. Per-iter `setup` is also untimed.
+        // `iter_batched_ref` is the correct primitive — Drop on
+        // `(PgProtocol, WriteBuf)` falls OUTSIDE the timed window.
+        // Per-iter `setup` is also untimed.
         //
-        // Quiet-system floor (cargo bench --warm-up 3 --measurement 5):
-        // ~114-130 ns — matches pre-DEF-246 baseline of 113 ns within
-        // measurement margin. The honest cost of `push + feed_bytes(rfq)`
-        // on a post-handshake `<Active>` proto. No regression.
+        // Quiet-system floor (cargo bench --warm-up 3 --measurement
+        // 5): ~114-130 ns. The honest cost of `push + feed_bytes(rfq)`
+        // on a post-handshake `<Active>` proto.
         //
         // Note on bench-stable.sh: that wrapper adds `taskpolicy -c
         // utility` (lower QoS) + 30s/10s measurement window. On a
@@ -197,7 +193,7 @@ fn bench_ping_round_trip(c: &mut Criterion) {
             || (fresh_active_via_trust_handshake(), WriteBuf::new()),
             |(proto, wb)| {
                 // Push Ping — emits Sync frame bytes into write_buf.
-                // DEF-270: mint reply via the public counter API.
+                // Mint reply via the public counter API.
                 let reply = proto.next_reply_id::<PingKind>();
                 let push_out = proto.bench_push_or_panic(
                     bsql_pg_proto::push_command::Ping { reply },
@@ -241,27 +237,24 @@ fn bench_ping_round_trip(c: &mut Criterion) {
 //
 // Measures the true per-row cost of the `row_stream` fast-path
 // in a hot SELECT loop. Setup (not timed) uses the public
-// [`PgProtocol::feed_inbound`] API (DEF-212 Phase 2 commit
-// 201f86a) to pre-populate `read_buf` with N DataRow frames —
-// raw append, no dispatch. Timed body loops `next_event()` N
-// times, consuming all rows via fast-path.
+// [`PgProtocol::feed_inbound`] API to pre-populate `read_buf`
+// with N DataRow frames — raw append, no dispatch. Timed body
+// loops `next_event()` N times, consuming all rows via fast-path.
 //
 // Throughput reports per-row amortised ns.
 //
 // # Why feed_inbound is the right setup primitive
 //
 // Public `feed_bytes` correctly rejects DataRow in
-// `SimpleQueryStreamingRows` state — that's production
-// behavior ("caller should use iter_rows, not feed_bytes"
-// catch-all arm). Verified 2026-04-24: feeding 100 DataRows
-// after RowDescription via `feed_bytes` lands in
-// Errored(Framing), 0 rows pullable. `feed_inbound` is the
-// dispatch-bypass primitive shipped with DEF-212 Phase 2 for
-// 1c-5 pipelining forward-compat — appends bytes without
-// triggering dispatch classification, exactly what bench setup
-// needs. Pre-DEF-211 FAKE-19 (audit + ship 2026-05-04) the
-// bench used a `bench_append_read_buf` hook that was a strict
-// duplicate of `feed_inbound` — replaced.
+// `SimpleQueryStreamingRows` state — that's production behaviour
+// ("caller should use `iter_rows`, not `feed_bytes`" catch-all
+// arm). Feeding 100 DataRows after RowDescription via `feed_bytes`
+// lands in `Errored(Framing)`, 0 rows pullable. `feed_inbound` is
+// the dispatch-bypass primitive for pipelining forward-compat —
+// appends bytes without triggering dispatch classification,
+// exactly what bench setup needs. A naive `bench_append_read_buf`
+// cfg(bench) hook would be a strict duplicate of `feed_inbound`
+// and a tier-3 by-discipline gap.
 //
 // # Row size vs READ_BUF_CAP
 //
@@ -367,19 +360,14 @@ fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------
-// DEF-248 Sub-A (2026-05-12): the 4 pre-Sub-A per-row bench
-// variants (next_row / next_row_bytes / consume_batch / for_each_row)
-// are DELETED — they exercised API that no longer exists.
-//
-// Replacement: three additional benches pin Sub-A's new scenarios.
-// The `iter_rows_via_col_next` group above is the canonical
-// per-row throughput probe; the three below target
+// The `iter_rows_via_col_next` group above is the canonical per-row
+// throughput probe; the three below target
 //   - multi-column large-row throughput (`iter_10cols_large_5kb_row`),
 //   - partial-frame chunked-body streaming (`iter_jsonb_1mb_streaming`),
 //   - per-event dispatch overhead (`col_next_per_event_cost`).
 // ---------------------------------------------------------------
 
-/// **DEF-248 Sub-A** — 10-column row totalling ~5 KB. Exercises:
+/// 10-column row totalling ~5 KB. Exercises:
 /// - many Got events per row (col_count = 10);
 /// - row body 1 + length-field 4 + col_count 2 + 10 × (4 + 500) =
 ///   5047 B > READ_BUF_CAP, so partial-frame mode activates and
@@ -512,7 +500,7 @@ fn bench_iter_10cols_large_5kb_row(c: &mut Criterion) {
     group.finish();
 }
 
-/// **DEF-248 Sub-A** — 1 MB BYTEA / JSONB-style single-column streaming.
+/// 1 MB BYTEA / JSONB-style single-column streaming.
 /// The headline scenario for partial-frame mode: a single column body
 /// of 1 MiB is streamed as a sequence of `Chunk` events bounded by
 /// READ_BUF_CAP. Pre-Sub-A this tore down the connection with
@@ -642,7 +630,7 @@ fn bench_iter_jsonb_1mb_streaming(c: &mut Criterion) {
     group.finish();
 }
 
-/// **DEF-248 Sub-A** — per-event overhead measurement. 100 small
+/// Per-event overhead measurement. 100 small
 /// rows (single 4-B column each) pre-loaded; each col_next yields
 /// one Got + one EndRow (200 events). Isolates the dispatch-loop
 /// cost from wire setup.
@@ -735,37 +723,37 @@ fn bench_push_ping(c: &mut Criterion) {
     let mut group = c.benchmark_group("push_command");
     group.throughput(Throughput::Elements(1));
 
-    // Original: full-cycle push (allocate proto + wb, push, drop).
-    // Includes zeroize-on-Drop cost from DEF-185 P0-B/P0-C
-    // (WriteBuf zeroize 4 KB + ReadBuf zeroize 4 KB on Drop).
-    // Production parallel: connection lifetime.
+    // Full-cycle push (allocate proto + wb, push, drop). Includes
+    // zeroize-on-Drop cost (`WriteBuf` zeroize 4 KB + `ReadBuf`
+    // zeroize 4 KB on Drop). Production parallel: connection
+    // lifetime.
     group.bench_function("ping", |b| {
-        // DEF-246 Phase 2+3+4 (2026-05-16): `iter_batched_ref` — see
-        // `ping_round_trip/push_then_feed` above for the rationale.
+        // `iter_batched_ref` — see `ping_round_trip/push_then_feed`
+        // above for the rationale.
         //
-        // Quiet-system floor (cargo bench --warm-up 3 --measurement 5):
-        // ~24-30 ns. Pre-DEF-246 baseline was ~10 ns; the +14-20 ns
-        // delta is bench-harness shape, NOT protocol cost — `black_box`
-        // on `Result<OutActions<'w,'r>, PushFailure>` (~88 B return
-        // slot) materialises ~80 `ldrh` instructions inside the timed
-        // window. asm-verified at offsets after the `bl
-        // bench_push_or_panic` call. Production callers iterate the
-        // OutActions once via `for action in out { writev(...) }` —
-        // they do not pay the `black_box` reads.
+        // Quiet-system floor (cargo bench --warm-up 3
+        // --measurement 5): ~24-30 ns. The number is bench-harness
+        // shape, NOT pure protocol cost — `black_box` on
+        // `Result<OutActions<'w,'r>, PushFailure>` (~88 B return
+        // slot) materialises ~80 `ldrh` instructions inside the
+        // timed window (asm-verified at offsets after the
+        // `bl bench_push_or_panic` call). Production callers iterate
+        // the `OutActions` once via `for action in out { writev(...) }`
+        // — they do not pay the `black_box` reads.
         //
-        // The "pure push" cost on a post-handshake proto is ~10-15 ns,
-        // recoverable from the asm decomposition (~5 ns write_buf
-        // clear + ~3 ns residue clear + ~5 ns state transition +
-        // ~2 ns single-pass materialise). Bench number ≈ push cost +
-        // ~10 ns harness overhead.
+        // The "pure push" cost on a post-handshake proto is
+        // ~10-15 ns, recoverable from the asm decomposition (~5 ns
+        // write_buf clear + ~3 ns residue clear + ~5 ns state
+        // transition + ~2 ns single-pass materialise). Bench number
+        // ≈ push cost + ~10 ns harness overhead.
         b.iter_batched_ref(
             || (fresh_active_via_trust_handshake(), WriteBuf::new()),
             |(proto, wb)| {
-                // DEF-269 v2 (T): use the per-command `Ping` struct directly.
-                // 16 B by-value vs 2176 B for the legacy `bsql_pg_proto::push_command::Ping`
-                // (sized to Parse). This is the bench probe for T's claimed
-                // -18..-22% gain.
-                // DEF-270: mint via the public counter API.
+                // Use the per-command `Ping` struct directly —
+                // 16 B by-value vs a naive `PgCommand`-enum shape
+                // (sized to `Parse`) that would force a 2176 B
+                // value on each push. Mint via the public counter
+                // API.
                 let reply = proto.next_reply_id::<PingKind>();
                 let out = proto.bench_push_or_panic(
                     bsql_pg_proto::push_command::Ping::new(reply),
@@ -777,22 +765,19 @@ fn bench_push_ping(c: &mut Criterion) {
         );
     });
 
-    // DEF-194 follow-up (2026-04-27): `ping_amortised` sub-bench —
-    // DROPPED 2026-05-05 along with DEF-211 FAKE-19's bench-hooks
-    // elimination. Pre-FAKE-19 the sub-bench used a `reset_for_bench`
-    // hook to reuse the same `PgProtocol` across criterion iterations
-    // (cache-warm, ~10 ns timing — production-relevant since real
-    // connections reuse proto across thousands of queries).
-    //
-    // Post-FAKE-19 the only safe-Rust replacement (criterion's
-    // `iter_batched_ref` with fresh proto per iter) reports a ~47 ns
-    // floor: ~30 ns criterion batch-management overhead + ~17 ns
-    // first-touch cache cost on each fresh proto. That number
+    // A naive `ping_amortised` sub-bench using a `reset_for_bench`
+    // hook to reuse the same `PgProtocol` across criterion
+    // iterations (cache-warm, ~10 ns timing — production-relevant
+    // since real connections reuse proto across thousands of
+    // queries) is out: the only safe-Rust replacement (criterion's
+    // `iter_batched_ref` with fresh proto per iter) reports a
+    // ~47 ns floor (~30 ns criterion batch-management overhead +
+    // ~17 ns first-touch cache cost on each fresh proto), which
     // **misleads readers** about the actual push cost — production
     // push remains ~10 ns (cache-warm).
     //
-    // Decision: drop `ping_amortised` rather than ship a misleading
-    // metric. Coverage gap closed by:
+    // Decision: no `ping_amortised` rather than ship a misleading
+    // metric. Coverage closed by:
     //   - `ping_round_trip/push_then_feed` (~113 ns full cycle —
     //     push + feed_bytes(rfq) — fresh proto each iter, honest
     //     cold-path cycle measurement). Regression on push WILL
@@ -801,34 +786,29 @@ fn bench_push_ping(c: &mut Criterion) {
     //     methodology, cold-cycle push-only number. Honest metric.
     //
     // If a future audit demands precise sub-ns per-push measurement
-    // for regression hunt, options: (a) hand-rolled black_box loop
-    // with cargo asm verification, (b) custom criterion harness,
-    // (c) re-introduce a tier-1 reset mechanism (non-feature-gated
-    // public API such as `proto.reset()` with proper scrub semantics
-    // — would be a real production API, not bench-only).
+    // for regression hunt, options: (a) hand-rolled `black_box` loop
+    // with `cargo asm` verification, (b) custom criterion harness,
+    // (c) a tier-1 reset mechanism (non-feature-gated public API
+    // such as `proto.reset()` with proper scrub semantics — would
+    // be a real production API, not bench-only).
 
     group.finish();
 }
 
 // ---------------------------------------------------------------
-// DEF-197: per-column decode hot path.
+// Per-column decode hot path.
 // ---------------------------------------------------------------
 //
-// Closes the largest measurement blind spot in the crate: the
-// per-column decode cost on row consumption. Pre-DEF-197 the bench
-// suite measured frame parse, dispatch, RowStream emission, and
-// `push_command` paths — but ZERO benches covered what happens
-// AFTER `RowStream::next_row_bytes` hands raw row bytes to the
-// caller: `DataRowRef::parse` (column-count header parse),
-// `ColumnsIter` per-column length-prefix walk, and
+// Covers what happens AFTER `RowStream::next_row_bytes` hands raw
+// row bytes to the caller: `DataRowRef::parse` (column-count header
+// parse), `ColumnsIter` per-column length-prefix walk, and
 // `FromPgText::from_pg_text` typed decoding.
 //
-// User context: real per-row latency on row-bearing responses is
-// dominated by per-column work (parse + iterate + decode), not
-// frame dispatch. DEF-197 lands the measurement infrastructure so
-// subsequent perf claims on decoder optimisations (DEF-200 LUT
-// dispatch, DEF-202 `simdutf8` text validation, DEF-203 niche
-// tightening) are evidence-backed per CREDO §4.12.
+// Real per-row latency on row-bearing responses is dominated by
+// per-column work (parse + iterate + decode), not frame dispatch.
+// The measurement infrastructure below makes perf claims on
+// decoder optimisations (LUT dispatch, `simdutf8` text validation,
+// niche tightening) evidence-backed per CREDO §4.12.
 //
 // # Bench shape
 //
@@ -864,7 +844,7 @@ fn data_row_body_int4(n_cols: u16, value: i32) -> alloc::vec::Vec<u8> {
     body
 }
 
-/// DEF-251 (audit 2026-05-08): build a DataRow body with one column
+/// Build a DataRow body with one column
 /// per supplied i32 value (text-format ASCII digits, no NUL).
 ///
 /// Used by the `iter_5cols_decode_i32_common_values` bench to feed
@@ -1021,7 +1001,7 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
         });
     });
 
-    // DEF-251 (audit 2026-05-08): common-value cache hit measurement.
+    // Common-value cache hit measurement.
     // The 5 columns are populated with {0, 1, -1, 0, 1} — the three
     // literals the fast-path branches exist for. On hit, the digit
     // loop is bypassed entirely; the bench measures the byte-equality
@@ -1029,7 +1009,7 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
     //
     // Compare with `iter_5cols_decode_i32` (above, 8-digit literal
     // 42_000_000) for the cache-miss baseline. Hit-vs-miss delta
-    // should be 1-2 ns/col post-DEF-251.
+    // should be 1-2 ns/col with the common-value cache active.
     let body_common = data_row_body_int4_mixed(&[0, 1, -1, 0, 1]);
     group.bench_function("iter_5cols_decode_i32_common_values", |b| {
         b.iter(|| {
@@ -1052,7 +1032,7 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
     group.finish();
 }
 
-/// DEF-250 Phase B (2026-05-08): caller-routed SWAR fast-path
+/// Caller-routed SWAR fast-path
 /// for short unsigned integers (ASCII-decimal, 0..=9999).
 ///
 /// `parse_short_uint_swar` is exposed as an opt-in helper at the
@@ -1061,7 +1041,7 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
 /// embed the SWAR inside `from_pg_text` regressed adjacent benches
 /// (Attempt 1: text +4-7%, 8-digit +5.2% from icache pressure;
 /// Attempt 2: `iter_5cols_decode_i32_common_values` +31% from
-/// `SimplifyCFG` merging dispatch with the DEF-251 common-value
+/// `SimplifyCFG` merging dispatch with the common-value
 /// match — forensics at `/tmp/asm-attempt{1,2}-i32.s`).
 ///
 /// This bench measures the realistic call shape: the caller knows
@@ -1073,7 +1053,7 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
 ///
 /// Compare with `iter_5cols_decode_i32` (8-digit literal
 /// `42_000_000`, generic decode) and `iter_5cols_decode_i32_common_values`
-/// (DEF-251 fast-path on `0`/`1`/`-1`). The SWAR helper is
+/// (common-value fast-path on `0`/`1`/`-1`). The SWAR helper is
 /// orthogonal to both — caller-routed dispatch decoupled from the
 /// `from_pg_text` body.
 fn bench_iter_columns_5x_int4_swar_short(c: &mut Criterion) {
@@ -1118,10 +1098,10 @@ fn bench_iter_columns_5x_int4_swar_short(c: &mut Criterion) {
     group.finish();
 }
 
-/// DEF-266 (β SWAR extension, 2026-05-11): caller-routed fast-path
+/// β SWAR extension: caller-routed fast-path
 /// for unsigned i64 text decoding on 5-19 digit values.
 ///
-/// `parse_long_uint_swar` extends the DEF-250 Phase B precedent to
+/// `parse_long_uint_swar` extends the SWAR-fast-path precedent to
 /// the i64-representable range. Bench shape: 5 columns of an 8-digit
 /// literal (`42_000_000`) — the same body as
 /// `iter_5cols_decode_i32` for direct comparison. The 8-digit shape
@@ -1166,7 +1146,7 @@ fn bench_iter_columns_5x_int4_swar_long(c: &mut Criterion) {
     group.finish();
 }
 
-/// DEF-266 (β SWAR extension, 2026-05-11): micro-bench for the
+/// β SWAR extension: micro-bench for the
 /// all-ASCII fast-path UTF-8 validator.
 ///
 /// `validate_utf8_swar` returns `Some(())` on pure ASCII input
@@ -1220,7 +1200,7 @@ fn bench_validate_utf8_swar(c: &mut Criterion) {
     group.finish();
 }
 
-/// DEF-266 (β SWAR extension, 2026-05-11): micro-bench for the
+/// β SWAR extension: micro-bench for the
 /// PG boolean text-literal cache-hit parser.
 ///
 /// `parse_pg_bool_swar` recognises the four PG-wire-legal forms
@@ -1279,7 +1259,7 @@ fn bench_parse_pg_bool_swar(c: &mut Criterion) {
 /// 1. **Short ASCII** (`alice@example.com`, 17 B) — typical OLTP
 ///    columns: usernames, emails, short identifiers.
 /// 2. **Long ASCII** (~200 B) — descriptions, log lines, SQL queries.
-///    SIMD UTF-8 validators (DEF-202) win most clearly here.
+///    SIMD UTF-8 validators win most clearly here.
 /// 3. **Multi-byte UTF-8** (Cyrillic, ~80 B) — non-ASCII real text.
 ///    Forces the validator off the ASCII fast-path; SIMD vs scalar
 ///    delta is largest on this shape.
@@ -1367,7 +1347,7 @@ fn bench_iter_columns_5x_text_decode(c: &mut Criterion) {
 }
 
 /// Bench: alternating NULL / non-NULL columns. Exercises the
-/// `col_len == -1` shortcut path in `ColumnsIter::next` (DEF-184
+/// `col_len == -1` shortcut path in `ColumnsIter::next` (
 /// A5/B10 sign-path collapse).
 fn bench_iter_columns_with_nulls(c: &mut Criterion) {
     use bsql_pg_proto::decode::{DataRowRef, FromPgText};
@@ -1409,7 +1389,7 @@ fn bench_iter_columns_with_nulls(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------
-// DEF-244 (2026-05-13) — `prepared!` macro path benches.
+// `prepared!` macro path benches.
 // ---------------------------------------------------------------
 //
 // Comparison anchor: `push_command/ping` and the
@@ -1434,7 +1414,7 @@ const BENCH_PREPARED_Q: PreparedQuery<(i32,), (i32, &'static str)> = prepared!(
     "SELECT id::int4, name::text FROM users WHERE id = $1::int4"
 );
 
-/// DEF-244 (2026-05-14) Gap 2 — DML-shape sister to
+/// DML-shape sister to
 /// [`BENCH_PREPARED_Q`] for the paired bench. One i32 param, zero
 /// result rows (DELETE with WHERE), fetch-all (vacuous since the
 /// statement returns 0 rows). Same wire-frame shape as the paired
@@ -1468,7 +1448,7 @@ fn bench_prepared_query_push(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
-    // DEF-244 Gap 2 (2026-05-14): DML-shape variant — matches the
+    // DML-shape variant — matches the
     // paired `push_bind_execute_one_int_param/bind_execute` bench's
     // shape exactly (1 i32 param, no result rows, no RowDesc parking).
     // The delta between this sub-bench and the paired bench is the
@@ -1499,7 +1479,7 @@ fn bench_prepared_query_push(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------
-// DEF-244 (2026-05-14) Gap 2 — paired bench for the «-25 ns»
+// Paired bench for the «-25 ns»
 // verification claim.
 // ---------------------------------------------------------------
 //
@@ -1514,7 +1494,7 @@ fn bench_prepared_query_push(c: &mut Criterion) {
 // Delta interpretation:
 //   prepared `execute_prepared` time − this bench's time
 //   = the saving per push. Reported as the verification of
-//     deferred.md DEF-244's `-25 ns` claim.
+//     prepared-macro path -25 ns claim.
 //
 // Notes on parity precision:
 //   - Both benches push 1 i32 param. The PAIRED variant uses
@@ -1564,10 +1544,10 @@ fn make_portal_name() -> PortalName {
 fn bench_push_bind_execute_one_int_param(c: &mut Criterion) {
     let mut group = c.benchmark_group("push_bind_execute_one_int_param");
     group.throughput(Throughput::Elements(1));
-    // DEF-244 Gap 2 (2026-05-14): pair anchor for
+    // Pair anchor for
     // `prepared_query_push/execute_prepared_dml`. Same exact shape —
     // 1 i32 param, no RowDesc (DML), fetch-all. The two benches form
-    // the verification couple for deferred.md DEF-244's "-25 ns per
+    // the verification couple for the prepared-macro -25 ns per
     // push" claim: prepared time minus this time = per-push saving.
     group.bench_function("bind_execute", |b| {
         // Build the names once; criterion's iter_batched_ref gives
@@ -1699,7 +1679,7 @@ fn bench_prepared_iter_rows_typed(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------
-// DEF-278 Bundle D' (2026-05-18) — with_cancel_request closure extract
+// `with_cancel_request` closure-extract bench
 //
 // Measures the cost of `<ActivePhase>::with_cancel_request(...)` on
 // a post-handshake protocol. The accessor path is:
@@ -1757,32 +1737,32 @@ criterion_group!(
     bench_parse_header,
     bench_ping_round_trip,
     bench_iter_rows_per_row_throughput,
-    // DEF-248 Sub-A (2026-05-12): new bench surface.
+    // Pull-API per-row throughput bench surface.
     bench_iter_10cols_large_5kb_row,
     bench_iter_jsonb_1mb_streaming,
     bench_col_next_per_event_cost,
     bench_push_ping,
-    // DEF-197: column decode measurement infra.
+    // Column decode measurement infra.
     bench_data_row_parse,
     bench_iter_columns_raw,
     bench_iter_columns_5x_int4_decode,
-    // DEF-250 Phase B: caller-routed SWAR fast-path for 4-digit
+    // Caller-routed SWAR fast-path for 4-digit
     // unsigned integers; opt-in helper, decoupled from `from_pg_text`.
     bench_iter_columns_5x_int4_swar_short,
     bench_iter_columns_5x_text_decode,
     bench_iter_columns_with_nulls,
-    // DEF-266 β SWAR extension: three additional opt-in helpers.
+    // β SWAR extension: three additional opt-in helpers.
     bench_iter_columns_5x_int4_swar_long,
     bench_validate_utf8_swar,
     bench_parse_pg_bool_swar,
-    // DEF-244 (2026-05-13): prepared! macro path.
+    // `prepared!` macro path.
     bench_prepared_query_push,
     bench_prepared_iter_rows_typed,
-    // DEF-244 Gap 2 (2026-05-14): paired bench for «-25 ns» claim
+    // Paired bench for «-25 ns» claim
     // verification — runtime BindExecute path, same shape as the
     // prepared DML variant.
     bench_push_bind_execute_one_int_param,
-    // DEF-278 Bundle D / D' (2026-05-17 / 2026-05-18):
+    //
     // `with_cancel_request` closure-scoped path.
     bench_cancel_credentials_extract,
 );

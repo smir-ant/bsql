@@ -236,7 +236,7 @@ fn build_rowdesc() -> alloc::vec::Vec<u8> {
     out
 }
 
-// DEF-270: ReplyId::from_raw is now pub(crate). Benches mint via
+// `ReplyId::from_raw` is `pub(crate)`. Benches mint via
 // `proto.next_reply_id::<K>()` directly inside each scenario.
 
 fn bench_push_or_panic<C: bsql_pg_proto::push_command::PushCommand>(
@@ -248,11 +248,11 @@ fn bench_push_or_panic<C: bsql_pg_proto::push_command::PushCommand>(
     let Some(g) = proto.as_ready() else {
         panic!("alloc bench fixture: proto must be Idle for push (status = {status:?})");
     };
-    // DEF-160 Z2 (2026-05-11): `push_command` returns `OutActions` to
-    // surface borrowed-SQL chunks. The bench drops the iterator
-    // immediately — production drains it via `writev` to the socket,
-    // which the bench excludes (push path is the measurement target,
-    // not the kernel `writev` syscall). Drop is alloc-neutral.
+    // `push_command` returns `OutActions` to surface borrowed-SQL
+    // chunks. The bench drops the iterator immediately — production
+    // drains it via `writev` to the socket, which the bench excludes
+    // (push path is the measurement target, not the kernel `writev`
+    // syscall). Drop is alloc-neutral.
     g.push_command(cmd, wb).map(|_actions| ())
 }
 
@@ -291,9 +291,8 @@ fn scenario_ping_round_trip() {
     let rfq = rfq_frame();
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
-    // DEF-270: mint reply via the public counter API. Same cost as
-    // the prior `reply_id_ping(1)` helper (single integer counter
-    // bump, no allocation).
+    // Mint reply via the public counter API — single integer
+    // counter bump, no allocation.
     let reply = proto.next_reply_id::<PingKind>();
     measure("ping_round_trip", || {
         let push_out = bench_push_or_panic(
@@ -331,7 +330,7 @@ fn scenario_iter_rows_100() {
     let single_row = data_row_frame(16);
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
-    // DEF-270: mint via the public counter API.
+    // Mint via the public counter API.
     let reply = proto.next_reply_id::<QueryKind>();
     let push_out = bench_push_or_panic(
         &mut proto,
@@ -379,7 +378,7 @@ fn scenario_advance_one_frame() {
     let rfq = rfq_frame();
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
-    // DEF-270: mint via the public counter API.
+    // Mint via the public counter API.
     let reply = proto.next_reply_id::<PingKind>();
     let push_out = bench_push_or_panic(
         &mut proto,

@@ -1,10 +1,9 @@
-//! DEF-246 Phase 2/3 (2026-05-16) — bench-side helper for driving a
-//! fresh `<DisconnectedPhase>` through a synthetic Trust handshake to
-//! `<ActivePhase>`. Mirror of `tests/common/mod.rs`'s
-//! `fresh_active_via_trust_handshake` — body duplicated by design
-//! (~140 LoC) so the bench crate has zero coupling to integration-test
-//! code beyond the public API. The dispatch is explicit: no
-//! `src/test_support/` cfg(test) bridge.
+//! Bench-side helper for driving a fresh `<DisconnectedPhase>`
+//! through a synthetic Trust handshake to `<ActivePhase>`. Mirror
+//! of `tests/common/mod.rs`'s `fresh_active_via_trust_handshake` —
+//! body duplicated by design (~140 LoC) so the bench crate has zero
+//! coupling to integration-test code beyond the public API. The
+//! dispatch is explicit: no `src/test_support/` cfg(test) bridge.
 //!
 //! # Why duplicated, not shared
 //!
@@ -62,9 +61,9 @@ fn rfq_frame(tx_status: u8) -> [u8; 6] {
     [b'Z', 0, 0, 0, 5, tx_status]
 }
 
-/// DEF-246 Phase 2/3 (2026-05-16) — drive a fresh `PgProtocol` through
-/// a synthetic Trust-auth handshake to `<ActivePhase>`. Uses ONLY the
-/// public API (mirror of `tests/common/mod.rs::fresh_active_via_trust_handshake`).
+/// Drive a fresh `PgProtocol` through a synthetic Trust-auth
+/// handshake to `<ActivePhase>`. Uses ONLY the public API (mirror
+/// of `tests/common/mod.rs::fresh_active_via_trust_handshake`).
 ///
 /// **Panics** on any unexpected handshake failure — the caller is in a
 /// happy-path bench fixture.
