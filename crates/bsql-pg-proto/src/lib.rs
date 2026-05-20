@@ -597,7 +597,13 @@ const _: () = assert!(
     core::mem::size_of::<action::Action<'static, 'static>>() == 88,
     "Action<'_, '_> exact size — 88 B. ProtocolError 72 B, so Action \
      bounded by max(Reply 72, FailReply 72) + discriminant + padding \
-     = 88 B. Exact pin catches any variant growth.",
+     = 88 B. Exact pin catches any variant growth. \
+     \
+     **NICHE OPTIMIZATION IS LOAD-BEARING** (DEF-260 MEASURED-REJECTED \
+     2026-05-21): a future `#[repr(u8)]` attempt would disable niche \
+     packing on `id: NonZeroU64` and grow Action 88 → 96 B (+8 B), \
+     cascading to OutActions 800 → 872 B (+72 B). Default Rust repr is \
+     provably better here — keep it.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::Reply<'static>>() >= 72

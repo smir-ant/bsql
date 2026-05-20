@@ -62,11 +62,13 @@ to git history. Keep this file a live work queue, NOT a diary.
 
 | DEF | Item | Status |
 |-----|------|--------|
-| DEF-260 | Custom `Action` enum layout (`#[repr(u8, C)]` hand-tagged union; current Rust default may already be optimal) | EXPLORATORY |
-| DEF-261 | Branchless DataRow column-length-prefix decode (skip per-col-len validity check if invariants held) | EXPLORATORY |
-| DEF-262 | `core::hint::black_box` as code-motion barrier in production hot paths (risk: may pessimise; careful measure) | EXPLORATORY |
-| DEF-263 | `#[inline(never)]` stack carve-out for hot fns with large stack frames (separates stack-cold from stack-hot) | EXPLORATORY |
-| DEF-264 | GAT-driven `FromRow` projector chain (stable Rust 1.65+ GATs; per-column zero-copy projections) | EXPLORATORY |
+| DEF-263 | `#[inline(never)]` stack carve-out for hot fns with large stack frames (separates stack-cold from stack-hot) | EXPLORATORY (no concrete target identified — reopen when a hot fn's stack frame is flagged via `cargo asm` / perf record) |
+
+**Closed exploratory items** (2026-05-21 batch — see §B for the rejected/verified verdicts and §D for one-line index):
+- DEF-260 MEASURED-REJECTED (niche optimization on `NonZeroU64::id` is load-bearing; `#[repr(u8)]` regresses Action 88 → 96 B / OutActions 800 → 872 B).
+- DEF-261 REJECTED BY-CONSTRUCTION (`#![forbid(unsafe_code)]` blocks the «skip bounds-check» path; current `read_col_len` slice-pattern `[a, b, c, d, ..]` is the canonical safe-Rust branchless form).
+- DEF-262 REJECTED BY-CONSTRUCTION (`core::hint::black_box` is a documented code-motion barrier for benchmark harnesses; placing it in production hot paths actively prevents LLVM optimizations — the entry's own «risk: may pessimise» note is determinative).
+- DEF-264 SUBSUMED by DEF-247-redesigned (queue Pos 10) — both converge on «higher-level typed-row projection on top of `col_next()`»; merging avoids parallel tracking.
 | DEF-275 | **[CLOSED 2026-05-15 as not-reproducible]** `column_decode/iter_5cols_decode_text_long_ascii` +8.3% observed during DEF-244 closure bench-stable compare under load 1.32-2.47 was investigated during DEF-276 rebaseline: clean re-measurement against `pre-def276-clean` baseline (load 1.89→2.12, full clean-rebaseline methodology) showed **−0.55% within noise threshold** (p=0.07, change not statistically significant). The original +8.3% was transient measurement noise / criterion sample artefact, NOT a real LLVM codegen drift from DEF-258. Lesson: bench-stable's noise floor on text-decode benches can spike to ±10% under marginally-loaded conditions even with `--measurement-time 30` — sub-30 ns timings are particularly susceptible. No further action needed. | CLOSED |
 | DEF-283 | **Full `BoundedIndex<MAX>` / `BoundedRange<MAX>` typed-index sweep** (audit_accepted #101 remainder) — the audit's «absolute tier-1 closure of the entire `unwrap_or(dead_fallback)` class» via dedicated witness types. Phase 1 SHIPPED (`5d3af48` + `33d38e1` + `abc791e`): 8 production sites migrated via `absorb()` signature change + `narrow` helper module (collapses N call-site dead-arms into one audit point per conversion kind). Phase 2 (deferred): introduce dedicated `BoundedIndex<MAX>` / `BoundedRange<MAX>` witness types and migrate ALL remaining `unwrap_or` patterns (including the 6 documented-tier-1 NLL-constrained two-phase shields in `row_stream.rs` / `buf.rs`). Audit estimate: 6-12 weeks of full-sweep work (major-version refactor scope). Gating: stable Rust dependent-types or const-generic-expressions for the proof carrier (currently approximated via `BoundedU8/16<MAX>`); revisit when `feature(generic_const_exprs)` stabilises. | DEFER (multi-session) |
 | DEF-284 | **Architectural-mechanisms maximization audit** (2026-05-20) — review of breakthrough mechanisms used vs not used. **MAXED in the crate**: RAII (`Sensitive<T>` ZeroizeOnDrop, `Zeroizing<T>` stack-guards, `WriteBuf`/`ReadBuf` zero-on-clear, `RowStream::Drop` auto-install-Errored, `ScopedTestNonce` RAII guards), sans-IO (entire `feed_bytes(bytes, wb) -> OutActions` shape), HRTB lifetimes (`with_cancel_request(\|bytes, pid\| ...) -> R`), GAT (`RowDecode::Row<'a>`), const-generics (`BoundedU8/16<MAX>`, `FixedStr<N, Tag, LenT>`, `heapless::Vec<T, N>`), sealed traits (`Pristine`, `RowDecode`, `ParamsWriter`, `ReplyKind`, `BoundedLen<N>`, `ValidUtf8`), token-gated mutations (`RowDescSlotCell`, `PartialAssemblyCell`, `BackendKey`, `SessionParams`), niche-packing (`Option<NonZeroU8/16/64>`, `Sensitive<i32>` over `Zeroize`), phantom-data witness (`RowStream::PhantomData<*const ()>` for `!Send`). **Not used and WHY**: `arrayvec`/`smallvec`/`tinyvec` (heapless::Vec covers, no extra dep); `dashmap`/`papaya` (n/a — sans-IO state machine has `&mut self` access only, `!Sync` by witness); `zerovec`/`zerocopy` (require `unsafe`, banned); `bitcode`/`postcard` (n/a — we implement PG wire, not a serialization format); `Pin<&mut T>` (n/a — no self-referential types); `async`/coroutines (explicitly rejected per sans-IO architecture); generative brands HRTB-threaded (rejected per `action.rs` analysis — brand's deliverable was infallible `apply` but `apply` still returns `Option<&[u8]>` for the post-clear case). | REFERENCE (documents the audit conclusion) |
@@ -662,6 +664,68 @@ proposals into factual data instead of speculation.
   case. The §A row was downgraded to "REJECTED — see §B" and
   the priority-order section updated.
 
+- **DEF-261 — Branchless DataRow column-length-prefix decode**
+  REJECTED 2026-05-21 by-construction. Original framing proposed
+  «skip per-col-len validity check if invariants held». The
+  current `RowStream::read_col_len` (row_stream.rs:1413) uses a
+  slice-pattern match `[a, b, c, d, ..] => Ok(i32::from_be_bytes([*a, *b, *c, *d]))`
+  which LLVM compiles to a single bounds-check + 4-byte load —
+  this IS the canonical branchless form in safe Rust.
+
+  The only path to «truly branchless» is an `unsafe` pointer
+  dereference:
+  ```rust
+  unsafe {
+      let ptr = unread.as_ptr().add(cursor);
+      let bytes = *(ptr as *const [u8; 4]);
+      Ok(i32::from_be_bytes(bytes))
+  }
+  ```
+  This is forbidden by the crate-wide `#![forbid(unsafe_code)]`
+  pragma — there is no opt-out short of a design discussion to
+  introduce a permitted-unsafe boundary, which would require a
+  separate DEF entry with explicit principal sign-off.
+
+  **Verdict**: REJECTED until a structural change in the
+  unsafe-policy lands. Reopen only if (a) the project's
+  forbid-unsafe policy changes (will not happen without major
+  architectural review), OR (b) stable Rust gains a safe
+  `assume_inbounds` intrinsic that lifts the bounds-check
+  without `unsafe`.
+
+  No code change. The current `read_col_len` is the canonical
+  shape.
+
+- **DEF-262 — `core::hint::black_box` in production hot paths**
+  REJECTED 2026-05-21 by-construction. Original framing:
+  «as code-motion barrier in production hot paths (risk: may
+  pessimise; careful measure)». The premise is structurally
+  self-defeating.
+
+  `core::hint::black_box(x)` is documented (rustdoc) as: «An
+  identity function that hints to the compiler to be maximally
+  pessimistic about what `black_box` could do.» Its intended
+  use is to **prevent LLVM from optimizing benchmark scaffolding
+  away** — taking a value into and out of `black_box` forces
+  LLVM to assume the value is observed and cannot be DCE'd.
+
+  Using `black_box` in production = actively preventing the
+  optimizer from doing its job. The DEF entry's own «risk: may
+  pessimise» note is exactly the by-construction outcome — there
+  is no shape of «production hot-path use» that would deliver
+  Pareto-better evidence, because the function's defined behaviour
+  IS «inhibit optimization on the value».
+
+  **Verdict**: REJECTED by-construction. Reopen ONLY if a
+  specific production code path is identified where LLVM's
+  default optimization is provably harmful AND `black_box` is
+  the cheapest safe inhibitor. Such a discovery would itself be
+  the «evidence» the DEF asked for; until then, no measurement
+  is warranted because the documented semantics determine the
+  outcome.
+
+  No code change.
+
 | DEF / Audit ID | Item | Disposition | Commit |
 |----------------|------|-------------|--------|
 | **A7** | Tag byte LUT via `InboundTagClass` enum + `classify` fn | **MEASURED REGRESSION** — all 4 bench groups regressed (+2.6% to +8.2%, p<0.05). LLVM's sparse-byte switch beats dense-enum form; classify step adds indirection not foldable. Hypothesis "dense discriminant jump table wins" falsified on modern LLVM. | `1a762ca` (2026-04-24) |
@@ -671,10 +735,7 @@ proposals into factual data instead of speculation.
 | **C5** | Bitpacked `StateErrorKind` | Factually already done via DEF-142 — StateErrorKind pinned at 1 B exact; further bit-packing has no consumer. | Closed 2026-04-24 |
 | **B19** | `ParamOids::EMPTY` all-zeros Eq check | False positive — current doc-safe, fresh-empty matches populated-empty correctly. | Audit #2 |
 | **B14** | HList `ParamsWriter` | Stable-Rust form requires `FORMATS`/`OIDS` tier-1 → tier-3 OID regression. Blocked on `generic_const_exprs` stabilisation (see §C). Reopen: measure binary delta via `cargo asm` first. | DEF-185 |
-
----
-
-## §C. Rust-Unstable Blockers
+| **DEF-260** | `#[repr(u8)]` (or `#[repr(u8, C)]`) on `Action<'w, 'r>` enum | **MEASURED REGRESSION.** Probed sizes via temporary `#[repr(u8)]` attribute on `pub enum Action` (action.rs:757): `Action 88 → 96 B (+8 B)` and `OutActions 800 → 872 B (+72 B)`. Default Rust repr uses niche optimization on the `id: NonZeroU64` field shared between `DeliverReply` and `FailReply` variants; `#[repr(u8)]` disables niche optimization and forces a separate u8 discriminant + alignment padding. Audit's «may already be optimal» note (DEF-260 entry) confirmed — default is provably better, by-construction. Annotation in `lib.rs` Action size pin docstring documents the «KEEP DEFAULT REPR» rule against future re-attempts. | reverted before commit 2026-05-21 (no commit since probe was discarded) |
 
 Features we're working around because they're not yet stable.
 Revisit at each MSRV bump. Single grep-point replaces per-site
@@ -819,6 +880,7 @@ Full detail in git log; this is just a navigation aid.
 - **DEF-223 (wire-bytes phase)**: Terminate ('X') frontend graceful-close primitive. `wire::TAG_TERMINATE = OutboundTag(b'X')` + `wire::TERMINATE_WIRE_BYTES: [u8;5] = [b'X', 0, 0, 0, 4]` (PG §55.7 frame). Tier-1 closure: 6 `const _: () = assert!(...)` drift-pins (length + tag literal + length-field bytes + `assert_all_distinct!` outbound list + per-tag drift-pin block in wire.rs). Top-level re-export `bsql_pg_proto::TERMINATE_WIRE_BYTES` for driver ergonomics. `tests/terminate_wire_spec.rs` 3 runtime tests + 3 const-asserts pin the public-API visibility (top-level re-export equals module path, distinct from Sync) from a downstream crate's POV — internal drift-pins cannot catch a `pub` → `pub(crate)` regression of the re-export, this file does. Mirrors the SYNC_WIRE_BYTES pattern (5-byte parameter-free outbound frame) — `Flush` is a sibling candidate for the same treatment in a future audit. **State-machine integration pending Phase 1e** (`Action::Terminate`, `ProtoState::Closed` variant, `ConnectionStatus` reporting); drivers can write the bytes directly today on graceful close. SHIPPED 2026-05-05.
 - **DEF-236**: `#[inline]` audit on protocol-hot-path classifier/materialise pair. ASM-driven (revert-vs-inlined `.s` diff): (a) `allows_unsolicited_param_status` + `allows_unsolicited_notice_response` (tiny one-liners) — LLVM already transparently inlines without hint; `#[inline]` applied for explicit intent + future-heuristic-shift pinning. (b) `materialise_push` (single call site `push_command_internal`) — LLVM takes the hint, standalone symbol vanishes in inlined ASM; `#[inline]` applied (codegen evidence shows real fold-in). (c) `materialise` (4 call sites in `feed_bytes_impl` arms) — LLVM rejects the hint (`bl` to standalone symbol persists at all 4 sites; body too large for net code bloat at 4 sites); NO `#[inline]` annotation, comment-only documents the audit finding so future contributors don't re-attempt. Bench measurement (load avg 4.0, 138% CPU) inconclusive — sign flipped across 3 runs on identical code state, pure noise. Conclusion stands on **codegen evidence** (LLVM's accept/reject decision), not bench: explicit annotation where LLVM accepts, comment where LLVM rejects, no decoration anywhere. Reopen path: PGO data, or quiet-bench environment showing reproducible win. SHIPPED 2026-05-05.
 - **DEF-207**: Wider-accumulator + length-bound + single-end-cast variant of `parse_pg_int_signed!` shipped as `parse_pg_int_signed_widened!($bytes, $result, $acc, $max_digits)`. Per-digit branch budget collapses 3 → 1 (digit-validation only); 10-digit i32 path: 30 → 12 branches total. Used by `i16` (i32 acc, 5-digit cap — i16::MAX = 32767 = 5 digits) and `i32` (i64 acc, 10-digit cap — i32::MAX = 2_147_483_647 = 10 digits). `i64` retained on original checked-arithmetic `parse_pg_int_signed!` path because i128 acc compiles to multi-instruction sequences on 64-bit native targets, losing the speed gain. **Bench evidence (column_decode/iter_5cols_decode_i32, criterion baseline before-def207 → compare):** 47.46 ns → 32.89 ns median, **−35.5% (CI [−42.4%, −30.6%], p=0.00)**, throughput +55% (102 → 152 Melem/s). Beats deferred.md's original "~30% speculative" estimate. Bench-cpu-time wrap during compare reported ratio 0.934 (WARN — minor scheduler interference; signal magnitude 7× exceeds the noise band). bench-allocs `compare initial-clean` confirmed all 5 alloc_counts scenarios unchanged at zero allocs. Correctness preservation: 4/4 from_pg_text test groups pass (existing boundary suite covers i32::MAX, i32::MIN, +/-overflow, empty, non-digit, multi-byte non-ASCII, embedded NUL). Tier preserved (runtime parse → tier-3 by classified `IntParse`). Length pre-check + i64 acc bound is a structural correctness pin: `wrapping_mul(10).wrapping_add(9)` provably cannot wrap during the loop given the bound (max acc reach for 10-digit i32 = 9_999_999_999 << i64::MAX ≈ 9.22 × 10^18). SHIPPED 2026-05-07.
+- **DEF-282 — `ProtoState` bit-packing via `Box<ParamOids>`** — `7bb3346` 2026-05-21. The 2 `DescribeStatement*` variants in `ProtoState` + `ActiveState` carried `param_oids: ParamOids` inline (68 B) — outliers next to SCRAM/MD5/Cleartext which were already heap-boxed. Boxed: `param_oids: alloc::boxed::Box<ParamOids>` per same precedent. Same Box ptr copy-moves across the `AwaitingRowDescOrNoData → AwaitingRfq` transition (zero allocator ops on transition); deref-move at 'Z' arrival into `StagedDescribeStatementCompletePayload.param_oids: ParamOids` keeps the public-API inline shape unchanged. Per-Describe-flow total: 1 alloc + 1 free. **Sizes**: `ProtoState` 80 → **48 B (−40%)**, `ActiveState` 80 → **48 B (−40%)**, `PgProtocol<ActivePhase>` 536 → **504 B (−6%)**. New dominators on state enums: the `BoundedStr<32>` command_tag bearers. Bench-stable compare vs `2026-05-20-pre-def282` baseline: **5 improvements, 11 unchanged, 0 regressions** — headline `cancel_credentials_extract/active_some_arm` **−30.95% (p=0.00)** on the ActiveState dispatch projection; also `column_decode/parse_pg_bool_swar_t` −12.63% (p=0.00). The wins cascade to non-Describe benches because every `state.set` / `state.get` `mem::replace` pays the inline tax. 596 tests pass + clippy clean. Generalisable lesson: when a state-machine variant is a size outlier vs its siblings, the inline-vs-Box Pareto frontier needs re-derivation per case — Box-reuse across N transitions + dominant-variant cascade can flip the verdict even at 68 B inline. SHIPPED 2026-05-21.
 
 ### DEF-184 (post-Y comprehensive audit)
 Shipped batches (commit-anchored):
