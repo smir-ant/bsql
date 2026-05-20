@@ -99,12 +99,13 @@
 )]
 #![warn(missing_debug_implementations, missing_copy_implementations)]
 
-// `bsql-pg-proto` is `no_std + alloc`. The crate uses `Box<T>` once
-// per connection during SCRAM-SHA-256 handshake to externalise
-// password-bearing session data; this enables a 9× reduction in
-// `ProtoState` size (712 → ~80 B) and corresponding hot-path latency
-// improvement on row streaming. Embedded targets without an
-// allocator should use Trust-auth (no Box allocated).
+// `bsql-pg-proto` is `no_std + alloc`. The crate uses `Box<T>` in
+// state variants to externalise large inline payloads — SCRAM/MD5/
+// Cleartext password-bearing handshake data, and the `ParamOids`
+// 68 B `DescribeStatement*` payload. This enables a ~15× reduction
+// in `ProtoState` size (712 → ~48 B) and corresponding hot-path
+// cache-density improvement on row streaming. Embedded targets
+// without an allocator should use Trust-auth (no Box allocated).
 //
 // Trade-off documented per CREDO §4 (user-land крейты могут зависеть
 // от alloc, когда обоснованно). Feature-gating evaluated and
@@ -625,22 +626,26 @@ const _: () = assert!(
 // target aarch64-apple-darwin; per-target `#[cfg(...)]` blocks
 // would land in the same commit that adds another target to CI.
 const _: () = assert!(
-    core::mem::size_of::<state::ProtoState>() == 80,
+    core::mem::size_of::<state::ProtoState>() == 48,
     "ProtoState exact size pin: row_desc_slot externalised on \
      PgProtocol; schema-presence flags deleted (`row_desc_slot. \
-     is_some()` is single source of truth). \
+     is_some()` is single source of truth); `param_oids` heap-boxed \
+     on DescribeStatement* variants (mirror of SCRAM/MD5/Cleartext \
+     pattern). \
      \
-     Layout on aarch64-apple-darwin: dominant variant is \
-     `DescribeStatementAwaitingRfq` — `ReplyId<DescribeStatementKind>` \
-     (8 B; NonZeroU64 + ZST PhantomData) + `ParamOids` (68 B; 4 B \
-     `n_params: u16` + 2 B padding + 16 × 4 B oid array) + 1 B variant \
-     discriminant + 3 B align(8) tail-pad → 80 B. \
+     Layout on aarch64-apple-darwin: dominant variants are now the \
+     `BoundedStr<32>`-bearing ones — `SimpleQueryAwaitingRfq` / \
+     `BindExecuteAwaitingRfqDml` / `BindExecuteAwaitingRfqSelect`. \
+     Shape: `ReplyId<_>` (8 B; NonZeroU64 + ZST PhantomData) + \
+     `BoundedStr<32>` (~36 B: 2 B len + 32 B buf + tail-pad to align 2) \
+     + 1 B variant discriminant + alignment → 48 B. \
      \
      Other notable variants: \
-     - SCRAM `ConnectingScramAwaitingServerFirst` — Box (8 B) + \
-       ReplyId (8 B) + discriminant + align-pad → ~24 B. \
-     - `SimpleQueryAwaitingRfq` — ReplyId (8 B) + BoundedStr<32> \
-       command_tag (~33 B) + discriminant + padding → ~48 B. \
+     - SCRAM `ConnectingScramAwaitingServerFirst` / `…ServerFinal` — \
+       Box (8 B) or SecretDigest (32 B) + ReplyId (8 B) + discriminant \
+       → ~24–48 B. \
+     - DescribeStatement* — ReplyId (8 B) + `Box<ParamOids>` (8 B) + \
+       discriminant → ~24 B (post-DEF-282 boxing). \
      - Streaming variants — ReplyId (8 B) + discriminant → ~16 B. \
      \
      Per-row hot-path single state-projection retrieves just the \
@@ -648,10 +653,10 @@ const _: () = assert!(
      `current_row_desc` slot (one immutable borrow, no per-row \
      state match for the desc field). \
      \
-     **The dominant constraint is `ParamOids` (68 B), not SCRAM.** A \
-     refactor that wants to shrink ProtoState should target ParamOids \
-     (16-OID arity) or split DescribeStatement* into a heap-boxed \
-     payload variant (pay-vs-tier tradeoff per CREDO §1). \
+     **The dominant constraint is now `BoundedStr<32>` command_tag.** \
+     A refactor that wants to shrink ProtoState further should target \
+     command_tag arity, or move command_tag off the variant entirely \
+     (e.g. into a slot pattern, mirror of row_desc_slot). \
      \
      If a refactor changes this number on aarch64-apple-darwin, \
      update both the literal AND the layout comment above (drift-pin \
@@ -685,7 +690,7 @@ const _: () = assert!(
 // Layout breakdown:
 //   ReadBuf inline:          ~256 B (heapless::Vec<u8, 256> + cursor)
 //   ReadBuf heap slot:          8 B (Option<Box<...>> niche)
-//   state:                    ~80 B (DescribeStatementAwaitingRfq dominant)
+//   state:                    ~48 B (SimpleQueryAwaitingRfq / BindExecuteAwaitingRfq* dominant; DescribeStatement* `param_oids` heap-boxed)
 //   row_desc_slot:           ~140 B (Option<RowDesc>)
 //   session_params:             8 B (Option<Box<SessionParams>> niche)
 //   error_arena:                8 B (Option<Box<ErrorArena>> niche)
@@ -694,7 +699,7 @@ const _: () = assert!(
 //   malformed_frame_count:      4 B (inline u32)
 //   sync_marker:                0 B (PhantomData)
 //   alignment padding:        ~16 B (to align(8))
-//   total:                    536 B
+//   total:                    504 B
 //
 // Heap economics per connection pattern:
 //   - Trust auth + no errors:        0 allocations.
@@ -720,16 +725,17 @@ const _: () = assert!(
 // on a quiet system (`load avg < 8`). On regression, investigate
 // (asm-diff, alternative shapes), do NOT roll back tier elevations.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() == 536,
+    core::mem::size_of::<protocol::PgProtocol>() == 504,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
-     Budget: ReadBuf inline 256 + ReadBuf heap-slot 8 + state ~80 + \
-     row_desc_slot ~140 (outer Extras) + session_params 8 + \
-     error_arena 8 + partial_assembly 8 + backend_key 8 + \
-     malformed_frame_count 4 + alignment-pad to align(8) = 536 B. \
+     Budget: ReadBuf inline 256 + ReadBuf heap-slot 8 + state ~48 \
+     (post-DEF-282 ParamOids boxing) + row_desc_slot ~140 (outer \
+     Extras) + session_params 8 + error_arena 8 + partial_assembly 8 \
+     + backend_key 8 + malformed_frame_count 4 + alignment-pad to \
+     align(8) = 504 B. \
      \
      Cross-platform: when CI matrix extends, either (a) every target \
-     lands at 536 (most likely — alignment-stable types), or \
+     lands at 504 (most likely — alignment-stable types), or \
      (b) per-target cfg-gated pins land in the same commit. \
      Permissive ranges forbidden — drift surface > variance cushion \
      (CREDO §3 + §4.12).",
@@ -741,8 +747,8 @@ const _: () = assert!(
 // `<P as SealedPhase>::Inner` + a ZST `PhantomData<fn() -> P>`.
 // Layout per phase is determined by the per-phase Inner:
 //   - DisconnectedPhase → DisconnectedInner (0 B, ZST)
-//   - ConnectingPhase  → ConnectingInner   (368 B)
-//   - ActivePhase      → ActiveInner       (536 B)
+//   - ConnectingPhase  → ConnectingInner   (360 B; unchanged — no Describe variants in `<ConnectingPhase>`)
+//   - ActivePhase      → ActiveInner       (504 B; post-DEF-282)
 //   - ClosedPhase      → ClosedInner       (16 B)
 //
 // If any pin trips, either (a) PhantomData was rendered non-ZST
@@ -789,11 +795,12 @@ const _: () = assert!(
 // `<ActivePhase>::Extras = RowDescSlotCell` (140 B; align 4); the
 // cell lives on outer Extras rather than inside ActiveInner.
 // PgProtocol<ActivePhase> = ActiveInner + Extras + ZST
-// phase_marker; measured 536 B on aarch64-apple-darwin.
+// phase_marker; measured 504 B on aarch64-apple-darwin (post-DEF-282
+// `Box<ParamOids>` boxing on DescribeStatement* variants).
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 536,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 504,
     "PgProtocol<ActivePhase> layout drift — must equal ActiveInner \
-     (state ActiveState 80 B + read_buf 264 B + 3 cells × 8 B + \
+     (state ActiveState 48 B + read_buf 264 B + 3 cells × 8 B + \
      1 u32 + alignment) PLUS Extras = RowDescSlotCell (140 B inline; \
      align 4) PLUS ZST phase_marker. If this trips, audit `mod \
      protocol::ActiveInner` and the SealedPhase Extras = \

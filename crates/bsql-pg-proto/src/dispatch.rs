@@ -1158,9 +1158,17 @@ pub(crate) fn dispatch(
         (ProtoState::DescribeStatementAwaitingParamDesc(reply), TAG_PARAMETER_DESCRIPTION) => {
             match crate::decode::parse_parameter_description(payload) {
                 Ok(param_oids) => {
+                    // Heap-box once at the 't' arrival; the same Box
+                    // is moved across the `AwaitingRowDescOrNoData →
+                    // AwaitingRfq` transition (zero allocator ops on
+                    // transition) and freed at the 'Z' deref-move into
+                    // `StagedDescribeStatementCompletePayload`. See
+                    // [`ProtoState::DescribeStatementAwaitingRowDescOrNoData`]
+                    // docstring for the `ProtoState`-size containment
+                    // rationale (mirror of SCRAM/MD5/Cleartext).
                     *state = ProtoState::DescribeStatementAwaitingRowDescOrNoData {
                         reply,
-                        param_oids,
+                        param_oids: alloc::boxed::Box::new(param_oids),
                     };
                     DispatchOutcome::AdvancedSilent
                 }
@@ -1241,7 +1249,14 @@ pub(crate) fn dispatch(
                     action: crate::action::deliver(
                         reply,
                         crate::action::StagedDescribeStatementCompletePayload {
-                            param_oids,
+                            // Deref-move the heap-boxed ParamOids back into
+                            // the terminal reply payload (inline `ParamOids`
+                            // is the public-API shape). Frees the Box —
+                            // one-shot per Describe flow, paired with the
+                            // `Box::new` at the 't' arrival above. See
+                            // [`ProtoState::DescribeStatementAwaitingRowDescOrNoData`]
+                            // docstring for the per-flow allocator total.
+                            param_oids: *param_oids,
                             tx_status,
                         },
                     ),

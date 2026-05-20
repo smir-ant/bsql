@@ -130,8 +130,8 @@ pub enum ProtoState {
     ///
     /// `Sensitive<Password>` is ~514 B (512 B buf + len + align).
     /// Inline storage would dominate `ProtoState` size pin
-    /// (currently 80 B exact). `Box` reduces variant footprint to
-    /// `8 B (ptr) + 8 B (ReplyId) + 1 B (disc) + align = ~24 B`.
+    /// (currently 48 B exact). `Box` reduces variant footprint to
+    /// 8 B (ptr) + 8 B (ReplyId) + 1 B (disc) + align ≈ 24 B.
     /// Tier-1 preserved — `Box` cannot be `None`, its `Drop` fires
     /// `Sensitive::Drop` → `Password::Drop` (`ZeroizeOnDrop`).
     /// Cost in this variant: one heap alloc per cleartext handshake
@@ -187,9 +187,9 @@ pub enum ProtoState {
     /// # Size pin
     ///
     /// Inline storage of `Ident` (~64 B) + `Sensitive<Password>`
-    /// (~514 B) would balloon the variant past the 80 B `ProtoState`
+    /// (~514 B) would balloon the variant past the 48 B `ProtoState`
     /// size pin. With Box: 8 B (Box ptr) + 8 B (ReplyId) + 1 B (disc)
-    /// + align = ~24 B. Pin preserved.
+    /// + align ≈ 24 B. Pin preserved.
     ConnectingStartupMd5 {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
@@ -650,12 +650,34 @@ pub enum ProtoState {
     /// to [`Self::DescribeStatementAwaitingRfq`].
     /// No-data branch: `'n'` → [`DescribedRows::NoData`]; continue
     /// to [`Self::DescribeStatementAwaitingRfq`].
+    ///
+    /// # Heap-boxed `param_oids` (mirror of SCRAM/MD5/Cleartext)
+    ///
+    /// [`ParamOids`] is 68 B inline (`#[repr(C, align(4))]` with
+    /// `n_params: u16` + 2 B pad + `[u32; 16]`). Inline storage
+    /// would dominate `ProtoState` size — see the same rationale
+    /// on [`Self::ConnectingStartupScram`] (`scram` field),
+    /// [`Self::ConnectingStartupMd5`] (`handshake` field), and
+    /// [`Self::ConnectingStartupCleartext`] (`password` field).
+    ///
+    /// `Box<ParamOids>` reduces variant footprint to ~24 B
+    /// (8 B Box ptr, 8 B ReplyId, 1 B disc, align tail-pad). Tier-1
+    /// preserved — `Box` cannot be `None`, the variant cannot exist
+    /// without its `ParamOids`. The same `Box` is moved across the
+    /// transition to `AwaitingRfq` (state-discriminant flip plus a
+    /// Box pointer copy-move, zero allocator ops). Per-Describe-flow
+    /// total: 1 alloc (`'t'` arrival) and 1 free (`'Z'` arrival when
+    /// the Box is deref-moved into the terminal reply payload).
     DescribeStatementAwaitingRowDescOrNoData {
         /// Correlator for the Describe command.
         reply: ReplyId<DescribeStatementKind>,
         /// Parameter OIDs parsed from the preceding `'t'` frame.
         /// Threaded through to the terminal reply payload.
-        param_oids: ParamOids,
+        /// Heap-boxed for [`ProtoState`] size containment — see
+        /// variant docstring above for the size + transition
+        /// rationale (mirror of `Box<ScramSession>` /
+        /// `Box<Md5HandshakeState>` / `Box<Sensitive<Password>>`).
+        param_oids: alloc::boxed::Box<ParamOids>,
     },
 
     /// Row-desc / no-data known; awaiting the trailing
@@ -680,11 +702,23 @@ pub enum ProtoState {
     /// Instead materialise reads `row_desc_slot.map(...)` directly.
     /// **Tier-1 by-construction**: the slot equals itself (identity,
     /// not discipline).
+    ///
+    /// # Heap-boxed `param_oids`
+    ///
+    /// See [`Self::DescribeStatementAwaitingRowDescOrNoData`] for
+    /// the full rationale — the `Box<ParamOids>` is the **same**
+    /// allocation as on the prior variant; the
+    /// `AwaitingRowDescOrNoData → AwaitingRfq` transition is a
+    /// state-discriminant flip + Box pointer copy-move (zero
+    /// allocator ops).
     DescribeStatementAwaitingRfq {
         /// Correlator for the Describe command.
         reply: ReplyId<DescribeStatementKind>,
         /// Parameter OIDs captured at the `'t'` transition.
-        param_oids: ParamOids,
+        /// **Same `Box` allocation** as on
+        /// [`Self::DescribeStatementAwaitingRowDescOrNoData`];
+        /// reused across the transition (no alloc on transition).
+        param_oids: alloc::boxed::Box<ParamOids>,
     },
 
     // ─── Portal-describe path ───
@@ -1166,10 +1200,14 @@ impl core::fmt::Debug for ConnectingState {
 /// `ActiveInner.state = ActiveState::StartupTrust { ... }` because
 /// the variant doesn't exist.
 ///
-/// **Layout**: ~80 B (matches `ProtoState`). Largest variant is
-/// [`Self::DescribeStatementAwaitingRowDescOrNoData`] /
-/// [`Self::DescribeStatementAwaitingRfq`] carrying
-/// `param_oids: ParamOids` (68 B inline) + `reply: ReplyId<…>` (8 B).
+/// **Layout**: 48 B (matches `ProtoState`). Largest variants are
+/// the `BoundedStr<32>`-bearing ones: [`Self::SimpleQueryAwaitingRfq`]
+/// / [`Self::BindExecuteAwaitingRfqDml`] /
+/// [`Self::BindExecuteAwaitingRfqSelect`] carrying
+/// `command_tag: BoundedStr<32>` (~36 B) + `reply: ReplyId<…>` (8 B).
+/// `DescribeStatement*` variants carry `Box<ParamOids>` per the same
+/// containment pattern as SCRAM/MD5/Cleartext (see [`ProtoState`]
+/// docstrings on those variants).
 ///
 /// **Manual `Debug` impl** — mirror of [`ProtoState`]'s manual Debug
 /// for the post-handshake variants. Active variants don't carry
@@ -1232,14 +1270,18 @@ pub enum ActiveState {
     /// Mirror of [`ProtoState::DescribeStatementAwaitingParamDesc`].
     DescribeStatementAwaitingParamDesc(ReplyId<DescribeStatementKind>),
     /// Mirror of [`ProtoState::DescribeStatementAwaitingRowDescOrNoData`].
+    /// `param_oids` is heap-boxed for size containment — see the
+    /// matching `ProtoState` variant docstring for rationale.
     DescribeStatementAwaitingRowDescOrNoData {
         reply: ReplyId<DescribeStatementKind>,
-        param_oids: ParamOids,
+        param_oids: alloc::boxed::Box<ParamOids>,
     },
-    /// Mirror of [`ProtoState::DescribeStatementAwaitingRfq`].
+    /// Mirror of [`ProtoState::DescribeStatementAwaitingRfq`]. Same
+    /// `Box<ParamOids>` allocation as the prior variant — moved
+    /// across the transition.
     DescribeStatementAwaitingRfq {
         reply: ReplyId<DescribeStatementKind>,
-        param_oids: ParamOids,
+        param_oids: alloc::boxed::Box<ParamOids>,
     },
     /// Mirror of [`ProtoState::DescribePortalAwaitingRowDescOrNoData`].
     DescribePortalAwaitingRowDescOrNoData(ReplyId<DescribePortalKind>),
@@ -1765,8 +1807,14 @@ const _: () = assert!(
     "ConnectingState dominant variant: ScramAwaitingServerFinal (32 B SecretDigest + 8 B ReplyId + 8 B alignment)",
 );
 const _: () = assert!(
-    core::mem::size_of::<ActiveState>() == 80,
-    "ActiveState dominant variant: DescribeStatement*AwaitingRowDescOrNoData / AwaitingRfq (68 B ParamOids + 8 B ReplyId + alignment)",
+    core::mem::size_of::<ActiveState>() == 48,
+    "ActiveState dominant variants (post-DEF-282 ParamOids boxing): \
+     `SimpleQueryAwaitingRfq` / `BindExecuteAwaitingRfqDml` / \
+     `BindExecuteAwaitingRfqSelect` — 8 B `ReplyId<QueryKind>` + \
+     ~36 B `BoundedStr<32>` (2 B len + 32 B buf + tail-pad) + \
+     discriminant + alignment → 48 B. DescribeStatement* variants \
+     now carry `Box<ParamOids>` (~24 B) per the same precedent as \
+     SCRAM/MD5/Cleartext heap-boxing.",
 );
 
 /// Classifier output for [`ProtoState::unsolicited_admit`]. Single
@@ -2238,14 +2286,14 @@ mod push_class_tests {
         pin(
             ProtoState::DescribeStatementAwaitingRowDescOrNoData {
                 reply: ReplyId::from_raw(nz(6_002)),
-                param_oids: crate::action::ParamOids::EMPTY,
+                param_oids: alloc::boxed::Box::new(crate::action::ParamOids::EMPTY),
             },
             StatePushClass::BusyQuery,
         );
         pin(
             ProtoState::DescribeStatementAwaitingRfq {
                 reply: ReplyId::from_raw(nz(6_003)),
-                param_oids: crate::action::ParamOids::EMPTY,
+                param_oids: alloc::boxed::Box::new(crate::action::ParamOids::EMPTY),
             },
             StatePushClass::BusyQuery,
         );
@@ -2517,11 +2565,11 @@ mod per_phase_state_roundtrip_tests {
         ));
         roundtrip_active(ProtoState::DescribeStatementAwaitingRowDescOrNoData {
             reply: ReplyId::from_raw(nz(6_002)),
-            param_oids: crate::action::ParamOids::default(),
+            param_oids: alloc::boxed::Box::new(crate::action::ParamOids::default()),
         });
         roundtrip_active(ProtoState::DescribeStatementAwaitingRfq {
             reply: ReplyId::from_raw(nz(6_003)),
-            param_oids: crate::action::ParamOids::default(),
+            param_oids: alloc::boxed::Box::new(crate::action::ParamOids::default()),
         });
 
         // DescribePortal flow.
