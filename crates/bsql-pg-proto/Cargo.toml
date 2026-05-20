@@ -18,26 +18,21 @@ categories = ["database", "no-std", "parser-implementations"]
 [features]
 default = []
 
-# DEF-211 FAKE-19 (audit + ship 2026-05-04): `bench-hooks` feature
-# REMOVED ENTIRELY. Pre-FAKE-19 the feature gated two `#[doc(hidden)]
-# pub fn` hooks on PgProtocol that downstream users could enable in
-# their Cargo.toml (tier-3 by-discipline; CREDO §1 absolute-safety
-# violation surface).
-#
-# Replacement is structural:
-#   - `bench_append_read_buf` was a duplicate of the public
-#     `feed_inbound(bytes) -> Result<(), ReadBufFull>` shipped in
-#     DEF-212 Phase 2. Benches use `feed_inbound` directly.
-#   - `reset_for_bench` replaced by `criterion::iter_batched(setup,
-#     routine, BatchSize)` — setup builds fresh proto per iter
-#     (untimed); routine measures the timed window only.
+# No `bench-hooks` feature. A naive shape would gate
+# `#[doc(hidden)] pub fn` hooks on `PgProtocol` behind a cargo
+# feature that downstream users could enable in their Cargo.toml
+# (tier-3 by-discipline; CREDO §1 absolute-safety violation
+# surface). Instead:
+#   - The dispatch-bypass read append is the public
+#     `feed_inbound(bytes) -> Result<(), ReadBufFull>` — benches use
+#     it directly.
+#   - Per-iter reset is `criterion::iter_batched(setup, routine,
+#     BatchSize)` — setup builds a fresh proto per iter (untimed);
+#     routine measures the timed window only.
 #
 # Tier closure: feature physically absent → no leak surface possible.
 # Downstream consumers cannot enable (nothing to enable). Tier-1
 # by-elimination.
-#
-# See `crates/bsql-pg-proto/src/protocol.rs` — comment block above
-# the `impl PgProtocol` block describes the rationale + replacements.
 
 [dependencies]
 heapless = { workspace = true }
@@ -50,8 +45,8 @@ subtle = { workspace = true }
 zeroize = { workspace = true }
 simdutf8 = { workspace = true }
 
-# DEF-233 / DEF-211 INNO-01 (2026-05-04): pair-crate hosting
-# `#[derive(Pristine)]`. Standard Rust convention (mirror
+# Pair-crate hosting `#[derive(Pristine)]` and the `prepared!`
+# proc-macro. Standard Rust convention (mirror
 # `serde`/`serde-derive`, `zeroize`/`zeroize-derive`). The derive
 # crate is pulled in for proc-macro expansion only — its
 # transitive deps (`syn`/`quote`/`proc-macro2`) live in the
@@ -81,8 +76,8 @@ getrandom = { workspace = true }
 # visibility anti-pattern.
 base64ct = { workspace = true }
 
-# `criterion` — DEF-143 bench harness. Dev-only; benches compile
-# with std, lib stays no_std. See workspace Cargo.toml.
+# `criterion` — bench harness. Dev-only; benches compile with std,
+# lib stays no_std. See workspace `Cargo.toml`.
 criterion = { workspace = true }
 
 # -- Bench targets --
@@ -90,10 +85,9 @@ criterion = { workspace = true }
 # use criterion's own main-function runner instead (generates HTML
 # reports + statistical analysis in target/criterion).
 #
-# DEF-211 FAKE-19 (2026-05-04): `required-features` removed alongside
-# the eliminated `bench-hooks` feature. The bench file now uses
-# public-API only (`feed_inbound` + `criterion::iter_batched`); no
-# crate-internal hooks needed. Run with plain `cargo bench`.
+# No `required-features` — the bench file uses public-API only
+# (`feed_inbound` + `criterion::iter_batched`); no crate-internal
+# hooks needed. Run with plain `cargo bench`.
 [[bench]]
 name = "hot_paths"
 harness = false

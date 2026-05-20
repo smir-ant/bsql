@@ -28,18 +28,17 @@ syn = { workspace = true }
 quote = { workspace = true }
 proc-macro2 = { workspace = true }
 
-# DEF-244 (P11 closure, 2026-05-13): SHA-256 for content-addressed
-# prepared-statement names. `prepared!("SELECT ...")` truncates
-# SHA-256 of the SQL bytes to 96 bits → 24 hex chars → stmt_name
-# `bsql_p_<24hex>`. 96-bit collision space is 2⁻⁹⁶ — effectively
-# tier-1 for any realistic codebase (memo §7 P11).
+# SHA-256 for content-addressed prepared-statement names.
+# `prepared!("SELECT ...")` truncates SHA-256 of the SQL bytes to
+# 96 bits → 24 hex chars → stmt_name `bsql_p_<24hex>`. 96-bit
+# collision space is 2⁻⁹⁶ — effectively tier-1 for any realistic
+# codebase.
 #
-# Policy-clean per DEF-META-01: `sha2` is already a workspace dep
-# used by SCRAM-SHA-256 in `bsql-pg-proto` runtime. Reusing it in
-# the proc-macro pair-crate is policy-clean — same RustCrypto org
-# audit-trust profile, same workspace pinned major. Proc-macro
-# expansion runs at compile time only; runtime users do NOT pay
-# for this dep.
+# `sha2` is already a workspace dep used by SCRAM-SHA-256 in
+# `bsql-pg-proto` runtime. Reusing it in the proc-macro pair-crate
+# is policy-clean — same RustCrypto org audit-trust profile, same
+# workspace pinned major. Proc-macro expansion runs at compile time
+# only; runtime users do NOT pay for this dep.
 sha2 = { workspace = true }
 
 [dev-dependencies]
@@ -49,28 +48,26 @@ sha2 = { workspace = true }
 # bsql-pg-proto for trait-bound resolution of generated impls.
 bsql-pg-proto = { path = "../bsql-pg-proto" }
 
-# DEF-244 (2026-05-14): trybuild for the hostile-bypass probe
-# golden harness (memo §7 P1-P12). The 12 .rs files under
-# `tests/prepared_compile_fail/` ARE the load-bearing automated
-# evidence for the tier-1 SQL-injection closure claim — a future
-# contributor whose change relaxes any of `pub(crate) sql`, sealed
-# `ParamsWriter`/`RowDecode`, content-addressed stmt_name, or
-# string-literal-only macro input gets a noisy `.stderr` mismatch.
-# See workspace Cargo.toml for the policy-clean justification of
-# the dep.
+# trybuild for the hostile-bypass probe golden harness (P1–P12).
+# The 12 `.rs` files under `tests/prepared_compile_fail/` ARE the
+# load-bearing automated evidence for the tier-1 SQL-injection
+# closure claim — a future contributor whose change relaxes any of
+# `pub(crate) sql`, sealed `ParamsWriter` / `RowDecode`,
+# content-addressed stmt_name, or string-literal-only macro input
+# gets a noisy `.stderr` mismatch. See workspace `Cargo.toml` for
+# the policy-clean justification of the dep.
 trybuild = { workspace = true }
 
-# DEF-233 (created 2026-05-04): pair-crate with bsql-pg-proto.
-# Hosts:
-#   - #[derive(Pristine)] (DEF-211 INNO-01) — generates
-#     is_pristine() check for invariant types like SessionParams.
-#     Lifts BS-11 broad-scope tier-3 ("contributor must remember to
-#     update is_pristine when adding fields") to tier-1
-#     by-construction (compiler emits the check; missed field is
-#     impossible).
+# Pair-crate with `bsql-pg-proto`. Hosts:
+#   - `#[derive(Pristine)]` — generates `is_pristine()` checks for
+#     invariant types like `SessionParams`. Lifts broad-scope tier-3
+#     ("contributor must remember to update `is_pristine` when
+#     adding fields") to tier-1 by-construction (compiler emits the
+#     check; missed field is impossible).
+#   - `prepared!` proc-macro for SQL-injection-rejecting prepared
+#     queries.
 #
-# Future entries:
-#   - Other discipline-derives as needed by audit findings.
+# Future entries: other discipline-derives as needed.
 #
 # This crate is intentionally minimal — proc-macro logic is
 # ergonomic-discipline, not runtime-perf code. Per CREDO §4.4,

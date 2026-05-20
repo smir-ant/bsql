@@ -12,9 +12,9 @@ rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/smir-ant/bsql"
 
-# Crates are added one-by-one as Phase 1..6 of reforge.md roll out.
-# The workspace landed in Phase 1a with `bsql-pg-proto` (sans-I/O
-# wire-protocol state machine, Ping flow only).
+# Crates are added one-by-one as the rebuild rolls out. The
+# workspace currently hosts `bsql-pg-proto` (sans-I/O wire-protocol
+# state machine) + `bsql-pg-proto-derive` (proc-macro).
 
 [workspace.dependencies]
 # Every addition is justified inline:
@@ -38,12 +38,12 @@ heapless = { version = "0.9.2", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 
 # `md-5` — MD5 hash used by PG's legacy AuthenticationMD5Password method
-# (DEF-216, sub-code 5). Expert-domain cryptography: DEF-META-01
-# mandates we never hand-roll a hash function, even one as broken-for-
-# new-uses as MD5 — drift between our implementation and the spec is
-# the principal risk, not the algorithmic weakness (which the PG
-# protocol owns, not us). RustCrypto, same audit-trust profile as
-# `sha2` / `hmac` / `pbkdf2`. `default-features = false` for no_std.
+# (sub-code 5). Expert-domain cryptography: never hand-roll a hash
+# function, even one as broken-for-new-uses as MD5 — drift between
+# our implementation and the spec is the principal risk, not the
+# algorithmic weakness (which the PG protocol owns, not us).
+# RustCrypto, same audit-trust profile as `sha2` / `hmac` /
+# `pbkdf2`. `default-features = false` for no_std.
 #
 # **Security note**: MD5 is cryptographically broken for collision-
 # resistant uses but PG's auth protocol specifically does NOT depend
@@ -64,8 +64,7 @@ hmac = { version = "0.12", default-features = false }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 
 # `base64ct` — **constant-time** RFC 4648 base64 for SCRAM wire
-# messages. DEF-102 swap from `base64` v0.22 → `base64ct` v1.
-# Rationale: the SCRAM ClientProof is derived from the user's
+# messages. Rationale: the SCRAM ClientProof is derived from the user's
 # password; its base64 encoding is one step in the authentication
 # sequence where a data-dependent branch or table-lookup-time
 # could in principle leak password-correlated bits via timing.
@@ -90,19 +89,19 @@ zeroize = { version = "1", default-features = false, features = ["zeroize_derive
 
 # `getrandom` — cryptographically secure random bytes for SCRAM
 # client nonce. OS-provided entropy; never hand-rolled, never
-# SystemTime-seeded. DEF-META-01 scope.
+# SystemTime-seeded (expert-domain cryptography).
 getrandom = { version = "0.2", default-features = false }
 
-# `simdutf8` — SIMD-accelerated UTF-8 validation (DEF-202). Drives
+# `simdutf8` — SIMD-accelerated UTF-8 validation. Drives
 # `<&str as FromPgText>::from_pg_text` for text-format column bytes
 # coming off the wire. `core::str::from_utf8` is scalar bytewise;
 # `simdutf8::basic::from_utf8` uses lane-wise vector shuffles +
 # masks (5-10× throughput improvement on aarch64 NEON; equivalent
-# scalar fast-path on no-SIMD targets). DEF-META-01 scope: SIMD
-# validators are expert-domain — `simdutf8` is the canonical
-# audited implementation (used by `serde_json`, `sonic-rs`,
-# `simd-json`). Bytewise behaviour parity with `core::str::from_utf8`
-# is documented + property-tested upstream.
+# scalar fast-path on no-SIMD targets). SIMD validators are
+# expert-domain — `simdutf8` is the canonical audited
+# implementation (used by `serde_json`, `sonic-rs`, `simd-json`).
+# Bytewise behaviour parity with `core::str::from_utf8` is
+# documented + property-tested upstream.
 #
 # `default-features = false` for no_std. `aarch64_neon` opt-in
 # adds NEON path (mandatory in aarch64; no runtime detection
@@ -111,7 +110,7 @@ getrandom = { version = "0.2", default-features = false }
 # simdutf8's scalar fast-path (still faster than `core::str::from_utf8`).
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon"] }
 
-# `criterion` — DEF-143 benchmark harness. Dev-only dependency;
+# `criterion` — benchmark harness. Dev-only dependency;
 # benches compile with std enabled (criterion requires std) while
 # the lib stays no_std. Provides statistical sampling (bootstrap
 # CI), outlier detection, and regression tracking across runs.
@@ -119,8 +118,9 @@ simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neo
 # with criterion's semver.
 criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
 
-# `trybuild` — DEF-244 (2026-05-14): compile_fail golden harness for
-# the `prepared!` proc-macro's hostile-bypass probes (memo §7 P1-P12).
+# `trybuild` — `compile_fail` golden harness for the `prepared!`
+# proc-macro's hostile-bypass probes P1–P12 (and the broader set of
+# compile-fail probes across the workspace).
 # Pins the EXACT compiler diagnostic for each forbidden user pattern
 # (e.g., `error[E0451]: field 'sql' of struct 'PreparedQuery' is
 # private`). A future contributor whose change perturbs the
@@ -142,14 +142,13 @@ criterion = { version = "0.5", default-features = false, features = ["html_repor
 # meaningfully shrink it for dev-deps).
 trybuild = { version = "1" }
 
-# DEF-233 (2026-05-04): proc-macro toolchain used ONLY by
-# `bsql-pg-proto-derive` (proc-macro pair-crate for `bsql-pg-proto`).
-# `bsql-pg-proto` itself never depends on these — they live entirely
-# behind the pair-crate boundary. Audit-trust class:
-# **expert-domain ecosystem standard** (1B+ downloads each, embedded
-# in Rust toolchain ecosystem; transitive `unsafe` for token-stream
-# manipulation is bounded and well-audited). Pinned majors per
-# CREDO §4.4.
+# Proc-macro toolchain used ONLY by `bsql-pg-proto-derive`
+# (proc-macro pair-crate for `bsql-pg-proto`). `bsql-pg-proto`
+# itself never depends on these — they live entirely behind the
+# pair-crate boundary. Audit-trust class: **expert-domain ecosystem
+# standard** (1B+ downloads each, embedded in the Rust toolchain
+# ecosystem; transitive `unsafe` for token-stream manipulation is
+# bounded and well-audited). Pinned majors per CREDO §4.4.
 syn = { version = "2", default-features = false, features = ["proc-macro", "derive", "parsing", "printing"] }
 quote = { version = "1", default-features = false }
 proc-macro2 = { version = "1", default-features = false, features = ["proc-macro"] }
@@ -166,8 +165,7 @@ incremental = true
 codegen-units = 1
 lto = "fat"
 opt-level = 3
-# DEF-185 P0-A (audit 2026-04-24): panic = "abort" vs "unwind"
-# architectural decision.
+# `panic = "abort"` vs `"unwind"` architectural decision.
 #
 # CONSEQUENCE for secret-bearing types (Password, ScramSession,
 # SecretDigest, Sensitive<T>):
@@ -186,12 +184,12 @@ opt-level = 3
 #   Accept `panic = "abort"` for the crash-safety + binary-size +
 #   FFI-safety benefits. Defense-in-depth for secrets:
 #     (a) `Zeroizing<T>` scope-guards on every secret-bearing local
-#         binding in SCRAM crypto composition (DEF-185 P0-D, P1-A) —
-#         these drop on normal scope exit which happens BEFORE the
-#         function can panic past the compute point.
+#         binding in SCRAM crypto composition — these drop on normal
+#         scope exit which happens BEFORE the function can panic
+#         past the compute point.
 #     (b) `WriteBuf::clear()` / `ReadBuf::clear()` zero-on-clear +
-#         Drop impls (DEF-185 P0-B, P0-C) scrub wire-level secret
-#         residue on normal reuse/teardown paths.
+#         Drop impls scrub wire-level secret residue on normal
+#         reuse/teardown paths.
 #     (c) `Password` / `ScramSession` / `SecretDigest` Drop impls fire
 #         on every state transition via `mem::replace` / `mem::take`
 #         (normal control flow).
