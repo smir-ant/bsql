@@ -84,7 +84,7 @@ fn p_d278d_5_backend_key_cell_field_private() {
         .compile_fail("tests/def278d_compile_fail/p_d278d_5_backend_key_cell_field_private.rs");
 }
 
-/// **P-D278D-6** (Bundle D' new probe) — the `&[u8; 16]` lent into
+/// **P-D278D-6** — the `&[u8; 16]` lent into
 /// the `with_cancel_request` closure cannot escape past the call.
 /// Expected: `E0521`-class diagnostic ("borrowed data escapes
 /// outside of closure" / "lifetime may not live long enough").

@@ -1,4 +1,4 @@
-//! Tier-3 audit #33 probe **P-E-10** — `DispatchContext<'state, 'r>`
+//! Probe **P-E-10** — `DispatchContext<'state, 'r>`
 //! is `pub(in crate::protocol)` so external crates cannot name the
 //! type, cannot import it, cannot construct it. Attempting to
 //! reference the type from outside the crate fails with E0603

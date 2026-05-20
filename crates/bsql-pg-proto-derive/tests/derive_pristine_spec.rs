@@ -10,12 +10,10 @@
 //!
 //! # Why these tests matter
 //!
-//! Pre-implementation audit (DEF-211 INNO-01 post-ship audit
-//! 2026-05-04) revealed the derive shipped without unit tests.
-//! That's a CREDO §4.11 violation: tier-1 by-construction is the
-//! claim, but the load-bearing translator (the proc-macro itself)
-//! had no test coverage of its tier-1 invariants. This file
-//! closes that gap.
+//! The derive macro is the load-bearing translator that emits the
+//! `is_pristine()` body. Tier-1 by-construction is the claim the
+//! macro lands; this file pins the matching test coverage of its
+//! tier-1 invariants (CREDO §4.11).
 
 #![forbid(unsafe_code)]
 

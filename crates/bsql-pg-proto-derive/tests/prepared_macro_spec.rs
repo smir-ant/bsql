@@ -1,6 +1,6 @@
-//! DEF-244 — spec tests for the `prepared!` proc-macro.
+//! Spec tests for the `prepared!` proc-macro.
 //!
-//! # Coverage matrix (memo §9.1 acceptance gate)
+//! # Coverage matrix
 //!
 //! - **T1**: happy path per supported type — i16/i32/i64/u32/bool/&str.
 //! - **T2**: multi-parameter SELECT (3+ placeholders).
@@ -182,13 +182,11 @@ fn t7_comments() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// T8 — REMOVED: concat!() at proc-macro level requires macro-aware
-// evaluation that v1 doesn't perform. Memo's claim about `concat!`
-// working was incorrect: proc-macros see their arguments as raw
-// token-streams BEFORE other macros expand, so `prepared!(concat!(...))`
-// is rejected at the LitStr parse step. Tracked as a v1 follow-up
-// for declarative-macro-style composition. The P6 closure (memo §7)
-// still holds — the macro accepts ONLY a syn::LitStr at expansion.
+// T8 — `concat!()` composition is not supported at the proc-macro
+// level: proc-macros see their arguments as raw token-streams
+// BEFORE other macros expand, so `prepared!(concat!(...))` is
+// rejected at the LitStr parse step. The P6 closure still holds —
+// the macro accepts ONLY a `syn::LitStr` at expansion.
 //
 // ═══════════════════════════════════════════════════════════════════
 // T9 — content-addressed stmt_name (P11 closure)
