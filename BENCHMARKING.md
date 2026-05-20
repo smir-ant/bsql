@@ -2,10 +2,10 @@
 
 Audit-canonical playbook for verifying that performance-relevant
 changes do (or do not) affect generated code and runtime
-behaviour. Established 2026-05-07 after DEF-236 demonstrated
-that default `cargo bench` runs under typical developer-machine
-load produce sign-flipping noise that swamps the kind of signal
-tier-elevation work generates.
+behaviour. Default `cargo bench` runs under typical developer-
+machine load produce sign-flipping noise that swamps the signal
+tier-elevation work generates; the stable-bench workflow below
+holds the measurement variance under the change variance.
 
 ## TL;DR
 
@@ -495,11 +495,10 @@ cargo bench:  rebuilds — picks up the in-progress edits
 result: "baseline" reflects edited code, not HEAD
 ```
 
-This happened in the DEF-207 (2026-05-07) session — I started a
-background `save` and edited the macro in parallel; the saved
-"before" baseline was actually a "with-changes" snapshot. Manual
-recovery via `git stash` + delete polluted baseline + re-save +
-`git stash pop`.
+A real incident: someone started a background `save` and edited
+the macro in parallel; the saved "before" baseline was actually a
+"with-changes" snapshot. Manual recovery via `git stash` + delete
+polluted baseline + re-save + `git stash pop`.
 
 The warning lets the user catch the mismatch immediately:
 

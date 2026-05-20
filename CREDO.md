@@ -529,7 +529,7 @@ match items.split_at_checked(n) {
 }
 ```
 Либо на `debug_assert!(...)` + documented-dead arm. Пример:
-`OutActions::as_slice` (DEF-184 B26).
+`OutActions::as_slice`.
 
 ### `mem::take(&mut t)` + `*t = new`
 

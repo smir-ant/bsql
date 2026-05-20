@@ -5401,8 +5401,7 @@ impl PgProtocol<ActivePhase> {
     /// caller's closure receives `&mut RowStream`. `mem::forget` on a
     /// `&mut` does nothing to the underlying value — the stream
     /// always drops at `iter_rows`'s return. Structural by Rust's
-    /// drop-glue contract (see memo `/tmp/def248-design-memo-v2.md`
-    /// §3.2).
+    /// drop-glue contract.
     ///
     /// # Tier-1 closure on panic unwind
     ///
