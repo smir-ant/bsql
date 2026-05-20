@@ -1,4 +1,4 @@
-//! DEF-246 Phase 4 elevation #4 probe **P-E-9** — discarding the
+//! Probe **P-E-9** — discarding the
 //! `Result<(), ProtocolError>` returned by `feed_inbound` trips
 //! `unused_must_use` + `-D warnings` = compile error.
 //!

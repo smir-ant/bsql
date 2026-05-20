@@ -1,4 +1,4 @@
-//! DEF-244 hostile-bypass probe **P8** — implement `ParamsWriter`
+//! Hostile-bypass probe **P8** — implement `ParamsWriter`
 //! on a hostile user type to write injection bytes.
 //!
 //! # Tier

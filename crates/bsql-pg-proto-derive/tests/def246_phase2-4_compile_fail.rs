@@ -1,5 +1,5 @@
-//! DEF-246 Phase 2/3/4 (2026-05-16) — `trybuild` golden harness for the
-//! consume-self phase-typed protocol's tier-1 closure probes.
+//! `trybuild` golden harness for the consume-self phase-typed
+//! protocol's tier-1 closure probes.
 //!
 //! Each probe is a self-contained `.rs` file under
 //! `tests/def246_phase2-4_compile_fail/`. Trybuild attempts to compile

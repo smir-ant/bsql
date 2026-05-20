@@ -1,5 +1,5 @@
-//! DEF-244 — pin the `varchar` rejection at macro-expand. Tracks
-//! DEF-228: when `DecodeFormat<TextFmt>` impls land for `varchar`
+//! Pin the `varchar` rejection at macro-expand. Tracks
+//! When `DecodeFormat<TextFmt>` impls land for `varchar`
 //! (likely re-using the `text` decoder; OIDs differ but the byte
 //! representation is identical text-format), the macro grows the
 //! `varchar` entry and **this file must be deleted in the same

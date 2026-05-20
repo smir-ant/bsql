@@ -1,5 +1,5 @@
-//! DEF-244 — drift-detection for the `prepared!` typemap's v1.0
-//! supported set vs the DEF-228 pending types.
+//! Drift-detection for the `prepared!` typemap's v1.0 supported set
+//! vs the pending types.
 //!
 //! For each PG type that the runtime crate does NOT yet support
 //! (`bytea` / `varchar` / `float4` / `float8` / `numeric` /
@@ -11,8 +11,8 @@
 //!
 //! # Drift detection contract
 //!
-//! When DEF-228 lands `DecodeFormat<TextFmt>` (and `EncodeBinary`)
-//! impls for a type, the typemap in `src/typemap.rs` grows a new
+//! When a runtime `DecodeFormat<TextFmt>` (and `EncodeBinary`) impl
+//! lands for a type, the typemap in `src/typemap.rs` grows a new
 //! arm AND the matching `.rs` + `.stderr` files under
 //! `tests/prepared_unsupported_types/` must be **deleted** in the
 //! same commit. If the contributor forgets to delete the file, the
@@ -26,8 +26,8 @@
 //! - **Selective re-run**: `cargo test --test prepared_unsupported_types
 //!   bytea` runs just the bytea probe.
 //! - **Per-type documentation**: each `.rs` file's header comment
-//!   names the Rust type, the DEF-228 dependency, and the deletion
-//!   instruction.
+//!   names the Rust type, the runtime-dependency it gates on, and
+//!   the deletion instruction.
 //! - **Compounding evidence**: a v2 contributor scanning the
 //!   directory sees the exact set of types that are pending and
 //!   their tier-1-rejection enforcement.
@@ -40,16 +40,16 @@
 
 #![forbid(unsafe_code)]
 
-/// `bytea` (PG BYTEA / binary blob). Tracks DEF-228 for `&[u8]` or
-/// canonical `Bytea` newtype decoder.
+/// `bytea` (PG BYTEA / binary blob). Awaits `&[u8]` or canonical
+/// `Bytea` newtype decoder support in the runtime crate.
 #[test]
 fn bytea_rejected() {
     trybuild::TestCases::new()
         .compile_fail("tests/prepared_unsupported_types/bytea.rs");
 }
 
-/// `varchar` (PG VARCHAR / variable-length text). Tracks DEF-228 —
-/// can likely re-use the `text` decoder when added.
+/// `varchar` (PG VARCHAR / variable-length text). Can likely re-use
+/// the `text` decoder when added.
 #[test]
 fn varchar_rejected() {
     trybuild::TestCases::new()

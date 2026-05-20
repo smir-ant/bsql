@@ -1,4 +1,4 @@
-//! DEF-278 Bundle D / D' probe **P-D278D-3** — `with_cancel_request()`
+//! Probe **P-D278D-3** — `with_cancel_request()`
 //! is method-absent on `<ClosedPhase>`.
 //!
 //! Tier-1 by construction: the method lives ONLY on

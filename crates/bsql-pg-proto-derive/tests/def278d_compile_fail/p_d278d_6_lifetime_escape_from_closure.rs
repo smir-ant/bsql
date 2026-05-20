@@ -1,4 +1,4 @@
-//! DEF-278 Bundle D' probe **P-D278D-6** — the `&[u8; 16]` lent into
+//! Probe **P-D278D-6** — the `&[u8; 16]` lent into
 //! the `with_cancel_request` closure cannot escape past the call.
 //!
 //! Tier-1 by construction: the closure type `impl FnOnce(&[u8; 16],

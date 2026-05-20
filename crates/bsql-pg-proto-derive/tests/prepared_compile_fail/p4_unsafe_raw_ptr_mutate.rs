@@ -1,4 +1,4 @@
-//! DEF-244 hostile-bypass probe **P4** — mutate `Q.sql` through an
+//! Hostile-bypass probe **P4** — mutate `Q.sql` through an
 //! `unsafe` raw pointer.
 //!
 //! # Tier
@@ -11,8 +11,10 @@
 //! - **OS-level (production runtime)**: `.rodata` is read-only at
 //!   the OS level (segment protection via `mprotect(PROT_READ)`).
 //!   Writing through a raw pointer to a `const` segfaults at
-//!   runtime — stronger than the language guarantee. Same boundary
-//!   DEF-248 Sub-A framed for `panic = "abort"`.
+//!   runtime — stronger than the language guarantee. The same
+//!   OS-boundary framing applies to the crate-wide
+//!   `panic = "abort"` policy for cases the language alone cannot
+//!   reject.
 //!
 //! # What this probe pins
 //!

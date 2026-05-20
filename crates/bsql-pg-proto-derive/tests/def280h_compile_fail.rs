@@ -1,5 +1,5 @@
-//! DEF-280 Bundle H (2026-05-18) — `trybuild` golden harness for the
-//! `RowStream: !Send` tier-1 closure.
+//! `trybuild` golden harness for the `RowStream: !Send` tier-1
+//! closure.
 //!
 //! Each probe is a self-contained `.rs` file under
 //! `tests/def280h_compile_fail/`. Trybuild attempts to compile each

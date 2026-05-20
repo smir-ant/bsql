@@ -1,5 +1,5 @@
-//! DEF-244 — `trybuild` golden harness for the `prepared!`
-//! proc-macro's hostile-bypass probes (memo §7 P1-P12).
+//! `trybuild` golden harness for the `prepared!` proc-macro's
+//! hostile-bypass probes P1–P12.
 //!
 //! Each probe is a self-contained `.rs` file under
 //! `tests/prepared_compile_fail/`. Trybuild attempts to compile each
@@ -13,7 +13,7 @@
 //! - **Selective re-run**: `cargo test --test prepared_compile_fail
 //!   p7_arg_type_mismatch` runs only P7.
 //! - **Per-probe documentation**: each `#[test]` carries a doc
-//!   comment naming the probe + memo section.
+//!   comment naming the probe and the bypass class it closes.
 //!
 //! # Regenerating goldens
 //!
@@ -39,15 +39,15 @@
 //! enforcement; trybuild cannot exercise it but the architectural
 //! statement is documented in each probe's header comment.
 //!
-//! See `/tmp/def244-design-memo.md` §7 for the full hostile-bypass
-//! enumeration and §12 for the OS-boundary framing parallel to
-//! DEF-248 Sub-A's `panic = "abort"`.
+//! The OS-boundary framing parallels the crate-wide
+//! `panic = "abort"` policy for cases the language alone cannot
+//! reject.
 
 #![forbid(unsafe_code)]
 
 /// **P1** — direct struct construction with hostile SQL.
 /// Expected: `error[E0451]: field 'sql' of struct 'PreparedQuery' is
-/// private` (plus same for other fields). Memo §7 Probe P1.
+/// private` (plus same for other fields). Probe P1.
 #[test]
 fn p1_direct_struct_construction() {
     trybuild::TestCases::new()
@@ -56,7 +56,7 @@ fn p1_direct_struct_construction() {
 
 /// **P2** — call `PreparedQuery::new(...)`. Expected:
 /// `error[E0599]: no function or associated item named 'new' found`.
-/// Memo §7 Probe P2.
+/// Probe P2.
 #[test]
 fn p2_no_public_new() {
     trybuild::TestCases::new()
@@ -65,7 +65,7 @@ fn p2_no_public_new() {
 
 /// **P3** — read `Q.sql` from outside crate. Expected:
 /// `error[E0616]: field 'sql' of struct 'PreparedQuery' is private`.
-/// Memo §7 Probe P3.
+/// Probe P3.
 #[test]
 fn p3_field_read_from_outside() {
     trybuild::TestCases::new()
@@ -74,8 +74,8 @@ fn p3_field_read_from_outside() {
 
 /// **P4** — mutate via raw pointer (`unsafe` raw-ptr mutate).
 /// Expected: `error: usage of an 'unsafe' block` (from
-/// `#[forbid(unsafe_code)]`). OS-boundary parallel to DEF-248 Sub-A.
-/// Memo §7 Probe P4 + §12.
+/// `#[forbid(unsafe_code)]`). Language-level half of an OS-boundary closure.
+/// Probe P4 (OS-boundary parallel).
 #[test]
 fn p4_unsafe_raw_ptr_mutate() {
     trybuild::TestCases::new()
@@ -84,7 +84,7 @@ fn p4_unsafe_raw_ptr_mutate() {
 
 /// **P5** — fabricate `PreparedQuery` via `unsafe` pointer cast.
 /// Expected: `error: usage of an 'unsafe' block`. Same OS-boundary
-/// class as P4. Memo §7 Probe P5 + §12.
+/// class as P4. Probe P5 (OS-boundary parallel).
 #[test]
 fn p5_unsafe_fabricate() {
     trybuild::TestCases::new()
@@ -93,7 +93,7 @@ fn p5_unsafe_fabricate() {
 
 /// **P6** — pass a runtime string into `prepared!`. Expected:
 /// `error: prepared!: SQL must be a single string literal`
-/// (macro-emitted `compile_error!`). Memo §7 Probe P6.
+/// (macro-emitted `compile_error!`). Probe P6.
 #[test]
 fn p6_runtime_string_into_macro() {
     trybuild::TestCases::new()
@@ -102,7 +102,7 @@ fn p6_runtime_string_into_macro() {
 
 /// **P7** — bind wrong-type arguments to a prepared query. Expected:
 /// `error[E0308]: mismatched types`. Tuple types nominally distinct.
-/// Memo §7 Probe P7.
+/// Probe P7.
 #[test]
 fn p7_arg_type_mismatch() {
     trybuild::TestCases::new()
@@ -111,8 +111,8 @@ fn p7_arg_type_mismatch() {
 
 /// **P8** — hostile `impl ParamsWriter for EvilParams`. Expected:
 /// `error[E0277]: ... ParamsWriterSealed`. Sealed super-trait
-/// barrier — external crates cannot satisfy the bound. Memo §7
-/// Probe P8.
+/// barrier — external crates cannot satisfy the bound..
+///
 #[test]
 fn p8_hostile_paramswriter_impl() {
     trybuild::TestCases::new()
@@ -122,7 +122,7 @@ fn p8_hostile_paramswriter_impl() {
 /// **P9** — `Box::leak(Box::new(PreparedQuery { ... }))` + field
 /// mutate. Expected: `error[E0451]: field 'sql' of struct
 /// 'PreparedQuery' is private` (struct literal step blocked before
-/// Box::leak is reached). Memo §7 Probe P9.
+/// `Box::leak` is reached). Probe P9.
 #[test]
 fn p9_box_leak_field_mutate() {
     trybuild::TestCases::new()
@@ -131,7 +131,7 @@ fn p9_box_leak_field_mutate() {
 
 /// **P10** — `core::mem::transmute` byte-array into `PreparedQuery`.
 /// Expected: `error: usage of an 'unsafe' block`. Same OS-boundary
-/// class as P4. Memo §7 Probe P10 + §12.
+/// class as P4 (probe P10, OS-boundary parallel).
 #[test]
 fn p10_mem_transmute() {
     trybuild::TestCases::new()
@@ -142,7 +142,7 @@ fn p10_mem_transmute() {
 /// requires harvesting the macro-baked statement name). Expected:
 /// `error[E0616]: field 'stmt_name' of struct 'PreparedQuery' is
 /// private`. The accessor `q.stmt_name()` exists for legitimate
-/// diagnostic use; raw field access is barred. Memo §7 Probe P11.
+/// diagnostic use; raw field access is barred. Probe P11.
 #[test]
 fn p11_stmt_name_hash_collision() {
     trybuild::TestCases::new()
@@ -152,8 +152,8 @@ fn p11_stmt_name_hash_collision() {
 /// **P12** — mutate baked `parse_template` bytes. Expected:
 /// `error[E0616]: field 'parse_template' of struct 'PreparedQuery'
 /// is private` (the visibility check fires; the unsafe block would
-/// also be rejected by the file-scope forbid). Memo §7 Probe P12
-/// + §12.
+/// also be rejected by the file-scope forbid). Probe P12
+/// (OS-boundary parallel).
 #[test]
 fn p12_mutate_wire_template() {
     trybuild::TestCases::new()

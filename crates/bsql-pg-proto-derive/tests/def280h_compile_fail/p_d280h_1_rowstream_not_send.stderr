@@ -1,7 +1,7 @@
 error[E0277]: `*const ()` cannot be sent between threads safely
-  --> tests/def280h_compile_fail/p_d280h_1_rowstream_not_send.rs:27:20
+  --> tests/def280h_compile_fail/p_d280h_1_rowstream_not_send.rs:26:20
    |
-27 |     require_send::<RowStream<'static, 'static>>();
+26 |     require_send::<RowStream<'static, 'static>>();
    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const ()` cannot be sent between threads safely
    |
    = help: within `RowStream<'static, 'static>`, the trait `Send` is not implemented for `*const ()`

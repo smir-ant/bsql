@@ -10,7 +10,7 @@ error: prepared!: unsupported PG type `numeric`.
 
        Why the restriction: the runtime crate's `DecodeFormat<TextFmt>` + `EncodeBinary` matrix currently implements only these six types. Adding a type here without the runtime decoder/encoder would compile the macro but fail at runtime when the generated `R::decode` body references a missing trait impl — that's why we reject at macro-expand.
 
-       Wider type coverage [bytea / varchar / bpchar / name / float4 / float8 / numeric / timestamp / timestamptz / date / time / uuid / jsonb / interval] tracks DEF-228 in deferred.md. When DEF-228 lands the missing `DecodeFormat<TextFmt>` impls, this table grows in lockstep — single source of truth for the type ↔ OID ↔ Rust-type mapping.
+       Wider type coverage [bytea / varchar / bpchar / name / float4 / float8 / numeric / timestamp / timestamptz / date / time / uuid / jsonb / interval] lands as the missing `DecodeFormat<TextFmt>` impls ship in the runtime crate. This table grows in lockstep — single source of truth for the type ↔ OID ↔ Rust-type mapping.
   --> tests/prepared_unsupported_types/numeric.rs:13:5
    |
 13 |     "SELECT $1::numeric"

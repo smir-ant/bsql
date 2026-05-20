@@ -1,4 +1,4 @@
-//! DEF-246 Phase 1 probe **P-E-8** — `PgProtocol`'s `inner` and
+//! Probe **P-E-8** — `PgProtocol`'s `inner` and
 //! `phase_marker` fields are module-private; struct-literal
 //! construction outside `mod protocol` fails with E0451 (private
 //! fields cannot be named in a literal).

@@ -1,4 +1,4 @@
-//! DEF-244 hostile-bypass probe **P1** — direct struct construction
+//! Hostile-bypass probe **P1** — direct struct construction
 //! with hostile SQL.
 //!
 //! # Tier
@@ -17,11 +17,7 @@
 //! Without `pub(crate)`, a hostile caller could bypass the
 //! `prepared!` macro entirely and mint a `PreparedQuery` carrying
 //! arbitrary SQL — including SQL with embedded user data. That
-//! would defeat the entire memo §7 closure.
-//!
-//! # Memo cross-reference
-//!
-//! Memo §7 Probe P1.
+//! would defeat the entire SQL-injection-rejection closure.
 
 extern crate bsql_pg_proto;
 

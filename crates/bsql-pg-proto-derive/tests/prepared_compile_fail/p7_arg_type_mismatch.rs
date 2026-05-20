@@ -1,4 +1,4 @@
-//! DEF-244 hostile-bypass probe **P7** — pass arguments of the
+//! Hostile-bypass probe **P7** — pass arguments of the
 //! wrong type to a `PreparedQuery`.
 //!
 //! # Tier
@@ -25,14 +25,10 @@
 //!
 //! # Memo cross-reference
 //!
-//! Memo §7 Probe P7.
+//! # Handshake driver
 //!
-//! # DEF-246 Phase 2 migration (2026-05-16)
-//!
-//! Pre-DEF-246 the probe used `PgProtocol::new() -> <ActivePhase>` +
-//! `as_ready()` to obtain a `ReadyGuard`. Post-DEF-246 the
-//! constructor returns `<DisconnectedPhase>`; the handshake must
-//! complete (`push_startup → ConnectingPhase` + auth frames +
+//! `PgProtocol::new()` returns `<DisconnectedPhase>`; the handshake
+//! must complete (`push_startup → ConnectingPhase` + auth frames +
 //! `into_active`) to reach `<ActivePhase>`. The probe drives a
 //! synthetic Trust handshake inline so the type-mismatch check at
 //! `execute_prepared` is the FIRST compile-time failure.

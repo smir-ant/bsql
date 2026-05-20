@@ -1,4 +1,4 @@
-//! DEF-280 Bundle H probe **P-D280H-1** — `RowStream` is `!Send`.
+//! Probe **P-D280H-1** — `RowStream` is `!Send`.
 //!
 //! Tier-1 by construction: `RowStream` carries a
 //! `PhantomData<*const ()>` field; `*const ()` is the canonical
@@ -22,7 +22,6 @@ use bsql_pg_proto::RowStream;
 fn require_send<T: Send>() {}
 
 fn main() {
-    // RowStream is !Send per DEF-280 Bundle H — this must fail
-    // to compile with E0277.
+    // RowStream is `!Send` — this must fail to compile with E0277.
     require_send::<RowStream<'static, 'static>>();
 }

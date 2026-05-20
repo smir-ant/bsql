@@ -1,4 +1,4 @@
-//! DEF-278 Bundle D / D' probe **P-D278D-1** — `with_cancel_request()`
+//! Probe **P-D278D-1** — `with_cancel_request()`
 //! is method-absent on `<DisconnectedPhase>`.
 //!
 //! Tier-1 by construction: the method lives ONLY on

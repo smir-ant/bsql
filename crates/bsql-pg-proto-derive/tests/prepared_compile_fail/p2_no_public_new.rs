@@ -1,4 +1,4 @@
-//! DEF-244 hostile-bypass probe **P2** — `PreparedQuery::new(...)`
+//! Hostile-bypass probe **P2** — `PreparedQuery::new(...)`
 //! does not exist as a public constructor.
 //!
 //! # Tier

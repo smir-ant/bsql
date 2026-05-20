@@ -1,4 +1,4 @@
-//! DEF-244 hostile-bypass probe **P5** — fabricate a hostile `&str`
+//! Hostile-bypass probe **P5** — fabricate a hostile `&str`
 //! via `unsafe` and route it through a fake `PreparedQuery`.
 //!
 //! # Tier

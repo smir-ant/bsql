@@ -1,4 +1,4 @@
-//! DEF-246 Phase 4 elevation #3 probe **P-E-6** — pushing a regular
+//! Probe **P-E-6** — pushing a regular
 //! command on `<ClosedPhase>` is method-absent.
 //!
 //! Tier-1 by construction: `<ClosedPhase>` exposes ONLY `cause()` —

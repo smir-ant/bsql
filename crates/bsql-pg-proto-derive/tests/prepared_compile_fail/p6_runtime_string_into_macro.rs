@@ -1,4 +1,4 @@
-//! DEF-244 hostile-bypass probe **P6** — feed a runtime string
+//! Hostile-bypass probe **P6** — feed a runtime string
 //! (variable, expression, or macro invocation other than the
 //! literal itself) into `prepared!`.
 //!

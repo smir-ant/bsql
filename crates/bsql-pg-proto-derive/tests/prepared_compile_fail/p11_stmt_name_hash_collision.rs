@@ -1,4 +1,4 @@
-//! DEF-244 hostile-bypass probe **P11** — re-use of stmt_name across
+//! Hostile-bypass probe **P11** — re-use of stmt_name across
 //! mismatched prepared queries (hash collision class).
 //!
 //! # Tier

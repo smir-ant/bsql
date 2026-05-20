@@ -1,5 +1,5 @@
-//! DEF-244 — pin the `float8` (PG DOUBLE PRECISION) rejection at
-//! macro-expand. Same DEF-228 dependency as `float4`. **Delete this
+//! Pin the `float8` (PG DOUBLE PRECISION) rejection at
+//! macro-expand. Same runtime dependency as `float4`. **Delete this
 //! file in the same commit that adds `f64` runtime support.**
 
 extern crate bsql_pg_proto;

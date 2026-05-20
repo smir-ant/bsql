@@ -1,23 +1,23 @@
-//! DEF-280 Bundle E Phase 1 probe **P-D280E-2** — the HRTB-scoped
+//! Probe **P-D280E-2** — the HRTB-scoped
 //! `&T` borrow lent into `Sensitive::with_inner`'s closure cannot
 //! escape past the call.
 //!
-//! This is the **retention-impossibility guarantee** that Bundle E
-//! lands. Pre-Bundle E `Sensitive::get(&self) -> &T` returned a
-//! borrow tied to `&self`'s lifetime — Rust's borrow checker
-//! prevented use-after-Drop but the borrow itself could propagate
-//! through arbitrary value-shapes (struct fields, async future
-//! captures, etc.) up to `Sensitive`'s scope-exit. The docstring
-//! asked callers «not to store the reference beyond the immediate
-//! computation» (tier-2 by-discipline).
-//!
-//! Post-Bundle E `with_inner<R>(&self, f: impl FnOnce(&T) -> R)
-//! -> R` desugars to `for<'a> FnOnce(&'a T) -> R` (HRTB-quantified
-//! `'a`). `R` is a single concrete type that does NOT depend on
-//! `'a`. So if the closure tries to return the inner borrow itself
+//! This is the **retention-impossibility guarantee**. The
+//! `with_inner<R>(&self, f: impl FnOnce(&T) -> R) -> R` accessor
+//! desugars to `for<'a> FnOnce(&'a T) -> R` (HRTB-quantified `'a`).
+//! `R` is a single concrete type that does NOT depend on `'a`. So
+//! if the closure tries to return the inner borrow itself
 //! (`R = &'a T`), `R` must encompass `&'a` for ALL `'a` — the only
 //! such type is `&'static T`, but the closure body's `inner` does
 //! not have `'static` lifetime. Type error.
+//!
+//! A naive `Sensitive::get(&self) -> &T` shape would return a
+//! borrow tied to `&self`'s lifetime — Rust's borrow checker would
+//! prevent use-after-Drop but the borrow itself could propagate
+//! through arbitrary value-shapes (struct fields, async future
+//! captures, etc.) up to `Sensitive`'s scope-exit. A docstring
+//! asking callers «not to store the reference beyond the immediate
+//! computation» would be tier-2 by-discipline.
 //!
 //! This probe attempts the retention attack and pins that rustc
 //! rejects it.

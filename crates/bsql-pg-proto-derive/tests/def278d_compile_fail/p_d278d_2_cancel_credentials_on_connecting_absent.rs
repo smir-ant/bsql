@@ -1,18 +1,16 @@
-//! DEF-278 Bundle D / D' probe **P-D278D-2** — `with_cancel_request()`
+//! Probe **P-D278D-2** — `with_cancel_request()`
 //! is method-absent on `<ConnectingPhase>`.
 //!
 //! Tier-1 by construction: the method lives ONLY on
 //! `impl PgProtocol<ActivePhase>` (see `src/protocol.rs`). Calling it
 //! on `<ConnectingPhase>` returns E0599 — phase has no such method.
 //!
-//! Rationale (Option α §8.5, DEF-278 Bundle D principal sign-off):
-//! method-absent on `<ConnectingPhase>`. A driver wanting to cancel
-//! mid-handshake must drop the connection; there is no production
-//! scenario where a pool cancels a mid-handshake connection (cost of
-//! opening a new connection < cost of debugging the cancel
-//! semantics). Method-absence eliminates the runtime-classify
-//! ambiguity ("sometimes returns Some, sometimes None based on
-//! whether K arrived").
+//! A driver wanting to cancel mid-handshake must drop the
+//! connection; there is no production scenario where a pool cancels
+//! a mid-handshake connection (cost of opening a new connection <
+//! cost of debugging the cancel semantics). Method-absence
+//! eliminates the runtime-classify ambiguity ("sometimes returns
+//! Some, sometimes None based on whether K arrived").
 
 extern crate bsql_pg_proto;
 

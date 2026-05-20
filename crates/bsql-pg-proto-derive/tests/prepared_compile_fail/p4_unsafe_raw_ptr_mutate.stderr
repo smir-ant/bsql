@@ -1,25 +1,25 @@
 error: usage of an `unsafe` block
-  --> tests/prepared_compile_fail/p4_unsafe_raw_ptr_mutate.rs:46:5
+  --> tests/prepared_compile_fail/p4_unsafe_raw_ptr_mutate.rs:48:5
    |
-46 | /     unsafe {
-47 | |         let sql_ptr = &Q.sql as *const &str as *mut &str;
-48 | |         sql_ptr.write("DROP TABLE users; --");
-49 | |     }
+48 | /     unsafe {
+49 | |         let sql_ptr = &Q.sql as *const &str as *mut &str;
+50 | |         sql_ptr.write("DROP TABLE users; --");
+51 | |     }
    | |_____^
    |
 note: the lint level is defined here
-  --> tests/prepared_compile_fail/p4_unsafe_raw_ptr_mutate.rs:35:11
+  --> tests/prepared_compile_fail/p4_unsafe_raw_ptr_mutate.rs:37:11
    |
-35 | #![forbid(unsafe_code)]
+37 | #![forbid(unsafe_code)]
    |           ^^^^^^^^^^^
 
 error[E0616]: field `sql` of struct `PreparedQuery` is private
-  --> tests/prepared_compile_fail/p4_unsafe_raw_ptr_mutate.rs:47:26
+  --> tests/prepared_compile_fail/p4_unsafe_raw_ptr_mutate.rs:49:26
    |
-47 |         let sql_ptr = &Q.sql as *const &str as *mut &str;
+49 |         let sql_ptr = &Q.sql as *const &str as *mut &str;
    |                          ^^^ private field
    |
 help: a method `sql` also exists, call it with parentheses
    |
-47 |         let sql_ptr = &Q.sql() as *const &str as *mut &str;
+49 |         let sql_ptr = &Q.sql() as *const &str as *mut &str;
    |                             ++

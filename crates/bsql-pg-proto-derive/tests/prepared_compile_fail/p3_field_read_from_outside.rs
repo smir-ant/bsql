@@ -1,4 +1,4 @@
-//! DEF-244 hostile-bypass probe **P3** — read `Q.sql` directly from
+//! Hostile-bypass probe **P3** — read `Q.sql` directly from
 //! outside the crate.
 //!
 //! # Tier

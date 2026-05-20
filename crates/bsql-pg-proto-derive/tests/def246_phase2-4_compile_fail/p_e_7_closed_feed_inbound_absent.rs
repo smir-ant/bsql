@@ -1,4 +1,4 @@
-//! DEF-246 Phase 4 elevation #3 probe **P-E-7** — `feed_inbound` is
+//! Probe **P-E-7** — `feed_inbound` is
 //! method-absent on `<ClosedPhase>`. Tier-1 by construction: the
 //! terminal phase absorbs no input.
 

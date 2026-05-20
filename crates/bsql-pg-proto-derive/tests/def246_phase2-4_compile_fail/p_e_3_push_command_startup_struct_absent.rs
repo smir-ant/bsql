@@ -1,4 +1,4 @@
-//! DEF-246 Approach E probe **P-E-3** — `push_command::Startup` is
+//! Probe **P-E-3** — `push_command::Startup` is
 //! deleted; the only path is `<DisconnectedPhase>::push_startup`.
 //! External code that imports the struct fails with E0432.
 

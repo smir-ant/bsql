@@ -1,4 +1,4 @@
-//! DEF-246 Phase 3 elevation #2 probe **P-E-5** — pushing a regular
+//! Probe **P-E-5** — pushing a regular
 //! command on `<ConnectingPhase>` is method-absent. Tier-1 by
 //! construction: handshake phase has only `feed_inbound` /
 //! `advance_one_frame` / `into_active`; no `push_command` /

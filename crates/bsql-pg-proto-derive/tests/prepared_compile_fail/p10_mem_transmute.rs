@@ -1,4 +1,4 @@
-//! DEF-244 hostile-bypass probe **P10** — `core::mem::transmute`
+//! Hostile-bypass probe **P10** — `core::mem::transmute`
 //! a raw byte array into a `PreparedQuery`.
 //!
 //! # Tier

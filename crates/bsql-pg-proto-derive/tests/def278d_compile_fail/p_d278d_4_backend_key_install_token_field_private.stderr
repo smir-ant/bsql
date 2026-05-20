@@ -1,13 +1,5 @@
-error[E0603]: module `_backend_key_install_leaf` is private
+error[E0433]: cannot find `_backend_key_install_leaf` in `protocol`
   --> tests/def278d_compile_fail/p_d278d_4_backend_key_install_token_field_private.rs:24:43
    |
 24 |     let _token = bsql_pg_proto::protocol::_backend_key_install_leaf::BackendKeyInstallToken(());
-   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^  ---------------------- tuple struct `BackendKeyInstallToken` is not publicly re-exported
-   |                                           |
-   |                                           private module
-   |
-note: the module `_backend_key_install_leaf` is defined here
-  --> $WORKSPACE/crates/bsql-pg-proto/src/protocol.rs
-   |
-   | pub(crate) mod _backend_key_install_leaf {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^ could not find `_backend_key_install_leaf` in `protocol`

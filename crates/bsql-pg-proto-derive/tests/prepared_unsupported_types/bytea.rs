@@ -1,5 +1,5 @@
-//! DEF-244 — pin the `bytea` rejection at macro-expand. Tracks
-//! DEF-228: when `DecodeFormat<TextFmt>` for `&[u8]` (or the
+//! Pin the `bytea` rejection at macro-expand. Tracks
+//! When `DecodeFormat<TextFmt>` for `&[u8]` (or the
 //! canonical `Bytea` newtype) lands, the runtime crate gains the
 //! decode/encode pair, the macro's typemap grows the `bytea` entry,
 //! and **this file must be deleted in the same commit**. Drift

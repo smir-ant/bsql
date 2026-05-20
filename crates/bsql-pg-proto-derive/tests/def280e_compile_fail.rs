@@ -1,14 +1,12 @@
-//! DEF-280 Bundle E Phase 1 (2026-05-18) — `trybuild` golden harness
-//! for the `Sensitive::get` → `Sensitive::with_inner` closure-scope
-//! migration.
+//! `trybuild` golden harness for `Sensitive`'s closure-scope
+//! borrow contract.
 //!
-//! Pre-Bundle E `Sensitive<T>` had `pub const fn get(&self) -> &T`
-//! with a docstring discipline («caller must not store the
-//! reference beyond the immediate computation»). Bundle E migrated
-//! this to `pub fn with_inner<R>(&self, f: impl FnOnce(&T) -> R)
-//! -> R` (tier-1 by-construction — HRTB-scoped borrow cannot
-//! escape). This trybuild harness pins that the old method is now
-//! absent from the public surface.
+//! `Sensitive<T>` exposes a `pub fn with_inner<R>(&self, f: impl
+//! FnOnce(&T) -> R) -> R` accessor — tier-1 by-construction, the
+//! HRTB-scoped `&T` borrow cannot escape. A naive `pub const fn
+//! get(&self) -> &T` shape would push the no-retention contract
+//! onto docstring discipline. This trybuild harness pins that the
+//! escape-hatch method is absent from the public surface.
 //!
 //! # Probes
 //!

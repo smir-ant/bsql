@@ -1,4 +1,4 @@
-//! DEF-244 hostile-bypass probe **P9** — `Box::leak` + field mutate
+//! Hostile-bypass probe **P9** — `Box::leak` + field mutate
 //! to obtain `&'static mut PreparedQuery` and overwrite `sql`.
 //!
 //! # Tier

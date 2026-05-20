@@ -1,4 +1,4 @@
-//! DEF-278 Bundle D probe **P-D278D-4** — the
+//! Probe **P-D278D-4** — the
 //! `BackendKeyInstallToken` cannot be minted from outside
 //! the `_backend_key_install_leaf` submodule (which is itself
 //! `pub(crate)`, so unreachable from external crates).

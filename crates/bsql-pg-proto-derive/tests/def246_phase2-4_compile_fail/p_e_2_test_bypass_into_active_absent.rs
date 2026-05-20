@@ -1,4 +1,4 @@
-//! DEF-246 Approach E probe **P-E-2** — `__test_bypass_into_active()`
+//! Probe **P-E-2** — `__test_bypass_into_active()`
 //! does not exist on `PgProtocol<DisconnectedPhase>`. The
 //! consume-self path is exclusively `push_startup → ConnectingPhase
 //! → into_active` (the latter is a real classifier, not a bypass).

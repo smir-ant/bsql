@@ -1,6 +1,5 @@
-//! DEF-278 Bundle D / D' (2026-05-17 / 2026-05-18) — `trybuild`
-//! golden harness for the CancelRequest mechanism's tier-1 closure
-//! probes.
+//! `trybuild` golden harness for the CancelRequest mechanism's
+//! tier-1 closure probes.
 //!
 //! Each probe is a self-contained `.rs` file under
 //! `tests/def278d_compile_fail/`. Trybuild attempts to compile each
@@ -12,23 +11,23 @@
 //! - **P-D278D-1** `<DisconnectedPhase>::with_cancel_request()`
 //!   → E0599 (method-absent — phase has no `with_cancel_request`).
 //! - **P-D278D-2** `<ConnectingPhase>::with_cancel_request()`
-//!   → E0599 (method-absent — per §8.5 decision, a driver must drive
-//!   handshake to completion or drop the connection).
+//!   → E0599 (method-absent — a driver wanting to cancel mid-
+//!   handshake must drop the connection; there is no production
+//!   scenario where a pool cancels a mid-handshake connection).
 //! - **P-D278D-3** `<ClosedPhase>::with_cancel_request()` →
 //!   E0599 (method-absent — terminal phase, no cancel surface).
 //! - **P-D278D-4** `BackendKeyInstallToken` field-private struct
 //!   literal → E0603 (the leaf submodule is `pub(crate)` so external
 //!   code cannot name it; behind that the tuple-struct field is also
 //!   private to the leaf).
-//! - **P-D278D-5** `CancelRequestCredentials` no longer publicly
-//!   exported post-Bundle-D' → E0432 (unresolved import). Bundle D'
-//!   eliminated the public struct entirely; the closure-scoped
-//!   `with_cancel_request` lends `&[u8; 16]` directly.
+//! - **P-D278D-5** `CancelRequestCredentials` is not a public
+//!   export → E0432 (unresolved import). The closure-scoped
+//!   `with_cancel_request` lends `&[u8; 16]` directly — no
+//!   long-lived public struct.
 //! - **P-D278D-6** `&[u8; 16]` lent into the closure cannot escape
 //!   past the call → `E0521` "borrowed data escapes outside of
 //!   closure" (HRTB-quantified lifetime). This is the **closure-
-//!   scope retention guarantee** — the tier elevation that
-//!   Bundle D' lands.
+//!   scope retention guarantee** — tier-1 against retention.
 //!
 //! # Regenerating goldens
 //!

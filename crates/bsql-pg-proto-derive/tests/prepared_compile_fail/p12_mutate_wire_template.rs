@@ -1,4 +1,4 @@
-//! DEF-244 hostile-bypass probe **P12** — mutate the macro-baked
+//! Hostile-bypass probe **P12** — mutate the macro-baked
 //! wire-template bytes (`parse_template` or `bind_execute_prefix`).
 //!
 //! # Tier

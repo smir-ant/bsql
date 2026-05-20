@@ -1,4 +1,4 @@
-//! DEF-246 Phase 2 elevation #1 probe **P-E-4** — pushing a regular
+//! Probe **P-E-4** — pushing a regular
 //! command from `<DisconnectedPhase>` is method-absent.
 //!
 //! Tier-1 by construction: `push_command` lives on
