@@ -440,8 +440,13 @@ impl PartialAssemblyInner {
     /// the prefix; the remainder are counted-and-skipped (decrement
     /// `body_remaining` without copying).
     ///
-    /// Returns the **total** number of bytes consumed (copied + skipped).
-    /// Caller advances its input pointer by the returned value.
+    /// Returns the `(consumed, leftover)` pair pre-split from `bytes`:
+    /// `consumed` is the prefix this call absorbed (copied + skipped);
+    /// `leftover` is the unconsumed suffix the caller should feed
+    /// onward (typically into `ReadBuf`). The split happens inside
+    /// the function where the count is known, so callers never see
+    /// the offset and cannot drift a downstream dead-arm
+    /// `bytes.get(N..).unwrap_or(&[])` pattern.
     ///
     /// # Algorithmic complexity
     ///
@@ -460,65 +465,52 @@ impl PartialAssemblyInner {
     /// braces shield — a future regression that mis-sizes
     /// `copy_take` would fail-closed (no copy) rather than panic.
     #[inline]
-    fn absorb(&mut self, bytes: &[u8]) -> usize {
-        // `usize::try_from(u32)` is infallible on every supported
-        // target (the `usize::BITS >= 32` const-assert at the crate
-        // root rejects 16-bit targets at build time). The `unwrap_or(0)`
-        // fallback is therefore architecturally dead — it survives
-        // syntactically because `expect`/`unreachable!`/`as` are all
-        // forbid-bundle-banned; the const-assert is the actual safety
-        // net. A future tier-1 lift would introduce a branded const
-        // widening that doesn't go through `Result`.
+    fn absorb<'b>(&mut self, bytes: &'b [u8]) -> (&'b [u8], &'b [u8]) {
+        // Widen `body_remaining` (u32) to `usize`. The crate-root
+        // const-assert `usize::BITS >= 32` makes the conversion
+        // infallible; the `unwrap_or(0)` fallback is architecturally
+        // dead but kept as the forbid-bundle-compliant landing pad
+        // (`expect` / `unreachable!` / `as` are all banned). A future
+        // typed-narrowing-helper sweep would lift this to a single
+        // audited helper.
         let owed_usize = usize::try_from(self.body_remaining).unwrap_or(0);
         let take = core::cmp::min(bytes.len(), owed_usize);
-        // The first `take` bytes are consumed from the wire stream;
-        // the prefix gets up to PREFIX_CAP - prefix_buf.len() of them.
+        // `take <= bytes.len()` by `min` — `split_at` is infallible
+        // (no `unwrap_or((_, &[]))` dead-arm landing pad).
+        let (consumed, leftover) = bytes.split_at(take);
+        // Prefix accumulator: copy at most `prefix_headroom` bytes
+        // from the consumed prefix into `prefix_buf`. Bytes beyond
+        // `prefix_headroom` are counted-and-skipped (not copied).
         let prefix_headroom = PREFIX_CAP.saturating_sub(self.prefix_buf.len());
         let copy_take = core::cmp::min(take, prefix_headroom);
-        // Single-shot bounds-check via `split_at_checked`.
-        // `copy_take = min(take, prefix_headroom)` and `take <= bytes
-        // .len()`, so `copy_take <= bytes.len()` by transitive
-        // min-bound; the `None` arm of `split_at_checked(copy_take)` is
-        // architecturally dead. The fail-closed semantic on that dead
-        // arm (no-op copy + counter still decrements → wire stays in
-        // sync) is preserved as belt-and-braces.
-        let copy_slice: &[u8] = match bytes.split_at_checked(copy_take) {
-            Some((head, _tail)) => head,
-            None => {
-                core::hint::cold_path();
-                &[]
-            }
-        };
+        // `copy_take <= take == consumed.len()` by transitive `min`
+        // — `split_at` infallible.
+        let (copy_slice, _spill) = consumed.split_at(copy_take);
         // `extend_from_slice` returns `Result<(), _>` on overflow of
-        // the const-generic cap. The slicing above (`copy_take =
-        // min(take, prefix_headroom)`) guarantees fit; the explicit
-        // pattern-match discards the result to satisfy the
-        // `clippy::let_underscore_must_use` lint while documenting
-        // that the Err arm is architecturally dead (no overflow can
-        // happen given headroom-pre-sized input).
+        // the const-generic cap. `copy_take <= prefix_headroom`
+        // guarantees fit; the explicit `is_err` discard satisfies
+        // `clippy::let_underscore_must_use` while documenting that
+        // the Err arm is architecturally dead.
         if self.prefix_buf.extend_from_slice(copy_slice).is_err() {
-            // Architecturally dead — `copy_slice.len() == copy_take ≤
-            // prefix_headroom`. Reached only via a future regression
-            // that mis-sizes the slice; classify as "no-op fail-closed"
-            // (no copy, body_remaining still decrements via the full
-            // `take` below — wire stream stays in sync).
+            // Architecturally dead — `copy_slice.len() == copy_take
+            // ≤ prefix_headroom`. Reached only via a future
+            // regression that mis-sizes the slice; classify as
+            // "no-op fail-closed" (no copy, body_remaining still
+            // decrements via the full `take` below — wire stream
+            // stays in sync).
             core::hint::cold_path();
         }
-        // body_remaining always decrements by the full `take` — bytes
-        // beyond prefix_headroom are counted-and-skipped, not copied.
-        // `take = min(bytes.len(), owed_usize)` and `owed_usize` was
-        // widened from a `u32` (body_remaining) above, so `take <=
-        // owed_usize <= u32::MAX`. `u32::try_from(take)` is therefore
-        // infallible; the `unwrap_or(u32::MAX)` saturation arm is
-        // architecturally dead. A structural lift to a branded narrowing
-        // helper (mirror of `_usize_widening::u32_to_usize` proposed at
-        // :472) would close this tier-1; deferred because `absorb`'s
-        // public signature returns `usize` (changing to `Result<usize,
-        // MalformedLengthCrateBug>` ripples through every caller in
-        // dispatch.rs — out of scope for Tier 3).
+        // body_remaining always decrements by the full `take` —
+        // bytes beyond `prefix_headroom` are counted-and-skipped,
+        // not copied. `take = min(bytes.len(), owed_usize)` and
+        // `owed_usize` was widened from a `u32` above, so
+        // `take <= owed_usize <= u32::MAX`; `u32::try_from(take)` is
+        // infallible. The `unwrap_or(u32::MAX)` saturation arm is
+        // architecturally dead pending the typed-narrowing-helper
+        // sweep.
         let take_u32 = u32::try_from(take).unwrap_or(u32::MAX);
         self.body_remaining = self.body_remaining.saturating_sub(take_u32);
-        take
+        (consumed, leftover)
     }
 
     /// `true` iff `body_remaining == 0` — the wire body has been
@@ -662,20 +654,24 @@ impl PartialAssemblyCell {
         }
     }
 
-    /// **Absorb bytes** into the active assembly. Returns the number of
-    /// bytes consumed from `bytes` (copied to prefix + counted-and-
-    /// skipped); caller advances its slice pointer accordingly.
-    /// Returns 0 if not in partial mode (defensive — production caller
-    /// always checks `is_active()` first).
+    /// **Absorb bytes** into the active assembly. Returns the
+    /// `(consumed, leftover)` pair pre-split from `bytes`:
+    /// `consumed` is what this call absorbed (copied + skipped);
+    /// `leftover` is what the caller should feed onward.
+    ///
+    /// When the cell is inactive (`is_active() == false`), returns
+    /// `(&[], bytes)` — nothing consumed, the whole input is the
+    /// leftover. Production callers always check `is_active()` first;
+    /// this branch is defensive.
     #[inline]
-    pub(crate) fn absorb_at_dispatch(
+    pub(crate) fn absorb_at_dispatch<'b>(
         &mut self,
         _token: crate::protocol::_partial_assembly_dispatch_leaf::PartialAssemblyAbsorbToken,
-        bytes: &[u8],
-    ) -> usize {
+        bytes: &'b [u8],
+    ) -> (&'b [u8], &'b [u8]) {
         match self.inner.as_mut() {
             Some(inner) => inner.absorb(bytes),
-            None => 0,
+            None => (&[], bytes),
         }
     }
 
@@ -778,11 +774,11 @@ mod tests {
     #[test]
     fn inner_absorbs_across_chunks_within_prefix_cap() {
         let mut inner = PartialAssemblyInner::new(b'T', 12);
-        let n1 = inner.absorb(b"hello");
-        assert_eq!(n1, 5);
+        let (consumed1, _) = inner.absorb(b"hello");
+        assert_eq!(consumed1.len(), 5);
         assert!(!inner.is_complete());
-        let n2 = inner.absorb(b" world!!");
-        assert_eq!(n2, 7); // only 12 - 5 = 7 owed
+        let (consumed2, _) = inner.absorb(b" world!!");
+        assert_eq!(consumed2.len(), 7); // only 12 - 5 = 7 owed
         assert!(inner.is_complete());
         assert_eq!(inner.prefix(), b"hello world!");
     }
@@ -801,15 +797,15 @@ mod tests {
 
         // Feed PREFIX_CAP bytes — exactly fills the prefix.
         let chunk1 = alloc::vec![b'X'; PREFIX_CAP];
-        let n1 = inner.absorb(&chunk1);
-        assert_eq!(n1, PREFIX_CAP);
+        let (consumed1, _) = inner.absorb(&chunk1);
+        assert_eq!(consumed1.len(), PREFIX_CAP);
         assert_eq!(inner.prefix().len(), PREFIX_CAP);
         assert!(!inner.is_complete());
 
         // Feed 100 more bytes — counted, NOT copied.
         let chunk2 = alloc::vec![b'Y'; 100];
-        let n2 = inner.absorb(&chunk2);
-        assert_eq!(n2, 100);
+        let (consumed2, _) = inner.absorb(&chunk2);
+        assert_eq!(consumed2.len(), 100);
         // Prefix size UNCHANGED.
         assert_eq!(inner.prefix().len(), PREFIX_CAP);
         // Prefix bytes are all 'X' (the first PREFIX_CAP bytes), zero 'Y'.
@@ -834,8 +830,8 @@ mod tests {
         let huge_u64: u64 = u64::from(huge_body_len);
 
         while total_fed < huge_u64 {
-            let n = inner.absorb(&chunk);
-            let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
+            let (consumed, _) = inner.absorb(&chunk);
+            let n_u64 = u64::try_from(consumed.len()).unwrap_or(u64::MAX);
             total_fed = total_fed.saturating_add(n_u64);
             // Prefix never grows past PREFIX_CAP.
             assert!(
@@ -844,10 +840,11 @@ mod tests {
                 inner.prefix().len(),
                 PREFIX_CAP,
             );
-            // Once prefix is full, subsequent absorbs return chunk_size
-            // (the input length) — pure count-and-skip path.
+            // Once prefix is full, subsequent absorbs consume the
+            // full chunk_size (input length) — pure count-and-skip
+            // path.
             if inner.prefix().len() == PREFIX_CAP && !inner.is_complete() {
-                assert_eq!(n, chunk_size);
+                assert_eq!(consumed.len(), chunk_size);
             }
         }
         assert!(inner.is_complete());
@@ -858,7 +855,8 @@ mod tests {
     #[test]
     fn inner_reset_preserves_inline_buffer() {
         let mut inner = PartialAssemblyInner::new(b'T', 256);
-        assert_eq!(inner.absorb(b"hello"), 5);
+        let (consumed, _) = inner.absorb(b"hello");
+        assert_eq!(consumed.len(), 5);
         inner.reset(b'E', 512);
         assert_eq!(inner.prefix().len(), 0);
         assert_eq!(inner.tag, b'E');
@@ -871,9 +869,10 @@ mod tests {
     #[test]
     fn inner_absorb_on_complete_consumes_nothing() {
         let mut inner = PartialAssemblyInner::new(b'T', 4);
-        assert_eq!(inner.absorb(&[0u8; 4]), 4);
+        let (consumed1, _) = inner.absorb(&[0u8; 4]);
+        assert_eq!(consumed1.len(), 4);
         assert!(inner.is_complete());
-        let n = inner.absorb(b"more bytes");
-        assert_eq!(n, 0);
+        let (consumed2, _) = inner.absorb(b"more bytes");
+        assert_eq!(consumed2.len(), 0);
     }
 }

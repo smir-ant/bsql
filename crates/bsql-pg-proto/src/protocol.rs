@@ -1259,13 +1259,14 @@ pub(crate) mod _partial_assembly_dispatch_leaf {
 
     /// Absorb body bytes via
     /// [`crate::partial_assembly::PartialAssemblyCell::absorb_at_dispatch`].
-    /// Returns the number of bytes consumed from `bytes`; caller
-    /// advances its input pointer accordingly.
+    /// Returns the `(consumed, leftover)` pair pre-split from
+    /// `bytes`: callers receive the post-split tail directly, no
+    /// downstream `bytes.get(N..).unwrap_or(&[])` dead-arm pattern.
     #[inline]
-    pub(in crate::protocol) fn absorb_partial_assembly_at_dispatch(
+    pub(in crate::protocol) fn absorb_partial_assembly_at_dispatch<'b>(
         cell: &mut crate::partial_assembly::PartialAssemblyCell,
-        bytes: &[u8],
-    ) -> usize {
+        bytes: &'b [u8],
+    ) -> (&'b [u8], &'b [u8]) {
         cell.absorb_at_dispatch(PartialAssemblyAbsorbToken(()), bytes)
     }
 
@@ -3570,22 +3571,11 @@ where
         && partial_assembly_slot.is_active()
     {
         core::hint::cold_path();
-        let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
+        let (_consumed, leftover) = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
             partial_assembly_slot,
             bytes,
         );
-        // Explicit bounds-check before the `.unwrap_or(&[])`
-        // syntactic fallback. `absorb_partial_*` returns the count
-        // of bytes it consumed from `bytes`, so
-        // `absorbed <= bytes.len()` by the function's contract; the
-        // None arm of `bytes.get(absorbed..)` is architecturally
-        // dead.
-        if absorbed > bytes.len() {
-            core::hint::cold_path();
-            &[]
-        } else {
-            bytes.get(absorbed..).unwrap_or(&[])
-        }
+        leftover
     } else {
         bytes
     };
@@ -3928,17 +3918,18 @@ where
                 body_len,
             );
             if !body_bytes.is_empty() {
-                let absorbed_n =
+                let (consumed, leftover) =
                     _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
                         partial_assembly_slot,
                         body_bytes,
                     );
-                debug_assert_eq!(
-                    absorbed_n,
+                debug_assert!(
+                    leftover.is_empty(),
+                    "partial-mode entry must absorb all body bytes \
+                     (consumed={}, body_bytes.len={}, leftover={})",
+                    consumed.len(),
                     body_bytes.len(),
-                    "partial-mode entry absorbed all body bytes \
-                     (absorbed={absorbed_n}, body_bytes.len={})",
-                    body_bytes.len(),
+                    leftover.len(),
                 );
             }
         }
@@ -4513,11 +4504,10 @@ impl ConnectingInner {
         }
         if self.partial_assembly.is_active() {
             core::hint::cold_path();
-            let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
+            let (_consumed, leftover) = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
                 &mut self.partial_assembly,
                 bytes,
             );
-            let leftover = bytes.get(absorbed..).unwrap_or(&[]);
             if leftover.is_empty() {
                 return Ok(());
             }
@@ -4699,11 +4689,10 @@ impl ActiveInner {
         }
         if self.partial_assembly.is_active() {
             core::hint::cold_path();
-            let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
+            let (_consumed, leftover) = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
                 &mut self.partial_assembly,
                 bytes,
             );
-            let leftover = bytes.get(absorbed..).unwrap_or(&[]);
             if leftover.is_empty() {
                 return Ok(());
             }
@@ -5025,11 +5014,10 @@ impl PgProtocol<ActivePhase> {
         // hot path 99.99% of the time (real PG payloads ≤ 4 KB).
         if self.inner.partial_assembly.is_active() {
             core::hint::cold_path();
-            let absorbed = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
+            let (_consumed, leftover) = _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
                 &mut self.inner.partial_assembly,
                 bytes,
             );
-            let leftover = bytes.get(absorbed..).unwrap_or(&[]);
             if leftover.is_empty() {
                 return Ok(());
             }
