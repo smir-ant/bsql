@@ -246,6 +246,10 @@ pub mod frame;
 pub mod guard;
 pub mod ident;
 pub(crate) mod md5;
+// Typed numeric narrowing/widening helpers with single-audit-point
+// encapsulation of the `try_from(...).unwrap_or(SATURATION)` pattern.
+// Crate-internal module; no public re-exports.
+pub(crate) mod narrow;
 pub mod params;
 pub mod password;
 // Runtime support for the `prepared!` proc-macro. Hosts

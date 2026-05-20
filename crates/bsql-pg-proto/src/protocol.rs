@@ -3771,10 +3771,16 @@ where
                             let already_buffered_body = after_consumed
                                 .get(HEADER_LEN..)
                                 .unwrap_or(&[]);
-                            let header_plus_body = u16::try_from(
-                                HEADER_LEN.saturating_add(already_buffered_body.len()),
-                            )
-                            .unwrap_or(u16::MAX);
+                            // `already_buffered_body.len() <=
+                            // READ_BUF_CAP - HEADER_LEN`; `HEADER_LEN +
+                            // body_len <= READ_BUF_CAP <= u16::MAX`.
+                            // The narrowing helper encapsulates the
+                            // dead-arm landing pad as a single audit
+                            // point.
+                            let header_plus_body =
+                                crate::narrow::u16_from_usize_under_u16_bound(
+                                    HEADER_LEN.saturating_add(already_buffered_body.len()),
+                                );
                             staged_partial_entry = Some((
                                 tag_byte,
                                 body_len,

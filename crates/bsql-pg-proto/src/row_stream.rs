@@ -1396,7 +1396,12 @@ impl<'p, 'w> RowStream<'p, 'w> {
                 if v_i16 < 0 {
                     return Err(ProtocolError::MalformedDataRow { total_len: 0 });
                 }
-                Ok(u16::try_from(v_i16).unwrap_or(0))
+                // Bit-cast under the just-proved `v_i16 >= 0`
+                // precondition. The helper uses
+                // `to_le_bytes`+`from_le_bytes` (zero-instruction
+                // reinterpret on LLVM); no `try_from` Err arm, no
+                // dead-arm landing pad.
+                Ok(crate::narrow::u16_from_nonneg_i16(v_i16))
             }
             _ => Err(ProtocolError::MalformedDataRow { total_len: 0 }),
         }

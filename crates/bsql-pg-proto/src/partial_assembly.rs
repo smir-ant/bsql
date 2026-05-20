@@ -466,14 +466,11 @@ impl PartialAssemblyInner {
     /// `copy_take` would fail-closed (no copy) rather than panic.
     #[inline]
     fn absorb<'b>(&mut self, bytes: &'b [u8]) -> (&'b [u8], &'b [u8]) {
-        // Widen `body_remaining` (u32) to `usize`. The crate-root
-        // const-assert `usize::BITS >= 32` makes the conversion
-        // infallible; the `unwrap_or(0)` fallback is architecturally
-        // dead but kept as the forbid-bundle-compliant landing pad
-        // (`expect` / `unreachable!` / `as` are all banned). A future
-        // typed-narrowing-helper sweep would lift this to a single
-        // audited helper.
-        let owed_usize = usize::try_from(self.body_remaining).unwrap_or(0);
+        // Widen `body_remaining` (u32) to `usize`. The conversion is
+        // infallible on every supported target (crate-root pin
+        // `usize::BITS >= 32`); `narrow::usize_from_u32` encapsulates
+        // the dead-arm landing pad in a single audit point.
+        let owed_usize = crate::narrow::usize_from_u32(self.body_remaining);
         let take = core::cmp::min(bytes.len(), owed_usize);
         // `take <= bytes.len()` by `min` — `split_at` is infallible
         // (no `unwrap_or((_, &[]))` dead-arm landing pad).
@@ -504,11 +501,11 @@ impl PartialAssemblyInner {
         // bytes beyond `prefix_headroom` are counted-and-skipped,
         // not copied. `take = min(bytes.len(), owed_usize)` and
         // `owed_usize` was widened from a `u32` above, so
-        // `take <= owed_usize <= u32::MAX`; `u32::try_from(take)` is
-        // infallible. The `unwrap_or(u32::MAX)` saturation arm is
-        // architecturally dead pending the typed-narrowing-helper
-        // sweep.
-        let take_u32 = u32::try_from(take).unwrap_or(u32::MAX);
+        // `take <= owed_usize <= u32::MAX`; the narrowing helper's
+        // `u32::try_from` Err arm is architecturally dead — the
+        // saturation lives in `narrow::u32_from_usize_under_u32_bound`
+        // as a single audited site.
+        let take_u32 = crate::narrow::u32_from_usize_under_u32_bound(take);
         self.body_remaining = self.body_remaining.saturating_sub(take_u32);
         (consumed, leftover)
     }
