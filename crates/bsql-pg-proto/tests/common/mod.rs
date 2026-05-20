@@ -1,30 +1,19 @@
-//! Shared helpers for DEF-198 ReadyGuard pattern in integration tests.
+//! Shared helpers for the `ReadyGuard` pattern in integration tests.
 //!
-//! # Pre-DEF-212 (pre-2026-05-04)
+//! # Push-path return shape
 //!
-//! Pre-DEF-212 tests called `proto.push_command(cmd, wb)` directly,
-//! got back `OutActions<'_, '_>`, and inspected the action list.
-//!
-//! # DEF-212 (Alt Y', architect-vetted impl plan, audit 2026-05-04)
-//!
-//! DEF-212 push paths returned `Result<(), PushFailure>` (~80 B
-//! return frame down from 800 B `OutActions`). On `Ok(())` bytes
-//! lived in the caller's `WriteBuf`; tests verified via `wb.as_bytes()`.
-//!
-//! # DEF-160 Z2 (2026-05-11)
-//!
-//! Post-DEF-160 push paths return `Result<OutActions<'_, 'static>, PushFailure>`
+//! Push paths return `Result<OutActions<'_, 'static>, PushFailure>`
 //! to surface the zero-copy SQL chunk (caller-owned `&str` borrowed
 //! via `SendBytesBorrowed`) alongside the header/trailer ranges in
 //! `WriteBuf`. Tests still want to assert on the FULL wire frame, so
 //! the helpers below drain `OutActions` into a local scratch buffer
 //! and rebuild `wb` with the concatenated bytes BEFORE returning —
-//! preserving the pre-DEF-160 test invariant `wb.as_bytes() == on-wire frame`.
+//! preserving the test invariant `wb.as_bytes() == on-wire frame`.
 //! This costs one extra memcpy in tests only; production callers
 //! drain `OutActions` directly to socket via `writev` / `IoSlice`.
 //!
 //! Tests that intentionally test the non-Idle branch (e.g.,
-//! "pushing while busy returns FailReply") now test
+//! "pushing while busy returns FailReply") use
 //! `proto.as_ready().is_none()` + `proto.connection_status()`
 //! directly — no helper needed for those.
 
@@ -38,11 +27,10 @@ use bsql_pg_proto::{
 };
 use core::num::NonZeroU64;
 
-/// DEF-270 (U letter) — test-friendly mint of a fresh `ReplyId<K>` and
-/// its underlying raw `NonZeroU64`. Pre-DEF-270 tests minted via
-/// `ReplyId::from_raw(raw_value)`; that constructor is now `pub(crate)`
-/// (external fabrication closed at tier-1 by-visibility — see the U
-/// letter in deferred.md `DEF-270`).
+/// Test-friendly mint of a fresh `ReplyId<K>` and its underlying raw
+/// `NonZeroU64`. `ReplyId::from_raw` is `pub(crate)` (external
+/// fabrication closed at tier-1 by-visibility); tests mint via the
+/// production `proto.next_reply_id::<K>()` API.
 ///
 /// Returns `(id, raw)` so the test can:
 /// - move `id` into a command's `reply` field, and
@@ -54,8 +42,8 @@ use core::num::NonZeroU64;
 /// for fixture-distinguishability across multiple commands in one
 /// scenario) can mint sequentially and capture the actual values.
 ///
-/// DEF-246 Phase 2 (2026-05-16): default-phase shape on `<ActivePhase>`.
-/// For `<DisconnectedPhase>` (pre-Startup mint) callers use
+/// Default-phase shape is on `<ActivePhase>`. For
+/// `<DisconnectedPhase>` (pre-Startup mint) callers use
 /// [`mint_reply_disconnected`] (same body, different phase type).
 pub fn mint_reply<K: ReplyKind>(proto: &mut PgProtocol) -> (ReplyId<K>, NonZeroU64) {
     let id = proto.next_reply_id::<K>();
@@ -63,9 +51,9 @@ pub fn mint_reply<K: ReplyKind>(proto: &mut PgProtocol) -> (ReplyId<K>, NonZeroU
     (id, raw)
 }
 
-/// DEF-246 Phase 2 (2026-05-16): mint a fresh `ReplyId<K>` on a
-/// `<DisconnectedPhase>` protocol (pre-Startup). Mirror of
-/// [`mint_reply`] but typed for the disconnect-phase shape.
+/// Mint a fresh `ReplyId<K>` on a `<DisconnectedPhase>` protocol
+/// (pre-Startup). Mirror of [`mint_reply`] but typed for the
+/// disconnect-phase shape.
 pub fn mint_reply_disconnected<K: ReplyKind>(
     proto: &mut PgProtocol<DisconnectedPhase>,
 ) -> (ReplyId<K>, NonZeroU64) {
@@ -75,7 +63,7 @@ pub fn mint_reply_disconnected<K: ReplyKind>(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// DEF-246 Phase 2/3 (2026-05-16) — handshake-driver helper
+// Handshake-driver helper
 // ═══════════════════════════════════════════════════════════════════
 //
 // `fresh_active_via_trust_handshake()` drives a fresh
@@ -129,9 +117,8 @@ fn rfq_frame(tx_status: u8) -> [u8; 6] {
     [b'Z', 0, 0, 0, 5, tx_status]
 }
 
-/// DEF-246 Phase 2/3 (2026-05-16) — drive a fresh `PgProtocol` through
-/// a synthetic Trust-auth handshake to `<ActivePhase>`. Uses ONLY the
-/// public API:
+/// Drive a fresh `PgProtocol` through a synthetic Trust-auth
+/// handshake to `<ActivePhase>`. Uses ONLY the public API:
 ///
 /// - `PgProtocol::new()` produces `<DisconnectedPhase>`.
 /// - `push_startup` consumes it → `<ConnectingPhase>`.
@@ -212,10 +199,10 @@ pub fn fresh_active_via_trust_handshake() -> PgProtocol<ActivePhase> {
     }
 }
 
-/// Extension trait: pre-DEF-198 ergonomics for happy-path tests.
+/// Extension trait: ergonomics for happy-path tests.
 ///
-/// DEF-269 v2: generic over `C: PushCommand` — tests pass per-command
-/// structs (e.g. `Ping { reply }`) directly, no `PgCommand` enum.
+/// Generic over `C: PushCommand` — tests pass per-command structs
+/// (e.g. `Ping { reply }`) directly, no `PgCommand` enum.
 ///
 /// `proto.push_or_panic(cmd, wb)` panics on:
 /// - Non-Idle state (caller's test fixture is malformed; the helper
@@ -243,10 +230,10 @@ pub trait PushOrPanic {
         wb: &mut WriteBuf,
     );
 
-    /// DEF-212: variant that returns the typed failure for tests that
-    /// EXPECT a `PushFailure` (e.g., builder-overflow classification
-    /// tests). Panics on non-Idle (same fixture-malformed semantics
-    /// as `push_or_panic`).
+    /// Variant that returns the typed failure for tests that EXPECT
+    /// a `PushFailure` (e.g., builder-overflow classification tests).
+    /// Panics on non-Idle (same fixture-malformed semantics as
+    /// `push_or_panic`).
     fn push_expect_failure<C: PushCommand>(
         &mut self,
         cmd: C,
@@ -254,15 +241,14 @@ pub trait PushOrPanic {
     ) -> PushFailure;
 }
 
-/// DEF-160 Z2 (2026-05-11): drain `OutActions` chunks into an owned
-/// scratch buffer.
+/// Drain `OutActions` chunks into an owned scratch buffer.
 ///
-/// Post-DEF-160 `OutActions` chunks span BOTH `wb` (header / trailer
-/// ranges via `SendBytesRange`) AND caller memory (SQL borrow via
+/// `OutActions` chunks span BOTH `wb` (header / trailer ranges via
+/// `SendBytesRange`) AND caller memory (SQL borrow via
 /// `SendBytesBorrowed`) AND static memory (Sync trailer via
-/// `SendBytesStatic`). Pre-DEF-160 tests checked `wb.as_bytes()` for
-/// the full frame; preserving that invariant in tests requires one
-/// extra memcpy here (production drains chunks directly via `writev`).
+/// `SendBytesStatic`). Tests check `wb.as_bytes()` for the full
+/// frame; preserving that invariant requires one extra memcpy here
+/// (production drains chunks directly via `writev`).
 ///
 /// Consumes `actions` by value so the caller can re-mut-borrow `wb`
 /// after the call returns (the `'w` lifetime that flowed into
@@ -391,9 +377,9 @@ impl PushOrPanic for PgProtocol {
     }
 }
 
-/// DEF-212 (Alt Y'): split `wb.as_bytes()` of a single-frame-plus-Sync
-/// push (Parse / Describe / etc.) into the leading frame and the
-/// trailing Sync wire bytes.
+/// Split `wb.as_bytes()` of a single-frame-plus-Sync push (Parse /
+/// Describe / etc.) into the leading frame and the trailing Sync
+/// wire bytes.
 ///
 /// Layout: `[frame: tag + length(4) + body] + [Sync (5 B literal:
 /// tag 'S' + BE u32 length=4)]`. Assumes the trailing 5 bytes are
@@ -421,10 +407,10 @@ pub fn split_frame_plus_sync(bytes: &[u8]) -> (&[u8], &[u8]) {
     (frame, sync)
 }
 
-/// DEF-212 (Alt Y'): split `wb.as_bytes()` of a Bind+Execute+Sync push
-/// into the three constituent wire frames.
+/// Split `wb.as_bytes()` of a Bind+Execute+Sync push into the three
+/// constituent wire frames.
 ///
-/// Layout (PG §55.7 + DEF-094 staged push):
+/// Layout (PG §55.7 staged push):
 ///   `[B frame: tag 'B' + length(4) + body] +
 ///    [E frame: tag 'E' + length(4) + body] +
 ///    [Sync wire bytes (5 B literal)]`

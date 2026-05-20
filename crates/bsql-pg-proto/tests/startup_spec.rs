@@ -1,4 +1,4 @@
-//! Phase 1b — startup handshake + SCRAM-SHA-256 end-to-end tests.
+//! Startup handshake + SCRAM-SHA-256 end-to-end tests.
 //!
 //! Every test here names the invariant it defends. Per architect.txt
 //! Part III, a test exists only for spec conformance (A), tier-3
@@ -150,7 +150,7 @@ fn negotiate_proto_version_frame() -> Vec<u8> {
     frame
 }
 
-/// DEF-246 Phase 2 (2026-05-16) — consume-self Startup push for tests.
+/// Consume-self Startup push for tests.
 ///
 /// Pre-Phase-2 shape: `startup_trust(&mut proto, ...)` over a default
 /// `<ActivePhase>` protocol via `push_command(Startup { ... })`.
@@ -217,7 +217,7 @@ fn trust_auth_handshake_end_to_end() {
     let proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
 
-    // Push Startup (trust). DEF-212: bytes live in wb post-Ok.
+    // Push Startup (trust). Bytes live in `wb` post-Ok.
     let (startup_raw, mut proto) = startup_trust_consume(proto, &mut wb,"testuser", Some("testdb"));
     {
         // Scope the `&wb` borrow so subsequent feed_bytes calls can
@@ -290,7 +290,7 @@ fn trust_auth_handshake_end_to_end() {
         Some("17.2"),
     );
     assert_eq!(proto.session_params().time_zone.as_ref().map(|s| s.as_str()), Some("UTC"));
-    // DEF-114: client_encoding is now a typed Encoding enum.
+    // `client_encoding` is a typed Encoding enum.
     assert_eq!(
         proto.session_params().client_encoding,
         Some(bsql_pg_proto::Encoding::Utf8),
@@ -309,10 +309,10 @@ fn error_response_during_startup_is_classified() {
     let out = proto.feed_bytes(&err_frame, &mut wb);
 
     assert_eq!(out.len(), 2, "ErrorResponse → FailReply + CloseSocket");
-    // DEF-184 (A1+A13): ServerErrorResponse now carries
-    // `details_ref: ErrorRef`. Extract the ref (Copy), drop `out`
-    // to release the &mut proto borrow, then resolve via
-    // `proto.get_server_error(r)` for message/detail/hint.
+    // `ServerErrorResponse` carries `details_ref: ErrorRef`.
+    // Extract the ref (Copy), drop `out` to release the `&mut proto`
+    // borrow, then resolve via `proto.get_server_error(r)` for
+    // message/detail/hint.
     let details_ref = match out.as_slice() {
         [Action::FailReply { id: failed_id, cause }, Action::CloseSocket] => {
             assert_eq!(failed_id, &startup_raw);
@@ -322,11 +322,10 @@ fn error_response_during_startup_is_classified() {
                     code,
                     details_ref,
                 } => {
-                    // Tier-3 #30 (2026-05-19): severity is now
-                    // `Option<Severity>`. `Some(_)` is required here
-                    // (PG sent `SFATAL` field per fixture below);
-                    // `None` would indicate a non-conformant peer
-                    // (no S/V field at all).
+                    // `severity` is `Option<Severity>`. `Some(_)` is
+                    // required here (PG sent `SFATAL` field per
+                    // fixture below); `None` would indicate a
+                    // non-conformant peer (no S/V field at all).
                     match severity {
                         Some(s) => assert_eq!(s.as_str(), "FATAL"),
                         None => panic!(
@@ -346,9 +345,9 @@ fn error_response_during_startup_is_classified() {
     // `out` is Copy-like (ManuallyDrop<heapless::Vec>); NLL
     // releases the &mut proto borrow at `out.as_slice()`'s last
     // use above. No explicit drop needed.
-    // DEF-184 (audit #3 A-06): Result-returning get_server_error.
-    // Err branch panics with the classified ArenaError for debuggability
-    // — architecturally unreachable here (parse allocated into arena,
+    // Result-returning `get_server_error`. Err branch panics with
+    // the classified `ArenaError` for debuggability —
+    // architecturally unreachable here (parse allocated into arena,
     // no intervening clear before this resolve).
     let payload = match proto.get_server_error(details_ref) {
         Ok(payload) => payload,
@@ -361,7 +360,7 @@ fn error_response_during_startup_is_classified() {
 }
 
 /// Invariant (spec): NegotiateProtocolVersion during startup →
-/// classified UnsupportedProtocolOption. DEF-044.
+/// classified `UnsupportedProtocolOption`.
 #[test]
 fn negotiate_protocol_version_during_startup() {
     let proto = PgProtocol::new();
@@ -398,9 +397,9 @@ fn unknown_auth_subcode_is_rejected() {
     assert_eq!(out.len(), 2);
     match out.as_slice() {
         [Action::FailReply { cause, .. }, Action::CloseSocket] => {
-            // DEF-184 (B9): Unknown carries NonZeroU32 (type-level
-            // proof that server sent ≠ 0; AUTH_OK = 0 is classified
-            // as KnownButWrong(AuthSubCode::Ok)).
+            // `Unknown` carries `NonZeroU32` (type-level proof that
+            // server sent ≠ 0; AUTH_OK = 0 is classified as
+            // `KnownButWrong(AuthSubCode::Ok)`).
             let expected_99 = match core::num::NonZeroU32::new(99) {
                 Some(nz) => nz,
                 None => panic!("99 is non-zero, NonZeroU32::new infallible"),
@@ -419,11 +418,12 @@ fn unknown_auth_subcode_is_rejected() {
     }
 }
 
-/// DEF-198 invariant: pipelined Startup while one is in flight is
-/// structurally blocked at the public API. `ConnectionStatus::Handshaking`
-/// classifies the in-flight startup state for caller-side recovery.
+/// Invariant: pipelined Startup while one is in flight is
+/// structurally blocked at the public API.
+/// `ConnectionStatus::Handshaking` classifies the in-flight startup
+/// state for caller-side recovery.
 #[test]
-fn def198_pipelined_startup_blocked_at_compile_time() {
+fn pipelined_startup_blocked_at_compile_time() {
     let proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
 
@@ -431,7 +431,7 @@ fn def198_pipelined_startup_blocked_at_compile_time() {
 
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None during in-flight Startup",
+        "as_ready must return None during in-flight Startup",
     );
     assert_eq!(
         proto.connection_status(),
@@ -448,11 +448,11 @@ fn def198_pipelined_startup_blocked_at_compile_time() {
     assert_eq!(out.len(), 1);
 }
 
-/// DEF-198 invariant: Startup on Errored state is structurally blocked
-/// at the public API. `ConnectionStatus::Errored(kind)` exposes the
+/// Invariant: Startup on Errored state is structurally blocked at
+/// the public API. `ConnectionStatus::Errored(kind)` exposes the
 /// stored cause (here: ServerError from the fatal auth-failure).
 #[test]
-fn def198_startup_on_errored_blocked_at_compile_time() {
+fn startup_on_errored_blocked_at_compile_time() {
     let proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (_first_raw, mut proto) = startup_trust_consume(proto, &mut wb,"testuser", None);
@@ -466,7 +466,7 @@ fn def198_startup_on_errored_blocked_at_compile_time() {
 
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None on Errored",
+        "as_ready must return None on Errored",
     );
     match proto.connection_status() {
         ConnectionStatus::Errored(state_err_kind) => {
@@ -522,17 +522,16 @@ fn password_validation() {
     // Valid
     assert!(Password::try_from_str("pencil").is_ok());
 
-    // Empty (DEF-051)
+    // Empty
     assert!(matches!(
         Password::try_from_str(""),
         Err(PasswordError::Empty),
     ));
 
-    // DEF-185 P2-E (audit 2026-04-24): symbolic + 1-over-cap boundary.
-    // Pre-fix literal `1025` happened to exceed the true cap (512
-    // post-DEF-154 O) by a generous margin, but did not pin the
-    // exact boundary. Post-fix uses `MAX_PASSWORD_LEN + 1` so any
-    // future cap bump keeps the boundary test honest without manual
+    // Symbolic + 1-over-cap boundary. A naive literal (e.g. `1025`)
+    // would happen to exceed the true cap by some margin but not
+    // pin the exact boundary; `MAX_PASSWORD_LEN + 1` keeps the
+    // boundary test honest under any future cap bump without manual
     // sync.
     let over_cap = "a".repeat(bsql_pg_proto::password::MAX_PASSWORD_LEN.saturating_add(1));
     assert!(matches!(
@@ -552,7 +551,7 @@ fn startup_message_wire_format() {
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (_startup_raw, mut proto) = startup_trust_consume(proto, &mut wb,"alice", Some("mydb"));
 
-    // DEF-212: bytes live in wb. Scope the borrow so subsequent
+    // Bytes live in `wb`. Scope the borrow so subsequent
     // feed_bytes calls reacquire &mut wb cleanly.
     {
         let bytes = wb.as_bytes();
@@ -655,7 +654,7 @@ fn connecting_states_become_errored_on_bad_frame() {
 // (A) SCRAM-SHA-256 handshake end-to-end
 // ------------------------------------------------------------------
 
-/// DEF-246 Phase 2 (2026-05-16) — consume-self Startup push for SCRAM
+/// Consume-self Startup push for SCRAM
 /// tests (mirror of `startup_trust_consume`).
 fn startup_scram_consume(
     proto: PgProtocol<DisconnectedPhase>,
@@ -745,7 +744,7 @@ fn scram_sha256_handshake_end_to_end() {
 
     // Step 1: Push Startup with SCRAM password.
     let (startup_raw, mut proto) = startup_scram_consume(proto, &mut wb,"user", password);
-    // DEF-212: bytes live in wb. StartupMessage has no tag byte;
+    // Bytes live in `wb`. StartupMessage has no tag byte;
     // protocol version 3.0 (196608 = 0x00030000) occupies bytes [4..8]
     // after the 4-byte length prefix.
     {
@@ -1162,7 +1161,7 @@ fn credentials_debug_does_not_leak_password() {
 
 // =================================================================
 // (A) Spec conformance — unsolicited ParameterStatus after startup.
-// DEF-054 regression guard.
+// Out-of-band ParameterStatus regression guard.
 // =================================================================
 
 /// Invariant (spec): once the handshake completes and the state is
@@ -1198,10 +1197,10 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
         proto.state(),
     );
 
-    // Now simulate PG sending ParameterStatus in idle (e.g. after a
-    // SET command finishes). Before DEF-054 this would trigger
-    // UnexpectedFrame → CloseSocket. After DEF-054 it is recorded
-    // silently.
+    // Now simulate PG sending `ParameterStatus` in idle (e.g. after
+    // a `SET` command finishes). The frame is recorded silently —
+    // a naive shape without the unsolicited-PS filter would
+    // misclassify as `UnexpectedFrame` → CloseSocket.
     let out = proto.feed_bytes(&param_status_frame("TimeZone", "America/New_York"), &mut wb);
     assert_eq!(out.len(), 0, "unsolicited PS in Idle emits no actions");
     assert!(
@@ -1221,10 +1220,10 @@ fn unsolicited_param_status_in_idle_is_recorded_and_skipped() {
 /// similarly recorded without disturbing the state. PG can emit PS
 /// during query execution if `ALTER SYSTEM` runs server-side.
 ///
-/// Before DEF-054 this would corrupt the in-flight ping (the PS would
-/// be misclassified as an unexpected frame, failing the Ping reply).
-/// After DEF-054 the PS is recorded pre-dispatch and the Ping remains
-/// in flight.
+/// The PS is recorded pre-dispatch and the Ping remains in flight
+/// — a naive shape without the pre-dispatch filter would corrupt
+/// the in-flight ping (PS misclassified as an unexpected frame,
+/// failing the Ping reply).
 #[test]
 fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     let proto = PgProtocol::new();
@@ -1235,8 +1234,8 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
     _ = proto.feed_bytes(&backend_key_data_frame(1, 1), &mut wb);
     _ = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
 
-    // DEF-246 Phase 3 (2026-05-16): the handshake completed; transition
-    // to <ActivePhase> before pushing post-handshake commands.
+    // The handshake completed; transition to `<ActivePhase>` before
+    // pushing post-handshake commands.
     let mut proto = match proto.into_active() {
         Ok(p) => p,
         Err(_) => panic!("test fixture: handshake did not complete"),
@@ -1265,7 +1264,7 @@ fn unsolicited_param_status_in_awaiting_ping_reply_is_recorded() {
         matches!(proto.state(), ActiveState::PingAwaitingRfq(_)),
         "PS must not disturb the PingAwaitingRfq state",
     );
-    // DEF-114: typed Encoding.
+    // Typed Encoding.
     assert_eq!(
         proto.session_params().client_encoding,
         Some(bsql_pg_proto::Encoding::Latin1),
@@ -1338,10 +1337,10 @@ fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
 /// UnexpectedFrame — `allows_unsolicited_param_status` returns false
 /// for Connecting* pre-auth states.
 ///
-/// This pins the other side of the DEF-054 boundary: flipping a
-/// Connecting* state from `false` to `true` in the exhaustive match
-/// would compile and silently accept server frames that contravene
-/// the auth handshake.
+/// This pins the other side of the unsolicited-PS filter: flipping
+/// a Connecting* state from `false` to `true` in the exhaustive
+/// match would compile and silently accept server frames that
+/// contravene the auth handshake.
 #[test]
 fn param_status_during_pre_auth_is_unexpected() {
     let proto = PgProtocol::new();
@@ -1364,13 +1363,12 @@ fn param_status_during_pre_auth_is_unexpected() {
     assert!(matches!(proto.state(), ConnectingState::Errored(_)));
 }
 
-/// DEF-184 (B17 fallback-hygiene catch): ParameterStatus with
-/// missing trailing NUL (wire-spec §55.7 violation) must be
-/// classified as MalformedPayload and silently dropped — NOT
-/// silently absorbed with the wrong value. Pre-(184)
-/// `strip_suffix(b"\0").unwrap_or(value_region)` silently accepted
-/// malformed payload; post-(184) explicit Option match routes
-/// missing-NUL to MalformedPayload.
+/// ParameterStatus with a missing trailing NUL (wire-spec §55.7
+/// violation) is classified as `MalformedPayload` and silently
+/// dropped — explicit `Option` match routes missing-NUL there.
+/// A naive `strip_suffix(b"\0").unwrap_or(value_region)` shape
+/// would silently absorb the malformed payload with the wrong
+/// value.
 ///
 /// Observable surface: the key is NOT recorded in SessionParams
 /// (server_version stays None). Additionally the connection stays
@@ -1423,7 +1421,7 @@ fn param_status_missing_trailing_nul_classified_as_malformed() {
 }
 
 // ------------------------------------------------------------------
-// (A) Cleartext-password auth handshake — DEF-215 (2026-05-05)
+// (A) Cleartext-password auth handshake
 // ------------------------------------------------------------------
 
 /// Build an `AuthenticationCleartextPassword` frame: tag 'R',
@@ -1432,7 +1430,7 @@ fn auth_cleartext_password_frame() -> [u8; 9] {
     [b'R', 0, 0, 0, 8, 0, 0, 0, 3]
 }
 
-/// DEF-246 Phase 2 (2026-05-16) — consume-self Startup push for
+/// Consume-self Startup push for
 /// cleartext-auth tests.
 fn startup_cleartext_consume(
     proto: PgProtocol<DisconnectedPhase>,
@@ -1644,9 +1642,8 @@ fn cleartext_startup_rejects_sasl_offer() {
     }
 }
 
-/// DEF-215 Debug-redaction pin (DEF-048-style): a `Credentials::
-/// CleartextPassword` instance must NOT print the password text
-/// in its Debug output.
+/// Debug-redaction pin: a `Credentials::CleartextPassword`
+/// instance must NOT print the password text in its Debug output.
 #[test]
 fn credentials_cleartext_debug_does_not_leak_password() {
     let pw = Password::try_from_str("super-secret-cleartext").unwrap_or_else(|e| panic!("{e}"));
@@ -1663,7 +1660,7 @@ fn credentials_cleartext_debug_does_not_leak_password() {
 }
 
 // ------------------------------------------------------------------
-// (A) MD5-password auth handshake — DEF-216 (2026-05-05)
+// (A) MD5-password auth handshake
 // ------------------------------------------------------------------
 
 /// Build an `AuthenticationMD5Password` frame: tag 'R',
@@ -1677,7 +1674,7 @@ fn auth_md5_password_frame(salt: [u8; 4]) -> [u8; 13] {
     ]
 }
 
-/// DEF-246 Phase 2 (2026-05-16) — consume-self Startup push for
+/// Consume-self Startup push for
 /// MD5-auth tests.
 fn startup_md5_consume(
     proto: PgProtocol<DisconnectedPhase>,
@@ -1769,7 +1766,7 @@ fn expected_md5_response_body(password: &[u8], username: &[u8], salt: [u8; 4]) -
     response
 }
 
-/// **Known Answer Test** (audit 2026-05-07): hardcoded expected
+/// **Known Answer Test**: hardcoded expected
 /// digest computed externally via Python `hashlib.md5`. Catches
 /// drift between our `compute_response_body` implementation and
 /// the canonical PG/RFC 1321 algorithm. Crucially, this test
@@ -2027,8 +2024,8 @@ fn md5_startup_rejects_cleartext_offer() {
     }
 }
 
-/// DEF-216 Debug-redaction pin: `Credentials::Md5Password` Debug
-/// must NOT print the password.
+/// Debug-redaction pin: `Credentials::Md5Password` Debug must NOT
+/// print the password.
 #[test]
 fn credentials_md5_debug_does_not_leak_password() {
     let pw = Password::try_from_str("super-secret-md5").unwrap_or_else(|e| panic!("{e}"));
@@ -2045,11 +2042,11 @@ fn credentials_md5_debug_does_not_leak_password() {
 }
 
 // ==================================================================
-// (B) Negative-path & symmetric coverage — DEF-215 + DEF-216
-// (audit 2026-05-05): comprehensive dispatcher and downgrade-
-// rejection test suite. Crypto + auth cannot be "good enough"
-// covered; every transition × every input combination is exercised
-// to pin tier-1 invariants against future drift.
+// (B) Negative-path & symmetric coverage for cleartext + MD5 auth:
+// comprehensive dispatcher and downgrade-rejection test suite.
+// Crypto + auth cannot be "good enough" covered; every transition
+// × every input combination is exercised to pin tier-1 invariants
+// against future drift.
 // ==================================================================
 
 /// Build an Authentication frame whose body is exactly the 4-byte
@@ -2062,11 +2059,9 @@ fn auth_subcode_only_frame(subcode: u32) -> [u8; 9] {
 }
 
 /// Helper: assert the FailReply path with `UnsupportedAuthMethod
-/// { sub_code: KnownButWrong(expected) }`.
-///
-/// DEF-246 Phase 2/3 (2026-05-16): typed for `<ConnectingPhase>`
-/// — all callers in this file are mid-handshake. Pre-DEF-246 this
-/// was `&mut PgProtocol` (default Active).
+/// { sub_code: KnownButWrong(expected) }`. Typed for
+/// `<ConnectingPhase>` — all callers in this file are
+/// mid-handshake.
 fn assert_known_but_wrong<const N: usize>(
     proto: &mut PgProtocol<ConnectingPhase>,
     wb: &mut bsql_pg_proto::WriteBuf,
@@ -2095,8 +2090,7 @@ fn assert_known_but_wrong<const N: usize>(
 }
 
 /// Helper: assert UnexpectedFrame classification with the given
-/// frame tag. DEF-246 Phase 3 (2026-05-16): typed for
-/// `<ConnectingPhase>`.
+/// frame tag. Typed for `<ConnectingPhase>`.
 fn assert_unexpected_frame<const N: usize>(
     proto: &mut PgProtocol<ConnectingPhase>,
     wb: &mut bsql_pg_proto::WriteBuf,
@@ -2188,9 +2182,9 @@ fn md5_startup_rejects_unknown_subcode() {
 
 /// Helper: drive proto to MD5AwaitingAuthOk state with valid
 /// MD5 challenge + response.
-/// DEF-270: returns the minted raw ID so callers can assert on round-trip.
+/// Returns the minted raw ID so callers can assert on round-trip.
 ///
-/// DEF-246 Phase 2 (2026-05-16): consume-self shape — takes
+/// Consume-self shape — takes
 /// `<DisconnectedPhase>`, returns `(NonZeroU64, <ConnectingPhase>)`.
 fn drive_to_md5_awaiting_authok(
     proto: PgProtocol<DisconnectedPhase>,
@@ -2351,8 +2345,8 @@ fn cleartext_startup_rejects_unknown_subcode() {
 
 // ----- CleartextAwaitingAuthOk — negative paths -----
 
-/// DEF-270: returns the minted raw ID so callers can assert on round-trip.
-/// DEF-246 Phase 2 (2026-05-16): consume-self shape.
+/// Returns the minted raw ID so callers can assert on round-trip.
+/// Consume-self shape.
 fn drive_to_cleartext_awaiting_authok(
     proto: PgProtocol<DisconnectedPhase>,
     wb: &mut bsql_pg_proto::WriteBuf,

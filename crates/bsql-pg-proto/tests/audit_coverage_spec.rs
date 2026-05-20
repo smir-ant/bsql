@@ -1,8 +1,6 @@
-//! DEF-185 audit coverage tests (2026-04-24).
-//!
-//! Tests added in response to the three-agent architect audit covering
-//! runtime safety, crypto hygiene, and protocol robustness. Each test
-//! pins a finding that the pre-audit suite did not cover.
+//! Audit-coverage tests for runtime safety, crypto hygiene, and
+//! protocol robustness. Each test pins a finding that a happy-path-
+//! only suite would not cover.
 
 use bsql_pg_proto::{
     Action, ActiveState, ConnectingState, PgProtocol, WriteBuf, error::ProtocolError,
@@ -11,13 +9,10 @@ use bsql_pg_proto::{
 mod common;
 use common::{PushOrPanic, fresh_active_via_trust_handshake};
 
-// DEF-270 (U letter): pre-DEF-270 these helpers wrapped
-// `ReplyId::from_raw(raw_value)`. Post-DEF-270 IDs are minted via
-// `proto.next_reply_id::<K>()`. Each helper now takes `&mut PgProtocol`
-// to mint via the production API.
-//
-// DEF-246 Phase 2 (2026-05-16): helpers typed for `<ActivePhase>` —
-// the audit tests below all start with a real Trust handshake.
+// IDs are minted via `proto.next_reply_id::<K>()` — each helper
+// takes `&mut PgProtocol` to mint via the production API. Helpers
+// are typed for `<ActivePhase>`; the tests below all start with a
+// real Trust handshake.
 fn ping_id(proto: &mut PgProtocol) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::PingKind> {
     proto.next_reply_id()
 }
@@ -30,22 +25,21 @@ fn parse_id(proto: &mut PgProtocol) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_
     proto.next_reply_id()
 }
 
-// DEF-246 Phase 2 (2026-05-16): `startup_id` retired — `<DisconnectedPhase>`
-// has its own `next_reply_id` and `push_startup` consumes the ID.
+// `<DisconnectedPhase>` has its own `next_reply_id` and
+// `push_startup` consumes the ID — no separate `startup_id` helper.
 
 fn push_ping(proto: &mut PgProtocol, wb: &mut WriteBuf) {
     let reply = ping_id(proto);
     proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, wb);
-    // DEF-212 (Alt Y'): bytes live in wb (Sync = 5 B for Ping). The
-    // helper's tier-1 invariant is "push succeeded" (Idle precondition
-    // already proved by `as_ready` inside push_or_panic); the
-    // non-empty assertion preserves the original tier-3 spec-conformance
-    // shield.
+    // Bytes live in `wb` (Sync = 5 B for Ping). The helper's tier-1
+    // invariant is "push succeeded" (Idle precondition proved by
+    // `as_ready` inside `push_or_panic`); the non-empty assertion
+    // preserves the original spec-conformance shield.
     assert!(!wb.as_bytes().is_empty(), "Ping push must emit at least the 5 B Sync");
 }
 
 // ───────────────────────────────────────────────────────────────────
-// DEF-185 P0-F: zero-body frame strict validation
+// Zero-body frame strict validation
 // ───────────────────────────────────────────────────────────────────
 
 /// A server-sent `EmptyQueryResponse` ('I') MUST have zero body per
@@ -65,8 +59,8 @@ fn empty_query_response_with_non_zero_body_classifies() {
         bsql_pg_proto::push_command::SimpleQuery { sql, reply },
         &mut wb,
     );
-    // DEF-212: SimpleQuery emits a 'Q' frame; non-empty wb verifies
-    // the push wrote bytes.
+    // SimpleQuery emits a 'Q' frame; non-empty `wb` verifies the
+    // push wrote bytes.
     assert!(!wb.as_bytes().is_empty(), "SimpleQuery push must emit Q frame");
 
     // Craft malformed EmptyQueryResponse: tag 'I' + length=5 + 1 body byte.
@@ -107,7 +101,7 @@ fn parse_complete_with_non_zero_body_classifies() {
         bsql_pg_proto::push_command::Parse { stmt_name: stmt, sql, reply },
         &mut wb,
     );
-    // DEF-212: Parse emits 'P' frame + 5 B Sync; non-empty wb confirms.
+    // Parse emits a 'P' frame + 5 B Sync; non-empty `wb` confirms.
     assert!(!wb.as_bytes().is_empty(), "Parse push must emit P+Sync");
 
     // ParseComplete with 1-byte body: tag '1' + len=5 + 1 body byte.
@@ -122,7 +116,7 @@ fn parse_complete_with_non_zero_body_classifies() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// DEF-185 P3-G: max frame size boundary (via public API)
+// Max frame size boundary (via public API)
 // ───────────────────────────────────────────────────────────────────
 
 /// Frame with `length = READ_BUF_CAP - 1` (the maximum legal length-
@@ -157,7 +151,7 @@ fn max_length_notice_frame_is_consumed_cleanly() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// DEF-185 P3-H: byte-at-a-time fragmentation
+// Byte-at-a-time fragmentation
 // ───────────────────────────────────────────────────────────────────
 
 /// Feeding a Pong-response one byte at a time across many `feed_bytes`
@@ -191,25 +185,25 @@ fn pong_delivered_via_byte_at_a_time_fragmentation() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// DEF-185 P3-B: PgProtocol drop during handshake (cancellation-safe)
+// PgProtocol drop during handshake (cancellation-safe)
 // ───────────────────────────────────────────────────────────────────
 
 /// Dropping a `PgProtocol` mid-SCRAM handshake must run all Drop
 /// impls — including `ScramSession`'s `ZeroizeOnDrop` for the
-/// variant carrying the password, `WriteBuf`'s zero-on-drop
-/// (DEF-185 P0-B), and `ReadBuf`'s zero-on-drop (DEF-185 P0-C).
-/// We cannot directly observe post-drop memory (Miri-only), but the
-/// test validates the drop chain compiles + runs without panic.
+/// variant carrying the password, `WriteBuf`'s zero-on-drop, and
+/// `ReadBuf`'s zero-on-drop. We cannot directly observe post-drop
+/// memory (Miri-only), but the test validates the drop chain
+/// compiles + runs without panic.
 #[test]
 fn dropping_proto_mid_scram_handshake_runs_drop_glue() {
     use bsql_pg_proto::ident::Ident;
     use bsql_pg_proto::password::{Credentials, Password};
     use bsql_pg_proto::sensitive::Sensitive;
 
-    // DEF-246 Phase 2 (2026-05-16): mid-handshake test — use a fresh
-    // `<DisconnectedPhase>` protocol and consume-self push_startup;
-    // the returned `<ConnectingPhase>` is dropped to exercise the
-    // SCRAM drop cascade.
+    // Mid-handshake test — use a fresh `<DisconnectedPhase>`
+    // protocol and consume-self `push_startup`; the returned
+    // `<ConnectingPhase>` is dropped to exercise the SCRAM drop
+    // cascade.
     let mut proto = PgProtocol::new();
     let mut wb = WriteBuf::new();
     let user = match Ident::try_from_str("scram_user") {
@@ -246,7 +240,7 @@ fn dropping_proto_mid_scram_handshake_runs_drop_glue() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// DEF-185 P3-G: frame_parse direct unit tests
+// frame_parse direct unit tests
 // ───────────────────────────────────────────────────────────────────
 
 /// Verify that `parse_header` accepts `length = MAX_FRAME_LEN_FIELD`
@@ -271,7 +265,7 @@ fn parse_header_boundary_cap_is_exact() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// DEF-185 P2-G: error-arena overwrite counter canary
+// Error-arena overwrite counter canary
 // ───────────────────────────────────────────────────────────────────
 
 /// The `error_arena_overwrite_count` canary is zero under normal
@@ -288,22 +282,22 @@ fn error_arena_overwrite_counter_starts_zero() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// DEF-185 P2-A: SCRAM iteration cap
+// SCRAM iteration cap
 // ───────────────────────────────────────────────────────────────────
 
-/// Post-P2-A `MAX_SCRAM_ITERATIONS = 100_000`. Pin the absolute value
-/// to catch silent bumps that could re-open the DoS window.
+/// `MAX_SCRAM_ITERATIONS = 100_000`. Pin the absolute value to
+/// catch silent bumps that could re-open the DoS window.
 #[test]
 fn scram_max_iterations_is_pinned_at_100k() {
     assert_eq!(
         bsql_pg_proto::scram::wire::MAX_SCRAM_ITERATIONS,
         100_000,
-        "MAX_SCRAM_ITERATIONS must stay at 100K per DEF-185 P2-A audit",
+        "MAX_SCRAM_ITERATIONS must stay at 100K (DoS cap)",
     );
 }
 
 // ───────────────────────────────────────────────────────────────────
-// DEF-185 P2-4: parse_error_response bounded per-field (shield pin)
+// parse_error_response bounded per-field (shield pin)
 // ───────────────────────────────────────────────────────────────────
 
 /// Audit concluded: MAX_ERROR_FIELDS=32 + frame cap + BoundedStr
@@ -353,7 +347,7 @@ fn error_response_max_fields_boundary_is_bounded() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// DEF-185 P2-6: parse_row_description bounded column-name scan
+// parse_row_description bounded column-name scan
 // ───────────────────────────────────────────────────────────────────
 
 /// Audit concluded: per-column name scan is O(N) but bounded by
@@ -375,7 +369,7 @@ fn row_description_frame_size_is_bounded_by_frame_cap() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// DEF-185 P2-8: parse_parameter_description zero-params boundary
+// parse_parameter_description zero-params boundary
 // ───────────────────────────────────────────────────────────────────
 
 /// Audit concluded: n_params=0 is legal (DML statements with no
@@ -394,17 +388,18 @@ fn parameter_description_zero_params_is_legal() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// DEF-185 P2-10: DataRow body length invariants
+// DataRow body length invariants
 // ───────────────────────────────────────────────────────────────────
 
-/// DEF-185 P1-3: fast-path now rejects row_body_len < 2. Pin the
-/// exact boundary — 1-byte body must classify MalformedDataRow.
+/// The fast-path rejects `row_body_len < 2`. Pin the exact boundary
+/// — a 1-byte body must classify `MalformedDataRow`.
 #[test]
 fn data_row_too_short_for_column_count_is_rejected() {
     use bsql_pg_proto::frame::{parse_header, HeaderParse};
-    // DataRow with declared_len=5 → 1-byte body. Pre-P1-3 was
-    // accepted + passed to user as TruncatedRow; post-P1-3 rejected
-    // at protocol layer as MalformedDataRow.
+    // DataRow with declared_len=5 → 1-byte body. A naive accept-and-
+    // pass-through shape would surface this as `TruncatedRow` to the
+    // user; the current path rejects at the protocol layer as
+    // `MalformedDataRow`.
     let synthetic = [b'D', 0x00, 0x00, 0x00, 0x05];
     let header = parse_header(&synthetic);
     assert!(
