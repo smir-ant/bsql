@@ -912,16 +912,69 @@ pub struct DisconnectedInner {
 /// `size_of::<ClosedInner>() == 16 B` (state_kind 1B + 7B pad +
 /// error_arena Option<Box> 8B). `DisconnectedInner` is 0 B;
 /// `ClosedInner` is the second-narrowest phase Inner.
+/// Why a `<ClosedPhase>` protocol is in its terminal state.
+///
+/// Two paths reach `<ClosedPhase>`:
+///
+/// - **[`Self::Errored`]** — a transport / framing / SCRAM / server-error
+///   classifier flagged the connection unrecoverable. The wrapper layer
+///   typically logs the error and discards the connection. The carried
+///   [`crate::error::StateErrorKind`] preserves the original cause
+///   classifier across the typestate transition (the full
+///   `ProtocolError` cause was already delivered via the matching
+///   `FailReply` action; only the kind classifier is retained here).
+///
+/// - **[`Self::GracefulTerminate`]** — the client explicitly sent the
+///   `'X'` Terminate frame via [`PgProtocol::<ActivePhase>::terminate`].
+///   No error occurred; the connection is closing cleanly. The wrapper
+///   layer typically flushes the trailing bytes to the socket and drops
+///   the TCP connection.
+///
+/// # Size
+///
+/// 2 B exact (`#[repr(u8)]` discriminant + max-variant `StateErrorKind`
+/// 1 B). Fits inside `ClosedInner`'s alignment padding — no size growth
+/// vs the prior `state_kind: StateErrorKind` field shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CloseCause {
+    /// The connection closed due to a tier-1-classified error
+    /// (transport / framing / SCRAM / server-error / etc.).
+    /// The carried [`crate::error::StateErrorKind`] is the
+    /// kind classifier extracted from the upstream `Errored(state_kind)`
+    /// transition boundary.
+    Errored(crate::error::StateErrorKind),
+    /// The connection closed gracefully via client-initiated
+    /// [`PgProtocol::<ActivePhase>::terminate`] (`'X'` frame). No
+    /// error occurred. The post-terminate `<ClosedPhase>` protocol
+    /// carries no error payload to inspect.
+    GracefulTerminate,
+}
+
+/// Per-phase Inner for the [`ClosedPhase`] terminally-closed phase.
+///
+/// Carries only the [`CloseCause`] discriminator (1 B + alignment)
+/// and the preserved server-error arena (8 B Box-niche). No
+/// `ProtoState`, no read/write buffers, no auth state — every other
+/// field is dropped at the transition boundary
+/// (`into_closed_if_errored`, `<ConnectingPhase>::into_active` Closed
+/// arm, or `<ActivePhase>::terminate`), releasing ~488 B of stack
+/// plus any Box behind the cell niches.
+///
+/// `size_of::<ClosedInner>() == 16 B` (sync_marker 0 B; cause 2 B;
+/// alignment pad 6 B; error_arena `Option<Box>` 8 B). Second-
+/// narrowest phase Inner (after `DisconnectedInner` at 0 B).
 #[derive(Debug)]
 pub struct ClosedInner {
     /// `!Sync` auto-trait propagation.
     sync_marker: PhantomData<core::cell::Cell<()>>,
     /// Terminal cause classifier — extracted from the transition
-    /// boundary's `Errored(state_kind)` variant. The full
-    /// `ProtoState` enum (80 B) is not retained: the only legal
-    /// Closed-state variant is `Errored(_)` and `state_kind` IS the
-    /// variant payload.
-    state_kind: crate::error::StateErrorKind,
+    /// boundary (`Errored(state_kind)` for the error path, or
+    /// [`CloseCause::GracefulTerminate`] for the client-initiated
+    /// terminate path). The full `ProtoState` enum (48 B post-DEF-282)
+    /// is not retained: `<ClosedPhase>` has no further state
+    /// transitions, so the discriminator suffices.
+    cause: CloseCause,
     /// Server-error arena handle — preserved across the transition
     /// for follow-up `ErrorRef → ErrorPayload` lookups (the wrapper
     /// layer may stash an `ErrorRef` from a `ServerErrorResponse`
@@ -1981,7 +2034,7 @@ impl PgProtocol<ConnectingPhase> {
             return Err(IntoActiveError::Closed(PgProtocol {
                 inner: ClosedInner {
                     sync_marker: PhantomData,
-                    state_kind,
+                    cause: CloseCause::Errored(state_kind),
                     error_arena,
                 },
                 extras: (),
@@ -2021,8 +2074,10 @@ impl PgProtocol<ConnectingPhase> {
                 return Err(IntoActiveError::Closed(PgProtocol {
                     inner: ClosedInner {
                         sync_marker: PhantomData,
-                        state_kind: crate::error::StateErrorKind::from_kind_or_internal(
-                            crate::error::ErrorKind::Internal,
+                        cause: CloseCause::Errored(
+                            crate::error::StateErrorKind::from_kind_or_internal(
+                                crate::error::ErrorKind::Internal,
+                            ),
                         ),
                         error_arena: None,
                     },
@@ -2207,18 +2262,47 @@ impl PgProtocol<ClosedPhase> {
     ///
     /// # Tier-1 closure
     ///
-    /// `<ClosedPhase>` exposes ONLY `cause()`. No `push_command`, no
-    /// `feed_inbound`, no `feed_bytes`, no `advance_one_frame`,
-    /// no `into_active`. Calling any of those on a `<ClosedPhase>`
-    /// instance is method-absent E0599 («Closed absorbs no input»).
-    /// The protocol is terminal.
+    /// `<ClosedPhase>` exposes ONLY `cause()` and `close_cause()`. No
+    /// `push_command`, no `feed_inbound`, no `feed_bytes`, no
+    /// `advance_one_frame`, no `into_active`. Calling any of those on
+    /// a `<ClosedPhase>` instance is method-absent E0599 («Closed
+    /// absorbs no input»). The protocol is terminal.
+    ///
+    /// # Errored vs graceful
+    ///
+    /// - **Errored close** (any tier-1-classified error path):
+    ///   returns `Err(ProtocolError::ConnectionAlreadyClosed { prior_kind })`.
+    /// - **Graceful close** (client-initiated via [`PgProtocol::<ActivePhase>::terminate`]):
+    ///   returns `Ok(())`. No error; the protocol was cleanly closed.
+    ///
+    /// Callers that need the raw discriminator (e.g. for logging the
+    /// close path without synthesising an error) can use
+    /// [`Self::close_cause`] which returns the [`CloseCause`] enum
+    /// directly.
     #[inline]
-    #[must_use = "the returned ProtocolError carries the terminal cause; observing it is the only \
-                  legitimate operation on a Closed protocol"]
-    pub fn cause(&self) -> crate::error::ProtocolError {
-        crate::error::ProtocolError::ConnectionAlreadyClosed {
-            prior_kind: self.inner.state_kind,
+    #[must_use = "the returned Result carries the terminal cause: Err for errored close, \
+                  Ok(()) for graceful terminate. Observing it is the only legitimate \
+                  operation on a Closed protocol."]
+    pub fn cause(&self) -> Result<(), crate::error::ProtocolError> {
+        match self.inner.cause {
+            CloseCause::Errored(prior_kind) => {
+                Err(crate::error::ProtocolError::ConnectionAlreadyClosed { prior_kind })
+            }
+            CloseCause::GracefulTerminate => Ok(()),
         }
+    }
+
+    /// Raw close-cause discriminator. Returns the [`CloseCause`] enum
+    /// the post-transition `<ClosedPhase>` was constructed with — see
+    /// the enum's variants for path-specific semantics.
+    ///
+    /// Use this when logging or branching on the close path WITHOUT
+    /// synthesising a [`crate::error::ProtocolError`]. For the
+    /// error-or-graceful Result shape, prefer [`Self::cause`].
+    #[inline]
+    #[must_use]
+    pub fn close_cause(&self) -> CloseCause {
+        self.inner.cause
     }
 
     /// Resolve a server `ErrorRef` against the preserved arena.
@@ -4835,11 +4919,11 @@ impl PgProtocol<ActivePhase> {
         mut self,
     ) -> Result<PgProtocol<ClosedPhase>, PgProtocol<ActivePhase>> {
         // Ok arm materialises `ClosedInner` (~16 B) instead of
-        // moving the full 536-B `ActiveInner`. Same
+        // moving the full 504-B `ActiveInner`. Same
         // extract-and-drop shape as `<ConnectingPhase>::into_active`'s
         // Closed arm: state_kind is Copy from `&state`; error_arena
         // is mem::take'd; the remaining ActiveInner Drops at scope
-        // end, releasing ~520 B of stack + any heap behind the
+        // end, releasing ~488 B of stack + any heap behind the
         // Box-niche cells.
         if let crate::state::ActiveState::Errored(state_kind) = &self.inner.state {
             let state_kind = *state_kind;
@@ -4847,7 +4931,7 @@ impl PgProtocol<ActivePhase> {
             Ok(PgProtocol {
                 inner: ClosedInner {
                     sync_marker: PhantomData,
-                    state_kind,
+                    cause: CloseCause::Errored(state_kind),
                     error_arena,
                 },
                 extras: (),
@@ -4856,6 +4940,95 @@ impl PgProtocol<ActivePhase> {
         } else {
             Err(self)
         }
+    }
+
+    /// Push a graceful Terminate (`'X'`) frame and consume self into
+    /// [`PgProtocol<ClosedPhase>`] with cause
+    /// [`CloseCause::GracefulTerminate`].
+    ///
+    /// # PG semantics
+    ///
+    /// The Terminate frame (PG §55.7) is a 5-byte client-initiated
+    /// graceful close: `[b'X', 0, 0, 0, 4]`. After sending Terminate,
+    /// the server completes any in-flight query, then closes the
+    /// connection. The client is expected to:
+    ///
+    /// 1. Flush the trailing bytes (returned by this method) to the
+    ///    socket.
+    /// 2. Drop the [`PgProtocol<ClosedPhase>`] (releasing any preserved
+    ///    `error_arena` heap) — or hold it briefly to inspect
+    ///    [`PgProtocol<ClosedPhase>::cause`] / [`close_cause`] for
+    ///    diagnostic logging.
+    /// 3. Close the TCP connection.
+    ///
+    /// [`close_cause`]: PgProtocol<ClosedPhase>::close_cause
+    ///
+    /// # Callable from any [`ActiveState`]
+    ///
+    /// PG accepts `Terminate` at any time in the protocol lifecycle
+    /// (Idle, mid-query, even during an in-flight Sync). This method
+    /// mirrors that — `self` is consumed regardless of `state`. Any
+    /// in-flight [`crate::reply_id::ReplyId`] inside the consumed state
+    /// drops cleanly (the [`#[must_use]`] lint is a HINT, not a
+    /// runtime check; the matching `oneshot::Sender` on the wrapper
+    /// layer drops along with the rest of the connection).
+    ///
+    /// [`ActiveState`]: crate::state::ActiveState
+    ///
+    /// # Returned bytes lifetime
+    ///
+    /// The `&'w [u8]` slice borrows from `wb` for the lifetime `'w`.
+    /// The returned [`PgProtocol<ClosedPhase>`] does NOT borrow `wb` —
+    /// it owns its own [`ClosedInner`]. Callers can drain the bytes to
+    /// the socket and then drop the `wb` borrow; the
+    /// `PgProtocol<ClosedPhase>` survives independently.
+    ///
+    /// # Failure modes
+    ///
+    /// - [`crate::write_buf::WriteBufFull`] if `wb` cannot fit 5 more
+    ///   bytes. `self` is consumed regardless (the protocol intent is
+    ///   "close this thing"); the caller has the [`WriteBufFull`]
+    ///   error and is expected to drop the socket.
+    ///
+    /// # Tier-1 closure on post-terminate API
+    ///
+    /// The returned [`PgProtocol<ClosedPhase>`] is method-absent for
+    /// every send/receive operation (`push_command`, `feed_inbound`,
+    /// `feed_bytes`, `advance_one_frame`, `into_active`). Calling any
+    /// of those is E0599 («Closed absorbs no input»). The only
+    /// available operations are [`PgProtocol<ClosedPhase>::cause`],
+    /// [`PgProtocol<ClosedPhase>::close_cause`],
+    /// [`PgProtocol<ClosedPhase>::get_server_error`], and
+    /// [`PgProtocol<ClosedPhase>::error_arena_overwrite_count`].
+    #[expect(
+        clippy::needless_lifetimes,
+        reason = "explicit `'w` documents that the returned `&[u8]` borrows from `wb`, \
+                  while the tuple's `PgProtocol<ClosedPhase>` is owned (no borrow). \
+                  Eliding makes the signature reader guess which output borrows from `wb`."
+    )]
+    pub fn terminate<'w>(
+        mut self,
+        wb: &'w mut crate::write_buf::WriteBuf,
+    ) -> Result<(&'w [u8], PgProtocol<ClosedPhase>), crate::write_buf::WriteBufFull> {
+        let start = wb.len();
+        wb.push_bytes(&crate::wire::TERMINATE_WIRE_BYTES)?;
+        let end = wb.len();
+        // Detach the wb-borrow before the consume-self assembly. After
+        // `wb.push_bytes` returns the `&mut WriteBuf` is no longer in
+        // active use; NLL releases the implicit `&mut` here, letting us
+        // take an immutable `&wb[start..end]` slice that lives for `'w`.
+        let bytes = wb.as_bytes().get(start..end).unwrap_or(&[]);
+        let error_arena = core::mem::take(&mut self.inner.error_arena);
+        let closed = PgProtocol {
+            inner: ClosedInner {
+                sync_marker: PhantomData,
+                cause: CloseCause::GracefulTerminate,
+                error_arena,
+            },
+            extras: (),
+            phase_marker: PhantomData,
+        };
+        Ok((bytes, closed))
     }
 
     /// Resolve an [`crate::error_arena::ErrorRef`] handle (carried
@@ -7362,7 +7535,7 @@ impl core::fmt::Debug for PgProtocol<ClosedPhase> {
         // diagnostic; `state_kind` is the terminal cause classifier.
         f.debug_struct("PgProtocol")
             .field("phase", &"ClosedPhase")
-            .field("state_kind", &self.inner.state_kind)
+            .field("cause", &self.inner.cause)
             .field("error_arena_overwrite_count", &self.error_arena_overwrite_count())
             .finish_non_exhaustive()
     }

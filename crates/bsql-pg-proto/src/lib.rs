@@ -349,7 +349,7 @@ pub use ident::{
 };
 pub use password::{Credentials, Password, PasswordError};
 pub use protocol::{
-    ActivePhase, ClosedPhase, ConnectingPhase, DisconnectedPhase, IntoActiveError,
+    ActivePhase, CloseCause, ClosedPhase, ConnectingPhase, DisconnectedPhase, IntoActiveError,
     MAX_ACTIONS_PER_CALL, MAX_STAGED_PER_CALL, PgProtocol, SealedPhase,
 };
 pub use reply_id::{
