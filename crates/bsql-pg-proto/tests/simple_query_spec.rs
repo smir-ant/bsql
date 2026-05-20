@@ -1,4 +1,4 @@
-//! Phase 1c-1b — SimpleQuery flow end-to-end + bad-path coverage.
+//! SimpleQuery flow end-to-end + bad-path coverage.
 //!
 //! Every test here names the invariant it defends. Tests cover:
 //!
@@ -128,8 +128,7 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
 }
 
 // ------------------------------------------------------------------
-// DEF-160 Z2 (2026-05-11): `fn sql(s) -> Sql` helper retired —
-// `push_command::SimpleQuery.sql` is `&'a str`, fixtures pass &str
+// `push_command::SimpleQuery.sql` is `&'a str`; fixtures pass &str
 // directly. The legacy `cfg(test)` `PgCommand::SimpleQuery` enum
 // (lib-internal tests only) still owns `Sql` and uses
 // `Sql::from_str_truncating` directly; integration tests like this
@@ -140,9 +139,9 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
 /// outbound bytes start with the `'Q'` tag and return them for
 /// further assertions.
 ///
-/// DEF-212 (Alt Y'): post-Phase-1a `push_or_panic` returns `()`;
-/// bytes live in `wb`. SimpleQuery emits a single 'Q' frame (no
-/// trailing Sync — Q is self-syncing per PG §55.2.4).
+/// `push_or_panic` returns `()`; bytes live in `wb`. SimpleQuery
+/// emits a single 'Q' frame (no trailing Sync — Q is self-syncing
+/// per PG §55.2.4).
 #[track_caller]
 fn simple_query_setup(
     proto: &mut PgProtocol,
@@ -217,12 +216,12 @@ fn select_zero_rows_end_to_end() {
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
-// DEF-154 (Y): `select_multiple_rows_stream_then_deliver` DELETED —
-// row-bearing SELECT is covered end-to-end by
-// `row_stream_spec::multi_row_select_end_to_end`. Post-(Y),
-// `Action::StreamRow` is deleted + DataRow via `feed_bytes` is
-// classified as `UnexpectedFrame`; feed_bytes is the control-path
-// API (no row streaming). Use `iter_rows` for row-bearing
+// `select_multiple_rows_stream_then_deliver` was deleted — row-
+// bearing SELECT is covered end-to-end by
+// `row_stream_spec::multi_row_select_end_to_end`. `Action::StreamRow`
+// is gone + DataRow via `feed_bytes` is classified as
+// `UnexpectedFrame`; `feed_bytes` is the control-path API (no row
+// streaming). Use `iter_rows` for row-bearing
 // responses.
 
 /// Invariant (spec): a DML statement (no rows) yields
@@ -335,22 +334,22 @@ fn query_error_emits_fail_reply_and_connection_survives() {
     );
 }
 
-// DEF-154 (Y): `error_after_some_rows_emits_stream_then_fail`
-// DELETED — migrated to `row_stream_spec::
-// rows_before_mid_stream_error_are_preserved`, which tests the
-// same invariant (server ErrorResponse after partial rows → rows
-// still emit, FailReply replaces DeliverReply) on the `iter_rows`
-// API (the only API supporting row streaming post-(Y)).
+// `error_after_some_rows_emits_stream_then_fail` was deleted —
+// migrated to
+// `row_stream_spec::rows_before_mid_stream_error_are_preserved`,
+// which tests the same invariant (server ErrorResponse after partial
+// rows → rows still emit, FailReply replaces DeliverReply) on the
+// `iter_rows` API (the only API supporting row streaming).
 
 // ==================================================================
 // (B) Tier-3 invariants — bad paths + push-state policy
 // ==================================================================
 
-/// DEF-198 invariant: SimpleQuery while another in flight is
-/// structurally blocked at the public API. The original in-flight
-/// state is preserved (caller must drive `feed_bytes` to drain).
+/// Invariant: SimpleQuery while another in flight is structurally
+/// blocked at the public API. The original in-flight state is
+/// preserved (caller must drive `feed_bytes` to drain).
 #[test]
-fn def198_simple_query_while_in_flight_blocked_at_compile_time() {
+fn simple_query_while_in_flight_blocked_at_compile_time() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (first_reply, _first_raw) = mint_reply::<QueryKind>(&mut proto);
@@ -358,7 +357,7 @@ fn def198_simple_query_while_in_flight_blocked_at_compile_time() {
 
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None during in-flight SimpleQuery",
+        "as_ready must return None during in-flight SimpleQuery",
     );
     assert_eq!(
         proto.connection_status(),
@@ -386,10 +385,10 @@ fn def198_simple_query_while_in_flight_blocked_at_compile_time() {
     ));
 }
 
-/// DEF-198 invariant: SimpleQuery on Errored is structurally blocked.
+/// Invariant: SimpleQuery on Errored is structurally blocked.
 /// `ConnectionStatus::Errored(kind)` exposes the underlying cause.
 #[test]
-fn def198_simple_query_on_errored_blocked_at_compile_time() {
+fn simple_query_on_errored_blocked_at_compile_time() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
@@ -404,7 +403,7 @@ fn def198_simple_query_on_errored_blocked_at_compile_time() {
 
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None on Errored",
+        "as_ready must return None on Errored",
     );
     match proto.connection_status() {
         ConnectionStatus::Errored(_kind) => {}
@@ -412,14 +411,15 @@ fn def198_simple_query_on_errored_blocked_at_compile_time() {
     }
 }
 
-// DEF-154 (Y): `data_row_then_malformed_command_complete_preserves_row_bytes`
-// DELETED — migrated to `row_stream_spec::
-// rows_preserved_when_command_complete_malformed`.
+// `data_row_then_malformed_command_complete_preserves_row_bytes`
+// was deleted — migrated to
+// `row_stream_spec::rows_preserved_when_command_complete_malformed`.
 //
-// DEF-154 (Y): `zero_body_data_row_classified_as_malformed_data_row`
-// DELETED — covered by `row_stream_spec::
-// fast_path_empty_data_row_body_is_malformed` (same classification
-// — `MalformedDataRow` — via `iter_rows` fast-path).
+// `zero_body_data_row_classified_as_malformed_data_row` was deleted
+// — covered by
+// `row_stream_spec::fast_path_empty_data_row_body_is_malformed`
+// (same classification — `MalformedDataRow` — via `iter_rows`
+// fast-path).
 
 /// Invariant: a `CommandComplete` with no NUL terminator is
 /// classified as `MalformedCommandComplete` and tears the
@@ -475,24 +475,24 @@ fn unexpected_rfq_during_await_first_response_tears_down() {
     assert!(matches!(proto.state(), ActiveState::Errored(_)));
 }
 
-// DEF-154 (Y): `rows_across_multiple_feed_bytes_calls` DELETED —
-// migrated to `row_stream_spec::rows_across_multiple_feed_calls`
-// (iter_rows equivalent: `feed()` split across calls).
+// `rows_across_multiple_feed_bytes_calls` was deleted — migrated to
+// `row_stream_spec::rows_across_multiple_feed_calls` (`iter_rows`
+// equivalent: `feed()` split across calls).
 //
-// DEF-154 (Y): `overflow_backpressure_preserves_delivery_across_calls`
-// DELETED — obsolete post-(Y). The test pinned the behaviour of
+// `overflow_backpressure_preserves_delivery_across_calls` was
+// deleted — obsolete. The test pinned the behaviour of
 // `MAX_STAGED_PER_CALL`-bounded backpressure on the `feed_bytes`
-// row path; `iter_rows` pulls one event per `next_event` call,
-// so there's no output-buffer overflow to backpressure against.
-// Row throughput is now bounded only by the caller's loop rate.
+// row path; `iter_rows` pulls one event per `next_event` call, so
+// there's no output-buffer overflow to backpressure against. Row
+// throughput is bounded only by the caller's loop rate.
 //
-// DEF-154 (Y): `stream_row_bytes_decode_via_data_row_ref` DELETED —
-// migrated to `row_stream_spec::row_bytes_decode_via_data_row_ref`.
+// `stream_row_bytes_decode_via_data_row_ref` was deleted — migrated
+// to `row_stream_spec::row_bytes_decode_via_data_row_ref`.
 //
-// DEF-154 (Y): `end_to_end_decode_typed_row` DELETED —
-// migrated to `row_stream_spec::end_to_end_decode_typed_row`.
+// `end_to_end_decode_typed_row` was deleted — migrated to
+// `row_stream_spec::end_to_end_decode_typed_row`.
 
-/// Invariant (1c-2a): a DML query following a SELECT must receive
+/// Invariant: a DML query following a SELECT must receive
 /// `Reply::QueryComplete { row_desc: None }` — NOT the prior
 /// SELECT's schema. This pins the `push_command` clear at line
 /// `self.row_desc = None` (in `bsql_pg_proto::push_command::SimpleQuery` branch).
@@ -519,11 +519,10 @@ fn dml_after_select_clears_row_desc() {
     // on `C`; consumed on `Z` into DeliverReply(QueryComplete).
     // Post-Q1 state = Idle (no residual schema anywhere).
     //
-    // DEF-248 Sub-A (2026-05-12): row-bearing Q1 drives through
-    // closure-scoped `iter_rows` + `col_next` (the sole row-streaming
-    // API post-(Sub-A)). Drain the stream to the terminal EndQuery
-    // event; the inner `flush_pending` mechanism consumes the
-    // trailing Z so state returns to Idle.
+    // Row-bearing Q1 drives through closure-scoped `iter_rows` +
+    // `col_next` (the sole row-streaming API). Drain the stream to
+    // the terminal `EndQuery` event; the inner `flush_pending`
+    // mechanism consumes the trailing Z so state returns to Idle.
     let (q1_reply, _q1_raw) = mint_reply::<QueryKind>(&mut proto);
     simple_query_setup(&mut proto, q1_reply, &mut wb);
     let mut q1_bytes = std::vec::Vec::new();

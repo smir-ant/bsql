@@ -1,4 +1,4 @@
-//! Phase 1a — end-to-end Ping flow + bad-path coverage.
+//! End-to-end Ping flow + bad-path coverage.
 //!
 //! Every test here names the invariant it defends. Per architect.txt
 //! Part III, a test exists *only* for:
@@ -109,13 +109,14 @@ fn drain_pending_ping(proto: &mut PgProtocol, wb: &mut bsql_pg_proto::WriteBuf) 
 /// Push a Ping command and assert the single expected emission —
 /// `wb.as_bytes()` carries the literal `SYNC_WIRE_BYTES` payload.
 ///
-/// # DEF-212 (Alt Y', audit 2026-05-04)
+/// # Wire layout
 ///
-/// Pre-(212) `push_or_panic` returned a 1-Action `OutActions` list
-/// containing `Action::SendBytes(SYNC_WIRE_BYTES)`. Post-(212) the
-/// helper returns `()`; the bytes live in `wb`. Ping is the simplest
-/// case — just the 5-byte Sync wire payload, no preceding frame, no
-/// trailing Sync (the Sync IS the Ping in PG §55.2.4).
+/// `push_or_panic` returns `()`; the bytes live in `wb`. Ping is
+/// the simplest case — just the 5-byte Sync wire payload, no
+/// preceding frame, no trailing Sync (the Sync IS the Ping in
+/// PG §55.2.4). A naive 1-Action `OutActions` list containing
+/// `Action::SendBytes(SYNC_WIRE_BYTES)` would force a heap-bearing
+/// list shape for this 5 B literal.
 ///
 /// Using this helper instead of `proto.push_or_panic(..., &mut wb)`
 /// verifies the setup is well-formed on every call site — any
@@ -155,9 +156,9 @@ fn ping_from_idle_emits_sync_bytes() {
     let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
     proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, &mut wb);
 
-    // DEF-212: bytes live in wb. F33 anti-tautology: assert literal PG
-    // Sync wire layout (tag 'S' + BE u32 length=4), not the internal
-    // SYNC_WIRE_BYTES const (which would mirror any drift).
+    // Bytes live in `wb`. Anti-tautology: assert literal PG Sync
+    // wire layout (tag 'S' + BE u32 length=4), not the internal
+    // `SYNC_WIRE_BYTES` const (which would mirror any drift).
     assert_eq!(
         wb.as_bytes(),
         &[b'S', 0u8, 0u8, 0u8, 4u8],
@@ -183,7 +184,7 @@ fn rfq_delivers_pong_and_returns_to_idle() {
 
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
 
-    assert_eq!(out.len(), 1, "Phase 1a budget: feed_bytes(RFQ) emits exactly 1 action");
+    assert_eq!(out.len(), 1, "feed_bytes(RFQ) emits exactly 1 action");
     match out.as_slice() {
         [Action::DeliverReply { id: delivered_id, value }] => {
             assert_eq!(
@@ -196,7 +197,7 @@ fn rfq_delivers_pong_and_returns_to_idle() {
                     p.tx_status, bsql_pg_proto::TxStatus::Idle,
                     "Pong must surface the RFQ payload byte (tx-status) unchanged",
                 ),
-                other => panic!("only Reply::Pong defined in Phase 1a; got {other:?}"),
+                other => panic!("only Reply::Pong is valid here; got {other:?}"),
             }
         }
         other => panic!("unexpected action shape: {other:?}"),
@@ -280,7 +281,7 @@ fn error_response_fails_the_in_flight_ping() {
     assert_eq!(
         out.len(),
         2,
-        "Phase 1a budget: server-error during ping → FailReply + CloseSocket",
+        "server-error during ping → FailReply + CloseSocket",
     );
     match out.as_slice() {
         [
@@ -388,10 +389,11 @@ fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
         other => panic!("unexpected action sequence: {other:?}"),
     }
 
-    // DEF-061: state carries only ErrorKind (the `Transport` kind
-    // classifies ReadBufferFull). The full ReadBufferFull diagnostic
-    // (with exact `attempted`/`available` bytes) went out in the
-    // FailReply action above, which the test already pins.
+    // State carries only `ErrorKind` (the `Transport` kind
+    // classifies `ReadBufferFull`). The full `ReadBufferFull`
+    // diagnostic (with exact `attempted`/`available` bytes) went
+    // out in the `FailReply` action above, which the test already
+    // pins.
     use bsql_pg_proto::error::ErrorKind;
     match proto.state() {
         ActiveState::Errored(k) if k.as_kind() == ErrorKind::Transport => {}
@@ -437,29 +439,25 @@ fn frame_too_large_is_rejected_pre_buffer() {
     }
 }
 
-/// DEF-198 invariant: a second Ping while one is in flight is
+/// Invariant: a second Ping while one is in flight is
 /// **structurally impossible** at the public API surface.
 ///
-/// Pre-DEF-198 this test verified that `proto.push_command(Ping)` from
-/// `PingAwaitingRfq` returned `FailReply(CommandInProgress)` to the
-/// second reply id without disturbing the first. Post-DEF-198
-/// `proto.as_ready()` returns `None` while a Ping is in flight — the
-/// second push never happens.
-///
-/// The internal `compute_push_ping` non-Idle arms (still emit
-/// `FailReply` defensively) are unreachable from the public API and
-/// covered by `compute_push_tests` in protocol.rs.
+/// `proto.as_ready()` returns `None` while a Ping is in flight —
+/// the second push never happens. The internal
+/// `compute_push_ping` non-Idle arms (still emit `FailReply`
+/// defensively) are unreachable from the public API and covered by
+/// `compute_push_tests` in protocol.rs.
 #[test]
-fn def198_pipelined_ping_blocked_at_compile_time() {
+fn pipelined_ping_blocked_at_compile_time() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (first_reply, first_raw) = mint_reply::<PingKind>(&mut proto);
     ping_setup(&mut proto, first_reply, &mut wb);
 
-    // DEF-198: state is PingAwaitingRfq. Public API blocks second push.
+    // State is `PingAwaitingRfq`. Public API blocks second push.
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None during in-flight Ping",
+        "as_ready must return None during in-flight Ping",
     );
     assert_eq!(
         proto.connection_status(),
@@ -596,10 +594,10 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
     // Drive into Errored via an ErrorResponse — `ServerError` cause.
     let err_out = proto.feed_bytes(&error_frame(), &mut wb);
     assert_eq!(err_out.len(), 2, "entering Errored emits FailReply + CloseSocket");
-    // DEF-061: state carries ErrorKind::ServerError (1 byte), the
-    // full diagnostic cause went out in the FailReply above.
+    // State carries `ErrorKind::ServerError` (1 byte); the
+    // full diagnostic cause went out in the `FailReply` above.
     use bsql_pg_proto::error::ErrorKind;
-    // DEF-142: Errored(StateErrorKind) — match outer + compare via as_kind()
+    // `Errored(StateErrorKind)` — match outer + compare via `as_kind()`
     match proto.state() {
         ActiveState::Errored(k) => assert_eq!(k.as_kind(), ErrorKind::ServerError),
         other => panic!("expected Errored(ServerError), got {other:?}"),
@@ -613,7 +611,7 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
         0,
         "post-terminal RFQ must emit zero actions, got {post_out_1:?}",
     );
-    // DEF-142: Errored(StateErrorKind) — match outer + compare via as_kind()
+    // `Errored(StateErrorKind)` — match outer + compare via `as_kind()`
     match proto.state() {
         ActiveState::Errored(k) => assert_eq!(k.as_kind(), ErrorKind::ServerError),
         other => panic!("expected Errored(ServerError), got {other:?}"),
@@ -628,26 +626,20 @@ fn errored_state_is_terminal_and_drops_subsequent_frames() {
         0,
         "post-terminal ErrorResponse must emit zero actions, got {post_out_2:?}",
     );
-    // DEF-142: Errored(StateErrorKind) — match outer + compare via as_kind()
+    // `Errored(StateErrorKind)` — match outer + compare via `as_kind()`
     match proto.state() {
         ActiveState::Errored(k) => assert_eq!(k.as_kind(), ErrorKind::ServerError),
         other => panic!("expected Errored(ServerError), got {other:?}"),
     }
 }
 
-/// DEF-198 invariant: `push_command` on `Errored` is structurally
+/// Invariant: `push_command` on `Errored` is structurally
 /// impossible at the public API surface. The stored cause is exposed
 /// to the caller via [`PgProtocol::connection_status`] for recovery
-/// decisions.
-///
-/// Pre-DEF-198 this test verified the `FailReply` for a second push
-/// carried `ConnectionAlreadyClosed{prior_kind: ServerError}`,
-/// preserving the diagnostic that triggered the Errored transition.
-/// Post-DEF-198 the diagnostic is exposed via
-/// `ConnectionStatus::Errored(StateErrorKind)` — direct access for
-/// caller-side recovery without synthesising a fake reply id.
+/// decisions — `ConnectionStatus::Errored(StateErrorKind)` gives
+/// direct access without synthesising a fake reply id.
 #[test]
-fn def198_push_on_errored_blocked_at_compile_time_status_exposes_cause() {
+fn push_on_errored_blocked_at_compile_time_status_exposes_cause() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = bsql_pg_proto::WriteBuf::new();
     let (first_reply, _first_raw) = mint_reply::<PingKind>(&mut proto);
@@ -659,15 +651,15 @@ fn def198_push_on_errored_blocked_at_compile_time_status_exposes_cause() {
 
     use bsql_pg_proto::error::ErrorKind;
 
-    // DEF-198: as_ready returns None on Errored.
+    // `as_ready` returns `None` on Errored.
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None on Errored",
+        "as_ready must return None on Errored",
     );
 
-    // ConnectionStatus exposes the underlying error kind for caller-side
-    // recovery (vs pre-DEF-198 buried inside FailReply.cause for a
-    // synthesised failure id).
+    // `ConnectionStatus` exposes the underlying error kind for
+    // caller-side recovery (a naive synthesised-failure-id
+    // `FailReply.cause` shape would bury the diagnostic).
     match proto.connection_status() {
         ConnectionStatus::Errored(state_err_kind) => {
             assert_eq!(
@@ -690,8 +682,8 @@ fn def198_push_on_errored_blocked_at_compile_time_status_exposes_cause() {
     }
 }
 
-/// Invariant (spec, DEF-062): `NoticeResponse` (tag `'N'`) is a
-/// PG advisory frame that can arrive in any state. The pre-dispatch
+/// Invariant (spec): `NoticeResponse` (tag `'N'`) is a PG advisory
+/// frame that can arrive in any state. The pre-dispatch
 /// filter in `feed_bytes` silently consumes it — state unchanged,
 /// no actions emitted, subsequent frames are processed normally.
 ///
