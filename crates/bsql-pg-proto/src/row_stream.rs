@@ -1139,34 +1139,28 @@ impl<'p, 'w> RowStream<'p, 'w> {
             new_progress.parsed_cols = idx.saturating_add(1);
             self.row_progress = Some(new_progress);
 
-            // Two-phase defense for the body-slice projection. A
-            // silent `populated.get(...).unwrap_or(&[])` would be the
-            // CREDO §V glass pattern — user-visible-data-corruption-
-            // class if `read_buf_advance`'s contract ever broke.
+            // Body-slice projection — two-phase shield.
             //
-            // Phase 1 (explicit pre-check, uses populated.len() as a
-            // copy so the borrow is fully released before any
-            // `&mut self` call): if the slice end exceeds the
-            // populated region OR bytes_offset arithmetic underflowed
-            // (saturating_add could produce a smaller-than-offset end
-            // only on usize wrap, architecturally impossible because
-            // col_len_usize fits in i32), classify via the canonical
-            // terminal helper — `CrateBugLocus::ReadCursorAdvance`
-            // (closest existing semantics: "cursor/populated invariant
-            // broke between `read_buf_advance` Ok and slice
-            // projection"). The borrow-checker constraint forces this
-            // pre-check to live BEFORE the `populated` re-borrow,
-            // because `terminal_internal_advance_err` takes `&mut self`
-            // and the slice's lifetime ties to the populated borrow.
+            // Phase 1 (uses `populated.len()` as a copy so the borrow
+            // is released before any `&mut self` call): if the slice
+            // end exceeds the populated region OR `bytes_offset` +
+            // `col_len_usize` underflowed `slice_end` (architecturally
+            // impossible because `col_len_usize` fits in i32),
+            // classify via the canonical terminal helper. The
+            // borrow-checker constraint requires this pre-check
+            // BEFORE the `populated` re-borrow because
+            // `terminal_internal_advance_err` takes `&mut self` and a
+            // `let-else` would tie `bytes`'s lifetime to the
+            // populated borrow across the else arm — NLL rejects
+            // (E0502).
             //
-            // Phase 2: project the slice. The `.unwrap_or(&[])`
-            // fallback is preserved as the closing syntactic shape
-            // (no `clippy::indexing_slicing` use; no `unwrap()` /
-            // `expect()` panic class), but its None arm is
-            // ARCHITECTURALLY UNREACHABLE per phase 1's pre-check.
-            // The pair is the tier-1 elevation: classified Err on the
-            // hazard path, syntactic-shape fallback on the proven-dead
-            // path.
+            // Phase 2: project the slice. After Phase 1's classified
+            // shield, `slice_end <= populated.len()` and `bytes_offset
+            // <= slice_end` hold — the None arm of `get(...)` is
+            // architecturally unreachable; the `unwrap_or(&[])`
+            // landing pad is the forbid-bundle-compliant syntactic
+            // shape (no `unwrap` / `expect` / `indexing_slicing`).
+            // Tier-1 by-construction via the Phase-1 shield.
             let populated_len = self.proto.read_buf_populated().len();
             let slice_end = bytes_offset.saturating_add(col_len_usize);
             if slice_end > populated_len || slice_end < bytes_offset {
@@ -1213,11 +1207,15 @@ impl<'p, 'w> RowStream<'p, 'w> {
         self.row_progress = Some(new_progress);
 
         let remaining_len = col_len.saturating_sub(chunk_len_u32);
-        // Two-phase defense mirroring the Got-arm projection above.
+        // Two-phase shield mirroring the Got-arm projection above —
+        // `let-else` would tie `bytes`'s lifetime to the populated
+        // borrow across the `else` arm (NLL rejects E0502 because
+        // `terminal_internal_advance_err` takes `&mut self`). Phase 1
+        // pre-checks bounds via a len-copy + classified terminal;
+        // Phase 2's `unwrap_or(&[])` is the forbid-bundle-compliant
+        // landing pad on a structurally-dead None.
         // `read_buf_advance(chunk_len)` succeeded above ⇒
-        // `bytes_offset + chunk_len <= populated.len()`. Pre-check
-        // via len-copy + classified Err on the architecturally-dead
-        // bounds-violation arm before the populated re-borrow.
+        // `bytes_offset + chunk_len <= populated.len()`.
         let populated_len = self.proto.read_buf_populated().len();
         let slice_end = bytes_offset.saturating_add(chunk_len);
         if slice_end > populated_len || slice_end < bytes_offset {
@@ -1296,9 +1294,11 @@ impl<'p, 'w> RowStream<'p, 'w> {
         }
         self.row_progress = Some(new_progress);
 
-        // Two-phase defense (chunk continuation), same pattern as
-        // the first-chunk site. `read_buf_advance(chunk_len_usize)`
-        // succeeded above ⇒
+        // Two-phase shield (chunk continuation), same NLL-driven
+        // pattern as the first-chunk site (`let-else` would tie
+        // `bytes`'s lifetime to the populated borrow across the
+        // else arm). `read_buf_advance(chunk_len_usize)` succeeded
+        // above ⇒
         // `bytes_offset + chunk_len_usize <= populated.len()`.
         let populated_len = self.proto.read_buf_populated().len();
         let slice_end = bytes_offset.saturating_add(chunk_len_usize);
