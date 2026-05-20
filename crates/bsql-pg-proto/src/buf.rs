@@ -972,21 +972,18 @@ impl ReadBuf {
             None => 0,
         };
         if n > current {
-            // Diagnostic-display saturation: `requested` and `available`
-            // are `usize` fields on `AdvancePastEnd` whose sole role is
-            // operator-visible error reporting. `try_from(u32) -> usize`
-            // is infallible on every supported target (the crate-root
-            // `usize::BITS >= 32` const-assert rejects 16-bit), so the
-            // `unwrap_or(usize::MAX)` saturation arm is architecturally
-            // dead. Saturating to `MAX` is the correct loud signal if a
-            // future 16-bit target somehow slipped past the const-assert
-            // — "we lost the exact count" beats silent zero. This is
-            // the only `try_from(...).unwrap_or(_)` form retained as a
-            // tier-3 diagnostic-display fallback; compute paths route
-            // through typed `Result` instead.
+            // Widen `u32 → usize` for the diagnostic-display fields.
+            // The conversion is infallible under the crate-root
+            // `usize::BITS >= 32` const-assert; routed through the
+            // single-audit-point `narrow::usize_from_u32` helper —
+            // the dead-arm landing pad lives there, not at this call
+            // site. (A prior audit verdict tagged this as
+            // "display-only tier-3 saturation"; in practice the
+            // architectural-dead status is identical to compute
+            // paths and the same helper applies.)
             return Err(AdvancePastEnd {
-                requested: usize::try_from(n).unwrap_or(usize::MAX),
-                available: usize::try_from(current).unwrap_or(usize::MAX),
+                requested: crate::narrow::usize_from_u32(n),
+                available: crate::narrow::usize_from_u32(current),
             });
         }
         // Type-state transition: when `current - n` reaches 0 we exit

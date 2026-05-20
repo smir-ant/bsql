@@ -2444,7 +2444,11 @@ macro_rules! impl_from_pg_binary_int {
                         .filter(|_| bytes.len() == $n)
                         .ok_or_else(|| DecodeError::BinaryLengthMismatch {
                             expected_len: $n,
-                            actual_len: u16::try_from(bytes.len()).unwrap_or(u16::MAX),
+                            // `bytes` is a column-body slice bounded
+                            // by `READ_BUF_CAP <= u16::MAX`; the
+                            // narrowing helper encapsulates the dead-
+                            // arm landing pad.
+                            actual_len: crate::narrow::u16_from_usize_under_u16_bound(bytes.len()),
                         })?;
                     Ok(<$t>::from_be_bytes(*arr))
                 }
@@ -2475,7 +2479,9 @@ impl FromPgBinary<'_> for bool {
             [_] => Err(DecodeError::BoolParse),
             _ => Err(DecodeError::BinaryLengthMismatch {
                 expected_len: 1,
-                actual_len: u16::try_from(bytes.len()).unwrap_or(u16::MAX),
+                // `bytes` is a column-body slice bounded by
+                // `READ_BUF_CAP <= u16::MAX`.
+                actual_len: crate::narrow::u16_from_usize_under_u16_bound(bytes.len()),
             }),
         }
     }
