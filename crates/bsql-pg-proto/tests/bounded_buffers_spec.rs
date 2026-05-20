@@ -192,8 +192,8 @@ fn clear_resets_both_cursor_and_contents() {
     assert_eq!(buf.unread(), b"new");
 }
 
-/// Invariant (spec, DEF-058 lazy compact): when the tail has room for
-/// an append, no memmove is needed; when it doesn't, the compact step
+/// Invariant (spec, lazy compact): when the tail has room for an
+/// append, no memmove is needed; when it doesn't, the compact step
 /// reclaims the consumed prefix and the retry succeeds.
 ///
 /// This exercises both paths through the lazy-compact logic. The

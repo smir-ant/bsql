@@ -1,4 +1,4 @@
-//! Phase 1c-3c — Extended Query `Describe` command end-to-end.
+//! Extended Query `Describe` command end-to-end.
 //!
 //! Covers both target shapes (statement / portal):
 //!
@@ -145,10 +145,9 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
 /// Push a statement describe + verify wire layout in `wb.as_bytes()`.
 /// Returns the D-frame bytes for further wire-layout inspection.
 ///
-/// DEF-212 (Alt Y'): post-Phase-1a `push_command` returns
-/// `Result<(), PushFailure>`; bytes live in `wb`. This helper
-/// thin-wraps `common::split_frame_plus_sync` with the additional
-/// `'D'` tag check (PG §55.2.2 — Describe message).
+/// `push_command` returns `Result<(), PushFailure>`; bytes live in
+/// `wb`. This helper thin-wraps `common::split_frame_plus_sync` with
+/// the additional `'D'` tag check (PG §55.2.2 — Describe message).
 #[track_caller]
 fn describe_stmt_setup(
     proto: &mut PgProtocol,
@@ -754,11 +753,11 @@ fn describe_statement_malformed_rfq_tears_down() {
 // (F) Push-state policy
 // ═════════════════════════════════════════════════════════════════
 
-/// DEF-198 invariant: DescribeStatement on Errored is structurally
+/// Invariant: DescribeStatement on Errored is structurally
 /// blocked at the public API. `ConnectionStatus::Errored(kind)`
 /// surfaces the underlying cause for caller recovery.
 #[test]
-fn def198_describe_statement_on_errored_blocked_at_compile_time() {
+fn describe_statement_on_errored_blocked_at_compile_time() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
@@ -770,7 +769,7 @@ fn def198_describe_statement_on_errored_blocked_at_compile_time() {
 
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None on Errored",
+        "as_ready must return None on Errored",
     );
     match proto.connection_status() {
         ConnectionStatus::Errored(_kind) => {}
@@ -778,10 +777,10 @@ fn def198_describe_statement_on_errored_blocked_at_compile_time() {
     }
 }
 
-/// DEF-198 invariant: DescribePortal on Errored is structurally
+/// Invariant: DescribePortal on Errored is structurally
 /// blocked at the public API.
 #[test]
-fn def198_describe_portal_on_errored_blocked_at_compile_time() {
+fn describe_portal_on_errored_blocked_at_compile_time() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
@@ -791,7 +790,7 @@ fn def198_describe_portal_on_errored_blocked_at_compile_time() {
 
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None on Errored",
+        "as_ready must return None on Errored",
     );
     match proto.connection_status() {
         ConnectionStatus::Errored(_kind) => {}
@@ -799,11 +798,11 @@ fn def198_describe_portal_on_errored_blocked_at_compile_time() {
     }
 }
 
-/// DEF-198 invariant: pushing any other command while Describe is in
+/// Invariant: pushing any other command while Describe is in
 /// flight is structurally blocked. The in-flight state is preserved
 /// (caller must drive `feed_bytes` to drain).
 #[test]
-fn def198_parse_while_describe_statement_in_flight_blocked_at_compile_time() {
+fn parse_while_describe_statement_in_flight_blocked_at_compile_time() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (first_reply, _first_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
@@ -811,7 +810,7 @@ fn def198_parse_while_describe_statement_in_flight_blocked_at_compile_time() {
 
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None during in-flight Describe",
+        "as_ready must return None during in-flight Describe",
     );
     assert_eq!(
         proto.connection_status(),
@@ -832,11 +831,11 @@ fn def198_parse_while_describe_statement_in_flight_blocked_at_compile_time() {
     assert!(matches!(drain_out.as_slice(), [Action::DeliverReply { .. }]));
 }
 
-/// DEF-198 invariant: DescribeStatement while DescribePortal in flight
+/// Invariant: DescribeStatement while DescribePortal in flight
 /// is structurally blocked. Two describe targets are mutually
 /// exclusive single-command shapes; pipelining lands in 1c-5.
 #[test]
-fn def198_describe_statement_while_describe_portal_in_flight_blocked() {
+fn describe_statement_while_describe_portal_in_flight_blocked() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (first_reply, _first_raw) = mint_reply::<DescribePortalKind>(&mut proto);
@@ -844,7 +843,7 @@ fn def198_describe_statement_while_describe_portal_in_flight_blocked() {
 
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None during in-flight DescribePortal",
+        "as_ready must return None during in-flight DescribePortal",
     );
     assert_eq!(
         proto.connection_status(),
@@ -860,10 +859,10 @@ fn def198_describe_statement_while_describe_portal_in_flight_blocked() {
     assert!(matches!(drain_out.as_slice(), [Action::DeliverReply { .. }]));
 }
 
-/// DEF-198 invariant: DescribeStatement while BindExecute (DML) in
+/// Invariant: DescribeStatement while BindExecute (DML) in
 /// flight is structurally blocked.
 #[test]
-fn def198_describe_statement_while_bind_execute_in_flight_blocked() {
+fn describe_statement_while_bind_execute_in_flight_blocked() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
@@ -879,12 +878,12 @@ fn def198_describe_statement_while_bind_execute_in_flight_blocked() {
         be_reply,
         &mut wb,
     );
-    // DEF-212: verify wb contains B+E+Sync structurally.
+    // Verify `wb` contains B+E+Sync structurally.
     let (_bind, _execute, _sync) = split_bind_execute_sync(wb.as_bytes());
 
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None during in-flight Bind+Execute",
+        "as_ready must return None during in-flight Bind+Execute",
     );
     assert_eq!(
         proto.connection_status(),
@@ -958,7 +957,7 @@ fn describe_after_completed_parse_starts_clean() {
         },
         &mut wb,
     );
-    // DEF-212: verify Parse+Sync layout.
+    // Verify Parse+Sync layout.
     let (_p_frame, _sync) = split_frame_plus_sync(wb.as_bytes());
 
     let mut bytes = std::vec::Vec::new();

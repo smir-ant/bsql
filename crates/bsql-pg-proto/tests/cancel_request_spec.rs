@@ -1,5 +1,5 @@
-//! DEF-278 Bundle D' (2026-05-18) — spec-conformance tests for the
-//! closure-scoped `CancelRequest` mechanism on `<ActivePhase>`.
+//! Spec-conformance tests for the closure-scoped `CancelRequest`
+//! mechanism on `<ActivePhase>`.
 //!
 //! Validates the PUBLIC API surface from outside the crate boundary:
 //!
@@ -281,13 +281,15 @@ fn with_cancel_request_lends_length_field_16_at_bytes_0_4() {
 // =====================================================================
 // Spec-6: Zeroizing<[u8; 16]> guard structural Drop-glue shield
 //
-// Bundle D' replaced the public `CancelRequestCredentials` struct
-// (whose Drop was driven by `Sensitive<i32>`'s ZeroizeOnDrop) with
-// a stack-local `Zeroizing<[u8; 16]>` guard inside
-// `with_cancel_request`. We cannot directly probe the guard from
-// outside the crate (it lives on `with_cancel_request`'s stack frame
-// and is never named in any public type), but we CAN pin the
-// transitive proof:
+// The wire-frame guard is a stack-local `Zeroizing<[u8; 16]>` inside
+// `with_cancel_request` — a naive public `CancelRequestCredentials`
+// struct whose Drop was driven by `Sensitive<i32>`'s ZeroizeOnDrop
+// would lift the secret-scrub mechanism to a long-lived field
+// (tier-1 by-Drop-fire, suppressible by `mem::forget` / `Box::leak` /
+// `ManuallyDrop`). We cannot directly probe the guard from outside
+// the crate (it lives on `with_cancel_request`'s stack frame and is
+// never named in any public type), but we CAN pin the transitive
+// proof:
 //
 // (a) `core::mem::needs_drop::<zeroize::Zeroizing<[u8; 16]>>() ==
 //     true` — `Zeroizing` derives `ZeroizeOnDrop`. If a future

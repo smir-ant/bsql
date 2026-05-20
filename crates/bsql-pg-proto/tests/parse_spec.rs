@@ -1,4 +1,4 @@
-//! Phase 1c-3a — Extended Query `Parse` command end-to-end.
+//! Extended Query `Parse` command end-to-end.
 //!
 //! Covers the minimum-viable extended-query slice: `Parse + Sync`
 //! out, `ParseComplete + ReadyForQuery` in, `Reply::ParseComplete`
@@ -28,10 +28,9 @@ use bsql_pg_proto::{
 mod common;
 use common::{PushOrPanic, fresh_active_via_trust_handshake, mint_reply};
 
-// DEF-160 Z2 (2026-05-11): the `fn sql(s) -> Sql` helper is gone —
-// `push_command::Parse.sql` is `&'a str`, fixtures pass `&str` literals
-// directly. Legacy `cfg(test)` `PgCommand::Parse` enum still owns
-// `Sql` but lives only inside the lib's own unit tests.
+// `push_command::Parse.sql` is `&'a str`; fixtures pass `&str`
+// literals directly. The legacy `cfg(test)` `PgCommand::Parse` enum
+// still owns `Sql` but lives only inside the lib's own unit tests.
 
 fn stmt_unnamed() -> StmtName {
     StmtName::default()
@@ -73,14 +72,15 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
 /// Push a Parse + assert wire layout in `wb.as_bytes()`.
 /// Returns the P-frame bytes for wire-layout inspection.
 ///
-/// # DEF-212 (Alt Y', audit 2026-05-04)
+/// # Wire layout
 ///
-/// Pre-(212) `push_or_panic` returned an `OutActions` list containing
-/// `[Action::SendBytes(p), Action::SendBytes(sync)]` (800 B per call).
-/// Post-(212) the helper returns `()`; bytes live in the caller's
-/// `wb` as a single concatenation of the P frame followed by the
-/// trailing Sync wire bytes — the production I/O path drains them in
-/// one socket write.
+/// `push_or_panic` returns `()`; bytes live in the caller's `wb` as
+/// a single concatenation of the P frame followed by the trailing
+/// Sync wire bytes — the production I/O path drains them in one
+/// socket write. A naive `OutActions` list of
+/// `[Action::SendBytes(p), Action::SendBytes(sync)]` (800 B per
+/// call) would cost a per-action heap surface that the
+/// single-concatenation shape erases.
 ///
 /// Wire-layout assertion preserved exactly (tail = literal `[b'S', 0,
 /// 0, 0, 4]` per PG §55.2.4 — tag 'S' + BE u32 length=4 self-inclusive,
@@ -247,32 +247,28 @@ fn parse_frame_wire_format_with_named_statement() {
 // (B) Push-state policy
 // ==================================================================
 
-/// DEF-198 invariant: pushing a second Parse while one is in flight
-/// is **structurally impossible** at the public API surface.
+/// Invariant: pushing a second Parse while one is in flight is
+/// **structurally impossible** at the public API surface.
 ///
-/// Pre-DEF-198 this test verified that `proto.push_command(Parse)` from
-/// `ParseAwaitingParseComplete` returned `FailReply(CommandInProgress)`
-/// to the second reply id. Post-DEF-198 the public surface routes
-/// through [`PgProtocol::as_ready`], which returns `None` during the
-/// in-flight wait — the second push never happens.
-///
-/// The internal `compute_push_parse` non-Idle arm (which still emits
-/// `FailReply(CommandInProgress)` defensively) is exercised by the
-/// in-file `compute_push_tests` module; this integration test verifies
-/// only the public API contract.
+/// The public surface routes through [`PgProtocol::as_ready`], which
+/// returns `None` during the in-flight wait — the second push never
+/// happens. The internal `compute_push_parse` non-Idle arm (which
+/// still emits `FailReply(CommandInProgress)` defensively) is
+/// exercised by the in-file `compute_push_tests` module; this
+/// integration test verifies only the public API contract.
 #[test]
-fn def198_parse_while_parse_in_flight_blocked_at_compile_time() {
+fn parse_while_parse_in_flight_blocked_at_compile_time() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (first_reply, _first_raw) = mint_reply::<ParseKind>(&mut proto);
     parse_setup(&mut proto, stmt_unnamed(), "SELECT 1", first_reply, &mut wb);
 
-    // DEF-198: state is `ParseAwaitingParseComplete`. The public API
+    // State is `ParseAwaitingParseComplete`. The public API
     // (`as_ready`) returns `None` — caller cannot acquire a guard,
     // therefore cannot push a second Parse.
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None during in-flight Parse",
+        "as_ready must return None during in-flight Parse",
     );
     assert_eq!(
         proto.connection_status(),
@@ -294,17 +290,15 @@ fn def198_parse_while_parse_in_flight_blocked_at_compile_time() {
     assert!(matches!(drain_out.as_slice(), [Action::DeliverReply { .. }]));
 }
 
-/// DEF-198 invariant: Parse on an `Errored` connection is structurally
+/// Invariant: Parse on an `Errored` connection is structurally
 /// impossible at the public API surface.
 ///
-/// Pre-DEF-198 this test verified that `push_command(Parse)` on Errored
-/// returned `FailReply(ConnectionAlreadyClosed)`. Post-DEF-198
 /// `as_ready` returns `None` and `connection_status` returns
 /// `ConnectionStatus::Errored(kind)` — caller has structured access
 /// to the underlying `StateErrorKind` for recovery decisions
 /// (typically: discard the connection, return to pool with disposal).
 #[test]
-fn def198_parse_on_errored_blocked_at_compile_time() {
+fn parse_on_errored_blocked_at_compile_time() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
 
@@ -314,15 +308,15 @@ fn def198_parse_on_errored_blocked_at_compile_time() {
     assert!(out.as_slice().iter().any(|a| matches!(a, Action::CloseSocket)));
     assert!(matches!(proto.state(), ActiveState::Errored(_)));
 
-    // DEF-198: as_ready returns None on Errored.
+    // as_ready returns None on Errored.
     assert!(
         proto.as_ready().is_none(),
-        "DEF-198: as_ready must return None on Errored state",
+        "as_ready must return None on Errored state",
     );
 
     // connection_status exposes the underlying error kind for
-    // structured caller-side recovery (vs pre-DEF-198 buried in
-    // FailReply.cause field on a synthesised reply).
+    // structured caller-side recovery (a naive `FailReply.cause`
+    // shape on a synthesised reply would bury the diagnostic).
     match proto.connection_status() {
         ConnectionStatus::Errored(_kind) => {
             // Caller can inspect _kind to decide recovery policy
