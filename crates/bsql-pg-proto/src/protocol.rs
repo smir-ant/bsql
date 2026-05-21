@@ -6576,6 +6576,40 @@ fn build_describe_message<N: crate::ident::DescribeName>(
     crate::action::WriteRange::from_write_span(start, reserved)
 }
 
+/// Build a PostgreSQL Extended Query `Close` (`'C'`) frame
+/// (PG §55.7).
+///
+/// Wire layout: tag `'C'`, 4-byte BE length (self-inclusive),
+/// single target byte (`'S'` statement or `'P'` portal via
+/// [`crate::wire::CloseTargetByte`]), NUL-terminated name.
+///
+/// Mirrors [`build_describe_message`] verbatim — same wire shape
+/// (1-byte tag + length-prefixed (1-byte target + name CSTR));
+/// only the tag (`'C'` vs `'D'`) and target-byte enum differ. The
+/// `name: &impl DescribeName` sealed-trait reuse is intentional:
+/// the trait enumerates exactly the two acceptable name types
+/// (`StmtName` for `'S'`, `PortalName` for `'P'`), which are the
+/// same two name types Close accepts. A future rename of
+/// `DescribeName` → `StmtOrPortalName` would be a one-grep
+/// refactor across this file + `ident.rs`.
+///
+/// `#[inline]` rationale matches [`build_describe_message`].
+#[inline]
+fn build_close_message<N: crate::ident::DescribeName>(
+    target: crate::wire::CloseTargetByte,
+    name: &N,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) -> Result<crate::action::WriteRange, ProtocolError> {
+    let start = reserved.len();
+    reserved.push_u8(crate::wire::TAG_CLOSE.byte())?;
+    reserved.with_length_prefix(|w| {
+        w.push_u8(target.byte())?;
+        w.push_nul_terminated(name.as_describe_name_bytes())?;
+        Ok(())
+    })?;
+    crate::action::WriteRange::from_write_span(start, reserved)
+}
+
 /// Compute the transition for [`PgCommand::DescribeStatement`]
 /// against the current [`ProtoState`]. Pure; see [`compute_push`]
 /// for framing.
@@ -6772,6 +6806,47 @@ pub(crate) fn compute_push_describe_portal_idle_only(
     // Typed witness pairs DescribePortal → DescribePortalAwaitingRowDescOrNoData.
     setter.install_post_state(
         crate::push_command::DescribePortalAwaitingRowDescOrNoDataInstall { reply },
+    );
+}
+
+/// Idle-only path for the `Close` push (statement or portal target).
+///
+/// Mirrors [`compute_push_describe_statement_idle_only`] / [`..._portal`]
+/// — emits TWO actions (`SendBytes(Close frame)` + `SendBytes(SYNC)`),
+/// then installs the typed witness pairing to
+/// [`crate::state::ProtoState::CloseAwaitingComplete`]. The
+/// target byte (`Statement` vs `Portal`) flows into the wire frame
+/// but the post-push state machine treats both paths uniformly —
+/// both targets produce identical response sequences (`CloseComplete`
+/// → `ReadyForQuery`).
+#[inline]
+pub(crate) fn compute_push_close_idle_only<N: crate::ident::DescribeName>(
+    setter: crate::state_setter::StateSetter<
+        '_,
+        crate::push_command::CloseAwaitingCompleteInstall,
+    >,
+    target: crate::wire::CloseTargetByte,
+    name: &N,
+    reply: ReplyId<crate::reply_id::CloseKind>,
+    staged: &mut StagedActions,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) {
+    let range = try_builder!(
+        build_close_message(target, name, reserved),
+        setter,
+        reply,
+        staged
+    );
+    emit_actions!(staged, budget: 2, [
+        StagedAction::SendBytesRange(range),
+        StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+    ]);
+    // Typed witness pairs CloseStatement / ClosePortal →
+    // CloseAwaitingComplete. Unified across the two close targets —
+    // the wire-level target byte distinction lives in the emitted
+    // Close frame, not in the state machine.
+    setter.install_post_state(
+        crate::push_command::CloseAwaitingCompleteInstall { reply },
     );
 }
 

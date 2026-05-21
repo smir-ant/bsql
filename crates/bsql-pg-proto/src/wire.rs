@@ -365,6 +365,83 @@ pub const TAG_EXECUTE: OutboundTag = OutboundTag::from_byte(b'E');
 /// `CommandComplete` but is type-distinct.
 pub const TAG_CLOSE: OutboundTag = OutboundTag::from_byte(b'C');
 
+/// Typed target enum for the `Close` frame (PG §55.7).
+///
+/// The Close frame wraps a 1-byte target discriminator plus a
+/// null-terminated name. The discriminator distinguishes a prepared
+/// statement (`'S'`) from a portal (`'P'`); a raw `u8` argument would
+/// be a tier-3 by-discipline seam — a contributor could call
+/// `build_close_message(b'X', ...)` and produce a server
+/// `ErrorResponse` at runtime. The typed enum moves discrimination to
+/// the call site: `CloseTargetByte::Statement` / `::Portal` are the
+/// only paths to construct a value.
+///
+/// Wire bytes are identical to [`DescribeTargetByte`] (both PG frames
+/// use `'S'`/`'P'`), but the enums are kept distinct so a
+/// `DescribeTargetByte` value cannot be passed to a Close builder
+/// (and vice versa). The shared byte values are pinned per-enum
+/// against PG §55.7 / §55.2.2 via independent const-asserts below.
+///
+/// # NOT `#[non_exhaustive]`
+///
+/// PG §55.7 defines exactly two Close targets (`'S'` statement,
+/// `'P'` portal). Adding a third would be a major-protocol bump.
+/// Closed-by-spec → exhaustive `match` is the load-bearing tier-1
+/// invariant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CloseTargetByte {
+    /// Close a prepared statement previously created via
+    /// `PgCommand::Parse`. Wire byte: `'S'`.
+    ///
+    /// Response shape: `CloseComplete` (`'3'`) followed by
+    /// `ReadyForQuery` (`'Z'`) — the standard Sync-bracketed
+    /// extended-query reply pattern.
+    Statement = b'S',
+    /// Close a bound portal previously created via
+    /// `push_bind_execute`. Wire byte: `'P'`.
+    ///
+    /// Response shape: `CloseComplete` (`'3'`) followed by
+    /// `ReadyForQuery` (`'Z'`). Same as Statement; the discriminator
+    /// matters only to the server (which resource to free) — the
+    /// client-side state machine treats both targets uniformly.
+    Portal = b'P',
+}
+
+impl CloseTargetByte {
+    /// The PG wire byte for this target. Explicit match (not `as u8`)
+    /// — the crate forbids `clippy::as_conversions`. With the
+    /// `#[repr(u8)]` discriminants above, each arm folds to a single
+    /// literal load at the monomorphic call site.
+    #[inline]
+    #[must_use]
+    pub const fn byte(self) -> u8 {
+        match self {
+            Self::Statement => b'S',
+            Self::Portal => b'P',
+        }
+    }
+}
+
+// Drift-pin the wire bytes — same shape as DescribeTargetByte's
+// pins above. An arm-body edit in `byte()` that drifted the byte
+// would still compile, but a Close frame with the wrong target
+// byte would either reference a non-existent resource (server
+// ErrorResponse) or close the wrong kind of resource (semantic
+// corruption — closing a portal when the caller meant a statement).
+const _: () = assert!(
+    CloseTargetByte::Statement.byte() == b'S',
+    "CloseTargetByte::Statement MUST wire-encode as b'S' per PG §55.7",
+);
+const _: () = assert!(
+    CloseTargetByte::Portal.byte() == b'P',
+    "CloseTargetByte::Portal MUST wire-encode as b'P' per PG §55.7",
+);
+const _: () = assert!(
+    CloseTargetByte::Statement.byte() != CloseTargetByte::Portal.byte(),
+    "CloseTargetByte variants MUST map to distinct wire bytes",
+);
+
 /// Frontend `Flush` message tag (`'H'`) — send buffered responses
 /// without advancing the transaction state. (`Sync` commits the
 /// implicit transaction and emits `ReadyForQuery`; `Flush` does

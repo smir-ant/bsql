@@ -663,6 +663,14 @@ impl InstallBody for crate::push_command::DescribePortalAwaitingRowDescOrNoDataI
     }
 }
 
+impl install_body_seal::InstallBodySealed for crate::push_command::CloseAwaitingCompleteInstall {}
+impl InstallBody for crate::push_command::CloseAwaitingCompleteInstall {
+    #[inline]
+    fn install(self, state: &mut ProtoState) {
+        *state = ProtoState::CloseAwaitingComplete(self.reply);
+    }
+}
+
 impl install_body_seal::InstallBodySealed for crate::push_command::BindExecutePostInstall {}
 impl InstallBody for crate::push_command::BindExecutePostInstall {
     #[inline]

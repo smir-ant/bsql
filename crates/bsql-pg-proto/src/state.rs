@@ -22,7 +22,7 @@ use crate::action::ParamOids;
 use crate::error::BoundedStr;
 use crate::error::StateErrorKind;
 use crate::reply_id::{
-    DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
+    CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
     StartupKind,
 };
 use crate::scram::session::ScramSession;
@@ -742,6 +742,64 @@ pub enum ProtoState {
         reply: ReplyId<DescribePortalKind>,
     },
 
+    // ---------------------------------------------------------------
+    // Extended Query — Close flow
+    // ---------------------------------------------------------------
+    //
+    // `push_command(CloseStatement | ClosePortal)` emits a `Close` +
+    // `Sync` bundle. Server response shape (PG §55.7):
+    //
+    //   't'-target ('S' statement or 'P' portal) is asymmetric only
+    //   server-side (resource lookup); the response sequence is
+    //   identical for both targets:
+    //
+    //     '3' (CloseComplete) — empty body, signals the close was
+    //         accepted
+    //     'Z' (ReadyForQuery) — Sync boundary
+    //
+    // Because both targets produce the SAME response sequence, the
+    // state variants here are unified (no statement-vs-portal
+    // discriminator on state). The wire-level distinction lives in
+    // the push struct (`CloseStatement` vs `ClosePortal`) and the
+    // emitted Close frame's target byte; once the frame is on the
+    // wire, the state machine treats both paths uniformly.
+    //
+    // PG also accepts Close on a non-existent name (it is NOT an
+    // error per PG §55.7); the server still emits CloseComplete + RFQ.
+    // Our state machine therefore doesn't need a NotFound classifier.
+    //
+    // Error path: 'E' (ErrorResponse) during a Close is non-standard
+    // (PG essentially never errors on Close) but spec-conforming:
+    // emit FailReply + transition to DrainRfqAfterError. Connection
+    // survives.
+
+    /// A `Close` + `Sync` bundle was sent (statement or portal target);
+    /// awaiting `CloseComplete` (`'3'`). The inner
+    /// [`ReplyId<CloseKind>`] is the only path to the correlator;
+    /// state-as-data invariant (§7.2).
+    ///
+    /// # Unified state for both targets
+    ///
+    /// Statement-target and portal-target Close pushes both transition
+    /// into this same variant. The wire-level target byte (`'S'` vs
+    /// `'P'`) is consumed at push time inside the Close frame; the
+    /// post-push state machine treats both paths uniformly because the
+    /// server's response sequence is identical (CloseComplete → RFQ).
+    ///
+    /// Next legitimate frames:
+    /// - `'3'` (CloseComplete, empty body) → transition to
+    ///   [`Self::CloseAwaitingRfq`].
+    /// - `'E'` (ErrorResponse) → emit FailReply + transition to
+    ///   [`Self::DrainRfqAfterError`] (recoverable — connection
+    ///   survives).
+    /// - Anything else → UnexpectedFrame → teardown.
+    CloseAwaitingComplete(ReplyId<CloseKind>),
+
+    /// `CloseComplete` (`'3'`) received; awaiting the `ReadyForQuery`
+    /// (`'Z'`) that closes the Sync boundary. On `'Z'` → deliver
+    /// [`crate::Reply::CloseComplete`] and transition to Idle.
+    CloseAwaitingRfq(ReplyId<CloseKind>),
+
     /// Terminal: the connection has been classified as unrecoverable.
     ///
     /// Entered by any path that calls `fail_inflight_and_close` or
@@ -847,6 +905,9 @@ impl ProtoState {
             | Self::DescribeStatementAwaitingRfq { reply, .. } => Some(reply.consume()),
             Self::DescribePortalAwaitingRowDescOrNoData(reply)
             | Self::DescribePortalAwaitingRfq { reply, .. } => Some(reply.consume()),
+            Self::CloseAwaitingComplete(reply) | Self::CloseAwaitingRfq(reply) => {
+                Some(reply.consume())
+            }
         }
     }
 
@@ -930,7 +991,9 @@ impl ProtoState {
             | Self::DescribeStatementAwaitingRowDescOrNoData { .. }
             | Self::DescribeStatementAwaitingRfq { .. }
             | Self::DescribePortalAwaitingRowDescOrNoData(_)
-            | Self::DescribePortalAwaitingRfq { .. } => StatePushClass::BusyQuery,
+            | Self::DescribePortalAwaitingRfq { .. }
+            | Self::CloseAwaitingComplete(_)
+            | Self::CloseAwaitingRfq(_) => StatePushClass::BusyQuery,
         }
     }
 }
@@ -1289,6 +1352,10 @@ pub enum ActiveState {
     DescribePortalAwaitingRfq {
         reply: ReplyId<DescribePortalKind>,
     },
+    /// Mirror of [`ProtoState::CloseAwaitingComplete`].
+    CloseAwaitingComplete(ReplyId<CloseKind>),
+    /// Mirror of [`ProtoState::CloseAwaitingRfq`].
+    CloseAwaitingRfq(ReplyId<CloseKind>),
     /// Transient `install_errored` write while wrapper is still
     /// `<ActivePhase>`. Lifted to `<ClosedPhase>` via
     /// `into_closed_if_errored`.
@@ -1428,6 +1495,8 @@ impl From<ActiveState> for ProtoState {
             ActiveState::DescribePortalAwaitingRfq { reply } => {
                 ProtoState::DescribePortalAwaitingRfq { reply }
             }
+            ActiveState::CloseAwaitingComplete(r) => ProtoState::CloseAwaitingComplete(r),
+            ActiveState::CloseAwaitingRfq(r) => ProtoState::CloseAwaitingRfq(r),
             ActiveState::Errored(k) => ProtoState::Errored(k),
         }
     }
@@ -1532,6 +1601,9 @@ impl ActiveState {
             | Self::DescribeStatementAwaitingRfq { reply, .. } => Some(reply.consume()),
             Self::DescribePortalAwaitingRowDescOrNoData(reply)
             | Self::DescribePortalAwaitingRfq { reply } => Some(reply.consume()),
+            Self::CloseAwaitingComplete(reply) | Self::CloseAwaitingRfq(reply) => {
+                Some(reply.consume())
+            }
         }
     }
 
@@ -1568,7 +1640,9 @@ impl ActiveState {
             | Self::DescribeStatementAwaitingRowDescOrNoData { .. }
             | Self::DescribeStatementAwaitingRfq { .. }
             | Self::DescribePortalAwaitingRowDescOrNoData(_)
-            | Self::DescribePortalAwaitingRfq { .. } => StatePushClass::BusyQuery,
+            | Self::DescribePortalAwaitingRfq { .. }
+            | Self::CloseAwaitingComplete(_)
+            | Self::CloseAwaitingRfq(_) => StatePushClass::BusyQuery,
         }
     }
 }
@@ -1649,6 +1723,8 @@ impl core::fmt::Debug for ActiveState {
                 .debug_struct("DescribePortalAwaitingRfq")
                 .field("reply", reply)
                 .finish(),
+            Self::CloseAwaitingComplete(id) => write!(f, "CloseAwaitingComplete({id:?})"),
+            Self::CloseAwaitingRfq(id) => write!(f, "CloseAwaitingRfq({id:?})"),
             Self::Errored(kind) => write!(f, "Errored({kind:?})"),
         }
     }
@@ -1788,6 +1864,8 @@ impl TryFrom<ProtoState> for ActiveState {
             ProtoState::DescribePortalAwaitingRfq { reply } => {
                 Ok(ActiveState::DescribePortalAwaitingRfq { reply })
             }
+            ProtoState::CloseAwaitingComplete(r) => Ok(ActiveState::CloseAwaitingComplete(r)),
+            ProtoState::CloseAwaitingRfq(r) => Ok(ActiveState::CloseAwaitingRfq(r)),
             ProtoState::Errored(k) => Ok(ActiveState::Errored(k)),
             other => Err(WrongPhase { recovered: other }),
         }
@@ -1885,7 +1963,9 @@ impl ProtoState {
             | Self::DescribeStatementAwaitingRowDescOrNoData { .. }
             | Self::DescribeStatementAwaitingRfq { .. }
             | Self::DescribePortalAwaitingRowDescOrNoData(_)
-            | Self::DescribePortalAwaitingRfq { .. } => UnsolicitedAdmit {
+            | Self::DescribePortalAwaitingRfq { .. }
+            | Self::CloseAwaitingComplete(_)
+            | Self::CloseAwaitingRfq(_) => UnsolicitedAdmit {
                 allow_param_status: true,
                 allow_notice_response: true,
             },
@@ -2063,6 +2143,8 @@ impl core::fmt::Debug for ProtoState {
                 .debug_struct("DescribePortalAwaitingRfq")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
+            Self::CloseAwaitingComplete(id) => write!(f, "CloseAwaitingComplete({id:?})"),
+            Self::CloseAwaitingRfq(id) => write!(f, "CloseAwaitingRfq({id:?})"),
             Self::HandshakeReady { pid, secret_key } => f
                 .debug_struct("HandshakeReady")
                 .field("pid", pid)

@@ -52,7 +52,7 @@ use crate::ident::{PortalName, StmtName};
 // (`use crate::ident::{ApplicationName, DatabaseName, Ident}` /
 // `use crate::password::Credentials` inside `mod protocol`).
 use crate::reply_id::{
-    DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
+    CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
     StartupKind,
 };
 
@@ -421,6 +421,95 @@ impl PushCommand for DescribePortal {
     }
 }
 
+/// Close a prepared statement via PG's Extended Query `Close` + `Sync`
+/// bundle (PG §55.7).
+///
+/// Closes the named prepared statement on the server side, freeing
+/// the resources it referenced. It is NOT an error to close a name
+/// that does not exist — the server emits `CloseComplete` either way.
+///
+/// Response shape: `'3'` (CloseComplete) → `'Z'` (ReadyForQuery).
+/// Identical to [`ClosePortal`]'s response — the post-push state
+/// machine treats both unified via [`crate::state::ProtoState::CloseAwaitingComplete`]
+/// / [`crate::state::ProtoState::CloseAwaitingRfq`].
+#[derive(Debug)]
+#[must_use = "a CloseStatement has no effect until passed to push_command"]
+pub struct CloseStatement {
+    /// Prepared-statement name.
+    pub stmt_name: StmtName,
+    /// Correlator for the reply.
+    pub reply: ReplyId<CloseKind>,
+}
+
+impl sealed::PushCommandSealed for CloseStatement {}
+
+impl PushCommand for CloseStatement {
+    type Output = ();
+    type PostState = CloseAwaitingCompleteInstall;
+
+    #[inline]
+    fn execute<'sql>(
+        self,
+        setter: crate::state_setter::StateSetter<'_, Self::PostState>,
+        _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
+        staged: &mut crate::action::StagedActions<'sql>,
+        reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+    )
+    where
+        Self: 'sql,
+    {
+        crate::protocol::compute_push_close_idle_only(
+            setter,
+            crate::wire::CloseTargetByte::Statement,
+            &self.stmt_name,
+            self.reply,
+            staged,
+            reserved,
+        );
+    }
+}
+
+/// Close a bound portal via PG's Extended Query `Close` + `Sync`
+/// bundle (PG §55.7). Mirrors [`CloseStatement`] — the wire-level
+/// target byte differs (`'P'` vs `'S'`) and the post-push state
+/// variant is unified.
+#[derive(Debug)]
+#[must_use = "a ClosePortal has no effect until passed to push_command"]
+pub struct ClosePortal {
+    /// Portal name.
+    pub portal_name: PortalName,
+    /// Correlator for the reply.
+    pub reply: ReplyId<CloseKind>,
+}
+
+impl sealed::PushCommandSealed for ClosePortal {}
+
+impl PushCommand for ClosePortal {
+    type Output = ();
+    type PostState = CloseAwaitingCompleteInstall;
+
+    #[inline]
+    fn execute<'sql>(
+        self,
+        setter: crate::state_setter::StateSetter<'_, Self::PostState>,
+        _row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
+        staged: &mut crate::action::StagedActions<'sql>,
+        reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+    )
+    where
+        Self: 'sql,
+    {
+        crate::protocol::compute_push_close_idle_only(
+            setter,
+            crate::wire::CloseTargetByte::Portal,
+            &self.portal_name,
+            self.reply,
+            staged,
+            reserved,
+        );
+    }
+}
+
 /// Extended-Query Bind+Execute pipeline.
 ///
 /// Pipelines three frames in one push: Bind + Execute + Sync.
@@ -605,6 +694,23 @@ pub struct DescribePortalAwaitingRowDescOrNoDataInstall {
 impl PostStateSealed for DescribePortalAwaitingRowDescOrNoDataInstall {}
 // Install body lives in `state_setter::InstallBody` impl.
 impl PostStateProof for DescribePortalAwaitingRowDescOrNoDataInstall {}
+
+/// Witness pairing [`CloseStatement`] / [`ClosePortal`] to
+/// [`crate::state::ProtoState::CloseAwaitingComplete`]. Unified across
+/// the two close targets — both produce identical post-push state
+/// (the wire-level target byte distinction lives in the emitted Close
+/// frame, not in the state machine).
+#[must_use = "a CloseAwaitingCompleteInstall has no effect until passed to StateSetter::install_post_state"]
+#[expect(
+    missing_debug_implementations,
+    reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface — defer until a concrete diagnostic surface needs the trait."
+)]
+pub struct CloseAwaitingCompleteInstall {
+    pub(crate) reply: ReplyId<CloseKind>,
+}
+impl PostStateSealed for CloseAwaitingCompleteInstall {}
+// Install body lives in `state_setter::InstallBody` impl.
+impl PostStateProof for CloseAwaitingCompleteInstall {}
 
 /// Witness pairing [`BindExecute<P>`] to one of two post-bind+execute
 /// variants (DML / SELECT). The split surfaces the schema-bearing

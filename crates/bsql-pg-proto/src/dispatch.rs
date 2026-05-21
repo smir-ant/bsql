@@ -84,7 +84,7 @@ pub(crate) mod _row_description_dispatch_leaf {
 }
 use crate::wire::{
     SCRAM_SHA_256_MECHANISM, TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE,
-    TAG_COMMAND_COMPLETE, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
+    TAG_CLOSE_COMPLETE, TAG_COMMAND_COMPLETE, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
     TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_NO_DATA, TAG_PARAMETER_DESCRIPTION, TAG_PARSE_COMPLETE,
     TAG_PORTAL_SUSPENDED, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
@@ -1326,6 +1326,65 @@ pub(crate) fn dispatch(
             Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
         },
         (ProtoState::DescribePortalAwaitingRfq { reply, .. }, other) => {
+            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // =============================================================
+        // Close flow (PG §55.7)
+        //
+        // Both `CloseStatement` and `ClosePortal` produce the SAME
+        // response sequence on the wire:
+        //   '3' (CloseComplete) → 'Z' (ReadyForQuery)
+        //
+        // The push-side target byte ('S'/'P') is consumed inside the
+        // Close frame on its way out; the dispatch-side treats both
+        // paths uniformly because both yield identical reply payload
+        // shapes (`CloseCompletePayload`, ZST).
+        //
+        // PG accepts Close on a non-existent name (NOT an error — see
+        // PG §55.7), so the happy path is the only common case.
+        // ErrorResponse during Close is non-standard but spec-conforming:
+        // emit FailReply + transition to DrainRfqAfterError. Connection
+        // survives (query-level recoverable, mirroring Parse / Describe).
+        // =============================================================
+
+        // Stage 1: awaiting CloseComplete ('3').
+        (ProtoState::CloseAwaitingComplete(reply), TAG_CLOSE_COMPLETE) => {
+            // PG §55.7 CloseComplete body must be empty. Reject any
+            // payload that doesn't match the empty-body invariant.
+            match validate_empty_body(payload, TAG_CLOSE_COMPLETE) {
+                Ok(()) => {
+                    *state = ProtoState::CloseAwaitingRfq(reply);
+                    DispatchOutcome::AdvancedSilent
+                }
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+            }
+        }
+        (ProtoState::CloseAwaitingComplete(reply), TAG_ERROR_RESPONSE) => {
+            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+        }
+        (ProtoState::CloseAwaitingComplete(reply), other) => {
+            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // Stage 2: awaiting ReadyForQuery — deliver the terminal
+        // CloseComplete reply. No payload data — `CloseCompletePayload`
+        // is ZST; only the correlator is meaningful.
+        (ProtoState::CloseAwaitingRfq(reply), TAG_READY_FOR_QUERY) => {
+            match parse_rfq_payload(payload) {
+                Ok(_tx_status) => {
+                    *state = ProtoState::Idle;
+                    DispatchOutcome::AdvancedWithAction {
+                        action: crate::action::deliver(
+                            reply,
+                            crate::action::CloseCompletePayload,
+                        ),
+                    }
+                }
+                Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
+            }
+        }
+        (ProtoState::CloseAwaitingRfq(reply), other) => {
             install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
