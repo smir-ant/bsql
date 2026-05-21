@@ -7070,6 +7070,73 @@ pub(crate) fn compute_push_bind_execute_idle_only<P: crate::params::ParamsWriter
     setter.install_post_state(post_install);
 }
 
+/// Idle-only push path for [`crate::push_command::ExecutePortal`].
+///
+/// Sends `Execute` + `Sync` (NO `Bind` — the portal was bound on a
+/// prior `BindExecute`). State transitions directly to the post-
+/// `BindComplete` shape (`AwaitingDataOrCompleteSelect` for the
+/// Select path, `AwaitingCommandCompleteDml` for Dml).
+///
+/// # PG semantics
+///
+/// PG §55.2.7: a bound portal can be Executed repeatedly. Each
+/// `Execute` consumes rows from the portal's row stream; the cursor
+/// state is maintained on the server. Resume after `PortalSuspended`
+/// reads the next batch. Resume after `CommandComplete` is a
+/// protocol-level error (the portal is consumed) — server emits
+/// `ErrorResponse` which our state machine routes through the
+/// existing DrainRfqAfterError path.
+///
+/// # Why no `BindComplete` wait
+///
+/// The current state transition installs
+/// `BindExecuteAwaitingDataOrCompleteSelect { reply }` directly,
+/// skipping the `BindExecuteAwaitingBindCompleteSelect` step. This
+/// is correct because the server emits `BindComplete` only in
+/// response to a `Bind` frame — and this resume command sends no
+/// `Bind`. A naive shape that installed `AwaitingBindCompleteSelect`
+/// here would tear down on the first real frame (DataRow / CommandComplete)
+/// arriving where `BindComplete` was expected.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors compute_push_bind_execute_idle_only's signature shape — \
+              each parameter corresponds to a 1:1 wire-frame argument (portal_name, \
+              row_desc, fetch, reply) or a structural staging slot (setter, \
+              row_desc_slot, staged, reserved); collapsing them into a struct \
+              would (a) add a per-call construction site, (b) opacify the wire \
+              parameter list at the call site"
+)]
+#[inline]
+pub(crate) fn compute_push_execute_portal_idle_only(
+    setter: crate::state_setter::StateSetter<'_, crate::push_command::ExecutePortalPostInstall>,
+    row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
+    portal_name: &crate::ident::PortalName,
+    row_desc: Option<crate::decode::RowDesc>,
+    fetch: crate::command::FetchRows,
+    reply: ReplyId<crate::reply_id::QueryKind>,
+    staged: &mut StagedActions,
+    reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+) {
+    let execute_range = try_builder!(
+        build_execute_message(portal_name, fetch, reserved),
+        setter,
+        reply,
+        staged
+    );
+    emit_actions!(staged, budget: 2, [
+        StagedAction::SendBytesRange(execute_range.0),
+        StagedAction::SendBytesStatic(&crate::wire::SYNC_WIRE_BYTES),
+    ]);
+    let post_install = match row_desc {
+        Some(desc) => {
+            _bind_execute_select_install_leaf::install_select_transition(row_desc_slot, desc);
+            crate::push_command::ExecutePortalPostInstall::Select { reply }
+        }
+        None => crate::push_command::ExecutePortalPostInstall::Dml { reply },
+    };
+    setter.install_post_state(post_install);
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // Idle-only push path for the `prepared!` macro's
 // `BindPrepared<'q, P, R>` command. Sister to

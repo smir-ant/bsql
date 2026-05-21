@@ -789,7 +789,7 @@ pub(crate) fn dispatch(
                     DispatchOutcome::AdvancedWithAction {
                         action: crate::action::deliver(
                             reply,
-                            crate::action::StagedQueryCompletePayload {
+                            crate::action::StagedQueryCompletePayload::Completed {
                                 command_tag,
                                 tx_status,
                             },
@@ -1004,7 +1004,7 @@ pub(crate) fn dispatch(
                 DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
                         reply,
-                        crate::action::StagedQueryCompletePayload {
+                        crate::action::StagedQueryCompletePayload::Completed {
                             command_tag,
                             tx_status,
                         },
@@ -1096,10 +1096,44 @@ pub(crate) fn dispatch(
         (ProtoState::BindExecuteStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
-        (ProtoState::BindExecuteStreamingRows { reply, .. }, TAG_PORTAL_SUSPENDED) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_PORTAL_SUSPENDED })
+        // PortalSuspended ('s') — alternative terminal frame to
+        // CommandComplete when `FetchRows::Chunked(N)` hit the row
+        // cap before the portal exhausted (PG §55.2.7). Body must be
+        // empty. Transition to AwaitingRfqAfterSuspended; trailing
+        // RFQ delivers `Reply::QuerySuspended`.
+        (ProtoState::BindExecuteStreamingRows { reply }, TAG_PORTAL_SUSPENDED) => {
+            match validate_empty_body(payload, TAG_PORTAL_SUSPENDED) {
+                Ok(()) => {
+                    *state = ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply };
+                    DispatchOutcome::AdvancedSilent
+                }
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+            }
         }
         (ProtoState::BindExecuteStreamingRows { reply, .. }, other) => {
+            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // BindExecuteAwaitingRfqAfterSuspended terminal arms.
+        (
+            ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply },
+            TAG_READY_FOR_QUERY,
+        ) => match parse_rfq_payload(payload) {
+            Ok(tx_status) => {
+                *state = ProtoState::Idle;
+                DispatchOutcome::AdvancedWithAction {
+                    action: crate::action::deliver(
+                        reply,
+                        crate::action::StagedQueryCompletePayload::Suspended { tx_status },
+                    ),
+                }
+            }
+            Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
+        },
+        (ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply }, TAG_ERROR_RESPONSE) => {
+            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+        }
+        (ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply }, other) => {
             install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
@@ -1118,7 +1152,7 @@ pub(crate) fn dispatch(
                 DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
                         reply,
-                        crate::action::StagedQueryCompletePayload {
+                        crate::action::StagedQueryCompletePayload::Completed {
                             command_tag,
                             tx_status,
                         },

@@ -1174,15 +1174,40 @@ pub enum StagedReply {
 /// Fields are `pub(crate)`: the type stays `pub` (forced by the
 /// `ReplyKind::StagedPayload` trait bound), but only in-crate code
 /// can construct via struct literal. A naive `pub` fields shape
-/// would enable external struct-literal construction
-/// (`StagedQueryCompletePayload { command_tag, tx_status }`),
-/// bypassing the `From` impls' crate-internal construction path —
+/// would enable external enum-variant construction, bypassing the
+/// `From` impls' crate-internal construction path —
 /// the "hidden-but-reachable" bypass class.
+///
+/// # Variants discriminate the post-Sync terminal shape
+///
+/// PG's `BindExecute`-with-`FetchRows::Chunked(N)` flow can resolve
+/// via TWO terminal frames per PG §55.2.7:
+///
+/// - **`CommandComplete` + `ReadyForQuery`** — portal exhausted
+///   within the row cap (or `FetchRows::All`); materialise emits
+///   [`Reply::QueryComplete`].
+/// - **`PortalSuspended` + `ReadyForQuery`** — row cap hit before
+///   portal exhaustion; the portal stays bound and can be resumed
+///   via [`crate::push_command::ExecutePortal`]. Materialise emits
+///   [`Reply::QuerySuspended`].
+///
+/// The dispatch arm that observes the terminal frame
+/// (`CommandComplete` vs `PortalSuspended`) selects the staged case
+/// at staging time; materialise reads the case to pick the public
+/// [`Reply`] variant.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StagedQueryCompletePayload {
-    pub(crate) command_tag: crate::ident::BoundedStr<32>,
-    pub(crate) tx_status: TxStatus,
+pub enum StagedQueryCompletePayload {
+    /// Portal exhausted — terminal `CommandComplete + RFQ` observed.
+    Completed {
+        command_tag: crate::ident::BoundedStr<32>,
+        tx_status: TxStatus,
+    },
+    /// Row cap hit — terminal `PortalSuspended + RFQ` observed. No
+    /// `command_tag` (server didn't send `CommandComplete`).
+    Suspended {
+        tx_status: TxStatus,
+    },
 }
 
 /// Lifetime-free staged counterpart to
@@ -1302,12 +1327,30 @@ impl StagedReply {
                 // (SELECT path); `None` ⇒ no schema (DML /
                 // empty-query path). No bool flag to keep in sync;
                 // the slot equals itself by identity.
+                //
+                // Staged variant discriminates between the two
+                // terminal frames: `Completed` (CommandComplete + RFQ)
+                // → `Reply::QueryComplete`, `Suspended` (PortalSuspended
+                // + RFQ) → `Reply::QuerySuspended`. The discrimination
+                // is set at staging time by the dispatch arm that
+                // observed the terminal frame; materialise just reads.
                 let row_desc = row_desc_slot.map(crate::decode::RowDescBorrow::from_ref);
-                Reply::QueryComplete(QueryCompletePayload {
-                    command_tag: staged.command_tag,
-                    tx_status: staged.tx_status,
-                    row_desc,
-                })
+                match staged {
+                    StagedQueryCompletePayload::Completed {
+                        command_tag,
+                        tx_status,
+                    } => Reply::QueryComplete(QueryCompletePayload {
+                        command_tag,
+                        tx_status,
+                        row_desc,
+                    }),
+                    StagedQueryCompletePayload::Suspended { tx_status } => {
+                        Reply::QuerySuspended(QuerySuspendedPayload {
+                            tx_status,
+                            row_desc,
+                        })
+                    }
+                }
             }
             Self::ParseComplete(p) => Reply::ParseComplete(p),
             Self::CloseComplete(p) => Reply::CloseComplete(p),
@@ -1537,6 +1580,22 @@ pub enum Reply<'r> {
     /// Ordered first — dominant variant in real workloads.
     QueryComplete(QueryCompletePayload<'r>),
 
+    /// A `BindExecute`-with-`FetchRows::Chunked(N)` paused at the
+    /// row cap before exhausting the portal (PG §55.2.7
+    /// `PortalSuspended` + `ReadyForQuery`). The portal stays bound
+    /// — caller can resume the stream by pushing
+    /// [`crate::push_command::ExecutePortal`] referencing the same
+    /// portal name (and, if needed, a new `FetchRows` cap).
+    ///
+    /// Unlike [`QueryComplete`](Self::QueryComplete), there is no
+    /// `command_tag` (server didn't send `CommandComplete`). The
+    /// `row_desc` is preserved because the portal's bound schema is
+    /// still valid — the next `ExecutePortal` will produce rows of
+    /// the same shape.
+    ///
+    /// [`QueryComplete`]: Self::QueryComplete
+    QuerySuspended(QuerySuspendedPayload<'r>),
+
     /// A `Parse` command succeeded (server accepted the prepared
     /// statement). See [`ParseCompletePayload`].
     ParseComplete(ParseCompletePayload),
@@ -1675,6 +1734,33 @@ impl<'r> From<QueryCompletePayload<'r>> for Reply<'r> {
     #[inline]
     fn from(p: QueryCompletePayload<'r>) -> Self {
         Self::QueryComplete(p)
+    }
+}
+
+/// Typed payload for the `PortalSuspended` terminal of a
+/// `BindExecute`-with-`FetchRows::Chunked(N)` flow (PG §55.2.7).
+///
+/// Mirrors [`QueryCompletePayload`]'s shape minus `command_tag`
+/// (server emits no `CommandComplete` on the suspended path —
+/// `PortalSuspended` is the terminal frame instead). The portal
+/// stays bound after this reply; caller resumes via
+/// [`crate::push_command::ExecutePortal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuerySuspendedPayload<'r> {
+    /// Transaction-status indicator from the trailing `ReadyForQuery`.
+    pub tx_status: TxStatus,
+    /// Result-set schema. Preserved from the original `Bind` —
+    /// the portal's bound schema applies to subsequent
+    /// `ExecutePortal` resumes too. `Some` for SELECT (including
+    /// 0-row SELECTs), `None` for DML / empty-query (though DML
+    /// with `Chunked(N)` is rare in practice).
+    pub row_desc: Option<crate::decode::RowDescBorrow<'r>>,
+}
+
+impl<'r> From<QuerySuspendedPayload<'r>> for Reply<'r> {
+    #[inline]
+    fn from(p: QuerySuspendedPayload<'r>) -> Self {
+        Self::QuerySuspended(p)
     }
 }
 

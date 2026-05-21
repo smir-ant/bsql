@@ -267,6 +267,23 @@ pub enum FetchRows {
     /// Fetch all rows the portal produces (no `PortalSuspended`).
     /// Maps to the wire value `max_rows = 0`.
     All,
+    /// Fetch at most `N` rows; server pauses at the cap with
+    /// `PortalSuspended` (PG §55.2.7). The portal stays open and can
+    /// be resumed via [`crate::push_command::ExecutePortal`] for
+    /// additional batches.
+    ///
+    /// `NonZeroU32` enforces «non-zero» at the type level — zero
+    /// would semantically be `Self::All` and would dispatch through
+    /// a different response shape (no `PortalSuspended`), so the
+    /// caller MUST pick `Self::All` explicitly for that case rather
+    /// than a `Chunked(0)` sentinel.
+    ///
+    /// Wire encoding: `i32` (PG's `Execute.max_rows` field is signed
+    /// 32-bit but client-side values > i32::MAX are sub-spec). The
+    /// `as_wire_i32` conversion narrows via `i32::try_from` with
+    /// saturation at `i32::MAX` — a value > i32::MAX is honest
+    /// «request capped at server-spec max» rather than wraparound.
+    Chunked(core::num::NonZeroU32),
 }
 
 impl FetchRows {
@@ -277,6 +294,24 @@ impl FetchRows {
     pub(crate) const fn as_wire_i32(self) -> i32 {
         match self {
             Self::All => 0,
+            Self::Chunked(n) => {
+                let v: u32 = n.get();
+                // `as` is forbidden; explicit narrow with saturation.
+                // u32 > i32::MAX is sub-spec (PG max_rows is i32);
+                // saturate to i32::MAX rather than wrap-negative.
+                // Bound: i32::MAX as u32 is 0x7FFF_FFFF — compute
+                // via `i32::MAX.to_le_bytes()` reinterpret to avoid
+                // any `as`.
+                const I32_MAX_AS_U32: u32 = u32::from_le_bytes(i32::MAX.to_le_bytes());
+                if v > I32_MAX_AS_U32 {
+                    i32::MAX
+                } else {
+                    // v <= i32::MAX so the cast is bound-checked
+                    // but `as` is banned — use i32::from_le_bytes
+                    // on u32::to_le_bytes for an `as`-free narrow.
+                    i32::from_le_bytes(v.to_le_bytes())
+                }
+            }
         }
     }
 }
@@ -291,3 +326,32 @@ const _: () = assert!(
     FetchRows::All.as_wire_i32() == 0,
     "FetchRows::All MUST wire-encode as 0 per PG §55.2.2",
 );
+
+// Drift-pin for the Chunked variant. NonZeroU32::MIN is 1; passing 1
+// must wire-encode as 1 (server returns 1 row + PortalSuspended). A
+// future arm-body edit that returned 0 would silently degrade to
+// «fetch all» semantics.
+const _: () = assert!(
+    matches!(
+        FetchRows::Chunked(core::num::NonZeroU32::MIN).as_wire_i32(),
+        1,
+    ),
+    "FetchRows::Chunked(1) MUST wire-encode as 1 per PG §55.2.7",
+);
+
+// Saturation pin: u32::MAX > i32::MAX must saturate (not wrap to
+// negative). PG's max_rows is i32, so values > i32::MAX are
+// sub-spec; honest cap rather than wraparound bug.
+const _: () = {
+    let max_u32 = u32::MAX;
+    // NonZeroU32::new is const-stable on recent Rust.
+    let nz_max = match core::num::NonZeroU32::new(max_u32) {
+        Some(n) => n,
+        // u32::MAX != 0, so this arm is dead.
+        None => panic!("u32::MAX is non-zero"),
+    };
+    assert!(
+        matches!(FetchRows::Chunked(nz_max).as_wire_i32(), i32::MAX),
+        "FetchRows::Chunked(u32::MAX) MUST saturate at i32::MAX, not wrap negative",
+    );
+};

@@ -599,6 +599,26 @@ pub enum ProtoState {
         command_tag: BoundedStr<32>,
     },
 
+    /// `PortalSuspended` (`'s'`) received — `FetchRows::Chunked(N)`
+    /// hit the row cap before the portal exhausted (PG §55.2.7).
+    /// Awaiting the trailing `ReadyForQuery`. Terminal reply emits
+    /// [`crate::Reply::QuerySuspended`] (NOT `QueryComplete` — server
+    /// did not send `CommandComplete`). The portal stays bound on
+    /// the server; caller resumes via
+    /// [`crate::push_command::ExecutePortal`].
+    ///
+    /// No `command_tag` field — server's `PortalSuspended` frame has
+    /// no payload (the bytes 's' + length-field=4 + empty body), so
+    /// there is no tag to carry. `row_desc` for the terminal reply
+    /// resolves from `PgProtocol::row_desc_slot` (populated by the
+    /// `Bind` that originally opened the portal, or by the caller-
+    /// supplied schema at push time per the `BindExecute` Select
+    /// path).
+    BindExecuteAwaitingRfqAfterSuspended {
+        /// Correlator for the in-flight command.
+        reply: ReplyId<QueryKind>,
+    },
+
     // ---------------------------------------------------------------
     // Extended Query — Describe flow
     // ---------------------------------------------------------------
@@ -894,6 +914,7 @@ impl ProtoState {
             | Self::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }
             | Self::BindExecuteStreamingRows { reply, .. }
             | Self::BindExecuteAwaitingRfqSelect { reply, .. }
+            | Self::BindExecuteAwaitingRfqAfterSuspended { reply, .. }
             | Self::BindExecuteAwaitingRfqDml { reply, .. } => Some(reply.consume()),
             Self::BindExecuteAwaitingBindCompleteDml(reply)
             | Self::BindExecuteAwaitingCommandCompleteDml(reply) => Some(reply.consume()),
@@ -987,6 +1008,7 @@ impl ProtoState {
             | Self::BindExecuteAwaitingDataOrCompleteSelect { .. }
             | Self::BindExecuteStreamingRows { .. }
             | Self::BindExecuteAwaitingRfqSelect { .. }
+            | Self::BindExecuteAwaitingRfqAfterSuspended { .. }
             | Self::DescribeStatementAwaitingParamDesc(_)
             | Self::DescribeStatementAwaitingRowDescOrNoData { .. }
             | Self::DescribeStatementAwaitingRfq { .. }
@@ -1325,6 +1347,10 @@ pub enum ActiveState {
     BindExecuteStreamingRows {
         reply: ReplyId<QueryKind>,
     },
+    /// Mirror of [`ProtoState::BindExecuteAwaitingRfqAfterSuspended`].
+    BindExecuteAwaitingRfqAfterSuspended {
+        reply: ReplyId<QueryKind>,
+    },
     /// Mirror of [`ProtoState::BindExecuteAwaitingRfqSelect`].
     BindExecuteAwaitingRfqSelect {
         reply: ReplyId<QueryKind>,
@@ -1476,6 +1502,9 @@ impl From<ActiveState> for ProtoState {
             ActiveState::BindExecuteAwaitingRfqSelect { reply, command_tag } => {
                 ProtoState::BindExecuteAwaitingRfqSelect { reply, command_tag }
             }
+            ActiveState::BindExecuteAwaitingRfqAfterSuspended { reply } => {
+                ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply }
+            }
             ActiveState::DescribeStatementAwaitingParamDesc(r) => {
                 ProtoState::DescribeStatementAwaitingParamDesc(r)
             }
@@ -1590,6 +1619,7 @@ impl ActiveState {
             | Self::BindExecuteAwaitingDataOrCompleteSelect { reply }
             | Self::BindExecuteStreamingRows { reply }
             | Self::BindExecuteAwaitingRfqSelect { reply, .. }
+            | Self::BindExecuteAwaitingRfqAfterSuspended { reply }
             | Self::BindExecuteAwaitingRfqDml { reply, .. } => Some(reply.consume()),
             Self::BindExecuteAwaitingBindCompleteDml(reply)
             | Self::BindExecuteAwaitingCommandCompleteDml(reply) => Some(reply.consume()),
@@ -1636,6 +1666,7 @@ impl ActiveState {
             | Self::BindExecuteAwaitingDataOrCompleteSelect { .. }
             | Self::BindExecuteStreamingRows { .. }
             | Self::BindExecuteAwaitingRfqSelect { .. }
+            | Self::BindExecuteAwaitingRfqAfterSuspended { .. }
             | Self::DescribeStatementAwaitingParamDesc(_)
             | Self::DescribeStatementAwaitingRowDescOrNoData { .. }
             | Self::DescribeStatementAwaitingRfq { .. }
@@ -1705,6 +1736,10 @@ impl core::fmt::Debug for ActiveState {
                 .field("reply", reply)
                 .field("command_tag", command_tag)
                 .finish_non_exhaustive(),
+            Self::BindExecuteAwaitingRfqAfterSuspended { reply } => f
+                .debug_struct("BindExecuteAwaitingRfqAfterSuspended")
+                .field("reply", reply)
+                .finish(),
             Self::DescribeStatementAwaitingParamDesc(id) => {
                 write!(f, "DescribeStatementAwaitingParamDesc({id:?})")
             }
@@ -1845,6 +1880,9 @@ impl TryFrom<ProtoState> for ActiveState {
             ProtoState::BindExecuteAwaitingRfqSelect { reply, command_tag } => {
                 Ok(ActiveState::BindExecuteAwaitingRfqSelect { reply, command_tag })
             }
+            ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply } => {
+                Ok(ActiveState::BindExecuteAwaitingRfqAfterSuspended { reply })
+            }
             ProtoState::DescribeStatementAwaitingParamDesc(r) => {
                 Ok(ActiveState::DescribeStatementAwaitingParamDesc(r))
             }
@@ -1959,6 +1997,7 @@ impl ProtoState {
             | Self::BindExecuteAwaitingDataOrCompleteSelect { .. }
             | Self::BindExecuteStreamingRows { .. }
             | Self::BindExecuteAwaitingRfqSelect { .. }
+            | Self::BindExecuteAwaitingRfqAfterSuspended { .. }
             | Self::DescribeStatementAwaitingParamDesc(_)
             | Self::DescribeStatementAwaitingRowDescOrNoData { .. }
             | Self::DescribeStatementAwaitingRfq { .. }
@@ -2118,6 +2157,10 @@ impl core::fmt::Debug for ProtoState {
                 .field("reply", reply)
                 .field("command_tag", command_tag)
                 .finish_non_exhaustive(),
+            Self::BindExecuteAwaitingRfqAfterSuspended { reply } => f
+                .debug_struct("BindExecuteAwaitingRfqAfterSuspended")
+                .field("reply", reply)
+                .finish(),
             Self::DrainRfqAfterError => {
                 f.write_str("DrainRfqAfterError")
             }

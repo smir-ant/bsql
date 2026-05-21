@@ -686,6 +686,24 @@ impl InstallBody for crate::push_command::BindExecutePostInstall {
     }
 }
 
+impl install_body_seal::InstallBodySealed for crate::push_command::ExecutePortalPostInstall {}
+impl InstallBody for crate::push_command::ExecutePortalPostInstall {
+    #[inline]
+    fn install(self, state: &mut ProtoState) {
+        // ExecutePortal skips the AwaitingBindComplete* step — server
+        // sent no BindComplete since no Bind was sent. Transition
+        // directly to AwaitingDataOrComplete* / AwaitingCommandComplete*.
+        *state = match self {
+            crate::push_command::ExecutePortalPostInstall::Dml { reply } => {
+                ProtoState::BindExecuteAwaitingCommandCompleteDml(reply)
+            }
+            crate::push_command::ExecutePortalPostInstall::Select { reply } => {
+                ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply }
+            }
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Sealed-trait pin. The `mod sealed` module is `pub(crate)` and

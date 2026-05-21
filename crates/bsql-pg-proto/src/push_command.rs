@@ -540,6 +540,89 @@ pub struct BindExecute<'a, P: crate::params::ParamsWriter> {
 
 impl<P: crate::params::ParamsWriter> sealed::PushCommandSealed for BindExecute<'_, P> {}
 
+/// Resume a previously-bound portal via PG's Extended Query
+/// `Execute` + `Sync` bundle (PG §55.2.7).
+///
+/// Used after a [`BindExecute`] with `FetchRows::Chunked(N)` paused
+/// at the row cap (`Reply::QuerySuspended` was delivered). The portal
+/// stays bound on the server until [`crate::push_command::ClosePortal`]
+/// or connection teardown; this resume command sends only `Execute`
+/// (no preceding `Bind`) and either resumes streaming for another N
+/// rows (with `Chunked(N)`) or drains the remaining rows (with
+/// `FetchRows::All`).
+///
+/// # Schema
+///
+/// `row_desc` is re-supplied because the protocol's row_desc_slot
+/// is cleared after each terminal reply (per the standard
+/// `clear_session_residue_for_class` discipline). Caller passes the
+/// SAME `RowDesc` that was used in the original [`BindExecute`] —
+/// the server's schema for the bound portal hasn't changed.
+///
+/// `Some(desc)` enters the Select path (server sends `DataRow*`).
+/// `None` enters the Dml path (server sends `CommandComplete`
+/// without prior `DataRow`s). Dml resume with chunked fetch is
+/// rare but PG-valid.
+///
+/// # State entry
+///
+/// Unlike [`BindExecute`] which awaits `BindComplete` first, this
+/// command transitions directly to
+/// [`crate::state::ProtoState::BindExecuteAwaitingDataOrCompleteSelect`]
+/// (Select path) or
+/// [`crate::state::ProtoState::BindExecuteAwaitingCommandCompleteDml`]
+/// (Dml path). The wire flow has no `BindComplete` since there is
+/// no `Bind` frame to ack.
+#[derive(Debug)]
+#[must_use = "an ExecutePortal has no effect until passed to push_command"]
+pub struct ExecutePortal<'a> {
+    /// Portal name (must match a previously-bound portal).
+    pub portal_name: &'a PortalName,
+    /// Pre-supplied result-set schema. `Some(desc)` for Select
+    /// resume; `None` for Dml resume. MUST match the schema used
+    /// in the original `BindExecute` — re-supplied because the
+    /// protocol's row_desc_slot is cleared between command cycles.
+    pub row_desc: Option<crate::decode::RowDesc>,
+    /// Row-count scope for THIS resume call. Can differ from the
+    /// `fetch` value used in the original `BindExecute` (caller may
+    /// want a different page size on resume).
+    pub fetch: FetchRows,
+    /// Typed correlator for the reply. The terminal reply will be
+    /// either [`crate::Reply::QueryComplete`] (portal exhausted)
+    /// or [`crate::Reply::QuerySuspended`] (cap hit again).
+    pub reply: ReplyId<QueryKind>,
+}
+
+impl sealed::PushCommandSealed for ExecutePortal<'_> {}
+
+impl PushCommand for ExecutePortal<'_> {
+    type Output = ();
+    type PostState = ExecutePortalPostInstall;
+
+    #[inline]
+    fn execute<'sql>(
+        self,
+        setter: crate::state_setter::StateSetter<'_, Self::PostState>,
+        row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
+        staged: &mut crate::action::StagedActions<'sql>,
+        reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
+    )
+    where
+        Self: 'sql,
+    {
+        crate::protocol::compute_push_execute_portal_idle_only(
+            setter,
+            row_desc_slot,
+            self.portal_name,
+            self.row_desc,
+            self.fetch,
+            self.reply,
+            staged,
+            reserved,
+        );
+    }
+}
+
 impl<P: crate::params::ParamsWriter> PushCommand for BindExecute<'_, P> {
     type Output = ();
     type PostState = BindExecutePostInstall;
@@ -748,6 +831,36 @@ pub enum BindExecutePostInstall {
 impl PostStateSealed for BindExecutePostInstall {}
 // Install body lives in `state_setter::InstallBody` impl.
 impl PostStateProof for BindExecutePostInstall {}
+
+/// Witness pairing [`ExecutePortal`] to the post-Execute states.
+/// Mirrors [`BindExecutePostInstall`] but installs `AwaitingDataOrComplete*`
+/// directly (skipping `AwaitingBindComplete*` — there is no `Bind` frame
+/// to ack in the resume flow).
+#[must_use = "an ExecutePortalPostInstall has no effect until passed to StateSetter::install_post_state"]
+#[expect(
+    missing_debug_implementations,
+    reason = "ZST witness flows by-value through one consumption path; Debug impl unused on this surface."
+)]
+pub enum ExecutePortalPostInstall {
+    /// Schema-less Dml resume → directly to
+    /// [`crate::state::ProtoState::BindExecuteAwaitingCommandCompleteDml`]
+    /// (skip the BindComplete await since no Bind was sent).
+    Dml {
+        /// Correlator for the in-flight command.
+        reply: ReplyId<QueryKind>,
+    },
+    /// Schema-bearing Select resume → directly to
+    /// [`crate::state::ProtoState::BindExecuteAwaitingDataOrCompleteSelect`]
+    /// (skip the BindComplete await). `RowDesc` already re-parked in
+    /// `PgProtocol::row_desc_slot` (caller re-supplied via
+    /// [`ExecutePortal::row_desc`]).
+    Select {
+        /// Correlator for the in-flight command.
+        reply: ReplyId<QueryKind>,
+    },
+}
+impl PostStateSealed for ExecutePortalPostInstall {}
+impl PostStateProof for ExecutePortalPostInstall {}
 
 // ═════════════════════════════════════════════════════════════════════
 // `BindPrepared<'q, P, R>` wraps a PreparedQuery + its argument tuple
