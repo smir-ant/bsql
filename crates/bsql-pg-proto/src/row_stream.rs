@@ -1413,6 +1413,18 @@ impl<'p, 'w> RowStream<'p, 'w> {
                 core::hint::cold_path();
                 ColEvent::NeedMore
             }
+            Some(Action::CopyDataChunk { .. }) => {
+                // DEF-219 Phase 3: COPY OUT data chunk arrived
+                // mid-iter_rows. iter_rows is row-streaming, not
+                // COPY-streaming — surfaces as NeedMore. The wrapper
+                // observes CopyDataChunk via the top-level feed_bytes
+                // OutActions path. (COPY can't actually be active
+                // mid-iter_rows because the state machine wouldn't
+                // be in a row-streaming variant during COPY — this
+                // arm is for exhaustiveness, not runtime path.)
+                core::hint::cold_path();
+                ColEvent::NeedMore
+            }
         }
     }
 

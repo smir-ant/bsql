@@ -300,6 +300,10 @@ pub(crate) fn dispatch(
     // that don't reach an ErrorResponse arm pay zero allocation
     // cost.
     error_arena_slot: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    // DEF-219 Phase 3: copy_chunks_arena slot. Lazy-init via
+    // `get_or_insert_with` on first CopyData arrival; most arms
+    // ignore it.
+    copy_chunks_arena_slot: &mut Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
 ) -> DispatchOutcome {
     // Snap owned prev for pattern matching; state slot holds the
     // explicit `ProtoState::Idle` placeholder during the match.
@@ -785,11 +789,33 @@ pub(crate) fn dispatch(
         // on CopyData (no Action emission yet); Phase 3 will surface
         // the bytes via `Action::CopyDataChunk` or pull API.
         (ProtoState::SimpleQueryCopyOutStreaming(reply), TAG_COPY_DATA) => {
-            // Phase 2: bytes consumed silently (frames_consumed
-            // advances at the dispatch caller). Phase 3 will emit
-            // `Action::CopyDataChunk { bytes_ref }` here.
-            *state = ProtoState::SimpleQueryCopyOutStreaming(reply);
-            DispatchOutcome::AdvancedSilent
+            // DEF-219 Phase 3: lazy-init the chunks arena, allocate
+            // a slot for these bytes, emit Action::CopyDataChunk
+            // carrying the gen-tagged ref. Caller resolves via
+            // PgProtocol::get_copy_chunk within the OutActions cycle.
+            // Arena cap exhaustion (rare; bounded by OutActions cap)
+            // → silent drop (cold path; mirror of NotificationsArena
+            // overflow behaviour).
+            let arena = copy_chunks_arena_slot.get_or_insert_with(|| {
+                alloc::boxed::Box::new(crate::copy_chunks_arena::CopyChunksArena::new())
+            });
+            let payload_bytes = crate::copy_chunks_arena::CopyChunkPayload {
+                bytes: alloc::vec::Vec::from(payload),
+            };
+            match arena.alloc(payload_bytes) {
+                Some(chunk_ref) => {
+                    *state = ProtoState::SimpleQueryCopyOutStreaming(reply);
+                    DispatchOutcome::AdvancedWithAction {
+                        action: crate::action::StagedAction::CopyDataChunk { chunk_ref },
+                    }
+                }
+                None => {
+                    // Arena exhausted (rare; per-cycle cap).
+                    core::hint::cold_path();
+                    *state = ProtoState::SimpleQueryCopyOutStreaming(reply);
+                    DispatchOutcome::AdvancedSilent
+                }
+            }
         }
         (ProtoState::SimpleQueryCopyOutStreaming(reply), TAG_COPY_DONE) => {
             match validate_empty_body(payload, TAG_COPY_DONE) {

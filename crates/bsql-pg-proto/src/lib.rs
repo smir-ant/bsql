@@ -245,6 +245,8 @@ pub(crate) mod error_arena;
 pub use error_arena::{ArenaError, DisplayError, ErrorPayload, ErrorRef};
 pub(crate) mod notifications_arena;
 pub use notifications_arena::{NotificationPayload, NotificationRef};
+pub(crate) mod copy_chunks_arena;
+pub use copy_chunks_arena::{CopyChunkPayload, CopyChunkRef};
 pub mod frame;
 pub mod guard;
 pub mod ident;
@@ -733,7 +735,7 @@ const _: () = assert!(
 // on a quiet system (`load avg < 8`). On regression, investigate
 // (asm-diff, alternative shapes), do NOT roll back tier elevations.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() == 512,
+    core::mem::size_of::<protocol::PgProtocol>() == 520,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      Budget: ReadBuf inline 256 + ReadBuf heap-slot 8 + state ~48 \
@@ -815,7 +817,7 @@ const _: () = assert!(
 // `Box<ParamOids>` boxing on DescribeStatement* variants, post-DEF-220
 // notifications_arena slot).
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 512,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 520,
     "PgProtocol<ActivePhase> layout drift — must equal ActiveInner \
      (state ActiveState 48 B + read_buf 264 B + 4 cells × 8 B + \
      1 u32 + alignment; the 4th cell is DEF-220's notifications_arena \

@@ -179,6 +179,63 @@ fn copy_in_full_cycle_state_transitions() {
 }
 
 #[test]
+fn copy_out_data_chunks_surface_via_action() {
+    // DEF-219 Phase 3: CopyData frames must produce
+    // Action::CopyDataChunk entries in OutActions; bytes resolvable
+    // via PgProtocol::get_copy_chunk within the same cycle.
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = WriteBuf::new();
+
+    let (reply, _raw) = mint_reply::<bsql_pg_proto::QueryKind>(&mut proto);
+
+    proto.push_or_panic(
+        SimpleQuery {
+            sql: "COPY users TO STDOUT",
+            reply,
+        },
+        &mut wb,
+    );
+
+    // Push CopyOutResponse first (separately) so the chunks flow
+    // arrives in a clean OutActions cycle.
+    let frame_h = copy_response_frame(TAG_COPY_OUT_RESPONSE.byte(), 0, 2);
+    let _ = proto.feed_bytes(&frame_h, &mut wb);
+
+    // Now feed 3 CopyData frames in one call — expect 3
+    // Action::CopyDataChunk entries.
+    let mut bytes = std::vec::Vec::new();
+    bytes.extend(copy_data_frame(b"row_a\tval_a\n"));
+    bytes.extend(copy_data_frame(b"row_b\tval_b\n"));
+    bytes.extend(copy_data_frame(b"row_c\tval_c\n"));
+
+    let refs: std::vec::Vec<_> = {
+        let actions = proto.feed_bytes(&bytes, &mut wb);
+        let slice = actions.as_slice();
+        assert_eq!(slice.len(), 3, "expected 3 CopyDataChunk actions; got {:?}", slice);
+        let mut out = std::vec::Vec::new();
+        for action in slice.iter() {
+            if let bsql_pg_proto::Action::CopyDataChunk { chunk_ref } = action {
+                out.push(*chunk_ref);
+            }
+        }
+        out
+    };
+    assert_eq!(refs.len(), 3);
+
+    // Resolve each ref — but note: get_copy_chunk MUST be called
+    // BEFORE the next feed_bytes (gen-bumped on cycle boundary).
+    // Phase 3 docstring: refs valid within same OutActions cycle.
+    // We resolve here, before any further feed_bytes calls.
+    let expected: [&[u8]; 3] = [b"row_a\tval_a\n", b"row_b\tval_b\n", b"row_c\tval_c\n"];
+    for (idx, r) in refs.iter().enumerate() {
+        let res = proto.get_copy_chunk(*r);
+        assert!(res.is_ok(), "ref {idx} must resolve in same cycle");
+        let Ok(payload) = res else { return };
+        assert_eq!(payload.bytes.as_slice(), expected[idx]);
+    }
+}
+
+#[test]
 fn copy_out_rejects_malformed_response_header() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();

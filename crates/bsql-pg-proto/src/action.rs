@@ -859,6 +859,20 @@ pub enum Action<'w, 'r> {
         /// `"BEGIN"`, `"UPDATE 3"`, `"COMMIT"`).
         tag: crate::error::BoundedStr<32>,
     },
+
+    /// COPY OUT data chunk (DEF-219 Phase 3, PG §55.2.6). Emitted
+    /// for each `CopyData` ('d') frame during a COPY OUT cycle.
+    /// The wrapper resolves the payload via
+    /// [`crate::PgProtocol::get_copy_chunk`] passing `chunk_ref` —
+    /// returns `Result<&CopyChunkPayload, ArenaError>`. Refs are
+    /// gen-tagged and valid only within the current OutActions
+    /// iteration cycle (the per-feed_bytes arena clear invalidates
+    /// outstanding refs).
+    CopyDataChunk {
+        /// Gen-tagged handle into the copy-chunks arena. Resolve
+        /// via [`crate::PgProtocol::get_copy_chunk`].
+        chunk_ref: crate::copy_chunks_arena::CopyChunkRef,
+    },
 }
 
 /// One-event-per-call feed signal.
@@ -1180,6 +1194,15 @@ pub(crate) enum StagedAction<'sql> {
         /// Command tag from the just-completed statement in a
         /// multi-statement batch.
         tag: crate::error::BoundedStr<32>,
+    },
+
+    /// Map to [`Action::CopyDataChunk`] — DEF-219 Phase 3 COPY OUT
+    /// data surface. Staged by `(SimpleQueryCopyOutStreaming,
+    /// TAG_COPY_DATA)` dispatch arm after the chunk bytes are
+    /// allocated in the copy_chunks_arena.
+    CopyDataChunk {
+        /// Gen-tagged arena handle.
+        chunk_ref: crate::copy_chunks_arena::CopyChunkRef,
     },
 }
 
