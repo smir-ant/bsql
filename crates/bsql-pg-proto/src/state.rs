@@ -444,6 +444,37 @@ pub enum ProtoState {
         reply: ReplyId<QueryKind>,
     },
 
+    /// DEF-219 COPY OUT streaming. Server sent `CopyOutResponse`
+    /// (`'H'`); now receiving zero or more `CopyData` (`'d'`) frames
+    /// from server. Transitions:
+    /// - `CopyData` → stay here (Phase 3 will emit
+    ///   `Action::CopyDataChunk`; Phase 2 stays silent).
+    /// - `CopyDone` → [`Self::SimpleQueryCopyOutAwaitingCC`].
+    /// - `ErrorResponse` → [`Self::DrainRfqAfterError`].
+    SimpleQueryCopyOutStreaming(ReplyId<QueryKind>),
+
+    /// DEF-219 COPY OUT post-CopyDone. Server has sent the final
+    /// `CopyDone` (`'c'`); now awaiting `CommandComplete` followed
+    /// by `ReadyForQuery`. Transitions:
+    /// - `CommandComplete` → [`Self::SimpleQueryAwaitingRfq`] with
+    ///   the parsed command tag (reuses the existing tail state).
+    /// - `ErrorResponse` → [`Self::DrainRfqAfterError`].
+    SimpleQueryCopyOutAwaitingCC(ReplyId<QueryKind>),
+
+    /// DEF-219 COPY IN active. Server sent `CopyInResponse`
+    /// (`'G'`); caller now pushes `CopyData` (`'d'`) bytes via the
+    /// (Phase 4) `PushCopyData` push command, then `CopyDone`
+    /// (`'c'`) or `CopyFail` (`'f'`). Server transitions to
+    /// `CommandComplete` once it observes the client's `CopyDone`.
+    ///
+    /// State stays in `SimpleQueryCopyInActive` throughout the
+    /// client-side push phase (the push commands write wire bytes
+    /// but do not change state; only server frames advance state).
+    /// Transitions:
+    /// - `CommandComplete` → [`Self::SimpleQueryAwaitingRfq`].
+    /// - `ErrorResponse` → [`Self::DrainRfqAfterError`].
+    SimpleQueryCopyInActive(ReplyId<QueryKind>),
+
     /// `CommandComplete` or `EmptyQueryResponse` received; awaiting
     /// the trailing `ReadyForQuery`. The command tag captured at `C`
     /// (empty for `EmptyQueryResponse`) ships in the final
@@ -908,6 +939,9 @@ impl ProtoState {
             | Self::ConnectingPostAuthAwaitingKey(reply)
             | Self::ConnectingPostAuthHaveKey { reply, .. } => Some(reply.consume()),
             Self::SimpleQueryAwaitingFirstResponse(id) => Some(id.consume()),
+            Self::SimpleQueryCopyOutStreaming(id)
+            | Self::SimpleQueryCopyOutAwaitingCC(id)
+            | Self::SimpleQueryCopyInActive(id) => Some(id.consume()),
             Self::SimpleQueryStreamingRows { reply, .. }
             | Self::SimpleQueryAwaitingRfq { reply, .. }
             | Self::BindExecuteAwaitingBindCompleteSelect { reply, .. }
@@ -998,6 +1032,9 @@ impl ProtoState {
             Self::SimpleQueryAwaitingFirstResponse(_)
             | Self::SimpleQueryStreamingRows { .. }
             | Self::SimpleQueryAwaitingRfq { .. }
+            | Self::SimpleQueryCopyOutStreaming(_)
+            | Self::SimpleQueryCopyOutAwaitingCC(_)
+            | Self::SimpleQueryCopyInActive(_)
             | Self::DrainRfqAfterError
             | Self::ParseAwaitingParseComplete(_)
             | Self::ParseAwaitingRfq(_)
@@ -1320,6 +1357,12 @@ pub enum ActiveState {
         reply: ReplyId<QueryKind>,
         command_tag: BoundedStr<32>,
     },
+    /// Mirror of [`ProtoState::SimpleQueryCopyOutStreaming`] (DEF-219).
+    SimpleQueryCopyOutStreaming(ReplyId<QueryKind>),
+    /// Mirror of [`ProtoState::SimpleQueryCopyOutAwaitingCC`] (DEF-219).
+    SimpleQueryCopyOutAwaitingCC(ReplyId<QueryKind>),
+    /// Mirror of [`ProtoState::SimpleQueryCopyInActive`] (DEF-219).
+    SimpleQueryCopyInActive(ReplyId<QueryKind>),
     /// Mirror of [`ProtoState::DrainRfqAfterError`].
     DrainRfqAfterError,
     /// Mirror of [`ProtoState::ParseAwaitingParseComplete`].
@@ -1473,6 +1516,15 @@ impl From<ActiveState> for ProtoState {
             ActiveState::SimpleQueryStreamingRows { reply } => {
                 ProtoState::SimpleQueryStreamingRows { reply }
             }
+            ActiveState::SimpleQueryCopyOutStreaming(r) => {
+                ProtoState::SimpleQueryCopyOutStreaming(r)
+            }
+            ActiveState::SimpleQueryCopyOutAwaitingCC(r) => {
+                ProtoState::SimpleQueryCopyOutAwaitingCC(r)
+            }
+            ActiveState::SimpleQueryCopyInActive(r) => {
+                ProtoState::SimpleQueryCopyInActive(r)
+            }
             ActiveState::SimpleQueryAwaitingRfq { reply, command_tag } => {
                 ProtoState::SimpleQueryAwaitingRfq { reply, command_tag }
             }
@@ -1613,6 +1665,9 @@ impl ActiveState {
             Self::Idle | Self::DrainRfqAfterError | Self::Errored(_) => None,
             Self::PingAwaitingRfq(id) => Some(id.consume()),
             Self::SimpleQueryAwaitingFirstResponse(id) => Some(id.consume()),
+            Self::SimpleQueryCopyOutStreaming(id)
+            | Self::SimpleQueryCopyOutAwaitingCC(id)
+            | Self::SimpleQueryCopyInActive(id) => Some(id.consume()),
             Self::SimpleQueryStreamingRows { reply }
             | Self::SimpleQueryAwaitingRfq { reply, .. }
             | Self::BindExecuteAwaitingBindCompleteSelect { reply }
@@ -1656,6 +1711,9 @@ impl ActiveState {
             Self::SimpleQueryAwaitingFirstResponse(_)
             | Self::SimpleQueryStreamingRows { .. }
             | Self::SimpleQueryAwaitingRfq { .. }
+            | Self::SimpleQueryCopyOutStreaming(_)
+            | Self::SimpleQueryCopyOutAwaitingCC(_)
+            | Self::SimpleQueryCopyInActive(_)
             | Self::DrainRfqAfterError
             | Self::ParseAwaitingParseComplete(_)
             | Self::ParseAwaitingRfq(_)
@@ -1703,6 +1761,15 @@ impl core::fmt::Debug for ActiveState {
                 .field("reply", reply)
                 .field("command_tag", command_tag)
                 .finish(),
+            Self::SimpleQueryCopyOutStreaming(id) => {
+                write!(f, "SimpleQueryCopyOutStreaming({id:?})")
+            }
+            Self::SimpleQueryCopyOutAwaitingCC(id) => {
+                write!(f, "SimpleQueryCopyOutAwaitingCC({id:?})")
+            }
+            Self::SimpleQueryCopyInActive(id) => {
+                write!(f, "SimpleQueryCopyInActive({id:?})")
+            }
             Self::DrainRfqAfterError => f.write_str("DrainRfqAfterError"),
             Self::ParseAwaitingParseComplete(id) => {
                 write!(f, "ParseAwaitingParseComplete({id:?})")
@@ -1854,6 +1921,15 @@ impl TryFrom<ProtoState> for ActiveState {
             ProtoState::SimpleQueryAwaitingRfq { reply, command_tag } => {
                 Ok(ActiveState::SimpleQueryAwaitingRfq { reply, command_tag })
             }
+            ProtoState::SimpleQueryCopyOutStreaming(r) => {
+                Ok(ActiveState::SimpleQueryCopyOutStreaming(r))
+            }
+            ProtoState::SimpleQueryCopyOutAwaitingCC(r) => {
+                Ok(ActiveState::SimpleQueryCopyOutAwaitingCC(r))
+            }
+            ProtoState::SimpleQueryCopyInActive(r) => {
+                Ok(ActiveState::SimpleQueryCopyInActive(r))
+            }
             ProtoState::DrainRfqAfterError => Ok(ActiveState::DrainRfqAfterError),
             ProtoState::ParseAwaitingParseComplete(r) => {
                 Ok(ActiveState::ParseAwaitingParseComplete(r))
@@ -1987,6 +2063,9 @@ impl ProtoState {
             | Self::SimpleQueryAwaitingFirstResponse(_)
             | Self::SimpleQueryStreamingRows { .. }
             | Self::SimpleQueryAwaitingRfq { .. }
+            | Self::SimpleQueryCopyOutStreaming(_)
+            | Self::SimpleQueryCopyOutAwaitingCC(_)
+            | Self::SimpleQueryCopyInActive(_)
             | Self::DrainRfqAfterError
             | Self::ParseAwaitingParseComplete(_)
             | Self::ParseAwaitingRfq(_)
@@ -2129,6 +2208,15 @@ impl core::fmt::Debug for ProtoState {
                 .field("reply", reply)
                 .field("command_tag", command_tag)
                 .finish(),
+            Self::SimpleQueryCopyOutStreaming(id) => {
+                write!(f, "SimpleQueryCopyOutStreaming({id:?})")
+            }
+            Self::SimpleQueryCopyOutAwaitingCC(id) => {
+                write!(f, "SimpleQueryCopyOutAwaitingCC({id:?})")
+            }
+            Self::SimpleQueryCopyInActive(id) => {
+                write!(f, "SimpleQueryCopyInActive({id:?})")
+            }
             Self::BindExecuteAwaitingBindCompleteDml(id) => {
                 write!(f, "BindExecuteAwaitingBindCompleteDml({id:?})")
             }

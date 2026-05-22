@@ -84,7 +84,8 @@ pub(crate) mod _row_description_dispatch_leaf {
 }
 use crate::wire::{
     SCRAM_SHA_256_MECHANISM, TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE,
-    TAG_CLOSE_COMPLETE, TAG_COMMAND_COMPLETE, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
+    TAG_CLOSE_COMPLETE, TAG_COMMAND_COMPLETE, TAG_COPY_DATA, TAG_COPY_DONE, TAG_COPY_IN_RESPONSE,
+    TAG_COPY_OUT_RESPONSE, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
     TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_NO_DATA, TAG_PARAMETER_DESCRIPTION, TAG_PARSE_COMPLETE,
     TAG_PORTAL_SUSPENDED, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
@@ -747,7 +748,93 @@ pub(crate) fn dispatch(
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
+        // DEF-219 COPY entry points: 'H' = CopyOutResponse,
+        // 'G' = CopyInResponse. Parse + validate the header (format
+        // byte 0/1, n_cols ≤ MAX_ROW_COLUMNS, per-col formats agree),
+        // transition into the appropriate COPY state.
+        // Phase 2 Note: header data (format, n_cols) is parsed-and-
+        // discarded for now — Phase 3 will route it into Action::Copy*
+        // surface when the data-emission path lands.
+        (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_COPY_OUT_RESPONSE) => {
+            match crate::decode::parse_copy_response_header(payload) {
+                Ok(_header) => {
+                    *state = ProtoState::SimpleQueryCopyOutStreaming(reply);
+                    DispatchOutcome::AdvancedSilent
+                }
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+            }
+        }
+        (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_COPY_IN_RESPONSE) => {
+            match crate::decode::parse_copy_response_header(payload) {
+                Ok(_header) => {
+                    *state = ProtoState::SimpleQueryCopyInActive(reply);
+                    DispatchOutcome::AdvancedSilent
+                }
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+            }
+        }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), other) => {
+            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // DEF-219 COPY OUT state-machine arms.
+        //
+        // CopyOutStreaming: server streams `CopyData` ('d') frames,
+        // terminates with `CopyDone` ('c'). ErrorResponse drains
+        // through standard recoverable path. Phase 2 stays silent
+        // on CopyData (no Action emission yet); Phase 3 will surface
+        // the bytes via `Action::CopyDataChunk` or pull API.
+        (ProtoState::SimpleQueryCopyOutStreaming(reply), TAG_COPY_DATA) => {
+            // Phase 2: bytes consumed silently (frames_consumed
+            // advances at the dispatch caller). Phase 3 will emit
+            // `Action::CopyDataChunk { bytes_ref }` here.
+            *state = ProtoState::SimpleQueryCopyOutStreaming(reply);
+            DispatchOutcome::AdvancedSilent
+        }
+        (ProtoState::SimpleQueryCopyOutStreaming(reply), TAG_COPY_DONE) => {
+            match validate_empty_body(payload, TAG_COPY_DONE) {
+                Ok(()) => {
+                    *state = ProtoState::SimpleQueryCopyOutAwaitingCC(reply);
+                    DispatchOutcome::AdvancedSilent
+                }
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+            }
+        }
+        (ProtoState::SimpleQueryCopyOutStreaming(reply), TAG_ERROR_RESPONSE) => {
+            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+        }
+        (ProtoState::SimpleQueryCopyOutStreaming(reply), other) => {
+            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // CopyOutAwaitingCC: server sends `CommandComplete` carrying
+        // the row count (e.g. `"COPY 1000"`), transitions into the
+        // standard `SimpleQueryAwaitingRfq` tail state.
+        (ProtoState::SimpleQueryCopyOutAwaitingCC(reply), TAG_COMMAND_COMPLETE) => {
+            advance_to_awaiting_rfq(state, reply, payload)
+        }
+        (ProtoState::SimpleQueryCopyOutAwaitingCC(reply), TAG_ERROR_RESPONSE) => {
+            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+        }
+        (ProtoState::SimpleQueryCopyOutAwaitingCC(reply), other) => {
+            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+        }
+
+        // DEF-219 COPY IN state-machine arms.
+        //
+        // CopyInActive: server has acknowledged the COPY IN request
+        // (via `CopyInResponse`); client now pushes `CopyData` /
+        // `CopyDone` / `CopyFail` frames via the (Phase 4) push API.
+        // Server transitions to `CommandComplete` once it observes
+        // the client's `CopyDone`. State stays in `CopyInActive`
+        // through the entire client push phase.
+        (ProtoState::SimpleQueryCopyInActive(reply), TAG_COMMAND_COMPLETE) => {
+            advance_to_awaiting_rfq(state, reply, payload)
+        }
+        (ProtoState::SimpleQueryCopyInActive(reply), TAG_ERROR_RESPONSE) => {
+            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+        }
+        (ProtoState::SimpleQueryCopyInActive(reply), other) => {
             install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
