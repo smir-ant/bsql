@@ -1381,6 +1381,26 @@ impl<'p, 'w> RowStream<'p, 'w> {
                 // "non-terminal, no event for caller" → NeedMore.
                 ColEvent::NeedMore
             }
+            Some(Action::Notify { .. }) => {
+                // DEF-220: an asynchronous NotificationResponse arrived
+                // mid-iter_rows. The arena slot is populated (the
+                // dispatch pre-filter on 'A' allocated the payload),
+                // but iter_rows's caller doesn't observe Notify
+                // through ColEvent (the row-streaming surface is
+                // query-result-only). The notification is effectively
+                // discarded for iter_rows callers — the wrapper
+                // observes Notify only via the top-level feed_bytes
+                // path's OutActions, NOT iter_rows.
+                //
+                // Phase 2 follow-up: extend ColEvent with a Notify
+                // variant if/when concrete consumers surface the
+                // mid-row-stream LISTEN/NOTIFY use case. For now the
+                // common pattern is «LISTEN once at startup, drain
+                // notifications between query cycles» — covered by
+                // the OutActions path.
+                core::hint::cold_path();
+                ColEvent::NeedMore
+            }
         }
     }
 

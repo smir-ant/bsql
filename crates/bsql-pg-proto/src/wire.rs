@@ -159,6 +159,27 @@ pub const TAG_NEGOTIATE_PROTOCOL_VERSION: InboundTag = InboundTag::from_byte(b'v
 /// `Action::EmitNotice(...)` would surface notices to the wrapper.
 pub const TAG_NOTICE_RESPONSE: InboundTag = InboundTag::from_byte(b'N');
 
+/// Backend `NotificationResponse` message tag (`'A'`) — PG §55.7.
+///
+/// Asynchronous notification: server emits this frame to subscribers
+/// of `LISTEN channel_name` when a `NOTIFY channel_name [, payload]`
+/// fires from any backend session. Body shape: 4-byte BE `pid` (the
+/// notifier's process id) + CSTR `channel` name + CSTR `payload`.
+/// Any post-startup state can receive one at any time.
+///
+/// Per DEF-220, the pre-dispatch filter in `feed_bytes` parses the
+/// frame and allocates a [`NotificationPayload`] in the
+/// `notifications_arena`, emitting [`Action::Notify { pid, notif_ref }`]
+/// in the same OutActions stream as other side-effects. The wrapper
+/// resolves `notif_ref` via [`PgProtocol::get_notification`] within
+/// the same OutActions iteration cycle (gen-tagged refs become
+/// `Err(ArenaError::Stale)` on the next `feed_bytes` cycle).
+///
+/// [`NotificationPayload`]: crate::notifications_arena::NotificationPayload
+/// [`Action::Notify { pid, notif_ref }`]: crate::action::Action::Notify
+/// [`PgProtocol::get_notification`]: crate::PgProtocol::get_notification
+pub const TAG_NOTIFICATION_RESPONSE: InboundTag = InboundTag::from_byte(b'A');
+
 /// Frontend `SASLInitialResponse` / `SASLResponse` message tag (`'p'`).
 ///
 /// Used for both the initial SASL response (mechanism + client-first)
@@ -1385,6 +1406,7 @@ assert_all_distinct!(
     TAG_BACKEND_KEY_DATA,
     TAG_NEGOTIATE_PROTOCOL_VERSION,
     TAG_NOTICE_RESPONSE,
+    TAG_NOTIFICATION_RESPONSE,
     // Query-flow inbound tags:
     TAG_ROW_DESCRIPTION,
     TAG_DATA_ROW,

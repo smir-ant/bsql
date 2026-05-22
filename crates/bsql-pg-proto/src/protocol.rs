@@ -1868,12 +1868,16 @@ impl PgProtocol<DisconnectedPhase> {
                             }
                             StagedAction::SendBytesBorrowed(_)
                             | StagedAction::CloseSocket
-                            | StagedAction::DeliverReply(_) => {
+                            | StagedAction::DeliverReply(_)
+                            | StagedAction::Notify { .. } => {
                                 // compute_push_startup_idle_only emits
                                 // only SendBytesRange (StartupMessage)
                                 // + post_install. Other variants are
                                 // architecturally unreachable from
-                                // this push path. Skip silently rather
+                                // this push path. `Notify` is staged
+                                // by the dispatch pre-filter on `'A'`
+                                // tags during `feed_bytes`, never by
+                                // a push path. Skip silently rather
                                 // than panic (CREDO §V); a future
                                 // refactor adding emits would surface
                                 // via test failure (no actions in out).
@@ -3255,6 +3259,15 @@ impl PgProtocol<ActivePhase> {
                                 },
                             });
                         }
+                    }
+                    StagedAction::Notify { .. } => {
+                        // DEF-220: Notify is staged ONLY by the dispatch
+                        // pre-filter on `'A'` tags during feed_bytes —
+                        // never by a push path. Reaching here from a
+                        // push materialise is architecturally dead;
+                        // classify silently to preserve the
+                        // staged-action accounting invariant.
+                        core::hint::cold_path();
                     }
                 }
             }
@@ -7574,6 +7587,12 @@ fn materialise<'w, 'r>(
             // `Action::SendBytes(&'w [u8])` carries the shorter
             // lifetime safely.
             StagedAction::SendBytesBorrowed(b) => Action::SendBytes(b),
+            // DEF-220: Notify passes through unchanged — pid + arena
+            // ref are both `Copy`, no schema resolution at materialise
+            // time. The wrapper resolves `notif_ref` via
+            // `PgProtocol::get_notification` within the OutActions
+            // iteration cycle.
+            StagedAction::Notify { pid, notif_ref } => Action::Notify { pid, notif_ref },
         };
         push_within_fanout_budget(&mut out, a);
     }
@@ -8275,6 +8294,14 @@ mod compute_push_tests {
                 // future test introduces a borrowed-SQL path here
                 // without updating the observation type.
                 StagedAction::SendBytesBorrowed(_) => Self::SendBytesStatic(b""),
+                // DEF-220: `Notify` is staged ONLY by the dispatch
+                // pre-filter on `'A'` tags during feed_bytes; no test
+                // fixture in this module exercises that path. Map to
+                // a sentinel `CloseSocket` if a future test ever
+                // routes through here (build will pass; the test
+                // observing actions sees `CloseSocket` and either
+                // tolerates it or fails on the unexpected variant).
+                StagedAction::Notify { .. } => Self::CloseSocket,
             }
         }
     }

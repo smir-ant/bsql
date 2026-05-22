@@ -814,6 +814,29 @@ pub enum Action<'w, 'r> {
     /// frame, etc.). The wrapper must close the underlying transport;
     /// the pool then discards this connection.
     CloseSocket,
+
+    /// Asynchronous server-pushed notification (PG §55.7 LISTEN/NOTIFY).
+    ///
+    /// Emitted in the OutActions stream alongside other side-effects
+    /// when a `NotificationResponse` ('A') frame arrives. The wrapper
+    /// resolves the payload via
+    /// [`crate::PgProtocol::get_notification`] passing `notif_ref` —
+    /// returns `Result<&NotificationPayload, ArenaError>`. Refs are
+    /// gen-tagged and valid only within the current OutActions
+    /// iteration cycle; resolving after the next `feed_bytes` call
+    /// returns `Err(ArenaError::Stale)`.
+    ///
+    /// `pid` is carried by value (4 B, `Copy`) so callers can route
+    /// notifications without resolving the arena. Channel name +
+    /// payload bytes live in the arena (variable-length payload up
+    /// to PG's `NOTIFY_PAYLOAD_MAX_LENGTH` = 8000 B).
+    Notify {
+        /// PID of the backend process that issued the `NOTIFY`.
+        pid: i32,
+        /// Gen-tagged handle into the notifications arena. Resolve
+        /// via [`crate::PgProtocol::get_notification`].
+        notif_ref: crate::notifications_arena::NotificationRef,
+    },
 }
 
 /// One-event-per-call feed signal.
@@ -1112,6 +1135,23 @@ pub(crate) enum StagedAction<'sql> {
     },
     /// Map to [`Action::CloseSocket`].
     CloseSocket,
+    /// Map to [`Action::Notify`]. Carries pid + arena ref by value
+    /// (both `Copy`); materialise passes through unchanged.
+    ///
+    /// DEF-220 step 3 lands this variant; step 4 (pre-dispatch filter
+    /// on `'A'` tag) is the construction site. Until step 4 lands,
+    /// `dead_code` would flag the variant despite the explicit
+    /// match arms in `materialise` / `materialise_push` / `StagedObs`.
+    #[allow(
+        dead_code,
+        reason = "DEF-220 step 4 wires the construction site (pre-dispatch filter on 'A')"
+    )]
+    Notify {
+        /// PID of the backend that issued the NOTIFY.
+        pid: i32,
+        /// Gen-tagged arena handle.
+        notif_ref: crate::notifications_arena::NotificationRef,
+    },
 }
 
 /// Internal lifetime-free counterpart to the public [`Reply<'r>`].

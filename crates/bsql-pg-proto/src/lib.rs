@@ -243,6 +243,8 @@ mod dispatch;
 pub mod error;
 pub(crate) mod error_arena;
 pub use error_arena::{ArenaError, DisplayError, ErrorPayload, ErrorRef};
+pub(crate) mod notifications_arena;
+pub use notifications_arena::{NotificationPayload, NotificationRef};
 pub mod frame;
 pub mod guard;
 pub mod ident;
