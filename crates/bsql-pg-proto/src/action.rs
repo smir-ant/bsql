@@ -1138,14 +1138,8 @@ pub(crate) enum StagedAction<'sql> {
     /// Map to [`Action::Notify`]. Carries pid + arena ref by value
     /// (both `Copy`); materialise passes through unchanged.
     ///
-    /// DEF-220 step 3 lands this variant; step 4 (pre-dispatch filter
-    /// on `'A'` tag) is the construction site. Until step 4 lands,
-    /// `dead_code` would flag the variant despite the explicit
-    /// match arms in `materialise` / `materialise_push` / `StagedObs`.
-    #[allow(
-        dead_code,
-        reason = "DEF-220 step 4 wires the construction site (pre-dispatch filter on 'A')"
-    )]
+    /// Staged by the dispatch pre-filter on `'A'` tag (see
+    /// [`crate::protocol::_notification_response_admit_leaf`]).
     Notify {
         /// PID of the backend that issued the NOTIFY.
         pid: i32,

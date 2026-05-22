@@ -733,17 +733,25 @@ const _: () = assert!(
 // on a quiet system (`load avg < 8`). On regression, investigate
 // (asm-diff, alternative shapes), do NOT roll back tier elevations.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() == 504,
+    core::mem::size_of::<protocol::PgProtocol>() == 512,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      Budget: ReadBuf inline 256 + ReadBuf heap-slot 8 + state ~48 \
      (post-DEF-282 ParamOids boxing) + row_desc_slot ~140 (outer \
-     Extras) + session_params 8 + error_arena 8 + partial_assembly 8 \
-     + backend_key 8 + malformed_frame_count 4 + alignment-pad to \
-     align(8) = 504 B. \
+     Extras) + session_params 8 + error_arena 8 + notifications_arena \
+     8 (DEF-220 lazy Option<Box<NotificationsArena>>) + \
+     partial_assembly 8 + backend_key 8 + malformed_frame_count 4 + \
+     alignment-pad to align(8) = 512 B. \
+     \
+     DEF-220 grew the pin from 504 → 512 B via the new \
+     notifications_arena slot. The slot is `Option<Box<_>>` so \
+     LISTEN-free connections pay the 8-byte field but no heap; \
+     LISTEN-using connections allocate one `Box<NotificationsArena>` \
+     on first NOTIFY arrival (lifelong per connection, not per-\
+     notification). \
      \
      Cross-platform: when CI matrix extends, either (a) every target \
-     lands at 504 (most likely — alignment-stable types), or \
+     lands at 512 (most likely — alignment-stable types), or \
      (b) per-target cfg-gated pins land in the same commit. \
      Permissive ranges forbidden — drift surface > variance cushion \
      (CREDO §3 + §4.12).",
@@ -803,16 +811,18 @@ const _: () = assert!(
 // `<ActivePhase>::Extras = RowDescSlotCell` (140 B; align 4); the
 // cell lives on outer Extras rather than inside ActiveInner.
 // PgProtocol<ActivePhase> = ActiveInner + Extras + ZST
-// phase_marker; measured 504 B on aarch64-apple-darwin (post-DEF-282
-// `Box<ParamOids>` boxing on DescribeStatement* variants).
+// phase_marker; measured 512 B on aarch64-apple-darwin (post-DEF-282
+// `Box<ParamOids>` boxing on DescribeStatement* variants, post-DEF-220
+// notifications_arena slot).
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 504,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 512,
     "PgProtocol<ActivePhase> layout drift — must equal ActiveInner \
-     (state ActiveState 48 B + read_buf 264 B + 3 cells × 8 B + \
-     1 u32 + alignment) PLUS Extras = RowDescSlotCell (140 B inline; \
-     align 4) PLUS ZST phase_marker. If this trips, audit `mod \
-     protocol::ActiveInner` and the SealedPhase Extras = \
-     RowDescSlotCell mapping for ActivePhase.",
+     (state ActiveState 48 B + read_buf 264 B + 4 cells × 8 B + \
+     1 u32 + alignment; the 4th cell is DEF-220's notifications_arena \
+     `Option<Box<NotificationsArena>>`) PLUS Extras = \
+     RowDescSlotCell (140 B inline; align 4) PLUS ZST phase_marker. \
+     If this trips, audit `mod protocol::ActiveInner` and the \
+     SealedPhase Extras = RowDescSlotCell mapping for ActivePhase.",
 );
 // `<ClosedPhase>::Inner = ClosedInner` (~16 B) — state_kind 1B + 7B
 // pad + error_arena Option<Box> 8B. Post-Errored only state_kind +

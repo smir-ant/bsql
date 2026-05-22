@@ -594,6 +594,16 @@ pub struct ActiveInner {
     session_params: crate::session_params_slot::SessionParamsCell,
     /// Lazy-init slot for server ErrorResponse payloads.
     error_arena: Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    /// Lazy-init slot for server NotificationResponse payloads (PG
+    /// §55.7 LISTEN/NOTIFY surface — DEF-220). `Option<Box<_>>` so
+    /// connections that never LISTEN pay zero (the slot stays
+    /// `None`); first NOTIFY arrival via the dispatch pre-filter
+    /// allocates one `Box<NotificationsArena>` for the connection's
+    /// lifetime. Cleared per `feed_bytes` cycle (gen bump on the
+    /// inner arena's `clear()` call invalidates outstanding
+    /// `NotificationRef`s — defence-in-depth against the wrapper
+    /// stashing refs past the cycle boundary).
+    notifications_arena: Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
     /// Spill buffer for oversize ErrorResponse / NoticeResponse
     /// frames during query execution.
     partial_assembly: crate::partial_assembly::PartialAssemblyCell,
@@ -669,6 +679,15 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
         &'r mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    /// DEF-220: lazy-allocated arena for `NotificationResponse`
+    /// payloads. Threaded from `ActiveInner.notifications_arena`
+    /// via [`feed_bytes_dispatch_active`]; the Connecting variant
+    /// uses an empty transient slot (LISTEN/NOTIFY is post-handshake
+    /// only — same transient pattern as `row_desc_slot` for
+    /// Connecting). The pre-dispatch filter on `TAG_NOTIFICATION_RESPONSE`
+    /// reads + writes this slot.
+    pub(in crate::protocol) notifications_arena:
+        &'r mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
     pub(in crate::protocol) partial_assembly:
         &'r mut crate::partial_assembly::PartialAssemblyCell,
     pub(in crate::protocol) malformed_count: &'r mut u32,
@@ -1385,6 +1404,99 @@ pub(crate) mod _notice_response_admit_leaf {
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// `_notification_response_admit_leaf` submodule — DEF-220 NOTIFY ('A')
+// pre-dispatch parsing + arena allocation.
+//
+// Mirror of `_notice_response_admit_leaf` (sibling 'N' tag) but writes
+// to the notifications_arena rather than the session_params NoticeResponse
+// counter.
+// ═════════════════════════════════════════════════════════════════════
+
+pub(in crate::protocol) mod _notification_response_admit_leaf {
+    use alloc::vec::Vec;
+
+    /// Parsed view of a NotificationResponse frame body.
+    ///
+    /// Borrows from `payload` (the dispatch loop's `&[u8]` view into
+    /// `read_buf.populated()`). The arena `admit` step copies the
+    /// channel + payload bytes into owned storage; `parsed`'s borrow
+    /// expires at the `admit` boundary.
+    pub(in crate::protocol) struct ParsedNotification<'a> {
+        pub(in crate::protocol) pid: i32,
+        pub(in crate::protocol) channel: &'a [u8],
+        pub(in crate::protocol) payload_bytes: &'a [u8],
+    }
+
+    /// Parse the NotificationResponse body per PG §55.7:
+    /// `pid: int32 BE` + `channel: CSTR` + `payload: CSTR`.
+    ///
+    /// Returns `None` if:
+    /// - body shorter than 4 bytes (no pid)
+    /// - channel CSTR has no nul terminator
+    /// - payload CSTR has no nul terminator
+    /// - bytes remain after the payload CSTR's nul terminator
+    ///   (extra trailing bytes — malformed body)
+    ///
+    /// The None case classifies as a malformed-body silent discard —
+    /// mirror of `admit_parameter_status_frame`'s `MalformedPayload`
+    /// policy. Logging this would surface adversarial / buggy server
+    /// frames; for v1 the discard is acceptable.
+    #[inline]
+    pub(in crate::protocol) fn parse_notification_payload(
+        body: &[u8],
+    ) -> Option<ParsedNotification<'_>> {
+        let (pid_bytes, rest) = body.split_first_chunk::<4>()?;
+        let pid = i32::from_be_bytes(*pid_bytes);
+        let nul_channel = rest.iter().position(|&b| b == 0)?;
+        let (channel, rest_after_channel_nul) = rest.split_at_checked(nul_channel)?;
+        let after_channel = rest_after_channel_nul.get(1..)?;
+        let nul_payload = after_channel.iter().position(|&b| b == 0)?;
+        let (payload_bytes, trailer) = after_channel.split_at_checked(nul_payload)?;
+        let trailer_after_nul = trailer.get(1..)?;
+        if !trailer_after_nul.is_empty() {
+            return None;
+        }
+        Some(ParsedNotification {
+            pid,
+            channel,
+            payload_bytes,
+        })
+    }
+
+    /// Lazy-init the arena (one Box per LISTEN-using connection),
+    /// validate channel as PG identifier, allocate a `NotificationPayload`
+    /// slot, return the gen-tagged ref.
+    ///
+    /// Returns `None` when:
+    /// - channel bytes fail `Ident::try_from_bytes` — non-UTF-8 or
+    ///   exceeds NAMEDATALEN-1 chars (PG spec says channel is an
+    ///   identifier; server emitting a non-identifier channel is a
+    ///   spec violation)
+    /// - arena cap reached (`MAX_NOTIFICATIONS_PER_CALL` slots
+    ///   already used in this cycle — structurally bounded by
+    ///   OutActions cap)
+    #[inline]
+    pub(in crate::protocol) fn admit_notification_frame(
+        slot: &mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
+        pid: i32,
+        channel_bytes: &[u8],
+        payload_bytes: &[u8],
+    ) -> Option<crate::notifications_arena::NotificationRef> {
+        let channel_str = core::str::from_utf8(channel_bytes).ok()?;
+        let channel = crate::ident::Ident::try_from_str(channel_str).ok()?;
+        let arena = slot.get_or_insert_with(|| {
+            alloc::boxed::Box::new(crate::notifications_arena::NotificationsArena::new())
+        });
+        let payload = crate::notifications_arena::NotificationPayload {
+            pid,
+            channel,
+            payload: Vec::from(payload_bytes),
+        };
+        arena.alloc(payload)
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // `_proto_init_leaf` submodule — sole legitimate cell-construction
 // site.
 //
@@ -1559,6 +1671,7 @@ pub(crate) mod _proto_init_leaf {
             read_buf: super::ReadBuf::new(),
             session_params: crate::session_params_slot::SessionParamsCell::empty(token),
             error_arena: None,
+            notifications_arena: None,
             partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
             // Placeholder backend_key for test-only fixture.
             // Production construction goes through
@@ -2095,6 +2208,7 @@ impl PgProtocol<ConnectingPhase> {
                     read_buf,
                     session_params,
                     error_arena,
+                    notifications_arena: None,
                     partial_assembly,
                     backend_key: crate::cancel::BackendKey { pid, secret_key },
                     malformed_frame_count,
@@ -3525,6 +3639,7 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
     row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
     session_params: &mut crate::session_params_slot::SessionParamsCell,
     error_arena: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    notifications_arena: &mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
     partial_assembly: &mut crate::partial_assembly::PartialAssemblyCell,
     class: crate::state::StatePushClass,
 ) {
@@ -3534,11 +3649,24 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
             if let Some(arena) = error_arena.as_deref_mut() {
                 arena.clear();
             }
+            // DEF-220: clear notifications arena at Idle boundaries.
+            // Refs issued in prior cycles become Stale here — the
+            // wrapper's OutActions iteration is complete by the time
+            // the next push transitions back to Idle.
+            if let Some(arena) = notifications_arena.as_deref_mut() {
+                arena.clear();
+            }
             _clear_residue_leaf::clear_partial_assembly_residue(partial_assembly);
         }
         crate::state::StatePushClass::Errored(_) => {
             _clear_residue_leaf::clear_schema_slot_residue(row_desc_slot);
             if let Some(arena) = error_arena.as_deref_mut() {
+                arena.clear();
+            }
+            // DEF-220: also clear notifications arena on Errored.
+            // Connection teardown is in progress; any outstanding
+            // NotificationRef is meaningless past this point.
+            if let Some(arena) = notifications_arena.as_deref_mut() {
                 arena.clear();
             }
             // Session-state forfeit on tear-down;
@@ -3607,6 +3735,7 @@ where
         row_desc_slot: terminal_row_desc,
         session_params: session_params_slot,
         error_arena: error_arena_slot,
+        notifications_arena: notifications_arena_slot,
         partial_assembly: partial_assembly_slot,
         malformed_count: malformed_counter,
     } = ctx;
@@ -3623,6 +3752,7 @@ where
         terminal_row_desc,
         session_params_slot,
         error_arena_slot,
+        notifications_arena_slot,
         partial_assembly_slot,
         entry_class,
     );
@@ -3948,6 +4078,47 @@ where
                             frames_consumed.saturating_add(total_len);
                         continue;
                     }
+                    // DEF-220: NotificationResponse ('A') pre-dispatch
+                    // filter. PG §55.7 LISTEN/NOTIFY surface. Frame
+                    // body: 4-byte BE pid + CSTR channel + CSTR
+                    // payload. Lazy-init the arena (one Box per
+                    // LISTEN-using connection), allocate the payload,
+                    // stage Action::Notify with the gen-tagged ref.
+                    //
+                    // Allowed in any post-handshake state — NOTIFY can
+                    // arrive at any time (idle, mid-query, mid-row-
+                    // stream). No state filter; just parse + admit.
+                    // Connecting phase uses an empty transient arena
+                    // slot (LISTEN can never be issued pre-handshake
+                    // so the filter would not fire there in practice;
+                    // the type-level threading is for shared-body
+                    // signature compliance).
+                    if tag == crate::wire::TAG_NOTIFICATION_RESPONSE {
+                        if let Some(parsed) =
+                            _notification_response_admit_leaf::parse_notification_payload(payload)
+                            && let Some(notif_ref) =
+                                _notification_response_admit_leaf::admit_notification_frame(
+                                    notifications_arena_slot,
+                                    parsed.pid,
+                                    parsed.channel,
+                                    parsed.payload_bytes,
+                                )
+                        {
+                            emit_actions!(staged, budget: 1, [
+                                StagedAction::Notify {
+                                    pid: parsed.pid,
+                                    notif_ref,
+                                },
+                            ]);
+                        }
+                        // Malformed body OR arena cap exhaustion → drop
+                        // the frame silently (cold path). Mirror of
+                        // `admit_parameter_status_frame`'s
+                        // `MalformedPayload` discard policy.
+                        frames_consumed =
+                            frames_consumed.saturating_add(total_len);
+                        continue;
+                    }
 
                     // Gate uses `MAX_STAGED_PER_CALL` — NOT
                     // `MAX_ACTIONS_PER_CALL`. The two consts differ
@@ -4228,6 +4399,15 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     // the borrow at function return; the local drops cleanly.
     let mut transient_row_desc =
         _proto_init_leaf::fresh_connecting_transient_row_desc_slot();
+    // DEF-220: Connecting phase doesn't carry a notifications_arena
+    // (LISTEN/NOTIFY is post-handshake only — PG §55.7 NOTIFY can
+    // arrive only in Active phase). Provide a transient empty slot
+    // for DispatchContext threading; the pre-dispatch filter on
+    // 'A' tag would never fire in Connecting state (no LISTEN
+    // command can have been issued pre-handshake), but the slot
+    // must exist for the shared dispatch body's type signature.
+    let mut transient_notifications_arena:
+        Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>> = None;
 
     let sentinel = ConnectingState::Errored(
         crate::error::StateErrorKind::from_kind_or_internal(
@@ -4252,6 +4432,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
             row_desc_slot: &mut transient_row_desc,
             session_params,
             error_arena,
+            notifications_arena: &mut transient_notifications_arena,
             partial_assembly,
             malformed_count,
         },
@@ -4317,6 +4498,13 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
         &'r mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
+    /// DEF-220: notifications_arena threaded from
+    /// `ActiveInner.notifications_arena` into the shared dispatch
+    /// body's `DispatchContext`. LISTEN/NOTIFY is post-handshake
+    /// only — only Active carries this field; Connecting uses a
+    /// transient empty slot at the wrapper level.
+    pub(in crate::protocol) notifications_arena:
+        &'r mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
     pub(in crate::protocol) partial_assembly:
         &'r mut crate::partial_assembly::PartialAssemblyCell,
     pub(in crate::protocol) malformed_count: &'r mut u32,
@@ -4353,6 +4541,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         row_desc_slot,
         session_params,
         error_arena,
+        notifications_arena,
         partial_assembly,
         malformed_count,
     } = ctx;
@@ -4375,6 +4564,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
             row_desc_slot,
             session_params,
             error_arena,
+            notifications_arena,
             partial_assembly,
             malformed_count,
         },
@@ -4778,6 +4968,7 @@ impl ActiveInner {
                 row_desc_slot,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
+                notifications_arena: &mut self.notifications_arena,
                 partial_assembly: &mut self.partial_assembly,
                 malformed_count: &mut self.malformed_frame_count,
             },
@@ -4855,6 +5046,7 @@ impl ActiveInner {
                 row_desc_slot,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
+                notifications_arena: &mut self.notifications_arena,
                 partial_assembly: &mut self.partial_assembly,
                 malformed_count: &mut self.malformed_frame_count,
             },
@@ -4883,6 +5075,7 @@ impl ActiveInner {
             row_desc_slot,
             &mut self.session_params,
             &mut self.error_arena,
+            &mut self.notifications_arena,
             &mut self.partial_assembly,
             class,
         );
@@ -5199,6 +5392,51 @@ impl PgProtocol<ActivePhase> {
         // as `ArenaError::Stale` — same diagnostic surface as a
         // populated arena's stale-ref path.
         crate::error_arena::DisplayError::new(err, self.cold_error_arena())
+    }
+
+    /// Resolve a [`crate::Action::Notify`]'s gen-tagged ref to its
+    /// payload (PG §55.7 LISTEN/NOTIFY surface — DEF-220).
+    ///
+    /// Returns:
+    /// - `Ok(&NotificationPayload)` — ref resolves cleanly within
+    ///   the current OutActions iteration cycle.
+    /// - `Err(ArenaError::Stale)` — ref was issued in a prior cycle
+    ///   (gen mismatch via the per-cycle `clear()` bump). Expected
+    ///   when the wrapper stashes refs past their cycle boundary.
+    /// - `Err(ArenaError::Empty)` — slot index out of bounds.
+    ///   Architecturally unreachable: `alloc` pushes to `slots` before
+    ///   issuing the ref. Classified explicitly per ArenaError
+    ///   discipline.
+    ///
+    /// The wrapper pattern: iterate the `OutActions` returned by
+    /// `feed_bytes`, and for each `Action::Notify { pid, notif_ref }`
+    /// call `proto.get_notification(notif_ref)` to read the payload
+    /// (channel + payload bytes). Copy what you need before the next
+    /// `feed_bytes` cycle clears the arena.
+    ///
+    /// # Empty-arena fallback
+    ///
+    /// If the slot has never been allocated (`None` because no NOTIFY
+    /// has arrived this connection's lifetime), the resolution against
+    /// a static empty `NotificationsArena` returns `Err(Stale)` for
+    /// any ref the caller might construct (impossible in practice —
+    /// no ref can be issued without an alloc, and alloc lazy-inits
+    /// the slot).
+    #[inline]
+    pub fn get_notification(
+        &self,
+        r: crate::notifications_arena::NotificationRef,
+    ) -> Result<
+        &crate::notifications_arena::NotificationPayload,
+        crate::error_arena::ArenaError,
+    > {
+        static EMPTY_ARENA: crate::notifications_arena::NotificationsArena =
+            crate::notifications_arena::NotificationsArena::new();
+        let arena = match self.inner.notifications_arena.as_deref() {
+            Some(a) => a,
+            None => &EMPTY_ARENA,
+        };
+        arena.get(r)
     }
 
     // ═════════════════════════════════════════════════════════════

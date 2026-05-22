@@ -95,13 +95,6 @@ pub struct NotificationRef {
 /// Option<Box<NotificationsArena>>`). Cleared at every `feed_bytes`
 /// entry — refs are valid only within their allocation cycle.
 #[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "DEF-220 step 1-3 staged; steps 4 (pre-dispatch filter + ActiveInner slot) \
-              and 5 (PgProtocol::get_notification accessor + integration test) wire \
-              up the methods. In-module tests exercise the API; this allow covers \
-              the dead_code on non-test bundle until steps 4-5 land. Remove when shipping step 4."
-)]
 pub(crate) struct NotificationsArena {
     /// Per-cycle ring of payload slots. Capacity bounded by
     /// `MAX_NOTIFICATIONS_PER_CALL`; `alloc` pushes to the next slot
@@ -124,10 +117,6 @@ pub(crate) struct NotificationsArena {
     generation: u16,
 }
 
-#[allow(
-    dead_code,
-    reason = "DEF-220 step 1-3 staged; methods used by in-module tests + by steps 4-5 (pre-dispatch filter + accessor) which land next"
-)]
 impl NotificationsArena {
     /// Construct an empty arena (no slots, gen 0).
     #[inline]
