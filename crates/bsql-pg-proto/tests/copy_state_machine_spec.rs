@@ -236,6 +236,116 @@ fn copy_out_data_chunks_surface_via_action() {
 }
 
 #[test]
+fn copy_in_full_push_cycle() {
+    // DEF-219 Phase 4: full COPY IN client-push cycle. push_copy_data
+    // ×3, then push_copy_done, then verify server-response-side
+    // transitions to Idle on CommandComplete + RFQ.
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = WriteBuf::new();
+
+    let (reply, _raw) = mint_reply::<bsql_pg_proto::QueryKind>(&mut proto);
+
+    proto.push_or_panic(
+        SimpleQuery {
+            sql: "COPY users FROM STDIN",
+            reply,
+        },
+        &mut wb,
+    );
+
+    // Server: CopyInResponse → state = CopyInActive.
+    let frame_g = copy_response_frame(TAG_COPY_IN_RESPONSE.byte(), 0, 3);
+    let _ = proto.feed_bytes(&frame_g, &mut wb);
+    assert!(matches!(proto.state(), ActiveState::SimpleQueryCopyInActive(_)));
+
+    // Push 3× CopyData frames. Use a separate WriteBuf for push
+    // staging to keep frame slices live for inspection. (In a real
+    // app the bytes are flushed to the socket between calls.)
+    let mut push_wb = WriteBuf::new();
+    let bytes_pushed_1 = {
+        let res = proto.push_copy_data(b"row1\tval1\n", &mut push_wb);
+        assert!(res.is_ok(), "push_copy_data must succeed in CopyInActive");
+        let Ok(slice) = res else { return };
+        slice.len()
+    };
+    assert!(bytes_pushed_1 > 0, "push wrote bytes");
+    // State stays CopyInActive (no client-side transition).
+    assert!(matches!(proto.state(), ActiveState::SimpleQueryCopyInActive(_)));
+
+    let _ = proto.push_copy_data(b"row2\tval2\n", &mut push_wb);
+    let _ = proto.push_copy_data(b"row3\tval3\n", &mut push_wb);
+    assert!(matches!(proto.state(), ActiveState::SimpleQueryCopyInActive(_)));
+
+    // CopyDone — still CopyInActive until server's CommandComplete.
+    let done_res = proto.push_copy_done(&mut push_wb);
+    assert!(done_res.is_ok());
+    assert!(matches!(proto.state(), ActiveState::SimpleQueryCopyInActive(_)));
+
+    // Server: CommandComplete + RFQ → state = Idle.
+    let mut tail = std::vec::Vec::new();
+    tail.extend(command_complete_frame(b"COPY 3"));
+    tail.extend(rfq_frame(b'I'));
+    let actions = proto.feed_bytes(&tail, &mut wb);
+    let slice = actions.as_slice();
+    let last = slice.last().expect("at least one action");
+    let bsql_pg_proto::Action::DeliverReply {
+        value: Reply::QueryComplete(p),
+        ..
+    } = last
+    else {
+        panic!("expected DeliverReply(QueryComplete); got {:?}", last);
+    };
+    assert_eq!(p.command_tag.as_str(), "COPY 3");
+    assert!(matches!(proto.state(), ActiveState::Idle));
+}
+
+#[test]
+fn push_copy_data_outside_copy_in_state_errors() {
+    // Calling push_copy_data when state is Idle (not CopyInActive)
+    // must return CopyPushError::NotInCopyInState without writing.
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = WriteBuf::new();
+
+    let pre_len = wb.len();
+    let res = proto.push_copy_data(b"data", &mut wb);
+    assert!(
+        matches!(res, Err(bsql_pg_proto::CopyPushError::NotInCopyInState)),
+        "expected NotInCopyInState; got {:?}",
+        res
+    );
+    assert_eq!(
+        wb.len(),
+        pre_len,
+        "WriteBuf must NOT be written on rejected push"
+    );
+}
+
+#[test]
+fn push_copy_fail_rejects_embedded_nul() {
+    // Set up CopyInActive state.
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = WriteBuf::new();
+    let (reply, _raw) = mint_reply::<bsql_pg_proto::QueryKind>(&mut proto);
+    proto.push_or_panic(
+        SimpleQuery {
+            sql: "COPY users FROM STDIN",
+            reply,
+        },
+        &mut wb,
+    );
+    let frame_g = copy_response_frame(TAG_COPY_IN_RESPONSE.byte(), 0, 1);
+    let _ = proto.feed_bytes(&frame_g, &mut wb);
+
+    let mut push_wb = WriteBuf::new();
+    let res = proto.push_copy_fail("err\0msg", &mut push_wb);
+    assert!(
+        matches!(res, Err(bsql_pg_proto::CopyPushError::EmbeddedNul)),
+        "expected EmbeddedNul; got {:?}",
+        res
+    );
+}
+
+#[test]
 fn copy_out_rejects_malformed_response_header() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();

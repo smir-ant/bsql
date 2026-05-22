@@ -322,7 +322,7 @@ pub mod wire;
 pub mod write_buf;
 
 pub use action::{
-    Action, CloseCompletePayload, DescribePortalCompletePayload,
+    Action, CloseCompletePayload, CopyPushError, DescribePortalCompletePayload,
     DescribeStatementCompletePayload, DescribedRows, FeedEvent, OutActions, ParamOids,
     ParseCompletePayload, PongPayload, PushFailure, QueryCompletePayload, Reply,
     StartupCompletePayload, TxStatus,

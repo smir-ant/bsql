@@ -1083,6 +1083,64 @@ pub struct PushFailure {
     pub cause: ProtocolError,
 }
 
+/// Failure classification for the COPY IN push methods
+/// (`push_copy_data` / `push_copy_done` / `push_copy_fail`) — DEF-219
+/// Phase 4.
+///
+/// Unlike the broader [`PushFailure`] used by query-flow push commands,
+/// COPY IN pushes have no in-flight `ReplyId` to drain (the reply_id
+/// is owned by the SimpleQuery that initiated the COPY IN cycle and
+/// is preserved in the `CopyInActive` state across all client push
+/// frames). So the failure surface is a simple sum type without an
+/// `id` correlator.
+#[derive(Debug, Clone, Copy)]
+pub enum CopyPushError {
+    /// Current proto state is not `SimpleQueryCopyInActive`. The
+    /// push was rejected without writing to the WriteBuf.
+    ///
+    /// Common causes: caller invoked `push_copy_data` before the
+    /// server's `CopyInResponse` arrived, or after the server's
+    /// `CommandComplete` already advanced state to `AwaitingRfq`.
+    NotInCopyInState,
+    /// The framed body would exceed PG's wire length limit
+    /// (`i32::MAX = 2_147_483_647` bytes including the 4-byte
+    /// self-inclusive length field). Caller must chunk the payload
+    /// into multiple `push_copy_data` calls.
+    FrameTooLarge,
+    /// The `error` string passed to `push_copy_fail` contains an
+    /// embedded NUL byte, which would corrupt the CSTR framing.
+    /// Strip / replace NULs caller-side before retrying.
+    EmbeddedNul,
+    /// WriteBuf capacity exhausted — frame doesn't fit.
+    WriteBufFull(crate::write_buf::WriteBufFull),
+}
+
+impl core::fmt::Display for CopyPushError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotInCopyInState => {
+                f.write_str("push_copy_* called outside CopyInActive state")
+            }
+            Self::FrameTooLarge => {
+                f.write_str("COPY IN payload exceeds PG i32 wire length limit")
+            }
+            Self::EmbeddedNul => {
+                f.write_str("CopyFail error message contains embedded NUL byte")
+            }
+            Self::WriteBufFull(inner) => write!(f, "WriteBuf full: {inner}"),
+        }
+    }
+}
+
+impl core::error::Error for CopyPushError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::WriteBufFull(inner) => Some(inner),
+            Self::NotInCopyInState | Self::FrameTooLarge | Self::EmbeddedNul => None,
+        }
+    }
+}
+
 // Additive Display + `core::error::Error` impls on `PushFailure`.
 // Downstream `?`-propagation into `Box<dyn Error>` would otherwise
 // require a manual `From<PushFailure>` bridge in every consumer.

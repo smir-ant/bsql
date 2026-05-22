@@ -5489,6 +5489,133 @@ impl PgProtocol<ActivePhase> {
         arena.get(r)
     }
 
+    /// Push a `CopyData` ('d') frame to the server during an
+    /// active COPY IN cycle (DEF-219 Phase 4, PG §55.2.6).
+    ///
+    /// Writes the `'d' + len + bytes` frame to `wb` and returns the
+    /// staged byte slice. State stays in
+    /// `SimpleQueryCopyInActive` — only the server's
+    /// `CommandComplete` (or `ErrorResponse`) response advances
+    /// state. Caller may invoke this repeatedly to stream bulk
+    /// data across multiple sub-buffer-sized chunks.
+    ///
+    /// # Errors
+    ///
+    /// - `CopyPushError::NotInCopyInState` — current state is not
+    ///   `CopyInActive`. The push is rejected without writing.
+    /// - `CopyPushError::FrameTooLarge` — `bytes.len() + 4 >
+    ///   i32::MAX as usize`. PG's wire length field is `i32 BE`;
+    ///   bodies exceeding 2 GiB cannot be framed.
+    /// - `CopyPushError::WriteBufFull` — `wb` lacks capacity for
+    ///   the framed bytes.
+    pub fn push_copy_data<'w>(
+        &mut self,
+        bytes: &[u8],
+        wb: &'w mut crate::write_buf::WriteBuf,
+    ) -> Result<&'w [u8], crate::action::CopyPushError> {
+        if !matches!(
+            self.inner.state,
+            crate::state::ActiveState::SimpleQueryCopyInActive(_)
+        ) {
+            return Err(crate::action::CopyPushError::NotInCopyInState);
+        }
+        let body_len_usize = bytes.len().saturating_add(4);
+        let body_len = u32::try_from(body_len_usize)
+            .map_err(|_| crate::action::CopyPushError::FrameTooLarge)?;
+        // PG wire length field is signed i32 — values > i32::MAX
+        // wrap negative on the server side. Reject via the
+        // u32-from-i32-LE-bytes round-trip (avoids `as` cast which
+        // is banned crate-wide).
+        const I32_MAX_AS_U32: u32 = u32::from_le_bytes(i32::MAX.to_le_bytes());
+        if body_len > I32_MAX_AS_U32 {
+            return Err(crate::action::CopyPushError::FrameTooLarge);
+        }
+        let start = wb.len();
+        wb.push_bytes(&[crate::wire::TAG_COPY_DATA_OUTBOUND.byte()])
+            .map_err(crate::action::CopyPushError::WriteBufFull)?;
+        wb.push_bytes(&body_len.to_be_bytes())
+            .map_err(crate::action::CopyPushError::WriteBufFull)?;
+        wb.push_bytes(bytes)
+            .map_err(crate::action::CopyPushError::WriteBufFull)?;
+        let end = wb.len();
+        Ok(wb.as_bytes().get(start..end).unwrap_or(&[]))
+    }
+
+    /// Push a `CopyDone` ('c') frame to the server (DEF-219 Phase 4).
+    ///
+    /// Signals clean end-of-data from the client side during COPY
+    /// IN. Server responds with `CommandComplete` (carrying the row
+    /// count tag) followed by `ReadyForQuery`. State stays in
+    /// `CopyInActive` until the server's `CommandComplete` arrives.
+    pub fn push_copy_done<'w>(
+        &mut self,
+        wb: &'w mut crate::write_buf::WriteBuf,
+    ) -> Result<&'w [u8], crate::action::CopyPushError> {
+        if !matches!(
+            self.inner.state,
+            crate::state::ActiveState::SimpleQueryCopyInActive(_)
+        ) {
+            return Err(crate::action::CopyPushError::NotInCopyInState);
+        }
+        // CopyDone has empty body; length = 4 (self-inclusive).
+        let frame: [u8; 5] = [crate::wire::TAG_COPY_DONE_OUTBOUND.byte(), 0, 0, 0, 4];
+        let start = wb.len();
+        wb.push_bytes(&frame)
+            .map_err(crate::action::CopyPushError::WriteBufFull)?;
+        let end = wb.len();
+        Ok(wb.as_bytes().get(start..end).unwrap_or(&[]))
+    }
+
+    /// Push a `CopyFail` ('f') frame to the server with the given
+    /// error message (DEF-219 Phase 4).
+    ///
+    /// Aborts an in-progress COPY IN cycle from the client side.
+    /// `error` is sent as a CSTR (NUL-terminated). Server responds
+    /// with `ErrorResponse` (carrying the abort reason classified
+    /// as a server error) followed by `ReadyForQuery`. State stays
+    /// in `CopyInActive` until the server's error arrives.
+    pub fn push_copy_fail<'w>(
+        &mut self,
+        error: &str,
+        wb: &'w mut crate::write_buf::WriteBuf,
+    ) -> Result<&'w [u8], crate::action::CopyPushError> {
+        if !matches!(
+            self.inner.state,
+            crate::state::ActiveState::SimpleQueryCopyInActive(_)
+        ) {
+            return Err(crate::action::CopyPushError::NotInCopyInState);
+        }
+        let error_bytes = error.as_bytes();
+        if error_bytes.contains(&0) {
+            // Reject embedded NUL — would corrupt CSTR framing.
+            return Err(crate::action::CopyPushError::EmbeddedNul);
+        }
+        // Body = error CSTR (bytes + NUL terminator).
+        // Total wire = tag (1) + len (4) + body.
+        let body_len_usize = error_bytes.len().saturating_add(1).saturating_add(4);
+        let body_len = u32::try_from(body_len_usize)
+            .map_err(|_| crate::action::CopyPushError::FrameTooLarge)?;
+        // PG wire length field is signed i32 — values > i32::MAX
+        // wrap negative on the server side. Reject via the
+        // u32-from-i32-LE-bytes round-trip (avoids `as` cast which
+        // is banned crate-wide).
+        const I32_MAX_AS_U32: u32 = u32::from_le_bytes(i32::MAX.to_le_bytes());
+        if body_len > I32_MAX_AS_U32 {
+            return Err(crate::action::CopyPushError::FrameTooLarge);
+        }
+        let start = wb.len();
+        wb.push_bytes(&[crate::wire::TAG_COPY_FAIL_OUTBOUND.byte()])
+            .map_err(crate::action::CopyPushError::WriteBufFull)?;
+        wb.push_bytes(&body_len.to_be_bytes())
+            .map_err(crate::action::CopyPushError::WriteBufFull)?;
+        wb.push_bytes(error_bytes)
+            .map_err(crate::action::CopyPushError::WriteBufFull)?;
+        wb.push_bytes(&[0])
+            .map_err(crate::action::CopyPushError::WriteBufFull)?;
+        let end = wb.len();
+        Ok(wb.as_bytes().get(start..end).unwrap_or(&[]))
+    }
+
     /// Resolve a [`crate::Action::CopyDataChunk`]'s gen-tagged ref
     /// to its bytes (DEF-219 Phase 3, PG §55.2.6 COPY OUT).
     ///
