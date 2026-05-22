@@ -180,6 +180,69 @@ pub const TAG_NOTICE_RESPONSE: InboundTag = InboundTag::from_byte(b'N');
 /// [`PgProtocol::get_notification`]: crate::PgProtocol::get_notification
 pub const TAG_NOTIFICATION_RESPONSE: InboundTag = InboundTag::from_byte(b'A');
 
+// ---------------------------------------------------------------
+// COPY sub-protocol tags (DEF-219, PG §55.2.6)
+// ---------------------------------------------------------------
+//
+// COPY toggles the connection into a bulk-transfer sub-protocol.
+// Two directions:
+//
+// - **COPY OUT** (`COPY ... TO STDOUT`): server → client. Server
+//   sends `CopyOutResponse` ('H') with format metadata, then 0+
+//   `CopyData` ('d') frames carrying bulk bytes, then `CopyDone`
+//   ('c'), then `CommandComplete` ('C') with row count, then RFQ.
+//
+// - **COPY IN** (`COPY ... FROM STDIN`): client → server. Server
+//   sends `CopyInResponse` ('G') with format metadata, client sends
+//   0+ `CopyData` ('d') frames, client sends `CopyDone` ('c') OR
+//   `CopyFail` ('f') with error reason, then server sends
+//   `CommandComplete` + RFQ.
+
+/// Backend `CopyOutResponse` message tag (`'H'`) — PG §55.2.6.
+///
+/// Initiates a COPY OUT (`COPY ... TO STDOUT`) sub-protocol cycle.
+/// Body shape: `format: int8` (0 = text, 1 = binary) +
+/// `n_cols: int16` + per-column `format_code: int16[]` array.
+pub const TAG_COPY_OUT_RESPONSE: InboundTag = InboundTag::from_byte(b'H');
+
+/// Backend `CopyInResponse` message tag (`'G'`) — PG §55.2.6.
+///
+/// Initiates a COPY IN (`COPY ... FROM STDIN`) sub-protocol cycle.
+/// Body shape identical to [`TAG_COPY_OUT_RESPONSE`]: `format` +
+/// `n_cols` + per-column `format_code[]`.
+pub const TAG_COPY_IN_RESPONSE: InboundTag = InboundTag::from_byte(b'G');
+
+/// Bidirectional `CopyData` message tag (`'d'`) — PG §55.2.6.
+///
+/// Carries bulk-transfer bytes during an active COPY sub-protocol
+/// cycle. The body is opaque payload (text-format CSV row chunks
+/// in text mode, PG binary tuples in binary mode). Server emits
+/// these during COPY OUT; client emits during COPY IN.
+pub const TAG_COPY_DATA: InboundTag = InboundTag::from_byte(b'd');
+
+/// `CopyData` outbound tag (`'d'`) — same byte as the inbound, but
+/// carried via the [`OutboundTag`] type for the COPY IN push path.
+pub const TAG_COPY_DATA_OUTBOUND: OutboundTag = OutboundTag::from_byte(b'd');
+
+/// Bidirectional `CopyDone` message tag (`'c'`) — PG §55.2.6.
+///
+/// Signals the end of a COPY sub-protocol cycle from one direction.
+/// In COPY OUT, server emits to indicate no more `CopyData` follows.
+/// In COPY IN, client emits to indicate clean completion (vs
+/// `CopyFail` for error abort). Empty body.
+pub const TAG_COPY_DONE: InboundTag = InboundTag::from_byte(b'c');
+
+/// `CopyDone` outbound tag (`'c'`) — same byte as the inbound,
+/// carried via [`OutboundTag`] for the COPY IN push path.
+pub const TAG_COPY_DONE_OUTBOUND: OutboundTag = OutboundTag::from_byte(b'c');
+
+/// Frontend `CopyFail` message tag (`'f'`) — PG §55.2.6.
+///
+/// Aborts an in-progress COPY IN cycle from the client side. Body
+/// is a CSTR with the failure reason. Server responds with an
+/// `ErrorResponse` carrying the abort reason, then RFQ.
+pub const TAG_COPY_FAIL_OUTBOUND: OutboundTag = OutboundTag::from_byte(b'f');
+
 /// Frontend `SASLInitialResponse` / `SASLResponse` message tag (`'p'`).
 ///
 /// Used for both the initial SASL response (mechanism + client-first)
@@ -1418,6 +1481,11 @@ assert_all_distinct!(
     TAG_CLOSE_COMPLETE,
     TAG_PARAMETER_DESCRIPTION,
     TAG_PORTAL_SUSPENDED,
+    // COPY sub-protocol inbound tags (DEF-219):
+    TAG_COPY_OUT_RESPONSE,
+    TAG_COPY_IN_RESPONSE,
+    TAG_COPY_DATA,
+    TAG_COPY_DONE,
 );
 
 // **Outbound** (frontend → backend) tag-distinctness.
@@ -1435,6 +1503,10 @@ assert_all_distinct!(
     TAG_FLUSH,
     // Connection-teardown:
     TAG_TERMINATE,
+    // COPY IN sub-protocol outbound tags (DEF-219):
+    TAG_COPY_DATA_OUTBOUND,
+    TAG_COPY_DONE_OUTBOUND,
+    TAG_COPY_FAIL_OUTBOUND,
 );
 
 // **Authentication sub-codes** distinctness. The sub-code is

@@ -1213,6 +1213,183 @@ pub(crate) fn parse_parameter_description(
 }
 
 // ════════════════════════════════════════════════════════════════════
+// COPY response header (DEF-219, PG §55.2.6)
+// ════════════════════════════════════════════════════════════════════
+
+/// Typed COPY transfer-format enum. Wire byte: 0 = text, 1 = binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CopyFormat {
+    /// Text-mode transfer — newline-separated rows, columns joined
+    /// by configurable delimiter (default tab).
+    Text = 0,
+    /// Binary-mode transfer — PG binary tuple format with a 19-byte
+    /// header signature, per-tuple field count + length-prefixed
+    /// values, and an end-of-stream marker.
+    Binary = 1,
+}
+
+/// COPY response header (PG §55.2.6) — shared shape for both
+/// `CopyOutResponse` ('H') and `CopyInResponse` ('G') frames.
+///
+/// Wire body shape: `format: int8` (0 = text, 1 = binary) +
+/// `n_cols: int16` + per-column `format_code: int16[]` array. Per-PG
+/// spec the per-column codes MUST all equal the overall format byte
+/// — wire-validated by [`parse_copy_response_header`]. Stored as
+/// `(format, n_cols)` only; per-column codes are redundant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyHeader {
+    /// Overall transfer format. All per-column codes in the wire
+    /// frame MUST equal this byte per PG spec.
+    pub format: CopyFormat,
+    /// Number of columns in the transfer. Bounded by
+    /// [`MAX_ROW_COLUMNS`] = 32.
+    pub n_cols: u16,
+}
+
+/// Parse a `CopyOutResponse` or `CopyInResponse` body (PG §55.2.6).
+///
+/// Body shape: `format: int8` (0/1) + `n_cols: int16 BE` +
+/// per-column `format_code: int16 BE × n_cols`.
+///
+/// Returns `Err(ProtocolError::MalformedCopyResponse)` when:
+/// body shorter than 3 bytes, format byte not 0/1, n_cols negative,
+/// body length inconsistent with declared n_cols, or per-column
+/// format code disagrees with overall format byte.
+///
+/// Returns `Err(ProtocolError::TooManyColumns)` if
+/// `n_cols > MAX_ROW_COLUMNS`.
+#[cold]
+#[allow(
+    dead_code,
+    reason = "DEF-219 Phase 1 (foundation); Phase 2 (dispatch arms) wires the consumer"
+)]
+pub(crate) fn parse_copy_response_header(
+    payload: &[u8],
+) -> Result<CopyHeader, crate::error::ProtocolError> {
+    use crate::error::ProtocolError;
+    let malformed = || ProtocolError::MalformedCopyResponse {
+        payload_len: payload.len(),
+    };
+
+    let (format_byte, rest) = payload.split_first().ok_or_else(malformed)?;
+    let format = match *format_byte {
+        0 => CopyFormat::Text,
+        1 => CopyFormat::Binary,
+        _ => return Err(malformed()),
+    };
+    let format_as_i16 = i16::from(*format_byte);
+
+    let (count_bytes, rest) = rest.split_first_chunk::<2>().ok_or_else(malformed)?;
+    let n_cols_i16 = i16::from_be_bytes(*count_bytes);
+    if n_cols_i16 < 0 {
+        return Err(malformed());
+    }
+    let n_cols = match u16::try_from(n_cols_i16) {
+        Ok(v) => v,
+        Err(_) => return Err(malformed()),
+    };
+    let n_cols_usize = usize::from(n_cols);
+
+    if n_cols_usize > MAX_ROW_COLUMNS {
+        return Err(ProtocolError::TooManyColumns {
+            count: n_cols_usize,
+            max: MAX_ROW_COLUMNS,
+        });
+    }
+
+    let expected_body_len = n_cols_usize.checked_mul(2).ok_or_else(malformed)?;
+    if rest.len() != expected_body_len {
+        return Err(malformed());
+    }
+
+    let mut cursor = rest;
+    for _ in 0..n_cols_usize {
+        let (code_bytes, tail) = cursor.split_first_chunk::<2>().ok_or_else(malformed)?;
+        let code = i16::from_be_bytes(*code_bytes);
+        if code != format_as_i16 {
+            return Err(malformed());
+        }
+        cursor = tail;
+    }
+
+    Ok(CopyHeader { format, n_cols })
+}
+
+#[cfg(test)]
+mod copy_header_tests {
+    use super::*;
+
+    fn build_copy_response_body(format: u8, n_cols: u16) -> std::vec::Vec<u8> {
+        let mut body = std::vec::Vec::new();
+        body.push(format);
+        body.extend_from_slice(&(i16::try_from(n_cols).unwrap_or(0)).to_be_bytes());
+        let code_as_i16 = i16::from(format);
+        for _ in 0..n_cols {
+            body.extend_from_slice(&code_as_i16.to_be_bytes());
+        }
+        body
+    }
+
+    #[test]
+    fn parse_text_format_zero_cols() {
+        let body = build_copy_response_body(0, 0);
+        let res = parse_copy_response_header(&body);
+        assert!(matches!(
+            res,
+            Ok(CopyHeader { format: CopyFormat::Text, n_cols: 0 })
+        ));
+    }
+
+    #[test]
+    fn parse_binary_format_three_cols() {
+        let body = build_copy_response_body(1, 3);
+        let res = parse_copy_response_header(&body);
+        assert!(matches!(
+            res,
+            Ok(CopyHeader { format: CopyFormat::Binary, n_cols: 3 })
+        ));
+    }
+
+    #[test]
+    fn rejects_format_byte_two() {
+        let body = build_copy_response_body(2, 0);
+        let res = parse_copy_response_header(&body);
+        assert!(matches!(
+            res,
+            Err(crate::error::ProtocolError::MalformedCopyResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_per_col_format_mismatch() {
+        // overall format = 0 (text), but per-col format = 1 (binary) — spec violation
+        let mut body = std::vec::Vec::new();
+        body.push(0); // overall text
+        body.extend_from_slice(&1_i16.to_be_bytes()); // n_cols = 1
+        body.extend_from_slice(&1_i16.to_be_bytes()); // per-col = binary (mismatch!)
+        let res = parse_copy_response_header(&body);
+        assert!(matches!(
+            res,
+            Err(crate::error::ProtocolError::MalformedCopyResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_too_many_columns() {
+        // n_cols = MAX + 1; body length doesn't matter (the cap check
+        // fires first).
+        let n = u16::try_from(MAX_ROW_COLUMNS.saturating_add(1)).unwrap_or(33);
+        let body = build_copy_response_body(0, n);
+        let res = parse_copy_response_header(&body);
+        assert!(matches!(
+            res,
+            Err(crate::error::ProtocolError::TooManyColumns { .. })
+        ));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
 // DataRow parser + ColumnsIter
 // ════════════════════════════════════════════════════════════════════
 

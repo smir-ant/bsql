@@ -553,6 +553,18 @@ pub enum ProtocolError {
         payload_len: usize,
     },
 
+    /// Server sent a malformed `CopyOutResponse` ('H') or
+    /// `CopyInResponse` ('G') payload (DEF-219) — short header
+    /// (< 3 bytes for format + count), format byte not in {0, 1},
+    /// negative column count, trailing bytes after declared columns,
+    /// or per-column format code disagreeing with the overall format
+    /// byte (PG §55.2.6 pins per-column codes to equal overall).
+    /// Framing-desync classification.
+    MalformedCopyResponse {
+        /// Actual payload byte count.
+        payload_len: usize,
+    },
+
     /// Server sent a `DataRow` (`'D'`) frame with no body — the
     /// 5-byte header is followed by zero payload bytes (`total_len
     /// == HEADER_LEN`). PG's wire spec mandates at minimum a 2-byte
@@ -1346,6 +1358,7 @@ impl ProtocolError {
             Self::StartupAlreadyInProgress | Self::CommandInProgress => ErrorKind::ClientOrdering,
             Self::MalformedCommandComplete { .. }
             | Self::MalformedRowDescription { .. }
+            | Self::MalformedCopyResponse { .. }
             | Self::MalformedDataRow { .. }
             | Self::TooManyColumns { .. }
             | Self::UnexpectedFormatCode { .. }
@@ -1549,6 +1562,10 @@ impl fmt::Display for ProtocolError {
             Self::MalformedRowDescription { payload_len } => write!(
                 f,
                 "malformed RowDescription: {payload_len}-byte payload (short header, negative count, missing name NUL, or truncated metadata)",
+            ),
+            Self::MalformedCopyResponse { payload_len } => write!(
+                f,
+                "malformed CopyOutResponse / CopyInResponse: {payload_len}-byte payload (short header, format byte not in {{0, 1}}, negative count, or per-column format code disagreeing with overall format)",
             ),
             Self::MalformedDataRow { total_len } => write!(
                 f,
