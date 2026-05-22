@@ -1335,6 +1335,17 @@ impl<'p, 'w> RowStream<'p, 'w> {
         );
         if is_terminal {
             self.flush_pending = true;
+            // Mark drained so the post-iter_rows Drop impl doesn't
+            // install `Errored(InternalCrateBug::StreamDroppedMidStream)`
+            // — the terminal frame was observed cleanly. Without this,
+            // any terminal that flows through the slow path (Reply
+            // delivered via FailReply/CloseSocket/DeliverReply other
+            // than the fast-path-handled `QueryComplete` post-DataRows
+            // shape — e.g. the new PG §55.2.7 `QuerySuspended` terminal
+            // from `BindExecuteAwaitingRfqAfterSuspended`) would
+            // leave the stream «mid-frame» from Drop's POV and
+            // erroneously install Errored on cleanup.
+            self.drained = true;
         }
         match first_opt {
             None => ColEvent::NeedMore,

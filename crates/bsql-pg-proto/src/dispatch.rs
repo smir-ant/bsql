@@ -1075,13 +1075,23 @@ pub(crate) fn dispatch(
         (ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
+        // PortalSuspended before any DataRow is valid PG §55.2.7 —
+        // server may emit PortalSuspended immediately if the cap is
+        // smaller than the row count actually produced (e.g., 0-row
+        // portal with `FetchRows::Chunked(N)`). Body must be empty;
+        // transition mirrors the StreamingRows arm below.
         (
-            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. },
+            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply },
             TAG_PORTAL_SUSPENDED,
-        ) => install_errored(state,
-            Some(reply.consume()),
-            ProtocolError::UnexpectedFrame { tag: TAG_PORTAL_SUSPENDED },
-        ),
+        ) => {
+            match validate_empty_body(payload, TAG_PORTAL_SUSPENDED) {
+                Ok(()) => {
+                    *state = ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply };
+                    DispatchOutcome::AdvancedSilent
+                }
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+            }
+        }
         (ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }, other) => {
             install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }

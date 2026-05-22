@@ -39,10 +39,14 @@
 use core::num::NonZeroU32;
 
 use bsql_pg_proto::{
-    ActiveState, FetchRows, PortalName, QueryKind, WriteBuf,
+    ActiveState, ColEvent, FetchRows, PortalName, ProtocolError, QueryKind, Reply, StmtName,
+    WriteBuf,
     decode::RowDesc,
     push_command::ExecutePortal,
-    wire::TAG_EXECUTE,
+    wire::{
+        TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_EXECUTE, TAG_PORTAL_SUSPENDED,
+        TAG_READY_FOR_QUERY,
+    },
 };
 
 mod common;
@@ -50,6 +54,52 @@ use common::{PushOrPanic, fresh_active_via_trust_handshake, mint_reply};
 
 fn portal_unnamed() -> PortalName {
     PortalName::default()
+}
+
+fn stmt_unnamed() -> StmtName {
+    StmtName::default()
+}
+
+/// Build a bare PG frame: tag + 4-byte BE length (self-inclusive) + body.
+fn frame(tag: u8, body: &[u8]) -> std::vec::Vec<u8> {
+    let mut out = std::vec::Vec::new();
+    out.push(tag);
+    let Ok(len) = u32::try_from(body.len().saturating_add(4)) else {
+        panic!("fixture body too large");
+    };
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+fn bind_complete_frame() -> [u8; 5] {
+    [TAG_BIND_COMPLETE.byte(), 0, 0, 0, 4]
+}
+
+/// 0-column DataRow body: `n_cols: i16 = 0`. Per PG §55.2.2 the body
+/// is `n_cols + per-column (i32 len + bytes)`; n_cols=0 means an empty
+/// column list. Useful with `RowDesc::EMPTY` to exercise the
+/// streaming-state machine WITHOUT depending on populated `RowDesc`
+/// (the only externally-constructable shape is EMPTY — populated
+/// `RowDesc` requires parsing a `RowDescription` frame, which the
+/// `BindExecute`-with-caller-supplied-schema path bypasses).
+fn empty_data_row_frame() -> std::vec::Vec<u8> {
+    let body = 0_i16.to_be_bytes();
+    frame(TAG_DATA_ROW.byte(), &body)
+}
+
+fn portal_suspended_frame() -> [u8; 5] {
+    [TAG_PORTAL_SUSPENDED.byte(), 0, 0, 0, 4]
+}
+
+fn command_complete_frame(tag: &[u8]) -> std::vec::Vec<u8> {
+    let mut body = tag.to_vec();
+    body.push(0);
+    frame(TAG_COMMAND_COMPLETE.byte(), &body)
+}
+
+fn rfq_frame(tx_byte: u8) -> [u8; 6] {
+    [TAG_READY_FOR_QUERY.byte(), 0, 0, 0, 5, tx_byte]
 }
 
 // =====================================================================
@@ -172,6 +222,174 @@ fn execute_portal_dml_path_skips_bind_complete() {
         "ExecutePortal Dml must transition to AwaitingCommandCompleteDml, got {:?}",
         proto.state(),
     );
+}
+
+// =====================================================================
+// End-to-end iter_rows integration (DEF-225 Phase F)
+//
+// Validates the full chunked-fetch round-trip:
+//   push_bind_execute(Chunked(N))
+//     → server: BindComplete + DataRow × N + PortalSuspended + RFQ
+//     → iter_rows pull loop observes:
+//        - EndRow × N (for 0-column DataRows with RowDesc::EMPTY)
+//        - EndQuery { outcome: Ok(Reply::QuerySuspended(_)) }
+//   ExecutePortal(All) resume
+//     → server: DataRow × 1 + CommandComplete + RFQ
+//     → iter_rows pull loop observes:
+//        - EndRow × 1
+//        - EndQuery { outcome: Ok(Reply::QueryComplete(_)) }
+//
+// Uses `RowDesc::EMPTY` + 0-column DataRows because populated
+// `RowDesc` requires parsing a `RowDescription` frame from the wire
+// (parser is `pub(crate)`), but `BindExecute`'s caller-supplied
+// schema path accepts `EMPTY` directly. The state-machine path
+// being tested is identical regardless of column count.
+// =====================================================================
+
+#[test]
+fn iter_rows_chunked_suspended_then_resume_to_completion() {
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = WriteBuf::new();
+
+    // Step 1: push BindExecute with Chunked(2). Caller pre-supplies
+    // RowDesc::EMPTY (0-column SELECT path).
+    let (reply1, raw1) = mint_reply::<QueryKind>(&mut proto);
+    let two = match NonZeroU32::new(2) {
+        Some(n) => n,
+        None => panic!("2 is non-zero"),
+    };
+    proto.push_bind_execute_or_panic(
+        &portal_unnamed(),
+        &stmt_unnamed(),
+        &(),
+        Some(RowDesc::EMPTY),
+        FetchRows::Chunked(two),
+        reply1,
+        &mut wb,
+    );
+
+    // Server response: BindComplete + 2×DataRow(0-col) + PortalSuspended + RFQ.
+    let mut server_bytes = std::vec::Vec::new();
+    server_bytes.extend_from_slice(&bind_complete_frame());
+    server_bytes.extend_from_slice(&empty_data_row_frame());
+    server_bytes.extend_from_slice(&empty_data_row_frame());
+    server_bytes.extend_from_slice(&portal_suspended_frame());
+    server_bytes.extend_from_slice(&rfq_frame(b'I'));
+
+    let collect_result: Result<(), ProtocolError> = proto.iter_rows(&mut wb, |stream| {
+        if stream.feed(&server_bytes).is_err() {
+            return Err(ProtocolError::InternalCrateBug {
+                locus: bsql_pg_proto::CrateBugLocus::ReadCursorAdvance,
+            });
+        }
+        let mut row_count = 0_usize;
+        let mut saw_end_query = false;
+        let mut events_seen: std::vec::Vec<std::string::String> = std::vec::Vec::new();
+        for _ in 0..64_u32 {
+            match stream.col_next() {
+                ColEvent::Got { .. } => panic!("0-column DataRows must not emit Got events"),
+                ColEvent::Null { .. } => panic!("0-column DataRows must not emit Null events"),
+                ColEvent::EndRow => {
+                    events_seen.push("EndRow".into());
+                    row_count = row_count.saturating_add(1);
+                }
+                ColEvent::Chunk { .. } | ColEvent::ChunkEnd { .. } => {
+                    panic!("0-column rows must not chunk")
+                }
+                ColEvent::NeedMore => {
+                    events_seen.push("NeedMore".into());
+                    continue;
+                }
+                ColEvent::EndQuery { id, outcome } => {
+                    events_seen.push(format!("EndQuery(id={id:?}, ok={})", outcome.is_ok()));
+                    assert_eq!(id, Some(raw1), "EndQuery id matches in-flight reply");
+                    match outcome {
+                        Ok(Reply::QuerySuspended(_)) => {}
+                        other => panic!(
+                            "expected EndQuery {{ outcome: Ok(QuerySuspended) }}, got {other:?}; events: {events_seen:?}"
+                        ),
+                    }
+                    saw_end_query = true;
+                    break;
+                }
+                // ColEvent is `#[non_exhaustive]`; wildcard mandatory.
+                other => panic!("unexpected ColEvent variant: {other:?}"),
+            }
+        }
+        assert_eq!(row_count, 2, "must observe exactly 2 EndRow events before suspension; events: {events_seen:?}");
+        assert!(saw_end_query, "must observe EndQuery with QuerySuspended outcome; events: {events_seen:?}");
+        Ok(())
+    });
+    if let Err(e) = collect_result {
+        panic!("Phase 1 iter_rows errored: {e:?}");
+    }
+
+    // Step 2: ExecutePortal resume with All. Server returns 1 more
+    // DataRow + CommandComplete + RFQ — portal exhausted.
+    let (reply2, raw2) = mint_reply::<QueryKind>(&mut proto);
+    proto.push_or_panic(
+        ExecutePortal {
+            portal_name: &portal_unnamed(),
+            row_desc: Some(RowDesc::EMPTY),
+            fetch: FetchRows::All,
+            reply: reply2,
+        },
+        &mut wb,
+    );
+
+    let mut server_bytes = std::vec::Vec::new();
+    server_bytes.extend_from_slice(&empty_data_row_frame());
+    server_bytes.extend_from_slice(&command_complete_frame(b"SELECT 3"));
+    server_bytes.extend_from_slice(&rfq_frame(b'I'));
+
+    let collect_result: Result<(), ProtocolError> = proto.iter_rows(&mut wb, |stream| {
+        if stream.feed(&server_bytes).is_err() {
+            return Err(ProtocolError::InternalCrateBug {
+                locus: bsql_pg_proto::CrateBugLocus::ReadCursorAdvance,
+            });
+        }
+        let mut row_count = 0_usize;
+        let mut saw_end_query = false;
+        for _ in 0..64_u32 {
+            match stream.col_next() {
+                ColEvent::Got { .. } | ColEvent::Null { .. } => {
+                    panic!("0-column DataRows emit no Got/Null events")
+                }
+                ColEvent::EndRow => {
+                    row_count = row_count.saturating_add(1);
+                }
+                ColEvent::Chunk { .. } | ColEvent::ChunkEnd { .. } => panic!("no chunks"),
+                ColEvent::NeedMore => continue,
+                ColEvent::EndQuery { id, outcome } => {
+                    assert_eq!(id, Some(raw2), "Phase 2 EndQuery id matches resume reply");
+                    match outcome {
+                        Ok(Reply::QueryComplete(p)) => {
+                            assert_eq!(
+                                p.command_tag.as_str(),
+                                "SELECT 3",
+                                "command_tag carried from CommandComplete frame"
+                            );
+                        }
+                        other => panic!(
+                            "expected EndQuery {{ outcome: Ok(QueryComplete) }} on resume to exhaustion, got {other:?}"
+                        ),
+                    }
+                    saw_end_query = true;
+                    break;
+                }
+                other => panic!("unexpected ColEvent variant: {other:?}"),
+            }
+        }
+        assert_eq!(row_count, 1, "Phase 2 sees exactly 1 EndRow event");
+        assert!(
+            saw_end_query,
+            "Phase 2 EndQuery must observe QueryComplete (portal exhausted)"
+        );
+        Ok(())
+    });
+    if let Err(e) = collect_result {
+        panic!("Phase 2 iter_rows errored: {e:?}");
+    }
 }
 
 #[test]
