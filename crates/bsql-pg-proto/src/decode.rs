@@ -1260,10 +1260,6 @@ pub struct CopyHeader {
 /// Returns `Err(ProtocolError::TooManyColumns)` if
 /// `n_cols > MAX_ROW_COLUMNS`.
 #[cold]
-#[allow(
-    dead_code,
-    reason = "DEF-219 Phase 1 (foundation); Phase 2 (dispatch arms) wires the consumer"
-)]
 pub(crate) fn parse_copy_response_header(
     payload: &[u8],
 ) -> Result<CopyHeader, crate::error::ProtocolError> {
