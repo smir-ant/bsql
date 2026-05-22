@@ -1401,6 +1401,18 @@ impl<'p, 'w> RowStream<'p, 'w> {
                 core::hint::cold_path();
                 ColEvent::NeedMore
             }
+            Some(Action::IntermediateCommandComplete { .. }) => {
+                // DEF-226: multi-statement batch intermediate signal.
+                // SimpleQuery row-streaming via iter_rows would observe
+                // this only if a batch like `SELECT *; SELECT *;` is
+                // issued and a non-final statement's CommandComplete
+                // arrives while the iter_rows pull loop is active.
+                // Like Notify, iter_rows surfaces it as NeedMore — the
+                // top-level OutActions path is the observation point
+                // for intermediate command-complete tags.
+                core::hint::cold_path();
+                ColEvent::NeedMore
+            }
         }
     }
 

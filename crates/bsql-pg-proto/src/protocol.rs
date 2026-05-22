@@ -1982,16 +1982,20 @@ impl PgProtocol<DisconnectedPhase> {
                             StagedAction::SendBytesBorrowed(_)
                             | StagedAction::CloseSocket
                             | StagedAction::DeliverReply(_)
-                            | StagedAction::Notify { .. } => {
+                            | StagedAction::Notify { .. }
+                            | StagedAction::IntermediateCommandComplete { .. } => {
                                 // compute_push_startup_idle_only emits
                                 // only SendBytesRange (StartupMessage)
                                 // + post_install. Other variants are
                                 // architecturally unreachable from
                                 // this push path. `Notify` is staged
                                 // by the dispatch pre-filter on `'A'`
-                                // tags during `feed_bytes`, never by
-                                // a push path. Skip silently rather
-                                // than panic (CREDO §V); a future
+                                // tags during `feed_bytes`;
+                                // `IntermediateCommandComplete` by the
+                                // SimpleQueryAwaitingRfq + C arm
+                                // (DEF-226). Both feed-path-only.
+                                // Skip silently rather than panic
+                                // (CREDO §V); a future
                                 // refactor adding emits would surface
                                 // via test failure (no actions in out).
                             }
@@ -3374,12 +3378,16 @@ impl PgProtocol<ActivePhase> {
                             });
                         }
                     }
-                    StagedAction::Notify { .. } => {
+                    StagedAction::Notify { .. }
+                    | StagedAction::IntermediateCommandComplete { .. } => {
                         // DEF-220: Notify is staged ONLY by the dispatch
-                        // pre-filter on `'A'` tags during feed_bytes —
-                        // never by a push path. Reaching here from a
-                        // push materialise is architecturally dead;
-                        // classify silently to preserve the
+                        // pre-filter on `'A'` tags during feed_bytes;
+                        // DEF-226: IntermediateCommandComplete by the
+                        // SimpleQueryAwaitingRfq + C/T/I arms. Both
+                        // feed-path-only — never by a push path.
+                        // Reaching here from a push materialise is
+                        // architecturally dead; classify silently to
+                        // preserve the
                         // staged-action accounting invariant.
                         core::hint::cold_path();
                     }
@@ -7831,6 +7839,13 @@ fn materialise<'w, 'r>(
             // `PgProtocol::get_notification` within the OutActions
             // iteration cycle.
             StagedAction::Notify { pid, notif_ref } => Action::Notify { pid, notif_ref },
+            // DEF-226: IntermediateCommandComplete passes through —
+            // `tag: BoundedStr<32>` is `Copy`, no schema resolution
+            // at materialise time. The wrapper observes the tag by
+            // value in the OutActions iteration cycle.
+            StagedAction::IntermediateCommandComplete { tag } => {
+                Action::IntermediateCommandComplete { tag }
+            }
         };
         push_within_fanout_budget(&mut out, a);
     }
@@ -8540,6 +8555,10 @@ mod compute_push_tests {
                 // observing actions sees `CloseSocket` and either
                 // tolerates it or fails on the unexpected variant).
                 StagedAction::Notify { .. } => Self::CloseSocket,
+                // DEF-226: IntermediateCommandComplete — same
+                // sentinel-CloseSocket mapping; no cfg(test) PgCommand
+                // fixture exercises multi-statement batch dispatch.
+                StagedAction::IntermediateCommandComplete { .. } => Self::CloseSocket,
             }
         }
     }

@@ -799,6 +799,85 @@ pub(crate) fn dispatch(
                 Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
             }
         }
+        // DEF-226 multi-statement batch: PG SimpleQuery (Q frame)
+        // accepts `;`-separated batches like
+        // `"BEGIN; UPDATE; UPDATE; COMMIT;"`. Server emits one
+        // CommandComplete per statement followed by a single final
+        // RFQ. Pre-DEF-226 a second CommandComplete arriving in
+        // AwaitingRfq hit the wildcard `UnexpectedFrame` teardown
+        // below; post-DEF-226 each non-final CommandComplete /
+        // RowDescription / EmptyQueryResponse emits
+        // `Action::IntermediateCommandComplete` carrying the PRIOR
+        // statement's tag, and the state cycles back into the next
+        // statement's response pattern (preserving the in-flight
+        // `ReplyId`). The final RFQ arm above produces the standard
+        // `Reply::QueryComplete` carrying the LAST statement's tag.
+        (ProtoState::SimpleQueryAwaitingRfq { reply, command_tag: prior_tag }, TAG_COMMAND_COMPLETE) => {
+            // Parse the new statement's tag. On success: emit
+            // intermediate signal for the prior tag, replace state's
+            // tag with the new one, stay in AwaitingRfq.
+            match parse_command_tag(payload) {
+                Ok(new_tag) => {
+                    *state = ProtoState::SimpleQueryAwaitingRfq {
+                        reply,
+                        command_tag: new_tag,
+                    };
+                    DispatchOutcome::AdvancedWithAction {
+                        action: crate::action::StagedAction::IntermediateCommandComplete {
+                            tag: prior_tag,
+                        },
+                    }
+                }
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+            }
+        }
+        (ProtoState::SimpleQueryAwaitingRfq { reply, command_tag: prior_tag }, TAG_ROW_DESCRIPTION) => {
+            // Next statement is a SELECT. Emit intermediate signal
+            // for prior tag, parse + park the new RowDesc, transition
+            // back to StreamingRows preserving reply_id.
+            match crate::decode::parse_row_description(payload) {
+                Ok(row_desc) => {
+                    _row_description_dispatch_leaf::park_row_description_at_dispatch(
+                        row_desc_slot,
+                        row_desc,
+                    );
+                    *state = ProtoState::SimpleQueryStreamingRows { reply };
+                    DispatchOutcome::AdvancedWithAction {
+                        action: crate::action::StagedAction::IntermediateCommandComplete {
+                            tag: prior_tag,
+                        },
+                    }
+                }
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+            }
+        }
+        (ProtoState::SimpleQueryAwaitingRfq { reply, command_tag: prior_tag }, TAG_EMPTY_QUERY_RESPONSE) => {
+            // Next statement is empty (e.g., `;;`). Emit intermediate
+            // for prior tag, replace state's tag with empty (matches
+            // SimpleQueryAwaitingFirstResponse + EmptyQueryResponse
+            // path's empty-tag transition).
+            match validate_empty_body(payload, TAG_EMPTY_QUERY_RESPONSE) {
+                Ok(()) => {
+                    *state = ProtoState::SimpleQueryAwaitingRfq {
+                        reply,
+                        command_tag: crate::error::BoundedStr::default(),
+                    };
+                    DispatchOutcome::AdvancedWithAction {
+                        action: crate::action::StagedAction::IntermediateCommandComplete {
+                            tag: prior_tag,
+                        },
+                    }
+                }
+                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+            }
+        }
+        (ProtoState::SimpleQueryAwaitingRfq { reply, .. }, TAG_ERROR_RESPONSE) => {
+            // Mid-batch error — drain to RFQ via standard recoverable
+            // path. Intermediate tags up to this point are observable
+            // via the stream; the final reply is FailReply, NOT
+            // QueryComplete with the last successful tag.
+            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+        }
         (ProtoState::SimpleQueryAwaitingRfq { reply, .. }, other) => {
             install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }

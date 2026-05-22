@@ -837,6 +837,28 @@ pub enum Action<'w, 'r> {
         /// via [`crate::PgProtocol::get_notification`].
         notif_ref: crate::notifications_arena::NotificationRef,
     },
+
+    /// Multi-statement batch intermediate command-complete signal
+    /// (DEF-226). PG SimpleQuery (Q frame) accepts `;`-separated
+    /// batches like `"BEGIN; UPDATE; UPDATE; COMMIT;"` — the
+    /// server emits one CommandComplete per statement followed by
+    /// a single final RFQ. Pre-DEF-226 the second CommandComplete
+    /// arriving in `SimpleQueryAwaitingRfq` triggered
+    /// `UnexpectedFrame` teardown; post-DEF-226 each non-final
+    /// CommandComplete / RowDescription / EmptyQueryResponse emits
+    /// this variant carrying the PRIOR statement's tag, and the
+    /// state cycles back into the next statement's response
+    /// pattern (preserving the in-flight `ReplyId`).
+    ///
+    /// Caller observes one `IntermediateCommandComplete` per
+    /// non-final statement + one final
+    /// `DeliverReply { Reply::QueryComplete }` carrying the LAST
+    /// statement's tag + transaction status.
+    IntermediateCommandComplete {
+        /// Command tag from the just-completed statement (e.g.,
+        /// `"BEGIN"`, `"UPDATE 3"`, `"COMMIT"`).
+        tag: crate::error::BoundedStr<32>,
+    },
 }
 
 /// One-event-per-call feed signal.
@@ -1145,6 +1167,19 @@ pub(crate) enum StagedAction<'sql> {
         pid: i32,
         /// Gen-tagged arena handle.
         notif_ref: crate::notifications_arena::NotificationRef,
+    },
+    /// Map to [`Action::IntermediateCommandComplete`] — DEF-226
+    /// multi-statement SimpleQuery support. Emitted by the
+    /// `SimpleQueryAwaitingRfq` dispatch arms when a SECOND+
+    /// CommandComplete / RowDescription / EmptyQueryResponse arrives
+    /// before RFQ (i.e., the original Q frame batched multiple
+    /// statements). Carries the PRIOR statement's command_tag by
+    /// value; the state retains the NEW tag for subsequent
+    /// transitions.
+    IntermediateCommandComplete {
+        /// Command tag from the just-completed statement in a
+        /// multi-statement batch.
+        tag: crate::error::BoundedStr<32>,
     },
 }
 
