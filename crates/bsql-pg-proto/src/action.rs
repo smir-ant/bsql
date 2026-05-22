@@ -1907,21 +1907,31 @@ impl<'r> DescribedRows<'r> {
 //
 // - `align(4)` matches the natural alignment of `[u32; _]` — no
 //   drift possible if future code reorders the fields.
-// - `repr(C)` nails field order: `n_params: u16` at offset 0,
-//   2 bytes padding, `oids` at offset 4, no trailing pad (total
-//   = 4 + 16*4 = 68).
+// - `repr(C)` nails field order: `n_params: BoundedU8<MAX>` at
+//   offset 0 (1 B + 3 B padding), `oids` at offset 4, no trailing
+//   pad (total = 4 + 16*4 = 68).
 //
-// The padding bytes at offsets 2..4 are ALWAYS zero via the
+// DEF-165 (2026-05-23): migrated `n_params` from `u16` to
+// `BoundedU8<MAX_PARAMS_ARITY>`. Tier-3 by-validation → tier-1
+// by-construction: the type itself enforces `0 ≤ n_params ≤
+// MAX_PARAMS_ARITY (= 16)`. A future refactor that constructs a
+// `ParamOids` with `n_params > MAX_PARAMS_ARITY` is a compile error
+// (BoundedU8's NonZeroU8-backed offset-by-one storage rejects
+// out-of-range values at the `try_new` / `new_const` constructor).
+// Size unchanged at 68 B (align(4) absorbs the 1-byte field into
+// the same 4-byte slot the u16 occupied).
+//
+// The padding bytes at offsets 1..4 are ALWAYS zero via the
 // `EMPTY` / `from_parts` constructors (both initialise `oids` from
-// a fully-populated `[u32; N]`, and the `n_params: u16` slot leaves
-// its two padding bytes untouched — `Copy` struct init zeroes
+// a fully-populated `[u32; N]`, and the `n_params: BoundedU8` slot
+// leaves its 3 padding bytes untouched — `Copy` struct init zeroes
 // padding in practice, but to remain portable across future
 // refactors, the `const _: () = assert!` below pins size and
 // alignment so any drift fails the build.
 #[derive(Debug, Clone, Copy)]
 #[repr(C, align(4))]
 pub struct ParamOids {
-    n_params: u16,
+    n_params: crate::bounded::BoundedU8<{ crate::params::MAX_PARAMS_ARITY }>,
     oids: [u32; crate::params::MAX_PARAMS_ARITY],
 }
 
@@ -1960,16 +1970,24 @@ impl ParamOids {
     /// Empty descriptor (0 parameters). Used as the default for
     /// statements that declare no parameters.
     pub const EMPTY: Self = Self {
-        n_params: 0,
+        n_params: crate::bounded::BoundedU8::ZERO,
         oids: [0; crate::params::MAX_PARAMS_ARITY],
     };
 
     /// Construct from a populated count + a full-capacity OID array.
     /// `pub(crate)` — only the parser creates these; users read.
+    ///
+    /// `n_params: BoundedU8<MAX_PARAMS_ARITY>` enforces the
+    /// `0 ≤ n ≤ MAX_PARAMS_ARITY` invariant at the type level
+    /// (DEF-165). Callers parsing the wire frame validate the
+    /// declared count against MAX_PARAMS_ARITY first, then construct
+    /// a BoundedU8 via `try_new` — the out-of-range case classifies
+    /// as `ProtocolError::TooManyParameters` BEFORE reaching this
+    /// constructor.
     #[inline]
     #[must_use]
     pub(crate) const fn from_parts(
-        n_params: u16,
+        n_params: crate::bounded::BoundedU8<{ crate::params::MAX_PARAMS_ARITY }>,
         oids: [u32; crate::params::MAX_PARAMS_ARITY],
     ) -> Self {
         Self { n_params, oids }
@@ -1979,14 +1997,14 @@ impl ParamOids {
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        usize::from(self.n_params)
+        usize::from(self.n_params.get())
     }
 
     /// Whether the descriptor carries any parameters.
     #[inline]
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.n_params == 0
+    pub fn is_empty(&self) -> bool {
+        self.n_params.get() == 0
     }
 
     /// Borrow the populated OIDs as a slice — tail default-filled
@@ -2058,7 +2076,7 @@ impl ParamOids {
 //    overhead.
 impl PartialEq for ParamOids {
     fn eq(&self, other: &Self) -> bool {
-        self.n_params == other.n_params && self.oids == other.oids
+        self.n_params.get() == other.n_params.get() && self.oids == other.oids
     }
 }
 impl Eq for ParamOids {}

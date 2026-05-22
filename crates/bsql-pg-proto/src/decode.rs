@@ -1156,10 +1156,15 @@ pub(crate) fn parse_parameter_description(
     let n_params = u16::try_from(n_params_i16).map_err(|_| malformed())?;
     let n_params_usize = usize::from(n_params);
 
-    // Tier-2 structural: reject counts too high for inline storage.
+    // Tier-1 structural: reject counts too high for inline storage.
     // MAX_PARAMS_ARITY matches the Bind-side cap — receiving more
     // OIDs than we can ever Bind against means the describe result
-    // is useless downstream.
+    // is useless downstream. Per DEF-165, the validated count flows
+    // into a `BoundedU8<MAX_PARAMS_ARITY>` field at the
+    // `from_parts` call below — the type itself rejects out-of-range
+    // values, so this check + the typed witness together form a
+    // tier-1 by-construction proof that `n_params ≤ MAX_PARAMS_ARITY`
+    // at every observation point.
     if n_params_usize > crate::params::MAX_PARAMS_ARITY {
         return Err(ProtocolError::TooManyParameters {
             count: n_params_usize,
@@ -1189,7 +1194,22 @@ pub(crate) fn parse_parameter_description(
         cursor = tail;
     }
 
-    Ok(crate::action::ParamOids::from_parts(n_params, oids))
+    // Convert validated u16 → BoundedU8<MAX_PARAMS_ARITY> (DEF-165).
+    // The `n_params_usize ≤ MAX_PARAMS_ARITY (= 16 < 256)` check
+    // above proves the u8 narrow is lossless, and `try_new` rejects
+    // out-of-range — both arms folded into one classified
+    // `MalformedParameterDescription` early-return for the
+    // architecturally-dead case (the upstream bounds check covers
+    // it).
+    let n_params_u8 = match u8::try_from(n_params_usize) {
+        Ok(v) => v,
+        Err(_) => return Err(malformed()),
+    };
+    let n_params_bounded = match crate::bounded::BoundedU8::<{ crate::params::MAX_PARAMS_ARITY }>::try_new(n_params_u8) {
+        Some(b) => b,
+        None => return Err(malformed()),
+    };
+    Ok(crate::action::ParamOids::from_parts(n_params_bounded, oids))
 }
 
 // ════════════════════════════════════════════════════════════════════
