@@ -4050,6 +4050,34 @@ where
             );
         }
 
+        // DEF-243: eager `read_buf.clear()` at the install_errored
+        // transition site (post-loop).
+        //
+        // Pre-DEF-243 path: if a dispatch arm installed Errored
+        // mid-loop (or the InternalCrateBug branch above triggered
+        // fail_inflight_no_readbuf), the read_buf bytes sat in the
+        // backing array un-scrubbed until either:
+        //   (a) the NEXT `feed_bytes` call hit the `AlreadyErrored`
+        //       arm and cleared (window ~one feed_bytes interval), or
+        //   (b) `Drop` fired on connection discard.
+        //
+        // The window left secret-correlated bytes in memory beyond
+        // strict need — SCRAM server-frame fragments (`v=<sig>`),
+        // ErrorResponse detail strings (may carry server-side
+        // operator data), partial frame bodies. The Drop path
+        // (DEF-185 P0-C zeroize-on-Drop) was the safety net, but
+        // the wrapper layer may delay Drop arbitrarily (connection
+        // pool, async handoff). Eager-clear here closes the window.
+        //
+        // Cost: one `matches!()` branch per feed_bytes (sub-ns on
+        // the happy non-Errored path; LLVM elides via cold-path
+        // hint) + one `clear()` call on the cold Errored exit path
+        // (O(populated_len) memset, ≤4 KiB read_buf cap).
+        if matches!(state, ProtoState::Errored(_)) {
+            core::hint::cold_path();
+            read_buf.clear();
+        }
+
         // Dispatch may have written to `terminal_row_desc` during
         // the loop (Z arms park schemas). NLL ends the dispatch
         // loop's `&mut` reborrow at the loop close brace above;
