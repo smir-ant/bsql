@@ -1080,7 +1080,32 @@ pub struct PushFailure {
     /// - `ProtocolError::InternalCrateBug { locus }` — builder
     ///   capacity overflow or empty write range (architecturally-dead
     ///   per const-asserts in `write_buf.rs`).
-    pub cause: ProtocolError,
+    ///
+    /// DEF-286 Φ2' (PushFailure-only Box hybrid, 2026-05-23):
+    /// heap-boxed. Pre-Φ2' shape was inline `ProtocolError` (72 B),
+    /// making PushFailure 80 B. Boxing shrinks PushFailure 80 → 16 B
+    /// (-80%) — every push-call failure return frame is 64 B
+    /// smaller. PushFailure was already `Clone`-only (not `Copy`);
+    /// Box is `Clone` so no API break beyond the field type.
+    /// Consumers use `failure.cause.kind()` / `&*failure.cause` —
+    /// both work through Box's auto-deref.
+    ///
+    /// **Hybrid rationale**: full Phase B (Box also in `Action` /
+    /// `FeedEvent` / `StagedAction` / `DispatchOutcome`) bench-stable
+    /// FAIL'd at +83% on `push_command/ping`. Root cause: Action
+    /// lost `Copy` → `heapless::Vec<Action>` Drop chain propagated
+    /// to success paths.
+    ///
+    /// PushFailure has **no `heapless::Vec` involvement** (return-
+    /// by-value, not vec-stored). Box cascade isolated to the
+    /// failure return frame. Safe footprint win.
+    ///
+    /// Phase B'' Arena pattern (DEFERRED): switch all FailReply
+    /// cause fields to `ProtocolErrorRef<'r>` Copy borrows for the
+    /// Action/OutActions cascade. See deferred.md DEF-286 Φ2''.
+    ///
+    /// One alloc per emitted PushFailure (cold path).
+    pub cause: alloc::boxed::Box<ProtocolError>,
 }
 
 /// Failure classification for the COPY IN push methods

@@ -2052,9 +2052,11 @@ impl PgProtocol<DisconnectedPhase> {
                 core::hint::cold_path();
                 return Err(crate::action::PushFailure {
                     id: reply.consume(),
-                    cause: crate::error::ProtocolError::InternalCrateBug {
-                        locus: crate::error::CrateBugLocus::PushCommandInternalNonIdle,
-                    },
+                    cause: alloc::boxed::Box::new(
+                        crate::error::ProtocolError::InternalCrateBug {
+                            locus: crate::error::CrateBugLocus::PushCommandInternalNonIdle,
+                        },
+                    ),
                 });
             }
         };
@@ -2092,7 +2094,14 @@ impl PgProtocol<DisconnectedPhase> {
                         match sa {
                             StagedAction::FailReply { id, cause } => {
                                 if failure.is_none() {
-                                    failure = Some(crate::action::PushFailure { id, cause });
+                                    // DEF-286 Φ2': Box wrap at the
+                                    // PushFailure boundary; staged
+                                    // cause is still inline
+                                    // (StagedAction unchanged).
+                                    failure = Some(crate::action::PushFailure {
+                                        id,
+                                        cause: alloc::boxed::Box::new(cause),
+                                    });
                                 }
                             }
                             StagedAction::SendBytesRange(range) => {
@@ -3429,9 +3438,11 @@ impl PgProtocol<ActivePhase> {
                 core::hint::cold_path();
                 return Err(crate::action::PushFailure {
                     id: crate::reply_id::CRATE_BUG_REPLY_ID_SENTINEL,
-                    cause: crate::error::ProtocolError::InternalCrateBug {
-                        locus: crate::error::CrateBugLocus::PushCommandInternalNonIdle,
-                    },
+                    cause: alloc::boxed::Box::new(
+                        crate::error::ProtocolError::InternalCrateBug {
+                            locus: crate::error::CrateBugLocus::PushCommandInternalNonIdle,
+                        },
+                    ),
                 });
             }
         };
@@ -3488,7 +3499,11 @@ impl PgProtocol<ActivePhase> {
                     // accounting invariant intact for any future audit).
                     StagedAction::FailReply { id, cause } => {
                         if failure.is_none() {
-                            failure = Some(crate::action::PushFailure { id, cause });
+                            // DEF-286 Φ2': Box wrap at PushFailure boundary.
+                            failure = Some(crate::action::PushFailure {
+                                id,
+                                cause: alloc::boxed::Box::new(cause),
+                            });
                         }
                     }
                     StagedAction::SendBytesRange(range) => {
@@ -3545,9 +3560,11 @@ impl PgProtocol<ActivePhase> {
                         if failure.is_none() {
                             failure = Some(crate::action::PushFailure {
                                 id: crate::reply_id::CRATE_BUG_REPLY_ID_SENTINEL,
-                                cause: crate::error::ProtocolError::InternalCrateBug {
-                                    locus: crate::error::CrateBugLocus::PushEmittedDeliverReply,
-                                },
+                                cause: alloc::boxed::Box::new(
+                                    crate::error::ProtocolError::InternalCrateBug {
+                                        locus: crate::error::CrateBugLocus::PushEmittedDeliverReply,
+                                    },
+                                ),
                             });
                         }
                     }
@@ -9516,7 +9533,7 @@ mod compute_push_tests {
         );
         assert!(
             matches!(
-                failure.cause,
+                &*failure.cause,
                 ProtocolError::InternalCrateBug {
                     locus: CrateBugLocus::ParamsWriterOverflow,
                 },

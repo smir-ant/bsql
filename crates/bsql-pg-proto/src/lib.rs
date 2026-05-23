@@ -932,18 +932,21 @@ const _: () = assert!(
 // `ProtocolError == 72` pin catches drift at the source; this pin
 // catches the propagation.
 const _: () = assert!(
-    core::mem::size_of::<action::PushFailure>() == 80,
-    "PushFailure exact size — 80 B (NonZeroU64 8 B + ProtocolError 72 B). \
-     If this trips: (a) ProtocolError grew past 72 B (check sibling pin \
-     at action::PushFailure docstring + error.rs ProtocolError pin), \
-     or (b) NonZeroU64 alignment changed (architecturally impossible \
-     under stable Rust). Cascade impact: Result<(), PushFailure> return \
-     frame on push paths grows in lockstep.",
+    core::mem::size_of::<action::PushFailure>() == 16,
+    "PushFailure exact size — 16 B post-DEF-286 Φ2' (was 80 B \
+     pre-Φ2': NonZeroU64 8 + ProtocolError 72 inline). Φ2' boxed \
+     cause: NonZeroU64 8 + Box<ProtocolError> 8 = 16 B (-80%). \
+     Cascade impact: Result<(), PushFailure> return frame on push \
+     paths shrinks 64 B per call. \
+     \
+     If this trips: (a) Box semantics changed (architecturally \
+     impossible under stable Rust), or (b) PushFailure gained a \
+     non-niche field that consumed the NonZeroU64 niche slot.",
 );
 const _: () = assert!(
-    core::mem::size_of::<Option<action::PushFailure>>() == 80,
-    "Option<PushFailure> niche-pack — must stay 80 B via the NonZeroU64 \
-     niche on PushFailure.id. If this regresses to 88 B (or higher), \
+    core::mem::size_of::<Option<action::PushFailure>>() == 16,
+    "Option<PushFailure> niche-pack — must stay 16 B via the NonZeroU64 \
+     niche on PushFailure.id (post-DEF-286 Φ2'). If this regresses, \
      the niche optimisation was lost — likely cause: a non-niche field \
      added to PushFailure that consumed the discriminant slot.",
 );
