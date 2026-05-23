@@ -2613,6 +2613,30 @@ impl ParsedServerError {
 
 /// Parse an ErrorResponse payload into a classified error.
 ///
+/// DEF-219-residue audit follow-up (DEF-248 Sub-B): the per-field
+/// inline cap (`MAX_ERROR_FIELDS`) and the largest per-field byte
+/// budget (`MAX_ERROR_RESPONSE_FIELD_BYTES`) are promoted to
+/// crate-visible consts so [`crate::partial_assembly::PREFIX_CAP`]'s
+/// lower-bound assertion can derive its floor from these source-of-
+/// truth values instead of repeating a hand-derived `5 * 1024`
+/// literal. Drift between parser caps and PREFIX_CAP would risk
+/// observational-inequivalence in the stream-and-truncate
+/// universal-coverage path.
+pub(crate) const MAX_ERROR_FIELDS: usize = 32;
+
+/// Largest per-field typed-output byte budget across the
+/// `parse_error_response` arms. Drives the [`crate::partial_assembly::PREFIX_CAP`]
+/// lower-bound assertion. The 128-byte ceiling is the `message`
+/// field's [`crate::error::SecretBoundedStr<128>`] cap; detail/hint
+/// use smaller caps (`<96>`/`<64>`).
+pub(crate) const MAX_ERROR_RESPONSE_FIELD_BYTES: usize = 128;
+
+/// Per-field framing overhead in the wire body: 1 byte field-code
+/// tag + 1 byte NUL terminator. Each field contributes
+/// `MAX_ERROR_RESPONSE_FIELD_BYTES + ERROR_FIELD_FRAMING_OVERHEAD`
+/// bytes worst-case in the inline-bounded parser-read region.
+pub(crate) const ERROR_FIELD_FRAMING_OVERHEAD: usize = 2;
+
 /// PG ErrorResponse body: series of typed fields, each = type-byte +
 /// NUL-terminated string. Terminated by a bare NUL (0x00). We extract
 /// 'S' (severity), 'C' (code), 'M' (message), 'D' (detail), 'H' (hint).
@@ -2666,7 +2690,14 @@ fn parse_error_response(
     // O(field_count) regardless of frame size. Tier-2 structural —
     // the invariant is enforced by the `for _ in 0..N` bound, not
     // an audit of `pos` math.
-    const MAX_ERROR_FIELDS: usize = 32;
+    //
+    // **Module-level const reference**: `MAX_ERROR_FIELDS` is the
+    // module-level `pub(crate)` const declared above; it is the
+    // source-of-truth value that `partial_assembly::PREFIX_CAP`'s
+    // lower-bound assertion derives its floor from. The local
+    // alias here keeps the existing arm body's `MAX_ERROR_FIELDS`
+    // unqualified references working with no body changes.
+    const MAX_ERROR_FIELDS: usize = self::MAX_ERROR_FIELDS;
 
     // Drift pin: typed arms below extract structured fields into
     // named locals (severity / code / message / detail / hint). If

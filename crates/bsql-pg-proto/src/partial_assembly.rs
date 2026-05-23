@@ -211,26 +211,45 @@ use alloc::boxed::Box;
 pub(crate) const PREFIX_CAP: usize = 8192;
 
 // `PREFIX_CAP` must comfortably hold the worst-case `parse_error_response`
-// inline-output ceiling (≤ 5 KB derivation in the module doc).
+// inline-output ceiling.
 //
-// **What this floor means** (so a future reader is not confused): the
-// parser-actually-reads worst case is ≈ 4.2 KB analytically. The floor
-// is 5 KB rather than 4.2 KB to cover the analytical-vs-actual gap
-// (alternate UTF-8 encoding paths can push a few hundred bytes above
-// the 130-B/field assumption). Going below 5 KB risks accidentally
-// truncating a typed E-field below its prefix-buffered byte range,
-// which would be observationally distinguishable from inline arrival —
-// breaking the stream-and-truncate observational-equivalence contract.
+// **Const-derived floor (DEF-248 Sub-B follow-up)**: previously this
+// pin used a hand-derived `5 * 1024` literal explained in the comment
+// only. The follow-up — promoting `MAX_ERROR_FIELDS` +
+// `MAX_ERROR_RESPONSE_FIELD_BYTES` + `ERROR_FIELD_FRAMING_OVERHEAD`
+// to `pub(crate)` consts in `dispatch.rs` — lets us compute the
+// floor directly from the parser's source-of-truth values. Drift
+// detection: bumping any of `MAX_ERROR_FIELDS` (32), the largest
+// per-field cap (128, from `SecretBoundedStr<128>` on the message
+// field), or the framing overhead (2 B = field-code byte + NUL)
+// re-runs this assertion automatically.
 //
-// Going ABOVE 5 KB is always safe; the chosen value (8 KB) sits above
-// the floor for future-proof + power-of-2-alignment reasons (see the
+// **What this floor means**: every wire-legal ErrorResponse body
+// produces an observationally-equivalent decoded `ProtocolError`
+// regardless of total declared length, BECAUSE the prefix buffer
+// holds at least as many bytes as the parser will read. The
+// parser's `MAX_ERROR_FIELDS` for-loop reads at most
+// `MAX_ERROR_FIELDS × (MAX_ERROR_RESPONSE_FIELD_BYTES +
+// ERROR_FIELD_FRAMING_OVERHEAD)` bytes — beyond which the truncated
+// tail is observationally invisible (the parser stops reading).
+//
+// The chosen value (8 KB) sits above this floor with ~1.9× headroom
+// for future-proof + power-of-2 alignment reasons (see the
 // `PREFIX_CAP` const docstring).
+const PARSE_ERROR_RESPONSE_WORST_CASE_BYTES: usize =
+    crate::dispatch::MAX_ERROR_FIELDS
+        .saturating_mul(
+            crate::dispatch::MAX_ERROR_RESPONSE_FIELD_BYTES
+                .saturating_add(crate::dispatch::ERROR_FIELD_FRAMING_OVERHEAD),
+        );
+
 const _: () = assert!(
-    PREFIX_CAP >= 5 * 1024,
-    "PREFIX_CAP must hold parse_error_response's 32-field × ~130 B \
-     bounded output (≈ 4.2 KB ceiling) with safety headroom. \
-     Bumping below 5 KB risks dropping a typed E-field below its \
-     prefix-buffered byte range.",
+    PREFIX_CAP >= PARSE_ERROR_RESPONSE_WORST_CASE_BYTES,
+    "PREFIX_CAP must hold parse_error_response's worst-case \
+     inline-output read: MAX_ERROR_FIELDS × \
+     (MAX_ERROR_RESPONSE_FIELD_BYTES + ERROR_FIELD_FRAMING_OVERHEAD). \
+     Dropping below this floor risks observationally-distinguishable \
+     truncation of a typed E-field on the stream-and-truncate path.",
 );
 
 // `PREFIX_CAP` must fit in u32 — the sink's `body_remaining` counter is
