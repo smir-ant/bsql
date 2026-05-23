@@ -482,6 +482,19 @@ pub(crate) fn error_arena_or_init(
     })
 }
 
+/// Lazy-init helper for `Option<Box<CommandTagsArena>>` (DEF-286 Φ-D).
+/// Called by `dispatch.rs` DEF-226 multi-statement arms when an
+/// intermediate command-complete tag needs to be externalised for
+/// `Action::IntermediateCommandComplete`.
+#[inline]
+pub(crate) fn command_tags_arena_or_init(
+    slot: &mut Option<alloc::boxed::Box<crate::command_tags_arena::CommandTagsArena>>,
+) -> &mut crate::command_tags_arena::CommandTagsArena {
+    slot.get_or_insert_with(|| {
+        alloc::boxed::Box::new(crate::command_tags_arena::CommandTagsArena::new())
+    })
+}
+
 /// Per-phase Inner for `<ConnectingPhase>`.
 ///
 /// Every `SealedPhase` now points at a per-phase Inner:
@@ -610,6 +623,14 @@ pub struct ActiveInner {
     /// `Box<CopyChunksArena>` for the connection's lifetime. Cleared
     /// per `feed_bytes` cycle.
     copy_chunks_arena: Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
+    /// Lazy-init slot for DEF-226 multi-statement intermediate
+    /// command tags (DEF-286 Φ-D). Mirror of `notifications_arena`.
+    /// Connections that never use batched SimpleQuery pay zero; first
+    /// `IntermediateCommandComplete` emission allocates one
+    /// `Box<CommandTagsArena>` for the connection's lifetime.
+    /// Cleared per `feed_bytes` cycle (refs from prior cycles
+    /// resolve `ArenaError::Stale`).
+    command_tags_arena: Option<alloc::boxed::Box<crate::command_tags_arena::CommandTagsArena>>,
     /// Spill buffer for oversize ErrorResponse / NoticeResponse
     /// frames during query execution.
     partial_assembly: crate::partial_assembly::PartialAssemblyCell,
@@ -715,6 +736,14 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
     /// transient empty slot (LISTEN-arena mirror pattern).
     pub(in crate::protocol) copy_chunks_arena:
         &'r mut Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
+    /// DEF-286 Φ-D: intermediate command-tag arena threaded from
+    /// `ActiveInner.command_tags_arena`. Connecting phase uses
+    /// transient empty slot (post-handshake only — same lazy-arena
+    /// mirror pattern as `notifications_arena` / `copy_chunks_arena`).
+    /// Used by DEF-226 multi-statement dispatch arms to externalise
+    /// the prior tag for `Action::IntermediateCommandComplete`.
+    pub(in crate::protocol) command_tags_arena:
+        &'r mut Option<alloc::boxed::Box<crate::command_tags_arena::CommandTagsArena>>,
     pub(in crate::protocol) partial_assembly:
         &'r mut crate::partial_assembly::PartialAssemblyCell,
     pub(in crate::protocol) malformed_count: &'r mut u32,
@@ -1841,6 +1870,7 @@ pub(crate) mod _proto_init_leaf {
             error_arena: None,
             notifications_arena: None,
             copy_chunks_arena: None,
+            command_tags_arena: None,
             partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
             // Placeholder backend_key for test-only fixture.
             // Production construction goes through
@@ -2393,6 +2423,7 @@ impl PgProtocol<ConnectingPhase> {
                     error_arena,
                     notifications_arena: None,
                     copy_chunks_arena: None,
+                    command_tags_arena: None,
                     partial_assembly,
                     backend_key: crate::cancel::BackendKey { pid, secret_key },
                     malformed_frame_count,
@@ -3936,6 +3967,7 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
     error_arena: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
     notifications_arena: &mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
     copy_chunks_arena: &mut Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
+    command_tags_arena: &mut Option<alloc::boxed::Box<crate::command_tags_arena::CommandTagsArena>>,
     partial_assembly: &mut crate::partial_assembly::PartialAssemblyCell,
     class: crate::state::StatePushClass,
 ) {
@@ -3967,6 +3999,13 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
             if let Some(arena) = copy_chunks_arena.as_deref_mut() {
                 arena.clear();
             }
+            // DEF-286 Φ-D: clear intermediate command-tags arena.
+            // Refs issued in prior cycles become Stale here; the
+            // wrapper's OutActions iteration is complete by the time
+            // the next push transitions back to Idle.
+            if let Some(arena) = command_tags_arena.as_deref_mut() {
+                arena.clear();
+            }
             _clear_residue_leaf::clear_partial_assembly_residue(partial_assembly);
         }
         crate::state::StatePushClass::Errored(_) => {
@@ -3988,6 +4027,10 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
             }
             // DEF-219 Phase 3: same for copy chunks arena.
             if let Some(arena) = copy_chunks_arena.as_deref_mut() {
+                arena.clear();
+            }
+            // DEF-286 Φ-D: same for intermediate command-tags arena.
+            if let Some(arena) = command_tags_arena.as_deref_mut() {
                 arena.clear();
             }
             // Session-state forfeit on tear-down;
@@ -4066,6 +4109,7 @@ where
         error_arena: error_arena_slot,
         notifications_arena: notifications_arena_slot,
         copy_chunks_arena: copy_chunks_arena_slot,
+        command_tags_arena: command_tags_arena_slot,
         partial_assembly: partial_assembly_slot,
         malformed_count: malformed_counter,
     } = ctx;
@@ -4086,6 +4130,7 @@ where
         error_arena_slot,
         notifications_arena_slot,
         copy_chunks_arena_slot,
+        command_tags_arena_slot,
         partial_assembly_slot,
         entry_class,
     );
@@ -4265,6 +4310,7 @@ where
                 terminal_command_tag,
                 error_arena_slot,
                 copy_chunks_arena_slot,
+                command_tags_arena_slot,
             );
             match outcome {
                 DispatchOutcome::AdvancedSilent => {
@@ -4489,6 +4535,7 @@ where
                         terminal_command_tag,
                         error_arena_slot,
                         copy_chunks_arena_slot,
+                        command_tags_arena_slot,
                     );
                     match outcome {
                         DispatchOutcome::AdvancedSilent => {
@@ -4776,6 +4823,11 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     // (COPY is post-handshake; never fires in Connecting state).
     let mut transient_copy_chunks_arena:
         Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>> = None;
+    // DEF-286 Φ-D: intermediate command-tags arena transient for
+    // Connecting (DEF-226 multi-statement SimpleQuery is
+    // post-handshake; ICC never fires in Connecting state).
+    let mut transient_command_tags_arena:
+        Option<alloc::boxed::Box<crate::command_tags_arena::CommandTagsArena>> = None;
 
     let sentinel = ConnectingState::Errored(
         crate::error::StateErrorKind::from_kind_or_internal(
@@ -4804,6 +4856,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
             error_arena,
             notifications_arena: &mut transient_notifications_arena,
             copy_chunks_arena: &mut transient_copy_chunks_arena,
+            command_tags_arena: &mut transient_command_tags_arena,
             partial_assembly,
             malformed_count,
         },
@@ -4902,6 +4955,13 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
     /// data emission.
     pub(in crate::protocol) copy_chunks_arena:
         &'r mut Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
+    /// DEF-286 Φ-D: command_tags_arena threaded from
+    /// `ActiveInner.command_tags_arena` into the shared dispatch
+    /// body's `DispatchContext`. Used by DEF-226 multi-statement
+    /// dispatch arms to externalise the prior command tag for
+    /// `Action::IntermediateCommandComplete`.
+    pub(in crate::protocol) command_tags_arena:
+        &'r mut Option<alloc::boxed::Box<crate::command_tags_arena::CommandTagsArena>>,
     pub(in crate::protocol) partial_assembly:
         &'r mut crate::partial_assembly::PartialAssemblyCell,
     pub(in crate::protocol) malformed_count: &'r mut u32,
@@ -4956,6 +5016,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         error_arena,
         notifications_arena,
         copy_chunks_arena,
+        command_tags_arena,
         partial_assembly,
         malformed_count,
     } = ctx;
@@ -4982,6 +5043,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
             error_arena,
             notifications_arena,
             copy_chunks_arena,
+            command_tags_arena,
             partial_assembly,
             malformed_count,
         },
@@ -5396,6 +5458,7 @@ impl ActiveInner {
                 error_arena: &mut self.error_arena,
                 notifications_arena: &mut self.notifications_arena,
                 copy_chunks_arena: &mut self.copy_chunks_arena,
+                command_tags_arena: &mut self.command_tags_arena,
                 partial_assembly: &mut self.partial_assembly,
                 malformed_count: &mut self.malformed_frame_count,
             },
@@ -5477,6 +5540,7 @@ impl ActiveInner {
                 error_arena: &mut self.error_arena,
                 notifications_arena: &mut self.notifications_arena,
                 copy_chunks_arena: &mut self.copy_chunks_arena,
+                command_tags_arena: &mut self.command_tags_arena,
                 partial_assembly: &mut self.partial_assembly,
                 malformed_count: &mut self.malformed_frame_count,
             },
@@ -5509,6 +5573,7 @@ impl ActiveInner {
             &mut self.error_arena,
             &mut self.notifications_arena,
             &mut self.copy_chunks_arena,
+            &mut self.command_tags_arena,
             &mut self.partial_assembly,
             class,
         );
@@ -6015,6 +6080,29 @@ impl PgProtocol<ActivePhase> {
         static EMPTY_ARENA: crate::copy_chunks_arena::CopyChunksArena =
             crate::copy_chunks_arena::CopyChunksArena::new();
         let arena = match self.inner.copy_chunks_arena.as_deref() {
+            Some(a) => a,
+            None => &EMPTY_ARENA,
+        };
+        arena.get(r)
+    }
+
+    /// Resolve a [`crate::Action::IntermediateCommandComplete`]'s
+    /// gen-tagged ref to its `CommandTag` (DEF-286 Φ-D, DEF-226
+    /// multi-statement SimpleQuery surface).
+    ///
+    /// Same lifetime contract as [`Self::get_notification`] /
+    /// [`Self::get_copy_chunk`]: refs are valid within the
+    /// OutActions iteration cycle only. The arena clears at the
+    /// next `feed_bytes` entry; refs held past that boundary
+    /// resolve [`crate::error_arena::ArenaError::Stale`].
+    #[inline]
+    pub fn get_command_tag(
+        &self,
+        r: crate::command_tags_arena::CommandTagRef,
+    ) -> Result<&crate::command_tag::CommandTag, crate::error_arena::ArenaError> {
+        static EMPTY_ARENA: crate::command_tags_arena::CommandTagsArena =
+            crate::command_tags_arena::CommandTagsArena::new();
+        let arena = match self.inner.command_tags_arena.as_deref() {
             Some(a) => a,
             None => &EMPTY_ARENA,
         };
@@ -8417,11 +8505,12 @@ fn materialise<'w, 'r>(
             // iteration cycle.
             StagedAction::Notify { pid, notif_ref } => Action::Notify { pid, notif_ref },
             // DEF-226: IntermediateCommandComplete passes through —
-            // `tag: BoundedStr<32>` is `Copy`, no schema resolution
-            // at materialise time. The wrapper observes the tag by
-            // value in the OutActions iteration cycle.
-            StagedAction::IntermediateCommandComplete { tag } => {
-                Action::IntermediateCommandComplete { tag }
+            // DEF-286 Φ-D: `tag_ref` (CommandTagRef, 4 B Copy) passes
+            // through unchanged. The wrapper resolves via
+            // `PgProtocol::get_command_tag(tag_ref)` within the
+            // current OutActions iteration cycle.
+            StagedAction::IntermediateCommandComplete { tag_ref } => {
+                Action::IntermediateCommandComplete { tag_ref }
             }
             // DEF-219 Phase 3: CopyDataChunk passes through —
             // `chunk_ref` is `Copy`, no schema resolution at

@@ -403,6 +403,11 @@ pub(crate) fn dispatch(
     // `get_or_insert_with` on first CopyData arrival; most arms
     // ignore it.
     copy_chunks_arena_slot: &mut Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
+    // DEF-286 Φ-D: command_tags_arena slot. Lazy-init via
+    // `get_or_insert_with` on first IntermediateCommandComplete
+    // emission (DEF-226 multi-statement batch). Only the three
+    // SimpleQueryAwaitingRfq arms below touch it.
+    command_tags_arena_slot: &mut Option<alloc::boxed::Box<crate::command_tags_arena::CommandTagsArena>>,
 ) -> DispatchOutcome {
     // Snap owned prev for pattern matching; state slot holds the
     // explicit `ProtoState::Idle` placeholder during the match.
@@ -1037,6 +1042,23 @@ pub(crate) fn dispatch(
             // embedded NUL) per pre-Φ3 contract.
             match crate::command_tag::parse_command_tag_bytes(payload) {
                 Ok(new_tag) => {
+                    // DEF-286 Φ-D: alloc prior tag into arena;
+                    // overflow (arch-dead, OutActions cap is 9 = same
+                    // as arena cap) installs InternalCrateBug rather
+                    // than silently dropping the action.
+                    let prior_tag_ref = crate::protocol::command_tags_arena_or_init(
+                        command_tags_arena_slot,
+                    )
+                    .alloc(prior_tag);
+                    let Some(prior_tag_ref) = prior_tag_ref else {
+                        return install_errored(
+                            state,
+                            Some(reply.consume()),
+                            ProtocolError::InternalCrateBug {
+                                locus: crate::error::CrateBugLocus::CommandTagsArenaOverflow,
+                            },
+                        );
+                    };
                     _command_complete_dispatch_leaf::park_command_tag_at_dispatch(
                         command_tag_slot,
                         alloc::boxed::Box::new(new_tag),
@@ -1044,7 +1066,7 @@ pub(crate) fn dispatch(
                     *state = ProtoState::SimpleQueryAwaitingRfq { reply };
                     DispatchOutcome::AdvancedWithAction {
                         action: crate::action::StagedAction::IntermediateCommandComplete {
-                            tag: prior_tag,
+                            tag_ref: prior_tag_ref,
                         },
                     }
                 }
@@ -1062,6 +1084,20 @@ pub(crate) fn dispatch(
                 .unwrap_or(crate::command_tag::CommandTag::EMPTY);
             match crate::decode::parse_row_description(payload) {
                 Ok(row_desc) => {
+                    // DEF-286 Φ-D: alloc prior tag into arena.
+                    let prior_tag_ref = crate::protocol::command_tags_arena_or_init(
+                        command_tags_arena_slot,
+                    )
+                    .alloc(prior_tag);
+                    let Some(prior_tag_ref) = prior_tag_ref else {
+                        return install_errored(
+                            state,
+                            Some(reply.consume()),
+                            ProtocolError::InternalCrateBug {
+                                locus: crate::error::CrateBugLocus::CommandTagsArenaOverflow,
+                            },
+                        );
+                    };
                     _row_description_dispatch_leaf::park_row_description_at_dispatch(
                         row_desc_slot,
                         row_desc,
@@ -1069,7 +1105,7 @@ pub(crate) fn dispatch(
                     *state = ProtoState::SimpleQueryStreamingRows { reply };
                     DispatchOutcome::AdvancedWithAction {
                         action: crate::action::StagedAction::IntermediateCommandComplete {
-                            tag: prior_tag,
+                            tag_ref: prior_tag_ref,
                         },
                     }
                 }
@@ -1086,6 +1122,20 @@ pub(crate) fn dispatch(
                 .unwrap_or(crate::command_tag::CommandTag::EMPTY);
             match validate_empty_body(payload, TAG_EMPTY_QUERY_RESPONSE) {
                 Ok(()) => {
+                    // DEF-286 Φ-D: alloc prior tag into arena.
+                    let prior_tag_ref = crate::protocol::command_tags_arena_or_init(
+                        command_tags_arena_slot,
+                    )
+                    .alloc(prior_tag);
+                    let Some(prior_tag_ref) = prior_tag_ref else {
+                        return install_errored(
+                            state,
+                            Some(reply.consume()),
+                            ProtocolError::InternalCrateBug {
+                                locus: crate::error::CrateBugLocus::CommandTagsArenaOverflow,
+                            },
+                        );
+                    };
                     _command_complete_dispatch_leaf::park_command_tag_at_dispatch(
                         command_tag_slot,
                         alloc::boxed::Box::new(crate::command_tag::CommandTag::EMPTY),
@@ -1093,7 +1143,7 @@ pub(crate) fn dispatch(
                     *state = ProtoState::SimpleQueryAwaitingRfq { reply };
                     DispatchOutcome::AdvancedWithAction {
                         action: crate::action::StagedAction::IntermediateCommandComplete {
-                            tag: prior_tag,
+                            tag_ref: prior_tag_ref,
                         },
                     }
                 }

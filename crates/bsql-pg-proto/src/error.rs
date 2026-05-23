@@ -961,6 +961,24 @@ pub enum CrateBugLocus {
     /// typed `Err`, the counter is preserved, and the caller routes
     /// through this locus and `Errored` state install.
     PartialModeExitUndrained,
+
+    /// [`crate::command_tags_arena::CommandTagsArena::alloc`] returned
+    /// `None` while staging a DEF-226 multi-statement
+    /// `IntermediateCommandComplete` — the per-cycle slot cap
+    /// ([`crate::command_tags_arena::MAX_INTERMEDIATE_TAGS_PER_CALL`]
+    /// = 9, equal to [`crate::MAX_ACTIONS_PER_CALL`]) was exceeded.
+    /// Architecturally dead: the dispatch loop cannot emit more ICCs
+    /// than there are OutActions slots, and arena capacity equals
+    /// that cap exactly. Emission indicates a refactor that
+    /// decoupled the two caps without re-aligning them.
+    ///
+    /// A naive `debug_assert!(false) + silent drop` would lose the
+    /// `IntermediateCommandComplete` action — wrapper observes
+    /// fewer events than the wire delivered, intermediate tags
+    /// silently absent from operator logs. Tier-3 classifier
+    /// installs `Errored(InternalCrateBug { locus: CommandTagsArenaOverflow })`
+    /// + `FailReply` + `CloseSocket`.
+    CommandTagsArenaOverflow,
 }
 
 // Niche-packed `Option<CrateBugLocus>` — 1 byte since all variants
@@ -1011,6 +1029,7 @@ impl fmt::Display for CrateBugLocus {
             Self::PushEmittedDeliverReply => f.write_str("push-emitted-deliver-reply"),
             Self::PartialModeReentry => f.write_str("partial-mode-reentry"),
             Self::PartialModeExitUndrained => f.write_str("partial-mode-exit-undrained"),
+            Self::CommandTagsArenaOverflow => f.write_str("command-tags-arena-overflow"),
         }
     }
 }

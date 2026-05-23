@@ -855,13 +855,15 @@ pub enum Action<'w, 'r> {
     /// `DeliverReply { Reply::QueryComplete }` carrying the LAST
     /// statement's tag + transaction status.
     IntermediateCommandComplete {
-        /// Command tag from the just-completed statement.
-        /// DEF-286 Φ3: typed [`crate::command_tag::CommandTag`]
-        /// (was `BoundedStr<32>` pre-Φ3) — consumer can match on
-        /// `CommandTag::{Insert, Update, Select, ...} { rows }` for
-        /// known commands or fall to `Other(BoundedStr<32>)` for
-        /// freeform.
-        tag: crate::command_tag::CommandTag,
+        /// Gen-tagged handle into
+        /// [`crate::command_tags_arena::CommandTagsArena`]. Resolve
+        /// via [`crate::PgProtocol::get_command_tag`] to obtain
+        /// `&CommandTag`. DEF-286 Φ-D externalisation drops the
+        /// inline 40-B tag payload to a 4-B arena handle; Action
+        /// stays `Copy` and the variant now niche-packs into the
+        /// outer enum's disc, collapsing Action 48 → 40 B and
+        /// OutActions 440 → 368 B cascade.
+        tag_ref: crate::command_tags_arena::CommandTagRef,
     },
 
     /// COPY OUT data chunk (DEF-219 Phase 3, PG §55.2.6). Emitted
@@ -1278,10 +1280,12 @@ pub(crate) enum StagedAction<'sql> {
     /// value; the state retains the NEW tag for subsequent
     /// transitions.
     IntermediateCommandComplete {
-        /// Command tag from the just-completed statement in a
-        /// multi-statement batch. DEF-286 Φ3: typed
-        /// [`crate::command_tag::CommandTag`] (was `BoundedStr<32>`).
-        tag: crate::command_tag::CommandTag,
+        /// Gen-tagged arena handle (DEF-286 Φ-D externalisation).
+        /// Materialise passes through unchanged; the public
+        /// [`Action::IntermediateCommandComplete`] carries the same
+        /// `tag_ref` for the wrapper to resolve via
+        /// [`crate::PgProtocol::get_command_tag`].
+        tag_ref: crate::command_tags_arena::CommandTagRef,
     },
 
     /// Map to [`Action::CopyDataChunk`] — DEF-219 Phase 3 COPY OUT

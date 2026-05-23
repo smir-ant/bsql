@@ -80,13 +80,13 @@ fn batch_two_dml_statements_surfaces_intermediate() {
         slice
     );
 
-    match &slice[0] {
-        Action::IntermediateCommandComplete { tag } => {
-            assert_eq!(format!("{}", tag), "BEGIN");
-        }
+    // DEF-286 Φ-D: ICC carries `tag_ref` (CommandTagRef, 4 B Copy).
+    // Snapshot ref before dropping `actions` so `proto.get_command_tag`
+    // can reborrow.
+    let icc0_ref = match &slice[0] {
+        Action::IntermediateCommandComplete { tag_ref } => *tag_ref,
         other => panic!("slot 0: expected IntermediateCommandComplete, got {other:?}"),
-    }
-
+    };
     match &slice[1] {
         Action::DeliverReply {
             value: Reply::QueryComplete(p),
@@ -96,6 +96,12 @@ fn batch_two_dml_statements_surfaces_intermediate() {
         }
         other => panic!("slot 1: expected DeliverReply(QueryComplete), got {other:?}"),
     }
+    // `actions` is `ManuallyDrop<heapless::Vec<_>>` — NLL releases
+    // the &mut proto borrow at the last `&slice[…]` use above.
+    let icc0_tag = proto
+        .get_command_tag(icc0_ref)
+        .unwrap_or_else(|e| panic!("ICC[0] resolve: {e:?}"));
+    assert_eq!(format!("{}", icc0_tag), "BEGIN");
 }
 
 #[test]
@@ -130,16 +136,15 @@ fn batch_three_statements_surfaces_two_intermediates() {
         slice
     );
 
-    let Action::IntermediateCommandComplete { tag } = &slice[0] else {
-        panic!("slot 0: expected Intermediate, got {:?}", slice[0]);
+    // DEF-286 Φ-D: snapshot tag_refs before dropping `actions`.
+    let icc0_ref = match &slice[0] {
+        Action::IntermediateCommandComplete { tag_ref } => *tag_ref,
+        other => panic!("slot 0: expected Intermediate, got {other:?}"),
     };
-    assert_eq!(format!("{}", tag), "BEGIN");
-
-    let Action::IntermediateCommandComplete { tag } = &slice[1] else {
-        panic!("slot 1: expected Intermediate, got {:?}", slice[1]);
+    let icc1_ref = match &slice[1] {
+        Action::IntermediateCommandComplete { tag_ref } => *tag_ref,
+        other => panic!("slot 1: expected Intermediate, got {other:?}"),
     };
-    assert_eq!(format!("{}", tag), "UPDATE 1");
-
     let Action::DeliverReply {
         value: Reply::QueryComplete(p),
         ..
@@ -148,6 +153,12 @@ fn batch_three_statements_surfaces_two_intermediates() {
         panic!("slot 2: expected DeliverReply, got {:?}", slice[2]);
     };
     assert_eq!(format!("{}", p.command_tag), "COMMIT");
+    // NLL releases the &mut proto borrow after the last `p`/`slice`
+    // use above; the subsequent `get_command_tag` calls reborrow.
+    let icc0_tag = proto.get_command_tag(icc0_ref).unwrap_or_else(|e| panic!("ICC[0]: {e:?}"));
+    assert_eq!(format!("{}", icc0_tag), "BEGIN");
+    let icc1_tag = proto.get_command_tag(icc1_ref).unwrap_or_else(|e| panic!("ICC[1]: {e:?}"));
+    assert_eq!(format!("{}", icc1_tag), "UPDATE 1");
 }
 
 #[test]
@@ -185,16 +196,14 @@ fn batch_with_empty_query_response_in_middle() {
         slice
     );
 
-    let Action::IntermediateCommandComplete { tag } = &slice[0] else {
-        panic!("slot 0: expected Intermediate, got {:?}", slice[0]);
+    let icc0_ref = match &slice[0] {
+        Action::IntermediateCommandComplete { tag_ref } => *tag_ref,
+        other => panic!("slot 0: expected Intermediate, got {other:?}"),
     };
-    assert_eq!(format!("{}", tag), "BEGIN");
-
-    let Action::IntermediateCommandComplete { tag } = &slice[1] else {
-        panic!("slot 1: expected Intermediate (empty), got {:?}", slice[1]);
+    let icc1_ref = match &slice[1] {
+        Action::IntermediateCommandComplete { tag_ref } => *tag_ref,
+        other => panic!("slot 1: expected Intermediate (empty), got {other:?}"),
     };
-    assert_eq!(format!("{}", tag), "", "empty query response yields empty tag");
-
     let Action::DeliverReply {
         value: Reply::QueryComplete(p),
         ..
@@ -203,6 +212,11 @@ fn batch_with_empty_query_response_in_middle() {
         panic!("slot 2: expected DeliverReply, got {:?}", slice[2]);
     };
     assert_eq!(format!("{}", p.command_tag), "COMMIT");
+    // NLL: borrow ends after last `p` use; reborrow proto for arena.
+    let icc0_tag = proto.get_command_tag(icc0_ref).unwrap_or_else(|e| panic!("ICC[0]: {e:?}"));
+    assert_eq!(format!("{}", icc0_tag), "BEGIN");
+    let icc1_tag = proto.get_command_tag(icc1_ref).unwrap_or_else(|e| panic!("ICC[1]: {e:?}"));
+    assert_eq!(format!("{}", icc1_tag), "", "empty query response yields empty tag");
 }
 
 #[test]
