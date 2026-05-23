@@ -681,6 +681,16 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
     pub(in crate::protocol) state: &'state mut ProtoState,
     pub(in crate::protocol) read_buf: &'r mut ReadBuf,
     pub(in crate::protocol) row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
+    /// DEF-286 Φ1: ParamOids slot threaded from
+    /// `<ActivePhase>::Extras.param_oids` via
+    /// [`feed_bytes_dispatch_active`]; the Connecting variant uses
+    /// the transient `ActiveExtras.param_oids` slot (DescribeStatement
+    /// is post-handshake only — same transient pattern as
+    /// `row_desc_slot` for Connecting). The `'t' ParameterDescription`
+    /// dispatch arm parks parsed ParamOids here via
+    /// [`crate::dispatch::_param_description_dispatch_leaf::park_param_oids_at_dispatch`].
+    pub(in crate::protocol) param_oids_slot:
+        &'r mut crate::param_oids_slot::ParamOidsSlotCell,
     pub(in crate::protocol) session_params:
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
@@ -1040,14 +1050,19 @@ impl SealedPhase for ActivePhase {
     // absence (`ActiveInner.state: ActiveState` — no Connecting
     // variants exist in the per-phase enum).
     //
-    // `row_desc_slot` lives on the outer for Active alone —
-    // `<ActivePhase>::Extras = RowDescSlotCell`. The
-    // `feed_bytes_dispatch_active` wrapper borrows
-    // `&mut self.extras` and threads it into the shared dispatch
-    // body's `DispatchContext`. Net footprint preserved (slot moved
-    // from Inner → outer Extras for Active monomorphisation).
+    // [`ActiveExtras`] carries TWO slots on the outer for Active
+    // alone: `row_desc` ([`crate::schema_slot::RowDescSlotCell`])
+    // and `param_oids` ([`crate::param_oids_slot::ParamOidsSlotCell`]).
+    // Both `feed_bytes_dispatch_active` and `feed_bytes_dispatch_connecting`
+    // borrow `&mut self.extras.row_desc` + `&mut self.extras.param_oids`
+    // and thread into the shared dispatch body's `DispatchContext`.
+    // Net footprint preserved (both slots moved from Inner → outer
+    // Extras for Active monomorphisation). DEF-286 Φ1 extended this
+    // pattern to `param_oids` (was inline `Box<ParamOids>` in two
+    // state variants; now lives in slot, state variants carry only
+    // the bare `ReplyId<DescribeStatementKind>`).
     type Inner = ActiveInner;
-    type Extras = crate::schema_slot::RowDescSlotCell;
+    type Extras = ActiveExtras;
 }
 impl SealedPhase for ClosedPhase {
     // The transition sites (`<ActivePhase>::into_closed_if_errored`
@@ -1057,6 +1072,69 @@ impl SealedPhase for ClosedPhase {
     // Drop at the boundary.
     type Inner = ClosedInner;
     type Extras = ();
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// `<ActivePhase>::Extras` carrier.
+//
+// Holds the TWO outer-level cells observed only during the Active
+// phase:
+//
+//   - `row_desc`     — parked `RowDescription` payload from the inbound
+//                      `'T'` frame. Lifecycle spans across one
+//                      streaming-rows phase or a Describe-portal-Rows
+//                      cycle; cleared at the next Idle/Errored entry.
+//   - `param_oids`   — parsed `ParameterDescription` payload from the
+//                      inbound `'t'` frame. Lifecycle spans across the
+//                      `'t' → ('T' | 'n') → 'Z'` window of a
+//                      DescribeStatement push cycle; cleared at the
+//                      next Idle/Errored entry.
+//
+// Both slots are placed on the outer `<ActivePhase>::Extras` (not
+// inside `ActiveInner`) so the `feed_bytes_dispatch_active` wrapper
+// can borrow `&mut self.inner` for the state dispatch AND
+// `&mut self.extras.row_desc` / `&mut self.extras.param_oids` for
+// per-cell mutation in DIFFERENT borrow slots — no aliasing
+// conflict with the `&mut self.inner.state` borrow that flows
+// through `dispatch()`.
+//
+// `<ConnectingPhase>::Extras = ()`: storage-absence tier-1 closure
+// on «outer-level can't write either schema or param-OIDs from
+// Connecting». The `feed_bytes_dispatch_connecting` wrapper mints
+// a stack-local transient [`ActiveExtras`] that the shared dispatch
+// body can name; the transient is empty (Connecting LHS arms never
+// write to either slot), and drops with the wrapper's frame.
+//
+// `#[allow]` rationale: `Copy`/`Debug` derived on `ActiveExtras`
+// would defeat the per-cell concrete-token write provenance
+// (mass-copying via Copy bypasses the token gate; Debug exposes
+// parked schema/OID payload through `{:?}`). Both rejected at the
+// trait level.
+#[allow(
+    missing_copy_implementations,
+    missing_debug_implementations,
+    reason = "`Copy` is BANNED on the carrier — copying would let \
+              callers bypass the token-gated per-cell write protocol. \
+              `Debug` is suppressed because the inner cells \
+              (`RowDescSlotCell` / `ParamOidsSlotCell`) also suppress \
+              `Debug` to protect parked schema/OID metadata from \
+              accidental observation via `{:?}`."
+)]
+/// Carrier for the `<ActivePhase>` outer-level slots —
+/// `row_desc_slot` for parked `RowDescription` payload and
+/// `param_oids_slot` for parked `ParameterDescription` payload.
+///
+/// Stored at `PgProtocol<ActivePhase>::extras`; the field types
+/// are crate-private (`pub(in crate::protocol)`) so external code
+/// can name the type (required by the `SealedPhase::Extras` assoc
+/// type bound) but cannot read or write the inner cells. The cells
+/// expose their own token-gated `pub(crate)` API for parks/clears
+/// (see `crate::schema_slot::RowDescSlotCell` and
+/// `crate::param_oids_slot::ParamOidsSlotCell`).
+pub struct ActiveExtras {
+    pub(in crate::protocol) row_desc: crate::schema_slot::RowDescSlotCell,
+    pub(in crate::protocol) param_oids:
+        crate::param_oids_slot::ParamOidsSlotCell,
 }
 
 /// Phase-typed wrapper over the per-phase Inner storage.
@@ -1253,6 +1331,13 @@ pub(crate) mod _clear_residue_leaf {
     /// can name it.
     pub(crate) struct ClearResiduePartialAssemblyToken(());
 
+    /// Leaf-scope token for the param-oids slot clear at residue
+    /// transitions. Field private to the leaf; type `pub(crate)` so
+    /// [`crate::param_oids_slot::ParamOidsSlotCell`] can name it in
+    /// its `clear_at_residue` parameter signature. DEF-286 Φ1 —
+    /// mirrors [`ClearResidueSchemaToken`]'s shape exactly.
+    pub(crate) struct ClearResidueParamOidsToken(());
+
     /// Clear the schema slot via
     /// [`crate::schema_slot::RowDescSlotCell::clear_at_residue`] with
     /// the [`ClearResidueSchemaToken`] minted inline. Used by
@@ -1292,6 +1377,20 @@ pub(crate) mod _clear_residue_leaf {
         cell: &mut crate::partial_assembly::PartialAssemblyCell,
     ) {
         cell.clear_at_residue(ClearResiduePartialAssemblyToken(()));
+    }
+
+    /// Clear the param-oids slot via
+    /// [`crate::param_oids_slot::ParamOidsSlotCell::clear_at_residue`]
+    /// with the [`ClearResidueParamOidsToken`] minted inline. Used by
+    /// `clear_session_residue_for_class` Idle and Errored arms —
+    /// drops the box if a Describe-statement was in flight, freeing
+    /// the 68 B heap. DEF-286 Φ1 mirror of
+    /// [`clear_schema_slot_residue`].
+    #[inline]
+    pub(in crate::protocol) fn clear_param_oids_slot_residue(
+        slot: &mut crate::param_oids_slot::ParamOidsSlotCell,
+    ) {
+        slot.clear_at_residue(ClearResidueParamOidsToken(()));
     }
 }
 
@@ -1626,33 +1725,52 @@ pub(crate) mod _proto_init_leaf {
         }
     }
 
-    /// Mint the outer `<ActivePhase>::Extras = RowDescSlotCell` at
-    /// the `<ConnectingPhase>::into_active` transition boundary.
-    /// Mirror of the per-cell `empty(token)` mint pattern used by
-    /// [`fresh_active_inner`]; lives inside `_proto_init_leaf` so
-    /// the [`ProtoInitToken`] stays leaf-private.
+    /// Mint the outer `<ActivePhase>::Extras = ActiveExtras` at the
+    /// `<ConnectingPhase>::into_active` transition boundary. Both
+    /// inner cells (`row_desc` + `param_oids`) start empty via
+    /// [`ProtoInitToken`]-gated constructors. Mirror of the per-cell
+    /// `empty(token)` mint pattern used by [`fresh_active_inner`];
+    /// lives inside `_proto_init_leaf` so the [`ProtoInitToken`]
+    /// stays leaf-private.
+    ///
+    /// DEF-286 Φ1: extended from single-cell `RowDescSlotCell` to
+    /// the two-cell `ActiveExtras` carrier per the slot-pattern
+    /// refactor that moved `param_oids: Box<ParamOids>` from state
+    /// variants into a slot.
     #[must_use]
-    pub(in crate::protocol) fn fresh_active_row_desc_slot()
-    -> crate::schema_slot::RowDescSlotCell {
-        let token = ProtoInitToken::mint();
-        crate::schema_slot::RowDescSlotCell::empty(token)
+    pub(in crate::protocol) fn fresh_active_extras() -> super::ActiveExtras {
+        super::ActiveExtras {
+            row_desc: crate::schema_slot::RowDescSlotCell::empty(
+                ProtoInitToken::mint(),
+            ),
+            param_oids: crate::param_oids_slot::ParamOidsSlotCell::empty(
+                ProtoInitToken::mint(),
+            ),
+        }
     }
 
-    /// Mint a stack-local transient `RowDescSlotCell` for
+    /// Mint a stack-local transient [`super::ActiveExtras`] for
     /// [`super::feed_bytes_dispatch_connecting`]'s call into the
-    /// shared dispatch body. The slot is empty (no Connecting LHS
-    /// arm writes to it) and drops with the wrapper's frame.
+    /// shared dispatch body. Both inner cells start empty (no
+    /// Connecting LHS arm writes either) and drop with the
+    /// wrapper's frame.
     ///
     /// **Tier impact**: the `<ConnectingPhase>::Extras = ()` storage
-    /// absence is the load-bearing closure (no slot on the outer);
+    /// absence is the load-bearing closure (no extras on the outer);
     /// this transient is a per-call wrapper-internal placeholder
     /// the shared dispatch body can name, never observable outside
     /// the wrapper frame.
     #[must_use]
-    pub(in crate::protocol) fn fresh_connecting_transient_row_desc_slot()
-    -> crate::schema_slot::RowDescSlotCell {
-        let token = ProtoInitToken::mint();
-        crate::schema_slot::RowDescSlotCell::empty(token)
+    pub(in crate::protocol) fn fresh_connecting_transient_extras()
+    -> super::ActiveExtras {
+        super::ActiveExtras {
+            row_desc: crate::schema_slot::RowDescSlotCell::empty(
+                ProtoInitToken::mint(),
+            ),
+            param_oids: crate::param_oids_slot::ParamOidsSlotCell::empty(
+                ProtoInitToken::mint(),
+            ),
+        }
     }
 
     /// Materialise a fresh [`super::ActiveInner`] for use by
@@ -2185,7 +2303,7 @@ impl PgProtocol<ConnectingPhase> {
         //
         // `row_desc_slot` lives on outer `<ActivePhase>::Extras`;
         // `ConnectingInner` does not carry it. Mint a fresh cell via
-        // `_proto_init_leaf::fresh_active_row_desc_slot()` at this
+        // `_proto_init_leaf::fresh_active_extras()` at this
         // transition boundary.
         if let ConnectingState::HandshakeReady { .. } = self.inner.state {
             let ConnectingInner {
@@ -2232,7 +2350,7 @@ impl PgProtocol<ConnectingPhase> {
                     malformed_frame_count,
                     sync_marker: PhantomData,
                 },
-                extras: _proto_init_leaf::fresh_active_row_desc_slot(),
+                extras: _proto_init_leaf::fresh_active_extras(),
                 phase_marker: PhantomData,
             });
         }
@@ -3276,14 +3394,19 @@ impl PgProtocol<ActivePhase> {
         // (architecturally unreachable from `ReadyGuard::push_command`
         // gating), the prior ActiveState (which may carry secrets)
         // drops here — that's the correct scrub path.
+        // ActiveState carries no Drop targets — none of its variants
+        // hold password/secret payloads (those live exclusively in
+        // Connecting variants). The `mem::replace` writes the Idle
+        // sentinel; the returned old value falls out of scope at the
+        // end of this statement without needing an explicit drop call
+        // (clippy::drop_non_drop forbids the no-op `drop` invocation).
         let _replaced: crate::state::ActiveState = core::mem::replace(
             &mut self.inner.state,
             crate::state::ActiveState::Idle,
         );
-        drop(_replaced);
         let mut proto_state: ProtoState = ProtoState::Idle;
         let state = &mut proto_state;
-        let row_desc_slot = &mut self.extras;
+        let row_desc_slot = &mut self.extras.row_desc;
         let idle = match crate::state_setter::IdleState::try_from(state) {
             Some(idle) => idle,
             None => {
@@ -3740,8 +3863,18 @@ impl PgProtocol<ActivePhase> {
 /// delegate and `feed_bytes_dispatch` (direct call BEFORE
 /// destructuring the `DispatchContext` into local re-bindings).
 #[inline]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "DEF-286 Φ1 added `param_oids_slot` next to \
+              `row_desc_slot` for the per-cell residue clear policy. \
+              Each parameter is a distinct mutable view into \
+              PgProtocol storage; the count grew from 7 to 8 to \
+              mirror the slot-pattern. Bundling would defeat the \
+              destructured-borrows discipline of the call site."
+)]
 pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
     row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
+    param_oids_slot: &mut crate::param_oids_slot::ParamOidsSlotCell,
     session_params: &mut crate::session_params_slot::SessionParamsCell,
     error_arena: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
     notifications_arena: &mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
@@ -3752,6 +3885,13 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
     match class {
         crate::state::StatePushClass::Idle => {
             _clear_residue_leaf::clear_schema_slot_residue(row_desc_slot);
+            // DEF-286 Φ1: clear ParamOids slot at Idle boundaries.
+            // Per-DescribeStatement-cycle lifecycle: 't' arrival
+            // parks the box; 'Z' arrival materialises via `as_ref()`
+            // into the public Reply. The cycle closes at the Idle
+            // boundary that follows the terminal RFQ — slot drops
+            // its box, freeing the 68 B heap.
+            _clear_residue_leaf::clear_param_oids_slot_residue(param_oids_slot);
             if let Some(arena) = error_arena.as_deref_mut() {
                 arena.clear();
             }
@@ -3770,6 +3910,10 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
         }
         crate::state::StatePushClass::Errored(_) => {
             _clear_residue_leaf::clear_schema_slot_residue(row_desc_slot);
+            // DEF-286 Φ1: also clear ParamOids slot on Errored —
+            // any in-flight Describe is torn down with the
+            // connection; the box's drop reclaims the heap.
+            _clear_residue_leaf::clear_param_oids_slot_residue(param_oids_slot);
             if let Some(arena) = error_arena.as_deref_mut() {
                 arena.clear();
             }
@@ -3841,12 +3985,18 @@ pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'state, 'r, R, M, const BOUND
     materialise_fn: M,
 ) -> R
 where
-    M: Fn(StagedActions<'w>, &'w [u8], Option<&'r crate::decode::RowDesc>) -> R,
+    M: Fn(
+        StagedActions<'w>,
+        &'w [u8],
+        Option<&'r crate::decode::RowDesc>,
+        Option<&'r crate::action::ParamOids>,
+    ) -> R,
 {
     let DispatchContext {
         state,
         read_buf,
         row_desc_slot: terminal_row_desc,
+        param_oids_slot: terminal_param_oids,
         session_params: session_params_slot,
         error_arena: error_arena_slot,
         notifications_arena: notifications_arena_slot,
@@ -3865,6 +4015,7 @@ where
     let entry_class = state.push_class();
     clear_session_residue_for_class_dispatch(
         terminal_row_desc,
+        terminal_param_oids,
         session_params_slot,
         error_arena_slot,
         notifications_arena_slot,
@@ -3946,9 +4097,11 @@ where
             read_buf.clear();
             let terminal_ref: Option<&crate::decode::RowDesc> =
                 (*terminal_row_desc).as_ref();
+            let terminal_param_oids_ref: Option<&crate::action::ParamOids> =
+                (*terminal_param_oids).as_ref();
             return write_buf.with_branded(|wb| -> R {
                 let staged: StagedActions = StagedActions::new();
-                materialise_fn(staged, wb.into_bytes(), terminal_ref)
+                materialise_fn(staged, wb.into_bytes(), terminal_ref, terminal_param_oids_ref)
             });
         }
         IngressClassification::AppendFailed { attempted, available } => {
@@ -3977,7 +4130,9 @@ where
                 );
                 let terminal_ref: Option<&crate::decode::RowDesc> =
                     (*terminal_row_desc).as_ref();
-                materialise_fn(staged, wb.into_bytes(), terminal_ref)
+                let terminal_param_oids_ref: Option<&crate::action::ParamOids> =
+                    (*terminal_param_oids).as_ref();
+                materialise_fn(staged, wb.into_bytes(), terminal_ref, terminal_param_oids_ref)
             });
         }
         IngressClassification::Ok => {
@@ -4036,6 +4191,7 @@ where
                 assembly_box.prefix(),
                 &mut reserved,
                 terminal_row_desc,
+                terminal_param_oids,
                 error_arena_slot,
                 copy_chunks_arena_slot,
             );
@@ -4258,6 +4414,7 @@ where
                         payload,
                         &mut reserved,
                         terminal_row_desc,
+                        terminal_param_oids,
                         error_arena_slot,
                         copy_chunks_arena_slot,
                     );
@@ -4380,13 +4537,16 @@ where
             read_buf.clear();
         }
 
-        // Dispatch may have written to `terminal_row_desc` during
-        // the loop (Z arms park schemas). NLL ends the dispatch
-        // loop's `&mut` reborrow at the loop close brace above;
+        // Dispatch may have written to `terminal_row_desc` AND/OR
+        // `terminal_param_oids` during the loop ('T' arms park
+        // schemas; 't' arms park ParamOids). NLL ends the dispatch
+        // loop's `&mut` reborrows at the loop close brace above;
         // reborrow as immutable here for materialise.
         let terminal_ref: Option<&crate::decode::RowDesc> =
             (*terminal_row_desc).as_ref();
-        materialise_fn(staged, wb.into_bytes(), terminal_ref)
+        let terminal_param_oids_ref: Option<&crate::action::ParamOids> =
+            (*terminal_param_oids).as_ref();
+        materialise_fn(staged, wb.into_bytes(), terminal_ref, terminal_param_oids_ref)
     })
 }
 
@@ -4527,8 +4687,8 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     // `&mut transient` reborrow needed by `feed_bytes_dispatch`
     // is supplied by reborrowing the local — Rust's NLL closes
     // the borrow at function return; the local drops cleanly.
-    let mut transient_row_desc =
-        _proto_init_leaf::fresh_connecting_transient_row_desc_slot();
+    let mut transient_extras =
+        _proto_init_leaf::fresh_connecting_transient_extras();
     // DEF-220: Connecting phase doesn't carry a notifications_arena
     // (LISTEN/NOTIFY is post-handshake only — PG §55.7 NOTIFY can
     // arrive only in Active phase). Provide a transient empty slot
@@ -4563,7 +4723,8 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
         DispatchContext {
             state: &mut proto_state,
             read_buf,
-            row_desc_slot: &mut transient_row_desc,
+            row_desc_slot: &mut transient_extras.row_desc,
+            param_oids_slot: &mut transient_extras.param_oids,
             session_params,
             error_arena,
             notifications_arena: &mut transient_notifications_arena,
@@ -4574,8 +4735,17 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
         bytes,
         write_buf,
         max_dispatches,
-        |staged, write_bytes, _terminal_ref_unused: Option<&crate::decode::RowDesc>| -> OutActions<'w, 'static> {
-            materialise(staged, write_bytes, None::<&'static crate::decode::RowDesc>)
+        |staged,
+         write_bytes,
+         _terminal_ref_unused: Option<&crate::decode::RowDesc>,
+         _terminal_param_oids_unused: Option<&crate::action::ParamOids>|
+         -> OutActions<'w, 'static> {
+            materialise(
+                staged,
+                write_bytes,
+                None::<&'static crate::decode::RowDesc>,
+                None::<&'static crate::action::ParamOids>,
+            )
         },
     );
 
@@ -4629,6 +4799,13 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
     pub(in crate::protocol) state: &'state mut crate::state::ActiveState,
     pub(in crate::protocol) read_buf: &'r mut ReadBuf,
     pub(in crate::protocol) row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
+    /// DEF-286 Φ1: param_oids_slot threaded from
+    /// `<ActivePhase>::Extras.param_oids` into the shared dispatch
+    /// body's `DispatchContext`. DescribeStatement is post-handshake
+    /// only — only Active carries the populated slot; Connecting
+    /// uses a transient empty slot at the wrapper level.
+    pub(in crate::protocol) param_oids_slot:
+        &'r mut crate::param_oids_slot::ParamOidsSlotCell,
     pub(in crate::protocol) session_params:
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
@@ -4692,6 +4869,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         state,
         read_buf,
         row_desc_slot,
+        param_oids_slot,
         session_params,
         error_arena,
         notifications_arena,
@@ -4716,6 +4894,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
             state: &mut proto_state,
             read_buf,
             row_desc_slot,
+            param_oids_slot,
             session_params,
             error_arena,
             notifications_arena,
@@ -4726,8 +4905,12 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         bytes,
         write_buf,
         max_dispatches,
-        |staged, write_bytes, terminal_ref: Option<&crate::decode::RowDesc>| -> OutActions<'w, 'r> {
-            materialise(staged, write_bytes, terminal_ref)
+        |staged,
+         write_bytes,
+         terminal_ref: Option<&crate::decode::RowDesc>,
+         terminal_param_oids_ref: Option<&crate::action::ParamOids>|
+         -> OutActions<'w, 'r> {
+            materialise(staged, write_bytes, terminal_ref, terminal_param_oids_ref)
         },
     );
 
@@ -5113,7 +5296,7 @@ impl ActiveInner {
     /// borrow and passes here.
     pub(crate) fn feed_bytes_impl<'w, 'r, const BOUNDED: bool>(
         &'r mut self,
-        row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
+        extras: &'r mut ActiveExtras,
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
         max_dispatches: u16,
@@ -5122,7 +5305,8 @@ impl ActiveInner {
             ActiveDispatchContext {
                 state: &mut self.state,
                 read_buf: &mut self.read_buf,
-                row_desc_slot,
+                row_desc_slot: &mut extras.row_desc,
+                param_oids_slot: &mut extras.param_oids,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 notifications_arena: &mut self.notifications_arena,
@@ -5140,12 +5324,12 @@ impl ActiveInner {
     #[inline]
     pub(crate) fn feed_bytes_bounded<'w, 'r>(
         &'r mut self,
-        row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
+        extras: &'r mut ActiveExtras,
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
         max_dispatches: u16,
     ) -> OutActions<'w, 'r> {
-        self.feed_bytes_impl::<true>(row_desc_slot, bytes, write_buf, max_dispatches)
+        self.feed_bytes_impl::<true>(extras, bytes, write_buf, max_dispatches)
     }
 
     /// Append inbound bytes (no dispatch). Mirror of the
@@ -5194,14 +5378,15 @@ impl ActiveInner {
                   trigger socket teardown"]
     pub(crate) fn advance_one_frame<'w, 'r>(
         &'r mut self,
-        row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
+        extras: &'r mut ActiveExtras,
         write_buf: &'w mut WriteBuf,
     ) -> crate::action::FeedEvent<'w, 'r> {
         advance_one_frame_dispatch_active(
             ActiveDispatchContext {
                 state: &mut self.state,
                 read_buf: &mut self.read_buf,
-                row_desc_slot,
+                row_desc_slot: &mut extras.row_desc,
+                param_oids_slot: &mut extras.param_oids,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 notifications_arena: &mut self.notifications_arena,
@@ -5227,11 +5412,12 @@ impl ActiveInner {
     #[inline]
     pub(crate) fn clear_session_residue_for_class(
         &mut self,
-        row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
+        extras: &mut ActiveExtras,
         class: crate::state::StatePushClass,
     ) {
         clear_session_residue_for_class_dispatch(
-            row_desc_slot,
+            &mut extras.row_desc,
+            &mut extras.param_oids,
             &mut self.session_params,
             &mut self.error_arena,
             &mut self.notifications_arena,
@@ -5937,6 +6123,7 @@ impl PgProtocol<ActivePhase> {
     #[must_use]
     pub fn current_row_desc(&self) -> Option<crate::decode::RowDescBorrow<'_>> {
         self.extras
+            .row_desc
             .as_ref()
             .map(crate::decode::RowDescBorrow::from_ref)
     }
@@ -8074,6 +8261,7 @@ fn materialise<'w, 'r>(
     staged: StagedActions<'w>,
     write_bytes: &'w [u8],
     terminal_row_desc: Option<&'r crate::decode::RowDesc>,
+    terminal_param_oids: Option<&'r crate::action::ParamOids>,
 ) -> OutActions<'w, 'r> {
     // Capacity invariant: `staged.len() ≤ MAX_STAGED_PER_CALL`
     // (heapless::Vec cap); each staged entry fans out to ≤
@@ -8123,7 +8311,7 @@ fn materialise<'w, 'r>(
                 let entry_id = entry.id();
                 Action::DeliverReply {
                     id: entry_id,
-                    value: entry.staged().into_public(terminal_row_desc),
+                    value: entry.staged().into_public(terminal_row_desc, terminal_param_oids),
                 }
             }
             StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
@@ -8271,7 +8459,8 @@ impl core::fmt::Debug for PgProtocol<ActivePhase> {
         // alongside the inner's debug projection.
         f.debug_struct("PgProtocol")
             .field("phase", &"ActivePhase")
-            .field("row_desc_slot_present", &self.extras.as_ref().is_some())
+            .field("row_desc_slot_present", &self.extras.row_desc.as_ref().is_some())
+            .field("param_oids_slot_present", &self.extras.param_oids.as_ref().is_some())
             .field("inner", &self.inner)
             .finish_non_exhaustive()
     }
@@ -8533,7 +8722,7 @@ mod residue_policy_per_class_tests {
     fn fresh_active_proto() -> PgProtocol<ActivePhase> {
         PgProtocol {
             inner: _proto_init_leaf::fresh_active_inner(),
-            extras: _proto_init_leaf::fresh_active_row_desc_slot(),
+            extras: _proto_init_leaf::fresh_active_extras(),
             phase_marker: PhantomData,
         }
     }
@@ -8548,7 +8737,7 @@ mod residue_policy_per_class_tests {
     /// only the `<ActivePhase>` monomorphisation carries both
     /// `ActiveInner` AND the `RowDescSlotCell` extras.
     fn populate_residue(proto: &mut PgProtocol<ActivePhase>) {
-        proto.extras._set_for_test(Some(RowDesc::EMPTY));
+        proto.extras.row_desc._set_for_test(Some(RowDesc::EMPTY));
         proto.inner.session_params._set_for_test(Some(dirty_session_params()));
         proto.inner.error_arena = Some(alloc::boxed::Box::new(
             crate::error_arena::ErrorArena::new(),
@@ -8586,7 +8775,7 @@ mod residue_policy_per_class_tests {
         proto.inner.clear_session_residue_for_class(&mut proto.extras, class);
 
         assert!(
-            proto.extras.is_none(),
+            proto.extras.row_desc.is_none(),
             "Idle must clear row_desc_slot",
         );
         assert!(
@@ -8614,7 +8803,7 @@ mod residue_policy_per_class_tests {
         proto.inner.clear_session_residue_for_class(&mut proto.extras, class);
 
         assert!(
-            proto.extras.is_none(),
+            proto.extras.row_desc.is_none(),
             "Errored must clear row_desc_slot",
         );
         assert!(
@@ -8647,7 +8836,7 @@ mod residue_policy_per_class_tests {
         );
 
         assert!(
-            proto.extras.is_some(),
+            proto.extras.row_desc.is_some(),
             "Connecting (StatePushClass::Connecting) must preserve row_desc_slot",
         );
         assert!(
@@ -8674,7 +8863,7 @@ mod residue_policy_per_class_tests {
         proto.inner.clear_session_residue_for_class(&mut proto.extras, class);
 
         assert!(
-            proto.extras.is_some(),
+            proto.extras.row_desc.is_some(),
             "PingAwaiting (StatePushClass::PingAwaiting) must preserve row_desc_slot",
         );
         assert!(
@@ -8699,7 +8888,7 @@ mod residue_policy_per_class_tests {
         proto.inner.clear_session_residue_for_class(&mut proto.extras, class);
 
         assert!(
-            proto.extras.is_some(),
+            proto.extras.row_desc.is_some(),
             "BusyQuery (StatePushClass::BusyQuery) must preserve row_desc_slot",
         );
         assert!(
@@ -9268,7 +9457,7 @@ mod compute_push_tests {
         // `phase_marker` is ZST without external construction.
         let mut proto: PgProtocol<ActivePhase> = PgProtocol {
             inner: _proto_init_leaf::fresh_active_inner(),
-            extras: _proto_init_leaf::fresh_active_row_desc_slot(),
+            extras: _proto_init_leaf::fresh_active_extras(),
             phase_marker: PhantomData,
         };
         let mut wb = WriteBuf::new();

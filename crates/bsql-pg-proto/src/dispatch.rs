@@ -82,6 +82,47 @@ pub(crate) mod _row_description_dispatch_leaf {
         slot.park_at_t_dispatch(row_desc, TDispatchToken(()));
     }
 }
+
+/// Leaf submodule for the inbound `'t'` (ParameterDescription) frame
+/// dispatch. Hosts the [`ParamDescDispatchToken`] type and the single
+/// park helper fn. DEF-286 Φ1 mirror of
+/// [`_row_description_dispatch_leaf`].
+///
+/// Sole call site:
+/// `(ProtoState::DescribeStatementAwaitingParamDesc, TAG_PARAMETER_DESCRIPTION)`
+/// dispatch arm. Parses the wire bytes into a boxed
+/// [`crate::decode::ParamOids`] then hands the Box to the slot via
+/// [`crate::param_oids_slot::ParamOidsSlotCell::park_at_param_desc_dispatch`].
+///
+/// State variant transitions to
+/// [`ProtoState::DescribeStatementAwaitingRowDescOrNoData`] AFTER
+/// the park; the variant carries only the bare `ReplyId` post-DEF-286
+/// (no more `param_oids: Box<ParamOids>` field — the slot owns the
+/// box).
+pub(crate) mod _param_description_dispatch_leaf {
+    /// Leaf-scope token. The tuple-struct field is PRIVATE to this
+    /// submodule — `Self(())` mints are callable ONLY here. The type
+    /// itself is `pub(crate)` so
+    /// [`crate::param_oids_slot::ParamOidsSlotCell::park_at_param_desc_dispatch`]
+    /// can name it in its parameter signature.
+    pub(crate) struct ParamDescDispatchToken(());
+
+    /// Mint a [`ParamDescDispatchToken`] and write `param_oids` into
+    /// `slot` via
+    /// [`crate::param_oids_slot::ParamOidsSlotCell::park_at_param_desc_dispatch`].
+    /// Sole call site: `'t'` arm dispatch transition for
+    /// `ProtoState::DescribeStatementAwaitingParamDesc`.
+    ///
+    /// The `param_oids` is passed by Box (allocated once at parse-time
+    /// inside this arm's parser call) — slot owns the heap.
+    #[inline]
+    pub(in crate::dispatch) fn park_param_oids_at_dispatch(
+        slot: &mut crate::param_oids_slot::ParamOidsSlotCell,
+        param_oids: alloc::boxed::Box<crate::action::ParamOids>,
+    ) {
+        slot.park_at_param_desc_dispatch(param_oids, ParamDescDispatchToken(()));
+    }
+}
 use crate::wire::{
     SCRAM_SHA_256_MECHANISM, TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE,
     TAG_CLOSE_COMPLETE, TAG_COMMAND_COMPLETE, TAG_COPY_DATA, TAG_COPY_DONE, TAG_COPY_IN_RESPONSE,
@@ -286,12 +327,35 @@ fn validate_empty_body(
 /// compiler cannot catch. Mitigation: arm-body coverage tests
 /// across all transitions (the existing test suite exercises every
 /// `(state, tag)` pair reachable in the state machine).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Slot threading across the per-frame dispatch boundary \
+              requires one `&mut` per outer-level cell + ancillary \
+              arena slots. Each parameter is a distinct mutable view \
+              into PgProtocol storage; bundling into a single \
+              `DispatchContext`-like struct would force the dispatch \
+              body to destructure that struct on every call (the \
+              outer `DispatchContext` already does this once — \
+              re-bundling here would double the indirection). \
+              DEF-286 Φ1 added `param_oids_slot` next to \
+              `row_desc_slot` to mirror the per-cell slot-pattern; \
+              the count grew from 7 to 8."
+)]
 pub(crate) fn dispatch(
     state: &mut ProtoState,
     tag: crate::wire::InboundTag,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
     row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
+    // DEF-286 Φ1: ParamOids slot. Only the `'t'`
+    // (ParameterDescription) arm in the
+    // `DescribeStatementAwaitingParamDesc` state writes here. All
+    // other arms ignore it. The slot's box is read via `as_ref()`
+    // by `materialise` at the trailing `'Z'` arm and projected into
+    // the public `Reply::DescribeStatementComplete.param_oids:
+    // &'r ParamOids`. Cycle close (Idle/Errored entry) drops the
+    // box via `clear_at_residue`.
+    param_oids_slot: &mut crate::param_oids_slot::ParamOidsSlotCell,
     // `&mut Option<Box<ErrorArena>>` slot for the dispatch path's
     // only cold-write target. Most dispatch arms don't write
     // error_arena; the few that do (ErrorResponse arms) lazy-init
@@ -1391,20 +1455,26 @@ pub(crate) fn dispatch(
         // ─── Statement-describe path ───
 
         // Stage 1: awaiting ParameterDescription.
+        //
+        // DEF-286 Φ1 (slot-pattern): parsed `ParamOids` is heap-
+        // boxed once here and PARKED IN THE SLOT (not inline in the
+        // post-state variant). The post-state variant carries only
+        // the bare `ReplyId<DescribeStatementKind>`. Slot
+        // `as_ref()` projects to `&'r ParamOids` at the trailing
+        // `'Z'` materialise, which produces the public Reply with
+        // `param_oids: &'r ParamOids` (rather than the prior
+        // inlined owned `ParamOids`). Slot cleared at the next
+        // Idle/Errored residue clear — net: 1 alloc per Describe,
+        // 1 free per Describe.
         (ProtoState::DescribeStatementAwaitingParamDesc(reply), TAG_PARAMETER_DESCRIPTION) => {
             match crate::decode::parse_parameter_description(payload) {
                 Ok(param_oids) => {
-                    // Heap-box once at the 't' arrival; the same Box
-                    // is moved across the `AwaitingRowDescOrNoData →
-                    // AwaitingRfq` transition (zero allocator ops on
-                    // transition) and freed at the 'Z' deref-move into
-                    // `StagedDescribeStatementCompletePayload`. See
-                    // [`ProtoState::DescribeStatementAwaitingRowDescOrNoData`]
-                    // docstring for the `ProtoState`-size containment
-                    // rationale (mirror of SCRAM/MD5/Cleartext).
+                    _param_description_dispatch_leaf::park_param_oids_at_dispatch(
+                        param_oids_slot,
+                        alloc::boxed::Box::new(param_oids),
+                    );
                     *state = ProtoState::DescribeStatementAwaitingRowDescOrNoData {
                         reply,
-                        param_oids: alloc::boxed::Box::new(param_oids),
                     };
                     DispatchOutcome::AdvancedSilent
                 }
@@ -1419,8 +1489,12 @@ pub(crate) fn dispatch(
         }
 
         // Stage 2: awaiting RowDescription or NoData.
+        //
+        // DEF-286 Φ1: ParamOids no longer lives in the state variant
+        // — slot holds the box from the preceding `'t'` arm.
+        // Transition is a pure state-discriminant flip (no Box move).
         (
-            ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, param_oids },
+            ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply },
             TAG_ROW_DESCRIPTION,
         ) => match crate::decode::parse_row_description(payload) {
             Ok(row_desc) => {
@@ -1434,16 +1508,13 @@ pub(crate) fn dispatch(
                     row_desc_slot,
                     row_desc,
                 );
-                *state = ProtoState::DescribeStatementAwaitingRfq {
-                    reply,
-                    param_oids,
-                };
+                *state = ProtoState::DescribeStatementAwaitingRfq { reply };
                 DispatchOutcome::AdvancedSilent
             }
             Err(cause) => install_errored(state, Some(reply.consume()), cause),
         },
         (
-            ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, param_oids },
+            ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply },
             TAG_NO_DATA,
         ) => {
             // PG §55.7 NoData body must be empty. row_desc_slot stays
@@ -1451,10 +1522,7 @@ pub(crate) fn dispatch(
             // and emits Reply::DescribeStatementComplete with `NoData`.
             match validate_empty_body(payload, TAG_NO_DATA) {
                 Ok(()) => {
-                    *state = ProtoState::DescribeStatementAwaitingRfq {
-                        reply,
-                        param_oids,
-                    };
+                    *state = ProtoState::DescribeStatementAwaitingRfq { reply };
                     DispatchOutcome::AdvancedSilent
                 }
                 Err(cause) => install_errored(state, Some(reply.consume()), cause),
@@ -1469,14 +1537,21 @@ pub(crate) fn dispatch(
         }
 
         // Stage 3: awaiting ReadyForQuery — deliver the terminal
-        // reply carrying the accumulated param_oids. Schema (if any)
-        // lives in row_desc_slot, populated at the 'T' arm above;
-        // materialise reads the slot directly.
+        // reply. Both `param_oids` AND schema (if any) live in slots
+        // (`<ActivePhase>::Extras.param_oids` and `.row_desc`
+        // respectively, both populated at the earlier dispatch arms);
+        // materialise reads both slots directly via `as_ref()` and
+        // emits `Reply::DescribeStatementComplete` with `param_oids:
+        // &'r ParamOids` borrowed from the slot.
+        //
+        // DEF-286 Φ1: state variant carries no payload beyond
+        // `ReplyId<K>` — the staged variant emits NO `param_oids`
+        // payload either (consumer reads via the borrow at the
+        // Reply level). Slot drops the box at the next Idle/Errored
+        // residue clear (one-shot per Describe flow, paired with
+        // the `Box::new` at the `'t'` arrival).
         (
-            ProtoState::DescribeStatementAwaitingRfq {
-                reply,
-                param_oids,
-            },
+            ProtoState::DescribeStatementAwaitingRfq { reply },
             TAG_READY_FOR_QUERY,
         ) => match parse_rfq_payload(payload) {
             Ok(tx_status) => {
@@ -1485,14 +1560,6 @@ pub(crate) fn dispatch(
                     action: crate::action::deliver(
                         reply,
                         crate::action::StagedDescribeStatementCompletePayload {
-                            // Deref-move the heap-boxed ParamOids back into
-                            // the terminal reply payload (inline `ParamOids`
-                            // is the public-API shape). Frees the Box —
-                            // one-shot per Describe flow, paired with the
-                            // `Box::new` at the 't' arrival above. See
-                            // [`ProtoState::DescribeStatementAwaitingRowDescOrNoData`]
-                            // docstring for the per-flow allocator total.
-                            param_oids: *param_oids,
                             tx_status,
                         },
                     ),

@@ -1380,7 +1380,11 @@ pub enum StagedQueryCompletePayload {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagedDescribeStatementCompletePayload {
-    pub(crate) param_oids: ParamOids,
+    // DEF-286 Φ1: `param_oids` moved to
+    // `<ActivePhase>::Extras.param_oids` slot. Materialise reads
+    // the slot as `Option<&'r ParamOids>` (parked at the `'t'`
+    // dispatch arm); the public Reply payload carries the borrow.
+    // Staged variant carries only `tx_status` now.
     pub(crate) tx_status: TxStatus,
 }
 
@@ -1467,6 +1471,7 @@ impl StagedReply {
     pub(crate) fn into_public<'r>(
         self,
         row_desc_slot: Option<&'r crate::decode::RowDesc>,
+        param_oids_slot: Option<&'r ParamOids>,
     ) -> Reply<'r> {
         match self {
             Self::Pong(p) => Reply::Pong(p),
@@ -1505,7 +1510,7 @@ impl StagedReply {
             Self::ParseComplete(p) => Reply::ParseComplete(p),
             Self::CloseComplete(p) => Reply::CloseComplete(p),
             Self::DescribeStatementComplete(staged) => {
-                describe_statement_complete_into_public(staged, row_desc_slot)
+                describe_statement_complete_into_public(staged, row_desc_slot, param_oids_slot)
             }
             Self::DescribePortalComplete(staged) => {
                 describe_portal_complete_into_public(staged, row_desc_slot)
@@ -1534,9 +1539,20 @@ impl StagedReply {
 fn describe_statement_complete_into_public<'r>(
     staged: StagedDescribeStatementCompletePayload,
     row_desc_slot: Option<&'r crate::decode::RowDesc>,
+    param_oids_slot: Option<&'r ParamOids>,
 ) -> Reply<'r> {
     Reply::DescribeStatementComplete(DescribeStatementCompletePayload {
-        param_oids: staged.param_oids,
+        // DEF-286 Φ1: `param_oids` borrowed from
+        // `<ActivePhase>::Extras.param_oids` slot (parked at the
+        // `'t'` arm). Slot's `as_ref()` projects to
+        // `Option<&'r ParamOids>`. The architecturally-dead `None`
+        // arm (slot empty at terminal RFQ would be a slot-cycle
+        // violation) defensively maps to a static EMPTY view —
+        // tier-3 classifier with no panic surface; the public
+        // contract guarantees `param_oids` is meaningful only after
+        // a successful `'t' → 'Z'` cycle, which is the only path
+        // that reaches this materialise site.
+        param_oids: param_oids_slot.unwrap_or(&ParamOids::EMPTY),
         rows: describe_rows_from_slot(row_desc_slot),
         tx_status: staged.tx_status,
     })
@@ -2244,7 +2260,15 @@ impl Eq for ParamOids {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DescribeStatementCompletePayload<'r> {
     /// Parameter OIDs, in positional order (`$1`, `$2`, …).
-    pub param_oids: ParamOids,
+    ///
+    /// DEF-286 Φ1: borrowed from
+    /// `<ActivePhase>::Extras.param_oids` slot (parked at the
+    /// `'t'` ParameterDescription dispatch arm; cleared at the
+    /// next Idle/Errored residue clear). The `&'r` lifetime ties
+    /// the borrow to the `feed_bytes` reply window — consumer
+    /// must read out (or `Clone`) before pushing the next command
+    /// (which clears the slot).
+    pub param_oids: &'r ParamOids,
     /// Rows-or-no-data sum from the subsequent response frame.
     /// `DescribedRows` holds a `&'r RowDesc` borrow.
     pub rows: DescribedRows<'r>,

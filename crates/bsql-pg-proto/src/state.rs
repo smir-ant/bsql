@@ -18,7 +18,11 @@
 //! (no action, no state change — post-`CloseSocket` packet flushes
 //! become true no-ops instead of silent mis-advances).
 
-use crate::action::ParamOids;
+// DEF-286 Φ1 removed the `param_oids: Box<ParamOids>` fields from
+// DescribeStatement state variants — slot-pattern lift to
+// `<ActivePhase>::Extras.param_oids`. Production state.rs no
+// longer references `ParamOids`; tests use the fully-qualified
+// `crate::action::ParamOids` path where needed.
 use crate::error::BoundedStr;
 use crate::error::StateErrorKind;
 use crate::reply_id::{
@@ -702,33 +706,41 @@ pub enum ProtoState {
     /// No-data branch: `'n'` → [`DescribedRows::NoData`]; continue
     /// to [`Self::DescribeStatementAwaitingRfq`].
     ///
-    /// # Heap-boxed `param_oids` (mirror of SCRAM/MD5/Cleartext)
+    /// # `param_oids` lives in the slot (DEF-286 Φ1)
     ///
-    /// [`ParamOids`] is 68 B inline (`#[repr(C, align(4))]` with
-    /// `n_params: u16` + 2 B pad + `[u32; 16]`). Inline storage
-    /// would dominate `ProtoState` size — see the same rationale
-    /// on [`Self::ConnectingStartupScram`] (`scram` field),
-    /// [`Self::ConnectingStartupMd5`] (`handshake` field), and
-    /// [`Self::ConnectingStartupCleartext`] (`password` field).
+    /// Pre-DEF-286 (and post-DEF-282), this variant carried
+    /// `param_oids: Box<ParamOids>` inline — the box moved across
+    /// the `AwaitingRowDescOrNoData → AwaitingRfq` transition by
+    /// pointer copy-move, then deref-inlined into
+    /// `StagedDescribeStatementCompletePayload.param_oids:
+    /// ParamOids` at the trailing `'Z'`.
     ///
-    /// `Box<ParamOids>` reduces variant footprint to ~24 B
-    /// (8 B Box ptr, 8 B ReplyId, 1 B disc, align tail-pad). Tier-1
-    /// preserved — `Box` cannot be `None`, the variant cannot exist
-    /// without its `ParamOids`. The same `Box` is moved across the
-    /// transition to `AwaitingRfq` (state-discriminant flip plus a
-    /// Box pointer copy-move, zero allocator ops). Per-Describe-flow
-    /// total: 1 alloc (`'t'` arrival) and 1 free (`'Z'` arrival when
-    /// the Box is deref-moved into the terminal reply payload).
+    /// DEF-286 Φ1 lifted the box to
+    /// [`crate::param_oids_slot::ParamOidsSlotCell`] on
+    /// `<ActivePhase>::Extras` — mirror of the `row_desc_slot`
+    /// pattern. Net effect:
+    ///
+    /// - Variant footprint shrinks 24 B → 16 B (bare `ReplyId<K>` +
+    ///   disc + tail-pad). The `ProtoState` size pin (currently
+    ///   capped by `BoundedStr<32>` command_tag in other variants)
+    ///   is unaffected by this single-variant shrink, but the
+    ///   architectural cleanup is real.
+    /// - Reply payload (public surface) changes from `param_oids:
+    ///   ParamOids` (68 B inline) to `param_oids: &'r ParamOids`
+    ///   (8 B borrowed from the slot). Reply size pin shrinks
+    ///   80 B → ~48 B (next dominator now wins).
+    /// - Tier-1 preserved: slot equals itself (identity, not
+    ///   discipline). Slot lifecycle is closed by-construction —
+    ///   `'t'` arm parks via concrete-type token, Idle/Errored
+    ///   residue clears via a different concrete-type token, no
+    ///   intermediate code can leak the box outside the per-cycle
+    ///   window.
     DescribeStatementAwaitingRowDescOrNoData {
-        /// Correlator for the Describe command.
+        /// Correlator for the Describe command. The associated
+        /// `ParamOids` lives in
+        /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the
+        /// outer Extras (parked at the `'t'` dispatch arm).
         reply: ReplyId<DescribeStatementKind>,
-        /// Parameter OIDs parsed from the preceding `'t'` frame.
-        /// Threaded through to the terminal reply payload.
-        /// Heap-boxed for [`ProtoState`] size containment — see
-        /// variant docstring above for the size + transition
-        /// rationale (mirror of `Box<ScramSession>` /
-        /// `Box<Md5HandshakeState>` / `Box<Sensitive<Password>>`).
-        param_oids: alloc::boxed::Box<ParamOids>,
     },
 
     /// Row-desc / no-data known; awaiting the trailing
@@ -754,22 +766,22 @@ pub enum ProtoState {
     /// **Tier-1 by-construction**: the slot equals itself (identity,
     /// not discipline).
     ///
-    /// # Heap-boxed `param_oids`
+    /// # `param_oids` lives in the slot (DEF-286 Φ1)
     ///
     /// See [`Self::DescribeStatementAwaitingRowDescOrNoData`] for
-    /// the full rationale — the `Box<ParamOids>` is the **same**
-    /// allocation as on the prior variant; the
-    /// `AwaitingRowDescOrNoData → AwaitingRfq` transition is a
-    /// state-discriminant flip + Box pointer copy-move (zero
-    /// allocator ops).
+    /// the full slot-pattern rationale — `param_oids` now lives in
+    /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the outer
+    /// Extras, not inline on this variant. The transition
+    /// `AwaitingRowDescOrNoData → AwaitingRfq` is now a pure
+    /// state-discriminant flip (no Box move, since the slot already
+    /// holds the box across both variants).
     DescribeStatementAwaitingRfq {
-        /// Correlator for the Describe command.
+        /// Correlator for the Describe command. The associated
+        /// `ParamOids` lives in
+        /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the
+        /// outer Extras (parked at the `'t'` dispatch arm of the
+        /// prior `DescribeStatementAwaitingParamDesc` state).
         reply: ReplyId<DescribeStatementKind>,
-        /// Parameter OIDs captured at the `'t'` transition.
-        /// **Same `Box` allocation** as on
-        /// [`Self::DescribeStatementAwaitingRowDescOrNoData`];
-        /// reused across the transition (no alloc on transition).
-        param_oids: alloc::boxed::Box<ParamOids>,
     },
 
     // ─── Portal-describe path ───
@@ -1402,18 +1414,20 @@ pub enum ActiveState {
     /// Mirror of [`ProtoState::DescribeStatementAwaitingParamDesc`].
     DescribeStatementAwaitingParamDesc(ReplyId<DescribeStatementKind>),
     /// Mirror of [`ProtoState::DescribeStatementAwaitingRowDescOrNoData`].
-    /// `param_oids` is heap-boxed for size containment — see the
-    /// matching `ProtoState` variant docstring for rationale.
+    /// DEF-286 Φ1: `param_oids` lives in
+    /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the outer
+    /// `<ActivePhase>::Extras` — variant carries only the bare
+    /// `ReplyId<K>`.
     DescribeStatementAwaitingRowDescOrNoData {
         reply: ReplyId<DescribeStatementKind>,
-        param_oids: alloc::boxed::Box<ParamOids>,
     },
-    /// Mirror of [`ProtoState::DescribeStatementAwaitingRfq`]. Same
-    /// `Box<ParamOids>` allocation as the prior variant — moved
-    /// across the transition.
+    /// Mirror of [`ProtoState::DescribeStatementAwaitingRfq`].
+    /// DEF-286 Φ1: `param_oids` lives in the
+    /// [`crate::param_oids_slot::ParamOidsSlotCell`] (parked at the
+    /// earlier `'t'` dispatch arm); variant carries only the bare
+    /// `ReplyId<K>`.
     DescribeStatementAwaitingRfq {
         reply: ReplyId<DescribeStatementKind>,
-        param_oids: alloc::boxed::Box<ParamOids>,
     },
     /// Mirror of [`ProtoState::DescribePortalAwaitingRowDescOrNoData`].
     DescribePortalAwaitingRowDescOrNoData(ReplyId<DescribePortalKind>),
@@ -1573,15 +1587,11 @@ impl From<ActiveState> for ProtoState {
             ActiveState::DescribeStatementAwaitingParamDesc(r) => {
                 ProtoState::DescribeStatementAwaitingParamDesc(r)
             }
-            ActiveState::DescribeStatementAwaitingRowDescOrNoData {
-                reply,
-                param_oids,
-            } => ProtoState::DescribeStatementAwaitingRowDescOrNoData {
-                reply,
-                param_oids,
-            },
-            ActiveState::DescribeStatementAwaitingRfq { reply, param_oids } => {
-                ProtoState::DescribeStatementAwaitingRfq { reply, param_oids }
+            ActiveState::DescribeStatementAwaitingRowDescOrNoData { reply } => {
+                ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply }
+            }
+            ActiveState::DescribeStatementAwaitingRfq { reply } => {
+                ProtoState::DescribeStatementAwaitingRfq { reply }
             }
             ActiveState::DescribePortalAwaitingRowDescOrNoData(r) => {
                 ProtoState::DescribePortalAwaitingRowDescOrNoData(r)
@@ -1982,15 +1992,11 @@ impl TryFrom<ProtoState> for ActiveState {
             ProtoState::DescribeStatementAwaitingParamDesc(r) => {
                 Ok(ActiveState::DescribeStatementAwaitingParamDesc(r))
             }
-            ProtoState::DescribeStatementAwaitingRowDescOrNoData {
-                reply,
-                param_oids,
-            } => Ok(ActiveState::DescribeStatementAwaitingRowDescOrNoData {
-                reply,
-                param_oids,
-            }),
-            ProtoState::DescribeStatementAwaitingRfq { reply, param_oids } => {
-                Ok(ActiveState::DescribeStatementAwaitingRfq { reply, param_oids })
+            ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply } => {
+                Ok(ActiveState::DescribeStatementAwaitingRowDescOrNoData { reply })
+            }
+            ProtoState::DescribeStatementAwaitingRfq { reply } => {
+                Ok(ActiveState::DescribeStatementAwaitingRfq { reply })
             }
             ProtoState::DescribePortalAwaitingRowDescOrNoData(r) => {
                 Ok(ActiveState::DescribePortalAwaitingRowDescOrNoData(r))
@@ -2519,14 +2525,12 @@ mod push_class_tests {
         pin(
             ProtoState::DescribeStatementAwaitingRowDescOrNoData {
                 reply: ReplyId::from_raw(nz(6_002)),
-                param_oids: alloc::boxed::Box::new(crate::action::ParamOids::EMPTY),
             },
             StatePushClass::BusyQuery,
         );
         pin(
             ProtoState::DescribeStatementAwaitingRfq {
                 reply: ReplyId::from_raw(nz(6_003)),
-                param_oids: alloc::boxed::Box::new(crate::action::ParamOids::EMPTY),
             },
             StatePushClass::BusyQuery,
         );
@@ -2798,11 +2802,9 @@ mod per_phase_state_roundtrip_tests {
         ));
         roundtrip_active(ProtoState::DescribeStatementAwaitingRowDescOrNoData {
             reply: ReplyId::from_raw(nz(6_002)),
-            param_oids: alloc::boxed::Box::new(crate::action::ParamOids::default()),
         });
         roundtrip_active(ProtoState::DescribeStatementAwaitingRfq {
             reply: ReplyId::from_raw(nz(6_003)),
-            param_oids: alloc::boxed::Box::new(crate::action::ParamOids::default()),
         });
 
         // DescribePortal flow.
