@@ -289,14 +289,17 @@ const _: () = assert!(
 
 // Colocated drift-pin.
 //
-// ProtocolError exact size must stay 72 B — variant growth here
-// cascades into `Action<'w,'r>` (88 B), `OutActions = [Action; 9]
-// + len` (800 B), and `StreamItem<'a>` (~80 B). The cascade costs
-// 1-2 KB of per-call stack frame, so the pin catches:
+// ProtocolError exact size must stay 24 B (post-DEF-286 Φ-B'').
+// Variant growth here cascades into `Action<'w,'r>` (32 B),
+// `OutActions = [Action; 9] + len` (296 B), and `StreamItem<'a>`.
+// The pin catches:
 //
-//   • New payload field on any variant that exceeds the 72 B budget.
+//   • New payload field on any variant that exceeds the 24 B budget.
 //   • Refactor that re-inlines the 288 B bounded strings into
 //     `ServerErrorResponse` (defeating the ErrorArena externalisation).
+//   • Refactor that re-inlines `BoundedStr<64>` into
+//     `ScramHandshakeFailure` (defeating the SCRAM-text
+//     externalisation introduced by DEF-286 Φ-B'').
 //   • Alignment-driven padding bumps from field ordering changes.
 //
 // The complementary `Action` / `OutActions` pins live in lib.rs
@@ -304,12 +307,14 @@ const _: () = assert!(
 // drift AT the variant-definition site (Fail-Fast locality) rather
 // than at first use.
 const _: () = assert!(
-    core::mem::size_of::<ProtocolError>() == 72,
-    "ProtocolError exact size — 72 B. \
-     Variant shape change detected. Run `cargo expand --test` and \
-     audit each variant payload: ServerErrorResponse should carry \
-     ErrorRef (8 B), not inline BoundedStr<N>. See lib.rs cascade \
-     pins (Action / OutActions) for downstream impact.",
+    core::mem::size_of::<ProtocolError>() == 24,
+    "ProtocolError exact size — 24 B (post-DEF-286 Φ-B''). \
+     Variant shape change detected. Audit each variant payload: \
+     ServerErrorResponse should carry ErrorRef (8 B), not inline \
+     BoundedStr<N>; ScramHandshakeFailure should carry \
+     ScramFailureClass (8 B) + Option<ErrorRef> (8 B), not inline \
+     ScramError (formerly 68 B via BoundedStr<64>). See lib.rs \
+     cascade pins (Action / OutActions) for downstream impact.",
 );
 
 
@@ -496,17 +501,53 @@ pub enum ProtocolError {
 
     /// SCRAM authentication failure.
     ///
-    /// Typed variant carrying the discrete
-    /// [`scram::wire::ScramError`] classification directly. A naive
-    /// `ScramError { detail: heapless::String<128> }` shape would
-    /// be a tier-3 silent-truncation seam (`.unwrap_or_default()`
-    /// on `heapless::String::try_from`) — formatted strings larger
-    /// than 128 bytes would silently collapse to empty. The typed
-    /// cause is a discrete enum; `Display` is computed from the
-    /// variant, no intermediate buffer, no truncation class.
+    /// **DEF-286 Φ-B'' shape**: carries a slim
+    /// [`crate::scram::wire::ScramFailureClass`] (8 B inline — tag +
+    /// optional u32 iteration count) alongside an
+    /// `Option<crate::error_arena::ErrorRef>` for the optional
+    /// server-supplied error text (`e=<text>` from RFC 5802 §5.1
+    /// server-final-message). The text — only populated for the
+    /// `ScramFailureClass::ServerScramError` class — lives in
+    /// [`crate::error_arena::ErrorArena`] alongside the
+    /// `ServerError` payload (mutually exclusive single-slot use:
+    /// SCRAM never coexists with `ErrorResponse` on the wire).
+    ///
+    /// # Why externalised rather than inline `BoundedStr<64>`
+    ///
+    /// Pre-DEF-286 Φ-B'' shape stored the inline 64-B
+    /// `ServerScramError { message }` payload directly inside
+    /// `ScramError`, blowing `ProtocolError` to 72 B (max-variant-
+    /// dominator). Externalisation collapses the variant to
+    /// `(class 8 B + detail 8 B) = 16 B` payload, taking
+    /// `ProtocolError` from 72 → 24 B (−67 %) — and that win
+    /// cascades through `Action` (80 → 32) and `OutActions`
+    /// (728 → 296) without touching the Copy chain or introducing
+    /// a Drop cascade through Vec slots (Phase B regression class).
+    ///
+    /// # Class vs detail ref
+    ///
+    /// - `class`: identity of the failure, including iteration count
+    ///   for `IterationsTooLow`/`TooHigh`. Always present.
+    /// - `detail`: `Some(ErrorRef)` only when the wire-supplied
+    ///   text was non-empty (i.e., `class ==
+    ///   ScramFailureClass::ServerScramError` with a non-empty
+    ///   `e=<text>` field); `None` for every other class. Resolved
+    ///   via [`crate::PgProtocol::get_server_error`] →
+    ///   `Result<&ErrorPayload, ArenaError>` with the `Scram`
+    ///   variant.
     ///
     /// [`scram::wire::ScramError`]: crate::scram::wire::ScramError
-    Scram(crate::scram::wire::ScramError),
+    ScramHandshakeFailure {
+        /// Discrete identity of the SCRAM failure (every variant of
+        /// [`crate::scram::wire::ScramError`] is mirrored, minus the
+        /// inline text payload).
+        class: crate::scram::wire::ScramFailureClass,
+        /// Arena-backed text for the `ServerScramError` class.
+        /// `None` for all other classes (the wire format only
+        /// supplies text in the `e=<text>` field of server-final-
+        /// message).
+        detail: Option<crate::error_arena::ErrorRef>,
+    },
 
     /// Server's `BackendKeyData` payload has wrong size (expected 8).
     MalformedBackendKeyData {
@@ -1349,7 +1390,7 @@ impl ProtocolError {
             Self::ServerErrorResponse { .. } => ErrorKind::ServerError,
             Self::UnsupportedAuthMethod { .. }
             | Self::UnsupportedProtocolOption
-            | Self::Scram(_) => ErrorKind::Auth,
+            | Self::ScramHandshakeFailure { .. } => ErrorKind::Auth,
             // Client-side push-ordering bugs must NOT route to `Auth`
             // — they're the user calling push_command out of order,
             // not a server auth failure. Wrappers reading
@@ -1409,6 +1450,49 @@ impl ProtocolError {
     #[must_use]
     pub const fn state_kind(&self) -> StateErrorKind {
         StateErrorKind::from_kind_or_internal(self.kind())
+    }
+}
+
+impl ProtocolError {
+    /// Construct a `ScramHandshakeFailure` from a wire-layer
+    /// [`crate::scram::wire::ScramError`] **without** allocating any
+    /// arena-backed text — used at SCRAM dispatch sites where the
+    /// error class is architecturally guaranteed never to be
+    /// `ServerScramError` (e.g., outbound builder
+    /// `BufferOverflow`, `parse_server_first` malformed-frame
+    /// classes, `HmacKeyRejected`).
+    ///
+    /// For sites where text COULD be present (notably
+    /// `parse_server_final` returning the server `e=<text>`),
+    /// callers MUST use
+    /// [`crate::error_arena::scram_error_to_protocol_error`]
+    /// instead — that path threads the arena slot and preserves the
+    /// forensic text payload via `ErrorPayload::Scram`.
+    ///
+    /// # Total
+    ///
+    /// Every `ScramError` variant maps to a `ScramFailureClass` of
+    /// matching identity. The `ServerScramError`'s inline message
+    /// (which is the only carrier of text) is dropped here — this
+    /// helper is reserved for sites where that variant is
+    /// architecturally unreachable, so the drop is a contract
+    /// fulfilment, not a forensic loss.
+    #[inline]
+    #[must_use]
+    pub(crate) fn from_scram_no_text(e: crate::scram::wire::ScramError) -> Self {
+        let (class, _text_unused) = e.split_into_class_and_text();
+        Self::ScramHandshakeFailure { class, detail: None }
+    }
+
+    /// Construct a `ScramHandshakeFailure` directly from a
+    /// [`crate::scram::wire::ScramFailureClass`] with no arena
+    /// text. Used at sites that construct the class inline (e.g.
+    /// `BufferOverflow` raised by an outbound-frame push without
+    /// going through a `ScramError`).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn scram_no_text(class: crate::scram::wire::ScramFailureClass) -> Self {
+        Self::ScramHandshakeFailure { class, detail: None }
     }
 }
 
@@ -1540,7 +1624,18 @@ impl fmt::Display for ProtocolError {
             Self::UnsupportedProtocolOption => {
                 f.write_str("server does not support requested protocol option")
             }
-            Self::Scram(failure) => write!(f, "SCRAM authentication failed: {failure}"),
+            Self::ScramHandshakeFailure { class, detail: _ } => {
+                // Inline Display emits the class identity; the
+                // arena-backed text (when present) is rendered by
+                // `PgProtocol::display_error` (the arena-aware
+                // adapter) since the built-in `Display` has no
+                // arena borrow in scope.
+                write!(
+                    f,
+                    "SCRAM authentication failed: {class} \
+                     [use PgProtocol::display_error for server text]",
+                )
+            }
             Self::MalformedBackendKeyData { payload_len } => write!(
                 f,
                 "BackendKeyData payload length {payload_len} (expected 8)",

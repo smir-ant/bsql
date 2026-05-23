@@ -286,6 +286,162 @@ pub enum ScramError {
     RandomnessUnavailable,
 }
 
+/// Discriminant-flattened mirror of [`ScramError`] for protocol-error
+/// embedding. Carries every variant's identity + small payloads
+/// (iteration counts) inline, but **never** the `ServerScramError`
+/// text — that text is externalised into
+/// [`crate::error_arena::ErrorArena`] via an [`crate::error_arena::ErrorRef`]
+/// alongside the class.
+///
+/// # Why a parallel enum rather than mutating `ScramError`
+///
+/// `ScramError` is the boundary type returned by `parse_*` functions
+/// in `scram/wire.rs`; reshaping it would cascade through the wire-
+/// parsing surface for no protocol-level benefit. Instead this enum
+/// captures the *protocol-error-embedding* shape: same identity
+/// classes, no inline 64-B string. Conversion is one-way
+/// ([`ScramError::split_into_class_and_text`]); the wire-layer keeps
+/// returning fat `ScramError`, the protocol layer stores the slim
+/// `(class, detail_ref)` pair.
+///
+/// # Footprint
+///
+/// Maximum variant payload is `u32` (`IterationsTooLow`/`TooHigh`);
+/// total enum size = 8 B (tag 1 B + 3 B pad + u32 4 B, align 4).
+/// Compared to inline `ScramError` (≈ 68 B due to BoundedStr<64>),
+/// this saves ≈ 60 B per `ProtocolError::ScramHandshakeFailure`
+/// occurrence — which cascades into Action (80 → 32 B) and
+/// OutActions (728 → 296 B).
+///
+/// # Const-asserts colocated in [`crate::error`]
+///
+/// Size pin and Option-niche pin live next to the
+/// `ProtocolError::ScramHandshakeFailure` variant for fail-fast on
+/// layout drift at the consumption site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScramFailureClass {
+    /// Mirror of [`ScramError::NoncePrefixMismatch`].
+    NoncePrefixMismatch,
+    /// Mirror of [`ScramError::IterationsTooLow`]; carries the
+    /// offending iteration count for ops diagnosis.
+    IterationsTooLow {
+        /// The iterations value the server sent (below RFC 7677 minimum).
+        iterations: u32,
+    },
+    /// Mirror of [`ScramError::IterationsTooHigh`].
+    IterationsTooHigh {
+        /// The offending iterations value (exceeded client sanity cap).
+        iterations: u32,
+    },
+    /// Mirror of [`ScramError::HmacKeyRejected`].
+    HmacKeyRejected,
+    /// Mirror of [`ScramError::MalformedServerFirst`].
+    MalformedServerFirst,
+    /// Mirror of [`ScramError::ServerScramError`] — the inline text
+    /// payload has been externalised into the arena alongside this
+    /// class; the `ProtocolError::ScramHandshakeFailure.detail`
+    /// `ErrorRef` field resolves the text.
+    ServerScramError,
+    /// Mirror of [`ScramError::MalformedServerFinal`].
+    MalformedServerFinal,
+    /// Mirror of [`ScramError::SignatureMismatch`].
+    SignatureMismatch,
+    /// Mirror of [`ScramError::Base64DecodeError`].
+    Base64DecodeError,
+    /// Mirror of [`ScramError::InvalidSalt`].
+    InvalidSalt,
+    /// Mirror of [`ScramError::ServerNonceTooLong`].
+    ServerNonceTooLong,
+    /// Mirror of [`ScramError::BufferOverflow`].
+    BufferOverflow,
+    /// Mirror of [`ScramError::NoSupportedMechanism`].
+    NoSupportedMechanism,
+    /// Mirror of [`ScramError::RandomnessUnavailable`].
+    RandomnessUnavailable,
+}
+
+impl ScramError {
+    /// One-way conversion: split a wire-layer [`ScramError`] into the
+    /// protocol-embedding [`ScramFailureClass`] + optional inline text
+    /// (only present for [`ScramError::ServerScramError`]).
+    ///
+    /// Callers in `dispatch.rs` use this to convert wire-layer SCRAM
+    /// errors into the slim [`crate::error::ProtocolError::ScramHandshakeFailure`]
+    /// form: the text (when present) is alloc'd into
+    /// [`crate::error_arena::ErrorArena`] via
+    /// [`crate::error_arena::ErrorPayload::Scram`], and the resulting
+    /// [`crate::error_arena::ErrorRef`] threads into the
+    /// `ProtocolError::ScramHandshakeFailure.detail` field.
+    ///
+    /// # Total
+    ///
+    /// Every `ScramError` variant produces a `ScramFailureClass` of
+    /// matching identity. Only `ServerScramError` contributes the
+    /// optional `Some(text)` half; all other variants return
+    /// `(class, None)`.
+    #[inline]
+    #[must_use]
+    pub fn split_into_class_and_text(
+        self,
+    ) -> (ScramFailureClass, Option<crate::ident::BoundedStr<64>>) {
+        match self {
+            Self::NoncePrefixMismatch => (ScramFailureClass::NoncePrefixMismatch, None),
+            Self::IterationsTooLow { iterations } => {
+                (ScramFailureClass::IterationsTooLow { iterations }, None)
+            }
+            Self::IterationsTooHigh { iterations } => {
+                (ScramFailureClass::IterationsTooHigh { iterations }, None)
+            }
+            Self::HmacKeyRejected => (ScramFailureClass::HmacKeyRejected, None),
+            Self::MalformedServerFirst => (ScramFailureClass::MalformedServerFirst, None),
+            Self::ServerScramError { message } => {
+                (ScramFailureClass::ServerScramError, Some(message))
+            }
+            Self::MalformedServerFinal => (ScramFailureClass::MalformedServerFinal, None),
+            Self::SignatureMismatch => (ScramFailureClass::SignatureMismatch, None),
+            Self::Base64DecodeError => (ScramFailureClass::Base64DecodeError, None),
+            Self::InvalidSalt => (ScramFailureClass::InvalidSalt, None),
+            Self::ServerNonceTooLong => (ScramFailureClass::ServerNonceTooLong, None),
+            Self::BufferOverflow => (ScramFailureClass::BufferOverflow, None),
+            Self::NoSupportedMechanism => (ScramFailureClass::NoSupportedMechanism, None),
+            Self::RandomnessUnavailable => (ScramFailureClass::RandomnessUnavailable, None),
+        }
+    }
+}
+
+impl core::fmt::Display for ScramFailureClass {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The class-only Display mirrors the inline ScramError Display
+        // arm-for-arm; the externalised text (when present) is rendered
+        // alongside by ProtocolError::Display via the ErrorArena resolver.
+        match self {
+            Self::NoncePrefixMismatch => {
+                f.write_str("SCRAM: server nonce does not start with client nonce")
+            }
+            Self::IterationsTooLow { iterations } => {
+                write!(f, "SCRAM: server iterations {iterations} below RFC 7677 minimum")
+            }
+            Self::IterationsTooHigh { iterations } => {
+                write!(f, "SCRAM: server iterations {iterations} above client sanity cap")
+            }
+            Self::HmacKeyRejected => f.write_str("SCRAM: HMAC-SHA-256 key construction rejected"),
+            Self::MalformedServerFirst => f.write_str("SCRAM: malformed server-first-message"),
+            Self::ServerScramError => {
+                f.write_str("SCRAM: server reported authentication error")
+            }
+            Self::MalformedServerFinal => f.write_str("SCRAM: malformed server-final-message"),
+            Self::SignatureMismatch => f.write_str("SCRAM: server signature verification failed"),
+            Self::Base64DecodeError => f.write_str("SCRAM: base64 decode failed"),
+            Self::InvalidSalt => f.write_str("SCRAM: invalid salt"),
+            Self::ServerNonceTooLong => f.write_str("SCRAM: server nonce too long"),
+            Self::BufferOverflow => f.write_str("SCRAM: message buffer overflow"),
+            Self::NoSupportedMechanism => f.write_str("SCRAM: no supported mechanism offered"),
+            Self::RandomnessUnavailable => f.write_str("SCRAM: OS randomness source unavailable"),
+        }
+    }
+}
+
 // `core::error::Error` impl on the SCRAM-handshake error — lets
 // downstream consumers route this type through any `?`-bubbling
 // stack that bounds on `core::error::Error`.

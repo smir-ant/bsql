@@ -96,16 +96,55 @@ use crate::ident::SecretBoundedStr;
 /// operators do NOT want lingering in freed memory after error-
 /// arena reuse. The contributor must explicitly choose: zeroize-
 /// aware type or `#[zeroize(skip)]` annotation with rationale.
+// `clippy::large_enum_variant`: the `ServerError` variant intentionally
+// carries the 288-B bundle of bounded strings inline; the parallel
+// `Scram` variant is ~67 B. Boxing `ServerError` would push every
+// alloc into a heap indirection and break the zero-alloc invariant
+// for the steady-state ErrorResponse handling path. The arena holds
+// a SINGLE slot — the max-variant size IS the arena footprint, so
+// shrinking the `Scram` variant to match would be wasted space:
+// the slot must accommodate `ServerError` regardless. Allow with
+// rationale.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, zeroize::ZeroizeOnDrop)]
-pub struct ErrorPayload {
-    /// Server-provided human-readable error message (M field per
-    /// PG §55.7 ErrorResponse). Truncated at 128 bytes with `"…"`
-    /// marker if longer.
-    pub message: SecretBoundedStr<128>,
-    /// Optional detail string (D field). Often empty.
-    pub detail: SecretBoundedStr<96>,
-    /// Optional hint string (H field). Often empty.
-    pub hint: SecretBoundedStr<64>,
+#[non_exhaustive]
+pub enum ErrorPayload {
+    /// PG-level `ErrorResponse` frame (`'E'`) — three-string bundle
+    /// (message + detail + hint) per PG §55.7. Allocated by
+    /// `parse_and_alloc_server_error` in `dispatch.rs`; references via
+    /// [`crate::error::ProtocolError::ServerErrorResponse`].
+    ServerError {
+        /// Server-provided human-readable error message (M field per
+        /// PG §55.7 ErrorResponse). Truncated at 128 bytes with `"…"`
+        /// marker if longer.
+        message: SecretBoundedStr<128>,
+        /// Optional detail string (D field). Often empty.
+        detail: SecretBoundedStr<96>,
+        /// Optional hint string (H field). Often empty.
+        hint: SecretBoundedStr<64>,
+    },
+    /// SCRAM-handshake server-final error text (`e=<text>` per RFC 5802
+    /// §5.1). The class of failure is carried inline by
+    /// [`crate::scram::wire::ScramFailureClass`] alongside this
+    /// arena-backed text in
+    /// [`crate::error::ProtocolError::ScramHandshakeFailure`].
+    ///
+    /// # Mutual exclusion vs `ServerError`
+    ///
+    /// SCRAM and PG-ErrorResponse never coexist on the same arena
+    /// slot: SCRAM errors only fire during the auth handshake (pre-
+    /// ReadyForQuery); a fatal `ErrorResponse` during startup either
+    /// precedes SCRAM negotiation or follows post-auth — never
+    /// concurrently with a SCRAM error. The state machine
+    /// transitions to `Errored` on first error, blocking further
+    /// allocs in the same cycle (single-inflight invariant).
+    Scram {
+        /// Server-supplied SCRAM error token text (e.g.
+        /// `"invalid-proof"`, `"server-does-support-channel-binding"`).
+        /// Cap 64 covers all RFC 5802 §5.1 standard tokens with ~2×
+        /// headroom for SASL-extension growth.
+        text: SecretBoundedStr<64>,
+    },
 }
 
 /// Opaque handle into [`ErrorArena`]. 8 bytes (u8 slot-marker +
@@ -397,6 +436,46 @@ impl ErrorArena {
     }
 }
 
+/// Convert a wire-layer [`crate::scram::wire::ScramError`] into the
+/// protocol-embedding
+/// [`crate::error::ProtocolError::ScramHandshakeFailure`] shape,
+/// allocating the optional inline text payload into the supplied
+/// arena slot.
+///
+/// # Why a free function (not impl on ScramError)
+///
+/// The conversion needs `&mut Option<Box<ErrorArena>>` so it can
+/// lazily initialise the arena if no slot has been alloc'd yet —
+/// mirrors the [`crate::protocol::error_arena_or_init`] pattern used
+/// at the `ErrorResponse` parsing sites. Free function keeps the
+/// scram module surface arena-agnostic.
+///
+/// # Total
+///
+/// Every `ScramError` variant produces a `ProtocolError::ScramHandshakeFailure`.
+/// `ScramError::ServerScramError { message }` allocates the message
+/// into the arena via [`ErrorPayload::Scram`]; all other variants
+/// pass `detail: None`.
+#[inline]
+#[must_use]
+pub(crate) fn scram_error_to_protocol_error(
+    scram_err: crate::scram::wire::ScramError,
+    error_arena_slot: &mut Option<alloc::boxed::Box<ErrorArena>>,
+) -> crate::error::ProtocolError {
+    let (class, text_opt) = scram_err.split_into_class_and_text();
+    let detail = text_opt.map(|text| {
+        // `from_str_truncating(as_str)` mirrors the parse-layer
+        // lossy-ASCII coercion already applied inside ScramError —
+        // the SCRAM parser uses `BoundedStr::from_bytes_lossy`, so
+        // the `BoundedStr<64>` view is already lossy-coerced and the
+        // SecretBoundedStr build is exact-copy.
+        let secret_text = crate::ident::SecretBoundedStr::<64>::from_str_truncating(text.as_str());
+        let arena = crate::protocol::error_arena_or_init(error_arena_slot);
+        arena.alloc(ErrorPayload::Scram { text: secret_text })
+    });
+    crate::error::ProtocolError::ScramHandshakeFailure { class, detail }
+}
+
 impl Default for ErrorArena {
     #[inline]
     fn default() -> Self {
@@ -471,20 +550,30 @@ impl core::fmt::Display for DisplayError<'_> {
                     None => write!(f, "server error: [severity absent] ({code})")?,
                 }
                 match self.arena.get(*details_ref) {
-                    Ok(payload) => {
-                        let message = payload.message.as_str();
+                    Ok(ErrorPayload::ServerError { message, detail, hint }) => {
+                        let message = message.as_str();
                         if !message.is_empty() {
                             write!(f, " — {message}")?;
                         }
-                        let detail = payload.detail.as_str();
+                        let detail = detail.as_str();
                         if !detail.is_empty() {
                             write!(f, "; detail: {detail}")?;
                         }
-                        let hint = payload.hint.as_str();
+                        let hint = hint.as_str();
                         if !hint.is_empty() {
                             write!(f, "; hint: {hint}")?;
                         }
                         Ok(())
+                    }
+                    Ok(ErrorPayload::Scram { .. }) => {
+                        // Variant mismatch — the arena holds a SCRAM
+                        // payload but the error ref came from a
+                        // ServerErrorResponse variant. Architecturally
+                        // unreachable under single-inflight (SCRAM and
+                        // ServerError never coexist on the slot
+                        // simultaneously), but classified explicitly
+                        // rather than silently rendering empty.
+                        f.write_str(" [arena payload variant mismatch: expected ServerError, found Scram]")
                     }
                     Err(e) => {
                         // Arena miss — classified diagnostic rather
@@ -496,9 +585,34 @@ impl core::fmt::Display for DisplayError<'_> {
                     }
                 }
             }
+            ProtocolError::ScramHandshakeFailure { class, detail } => {
+                // Class always renders inline (matches built-in
+                // ProtocolError::Display arm verbatim).
+                write!(f, "SCRAM authentication failed: {class}")?;
+                // If the variant carries a detail ref, resolve via
+                // arena and append the server-supplied text — same
+                // pattern as ServerErrorResponse rendering above.
+                let Some(detail_ref) = detail else {
+                    return Ok(());
+                };
+                match self.arena.get(*detail_ref) {
+                    Ok(ErrorPayload::Scram { text }) => {
+                        let text = text.as_str();
+                        if !text.is_empty() {
+                            write!(f, " — {text}")?;
+                        }
+                        Ok(())
+                    }
+                    Ok(ErrorPayload::ServerError { .. }) => f.write_str(
+                        " [arena payload variant mismatch: expected Scram, found ServerError]",
+                    ),
+                    Err(e) => write!(f, " [arena ref unresolved: {e}]"),
+                }
+            }
             // Other variants: delegate verbatim to the built-in
             // Display impl. No regression class here — only
-            // ServerErrorResponse had arena-backed strings.
+            // ServerErrorResponse + ScramHandshakeFailure had
+            // arena-backed strings.
             other => core::fmt::Display::fmt(other, f),
         }
     }
@@ -554,7 +668,7 @@ mod drop_witness_tests {
     #[test]
     fn error_payload_drop_fires_zeroize_chain() {
         let probe = DropProbe::new();
-        let payload = ErrorPayload {
+        let payload = ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::from_str_truncating("error-witness"),
             detail: SecretBoundedStr::<96>::from_str_truncating("detail"),
             hint: SecretBoundedStr::<64>::from_str_truncating("hint"),
@@ -576,7 +690,7 @@ mod drop_witness_tests {
     fn error_payload_overwrite_fires_drop_on_old_value() {
         let probe = DropProbe::new();
         let mut wrapper = DropCounter::new(
-            ErrorPayload {
+            ErrorPayload::ServerError {
                 message: SecretBoundedStr::<128>::from_str_truncating("first"),
                 detail: SecretBoundedStr::<96>::new(),
                 hint: SecretBoundedStr::<64>::new(),
@@ -595,7 +709,7 @@ mod drop_witness_tests {
         core::mem::drop(core::mem::replace(
             &mut wrapper,
             DropCounter::new(
-                ErrorPayload {
+                ErrorPayload::ServerError {
                     message: SecretBoundedStr::<128>::from_str_truncating("second"),
                     detail: SecretBoundedStr::<96>::new(),
                     hint: SecretBoundedStr::<64>::new(),
@@ -638,7 +752,7 @@ mod tests {
     #[test]
     fn alloc_then_get_returns_payload() {
         let mut arena = ErrorArena::new();
-        let payload = ErrorPayload {
+        let payload = ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::from_str_truncating("boom"),
             detail: SecretBoundedStr::<96>::new(),
             hint: SecretBoundedStr::<64>::new(),
@@ -646,15 +760,15 @@ mod tests {
         let r = arena.alloc(payload);
         let got = arena.get(r);
         assert!(got.is_ok(), "alloc'd ref must resolve, got {got:?}");
-        if let Ok(payload_ref) = got {
-            assert_eq!(payload_ref.message.as_str(), "boom");
+        if let Ok(ErrorPayload::ServerError { message, .. }) = got {
+            assert_eq!(message.as_str(), "boom");
         }
     }
 
     #[test]
     fn get_after_clear_classifies_as_stale() {
         let mut arena = ErrorArena::new();
-        let payload = ErrorPayload {
+        let payload = ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::new(),
             detail: SecretBoundedStr::<96>::new(),
             hint: SecretBoundedStr::<64>::new(),
@@ -677,7 +791,7 @@ mod tests {
         let mut arena = ErrorArena::new();
         assert_eq!(arena.overwrite_count(), 0, "pristine arena starts at zero");
 
-        let p1 = ErrorPayload {
+        let p1 = ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::from_str_truncating("first"),
             detail: SecretBoundedStr::<96>::new(),
             hint: SecretBoundedStr::<64>::new(),
@@ -691,7 +805,7 @@ mod tests {
             "first alloc on empty slot must not bump overwrite_count",
         );
 
-        let p2 = ErrorPayload {
+        let p2 = ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::from_str_truncating("second"),
             detail: SecretBoundedStr::<96>::new(),
             hint: SecretBoundedStr::<64>::new(),
@@ -715,13 +829,13 @@ mod tests {
     #[test]
     fn alloc_overwrites_previous_and_bumps_generation() {
         let mut arena = ErrorArena::new();
-        let p1 = ErrorPayload {
+        let p1 = ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::from_str_truncating("first"),
             detail: SecretBoundedStr::<96>::new(),
             hint: SecretBoundedStr::<64>::new(),
         };
         let r1 = arena.alloc(p1);
-        let p2 = ErrorPayload {
+        let p2 = ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::from_str_truncating("second"),
             detail: SecretBoundedStr::<96>::new(),
             hint: SecretBoundedStr::<64>::new(),
@@ -736,8 +850,8 @@ mod tests {
         // r2 resolves the new payload.
         let got = arena.get(r2);
         assert!(got.is_ok(), "fresh ref must resolve, got {got:?}");
-        if let Ok(payload_ref) = got {
-            assert_eq!(payload_ref.message.as_str(), "second");
+        if let Ok(ErrorPayload::ServerError { message, .. }) = got {
+            assert_eq!(message.as_str(), "second");
         }
     }
 
@@ -756,7 +870,7 @@ mod tests {
         let mut arena = ErrorArena::new();
         // Empty clear — bumps to 1.
         arena.clear();
-        let payload = ErrorPayload {
+        let payload = ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::from_str_truncating("after"),
             detail: SecretBoundedStr::<96>::new(),
             hint: SecretBoundedStr::<64>::new(),
@@ -780,7 +894,7 @@ mod tests {
         // (gen mismatch), never Empty. Pins the gen-mismatch arm
         // against a would-be body swap.
         let mut a = ErrorArena::new();
-        let p = ErrorPayload {
+        let p = ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::new(),
             detail: SecretBoundedStr::<96>::new(),
             hint: SecretBoundedStr::<64>::new(),
@@ -862,7 +976,7 @@ mod tests {
     fn display_error_renders_full_text_when_ref_resolves() {
         use crate::error::{ProtocolError, Severity, SqlStateCode};
         let mut arena = ErrorArena::new();
-        let details_ref = arena.alloc(ErrorPayload {
+        let details_ref = arena.alloc(ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::from_str_truncating("password authentication failed"),
             detail: SecretBoundedStr::<96>::from_str_truncating("user 'alice' not found"),
             hint: SecretBoundedStr::<64>::from_str_truncating("check pg_hba.conf"),
@@ -885,7 +999,7 @@ mod tests {
     fn display_error_suppresses_empty_detail_and_hint() {
         use crate::error::{ProtocolError, Severity, SqlStateCode};
         let mut arena = ErrorArena::new();
-        let details_ref = arena.alloc(ErrorPayload {
+        let details_ref = arena.alloc(ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::from_str_truncating("boom"),
             detail: SecretBoundedStr::<96>::new(),
             hint: SecretBoundedStr::<64>::new(),
@@ -904,7 +1018,7 @@ mod tests {
     fn display_error_emits_arena_miss_diagnostic_when_ref_stale() {
         use crate::error::{ProtocolError, Severity, SqlStateCode};
         let mut arena = ErrorArena::new();
-        let details_ref = arena.alloc(ErrorPayload {
+        let details_ref = arena.alloc(ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::from_str_truncating("orig"),
             detail: SecretBoundedStr::<96>::new(),
             hint: SecretBoundedStr::<64>::new(),
@@ -938,7 +1052,7 @@ mod tests {
         // for non-adapter log / panic / thiserror-source sites.
         use crate::error::{ProtocolError, Severity, SqlStateCode};
         let mut arena = ErrorArena::new();
-        let details_ref = arena.alloc(ErrorPayload {
+        let details_ref = arena.alloc(ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::from_str_truncating("boom"),
             detail: SecretBoundedStr::<96>::new(),
             hint: SecretBoundedStr::<64>::new(),

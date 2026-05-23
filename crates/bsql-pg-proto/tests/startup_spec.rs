@@ -353,10 +353,13 @@ fn error_response_during_startup_is_classified() {
         Ok(payload) => payload,
         Err(e) => panic!("server error payload must resolve via arena, got ArenaError::{e:?}"),
     };
-    assert_eq!(
-        payload.message.as_str(),
-        "password authentication failed",
-    );
+    match payload {
+        bsql_pg_proto::ErrorPayload::ServerError { message, .. } => assert_eq!(
+            message.as_str(),
+            "password authentication failed",
+        ),
+        other => panic!("expected ServerError variant, got {other:?}"),
+    }
 }
 
 /// Invariant (spec): NegotiateProtocolVersion during startup →
@@ -923,7 +926,7 @@ fn scram_signature_mismatch_is_rejected() {
     match out.as_slice() {
         [Action::FailReply { cause, .. }, Action::CloseSocket] => {
             assert!(
-                matches!(cause, ProtocolError::Scram(_)),
+                matches!(cause, ProtocolError::ScramHandshakeFailure { .. }),
                 "expected ScramError, got {cause:?}",
             );
         }
@@ -960,7 +963,7 @@ fn scram_iterations_too_low_is_rejected() {
     match out.as_slice() {
         [Action::FailReply { cause, .. }, Action::CloseSocket] => {
             assert!(
-                matches!(cause, ProtocolError::Scram(_)),
+                matches!(cause, ProtocolError::ScramHandshakeFailure { .. }),
                 "expected ScramError for low iterations, got {cause:?}",
             );
         }
@@ -975,7 +978,7 @@ fn scram_iterations_too_low_is_rejected() {
 /// PBKDF2 for minutes per connection.
 #[test]
 fn scram_iterations_above_cap_is_rejected() {
-    use bsql_pg_proto::scram::wire::{MAX_SCRAM_ITERATIONS, ScramError};
+    use bsql_pg_proto::scram::wire::{MAX_SCRAM_ITERATIONS, ScramFailureClass};
 
     let proto = PgProtocol::new();
     let mut wb = bsql_pg_proto::WriteBuf::new();
@@ -1004,7 +1007,10 @@ fn scram_iterations_above_cap_is_rejected() {
     match out.as_slice() {
         [Action::FailReply { cause, .. }, Action::CloseSocket] => {
             match cause {
-                ProtocolError::Scram(ScramError::IterationsTooHigh { iterations }) => {
+                ProtocolError::ScramHandshakeFailure {
+                    class: ScramFailureClass::IterationsTooHigh { iterations },
+                    detail: _,
+                } => {
                     assert_eq!(*iterations, too_high);
                 }
                 other => panic!("expected IterationsTooHigh, got {other:?}"),
@@ -1053,20 +1059,35 @@ fn scram_server_error_preserves_diagnostic_message() {
     let out = proto.feed_bytes(&auth_sasl_final_frame(server_error_msg), &mut wb);
 
     assert_eq!(out.len(), 2, "server e= → FailReply + CloseSocket");
-    match out.as_slice() {
-        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
-            match cause {
-                ProtocolError::Scram(bsql_pg_proto::scram::wire::ScramError::ServerScramError { message }) => {
-                    assert_eq!(
-                        message.as_str(),
-                        "invalid-proof",
-                        "F30: server-error-value must be preserved, not silent-empty",
-                    );
-                }
-                other => panic!("expected ServerScramError{{message}}, got {other:?}"),
-            }
-        }
+    // Snapshot the detail ref before reborrowing `proto` for arena
+    // resolution.
+    let detail_ref = match out.as_slice() {
+        [Action::FailReply { cause, .. }, Action::CloseSocket] => match cause {
+            ProtocolError::ScramHandshakeFailure {
+                class: bsql_pg_proto::scram::wire::ScramFailureClass::ServerScramError,
+                detail: Some(r),
+            } => *r,
+            other => panic!("expected ScramHandshakeFailure{{ServerScramError, Some(_)}}, got {other:?}"),
+        },
         other => panic!("unexpected: {other:?}"),
+    };
+    // `out` is `OutActions` (`ManuallyDrop<heapless::Vec>`) — not a
+    // Drop type. NLL releases the &mut proto borrow after the match
+    // above; no explicit drop call needed.
+    // F30 regression: server-error-value text must survive the
+    // arena externalisation. Resolve via the same accessor used
+    // for `ServerErrorResponse`.
+    let payload = match proto.get_server_error(detail_ref) {
+        Ok(p) => p,
+        Err(e) => panic!("scram detail must resolve via arena, got ArenaError::{e:?}"),
+    };
+    match payload {
+        bsql_pg_proto::ErrorPayload::Scram { text } => assert_eq!(
+            text.as_str(),
+            "invalid-proof",
+            "F30: server-error-value must be preserved, not silent-empty",
+        ),
+        other => panic!("expected ErrorPayload::Scram, got {other:?}"),
     }
 }
 
@@ -1088,7 +1109,7 @@ fn scram_nonce_prefix_mismatch_is_rejected() {
     match out.as_slice() {
         [Action::FailReply { cause, .. }, Action::CloseSocket] => {
             assert!(
-                matches!(cause, ProtocolError::Scram(_)),
+                matches!(cause, ProtocolError::ScramHandshakeFailure { .. }),
                 "expected ScramError for nonce mismatch, got {cause:?}",
             );
         }

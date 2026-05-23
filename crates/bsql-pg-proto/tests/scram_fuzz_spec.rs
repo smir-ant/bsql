@@ -205,7 +205,7 @@ fn scram_server_first_fuzz_never_panics_never_silent_pass() {
             let out = proto.feed_bytes(&fuzz_frame, &mut wb);
             out.as_slice().iter().any(|a| matches!(a,
                 Action::FailReply {
-                    cause: ProtocolError::Scram(_) | ProtocolError::MalformedAuthentication { .. },
+                    cause: ProtocolError::ScramHandshakeFailure { .. } | ProtocolError::MalformedAuthentication { .. },
                     ..
                 },
             ))
@@ -293,7 +293,7 @@ fn scram_server_final_fuzz_never_panics() {
             let out = proto.feed_bytes(&build_sasl_final_frame(&final_body), &mut wb);
             out.as_slice().iter().any(|a| matches!(a,
                 Action::FailReply {
-                    cause: ProtocolError::Scram(_) | ProtocolError::MalformedAuthentication { .. },
+                    cause: ProtocolError::ScramHandshakeFailure { .. } | ProtocolError::MalformedAuthentication { .. },
                     ..
                 },
             ))

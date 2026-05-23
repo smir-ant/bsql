@@ -617,26 +617,40 @@ const _: () = assert!(
 // additions (upper) AND accidental field removals (lower). Exact
 // pins where reproducible cross-platform.
 const _: () = assert!(
-    core::mem::size_of::<error::ProtocolError>() == 72,
-    "ProtocolError exact size — 72 B. ServerErrorResponse carries \
-     `details_ref: ErrorRef` (2 B); bounded strings live in \
-     PgProtocol::error_arena. Remaining 72 B dominated by other \
-     large variants (e.g. Scram(ScramError), Malformed* with \
-     BoundedStr<32>). Exact pin catches any variant growth / layout \
-     drift.",
+    core::mem::size_of::<error::ProtocolError>() == 24,
+    "ProtocolError exact size — 24 B post-DEF-286 Φ-B'' \
+     (SCRAM externalisation). ServerErrorResponse carries \
+     `details_ref: ErrorRef` (8 B); ScramHandshakeFailure carries \
+     `class: ScramFailureClass (8 B) + detail: Option<ErrorRef> (8 B)`. \
+     Pre-Φ-B'' shape was 72 B dominated by `Scram(ScramError)` whose \
+     `ServerScramError` variant (carrying `message: BoundedStr<64>`) \
+     was ~68 B inline. Externalisation into `ErrorPayload::Scram` \
+     drops the dominator. Exact pin catches any variant growth / \
+     layout drift.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Action<'static, 'static>>() == 80,
-    "Action<'_, '_> exact size — 80 B post-DEF-286 Φ3 (CommandTag \
-     slot + typed enum). Dominator: FailReply with NonZeroU64 8 + \
-     ProtocolError 72 + discriminant niche-packed in NonZeroU64 = \
-     80 B. Reply variant (32 B post-Φ3) no longer the cap. \
-     IntermediateCommandComplete carries CommandTag (40 B) — also \
-     not the cap. \
+    core::mem::size_of::<action::Action<'static, 'static>>() == 48,
+    "Action<'_, '_> exact size — 48 B post-DEF-286 Φ-B'' (SCRAM \
+     externalisation). \
      \
-     DEF-286 Φ2'' Arena pattern (DEFERRED): ProtocolError refs \
-     would shrink FailReply to 16 B → Action ~40 B → OutActions \
-     ~368 B cascade. \
+     Dominator: `IntermediateCommandComplete` carrying \
+     `tag: CommandTag` — CommandTag is 40 B + 1 B explicit \
+     discriminant + 7 B \
+     alignment padding (CommandTag has no NonZeroU64 niche, so the \
+     enum discriminant cannot fold into its payload). \
+     \
+     Variant sizes after Φ-B'' (PG sans-IO state machine actions): \
+     - DeliverReply: 8 (NonZeroU64 id, niche absorbs disc) + 32 \
+       (Reply<'r>) = 40 B; outer disc niche-packed via id. \
+     - FailReply: 8 (NonZeroU64 id) + 24 (ProtocolError) = 32 B; \
+       disc niche-packed via id. \
+     - IntermediateCommandComplete: CommandTag 40 B + explicit disc \
+       + padding = 48 B. \
+     - SendBytes/Notify/CopyDataChunk/CloseSocket: < 24 B each. \
+     \
+     Pre-Φ-B'' was 80 B dominated by FailReply (8 + 72 PE). The \
+     Φ-B'' externalisation drops FailReply to 32 B; \
+     IntermediateCommandComplete takes over as dominator. \
      \
      **NICHE OPTIMIZATION IS LOAD-BEARING** (DEF-260 MEASURED-REJECTED \
      2026-05-21): `#[repr(u8)]` would disable niche packing on \
@@ -901,28 +915,34 @@ const _: () = assert!(
      was added/removed/reshaped on `ClosedInner`.",
 );
 
-// DispatchOutcome size pin — bounded by `AdvancedWithAction(
-// StagedAction 88 B)`. Dispatch writes state directly via
+// DispatchOutcome size pin — post-Φ-B'' bounded by `AdvancedWithAction(
+// StagedAction 40 B)`. Dispatch writes state directly via
 // `&mut ProtoState`, so DispatchOutcome carries only the
 // side-effect signal (StagedAction for WithAction, reply_id +
-// ProtocolError 72 B for Errored).
+// ProtocolError 24 B for Errored — pre-Φ-B'' ProtocolError was
+// 72 B; SCRAM externalisation collapses it).
 const _: () = assert!(
-    core::mem::size_of::<dispatch::DispatchOutcome>() == 88,
-    "DispatchOutcome exact size — 88 B. Dominated by \
-     AdvancedWithAction(StagedAction 88 B); the discriminant + \
-     Errored variant payload fold into StagedAction's alignment + \
-     niches. If this trips, either (a) a new ProtocolError variant \
-     inflated the Errored payload, (b) StagedAction grew (cascade \
-     into Action / OutActions), or (c) `new_state` was added to an \
-     Advanced variant — regression vs the by-ref-state dispatch \
-     shape.",
+    core::mem::size_of::<dispatch::DispatchOutcome>() == 40,
+    "DispatchOutcome exact size — 40 B post-DEF-286 Φ-B''. \
+     Pre-Φ-B'' was 88 B dominated by AdvancedWithAction(StagedAction \
+     88 B); StagedAction shrunk to 40 B alongside Action (cascade \
+     from ProtocolError 72 → 24 B), so Errored variant \
+     (NonZeroU64 reply_id 8 + ProtocolError 24 = 32 B) is now \
+     comparable to AdvancedWithAction(StagedAction 40 B) — \
+     outer enum settles at 40 B. If this trips, either (a) a new \
+     ProtocolError variant inflated the Errored payload, (b) \
+     StagedAction grew (cascade into Action / OutActions), or (c) \
+     `new_state` was added to an Advanced variant — regression vs \
+     the by-ref-state dispatch shape.",
 );
 
 const _: () = assert!(
-    core::mem::size_of::<action::OutActions<'static, 'static>>() == 728,
-    "OutActions<'_, '_> exact size — 728 B post-DEF-286 Φ3 \
-     = 9 (MAX_ACTIONS_PER_CALL) × 80 (Action) + 8 (usize len). \
-     Unchanged from Phase A (Action stays 80 B until Φ2'' Arena).",
+    core::mem::size_of::<action::OutActions<'static, 'static>>() == 440,
+    "OutActions<'_, '_> exact size — 440 B post-DEF-286 Φ-B'' \
+     = 9 (MAX_ACTIONS_PER_CALL) × 48 (Action) + 8 (usize len). \
+     Pre-Φ-B'' was 728 B (= 9 × 80 + 8). The SCRAM externalisation \
+     shrank Action 80 → 48 B, cascading -288 B per OutActions \
+     stack frame.",
 );
 
 // ---------------------------------------------------------------------
@@ -931,16 +951,16 @@ const _: () = assert!(
 // make every byte change a contributor decision-point.
 // ---------------------------------------------------------------------
 
-// `PushFailure` exact size — 80 B.
+// `PushFailure` exact size — 16 B (post-DEF-286 Φ2' Box<ProtocolError>;
+// independent of Φ-B'' since the cause is heap-indirected).
 //
-// Layout: NonZeroU64 (8 B, 8-aligned) + ProtocolError (72 B) = 80 B
-// total. Niche-packed: `Option<PushFailure>` is also 80 B (NonZeroU64
-// niche absorbs the discriminant).
-//
-// Drift surface: a future `ProtocolError` variant addition that
-// pushes the enum past 72 B would cascade here. The complementary
-// `ProtocolError == 72` pin catches drift at the source; this pin
-// catches the propagation.
+// Layout: NonZeroU64 (8 B, 8-aligned) + Box<ProtocolError> (8 B) =
+// 16 B total. Niche-packed: `Option<PushFailure>` is also 16 B
+// (NonZeroU64 niche absorbs the discriminant). PushFailure is the
+// ONLY structurally-Boxed cause across the action surface — Vec-
+// resident `Action::FailReply` keeps `cause: ProtocolError` inline
+// (Φ-B'' shrunk it to 24 B, no Box cascade required, Copy preserved
+// — Phase B regression class avoided).
 const _: () = assert!(
     core::mem::size_of::<action::PushFailure>() == 16,
     "PushFailure exact size — 16 B post-DEF-286 Φ2' (was 80 B \
@@ -973,15 +993,17 @@ const _: () = assert!(
 // FeedEvent). A new variant carrying a payload > 80 B would also
 // trip this.
 const _: () = assert!(
-    core::mem::size_of::<action::FeedEvent<'static, 'static>>() == 80,
-    "FeedEvent<'wb, 'r> exact size — 80 B post-DEF-286 Φ3. Max \
-     variant: Fail with NonZeroU64 8 + ProtocolError 72 + disc \
-     niche-packed in NonZeroU64 = 80 B. Reply variant on Deliver \
-     shrunk to 32 B post-Φ3.",
+    core::mem::size_of::<action::FeedEvent<'static, 'static>>() == 40,
+    "FeedEvent<'wb, 'r> exact size — 40 B post-DEF-286 Φ-B''. Max \
+     variant: Deliver with NonZeroU64 8 + Reply<'r> 32 (post-Φ3) = \
+     40 B; disc niche-packed in NonZeroU64. Pre-Φ-B'' was 80 B \
+     (Fail variant dominant via 72-B ProtocolError); externalising \
+     SCRAM text shrinks ProtocolError to 24 B so Fail collapses to \
+     32 B and Deliver becomes the new dominator.",
 );
 const _: () = assert!(
-    core::mem::size_of::<Option<action::FeedEvent<'static, 'static>>>() == 80,
-    "Option<FeedEvent> niche-pack — must stay 80 B via the NonZeroU64 \
+    core::mem::size_of::<Option<action::FeedEvent<'static, 'static>>>() == 40,
+    "Option<FeedEvent> niche-pack — must stay 40 B via the NonZeroU64 \
      niche on Deliver.id / Fail.id.",
 );
 

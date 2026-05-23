@@ -80,13 +80,16 @@ fn error_payload_is_non_copy() {
     // fields are Copy-able, which means SecretBoundedStr lost its
     // Drop, which means the staleness leak returned), this test
     // fails to compile because `let dup = src;` consumes `src`.
-    let src = ErrorPayload {
+    let src = ErrorPayload::ServerError {
         message: SecretBoundedStr::<128>::from_str_truncating("magic"),
         detail: SecretBoundedStr::<96>::new(),
         hint: SecretBoundedStr::<64>::new(),
     };
     let dup = src; // move — `src` consumed
-    assert_eq!(dup.message.as_str(), "magic");
+    assert!(matches!(dup, ErrorPayload::ServerError { .. }));
+    if let ErrorPayload::ServerError { message, .. } = &dup {
+        assert_eq!(message.as_str(), "magic");
+    }
     // `let _ = src.message.as_str();` would be a compile error here
     // (use of moved value). Compile-fail is the negative-witness
     // for non-Copy enforcement.
@@ -104,19 +107,28 @@ fn error_payload_drop_zeroizes_all_fields() {
     const MAGIC_H: &str = "HINT-MAGIC-IJKLMNOP";
 
     let (m_ptr, m_len, d_ptr, d_len, h_ptr, h_len) = {
-        let payload = ErrorPayload {
+        let payload = ErrorPayload::ServerError {
             message: SecretBoundedStr::<128>::from_str_truncating(MAGIC_M),
             detail: SecretBoundedStr::<96>::from_str_truncating(MAGIC_D),
             hint: SecretBoundedStr::<64>::from_str_truncating(MAGIC_H),
         };
         // Capture raw pointers. The buffers are live as long as
-        // `payload` is on the stack.
-        let m_ptr: *const u8 = payload.message.as_bytes().as_ptr();
-        let m_len = payload.message.as_bytes().len();
-        let d_ptr: *const u8 = payload.detail.as_bytes().as_ptr();
-        let d_len = payload.detail.as_bytes().len();
-        let h_ptr: *const u8 = payload.hint.as_bytes().as_ptr();
-        let h_len = payload.hint.as_bytes().len();
+        // `payload` is on the stack. Architecturally-dead Scram-arm
+        // returns null pointers; the `assert!(matches!())` above
+        // closes the seam.
+        assert!(matches!(payload, ErrorPayload::ServerError { .. }));
+        let zero_ptr: *const u8 = core::ptr::null();
+        let (m_ptr, m_len, d_ptr, d_len, h_ptr, h_len) = match &payload {
+            ErrorPayload::ServerError { message, detail, hint } => (
+                message.as_bytes().as_ptr(),
+                message.as_bytes().len(),
+                detail.as_bytes().as_ptr(),
+                detail.as_bytes().len(),
+                hint.as_bytes().as_ptr(),
+                hint.as_bytes().len(),
+            ),
+            _ => (zero_ptr, 0, zero_ptr, 0, zero_ptr, 0),
+        };
 
         // Sanity: pre-drop, the buffers contain the MAGIC bytes.
         let m_pre = unsafe { probe_bytes(m_ptr, m_len) };
@@ -159,12 +171,15 @@ fn error_payload_overwrite_zeroizes_old_value() {
     const FIRST: &str = "FIRST-MAGIC-XYZ";
     const SECOND: &str = "second";
 
-    let mut slot = ErrorPayload {
+    let mut slot = ErrorPayload::ServerError {
         message: SecretBoundedStr::<128>::from_str_truncating(FIRST),
         detail: SecretBoundedStr::<96>::new(),
         hint: SecretBoundedStr::<64>::new(),
     };
-    let raw_ptr: *const u8 = slot.message.as_bytes().as_ptr();
+    let raw_ptr: *const u8 = match &slot {
+        ErrorPayload::ServerError { message, .. } => message.as_bytes().as_ptr(),
+        _ => core::ptr::null(),
+    };
     let first_len = FIRST.len();
 
     // Sanity: pre-overwrite, the message buffer contains FIRST.
@@ -174,14 +189,17 @@ fn error_payload_overwrite_zeroizes_old_value() {
     // Overwrite — Rust drops `slot`'s old fields (firing Drop
     // chain on each SecretBoundedStr) BEFORE moving the new
     // ErrorPayload in.
-    slot = ErrorPayload {
+    slot = ErrorPayload::ServerError {
         message: SecretBoundedStr::<128>::from_str_truncating(SECOND),
         detail: SecretBoundedStr::<96>::new(),
         hint: SecretBoundedStr::<64>::new(),
     };
     // Touch slot post-assignment so the compiler sees a use AND
     // functionally pins the new content.
-    assert_eq!(slot.message.as_str(), SECOND);
+    assert!(matches!(slot, ErrorPayload::ServerError { .. }));
+    if let ErrorPayload::ServerError { message, .. } = &slot {
+        assert_eq!(message.as_str(), SECOND);
+    }
 
     // Probe the tail beyond SECOND's content — Drop on the old
     // payload zeroizes FIRST's tail bytes. A naive Copy-payload

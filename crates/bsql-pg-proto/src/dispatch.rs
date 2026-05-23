@@ -617,7 +617,7 @@ pub(crate) fn dispatch(
         ) => {
             // `expected_server_sig` destructured inline — tier-1
             // variant-carries-field.
-            dispatch_auth_sasl_final(state, reply, expected_server_sig, payload)
+            dispatch_auth_sasl_final(state, reply, expected_server_sig, payload, error_arena_slot)
         }
         (ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
@@ -1912,7 +1912,7 @@ fn dispatch_auth_in_startup_scram(
     match code {
         crate::wire::AuthSubCode::Sasl => {
             if !mechanism_list_contains_scram(rest) {
-                return install_errored(state, Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::NoSupportedMechanism));
+                return install_errored(state, Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::NoSupportedMechanism));
             }
 
             // Build client-first-message and SASLInitialResponse.
@@ -2054,13 +2054,13 @@ fn build_sasl_initial_response(
     // user identifier through as a `Sensitive<...>` argument here.
     let user_bytes: &[u8] = b"";
 
-    let client_nonce_vec = wire::generate_client_nonce().map_err(ProtocolError::Scram)?;
+    let client_nonce_vec = wire::generate_client_nonce().map_err(ProtocolError::from_scram_no_text)?;
 
     let client_first_bare_vec =
-        wire::build_client_first_bare(user_bytes, &client_nonce_vec).map_err(ProtocolError::Scram)?;
+        wire::build_client_first_bare(user_bytes, &client_nonce_vec).map_err(ProtocolError::from_scram_no_text)?;
 
     let client_first_msg =
-        wire::build_client_first_message(user_bytes, &client_nonce_vec).map_err(ProtocolError::Scram)?;
+        wire::build_client_first_message(user_bytes, &client_nonce_vec).map_err(ProtocolError::from_scram_no_text)?;
 
     // SCRAM auth is a cold handshake path. The scram::wire builders
     // hand back owned heapless::Vec; the bytes are pushed into the
@@ -2073,7 +2073,7 @@ fn build_sasl_initial_response(
     let start = reserved.len();
     let buf = reserved.as_write_buf_mut();
     buf.push_u8(crate::wire::TAG_SASL_RESPONSE.byte())
-        .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
+        .map_err(|_| ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow))?;
     buf.with_length_prefix(|w| {
         w.push_bytes(SCRAM_SHA_256_MECHANISM)
             .map_err(|_| crate::write_buf::WriteBufFull)?;
@@ -2086,7 +2086,7 @@ fn build_sasl_initial_response(
             .map_err(|_| crate::write_buf::WriteBufFull)?;
         Ok(())
     })
-    .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
+    .map_err(|_| ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow))?;
 
     // Populate the SCRAM session's client_first_bare +
     // client_nonce_b64 fields IN PLACE — a naive shape that returned
@@ -2095,9 +2095,9 @@ fn build_sasl_initial_response(
     // `Box<ScramSession>` is reused across the StartupScram →
     // ServerFirst transition with zero allocator ops.
     scram.client_first_bare = crate::ident::PodBytes::try_from_slice(&client_first_bare_vec)
-        .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
+        .map_err(|_| ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow))?;
     scram.client_nonce_b64 = crate::ident::PodBytes::try_from_slice(&client_nonce_vec)
-        .map_err(|_| ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))?;
+        .map_err(|_| ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow))?;
     // `from_write_span` returns `Result`; `?` propagates up
     // through the function's own Result return type. Err here
     // classifies as `EmptyWriteRange` — dead under intact SCRAM
@@ -2149,7 +2149,7 @@ fn dispatch_auth_sasl_continue(
         match crate::scram::wire::parse_server_first(rest, scram.client_nonce_b64.as_slice()) {
             Ok(sf) => sf,
             Err(e) => {
-                return install_errored(state, Some(reply.consume()), ProtocolError::Scram(e));
+                return install_errored(state, Some(reply.consume()), ProtocolError::from_scram_no_text(e));
             }
         };
 
@@ -2163,7 +2163,7 @@ fn dispatch_auth_sasl_continue(
         ) {
             Ok(v) => v,
             Err(e) => {
-                return install_errored(state, Some(reply.consume()), ProtocolError::Scram(e));
+                return install_errored(state, Some(reply.consume()), ProtocolError::from_scram_no_text(e));
             }
         };
 
@@ -2201,7 +2201,7 @@ fn dispatch_auth_sasl_continue(
     });
     let (proof, expected_server_sig) = match proof_result {
         Ok(v) => v,
-        Err(e) => return install_errored(state, Some(reply.consume()), ProtocolError::Scram(e)),
+        Err(e) => return install_errored(state, Some(reply.consume()), ProtocolError::from_scram_no_text(e)),
     };
 
     // Base64-encode proof.
@@ -2217,13 +2217,13 @@ fn dispatch_auth_sasl_continue(
         match crate::scram::wire::base64_encode_to_buf(proof.as_ref(), proof_b64_buf.as_mut()) {
             Ok(n) => n,
             Err(_) => {
-                return install_errored(state, Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))
+                return install_errored(state, Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow))
             }
         };
     let proof_b64 = match proof_b64_buf.get(..proof_b64_len) {
         Some(s) => s,
         None => {
-            return install_errored(state, Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow))
+            return install_errored(state, Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow))
         }
     };
 
@@ -2245,7 +2245,7 @@ fn dispatch_auth_sasl_continue(
     ) {
         Ok(v) => v,
         Err(e) => {
-            return install_errored(state, Some(reply.consume()), ProtocolError::Scram(e));
+            return install_errored(state, Some(reply.consume()), ProtocolError::from_scram_no_text(e));
         }
     };
 
@@ -2267,7 +2267,7 @@ fn dispatch_auth_sasl_continue(
             // failed.
             use zeroize::Zeroize;
             client_final_msg.as_mut_slice().zeroize();
-            return install_errored(state, Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::BufferOverflow));
+            return install_errored(state, Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow));
         }
     }
     // Scrub the password-correlated client_final_msg contents now
@@ -2309,6 +2309,7 @@ fn dispatch_auth_sasl_final(
     reply: ReplyId<crate::reply_id::StartupKind>,
     expected_server_sig: crate::scram::types::SecretDigest,
     payload: &[u8],
+    error_arena_slot: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
 ) -> DispatchOutcome {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
@@ -2322,16 +2323,23 @@ fn dispatch_auth_sasl_final(
     }
 
     // Parse server-final-message.
+    //
+    // The `Err(e)` arm is the ONLY SCRAM dispatch site that may
+    // observe `ScramError::ServerScramError { message }` — the
+    // server's `e=<text>` field per RFC 5802 §5.1. Route through
+    // the arena-aware helper so the text is preserved via
+    // `ErrorPayload::Scram` instead of dropped.
     let received_sig = match crate::scram::wire::parse_server_final(rest) {
         Ok(sig) => sig,
         Err(e) => {
-            return install_errored(state, Some(reply.consume()), ProtocolError::Scram(e));
+            let cause = crate::error_arena::scram_error_to_protocol_error(e, error_arena_slot);
+            return install_errored(state, Some(reply.consume()), cause);
         }
     };
 
     // Constant-time comparison.
     if !bool::from(expected_server_sig.ct_eq(&received_sig)) {
-        return install_errored(state, Some(reply.consume()), ProtocolError::Scram(crate::scram::wire::ScramError::SignatureMismatch));
+        return install_errored(state, Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::SignatureMismatch));
     }
 
     // Signature matches. Await AuthenticationOk.
@@ -2953,7 +2961,7 @@ fn parse_error_response(
     // Allocate the bounded strings into the caller-supplied error
     // arena; return the small `ParsedServerError` (16 B) with the
     // `ErrorRef` handle.
-    let details_ref = error_arena.alloc(crate::error_arena::ErrorPayload {
+    let details_ref = error_arena.alloc(crate::error_arena::ErrorPayload::ServerError {
         message,
         detail,
         hint,
@@ -3224,7 +3232,7 @@ mod parse_error_response_tests {
         (
             parsed_severity,
             SqlStateCode::from_bytes(code.as_bytes()),
-            crate::error_arena::ErrorPayload {
+            crate::error_arena::ErrorPayload::ServerError {
                 message: SecretBoundedStr::<128>::from_str_truncating(message),
                 detail: SecretBoundedStr::<96>::from_str_truncating(detail),
                 hint: SecretBoundedStr::<64>::from_str_truncating(hint),
@@ -3262,7 +3270,7 @@ mod parse_error_response_tests {
         );
         let payload = match r.cloned() {
             Ok(p) => p,
-            Err(_) => crate::error_arena::ErrorPayload {
+            Err(_) => crate::error_arena::ErrorPayload::ServerError {
                 message: crate::ident::SecretBoundedStr::<128>::new(),
                 detail: crate::ident::SecretBoundedStr::<96>::new(),
                 hint: crate::ident::SecretBoundedStr::<64>::new(),
