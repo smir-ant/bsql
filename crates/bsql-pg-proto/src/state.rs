@@ -1443,7 +1443,12 @@ impl From<ErroredState> for ProtoState {
 }
 
 impl From<ConnectingState> for ProtoState {
-    #[inline]
+    // DEF-285 perf-recovery: `#[inline(always)]` for the handshake
+    // hot path (push_command/ping bench fixture). Same rationale as
+    // the `From<ActiveState>` impl below — paired with the
+    // `feed_bytes_dispatch_connecting` wrapper's inline annotation
+    // for full hot-path fusion.
+    #[inline(always)]
     fn from(s: ConnectingState) -> Self {
         match s {
             ConnectingState::StartupTrust { reply } => {
@@ -1505,7 +1510,15 @@ impl From<ConnectingState> for ProtoState {
 }
 
 impl From<ActiveState> for ProtoState {
-    #[inline]
+    // DEF-285 perf-recovery: `#[inline(always)]` not just `#[inline]`.
+    // The hot-path `feed_bytes_dispatch_active` lift step calls this
+    // per `advance_one_frame`; LLVM was emitting an out-of-line call
+    // for the ~25-arm match. Pinning `inline(always)` lets the
+    // wrapper fuse the lift into the dispatch loop, eliminating ~3-5
+    // ns per call. Function-size cost: ~25 match arms (small body
+    // per arm); LTO dedup makes cross-monomorphisation expansion
+    // benign.
+    #[inline(always)]
     fn from(s: ActiveState) -> Self {
         match s {
             ActiveState::Idle => ProtoState::Idle,
@@ -1849,7 +1862,9 @@ impl TryFrom<ProtoState> for ErroredState {
 impl TryFrom<ProtoState> for ConnectingState {
     type Error = WrongPhase;
 
-    #[inline]
+    // DEF-285 perf-recovery: `#[inline(always)]` for the handshake
+    // hot path. Paired with `feed_bytes_dispatch_connecting`'s inline.
+    #[inline(always)]
     fn try_from(s: ProtoState) -> Result<Self, Self::Error> {
         match s {
             ProtoState::ConnectingStartupTrust { reply } => {
@@ -1907,7 +1922,12 @@ impl TryFrom<ProtoState> for ConnectingState {
 impl TryFrom<ProtoState> for ActiveState {
     type Error = WrongPhase;
 
-    #[inline]
+    // DEF-285 perf-recovery: `#[inline(always)]` for the same reason
+    // as `From<ActiveState> for ProtoState` above — the `feed_bytes_dispatch_active`
+    // lower step calls this per `advance_one_frame`. Pinning the
+    // inline lets LLVM fuse the lower into the dispatch loop, paired
+    // with the lift's inline above.
+    #[inline(always)]
     fn try_from(s: ProtoState) -> Result<Self, Self::Error> {
         match s {
             ProtoState::Idle => Ok(ActiveState::Idle),

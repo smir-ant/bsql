@@ -3235,17 +3235,53 @@ impl PgProtocol<ActivePhase> {
             crate::state::StatePushClass::Idle,
         );
 
-        // Lift+lower for the IdleState setter machinery (which
-        // operates on `&mut ProtoState`). self.inner.state is now
-        // ActiveState; we mem::replace with the `Idle` sentinel
-        // (the natural value when ready), pass `&mut proto_state`
-        // to the setter, then lower the result back via
-        // `ActiveState::try_from` after the branded closure returns.
-        let mut proto_state: ProtoState = core::mem::replace(
+        // DEF-285 perf-recovery (2026-05-23): the lift step
+        // pre-DEF-285 was
+        //
+        //   let mut proto_state: ProtoState =
+        //       core::mem::replace(&mut self.inner.state,
+        //                          ActiveState::Idle).into();
+        //
+        // The `.into()` walks a 25-arm `From<ActiveState> for
+        // ProtoState` match — fully redundant on the IdleState hot
+        // path because the setter precondition is `state == Idle`
+        // and the only Idle→ProtoState mapping is `ProtoState::Idle`.
+        //
+        // Pre-check the Idle precondition via `matches!()` against
+        // `self.inner.state` (which is `ActiveState`). On the
+        // production hot path (`as_ready()` upstream Idle check)
+        // this is always true; the local `proto_state` starts as
+        // `ProtoState::Idle` directly without the From walk. The
+        // cold non-Idle branch (architecturally dead from
+        // `ReadyGuard::push_command`) falls through to the
+        // PushFailure arm below — the setter's `IdleState::try_from`
+        // on a non-Idle ProtoState would have returned `None`
+        // anyway; we just bypass the redundant conversion to surface
+        // the same classifier failure.
+        //
+        // `mem::replace` is still required to overwrite `self.inner.state`
+        // with the Idle sentinel so the post-closure lower-and-install
+        // step can write the new variant without aliasing. The
+        // RETURNED old value is intentionally discarded — Idle is a
+        // ZST tag with no Drop targets.
+        // Replace the slot with Idle sentinel; old value (must be
+        // Idle on the hot path) is dropped trivially via the binding
+        // `_replaced` (Idle is a ZST tag — Drop is a no-op). The
+        // explicit binding (not `let _`) satisfies clippy's
+        // `let_underscore_drop` lint forbidden crate-wide for
+        // ZeroizeOnDrop-bearing types; ActiveState carries
+        // SCRAM/MD5/Cleartext password variants that DO have
+        // ZeroizeOnDrop, but Idle does not, so the drop is trivial
+        // on the production hot path. On the cold non-Idle entry
+        // (architecturally unreachable from `ReadyGuard::push_command`
+        // gating), the prior ActiveState (which may carry secrets)
+        // drops here — that's the correct scrub path.
+        let _replaced: crate::state::ActiveState = core::mem::replace(
             &mut self.inner.state,
             crate::state::ActiveState::Idle,
-        )
-        .into();
+        );
+        drop(_replaced);
+        let mut proto_state: ProtoState = ProtoState::Idle;
         let state = &mut proto_state;
         let row_desc_slot = &mut self.extras;
         let idle = match crate::state_setter::IdleState::try_from(state) {
@@ -3414,21 +3450,67 @@ impl PgProtocol<ActivePhase> {
             }
         });
 
-        // Project the setter-mutated `proto_state` back to
-        // ActiveState and install on self.inner.state. The setter's
-        // terminal mutation set `proto_state` to one of the Active
-        // flow variants (SimpleQueryAwaitingFirstResponse,
-        // ParseAwaitingParseComplete, etc.) which all project
-        // cleanly to ActiveState. Connecting outcomes are
-        // architecturally impossible from an Idle setter (the
-        // setter's PostState bound restricts target variants);
-        // defensive Errored absorbs any.
-        use crate::state::{ActiveState, WrongPhase};
-        self.inner.state = match ActiveState::try_from(proto_state) {
-            Ok(active) => active,
-            Err(WrongPhase { recovered }) => {
+        // DEF-285 perf-recovery (2026-05-23): specialized
+        // ProtoState→ActiveState lower for the push-output subset.
+        //
+        // The setter's `InstallBody::install` writes ONLY the
+        // following ~10 ProtoState variants (per the InstallBody
+        // impls in `state_setter.rs:605+` — Active-phase targets):
+        //   - PingAwaitingRfq
+        //   - SimpleQueryAwaitingFirstResponse
+        //   - ParseAwaitingParseComplete
+        //   - BindExecuteAwaitingBindCompleteDml
+        //   - BindExecuteAwaitingBindCompleteSelect
+        //   - BindExecuteAwaitingDataOrCompleteSelect (DEF-225 resume)
+        //   - BindExecuteAwaitingCommandCompleteDml (DEF-225 resume)
+        //   - DescribeStatementAwaitingParamDesc
+        //   - DescribePortalAwaitingRowDescOrNoData
+        //   - CloseAwaitingComplete
+        //
+        // The generic `ActiveState::try_from` walks the FULL 25-arm
+        // match. The 15 non-push-output arms are architecturally
+        // dead on this code path (setter cannot produce them). Open-
+        // coding the 10 hot arms inline saves ~5-10 ns per
+        // push_command_internal call.
+        //
+        // The defensive `_other` arm absorbs any setter-machinery bug
+        // via classified Errored — same safety net as the prior
+        // `TryFrom::try_from` Err branch.
+        use crate::state::ActiveState;
+        self.inner.state = match proto_state {
+            ProtoState::PingAwaitingRfq(r) => ActiveState::PingAwaitingRfq(r),
+            ProtoState::SimpleQueryAwaitingFirstResponse(r) => {
+                ActiveState::SimpleQueryAwaitingFirstResponse(r)
+            }
+            ProtoState::ParseAwaitingParseComplete(r) => {
+                ActiveState::ParseAwaitingParseComplete(r)
+            }
+            ProtoState::BindExecuteAwaitingBindCompleteDml(r) => {
+                ActiveState::BindExecuteAwaitingBindCompleteDml(r)
+            }
+            ProtoState::BindExecuteAwaitingBindCompleteSelect { reply } => {
+                ActiveState::BindExecuteAwaitingBindCompleteSelect { reply }
+            }
+            ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply } => {
+                ActiveState::BindExecuteAwaitingDataOrCompleteSelect { reply }
+            }
+            ProtoState::BindExecuteAwaitingCommandCompleteDml(r) => {
+                ActiveState::BindExecuteAwaitingCommandCompleteDml(r)
+            }
+            ProtoState::DescribeStatementAwaitingParamDesc(r) => {
+                ActiveState::DescribeStatementAwaitingParamDesc(r)
+            }
+            ProtoState::DescribePortalAwaitingRowDescOrNoData(r) => {
+                ActiveState::DescribePortalAwaitingRowDescOrNoData(r)
+            }
+            ProtoState::CloseAwaitingComplete(r) => ActiveState::CloseAwaitingComplete(r),
+            other => {
+                // Architecturally dead: setter PostState bound
+                // restricts output to the 10 arms above. Defensive
+                // Errored absorbs any future setter-machinery bug
+                // without panicking.
                 core::hint::cold_path();
-                match recovered.take_inflight_reply_raw_id() {
+                match other.take_inflight_reply_raw_id() {
                     Some(_) | None => {}
                 }
                 ActiveState::Errored(
@@ -4397,6 +4479,18 @@ pub(in crate::protocol) struct ConnectingDispatchContext<'state, 'r> {
 /// defensive `Errored(Internal)` on a dispatch bug). The
 /// placeholder is unobservable: no reader sees the state between
 /// `mem::replace` and the lower-step write.
+///
+/// **DEF-285 perf-recovery** (2026-05-23): `#[inline(always)]` —
+/// the handshake hot path (push_command/ping bench fixture's
+/// `fresh_active_via_trust_handshake` = 5 `advance_one_frame`
+/// calls during the AuthOk/ParameterStatus×2/BackendKeyData/RFQ
+/// sequence) routes through this wrapper. Bisect confirmed
+/// regression at `0597dae` (DEF-279 Phase 2 SealedPhase flip):
+/// pre-flip push_command/ping 49 ns → post-flip 77 ns = +28 ns =
+/// ~5.6 ns × 5 calls. Inlining lets LLVM fuse the lift+dispatch+lower
+/// into the calling hot path, eliminating the per-call lift/lower
+/// overhead.
+#[inline(always)]
 pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED: bool>(
     ctx: ConnectingDispatchContext<'_, 'r>,
     bytes: &[u8],
@@ -4572,6 +4666,20 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
 /// **Sentinel choice during lift**: `ActiveState::Errored(Framing)`
 /// as a transient placeholder; always overwritten by the lower
 /// step before any reader sees it.
+///
+/// **DEF-285 perf-recovery** (2026-05-23): `#[inline(always)]`
+/// — without inlining the wrapper, the per-call lift+lower (2 enum
+/// matches × ~25 arms each) accounts for ~5.6 ns per call on the
+/// `advance_one_frame` hot path. push_command/ping bench (5 calls
+/// per handshake fixture iter) regressed +28 ns vs pre-DEF-279
+/// Phase 2 baseline (`5d59b64`: 49 ns → `0597dae`: 77 ns). Inlining
+/// lets LLVM fuse the lift+dispatch+lower into a single optimised
+/// pattern, eliding the redundant variant-conversion math when
+/// the caller's state slot type-stabilises. The function is large
+/// (~150 LoC body via shared `feed_bytes_dispatch`), but with LTO
+/// fat + codegen-units=1 the inlined copies dedup. Asm-verified at
+/// the recovery commit.
+#[inline(always)]
 pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: bool>(
     ctx: ActiveDispatchContext<'_, 'r>,
     bytes: &[u8],
@@ -4660,6 +4768,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
 #[must_use = "FeedEvent variants carry side-effect contracts: \
               SendBytes/Deliver MUST be processed; Fail/Close MUST \
               trigger socket teardown"]
+#[inline(always)]
 pub(in crate::protocol) fn advance_one_frame_dispatch_active<'w, 'r>(
     ctx: ActiveDispatchContext<'_, 'r>,
     write_buf: &'w mut WriteBuf,
@@ -4712,6 +4821,7 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_active<'w, 'r>(
 #[must_use = "FeedEvent variants carry side-effect contracts: \
               SendBytes/Deliver MUST be processed; Fail/Close MUST \
               trigger socket teardown"]
+#[inline(always)]
 pub(in crate::protocol) fn advance_one_frame_dispatch_connecting<'w, 'r>(
     ctx: ConnectingDispatchContext<'_, 'r>,
     write_buf: &'w mut WriteBuf,
