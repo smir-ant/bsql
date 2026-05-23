@@ -231,10 +231,11 @@ fn describe_statement_with_rows_success_end_to_end() {
                 }
                 DescribedRows::NoData => panic!("expected Rows(..), got NoData"),
             }
-            assert_eq!(p.tx_status, TxStatus::Idle);
         }
         other => panic!("expected DeliverReply(DescribeStatementComplete), got {other:?}"),
     }
+    // DEF-286 Φ-E: tx_status accessor instead of inline field.
+    assert_eq!(proto.terminal_tx_status(), TxStatus::Idle);
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
@@ -400,10 +401,11 @@ fn describe_portal_with_rows_success_end_to_end() {
                 }
                 DescribedRows::NoData => panic!("expected Rows(..)"),
             }
-            assert_eq!(p.tx_status, TxStatus::InTransaction);
         }
         other => panic!("expected DescribePortalComplete, got {other:?}"),
     }
+    // DEF-286 Φ-E: tx_status accessor instead of inline field.
+    assert_eq!(proto.terminal_tx_status(), TxStatus::InTransaction);
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 

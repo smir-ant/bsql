@@ -151,13 +151,14 @@ fn parse_success_end_to_end() {
     match out.as_slice() {
         [Action::DeliverReply {
             id: delivered_id,
-            value: Reply::ParseComplete(p),
+            value: Reply::ParseComplete(_p),
         }] => {
             assert_eq!(*delivered_id, reply_raw, "correlator round-trips");
-            assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::Idle);
         }
         other => panic!("expected DeliverReply(ParseComplete), got {other:?}"),
     }
+    // DEF-286 Φ-E: tx_status moved off Reply payloads to slot accessor.
+    assert_eq!(proto.terminal_tx_status(), bsql_pg_proto::TxStatus::Idle);
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 

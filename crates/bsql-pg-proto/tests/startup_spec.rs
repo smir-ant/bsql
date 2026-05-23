@@ -275,6 +275,9 @@ fn trust_auth_handshake_end_to_end() {
                 Reply::StartupComplete(p) => {
                     assert_eq!(p.pid, 12345);
                     assert_eq!(p.secret_key, 67890);
+                    // DEF-286 Φ-E exception: StartupCompletePayload
+                    // keeps inline tx_status (Connecting phase has
+                    // no persistent slot).
                     assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::Idle);
                 }
                 other => panic!("expected StartupComplete, got {other:?}"),

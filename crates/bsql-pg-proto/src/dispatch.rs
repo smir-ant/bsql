@@ -150,6 +150,37 @@ pub(crate) mod _param_description_dispatch_leaf {
         slot.park_at_param_desc_dispatch(param_oids, ParamDescDispatchToken(()));
     }
 }
+
+/// Leaf submodule for the inbound `'Z'` (ReadyForQuery) frame
+/// dispatch. Hosts the [`RfqDispatchToken`] type and the park helper
+/// fn. DEF-286 Φ-E mirror of [`_command_complete_dispatch_leaf`].
+///
+/// Sole call sites: every `'Z'`-handling dispatch arm
+/// (`PingAwaitingRfq`, `SimpleQueryAwaitingRfq`,
+/// `BindExecuteAwaitingRfq*`, `DescribeStatement*`, `DescribePortal*`,
+/// etc.). Each arm parses the wire byte into a [`crate::action::TxStatus`]
+/// via [`parse_rfq_payload`], then parks via this helper.
+pub(crate) mod _rfq_dispatch_leaf {
+    /// Leaf-scope token for the `'Z'` arm parking call. The
+    /// tuple-struct field is PRIVATE to this submodule — `Self(())`
+    /// mints are callable ONLY here. Type `pub(crate)` so
+    /// [`crate::tx_status_slot::TxStatusSlotCell::park_at_rfq_dispatch`]
+    /// can name it in its parameter signature.
+    pub(crate) struct RfqDispatchToken(());
+
+    /// Mint a [`RfqDispatchToken`] and write `tx_status` into `slot`
+    /// via
+    /// [`crate::tx_status_slot::TxStatusSlotCell::park_at_rfq_dispatch`].
+    /// Sole call sites: every `'Z'`-handling dispatch arm.
+    #[inline]
+    pub(in crate::dispatch) fn park_tx_status_at_dispatch(
+        slot: &mut crate::tx_status_slot::TxStatusSlotCell,
+        tx_status: crate::action::TxStatus,
+    ) {
+        slot.park_at_rfq_dispatch(tx_status, RfqDispatchToken(()));
+    }
+}
+
 use crate::wire::{
     SCRAM_SHA_256_MECHANISM, TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE,
     TAG_CLOSE_COMPLETE, TAG_COMMAND_COMPLETE, TAG_COPY_DATA, TAG_COPY_DONE, TAG_COPY_IN_RESPONSE,
@@ -391,6 +422,12 @@ pub(crate) fn dispatch(
     // and projects into `Reply::QueryComplete.command_tag:
     // &'r CommandTag`.
     command_tag_slot: &mut crate::command_tag_slot::CommandTagSlotCell,
+    // DEF-286 Φ-E: TxStatus slot. Written by every `'Z'`
+    // (ReadyForQuery) dispatch arm; the parked value is read by
+    // callers via `PgProtocol::terminal_tx_status` post-`feed_bytes`.
+    // Materialise does NOT read it — Reply payloads no longer carry
+    // tx_status; the slot is the single source of truth.
+    tx_status_slot: &mut crate::tx_status_slot::TxStatusSlotCell,
     // `&mut Option<Box<ErrorArena>>` slot for the dispatch path's
     // only cold-write target. Most dispatch arms don't write
     // error_arena; the few that do (ErrorResponse arms) lazy-init
@@ -438,11 +475,15 @@ pub(crate) fn dispatch(
             // `payload_len`.
             match parse_rfq_payload(payload) {
                 Ok(tx_status) => {
+                    _rfq_dispatch_leaf::park_tx_status_at_dispatch(
+                        tx_status_slot,
+                        tx_status,
+                    );
                     *state = ProtoState::Idle;
                     DispatchOutcome::AdvancedWithAction {
                         action: crate::action::deliver(
                             id,
-                            crate::action::PongPayload { tx_status },
+                            crate::action::PongPayload,
                         ),
                     }
                 }
@@ -762,6 +803,10 @@ pub(crate) fn dispatch(
                     // and rides the state variant's drop glue
                     // forward to `BackendKey.secret_key` at
                     // `into_active` time.
+                    _rfq_dispatch_leaf::park_tx_status_at_dispatch(
+                        tx_status_slot,
+                        tx_status,
+                    );
                     *state = ProtoState::HandshakeReady {
                         pid,
                         secret_key: crate::sensitive::Sensitive::new(*secret_key_inner),
@@ -772,6 +817,13 @@ pub(crate) fn dispatch(
                             crate::action::StartupCompletePayload {
                                 pid,
                                 secret_key: *secret_key_inner,
+                                // DEF-286 Φ-E exception: tx_status
+                                // kept inline ONLY on StartupComplete
+                                // because Connecting phase has no
+                                // persistent slot. Other Reply variants
+                                // strip the field; callers query via
+                                // PgProtocol::terminal_tx_status post-
+                                // into_active().
                                 tx_status,
                             },
                         ),
@@ -1004,13 +1056,15 @@ pub(crate) fn dispatch(
         (ProtoState::SimpleQueryAwaitingRfq { reply }, TAG_READY_FOR_QUERY) => {
             match parse_rfq_payload(payload) {
                 Ok(tx_status) => {
+                    _rfq_dispatch_leaf::park_tx_status_at_dispatch(
+                        tx_status_slot,
+                        tx_status,
+                    );
                     *state = ProtoState::Idle;
                     DispatchOutcome::AdvancedWithAction {
                         action: crate::action::deliver(
                             reply,
-                            crate::action::StagedQueryCompletePayload::Completed {
-                                tx_status,
-                            },
+                            crate::action::StagedQueryCompletePayload::Completed,
                         ),
                     }
                 }
@@ -1235,11 +1289,15 @@ pub(crate) fn dispatch(
         (ProtoState::ParseAwaitingRfq(reply), TAG_READY_FOR_QUERY) => {
             match parse_rfq_payload(payload) {
                 Ok(tx_status) => {
+                    _rfq_dispatch_leaf::park_tx_status_at_dispatch(
+                        tx_status_slot,
+                        tx_status,
+                    );
                     *state = ProtoState::Idle;
                     DispatchOutcome::AdvancedWithAction {
                         action: crate::action::deliver(
                             reply,
-                            crate::action::ParseCompletePayload { tx_status },
+                            crate::action::ParseCompletePayload,
                         ),
                     }
                 }
@@ -1359,16 +1417,19 @@ pub(crate) fn dispatch(
             TAG_READY_FOR_QUERY,
         ) => match parse_rfq_payload(payload) {
             Ok(tx_status) => {
+                _rfq_dispatch_leaf::park_tx_status_at_dispatch(
+                    tx_status_slot,
+                    tx_status,
+                );
                 // DEF-286 Φ3: command_tag in slot. Materialise reads
                 // the slot at the Z arm → Reply::QueryComplete with
-                // `command_tag: &'r CommandTag`.
+                // `command_tag: &'r CommandTag`. DEF-286 Φ-E:
+                // tx_status now also in slot (parked above).
                 *state = ProtoState::Idle;
                 DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
                         reply,
-                        crate::action::StagedQueryCompletePayload::Completed {
-                            tx_status,
-                        },
+                        crate::action::StagedQueryCompletePayload::Completed,
                     ),
                 }
             }
@@ -1491,11 +1552,15 @@ pub(crate) fn dispatch(
             TAG_READY_FOR_QUERY,
         ) => match parse_rfq_payload(payload) {
             Ok(tx_status) => {
+                _rfq_dispatch_leaf::park_tx_status_at_dispatch(
+                    tx_status_slot,
+                    tx_status,
+                );
                 *state = ProtoState::Idle;
                 DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
                         reply,
-                        crate::action::StagedQueryCompletePayload::Suspended { tx_status },
+                        crate::action::StagedQueryCompletePayload::Suspended,
                     ),
                 }
             }
@@ -1513,15 +1578,19 @@ pub(crate) fn dispatch(
             TAG_READY_FOR_QUERY,
         ) => match parse_rfq_payload(payload) {
             Ok(tx_status) => {
+                _rfq_dispatch_leaf::park_tx_status_at_dispatch(
+                    tx_status_slot,
+                    tx_status,
+                );
                 // DEF-286 Φ3: command_tag in slot; row_desc in
-                // row_desc_slot. Materialise reads both slots at Z.
+                // row_desc_slot. DEF-286 Φ-E: tx_status in slot.
+                // Materialise reads command_tag + row_desc slots at Z;
+                // callers query tx_status via terminal_tx_status.
                 *state = ProtoState::Idle;
                 DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
                         reply,
-                        crate::action::StagedQueryCompletePayload::Completed {
-                            tx_status,
-                        },
+                        crate::action::StagedQueryCompletePayload::Completed,
                     ),
                 }
             }
@@ -1655,13 +1724,15 @@ pub(crate) fn dispatch(
             TAG_READY_FOR_QUERY,
         ) => match parse_rfq_payload(payload) {
             Ok(tx_status) => {
+                _rfq_dispatch_leaf::park_tx_status_at_dispatch(
+                    tx_status_slot,
+                    tx_status,
+                );
                 *state = ProtoState::Idle;
                 DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
                         reply,
-                        crate::action::StagedDescribeStatementCompletePayload {
-                            tx_status,
-                        },
+                        crate::action::StagedDescribeStatementCompletePayload,
                     ),
                 }
             }
@@ -1718,11 +1789,15 @@ pub(crate) fn dispatch(
             TAG_READY_FOR_QUERY,
         ) => match parse_rfq_payload(payload) {
             Ok(tx_status) => {
+                _rfq_dispatch_leaf::park_tx_status_at_dispatch(
+                    tx_status_slot,
+                    tx_status,
+                );
                 *state = ProtoState::Idle;
                 DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
                         reply,
-                        crate::action::StagedDescribePortalCompletePayload { tx_status },
+                        crate::action::StagedDescribePortalCompletePayload,
                     ),
                 }
             }

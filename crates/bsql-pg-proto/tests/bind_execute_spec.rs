@@ -179,11 +179,12 @@ fn bind_execute_dml_full_round_trip() {
         }] => {
             assert_eq!(*delivered, reply_raw, "correlator round-trips");
             assert_eq!(format!("{}", p.command_tag), "INSERT 0 1");
-            assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::Idle);
             assert!(p.row_desc.is_none(), "DML: no schema delivered");
         }
         other => panic!("expected DeliverReply(QueryComplete), got {other:?}"),
     }
+    // DEF-286 Φ-E: tx_status accessor instead of inline field.
+    assert_eq!(proto.terminal_tx_status(), bsql_pg_proto::TxStatus::Idle);
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 

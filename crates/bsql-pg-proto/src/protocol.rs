@@ -718,6 +718,14 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
     /// transient `ActiveExtras.command_tag` slot.
     pub(in crate::protocol) command_tag_slot:
         &'r mut crate::command_tag_slot::CommandTagSlotCell,
+    /// DEF-286 Φ-E: TxStatus slot threaded from
+    /// `<ActivePhase>::Extras.tx_status` via
+    /// `feed_bytes_dispatch_active`. Connecting variant uses the
+    /// transient `ActiveExtras.tx_status` slot. The `'Z'` dispatch
+    /// arms park here; callers query via
+    /// [`crate::PgProtocol::terminal_tx_status`] post-`feed_bytes`.
+    pub(in crate::protocol) tx_status_slot:
+        &'r mut crate::tx_status_slot::TxStatusSlotCell,
     pub(in crate::protocol) session_params:
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
@@ -1178,6 +1186,19 @@ pub struct ActiveExtras {
     /// Cleared at Idle/Errored residue boundary.
     pub(in crate::protocol) command_tag:
         crate::command_tag_slot::CommandTagSlotCell,
+    /// DEF-286 Φ-E — slot for parked `ReadyForQuery` transaction
+    /// status. Per-cycle: `'Z'` arrival parks the
+    /// [`crate::action::TxStatus`]; callers query via
+    /// [`crate::PgProtocol::terminal_tx_status`] AFTER consuming
+    /// `Action::DeliverReply`. Reset to `TxStatus::Idle` at
+    /// Idle/Errored residue boundary. Externalising tx_status
+    /// strips the 1-B `pub tx_status` field from every Reply
+    /// variant — collapses the 7-byte alignment tail on every
+    /// 24-B-class variant (QueryComplete /
+    /// DescribeStatementComplete) to zero, cascading Reply
+    /// 32 → 16-24 B and Action 40 → 24-32 B.
+    pub(in crate::protocol) tx_status:
+        crate::tx_status_slot::TxStatusSlotCell,
 }
 
 /// Phase-typed wrapper over the per-phase Inner storage.
@@ -1387,6 +1408,12 @@ pub(crate) mod _clear_residue_leaf {
     /// [`crate::command_tag_slot::CommandTagSlotCell`] can name it.
     pub(crate) struct ClearResidueCommandTagToken(());
 
+    /// Leaf-scope token for the tx_status slot reset at residue
+    /// transitions. DEF-286 Φ-E — mirror of
+    /// [`ClearResidueCommandTagToken`]. Type `pub(crate)` so
+    /// [`crate::tx_status_slot::TxStatusSlotCell`] can name it.
+    pub(crate) struct ClearResidueTxStatusToken(());
+
     /// Clear the schema slot via
     /// [`crate::schema_slot::RowDescSlotCell::clear_at_residue`] with
     /// the [`ClearResidueSchemaToken`] minted inline. Used by
@@ -1453,6 +1480,19 @@ pub(crate) mod _clear_residue_leaf {
         slot: &mut crate::command_tag_slot::CommandTagSlotCell,
     ) {
         slot.clear_at_residue(ClearResidueCommandTagToken(()));
+    }
+
+    /// Reset the tx_status slot to the conn-start default
+    /// (`TxStatus::Idle`) via
+    /// [`crate::tx_status_slot::TxStatusSlotCell::clear_at_residue`]
+    /// with the [`ClearResidueTxStatusToken`] minted inline. DEF-286
+    /// Φ-E. Used by both Idle and Errored arms of
+    /// `clear_session_residue_for_class_dispatch`.
+    #[inline]
+    pub(in crate::protocol) fn clear_tx_status_slot_residue(
+        slot: &mut crate::tx_status_slot::TxStatusSlotCell,
+    ) {
+        slot.clear_at_residue(ClearResidueTxStatusToken(()));
     }
 }
 
@@ -1811,6 +1851,9 @@ pub(crate) mod _proto_init_leaf {
             command_tag: crate::command_tag_slot::CommandTagSlotCell::empty(
                 ProtoInitToken::mint(),
             ),
+            tx_status: crate::tx_status_slot::TxStatusSlotCell::fresh(
+                ProtoInitToken::mint(),
+            ),
         }
     }
 
@@ -1836,6 +1879,9 @@ pub(crate) mod _proto_init_leaf {
                 ProtoInitToken::mint(),
             ),
             command_tag: crate::command_tag_slot::CommandTagSlotCell::empty(
+                ProtoInitToken::mint(),
+            ),
+            tx_status: crate::tx_status_slot::TxStatusSlotCell::fresh(
                 ProtoInitToken::mint(),
             ),
         }
@@ -3963,6 +4009,7 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
     row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
     param_oids_slot: &mut crate::param_oids_slot::ParamOidsSlotCell,
     command_tag_slot: &mut crate::command_tag_slot::CommandTagSlotCell,
+    tx_status_slot: &mut crate::tx_status_slot::TxStatusSlotCell,
     session_params: &mut crate::session_params_slot::SessionParamsCell,
     error_arena: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
     notifications_arena: &mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
@@ -3985,6 +4032,10 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
             // Cycle closes at Idle entry — drop boxed CommandTag,
             // freeing the ~40 B heap.
             _clear_residue_leaf::clear_command_tag_slot_residue(command_tag_slot);
+            // DEF-286 Φ-E: reset tx_status slot to Idle at Idle
+            // boundaries. Single-byte reset; conn-start-default
+            // matches PG's actual idle state.
+            _clear_residue_leaf::clear_tx_status_slot_residue(tx_status_slot);
             if let Some(arena) = error_arena.as_deref_mut() {
                 arena.clear();
             }
@@ -4016,6 +4067,8 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
             _clear_residue_leaf::clear_param_oids_slot_residue(param_oids_slot);
             // DEF-286 Φ3: also clear CommandTag slot on Errored.
             _clear_residue_leaf::clear_command_tag_slot_residue(command_tag_slot);
+            // DEF-286 Φ-E: also reset tx_status slot on Errored.
+            _clear_residue_leaf::clear_tx_status_slot_residue(tx_status_slot);
             if let Some(arena) = error_arena.as_deref_mut() {
                 arena.clear();
             }
@@ -4105,6 +4158,7 @@ where
         row_desc_slot: terminal_row_desc,
         param_oids_slot: terminal_param_oids,
         command_tag_slot: terminal_command_tag,
+        tx_status_slot: terminal_tx_status,
         session_params: session_params_slot,
         error_arena: error_arena_slot,
         notifications_arena: notifications_arena_slot,
@@ -4126,6 +4180,7 @@ where
         terminal_row_desc,
         terminal_param_oids,
         terminal_command_tag,
+        terminal_tx_status,
         session_params_slot,
         error_arena_slot,
         notifications_arena_slot,
@@ -4308,6 +4363,7 @@ where
                 terminal_row_desc,
                 terminal_param_oids,
                 terminal_command_tag,
+                terminal_tx_status,
                 error_arena_slot,
                 copy_chunks_arena_slot,
                 command_tags_arena_slot,
@@ -4533,6 +4589,7 @@ where
                         terminal_row_desc,
                         terminal_param_oids,
                         terminal_command_tag,
+                        terminal_tx_status,
                         error_arena_slot,
                         copy_chunks_arena_slot,
                         command_tags_arena_slot,
@@ -4852,6 +4909,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
             row_desc_slot: &mut transient_extras.row_desc,
             param_oids_slot: &mut transient_extras.param_oids,
             command_tag_slot: &mut transient_extras.command_tag,
+            tx_status_slot: &mut transient_extras.tx_status,
             session_params,
             error_arena,
             notifications_arena: &mut transient_notifications_arena,
@@ -4940,6 +4998,10 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
     /// `<ActivePhase>::Extras.command_tag`.
     pub(in crate::protocol) command_tag_slot:
         &'r mut crate::command_tag_slot::CommandTagSlotCell,
+    /// DEF-286 Φ-E: tx_status_slot threaded from
+    /// `<ActivePhase>::Extras.tx_status`.
+    pub(in crate::protocol) tx_status_slot:
+        &'r mut crate::tx_status_slot::TxStatusSlotCell,
     pub(in crate::protocol) session_params:
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
@@ -5012,6 +5074,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         row_desc_slot,
         param_oids_slot,
         command_tag_slot,
+        tx_status_slot,
         session_params,
         error_arena,
         notifications_arena,
@@ -5039,6 +5102,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
             row_desc_slot,
             param_oids_slot,
             command_tag_slot,
+            tx_status_slot,
             session_params,
             error_arena,
             notifications_arena,
@@ -5454,6 +5518,7 @@ impl ActiveInner {
                 row_desc_slot: &mut extras.row_desc,
                 param_oids_slot: &mut extras.param_oids,
                 command_tag_slot: &mut extras.command_tag,
+                tx_status_slot: &mut extras.tx_status,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 notifications_arena: &mut self.notifications_arena,
@@ -5536,6 +5601,7 @@ impl ActiveInner {
                 row_desc_slot: &mut extras.row_desc,
                 param_oids_slot: &mut extras.param_oids,
                 command_tag_slot: &mut extras.command_tag,
+                tx_status_slot: &mut extras.tx_status,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 notifications_arena: &mut self.notifications_arena,
@@ -5569,6 +5635,7 @@ impl ActiveInner {
             &mut extras.row_desc,
             &mut extras.param_oids,
             &mut extras.command_tag,
+            &mut extras.tx_status,
             &mut self.session_params,
             &mut self.error_arena,
             &mut self.notifications_arena,
@@ -6301,6 +6368,31 @@ impl PgProtocol<ActivePhase> {
             .row_desc
             .as_ref()
             .map(crate::decode::RowDescBorrow::from_ref)
+    }
+
+    /// Read the terminal `ReadyForQuery` transaction-status byte
+    /// parked at the most-recent `'Z'` arrival (DEF-286 Φ-E).
+    ///
+    /// Externalisation of the byte from every `Reply<'r>` variant
+    /// payload removed it from inline pattern destructure; callers
+    /// query this accessor AFTER consuming `Action::DeliverReply`
+    /// from `OutActions`. Default value is
+    /// [`crate::action::TxStatus::Idle`] — the conn-start state for
+    /// a freshly handshaked Active connection. Reset to `Idle` at
+    /// every Idle/Errored residue boundary.
+    ///
+    /// # Lifetime contract
+    ///
+    /// Unlike `get_notification` / `get_copy_chunk` /
+    /// `get_command_tag` (gen-tagged arena handles that require
+    /// resolution within the current OutActions cycle), this is a
+    /// plain `Copy` accessor — the parked value is valid until the
+    /// next residue clear OR the next `'Z'` arrival overwrites it.
+    /// Callers may stash it freely.
+    #[inline]
+    #[must_use]
+    pub fn terminal_tx_status(&self) -> crate::action::TxStatus {
+        self.extras.tx_status.get()
     }
 
     /// Fused state classification for the row-stream fast-path

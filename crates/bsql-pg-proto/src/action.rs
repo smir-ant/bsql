@@ -1385,17 +1385,18 @@ pub enum StagedQueryCompletePayload {
     /// Portal exhausted — terminal `CommandComplete + RFQ` observed.
     ///
     /// DEF-286 Φ3: `command_tag` field removed — slot pattern via
-    /// [`crate::command_tag_slot::CommandTagSlotCell`]. Materialise
-    /// reads the slot at the `'Z'` arm and produces
-    /// `Reply::QueryComplete.command_tag: &'r CommandTag`.
-    Completed {
-        tx_status: TxStatus,
-    },
+    /// [`crate::command_tag_slot::CommandTagSlotCell`]. DEF-286 Φ-E:
+    /// `tx_status` field removed — slot pattern via
+    /// [`crate::tx_status_slot::TxStatusSlotCell`]. Both reads happen
+    /// at materialise (slot `'r` borrow) and at
+    /// [`crate::PgProtocol::terminal_tx_status`] respectively. The
+    /// staged variant is now a unit tag.
+    Completed,
     /// Row cap hit — terminal `PortalSuspended + RFQ` observed. No
-    /// `command_tag` (server didn't send `CommandComplete`).
-    Suspended {
-        tx_status: TxStatus,
-    },
+    /// `command_tag` (server didn't send `CommandComplete`). DEF-286
+    /// Φ-E: `tx_status` field removed (mirror of `Completed`'s
+    /// shape; reason colocated above).
+    Suspended,
 }
 
 /// Lifetime-free staged counterpart to
@@ -1416,28 +1417,19 @@ pub enum StagedQueryCompletePayload {
 /// Fields are `pub(crate)`; see [`StagedQueryCompletePayload`] for
 /// the bypass-closure rationale.
 #[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StagedDescribeStatementCompletePayload {
-    // DEF-286 Φ1: `param_oids` moved to
-    // `<ActivePhase>::Extras.param_oids` slot. Materialise reads
-    // the slot as `Option<&'r ParamOids>` (parked at the `'t'`
-    // dispatch arm); the public Reply payload carries the borrow.
-    // Staged variant carries only `tx_status` now.
-    pub(crate) tx_status: TxStatus,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StagedDescribeStatementCompletePayload;
 
 /// Lifetime-free staged counterpart to
 /// [`DescribePortalCompletePayload<'r>`].
 ///
 /// See [`StagedDescribeStatementCompletePayload`] for the
-/// single-source-of-truth rationale on schema presence. Field is
-/// `pub(crate)`; see [`StagedQueryCompletePayload`] for the
-/// bypass-closure rationale.
+/// single-source-of-truth rationale on schema presence. DEF-286 Φ-E:
+/// formerly carried `tx_status` inline; now externalised into
+/// `<ActivePhase>::Extras.tx_status` slot.
 #[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StagedDescribePortalCompletePayload {
-    pub(crate) tx_status: TxStatus,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StagedDescribePortalCompletePayload;
 
 // From impls: schema-less payloads wrap directly; schema-bearing
 // payloads use their staged form to produce a StagedReply.
@@ -1530,23 +1522,26 @@ impl StagedReply {
                 // observed the terminal frame; materialise just reads.
                 let row_desc = row_desc_slot.map(crate::decode::RowDescBorrow::from_ref);
                 match staged {
-                    StagedQueryCompletePayload::Completed {
-                        tx_status,
-                    } => Reply::QueryComplete(QueryCompletePayload {
-                        // DEF-286 Φ3: command_tag borrowed from slot.
-                        // Defensive: slot empty would be a slot-cycle
-                        // violation (architecturally unreachable from
-                        // a Z arm in AwaitingRfq); map to static EMPTY
-                        // sentinel — tier-3 classifier, no panic.
-                        command_tag: command_tag_slot.unwrap_or(
-                            &crate::command_tag::CommandTag::EMPTY,
-                        ),
-                        tx_status,
-                        row_desc,
-                    }),
-                    StagedQueryCompletePayload::Suspended { tx_status } => {
+                    StagedQueryCompletePayload::Completed => {
+                        Reply::QueryComplete(QueryCompletePayload {
+                            // DEF-286 Φ3: command_tag borrowed from
+                            // slot. Defensive: slot empty would be a
+                            // slot-cycle violation (architecturally
+                            // unreachable from a Z arm in
+                            // AwaitingRfq); map to static EMPTY
+                            // sentinel — tier-3 classifier, no panic.
+                            command_tag: command_tag_slot.unwrap_or(
+                                &crate::command_tag::CommandTag::EMPTY,
+                            ),
+                            // DEF-286 Φ-E: tx_status externalised
+                            // into the `<ActivePhase>::Extras.tx_status`
+                            // slot. Callers query via
+                            // `pg.terminal_tx_status()`.
+                            row_desc,
+                        })
+                    }
+                    StagedQueryCompletePayload::Suspended => {
                         Reply::QuerySuspended(QuerySuspendedPayload {
-                            tx_status,
                             row_desc,
                         })
                     }
@@ -1586,6 +1581,7 @@ fn describe_statement_complete_into_public<'r>(
     row_desc_slot: Option<&'r crate::decode::RowDesc>,
     param_oids_slot: Option<&'r ParamOids>,
 ) -> Reply<'r> {
+    let _staged = staged; // pin moved binding for the unused payload
     Reply::DescribeStatementComplete(DescribeStatementCompletePayload {
         // DEF-286 Φ1: `param_oids` borrowed from
         // `<ActivePhase>::Extras.param_oids` slot (parked at the
@@ -1599,7 +1595,8 @@ fn describe_statement_complete_into_public<'r>(
         // that reaches this materialise site.
         param_oids: param_oids_slot.unwrap_or(&ParamOids::EMPTY),
         rows: describe_rows_from_slot(row_desc_slot),
-        tx_status: staged.tx_status,
+        // DEF-286 Φ-E: tx_status externalised; callers query via
+        // `pg.terminal_tx_status()`.
     })
 }
 
@@ -1609,9 +1606,11 @@ fn describe_portal_complete_into_public<'r>(
     staged: StagedDescribePortalCompletePayload,
     row_desc_slot: Option<&'r crate::decode::RowDesc>,
 ) -> Reply<'r> {
+    let _staged = staged; // pin moved binding for the unused payload
     Reply::DescribePortalComplete(DescribePortalCompletePayload {
         rows: describe_rows_from_slot(row_desc_slot),
-        tx_status: staged.tx_status,
+        // DEF-286 Φ-E: tx_status externalised; callers query via
+        // `pg.terminal_tx_status()`.
     })
 }
 
@@ -1850,12 +1849,17 @@ pub enum Reply<'r> {
 /// `'E'` failed transaction.
 ///
 /// [transaction-status indicator]: https://www.postgresql.org/docs/current/protocol-message-formats.html
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PongPayload {
-    /// Transaction-status indicator byte (`'I'`, `'T'`, `'E'`) from
-    /// the matching `ReadyForQuery` frame.
-    pub tx_status: TxStatus,
-}
+/// Typed payload for [`crate::reply_id::PingKind`] replies (post-Φ-E).
+///
+/// DEF-286 Φ-E: `tx_status` field stripped. Callers query the
+/// terminal transaction-status via
+/// [`crate::PgProtocol::terminal_tx_status`] after consuming the
+/// `Action::DeliverReply`. Externalisation cascades into Reply
+/// (32 → 16-24 B) and Action (40 → 24-32 B) — the 7-byte
+/// alignment-tail on 24-B-class variants collapses to zero once the
+/// inline 1-B field is removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PongPayload;
 
 impl<'r> From<PongPayload> for Reply<'r> {
     #[inline]
@@ -1891,6 +1895,19 @@ pub struct StartupCompletePayload {
     /// Logged as `<REDACTED>` via the manual `Debug` impl.
     pub secret_key: i32,
     /// Transaction status from the final `ReadyForQuery`.
+    ///
+    /// **DEF-286 Φ-E exception**: tx_status is stripped from every
+    /// other Reply variant (callers query
+    /// [`crate::PgProtocol::terminal_tx_status`] on the post-
+    /// `feed_bytes` Active-phase state), but kept inline HERE because
+    /// the handshake-complete event fires from
+    /// `PgProtocol<ConnectingPhase>` which lacks a persistent
+    /// `ActiveExtras.tx_status` slot — only Active phase carries
+    /// the slot. Callers inspect tx_status either via this field
+    /// (during handshake) or via `terminal_tx_status()` (after
+    /// `into_active()`). The inline 1-B field does NOT inflate
+    /// `Reply<'r>` (max variant is QueryComplete at 16 B;
+    /// StartupComplete at 12 B with tx_status stays under cap).
     pub tx_status: TxStatus,
 }
 
@@ -1939,8 +1956,6 @@ pub struct QueryCompletePayload<'r> {
     /// `&'r CommandTag` (8 B borrow into the typed enum). Consumers
     /// can match on `CommandTag::Insert { rows }` etc. directly.
     pub command_tag: &'r crate::command_tag::CommandTag,
-    /// Transaction-status indicator from the trailing `ReadyForQuery`.
-    pub tx_status: TxStatus,
     /// Result-set schema, if any. `Some` for SELECT (including
     /// 0-row SELECTs), `None` for DML / empty-query.
     ///
@@ -1969,8 +1984,6 @@ impl<'r> From<QueryCompletePayload<'r>> for Reply<'r> {
 /// [`crate::push_command::ExecutePortal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuerySuspendedPayload<'r> {
-    /// Transaction-status indicator from the trailing `ReadyForQuery`.
-    pub tx_status: TxStatus,
     /// Result-set schema. Preserved from the original `Bind` —
     /// the portal's bound schema applies to subsequent
     /// `ExecutePortal` resumes too. `Some` for SELECT (including
@@ -1986,17 +1999,14 @@ impl<'r> From<QuerySuspendedPayload<'r>> for Reply<'r> {
     }
 }
 
-/// Typed payload for [`crate::reply_id::ParseKind`] replies.
+/// Typed payload for [`crate::reply_id::ParseKind`] replies
+/// (post-Φ-E).
 ///
-/// Carries the transaction-status byte from the trailing
-/// `ReadyForQuery` — uniform with the other payloads, preserving
-/// the tx_status value the dispatcher already validates. A naive
-/// ZST shape would silently discard it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParseCompletePayload {
-    /// Transaction-status indicator from the trailing `ReadyForQuery`.
-    pub tx_status: TxStatus,
-}
+/// DEF-286 Φ-E: `tx_status` field stripped; callers query the
+/// terminal transaction-status via
+/// [`crate::PgProtocol::terminal_tx_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ParseCompletePayload;
 
 impl<'r> From<ParseCompletePayload> for Reply<'r> {
     #[inline]
@@ -2328,8 +2338,6 @@ pub struct DescribeStatementCompletePayload<'r> {
     /// Rows-or-no-data sum from the subsequent response frame.
     /// `DescribedRows` holds a `&'r RowDesc` borrow.
     pub rows: DescribedRows<'r>,
-    /// Transaction status from the trailing `ReadyForQuery`.
-    pub tx_status: TxStatus,
 }
 
 impl<'r> From<DescribeStatementCompletePayload<'r>> for Reply<'r> {
@@ -2356,8 +2364,6 @@ pub struct DescribePortalCompletePayload<'r> {
     /// Rows-or-no-data sum from the response frame.
     /// `DescribedRows` holds a `&'r RowDesc` borrow.
     pub rows: DescribedRows<'r>,
-    /// Transaction status from the trailing `ReadyForQuery`.
-    pub tx_status: TxStatus,
 }
 
 impl<'r> From<DescribePortalCompletePayload<'r>> for Reply<'r> {

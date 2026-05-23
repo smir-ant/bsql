@@ -200,7 +200,6 @@ fn select_zero_rows_end_to_end() {
             match value {
                 Reply::QueryComplete(p) => {
                     assert_eq!(format!("{}", p.command_tag), "SELECT 0");
-                    assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::Idle);
                     // 1c-2a: 0-row SELECT delivers schema via Reply
                     // (no StreamRow to carry it).
                     assert!(
@@ -213,6 +212,8 @@ fn select_zero_rows_end_to_end() {
         }
         other => panic!("expected DeliverReply, got {other:?}"),
     }
+    // DEF-286 Φ-E: tx_status accessor instead of inline field.
+    assert_eq!(proto.terminal_tx_status(), bsql_pg_proto::TxStatus::Idle);
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
@@ -248,7 +249,6 @@ fn dml_no_rows_end_to_end() {
         }] => {
             assert_eq!(*delivered_id, q_raw);
             assert_eq!(format!("{}", p.command_tag), "INSERT 0 3");
-            assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::InTransaction);
             // 1c-2a: DML never received a 'T' frame — row_desc is None.
             // Critical invariant: push_command clears prior SELECT's
             // row_desc, so a DML following a SELECT gets None here,
@@ -260,6 +260,8 @@ fn dml_no_rows_end_to_end() {
         }
         other => panic!("expected DeliverReply(QueryComplete(INSERT 0 3)), got {other:?}"),
     }
+    // DEF-286 Φ-E: tx_status moved to accessor; final state was a `T`-frame.
+    assert_eq!(proto.terminal_tx_status(), bsql_pg_proto::TxStatus::InTransaction);
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 

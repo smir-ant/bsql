@@ -192,16 +192,19 @@ fn rfq_delivers_pong_and_returns_to_idle() {
                 &ping_raw,
                 "reply correlator round-trips unchanged",
             );
-            match value {
-                Reply::Pong(p) => assert_eq!(
-                    p.tx_status, bsql_pg_proto::TxStatus::Idle,
-                    "Pong must surface the RFQ payload byte (tx-status) unchanged",
-                ),
-                other => panic!("only Reply::Pong is valid here; got {other:?}"),
-            }
+            assert!(
+                matches!(value, Reply::Pong(_)),
+                "only Reply::Pong is valid here; got {value:?}",
+            );
         }
         other => panic!("unexpected action shape: {other:?}"),
     }
+    // DEF-286 Φ-E: tx_status moved to accessor — Pong is now ZST.
+    assert_eq!(
+        proto.terminal_tx_status(),
+        bsql_pg_proto::TxStatus::Idle,
+        "RFQ payload byte (tx-status) must round-trip via terminal_tx_status accessor",
+    );
     assert!(matches!(proto.state(), ActiveState::Idle));
     assert_eq!(proto.unread().len(), 0, "frame fully consumed");
 }

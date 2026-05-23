@@ -249,6 +249,7 @@ pub(crate) mod copy_chunks_arena;
 pub use copy_chunks_arena::{CopyChunkPayload, CopyChunkRef};
 pub(crate) mod command_tags_arena;
 pub use command_tags_arena::CommandTagRef;
+pub(crate) mod tx_status_slot;
 pub mod frame;
 pub mod guard;
 pub mod ident;
@@ -632,41 +633,70 @@ const _: () = assert!(
 );
 const _: () = assert!(
     core::mem::size_of::<action::Action<'static, 'static>>() == 40,
-    "Action<'_, '_> exact size — 40 B post-DEF-286 Φ-D (ICC \
-     arena externalisation). \
+    "Action<'_, '_> exact size — 40 B post-DEF-286 Φ-E. \
      \
-     Variant sizes (PG sans-IO state machine actions): \
-     - DeliverReply: 8 (NonZeroU64 id, niche absorbs outer disc) + 32 \
-       (Reply<'r>) = 40 B — DOMINATOR. \
-     - FailReply: 8 (NonZeroU64 id) + 24 (ProtocolError) = 32 B; \
-       outer disc niche-packs via id. \
-     - IntermediateCommandComplete: 4 (CommandTagRef) — niche-packs \
-       outer disc via NonZeroU8 slot marker. \
-     - SendBytes/Notify/CopyDataChunk/CloseSocket: < 24 B each. \
+     **AT STRUCTURAL FLOOR** under Rust 1.95 niche-search rules. \
+     Floor proof (verified via `-Zprint-type-sizes`): \
+     - DeliverReply variant body = id(NonZeroU64 8) + value(Reply 24) \
+       = 32 B at align 8. \
+     - Outer disc 2 B explicit + 6 B align-8 padding before \
+       variant payload = 8 B disc-slot. \
+     - Total Action = 8 + 32 = 40 B. \
      \
-     Pre-Φ-D was 48 B (ICC carried 40 B inline CommandTag, no \
-     NonZeroU* niche → outer disc required explicit byte +7B pad). \
-     The Φ-D externalisation drops ICC to 4 B + niche-pack; the \
-     outer enum disc folds into a niche of some variant for every \
-     variant now. \
+     Why niche-encoded outer disc is STRUCTURALLY IMPOSSIBLE: \
+     `rustc_abi::Niche` treats NonZeroU64 as ONE forbidden \
+     bit-pattern (all-zeros), NOT 2^64-1 unused patterns. With 7 \
+     Action variants needing 6 disc values from a single donor \
+     variant's niche, niche-search fails (1 unused pattern < 6 \
+     needed). Rust falls back to TagEncoding::Direct → explicit \
+     disc slot. \
      \
-     Cumulative DEF-286 cascade: pre-Φ1 = 80 B (FailReply 72 PE) → \
-     post-Φ-D = 40 B (−50 %). \
+     Variant sizes post-Φ-E: \
+     - DeliverReply: id(8) + value(Reply 24) = 32 B body — DOMINATOR. \
+     - FailReply: id(8) + cause(ProtocolError 24) = 32 B body. \
+     - SendBytes: &[u8] fat-ptr = 16 B body. \
+     - Notify: pid(i32 4) + notif_ref(NotificationRef 4) = 8 B body. \
+     - IntermediateCommandComplete: tag_ref(CommandTagRef 4) = 4 B. \
+     - CopyDataChunk: chunk_ref(4) = 4 B. \
+     - CloseSocket: unit, 0 B (NO niche — blocks niche-encoding). \
+     \
+     Φ-E shrunk Reply 32 → 24 B (cascade hit the variant body) but \
+     the disc-slot floor unmoved. StagedAction did shrink (40 → 32 B) \
+     because it has fewer variants and a different niche search \
+     outcome — see StagedAction's separate pin. \
+     \
+     Cumulative DEF-286 cascade on Action: pre-Φ1 = 80 B \
+     (FailReply 72 PE) → post-Φ-D = 40 B (−50 %). Floor unchanged \
+     by Φ-E. Real Action shrink requires Φ-F: Reply<'r> variant \
+     consolidation (collapse 3 ZST variants into Acked carrier → \
+     ≤ 2 outer variants → niche-encoding becomes possible → Reply \
+     24 → 16 B → Action 40 → 32 B). \
      \
      **NICHE OPTIMIZATION IS LOAD-BEARING** (DEF-260 MEASURED-REJECTED \
      2026-05-21): `#[repr(u8)]` would disable niche packing on \
      `id: NonZeroU64`. Default Rust repr is provably better — keep it.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Reply<'static>>() == 32,
-    "Reply<'r> exact pin — 48 B post-DEF-286 Φ1 (was 80 B \
-     pre-Φ1). DescribeStatementComplete's `param_oids: &'r ParamOids` \
-     borrow drops the variant from ~76 B inline → 16 B. New \
-     dominator is `QueryComplete.command_tag: BoundedStr<32>` \
-     ~36 B + DescribedRows ~8 B + discriminant + padding = 48 B. \
-     Φ3 (CommandTag typed enum) would shrink this further. Niche \
-     optimisation via NonZeroU64 on DescribeStatementComplete.tx_status / \
-     similar still applies. Exact pin catches any variant growth.",
+    core::mem::size_of::<action::Reply<'static>>() == 24,
+    "Reply<'r> exact pin — 24 B post-DEF-286 Φ-E (tx_status slot \
+     externalisation). DescribeStatementComplete / QueryComplete \
+     payloads are each 16 B (two 8-B borrows / ref handles), tail-pad \
+     to align 8. Outer disc 4 B (explicit) + 4 B pre-payload pad = \
+     8 B disc-slot. Total 16 + 8 = 24 B. \
+     \
+     Pre-Φ-E history: 80 B pre-Φ1 (inline RowDesc + param_oids); \
+     48 B post-Φ1 (Φ1 ParamOids slot); 32 B post-Φ3 (Φ3 CommandTag \
+     typed enum + slot externalisation); 24 B post-Φ-E (strip \
+     tx_status field from all Reply variants). \
+     \
+     **At structural floor for current variant shape.** Rust 1.95 \
+     niche-search uses single-pattern Niche encoding (NonZeroU64 \
+     contributes ONE forbidden bit-pattern, not 2^64-1) — with 9 \
+     Reply variants, niche-encoding the outer disc is structurally \
+     impossible. Future Φ-F would consolidate 0-B variants (Pong, \
+     ParseComplete, CloseComplete) into a single `Acked` carrier — \
+     could drop variant count to ≤ 2 and enable niche-packing, but \
+     requires major API redesign.",
 );
 const _: () = assert!(
     core::mem::size_of::<reply_id::ReplyId<reply_id::PingKind>>() <= 24,
@@ -786,7 +816,7 @@ const _: () = assert!(
 // on a quiet system (`load avg < 8`). On regression, investigate
 // (asm-diff, alternative shapes), do NOT roll back tier elevations.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() == 512,
+    core::mem::size_of::<protocol::PgProtocol>() == 520,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      Budget: ActiveInner ~348 B (ActiveState 16 + read_buf 264 + \
@@ -882,7 +912,7 @@ const _: () = assert!(
 // Φ1 slot-pattern lift of `Box<ParamOids>` from state variants to
 // Extras slot; post-DEF-220 notifications_arena slot).
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 512,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 520,
     "PgProtocol<ActivePhase> layout drift — must equal ActiveInner \
      (state ActiveState 48 B + read_buf 264 B + 4 cells × 8 B + \
      1 u32 + alignment; the 4th cell is DEF-220's notifications_arena \
