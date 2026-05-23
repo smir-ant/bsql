@@ -691,6 +691,12 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
     /// [`crate::dispatch::_param_description_dispatch_leaf::park_param_oids_at_dispatch`].
     pub(in crate::protocol) param_oids_slot:
         &'r mut crate::param_oids_slot::ParamOidsSlotCell,
+    /// DEF-286 Φ3: CommandTag slot threaded from
+    /// `<ActivePhase>::Extras.command_tag` via
+    /// `feed_bytes_dispatch_active`. Connecting variant uses the
+    /// transient `ActiveExtras.command_tag` slot.
+    pub(in crate::protocol) command_tag_slot:
+        &'r mut crate::command_tag_slot::CommandTagSlotCell,
     pub(in crate::protocol) session_params:
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
@@ -1135,6 +1141,14 @@ pub struct ActiveExtras {
     pub(in crate::protocol) row_desc: crate::schema_slot::RowDescSlotCell,
     pub(in crate::protocol) param_oids:
         crate::param_oids_slot::ParamOidsSlotCell,
+    /// DEF-286 Φ3 — slot for parked `CommandComplete` payload.
+    /// Per-cycle: `'C'` arrival parks the boxed
+    /// [`crate::command_tag::CommandTag`]; the trailing `'Z'`
+    /// materialise reads via `as_ref()` and emits
+    /// `Reply::QueryComplete.command_tag: &'r CommandTag`.
+    /// Cleared at Idle/Errored residue boundary.
+    pub(in crate::protocol) command_tag:
+        crate::command_tag_slot::CommandTagSlotCell,
 }
 
 /// Phase-typed wrapper over the per-phase Inner storage.
@@ -1338,6 +1352,12 @@ pub(crate) mod _clear_residue_leaf {
     /// mirrors [`ClearResidueSchemaToken`]'s shape exactly.
     pub(crate) struct ClearResidueParamOidsToken(());
 
+    /// Leaf-scope token for the command_tag slot clear at residue
+    /// transitions. DEF-286 Φ3 — mirror of
+    /// [`ClearResidueParamOidsToken`]. Type `pub(crate)` so
+    /// [`crate::command_tag_slot::CommandTagSlotCell`] can name it.
+    pub(crate) struct ClearResidueCommandTagToken(());
+
     /// Clear the schema slot via
     /// [`crate::schema_slot::RowDescSlotCell::clear_at_residue`] with
     /// the [`ClearResidueSchemaToken`] minted inline. Used by
@@ -1391,6 +1411,19 @@ pub(crate) mod _clear_residue_leaf {
         slot: &mut crate::param_oids_slot::ParamOidsSlotCell,
     ) {
         slot.clear_at_residue(ClearResidueParamOidsToken(()));
+    }
+
+    /// Clear the command_tag slot via
+    /// [`crate::command_tag_slot::CommandTagSlotCell::clear_at_residue`]
+    /// with the [`ClearResidueCommandTagToken`] minted inline.
+    /// DEF-286 Φ3 — mirror of [`clear_param_oids_slot_residue`].
+    /// Used by both Idle and Errored arms of
+    /// `clear_session_residue_for_class_dispatch`.
+    #[inline]
+    pub(in crate::protocol) fn clear_command_tag_slot_residue(
+        slot: &mut crate::command_tag_slot::CommandTagSlotCell,
+    ) {
+        slot.clear_at_residue(ClearResidueCommandTagToken(()));
     }
 }
 
@@ -1746,6 +1779,9 @@ pub(crate) mod _proto_init_leaf {
             param_oids: crate::param_oids_slot::ParamOidsSlotCell::empty(
                 ProtoInitToken::mint(),
             ),
+            command_tag: crate::command_tag_slot::CommandTagSlotCell::empty(
+                ProtoInitToken::mint(),
+            ),
         }
     }
 
@@ -1768,6 +1804,9 @@ pub(crate) mod _proto_init_leaf {
                 ProtoInitToken::mint(),
             ),
             param_oids: crate::param_oids_slot::ParamOidsSlotCell::empty(
+                ProtoInitToken::mint(),
+            ),
+            command_tag: crate::command_tag_slot::CommandTagSlotCell::empty(
                 ProtoInitToken::mint(),
             ),
         }
@@ -3892,6 +3931,7 @@ impl PgProtocol<ActivePhase> {
 pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
     row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
     param_oids_slot: &mut crate::param_oids_slot::ParamOidsSlotCell,
+    command_tag_slot: &mut crate::command_tag_slot::CommandTagSlotCell,
     session_params: &mut crate::session_params_slot::SessionParamsCell,
     error_arena: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
     notifications_arena: &mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
@@ -3909,6 +3949,10 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
             // boundary that follows the terminal RFQ — slot drops
             // its box, freeing the 68 B heap.
             _clear_residue_leaf::clear_param_oids_slot_residue(param_oids_slot);
+            // DEF-286 Φ3: clear command_tag slot at Idle boundaries.
+            // Cycle closes at Idle entry — drop boxed CommandTag,
+            // freeing the ~40 B heap.
+            _clear_residue_leaf::clear_command_tag_slot_residue(command_tag_slot);
             if let Some(arena) = error_arena.as_deref_mut() {
                 arena.clear();
             }
@@ -3931,6 +3975,8 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
             // any in-flight Describe is torn down with the
             // connection; the box's drop reclaims the heap.
             _clear_residue_leaf::clear_param_oids_slot_residue(param_oids_slot);
+            // DEF-286 Φ3: also clear CommandTag slot on Errored.
+            _clear_residue_leaf::clear_command_tag_slot_residue(command_tag_slot);
             if let Some(arena) = error_arena.as_deref_mut() {
                 arena.clear();
             }
@@ -4007,6 +4053,7 @@ where
         &'w [u8],
         Option<&'r crate::decode::RowDesc>,
         Option<&'r crate::action::ParamOids>,
+        Option<&'r crate::command_tag::CommandTag>,
     ) -> R,
 {
     let DispatchContext {
@@ -4014,6 +4061,7 @@ where
         read_buf,
         row_desc_slot: terminal_row_desc,
         param_oids_slot: terminal_param_oids,
+        command_tag_slot: terminal_command_tag,
         session_params: session_params_slot,
         error_arena: error_arena_slot,
         notifications_arena: notifications_arena_slot,
@@ -4033,6 +4081,7 @@ where
     clear_session_residue_for_class_dispatch(
         terminal_row_desc,
         terminal_param_oids,
+        terminal_command_tag,
         session_params_slot,
         error_arena_slot,
         notifications_arena_slot,
@@ -4116,9 +4165,11 @@ where
                 (*terminal_row_desc).as_ref();
             let terminal_param_oids_ref: Option<&crate::action::ParamOids> =
                 (*terminal_param_oids).as_ref();
+            let terminal_command_tag_ref: Option<&crate::command_tag::CommandTag> =
+                (*terminal_command_tag).as_ref();
             return write_buf.with_branded(|wb| -> R {
                 let staged: StagedActions = StagedActions::new();
-                materialise_fn(staged, wb.into_bytes(), terminal_ref, terminal_param_oids_ref)
+                materialise_fn(staged, wb.into_bytes(), terminal_ref, terminal_param_oids_ref, terminal_command_tag_ref)
             });
         }
         IngressClassification::AppendFailed { attempted, available } => {
@@ -4149,7 +4200,9 @@ where
                     (*terminal_row_desc).as_ref();
                 let terminal_param_oids_ref: Option<&crate::action::ParamOids> =
                     (*terminal_param_oids).as_ref();
-                materialise_fn(staged, wb.into_bytes(), terminal_ref, terminal_param_oids_ref)
+                let terminal_command_tag_ref: Option<&crate::command_tag::CommandTag> =
+                    (*terminal_command_tag).as_ref();
+                materialise_fn(staged, wb.into_bytes(), terminal_ref, terminal_param_oids_ref, terminal_command_tag_ref)
             });
         }
         IngressClassification::Ok => {
@@ -4209,6 +4262,7 @@ where
                 &mut reserved,
                 terminal_row_desc,
                 terminal_param_oids,
+                terminal_command_tag,
                 error_arena_slot,
                 copy_chunks_arena_slot,
             );
@@ -4432,6 +4486,7 @@ where
                         &mut reserved,
                         terminal_row_desc,
                         terminal_param_oids,
+                        terminal_command_tag,
                         error_arena_slot,
                         copy_chunks_arena_slot,
                     );
@@ -4563,7 +4618,9 @@ where
             (*terminal_row_desc).as_ref();
         let terminal_param_oids_ref: Option<&crate::action::ParamOids> =
             (*terminal_param_oids).as_ref();
-        materialise_fn(staged, wb.into_bytes(), terminal_ref, terminal_param_oids_ref)
+        let terminal_command_tag_ref: Option<&crate::command_tag::CommandTag> =
+            (*terminal_command_tag).as_ref();
+        materialise_fn(staged, wb.into_bytes(), terminal_ref, terminal_param_oids_ref, terminal_command_tag_ref)
     })
 }
 
@@ -4742,6 +4799,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
             read_buf,
             row_desc_slot: &mut transient_extras.row_desc,
             param_oids_slot: &mut transient_extras.param_oids,
+            command_tag_slot: &mut transient_extras.command_tag,
             session_params,
             error_arena,
             notifications_arena: &mut transient_notifications_arena,
@@ -4755,13 +4813,15 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
         |staged,
          write_bytes,
          _terminal_ref_unused: Option<&crate::decode::RowDesc>,
-         _terminal_param_oids_unused: Option<&crate::action::ParamOids>|
+         _terminal_param_oids_unused: Option<&crate::action::ParamOids>,
+         _terminal_command_tag_unused: Option<&crate::command_tag::CommandTag>|
          -> OutActions<'w, 'static> {
             materialise(
                 staged,
                 write_bytes,
                 None::<&'static crate::decode::RowDesc>,
                 None::<&'static crate::action::ParamOids>,
+                None::<&'static crate::command_tag::CommandTag>,
             )
         },
     );
@@ -4823,6 +4883,10 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
     /// uses a transient empty slot at the wrapper level.
     pub(in crate::protocol) param_oids_slot:
         &'r mut crate::param_oids_slot::ParamOidsSlotCell,
+    /// DEF-286 Φ3: command_tag_slot threaded from
+    /// `<ActivePhase>::Extras.command_tag`.
+    pub(in crate::protocol) command_tag_slot:
+        &'r mut crate::command_tag_slot::CommandTagSlotCell,
     pub(in crate::protocol) session_params:
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
@@ -4887,6 +4951,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         read_buf,
         row_desc_slot,
         param_oids_slot,
+        command_tag_slot,
         session_params,
         error_arena,
         notifications_arena,
@@ -4912,6 +4977,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
             read_buf,
             row_desc_slot,
             param_oids_slot,
+            command_tag_slot,
             session_params,
             error_arena,
             notifications_arena,
@@ -4925,9 +4991,10 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         |staged,
          write_bytes,
          terminal_ref: Option<&crate::decode::RowDesc>,
-         terminal_param_oids_ref: Option<&crate::action::ParamOids>|
+         terminal_param_oids_ref: Option<&crate::action::ParamOids>,
+         terminal_command_tag_ref: Option<&crate::command_tag::CommandTag>|
          -> OutActions<'w, 'r> {
-            materialise(staged, write_bytes, terminal_ref, terminal_param_oids_ref)
+            materialise(staged, write_bytes, terminal_ref, terminal_param_oids_ref, terminal_command_tag_ref)
         },
     );
 
@@ -5324,6 +5391,7 @@ impl ActiveInner {
                 read_buf: &mut self.read_buf,
                 row_desc_slot: &mut extras.row_desc,
                 param_oids_slot: &mut extras.param_oids,
+                command_tag_slot: &mut extras.command_tag,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 notifications_arena: &mut self.notifications_arena,
@@ -5404,6 +5472,7 @@ impl ActiveInner {
                 read_buf: &mut self.read_buf,
                 row_desc_slot: &mut extras.row_desc,
                 param_oids_slot: &mut extras.param_oids,
+                command_tag_slot: &mut extras.command_tag,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 notifications_arena: &mut self.notifications_arena,
@@ -5435,6 +5504,7 @@ impl ActiveInner {
         clear_session_residue_for_class_dispatch(
             &mut extras.row_desc,
             &mut extras.param_oids,
+            &mut extras.command_tag,
             &mut self.session_params,
             &mut self.error_arena,
             &mut self.notifications_arena,
@@ -8279,6 +8349,7 @@ fn materialise<'w, 'r>(
     write_bytes: &'w [u8],
     terminal_row_desc: Option<&'r crate::decode::RowDesc>,
     terminal_param_oids: Option<&'r crate::action::ParamOids>,
+    terminal_command_tag: Option<&'r crate::command_tag::CommandTag>,
 ) -> OutActions<'w, 'r> {
     // Capacity invariant: `staged.len() ≤ MAX_STAGED_PER_CALL`
     // (heapless::Vec cap); each staged entry fans out to ≤
@@ -8328,7 +8399,7 @@ fn materialise<'w, 'r>(
                 let entry_id = entry.id();
                 Action::DeliverReply {
                     id: entry_id,
-                    value: entry.staged().into_public(terminal_row_desc, terminal_param_oids),
+                    value: entry.staged().into_public(terminal_row_desc, terminal_param_oids, terminal_command_tag),
                 }
             }
             StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
@@ -8659,7 +8730,6 @@ mod allows_unsolicited_param_status_tests {
 
         let q_rfq = ProtoState::SimpleQueryAwaitingRfq {
             reply: ReplyId::from_raw(nz(8003)),
-            command_tag: crate::error::BoundedStr::default(),
         };
         assert!(allows_unsolicited_param_status(&q_rfq));
         consume_state(q_rfq);

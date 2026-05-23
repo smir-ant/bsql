@@ -178,7 +178,7 @@ fn bind_execute_dml_full_round_trip() {
             value: Reply::QueryComplete(p),
         }] => {
             assert_eq!(*delivered, reply_raw, "correlator round-trips");
-            assert_eq!(p.command_tag.as_str(), "INSERT 0 1");
+            assert_eq!(format!("{}", p.command_tag), "INSERT 0 1");
             assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::Idle);
             assert!(p.row_desc.is_none(), "DML: no schema delivered");
         }
@@ -221,7 +221,7 @@ fn bind_execute_select_with_schema_streams_rows() {
             value: Reply::QueryComplete(p),
             ..
         }] => {
-            assert_eq!(p.command_tag.as_str(), "SELECT 0");
+            assert_eq!(format!("{}", p.command_tag), "SELECT 0");
             assert!(p.row_desc.is_some(), "SELECT: schema delivered");
         }
         other => panic!("expected DeliverReply, got {other:?}"),

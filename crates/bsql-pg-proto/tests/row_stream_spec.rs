@@ -201,7 +201,7 @@ fn multi_row_select_end_to_end() {
                     let Ok(Reply::QueryComplete(p)) = outcome else {
                         panic!("expected Ok(QueryComplete), got {outcome:?}");
                     };
-                    assert_eq!(p.command_tag.as_str(), "SELECT 3");
+                    assert_eq!(format!("{}", p.command_tag), "SELECT 3");
                     saw_end_query = true;
                     break;
                 }

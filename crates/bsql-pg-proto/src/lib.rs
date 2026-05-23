@@ -284,6 +284,19 @@ pub(crate) mod schema_slot;
 // next Idle/Errored entry drops the box. On connections that never
 // run DescribeStatement, the 8 B niche slot stays None (zero heap).
 pub(crate) mod param_oids_slot;
+// DEF-286 Φ3: typed CommandTag enum + slot-pattern for parked
+// `CommandComplete` payload. Mirror of param_oids_slot (DEF-286 Φ1).
+// `command_tag` module: typed `{Insert/Update/Delete/Select/Fetch/
+// Move/Copy {rows: u64}, Other(BoundedStr<32>)}` + wire parser.
+// `command_tag_slot` module: CommandTagSlotCell — Option<Box<CommandTag>>
+// niche-packed slot. Slot lifecycle aligned with row_desc /
+// param_oids: parked at `'C'`, read at `'Z'` materialise, cleared
+// at Idle/Errored residue. ProtoState SimpleQueryAwaitingRfq /
+// BindExecuteAwaitingRfq{Dml,Select} variants drop the inline
+// `command_tag: BoundedStr<32>` field (saves ~36 B/variant);
+// ProtoState dominator shifts from 48 B → ~24 B (-50%).
+pub mod command_tag;
+pub(crate) mod command_tag_slot;
 // Tier-1 state-transition ↔ command-kind pairing. Crate-internal
 // module; no public re-exports. Per-command witness types live in
 // `push_command` alongside the impls; this module owns the
@@ -614,23 +627,23 @@ const _: () = assert!(
 );
 const _: () = assert!(
     core::mem::size_of::<action::Action<'static, 'static>>() == 80,
-    "Action<'_, '_> exact size — 80 B post-DEF-286 Φ1 (was 88 B \
-     pre-Φ1). Dominator is FailReply: NonZeroU64 8 B + \
-     ProtocolError 72 B + discriminant niche-packed via the \
-     NonZeroU64 = 80 B. Reply variant (now 48 B post-Φ1) is no \
-     longer the cap; FailReply dominates. \
+    "Action<'_, '_> exact size — 80 B post-DEF-286 Φ3 (CommandTag \
+     slot + typed enum). Dominator: FailReply with NonZeroU64 8 + \
+     ProtocolError 72 + discriminant niche-packed in NonZeroU64 = \
+     80 B. Reply variant (32 B post-Φ3) no longer the cap. \
+     IntermediateCommandComplete carries CommandTag (40 B) — also \
+     not the cap. \
      \
-     DEF-286 Φ2 (ProtocolError boxing) would shrink FailReply to \
-     16 B (NonZeroU64 + 8-B Box<ProtocolError>) and let Action \
-     shrink further. \
+     DEF-286 Φ2'' Arena pattern (DEFERRED): ProtocolError refs \
+     would shrink FailReply to 16 B → Action ~40 B → OutActions \
+     ~368 B cascade. \
      \
      **NICHE OPTIMIZATION IS LOAD-BEARING** (DEF-260 MEASURED-REJECTED \
-     2026-05-21): a future `#[repr(u8)]` attempt would disable niche \
-     packing on `id: NonZeroU64`. Default Rust repr is provably \
-     better here — keep it.",
+     2026-05-21): `#[repr(u8)]` would disable niche packing on \
+     `id: NonZeroU64`. Default Rust repr is provably better — keep it.",
 );
 const _: () = assert!(
-    core::mem::size_of::<action::Reply<'static>>() == 48,
+    core::mem::size_of::<action::Reply<'static>>() == 32,
     "Reply<'r> exact pin — 48 B post-DEF-286 Φ1 (was 80 B \
      pre-Φ1). DescribeStatementComplete's `param_oids: &'r ParamOids` \
      borrow drops the variant from ~76 B inline → 16 B. New \
@@ -758,12 +771,13 @@ const _: () = assert!(
 // on a quiet system (`load avg < 8`). On regression, investigate
 // (asm-diff, alternative shapes), do NOT roll back tier elevations.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() == 528,
+    core::mem::size_of::<protocol::PgProtocol>() == 504,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
-     Budget: ActiveInner ~380 B (ActiveState 48 + read_buf 264 + \
-     4 cells × 8 + 1 u32 + alignment) + ActiveExtras ~148 (RowDescSlotCell \
-     140 + ParamOidsSlotCell 8) + ZST phase_marker = 528 B. \
+     Budget: ActiveInner ~348 B (ActiveState 16 + read_buf 264 + \
+     4 cells × 8 + 1 u32 + alignment) + ActiveExtras ~156 \
+     (RowDescSlotCell 140 + ParamOidsSlotCell 8 + CommandTagSlotCell 8) \
+     + ZST phase_marker = 504 B. \
      \
      DEF-286 Φ1 grew the pin 520 → 528 B by adding the \
      ParamOidsSlotCell to ActiveExtras (8 B niche-packed \
@@ -853,7 +867,7 @@ const _: () = assert!(
 // Φ1 slot-pattern lift of `Box<ParamOids>` from state variants to
 // Extras slot; post-DEF-220 notifications_arena slot).
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 528,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 504,
     "PgProtocol<ActivePhase> layout drift — must equal ActiveInner \
      (state ActiveState 48 B + read_buf 264 B + 4 cells × 8 B + \
      1 u32 + alignment; the 4th cell is DEF-220's notifications_arena \
@@ -906,13 +920,9 @@ const _: () = assert!(
 
 const _: () = assert!(
     core::mem::size_of::<action::OutActions<'static, 'static>>() == 728,
-    "OutActions<'_, '_> exact size — 728 B post-DEF-286 Φ1 (was \
-     800 B pre-Φ1, −72 B / −9 %). \
-     = 9 (MAX_ACTIONS_PER_CALL) × 80 (Action post-Φ1) + 8 (usize len). \
-     \
-     Φ2 (ProtocolError boxing) cascade target: ~152-224 B after \
-     Action shrinks to ~16 B (FailReply 16). Exact pin catches \
-     ANY layout drift.",
+    "OutActions<'_, '_> exact size — 728 B post-DEF-286 Φ3 \
+     = 9 (MAX_ACTIONS_PER_CALL) × 80 (Action) + 8 (usize len). \
+     Unchanged from Phase A (Action stays 80 B until Φ2'' Arena).",
 );
 
 // ---------------------------------------------------------------------
@@ -964,19 +974,15 @@ const _: () = assert!(
 // trip this.
 const _: () = assert!(
     core::mem::size_of::<action::FeedEvent<'static, 'static>>() == 80,
-    "FeedEvent<'wb, 'r> exact size — 80 B post-DEF-286 Φ1 (was \
-     88 B pre-Φ1). Max variant = Fail: NonZeroU64 8 B + \
-     ProtocolError 72 B + discriminant niche-packed via the \
-     NonZeroU64. Post-Φ1 Reply variant on Deliver shrunk to 48 B \
-     but Fail with ProtocolError still dominates the enum. \
-     Φ2 cascade target: ~16-24 B after ProtocolError boxing.",
+    "FeedEvent<'wb, 'r> exact size — 80 B post-DEF-286 Φ3. Max \
+     variant: Fail with NonZeroU64 8 + ProtocolError 72 + disc \
+     niche-packed in NonZeroU64 = 80 B. Reply variant on Deliver \
+     shrunk to 32 B post-Φ3.",
 );
 const _: () = assert!(
     core::mem::size_of::<Option<action::FeedEvent<'static, 'static>>>() == 80,
     "Option<FeedEvent> niche-pack — must stay 80 B via the NonZeroU64 \
-     niche on Deliver.id / Fail.id. If this regresses, the niche was \
-     lost — verify variant layout still routes the discriminant through \
-     a NonZero* slot.",
+     niche on Deliver.id / Fail.id.",
 );
 
 // `PreparedQuery<P, R>` is a struct of 6 × `&'static`-fat-pointers

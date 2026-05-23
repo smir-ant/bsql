@@ -855,9 +855,13 @@ pub enum Action<'w, 'r> {
     /// `DeliverReply { Reply::QueryComplete }` carrying the LAST
     /// statement's tag + transaction status.
     IntermediateCommandComplete {
-        /// Command tag from the just-completed statement (e.g.,
-        /// `"BEGIN"`, `"UPDATE 3"`, `"COMMIT"`).
-        tag: crate::error::BoundedStr<32>,
+        /// Command tag from the just-completed statement.
+        /// DEF-286 Φ3: typed [`crate::command_tag::CommandTag`]
+        /// (was `BoundedStr<32>` pre-Φ3) — consumer can match on
+        /// `CommandTag::{Insert, Update, Select, ...} { rows }` for
+        /// known commands or fall to `Other(BoundedStr<32>)` for
+        /// freeform.
+        tag: crate::command_tag::CommandTag,
     },
 
     /// COPY OUT data chunk (DEF-219 Phase 3, PG §55.2.6). Emitted
@@ -1275,8 +1279,9 @@ pub(crate) enum StagedAction<'sql> {
     /// transitions.
     IntermediateCommandComplete {
         /// Command tag from the just-completed statement in a
-        /// multi-statement batch.
-        tag: crate::error::BoundedStr<32>,
+        /// multi-statement batch. DEF-286 Φ3: typed
+        /// [`crate::command_tag::CommandTag`] (was `BoundedStr<32>`).
+        tag: crate::command_tag::CommandTag,
     },
 
     /// Map to [`Action::CopyDataChunk`] — DEF-219 Phase 3 COPY OUT
@@ -1374,8 +1379,12 @@ pub enum StagedReply {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagedQueryCompletePayload {
     /// Portal exhausted — terminal `CommandComplete + RFQ` observed.
+    ///
+    /// DEF-286 Φ3: `command_tag` field removed — slot pattern via
+    /// [`crate::command_tag_slot::CommandTagSlotCell`]. Materialise
+    /// reads the slot at the `'Z'` arm and produces
+    /// `Reply::QueryComplete.command_tag: &'r CommandTag`.
     Completed {
-        command_tag: crate::ident::BoundedStr<32>,
         tx_status: TxStatus,
     },
     /// Row cap hit — terminal `PortalSuspended + RFQ` observed. No
@@ -1497,6 +1506,7 @@ impl StagedReply {
         self,
         row_desc_slot: Option<&'r crate::decode::RowDesc>,
         param_oids_slot: Option<&'r ParamOids>,
+        command_tag_slot: Option<&'r crate::command_tag::CommandTag>,
     ) -> Reply<'r> {
         match self {
             Self::Pong(p) => Reply::Pong(p),
@@ -1517,10 +1527,16 @@ impl StagedReply {
                 let row_desc = row_desc_slot.map(crate::decode::RowDescBorrow::from_ref);
                 match staged {
                     StagedQueryCompletePayload::Completed {
-                        command_tag,
                         tx_status,
                     } => Reply::QueryComplete(QueryCompletePayload {
-                        command_tag,
+                        // DEF-286 Φ3: command_tag borrowed from slot.
+                        // Defensive: slot empty would be a slot-cycle
+                        // violation (architecturally unreachable from
+                        // a Z arm in AwaitingRfq); map to static EMPTY
+                        // sentinel — tier-3 classifier, no panic.
+                        command_tag: command_tag_slot.unwrap_or(
+                            &crate::command_tag::CommandTag::EMPTY,
+                        ),
                         tx_status,
                         row_desc,
                     }),
@@ -1906,8 +1922,19 @@ impl<'r> From<StartupCompletePayload> for Reply<'r> {
 /// the caller drops the actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryCompletePayload<'r> {
-    /// Raw ASCII tag from `CommandComplete` body.
-    pub command_tag: crate::ident::BoundedStr<32>,
+    /// Typed command tag from `CommandComplete` body.
+    ///
+    /// DEF-286 Φ3: borrowed from
+    /// `<ActivePhase>::Extras.command_tag` slot (parked at the
+    /// `'C'` dispatch arm; cleared at next Idle/Errored residue).
+    /// `&'r` ties the borrow to the `feed_bytes` reply window —
+    /// consumer reads (or copies, `CommandTag: Copy`) before
+    /// pushing the next command.
+    ///
+    /// Pre-Φ3 was `BoundedStr<32>` (raw ASCII inline 36 B); now is
+    /// `&'r CommandTag` (8 B borrow into the typed enum). Consumers
+    /// can match on `CommandTag::Insert { rows }` etc. directly.
+    pub command_tag: &'r crate::command_tag::CommandTag,
     /// Transaction-status indicator from the trailing `ReadyForQuery`.
     pub tx_status: TxStatus,
     /// Result-set schema, if any. `Some` for SELECT (including

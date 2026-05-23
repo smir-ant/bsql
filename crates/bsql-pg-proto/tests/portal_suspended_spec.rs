@@ -365,7 +365,7 @@ fn iter_rows_chunked_suspended_then_resume_to_completion() {
                     match outcome {
                         Ok(Reply::QueryComplete(p)) => {
                             assert_eq!(
-                                p.command_tag.as_str(),
+                                format!("{}", p.command_tag),
                                 "SELECT 3",
                                 "command_tag carried from CommandComplete frame"
                             );

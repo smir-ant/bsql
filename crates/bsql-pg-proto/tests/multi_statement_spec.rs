@@ -82,7 +82,7 @@ fn batch_two_dml_statements_surfaces_intermediate() {
 
     match &slice[0] {
         Action::IntermediateCommandComplete { tag } => {
-            assert_eq!(tag.as_str(), "BEGIN");
+            assert_eq!(format!("{}", tag), "BEGIN");
         }
         other => panic!("slot 0: expected IntermediateCommandComplete, got {other:?}"),
     }
@@ -92,7 +92,7 @@ fn batch_two_dml_statements_surfaces_intermediate() {
             value: Reply::QueryComplete(p),
             ..
         } => {
-            assert_eq!(p.command_tag.as_str(), "COMMIT");
+            assert_eq!(format!("{}", p.command_tag), "COMMIT");
         }
         other => panic!("slot 1: expected DeliverReply(QueryComplete), got {other:?}"),
     }
@@ -133,12 +133,12 @@ fn batch_three_statements_surfaces_two_intermediates() {
     let Action::IntermediateCommandComplete { tag } = &slice[0] else {
         panic!("slot 0: expected Intermediate, got {:?}", slice[0]);
     };
-    assert_eq!(tag.as_str(), "BEGIN");
+    assert_eq!(format!("{}", tag), "BEGIN");
 
     let Action::IntermediateCommandComplete { tag } = &slice[1] else {
         panic!("slot 1: expected Intermediate, got {:?}", slice[1]);
     };
-    assert_eq!(tag.as_str(), "UPDATE 1");
+    assert_eq!(format!("{}", tag), "UPDATE 1");
 
     let Action::DeliverReply {
         value: Reply::QueryComplete(p),
@@ -147,7 +147,7 @@ fn batch_three_statements_surfaces_two_intermediates() {
     else {
         panic!("slot 2: expected DeliverReply, got {:?}", slice[2]);
     };
-    assert_eq!(p.command_tag.as_str(), "COMMIT");
+    assert_eq!(format!("{}", p.command_tag), "COMMIT");
 }
 
 #[test]
@@ -188,12 +188,12 @@ fn batch_with_empty_query_response_in_middle() {
     let Action::IntermediateCommandComplete { tag } = &slice[0] else {
         panic!("slot 0: expected Intermediate, got {:?}", slice[0]);
     };
-    assert_eq!(tag.as_str(), "BEGIN");
+    assert_eq!(format!("{}", tag), "BEGIN");
 
     let Action::IntermediateCommandComplete { tag } = &slice[1] else {
         panic!("slot 1: expected Intermediate (empty), got {:?}", slice[1]);
     };
-    assert_eq!(tag.as_str(), "", "empty query response yields empty tag");
+    assert_eq!(format!("{}", tag), "", "empty query response yields empty tag");
 
     let Action::DeliverReply {
         value: Reply::QueryComplete(p),
@@ -202,7 +202,7 @@ fn batch_with_empty_query_response_in_middle() {
     else {
         panic!("slot 2: expected DeliverReply, got {:?}", slice[2]);
     };
-    assert_eq!(p.command_tag.as_str(), "COMMIT");
+    assert_eq!(format!("{}", p.command_tag), "COMMIT");
 }
 
 #[test]
@@ -244,5 +244,5 @@ fn single_statement_batch_no_intermediates() {
     else {
         panic!("slot 0: expected DeliverReply, got {:?}", slice[0]);
     };
-    assert_eq!(p.command_tag.as_str(), "SELECT 1");
+    assert_eq!(format!("{}", p.command_tag), "SELECT 1");
 }

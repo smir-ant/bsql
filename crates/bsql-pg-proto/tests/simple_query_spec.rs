@@ -199,7 +199,7 @@ fn select_zero_rows_end_to_end() {
             assert_eq!(*delivered_id, q_raw, "correlator round-trips");
             match value {
                 Reply::QueryComplete(p) => {
-                    assert_eq!(p.command_tag.as_str(), "SELECT 0");
+                    assert_eq!(format!("{}", p.command_tag), "SELECT 0");
                     assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::Idle);
                     // 1c-2a: 0-row SELECT delivers schema via Reply
                     // (no StreamRow to carry it).
@@ -247,7 +247,7 @@ fn dml_no_rows_end_to_end() {
             value: Reply::QueryComplete(p),
         }] => {
             assert_eq!(*delivered_id, q_raw);
-            assert_eq!(p.command_tag.as_str(), "INSERT 0 3");
+            assert_eq!(format!("{}", p.command_tag), "INSERT 0 3");
             assert_eq!(p.tx_status, bsql_pg_proto::TxStatus::InTransaction);
             // 1c-2a: DML never received a 'T' frame — row_desc is None.
             // Critical invariant: push_command clears prior SELECT's
@@ -282,7 +282,7 @@ fn empty_query_yields_empty_tag() {
     match out.as_slice() {
         [Action::DeliverReply { value: Reply::QueryComplete(p), .. }] => {
             assert_eq!(
-                p.command_tag.as_str(),
+                format!("{}", p.command_tag),
                 "",
                 "EmptyQueryResponse surfaces as empty command tag",
             );

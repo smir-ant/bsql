@@ -23,7 +23,10 @@
 // `<ActivePhase>::Extras.param_oids`. Production state.rs no
 // longer references `ParamOids`; tests use the fully-qualified
 // `crate::action::ParamOids` path where needed.
-use crate::error::BoundedStr;
+// DEF-286 Φ3: `BoundedStr` no longer needed — production variants
+// don't carry the inline `command_tag` field (slot pattern via
+// `crate::command_tag_slot::CommandTagSlotCell`). Test cfg blocks
+// that need it use the fully-qualified path.
 use crate::error::StateErrorKind;
 use crate::reply_id::{
     CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind, ReplyId,
@@ -502,12 +505,16 @@ pub enum ProtoState {
     /// itself", which is identity, not discipline.
     SimpleQueryAwaitingRfq {
         /// Correlator for the in-flight query.
+        ///
+        /// DEF-286 Φ3: `command_tag` field removed — slot pattern
+        /// via [`crate::command_tag_slot::CommandTagSlotCell`] on
+        /// `<ActivePhase>::Extras.command_tag`. The `'C'` dispatch
+        /// arm parses the tag and parks the boxed
+        /// [`crate::command_tag::CommandTag`] into the slot;
+        /// materialise reads via `as_ref()` at the trailing `'Z'`.
+        /// Multi-statement (DEF-226): each subsequent `'C'`
+        /// overwrites the slot (latest-wins).
         reply: ReplyId<QueryKind>,
-        /// Command tag — `"SELECT 5"`, `"INSERT 0 3"`, or empty
-        /// for empty-query responses. Capacity 32 bytes handles
-        /// PG's documented tag shapes (the longest standard tag,
-        /// `"INSERT <oid> <n>"` with 10-digit values, is ~23 bytes).
-        command_tag: BoundedStr<32>,
     },
 
     /// `ErrorResponse` received mid-query; `FailReply` already
@@ -589,9 +596,10 @@ pub enum ProtoState {
     /// `row_desc: None`.
     BindExecuteAwaitingRfqDml {
         /// Correlator for the in-flight command.
+        ///
+        /// DEF-286 Φ3: `command_tag` field removed — slot pattern
+        /// via [`crate::command_tag_slot::CommandTagSlotCell`].
         reply: ReplyId<QueryKind>,
-        /// Command tag parsed from the `C` frame body.
-        command_tag: BoundedStr<32>,
     },
 
     // ─── Schema-bearing path (SELECT with pre-provided schema) ───
@@ -629,9 +637,10 @@ pub enum ProtoState {
     /// carries `row_desc: Some(...)` resolved from the slot.
     BindExecuteAwaitingRfqSelect {
         /// Correlator for the in-flight command.
+        ///
+        /// DEF-286 Φ3: `command_tag` field removed — slot pattern
+        /// via [`crate::command_tag_slot::CommandTagSlotCell`].
         reply: ReplyId<QueryKind>,
-        /// Command tag parsed from the `C` frame body.
-        command_tag: BoundedStr<32>,
     },
 
     /// `PortalSuspended` (`'s'`) received — `FetchRows::Chunked(N)`
@@ -1364,10 +1373,10 @@ pub enum ActiveState {
     SimpleQueryStreamingRows {
         reply: ReplyId<QueryKind>,
     },
-    /// Mirror of [`ProtoState::SimpleQueryAwaitingRfq`].
+    /// Mirror of [`ProtoState::SimpleQueryAwaitingRfq`]. DEF-286 Φ3:
+    /// `command_tag` lives in slot.
     SimpleQueryAwaitingRfq {
         reply: ReplyId<QueryKind>,
-        command_tag: BoundedStr<32>,
     },
     /// Mirror of [`ProtoState::SimpleQueryCopyOutStreaming`] (DEF-219).
     SimpleQueryCopyOutStreaming(ReplyId<QueryKind>),
@@ -1385,10 +1394,9 @@ pub enum ActiveState {
     BindExecuteAwaitingBindCompleteDml(ReplyId<QueryKind>),
     /// Mirror of [`ProtoState::BindExecuteAwaitingCommandCompleteDml`].
     BindExecuteAwaitingCommandCompleteDml(ReplyId<QueryKind>),
-    /// Mirror of [`ProtoState::BindExecuteAwaitingRfqDml`].
+    /// Mirror of [`ProtoState::BindExecuteAwaitingRfqDml`]. DEF-286 Φ3.
     BindExecuteAwaitingRfqDml {
         reply: ReplyId<QueryKind>,
-        command_tag: BoundedStr<32>,
     },
     /// Mirror of [`ProtoState::BindExecuteAwaitingBindCompleteSelect`].
     BindExecuteAwaitingBindCompleteSelect {
@@ -1409,7 +1417,6 @@ pub enum ActiveState {
     /// Mirror of [`ProtoState::BindExecuteAwaitingRfqSelect`].
     BindExecuteAwaitingRfqSelect {
         reply: ReplyId<QueryKind>,
-        command_tag: BoundedStr<32>,
     },
     /// Mirror of [`ProtoState::DescribeStatementAwaitingParamDesc`].
     DescribeStatementAwaitingParamDesc(ReplyId<DescribeStatementKind>),
@@ -1552,8 +1559,8 @@ impl From<ActiveState> for ProtoState {
             ActiveState::SimpleQueryCopyInActive(r) => {
                 ProtoState::SimpleQueryCopyInActive(r)
             }
-            ActiveState::SimpleQueryAwaitingRfq { reply, command_tag } => {
-                ProtoState::SimpleQueryAwaitingRfq { reply, command_tag }
+            ActiveState::SimpleQueryAwaitingRfq { reply } => {
+                ProtoState::SimpleQueryAwaitingRfq { reply }
             }
             ActiveState::DrainRfqAfterError => ProtoState::DrainRfqAfterError,
             ActiveState::ParseAwaitingParseComplete(r) => {
@@ -1566,8 +1573,8 @@ impl From<ActiveState> for ProtoState {
             ActiveState::BindExecuteAwaitingCommandCompleteDml(r) => {
                 ProtoState::BindExecuteAwaitingCommandCompleteDml(r)
             }
-            ActiveState::BindExecuteAwaitingRfqDml { reply, command_tag } => {
-                ProtoState::BindExecuteAwaitingRfqDml { reply, command_tag }
+            ActiveState::BindExecuteAwaitingRfqDml { reply } => {
+                ProtoState::BindExecuteAwaitingRfqDml { reply }
             }
             ActiveState::BindExecuteAwaitingBindCompleteSelect { reply } => {
                 ProtoState::BindExecuteAwaitingBindCompleteSelect { reply }
@@ -1578,8 +1585,8 @@ impl From<ActiveState> for ProtoState {
             ActiveState::BindExecuteStreamingRows { reply } => {
                 ProtoState::BindExecuteStreamingRows { reply }
             }
-            ActiveState::BindExecuteAwaitingRfqSelect { reply, command_tag } => {
-                ProtoState::BindExecuteAwaitingRfqSelect { reply, command_tag }
+            ActiveState::BindExecuteAwaitingRfqSelect { reply } => {
+                ProtoState::BindExecuteAwaitingRfqSelect { reply }
             }
             ActiveState::BindExecuteAwaitingRfqAfterSuspended { reply } => {
                 ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply }
@@ -1779,11 +1786,10 @@ impl core::fmt::Debug for ActiveState {
                 .debug_struct("SimpleQueryStreamingRows")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
-            Self::SimpleQueryAwaitingRfq { reply, command_tag } => f
+            Self::SimpleQueryAwaitingRfq { reply } => f
                 .debug_struct("SimpleQueryAwaitingRfq")
                 .field("reply", reply)
-                .field("command_tag", command_tag)
-                .finish(),
+                .finish_non_exhaustive(),
             Self::SimpleQueryCopyOutStreaming(id) => {
                 write!(f, "SimpleQueryCopyOutStreaming({id:?})")
             }
@@ -1804,11 +1810,10 @@ impl core::fmt::Debug for ActiveState {
             Self::BindExecuteAwaitingCommandCompleteDml(id) => {
                 write!(f, "BindExecuteAwaitingCommandCompleteDml({id:?})")
             }
-            Self::BindExecuteAwaitingRfqDml { reply, command_tag } => f
+            Self::BindExecuteAwaitingRfqDml { reply } => f
                 .debug_struct("BindExecuteAwaitingRfqDml")
                 .field("reply", reply)
-                .field("command_tag", command_tag)
-                .finish(),
+                .finish_non_exhaustive(),
             Self::BindExecuteAwaitingBindCompleteSelect { reply } => f
                 .debug_struct("BindExecuteAwaitingBindCompleteSelect")
                 .field("reply", reply)
@@ -1821,10 +1826,9 @@ impl core::fmt::Debug for ActiveState {
                 .debug_struct("BindExecuteStreamingRows")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
-            Self::BindExecuteAwaitingRfqSelect { reply, command_tag } => f
+            Self::BindExecuteAwaitingRfqSelect { reply } => f
                 .debug_struct("BindExecuteAwaitingRfqSelect")
                 .field("reply", reply)
-                .field("command_tag", command_tag)
                 .finish_non_exhaustive(),
             Self::BindExecuteAwaitingRfqAfterSuspended { reply } => f
                 .debug_struct("BindExecuteAwaitingRfqAfterSuspended")
@@ -1948,8 +1952,8 @@ impl TryFrom<ProtoState> for ActiveState {
             ProtoState::SimpleQueryStreamingRows { reply } => {
                 Ok(ActiveState::SimpleQueryStreamingRows { reply })
             }
-            ProtoState::SimpleQueryAwaitingRfq { reply, command_tag } => {
-                Ok(ActiveState::SimpleQueryAwaitingRfq { reply, command_tag })
+            ProtoState::SimpleQueryAwaitingRfq { reply } => {
+                Ok(ActiveState::SimpleQueryAwaitingRfq { reply })
             }
             ProtoState::SimpleQueryCopyOutStreaming(r) => {
                 Ok(ActiveState::SimpleQueryCopyOutStreaming(r))
@@ -1971,8 +1975,8 @@ impl TryFrom<ProtoState> for ActiveState {
             ProtoState::BindExecuteAwaitingCommandCompleteDml(r) => {
                 Ok(ActiveState::BindExecuteAwaitingCommandCompleteDml(r))
             }
-            ProtoState::BindExecuteAwaitingRfqDml { reply, command_tag } => {
-                Ok(ActiveState::BindExecuteAwaitingRfqDml { reply, command_tag })
+            ProtoState::BindExecuteAwaitingRfqDml { reply } => {
+                Ok(ActiveState::BindExecuteAwaitingRfqDml { reply })
             }
             ProtoState::BindExecuteAwaitingBindCompleteSelect { reply } => {
                 Ok(ActiveState::BindExecuteAwaitingBindCompleteSelect { reply })
@@ -1983,8 +1987,8 @@ impl TryFrom<ProtoState> for ActiveState {
             ProtoState::BindExecuteStreamingRows { reply } => {
                 Ok(ActiveState::BindExecuteStreamingRows { reply })
             }
-            ProtoState::BindExecuteAwaitingRfqSelect { reply, command_tag } => {
-                Ok(ActiveState::BindExecuteAwaitingRfqSelect { reply, command_tag })
+            ProtoState::BindExecuteAwaitingRfqSelect { reply } => {
+                Ok(ActiveState::BindExecuteAwaitingRfqSelect { reply })
             }
             ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply } => {
                 Ok(ActiveState::BindExecuteAwaitingRfqAfterSuspended { reply })
@@ -2025,14 +2029,16 @@ const _: () = assert!(
     "ConnectingState dominant variant: ScramAwaitingServerFinal (32 B SecretDigest + 8 B ReplyId + 8 B alignment)",
 );
 const _: () = assert!(
-    core::mem::size_of::<ActiveState>() == 48,
-    "ActiveState dominant variants (post-DEF-282 ParamOids boxing): \
-     `SimpleQueryAwaitingRfq` / `BindExecuteAwaitingRfqDml` / \
-     `BindExecuteAwaitingRfqSelect` — 8 B `ReplyId<QueryKind>` + \
-     ~36 B `BoundedStr<32>` (2 B len + 32 B buf + tail-pad) + \
-     discriminant + alignment → 48 B. DescribeStatement* variants \
-     now carry `Box<ParamOids>` (~24 B) per the same precedent as \
-     SCRAM/MD5/Cleartext heap-boxing.",
+    core::mem::size_of::<ActiveState>() == 16,
+    "ActiveState exact size — 16 B post-DEF-286 Φ3 (was 48 B \
+     pre-Φ3 — **3× shrink**). The three AwaitingRfq variants \
+     (SimpleQueryAwaitingRfq / BindExecuteAwaitingRfqDml / \
+     BindExecuteAwaitingRfqSelect) dropped the inline \
+     `command_tag: BoundedStr<32>` field (36 B savings each) — \
+     slot pattern via `crate::command_tag_slot::CommandTagSlotCell` \
+     on `<ActivePhase>::Extras`. ActiveState dominator now any \
+     variant carrying just `ReplyId<K>` (8 B NonZeroU64) + disc + \
+     align to 8 = 16 B total.",
 );
 
 /// Classifier output for [`ProtoState::unsolicited_admit`]. Single
@@ -2229,11 +2235,10 @@ impl core::fmt::Debug for ProtoState {
                 .debug_struct("SimpleQueryStreamingRows")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
-            Self::SimpleQueryAwaitingRfq { reply, command_tag } => f
+            Self::SimpleQueryAwaitingRfq { reply } => f
                 .debug_struct("SimpleQueryAwaitingRfq")
                 .field("reply", reply)
-                .field("command_tag", command_tag)
-                .finish(),
+                .finish_non_exhaustive(),
             Self::SimpleQueryCopyOutStreaming(id) => {
                 write!(f, "SimpleQueryCopyOutStreaming({id:?})")
             }
@@ -2249,11 +2254,10 @@ impl core::fmt::Debug for ProtoState {
             Self::BindExecuteAwaitingCommandCompleteDml(id) => {
                 write!(f, "BindExecuteAwaitingCommandCompleteDml({id:?})")
             }
-            Self::BindExecuteAwaitingRfqDml { reply, command_tag } => f
+            Self::BindExecuteAwaitingRfqDml { reply } => f
                 .debug_struct("BindExecuteAwaitingRfqDml")
                 .field("reply", reply)
-                .field("command_tag", command_tag)
-                .finish(),
+                .finish_non_exhaustive(),
             Self::BindExecuteAwaitingBindCompleteSelect { reply, .. } => f
                 .debug_struct("BindExecuteAwaitingBindCompleteSelect")
                 .field("reply", reply)
@@ -2266,10 +2270,9 @@ impl core::fmt::Debug for ProtoState {
                 .debug_struct("BindExecuteStreamingRows")
                 .field("reply", reply)
                 .finish_non_exhaustive(),
-            Self::BindExecuteAwaitingRfqSelect { reply, command_tag, .. } => f
+            Self::BindExecuteAwaitingRfqSelect { reply, .. } => f
                 .debug_struct("BindExecuteAwaitingRfqSelect")
                 .field("reply", reply)
-                .field("command_tag", command_tag)
                 .finish_non_exhaustive(),
             Self::BindExecuteAwaitingRfqAfterSuspended { reply } => f
                 .debug_struct("BindExecuteAwaitingRfqAfterSuspended")
@@ -2350,7 +2353,7 @@ mod push_class_tests {
     //! classified" AND "every variant has the CORRECT classification."
 
     use super::*;
-    use crate::error::{BoundedStr, ErrorKind};
+    use crate::error::ErrorKind;
     use crate::password::Password;
     use crate::reply_id::ReplyId;
     use crate::scram::session::ScramSession;
@@ -2459,7 +2462,6 @@ mod push_class_tests {
         pin(
             ProtoState::SimpleQueryAwaitingRfq {
                 reply: ReplyId::from_raw(nz(3_003)),
-                command_tag: BoundedStr::default(),
             },
             StatePushClass::BusyQuery,
         );
@@ -2487,7 +2489,6 @@ mod push_class_tests {
         pin(
             ProtoState::BindExecuteAwaitingRfqDml {
                 reply: ReplyId::from_raw(nz(5_003)),
-                command_tag: BoundedStr::default(),
             },
             StatePushClass::BusyQuery,
         );
@@ -2512,7 +2513,6 @@ mod push_class_tests {
         pin(
             ProtoState::BindExecuteAwaitingRfqSelect {
                 reply: ReplyId::from_raw(nz(5_007)),
-                command_tag: BoundedStr::default(),
             },
             StatePushClass::BusyQuery,
         );
@@ -2594,7 +2594,7 @@ mod per_phase_state_roundtrip_tests {
     //! safe.
 
     use super::*;
-    use crate::error::{BoundedStr, ErrorKind};
+    use crate::error::ErrorKind;
     use crate::password::Password;
     use crate::reply_id::ReplyId;
     use crate::scram::session::ScramSession;
@@ -2759,7 +2759,6 @@ mod per_phase_state_roundtrip_tests {
         });
         roundtrip_active(ProtoState::SimpleQueryAwaitingRfq {
             reply: ReplyId::from_raw(nz(3_003)),
-            command_tag: BoundedStr::default(),
         });
         roundtrip_active(ProtoState::DrainRfqAfterError);
 
@@ -2778,7 +2777,6 @@ mod per_phase_state_roundtrip_tests {
         ));
         roundtrip_active(ProtoState::BindExecuteAwaitingRfqDml {
             reply: ReplyId::from_raw(nz(5_003)),
-            command_tag: BoundedStr::default(),
         });
 
         // BindExecute SELECT.
@@ -2793,7 +2791,6 @@ mod per_phase_state_roundtrip_tests {
         });
         roundtrip_active(ProtoState::BindExecuteAwaitingRfqSelect {
             reply: ReplyId::from_raw(nz(5_007)),
-            command_tag: BoundedStr::default(),
         });
 
         // DescribeStatement flow.

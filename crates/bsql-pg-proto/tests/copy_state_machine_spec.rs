@@ -130,7 +130,7 @@ fn copy_out_full_cycle_state_transitions() {
     else {
         panic!("expected final DeliverReply(QueryComplete); got {:?}", last);
     };
-    assert_eq!(p.command_tag.as_str(), "COPY 2");
+    assert_eq!(format!("{}", p.command_tag), "COPY 2");
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
@@ -174,7 +174,7 @@ fn copy_in_full_cycle_state_transitions() {
     else {
         panic!("expected final DeliverReply(QueryComplete); got {:?}", last);
     };
-    assert_eq!(p.command_tag.as_str(), "COPY 5");
+    assert_eq!(format!("{}", p.command_tag), "COPY 5");
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
@@ -295,7 +295,7 @@ fn copy_in_full_push_cycle() {
     else {
         panic!("expected DeliverReply(QueryComplete); got {:?}", last);
     };
-    assert_eq!(p.command_tag.as_str(), "COPY 3");
+    assert_eq!(format!("{}", p.command_tag), "COPY 3");
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
