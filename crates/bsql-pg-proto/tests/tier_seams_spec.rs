@@ -221,16 +221,16 @@ fn errored_cause_is_preserved_in_state_and_reply() {
     // kind classification, not the full cause.
     use bsql_pg_proto::error::ErrorKind;
     match out.as_slice() {
-        [
-            Action::FailReply {
-                cause: ProtocolError::FrameTooLarge { declared },
-                ..
-            },
-            Action::CloseSocket,
-        ] => {
-            assert_eq!(*declared, 0xDEAD, "first FailReply carries full cause");
+        [Action::FailReply { .. }, Action::CloseSocket] => {}
+        other => panic!("expected [FailReply, CloseSocket], got {other:?}"),
+    }
+    let _ = out;
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    match cause {
+        ProtocolError::FrameTooLarge { declared } => {
+            assert_eq!(declared, 0xDEAD, "first FailReply carries full cause");
         }
-        other => panic!("expected [FailReply(FrameTooLarge 0xDEAD), CloseSocket], got {other:?}"),
+        other => panic!("expected FrameTooLarge 0xDEAD, got {other:?}"),
     }
     assert!(
         matches!(proto.state(), ActiveState::Errored(k) if k.as_kind() == ErrorKind::Framing),
@@ -480,13 +480,17 @@ fn backend_key_data_wrong_payload_size_is_classified() {
         "malformed BKD → FailReply + CloseSocket",
     );
     match out.as_slice() {
-        [Action::FailReply { cause, .. }, Action::CloseSocket] => match cause {
-            ProtocolError::MalformedBackendKeyData { payload_len } => {
-                assert_eq!(*payload_len, 4);
-            }
-            other => panic!("expected MalformedBackendKeyData, got {other:?}"),
-        },
+        [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
+    }
+    let _ = out;
+    // DEF-286 Φ-I.b: query cause via slot accessor on ConnectingPhase.
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
+    match cause {
+        ProtocolError::MalformedBackendKeyData { payload_len } => {
+            assert_eq!(payload_len, 4);
+        }
+        other => panic!("expected MalformedBackendKeyData, got {other:?}"),
     }
     assert!(matches!(proto.state(), ConnectingState::Errored(_)));
 }

@@ -288,17 +288,19 @@ fn error_response_fails_the_in_flight_ping() {
     );
     match out.as_slice() {
         [
-            Action::FailReply { id: failed_id, cause },
+            Action::FailReply { id: failed_id },
             Action::CloseSocket,
         ] => {
             assert_eq!(failed_id, &ping_raw);
-            assert!(
-                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
-                "expected ServerErrorResponse, got {cause:?}",
-            );
         }
         _ => panic!("unexpected action sequence: {out:?}"),
     }
+    let _ = out;
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+        "expected ServerErrorResponse, got {cause:?}",
+    );
 }
 
 /// Invariant (spec): a frame with a malformed length-field (< 4) is
@@ -317,17 +319,19 @@ fn malformed_length_fails_and_closes() {
     assert_eq!(out.len(), 2);
     match out.as_slice() {
         [
-            Action::FailReply { id: failed_id, cause },
+            Action::FailReply { id: failed_id },
             Action::CloseSocket,
         ] => {
             assert_eq!(failed_id, &ping_raw);
-            assert!(matches!(
-                cause,
-                ProtocolError::MalformedFrameLength { declared: 3 },
-            ));
         }
         _ => panic!("unexpected action sequence: {out:?}"),
     }
+    let _ = out;
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(matches!(
+        cause,
+        ProtocolError::MalformedFrameLength { declared: 3 },
+    ));
 }
 
 /// Invariant (spec): a chunk of bytes exceeding the `ReadBuf`
@@ -372,24 +376,26 @@ fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
     );
     match out.as_slice() {
         [
-            Action::FailReply { id: failed_id, cause },
+            Action::FailReply { id: failed_id },
             Action::CloseSocket,
         ] => {
             assert_eq!(failed_id, &ping_raw);
-            match cause {
-                ProtocolError::ReadBufferFull {
-                    attempted,
-                    available,
-                } => {
-                    assert_eq!(*attempted, overflow_len);
-                    assert_eq!(*available, READ_BUF_CAP);
-                }
-                other => panic!(
-                    "expected ReadBufferFull {{ attempted: {overflow_len}, available: {READ_BUF_CAP} }}, got {other:?}",
-                ),
-            }
         }
         other => panic!("unexpected action sequence: {other:?}"),
+    }
+    let _ = out;
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    match cause {
+        ProtocolError::ReadBufferFull {
+            attempted,
+            available,
+        } => {
+            assert_eq!(attempted, overflow_len);
+            assert_eq!(available, READ_BUF_CAP);
+        }
+        other => panic!(
+            "expected ReadBufferFull {{ attempted: {overflow_len}, available: {READ_BUF_CAP} }}, got {other:?}",
+        ),
     }
 
     // State carries only `ErrorKind` (the `Transport` kind
@@ -429,17 +435,19 @@ fn frame_too_large_is_rejected_pre_buffer() {
     assert_eq!(out.len(), 2);
     match out.as_slice() {
         [
-            Action::FailReply { id: failed_id, cause },
+            Action::FailReply { id: failed_id },
             Action::CloseSocket,
         ] => {
             assert_eq!(failed_id, &ping_raw);
-            assert!(matches!(
-                cause,
-                ProtocolError::FrameTooLarge { declared: 0xFFFF_FFFF },
-            ));
         }
         _ => panic!("unexpected action sequence: {out:?}"),
     }
+    let _ = out;
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(matches!(
+        cause,
+        ProtocolError::FrameTooLarge { declared: 0xFFFF_FFFF },
+    ));
 }
 
 /// Invariant: a second Ping while one is in flight is
@@ -523,21 +531,23 @@ fn rfq_with_non_single_byte_payload_is_rejected() {
         );
         match out.as_slice() {
             [
-                Action::FailReply { id: failed_id, cause },
+                Action::FailReply { id: failed_id },
                 Action::CloseSocket,
             ] => {
                 assert_eq!(failed_id, &ping_raw);
-                assert!(
-                    matches!(
-                        cause,
-                        ProtocolError::MalformedReadyForQuery { payload_len: actual }
-                            if *actual == payload_len,
-                    ),
-                    "payload_len={payload_len}: unexpected cause {cause:?}",
-                );
             }
             other => panic!("payload_len={payload_len}: unexpected actions {other:?}"),
         }
+        let _ = out;
+        let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+        assert!(
+            matches!(
+                cause,
+                ProtocolError::MalformedReadyForQuery { payload_len: actual }
+                    if actual == payload_len,
+            ),
+            "payload_len={payload_len}: unexpected cause {cause:?}",
+        );
     }
 }
 
@@ -560,15 +570,14 @@ fn rfq_with_invalid_tx_status_byte_is_rejected() {
 
         let out = proto.feed_bytes(&rfq_frame(bad), &mut wb);
         let actions = out.as_slice();
+        let saw_fail = actions.iter().any(|a| matches!(a, Action::FailReply { .. }));
+        let _ = out;
+        let cause_match = proto.fail_cause().is_some_and(|c|
+            matches!(c, ProtocolError::MalformedReadyForQuery { payload_len: 1 })
+        );
         assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::FailReply {
-                    cause: ProtocolError::MalformedReadyForQuery { payload_len: 1 },
-                    ..
-                }
-            )),
-            "bad={bad:#04x}: expected FailReply(MalformedReadyForQuery{{1}}), got {actions:?}",
+            saw_fail && cause_match,
+            "bad={bad:#04x}: expected FailReply(MalformedReadyForQuery{{1}})",
         );
     }
 }

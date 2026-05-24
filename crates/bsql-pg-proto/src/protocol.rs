@@ -197,6 +197,10 @@ macro_rules! emit_actions {
 /// debug_assert on the same invariant would be redundant — same
 /// invariant, single load-bearing assertion site.
 macro_rules! try_builder {
+    // DEF-286 Φ-I.b: macro unchanged — StagedAction::FailReply retains
+    // cause inline; materialise (and the push-path PushFailure fold)
+    // perform the park-into-fail_cause-slot step at the StagedAction
+    // → Action / PushFailure transformation boundary.
     ($result:expr, $setter:expr, $reply:expr, $staged:expr) => {
         match $result {
             Ok(r) => r,
@@ -568,6 +572,15 @@ pub struct ConnectingInner {
     /// Spill buffer for oversize ErrorResponse / NoticeResponse
     /// frames during handshake.
     partial_assembly: crate::partial_assembly::PartialAssemblyCell,
+    /// DEF-286 Φ-I.b — slot for parked `Action::FailReply.cause`
+    /// during the handshake phase. Mirror of the `ActiveExtras.fail_cause`
+    /// cell but living inline on `ConnectingInner` because
+    /// `<ConnectingPhase>::Extras = ()` (cell-on-outer pattern is
+    /// reserved for Active-only cells; Connecting-relevant slots
+    /// live on the Inner). Per-cycle lifecycle mirrors the Active
+    /// pattern. Callers query via
+    /// [`crate::PgProtocol::fail_cause`] (per-phase impl).
+    fail_cause: crate::fail_cause_slot::FailCauseSlotCell,
     /// Count of malformed frames observed during handshake.
     malformed_frame_count: u32,
     /// `!Sync` witness — `PhantomData<Cell<()>>` makes the type
@@ -689,11 +702,11 @@ pub struct ActiveInner {
 ///
 /// **Lifetimes**: `'state` covers the state `&mut` (lifted local in
 /// per-phase lift+lower wrappers). `'r` covers all other `&mut`
-/// refs that flow into [`OutActions<'_, 'r>`] via `materialise`.
+/// refs that flow into [`OutActions<'_>`] via `materialise`.
 /// Independent lifetimes enable per-phase wrappers to provide a
 /// short-lived lifted `&mut ProtoState` (local owned `proto_state`)
 /// alongside outer-lifetime borrows for the data fields. Returns
-/// `OutActions<'w, 'r>` constrained only by `'r`, so the wrapper's
+/// `OutActions<'w>` constrained only by `'r`, so the wrapper's
 /// projection of state back to per-phase form after the call does
 /// not constrain the return-borrow lifetime. Single-lifetime call
 /// sites (`<ActivePhase>::feed_bytes`, `<ConnectingPhase>::feed_bytes`,
@@ -726,6 +739,17 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
     /// [`crate::PgProtocol::terminal_tx_status`] post-`feed_bytes`.
     pub(in crate::protocol) tx_status_slot:
         &'r mut crate::tx_status_slot::TxStatusSlotCell,
+    /// DEF-286 Φ-I.b: FailCause slot threaded from
+    /// `<ActivePhase>::Extras.fail_cause` via
+    /// `feed_bytes_dispatch_active`, OR from
+    /// `ConnectingInner.fail_cause` via
+    /// `feed_bytes_dispatch_connecting` (NOT a transient — Connecting
+    /// fail_cause must persist across the wrapper return so callers
+    /// can query `pg.fail_cause()` after the `FailReply` event).
+    /// `install_errored` parks here; callers query via
+    /// [`crate::PgProtocol::fail_cause`] (per-phase impl) post-FailReply.
+    pub(in crate::protocol) fail_cause_slot:
+        &'r mut crate::fail_cause_slot::FailCauseSlotCell,
     pub(in crate::protocol) session_params:
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
@@ -1199,6 +1223,19 @@ pub struct ActiveExtras {
     /// 32 → 16-24 B and Action 40 → 24-32 B.
     pub(in crate::protocol) tx_status:
         crate::tx_status_slot::TxStatusSlotCell,
+    /// DEF-286 Φ-I.b — slot for parked `Action::FailReply.cause`.
+    /// Externalised so `Action::FailReply { id, cause }` (32 B body)
+    /// collapses to `Action::FailReply { id }` (8 B body). With
+    /// Φ-F* shrinking `DeliverReply` body 24 → 16 B in parallel,
+    /// Action floor drops 40 → 24 B (-40%).
+    ///
+    /// Per-cycle lifecycle: `dispatch::install_errored` parks
+    /// `Box<ProtocolError>`; callers query via
+    /// [`crate::PgProtocol::fail_cause`] AFTER consuming
+    /// `Action::FailReply`. Cleared at Idle entry; NOT cleared at
+    /// Errored entry (slot persists across Errored cycle).
+    pub(in crate::protocol) fail_cause:
+        crate::fail_cause_slot::FailCauseSlotCell,
 }
 
 /// Phase-typed wrapper over the per-phase Inner storage.
@@ -1414,6 +1451,16 @@ pub(crate) mod _clear_residue_leaf {
     /// [`crate::tx_status_slot::TxStatusSlotCell`] can name it.
     pub(crate) struct ClearResidueTxStatusToken(());
 
+    // DEF-286 Φ-Final perf-recovery: `ClearResidueFailCauseToken` and
+    // `clear_fail_cause_slot_residue` (sister to the other slot
+    // residue-clear helpers) are intentionally absent. The fail_cause
+    // slot is never cleared by the dispatch path — it is empty by
+    // construction whenever the dispatch enters its Idle arm (see
+    // `clear_session_residue_for_class_dispatch` docstring + the
+    // `into_active` slot-initialisation note). The slot's Drop is the
+    // sole cleanup path; happens when ActiveExtras drops at
+    // `into_closed_if_errored` or at wrapper Drop.
+
     /// Clear the schema slot via
     /// [`crate::schema_slot::RowDescSlotCell::clear_at_residue`] with
     /// the [`ClearResidueSchemaToken`] minted inline. Used by
@@ -1494,6 +1541,11 @@ pub(crate) mod _clear_residue_leaf {
     ) {
         slot.clear_at_residue(ClearResidueTxStatusToken(()));
     }
+
+    // DEF-286 Φ-Final perf-recovery: `clear_fail_cause_slot_residue`
+    // helper deleted — the dispatch never calls it (slot empty by
+    // construction; see the omitted-token comment near
+    // `ClearResidueTxStatusToken` above).
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -1822,6 +1874,10 @@ pub(crate) mod _proto_init_leaf {
             session_params: crate::session_params_slot::SessionParamsCell::empty(token),
             error_arena: None,
             partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
+            // DEF-286 Φ-I.b: empty fail_cause slot for the handshake
+            // phase; install_errored arms park here when a handshake
+            // dispatch path raises a FailReply.
+            fail_cause: crate::fail_cause_slot::FailCauseSlotCell::empty(token),
             malformed_frame_count: 0,
             sync_marker: super::PhantomData,
         }
@@ -1854,6 +1910,13 @@ pub(crate) mod _proto_init_leaf {
             tx_status: crate::tx_status_slot::TxStatusSlotCell::fresh(
                 ProtoInitToken::mint(),
             ),
+            // DEF-286 Φ-I.b: empty fail_cause slot. Installed by
+            // `dispatch::install_errored` when a server-frame dispatch
+            // arm fails; queried by callers via
+            // `pg.fail_cause()` post-`Action::FailReply`.
+            fail_cause: crate::fail_cause_slot::FailCauseSlotCell::empty(
+                ProtoInitToken::mint(),
+            ),
         }
     }
 
@@ -1882,6 +1945,16 @@ pub(crate) mod _proto_init_leaf {
                 ProtoInitToken::mint(),
             ),
             tx_status: crate::tx_status_slot::TxStatusSlotCell::fresh(
+                ProtoInitToken::mint(),
+            ),
+            // DEF-286 Φ-I.b: present in the transient for shape
+            // compliance, but NOT used by the Connecting wrapper —
+            // the wrapper threads the REAL
+            // `ConnectingInner.fail_cause` into
+            // `DispatchContext.fail_cause_slot` so the cause persists
+            // across the wrapper return (callers can still query
+            // `pg.fail_cause()` post-FailReply event).
+            fail_cause: crate::fail_cause_slot::FailCauseSlotCell::empty(
                 ProtoInitToken::mint(),
             ),
         }
@@ -2095,7 +2168,7 @@ impl PgProtocol<DisconnectedPhase> {
     /// # Returned tuple
     ///
     /// On `Ok((actions, proto_connecting))`:
-    /// - `actions: OutActions<'w, 'static>` — the StartupMessage wire
+    /// - `actions: OutActions<'w>` — the StartupMessage wire
     ///   bytes (single `Action::SendBytes` chunk in `write_buf`).
     /// - `proto_connecting: PgProtocol<ConnectingPhase>` — the typed
     ///   wrapper for the handshake window.
@@ -2120,7 +2193,7 @@ impl PgProtocol<DisconnectedPhase> {
         write_buf: &'w mut WriteBuf,
     ) -> Result<
         (
-            crate::action::OutActions<'w, 'static>,
+            crate::action::OutActions<'w>,
             PgProtocol<ConnectingPhase>,
         ),
         crate::action::PushFailure,
@@ -2180,11 +2253,11 @@ impl PgProtocol<DisconnectedPhase> {
         // closure produces the final `Result<OutActions, PushFailure>`
         // directly — no intermediate StagedActions escape.
         let result: Result<
-            crate::action::OutActions<'w, 'static>,
+            crate::action::OutActions<'w>,
             crate::action::PushFailure,
         > = write_buf
             .with_branded(
-                |mut wb| -> Result<crate::action::OutActions<'w, 'static>, crate::action::PushFailure> {
+                |mut wb| -> Result<crate::action::OutActions<'w>, crate::action::PushFailure> {
                     let mut staged: StagedActions<'_> = StagedActions::new();
                     {
                         let mut reserved = wb.reserve();
@@ -2203,7 +2276,7 @@ impl PgProtocol<DisconnectedPhase> {
                     let bytes: &'w [u8] = wb.into_bytes();
 
                     let mut failure: Option<crate::action::PushFailure> = None;
-                    let mut out: crate::action::OutActions<'w, 'static> =
+                    let mut out: crate::action::OutActions<'w> =
                         crate::action::OutActions::new();
                     for sa in staged {
                         match sa {
@@ -2344,10 +2417,10 @@ impl PgProtocol<ConnectingPhase> {
     #[must_use = "FeedEvent variants carry side-effect contracts: \
                   SendBytes/Deliver MUST be processed; Fail/Close MUST \
                   trigger socket teardown"]
-    pub fn advance_one_frame<'w, 'r>(
-        &'r mut self,
+    pub fn advance_one_frame<'w>(
+        &mut self,
         write_buf: &'w mut WriteBuf,
-    ) -> crate::action::FeedEvent<'w, 'r> {
+    ) -> crate::action::FeedEvent<'w> {
         self.inner.advance_one_frame(write_buf)
     }
 
@@ -2358,11 +2431,11 @@ impl PgProtocol<ConnectingPhase> {
     /// `advance_one_frame` loop. Same const-generic specialisation
     /// (`BOUNDED = false`).
     #[must_use = "the returned actions carry side-effects that must be executed"]
-    pub fn feed_bytes<'w, 'r>(
-        &'r mut self,
+    pub fn feed_bytes<'w>(
+        &mut self,
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
-    ) -> OutActions<'w, 'r> {
+    ) -> OutActions<'w> {
         self.inner.feed_bytes_impl::<false>(bytes, write_buf, 0)
     }
 
@@ -2436,9 +2509,24 @@ impl PgProtocol<ConnectingPhase> {
                 session_params,
                 error_arena,
                 partial_assembly,
+                fail_cause,
                 malformed_frame_count,
                 sync_marker: _,
             } = self.inner;
+            // DEF-286 Φ-Final perf-recovery: explicitly drop the
+            // Connecting-phase `fail_cause`. The slot is normally
+            // None on the HandshakeReady success path; forwarding it
+            // into ActiveExtras (prior Φ-I.b design) was the lone
+            // construction site of a non-empty `<ActivePhase>::Idle`
+            // fail_cause slot. Dropping at the phase boundary
+            // establishes the invariant "`<ActivePhase>` Idle state
+            // → `fail_cause` slot empty" by-construction, which lets
+            // the push hot path skip a 4-instruction clear at every
+            // call (asm-diff confirmed). Callers wanting to inspect a
+            // failed-handshake cause query `pg.fail_cause()` BEFORE
+            // calling `into_active` (the `<ConnectingPhase>` accessor
+            // is the canonical query site).
+            drop(fail_cause);
             // `if let` guarded the variant; the destructure here is
             // architecturally infallible. Use a `let-else` form to
             // keep the match exhaustive without panic/unwrap (clippy
@@ -2461,6 +2549,16 @@ impl PgProtocol<ConnectingPhase> {
                     phase_marker: PhantomData,
                 }));
             };
+            // ActiveExtras initialised with empty `fail_cause`
+            // (the explicit drop above is the invariant-establishing
+            // step). `fresh_active_extras()` constructs `fail_cause`
+            // as `FailCauseSlotCell::empty(token)` — the slot starts
+            // empty in `<ActivePhase>` and stays empty until a
+            // feed-bytes path with `materialise(...) → install_errored`
+            // parks a cause (which simultaneously transitions state
+            // to `Errored`; state can never go Errored → Idle, so the
+            // slot remains empty whenever state is Idle).
+            let extras = _proto_init_leaf::fresh_active_extras();
             return Ok(PgProtocol {
                 inner: ActiveInner {
                     state: crate::state::ActiveState::Idle,
@@ -2475,7 +2573,7 @@ impl PgProtocol<ConnectingPhase> {
                     malformed_frame_count,
                     sync_marker: PhantomData,
                 },
-                extras: _proto_init_leaf::fresh_active_extras(),
+                extras,
                 phase_marker: PhantomData,
             });
         }
@@ -2583,6 +2681,23 @@ impl PgProtocol<ConnectingPhase> {
         // generation-mismatch resolves correctly via `get`'s
         // Stale classification — identity result is what we want.
         arena.get(r)
+    }
+
+    /// Read the parked `Action::FailReply.cause` from the most-recent
+    /// failure event during handshake (DEF-286 Φ-I.b). Mirror of
+    /// [`PgProtocol::<ActivePhase>::fail_cause`].
+    ///
+    /// Returns `None` if no failure has been observed yet on this
+    /// connecting protocol instance. The slot persists across
+    /// `into_active` (forwarded into the new
+    /// `<ActivePhase>::Extras.fail_cause` slot).
+    ///
+    /// See the Active-phase doc for the caller contract on
+    /// latest-wins semantics.
+    #[inline]
+    #[must_use]
+    pub fn fail_cause(&self) -> Option<&crate::error::ProtocolError> {
+        self.inner.fail_cause.as_ref()
     }
 
     /// `as_ready` accessor during handshake. ALWAYS returns `None`
@@ -3423,7 +3538,7 @@ impl PgProtocol<ActivePhase> {
     ///
     /// # Return surface
     ///
-    /// Returns `Result<OutActions<'w, 'static>, PushFailure>` (~88 B
+    /// Returns `Result<OutActions<'w>, PushFailure>` (~88 B
     /// plus the OutActions container in the Ok arm). On Ok, the
     /// frame bytes live in the caller's [`WriteBuf`] and the
     /// returned `OutActions` carries the `Action::SendBytes(&'w [u8])`
@@ -3445,7 +3560,7 @@ impl PgProtocol<ActivePhase> {
         &mut self,
         cmd: C,
         write_buf: &'w mut WriteBuf,
-    ) -> Result<crate::action::OutActions<'w, 'static>, crate::action::PushFailure> {
+    ) -> Result<crate::action::OutActions<'w>, crate::action::PushFailure> {
         // The full outbound frame is the ordered concatenation of:
         //   1. SendBytesRange (header bytes in wb)
         //   2. SendBytesBorrowed (caller's SQL — zero-copy)
@@ -3566,7 +3681,7 @@ impl PgProtocol<ActivePhase> {
         // Single-pass materialise inside the branded closure: stage,
         // drain, classify-fail, emit `Action::SendBytes` chunks —
         // all in one walk. Closure returns the final
-        // `Result<OutActions<'w, 'static>, _>` directly; no
+        // `Result<OutActions<'w>, _>` directly; no
         // intermediate `StagedActions` escape.
         //
         // A naive shape would (1) return `StagedActions` from the
@@ -3584,7 +3699,7 @@ impl PgProtocol<ActivePhase> {
         // `WriteRange::apply`; read side is unbranded. row_desc_slot
         // is threaded through for BindExecute (other commands
         // ignore it).
-        let result = write_buf.with_branded(|mut wb| -> Result<crate::action::OutActions<'w, 'static>, crate::action::PushFailure> {
+        let result = write_buf.with_branded(|mut wb| -> Result<crate::action::OutActions<'w>, crate::action::PushFailure> {
             let mut staged: StagedActions<'_> = StagedActions::new();
             {
                 let mut reserved = wb.reserve();
@@ -3602,7 +3717,7 @@ impl PgProtocol<ActivePhase> {
             let bytes: &'w [u8] = wb.into_bytes();
 
             let mut failure: Option<crate::action::PushFailure> = None;
-            let mut out: crate::action::OutActions<'w, 'static> = crate::action::OutActions::new();
+            let mut out: crate::action::OutActions<'w> = crate::action::OutActions::new();
             for sa in staged {
                 match sa {
                     // Push-path failure surface: a `try_builder!`-emitted
@@ -3851,7 +3966,7 @@ impl PgProtocol<ActivePhase> {
     ///
     /// # Lifetime contract
     ///
-    /// `FeedEvent<'wb, 'r>` carries two lifetimes:
+    /// `FeedEvent<'wb>` carries two lifetimes:
     ///   - `'wb` ties [`FeedEvent::SendBytes`] to the caller's `write_buf`.
     ///   - `'r` ties [`FeedEvent::Deliver`]'s `Reply<'r>` to the
     ///     `&'r mut self` borrow of this protocol.
@@ -3866,10 +3981,10 @@ impl PgProtocol<ActivePhase> {
     #[must_use = "FeedEvent variants carry side-effect contracts: \
                   SendBytes/Deliver MUST be processed; Fail/Close MUST \
                   trigger socket teardown"]
-    pub fn advance_one_frame<'w, 'r>(
-        &'r mut self,
+    pub fn advance_one_frame<'w>(
+        &mut self,
         write_buf: &'w mut WriteBuf,
-    ) -> crate::action::FeedEvent<'w, 'r> {
+    ) -> crate::action::FeedEvent<'w> {
         // 1-line delegate to the Inner so `<ConnectingPhase>` and
         // `<ActivePhase>` share the same implementation (handshake-
         // window callers also need per-event advance for server-
@@ -3886,17 +4001,17 @@ impl PgProtocol<ActivePhase> {
     ///
     /// `&'r mut self` — the row slices in `Action::StreamRow`
     /// borrow from `self.inner.read_buf`. The `'r` lifetime propagates
-    /// into `OutActions<'w, 'r>`; the borrow checker blocks
+    /// into `OutActions<'w>`; the borrow checker blocks
     /// subsequent `&mut self` calls (and thus the next `feed_bytes`)
     /// until `OutActions` drops.
     ///
     /// [`push_command`]: Self::push_command
     #[must_use = "the returned actions carry side-effects that must be executed"]
-    pub fn feed_bytes<'w, 'r>(
-        &'r mut self,
+    pub fn feed_bytes<'w>(
+        &mut self,
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
-    ) -> OutActions<'w, 'r> {
+    ) -> OutActions<'w> {
         // `const BOUNDED = false` specialisation — monomorphised
         // body with the per-iter bound check eliminated at compile
         // time. The production hot path does not pay
@@ -3929,12 +4044,12 @@ impl PgProtocol<ActivePhase> {
     /// specialisation, eliminating the gate entirely at compile
     /// time.
     #[inline]
-    pub(crate) fn feed_bytes_bounded<'w, 'r>(
-        &'r mut self,
+    pub(crate) fn feed_bytes_bounded<'w>(
+        &mut self,
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
         max_dispatches: u16,
-    ) -> OutActions<'w, 'r> {
+    ) -> OutActions<'w> {
         // 1-line delegate to the Inner mirror. `row_stream`'s
         // slow-path call site (`self.proto.feed_bytes_bounded`)
         // resolves through this delegate unchanged. row_desc_slot
@@ -4003,7 +4118,14 @@ impl PgProtocol<ActivePhase> {
               Each parameter is a distinct mutable view into \
               PgProtocol storage; the count grew from 7 to 8 to \
               mirror the slot-pattern. Bundling would defeat the \
-              destructured-borrows discipline of the call site."
+              destructured-borrows discipline of the call site. \
+              DEF-286 Φ-Final perf-recovery: `fail_cause_slot` is \
+              NOT a parameter — the `<ActivePhase>::Idle` invariant \
+              (slot empty by-construction; see `into_active` and \
+              dispatch's Errored-is-terminal contract) makes the \
+              clear provably dead. Skipping the arg saves one stack \
+              push on every push_command and feed_bytes (ARM64 13th \
+              arg spills past x0-x7)."
 )]
 pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
     row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
@@ -4036,6 +4158,32 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
             // boundaries. Single-byte reset; conn-start-default
             // matches PG's actual idle state.
             _clear_residue_leaf::clear_tx_status_slot_residue(tx_status_slot);
+            // DEF-286 Φ-Final perf-recovery: NO `fail_cause` clear
+            // on the Idle arm. The slot is empty by-construction
+            // whenever state is Idle (proof):
+            //   1. `<ActivePhase>` is reachable only via
+            //      `into_active`, which initialises ActiveExtras
+            //      with `FailCauseSlotCell::empty(token)`.
+            //   2. The push hot path never parks (the open-coded
+            //      materialiser in `push_command_internal` converts
+            //      `StagedAction::FailReply` directly into
+            //      `PushFailure { id, cause: Box::new(cause) }` and
+            //      transitions state to Errored without touching the
+            //      slot).
+            //   3. The feed_bytes hot path parks via `materialise`,
+            //      which simultaneously transitions state to Errored
+            //      (the `(state, install_errored, materialise)`
+            //      triple is atomic per dispatch outcome).
+            //   4. State Errored → Idle is structurally impossible
+            //      (Errored is terminal in `<ActivePhase>`; the only
+            //      exit is `into_closed_if_errored` to `<ClosedPhase>`).
+            // Therefore whenever this Idle arm runs, the slot is
+            // None. The prior Φ-I.b `clear_fail_cause_slot_residue`
+            // call was provably dead; removing it eliminates ~3-4
+            // instructions per push and (more impactfully) drops the
+            // `fail_cause_slot: &mut` parameter from this function's
+            // ABI — saving one stack push per call (12 → 11 args,
+            // ARM64 9th+ args spill past x0-x7).
             if let Some(arena) = error_arena.as_deref_mut() {
                 arena.clear();
             }
@@ -4120,12 +4268,12 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
 //
 // - **With-schema (Active path)** — closure does
 //   `materialise(staged, bytes, terminal_ref)` where `terminal_ref`
-//   has the slot's `'r` lifetime → returns `OutActions<'w, 'r>`.
+//   has the slot's `'r` lifetime → returns `OutActions<'w>`.
 //
 // - **No-schema (Connecting path)** — closure ignores `terminal_ref`
 //   and calls `materialise(staged, bytes, None::<&'static RowDesc>)`
-//   → returns `OutActions<'w, 'static>`. By covariance the caller
-//   observes this as `OutActions<'w, 'r_outer>` for any `'r_outer`.
+//   → returns `OutActions<'w>`. By covariance the caller
+//   observes this as `OutActions<'w>` for any `'r_outer`.
 //
 // This pattern keeps the dispatch body unified (one source of truth,
 // asm-diff cleared once) while splitting the output type at the
@@ -4144,12 +4292,22 @@ pub(in crate::protocol) fn feed_bytes_dispatch<'w, 'state, 'r, R, M, const BOUND
     materialise_fn: M,
 ) -> R
 where
+    // DEF-286 Φ-F*: closure no longer takes Reply payload slot args
+    // (row_desc / param_oids / command_tag). DEF-286 Φ-I.b: closure
+    // takes `fail_cause_slot: &mut FailCauseSlotCell` so materialise
+    // can park the cause at the StagedAction → Action transformation
+    // boundary. The `'r` parameter stays on `OutActions` to bind the
+    // `current_*` payload accessors.
+    //
+    // `Fn` (not `FnOnce`) because the body has THREE materialise
+    // sites (`AlreadyErrored` / `AppendFailed` early-exit arms +
+    // main-loop end). The slot is passed as a `&mut` argument to
+    // each call to satisfy the unique-borrow rule (no closure
+    // capture of the mut ref).
     M: Fn(
         StagedActions<'w>,
         &'w [u8],
-        Option<&'r crate::decode::RowDesc>,
-        Option<&'r crate::action::ParamOids>,
-        Option<&'r crate::command_tag::CommandTag>,
+        &mut crate::fail_cause_slot::FailCauseSlotCell,
     ) -> R,
 {
     let DispatchContext {
@@ -4159,6 +4317,7 @@ where
         param_oids_slot: terminal_param_oids,
         command_tag_slot: terminal_command_tag,
         tx_status_slot: terminal_tx_status,
+        fail_cause_slot,
         session_params: session_params_slot,
         error_arena: error_arena_slot,
         notifications_arena: notifications_arena_slot,
@@ -4176,6 +4335,12 @@ where
     // amortises one classification across the full feed_bytes
     // dispatch loop.
     let entry_class = state.push_class();
+    // DEF-286 Φ-Final perf-recovery: `fail_cause_slot` is no longer
+    // an argument here — the Idle-arm clear was provably dead (see
+    // `clear_session_residue_for_class_dispatch` docstring). The
+    // local binding is still needed for `materialise_fn` (the park
+    // site). Dropping the arg saves one stack push per feed_bytes
+    // entry (ARM64 13th arg spilled past x0-x7).
     clear_session_residue_for_class_dispatch(
         terminal_row_desc,
         terminal_param_oids,
@@ -4261,15 +4426,12 @@ where
             // state.
             core::hint::cold_path();
             read_buf.clear();
-            let terminal_ref: Option<&crate::decode::RowDesc> =
-                (*terminal_row_desc).as_ref();
-            let terminal_param_oids_ref: Option<&crate::action::ParamOids> =
-                (*terminal_param_oids).as_ref();
-            let terminal_command_tag_ref: Option<&crate::command_tag::CommandTag> =
-                (*terminal_command_tag).as_ref();
+            // DEF-286 Φ-F*: closure no longer takes slot args; Reply
+            // payloads are unit-shape lifetime markers, accessors live
+            // on PgProtocol / OutActions.
             return write_buf.with_branded(|wb| -> R {
                 let staged: StagedActions = StagedActions::new();
-                materialise_fn(staged, wb.into_bytes(), terminal_ref, terminal_param_oids_ref, terminal_command_tag_ref)
+                materialise_fn(staged, wb.into_bytes(), fail_cause_slot)
             });
         }
         IngressClassification::AppendFailed { attempted, available } => {
@@ -4296,13 +4458,9 @@ where
                     &mut staged,
                     malformed_counter,
                 );
-                let terminal_ref: Option<&crate::decode::RowDesc> =
-                    (*terminal_row_desc).as_ref();
-                let terminal_param_oids_ref: Option<&crate::action::ParamOids> =
-                    (*terminal_param_oids).as_ref();
-                let terminal_command_tag_ref: Option<&crate::command_tag::CommandTag> =
-                    (*terminal_command_tag).as_ref();
-                materialise_fn(staged, wb.into_bytes(), terminal_ref, terminal_param_oids_ref, terminal_command_tag_ref)
+                // DEF-286 Φ-F*: no slot args; payload data lives in
+                // PgProtocol slots, queried via accessors.
+                materialise_fn(staged, wb.into_bytes(), fail_cause_slot)
             });
         }
         IngressClassification::Ok => {
@@ -4381,6 +4539,11 @@ where
                     ]);
                 }
                 DispatchOutcome::Errored { reply_id, cause } => {
+                    // DEF-286 Φ-I.b: StagedAction::FailReply still
+                    // carries `cause` inline; the park-into-slot step
+                    // happens at materialise time when StagedAction
+                    // is transformed into the tag+id-only public
+                    // `Action::FailReply`.
                     match reply_id {
                         Some(id) => {
                             emit_actions!(&mut staged, budget: 2, [
@@ -4614,6 +4777,10 @@ where
                             // Terminal FailReply + CloseSocket MUST
                             // reach the caller (reply promise
                             // resolution, socket teardown signal).
+                            // DEF-286 Φ-I.b: StagedAction carries
+                            // cause inline; materialise parks it
+                            // into the slot when emitting the public
+                            // tag+id-only Action::FailReply.
                             match reply_id {
                                 Some(id) => {
                                     emit_actions!(&mut staged, budget: 2, [
@@ -4713,18 +4880,13 @@ where
             read_buf.clear();
         }
 
-        // Dispatch may have written to `terminal_row_desc` AND/OR
-        // `terminal_param_oids` during the loop ('T' arms park
-        // schemas; 't' arms park ParamOids). NLL ends the dispatch
-        // loop's `&mut` reborrows at the loop close brace above;
-        // reborrow as immutable here for materialise.
-        let terminal_ref: Option<&crate::decode::RowDesc> =
-            (*terminal_row_desc).as_ref();
-        let terminal_param_oids_ref: Option<&crate::action::ParamOids> =
-            (*terminal_param_oids).as_ref();
-        let terminal_command_tag_ref: Option<&crate::command_tag::CommandTag> =
-            (*terminal_command_tag).as_ref();
-        materialise_fn(staged, wb.into_bytes(), terminal_ref, terminal_param_oids_ref, terminal_command_tag_ref)
+        // DEF-286 Φ-F*: payload data lives in PgProtocol slots —
+        // queried by callers via `current_row_desc()` /
+        // `current_param_oids()` / `current_command_tag()` accessors
+        // on `OutActions<'_>` (and PgProtocol equivalents).
+        // Materialise no longer projects per-Reply; the residue-clear
+        // and dispatch loop already consumed the slot mut refs above.
+        materialise_fn(staged, wb.into_bytes(), fail_cause_slot)
     })
 }
 
@@ -4741,7 +4903,7 @@ where
 /// **Two lifetimes** mirror the lifetime split in
 /// [`DispatchContext`]: `'state` for the state borrow (lifted-local
 /// in `feed_bytes_dispatch_connecting`), `'r` for the other `&mut`
-/// field borrows that flow into `OutActions<'_, 'r>`.
+/// field borrows that flow into `OutActions<'_>`.
 ///
 /// **Construction**: only by `ConnectingInner` methods via
 /// disjoint-field-borrow from `&mut self`. Free function shape (not
@@ -4769,6 +4931,12 @@ pub(in crate::protocol) struct ConnectingDispatchContext<'state, 'r> {
         &'r mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
     pub(in crate::protocol) partial_assembly:
         &'r mut crate::partial_assembly::PartialAssemblyCell,
+    /// DEF-286 Φ-I.b: fail_cause_slot threaded from the REAL
+    /// `ConnectingInner.fail_cause` field (NOT a transient — must
+    /// persist across the wrapper return so callers can query
+    /// `pg.fail_cause()` post-FailReply event).
+    pub(in crate::protocol) fail_cause_slot:
+        &'r mut crate::fail_cause_slot::FailCauseSlotCell,
     pub(in crate::protocol) malformed_count: &'r mut u32,
 }
 
@@ -4788,7 +4956,7 @@ pub(in crate::protocol) struct ConnectingDispatchContext<'state, 'r> {
 /// lifetime `'tmp` (shorter than caller's `'r`); the inner
 /// [`feed_bytes_dispatch`] signature `<'w, 'state, 'r, BOUNDED>`
 /// accepts `'state = 'tmp` while preserving `'r = 'r_outer` for the
-/// `OutActions<'w, 'r_outer>` return. Without the independent
+/// `OutActions<'w>` return. Without the independent
 /// `'state` / `'r` split this wrapper would be inexpressible
 /// (lifetime-widening 'tmp → 'r is contravariant, requires
 /// `mem::transmute` — forbidden under `#![forbid(unsafe_code)]`).
@@ -4834,7 +5002,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     bytes: &[u8],
     write_buf: &'w mut WriteBuf,
     max_dispatches: u16,
-) -> OutActions<'w, 'r> {
+) -> OutActions<'w> {
     use crate::state::{ConnectingState, WrongPhase};
 
     let ConnectingDispatchContext {
@@ -4843,6 +5011,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
         session_params,
         error_arena,
         partial_assembly,
+        fail_cause_slot,
         malformed_count,
     } = ctx;
 
@@ -4858,7 +5027,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     // **Lifetime safety**: the inner `DispatchContext.row_desc_slot`
     // is `&'r mut RowDescSlotCell` — `'r` here is the wrapper's
     // outer lifetime, BUT the borrow only flows out via
-    // `OutActions<'_, 'r>` if `terminal_ref: Option<&'r RowDesc>`
+    // `OutActions<'_>` if `terminal_ref: Option<&'r RowDesc>`
     // is `Some`. The transient is always empty (Connecting LHS
     // never writes), so `terminal_ref = None` for the whole call;
     // no `'r` borrow escapes via the return value. The
@@ -4898,11 +5067,11 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     // (architecturally `None` for Connecting LHS — no arm writes
     // the slot) and calls `materialise` with
     // `None::<&'static RowDesc>`. R is inferred as
-    // `OutActions<'w, 'static>`; covariance lets the wrapper's
-    // outer signature `OutActions<'w, 'r>` accept it (since
+    // `OutActions<'w>`; covariance lets the wrapper's
+    // outer signature `OutActions<'w>` accept it (since
     // `'static: 'r` for any `'r`). The transient slot's local
     // lifetime never leaks into R.
-    let actions: OutActions<'w, 'static> = feed_bytes_dispatch::<_, _, BOUNDED>(
+    let actions: OutActions<'w> = feed_bytes_dispatch::<_, _, BOUNDED>(
         DispatchContext {
             state: &mut proto_state,
             read_buf,
@@ -4910,6 +5079,11 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
             param_oids_slot: &mut transient_extras.param_oids,
             command_tag_slot: &mut transient_extras.command_tag,
             tx_status_slot: &mut transient_extras.tx_status,
+            // DEF-286 Φ-I.b: thread the REAL ConnectingInner.fail_cause
+            // (NOT transient_extras.fail_cause) so the parked cause
+            // persists across the wrapper return — callers can query
+            // `pg.fail_cause()` post-FailReply.
+            fail_cause_slot,
             session_params,
             error_arena,
             notifications_arena: &mut transient_notifications_arena,
@@ -4921,19 +5095,12 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
         bytes,
         write_buf,
         max_dispatches,
-        |staged,
-         write_bytes,
-         _terminal_ref_unused: Option<&crate::decode::RowDesc>,
-         _terminal_param_oids_unused: Option<&crate::action::ParamOids>,
-         _terminal_command_tag_unused: Option<&crate::command_tag::CommandTag>|
-         -> OutActions<'w, 'static> {
-            materialise(
-                staged,
-                write_bytes,
-                None::<&'static crate::decode::RowDesc>,
-                None::<&'static crate::action::ParamOids>,
-                None::<&'static crate::command_tag::CommandTag>,
-            )
+        |staged, write_bytes, fail_cause_slot| -> OutActions<'w> {
+            // DEF-286 Φ-F*: closure no longer takes Reply payload
+            // slot args. DEF-286 Φ-I.b: `fail_cause_slot` threaded
+            // through so materialise can park the cause at the
+            // StagedAction → Action transformation boundary.
+            materialise(staged, write_bytes, fail_cause_slot)
         },
     );
 
@@ -4977,7 +5144,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
 /// **Two lifetimes** mirror the lifetime split: `'state` for the
 /// state borrow (lifted-local in `feed_bytes_dispatch_active`),
 /// `'r` for the seven other `&mut` field borrows that flow into
-/// `OutActions<'_, 'r>` via `materialise`.
+/// `OutActions<'_>` via `materialise`.
 ///
 /// **Construction**: only by `ActiveInner` methods via
 /// disjoint-field-borrow from `&mut self`. Tier-1 closure by
@@ -5002,6 +5169,10 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
     /// `<ActivePhase>::Extras.tx_status`.
     pub(in crate::protocol) tx_status_slot:
         &'r mut crate::tx_status_slot::TxStatusSlotCell,
+    /// DEF-286 Φ-I.b: fail_cause_slot threaded from
+    /// `<ActivePhase>::Extras.fail_cause`.
+    pub(in crate::protocol) fail_cause_slot:
+        &'r mut crate::fail_cause_slot::FailCauseSlotCell,
     pub(in crate::protocol) session_params:
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
@@ -5065,7 +5236,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
     bytes: &[u8],
     write_buf: &'w mut WriteBuf,
     max_dispatches: u16,
-) -> OutActions<'w, 'r> {
+) -> OutActions<'w> {
     use crate::state::{ActiveState, WrongPhase};
 
     let ActiveDispatchContext {
@@ -5075,6 +5246,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         param_oids_slot,
         command_tag_slot,
         tx_status_slot,
+        fail_cause_slot,
         session_params,
         error_arena,
         notifications_arena,
@@ -5094,7 +5266,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
 
     // With-schema closure: reads the slot's RowDesc as
     // `Option<&'r RowDesc>` and forwards to `materialise`; R is
-    // inferred as `OutActions<'w, 'r>`.
+    // inferred as `OutActions<'w>`.
     let actions = feed_bytes_dispatch::<_, _, BOUNDED>(
         DispatchContext {
             state: &mut proto_state,
@@ -5103,6 +5275,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
             param_oids_slot,
             command_tag_slot,
             tx_status_slot,
+            fail_cause_slot,
             session_params,
             error_arena,
             notifications_arena,
@@ -5114,13 +5287,12 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         bytes,
         write_buf,
         max_dispatches,
-        |staged,
-         write_bytes,
-         terminal_ref: Option<&crate::decode::RowDesc>,
-         terminal_param_oids_ref: Option<&crate::action::ParamOids>,
-         terminal_command_tag_ref: Option<&crate::command_tag::CommandTag>|
-         -> OutActions<'w, 'r> {
-            materialise(staged, write_bytes, terminal_ref, terminal_param_oids_ref, terminal_command_tag_ref)
+        |staged, write_bytes, fail_cause_slot| -> OutActions<'w> {
+            // DEF-286 Φ-F*: closure no longer takes Reply payload
+            // slot args. DEF-286 Φ-I.b: `fail_cause_slot` threaded
+            // through so materialise can park the cause at the
+            // StagedAction → Action transformation boundary.
+            materialise(staged, write_bytes, fail_cause_slot)
         },
     );
 
@@ -5165,7 +5337,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
 pub(in crate::protocol) fn advance_one_frame_dispatch_active<'w, 'r>(
     ctx: ActiveDispatchContext<'_, 'r>,
     write_buf: &'w mut WriteBuf,
-) -> crate::action::FeedEvent<'w, 'r> {
+) -> crate::action::FeedEvent<'w> {
     use crate::action::{Action, FeedEvent};
     use crate::state::ActiveState;
 
@@ -5191,7 +5363,9 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_active<'w, 'r>(
         [] => FeedEvent::NeedMoreBytes,
         [Action::SendBytes(bytes)] => FeedEvent::SendBytes(bytes),
         [Action::DeliverReply { id, value }] => FeedEvent::Deliver(*id, *value),
-        [Action::FailReply { id, cause }, ..] => FeedEvent::Fail(*id, *cause),
+        // DEF-286 Φ-I.b: cause externalised; caller queries via
+        // `pg.fail_cause()` AFTER consuming this event.
+        [Action::FailReply { id }, ..] => FeedEvent::Fail(*id),
         [Action::CloseSocket] => FeedEvent::Close,
         _ => FeedEvent::Close,
     }
@@ -5218,7 +5392,7 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_active<'w, 'r>(
 pub(in crate::protocol) fn advance_one_frame_dispatch_connecting<'w, 'r>(
     ctx: ConnectingDispatchContext<'_, 'r>,
     write_buf: &'w mut WriteBuf,
-) -> crate::action::FeedEvent<'w, 'r> {
+) -> crate::action::FeedEvent<'w> {
     use crate::action::{Action, FeedEvent};
     use crate::state::ConnectingState;
 
@@ -5238,7 +5412,9 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_connecting<'w, 'r>(
         [] => FeedEvent::NeedMoreBytes,
         [Action::SendBytes(bytes)] => FeedEvent::SendBytes(bytes),
         [Action::DeliverReply { id, value }] => FeedEvent::Deliver(*id, *value),
-        [Action::FailReply { id, cause }, ..] => FeedEvent::Fail(*id, *cause),
+        // DEF-286 Φ-I.b: cause externalised; caller queries via
+        // `pg.fail_cause()` AFTER consuming this event.
+        [Action::FailReply { id }, ..] => FeedEvent::Fail(*id),
         [Action::CloseSocket] => FeedEvent::Close,
         _ => FeedEvent::Close,
     }
@@ -5329,12 +5505,12 @@ impl ConnectingInner {
     /// wrapper). Builds [`ConnectingDispatchContext`] from
     /// `&mut self.<field>` via disjoint-field-borrow (Rust 2018+).
     /// LLVM inlines this delegate unconditionally.
-    pub(crate) fn feed_bytes_impl<'w, 'r, const BOUNDED: bool>(
-        &'r mut self,
+    pub(crate) fn feed_bytes_impl<'w, const BOUNDED: bool>(
+        &mut self,
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
         max_dispatches: u16,
-    ) -> OutActions<'w, 'r> {
+    ) -> OutActions<'w> {
         feed_bytes_dispatch_connecting::<BOUNDED>(
             ConnectingDispatchContext {
                 state: &mut self.state,
@@ -5342,6 +5518,9 @@ impl ConnectingInner {
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 partial_assembly: &mut self.partial_assembly,
+                // DEF-286 Φ-I.b: thread the REAL ConnectingInner.fail_cause
+                // (lives directly on Inner; ConnectingPhase has no Extras).
+                fail_cause_slot: &mut self.fail_cause,
                 malformed_count: &mut self.malformed_frame_count,
             },
             bytes,
@@ -5399,10 +5578,10 @@ impl ConnectingInner {
     #[must_use = "FeedEvent variants carry side-effect contracts: \
                   SendBytes/Deliver MUST be processed; Fail/Close MUST \
                   trigger socket teardown"]
-    pub(crate) fn advance_one_frame<'w, 'r>(
-        &'r mut self,
+    pub(crate) fn advance_one_frame<'w>(
+        &mut self,
         write_buf: &'w mut WriteBuf,
-    ) -> crate::action::FeedEvent<'w, 'r> {
+    ) -> crate::action::FeedEvent<'w> {
         advance_one_frame_dispatch_connecting(
             ConnectingDispatchContext {
                 state: &mut self.state,
@@ -5410,6 +5589,9 @@ impl ConnectingInner {
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 partial_assembly: &mut self.partial_assembly,
+                // DEF-286 Φ-I.b: thread the REAL ConnectingInner.fail_cause
+                // (lives directly on Inner; ConnectingPhase has no Extras).
+                fail_cause_slot: &mut self.fail_cause,
                 malformed_count: &mut self.malformed_frame_count,
             },
             write_buf,
@@ -5510,7 +5692,7 @@ impl ActiveInner {
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
         max_dispatches: u16,
-    ) -> OutActions<'w, 'r> {
+    ) -> OutActions<'w> {
         feed_bytes_dispatch_active::<BOUNDED>(
             ActiveDispatchContext {
                 state: &mut self.state,
@@ -5519,6 +5701,8 @@ impl ActiveInner {
                 param_oids_slot: &mut extras.param_oids,
                 command_tag_slot: &mut extras.command_tag,
                 tx_status_slot: &mut extras.tx_status,
+                // DEF-286 Φ-I.b: thread the real ActiveExtras.fail_cause.
+                fail_cause_slot: &mut extras.fail_cause,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 notifications_arena: &mut self.notifications_arena,
@@ -5541,7 +5725,7 @@ impl ActiveInner {
         bytes: &[u8],
         write_buf: &'w mut WriteBuf,
         max_dispatches: u16,
-    ) -> OutActions<'w, 'r> {
+    ) -> OutActions<'w> {
         self.feed_bytes_impl::<true>(extras, bytes, write_buf, max_dispatches)
     }
 
@@ -5593,7 +5777,7 @@ impl ActiveInner {
         &'r mut self,
         extras: &'r mut ActiveExtras,
         write_buf: &'w mut WriteBuf,
-    ) -> crate::action::FeedEvent<'w, 'r> {
+    ) -> crate::action::FeedEvent<'w> {
         advance_one_frame_dispatch_active(
             ActiveDispatchContext {
                 state: &mut self.state,
@@ -5602,6 +5786,8 @@ impl ActiveInner {
                 param_oids_slot: &mut extras.param_oids,
                 command_tag_slot: &mut extras.command_tag,
                 tx_status_slot: &mut extras.tx_status,
+                // DEF-286 Φ-I.b: thread the real ActiveExtras.fail_cause.
+                fail_cause_slot: &mut extras.fail_cause,
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 notifications_arena: &mut self.notifications_arena,
@@ -5631,6 +5817,12 @@ impl ActiveInner {
         extras: &mut ActiveExtras,
         class: crate::state::StatePushClass,
     ) {
+        // DEF-286 Φ-Final perf-recovery: `extras.fail_cause` is NOT
+        // passed — the clear is provably dead in the Idle arm (see
+        // dispatch fn docstring + `into_active` invariant note) and
+        // the Errored arm never clears it. The 12-arg → 11-arg ABI
+        // shrink eliminates one stack push at the push hot path,
+        // restoring Phase E call-site shape.
         clear_session_residue_for_class_dispatch(
             &mut extras.row_desc,
             &mut extras.param_oids,
@@ -6370,6 +6562,56 @@ impl PgProtocol<ActivePhase> {
             .map(crate::decode::RowDescBorrow::from_ref)
     }
 
+    /// Read the parked terminal `CommandTag` from the protocol's
+    /// command_tag_slot (DEF-286 Φ3/Φ-F*). Returns `None` if no
+    /// `'C'` (CommandComplete) frame has been observed since the
+    /// last residue clear. Callers query this AFTER consuming
+    /// `Action::DeliverReply { Reply::QueryComplete(..) }` from
+    /// `OutActions`.
+    ///
+    /// DEF-286 Φ-F* moved `command_tag` off the inline Reply
+    /// variant. The accessor mirrors `current_row_desc`'s contract.
+    #[inline]
+    #[must_use]
+    pub fn current_command_tag(&self) -> Option<&crate::command_tag::CommandTag> {
+        self.extras.command_tag.as_ref()
+    }
+
+    /// Read the parked terminal `ParamOids` from the protocol's
+    /// param_oids_slot (DEF-286 Φ1/Φ-F*). Returns `None` if no
+    /// `'t'` (ParameterDescription) frame has been observed since
+    /// the last residue clear. Callers query this AFTER consuming
+    /// `Action::DeliverReply { Reply::DescribeStatementComplete(..) }`
+    /// from `OutActions`.
+    ///
+    /// DEF-286 Φ-F* moved `param_oids` off the inline
+    /// `DescribeStatementCompletePayload`. The accessor mirrors
+    /// `current_row_desc`'s contract.
+    #[inline]
+    #[must_use]
+    pub fn current_param_oids(&self) -> Option<&crate::action::ParamOids> {
+        self.extras.param_oids.as_ref()
+    }
+
+    /// Compute the typed `DescribedRows<'_>` view from the parked
+    /// row_desc_slot (DEF-286 Φ-F*). `Rows(..)` if a `'T'`
+    /// (RowDescription) frame was observed since the last residue
+    /// clear; `NoData` if `'n'` (NoData) was observed.
+    ///
+    /// Slot population is the single source of truth for schema
+    /// presence: dispatch arms park RowDesc on `'T'` arrival;
+    /// `'n'` arms skip the park. The accessor materialises the
+    /// `DescribedRows` sum from the slot state, mirroring the
+    /// dispatch-time discrimination.
+    ///
+    /// Callers query this AFTER consuming `Action::DeliverReply
+    /// { Reply::Describe*Complete(..) }` from `OutActions`.
+    #[inline]
+    #[must_use]
+    pub fn current_described_rows(&self) -> crate::action::DescribedRows<'_> {
+        crate::action::describe_rows_from_slot(self.extras.row_desc.as_ref())
+    }
+
     /// Read the terminal `ReadyForQuery` transaction-status byte
     /// parked at the most-recent `'Z'` arrival (DEF-286 Φ-E).
     ///
@@ -6393,6 +6635,33 @@ impl PgProtocol<ActivePhase> {
     #[must_use]
     pub fn terminal_tx_status(&self) -> crate::action::TxStatus {
         self.extras.tx_status.get()
+    }
+
+    /// Read the parked `Action::FailReply.cause` from the most-recent
+    /// failure event (DEF-286 Φ-I.b).
+    ///
+    /// Returns `None` if no failure has been observed yet on this
+    /// protocol instance (slot empty post-init or post-Idle residue
+    /// clear).
+    ///
+    /// # Caller contract
+    ///
+    /// Query IMMEDIATELY after consuming `Action::FailReply` /
+    /// `FeedEvent::Fail` from the action surface. A subsequent
+    /// `install_errored` (e.g. `ConnectionAlreadyClosed` raised when
+    /// the caller pushes a command on an already-Errored protocol)
+    /// overwrites the slot via latest-wins semantics. Deferring the
+    /// query past a subsequent push loses the original cause.
+    ///
+    /// # Lifetime contract
+    ///
+    /// Returns `Option<&ProtocolError>` — the borrow is tied to
+    /// `&self`. `ProtocolError: Copy`, so callers typically `.copied()`
+    /// to detach.
+    #[inline]
+    #[must_use]
+    pub fn fail_cause(&self) -> Option<&crate::error::ProtocolError> {
+        self.extras.fail_cause.as_ref()
     }
 
     /// Fused state classification for the row-stream fast-path
@@ -6861,6 +7130,9 @@ fn fail_inflight_no_readbuf(
             // Real transition occurred: bump the canary regardless
             // of whether prior state carried an inflight reply.
             *malformed_counter = malformed_counter.saturating_add(1);
+            // DEF-286 Φ-I.b: StagedAction::FailReply carries cause
+            // inline; materialise parks it into the slot at the
+            // StagedAction → Action transformation boundary.
             match inflight {
                 Some(id) => {
                     emit_actions!(staged, budget: 2, [
@@ -8498,13 +8770,13 @@ fn build_startup_message(
 }
 
 /// Phase-2 materialiser: convert the write-phase's
-/// [`StagedActions`] into [`OutActions<'w, 'r>`] with references
+/// [`StagedActions`] into [`OutActions<'w>`] with references
 /// into `write_buf_bytes` (`'w`) or `terminal_row_desc` (`'r`).
 ///
 /// Lifetime plumbing: `write_buf_bytes` supplies `'w`;
 /// `terminal_row_desc: Option<&'r RowDesc>` supplies `'r` (the
 /// parking slot on `PgProtocol`). The borrow checker refuses any
-/// `&mut WriteBuf` re-borrow while the returned `OutActions<'w, 'r>`
+/// `&mut WriteBuf` re-borrow while the returned `OutActions<'w>`
 /// is alive, and any `&mut self` re-borrow on `PgProtocol` while
 /// `'r` is alive.
 //
@@ -8524,13 +8796,11 @@ fn build_startup_message(
 // `Action::SendBytes(&'w [u8])` for both `SendBytesRange` (bytes
 // from `write_bytes: &'w [u8]`) and `SendBytesBorrowed` (bytes
 // from caller's SQL, lifetime ≥ 'w by the unified parameter).
-fn materialise<'w, 'r>(
+fn materialise<'w>(
     staged: StagedActions<'w>,
     write_bytes: &'w [u8],
-    terminal_row_desc: Option<&'r crate::decode::RowDesc>,
-    terminal_param_oids: Option<&'r crate::action::ParamOids>,
-    terminal_command_tag: Option<&'r crate::command_tag::CommandTag>,
-) -> OutActions<'w, 'r> {
+    fail_cause_slot: &mut crate::fail_cause_slot::FailCauseSlotCell,
+) -> OutActions<'w> {
     // Capacity invariant: `staged.len() ≤ MAX_STAGED_PER_CALL`
     // (heapless::Vec cap); each staged entry fans out to ≤
     // MAX_FANOUT_PER_STAGED actions. `out.push(a)` below is
@@ -8545,7 +8815,7 @@ fn materialise<'w, 'r>(
         // `StagedAction::StreamRowRange` does not exist — DataRow
         // flows via the `iter_rows` fast-path (no staging). The
         // stale-ref class was deleted; `into_public` is infallible.
-        let a: Action<'w, 'r> = match sa {
+        let a: Action<'w> = match sa {
             StagedAction::SendBytesRange(range) => {
                 // `WriteRange::apply` returns `Option<&[u8]>` — None
                 // is architecturally unreachable under intact
@@ -8579,10 +8849,20 @@ fn materialise<'w, 'r>(
                 let entry_id = entry.id();
                 Action::DeliverReply {
                     id: entry_id,
-                    value: entry.staged().into_public(terminal_row_desc, terminal_param_oids, terminal_command_tag),
+                    value: entry.staged().into_public(),
                 }
             }
-            StagedAction::FailReply { id, cause } => Action::FailReply { id, cause },
+            StagedAction::FailReply { id, cause } => {
+                // DEF-286 Φ-I.b: park the cause into the slot at the
+                // StagedAction → Action transformation boundary.
+                // Public `Action::FailReply` carries only `id`;
+                // callers query the cause via `pg.fail_cause()`.
+                crate::dispatch::_install_errored_leaf::park_cause_at_install_errored(
+                    fail_cause_slot,
+                    alloc::boxed::Box::new(cause),
+                );
+                Action::FailReply { id }
+            }
             StagedAction::CloseSocket => Action::CloseSocket,
             // Pass borrowed slice through unchanged. The `'sql: 'w`
             // bound on `materialise` ensures the borrow is at least
@@ -8661,9 +8941,9 @@ fn materialise<'w, 'r>(
 /// sites, avoiding drift (a future 7th site would inherit the
 /// correct dead-arm discipline automatically).
 #[inline(always)]
-fn push_within_fanout_budget<'w, 'r>(
-    out: &mut OutActions<'w, 'r>,
-    a: Action<'w, 'r>,
+fn push_within_fanout_budget<'w>(
+    out: &mut OutActions<'w>,
+    a: Action<'w>,
 ) {
     match out.push(a) {
         Ok(()) => {}

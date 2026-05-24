@@ -2,7 +2,7 @@
 //!
 //! # Push-path return shape
 //!
-//! Push paths return `Result<OutActions<'_, 'static>, PushFailure>`
+//! Push paths return `Result<OutActions<'_>, PushFailure>`
 //! to surface the zero-copy SQL chunk (caller-owned `&str` borrowed
 //! via `SendBytesBorrowed`) alongside the header/trailer ranges in
 //! `WriteBuf`. Tests still want to assert on the FULL wire frame, so
@@ -257,7 +257,7 @@ pub trait PushOrPanic {
 /// Panics on unexpected action variants (push paths emit only
 /// `SendBytes` per the architecturally-pinned push contract).
 #[track_caller]
-fn actions_to_scratch(actions: OutActions<'_, '_>) -> std::vec::Vec<u8> {
+fn actions_to_scratch(actions: OutActions<'_>) -> std::vec::Vec<u8> {
     let mut scratch: std::vec::Vec<u8> = std::vec::Vec::with_capacity(8192);
     for action in actions {
         match action {

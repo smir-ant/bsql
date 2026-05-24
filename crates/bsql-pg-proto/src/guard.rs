@@ -211,7 +211,7 @@ impl<'a> ReadyGuard<'a> {
         self,
         cmd: C,
         write_buf: &'w mut WriteBuf,
-    ) -> Result<OutActions<'w, 'static>, PushFailure> {
+    ) -> Result<OutActions<'w>, PushFailure> {
         // The Idle precondition is re-checked inside
         // `push_command_internal` via `IdleState::try_from` (returns
         // `Option<IdleState<'_>>`). ReadyGuard's existence already
@@ -242,7 +242,7 @@ impl<'a> ReadyGuard<'a> {
         fetch: FetchRows,
         reply: ReplyId<QueryKind>,
         write_buf: &'w mut WriteBuf,
-    ) -> Result<OutActions<'w, 'static>, PushFailure> {
+    ) -> Result<OutActions<'w>, PushFailure> {
         self.push_command(
             crate::push_command::BindExecute {
                 portal_name,
@@ -288,7 +288,7 @@ impl<'a> ReadyGuard<'a> {
         fetch: FetchRows,
         reply: ReplyId<QueryKind>,
         write_buf: &'w mut WriteBuf,
-    ) -> Result<OutActions<'w, 'static>, PushFailure>
+    ) -> Result<OutActions<'w>, PushFailure>
     where
         P: ParamsWriter + 'w,
         R: crate::prepared::RowDecode + 'static,

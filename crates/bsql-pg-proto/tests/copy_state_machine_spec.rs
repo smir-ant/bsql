@@ -122,15 +122,17 @@ fn copy_out_full_cycle_state_transitions() {
     let actions = proto.feed_bytes(&tail, &mut wb);
     let slice = actions.as_slice();
     // Final action is DeliverReply with command_tag "COPY 2".
-    let last = slice.last().expect("at least one action");
+    let Some(last) = slice.last() else { panic!("at least one action"); };
     let bsql_pg_proto::Action::DeliverReply {
-        value: Reply::QueryComplete(p),
+        value: Reply::QueryComplete(_),
         ..
     } = last
     else {
         panic!("expected final DeliverReply(QueryComplete); got {:?}", last);
     };
-    assert_eq!(format!("{}", p.command_tag), "COPY 2");
+    let _ = actions;
+    let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
+    assert_eq!(format!("{}", command_tag), "COPY 2");
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
@@ -166,15 +168,17 @@ fn copy_in_full_cycle_state_transitions() {
     tail.extend(rfq_frame(b'I'));
     let actions = proto.feed_bytes(&tail, &mut wb);
     let slice = actions.as_slice();
-    let last = slice.last().expect("at least one action");
+    let Some(last) = slice.last() else { panic!("at least one action"); };
     let bsql_pg_proto::Action::DeliverReply {
-        value: Reply::QueryComplete(p),
+        value: Reply::QueryComplete(_),
         ..
     } = last
     else {
         panic!("expected final DeliverReply(QueryComplete); got {:?}", last);
     };
-    assert_eq!(format!("{}", p.command_tag), "COPY 5");
+    let _ = actions;
+    let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
+    assert_eq!(format!("{}", command_tag), "COPY 5");
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
@@ -287,15 +291,17 @@ fn copy_in_full_push_cycle() {
     tail.extend(rfq_frame(b'I'));
     let actions = proto.feed_bytes(&tail, &mut wb);
     let slice = actions.as_slice();
-    let last = slice.last().expect("at least one action");
+    let Some(last) = slice.last() else { panic!("at least one action"); };
     let bsql_pg_proto::Action::DeliverReply {
-        value: Reply::QueryComplete(p),
+        value: Reply::QueryComplete(_),
         ..
     } = last
     else {
         panic!("expected DeliverReply(QueryComplete); got {:?}", last);
     };
-    assert_eq!(format!("{}", p.command_tag), "COPY 3");
+    let _ = actions;
+    let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
+    assert_eq!(format!("{}", command_tag), "COPY 3");
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 

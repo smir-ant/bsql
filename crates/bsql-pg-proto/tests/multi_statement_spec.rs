@@ -89,15 +89,15 @@ fn batch_two_dml_statements_surfaces_intermediate() {
     };
     match &slice[1] {
         Action::DeliverReply {
-            value: Reply::QueryComplete(p),
+            value: Reply::QueryComplete(_),
             ..
-        } => {
-            assert_eq!(format!("{}", p.command_tag), "COMMIT");
-        }
+        } => {}
         other => panic!("slot 1: expected DeliverReply(QueryComplete), got {other:?}"),
     }
     // `actions` is `ManuallyDrop<heapless::Vec<_>>` — NLL releases
     // the &mut proto borrow at the last `&slice[…]` use above.
+    let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
+    assert_eq!(format!("{}", command_tag), "COMMIT");
     let icc0_tag = proto
         .get_command_tag(icc0_ref)
         .unwrap_or_else(|e| panic!("ICC[0] resolve: {e:?}"));
@@ -146,15 +146,16 @@ fn batch_three_statements_surfaces_two_intermediates() {
         other => panic!("slot 1: expected Intermediate, got {other:?}"),
     };
     let Action::DeliverReply {
-        value: Reply::QueryComplete(p),
+        value: Reply::QueryComplete(_),
         ..
     } = &slice[2]
     else {
         panic!("slot 2: expected DeliverReply, got {:?}", slice[2]);
     };
-    assert_eq!(format!("{}", p.command_tag), "COMMIT");
-    // NLL releases the &mut proto borrow after the last `p`/`slice`
-    // use above; the subsequent `get_command_tag` calls reborrow.
+    // NLL releases the &mut proto borrow after the last `slice` use
+    // above; the subsequent accessor calls reborrow.
+    let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
+    assert_eq!(format!("{}", command_tag), "COMMIT");
     let icc0_tag = proto.get_command_tag(icc0_ref).unwrap_or_else(|e| panic!("ICC[0]: {e:?}"));
     assert_eq!(format!("{}", icc0_tag), "BEGIN");
     let icc1_tag = proto.get_command_tag(icc1_ref).unwrap_or_else(|e| panic!("ICC[1]: {e:?}"));
@@ -205,14 +206,15 @@ fn batch_with_empty_query_response_in_middle() {
         other => panic!("slot 1: expected Intermediate (empty), got {other:?}"),
     };
     let Action::DeliverReply {
-        value: Reply::QueryComplete(p),
+        value: Reply::QueryComplete(_),
         ..
     } = &slice[2]
     else {
         panic!("slot 2: expected DeliverReply, got {:?}", slice[2]);
     };
-    assert_eq!(format!("{}", p.command_tag), "COMMIT");
-    // NLL: borrow ends after last `p` use; reborrow proto for arena.
+    // NLL: borrow ends after last `slice` use; reborrow proto for accessor.
+    let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
+    assert_eq!(format!("{}", command_tag), "COMMIT");
     let icc0_tag = proto.get_command_tag(icc0_ref).unwrap_or_else(|e| panic!("ICC[0]: {e:?}"));
     assert_eq!(format!("{}", icc0_tag), "BEGIN");
     let icc1_tag = proto.get_command_tag(icc1_ref).unwrap_or_else(|e| panic!("ICC[1]: {e:?}"));
@@ -252,11 +254,13 @@ fn single_statement_batch_no_intermediates() {
     // Expect: ONE DeliverReply only — no intermediate.
     assert_eq!(slice.len(), 1, "single-statement must produce 1 action; got {:?}", slice);
     let Action::DeliverReply {
-        value: Reply::QueryComplete(p),
+        value: Reply::QueryComplete(_),
         ..
     } = &slice[0]
     else {
         panic!("slot 0: expected DeliverReply, got {:?}", slice[0]);
     };
-    assert_eq!(format!("{}", p.command_tag), "SELECT 1");
+    let _ = actions;
+    let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
+    assert_eq!(format!("{}", command_tag), "SELECT 1");
 }

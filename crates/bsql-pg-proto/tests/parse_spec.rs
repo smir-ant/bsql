@@ -181,12 +181,8 @@ fn parse_error_is_recoverable() {
     let actions = out.as_slice();
     assert_eq!(actions.len(), 1, "E emits FailReply; Z drained silently");
     match actions.first() {
-        Some(Action::FailReply { id: failed_id, cause }) => {
+        Some(Action::FailReply { id: failed_id }) => {
             assert_eq!(*failed_id, reply_raw);
-            assert!(
-                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
-                "FailReply.cause must be ServerErrorResponse, got {cause:?}",
-            );
         }
         other => panic!("expected FailReply, got {other:?}"),
     }
@@ -197,6 +193,13 @@ fn parse_error_is_recoverable() {
             "parse-error must not close socket: {a:?}",
         );
     }
+    let _ = out;
+    // DEF-286 Φ-I.b: cause via slot.
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
+    assert!(
+        matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+        "FailReply.cause must be ServerErrorResponse, got {cause:?}",
+    );
     assert!(
         matches!(proto.state(), ActiveState::Idle),
         "state returns to Idle after drain; got {:?}", proto.state(),
@@ -346,16 +349,11 @@ fn parse_unexpected_frame_tears_down() {
     let bad = frame(b'D', &[0, 0]);
     let out = proto.feed_bytes(&bad, &mut wb);
     let actions = out.as_slice();
-    assert!(
-        actions.iter().any(|a| matches!(
-            a,
-            Action::FailReply {
-                cause: ProtocolError::UnexpectedFrame { .. },
-                ..
-            },
-        )),
-        "expected FailReply(UnexpectedFrame), got {actions:?}",
-    );
-    assert!(actions.iter().any(|a| matches!(a, Action::CloseSocket)));
+    let saw_fail = actions.iter().any(|a| matches!(a, Action::FailReply { .. }));
+    let saw_close = actions.iter().any(|a| matches!(a, Action::CloseSocket));
+    let _ = out;
+    let cause_match = proto.fail_cause().is_some_and(|c| matches!(c, ProtocolError::UnexpectedFrame { .. }));
+    assert!(saw_fail && cause_match, "expected FailReply(UnexpectedFrame)");
+    assert!(saw_close, "expected CloseSocket");
     assert!(matches!(proto.state(), ActiveState::Errored(_)));
 }

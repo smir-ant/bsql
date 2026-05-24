@@ -198,20 +198,20 @@ fn select_zero_rows_end_to_end() {
         [Action::DeliverReply { id: delivered_id, value }] => {
             assert_eq!(*delivered_id, q_raw, "correlator round-trips");
             match value {
-                Reply::QueryComplete(p) => {
-                    assert_eq!(format!("{}", p.command_tag), "SELECT 0");
-                    // 1c-2a: 0-row SELECT delivers schema via Reply
-                    // (no StreamRow to carry it).
-                    assert!(
-                        matches!(p.row_desc, Some(desc) if desc.is_empty()),
-                        "0-row SELECT: row_desc must be Some(empty-desc), got {:?}", p.row_desc,
-                    );
-                }
+                Reply::QueryComplete(_) => {}
                 other => panic!("expected QueryComplete, got {other:?}"),
             }
         }
         other => panic!("expected DeliverReply, got {other:?}"),
     }
+    let _ = out;
+    let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
+    assert_eq!(format!("{}", command_tag), "SELECT 0");
+    let row_desc = proto.current_row_desc();
+    assert!(
+        matches!(row_desc, Some(desc) if desc.is_empty()),
+        "0-row SELECT: row_desc must be Some(empty-desc), got {row_desc:?}",
+    );
     // DEF-286 Φ-E: tx_status accessor instead of inline field.
     assert_eq!(proto.terminal_tx_status(), bsql_pg_proto::TxStatus::Idle);
     assert!(matches!(proto.state(), ActiveState::Idle));
@@ -245,21 +245,23 @@ fn dml_no_rows_end_to_end() {
     match out.as_slice() {
         [Action::DeliverReply {
             id: delivered_id,
-            value: Reply::QueryComplete(p),
+            value: Reply::QueryComplete(_),
         }] => {
             assert_eq!(*delivered_id, q_raw);
-            assert_eq!(format!("{}", p.command_tag), "INSERT 0 3");
-            // 1c-2a: DML never received a 'T' frame — row_desc is None.
-            // Critical invariant: push_command clears prior SELECT's
-            // row_desc, so a DML following a SELECT gets None here,
-            // not stale schema.
-            assert!(
-                p.row_desc.is_none(),
-                "DML receives no RowDescription → row_desc must be None",
-            );
         }
         other => panic!("expected DeliverReply(QueryComplete(INSERT 0 3)), got {other:?}"),
     }
+    let _ = out;
+    let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
+    assert_eq!(format!("{}", command_tag), "INSERT 0 3");
+    // 1c-2a: DML never received a 'T' frame — row_desc is None.
+    // Critical invariant: push_command clears prior SELECT's
+    // row_desc, so a DML following a SELECT gets None here,
+    // not stale schema.
+    assert!(
+        proto.current_row_desc().is_none(),
+        "DML receives no RowDescription → row_desc must be None",
+    );
     // DEF-286 Φ-E: tx_status moved to accessor; final state was a `T`-frame.
     assert_eq!(proto.terminal_tx_status(), bsql_pg_proto::TxStatus::InTransaction);
     assert!(matches!(proto.state(), ActiveState::Idle));
@@ -282,15 +284,16 @@ fn empty_query_yields_empty_tag() {
     let out = proto.feed_bytes(&bytes, &mut wb);
     assert_eq!(out.len(), 1);
     match out.as_slice() {
-        [Action::DeliverReply { value: Reply::QueryComplete(p), .. }] => {
-            assert_eq!(
-                format!("{}", p.command_tag),
-                "",
-                "EmptyQueryResponse surfaces as empty command tag",
-            );
-        }
+        [Action::DeliverReply { value: Reply::QueryComplete(_), .. }] => {}
         other => panic!("expected DeliverReply with empty command_tag, got {other:?}"),
     }
+    let _ = out;
+    let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
+    assert_eq!(
+        format!("{}", command_tag),
+        "",
+        "EmptyQueryResponse surfaces as empty command tag",
+    );
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
@@ -313,12 +316,8 @@ fn query_error_emits_fail_reply_and_connection_survives() {
     let actions = out.as_slice();
     assert_eq!(actions.len(), 1, "E emits FailReply; trailing Z drained silently");
     match actions.first() {
-        Some(Action::FailReply { id: failed_id, cause }) => {
+        Some(Action::FailReply { id: failed_id }) => {
             assert_eq!(*failed_id, q_raw);
-            assert!(
-                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
-                "FailReply cause must be ServerErrorResponse, got {cause:?}",
-            );
         }
         other => panic!("expected FailReply, got {other:?}"),
     }
@@ -329,6 +328,12 @@ fn query_error_emits_fail_reply_and_connection_survives() {
             "query-level error must not close the socket: {a:?}",
         );
     }
+    let _ = out;
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
+    assert!(
+        matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+        "FailReply cause must be ServerErrorResponse, got {cause:?}",
+    );
     assert!(
         matches!(proto.state(), ActiveState::Idle),
         "state returns to Idle after drain Z; got {:?}",
@@ -437,17 +442,14 @@ fn malformed_command_complete_no_nul_terminator_tears_down() {
     let bad = frame(TAG_COMMAND_COMPLETE.byte(), b"SELECT 1");
     let out = proto.feed_bytes(&bad, &mut wb);
     let actions = out.as_slice();
-    assert!(
-        actions.iter().any(|a| matches!(
-            a,
-            Action::FailReply { cause: ProtocolError::MalformedCommandComplete { .. }, .. }
-        )),
-        "expected FailReply(MalformedCommandComplete), got {actions:?}",
+    let saw_fail = actions.iter().any(|a| matches!(a, Action::FailReply { .. }));
+    let saw_close = actions.iter().any(|a| matches!(a, Action::CloseSocket));
+    let _ = out;
+    let cause_match = proto.fail_cause().is_some_and(|c|
+        matches!(c, ProtocolError::MalformedCommandComplete { .. })
     );
-    assert!(
-        actions.iter().any(|a| matches!(a, Action::CloseSocket)),
-        "malformed wire framing must close the socket: {actions:?}",
-    );
+    assert!(saw_fail && cause_match, "expected FailReply(MalformedCommandComplete)");
+    assert!(saw_close, "malformed wire framing must close the socket");
     assert!(matches!(proto.state(), ActiveState::Errored(_)));
 }
 
@@ -463,17 +465,14 @@ fn unexpected_rfq_during_await_first_response_tears_down() {
 
     let out = proto.feed_bytes(&rfq_frame(b'I'), &mut wb);
     let actions = out.as_slice();
-    assert!(
-        actions.iter().any(|a| matches!(
-            a,
-            Action::FailReply {
-                cause: ProtocolError::UnexpectedFrame { tag: TAG_READY_FOR_QUERY },
-                ..
-            },
-        )),
-        "expected FailReply(UnexpectedFrame{{Z}}), got {actions:?}",
+    let saw_fail = actions.iter().any(|a| matches!(a, Action::FailReply { .. }));
+    let saw_close = actions.iter().any(|a| matches!(a, Action::CloseSocket));
+    let _ = out;
+    let cause_match = proto.fail_cause().is_some_and(|c|
+        matches!(c, ProtocolError::UnexpectedFrame { tag: TAG_READY_FOR_QUERY })
     );
-    assert!(actions.iter().any(|a| matches!(a, Action::CloseSocket)));
+    assert!(saw_fail && cause_match, "expected FailReply(UnexpectedFrame{{Z}})");
+    assert!(saw_close);
     assert!(matches!(proto.state(), ActiveState::Errored(_)));
 }
 
@@ -573,16 +572,17 @@ fn dml_after_select_clears_row_desc() {
     let out = proto.feed_bytes(&q2_bytes, &mut wb);
     match out.as_slice() {
         [Action::DeliverReply {
-            value: Reply::QueryComplete(p),
+            value: Reply::QueryComplete(_),
             ..
-        }] => {
-            assert!(
-                p.row_desc.is_none(),
-                "DML following SELECT must NOT inherit prior schema; got {:?}", p.row_desc,
-            );
-        }
+        }] => {}
         other => panic!("expected single DeliverReply for DML, got {other:?}"),
     }
+    let _ = out;
+    let row_desc = proto.current_row_desc();
+    assert!(
+        row_desc.is_none(),
+        "DML following SELECT must NOT inherit prior schema; got {row_desc:?}",
+    );
 }
 
 /// Invariant: the outbound `Q` frame layout is tag + BE-length +

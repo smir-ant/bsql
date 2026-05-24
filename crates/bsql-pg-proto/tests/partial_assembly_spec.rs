@@ -273,15 +273,22 @@ fn streaming_e_error_response_oversized_dispatches_to_fail_reply() {
         let end = core::cmp::min(pos.saturating_add(1024), large_e.len());
         let chunk = large_e.get(pos..end).unwrap_or(&[]);
         let out = proto.feed_bytes(chunk, &mut wb);
+        let mut saw_fail_this_iter = false;
         for action in out.as_slice() {
-            if let Action::FailReply { id, cause } = action {
+            if let Action::FailReply { id } = action {
                 assert_eq!(*id, q_raw, "FailReply correlator matches in-flight");
-                assert!(
-                    matches!(cause, ProtocolError::ServerErrorResponse { .. }),
-                    "cause must be ServerErrorResponse, got {cause:?}",
-                );
-                got_fail_reply = true;
+                saw_fail_this_iter = true;
             }
+        }
+        let _ = out;
+        if saw_fail_this_iter {
+            // DEF-286 Φ-I.b: cause externalised; query slot.
+            let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
+            assert!(
+                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+                "cause must be ServerErrorResponse, got {cause:?}",
+            );
+            got_fail_reply = true;
         }
         pos = end;
     }
@@ -493,12 +500,18 @@ fn universal_coverage_100_kb_e_body_in_constant_memory() {
         let end = core::cmp::min(pos.saturating_add(4096), huge_e.len());
         let chunk = huge_e.get(pos..end).unwrap_or(&[]);
         let out = proto.feed_bytes(chunk, &mut wb);
+        let mut saw_fail_this_iter = false;
         for action in out.as_slice() {
-            if let Action::FailReply { id, cause } = action {
+            if let Action::FailReply { id } = action {
                 assert_eq!(*id, q_raw);
-                assert!(matches!(cause, ProtocolError::ServerErrorResponse { .. }));
-                got_fail_reply = true;
+                saw_fail_this_iter = true;
             }
+        }
+        let _ = out;
+        if saw_fail_this_iter {
+            let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
+            assert!(matches!(cause, ProtocolError::ServerErrorResponse { .. }));
+            got_fail_reply = true;
         }
         pos = end;
     }
@@ -657,11 +670,18 @@ fn single_chunk_oversize_e_frame_completes_correctly() {
         let end = core::cmp::min(pos.saturating_add(2048), large_e.len());
         let chunk = large_e.get(pos..end).unwrap_or(&[]);
         let out = proto.feed_bytes(chunk, &mut wb);
+        let mut saw_fail_id_match = false;
         for a in out.as_slice() {
-            if let Action::FailReply { id, cause } = a
+            if let Action::FailReply { id } = a
                 && *id == q_raw
-                && matches!(cause, ProtocolError::ServerErrorResponse { .. })
             {
+                saw_fail_id_match = true;
+            }
+        }
+        let _ = out;
+        if saw_fail_id_match {
+            let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
+            if matches!(cause, ProtocolError::ServerErrorResponse { .. }) {
                 got_fail = true;
             }
         }
@@ -690,7 +710,7 @@ fn inline_path_unchanged_for_small_e_frame() {
     let actions = out.as_slice();
     let got_fail = actions.iter().any(|a| matches!(
         a,
-        Action::FailReply { id, cause: ProtocolError::ServerErrorResponse { .. } }
+        Action::FailReply { id }
             if *id == q_raw
     ));
     assert!(got_fail, "small E must produce FailReply via inline path");
