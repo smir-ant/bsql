@@ -226,7 +226,7 @@ fn describe_statement_with_rows_success_end_to_end() {
         }
         other => panic!("expected DeliverReply(DescribeStatementComplete), got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     // DEF-286 Φ-F*: payload fields externalised; query via accessors.
     let Some(param_oids) = proto.current_param_oids() else { panic!("param_oids slot populated"); };
     assert_eq!(param_oids.len(), 2);
@@ -267,7 +267,7 @@ fn describe_statement_no_data_success_end_to_end() {
         }
         other => panic!("expected DescribeStatementComplete (NoData), got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(param_oids) = proto.current_param_oids() else { panic!("param_oids slot populated"); };
     assert_eq!(param_oids.oids(), &[23]);
     assert!(matches!(proto.current_described_rows(), DescribedRows::NoData));
@@ -297,7 +297,7 @@ fn describe_statement_zero_params_ok() {
         }] => {}
         other => panic!("expected DescribeStatementComplete, got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(param_oids) = proto.current_param_oids() else { panic!("param_oids slot populated"); };
     assert!(param_oids.is_empty(), "zero-param statement");
     assert_eq!(param_oids.len(), 0);
@@ -329,7 +329,7 @@ fn describe_statement_max_params_ok() {
         }] => {}
         other => panic!("expected DescribeStatementComplete, got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(param_oids) = proto.current_param_oids() else { panic!("param_oids slot populated"); };
     assert_eq!(param_oids.len(), 16);
     assert_eq!(param_oids.oids(), oids.as_slice());
@@ -405,7 +405,7 @@ fn describe_portal_with_rows_success_end_to_end() {
         }
         other => panic!("expected DescribePortalComplete, got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     match proto.current_described_rows() {
         DescribedRows::Rows(desc) => {
             assert_eq!(desc.len(), 2);
@@ -437,7 +437,7 @@ fn describe_portal_no_data_success_end_to_end() {
         }] => {}
         other => panic!("expected DescribePortalComplete (NoData), got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     assert!(matches!(proto.current_described_rows(), DescribedRows::NoData));
 }
 
@@ -503,7 +503,7 @@ fn describe_statement_error_at_param_desc_is_recoverable() {
             "describe-error must not close socket: {a:?}",
         );
     }
-    drop(out);
+    let _ = out;
     // DEF-286 Φ-I.b: query cause via slot.
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
     assert!(

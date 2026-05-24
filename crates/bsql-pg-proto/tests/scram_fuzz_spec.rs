@@ -204,7 +204,7 @@ fn scram_server_first_fuzz_never_panics_never_silent_pass() {
         let has_classified = {
             let out = proto.feed_bytes(&fuzz_frame, &mut wb);
             let saw_fail = out.as_slice().iter().any(|a| matches!(a, Action::FailReply { .. }));
-            drop(out);
+            let _ = out;
             saw_fail && proto.fail_cause().is_some_and(|c| matches!(c,
                 ProtocolError::ScramHandshakeFailure { .. } | ProtocolError::MalformedAuthentication { .. },
             ))
@@ -291,7 +291,7 @@ fn scram_server_final_fuzz_never_panics() {
         let has_classified = {
             let out = proto.feed_bytes(&build_sasl_final_frame(&final_body), &mut wb);
             let saw_fail = out.as_slice().iter().any(|a| matches!(a, Action::FailReply { .. }));
-            drop(out);
+            let _ = out;
             saw_fail && proto.fail_cause().is_some_and(|c| matches!(c,
                 ProtocolError::ScramHandshakeFailure { .. } | ProtocolError::MalformedAuthentication { .. },
             ))

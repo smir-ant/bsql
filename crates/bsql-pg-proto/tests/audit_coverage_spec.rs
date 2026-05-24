@@ -76,7 +76,7 @@ fn empty_query_response_with_non_zero_body_classifies() {
             _ => {}
         }
     }
-    drop(out);
+    let _ = out;
     let saw_fail = saw_fail_id_match
         && proto.fail_cause().is_some_and(|c| {
             matches!(c, ProtocolError::UnexpectedFrameBody { .. })
@@ -109,7 +109,7 @@ fn parse_complete_with_non_zero_body_classifies() {
     let bad_frame = [b'1', 0x00, 0x00, 0x00, 0x05, 0xCD];
     let out = proto.feed_bytes(&bad_frame, &mut wb);
     let saw_fail = out.as_slice().iter().any(|a| matches!(a, Action::FailReply { .. }));
-    drop(out);
+    let _ = out;
     let cause_match = proto.fail_cause().is_some_and(|c| matches!(c, ProtocolError::UnexpectedFrameBody { .. }));
     assert!(saw_fail && cause_match,
         "ParseComplete with body must classify UnexpectedFrameBody",
@@ -343,7 +343,7 @@ fn error_response_max_fields_boundary_is_bounded() {
             saw_fail_id_match = true;
         }
     }
-    drop(out);
+    let _ = out;
     let saw_fail = saw_fail_id_match
         && proto.fail_cause().is_some_and(|c| {
             matches!(c, ProtocolError::ServerErrorResponse { .. })

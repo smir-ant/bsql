@@ -1798,11 +1798,11 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 /// keeps `'r` only for `current_*` accessor borrows on `OutActions`,
 /// and the public action surface shrinks to:
 ///
-/// - `Reply` (16 B max — `StartupCompletePayload` carrying pid + secret_key
-///   + tx_status inline; ParseComplete / CloseComplete / Pong are 0 B
-///   carriers; QueryComplete / QuerySuspended / DescribeStatementComplete
-///   / DescribePortalComplete are 0 B carriers — schema/cmd_tag/param_oids
-///   queried via accessors).
+/// - `Reply` (16 B max — `StartupCompletePayload` carrying pid +
+///   secret_key + tx_status inline; ParseComplete / CloseComplete /
+///   Pong are 0 B carriers; QueryComplete / QuerySuspended /
+///   DescribeStatementComplete / DescribePortalComplete are 0 B
+///   carriers — schema/cmd_tag/param_oids queried via accessors).
 /// - `Action<'w>` (24 B max — DeliverReply { id: NonZeroU64,
 ///   value: Reply } = 8 + 16 = 24).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

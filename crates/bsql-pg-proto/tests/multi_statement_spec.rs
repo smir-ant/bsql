@@ -260,7 +260,7 @@ fn single_statement_batch_no_intermediates() {
     else {
         panic!("slot 0: expected DeliverReply, got {:?}", slice[0]);
     };
-    drop(actions);
+    let _ = actions;
     let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
     assert_eq!(format!("{}", command_tag), "SELECT 1");
 }

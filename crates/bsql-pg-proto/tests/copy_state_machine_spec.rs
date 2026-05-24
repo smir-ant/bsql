@@ -130,7 +130,7 @@ fn copy_out_full_cycle_state_transitions() {
     else {
         panic!("expected final DeliverReply(QueryComplete); got {:?}", last);
     };
-    drop(actions);
+    let _ = actions;
     let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
     assert_eq!(format!("{}", command_tag), "COPY 2");
     assert!(matches!(proto.state(), ActiveState::Idle));
@@ -176,7 +176,7 @@ fn copy_in_full_cycle_state_transitions() {
     else {
         panic!("expected final DeliverReply(QueryComplete); got {:?}", last);
     };
-    drop(actions);
+    let _ = actions;
     let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
     assert_eq!(format!("{}", command_tag), "COPY 5");
     assert!(matches!(proto.state(), ActiveState::Idle));
@@ -299,7 +299,7 @@ fn copy_in_full_push_cycle() {
     else {
         panic!("expected DeliverReply(QueryComplete); got {:?}", last);
     };
-    drop(actions);
+    let _ = actions;
     let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
     assert_eq!(format!("{}", command_tag), "COPY 3");
     assert!(matches!(proto.state(), ActiveState::Idle));

@@ -224,7 +224,7 @@ fn errored_cause_is_preserved_in_state_and_reply() {
         [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("expected [FailReply, CloseSocket], got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     match cause {
         ProtocolError::FrameTooLarge { declared } => {
@@ -483,7 +483,7 @@ fn backend_key_data_wrong_payload_size_is_classified() {
         [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     // DEF-286 Φ-I.b: query cause via slot accessor on ConnectingPhase.
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
     match cause {

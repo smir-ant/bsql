@@ -181,7 +181,7 @@ fn bind_execute_dml_full_round_trip() {
         }
         other => panic!("expected DeliverReply(QueryComplete), got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
     assert_eq!(format!("{}", command_tag), "INSERT 0 1");
     assert!(proto.current_row_desc().is_none(), "DML: no schema delivered");
@@ -226,7 +226,7 @@ fn bind_execute_select_with_schema_streams_rows() {
         }] => {}
         other => panic!("expected DeliverReply, got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
     assert_eq!(format!("{}", command_tag), "SELECT 0");
     assert!(proto.current_row_desc().is_some(), "SELECT: schema delivered");
@@ -270,7 +270,7 @@ fn bind_error_is_recoverable() {
         }
         other => panic!("expected single FailReply, got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::ServerErrorResponse { .. }),
@@ -316,7 +316,7 @@ fn bind_execute_data_row_without_schema_is_unexpected_frame() {
         [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::UnexpectedFrame { .. }),
@@ -360,7 +360,7 @@ fn portal_suspended_is_unexpected_frame_in_1c_3b() {
         [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::UnexpectedFrame { .. }),

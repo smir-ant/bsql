@@ -204,7 +204,7 @@ fn select_zero_rows_end_to_end() {
         }
         other => panic!("expected DeliverReply, got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
     assert_eq!(format!("{}", command_tag), "SELECT 0");
     let row_desc = proto.current_row_desc();
@@ -251,7 +251,7 @@ fn dml_no_rows_end_to_end() {
         }
         other => panic!("expected DeliverReply(QueryComplete(INSERT 0 3)), got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
     assert_eq!(format!("{}", command_tag), "INSERT 0 3");
     // 1c-2a: DML never received a 'T' frame — row_desc is None.
@@ -287,7 +287,7 @@ fn empty_query_yields_empty_tag() {
         [Action::DeliverReply { value: Reply::QueryComplete(_), .. }] => {}
         other => panic!("expected DeliverReply with empty command_tag, got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
     assert_eq!(
         format!("{}", command_tag),
@@ -328,7 +328,7 @@ fn query_error_emits_fail_reply_and_connection_survives() {
             "query-level error must not close the socket: {a:?}",
         );
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
     assert!(
         matches!(cause, ProtocolError::ServerErrorResponse { .. }),
@@ -444,7 +444,7 @@ fn malformed_command_complete_no_nul_terminator_tears_down() {
     let actions = out.as_slice();
     let saw_fail = actions.iter().any(|a| matches!(a, Action::FailReply { .. }));
     let saw_close = actions.iter().any(|a| matches!(a, Action::CloseSocket));
-    drop(out);
+    let _ = out;
     let cause_match = proto.fail_cause().is_some_and(|c|
         matches!(c, ProtocolError::MalformedCommandComplete { .. })
     );
@@ -467,7 +467,7 @@ fn unexpected_rfq_during_await_first_response_tears_down() {
     let actions = out.as_slice();
     let saw_fail = actions.iter().any(|a| matches!(a, Action::FailReply { .. }));
     let saw_close = actions.iter().any(|a| matches!(a, Action::CloseSocket));
-    drop(out);
+    let _ = out;
     let cause_match = proto.fail_cause().is_some_and(|c|
         matches!(c, ProtocolError::UnexpectedFrame { tag: TAG_READY_FOR_QUERY })
     );
@@ -577,7 +577,7 @@ fn dml_after_select_clears_row_desc() {
         }] => {}
         other => panic!("expected single DeliverReply for DML, got {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let row_desc = proto.current_row_desc();
     assert!(
         row_desc.is_none(),

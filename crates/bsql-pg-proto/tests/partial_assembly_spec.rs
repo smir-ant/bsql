@@ -280,7 +280,7 @@ fn streaming_e_error_response_oversized_dispatches_to_fail_reply() {
                 saw_fail_this_iter = true;
             }
         }
-        drop(out);
+        let _ = out;
         if saw_fail_this_iter {
             // DEF-286 Φ-I.b: cause externalised; query slot.
             let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
@@ -507,7 +507,7 @@ fn universal_coverage_100_kb_e_body_in_constant_memory() {
                 saw_fail_this_iter = true;
             }
         }
-        drop(out);
+        let _ = out;
         if saw_fail_this_iter {
             let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
             assert!(matches!(cause, ProtocolError::ServerErrorResponse { .. }));
@@ -678,7 +678,7 @@ fn single_chunk_oversize_e_frame_completes_correctly() {
                 saw_fail_id_match = true;
             }
         }
-        drop(out);
+        let _ = out;
         if saw_fail_id_match {
             let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
             if matches!(cause, ProtocolError::ServerErrorResponse { .. }) {

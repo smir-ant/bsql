@@ -295,7 +295,7 @@ fn error_response_fails_the_in_flight_ping() {
         }
         _ => panic!("unexpected action sequence: {out:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::ServerErrorResponse { .. }),
@@ -326,7 +326,7 @@ fn malformed_length_fails_and_closes() {
         }
         _ => panic!("unexpected action sequence: {out:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(matches!(
         cause,
@@ -383,7 +383,7 @@ fn read_buf_overflow_through_feed_bytes_propagates_as_classified_error() {
         }
         other => panic!("unexpected action sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     match cause {
         ProtocolError::ReadBufferFull {
@@ -442,7 +442,7 @@ fn frame_too_large_is_rejected_pre_buffer() {
         }
         _ => panic!("unexpected action sequence: {out:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(matches!(
         cause,
@@ -538,7 +538,7 @@ fn rfq_with_non_single_byte_payload_is_rejected() {
             }
             other => panic!("payload_len={payload_len}: unexpected actions {other:?}"),
         }
-        drop(out);
+        let _ = out;
         let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
         assert!(
             matches!(
@@ -571,7 +571,7 @@ fn rfq_with_invalid_tx_status_byte_is_rejected() {
         let out = proto.feed_bytes(&rfq_frame(bad), &mut wb);
         let actions = out.as_slice();
         let saw_fail = actions.iter().any(|a| matches!(a, Action::FailReply { .. }));
-        drop(out);
+        let _ = out;
         let cause_match = proto.fail_cause().is_some_and(|c|
             matches!(c, ProtocolError::MalformedReadyForQuery { payload_len: 1 })
         );

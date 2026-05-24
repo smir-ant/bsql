@@ -386,7 +386,7 @@ fn negotiate_protocol_version_during_startup() {
         }
         other => panic!("unexpected: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause must be populated"); };
     assert!(
         matches!(cause, ProtocolError::UnsupportedProtocolOption),
@@ -411,7 +411,7 @@ fn unknown_auth_subcode_is_rejected() {
         [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let expected_99 = match core::num::NonZeroU32::new(99) {
         Some(nz) => nz,
         None => panic!("99 is non-zero, NonZeroU32::new infallible"),
@@ -648,7 +648,7 @@ fn connecting_states_become_errored_on_bad_frame() {
         [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'X'),
@@ -935,7 +935,7 @@ fn scram_signature_mismatch_is_rejected() {
         [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::ScramHandshakeFailure { .. }),
@@ -973,7 +973,7 @@ fn scram_iterations_too_low_is_rejected() {
         [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::ScramHandshakeFailure { .. }),
@@ -1018,7 +1018,7 @@ fn scram_iterations_above_cap_is_rejected() {
         [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     match cause {
         ProtocolError::ScramHandshakeFailure {
@@ -1074,7 +1074,7 @@ fn scram_server_error_preserves_diagnostic_message() {
         [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     let detail_ref = match cause {
         ProtocolError::ScramHandshakeFailure {
@@ -1122,7 +1122,7 @@ fn scram_nonce_prefix_mismatch_is_rejected() {
         [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::ScramHandshakeFailure { .. }),
@@ -1359,7 +1359,7 @@ fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
         }
         other => panic!("unexpected action sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'S'),
@@ -1392,7 +1392,7 @@ fn param_status_during_pre_auth_is_unexpected() {
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'S'),
@@ -1638,7 +1638,7 @@ fn error_response_during_cleartext_startup() {
         }
         other => panic!("unexpected action sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::ServerErrorResponse { .. }),
@@ -1666,7 +1666,7 @@ fn cleartext_startup_rejects_sasl_offer() {
         }
         other => panic!("unexpected action sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     match cause {
         ProtocolError::UnsupportedAuthMethod { sub_code } => {
@@ -2024,7 +2024,7 @@ fn md5_auth_rejects_wrong_salt_length() {
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::MalformedAuthentication { .. }),
@@ -2052,7 +2052,7 @@ fn md5_startup_rejects_cleartext_offer() {
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     match cause {
         ProtocolError::UnsupportedAuthMethod { sub_code } => {
@@ -2123,7 +2123,7 @@ fn assert_known_but_wrong<const N: usize>(
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     match cause {
         ProtocolError::UnsupportedAuthMethod { sub_code } => {
@@ -2154,7 +2154,7 @@ fn assert_unexpected_frame<const N: usize>(
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     match cause {
         ProtocolError::UnexpectedFrame { tag } => {
@@ -2212,7 +2212,7 @@ fn md5_startup_rejects_unknown_subcode() {
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     match cause {
         ProtocolError::UnsupportedAuthMethod { sub_code } => {
@@ -2299,7 +2299,7 @@ fn md5_awaiting_authok_rejects_sasl_subcode() {
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'R'),
@@ -2322,7 +2322,7 @@ fn md5_awaiting_authok_handles_error_response() {
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::ServerErrorResponse { .. }),
@@ -2346,7 +2346,7 @@ fn md5_awaiting_authok_rejects_random_tag() {
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'Z'),
@@ -2394,7 +2394,7 @@ fn cleartext_startup_rejects_unknown_subcode() {
         [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::UnsupportedAuthMethod { .. }),
@@ -2450,7 +2450,7 @@ fn cleartext_awaiting_authok_handles_error_response() {
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(
         matches!(cause, ProtocolError::ServerErrorResponse { .. }),
@@ -2542,7 +2542,7 @@ fn md5_startup_handles_error_response() {
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(matches!(cause, ProtocolError::ServerErrorResponse { .. }));
 }
@@ -2562,7 +2562,7 @@ fn md5_startup_handles_negotiate_protocol_version() {
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(matches!(cause, ProtocolError::UnsupportedProtocolOption));
 }
@@ -2582,7 +2582,7 @@ fn cleartext_startup_handles_negotiate_protocol_version() {
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
-    drop(out);
+    let _ = out;
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
     assert!(matches!(cause, ProtocolError::UnsupportedProtocolOption));
 }

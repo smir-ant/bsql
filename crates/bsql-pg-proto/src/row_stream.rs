@@ -1367,7 +1367,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             Some(Action::IntermediateCommandComplete { .. }) => SlowPathFirst::Other,
             Some(Action::CopyDataChunk { .. }) => SlowPathFirst::Other,
         };
-        drop(actions);
+        let _ = actions;
         let is_terminal = matches!(
             first_class,
             SlowPathFirst::Delivered { .. }

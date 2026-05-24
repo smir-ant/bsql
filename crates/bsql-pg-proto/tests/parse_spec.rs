@@ -193,7 +193,7 @@ fn parse_error_is_recoverable() {
             "parse-error must not close socket: {a:?}",
         );
     }
-    drop(out);
+    let _ = out;
     // DEF-286 Φ-I.b: cause via slot.
     let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
     assert!(
@@ -351,7 +351,7 @@ fn parse_unexpected_frame_tears_down() {
     let actions = out.as_slice();
     let saw_fail = actions.iter().any(|a| matches!(a, Action::FailReply { .. }));
     let saw_close = actions.iter().any(|a| matches!(a, Action::CloseSocket));
-    drop(out);
+    let _ = out;
     let cause_match = proto.fail_cause().is_some_and(|c| matches!(c, ProtocolError::UnexpectedFrame { .. }));
     assert!(saw_fail && cause_match, "expected FailReply(UnexpectedFrame)");
     assert!(saw_close, "expected CloseSocket");
