@@ -38,27 +38,34 @@
 //!
 //! # Per-cycle lifecycle
 //!
-//! 1. `dispatch::install_errored` (or push-path equivalent like
-//!    `compute_push_*` error classification arm) calls
+//! 1. `dispatch::install_errored` calls
 //!    [`crate::dispatch::_install_errored_leaf::park_cause_at_install_errored`]
-//!    which delegates to [`Self::park_at_install_errored`]. State
-//!    transitions to `Errored`. Slot now holds `Some(Box<cause>)`.
+//!    which delegates to [`Self::park_at_install_errored`] only from
+//!    the `materialise` site. State transitions to `Errored`. Slot
+//!    now holds `Some(Box<cause>)`.
 //! 2. `Action::FailReply { id }` flows through the action surface; the
 //!    cause is NOT inline. Callers query via
 //!    [`crate::PgProtocol::fail_cause`].
-//! 3. Next Idle entry → [`Self::clear_at_residue`] empties the slot.
-//!    Errored entry does NOT clear — slot persists across Errored
-//!    cycle so callers can query post-fact via `<ClosedPhase>` API
-//!    OR re-query in the next feed_bytes call's iteration.
+//! 3. Cleanup: the slot is NEVER cleared by a transition handler.
+//!    State Errored is terminal in `<ActivePhase>` (no Errored→Idle
+//!    path exists); the slot's Drop chain (Option<Box<ProtocolError>>'s
+//!    niche-packed pointer → Box::drop on Some) runs at wrapper Drop
+//!    or at `into_closed_if_errored` when ActiveExtras drops.
+//!
+//! DEF-286 Φ-Final perf-recovery: the prior `clear_at_residue` site
+//! on the Idle arm of `clear_session_residue_for_class_dispatch` was
+//! provably dead (state cannot reach Idle once Errored), so it was
+//! removed alongside the slot's `clear_at_residue` method. This
+//! shrinks the dispatch ABI by one argument, eliminating one stack
+//! push per `push_command`/`feed_bytes` entry on ARM64 (13th arg
+//! spilled past x0-x7).
 //!
 //! # `ConnectionAlreadyClosed` semantic
 //!
-//! Pushing a command on an already-Errored protocol re-runs the
-//! "park new cause" path with cause = `ConnectionAlreadyClosed`. The
-//! prior cause is overwritten. Tier-3 ergonomic: callers query
-//! `fail_cause` IMMEDIATELY on the first FailReply event; deferring
-//! query past a subsequent push loses the original cause. Documented
-//! contract — see push-path docs.
+//! Pushing a command on an already-Errored protocol returns
+//! `PushFailure` via the push path's open-coded materialiser (not via
+//! this slot — the push path never parks). The slot only sees writes
+//! from feed_bytes paths via `materialise`.
 //!
 //! # `repr(transparent)` over `Option<Box<ProtocolError>>`
 //!
@@ -147,21 +154,17 @@ impl FailCauseSlotCell {
         self.inner = Some(cause);
     }
 
-    /// Clear the slot at residue-cleanup transition. Token-gated to
-    /// [`crate::protocol::_clear_residue_leaf::ClearResidueFailCauseToken`].
-    ///
-    /// **Cleared only at Idle** entry — Errored entry does NOT clear
-    /// because the slot's whole purpose is to persist the cause for
-    /// caller queries until the next legitimate query cycle. The
-    /// `clear_session_residue_for_class_dispatch` helper's Errored
-    /// arm intentionally skips this clear.
-    #[inline]
-    pub(crate) fn clear_at_residue(
-        &mut self,
-        _token: crate::protocol::_clear_residue_leaf::ClearResidueFailCauseToken,
-    ) {
-        self.inner = None;
-    }
+    // DEF-286 Φ-Final perf-recovery: no `clear_at_residue` method.
+    // The slot is empty by construction whenever its containing
+    // ActiveExtras / ConnectingInner sits in a state where the
+    // dispatch's Idle arm could fire (proven: `<ActivePhase>` Idle
+    // ⇒ slot empty; `<ConnectingPhase>` Idle is unreachable post-
+    // handshake — Connecting transitions to HandshakeReady, then
+    // into_active drops to ActiveExtras with a fresh empty slot).
+    // The slot's Drop chain (Option<Box<ProtocolError>>'s niche-
+    // packed pointer → Box::drop on Some) is the sole cleanup path,
+    // invoked at wrapper Drop or at into_closed_if_errored when
+    // ActiveExtras drops. A residue-clear method would be dead code.
 }
 
 // ─── Drift pins ────────────────────────────────────────────────────

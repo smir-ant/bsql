@@ -1451,18 +1451,15 @@ pub(crate) mod _clear_residue_leaf {
     /// [`crate::tx_status_slot::TxStatusSlotCell`] can name it.
     pub(crate) struct ClearResidueTxStatusToken(());
 
-    /// Leaf-scope token for the fail_cause slot clear at Idle residue
-    /// transitions. DEF-286 Φ-I.b — mirror of the other residue
-    /// tokens. Type `pub(crate)` so
-    /// [`crate::fail_cause_slot::FailCauseSlotCell`] can name it in its
-    /// `clear_at_residue` parameter signature.
-    ///
-    /// **Idle-only semantics**: unlike the other residue tokens,
-    /// fail_cause is cleared only on Idle entry, NOT on Errored entry.
-    /// The slot's whole purpose is to persist the cause for caller
-    /// queries past the action emission; clearing on Errored would
-    /// erase it before callers got a chance to read.
-    pub(crate) struct ClearResidueFailCauseToken(());
+    // DEF-286 Φ-Final perf-recovery: `ClearResidueFailCauseToken` and
+    // `clear_fail_cause_slot_residue` (sister to the other slot
+    // residue-clear helpers) are intentionally absent. The fail_cause
+    // slot is never cleared by the dispatch path — it is empty by
+    // construction whenever the dispatch enters its Idle arm (see
+    // `clear_session_residue_for_class_dispatch` docstring + the
+    // `into_active` slot-initialisation note). The slot's Drop is the
+    // sole cleanup path; happens when ActiveExtras drops at
+    // `into_closed_if_errored` or at wrapper Drop.
 
     /// Clear the schema slot via
     /// [`crate::schema_slot::RowDescSlotCell::clear_at_residue`] with
@@ -1545,21 +1542,10 @@ pub(crate) mod _clear_residue_leaf {
         slot.clear_at_residue(ClearResidueTxStatusToken(()));
     }
 
-    /// Clear the fail_cause slot via
-    /// [`crate::fail_cause_slot::FailCauseSlotCell::clear_at_residue`]
-    /// with the [`ClearResidueFailCauseToken`] minted inline. DEF-286
-    /// Φ-I.b — mirror of [`clear_command_tag_slot_residue`] shape, but
-    /// called ONLY from the Idle arm of
-    /// `clear_session_residue_for_class_dispatch` (Errored arm
-    /// intentionally skips — slot persists until next legitimate Idle
-    /// cycle so callers can query `pg.fail_cause()` after the
-    /// FailReply event).
-    #[inline]
-    pub(in crate::protocol) fn clear_fail_cause_slot_residue(
-        slot: &mut crate::fail_cause_slot::FailCauseSlotCell,
-    ) {
-        slot.clear_at_residue(ClearResidueFailCauseToken(()));
-    }
+    // DEF-286 Φ-Final perf-recovery: `clear_fail_cause_slot_residue`
+    // helper deleted — the dispatch never calls it (slot empty by
+    // construction; see the omitted-token comment near
+    // `ClearResidueTxStatusToken` above).
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -2527,6 +2513,20 @@ impl PgProtocol<ConnectingPhase> {
                 malformed_frame_count,
                 sync_marker: _,
             } = self.inner;
+            // DEF-286 Φ-Final perf-recovery: explicitly drop the
+            // Connecting-phase `fail_cause`. The slot is normally
+            // None on the HandshakeReady success path; forwarding it
+            // into ActiveExtras (prior Φ-I.b design) was the lone
+            // construction site of a non-empty `<ActivePhase>::Idle`
+            // fail_cause slot. Dropping at the phase boundary
+            // establishes the invariant "`<ActivePhase>` Idle state
+            // → `fail_cause` slot empty" by-construction, which lets
+            // the push hot path skip a 4-instruction clear at every
+            // call (asm-diff confirmed). Callers wanting to inspect a
+            // failed-handshake cause query `pg.fail_cause()` BEFORE
+            // calling `into_active` (the `<ConnectingPhase>` accessor
+            // is the canonical query site).
+            drop(fail_cause);
             // `if let` guarded the variant; the destructure here is
             // architecturally infallible. Use a `let-else` form to
             // keep the match exhaustive without panic/unwrap (clippy
@@ -2549,17 +2549,16 @@ impl PgProtocol<ConnectingPhase> {
                     phase_marker: PhantomData,
                 }));
             };
-            // DEF-286 Φ-I.b: forward the parked handshake-phase
-            // `fail_cause` from `ConnectingInner` into `ActiveExtras`.
-            // A `HandshakeReady` arrival means the handshake succeeded,
-            // so the slot is normally `None` here — but a previous
-            // failed `into_active` attempt could have parked something;
-            // forwarding rather than dropping keeps the semantics
-            // honest (callers querying `pg.fail_cause()` immediately
-            // post-`into_active` see the same value that was visible
-            // pre-transition).
-            let mut extras = _proto_init_leaf::fresh_active_extras();
-            extras.fail_cause = fail_cause;
+            // ActiveExtras initialised with empty `fail_cause`
+            // (the explicit drop above is the invariant-establishing
+            // step). `fresh_active_extras()` constructs `fail_cause`
+            // as `FailCauseSlotCell::empty(token)` — the slot starts
+            // empty in `<ActivePhase>` and stays empty until a
+            // feed-bytes path with `materialise(...) → install_errored`
+            // parks a cause (which simultaneously transitions state
+            // to `Errored`; state can never go Errored → Idle, so the
+            // slot remains empty whenever state is Idle).
+            let extras = _proto_init_leaf::fresh_active_extras();
             return Ok(PgProtocol {
                 inner: ActiveInner {
                     state: crate::state::ActiveState::Idle,
@@ -4119,14 +4118,20 @@ impl PgProtocol<ActivePhase> {
               Each parameter is a distinct mutable view into \
               PgProtocol storage; the count grew from 7 to 8 to \
               mirror the slot-pattern. Bundling would defeat the \
-              destructured-borrows discipline of the call site."
+              destructured-borrows discipline of the call site. \
+              DEF-286 Φ-Final perf-recovery: `fail_cause_slot` is \
+              NOT a parameter — the `<ActivePhase>::Idle` invariant \
+              (slot empty by-construction; see `into_active` and \
+              dispatch's Errored-is-terminal contract) makes the \
+              clear provably dead. Skipping the arg saves one stack \
+              push on every push_command and feed_bytes (ARM64 13th \
+              arg spills past x0-x7)."
 )]
 pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
     row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
     param_oids_slot: &mut crate::param_oids_slot::ParamOidsSlotCell,
     command_tag_slot: &mut crate::command_tag_slot::CommandTagSlotCell,
     tx_status_slot: &mut crate::tx_status_slot::TxStatusSlotCell,
-    fail_cause_slot: &mut crate::fail_cause_slot::FailCauseSlotCell,
     session_params: &mut crate::session_params_slot::SessionParamsCell,
     error_arena: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
     notifications_arena: &mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
@@ -4153,13 +4158,32 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
             // boundaries. Single-byte reset; conn-start-default
             // matches PG's actual idle state.
             _clear_residue_leaf::clear_tx_status_slot_residue(tx_status_slot);
-            // DEF-286 Φ-I.b: clear fail_cause slot at Idle boundaries
-            // ONLY. The next push reaches Idle iff the prior FailReply
-            // event was consumed by the caller (drop the Box). Errored
-            // arm below intentionally SKIPS this clear — the slot
-            // persists across the Errored cycle so callers can query
-            // `pg.fail_cause()` post-FailReply.
-            _clear_residue_leaf::clear_fail_cause_slot_residue(fail_cause_slot);
+            // DEF-286 Φ-Final perf-recovery: NO `fail_cause` clear
+            // on the Idle arm. The slot is empty by-construction
+            // whenever state is Idle (proof):
+            //   1. `<ActivePhase>` is reachable only via
+            //      `into_active`, which initialises ActiveExtras
+            //      with `FailCauseSlotCell::empty(token)`.
+            //   2. The push hot path never parks (the open-coded
+            //      materialiser in `push_command_internal` converts
+            //      `StagedAction::FailReply` directly into
+            //      `PushFailure { id, cause: Box::new(cause) }` and
+            //      transitions state to Errored without touching the
+            //      slot).
+            //   3. The feed_bytes hot path parks via `materialise`,
+            //      which simultaneously transitions state to Errored
+            //      (the `(state, install_errored, materialise)`
+            //      triple is atomic per dispatch outcome).
+            //   4. State Errored → Idle is structurally impossible
+            //      (Errored is terminal in `<ActivePhase>`; the only
+            //      exit is `into_closed_if_errored` to `<ClosedPhase>`).
+            // Therefore whenever this Idle arm runs, the slot is
+            // None. The prior Φ-I.b `clear_fail_cause_slot_residue`
+            // call was provably dead; removing it eliminates ~3-4
+            // instructions per push and (more impactfully) drops the
+            // `fail_cause_slot: &mut` parameter from this function's
+            // ABI — saving one stack push per call (12 → 11 args,
+            // ARM64 9th+ args spill past x0-x7).
             if let Some(arena) = error_arena.as_deref_mut() {
                 arena.clear();
             }
@@ -4311,12 +4335,17 @@ where
     // amortises one classification across the full feed_bytes
     // dispatch loop.
     let entry_class = state.push_class();
+    // DEF-286 Φ-Final perf-recovery: `fail_cause_slot` is no longer
+    // an argument here — the Idle-arm clear was provably dead (see
+    // `clear_session_residue_for_class_dispatch` docstring). The
+    // local binding is still needed for `materialise_fn` (the park
+    // site). Dropping the arg saves one stack push per feed_bytes
+    // entry (ARM64 13th arg spilled past x0-x7).
     clear_session_residue_for_class_dispatch(
         terminal_row_desc,
         terminal_param_oids,
         terminal_command_tag,
         terminal_tx_status,
-        fail_cause_slot,
         session_params_slot,
         error_arena_slot,
         notifications_arena_slot,
@@ -5788,12 +5817,17 @@ impl ActiveInner {
         extras: &mut ActiveExtras,
         class: crate::state::StatePushClass,
     ) {
+        // DEF-286 Φ-Final perf-recovery: `extras.fail_cause` is NOT
+        // passed — the clear is provably dead in the Idle arm (see
+        // dispatch fn docstring + `into_active` invariant note) and
+        // the Errored arm never clears it. The 12-arg → 11-arg ABI
+        // shrink eliminates one stack push at the push hot path,
+        // restoring Phase E call-site shape.
         clear_session_residue_for_class_dispatch(
             &mut extras.row_desc,
             &mut extras.param_oids,
             &mut extras.command_tag,
             &mut extras.tx_status,
-            &mut extras.fail_cause,
             &mut self.session_params,
             &mut self.error_arena,
             &mut self.notifications_arena,
