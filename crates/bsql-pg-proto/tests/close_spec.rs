@@ -227,7 +227,7 @@ fn close_statement_errored_path_recovers_via_rfq() {
     let out = proto.feed_bytes(&error_response_frame(), &mut wb);
     let mut failed = false;
     for action in out.as_slice() {
-        if let Action::FailReply { id, cause: _ } = action {
+        if let Action::FailReply { id } = action {
             assert_eq!(*id, raw_reply_id);
             failed = true;
         }

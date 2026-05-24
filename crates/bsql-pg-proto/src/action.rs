@@ -17,7 +17,7 @@
 //! (each entry-point call clears the buffer at entry).
 //!
 //! The borrow-checker enforces the "consume before next call"
-//! invariant at compile time: [`OutActions<'w, 'r>`] holds two
+//! invariant at compile time: [`OutActions<'w>`] holds two
 //! distinct borrows — `'w` ties [`Action::SendBytes`] back to the
 //! caller's [`crate::write_buf::WriteBuf`] (`&mut WriteBuf` is
 //! rejected while any `Action<'w, _>` is alive), and `'r` ties row-
@@ -500,7 +500,7 @@ mod range_newtype_tests {
 /// of proto still live at the `proto.state()` call).
 ///
 /// `ManuallyDrop<T>` inhibits the inner Drop unconditionally.
-/// Since `Action<'w, 'r>` is `Copy` (POD refs + small payloads),
+/// Since `Action<'w>` is `Copy` (POD refs + small payloads),
 /// the inner Drop body is trivial anyway — skipping it is sound.
 ///
 /// ## Win
@@ -537,7 +537,7 @@ mod range_newtype_tests {
 ///   distinct borrow sources visible in every signature, instead of
 ///   collapsing them into one opaque lifetime that requires reading
 ///   doc-prose to disambiguate.
-/// - **Push-path expressivity**: `OutActions<'w, 'static>` returned
+/// - **Push-path expressivity**: `OutActions<'w>` returned
 ///   from [`crate::PgProtocol::push_command_internal`] (16 sites)
 ///   states *at the type level* that the outbound batch carries no
 ///   arena-borrowed Reply variants — only the WriteBuf borrow
@@ -549,22 +549,22 @@ mod range_newtype_tests {
 /// signatures are preferred over signatures that depend on
 /// prose-doc explanation.
 #[derive(Debug)]
-pub struct OutActions<'w, 'r> {
+pub struct OutActions<'w> {
     /// ManuallyDrop-wrapped heapless vec. `ManuallyDrop` makes the
     /// wrapper Drop-free regardless of inner type, preserving
     /// pre-(184) NLL last-use borrow-release semantics.
     items: core::mem::ManuallyDrop<
-        heapless::Vec<Action<'w, 'r>, MAX_ACTIONS_PER_CALL>,
+        heapless::Vec<Action<'w>, MAX_ACTIONS_PER_CALL>,
     >,
 }
 
-impl Default for OutActions<'_, '_> {
+impl Default for OutActions<'_> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'w, 'r> OutActions<'w, 'r> {
+impl<'w> OutActions<'w> {
     /// Construct an empty `OutActions`.
     ///
     /// Backed by `ManuallyDrop::new(heapless::Vec::new())` — zero
@@ -595,28 +595,28 @@ impl<'w, 'r> OutActions<'w, 'r> {
 
     /// Borrow the populated prefix as a slice.
     #[inline]
-    pub fn as_slice(&self) -> &[Action<'w, 'r>] {
+    pub fn as_slice(&self) -> &[Action<'w>] {
         self.items.as_slice()
     }
 
     /// Return the first populated action (or `None` if empty).
     /// Convenience for test assertions.
     #[inline]
-    pub fn first(&self) -> Option<&Action<'w, 'r>> {
+    pub fn first(&self) -> Option<&Action<'w>> {
         self.items.first()
     }
 
     /// Push an action. Returns `Err(action)` (mirrors heapless's
     /// convention) if the container is full.
     #[inline]
-    pub fn push(&mut self, action: Action<'w, 'r>) -> Result<(), Action<'w, 'r>> {
+    pub fn push(&mut self, action: Action<'w>) -> Result<(), Action<'w>> {
         self.items.push(action)
     }
 }
 
-impl<'w, 'r> IntoIterator for OutActions<'w, 'r> {
-    type Item = Action<'w, 'r>;
-    type IntoIter = <heapless::Vec<Action<'w, 'r>, MAX_ACTIONS_PER_CALL> as IntoIterator>::IntoIter;
+impl<'w> IntoIterator for OutActions<'w> {
+    type Item = Action<'w>;
+    type IntoIter = <heapless::Vec<Action<'w>, MAX_ACTIONS_PER_CALL> as IntoIterator>::IntoIter;
     fn into_iter(self) -> Self::IntoIter {
         // Unwrap ManuallyDrop to move inner vec; since `Action`
         // is Copy the inner vec's Drop is a no-op anyway. This is
@@ -627,9 +627,9 @@ impl<'w, 'r> IntoIterator for OutActions<'w, 'r> {
 }
 
 /// By-reference iteration — `for action in &out` yields `&Action`.
-impl<'a, 'w, 'r> IntoIterator for &'a OutActions<'w, 'r> {
-    type Item = &'a Action<'w, 'r>;
-    type IntoIter = core::slice::Iter<'a, Action<'w, 'r>>;
+impl<'a, 'w> IntoIterator for &'a OutActions<'w> {
+    type Item = &'a Action<'w>;
+    type IntoIter = core::slice::Iter<'a, Action<'w>>;
     fn into_iter(self) -> Self::IntoIter {
         self.items.iter()
     }
@@ -757,7 +757,7 @@ pub(crate) type StagedActions<'sql> = heapless::Vec<StagedAction<'sql>, { crate:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "an Action carries a side-effect that must be executed"]
-pub enum Action<'w, 'r> {
+pub enum Action<'w> {
     /// Send these bytes verbatim to the server.
     ///
     /// The slice references the caller-owned [`crate::write_buf::WriteBuf`]
@@ -767,7 +767,7 @@ pub enum Action<'w, 'r> {
     /// out of the protocol. Zero-copy.
     ///
     /// The `'w` lifetime ensures the slice is valid for exactly
-    /// as long as the owning `OutActions<'w, '_>` is alive — the
+    /// as long as the owning `OutActions<'w>` is alive — the
     /// next `&mut WriteBuf` call is blocked by the borrow checker
     /// until the caller drops `OutActions`.
     SendBytes(&'w [u8]),
@@ -790,21 +790,40 @@ pub enum Action<'w, 'r> {
         id: NonZeroU64,
         /// The typed payload.
         ///
-        /// `Reply<'r>` borrows schema data from the arena via the
-        /// `'r` lifetime (same as `StreamRow::row_bytes`).
-        value: Reply<'r>,
+        /// DEF-286 Φ-F*: `Reply` is lifetime-free post-payload
+        /// externalisation; the `'r` parameter on the enclosing
+        /// `Action<'w>` is preserved for `current_*` accessor
+        /// borrows via `OutActions`. The `value` itself carries no
+        /// borrowed data.
+        value: Reply,
     },
 
     /// Deliver a failure to the wrapper.
     ///
-    /// Same routing as `DeliverReply`; the wrapper translates `cause`
-    /// into its public error type.
+    /// Same routing as `DeliverReply`; the wrapper resolves the
+    /// failure cause via
+    /// [`crate::PgProtocol::fail_cause`] AFTER consuming this action.
+    ///
+    /// DEF-286 Φ-I.b: cause externalised into
+    /// [`crate::fail_cause_slot::FailCauseSlotCell`] living on
+    /// `<ActivePhase>::Extras` (and `<ConnectingPhase>::Inner` for
+    /// handshake-phase fails). The inline `cause: ProtocolError`
+    /// (24 B) was the dominator on `FailReply`'s 32-B variant body;
+    /// externalising collapses `FailReply` body to 8 B (id only) and
+    /// drops `Action`'s outer size 40 → 24 B (-40%).
+    ///
+    /// # Caller contract
+    ///
+    /// Query `pg.fail_cause()` IMMEDIATELY on observing this action.
+    /// A subsequent `install_errored` (e.g. `ConnectionAlreadyClosed`
+    /// raised when the caller pushes on an already-Errored protocol)
+    /// overwrites the slot via latest-wins semantics. Deferring the
+    /// query past a subsequent push loses the original cause.
     FailReply {
         /// The correlator the user originally supplied with their
-        /// command.
+        /// command. Query the cause via
+        /// [`crate::PgProtocol::fail_cause`].
         id: NonZeroU64,
-        /// Why the protocol failed the in-flight command.
-        cause: ProtocolError,
     },
 
     /// The socket is no longer safe to use; close it.
@@ -884,7 +903,7 @@ pub enum Action<'w, 'r> {
 /// One-event-per-call feed signal.
 ///
 /// Per-call return type alternative to the batched
-/// `OutActions<'w, 'r>` — used by
+/// `OutActions<'w>` — used by
 /// [`crate::PgProtocol::advance_one_frame`] to drive the protocol
 /// in single-event steps. Forward-compat anchor for pipelining
 /// work (where multiple in-flight replies may resolve in one call
@@ -923,7 +942,7 @@ pub enum Action<'w, 'r> {
 ///
 /// # Lifetime contract
 ///
-/// Two lifetimes (mirror of [`OutActions<'w, 'r>`]):
+/// Two lifetimes (mirror of [`OutActions<'w>`]):
 ///
 /// - `'wb` for [`Self::SendBytes`] which borrows the caller's
 ///   [`crate::write_buf::WriteBuf`]. Collapsing to a single
@@ -937,7 +956,7 @@ pub enum Action<'w, 'r> {
 ///
 /// # Size pin
 ///
-/// `size_of::<FeedEvent<'static, 'static>>() == 88` exact: max
+/// `size_of::<FeedEvent<'static>>() == 88` exact: max
 /// variant is [`Self::Deliver`] = `NonZeroU64` (8 B) +
 /// `Reply<'r>` (80 B) = 88 B; discriminant niche-optimised via
 /// the payload's `NonZero` niche where possible. The exact `==`
@@ -968,7 +987,7 @@ pub enum Action<'w, 'r> {
 #[must_use = "FeedEvent variants carry side-effect contracts: \
               SendBytes/Deliver MUST be processed; Fail/Close MUST \
               trigger socket teardown"]
-pub enum FeedEvent<'wb, 'r> {
+pub enum FeedEvent<'wb> {
     /// State is `Idle` and read_buf is empty — no work, caller can push.
     Idle,
     /// Partial frame buffered (or empty buffer non-Idle). Need more
@@ -982,11 +1001,25 @@ pub enum FeedEvent<'wb, 'r> {
     SendBytes(&'wb [u8]),
     /// Terminal reply for an in-flight command. Route via `id` to the
     /// user's `oneshot::Sender` and forward `value`.
-    Deliver(NonZeroU64, Reply<'r>),
+    ///
+    /// DEF-286 Φ-F*: `Reply` is lifetime-free post-payload
+    /// externalisation. The `'r` parameter on the enclosing
+    /// `FeedEvent<'wb>` is preserved structurally for backward
+    /// compatibility with callers that bind `'r`; the `value` itself
+    /// carries no borrowed data.
+    Deliver(NonZeroU64, Reply),
     /// Fatal failure for an in-flight command. **Implies socket close**
-    /// (M2). Caller resolves user's oneshot via `(id, cause)` AND
-    /// closes the socket. State is `Errored` post-event.
-    Fail(NonZeroU64, ProtocolError),
+    /// (M2). Caller resolves user's oneshot via `id` (cause queried
+    /// separately via [`crate::PgProtocol::fail_cause`]) AND closes
+    /// the socket. State is `Errored` post-event.
+    ///
+    /// DEF-286 Φ-I.b: cause externalised into the per-phase
+    /// `fail_cause_slot`. Caller contract: query
+    /// `pg.fail_cause()` IMMEDIATELY on observing this event — the
+    /// slot holds latest-wins semantics, so a subsequent
+    /// `install_errored` (e.g. `ConnectionAlreadyClosed` raised when
+    /// the caller pushes on an already-Errored protocol) overwrites.
+    Fail(NonZeroU64),
     /// State→Errored without in-flight reply. Caller closes the socket.
     Close,
 }
@@ -1000,7 +1033,7 @@ pub enum FeedEvent<'wb, 'r> {
 /// (caller drains via `wb.as_bytes()`); failure signals come back
 /// via `Result::Err(PushFailure)` — an ~80 B per-call return frame.
 ///
-/// A naive shape returning the full `OutActions<'w, 'a>`
+/// A naive shape returning the full `OutActions<'w>`
 /// (`ManuallyDrop<heapless::Vec<Action, 9>>`, ~800 B per call)
 /// would force callers to iterate the action list to drive the I/O
 /// layer:
@@ -1239,7 +1272,7 @@ pub(crate) enum StagedAction<'sql> {
     /// queries.
     ///
     /// Caller responsibility: SQL must outlive the materialised
-    /// `Action<'w, 'r>` (lifetime checked by the unified `'w` in
+    /// `Action<'w>` (lifetime checked by the unified `'w` in
     /// `materialise` / `materialise_push`). For SQL containing
     /// secrets (e.g. passwords in `UPDATE` clauses), caller holds
     /// the SQL in `Zeroizing<String>` — zeroize-on-drop happens at
@@ -1252,10 +1285,19 @@ pub(crate) enum StagedAction<'sql> {
     /// [`crate::reply_id::ReplyKind::Payload`].
     DeliverReply(DeliverReplyEntry),
     /// Map to [`Action::FailReply`].
+    ///
+    /// DEF-286 Φ-I.b: staged retains `cause` inline; materialise
+    /// PARKS the cause into the fail_cause_slot and emits the
+    /// tag+id-only public `Action::FailReply`. Internal-only carrier
+    /// — keeping cause inline here avoids threading `fail_cause_slot`
+    /// through every `compute_push_*` signature (~16 sites).
     FailReply {
         /// Raw correlator (post-consume of the `ReplyId`).
         id: NonZeroU64,
-        /// Why the protocol failed.
+        /// Why the protocol failed. Parked into
+        /// `<ActivePhase>::Extras.fail_cause` /
+        /// `ConnectingInner.fail_cause` at materialise time; the
+        /// public [`Action::FailReply`] strips this field.
         cause: ProtocolError,
     },
     /// Map to [`Action::CloseSocket`].
@@ -1340,7 +1382,7 @@ pub enum StagedReply {
     #[doc(hidden)] DescribePortalComplete(StagedDescribePortalCompletePayload),
 }
 
-/// Lifetime-free staged counterpart to [`QueryCompletePayload<'r>`].
+/// Lifetime-free staged counterpart to [`QueryCompletePayload`].
 ///
 /// # Single source of truth for schema presence
 ///
@@ -1400,7 +1442,7 @@ pub enum StagedQueryCompletePayload {
 }
 
 /// Lifetime-free staged counterpart to
-/// [`DescribeStatementCompletePayload<'r>`].
+/// [`DescribeStatementCompletePayload`].
 ///
 /// # Single source of truth for schema presence
 ///
@@ -1421,7 +1463,7 @@ pub enum StagedQueryCompletePayload {
 pub struct StagedDescribeStatementCompletePayload;
 
 /// Lifetime-free staged counterpart to
-/// [`DescribePortalCompletePayload<'r>`].
+/// [`DescribePortalCompletePayload`].
 ///
 /// See [`StagedDescribeStatementCompletePayload`] for the
 /// single-source-of-truth rationale on schema presence. DEF-286 Φ-E:
@@ -1497,63 +1539,43 @@ impl StagedReply {
     /// flag, no atomic-pair discipline, no drift surface. A naive
     /// shape carrying handles + arena would require a
     /// `StaleSchemaRef` classified-error path.
+    /// DEF-286 Φ-F*: all payload fields externalised to slots on
+    /// `PgProtocol::Extras`. Materialise no longer needs the slot
+    /// args — payloads are unit ZSTs and `Reply` is lifetime-free.
+    /// The actual data is queried via the `current_*` accessors on
+    /// `OutActions<'_>` / `PgProtocol<ActivePhase>`.
     #[inline]
-    pub(crate) fn into_public<'r>(
-        self,
-        row_desc_slot: Option<&'r crate::decode::RowDesc>,
-        param_oids_slot: Option<&'r ParamOids>,
-        command_tag_slot: Option<&'r crate::command_tag::CommandTag>,
-    ) -> Reply<'r> {
+    pub(crate) fn into_public(self) -> Reply {
         match self {
             Self::Pong(p) => Reply::Pong(p),
             Self::StartupComplete(p) => Reply::StartupComplete(p),
             Self::QueryComplete(staged) => {
-                // The slot is the single source of truth for schema
-                // presence. `Some` ⇒ project to RowDescBorrow
-                // (SELECT path); `None` ⇒ no schema (DML /
-                // empty-query path). No bool flag to keep in sync;
-                // the slot equals itself by identity.
-                //
                 // Staged variant discriminates between the two
                 // terminal frames: `Completed` (CommandComplete + RFQ)
                 // → `Reply::QueryComplete`, `Suspended` (PortalSuspended
                 // + RFQ) → `Reply::QuerySuspended`. The discrimination
                 // is set at staging time by the dispatch arm that
-                // observed the terminal frame; materialise just reads.
-                let row_desc = row_desc_slot.map(crate::decode::RowDescBorrow::from_ref);
+                // observed the terminal frame.
+                //
+                // DEF-286 Φ-F*: `command_tag` / `row_desc` fields
+                // externalised; payloads are now unit-shape lifetime
+                // markers.
                 match staged {
                     StagedQueryCompletePayload::Completed => {
-                        Reply::QueryComplete(QueryCompletePayload {
-                            // DEF-286 Φ3: command_tag borrowed from
-                            // slot. Defensive: slot empty would be a
-                            // slot-cycle violation (architecturally
-                            // unreachable from a Z arm in
-                            // AwaitingRfq); map to static EMPTY
-                            // sentinel — tier-3 classifier, no panic.
-                            command_tag: command_tag_slot.unwrap_or(
-                                &crate::command_tag::CommandTag::EMPTY,
-                            ),
-                            // DEF-286 Φ-E: tx_status externalised
-                            // into the `<ActivePhase>::Extras.tx_status`
-                            // slot. Callers query via
-                            // `pg.terminal_tx_status()`.
-                            row_desc,
-                        })
+                        Reply::QueryComplete(QueryCompletePayload)
                     }
                     StagedQueryCompletePayload::Suspended => {
-                        Reply::QuerySuspended(QuerySuspendedPayload {
-                            row_desc,
-                        })
+                        Reply::QuerySuspended(QuerySuspendedPayload)
                     }
                 }
             }
             Self::ParseComplete(p) => Reply::ParseComplete(p),
             Self::CloseComplete(p) => Reply::CloseComplete(p),
             Self::DescribeStatementComplete(staged) => {
-                describe_statement_complete_into_public(staged, row_desc_slot, param_oids_slot)
+                describe_statement_complete_into_public(staged)
             }
             Self::DescribePortalComplete(staged) => {
-                describe_portal_complete_into_public(staged, row_desc_slot)
+                describe_portal_complete_into_public(staged)
             }
         }
     }
@@ -1575,50 +1597,33 @@ impl StagedReply {
 /// The Describe paths pay a function call but they are NOT the hot
 /// path — describe completion runs once per statement preparation,
 /// not per row or per push.
-#[inline(never)]
-fn describe_statement_complete_into_public<'r>(
-    staged: StagedDescribeStatementCompletePayload,
-    row_desc_slot: Option<&'r crate::decode::RowDesc>,
-    param_oids_slot: Option<&'r ParamOids>,
-) -> Reply<'r> {
-    let _staged = staged; // pin moved binding for the unused payload
-    Reply::DescribeStatementComplete(DescribeStatementCompletePayload {
-        // DEF-286 Φ1: `param_oids` borrowed from
-        // `<ActivePhase>::Extras.param_oids` slot (parked at the
-        // `'t'` arm). Slot's `as_ref()` projects to
-        // `Option<&'r ParamOids>`. The architecturally-dead `None`
-        // arm (slot empty at terminal RFQ would be a slot-cycle
-        // violation) defensively maps to a static EMPTY view —
-        // tier-3 classifier with no panic surface; the public
-        // contract guarantees `param_oids` is meaningful only after
-        // a successful `'t' → 'Z'` cycle, which is the only path
-        // that reaches this materialise site.
-        param_oids: param_oids_slot.unwrap_or(&ParamOids::EMPTY),
-        rows: describe_rows_from_slot(row_desc_slot),
-        // DEF-286 Φ-E: tx_status externalised; callers query via
-        // `pg.terminal_tx_status()`.
-    })
+/// DEF-286 Φ-F*: payload externalisation collapsed this helper to
+/// a unit-construction. All data fields moved to slots on
+/// `PgProtocol`; callers query via accessors. Kept as a 1-liner
+/// for symmetry with `describe_portal_complete_into_public`.
+#[inline]
+fn describe_statement_complete_into_public(
+    _staged: StagedDescribeStatementCompletePayload,
+) -> Reply {
+    Reply::DescribeStatementComplete(DescribeStatementCompletePayload)
 }
 
 /// See [`describe_statement_complete_into_public`] for rationale.
-#[inline(never)]
-fn describe_portal_complete_into_public<'r>(
-    staged: StagedDescribePortalCompletePayload,
-    row_desc_slot: Option<&'r crate::decode::RowDesc>,
-) -> Reply<'r> {
-    let _staged = staged; // pin moved binding for the unused payload
-    Reply::DescribePortalComplete(DescribePortalCompletePayload {
-        rows: describe_rows_from_slot(row_desc_slot),
-        // DEF-286 Φ-E: tx_status externalised; callers query via
-        // `pg.terminal_tx_status()`.
-    })
+#[inline]
+fn describe_portal_complete_into_public(
+    _staged: StagedDescribePortalCompletePayload,
+) -> Reply {
+    Reply::DescribePortalComplete(DescribePortalCompletePayload)
 }
 
-/// Shared slot-projection helper for the two Describe materialise
-/// arms. Inlined into the `#[inline(never)]` Describe wrappers so
-/// the projection cost stays at one site each.
+/// Shared slot-projection helper to construct `DescribedRows<'r>`
+/// from the parked schema slot. Used by the `OutActions` /
+/// `PgProtocol` `current_described_rows()` accessors. DEF-286 Φ-F*:
+/// the dispatch arms only park the slot on `T`-tag arrival; if the
+/// slot is `None` at query time, semantically that means a `NoData`
+/// frame was observed (the dispatch path skipped slot-park).
 #[inline]
-fn describe_rows_from_slot<'r>(
+pub(crate) fn describe_rows_from_slot<'r>(
     row_desc_slot: Option<&'r crate::decode::RowDesc>,
 ) -> DescribedRows<'r> {
     match row_desc_slot {
@@ -1779,16 +1784,37 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 /// - `Describe*Complete` — pre-Bind schema introspection.
 /// - `Pong` — keep-alive Ping; rare in tight loops.
 /// - `StartupComplete` — exactly once per connection.
+///
+/// DEF-286 Φ-F*: lifetime parameter DROPPED. All payload structs are
+/// now unit ZSTs; data fields (row_desc / param_oids / command_tag /
+/// tx_status) are externalised into per-phase slots on
+/// `PgProtocol::Extras`. Callers query via the `current_*` /
+/// `terminal_tx_status` / `fail_cause` accessors on
+/// `PgProtocol<ActivePhase>` (or the corresponding `OutActions::current_*`
+/// methods within the actions iteration borrow window).
+///
+/// Dropping the `'r` lifetime is a BREAKING API change but enables
+/// the cascade: `Reply` is now lifetime-free, `Action<'w>`
+/// keeps `'r` only for `current_*` accessor borrows on `OutActions`,
+/// and the public action surface shrinks to:
+///
+/// - `Reply` (16 B max — `StartupCompletePayload` carrying pid + secret_key
+///   + tx_status inline; ParseComplete / CloseComplete / Pong are 0 B
+///   carriers; QueryComplete / QuerySuspended / DescribeStatementComplete
+///   / DescribePortalComplete are 0 B carriers — schema/cmd_tag/param_oids
+///   queried via accessors).
+/// - `Action<'w>` (24 B max — DeliverReply { id: NonZeroU64,
+///   value: Reply } = 8 + 16 = 24).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Reply<'r> {
+pub enum Reply {
     /// A Query / BindExecute command completed. Delivered on the
     /// terminal `CommandComplete + ReadyForQuery` pair at the end
     /// of the result stream. Rows (if any) were emitted individually
     /// via `Action::StreamRow`. See [`QueryCompletePayload`].
     ///
     /// Ordered first — dominant variant in real workloads.
-    QueryComplete(QueryCompletePayload<'r>),
+    QueryComplete(QueryCompletePayload),
 
     /// A `BindExecute`-with-`FetchRows::Chunked(N)` paused at the
     /// row cap before exhausting the portal (PG §55.2.7
@@ -1804,7 +1830,7 @@ pub enum Reply<'r> {
     /// the same shape.
     ///
     /// [`QueryComplete`]: Self::QueryComplete
-    QuerySuspended(QuerySuspendedPayload<'r>),
+    QuerySuspended(QuerySuspendedPayload),
 
     /// A `Parse` command succeeded (server accepted the prepared
     /// statement). See [`ParseCompletePayload`].
@@ -1816,11 +1842,11 @@ pub enum Reply<'r> {
 
     /// A statement-level `Describe` (`'D' 'S' name`) completed. See
     /// [`DescribeStatementCompletePayload`].
-    DescribeStatementComplete(DescribeStatementCompletePayload<'r>),
+    DescribeStatementComplete(DescribeStatementCompletePayload),
 
     /// A portal-level `Describe` (`'D' 'P' name`) completed. See
     /// [`DescribePortalCompletePayload`].
-    DescribePortalComplete(DescribePortalCompletePayload<'r>),
+    DescribePortalComplete(DescribePortalCompletePayload),
 
     /// The server is alive and responsive. See [`PongPayload`].
     Pong(PongPayload),
@@ -1861,7 +1887,7 @@ pub enum Reply<'r> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PongPayload;
 
-impl<'r> From<PongPayload> for Reply<'r> {
+impl From<PongPayload> for Reply {
     #[inline]
     fn from(p: PongPayload) -> Self {
         Self::Pong(p)
@@ -1921,7 +1947,7 @@ impl core::fmt::Debug for StartupCompletePayload {
     }
 }
 
-impl<'r> From<StartupCompletePayload> for Reply<'r> {
+impl From<StartupCompletePayload> for Reply {
     #[inline]
     fn from(p: StartupCompletePayload) -> Self {
         Self::StartupComplete(p)
@@ -1935,41 +1961,34 @@ impl<'r> From<StartupCompletePayload> for Reply<'r> {
 /// tag PG returns (`"SELECT 5"`, `"INSERT 0 3"`, etc.) — typed
 /// `CommandTag` parsing is a planned follow-up.
 ///
-/// `row_desc` borrows from the protocol's parked terminal schema
-/// slot via the `'r` lifetime. `Some(&desc)` for SELECT (including
-/// 0-row), `None` for DML / empty-query. The schema stays valid
-/// for the lifetime of the owning `OutActions<'w, 'r>`; the next
-/// `&mut PgProtocol` call is blocked by the borrow checker until
-/// the caller drops the actions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QueryCompletePayload<'r> {
-    /// Typed command tag from `CommandComplete` body.
-    ///
-    /// DEF-286 Φ3: borrowed from
-    /// `<ActivePhase>::Extras.command_tag` slot (parked at the
-    /// `'C'` dispatch arm; cleared at next Idle/Errored residue).
-    /// `&'r` ties the borrow to the `feed_bytes` reply window —
-    /// consumer reads (or copies, `CommandTag: Copy`) before
-    /// pushing the next command.
-    ///
-    /// Pre-Φ3 was `BoundedStr<32>` (raw ASCII inline 36 B); now is
-    /// `&'r CommandTag` (8 B borrow into the typed enum). Consumers
-    /// can match on `CommandTag::Insert { rows }` etc. directly.
-    pub command_tag: &'r crate::command_tag::CommandTag,
-    /// Result-set schema, if any. `Some` for SELECT (including
-    /// 0-row SELECTs), `None` for DML / empty-query.
-    ///
-    /// Borrowed via [`crate::decode::RowDescBorrow`] from
-    /// `PgProtocol::row_desc_slot`. The borrow's `'r` lifetime
-    /// matches the owning `OutActions<'_, 'r>` — the next
-    /// `&mut PgProtocol` call is blocked while this borrow is live,
-    /// so the slot cannot be cleared underneath the user.
-    pub row_desc: Option<crate::decode::RowDescBorrow<'r>>,
-}
+/// DEF-286 Φ-F*: payload is now a unit-shape ZST. The `command_tag`
+/// field (formerly `&'r CommandTag`) and `row_desc` field (formerly
+/// `Option<RowDescBorrow<'r>>`) have been externalised to
+/// `<ActivePhase>::Extras.command_tag` /
+/// `<ActivePhase>::Extras.row_desc` slots, queried via
+/// [`crate::PgProtocol::current_command_tag`] /
+/// [`crate::PgProtocol::current_row_desc`] (or
+/// [`crate::action::OutActions::current_command_tag`] /
+/// [`OutActions::current_row_desc`] within the actions iteration
+/// borrow window).
+///
+/// The `'r` lifetime parameter has been DROPPED — the payload
+/// carries no `'r`-borrowed data; accessors live on the protocol
+/// surface and produce their own borrows.
+///
+/// # Why a payload struct at all (not a unit variant)
+///
+/// Preserving the struct wrapper keeps the `From<QueryCompletePayload> for Reply`
+/// bridge usable for `<K: ReplyKind>::Payload` projection and
+/// preserves the `Reply::QueryComplete(payload)` pattern shape
+/// callers already match on (just the destructure becomes `(_)`
+/// instead of `({ command_tag, row_desc })`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueryCompletePayload;
 
-impl<'r> From<QueryCompletePayload<'r>> for Reply<'r> {
+impl From<QueryCompletePayload> for Reply {
     #[inline]
-    fn from(p: QueryCompletePayload<'r>) -> Self {
+    fn from(p: QueryCompletePayload) -> Self {
         Self::QueryComplete(p)
     }
 }
@@ -1977,24 +1996,17 @@ impl<'r> From<QueryCompletePayload<'r>> for Reply<'r> {
 /// Typed payload for the `PortalSuspended` terminal of a
 /// `BindExecute`-with-`FetchRows::Chunked(N)` flow (PG §55.2.7).
 ///
-/// Mirrors [`QueryCompletePayload`]'s shape minus `command_tag`
-/// (server emits no `CommandComplete` on the suspended path —
-/// `PortalSuspended` is the terminal frame instead). The portal
-/// stays bound after this reply; caller resumes via
-/// [`crate::push_command::ExecutePortal`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QuerySuspendedPayload<'r> {
-    /// Result-set schema. Preserved from the original `Bind` —
-    /// the portal's bound schema applies to subsequent
-    /// `ExecutePortal` resumes too. `Some` for SELECT (including
-    /// 0-row SELECTs), `None` for DML / empty-query (though DML
-    /// with `Chunked(N)` is rare in practice).
-    pub row_desc: Option<crate::decode::RowDescBorrow<'r>>,
-}
+/// DEF-286 Φ-F*: `row_desc` field externalised. Query via
+/// [`crate::PgProtocol::current_row_desc`] /
+/// [`crate::action::OutActions::current_row_desc`]. The `'r`
+/// lifetime parameter has been DROPPED — payload is a unit ZST.
+/// See [`QueryCompletePayload`] for the externalisation rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QuerySuspendedPayload;
 
-impl<'r> From<QuerySuspendedPayload<'r>> for Reply<'r> {
+impl From<QuerySuspendedPayload> for Reply {
     #[inline]
-    fn from(p: QuerySuspendedPayload<'r>) -> Self {
+    fn from(p: QuerySuspendedPayload) -> Self {
         Self::QuerySuspended(p)
     }
 }
@@ -2008,7 +2020,7 @@ impl<'r> From<QuerySuspendedPayload<'r>> for Reply<'r> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ParseCompletePayload;
 
-impl<'r> From<ParseCompletePayload> for Reply<'r> {
+impl From<ParseCompletePayload> for Reply {
     #[inline]
     fn from(p: ParseCompletePayload) -> Self {
         Self::ParseComplete(p)
@@ -2021,7 +2033,7 @@ impl<'r> From<ParseCompletePayload> for Reply<'r> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CloseCompletePayload;
 
-impl<'r> From<CloseCompletePayload> for Reply<'r> {
+impl From<CloseCompletePayload> for Reply {
     #[inline]
     fn from(p: CloseCompletePayload) -> Self {
         Self::CloseComplete(p)
@@ -2085,7 +2097,7 @@ pub enum DescribedRows<'r> {
     /// produces result columns. The schema borrows from
     /// `PgProtocol::row_desc_slot` via the lifetime-bound
     /// [`crate::decode::RowDescBorrow`]; `'r` matches the containing
-    /// `Reply<'r>` / `Action<'_, 'r>` lifetime.
+    /// `Reply<'r>` / `Action<'_>` lifetime.
     Rows(crate::decode::RowDescBorrow<'r>),
     /// Server sent `NoData` (`'n'`) — the statement/portal has no
     /// result columns. DML without `RETURNING` is the common case.
@@ -2323,26 +2335,18 @@ impl Eq for ParamOids {}
 /// - `rows` — `Rows(..)` if a `RowDescription` arrived, `NoData` if a
 ///   `NoData` (`'n'`) arrived.
 /// - `tx_status` — from the final RFQ.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DescribeStatementCompletePayload<'r> {
-    /// Parameter OIDs, in positional order (`$1`, `$2`, …).
-    ///
-    /// DEF-286 Φ1: borrowed from
-    /// `<ActivePhase>::Extras.param_oids` slot (parked at the
-    /// `'t'` ParameterDescription dispatch arm; cleared at the
-    /// next Idle/Errored residue clear). The `&'r` lifetime ties
-    /// the borrow to the `feed_bytes` reply window — consumer
-    /// must read out (or `Clone`) before pushing the next command
-    /// (which clears the slot).
-    pub param_oids: &'r ParamOids,
-    /// Rows-or-no-data sum from the subsequent response frame.
-    /// `DescribedRows` holds a `&'r RowDesc` borrow.
-    pub rows: DescribedRows<'r>,
-}
+///
+/// DEF-286 Φ-F*: `param_oids` and `rows` fields externalised.
+/// Query via [`crate::PgProtocol::current_param_oids`] /
+/// [`crate::PgProtocol::current_described_rows`] (or the OutActions
+/// equivalents within the actions iteration borrow window). The
+/// `'r` lifetime parameter has been DROPPED — payload is a unit ZST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DescribeStatementCompletePayload;
 
-impl<'r> From<DescribeStatementCompletePayload<'r>> for Reply<'r> {
+impl From<DescribeStatementCompletePayload> for Reply {
     #[inline]
-    fn from(p: DescribeStatementCompletePayload<'r>) -> Self {
+    fn from(p: DescribeStatementCompletePayload) -> Self {
         Self::DescribeStatementComplete(p)
     }
 }
@@ -2359,16 +2363,17 @@ impl<'r> From<DescribeStatementCompletePayload<'r>> for Reply<'r> {
 /// No `param_oids` field: portals are bound-state handles; their
 /// parameter values were fixed at Bind time, so PG does not replay
 /// a `ParameterDescription` frame for a portal-Describe per PG §55.2.2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DescribePortalCompletePayload<'r> {
-    /// Rows-or-no-data sum from the response frame.
-    /// `DescribedRows` holds a `&'r RowDesc` borrow.
-    pub rows: DescribedRows<'r>,
-}
+///
+/// DEF-286 Φ-F*: `rows` field externalised. Query via
+/// [`crate::PgProtocol::current_described_rows`] /
+/// [`crate::action::OutActions::current_described_rows`]. The
+/// `'r` lifetime parameter has been DROPPED — payload is a unit ZST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DescribePortalCompletePayload;
 
-impl<'r> From<DescribePortalCompletePayload<'r>> for Reply<'r> {
+impl From<DescribePortalCompletePayload> for Reply {
     #[inline]
-    fn from(p: DescribePortalCompletePayload<'r>) -> Self {
+    fn from(p: DescribePortalCompletePayload) -> Self {
         Self::DescribePortalComplete(p)
     }
 }

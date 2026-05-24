@@ -312,38 +312,42 @@ fn error_response_during_startup_is_classified() {
     let out = proto.feed_bytes(&err_frame, &mut wb);
 
     assert_eq!(out.len(), 2, "ErrorResponse → FailReply + CloseSocket");
-    // `ServerErrorResponse` carries `details_ref: ErrorRef`.
-    // Extract the ref (Copy), drop `out` to release the `&mut proto`
-    // borrow, then resolve via `proto.get_server_error(r)` for
-    // message/detail/hint.
-    let details_ref = match out.as_slice() {
-        [Action::FailReply { id: failed_id, cause }, Action::CloseSocket] => {
+    // DEF-286 Φ-I.b: cause externalised onto the protocol's
+    // `fail_cause_slot`. Action::FailReply carries only `id`; the
+    // cause is queried via `proto.fail_cause()` AFTER out's borrow
+    // releases. Pre-extract the FailReply id (Copy) here.
+    match out.as_slice() {
+        [Action::FailReply { id: failed_id }, Action::CloseSocket] => {
             assert_eq!(failed_id, &startup_raw);
-            match cause {
-                ProtocolError::ServerErrorResponse {
-                    severity,
-                    code,
-                    details_ref,
-                } => {
-                    // `severity` is `Option<Severity>`. `Some(_)` is
-                    // required here (PG sent `SFATAL` field per
-                    // fixture below); `None` would indicate a
-                    // non-conformant peer (no S/V field at all).
-                    match severity {
-                        Some(s) => assert_eq!(s.as_str(), "FATAL"),
-                        None => panic!(
-                            "expected Some(Severity::Fatal), got None — \
-                             fixture sent SFATAL on the wire so the parser \
-                             should have captured it",
-                        ),
-                    }
-                    assert_eq!(code.as_str(), "28P01");
-                    *details_ref
-                }
-                other => panic!("expected ServerErrorResponse, got {other:?}"),
-            }
         }
         other => panic!("unexpected action sequence: {other:?}"),
+    }
+    // `out` is Copy-like (ManuallyDrop<heapless::Vec>); NLL
+    // releases the &mut proto borrow at `out.as_slice()`'s last
+    // use above. Query the cause now.
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply event"); };
+    let details_ref = match cause {
+        ProtocolError::ServerErrorResponse {
+            severity,
+            code,
+            details_ref,
+        } => {
+            // `severity` is `Option<Severity>`. `Some(_)` is
+            // required here (PG sent `SFATAL` field per
+            // fixture below); `None` would indicate a
+            // non-conformant peer (no S/V field at all).
+            match severity {
+                Some(s) => assert_eq!(s.as_str(), "FATAL"),
+                None => panic!(
+                    "expected Some(Severity::Fatal), got None — \
+                     fixture sent SFATAL on the wire so the parser \
+                     should have captured it",
+                ),
+            }
+            assert_eq!(code.as_str(), "28P01");
+            details_ref
+        }
+        other => panic!("expected ServerErrorResponse, got {other:?}"),
     };
     // `out` is Copy-like (ManuallyDrop<heapless::Vec>); NLL
     // releases the &mut proto borrow at `out.as_slice()`'s last
@@ -377,15 +381,17 @@ fn negotiate_protocol_version_during_startup() {
 
     assert_eq!(out.len(), 2);
     match out.as_slice() {
-        [Action::FailReply { id: failed_id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id: failed_id }, Action::CloseSocket] => {
             assert_eq!(failed_id, &startup_raw);
-            assert!(
-                matches!(cause, ProtocolError::UnsupportedProtocolOption),
-                "expected UnsupportedProtocolOption, got {cause:?}",
-            );
         }
         other => panic!("unexpected: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::UnsupportedProtocolOption),
+        "expected UnsupportedProtocolOption, got {cause:?}",
+    );
 }
 
 /// Invariant (spec): unknown Authentication sub-code → classified
@@ -402,26 +408,24 @@ fn unknown_auth_subcode_is_rejected() {
 
     assert_eq!(out.len(), 2);
     match out.as_slice() {
-        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
-            // `Unknown` carries `NonZeroU32` (type-level proof that
-            // server sent ≠ 0; AUTH_OK = 0 is classified as
-            // `KnownButWrong(AuthSubCode::Ok)`).
-            let expected_99 = match core::num::NonZeroU32::new(99) {
-                Some(nz) => nz,
-                None => panic!("99 is non-zero, NonZeroU32::new infallible"),
-            };
-            assert!(
-                matches!(
-                    cause,
-                    ProtocolError::UnsupportedAuthMethod {
-                        sub_code: bsql_pg_proto::error::AuthSubCodeClass::Unknown(nz),
-                    } if *nz == expected_99,
-                ),
-                "expected UnsupportedAuthMethod(Unknown(99)), got {cause:?}",
-            );
-        }
+        [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
+    drop(out);
+    let expected_99 = match core::num::NonZeroU32::new(99) {
+        Some(nz) => nz,
+        None => panic!("99 is non-zero, NonZeroU32::new infallible"),
+    };
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(
+            cause,
+            ProtocolError::UnsupportedAuthMethod {
+                sub_code: bsql_pg_proto::error::AuthSubCodeClass::Unknown(nz),
+            } if nz == expected_99,
+        ),
+        "expected UnsupportedAuthMethod(Unknown(99)), got {cause:?}",
+    );
 }
 
 /// Invariant: pipelined Startup while one is in flight is
@@ -641,14 +645,15 @@ fn connecting_states_become_errored_on_bad_frame() {
 
     assert_eq!(out.len(), 2, "unexpected frame → FailReply + CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
-            assert!(
-                matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'X'),
-                "expected UnexpectedFrame(X), got {cause:?}",
-            );
-        }
+        [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'X'),
+        "expected UnexpectedFrame(X), got {cause:?}",
+    );
     assert!(matches!(proto.state(), ConnectingState::Errored(_)));
 
     // Post-terminal frames are dropped silently.
@@ -927,14 +932,15 @@ fn scram_signature_mismatch_is_rejected() {
 
     assert_eq!(out.len(), 2, "sig mismatch → FailReply + CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
-            assert!(
-                matches!(cause, ProtocolError::ScramHandshakeFailure { .. }),
-                "expected ScramError, got {cause:?}",
-            );
-        }
+        [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::ScramHandshakeFailure { .. }),
+        "expected ScramError, got {cause:?}",
+    );
 }
 
 /// Invariant (spec): SCRAM iterations < 4096 → classified error.
@@ -964,14 +970,15 @@ fn scram_iterations_too_low_is_rejected() {
 
     assert_eq!(out.len(), 2, "low iterations → FailReply + CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
-            assert!(
-                matches!(cause, ProtocolError::ScramHandshakeFailure { .. }),
-                "expected ScramError for low iterations, got {cause:?}",
-            );
-        }
+        [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::ScramHandshakeFailure { .. }),
+        "expected ScramError for low iterations, got {cause:?}",
+    );
 }
 
 /// BS8 regression (pass #6 audit): SCRAM iteration count above the
@@ -1008,18 +1015,19 @@ fn scram_iterations_above_cap_is_rejected() {
 
     assert_eq!(out.len(), 2, "high iterations → FailReply + CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
-            match cause {
-                ProtocolError::ScramHandshakeFailure {
-                    class: ScramFailureClass::IterationsTooHigh { iterations },
-                    detail: _,
-                } => {
-                    assert_eq!(*iterations, too_high);
-                }
-                other => panic!("expected IterationsTooHigh, got {other:?}"),
-            }
-        }
+        [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
+    }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    match cause {
+        ProtocolError::ScramHandshakeFailure {
+            class: ScramFailureClass::IterationsTooHigh { iterations },
+            detail: _,
+        } => {
+            assert_eq!(iterations, too_high);
+        }
+        other => panic!("expected IterationsTooHigh, got {other:?}"),
     }
 }
 
@@ -1062,17 +1070,18 @@ fn scram_server_error_preserves_diagnostic_message() {
     let out = proto.feed_bytes(&auth_sasl_final_frame(server_error_msg), &mut wb);
 
     assert_eq!(out.len(), 2, "server e= → FailReply + CloseSocket");
-    // Snapshot the detail ref before reborrowing `proto` for arena
-    // resolution.
-    let detail_ref = match out.as_slice() {
-        [Action::FailReply { cause, .. }, Action::CloseSocket] => match cause {
-            ProtocolError::ScramHandshakeFailure {
-                class: bsql_pg_proto::scram::wire::ScramFailureClass::ServerScramError,
-                detail: Some(r),
-            } => *r,
-            other => panic!("expected ScramHandshakeFailure{{ServerScramError, Some(_)}}, got {other:?}"),
-        },
+    match out.as_slice() {
+        [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
+    }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    let detail_ref = match cause {
+        ProtocolError::ScramHandshakeFailure {
+            class: bsql_pg_proto::scram::wire::ScramFailureClass::ServerScramError,
+            detail: Some(r),
+        } => r,
+        other => panic!("expected ScramHandshakeFailure{{ServerScramError, Some(_)}}, got {other:?}"),
     };
     // `out` is `OutActions` (`ManuallyDrop<heapless::Vec>`) — not a
     // Drop type. NLL releases the &mut proto borrow after the match
@@ -1110,14 +1119,15 @@ fn scram_nonce_prefix_mismatch_is_rejected() {
 
     assert_eq!(out.len(), 2, "nonce mismatch → FailReply + CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
-            assert!(
-                matches!(cause, ProtocolError::ScramHandshakeFailure { .. }),
-                "expected ScramError for nonce mismatch, got {cause:?}",
-            );
-        }
+        [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::ScramHandshakeFailure { .. }),
+        "expected ScramError for nonce mismatch, got {cause:?}",
+    );
 }
 
 // =================================================================
@@ -1344,15 +1354,17 @@ fn unsolicited_ps_during_scram_await_server_first_is_unexpected() {
     let out = proto.feed_bytes(&param_status_frame("TimeZone", "UTC"), &mut wb);
     assert_eq!(out.len(), 2, "PS during SCRAM → FailReply + CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id }, Action::CloseSocket] => {
             assert_eq!(id, &startup_raw);
-            assert!(
-                matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'S'),
-                "expected UnexpectedFrame('S'), got {cause:?}",
-            );
         }
         other => panic!("unexpected action sequence: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'S'),
+        "expected UnexpectedFrame('S'), got {cause:?}",
+    );
     assert!(matches!(proto.state(), ConnectingState::Errored(_)));
 }
 
@@ -1375,15 +1387,17 @@ fn param_status_during_pre_auth_is_unexpected() {
     let out = proto.feed_bytes(&param_status_frame("TimeZone", "UTC"), &mut wb);
     assert_eq!(out.len(), 2, "pre-auth PS → FailReply + CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { id: failed, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id: failed }, Action::CloseSocket] => {
             assert_eq!(failed, &startup_raw);
-            assert!(
-                matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'S'),
-                "expected UnexpectedFrame('S'), got {cause:?}",
-            );
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'S'),
+        "expected UnexpectedFrame('S'), got {cause:?}",
+    );
     assert!(matches!(proto.state(), ConnectingState::Errored(_)));
 }
 
@@ -1619,15 +1633,17 @@ fn error_response_during_cleartext_startup() {
 
     assert_eq!(out.len(), 2, "ErrorResponse → FailReply + CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { id: failed_id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id: failed_id }, Action::CloseSocket] => {
             assert_eq!(failed_id, &startup_raw);
-            assert!(
-                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
-                "expected ServerErrorResponse, got {cause:?}",
-            );
         }
         other => panic!("unexpected action sequence: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+        "expected ServerErrorResponse, got {cause:?}",
+    );
 }
 
 /// Spec conformance: server sends wrong auth code (e.g. SASL) while
@@ -1645,24 +1661,26 @@ fn cleartext_startup_rejects_sasl_offer() {
     let out = proto.feed_bytes(&auth_sasl_frame(), &mut wb);
     assert_eq!(out.len(), 2, "wrong auth code → FailReply + CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { id: failed_id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id: failed_id }, Action::CloseSocket] => {
             assert_eq!(failed_id, &startup_raw);
-            match cause {
-                ProtocolError::UnsupportedAuthMethod { sub_code } => {
-                    use bsql_pg_proto::error::AuthSubCodeClass;
-                    use bsql_pg_proto::wire::AuthSubCode;
-                    assert!(
-                        matches!(
-                            sub_code,
-                            AuthSubCodeClass::KnownButWrong(AuthSubCode::Sasl),
-                        ),
-                        "expected KnownButWrong(Sasl), got {sub_code:?}",
-                    );
-                }
-                other => panic!("expected UnsupportedAuthMethod, got {other:?}"),
-            }
         }
         other => panic!("unexpected action sequence: {other:?}"),
+    }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    match cause {
+        ProtocolError::UnsupportedAuthMethod { sub_code } => {
+            use bsql_pg_proto::error::AuthSubCodeClass;
+            use bsql_pg_proto::wire::AuthSubCode;
+            assert!(
+                matches!(
+                    sub_code,
+                    AuthSubCodeClass::KnownButWrong(AuthSubCode::Sasl),
+                ),
+                "expected KnownButWrong(Sasl), got {sub_code:?}",
+            );
+        }
+        other => panic!("expected UnsupportedAuthMethod, got {other:?}"),
     }
 }
 
@@ -2001,15 +2019,17 @@ fn md5_auth_rejects_wrong_salt_length() {
         "malformed MD5 salt → FailReply + CloseSocket",
     );
     match out.as_slice() {
-        [Action::FailReply { id: failed_id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id: failed_id }, Action::CloseSocket] => {
             assert_eq!(failed_id, &startup_raw);
-            assert!(
-                matches!(cause, ProtocolError::MalformedAuthentication { .. }),
-                "expected MalformedAuthentication, got {cause:?}",
-            );
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::MalformedAuthentication { .. }),
+        "expected MalformedAuthentication, got {cause:?}",
+    );
 }
 
 /// Server tries to coerce MD5 client into cleartext (downgrade) →
@@ -2027,24 +2047,26 @@ fn md5_startup_rejects_cleartext_offer() {
     let out = proto.feed_bytes(&cleartext_frame, &mut wb);
     assert_eq!(out.len(), 2);
     match out.as_slice() {
-        [Action::FailReply { id: failed_id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id: failed_id }, Action::CloseSocket] => {
             assert_eq!(failed_id, &startup_raw);
-            match cause {
-                ProtocolError::UnsupportedAuthMethod { sub_code } => {
-                    use bsql_pg_proto::error::AuthSubCodeClass;
-                    use bsql_pg_proto::wire::AuthSubCode;
-                    assert!(
-                        matches!(
-                            sub_code,
-                            AuthSubCodeClass::KnownButWrong(AuthSubCode::CleartextPassword),
-                        ),
-                        "expected KnownButWrong(CleartextPassword), got {sub_code:?}",
-                    );
-                }
-                other => panic!("expected UnsupportedAuthMethod, got {other:?}"),
-            }
         }
         other => panic!("unexpected sequence: {other:?}"),
+    }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    match cause {
+        ProtocolError::UnsupportedAuthMethod { sub_code } => {
+            use bsql_pg_proto::error::AuthSubCodeClass;
+            use bsql_pg_proto::wire::AuthSubCode;
+            assert!(
+                matches!(
+                    sub_code,
+                    AuthSubCodeClass::KnownButWrong(AuthSubCode::CleartextPassword),
+                ),
+                "expected KnownButWrong(CleartextPassword), got {sub_code:?}",
+            );
+        }
+        other => panic!("expected UnsupportedAuthMethod, got {other:?}"),
     }
 }
 
@@ -2096,20 +2118,22 @@ fn assert_known_but_wrong<const N: usize>(
     let out = proto.feed_bytes(&frame, wb);
     assert_eq!(out.len(), 2, "wrong sub-code → FailReply + CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id }, Action::CloseSocket] => {
             assert_eq!(id, &expected_reply_raw);
-            match cause {
-                ProtocolError::UnsupportedAuthMethod { sub_code } => {
-                    use bsql_pg_proto::error::AuthSubCodeClass;
-                    assert!(
-                        matches!(sub_code, AuthSubCodeClass::KnownButWrong(c) if *c == expected_subcode),
-                        "expected KnownButWrong({expected_subcode:?}), got {sub_code:?}",
-                    );
-                }
-                other => panic!("expected UnsupportedAuthMethod, got {other:?}"),
-            }
         }
         other => panic!("unexpected sequence: {other:?}"),
+    }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    match cause {
+        ProtocolError::UnsupportedAuthMethod { sub_code } => {
+            use bsql_pg_proto::error::AuthSubCodeClass;
+            assert!(
+                matches!(sub_code, AuthSubCodeClass::KnownButWrong(c) if c == expected_subcode),
+                "expected KnownButWrong({expected_subcode:?}), got {sub_code:?}",
+            );
+        }
+        other => panic!("expected UnsupportedAuthMethod, got {other:?}"),
     }
 }
 
@@ -2125,16 +2149,18 @@ fn assert_unexpected_frame<const N: usize>(
     let out = proto.feed_bytes(&frame, wb);
     assert_eq!(out.len(), 2, "unexpected frame → FailReply + CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id }, Action::CloseSocket] => {
             assert_eq!(id, &expected_reply_raw);
-            match cause {
-                ProtocolError::UnexpectedFrame { tag } => {
-                    assert_eq!(tag.byte(), expected_tag_byte, "tag byte mismatch");
-                }
-                other => panic!("expected UnexpectedFrame, got {other:?}"),
-            }
         }
         other => panic!("unexpected sequence: {other:?}"),
+    }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    match cause {
+        ProtocolError::UnexpectedFrame { tag } => {
+            assert_eq!(tag.byte(), expected_tag_byte, "tag byte mismatch");
+        }
+        other => panic!("expected UnexpectedFrame, got {other:?}"),
     }
 }
 
@@ -2181,24 +2207,26 @@ fn md5_startup_rejects_unknown_subcode() {
     let out = proto.feed_bytes(&frame, &mut wb);
     assert_eq!(out.len(), 2);
     match out.as_slice() {
-        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id }, Action::CloseSocket] => {
             assert_eq!(id, &raw_id);
-            match cause {
-                ProtocolError::UnsupportedAuthMethod { sub_code } => {
-                    use bsql_pg_proto::error::AuthSubCodeClass;
-                    let expected = match core::num::NonZeroU32::new(99) {
-                        Some(n) => n,
-                        None => panic!("99 is non-zero"),
-                    };
-                    assert!(
-                        matches!(sub_code, AuthSubCodeClass::Unknown(n) if *n == expected),
-                        "expected Unknown(99), got {sub_code:?}",
-                    );
-                }
-                other => panic!("expected UnsupportedAuthMethod, got {other:?}"),
-            }
         }
         other => panic!("unexpected sequence: {other:?}"),
+    }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    match cause {
+        ProtocolError::UnsupportedAuthMethod { sub_code } => {
+            use bsql_pg_proto::error::AuthSubCodeClass;
+            let expected = match core::num::NonZeroU32::new(99) {
+                Some(n) => n,
+                None => panic!("99 is non-zero"),
+            };
+            assert!(
+                matches!(sub_code, AuthSubCodeClass::Unknown(n) if n == expected),
+                "expected Unknown(99), got {sub_code:?}",
+            );
+        }
+        other => panic!("expected UnsupportedAuthMethod, got {other:?}"),
     }
 }
 
@@ -2266,15 +2294,17 @@ fn md5_awaiting_authok_rejects_sasl_subcode() {
     let out = proto.feed_bytes(&frame, &mut wb);
     assert_eq!(out.len(), 2);
     match out.as_slice() {
-        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id }, Action::CloseSocket] => {
             assert_eq!(id, &raw_id);
-            assert!(
-                matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'R'),
-                "expected UnexpectedFrame{{R}}, got {cause:?}",
-            );
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'R'),
+        "expected UnexpectedFrame{{R}}, got {cause:?}",
+    );
 }
 
 #[test]
@@ -2287,15 +2317,17 @@ fn md5_awaiting_authok_handles_error_response() {
     let out = proto.feed_bytes(&err_frame, &mut wb);
     assert_eq!(out.len(), 2);
     match out.as_slice() {
-        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id }, Action::CloseSocket] => {
             assert_eq!(id, &raw_id);
-            assert!(
-                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
-                "expected ServerErrorResponse, got {cause:?}",
-            );
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+        "expected ServerErrorResponse, got {cause:?}",
+    );
 }
 
 #[test]
@@ -2309,15 +2341,17 @@ fn md5_awaiting_authok_rejects_random_tag() {
     let out = proto.feed_bytes(&frame, &mut wb);
     assert_eq!(out.len(), 2);
     match out.as_slice() {
-        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id }, Action::CloseSocket] => {
             assert_eq!(id, &raw_id);
-            assert!(
-                matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'Z'),
-                "expected UnexpectedFrame{{Z}}, got {cause:?}",
-            );
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::UnexpectedFrame { tag } if tag.byte() == b'Z'),
+        "expected UnexpectedFrame{{Z}}, got {cause:?}",
+    );
 }
 
 // ----- Cleartext startup — extended negative paths -----
@@ -2357,14 +2391,15 @@ fn cleartext_startup_rejects_unknown_subcode() {
     let out = proto.feed_bytes(&auth_subcode_only_frame(77), &mut wb);
     assert_eq!(out.len(), 2);
     match out.as_slice() {
-        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
-            assert!(
-                matches!(cause, ProtocolError::UnsupportedAuthMethod { .. }),
-                "expected UnsupportedAuthMethod for unknown sub-code; got {cause:?}",
-            );
-        }
+        [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected sequence: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::UnsupportedAuthMethod { .. }),
+        "expected UnsupportedAuthMethod for unknown sub-code; got {cause:?}",
+    );
 }
 
 // ----- CleartextAwaitingAuthOk — negative paths -----
@@ -2410,15 +2445,17 @@ fn cleartext_awaiting_authok_handles_error_response() {
     let out = proto.feed_bytes(&err_frame, &mut wb);
     assert_eq!(out.len(), 2);
     match out.as_slice() {
-        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id }, Action::CloseSocket] => {
             assert_eq!(id, &raw_id);
-            assert!(
-                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
-                "expected ServerErrorResponse, got {cause:?}",
-            );
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+        "expected ServerErrorResponse, got {cause:?}",
+    );
 }
 
 // ----- Trust + SCRAM — symmetric downgrade rejection of new codes -----
@@ -2500,12 +2537,14 @@ fn md5_startup_handles_error_response() {
     let out = proto.feed_bytes(&frame, &mut wb);
     assert_eq!(out.len(), 2);
     match out.as_slice() {
-        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id }, Action::CloseSocket] => {
             assert_eq!(id, &raw_id);
-            assert!(matches!(cause, ProtocolError::ServerErrorResponse { .. }));
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(matches!(cause, ProtocolError::ServerErrorResponse { .. }));
 }
 
 #[test]
@@ -2518,12 +2557,14 @@ fn md5_startup_handles_negotiate_protocol_version() {
     let out = proto.feed_bytes(&frame, &mut wb);
     assert_eq!(out.len(), 2);
     match out.as_slice() {
-        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id }, Action::CloseSocket] => {
             assert_eq!(id, &raw_id);
-            assert!(matches!(cause, ProtocolError::UnsupportedProtocolOption));
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(matches!(cause, ProtocolError::UnsupportedProtocolOption));
 }
 
 #[test]
@@ -2536,12 +2577,14 @@ fn cleartext_startup_handles_negotiate_protocol_version() {
     let out = proto.feed_bytes(&frame, &mut wb);
     assert_eq!(out.len(), 2);
     match out.as_slice() {
-        [Action::FailReply { id, cause }, Action::CloseSocket] => {
+        [Action::FailReply { id }, Action::CloseSocket] => {
             assert_eq!(id, &raw_id);
-            assert!(matches!(cause, ProtocolError::UnsupportedProtocolOption));
         }
         other => panic!("unexpected sequence: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(matches!(cause, ProtocolError::UnsupportedProtocolOption));
 }
 
 // ----- State preservation under password handling -----

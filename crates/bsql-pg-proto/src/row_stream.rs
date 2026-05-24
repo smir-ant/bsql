@@ -205,7 +205,7 @@ pub enum ColEvent<'a> {
         id: Option<NonZeroU64>,
         /// Success — typed payload | Error — protocol-classified
         /// failure.
-        outcome: Result<Reply<'a>, ProtocolError>,
+        outcome: Result<Reply, ProtocolError>,
     },
 }
 
@@ -320,6 +320,26 @@ pub struct RowStream<'p, 'w> {
     /// struct (the field is private + has no `pub` constructor surface;
     /// callers go through `RowStream::new`).
     _not_send: PhantomData<*const ()>,
+}
+
+/// Lifetime-free classification of `slow_path_once`'s first emitted
+/// action (DEF-286 Φ-I.b helper). Pre-classifying into this Copy
+/// enum collapses the lifetime-bearing match into a borrow-free one
+/// — the function can then call `&self.proto.fail_cause()` (immut
+/// borrow) on the Failed arm without re-borrow conflict.
+///
+/// Post-Φ-F* `Reply` is lifetime-free (all payload data lives in
+/// PgProtocol slots, queried via accessors), so extracting `value`
+/// by Copy from the lifetime-bearing `Action<'r,'r>` source is
+/// sound — `Reply: Copy` and no `'r`-borrowed data flows through.
+#[derive(Debug, Clone, Copy)]
+enum SlowPathFirst {
+    Empty,
+    Delivered { id: NonZeroU64, value: crate::action::Reply },
+    Failed { id: NonZeroU64 },
+    Closed,
+    SendBytes,
+    Other,
 }
 
 impl<'p, 'w> RowStream<'p, 'w> {
@@ -1325,13 +1345,34 @@ impl<'p, 'w> RowStream<'p, 'w> {
     /// (`EndQuery`) or `NeedMore` (silent state transition).
     #[inline]
     fn slow_path_once(&mut self, cached_id: Option<NonZeroU64>) -> ColEvent<'_> {
+        // DEF-286 Φ-I.b: classify the first action eagerly into
+        // a Copy enum that strips the `'r` borrow. This releases
+        // `actions`'s mut borrow on `self.proto` (NLL closes at the
+        // last use of `first_class`), allowing the FailReply arm to
+        // call `self.proto.fail_cause()` (immutable borrow) for the
+        // externalised cause.
+        //
+        // Post-Φ-F* Reply<'r> is phantom-only `'r`; its variant data
+        // is queried via accessors. Reply is Copy so we can detach.
         let actions = self.proto.feed_bytes_bounded(&[], self.write_buf, 1);
-        let first_opt = actions.as_slice().first().copied();
+        let first_class: SlowPathFirst = match actions.as_slice().first() {
+            None => SlowPathFirst::Empty,
+            Some(Action::DeliverReply { id, value }) => {
+                SlowPathFirst::Delivered { id: *id, value: *value }
+            }
+            Some(Action::FailReply { id }) => SlowPathFirst::Failed { id: *id },
+            Some(Action::CloseSocket) => SlowPathFirst::Closed,
+            Some(Action::SendBytes(_)) => SlowPathFirst::SendBytes,
+            Some(Action::Notify { .. }) => SlowPathFirst::Other,
+            Some(Action::IntermediateCommandComplete { .. }) => SlowPathFirst::Other,
+            Some(Action::CopyDataChunk { .. }) => SlowPathFirst::Other,
+        };
+        drop(actions);
         let is_terminal = matches!(
-            first_opt,
-            Some(Action::DeliverReply { .. })
-                | Some(Action::FailReply { .. })
-                | Some(Action::CloseSocket),
+            first_class,
+            SlowPathFirst::Delivered { .. }
+                | SlowPathFirst::Failed { .. }
+                | SlowPathFirst::Closed,
         );
         if is_terminal {
             self.flush_pending = true;
@@ -1347,17 +1388,24 @@ impl<'p, 'w> RowStream<'p, 'w> {
             // erroneously install Errored on cleanup.
             self.drained = true;
         }
-        match first_opt {
-            None => ColEvent::NeedMore,
-            Some(Action::DeliverReply { id, value }) => ColEvent::EndQuery {
+        match first_class {
+            SlowPathFirst::Empty => ColEvent::NeedMore,
+            SlowPathFirst::Delivered { id, value } => ColEvent::EndQuery {
                 id: Some(id),
                 outcome: Ok(value),
             },
-            Some(Action::FailReply { id, cause }) => ColEvent::EndQuery {
-                id: Some(id),
-                outcome: Err(cause),
-            },
-            Some(Action::CloseSocket) => {
+            SlowPathFirst::Failed { id } => {
+                let cause = self.proto.fail_cause().copied().unwrap_or(
+                    ProtocolError::InternalCrateBug {
+                        locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                    },
+                );
+                ColEvent::EndQuery {
+                    id: Some(id),
+                    outcome: Err(cause),
+                }
+            }
+            SlowPathFirst::Closed => {
                 // CloseSocket with no prior FailReply: classify via
                 // cached id (if any) as a connection teardown without
                 // a server-attributable cause. Synthesise an Err
@@ -1372,7 +1420,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
                     }),
                 }
             }
-            Some(Action::SendBytes(_)) => {
+            SlowPathFirst::SendBytes => {
                 // SCRAM-mid-handshake bytes flowed through slow path;
                 // re-enter caller loop to drain remaining frames.
                 // This is rare from inside iter_rows (handshake should
@@ -1381,47 +1429,12 @@ impl<'p, 'w> RowStream<'p, 'w> {
                 // "non-terminal, no event for caller" → NeedMore.
                 ColEvent::NeedMore
             }
-            Some(Action::Notify { .. }) => {
-                // DEF-220: an asynchronous NotificationResponse arrived
-                // mid-iter_rows. The arena slot is populated (the
-                // dispatch pre-filter on 'A' allocated the payload),
-                // but iter_rows's caller doesn't observe Notify
-                // through ColEvent (the row-streaming surface is
-                // query-result-only). The notification is effectively
-                // discarded for iter_rows callers — the wrapper
-                // observes Notify only via the top-level feed_bytes
-                // path's OutActions, NOT iter_rows.
-                //
-                // Phase 2 follow-up: extend ColEvent with a Notify
-                // variant if/when concrete consumers surface the
-                // mid-row-stream LISTEN/NOTIFY use case. For now the
-                // common pattern is «LISTEN once at startup, drain
-                // notifications between query cycles» — covered by
-                // the OutActions path.
-                core::hint::cold_path();
-                ColEvent::NeedMore
-            }
-            Some(Action::IntermediateCommandComplete { .. }) => {
-                // DEF-226: multi-statement batch intermediate signal.
-                // SimpleQuery row-streaming via iter_rows would observe
-                // this only if a batch like `SELECT *; SELECT *;` is
-                // issued and a non-final statement's CommandComplete
-                // arrives while the iter_rows pull loop is active.
-                // Like Notify, iter_rows surfaces it as NeedMore — the
-                // top-level OutActions path is the observation point
-                // for intermediate command-complete tags.
-                core::hint::cold_path();
-                ColEvent::NeedMore
-            }
-            Some(Action::CopyDataChunk { .. }) => {
-                // DEF-219 Phase 3: COPY OUT data chunk arrived
-                // mid-iter_rows. iter_rows is row-streaming, not
-                // COPY-streaming — surfaces as NeedMore. The wrapper
-                // observes CopyDataChunk via the top-level feed_bytes
-                // OutActions path. (COPY can't actually be active
-                // mid-iter_rows because the state machine wouldn't
-                // be in a row-streaming variant during COPY — this
-                // arm is for exhaustiveness, not runtime path.)
+            SlowPathFirst::Other => {
+                // Notify / IntermediateCommandComplete / CopyDataChunk /
+                // StreamRow: not surfaced through ColEvent (iter_rows
+                // is row-streaming-only; these flow via the top-level
+                // OutActions path). Map to NeedMore so the iter_rows
+                // pull loop re-enters and drains remaining frames.
                 core::hint::cold_path();
                 ColEvent::NeedMore
             }

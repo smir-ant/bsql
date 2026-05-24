@@ -175,14 +175,16 @@ fn bind_execute_dml_full_round_trip() {
     match out.as_slice() {
         [Action::DeliverReply {
             id: delivered,
-            value: Reply::QueryComplete(p),
+            value: Reply::QueryComplete(_),
         }] => {
             assert_eq!(*delivered, reply_raw, "correlator round-trips");
-            assert_eq!(format!("{}", p.command_tag), "INSERT 0 1");
-            assert!(p.row_desc.is_none(), "DML: no schema delivered");
         }
         other => panic!("expected DeliverReply(QueryComplete), got {other:?}"),
     }
+    drop(out);
+    let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
+    assert_eq!(format!("{}", command_tag), "INSERT 0 1");
+    assert!(proto.current_row_desc().is_none(), "DML: no schema delivered");
     // DEF-286 Φ-E: tx_status accessor instead of inline field.
     assert_eq!(proto.terminal_tx_status(), bsql_pg_proto::TxStatus::Idle);
     assert!(matches!(proto.state(), ActiveState::Idle));
@@ -219,14 +221,15 @@ fn bind_execute_select_with_schema_streams_rows() {
     assert_eq!(out.len(), 1, "0-row SELECT: just DeliverReply");
     match out.as_slice() {
         [Action::DeliverReply {
-            value: Reply::QueryComplete(p),
+            value: Reply::QueryComplete(_),
             ..
-        }] => {
-            assert_eq!(format!("{}", p.command_tag), "SELECT 0");
-            assert!(p.row_desc.is_some(), "SELECT: schema delivered");
-        }
+        }] => {}
         other => panic!("expected DeliverReply, got {other:?}"),
     }
+    drop(out);
+    let Some(command_tag) = proto.current_command_tag() else { panic!("command_tag slot populated"); };
+    assert_eq!(format!("{}", command_tag), "SELECT 0");
+    assert!(proto.current_row_desc().is_some(), "SELECT: schema delivered");
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -262,15 +265,17 @@ fn bind_error_is_recoverable() {
     let out = proto.feed_bytes(&bytes, &mut wb);
     assert_eq!(out.len(), 1, "error + RFQ → FailReply, no CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { id: failed, cause }] => {
+        [Action::FailReply { id: failed }] => {
             assert_eq!(*failed, reply_raw);
-            assert!(
-                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
-                "expected classified server error, got {cause:?}",
-            );
         }
         other => panic!("expected single FailReply, got {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+        "expected classified server error, got {cause:?}",
+    );
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
@@ -308,14 +313,15 @@ fn bind_execute_data_row_without_schema_is_unexpected_frame() {
     // wire frame in the current state).
     assert_eq!(out.len(), 2, "unexpected DataRow → FailReply + CloseSocket");
     match out.as_slice() {
-        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
-            assert!(
-                matches!(cause, ProtocolError::UnexpectedFrame { .. }),
-                "expected UnexpectedFrame, got {cause:?}",
-            );
-        }
+        [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::UnexpectedFrame { .. }),
+        "expected UnexpectedFrame, got {cause:?}",
+    );
 }
 
 /// 1c-3b scope: server emitting `PortalSuspended` (tag 's') during
@@ -351,14 +357,15 @@ fn portal_suspended_is_unexpected_frame_in_1c_3b() {
         "PortalSuspended → FailReply + CloseSocket (1c-3b scope)",
     );
     match out.as_slice() {
-        [Action::FailReply { cause, .. }, Action::CloseSocket] => {
-            assert!(
-                matches!(cause, ProtocolError::UnexpectedFrame { .. }),
-                "expected UnexpectedFrame, got {cause:?}",
-            );
-        }
+        [Action::FailReply { .. }, Action::CloseSocket] => {}
         other => panic!("unexpected: {other:?}"),
     }
+    drop(out);
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated"); };
+    assert!(
+        matches!(cause, ProtocolError::UnexpectedFrame { .. }),
+        "expected UnexpectedFrame, got {cause:?}",
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════

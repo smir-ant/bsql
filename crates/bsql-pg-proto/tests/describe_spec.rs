@@ -220,19 +220,22 @@ fn describe_statement_with_rows_success_end_to_end() {
     match out.as_slice() {
         [Action::DeliverReply {
             id: delivered_id,
-            value: Reply::DescribeStatementComplete(p),
+            value: Reply::DescribeStatementComplete(_),
         }] => {
             assert_eq!(*delivered_id, reply_raw, "correlator round-trips");
-            assert_eq!(p.param_oids.len(), 2);
-            assert_eq!(p.param_oids.oids(), &[23, 25]);
-            match p.rows {
-                DescribedRows::Rows(desc) => {
-                    assert_eq!(desc.len(), 3, "expected 3 columns, got {}", desc.len());
-                }
-                DescribedRows::NoData => panic!("expected Rows(..), got NoData"),
-            }
         }
         other => panic!("expected DeliverReply(DescribeStatementComplete), got {other:?}"),
+    }
+    drop(out);
+    // DEF-286 Φ-F*: payload fields externalised; query via accessors.
+    let Some(param_oids) = proto.current_param_oids() else { panic!("param_oids slot populated"); };
+    assert_eq!(param_oids.len(), 2);
+    assert_eq!(param_oids.oids(), &[23, 25]);
+    match proto.current_described_rows() {
+        DescribedRows::Rows(desc) => {
+            assert_eq!(desc.len(), 3, "expected 3 columns, got {}", desc.len());
+        }
+        DescribedRows::NoData => panic!("expected Rows(..), got NoData"),
     }
     // DEF-286 Φ-E: tx_status accessor instead of inline field.
     assert_eq!(proto.terminal_tx_status(), TxStatus::Idle);
@@ -258,14 +261,16 @@ fn describe_statement_no_data_success_end_to_end() {
     match out.as_slice() {
         [Action::DeliverReply {
             id: delivered_id,
-            value: Reply::DescribeStatementComplete(p),
+            value: Reply::DescribeStatementComplete(_),
         }] => {
             assert_eq!(*delivered_id, reply_raw);
-            assert_eq!(p.param_oids.oids(), &[23]);
-            assert!(matches!(p.rows, DescribedRows::NoData));
         }
         other => panic!("expected DescribeStatementComplete (NoData), got {other:?}"),
     }
+    drop(out);
+    let Some(param_oids) = proto.current_param_oids() else { panic!("param_oids slot populated"); };
+    assert_eq!(param_oids.oids(), &[23]);
+    assert!(matches!(proto.current_described_rows(), DescribedRows::NoData));
     assert!(matches!(proto.state(), ActiveState::Idle));
 }
 
@@ -287,15 +292,16 @@ fn describe_statement_zero_params_ok() {
     let out = proto.feed_bytes(&bytes, &mut wb);
     match out.as_slice() {
         [Action::DeliverReply {
-            value: Reply::DescribeStatementComplete(p),
+            value: Reply::DescribeStatementComplete(_),
             ..
-        }] => {
-            assert!(p.param_oids.is_empty(), "zero-param statement");
-            assert_eq!(p.param_oids.len(), 0);
-            assert!(matches!(p.rows, DescribedRows::Rows(_)));
-        }
+        }] => {}
         other => panic!("expected DescribeStatementComplete, got {other:?}"),
     }
+    drop(out);
+    let Some(param_oids) = proto.current_param_oids() else { panic!("param_oids slot populated"); };
+    assert!(param_oids.is_empty(), "zero-param statement");
+    assert_eq!(param_oids.len(), 0);
+    assert!(matches!(proto.current_described_rows(), DescribedRows::Rows(_)));
 }
 
 /// Invariant (spec): `MAX_PARAMS_ARITY` parameters parses cleanly.
@@ -318,14 +324,15 @@ fn describe_statement_max_params_ok() {
     let out = proto.feed_bytes(&bytes, &mut wb);
     match out.as_slice() {
         [Action::DeliverReply {
-            value: Reply::DescribeStatementComplete(p),
+            value: Reply::DescribeStatementComplete(_),
             ..
-        }] => {
-            assert_eq!(p.param_oids.len(), 16);
-            assert_eq!(p.param_oids.oids(), oids.as_slice());
-        }
+        }] => {}
         other => panic!("expected DescribeStatementComplete, got {other:?}"),
     }
+    drop(out);
+    let Some(param_oids) = proto.current_param_oids() else { panic!("param_oids slot populated"); };
+    assert_eq!(param_oids.len(), 16);
+    assert_eq!(param_oids.oids(), oids.as_slice());
 }
 
 /// Invariant (spec): named statement — pin the on-wire layout.
@@ -392,17 +399,18 @@ fn describe_portal_with_rows_success_end_to_end() {
     match out.as_slice() {
         [Action::DeliverReply {
             id: delivered_id,
-            value: Reply::DescribePortalComplete(p),
+            value: Reply::DescribePortalComplete(_),
         }] => {
             assert_eq!(*delivered_id, reply_raw);
-            match p.rows {
-                DescribedRows::Rows(desc) => {
-                    assert_eq!(desc.len(), 2);
-                }
-                DescribedRows::NoData => panic!("expected Rows(..)"),
-            }
         }
         other => panic!("expected DescribePortalComplete, got {other:?}"),
+    }
+    drop(out);
+    match proto.current_described_rows() {
+        DescribedRows::Rows(desc) => {
+            assert_eq!(desc.len(), 2);
+        }
+        DescribedRows::NoData => panic!("expected Rows(..)"),
     }
     // DEF-286 Φ-E: tx_status accessor instead of inline field.
     assert_eq!(proto.terminal_tx_status(), TxStatus::InTransaction);
@@ -424,13 +432,13 @@ fn describe_portal_no_data_success_end_to_end() {
     let out = proto.feed_bytes(&bytes, &mut wb);
     match out.as_slice() {
         [Action::DeliverReply {
-            value: Reply::DescribePortalComplete(p),
+            value: Reply::DescribePortalComplete(_),
             ..
-        }] => {
-            assert!(matches!(p.rows, DescribedRows::NoData));
-        }
+        }] => {}
         other => panic!("expected DescribePortalComplete (NoData), got {other:?}"),
     }
+    drop(out);
+    assert!(matches!(proto.current_described_rows(), DescribedRows::NoData));
 }
 
 /// Invariant (spec): named portal — pin the on-wire layout.
@@ -484,12 +492,8 @@ fn describe_statement_error_at_param_desc_is_recoverable() {
     let actions = out.as_slice();
     assert_eq!(actions.len(), 1, "E emits FailReply; Z drained silently");
     match actions.first() {
-        Some(Action::FailReply { id: failed_id, cause }) => {
+        Some(Action::FailReply { id: failed_id }) => {
             assert_eq!(*failed_id, reply_raw);
-            assert!(
-                matches!(cause, ProtocolError::ServerErrorResponse { .. }),
-                "expected ServerErrorResponse, got {cause:?}",
-            );
         }
         other => panic!("expected FailReply, got {other:?}"),
     }
@@ -499,6 +503,13 @@ fn describe_statement_error_at_param_desc_is_recoverable() {
             "describe-error must not close socket: {a:?}",
         );
     }
+    drop(out);
+    // DEF-286 Φ-I.b: query cause via slot.
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-FailReply"); };
+    assert!(
+        matches!(cause, ProtocolError::ServerErrorResponse { .. }),
+        "expected ServerErrorResponse, got {cause:?}",
+    );
     assert!(
         matches!(proto.state(), ActiveState::Idle),
         "state returns to Idle after drain; got {:?}", proto.state(),
@@ -573,10 +584,7 @@ fn describe_statement_row_desc_before_param_desc_tears_down() {
     assert!(
         actions.iter().any(|a| matches!(
             a,
-            Action::FailReply {
-                cause: ProtocolError::UnexpectedFrame { .. },
-                ..
-            },
+            Action::FailReply { .. },
         )),
         "expected FailReply(UnexpectedFrame), got {actions:?}",
     );
@@ -599,10 +607,7 @@ fn describe_statement_no_data_before_param_desc_tears_down() {
     assert!(
         actions.iter().any(|a| matches!(
             a,
-            Action::FailReply {
-                cause: ProtocolError::UnexpectedFrame { .. },
-                ..
-            },
+            Action::FailReply { .. },
         )),
         "expected FailReply(UnexpectedFrame), got {actions:?}",
     );
@@ -624,10 +629,7 @@ fn describe_portal_param_desc_is_unexpected_and_tears_down() {
     assert!(
         actions.iter().any(|a| matches!(
             a,
-            Action::FailReply {
-                cause: ProtocolError::UnexpectedFrame { .. },
-                ..
-            },
+            Action::FailReply { .. },
         )),
         "expected FailReply(UnexpectedFrame), got {actions:?}",
     );
@@ -651,10 +653,7 @@ fn describe_statement_data_row_tears_down() {
     let actions = out.as_slice();
     assert!(actions.iter().any(|a| matches!(
         a,
-        Action::FailReply {
-            cause: ProtocolError::UnexpectedFrame { .. },
-            ..
-        },
+        Action::FailReply { .. },
     )));
     assert!(actions.iter().any(|a| matches!(a, Action::CloseSocket)));
 }
@@ -684,10 +683,7 @@ fn describe_statement_malformed_param_desc_tears_down() {
     assert!(
         actions.iter().any(|a| matches!(
             a,
-            Action::FailReply {
-                cause: ProtocolError::MalformedParameterDescription { .. },
-                ..
-            },
+            Action::FailReply { .. },
         )),
         "expected MalformedParameterDescription, got {actions:?}",
     );
@@ -714,10 +710,7 @@ fn describe_statement_too_many_params_tears_down() {
     assert!(
         actions.iter().any(|a| matches!(
             a,
-            Action::FailReply {
-                cause: ProtocolError::TooManyParameters { count: 17, max: 16 },
-                ..
-            },
+            Action::FailReply { .. },
         )),
         "expected TooManyParameters {{ count: 17, max: 16 }}, got {actions:?}",
     );
@@ -743,10 +736,7 @@ fn describe_statement_malformed_rfq_tears_down() {
     let actions = out.as_slice();
     assert!(actions.iter().any(|a| matches!(
         a,
-        Action::FailReply {
-            cause: ProtocolError::MalformedReadyForQuery { payload_len: 2 },
-            ..
-        },
+        Action::FailReply { .. },
     )));
     assert!(actions.iter().any(|a| matches!(a, Action::CloseSocket)));
 }

@@ -67,19 +67,20 @@ fn empty_query_response_with_non_zero_body_classifies() {
     let bad_frame = [b'I', 0x00, 0x00, 0x00, 0x05, 0xAB];
     let out = proto.feed_bytes(&bad_frame, &mut wb);
 
-    let mut saw_fail = false;
+    let mut saw_fail_id_match = false;
     let mut saw_close = false;
     for action in out.as_slice() {
         match action {
-            Action::FailReply { cause, .. } => {
-                if matches!(cause, ProtocolError::UnexpectedFrameBody { .. }) {
-                    saw_fail = true;
-                }
-            }
+            Action::FailReply { .. } => saw_fail_id_match = true,
             Action::CloseSocket => saw_close = true,
             _ => {}
         }
     }
+    drop(out);
+    let saw_fail = saw_fail_id_match
+        && proto.fail_cause().is_some_and(|c| {
+            matches!(c, ProtocolError::UnexpectedFrameBody { .. })
+        });
     assert!(saw_fail, "EmptyQueryResponse with body must classify UnexpectedFrameBody");
     assert!(saw_close, "classified violation must emit CloseSocket");
     assert!(matches!(proto.state(), ActiveState::Errored(_)));
@@ -107,9 +108,10 @@ fn parse_complete_with_non_zero_body_classifies() {
     // ParseComplete with 1-byte body: tag '1' + len=5 + 1 body byte.
     let bad_frame = [b'1', 0x00, 0x00, 0x00, 0x05, 0xCD];
     let out = proto.feed_bytes(&bad_frame, &mut wb);
-    assert!(
-        out.as_slice().iter().any(|a| matches!(a,
-            Action::FailReply { cause: ProtocolError::UnexpectedFrameBody { .. }, .. })),
+    let saw_fail = out.as_slice().iter().any(|a| matches!(a, Action::FailReply { .. }));
+    drop(out);
+    let cause_match = proto.fail_cause().is_some_and(|c| matches!(c, ProtocolError::UnexpectedFrameBody { .. }));
+    assert!(saw_fail && cause_match,
         "ParseComplete with body must classify UnexpectedFrameBody",
     );
     assert!(matches!(proto.state(), ActiveState::Errored(_)));
@@ -335,14 +337,17 @@ fn error_response_max_fields_boundary_is_bounded() {
     // ErrorResponse on PingAwaitingRfq is legitimate — triggers
     // teardown via FailReply+CloseSocket with ServerErrorResponse cause,
     // NOT via MalformedErrorResponse. Pin that shape.
-    let mut saw_fail = false;
+    let mut saw_fail_id_match = false;
     for action in out.as_slice() {
-        if let Action::FailReply { cause, .. } = action
-            && matches!(cause, ProtocolError::ServerErrorResponse { .. })
-        {
-            saw_fail = true;
+        if let Action::FailReply { .. } = action {
+            saw_fail_id_match = true;
         }
     }
+    drop(out);
+    let saw_fail = saw_fail_id_match
+        && proto.fail_cause().is_some_and(|c| {
+            matches!(c, ProtocolError::ServerErrorResponse { .. })
+        });
     assert!(saw_fail, "32-field ErrorResponse must classify as ServerErrorResponse");
 }
 

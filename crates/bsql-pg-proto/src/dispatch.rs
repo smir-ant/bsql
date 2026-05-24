@@ -181,6 +181,39 @@ pub(crate) mod _rfq_dispatch_leaf {
     }
 }
 
+/// Leaf submodule for the `install_errored` cause-park transition.
+/// DEF-286 Φ-I.b. Hosts the [`InstallErroredToken`] type and the
+/// [`park_cause_at_install_errored`] helper. The token's tuple-struct
+/// field is PRIVATE to this submodule, so `Self(())` mints are
+/// callable ONLY here. Tier-1 within-crate write provenance.
+pub(crate) mod _install_errored_leaf {
+    /// Leaf-scope token for the `install_errored` cause-park call.
+    /// Field private to this submodule; type `pub(crate)` so
+    /// [`crate::fail_cause_slot::FailCauseSlotCell::park_at_install_errored`]
+    /// can name it in its parameter signature. Naming alone confers
+    /// no minting power.
+    pub(crate) struct InstallErroredToken(());
+
+    /// Mint an [`InstallErroredToken`] and park `cause` into `slot`
+    /// via
+    /// [`crate::fail_cause_slot::FailCauseSlotCell::park_at_install_errored`].
+    /// Sole call sites: [`super::install_errored`] (dispatch path),
+    /// `compute_push_*` error-classification arms, `try_builder!`
+    /// macro, `feed_bytes_dispatch` Errored arm, push-path startup
+    /// FailReply fold (PushFailure construction).
+    ///
+    /// **Latest-wins**: subsequent park overwrites the prior cause.
+    /// Caller contract: query `pg.fail_cause()` IMMEDIATELY on the
+    /// first FailReply event.
+    #[inline]
+    pub(crate) fn park_cause_at_install_errored(
+        slot: &mut crate::fail_cause_slot::FailCauseSlotCell,
+        cause: alloc::boxed::Box<crate::error::ProtocolError>,
+    ) {
+        slot.park_at_install_errored(cause, InstallErroredToken(()));
+    }
+}
+
 use crate::wire::{
     SCRAM_SHA_256_MECHANISM, TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE,
     TAG_CLOSE_COMPLETE, TAG_COMMAND_COMPLETE, TAG_COPY_DATA, TAG_COPY_DONE, TAG_COPY_IN_RESPONSE,
@@ -298,6 +331,17 @@ fn install_errored(
     reply_id: Option<core::num::NonZeroU64>,
     cause: ProtocolError,
 ) -> DispatchOutcome {
+    // DEF-286 Φ-I.b: `install_errored` does NOT park the cause into
+    // the slot — that happens at materialise time when the
+    // `StagedAction::FailReply { id, cause }` is transformed into the
+    // public `Action::FailReply { id }`. Keeping cause inline through
+    // the staged surface avoids threading `fail_cause_slot` through
+    // every `compute_push_*` signature.
+    //
+    // `install_errored`'s sole responsibility: write the Errored
+    // state transition. The Caller-Drains-Cause discipline ensures
+    // dispatch arms always pair `install_errored` with downstream
+    // `StagedAction::FailReply` emission carrying the same cause.
     *state = ProtoState::Errored(cause.state_kind());
     DispatchOutcome::Errored { reply_id, cause }
 }

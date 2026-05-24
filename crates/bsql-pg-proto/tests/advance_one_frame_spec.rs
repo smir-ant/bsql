@@ -188,10 +188,12 @@ fn unexpected_frame_mid_ping_yields_fail_with_id() {
     assert!(proto.feed_inbound(&bad).is_ok());
 
     let event = proto.advance_one_frame(&mut wb);
-    let (failed_id, cause) = match event {
-        FeedEvent::Fail(id, cause) => (id, cause),
+    let failed_id = match event {
+        FeedEvent::Fail(id) => id,
         other => panic!("expected FeedEvent::Fail, got {other:?}"),
     };
+    // DEF-286 Φ-I.b: cause externalised; query via slot accessor.
+    let Some(cause) = proto.fail_cause().copied() else { panic!("fail_cause slot must be populated post-Fail event"); };
     assert_eq!(failed_id, ping_raw, "correlator must round-trip on Fail");
     assert!(
         matches!(cause, ProtocolError::UnexpectedFrame { .. }),
