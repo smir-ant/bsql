@@ -4651,13 +4651,25 @@ where
                     // total_len <= after_consumed.len(). Classified
                     // as tier-2 structural shield (architecturally
                     // dead None).
-                    let payload_opt =
-                        after_consumed.get(HEADER_LEN..total_len_usize);
-                    debug_assert!(
-                        payload_opt.is_some(),
-                        "payload slice .get(HEADER_LEN..total_len) None",
-                    );
-                    let payload = payload_opt.unwrap_or(&[]);
+                    let payload = match after_consumed.get(HEADER_LEN..total_len_usize) {
+                        Some(p) => p,
+                        None => {
+                            // Architecturally dead: parse_header
+                            // validated total_len <= populated.len().
+                            // None indicates a ReadBuf lifecycle bug.
+                            // Classified rather than silent empty-
+                            // slice fallback (CREDO §V glass ban).
+                            fail_inflight_no_readbuf(
+                                state,
+                                ProtocolError::InternalCrateBug {
+                                    locus: crate::error::CrateBugLocus::ReadCursorAdvance,
+                                },
+                                &mut staged,
+                                malformed_counter,
+                            );
+                            break;
+                        }
+                    };
 
                     // Pre-dispatch filters.
                     if tag == crate::wire::TAG_PARAMETER_STATUS
@@ -4813,19 +4825,30 @@ where
                 body_len,
             );
             if !body_bytes.is_empty() {
-                let (consumed, leftover) =
+                let (_consumed, leftover) =
                     _partial_assembly_dispatch_leaf::absorb_partial_assembly_at_dispatch(
                         partial_assembly_slot,
                         body_bytes,
                     );
-                debug_assert!(
-                    leftover.is_empty(),
-                    "partial-mode entry must absorb all body bytes \
-                     (consumed={}, body_bytes.len={}, leftover={})",
-                    consumed.len(),
-                    body_bytes.len(),
-                    leftover.len(),
-                );
+                if !leftover.is_empty() {
+                    // Architecturally dead: enter_partial sets
+                    // body_remaining = body_len, then absorb drains
+                    // body_bytes which ≤ body_remaining by construction.
+                    // Non-empty leftover = accounting bug → orphaned
+                    // wire bytes corrupt subsequent frame parsing.
+                    // Classified (CREDO §V: was debug_assert + silent
+                    // fallthrough in release). Pushes FailReply +
+                    // CloseSocket into staged; materialise at
+                    // closure-end converts to public Actions.
+                    fail_inflight_no_readbuf(
+                        state,
+                        ProtocolError::InternalCrateBug {
+                            locus: crate::error::CrateBugLocus::PartialModeReentry,
+                        },
+                        &mut staged,
+                        malformed_counter,
+                    );
+                }
             }
         }
 
