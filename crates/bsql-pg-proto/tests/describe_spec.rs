@@ -692,29 +692,23 @@ fn describe_statement_malformed_param_desc_tears_down() {
 
 /// Invariant (spec): `'t'` body with count > `MAX_PARAMS_ARITY` (=16)
 /// classifies as `TooManyParameters`. Pins the BindExecute-arity
-/// matching cap — receiving more OIDs than we can ever Bind against
-/// is a structural rejection.
+/// Post-redesign: ParamOids has no fixed cap (exact-size Box<[u32]>).
+/// 17+ params parse successfully — no rejection.
 #[test]
-fn describe_statement_too_many_params_tears_down() {
+fn describe_statement_many_params_succeeds() {
     let mut proto = fresh_active_via_trust_handshake();
     let mut wb = WriteBuf::new();
     let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
-    // 17 OIDs — one over the cap.
-    let oids: std::vec::Vec<u32> = (1..=17u32).collect();
-    let bad = parameter_description_frame(&oids);
-
-    let out = proto.feed_bytes(&bad, &mut wb);
-    let actions = out.as_slice();
+    let oids: std::vec::Vec<u32> = (1..=50u32).collect();
+    let t_frame = parameter_description_frame(&oids);
+    let out = proto.feed_bytes(&t_frame, &mut wb);
     assert!(
-        actions.iter().any(|a| matches!(
-            a,
-            Action::FailReply { .. },
-        )),
-        "expected TooManyParameters {{ count: 17, max: 16 }}, got {actions:?}",
+        !out.as_slice().iter().any(|a| matches!(a, Action::FailReply { .. })),
+        "50 params should parse successfully with no cap, got {:?}",
+        out.as_slice()
     );
-    assert!(actions.iter().any(|a| matches!(a, Action::CloseSocket)));
 }
 
 /// Invariant (spec): malformed RFQ payload (length != 1) in the

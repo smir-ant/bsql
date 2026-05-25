@@ -24,7 +24,7 @@
 //! # Two structural mechanisms close the within-crate write surface
 //!
 //! 1. **`ParamOidsSlotCell` newtype** wraps the inner
-//!    `Option<alloc::boxed::Box<ParamOids>>` with a PRIVATE `inner`
+//!    `Option<ParamOids>` with a PRIVATE `inner`
 //!    field (private to `mod param_oids_slot`). The field is
 //!    unreachable even from `mod protocol` — direct
 //!    `*self.param_oids_slot.inner = ...` does not compile. The only
@@ -96,7 +96,7 @@
 //! # Bench cost
 //!
 //! The Cell is `#[repr(transparent)]` over
-//! `Option<alloc::boxed::Box<ParamOids>>`. Read methods (`as_ref`,
+//! `Option<ParamOids>`. Read methods (`as_ref`,
 //! `is_some`, etc.) compile to the same code as the bare `Option`
 //! accessors. Write methods are a single field assignment plus a no-op
 //! token consume; LLVM erases the token (zero-sized type). 0 ns / 0 B
@@ -107,7 +107,7 @@ use crate::action::ParamOids;
 
 /// Tier-1 within-crate write provenance for the protocol's parked
 /// `ParameterDescription` payload. Wraps
-/// `Option<alloc::boxed::Box<ParamOids>>` with a PRIVATE inner field;
+/// `Option<ParamOids>` with a PRIVATE inner field;
 /// writes require per-leaf concrete-type tokens (see module-level
 /// docs).
 ///
@@ -133,7 +133,7 @@ use crate::action::ParamOids;
 )]
 #[repr(transparent)]
 pub struct ParamOidsSlotCell {
-    inner: Option<alloc::boxed::Box<ParamOids>>,
+    inner: Option<ParamOids>,
 }
 
 impl ParamOidsSlotCell {
@@ -164,7 +164,7 @@ impl ParamOidsSlotCell {
         // `Option::as_deref` projects `Option<Box<T>>` → `Option<&T>`
         // without per-call allocation. Tier-1 by `Box::deref` const-
         // identity.
-        self.inner.as_deref()
+        self.inner.as_ref()
     }
 
     /// Returns `true` if the slot is populated. Read-only. Currently
@@ -210,7 +210,7 @@ impl ParamOidsSlotCell {
     #[inline]
     pub(crate) fn park_at_param_desc_dispatch(
         &mut self,
-        oids: alloc::boxed::Box<ParamOids>,
+        oids: ParamOids,
         _token: crate::dispatch::_param_description_dispatch_leaf::ParamDescDispatchToken,
     ) {
         self.inner = Some(oids);
@@ -241,6 +241,6 @@ impl ParamOidsSlotCell {
     #[cfg(test)]
     #[inline]
     pub(crate) fn _set_for_test(&mut self, value: Option<ParamOids>) {
-        self.inner = value.map(alloc::boxed::Box::new);
+        self.inner = value;
     }
 }

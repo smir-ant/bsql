@@ -144,7 +144,7 @@ pub(crate) mod _param_description_dispatch_leaf {
     #[inline]
     pub(in crate::dispatch) fn park_param_oids_at_dispatch(
         slot: &mut crate::param_oids_slot::ParamOidsSlotCell,
-        param_oids: alloc::boxed::Box<crate::action::ParamOids>,
+        param_oids: crate::action::ParamOids,
     ) {
         slot.park_at_param_desc_dispatch(param_oids, ParamDescDispatchToken(()));
     }
@@ -1684,7 +1684,7 @@ pub(crate) fn dispatch(
                 Ok(param_oids) => {
                     _param_description_dispatch_leaf::park_param_oids_at_dispatch(
                         param_oids_slot,
-                        alloc::boxed::Box::new(param_oids),
+                        param_oids,
                     );
                     *state = ProtoState::DescribeStatementAwaitingRowDescOrNoData {
                         reply,

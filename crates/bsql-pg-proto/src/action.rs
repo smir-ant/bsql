@@ -2139,175 +2139,56 @@ impl<'r> DescribedRows<'r> {
     }
 }
 
-/// Bounded list of parameter OIDs returned by server `ParameterDescription`
-/// (`'t'`) in response to a statement-level Describe.
+/// Parameter OIDs from server `ParameterDescription` (`'t'`).
 ///
-/// POD shape: `n_params` (populated count) + `[u32; MAX_PARAMS_ARITY]`
-/// array. `Copy + Default`. Mirrors the [`crate::decode::RowDesc`]
-/// layout one-to-one.
-///
-/// # Bound
-///
-/// The capacity is [`crate::params::MAX_PARAMS_ARITY`] = 16, which
-/// matches the crate's Bind-side cap. A server returning more OIDs
-/// than that means the SQL declared more placeholders than we can
-/// ever Bind against — classified as
-/// [`crate::error::ProtocolError::TooManyParameters`] at parse time,
-/// since the result is useless downstream.
-///
-/// # Niche
-///
-/// Not niche-friendly (`u32` OIDs, empty slots fill with 0 which IS
-/// a valid OID sentinel). `Option<ParamOids>` keeps its full 4-byte
-/// length-count overhead. Since the reply shape always includes
-/// ParamOids (statement-describe only), we never need
-/// `Option<ParamOids>` — the type is always present at the API
-/// surface.
-// Layout pinned `#[repr(C, align(4))]`:
-//
-// - `align(4)` matches the natural alignment of `[u32; _]` — no
-//   drift possible if future code reorders the fields.
-// - `repr(C)` nails field order: `n_params: BoundedU8<MAX>` at
-//   offset 0 (1 B + 3 B padding), `oids` at offset 4, no trailing
-//   pad (total = 4 + 16*4 = 68).
-//
-// (2026-05-23): migrated `n_params` from `u16` to
-// `BoundedU8<MAX_PARAMS_ARITY>`. Tier-3 by-validation → tier-1
-// by-construction: the type itself enforces `0 ≤ n_params ≤
-// MAX_PARAMS_ARITY (= 16)`. A future refactor that constructs a
-// `ParamOids` with `n_params > MAX_PARAMS_ARITY` is a compile error
-// (BoundedU8's NonZeroU8-backed offset-by-one storage rejects
-// out-of-range values at the `try_new` / `new_const` constructor).
-// Size unchanged at 68 B (align(4) absorbs the 1-byte field into
-// the same 4-byte slot the u16 occupied).
-//
-// The padding bytes at offsets 1..4 are ALWAYS zero via the
-// `EMPTY` / `from_parts` constructors (both initialise `oids` from
-// a fully-populated `[u32; N]`, and the `n_params: BoundedU8` slot
-// leaves its 3 padding bytes untouched — `Copy` struct init zeroes
-// padding in practice, but to remain portable across future
-// refactors, the `const _: () = assert!` below pins size and
-// alignment so any drift fails the build.
-#[derive(Debug, Clone, Copy)]
-#[repr(C, align(4))]
+/// Exact-size heap allocation. No fixed cap.
+/// Same pattern as [`crate::decode::RowDesc`]: newtype over
+/// `Box<[u32]>` — the slice IS the OID list. `len()` = param count.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamOids {
-    n_params: crate::bounded::BoundedU8<{ crate::params::MAX_PARAMS_ARITY }>,
-    oids: [u32; crate::params::MAX_PARAMS_ARITY],
-}
-
-// Drift pin: bumping `MAX_PARAMS_ARITY` or swapping the field
-// order without updating this assertion fails the build. Size
-// must be `2 (u16) + 2 (pad) + 4 * MAX_PARAMS_ARITY`.
-const _: () = assert!(
-    core::mem::size_of::<ParamOids>()
-        == 4usize.saturating_add(4usize.saturating_mul(crate::params::MAX_PARAMS_ARITY)),
-    "ParamOids layout drift — expected size = 4 (u16 + 2-byte pad) + 4 * MAX_PARAMS_ARITY",
-);
-const _: () = assert!(
-    core::mem::align_of::<ParamOids>() == 4,
-    "ParamOids alignment drift — expected 4 (u32-aligned oids array forces this)",
-);
-// SIMD-wide PartialEq pin: tail slots are constructor-filled with
-// 0 so full-array `self.oids == other.oids` is byte-equivalent to
-// a populated-prefix compare. Requiring total array size ≤ 64
-// bytes keeps it within a single AVX2 register. If
-// `MAX_PARAMS_ARITY` grows past 16, revisit eq strategy
-// (populated-prefix might become cheaper than the wide compare).
-const _: () = assert!(
-    4usize.saturating_mul(crate::params::MAX_PARAMS_ARITY) <= 64,
-    "ParamOids eq is SIMD-wide (≤64 bytes). \
-     Revisit populated-prefix eq if MAX_PARAMS_ARITY grows > 16.",
-);
-
-impl Default for ParamOids {
-    #[inline]
-    fn default() -> Self {
-        Self::EMPTY
-    }
+    oids: alloc::boxed::Box<[u32]>,
 }
 
 impl ParamOids {
-    /// Empty descriptor (0 parameters). Used as the default for
-    /// statements that declare no parameters.
-    pub const EMPTY: Self = Self {
-        n_params: crate::bounded::BoundedU8::ZERO,
-        oids: [0; crate::params::MAX_PARAMS_ARITY],
-    };
-
-    /// Construct from a populated count + a full-capacity OID array.
-    /// `pub(crate)` — only the parser creates these; users read.
-    ///
-    /// `n_params: BoundedU8<MAX_PARAMS_ARITY>` enforces the
-    /// `0 ≤ n ≤ MAX_PARAMS_ARITY` invariant at the type level
-    /// (). Callers parsing the wire frame validate the
-    /// declared count against MAX_PARAMS_ARITY first, then construct
-    /// a BoundedU8 via `try_new` — the out-of-range case classifies
-    /// as `ProtocolError::TooManyParameters` BEFORE reaching this
-    /// constructor.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn from_parts(
-        n_params: crate::bounded::BoundedU8<{ crate::params::MAX_PARAMS_ARITY }>,
-        oids: [u32; crate::params::MAX_PARAMS_ARITY],
-    ) -> Self {
-        Self { n_params, oids }
+    /// Empty descriptor (0 parameters).
+    pub fn empty() -> Self {
+        Self {
+            oids: alloc::vec::Vec::new().into_boxed_slice(),
+        }
     }
 
-    /// Number of populated parameters.
+    /// Construct from a slice of OIDs.
+    pub(crate) fn from_slice(oids: &[u32]) -> Self {
+        Self {
+            oids: alloc::vec::Vec::from(oids).into_boxed_slice(),
+        }
+    }
+
+    /// Number of parameters.
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        usize::from(self.n_params.get())
+        self.oids.len()
     }
 
-    /// Whether the descriptor carries any parameters.
+    /// Whether the descriptor is empty.
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.n_params.get() == 0
+        self.oids.is_empty()
     }
 
-    /// Borrow the populated OIDs as a slice — tail default-filled
-    /// slots are not exposed.
-    ///
-    /// Explicit `split_at_checked` match.
-    /// `self.n_params ≤ MAX_PG_PARAMS ≤ self.oids.len()` by
-    /// construction; the `None` arm is architecturally unreachable
-    /// (empty-slice sentinel — same observable as "zero params",
-    /// no corruption vector). A naive `.unwrap_or(&[])` would form
-    /// the banned silent-fallback pattern.
+    /// Borrow the OIDs as a slice.
     #[inline]
     #[must_use]
     pub fn oids(&self) -> &[u32] {
-        let n = self.len();
-        match self.oids.split_at_checked(n) {
-            Some((head, _)) => head,
-            None => &[],
-        }
+        &self.oids
     }
 
-    /// Get one OID by index, or `None` if out of range.
-    ///
-    /// # Returns `Option<u32>` by value (not `Option<&u32>`)
-    ///
-    /// On 64-bit targets `u32` is 4 bytes vs `&u32` at 8 bytes. Returning
-    /// the value directly is strictly smaller. The asymmetry with
-    /// [`crate::decode::RowDesc::get`] (which returns `Option<&ColumnDesc>`)
-    /// is **intentional and size-driven**: `ColumnDesc` is 8 bytes on
-    /// x86_64, so `&ColumnDesc` (8 B) and `ColumnDesc` (8 B) are
-    /// equivalent at the ABI — but `&ColumnDesc` preserves identity
-    /// if the caller wants pointer-stability. For `ParamOids::get`
-    /// none of those pointer-stability arguments apply: OIDs are
-    /// opaque u32 catalog lookups, never-mutated, cheap to copy.
-    ///
-    /// Do NOT "normalise" this to `Option<&u32>` in a future refactor
-    /// — the by-value form is deliberate.
+    /// Get one OID by index.
     #[inline]
     #[must_use]
     pub fn get(&self, idx: usize) -> Option<u32> {
-        if idx >= self.len() {
-            return None;
-        }
         self.oids.get(idx).copied()
     }
 }
@@ -2334,12 +2215,7 @@ impl ParamOids {
 //    per Parse round-trip — not per-row. 60 B × N describes is
 //    negligible vs `OutActions` per-feed_bytes already-addressed
 //    overhead.
-impl PartialEq for ParamOids {
-    fn eq(&self, other: &Self) -> bool {
-        self.n_params.get() == other.n_params.get() && self.oids == other.oids
-    }
-}
-impl Eq for ParamOids {}
+// PartialEq + Eq derived on the struct via Box<[u32]>.
 
 /// Typed payload for [`crate::reply_id::DescribeStatementKind`] replies.
 ///

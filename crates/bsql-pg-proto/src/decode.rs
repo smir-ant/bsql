@@ -557,22 +557,6 @@ pub(crate) fn parse_parameter_description(
     let n_params = u16::try_from(n_params_i16).map_err(|_| malformed())?;
     let n_params_usize = usize::from(n_params);
 
-    // Tier-1 structural: reject counts too high for inline storage.
-    // MAX_PARAMS_ARITY matches the Bind-side cap — receiving more
-    // OIDs than we can ever Bind against means the describe result
- // is useless downstream. Per , the validated count flows
-    // into a `BoundedU8<MAX_PARAMS_ARITY>` field at the
-    // `from_parts` call below — the type itself rejects out-of-range
-    // values, so this check + the typed witness together form a
-    // tier-1 by-construction proof that `n_params ≤ MAX_PARAMS_ARITY`
-    // at every observation point.
-    if n_params_usize > crate::params::MAX_PARAMS_ARITY {
-        return Err(ProtocolError::TooManyParameters {
-            count: n_params_usize,
-            max: crate::params::MAX_PARAMS_ARITY,
-        });
-    }
-
     // Body length must exactly equal `count × 4` (one i32 per OID).
     // Trailing bytes imply wire corruption; short body implies the
     // declared count lies. Both classify as framing error.
@@ -587,30 +571,15 @@ pub(crate) fn parse_parameter_description(
     // body-length check above proves remaining bytes suffice) yet
     // surfaces as `Err(malformed())` rather than `unreachable!()`
     // (forbid-bundle).
-    let mut oids = [0u32; crate::params::MAX_PARAMS_ARITY];
+    let mut oids = alloc::vec::Vec::with_capacity(n_params_usize);
     let mut cursor = rest;
-    for slot in oids.iter_mut().take(n_params_usize) {
+    for _i in 0..n_params_usize {
         let (chunk, tail) = cursor.split_first_chunk::<4>().ok_or_else(malformed)?;
-        *slot = u32::from_be_bytes(*chunk);
+        oids.push(u32::from_be_bytes(*chunk));
         cursor = tail;
     }
 
- // Convert validated u16 → BoundedU8<MAX_PARAMS_ARITY> ().
-    // The `n_params_usize ≤ MAX_PARAMS_ARITY (= 16 < 256)` check
-    // above proves the u8 narrow is lossless, and `try_new` rejects
-    // out-of-range — both arms folded into one classified
-    // `MalformedParameterDescription` early-return for the
-    // architecturally-dead case (the upstream bounds check covers
-    // it).
-    let n_params_u8 = match u8::try_from(n_params_usize) {
-        Ok(v) => v,
-        Err(_) => return Err(malformed()),
-    };
-    let n_params_bounded = match crate::bounded::BoundedU8::<{ crate::params::MAX_PARAMS_ARITY }>::try_new(n_params_u8) {
-        Some(b) => b,
-        None => return Err(malformed()),
-    };
-    Ok(crate::action::ParamOids::from_parts(n_params_bounded, oids))
+    Ok(crate::action::ParamOids::from_slice(&oids))
 }
 
 // ════════════════════════════════════════════════════════════════════
