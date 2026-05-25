@@ -499,6 +499,14 @@ pub(crate) fn command_tags_arena_or_init(
     })
 }
 
+pub(crate) fn notices_arena_or_init(
+    slot: &mut Option<alloc::boxed::Box<crate::notices_arena::NoticesArena>>,
+) -> &mut crate::notices_arena::NoticesArena {
+    slot.get_or_insert_with(|| {
+        alloc::boxed::Box::new(crate::notices_arena::NoticesArena::new())
+    })
+}
+
 /// Per-phase Inner for `<ConnectingPhase>`.
 ///
 /// Every `SealedPhase` now points at a per-phase Inner:
@@ -630,11 +638,11 @@ pub struct ActiveInner {
     /// `NotificationRef`s — defence-in-depth against the wrapper
     /// stashing refs past the cycle boundary).
     notifications_arena: Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
-    /// Lazy-init slot for COPY OUT data chunks .
-    /// Mirror of `notifications_arena`. Connections that never issue
-    /// COPY pay zero; first CopyData arrival allocates one
-    /// `Box<CopyChunksArena>` for the connection's lifetime. Cleared
-    /// per `feed_bytes` cycle.
+    /// Lazy-init slot for server notices (WARNING/NOTICE/INFO/DEBUG/LOG).
+    /// Mirror of `notifications_arena`. Connections that never receive
+    /// notices pay zero; first NoticeResponse allocates one Box.
+    notices_arena: Option<alloc::boxed::Box<crate::notices_arena::NoticesArena>>,
+    /// Lazy-init slot for COPY OUT data chunks.
     copy_chunks_arena: Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
     /// Lazy-init slot for multi-statement intermediate
     /// command tags (). Mirror of `notifications_arena`.
@@ -763,9 +771,11 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
     /// reads + writes this slot.
     pub(in crate::protocol) notifications_arena:
         &'r mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
-    /// COPY chunks arena threaded from
-    /// `ActiveInner.copy_chunks_arena`. Connecting phase uses
-    /// transient empty slot (LISTEN-arena mirror pattern).
+    /// Notices arena threaded from `ActiveInner.notices_arena`.
+    /// Connecting phase uses transient empty slot.
+    pub(in crate::protocol) notices_arena:
+        &'r mut Option<alloc::boxed::Box<crate::notices_arena::NoticesArena>>,
+    /// COPY chunks arena threaded from `ActiveInner.copy_chunks_arena`.
     pub(in crate::protocol) copy_chunks_arena:
         &'r mut Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
     /// : intermediate command-tag arena threaded from
@@ -1990,6 +2000,7 @@ pub(crate) mod _proto_init_leaf {
             session_params: crate::session_params_slot::SessionParamsCell::empty(token),
             error_arena: None,
             notifications_arena: None,
+            notices_arena: None,
             copy_chunks_arena: None,
             command_tags_arena: None,
             partial_assembly: crate::partial_assembly::PartialAssemblyCell::empty(token),
@@ -2310,6 +2321,7 @@ impl PgProtocol<DisconnectedPhase> {
                             | StagedAction::CloseSocket
                             | StagedAction::DeliverReply(_)
                             | StagedAction::Notify { .. }
+                            | StagedAction::Notice { .. }
                             | StagedAction::IntermediateCommandComplete { .. }
                             | StagedAction::CopyDataChunk { .. } => {
                                 // compute_push_startup_idle_only emits
@@ -2566,6 +2578,7 @@ impl PgProtocol<ConnectingPhase> {
                     session_params,
                     error_arena,
                     notifications_arena: None,
+                    notices_arena: None,
                     copy_chunks_arena: None,
                     command_tags_arena: None,
                     partial_assembly,
@@ -3800,6 +3813,7 @@ impl PgProtocol<ActivePhase> {
                         }
                     }
                     StagedAction::Notify { .. }
+                    | StagedAction::Notice { .. }
                     | StagedAction::IntermediateCommandComplete { .. }
                     | StagedAction::CopyDataChunk { .. } => {
                         // : Notify is staged ONLY by the dispatch
@@ -4194,11 +4208,9 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
             if let Some(arena) = notifications_arena.as_deref_mut() {
                 arena.clear();
             }
-            // clear copy chunks arena similarly.
             if let Some(arena) = copy_chunks_arena.as_deref_mut() {
                 arena.clear();
             }
-            // : clear intermediate command-tags arena.
             // Refs issued in prior cycles become Stale here; the
             // wrapper's OutActions iteration is complete by the time
             // the next push transitions back to Idle.
@@ -4226,11 +4238,9 @@ pub(in crate::protocol) fn clear_session_residue_for_class_dispatch(
             if let Some(arena) = notifications_arena.as_deref_mut() {
                 arena.clear();
             }
-            // same for copy chunks arena.
             if let Some(arena) = copy_chunks_arena.as_deref_mut() {
                 arena.clear();
             }
-            // : same for intermediate command-tags arena.
             if let Some(arena) = command_tags_arena.as_deref_mut() {
                 arena.clear();
             }
@@ -4321,6 +4331,7 @@ where
         session_params: session_params_slot,
         error_arena: error_arena_slot,
         notifications_arena: notifications_arena_slot,
+        notices_arena: notices_arena_slot,
         copy_chunks_arena: copy_chunks_arena_slot,
         command_tags_arena: command_tags_arena_slot,
         partial_assembly: partial_assembly_slot,
@@ -4340,6 +4351,9 @@ where
         crate::state::StatePushClass::Idle
             | crate::state::StatePushClass::Errored(_)
     ) {
+        if let Some(arena) = notices_arena_slot.as_deref_mut() {
+            arena.clear();
+        }
         clear_session_residue_for_class_dispatch(
             terminal_row_desc,
             terminal_param_oids,
@@ -4695,6 +4709,14 @@ where
                         _notice_response_admit_leaf::admit_notice_response_frame(
                             session_params_slot,
                         );
+                        let notices_arena = notices_arena_or_init(notices_arena_slot);
+                        if let Some(notice_ref) =
+                            crate::dispatch::parse_and_alloc_notice(payload, notices_arena)
+                        {
+                            emit_actions!(&mut staged, budget: 1, [
+                                StagedAction::Notice { notice_ref },
+                            ]);
+                        }
                         frames_consumed =
                             frames_consumed.wrapping_add(total_len);
                         continue;
@@ -5066,8 +5088,8 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     // must exist for the shared dispatch body's type signature.
     let mut transient_notifications_arena:
         Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>> = None;
-    // COPY chunks arena transient for Connecting
-    // (COPY is post-handshake; never fires in Connecting state).
+    let mut transient_notices_arena:
+        Option<alloc::boxed::Box<crate::notices_arena::NoticesArena>> = None;
     let mut transient_copy_chunks_arena:
         Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>> = None;
     // : intermediate command-tags arena transient for
@@ -5108,6 +5130,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
             session_params,
             error_arena,
             notifications_arena: &mut transient_notifications_arena,
+            notices_arena: &mut transient_notices_arena,
             copy_chunks_arena: &mut transient_copy_chunks_arena,
             command_tags_arena: &mut transient_command_tags_arena,
             partial_assembly,
@@ -5205,8 +5228,8 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
     /// transient empty slot at the wrapper level.
     pub(in crate::protocol) notifications_arena:
         &'r mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
-    /// copy_chunks_arena threaded for COPY OUT
-    /// data emission.
+    pub(in crate::protocol) notices_arena:
+        &'r mut Option<alloc::boxed::Box<crate::notices_arena::NoticesArena>>,
     pub(in crate::protocol) copy_chunks_arena:
         &'r mut Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
     /// : command_tags_arena threaded from
@@ -5270,6 +5293,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         session_params,
         error_arena,
         notifications_arena,
+        notices_arena,
         copy_chunks_arena,
         command_tags_arena,
         partial_assembly,
@@ -5299,6 +5323,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
             session_params,
             error_arena,
             notifications_arena,
+            notices_arena,
             copy_chunks_arena,
             command_tags_arena,
             partial_assembly,
@@ -5726,6 +5751,7 @@ impl ActiveInner {
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 notifications_arena: &mut self.notifications_arena,
+                notices_arena: &mut self.notices_arena,
                 copy_chunks_arena: &mut self.copy_chunks_arena,
                 command_tags_arena: &mut self.command_tags_arena,
                 partial_assembly: &mut self.partial_assembly,
@@ -5811,6 +5837,7 @@ impl ActiveInner {
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 notifications_arena: &mut self.notifications_arena,
+                notices_arena: &mut self.notices_arena,
                 copy_chunks_arena: &mut self.copy_chunks_arena,
                 command_tags_arena: &mut self.command_tags_arena,
                 partial_assembly: &mut self.partial_assembly,
@@ -6214,6 +6241,30 @@ impl PgProtocol<ActivePhase> {
         static EMPTY_ARENA: crate::notifications_arena::NotificationsArena =
             crate::notifications_arena::NotificationsArena::new();
         let arena = match self.inner.notifications_arena.as_deref() {
+            Some(a) => a,
+            None => &EMPTY_ARENA,
+        };
+        arena.get(r)
+    }
+
+    /// Resolve a `NoticeRef` to the notice payload.
+    ///
+    /// Returns the server-sent notice text (severity, code, message,
+    /// detail, hint). Refs are valid only within the `feed_bytes`
+    /// cycle that produced them — after the next call, stale refs
+    /// return `Err(ArenaError::Stale)`.
+    #[inline]
+    #[must_use]
+    pub fn get_notice(
+        &self,
+        r: crate::notices_arena::NoticeRef,
+    ) -> Result<
+        &crate::notices_arena::NoticePayload,
+        crate::error_arena::ArenaError,
+    > {
+        static EMPTY_ARENA: crate::notices_arena::NoticesArena =
+            crate::notices_arena::NoticesArena::new();
+        let arena = match self.inner.notices_arena.as_deref() {
             Some(a) => a,
             None => &EMPTY_ARENA,
         };
@@ -8987,6 +9038,7 @@ fn materialise<'w>(
             // `PgProtocol::get_notification` within the OutActions
             // iteration cycle.
             StagedAction::Notify { pid, notif_ref } => Action::Notify { pid, notif_ref },
+            StagedAction::Notice { notice_ref } => Action::Notice { notice_ref },
             // : IntermediateCommandComplete passes through —
             // : `tag_ref` (CommandTagRef, 4 B Copy) passes
             // through unchanged. The wrapper resolves via
@@ -9710,7 +9762,7 @@ mod compute_push_tests {
                 // routes through here (build will pass; the test
                 // observing actions sees `CloseSocket` and either
                 // tolerates it or fails on the unexpected variant).
-                StagedAction::Notify { .. } => Self::CloseSocket,
+                StagedAction::Notify { .. } | StagedAction::Notice { .. } => Self::CloseSocket,
                 // : IntermediateCommandComplete — same
                 // sentinel-CloseSocket mapping; no cfg(test) PgCommand
                 // fixture exercises multi-statement batch dispatch.

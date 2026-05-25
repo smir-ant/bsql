@@ -245,6 +245,8 @@ pub(crate) mod error_arena;
 pub use error_arena::{ArenaError, DisplayError, ErrorPayload, ErrorRef};
 pub(crate) mod notifications_arena;
 pub use notifications_arena::{NotificationPayload, NotificationRef};
+pub(crate) mod notices_arena;
+pub use notices_arena::{NoticePayload, NoticeRef};
 pub(crate) mod copy_chunks_arena;
 pub use copy_chunks_arena::{CopyChunkPayload, CopyChunkRef};
 pub(crate) mod command_tags_arena;
@@ -802,7 +804,7 @@ const _: () = assert!(
 // on a quiet system (`load avg < 8`). On regression, investigate
 // (asm-diff, alternative shapes), do NOT roll back tier elevations.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 400,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 408,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      .b: pin stays at 528 B post-.b — the \
@@ -897,7 +899,7 @@ const _: () = assert!(
 // phase_marker; measured 528 B on aarch64-apple-darwin (post-// slot-pattern lift of `Box<ParamOids>` from state variants to
 // Extras slot; post-notifications_arena slot).
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 400,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 408,
     "PgProtocol<ActivePhase> layout drift — must equal ActiveInner \
      PLUS Extras = ActiveExtras (RowDescSlotCell + ParamOidsSlotCell \
      + CommandTagSlotCell + TxStatusSlotCell + FailCauseSlotCell) \

@@ -1367,7 +1367,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             Some(Action::FailReply { id }) => SlowPathFirst::Failed { id: *id },
             Some(Action::CloseSocket) => SlowPathFirst::Closed,
             Some(Action::SendBytes(_)) => SlowPathFirst::SendBytes,
-            Some(Action::Notify { .. }) => SlowPathFirst::Other,
+            Some(Action::Notify { .. }) | Some(Action::Notice { .. }) => SlowPathFirst::Other,
             Some(Action::IntermediateCommandComplete { .. }) => SlowPathFirst::Other,
             Some(Action::CopyDataChunk { .. }) => SlowPathFirst::Other,
         };

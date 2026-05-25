@@ -857,6 +857,15 @@ pub enum Action<'w> {
         notif_ref: crate::notifications_arena::NotificationRef,
     },
 
+    /// Server notice (WARNING, NOTICE, INFO, DEBUG, LOG) delivered
+    /// via the notices arena. Resolve via
+    /// [`crate::PgProtocol::get_notice`]. Unlike errors, notices are
+    /// non-fatal — the query continues normally after delivery.
+    Notice {
+        /// Gen-tagged handle into the notices arena.
+        notice_ref: crate::notices_arena::NoticeRef,
+    },
+
     /// Multi-statement batch intermediate command-complete signal
     /// (). PG SimpleQuery (Q frame) accepts `;`-separated
     /// batches like `"BEGIN; UPDATE; UPDATE; COMMIT;"` — the
@@ -1312,7 +1321,14 @@ pub(crate) enum StagedAction<'sql> {
         /// Gen-tagged arena handle.
         notif_ref: crate::notifications_arena::NotificationRef,
     },
-    /// Map to [`Action::IntermediateCommandComplete`] —     /// multi-statement SimpleQuery support. Emitted by the
+    /// Map to [`Action::Notice`]. Arena ref by value (Copy);
+    /// materialise passes through unchanged.
+    Notice {
+        /// Gen-tagged handle into notices arena.
+        notice_ref: crate::notices_arena::NoticeRef,
+    },
+    /// Map to [`Action::IntermediateCommandComplete`] —
+    /// multi-statement SimpleQuery support. Emitted by the
     /// `SimpleQueryAwaitingRfq` dispatch arms when a SECOND+
     /// CommandComplete / RowDescription / EmptyQueryResponse arrives
     /// before RFQ (i.e., the original Q frame batched multiple

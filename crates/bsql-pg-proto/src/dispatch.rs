@@ -3147,6 +3147,96 @@ fn parse_error_response(
     }
 }
 
+/// Parse a `NoticeResponse` payload into a [`crate::notices_arena::NoticePayload`]
+/// and allocate it into the notices arena.
+///
+/// Same wire format as ErrorResponse. Uses `BoundedStr` (not Secret)
+/// because notices carry operator-informational text, not credentials.
+#[cold]
+pub(crate) fn parse_and_alloc_notice(
+    payload: &[u8],
+    notices_arena: &mut crate::notices_arena::NoticesArena,
+) -> Option<crate::notices_arena::NoticeRef> {
+    use crate::error::SqlStateCode;
+    use crate::ident::BoundedStr;
+
+    let mut severity: BoundedStr<32> = BoundedStr::default();
+    let mut code = SqlStateCode::from_bytes(b"");
+    let mut message: BoundedStr<128> = BoundedStr::default();
+    let mut detail: BoundedStr<96> = BoundedStr::default();
+    let mut hint: BoundedStr<64> = BoundedStr::default();
+
+    const MAX_FIELDS: usize = self::MAX_ERROR_FIELDS;
+    let mut pos: usize = 0;
+    for _ in 0..MAX_FIELDS {
+        let field_type = match payload.get(pos) {
+            Some(0) | None => break,
+            Some(b) => *b,
+        };
+        pos = match pos.checked_add(1) {
+            Some(p) => p,
+            None => break,
+        };
+        let tail: &[u8] = match payload.split_at_checked(pos) {
+            Some((_head, tail)) => tail,
+            None => {
+                core::hint::cold_path();
+                &[]
+            }
+        };
+        let value_bytes;
+        match tail.iter().position(|&b| b == 0) {
+            Some(n) => {
+                value_bytes = match tail.split_at_checked(n) {
+                    Some((head, _)) => head,
+                    None => {
+                        core::hint::cold_path();
+                        &[]
+                    }
+                };
+                pos = pos.saturating_add(n).saturating_add(1);
+            }
+            None => {
+                value_bytes = tail;
+                pos = payload.len();
+            }
+        }
+
+        match field_type {
+            b'S' | b'V' => {
+                if severity.is_empty() {
+                    severity = crate::ident::LossyText::from_bytes_lossy(value_bytes)
+                        .to_bounded::<32>();
+                }
+            }
+            b'C' => {
+                code = SqlStateCode::from_bytes(value_bytes);
+            }
+            b'M' => {
+                message = crate::ident::LossyText::from_bytes_lossy(value_bytes)
+                    .to_bounded::<128>();
+            }
+            b'D' => {
+                detail = crate::ident::LossyText::from_bytes_lossy(value_bytes)
+                    .to_bounded::<96>();
+            }
+            b'H' => {
+                hint = crate::ident::LossyText::from_bytes_lossy(value_bytes)
+                    .to_bounded::<64>();
+            }
+            _ => {}
+        }
+    }
+
+    notices_arena.alloc(crate::notices_arena::NoticePayload {
+        severity,
+        code,
+        message,
+        detail,
+        hint,
+    })
+}
+
 // -----------------------------------------------------------------
 // Helper: parse BackendKeyData
 // -----------------------------------------------------------------
