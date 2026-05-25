@@ -491,7 +491,7 @@ const _: fn() = || {
     assert_send::<action::Reply>();
     assert_send::<command::PgCommand>();
     assert_send::<error::ProtocolError>();
-    assert_send::<protocol::PgProtocol>();
+    assert_send::<protocol::PgProtocol<protocol::ActivePhase>>();
     // `ReplyId` is generic over `K: ReplyKind`. The nominal kind
     // parameter is `PhantomData<fn() -> K>` (ZST, unconditionally
     // `Send + Sync`), so assert_send holds for every `K`; checking
@@ -570,7 +570,7 @@ const _: fn() = || {
 
     // If `PgProtocol: Sync`, the two impls above collide on method
     // resolution — this line fails to compile.
-    <protocol::PgProtocol as AmbiguousIfSync<_>>::assert_not_sync();
+    <protocol::PgProtocol<protocol::ActivePhase> as AmbiguousIfSync<_>>::assert_not_sync();
 };
 
 // ---------------------------------------------------------------------
@@ -802,7 +802,7 @@ const _: () = assert!(
 // on a quiet system (`load avg < 8`). On regression, investigate
 // (asm-diff, alternative shapes), do NOT roll back tier elevations.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol>() == 528,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 528,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      DEF-286 Φ-I.b: pin stays at 528 B post-Φ-I.b — the \

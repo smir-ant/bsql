@@ -160,7 +160,7 @@ use crate::write_buf::WriteBuf;
 /// ```
 #[derive(Debug)]
 pub struct ReadyGuard<'a> {
-    proto: &'a mut PgProtocol,
+    proto: &'a mut PgProtocol<crate::protocol::ActivePhase>,
 }
 
 impl<'a> ReadyGuard<'a> {
@@ -173,7 +173,7 @@ impl<'a> ReadyGuard<'a> {
     /// Production callsite is `PgProtocol::as_ready` which performs
     /// the check via `state.push_class()` exhaustive match.
     #[inline]
-    pub(crate) fn new(proto: &'a mut PgProtocol) -> Self {
+    pub(crate) fn new(proto: &'a mut PgProtocol<crate::protocol::ActivePhase>) -> Self {
         Self { proto }
     }
 

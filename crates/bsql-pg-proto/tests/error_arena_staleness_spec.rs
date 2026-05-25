@@ -223,6 +223,6 @@ fn error_payload_overwrite_zeroizes_old_value() {
 // `_`-prefixed function names suppress the `dead_code` lint by
 // convention; the helper still binds `PgProtocol` so the import
 // survives dead-import checks for any future test-extension scope.
-fn _silence_unused_proto_import() -> Option<PgProtocol> {
+fn _silence_unused_proto_import() -> Option<PgProtocol<bsql_pg_proto::ActivePhase>> {
     None
 }

@@ -240,7 +240,7 @@ fn build_rowdesc() -> alloc::vec::Vec<u8> {
 // `proto.next_reply_id::<K>()` directly inside each scenario.
 
 fn bench_push_or_panic<C: bsql_pg_proto::push_command::PushCommand>(
-    proto: &mut PgProtocol,
+    proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>,
     cmd: C,
     wb: &mut WriteBuf,
 ) -> Result<(), PushFailure> {

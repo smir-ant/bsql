@@ -45,7 +45,7 @@ use core::num::NonZeroU64;
 /// Default-phase shape is on `<ActivePhase>`. For
 /// `<DisconnectedPhase>` (pre-Startup mint) callers use
 /// [`mint_reply_disconnected`] (same body, different phase type).
-pub fn mint_reply<K: ReplyKind>(proto: &mut PgProtocol) -> (ReplyId<K>, NonZeroU64) {
+pub fn mint_reply<K: ReplyKind>(proto: &mut PgProtocol<ActivePhase>) -> (ReplyId<K>, NonZeroU64) {
     let id = proto.next_reply_id::<K>();
     let raw = id.get();
     (id, raw)
@@ -289,7 +289,7 @@ fn actions_to_scratch(actions: OutActions<'_>) -> std::vec::Vec<u8> {
     scratch
 }
 
-impl PushOrPanic for PgProtocol {
+impl PushOrPanic for PgProtocol<ActivePhase> {
     fn push_or_panic<C: PushCommand>(&mut self, cmd: C, wb: &mut WriteBuf) {
         let status = self.connection_status();
         let Some(g) = self.as_ready() else {

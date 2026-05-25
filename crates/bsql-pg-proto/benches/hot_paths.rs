@@ -79,7 +79,7 @@ trait BenchPushOrPanic {
     ) -> Result<(), PushFailure>;
 }
 
-impl BenchPushOrPanic for PgProtocol {
+impl BenchPushOrPanic for PgProtocol<bsql_pg_proto::ActivePhase> {
     #[inline]
     fn bench_push_or_panic<C: bsql_pg_proto::push_command::PushCommand>(
         &mut self,

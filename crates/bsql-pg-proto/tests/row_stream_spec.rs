@@ -129,7 +129,7 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
 
 /// Push a SimpleQuery and assert it produced an outbound `'Q'` frame.
 #[track_caller]
-fn push_simple_query(proto: &mut PgProtocol, reply: ReplyId<QueryKind>, wb: &mut WriteBuf) {
+fn push_simple_query(proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>, reply: ReplyId<QueryKind>, wb: &mut WriteBuf) {
     proto.push_or_panic(
         bsql_pg_proto::push_command::SimpleQuery {
             sql: "SELECT 1",

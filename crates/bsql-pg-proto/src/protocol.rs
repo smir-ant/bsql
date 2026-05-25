@@ -1247,10 +1247,13 @@ pub struct ActiveExtras {
 /// `inner.sync_marker: PhantomData<Cell<()>>` via `repr(transparent)`
 /// auto-trait propagation).
 ///
-/// **Default `P = ActivePhase`** — every `PgProtocol::new()`,
-/// `let proto: PgProtocol = ...`, `impl Trait for PgProtocol`, etc.,
-/// resolves to `PgProtocol<ActivePhase>` without spelling the
-/// parameter out.
+/// **No default `P`** (DEF-246 Phase 6) — every usage must spell
+/// out the phase parameter explicitly: `PgProtocol<ActivePhase>`,
+/// `PgProtocol<ConnectingPhase>`, etc. The pre-DEF-246 default
+/// `P = ActivePhase` hid the phase at call sites, making the
+/// typestate discipline implicit. Removing the default forces
+/// every type-position to be phase-aware — stronger documentation
+/// of the phase topology in the type system.
 ///
 /// # Field-access discipline
 ///
@@ -1276,7 +1279,7 @@ pub struct ActiveExtras {
 /// surface — the inner-data shape stays an internal detail of
 /// `mod protocol` (and its leaf submodules per Rust submodule
 /// visibility rules).
-pub struct PgProtocol<P: SealedPhase = ActivePhase> {
+pub struct PgProtocol<P: SealedPhase> {
     // Per-phase `Inner` storage via the associated type
     // `<P as SealedPhase>::Inner`. Each monomorphisation has a
     // concrete layout:

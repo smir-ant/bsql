@@ -190,7 +190,7 @@ fn large_negotiate_protocol_version_frame(extra_option_name_len: usize) -> std::
 /// Push a SimpleQuery to set up state for tests that need an in-flight
 /// reply (T/E/N/C/A arms during query execution).
 #[track_caller]
-fn push_simple_query(proto: &mut PgProtocol, reply: ReplyId<QueryKind>, wb: &mut WriteBuf) {
+fn push_simple_query(proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>, reply: ReplyId<QueryKind>, wb: &mut WriteBuf) {
     proto.push_or_panic(
         bsql_pg_proto::push_command::SimpleQuery {
             sql: "SELECT 1",

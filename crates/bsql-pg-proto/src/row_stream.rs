@@ -280,7 +280,7 @@ const _: () = assert!(
 pub struct RowStream<'p, 'w> {
     /// Owning borrow of the protocol — all state mutation flows
     /// through this ref.
-    proto: &'p mut PgProtocol,
+    proto: &'p mut PgProtocol<crate::protocol::ActivePhase>,
     /// Caller-owned write buffer. Slow-path emission writes here;
     /// not currently surfaced as an event (Sub-A scope: SendBytes
     /// for SCRAM-mid-handshake is handled by [`PgProtocol::feed_bytes`]
@@ -348,7 +348,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
     /// from inside the crate.
     #[inline]
     #[must_use]
-    pub(crate) fn new(proto: &'p mut PgProtocol, write_buf: &'w mut WriteBuf) -> Self {
+    pub(crate) fn new(proto: &'p mut PgProtocol<crate::protocol::ActivePhase>, write_buf: &'w mut WriteBuf) -> Self {
         Self {
             proto,
             write_buf,

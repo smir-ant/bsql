@@ -93,7 +93,7 @@ fn expect_awaiting_ping_reply(state: &ActiveState, expected: NonZeroU64) {
 /// [`crate::PgProtocol::terminate`] (not shipped yet; lands with the
 /// async wrapper in 1e).
 #[track_caller]
-fn drain_pending_ping(proto: &mut PgProtocol, wb: &mut bsql_pg_proto::WriteBuf) {
+fn drain_pending_ping(proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>, wb: &mut bsql_pg_proto::WriteBuf) {
     let out = proto.feed_bytes(&rfq_frame(b'I'), wb);
     assert_eq!(
         out.len(),
@@ -124,7 +124,7 @@ fn drain_pending_ping(proto: &mut PgProtocol, wb: &mut bsql_pg_proto::WriteBuf) 
 /// surfaced at the top of the test, not masked. Every test that uses
 /// `ping_setup` implicitly validates push-content for free.
 #[track_caller]
-fn ping_setup(proto: &mut PgProtocol, reply: ReplyId<PingKind>, wb: &mut bsql_pg_proto::WriteBuf) {
+fn ping_setup(proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>, reply: ReplyId<PingKind>, wb: &mut bsql_pg_proto::WriteBuf) {
     proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, wb);
     // F33: assert the LITERAL 5-byte Sync wire layout from PG §55.7 —
     // tag 'S' + BE u32 length-field `4`. This is the load-bearing wire

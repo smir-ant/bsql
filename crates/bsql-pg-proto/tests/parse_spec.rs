@@ -88,7 +88,7 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
 /// here, not a reference to the internal `SYNC_WIRE_BYTES` const.
 #[track_caller]
 fn parse_setup(
-    proto: &mut PgProtocol,
+    proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>,
     stmt_name: StmtName,
     sql_text: &str,
     reply: ReplyId<ParseKind>,

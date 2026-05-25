@@ -144,7 +144,7 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
 /// per PG §55.2.4).
 #[track_caller]
 fn simple_query_setup(
-    proto: &mut PgProtocol,
+    proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>,
     reply: ReplyId<QueryKind>,
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {

@@ -13,22 +13,22 @@ use common::{PushOrPanic, fresh_active_via_trust_handshake};
 // takes `&mut PgProtocol` to mint via the production API. Helpers
 // are typed for `<ActivePhase>`; the tests below all start with a
 // real Trust handshake.
-fn ping_id(proto: &mut PgProtocol) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::PingKind> {
+fn ping_id(proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::PingKind> {
     proto.next_reply_id()
 }
 
-fn query_id(proto: &mut PgProtocol) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::QueryKind> {
+fn query_id(proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::QueryKind> {
     proto.next_reply_id()
 }
 
-fn parse_id(proto: &mut PgProtocol) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::ParseKind> {
+fn parse_id(proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>) -> bsql_pg_proto::reply_id::ReplyId<bsql_pg_proto::reply_id::ParseKind> {
     proto.next_reply_id()
 }
 
 // `<DisconnectedPhase>` has its own `next_reply_id` and
 // `push_startup` consumes the ID — no separate `startup_id` helper.
 
-fn push_ping(proto: &mut PgProtocol, wb: &mut WriteBuf) {
+fn push_ping(proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>, wb: &mut WriteBuf) {
     let reply = ping_id(proto);
     proto.push_or_panic(bsql_pg_proto::push_command::Ping { reply }, wb);
     // Bytes live in `wb` (Sync = 5 B for Ping). The helper's tier-1

@@ -150,7 +150,7 @@ fn error_response_frame(message: &[u8]) -> std::vec::Vec<u8> {
 /// the additional `'D'` tag check (PG §55.2.2 — Describe message).
 #[track_caller]
 fn describe_stmt_setup(
-    proto: &mut PgProtocol,
+    proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>,
     stmt_name: StmtName,
     reply: ReplyId<DescribeStatementKind>,
     wb: &mut WriteBuf,
@@ -171,7 +171,7 @@ fn describe_stmt_setup(
 /// Push a portal describe + verify wire layout.
 #[track_caller]
 fn describe_portal_setup(
-    proto: &mut PgProtocol,
+    proto: &mut PgProtocol<bsql_pg_proto::ActivePhase>,
     portal_name: PortalName,
     reply: ReplyId<DescribePortalKind>,
     wb: &mut WriteBuf,
