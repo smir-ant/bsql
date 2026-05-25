@@ -422,35 +422,40 @@ pub(crate) struct PartialAssemblyInner {
     /// receives at dispatch time. After
     /// `prefix_buf.len() == PREFIX_CAP`, further absorb calls
     /// count-and-skip via `body_remaining` decrement.
-    prefix_buf: heapless::Vec<u8, PREFIX_CAP>,
+    copy_cap: u32,
+    prefix_buf: alloc::vec::Vec<u8>,
+}
+
+/// Per-tag copy limit. RowDescription ('T') copies the entire body
+/// (parser needs all columns). All other tags cap at PREFIX_CAP.
+fn effective_copy_cap(tag: u8, declared_body_len: u32) -> u32 {
+    if tag == crate::wire::TAG_ROW_DESCRIPTION.byte() {
+        declared_body_len
+    } else {
+        let cap = crate::narrow::u32_from_usize_under_u32_bound(PREFIX_CAP);
+        core::cmp::min(declared_body_len, cap)
+    }
 }
 
 impl PartialAssemblyInner {
-    /// Construct a fresh assembly for the given tag + declared body
-    /// length. Allocates an empty `heapless::Vec<u8, PREFIX_CAP>` — no
-    /// heap allocation for the vec itself; the surrounding Box absorbs
-    /// the only heap cost.
     #[inline]
     fn new(tag: u8, declared_body_len: u32) -> Self {
+        let cap = effective_copy_cap(tag, declared_body_len);
+        let cap_usize = crate::narrow::usize_from_u32(cap);
         Self {
             tag,
             body_remaining: declared_body_len,
-            prefix_buf: heapless::Vec::new(),
+            copy_cap: cap,
+            prefix_buf: alloc::vec::Vec::with_capacity(cap_usize),
         }
     }
 
-    /// Reset the accumulator to host a fresh partial frame, preserving
-    /// the underlying Vec's allocation (which lives inline in the Box
-    /// regardless of its `len`).
-    ///
-    /// Mirrors [`PartialAssemblyCell::enter_at_dispatch`]'s box-reuse
-    /// pattern: amortises heap-alloc cost across re-entries on the same
-    /// connection.
     #[inline]
     fn reset(&mut self, tag: u8, declared_body_len: u32) {
         self.prefix_buf.clear();
         self.tag = tag;
         self.body_remaining = declared_body_len;
+        self.copy_cap = effective_copy_cap(tag, declared_body_len);
     }
 
     /// **Stream-and-truncate absorb**: consume up to
@@ -497,25 +502,11 @@ impl PartialAssemblyInner {
         // Prefix accumulator: copy at most `prefix_headroom` bytes
         // from the consumed prefix into `prefix_buf`. Bytes beyond
         // `prefix_headroom` are counted-and-skipped (not copied).
-        let prefix_headroom = PREFIX_CAP.saturating_sub(self.prefix_buf.len());
+        let cap_usize = crate::narrow::usize_from_u32(self.copy_cap);
+        let prefix_headroom = cap_usize.saturating_sub(self.prefix_buf.len());
         let copy_take = core::cmp::min(take, prefix_headroom);
-        // `copy_take <= take == consumed.len()` by transitive `min`
-        // — `split_at` infallible.
         let (copy_slice, _spill) = consumed.split_at(copy_take);
-        // `extend_from_slice` returns `Result<(), _>` on overflow of
-        // the const-generic cap. `copy_take <= prefix_headroom`
-        // guarantees fit; the explicit `is_err` discard satisfies
-        // `clippy::let_underscore_must_use` while documenting that
-        // the Err arm is architecturally dead.
-        if self.prefix_buf.extend_from_slice(copy_slice).is_err() {
-            // Architecturally dead — `copy_slice.len() == copy_take
-            // ≤ prefix_headroom`. Reached only via a future
-            // regression that mis-sizes the slice; classify as
-            // "no-op fail-closed" (no copy, body_remaining still
-            // decrements via the full `take` below — wire stream
-            // stays in sync).
-            core::hint::cold_path();
-        }
+        self.prefix_buf.extend_from_slice(copy_slice);
         // body_remaining always decrements by the full `take` —
         // bytes beyond `prefix_headroom` are counted-and-skipped,
         // not copied. `take = min(bytes.len(), owed_usize)` and
