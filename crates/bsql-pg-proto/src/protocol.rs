@@ -7281,10 +7281,24 @@ fn compute_push_ping(
             let idle = match crate::state_setter::IdleState::try_from(state) {
                 Some(idle) => idle,
                 None => {
-                    debug_assert!(
-                        false,
-                        "Idle arm of push_class() — try_from returned None (push_class() bug)",
+                    // DEF-286 session audit: glass pattern
+                    // (debug_assert + return) replaced with
+                    // classified error. See CrateBugLocus::
+                    // PushClassIdleMismatch.
+                    *state = ProtoState::Errored(
+                        crate::error::StateErrorKind::from_kind_or_internal(
+                            crate::error::ErrorKind::Internal,
+                        ),
                     );
+                    emit_actions!(staged, budget: 2, [
+                        StagedAction::FailReply {
+                            id: reply.consume(),
+                            cause: ProtocolError::InternalCrateBug {
+                                locus: crate::error::CrateBugLocus::PushClassIdleMismatch,
+                            },
+                        },
+                        StagedAction::CloseSocket,
+                    ]);
                     return;
                 }
             };
@@ -7480,10 +7494,24 @@ fn compute_push_simple_query(
             let idle = match crate::state_setter::IdleState::try_from(state) {
                 Some(idle) => idle,
                 None => {
-                    debug_assert!(
-                        false,
-                        "Idle arm of push_class() — try_from returned None (push_class() bug)",
+                    // DEF-286 session audit: glass pattern
+                    // (debug_assert + return) replaced with
+                    // classified error. See CrateBugLocus::
+                    // PushClassIdleMismatch.
+                    *state = ProtoState::Errored(
+                        crate::error::StateErrorKind::from_kind_or_internal(
+                            crate::error::ErrorKind::Internal,
+                        ),
                     );
+                    emit_actions!(staged, budget: 2, [
+                        StagedAction::FailReply {
+                            id: reply.consume(),
+                            cause: ProtocolError::InternalCrateBug {
+                                locus: crate::error::CrateBugLocus::PushClassIdleMismatch,
+                            },
+                        },
+                        StagedAction::CloseSocket,
+                    ]);
                     return;
                 }
             };
@@ -7761,10 +7789,24 @@ fn compute_push_parse(
             let idle = match crate::state_setter::IdleState::try_from(state) {
                 Some(idle) => idle,
                 None => {
-                    debug_assert!(
-                        false,
-                        "Idle arm of push_class() — try_from returned None (push_class() bug)",
+                    // DEF-286 session audit: glass pattern
+                    // (debug_assert + return) replaced with
+                    // classified error. See CrateBugLocus::
+                    // PushClassIdleMismatch.
+                    *state = ProtoState::Errored(
+                        crate::error::StateErrorKind::from_kind_or_internal(
+                            crate::error::ErrorKind::Internal,
+                        ),
                     );
+                    emit_actions!(staged, budget: 2, [
+                        StagedAction::FailReply {
+                            id: reply.consume(),
+                            cause: ProtocolError::InternalCrateBug {
+                                locus: crate::error::CrateBugLocus::PushClassIdleMismatch,
+                            },
+                        },
+                        StagedAction::CloseSocket,
+                    ]);
                     return;
                 }
             };
@@ -7960,10 +8002,24 @@ fn compute_push_describe_statement(
             let idle = match crate::state_setter::IdleState::try_from(state) {
                 Some(idle) => idle,
                 None => {
-                    debug_assert!(
-                        false,
-                        "Idle arm of push_class() — try_from returned None (push_class() bug)",
+                    // DEF-286 session audit: glass pattern
+                    // (debug_assert + return) replaced with
+                    // classified error. See CrateBugLocus::
+                    // PushClassIdleMismatch.
+                    *state = ProtoState::Errored(
+                        crate::error::StateErrorKind::from_kind_or_internal(
+                            crate::error::ErrorKind::Internal,
+                        ),
                     );
+                    emit_actions!(staged, budget: 2, [
+                        StagedAction::FailReply {
+                            id: reply.consume(),
+                            cause: ProtocolError::InternalCrateBug {
+                                locus: crate::error::CrateBugLocus::PushClassIdleMismatch,
+                            },
+                        },
+                        StagedAction::CloseSocket,
+                    ]);
                     return;
                 }
             };
@@ -8056,10 +8112,24 @@ fn compute_push_describe_portal(
             let idle = match crate::state_setter::IdleState::try_from(state) {
                 Some(idle) => idle,
                 None => {
-                    debug_assert!(
-                        false,
-                        "Idle arm of push_class() — try_from returned None (push_class() bug)",
+                    // DEF-286 session audit: glass pattern
+                    // (debug_assert + return) replaced with
+                    // classified error. See CrateBugLocus::
+                    // PushClassIdleMismatch.
+                    *state = ProtoState::Errored(
+                        crate::error::StateErrorKind::from_kind_or_internal(
+                            crate::error::ErrorKind::Internal,
+                        ),
                     );
+                    emit_actions!(staged, budget: 2, [
+                        StagedAction::FailReply {
+                            id: reply.consume(),
+                            cause: ProtocolError::InternalCrateBug {
+                                locus: crate::error::CrateBugLocus::PushClassIdleMismatch,
+                            },
+                        },
+                        StagedAction::CloseSocket,
+                    ]);
                     return;
                 }
             };

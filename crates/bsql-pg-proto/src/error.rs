@@ -979,6 +979,21 @@ pub enum CrateBugLocus {
     /// installs `Errored(InternalCrateBug { locus: CommandTagsArenaOverflow })`
     /// + `FailReply` + `CloseSocket`.
     CommandTagsArenaOverflow,
+
+    /// `StatePushClass::Idle` was observed by `compute_push_*` but
+    /// `IdleState::try_from(state)` returned `None` — the push-class
+    /// classifier and the state enum disagree on whether the state is
+    /// Idle. Architecturally dead under intact `push_class()` →
+    /// `IdleState::try_from` pairing; emission indicates a refactor
+    /// regression that decoupled the two classifiers.
+    ///
+    /// Pre-audit (DEF-286 session) this arm was a glass pattern:
+    /// `debug_assert!(false, ...) + return` — dev-loud, release-
+    /// silent. The silent `return` dropped the `ReplyId` without
+    /// emitting a FailReply — the user's oneshot was never resolved,
+    /// the command silently vanished. Now classified: FailReply +
+    /// CloseSocket + Errored state install.
+    PushClassIdleMismatch,
 }
 
 // Niche-packed `Option<CrateBugLocus>` — 1 byte since all variants
@@ -1030,6 +1045,7 @@ impl fmt::Display for CrateBugLocus {
             Self::PartialModeReentry => f.write_str("partial-mode-reentry"),
             Self::PartialModeExitUndrained => f.write_str("partial-mode-exit-undrained"),
             Self::CommandTagsArenaOverflow => f.write_str("command-tags-arena-overflow"),
+            Self::PushClassIdleMismatch => f.write_str("push-class-idle-mismatch"),
         }
     }
 }
