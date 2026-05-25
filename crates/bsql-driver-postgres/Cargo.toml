@@ -1,0 +1,11 @@
+[package]
+name = "bsql-driver-postgres"
+version = "0.1.0-alpha.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Async PostgreSQL driver built on bsql-pg-proto sans-IO state machine"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bsql-pg-proto = { path = "../bsql-pg-proto" }
+tokio = { version = "1", features = ["net", "io-util", "macros", "rt"] }
