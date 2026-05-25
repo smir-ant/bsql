@@ -4231,3 +4231,70 @@ mod rowdesc_box_tests {
         assert!(matches!(rd.format_code(2), Some(FormatCode::Text)));
     }
 }
+
+#[cfg(test)]
+mod parse_edge_case_tests {
+    use super::*;
+
+    #[test]
+    fn parse_row_description_zero_columns() {
+        let payload: &[u8] = &[0, 0]; // i16 BE = 0
+        let result = parse_row_description(payload);
+        assert!(result.is_ok());
+        let rd = match result { Ok(r) => r, Err(_) => return };
+        assert_eq!(rd.len(), 0);
+        assert!(rd.is_empty());
+    }
+
+    #[test]
+    fn parse_row_description_one_column() {
+        let mut payload = alloc::vec::Vec::new();
+        payload.extend_from_slice(&1i16.to_be_bytes()); // 1 column
+        payload.push(b'x'); // column name
+        payload.push(0);    // NUL terminator
+        payload.extend_from_slice(&0i32.to_be_bytes()); // table_oid
+        payload.extend_from_slice(&0i16.to_be_bytes()); // attr_num
+        payload.extend_from_slice(&23i32.to_be_bytes()); // type_oid = int4
+        payload.extend_from_slice(&4i16.to_be_bytes());  // type_size
+        payload.extend_from_slice(&(-1i32).to_be_bytes()); // type_mod
+        payload.extend_from_slice(&0i16.to_be_bytes());  // format = text
+        let result = parse_row_description(&payload);
+        assert!(result.is_ok());
+        let rd = match result { Ok(r) => r, Err(_) => return };
+        assert_eq!(rd.len(), 1);
+        assert!(matches!(rd.type_oid(0), Some(23)));
+        assert!(matches!(rd.format_code(0), Some(FormatCode::Text)));
+    }
+
+    #[test]
+    fn parse_row_description_negative_count_rejected() {
+        let payload: &[u8] = &[0xFF, 0xFF]; // i16 BE = -1
+        assert!(parse_row_description(payload).is_err());
+    }
+
+    #[test]
+    fn parse_parameter_description_zero_params() {
+        let payload: &[u8] = &[0, 0]; // i16 BE = 0
+        let result = parse_parameter_description(payload);
+        assert!(result.is_ok());
+        let po = match result { Ok(p) => p, Err(_) => return };
+        assert_eq!(po.len(), 0);
+        assert!(po.is_empty());
+    }
+
+    #[test]
+    fn parse_parameter_description_three_params() {
+        let mut payload = alloc::vec::Vec::new();
+        payload.extend_from_slice(&3i16.to_be_bytes());
+        payload.extend_from_slice(&23u32.to_be_bytes());  // int4
+        payload.extend_from_slice(&25u32.to_be_bytes());  // text
+        payload.extend_from_slice(&16u32.to_be_bytes());  // bool
+        let result = parse_parameter_description(&payload);
+        assert!(result.is_ok());
+        let po = match result { Ok(p) => p, Err(_) => return };
+        assert_eq!(po.len(), 3);
+        assert!(matches!(po.get(0), Some(23)));
+        assert!(matches!(po.get(1), Some(25)));
+        assert!(matches!(po.get(2), Some(16)));
+    }
+}
