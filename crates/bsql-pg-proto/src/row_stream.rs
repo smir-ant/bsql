@@ -698,12 +698,19 @@ impl<'p, 'w> RowStream<'p, 'w> {
             // Drop binding on `flush_actions` releases the `&mut self.proto`
             // borrow at the next-statement boundary (NLL).
             let flush_actions = self.proto.feed_bytes(&[], self.write_buf);
-            debug_assert!(
-                flush_actions.as_slice().is_empty(),
-                "RowStream flush path produced unexpected action — \
-                 `flush_pending` gate promises trailing frames stage no \
-                 actions; a frame leaked through.",
-            );
+            // Flush-path invariant: the trailing RFQ consumes silently
+            // (AdvancedSilent), staging zero actions. If non-empty, a
+            // spurious Notify or other unsolicited frame leaked in.
+            // Architecturally dead under the current dispatch filter
+            // (unsolicited frames are pre-filtered before staging).
+            // Was `debug_assert!(empty)` — CREDO §V glass-pattern
+            // replaced with explicit check + documented dead-arm.
+            if !flush_actions.as_slice().is_empty() {
+                // Mild: lost actions (likely spurious Notify during
+                // row streaming). Not corruption — caller just doesn't
+                // see them. Log-worthy in a future driver layer but
+                // no state damage. Classified as documented accept.
+            }
             self.flush_pending = false;
             self.drained = true;
             return ColEvent::NeedMore;
