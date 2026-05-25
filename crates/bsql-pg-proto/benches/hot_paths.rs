@@ -1934,6 +1934,33 @@ fn bench_multi_ping_amortised(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_advance_one_frame_ping(c: &mut Criterion) {
+    let mut group = c.benchmark_group("advance_one_frame");
+    group.throughput(Throughput::Elements(1));
+
+    let rfq = rfq_frame();
+
+    group.bench_function("ping_via_aof", |b| {
+        b.iter_batched_ref(
+            || (fresh_active_via_trust_handshake(), WriteBuf::new()),
+            |(proto, wb)| {
+                let reply = proto.next_reply_id::<PingKind>();
+                let push_out = proto.bench_push_or_panic(
+                    bsql_pg_proto::push_command::Ping { reply },
+                    wb,
+                );
+                let _ = black_box(push_out);
+                proto.feed_inbound(black_box(&rfq));
+                let event = proto.advance_one_frame(wb);
+                black_box(event);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse_header,
@@ -1971,6 +1998,7 @@ criterion_group!(
     bench_readbuf_compact_pressure,
     bench_interleaved_streaming,
     bench_multi_ping_amortised,
+    bench_advance_one_frame_ping,
 );
 criterion_main!(benches);
 
