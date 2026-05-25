@@ -378,3 +378,125 @@ fn copy_out_rejects_malformed_response_header() {
         proto.state()
     );
 }
+
+// ═════════════════════════════════════════════════════════════════
+// COPY IN push-method error-arm coverage (DEF-286 session audit #6)
+// ═════════════════════════════════════════════════════════════════
+
+/// push_copy_data on Idle state (not CopyInActive) → NotInCopyInState.
+#[test]
+fn push_copy_data_not_in_copy_state_rejects() {
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = WriteBuf::new();
+    let result = proto.push_copy_data(b"hello", &mut wb);
+    assert!(
+        matches!(result, Err(bsql_pg_proto::CopyPushError::NotInCopyInState)),
+        "push_copy_data on Idle must return NotInCopyInState, got {result:?}",
+    );
+}
+
+/// push_copy_done on Idle state → NotInCopyInState.
+#[test]
+fn push_copy_done_not_in_copy_state_rejects() {
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = WriteBuf::new();
+    let result = proto.push_copy_done(&mut wb);
+    assert!(
+        matches!(result, Err(bsql_pg_proto::CopyPushError::NotInCopyInState)),
+        "push_copy_done on Idle must return NotInCopyInState, got {result:?}",
+    );
+}
+
+/// push_copy_fail on Idle state → NotInCopyInState.
+#[test]
+fn push_copy_fail_not_in_copy_state_rejects() {
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = WriteBuf::new();
+    let result = proto.push_copy_fail("abort reason", &mut wb);
+    assert!(
+        matches!(result, Err(bsql_pg_proto::CopyPushError::NotInCopyInState)),
+        "push_copy_fail on Idle must return NotInCopyInState, got {result:?}",
+    );
+}
+
+/// push_copy_fail with embedded NUL byte → EmbeddedNul.
+#[test]
+fn push_copy_fail_embedded_nul_rejects() {
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = WriteBuf::new();
+
+    // Enter CopyInActive state via server CopyInResponse.
+    let (reply, _raw) = mint_reply::<bsql_pg_proto::QueryKind>(&mut proto);
+    proto.push_or_panic(
+        SimpleQuery {
+            sql: "COPY users FROM STDIN",
+            reply,
+        },
+        &mut wb,
+    );
+    let gin = copy_response_frame(TAG_COPY_IN_RESPONSE.byte(), 0, 1);
+    let _ = proto.feed_bytes(&gin, &mut wb);
+    assert!(
+        matches!(proto.state(), ActiveState::SimpleQueryCopyInActive(_)),
+        "pre-condition: must be CopyInActive",
+    );
+
+    let result = proto.push_copy_fail("error\0embedded", &mut wb);
+    assert!(
+        matches!(result, Err(bsql_pg_proto::CopyPushError::EmbeddedNul)),
+        "push_copy_fail with NUL byte must return EmbeddedNul, got {result:?}",
+    );
+}
+
+/// push_copy_done happy path — frame bytes in WriteBuf.
+#[test]
+fn push_copy_done_happy_path() {
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = WriteBuf::new();
+
+    let (reply, _raw) = mint_reply::<bsql_pg_proto::QueryKind>(&mut proto);
+    proto.push_or_panic(
+        SimpleQuery {
+            sql: "COPY users FROM STDIN",
+            reply,
+        },
+        &mut wb,
+    );
+    let gin = copy_response_frame(TAG_COPY_IN_RESPONSE.byte(), 0, 1);
+    let _ = proto.feed_bytes(&gin, &mut wb);
+    assert!(matches!(proto.state(), ActiveState::SimpleQueryCopyInActive(_)));
+
+    let result = proto.push_copy_done(&mut wb);
+    assert!(result.is_ok(), "push_copy_done must succeed in CopyInActive, got {result:?}");
+    if let Ok(frame_bytes) = result {
+        // CopyDone frame: tag 'c' + length 4 = 5 bytes total.
+        assert_eq!(frame_bytes.len(), 5, "CopyDone frame must be 5 bytes");
+    }
+}
+
+/// push_copy_fail happy path — frame includes NUL-terminated error message.
+#[test]
+fn push_copy_fail_happy_path() {
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = WriteBuf::new();
+
+    let (reply, _raw) = mint_reply::<bsql_pg_proto::QueryKind>(&mut proto);
+    proto.push_or_panic(
+        SimpleQuery {
+            sql: "COPY users FROM STDIN",
+            reply,
+        },
+        &mut wb,
+    );
+    let gin = copy_response_frame(TAG_COPY_IN_RESPONSE.byte(), 0, 1);
+    let _ = proto.feed_bytes(&gin, &mut wb);
+    assert!(matches!(proto.state(), ActiveState::SimpleQueryCopyInActive(_)));
+
+    let result = proto.push_copy_fail("client abort", &mut wb);
+    assert!(result.is_ok(), "push_copy_fail must succeed in CopyInActive, got {result:?}");
+    if let Ok(frame_bytes) = result {
+        // CopyFail frame: tag 'f' + length(4) + "client abort" + NUL
+        // = 1 + 4 + 12 + 1 = 18 bytes total.
+        assert_eq!(frame_bytes.len(), 18, "CopyFail frame length mismatch");
+    }
+}
