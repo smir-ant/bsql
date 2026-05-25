@@ -5,5 +5,5 @@ error[E0599]: no method named `feed_inbound` found for struct `PgProtocol<Closed
    |                    ^^^^^^^^^^^^ method not found in `PgProtocol<ClosedPhase>`
    |
    = note: the method was found for
-           - `PgProtocol`
+           - `PgProtocol<ActivePhase>`
            - `PgProtocol<ConnectingPhase>`
