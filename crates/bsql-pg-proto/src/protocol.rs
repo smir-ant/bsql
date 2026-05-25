@@ -8676,7 +8676,7 @@ pub(crate) fn compute_push_bind_prepared_idle_only<'sql, P, R>(
     } else {
         // Synthesise a RowDesc from `q.row_oids` (all-text format).
         // The macro's row_oids list is small (≤ 16) and bounded by
-        // MAX_ROW_COLUMNS = 32; the construction is infallible at
+        // MAX_ROW_COLUMNS = 1600; the construction is infallible at
         // runtime.
         let row_desc = match build_synthetic_row_desc(q.row_oids) {
             Ok(desc) => desc,
@@ -8684,7 +8684,7 @@ pub(crate) fn compute_push_bind_prepared_idle_only<'sql, P, R>(
                 // Architecturally rare: macro emits row_oids of
                 // arity > MAX_ROW_COLUMNS would have failed the
                 // RowDecode trait bound at compile time (RowDecode
-                // tuple impls cap at 16 < 32). Fall through with a
+                // tuple impls cap at 16 < 1600). Fall through with a
                 // classified error.
                 emit_actions!(staged, budget: 1, [
                     StagedAction::FailReply {

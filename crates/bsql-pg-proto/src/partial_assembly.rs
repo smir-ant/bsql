@@ -17,7 +17,7 @@
 //!   (hint) per ErrorResponse. Even with 32 ErrorResponse field tags
 //!   (the [`crate::dispatch::parse_error_response`] cap) the parser
 //!   reads at most ~5 KB before saturating every inline-bounded target.
-//! - [`crate::decode::MAX_ROW_COLUMNS`] = 32 × 18 B metadata + 32 ×
+//! - [`crate::decode::MAX_ROW_COLUMNS` = 1600 × 18 B metadata + 32 ×
 //!   64 B (`NAMEDATALEN` ceiling per PG §43.2.7) ≈ 2.6 KB before
 //!   [`crate::error::ProtocolError::TooManyColumns`] fires.
 //! - SCRAM server-first-message: `256 B nonce + 64 B salt + ~10 B
@@ -84,7 +84,7 @@
 //!   `<N>` cap with a `"…"` marker.
 //! - [`crate::dispatch::parse_error_response`]'s 32-field cap
 //!   ([`crate::dispatch::MAX_ERROR_FIELDS`]) bounds DoS surface.
-//! - [`crate::decode::parse_row_description`] rejects > 32 columns
+//! - [`crate::decode::parse_row_description`] rejects > 1600 columns
 //!   with [`crate::error::ProtocolError::TooManyColumns`].
 //! - SCRAM's `parse_server_first` rejects oversize server nonces with
 //!   [`crate::scram::wire::ScramError::ServerNonceTooLong`].
@@ -268,7 +268,7 @@ const _: () = assert!(
 /// variable-size per PG wire spec AND whose existing dispatch arm
 /// accepts arbitrary-length payloads via bounded-inline truncation:
 ///
-/// - `'T'` RowDescription — wide tables (cap: 32 cols)
+/// - `'T'` RowDescription — wide tables (cap: 1600 cols)
 /// - `'E'` ErrorResponse — long error context (cap: 32 typed fields,
 ///   each `SecretBoundedStr<≤128>`)
 /// - `'N'` NoticeResponse — long notices (counter-only handler; body
