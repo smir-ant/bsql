@@ -84,7 +84,7 @@ pub(crate) mod _row_description_dispatch_leaf {
 }
 
 /// Leaf submodule for the inbound `'C'` (CommandComplete) frame
-/// dispatch. DEF-286 Φ3 — hosts [`CommandCompleteDispatchToken`]
+/// dispatch. Φ3 — hosts [`CommandCompleteDispatchToken`]
 /// and the single park helper fn. Mirror of
 /// [`_row_description_dispatch_leaf`] /
 /// [`_param_description_dispatch_leaf`].
@@ -112,7 +112,7 @@ pub(crate) mod _command_complete_dispatch_leaf {
 
 /// Leaf submodule for the inbound `'t'` (ParameterDescription) frame
 /// dispatch. Hosts the [`ParamDescDispatchToken`] type and the single
-/// park helper fn. DEF-286 Φ1 mirror of
+/// park helper fn. Φ1 mirror of
 /// [`_row_description_dispatch_leaf`].
 ///
 /// Sole call site:
@@ -123,8 +123,7 @@ pub(crate) mod _command_complete_dispatch_leaf {
 ///
 /// State variant transitions to
 /// [`ProtoState::DescribeStatementAwaitingRowDescOrNoData`] AFTER
-/// the park; the variant carries only the bare `ReplyId` post-DEF-286
-/// (no more `param_oids: Box<ParamOids>` field — the slot owns the
+/// the park; the variant carries only the bare `ReplyId` post-/// (no more `param_oids: Box<ParamOids>` field — the slot owns the
 /// box).
 pub(crate) mod _param_description_dispatch_leaf {
     /// Leaf-scope token. The tuple-struct field is PRIVATE to this
@@ -153,7 +152,7 @@ pub(crate) mod _param_description_dispatch_leaf {
 
 /// Leaf submodule for the inbound `'Z'` (ReadyForQuery) frame
 /// dispatch. Hosts the [`RfqDispatchToken`] type and the park helper
-/// fn. DEF-286 Φ-E mirror of [`_command_complete_dispatch_leaf`].
+/// fn. mirror of [`_command_complete_dispatch_leaf`].
 ///
 /// Sole call sites: every `'Z'`-handling dispatch arm
 /// (`PingAwaitingRfq`, `SimpleQueryAwaitingRfq`,
@@ -182,7 +181,7 @@ pub(crate) mod _rfq_dispatch_leaf {
 }
 
 /// Leaf submodule for the `install_errored` cause-park transition.
-/// DEF-286 Φ-I.b. Hosts the [`InstallErroredToken`] type and the
+/// .b. Hosts the [`InstallErroredToken`] type and the
 /// [`park_cause_at_install_errored`] helper. The token's tuple-struct
 /// field is PRIVATE to this submodule, so `Self(())` mints are
 /// callable ONLY here. Tier-1 within-crate write provenance.
@@ -2907,7 +2906,7 @@ impl ParsedServerError {
 
 /// Parse an ErrorResponse payload into a classified error.
 ///
-/// DEF-219-residue audit follow-up (DEF-248 Sub-B): the per-field
+/// residue audit follow-up (Sub-B): the per-field
 /// inline cap (`MAX_ERROR_FIELDS`) and the largest per-field byte
 /// budget (`MAX_ERROR_RESPONSE_FIELD_BYTES`) are promoted to
 /// crate-visible consts so [`crate::partial_assembly::PREFIX_CAP`]'s

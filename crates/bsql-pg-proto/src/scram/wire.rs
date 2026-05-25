@@ -192,7 +192,7 @@ const _: () = assert!(
 
 /// Errors from SCRAM wire message construction or parsing.
 ///
-/// `#[non_exhaustive]` (pass #6 audit MI6) — SCRAM wire-spec
+/// `#[non_exhaustive]` (audit MI6) — SCRAM wire-spec
 /// extensions (channel-binding, future SASL profiles) may introduce
 /// new error classes. Downstream `_ =>` arms absorb additions;
 /// exhaustive matches have always been a compatibility hazard.
@@ -210,7 +210,7 @@ pub enum ScramError {
     /// ([`MAX_SCRAM_ITERATIONS`]). Closes the client-side DoS surface
     /// where a malicious or mis-configured server would send a
     /// deliberately-large iteration count to stall PBKDF2 for
-    /// minutes per connection (pass #6 audit BS8).
+ /// minutes per connection (audit BS8).
     IterationsTooHigh {
         /// The offending iterations value.
         iterations: u32,
@@ -221,7 +221,7 @@ pub enum ScramError {
     /// crate. Emission indicates a supply-chain compromise or
     /// upstream contract break.
     ///
-    /// # Why fail-closed, not silent-zero (pass #6 F54)
+ /// # Why fail-closed, not silent-zero (F54)
     ///
     /// Pre-F54 the HMAC helpers returned `[0u8; 32]` on the dead Err
     /// branch. Even though SCRAM's server-side verification would

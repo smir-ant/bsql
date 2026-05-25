@@ -167,7 +167,7 @@ pub const TAG_NOTICE_RESPONSE: InboundTag = InboundTag::from_byte(b'N');
 /// notifier's process id) + CSTR `channel` name + CSTR `payload`.
 /// Any post-startup state can receive one at any time.
 ///
-/// Per DEF-220, the pre-dispatch filter in `feed_bytes` parses the
+/// Per , the pre-dispatch filter in `feed_bytes` parses the
 /// frame and allocates a [`NotificationPayload`] in the
 /// `notifications_arena`, emitting [`Action::Notify { pid, notif_ref }`]
 /// in the same OutActions stream as other side-effects. The wrapper

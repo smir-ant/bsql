@@ -135,8 +135,7 @@ impl FailCauseSlotCell {
     }
 
     /// Park `cause` at the `install_errored` transition site. Token
-    /// gated to `_install_errored_leaf::InstallErroredToken` (DEF-286
-    /// Φ-I.b). The leaf submodule lives in `dispatch.rs` because the
+ /// gated to `_install_errored_leaf::InstallErroredToken` ( /// .b). The leaf submodule lives in `dispatch.rs` because the
     /// `install_errored` helper is dispatch-scoped — token type lives
     /// alongside its mint site.
     ///

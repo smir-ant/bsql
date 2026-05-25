@@ -486,8 +486,8 @@ pub(crate) fn error_arena_or_init(
     })
 }
 
-/// Lazy-init helper for `Option<Box<CommandTagsArena>>` (DEF-286 Φ-D).
-/// Called by `dispatch.rs` DEF-226 multi-statement arms when an
+/// Lazy-init helper for `Option<Box<CommandTagsArena>>` ().
+/// Called by `dispatch.rs` multi-statement arms when an
 /// intermediate command-complete tag needs to be externalised for
 /// `Action::IntermediateCommandComplete`.
 #[inline]
@@ -572,7 +572,7 @@ pub struct ConnectingInner {
     /// Spill buffer for oversize ErrorResponse / NoticeResponse
     /// frames during handshake.
     partial_assembly: crate::partial_assembly::PartialAssemblyCell,
-    /// DEF-286 Φ-I.b — slot for parked `Action::FailReply.cause`
+ /// .b — slot for parked `Action::FailReply.cause`
     /// during the handshake phase. Mirror of the `ActiveExtras.fail_cause`
     /// cell but living inline on `ConnectingInner` because
     /// `<ConnectingPhase>::Extras = ()` (cell-on-outer pattern is
@@ -621,7 +621,7 @@ pub struct ActiveInner {
     /// Lazy-init slot for server ErrorResponse payloads.
     error_arena: Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
     /// Lazy-init slot for server NotificationResponse payloads (PG
-    /// §55.7 LISTEN/NOTIFY surface — DEF-220). `Option<Box<_>>` so
+ /// §55.7 LISTEN/NOTIFY surface — ). `Option<Box<_>>` so
     /// connections that never LISTEN pay zero (the slot stays
     /// `None`); first NOTIFY arrival via the dispatch pre-filter
     /// allocates one `Box<NotificationsArena>` for the connection's
@@ -630,14 +630,14 @@ pub struct ActiveInner {
     /// `NotificationRef`s — defence-in-depth against the wrapper
     /// stashing refs past the cycle boundary).
     notifications_arena: Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
-    /// Lazy-init slot for COPY OUT data chunks (DEF-219 Phase 3).
+ /// Lazy-init slot for COPY OUT data chunks .
     /// Mirror of `notifications_arena`. Connections that never issue
     /// COPY pay zero; first CopyData arrival allocates one
     /// `Box<CopyChunksArena>` for the connection's lifetime. Cleared
     /// per `feed_bytes` cycle.
     copy_chunks_arena: Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
-    /// Lazy-init slot for DEF-226 multi-statement intermediate
-    /// command tags (DEF-286 Φ-D). Mirror of `notifications_arena`.
+ /// Lazy-init slot for multi-statement intermediate
+ /// command tags (). Mirror of `notifications_arena`.
     /// Connections that never use batched SimpleQuery pay zero; first
     /// `IntermediateCommandComplete` emission allocates one
     /// `Box<CommandTagsArena>` for the connection's lifetime.
@@ -715,7 +715,7 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
     pub(in crate::protocol) state: &'state mut ProtoState,
     pub(in crate::protocol) read_buf: &'r mut ReadBuf,
     pub(in crate::protocol) row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
-    /// DEF-286 Φ1: ParamOids slot threaded from
+ /// Φ1: ParamOids slot threaded from
     /// `<ActivePhase>::Extras.param_oids` via
     /// [`feed_bytes_dispatch_active`]; the Connecting variant uses
     /// the transient `ActiveExtras.param_oids` slot (DescribeStatement
@@ -725,13 +725,13 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
     /// [`crate::dispatch::_param_description_dispatch_leaf::park_param_oids_at_dispatch`].
     pub(in crate::protocol) param_oids_slot:
         &'r mut crate::param_oids_slot::ParamOidsSlotCell,
-    /// DEF-286 Φ3: CommandTag slot threaded from
+ /// Φ3: CommandTag slot threaded from
     /// `<ActivePhase>::Extras.command_tag` via
     /// `feed_bytes_dispatch_active`. Connecting variant uses the
     /// transient `ActiveExtras.command_tag` slot.
     pub(in crate::protocol) command_tag_slot:
         &'r mut crate::command_tag_slot::CommandTagSlotCell,
-    /// DEF-286 Φ-E: TxStatus slot threaded from
+ /// TxStatus slot threaded from
     /// `<ActivePhase>::Extras.tx_status` via
     /// `feed_bytes_dispatch_active`. Connecting variant uses the
     /// transient `ActiveExtras.tx_status` slot. The `'Z'` dispatch
@@ -739,7 +739,7 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
     /// [`crate::PgProtocol::terminal_tx_status`] post-`feed_bytes`.
     pub(in crate::protocol) tx_status_slot:
         &'r mut crate::tx_status_slot::TxStatusSlotCell,
-    /// DEF-286 Φ-I.b: FailCause slot threaded from
+ /// .b: FailCause slot threaded from
     /// `<ActivePhase>::Extras.fail_cause` via
     /// `feed_bytes_dispatch_active`, OR from
     /// `ConnectingInner.fail_cause` via
@@ -754,7 +754,7 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
         &'r mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
-    /// DEF-220: lazy-allocated arena for `NotificationResponse`
+ /// lazy-allocated arena for `NotificationResponse`
     /// payloads. Threaded from `ActiveInner.notifications_arena`
     /// via [`feed_bytes_dispatch_active`]; the Connecting variant
     /// uses an empty transient slot (LISTEN/NOTIFY is post-handshake
@@ -763,16 +763,16 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
     /// reads + writes this slot.
     pub(in crate::protocol) notifications_arena:
         &'r mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
-    /// DEF-219 Phase 3: COPY chunks arena threaded from
+ /// COPY chunks arena threaded from
     /// `ActiveInner.copy_chunks_arena`. Connecting phase uses
     /// transient empty slot (LISTEN-arena mirror pattern).
     pub(in crate::protocol) copy_chunks_arena:
         &'r mut Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
-    /// DEF-286 Φ-D: intermediate command-tag arena threaded from
+ /// intermediate command-tag arena threaded from
     /// `ActiveInner.command_tags_arena`. Connecting phase uses
     /// transient empty slot (post-handshake only — same lazy-arena
     /// mirror pattern as `notifications_arena` / `copy_chunks_arena`).
-    /// Used by DEF-226 multi-statement dispatch arms to externalise
+ /// Used by multi-statement dispatch arms to externalise
     /// the prior tag for `Action::IntermediateCommandComplete`.
     pub(in crate::protocol) command_tags_arena:
         &'r mut Option<alloc::boxed::Box<crate::command_tags_arena::CommandTagsArena>>,
@@ -1078,7 +1078,7 @@ pub struct ClosedInner {
     /// Terminal cause classifier — extracted from the transition
     /// boundary (`Errored(state_kind)` for the error path, or
     /// [`CloseCause::GracefulTerminate`] for the client-initiated
-    /// terminate path). The full `ProtoState` enum (48 B post-DEF-282)
+ /// terminate path). The full `ProtoState` enum (48 B post-)
     /// is not retained: `<ClosedPhase>` has no further state
     /// transitions, so the discriminator suffices.
     cause: CloseCause,
@@ -1202,7 +1202,7 @@ pub struct ActiveExtras {
     pub(in crate::protocol) row_desc: crate::schema_slot::RowDescSlotCell,
     pub(in crate::protocol) param_oids:
         crate::param_oids_slot::ParamOidsSlotCell,
-    /// DEF-286 Φ3 — slot for parked `CommandComplete` payload.
+ /// Φ3 — slot for parked `CommandComplete` payload.
     /// Per-cycle: `'C'` arrival parks the boxed
     /// [`crate::command_tag::CommandTag`]; the trailing `'Z'`
     /// materialise reads via `as_ref()` and emits
@@ -1210,7 +1210,7 @@ pub struct ActiveExtras {
     /// Cleared at Idle/Errored residue boundary.
     pub(in crate::protocol) command_tag:
         crate::command_tag_slot::CommandTagSlotCell,
-    /// DEF-286 Φ-E — slot for parked `ReadyForQuery` transaction
+ /// slot for parked `ReadyForQuery` transaction
     /// status. Per-cycle: `'Z'` arrival parks the
     /// [`crate::action::TxStatus`]; callers query via
     /// [`crate::PgProtocol::terminal_tx_status`] AFTER consuming
@@ -1223,10 +1223,10 @@ pub struct ActiveExtras {
     /// 32 → 16-24 B and Action 40 → 24-32 B.
     pub(in crate::protocol) tx_status:
         crate::tx_status_slot::TxStatusSlotCell,
-    /// DEF-286 Φ-I.b — slot for parked `Action::FailReply.cause`.
+ /// .b — slot for parked `Action::FailReply.cause`.
     /// Externalised so `Action::FailReply { id, cause }` (32 B body)
     /// collapses to `Action::FailReply { id }` (8 B body). With
-    /// Φ-F* shrinking `DeliverReply` body 24 → 16 B in parallel,
+ /// shrinking `DeliverReply` body 24 → 16 B in parallel,
     /// Action floor drops 40 → 24 B (-40%).
     ///
     /// Per-cycle lifecycle: `dispatch::install_errored` parks
@@ -1247,9 +1247,9 @@ pub struct ActiveExtras {
 /// `inner.sync_marker: PhantomData<Cell<()>>` via `repr(transparent)`
 /// auto-trait propagation).
 ///
-/// **No default `P`** (DEF-246 Phase 6) — every usage must spell
+/// **No default `P`** — every usage must spell
 /// out the phase parameter explicitly: `PgProtocol<ActivePhase>`,
-/// `PgProtocol<ConnectingPhase>`, etc. The pre-DEF-246 default
+/// `PgProtocol<ConnectingPhase>`, etc. The pre-default
 /// `P = ActivePhase` hid the phase at call sites, making the
 /// typestate discipline implicit. Removing the default forces
 /// every type-position to be phase-aware — stronger documentation
@@ -1438,18 +1438,18 @@ pub(crate) mod _clear_residue_leaf {
     /// Leaf-scope token for the param-oids slot clear at residue
     /// transitions. Field private to the leaf; type `pub(crate)` so
     /// [`crate::param_oids_slot::ParamOidsSlotCell`] can name it in
-    /// its `clear_at_residue` parameter signature. DEF-286 Φ1 —
+ /// its `clear_at_residue` parameter signature. Φ1 —
     /// mirrors [`ClearResidueSchemaToken`]'s shape exactly.
     pub(crate) struct ClearResidueParamOidsToken(());
 
     /// Leaf-scope token for the command_tag slot clear at residue
-    /// transitions. DEF-286 Φ3 — mirror of
+ /// transitions. Φ3 — mirror of
     /// [`ClearResidueParamOidsToken`]. Type `pub(crate)` so
     /// [`crate::command_tag_slot::CommandTagSlotCell`] can name it.
     pub(crate) struct ClearResidueCommandTagToken(());
 
     /// Leaf-scope token for the tx_status slot reset at residue
-    /// transitions. DEF-286 Φ-E — mirror of
+ /// transitions. mirror of
     /// [`ClearResidueCommandTagToken`]. Type `pub(crate)` so
     /// [`crate::tx_status_slot::TxStatusSlotCell`] can name it.
     pub(crate) struct ClearResidueTxStatusToken(());
@@ -1510,7 +1510,7 @@ pub(crate) mod _clear_residue_leaf {
     /// with the [`ClearResidueParamOidsToken`] minted inline. Used by
     /// `clear_session_residue_for_class` Idle and Errored arms —
     /// drops the box if a Describe-statement was in flight, freeing
-    /// the 68 B heap. DEF-286 Φ1 mirror of
+ /// the 68 B heap. Φ1 mirror of
     /// [`clear_schema_slot_residue`].
     #[inline]
     pub(in crate::protocol) fn clear_param_oids_slot_residue(
@@ -1522,7 +1522,7 @@ pub(crate) mod _clear_residue_leaf {
     /// Clear the command_tag slot via
     /// [`crate::command_tag_slot::CommandTagSlotCell::clear_at_residue`]
     /// with the [`ClearResidueCommandTagToken`] minted inline.
-    /// DEF-286 Φ3 — mirror of [`clear_param_oids_slot_residue`].
+ /// Φ3 — mirror of [`clear_param_oids_slot_residue`].
     /// Used by both Idle and Errored arms of
     /// `clear_session_residue_for_class_dispatch`.
     #[inline]
@@ -1535,8 +1535,7 @@ pub(crate) mod _clear_residue_leaf {
     /// Reset the tx_status slot to the conn-start default
     /// (`TxStatus::Idle`) via
     /// [`crate::tx_status_slot::TxStatusSlotCell::clear_at_residue`]
-    /// with the [`ClearResidueTxStatusToken`] minted inline. DEF-286
-    /// Φ-E. Used by both Idle and Errored arms of
+ /// with the [`ClearResidueTxStatusToken`] minted inline.  /// . Used by both Idle and Errored arms of
     /// `clear_session_residue_for_class_dispatch`.
     #[inline]
     pub(in crate::protocol) fn clear_tx_status_slot_residue(
@@ -1894,7 +1893,7 @@ pub(crate) mod _proto_init_leaf {
     /// lives inside `_proto_init_leaf` so the [`ProtoInitToken`]
     /// stays leaf-private.
     ///
-    /// DEF-286 Φ1: extended from single-cell `RowDescSlotCell` to
+ /// Φ1: extended from single-cell `RowDescSlotCell` to
     /// the two-cell `ActiveExtras` carrier per the slot-pattern
     /// refactor that moved `param_oids: Box<ParamOids>` from state
     /// variants into a slot.
@@ -2024,7 +2023,7 @@ pub(crate) mod _proto_init_leaf {
 //
 // Tier elevations:
 //   #1: push-before-Startup            → method-absent E0599 on <DisconnectedPhase>::push_*
-//   #2: push-during-Connecting         → method-absent E0599 on <ConnectingPhase>::push_*
+//   #2: push-during-Connecting         → method-absent E0599 on `<ConnectingPhase>`::push_*
 //   #3: Closed absorbs no input        → method-absent E0599 on <ClosedPhase>::feed_*/push_*
 //   #4: feed_inbound surfaces typed err → Result<(), ProtocolError> across all phases that have feed_inbound
 // ═════════════════════════════════════════════════════════════════════
@@ -2687,7 +2686,7 @@ impl PgProtocol<ConnectingPhase> {
     }
 
     /// Read the parked `Action::FailReply.cause` from the most-recent
-    /// failure event during handshake (DEF-286 Φ-I.b). Mirror of
+ /// failure event during handshake (.b). Mirror of
     /// [`PgProtocol::<ActivePhase>::fail_cause`].
     ///
     /// Returns `None` if no failure has been observed yet on this
@@ -4957,7 +4956,7 @@ pub(in crate::protocol) struct ConnectingDispatchContext<'state, 'r> {
         &'r mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
     pub(in crate::protocol) partial_assembly:
         &'r mut crate::partial_assembly::PartialAssemblyCell,
-    /// DEF-286 Φ-I.b: fail_cause_slot threaded from the REAL
+ /// .b: fail_cause_slot threaded from the REAL
     /// `ConnectingInner.fail_cause` field (NOT a transient — must
     /// persist across the wrapper return so callers can query
     /// `pg.fail_cause()` post-FailReply event).
@@ -5012,12 +5011,12 @@ pub(in crate::protocol) struct ConnectingDispatchContext<'state, 'r> {
 /// placeholder is unobservable: no reader sees the state between
 /// `mem::replace` and the lower-step write.
 ///
-/// **DEF-285 perf-recovery** (2026-05-23): `#[inline(always)]` —
+/// **perf-recovery** : `#[inline(always)]` —
 /// the handshake hot path (push_command/ping bench fixture's
 /// `fresh_active_via_trust_handshake` = 5 `advance_one_frame`
 /// calls during the AuthOk/ParameterStatus×2/BackendKeyData/RFQ
 /// sequence) routes through this wrapper. Bisect confirmed
-/// regression at `0597dae` (DEF-279 Phase 2 SealedPhase flip):
+/// regression at `0597dae` (SealedPhase flip):
 /// pre-flip push_command/ping 49 ns → post-flip 77 ns = +28 ns =
 /// ~5.6 ns × 5 calls. Inlining lets LLVM fuse the lift+dispatch+lower
 /// into the calling hot path, eliminating the per-call lift/lower
@@ -5180,22 +5179,22 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
     pub(in crate::protocol) state: &'state mut crate::state::ActiveState,
     pub(in crate::protocol) read_buf: &'r mut ReadBuf,
     pub(in crate::protocol) row_desc_slot: &'r mut crate::schema_slot::RowDescSlotCell,
-    /// DEF-286 Φ1: param_oids_slot threaded from
+ /// Φ1: param_oids_slot threaded from
     /// `<ActivePhase>::Extras.param_oids` into the shared dispatch
     /// body's `DispatchContext`. DescribeStatement is post-handshake
     /// only — only Active carries the populated slot; Connecting
     /// uses a transient empty slot at the wrapper level.
     pub(in crate::protocol) param_oids_slot:
         &'r mut crate::param_oids_slot::ParamOidsSlotCell,
-    /// DEF-286 Φ3: command_tag_slot threaded from
+ /// Φ3: command_tag_slot threaded from
     /// `<ActivePhase>::Extras.command_tag`.
     pub(in crate::protocol) command_tag_slot:
         &'r mut crate::command_tag_slot::CommandTagSlotCell,
-    /// DEF-286 Φ-E: tx_status_slot threaded from
+ /// tx_status_slot threaded from
     /// `<ActivePhase>::Extras.tx_status`.
     pub(in crate::protocol) tx_status_slot:
         &'r mut crate::tx_status_slot::TxStatusSlotCell,
-    /// DEF-286 Φ-I.b: fail_cause_slot threaded from
+ /// .b: fail_cause_slot threaded from
     /// `<ActivePhase>::Extras.fail_cause`.
     pub(in crate::protocol) fail_cause_slot:
         &'r mut crate::fail_cause_slot::FailCauseSlotCell,
@@ -5203,20 +5202,20 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
         &'r mut crate::session_params_slot::SessionParamsCell,
     pub(in crate::protocol) error_arena:
         &'r mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
-    /// DEF-220: notifications_arena threaded from
+ /// notifications_arena threaded from
     /// `ActiveInner.notifications_arena` into the shared dispatch
     /// body's `DispatchContext`. LISTEN/NOTIFY is post-handshake
     /// only — only Active carries this field; Connecting uses a
     /// transient empty slot at the wrapper level.
     pub(in crate::protocol) notifications_arena:
         &'r mut Option<alloc::boxed::Box<crate::notifications_arena::NotificationsArena>>,
-    /// DEF-219 Phase 3: copy_chunks_arena threaded for COPY OUT
+ /// copy_chunks_arena threaded for COPY OUT
     /// data emission.
     pub(in crate::protocol) copy_chunks_arena:
         &'r mut Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
-    /// DEF-286 Φ-D: command_tags_arena threaded from
+ /// command_tags_arena threaded from
     /// `ActiveInner.command_tags_arena` into the shared dispatch
-    /// body's `DispatchContext`. Used by DEF-226 multi-statement
+ /// body's `DispatchContext`. Used by multi-statement
     /// dispatch arms to externalise the prior command tag for
     /// `Action::IntermediateCommandComplete`.
     pub(in crate::protocol) command_tags_arena:
@@ -5244,12 +5243,11 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
 /// as a transient placeholder; always overwritten by the lower
 /// step before any reader sees it.
 ///
-/// **DEF-285 perf-recovery** (2026-05-23): `#[inline(always)]`
+/// **perf-recovery** : `#[inline(always)]`
 /// — without inlining the wrapper, the per-call lift+lower (2 enum
 /// matches × ~25 arms each) accounts for ~5.6 ns per call on the
 /// `advance_one_frame` hot path. push_command/ping bench (5 calls
-/// per handshake fixture iter) regressed +28 ns vs pre-DEF-279
-/// Phase 2 baseline (`5d59b64`: 49 ns → `0597dae`: 77 ns). Inlining
+/// per handshake fixture iter) regressed +28 ns vs pre-/// baseline (`5d59b64`: 49 ns → `0597dae`: 77 ns). Inlining
 /// lets LLVM fuse the lift+dispatch+lower into a single optimised
 /// pattern, eliding the redundant variant-conversion math when
 /// the caller's state slot type-stabilises. The function is large
@@ -6182,7 +6180,7 @@ impl PgProtocol<ActivePhase> {
     }
 
     /// Resolve a [`crate::Action::Notify`]'s gen-tagged ref to its
-    /// payload (PG §55.7 LISTEN/NOTIFY surface — DEF-220).
+ /// payload (PG §55.7 LISTEN/NOTIFY surface — ).
     ///
     /// Returns:
     /// - `Ok(&NotificationPayload)` — ref resolves cleanly within
@@ -6227,7 +6225,7 @@ impl PgProtocol<ActivePhase> {
     }
 
     /// Push a `CopyData` ('d') frame to the server during an
-    /// active COPY IN cycle (DEF-219 Phase 4, PG §55.2.6).
+ /// active COPY IN cycle (Phase 4, PG §55.2.6).
     ///
     /// Writes the `'d' + len + bytes` frame to `wb` and returns the
     /// staged byte slice. State stays in
@@ -6284,7 +6282,7 @@ impl PgProtocol<ActivePhase> {
         }
     }
 
-    /// Push a `CopyDone` ('c') frame to the server (DEF-219 Phase 4).
+ /// Push a `CopyDone` ('c') frame to the server .
     ///
     /// Signals clean end-of-data from the client side during COPY
     /// IN. Server responds with `CommandComplete` (carrying the row
@@ -6316,7 +6314,7 @@ impl PgProtocol<ActivePhase> {
     }
 
     /// Push a `CopyFail` ('f') frame to the server with the given
-    /// error message (DEF-219 Phase 4).
+ /// error message .
     ///
     /// Aborts an in-progress COPY IN cycle from the client side.
     /// `error` is sent as a CSTR (NUL-terminated). Server responds
@@ -6372,7 +6370,7 @@ impl PgProtocol<ActivePhase> {
     }
 
     /// Resolve a [`crate::Action::CopyDataChunk`]'s gen-tagged ref
-    /// to its bytes (DEF-219 Phase 3, PG §55.2.6 COPY OUT).
+ /// to its bytes (Phase 3, PG §55.2.6 COPY OUT).
     ///
     /// Same lifetime contract as [`Self::get_notification`]: refs
     /// are valid within the OutActions iteration cycle only.
@@ -6394,8 +6392,7 @@ impl PgProtocol<ActivePhase> {
     }
 
     /// Resolve a [`crate::Action::IntermediateCommandComplete`]'s
-    /// gen-tagged ref to its `CommandTag` (DEF-286 Φ-D, DEF-226
-    /// multi-statement SimpleQuery surface).
+ /// gen-tagged ref to its `CommandTag` (,     /// multi-statement SimpleQuery surface).
     ///
     /// Same lifetime contract as [`Self::get_notification`] /
     /// [`Self::get_copy_chunk`]: refs are valid within the
@@ -6611,13 +6608,13 @@ impl PgProtocol<ActivePhase> {
     }
 
     /// Read the parked terminal `CommandTag` from the protocol's
-    /// command_tag_slot (DEF-286 Φ3/Φ-F*). Returns `None` if no
+ /// command_tag_slot (Φ3/). Returns `None` if no
     /// `'C'` (CommandComplete) frame has been observed since the
     /// last residue clear. Callers query this AFTER consuming
     /// `Action::DeliverReply { Reply::QueryComplete(..) }` from
     /// `OutActions`.
     ///
-    /// DEF-286 Φ-F* moved `command_tag` off the inline Reply
+ /// moved `command_tag` off the inline Reply
     /// variant. The accessor mirrors `current_row_desc`'s contract.
     #[inline]
     #[must_use]
@@ -6626,13 +6623,13 @@ impl PgProtocol<ActivePhase> {
     }
 
     /// Read the parked terminal `ParamOids` from the protocol's
-    /// param_oids_slot (DEF-286 Φ1/Φ-F*). Returns `None` if no
+ /// param_oids_slot (Φ1/). Returns `None` if no
     /// `'t'` (ParameterDescription) frame has been observed since
     /// the last residue clear. Callers query this AFTER consuming
     /// `Action::DeliverReply { Reply::DescribeStatementComplete(..) }`
     /// from `OutActions`.
     ///
-    /// DEF-286 Φ-F* moved `param_oids` off the inline
+ /// moved `param_oids` off the inline
     /// `DescribeStatementCompletePayload`. The accessor mirrors
     /// `current_row_desc`'s contract.
     #[inline]
@@ -6642,7 +6639,7 @@ impl PgProtocol<ActivePhase> {
     }
 
     /// Compute the typed `DescribedRows<'_>` view from the parked
-    /// row_desc_slot (DEF-286 Φ-F*). `Rows(..)` if a `'T'`
+ /// row_desc_slot (). `Rows(..)` if a `'T'`
     /// (RowDescription) frame was observed since the last residue
     /// clear; `NoData` if `'n'` (NoData) was observed.
     ///
@@ -6661,7 +6658,7 @@ impl PgProtocol<ActivePhase> {
     }
 
     /// Read the terminal `ReadyForQuery` transaction-status byte
-    /// parked at the most-recent `'Z'` arrival (DEF-286 Φ-E).
+ /// parked at the most-recent `'Z'` arrival ().
     ///
     /// Externalisation of the byte from every `Reply<'r>` variant
     /// payload removed it from inline pattern destructure; callers
@@ -6686,7 +6683,7 @@ impl PgProtocol<ActivePhase> {
     }
 
     /// Read the parked `Action::FailReply.cause` from the most-recent
-    /// failure event (DEF-286 Φ-I.b).
+ /// failure event (.b).
     ///
     /// Returns `None` if no failure has been observed yet on this
     /// protocol instance (slot empty post-init or post-Idle residue

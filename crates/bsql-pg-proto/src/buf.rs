@@ -119,7 +119,7 @@ impl<const N: usize> ReadBufN<N> {
     /// Returns [`ReadBufFull`] if the resulting length would exceed
     /// capacity even after reclaiming the consumed prefix.
     ///
-    /// **Eager cursor-reset + lazy compact fallback (DEF-058).**
+ /// **Eager cursor-reset + lazy compact fallback ().**
     /// When the buffer is fully consumed (`cursor == inner.len()`),
     /// zeroizes the consumed region and resets to empty before
     /// extending. The `extend_from_slice` then sees an empty buffer
@@ -561,7 +561,7 @@ impl ReadBuf {
     /// inline storage is exhausted, escape to heap (one-time alloc +
     /// memcpy of inline contents) and retry.
     ///
-    /// # Eager cursor-reset (DEF-058)
+ /// # Eager cursor-reset ()
     ///
     /// Before attempting `extend_from_slice`, checks whether the
     /// active storage is fully consumed (`cursor == populated.len()`

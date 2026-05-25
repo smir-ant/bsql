@@ -323,12 +323,12 @@ pub struct RowStream<'p, 'w> {
 }
 
 /// Lifetime-free classification of `slow_path_once`'s first emitted
-/// action (DEF-286 Φ-I.b helper). Pre-classifying into this Copy
+/// action (.b helper). Pre-classifying into this Copy
 /// enum collapses the lifetime-bearing match into a borrow-free one
 /// — the function can then call `&self.proto.fail_cause()` (immut
 /// borrow) on the Failed arm without re-borrow conflict.
 ///
-/// Post-Φ-F* `Reply` is lifetime-free (all payload data lives in
+/// Post-`Reply` is lifetime-free (all payload data lives in
 /// PgProtocol slots, queried via accessors), so extracting `value`
 /// by Copy from the lifetime-bearing `Action<'r,'r>` source is
 /// sound — `Reply: Copy` and no `'r`-borrowed data flows through.

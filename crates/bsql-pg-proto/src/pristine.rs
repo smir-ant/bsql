@@ -63,7 +63,7 @@
 ///
 /// # Sealing posture
 ///
-/// Not sealed: external crates (Phase 2 macros, future drivers) may
+/// Not sealed: external crates (macros, future drivers) may
 /// have their own pristine-state types deserving the trait. The
 /// derive remains the recommended path; manual impls follow the same
 /// shape.

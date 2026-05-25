@@ -501,7 +501,7 @@ pub enum ProtocolError {
 
     /// SCRAM authentication failure.
     ///
-    /// **DEF-286 Φ-B'' shape**: carries a slim
+ /// **shape**: carries a slim
     /// [`crate::scram::wire::ScramFailureClass`] (8 B inline — tag +
     /// optional u32 iteration count) alongside an
     /// `Option<crate::error_arena::ErrorRef>` for the optional
@@ -514,7 +514,7 @@ pub enum ProtocolError {
     ///
     /// # Why externalised rather than inline `BoundedStr<64>`
     ///
-    /// Pre-DEF-286 Φ-B'' shape stored the inline 64-B
+ /// Pre-shape stored the inline 64-B
     /// `ServerScramError { message }` payload directly inside
     /// `ScramError`, blowing `ProtocolError` to 72 B (max-variant-
     /// dominator). Externalisation collapses the variant to
@@ -595,7 +595,7 @@ pub enum ProtocolError {
     },
 
     /// Server sent a malformed `CopyOutResponse` ('H') or
-    /// `CopyInResponse` ('G') payload (DEF-219) — short header
+ /// `CopyInResponse` ('G') payload () — short header
     /// (< 3 bytes for format + count), format byte not in {0, 1},
     /// negative column count, trailing bytes after declared columns,
     /// or per-column format code disagreeing with the overall format
@@ -963,7 +963,7 @@ pub enum CrateBugLocus {
     PartialModeExitUndrained,
 
     /// [`crate::command_tags_arena::CommandTagsArena::alloc`] returned
-    /// `None` while staging a DEF-226 multi-statement
+ /// `None` while staging a multi-statement
     /// `IntermediateCommandComplete` — the per-cycle slot cap
     /// ([`crate::command_tags_arena::MAX_INTERMEDIATE_TAGS_PER_CALL`]
     /// = 9, equal to [`crate::MAX_ACTIONS_PER_CALL`]) was exceeded.
@@ -987,7 +987,7 @@ pub enum CrateBugLocus {
     /// `IdleState::try_from` pairing; emission indicates a refactor
     /// regression that decoupled the two classifiers.
     ///
-    /// Pre-audit (DEF-286 session) this arm was a glass pattern:
+ /// Pre-audit (session) this arm was a glass pattern:
     /// `debug_assert!(false, ...) + return` — dev-loud, release-
     /// silent. The silent `return` dropped the `ReplyId` without
     /// emitting a FailReply — the user's oneshot was never resolved,

@@ -36,8 +36,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Derive the SCRAM SaltedPassword via PBKDF2-HMAC-SHA-256.
 ///
-/// Per RFC 7677 §3, the minimum iteration count is 4096 and (pass #6
-/// audit BS8) the maximum client-accepted count is
+/// Per RFC 7677 §3, the minimum iteration count is 4096 and (/// audit BS8) the maximum client-accepted count is
 /// [`crate::scram::wire::MAX_SCRAM_ITERATIONS`] — both bounds enforced
 /// at `parse_server_first` before this function is called.
 ///
@@ -50,7 +49,7 @@ fn salted_password(password: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[
 
 /// HMAC-SHA-256(key, message) → 32 bytes.
 ///
-/// # F54 (pass #6 audit, 2026-04-21) — fail-closed explicit Result
+/// # (audit, — fail-closed explicit Result
 ///
 /// `HmacSha256::new_from_slice` returns `Result<Self, InvalidLength>`
 /// in signature, but HMAC-SHA-256 structurally accepts keys of ANY

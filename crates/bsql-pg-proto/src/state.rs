@@ -324,7 +324,7 @@ pub enum ProtoState {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
         /// Expected server signature for constant-time comparison.
-        /// Box-backed (DEF-286 follow-up): 32-B inline SecretDigest
+ /// Box-backed (follow-up): 32-B inline SecretDigest
         /// dominates ConnectingState at 48 B. Boxing → 8 B pointer
         /// → ConnectingState max-variant drops to 23 B → state 48→24 B
         /// (−50 %). One alloc per SCRAM handshake (once per conn),
@@ -456,16 +456,16 @@ pub enum ProtoState {
         reply: ReplyId<QueryKind>,
     },
 
-    /// DEF-219 COPY OUT streaming. Server sent `CopyOutResponse`
+ /// COPY OUT streaming. Server sent `CopyOutResponse`
     /// (`'H'`); now receiving zero or more `CopyData` (`'d'`) frames
     /// from server. Transitions:
-    /// - `CopyData` → stay here (Phase 3 will emit
-    ///   `Action::CopyDataChunk`; Phase 2 stays silent).
+ /// - `CopyData` → stay here (will emit
+ /// `Action::CopyDataChunk`; stays silent).
     /// - `CopyDone` → [`Self::SimpleQueryCopyOutAwaitingCC`].
     /// - `ErrorResponse` → [`Self::DrainRfqAfterError`].
     SimpleQueryCopyOutStreaming(ReplyId<QueryKind>),
 
-    /// DEF-219 COPY OUT post-CopyDone. Server has sent the final
+ /// COPY OUT post-CopyDone. Server has sent the final
     /// `CopyDone` (`'c'`); now awaiting `CommandComplete` followed
     /// by `ReadyForQuery`. Transitions:
     /// - `CommandComplete` → [`Self::SimpleQueryAwaitingRfq`] with
@@ -473,9 +473,9 @@ pub enum ProtoState {
     /// - `ErrorResponse` → [`Self::DrainRfqAfterError`].
     SimpleQueryCopyOutAwaitingCC(ReplyId<QueryKind>),
 
-    /// DEF-219 COPY IN active. Server sent `CopyInResponse`
+ /// COPY IN active. Server sent `CopyInResponse`
     /// (`'G'`); caller now pushes `CopyData` (`'d'`) bytes via the
-    /// (Phase 4) `PushCopyData` push command, then `CopyDone`
+ /// `PushCopyData` push command, then `CopyDone`
     /// (`'c'`) or `CopyFail` (`'f'`). Server transitions to
     /// `CommandComplete` once it observes the client's `CopyDone`.
     ///
@@ -511,13 +511,13 @@ pub enum ProtoState {
     SimpleQueryAwaitingRfq {
         /// Correlator for the in-flight query.
         ///
-        /// DEF-286 Φ3: `command_tag` field removed — slot pattern
+ /// Φ3: `command_tag` field removed — slot pattern
         /// via [`crate::command_tag_slot::CommandTagSlotCell`] on
         /// `<ActivePhase>::Extras.command_tag`. The `'C'` dispatch
         /// arm parses the tag and parks the boxed
         /// [`crate::command_tag::CommandTag`] into the slot;
         /// materialise reads via `as_ref()` at the trailing `'Z'`.
-        /// Multi-statement (DEF-226): each subsequent `'C'`
+ /// Multi-statement (): each subsequent `'C'`
         /// overwrites the slot (latest-wins).
         reply: ReplyId<QueryKind>,
     },
@@ -602,7 +602,7 @@ pub enum ProtoState {
     BindExecuteAwaitingRfqDml {
         /// Correlator for the in-flight command.
         ///
-        /// DEF-286 Φ3: `command_tag` field removed — slot pattern
+ /// Φ3: `command_tag` field removed — slot pattern
         /// via [`crate::command_tag_slot::CommandTagSlotCell`].
         reply: ReplyId<QueryKind>,
     },
@@ -643,7 +643,7 @@ pub enum ProtoState {
     BindExecuteAwaitingRfqSelect {
         /// Correlator for the in-flight command.
         ///
-        /// DEF-286 Φ3: `command_tag` field removed — slot pattern
+ /// Φ3: `command_tag` field removed — slot pattern
         /// via [`crate::command_tag_slot::CommandTagSlotCell`].
         reply: ReplyId<QueryKind>,
     },
@@ -720,16 +720,16 @@ pub enum ProtoState {
     /// No-data branch: `'n'` → [`DescribedRows::NoData`]; continue
     /// to [`Self::DescribeStatementAwaitingRfq`].
     ///
-    /// # `param_oids` lives in the slot (DEF-286 Φ1)
+ /// # `param_oids` lives in the slot (Φ1)
     ///
-    /// Pre-DEF-286 (and post-DEF-282), this variant carried
+ /// Pre-(and post-), this variant carried
     /// `param_oids: Box<ParamOids>` inline — the box moved across
     /// the `AwaitingRowDescOrNoData → AwaitingRfq` transition by
     /// pointer copy-move, then deref-inlined into
     /// `StagedDescribeStatementCompletePayload.param_oids:
     /// ParamOids` at the trailing `'Z'`.
     ///
-    /// DEF-286 Φ1 lifted the box to
+ /// Φ1 lifted the box to
     /// [`crate::param_oids_slot::ParamOidsSlotCell`] on
     /// `<ActivePhase>::Extras` — mirror of the `row_desc_slot`
     /// pattern. Net effect:
@@ -780,7 +780,7 @@ pub enum ProtoState {
     /// **Tier-1 by-construction**: the slot equals itself (identity,
     /// not discipline).
     ///
-    /// # `param_oids` lives in the slot (DEF-286 Φ1)
+ /// # `param_oids` lives in the slot (Φ1)
     ///
     /// See [`Self::DescribeStatementAwaitingRowDescOrNoData`] for
     /// the full slot-pattern rationale — `param_oids` now lives in
@@ -1378,16 +1378,16 @@ pub enum ActiveState {
     SimpleQueryStreamingRows {
         reply: ReplyId<QueryKind>,
     },
-    /// Mirror of [`ProtoState::SimpleQueryAwaitingRfq`]. DEF-286 Φ3:
+ /// Mirror of [`ProtoState::SimpleQueryAwaitingRfq`]. Φ3:
     /// `command_tag` lives in slot.
     SimpleQueryAwaitingRfq {
         reply: ReplyId<QueryKind>,
     },
-    /// Mirror of [`ProtoState::SimpleQueryCopyOutStreaming`] (DEF-219).
+ /// Mirror of [`ProtoState::SimpleQueryCopyOutStreaming`] ().
     SimpleQueryCopyOutStreaming(ReplyId<QueryKind>),
-    /// Mirror of [`ProtoState::SimpleQueryCopyOutAwaitingCC`] (DEF-219).
+ /// Mirror of [`ProtoState::SimpleQueryCopyOutAwaitingCC`] ().
     SimpleQueryCopyOutAwaitingCC(ReplyId<QueryKind>),
-    /// Mirror of [`ProtoState::SimpleQueryCopyInActive`] (DEF-219).
+ /// Mirror of [`ProtoState::SimpleQueryCopyInActive`] ().
     SimpleQueryCopyInActive(ReplyId<QueryKind>),
     /// Mirror of [`ProtoState::DrainRfqAfterError`].
     DrainRfqAfterError,
@@ -1399,7 +1399,7 @@ pub enum ActiveState {
     BindExecuteAwaitingBindCompleteDml(ReplyId<QueryKind>),
     /// Mirror of [`ProtoState::BindExecuteAwaitingCommandCompleteDml`].
     BindExecuteAwaitingCommandCompleteDml(ReplyId<QueryKind>),
-    /// Mirror of [`ProtoState::BindExecuteAwaitingRfqDml`]. DEF-286 Φ3.
+ /// Mirror of [`ProtoState::BindExecuteAwaitingRfqDml`]. Φ3.
     BindExecuteAwaitingRfqDml {
         reply: ReplyId<QueryKind>,
     },
@@ -1426,7 +1426,7 @@ pub enum ActiveState {
     /// Mirror of [`ProtoState::DescribeStatementAwaitingParamDesc`].
     DescribeStatementAwaitingParamDesc(ReplyId<DescribeStatementKind>),
     /// Mirror of [`ProtoState::DescribeStatementAwaitingRowDescOrNoData`].
-    /// DEF-286 Φ1: `param_oids` lives in
+ /// Φ1: `param_oids` lives in
     /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the outer
     /// `<ActivePhase>::Extras` — variant carries only the bare
     /// `ReplyId<K>`.
@@ -1434,7 +1434,7 @@ pub enum ActiveState {
         reply: ReplyId<DescribeStatementKind>,
     },
     /// Mirror of [`ProtoState::DescribeStatementAwaitingRfq`].
-    /// DEF-286 Φ1: `param_oids` lives in the
+ /// Φ1: `param_oids` lives in the
     /// [`crate::param_oids_slot::ParamOidsSlotCell`] (parked at the
     /// earlier `'t'` dispatch arm); variant carries only the bare
     /// `ReplyId<K>`.

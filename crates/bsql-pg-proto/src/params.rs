@@ -202,7 +202,7 @@ pub trait ParamsWriter: sealed::ParamsWriterSealed {
     const FORMATS: &'static [FormatCode];
 
     /// Per-parameter PG type OIDs, derived from each element's
-    /// [`EncodeBinary::OID`]. Exposed as a static slice so Phase 2's
+ /// [`EncodeBinary::OID`]. Exposed as a static slice so Phase 2's
     /// `query!` macro can cross-check the tuple's OID sequence
     /// against the server's `ParameterDescription` response at
     /// compile time — a tier-1 shield against "wrong param types
