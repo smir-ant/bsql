@@ -324,7 +324,12 @@ pub enum ProtoState {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
         /// Expected server signature for constant-time comparison.
-        expected_server_sig: SecretDigest,
+        /// Box-backed (DEF-286 follow-up): 32-B inline SecretDigest
+        /// dominates ConnectingState at 48 B. Boxing → 8 B pointer
+        /// → ConnectingState max-variant drops to 23 B → state 48→24 B
+        /// (−50 %). One alloc per SCRAM handshake (once per conn),
+        /// freed at variant transition; ZeroizeOnDrop scrubs on Box drop.
+        expected_server_sig: alloc::boxed::Box<SecretDigest>,
     },
 
     /// SCRAM step 3 complete (server signature verified); awaiting
@@ -1216,7 +1221,7 @@ pub enum ConnectingState {
     /// Mirror of [`ProtoState::ConnectingScramAwaitingServerFinal`].
     ScramAwaitingServerFinal {
         reply: ReplyId<StartupKind>,
-        expected_server_sig: SecretDigest,
+        expected_server_sig: alloc::boxed::Box<SecretDigest>,
     },
     /// Mirror of [`ProtoState::ConnectingScramAwaitingAuthOk`].
     ScramAwaitingAuthOk(ReplyId<StartupKind>),
@@ -2025,8 +2030,10 @@ const _: () = assert!(
     "ErroredState must remain 1 B (single Errored variant carrying StateErrorKind)",
 );
 const _: () = assert!(
-    core::mem::size_of::<ConnectingState>() == 48,
-    "ConnectingState dominant variant: ScramAwaitingServerFinal (32 B SecretDigest + 8 B ReplyId + 8 B alignment)",
+    core::mem::size_of::<ConnectingState>() == 24,
+    "ConnectingState 24 B post-SecretDigest boxing. Prior dominator \
+     ScramAwaitingServerFinal shrank from 47 to 15 B via \
+     Box<SecretDigest>. New dominator: StartupCleartext at 23 B.",
 );
 const _: () = assert!(
     core::mem::size_of::<ActiveState>() == 16,
@@ -2427,7 +2434,7 @@ mod push_class_tests {
         pin(
             ProtoState::ConnectingScramAwaitingServerFinal {
                 reply: ReplyId::from_raw(nz(2_004)),
-                expected_server_sig: SecretDigest::new([0_u8; 32]),
+                expected_server_sig: alloc::boxed::Box::new(SecretDigest::new([0_u8; 32])),
             },
             StatePushClass::Connecting,
         );
@@ -2723,7 +2730,7 @@ mod per_phase_state_roundtrip_tests {
         }
         roundtrip_connecting(ProtoState::ConnectingScramAwaitingServerFinal {
             reply: ReplyId::from_raw(nz(2_007)),
-            expected_server_sig: SecretDigest::new([0_u8; 32]),
+            expected_server_sig: alloc::boxed::Box::new(SecretDigest::new([0_u8; 32])),
         });
         roundtrip_connecting(ProtoState::ConnectingScramAwaitingAuthOk(
             ReplyId::from_raw(nz(2_008)),

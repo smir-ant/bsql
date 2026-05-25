@@ -703,7 +703,7 @@ const _: () = assert!(
 // target aarch64-apple-darwin; per-target `#[cfg(...)]` blocks
 // would land in the same commit that adds another target to CI.
 const _: () = assert!(
-    core::mem::size_of::<state::ProtoState>() == 48,
+    core::mem::size_of::<state::ProtoState>() == 24,
     "ProtoState exact size pin: row_desc_slot externalised on \
      PgProtocol; schema-presence flags deleted (`row_desc_slot. \
      is_some()` is single source of truth); `param_oids` heap-boxed \
@@ -874,7 +874,7 @@ const _: () = assert!(
 // `ConnectingState` LHS writes it (Extras = ()). PgProtocol<P>
 // = Inner + Extras + ZST phase_marker.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 368,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 344,
     "PgProtocol<ConnectingPhase> layout drift — must equal \
      ConnectingInner (state ConnectingState 48 B + read_buf 264 B + \
      4 cells × 8 B + 1 u32 + alignment) PLUS Extras = () (ZST) PLUS \

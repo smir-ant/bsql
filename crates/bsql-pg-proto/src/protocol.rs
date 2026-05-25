@@ -9153,7 +9153,7 @@ mod allows_unsolicited_param_status_tests {
 
         let scram_final = ProtoState::ConnectingScramAwaitingServerFinal {
             reply: ReplyId::from_raw(nz(6)),
-            expected_server_sig: crate::scram::types::SecretDigest::new([0_u8; 32]),
+            expected_server_sig: alloc::boxed::Box::new(crate::scram::types::SecretDigest::new([0_u8; 32])),
         };
         assert!(!allows_unsolicited_param_status(&scram_final));
         consume_state(scram_final);
@@ -9837,7 +9837,7 @@ mod compute_push_tests {
             let raw_new = nz(206);
             let prev = ProtoState::ConnectingScramAwaitingServerFinal {
                 reply: ReplyId::from_raw(raw_prev),
-                expected_server_sig: crate::scram::types::SecretDigest::new([0_u8; 32]),
+                expected_server_sig: alloc::boxed::Box::new(crate::scram::types::SecretDigest::new([0_u8; 32])),
             };
             let cmd = PgCommand::Ping { reply: ReplyId::from_raw(raw_new) };
             let (new_state, staged) = compute_staged(cmd, prev);

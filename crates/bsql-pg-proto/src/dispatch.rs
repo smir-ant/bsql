@@ -707,7 +707,7 @@ pub(crate) fn dispatch(
         ) => {
             // `expected_server_sig` destructured inline — tier-1
             // variant-carries-field.
-            dispatch_auth_sasl_final(state, reply, expected_server_sig, payload, error_arena_slot)
+            dispatch_auth_sasl_final(state, reply, *expected_server_sig, payload, error_arena_slot)
         }
         (ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
@@ -2465,7 +2465,7 @@ fn dispatch_auth_sasl_continue(
     // the handshake no longer needs it.
     *state = ProtoState::ConnectingScramAwaitingServerFinal {
         reply,
-        expected_server_sig,
+        expected_server_sig: alloc::boxed::Box::new(expected_server_sig),
     };
     DispatchOutcome::AdvancedWithAction {
         action: StagedAction::SendBytesRange(range),
