@@ -1031,6 +1031,9 @@ pub enum FeedEvent<'wb> {
     Fail(NonZeroU64),
     /// State→Errored without in-flight reply. Caller closes the socket.
     Close,
+    /// Server notice (WARNING/NOTICE/INFO/DEBUG/LOG). Non-fatal.
+    /// Resolve via [`crate::PgProtocol::get_notice`].
+    Notice(crate::notices_arena::NoticeRef),
 }
 
 /// Classified push-side failure — the bytes-only push API

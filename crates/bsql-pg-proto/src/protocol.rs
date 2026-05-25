@@ -5408,10 +5408,9 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_active<'w, 'r>(
         [] => FeedEvent::NeedMoreBytes,
         [Action::SendBytes(bytes)] => FeedEvent::SendBytes(bytes),
         [Action::DeliverReply { id, value }] => FeedEvent::Deliver(*id, *value),
-        // .b: cause externalised; caller queries via
-        // `pg.fail_cause()` AFTER consuming this event.
         [Action::FailReply { id }, ..] => FeedEvent::Fail(*id),
         [Action::CloseSocket] => FeedEvent::Close,
+        [Action::Notice { notice_ref }] => FeedEvent::Notice(*notice_ref),
         _ => FeedEvent::Close,
     }
 }
@@ -5457,10 +5456,9 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_connecting<'w, 'r>(
         [] => FeedEvent::NeedMoreBytes,
         [Action::SendBytes(bytes)] => FeedEvent::SendBytes(bytes),
         [Action::DeliverReply { id, value }] => FeedEvent::Deliver(*id, *value),
-        // .b: cause externalised; caller queries via
-        // `pg.fail_cause()` AFTER consuming this event.
         [Action::FailReply { id }, ..] => FeedEvent::Fail(*id),
         [Action::CloseSocket] => FeedEvent::Close,
+        [Action::Notice { notice_ref }] => FeedEvent::Notice(*notice_ref),
         _ => FeedEvent::Close,
     }
 }

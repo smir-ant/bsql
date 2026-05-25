@@ -716,7 +716,12 @@ fn notice_response_mid_flight_is_silently_consumed() {
     // (self-inclusive) = 9.
     let notice: [u8; 10] = [b'N', 0, 0, 0, 9, b'M', b'h', b'i', 0, 0];
     let out = proto.feed_bytes(&notice, &mut wb);
-    assert_eq!(out.len(), 0, "NoticeResponse emits no actions");
+    assert_eq!(out.len(), 1, "NoticeResponse emits Action::Notice");
+    assert!(
+        matches!(out.as_slice(), [Action::Notice { .. }]),
+        "expected Action::Notice, got {:?}",
+        out.as_slice()
+    );
     expect_awaiting_ping_reply(proto.state(), ping_raw);
 
     // Now complete the ping normally.
