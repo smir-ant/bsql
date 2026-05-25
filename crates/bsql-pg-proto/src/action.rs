@@ -2214,8 +2214,9 @@ const _: () = assert!(
 // `MAX_PARAMS_ARITY` grows past 16, revisit eq strategy
 // (populated-prefix might become cheaper than the wide compare).
 const _: () = assert!(
-    crate::params::MAX_PARAMS_ARITY <= 255,
-    "ParamOids n_params is BoundedU8 — MAX_PARAMS_ARITY must fit u8.",
+    4usize.saturating_mul(crate::params::MAX_PARAMS_ARITY) <= 64,
+    "ParamOids eq is SIMD-wide (≤64 bytes). \
+     Revisit populated-prefix eq if MAX_PARAMS_ARITY grows > 16.",
 );
 
 impl Default for ParamOids {
@@ -2335,14 +2336,7 @@ impl ParamOids {
 //    overhead.
 impl PartialEq for ParamOids {
     fn eq(&self, other: &Self) -> bool {
-        let n = usize::from(self.n_params.get());
-        if n != usize::from(other.n_params.get()) {
-            return false;
-        }
-        match (self.oids.get(..n), other.oids.get(..n)) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
-        }
+        self.n_params.get() == other.n_params.get() && self.oids == other.oids
     }
 }
 impl Eq for ParamOids {}

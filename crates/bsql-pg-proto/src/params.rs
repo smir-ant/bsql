@@ -160,9 +160,9 @@ impl<T: EncodeBinary> ParamEncoder for Option<T> {
 /// for the worst-case Bind-frame size computation — changing this
 /// const without updating the tuple-impl invocation list would
 /// silently break the budget.
-pub const MAX_PARAMS_ARITY: usize = 64;
+pub const MAX_PARAMS_ARITY: usize = 16;
 
-/// Upper bound on total parameter-data bytes across all 64 params
+/// Upper bound on total parameter-data bytes across all 16 params
 /// in a single Bind frame. Per-param individual size isn't capped
 /// structurally — the caller can send one 1 KB text param OR 16 ×
 /// 64-byte params, provided the SUM stays under this limit.
