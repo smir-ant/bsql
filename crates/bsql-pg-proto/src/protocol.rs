@@ -1289,6 +1289,7 @@ pub struct ActiveExtras {
 /// surface — the inner-data shape stays an internal detail of
 /// `mod protocol` (and its leaf submodules per Rust submodule
 /// visibility rules).
+#[repr(C)]
 pub struct PgProtocol<P: SealedPhase> {
     // Per-phase `Inner` storage via the associated type
     // `<P as SealedPhase>::Inner`. Each monomorphisation has a

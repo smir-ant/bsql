@@ -95,7 +95,7 @@ use crate::decode::RowDesc;
 )]
 #[repr(transparent)]
 pub struct RowDescSlotCell {
-    inner: Option<RowDesc>,
+    inner: Option<alloc::boxed::Box<RowDesc>>,
 }
 
 impl RowDescSlotCell {
@@ -123,7 +123,7 @@ impl RowDescSlotCell {
     #[inline]
     #[must_use]
     pub(crate) fn as_ref(&self) -> Option<&RowDesc> {
-        self.inner.as_ref()
+        self.inner.as_deref()
     }
 
     /// Returns `true` if the slot is populated. Read-only. Currently
@@ -155,7 +155,7 @@ impl RowDescSlotCell {
         desc: RowDesc,
         _token: crate::protocol::_bind_execute_select_install_leaf::BeSelectToken,
     ) {
-        self.inner = Some(desc);
+        self.inner = Some(alloc::boxed::Box::new(desc));
     }
 
     /// Park `desc` from the inbound `'T'` (RowDescription) frame
@@ -167,7 +167,7 @@ impl RowDescSlotCell {
         desc: RowDesc,
         _token: crate::dispatch::_row_description_dispatch_leaf::TDispatchToken,
     ) {
-        self.inner = Some(desc);
+        self.inner = Some(alloc::boxed::Box::new(desc));
     }
 
     /// Clear the slot at the residue-cleanup transition (Idle/Errored
@@ -187,7 +187,7 @@ impl RowDescSlotCell {
     #[cfg(test)]
     #[inline]
     pub(crate) fn _set_for_test(&mut self, value: Option<RowDesc>) {
-        self.inner = value;
+        self.inner = value.map(alloc::boxed::Box::new);
     }
 }
 

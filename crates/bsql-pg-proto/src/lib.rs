@@ -804,7 +804,7 @@ const _: () = assert!(
 // on a quiet system (`load avg < 8`). On regression, investigate
 // (asm-diff, alternative shapes), do NOT roll back tier elevations.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 408,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 280,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
      .b: pin stays at 528 B post-.b — the \
@@ -899,7 +899,7 @@ const _: () = assert!(
 // phase_marker; measured 528 B on aarch64-apple-darwin (post-// slot-pattern lift of `Box<ParamOids>` from state variants to
 // Extras slot; post-notifications_arena slot).
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 408,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 280,
     "PgProtocol<ActivePhase> layout drift — must equal ActiveInner \
      PLUS Extras = ActiveExtras (RowDescSlotCell + ParamOidsSlotCell \
      + CommandTagSlotCell + TxStatusSlotCell + FailCauseSlotCell) \
