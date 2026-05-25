@@ -117,19 +117,28 @@ impl<const N: usize> ReadBufN<N> {
     /// Append `bytes` to the unread region.
     ///
     /// Returns [`ReadBufFull`] if the resulting length would exceed
-    /// [`READ_BUF_CAP`] even after reclaiming the consumed prefix.
+    /// capacity even after reclaiming the consumed prefix.
     ///
-    /// **Lazy compaction.** Tries to fit the incoming bytes
-    /// into the tail first — `heapless::Vec::extend_from_slice`
-    /// checks capacity before copying and returns `Err` without
-    /// mutation, so a retry after compacting is safe. On the typical
-    /// workload (8 KiB chunks on a 4 KiB buffer where previous
-    /// frames have been consumed) this saves one `memmove` per
-    /// `append` call whenever the tail already has room. Only when
-    /// the tail is insufficient does the buffer reclaim
-    /// `[0..cursor)` and try again.
+    /// **Eager cursor-reset + lazy compact fallback (DEF-058).**
+    /// When the buffer is fully consumed (`cursor == inner.len()`),
+    /// zeroizes the consumed region and resets to empty before
+    /// extending. The `extend_from_slice` then sees an empty buffer
+    /// with full capacity — no `compact()` needed. Only when a
+    /// partial frame residue exists (cursor < len) does the lazy
+    /// compact fallback fire.
     #[inline]
     pub fn append(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
+        // DEF-058 eager cursor-reset: when the buffer is fully
+        // consumed (cursor == inner.len() and cursor > 0), zeroize
+        // and reset before extending. The extend then sees an empty
+        // buffer with full capacity — no compact() needed. The
+        // `cursor > 0` guard skips the no-op case (fresh buffer).
+        if self.cursor > 0 && usize::from(self.cursor) == self.inner.len() {
+            use zeroize::Zeroize;
+            self.inner.as_mut_slice().zeroize();
+            self.inner.clear();
+            self.cursor = 0;
+        }
         // Fast path: tail has room, no need to compact.
         if self.inner.extend_from_slice(bytes).is_ok() {
             return Ok(());
@@ -551,11 +560,102 @@ impl ReadBuf {
     /// Inline-mode fast path: try inline `extend_from_slice`. If the
     /// inline storage is exhausted, escape to heap (one-time alloc +
     /// memcpy of inline contents) and retry.
+    ///
+    /// # Eager cursor-reset (DEF-058)
+    ///
+    /// Before attempting `extend_from_slice`, checks whether the
+    /// active storage is fully consumed (`cursor == populated.len()`
+    /// and `cursor > 0`). If so, zeroizes the consumed region and
+    /// resets the storage to empty (len = 0, cursor = 0). The
+    /// subsequent `extend_from_slice` then finds an empty buffer with
+    /// full capacity — no `compact()` needed.
+    ///
+    /// **Why this eliminates compact on the hot path**: the Postgres
+    /// wire protocol has a consume-then-append pattern — the driver
+    /// reads a TCP chunk, parses all complete frames (advancing past
+    /// each), then waits for the next chunk. After parsing all frames,
+    /// cursor == len (the common case). With eager reset, the next
+    /// `append()` sees room = full capacity and succeeds on the first
+    /// `extend_from_slice` attempt. Without it, the buffer has
+    /// cursor = len = N, room = cap - N, which may be insufficient
+    /// for the incoming bytes — triggering `compact()` with its
+    /// `copy_within` memmove + zeroize + truncate + retry overhead.
+    ///
+    /// **Residual compacts**: the `compact_inline()` / `compact_heap()`
+    /// fallbacks remain for the case where advance left a partial
+    /// residue (cursor < len) and the residue + incoming bytes exceed
+    /// tail capacity. The fallback fires only on that path — with
+    /// eager reset covering the fully-consumed case, the residual
+    /// compacts run strictly fewer times.
+    ///
+    /// # Zeroize discipline
+    ///
+    /// The eager reset path zeroizes `[0..len)` of the active storage
+    /// before truncating — same staleness-leak-closure guarantee as
+    /// `compact()`. Every consumed byte is scrubbed before the buffer
+    /// re-enters the empty state; no stale frame data (SQL history,
+    /// SCRAM proofs) persists past the reset point.
+    ///
+    /// Tier-2 structural: zeroize-before-truncate is unconditional on
+    /// the reset path — no call-pattern audit dependency.
+    ///
+    /// # Safety of reset timing
+    ///
+    /// The reset runs inside `append()`, which takes `&mut self`.
+    /// The borrow checker guarantees that no outstanding `&populated`
+    /// / `&unread` borrows can be alive at this point — the caller
+    /// must have released all shared borrows before calling `append`.
+    /// This is stricter than resetting inside `advance()`, where
+    /// callers (e.g., `emit_next_col`) may still project slices from
+    /// `populated()` after advancing the cursor.
     #[inline]
     pub fn append(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
-        // Heap-mode: append to heap with compact-on-overflow.
-        if self.heap.is_some() {
-            return self.append_heap(bytes);
+        // Heap-mode fast path.
+        if let Some(heap) = self.heap.as_mut() {
+            // DEF-058 eager cursor-reset: when the heap buffer is
+            // fully consumed (cursor == heap.len()), zeroize and
+            // reset before extending. The extend then sees an empty
+            // buffer with full capacity — no compact_heap() needed.
+            if self.cursor > 0 && usize::from(self.cursor) == heap.len() {
+                use zeroize::Zeroize;
+                heap.as_mut_slice().zeroize();
+                heap.clear();
+                self.cursor = 0;
+            }
+            // Try extend. Fast path: room in tail → single memcpy.
+            if heap.extend_from_slice(bytes).is_ok() {
+                return Ok(());
+            }
+            // Slow path: tail exhausted with unread residue.
+            // compact_heap moves the residue to position 0, frees
+            // tail, and retries. This fires only when advance left a
+            // partial frame — rare under the eager-reset gate above.
+            self.compact_heap();
+            let Some(heap) = self.heap.as_mut() else {
+                return Err(ReadBufFull {
+                    attempted: bytes.len(),
+                    available: READ_BUF_CAP,
+                    cap: READ_BUF_CAP,
+                });
+            };
+            return heap
+                .extend_from_slice(bytes)
+                .map_err(|CapacityError { .. }| {
+                    let len = heap.len();
+                    ReadBufFull {
+                        attempted: bytes.len(),
+                        available: READ_BUF_CAP.saturating_sub(len),
+                        cap: READ_BUF_CAP,
+                    }
+                });
+        }
+
+        // Inline-mode: DEF-058 eager cursor-reset for inline tier.
+        if self.cursor > 0 && usize::from(self.cursor) == self.inline.len() {
+            use zeroize::Zeroize;
+            self.inline.as_mut_slice().zeroize();
+            self.inline.clear();
+            self.cursor = 0;
         }
         // Inline-mode fast path: try inline append.
         if self.inline.extend_from_slice(bytes).is_ok() {
@@ -693,44 +793,6 @@ impl ReadBuf {
         self.populated()
             .len()
             .saturating_sub(usize::from(self.cursor))
-    }
-
-    /// Heap-mode append helper: try direct extend; on capacity
-    /// failure, compact heap and retry. Mirrors the
-    /// `ReadBufN<N>::append` lazy-compact discipline.
-    #[inline]
-    fn append_heap(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
-        let Some(heap) = self.heap.as_mut() else {
-            // Caller bug — branch unreachable per `append` precondition.
-            return Err(ReadBufFull {
-                attempted: bytes.len(),
-                available: READ_BUF_CAP,
-                cap: READ_BUF_CAP,
-            });
-        };
-        if heap.extend_from_slice(bytes).is_ok() {
-            return Ok(());
-        }
-        // Slow path: heap full. Compact (reclaim consumed prefix) and
-        // retry. The cursor advances during dispatch — the heap may
-        // be physically full while the unread region is small.
-        self.compact_heap();
-        let Some(heap) = self.heap.as_mut() else {
-            return Err(ReadBufFull {
-                attempted: bytes.len(),
-                available: READ_BUF_CAP,
-                cap: READ_BUF_CAP,
-            });
-        };
-        heap.extend_from_slice(bytes)
-            .map_err(|CapacityError { .. }| {
-                let len = heap.len();
-                ReadBufFull {
-                    attempted: bytes.len(),
-                    available: READ_BUF_CAP.saturating_sub(len),
-                    cap: READ_BUF_CAP,
-                }
-            })
     }
 
     /// Reclaim the consumed prefix of inline storage.
