@@ -441,10 +441,11 @@ impl<'p, 'w> RowStream<'p, 'w> {
     where
         R: crate::prepared::RowDecode,
     {
-        let mut col_offsets: [Option<(usize, usize)>; crate::decode::MAX_ROW_COLUMNS] =
-            [None; crate::decode::MAX_ROW_COLUMNS];
-        let col_formats: [crate::decode::FormatCode; crate::decode::MAX_ROW_COLUMNS] =
-            [crate::decode::FormatCode::Text; crate::decode::MAX_ROW_COLUMNS];
+        const MAX_DECODE_ARITY: usize = 16;
+        let mut col_offsets: [Option<(usize, usize)>; MAX_DECODE_ARITY] =
+            [None; MAX_DECODE_ARITY];
+        let col_formats: [crate::decode::FormatCode; MAX_DECODE_ARITY] =
+            [crate::decode::FormatCode::Text; MAX_DECODE_ARITY];
         let mut col_count: u16 = 0;
         loop {
             // Pull one event; if it's a chunked column or terminal,
@@ -466,10 +467,10 @@ impl<'p, 'w> RowStream<'p, 'w> {
                     // outer scope (after the arm) re-fetch populated
                     // base and compute offset.
                     let idx_usize = usize::from(idx);
-                    if idx_usize >= crate::decode::MAX_ROW_COLUMNS {
+                    if idx_usize >= MAX_DECODE_ARITY {
                         return Err(ProtocolError::TooManyColumns {
                             count: idx_usize.saturating_add(1),
-                            max: crate::decode::MAX_ROW_COLUMNS,
+                            max: MAX_DECODE_ARITY,
                         });
                     }
                     let slice_addr = bytes.as_ptr().addr();
@@ -514,10 +515,10 @@ impl<'p, 'w> RowStream<'p, 'w> {
                     // The explicit `TooManyColumns` classification
                     // surfaces a typed ProtocolError instead.
                     let idx_usize = usize::from(idx);
-                    if idx_usize >= crate::decode::MAX_ROW_COLUMNS {
+                    if idx_usize >= MAX_DECODE_ARITY {
                         return Err(ProtocolError::TooManyColumns {
                             count: idx_usize.saturating_add(1),
-                            max: crate::decode::MAX_ROW_COLUMNS,
+                            max: MAX_DECODE_ARITY,
                         });
                     }
                     // Slot already None.
