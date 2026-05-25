@@ -701,8 +701,8 @@ fn describe_statement_too_many_params_tears_down() {
     let (reply, _reply_raw) = mint_reply::<DescribeStatementKind>(&mut proto);
     describe_stmt_setup(&mut proto, stmt_unnamed(), reply, &mut wb);
 
-    // 17 OIDs — one over the cap.
-    let oids: std::vec::Vec<u32> = (1..=17u32).collect();
+    // 65 OIDs — one over the cap (MAX_PARAMS_ARITY = 64).
+    let oids: std::vec::Vec<u32> = (1..=65u32).collect();
     let bad = parameter_description_frame(&oids);
 
     let out = proto.feed_bytes(&bad, &mut wb);
@@ -712,7 +712,7 @@ fn describe_statement_too_many_params_tears_down() {
             a,
             Action::FailReply { .. },
         )),
-        "expected TooManyParameters {{ count: 17, max: 16 }}, got {actions:?}",
+        "expected TooManyParameters {{ count: 65, max: 64 }}, got {actions:?}",
     );
     assert!(actions.iter().any(|a| matches!(a, Action::CloseSocket)));
 }
