@@ -506,7 +506,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
                 ColEvent::Null { idx } => {
                     // Mirrors the `Got` path above (oversize index
                     // classification). A silent `if idx_usize <
-                    // MAX_ROW_COLUMNS { … }` guard form would skip the
+                    // MAX_DECODE_ARITY { … }` guard form would skip the
                     // col_count bump on overflow: a server emitting a
                     // row with 33+ Null columns would see `col_count`
                     // plateau at 32 + the R::ARITY check pass false-
@@ -540,9 +540,9 @@ impl<'p, 'w> RowStream<'p, 'w> {
                     // between frames).
                     let populated = self.proto.read_buf_populated();
                     // Build the per-column &[u8] slice array.
-                    let mut col_bytes: [Option<&[u8]>; crate::decode::MAX_ROW_COLUMNS] =
-                        [None; crate::decode::MAX_ROW_COLUMNS];
-                    let n_used = usize::from(col_count).min(crate::decode::MAX_ROW_COLUMNS);
+                    let mut col_bytes: [Option<&[u8]>; MAX_DECODE_ARITY] =
+                        [None; MAX_DECODE_ARITY];
+                    let n_used = usize::from(col_count).min(MAX_DECODE_ARITY);
                     // Let-chain (Rust 1.88+) — short-circuit
                     // evaluation; inner body runs iff all three clauses
                     // bind.

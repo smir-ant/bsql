@@ -39,10 +39,10 @@ use core::fmt;
 /// connection stays alive (recoverable), the user retries with a
 /// narrower projection.
 ///
-/// 32 covers typical application queries with headroom. Widening this
-/// bound grows [`RowDesc`] linearly and propagates up through
-/// [`crate::Reply::QueryComplete`].
-pub const MAX_ROW_COLUMNS: usize = 32;
+/// 1600 matches PG's `MaxTupleAttributeNumber`. Since RowDesc is
+/// now heap-allocated (`Box<[u32]>`, exact-size), this constant
+/// only affects the parse-time rejection threshold — not storage.
+pub const MAX_ROW_COLUMNS: usize = 1600;
 
 /// PostgreSQL wire format for one column's bytes.
 ///
