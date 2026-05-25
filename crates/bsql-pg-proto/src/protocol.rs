@@ -4335,25 +4335,25 @@ where
     // amortises one classification across the full feed_bytes
     // dispatch loop.
     let entry_class = state.push_class();
-    // perf-recovery: `fail_cause_slot` is no longer
-    // an argument here — the Idle-arm clear was provably dead (see
-    // `clear_session_residue_for_class_dispatch` docstring). The
-    // local binding is still needed for `materialise_fn` (the park
-    // site). Dropping the arg saves one stack push per feed_bytes
-    // entry (ARM64 13th arg spilled past x0-x7).
-    clear_session_residue_for_class_dispatch(
-        terminal_row_desc,
-        terminal_param_oids,
-        terminal_command_tag,
-        terminal_tx_status,
-        session_params_slot,
-        error_arena_slot,
-        notifications_arena_slot,
-        copy_chunks_arena_slot,
-        command_tags_arena_slot,
-        partial_assembly_slot,
+    if matches!(
         entry_class,
-    );
+        crate::state::StatePushClass::Idle
+            | crate::state::StatePushClass::Errored(_)
+    ) {
+        clear_session_residue_for_class_dispatch(
+            terminal_row_desc,
+            terminal_param_oids,
+            terminal_command_tag,
+            terminal_tx_status,
+            session_params_slot,
+            error_arena_slot,
+            notifications_arena_slot,
+            copy_chunks_arena_slot,
+            command_tags_arena_slot,
+            partial_assembly_slot,
+            entry_class,
+        );
+    }
 
     // No `pending_advance` slot is needed: cursor advance fires
     // IN-SCOPE inside the dispatch loop because no `StagedAction`
@@ -4529,11 +4529,11 @@ where
             match outcome {
                 DispatchOutcome::AdvancedSilent => {
                     dispatches_this_call =
-                        dispatches_this_call.saturating_add(1);
+                        dispatches_this_call.wrapping_add(1);
                 }
                 DispatchOutcome::AdvancedWithAction { action } => {
                     dispatches_this_call =
-                        dispatches_this_call.saturating_add(1);
+                        dispatches_this_call.wrapping_add(1);
                     emit_actions!(&mut staged, budget: 1, [
                         action,
                     ]);
@@ -4569,7 +4569,7 @@ where
             if BOUNDED && dispatches_this_call >= max_dispatches {
                 break;
             }
-            let absolute_start = cursor.saturating_add(frames_consumed);
+            let absolute_start = cursor.wrapping_add(frames_consumed);
             let after_consumed = populated
                 .get(usize::from(absolute_start)..)
                 .unwrap_or(&[]);
@@ -4686,7 +4686,7 @@ where
                             | ParamStatusRecordOutcome::MalformedPayload => {}
                         }
                         frames_consumed =
-                            frames_consumed.saturating_add(total_len);
+                            frames_consumed.wrapping_add(total_len);
                         continue;
                     }
                     if tag == crate::wire::TAG_NOTICE_RESPONSE
@@ -4696,7 +4696,7 @@ where
                             session_params_slot,
                         );
                         frames_consumed =
-                            frames_consumed.saturating_add(total_len);
+                            frames_consumed.wrapping_add(total_len);
                         continue;
                     }
                     // : NotificationResponse ('A') pre-dispatch
@@ -4737,7 +4737,7 @@ where
                         // `admit_parameter_status_frame`'s
                         // `MalformedPayload` discard policy.
                         frames_consumed =
-                            frames_consumed.saturating_add(total_len);
+                            frames_consumed.wrapping_add(total_len);
                         continue;
                     }
 
@@ -4772,15 +4772,15 @@ where
                     match outcome {
                         DispatchOutcome::AdvancedSilent => {
                             frames_consumed =
-                                frames_consumed.saturating_add(total_len);
+                                frames_consumed.wrapping_add(total_len);
                             dispatches_this_call =
-                                dispatches_this_call.saturating_add(1);
+                                dispatches_this_call.wrapping_add(1);
                         }
                         DispatchOutcome::AdvancedWithAction { action } => {
                             frames_consumed =
-                                frames_consumed.saturating_add(total_len);
+                                frames_consumed.wrapping_add(total_len);
                             dispatches_this_call =
-                                dispatches_this_call.saturating_add(1);
+                                dispatches_this_call.wrapping_add(1);
                             emit_actions!(&mut staged, budget: 1, [
                                 action,
                             ]);
