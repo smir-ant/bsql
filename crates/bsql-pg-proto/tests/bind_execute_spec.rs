@@ -200,7 +200,7 @@ fn bind_execute_select_with_schema_streams_rows() {
 
     // User-provided schema — 1 TEXT column. In real use, macro-
     // generated at compile time from Parse+Describe fingerprint.
-    let schema = RowDesc::EMPTY; // empty schema — 0-column "SELECT" case
+    let schema = RowDesc::empty(); // empty schema — 0-column "SELECT" case
 
     proto.push_bind_execute_or_panic(
         &portal_unnamed(),

@@ -127,581 +127,176 @@ const _: () = {
     );
 };
 
-/// Bit-packed set of [`FormatCode`] values for the columns of a
-/// result-set. Bit `i` is `1` if column `i` is [`FormatCode::Binary`],
-/// `0` otherwise (default = [`FormatCode::Text`]).
-///
-/// # Tier-1 size win
-///
-/// Storage is one `u32`, exactly the bit-width of
-/// [`MAX_ROW_COLUMNS`] (= 32). A naive
-/// `[FormatCode; MAX_ROW_COLUMNS]` shape would burn 32 bytes for
-/// the 32-column inline cap, and the bit-packed form removes the
-/// `[FormatCode; 32]` niche from the outer struct (the new u32
-/// storage is non-niche, so `Option<RowDesc>` may grow by one
-/// discriminant byte + alignment — net per-Option saving is
-/// 24-28 B depending on layout).
-///
-/// # Tier
-///
-/// Construction is **tier-2 structural**: [`Self::set`] returns
-/// [`OutOfRange`] for `idx >= MAX_ROW_COLUMNS`, never panics.
-/// Round-trip — `set(i, code)` followed by `get(i)` returns the same
-/// `code` — is verified by tier-1 unit tests below.
-///
-/// # `repr(transparent)`
-///
-/// Pinned via `#[repr(transparent)]` so the struct layout is exactly
-/// the inner `u32`. A future field addition would change the
-/// `size_of::<FormatCodeSet>() == 4` const-assert and the build
-/// would fail — adding a field is a decision point, not a silent
-/// regression.
-// `Default` derive deliberately absent to eliminate the tier-3
-// `Default::default() == empty()` audit gap. `Default::default` is
-// not const-fn-callable (const traits unstable), so the identity
-// could only be verified via runtime test — a tier-3 surface where
-// a custom-impl `Default` could silently diverge from `empty()`.
-// Callers use `FormatCodeSet::empty()` explicitly; production
-// search confirms zero `::default()` consumers in the crate. **Tier-1
-// by removal** — no surface = no possibility of drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct FormatCodeSet {
-    /// Bit `i` (0-indexed) is `1` iff column `i` is [`FormatCode::Binary`].
-    /// Bits at positions `>= MAX_ROW_COLUMNS` MUST always be `0` — every
-    /// constructor and mutator on this type preserves that invariant.
-    bits: u32,
-}
-
-/// Error returned by [`FormatCodeSet::set`] when the column index
-/// exceeds [`MAX_ROW_COLUMNS`].
-///
-/// Kept as a typed sentinel (rather than a `bool` / `Option`) so a
-/// caller mapping the failure into a higher-level classification
-/// (e.g. [`crate::ProtocolError::MalformedRowDescription`]) does
-/// so explicitly. Tier-3 classified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OutOfRange {
-    /// Caller-supplied index that exceeded the bound.
-    pub idx: usize,
-    /// Maximum index permitted (one past = [`MAX_ROW_COLUMNS`]).
-    pub max: usize,
-}
-
-// Additive `core::error::Error` impl — `OutOfRange` is a small
-// ZST-shape error sentinel signalling format-code-index out of
-// range, used by callers to detect `MAX_ROW_COLUMNS` / per-column
-// index overrun.
-impl core::error::Error for OutOfRange {}
-
-impl fmt::Display for OutOfRange {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "FormatCodeSet index {} exceeds MAX_ROW_COLUMNS = {}",
-            self.idx, self.max,
-        )
-    }
-}
-
-// Tier-1 storage-width pin. `FormatCodeSet` uses `u32` with the
-// invariant "bit i ↔ column i", which only works while the bit-width
-// of u32 (= 32) is at least `MAX_ROW_COLUMNS`. If `MAX_ROW_COLUMNS`
-// bumps from 32, the storage type must widen (u64 / u128 / `[u32; N]`)
-// AND the `get` / `set` shift logic must follow.
-const _: () = assert!(
-    MAX_ROW_COLUMNS == 32,
-    "FormatCodeSet uses u32 (32-bit) storage tied to MAX_ROW_COLUMNS == 32. \
-     If MAX_ROW_COLUMNS changes, switch storage type to a wider integer or \
-     a [u32; N] array AND update the shift logic in get/set/empty.",
-);
-
-const _: () = assert!(
-    core::mem::size_of::<FormatCodeSet>() == 4,
-    "FormatCodeSet must remain 4 bytes (single u32). repr(transparent) \
-     pins the layout; adding any field would break this invariant and \
-     erode the bit-packed size win.",
-);
-
-impl FormatCodeSet {
-    /// Empty set — every column position resolves to [`FormatCode::Text`].
-    /// Used by [`RowDesc::EMPTY`] and as the zero-init seed inside
-    /// `parse_row_description`.
-    #[inline]
-    #[must_use]
-    pub const fn empty() -> Self {
-        Self { bits: 0 }
-    }
-
-    /// Compute the bit-mask for column index `idx`. Returns `None`
-    /// for `idx >= MAX_ROW_COLUMNS`.
-    ///
-    /// Implementation: repeated `wrapping_mul(2)` instead of a
-    /// single `checked_shl`. Both forms are `const fn` stable, but
-    /// the shift-by-usize form requires a usize → u32 conversion
-    /// in const context which is **not yet const-stable**
-    /// (`TryFrom<usize> for u32` const-trait gated on
-    /// rust-lang/rust#143874). Repeated multiplication sidesteps
-    /// the conversion entirely; the const-eval cost is `O(idx)` at
-    /// **compile time only** (runtime accessors don't call this —
-    /// see the inline note below).
-    ///
-    /// # Tier-1 round-trip enabler
-    ///
-    /// Existence as a `const fn` is what enables the round-trip
-    /// const-assert block below to verify
-    /// `set(i, code) → get(i) == code` **at compile time** for every
-    /// `(i ∈ 0..32, code ∈ {Text, Binary})` pair (64 distinct
-    /// assertions). Without `mask_for_const`, the round-trip
-    /// guarantee would live as runtime tests (tier-3 verified) instead
-    /// of compile-time pin (tier-1 by-construction).
-    #[inline]
-    const fn mask_for_const(idx: usize) -> Option<u32> {
-        if idx >= MAX_ROW_COLUMNS {
-            return None;
-        }
-        // O(idx) const loop. const-stable since Rust 1.46. At runtime
-        // the function is `#[inline]` and called from `get` / `set`
-        // which then turns the loop into LLVM-optimised code; modern
-        // compilers reduce this to a single shift on the happy path.
-        let mut mask = 1u32;
-        let mut i = 0usize;
-        while i < idx {
-            mask = mask.wrapping_mul(2);
-            i = i.wrapping_add(1);
-        }
-        Some(mask)
-    }
-
-    /// Format code at column `idx`.
-    ///
-    /// Returns `None` for `idx >= MAX_ROW_COLUMNS` — defensive
-    /// secondary guard. Production call sites
-    /// ([`RowDesc::format_code`]) gate `idx < n_columns` first; this
-    /// accessor's bound shields against constructor / refactor drift
-    /// independently.
-    ///
-    /// # `const fn`
-    ///
-    /// `const fn` so the round-trip pin block below can verify
-    /// `set(i, code) → get(i) == code` at **compile time** —
-    /// elevating round-trip from tier-3 runtime-test to tier-1
-    /// const-assert.
-    #[inline]
-    #[must_use]
-    pub const fn get(&self, idx: usize) -> Option<FormatCode> {
-        let mask = match Self::mask_for_const(idx) {
-            Some(m) => m,
-            None => return None,
-        };
-        if self.bits & mask != 0 {
-            Some(FormatCode::Binary)
-        } else {
-            Some(FormatCode::Text)
-        }
-    }
-
-    /// Set the format code at column `idx`.
-    ///
-    /// Returns `Err(OutOfRange)` for `idx >= MAX_ROW_COLUMNS`. The
-    /// caller MUST classify the failure (the only call site today is
-    /// `parse_row_description`, which maps it to
-    /// [`crate::ProtocolError::MalformedRowDescription`] alongside the
-    /// existing dead-arm classification of out-of-range slot writes).
-    ///
-    /// # `const fn` with `&mut self` (Rust 1.83+ const_mut_refs)
-    ///
-    /// Const-mut-refs is stable since Rust 1.83.0 (workspace MSRV =
-    /// 1.95). Promoting `set` to `const fn` is what lets the
-    /// round-trip const-assert block below mutate a `FormatCodeSet`
-    /// at compile time — completing the tier-1 elevation.
-    pub const fn set(&mut self, idx: usize, code: FormatCode) -> Result<(), OutOfRange> {
-        let mask = match Self::mask_for_const(idx) {
-            Some(m) => m,
-            None => return Err(OutOfRange { idx, max: MAX_ROW_COLUMNS }),
-        };
-        match code {
-            FormatCode::Text => self.bits &= !mask,
-            FormatCode::Binary => self.bits |= mask,
-        }
-        Ok(())
-    }
-
-    /// Raw bit pattern — diagnostic / test access only.
-    ///
-    /// Bit `i` (0-indexed) is `1` iff column `i` is
-    /// [`FormatCode::Binary`]. Bits beyond [`MAX_ROW_COLUMNS`] are
-    /// always zero by construction.
-    #[inline]
-    #[must_use]
-    pub const fn raw_bits(self) -> u32 {
-        self.bits
-    }
-
-    /// Construct from a raw bit pattern — diagnostic / test access
-    /// only. Caller is responsible for ensuring bits at positions
-    /// `>= MAX_ROW_COLUMNS` are zero. Production call paths use
-    /// [`Self::set`] in a loop (`parse_row_description`).
-    #[inline]
-    #[must_use]
-    pub const fn from_raw_bits(bits: u32) -> Self {
-        Self { bits }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Tier-1 round-trip compile pin.
-// ─────────────────────────────────────────────────────────────────
+// ── RowDesc: exact-size heap-backed schema ────────────────────────
 //
-// Verifies at COMPILE TIME that for every (idx, code) pair where
-// idx ∈ 0..MAX_ROW_COLUMNS and code ∈ {Text, Binary}:
+// Layout inside `Box<[u32]>`:
+//   [n_columns, oid_0, ..., oid_{n-1}, fmt_word_0, ..., fmt_word_{k-1}]
+// where k = (n + 31) / 32   (ceil division, 1 bit per column)
 //
-//     1. empty().get(idx) == Some(Text)        — zero-init semantic
-//     2. set(idx, code) succeeds               — bound respected
-//     3. (after set) get(idx) == Some(code)    — round-trip
-//     4. set(idx, Text) clears                 — explicit Text-write
-//     5. (after Text-set) get(idx) == Text     — clear semantic
-//
-// 64 distinct properties × 32 column positions = 320 assertions
-// total, all verified at compile time. A body-swap of `&` / `|` /
-// `!` in `set`, an inverse-swap of arms in `get`, or a misclassified
-// idx → mask mapping in `mask_for_const` would fail this block at
-// const-eval time.
-//
-// Pre-(this block) the round-trip property lived in runtime unit
-// tests (tier-3 verified) — a deletion of the test would be silent.
-// Post-(this block) the round-trip is a build-failure if violated.
-//
-// Loop body is `assert!(matches!(...))` — both const-stable.
-const _: () = {
-    let mut idx = 0usize;
-    while idx < MAX_ROW_COLUMNS {
-        // (1) Empty set: every position is Text.
-        let s_empty = FormatCodeSet::empty();
-        assert!(
-            matches!(s_empty.get(idx), Some(FormatCode::Text)),
-            "FormatCodeSet round-trip pin: empty().get(idx) must be Text",
-        );
+// Slice length = 1 + n + k.
+// Single heap allocation. No fixed cap. No waste.
 
-        // (2 + 3): set(idx, Binary) succeeds, get(idx) returns Binary.
-        let mut s = FormatCodeSet::empty();
-        let r = s.set(idx, FormatCode::Binary);
-        assert!(
-            matches!(r, Ok(())),
-            "FormatCodeSet round-trip pin: set(idx, Binary) must succeed for idx in 0..MAX_ROW_COLUMNS",
-        );
-        assert!(
-            matches!(s.get(idx), Some(FormatCode::Binary)),
-            "FormatCodeSet round-trip pin: set(idx, Binary).get(idx) must be Binary",
-        );
-
-        // (4 + 5): set(idx, Text) clears the bit; get(idx) returns Text.
-        let r = s.set(idx, FormatCode::Text);
-        assert!(
-            matches!(r, Ok(())),
-            "FormatCodeSet round-trip pin: set(idx, Text) must succeed",
-        );
-        assert!(
-            matches!(s.get(idx), Some(FormatCode::Text)),
-            "FormatCodeSet round-trip pin: set(idx, Text).get(idx) must be Text",
-        );
-
-        idx = idx.wrapping_add(1);
-    }
-};
-
-// Out-of-range pin: idx == MAX_ROW_COLUMNS yields None on get and
-// Err(OutOfRange) on set. Pins the boundary-classification arm.
-// `Option::is_none` / `Result::is_err` are const-stable since
-// Rust 1.48 — preferred over `matches!` here for clippy
-// (`redundant_pattern_matching`).
-const _: () = {
-    let s = FormatCodeSet::empty();
-    assert!(
-        s.get(MAX_ROW_COLUMNS).is_none(),
-        "FormatCodeSet boundary pin: get(MAX_ROW_COLUMNS) must be None",
-    );
-    let mut s_mut = FormatCodeSet::empty();
-    assert!(
-        s_mut.set(MAX_ROW_COLUMNS, FormatCode::Binary).is_err(),
-        "FormatCodeSet boundary pin: set(MAX_ROW_COLUMNS, _) must be Err",
-    );
-};
-
-// Independence pin: setting bit i does NOT affect bit j (j != i).
-// Catches a hypothetical mask-broadcast bug (`self.bits = mask`
-// instead of `self.bits |= mask`) at compile time.
-const _: () = {
-    let mut s = FormatCodeSet::empty();
-    assert!(matches!(s.set(0, FormatCode::Binary), Ok(())));
-    assert!(matches!(s.set(31, FormatCode::Binary), Ok(())));
-    assert!(matches!(s.get(0), Some(FormatCode::Binary)));
-    assert!(matches!(s.get(31), Some(FormatCode::Binary)));
-    // Bits 1..31 must remain Text.
-    let mut j = 1usize;
-    while j < 31 {
-        assert!(
-            matches!(s.get(j), Some(FormatCode::Text)),
-            "FormatCodeSet independence pin: set(0,Binary)+set(31,Binary) must not affect bits 1..31",
-        );
-        j = j.wrapping_add(1);
-    }
-};
-
-// Tier-1 elevation of `OutOfRange` field preservation.
-//
-// Const-eval verifies the `.idx` and `.max` field surface is
-// preserved exactly through `set`'s OOR path. A naive shape would
-// leave this to a runtime test: a field-swap regression where
-// `set` returned `OutOfRange { idx: 0, max }` (or `idx: max` etc.)
-// instead of `idx: caller_idx` would compile, propagate to operator
-// diagnostics, and pass static analysis — only the runtime test
-// would notice.
-//
-// Pattern: `assert!(result.is_err(), …)` first (guarantees the Ok
-// arm is unreachable in const-eval), then `match` with an empty Ok
-// arm (architecturally dead under the prior assertion). This
-// avoids `assert!(false, …)` which `clippy::assertions_on_constants`
-// rejects.
-const _: () = {
-    // Three offending indices spanning the typical range: just past
-    // the boundary (32), well-beyond (99), and pathological (usize::MAX).
-    // Each is documented-dead from a `set` mutation perspective (no bits
-    // touched on Err path), so we also verify state-preservation.
-    let mut s_a = FormatCodeSet::from_raw_bits(0xdead_beef);
-    let r_a = s_a.set(MAX_ROW_COLUMNS, FormatCode::Binary);
-    assert!(r_a.is_err(), "set(MAX_ROW_COLUMNS, _) must fail");
-    if let Err(OutOfRange { idx, max }) = r_a {
-        assert!(
-            idx == MAX_ROW_COLUMNS,
-            "OutOfRange.idx must equal caller's offending index (boundary case)",
-        );
-        assert!(
-            max == MAX_ROW_COLUMNS,
-            "OutOfRange.max must equal MAX_ROW_COLUMNS",
-        );
-    }
-    // State must NOT have mutated on Err.
-    assert!(
-        s_a.raw_bits() == 0xdead_beef,
-        "Failed set must leave raw_bits untouched (OOR boundary case)",
-    );
-
-    let mut s_b = FormatCodeSet::from_raw_bits(0xdead_beef);
-    let r_b = s_b.set(99, FormatCode::Text);
-    assert!(r_b.is_err(), "set(99, _) must fail");
-    if let Err(OutOfRange { idx, max }) = r_b {
-        assert!(
-            idx == 99,
-            "OutOfRange.idx must equal caller's offending index (well-beyond)",
-        );
-        assert!(max == MAX_ROW_COLUMNS);
-    }
-    assert!(s_b.raw_bits() == 0xdead_beef, "Failed set leaves state");
-
-    let mut s_c = FormatCodeSet::from_raw_bits(0xdead_beef);
-    let r_c = s_c.set(usize::MAX, FormatCode::Binary);
-    assert!(r_c.is_err(), "set(usize::MAX, _) must fail");
-    if let Err(OutOfRange { idx, max }) = r_c {
-        assert!(
-            idx == usize::MAX,
-            "OutOfRange.idx must equal caller's offending index (pathological)",
-        );
-        assert!(max == MAX_ROW_COLUMNS);
-    }
-    assert!(s_c.raw_bits() == 0xdead_beef, "Failed set leaves state");
-};
-
-// Tier-1 elevation of `raw_bits` round-trip.
-//
-// Const-eval verifies `from_raw_bits(x).raw_bits() == x` on
-// multiple representative bit patterns (zero, all-ones,
-// alternating, single bits at low and high positions). A naive
-// shape would leave this to a runtime test: a hidden
-// transformation in either accessor (e.g. xor with constant, byte-
-// swap) would compile silently and only show on inspect-and-
-// rebuild flows.
-const _: () = {
-    // Pattern 1: zero (covers empty()-equivalent path).
-    assert!(FormatCodeSet::from_raw_bits(0).raw_bits() == 0);
-    // Pattern 2: all-ones (covers max-pattern path; every bit Binary).
-    assert!(FormatCodeSet::from_raw_bits(u32::MAX).raw_bits() == u32::MAX);
-    // Pattern 3: alternating 0xa..a (covers interleaved bits).
-    assert!(FormatCodeSet::from_raw_bits(0xaaaa_aaaa).raw_bits() == 0xaaaa_aaaa);
-    // Pattern 4: alternating 0x5..5 (complement of 3 — both halves).
-    assert!(FormatCodeSet::from_raw_bits(0x5555_5555).raw_bits() == 0x5555_5555);
-    // Pattern 5: single low bit (catches a mask-by-low-byte bug).
-    assert!(FormatCodeSet::from_raw_bits(1).raw_bits() == 1);
-    // Pattern 6: single high bit (catches a sign-flag / shift-direction bug).
-    assert!(FormatCodeSet::from_raw_bits(0x8000_0000).raw_bits() == 0x8000_0000);
-    // Pattern 7: arbitrary "magic" pattern.
-    assert!(FormatCodeSet::from_raw_bits(0xdead_beef).raw_bits() == 0xdead_beef);
-};
-
-/// Per-column metadata from a `RowDescription` frame.
-///
-/// Carries the load-bearing fields for row decoding: the PG type OID
-/// (which tells the caller what Rust type to decode into) and the
-/// format code (which tells the decoder whether to parse text or
-/// binary representation).
-///
-/// **Fields dropped vs PG spec**: `table_oid`, `attr_num`,
-/// `type_size`, `type_mod`, column name. Names can be restored if
-/// runtime-reflection tooling requires them; the typed-macro layer
-/// resolves names at compile time and does not need the runtime
-/// copy.
-///
-/// # Derived projection, not stored representation
-///
-/// `ColumnDesc` is produced on demand by [`RowDesc::get`] /
-/// `RowDesc::columns`; it is not the storage shape. A naive shape
-/// that stored an inline `[ColumnDesc; 32]` array (8 B per slot,
-/// 256 B total + n_columns + padding = 264 B) would balloon the
-/// per-result-set footprint. The current struct-of-arrays layout
-/// (`[u32; 32]` for OIDs + bit-packed `FormatCodeSet` for format
-/// codes) is 136 B (~48% smaller).
+/// Per-column descriptor returned by [`RowDesc::get`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ColumnDesc {
-    /// PostgreSQL type OID (e.g. `23` = `int4`, `25` = `text`). Match
-    /// via the constants in [`crate::oids`].
+    /// PostgreSQL type OID.
     pub type_oid: u32,
     /// Text or binary.
     pub format_code: FormatCode,
 }
 
-/// Schema of a result-set's rows.
+/// Result-set schema. Exact-size, no fixed cap, single heap allocation.
 ///
-/// # Bit-packed format codes
-///
-/// Format codes are stored in a [`FormatCodeSet`] (one `u32`, 1
-/// bit per column). The per-column accessor `format_code(idx)`
-/// reads `(packed >> idx) & 1` — branchless, single-instruction
-/// on every relevant ISA. A naive `[FormatCode; 32]` shape would
-/// burn 32 B per descriptor; the bit-packed form is 4 B (saving
-/// 28 B per descriptor).
-///
-/// # Struct-of-arrays (SoA) layout
-///
-/// POD layout: a parallel array of OIDs (one `u32` slot per column
-/// up to [`MAX_ROW_COLUMNS`]) + a bit-packed [`FormatCodeSet`] +
-/// a 1-byte populated count. `Copy`, no `Drop`. Equality compares
-/// the full storage — trailing slots are zero-filled by every
-/// constructor and never mutated thereafter.
-///
-/// ```text
-/// n_columns:    BoundedU8<32>    [1 B]
-/// (padding to align u32)         [3 B]
-/// type_oids:    [u32; 32]        [128 B]
-/// format_codes: FormatCodeSet    [4 B]
-/// total:                         [136 B]
-/// ```
-///
-/// A naive array-of-structs shape (`[(u32, FormatCode); 32]` = 8 B
-/// per slot = 264 B) would burn ~128 B more per descriptor.
-///
-/// # Per-row hot-path access
-///
-/// The streaming fast-path reads `desc.type_oid(i)` (single u32
-/// array lookup) and `desc.format_code(i)` (bit-pack mask read on
-/// a u32 — fits one cache line shared with adjacent metadata).
-/// Both O(1), branchless on the happy path, no `&ColumnDesc`
-/// reconstruction needed for the hot path.
-#[derive(Debug, Clone, Copy)]
-#[repr(C, align(4))]
+/// Parsed once from the server's `RowDescription` (`'T'`) frame.
+/// Read-only thereafter. Accessed once per query via
+/// `current_row_desc()` — NOT per-column during streaming.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowDesc {
-    /// Column count is `BoundedU8<MAX_ROW_COLUMNS>` (1 byte,
-    /// `NonZeroU8`-backed niche). Tier-2 by-construct: the parser
-    /// rejects any wire `n_columns > MAX_ROW_COLUMNS` before
-    /// constructing this field, so an out-of-bounds row descriptor
-    /// cannot exist in safe code. The niche absorbs the
-    /// discriminant of `Option<RowDesc>`.
-    n_columns: crate::bounded::BoundedU8<MAX_ROW_COLUMNS>,
-    /// Padding so `type_oids` is 4-byte aligned. Always zero
-    /// (initialised by constructors).
-    _pad: [u8; 3],
-    type_oids: [u32; MAX_ROW_COLUMNS],
-    /// Bit-packed (1 bit per column) — replaces a naive
-    /// `[FormatCode; MAX_ROW_COLUMNS]` shape (32 B → 4 B).
-    format_codes: FormatCodeSet,
+    data: alloc::boxed::Box<[u32]>,
 }
 
 impl RowDesc {
-    /// Empty descriptor (0 columns). Used as a test fixture and as
-    /// the schema-less sentinel for empty-query / NoData paths.
-    /// `format_codes: FormatCodeSet::empty()` zero-initialises
-    /// every column position to [`FormatCode::Text`] (bit 0 = Text).
-    pub const EMPTY: Self = Self {
-        n_columns: crate::bounded::BoundedU8::ZERO,
-        _pad: [0; 3],
-        type_oids: [0; MAX_ROW_COLUMNS],
-        format_codes: FormatCodeSet::empty(),
-    };
+    /// Construct from pre-parsed OIDs and format codes.
+    pub(crate) fn from_parts(
+        oids: &[u32],
+        format_codes: &[FormatCode],
+    ) -> Result<Self, crate::error::ProtocolError> {
+        let n = oids.len();
+        if n > MAX_ROW_COLUMNS {
+            return Err(crate::error::ProtocolError::TooManyColumns {
+                count: n,
+                max: MAX_ROW_COLUMNS,
+            });
+        }
+        let k = n.div_ceil(32);
+        let total = 1usize.saturating_add(n).saturating_add(k);
+        let mut v = alloc::vec![0u32; total];
+        let Ok(n_u32) = u32::try_from(n) else {
+            return Err(crate::error::ProtocolError::TooManyColumns {
+                count: n,
+                max: MAX_ROW_COLUMNS,
+            });
+        };
+        if let Some(slot) = v.get_mut(0) {
+            *slot = n_u32;
+        }
+        for (i, &oid) in oids.iter().enumerate() {
+            if let Some(slot) = v.get_mut(1usize.saturating_add(i)) {
+                *slot = oid;
+            }
+        }
+        let bits_start = 1usize.saturating_add(n);
+        for (i, &fc) in format_codes.iter().enumerate() {
+            if matches!(fc, FormatCode::Binary) {
+                let word_idx = i >> 5;
+                let bit_idx = i & 31;
+                if let Some(word) = v.get_mut(bits_start.saturating_add(word_idx)) {
+                    *word |= 1u32 << bit_idx;
+                }
+            }
+        }
+        Ok(Self {
+            data: v.into_boxed_slice(),
+        })
+    }
+
+    /// Synthesise from a static OID list with all-text format codes.
+    pub(crate) fn from_static_oids_text_format(
+        oids: &[u32],
+    ) -> Result<Self, crate::error::ProtocolError> {
+        let n = oids.len();
+        let k = n.div_ceil(32);
+        let total = 1usize.saturating_add(n).saturating_add(k);
+        let mut v = alloc::vec![0u32; total];
+        let Ok(n_u32) = u32::try_from(n) else {
+            return Err(crate::error::ProtocolError::TooManyColumns {
+                count: n,
+                max: MAX_ROW_COLUMNS,
+            });
+        };
+        if let Some(slot) = v.get_mut(0) {
+            *slot = n_u32;
+        }
+        for (i, &oid) in oids.iter().enumerate() {
+            if let Some(slot) = v.get_mut(1usize.saturating_add(i)) {
+                *slot = oid;
+            }
+        }
+        Ok(Self {
+            data: v.into_boxed_slice(),
+        })
+    }
+
+    /// Empty descriptor (0 columns).
+    pub fn empty() -> Self {
+        Self {
+            data: alloc::vec![0u32; 1].into_boxed_slice(),
+        }
+    }
 
     /// Number of populated columns.
-    ///
-    /// Non-const: `From<u8> for usize` is not yet a const trait
-    /// on stable (RU-01 watch).
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        usize::from(self.n_columns.get())
+        self.data
+            .first()
+            .map(|&v| {
+                let Ok(u) = usize::try_from(v) else {
+                    return 0;
+                };
+                u
+            })
+            .unwrap_or(0)
     }
 
-    /// Number of populated columns as a `u16` — matches the wire
-    /// representation; internally `BoundedU8<32>` enforces the
-    /// range invariant.
-    ///
-    /// Non-const for the same reason as [`Self::len`]
-    /// (`u16::from(u8)` is not const-trait-callable on stable Rust
-    /// yet).
+    /// Number of populated columns as `u16`.
     #[inline]
     #[must_use]
     pub fn n_columns(&self) -> u16 {
-        u16::from(self.n_columns.get())
+        let n = self.len();
+        let Ok(v) = u16::try_from(n) else {
+            return 0;
+        };
+        v
     }
 
     /// Whether the descriptor carries any columns.
     #[inline]
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.n_columns.get() == 0
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// PG type OID for column `idx`, or `None` if out of range.
-    ///
-    /// O(1) indexed lookup into the `type_oids` SoA array — hot-
-    /// path callers (per-column decode) get a single bounds-checked
-    /// u32 read.
     #[inline]
     #[must_use]
     pub fn type_oid(&self, idx: usize) -> Option<u32> {
         if idx >= self.len() {
             return None;
         }
-        self.type_oids.get(idx).copied()
+        self.data.get(1usize.saturating_add(idx)).copied()
     }
 
     /// Format code for column `idx`, or `None` if out of range.
-    ///
-    /// O(1) indexed lookup — reads from the bit-packed
-    /// [`FormatCodeSet`] (single `u32` shift + mask). The
-    /// `idx >= self.len()` gate is the populated-prefix bound; the
-    /// inner `FormatCodeSet::get` carries an independent
-    /// `idx >= MAX_ROW_COLUMNS` defensive guard (returns `None`).
     #[inline]
     #[must_use]
     pub fn format_code(&self, idx: usize) -> Option<FormatCode> {
-        if idx >= self.len() {
+        let n = self.len();
+        if idx >= n {
             return None;
         }
-        self.format_codes.get(idx)
+        let bits_start = 1usize.saturating_add(n);
+        let word_idx = idx >> 5;
+        let bit_idx = idx & 31;
+        let word = self.data.get(bits_start.saturating_add(word_idx)).copied()?;
+        if word & (1u32 << bit_idx) != 0 {
+            Some(FormatCode::Binary)
+        } else {
+            Some(FormatCode::Text)
+        }
     }
 
-    /// Construct a `ColumnDesc` for column `idx`, or `None` if out
-    /// of range. Reconstructs the AoS shape on demand from the SoA
-    /// storage. Returns `Option<ColumnDesc>` (by value) — on 64-bit
-    /// targets a `ColumnDesc` (8 B) by-value is identical in ABI
-    /// cost to a `&ColumnDesc`, with no pointer-stability surprise.
+    /// Construct a `ColumnDesc` for column `idx`.
     #[inline]
     #[must_use]
     pub fn get(&self, idx: usize) -> Option<ColumnDesc> {
@@ -711,12 +306,7 @@ impl RowDesc {
         })
     }
 
-    /// Iterate over populated columns in declaration order.
-    ///
-    /// Each yielded item is a `ColumnDesc` reconstructed from the SoA
-    /// storage. For decode hot paths prefer the per-array accessors
-    /// ([`Self::type_oid`], [`Self::format_code`]) — they avoid the
-    /// per-step struct construction.
+    /// Iterate over populated columns.
     #[inline]
     #[must_use]
     pub fn columns_iter(&self) -> RowDescColumnsIter<'_> {
@@ -725,65 +315,6 @@ impl RowDesc {
             idx: 0,
             len: self.len(),
         }
-    }
-
-    /// Synthesise a `RowDesc` from a static OID list with all-text
-    /// format codes.
-    ///
-    /// Used by the `prepared!` macro's runtime path
-    /// ([`crate::protocol::compute_push_bind_prepared_idle_only`]):
-    /// the macro carries `row_oids: &'static [u32]`, but the
-    /// server's Parse+Bind+Execute pipeline does NOT emit a
-    /// `RowDescription` frame absent a prior `Describe`. The
-    /// synthetic descriptor satisfies the SELECT-path's
-    /// `RowDescSlotCell::park_at_be_select` contract without a
-    /// server round-trip.
-    ///
-    /// Format codes default to [`FormatCode::Text`] (v1 text
-    /// format; a binary track is a planned follow-up).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::error::ProtocolError::TooManyColumns`] when
-    /// `oids.len() > MAX_ROW_COLUMNS`. The macro's `RowDecode` trait
-    /// caps tuple arity at 16 < 32, so this is architecturally dead
-    /// at the typical call site — but the Result keeps the no-panic
-    /// discipline.
-    #[inline]
-    pub(crate) fn from_static_oids_text_format(
-        oids: &[u32],
-    ) -> Result<Self, crate::error::ProtocolError> {
-        if oids.len() > MAX_ROW_COLUMNS {
-            return Err(crate::error::ProtocolError::TooManyColumns {
-                count: oids.len(),
-                max: MAX_ROW_COLUMNS,
-            });
-        }
-        let n_u8 = u8::try_from(oids.len()).map_err(|_| {
-            crate::error::ProtocolError::TooManyColumns {
-                count: oids.len(),
-                max: MAX_ROW_COLUMNS,
-            }
-        })?;
-        let n_columns = crate::bounded::BoundedU8::<MAX_ROW_COLUMNS>::try_new(n_u8)
-            .ok_or(crate::error::ProtocolError::TooManyColumns {
-                count: oids.len(),
-                max: MAX_ROW_COLUMNS,
-            })?;
-        let mut type_oids: [u32; MAX_ROW_COLUMNS] = [0; MAX_ROW_COLUMNS];
-        // Copy in-place — no allocator, no Vec round-trip.
-        for (slot, src) in type_oids.iter_mut().zip(oids.iter()) {
-            *slot = *src;
-        }
-        // FormatCodeSet::empty() initialises every bit to 0 = Text,
-        // matching the macro's v1 all-text choice.
-        let format_codes = FormatCodeSet::empty();
-        Ok(Self {
-            n_columns,
-            _pad: [0; 3],
-            type_oids,
-            format_codes,
-        })
     }
 }
 
@@ -811,170 +342,79 @@ impl Iterator for RowDescColumnsIter<'_> {
         (n, Some(n))
     }
 }
-
 impl ExactSizeIterator for RowDescColumnsIter<'_> {}
 impl core::iter::FusedIterator for RowDescColumnsIter<'_> {}
 
-// RowDesc uses full-array Eq (trailing slots are zero-filled by
-// constructors and never mutated thereafter, so byte-equality of the
-// SoA arrays implies logical equality of populated-prefix semantics).
-impl PartialEq for RowDesc {
-    fn eq(&self, other: &Self) -> bool {
-        self.n_columns == other.n_columns
-            && self.type_oids == other.type_oids
-            && self.format_codes == other.format_codes
-    }
-}
-impl Eq for RowDesc {}
 
-// RowDesc size pin: 136 B exact.
-// `MAX_ROW_COLUMNS = 32`: 4 (n_columns + pad) + 128 (type_oids) +
-// 4 (format_codes FormatCodeSet u32) = 136 B.
-const _: () = assert!(
-    core::mem::size_of::<RowDesc>() == 136,
-    "RowDesc size pin: 136 B exact. If MAX_ROW_COLUMNS bumps from \
-     32, update both this pin AND `FormatCodeSet`'s storage type \
-     (u32 → wider integer / array) AND the const-assert tying the \
-     two together. New size = 4 + 4 * MAX_ROW_COLUMNS + \
-     bytes_for(FormatCodeSet) rounded for alignment.",
-);
-const _: () = assert!(
-    core::mem::align_of::<RowDesc>() == 4,
-    "RowDesc alignment must remain 4 (u32 type_oids force this). \
-     repr(C, align(4)) keeps the layout drift-pinned.",
-);
-
-// `Option<RowDesc>` exact pin.
-//
-// The Option niches through the `NonZeroU8` inside `n_columns` (the
-// first field), so the discriminant adds zero bytes. A naive shape
-// where `n_columns` was `u8` (non-niche) would force the Option to
-// add 1 discriminant byte + 3 alignment padding = +4 B per
-// `Option<RowDesc>` (cascading into `PgProtocol::row_desc_slot`).
-//
-// The exact-pin form makes any future change that loses the niche
-// (e.g. replacing `FormatCodeSet` with a non-niche-friendly type,
-// adding a non-Copy field that loses the leading-niche position)
-// a build-time decision point rather than a silent size regression.
-const _: () = assert!(
-    core::mem::size_of::<Option<RowDesc>>() == 136,
-    "Option<RowDesc> exact pin: 136 B (= 136 RowDesc, niche absorbed \
-     via `BoundedU8<32>::NonZeroU8` in the `n_columns` first field).",
-);
-
-/// Lifetime-bound borrow of a [`RowDesc`] living inside
-/// `crate::PgProtocol::row_desc_slot`.
-///
-/// `RowDescBorrow<'r>` is the public read-only handle the user
-/// receives for SELECT-bearing replies and per-row events. It is
-/// `Copy` (8 B — just a `&RowDesc` reference) and ties its validity
-/// to the `&'r mut PgProtocol` borrow chain that produced it.
-///
-/// # Lifetime contract
-///
-/// `'r` is the same lifetime as the `OutActions<'_, 'r>` /
-/// `StreamItem<'r>` that delivered the borrow. While the borrow is
-/// alive, the borrow checker blocks any `&mut PgProtocol` re-entry —
-/// in particular, the next `iter_rows` / `feed_bytes` / `push_command`
-/// call cannot fire until this borrow drops. This means `row_desc_slot`
-/// cannot be cleared, and the underlying `RowDesc` stays valid.
-///
-/// # Why a separate type vs `&'r RowDesc`
-///
-/// Three reasons:
-///
-/// 1. **API stability**: the internal storage layout (currently a
-///    direct `Option<RowDesc>` slot, possibly future per-column
-///    SoA arrays addressed by an external buffer) is hidden
-///    behind this borrow. Users access via `n_columns()` /
-///    `type_oid(i)` / `format_code(i)` and don't depend on field
-///    projections.
-/// 2. **Implementation flexibility**: future versions may back the
-///    borrow with byte-range descriptors into a dedicated buffer,
-///    or with rkyv-style zero-copy archives — without breaking
-///    user code.
-/// 3. **Discoverability**: `RowDescBorrow::n_columns(&self)` chains
-///    fluently in user code; `(&'r RowDesc).len()` is less
-///    natural.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
+/// Lifetime-bound borrow of a [`RowDesc`].
+#[derive(Debug, Clone, Copy)]
 pub struct RowDescBorrow<'r> {
     inner: &'r RowDesc,
 }
 
 impl<'r> RowDescBorrow<'r> {
-    /// Construct from an immutable reference. Crate-internal — the
-    /// public path is via [`crate::PgProtocol::current_row_desc`].
     #[inline]
     #[must_use]
-    pub(crate) const fn from_ref(inner: &'r RowDesc) -> Self {
+    pub(crate) fn from_ref(inner: &'r RowDesc) -> Self {
         Self { inner }
     }
 
-    /// Number of populated columns.
-    ///
-    /// Non-const because `u16::from(u8)` is not const-trait-stable
-    /// yet.
+    /// Column count as u16.
     #[inline]
     #[must_use]
     pub fn n_columns(&self) -> u16 {
         self.inner.n_columns()
     }
 
-    /// Number of populated columns as `usize`.
+    /// Column count as usize.
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
-    /// Whether the descriptor carries any columns.
+    /// Whether the descriptor is empty.
     #[inline]
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
-    /// PG type OID for column `idx`, or `None` if out of range.
-    ///
-    /// Single bounds-checked u32 read into the underlying SoA storage.
+    /// PG type OID for column `idx`.
     #[inline]
     #[must_use]
     pub fn type_oid(&self, idx: usize) -> Option<u32> {
         self.inner.type_oid(idx)
     }
 
-    /// Format code for column `idx`, or `None` if out of range.
+    /// Format code for column `idx`.
     #[inline]
     #[must_use]
     pub fn format_code(&self, idx: usize) -> Option<FormatCode> {
         self.inner.format_code(idx)
     }
 
-    /// Construct a [`ColumnDesc`] for column `idx`, or `None` if out
-    /// of range. Mirrors [`RowDesc::get`].
+    /// Column descriptor for column `idx`.
     #[inline]
     #[must_use]
     pub fn get(&self, idx: usize) -> Option<ColumnDesc> {
         self.inner.get(idx)
     }
 
-    /// Iterate over populated columns as [`ColumnDesc`] tuples.
+    /// Iterate over populated columns.
     #[inline]
     #[must_use]
-    pub fn columns_iter(&self) -> RowDescColumnsIter<'r> {
+    pub fn columns_iter(&self) -> RowDescColumnsIter<'_> {
         self.inner.columns_iter()
     }
 }
 
-// RowDescBorrow size pin: 8 B (single reference on 64-bit, 4 B on
-// 32-bit targets). Ensures the borrow doesn't grow into a payload
-// — a future regression that inlined the descriptor would land here.
-const _: () = assert!(
-    core::mem::size_of::<RowDescBorrow<'_>>() == core::mem::size_of::<&RowDesc>(),
-    "RowDescBorrow must be the same size as &RowDesc — adding a payload \
-     defeats the lazy-projection design.",
-);
+impl PartialEq for RowDescBorrow<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+impl Eq for RowDescBorrow<'_> {}
 
 impl fmt::Display for FormatCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -984,6 +424,7 @@ impl fmt::Display for FormatCode {
         }
     }
 }
+
 
 /// Parse a `RowDescription` payload (body of the `'T'` frame, after
 /// the 5-byte header) into a [`RowDesc`].
@@ -1020,19 +461,14 @@ pub(crate) fn parse_row_description(
         payload_len: payload.len(),
     };
 
-    // column_count: i16 BE at offset 0.
     let (count_bytes, mut rest) = payload.split_first_chunk::<2>().ok_or_else(malformed)?;
     let n_columns_i16 = i16::from_be_bytes(*count_bytes);
     if n_columns_i16 < 0 {
         return Err(malformed());
     }
-    // `n_columns_i16 >= 0`, so `u16::try_from` is infallible (just a
-    // bit-width narrowing from a non-negative i16). Keep the Result
-    // chain for the crate's no-panic discipline.
     let n_columns = u16::try_from(n_columns_i16).map_err(|_| malformed())?;
     let n_columns_usize = usize::from(n_columns);
 
-    // Tier-2 structural: reject results too wide for inline storage.
     if n_columns_usize > MAX_ROW_COLUMNS {
         return Err(ProtocolError::TooManyColumns {
             count: n_columns_usize,
@@ -1040,76 +476,41 @@ pub(crate) fn parse_row_description(
         });
     }
 
-    // SoA per-column parse. Populated slots overwrite the zero-
-    // initialised array / bit-pack; trailing slots remain default.
-    // `format_codes` is a bit-packed `FormatCodeSet` (u32);
-    // population is via `FormatCodeSet::set(idx, code)?`.
-    let mut type_oids = [0u32; MAX_ROW_COLUMNS];
-    let mut format_codes = FormatCodeSet::empty();
-    for idx in 0..n_columns_usize {
-        // Name: cstring (NUL-terminated). Bytes are skipped here —
-        // the typed-newtypes elsewhere already cover identifier
-        // discipline.
+    let mut oids = alloc::vec::Vec::with_capacity(n_columns_usize);
+    let mut formats = alloc::vec::Vec::with_capacity(n_columns_usize);
+
+    for _idx in 0..n_columns_usize {
         let nul_pos = rest.iter().position(|&b| b == 0).ok_or_else(malformed)?;
         let name_end = nul_pos.saturating_add(1);
         let after_name = rest.get(name_end..).ok_or_else(malformed)?;
 
-        // 18 bytes of metadata after name: table_oid(4) + attr_num(2) +
-        // type_oid(4) + type_size(2) + type_mod(4) + format_code(2).
         let (meta, next_cursor) = after_name
             .split_first_chunk::<18>()
             .ok_or_else(malformed)?;
 
-        // Destructure into the two fields we keep. Slice-pattern makes
-        // the offsets readable inline (no magic-index arithmetic).
         let &[
-            _tbl0, _tbl1, _tbl2, _tbl3,        // table_oid
-            _att0, _att1,                      // attr_num
-            toid0, toid1, toid2, toid3,        // type_oid
-            _ts0, _ts1,                        // type_size
-            _tm0, _tm1, _tm2, _tm3,            // type_mod
-            fc0, fc1,                          // format_code
+            _tbl0, _tbl1, _tbl2, _tbl3,
+            _att0, _att1,
+            toid0, toid1, toid2, toid3,
+            _ts0, _ts1,
+            _tm0, _tm1, _tm2, _tm3,
+            fc0, fc1,
         ] = meta;
         let type_oid = u32::from_be_bytes([toid0, toid1, toid2, toid3]);
         let format_code_i16 = i16::from_be_bytes([fc0, fc1]);
         let format_code = FormatCode::try_from_wire_i16(format_code_i16)
             .map_err(|code| ProtocolError::UnexpectedFormatCode { code })?;
 
-        // Bounds: idx < n_columns_usize ≤ MAX_ROW_COLUMNS. Both writes
-        // are architecturally-infallible under the upstream
-        // n_columns_usize gate. The dead Err arms classify as
-        // MalformedRowDescription rather than silently dropping the
-        // column (forbid-bundle no-panic discipline).
-        let oid_slot = type_oids.get_mut(idx).ok_or_else(malformed)?;
-        *oid_slot = type_oid;
-        // `FormatCodeSet::set` returns `OutOfRange` for
-        // `idx >= MAX_ROW_COLUMNS`; under the upstream gate this
-        // Err is dead. Map to `malformed` for surface uniformity
-        // with the type_oids slot write above.
-        format_codes.set(idx, format_code).map_err(|_| malformed())?;
+        oids.push(type_oid);
+        formats.push(format_code);
         rest = next_cursor;
     }
 
-    // Trailing bytes after the declared column count are a framing
-    // bug; `rest` must be empty at this point.
     if !rest.is_empty() {
         return Err(malformed());
     }
 
-    // Convert the validated `n_columns` (u16, range-checked above
-    // against `MAX_ROW_COLUMNS`) to the
-    // `BoundedU8<MAX_ROW_COLUMNS>` niche-bearing type. Both
-    // narrowings have architecturally-dead Err paths (the upstream
-    // guard rejects any value > 32).
-    let n_columns_bounded = <crate::bounded::BoundedU8<MAX_ROW_COLUMNS>
-        as crate::bounded::BoundedLen<MAX_ROW_COLUMNS>>::try_new_usize(n_columns_usize)
-        .ok_or_else(malformed)?;
-    Ok(RowDesc {
-        n_columns: n_columns_bounded,
-        _pad: [0; 3],
-        type_oids,
-        format_codes,
-    })
+    RowDesc::from_parts(&oids, &formats)
 }
 
 /// Parse a `ParameterDescription` payload (body of the `'t'`
@@ -3839,22 +3240,8 @@ mod format_code_set_tests {
     /// `OutOfRange::Display` carries the offending idx + max — used
     /// by future operator diagnostics. Pin the format so a body swap
     /// (idx vs max) is caught.
-    #[test]
-    fn out_of_range_display_carries_idx_and_max() {
-        let err = OutOfRange { idx: 99, max: 32 };
-        let rendered = format!("{err}");
-        assert!(rendered.contains("99"), "Display must contain idx, got: {rendered}");
-        assert!(rendered.contains("32"), "Display must contain max, got: {rendered}");
-    }
-
-    /// Size pin (runtime witness for the const-assert above). Catches
-    /// a future field addition that bypasses repr(transparent) — the
-    /// const-assert would also fire, but a runtime test gives a
-    /// second witness in the test report and surfaces in diff review.
-    #[test]
-    fn size_is_4_bytes() {
-        assert_eq!(core::mem::size_of::<FormatCodeSet>(), 4);
-    }
+    // FormatCodeSet and OutOfRange deleted — format codes now stored
+    // as trailing u32 words in RowDesc's Box<[u32]>.
 
     /// Wide-RowDesc bit-pack test. The bit-packed `FormatCodeSet`
     /// stores all 32 codes in a single u32. The narrow 2-column

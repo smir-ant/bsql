@@ -8777,7 +8777,7 @@ fn build_synthetic_row_desc(
     oids: &[u32],
 ) -> Result<crate::decode::RowDesc, ProtocolError> {
     // We need to construct a RowDesc; the existing constructors are
-    // `RowDesc::EMPTY` (0 cols) and the internal `parse_row_description`
+    // `RowDesc::empty()` (0 cols) and the internal `parse_row_description`
     // (parses wire bytes). For the macro path we synthesise directly
     // via a helper on `RowDesc` itself — exposed `pub(crate)` for
     // the prepared module to use.
@@ -9447,7 +9447,7 @@ mod residue_policy_per_class_tests {
     /// only the `<ActivePhase>` monomorphisation carries both
     /// `ActiveInner` AND the `RowDescSlotCell` extras.
     fn populate_residue(proto: &mut PgProtocol<ActivePhase>) {
-        proto.extras.row_desc._set_for_test(Some(RowDesc::EMPTY));
+        proto.extras.row_desc._set_for_test(Some(RowDesc::empty()));
         proto.inner.session_params._set_for_test(Some(dirty_session_params()));
         proto.inner.error_arena = Some(alloc::boxed::Box::new(
             crate::error_arena::ErrorArena::new(),

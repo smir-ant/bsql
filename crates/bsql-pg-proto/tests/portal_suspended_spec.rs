@@ -78,7 +78,7 @@ fn bind_complete_frame() -> [u8; 5] {
 
 /// 0-column DataRow body: `n_cols: i16 = 0`. Per PG §55.2.2 the body
 /// is `n_cols + per-column (i32 len + bytes)`; n_cols=0 means an empty
-/// column list. Useful with `RowDesc::EMPTY` to exercise the
+/// column list. Useful with `RowDesc::empty()` to exercise the
 /// streaming-state machine WITHOUT depending on populated `RowDesc`
 /// (the only externally-constructable shape is EMPTY — populated
 /// `RowDesc` requires parsing a `RowDescription` frame, which the
@@ -148,7 +148,7 @@ fn execute_portal_select_path_emits_execute_and_sync() {
     proto.push_or_panic(
         ExecutePortal {
             portal_name: &portal_unnamed(),
-            row_desc: Some(RowDesc::EMPTY),
+            row_desc: Some(RowDesc::empty()),
             fetch: FetchRows::Chunked(three),
             reply,
         },
@@ -231,7 +231,7 @@ fn execute_portal_dml_path_skips_bind_complete() {
 //   push_bind_execute(Chunked(N))
 //     → server: BindComplete + DataRow × N + PortalSuspended + RFQ
 //     → iter_rows pull loop observes:
-//        - EndRow × N (for 0-column DataRows with RowDesc::EMPTY)
+//        - EndRow × N (for 0-column DataRows with RowDesc::empty())
 //        - EndQuery { outcome: Ok(Reply::QuerySuspended(_)) }
 //   ExecutePortal(All) resume
 //     → server: DataRow × 1 + CommandComplete + RFQ
@@ -239,7 +239,7 @@ fn execute_portal_dml_path_skips_bind_complete() {
 //        - EndRow × 1
 //        - EndQuery { outcome: Ok(Reply::QueryComplete(_)) }
 //
-// Uses `RowDesc::EMPTY` + 0-column DataRows because populated
+// Uses `RowDesc::empty()` + 0-column DataRows because populated
 // `RowDesc` requires parsing a `RowDescription` frame from the wire
 // (parser is `pub(crate)`), but `BindExecute`'s caller-supplied
 // schema path accepts `EMPTY` directly. The state-machine path
@@ -252,7 +252,7 @@ fn iter_rows_chunked_suspended_then_resume_to_completion() {
     let mut wb = WriteBuf::new();
 
     // Step 1: push BindExecute with Chunked(2). Caller pre-supplies
-    // RowDesc::EMPTY (0-column SELECT path).
+    // RowDesc::empty() (0-column SELECT path).
     let (reply1, raw1) = mint_reply::<QueryKind>(&mut proto);
     let two = match NonZeroU32::new(2) {
         Some(n) => n,
@@ -262,7 +262,7 @@ fn iter_rows_chunked_suspended_then_resume_to_completion() {
         &portal_unnamed(),
         &stmt_unnamed(),
         &(),
-        Some(RowDesc::EMPTY),
+        Some(RowDesc::empty()),
         FetchRows::Chunked(two),
         reply1,
         &mut wb,
@@ -330,7 +330,7 @@ fn iter_rows_chunked_suspended_then_resume_to_completion() {
     proto.push_or_panic(
         ExecutePortal {
             portal_name: &portal_unnamed(),
-            row_desc: Some(RowDesc::EMPTY),
+            row_desc: Some(RowDesc::empty()),
             fetch: FetchRows::All,
             reply: reply2,
         },
@@ -406,7 +406,7 @@ fn execute_portal_wire_contains_max_rows_be_i32() {
     proto.push_or_panic(
         ExecutePortal {
             portal_name: &portal_unnamed(),
-            row_desc: Some(RowDesc::EMPTY),
+            row_desc: Some(RowDesc::empty()),
             fetch: FetchRows::Chunked(cap),
             reply,
         },
