@@ -1792,6 +1792,121 @@ fn bench_readbuf_compact_pressure(c: &mut Criterion) {
 // append→parse→advance→compact cycle that production servers see.
 // ---------------------------------------------------------------
 
+// ---------------------------------------------------------------
+// Bench: interleaved streaming SELECT (DEF-058 realistic workload).
+//
+// Simulates a 100-row SELECT where rows arrive in TCP-chunk-sized
+// batches and are consumed incrementally via `stream.feed(chunk)`
+// + `stream.col_next()`. This exercises the ReadBuf
+// append→parse→advance→(compact|reset) cycle that DEF-058's
+// cursor-reset optimizes — unlike the pre-loaded `pull_100_rows`
+// bench which bypasses the append/compact path entirely.
+//
+// Per-element throughput = 1 row.
+// ---------------------------------------------------------------
+
+fn bench_interleaved_streaming(c: &mut Criterion) {
+    use bsql_pg_proto::ColEvent;
+
+    let mut group = c.benchmark_group("interleaved_streaming");
+
+    const N_ROWS: u32 = 100;
+    group.throughput(Throughput::Elements(u64::from(N_ROWS)));
+
+    let rowdesc: alloc::vec::Vec<u8> = {
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(b"col\0");
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&25u32.to_be_bytes());
+        body.extend_from_slice(&(-1i16).to_be_bytes());
+        body.extend_from_slice(&(-1i32).to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        let mut frame = alloc::vec::Vec::new();
+        frame.push(b'T');
+        let total = u32::try_from(4 + body.len()).unwrap_or(0);
+        frame.extend_from_slice(&total.to_be_bytes());
+        frame.extend_from_slice(&body);
+        frame
+    };
+    let single_row = data_row_frame(16);
+    let cc_rfq = {
+        let mut out = alloc::vec::Vec::new();
+        out.push(b'C');
+        let tag = b"SELECT 100\0";
+        let len = u32::try_from(4 + tag.len()).unwrap_or(0);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&rfq_frame());
+        out
+    };
+
+    group.bench_function("100_rows_chunked_feed", |b| {
+        b.iter_batched(
+            || {
+                let mut proto = fresh_active_via_trust_handshake();
+                let mut wb = WriteBuf::new();
+                let reply = proto.next_reply_id::<QueryKind>();
+                let _ = proto.bench_push_or_panic(
+                    bsql_pg_proto::push_command::SimpleQuery {
+                        sql: "SELECT x",
+                        reply,
+                    },
+                    &mut wb,
+                );
+                let _ = proto.feed_bytes(&rowdesc, &mut wb);
+                // Build N row frames (not pre-loaded into read_buf)
+                let mut all_rows = alloc::vec::Vec::new();
+                for _ in 0..N_ROWS {
+                    all_rows.extend_from_slice(&single_row);
+                }
+                all_rows.extend_from_slice(&cc_rfq);
+                (proto, wb, all_rows)
+            },
+            |(mut proto, mut wb, all_rows)| {
+                // Feed rows in chunks of ~200 B (simulates TCP segments)
+                let chunk_size = 200;
+                let rows_seen = proto.iter_rows(&mut wb, |stream| {
+                    let mut rows: u32 = 0;
+                    let mut offset = 0;
+                    loop {
+                        match stream.col_next() {
+                            ColEvent::Got { .. } | ColEvent::Null { .. } => {}
+                            ColEvent::EndRow => {
+                                rows = rows.saturating_add(1);
+                            }
+                            ColEvent::Chunk { .. } | ColEvent::ChunkEnd { .. } => {}
+                            ColEvent::NeedMore => {
+                                if offset >= all_rows.len() {
+                                    break;
+                                }
+                                let end = core::cmp::min(
+                                    offset.saturating_add(chunk_size),
+                                    all_rows.len(),
+                                );
+                                if let Some(chunk) = all_rows.get(offset..end) {
+                                    let _ = stream.feed(black_box(chunk));
+                                    offset = end;
+                                } else {
+                                    break;
+                                }
+                            }
+                            ColEvent::EndQuery { .. } => break,
+                            _ => break,
+                        }
+                    }
+                    rows
+                });
+                black_box(rows_seen);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 fn bench_multi_ping_amortised(c: &mut Criterion) {
     let mut group = c.benchmark_group("multi_ping_amortised");
     group.throughput(Throughput::Elements(100));
@@ -1854,6 +1969,7 @@ criterion_group!(
     bench_cancel_credentials_extract,
     // DEF-058 pre-measurement: ReadBuf compact cost + amortised streaming.
     bench_readbuf_compact_pressure,
+    bench_interleaved_streaming,
     bench_multi_ping_amortised,
 );
 criterion_main!(benches);
