@@ -82,21 +82,12 @@ impl Connection {
                 )));
             }
 
-            loop {
-                let event = connecting.advance_one_frame(&mut wb);
-                match event {
-                    FeedEvent::SendBytes(bytes) => {
+            {
+                let actions = connecting.feed_bytes(&[], &mut wb);
+                for action in actions.as_slice() {
+                    if let bsql_pg_proto::Action::SendBytes(bytes) = action {
                         stream.write_all(bytes).await?;
                     }
-                    FeedEvent::Deliver(_, _) => {}
-                    FeedEvent::Idle | FeedEvent::NeedMoreBytes => break,
-                    FeedEvent::Fail(_) => {
-                        return Err(DriverError::NotReady);
-                    }
-                    FeedEvent::Close => {
-                        return Err(DriverError::NotReady);
-                    }
-                    _ => {}
                 }
             }
 
@@ -123,16 +114,17 @@ impl Connection {
     pub async fn ping(&mut self) -> Result<(), DriverError> {
         let reply = self.proto.next_reply_id::<PingKind>();
         let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
-        guard
+        let actions = guard
             .push_command(
                 bsql_pg_proto::push_command::Ping { reply },
                 &mut self.wb,
             )
             .map_err(|pf| DriverError::Protocol(*pf.cause))?;
 
-        let wb_bytes = self.wb.as_bytes();
-        if !wb_bytes.is_empty() {
-            self.stream.write_all(wb_bytes).await?;
+        for action in actions.as_slice() {
+            if let bsql_pg_proto::Action::SendBytes(bytes) = action {
+                self.stream.write_all(bytes).await?;
+            }
         }
 
         self.drain_until_idle().await
