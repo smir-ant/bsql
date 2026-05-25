@@ -4,7 +4,7 @@
 //! `RowDescription` frame tells us column count, type OIDs, and
 //! per-column format codes; each `DataRow` frame carries the column
 //! values. This module parses `RowDescription` into [`RowDesc`]
-//! (shared between [`crate::Action::StreamRow`] and
+//! (shared between the row-streaming `ColEvent` API and
 //! [`crate::Reply::QueryComplete`]) and hosts the typed-decoder
 //! primitives that materialise column bytes into Rust types.
 //!
@@ -1536,7 +1536,7 @@ impl fmt::Display for DecodeError {
 /// # Lifetimes
 ///
 /// `'a` borrows the body bytes. Typically obtained from
-/// [`crate::Action::StreamRow::row_bytes`], in which case `'a` is
+/// the row-streaming `ColEvent` pull API, in which case `'a` is
 /// the `'r` lifetime of the owning [`crate::OutActions`]. The
 /// iterator yields column slices that share this borrow — no
 /// copying, no allocation.

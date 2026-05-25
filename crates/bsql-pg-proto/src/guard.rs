@@ -177,7 +177,7 @@ impl<'a> ReadyGuard<'a> {
         Self { proto }
     }
 
-    /// Send a generic [`crate::PgCommand`].
+    /// Send a generic a command from `push_command`.
     ///
     /// The guard's existence proves the precondition (`state == Idle`).
     ///

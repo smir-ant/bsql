@@ -523,7 +523,7 @@ mod range_newtype_tests {
 /// is **not** a reborrow of `self`.
 ///
 /// **`'r` (read-state)** binds the row-arena slices inside
-/// [`QueryCompletePayload::row_desc`] + sibling
+/// the schema accessor `PgProtocol::current_row_desc()` + sibling
 /// `Describe*Payload<'r>` fields back to `PgProtocol`'s internal
 /// `row_desc_slot` / `error_arena` — a shared `&'r PgProtocol`
 /// reborrow (NOT `&mut`; module-doc explains the read-only nature).
@@ -1753,7 +1753,7 @@ pub(crate) fn deliver<K: crate::reply_id::ReplyKind>(
 /// (parked by the dispatch Z arm before transitioning to `Idle`).
 /// The `'r` lifetime ties the public payload's `&'r RowDesc` to
 /// the `&'r mut PgProtocol` that produced the reply — same
-/// lifetime as `Action::StreamRow::row_bytes`, so both row bytes
+/// lifetime as the row-streaming `ColEvent` pull API, so both row bytes
 /// and row schema have identical validity windows. A naive
 /// owned-inline-`RowDesc` shape would bloat the payload to ~340 B
 /// per variant (RowDesc + ParamOids); the current `'r`-borrowed
@@ -1811,7 +1811,7 @@ pub enum Reply {
     /// A Query / BindExecute command completed. Delivered on the
     /// terminal `CommandComplete + ReadyForQuery` pair at the end
     /// of the result stream. Rows (if any) were emitted individually
-    /// via `Action::StreamRow`. See [`QueryCompletePayload`].
+    /// via the `ColEvent` row-streaming pull API. See [`QueryCompletePayload`].
     ///
     /// Ordered first — dominant variant in real workloads.
     QueryComplete(QueryCompletePayload),
@@ -2054,8 +2054,8 @@ impl From<CloseCompletePayload> for Reply {
 // way into the `Action::DeliverReply` construction site.
 // ═════════════════════════════════════════════════════════════════
 
-/// Rows-or-not result of a [`crate::PgCommand::DescribeStatement`]
-/// / [`crate::PgCommand::DescribePortal`] query.
+/// Rows-or-not result of a `push_command::DescribeStatement`
+/// / `push_command::DescribePortal` query.
 ///
 /// PG sends EITHER a `RowDescription` (the statement/portal produces
 /// a result-set) OR a `NoData` (`'n'`) response (no result columns —

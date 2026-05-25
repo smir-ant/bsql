@@ -2,7 +2,7 @@
 //!
 //! Two public methods drive the machine:
 //!
-//! - [`PgProtocol::push_command`] — user pushes a [`crate::PgCommand`];
+//! - [`PgProtocol::push_command`] — user pushes a a command from `push_command`;
 //!   protocol reacts (typically: emit a `SendBytes`, transition state).
 //! - [`PgProtocol::feed_bytes`] — host hands inbound wire bytes;
 //!   protocol parses zero or more frames, dispatches each, emits zero
@@ -4002,7 +4002,7 @@ impl PgProtocol<ActivePhase> {
     /// Caller-owned `write_buf` — see [`push_command`] for the
     /// staged-dispatch architecture.
     ///
-    /// `&'r mut self` — the row slices in `Action::StreamRow`
+    /// `&'r mut self` — the row slices in the row-streaming `ColEvent` pull API
     /// borrow from `self.inner.read_buf`. The `'r` lifetime propagates
     /// into `OutActions<'w>`; the borrow checker blocks
     /// subsequent `&mut self` calls (and thus the next `feed_bytes`)

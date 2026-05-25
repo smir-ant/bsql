@@ -2,7 +2,7 @@
 //!
 //! `bsql-pg-proto` is `no_std` and oblivious to async runtimes; it cannot
 //! own `tokio::sync::oneshot::Sender`s itself. Instead, each
-//! [`crate::PgCommand`] carries a [`ReplyId<K>`] that the upstream
+//! a command from `push_command` carries a [`ReplyId<K>`] that the upstream
 //! wrapper crate uses as the key in its pending-replies table.
 //!
 //! # Kind-parameterisation
@@ -161,7 +161,7 @@ pub trait ReplyKind: sealed::Sealed {
     const NAME: &'static str;
 }
 
-/// Kind marker for [`crate::PgCommand::Ping`] replies.
+/// Kind marker for `push_command::Ping` replies.
 ///
 /// Payload type: [`crate::action::PongPayload`]. A dispatcher that
 /// emits a non-`Pong` payload via a `ReplyId<PingKind>` fails to
@@ -174,7 +174,7 @@ impl ReplyKind for PingKind {
     const NAME: &'static str = "Ping";
 }
 
-/// Kind marker for [`crate::PgCommand::Startup`] replies.
+/// Kind marker for `push_command::Startup` replies.
 ///
 /// Payload type: [`crate::action::StartupCompletePayload`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,13 +191,13 @@ impl ReplyKind for StartupKind {
 // the final reply payload. Mirror the kind-marker pattern
 // established for PingKind / StartupKind.
 
-/// Kind marker for `PgCommand::SimpleQuery` and
-/// `PgCommand::BindExecute` replies. Payload type:
+/// Kind marker for `push_command::SimpleQuery` and
+/// `push_command::BindExecute` replies. Payload type:
 /// [`crate::action::QueryCompletePayload`].
 ///
 /// Delivered on the terminal `CommandComplete` + `ReadyForQuery`
 /// pair after the row stream (which is emitted separately via
-/// `Action::StreamRow`).
+/// the row-streaming `ColEvent` pull API).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryKind {}
 impl sealed::Sealed for QueryKind {}
@@ -206,7 +206,7 @@ impl ReplyKind for QueryKind {
     const NAME: &'static str = "Query";
 }
 
-/// Kind marker for `PgCommand::Parse` replies. Payload:
+/// Kind marker for `push_command::Parse` replies. Payload:
 /// [`crate::action::ParseCompletePayload`] (ZST).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseKind {}
@@ -216,7 +216,7 @@ impl ReplyKind for ParseKind {
     const NAME: &'static str = "Parse";
 }
 
-/// Kind marker for `PgCommand::CloseStatement` / `CloseP portal`
+/// Kind marker for `push_command::CloseStatement` / `CloseP portal`
 /// replies. Payload: [`crate::action::CloseCompletePayload`]
 /// (ZST).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,7 +227,7 @@ impl ReplyKind for CloseKind {
     const NAME: &'static str = "Close";
 }
 
-/// Kind marker for `PgCommand::DescribeStatement` replies.
+/// Kind marker for `push_command::DescribeStatement` replies.
 ///
 /// Payload type: [`crate::action::DescribeStatementCompletePayload`] —
 /// carries `param_oids` (PG's `ParameterDescription`), `rows`
@@ -248,7 +248,7 @@ impl ReplyKind for DescribeStatementKind {
     const NAME: &'static str = "DescribeStatement";
 }
 
-/// Kind marker for `PgCommand::DescribePortal` replies.
+/// Kind marker for `push_command::DescribePortal` replies.
 ///
 /// Payload type: [`crate::action::DescribePortalCompletePayload`] —
 /// no `param_oids` (portals are already bound; parameters are

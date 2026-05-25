@@ -1238,7 +1238,7 @@ pub enum ErrorKind {
     ServerError = 2,
     /// Authentication negotiation failed — unsupported method or
     /// SCRAM exchange error. [`ProtocolError::UnsupportedAuthMethod`] +
-    /// [`ProtocolError::ScramError`] +
+    /// [`ProtocolError::ScramHandshakeFailure`] +
     /// [`ProtocolError::UnsupportedProtocolOption`].
     ///
     /// `StartupAlreadyInProgress` and `CommandInProgress` are NOT

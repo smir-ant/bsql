@@ -197,7 +197,7 @@ impl<const N: usize> ReadBufN<N> {
     /// [`unread`]. Compaction happens lazily on the next `append`;
     /// by then no outstanding borrow can be alive (the borrow
     /// checker refuses the `&mut` call otherwise). Callers emit
-    /// [`crate::action::Action::StreamRow`] with slices carved out
+    /// the `ColEvent` row-streaming pull API with slices carved out
     /// of this region during [`crate::PgProtocol::feed_bytes`]; the
     /// `'r` lifetime on `OutActions<'w, 'r>` ties those slices back
     /// to the `&'r mut self` borrow on `PgProtocol`, which blocks

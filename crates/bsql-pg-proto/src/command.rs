@@ -1,6 +1,6 @@
 //! User-pushed commands.
 //!
-//! A [`PgCommand`] is the upstream wrapper's request to the protocol
+//! A `PgCommand` is the upstream wrapper's request to the protocol
 //! state machine. Each variant carries a [`crate::ReplyId`] — the
 //! correlator the wrapper later uses to route the reply back to the
 //! correct caller's `oneshot::Sender`.
@@ -127,7 +127,7 @@ pub(crate) enum PgCommand {
     /// # Response sequence
     ///
     /// - SELECT: `RowDescription` → 0..N `DataRow` (streamed via
-    ///   [`crate::Action::StreamRow`]) → `CommandComplete` →
+    ///   the row-streaming `ColEvent` pull API) → `CommandComplete` →
     ///   `ReadyForQuery` → [`crate::Reply::QueryComplete`] delivered.
     /// - DML (INSERT/UPDATE/DELETE): `CommandComplete` →
     ///   `ReadyForQuery` → `QueryComplete` (no rows).
