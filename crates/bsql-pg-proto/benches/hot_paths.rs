@@ -1732,6 +1732,93 @@ fn bench_cancel_credentials_extract(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------
+// Bench: ReadBuf compact pressure (DEF-058 pre-measurement).
+//
+// Measures the amortised cost of the append→advance→compact cycle
+// that ReadBuf performs when the consumed prefix is reclaimed during
+// a subsequent append. This is the exact cost DEF-058 (ring-buffer)
+// would eliminate.
+//
+// Two sub-benches:
+// - `small_67B` — typical DataRow frame size (67 B); stays inline
+//   for the first ~3 appends then triggers compact on each subsequent.
+// - `large_500B` — escapes to heap tier; compact_heap runs on every
+//   append past the first fill (500 B × 8 = 4000 B fills heap 4096).
+//
+// Per-element throughput = 1 append+advance cycle.
+// ---------------------------------------------------------------
+
+fn bench_readbuf_compact_pressure(c: &mut Criterion) {
+    let mut group = c.benchmark_group("readbuf_compact");
+    group.throughput(Throughput::Elements(1000));
+
+    group.bench_function("1000x_small_67B_append_advance", |b| {
+        b.iter_batched_ref(
+            bsql_pg_proto::ReadBuf::new,
+            |buf| {
+                let chunk = [0u8; 67];
+                for _ in 0..1000_u32 {
+                    let _ = buf.append(black_box(&chunk));
+                    let _ = buf.advance(67);
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("1000x_large_500B_append_advance", |b| {
+        b.iter_batched_ref(
+            bsql_pg_proto::ReadBuf::new,
+            |buf| {
+                let chunk = [0u8; 500];
+                for _ in 0..1000_u32 {
+                    let _ = buf.append(black_box(&chunk));
+                    let _ = buf.advance(500);
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------
+// Bench: multi-query amortised round-trip (DEF-058 pre-measurement).
+//
+// Simulates 100 consecutive Ping round-trips on the SAME proto
+// (cache-warm, amortised). Exercises the continuous ReadBuf
+// append→parse→advance→compact cycle that production servers see.
+// ---------------------------------------------------------------
+
+fn bench_multi_ping_amortised(c: &mut Criterion) {
+    let mut group = c.benchmark_group("multi_ping_amortised");
+    group.throughput(Throughput::Elements(100));
+
+    let rfq = rfq_frame();
+
+    group.bench_function("100_pings_same_proto", |b| {
+        b.iter_batched_ref(
+            || (fresh_active_via_trust_handshake(), WriteBuf::new()),
+            |(proto, wb)| {
+                for _ in 0..100_u32 {
+                    let reply = proto.next_reply_id::<PingKind>();
+                    let _ = proto.bench_push_or_panic(
+                        bsql_pg_proto::push_command::Ping { reply },
+                        wb,
+                    );
+                    let out = proto.feed_bytes(black_box(&rfq), wb);
+                    let _ = black_box(out);
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_parse_header,
@@ -1765,6 +1852,9 @@ criterion_group!(
     //
     // `with_cancel_request` closure-scoped path.
     bench_cancel_credentials_extract,
+    // DEF-058 pre-measurement: ReadBuf compact cost + amortised streaming.
+    bench_readbuf_compact_pressure,
+    bench_multi_ping_amortised,
 );
 criterion_main!(benches);
 
