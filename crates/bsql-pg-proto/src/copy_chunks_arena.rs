@@ -47,7 +47,7 @@ pub struct CopyChunkPayload {
     pub bytes: alloc::vec::Vec<u8>,
 }
 
-/// Gen-tagged handle into [`CopyChunksArena`].
+/// Gen-tagged handle into `CopyChunksArena`.
 ///
 /// `Copy` (4 B inline: slot 1 B + gen 2 B + 1 B padding). Carried
 /// by [`crate::Action::CopyDataChunk`] so Action stays `Copy`.

@@ -65,7 +65,7 @@
 //!
 //! # `BackendKey` cell payload
 //!
-//! [`BackendKey`] is the `pub(crate)` cell payload — the storage
+//! `BackendKey` is the `pub(crate)` cell payload — the storage
 //! shape that lives on `ActiveInner`. Carries `Sensitive<i32>`
 //! for the secret_key so the cell's drop chain scrubs the secret
 //! when the connection terminates. The wire-frame materialisation
@@ -79,7 +79,7 @@
 //! [length BE u32 = 16] [magic BE u32 = 80877102] [pid BE i32] [secret BE i32]
 //! ```
 //!
-//! The const [`CANCEL_REQUEST_LEN`] pins the length-field value;
+//! The const `CANCEL_REQUEST_LEN` pins the length-field value;
 //! [`crate::wire::CANCEL_REQUEST_VERSION`] pins the magic. The
 //! existing crate-level [`crate::cancel_request_bytes`] free function
 //! is the single source of truth for the byte composition;
@@ -188,7 +188,7 @@ const _CANCEL_LEN_CROSS_MODULE_PIN: () = {
 
 #[cfg(test)]
 mod cell_tests {
-    //! Crate-internal smoke tests for [`BackendKey`]'s Debug
+    //! Crate-internal smoke tests for `BackendKey`'s Debug
     //! redaction. Cell write/read provenance is exercised end-to-end
     //! via `tests/cancel_request_spec.rs` through the public
     //! [`crate::PgProtocol::<crate::ActivePhase>::with_cancel_request`]

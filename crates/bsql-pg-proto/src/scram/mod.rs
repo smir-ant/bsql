@@ -3,8 +3,8 @@
 //! - [`crypto`] — cryptographic operations composed over RustCrypto
 //!   crates. Never hand-rolled (expert-domain policy).
 //! - [`wire`] — SCRAM text-protocol message construction and parsing.
-//! - [`types`] — [`SecretDigest`] (no `PartialEq`; constant-time compare
-//!   only) and [`CappedServerNonce`].
+//! - [`types`] — `SecretDigest` (no `PartialEq`; constant-time compare
+//!   only) and `CappedServerNonce`.
 //! - [`session`] — [`ScramSession`] typestate eliminating the
 //!   `Trust`-vs-`ScramPassword` double-match seam.
 //!

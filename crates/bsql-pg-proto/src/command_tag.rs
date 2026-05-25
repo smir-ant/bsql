@@ -23,8 +23,8 @@
 //!
 //! Dominator is `Other(BoundedStr<32>)` at 36 B + disc + pad ≈ 40 B
 //! with default repr aligned to 8 (from `u64 rows`). Used inside a
-//! slot ([`crate::command_tag_slot::CommandTagSlotCell`]) mirror of
-//! [`crate::param_oids_slot::ParamOidsSlotCell`] (DEF-286 Φ1) — the
+//! slot (`crate::command_tag_slot::CommandTagSlotCell`) mirror of
+//! `crate::param_oids_slot::ParamOidsSlotCell` (DEF-286 Φ1) — the
 //! slot stores `Option<Box<CommandTag>>` so state variants carry
 //! only the `ReplyId<K>` correlator.
 //!
@@ -43,7 +43,7 @@ use crate::ident::BoundedStr;
 ///
 /// `Copy + Clone + Eq + Debug` — no Drop impact on hot path. Public
 /// API surfaces `Reply::QueryComplete.command_tag: &'r CommandTag`
-/// (borrow into [`crate::command_tag_slot::CommandTagSlotCell`]).
+/// (borrow into `crate::command_tag_slot::CommandTagSlotCell`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CommandTag {

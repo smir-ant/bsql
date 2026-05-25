@@ -103,7 +103,7 @@ pub enum ProtoState {
     ///   compile time.
     ///
     /// The Trust/Scram split moves discrimination to
-    /// [`crate::PgProtocol::push_command`]. Each variant only carries
+    /// `crate::PgProtocol::push_command`. Each variant only carries
     /// what its authentication path needs. A server frame of the
     /// wrong shape for the connection's credential type becomes a
     /// per-variant dispatcher arm — a missed arm is a build failure.
@@ -177,7 +177,7 @@ pub enum ProtoState {
     /// the `StartupMessage` and is otherwise not retained by the
     /// state machine; it stays bundled with the password until the
     /// handshake completes. Both live inside one
-    /// [`Md5HandshakeState`] struct, heap-boxed once, mirroring the
+    /// `Md5HandshakeState` struct, heap-boxed once, mirroring the
     /// SCRAM single-Box pattern. Per-handshake total: 1 alloc
     /// (StartupMd5 construction) + 1 free (PasswordMessage dispatch
     /// transition).
@@ -201,7 +201,7 @@ pub enum ProtoState {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
         /// Bundled handshake state — username + password. See
-        /// [`Md5HandshakeState`] for fields. The Box is dropped on
+        /// `Md5HandshakeState` for fields. The Box is dropped on
         /// every transition path, firing the ZeroizeOnDrop chain.
         handshake: alloc::boxed::Box<crate::md5::Md5HandshakeState>,
     },
@@ -459,8 +459,7 @@ pub enum ProtoState {
  /// COPY OUT streaming. Server sent `CopyOutResponse`
     /// (`'H'`); now receiving zero or more `CopyData` (`'d'`) frames
     /// from server. Transitions:
- /// - `CopyData` → stay here (will emit
- /// `Action::CopyDataChunk`; stays silent).
+    /// - `CopyData` → stay here (emits `Action::CopyDataChunk`).
     /// - `CopyDone` → [`Self::SimpleQueryCopyOutAwaitingCC`].
     /// - `ErrorResponse` → [`Self::DrainRfqAfterError`].
     SimpleQueryCopyOutStreaming(ReplyId<QueryKind>),
@@ -512,7 +511,7 @@ pub enum ProtoState {
         /// Correlator for the in-flight query.
         ///
  /// Φ3: `command_tag` field removed — slot pattern
-        /// via [`crate::command_tag_slot::CommandTagSlotCell`] on
+        /// via `crate::command_tag_slot::CommandTagSlotCell` on
         /// `<ActivePhase>::Extras.command_tag`. The `'C'` dispatch
         /// arm parses the tag and parks the boxed
         /// [`crate::command_tag::CommandTag`] into the slot;
@@ -603,7 +602,7 @@ pub enum ProtoState {
         /// Correlator for the in-flight command.
         ///
  /// Φ3: `command_tag` field removed — slot pattern
-        /// via [`crate::command_tag_slot::CommandTagSlotCell`].
+        /// via `crate::command_tag_slot::CommandTagSlotCell`.
         reply: ReplyId<QueryKind>,
     },
 
@@ -644,7 +643,7 @@ pub enum ProtoState {
         /// Correlator for the in-flight command.
         ///
  /// Φ3: `command_tag` field removed — slot pattern
-        /// via [`crate::command_tag_slot::CommandTagSlotCell`].
+        /// via `crate::command_tag_slot::CommandTagSlotCell`.
         reply: ReplyId<QueryKind>,
     },
 
@@ -715,9 +714,9 @@ pub enum ProtoState {
     /// `ParameterDescription` parsed; awaiting either
     /// `RowDescription` (`'T'`) or `NoData` (`'n'`).
     ///
-    /// Schema branch: `'T'` → [`DescribedRows::Rows(desc)`]; continue
+    /// Schema branch: `'T'` → `DescribedRows::Rows(desc)`; continue
     /// to [`Self::DescribeStatementAwaitingRfq`].
-    /// No-data branch: `'n'` → [`DescribedRows::NoData`]; continue
+    /// No-data branch: `'n'` → `DescribedRows::NoData`; continue
     /// to [`Self::DescribeStatementAwaitingRfq`].
     ///
  /// # `param_oids` lives in the slot (Φ1)
@@ -730,7 +729,7 @@ pub enum ProtoState {
     /// ParamOids` at the trailing `'Z'`.
     ///
  /// Φ1 lifted the box to
-    /// [`crate::param_oids_slot::ParamOidsSlotCell`] on
+    /// `crate::param_oids_slot::ParamOidsSlotCell` on
     /// `<ActivePhase>::Extras` — mirror of the `row_desc_slot`
     /// pattern. Net effect:
     ///
@@ -752,7 +751,7 @@ pub enum ProtoState {
     DescribeStatementAwaitingRowDescOrNoData {
         /// Correlator for the Describe command. The associated
         /// `ParamOids` lives in
-        /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the
+        /// `crate::param_oids_slot::ParamOidsSlotCell` on the
         /// outer Extras (parked at the `'t'` dispatch arm).
         reply: ReplyId<DescribeStatementKind>,
     },
@@ -784,7 +783,7 @@ pub enum ProtoState {
     ///
     /// See [`Self::DescribeStatementAwaitingRowDescOrNoData`] for
     /// the full slot-pattern rationale — `param_oids` now lives in
-    /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the outer
+    /// `crate::param_oids_slot::ParamOidsSlotCell` on the outer
     /// Extras, not inline on this variant. The transition
     /// `AwaitingRowDescOrNoData → AwaitingRfq` is now a pure
     /// state-discriminant flip (no Box move, since the slot already
@@ -792,7 +791,7 @@ pub enum ProtoState {
     DescribeStatementAwaitingRfq {
         /// Correlator for the Describe command. The associated
         /// `ParamOids` lives in
-        /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the
+        /// `crate::param_oids_slot::ParamOidsSlotCell` on the
         /// outer Extras (parked at the `'t'` dispatch arm of the
         /// prior `DescribeStatementAwaitingParamDesc` state).
         reply: ReplyId<DescribeStatementKind>,
@@ -1116,7 +1115,7 @@ impl ProtoState {
 /// state-as-data invariant exists to prevent (reforge.md §7.2).
 /// Returning the original via `recovered` lets the caller either
 /// feed it back to the state slot or hand it to
-/// [`ProtoState::take_inflight_reply_raw_id`] to drain correlators
+/// `ProtoState::take_inflight_reply_raw_id` to drain correlators
 /// safely.
 #[non_exhaustive]
 pub struct WrongPhase {
@@ -1427,7 +1426,7 @@ pub enum ActiveState {
     DescribeStatementAwaitingParamDesc(ReplyId<DescribeStatementKind>),
     /// Mirror of [`ProtoState::DescribeStatementAwaitingRowDescOrNoData`].
  /// Φ1: `param_oids` lives in
-    /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the outer
+    /// `crate::param_oids_slot::ParamOidsSlotCell` on the outer
     /// `<ActivePhase>::Extras` — variant carries only the bare
     /// `ReplyId<K>`.
     DescribeStatementAwaitingRowDescOrNoData {
@@ -1435,7 +1434,7 @@ pub enum ActiveState {
     },
     /// Mirror of [`ProtoState::DescribeStatementAwaitingRfq`].
  /// Φ1: `param_oids` lives in the
-    /// [`crate::param_oids_slot::ParamOidsSlotCell`] (parked at the
+    /// `crate::param_oids_slot::ParamOidsSlotCell` (parked at the
     /// earlier `'t'` dispatch arm); variant carries only the bare
     /// `ReplyId<K>`.
     DescribeStatementAwaitingRfq {
@@ -1621,7 +1620,7 @@ impl From<ActiveState> for ProtoState {
 // ─── Per-phase classifier methods ───
 
 impl ConnectingState {
-    /// Mirror of [`ProtoState::take_inflight_reply_raw_id`] for the
+    /// Mirror of `ProtoState::take_inflight_reply_raw_id` for the
     /// per-phase enum. Consumes the variant's `ReplyId<K>` (if any)
     /// and returns its raw [`core::num::NonZeroU64`].
     ///
@@ -1685,7 +1684,7 @@ impl ConnectingState {
 
 /// Per-phase classifier surface for [`ActiveState`].
 impl ActiveState {
-    /// Per-phase mirror of [`ProtoState::take_inflight_reply_raw_id`].
+    /// Per-phase mirror of `ProtoState::take_inflight_reply_raw_id`.
     /// Exhaustive over every variant — adding a `ReplyId<K>`-carrying
     /// variant without routing it here fails the build.
     ///

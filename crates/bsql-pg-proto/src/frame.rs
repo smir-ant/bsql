@@ -62,7 +62,7 @@ pub const MAX_FRAME_LEN_FIELD: u32 = 4095;
 /// find and update. The parser's `total_len = declared + 1` formula
 /// still uses the literal `1` (that is the tag-byte component of the
 /// header, not the whole header), which is a separate spec commitment
-/// pinned by [`total_len_equals_one_plus_declared_len`] in
+/// pinned by `total_len_equals_one_plus_declared_len` in
 /// `tests/frame_parse.rs`.
 pub const HEADER_LEN: usize = 5;
 

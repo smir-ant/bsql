@@ -290,7 +290,7 @@ pub enum ScramError {
 /// embedding. Carries every variant's identity + small payloads
 /// (iteration counts) inline, but **never** the `ServerScramError`
 /// text — that text is externalised into
-/// [`crate::error_arena::ErrorArena`] via an [`crate::error_arena::ErrorRef`]
+/// `crate::error_arena::ErrorArena` via an [`crate::error_arena::ErrorRef`]
 /// alongside the class.
 ///
 /// # Why a parallel enum rather than mutating `ScramError`
@@ -369,7 +369,7 @@ impl ScramError {
     /// Callers in `dispatch.rs` use this to convert wire-layer SCRAM
     /// errors into the slim [`crate::error::ProtocolError::ScramHandshakeFailure`]
     /// form: the text (when present) is alloc'd into
-    /// [`crate::error_arena::ErrorArena`] via
+    /// `crate::error_arena::ErrorArena` via
     /// [`crate::error_arena::ErrorPayload::Scram`], and the resulting
     /// [`crate::error_arena::ErrorRef`] threads into the
     /// `ProtocolError::ScramHandshakeFailure.detail` field.

@@ -43,7 +43,7 @@
 //!
 //! # Staleness classification
 //!
-//! [`ErrorArena::get`] returns `Result<&ErrorPayload, ArenaError>`
+//! `ErrorArena::get` returns `Result<&ErrorPayload, ArenaError>`
 //! with two classified error variants:
 //!
 //! - [`ArenaError::Empty`] — arena was never populated for this
@@ -65,7 +65,7 @@
 use crate::ident::SecretBoundedStr;
 
 /// Full per-server-error payload — the three bounded strings stored
-/// in the externalised [`ErrorArena`].
+/// in the externalised `ErrorArena`.
 ///
 /// # Tier-1 staleness closure
 ///
@@ -143,14 +143,14 @@ pub enum ErrorPayload {
     },
 }
 
-/// Opaque handle into [`ErrorArena`]. 8 bytes (u8 slot-marker +
+/// Opaque handle into `ErrorArena`. 8 bytes (u8 slot-marker +
 /// u32 generation + padding), niche-packed for `Option<ErrorRef>`
 /// at the same size.
 ///
 /// # Invariants
 ///
-/// An `ErrorRef` is **only** constructed via [`ErrorArena::alloc`];
-/// its `slot` is the constant [`SLOT_OCCUPIED_MARKER`] and its
+/// An `ErrorRef` is **only** constructed via `ErrorArena::alloc`;
+/// its `slot` is the constant `SLOT_OCCUPIED_MARKER` and its
 /// `generation` matches the arena's counter at the moment of
 /// allocation.
 ///
@@ -196,7 +196,7 @@ pub struct ErrorRef {
     generation: u32,
 }
 
-/// Classified failure from [`ErrorArena::get`] / [`crate::PgProtocol::get_server_error`].
+/// Classified failure from `ErrorArena::get` / [`crate::PgProtocol::get_server_error`].
 ///
 /// Distinguishes two failure modes: empty slot vs stale generation.
 /// Collapsing both into `None` would leave callers without a signal
@@ -259,7 +259,7 @@ impl ErrorRef {
     ///
     /// Constructs an `ErrorRef` with an arbitrary generation and the
     /// SLOT_OCCUPIED_MARKER slot — exclusively for exercising the
-    /// [`ArenaError::Empty`] arm in [`ErrorArena::get`], which is
+    /// [`ArenaError::Empty`] arm in `ErrorArena::get`, which is
     /// architecturally unreachable via public API (`alloc()` is the
     /// only constructor and always populates `slot`).
     ///
@@ -481,7 +481,7 @@ impl Default for ErrorArena {
 
 // ─── Display-with-arena adapter ───────────────────────────────────
 
-/// Display wrapper that resolves a [`ProtocolError::ServerErrorResponse`]'s
+/// Display wrapper that resolves a `ProtocolError::ServerErrorResponse`'s
 /// arena-backed strings inline.
 ///
 /// Constructed via [`crate::PgProtocol::display_error`]. The adapter
@@ -496,7 +496,7 @@ impl Default for ErrorArena {
 /// - `ServerErrorResponse` with unresolvable ref:
 ///   `"server error: SEVERITY (SQLSTATE) [arena ref unresolved:
 ///   <ArenaError>]"` — honest diagnostic over silent empty-string.
-/// - Other variants: delegates to [`ProtocolError`]'s built-in
+/// - Other variants: delegates to `ProtocolError`'s built-in
 ///   `Display` impl verbatim (no UX change).
 ///
 /// # Lifetime budget

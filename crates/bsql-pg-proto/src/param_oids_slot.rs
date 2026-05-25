@@ -1,7 +1,7 @@
 //! Tier-1 within-crate `param_oids_slot` write provenance via
 //! concrete-token + Cell newtype.
 //!
-//! # Architecture (mirror of [`crate::schema_slot::RowDescSlotCell`])
+//! # Architecture (mirror of `crate::schema_slot::RowDescSlotCell`)
 //!
 //! [`ParamOids`] is parsed once on the inbound `'t'`
 //! (`ParameterDescription`) frame after a `DescribeStatement` push, then

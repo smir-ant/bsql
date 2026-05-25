@@ -11,7 +11,7 @@
 //! [`NotificationRef`] (4 B, `Copy`) that [`crate::Action::Notify`]
 //! carries — Action stays `Copy`, arena holds the bytes.
 //!
-//! Mirror of [`crate::error_arena::ErrorArena`] (single-slot
+//! Mirror of `crate::error_arena::ErrorArena` (single-slot
 //! server-error storage) but multi-slot — multiple `NotificationResponse`
 //! frames may arrive in one `feed_bytes` call (server batches
 //! NOTIFYs across a single network read), each needing a stable
@@ -71,7 +71,7 @@ pub struct NotificationPayload {
     pub payload: alloc::vec::Vec<u8>,
 }
 
-/// Gen-tagged handle into [`NotificationsArena`].
+/// Gen-tagged handle into `NotificationsArena`.
 ///
 /// `Copy` (4 B inline: slot 1 B + gen 2 B + 1 B padding). Carried
 /// by [`crate::Action::Notify`] so Action stays `Copy`. Resolution

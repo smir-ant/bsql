@@ -1,9 +1,9 @@
 //! Tier-1 within-crate `fail_cause_slot` write provenance via
 //! concrete-token + Cell newtype. DEF-286 Φ-I.b.
 //!
-//! Mirror of [`crate::command_tag_slot::CommandTagSlotCell`] /
-//! [`crate::param_oids_slot::ParamOidsSlotCell`] /
-//! [`crate::schema_slot::RowDescSlotCell`] /
+//! Mirror of `crate::command_tag_slot::CommandTagSlotCell` /
+//! `crate::param_oids_slot::ParamOidsSlotCell` /
+//! `crate::schema_slot::RowDescSlotCell` /
 //! [`crate::tx_status_slot::TxStatusSlotCell`]. The cell holds the
 //! parsed [`crate::error::ProtocolError`] across the FailReply
 //! emission window — staged when the dispatch path calls
@@ -48,7 +48,7 @@
 //!    [`crate::PgProtocol::fail_cause`].
 //! 3. Cleanup: the slot is NEVER cleared by a transition handler.
 //!    State Errored is terminal in `<ActivePhase>` (no Errored→Idle
-//!    path exists); the slot's Drop chain (Option<Box<ProtocolError>>'s
+//!    path exists); the slot's Drop chain (`Option<Box<ProtocolError>>`'s
 //!    niche-packed pointer → Box::drop on Some) runs at wrapper Drop
 //!    or at `into_closed_if_errored` when ActiveExtras drops.
 //!
@@ -71,7 +71,7 @@
 //!
 //! Niche-packed: `Box<T>`'s non-null pointer absorbs `Option`'s disc.
 //! Total footprint = 8 B (one pointer-width) regardless of
-//! `ProtocolError`'s size. Compare to inline `Option<ProtocolError>`
+//! `ProtocolError`'s size. Compare to inline ``Option<ProtocolError>``
 //! = 32 B (ProtocolError 24 + disc + padding). The slot's pointer
 //! indirection costs ~1 ns per fail-path lookup vs zero on the
 //! happy path. Lookup is cold; happy path is hot. Asymmetric cost

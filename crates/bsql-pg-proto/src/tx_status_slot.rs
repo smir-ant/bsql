@@ -1,9 +1,9 @@
 //! Tier-1 within-crate `tx_status_slot` write provenance via
 //! concrete-token + Cell newtype. DEF-286 Φ-E.
 //!
-//! Mirror of [`crate::command_tag_slot::CommandTagSlotCell`] /
-//! [`crate::param_oids_slot::ParamOidsSlotCell`] /
-//! [`crate::schema_slot::RowDescSlotCell`]. The cell holds the
+//! Mirror of `crate::command_tag_slot::CommandTagSlotCell` /
+//! `crate::param_oids_slot::ParamOidsSlotCell` /
+//! `crate::schema_slot::RowDescSlotCell`. The cell holds the
 //! parsed [`TxStatus`] across the `'Z'` (ReadyForQuery) arrival.
 //! Externalising tx_status removes it from every `Reply<'r>` variant
 //! payload — `Reply::QueryComplete`/`Suspended`/`ParseComplete`/

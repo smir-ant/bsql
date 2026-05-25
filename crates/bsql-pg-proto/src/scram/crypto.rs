@@ -169,7 +169,7 @@ fn hmac_auth_message(
 ///
 /// Returns `(client_proof, server_signature)`. Both are 32-byte values.
 /// `client_proof` is the XOR of ClientKey and ClientSignature.
-/// `server_signature` is returned as [`SecretDigest`] for constant-time
+/// `server_signature` is returned as `SecretDigest` for constant-time
 /// comparison later.
 ///
 /// # AuthMessage — tier-1 no-truncation
@@ -177,7 +177,7 @@ fn hmac_auth_message(
 /// The three AuthMessage components are passed separately and fed
 /// incrementally into HMAC. No intermediate buffer is assembled,
 /// so the silent-truncation class does not exist. See
-/// [`hmac_auth_message`].
+/// `hmac_auth_message`.
 ///
 /// # Arguments
 ///

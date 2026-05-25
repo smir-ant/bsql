@@ -338,7 +338,7 @@ fn write_hex_lowercase(input: &[u8; 16], out: &mut [u8; 32]) {
 #[cfg(test)]
 mod drop_witness_tests {
     //! Tier-1-by-construction Drop-fire witness for
-    //! [`Md5HandshakeState`] via [`crate::drop_witness::DropCounter`].
+    //! `Md5HandshakeState` via [`crate::drop_witness::DropCounter`].
     //! Every `cargo test` run increments the counter when
     //! `Md5HandshakeState::drop` (derive-generated `ZeroizeOnDrop`
     //! body) fires, transitively scrubbing `Sensitive<Password>`

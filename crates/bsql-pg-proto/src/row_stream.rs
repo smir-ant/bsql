@@ -17,7 +17,7 @@
 //! RowDescription, `E` ErrorResponse, …) use the existing
 //! `feed_bytes` dispatch path; oversized bodies for those tags are
 //! handled by the separate streaming-sink path in
-//! [`crate::partial_assembly`]. (All current PG drivers cap them
+//! `crate::partial_assembly`. (All current PG drivers cap them
 //! well below 4 KB in practice; the streaming sink handles the rare
 //! over-cap cases.)
 //!
@@ -34,7 +34,7 @@
 //! workspace default). When the stream's `drained` flag is `false`
 //! at drop time, the Drop impl installs
 //! `Errored(InternalCrateBug { locus: StreamDroppedMidStream })` via
-//! [`crate::PgProtocol::install_errored_stream_dropped_mid_stream`].
+//! `crate::PgProtocol::install_errored_stream_dropped_mid_stream`.
 //! The next operation on the connection observes Errored and the
 //! wrapper surfaces `ConnectionAlreadyClosed { prior_kind }` to the
 //! caller's pending oneshots.
@@ -367,7 +367,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
     /// resolves via the returned `Err`.
     ///
     /// Returns the compact [`ReadBufFull`] struct (a few bytes)
-    /// rather than [`ProtocolError`] (~72 B) so the happy-path
+    /// rather than `ProtocolError` (~72 B) so the happy-path
     /// return doesn't pay a ProtocolError-sized stack slot for a
     /// cold failure mode. Callers who want a `ProtocolError` can
     /// `.map_err(ProtocolError::from)` at the boundary.
@@ -630,7 +630,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
     /// 4. Otherwise drive the per-column / per-row / per-frame
     ///    state machine: parse header, handle DataRow column-by-column
     ///    (whole-row fast path or partial-frame chunked path), or
-    ///    delegate non-D frames to [`feed_bytes_bounded`] and
+    ///    delegate non-D frames to `feed_bytes_bounded` and
     ///    surface a terminal `EndQuery` on `CommandComplete` /
     ///    `ErrorResponse`.
     ///
@@ -1580,8 +1580,8 @@ const _: () = assert!(MAX_FRAME_LEN_FIELD >= 4);
 /// Leaf submodule for partial-frame mode entry.
 ///
 /// Hosts the per-call-site concrete-type token gating
-/// [`crate::buf::ReadBuf::enter_partial_mode`] /
-/// [`crate::buf::ReadBuf::exit_partial_mode`] /
+/// `crate::buf::ReadBuf::enter_partial_mode` /
+/// `crate::buf::ReadBuf::exit_partial_mode` /
 /// [`crate::buf::ReadBuf::subtract_partial_remaining`]. The token's
 /// tuple-struct field is private to this submodule — `Self(())` mints
 /// are callable ONLY inside the leaf. The leaf lives in `mod row_stream`

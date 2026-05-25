@@ -33,7 +33,7 @@
 //! investigation (Tier-3 #25, 2026-05-19) that confirmed the
 //! 2-lifetime form is structurally load-bearing.
 //!
-//! Internally, dispatchers emit [`StagedAction`] values (range-based,
+//! Internally, dispatchers emit `StagedAction` values (range-based,
 //! no refs) during the write phase; the entry-point materialises them
 //! into ref-bound [`Action<'buf>`]s once the mutable write phase
 //! completes. A naive shape that emitted ref-bound `Action<'buf>`
@@ -538,7 +538,7 @@ mod range_newtype_tests {
 ///   collapsing them into one opaque lifetime that requires reading
 ///   doc-prose to disambiguate.
 /// - **Push-path expressivity**: `OutActions<'w>` returned
-///   from [`crate::PgProtocol::push_command_internal`] (16 sites)
+///   from `crate::PgProtocol::push_command_internal` (16 sites)
 ///   states *at the type level* that the outbound batch carries no
 ///   arena-borrowed Reply variants — only the WriteBuf borrow
 ///   constrains the caller's hold-time. Unification erases this
@@ -805,7 +805,7 @@ pub enum Action<'w> {
     /// [`crate::PgProtocol::fail_cause`] AFTER consuming this action.
     ///
  /// .b: cause externalised into
-    /// [`crate::fail_cause_slot::FailCauseSlotCell`] living on
+    /// `crate::fail_cause_slot::FailCauseSlotCell` living on
     /// `<ActivePhase>::Extras` (and `<ConnectingPhase>::Inner` for
     /// handshake-phase fails). The inline `cause: ProtocolError`
     /// (24 B) was the dominator on `FailReply`'s 32-B variant body;
@@ -875,7 +875,7 @@ pub enum Action<'w> {
     /// statement's tag + transaction status.
     IntermediateCommandComplete {
         /// Gen-tagged handle into
-        /// [`crate::command_tags_arena::CommandTagsArena`]. Resolve
+        /// `crate::command_tags_arena::CommandTagsArena`. Resolve
         /// via [`crate::PgProtocol::get_command_tag`] to obtain
  /// `&CommandTag`. externalisation drops the
         /// inline 40-B tag payload to a 4-B arena handle; Action
@@ -1425,7 +1425,7 @@ pub enum StagedQueryCompletePayload {
     /// Portal exhausted — terminal `CommandComplete + RFQ` observed.
     ///
  /// Φ3: `command_tag` field removed — slot pattern via
- /// [`crate::command_tag_slot::CommandTagSlotCell`].     /// `tx_status` field removed — slot pattern via
+ /// `crate::command_tag_slot::CommandTagSlotCell`.     /// `tx_status` field removed — slot pattern via
     /// [`crate::tx_status_slot::TxStatusSlotCell`]. Both reads happen
     /// at materialise (slot `'r` borrow) and at
     /// [`crate::PgProtocol::terminal_tx_status`] respectively. The
@@ -1962,8 +1962,8 @@ impl From<StartupCompletePayload> for Reply {
 /// `<ActivePhase>::Extras.row_desc` slots, queried via
 /// [`crate::PgProtocol::current_command_tag`] /
 /// [`crate::PgProtocol::current_row_desc`] (or
-/// [`crate::action::OutActions::current_command_tag`] /
-/// [`OutActions::current_row_desc`] within the actions iteration
+/// `crate::action::OutActions::current_command_tag` /
+/// `OutActions::current_row_desc` within the actions iteration
 /// borrow window).
 ///
 /// The `'r` lifetime parameter has been DROPPED — the payload
@@ -1992,7 +1992,7 @@ impl From<QueryCompletePayload> for Reply {
 ///
 /// `row_desc` field externalised. Query via
 /// [`crate::PgProtocol::current_row_desc`] /
-/// [`crate::action::OutActions::current_row_desc`]. The `'r`
+/// `crate::action::OutActions::current_row_desc`. The `'r`
 /// lifetime parameter has been DROPPED — payload is a unit ZST.
 /// See [`QueryCompletePayload`] for the externalisation rationale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2360,7 +2360,7 @@ impl From<DescribeStatementCompletePayload> for Reply {
 ///
 /// `rows` field externalised. Query via
 /// [`crate::PgProtocol::current_described_rows`] /
-/// [`crate::action::OutActions::current_described_rows`]. The
+/// `crate::action::OutActions::current_described_rows`. The
 /// `'r` lifetime parameter has been DROPPED — payload is a unit ZST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DescribePortalCompletePayload;

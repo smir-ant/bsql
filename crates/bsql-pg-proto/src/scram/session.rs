@@ -5,7 +5,7 @@
 //! `Trust`-vs-`ScramPassword` seam.
 //!
 //! The `Trust`/`ScramPassword` discrimination happens inside
-//! [`crate::PgProtocol::push_command`] — specifically the
+//! `crate::PgProtocol::push_command` — specifically the
 //! `compute_push_startup` branch that routes a Trust command into
 //! [`crate::state::ProtoState::ConnectingStartupTrust`] and a Scram
 //! command into [`crate::state::ProtoState::ConnectingStartupScram`].
@@ -18,7 +18,7 @@
 //! classification.
 //!
 //! `ScramSession` has a single constructor
-//! [`ScramSession::from_password`] — `Credentials::Trust` never
+//! `ScramSession::from_password` — `Credentials::Trust` never
 //! reaches this module.
 
 use crate::password::Password;

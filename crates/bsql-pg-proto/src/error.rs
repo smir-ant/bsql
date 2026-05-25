@@ -508,7 +508,7 @@ pub enum ProtocolError {
     /// server-supplied error text (`e=<text>` from RFC 5802 §5.1
     /// server-final-message). The text — only populated for the
     /// `ScramFailureClass::ServerScramError` class — lives in
-    /// [`crate::error_arena::ErrorArena`] alongside the
+    /// `crate::error_arena::ErrorArena` alongside the
     /// `ServerError` payload (mutually exclusive single-slot use:
     /// SCRAM never coexists with `ErrorResponse` on the wire).
     ///
@@ -650,7 +650,7 @@ pub enum ProtocolError {
     /// count disagrees with the remaining byte length, or negative
     /// count. Wire violation; the connection is torn down.
     ///
-    /// Emitted by [`crate::decode::parse_parameter_description`].
+    /// Emitted by `crate::decode::parse_parameter_description`.
     MalformedParameterDescription {
         /// Actual payload byte count.
         payload_len: usize,
@@ -756,7 +756,7 @@ pub enum ProtocolError {
 /// every locus classifies as [`ErrorKind::Internal`].
 ///
 /// Additive: as new dead-paths are identified, variants grow
-/// WITHOUT expanding the top-level [`ProtocolError`] enum.
+/// WITHOUT expanding the top-level `ProtocolError` enum.
 ///
 /// `#[repr(u8)]` makes the discriminant explicit 1-byte.
 /// `Option<CrateBugLocus>` niche-packs in the same byte —
@@ -784,10 +784,10 @@ pub enum CrateBugLocus {
     /// bug.
     ReadCursorAdvance,
 
-    /// [`crate::action::NonEmptyRange::new`] returned None when
+    /// `crate::action::NonEmptyRange::new` returned None when
     /// constructing a row-range for a `DataRow` frame.
     /// `parse_header` validates `payload_end <= populated_len`;
-    /// emission indicates a [`crate::dispatch::FrameCoords`] math
+    /// emission indicates a `crate::dispatch::FrameCoords` math
     /// bug.
     RowRangeConstruction,
 
@@ -919,14 +919,14 @@ pub enum CrateBugLocus {
     /// dead arm classifies via `PushFailure { id: …, cause:
     /// InternalCrateBug { locus: PushEmittedDeliverReply } }`; both
     /// dev and release route uniformly. The sentinel id is the
-    /// distinct [`crate::reply_id::CRATE_BUG_REPLY_ID_SENTINEL`]
+    /// distinct `crate::reply_id::CRATE_BUG_REPLY_ID_SENTINEL`
     /// (= NonZeroU64::MAX), not `NonZeroU64::MIN` — the latter would
     /// collide with the legitimate first id minted by
     /// `next_reply_id` on every connection's first command. Closed
     /// by-construction by the distinct sentinel.
     PushEmittedDeliverReply,
 
-    /// [`crate::buf::ReadBuf::enter_partial_mode`] was called while
+    /// `crate::buf::ReadBuf::enter_partial_mode` was called while
     /// the buffer was already in partial-frame mode
     /// (`partial_remaining > 0`). The streaming dispatcher's state
     /// machine guarantees the precondition (`exit_partial_mode`
@@ -942,7 +942,7 @@ pub enum CrateBugLocus {
     /// `Err` and route through this locus + `Errored` state install.
     PartialModeReentry,
 
-    /// [`crate::buf::ReadBuf::exit_partial_mode`] was called while
+    /// `crate::buf::ReadBuf::exit_partial_mode` was called while
     /// the buffer still owed wire body bytes (`partial_remaining >
     /// 0`). The streaming dispatcher's state machine guarantees the
     /// precondition (every wire-legal streaming row drains its body
@@ -962,10 +962,10 @@ pub enum CrateBugLocus {
     /// through this locus and `Errored` state install.
     PartialModeExitUndrained,
 
-    /// [`crate::command_tags_arena::CommandTagsArena::alloc`] returned
+    /// `crate::command_tags_arena::CommandTagsArena::alloc` returned
  /// `None` while staging a multi-statement
     /// `IntermediateCommandComplete` — the per-cycle slot cap
-    /// ([`crate::command_tags_arena::MAX_INTERMEDIATE_TAGS_PER_CALL`]
+    /// (`crate::command_tags_arena::MAX_INTERMEDIATE_TAGS_PER_CALL`
     /// = 9, equal to [`crate::MAX_ACTIONS_PER_CALL`]) was exceeded.
     /// Architecturally dead: the dispatch loop cannot emit more ICCs
     /// than there are OutActions slots, and arena capacity equals
@@ -1185,7 +1185,7 @@ mod crate_bug_locus_display_tests {
     }
 }
 
-/// Compact 1-byte classification of a [`ProtocolError`], stored in
+/// Compact 1-byte classification of a `ProtocolError`, stored in
 /// [`crate::state::ProtoState::Errored`].
 ///
 /// # Rationale
@@ -1234,7 +1234,7 @@ pub enum ErrorKind {
     /// [`ProtocolError::ReadBufferFull`].
     Transport = 1,
     /// Server-side error response arrived mid-handshake or mid-query.
-    /// [`ProtocolError::ServerErrorResponse`].
+    /// `ProtocolError::ServerErrorResponse`.
     ServerError = 2,
     /// Authentication negotiation failed — unsupported method or
     /// SCRAM exchange error. [`ProtocolError::UnsupportedAuthMethod`] +
@@ -1404,7 +1404,7 @@ const _: () = assert!(
 impl ProtocolError {
     /// Compact kind classification for this error.
     ///
-    /// Used by [`crate::state::ProtoState::Errored(ErrorKind)`] to
+    /// Used by `crate::state::ProtoState::Errored(ErrorKind)` to
     /// store the terminal state cheaply — 1 byte instead of 856.
     /// The full cause is emitted in `FailReply` exactly once (the
     /// first fatal); the state retains only the kind.
@@ -1455,7 +1455,7 @@ impl ProtocolError {
         }
     }
 
-    /// Total projection from [`ProtocolError`] to the
+    /// Total projection from `ProtocolError` to the
     /// [`StateErrorKind`] subset storable in
     /// [`crate::state::ProtoState::Errored`].
     ///

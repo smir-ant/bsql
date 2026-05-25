@@ -1160,7 +1160,7 @@ impl fmt::Display for AdvancePastEnd {
     }
 }
 
-/// Returned by [`ReadBuf::enter_partial_mode`] when called while the
+/// Returned by `ReadBuf::enter_partial_mode` when called while the
 /// buffer is already in partial-frame mode (`partial_remaining > 0`).
 ///
 /// A naive `debug_assert!` here would panic in dev builds and
@@ -1200,7 +1200,7 @@ impl fmt::Display for AlreadyInPartialMode {
     }
 }
 
-/// Returned by [`ReadBuf::exit_partial_mode`] when called while the
+/// Returned by `ReadBuf::exit_partial_mode` when called while the
 /// buffer still owes wire body bytes (`partial_remaining > 0`).
 ///
 /// A naive `debug_assert!` (panic in dev) plus a silent counter

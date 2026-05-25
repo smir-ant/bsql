@@ -49,7 +49,7 @@
 //! - [`error`] — classified protocol errors.
 //! - [`protocol`] — `PgProtocol` itself; entry points `feed_bytes` and
 //!   `push_command`; emits [`OutActions`].
-//! - [`dispatch`] — internal `(state, header) → outcome` matcher.
+//! - `dispatch` — internal `(state, header) → outcome` matcher.
 
 #![no_std]
 #![forbid(unsafe_code)]

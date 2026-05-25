@@ -83,7 +83,7 @@ impl FormatCode {
     /// PG §55.2.2 defines exactly two legal values: `0` (text) and
     /// `1` (binary). Any other value is a server-side wire violation
     /// and returns the offending code in `Err` for the caller to wrap
-    /// into [`ProtocolError::UnexpectedFormatCode`].
+    /// into `ProtocolError::UnexpectedFormatCode`.
     ///
     /// # Single classifier
     ///
@@ -226,7 +226,7 @@ const _: () = assert!(
 impl FormatCodeSet {
     /// Empty set — every column position resolves to [`FormatCode::Text`].
     /// Used by [`RowDesc::EMPTY`] and as the zero-init seed inside
-    /// [`parse_row_description`].
+    /// `parse_row_description`.
     #[inline]
     #[must_use]
     pub const fn empty() -> Self {
@@ -305,7 +305,7 @@ impl FormatCodeSet {
     ///
     /// Returns `Err(OutOfRange)` for `idx >= MAX_ROW_COLUMNS`. The
     /// caller MUST classify the failure (the only call site today is
-    /// [`parse_row_description`], which maps it to
+    /// `parse_row_description`, which maps it to
     /// [`crate::ProtocolError::MalformedRowDescription`] alongside the
     /// existing dead-arm classification of out-of-range slot writes).
     ///
@@ -341,7 +341,7 @@ impl FormatCodeSet {
     /// Construct from a raw bit pattern — diagnostic / test access
     /// only. Caller is responsible for ensuring bits at positions
     /// `>= MAX_ROW_COLUMNS` are zero. Production call paths use
-    /// [`Self::set`] in a loop ([`parse_row_description`]).
+    /// [`Self::set`] in a loop (`parse_row_description`).
     #[inline]
     #[must_use]
     pub const fn from_raw_bits(bits: u32) -> Self {
@@ -554,7 +554,7 @@ const _: () = {
 /// # Derived projection, not stored representation
 ///
 /// `ColumnDesc` is produced on demand by [`RowDesc::get`] /
-/// [`RowDesc::columns`]; it is not the storage shape. A naive shape
+/// `RowDesc::columns`; it is not the storage shape. A naive shape
 /// that stored an inline `[ColumnDesc; 32]` array (8 B per slot,
 /// 256 B total + n_columns + padding = 264 B) would balloon the
 /// per-result-set footprint. The current struct-of-arrays layout
@@ -863,7 +863,7 @@ const _: () = assert!(
 );
 
 /// Lifetime-bound borrow of a [`RowDesc`] living inside
-/// [`crate::PgProtocol::row_desc_slot`].
+/// `crate::PgProtocol::row_desc_slot`.
 ///
 /// `RowDescBorrow<'r>` is the public read-only handle the user
 /// receives for SELECT-bearing replies and per-row events. It is
@@ -1235,7 +1235,7 @@ pub enum CopyFormat {
 /// Wire body shape: `format: int8` (0 = text, 1 = binary) +
 /// `n_cols: int16` + per-column `format_code: int16[]` array. Per-PG
 /// spec the per-column codes MUST all equal the overall format byte
-/// — wire-validated by [`parse_copy_response_header`]. Stored as
+/// — wire-validated by `parse_copy_response_header`. Stored as
 /// `(format, n_cols)` only; per-column codes are redundant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CopyHeader {
@@ -2587,7 +2587,7 @@ impl<'a> FromPgText<'a> for &'a str {
 ///
 /// # Sealed
 ///
-/// The [`sealed::FromPgBinarySealed`] supertrait is module-private
+/// The `sealed::FromPgBinarySealed` supertrait is module-private
 /// — downstream crates cannot impl the trait for their own Rust
 /// types. The binary-codec surface is a fixed set of primitives;
 /// wider types (arrays, uuid, timestamp) land with their dedicated
@@ -2814,7 +2814,7 @@ impl FormatCodeMarker for BinaryFmt {
 ///
 /// Generic over `F: FormatCodeMarker` — the static format marker.
 /// Implemented for each (Rust type, wire format) pair the crate
-/// supports. Sealed via [`format_marker_sealed::DecodeFormatSealed`];
+/// supports. Sealed via `format_marker_sealed::DecodeFormatSealed`;
 /// downstream crates cannot add impls for their own types. Wider
 /// type coverage (date, time, uuid, decimal) lands with future
 /// follow-ups.
@@ -2822,7 +2822,7 @@ impl FormatCodeMarker for BinaryFmt {
 /// # Type-level pair check
 ///
 /// Calling `<T as DecodeFormat<F>>::decode(bytes)` requires T to
-/// implement DecodeFormat<F>. A missing pair (e.g. a hypothetical
+/// implement DecodeFormat`<F>`. A missing pair (e.g. a hypothetical
 /// type with only text support but caller tries
 /// `<T as DecodeFormat<BinaryFmt>>::decode`) is a compile error,
 /// NOT a runtime classification. This **closes** the runtime
@@ -2946,7 +2946,7 @@ const _: () = {
 /// Runtime [`FormatCode`] → static dispatch helper.
 ///
 /// Bridges the runtime `FormatCode` value carried in
-/// [`RowDescription`] / [`ColumnDesc::format_code`] to the
+/// `RowDescription` / [`ColumnDesc::format_code`] to the
 /// compile-time [`DecodeFormat`] dispatch surface. Requires `T`
 /// to implement **both** [`DecodeFormat<TextFmt>`] **and**
 /// [`DecodeFormat<BinaryFmt>`] — the common case for every

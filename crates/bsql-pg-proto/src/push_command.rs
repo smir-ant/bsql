@@ -14,15 +14,15 @@
 //! dispatch on a single discriminant byte. Logical Ping is ~16 B —
 //! 2160 B wasted per call.
 //!
-//! With the per-command shape: [`Ping`] is 16 B, [`Flush`] is 0 B,
+//! With the per-command shape: [`Ping`] is 16 B, `Flush` is 0 B,
 //! [`BindExecute`] is parameterised on `P: ParamsWriter` and carries
 //! only what its actual parameters need. Each push pays its own size.
 //!
 //! # Tier-1 invariants
 //!
 //! - **Push from Idle**: enforced at the
-//!   [`crate::PgProtocol::push_command_internal`] entry via the
-//!   [`crate::state_setter::IdleState::try_from`] lifetime-bound
+//!   `crate::PgProtocol::push_command_internal` entry via the
+//!   `crate::state_setter::IdleState::try_from` lifetime-bound
 //!   typestate. The typestate IS the `&mut state` borrow + the Idle
 //!   proof, inseparable; pairing-with-different-state is impossible
 //!   by lifetime ownership. ReadyGuard's `as_ready` runtime check is
@@ -101,7 +101,7 @@ pub trait PushCommand: sealed::PushCommandSealed {
     /// command (e.g. [`Ping`]) to a single witness type (e.g.
     /// [`PingAwaitingRfqInstall`]) which carries exactly the data
     /// the variant requires. The
-    /// [`crate::state_setter::StateSetter`] takes a
+    /// `crate::state_setter::StateSetter` takes a
     /// `Self::PostState` proof at consumption time — there is no
     /// path to install a non-matching state variant from `execute()`.
     /// A bare `execute(state: &mut ProtoState, …)` shape would be
@@ -133,7 +133,7 @@ pub trait PushCommand: sealed::PushCommandSealed {
     ///
     /// The `setter: StateSetter<'_, Self::PostState>` parameter
     /// inherits its `&mut state` borrow from the
-    /// [`crate::state_setter::IdleState::try_from`] typestate
+    /// `crate::state_setter::IdleState::try_from` typestate
     /// constructed inside `push_command_internal`. The typestate IS
     /// the proof + the borrow; reaching `execute()` implies the
     /// runtime Idle classification succeeded. ReadyGuard's `as_ready`
@@ -145,11 +145,11 @@ pub trait PushCommand: sealed::PushCommandSealed {
     /// `setter` is the **only** path to mutate
     /// [`crate::state::ProtoState`] from inside `execute()`. The raw
     /// `&mut ProtoState` lives privately inside
-    /// [`crate::PgProtocol::push_command_internal`], never handed to
+    /// `crate::PgProtocol::push_command_internal`, never handed to
     /// the impl. The setter is consumed (linear) by exactly one of:
-    /// - [`crate::state_setter::StateSetter::install_post_state`]
+    /// - `crate::state_setter::StateSetter::install_post_state`
     ///   (happy path, takes `Self::PostState` witness)
-    /// - [`crate::state_setter::StateSetter::install_errored`]
+    /// - `crate::state_setter::StateSetter::install_errored`
     ///   (failure path via `try_builder!` macro, takes
     ///   `StateErrorKind`)
     ///
@@ -259,7 +259,7 @@ impl PushCommand for Ping {
 /// (`Q`-frame).
 ///
 /// `sql` is `&'a str` — the bytes are streamed zero-copy via
-/// [`StagedAction::SendBytesBorrowed`](crate::action::StagedAction).
+/// `StagedAction::SendBytesBorrowed`.
 /// No protocol cap on SQL size, no truncation arena. Caller owns
 /// the string allocation; for SQL containing secrets, hold it in
 /// `Zeroizing<String>` (zeroize-on-drop happens at the caller, not
@@ -688,7 +688,7 @@ impl PostStateSealed for PingAwaitingRfqInstall {}
 // state_setter.rs's `InstallBody` doc for details.
 impl PostStateProof for PingAwaitingRfqInstall {}
 
-/// Witness pairing [`Startup`] to one of four post-startup variants
+/// Witness pairing `Startup` to one of four post-startup variants
 /// (Trust / SCRAM / Cleartext / MD5). The split surfaces the
 /// per-credential-type post-state pairing structurally — adding a
 /// new credential variant fails the build until a matching enum
@@ -798,7 +798,7 @@ impl PostStateProof for CloseAwaitingCompleteInstall {}
 /// Witness pairing [`BindExecute<P>`] to one of two post-bind+execute
 /// variants (DML / SELECT). The split surfaces the schema-bearing
 /// vs schema-less path structurally — schema parking via
-/// [`crate::schema_slot::RowDescSlotCell::park_at_be_select`] happens
+/// `crate::schema_slot::RowDescSlotCell::park_at_be_select` happens
 /// BEFORE the install, inside `compute_push_bind_execute_idle_only`
 /// (gated by the leaf-private `BeSelectToken`); this witness only
 /// captures the variant choice + reply correlator.
@@ -821,7 +821,7 @@ pub enum BindExecutePostInstall {
     },
     /// Schema-bearing path → [`crate::state::ProtoState::BindExecuteAwaitingBindCompleteSelect`].
     /// `RowDesc` already parked in `PgProtocol::row_desc_slot` via
-    /// [`crate::schema_slot::RowDescSlotCell::park_at_be_select`]
+    /// `crate::schema_slot::RowDescSlotCell::park_at_be_select`
     /// (gated by the `BeSelectToken` leaf-private mint) before install.
     Select {
         /// Correlator for the in-flight command.

@@ -1,7 +1,7 @@
 //! Password buffer and authentication credentials.
 //!
 //! [`Password`] is a bounded byte buffer for user passwords, wrapped in
-//! [`Sensitive`](crate::sensitive::Sensitive) to guarantee zero-on-drop
+//! [`Sensitive`] to guarantee zero-on-drop
 //! and redacted debug. [`Credentials`] selects between trust auth (no
 //! password) and password-based auth.
 //!
@@ -232,7 +232,7 @@ pub enum Credentials {
     ///
     /// The password is wrapped in [`Sensitive`] for zero-on-drop and
     /// debug redaction. The MD5 computation is performed inside
-    /// [`crate::md5`] which uses `Zeroizing<>` for every password-
+    /// `crate::md5` which uses `Zeroizing<>` for every password-
     /// derived intermediate buffer.
     Md5Password(Sensitive<Password>),
 }

@@ -105,7 +105,7 @@
 //! 3. **Construction requires
 //!    [`crate::protocol::_proto_init_leaf::ProtoInitToken`]** — the
 //!    cell's `empty()` constructor is leaf-gated, mirroring the
-//!    [`crate::schema_slot::RowDescSlotCell`] /
+//!    `crate::schema_slot::RowDescSlotCell` /
 //!    [`crate::session_params_slot::SessionParamsCell`] cluster α/β
 //!    pattern.
 //! 4. **Mutating methods require per-leaf concrete-type tokens** —
@@ -573,7 +573,7 @@ impl PartialAssemblyInner {
 /// assembly slot. Wraps `Option<Box<PartialAssemblyInner>>` with a
 /// PRIVATE inner field; writes require per-leaf concrete-type tokens.
 ///
-/// Mirror of [`crate::schema_slot::RowDescSlotCell`] /
+/// Mirror of `crate::schema_slot::RowDescSlotCell` /
 /// [`crate::session_params_slot::SessionParamsCell`] discipline.
 ///
 /// `#[repr(transparent)]` so the layout is identical to the bare

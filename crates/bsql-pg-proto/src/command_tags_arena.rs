@@ -23,7 +23,7 @@
 //!
 //! # Single-slot vs multi-slot — why the latter
 //!
-//! [`crate::command_tag_slot::CommandTagSlotCell`] is single-slot —
+//! `crate::command_tag_slot::CommandTagSlotCell` is single-slot —
 //! it parks the LATEST tag for the terminal
 //! `Reply::QueryComplete` borrow at materialise. ICC cannot share
 //! that semantic: each ICC emission references its OWN prior tag,
@@ -40,7 +40,7 @@
 //!   SimpleQuery, zero cost for single-statement-only connections.
 //! - **Per-cycle clear**: cleared at `feed_bytes` entry (mirror of
 //!   [`crate::notifications_arena::NotificationsArena`] /
-//!   [`crate::error_arena::ErrorArena`] clear-at-entry pattern).
+//!   `crate::error_arena::ErrorArena` clear-at-entry pattern).
 //!   Refs issued in cycle N resolve [`ArenaError::Stale`] in
 //!   cycle N+1 via gen mismatch — the wrapper layer MUST consume
 //!   `Action::IntermediateCommandComplete` payloads within the same
@@ -68,7 +68,7 @@ use crate::error_arena::ArenaError;
 /// per-call cap of 9 is the structural ceiling.
 pub(crate) const MAX_INTERMEDIATE_TAGS_PER_CALL: usize = crate::MAX_ACTIONS_PER_CALL;
 
-/// Gen-tagged handle into [`CommandTagsArena`].
+/// Gen-tagged handle into `CommandTagsArena`.
 ///
 /// `Copy` (4 B inline: slot 1 B + gen 2 B + 1 B padding). Carried
 /// by [`crate::Action::IntermediateCommandComplete`] so Action stays

@@ -162,7 +162,7 @@ mod sealed {
 /// `Debug`.
 ///
 /// **Sealed**: external crates cannot introduce new tags. The sealed
-/// supertrait [`sealed::FixedStrKindSealed`] is module-private, so no
+/// supertrait `sealed::FixedStrKindSealed` is module-private, so no
 /// downstream impl compiles.
 ///
 /// `ALLOW_EMPTY` is consulted by validated-constructor impls.
@@ -233,7 +233,7 @@ pub trait Truncating: FixedStrKind + sealed::TruncatingSealed {}
 )]
 pub trait ValidUtf8: FixedStrKind + sealed::ValidUtf8Sealed {}
 
-/// Tag for [`Ident`] — non-empty, no NUL, max 63 bytes.
+/// Tag for `Ident` — non-empty, no NUL, max 63 bytes.
 ///
 /// `enum`-with-no-variants → uninstantiable; the type parameter
 /// alone carries the nominal distinction without runtime cost.
@@ -250,7 +250,7 @@ impl FixedStrKind for IdentTag {
 impl Validated for IdentTag {}
 impl ValidUtf8 for IdentTag {}
 
-/// Tag for [`DatabaseName`] — same invariants as [`IdentTag`] but a
+/// Tag for `DatabaseName` — same invariants as [`IdentTag`] but a
 /// distinct compile-time type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseNameTag {}
@@ -265,7 +265,7 @@ impl FixedStrKind for DatabaseNameTag {
 impl Validated for DatabaseNameTag {}
 impl ValidUtf8 for DatabaseNameTag {}
 
-/// Tag for [`ApplicationName`] — may be empty; no NUL; max 128 bytes.
+/// Tag for `ApplicationName` — may be empty; no NUL; max 128 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationNameTag {}
 
@@ -462,7 +462,7 @@ pub type ApplicationName =
 
 /// A bounded string with explicit `"…"`-marked truncation on overflow.
 ///
-/// Used in [`crate::error::ServerErrorResponse`] to hold server-sent
+/// Used in `crate::error::ServerErrorResponse` to hold server-sent
 /// error message fields with a hard byte cap and no silent truncation.
 ///
 /// Uses the default `BoundedU16<N>` LenT — covers any N up to 65_534.

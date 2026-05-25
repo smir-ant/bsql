@@ -1,8 +1,8 @@
 //! Tier-1 within-crate `command_tag_slot` write provenance via
 //! concrete-token + Cell newtype. DEF-286 Φ3.
 //!
-//! Mirror of [`crate::param_oids_slot::ParamOidsSlotCell`] /
-//! [`crate::schema_slot::RowDescSlotCell`]. The cell holds the
+//! Mirror of `crate::param_oids_slot::ParamOidsSlotCell` /
+//! `crate::schema_slot::RowDescSlotCell`. The cell holds the
 //! parsed [`CommandTag`] across the multi-frame
 //! `'C' [→ 'C']* → 'Z'` window of a query/extended-query cycle.
 //!

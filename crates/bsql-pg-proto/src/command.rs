@@ -16,7 +16,7 @@ use crate::reply_id::{
 /// paths come online; user `match` arms must accommodate growth.
 ///
 /// `#[must_use]` because constructing a command without pushing it
-/// into [`crate::PgProtocol::push_command`] cannot deliver a reply —
+/// into `crate::PgProtocol::push_command` cannot deliver a reply —
 /// the user's `oneshot::Receiver` would block forever.
 ///
 /// # No `Clone`
@@ -242,7 +242,7 @@ pub(crate) enum PgCommand {
 
 /// How many rows a bound portal should produce before pausing.
 ///
-/// Parameter of [`crate::PgProtocol::push_bind_execute`]. Encoded on
+/// Parameter of `crate::PgProtocol::push_bind_execute`. Encoded on
 /// the wire in the PG `Execute` frame as a 4-byte `i32` — but the
 /// type system narrows the user-facing API to the variants this
 /// codebase supports.

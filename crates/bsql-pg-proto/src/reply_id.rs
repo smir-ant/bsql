@@ -9,9 +9,9 @@
 //!
 //! [`ReplyId<K>`] is parameterised by a marker type `K: ReplyKind`
 //! that binds the **expected payload** via an associated type
-//! [`ReplyKind::Payload`]. The only way to produce a
+//! `ReplyKind::Payload`. The only way to produce a
 //! `StagedAction::DeliverReply` carrying payload `P` is through
-//! [`crate::action::deliver`], whose signature is
+//! `crate::action::deliver`, whose signature is
 //! `fn deliver<K: ReplyKind>(id: ReplyId<K>, payload: K::Payload) -> StagedAction`
 //! — passing a `ReplyId<PingKind>` and a `StartupCompletePayload`
 //! is a type error at the call site, not a runtime misroute.
@@ -24,14 +24,14 @@
 //! StartupComplete payload. The kind tag closes that seam tier-1 at
 //! compile time.
 //!
-//! The [`crate::action::DeliverReplyEntry`] struct that backs the
+//! The `crate::action::DeliverReplyEntry` struct that backs the
 //! variant has module-private fields so direct struct-literal
 //! construction outside the sanctioned path is also a compile error —
 //! not just a convention.
 //!
 //! # Sealing
 //!
-//! `ReplyKind` is sealed (via the private [`sealed::Sealed`]
+//! `ReplyKind` is sealed (via the private `sealed::Sealed`
 //! supertrait) so external code cannot introduce new kinds. Each
 //! PG command carries exactly one kind, known statically at the
 //! crate level; new kinds land with new commands in later sub-phases.
@@ -48,7 +48,7 @@
 //!
 //! `bsql-pg-proto` mints IDs internally via [`crate::PgProtocol::next_reply_id`]:
 //!
-//! - **External fabrication: tier-1 by-visibility.** [`ReplyId::from_raw`]
+//! - **External fabrication: tier-1 by-visibility.** `ReplyId::from_raw`
 //!   is `pub(crate)` — external crates cannot construct a `ReplyId<K>`.
 //!   The sole public mint is [`crate::PgProtocol::next_reply_id`]
 //!   `<K: ReplyKind>(&mut self) -> ReplyId<K>`.
@@ -118,12 +118,12 @@ mod sealed {
 ///
 /// Each impl is an uninhabited `enum` (structurally impossible to
 /// instantiate) that serves purely as a type-level nominal tag.
-/// The associated [`Payload`] type is the **only** payload shape
+/// The associated `Payload` type is the **only** payload shape
 /// the protocol may deliver for this command-kind; attempts to
 /// deliver a different payload fail to compile at the construction
-/// site (see [`crate::action::deliver`]).
+/// site (see `crate::action::deliver`).
 ///
-/// [`Payload`]: ReplyKind::Payload
+/// `Payload`: the associated type on `ReplyKind`
 //
 // Structural diagnostic. The sealed supertrait error «`T: Sealed`
 // is not satisfied» is not actionable from outside the crate —
@@ -292,7 +292,7 @@ impl ReplyKind for DescribePortalKind {
 /// - **Tier 1 compile** — kind-parameterised. A `ReplyId<PingKind>`
 ///   cannot produce anything other than a `PongPayload`-backed
 ///   delivery; attempting so is a type error at
-///   [`crate::action::deliver`].
+///   `crate::action::deliver`.
 /// - **Tier 2 structural** — cannot be silently ignored from a
 ///   pattern match. The crate-root `#[deny(unused_variables)]`
 ///   combined with the crate-wide CREDO bans on `let _ = expr;`

@@ -28,7 +28,7 @@
 //! # Tier-1 closure
 //!
 //! [`crate::PgProtocol::as_ready`] dispatches on
-//! [`crate::state::ProtoState::push_class`], an exhaustive 5-variant
+//! `crate::state::ProtoState::push_class`, an exhaustive 5-variant
 //! classifier (`Idle | Errored | Connecting | PingAwaiting | BusyQuery`).
 //! Adding a new `ProtoState` variant requires updating `push_class`
 //! (build failure if forgotten — pinned by `state::push_class_tests`).
@@ -227,7 +227,7 @@ impl<'a> ReadyGuard<'a> {
     /// Convenience for callers that prefer the positional-args shape;
     /// new callers should construct
     /// [`crate::push_command::BindExecute`] and call
-    /// [`Self::push_command`] directly.
+    /// `Self::push_command` directly.
     #[expect(
         clippy::too_many_arguments,
         reason = "push_bind_execute mirrors the PG Bind+Execute wire contract 1:1; the wrapper preserves the same arg count by design"
@@ -260,7 +260,7 @@ impl<'a> ReadyGuard<'a> {
     /// arguments. The proc-macro emits a `const` of
     /// `PreparedQuery<P, R>`; this helper wraps the (q, args, fetch,
     /// reply) tuple into a [`crate::push_command::BindPrepared`] and
-    /// routes through [`Self::push_command`] — the Idle precondition
+    /// routes through `Self::push_command` — the Idle precondition
     /// and typed post-state-install closures apply unchanged.
     ///
     /// Compared to [`Self::push_bind_execute`], the prepared path:
@@ -309,7 +309,7 @@ impl<'a> ReadyGuard<'a> {
 ///
 /// # Tier-1 closure
 ///
-/// Maps 1:1 to [`crate::state::StatePushClass`] (5 variants with
+/// Maps 1:1 to `crate::state::StatePushClass` (5 variants with
 /// `BusyQuery` and `PingAwaiting` collapsed to a single `Busy` since
 /// caller recovery for both is identical: wait for in-flight reply).
 /// Exhaustive match in `connection_status` — adding a `StatePushClass`

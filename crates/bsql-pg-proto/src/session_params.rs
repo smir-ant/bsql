@@ -117,7 +117,7 @@ impl Encoding {
     ///
     /// # Over-length names
     ///
-    /// Names longer than [`MAX_ENCODING_NAME_LEN`] are preserved via
+    /// Names longer than `MAX_ENCODING_NAME_LEN` are preserved via
     /// [`OtherEncoding::from_truncated_bytes`] — the visible prefix
     /// plus a `"…"` truncation marker. A silent `Other(empty)`
     /// fallback would be tier-4 (lost forensic information); the
@@ -141,7 +141,7 @@ impl Encoding {
 }
 
 /// Raw bytes of an unrecognised PG encoding name, bounded at
-/// [`MAX_ENCODING_NAME_LEN`]. Preserves the byte-exact spelling
+/// `MAX_ENCODING_NAME_LEN`. Preserves the byte-exact spelling
 /// the server sent.
 ///
 /// # `len` narrowing
@@ -161,7 +161,7 @@ pub struct OtherEncoding {
 
 impl OtherEncoding {
     /// Empty fallback — used when the server sends a name longer
-    /// than [`MAX_ENCODING_NAME_LEN`].
+    /// than `MAX_ENCODING_NAME_LEN`.
     #[inline]
     #[must_use]
     pub const fn empty() -> Self {

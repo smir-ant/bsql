@@ -174,7 +174,7 @@ pub(crate) trait InstallBody: PostStateProof + install_body_seal::InstallBodySea
 /// concrete post-state witness type.
 ///
 /// **Construction:** only via [`Self::new`] (`pub(crate)`), called
-/// inside [`crate::PgProtocol::push_command_internal`] just before
+/// inside `crate::PgProtocol::push_command_internal` just before
 /// [`crate::push_command::PushCommand::execute`] is dispatched.
 ///
 /// **Consumption:** exactly one of [`Self::install_post_state`] or
@@ -289,7 +289,7 @@ impl<'a, W: InstallBody> StateSetter<'a, W> {
 ///
 /// **Consumption:** [`Self::drain_and_install_errored`] is the sole
 /// consumption path. Atomic: extracts the in-flight reply id from the
-/// prior state via [`ProtoState::take_inflight_reply_raw_id`] **and**
+/// prior state via `ProtoState::take_inflight_reply_raw_id` **and**
 /// installs `ProtoState::Errored(kind)` in one `mem::replace` —
 /// observer (the `!Sync` `PgProtocol`) cannot witness the partial
 /// triple. The returned `Option<NonZeroU64>` is `#[must_use]` —
@@ -491,7 +491,7 @@ pub(crate) fn drain_at_fail_inflight_no_readbuf(
 /// Leaf entry point: RowStream Drop fired while the stream was
 /// mid-frame (column events still pending or partial-frame mode
 /// active). Used by
-/// [`crate::PgProtocol::install_errored_stream_dropped_mid_stream`]
+/// `crate::PgProtocol::install_errored_stream_dropped_mid_stream`
 /// from inside [`crate::row_stream::RowStream::drop`]; classified as
 /// [`crate::error::CrateBugLocus::StreamDroppedMidStream`].
 ///
@@ -562,7 +562,7 @@ impl<'a> IdleState<'a> {
     /// Construct an [`IdleState`] from a `&'a mut ProtoState`,
     /// returning `Some(_)` if the state is currently
     /// `ProtoState::Idle` and `None` otherwise. Production callers go
-    /// through [`crate::PgProtocol::push_command`] which performs an
+    /// through `crate::PgProtocol::push_command` which performs an
     /// upstream `as_ready()` runtime check; this `try_from` re-checks
     /// at the typestate boundary, providing build-time tier-1
     /// enforcement against any in-crate caller pairing a proof with a

@@ -24,7 +24,7 @@
 //!   per impl).
 //! - **Tier-1 compile**: `FORMATS.len() == COUNT`, `OIDS.len() == COUNT`.
 //!   Built into the macro expansion.
-//! - **Tier-1 compile**: sealed via [`sealed::ParamsWriterSealed`].
+//! - **Tier-1 compile**: sealed via `sealed::ParamsWriterSealed`.
 //!   Downstream crates cannot impl `ParamsWriter` for their own types.
 //! - **Tier-2 structural**: all `write_params` impls return
 //!   `Result<(), WriteBufFull>` — buffer overflow is classified,
@@ -92,7 +92,7 @@ mod sealed {
 ///
 /// # Sealed
 ///
-/// Module-private seal via [`sealed::ParamEncoderSealed`] — only
+/// Module-private seal via `sealed::ParamEncoderSealed` — only
 /// two impls exist:
 /// - `impl<T: EncodeBinary> ParamEncoder for T` — the non-NULL
 ///   path, writes `len` + bytes via
@@ -218,7 +218,7 @@ pub trait ParamsWriter: sealed::ParamsWriterSealed {
     ///
     /// # Errors
     ///
-    /// [`WriteBufFull`] if any element overflows the buffer. The
+    /// `WriteBufFull` if any element overflows the buffer. The
     /// Bind-frame const-assert pins the worst-case size against
     /// `MAX_OWNED_SEND_LEN`; in production the error branch is
     /// architecturally dead but surfaces as a classified error

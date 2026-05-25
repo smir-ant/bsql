@@ -1,9 +1,9 @@
 //! SCRAM-specific newtypes for secret values and bounded nonces.
 //!
-//! [`SecretDigest`] — 32-byte wrapper that deliberately omits `PartialEq`
+//! `SecretDigest` — 32-byte wrapper that deliberately omits `PartialEq`
 //! / `Eq`, forcing all comparisons through constant-time `ct_eq`.
 //!
-//! [`CappedServerNonce`] — bounded byte buffer for the server's SCRAM
+//! `CappedServerNonce` — bounded byte buffer for the server's SCRAM
 //! nonce.
 
 use core::fmt;
@@ -79,7 +79,7 @@ pub const MAX_SERVER_NONCE_LEN: usize = 256;
 
 /// A bounded server nonce for SCRAM authentication.
 ///
-/// Constructible only via [`CappedServerNonce::try_from_bytes`], which
+/// Constructible only via `CappedServerNonce::try_from_bytes`, which
 /// enforces the capacity bound. Downstream builders of
 /// `client-final-message` accept only this type — an unbounded nonce
 /// cannot reach the wire. `#[repr(transparent)]` for zero-cost ABI.
@@ -151,7 +151,7 @@ impl fmt::Debug for CappedServerNonce {
 
 #[cfg(test)]
 mod drop_witness_tests {
-    //! Tier-1-by-construction Drop-fire witness for [`SecretDigest`]
+    //! Tier-1-by-construction Drop-fire witness for `SecretDigest`
     //! via [`crate::drop_witness::DropCounter`]. Every `cargo test`
     //! increments the counter when `SecretDigest::drop` fires its
     //! `ZeroizeOnDrop` body. Without this witness, coverage would be

@@ -2,7 +2,7 @@
 //!
 //! Two public methods drive the machine:
 //!
-//! - [`PgProtocol::push_command`] — user pushes a a command from `push_command`;
+//! - `PgProtocol::push_command` — user pushes a a command from `push_command`;
 //!   protocol reacts (typically: emit a `SendBytes`, transition state).
 //! - [`PgProtocol::feed_bytes`] — host hands inbound wire bytes;
 //!   protocol parses zero or more frames, dispatches each, emits zero
@@ -176,7 +176,7 @@ macro_rules! emit_actions {
 /// alternative would take `$state: &mut ProtoState` and write
 /// `*$state = ProtoState::Errored(state_kind)` directly — but raw
 /// `&mut ProtoState` is no longer reachable from `execute()` (only
-/// via [`crate::state_setter::StateSetter`]), and the setter's
+/// via `crate::state_setter::StateSetter`), and the setter's
 /// `must_use` lint surfaces a missed install at the call site
 /// rather than leaving the responsibility to a docstring discipline
 /// note.
@@ -313,7 +313,7 @@ pub const MAX_STAGED_PER_CALL: usize = 8;
 ///
 /// If a future pipelining refactor emits 2+ DeliverReply per
 /// dispatch call (batched replies), bump
-/// [`MAX_FANOUT2_ENTRIES_PER_CALL`] to match the max number of
+/// `MAX_FANOUT2_ENTRIES_PER_CALL` to match the max number of
 /// simultaneous fanout-2 staged entries — the formula recomputes.
 ///
 /// # Named constants vs magic literal
@@ -539,7 +539,7 @@ pub(crate) fn command_tags_arena_or_init(
 /// can shrink later via a ring-buffer migration.
 ///
 /// **Construction**: only via
-/// [`_proto_init_leaf::fresh_connecting_inner`] (token-gated,
+/// `_proto_init_leaf::fresh_connecting_inner` (token-gated,
 /// leaf-private) called from `<DisconnectedPhase>::push_startup`.
 ///
 /// **Field visibility**: private. The `pub` struct declaration is
@@ -606,7 +606,7 @@ pub struct ConnectingInner {
 /// 4 cells 8 B each + u32 + alignment). The per-phase split
 /// delivers tier-1 closure without a footprint regression.
 ///
-/// **Construction**: only via [`_proto_init_leaf::fresh_active_inner`]
+/// **Construction**: only via `_proto_init_leaf::fresh_active_inner`
 /// called from `<ConnectingPhase>::into_active`.
 pub struct ActiveInner {
     /// State narrowed to [`crate::state::ActiveState`] variants
@@ -813,7 +813,7 @@ pub(crate) mod _sealed_phase {
 ///
 /// `P: SealedPhase` is the type-level proof that the runtime
 /// [`PgProtocol<P>`] is in phase `P`. The trait is sealed via
-/// [`_sealed_phase::Sealed`]; the 4 implementing types are
+/// `_sealed_phase::Sealed`; the 4 implementing types are
 /// [`DisconnectedPhase`], [`ConnectingPhase`], [`ActivePhase`],
 /// [`ClosedPhase`].
 ///
@@ -870,9 +870,9 @@ pub trait SealedPhase: _sealed_phase::Sealed + 'static {
     ///   reachable pre-Startup.
     /// - [`ConnectingPhase`]: `type Extras = ()` (ZST). No dispatch
     ///   arm reachable from a `ConnectingState` LHS writes
-    ///   [`crate::schema_slot::RowDescSlotCell`] — the field
+    ///   `crate::schema_slot::RowDescSlotCell` — the field
     ///   physically does not exist on the outer for this phase.
-    /// - [`ActivePhase`]: `type Extras = `[`crate::schema_slot::RowDescSlotCell`].
+    /// - [`ActivePhase`]: `type Extras = ``crate::schema_slot::RowDescSlotCell`.
     ///   BindExecute SELECT install + Describe arms write the slot;
     ///   storage lives on the outer (hoisted from `ActiveInner`).
     /// - [`ClosedPhase`]: `type Extras = ()` (ZST). Closed absorbs no
@@ -906,7 +906,7 @@ pub trait SealedPhase: _sealed_phase::Sealed + 'static {
     /// The dual side of the probe (verifying that
     /// `<ConnectingPhase>::Extras = ()` and `<ActivePhase>::Extras =
     /// RowDescSlotCell`) is enforced by the layout pins in `lib.rs`
-    /// (PgProtocol<ConnectingPhase> at 368 B, PgProtocol<ActivePhase>
+    /// (PgProtocol`<ConnectingPhase>` at 368 B, PgProtocol`<ActivePhase>`
     /// at 536 B). A regression in either Extras mapping would shift
     /// the layout and trip those `const _: () = assert!(…)` gates at
     /// compile time.
@@ -1017,7 +1017,7 @@ pub struct DisconnectedInner {
 /// stack + any heap behind the Box-niche cells.
 ///
 /// `size_of::<ClosedInner>() == 16 B` (state_kind 1B + 7B pad +
-/// error_arena Option<Box> 8B). `DisconnectedInner` is 0 B;
+/// error_arena Option`<Box>` 8B). `DisconnectedInner` is 0 B;
 /// `ClosedInner` is the second-narrowest phase Inner.
 /// Why a `<ClosedPhase>` protocol is in its terminal state.
 ///
@@ -1118,8 +1118,8 @@ impl SealedPhase for ActivePhase {
     // variants exist in the per-phase enum).
     //
     // [`ActiveExtras`] carries TWO slots on the outer for Active
-    // alone: `row_desc` ([`crate::schema_slot::RowDescSlotCell`])
-    // and `param_oids` ([`crate::param_oids_slot::ParamOidsSlotCell`]).
+    // alone: `row_desc` (`crate::schema_slot::RowDescSlotCell`)
+    // and `param_oids` (`crate::param_oids_slot::ParamOidsSlotCell`).
     // Both `feed_bytes_dispatch_active` and `feed_bytes_dispatch_connecting`
     // borrow `&mut self.extras.row_desc` + `&mut self.extras.param_oids`
     // and thread into the shared dispatch body's `DispatchContext`.
@@ -1241,7 +1241,7 @@ pub struct ActiveExtras {
 /// Phase-typed wrapper over the per-phase Inner storage.
 ///
 /// `#[repr(transparent)]` over the per-phase `Inner` field plus a
-/// ZST [`PhantomData<fn() -> P>`]. The `fn() -> P` phantom shape
+/// ZST `PhantomData<fn() -> P>`. The `fn() -> P` phantom shape
 /// gives covariant `P` + unconditional `Send + Sync` of the phantom
 /// itself (the wrapper's `!Sync` inherits from
 /// `inner.sync_marker: PhantomData<Cell<()>>` via `repr(transparent)`
@@ -1258,8 +1258,8 @@ pub struct ActiveExtras {
 /// # Field-access discipline
 ///
 /// Methods inside `impl PgProtocol<P>` access inner fields via
-/// **explicit `self.inner.<field>`** — there is no [`Deref`] /
-/// [`DerefMut`] impl. The explicit projection is load-bearing for
+/// **explicit `self.inner.<field>`** — there is no `Deref` /
+/// `DerefMut` impl. The explicit projection is load-bearing for
 /// the multi-phase foundation:
 ///
 /// 1. **Phase transitions** (`fn into_connecting(self) -> PgProtocol<ConnectingPhase>`)
@@ -1396,13 +1396,13 @@ pub(crate) mod _bind_execute_select_install_leaf {
     /// Leaf-scope token. The tuple-struct field is PRIVATE to this
     /// submodule — `Self(())` mints are callable ONLY here. The
     /// type itself is `pub(crate)` so
-    /// [`crate::schema_slot::RowDescSlotCell::park_at_be_select`]
+    /// `crate::schema_slot::RowDescSlotCell::park_at_be_select`
     /// can name it in its parameter signature; naming alone confers
     /// no minting power.
     pub(crate) struct BeSelectToken(());
 
     /// Mint a [`BeSelectToken`] and write `desc` into `slot` via
-    /// [`crate::schema_slot::RowDescSlotCell::park_at_be_select`]. The
+    /// `crate::schema_slot::RowDescSlotCell::park_at_be_select`. The
     /// only legitimate path to populate the schema slot from the
     /// BindExecute SELECT install code path.
     #[inline]
@@ -1437,7 +1437,7 @@ pub(crate) mod _clear_residue_leaf {
 
     /// Leaf-scope token for the param-oids slot clear at residue
     /// transitions. Field private to the leaf; type `pub(crate)` so
-    /// [`crate::param_oids_slot::ParamOidsSlotCell`] can name it in
+    /// `crate::param_oids_slot::ParamOidsSlotCell` can name it in
  /// its `clear_at_residue` parameter signature. Φ1 —
     /// mirrors [`ClearResidueSchemaToken`]'s shape exactly.
     pub(crate) struct ClearResidueParamOidsToken(());
@@ -1445,7 +1445,7 @@ pub(crate) mod _clear_residue_leaf {
     /// Leaf-scope token for the command_tag slot clear at residue
  /// transitions. Φ3 — mirror of
     /// [`ClearResidueParamOidsToken`]. Type `pub(crate)` so
-    /// [`crate::command_tag_slot::CommandTagSlotCell`] can name it.
+    /// `crate::command_tag_slot::CommandTagSlotCell` can name it.
     pub(crate) struct ClearResidueCommandTagToken(());
 
     /// Leaf-scope token for the tx_status slot reset at residue
@@ -1560,7 +1560,7 @@ pub(crate) mod _clear_residue_leaf {
 // `Self(())` literal mint is callable ONLY here.
 //
 // Tier-1 within-crate by-construction. The leaf body is small enough
-// to review as a unit; see [`crate::partial_assembly`] for the cell
+// to review as a unit; see `crate::partial_assembly` for the cell
 // + sink design rationale.
 // ═════════════════════════════════════════════════════════════════════
 
@@ -1812,7 +1812,7 @@ pub(crate) mod _proto_init_leaf {
         /// [`super::DisconnectedInner`]. Constructor allocates ZERO
         /// bytes — `size_of::<PgProtocol<DisconnectedPhase>>() == 0`.
         /// Cell materialisation is deferred to
-        /// [`super::_proto_init_leaf::fresh_connecting_inner`] called
+        /// `super::_proto_init_leaf::fresh_connecting_inner` called
         /// inside `push_startup`. A naive shape would materialise a
         /// full 536-B Inner at construction time (state Idle,
         /// read_buf empty, four cells, counter, sync marker), all of
@@ -1829,7 +1829,7 @@ pub(crate) mod _proto_init_leaf {
         /// only through `<ActivePhase>::push_command_internal`.
         ///
         /// `<DisconnectedPhase>` has no cells, so the
-        /// [`ProtoInitToken`] is not needed at this constructor —
+        /// `ProtoInitToken` is not needed at this constructor —
         /// only `fresh_connecting_inner` (called when `push_startup`
         /// materialises a fresh `ConnectingInner` for the
         /// `<ConnectingPhase>` transition) needs the token. The
@@ -1849,7 +1849,7 @@ pub(crate) mod _proto_init_leaf {
     /// Materialise a fresh [`super::ConnectingInner`] for use by
     /// the `<DisconnectedPhase>::push_startup` transition.
     ///
-    /// Cells start empty via the [`ProtoInitToken`]-gated
+    /// Cells start empty via the `ProtoInitToken`-gated
     /// constructors; `read_buf` starts empty;
     /// `malformed_frame_count` starts 0; `sync_marker` is
     /// `PhantomData`.
@@ -1888,9 +1888,9 @@ pub(crate) mod _proto_init_leaf {
     /// Mint the outer `<ActivePhase>::Extras = ActiveExtras` at the
     /// `<ConnectingPhase>::into_active` transition boundary. Both
     /// inner cells (`row_desc` + `param_oids`) start empty via
-    /// [`ProtoInitToken`]-gated constructors. Mirror of the per-cell
+    /// `ProtoInitToken`-gated constructors. Mirror of the per-cell
     /// `empty(token)` mint pattern used by [`fresh_active_inner`];
-    /// lives inside `_proto_init_leaf` so the [`ProtoInitToken`]
+    /// lives inside `_proto_init_leaf` so the `ProtoInitToken`
     /// stays leaf-private.
     ///
  /// Φ1: extended from single-cell `RowDescSlotCell` to
@@ -2893,7 +2893,7 @@ pub(crate) mod _read_cursor_advance_drain_leaf {
 }
 
 /// Leaf submodule for the `install_errored_partial_mode_reentry`
-/// transition. Fires when [`crate::buf::ReadBuf::enter_partial_mode`]
+/// transition. Fires when `crate::buf::ReadBuf::enter_partial_mode`
 /// returns `Err(AlreadyInPartialMode)` — an internal classifier bug
 /// classified as
 /// [`crate::error::CrateBugLocus::PartialModeReentry`].
@@ -2916,7 +2916,7 @@ pub(crate) mod _partial_mode_reentry_drain_leaf {
 
 /// Leaf submodule for the
 /// `install_errored_partial_mode_exit_undrained` transition. Fires
-/// when [`crate::buf::ReadBuf::exit_partial_mode`] returns
+/// when `crate::buf::ReadBuf::exit_partial_mode` returns
 /// `Err(PartialModeExitUndrained)` — an internal classifier bug OR
 /// adversarial server emitting a body-length-vs-column-sum-mismatched
 /// DataRow; classified as
@@ -3035,7 +3035,7 @@ pub(crate) mod _stream_dropped_mid_stream_drain_leaf {
     /// Mint a [`StreamDroppedMidStreamToken`] and route through
     /// [`crate::state_setter::drain_at_stream_dropped_mid_stream`].
     /// Sole legitimate caller is
-    /// [`crate::PgProtocol::install_errored_stream_dropped_mid_stream`]
+    /// `crate::PgProtocol::install_errored_stream_dropped_mid_stream`
     /// (the `install_errored_*` helper invoked from
     /// `RowStream`'s Drop impl).
     #[inline]
@@ -3170,7 +3170,7 @@ impl PgProtocol<ActivePhase> {
     ///   Diagnostic value for operators.
     /// - **Zeroize-on-drop via stack guard**: A naive shape would
     ///   keep the secret-scrub mechanism on a long-lived
-    ///   Sensitive<i32> field — tier-1 by-Drop-fire, suppressible
+    ///   Sensitive`<i32>` field — tier-1 by-Drop-fire, suppressible
     ///   by mem::forget / Box::leak / ManuallyDrop. Instead the
     ///   stack-local Zeroizing guard is tier-1 by-closure-scope,
     ///   with retention structurally impossible.
@@ -3291,7 +3291,7 @@ impl PgProtocol<ActivePhase> {
     /// `K: ReplyKind` — the typed reply-kind tag bound to the command
     /// being pushed. Caller writes `proto.next_reply_id::<PingKind>()`
     /// for a Ping reply, etc. The kind binds the payload type via
-    /// [`crate::ReplyKind::Payload`] — passing the wrong kind to a
+    /// `crate::ReplyKind::Payload` — passing the wrong kind to a
     /// command's `reply` field is a type error.
     ///
     /// # Counter behaviour
@@ -3306,7 +3306,7 @@ impl PgProtocol<ActivePhase> {
     ///
     /// # Tier-1 by-construction: single shared atomic
     ///
-    /// Delegates to [`ActiveInner::next_reply_id`] which mints from
+    /// Delegates to `ActiveInner::next_reply_id` which mints from
     /// the shared `PROCESS_REPLY_ID_COUNTER` static (process-global
     /// uniqueness across all four phases). A naive shape would
     /// maintain a SEPARATE local `static COUNTER` on this
@@ -3465,7 +3465,7 @@ impl PgProtocol<ActivePhase> {
     ///
     /// # Tier-1 closure
     ///
-    /// Dispatches on [`crate::state::ProtoState::push_class`] (5-variant
+    /// Dispatches on `crate::state::ProtoState::push_class` (5-variant
     /// exhaustive classifier). Adding a new state variant is a build
     /// failure that forces classification (transitive: state → push_class
     /// → as_ready). Pinned by the guard-closure spec test suite.
@@ -3490,7 +3490,7 @@ impl PgProtocol<ActivePhase> {
 
     /// Caller-facing fine-grained connection state classification.
     ///
-    /// Maps the internal [`crate::state::StatePushClass`] to the
+    /// Maps the internal `crate::state::StatePushClass` to the
     /// public-API [`crate::guard::ConnectionStatus`] (`PingAwaiting` and
     /// `BusyQuery` collapse to `Busy` — caller recovery is identical:
     /// drive `feed_bytes` until the in-flight reply arrives).
@@ -3575,7 +3575,7 @@ impl PgProtocol<ActivePhase> {
         write_buf.clear();
 
         // The Idle precondition is enforced by
-        // [`crate::state_setter::IdleState::try_from`] below — the
+        // `crate::state_setter::IdleState::try_from` below — the
         // `Option<IdleState<'_>>` typestate IS the proof. The
         // legitimate caller is `ReadyGuard::push_command` (which
         // performs `as_ready` Idle classification upstream); this
@@ -3946,37 +3946,37 @@ impl PgProtocol<ActivePhase> {
     /// concurrent in-flight replies may resolve in one cycle and the
     /// caller wants explicit event-by-event control).
     ///
-    /// The implementation reuses [`Self::feed_bytes_bounded`] with
+    /// The implementation reuses `Self::feed_bytes_bounded` with
     /// `max_dispatches = 1` and an empty byte slice — single source
     /// of truth for dispatch is preserved.
     ///
     /// # Returned event mapping
     ///
-    /// - `state == Idle`, read_buf empty → [`FeedEvent::Idle`]
-    /// - `state` in row-streaming → [`FeedEvent::StreamingRows`]
+    /// - `state == Idle`, read_buf empty → `FeedEvent::Idle`
+    /// - `state` in row-streaming → `FeedEvent::StreamingRows`
     ///   (caller switches to [`Self::iter_rows`] for per-row decoding)
-    /// - `state == Errored(_)` → [`FeedEvent::Close`]
+    /// - `state == Errored(_)` → `FeedEvent::Close`
     /// - read_buf has partial frame, or empty in non-Idle non-streaming
-    ///   non-Errored state → [`FeedEvent::NeedMoreBytes`]
+    ///   non-Errored state → `FeedEvent::NeedMoreBytes`
     /// - One actionable frame consumed:
-    ///   - `Action::SendBytes(b)` → [`FeedEvent::SendBytes(b)`]
+    ///   - `Action::SendBytes(b)` → `FeedEvent::SendBytes(b)`
     ///   - `Action::DeliverReply { id, value }` → [`FeedEvent::Deliver(id, value)`]
     ///   - `Action::FailReply { id, cause }` (paired with implicit
     ///     `Action::CloseSocket`) → [`FeedEvent::Fail(id, cause)`]
     ///   - `Action::CloseSocket` alone (no in-flight reply id) →
-    ///     [`FeedEvent::Close`]
+    ///     `FeedEvent::Close`
     ///
     /// # Lifetime contract
     ///
     /// `FeedEvent<'wb>` carries two lifetimes:
-    ///   - `'wb` ties [`FeedEvent::SendBytes`] to the caller's `write_buf`.
-    ///   - `'r` ties [`FeedEvent::Deliver`]'s `Reply<'r>` to the
+    ///   - `'wb` ties `FeedEvent::SendBytes` to the caller's `write_buf`.
+    ///   - `'r` ties `FeedEvent::Deliver`'s `Reply<'r>` to the
     ///     `&'r mut self` borrow of this protocol.
     ///
     /// # `wb` lifecycle
     ///
     /// `advance_one_frame` calls `wb.clear()` at entry (mirroring
-    /// `feed_bytes` semantics). A [`FeedEvent::SendBytes`] slice is
+    /// `feed_bytes` semantics). A `FeedEvent::SendBytes` slice is
     /// valid until the next `&mut wb` call (typically the next
     /// `advance_one_frame` iteration). Caller MUST drain the slice
     /// to the socket before re-borrowing `wb`.
@@ -4007,7 +4007,7 @@ impl PgProtocol<ActivePhase> {
     /// subsequent `&mut self` calls (and thus the next `feed_bytes`)
     /// until `OutActions` drops.
     ///
-    /// [`push_command`]: Self::push_command
+    /// [`push_command`]: crate::push_command
     #[must_use = "the returned actions carry side-effects that must be executed"]
     pub fn feed_bytes<'w>(
         &mut self,
@@ -5347,9 +5347,9 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
 /// **Active-specific fast paths**:
 /// - `ActiveState::SimpleQueryStreamingRows { .. }` or
 ///   `ActiveState::BindExecuteStreamingRows { .. }` →
-///   [`FeedEvent::StreamingRows`].
-/// - `ActiveState::Errored(_)` → [`FeedEvent::Close`].
-/// - `ActiveState::Idle` + empty `read_buf` → [`FeedEvent::Idle`].
+///   `FeedEvent::StreamingRows`.
+/// - `ActiveState::Errored(_)` → `FeedEvent::Close`.
+/// - `ActiveState::Idle` + empty `read_buf` → `FeedEvent::Idle`.
 ///
 /// All other Active variants delegate to
 /// [`feed_bytes_dispatch_active::<true>`] with
@@ -5400,9 +5400,9 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_active<'w, 'r>(
 ///
 /// **Connecting-specific fast paths**:
 /// - No `StreamingRows` equivalent in `ConnectingState`.
-/// - `ConnectingState::Errored(_)` → [`FeedEvent::Close`].
+/// - `ConnectingState::Errored(_)` → `FeedEvent::Close`.
 /// - `ConnectingState::HandshakeReady` + empty `read_buf` →
-///   [`FeedEvent::Idle`] (HandshakeReady is the per-phase
+///   `FeedEvent::Idle` (HandshakeReady is the per-phase
 ///   representation of post-handshake Idle, with the caller-visible
 ///   expectation that the next user action is `into_active()`).
 ///
@@ -6002,7 +6002,7 @@ impl PgProtocol<ActivePhase> {
     ///
     /// - [`crate::write_buf::WriteBufFull`] if `wb` cannot fit 5 more
     ///   bytes. `self` is consumed regardless (the protocol intent is
-    ///   "close this thing"); the caller has the [`WriteBufFull`]
+    ///   "close this thing"); the caller has the `WriteBufFull`
     ///   error and is expected to drop the socket.
     ///
     /// # Tier-1 closure on post-terminate API
@@ -6506,7 +6506,7 @@ impl PgProtocol<ActivePhase> {
 
 
     /// Partial-mode entry point routed through the leaf-gated
-    /// [`crate::buf::ReadBuf::enter_partial_mode`] accepting a
+    /// `crate::buf::ReadBuf::enter_partial_mode` accepting a
     /// `&PartialFrameToken`. The token mint is gated to
     /// `crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher`,
     /// itself `pub(in crate::row_stream)` — so this entry point is
@@ -7210,7 +7210,7 @@ fn fail_inflight_no_readbuf(
 /// command and current [`ProtoState`] *by value*, it produces the new
 /// state and a bounded [`OutActions`] list. No `&mut PgProtocol` — the
 /// only mutation the caller needs is the single `self.inner.state = new_state`
-/// assignment in [`PgProtocol::push_command`].
+/// assignment in `PgProtocol::push_command`.
 ///
 /// Why pure:
 /// - **Testability.** Unit tests call `compute_push` directly with a
@@ -9654,7 +9654,7 @@ mod compute_push_tests {
         }
     }
 
-    /// Test-only observation of a [`StagedAction`] — brand
+    /// Test-only observation of a `StagedAction` — brand
     /// stripped, range carried as `NonEmptyRange`. Tests compare
     /// against this instead of `StagedAction` directly because
     /// `'wb` is HRTB-fresh per call site and cannot be named

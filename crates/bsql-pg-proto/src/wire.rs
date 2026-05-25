@@ -47,7 +47,7 @@ impl InboundTag {
 /// A PostgreSQL wire tag sent to the server (frontend → backend).
 ///
 /// Mirror of [`InboundTag`] for the outbound direction. Used by the
-/// protocol's frame builders ([`crate::PgProtocol::push_command`]
+/// protocol's frame builders (`crate::PgProtocol::push_command`
 /// paths). Users never construct `OutboundTag` instances directly —
 /// they reference the named constants ([`TAG_QUERY`], [`TAG_SYNC`],
 /// etc.).
@@ -580,13 +580,13 @@ pub const FLUSH_WIRE_BYTES: [u8; 5] = [TAG_FLUSH.byte(), 0, 0, 0, 4];
 ///
 /// `Terminate` carries no body — the entire wire form is the
 /// 5-byte literal [`TERMINATE_WIRE_BYTES`] below. Same shape as
-/// [`SYNC_WIRE_BYTES`] — tag + length-field of 4 (length includes
+/// `SYNC_WIRE_BYTES` — tag + length-field of 4 (length includes
 /// itself, no payload).
 pub const TAG_TERMINATE: OutboundTag = OutboundTag::from_byte(b'X');
 
 /// The complete `Terminate` frame on the wire.
 ///
-/// Static byte literal. Mirrors [`SYNC_WIRE_BYTES`]: 5-byte body =
+/// Static byte literal. Mirrors `SYNC_WIRE_BYTES`: 5-byte body =
 /// tag (`'X'`) + 4-byte length-field (BE u32 = 4, length includes
 /// itself but excludes tag).
 ///
@@ -872,7 +872,7 @@ pub const PROTOCOL_VERSION_3_0: u32 = 196608;
 /// SSLRequest packet that tells PG "I want to negotiate SSL/TLS
 /// before sending the actual StartupMessage". PG §55.10
 /// "SSL Session Encryption". The companion code
-/// [`GSSENC_REQUEST_VERSION`] (80877104) is the GSS encryption
+/// `GSSENC_REQUEST_VERSION` (80877104) is the GSS encryption
 /// counterpart (not yet supported in this crate).
 ///
 /// Composed of (1234 << 16) | 5679 — PG's standard "magic-version"
@@ -1265,7 +1265,7 @@ const _: () = assert!(
 /// # Why a function, not a static const
 ///
 /// Unlike [`SSL_REQUEST_WIRE_BYTES`] / [`TERMINATE_WIRE_BYTES`] /
-/// [`SYNC_WIRE_BYTES`] (parameterless and thus encodable as
+/// `SYNC_WIRE_BYTES` (parameterless and thus encodable as
 /// `pub const` arrays), CancelRequest carries dynamic per-
 /// connection payload. A const can't capture the runtime values;
 /// the `const fn` form materialises the bytes at every call site,
