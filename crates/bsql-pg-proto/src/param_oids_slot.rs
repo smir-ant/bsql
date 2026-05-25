@@ -78,7 +78,7 @@
 //! lifetime on OLTP workloads). Saves ~64 B per active connection in
 //! the no-Describe steady state.
 //!
-//! The DEF-282 lesson (per
+//! The lesson (per
 //! [[feedback_box_state_outliers]] / [[bsql_perf_measurement]]):
 //! Pareto frontier favours Box-reuse for state outliers even at 68 B —
 //! the cancel_credentials bench showed −30.95% from the same boxing

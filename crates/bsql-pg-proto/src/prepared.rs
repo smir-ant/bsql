@@ -496,8 +496,8 @@ where
 ///     PreparedMacroSeal(());` re-export is reachable by hand-written
 ///     user code too — friction-based deflection, not type-safe
 ///     enforcement. Same effective tier as the current `pub fn`.
-///   - Phase B (compile-time `(file!(), line!(), column!())`
-///     fingerprint as a const-generic str triple) requires unstable
+///   - Compile-time `(file!(), line!(), column!())` fingerprint as
+///     a const-generic str triple — requires unstable
 ///     `feature(adt_const_params)` / unstable const-generic strings.
 ///     Off-table for stable v1.0.
 ///   - `macro_rules!` `$crate::` does NOT grant cross-crate access

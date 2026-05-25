@@ -647,9 +647,19 @@ impl<'p, 'w> RowStream<'p, 'w> {
         if self.drained {
             return ColEvent::NeedMore;
         }
-        // Fused classification: one match on state observes (Errored
-        // / Streaming / Other) + returns the streaming reply id by
-        // value (Copy NonZeroU64).
+
+        // Mid-row fast path: state cannot change between col_next
+        // calls within the same row (no feed_bytes interleaved), so
+        // classify + flush + cached_id extraction are invariant.
+        // Skip them entirely — 9/10 calls on a 10-column row.
+        if let Some(progress) = self.row_progress {
+            if progress.in_chunked_col() {
+                return self.emit_next_chunk(progress);
+            }
+            return self.emit_next_col(progress);
+        }
+
+        // Not mid-row — full classify.
         let class = self.proto.classify_for_iter_rows();
         if matches!(class, crate::protocol::IterRowsClass::Errored) {
             self.drained = true;
@@ -730,19 +740,6 @@ impl<'p, 'w> RowStream<'p, 'w> {
                 return ColEvent::NeedMore;
             }
         };
-
-        // If we are mid-row in a chunked column, continue emitting
-        // chunks before parsing any new header.
-        if let Some(progress) = self.row_progress {
-            if progress.in_chunked_col() {
-                return self.emit_next_chunk(progress);
-            }
-            // Mid-row but not in a chunked col — we just finished
-            // emitting EndRow or are between columns inside a body
-            // that's fully buffered. Continue per-column emission
-            // from the current cursor.
-            return self.emit_next_col(progress);
-        }
 
         // Between rows — peek next frame header to decide path.
         self.dispatch_next_frame(cached_id)
@@ -1115,7 +1112,8 @@ impl<'p, 'w> RowStream<'p, 'w> {
         if self.proto.read_buf_advance(4).is_err() {
             return self.terminal_internal_advance_err();
         }
-        if self.proto.is_in_partial_mode_for_row_stream() {
+        let is_partial = self.proto.is_in_partial_mode_for_row_stream();
+        if is_partial {
             let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
             if self.proto.subtract_partial_for_row_stream(&token, 4).is_err() {
                 return self.terminal_internal_advance_err();
@@ -1152,7 +1150,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             if self.proto.read_buf_advance(col_len_usize).is_err() {
                 return self.terminal_internal_advance_err();
             }
-            if self.proto.is_in_partial_mode_for_row_stream() {
+            if is_partial {
                 let token = crate::row_stream::_row_stream_partial_leaf::mint_for_row_stream_dispatcher();
                 if self
                     .proto
@@ -1168,7 +1166,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
 
             // Body-slice projection — two-phase shield.
             //
-            // Phase 1 (uses `populated.len()` as a copy so the borrow
+ // (uses `populated.len()` as a copy so the borrow
             // is released before any `&mut self` call): if the slice
             // end exceeds the populated region OR `bytes_offset` +
             // `col_len_usize` underflowed `slice_end` (architecturally
@@ -1181,7 +1179,7 @@ impl<'p, 'w> RowStream<'p, 'w> {
             // populated borrow across the else arm — NLL rejects
             // (E0502).
             //
-            // Phase 2: project the slice. After Phase 1's classified
+            // project the slice. After the classified
             // shield, `slice_end <= populated.len()` and `bytes_offset
             // <= slice_end` hold — the None arm of `get(...)` is
             // architecturally unreachable; the `unwrap_or(&[])`
@@ -1237,9 +1235,8 @@ impl<'p, 'w> RowStream<'p, 'w> {
         // Two-phase shield mirroring the Got-arm projection above —
         // `let-else` would tie `bytes`'s lifetime to the populated
         // borrow across the `else` arm (NLL rejects E0502 because
-        // `terminal_internal_advance_err` takes `&mut self`). Phase 1
-        // pre-checks bounds via a len-copy + classified terminal;
-        // Phase 2's `unwrap_or(&[])` is the forbid-bundle-compliant
+ // `terminal_internal_advance_err` takes `&mut self`).         // pre-checks bounds via a len-copy + classified terminal;
+            // `unwrap_or(&[])` is the forbid-bundle-compliant
         // landing pad on a structurally-dead None.
         // `read_buf_advance(chunk_len)` succeeded above ⇒
         // `bytes_offset + chunk_len <= populated.len()`.
@@ -1352,14 +1349,14 @@ impl<'p, 'w> RowStream<'p, 'w> {
     /// (`EndQuery`) or `NeedMore` (silent state transition).
     #[inline]
     fn slow_path_once(&mut self, cached_id: Option<NonZeroU64>) -> ColEvent<'_> {
-        // DEF-286 Φ-I.b: classify the first action eagerly into
+ // .b: classify the first action eagerly into
         // a Copy enum that strips the `'r` borrow. This releases
         // `actions`'s mut borrow on `self.proto` (NLL closes at the
         // last use of `first_class`), allowing the FailReply arm to
         // call `self.proto.fail_cause()` (immutable borrow) for the
         // externalised cause.
         //
-        // Post-Φ-F* Reply<'r> is phantom-only `'r`; its variant data
+ // Post-Reply<'r> is phantom-only `'r`; its variant data
         // is queried via accessors. Reply is Copy so we can detach.
         let actions = self.proto.feed_bytes_bounded(&[], self.write_buf, 1);
         let first_class: SlowPathFirst = match actions.as_slice().first() {

@@ -213,7 +213,7 @@ pub(crate) const PREFIX_CAP: usize = 8192;
 // `PREFIX_CAP` must comfortably hold the worst-case `parse_error_response`
 // inline-output ceiling.
 //
-// **Const-derived floor (DEF-248 Sub-B follow-up)**: previously this
+// **Const-derived floor (Sub-B follow-up)**: previously this
 // pin used a hand-derived `5 * 1024` literal explained in the comment
 // only. The follow-up — promoting `MAX_ERROR_FIELDS` +
 // `MAX_ERROR_RESPONSE_FIELD_BYTES` + `ERROR_FIELD_FRAMING_OVERHEAD`

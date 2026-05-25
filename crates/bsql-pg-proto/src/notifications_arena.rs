@@ -1,5 +1,5 @@
 //! Multi-slot arena for `NotificationResponse` (`'A'`) payloads — PG
-//! §55.7 LISTEN/NOTIFY surface (DEF-220).
+//! §55.7 LISTEN/NOTIFY surface ().
 //!
 //! # Why an arena
 //!

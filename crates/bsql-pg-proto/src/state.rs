@@ -18,12 +18,12 @@
 //! (no action, no state change — post-`CloseSocket` packet flushes
 //! become true no-ops instead of silent mis-advances).
 
-// DEF-286 Φ1 removed the `param_oids: Box<ParamOids>` fields from
+// removed the `param_oids: Box<ParamOids>` fields from
 // DescribeStatement state variants — slot-pattern lift to
 // `<ActivePhase>::Extras.param_oids`. Production state.rs no
 // longer references `ParamOids`; tests use the fully-qualified
 // `crate::action::ParamOids` path where needed.
-// DEF-286 Φ3: `BoundedStr` no longer needed — production variants
+// : `BoundedStr` no longer needed — production variants
 // don't carry the inline `command_tag` field (slot pattern via
 // `crate::command_tag_slot::CommandTagSlotCell`). Test cfg blocks
 // that need it use the fully-qualified path.
@@ -103,7 +103,7 @@ pub enum ProtoState {
     ///   compile time.
     ///
     /// The Trust/Scram split moves discrimination to
-    /// `crate::PgProtocol::push_command`. Each variant only carries
+    /// [`crate::PgProtocol::push_command`]. Each variant only carries
     /// what its authentication path needs. A server frame of the
     /// wrong shape for the connection's credential type becomes a
     /// per-variant dispatcher arm — a missed arm is a build failure.
@@ -177,7 +177,7 @@ pub enum ProtoState {
     /// the `StartupMessage` and is otherwise not retained by the
     /// state machine; it stays bundled with the password until the
     /// handshake completes. Both live inside one
-    /// `Md5HandshakeState` struct, heap-boxed once, mirroring the
+    /// [`Md5HandshakeState`] struct, heap-boxed once, mirroring the
     /// SCRAM single-Box pattern. Per-handshake total: 1 alloc
     /// (StartupMd5 construction) + 1 free (PasswordMessage dispatch
     /// transition).
@@ -201,7 +201,7 @@ pub enum ProtoState {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
         /// Bundled handshake state — username + password. See
-        /// `Md5HandshakeState` for fields. The Box is dropped on
+        /// [`Md5HandshakeState`] for fields. The Box is dropped on
         /// every transition path, firing the ZeroizeOnDrop chain.
         handshake: alloc::boxed::Box<crate::md5::Md5HandshakeState>,
     },
@@ -324,7 +324,7 @@ pub enum ProtoState {
         /// Correlator for the Startup command.
         reply: ReplyId<StartupKind>,
         /// Expected server signature for constant-time comparison.
- /// Box-backed (follow-up): 32-B inline SecretDigest
+        /// Box-backed (follow-up): 32-B inline SecretDigest
         /// dominates ConnectingState at 48 B. Boxing → 8 B pointer
         /// → ConnectingState max-variant drops to 23 B → state 48→24 B
         /// (−50 %). One alloc per SCRAM handshake (once per conn),
@@ -456,15 +456,16 @@ pub enum ProtoState {
         reply: ReplyId<QueryKind>,
     },
 
- /// COPY OUT streaming. Server sent `CopyOutResponse`
+    /// COPY OUT streaming. Server sent `CopyOutResponse`
     /// (`'H'`); now receiving zero or more `CopyData` (`'d'`) frames
     /// from server. Transitions:
-    /// - `CopyData` → stay here (emits `Action::CopyDataChunk`).
+    /// - `CopyData` → stay here (emits
+    ///   `Action::CopyDataChunk`; stays silent).
     /// - `CopyDone` → [`Self::SimpleQueryCopyOutAwaitingCC`].
     /// - `ErrorResponse` → [`Self::DrainRfqAfterError`].
     SimpleQueryCopyOutStreaming(ReplyId<QueryKind>),
 
- /// COPY OUT post-CopyDone. Server has sent the final
+    /// COPY OUT post-CopyDone. Server has sent the final
     /// `CopyDone` (`'c'`); now awaiting `CommandComplete` followed
     /// by `ReadyForQuery`. Transitions:
     /// - `CommandComplete` → [`Self::SimpleQueryAwaitingRfq`] with
@@ -472,9 +473,9 @@ pub enum ProtoState {
     /// - `ErrorResponse` → [`Self::DrainRfqAfterError`].
     SimpleQueryCopyOutAwaitingCC(ReplyId<QueryKind>),
 
- /// COPY IN active. Server sent `CopyInResponse`
+    /// COPY IN active. Server sent `CopyInResponse`
     /// (`'G'`); caller now pushes `CopyData` (`'d'`) bytes via the
- /// `PushCopyData` push command, then `CopyDone`
+    /// `PushCopyData` push command, then `CopyDone`
     /// (`'c'`) or `CopyFail` (`'f'`). Server transitions to
     /// `CommandComplete` once it observes the client's `CopyDone`.
     ///
@@ -510,13 +511,13 @@ pub enum ProtoState {
     SimpleQueryAwaitingRfq {
         /// Correlator for the in-flight query.
         ///
- /// Φ3: `command_tag` field removed — slot pattern
-        /// via `crate::command_tag_slot::CommandTagSlotCell` on
+        /// : `command_tag` field removed — slot pattern
+        /// via [`crate::command_tag_slot::CommandTagSlotCell`] on
         /// `<ActivePhase>::Extras.command_tag`. The `'C'` dispatch
         /// arm parses the tag and parks the boxed
         /// [`crate::command_tag::CommandTag`] into the slot;
         /// materialise reads via `as_ref()` at the trailing `'Z'`.
- /// Multi-statement (): each subsequent `'C'`
+        /// Multi-statement (): each subsequent `'C'`
         /// overwrites the slot (latest-wins).
         reply: ReplyId<QueryKind>,
     },
@@ -601,8 +602,8 @@ pub enum ProtoState {
     BindExecuteAwaitingRfqDml {
         /// Correlator for the in-flight command.
         ///
- /// Φ3: `command_tag` field removed — slot pattern
-        /// via `crate::command_tag_slot::CommandTagSlotCell`.
+        /// : `command_tag` field removed — slot pattern
+        /// via [`crate::command_tag_slot::CommandTagSlotCell`].
         reply: ReplyId<QueryKind>,
     },
 
@@ -642,8 +643,8 @@ pub enum ProtoState {
     BindExecuteAwaitingRfqSelect {
         /// Correlator for the in-flight command.
         ///
- /// Φ3: `command_tag` field removed — slot pattern
-        /// via `crate::command_tag_slot::CommandTagSlotCell`.
+        /// : `command_tag` field removed — slot pattern
+        /// via [`crate::command_tag_slot::CommandTagSlotCell`].
         reply: ReplyId<QueryKind>,
     },
 
@@ -714,22 +715,22 @@ pub enum ProtoState {
     /// `ParameterDescription` parsed; awaiting either
     /// `RowDescription` (`'T'`) or `NoData` (`'n'`).
     ///
-    /// Schema branch: `'T'` → `DescribedRows::Rows(desc)`; continue
+    /// Schema branch: `'T'` → [`DescribedRows::Rows(desc)`]; continue
     /// to [`Self::DescribeStatementAwaitingRfq`].
-    /// No-data branch: `'n'` → `DescribedRows::NoData`; continue
+    /// No-data branch: `'n'` → [`DescribedRows::NoData`]; continue
     /// to [`Self::DescribeStatementAwaitingRfq`].
     ///
- /// # `param_oids` lives in the slot (Φ1)
+    /// # `param_oids` lives in the slot ()
     ///
- /// Pre-(and post-), this variant carried
+    /// Pre-(and post-), this variant carried
     /// `param_oids: Box<ParamOids>` inline — the box moved across
     /// the `AwaitingRowDescOrNoData → AwaitingRfq` transition by
     /// pointer copy-move, then deref-inlined into
     /// `StagedDescribeStatementCompletePayload.param_oids:
     /// ParamOids` at the trailing `'Z'`.
     ///
- /// Φ1 lifted the box to
-    /// `crate::param_oids_slot::ParamOidsSlotCell` on
+    /// lifted the box to
+    /// [`crate::param_oids_slot::ParamOidsSlotCell`] on
     /// `<ActivePhase>::Extras` — mirror of the `row_desc_slot`
     /// pattern. Net effect:
     ///
@@ -751,7 +752,7 @@ pub enum ProtoState {
     DescribeStatementAwaitingRowDescOrNoData {
         /// Correlator for the Describe command. The associated
         /// `ParamOids` lives in
-        /// `crate::param_oids_slot::ParamOidsSlotCell` on the
+        /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the
         /// outer Extras (parked at the `'t'` dispatch arm).
         reply: ReplyId<DescribeStatementKind>,
     },
@@ -779,11 +780,11 @@ pub enum ProtoState {
     /// **Tier-1 by-construction**: the slot equals itself (identity,
     /// not discipline).
     ///
- /// # `param_oids` lives in the slot (Φ1)
+    /// # `param_oids` lives in the slot ()
     ///
     /// See [`Self::DescribeStatementAwaitingRowDescOrNoData`] for
     /// the full slot-pattern rationale — `param_oids` now lives in
-    /// `crate::param_oids_slot::ParamOidsSlotCell` on the outer
+    /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the outer
     /// Extras, not inline on this variant. The transition
     /// `AwaitingRowDescOrNoData → AwaitingRfq` is now a pure
     /// state-discriminant flip (no Box move, since the slot already
@@ -791,7 +792,7 @@ pub enum ProtoState {
     DescribeStatementAwaitingRfq {
         /// Correlator for the Describe command. The associated
         /// `ParamOids` lives in
-        /// `crate::param_oids_slot::ParamOidsSlotCell` on the
+        /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the
         /// outer Extras (parked at the `'t'` dispatch arm of the
         /// prior `DescribeStatementAwaitingParamDesc` state).
         reply: ReplyId<DescribeStatementKind>,
@@ -1115,7 +1116,7 @@ impl ProtoState {
 /// state-as-data invariant exists to prevent (reforge.md §7.2).
 /// Returning the original via `recovered` lets the caller either
 /// feed it back to the state slot or hand it to
-/// `ProtoState::take_inflight_reply_raw_id` to drain correlators
+/// [`ProtoState::take_inflight_reply_raw_id`] to drain correlators
 /// safely.
 #[non_exhaustive]
 pub struct WrongPhase {
@@ -1377,16 +1378,16 @@ pub enum ActiveState {
     SimpleQueryStreamingRows {
         reply: ReplyId<QueryKind>,
     },
- /// Mirror of [`ProtoState::SimpleQueryAwaitingRfq`]. Φ3:
+    /// Mirror of [`ProtoState::SimpleQueryAwaitingRfq`]. :
     /// `command_tag` lives in slot.
     SimpleQueryAwaitingRfq {
         reply: ReplyId<QueryKind>,
     },
- /// Mirror of [`ProtoState::SimpleQueryCopyOutStreaming`] ().
+    /// Mirror of [`ProtoState::SimpleQueryCopyOutStreaming`] ().
     SimpleQueryCopyOutStreaming(ReplyId<QueryKind>),
- /// Mirror of [`ProtoState::SimpleQueryCopyOutAwaitingCC`] ().
+    /// Mirror of [`ProtoState::SimpleQueryCopyOutAwaitingCC`] ().
     SimpleQueryCopyOutAwaitingCC(ReplyId<QueryKind>),
- /// Mirror of [`ProtoState::SimpleQueryCopyInActive`] ().
+    /// Mirror of [`ProtoState::SimpleQueryCopyInActive`] ().
     SimpleQueryCopyInActive(ReplyId<QueryKind>),
     /// Mirror of [`ProtoState::DrainRfqAfterError`].
     DrainRfqAfterError,
@@ -1398,7 +1399,7 @@ pub enum ActiveState {
     BindExecuteAwaitingBindCompleteDml(ReplyId<QueryKind>),
     /// Mirror of [`ProtoState::BindExecuteAwaitingCommandCompleteDml`].
     BindExecuteAwaitingCommandCompleteDml(ReplyId<QueryKind>),
- /// Mirror of [`ProtoState::BindExecuteAwaitingRfqDml`]. Φ3.
+    /// Mirror of [`ProtoState::BindExecuteAwaitingRfqDml`]. .
     BindExecuteAwaitingRfqDml {
         reply: ReplyId<QueryKind>,
     },
@@ -1425,16 +1426,16 @@ pub enum ActiveState {
     /// Mirror of [`ProtoState::DescribeStatementAwaitingParamDesc`].
     DescribeStatementAwaitingParamDesc(ReplyId<DescribeStatementKind>),
     /// Mirror of [`ProtoState::DescribeStatementAwaitingRowDescOrNoData`].
- /// Φ1: `param_oids` lives in
-    /// `crate::param_oids_slot::ParamOidsSlotCell` on the outer
+    /// : `param_oids` lives in
+    /// [`crate::param_oids_slot::ParamOidsSlotCell`] on the outer
     /// `<ActivePhase>::Extras` — variant carries only the bare
     /// `ReplyId<K>`.
     DescribeStatementAwaitingRowDescOrNoData {
         reply: ReplyId<DescribeStatementKind>,
     },
     /// Mirror of [`ProtoState::DescribeStatementAwaitingRfq`].
- /// Φ1: `param_oids` lives in the
-    /// `crate::param_oids_slot::ParamOidsSlotCell` (parked at the
+    /// : `param_oids` lives in the
+    /// [`crate::param_oids_slot::ParamOidsSlotCell`] (parked at the
     /// earlier `'t'` dispatch arm); variant carries only the bare
     /// `ReplyId<K>`.
     DescribeStatementAwaitingRfq {
@@ -1468,7 +1469,7 @@ impl From<ErroredState> for ProtoState {
 }
 
 impl From<ConnectingState> for ProtoState {
-    // DEF-285 perf-recovery: `#[inline(always)]` for the handshake
+    // perf-recovery: `#[inline(always)]` for the handshake
     // hot path (push_command/ping bench fixture). Same rationale as
     // the `From<ActiveState>` impl below — paired with the
     // `feed_bytes_dispatch_connecting` wrapper's inline annotation
@@ -1535,7 +1536,7 @@ impl From<ConnectingState> for ProtoState {
 }
 
 impl From<ActiveState> for ProtoState {
-    // DEF-285 perf-recovery: `#[inline(always)]` not just `#[inline]`.
+    // perf-recovery: `#[inline(always)]` not just `#[inline]`.
     // The hot-path `feed_bytes_dispatch_active` lift step calls this
     // per `advance_one_frame`; LLVM was emitting an out-of-line call
     // for the ~25-arm match. Pinning `inline(always)` lets the
@@ -1620,7 +1621,7 @@ impl From<ActiveState> for ProtoState {
 // ─── Per-phase classifier methods ───
 
 impl ConnectingState {
-    /// Mirror of `ProtoState::take_inflight_reply_raw_id` for the
+    /// Mirror of [`ProtoState::take_inflight_reply_raw_id`] for the
     /// per-phase enum. Consumes the variant's `ReplyId<K>` (if any)
     /// and returns its raw [`core::num::NonZeroU64`].
     ///
@@ -1684,7 +1685,7 @@ impl ConnectingState {
 
 /// Per-phase classifier surface for [`ActiveState`].
 impl ActiveState {
-    /// Per-phase mirror of `ProtoState::take_inflight_reply_raw_id`.
+    /// Per-phase mirror of [`ProtoState::take_inflight_reply_raw_id`].
     /// Exhaustive over every variant — adding a `ReplyId<K>`-carrying
     /// variant without routing it here fails the build.
     ///
@@ -1880,7 +1881,7 @@ impl TryFrom<ProtoState> for ErroredState {
 impl TryFrom<ProtoState> for ConnectingState {
     type Error = WrongPhase;
 
-    // DEF-285 perf-recovery: `#[inline(always)]` for the handshake
+    // perf-recovery: `#[inline(always)]` for the handshake
     // hot path. Paired with `feed_bytes_dispatch_connecting`'s inline.
     #[inline(always)]
     fn try_from(s: ProtoState) -> Result<Self, Self::Error> {
@@ -1940,7 +1941,7 @@ impl TryFrom<ProtoState> for ConnectingState {
 impl TryFrom<ProtoState> for ActiveState {
     type Error = WrongPhase;
 
-    // DEF-285 perf-recovery: `#[inline(always)]` for the same reason
+    // perf-recovery: `#[inline(always)]` for the same reason
     // as `From<ActiveState> for ProtoState` above — the `feed_bytes_dispatch_active`
     // lower step calls this per `advance_one_frame`. Pinning the
     // inline lets LLVM fuse the lower into the dispatch loop, paired
@@ -2036,8 +2037,8 @@ const _: () = assert!(
 );
 const _: () = assert!(
     core::mem::size_of::<ActiveState>() == 16,
-    "ActiveState exact size — 16 B post-DEF-286 Φ3 (was 48 B \
-     pre-Φ3 — **3× shrink**). The three AwaitingRfq variants \
+    "ActiveState exact size — 16 B post-(was 48 B \
+     pre-— **3× shrink**). The three AwaitingRfq variants \
      (SimpleQueryAwaitingRfq / BindExecuteAwaitingRfqDml / \
      BindExecuteAwaitingRfqSelect) dropped the inline \
      `command_tag: BoundedStr<32>` field (36 B savings each) — \

@@ -821,7 +821,7 @@ fn base64_decode_bounded(
 /// Generate a cryptographically random client nonce (18 bytes),
 /// base64-encoded.
 ///
-/// Uses `getrandom::getrandom` directly per DEF-META-01.
+/// Uses `getrandom::getrandom` directly — no hand-rolled entropy.
 ///
 /// # Test injection
 ///

@@ -250,7 +250,7 @@ pub use copy_chunks_arena::{CopyChunkPayload, CopyChunkRef};
 pub(crate) mod command_tags_arena;
 pub use command_tags_arena::CommandTagRef;
 pub(crate) mod tx_status_slot;
-// Tier-1 fail-cause slot externalisation (DEF-286 Φ-I.b). The slot
+// Tier-1 fail-cause slot externalisation (.b). The slot
 // holds the FailReply.cause across the action-emission window so
 // Action stays Copy and FailReply body collapses 32 → 8 B.
 pub(crate) mod fail_cause_slot;
@@ -291,8 +291,8 @@ pub(crate) mod schema_slot;
 // next Idle/Errored entry drops the box. On connections that never
 // run DescribeStatement, the 8 B niche slot stays None (zero heap).
 pub(crate) mod param_oids_slot;
-// DEF-286 Φ3: typed CommandTag enum + slot-pattern for parked
-// `CommandComplete` payload. Mirror of param_oids_slot (DEF-286 Φ1).
+// : typed CommandTag enum + slot-pattern for parked
+// `CommandComplete` payload. Mirror of param_oids_slot ().
 // `command_tag` module: typed `{Insert/Update/Delete/Select/Fetch/
 // Move/Copy {rows: u64}, Other(BoundedStr<32>)}` + wire parser.
 // `command_tag_slot` module: CommandTagSlotCell — Option<Box<CommandTag>>
@@ -625,11 +625,11 @@ const _: () = assert!(
 // pins where reproducible cross-platform.
 const _: () = assert!(
     core::mem::size_of::<error::ProtocolError>() == 24,
-    "ProtocolError exact size — 24 B post-DEF-286 Φ-B'' \
+    "ProtocolError exact size — 24 B post-\
      (SCRAM externalisation). ServerErrorResponse carries \
      `details_ref: ErrorRef` (8 B); ScramHandshakeFailure carries \
      `class: ScramFailureClass (8 B) + detail: Option<ErrorRef> (8 B)`. \
-     Pre-Φ-B'' shape was 72 B dominated by `Scram(ScramError)` whose \
+     Pre-shape was 72 B dominated by `Scram(ScramError)` whose \
      `ServerScramError` variant (carrying `message: BoundedStr<64>`) \
      was ~68 B inline. Externalisation into `ErrorPayload::Scram` \
      drops the dominator. Exact pin catches any variant growth / \
@@ -637,8 +637,8 @@ const _: () = assert!(
 );
 const _: () = assert!(
     core::mem::size_of::<action::Action<'static>>() == 24,
-    "Action<'_> exact size — 24 B post-DEF-286 Φ-I.b + Φ-F* \
-     (cumulative -70% vs pre-Φ1 80 B; -40% vs Φ-E 40 B). \
+    "Action<'_> exact size — 24 B post-.b + \
+     (cumulative -70% vs pre-80 B; -40% vs 40 B). \
      \
      **Floor proof** (measured via examples/sizes_probe; \
      verified via `-Zprint-type-sizes`): \
@@ -650,24 +650,24 @@ const _: () = assert!(
      - IntermediateCommandComplete / CopyDataChunk: 4 B body. \
      - CloseSocket: unit. \
      \
-     Outer disc: NonZeroU64 niche-encoding succeeds post-Φ-I.b — \
+     Outer disc: NonZeroU64 niche-encoding succeeds post-.b — \
      FailReply body shrunk to id-only (NonZeroU64), niche-search \
      finds a viable encoding. Total Action = body 24 B (no disc-slot \
      overhead — niche absorbs disc). \
      \
-     Cumulative DEF-286 cascade on Action: pre-Φ1 = 80 B → \
-     post-Φ-D = 40 B (−50 %) → post-Φ-I.b+Φ-F* = 24 B (−70 %). \
+     Cumulative cascade on Action: pre-= 80 B → \
+     post-= 40 B (−50 %) → post-.b+= 24 B (−70 %). \
      \
-     **NICHE OPTIMIZATION IS LOAD-BEARING** (DEF-260 MEASURED-REJECTED \
+     **NICHE OPTIMIZATION IS LOAD-BEARING** (MEASURED-REJECTED \
      2026-05-21): `#[repr(u8)]` would disable niche packing on \
      `id: NonZeroU64`. Default Rust repr is provably better — keep it.",
 );
 const _: () = assert!(
     core::mem::size_of::<action::Reply>() == 12,
-    "Reply exact pin — 12 B post-DEF-286 Φ-F* (payload externalisation \
+    "Reply exact pin — 12 B post-(payload externalisation \
      to slots on `<ActivePhase>::Extras`). \
      \
-     DEF-286 Φ-F*: `'r` lifetime parameter DROPPED. All payload \
+     : `'r` lifetime parameter DROPPED. All payload \
      structs (QueryCompletePayload, QuerySuspendedPayload, \
      DescribeStatementCompletePayload, DescribePortalCompletePayload) \
      are now unit ZSTs. Data fields (row_desc / param_oids / \
@@ -681,8 +681,8 @@ const _: () = assert!(
      Outer disc 1 B (9 variants ≤ u8); the disc fits in the body's \
      tail-pad (no extra slot). Total 12 B. \
      \
-     Pre-Φ-F* history: 80 B pre-Φ1 → 48 B post-Φ1 → 32 B post-Φ3 → \
-     24 B post-Φ-E → 12 B post-Φ-F* (full payload externalisation).",
+     Pre-history: 80 B pre-→ 48 B post-→ 32 B post-→ \
+     24 B post-→ 12 B post-(full payload externalisation).",
 );
 const _: () = assert!(
     core::mem::size_of::<reply_id::ReplyId<reply_id::PingKind>>() <= 24,
@@ -722,7 +722,7 @@ const _: () = assert!(
        Box (8 B) or SecretDigest (32 B) + ReplyId (8 B) + discriminant \
        → ~24–48 B. \
      - DescribeStatement* — ReplyId (8 B) + `Box<ParamOids>` (8 B) + \
-       discriminant → ~24 B (post-DEF-282 boxing). \
+       discriminant → ~24 B (post-boxing). \
      - Streaming variants — ReplyId (8 B) + discriminant → ~16 B. \
      \
      Per-row hot-path single state-projection retrieves just the \
@@ -802,22 +802,22 @@ const _: () = assert!(
 // on a quiet system (`load avg < 8`). On regression, investigate
 // (asm-diff, alternative shapes), do NOT roll back tier elevations.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 528,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 400,
     "PgProtocol size exact pin (aarch64-apple-darwin reference). \
      \
-     DEF-286 Φ-I.b: pin stays at 528 B post-Φ-I.b — the \
+     .b: pin stays at 528 B post-.b — the \
      FailCauseSlotCell (8 B `Option<Box<ProtocolError>>` niche-packed) \
      was added to ActiveExtras alongside the existing slot cells. \
      Net: connections without an in-flight failure pay the 8-byte \
      slot only; the lazy heap allocation fires on first \
      `install_errored` per error cycle. \
      \
-     Pre-DEF-286 history: DEF-220 grew 504 → 512 B \
-     (notifications_arena slot); DEF-282 boxed ParamOids \
+     Pre-history: grew 504 → 512 B \
+     (notifications_arena slot); boxed ParamOids \
      inline-into-state-variants (no PgProtocol size impact). \
-     DEF-286 Φ1 grew 512 → 520 B (ParamOidsSlotCell on Extras). \
-     DEF-286 Φ-E grew 520 → 528 B (TxStatusSlotCell on Extras; \
-     adds 1 B with 7 B alignment tail). DEF-286 Φ-I.b grew \
+     grew 512 → 520 B (ParamOidsSlotCell on Extras). \
+     grew 520 → 528 B (TxStatusSlotCell on Extras; \
+     adds 1 B with 7 B alignment tail). .b grew \
      ConnectingInner by 8 B (fail_cause slot on Inner, not Extras — \
      ConnectingPhase has `Extras = ()` and the slot must persist \
      across the wrapper return). Active phase pin stays 528 because \
@@ -838,7 +838,7 @@ const _: () = assert!(
 // Layout per phase is determined by the per-phase Inner:
 //   - DisconnectedPhase → DisconnectedInner (0 B, ZST)
 //   - ConnectingPhase  → ConnectingInner   (360 B; unchanged — no Describe variants in `<ConnectingPhase>`)
-//   - ActivePhase      → ActiveInner       (504 B; post-DEF-282)
+//   - ActivePhase      → ActiveInner       (504 B; post-)
 //   - ClosedPhase      → ClosedInner       (16 B)
 //
 // If any pin trips, either (a) PhantomData was rendered non-ZST
@@ -874,11 +874,11 @@ const _: () = assert!(
 // `ConnectingState` LHS writes it (Extras = ()). PgProtocol<P>
 // = Inner + Extras + ZST phase_marker.
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 344,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 216,
     "PgProtocol<ConnectingPhase> layout drift — must equal \
      ConnectingInner (state ConnectingState 48 B + read_buf 264 B + \
      4 cells × 8 B + 1 u32 + alignment) PLUS Extras = () (ZST) PLUS \
-     ZST phase_marker. DEF-286 Φ-I.b grew this pin 360 → 368 B by \
+     ZST phase_marker. .b grew this pin 360 → 368 B by \
      adding the FailCauseSlotCell to ConnectingInner (NOT to Extras \
      because Extras=() for ConnectingPhase; the slot must persist \
      across the wrapper return so callers can query `pg.fail_cause()` \
@@ -894,19 +894,18 @@ const _: () = assert!(
 // shared dispatch body.
 //
 // PgProtocol<ActivePhase> = ActiveInner + ActiveExtras + ZST
-// phase_marker; measured 528 B on aarch64-apple-darwin (post-DEF-286
-// Φ1 slot-pattern lift of `Box<ParamOids>` from state variants to
-// Extras slot; post-DEF-220 notifications_arena slot).
+// phase_marker; measured 528 B on aarch64-apple-darwin (post-// slot-pattern lift of `Box<ParamOids>` from state variants to
+// Extras slot; post-notifications_arena slot).
 const _: () = assert!(
-    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 528,
+    core::mem::size_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 400,
     "PgProtocol<ActivePhase> layout drift — must equal ActiveInner \
      PLUS Extras = ActiveExtras (RowDescSlotCell + ParamOidsSlotCell \
      + CommandTagSlotCell + TxStatusSlotCell + FailCauseSlotCell) \
      PLUS ZST phase_marker. \
      \
-     DEF-286 cascade: pre-Φ1 = 512 B → post-Φ1 = 520 B (+8 ParamOids \
-     slot) → post-Φ-E = 528 B (+8 TxStatus slot via 1 B + 7 B \
-     alignment) → post-Φ-I.b = 528 B (FailCauseSlotCell absorbed into \
+     cascade: pre-= 512 B → post-= 520 B (+8 ParamOids \
+     slot) → post-= 528 B (+8 TxStatus slot via 1 B + 7 B \
+     alignment) → post-.b = 528 B (FailCauseSlotCell absorbed into \
      existing alignment padding on ActiveExtras). If this trips, \
      audit `mod protocol::ActiveInner` / `mod protocol::ActiveExtras` \
      and the SealedPhase Extras = ActiveExtras mapping for ActivePhase.",
@@ -932,15 +931,15 @@ const _: () = assert!(
      was added/removed/reshaped on `ClosedInner`.",
 );
 
-// DispatchOutcome size pin — post-Φ-B'' bounded by `AdvancedWithAction(
+// DispatchOutcome size pin — post-bounded by `AdvancedWithAction(
 // StagedAction 40 B)`. Dispatch writes state directly via
 // `&mut ProtoState`, so DispatchOutcome carries only the
 // side-effect signal (StagedAction for WithAction, reply_id +
-// ProtocolError 24 B for Errored — pre-Φ-B'' ProtocolError was
+// ProtocolError 24 B for Errored — pre-ProtocolError was
 // 72 B; SCRAM externalisation collapses it).
 const _: () = assert!(
     core::mem::size_of::<dispatch::DispatchOutcome>() <= 48,
-    "DispatchOutcome size budget post-DEF-286 Φ-I.b+Φ-F*. \
+    "DispatchOutcome size budget post-.b+. \
      Cause still inline in DispatchOutcome::Errored \
      (cause-park happens at materialise time, not at dispatch return); \
      DispatchOutcome footprint dominated by Errored variant carrying \
@@ -953,15 +952,15 @@ const _: () = assert!(
 
 const _: () = assert!(
     core::mem::size_of::<action::OutActions<'static>>() == 224,
-    "OutActions<'_> exact size — 224 B post-DEF-286 Φ-I.b+Φ-F* \
+    "OutActions<'_> exact size — 224 B post-.b+\
      = 9 (MAX_ACTIONS_PER_CALL) × 24 (Action) + 8 (usize len). \
-     Cumulative DEF-286 cascade: pre-Φ1 = 728 B (9 × 80 + 8) → \
-     post-Φ-D = 368 B (9 × 40 + 8) → post-Φ-I.b+Φ-F* = 224 B \
+     Cumulative cascade: pre-= 728 B (9 × 80 + 8) → \
+     post-= 368 B (9 × 40 + 8) → post-.b+= 224 B \
      (9 × 24 + 8); −504 B per frame (-69 %). \
      \
      Cascade source: Action body shrunk 32 B → 16 B via FailReply \
-     cause externalisation (Φ-I.b) + Reply payload externalisation \
-     (Φ-F*) cascading into Action's DeliverReply body \
+     cause externalisation (.b) + Reply payload externalisation \
+     () cascading into Action's DeliverReply body \
      (value: Reply 24 → 12 → fits in id alignment).",
 );
 
@@ -971,20 +970,20 @@ const _: () = assert!(
 // make every byte change a contributor decision-point.
 // ---------------------------------------------------------------------
 
-// `PushFailure` exact size — 16 B (post-DEF-286 Φ2' Box<ProtocolError>;
-// independent of Φ-B'' since the cause is heap-indirected).
+// `PushFailure` exact size — 16 B (post-Box<ProtocolError>;
+// independent of since the cause is heap-indirected).
 //
 // Layout: NonZeroU64 (8 B, 8-aligned) + Box<ProtocolError> (8 B) =
 // 16 B total. Niche-packed: `Option<PushFailure>` is also 16 B
 // (NonZeroU64 niche absorbs the discriminant). PushFailure is the
 // ONLY structurally-Boxed cause across the action surface — Vec-
 // resident `Action::FailReply` keeps `cause: ProtocolError` inline
-// (Φ-B'' shrunk it to 24 B, no Box cascade required, Copy preserved
-// — Phase B regression class avoided).
+// (shrunk it to 24 B, no Box cascade required, Copy preserved
+// — blanket-Box regression class avoided).
 const _: () = assert!(
     core::mem::size_of::<action::PushFailure>() == 16,
-    "PushFailure exact size — 16 B post-DEF-286 Φ2' (was 80 B \
-     pre-Φ2': NonZeroU64 8 + ProtocolError 72 inline). Φ2' boxed \
+    "PushFailure exact size — 16 B post-(was 80 B \
+     pre-: NonZeroU64 8 + ProtocolError 72 inline). boxed \
      cause: NonZeroU64 8 + Box<ProtocolError> 8 = 16 B (-80%). \
      Cascade impact: Result<(), PushFailure> return frame on push \
      paths shrinks 64 B per call. \
@@ -996,7 +995,7 @@ const _: () = assert!(
 const _: () = assert!(
     core::mem::size_of::<Option<action::PushFailure>>() == 16,
     "Option<PushFailure> niche-pack — must stay 16 B via the NonZeroU64 \
-     niche on PushFailure.id (post-DEF-286 Φ2'). If this regresses, \
+     niche on PushFailure.id (post-). If this regresses, \
      the niche optimisation was lost — likely cause: a non-niche field \
      added to PushFailure that consumed the discriminant slot.",
 );
@@ -1014,21 +1013,21 @@ const _: () = assert!(
 // trip this.
 const _: () = assert!(
     core::mem::size_of::<action::FeedEvent<'static>>() == 24,
-    "FeedEvent<'wb> exact size — 24 B post-DEF-286 Φ-I.b+Φ-F*. \
+    "FeedEvent<'wb> exact size — 24 B post-.b+. \
      Max variant: Deliver(NonZeroU64 8, Reply 12) = 20 B body, \
      tail-pad to align 8 → 24 B. Disc niche-packed in NonZeroU64. \
-     Cumulative DEF-286 cascade: pre-Φ-B'' = 80 B → post-Φ-B''+Φ-D \
-     = 40 B → post-Φ-I.b+Φ-F* = 24 B (-70 % vs pre-Φ-B'', \
-     -40 % vs Φ-D). \
+     Cumulative cascade: pre-= 80 B → post-+\
+     = 40 B → post-.b+= 24 B (-70 % vs pre-, \
+     -40 % vs ). \
      \
-     Cascade source: (1) Φ-F* shrinks Reply 24 → 12 B (payload \
-     externalisation); (2) Φ-I.b strips cause from `FeedEvent::Fail`. \
+     Cascade source: (1) shrinks Reply 24 → 12 B (payload \
+     externalisation); (2) .b strips cause from `FeedEvent::Fail`. \
      Both reduce variant bodies; outer FeedEvent size collapses.",
 );
 const _: () = assert!(
     core::mem::size_of::<Option<action::FeedEvent<'static>>>() == 24,
     "Option<FeedEvent> niche-pack — must stay 24 B via the NonZeroU64 \
-     niche on Deliver.id / Fail.id. DEF-286 Φ-I.b+Φ-F* shrunk \
+     niche on Deliver.id / Fail.id. .b+shrunk \
      FeedEvent 40 → 24 B; the niche-encoding stays viable post-shrink.",
 );
 

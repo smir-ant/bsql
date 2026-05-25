@@ -1,5 +1,5 @@
 //! Multi-slot arena for `CopyData` ('d') chunk bytes — PG §55.2.6
-//! COPY OUT surface (DEF-219 Phase 3).
+//! COPY OUT surface .
 //!
 //! # Why an arena
 //!
@@ -12,7 +12,7 @@
 //! carries — Action stays `Copy`, arena holds the bytes.
 //!
 //! Mirror of [`crate::notifications_arena::NotificationsArena`]
-//! (DEF-220) — both arenas use the same multi-slot + gen-tagged
+//! () — both arenas use the same multi-slot + gen-tagged
 //! ref pattern.
 //!
 //! # Per-call cap

@@ -181,7 +181,7 @@ pub const TAG_NOTICE_RESPONSE: InboundTag = InboundTag::from_byte(b'N');
 pub const TAG_NOTIFICATION_RESPONSE: InboundTag = InboundTag::from_byte(b'A');
 
 // ---------------------------------------------------------------
-// COPY sub-protocol tags (DEF-219, PG §55.2.6)
+// COPY sub-protocol tags (, PG §55.2.6)
 // ---------------------------------------------------------------
 //
 // COPY toggles the connection into a bulk-transfer sub-protocol.
@@ -1481,7 +1481,7 @@ assert_all_distinct!(
     TAG_CLOSE_COMPLETE,
     TAG_PARAMETER_DESCRIPTION,
     TAG_PORTAL_SUSPENDED,
-    // COPY sub-protocol inbound tags (DEF-219):
+ // COPY sub-protocol inbound tags ():
     TAG_COPY_OUT_RESPONSE,
     TAG_COPY_IN_RESPONSE,
     TAG_COPY_DATA,
@@ -1503,7 +1503,7 @@ assert_all_distinct!(
     TAG_FLUSH,
     // Connection-teardown:
     TAG_TERMINATE,
-    // COPY IN sub-protocol outbound tags (DEF-219):
+ // COPY IN sub-protocol outbound tags ():
     TAG_COPY_DATA_OUTBOUND,
     TAG_COPY_DONE_OUTBOUND,
     TAG_COPY_FAIL_OUTBOUND,

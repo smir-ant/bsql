@@ -1,5 +1,5 @@
 //! Tier-1 within-crate `command_tag_slot` write provenance via
-//! concrete-token + Cell newtype. DEF-286 Φ3.
+//! concrete-token + Cell newtype.
 //!
 //! Mirror of `crate::param_oids_slot::ParamOidsSlotCell` /
 //! `crate::schema_slot::RowDescSlotCell`. The cell holds the
@@ -11,7 +11,7 @@
 //!    the wire-tag bytes via
 //!    [`crate::command_tag::parse_command_tag_bytes`], boxes the
 //!    result, and parks it.
-//! 2. Multi-statement (DEF-226): another `'C'` arrival overwrites
+//! 2. Multi-statement (): another `'C'` arrival overwrites
 //!    the slot. Latest-wins — the prior tag's
 //!    `IntermediateCommandComplete` action was already emitted
 //!    when the prior `'C'` fired (by-value copy from slot to

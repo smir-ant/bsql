@@ -1,5 +1,5 @@
 //! Tier-1 within-crate `tx_status_slot` write provenance via
-//! concrete-token + Cell newtype. DEF-286 Φ-E.
+//! concrete-token + Cell newtype. .
 //!
 //! Mirror of `crate::command_tag_slot::CommandTagSlotCell` /
 //! `crate::param_oids_slot::ParamOidsSlotCell` /

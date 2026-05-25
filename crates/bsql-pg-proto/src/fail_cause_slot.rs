@@ -1,9 +1,9 @@
 //! Tier-1 within-crate `fail_cause_slot` write provenance via
-//! concrete-token + Cell newtype. DEF-286 Φ-I.b.
+//! concrete-token + Cell newtype. .b.
 //!
-//! Mirror of `crate::command_tag_slot::CommandTagSlotCell` /
-//! `crate::param_oids_slot::ParamOidsSlotCell` /
-//! `crate::schema_slot::RowDescSlotCell` /
+//! Mirror of [`crate::command_tag_slot::CommandTagSlotCell`] /
+//! [`crate::param_oids_slot::ParamOidsSlotCell`] /
+//! [`crate::schema_slot::RowDescSlotCell`] /
 //! [`crate::tx_status_slot::TxStatusSlotCell`]. The cell holds the
 //! parsed [`crate::error::ProtocolError`] across the FailReply
 //! emission window — staged when the dispatch path calls
@@ -14,17 +14,17 @@
 //!
 //! # Why externalise the cause
 //!
-//! Pre-Φ-I.b shape:
+//! Pre-.b shape:
 //!
 //! ```text
 //! Action::FailReply { id: NonZeroU64, cause: ProtocolError }   // 32 B body
 //! ```
 //!
-//! `ProtocolError` is 24 B (post-Φ-B'' SCRAM externalisation). Inline
+//! `ProtocolError` is 24 B (post-SCRAM externalisation). Inline
 //! cause tied `FailReply` body to 32 B = id(8) + cause(24). Outer
 //! `Action` enum disc adds 8 B → Action = 40 B floor.
 //!
-//! Post-Φ-I.b:
+//! Post-.b:
 //!
 //! ```text
 //! Action::FailReply { id: NonZeroU64 }                          // 8 B body
@@ -32,7 +32,7 @@
 //! ```
 //!
 //! `FailReply` body collapses 32 → 8 B; with `DeliverReply` body
-//! shrinking via Φ-F* (Reply 24 → 16 B → body 24 → 16 B → 8+16 = 24 B),
+//! shrinking via (Reply 24 → 16 B → body 24 → 16 B → 8+16 = 24 B),
 //! the Action floor drops 40 → 24 B (-40%). Cascade through
 //! `OutActions` (9 × 40 → 9 × 24 + 8 = 224 B) = -39%.
 //!
@@ -48,11 +48,11 @@
 //!    [`crate::PgProtocol::fail_cause`].
 //! 3. Cleanup: the slot is NEVER cleared by a transition handler.
 //!    State Errored is terminal in `<ActivePhase>` (no Errored→Idle
-//!    path exists); the slot's Drop chain (`Option<Box<ProtocolError>>`'s
+//!    path exists); the slot's Drop chain (Option<Box<ProtocolError>>'s
 //!    niche-packed pointer → Box::drop on Some) runs at wrapper Drop
 //!    or at `into_closed_if_errored` when ActiveExtras drops.
 //!
-//! DEF-286 Φ-Final perf-recovery: the prior `clear_at_residue` site
+//! perf-recovery: the prior `clear_at_residue` site
 //! on the Idle arm of `clear_session_residue_for_class_dispatch` was
 //! provably dead (state cannot reach Idle once Errored), so it was
 //! removed alongside the slot's `clear_at_residue` method. This
@@ -71,7 +71,7 @@
 //!
 //! Niche-packed: `Box<T>`'s non-null pointer absorbs `Option`'s disc.
 //! Total footprint = 8 B (one pointer-width) regardless of
-//! `ProtocolError`'s size. Compare to inline ``Option<ProtocolError>``
+//! `ProtocolError`'s size. Compare to inline `Option<ProtocolError>`
 //! = 32 B (ProtocolError 24 + disc + padding). The slot's pointer
 //! indirection costs ~1 ns per fail-path lookup vs zero on the
 //! happy path. Lookup is cold; happy path is hot. Asymmetric cost
@@ -135,7 +135,7 @@ impl FailCauseSlotCell {
     }
 
     /// Park `cause` at the `install_errored` transition site. Token
- /// gated to `_install_errored_leaf::InstallErroredToken` ( /// .b). The leaf submodule lives in `dispatch.rs` because the
+    /// gated to `_install_errored_leaf::InstallErroredToken` (    /// .b). The leaf submodule lives in `dispatch.rs` because the
     /// `install_errored` helper is dispatch-scoped — token type lives
     /// alongside its mint site.
     ///
@@ -153,7 +153,7 @@ impl FailCauseSlotCell {
         self.inner = Some(cause);
     }
 
-    // DEF-286 Φ-Final perf-recovery: no `clear_at_residue` method.
+ // perf-recovery: no `clear_at_residue` method.
     // The slot is empty by construction whenever its containing
     // ActiveExtras / ConnectingInner sits in a state where the
     // dispatch's Idle arm could fire (proven: `<ActivePhase>` Idle
@@ -174,7 +174,7 @@ const _: () = assert!(
      Option<Box<ProtocolError>>; niche-packed via Box's non-null \
      pointer). If this grows, either (a) Box semantics changed \
      (architecturally impossible under stable Rust), or (b) a non-niche \
-     field crept in. The DEF-286 Φ-I.b footprint claim depends on \
+ field crept in. The.b footprint claim depends on \
      this 8-byte size: PgProtocol grows +8 B for the slot field; \
      Action's body collapses -24 B per FailReply variant.",
 );

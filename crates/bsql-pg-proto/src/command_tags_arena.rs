@@ -1,16 +1,16 @@
 //! Multi-slot arena for `IntermediateCommandComplete` command tags
-//! (DEF-286 Φ-D — DEF-226 multi-statement footprint cascade).
+//! (multi-statement footprint cascade).
 //!
 //! # Why an arena
 //!
 //! [`crate::Action::IntermediateCommandComplete`] is emitted by the
-//! DEF-226 multi-statement dispatch arms — each non-final
+//! multi-statement dispatch arms — each non-final
 //! `CommandComplete` / `RowDescription` / `EmptyQueryResponse` in a
 //! batched SimpleQuery (`"BEGIN; UPDATE; UPDATE; COMMIT;"`) emits
 //! one Action carrying the PRIOR statement's
 //! [`crate::command_tag::CommandTag`].
 //!
-//! Pre-Φ-D the variant carried `tag: CommandTag` inline (40 B). With
+//! Pre-the variant carried `tag: CommandTag` inline (40 B). With
 //! 9 OutActions slots, the inline payload set Action's variant floor
 //! at 48 B (`CommandTag 40 + explicit discriminant + alignment`) —
 //! CommandTag has no NonZeroU\* niche, so the outer enum disc could
@@ -207,7 +207,7 @@ impl Default for CommandTagsArena {
 // Size pin: CommandTagRef must stay ≤ 4 bytes — the niche-bearing
 // shape that lets Action::IntermediateCommandComplete collapse from
 // 40 B inline tag to a single arena handle. If this grows past 4 B,
-// the Φ-D footprint cascade silently regresses.
+// the footprint cascade silently regresses.
 const _: () = assert!(
     core::mem::size_of::<CommandTagRef>() == 4,
     "CommandTagRef exact size — 4 B (BoundedU8 slot + u16 generation + \

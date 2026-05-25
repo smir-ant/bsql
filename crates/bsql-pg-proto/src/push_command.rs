@@ -190,7 +190,7 @@ pub trait PushCommand: sealed::PushCommandSealed {
 //
 // Compare to former PgCommand enum: 2176 B (sized to Parse).
 //
-// Phase 2 (M) will add per-command `const CAP: usize` for SendList
+// (M) will add per-command `const CAP: usize` for SendList
 // sizing — enabling Ping's stack frame to shrink to 5 B SendList
 // instead of carrying 2176 B for unused capacity.
 // ═════════════════════════════════════════════════════════════════════

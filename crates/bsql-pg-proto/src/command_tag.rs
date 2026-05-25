@@ -4,7 +4,7 @@
 //!
 //! PostgreSQL's `CommandComplete` frame carries a NUL-terminated
 //! command tag string (e.g. `"INSERT 0 5"`, `"UPDATE 12"`,
-//! `"SELECT 100"`, `"DELETE 3"`). Pre-DEF-286 Φ3, this was stored
+//! `"SELECT 100"`, `"DELETE 3"`). Pre-, this was stored
 //! as a freeform `BoundedStr<32>` (36 B). The string format is
 //! well-defined per PG §55.2.6.10:
 //!
@@ -24,7 +24,7 @@
 //! Dominator is `Other(BoundedStr<32>)` at 36 B + disc + pad ≈ 40 B
 //! with default repr aligned to 8 (from `u64 rows`). Used inside a
 //! slot (`crate::command_tag_slot::CommandTagSlotCell`) mirror of
-//! `crate::param_oids_slot::ParamOidsSlotCell` (DEF-286 Φ1) — the
+//! `crate::param_oids_slot::ParamOidsSlotCell` — the
 //! slot stores `Option<Box<CommandTag>>` so state variants carry
 //! only the `ReplyId<K>` correlator.
 //!

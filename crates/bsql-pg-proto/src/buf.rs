@@ -81,7 +81,7 @@ pub struct ReadBufN<const N: usize> {
 /// - analytics queries with multi-KB JSON / TEXT cells
 /// - `iter_rows` benches feeding 100×row batch (~6700 B total)
 /// - large `RowDescription` (wide tables)
-const INLINE_BUF_CAP: usize = 256;
+const INLINE_BUF_CAP: usize = 128;
 
 impl<const N: usize> Default for ReadBufN<N> {
     fn default() -> Self {
@@ -119,7 +119,7 @@ impl<const N: usize> ReadBufN<N> {
     /// Returns [`ReadBufFull`] if the resulting length would exceed
     /// capacity even after reclaiming the consumed prefix.
     ///
- /// **Eager cursor-reset + lazy compact fallback ().**
+    /// **Eager cursor-reset + lazy compact fallback ().**
     /// When the buffer is fully consumed (`cursor == inner.len()`),
     /// zeroizes the consumed region and resets to empty before
     /// extending. The `extend_from_slice` then sees an empty buffer
@@ -128,7 +128,7 @@ impl<const N: usize> ReadBufN<N> {
     /// compact fallback fire.
     #[inline]
     pub fn append(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
-        // DEF-058 eager cursor-reset: when the buffer is fully
+ // eager cursor-reset: when the buffer is fully
         // consumed (cursor == inner.len() and cursor > 0), zeroize
         // and reset before extending. The extend then sees an empty
         // buffer with full capacity — no compact() needed. The
@@ -250,6 +250,7 @@ impl<const N: usize> ReadBufN<N> {
     pub fn advance(&mut self, n: usize) -> Result<(), AdvancePastEnd> {
         let available = self.unread_len();
         if n > available {
+            core::hint::cold_path();
             return Err(AdvancePastEnd {
                 requested: n,
                 available,
@@ -561,7 +562,7 @@ impl ReadBuf {
     /// inline storage is exhausted, escape to heap (one-time alloc +
     /// memcpy of inline contents) and retry.
     ///
- /// # Eager cursor-reset ()
+    /// # Eager cursor-reset ()
     ///
     /// Before attempting `extend_from_slice`, checks whether the
     /// active storage is fully consumed (`cursor == populated.len()`
@@ -612,7 +613,7 @@ impl ReadBuf {
     pub fn append(&mut self, bytes: &[u8]) -> Result<(), ReadBufFull> {
         // Heap-mode fast path.
         if let Some(heap) = self.heap.as_mut() {
-            // DEF-058 eager cursor-reset: when the heap buffer is
+ // eager cursor-reset: when the heap buffer is
             // fully consumed (cursor == heap.len()), zeroize and
             // reset before extending. The extend then sees an empty
             // buffer with full capacity — no compact_heap() needed.
@@ -632,6 +633,7 @@ impl ReadBuf {
             // partial frame — rare under the eager-reset gate above.
             self.compact_heap();
             let Some(heap) = self.heap.as_mut() else {
+                core::hint::cold_path();
                 return Err(ReadBufFull {
                     attempted: bytes.len(),
                     available: READ_BUF_CAP,
@@ -650,7 +652,7 @@ impl ReadBuf {
                 });
         }
 
-        // Inline-mode: DEF-058 eager cursor-reset for inline tier.
+ // Inline-mode: eager cursor-reset for inline tier.
         if self.cursor > 0 && usize::from(self.cursor) == self.inline.len() {
             use zeroize::Zeroize;
             self.inline.as_mut_slice().zeroize();
@@ -729,6 +731,21 @@ impl ReadBuf {
         }
     }
 
+    #[inline]
+    #[must_use]
+    fn active_len(&self) -> usize {
+        match &self.heap {
+            None => self.inline.len(),
+            Some(heap) => heap.len(),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_unread_empty(&self) -> bool {
+        usize::from(self.cursor) >= self.active_len()
+    }
+
     /// Absolute cursor position in u16.
     #[inline]
     #[must_use]
@@ -741,6 +758,7 @@ impl ReadBuf {
     pub fn advance(&mut self, n: usize) -> Result<(), AdvancePastEnd> {
         let available = self.unread_len();
         if n > available {
+            core::hint::cold_path();
             return Err(AdvancePastEnd {
                 requested: n,
                 available,
@@ -790,8 +808,7 @@ impl ReadBuf {
     #[inline]
     #[must_use]
     pub fn unread_len(&self) -> usize {
-        self.populated()
-            .len()
+        self.active_len()
             .saturating_sub(usize::from(self.cursor))
     }
 
@@ -1160,7 +1177,7 @@ impl fmt::Display for AdvancePastEnd {
     }
 }
 
-/// Returned by `ReadBuf::enter_partial_mode` when called while the
+/// Returned by [`ReadBuf::enter_partial_mode`] when called while the
 /// buffer is already in partial-frame mode (`partial_remaining > 0`).
 ///
 /// A naive `debug_assert!` here would panic in dev builds and
@@ -1200,7 +1217,7 @@ impl fmt::Display for AlreadyInPartialMode {
     }
 }
 
-/// Returned by `ReadBuf::exit_partial_mode` when called while the
+/// Returned by [`ReadBuf::exit_partial_mode`] when called while the
 /// buffer still owes wire body bytes (`partial_remaining > 0`).
 ///
 /// A naive `debug_assert!` (panic in dev) plus a silent counter
@@ -1240,6 +1257,56 @@ impl fmt::Display for PartialModeExitUndrained {
              (counter preserved; not silently reset)",
             self.remaining,
         )
+    }
+}
+
+#[cfg(test)]
+mod readbuf_helper_tests {
+    use super::*;
+
+    #[test]
+    fn is_unread_empty_fresh_buffer() {
+        let buf = ReadBuf::new();
+        assert!(buf.is_unread_empty());
+    }
+
+    #[test]
+    fn is_unread_empty_after_append() {
+        let mut buf = ReadBuf::new();
+        let ok = buf.append(&[1, 2, 3]);
+        assert!(ok.is_ok());
+        assert!(!buf.is_unread_empty());
+    }
+
+    #[test]
+    fn is_unread_empty_after_full_advance() {
+        let mut buf = ReadBuf::new();
+        let ok = buf.append(&[1, 2, 3]);
+        assert!(ok.is_ok());
+        let ok = buf.advance(3);
+        assert!(ok.is_ok());
+        assert!(buf.is_unread_empty());
+    }
+
+    #[test]
+    fn active_len_matches_populated_len() {
+        let mut buf = ReadBuf::new();
+        assert_eq!(buf.active_len(), buf.populated().len());
+        let ok = buf.append(&[10; 50]);
+        assert!(ok.is_ok());
+        assert_eq!(buf.active_len(), buf.populated().len());
+        assert_eq!(buf.active_len(), 50);
+    }
+
+    #[test]
+    fn unread_len_uses_active_len_not_populated() {
+        let mut buf = ReadBuf::new();
+        let ok = buf.append(&[0; 20]);
+        assert!(ok.is_ok());
+        let ok = buf.advance(5);
+        assert!(ok.is_ok());
+        assert_eq!(buf.unread_len(), 15);
+        assert_eq!(buf.active_len(), 20);
     }
 }
 

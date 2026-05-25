@@ -24,7 +24,7 @@
 //!   per impl).
 //! - **Tier-1 compile**: `FORMATS.len() == COUNT`, `OIDS.len() == COUNT`.
 //!   Built into the macro expansion.
-//! - **Tier-1 compile**: sealed via `sealed::ParamsWriterSealed`.
+//! - **Tier-1 compile**: sealed via [`sealed::ParamsWriterSealed`].
 //!   Downstream crates cannot impl `ParamsWriter` for their own types.
 //! - **Tier-2 structural**: all `write_params` impls return
 //!   `Result<(), WriteBufFull>` — buffer overflow is classified,
@@ -92,7 +92,7 @@ mod sealed {
 ///
 /// # Sealed
 ///
-/// Module-private seal via `sealed::ParamEncoderSealed` — only
+/// Module-private seal via [`sealed::ParamEncoderSealed`] — only
 /// two impls exist:
 /// - `impl<T: EncodeBinary> ParamEncoder for T` — the non-NULL
 ///   path, writes `len` + bytes via
@@ -202,7 +202,7 @@ pub trait ParamsWriter: sealed::ParamsWriterSealed {
     const FORMATS: &'static [FormatCode];
 
     /// Per-parameter PG type OIDs, derived from each element's
- /// [`EncodeBinary::OID`]. Exposed as a static slice so Phase 2's
+    /// [`EncodeBinary::OID`]. Exposed as a static slice so the
     /// `query!` macro can cross-check the tuple's OID sequence
     /// against the server's `ParameterDescription` response at
     /// compile time — a tier-1 shield against "wrong param types
@@ -218,7 +218,7 @@ pub trait ParamsWriter: sealed::ParamsWriterSealed {
     ///
     /// # Errors
     ///
-    /// `WriteBufFull` if any element overflows the buffer. The
+    /// [`WriteBufFull`] if any element overflows the buffer. The
     /// Bind-frame const-assert pins the worst-case size against
     /// `MAX_OWNED_SEND_LEN`; in production the error branch is
     /// architecturally dead but surfaces as a classified error
@@ -362,7 +362,7 @@ const _: () = {
     assert!(oids.len() == 3);
     assert!(matches!(oids, [crate::decode::oids::INT4, crate::decode::oids::TEXT, crate::decode::oids::BOOL]));
 
-    // F60 (pass #6): drift-pin for the `Option<T> as ParamEncoder`
+ // (): drift-pin for the `Option<T> as ParamEncoder`
     // blanket-vs-dedicated impl dispatch. Instantiates the Option
     // path at compile time — if Rust's trait resolution ever changed
     // so that the `impl<T: EncodeBinary> ParamEncoder for T` blanket

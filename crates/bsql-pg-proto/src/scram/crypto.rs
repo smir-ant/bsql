@@ -1,7 +1,7 @@
 //! SCRAM-SHA-256 cryptographic operations — composition over RustCrypto.
 //!
 //! Every operation here is a thin composition of `sha2`, `hmac`, and
-//! `pbkdf2` crate calls. Per DEF-META-01 we never hand-roll crypto.
+//! `pbkdf2` crate calls. We never hand-roll crypto.
 //! No facades, no wrappers — the crate APIs are called directly.
 //!
 //! # Operations (RFC 5802 §2.2)

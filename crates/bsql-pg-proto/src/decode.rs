@@ -1159,7 +1159,7 @@ pub(crate) fn parse_parameter_description(
     // Tier-1 structural: reject counts too high for inline storage.
     // MAX_PARAMS_ARITY matches the Bind-side cap — receiving more
     // OIDs than we can ever Bind against means the describe result
-    // is useless downstream. Per DEF-165, the validated count flows
+ // is useless downstream. Per , the validated count flows
     // into a `BoundedU8<MAX_PARAMS_ARITY>` field at the
     // `from_parts` call below — the type itself rejects out-of-range
     // values, so this check + the typed witness together form a
@@ -1194,7 +1194,7 @@ pub(crate) fn parse_parameter_description(
         cursor = tail;
     }
 
-    // Convert validated u16 → BoundedU8<MAX_PARAMS_ARITY> (DEF-165).
+ // Convert validated u16 → BoundedU8<MAX_PARAMS_ARITY> ().
     // The `n_params_usize ≤ MAX_PARAMS_ARITY (= 16 < 256)` check
     // above proves the u8 narrow is lossless, and `try_new` rejects
     // out-of-range — both arms folded into one classified
@@ -1213,7 +1213,7 @@ pub(crate) fn parse_parameter_description(
 }
 
 // ════════════════════════════════════════════════════════════════════
-// COPY response header (DEF-219, PG §55.2.6)
+// COPY response header (, PG §55.2.6)
 // ════════════════════════════════════════════════════════════════════
 
 /// Typed COPY transfer-format enum. Wire byte: 0 = text, 1 = binary.
@@ -1770,7 +1770,7 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 /// `cols.next()` returns `Option<Result<Option<&[u8]>, DecodeError>>`
 /// and is matched structurally via `let Some(...) else`. Real user
 /// code can adapt to its own error strategy (`?` into custom errors,
-/// slogged through a macro in Phase 2's `query!`, etc.).
+/// slogged through the `query!` macro, etc.).
 ///
 /// The doc-test below is COMPILE-CHECKED — a future refactor that
 /// alters `DataRowRef::parse`, `ColumnsIter::next`, the `FromPgText`
@@ -2503,6 +2503,11 @@ impl FromPgText<'_> for u32 {
     const OID: u32 = oids::OID;
     #[inline]
     fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+        match bytes {
+            b"0" => return Ok(0),
+            b"1" => return Ok(1),
+            _ => {}
+        }
         parse_pg_int_unsigned!(bytes, u32)
     }
 }
@@ -2685,12 +2690,9 @@ impl FromPgBinary<'_> for bool {
 /// # UTF-8 validation cost
 ///
 /// Every column read walks the column bytes to verify UTF-8 well-formedness
-/// — `core::str::from_utf8` is O(N) with a well-tuned SSE2 fast path (~1 ns
-/// per byte on modern x86). A 32-byte text column costs ~32 ns; a typical
-/// 1000-row SELECT with 5 text columns pays ~160 μs of total validation.
-///
-/// Under `#![forbid(unsafe_code)]` this validation cannot be skipped —
-/// `core::str::from_utf8_unchecked` is unsafe and inaccessible in the crate.
+/// — `simdutf8::basic::from_utf8` (SIMD-accelerated, matching the text-format
+/// path) is O(N). Under `#![forbid(unsafe_code)]` validation cannot be
+/// skipped — `core::str::from_utf8_unchecked` is unsafe and inaccessible.
 /// Callers who need to bypass should hold the bytes as `&[u8]` (via a
 /// separate `FromPgBinary<Target = &[u8]>` impl — not implemented today)
 /// and validate externally if / when they need a `&str`.
@@ -2704,7 +2706,7 @@ impl<'a> FromPgBinary<'a> for &'a str {
     const OID: u32 = oids::TEXT;
     #[inline]
     fn from_pg_binary(bytes: &'a [u8]) -> Result<Self, DecodeError> {
-        core::str::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
+        simdutf8::basic::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
     }
 }
 
@@ -4766,5 +4768,36 @@ mod decode_format_tests {
         // ZST property — markers carry zero runtime cost.
         assert_eq!(core::mem::size_of::<TextFmt>(), 0);
         assert_eq!(core::mem::size_of::<BinaryFmt>(), 0);
+    }
+}
+
+#[cfg(test)]
+mod session_2025_05_25_tests {
+    use super::*;
+
+    #[test]
+    fn u32_from_pg_text_common_value_zero() {
+        assert!(matches!(<u32 as FromPgText>::from_pg_text(b"0"), Ok(0)));
+    }
+
+    #[test]
+    fn u32_from_pg_text_common_value_one() {
+        assert!(matches!(<u32 as FromPgText>::from_pg_text(b"1"), Ok(1)));
+    }
+
+    #[test]
+    fn u32_from_pg_text_regular_value() {
+        assert!(matches!(<u32 as FromPgText>::from_pg_text(b"42"), Ok(42)));
+    }
+
+    #[test]
+    fn str_from_pg_binary_valid_utf8() {
+        assert!(matches!(<&str as FromPgBinary>::from_pg_binary(b"hello"), Ok("hello")));
+    }
+
+    #[test]
+    fn str_from_pg_binary_invalid_utf8() {
+        let bytes: &[u8] = &[0xFF, 0xFE];
+        assert!(<&str as FromPgBinary>::from_pg_binary(bytes).is_err());
     }
 }

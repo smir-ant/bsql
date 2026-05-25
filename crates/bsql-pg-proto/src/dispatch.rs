@@ -84,7 +84,7 @@ pub(crate) mod _row_description_dispatch_leaf {
 }
 
 /// Leaf submodule for the inbound `'C'` (CommandComplete) frame
-/// dispatch. Φ3 — hosts [`CommandCompleteDispatchToken`]
+/// dispatch. — hosts [`CommandCompleteDispatchToken`]
 /// and the single park helper fn. Mirror of
 /// [`_row_description_dispatch_leaf`] /
 /// [`_param_description_dispatch_leaf`].
@@ -112,7 +112,7 @@ pub(crate) mod _command_complete_dispatch_leaf {
 
 /// Leaf submodule for the inbound `'t'` (ParameterDescription) frame
 /// dispatch. Hosts the [`ParamDescDispatchToken`] type and the single
-/// park helper fn. Φ1 mirror of
+/// park helper fn. mirror of
 /// [`_row_description_dispatch_leaf`].
 ///
 /// Sole call site:
@@ -330,7 +330,7 @@ fn install_errored(
     reply_id: Option<core::num::NonZeroU64>,
     cause: ProtocolError,
 ) -> DispatchOutcome {
-    // DEF-286 Φ-I.b: `install_errored` does NOT park the cause into
+    // .b: `install_errored` does NOT park the cause into
     // the slot — that happens at materialise time when the
     // `StagedAction::FailReply { id, cause }` is transformed into the
     // public `Action::FailReply { id }`. Keeping cause inline through
@@ -369,6 +369,7 @@ fn validate_empty_body(
     if payload.is_empty() {
         Ok(())
     } else {
+        core::hint::cold_path();
         Err(ProtocolError::UnexpectedFrameBody {
             tag,
             payload_len: payload.len(),
@@ -438,7 +439,7 @@ fn validate_empty_body(
               body to destructure that struct on every call (the \
               outer `DispatchContext` already does this once — \
               re-bundling here would double the indirection). \
-              DEF-286 Φ1 added `param_oids_slot` next to \
+              added `param_oids_slot` next to \
               `row_desc_slot` to mirror the per-cell slot-pattern; \
               the count grew from 7 to 8."
 )]
@@ -448,7 +449,7 @@ pub(crate) fn dispatch(
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
     row_desc_slot: &mut crate::schema_slot::RowDescSlotCell,
-    // DEF-286 Φ1: ParamOids slot. Only the `'t'`
+    // : ParamOids slot. Only the `'t'`
     // (ParameterDescription) arm in the
     // `DescribeStatementAwaitingParamDesc` state writes here. All
     // other arms ignore it. The slot's box is read via `as_ref()`
@@ -457,7 +458,7 @@ pub(crate) fn dispatch(
     // &'r ParamOids`. Cycle close (Idle/Errored entry) drops the
     // box via `clear_at_residue`.
     param_oids_slot: &mut crate::param_oids_slot::ParamOidsSlotCell,
-    // DEF-286 Φ3: CommandTag slot. Written by `'C'`
+    // : CommandTag slot. Written by `'C'`
     // (CommandComplete) arms in SimpleQueryAwaitingRfq /
     // BindExecuteAwaitingRfq{Dml,Select} and by the
     // EmptyQueryResponse transition into SimpleQueryAwaitingRfq.
@@ -465,7 +466,7 @@ pub(crate) fn dispatch(
     // and projects into `Reply::QueryComplete.command_tag:
     // &'r CommandTag`.
     command_tag_slot: &mut crate::command_tag_slot::CommandTagSlotCell,
-    // DEF-286 Φ-E: TxStatus slot. Written by every `'Z'`
+    // : TxStatus slot. Written by every `'Z'`
     // (ReadyForQuery) dispatch arm; the parked value is read by
     // callers via `PgProtocol::terminal_tx_status` post-`feed_bytes`.
     // Materialise does NOT read it — Reply payloads no longer carry
@@ -479,13 +480,13 @@ pub(crate) fn dispatch(
     // that don't reach an ErrorResponse arm pay zero allocation
     // cost.
     error_arena_slot: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
-    // DEF-219 Phase 3: copy_chunks_arena slot. Lazy-init via
+    // copy_chunks_arena slot. Lazy-init via
     // `get_or_insert_with` on first CopyData arrival; most arms
     // ignore it.
     copy_chunks_arena_slot: &mut Option<alloc::boxed::Box<crate::copy_chunks_arena::CopyChunksArena>>,
-    // DEF-286 Φ-D: command_tags_arena slot. Lazy-init via
+    // : command_tags_arena slot. Lazy-init via
     // `get_or_insert_with` on first IntermediateCommandComplete
-    // emission (DEF-226 multi-statement batch). Only the three
+    // emission (multi-statement batch). Only the three
     // SimpleQueryAwaitingRfq arms below touch it.
     command_tags_arena_slot: &mut Option<alloc::boxed::Box<crate::command_tags_arena::CommandTagsArena>>,
 ) -> DispatchOutcome {
@@ -860,7 +861,7 @@ pub(crate) fn dispatch(
                             crate::action::StartupCompletePayload {
                                 pid,
                                 secret_key: *secret_key_inner,
-                                // DEF-286 Φ-E exception: tx_status
+                                // exception: tx_status
                                 // kept inline ONLY on StartupComplete
                                 // because Connecting phase has no
                                 // persistent slot. Other Reply variants
@@ -939,7 +940,7 @@ pub(crate) fn dispatch(
             // classification across all zero-body frames.
             match validate_empty_body(payload, TAG_EMPTY_QUERY_RESPONSE) {
                 Ok(()) => {
-                    // DEF-286 Φ3: SimpleQueryAwaitingRfq no longer
+                    // : SimpleQueryAwaitingRfq no longer
                     // carries inline command_tag. Empty-query path:
                     // park CommandTag::EMPTY into the slot so the
                     // terminal `'Z'` materialise emits an empty tag
@@ -959,12 +960,12 @@ pub(crate) fn dispatch(
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ERROR_RESPONSE) => {
             advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
-        // DEF-219 COPY entry points: 'H' = CopyOutResponse,
+        // COPY entry points: 'H' = CopyOutResponse,
         // 'G' = CopyInResponse. Parse + validate the header (format
         // byte 0/1, n_cols ≤ MAX_ROW_COLUMNS, per-col formats agree),
         // transition into the appropriate COPY state.
-        // Phase 2 Note: header data (format, n_cols) is parsed-and-
-        // discarded for now — Phase 3 will route it into Action::Copy*
+        // Note: header data (format, n_cols) is parsed-and-
+        // discarded for now — will route it into Action::Copy*
         // surface when the data-emission path lands.
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_COPY_OUT_RESPONSE) => {
             match crate::decode::parse_copy_response_header(payload) {
@@ -988,15 +989,15 @@ pub(crate) fn dispatch(
             install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        // DEF-219 COPY OUT state-machine arms.
+        // COPY OUT state-machine arms.
         //
         // CopyOutStreaming: server streams `CopyData` ('d') frames,
         // terminates with `CopyDone` ('c'). ErrorResponse drains
-        // through standard recoverable path. Phase 2 stays silent
-        // on CopyData (no Action emission yet); Phase 3 will surface
+        // through standard recoverable path. stays silent
+        // on CopyData (no Action emission yet); will surface
         // the bytes via `Action::CopyDataChunk` or pull API.
         (ProtoState::SimpleQueryCopyOutStreaming(reply), TAG_COPY_DATA) => {
-            // DEF-219 Phase 3: lazy-init the chunks arena, allocate
+            // lazy-init the chunks arena, allocate
             // a slot for these bytes, emit Action::CopyDataChunk
             // carrying the gen-tagged ref. Caller resolves via
             // PgProtocol::get_copy_chunk within the OutActions cycle.
@@ -1053,11 +1054,11 @@ pub(crate) fn dispatch(
             install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
-        // DEF-219 COPY IN state-machine arms.
+        // COPY IN state-machine arms.
         //
         // CopyInActive: server has acknowledged the COPY IN request
         // (via `CopyInResponse`); client now pushes `CopyData` /
-        // `CopyDone` / `CopyFail` frames via the (Phase 4) push API.
+        // `CopyDone` / `CopyFail` frames via the () push API.
         // Server transitions to `CommandComplete` once it observes
         // the client's `CopyDone`. State stays in `CopyInActive`
         // through the entire client push phase.
@@ -1094,7 +1095,7 @@ pub(crate) fn dispatch(
         }
 
         // AwaitingRfq: Z is the only legal frame
-        // DEF-286 Φ3: command_tag lives in slot. State variant
+        // : command_tag lives in slot. State variant
         // carries only `reply`. Materialise reads slot at Z arm.
         (ProtoState::SimpleQueryAwaitingRfq { reply }, TAG_READY_FOR_QUERY) => {
             match parse_rfq_payload(payload) {
@@ -1114,7 +1115,7 @@ pub(crate) fn dispatch(
                 Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
             }
         }
-        // DEF-226 multi-statement batch: PG SimpleQuery accepts
+        // multi-statement batch: PG SimpleQuery accepts
         // `;`-separated batches like `"BEGIN; UPDATE; UPDATE; COMMIT;"`.
         // Server emits one CommandComplete per statement followed
         // by a single final RFQ. Each non-final CommandComplete /
@@ -1125,7 +1126,7 @@ pub(crate) fn dispatch(
         // standard `Reply::QueryComplete` carrying the LAST tag from
         // the slot.
         //
-        // DEF-286 Φ3: slot holds the LATEST parked tag. Intermediate
+        // : slot holds the LATEST parked tag. Intermediate
         // emit captures the PRIOR tag (from slot) BEFORE overwriting
         // — by-value copy via slot.as_ref() + Copy. Then parse new
         // tag → park (overwrites slot). State stays in AwaitingRfq.
@@ -1136,10 +1137,10 @@ pub(crate) fn dispatch(
                 .copied()
                 .unwrap_or(crate::command_tag::CommandTag::EMPTY);
             // Parse new tag — classified on malformed (missing NUL /
-            // embedded NUL) per pre-Φ3 contract.
+            // embedded NUL) per pre-contract.
             match crate::command_tag::parse_command_tag_bytes(payload) {
                 Ok(new_tag) => {
-                    // DEF-286 Φ-D: alloc prior tag into arena;
+                    // : alloc prior tag into arena;
                     // overflow (arch-dead, OutActions cap is 9 = same
                     // as arena cap) installs InternalCrateBug rather
                     // than silently dropping the action.
@@ -1181,7 +1182,7 @@ pub(crate) fn dispatch(
                 .unwrap_or(crate::command_tag::CommandTag::EMPTY);
             match crate::decode::parse_row_description(payload) {
                 Ok(row_desc) => {
-                    // DEF-286 Φ-D: alloc prior tag into arena.
+                    // : alloc prior tag into arena.
                     let prior_tag_ref = crate::protocol::command_tags_arena_or_init(
                         command_tags_arena_slot,
                     )
@@ -1219,7 +1220,7 @@ pub(crate) fn dispatch(
                 .unwrap_or(crate::command_tag::CommandTag::EMPTY);
             match validate_empty_body(payload, TAG_EMPTY_QUERY_RESPONSE) {
                 Ok(()) => {
-                    // DEF-286 Φ-D: alloc prior tag into arena.
+                    // : alloc prior tag into arena.
                     let prior_tag_ref = crate::protocol::command_tags_arena_or_init(
                         command_tags_arena_slot,
                     )
@@ -1430,7 +1431,7 @@ pub(crate) fn dispatch(
         }
 
         (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), TAG_COMMAND_COMPLETE) => {
-            // DEF-286 Φ3: parse + park; classified on malformed.
+            // : parse + park; classified on malformed.
             match crate::command_tag::parse_command_tag_bytes(payload) {
                 Ok(parsed) => {
                     _command_complete_dispatch_leaf::park_command_tag_at_dispatch(
@@ -1464,9 +1465,9 @@ pub(crate) fn dispatch(
                     tx_status_slot,
                     tx_status,
                 );
-                // DEF-286 Φ3: command_tag in slot. Materialise reads
+                // : command_tag in slot. Materialise reads
                 // the slot at the Z arm → Reply::QueryComplete with
-                // `command_tag: &'r CommandTag`. DEF-286 Φ-E:
+                // `command_tag: &'r CommandTag`. :
                 // tx_status now also in slot (parked above).
                 *state = ProtoState::Idle;
                 DispatchOutcome::AdvancedWithAction {
@@ -1625,8 +1626,8 @@ pub(crate) fn dispatch(
                     tx_status_slot,
                     tx_status,
                 );
-                // DEF-286 Φ3: command_tag in slot; row_desc in
-                // row_desc_slot. DEF-286 Φ-E: tx_status in slot.
+                // : command_tag in slot; row_desc in
+                // row_desc_slot. : tx_status in slot.
                 // Materialise reads command_tag + row_desc slots at Z;
                 // callers query tx_status via terminal_tx_status.
                 *state = ProtoState::Idle;
@@ -1668,7 +1669,7 @@ pub(crate) fn dispatch(
 
         // Stage 1: awaiting ParameterDescription.
         //
-        // DEF-286 Φ1 (slot-pattern): parsed `ParamOids` is heap-
+        // (slot-pattern): parsed `ParamOids` is heap-
         // boxed once here and PARKED IN THE SLOT (not inline in the
         // post-state variant). The post-state variant carries only
         // the bare `ReplyId<DescribeStatementKind>`. Slot
@@ -1702,7 +1703,7 @@ pub(crate) fn dispatch(
 
         // Stage 2: awaiting RowDescription or NoData.
         //
-        // DEF-286 Φ1: ParamOids no longer lives in the state variant
+        // : ParamOids no longer lives in the state variant
         // — slot holds the box from the preceding `'t'` arm.
         // Transition is a pure state-discriminant flip (no Box move).
         (
@@ -1756,7 +1757,7 @@ pub(crate) fn dispatch(
         // emits `Reply::DescribeStatementComplete` with `param_oids:
         // &'r ParamOids` borrowed from the slot.
         //
-        // DEF-286 Φ1: state variant carries no payload beyond
+        // : state variant carries no payload beyond
         // `ReplyId<K>` — the staged variant emits NO `param_oids`
         // payload either (consumer reads via the borrow at the
         // Reply level). Slot drops the box at the next Idle/Errored
@@ -2906,7 +2907,7 @@ impl ParsedServerError {
 
 /// Parse an ErrorResponse payload into a classified error.
 ///
-/// residue audit follow-up (Sub-B): the per-field
+/// -residue audit follow-up (Sub-B): the per-field
 /// inline cap (`MAX_ERROR_FIELDS`) and the largest per-field byte
 /// budget (`MAX_ERROR_RESPONSE_FIELD_BYTES`) are promoted to
 /// crate-visible consts so [`crate::partial_assembly::PREFIX_CAP`]'s
@@ -3173,8 +3174,8 @@ fn advance_to_awaiting_rfq(
     payload: &[u8],
     command_tag_slot: &mut crate::command_tag_slot::CommandTagSlotCell,
 ) -> DispatchOutcome {
-    // DEF-286 Φ3: typed parser + slot park. Classified on malformed
-    // (missing NUL / embedded NUL) per pre-Φ3 contract.
+    // : typed parser + slot park. Classified on malformed
+    // (missing NUL / embedded NUL) per pre-contract.
     match crate::command_tag::parse_command_tag_bytes(payload) {
         Ok(parsed) => {
             _command_complete_dispatch_leaf::park_command_tag_at_dispatch(
@@ -3203,7 +3204,7 @@ fn advance_to_bindexecute_awaiting_rfq_select(
     payload: &[u8],
     command_tag_slot: &mut crate::command_tag_slot::CommandTagSlotCell,
 ) -> DispatchOutcome {
-    // DEF-286 Φ3: parse + park via slot pattern; classified on malformed.
+    // : parse + park via slot pattern; classified on malformed.
     match crate::command_tag::parse_command_tag_bytes(payload) {
         Ok(parsed) => {
             _command_complete_dispatch_leaf::park_command_tag_at_dispatch(
@@ -3284,7 +3285,6 @@ fn advance_to_drain_after_error(
 /// => ... }` at every `*AwaitingRfq` state (4+ parallel sites);
 /// centralising here closes drift if a future change alters the
 /// `TxStatus` variant set.
-#[cold]
 #[inline]
 fn parse_rfq_payload(
     payload: &[u8],
@@ -3302,7 +3302,7 @@ fn parse_rfq_payload(
     }
 }
 
-// DEF-286 Φ3: `parse_command_tag` (returning `BoundedStr<32>`)
+// : `parse_command_tag` (returning `BoundedStr<32>`)
 // removed. The typed [`crate::command_tag::parse_command_tag_bytes`]
 // in `mod command_tag` replaces it — produces a typed
 // [`crate::command_tag::CommandTag`] enum with known commands

@@ -1,8 +1,8 @@
 //! Bounded outbound frame builder.
 //!
 //! [`WriteBuf`] wraps `heapless::Vec<u8, MAX_OWNED_SEND_LEN>` with
-//! PG-wire-aware helpers: `push_u8`, `push_u32_be`,
-//! `push_nul_terminated`, and `with_length_prefix` for the PG
+//! PG-wire-aware helpers: [`push_u8`], [`push_u32_be`],
+//! [`push_nul_terminated`], and [`with_length_prefix`] for the PG
 //! "length includes itself but excludes tag" convention. Every mutator
 //! returns `Result<(), WriteBufFull>` — no panic, no silent truncation.
 //!
@@ -324,8 +324,8 @@ pub const fn max_password_message_size_md5() -> usize {
 /// to [`crate::password::MAX_PASSWORD_LEN`] bytes; MD5 is fixed at
 /// 35-byte body. Used by the global [`MAX_OWNED_SEND_LEN`]
 /// drift-pin to make the `WriteBufFull` arm in
-/// `crate::dispatch::build_password_message` +
-/// `crate::dispatch::build_md5_password_message`
+/// [`crate::dispatch::build_password_message`] +
+/// [`crate::dispatch::build_md5_password_message`]
 /// **architecturally impossible** rather than tier-3 by-classification.
 pub const fn max_password_message_size() -> usize {
     let cleartext = max_password_message_size_cleartext();
@@ -406,6 +406,7 @@ impl WriteBuf {
     }
 
     /// Push a big-endian `u32`.
+    #[inline]
     pub fn push_u32_be(&mut self, val: u32) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
@@ -414,6 +415,7 @@ impl WriteBuf {
     }
 
     /// Push a big-endian `i32`.
+    #[inline]
     pub fn push_i32_be(&mut self, val: i32) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
@@ -422,12 +424,13 @@ impl WriteBuf {
     }
 
     /// Push a big-endian `i16`. Parallel to [`push_i32_be`] /
-    /// `push_u32_be` — used by Extended Query frame builders
+    /// [`push_u32_be`] — used by Extended Query frame builders
     /// (Parse's `n_param_types`, Bind's per-column format codes,
     /// etc.).
     ///
     /// [`push_i32_be`]: Self::push_i32_be
-    /// `push_u32_be`: Self::push_u32_be
+    /// [`push_u32_be`]: Self::push_u32_be
+    #[inline]
     pub fn push_i16_be(&mut self, val: i16) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
@@ -439,6 +442,7 @@ impl WriteBuf {
     /// in PG wire messages (e.g., `n_params` in Bind). Equivalent to
     /// `push_i16_be(val as i16)` when the value fits `i16::MAX`, but
     /// the crate bans `as` casts — call `push_u16_be` directly instead.
+    #[inline]
     pub fn push_u16_be(&mut self, val: u16) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
@@ -448,6 +452,7 @@ impl WriteBuf {
 
     /// Push an `i64` in big-endian — used by the PG binary-format
     /// encoder for `int8` / `bigint` columns.
+    #[inline]
     pub fn push_i64_be(&mut self, val: i64) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
@@ -458,6 +463,7 @@ impl WriteBuf {
     /// Push a `u64` in big-endian — reserved for future unsigned
     /// 8-byte PG wire fields (none currently in use, added for API
     /// symmetry with the `u32` / `u16` pair).
+    #[inline]
     pub fn push_u64_be(&mut self, val: u64) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
@@ -466,6 +472,7 @@ impl WriteBuf {
     }
 
     /// Push raw bytes.
+    #[inline]
     pub fn push_bytes(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
         self.inner
             .extend_from_slice(data)
@@ -474,8 +481,9 @@ impl WriteBuf {
 
     /// Push a NUL-terminated string (bytes + `\0`).
     ///
-    /// The input must not contain NUL — use `Ident` / `ApplicationName`
-    /// / `DatabaseName` newtypes which guarantee this at construction.
+    /// The input must not contain NUL — use [`Ident`] / [`ApplicationName`]
+    /// / [`DatabaseName`] newtypes which guarantee this at construction.
+    #[inline]
     pub fn push_nul_terminated(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
         self.push_bytes(data)?;
         self.push_u8(0)
@@ -483,6 +491,7 @@ impl WriteBuf {
 
     /// Write a length-prefixed region using the PG convention:
     /// the 4-byte length field includes itself but excludes the tag.
+    #[inline]
     ///
     /// Writes a placeholder `[0,0,0,0]`, calls `body_fn(self)` to fill
     /// the body, then patches the placeholder with the actual length.
@@ -538,7 +547,7 @@ impl WriteBuf {
     /// ONLY the body bytes (not the 4-byte length field itself).
     ///
     /// PG Bind frame `per-param: len i32 + bytes` uses this shape
-    /// (vs `with_length_prefix` which uses the "length includes
+    /// (vs [`with_length_prefix`] which uses the "length includes
     /// itself" convention for top-level frames).
     ///
     /// The placeholder is reserved, the body function runs, the
@@ -548,6 +557,7 @@ impl WriteBuf {
     /// Note: for PG's SQL NULL param (wire length `-1`, no body),
     /// callers should `push_i32_be(-1)` directly instead of using
     /// this helper.
+    #[inline]
     pub fn with_i32_length_prefixed_body<F>(
         &mut self,
         body_fn: F,
@@ -597,7 +607,7 @@ impl WriteBuf {
 
     /// Reset the buffer length to zero without deallocating.
     ///
-    /// Called by `crate::PgProtocol::push_command` and
+    /// Called by [`crate::PgProtocol::push_command`] and
     /// [`crate::PgProtocol::feed_bytes`] at entry to reuse the
     /// caller-owned bounded storage across calls. Any previously
     /// issued `&[u8]` borrows into this buffer are invalidated — the
