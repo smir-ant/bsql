@@ -42,6 +42,16 @@ use core::fmt;
 /// 1600 matches PG's `MaxTupleAttributeNumber`. Since RowDesc is
 /// now heap-allocated (`Box<[u32]>`, exact-size), this constant
 /// only affects the parse-time rejection threshold — not storage.
+///
+/// # Effective wire limit
+///
+/// The RowDescription frame for >~140 typical columns exceeds
+/// `READ_BUF_CAP` (4096 B) and enters partial-assembly mode
+/// (`PREFIX_CAP` = 8 KB prefix + skip tail). Queries with
+/// ~300-400 columns parse from the prefix; beyond ~400 the
+/// prefix truncation causes `MalformedRowDescription`. The
+/// RowDesc TYPE has no cap — only the wire infrastructure
+/// constrains the effective maximum.
 pub const MAX_ROW_COLUMNS: usize = 1600;
 
 /// PostgreSQL wire format for one column's bytes.
@@ -4155,5 +4165,69 @@ mod session_2025_05_25_tests {
     fn str_from_pg_binary_invalid_utf8() {
         let bytes: &[u8] = &[0xFF, 0xFE];
         assert!(<&str as FromPgBinary>::from_pg_binary(bytes).is_err());
+    }
+}
+
+#[cfg(test)]
+mod rowdesc_box_tests {
+    use super::*;
+
+    #[test]
+    fn empty_rowdesc() {
+        let rd = RowDesc::empty();
+        assert_eq!(rd.len(), 0);
+        assert!(rd.is_empty());
+        assert!(rd.type_oid(0).is_none());
+        assert!(rd.format_code(0).is_none());
+    }
+
+    #[test]
+    fn five_column_round_trip() {
+        let oids: &[u32] = &[23, 25, 16, 20, 701];
+        let formats: &[FormatCode] = &[
+            FormatCode::Text,
+            FormatCode::Binary,
+            FormatCode::Text,
+            FormatCode::Text,
+            FormatCode::Binary,
+        ];
+        let rd = RowDesc::from_parts(oids, formats);
+        assert!(rd.is_ok());
+        let rd = match rd { Ok(r) => r, Err(_) => return };
+        assert_eq!(rd.len(), 5);
+        assert!(matches!(rd.type_oid(0), Some(23)));
+        assert!(matches!(rd.type_oid(4), Some(701)));
+        assert!(matches!(rd.format_code(0), Some(FormatCode::Text)));
+        assert!(matches!(rd.format_code(1), Some(FormatCode::Binary)));
+        assert!(matches!(rd.format_code(4), Some(FormatCode::Binary)));
+        assert!(rd.type_oid(5).is_none());
+    }
+
+    #[test]
+    fn wide_table_50_columns() {
+        let oids: alloc::vec::Vec<u32> = (1..=50).collect();
+        let formats: alloc::vec::Vec<FormatCode> =
+            (0..50).map(|i| if i & 1 == 0 { FormatCode::Text } else { FormatCode::Binary }).collect();
+        let rd = RowDesc::from_parts(&oids, &formats);
+        assert!(rd.is_ok());
+        let rd = match rd { Ok(r) => r, Err(_) => return };
+        assert_eq!(rd.len(), 50);
+        assert!(matches!(rd.type_oid(49), Some(50)));
+        assert!(matches!(rd.format_code(0), Some(FormatCode::Text)));
+        assert!(matches!(rd.format_code(1), Some(FormatCode::Binary)));
+        assert!(matches!(rd.format_code(33), Some(FormatCode::Binary)));
+        assert!(matches!(rd.format_code(32), Some(FormatCode::Text)));
+    }
+
+    #[test]
+    fn static_oids_all_text() {
+        let oids: &[u32] = &[23, 25, 16];
+        let rd = RowDesc::from_static_oids_text_format(oids);
+        assert!(rd.is_ok());
+        let rd = match rd { Ok(r) => r, Err(_) => return };
+        assert_eq!(rd.len(), 3);
+        assert!(matches!(rd.format_code(0), Some(FormatCode::Text)));
+        assert!(matches!(rd.format_code(1), Some(FormatCode::Text)));
+        assert!(matches!(rd.format_code(2), Some(FormatCode::Text)));
     }
 }
