@@ -391,7 +391,8 @@ pub use ident::{
 pub use password::{Credentials, Password, PasswordError};
 pub use protocol::{
     ActivePhase, CloseCause, ClosedPhase, ConnectingPhase, DisconnectedPhase, IntoActiveError,
-    MAX_ACTIONS_PER_CALL, MAX_STAGED_PER_CALL, PgProtocol, SealedPhase,
+    MAX_ACTIONS_PER_CALL, MAX_STAGED_PER_CALL, PgProtocol, SealedPhase, SslClassified,
+    SslNegotiatingPhase,
 };
 pub use reply_id::{
     CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind,
@@ -862,6 +863,10 @@ const _: () = assert!(
      (ZST DisconnectedInner + ZST phase_marker PhantomData<fn() -> \
      DisconnectedPhase>). If this trips, a non-ZST field crept onto \
      DisconnectedInner — audit `mod protocol::DisconnectedInner`.",
+);
+const _: () = assert!(
+    core::mem::size_of::<protocol::PgProtocol<protocol::SslNegotiatingPhase>>() == 0,
+    "PgProtocol<SslNegotiatingPhase> must be 0 B (same ZST Inner as Disconnected).",
 );
 const _: () = assert!(
     core::mem::size_of::<protocol::DisconnectedInner>() == 0,

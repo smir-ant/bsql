@@ -932,6 +932,14 @@ pub trait SealedPhase: _sealed_phase::Sealed + 'static {
 #[derive(Debug, Clone, Copy)]
 pub struct DisconnectedPhase;
 
+/// SSL negotiation phase marker.
+///
+/// `PgProtocol<SslNegotiatingPhase>` represents the window between
+/// sending the SSLRequest packet and classifying the server's 1-byte
+/// response. The only legal operation is `classify_ssl_response`.
+#[derive(Debug, Clone, Copy)]
+pub struct SslNegotiatingPhase;
+
 /// Connecting phase marker.
 ///
 /// `PgProtocol<ConnectingPhase>` represents the Startup → AuthOk
@@ -964,6 +972,7 @@ pub struct ActivePhase;
 pub struct ClosedPhase;
 
 impl _sealed_phase::Sealed for DisconnectedPhase {}
+impl _sealed_phase::Sealed for SslNegotiatingPhase {}
 impl _sealed_phase::Sealed for ConnectingPhase {}
 impl _sealed_phase::Sealed for ActivePhase {}
 impl _sealed_phase::Sealed for ClosedPhase {}
@@ -1103,6 +1112,10 @@ pub struct ClosedInner {
 }
 
 impl SealedPhase for DisconnectedPhase {
+    type Inner = DisconnectedInner;
+    type Extras = ();
+}
+impl SealedPhase for SslNegotiatingPhase {
     type Inner = DisconnectedInner;
     type Extras = ();
 }
@@ -2195,6 +2208,36 @@ impl PgProtocol<DisconnectedPhase> {
     // callsite. The returned `Result<_, PushFailure>` carries ~80 B
     // in the Err arm (below the 128 B threshold); no
     // `result_large_err` exception needed.
+    /// Emit the SSLRequest probe and transition to `SslNegotiatingPhase`.
+    ///
+    /// Returns the 8-byte packet and the next-phase protocol wrapper.
+    /// Caller writes the bytes to the socket, reads 1 byte back,
+    /// then calls `classify_ssl_response`.
+    ///
+    /// Consume-self: prevents double-send and blocks `push_startup`
+    /// until SSL negotiation completes (method-absent on
+    /// `SslNegotiatingPhase`).
+    #[inline]
+    #[must_use]
+    pub fn push_ssl_request(
+        self,
+    ) -> (
+        &'static [u8; 8],
+        PgProtocol<SslNegotiatingPhase>,
+    ) {
+        (
+            &crate::wire::SSL_REQUEST_WIRE_BYTES,
+            PgProtocol {
+                inner: DisconnectedInner {
+                    sync_marker: core::marker::PhantomData,
+                },
+                extras: (),
+                phase_marker: core::marker::PhantomData,
+            },
+        )
+    }
+
+    /// Emit the `StartupMessage` frame and transition to `ConnectingPhase`.
     pub fn push_startup<'w>(
         self,
         user: crate::ident::Ident,
@@ -2387,6 +2430,53 @@ impl PgProtocol<DisconnectedPhase> {
                 ))
             }
             Err(f) => Err(f),
+        }
+    }
+}
+
+/// Result of classifying the server's SSL response byte.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SslClassified {
+    /// Server accepted SSL ('S'). Driver performs TLS handshake,
+    /// then calls `push_startup` on the returned proto.
+    Accepted(PgProtocol<DisconnectedPhase>),
+    /// Server refused SSL ('N'). Driver checks sslmode policy.
+    Refused(PgProtocol<DisconnectedPhase>),
+    /// Server sent 'E' — an ErrorResponse follows on the wire.
+    ErrorIncoming(PgProtocol<DisconnectedPhase>),
+    /// Protocol violation — unknown byte. Connection irrecoverable.
+    InvalidByte {
+        /// The offending byte.
+        byte: u8,
+    },
+}
+
+impl PgProtocol<SslNegotiatingPhase> {
+    /// Classify the server's 1-byte SSL response and exit
+    /// `SslNegotiatingPhase`.
+    ///
+    /// Consume-self. The returned `SslClassified` carries the
+    /// typed outcome plus the next-phase protocol wrapper.
+    /// sslmode policy is a driver concern — this method only
+    /// classifies the wire byte.
+    #[inline]
+    #[must_use]
+    pub fn classify_ssl_response(self, byte: u8) -> SslClassified {
+        let disconnected = PgProtocol::new();
+        match crate::wire::classify_ssl_response_byte(byte) {
+            crate::wire::SslNegotiationOutcome::Accepted => {
+                SslClassified::Accepted(disconnected)
+            }
+            crate::wire::SslNegotiationOutcome::Refused => {
+                SslClassified::Refused(disconnected)
+            }
+            crate::wire::SslNegotiationOutcome::ErrorIncoming => {
+                SslClassified::ErrorIncoming(disconnected)
+            }
+            crate::wire::SslNegotiationOutcome::InvalidByte(b) => {
+                SslClassified::InvalidByte { byte: b }
+            }
         }
     }
 }
