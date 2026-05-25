@@ -96,16 +96,12 @@ use crate::ident::SecretBoundedStr;
 /// operators do NOT want lingering in freed memory after error-
 /// arena reuse. The contributor must explicitly choose: zeroize-
 /// aware type or `#[zeroize(skip)]` annotation with rationale.
-// `clippy::large_enum_variant`: the `ServerError` variant intentionally
-// carries the 288-B bundle of bounded strings inline; the parallel
-// `Scram` variant is ~67 B. Boxing `ServerError` would push every
-// alloc into a heap indirection and break the zero-alloc invariant
-// for the steady-state ErrorResponse handling path. The arena holds
-// a SINGLE slot — the max-variant size IS the arena footprint, so
-// shrinking the `Scram` variant to match would be wasted space:
-// the slot must accommodate `ServerError` regardless. Allow with
-// rationale.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "ServerError (288 B) vs Scram (~67 B): boxing would add \
+              heap indirection on steady-state ErrorResponse path; \
+              single-slot arena footprint = max-variant regardless"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, zeroize::ZeroizeOnDrop)]
 #[non_exhaustive]
 pub enum ErrorPayload {

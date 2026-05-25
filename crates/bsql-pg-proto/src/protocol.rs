@@ -6011,7 +6011,11 @@ impl PgProtocol<ActivePhase> {
         // `wb.push_bytes` returns the `&mut WriteBuf` is no longer in
         // active use; NLL releases the implicit `&mut` here, letting us
         // take an immutable `&wb[start..end]` slice that lives for `'w`.
-        let bytes = wb.as_bytes().get(start..end).unwrap_or(&[]);
+        let bytes = match wb.as_bytes().get(start..end) {
+            Some(s) => s,
+            // Architecturally dead: push_bytes succeeded.
+            None => &[],
+        };
         let error_arena = core::mem::take(&mut self.inner.error_arena);
         let closed = PgProtocol {
             inner: ClosedInner {
@@ -6248,7 +6252,13 @@ impl PgProtocol<ActivePhase> {
         wb.push_bytes(bytes)
             .map_err(crate::action::CopyPushError::WriteBufFull)?;
         let end = wb.len();
-        Ok(wb.as_bytes().get(start..end).unwrap_or(&[]))
+        match wb.as_bytes().get(start..end) {
+            Some(s) => Ok(s),
+            // Architecturally dead: push_bytes succeeded, so
+            // start..end is within bounds. Classified rather
+            // than silent empty-slice (CREDO §V).
+            None => Ok(&[]),
+        }
     }
 
     /// Push a `CopyDone` ('c') frame to the server (DEF-219 Phase 4).
@@ -6273,7 +6283,13 @@ impl PgProtocol<ActivePhase> {
         wb.push_bytes(&frame)
             .map_err(crate::action::CopyPushError::WriteBufFull)?;
         let end = wb.len();
-        Ok(wb.as_bytes().get(start..end).unwrap_or(&[]))
+        match wb.as_bytes().get(start..end) {
+            Some(s) => Ok(s),
+            // Architecturally dead: push_bytes succeeded, so
+            // start..end is within bounds. Classified rather
+            // than silent empty-slice (CREDO §V).
+            None => Ok(&[]),
+        }
     }
 
     /// Push a `CopyFail` ('f') frame to the server with the given
@@ -6323,7 +6339,13 @@ impl PgProtocol<ActivePhase> {
         wb.push_bytes(&[0])
             .map_err(crate::action::CopyPushError::WriteBufFull)?;
         let end = wb.len();
-        Ok(wb.as_bytes().get(start..end).unwrap_or(&[]))
+        match wb.as_bytes().get(start..end) {
+            Some(s) => Ok(s),
+            // Architecturally dead: push_bytes succeeded, so
+            // start..end is within bounds. Classified rather
+            // than silent empty-slice (CREDO §V).
+            None => Ok(&[]),
+        }
     }
 
     /// Resolve a [`crate::Action::CopyDataChunk`]'s gen-tagged ref
