@@ -2,13 +2,14 @@
 //! backend frames whose declared body exceeds
 //! [`crate::frame::READ_BUF_CAP`] (4096 B).
 //!
-//! # Universal coverage at constant memory
+//! # Universal coverage with per-tag memory
 //!
 //! Every PG wire-legal backend frame body size (0..= ~2 GiB) is
-//! consumable through this sink. Memory cost is **constant**
-//! ([`PREFIX_CAP`] = 8 KB) regardless of declared body length —
-//! a 2 GiB error response, a 100 KB row description, an 8 KB
-//! parameter status frame all cost the same 8 KB heap slot.
+//! consumable through this sink. Memory cost is **per-tag**:
+//! - `'T'` (RowDescription): exact body size (up to ~131 KB for
+//!   1600 columns). Parser needs all columns.
+//! - All other tags: constant [`PREFIX_CAP`] = 8 KB cap. Parsers
+//!   saturate below 8 KB; excess bytes are counted-and-skipped.
 //!
 //! The cap is **inline-type-derived**, NOT frequency-derived:
 //!
@@ -18,7 +19,7 @@
 //!   (the [`crate::dispatch::parse_error_response`] cap) the parser
 //!   reads at most ~5 KB before saturating every inline-bounded target.
 //! - [`crate::decode::MAX_ROW_COLUMNS` = 1600 × 18 B metadata + 32 ×
-//!   64 B (`NAMEDATALEN` ceiling per PG §43.2.7) ≈ 2.6 KB before
+//!   64 B (`NAMEDATALEN` ceiling per PG §43.2.7) ≈ 131 KB worst case before
 //!   [`crate::error::ProtocolError::TooManyColumns`] fires.
 //! - SCRAM server-first-message: `256 B nonce + 64 B salt + ~10 B
 //!   iters` ≈ 330 B.
@@ -27,7 +28,7 @@
 //!   read ≤ 256 B before saturating their bounded outputs.
 //!
 //! 8 KB ([`PREFIX_CAP`]) gives ≥ 2× headroom on the worst case. The
-//! cap is enforced by `heapless::Vec`'s const-generic capacity — a
+//! cap is enforced by the per-tag copy_cap field — a
 //! single-const change re-tunes the budget without any logic touching
 //! the literal. Tier-1 by construction on the buffer ceiling.
 //!
@@ -40,11 +41,11 @@
 //!    upper bound on bytes any non-`'D'` parser meaningfully consumes
 //!    before its inline-bounded outputs saturate. Dominated by
 //!    `parse_error_response` (32 fields × ~130 B). Other parsers
-//!    consume significantly less (RowDescription ~2.6 KB, SCRAM
+//!    consume significantly less (RowDescription up to ~131 KB (1600 cols), SCRAM
 //!    ~330 B, all others ≤ 256 B).
 //!
 //! 2. **Library-buffered capacity** [`PREFIX_CAP`] = **8 KB** — what
-//!    this module's `heapless::Vec<u8, PREFIX_CAP>` allocates. Bigger
+//!    this module's `alloc::vec::Vec<u8>` allocates (up to PREFIX_CAP for non-RowDesc tags). Bigger
 //!    than (1) on purpose: 5 KB safety floor (const-asserted at
 //!    [`PREFIX_CAP`]) + future-proof + power-of-2 alignment. See the
 //!    [`PREFIX_CAP`] docstring for the full rationale.
@@ -112,8 +113,8 @@
 //!    `enter`, `absorb`, `take`, `clear` each require a token type
 //!    whose tuple-struct field is private to its defining leaf
 //!    submodule.
-//! 5. **`PREFIX_CAP` is a `heapless::Vec` const-generic** — overflow
-//!    of the inline cap is structurally impossible (`extend_from_slice`
+//! 5. **`copy_cap` limits per-tag prefix copy — RowDescription copies full body,
+//!    other tags cap at PREFIX_CAP = 8 KB.
 //!    bounded by `Vec::push_bounded`).
 //!
 //! # No memory leak / no panic / no unsafe
@@ -128,8 +129,8 @@
 //!     scope end.
 //! - No `unwrap`/`expect`/`panic!`/`unreachable!`: every fallible
 //!   operation is handled with explicit `match` arms; the
-//!   `heapless::Vec::extend_from_slice` API returns `Result<(), ()>`
-//!   on overflow, and the sink only ever calls it with sliced inputs
+//!   `Vec::extend_from_slice is infallible (dynamic capacity);`
+//!   the copy_cap field bounds the bytes copied per tag.
 //!   sized to fit (`take_amount = min(input, headroom)`).
 
 use crate::wire::InboundTag;
@@ -148,7 +149,7 @@ use alloc::boxed::Box;
 ///    but never stored anywhere.
 ///
 /// 2. **What this library buffers** (the `PREFIX_CAP` const): **8 KB**.
-///    This is what `heapless::Vec<u8, PREFIX_CAP>` allocates as a
+///    This is the soft copy cap for non-RowDescription tags (RowDesc copies full body). Was
 ///    fixed-capacity, const-generic-sized buffer on the heap (inside
 ///    `Box<PartialAssemblyInner>`).
 ///
@@ -186,7 +187,7 @@ use alloc::boxed::Box;
 ///   by the parser's NUL-position search and never touched in
 ///   storage.)
 /// - `parse_row_description` reads at most
-///   `2 + 32 × (NAMEDATALEN + 1 + 18)` ≈ 2.6 KB. Wider frames hit
+///   `2 + 1600 × (NAMEDATALEN + 1 + 18)` ≈ 131 KB worst case. Per-tag
 ///   `TooManyColumns` before any prefix saturation.
 /// - SCRAM `parse_server_first` reads `r=<≤256>, s=<≤64>, i=<u32 ascii>
 ///   ≈ 10 B` ≈ 330 B + comma separators.
@@ -394,7 +395,7 @@ const _: () = {
 /// _pad:              u8 × 3                      (3 B alignment)
 /// body_remaining:    u32                         (4 B) — declines on every
 ///                                                       absorb call until 0
-/// prefix_buf:        heapless::Vec<u8, 8192>     (8192 + 8 = 8200 B with len)
+/// prefix_buf:        alloc::vec::Vec<u8>       (exact-size, per-tag cap)
 /// ```
 ///
 /// `Box<PartialAssemblyInner>` is 8 B on `PgProtocol` (one heap pointer,
@@ -481,7 +482,7 @@ impl PartialAssemblyInner {
     ///
     /// # Tier-1 buffer-overflow shield
     ///
-    /// `heapless::Vec::extend_from_slice` enforces the const-generic
+    /// Vec capacity is dynamic; copy_cap field limits the
     /// capacity at compile time. The sliced input here is always
     /// pre-sized to fit (`copy_take = min(take, headroom)`), so the
     /// `extend_from_slice` overflow `Err(_)` path is architecturally
@@ -689,7 +690,7 @@ impl PartialAssemblyCell {
     /// # Ownership
     ///
     /// The returned Box is owned by the caller; dropping it frees the
-    /// inline `heapless::Vec` allocation. The standard usage pattern in
+    /// inline `Vec` allocation. The standard usage pattern in
     /// `feed_bytes_impl` is: take the box, extract
     /// `(box.typed_tag(), box.prefix())`, run `dispatch()`, drop the
     /// box at the end of the dispatch arm.
@@ -709,7 +710,7 @@ impl PartialAssemblyCell {
     /// **Clear the cell** at the residue-cleanup transition (Idle or
     /// Errored entry per
     /// [`crate::protocol::PgProtocol::clear_session_residue_for_class`]).
-    /// Drops the inner Box; its heapless::Vec drops in turn.
+    /// Drops the inner Box; its Vec drops in turn.
     ///
     /// Mirror of the schema_slot / session_params_slot
     /// `clear_at_residue` contract.
@@ -858,7 +859,7 @@ mod tests {
         assert_eq!(inner.prefix().len(), PREFIX_CAP);
     }
 
-    /// Reset preserves the heapless::Vec for re-entry amortisation.
+    /// Reset preserves the Vec for re-entry amortisation.
     #[test]
     fn inner_reset_preserves_inline_buffer() {
         let mut inner = PartialAssemblyInner::new(b'T', 256);
