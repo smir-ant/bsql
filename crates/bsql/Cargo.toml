@@ -7,10 +7,12 @@ description = "Multi-backend SQL toolkit — PostgreSQL and SQLite"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = ["postgres", "sqlite"]
+default = ["postgres", "postgres-sync", "sqlite"]
 postgres = ["dep:bsql-postgres"]
+postgres-sync = ["dep:bsql-postgres-sync"]
 sqlite = ["dep:bsql-sqlite"]
 
 [dependencies]
 bsql-postgres = { path = "../postgres/driver", optional = true }
+bsql-postgres-sync = { path = "../postgres/sync", optional = true }
 bsql-sqlite = { path = "../sqlite/driver", optional = true }

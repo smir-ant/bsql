@@ -77,6 +77,7 @@ name = "bsql"
 version = "0.1.0-alpha.0"
 dependencies = [
  "bsql-postgres",
+ "bsql-postgres-sync",
  "bsql-sqlite",
 ]
 
@@ -119,6 +120,15 @@ dependencies = [
  "simdutf8",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "bsql-postgres-sync"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "bsql-postgres-proto",
+ "rustls",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
