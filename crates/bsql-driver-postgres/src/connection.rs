@@ -126,8 +126,7 @@ impl Connection {
                 self.stream.write_all(bytes).await?;
             }
         }
-
-        self.drain_until_idle().await
+        self.pump_until_idle(|_, _| {}).await
     }
 
     /// Execute a Simple Query. Returns the command tag.
@@ -148,80 +147,18 @@ impl Connection {
                 self.stream.write_all(bytes).await?;
             }
         }
-
         self.wb.clear();
         let mut command_tag = String::new();
-        loop {
-            let event = self.proto.advance_one_frame(&mut self.wb);
-            match event {
-                FeedEvent::Idle => return Ok(command_tag),
-                FeedEvent::NeedMoreBytes => {
-                    // Try again — buffer may have more frames
-                    // (silent dispatches return NeedMoreBytes even
-                    // when unread data remains).
-                    let event2 = self.proto.advance_one_frame(&mut self.wb);
-                    match event2 {
-                        FeedEvent::Idle => return Ok(command_tag),
-                        FeedEvent::Deliver(_, reply) => {
-                            if let bsql_pg_proto::Reply::QueryComplete(_) = reply {
-                                if let Some(tag) = self.proto.current_command_tag() {
-                                    use core::fmt::Write;
-                                    command_tag.clear();
-                                    let _ = write!(command_tag, "{}", tag);
-                                }
-                            }
-                            continue;
-                        }
-                        FeedEvent::NeedMoreBytes => {
-                            // Truly need bytes from socket.
-                            let n = self.stream.read(&mut self.buf).await?;
-                            if n == 0 {
-                                return Err(DriverError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::UnexpectedEof,
-                                    "server closed",
-                                )));
-                            }
-                            self.proto.feed_inbound(&self.buf[..n]).map_err(|_| {
-                                DriverError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "buf full",
-                                ))
-                            })?;
-                        }
-                        _ => { /* handle others same as outer loop */ }
-                    }
-                }
-                FeedEvent::Deliver(_, reply) => {
-                    if let bsql_pg_proto::Reply::QueryComplete(_) = reply {
-                        if let Some(tag) = self.proto.current_command_tag() {
-                            use core::fmt::Write;
-                            command_tag.clear();
-                            let _ = write!(command_tag, "{}", tag);
-                        }
-                    }
-                }
-                FeedEvent::StreamingRows => {
-                    self.proto.iter_rows(&mut self.wb, |stream| {
-                        loop {
-                            match stream.col_next() {
-                                bsql_pg_proto::ColEvent::EndQuery { .. } => break,
-                                bsql_pg_proto::ColEvent::NeedMore => break,
-                                _ => {}
-                            }
-                        }
-                    });
-                }
-                FeedEvent::Notice(_) => {}
-                FeedEvent::Fail(_) => {
-                    if let Some(&cause) = self.proto.fail_cause() {
-                        return Err(DriverError::Protocol(cause));
-                    }
-                    return Err(DriverError::NotReady);
-                }
-                FeedEvent::Close => return Err(DriverError::NotReady),
-                _ => {}
+        self.pump_until_idle(|_id, reply| {
+            if let bsql_pg_proto::Reply::QueryComplete(_) = reply {
+                // Can't borrow self.proto inside closure — capture tag later.
             }
+        }).await?;
+        if let Some(tag) = self.proto.current_command_tag() {
+            use core::fmt::Write;
+            let _ = write!(command_tag, "{}", tag);
         }
+        Ok(command_tag)
     }
 
     /// Gracefully close the connection.
@@ -240,39 +177,110 @@ impl Connection {
         }
     }
 
-    async fn drain_until_idle(&mut self) -> Result<(), DriverError> {
+    /// Core event pump: advance frames until Idle. Handles:
+    /// - NeedMoreBytes retry (silent dispatches leave unread frames)
+    /// - Socket read when buffer truly empty
+    /// - SendBytes → socket write
+    /// - StreamingRows → iter_rows drain with async feed
+    /// - Deliver → callback
+    /// - Fail/Close → error
+    async fn pump_until_idle(
+        &mut self,
+        mut on_deliver: impl FnMut(core::num::NonZeroU64, bsql_pg_proto::Reply),
+    ) -> Result<(), DriverError> {
         loop {
             let event = self.proto.advance_one_frame(&mut self.wb);
             match event {
                 FeedEvent::Idle => return Ok(()),
                 FeedEvent::NeedMoreBytes => {
-                    let n = self.stream.read(&mut self.buf).await?;
-                    if n == 0 {
-                        return Err(DriverError::Io(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "server closed connection",
-                        )));
-                    }
-                    if self.proto.feed_inbound(&self.buf[..n]).is_err() {
-                        return Err(DriverError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "read buffer full",
-                        )));
+                    // Retry — buffer may have frames after silent dispatch.
+                    let retry = self.proto.advance_one_frame(&mut self.wb);
+                    match retry {
+                        FeedEvent::Idle => return Ok(()),
+                        FeedEvent::Deliver(id, reply) => {
+                            on_deliver(id, reply);
+                            continue;
+                        }
+                        FeedEvent::SendBytes(bytes) => {
+                            self.stream.write_all(bytes).await?;
+                            continue;
+                        }
+                        FeedEvent::StreamingRows => {
+                            self.drain_streaming().await?;
+                            continue;
+                        }
+                        FeedEvent::NeedMoreBytes => {
+                            if matches!(self.proto.state(),
+                                bsql_pg_proto::ActiveState::SimpleQueryStreamingRows { .. }
+                                | bsql_pg_proto::ActiveState::BindExecuteStreamingRows { .. })
+                            {
+                                self.drain_streaming().await?;
+                                continue;
+                            }
+                            self.read_from_socket().await?;
+                        }
+                        FeedEvent::Fail(_) => {
+                            if let Some(&cause) = self.proto.fail_cause() {
+                                return Err(DriverError::Protocol(cause));
+                            }
+                            return Err(DriverError::NotReady);
+                        }
+                        FeedEvent::Close => return Err(DriverError::NotReady),
+                        _ => {}
                     }
                 }
                 FeedEvent::SendBytes(bytes) => {
                     self.stream.write_all(bytes).await?;
                 }
-                FeedEvent::Deliver(_, _) => {}
+                FeedEvent::Deliver(id, reply) => {
+                    on_deliver(id, reply);
+                }
+                FeedEvent::StreamingRows => {
+                    self.drain_streaming().await?;
+                }
                 FeedEvent::Notice(_) => {}
                 FeedEvent::Fail(_) => {
+                    if let Some(&cause) = self.proto.fail_cause() {
+                        return Err(DriverError::Protocol(cause));
+                    }
                     return Err(DriverError::NotReady);
                 }
-                FeedEvent::Close => {
-                    return Err(DriverError::NotReady);
-                }
+                FeedEvent::Close => return Err(DriverError::NotReady),
                 _ => {}
             }
         }
+    }
+
+    async fn read_from_socket(&mut self) -> Result<(), DriverError> {
+        let n = self.stream.read(&mut self.buf).await?;
+        if n == 0 {
+            return Err(DriverError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "server closed connection",
+            )));
+        }
+        self.proto.feed_inbound(&self.buf[..n]).map_err(|_| {
+            DriverError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "read buffer full",
+            ))
+        })
+    }
+
+    async fn drain_streaming(&mut self) -> Result<(), DriverError> {
+        self.proto.iter_rows(&mut self.wb, |stream| {
+            loop {
+                match stream.col_next() {
+                    bsql_pg_proto::ColEvent::EndQuery { .. } => return,
+                    bsql_pg_proto::ColEvent::NeedMore => {
+                        // NeedMore after EndRow = CC dispatched silently,
+                        // RFQ pending. Continue — next col_next dispatches RFQ.
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Ok(())
     }
 }

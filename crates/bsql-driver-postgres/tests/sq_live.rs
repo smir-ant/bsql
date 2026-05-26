@@ -32,3 +32,15 @@ async fn dml_insert_and_drop() {
 
     conn.close().await.expect("close");
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn select_1_returns_tag() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+    let tag = conn.simple_query("SELECT 1").await.expect("select");
+    eprintln!("SELECT 1 tag: [{tag}]");
+    assert!(tag.contains("SELECT"), "got: {tag}");
+    conn.close().await.expect("close");
+}
