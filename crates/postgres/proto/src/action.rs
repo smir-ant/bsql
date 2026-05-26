@@ -1034,6 +1034,14 @@ pub enum FeedEvent<'wb> {
     /// Server notice (WARNING/NOTICE/INFO/DEBUG/LOG). Non-fatal.
     /// Resolve via [`crate::PgProtocol::get_notice`].
     Notice(crate::notices_arena::NoticeRef),
+    /// Async notification from LISTEN/NOTIFY. Resolve via
+    /// [`crate::PgProtocol::get_notification`].
+    Notify {
+        /// PID of the notifying backend process.
+        pid: i32,
+        /// Handle into the notifications arena.
+        notif_ref: crate::notifications_arena::NotificationRef,
+    },
 }
 
 /// Classified push-side failure — the bytes-only push API

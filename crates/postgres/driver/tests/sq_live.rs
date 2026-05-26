@@ -620,6 +620,36 @@ async fn transaction_helpers() {
 
 #[tokio::test]
 #[ignore = "requires local PG"]
+async fn listen_notify() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut listener = Connection::connect(&config).await.expect("listener");
+    let mut notifier = Connection::connect(&config).await.expect("notifier");
+
+    listener.listen("bsql_test_ch").await.expect("listen");
+
+    notifier.simple_query("NOTIFY bsql_test_ch, 'hello from bsql'")
+        .await.expect("notify");
+
+    let notif = listener.recv_notification(std::time::Duration::from_secs(5))
+        .await.expect("recv");
+    let notif = notif.expect("should have notification");
+    assert_eq!(notif.channel, "bsql_test_ch");
+    assert_eq!(notif.payload, "hello from bsql");
+    assert!(notif.pid > 0);
+
+    listener.unlisten("bsql_test_ch").await.expect("unlisten");
+
+    let none = listener.recv_notification(std::time::Duration::from_millis(100))
+        .await.expect("recv timeout");
+    assert!(none.is_none(), "no notification after unlisten");
+
+    listener.close().await.expect("close listener");
+    notifier.close().await.expect("close notifier");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
 async fn pool_basic() {
     use bsql_postgres::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")

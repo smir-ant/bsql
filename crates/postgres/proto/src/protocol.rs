@@ -5502,6 +5502,7 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_active<'w, 'r>(
         [Action::FailReply { id }, ..] => FeedEvent::Fail(*id),
         [Action::CloseSocket] => FeedEvent::Close,
         [Action::Notice { notice_ref }] => FeedEvent::Notice(*notice_ref),
+        [Action::Notify { pid, notif_ref }] => FeedEvent::Notify { pid: *pid, notif_ref: *notif_ref },
         _ => FeedEvent::Close,
     }
 }
@@ -5550,6 +5551,7 @@ pub(in crate::protocol) fn advance_one_frame_dispatch_connecting<'w, 'r>(
         [Action::FailReply { id }, ..] => FeedEvent::Fail(*id),
         [Action::CloseSocket] => FeedEvent::Close,
         [Action::Notice { notice_ref }] => FeedEvent::Notice(*notice_ref),
+        [Action::Notify { pid, notif_ref }] => FeedEvent::Notify { pid: *pid, notif_ref: *notif_ref },
         _ => FeedEvent::Close,
     }
 }

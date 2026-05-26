@@ -33,6 +33,17 @@ impl PreparedStatement {
     }
 }
 
+/// An async notification received via LISTEN/NOTIFY.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    /// Channel name.
+    pub channel: String,
+    /// Payload (may be empty).
+    pub payload: String,
+    /// PID of the backend that sent the notification.
+    pub pid: i32,
+}
+
 /// Result of a query — rows + command tag + column count.
 #[derive(Debug)]
 pub struct QueryResult {
@@ -557,6 +568,59 @@ impl Connection {
         Ok(())
     }
 
+    /// Subscribe to a LISTEN channel.
+    pub async fn listen(&mut self, channel: &str) -> Result<(), DriverError> {
+        self.simple_query(&format!("LISTEN {channel}")).await?;
+        Ok(())
+    }
+
+    /// Unsubscribe from a LISTEN channel.
+    pub async fn unlisten(&mut self, channel: &str) -> Result<(), DriverError> {
+        self.simple_query(&format!("UNLISTEN {channel}")).await?;
+        Ok(())
+    }
+
+    /// Wait for the next async notification. Reads from the socket
+    /// until a NotificationResponse arrives or the timeout expires.
+    pub async fn recv_notification(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Notification>, DriverError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            match tokio::time::timeout(remaining, self.stream.read(&mut self.buf)).await {
+                Ok(Ok(0)) => return Err(DriverError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "server closed connection",
+                ))),
+                Ok(Ok(n)) => {
+                    self.proto.feed_inbound(&self.buf[..n]).map_err(|_| {
+                        DriverError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "read buffer full",
+                        ))
+                    })?;
+                    let event = self.proto.advance_one_frame(&mut self.wb);
+                    if let FeedEvent::Notify { notif_ref, pid } = event {
+                        if let Ok(payload) = self.proto.get_notification(notif_ref) {
+                            return Ok(Some(Notification {
+                                channel: payload.channel.as_str().to_string(),
+                                payload: String::from_utf8_lossy(&payload.payload).into_owned(),
+                                pid,
+                            }));
+                        }
+                    }
+                }
+                Ok(Err(e)) => return Err(DriverError::Io(e)),
+                Err(_) => return Ok(None),
+            }
+        }
+    }
+
     /// Execute a parameterized DML. Returns affected row count.
     ///
     /// Uses Extended Query (Parse + Bind + Execute). Prevents SQL injection.
@@ -880,7 +944,7 @@ impl Connection {
                 FeedEvent::StreamingRows => {
                     self.drain_streaming().await?;
                 }
-                FeedEvent::Notice(_) => {}
+                FeedEvent::Notice(_) | FeedEvent::Notify { .. } => {}
                 FeedEvent::Fail(_) => {
                     // Capture error but continue pumping to drain
                     // the trailing RFQ and return to Idle.
@@ -1015,7 +1079,7 @@ impl Connection {
                 FeedEvent::StreamingRows => {
                     self.collect_streaming(rows).await?;
                 }
-                FeedEvent::Notice(_) => {}
+                FeedEvent::Notice(_) | FeedEvent::Notify { .. } => {}
                 FeedEvent::Fail(_) => {
                     // Capture error but continue pumping to drain
                     // the trailing RFQ and return to Idle.
