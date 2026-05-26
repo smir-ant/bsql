@@ -753,6 +753,139 @@ async fn copy_in_large() {
 
 #[tokio::test]
 #[ignore = "requires local PG"]
+async fn copy_in_empty() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+    conn.execute("CREATE TEMP TABLE cp_empty(v int)").await.expect("create");
+
+    let n = conn.copy_in("cp_empty", Vec::<&str>::new()).await.expect("copy_in empty");
+    assert_eq!(n, 0);
+
+    let r = conn.query("SELECT count(*) FROM cp_empty").await.expect("count");
+    assert_eq!(r.rows[0].get_i64(0), Some(0));
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn prepared_reuse_after_error() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.execute("CREATE TEMP TABLE pr_err(id int PRIMARY KEY)").await.expect("create");
+    let stmt = conn.prepare("INSERT INTO pr_err VALUES ($1)").await.expect("prepare");
+
+    conn.execute_prepared(&stmt, &(1i32,)).await.expect("insert 1");
+    let err = conn.execute_prepared(&stmt, &(1i32,)).await;
+    assert!(err.is_err(), "duplicate should fail");
+
+    conn.execute_prepared(&stmt, &(2i32,)).await.expect("insert 2 after error");
+
+    let r = conn.query("SELECT count(*) FROM pr_err").await.expect("count");
+    assert_eq!(r.rows[0].get_i64(0), Some(2));
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn unicode_values() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    let result = conn.query("SELECT 'Привет мир'::text, '日本語'::text, '🦀🐘'::text")
+        .await.expect("query");
+    assert_eq!(result.rows[0].get_str(0), Some("Привет мир"));
+    assert_eq!(result.rows[0].get_str(1), Some("日本語"));
+    assert_eq!(result.rows[0].get_str(2), Some("🦀🐘"));
+
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn null_heavy_result() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    let result = conn.query(
+        "SELECT NULL::int, NULL::text, NULL::bool FROM generate_series(1, 500)"
+    ).await.expect("query");
+    assert_eq!(result.rows.len(), 500);
+    for row in &result.rows {
+        assert!(row.is_null(0));
+        assert!(row.is_null(1));
+        assert!(row.is_null(2));
+        assert_eq!(row.len(), 3);
+    }
+    conn.close().await.expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local PG"]
+async fn pool_concurrent_contention() {
+    use bsql_postgres::Pool;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let pool = Pool::new(config, 3).await.expect("pool");
+
+    let mut handles = Vec::new();
+    for i in 0..20u32 {
+        let p = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let mut conn = p.get().await.expect("get");
+            let r = conn.query(&format!("SELECT {i}::int")).await.expect("query");
+            assert_eq!(r.rows[0].get_i32(0), Some(i as i32));
+        }));
+    }
+    for h in handles {
+        h.await.expect("task");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn sequential_errors_recovery() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    for _ in 0..10 {
+        let err = conn.simple_query("INVALID SQL").await;
+        assert!(err.is_err());
+    }
+
+    let result = conn.query("SELECT 42::int").await.expect("query after 10 errors");
+    assert_eq!(result.rows[0].get_i32(0), Some(42));
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn wide_row_many_columns() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    let cols: Vec<String> = (0..50).map(|i| format!("{i}::int AS c{i}")).collect();
+    let sql = format!("SELECT {}", cols.join(", "));
+    let result = conn.query(&sql).await.expect("query");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].len(), 50);
+    assert_eq!(result.column_names.len(), 50);
+    assert_eq!(result.column_names[0], "c0");
+    assert_eq!(result.column_names[49], "c49");
+    assert_eq!(result.rows[0].get_i32(0), Some(0));
+    assert_eq!(result.rows[0].get_i32(49), Some(49));
+
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
 async fn pool_basic() {
     use bsql_postgres::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")

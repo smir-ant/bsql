@@ -1052,10 +1052,13 @@ impl Connection {
                                 continue;
                             }
                             FeedEvent::Fail(_) => {
-                                if let Some(&cause) = self.proto.fail_cause() {
-                                    return Err(self.classify_error(cause));
-                                }
-                                return Err(DriverError::NotReady);
+                                let err = if let Some(&cause) = self.proto.fail_cause() {
+                                    self.classify_error(cause)
+                                } else {
+                                    DriverError::NotReady
+                                };
+                                self.drain_to_idle().await;
+                                return Err(err);
                             }
                             FeedEvent::Close => return Err(DriverError::NotReady),
                             _ => { break; }
@@ -1073,36 +1076,13 @@ impl Connection {
                 }
                 FeedEvent::Notice(_) | FeedEvent::Notify { .. } => {}
                 FeedEvent::Fail(_) => {
-                    // Capture error but continue pumping to drain
-                    // the trailing RFQ and return to Idle.
-                    // Without this, the connection is stuck in
-                    // DrainRfqAfterError and unusable.
                     let err = if let Some(&cause) = self.proto.fail_cause() {
                         self.classify_error(cause)
                     } else {
                         DriverError::NotReady
                     };
-                    // Drain until Idle, then return the captured error.
-                    loop {
-                        let ev = self.proto.advance_one_frame(&mut self.wb);
-                        match ev {
-                            FeedEvent::Idle => return Err(err),
-                            FeedEvent::NeedMoreBytes => {
-                                // Retry before socket read (silent dispatch).
-                                let ev2 = self.proto.advance_one_frame(&mut self.wb);
-                                match ev2 {
-                                    FeedEvent::Idle => return Err(err),
-                                    FeedEvent::NeedMoreBytes => {
-                                        if let Err(e) = self.read_from_socket().await {
-                                            return Err(e);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                    self.drain_to_idle().await;
+                    return Err(err);
                 }
                 FeedEvent::Close => return Err(DriverError::NotReady),
                 _ => {}
@@ -1141,6 +1121,28 @@ impl Connection {
             }
         });
         Ok(())
+    }
+
+    async fn drain_to_idle(&mut self) {
+        for _ in 0..50 {
+            let ev = self.proto.advance_one_frame(&mut self.wb);
+            match ev {
+                FeedEvent::Idle => return,
+                FeedEvent::NeedMoreBytes => {
+                    let ev2 = self.proto.advance_one_frame(&mut self.wb);
+                    match ev2 {
+                        FeedEvent::Idle => return,
+                        FeedEvent::NeedMoreBytes => {
+                            if self.read_from_socket().await.is_err() {
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     async fn pump_until_idle_with_rows(
@@ -1188,10 +1190,13 @@ impl Connection {
                             self.read_from_socket().await?;
                         }
                         FeedEvent::Fail(_) => {
-                            if let Some(&cause) = self.proto.fail_cause() {
-                                return Err(DriverError::Protocol(cause));
-                            }
-                            return Err(DriverError::NotReady);
+                            let err = if let Some(&cause) = self.proto.fail_cause() {
+                                self.classify_error(cause)
+                            } else {
+                                DriverError::NotReady
+                            };
+                            self.drain_to_idle().await;
+                            return Err(err);
                         }
                         FeedEvent::Close => return Err(DriverError::NotReady),
                         _ => {}
@@ -1208,36 +1213,13 @@ impl Connection {
                 }
                 FeedEvent::Notice(_) | FeedEvent::Notify { .. } => {}
                 FeedEvent::Fail(_) => {
-                    // Capture error but continue pumping to drain
-                    // the trailing RFQ and return to Idle.
-                    // Without this, the connection is stuck in
-                    // DrainRfqAfterError and unusable.
                     let err = if let Some(&cause) = self.proto.fail_cause() {
                         self.classify_error(cause)
                     } else {
                         DriverError::NotReady
                     };
-                    // Drain until Idle, then return the captured error.
-                    loop {
-                        let ev = self.proto.advance_one_frame(&mut self.wb);
-                        match ev {
-                            FeedEvent::Idle => return Err(err),
-                            FeedEvent::NeedMoreBytes => {
-                                // Retry before socket read (silent dispatch).
-                                let ev2 = self.proto.advance_one_frame(&mut self.wb);
-                                match ev2 {
-                                    FeedEvent::Idle => return Err(err),
-                                    FeedEvent::NeedMoreBytes => {
-                                        if let Err(e) = self.read_from_socket().await {
-                                            return Err(e);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                    self.drain_to_idle().await;
+                    return Err(err);
                 }
                 FeedEvent::Close => return Err(DriverError::NotReady),
                 _ => {}
