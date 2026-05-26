@@ -394,3 +394,36 @@ async fn ssl_disable_works() {
     conn.ping().await.expect("ping");
     conn.close().await.expect("close");
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn connect_via_dsn() {
+    let config = ConnectConfig::from_dsn(
+        "postgres://smir-ant@127.0.0.1:5432/postgres?sslmode=disable"
+    ).expect("parse DSN");
+    let mut conn = Connection::connect(&config).await.expect("connect");
+    let row = conn.query_one("SELECT 1").await.expect("query");
+    assert_eq!(row.get_i32(0), Some(1));
+    conn.close().await.expect("close");
+}
+
+#[test]
+fn dsn_parsing_unit_tests() {
+    let c = ConnectConfig::from_dsn("postgres://alice:secret@db.example.com:5433/mydb?sslmode=require").unwrap();
+    assert_eq!(c.user, "alice");
+    assert_eq!(c.password.as_deref(), Some("secret"));
+    assert_eq!(c.host, "db.example.com");
+    assert_eq!(c.port, 5433);
+    assert_eq!(c.database.as_deref(), Some("mydb"));
+    assert_eq!(c.ssl_mode, bsql_driver_postgres::SslMode::Require);
+
+    let c2 = ConnectConfig::from_dsn("postgres://bob@localhost").unwrap();
+    assert_eq!(c2.user, "bob");
+    assert!(c2.password.is_none());
+    assert_eq!(c2.host, "localhost");
+    assert_eq!(c2.port, 5432);
+    assert!(c2.database.is_none());
+
+    assert!(ConnectConfig::from_dsn("http://bad").is_err());
+    assert!(ConnectConfig::from_dsn("postgres://").is_err());
+}

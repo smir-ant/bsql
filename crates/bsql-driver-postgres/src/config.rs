@@ -35,6 +35,90 @@ pub struct ConnectConfig {
 }
 
 impl ConnectConfig {
+    /// Parse a PostgreSQL connection string (DSN).
+    ///
+    /// Format: `postgres://user:password@host:port/database?sslmode=require`
+    ///
+    /// All components except user are optional:
+    /// - `postgres://user@host/db` — no password, default port
+    /// - `postgres://user:pass@host` — no database (defaults to user)
+    /// - `postgres://user@host?sslmode=disable`
+    pub fn from_dsn(dsn: &str) -> Result<Self, String> {
+        let s = dsn.strip_prefix("postgres://")
+            .or_else(|| dsn.strip_prefix("postgresql://"))
+            .ok_or_else(|| "DSN must start with postgres:// or postgresql://".to_string())?;
+
+        // Split query string
+        let (main, query) = match s.split_once('?') {
+            Some((m, q)) => (m, Some(q)),
+            None => (s, None),
+        };
+
+        // Split userinfo@hostpath
+        let (userinfo, hostpath) = match main.split_once('@') {
+            Some((u, h)) => (u, h),
+            None => return Err("missing @ in DSN".to_string()),
+        };
+
+        // Parse user:password
+        let (user, password) = match userinfo.split_once(':') {
+            Some((u, p)) => (u.to_string(), Some(p.to_string())),
+            None => (userinfo.to_string(), None),
+        };
+
+        if user.is_empty() {
+            return Err("empty user in DSN".to_string());
+        }
+
+        // Parse host:port/database
+        let (hostport, database) = match hostpath.split_once('/') {
+            Some((hp, db)) => (hp, if db.is_empty() { None } else { Some(db.to_string()) }),
+            None => (hostpath, None),
+        };
+
+        let (host, port) = match hostport.rsplit_once(':') {
+            Some((h, p)) => {
+                let port = p.parse::<u16>().map_err(|_| format!("invalid port: {p}"))?;
+                (h.to_string(), port)
+            }
+            None => (hostport.to_string(), 5432),
+        };
+
+        // Parse query params
+        let mut ssl_mode = SslMode::Prefer;
+        let mut timeout = 10u64;
+        if let Some(q) = query {
+            for param in q.split('&') {
+                if let Some((k, v)) = param.split_once('=') {
+                    match k {
+                        "sslmode" => {
+                            ssl_mode = match v {
+                                "disable" => SslMode::Disable,
+                                "prefer" => SslMode::Prefer,
+                                "require" => SslMode::Require,
+                                other => return Err(format!("unknown sslmode: {other}")),
+                            };
+                        }
+                        "connect_timeout" => {
+                            timeout = v.parse().map_err(|_| format!("invalid timeout: {v}"))?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            host,
+            port,
+            user,
+            database,
+            password,
+            connect_timeout_secs: timeout,
+            ssl_mode,
+        })
+    }
+
     /// Construct with required fields. Port defaults to 5432.
     pub fn new(host: impl Into<String>, user: impl Into<String>) -> Self {
         Self {
