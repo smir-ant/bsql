@@ -307,6 +307,19 @@ impl Connection {
         Ok(QueryResult { rows, command_tag })
     }
 
+    /// Server version string (e.g., "15.4").
+    pub fn server_version(&self) -> Option<&str> {
+        self.proto.session_params()
+            .server_version
+            .as_ref()
+            .map(|s| s.as_str())
+    }
+
+    /// Server process ID for this connection.
+    pub fn backend_pid(&self) -> i32 {
+        self.proto.with_cancel_request(|_bytes, pid| pid)
+    }
+
     /// Gracefully close the connection.
     pub async fn close(mut self) -> Result<(), DriverError> {
         let mut wb = WriteBuf::new();

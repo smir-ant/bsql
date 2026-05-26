@@ -288,3 +288,21 @@ async fn execute_returns_row_count() {
     conn.close().await.expect("close");
 }
 
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn server_version_and_pid() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    let version = conn.server_version();
+    eprintln!("server version: {:?}", version);
+    assert!(version.is_some(), "expected server version");
+
+    let pid = conn.backend_pid();
+    eprintln!("backend pid: {pid}");
+    assert!(pid > 0, "expected positive pid");
+
+    conn.close().await.expect("close");
+}
