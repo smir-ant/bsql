@@ -965,6 +965,9 @@ impl Connection {
         }
     }
 
+}
+
+impl Connection {
     /// Core event pump: advance frames until Idle. Handles:
     /// - NeedMoreBytes retry (silent dispatches leave unread frames)
     /// - Socket read when buffer truly empty

@@ -87,6 +87,7 @@ pub struct Connection {
     stream: Stream,
     wb: WriteBuf,
     buf: Vec<u8>,
+    terminated: bool,
 }
 
 impl Connection {
@@ -150,7 +151,7 @@ impl Connection {
                     FeedEvent::Idle => {
                         consecutive_need = 0;
                         match connecting.into_active() {
-                            Ok(active) => return Ok(Self { proto: active, stream, wb, buf }),
+                            Ok(active) => return Ok(Self { proto: active, stream, wb, buf, terminated: false }),
                             Err(bsql_postgres_proto::IntoActiveError::StillConnecting(c)) => {
                                 connecting = c;
                             }
@@ -539,11 +540,19 @@ impl Connection {
         self.proto.session_params().server_version.as_ref().map(|s| s.as_str())
     }
 
-    pub fn close(mut self) -> Result<(), DriverError> {
-        let mut wb = WriteBuf::new();
-        match self.proto.terminate(&mut wb) {
-            Ok((bytes, _)) => { self.stream.write_all(bytes)?; self.stream.shutdown()?; Ok(()) }
-            Err(_) => Err(DriverError::Io(std::io::Error::other("terminate failed"))),
-        }
+    pub fn close(&mut self) -> Result<(), DriverError> {
+        if self.terminated { return Ok(()); }
+        self.terminated = true;
+        self.stream.write_all(&[b'X', 0, 0, 0, 4])?;
+        self.stream.shutdown()?;
+        Ok(())
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if self.terminated { return; }
+        // PG Terminate message: tag 'X' + length 4 (self-inclusive)
+        let _ = self.stream.write_all(&[b'X', 0, 0, 0, 4]);
     }
 }

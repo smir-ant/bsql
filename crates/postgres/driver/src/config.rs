@@ -17,6 +17,7 @@ impl Default for SslMode {
 
 /// Connection configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConnectConfig {
     /// PostgreSQL server hostname.
     pub host: String,
