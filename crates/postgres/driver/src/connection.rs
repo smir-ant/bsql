@@ -496,6 +496,67 @@ impl Connection {
         Ok(QueryResult { rows, command_tag, column_count })
     }
 
+    /// Execute a parameterized query and return rows.
+    ///
+    /// One-shot: Parse + Describe + BindExecute. For repeated queries,
+    /// use `prepare` + `query_prepared` to avoid re-parsing.
+    pub async fn query_params<P: bsql_postgres_proto::params::ParamsWriter>(
+        &mut self,
+        sql: &str,
+        params: &P,
+    ) -> Result<QueryResult, DriverError> {
+        let stmt = self.prepare(sql).await?;
+        let result = self.query_prepared(&stmt, params).await?;
+        let _ = self.close_statement(&stmt).await;
+        Ok(result)
+    }
+
+    /// Parameterized query returning exactly one row.
+    pub async fn query_params_one<P: bsql_postgres_proto::params::ParamsWriter>(
+        &mut self,
+        sql: &str,
+        params: &P,
+    ) -> Result<Row, DriverError> {
+        let result = self.query_params(sql, params).await?;
+        if result.rows.is_empty() {
+            return Err(DriverError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "query returned no rows",
+            )));
+        }
+        let mut rows = result.rows;
+        Ok(rows.swap_remove(0))
+    }
+
+    /// Parameterized query returning zero or one row.
+    pub async fn query_params_opt<P: bsql_postgres_proto::params::ParamsWriter>(
+        &mut self,
+        sql: &str,
+        params: &P,
+    ) -> Result<Option<Row>, DriverError> {
+        let result = self.query_params(sql, params).await?;
+        let mut rows = result.rows;
+        if rows.is_empty() { Ok(None) } else { Ok(Some(rows.swap_remove(0))) }
+    }
+
+    /// Begin an explicit transaction.
+    pub async fn begin(&mut self) -> Result<(), DriverError> {
+        self.simple_query("BEGIN").await?;
+        Ok(())
+    }
+
+    /// Commit the current transaction.
+    pub async fn commit(&mut self) -> Result<(), DriverError> {
+        self.simple_query("COMMIT").await?;
+        Ok(())
+    }
+
+    /// Roll back the current transaction.
+    pub async fn rollback(&mut self) -> Result<(), DriverError> {
+        self.simple_query("ROLLBACK").await?;
+        Ok(())
+    }
+
     /// Execute a parameterized DML. Returns affected row count.
     ///
     /// Uses Extended Query (Parse + Bind + Execute). Prevents SQL injection.

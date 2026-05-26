@@ -562,6 +562,64 @@ async fn prepared_empty_result() {
 
 #[tokio::test]
 #[ignore = "requires local PG"]
+async fn query_params_select() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.execute("CREATE TEMP TABLE qp_test(id int, name text)").await.expect("create");
+    conn.execute("INSERT INTO qp_test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')")
+        .await.expect("insert");
+
+    let result = conn.query_params(
+        "SELECT name FROM qp_test WHERE id > $1 ORDER BY id",
+        &(1i32,),
+    ).await.expect("query_params");
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0].get_str(0), Some("bob"));
+    assert_eq!(result.rows[1].get_str(0), Some("charlie"));
+
+    let row = conn.query_params_one(
+        "SELECT name FROM qp_test WHERE id = $1",
+        &(2i32,),
+    ).await.expect("query_params_one");
+    assert_eq!(row.get_str(0), Some("bob"));
+
+    let none = conn.query_params_opt(
+        "SELECT name FROM qp_test WHERE id = $1",
+        &(999i32,),
+    ).await.expect("query_params_opt");
+    assert!(none.is_none());
+
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn transaction_helpers() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.execute("CREATE TEMP TABLE tx_h(v int)").await.expect("create");
+
+    conn.begin().await.expect("begin");
+    conn.execute("INSERT INTO tx_h VALUES (1)").await.expect("insert");
+    conn.commit().await.expect("commit");
+    let r = conn.query("SELECT count(*) FROM tx_h").await.expect("count");
+    assert_eq!(r.rows[0].get_i64(0), Some(1));
+
+    conn.begin().await.expect("begin2");
+    conn.execute("INSERT INTO tx_h VALUES (2)").await.expect("insert2");
+    conn.rollback().await.expect("rollback");
+    let r = conn.query("SELECT count(*) FROM tx_h").await.expect("count2");
+    assert_eq!(r.rows[0].get_i64(0), Some(1));
+
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
 async fn pool_basic() {
     use bsql_postgres::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
