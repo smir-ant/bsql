@@ -21,7 +21,7 @@ Three crates live in the workspace:
 |-------|-------------|--------|
 | [`bsql-pg-proto`](crates/bsql-pg-proto/) | Sans-IO PG wire protocol state machine (`no_std + alloc`, `#![forbid(unsafe_code)]`) | Feature-complete for v1 |
 | [`bsql-pg-proto-derive`](crates/bsql-pg-proto-derive/) | Proc-macro pair (`#[derive(Pristine)]`) | Shipped |
-| [`bsql-driver-postgres`](crates/bsql-driver-postgres/) | Async driver (tokio + rustls) | Alpha — [README](crates/bsql-driver-postgres/README.md) |
+| [`bsql-postgres`](crates/bsql-postgres/) | Async driver (tokio + rustls) | Alpha — [README](crates/bsql-postgres/README.md) |
 
 ### bsql-pg-proto highlights
 - PgProtocol<Active>: 296 B per connection
@@ -32,7 +32,7 @@ Three crates live in the workspace:
 - No fixed column/param caps (exact-size Box<[u32]>)
 - 673 tests, bench-verified 0 regressions
 
-### bsql-driver-postgres highlights
+### bsql-postgres highlights
 - Connect (Trust + SCRAM + TLS via rustls)
 - query / query_one / query_opt / simple_query / execute
 - Typed Row access: `row.get::<i32>(0)`

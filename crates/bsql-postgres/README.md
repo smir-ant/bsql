@@ -1,4 +1,4 @@
-# bsql-driver-postgres
+# bsql-postgres
 
 Async PostgreSQL driver for Rust, built on the [`bsql-pg-proto`](../bsql-pg-proto) sans-IO state machine.
 
@@ -17,7 +17,7 @@ Async PostgreSQL driver for Rust, built on the [`bsql-pg-proto`](../bsql-pg-prot
 ## Quick Start
 
 ```rust
-use bsql_driver_postgres::{ConnectConfig, Connection};
+use bsql_postgres::{ConnectConfig, Connection};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -110,7 +110,7 @@ Supported types via `FromText`: `i16`, `i32`, `i64`, `f32`, `f64`, `bool`, `Stri
 ## Architecture
 
 ```
-bsql-driver-postgres (this crate)
+bsql-postgres (this crate)
   └─ bsql-pg-proto (sans-IO state machine, #![forbid(unsafe_code)])
        └─ heapless, simdutf8, sha2, hmac, pbkdf2, md-5, zeroize, getrandom
 ```

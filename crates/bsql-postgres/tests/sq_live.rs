@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-use bsql_driver_postgres::{ConnectConfig, Connection};
+use bsql_postgres::{ConnectConfig, Connection};
 
 #[tokio::test]
 #[ignore = "requires local PG"]
@@ -363,7 +363,7 @@ async fn connect_timeout() {
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn ssl_prefer_falls_back_to_plain() {
-    use bsql_driver_postgres::SslMode;
+    use bsql_postgres::SslMode;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
         .ssl_mode(SslMode::Prefer);
@@ -375,7 +375,7 @@ async fn ssl_prefer_falls_back_to_plain() {
 #[tokio::test]
 #[ignore = "requires local PG without SSL"]
 async fn ssl_require_fails_on_non_ssl_server() {
-    use bsql_driver_postgres::SslMode;
+    use bsql_postgres::SslMode;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
         .ssl_mode(SslMode::Require);
@@ -386,7 +386,7 @@ async fn ssl_require_fails_on_non_ssl_server() {
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn ssl_disable_works() {
-    use bsql_driver_postgres::SslMode;
+    use bsql_postgres::SslMode;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
         .ssl_mode(SslMode::Disable);
@@ -415,7 +415,7 @@ fn dsn_parsing_unit_tests() {
     assert_eq!(c.host, "db.example.com");
     assert_eq!(c.port, 5433);
     assert_eq!(c.database.as_deref(), Some("mydb"));
-    assert_eq!(c.ssl_mode, bsql_driver_postgres::SslMode::Require);
+    assert_eq!(c.ssl_mode, bsql_postgres::SslMode::Require);
 
     let c2 = ConnectConfig::from_dsn("postgres://bob@localhost").unwrap();
     assert_eq!(c2.user, "bob");
