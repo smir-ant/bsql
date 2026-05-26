@@ -119,6 +119,36 @@ impl ConnectConfig {
         })
     }
 
+    /// Construct from environment variables.
+    ///
+    /// Reads: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE`.
+    /// Falls back to defaults: host=localhost, port=5432, user=current OS user.
+    pub fn from_env() -> Self {
+        let host = std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_string());
+        let port = std::env::var("PGPORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(5432);
+        let user = std::env::var("PGUSER")
+            .unwrap_or_else(|_| std::env::var("USER").unwrap_or_else(|_| "postgres".to_string()));
+        let database = std::env::var("PGDATABASE").ok();
+        let password = std::env::var("PGPASSWORD").ok();
+        let ssl_mode = match std::env::var("PGSSLMODE").as_deref() {
+            Ok("disable") => SslMode::Disable,
+            Ok("require") => SslMode::Require,
+            _ => SslMode::Prefer,
+        };
+        Self {
+            host,
+            port,
+            user,
+            database,
+            password,
+            connect_timeout_secs: 10,
+            ssl_mode,
+        }
+    }
+
     /// Construct with required fields. Port defaults to 5432.
     pub fn new(host: impl Into<String>, user: impl Into<String>) -> Self {
         Self {

@@ -427,3 +427,13 @@ fn dsn_parsing_unit_tests() {
     assert!(ConnectConfig::from_dsn("http://bad").is_err());
     assert!(ConnectConfig::from_dsn("postgres://").is_err());
 }
+
+
+#[test]
+fn from_env_creates_config() {
+    // Just verify from_env doesn't panic and returns sane defaults
+    let config = ConnectConfig::from_env();
+    assert!(!config.host.is_empty());
+    assert!(config.port > 0);
+    assert!(!config.user.is_empty());
+}
