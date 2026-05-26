@@ -299,6 +299,9 @@ impl Connection {
                 return Err(err);
             }
 
+            if Self::is_streaming_state(self.proto.state()) {
+                continue;
+            }
             if was_empty && !matches!(self.proto.connection_status(),
                 bsql_postgres_proto::ConnectionStatus::Ready)
             {
@@ -341,10 +344,32 @@ impl Connection {
                     }
                     bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
                     bsql_postgres_proto::ColEvent::NeedMore => {
-                        let cap = feed_cap.max(1).min(buf.len());
-                        let Ok(n) = stream.read(&mut buf[..cap]) else { return };
-                        if n == 0 { return; }
-                        let _ = rs.feed(&buf[..n]);
+                        // Retry col_next first — CC+Z may already be in read_buf
+                        // (silent dispatch returns NeedMore but data exists).
+                        match rs.col_next() {
+                            bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
+                            bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
+                                current_row.push(Some(bytes.to_vec()));
+                                continue;
+                            }
+                            bsql_postgres_proto::ColEvent::NeedMore => {
+                                // Truly empty — read from socket.
+                                let cap = feed_cap.max(1).min(buf.len());
+                                let Ok(n) = stream.read(&mut buf[..cap]) else { return };
+                                if n == 0 { return; }
+                                let _ = rs.feed(&buf[..n]);
+                            }
+                            other => {
+                                // Handle other events inline.
+                                match other {
+                                    bsql_postgres_proto::ColEvent::Null { .. } => current_row.push(None),
+                                    bsql_postgres_proto::ColEvent::EndRow => {
+                                        rows.push(Row { columns: core::mem::take(&mut current_row) });
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                     }
                     bsql_postgres_proto::ColEvent::Chunk { bytes, .. } => {
                         if let Some(Some(v)) = current_row.last_mut() {
@@ -371,9 +396,11 @@ impl Connection {
         let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
         let actions = guard.push_command(cmd, &mut self.wb)
             .map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        let mut sent = 0usize;
         for action in actions.as_slice() {
             if let bsql_postgres_proto::Action::SendBytes(bytes) = action {
                 self.stream.write_all(bytes)?;
+                sent += bytes.len();
             }
         }
         self.wb.clear();
