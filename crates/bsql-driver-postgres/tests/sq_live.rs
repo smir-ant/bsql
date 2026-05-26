@@ -306,3 +306,20 @@ async fn server_version_and_pid() {
 
     conn.close().await.expect("close");
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn query_opt_found_and_not_found() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    let found = conn.query_opt("SELECT 42").await.expect("found");
+    assert!(found.is_some());
+    assert_eq!(found.unwrap().get_i32(0), Some(42));
+
+    let empty = conn.query_opt("SELECT 1 WHERE false").await.expect("empty");
+    assert!(empty.is_none());
+
+    conn.close().await.expect("close");
+}

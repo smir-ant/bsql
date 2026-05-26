@@ -255,6 +255,17 @@ impl Connection {
         Ok(count)
     }
 
+    /// Execute a query expecting zero or one row. Returns `None` if empty.
+    pub async fn query_opt(&mut self, sql: &str) -> Result<Option<Row>, DriverError> {
+        let result = self.query(sql).await?;
+        let mut rows = result.rows;
+        if rows.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(rows.swap_remove(0)))
+        }
+    }
+
     /// Execute a query expecting exactly one row. Returns the row.
     pub async fn query_one(&mut self, sql: &str) -> Result<Row, DriverError> {
         let result = self.query(sql).await?;
