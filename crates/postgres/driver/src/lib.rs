@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 //! Async PostgreSQL driver built on the `bsql-pg-proto` sans-IO state machine.
 //!
 //! This crate wraps the protocol state machine with real TCP I/O via

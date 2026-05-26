@@ -705,7 +705,7 @@ impl Connection {
         let id = self.stmt_counter;
         self.stmt_counter = self.stmt_counter.wrapping_add(1);
         let stmt_name = bsql_postgres_proto::StmtName::try_from_str(&format!("_bsql_{id}"))
-            .expect("generated stmt name always valid");
+            .map_err(|_| DriverError::Config("generated stmt name invalid"))?;
 
         // Phase 1: Parse
         let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::ParseKind>();

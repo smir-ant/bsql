@@ -36,6 +36,8 @@ pub enum DriverError {
     Io(std::io::Error),
     NotReady,
     SslRefused,
+    NoRows,
+    Config(&'static str),
 }
 
 impl fmt::Display for DriverError {
@@ -46,6 +48,8 @@ impl fmt::Display for DriverError {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::NotReady => write!(f, "connection not ready"),
             Self::SslRefused => write!(f, "server refused SSL"),
+            Self::NoRows => write!(f, "query returned no rows"),
+            Self::Config(msg) => write!(f, "config error: {msg}"),
         }
     }
 }
@@ -56,7 +60,7 @@ impl std::error::Error for DriverError {
             Self::Db(e) => Some(e),
             Self::Protocol(e) => Some(e),
             Self::Io(e) => Some(e),
-            _ => None,
+            Self::NotReady | Self::SslRefused | Self::NoRows | Self::Config(_) => None,
         }
     }
 }

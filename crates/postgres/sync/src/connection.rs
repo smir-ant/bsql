@@ -100,10 +100,10 @@ impl Connection {
         let mut stream = Stream::Plain(tcp);
 
         let user = bsql_postgres_proto::Ident::try_from_str(&config.user)
-            .map_err(|_| DriverError::Io(std::io::Error::other("invalid user name")))?;
+            .map_err(|_| DriverError::Config("invalid user name"))?;
         let database = match &config.database {
             Some(d) => Some(bsql_postgres_proto::DatabaseName::try_from_str(d)
-                .map_err(|_| DriverError::Io(std::io::Error::other("invalid database name")))?),
+                .map_err(|_| DriverError::Config("invalid database name"))?),
             None => None,
         };
 
@@ -114,7 +114,7 @@ impl Connection {
         let credentials = match config.password_str() {
             Some(pw) => {
                 let password = bsql_postgres_proto::Password::try_from_str(pw)
-                    .map_err(|_| DriverError::Io(std::io::Error::other("invalid password")))?;
+                    .map_err(|_| DriverError::Config("invalid password"))?;
                 bsql_postgres_proto::Credentials::ScramPassword(
                     bsql_postgres_proto::sensitive::Sensitive::new(password),
                 )
@@ -195,8 +195,8 @@ impl Connection {
                 let tls_config = rustls::ClientConfig::builder()
                     .with_root_certificates(root_store)
                     .with_no_client_auth();
-                let server_name = config.host.clone().try_into()
-                    .unwrap_or_else(|_| "localhost".to_owned().try_into().expect("localhost"));
+                let server_name: rustls::pki_types::ServerName<'_> = config.host.clone().try_into()
+                    .map_err(|_| DriverError::Config("invalid server name for TLS"))?;
                 let tls_conn = rustls::ClientConnection::new(
                     std::sync::Arc::new(tls_config), server_name,
                 ).map_err(|e| DriverError::Io(std::io::Error::other(format!("TLS: {e}"))))?;
@@ -418,7 +418,7 @@ impl Connection {
 
     pub fn query_one(&mut self, sql: &str) -> Result<Row, DriverError> {
         let r = self.query(sql)?;
-        r.rows.into_iter().next().ok_or(DriverError::Io(std::io::Error::other("no rows")))
+        r.rows.into_iter().next().ok_or(DriverError::NoRows)
     }
 
     pub fn query_opt(&mut self, sql: &str) -> Result<Option<Row>, DriverError> {
@@ -430,7 +430,7 @@ impl Connection {
         let stmt_name = {
             let id = STMT_COUNTER.fetch_add(1, Ordering::Relaxed);
             bsql_postgres_proto::StmtName::try_from_str(&format!("_bsql_s{id}"))
-                .expect("generated name valid")
+                .map_err(|_| DriverError::Config("generated stmt name invalid"))?
         };
 
         let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::ParseKind>();
@@ -519,7 +519,7 @@ impl Connection {
         &mut self, sql: &str, params: &P,
     ) -> Result<Row, DriverError> {
         let r = self.query_params(sql, params)?;
-        r.rows.into_iter().next().ok_or(DriverError::Io(std::io::Error::other("no rows")))
+        r.rows.into_iter().next().ok_or(DriverError::NoRows)
     }
 
     pub fn close_statement(&mut self, stmt: PreparedStatement) -> Result<(), DriverError> {
