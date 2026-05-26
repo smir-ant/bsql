@@ -2,7 +2,6 @@ use bsql_pg_proto::{
     ActivePhase, FeedEvent, PgProtocol, WriteBuf,
     reply_id::PingKind,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Result of a query — rows + command tag + column count.
 #[derive(Debug)]
@@ -108,16 +107,45 @@ impl FromText for String {
 }
 use tokio::net::TcpStream;
 
-use crate::config::ConnectConfig;
+use crate::config::{ConnectConfig, SslMode};
 use crate::error::DriverError;
+
+enum Stream {
+    Plain(TcpStream),
+    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+impl Stream {
+    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        match self {
+            Self::Plain(s) => s.write_all(buf).await,
+            Self::Tls(s) => s.write_all(buf).await,
+        }
+    }
+    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use tokio::io::AsyncReadExt;
+        match self {
+            Self::Plain(s) => s.read(buf).await,
+            Self::Tls(s) => s.read(buf).await,
+        }
+    }
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        match self {
+            Self::Plain(s) => s.shutdown().await,
+            Self::Tls(s) => s.shutdown().await,
+        }
+    }
+}
 
 /// Async PostgreSQL connection.
 ///
-/// Wraps `PgProtocol<ActivePhase>` with a TCP socket and drives
-/// the sans-IO state machine via an event-pump loop.
+/// Wraps `PgProtocol<ActivePhase>` with a TCP (or TLS) socket and
+/// drives the sans-IO state machine via an event-pump loop.
 pub struct Connection {
     proto: PgProtocol<ActivePhase>,
-    stream: TcpStream,
+    stream: Stream,
     wb: WriteBuf,
     buf: Vec<u8>,
 }
@@ -129,13 +157,15 @@ impl Connection {
     pub async fn connect(config: &ConnectConfig) -> Result<Self, DriverError> {
         let addr = format!("{}:{}", config.host, config.port);
         let timeout = std::time::Duration::from_secs(config.connect_timeout_secs);
-        let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
+        let tcp = tokio::time::timeout(timeout, TcpStream::connect(&addr))
             .await
             .map_err(|_| DriverError::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "connection timed out",
             )))?
             ?;
+
+        let mut stream = Self::negotiate_ssl(tcp, config).await?;
 
         let user = bsql_pg_proto::Ident::try_from_str(&config.user)
             .map_err(|_| DriverError::Io(std::io::Error::new(
@@ -231,6 +261,79 @@ impl Connection {
                     return Err(DriverError::NotReady);
                 }
             }
+        }
+    }
+
+    async fn negotiate_ssl(
+        mut tcp: TcpStream,
+        config: &ConnectConfig,
+    ) -> Result<Stream, DriverError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        if config.ssl_mode == SslMode::Disable {
+            return Ok(Stream::Plain(tcp));
+        }
+
+        // SSL probe via protocol typestate
+        let proto = bsql_pg_proto::PgProtocol::new();
+        let (ssl_bytes, ssl_proto) = proto.push_ssl_request();
+        tcp.write_all(ssl_bytes).await?;
+
+        let mut response = [0u8; 1];
+        tcp.read_exact(&mut response).await?;
+
+        let classified = ssl_proto.classify_ssl_response(response[0]);
+        match classified {
+            bsql_pg_proto::SslClassified::Accepted(_) => {
+                let mut root_store = rustls::RootCertStore::empty();
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+                let tls_config = rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth();
+
+                let connector = tokio_rustls::TlsConnector::from(
+                    std::sync::Arc::new(tls_config),
+                );
+                let server_name = rustls::pki_types::ServerName::try_from(
+                    config.host.as_str(),
+                )
+                .map_err(|_| DriverError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid server name for TLS",
+                )))?
+                .to_owned();
+
+                let tls_stream = connector.connect(server_name, tcp).await
+                    .map_err(|e| DriverError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        format!("TLS handshake failed: {e}"),
+                    )))?;
+
+                Ok(Stream::Tls(tls_stream))
+            }
+            bsql_pg_proto::SslClassified::Refused(_) => {
+                if config.ssl_mode == SslMode::Require {
+                    return Err(DriverError::SslRefused);
+                }
+                Ok(Stream::Plain(tcp))
+            }
+            bsql_pg_proto::SslClassified::ErrorIncoming(_) => {
+                Err(DriverError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "server sent ErrorResponse during SSL probe",
+                )))
+            }
+            bsql_pg_proto::SslClassified::InvalidByte { byte } => {
+                Err(DriverError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid SSL response byte: 0x{byte:02x}"),
+                )))
+            }
+            _ => Err(DriverError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "unexpected SSL classification",
+            ))),
         }
     }
 

@@ -8,6 +8,6 @@ mod config;
 mod connection;
 mod error;
 
-pub use config::ConnectConfig;
+pub use config::{ConnectConfig, SslMode};
 pub use connection::{Connection, FromText, QueryResult, Row};
 pub use error::DriverError;

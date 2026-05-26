@@ -1,3 +1,20 @@
+/// SSL negotiation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SslMode {
+    /// No SSL. Plain TCP.
+    Disable,
+    /// Try SSL; fall back to plain TCP if server refuses.
+    Prefer,
+    /// Require SSL. Fail if server refuses.
+    Require,
+}
+
+impl Default for SslMode {
+    fn default() -> Self {
+        Self::Prefer
+    }
+}
+
 /// Connection configuration.
 #[derive(Debug, Clone)]
 pub struct ConnectConfig {
@@ -13,6 +30,8 @@ pub struct ConnectConfig {
     pub password: Option<String>,
     /// Connection timeout in seconds. Default: 10.
     pub connect_timeout_secs: u64,
+    /// SSL mode. Default: Prefer.
+    pub ssl_mode: SslMode,
 }
 
 impl ConnectConfig {
@@ -25,6 +44,7 @@ impl ConnectConfig {
             database: None,
             password: None,
             connect_timeout_secs: 10,
+            ssl_mode: SslMode::default(),
         }
     }
 
@@ -37,6 +57,12 @@ impl ConnectConfig {
     /// Set the database.
     pub fn database(mut self, db: impl Into<String>) -> Self {
         self.database = Some(db.into());
+        self
+    }
+
+    /// Set SSL mode.
+    pub fn ssl_mode(mut self, mode: SslMode) -> Self {
+        self.ssl_mode = mode;
         self
     }
 
