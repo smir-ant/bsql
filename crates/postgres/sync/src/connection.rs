@@ -322,6 +322,7 @@ impl Connection {
 
     // Sync collect_streaming — blocking reads inside iter_rows work naturally.
     fn collect_streaming(&mut self, rows: &mut Vec<Row>) -> Result<(), DriverError> {
+        let feed_cap = self.proto.feed_capacity();
         let stream = &mut self.stream;
         let buf = &mut self.buf;
 
@@ -340,7 +341,8 @@ impl Connection {
                     }
                     bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
                     bsql_postgres_proto::ColEvent::NeedMore => {
-                        let Ok(n) = stream.read(buf) else { return };
+                        let cap = feed_cap.max(1).min(buf.len());
+                        let Ok(n) = stream.read(&mut buf[..cap]) else { return };
                         if n == 0 { return; }
                         let _ = rs.feed(&buf[..n]);
                     }
