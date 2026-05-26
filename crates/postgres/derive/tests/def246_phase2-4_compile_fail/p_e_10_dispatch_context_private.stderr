@@ -1,0 +1,11 @@
+error[E0603]: struct `DispatchContext` is private
+  --> tests/def246_phase2-4_compile_fail/p_e_10_dispatch_context_private.rs:18:40
+   |
+18 |     use bsql_postgres_proto::protocol::DispatchContext;
+   |                                        ^^^^^^^^^^^^^^^ private struct
+   |
+note: the struct `DispatchContext` is defined here
+  --> $WORKSPACE/crates/postgres/proto/src/protocol.rs
+   |
+   | pub(in crate::protocol) struct DispatchContext<'state, 'r> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

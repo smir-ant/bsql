@@ -1,0 +1,104 @@
+[package]
+name = "bsql-postgres-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PostgreSQL wire-protocol state machine — pure sync, no_std, no alloc. Sans-I/O core for bsql."
+keywords = ["postgres", "postgresql", "wire", "protocol", "sans-io"]
+categories = ["database", "no-std", "parser-implementations"]
+
+# `bsql-postgres-proto` is the sans-I/O kernel: pure synchronous state
+# machine, zero I/O, zero allocator, zero async runtime. It runs
+# inside an async wrapper (`bsql-driver-postgres`, ships in 1e),
+# inside the proc-macro online client (Phase 2), or inside a
+# blocking ad-hoc test — identically. See reforge.md §7.1, §13.
+
+[features]
+default = []
+
+# No `bench-hooks` feature. A naive shape would gate
+# `#[doc(hidden)] pub fn` hooks on `PgProtocol` behind a cargo
+# feature that downstream users could enable in their Cargo.toml
+# (tier-3 by-discipline; CREDO §1 absolute-safety violation
+# surface). Instead:
+#   - The dispatch-bypass read append is the public
+#     `feed_inbound(bytes) -> Result<(), ReadBufFull>` — benches use
+#     it directly.
+#   - Per-iter reset is `criterion::iter_batched(setup, routine,
+#     BatchSize)` — setup builds a fresh proto per iter (untimed);
+#     routine measures the timed window only.
+#
+# Tier closure: feature physically absent → no leak surface possible.
+# Downstream consumers cannot enable (nothing to enable). Tier-1
+# by-elimination.
+
+[dependencies]
+heapless = { workspace = true }
+sha2 = { workspace = true }
+md-5 = { workspace = true }
+hmac = { workspace = true }
+pbkdf2 = { workspace = true }
+base64ct = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+simdutf8 = { workspace = true }
+
+# Pair-crate hosting `#[derive(Pristine)]` and the `prepared!`
+# proc-macro. Standard Rust convention (mirror
+# `serde`/`serde-derive`, `zeroize`/`zeroize-derive`). The derive
+# crate is pulled in for proc-macro expansion only — its
+# transitive deps (`syn`/`quote`/`proc-macro2`) live in the
+# proc-macro pair-crate boundary and do NOT propagate to runtime
+# users of `bsql-postgres-proto`.
+bsql-postgres-derive = { path = "../derive", version = "1.0.0-alpha.0" }
+
+# `getrandom` is a dev/test dependency for deterministic nonce
+# injection in tests. Production nonce generation uses it too, but
+# behind a cfg — the no_std, no_alloc contract is preserved because
+# getrandom provides OS entropy via a thin syscall wrapper.
+getrandom = { workspace = true }
+
+# `panic = "abort"` is set at the workspace level for `release` so
+# unwinding cannot occur in production. The forbid-bundle in
+# `lib.rs` rules out panic-able expressions at compile time, so
+# the abort path is unreachable by construction.
+
+[dev-dependencies]
+# SCRAM integration tests (`tests/startup_spec.rs`) build synthetic
+# server-first / server-final message fixtures, which require
+# base64-encoding salt + signature bytes. Pre-audit the tests
+# imported the crate-internal `base64_encode_to_buf` — which forced
+# that function to be `pub` for test access alone. Post-audit the
+# function is `pub(crate)` and tests call `base64ct::Base64::encode`
+# directly via this dev-only entry, closing the "pub for tests"
+# visibility anti-pattern.
+base64ct = { workspace = true }
+
+# `criterion` — bench harness. Dev-only; benches compile with std,
+# lib stays no_std. See workspace `Cargo.toml`.
+criterion = { workspace = true }
+
+# -- Bench targets --
+# `harness = false` disables the default libtest bench runner; we
+# use criterion's own main-function runner instead (generates HTML
+# reports + statistical analysis in target/criterion).
+#
+# No `required-features` — the bench file uses public-API only
+# (`feed_inbound` + `criterion::iter_batched`); no crate-internal
+# hooks needed. Run with plain `cargo bench`.
+[[bench]]
+name = "hot_paths"
+harness = false
+
+# Allocation-traffic measurement bench (B-layer of `BENCHMARKING.md`
+# stack). Companion to `hot_paths.rs` criterion ns/op timings —
+# `alloc_counts.rs` reports deterministic alloc / dealloc / bytes
+# per scenario via a `#[global_allocator]` wrapper around `System`.
+# `harness = false` because we provide our own `fn main()`; criterion
+# is not used (each scenario runs exactly once for an integer answer
+# instead of statistically-sampled millions of iterations).
+[[bench]]
+name = "alloc_counts"
+harness = false

@@ -67,11 +67,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "bsql-pg-proto"
+name = "bsql-postgres"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "bsql-postgres-proto",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "bsql-postgres-derive"
+version = "1.0.0-alpha.0"
+dependencies = [
+ "bsql-postgres-proto",
+ "proc-macro2",
+ "quote",
+ "sha2",
+ "syn",
+ "trybuild",
+]
+
+[[package]]
+name = "bsql-postgres-proto"
 version = "1.0.0-alpha.0"
 dependencies = [
  "base64ct",
- "bsql-pg-proto-derive",
+ "bsql-postgres-derive",
  "criterion",
  "getrandom 0.2.17",
  "heapless",
@@ -82,29 +105,6 @@ dependencies = [
  "simdutf8",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "bsql-pg-proto-derive"
-version = "1.0.0-alpha.0"
-dependencies = [
- "bsql-pg-proto",
- "proc-macro2",
- "quote",
- "sha2",
- "syn",
- "trybuild",
-]
-
-[[package]]
-name = "bsql-postgres"
-version = "0.1.0-alpha.0"
-dependencies = [
- "bsql-pg-proto",
- "rustls",
- "tokio",
- "tokio-rustls",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]

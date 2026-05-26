@@ -1,5 +1,0 @@
-error[E0432]: unresolved import `bsql_pg_proto::push_command::Startup`
- --> tests/def246_phase2-4_compile_fail/p_e_3_push_command_startup_struct_absent.rs:7:5
-  |
-7 | use bsql_pg_proto::push_command::Startup;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `Startup` in `push_command`

@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `bsql_postgres_proto::CancelRequestCredentials`
+  --> tests/def278d_compile_fail/p_d278d_5_backend_key_cell_field_private.rs:20:5
+   |
+20 | use bsql_postgres_proto::CancelRequestCredentials;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `CancelRequestCredentials` in the root

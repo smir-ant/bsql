@@ -1,0 +1,5 @@
+error[E0433]: cannot find `_backend_key_install_leaf` in `protocol`
+  --> tests/def278d_compile_fail/p_d278d_4_backend_key_install_token_field_private.rs:24:49
+   |
+24 |     let _token = bsql_postgres_proto::protocol::_backend_key_install_leaf::BackendKeyInstallToken(());
+   |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^ could not find `_backend_key_install_leaf` in `protocol`

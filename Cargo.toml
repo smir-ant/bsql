@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/bsql-pg-proto",
-    "crates/bsql-pg-proto-derive",
-    "crates/bsql-postgres",
+    "crates/postgres/proto",
+    "crates/postgres/derive",
+    "crates/postgres/driver",
 ]
 
 [workspace.package]
