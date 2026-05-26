@@ -894,6 +894,14 @@ impl Connection {
             .map(|s| s.as_str())
     }
 
+    /// Whether the connection is in a usable state (Ready, not Errored).
+    pub fn is_healthy(&self) -> bool {
+        matches!(
+            self.proto.connection_status(),
+            bsql_postgres_proto::ConnectionStatus::Ready
+        )
+    }
+
     /// Server process ID for this connection.
     pub fn backend_pid(&self) -> i32 {
         self.proto.with_cancel_request(|_bytes, pid| pid)

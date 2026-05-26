@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/bsql",
     "crates/postgres/proto",
     "crates/postgres/derive",
     "crates/postgres/driver",

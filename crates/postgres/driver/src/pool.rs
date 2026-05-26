@@ -12,12 +12,8 @@ use crate::error::DriverError;
 /// Manages a set of reusable connections. `pool.get()` returns a
 /// `PooledConnection` that auto-returns to the pool on Drop.
 ///
-/// ```ignore
-/// let pool = Pool::new(config, 10).await?;
-/// let mut conn = pool.get().await?;
-/// conn.query("SELECT 1").await?;
-/// // conn drops → returned to pool
-/// ```
+/// Unhealthy connections (Errored state) are discarded on return
+/// rather than recycled — the next `get()` creates a fresh one.
 #[derive(Clone)]
 pub struct Pool {
     inner: Arc<PoolInner>,
@@ -31,7 +27,6 @@ struct PoolInner {
 }
 
 impl Pool {
-    /// Create a new pool. Connects `initial_size` connections eagerly.
     pub async fn new(config: ConnectConfig, max_size: usize) -> Result<Self, DriverError> {
         let pool = Self {
             inner: Arc::new(PoolInner {
@@ -44,11 +39,6 @@ impl Pool {
         Ok(pool)
     }
 
-    /// Get a connection from the pool.
-    ///
-    /// If a free connection is available, returns it immediately.
-    /// Otherwise creates a new one (up to max_size). Blocks if
-    /// max_size connections are all in use.
     pub async fn get(&self) -> Result<PooledConnection, DriverError> {
         let permit = self.inner.semaphore.acquire().await
             .map_err(|_| DriverError::Io(std::io::Error::new(
@@ -57,15 +47,17 @@ impl Pool {
             )))?;
         permit.forget();
 
-        let mut conns = self.inner.connections.lock().await;
-        if let Some(conn) = conns.pop_front() {
-            drop(conns);
-            return Ok(PooledConnection {
-                conn: Some(conn),
-                pool: self.inner.clone(),
-            });
+        {
+            let mut conns = self.inner.connections.lock().await;
+            while let Some(conn) = conns.pop_front() {
+                if conn.is_healthy() {
+                    return Ok(PooledConnection {
+                        conn: Some(conn),
+                        pool: self.inner.clone(),
+                    });
+                }
+            }
         }
-        drop(conns);
 
         let conn = Connection::connect(&self.inner.config).await?;
         Ok(PooledConnection {
@@ -74,12 +66,10 @@ impl Pool {
         })
     }
 
-    /// Number of idle connections in the pool.
     pub async fn idle_count(&self) -> usize {
         self.inner.connections.lock().await.len()
     }
 
-    /// Maximum pool size.
     pub fn max_size(&self) -> usize {
         self.inner.max_size
     }
@@ -88,7 +78,8 @@ impl Pool {
 /// A connection checked out from a [`Pool`].
 ///
 /// Implements `Deref<Target = Connection>` so all Connection
-/// methods are available directly. Returns to the pool on Drop.
+/// methods are available directly. Returns to the pool on Drop
+/// if the connection is healthy; discards it otherwise.
 pub struct PooledConnection {
     conn: Option<Connection>,
     pool: Arc<PoolInner>,
@@ -112,8 +103,9 @@ impl Drop for PooledConnection {
         if let Some(conn) = self.conn.take() {
             let pool = self.pool.clone();
             tokio::spawn(async move {
-                let mut conns = pool.connections.lock().await;
-                conns.push_back(conn);
+                if conn.is_healthy() {
+                    pool.connections.lock().await.push_back(conn);
+                }
                 pool.semaphore.add_permits(1);
             });
         }

@@ -1,0 +1,16 @@
+[package]
+name = "bsql"
+version = "0.1.0-alpha.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Multi-backend SQL toolkit — PostgreSQL and SQLite"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["postgres", "sqlite"]
+postgres = ["dep:bsql-postgres"]
+sqlite = ["dep:bsql-sqlite"]
+
+[dependencies]
+bsql-postgres = { path = "../postgres/driver", optional = true }
+bsql-sqlite = { path = "../sqlite/driver", optional = true }
