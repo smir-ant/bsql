@@ -63,19 +63,17 @@ async fn query_select_rows() {
     eprintln!("tag: {}", result.command_tag);
     eprintln!("rows: {}", result.rows.len());
     for (i, row) in result.rows.iter().enumerate() {
-        let cols: Vec<String> = row.iter().map(|c| match c {
-            Some(b) => String::from_utf8_lossy(b).to_string(),
-            None => "NULL".to_string(),
-        }).collect();
-        eprintln!("  row[{i}]: {:?}", cols);
+        let c0 = row.get_str(0).unwrap_or("NULL");
+        let c1 = row.get_str(1).unwrap_or("NULL");
+        eprintln!("  row[{i}]: [{c0}, {c1}]");
     }
 
     assert_eq!(result.rows.len(), 2, "expected 2 rows");
     assert_eq!(result.rows[0].len(), 2, "expected 2 columns");
-    assert_eq!(result.rows[0][0].as_deref(), Some(b"1".as_slice()));
-    assert_eq!(result.rows[0][1].as_deref(), Some(b"alice".as_slice()));
-    assert_eq!(result.rows[1][0].as_deref(), Some(b"2".as_slice()));
-    assert_eq!(result.rows[1][1].as_deref(), Some(b"bob".as_slice()));
+    assert_eq!(result.rows[0].get_raw(0), Some(b"1".as_slice()));
+    assert_eq!(result.rows[0].get_raw(1), Some(b"alice".as_slice()));
+    assert_eq!(result.rows[1].get_raw(0), Some(b"2".as_slice()));
+    assert_eq!(result.rows[1].get_raw(1), Some(b"bob".as_slice()));
 
     let _ = conn.close().await;
 }
@@ -90,9 +88,9 @@ async fn query_with_nulls() {
     let result = conn.query("SELECT 1, NULL::text, 'hello'").await.expect("select");
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].len(), 3);
-    assert_eq!(result.rows[0][0].as_deref(), Some(b"1".as_slice()));
-    assert!(result.rows[0][1].is_none(), "expected NULL");
-    assert_eq!(result.rows[0][2].as_deref(), Some(b"hello".as_slice()));
+    assert_eq!(result.rows[0].get_raw(0), Some(b"1".as_slice()));
+    assert!(result.rows[0].is_null(1), "expected NULL");
+    assert_eq!(result.rows[0].get_raw(2), Some(b"hello".as_slice()));
 
     let _ = conn.close().await;
 }
@@ -108,8 +106,8 @@ async fn query_100_rows() {
         .await.expect("select");
     assert_eq!(result.rows.len(), 100, "expected 100 rows");
     // First row = "1", last = "100"
-    assert_eq!(result.rows[0][0].as_deref(), Some(b"1".as_slice()));
-    assert_eq!(result.rows[99][0].as_deref(), Some(b"100".as_slice()));
+    assert_eq!(result.rows[0].get_raw(0), Some(b"1".as_slice()));
+    assert_eq!(result.rows[99].get_raw(0), Some(b"100".as_slice()));
 
     let _ = conn.close().await;
 }
@@ -138,8 +136,29 @@ async fn scram_auth_connect_and_query() {
 
     let mut conn = Connection::connect(&config).await.expect("SCRAM connect");
     let result = conn.query("SELECT current_user").await.expect("query");
-    eprintln!("user: {:?}", result.rows[0][0].as_deref().map(String::from_utf8_lossy));
-    assert_eq!(result.rows[0][0].as_deref(), Some(b"bsql_test_scram".as_slice()));
+    eprintln!("user: {:?}", result.rows[0].get_raw(0).map(String::from_utf8_lossy));
+    assert_eq!(result.rows[0].get_raw(0), Some(b"bsql_test_scram".as_slice()));
+
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_row_access() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    let result = conn.query("SELECT 42::int, 'hello'::text, true::bool, NULL::int")
+        .await.expect("query");
+    let row = &result.rows[0];
+
+    assert_eq!(row.get_i32(0), Some(42));
+    assert_eq!(row.get_str(1), Some("hello"));
+    assert_eq!(row.get_bool(2), Some(true));
+    assert!(row.is_null(3));
+    assert_eq!(row.get_i32(3), None); // NULL → None
+    assert_eq!(row.len(), 4);
 
     conn.close().await.expect("close");
 }

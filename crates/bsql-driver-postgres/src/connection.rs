@@ -6,11 +6,61 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Result of a query — rows + command tag.
 pub struct QueryResult {
-    /// Rows as raw byte vectors. Each row = `Vec<Option<Vec<u8>>>`.
-    /// `None` = SQL NULL. Decode via `core::str::from_utf8` for text.
-    pub rows: Vec<Vec<Option<Vec<u8>>>>,
+    /// Rows. Each row provides typed column access via `Row::get`.
+    pub rows: Vec<Row>,
     /// Command tag (e.g., "SELECT 3", "INSERT 0 1").
     pub command_tag: String,
+}
+
+/// A single result row. Column values are raw bytes decoded on access.
+pub struct Row {
+    columns: Vec<Option<Vec<u8>>>,
+}
+
+impl Row {
+    /// Get column `idx` as `&str`. Returns `None` for NULL or out-of-range.
+    pub fn get_str(&self, idx: usize) -> Option<&str> {
+        self.columns.get(idx)?.as_deref().and_then(|b| core::str::from_utf8(b).ok())
+    }
+
+    /// Get column `idx` as `i32`. Returns `None` for NULL, out-of-range, or parse error.
+    pub fn get_i32(&self, idx: usize) -> Option<i32> {
+        self.get_str(idx)?.parse().ok()
+    }
+
+    /// Get column `idx` as `i64`. Returns `None` for NULL, out-of-range, or parse error.
+    pub fn get_i64(&self, idx: usize) -> Option<i64> {
+        self.get_str(idx)?.parse().ok()
+    }
+
+    /// Get column `idx` as `bool`. PG text: "t"=true, "f"=false.
+    pub fn get_bool(&self, idx: usize) -> Option<bool> {
+        match self.get_str(idx)? {
+            "t" => Some(true),
+            "f" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Get raw bytes for column `idx`. `None` = SQL NULL.
+    pub fn get_raw(&self, idx: usize) -> Option<&[u8]> {
+        self.columns.get(idx)?.as_deref()
+    }
+
+    /// Is column `idx` NULL?
+    pub fn is_null(&self, idx: usize) -> bool {
+        matches!(self.columns.get(idx), Some(None))
+    }
+
+    /// Number of columns.
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Whether the row has zero columns.
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
 }
 use tokio::net::TcpStream;
 
@@ -207,7 +257,7 @@ impl Connection {
         }
         self.wb.clear();
 
-        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+        let mut rows: Vec<Row> = Vec::new();
         let mut command_tag = String::new();
 
         self.pump_until_idle_with_rows(|_id, reply| {
@@ -349,7 +399,7 @@ impl Connection {
     async fn pump_until_idle_with_rows(
         &mut self,
         mut on_deliver: impl FnMut(core::num::NonZeroU64, bsql_pg_proto::Reply),
-        rows: &mut Vec<Vec<Option<Vec<u8>>>>,
+        rows: &mut Vec<Row>,
     ) -> Result<(), DriverError> {
         loop {
             let event = self.proto.advance_one_frame(&mut self.wb);
@@ -415,7 +465,7 @@ impl Connection {
 
     async fn collect_streaming(
         &mut self,
-        rows: &mut Vec<Vec<Option<Vec<u8>>>>,
+        rows: &mut Vec<Row>,
     ) -> Result<(), DriverError> {
         self.proto.iter_rows(&mut self.wb, |stream| {
             let mut current_row: Vec<Option<Vec<u8>>> = Vec::new();
@@ -428,7 +478,7 @@ impl Connection {
                         current_row.push(None);
                     }
                     bsql_pg_proto::ColEvent::EndRow => {
-                        rows.push(core::mem::take(&mut current_row));
+                        rows.push(Row { columns: core::mem::take(&mut current_row) });
                     }
                     bsql_pg_proto::ColEvent::EndQuery { .. } => return,
                     bsql_pg_proto::ColEvent::NeedMore => continue,
