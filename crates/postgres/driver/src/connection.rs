@@ -1,11 +1,8 @@
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use bsql_postgres_proto::{
     ActivePhase, FeedEvent, PgProtocol, WriteBuf,
     reply_id::PingKind,
 };
 
-static STMT_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Handle to a server-side prepared statement.
 ///
@@ -13,7 +10,7 @@ static STMT_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// `query_prepared` / `execute_prepared` calls to avoid re-parsing.
 /// Holds a cached `RowDesc` (from DescribeStatement) so the proto
 /// can distinguish SELECT (returns rows) from DML (no rows).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PreparedStatement {
     stmt_name: bsql_postgres_proto::StmtName,
     row_desc: Option<bsql_postgres_proto::decode::RowDesc>,
@@ -21,12 +18,6 @@ pub struct PreparedStatement {
 }
 
 impl PreparedStatement {
-    fn generate_name() -> bsql_postgres_proto::StmtName {
-        let id = STMT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let name = format!("_bsql_{id}");
-        bsql_postgres_proto::StmtName::try_from_str(&name)
-            .expect("generated stmt name always valid")
-    }
 
     /// Whether this statement returns rows (SELECT / RETURNING).
     pub fn returns_rows(&self) -> bool {
@@ -47,6 +38,7 @@ pub struct Notification {
 
 /// Result of a query — rows + command tag + column count.
 #[derive(Debug)]
+#[must_use]
 pub struct QueryResult {
     /// Rows. Each row provides typed column access via `Row::get`.
     pub rows: Vec<Row>,
@@ -59,7 +51,8 @@ pub struct QueryResult {
 }
 
 /// A single result row. Column values are raw bytes decoded on access.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[must_use]
 pub struct Row {
     columns: Vec<Option<Vec<u8>>>,
 }
@@ -198,6 +191,7 @@ pub struct Connection {
     stream: Stream,
     wb: WriteBuf,
     buf: Vec<u8>,
+    stmt_counter: u32,
 }
 
 impl Connection {
@@ -338,6 +332,7 @@ impl Connection {
                         stream,
                         wb,
                         buf,
+                        stmt_counter: 0,
                     });
                 }
                 Err(bsql_postgres_proto::IntoActiveError::StillConnecting(c)) => {
@@ -558,7 +553,7 @@ impl Connection {
     ) -> Result<QueryResult, DriverError> {
         let stmt = self.prepare(sql).await?;
         let result = self.query_prepared(&stmt, params).await?;
-        let _ = self.close_statement(&stmt).await;
+        let _ = self.close_statement(stmt).await;
         Ok(result)
     }
 
@@ -725,7 +720,10 @@ impl Connection {
     /// The server caches the query plan. Use with `query_prepared` or
     /// `execute_prepared` to avoid re-parsing on repeated calls.
     pub async fn prepare(&mut self, sql: &str) -> Result<PreparedStatement, DriverError> {
-        let stmt_name = PreparedStatement::generate_name();
+        let id = self.stmt_counter;
+        self.stmt_counter = self.stmt_counter.wrapping_add(1);
+        let stmt_name = bsql_postgres_proto::StmtName::try_from_str(&format!("_bsql_{id}"))
+            .expect("generated stmt name always valid");
 
         // Phase 1: Parse
         let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::ParseKind>();
@@ -856,7 +854,7 @@ impl Connection {
     /// Close a server-side prepared statement, releasing its resources.
     pub async fn close_statement(
         &mut self,
-        stmt: &PreparedStatement,
+        stmt: PreparedStatement,
     ) -> Result<(), DriverError> {
         let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::CloseKind>();
         let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
@@ -936,6 +934,7 @@ impl Connection {
             let err = self.proto.fail_cause()
                 .map(|&c| self.classify_error(c))
                 .unwrap_or(DriverError::NotReady);
+            self.drain_to_idle().await;
             return Err(err);
         }
 
@@ -1124,7 +1123,8 @@ impl Connection {
         let mut pos = 0usize;
         let prebuf_slice = prebuf.as_slice();
         self.proto.iter_rows(&mut self.wb, |rs| {
-            let mut current_row: Vec<Option<Vec<u8>>> = Vec::new();
+            let n_cols = rs.current_row_desc().map_or(0, |d| d.len());
+            let mut current_row: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_cols);
             loop {
                 match rs.col_next() {
                     bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
@@ -1139,7 +1139,7 @@ impl Connection {
                     bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
                     bsql_postgres_proto::ColEvent::NeedMore => {
                         if pos < prebuf_slice.len() {
-                            let end = (pos + 256).min(prebuf_slice.len());
+                            let end = prebuf_slice.len();
                             if rs.feed(&prebuf_slice[pos..end]).is_ok() {
                                 pos = end;
                                 continue;

@@ -44,7 +44,7 @@ impl Row {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PreparedStatement {
     stmt_name: bsql_postgres_proto::StmtName,
     row_desc: Option<bsql_postgres_proto::decode::RowDesc>,
@@ -510,7 +510,7 @@ impl Connection {
     ) -> Result<QueryResult, DriverError> {
         let stmt = self.prepare(sql)?;
         let result = self.query_prepared(&stmt, params)?;
-        let _ = self.close_statement(&stmt);
+        let _ = self.close_statement(stmt);
         Ok(result)
     }
 
@@ -521,7 +521,7 @@ impl Connection {
         r.rows.into_iter().next().ok_or(DriverError::Io(std::io::Error::other("no rows")))
     }
 
-    pub fn close_statement(&mut self, stmt: &PreparedStatement) -> Result<(), DriverError> {
+    pub fn close_statement(&mut self, stmt: PreparedStatement) -> Result<(), DriverError> {
         let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::CloseKind>();
         self.push_and_send(bsql_postgres_proto::push_command::CloseStatement { stmt_name: stmt.stmt_name, reply })?;
         self.pump(None)

@@ -570,7 +570,7 @@ async fn prepared_query_reuse() {
     assert_eq!(r3.rows.len(), 1);
     assert_eq!(r3.rows[0].get_str(1), Some("charlie"));
 
-    conn.close_statement(&stmt).await.expect("close stmt");
+    conn.close_statement(stmt).await.expect("close stmt");
     conn.close().await.expect("close");
 }
 
@@ -594,7 +594,7 @@ async fn prepared_execute_dml() {
     let result = conn.query("SELECT count(*) FROM prep_dml").await.expect("count");
     assert_eq!(result.rows[0].get_i64(0), Some(5));
 
-    conn.close_statement(&stmt).await.expect("close stmt");
+    conn.close_statement(stmt).await.expect("close stmt");
     conn.close().await.expect("close");
 }
 
@@ -613,7 +613,7 @@ async fn prepared_empty_result() {
     let result = conn.query_prepared(&stmt, &(999i32,)).await.expect("query");
     assert_eq!(result.rows.len(), 0);
 
-    conn.close_statement(&stmt).await.expect("close stmt");
+    conn.close_statement(stmt).await.expect("close stmt");
     conn.close().await.expect("close");
 }
 

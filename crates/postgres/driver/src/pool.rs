@@ -58,7 +58,13 @@ impl Pool {
             }
         }
 
-        let conn = Connection::connect(&self.inner.config).await?;
+        let conn = match Connection::connect(&self.inner.config).await {
+            Ok(c) => c,
+            Err(e) => {
+                self.inner.semaphore.add_permits(1);
+                return Err(e);
+            }
+        };
         Ok(PooledConnection {
             conn: Some(conn),
             pool: self.inner.clone(),

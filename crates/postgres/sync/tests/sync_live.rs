@@ -89,7 +89,7 @@ fn prepared_statement_reuse() {
     assert_eq!(r1.rows[0].get_str(0), Some("a"));
     let r2 = conn.query_prepared(&stmt, &(2i32,)).expect("q2");
     assert_eq!(r2.rows[0].get_str(0), Some("b"));
-    conn.close_statement(&stmt).expect("close stmt");
+    conn.close_statement(stmt).expect("close stmt");
     conn.close().expect("close");
 }
 
