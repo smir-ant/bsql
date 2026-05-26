@@ -11,6 +11,8 @@ pub struct ConnectConfig {
     pub database: Option<String>,
     /// Password for SCRAM/MD5/Cleartext auth. None = Trust.
     pub password: Option<String>,
+    /// Connection timeout in seconds. Default: 10.
+    pub connect_timeout_secs: u64,
 }
 
 impl ConnectConfig {
@@ -22,6 +24,7 @@ impl ConnectConfig {
             user: user.into(),
             database: None,
             password: None,
+            connect_timeout_secs: 10,
         }
     }
 
@@ -34,6 +37,12 @@ impl ConnectConfig {
     /// Set the database.
     pub fn database(mut self, db: impl Into<String>) -> Self {
         self.database = Some(db.into());
+        self
+    }
+
+    /// Set connection timeout in seconds.
+    pub fn connect_timeout(mut self, secs: u64) -> Self {
+        self.connect_timeout_secs = secs;
         self
     }
 

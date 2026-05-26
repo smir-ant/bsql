@@ -346,3 +346,16 @@ async fn generic_get_typed() {
 
     conn.close().await.expect("close");
 }
+
+#[tokio::test]
+#[ignore = "requires unreachable host"]
+async fn connect_timeout() {
+    // 192.0.2.1 is TEST-NET-1 — packets are dropped, never refused
+    let config = ConnectConfig::new("192.0.2.1", "test")
+        .connect_timeout(1);
+    let start = std::time::Instant::now();
+    let result = Connection::connect(&config).await;
+    let elapsed = start.elapsed();
+    assert!(result.is_err());
+    assert!(elapsed.as_secs() <= 3, "timeout took too long: {:?}", elapsed);
+}

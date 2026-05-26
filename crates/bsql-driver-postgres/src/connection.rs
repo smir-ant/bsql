@@ -4,13 +4,15 @@ use bsql_pg_proto::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Result of a query — rows + command tag.
+/// Result of a query — rows + command tag + column count.
 #[derive(Debug)]
 pub struct QueryResult {
     /// Rows. Each row provides typed column access via `Row::get`.
     pub rows: Vec<Row>,
     /// Command tag (e.g., "SELECT 3", "INSERT 0 1").
     pub command_tag: String,
+    /// Number of columns in the result set.
+    pub column_count: usize,
 }
 
 /// A single result row. Column values are raw bytes decoded on access.
@@ -126,7 +128,14 @@ impl Connection {
     /// TCP → StartupMessage → auth handshake → Active.
     pub async fn connect(config: &ConnectConfig) -> Result<Self, DriverError> {
         let addr = format!("{}:{}", config.host, config.port);
-        let mut stream = TcpStream::connect(&addr).await?;
+        let timeout = std::time::Duration::from_secs(config.connect_timeout_secs);
+        let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
+            .await
+            .map_err(|_| DriverError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connection timed out",
+            )))?
+            ?;
 
         let user = bsql_pg_proto::Ident::try_from_str(&config.user)
             .map_err(|_| DriverError::Io(std::io::Error::new(
@@ -350,7 +359,8 @@ impl Connection {
             let _ = write!(command_tag, "{}", tag);
         }
 
-        Ok(QueryResult { rows, command_tag })
+        let column_count = rows.first().map_or(0, |r| r.len());
+        Ok(QueryResult { rows, command_tag, column_count })
     }
 
     /// Server version string (e.g., "15.4").
