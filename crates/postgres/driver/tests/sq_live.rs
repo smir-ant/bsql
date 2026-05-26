@@ -254,13 +254,40 @@ async fn connect_wrong_password_errors() {
 
 #[tokio::test]
 #[ignore = "requires local PG"]
-async fn large_result_200_rows() {
+async fn large_result_1000_rows() {
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string());
     let mut conn = Connection::connect(&config).await.expect("connect");
-    let result = conn.query("SELECT generate_series(1, 200)").await.expect("query");
-    assert_eq!(result.rows.len(), 200);
-    assert_eq!(result.rows[199].get_i32(0), Some(200));
+    let result = conn.query("SELECT generate_series(1, 1000)").await.expect("query");
+    assert_eq!(result.rows.len(), 1000);
+    assert_eq!(result.rows[0].get_i32(0), Some(1));
+    assert_eq!(result.rows[999].get_i32(0), Some(1000));
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn large_result_10k_rows() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+    let result = conn.query("SELECT generate_series(1, 10000)").await.expect("query");
+    assert_eq!(result.rows.len(), 10000);
+    assert_eq!(result.rows[0].get_i32(0), Some(1));
+    assert_eq!(result.rows[9999].get_i32(0), Some(10000));
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn large_result_100k_rows() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+    let result = conn.query("SELECT generate_series(1, 100000)").await.expect("query");
+    assert_eq!(result.rows.len(), 100000);
+    assert_eq!(result.rows[0].get_i32(0), Some(1));
+    assert_eq!(result.rows[99999].get_i32(0), Some(100000));
     conn.close().await.expect("close");
 }
 
@@ -294,7 +321,7 @@ async fn execute_returns_row_count() {
 async fn server_version_and_pid() {
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string());
-    let mut conn = Connection::connect(&config).await.expect("connect");
+    let conn = Connection::connect(&config).await.expect("connect");
 
     let version = conn.server_version();
     eprintln!("server version: {:?}", version);

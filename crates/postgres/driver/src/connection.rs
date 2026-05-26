@@ -795,54 +795,79 @@ impl Connection {
         &mut self,
         rows: &mut Vec<Row>,
     ) -> Result<(), DriverError> {
-        // Use tokio's current runtime to do blocking reads inside
-        // the sync iter_rows closure via RowStream::feed().
-        let rt = tokio::runtime::Handle::current();
-        let stream = &mut self.stream;
-        let buf = &mut self.buf;
+        // Pre-buffer: read remaining response bytes from the socket
+        // BEFORE entering iter_rows. Small results fit entirely in the
+        // proto's 4 KB read_buf (socket is empty → probe times out).
+        // Large results have remaining DataRows + CC + Z on the socket.
+        let mut prebuf = Vec::new();
+        let probe = std::time::Duration::from_millis(10);
+        match tokio::time::timeout(probe, self.stream.read(&mut self.buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                prebuf.extend_from_slice(&self.buf[..n]);
+                while !Self::has_rfq_marker(&prebuf) {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        self.stream.read(&mut self.buf),
+                    ).await {
+                        Ok(Ok(n)) if n > 0 => {
+                            prebuf.extend_from_slice(&self.buf[..n]);
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            _ => {}
+        }
 
-        self.proto.iter_rows(&mut self.wb, |row_stream| {
+        let mut pos = 0usize;
+        let prebuf_slice = prebuf.as_slice();
+        self.proto.iter_rows(&mut self.wb, |rs| {
             let mut current_row: Vec<Option<Vec<u8>>> = Vec::new();
+            let mut need_spins = 0u32;
             loop {
-                match row_stream.col_next() {
+                match rs.col_next() {
                     bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
+                        need_spins = 0;
                         current_row.push(Some(bytes.to_vec()));
                     }
                     bsql_postgres_proto::ColEvent::Null { .. } => {
+                        need_spins = 0;
                         current_row.push(None);
                     }
                     bsql_postgres_proto::ColEvent::EndRow => {
+                        need_spins = 0;
                         rows.push(Row { columns: core::mem::take(&mut current_row) });
                     }
                     bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
                     bsql_postgres_proto::ColEvent::NeedMore => {
-                        // Try again — may be silent dispatch (CC after last row).
-                        match row_stream.col_next() {
-                            bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
-                            bsql_postgres_proto::ColEvent::NeedMore => {
-                                // Buffer truly empty. Read from socket.
-                                let read_result = tokio::task::block_in_place(|| {
-                                    rt.block_on(async {
-                                        stream.read(buf).await
-                                    })
-                                });
-                                match read_result {
-                                    Ok(0) | Err(_) => return,
-                                    Ok(n) => {
-                                        let _ = row_stream.feed(&buf[..n]);
-                                    }
-                                }
+                        if pos < prebuf_slice.len() {
+                            let end = (pos + 256).min(prebuf_slice.len());
+                            if rs.feed(&prebuf_slice[pos..end]).is_ok() {
+                                pos = end;
+                                need_spins = 0;
+                                continue;
                             }
-                            bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
-                                current_row.push(Some(bytes.to_vec()));
-                            }
-                            bsql_postgres_proto::ColEvent::Null { .. } => {
-                                current_row.push(None);
-                            }
-                            bsql_postgres_proto::ColEvent::EndRow => {
-                                rows.push(Row { columns: core::mem::take(&mut current_row) });
-                            }
-                            _ => {}
+                        }
+                        need_spins += 1;
+                        if need_spins > 20 {
+                            return;
+                        }
+                        continue;
+                    }
+                    bsql_postgres_proto::ColEvent::Chunk { bytes, .. } => {
+                        need_spins = 0;
+                        if let Some(Some(v)) = current_row.last_mut() {
+                            v.extend_from_slice(bytes);
+                        } else {
+                            current_row.push(Some(bytes.to_vec()));
+                        }
+                    }
+                    bsql_postgres_proto::ColEvent::ChunkEnd { bytes, .. } => {
+                        need_spins = 0;
+                        if let Some(Some(v)) = current_row.last_mut() {
+                            v.extend_from_slice(bytes);
+                        } else {
+                            current_row.push(Some(bytes.to_vec()));
                         }
                     }
                     _ => {}
@@ -850,5 +875,9 @@ impl Connection {
             }
         });
         Ok(())
+    }
+
+    fn has_rfq_marker(data: &[u8]) -> bool {
+        data.windows(5).any(|w| w[0] == b'Z' && w[1..5] == [0, 0, 0, 5])
     }
 }
