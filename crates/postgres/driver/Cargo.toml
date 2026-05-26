@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 bsql-postgres-proto = { path = "../proto" }
-tokio = { version = "1", features = ["net", "io-util", "macros", "rt", "time"] }
+tokio = { version = "1", features = ["net", "io-util", "macros", "rt", "time", "sync"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = "0.26"

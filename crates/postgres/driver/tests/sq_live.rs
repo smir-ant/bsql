@@ -459,3 +459,60 @@ async fn execute_params_insert() {
 
     conn.close().await.expect("close");
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pool_basic() {
+    use bsql_postgres::Pool;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let pool = Pool::new(config, 3).await.expect("pool");
+
+    // Get two connections
+    let mut c1 = pool.get().await.expect("c1");
+    let mut c2 = pool.get().await.expect("c2");
+
+    c1.ping().await.expect("c1 ping");
+    c2.ping().await.expect("c2 ping");
+
+    let r1 = c1.query_one("SELECT 1").await.expect("q1");
+    assert_eq!(r1.get_i32(0), Some(1));
+
+    let r2 = c2.query_one("SELECT 2").await.expect("q2");
+    assert_eq!(r2.get_i32(0), Some(2));
+
+    // Return c1 to pool
+    drop(c1);
+    tokio::task::yield_now().await;
+
+    assert_eq!(pool.idle_count().await, 1);
+
+    // Get c3 — should reuse c1's connection
+    let mut c3 = pool.get().await.expect("c3");
+    c3.ping().await.expect("c3 ping");
+
+    drop(c2);
+    drop(c3);
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pool_concurrent_queries() {
+    use bsql_postgres::Pool;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let pool = Pool::new(config, 5).await.expect("pool");
+
+    let mut handles = vec![];
+    for i in 0..5u32 {
+        let p = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let mut conn = p.get().await.expect("get");
+            let row = conn.query_one(&format!("SELECT {i}")).await.expect("q");
+            assert_eq!(row.get_i32(0), Some(i as i32));
+        }));
+    }
+    for h in handles {
+        h.await.expect("join");
+    }
+}

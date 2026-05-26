@@ -7,7 +7,9 @@
 mod config;
 mod connection;
 mod error;
+mod pool;
 
 pub use config::{ConnectConfig, SslMode};
 pub use connection::{Connection, FromText, QueryResult, Row};
 pub use error::DriverError;
+pub use pool::{Pool, PooledConnection};
