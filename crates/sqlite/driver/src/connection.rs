@@ -133,6 +133,17 @@ impl Connection {
         Ok(QueryResult { rows: rows_out, column_count: col_count, column_names })
     }
 
+    pub fn query_params_one(&self, sql: &str, params: &[&str]) -> Result<Row, SqliteError> {
+        let result = self.query_params(sql, params)?;
+        result.rows.into_iter().next()
+            .ok_or_else(|| SqliteError::Query("query returned no rows".to_string()))
+    }
+
+    pub fn query_params_opt(&self, sql: &str, params: &[&str]) -> Result<Option<Row>, SqliteError> {
+        let result = self.query_params(sql, params)?;
+        Ok(result.rows.into_iter().next())
+    }
+
     pub fn query_one(&self, sql: &str) -> Result<Row, SqliteError> {
         let result = self.query(sql)?;
         result.rows.into_iter().next()
