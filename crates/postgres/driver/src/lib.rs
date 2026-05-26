@@ -11,5 +11,5 @@ mod pool;
 
 pub use config::{ConnectConfig, SslMode};
 pub use connection::{Connection, FromText, Notification, PreparedStatement, QueryResult, Row};
-pub use error::DriverError;
+pub use error::{DbError, DriverError};
 pub use pool::{Pool, PooledConnection};

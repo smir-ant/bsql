@@ -122,9 +122,40 @@ async fn bad_sql_returns_error() {
     let result = conn.simple_query("SELCT TYPO").await;
     assert!(result.is_err(), "bad SQL should error");
 
-    // Connection should still be usable after error
-    // Connection recovers — ping after error works
     conn.ping().await.expect("ping after error"); conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn db_error_sqlstate() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    // Syntax error → SQLSTATE 42601
+    let err = conn.simple_query("SELCT TYPO").await.unwrap_err();
+    if let bsql_postgres::DriverError::Db(ref db_err) = err {
+        eprintln!("code={} severity={} msg={}", db_err.code, db_err.severity, db_err.message);
+        assert_eq!(&db_err.code, "42601", "expected syntax_error SQLSTATE");
+        assert_eq!(&db_err.severity, "ERROR");
+        assert!(!db_err.message.is_empty());
+    } else {
+        panic!("expected DbError, got: {err:?}");
+    }
+
+    // Unique violation → SQLSTATE 23505
+    conn.execute("CREATE TEMP TABLE uk_test(id int PRIMARY KEY)").await.expect("create");
+    conn.execute("INSERT INTO uk_test VALUES (1)").await.expect("insert");
+    let err = conn.execute("INSERT INTO uk_test VALUES (1)").await.unwrap_err();
+    if let bsql_postgres::DriverError::Db(ref db_err) = err {
+        eprintln!("code={} severity={} msg={}", db_err.code, db_err.severity, db_err.message);
+        assert!(db_err.is_unique_violation(), "expected 23505, got {}", db_err.code);
+    } else {
+        panic!("expected DbError for unique violation, got: {err:?}");
+    }
+
+    conn.ping().await.expect("ping after errors");
+    conn.close().await.expect("close");
 }
 
 #[tokio::test]

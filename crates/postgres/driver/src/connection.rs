@@ -192,6 +192,42 @@ pub struct Connection {
 }
 
 impl Connection {
+    fn classify_error(&self, cause: bsql_postgres_proto::ProtocolError) -> DriverError {
+        use crate::error::DbError;
+        if let bsql_postgres_proto::ProtocolError::ServerErrorResponse {
+            severity, code, details_ref,
+        } = cause
+        {
+            let sev = severity
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_else(|| "ERROR".to_string());
+            let sqlstate = code.as_str().trim().to_string();
+            let (msg, det, hnt) = match self.proto.get_server_error(details_ref) {
+                Ok(bsql_postgres_proto::ErrorPayload::ServerError { message, detail, hint }) => {
+                    let m = message.as_str().to_string();
+                    let d = {
+                        let s = detail.as_str();
+                        if s.is_empty() { None } else { Some(s.to_string()) }
+                    };
+                    let h = {
+                        let s = hint.as_str();
+                        if s.is_empty() { None } else { Some(s.to_string()) }
+                    };
+                    (m, d, h)
+                }
+                _ => (String::new(), None, None),
+            };
+            return DriverError::Db(DbError {
+                code: sqlstate,
+                severity: sev,
+                message: msg,
+                detail: det,
+                hint: hnt,
+            });
+        }
+        DriverError::Protocol(cause)
+    }
+
     /// Connect to PostgreSQL with Trust auth (no password).
     ///
     /// TCP → StartupMessage → auth handshake → Active.
@@ -926,7 +962,7 @@ impl Connection {
                             }
                             FeedEvent::Fail(_) => {
                                 if let Some(&cause) = self.proto.fail_cause() {
-                                    return Err(DriverError::Protocol(cause));
+                                    return Err(self.classify_error(cause));
                                 }
                                 return Err(DriverError::NotReady);
                             }
@@ -951,7 +987,7 @@ impl Connection {
                     // Without this, the connection is stuck in
                     // DrainRfqAfterError and unusable.
                     let err = if let Some(&cause) = self.proto.fail_cause() {
-                        DriverError::Protocol(cause)
+                        self.classify_error(cause)
                     } else {
                         DriverError::NotReady
                     };
@@ -1086,7 +1122,7 @@ impl Connection {
                     // Without this, the connection is stuck in
                     // DrainRfqAfterError and unusable.
                     let err = if let Some(&cause) = self.proto.fail_cause() {
-                        DriverError::Protocol(cause)
+                        self.classify_error(cause)
                     } else {
                         DriverError::NotReady
                     };
