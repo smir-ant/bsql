@@ -359,3 +359,38 @@ async fn connect_timeout() {
     assert!(result.is_err());
     assert!(elapsed.as_secs() <= 3, "timeout took too long: {:?}", elapsed);
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn ssl_prefer_falls_back_to_plain() {
+    use bsql_driver_postgres::SslMode;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(SslMode::Prefer);
+    let mut conn = Connection::connect(&config).await.expect("prefer should fallback");
+    conn.ping().await.expect("ping");
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG without SSL"]
+async fn ssl_require_fails_on_non_ssl_server() {
+    use bsql_driver_postgres::SslMode;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(SslMode::Require);
+    let result = Connection::connect(&config).await;
+    assert!(result.is_err(), "require should fail on non-SSL server");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn ssl_disable_works() {
+    use bsql_driver_postgres::SslMode;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(SslMode::Disable);
+    let mut conn = Connection::connect(&config).await.expect("disable should work");
+    conn.ping().await.expect("ping");
+    conn.close().await.expect("close");
+}
