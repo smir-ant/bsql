@@ -9,5 +9,5 @@ mod connection;
 mod error;
 
 pub use config::ConnectConfig;
-pub use connection::Connection;
+pub use connection::{Connection, QueryResult};
 pub use error::DriverError;

@@ -3,6 +3,15 @@ use bsql_pg_proto::{
     reply_id::PingKind,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Result of a query — rows + command tag.
+pub struct QueryResult {
+    /// Rows as raw byte vectors. Each row = `Vec<Option<Vec<u8>>>`.
+    /// `None` = SQL NULL. Decode via `core::str::from_utf8` for text.
+    pub rows: Vec<Vec<Option<Vec<u8>>>>,
+    /// Command tag (e.g., "SELECT 3", "INSERT 0 1").
+    pub command_tag: String,
+}
 use tokio::net::TcpStream;
 
 use crate::config::ConnectConfig;
@@ -161,6 +170,45 @@ impl Connection {
         Ok(command_tag)
     }
 
+    /// Execute a query and return rows as raw byte vectors.
+    ///
+    /// Each row is `Vec<Option<Vec<u8>>>` — one entry per column.
+    /// `None` = SQL NULL. Caller decodes via `FromPgText` / `FromPgBinary`.
+    pub async fn query(
+        &mut self,
+        sql: &str,
+    ) -> Result<QueryResult, DriverError> {
+        let reply = self.proto.next_reply_id::<bsql_pg_proto::reply_id::QueryKind>();
+        let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
+        let actions = guard
+            .push_command(
+                bsql_pg_proto::push_command::SimpleQuery { sql, reply },
+                &mut self.wb,
+            )
+            .map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        for action in actions.as_slice() {
+            if let bsql_pg_proto::Action::SendBytes(bytes) = action {
+                self.stream.write_all(bytes).await?;
+            }
+        }
+        self.wb.clear();
+
+        let mut rows: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+        let mut command_tag = String::new();
+
+        self.pump_until_idle_with_rows(|_id, reply| {
+            if let bsql_pg_proto::Reply::QueryComplete(_) = reply {
+            }
+        }, &mut rows).await?;
+
+        if let Some(tag) = self.proto.current_command_tag() {
+            use core::fmt::Write;
+            let _ = write!(command_tag, "{}", tag);
+        }
+
+        Ok(QueryResult { rows, command_tag })
+    }
+
     /// Gracefully close the connection.
     pub async fn close(mut self) -> Result<(), DriverError> {
         let mut wb = WriteBuf::new();
@@ -277,6 +325,99 @@ impl Connection {
                         // RFQ pending. Continue — next col_next dispatches RFQ.
                         continue;
                     }
+                    _ => {}
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn pump_until_idle_with_rows(
+        &mut self,
+        mut on_deliver: impl FnMut(core::num::NonZeroU64, bsql_pg_proto::Reply),
+        rows: &mut Vec<Vec<Option<Vec<u8>>>>,
+    ) -> Result<(), DriverError> {
+        loop {
+            let event = self.proto.advance_one_frame(&mut self.wb);
+            match event {
+                FeedEvent::Idle => return Ok(()),
+                FeedEvent::NeedMoreBytes => {
+                    let retry = self.proto.advance_one_frame(&mut self.wb);
+                    match retry {
+                        FeedEvent::Idle => return Ok(()),
+                        FeedEvent::Deliver(id, reply) => {
+                            on_deliver(id, reply);
+                            continue;
+                        }
+                        FeedEvent::SendBytes(bytes) => {
+                            self.stream.write_all(bytes).await?;
+                            continue;
+                        }
+                        FeedEvent::StreamingRows => {
+                            self.collect_streaming(rows).await?;
+                            continue;
+                        }
+                        FeedEvent::NeedMoreBytes => {
+                            if matches!(self.proto.state(),
+                                bsql_pg_proto::ActiveState::SimpleQueryStreamingRows { .. }
+                                | bsql_pg_proto::ActiveState::BindExecuteStreamingRows { .. })
+                            {
+                                self.collect_streaming(rows).await?;
+                                continue;
+                            }
+                            self.read_from_socket().await?;
+                        }
+                        FeedEvent::Fail(_) => {
+                            if let Some(&cause) = self.proto.fail_cause() {
+                                return Err(DriverError::Protocol(cause));
+                            }
+                            return Err(DriverError::NotReady);
+                        }
+                        FeedEvent::Close => return Err(DriverError::NotReady),
+                        _ => {}
+                    }
+                }
+                FeedEvent::SendBytes(bytes) => {
+                    self.stream.write_all(bytes).await?;
+                }
+                FeedEvent::Deliver(id, reply) => {
+                    on_deliver(id, reply);
+                }
+                FeedEvent::StreamingRows => {
+                    self.collect_streaming(rows).await?;
+                }
+                FeedEvent::Notice(_) => {}
+                FeedEvent::Fail(_) => {
+                    if let Some(&cause) = self.proto.fail_cause() {
+                        return Err(DriverError::Protocol(cause));
+                    }
+                    return Err(DriverError::NotReady);
+                }
+                FeedEvent::Close => return Err(DriverError::NotReady),
+                _ => {}
+            }
+        }
+    }
+
+    async fn collect_streaming(
+        &mut self,
+        rows: &mut Vec<Vec<Option<Vec<u8>>>>,
+    ) -> Result<(), DriverError> {
+        self.proto.iter_rows(&mut self.wb, |stream| {
+            let mut current_row: Vec<Option<Vec<u8>>> = Vec::new();
+            loop {
+                match stream.col_next() {
+                    bsql_pg_proto::ColEvent::Got { bytes, .. } => {
+                        current_row.push(Some(bytes.to_vec()));
+                    }
+                    bsql_pg_proto::ColEvent::Null { .. } => {
+                        current_row.push(None);
+                    }
+                    bsql_pg_proto::ColEvent::EndRow => {
+                        rows.push(core::mem::take(&mut current_row));
+                    }
+                    bsql_pg_proto::ColEvent::EndQuery { .. } => return,
+                    bsql_pg_proto::ColEvent::NeedMore => continue,
                     _ => {}
                 }
             }
