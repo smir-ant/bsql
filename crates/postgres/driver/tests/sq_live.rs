@@ -707,6 +707,52 @@ async fn listen_notify() {
 
 #[tokio::test]
 #[ignore = "requires local PG"]
+async fn copy_in_bulk_insert() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.execute("CREATE TEMP TABLE cp_test(id int, name text)").await.expect("create");
+
+    let rows = vec![
+        "1\talice",
+        "2\tbob",
+        "3\tcharlie",
+    ];
+    let n = conn.copy_in("cp_test", rows).await.expect("copy_in");
+    assert_eq!(n, 3, "expected 3 rows copied");
+
+    let result = conn.query("SELECT id, name FROM cp_test ORDER BY id")
+        .await.expect("select");
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.rows[0].get_str(0), Some("1"));
+    assert_eq!(result.rows[0].get_str(1), Some("alice"));
+    assert_eq!(result.rows[2].get_str(1), Some("charlie"));
+
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn copy_in_large() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.execute("CREATE TEMP TABLE cp_large(i int)").await.expect("create");
+
+    let rows: Vec<String> = (0..10000).map(|i| i.to_string()).collect();
+    let n = conn.copy_in("cp_large", &rows).await.expect("copy_in");
+    assert_eq!(n, 10000);
+
+    let result = conn.query("SELECT count(*) FROM cp_large").await.expect("count");
+    assert_eq!(result.rows[0].get_i64(0), Some(10000));
+
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
 async fn pool_basic() {
     use bsql_postgres::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")

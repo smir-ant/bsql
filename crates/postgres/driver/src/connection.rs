@@ -899,6 +899,73 @@ impl Connection {
         self.proto.with_cancel_request(|_bytes, pid| pid)
     }
 
+    /// Bulk-insert rows via COPY FROM STDIN.
+    ///
+    /// `table` is the target table name. `rows` is an iterator of
+    /// tab-separated text lines (no trailing newline). Uses PG text
+    /// format with tab delimiter.
+    ///
+    /// Returns the number of rows copied.
+    pub async fn copy_in(
+        &mut self,
+        table: &str,
+        rows: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<u64, DriverError> {
+        let sql = format!("COPY {table} FROM STDIN");
+        let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::QueryKind>();
+        let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
+        let actions = guard
+            .push_command(
+                bsql_postgres_proto::push_command::SimpleQuery { sql: &sql, reply },
+                &mut self.wb,
+            )
+            .map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        for action in actions.as_slice() {
+            if let bsql_postgres_proto::Action::SendBytes(bytes) = action {
+                self.stream.write_all(bytes).await?;
+            }
+        }
+        self.wb.clear();
+
+        self.read_from_socket().await?;
+        let event = self.proto.advance_one_frame(&mut self.wb);
+        if let FeedEvent::Fail(_) = event {
+            if let Some(&cause) = self.proto.fail_cause() {
+                return Err(self.classify_error(cause));
+            }
+            return Err(DriverError::NotReady);
+        }
+
+        for row in rows {
+            let line = row.as_ref();
+            let mut data = line.as_bytes().to_vec();
+            data.push(b'\n');
+            let bytes = self.proto.push_copy_data(&data, &mut self.wb)
+                .map_err(|e| DriverError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{e}"),
+                )))?;
+            self.stream.write_all(bytes).await?;
+            self.wb.clear();
+        }
+
+        let done_bytes = self.proto.push_copy_done(&mut self.wb)
+            .map_err(|e| DriverError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{e}"),
+            )))?;
+        self.stream.write_all(done_bytes).await?;
+        self.wb.clear();
+
+        self.pump_until_idle(|_, _| {}).await?;
+        let mut tag = String::new();
+        if let Some(t) = self.proto.current_command_tag() {
+            use core::fmt::Write;
+            let _ = write!(tag, "{}", t);
+        }
+        Ok(tag.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+
     /// Gracefully close the connection.
     pub async fn close(mut self) -> Result<(), DriverError> {
         let mut wb = WriteBuf::new();
