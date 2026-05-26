@@ -489,6 +489,79 @@ async fn execute_params_insert() {
 
 #[tokio::test]
 #[ignore = "requires local PG"]
+async fn prepared_query_reuse() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.execute("CREATE TEMP TABLE prep_test(id int, name text)").await.expect("create");
+    conn.execute("INSERT INTO prep_test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')")
+        .await.expect("insert");
+
+    let stmt = conn.prepare("SELECT id, name FROM prep_test WHERE id = $1")
+        .await.expect("prepare");
+
+    let r1 = conn.query_prepared(&stmt, &(1i32,)).await.expect("q1");
+    assert_eq!(r1.rows.len(), 1);
+    assert_eq!(r1.rows[0].get_str(1), Some("alice"));
+
+    let r2 = conn.query_prepared(&stmt, &(2i32,)).await.expect("q2");
+    assert_eq!(r2.rows.len(), 1);
+    assert_eq!(r2.rows[0].get_str(1), Some("bob"));
+
+    let r3 = conn.query_prepared(&stmt, &(3i32,)).await.expect("q3");
+    assert_eq!(r3.rows.len(), 1);
+    assert_eq!(r3.rows[0].get_str(1), Some("charlie"));
+
+    conn.close_statement(&stmt).await.expect("close stmt");
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn prepared_execute_dml() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.execute("CREATE TEMP TABLE prep_dml(v int)").await.expect("create");
+
+    let stmt = conn.prepare("INSERT INTO prep_dml VALUES ($1)")
+        .await.expect("prepare");
+
+    for i in 1..=5 {
+        let n = conn.execute_prepared(&stmt, &(i as i32,)).await.expect("exec");
+        assert_eq!(n, 1);
+    }
+
+    let result = conn.query("SELECT count(*) FROM prep_dml").await.expect("count");
+    assert_eq!(result.rows[0].get_i64(0), Some(5));
+
+    conn.close_statement(&stmt).await.expect("close stmt");
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn prepared_empty_result() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.execute("CREATE TEMP TABLE prep_empty(id int)").await.expect("create");
+
+    let stmt = conn.prepare("SELECT id FROM prep_empty WHERE id = $1")
+        .await.expect("prepare");
+
+    let result = conn.query_prepared(&stmt, &(999i32,)).await.expect("query");
+    assert_eq!(result.rows.len(), 0);
+
+    conn.close_statement(&stmt).await.expect("close stmt");
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
 async fn pool_basic() {
     use bsql_postgres::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")

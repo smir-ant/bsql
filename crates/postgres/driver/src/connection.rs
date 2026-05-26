@@ -1,7 +1,37 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use bsql_postgres_proto::{
     ActivePhase, FeedEvent, PgProtocol, WriteBuf,
     reply_id::PingKind,
 };
+
+static STMT_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Handle to a server-side prepared statement.
+///
+/// Created via [`Connection::prepare`]. Reuse across multiple
+/// `query_prepared` / `execute_prepared` calls to avoid re-parsing.
+/// Holds a cached `RowDesc` (from DescribeStatement) so the proto
+/// can distinguish SELECT (returns rows) from DML (no rows).
+#[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    stmt_name: bsql_postgres_proto::StmtName,
+    row_desc: Option<bsql_postgres_proto::decode::RowDesc>,
+}
+
+impl PreparedStatement {
+    fn generate_name() -> bsql_postgres_proto::StmtName {
+        let id = STMT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = format!("_bsql_{id}");
+        bsql_postgres_proto::StmtName::try_from_str(&name)
+            .expect("generated stmt name always valid")
+    }
+
+    /// Whether this statement returns rows (SELECT / RETURNING).
+    pub fn returns_rows(&self) -> bool {
+        self.row_desc.is_some()
+    }
+}
 
 /// Result of a query — rows + command tag + column count.
 #[derive(Debug)]
@@ -525,6 +555,160 @@ impl Connection {
         Ok(tag.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0))
     }
 
+    /// Parse a SQL statement on the server and return a reusable handle.
+    ///
+    /// The server caches the query plan. Use with `query_prepared` or
+    /// `execute_prepared` to avoid re-parsing on repeated calls.
+    pub async fn prepare(&mut self, sql: &str) -> Result<PreparedStatement, DriverError> {
+        let stmt_name = PreparedStatement::generate_name();
+
+        // Phase 1: Parse
+        let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::ParseKind>();
+        let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
+        let actions = guard
+            .push_command(
+                bsql_postgres_proto::push_command::Parse {
+                    stmt_name: stmt_name.clone(),
+                    sql,
+                    reply,
+                },
+                &mut self.wb,
+            )
+            .map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        for action in actions.as_slice() {
+            if let bsql_postgres_proto::Action::SendBytes(bytes) = action {
+                self.stream.write_all(bytes).await?;
+            }
+        }
+        self.wb.clear();
+        self.pump_until_idle(|_, _| {}).await?;
+
+        // Phase 2: DescribeStatement — gets RowDesc (SELECT) or NoData (DML)
+        let desc_reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::DescribeStatementKind>();
+        let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
+        let actions = guard
+            .push_command(
+                bsql_postgres_proto::push_command::DescribeStatement {
+                    stmt_name: stmt_name.clone(),
+                    reply: desc_reply,
+                },
+                &mut self.wb,
+            )
+            .map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        for action in actions.as_slice() {
+            if let bsql_postgres_proto::Action::SendBytes(bytes) = action {
+                self.stream.write_all(bytes).await?;
+            }
+        }
+        self.wb.clear();
+        self.pump_until_idle(|_, _| {}).await?;
+
+        let row_desc = match self.proto.current_described_rows() {
+            bsql_postgres_proto::DescribedRows::Rows(borrow) => Some(borrow.to_owned()),
+            bsql_postgres_proto::DescribedRows::NoData => None,
+        };
+
+        Ok(PreparedStatement { stmt_name, row_desc })
+    }
+
+    /// Execute a prepared statement with parameters and return rows.
+    pub async fn query_prepared<P: bsql_postgres_proto::params::ParamsWriter>(
+        &mut self,
+        stmt: &PreparedStatement,
+        params: &P,
+    ) -> Result<QueryResult, DriverError> {
+        let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::QueryKind>();
+        let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
+        let portal = bsql_postgres_proto::PortalName::default();
+        let actions = guard
+            .push_bind_execute(
+                &portal,
+                &stmt.stmt_name,
+                params,
+                stmt.row_desc.clone(),
+                bsql_postgres_proto::FetchRows::All,
+                reply,
+                &mut self.wb,
+            )
+            .map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        for action in actions.as_slice() {
+            if let bsql_postgres_proto::Action::SendBytes(bytes) = action {
+                self.stream.write_all(bytes).await?;
+            }
+        }
+        self.wb.clear();
+
+        let mut rows: Vec<Row> = Vec::new();
+        let mut command_tag = String::new();
+        self.pump_until_idle_with_rows(|_, _| {}, &mut rows).await?;
+        if let Some(tag) = self.proto.current_command_tag() {
+            use core::fmt::Write;
+            let _ = write!(command_tag, "{}", tag);
+        }
+        let column_count = rows.first().map_or(0, |r| r.len());
+        Ok(QueryResult { rows, command_tag, column_count })
+    }
+
+    /// Execute a prepared DML statement with parameters. Returns affected rows.
+    pub async fn execute_prepared<P: bsql_postgres_proto::params::ParamsWriter>(
+        &mut self,
+        stmt: &PreparedStatement,
+        params: &P,
+    ) -> Result<u64, DriverError> {
+        let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::QueryKind>();
+        let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
+        let portal = bsql_postgres_proto::PortalName::default();
+        let actions = guard
+            .push_bind_execute(
+                &portal,
+                &stmt.stmt_name,
+                params,
+                None,
+                bsql_postgres_proto::FetchRows::All,
+                reply,
+                &mut self.wb,
+            )
+            .map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        for action in actions.as_slice() {
+            if let bsql_postgres_proto::Action::SendBytes(bytes) = action {
+                self.stream.write_all(bytes).await?;
+            }
+        }
+        self.wb.clear();
+        self.pump_until_idle(|_, _| {}).await?;
+        let mut tag = String::new();
+        if let Some(t) = self.proto.current_command_tag() {
+            use core::fmt::Write;
+            let _ = write!(tag, "{}", t);
+        }
+        Ok(tag.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+
+    /// Close a server-side prepared statement, releasing its resources.
+    pub async fn close_statement(
+        &mut self,
+        stmt: &PreparedStatement,
+    ) -> Result<(), DriverError> {
+        let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::CloseKind>();
+        let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
+        let actions = guard
+            .push_command(
+                bsql_postgres_proto::push_command::CloseStatement {
+                    stmt_name: stmt.stmt_name.clone(),
+                    reply,
+                },
+                &mut self.wb,
+            )
+            .map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        for action in actions.as_slice() {
+            if let bsql_postgres_proto::Action::SendBytes(bytes) = action {
+                self.stream.write_all(bytes).await?;
+            }
+        }
+        self.wb.clear();
+        self.pump_until_idle(|_, _| {}).await
+    }
+
     /// Server version string (e.g., "15.4").
     pub fn server_version(&self) -> Option<&str> {
         self.proto.session_params()
@@ -570,10 +754,18 @@ impl Connection {
             match event {
                 FeedEvent::Idle => return Ok(()),
                 FeedEvent::NeedMoreBytes => {
-                    // Retry loop — keep advancing until non-NeedMoreBytes
-                    // event or buffer truly empty (need socket read).
-                    // Silent dispatches (ParseComplete, BindComplete, CC)
-                    // return NeedMoreBytes despite buffer having more frames.
+                    // Check streaming-eligible states BEFORE retrying.
+                    // BindExecute Select path: BindComplete → AwaitingDataOrComplete
+                    // is a silent advance. The next frame is DataRow which must
+                    // go through iter_rows, not advance_one_frame.
+                    if matches!(self.proto.state(),
+                        bsql_postgres_proto::ActiveState::SimpleQueryStreamingRows { .. }
+                        | bsql_postgres_proto::ActiveState::BindExecuteStreamingRows { .. }
+                        | bsql_postgres_proto::ActiveState::BindExecuteAwaitingDataOrCompleteSelect { .. })
+                    {
+                        self.drain_streaming().await?;
+                        continue;
+                    }
                     let mut consecutive_need = 1u32;
                     loop {
                         let retry = self.proto.advance_one_frame(&mut self.wb);
@@ -595,7 +787,8 @@ impl Connection {
                                 consecutive_need = consecutive_need.saturating_add(1);
                                 if matches!(self.proto.state(),
                                     bsql_postgres_proto::ActiveState::SimpleQueryStreamingRows { .. }
-                                    | bsql_postgres_proto::ActiveState::BindExecuteStreamingRows { .. })
+                                    | bsql_postgres_proto::ActiveState::BindExecuteStreamingRows { .. }
+                                    | bsql_postgres_proto::ActiveState::BindExecuteAwaitingDataOrCompleteSelect { .. })
                                 {
                                     self.drain_streaming().await?;
                                     break;
@@ -708,6 +901,14 @@ impl Connection {
             match event {
                 FeedEvent::Idle => return Ok(()),
                 FeedEvent::NeedMoreBytes => {
+                    if matches!(self.proto.state(),
+                        bsql_postgres_proto::ActiveState::SimpleQueryStreamingRows { .. }
+                        | bsql_postgres_proto::ActiveState::BindExecuteStreamingRows { .. }
+                        | bsql_postgres_proto::ActiveState::BindExecuteAwaitingDataOrCompleteSelect { .. })
+                    {
+                        self.collect_streaming(rows).await?;
+                        continue;
+                    }
                     let retry = self.proto.advance_one_frame(&mut self.wb);
                     match retry {
                         FeedEvent::Idle => return Ok(()),
@@ -726,7 +927,8 @@ impl Connection {
                         FeedEvent::NeedMoreBytes => {
                             if matches!(self.proto.state(),
                                 bsql_postgres_proto::ActiveState::SimpleQueryStreamingRows { .. }
-                                | bsql_postgres_proto::ActiveState::BindExecuteStreamingRows { .. })
+                                | bsql_postgres_proto::ActiveState::BindExecuteStreamingRows { .. }
+                                | bsql_postgres_proto::ActiveState::BindExecuteAwaitingDataOrCompleteSelect { .. })
                             {
                                 self.collect_streaming(rows).await?;
                                 continue;

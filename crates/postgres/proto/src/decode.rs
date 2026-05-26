@@ -417,6 +417,13 @@ impl<'r> RowDescBorrow<'r> {
     pub fn columns_iter(&self) -> RowDescColumnsIter<'_> {
         self.inner.columns_iter()
     }
+
+    /// Clone the underlying `RowDesc` into an owned value.
+    #[inline]
+    #[must_use]
+    pub fn to_owned(&self) -> RowDesc {
+        self.inner.clone()
+    }
 }
 
 impl PartialEq for RowDescBorrow<'_> {
