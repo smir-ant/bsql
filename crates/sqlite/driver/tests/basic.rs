@@ -183,3 +183,53 @@ fn open_file_and_reopen() {
 
     let _ = std::fs::remove_file(&dir);
 }
+
+#[test]
+fn column_names() {
+    let conn = Connection::open_in_memory().expect("open");
+    let result = conn.query("SELECT 1 AS id, 'hello' AS greeting").expect("query");
+    assert_eq!(result.column_names, vec!["id", "greeting"]);
+    assert_eq!(result.rows[0].get_by_name("id", &result.column_names), Some(b"1".as_slice()));
+    assert_eq!(result.rows[0].get_by_name("greeting", &result.column_names), Some(b"hello".as_slice()));
+    assert_eq!(result.rows[0].get_by_name("missing", &result.column_names), None);
+}
+
+#[test]
+fn query_one_and_opt() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute("CREATE TABLE t(v int)").expect("create");
+    conn.execute("INSERT INTO t VALUES (42)").expect("insert");
+
+    let row = conn.query_one("SELECT v FROM t").expect("query_one");
+    assert_eq!(row.get_i32(0), Some(42));
+
+    let opt = conn.query_opt("SELECT v FROM t WHERE v = 999").expect("query_opt");
+    assert!(opt.is_none());
+}
+
+#[test]
+fn transaction_helpers() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute("CREATE TABLE t(v int)").expect("create");
+
+    conn.begin().expect("begin");
+    conn.execute("INSERT INTO t VALUES (1)").expect("insert");
+    conn.commit().expect("commit");
+    let r = conn.query("SELECT count(*) FROM t").expect("count");
+    assert_eq!(r.rows[0].get_i64(0), Some(1));
+
+    conn.begin().expect("begin2");
+    conn.execute("INSERT INTO t VALUES (2)").expect("insert2");
+    conn.rollback().expect("rollback");
+    let r = conn.query("SELECT count(*) FROM t").expect("count2");
+    assert_eq!(r.rows[0].get_i64(0), Some(1));
+}
+
+#[test]
+fn unicode_values() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute("CREATE TABLE t(v text)").expect("create");
+    conn.execute("INSERT INTO t VALUES ('Привет мир')").expect("insert");
+    let result = conn.query("SELECT v FROM t").expect("query");
+    assert_eq!(result.rows[0].get_str(0), Some("Привет мир"));
+}

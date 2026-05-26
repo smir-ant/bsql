@@ -73,6 +73,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsql"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "bsql-postgres",
+ "bsql-sqlite",
+]
+
+[[package]]
 name = "bsql-postgres"
 version = "0.1.0-alpha.0"
 dependencies = [

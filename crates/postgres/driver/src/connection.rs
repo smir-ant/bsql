@@ -416,8 +416,7 @@ impl Connection {
                     format!("invalid SSL response byte: 0x{byte:02x}"),
                 )))
             }
-            _ => Err(DriverError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            _ => Err(DriverError::Io(std::io::Error::other(
                 "unexpected SSL classification",
             ))),
         }
@@ -741,7 +740,7 @@ impl Connection {
         let actions = guard
             .push_command(
                 bsql_postgres_proto::push_command::Parse {
-                    stmt_name: stmt_name.clone(),
+                    stmt_name,
                     sql,
                     reply,
                 },
@@ -762,7 +761,7 @@ impl Connection {
         let actions = guard
             .push_command(
                 bsql_postgres_proto::push_command::DescribeStatement {
-                    stmt_name: stmt_name.clone(),
+                    stmt_name,
                     reply: desc_reply,
                 },
                 &mut self.wb,
@@ -871,7 +870,7 @@ impl Connection {
         let actions = guard
             .push_command(
                 bsql_postgres_proto::push_command::CloseStatement {
-                    stmt_name: stmt.stmt_name.clone(),
+                    stmt_name: stmt.stmt_name,
                     reply,
                 },
                 &mut self.wb,
@@ -983,8 +982,7 @@ impl Connection {
                 self.stream.shutdown().await?;
                 Ok(())
             }
-            Err(_) => Err(DriverError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(_) => Err(DriverError::Io(std::io::Error::other(
                 "write buffer full on terminate",
             ))),
         }

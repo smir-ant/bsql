@@ -8,6 +8,7 @@ use crate::error::SqliteError;
 pub struct QueryResult {
     pub rows: Vec<Row>,
     pub column_count: usize,
+    pub column_names: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -55,6 +56,11 @@ impl Row {
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
     }
+
+    pub fn get_by_name<'a>(&'a self, name: &str, column_names: &[String]) -> Option<&'a [u8]> {
+        let idx = column_names.iter().position(|n| n == name)?;
+        self.get_raw(idx)
+    }
 }
 
 pub struct Connection {
@@ -94,6 +100,7 @@ impl Connection {
     pub fn query(&self, sql: &str) -> Result<QueryResult, SqliteError> {
         let mut stmt = self.inner.prepare(sql)?;
         let col_count = stmt.column_count();
+        let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let mut rows_out = Vec::new();
 
         let mut rows = stmt.query([])?;
@@ -101,7 +108,7 @@ impl Connection {
             rows_out.push(read_row(row, col_count)?);
         }
 
-        Ok(QueryResult { rows: rows_out, column_count: col_count })
+        Ok(QueryResult { rows: rows_out, column_count: col_count, column_names })
     }
 
     pub fn query_params(&self, sql: &str, params: &[&str]) -> Result<QueryResult, SqliteError> {
@@ -113,6 +120,7 @@ impl Connection {
 
         let mut stmt = self.inner.prepare(sql)?;
         let col_count = stmt.column_count();
+        let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let mut rows_out = Vec::new();
 
         let mut rows = stmt.query(refs.as_slice())?;
@@ -120,7 +128,33 @@ impl Connection {
             rows_out.push(read_row(row, col_count)?);
         }
 
-        Ok(QueryResult { rows: rows_out, column_count: col_count })
+        Ok(QueryResult { rows: rows_out, column_count: col_count, column_names })
+    }
+
+    pub fn query_one(&self, sql: &str) -> Result<Row, SqliteError> {
+        let result = self.query(sql)?;
+        result.rows.into_iter().next()
+            .ok_or_else(|| SqliteError::Query("query returned no rows".to_string()))
+    }
+
+    pub fn query_opt(&self, sql: &str) -> Result<Option<Row>, SqliteError> {
+        let result = self.query(sql)?;
+        Ok(result.rows.into_iter().next())
+    }
+
+    pub fn begin(&self) -> Result<(), SqliteError> {
+        self.inner.execute_batch("BEGIN")?;
+        Ok(())
+    }
+
+    pub fn commit(&self) -> Result<(), SqliteError> {
+        self.inner.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    pub fn rollback(&self) -> Result<(), SqliteError> {
+        self.inner.execute_batch("ROLLBACK")?;
+        Ok(())
     }
 
     pub fn close(self) -> Result<(), SqliteError> {

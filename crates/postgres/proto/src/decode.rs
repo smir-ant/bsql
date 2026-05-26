@@ -539,11 +539,10 @@ pub fn parse_column_names(payload: &[u8]) -> alloc::vec::Vec<alloc::string::Stri
     let Some((count_bytes, mut rest)) = payload.split_first_chunk::<2>() else {
         return alloc::vec::Vec::new();
     };
-    let n = i16::from_be_bytes(*count_bytes);
-    if n < 0 {
+    let n_i16 = i16::from_be_bytes(*count_bytes);
+    let Ok(n) = usize::try_from(n_i16) else {
         return alloc::vec::Vec::new();
-    }
-    let n = n as usize;
+    };
     let mut names = alloc::vec::Vec::with_capacity(n);
     for _ in 0..n {
         let Some(nul_pos) = rest.iter().position(|&b| b == 0) else { break };

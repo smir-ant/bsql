@@ -41,8 +41,7 @@ impl Pool {
 
     pub async fn get(&self) -> Result<PooledConnection, DriverError> {
         let permit = self.inner.semaphore.acquire().await
-            .map_err(|_| DriverError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            .map_err(|_| DriverError::Io(std::io::Error::other(
                 "pool closed",
             )))?;
         permit.forget();
