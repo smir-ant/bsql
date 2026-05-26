@@ -15,9 +15,29 @@ macros ethos, verification strategy, and roadmap live in one place:
 
 ## Current state
 
-Phase 1a has landed: `bsql-pg-proto` crate with the sans-I/O
-PostgreSQL wire-protocol state machine (Ping flow only). See
-[`crates/bsql-pg-proto/`](crates/bsql-pg-proto/).
+Three crates live in the workspace:
+
+| Crate | Description | Status |
+|-------|-------------|--------|
+| [`bsql-pg-proto`](crates/bsql-pg-proto/) | Sans-IO PG wire protocol state machine (`no_std + alloc`, `#![forbid(unsafe_code)]`) | Feature-complete for v1 |
+| [`bsql-pg-proto-derive`](crates/bsql-pg-proto-derive/) | Proc-macro pair (`#[derive(Pristine)]`) | Shipped |
+| [`bsql-driver-postgres`](crates/bsql-driver-postgres/) | Async driver (tokio + rustls) | Alpha — [README](crates/bsql-driver-postgres/README.md) |
+
+### bsql-pg-proto highlights
+- PgProtocol<Active>: 296 B per connection
+- push_command/ping: 46 ns
+- SimpleQuery, Extended Query, COPY, LISTEN/NOTIFY, Describe, Close, Terminate
+- SCRAM-SHA-256 + MD5 + Cleartext + Trust authentication
+- SSL negotiation typestate (0 B runtime cost)
+- No fixed column/param caps (exact-size Box<[u32]>)
+- 673 tests, bench-verified 0 regressions
+
+### bsql-driver-postgres highlights
+- Connect (Trust + SCRAM + TLS via rustls)
+- query / query_one / query_opt / simple_query / execute
+- Typed Row access: `row.get::<i32>(0)`
+- DSN parsing + env var config
+- 29 tests live-tested against real PostgreSQL
 
 The crate is `no_std`, forbids `unsafe`, runs the full clippy forbid
 bundle, and passes a hand-rolled 100 000-iteration randomized fuzz of
