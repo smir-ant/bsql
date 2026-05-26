@@ -495,7 +495,7 @@ async fn connect_via_dsn() {
 fn dsn_parsing_unit_tests() {
     let c = ConnectConfig::from_dsn("postgres://alice:secret@db.example.com:5433/mydb?sslmode=require").unwrap();
     assert_eq!(c.user, "alice");
-    assert_eq!(c.password.as_deref(), Some("secret"));
+    assert_eq!(c.password_str(), Some("secret"));
     assert_eq!(c.host, "db.example.com");
     assert_eq!(c.port, 5433);
     assert_eq!(c.database.as_deref(), Some("mydb"));
@@ -503,7 +503,7 @@ fn dsn_parsing_unit_tests() {
 
     let c2 = ConnectConfig::from_dsn("postgres://bob@localhost").unwrap();
     assert_eq!(c2.user, "bob");
-    assert!(c2.password.is_none());
+    assert!(c2.password_str().is_none());
     assert_eq!(c2.host, "localhost");
     assert_eq!(c2.port, 5432);
     assert!(c2.database.is_none());

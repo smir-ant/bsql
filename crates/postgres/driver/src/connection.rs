@@ -262,7 +262,7 @@ impl Connection {
 
         let reply = proto.next_reply_id::<bsql_postgres_proto::reply_id::StartupKind>();
 
-        let credentials = match &config.password {
+        let credentials = match config.password_str() {
             Some(pw) => {
                 let password = bsql_postgres_proto::Password::try_from_str(pw)
                     .map_err(|_| DriverError::Config("invalid password"))?;

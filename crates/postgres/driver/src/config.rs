@@ -16,23 +16,38 @@ impl Default for SslMode {
 }
 
 /// Connection configuration.
-#[derive(Debug, Clone)]
+///
+/// Password is zeroized on drop via `Zeroizing<String>` wrapper.
+/// Debug output redacts the password field.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ConnectConfig {
-    /// PostgreSQL server hostname.
     pub host: String,
-    /// PostgreSQL server port (default 5432).
     pub port: u16,
-    /// PostgreSQL user name.
     pub user: String,
-    /// Database name (defaults to user if absent).
     pub database: Option<String>,
-    /// Password for SCRAM/MD5/Cleartext auth. None = Trust.
-    pub password: Option<String>,
-    /// Connection timeout in seconds. Default: 10.
+    password_inner: Option<zeroize::Zeroizing<String>>,
     pub connect_timeout_secs: u64,
-    /// SSL mode. Default: Prefer.
     pub ssl_mode: SslMode,
+}
+
+impl ConnectConfig {
+    pub fn password_str(&self) -> Option<&str> {
+        self.password_inner.as_deref().map(|s| s.as_str())
+    }
+}
+
+impl core::fmt::Debug for ConnectConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ConnectConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("database", &self.database)
+            .field("password", &self.password_inner.as_ref().map(|_| "[REDACTED]"))
+            .field("ssl_mode", &self.ssl_mode)
+            .finish()
+    }
 }
 
 impl ConnectConfig {
@@ -114,7 +129,7 @@ impl ConnectConfig {
             port,
             user,
             database,
-            password,
+            password_inner: password.map(zeroize::Zeroizing::new),
             connect_timeout_secs: timeout,
             ssl_mode,
         })
@@ -144,7 +159,7 @@ impl ConnectConfig {
             port,
             user,
             database,
-            password,
+            password_inner: password.map(zeroize::Zeroizing::new),
             connect_timeout_secs: 10,
             ssl_mode,
         }
@@ -157,7 +172,7 @@ impl ConnectConfig {
             port: 5432,
             user: user.into(),
             database: None,
-            password: None,
+            password_inner: None,
             connect_timeout_secs: 10,
             ssl_mode: SslMode::default(),
         }
@@ -191,7 +206,7 @@ impl ConnectConfig {
     /// Server chooses the actual method — SCRAM works for both
     /// `scram-sha-256` and `md5` pg_hba rules (PG falls back).
     pub fn password(mut self, pw: impl Into<String>) -> Self {
-        self.password = Some(pw.into());
+        self.password_inner = Some(zeroize::Zeroizing::new(pw.into()));
         self
     }
 }
