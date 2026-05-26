@@ -222,3 +222,44 @@ async fn query_one_convenience() {
 
     conn.close().await.expect("close");
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn unicode_round_trip() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+    let row = conn.query_one("SELECT 'Привет мир 🌍'::text").await.expect("query");
+    assert_eq!(row.get_str(0), Some("Привет мир 🌍"));
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn connect_wrong_port_errors() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").port(19999);
+    let result = Connection::connect(&config).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires local PG with scram-sha-256 auth (not trust)"]
+async fn connect_wrong_password_errors() {
+    let config = ConnectConfig::new("127.0.0.1", "bsql_test_scram")
+        .database("postgres".to_string())
+        .password("WRONG_PASSWORD".to_string());
+    let result = Connection::connect(&config).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn large_result_200_rows() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+    let result = conn.query("SELECT generate_series(1, 200)").await.expect("query");
+    assert_eq!(result.rows.len(), 200);
+    assert_eq!(result.rows[199].get_i32(0), Some(200));
+    conn.close().await.expect("close");
+}

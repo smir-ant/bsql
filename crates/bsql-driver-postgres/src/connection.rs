@@ -537,25 +537,45 @@ impl Connection {
         &mut self,
         rows: &mut Vec<Row>,
     ) -> Result<(), DriverError> {
-        self.proto.iter_rows(&mut self.wb, |stream| {
-            let mut current_row: Vec<Option<Vec<u8>>> = Vec::new();
-            loop {
-                match stream.col_next() {
-                    bsql_pg_proto::ColEvent::Got { bytes, .. } => {
-                        current_row.push(Some(bytes.to_vec()));
-                    }
-                    bsql_pg_proto::ColEvent::Null { .. } => {
-                        current_row.push(None);
-                    }
-                    bsql_pg_proto::ColEvent::EndRow => {
-                        rows.push(Row { columns: core::mem::take(&mut current_row) });
-                    }
-                    bsql_pg_proto::ColEvent::EndQuery { .. } => return,
-                    bsql_pg_proto::ColEvent::NeedMore => continue,
+        loop {
+            let done = self.proto.iter_rows(&mut self.wb, |stream| {
+                let mut current_row: Vec<Option<Vec<u8>>> = Vec::new();
+                let mut need_more_count = 0u32;
+                loop {
+                    match stream.col_next() {
+                        bsql_pg_proto::ColEvent::Got { bytes, .. } => {
+                            current_row.push(Some(bytes.to_vec()));
+                            need_more_count = 0;
+                        }
+                        bsql_pg_proto::ColEvent::Null { .. } => {
+                            current_row.push(None);
+                            need_more_count = 0;
+                        }
+                        bsql_pg_proto::ColEvent::EndRow => {
+                            rows.push(Row { columns: core::mem::take(&mut current_row) });
+                            need_more_count = 0;
+                        }
+                        bsql_pg_proto::ColEvent::EndQuery { .. } => return true,
+                        bsql_pg_proto::ColEvent::NeedMore => {
+                            need_more_count = need_more_count.saturating_add(1);
+                            if need_more_count > 2 {
+                                return false;
+                            }
+                            continue;
+                        }
                     _ => {}
                 }
             }
         });
-        Ok(())
+            if done {
+                return Ok(());
+            }
+            // RowStream::Drop fired but we exited on NeedMore
+            // (buffer truly empty). Read more bytes and retry.
+            // Note: Drop may have errored the proto — but
+            // feed_inbound + next iter_rows will see the Errored state
+            // and return EndQuery immediately.
+            self.read_from_socket().await?;
+        }
     }
 }
