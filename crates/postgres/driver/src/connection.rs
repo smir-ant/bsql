@@ -795,45 +795,60 @@ impl Connection {
         &mut self,
         rows: &mut Vec<Row>,
     ) -> Result<(), DriverError> {
-        loop {
-            let done = self.proto.iter_rows(&mut self.wb, |stream| {
-                let mut current_row: Vec<Option<Vec<u8>>> = Vec::new();
-                let mut need_more_count = 0u32;
-                loop {
-                    match stream.col_next() {
-                        bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
-                            current_row.push(Some(bytes.to_vec()));
-                            need_more_count = 0;
-                        }
-                        bsql_postgres_proto::ColEvent::Null { .. } => {
-                            current_row.push(None);
-                            need_more_count = 0;
-                        }
-                        bsql_postgres_proto::ColEvent::EndRow => {
-                            rows.push(Row { columns: core::mem::take(&mut current_row) });
-                            need_more_count = 0;
-                        }
-                        bsql_postgres_proto::ColEvent::EndQuery { .. } => return true,
-                        bsql_postgres_proto::ColEvent::NeedMore => {
-                            need_more_count = need_more_count.saturating_add(1);
-                            if need_more_count > 2 {
-                                return false;
+        // Use tokio's current runtime to do blocking reads inside
+        // the sync iter_rows closure via RowStream::feed().
+        let rt = tokio::runtime::Handle::current();
+        let stream = &mut self.stream;
+        let buf = &mut self.buf;
+
+        self.proto.iter_rows(&mut self.wb, |row_stream| {
+            let mut current_row: Vec<Option<Vec<u8>>> = Vec::new();
+            loop {
+                match row_stream.col_next() {
+                    bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
+                        current_row.push(Some(bytes.to_vec()));
+                    }
+                    bsql_postgres_proto::ColEvent::Null { .. } => {
+                        current_row.push(None);
+                    }
+                    bsql_postgres_proto::ColEvent::EndRow => {
+                        rows.push(Row { columns: core::mem::take(&mut current_row) });
+                    }
+                    bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
+                    bsql_postgres_proto::ColEvent::NeedMore => {
+                        // Try again — may be silent dispatch (CC after last row).
+                        match row_stream.col_next() {
+                            bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
+                            bsql_postgres_proto::ColEvent::NeedMore => {
+                                // Buffer truly empty. Read from socket.
+                                let read_result = tokio::task::block_in_place(|| {
+                                    rt.block_on(async {
+                                        stream.read(buf).await
+                                    })
+                                });
+                                match read_result {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => {
+                                        let _ = row_stream.feed(&buf[..n]);
+                                    }
+                                }
                             }
-                            continue;
+                            bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
+                                current_row.push(Some(bytes.to_vec()));
+                            }
+                            bsql_postgres_proto::ColEvent::Null { .. } => {
+                                current_row.push(None);
+                            }
+                            bsql_postgres_proto::ColEvent::EndRow => {
+                                rows.push(Row { columns: core::mem::take(&mut current_row) });
+                            }
+                            _ => {}
                         }
+                    }
                     _ => {}
                 }
             }
         });
-            if done {
-                return Ok(());
-            }
-            // RowStream::Drop fired but we exited on NeedMore
-            // (buffer truly empty). Read more bytes and retry.
-            // Note: Drop may have errored the proto — but
-            // feed_inbound + next iter_rows will see the Errored state
-            // and return EndQuery immediately.
-            self.read_from_socket().await?;
-        }
+        Ok(())
     }
 }
