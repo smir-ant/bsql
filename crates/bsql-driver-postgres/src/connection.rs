@@ -239,6 +239,20 @@ impl Connection {
         Ok(command_tag)
     }
 
+    /// Execute a DML statement. Returns the number of affected rows.
+    ///
+    /// For INSERT/UPDATE/DELETE the tag is "INSERT 0 N" / "UPDATE N" /
+    /// "DELETE N". This method parses N from the tag.
+    /// For DDL (CREATE/DROP/ALTER) returns 0.
+    pub async fn execute(&mut self, sql: &str) -> Result<u64, DriverError> {
+        let tag = self.simple_query(sql).await?;
+        let count = tag.rsplit(' ')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        Ok(count)
+    }
+
     /// Execute a query expecting exactly one row. Returns the row.
     pub async fn query_one(&mut self, sql: &str) -> Result<Row, DriverError> {
         let result = self.query(sql).await?;

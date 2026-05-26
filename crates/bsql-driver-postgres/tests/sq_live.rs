@@ -263,3 +263,27 @@ async fn large_result_200_rows() {
     assert_eq!(result.rows[199].get_i32(0), Some(200));
     conn.close().await.expect("close");
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn execute_returns_row_count() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.execute("CREATE TEMP TABLE exec_test(v int)").await.expect("create");
+
+    let n = conn.execute("INSERT INTO exec_test VALUES (1), (2), (3)")
+        .await.expect("insert");
+    assert_eq!(n, 3, "expected 3 rows inserted");
+
+    let n = conn.execute("UPDATE exec_test SET v = v + 10 WHERE v > 1")
+        .await.expect("update");
+    assert_eq!(n, 2, "expected 2 rows updated");
+
+    let n = conn.execute("DELETE FROM exec_test WHERE v = 1")
+        .await.expect("delete");
+    assert_eq!(n, 1, "expected 1 row deleted");
+
+    conn.close().await.expect("close");
+}
