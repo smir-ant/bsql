@@ -17,6 +17,7 @@ static STMT_COUNTER: AtomicU32 = AtomicU32::new(0);
 pub struct PreparedStatement {
     stmt_name: bsql_postgres_proto::StmtName,
     row_desc: Option<bsql_postgres_proto::decode::RowDesc>,
+    column_names: Vec<String>,
 }
 
 impl PreparedStatement {
@@ -53,6 +54,8 @@ pub struct QueryResult {
     pub command_tag: String,
     /// Number of columns in the result set.
     pub column_count: usize,
+    /// Column names from RowDescription (empty for DML).
+    pub column_names: Vec<String>,
 }
 
 /// A single result row. Column values are raw bytes decoded on access.
@@ -109,6 +112,12 @@ impl Row {
     /// Whether the row has zero columns.
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
+    }
+
+    /// Get column value by name. Requires `column_names` from QueryResult.
+    pub fn get_by_name<'a>(&'a self, name: &str, column_names: &[String]) -> Option<&'a [u8]> {
+        let idx = column_names.iter().position(|n| n == name)?;
+        self.get_raw(idx)
     }
 
     /// Get column by index with generic FromText conversion.
@@ -539,8 +548,11 @@ impl Connection {
             let _ = write!(command_tag, "{}", tag);
         }
 
+        let column_names = self.proto.current_column_names()
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
         let column_count = rows.first().map_or(0, |r| r.len());
-        Ok(QueryResult { rows, command_tag, column_count })
+        Ok(QueryResult { rows, command_tag, column_count, column_names })
     }
 
     /// Execute a parameterized query and return rows.
@@ -768,8 +780,11 @@ impl Connection {
             bsql_postgres_proto::DescribedRows::Rows(borrow) => Some(borrow.to_owned()),
             bsql_postgres_proto::DescribedRows::NoData => None,
         };
+        let column_names = self.proto.current_column_names()
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
 
-        Ok(PreparedStatement { stmt_name, row_desc })
+        Ok(PreparedStatement { stmt_name, row_desc, column_names })
     }
 
     /// Execute a prepared statement with parameters and return rows.
@@ -806,8 +821,9 @@ impl Connection {
             use core::fmt::Write;
             let _ = write!(command_tag, "{}", tag);
         }
+        let column_names = stmt.column_names.clone();
         let column_count = rows.first().map_or(0, |r| r.len());
-        Ok(QueryResult { rows, command_tag, column_count })
+        Ok(QueryResult { rows, command_tag, column_count, column_names })
     }
 
     /// Execute a prepared DML statement with parameters. Returns affected rows.

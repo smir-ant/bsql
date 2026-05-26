@@ -489,6 +489,7 @@ pub(crate) fn dispatch(
     // emission (multi-statement batch). Only the three
     // SimpleQueryAwaitingRfq arms below touch it.
     command_tags_arena_slot: &mut Option<alloc::boxed::Box<crate::command_tags_arena::CommandTagsArena>>,
+    column_names_slot: &mut Option<alloc::boxed::Box<[alloc::string::String]>>,
 ) -> DispatchOutcome {
     // Snap owned prev for pattern matching; state slot holds the
     // explicit `ProtoState::Idle` placeholder during the match.
@@ -910,18 +911,13 @@ pub(crate) fn dispatch(
 
         // AwaitingFirstResponse: T / C / I / E — any other tag is desync
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ROW_DESCRIPTION) => {
-            // Parsed schema lands in PgProtocol::row_desc_slot. The
-            // variant transitions to StreamingRows (no inline
-            // payload). The slot lives across the entire stream
-            // (DataRows + Z).
             match crate::decode::parse_row_description(payload) {
                 Ok(row_desc) => {
-                    // Leaf helper performs the mint+park with the
-                    // auth tag's scope confined to its submodule.
                     _row_description_dispatch_leaf::park_row_description_at_dispatch(
                         row_desc_slot,
                         row_desc,
                     );
+                    *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
                     *state = ProtoState::SimpleQueryStreamingRows { reply };
                     DispatchOutcome::AdvancedSilent
                 }
@@ -1200,6 +1196,7 @@ pub(crate) fn dispatch(
                         row_desc_slot,
                         row_desc,
                     );
+                    *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
                     *state = ProtoState::SimpleQueryStreamingRows { reply };
                     DispatchOutcome::AdvancedWithAction {
                         action: crate::action::StagedAction::IntermediateCommandComplete {
@@ -1711,16 +1708,11 @@ pub(crate) fn dispatch(
             TAG_ROW_DESCRIPTION,
         ) => match crate::decode::parse_row_description(payload) {
             Ok(row_desc) => {
-                // Parsed schema lands in PgProtocol::row_desc_slot
-                // — the single source of truth (a naive
-                // `rows: Rows` discriminator would duplicate it).
-                // Materialise reads the slot at the Z arm. Leaf
-                // helper performs the mint+park with the auth tag's
-                // scope confined to its submodule.
                 _row_description_dispatch_leaf::park_row_description_at_dispatch(
                     row_desc_slot,
                     row_desc,
                 );
+                *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
                 *state = ProtoState::DescribeStatementAwaitingRfq { reply };
                 DispatchOutcome::AdvancedSilent
             }
@@ -1794,12 +1786,11 @@ pub(crate) fn dispatch(
             // single source of truth.
             match crate::decode::parse_row_description(payload) {
                 Ok(row_desc) => {
-                    // Leaf helper performs the mint+park with the
-                    // auth tag's scope confined to its submodule.
                     _row_description_dispatch_leaf::park_row_description_at_dispatch(
                         row_desc_slot,
                         row_desc,
                     );
+                    *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
                     *state = ProtoState::DescribePortalAwaitingRfq { reply };
                     DispatchOutcome::AdvancedSilent
                 }

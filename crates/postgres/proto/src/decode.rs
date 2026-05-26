@@ -530,6 +530,31 @@ pub(crate) fn parse_row_description(
     RowDesc::from_parts(&oids, &formats)
 }
 
+/// Extract column names from a `RowDescription` payload.
+///
+/// Same wire format as [`parse_row_description`] but only extracts
+/// the NUL-terminated name strings, skipping OID/format metadata.
+/// Returns one `String` per column in wire order.
+pub fn parse_column_names(payload: &[u8]) -> alloc::vec::Vec<alloc::string::String> {
+    let Some((count_bytes, mut rest)) = payload.split_first_chunk::<2>() else {
+        return alloc::vec::Vec::new();
+    };
+    let n = i16::from_be_bytes(*count_bytes);
+    if n < 0 {
+        return alloc::vec::Vec::new();
+    }
+    let n = n as usize;
+    let mut names = alloc::vec::Vec::with_capacity(n);
+    for _ in 0..n {
+        let Some(nul_pos) = rest.iter().position(|&b| b == 0) else { break };
+        let name_bytes = rest.get(..nul_pos).unwrap_or(&[]);
+        names.push(alloc::string::String::from_utf8_lossy(name_bytes).into_owned());
+        let skip = nul_pos.saturating_add(1).saturating_add(18);
+        rest = rest.get(skip..).unwrap_or(&[]);
+    }
+    names
+}
+
 /// Parse a `ParameterDescription` payload (body of the `'t'`
 /// frame, after the 5-byte header) into a
 /// [`crate::action::ParamOids`].

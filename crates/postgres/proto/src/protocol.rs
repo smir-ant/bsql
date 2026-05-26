@@ -789,6 +789,8 @@ pub(in crate::protocol) struct DispatchContext<'state, 'r> {
     pub(in crate::protocol) partial_assembly:
         &'r mut crate::partial_assembly::PartialAssemblyCell,
     pub(in crate::protocol) malformed_count: &'r mut u32,
+    pub(in crate::protocol) column_names:
+        &'r mut Option<alloc::boxed::Box<[alloc::string::String]>>,
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -1259,6 +1261,11 @@ pub struct ActiveExtras {
     /// Errored entry (slot persists across Errored cycle).
     pub(in crate::protocol) fail_cause:
         crate::fail_cause_slot::FailCauseSlotCell,
+    /// Column names from the most recent RowDescription frame.
+    /// Populated alongside `row_desc` during T-frame dispatch;
+    /// cleared at Idle/Errored residue boundary.
+    pub(in crate::protocol) column_names:
+        Option<alloc::boxed::Box<[alloc::string::String]>>,
 }
 
 /// Phase-typed wrapper over the per-phase Inner storage.
@@ -1943,6 +1950,7 @@ pub(crate) mod _proto_init_leaf {
             fail_cause: crate::fail_cause_slot::FailCauseSlotCell::empty(
                 ProtoInitToken::mint(),
             ),
+            column_names: None,
         }
     }
 
@@ -1983,6 +1991,7 @@ pub(crate) mod _proto_init_leaf {
             fail_cause: crate::fail_cause_slot::FailCauseSlotCell::empty(
                 ProtoInitToken::mint(),
             ),
+            column_names: None,
         }
     }
 
@@ -4427,6 +4436,7 @@ where
         command_tags_arena: command_tags_arena_slot,
         partial_assembly: partial_assembly_slot,
         malformed_count: malformed_counter,
+        column_names: column_names_slot,
     } = ctx;
 
     write_buf.clear();
@@ -4630,6 +4640,7 @@ where
                 error_arena_slot,
                 copy_chunks_arena_slot,
                 command_tags_arena_slot,
+                column_names_slot,
             );
             match outcome {
                 DispatchOutcome::AdvancedSilent => {
@@ -4881,6 +4892,7 @@ where
                         error_arena_slot,
                         copy_chunks_arena_slot,
                         command_tags_arena_slot,
+                        column_names_slot,
                     );
                     match outcome {
                         DispatchOutcome::AdvancedSilent => {
@@ -5188,6 +5200,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
     // post-handshake; ICC never fires in Connecting state).
     let mut transient_command_tags_arena:
         Option<alloc::boxed::Box<crate::command_tags_arena::CommandTagsArena>> = None;
+    let mut transient_column_names: Option<alloc::boxed::Box<[alloc::string::String]>> = None;
 
     let sentinel = ConnectingState::Errored(
         crate::error::StateErrorKind::from_kind_or_internal(
@@ -5226,6 +5239,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_connecting<'w, 'r, const BOUNDED:
             command_tags_arena: &mut transient_command_tags_arena,
             partial_assembly,
             malformed_count,
+            column_names: &mut transient_column_names,
         },
         bytes,
         write_buf,
@@ -5333,6 +5347,8 @@ pub(in crate::protocol) struct ActiveDispatchContext<'state, 'r> {
     pub(in crate::protocol) partial_assembly:
         &'r mut crate::partial_assembly::PartialAssemblyCell,
     pub(in crate::protocol) malformed_count: &'r mut u32,
+    pub(in crate::protocol) column_names:
+        &'r mut Option<alloc::boxed::Box<[alloc::string::String]>>,
 }
 
 /// Per-phase dispatch entry for `<ActivePhase>`'s `ActiveInner`.
@@ -5389,6 +5405,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
         command_tags_arena,
         partial_assembly,
         malformed_count,
+        column_names,
     } = ctx;
 
     let sentinel = ActiveState::Errored(
@@ -5419,6 +5436,7 @@ pub(in crate::protocol) fn feed_bytes_dispatch_active<'w, 'r, const BOUNDED: boo
             command_tags_arena,
             partial_assembly,
             malformed_count,
+            column_names,
         },
         bytes,
         write_buf,
@@ -5725,8 +5743,6 @@ impl ConnectingInner {
                 session_params: &mut self.session_params,
                 error_arena: &mut self.error_arena,
                 partial_assembly: &mut self.partial_assembly,
-                // .b: thread the REAL ConnectingInner.fail_cause
-                // (lives directly on Inner; ConnectingPhase has no Extras).
                 fail_cause_slot: &mut self.fail_cause,
                 malformed_count: &mut self.malformed_frame_count,
             },
@@ -5847,6 +5863,7 @@ impl ActiveInner {
                 command_tags_arena: &mut self.command_tags_arena,
                 partial_assembly: &mut self.partial_assembly,
                 malformed_count: &mut self.malformed_frame_count,
+                column_names: &mut extras.column_names,
             },
             bytes,
             write_buf,
@@ -5933,6 +5950,7 @@ impl ActiveInner {
                 command_tags_arena: &mut self.command_tags_arena,
                 partial_assembly: &mut self.partial_assembly,
                 malformed_count: &mut self.malformed_frame_count,
+                column_names: &mut extras.column_names,
             },
             write_buf,
         )
@@ -5974,6 +5992,11 @@ impl ActiveInner {
             &mut self.partial_assembly,
             class,
         );
+        if matches!(class,
+            crate::state::StatePushClass::Idle | crate::state::StatePushClass::Errored(_))
+        {
+            extras.column_names = None;
+        }
     }
 }
 
@@ -6736,6 +6759,14 @@ impl PgProtocol<ActivePhase> {
     /// re-project the schema after `read_buf_advance`. The Option
     /// projection is strictly cheaper than the second enum match
     /// — one byte read for the discriminant, one ptr-deref on Some.
+    /// Column names from the most recent RowDescription frame.
+    #[inline]
+    #[must_use]
+    pub fn current_column_names(&self) -> Option<&[alloc::string::String]> {
+        self.extras.column_names.as_deref()
+    }
+
+    /// Read the parked `RowDesc` from the protocol's row_desc_slot.
     #[inline]
     #[must_use]
     pub fn current_row_desc(&self) -> Option<crate::decode::RowDescBorrow<'_>> {
