@@ -19,11 +19,11 @@ Three crates live in the workspace:
 
 | Crate | Description | Status |
 |-------|-------------|--------|
-| [`bsql-pg-proto`](crates/bsql-pg-proto/) | Sans-IO PG wire protocol state machine (`no_std + alloc`, `#![forbid(unsafe_code)]`) | Feature-complete for v1 |
+| [`bsql-postgres-proto`](crates/bsql-pg-proto/) | Sans-IO PG wire protocol state machine (`no_std + alloc`, `#![forbid(unsafe_code)]`) | Feature-complete for v1 |
 | [`bsql-pg-proto-derive`](crates/bsql-pg-proto-derive/) | Proc-macro pair (`#[derive(Pristine)]`) | Shipped |
-| [`bsql-postgres`](crates/bsql-postgres/) | Async driver (tokio + rustls) | Alpha — [README](crates/bsql-postgres/README.md) |
+| [`bsql-postgres`](crates/bsql-postgres/) | Async driver (tokio + rustls) | Alpha — [README](crates/postgres/driver/README.md) |
 
-### bsql-pg-proto highlights
+### bsql-postgres-proto highlights
 - PgProtocol<Active>: 296 B per connection
 - push_command/ping: 46 ns
 - SimpleQuery, Extended Query, COPY, LISTEN/NOTIFY, Describe, Close, Terminate
