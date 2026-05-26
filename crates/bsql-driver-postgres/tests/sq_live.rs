@@ -287,3 +287,4 @@ async fn execute_returns_row_count() {
 
     conn.close().await.expect("close");
 }
+

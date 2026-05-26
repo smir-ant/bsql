@@ -5,6 +5,7 @@ use bsql_pg_proto::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Result of a query — rows + command tag.
+#[derive(Debug)]
 pub struct QueryResult {
     /// Rows. Each row provides typed column access via `Row::get`.
     pub rows: Vec<Row>,
@@ -13,6 +14,7 @@ pub struct QueryResult {
 }
 
 /// A single result row. Column values are raw bytes decoded on access.
+#[derive(Debug)]
 pub struct Row {
     columns: Vec<Option<Vec<u8>>>,
 }
