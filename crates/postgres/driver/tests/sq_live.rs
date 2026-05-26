@@ -437,3 +437,25 @@ fn from_env_creates_config() {
     assert!(config.port > 0);
     assert!(!config.user.is_empty());
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn execute_params_insert() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.execute("CREATE TEMP TABLE param_test(id int, name text)").await.expect("create");
+
+    let n = conn.execute_params(
+        "INSERT INTO param_test VALUES ($1, $2)",
+        &(42i32, "alice"),
+    ).await.expect("insert");
+    assert_eq!(n, 1, "expected 1 row inserted");
+
+    let row = conn.query_one("SELECT id, name FROM param_test").await.expect("select");
+    assert_eq!(row.get_i32(0), Some(42));
+    assert_eq!(row.get_str(1), Some("alice"));
+
+    conn.close().await.expect("close");
+}

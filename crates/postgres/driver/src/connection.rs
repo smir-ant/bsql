@@ -466,6 +466,65 @@ impl Connection {
         Ok(QueryResult { rows, command_tag, column_count })
     }
 
+    /// Execute a parameterized DML. Returns affected row count.
+    ///
+    /// Uses Extended Query (Parse + Bind + Execute). Prevents SQL injection.
+    pub async fn execute_params<P: bsql_postgres_proto::params::ParamsWriter>(
+        &mut self,
+        sql: &str,
+        params: &P,
+    ) -> Result<u64, DriverError> {
+        let parse_reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::ParseKind>();
+        let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
+        let actions = guard
+            .push_command(
+                bsql_postgres_proto::push_command::Parse {
+                    stmt_name: bsql_postgres_proto::StmtName::default(),
+                    sql,
+                    reply: parse_reply,
+                },
+                &mut self.wb,
+            )
+            .map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        for action in actions.as_slice() {
+            if let bsql_postgres_proto::Action::SendBytes(bytes) = action {
+                self.stream.write_all(bytes).await?;
+            }
+        }
+        self.wb.clear();
+        self.pump_until_idle(|_, _| {}).await?;
+
+        let query_reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::QueryKind>();
+        let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
+        let portal = bsql_postgres_proto::PortalName::default();
+        let stmt = bsql_postgres_proto::StmtName::default();
+        let actions = guard
+            .push_bind_execute(
+                &portal,
+                &stmt,
+                params,
+                None,
+                bsql_postgres_proto::FetchRows::All,
+                query_reply,
+                &mut self.wb,
+            )
+            .map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        for action in actions.as_slice() {
+            if let bsql_postgres_proto::Action::SendBytes(bytes) = action {
+                self.stream.write_all(bytes).await?;
+            }
+        }
+        self.wb.clear();
+
+        self.pump_until_idle(|_, _| {}).await?;
+        let mut tag = String::new();
+        if let Some(t) = self.proto.current_command_tag() {
+            use core::fmt::Write;
+            let _ = write!(tag, "{}", t);
+        }
+        Ok(tag.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+
     /// Server version string (e.g., "15.4").
     pub fn server_version(&self) -> Option<&str> {
         self.proto.session_params()
@@ -511,40 +570,51 @@ impl Connection {
             match event {
                 FeedEvent::Idle => return Ok(()),
                 FeedEvent::NeedMoreBytes => {
-                    // Retry — buffer may have frames after silent dispatch.
-                    let retry = self.proto.advance_one_frame(&mut self.wb);
-                    match retry {
-                        FeedEvent::Idle => return Ok(()),
-                        FeedEvent::Deliver(id, reply) => {
-                            on_deliver(id, reply);
-                            continue;
-                        }
-                        FeedEvent::SendBytes(bytes) => {
-                            self.stream.write_all(bytes).await?;
-                            continue;
-                        }
-                        FeedEvent::StreamingRows => {
-                            self.drain_streaming().await?;
-                            continue;
-                        }
-                        FeedEvent::NeedMoreBytes => {
-                            if matches!(self.proto.state(),
-                                bsql_postgres_proto::ActiveState::SimpleQueryStreamingRows { .. }
-                                | bsql_postgres_proto::ActiveState::BindExecuteStreamingRows { .. })
-                            {
+                    // Retry loop — keep advancing until non-NeedMoreBytes
+                    // event or buffer truly empty (need socket read).
+                    // Silent dispatches (ParseComplete, BindComplete, CC)
+                    // return NeedMoreBytes despite buffer having more frames.
+                    let mut consecutive_need = 1u32;
+                    loop {
+                        let retry = self.proto.advance_one_frame(&mut self.wb);
+                        match retry {
+                            FeedEvent::Idle => return Ok(()),
+                            FeedEvent::Deliver(id, reply) => {
+                                on_deliver(id, reply);
+                                break;
+                            }
+                            FeedEvent::SendBytes(bytes) => {
+                                self.stream.write_all(bytes).await?;
+                                break;
+                            }
+                            FeedEvent::StreamingRows => {
                                 self.drain_streaming().await?;
+                                break;
+                            }
+                            FeedEvent::NeedMoreBytes => {
+                                consecutive_need = consecutive_need.saturating_add(1);
+                                if matches!(self.proto.state(),
+                                    bsql_postgres_proto::ActiveState::SimpleQueryStreamingRows { .. }
+                                    | bsql_postgres_proto::ActiveState::BindExecuteStreamingRows { .. })
+                                {
+                                    self.drain_streaming().await?;
+                                    break;
+                                }
+                                if consecutive_need > 5 {
+                                    self.read_from_socket().await?;
+                                    break;
+                                }
                                 continue;
                             }
-                            self.read_from_socket().await?;
-                        }
-                        FeedEvent::Fail(_) => {
-                            if let Some(&cause) = self.proto.fail_cause() {
-                                return Err(DriverError::Protocol(cause));
+                            FeedEvent::Fail(_) => {
+                                if let Some(&cause) = self.proto.fail_cause() {
+                                    return Err(DriverError::Protocol(cause));
+                                }
+                                return Err(DriverError::NotReady);
                             }
-                            return Err(DriverError::NotReady);
+                            FeedEvent::Close => return Err(DriverError::NotReady),
+                            _ => { break; }
                         }
-                        FeedEvent::Close => return Err(DriverError::NotReady),
-                        _ => {}
                     }
                 }
                 FeedEvent::SendBytes(bytes) => {
