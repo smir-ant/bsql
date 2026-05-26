@@ -1,0 +1,15 @@
+[package]
+name = "bsql-sqlite"
+version = "0.1.0-alpha.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Lightweight SQLite driver with API-compatible Row type"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# `rusqlite` — Safe Rust bindings for SQLite. `bundled` feature compiles
+# SQLite from source via `libsqlite3-sys`, removing system-library
+# dependency and ensuring version consistency across platforms.
+# Audit-trust class: ecosystem standard (100M+ downloads), maintained
+# by the rusqlite working group.
+rusqlite = { version = "0.33", features = ["bundled"] }

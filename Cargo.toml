@@ -4,6 +4,7 @@ members = [
     "crates/postgres/proto",
     "crates/postgres/derive",
     "crates/postgres/driver",
+    "crates/sqlite/driver",
 ]
 
 [workspace.package]
