@@ -25,9 +25,9 @@ pub enum PumpAction {
 /// Both async and sync drivers hold a Session and drive it via
 /// the PumpAction state machine.
 pub struct Session {
-    pub(crate) proto: PgProtocol<ActivePhase>,
-    pub(crate) wb: WriteBuf,
-    pub(crate) buf: Vec<u8>,
+    pub proto: PgProtocol<ActivePhase>,
+    pub wb: WriteBuf,
+    pub buf: Vec<u8>,
     stmt_counter: u32,
 }
 

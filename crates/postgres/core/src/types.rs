@@ -77,9 +77,9 @@ impl FromText for String {
 /// Handle to a server-side prepared statement.
 #[derive(Debug)]
 pub struct PreparedStatement {
-    pub(crate) stmt_name: bsql_postgres_proto::StmtName,
-    pub(crate) row_desc: Option<bsql_postgres_proto::decode::RowDesc>,
-    pub(crate) column_names: Arc<[String]>,
+    pub stmt_name: bsql_postgres_proto::StmtName,
+    pub row_desc: Option<bsql_postgres_proto::decode::RowDesc>,
+    pub column_names: Arc<[String]>,
 }
 
 impl PreparedStatement {

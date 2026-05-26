@@ -3,9 +3,8 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
-use crate::config::ConnectConfig;
+use bsql_postgres_core::{ConnectConfig, DriverError};
 use crate::connection::Connection;
-use crate::error::DriverError;
 
 #[derive(Clone)]
 pub struct Pool {
