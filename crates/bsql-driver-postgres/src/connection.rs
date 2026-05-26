@@ -68,6 +68,41 @@ impl Row {
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
     }
+
+    /// Get column by index with generic FromText conversion.
+    pub fn get<T: FromText>(&self, idx: usize) -> Option<T> {
+        T::from_text(self.get_str(idx)?)
+    }
+}
+
+/// Trait for converting PG text-format values to Rust types.
+pub trait FromText: Sized {
+    /// Parse from PG text representation.
+    fn from_text(s: &str) -> Option<Self>;
+}
+
+impl FromText for i16 {
+    fn from_text(s: &str) -> Option<Self> { s.parse().ok() }
+}
+impl FromText for i32 {
+    fn from_text(s: &str) -> Option<Self> { s.parse().ok() }
+}
+impl FromText for i64 {
+    fn from_text(s: &str) -> Option<Self> { s.parse().ok() }
+}
+impl FromText for f32 {
+    fn from_text(s: &str) -> Option<Self> { s.parse().ok() }
+}
+impl FromText for f64 {
+    fn from_text(s: &str) -> Option<Self> { s.parse().ok() }
+}
+impl FromText for bool {
+    fn from_text(s: &str) -> Option<Self> {
+        match s { "t" => Some(true), "f" => Some(false), _ => None }
+    }
+}
+impl FromText for String {
+    fn from_text(s: &str) -> Option<Self> { Some(s.to_string()) }
 }
 use tokio::net::TcpStream;
 

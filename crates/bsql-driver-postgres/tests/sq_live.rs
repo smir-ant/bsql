@@ -323,3 +323,26 @@ async fn query_opt_found_and_not_found() {
 
     conn.close().await.expect("close");
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn generic_get_typed() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    let row = conn.query_one("SELECT 42::int, 3.14::float8, true::bool, 'hello'::text")
+        .await.expect("query");
+
+    let i: i32 = row.get(0).unwrap();
+    let f: f64 = row.get(1).unwrap();
+    let b: bool = row.get(2).unwrap();
+    let s: String = row.get(3).unwrap();
+
+    assert_eq!(i, 42);
+    assert!((f - 3.14).abs() < 0.001);
+    assert!(b);
+    assert_eq!(s, "hello");
+
+    conn.close().await.expect("close");
+}
