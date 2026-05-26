@@ -5,13 +5,15 @@ use rusqlite::types::Value;
 use crate::error::SqliteError;
 
 #[derive(Debug)]
+#[must_use]
 pub struct QueryResult {
     pub rows: Vec<Row>,
     pub column_count: usize,
     pub column_names: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[must_use]
 pub struct Row {
     columns: Vec<Option<Vec<u8>>>,
 }

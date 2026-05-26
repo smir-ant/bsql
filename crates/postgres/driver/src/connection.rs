@@ -248,17 +248,11 @@ impl Connection {
         let mut stream = Self::negotiate_ssl(tcp, config).await?;
 
         let user = bsql_postgres_proto::Ident::try_from_str(&config.user)
-            .map_err(|_| DriverError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "invalid user name",
-            )))?;
+            .map_err(|_| DriverError::Config("invalid user name"))?;
         let database = match &config.database {
             Some(d) => Some(
                 bsql_postgres_proto::DatabaseName::try_from_str(d)
-                    .map_err(|_| DriverError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "invalid database name",
-                    )))?,
+                    .map_err(|_| DriverError::Config("invalid database name"))?,
             ),
             None => None,
         };
@@ -271,10 +265,7 @@ impl Connection {
         let credentials = match &config.password {
             Some(pw) => {
                 let password = bsql_postgres_proto::Password::try_from_str(pw)
-                    .map_err(|_| DriverError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "invalid password",
-                    )))?;
+                    .map_err(|_| DriverError::Config("invalid password"))?;
                 bsql_postgres_proto::Credentials::ScramPassword(
                     bsql_postgres_proto::sensitive::Sensitive::new(password),
                 )
@@ -379,10 +370,7 @@ impl Connection {
                 let server_name = rustls::pki_types::ServerName::try_from(
                     config.host.as_str(),
                 )
-                .map_err(|_| DriverError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "invalid server name for TLS",
-                )))?
+                .map_err(|_| DriverError::Config("invalid server name for TLS"))?
                 .to_owned();
 
                 let tls_stream = connector.connect(server_name, tcp).await
@@ -493,10 +481,7 @@ impl Connection {
     pub async fn query_one(&mut self, sql: &str) -> Result<Row, DriverError> {
         let result = self.query(sql).await?;
         if result.rows.is_empty() {
-            return Err(DriverError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "query returned no rows",
-            )));
+            return Err(DriverError::NoRows);
         }
         let mut rows = result.rows;
         Ok(rows.swap_remove(0))
@@ -565,10 +550,7 @@ impl Connection {
     ) -> Result<Row, DriverError> {
         let result = self.query_params(sql, params).await?;
         if result.rows.is_empty() {
-            return Err(DriverError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "query returned no rows",
-            )));
+            return Err(DriverError::NoRows);
         }
         let mut rows = result.rows;
         Ok(rows.swap_remove(0))
