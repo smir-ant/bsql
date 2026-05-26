@@ -87,7 +87,7 @@ async fn column_names() {
 
     let result = conn.query("SELECT 1 AS id, 'hello' AS greeting")
         .await.expect("select");
-    assert_eq!(result.column_names, vec!["id", "greeting"]);
+    assert_eq!(&*result.column_names, &["id", "greeting"]);
 
     let row = &result.rows[0];
     assert_eq!(row.get_by_name("id", &result.column_names), Some(b"1".as_slice()));
@@ -98,7 +98,7 @@ async fn column_names() {
         "SELECT $1::int AS val",
         &(42i32,),
     ).await.expect("query_params");
-    assert_eq!(result2.column_names, vec!["val"]);
+    assert_eq!(&*result2.column_names, &["val"]);
     assert_eq!(result2.rows[0].get_by_name("val", &result2.column_names), Some(b"42".as_slice()));
 
     conn.close().await.expect("close");

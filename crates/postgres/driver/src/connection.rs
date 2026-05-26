@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use bsql_postgres_proto::{
     ActivePhase, FeedEvent, PgProtocol, WriteBuf,
     reply_id::PingKind,
@@ -14,7 +16,7 @@ use bsql_postgres_proto::{
 pub struct PreparedStatement {
     stmt_name: bsql_postgres_proto::StmtName,
     row_desc: Option<bsql_postgres_proto::decode::RowDesc>,
-    column_names: Vec<String>,
+    column_names: Arc<[String]>,
 }
 
 impl PreparedStatement {
@@ -46,8 +48,9 @@ pub struct QueryResult {
     pub command_tag: String,
     /// Number of columns in the result set.
     pub column_count: usize,
-    /// Column names from RowDescription (empty for DML).
-    pub column_names: Vec<String>,
+    /// Column names from RowDescription (empty for DML). Arc-shared
+    /// across QueryResults from the same prepared statement.
+    pub column_names: Arc<[String]>,
 }
 
 /// A single result row. Column values are raw bytes decoded on access.
@@ -520,9 +523,9 @@ impl Connection {
             let _ = write!(command_tag, "{}", tag);
         }
 
-        let column_names = self.proto.current_column_names()
-            .map(|s| s.to_vec())
-            .unwrap_or_default();
+        let column_names: Arc<[String]> = self.proto.current_column_names()
+            .map(|s| Arc::from(s.to_vec().into_boxed_slice()))
+            .unwrap_or_else(|| Arc::from(Vec::new().into_boxed_slice()));
         let column_count = rows.first().map_or(0, |r| r.len());
         Ok(QueryResult { rows, command_tag, column_count, column_names })
     }
@@ -752,9 +755,9 @@ impl Connection {
             bsql_postgres_proto::DescribedRows::Rows(borrow) => Some(borrow.to_owned()),
             bsql_postgres_proto::DescribedRows::NoData => None,
         };
-        let column_names = self.proto.current_column_names()
-            .map(|s| s.to_vec())
-            .unwrap_or_default();
+        let column_names: Arc<[String]> = self.proto.current_column_names()
+            .map(|s| Arc::from(s.to_vec().into_boxed_slice()))
+            .unwrap_or_else(|| Arc::from(Vec::new().into_boxed_slice()));
 
         Ok(PreparedStatement { stmt_name, row_desc, column_names })
     }
