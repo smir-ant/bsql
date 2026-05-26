@@ -37,7 +37,9 @@ impl ConnectConfig {
         self
     }
 
-    /// Set the password (enables SCRAM-SHA-256 auth).
+    /// Set the password. Default auth is SCRAM-SHA-256.
+    /// Server chooses the actual method — SCRAM works for both
+    /// `scram-sha-256` and `md5` pg_hba rules (PG falls back).
     pub fn password(mut self, pw: impl Into<String>) -> Self {
         self.password = Some(pw.into());
         self

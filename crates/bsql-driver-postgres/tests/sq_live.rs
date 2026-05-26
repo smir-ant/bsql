@@ -206,3 +206,19 @@ async fn transaction_commit() {
 
     conn.close().await.expect("close");
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn query_one_convenience() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    let row = conn.query_one("SELECT 42::int, 3.14::float8, 'bsql'::text")
+        .await.expect("query_one");
+    assert_eq!(row.get_i32(0), Some(42));
+    assert_eq!(row.get_f64(1), Some(3.14));
+    assert_eq!(row.get_str(2), Some("bsql"));
+
+    conn.close().await.expect("close");
+}

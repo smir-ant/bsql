@@ -239,6 +239,19 @@ impl Connection {
         Ok(command_tag)
     }
 
+    /// Execute a query expecting exactly one row. Returns the row.
+    pub async fn query_one(&mut self, sql: &str) -> Result<Row, DriverError> {
+        let result = self.query(sql).await?;
+        if result.rows.is_empty() {
+            return Err(DriverError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "query returned no rows",
+            )));
+        }
+        let mut rows = result.rows;
+        Ok(rows.swap_remove(0))
+    }
+
     /// Execute a query and return rows as raw byte vectors.
     ///
     /// Each row is `Vec<Option<Vec<u8>>>` — one entry per column.
