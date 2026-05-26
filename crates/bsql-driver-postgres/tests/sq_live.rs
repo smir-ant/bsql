@@ -162,3 +162,47 @@ async fn typed_row_access() {
 
     conn.close().await.expect("close");
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn sequential_queries() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.simple_query("CREATE TEMP TABLE seq_test(v int)").await.expect("create");
+    for i in 1..=5 {
+        conn.simple_query(&format!("INSERT INTO seq_test VALUES ({i})"))
+            .await.expect("insert");
+    }
+    let result = conn.query("SELECT v FROM seq_test ORDER BY v").await.expect("select");
+    assert_eq!(result.rows.len(), 5);
+    for (i, row) in result.rows.iter().enumerate() {
+        assert_eq!(row.get_i32(0), Some((i as i32) + 1));
+    }
+
+    // Second SELECT on same connection
+    let r2 = conn.query("SELECT count(*) FROM seq_test").await.expect("count");
+    assert_eq!(r2.rows[0].get_i64(0), Some(5));
+
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn transaction_commit() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.simple_query("CREATE TEMP TABLE tx_test(v int)").await.expect("create");
+    conn.simple_query("BEGIN").await.expect("begin");
+    conn.simple_query("INSERT INTO tx_test VALUES (1)").await.expect("insert");
+    conn.simple_query("COMMIT").await.expect("commit");
+
+    let result = conn.query("SELECT v FROM tx_test").await.expect("select");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].get_i32(0), Some(1));
+
+    conn.close().await.expect("close");
+}
