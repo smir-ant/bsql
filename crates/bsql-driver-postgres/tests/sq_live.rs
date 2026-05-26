@@ -11,7 +11,7 @@ async fn dml_create() {
         .await.expect("query");
     eprintln!("tag: [{tag}]");
     assert!(tag.contains("CREATE"), "got: {tag}");
-    let _ = conn.close().await;
+    conn.ping().await.expect("ping after error"); conn.close().await.expect("close");
 }
 
 #[tokio::test]
@@ -30,7 +30,7 @@ async fn dml_insert_and_drop() {
     let t = conn.simple_query("DROP TABLE sq2").await.expect("drop");
     assert!(t.contains("DROP"), "got: {t}");
 
-    let _ = conn.close().await;
+    conn.ping().await.expect("ping after error"); conn.close().await.expect("close");
 }
 
 #[tokio::test]
@@ -42,7 +42,7 @@ async fn select_1_returns_tag() {
     let tag = conn.simple_query("SELECT 1").await.expect("select");
     eprintln!("SELECT 1 tag: [{tag}]");
     assert!(tag.contains("SELECT"), "got: {tag}");
-    let _ = conn.close().await;
+    conn.ping().await.expect("ping after error"); conn.close().await.expect("close");
 }
 
 #[tokio::test]
@@ -75,7 +75,7 @@ async fn query_select_rows() {
     assert_eq!(result.rows[1].get_raw(0), Some(b"2".as_slice()));
     assert_eq!(result.rows[1].get_raw(1), Some(b"bob".as_slice()));
 
-    let _ = conn.close().await;
+    conn.ping().await.expect("ping after error"); conn.close().await.expect("close");
 }
 
 #[tokio::test]
@@ -92,7 +92,7 @@ async fn query_with_nulls() {
     assert!(result.rows[0].is_null(1), "expected NULL");
     assert_eq!(result.rows[0].get_raw(2), Some(b"hello".as_slice()));
 
-    let _ = conn.close().await;
+    conn.ping().await.expect("ping after error"); conn.close().await.expect("close");
 }
 
 #[tokio::test]
@@ -109,7 +109,7 @@ async fn query_100_rows() {
     assert_eq!(result.rows[0].get_raw(0), Some(b"1".as_slice()));
     assert_eq!(result.rows[99].get_raw(0), Some(b"100".as_slice()));
 
-    let _ = conn.close().await;
+    conn.ping().await.expect("ping after error"); conn.close().await.expect("close");
 }
 
 #[tokio::test]
@@ -123,8 +123,8 @@ async fn bad_sql_returns_error() {
     assert!(result.is_err(), "bad SQL should error");
 
     // Connection should still be usable after error
-    // Connection may be in errored state — recovery is future work
-    let _ = conn.close().await;
+    // Connection recovers — ping after error works
+    conn.ping().await.expect("ping after error"); conn.close().await.expect("close");
 }
 
 #[tokio::test]

@@ -33,6 +33,11 @@ impl Row {
         self.get_str(idx)?.parse().ok()
     }
 
+    /// Get column `idx` as `f64`.
+    pub fn get_f64(&self, idx: usize) -> Option<f64> {
+        self.get_str(idx)?.parse().ok()
+    }
+
     /// Get column `idx` as `bool`. PG text: "t"=true, "f"=false.
     pub fn get_bool(&self, idx: usize) -> Option<bool> {
         match self.get_str(idx)? {
@@ -352,10 +357,36 @@ impl Connection {
                 }
                 FeedEvent::Notice(_) => {}
                 FeedEvent::Fail(_) => {
-                    if let Some(&cause) = self.proto.fail_cause() {
-                        return Err(DriverError::Protocol(cause));
+                    // Capture error but continue pumping to drain
+                    // the trailing RFQ and return to Idle.
+                    // Without this, the connection is stuck in
+                    // DrainRfqAfterError and unusable.
+                    let err = if let Some(&cause) = self.proto.fail_cause() {
+                        DriverError::Protocol(cause)
+                    } else {
+                        DriverError::NotReady
+                    };
+                    // Drain until Idle, then return the captured error.
+                    loop {
+                        let ev = self.proto.advance_one_frame(&mut self.wb);
+                        match ev {
+                            FeedEvent::Idle => return Err(err),
+                            FeedEvent::NeedMoreBytes => {
+                                // Retry before socket read (silent dispatch).
+                                let ev2 = self.proto.advance_one_frame(&mut self.wb);
+                                match ev2 {
+                                    FeedEvent::Idle => return Err(err),
+                                    FeedEvent::NeedMoreBytes => {
+                                        if let Err(e) = self.read_from_socket().await {
+                                            return Err(e);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
                     }
-                    return Err(DriverError::NotReady);
                 }
                 FeedEvent::Close => return Err(DriverError::NotReady),
                 _ => {}
@@ -452,10 +483,36 @@ impl Connection {
                 }
                 FeedEvent::Notice(_) => {}
                 FeedEvent::Fail(_) => {
-                    if let Some(&cause) = self.proto.fail_cause() {
-                        return Err(DriverError::Protocol(cause));
+                    // Capture error but continue pumping to drain
+                    // the trailing RFQ and return to Idle.
+                    // Without this, the connection is stuck in
+                    // DrainRfqAfterError and unusable.
+                    let err = if let Some(&cause) = self.proto.fail_cause() {
+                        DriverError::Protocol(cause)
+                    } else {
+                        DriverError::NotReady
+                    };
+                    // Drain until Idle, then return the captured error.
+                    loop {
+                        let ev = self.proto.advance_one_frame(&mut self.wb);
+                        match ev {
+                            FeedEvent::Idle => return Err(err),
+                            FeedEvent::NeedMoreBytes => {
+                                // Retry before socket read (silent dispatch).
+                                let ev2 = self.proto.advance_one_frame(&mut self.wb);
+                                match ev2 {
+                                    FeedEvent::Idle => return Err(err),
+                                    FeedEvent::NeedMoreBytes => {
+                                        if let Err(e) = self.read_from_socket().await {
+                                            return Err(e);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
                     }
-                    return Err(DriverError::NotReady);
                 }
                 FeedEvent::Close => return Err(DriverError::NotReady),
                 _ => {}
