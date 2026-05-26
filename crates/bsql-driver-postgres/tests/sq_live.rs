@@ -128,3 +128,18 @@ async fn bad_sql_returns_error() {
     // Connection may be in errored state — recovery is future work
     let _ = conn.close().await;
 }
+
+#[tokio::test]
+#[ignore = "requires local PG with scram-sha-256 auth (not trust)"]
+async fn scram_auth_connect_and_query() {
+    let config = ConnectConfig::new("127.0.0.1", "bsql_test_scram")
+        .database("postgres".to_string())
+        .password("test_password_123".to_string());
+
+    let mut conn = Connection::connect(&config).await.expect("SCRAM connect");
+    let result = conn.query("SELECT current_user").await.expect("query");
+    eprintln!("user: {:?}", result.rows[0][0].as_deref().map(String::from_utf8_lossy));
+    assert_eq!(result.rows[0][0].as_deref(), Some(b"bsql_test_scram".as_slice()));
+
+    conn.close().await.expect("close");
+}

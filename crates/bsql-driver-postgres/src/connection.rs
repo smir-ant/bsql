@@ -57,12 +57,26 @@ impl Connection {
 
         let reply = proto.next_reply_id::<bsql_pg_proto::reply_id::StartupKind>();
 
+        let credentials = match &config.password {
+            Some(pw) => {
+                let password = bsql_pg_proto::Password::try_from_str(pw)
+                    .map_err(|_| DriverError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid password",
+                    )))?;
+                bsql_pg_proto::Credentials::ScramPassword(
+                    bsql_pg_proto::sensitive::Sensitive::new(password),
+                )
+            }
+            None => bsql_pg_proto::password::Credentials::Trust,
+        };
+
         let (actions, mut connecting) = proto
             .push_startup(
                 user,
                 database,
                 None,
-                bsql_pg_proto::password::Credentials::Trust,
+                credentials,
                 reply,
                 &mut wb,
             )

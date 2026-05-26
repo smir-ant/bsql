@@ -9,6 +9,8 @@ pub struct ConnectConfig {
     pub user: String,
     /// Database name (defaults to user if absent).
     pub database: Option<String>,
+    /// Password for SCRAM/MD5/Cleartext auth. None = Trust.
+    pub password: Option<String>,
 }
 
 impl ConnectConfig {
@@ -19,6 +21,7 @@ impl ConnectConfig {
             port: 5432,
             user: user.into(),
             database: None,
+            password: None,
         }
     }
 
@@ -31,6 +34,12 @@ impl ConnectConfig {
     /// Set the database.
     pub fn database(mut self, db: impl Into<String>) -> Self {
         self.database = Some(db.into());
+        self
+    }
+
+    /// Set the password (enables SCRAM-SHA-256 auth).
+    pub fn password(mut self, pw: impl Into<String>) -> Self {
+        self.password = Some(pw.into());
         self
     }
 }
