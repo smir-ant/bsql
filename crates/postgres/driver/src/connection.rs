@@ -1088,11 +1088,15 @@ impl Connection {
         rows: &mut Vec<Row>,
     ) -> Result<(), DriverError> {
         let mut prebuf = Vec::new();
+        let mut scan_from = 0usize;
         let probe = std::time::Duration::from_millis(10);
         match tokio::time::timeout(probe, self.stream.read(&mut self.buf)).await {
             Ok(Ok(n)) if n > 0 => {
                 prebuf.extend_from_slice(&self.buf[..n]);
-                while !prebuf.windows(5).any(|w| w[0] == b'Z' && w[1..5] == [0, 0, 0, 5]) {
+                while !prebuf.get(scan_from..).unwrap_or(&[])
+                    .windows(5).any(|w| w[0] == b'Z' && w[1..5] == [0, 0, 0, 5])
+                {
+                    scan_from = prebuf.len().saturating_sub(4);
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
                         self.stream.read(&mut self.buf),
