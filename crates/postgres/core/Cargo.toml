@@ -1,0 +1,11 @@
+[package]
+name = "bsql-postgres-core"
+version = "0.1.0-alpha.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Shared types and Session for bsql PostgreSQL drivers (async + sync)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bsql-postgres-proto = { path = "../proto" }
+zeroize = { version = "1", default-features = false, features = ["zeroize_derive", "alloc"] }

@@ -4,6 +4,7 @@ members = [
     "crates/bsql",
     "crates/postgres/proto",
     "crates/postgres/derive",
+    "crates/postgres/core",
     "crates/postgres/driver",
     "crates/postgres/sync",
     "crates/sqlite/driver",

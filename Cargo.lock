@@ -72,6 +72,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsql-postgres-core"
+version = "0.1.0-alpha.0"
+dependencies = [
+ "bsql-postgres-proto",
+ "zeroize",
+]
+
+[[package]]
 name = "bsql-postgres-derive"
 version = "1.0.0-alpha.0"
 dependencies = [
