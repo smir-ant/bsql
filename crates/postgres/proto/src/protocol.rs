@@ -4880,6 +4880,14 @@ where
                         break;
                     }
 
+                    if tag.byte() == crate::wire::TAG_DATA_ROW.byte()
+                        && matches!(*state,
+                            ProtoState::SimpleQueryStreamingRows { .. }
+                            | ProtoState::BindExecuteStreamingRows { .. }
+                            | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. })
+                    {
+                        break;
+                    }
                     let outcome = dispatch(
                         state,
                         tag,

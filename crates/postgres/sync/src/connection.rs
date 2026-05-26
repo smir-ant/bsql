@@ -240,70 +240,73 @@ impl Connection {
     }
 
     fn drain_to_idle(&mut self) {
-        for _ in 0..50 {
-            let ev = self.proto.advance_one_frame(&mut self.wb);
-            match ev {
-                FeedEvent::Idle => return,
-                FeedEvent::NeedMoreBytes => {
-                    let ev2 = self.proto.advance_one_frame(&mut self.wb);
-                    if matches!(ev2, FeedEvent::Idle) { return; }
-                    if matches!(ev2, FeedEvent::NeedMoreBytes) {
-                        if self.read_from_socket().is_err() { return; }
-                    }
-                }
-                _ => {}
-            }
+        for _ in 0..10 {
+            let _ = self.proto.feed_bytes(&[], &mut self.wb);
+            if matches!(self.proto.connection_status(),
+                bsql_postgres_proto::ConnectionStatus::Ready) { return; }
+            if self.read_from_socket().is_err() { return; }
         }
     }
 
-    fn pump_until_idle(&mut self) -> Result<(), DriverError> {
-        let mut consecutive_need = 0u32;
-        loop {
-            if matches!(self.proto.connection_status(),
-                bsql_postgres_proto::ConnectionStatus::Ready) { return Ok(()); }
+    fn is_streaming_state(state: &bsql_postgres_proto::ActiveState) -> bool {
+        matches!(state,
+            bsql_postgres_proto::ActiveState::SimpleQueryStreamingRows { .. }
+            | bsql_postgres_proto::ActiveState::BindExecuteStreamingRows { .. }
+            | bsql_postgres_proto::ActiveState::BindExecuteAwaitingDataOrCompleteSelect { .. })
+    }
 
-            if matches!(self.proto.state(),
-                bsql_postgres_proto::ActiveState::SimpleQueryStreamingRows { .. }
-                | bsql_postgres_proto::ActiveState::BindExecuteStreamingRows { .. }
-                | bsql_postgres_proto::ActiveState::BindExecuteAwaitingDataOrCompleteSelect { .. })
-            {
-                self.drain_streaming_discard()?;
+    fn pump(&mut self, mut rows: Option<&mut Vec<Row>>) -> Result<(), DriverError> {
+        loop {
+            if Self::is_streaming_state(self.proto.state()) {
+                match rows {
+                    Some(ref mut r) => self.collect_streaming(r)?,
+                    None => self.drain_streaming()?,
+                }
                 continue;
             }
 
-            let event = self.proto.advance_one_frame(&mut self.wb);
-            match event {
-                FeedEvent::Idle => return Ok(()),
-                FeedEvent::NeedMoreBytes => {
-                    let retry = self.proto.advance_one_frame(&mut self.wb);
-                    match retry {
-                        FeedEvent::Idle => return Ok(()),
-                        FeedEvent::NeedMoreBytes => { self.read_from_socket()?; }
-                        FeedEvent::SendBytes(bytes) => { self.stream.write_all(bytes)?; }
-                        FeedEvent::StreamingRows => {}
-                        FeedEvent::Fail(_) => {
-                            let err = self.proto.fail_cause().map(|&c| self.classify_error(c))
-                                .unwrap_or(DriverError::NotReady);
-                            self.drain_to_idle();
-                            return Err(err);
-                        }
-                        _ => {}
-                    }
+            match self.proto.connection_status() {
+                bsql_postgres_proto::ConnectionStatus::Ready => return Ok(()),
+                bsql_postgres_proto::ConnectionStatus::Errored(_) => {
+                    return Err(DriverError::NotReady);
                 }
-                FeedEvent::SendBytes(bytes) => { self.stream.write_all(bytes)?; }
-                FeedEvent::Fail(_) => {
-                    let err = self.proto.fail_cause().map(|&c| self.classify_error(c))
-                        .unwrap_or(DriverError::NotReady);
-                    self.drain_to_idle();
-                    return Err(err);
-                }
-                FeedEvent::Close => return Err(DriverError::NotReady),
                 _ => {}
+            }
+
+            let actions = self.proto.feed_bytes(&[], &mut self.wb);
+            let mut had_fail = false;
+            let mut had_close = false;
+            for action in actions.as_slice() {
+                match action {
+                    bsql_postgres_proto::Action::SendBytes(bytes) => {
+                        self.stream.write_all(bytes)?;
+                    }
+                    bsql_postgres_proto::Action::FailReply { .. } => { had_fail = true; }
+                    bsql_postgres_proto::Action::CloseSocket => { had_close = true; }
+                    _ => {}
+                }
+            }
+            let was_empty = actions.as_slice().is_empty();
+            drop(actions);
+
+            if had_close { return Err(DriverError::NotReady); }
+            if had_fail {
+                let err = self.proto.fail_cause()
+                    .map(|&c| self.classify_error(c))
+                    .unwrap_or(DriverError::NotReady);
+                self.drain_to_idle();
+                return Err(err);
+            }
+
+            if was_empty && !matches!(self.proto.connection_status(),
+                bsql_postgres_proto::ConnectionStatus::Ready)
+            {
+                self.read_from_socket()?;
             }
         }
     }
 
-    fn drain_streaming_discard(&mut self) -> Result<(), DriverError> {
+    fn drain_streaming(&mut self) -> Result<(), DriverError> {
         self.proto.iter_rows(&mut self.wb, |stream| {
             loop {
                 match stream.col_next() {
@@ -361,53 +364,6 @@ impl Connection {
         Ok(())
     }
 
-    fn pump_with_rows(&mut self, rows: &mut Vec<Row>) -> Result<(), DriverError> {
-        let mut consecutive_need = 0u32;
-        loop {
-            if matches!(self.proto.connection_status(),
-                bsql_postgres_proto::ConnectionStatus::Ready) { return Ok(()); }
-
-            if matches!(self.proto.state(),
-                bsql_postgres_proto::ActiveState::SimpleQueryStreamingRows { .. }
-                | bsql_postgres_proto::ActiveState::BindExecuteStreamingRows { .. }
-                | bsql_postgres_proto::ActiveState::BindExecuteAwaitingDataOrCompleteSelect { .. })
-            {
-                self.collect_streaming(rows)?;
-                continue;
-            }
-
-            let event = self.proto.advance_one_frame(&mut self.wb);
-            match event {
-                FeedEvent::Idle => return Ok(()),
-                FeedEvent::NeedMoreBytes => {
-                    let retry = self.proto.advance_one_frame(&mut self.wb);
-                    match retry {
-                        FeedEvent::Idle => return Ok(()),
-                        FeedEvent::NeedMoreBytes => { self.read_from_socket()?; }
-                        FeedEvent::SendBytes(bytes) => { self.stream.write_all(bytes)?; }
-                        FeedEvent::StreamingRows => {}
-                        FeedEvent::Fail(_) => {
-                            let err = self.proto.fail_cause().map(|&c| self.classify_error(c))
-                                .unwrap_or(DriverError::NotReady);
-                            self.drain_to_idle();
-                            return Err(err);
-                        }
-                        _ => {}
-                    }
-                }
-                FeedEvent::SendBytes(bytes) => { self.stream.write_all(bytes)?; }
-                FeedEvent::Fail(_) => {
-                    let err = self.proto.fail_cause().map(|&c| self.classify_error(c))
-                        .unwrap_or(DriverError::NotReady);
-                    self.drain_to_idle();
-                    return Err(err);
-                }
-                FeedEvent::Close => return Err(DriverError::NotReady),
-                _ => {}
-            }
-        }
-    }
-
     fn push_and_send(&mut self, cmd: impl bsql_postgres_proto::push_command::PushCommand) -> Result<(), DriverError> {
         let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
         let actions = guard.push_command(cmd, &mut self.wb)
@@ -424,13 +380,13 @@ impl Connection {
     pub fn ping(&mut self) -> Result<(), DriverError> {
         let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::PingKind>();
         self.push_and_send(bsql_postgres_proto::push_command::Ping::new(reply))?;
-        self.pump_until_idle()
+        self.pump(None)
     }
 
     pub fn simple_query(&mut self, sql: &str) -> Result<String, DriverError> {
         let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::QueryKind>();
         self.push_and_send(bsql_postgres_proto::push_command::SimpleQuery { sql, reply })?;
-        self.pump_until_idle()?;
+        self.pump(None)?;
         let mut tag = String::new();
         if let Some(t) = self.proto.current_command_tag() {
             use core::fmt::Write;
@@ -448,7 +404,7 @@ impl Connection {
         let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::QueryKind>();
         self.push_and_send(bsql_postgres_proto::push_command::SimpleQuery { sql, reply })?;
         let mut rows = Vec::new();
-        self.pump_with_rows(&mut rows)?;
+        self.pump(Some(&mut rows))?;
         let column_names = self.proto.current_column_names().map(|s| s.to_vec()).unwrap_or_default();
         let column_count = rows.first().map_or(0, |r| r.len());
         let mut command_tag = String::new();
@@ -478,11 +434,11 @@ impl Connection {
 
         let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::ParseKind>();
         self.push_and_send(bsql_postgres_proto::push_command::Parse { stmt_name, sql, reply })?;
-        self.pump_until_idle()?;
+        self.pump(None)?;
 
         let desc_reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::DescribeStatementKind>();
         self.push_and_send(bsql_postgres_proto::push_command::DescribeStatement { stmt_name, reply: desc_reply })?;
-        self.pump_until_idle()?;
+        self.pump(None)?;
 
         let row_desc = match self.proto.current_described_rows() {
             bsql_postgres_proto::DescribedRows::Rows(b) => Some(b.to_owned()),
@@ -511,7 +467,7 @@ impl Connection {
             self.wb.clear();
         }
         let mut rows = Vec::new();
-        self.pump_with_rows(&mut rows)?;
+        self.pump(Some(&mut rows))?;
         let column_names = stmt.column_names.clone();
         let column_count = rows.first().map_or(0, |r| r.len());
         let mut command_tag = String::new();
@@ -540,7 +496,7 @@ impl Connection {
             }
             self.wb.clear();
         }
-        self.pump_until_idle()?;
+        self.pump(None)?;
         let mut tag = String::new();
         if let Some(t) = self.proto.current_command_tag() {
             use core::fmt::Write;
@@ -568,7 +524,7 @@ impl Connection {
     pub fn close_statement(&mut self, stmt: &PreparedStatement) -> Result<(), DriverError> {
         let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::CloseKind>();
         self.push_and_send(bsql_postgres_proto::push_command::CloseStatement { stmt_name: stmt.stmt_name, reply })?;
-        self.pump_until_idle()
+        self.pump(None)
     }
 
     pub fn begin(&mut self) -> Result<(), DriverError> { self.simple_query("BEGIN")?; Ok(()) }
