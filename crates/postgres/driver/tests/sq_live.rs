@@ -909,7 +909,7 @@ async fn pool_basic() {
     drop(c1);
     tokio::task::yield_now().await;
 
-    assert_eq!(pool.idle_count().await, 1);
+    assert_eq!(pool.idle_count(), 1);
 
     // Get c3 — should reuse c1's connection
     let mut c3 = pool.get().await.expect("c3");

@@ -2,7 +2,7 @@
 name = "bsql"
 version = "0.1.0-alpha.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 description = "Multi-backend SQL toolkit — PostgreSQL and SQLite"
 license = "MIT OR Apache-2.0"
 

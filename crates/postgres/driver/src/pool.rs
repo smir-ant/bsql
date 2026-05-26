@@ -1,19 +1,12 @@
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
 
 use crate::config::ConnectConfig;
 use crate::connection::Connection;
 use crate::error::DriverError;
 
-/// Connection pool for PostgreSQL.
-///
-/// Manages a set of reusable connections. `pool.get()` returns a
-/// `PooledConnection` that auto-returns to the pool on Drop.
-///
-/// Unhealthy connections (Errored state) are discarded on return
-/// rather than recycled — the next `get()` creates a fresh one.
 #[derive(Clone)]
 pub struct Pool {
     inner: Arc<PoolInner>,
@@ -28,26 +21,24 @@ struct PoolInner {
 
 impl Pool {
     pub async fn new(config: ConnectConfig, max_size: usize) -> Result<Self, DriverError> {
-        let pool = Self {
+        Ok(Self {
             inner: Arc::new(PoolInner {
                 config,
                 connections: Mutex::new(VecDeque::with_capacity(max_size)),
                 semaphore: Semaphore::new(max_size),
                 max_size,
             }),
-        };
-        Ok(pool)
+        })
     }
 
     pub async fn get(&self) -> Result<PooledConnection, DriverError> {
         let permit = self.inner.semaphore.acquire().await
-            .map_err(|_| DriverError::Io(std::io::Error::other(
-                "pool closed",
-            )))?;
+            .map_err(|_| DriverError::Io(std::io::Error::other("pool closed")))?;
         permit.forget();
 
         {
-            let mut conns = self.inner.connections.lock().await;
+            let mut conns = self.inner.connections.lock()
+                .unwrap_or_else(|e| e.into_inner());
             while let Some(conn) = conns.pop_front() {
                 if conn.is_healthy() {
                     return Ok(PooledConnection {
@@ -71,8 +62,10 @@ impl Pool {
         })
     }
 
-    pub async fn idle_count(&self) -> usize {
-        self.inner.connections.lock().await.len()
+    pub fn idle_count(&self) -> usize {
+        self.inner.connections.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     pub fn max_size(&self) -> usize {
@@ -80,11 +73,6 @@ impl Pool {
     }
 }
 
-/// A connection checked out from a [`Pool`].
-///
-/// Implements `Deref<Target = Connection>` so all Connection
-/// methods are available directly. Returns to the pool on Drop
-/// if the connection is healthy; discards it otherwise.
 pub struct PooledConnection {
     conn: Option<Connection>,
     pool: Arc<PoolInner>,
@@ -93,26 +81,34 @@ pub struct PooledConnection {
 impl Deref for PooledConnection {
     type Target = Connection;
     fn deref(&self) -> &Connection {
-        self.conn.as_ref().expect("connection taken")
+        // Invariant: conn is Some until Drop. After Drop, Rust prevents
+        // calling deref (the value is consumed). The None branch is
+        // structurally unreachable — tier-2 by Rust ownership rules.
+        match self.conn.as_ref() {
+            Some(c) => c,
+            None => unreachable!("PooledConnection used after drop"),
+        }
     }
 }
 
 impl DerefMut for PooledConnection {
     fn deref_mut(&mut self) -> &mut Connection {
-        self.conn.as_mut().expect("connection taken")
+        match self.conn.as_mut() {
+            Some(c) => c,
+            None => unreachable!("PooledConnection used after drop"),
+        }
     }
 }
 
 impl Drop for PooledConnection {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            let pool = self.pool.clone();
-            tokio::spawn(async move {
-                if conn.is_healthy() {
-                    pool.connections.lock().await.push_back(conn);
+            if conn.is_healthy() {
+                if let Ok(mut conns) = self.pool.connections.lock() {
+                    conns.push_back(conn);
                 }
-                pool.semaphore.add_permits(1);
-            });
+            }
+            self.pool.semaphore.add_permits(1);
         }
     }
 }
