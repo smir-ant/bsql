@@ -1128,7 +1128,7 @@ impl Connection {
                     bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
                     bsql_postgres_proto::ColEvent::NeedMore => {
                         if pos < prebuf_slice.len() {
-                            let end = prebuf_slice.len();
+                            let end = (pos + 2048).min(prebuf_slice.len());
                             if rs.feed(&prebuf_slice[pos..end]).is_ok() {
                                 pos = end;
                                 continue;
