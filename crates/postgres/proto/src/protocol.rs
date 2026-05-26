@@ -6673,6 +6673,14 @@ impl PgProtocol<ActivePhase> {
         self.inner.read_buf.unread_len()
     }
 
+    /// Maximum bytes that can be fed via `RowStream::feed` without
+    /// overflow. Equal to `READ_BUF_CAP - unread_bytes` (post-compaction).
+    #[inline]
+    #[must_use]
+    pub fn feed_capacity(&self) -> usize {
+        crate::frame::READ_BUF_CAP.saturating_sub(self.inner.read_buf.unread_len())
+    }
+
 
     /// Partial-mode entry point routed through the leaf-gated
     /// [`crate::buf::ReadBuf::enter_partial_mode`] accepting a
