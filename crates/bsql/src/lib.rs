@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-async")]
 pub mod pg {
-    pub use bsql_postgres::*;
+    pub use bsql_postgres_async::*;
 }
 
 #[cfg(feature = "postgres-sync")]

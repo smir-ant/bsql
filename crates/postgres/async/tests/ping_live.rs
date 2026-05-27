@@ -3,7 +3,7 @@
 //! Run: `cargo test -p bsql-driver-postgres --test ping_live`
 //! Skip if no PG: tests are `#[ignore]` by default.
 
-use bsql_postgres::{ConnectConfig, Connection};
+use bsql_postgres_async::{ConnectConfig, Connection};
 
 #[tokio::test]
 #[ignore = "requires local PG with Trust auth"]

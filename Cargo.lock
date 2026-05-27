@@ -54,13 +54,13 @@ dependencies = [
 name = "bsql"
 version = "0.1.0-alpha.0"
 dependencies = [
- "bsql-postgres",
+ "bsql-postgres-async",
  "bsql-postgres-sync",
  "bsql-sqlite",
 ]
 
 [[package]]
-name = "bsql-postgres"
+name = "bsql-postgres-async"
 version = "0.1.0-alpha.0"
 dependencies = [
  "bsql-postgres-core",

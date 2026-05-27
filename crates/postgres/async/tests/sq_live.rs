@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-use bsql_postgres::{ConnectConfig, Connection};
+use bsql_postgres_async::{ConnectConfig, Connection};
 
 #[tokio::test]
 #[ignore = "requires local PG"]
@@ -160,7 +160,7 @@ async fn db_error_sqlstate() {
 
     // Syntax error → SQLSTATE 42601
     let err = conn.simple_query("SELCT TYPO").await.unwrap_err();
-    if let bsql_postgres::DriverError::Db(ref db_err) = err {
+    if let bsql_postgres_async::DriverError::Db(ref db_err) = err {
         eprintln!("code={} severity={} msg={}", db_err.code, db_err.severity, db_err.message);
         assert_eq!(&db_err.code, "42601", "expected syntax_error SQLSTATE");
         assert_eq!(&db_err.severity, "ERROR");
@@ -173,7 +173,7 @@ async fn db_error_sqlstate() {
     conn.execute("CREATE TEMP TABLE uk_test(id int PRIMARY KEY)").await.expect("create");
     conn.execute("INSERT INTO uk_test VALUES (1)").await.expect("insert");
     let err = conn.execute("INSERT INTO uk_test VALUES (1)").await.unwrap_err();
-    if let bsql_postgres::DriverError::Db(ref db_err) = err {
+    if let bsql_postgres_async::DriverError::Db(ref db_err) = err {
         eprintln!("code={} severity={} msg={}", db_err.code, db_err.severity, db_err.message);
         assert!(db_err.is_unique_violation(), "expected 23505, got {}", db_err.code);
     } else {
@@ -447,7 +447,7 @@ async fn connect_timeout() {
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn ssl_prefer_falls_back_to_plain() {
-    use bsql_postgres::SslMode;
+    use bsql_postgres_async::SslMode;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
         .ssl_mode(SslMode::Prefer);
@@ -459,7 +459,7 @@ async fn ssl_prefer_falls_back_to_plain() {
 #[tokio::test]
 #[ignore = "requires local PG without SSL"]
 async fn ssl_require_fails_on_non_ssl_server() {
-    use bsql_postgres::SslMode;
+    use bsql_postgres_async::SslMode;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
         .ssl_mode(SslMode::Require);
@@ -470,7 +470,7 @@ async fn ssl_require_fails_on_non_ssl_server() {
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn ssl_disable_works() {
-    use bsql_postgres::SslMode;
+    use bsql_postgres_async::SslMode;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
         .ssl_mode(SslMode::Disable);
@@ -499,7 +499,7 @@ fn dsn_parsing_unit_tests() {
     assert_eq!(c.host, "db.example.com");
     assert_eq!(c.port, 5433);
     assert_eq!(c.database.as_deref(), Some("mydb"));
-    assert_eq!(c.ssl_mode, bsql_postgres::SslMode::Require);
+    assert_eq!(c.ssl_mode, bsql_postgres_async::SslMode::Require);
 
     let c2 = ConnectConfig::from_dsn("postgres://bob@localhost").unwrap();
     assert_eq!(c2.user, "bob");
@@ -827,7 +827,7 @@ async fn null_heavy_result() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires local PG"]
 async fn pool_concurrent_contention() {
-    use bsql_postgres::Pool;
+    use bsql_postgres_async::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string());
     let pool = Pool::new(config, 3).await.expect("pool");
@@ -887,7 +887,7 @@ async fn wide_row_many_columns() {
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn pool_basic() {
-    use bsql_postgres::Pool;
+    use bsql_postgres_async::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string());
     let pool = Pool::new(config, 3).await.expect("pool");
@@ -922,7 +922,7 @@ async fn pool_basic() {
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn pool_concurrent_queries() {
-    use bsql_postgres::Pool;
+    use bsql_postgres_async::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string());
     let pool = Pool::new(config, 5).await.expect("pool");
