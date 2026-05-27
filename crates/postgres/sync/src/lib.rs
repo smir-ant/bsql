@@ -13,15 +13,15 @@ pub use connection::Connection;
 pub use pool::{Pool, PooledConnection};
 
 const _: () = {
-    fn assert_send<T: Send>() {}
-    fn assert_sync<T: Sync>() {}
-    fn assert_static<T: 'static>() {}
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+    fn _assert_static<T: 'static>() {}
     fn _assertions() {
-        assert_send::<Connection>();
-        assert_send::<Row>();
-        assert_sync::<Row>();
-        assert_static::<Row>();
-        assert_send::<Pool>();
-        assert_sync::<Pool>();
+        _assert_send::<Connection>();
+        _assert_send::<Row>();
+        _assert_sync::<Row>();
+        _assert_static::<Row>();
+        _assert_send::<Pool>();
+        _assert_sync::<Pool>();
     }
 };

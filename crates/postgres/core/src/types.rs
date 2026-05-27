@@ -62,10 +62,10 @@ impl Row {
         let inner = &*self.arena;
         let n = usize::from(inner.n_cols);
         if col >= n { return None; }
-        let base = (self.row_idx as usize).checked_mul(n)?;
+        let base = usize::try_from(self.row_idx).ok()?.checked_mul(n)?;
         let slot = inner.slots.get(base.checked_add(col)?)?;
-        let len = slot.byte_len()? as usize;
-        let start = slot.offset as usize;
+        let len = usize::try_from(slot.byte_len()?).ok()?;
+        let start = usize::try_from(slot.offset).ok()?;
         inner.data.get(start..start.checked_add(len)?)
     }
 
@@ -85,7 +85,8 @@ impl Row {
         let inner = &*self.arena;
         let n = usize::from(inner.n_cols);
         if col >= n { return true; }
-        let base = (self.row_idx as usize) * n;
+        let Ok(row_idx) = usize::try_from(self.row_idx) else { return true; };
+        let base = row_idx * n;
         inner.slots.get(base + col)
             .is_none_or(|s| s.len_plus_one.is_none())
     }
@@ -116,17 +117,18 @@ pub struct ArenaBuilder {
 
 impl ArenaBuilder {
     pub fn new(n_cols: usize) -> Self {
+        let n = u16::try_from(n_cols).unwrap_or(u16::MAX);
         Self {
             data: Vec::new(),
             slots: Vec::new(),
-            n_cols: n_cols as u16,
+            n_cols: n,
             rows_finished: 0,
         }
     }
 
     pub fn push_value(&mut self, bytes: &[u8]) {
-        let offset = self.data.len() as u32;
-        let len = bytes.len() as u32;
+        let offset = u32::try_from(self.data.len()).unwrap_or(u32::MAX);
+        let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
         self.data.extend_from_slice(bytes);
         self.slots.push(ColSlot::value(offset, len));
     }
@@ -141,7 +143,8 @@ impl ArenaBuilder {
         if let Some(slot) = self.slots.last_mut()
             && let Some(old_len) = slot.byte_len()
         {
-            *slot = ColSlot::value(slot.offset, old_len + bytes.len() as u32);
+            let extra = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+            *slot = ColSlot::value(slot.offset, old_len.saturating_add(extra));
         }
     }
 
