@@ -233,3 +233,53 @@ fn unicode_values() {
     let result = conn.query("SELECT v FROM t").expect("query");
     assert_eq!(result.rows[0].get_str(0), Some("Привет мир"));
 }
+
+#[test]
+fn transaction_raii_commit() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute("CREATE TABLE t(v int)").expect("create");
+    {
+        let tx = conn.transaction().expect("begin");
+        tx.execute("INSERT INTO t VALUES (1)").expect("insert");
+        tx.commit().expect("commit");
+    }
+    let r = conn.query("SELECT count(*) FROM t").expect("count");
+    assert_eq!(r.rows[0].get_i64(0), Some(1));
+}
+
+#[test]
+fn transaction_raii_rollback_on_drop() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute("CREATE TABLE t(v int)").expect("create");
+    conn.execute("INSERT INTO t VALUES (1)").expect("seed");
+    {
+        let tx = conn.transaction().expect("begin");
+        tx.execute("INSERT INTO t VALUES (2)").expect("insert");
+        // tx drops without commit — auto-rollback
+    }
+    let r = conn.query("SELECT count(*) FROM t").expect("count");
+    assert_eq!(r.rows[0].get_i64(0), Some(1), "should have rolled back");
+}
+
+#[test]
+fn transaction_raii_explicit_rollback() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute("CREATE TABLE t(v int)").expect("create");
+    {
+        let tx = conn.transaction().expect("begin");
+        tx.execute("INSERT INTO t VALUES (1)").expect("insert");
+        tx.rollback().expect("rollback");
+    }
+    let r = conn.query("SELECT count(*) FROM t").expect("count");
+    assert_eq!(r.rows[0].get_i64(0), Some(0));
+}
+
+#[test]
+fn typed_get_from_text() {
+    let conn = Connection::open_in_memory().expect("open");
+    let r = conn.query("SELECT 42, 3.14, 'hello'").expect("query");
+    let row = &r.rows[0];
+    assert_eq!(row.get::<i32>(0), Some(42));
+    assert_eq!(row.get::<f64>(1), Some(3.14));
+    assert_eq!(row.get::<String>(2), Some("hello".to_string()));
+}
