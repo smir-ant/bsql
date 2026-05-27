@@ -4,6 +4,21 @@ use rusqlite::types::Value;
 
 use crate::error::SqliteError;
 
+/// Trait for converting text-format values to Rust types.
+pub trait FromText: Sized {
+    fn from_text(s: &str) -> Option<Self>;
+}
+
+impl FromText for i32 { fn from_text(s: &str) -> Option<Self> { s.parse().ok() } }
+impl FromText for i64 { fn from_text(s: &str) -> Option<Self> { s.parse().ok() } }
+impl FromText for f64 { fn from_text(s: &str) -> Option<Self> { s.parse().ok() } }
+impl FromText for bool {
+    fn from_text(s: &str) -> Option<Self> {
+        match s { "1" | "true" | "TRUE" => Some(true), "0" | "false" | "FALSE" => Some(false), _ => None }
+    }
+}
+impl FromText for String { fn from_text(s: &str) -> Option<Self> { Some(s.to_string()) } }
+
 #[derive(Debug)]
 #[must_use]
 pub struct QueryResult {
@@ -57,6 +72,10 @@ impl Row {
 
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
+    }
+
+    pub fn get<T: FromText>(&self, idx: usize) -> Option<T> {
+        T::from_text(self.get_str(idx)?)
     }
 
     pub fn get_by_name<'a>(&'a self, name: &str, column_names: &[String]) -> Option<&'a [u8]> {

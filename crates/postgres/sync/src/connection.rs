@@ -341,6 +341,12 @@ impl Connection {
         self.query_params(sql, params)?.rows.into_iter().next().ok_or(DriverError::NoRows)
     }
 
+    pub fn query_params_opt<P: bsql_postgres_proto::params::ParamsWriter>(
+        &mut self, sql: &str, params: &P,
+    ) -> Result<Option<Row>, DriverError> {
+        Ok(self.query_params(sql, params)?.rows.into_iter().next())
+    }
+
     pub fn close_statement(&mut self, stmt: PreparedStatement) -> Result<(), DriverError> {
         self.session.push_close_statement(stmt)?;
         self.stream.write_all(self.session.pending_bytes())?;
