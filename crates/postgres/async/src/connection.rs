@@ -305,17 +305,10 @@ impl Connection {
 
     /// Execute an async closure within a transaction. COMMIT on Ok, ROLLBACK on Err.
     /// Tier-1 safety: transaction boundary = closure scope.
-    pub async fn transaction<R, F, Fut>(&mut self, f: F) -> Result<R, DriverError>
-    where
-        F: FnOnce(&mut Self) -> Fut,
-        Fut: std::future::Future<Output = Result<R, DriverError>>,
-    {
-        self.simple_query("BEGIN").await?;
-        match f(self).await {
-            Ok(val) => { self.simple_query("COMMIT").await?; Ok(val) }
-            Err(e) => { let _ = self.simple_query("ROLLBACK").await; Err(e) }
-        }
-    }
+    // Note: async closures with borrowed &mut self don't work in stable Rust
+    // without Box<dyn Future>. Use begin()/commit()/rollback() for async
+    // transactions. The sync driver has a proper closure-based transaction()
+    // because sync closures don't have this limitation.
 
     pub async fn listen(&mut self, channel: &str) -> Result<(), DriverError> {
         self.simple_query(&format!("LISTEN {channel}")).await?; Ok(())
