@@ -10,20 +10,58 @@ pub struct QueryResult {
     pub column_names: Arc<[String]>,
 }
 
-/// A single result row. Column values are raw bytes decoded on access.
+/// Column range within a Row's data buffer. NULL = offset u32::MAX.
+#[derive(Debug, Clone, Copy)]
+struct ColRange {
+    offset: u32,
+    len: u32,
+}
+
+impl ColRange {
+    const NULL: Self = Self { offset: u32::MAX, len: 0 };
+
+    fn is_null(self) -> bool { self.offset == u32::MAX }
+}
+
+/// A single result row. Column values stored contiguously in one buffer.
+/// 2 allocations per row (data + offsets) instead of N+1.
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct Row {
-    columns: Vec<Option<Vec<u8>>>,
+    data: Vec<u8>,
+    cols: Vec<ColRange>,
 }
 
 impl Row {
+    /// Build a Row from the old Vec<Option<Vec<u8>>> format (migration helper).
     pub fn from_columns(columns: Vec<Option<Vec<u8>>>) -> Self {
-        Self { columns }
+        let mut data = Vec::new();
+        let mut cols = Vec::with_capacity(columns.len());
+        for col in &columns {
+            match col {
+                Some(bytes) => {
+                    let offset = data.len() as u32;
+                    let len = bytes.len() as u32;
+                    data.extend_from_slice(bytes);
+                    cols.push(ColRange { offset, len });
+                }
+                None => cols.push(ColRange::NULL),
+            }
+        }
+        Self { data, cols }
+    }
+
+    /// Build a Row incrementally during streaming.
+    pub fn builder(n_cols: usize) -> RowBuilder {
+        RowBuilder {
+            data: Vec::new(),
+            cols: Vec::with_capacity(n_cols),
+        }
     }
 
     pub fn get_str(&self, idx: usize) -> Option<&str> {
-        self.columns.get(idx)?.as_deref().and_then(|b| core::str::from_utf8(b).ok())
+        let raw = self.get_raw(idx)?;
+        core::str::from_utf8(raw).ok()
     }
 
     pub fn get_i32(&self, idx: usize) -> Option<i32> { self.get_str(idx)?.parse().ok() }
@@ -35,15 +73,17 @@ impl Row {
     }
 
     pub fn get_raw(&self, idx: usize) -> Option<&[u8]> {
-        self.columns.get(idx)?.as_deref()
+        let cr = self.cols.get(idx)?;
+        if cr.is_null() { return None; }
+        self.data.get(cr.offset as usize..(cr.offset + cr.len) as usize)
     }
 
     pub fn is_null(&self, idx: usize) -> bool {
-        matches!(self.columns.get(idx), Some(None))
+        self.cols.get(idx).map_or(true, |cr| cr.is_null())
     }
 
-    pub fn len(&self) -> usize { self.columns.len() }
-    pub fn is_empty(&self) -> bool { self.columns.is_empty() }
+    pub fn len(&self) -> usize { self.cols.len() }
+    pub fn is_empty(&self) -> bool { self.cols.is_empty() }
 
     pub fn get_by_name<'a>(&'a self, name: &str, column_names: &[String]) -> Option<&'a [u8]> {
         let idx = column_names.iter().position(|n| n == name)?;
@@ -52,6 +92,41 @@ impl Row {
 
     pub fn get<T: FromText>(&self, idx: usize) -> Option<T> {
         T::from_text(self.get_str(idx)?)
+    }
+}
+
+/// Incremental row builder for streaming construction.
+pub struct RowBuilder {
+    data: Vec<u8>,
+    cols: Vec<ColRange>,
+}
+
+impl RowBuilder {
+    pub fn push_value(&mut self, bytes: &[u8]) {
+        let offset = self.data.len() as u32;
+        let len = bytes.len() as u32;
+        self.data.extend_from_slice(bytes);
+        self.cols.push(ColRange { offset, len });
+    }
+
+    pub fn push_null(&mut self) {
+        self.cols.push(ColRange::NULL);
+    }
+
+    pub fn extend_last(&mut self, bytes: &[u8]) {
+        self.data.extend_from_slice(bytes);
+        if let Some(last) = self.cols.last_mut() {
+            last.len += bytes.len() as u32;
+        }
+    }
+
+    pub fn finish(self) -> Row {
+        Row { data: self.data, cols: self.cols }
+    }
+
+    pub fn reset(&mut self) {
+        self.data.clear();
+        self.cols.clear();
     }
 }
 

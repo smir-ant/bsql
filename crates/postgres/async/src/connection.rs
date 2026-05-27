@@ -156,17 +156,18 @@ impl Connection {
         let prebuf_slice = prebuf.as_slice();
         self.session.iter_rows(|rs| {
             let n_cols = rs.current_row_desc().map_or(0, |d| d.len());
-            let mut current_row: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_cols);
+            let mut rb = Row::builder(n_cols);
             loop {
                 match rs.col_next() {
                     bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
-                        current_row.push(Some(bytes.to_vec()));
+                        rb.push_value(bytes);
                     }
                     bsql_postgres_proto::ColEvent::Null { .. } => {
-                        current_row.push(None);
+                        rb.push_null();
                     }
                     bsql_postgres_proto::ColEvent::EndRow => {
-                        rows.push(Row::from_columns(core::mem::take(&mut current_row)));
+                        rows.push(rb.finish());
+                        rb = Row::builder(n_cols);
                     }
                     bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
                     bsql_postgres_proto::ColEvent::NeedMore
@@ -179,11 +180,7 @@ impl Connection {
                         }
                     bsql_postgres_proto::ColEvent::Chunk { bytes, .. }
                     | bsql_postgres_proto::ColEvent::ChunkEnd { bytes, .. } => {
-                        if let Some(Some(v)) = current_row.last_mut() {
-                            v.extend_from_slice(bytes);
-                        } else {
-                            current_row.push(Some(bytes.to_vec()));
-                        }
+                        rb.extend_last(bytes);
                     }
                     _ => {}
                 }
