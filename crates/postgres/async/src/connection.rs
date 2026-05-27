@@ -2,7 +2,7 @@ use bsql_postgres_core::{
     ConnectConfig, DriverError, Notification, PreparedStatement,
     PumpAction, QueryResult, Row, Session, SslMode,
 };
-use bsql_postgres_proto::{ActivePhase, FeedEvent, PgProtocol, WriteBuf};
+use bsql_postgres_proto::{FeedEvent, PgProtocol, WriteBuf};
 use tokio::net::TcpStream;
 
 enum Stream {
@@ -181,9 +181,8 @@ impl Connection {
                     // Try to drain trailing RFQ so connection recovers.
                     for _ in 0..5 {
                         if self.session.is_healthy() { break; }
-                        if let Ok(n) = self.stream.read(&mut self.read_buf).await {
-                            if n > 0 { let _ = self.session.feed(&self.read_buf[..n]); }
-                        }
+                        if let Ok(n) = self.stream.read(&mut self.read_buf).await
+                            && n > 0 { let _ = self.session.feed(&self.read_buf[..n]); }
                         self.session.drain_to_idle();
                     }
                     return Err(e);
@@ -235,15 +234,14 @@ impl Connection {
                         rows.push(Row::from_columns(core::mem::take(&mut current_row)));
                     }
                     bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
-                    bsql_postgres_proto::ColEvent::NeedMore => {
-                        if pos < prebuf_slice.len() {
+                    bsql_postgres_proto::ColEvent::NeedMore
+                        if pos < prebuf_slice.len() => {
                             let end = (pos + feed_cap).min(prebuf_slice.len());
                             if rs.feed(&prebuf_slice[pos..end]).is_ok() {
                                 pos = end;
                                 continue;
                             }
                         }
-                    }
                     bsql_postgres_proto::ColEvent::Chunk { bytes, .. }
                     | bsql_postgres_proto::ColEvent::ChunkEnd { bytes, .. } => {
                         if let Some(Some(v)) = current_row.last_mut() {
@@ -405,15 +403,14 @@ impl Connection {
                 Ok(Ok(n)) => {
                     self.session.feed(&self.read_buf[..n])?;
                     let event = self.session.proto.advance_one_frame(&mut self.session.wb);
-                    if let FeedEvent::Notify { notif_ref, pid } = event {
-                        if let Ok(payload) = self.session.proto.get_notification(notif_ref) {
+                    if let FeedEvent::Notify { notif_ref, pid } = event
+                        && let Ok(payload) = self.session.proto.get_notification(notif_ref) {
                             return Ok(Some(Notification {
                                 channel: payload.channel.as_str().to_string(),
                                 payload: String::from_utf8_lossy(&payload.payload).into_owned(),
                                 pid,
                             }));
                         }
-                    }
                 }
                 Ok(Err(e)) => return Err(DriverError::Io(e)),
                 Err(_) => return Ok(None),

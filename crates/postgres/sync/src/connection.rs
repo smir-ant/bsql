@@ -5,7 +5,7 @@ use bsql_postgres_core::{
     ConnectConfig, DriverError, PreparedStatement,
     PumpAction, QueryResult, Row, Session, SslMode,
 };
-use bsql_postgres_proto::{ActivePhase, FeedEvent, PgProtocol, WriteBuf};
+use bsql_postgres_proto::{FeedEvent, PgProtocol, WriteBuf};
 
 enum Stream {
     Plain(TcpStream),
@@ -188,9 +188,8 @@ impl Connection {
                 PumpAction::Error(e) => {
                     for _ in 0..5 {
                         if self.session.is_healthy() { break; }
-                        if let Ok(n) = self.stream.read(&mut self.read_buf) {
-                            if n > 0 { let _ = self.session.feed(&self.read_buf[..n]); }
-                        }
+                        if let Ok(n) = self.stream.read(&mut self.read_buf)
+                            && n > 0 { let _ = self.session.feed(&self.read_buf[..n]); }
                         self.session.drain_to_idle();
                     }
                     return Err(e);
@@ -400,8 +399,8 @@ impl Connection {
                 Ok(n) => {
                     self.session.feed(&self.read_buf[..n])?;
                     let event = self.session.proto.advance_one_frame(&mut self.session.wb);
-                    if let FeedEvent::Notify { notif_ref, pid } = event {
-                        if let Ok(payload) = self.session.proto.get_notification(notif_ref) {
+                    if let FeedEvent::Notify { notif_ref, pid } = event
+                        && let Ok(payload) = self.session.proto.get_notification(notif_ref) {
                             self.stream.set_read_timeout(Some(std::time::Duration::from_secs(
                                 10)))?;
                             return Ok(Some(bsql_postgres_core::Notification {
@@ -410,7 +409,6 @@ impl Connection {
                                 pid,
                             }));
                         }
-                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut => {

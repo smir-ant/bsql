@@ -13,12 +13,10 @@ pub struct DbError {
 impl fmt::Display for DbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {} ({})", self.severity, self.message, self.code)?;
-        if let Some(ref d) = self.detail {
-            if !d.is_empty() { write!(f, "\nDETAIL: {d}")?; }
-        }
-        if let Some(ref h) = self.hint {
-            if !h.is_empty() { write!(f, "\nHINT: {h}")?; }
-        }
+        if let Some(ref d) = self.detail
+            && !d.is_empty() { write!(f, "\nDETAIL: {d}")?; }
+        if let Some(ref h) = self.hint
+            && !h.is_empty() { write!(f, "\nHINT: {h}")?; }
         Ok(())
     }
 }

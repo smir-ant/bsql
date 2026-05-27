@@ -118,11 +118,10 @@ impl Drop for PooledConnection {
                 .unwrap_or_else(|e| e.into_inner());
             *out = out.saturating_sub(1);
 
-            if conn.is_healthy() {
-                if let Ok(mut conns) = self.pool.connections.lock() {
+            if conn.is_healthy()
+                && let Ok(mut conns) = self.pool.connections.lock() {
                     conns.push_back(conn);
                 }
-            }
             self.pool.available.notify_one();
         }
     }

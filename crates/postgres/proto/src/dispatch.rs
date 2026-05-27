@@ -3194,12 +3194,11 @@ pub(crate) fn parse_and_alloc_notice(
         }
 
         match field_type {
-            b'S' | b'V' => {
-                if severity.is_empty() {
+            b'S' | b'V'
+                if severity.is_empty() => {
                     severity = crate::ident::LossyText::from_bytes_lossy(value_bytes)
                         .to_bounded::<32>();
                 }
-            }
             b'C' => {
                 code = SqlStateCode::from_bytes(value_bytes);
             }

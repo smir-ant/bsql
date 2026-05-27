@@ -102,11 +102,10 @@ impl DerefMut for PooledConnection {
 impl Drop for PooledConnection {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            if conn.is_healthy() {
-                if let Ok(mut conns) = self.pool.connections.lock() {
+            if conn.is_healthy()
+                && let Ok(mut conns) = self.pool.connections.lock() {
                     conns.push_back(conn);
                 }
-            }
             self.pool.semaphore.add_permits(1);
         }
     }

@@ -1,19 +1,16 @@
 /// SSL negotiation mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SslMode {
     /// No SSL. Plain TCP.
     Disable,
     /// Try SSL; fall back to plain TCP if server refuses.
+    #[default]
     Prefer,
     /// Require SSL. Fail if server refuses.
     Require,
 }
 
-impl Default for SslMode {
-    fn default() -> Self {
-        Self::Prefer
-    }
-}
 
 /// Connection configuration.
 ///
