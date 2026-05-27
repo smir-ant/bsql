@@ -22,6 +22,12 @@ impl Stream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self { Self::Plain(s) => s.read(buf), Self::Tls(s) => s.read(buf) }
     }
+    fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.set_read_timeout(dur),
+            Self::Tls(s) => s.sock.set_read_timeout(dur),
+        }
+    }
     fn shutdown(&mut self) -> std::io::Result<()> {
         match self {
             Self::Plain(s) => s.shutdown(std::net::Shutdown::Both),
@@ -354,8 +360,97 @@ impl Connection {
     pub fn commit(&mut self) -> Result<(), DriverError> { self.simple_query("COMMIT")?; Ok(()) }
     pub fn rollback(&mut self) -> Result<(), DriverError> { self.simple_query("ROLLBACK")?; Ok(()) }
 
+    pub fn listen(&mut self, channel: &str) -> Result<(), DriverError> {
+        self.simple_query(&format!("LISTEN {channel}"))?; Ok(())
+    }
+
+    pub fn unlisten(&mut self, channel: &str) -> Result<(), DriverError> {
+        self.simple_query(&format!("UNLISTEN {channel}"))?; Ok(())
+    }
+
+    pub fn recv_notification(
+        &mut self, timeout: std::time::Duration,
+    ) -> Result<Option<bsql_postgres_core::Notification>, DriverError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { return Ok(None); }
+            self.stream.set_read_timeout(Some(remaining))?;
+            match self.stream.read(&mut self.read_buf) {
+                Ok(0) => return Err(DriverError::Io(std::io::Error::other("server closed"))),
+                Ok(n) => {
+                    self.session.feed(&self.read_buf[..n])?;
+                    let event = self.session.proto.advance_one_frame(&mut self.session.wb);
+                    if let FeedEvent::Notify { notif_ref, pid } = event {
+                        if let Ok(payload) = self.session.proto.get_notification(notif_ref) {
+                            self.stream.set_read_timeout(Some(std::time::Duration::from_secs(
+                                10)))?;
+                            return Ok(Some(bsql_postgres_core::Notification {
+                                channel: payload.channel.as_str().to_string(),
+                                payload: String::from_utf8_lossy(&payload.payload).into_owned(),
+                                pid,
+                            }));
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {
+                    return Ok(None);
+                }
+                Err(e) => return Err(DriverError::Io(e)),
+            }
+        }
+    }
+
+    pub fn copy_in(
+        &mut self, table: &str,
+        rows_data: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<u64, DriverError> {
+        self.session.push_simple_query(&format!("COPY {table} FROM STDIN"))?;
+        self.stream.write_all(self.session.pending_bytes())?;
+
+        let n = self.stream.read(&mut self.read_buf)?;
+        if n == 0 { return Err(DriverError::Io(std::io::Error::other("server closed"))); }
+        self.session.feed(&self.read_buf[..n])?;
+        let actions = self.session.proto.feed_bytes(&[], &mut self.session.wb);
+        let had_fail = actions.as_slice().iter()
+            .any(|a| matches!(a, bsql_postgres_proto::Action::FailReply { .. }));
+        drop(actions);
+        if had_fail {
+            let err = self.session.proto.fail_cause()
+                .map(|&c| self.session.classify_error(c))
+                .unwrap_or(DriverError::NotReady);
+            self.session.drain_to_idle();
+            return Err(err);
+        }
+
+        for row in rows_data {
+            let line = row.as_ref();
+            let mut data = line.as_bytes().to_vec();
+            data.push(b'\n');
+            let bytes = self.session.proto.push_copy_data(&data, &mut self.session.wb)
+                .map_err(|e| DriverError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput, format!("{e}"),
+                )))?;
+            self.stream.write_all(bytes)?;
+            self.session.wb.clear();
+        }
+
+        let done_bytes = self.session.proto.push_copy_done(&mut self.session.wb)
+            .map_err(|e| DriverError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput, format!("{e}"),
+            )))?;
+        self.stream.write_all(done_bytes)?;
+        self.session.wb.clear();
+
+        self.pump(None)?;
+        let tag = self.session.extract_command_tag();
+        Ok(tag.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+
     pub fn is_healthy(&self) -> bool { self.session.is_healthy() }
     pub fn server_version(&self) -> Option<&str> { self.session.server_version() }
+    pub fn backend_pid(&self) -> i32 { self.session.backend_pid() }
 
     pub fn close(&mut self) -> Result<(), DriverError> {
         if self.terminated { return Ok(()); }

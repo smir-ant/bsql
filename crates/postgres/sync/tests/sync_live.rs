@@ -298,3 +298,56 @@ fn prepared_reuse_after_error_sync() {
     assert_eq!(r.rows[0].get_i64(0), Some(2));
     conn.close().expect("close");
 }
+
+#[test]
+#[ignore = "requires local PG"]
+fn copy_in_sync() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+    conn.execute("CREATE TEMP TABLE cp_sync(id int, name text)").expect("create");
+    let rows = vec!["1\talice", "2\tbob", "3\tcharlie"];
+    let n = conn.copy_in("cp_sync", rows).expect("copy_in");
+    assert_eq!(n, 3);
+    let result = conn.query("SELECT count(*) FROM cp_sync").expect("count");
+    assert_eq!(result.rows[0].get_i64(0), Some(3));
+    conn.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn listen_notify_sync() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut listener = Connection::connect(&config).expect("listener");
+    let mut notifier = Connection::connect(&config).expect("notifier");
+
+    listener.listen("bsql_sync_ch").expect("listen");
+    notifier.simple_query("NOTIFY bsql_sync_ch, 'sync hello'").expect("notify");
+
+    let notif = listener.recv_notification(std::time::Duration::from_secs(5))
+        .expect("recv");
+    let notif = notif.expect("should have notification");
+    assert_eq!(notif.channel, "bsql_sync_ch");
+    assert_eq!(notif.payload, "sync hello");
+
+    listener.unlisten("bsql_sync_ch").expect("unlisten");
+    let none = listener.recv_notification(std::time::Duration::from_millis(100))
+        .expect("recv timeout");
+    assert!(none.is_none());
+
+    listener.close().expect("close");
+    notifier.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn backend_pid_sync() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let conn = Connection::connect(&config).expect("connect");
+    assert!(conn.backend_pid() > 0);
+}
