@@ -5,7 +5,7 @@ use bsql_postgres_core::{
     ConnectConfig, DriverError, PreparedStatement,
     PumpAction, QueryResult, Row, Session, SslMode,
 };
-use bsql_postgres_proto::{FeedEvent, PgProtocol, WriteBuf};
+use bsql_postgres_proto::{FeedEvent, PgProtocol};
 
 enum Stream {
     Plain(TcpStream),
@@ -61,75 +61,25 @@ impl Connection {
             Self::negotiate_ssl(tcp, config)?
         };
 
-        let user = bsql_postgres_proto::Ident::try_from_str(&config.user)
-            .map_err(|_| DriverError::Config("invalid user name"))?;
-        let database = match &config.database {
-            Some(d) => Some(bsql_postgres_proto::DatabaseName::try_from_str(d)
-                .map_err(|_| DriverError::Config("invalid database name"))?),
-            None => None,
-        };
-
-        let mut proto = PgProtocol::new();
-        let mut wb = WriteBuf::new();
-        let reply = proto.next_reply_id::<bsql_postgres_proto::reply_id::StartupKind>();
-
-        let credentials = match config.password_str() {
-            Some(pw) => {
-                let password = bsql_postgres_proto::Password::try_from_str(pw)
-                    .map_err(|_| DriverError::Config("invalid password"))?;
-                bsql_postgres_proto::Credentials::ScramPassword(
-                    bsql_postgres_proto::sensitive::Sensitive::new(password),
-                )
-            }
-            None => bsql_postgres_proto::password::Credentials::Trust,
-        };
-
-        let (actions, mut connecting) = proto.push_startup(
-            user, database, None, credentials, reply, &mut wb,
-        ).map_err(|pf| DriverError::Protocol(*pf.cause))?;
-
-        let startup_bytes: Vec<u8> = actions.as_slice().iter().filter_map(|a| {
-            if let bsql_postgres_proto::Action::SendBytes(bytes) = a { Some(*bytes) } else { None }
-        }).flatten().copied().collect();
-        drop(actions);
-        match &mut stream {
-            Stream::Plain(tcp) => { tcp.write_all(&startup_bytes)?; tcp.flush()?; }
-            Stream::Tls(tls) => { tls.write_all(&startup_bytes)?; tls.flush()?; }
-        }
+        let (startup_bytes, mut hs) = bsql_postgres_core::Handshake::begin(config)?;
+        stream.write_all(&startup_bytes)?;
 
         let mut buf = vec![0u8; 4096];
         loop {
-            let n = stream.read(&mut buf)?;
-            if n == 0 { return Err(DriverError::Io(std::io::Error::other("server closed"))); }
-            if connecting.feed_inbound(&buf[..n]).is_err() {
-                return Err(DriverError::Io(std::io::Error::other("read buffer full")));
-            }
-            let mut consecutive_need = 0u32;
-            loop {
-                let event = connecting.advance_one_frame(&mut wb);
-                match event {
-                    FeedEvent::Idle => {
-                        consecutive_need = 0;
-                        match connecting.into_active() {
-                            Ok(active) => {
-                                let session = Session::new(active, wb, vec![0u8; 4096]);
-                                return Ok(Self { session, stream, read_buf: buf, terminated: false });
-                            }
-                            Err(bsql_postgres_proto::IntoActiveError::StillConnecting(c)) => {
-                                connecting = c;
-                            }
-                            Err(_) => return Err(DriverError::NotReady),
-                        }
-                    }
-                    FeedEvent::SendBytes(bytes) => { consecutive_need = 0; stream.write_all(bytes)?; }
-                    FeedEvent::NeedMoreBytes => {
-                        consecutive_need += 1;
-                        if consecutive_need > 20 { break; }
-                    }
-                    FeedEvent::Fail(_) => return Err(DriverError::Io(std::io::Error::other("auth failed"))),
-                    FeedEvent::Close => return Err(DriverError::NotReady),
-                    _ => { consecutive_need = 0; }
+            match hs.step() {
+                bsql_postgres_core::HandshakeAction::Send => {
+                    stream.write_all(hs.pending_bytes())?;
                 }
+                bsql_postgres_core::HandshakeAction::NeedRead => {
+                    let n = stream.read(&mut buf)?;
+                    if n == 0 { return Err(DriverError::Io(std::io::Error::other("server closed"))); }
+                    hs.feed(&buf[..n])?;
+                }
+                bsql_postgres_core::HandshakeAction::Done => {
+                    let session = hs.finish()?;
+                    return Ok(Self { session, stream, read_buf: buf, terminated: false });
+                }
+                bsql_postgres_core::HandshakeAction::Error(e) => return Err(e),
             }
         }
     }

@@ -1,11 +1,145 @@
 use std::sync::Arc;
 
 use bsql_postgres_proto::{
-    ActivePhase, PgProtocol, WriteBuf,
+    ActivePhase, ConnectingPhase, FeedEvent, PgProtocol, WriteBuf,
 };
 
+use crate::config::ConnectConfig;
 use crate::error::{DbError, DriverError};
 use crate::types::{PreparedStatement, QueryResult, Row};
+
+/// Handshake step result — what the I/O adapter should do next.
+pub enum HandshakeAction {
+    /// Send bytes to server. Read them from `handshake.pending_bytes()`.
+    Send,
+    /// Need more bytes from server.
+    NeedRead,
+    /// Handshake complete — call `handshake.finish()` to get Session.
+    Done,
+    /// Error during handshake.
+    Error(DriverError),
+}
+
+/// Pre-connect state machine. Created by `Handshake::begin()`,
+/// driven by the I/O adapter via `step()` + `feed()`.
+pub struct Handshake {
+    connecting: Option<PgProtocol<ConnectingPhase>>,
+    wb: WriteBuf,
+    buf: Vec<u8>,
+    consecutive_need: u32,
+    session_parts: Option<(PgProtocol<ActivePhase>, WriteBuf, Vec<u8>)>,
+}
+
+impl Handshake {
+    /// Start the handshake. Returns startup bytes to send + the Handshake state.
+    pub fn begin(config: &ConnectConfig) -> Result<(Vec<u8>, Self), DriverError> {
+        let user = bsql_postgres_proto::Ident::try_from_str(&config.user)
+            .map_err(|_| DriverError::Config("invalid user name"))?;
+        let database = match &config.database {
+            Some(d) => Some(bsql_postgres_proto::DatabaseName::try_from_str(d)
+                .map_err(|_| DriverError::Config("invalid database name"))?),
+            None => None,
+        };
+
+        let mut proto = PgProtocol::new();
+        let mut wb = WriteBuf::new();
+        let reply = proto.next_reply_id::<bsql_postgres_proto::reply_id::StartupKind>();
+
+        let credentials = match config.password_str() {
+            Some(pw) => {
+                let password = bsql_postgres_proto::Password::try_from_str(pw)
+                    .map_err(|_| DriverError::Config("invalid password"))?;
+                bsql_postgres_proto::Credentials::ScramPassword(
+                    bsql_postgres_proto::sensitive::Sensitive::new(password),
+                )
+            }
+            None => bsql_postgres_proto::password::Credentials::Trust,
+        };
+
+        let (actions, connecting) = proto.push_startup(
+            user, database, None, credentials, reply, &mut wb,
+        ).map_err(|pf| DriverError::Protocol(*pf.cause))?;
+
+        let startup_bytes: Vec<u8> = actions.as_slice().iter().filter_map(|a| {
+            if let bsql_postgres_proto::Action::SendBytes(bytes) = a { Some(*bytes) } else { None }
+        }).flatten().copied().collect();
+
+        Ok((startup_bytes, Self {
+            connecting: Some(connecting), wb, buf: vec![0u8; 4096],
+            consecutive_need: 0, session_parts: None,
+        }))
+    }
+
+    /// Feed inbound bytes from the server.
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), DriverError> {
+        let conn = self.connecting.as_mut().ok_or(DriverError::NotReady)?;
+        conn.feed_inbound(bytes).map_err(|_|
+            DriverError::Io(std::io::Error::other("read buffer full"))
+        )
+    }
+
+    /// Bytes to send after a `Send` action.
+    pub fn pending_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Advance the handshake. Call in a loop with I/O between steps.
+    pub fn step(&mut self) -> HandshakeAction {
+        loop {
+            let Some(ref mut connecting) = self.connecting else {
+                return HandshakeAction::Error(DriverError::NotReady);
+            };
+            let event = connecting.advance_one_frame(&mut self.wb);
+            match event {
+                FeedEvent::Idle => {
+                    self.consecutive_need = 0;
+                    let Some(connecting) = self.connecting.take() else {
+                        return HandshakeAction::Error(DriverError::NotReady);
+                    };
+                    match connecting.into_active() {
+                        Ok(active) => {
+                            let wb = core::mem::replace(&mut self.wb, WriteBuf::new());
+                            self.buf = Vec::new();
+                            let buf = vec![0u8; 4096];
+                            self.session_parts = Some((active, wb, buf));
+                            return HandshakeAction::Done;
+                        }
+                        Err(bsql_postgres_proto::IntoActiveError::StillConnecting(c)) => {
+                            self.connecting = Some(c);
+                        }
+                        Err(_) => return HandshakeAction::Error(DriverError::NotReady),
+                    }
+                }
+                FeedEvent::SendBytes(bytes) => {
+                    self.consecutive_need = 0;
+                    self.buf.clear();
+                    self.buf.extend_from_slice(bytes);
+                    return HandshakeAction::Send;
+                }
+                FeedEvent::NeedMoreBytes => {
+                    self.consecutive_need += 1;
+                    if self.consecutive_need > 20 {
+                        self.consecutive_need = 0;
+                        return HandshakeAction::NeedRead;
+                    }
+                    continue;
+                }
+                FeedEvent::Fail(_) => return HandshakeAction::Error(
+                    DriverError::Io(std::io::Error::other("auth failed"))
+                ),
+                FeedEvent::Close => return HandshakeAction::Error(DriverError::NotReady),
+                _ => { self.consecutive_need = 0; continue; }
+            }
+        }
+    }
+
+    /// Extract the Session after `Done`. Returns Err if handshake not complete.
+    pub fn finish(mut self) -> Result<Session, DriverError> {
+        let (active, wb, buf) = self.session_parts.take()
+            .ok_or(DriverError::NotReady)?;
+        Ok(Session::new(active, wb, buf))
+    }
+}
 
 /// Pump step result — what the I/O adapter should do next.
 pub enum PumpAction {
