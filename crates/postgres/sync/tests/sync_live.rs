@@ -527,3 +527,33 @@ fn full_lifecycle_integration() {
     // Clean close
     conn.close().expect("close");
 }
+
+#[test]
+#[ignore = "requires local PG"]
+fn copy_in_large_sync() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+    conn.execute("CREATE TEMP TABLE cp_lg(i int)").expect("create");
+    let rows: Vec<String> = (0..1000).map(|i| i.to_string()).collect();
+    let n = conn.copy_in("cp_lg", &rows).expect("copy");
+    assert_eq!(n, 1000);
+    let r = conn.query("SELECT count(*) FROM cp_lg").expect("count");
+    assert_eq!(r.rows[0].get_i64(0), Some(1000));
+    conn.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn streaming_10k_rows_sync() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+    let result = conn.query("SELECT generate_series(1, 10000)").expect("query");
+    assert_eq!(result.rows.len(), 10000);
+    assert_eq!(result.rows[0].get_i32(0), Some(1));
+    assert_eq!(result.rows[9999].get_i32(0), Some(10000));
+    conn.close().expect("close");
+}
