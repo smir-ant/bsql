@@ -142,25 +142,30 @@ impl Connection {
 
         self.session.iter_rows(|rs| {
             let n_cols = rs.current_row_desc().map_or(0, |d| d.len());
-            let mut rb = Row::builder(n_cols);
+            let mut ab = bsql_postgres_core::ArenaBuilder::new(n_cols);
             loop {
                 match rs.col_next() {
                     bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
-                        rb.push_value(bytes);
+                        ab.push_value(bytes);
                     }
                     bsql_postgres_proto::ColEvent::Null { .. } => {
-                        rb.push_null();
+                        ab.push_null();
                     }
                     bsql_postgres_proto::ColEvent::EndRow => {
-                        rows.push(rb.finish());
-                        rb = Row::builder(n_cols);
+                        ab.end_row();
                     }
-                    bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
+                    bsql_postgres_proto::ColEvent::EndQuery { .. } => {
+                        *rows = ab.finish();
+                        return;
+                    }
                     bsql_postgres_proto::ColEvent::NeedMore => {
                         match rs.col_next() {
-                            bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
+                            bsql_postgres_proto::ColEvent::EndQuery { .. } => {
+                                *rows = ab.finish();
+                                return;
+                            }
                             bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
-                                rb.push_value(bytes);
+                                ab.push_value(bytes);
                                 continue;
                             }
                             bsql_postgres_proto::ColEvent::NeedMore => {
@@ -171,11 +176,8 @@ impl Connection {
                             }
                             other => {
                                 match other {
-                                    bsql_postgres_proto::ColEvent::Null { .. } => rb.push_null(),
-                                    bsql_postgres_proto::ColEvent::EndRow => {
-                                        rows.push(rb.finish());
-                                        rb = Row::builder(n_cols);
-                                    }
+                                    bsql_postgres_proto::ColEvent::Null { .. } => ab.push_null(),
+                                    bsql_postgres_proto::ColEvent::EndRow => ab.end_row(),
                                     _ => {}
                                 }
                             }
@@ -183,7 +185,7 @@ impl Connection {
                     }
                     bsql_postgres_proto::ColEvent::Chunk { bytes, .. }
                     | bsql_postgres_proto::ColEvent::ChunkEnd { bytes, .. } => {
-                        rb.extend_last(bytes);
+                        ab.extend_last(bytes);
                     }
                     _ => {}
                 }
