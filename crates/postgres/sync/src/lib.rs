@@ -9,5 +9,5 @@ pub use bsql_postgres_core::{
     Notification, PreparedStatement, PumpAction, QueryResult, Row, Session, SslMode,
 };
 
-pub use connection::Connection;
+pub use connection::{Connection, PgTransaction};
 pub use pool::{Pool, PooledConnection};

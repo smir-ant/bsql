@@ -366,6 +366,12 @@ impl Connection {
     pub fn commit(&mut self) -> Result<(), DriverError> { self.simple_query("COMMIT")?; Ok(()) }
     pub fn rollback(&mut self) -> Result<(), DriverError> { self.simple_query("ROLLBACK")?; Ok(()) }
 
+    /// Begin a transaction with RAII guard. Rolls back on Drop if not committed.
+    pub fn transaction(&mut self) -> Result<PgTransaction<'_>, DriverError> {
+        self.simple_query("BEGIN")?;
+        Ok(PgTransaction { conn: self, done: false })
+    }
+
     pub fn listen(&mut self, channel: &str) -> Result<(), DriverError> {
         self.simple_query(&format!("LISTEN {channel}"))?; Ok(())
     }
@@ -464,6 +470,52 @@ impl Connection {
         self.stream.write_all(&[b'X', 0, 0, 0, 4])?;
         self.stream.shutdown()?;
         Ok(())
+    }
+}
+
+/// RAII transaction guard for sync PG connections.
+pub struct PgTransaction<'conn> {
+    conn: &'conn mut Connection,
+    done: bool,
+}
+
+impl PgTransaction<'_> {
+    pub fn execute(&mut self, sql: &str) -> Result<u64, DriverError> {
+        self.conn.execute(sql)
+    }
+
+    pub fn query(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
+        self.conn.query(sql)
+    }
+
+    pub fn execute_params<P: bsql_postgres_proto::params::ParamsWriter>(
+        &mut self, sql: &str, params: &P,
+    ) -> Result<u64, DriverError> {
+        self.conn.execute_params(sql, params)
+    }
+
+    pub fn query_params<P: bsql_postgres_proto::params::ParamsWriter>(
+        &mut self, sql: &str, params: &P,
+    ) -> Result<QueryResult, DriverError> {
+        self.conn.query_params(sql, params)
+    }
+
+    pub fn commit(mut self) -> Result<(), DriverError> {
+        self.done = true;
+        self.conn.commit()
+    }
+
+    pub fn rollback(mut self) -> Result<(), DriverError> {
+        self.done = true;
+        self.conn.rollback()
+    }
+}
+
+impl Drop for PgTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.conn.simple_query("ROLLBACK");
+        }
     }
 }
 
