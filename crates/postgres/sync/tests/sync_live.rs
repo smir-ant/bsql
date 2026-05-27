@@ -615,3 +615,92 @@ fn wide_250_columns_sync() {
     assert_eq!(result.rows[0].get_i32(249), Some(249));
     conn.close().expect("close");
 }
+
+#[test]
+#[ignore = "requires local PG"]
+fn all_sql_command_types() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+
+    // DDL: CREATE, ALTER, DROP
+    conn.execute("CREATE TEMP TABLE cmd_test(id int, name text)").expect("CREATE TABLE");
+    conn.execute("ALTER TABLE cmd_test ADD COLUMN score real").expect("ALTER TABLE");
+    conn.execute("CREATE INDEX idx_cmd ON cmd_test(id)").expect("CREATE INDEX");
+
+    // DML: INSERT, UPDATE, DELETE, SELECT
+    conn.execute("INSERT INTO cmd_test VALUES (1, 'alice', 95.5)").expect("INSERT");
+    conn.execute("INSERT INTO cmd_test VALUES (2, 'bob', 88.0)").expect("INSERT 2");
+    let n = conn.execute("UPDATE cmd_test SET score = 100.0 WHERE id = 1").expect("UPDATE");
+    assert_eq!(n, 1);
+    let n = conn.execute("DELETE FROM cmd_test WHERE id = 2").expect("DELETE");
+    assert_eq!(n, 1);
+    let r = conn.query("SELECT * FROM cmd_test").expect("SELECT");
+    assert_eq!(r.rows.len(), 1);
+
+    // TCL: BEGIN, SAVEPOINT, RELEASE, ROLLBACK TO, COMMIT
+    conn.simple_query("BEGIN").expect("BEGIN");
+    conn.execute("INSERT INTO cmd_test VALUES (3, 'charlie', 70.0)").expect("INSERT in tx");
+    conn.simple_query("SAVEPOINT sp1").expect("SAVEPOINT");
+    conn.execute("INSERT INTO cmd_test VALUES (4, 'dave', 60.0)").expect("INSERT after savepoint");
+    conn.simple_query("ROLLBACK TO sp1").expect("ROLLBACK TO");
+    conn.simple_query("COMMIT").expect("COMMIT");
+    let r = conn.query("SELECT count(*) FROM cmd_test").expect("count");
+    assert_eq!(r.rows[0].get_i64(0), Some(2)); // alice + charlie (dave rolled back)
+
+    // Utility: EXPLAIN, SET, SHOW, DISCARD
+    let tag = conn.simple_query("EXPLAIN SELECT 1").expect("EXPLAIN");
+    assert!(!tag.is_empty());
+    conn.simple_query("SET client_encoding TO 'UTF8'").expect("SET");
+    let r = conn.query("SHOW client_encoding").expect("SHOW");
+    assert_eq!(r.rows[0].get_str(0), Some("UTF8"));
+    conn.simple_query("DISCARD TEMP").expect("DISCARD");
+
+    // TRUNCATE (need a new table since DISCARD dropped temps)
+    conn.execute("CREATE TEMP TABLE trunc_test(v int)").expect("create");
+    conn.execute("INSERT INTO trunc_test VALUES (1), (2)").expect("insert");
+    conn.simple_query("TRUNCATE trunc_test").expect("TRUNCATE");
+    let r = conn.query("SELECT count(*) FROM trunc_test").expect("count after truncate");
+    assert_eq!(r.rows[0].get_i64(0), Some(0));
+
+    // DO (anonymous block)
+    conn.simple_query("DO $$ BEGIN RAISE NOTICE 'hello from DO block'; END $$").expect("DO");
+
+    conn.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn connection_reuse_after_various_errors() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+
+    // Syntax error
+    assert!(conn.simple_query("SELCT").is_err());
+    conn.ping().expect("after syntax err");
+
+    // Table not found
+    assert!(conn.query("SELECT * FROM nonexistent_table_xyz").is_err());
+    conn.ping().expect("after missing table");
+
+    // Type error
+    assert!(conn.query("SELECT 'abc'::int").is_err());
+    conn.ping().expect("after type err");
+
+    // Division by zero
+    assert!(conn.query("SELECT 1/0").is_err());
+    conn.ping().expect("after div zero");
+
+    // Permission-ish (cancel mid-query via timeout — skip, needs async)
+
+    // Verify connection still fully functional
+    conn.execute("CREATE TEMP TABLE resilience(v int)").expect("create");
+    conn.execute("INSERT INTO resilience VALUES (42)").expect("insert");
+    let r = conn.query("SELECT v FROM resilience").expect("select");
+    assert_eq!(r.rows[0].get_i32(0), Some(42));
+
+    conn.close().expect("close");
+}

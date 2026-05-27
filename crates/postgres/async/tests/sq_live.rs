@@ -992,3 +992,66 @@ async fn wide_250_columns() {
     assert_eq!(result.rows[0].get_i32(249), Some(249));
     conn.close().await.expect("close");
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn all_sql_command_types() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    // DDL
+    conn.execute("CREATE TEMP TABLE cmd_a(id int, name text)").await.expect("CREATE");
+    conn.execute("ALTER TABLE cmd_a ADD COLUMN score real").await.expect("ALTER");
+
+    // DML
+    conn.execute("INSERT INTO cmd_a VALUES (1, 'alice', 95.5)").await.expect("INSERT");
+    let n = conn.execute("UPDATE cmd_a SET score = 100.0 WHERE id = 1").await.expect("UPDATE");
+    assert_eq!(n, 1);
+    let n = conn.execute("DELETE FROM cmd_a WHERE id = 1").await.expect("DELETE");
+    assert_eq!(n, 1);
+
+    // TCL: SAVEPOINT
+    conn.begin().await.expect("BEGIN");
+    conn.execute("INSERT INTO cmd_a VALUES (2, 'bob', 88.0)").await.expect("INSERT");
+    conn.simple_query("SAVEPOINT sp1").await.expect("SAVEPOINT");
+    conn.execute("INSERT INTO cmd_a VALUES (3, 'charlie', 70.0)").await.expect("INSERT");
+    conn.simple_query("ROLLBACK TO sp1").await.expect("ROLLBACK TO");
+    conn.commit().await.expect("COMMIT");
+    let r = conn.query("SELECT count(*) FROM cmd_a").await.expect("count");
+    assert_eq!(r.rows[0].get_i64(0), Some(1)); // only bob survived
+
+    // Utility
+    conn.simple_query("SET client_encoding TO 'UTF8'").await.expect("SET");
+    let r = conn.query("SHOW client_encoding").await.expect("SHOW");
+    assert_eq!(r.rows[0].get_str(0), Some("UTF8"));
+
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn connection_reuse_after_various_errors() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    assert!(conn.simple_query("SELCT").await.is_err());
+    conn.ping().await.expect("after syntax");
+
+    assert!(conn.query("SELECT * FROM nonexistent_xyz").await.is_err());
+    conn.ping().await.expect("after missing table");
+
+    assert!(conn.query("SELECT 'abc'::int").await.is_err());
+    conn.ping().await.expect("after type err");
+
+    assert!(conn.query("SELECT 1/0").await.is_err());
+    conn.ping().await.expect("after div zero");
+
+    conn.execute("CREATE TEMP TABLE res_a(v int)").await.expect("create");
+    conn.execute("INSERT INTO res_a VALUES (42)").await.expect("insert");
+    let r = conn.query("SELECT v FROM res_a").await.expect("select");
+    assert_eq!(r.rows[0].get_i32(0), Some(42));
+
+    conn.close().await.expect("close");
+}
