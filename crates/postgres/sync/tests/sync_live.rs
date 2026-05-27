@@ -557,3 +557,61 @@ fn streaming_10k_rows_sync() {
     assert_eq!(result.rows[9999].get_i32(0), Some(10000));
     conn.close().expect("close");
 }
+
+#[test]
+#[ignore = "requires local PG"]
+fn bad_sql_returns_error_sync() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+    let result = conn.simple_query("SELCT TYPO");
+    assert!(result.is_err());
+    conn.ping().expect("ping after error");
+    conn.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn query_with_nulls_sync() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+    let result = conn.query("SELECT 1, NULL::text, 'hello'").expect("select");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].len(), 3);
+    assert!(result.rows[0].is_null(1));
+    assert_eq!(result.rows[0].get_str(2), Some("hello"));
+    conn.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn copy_in_empty_sync() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+    conn.execute("CREATE TEMP TABLE cp_empty(v int)").expect("create");
+    let n = conn.copy_in("cp_empty", Vec::<&str>::new()).expect("copy_in empty");
+    assert_eq!(n, 0);
+    conn.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn wide_250_columns_sync() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+    let cols: Vec<String> = (0..250).map(|i| format!("{i}::int")).collect();
+    let sql = format!("SELECT {}", cols.join(", "));
+    let result = conn.query(&sql).expect("query 250 cols");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].len(), 250);
+    assert_eq!(result.rows[0].get_i32(0), Some(0));
+    assert_eq!(result.rows[0].get_i32(249), Some(249));
+    conn.close().expect("close");
+}

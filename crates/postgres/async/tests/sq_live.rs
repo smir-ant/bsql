@@ -976,3 +976,19 @@ async fn full_lifecycle_integration() {
 
     conn.close().await.expect("close");
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn wide_250_columns() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+    let cols: Vec<String> = (0..250).map(|i| format!("{i}::int")).collect();
+    let sql = format!("SELECT {}", cols.join(", "));
+    let result = conn.query(&sql).await.expect("query 250 cols");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].len(), 250);
+    assert_eq!(result.rows[0].get_i32(0), Some(0));
+    assert_eq!(result.rows[0].get_i32(249), Some(249));
+    conn.close().await.expect("close");
+}
