@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-mod config;
 mod connection;
-mod error;
 
-pub use config::{ConnectConfig, SslMode};
-pub use connection::{Connection, PreparedStatement, QueryResult, Row};
-pub use error::{DbError, DriverError};
+// Re-export shared types from core
+pub use bsql_postgres_core::{
+    ConnectConfig, DbError, DriverError, FromText,
+    Notification, PreparedStatement, PumpAction, QueryResult, Row, Session, SslMode,
+};
+
+pub use connection::Connection;

@@ -52,7 +52,7 @@ fn query_select_rows() {
 
     let result = conn.query("SELECT id, name FROM sq ORDER BY id").expect("select");
     assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.column_names, vec!["id", "name"]);
+    assert_eq!(&*result.column_names, &["id", "name"]);
     assert_eq!(result.rows[0].get_i32(0), Some(1));
     assert_eq!(result.rows[0].get_str(1), Some("alice"));
     assert_eq!(result.rows[1].get_by_name("name", &result.column_names), Some(b"bob".as_slice()));

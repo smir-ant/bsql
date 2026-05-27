@@ -7,6 +7,7 @@ description = "Sync PostgreSQL driver built on bsql-pg-proto sans-IO state machi
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+bsql-postgres-core = { path = "../core" }
 bsql-postgres-proto = { path = "../proto" }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = "0.26"
