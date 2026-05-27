@@ -351,3 +351,46 @@ fn backend_pid_sync() {
     let conn = Connection::connect(&config).expect("connect");
     assert!(conn.backend_pid() > 0);
 }
+
+#[test]
+#[ignore = "requires local PG"]
+fn pool_sync_basic() {
+    use bsql_postgres_sync::Pool;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let pool = Pool::new(config, 3);
+
+    let mut c1 = pool.get().expect("c1");
+    let mut c2 = pool.get().expect("c2");
+    c1.ping().expect("c1 ping");
+    c2.ping().expect("c2 ping");
+    drop(c1);
+    drop(c2);
+
+    assert_eq!(pool.idle_count(), 2);
+
+    let mut c3 = pool.get().expect("c3");
+    let result = c3.query("SELECT 1::int").expect("query");
+    assert_eq!(result.rows[0].get_i32(0), Some(1));
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn pool_sync_concurrent() {
+    use bsql_postgres_sync::Pool;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let pool = Pool::new(config, 3);
+
+    let handles: Vec<_> = (0..10u32).map(|i| {
+        let p = pool.clone();
+        std::thread::spawn(move || {
+            let mut conn = p.get().expect("get");
+            let r = conn.query(&format!("SELECT {i}::int")).expect("query");
+            assert_eq!(r.rows[0].get_i32(0), Some(i as i32));
+        })
+    }).collect();
+    for h in handles { h.join().expect("thread"); }
+}

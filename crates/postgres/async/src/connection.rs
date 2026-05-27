@@ -30,6 +30,7 @@ pub struct Connection {
     session: Session,
     stream: Stream,
     read_buf: Vec<u8>,
+    terminated: bool,
 }
 
 impl Connection {
@@ -93,7 +94,7 @@ impl Connection {
                         match connecting.into_active() {
                             Ok(active) => {
                                 let session = Session::new(active, wb, vec![0u8; 4096]);
-                                return Ok(Self { session, stream, read_buf: buf });
+                                return Ok(Self { session, stream, read_buf: buf, terminated: false });
                             }
                             Err(bsql_postgres_proto::IntoActiveError::StillConnecting(c)) => {
                                 connecting = c;
@@ -457,11 +458,24 @@ impl Connection {
     pub fn server_version(&self) -> Option<&str> { self.session.server_version() }
     pub fn backend_pid(&self) -> i32 { self.session.backend_pid() }
 
-    pub async fn close(mut self) -> Result<(), DriverError> {
-        let mut wb = WriteBuf::new();
-        match self.session.proto.terminate(&mut wb) {
-            Ok((bytes, _)) => { self.stream.write_all(bytes).await?; self.stream.shutdown().await?; Ok(()) }
-            Err(_) => Err(DriverError::Io(std::io::Error::other("terminate failed"))),
+    pub async fn close(&mut self) -> Result<(), DriverError> {
+        if self.terminated { return Ok(()); }
+        self.terminated = true;
+        self.stream.write_all(&[b'X', 0, 0, 0, 4]).await?;
+        self.stream.shutdown().await?;
+        Ok(())
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if self.terminated { return; }
+        // Best-effort Terminate via non-blocking try_write.
+        // Can't .await in Drop — this is the sync fallback.
+        let terminate = [b'X', 0, 0, 0, 4];
+        match &self.stream {
+            Stream::Plain(tcp) => { let _ = tcp.try_write(&terminate); }
+            Stream::Tls(_) => {} // TLS needs async — skip, OS RST will clean up
         }
     }
 }

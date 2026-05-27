@@ -378,7 +378,7 @@ async fn execute_returns_row_count() {
 async fn server_version_and_pid() {
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string());
-    let conn = Connection::connect(&config).await.expect("connect");
+    let mut conn = Connection::connect(&config).await.expect("connect");
 
     let version = conn.server_version();
     eprintln!("server version: {:?}", version);
