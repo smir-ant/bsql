@@ -385,7 +385,12 @@ impl Connection {
             let err = self.session.proto.fail_cause()
                 .map(|&c| self.session.classify_error(c))
                 .unwrap_or(DriverError::NotReady);
-            self.session.drain_to_idle();
+            for _ in 0..5 {
+                if self.session.is_healthy() { break; }
+                if let Ok(n) = self.stream.read(&mut self.read_buf)
+                    && n > 0 { let _ = self.session.feed(&self.read_buf[..n]); }
+                self.session.drain_to_idle();
+            }
             return Err(err);
         }
 

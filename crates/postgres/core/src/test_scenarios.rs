@@ -388,7 +388,304 @@ fn sql_date_and_interval() {
     c.close().expect("close");
 }
 
+#[test]
+#[ignore = "requires local PG"]
+fn sql_error_zoo() {
+    let mut c = $config_fn();
+
+    // Syntax errors
+    assert!(c.simple_query("SELCT").is_err());
+    assert!(c.simple_query("SELECT FROM").is_err());
+    assert!(c.simple_query("INSERT").is_err());
+    assert!(c.simple_query("DROP TABLE").is_err());
+    let _ = c.simple_query(""); // PG treats empty string as no-op — may succeed
+    c.ping().expect("recover after syntax errors");
+
+    // Missing objects
+    assert!(c.query("SELECT * FROM table_that_does_not_exist_xyz").is_err());
+    assert!(c.query("SELECT nonexistent_column FROM pg_class LIMIT 1").is_err());
+    assert!(c.execute("DROP TABLE table_that_does_not_exist_xyz").is_err());
+    assert!(c.execute("ALTER TABLE nonexistent_xyz ADD COLUMN x int").is_err());
+    c.ping().expect("recover after missing objects");
+
+    // Double-drop
+    c.execute("CREATE TEMP TABLE dd(x int)").expect("create");
+    c.execute("DROP TABLE dd").expect("drop");
+    assert!(c.execute("DROP TABLE dd").is_err());
+    c.ping().expect("recover after double drop");
+
+    // Type mismatch
+    assert!(c.query("SELECT 'not_a_number'::int").is_err());
+    assert!(c.query("SELECT 'not_a_bool'::bool").is_err());
+    assert!(c.query("SELECT '99999999999999999999'::int").is_err());
+    c.ping().expect("recover after type mismatch");
+
+    // Division by zero
+    assert!(c.query("SELECT 1/0").is_err());
+    assert!(c.query("SELECT 1.0/0.0").is_err());
+    c.ping().expect("recover after division by zero");
+
+    // Constraint violations
+    c.execute("CREATE TEMP TABLE cv(id int PRIMARY KEY, name text NOT NULL, val int CHECK(val > 0))").expect("create");
+    c.execute("INSERT INTO cv VALUES (1, 'a', 1)").expect("ok");
+    assert!(c.execute("INSERT INTO cv VALUES (1, 'b', 2)").is_err()); // PK dup
+    assert!(c.execute("INSERT INTO cv VALUES (2, NULL, 2)").is_err()); // NOT NULL
+    assert!(c.execute("INSERT INTO cv VALUES (3, 'c', -1)").is_err()); // CHECK
+    assert!(c.execute("INSERT INTO cv VALUES (4, 'c', 0)").is_err()); // CHECK
+    c.ping().expect("recover after constraints");
+    assert_eq!(c.query("SELECT count(*) FROM cv").expect("c").rows[0].get_i64(0), Some(1));
+
+    // Truncation / overflow
+    assert!(c.query("SELECT 2147483648::int").is_err()); // i32 overflow
+    assert!(c.query("SELECT 9999999999999999999::bigint").is_err()); // i64 overflow
+
+    // Nested BEGIN (PG issues WARNING, doesn't error)
+    c.simple_query("BEGIN").expect("begin");
+    let _ = c.simple_query("BEGIN"); // warning, not error
+    c.simple_query("ROLLBACK").expect("rollback");
+
+    // CRUD on non-existent after successful ops
+    c.execute("CREATE TEMP TABLE ghost(v int)").expect("create");
+    c.execute("INSERT INTO ghost VALUES (1)").expect("ins");
+    c.execute("DROP TABLE ghost").expect("drop");
+    assert!(c.query("SELECT * FROM ghost").is_err());
+    assert!(c.execute("INSERT INTO ghost VALUES (2)").is_err());
+    c.ping().expect("recover final");
+
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn sql_extreme_values() {
+    let mut c = $config_fn();
+
+    // Integer extremes
+    let r = c.query("SELECT (-2147483647-1)::int, 2147483647::int").expect("i32 extremes");
+    assert_eq!(r.rows[0].get_i32(0), Some(i32::MIN));
+    assert_eq!(r.rows[0].get_i32(1), Some(i32::MAX));
+
+    let r = c.query("SELECT (-9223372036854775807-1)::bigint, 9223372036854775807::bigint").expect("i64 extremes");
+    assert_eq!(r.rows[0].get_i64(0), Some(i64::MIN));
+    assert_eq!(r.rows[0].get_i64(1), Some(i64::MAX));
+
+    let r = c.query("SELECT (-32767-1)::smallint, 32767::smallint").expect("i16 extremes");
+    assert_eq!(r.rows[0].get_i32(0), Some(i16::MIN as i32));
+    assert_eq!(r.rows[0].get_i32(1), Some(i16::MAX as i32));
+
+    // Zero
+    let r = c.query("SELECT 0::int, 0::bigint, 0::smallint, 0.0::float4, 0.0::float8").expect("zeros");
+    assert_eq!(r.rows[0].get_i32(0), Some(0));
+    assert_eq!(r.rows[0].get_i64(1), Some(0));
+    assert_eq!(r.rows[0].get_i32(2), Some(0));
+
+    // Float specials
+    let r = c.query("SELECT 'NaN'::float8, 'Infinity'::float8, '-Infinity'::float8").expect("float specials");
+    let nan = r.rows[0].get_f64(0);
+    assert!(nan.is_some() && nan.unwrap().is_nan());
+    let inf = r.rows[0].get_f64(1);
+    assert!(inf.is_some() && inf.unwrap().is_infinite() && inf.unwrap() > 0.0);
+    let neg_inf = r.rows[0].get_f64(2);
+    assert!(neg_inf.is_some() && neg_inf.unwrap().is_infinite() && neg_inf.unwrap() < 0.0);
+
+    // Empty string vs NULL
+    let r = c.query("SELECT ''::text, NULL::text, ' '::text").expect("empty vs null");
+    assert_eq!(r.rows[0].get_str(0), Some(""));
+    assert!(r.rows[0].is_null(1));
+    assert_eq!(r.rows[0].get_str(2), Some(" "));
+
+    // Long text via params (limited by MAX_PARAMS_DATA_TOTAL=1024)
+    c.execute("CREATE TEMP TABLE longtext(v text)").expect("create");
+    let long = "x".repeat(900);
+    c.execute_params("INSERT INTO longtext VALUES ($1)", &(long.as_str(),)).expect("insert 900");
+    let r = c.query("SELECT length(v), v FROM longtext").expect("select");
+    assert_eq!(r.rows[0].get_i32(0), Some(900));
+    assert_eq!(r.rows[0].get_str(1).map(|s| s.len()), Some(900));
+
+    // Very long text via SQL literal (bypasses param limit)
+    let big_literal = "y".repeat(50_000);
+    c.execute(&format!("INSERT INTO longtext VALUES ('{big_literal}')")).expect("insert 50K literal");
+    let r = c.query("SELECT length(v) FROM longtext WHERE v LIKE 'y%'").expect("select big");
+    assert_eq!(r.rows[0].get_i32(0), Some(50_000));
+
+    // Unicode stress
+    let r = c.query("SELECT '🎭🎪🎨'::text, '中文测试'::text, 'العربية'::text, '日本語テスト'::text").expect("unicode");
+    assert_eq!(r.rows[0].get_str(0), Some("🎭🎪🎨"));
+    assert_eq!(r.rows[0].get_str(1), Some("中文测试"));
+    assert_eq!(r.rows[0].get_str(2), Some("العربية"));
+    assert_eq!(r.rows[0].get_str(3), Some("日本語テスト"));
+
+    // All NULLs
+    let r = c.query("SELECT NULL::int, NULL::text, NULL::bool, NULL::float8, NULL::bigint").expect("all null");
+    for i in 0..5 { assert!(r.rows[0].is_null(i), "col {i} should be null"); }
+
+    // Booleans
+    let r = c.query("SELECT true, false, NOT true, true AND false, true OR false").expect("bools");
+    assert_eq!(r.rows[0].get_bool(0), Some(true));
+    assert_eq!(r.rows[0].get_bool(1), Some(false));
+    assert_eq!(r.rows[0].get_bool(2), Some(false));
+    assert_eq!(r.rows[0].get_bool(3), Some(false));
+    assert_eq!(r.rows[0].get_bool(4), Some(true));
+
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn sql_empty_and_boundary_results() {
+    let mut c = $config_fn();
+
+    // Empty result set
+    c.execute("CREATE TEMP TABLE empty_t(v int)").expect("create");
+    let r = c.query("SELECT * FROM empty_t").expect("empty");
+    assert_eq!(r.rows.len(), 0);
+    assert!(r.column_names.len() > 0);
+
+    // WHERE that matches nothing
+    c.execute("INSERT INTO empty_t VALUES (1),(2),(3)").expect("ins");
+    let r = c.query("SELECT * FROM empty_t WHERE v > 999").expect("no match");
+    assert_eq!(r.rows.len(), 0);
+
+    // Single row, single column
+    let r = c.query("SELECT 42::int").expect("scalar");
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.column_names.len(), 1);
+
+    // Single row, many NULLs
+    let r = c.query("SELECT NULL::int, NULL::text, NULL::bool, NULL::float8, NULL::int, NULL::text, NULL::bool, NULL::float8, NULL::int, NULL::text").expect("10 nulls");
+    assert_eq!(r.rows.len(), 1);
+    for i in 0..10 { assert!(r.rows[0].is_null(i)); }
+
+    // Many rows, one column
+    let r = c.query("SELECT generate_series(1, 5000)").expect("5k rows");
+    assert_eq!(r.rows.len(), 5000);
+    assert_eq!(r.rows[0].get_i32(0), Some(1));
+    assert_eq!(r.rows[4999].get_i32(0), Some(5000));
+
+    // LIMIT 0
+    let r = c.query("SELECT * FROM empty_t LIMIT 0").expect("limit 0");
+    assert_eq!(r.rows.len(), 0);
+
+    // OFFSET past end
+    let r = c.query("SELECT * FROM empty_t OFFSET 999").expect("offset past end");
+    assert_eq!(r.rows.len(), 0);
+
+    // SELECT with no FROM (synthetic row)
+    let r = c.query("SELECT 1 as a, 'b' as b, true as c").expect("no from");
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(&*r.column_names, &["a", "b", "c"]);
+
+    // Duplicate column names
+    let r = c.query("SELECT 1 as x, 2 as x, 3 as x").expect("dup names");
+    assert_eq!(r.column_names.len(), 3);
+    assert_eq!(r.rows[0].get_i32(0), Some(1));
+    assert_eq!(r.rows[0].get_i32(2), Some(3));
+
+    // Reserved words as identifiers
+    c.execute("CREATE TEMP TABLE \"select\"(\"where\" int, \"from\" text)").expect("reserved");
+    c.execute("INSERT INTO \"select\" VALUES (1, 'a')").expect("ins");
+    let r = c.query("SELECT \"where\", \"from\" FROM \"select\"").expect("select reserved");
+    assert_eq!(r.rows[0].get_i32(0), Some(1));
+    assert_eq!(r.rows[0].get_str(1), Some("a"));
+
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn sql_concurrent_ddl_and_rapid_ops() {
+    let mut c = $config_fn();
+
+    // Rapid create/drop cycle
+    for i in 0..20u32 {
+        let name = format!("rapid_{i}");
+        c.execute(&format!("CREATE TEMP TABLE {name}(v int)")).expect("create");
+        c.execute(&format!("INSERT INTO {name} VALUES ({i})")).expect("ins");
+        assert_eq!(c.query(&format!("SELECT v FROM {name}")).expect("q").rows[0].get_i32(0), Some(i as i32));
+        c.execute(&format!("DROP TABLE {name}")).expect("drop");
+    }
+    c.ping().expect("after rapid cycle");
+
+    // Rapid query cycle — 100 queries on one connection
+    for i in 0..100u32 {
+        assert_eq!(c.query(&format!("SELECT {i}::int")).expect("q").rows[0].get_i32(0), Some(i as i32));
+    }
+
+    // Interleaved errors and successes
+    for _ in 0..10 {
+        assert!(c.query("SELECT * FROM nonexistent_table_zzz").is_err());
+        assert_eq!(c.query("SELECT 1::int").expect("ok").rows[0].get_i32(0), Some(1));
+    }
+
+    // Multiple temp tables at once
+    for i in 0..10u32 {
+        c.execute(&format!("CREATE TEMP TABLE mt_{i}(v int)")).expect("create");
+        c.execute(&format!("INSERT INTO mt_{i} VALUES ({i})")).expect("ins");
+    }
+    for i in 0..10u32 {
+        let r = c.query(&format!("SELECT v FROM mt_{i}")).expect("q");
+        assert_eq!(r.rows[0].get_i32(0), Some(i as i32));
+    }
+    // Cross-table join across all 10
+    let tables: Vec<String> = (0..10).map(|i| format!("mt_{i}")).collect();
+    let joins = tables.windows(2).map(|w| format!("{} JOIN {} ON true", w[0], w[1])).collect::<Vec<_>>();
+    let sql = format!("SELECT count(*) FROM {}", if joins.is_empty() { "mt_0".to_string() } else {
+        format!("mt_0 {}", (1..10).map(|i| format!("JOIN mt_{i} ON true")).collect::<Vec<_>>().join(" "))
+    });
+    let r = c.query(&sql).expect("mega join");
+    assert_eq!(r.rows[0].get_i64(0), Some(1)); // 1 row each × CROSS JOIN = 1 row
+
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn sql_transaction_edge_cases() {
+    let mut c = $config_fn();
+
+    c.execute("CREATE TEMP TABLE txe(id int PRIMARY KEY, v text)").expect("create");
+
+    // Empty transaction — commit nothing
+    c.transaction(|tx| Ok(())).expect("empty tx");
+
+    // Transaction with only reads
+    c.execute("INSERT INTO txe VALUES (1, 'a')").expect("seed");
+    c.transaction(|tx| {
+        let r = tx.query("SELECT v FROM txe WHERE id = 1")?;
+        assert_eq!(r.rows[0].get_str(0), Some("a"));
+        Ok(())
+    }).expect("read-only tx");
+
+    // Rollback on error
+    let result: Result<(), _> = c.transaction(|tx| {
+        tx.execute("INSERT INTO txe VALUES (2, 'b')")?;
+        tx.execute("INSERT INTO txe VALUES (2, 'dupe')")?; // PK violation
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_eq!(c.query("SELECT count(*) FROM txe").expect("c").rows[0].get_i64(0), Some(1));
+
+    // Rollback on user error
+    let _: Result<(), _> = c.transaction(|tx| {
+        tx.execute("INSERT INTO txe VALUES (3, 'c')")?;
+        Err(bsql_postgres_core::DriverError::NoRows) // user-triggered rollback
+    });
+    assert_eq!(c.query("SELECT count(*) FROM txe").expect("c").rows[0].get_i64(0), Some(1));
+
+    // Successful multi-statement transaction
+    c.transaction(|tx| {
+        tx.execute("INSERT INTO txe VALUES (10, 'x')")?;
+        tx.execute("INSERT INTO txe VALUES (11, 'y')")?;
+        tx.execute("UPDATE txe SET v = 'z' WHERE id = 10")?;
+        tx.execute("DELETE FROM txe WHERE id = 1")?;
+        Ok(())
+    }).expect("multi-stmt tx");
+    assert_eq!(c.query("SELECT count(*) FROM txe").expect("c").rows[0].get_i64(0), Some(2));
+    assert_eq!(c.query("SELECT v FROM txe WHERE id = 10").expect("q").rows[0].get_str(0), Some("z"));
+
+    c.close().expect("close");
+}
+
     }; // end macro
 }
 
-// Additional scenario added outside macro for special cases

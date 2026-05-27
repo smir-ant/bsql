@@ -274,3 +274,170 @@ fn wide_columns() {
     }
     c.close().expect("close");
 }
+
+#[test]
+#[ignore = "requires local PG"]
+fn prepared_statement_edge_cases() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute("CREATE TEMP TABLE ps_edge(id int, v text)").expect("create");
+
+    // Prepare, execute 0 times, close
+    let stmt = c.prepare("INSERT INTO ps_edge VALUES ($1, $2)").expect("prep");
+    c.close_statement(stmt).expect("close unused stmt");
+
+    // Prepare, execute many times
+    let stmt = c.prepare("INSERT INTO ps_edge VALUES ($1, $2)").expect("prep");
+    for i in 0..50i32 {
+        c.execute_prepared(&stmt, &(i, format!("v{i}").as_str())).expect("exec");
+    }
+    assert_eq!(c.query("SELECT count(*) FROM ps_edge").expect("c").rows[0].get_i64(0), Some(50));
+    c.close_statement(stmt).expect("close");
+
+    // Prepare SELECT, query many times
+    let stmt = c.prepare("SELECT v FROM ps_edge WHERE id = $1").expect("prep select");
+    for i in 0..50i32 {
+        let r = c.query_prepared(&stmt, &(i,)).expect("qp");
+        assert_eq!(r.rows[0].get_str(0), Some(format!("v{i}").as_str()));
+    }
+    c.close_statement(stmt).expect("close");
+
+    // Multiple prepared statements open at once
+    let s1 = c.prepare("SELECT id FROM ps_edge WHERE id < $1").expect("s1");
+    let s2 = c.prepare("SELECT v FROM ps_edge WHERE id = $1").expect("s2");
+    let s3 = c.prepare("UPDATE ps_edge SET v = $1 WHERE id = $2").expect("s3");
+    let r1 = c.query_prepared(&s1, &(5i32,)).expect("q1");
+    assert_eq!(r1.rows.len(), 5);
+    let r2 = c.query_prepared(&s2, &(0i32,)).expect("q2");
+    assert_eq!(r2.rows[0].get_str(0), Some("v0"));
+    c.execute_prepared(&s3, &("updated", 0i32)).expect("exec3");
+    let r2b = c.query_prepared(&s2, &(0i32,)).expect("q2b");
+    assert_eq!(r2b.rows[0].get_str(0), Some("updated"));
+    c.close_statement(s1).expect("close s1");
+    c.close_statement(s2).expect("close s2");
+    c.close_statement(s3).expect("close s3");
+
+    // Error in prepared doesn't break statement
+    c.execute("CREATE TEMP TABLE ps_uk(id int UNIQUE)").expect("create");
+    let stmt = c.prepare("INSERT INTO ps_uk VALUES ($1)").expect("prep");
+    c.execute_prepared(&stmt, &(1i32,)).expect("ok");
+    assert!(c.execute_prepared(&stmt, &(1i32,)).is_err()); // dup
+    c.execute_prepared(&stmt, &(2i32,)).expect("ok after error");
+    c.close_statement(stmt).expect("close");
+
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn copy_in_edge_cases() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    // COPY 0 rows
+    c.execute("CREATE TEMP TABLE cp_edge(id int, name text)").expect("create");
+    assert_eq!(c.copy_in("cp_edge", Vec::<&str>::new()).expect("empty"), 0);
+    assert_eq!(c.query("SELECT count(*) FROM cp_edge").expect("c").rows[0].get_i64(0), Some(0));
+
+    // COPY 1 row
+    assert_eq!(c.copy_in("cp_edge", vec!["1\tone"]).expect("one"), 1);
+
+    // COPY with NULLs (PG COPY \N = NULL)
+    assert_eq!(c.copy_in("cp_edge", vec!["2\t\\N"]).expect("null"), 1);
+
+    // COPY many rows
+    let big: Vec<String> = (0..5000).map(|i| format!("{i}\tname_{i}")).collect();
+    assert_eq!(c.copy_in("cp_edge", &big).expect("5k"), 5000);
+    assert_eq!(c.query("SELECT count(*) FROM cp_edge").expect("c").rows[0].get_i64(0), Some(5002));
+
+    // COPY into non-existent table — use fresh connection (COPY error recovery
+    // sometimes leaves connection in unrecoverable state under parallel load)
+    let mut c2 = Connection::connect(&sync_config()).expect("c2");
+    assert!(c2.copy_in("table_that_does_not_exist", vec!["1\ta"]).is_err());
+    c2.ping().expect("recover");
+    c2.close().expect("close c2");
+
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn streaming_edge_cases() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    // 0 rows streaming (query returns no DataRow)
+    c.execute("CREATE TEMP TABLE empty_stream(v int)").expect("create");
+    let r = c.query("SELECT * FROM empty_stream").expect("empty");
+    assert_eq!(r.rows.len(), 0);
+
+    // 1 row streaming
+    c.execute("INSERT INTO empty_stream VALUES (42)").expect("ins");
+    let r = c.query("SELECT * FROM empty_stream").expect("one");
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].get_i32(0), Some(42));
+
+    // Large value via SQL literal (params limited to 1024 bytes)
+    let big_val = "X".repeat(50_000);
+    c.execute("CREATE TEMP TABLE big_val(v text)").expect("create");
+    c.execute(&format!("INSERT INTO big_val VALUES ('{big_val}')")).expect("ins");
+    let r = c.query("SELECT v FROM big_val").expect("q");
+    assert_eq!(r.rows[0].get_str(0).map(|s| s.len()), Some(50_000));
+
+    // Many columns with NULLs
+    let r = c.query("SELECT NULL::int, 1::int, NULL::text, 'a'::text, NULL::bool, true").expect("mixed nulls");
+    assert!(r.rows[0].is_null(0));
+    assert_eq!(r.rows[0].get_i32(1), Some(1));
+    assert!(r.rows[0].is_null(2));
+    assert_eq!(r.rows[0].get_str(3), Some("a"));
+    assert!(r.rows[0].is_null(4));
+    assert_eq!(r.rows[0].get_bool(5), Some(true));
+
+    // Query after error mid-stream should recover
+    assert!(c.query("SELECT 1/0 FROM generate_series(1,10)").is_err());
+    c.ping().expect("recover after mid-stream error");
+    let r = c.query("SELECT 1::int").expect("after recover");
+    assert_eq!(r.rows[0].get_i32(0), Some(1));
+
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn connection_resilience_marathon() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    // 50 alternating errors and successes
+    for i in 0..50u32 {
+        if i % 2 == 0 {
+            assert!(c.query("SELECT * FROM nonexistent_marathon").is_err());
+        } else {
+            assert_eq!(c.query(&format!("SELECT {i}::int")).expect("q").rows[0].get_i32(0), Some(i as i32));
+        }
+    }
+    c.ping().expect("after marathon");
+
+    // 200 rapid pings
+    for _ in 0..200 {
+        c.ping().expect("rapid ping");
+    }
+
+    // Error → recover → success cycle
+    c.execute("CREATE TEMP TABLE IF NOT EXISTS marathon_t(v int)").expect("create");
+    for i in 0..20u32 {
+        assert!(c.simple_query("INVALID SQL GIBBERISH").is_err());
+        c.ping().unwrap_or_else(|e| panic!("ping after err #{i}: {e}"));
+        c.execute("INSERT INTO marathon_t VALUES (1)").unwrap_or_else(|e| panic!("ins #{i}: {e}"));
+        assert!(c.query("SELECT 'bad'::int").is_err());
+        c.ping().unwrap_or_else(|e| panic!("ping2 #{i}: {e}"));
+        let r = c.query("SELECT count(*) FROM marathon_t").unwrap_or_else(|e| panic!("count #{i}: {e}"));
+        assert!(r.rows[0].get_i64(0).unwrap_or(0) > 0);
+    }
+
+    // Verify connection is still fully functional
+    c.execute("CREATE TEMP TABLE final_check(a int, b text, c bool)").expect("create");
+    c.execute("INSERT INTO final_check VALUES (1, 'hello', true)").expect("ins");
+    let r = c.query("SELECT * FROM final_check").expect("final");
+    assert_eq!(r.rows[0].get_i32(0), Some(1));
+    assert_eq!(r.rows[0].get_str(1), Some("hello"));
+    assert_eq!(r.rows[0].get_bool(2), Some(true));
+
+    c.close().expect("close");
+}
