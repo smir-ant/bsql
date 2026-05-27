@@ -464,3 +464,66 @@ fn prepared_empty_result_sync() {
     conn.close_statement(stmt).expect("close stmt");
     conn.close().expect("close");
 }
+
+#[test]
+#[ignore = "requires local PG"]
+fn full_lifecycle_integration() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+
+    // DDL
+    conn.execute("CREATE TEMP TABLE lifecycle(id serial PRIMARY KEY, name text, val int)").expect("create");
+
+    // Transaction with closure
+    conn.transaction(|tx| {
+        tx.execute("INSERT INTO lifecycle(name, val) VALUES ('alice', 95)")?;
+        tx.execute("INSERT INTO lifecycle(name, val) VALUES ('bob', 88)")?;
+        tx.execute("INSERT INTO lifecycle(name, val) VALUES ('charlie', 72)")?;
+        Ok(())
+    }).expect("tx");
+
+    // Parameterized query
+    let row = conn.query_params_one(
+        "SELECT name, val FROM lifecycle WHERE val > $1 ORDER BY val DESC",
+        &(90i32,),
+    ).expect("params");
+    assert_eq!(row.get_str(0), Some("alice"));
+
+    // Prepared statement reuse
+    let stmt = conn.prepare("UPDATE lifecycle SET val = val + $1 WHERE name = $2").expect("prepare");
+    conn.execute_prepared(&stmt, &(5i32, "bob")).expect("update bob");
+    conn.execute_prepared(&stmt, &(10i32, "charlie")).expect("update charlie");
+    conn.close_statement(stmt).expect("close stmt");
+
+    // Verify updates
+    let result = conn.query("SELECT name, val FROM lifecycle ORDER BY val DESC").expect("verify");
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.column_names.len(), 2);
+    assert_eq!(result.rows[0].get_str(0), Some("alice"));
+
+    // Column name access
+    let bob_row = &result.rows[1];
+    assert_eq!(bob_row.get_by_name("name", &result.column_names), Some(b"bob".as_slice()));
+
+    // Row is Clone + Send + 'static
+    let cloned = result.rows[0].clone();
+    let handle = std::thread::spawn(move || {
+        cloned.get_str(0).map(String::from)
+    });
+    assert_eq!(handle.join().expect("thread"), Some("alice".to_string()));
+
+    // Error recovery
+    let err = conn.execute("INSERT INTO lifecycle(id) VALUES (1)"); // duplicate PK
+    assert!(err.is_err());
+    conn.ping().expect("ping after error");
+
+    // COPY IN
+    conn.execute("CREATE TEMP TABLE cp(v int)").expect("create cp");
+    let n = conn.copy_in("cp", vec!["100", "200", "300"]).expect("copy");
+    assert_eq!(n, 3);
+
+    // Clean close
+    conn.close().expect("close");
+}

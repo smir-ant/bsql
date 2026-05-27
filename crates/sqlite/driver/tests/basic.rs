@@ -308,3 +308,40 @@ fn native_integer_access() {
     assert_eq!(row.get_f64(0), Some(42.0)); // Integer → f64 coercion
     assert!(row.is_null(2));
 }
+
+#[test]
+fn full_lifecycle_integration() {
+    let conn = Connection::open_in_memory().expect("open");
+
+    conn.execute_batch("
+        CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, score REAL);
+    ").expect("create");
+
+    conn.transaction(|tx| {
+        tx.execute("INSERT INTO users(name, score) VALUES ('alice', 95.5)")?;
+        tx.execute("INSERT INTO users(name, score) VALUES ('bob', 88.0)")?;
+        Ok(())
+    }).expect("tx");
+
+    let result = conn.query("SELECT id, name, score FROM users ORDER BY id").expect("query");
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.column_names, vec!["id", "name", "score"]);
+    assert_eq!(result.rows[0].get_str(1), Some("alice"));
+    assert_eq!(result.rows[0].get_f64(2), Some(95.5));
+    assert_eq!(result.rows[1].get_i64(0), Some(2));
+
+    // Native type access — no double-conversion
+    assert_eq!(result.rows[0].get_i64(0), Some(1)); // Integer direct
+    assert_eq!(result.rows[0].get_f64(0), Some(1.0)); // Integer → f64 coercion
+
+    // Error in transaction → rollback
+    let err: Result<(), _> = conn.transaction(|tx| {
+        tx.execute("INSERT INTO users(name) VALUES ('charlie')")?;
+        Err(bsql_sqlite::SqliteError::Query("abort".to_string()))
+    });
+    assert!(err.is_err());
+    let count = conn.query("SELECT count(*) FROM users").expect("count");
+    assert_eq!(count.rows[0].get_i64(0), Some(2)); // charlie rolled back
+
+    conn.close().expect("close");
+}

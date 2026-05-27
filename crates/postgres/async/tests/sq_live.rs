@@ -940,3 +940,39 @@ async fn pool_concurrent_queries() {
         h.await.expect("join");
     }
 }
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn full_lifecycle_integration() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string());
+    let mut conn = Connection::connect(&config).await.expect("connect");
+
+    conn.execute("CREATE TEMP TABLE lc(id serial PRIMARY KEY, name text, val int)").await.expect("create");
+
+    conn.begin().await.expect("begin");
+    conn.execute("INSERT INTO lc(name, val) VALUES ('a', 10)").await.expect("insert a");
+    conn.execute("INSERT INTO lc(name, val) VALUES ('b', 20)").await.expect("insert b");
+    conn.commit().await.expect("commit");
+
+    let stmt = conn.prepare("SELECT name FROM lc WHERE val = $1").await.expect("prepare");
+    let r1 = conn.query_prepared(&stmt, &(10i32,)).await.expect("q1");
+    assert_eq!(r1.rows[0].get_str(0), Some("a"));
+    let r2 = conn.query_prepared(&stmt, &(20i32,)).await.expect("q2");
+    assert_eq!(r2.rows[0].get_str(0), Some("b"));
+    conn.close_statement(stmt).await.expect("close stmt");
+
+    let err = conn.execute("INSERT INTO lc(id) VALUES (1)").await;
+    assert!(err.is_err());
+    conn.ping().await.expect("ping after error");
+
+    // Row is Send + 'static — can cross .await
+    let result = conn.query("SELECT name FROM lc ORDER BY val").await.expect("query");
+    let row = result.rows[0].clone();
+    let name = tokio::task::spawn(async move {
+        row.get_str(0).map(String::from)
+    }).await.expect("spawn");
+    assert_eq!(name, Some("a".to_string()));
+
+    conn.close().await.expect("close");
+}
