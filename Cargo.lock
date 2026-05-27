@@ -65,10 +65,8 @@ version = "0.1.0-alpha.0"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
- "rustls",
  "tokio",
  "tokio-rustls",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -118,7 +116,6 @@ dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
  "rustls",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
