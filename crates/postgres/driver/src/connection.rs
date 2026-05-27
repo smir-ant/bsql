@@ -84,10 +84,12 @@ impl Connection {
             if connecting.feed_inbound(&buf[..n]).is_err() {
                 return Err(DriverError::Io(std::io::Error::other("read buffer full")));
             }
+            let mut consecutive_need = 0u32;
             loop {
                 let event = connecting.advance_one_frame(&mut wb);
                 match event {
                     FeedEvent::Idle => {
+                        consecutive_need = 0;
                         match connecting.into_active() {
                             Ok(active) => {
                                 let session = Session::new(active, wb, vec![0u8; 4096]);
@@ -95,16 +97,18 @@ impl Connection {
                             }
                             Err(bsql_postgres_proto::IntoActiveError::StillConnecting(c)) => {
                                 connecting = c;
-                                break;
                             }
                             Err(_) => return Err(DriverError::NotReady),
                         }
                     }
-                    FeedEvent::SendBytes(bytes) => { stream.write_all(bytes).await?; }
-                    FeedEvent::NeedMoreBytes => break,
+                    FeedEvent::SendBytes(bytes) => { consecutive_need = 0; stream.write_all(bytes).await?; }
+                    FeedEvent::NeedMoreBytes => {
+                        consecutive_need += 1;
+                        if consecutive_need > 20 { break; }
+                    }
                     FeedEvent::Fail(_) => return Err(DriverError::Io(std::io::Error::other("auth failed"))),
                     FeedEvent::Close => return Err(DriverError::NotReady),
-                    _ => {}
+                    _ => { consecutive_need = 0; }
                 }
             }
         }
@@ -172,7 +176,17 @@ impl Connection {
                         None => self.session.drain_streaming(),
                     }
                 }
-                PumpAction::Error(e) => return Err(e),
+                PumpAction::Error(e) => {
+                    // Try to drain trailing RFQ so connection recovers.
+                    for _ in 0..5 {
+                        if self.session.is_healthy() { break; }
+                        if let Ok(n) = self.stream.read(&mut self.read_buf).await {
+                            if n > 0 { let _ = self.session.feed(&self.read_buf[..n]); }
+                        }
+                        self.session.drain_to_idle();
+                    }
+                    return Err(e);
+                }
             }
         }
     }
