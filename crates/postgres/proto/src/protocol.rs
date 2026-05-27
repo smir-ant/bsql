@@ -9260,6 +9260,7 @@ fn push_within_fanout_budget<'w>(
         // reaching this arm.
         Err(_) => {
             core::hint::cold_path();
+            debug_assert!(false, "OutActions overflow — capacity const-assert broken");
         }
     }
 }
