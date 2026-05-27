@@ -150,6 +150,9 @@ impl Connection {
             }
             bsql_postgres_proto::SslClassified::Refused(_) => {
                 if config.ssl_mode == SslMode::Require { return Err(DriverError::SslRefused); }
+                #[cfg(debug_assertions)]
+                eprintln!("[bsql] WARNING: SSL refused by server, falling back to plain TCP. \
+                    Use SslMode::Require for production over untrusted networks.");
                 Ok(Stream::Plain(tcp))
             }
             _ => Err(DriverError::Io(std::io::Error::other("unexpected SSL response"))),

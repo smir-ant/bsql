@@ -1,13 +1,22 @@
 /// SSL negotiation mode.
+///
+/// # Security
+///
+/// `Prefer` silently falls back to plain TCP if the server refuses SSL.
+/// An active network attacker can forge the single-byte 'N' refusal
+/// (sent before TLS protects the stream), stripping SSL entirely.
+/// Use `Require` for production deployments over untrusted networks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Default)]
 pub enum SslMode {
-    /// No SSL. Plain TCP.
+    /// No SSL. Plain TCP. Use only for localhost/unix socket.
     Disable,
     /// Try SSL; fall back to plain TCP if server refuses.
+    /// **WARNING**: vulnerable to active SSL-stripping attacks.
+    /// Use `Require` for production over untrusted networks.
     #[default]
     Prefer,
-    /// Require SSL. Fail if server refuses.
+    /// Require SSL. Fail if server refuses. Safe against downgrade.
     Require,
 }
 
