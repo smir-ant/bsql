@@ -292,5 +292,101 @@ fn sql_generate_series_and_lateral() {
     c.close().expect("close");
 }
 
+#[test]
+#[ignore = "requires local PG"]
+fn sql_system_and_meta_queries() {
+    let mut c = $config_fn();
+
+    // SELECT version()
+    let r = c.query("SELECT version()").expect("version");
+    let v = r.rows[0].get_str(0).expect("version str");
+    assert!(v.contains("PostgreSQL"));
+
+    // current_database, current_user, current_timestamp
+    let r = c.query("SELECT current_database(), current_user, now()::text").expect("meta");
+    assert!(r.rows[0].get_str(0).is_some());
+    assert!(r.rows[0].get_str(1).is_some());
+    assert!(r.rows[0].get_str(2).is_some());
+
+    // pg_catalog queries
+    let r = c.query("SELECT count(*) FROM pg_catalog.pg_tables WHERE schemaname = 'pg_catalog'").expect("pg_tables");
+    assert!(r.rows[0].get_i64(0).is_some_and(|n| n > 0));
+
+    // information_schema
+    let r = c.query("SELECT count(*) FROM information_schema.tables WHERE table_schema = 'pg_catalog'").expect("info_schema");
+    assert!(r.rows[0].get_i64(0).is_some_and(|n| n > 0));
+
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn sql_edge_cases() {
+    let mut c = $config_fn();
+
+    // Empty string vs NULL
+    c.execute("CREATE TEMP TABLE edge(v text)").expect("create");
+    c.execute("INSERT INTO edge VALUES (''), (NULL), (' '), ('hello')").expect("ins");
+    let r = c.query("SELECT v FROM edge ORDER BY v NULLS FIRST").expect("q");
+    assert!(r.rows[0].is_null(0)); // NULL first
+    assert_eq!(r.rows[1].get_str(0), Some("")); // empty string
+    assert_eq!(r.rows[2].get_str(0), Some(" ")); // space
+
+    // Long text value (within WriteBuf capacity)
+    let long = "x".repeat(1_000);
+    c.execute("CREATE TEMP TABLE longval(v text)").expect("create");
+    c.execute_params("INSERT INTO longval VALUES ($1)", &(long.as_str(),)).expect("ins long");
+    let r = c.query("SELECT LENGTH(v) FROM longval").expect("len");
+    assert_eq!(r.rows[0].get_i32(0), Some(1_000));
+
+    // Unicode edge cases
+    let r = c.query("SELECT '🦀🐘'::text, E'tab\\there'::text, E'new\\nline'::text").expect("unicode");
+    assert_eq!(r.rows[0].get_str(0), Some("🦀🐘"));
+    assert!(r.rows[0].get_str(1).is_some_and(|s| s.contains('\t')));
+    assert!(r.rows[0].get_str(2).is_some_and(|s| s.contains('\n')));
+
+    // Numeric edge cases
+    let r = c.query("SELECT 2147483647::int, (-2147483647-1)::int, 9223372036854775807::bigint").expect("nums");
+    assert_eq!(r.rows[0].get_i32(0), Some(i32::MAX));
+    assert_eq!(r.rows[0].get_i32(1), Some(i32::MIN));
+    assert_eq!(r.rows[0].get_i64(2), Some(i64::MAX));
+
+    // Boolean
+    let r = c.query("SELECT true, false, NULL::bool").expect("bools");
+    assert_eq!(r.rows[0].get_bool(0), Some(true));
+    assert_eq!(r.rows[0].get_bool(1), Some(false));
+    assert!(r.rows[0].is_null(2));
+
+    // Empty result set
+    let r = c.query("SELECT 1 WHERE false").expect("empty");
+    assert_eq!(r.rows.len(), 0);
+
+    // Multiple columns same name (PG allows this)
+    let r = c.query("SELECT 1 AS x, 2 AS x").expect("dup cols");
+    assert_eq!(r.rows[0].get_i32(0), Some(1));
+    assert_eq!(r.rows[0].get_i32(1), Some(2));
+
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn sql_date_and_interval() {
+    let mut c = $config_fn();
+
+    let r = c.query("SELECT '2024-01-15'::date::text, '13:45:00'::time::text").expect("date/time");
+    assert_eq!(r.rows[0].get_str(0), Some("2024-01-15"));
+    assert_eq!(r.rows[0].get_str(1), Some("13:45:00"));
+
+    let r = c.query("SELECT '2024-01-15'::date + interval '1 month' + interval '2 days'").expect("interval");
+    assert!(r.rows[0].get_str(0).is_some());
+
+    // EXTRACT
+    let r = c.query("SELECT EXTRACT(YEAR FROM '2024-06-15'::date)::int").expect("extract");
+    assert_eq!(r.rows[0].get_i32(0), Some(2024));
+
+    c.close().expect("close");
+}
+
     }; // end macro
 }
