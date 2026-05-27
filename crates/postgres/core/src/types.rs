@@ -43,7 +43,7 @@ struct ArenaInner {
     data: Vec<u8>,
     slots: Vec<ColSlot>,
     n_cols: u16,
-    n_rows: u32,
+    _n_rows: u32,
 }
 
 // ─── Row ────────────────────────────────────────────────────
@@ -87,7 +87,7 @@ impl Row {
         if col >= n { return true; }
         let base = (self.row_idx as usize) * n;
         inner.slots.get(base + col)
-            .map_or(true, |s| s.len_plus_one.is_none())
+            .is_none_or(|s| s.len_plus_one.is_none())
     }
 
     pub fn len(&self) -> usize { usize::from(self.arena.n_cols) }
@@ -138,10 +138,10 @@ impl ArenaBuilder {
     /// Extend the last pushed column's data (for chunked columns).
     pub fn extend_last(&mut self, bytes: &[u8]) {
         self.data.extend_from_slice(bytes);
-        if let Some(slot) = self.slots.last_mut() {
-            if let Some(old_len) = slot.byte_len() {
-                *slot = ColSlot::value(slot.offset, old_len + bytes.len() as u32);
-            }
+        if let Some(slot) = self.slots.last_mut()
+            && let Some(old_len) = slot.byte_len()
+        {
+            *slot = ColSlot::value(slot.offset, old_len + bytes.len() as u32);
         }
     }
 
@@ -156,7 +156,7 @@ impl ArenaBuilder {
             data: self.data,
             slots: self.slots,
             n_cols: self.n_cols,
-            n_rows,
+            _n_rows: n_rows,
         });
         (0..n_rows)
             .map(|i| Row { arena: arena.clone(), row_idx: i })

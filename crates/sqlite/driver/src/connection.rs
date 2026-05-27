@@ -105,7 +105,7 @@ impl Row {
         match self.columns.get(idx)? {
             SqliteValue::Text(s) => Some(s.as_bytes()),
             SqliteValue::Blob(b) => Some(b.as_slice()),
-            SqliteValue::Integer(n) => None, // no raw bytes for integers
+            SqliteValue::Integer(_) => None,
             _ => None,
         }
     }

@@ -2,7 +2,7 @@ use bsql_postgres_core::{
     ConnectConfig, DriverError, Notification, PreparedStatement,
     PumpAction, QueryResult, Row, Session, SslMode,
 };
-use bsql_postgres_proto::{FeedEvent, PgProtocol};
+use bsql_postgres_proto::FeedEvent;
 use tokio::net::TcpStream;
 
 enum Stream {

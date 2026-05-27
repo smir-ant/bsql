@@ -5,7 +5,7 @@ use bsql_postgres_core::{
     ConnectConfig, DriverError, PreparedStatement,
     PumpAction, QueryResult, Row, Session, SslMode,
 };
-use bsql_postgres_proto::{FeedEvent, PgProtocol};
+use bsql_postgres_proto::FeedEvent;
 
 enum Stream {
     Plain(TcpStream),
