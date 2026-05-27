@@ -260,20 +260,6 @@ fn one_connection_everything() {
 
 #[test]
 #[ignore = "requires local PG"]
-fn wide_250_columns() {
-    let mut c = Connection::connect(&sync_config()).expect("connect");
-    let cols: Vec<String> = (0..250u32).map(|i| format!("{i}::int AS col_{i}")).collect();
-    let sql = format!("SELECT {}", cols.join(", "));
-    let r = c.query(&sql).expect("250 cols");
-    assert_eq!(r.rows.len(), 1);
-    assert_eq!(r.column_names.len(), 250);
-    assert_eq!(r.rows[0].get_i32(0), Some(0));
-    assert_eq!(r.rows[0].get_i32(249), Some(249));
-    c.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
 fn wide_columns() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     for n in [250u32, 500, 600, 800, 1000, 1600] {
