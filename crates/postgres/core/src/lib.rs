@@ -4,6 +4,7 @@
 pub mod config;
 pub mod error;
 pub mod session;
+pub mod ssl;
 pub mod types;
 
 pub use config::{ConnectConfig, SslMode};

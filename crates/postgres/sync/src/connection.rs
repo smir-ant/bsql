@@ -85,35 +85,19 @@ impl Connection {
     }
 
     fn negotiate_ssl(tcp: TcpStream, config: &ConnectConfig) -> Result<Stream, DriverError> {
-        let proto_disc = PgProtocol::<bsql_postgres_proto::DisconnectedPhase>::new();
-        let (ssl_bytes, ssl_proto) = proto_disc.push_ssl_request();
+        let (ssl_bytes, ssl_proto) = bsql_postgres_core::ssl::ssl_request_bytes();
         let mut tcp = tcp;
         tcp.write_all(ssl_bytes)?;
         let mut response = [0u8; 1];
         tcp.read_exact(&mut response)?;
-        let classified = ssl_proto.classify_ssl_response(response[0]);
-        match classified {
-            bsql_postgres_proto::SslClassified::Accepted(_) => {
-                let mut root_store = rustls::RootCertStore::empty();
-                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                let tls_config = rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth();
-                let server_name: rustls::pki_types::ServerName<'_> = config.host.clone().try_into()
-                    .map_err(|_| DriverError::Config("invalid server name for TLS"))?;
-                let tls_conn = rustls::ClientConnection::new(
-                    std::sync::Arc::new(tls_config), server_name,
-                ).map_err(|e| DriverError::Io(std::io::Error::other(format!("TLS: {e}"))))?;
+
+        match bsql_postgres_core::ssl::classify_ssl_response(ssl_proto, response[0], config)? {
+            bsql_postgres_core::ssl::SslProbe::Accepted { tls_config, server_name } => {
+                let tls_conn = rustls::ClientConnection::new(tls_config, server_name)
+                    .map_err(|e| DriverError::Io(std::io::Error::other(format!("TLS: {e}"))))?;
                 Ok(Stream::Tls(rustls::StreamOwned::new(tls_conn, tcp)))
             }
-            bsql_postgres_proto::SslClassified::Refused(_) => {
-                if config.ssl_mode == SslMode::Require { return Err(DriverError::SslRefused); }
-                #[cfg(debug_assertions)]
-                eprintln!("[bsql] WARNING: SSL refused by server, falling back to plain TCP. \
-                    Use SslMode::Require for production over untrusted networks.");
-                Ok(Stream::Plain(tcp))
-            }
-            _ => Err(DriverError::Io(std::io::Error::other("unexpected SSL response"))),
+            bsql_postgres_core::ssl::SslProbe::PlainTcp => Ok(Stream::Plain(tcp)),
         }
     }
 
