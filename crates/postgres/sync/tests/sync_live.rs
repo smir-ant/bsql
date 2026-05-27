@@ -704,3 +704,13 @@ fn connection_reuse_after_various_errors() {
 
     conn.close().expect("close");
 }
+
+// Shared SQL scenario tests — unified across async/sync
+fn make_sync_conn() -> Connection {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    Connection::connect(&config).expect("connect")
+}
+
+bsql_postgres_core::define_sync_sql_tests!(make_sync_conn);

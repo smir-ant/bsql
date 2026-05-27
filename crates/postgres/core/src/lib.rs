@@ -7,6 +7,8 @@
 //! `Row` (Arc-shared arena), `ConnectConfig`, `DriverError`, `ssl` module.
 //! Both `bsql-postgres-async` and `bsql-postgres-sync` depend on this.
 
+pub mod test_scenarios;
+
 pub mod config;
 pub mod error;
 pub mod session;
