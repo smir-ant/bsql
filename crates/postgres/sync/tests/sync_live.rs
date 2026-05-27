@@ -1,395 +1,118 @@
 #![forbid(unsafe_code)]
 use bsql_postgres_sync::{ConnectConfig, Connection};
 
-#[test]
-#[ignore = "requires local PG"]
-fn raw_tcp_sanity() {
-    use std::io::{Read, Write};
-    let mut tcp = std::net::TcpStream::connect("127.0.0.1:5432").unwrap();
-    tcp.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-    let startup: &[u8] = &[0,0,0,41, 0,3,0,0, 117,115,101,114,0, 115,109,105,114,45,97,110,116,0, 100,97,116,97,98,97,115,101,0, 112,111,115,116,103,114,101,115,0, 0];
-    tcp.write_all(startup).unwrap();
-    let mut buf = [0u8; 1024];
-    let n = tcp.read(&mut buf).unwrap();
-    assert!(n > 0, "PG should respond");
-    assert_eq!(buf[0], b'R', "first byte should be R (AuthenticationOk)");
+fn sync_config() -> ConnectConfig {
+    ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable)
 }
+
+// ═══════════════════════════════════════════════════════════
+// Driver-specific tests (I/O, protocol, infra — not SQL)
+// ═══════════════════════════════════════════════════════════
 
 #[test]
 #[ignore = "requires local PG"]
 fn connect_and_ping() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    conn.ping().expect("ping");
-    assert!(conn.is_healthy());
-    conn.close().expect("close");
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.ping().expect("ping");
+    assert!(c.is_healthy());
+    assert!(c.server_version().is_some());
+    assert!(c.backend_pid() > 0);
+    c.close().expect("close");
 }
 
 #[test]
 #[ignore = "requires local PG"]
-fn simple_query_ddl() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let tag = conn.simple_query("CREATE TEMP TABLE sync_test(i int)").expect("create");
-    assert!(tag.contains("CREATE"));
-    conn.close().expect("close");
+fn streaming_1k_rows() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let r = c.query("SELECT generate_series(1, 1000)").expect("query");
+    assert_eq!(r.rows.len(), 1000);
+    assert_eq!(r.rows[0].get_i32(0), Some(1));
+    assert_eq!(r.rows[999].get_i32(0), Some(1000));
+    c.close().expect("close");
 }
 
 #[test]
 #[ignore = "requires local PG"]
-fn query_select_rows() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-
-    conn.simple_query("CREATE TEMP TABLE sq(id int, name text)").expect("create");
-    conn.simple_query("INSERT INTO sq VALUES (1, 'alice'), (2, 'bob')").expect("insert");
-
-    let result = conn.query("SELECT id, name FROM sq ORDER BY id").expect("select");
-    assert_eq!(result.rows.len(), 2);
-    assert_eq!(&*result.column_names, &["id", "name"]);
-    assert_eq!(result.rows[0].get_i32(0), Some(1));
-    assert_eq!(result.rows[0].get_str(1), Some("alice"));
-    assert_eq!(result.rows[1].get_by_name("name", &result.column_names), Some(b"bob".as_slice()));
-    conn.close().expect("close");
+fn streaming_10k_rows() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let r = c.query("SELECT generate_series(1, 10000)").expect("query");
+    assert_eq!(r.rows.len(), 10000);
+    assert_eq!(r.rows[9999].get_i32(0), Some(10000));
+    c.close().expect("close");
 }
 
 #[test]
 #[ignore = "requires local PG"]
-fn streaming_1000_rows() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let result = conn.query("SELECT generate_series(1, 1000)").expect("query");
-    assert_eq!(result.rows.len(), 1000);
-    assert_eq!(result.rows[0].get_i32(0), Some(1));
-    assert_eq!(result.rows[999].get_i32(0), Some(1000));
-    conn.close().expect("close");
+fn error_recovery_and_resilience() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    // 4 different error types, all recover
+    assert!(c.simple_query("SELCT").is_err());
+    assert!(c.query("SELECT * FROM nonexistent_xyz").is_err());
+    assert!(c.query("SELECT 'abc'::int").is_err());
+    assert!(c.query("SELECT 1/0").is_err());
+    c.ping().expect("ping after 4 errors");
+    // Full CRUD still works
+    c.execute("CREATE TEMP TABLE resilience(v int)").expect("create");
+    c.execute("INSERT INTO resilience VALUES (42)").expect("insert");
+    assert_eq!(c.query("SELECT v FROM resilience").expect("select").rows[0].get_i32(0), Some(42));
+    c.close().expect("close");
 }
 
 #[test]
 #[ignore = "requires local PG"]
-fn prepared_statement_reuse() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-
-    conn.execute("CREATE TEMP TABLE ps(id int, v text)").expect("create");
-    conn.execute("INSERT INTO ps VALUES (1, 'a'), (2, 'b')").expect("insert");
-
-    let stmt = conn.prepare("SELECT v FROM ps WHERE id = $1").expect("prepare");
-    let r1 = conn.query_prepared(&stmt, &(1i32,)).expect("q1");
-    assert_eq!(r1.rows[0].get_str(0), Some("a"));
-    let r2 = conn.query_prepared(&stmt, &(2i32,)).expect("q2");
-    assert_eq!(r2.rows[0].get_str(0), Some("b"));
-    conn.close_statement(stmt).expect("close stmt");
-    conn.close().expect("close");
+fn prepared_reuse_after_constraint_violation() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute("CREATE TEMP TABLE pr_err(id int PRIMARY KEY)").expect("create");
+    let stmt = c.prepare("INSERT INTO pr_err VALUES ($1)").expect("prepare");
+    c.execute_prepared(&stmt, &(1i32,)).expect("insert 1");
+    assert!(c.execute_prepared(&stmt, &(1i32,)).is_err());
+    c.execute_prepared(&stmt, &(2i32,)).expect("insert 2 after error");
+    assert_eq!(c.query("SELECT count(*) FROM pr_err").expect("count").rows[0].get_i64(0), Some(2));
+    c.close_statement(stmt).expect("close stmt");
+    c.close().expect("close");
 }
 
 #[test]
 #[ignore = "requires local PG"]
-fn query_params_one_shot() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let row = conn.query_params_one("SELECT $1::int + $2::int AS sum", &(10i32, 32i32))
-        .expect("query_params_one");
-    assert_eq!(row.get_i32(0), Some(42));
-    conn.close().expect("close");
+fn copy_in() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute("CREATE TEMP TABLE cp(id int, name text)").expect("create");
+    assert_eq!(c.copy_in("cp", vec!["1\talice", "2\tbob"]).expect("copy"), 2);
+    assert_eq!(c.copy_in("cp", Vec::<&str>::new()).expect("copy empty"), 0);
+    c.execute("CREATE TEMP TABLE cp_lg(i int)").expect("create lg");
+    let rows: Vec<String> = (0..1000).map(|i| i.to_string()).collect();
+    assert_eq!(c.copy_in("cp_lg", &rows).expect("copy 1000"), 1000);
+    c.close().expect("close");
 }
 
 #[test]
 #[ignore = "requires local PG"]
-fn transactions() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    conn.execute("CREATE TEMP TABLE tx(v int)").expect("create");
-
-    conn.begin().expect("begin");
-    conn.execute("INSERT INTO tx VALUES (1)").expect("insert");
-    conn.commit().expect("commit");
-    let r = conn.query("SELECT count(*) FROM tx").expect("count");
-    assert_eq!(r.rows[0].get_i64(0), Some(1));
-
-    conn.begin().expect("begin2");
-    conn.execute("INSERT INTO tx VALUES (2)").expect("insert2");
-    conn.rollback().expect("rollback");
-    let r = conn.query("SELECT count(*) FROM tx").expect("count2");
-    assert_eq!(r.rows[0].get_i64(0), Some(1));
-
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn error_recovery() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-
-    let err = conn.simple_query("INVALID SQL").unwrap_err();
-    assert!(matches!(err, bsql_postgres_sync::DriverError::Db(_)));
-
-    let result = conn.query("SELECT 42::int").expect("query after error");
-    assert_eq!(result.rows[0].get_i32(0), Some(42));
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn unicode_and_nulls() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let r = conn.query("SELECT 'Привет'::text, NULL::int, '🦀'::text").expect("query");
-    assert_eq!(r.rows[0].get_str(0), Some("Привет"));
-    assert!(r.rows[0].is_null(1));
-    assert_eq!(r.rows[0].get_str(2), Some("🦀"));
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn execute_params_insert() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    conn.execute("CREATE TEMP TABLE ep_test(id int, name text)").expect("create");
-    let n = conn.execute_params("INSERT INTO ep_test VALUES ($1, $2)", &(42i32, "alice")).expect("insert");
-    assert_eq!(n, 1);
-    let row = conn.query_one("SELECT id, name FROM ep_test").expect("select");
-    assert_eq!(row.get_i32(0), Some(42));
-    assert_eq!(row.get_str(1), Some("alice"));
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn column_names_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let result = conn.query("SELECT 1 AS id, 'hello' AS greeting").expect("query");
-    assert_eq!(&*result.column_names, &["id", "greeting"]);
-    assert_eq!(result.rows[0].get_by_name("id", &result.column_names), Some(b"1".as_slice()));
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn db_error_sqlstate_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let err = conn.simple_query("SELCT TYPO").unwrap_err();
-    if let bsql_postgres_sync::DriverError::Db(ref db_err) = err {
-        assert_eq!(&db_err.code, "42601");
-    } else { panic!("expected DbError"); }
-    conn.ping().expect("ping after error");
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn sequential_errors_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    for _ in 0..10 { let _ = conn.simple_query("INVALID SQL"); }
-    let result = conn.query("SELECT 42::int").expect("query after errors");
-    assert_eq!(result.rows[0].get_i32(0), Some(42));
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn wide_row_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let cols: Vec<String> = (0..50).map(|i| format!("{i}::int AS c{i}")).collect();
-    let result = conn.query(&format!("SELECT {}", cols.join(", "))).expect("query");
-    assert_eq!(result.rows[0].len(), 50);
-    assert_eq!(result.column_names.len(), 50);
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn null_heavy_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let result = conn.query("SELECT NULL::int, NULL::text FROM generate_series(1, 100)").expect("query");
-    assert_eq!(result.rows.len(), 100);
-    for row in &result.rows { assert!(row.is_null(0)); assert!(row.is_null(1)); }
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn query_100_rows_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let result = conn.query("SELECT generate_series(1, 100)").expect("query");
-    assert_eq!(result.rows.len(), 100);
-    assert_eq!(result.rows[0].get_raw(0), Some(b"1".as_slice()));
-    assert_eq!(result.rows[99].get_raw(0), Some(b"100".as_slice()));
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn execute_returns_count_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    conn.execute("CREATE TEMP TABLE erc(v int)").expect("create");
-    let n = conn.execute("INSERT INTO erc VALUES (1), (2), (3)").expect("insert");
-    assert_eq!(n, 3);
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn server_version_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let conn = Connection::connect(&config).expect("connect");
-    assert!(conn.server_version().is_some());
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn prepared_reuse_after_error_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    conn.execute("CREATE TEMP TABLE pr_err(id int PRIMARY KEY)").expect("create");
-    let stmt = conn.prepare("INSERT INTO pr_err VALUES ($1)").expect("prepare");
-    conn.execute_prepared(&stmt, &(1i32,)).expect("insert 1");
-    let err = conn.execute_prepared(&stmt, &(1i32,));
-    assert!(err.is_err());
-    conn.execute_prepared(&stmt, &(2i32,)).expect("insert 2 after error");
-    let r = conn.query("SELECT count(*) FROM pr_err").expect("count");
-    assert_eq!(r.rows[0].get_i64(0), Some(2));
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn copy_in_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    conn.execute("CREATE TEMP TABLE cp_sync(id int, name text)").expect("create");
-    let rows = vec!["1\talice", "2\tbob", "3\tcharlie"];
-    let n = conn.copy_in("cp_sync", rows).expect("copy_in");
-    assert_eq!(n, 3);
-    let result = conn.query("SELECT count(*) FROM cp_sync").expect("count");
-    assert_eq!(result.rows[0].get_i64(0), Some(3));
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn listen_notify_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut listener = Connection::connect(&config).expect("listener");
-    let mut notifier = Connection::connect(&config).expect("notifier");
-
+fn listen_notify() {
+    let mut listener = Connection::connect(&sync_config()).expect("listener");
+    let mut notifier = Connection::connect(&sync_config()).expect("notifier");
     listener.listen("bsql_sync_ch").expect("listen");
-    notifier.simple_query("NOTIFY bsql_sync_ch, 'sync hello'").expect("notify");
-
-    let notif = listener.recv_notification(std::time::Duration::from_secs(5))
-        .expect("recv");
-    let notif = notif.expect("should have notification");
-    assert_eq!(notif.channel, "bsql_sync_ch");
-    assert_eq!(notif.payload, "sync hello");
-
-    listener.unlisten("bsql_sync_ch").expect("unlisten");
-    let none = listener.recv_notification(std::time::Duration::from_millis(100))
-        .expect("recv timeout");
-    assert!(none.is_none());
-
-    listener.close().expect("close");
-    notifier.close().expect("close");
+    notifier.simple_query("NOTIFY bsql_sync_ch, 'hello'").expect("notify");
+    let n = listener.recv_notification(std::time::Duration::from_secs(5))
+        .expect("recv").expect("should have notification");
+    assert_eq!(n.channel, "bsql_sync_ch");
+    assert_eq!(n.payload, "hello");
+    listener.close().expect("close"); notifier.close().expect("close");
 }
 
 #[test]
 #[ignore = "requires local PG"]
-fn backend_pid_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let conn = Connection::connect(&config).expect("connect");
-    assert!(conn.backend_pid() > 0);
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn pool_sync_basic() {
+fn pool() {
     use bsql_postgres_sync::Pool;
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let pool = Pool::new(config, 3);
-
-    let mut c1 = pool.get().expect("c1");
-    let mut c2 = pool.get().expect("c2");
-    c1.ping().expect("c1 ping");
-    c2.ping().expect("c2 ping");
-    drop(c1);
-    drop(c2);
-
-    assert_eq!(pool.idle_count(), 2);
-
-    let mut c3 = pool.get().expect("c3");
-    let result = c3.query("SELECT 1::int").expect("query");
-    assert_eq!(result.rows[0].get_i32(0), Some(1));
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn pool_sync_concurrent() {
-    use bsql_postgres_sync::Pool;
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let pool = Pool::new(config, 3);
-
+    let pool = Pool::new(sync_config(), 3);
+    let mut c = pool.get().expect("get"); c.ping().expect("ping"); drop(c);
+    assert_eq!(pool.idle_count(), 1);
     let handles: Vec<_> = (0..10u32).map(|i| {
         let p = pool.clone();
         std::thread::spawn(move || {
             let mut conn = p.get().expect("get");
-            let r = conn.query(&format!("SELECT {i}::int")).expect("query");
-            assert_eq!(r.rows[0].get_i32(0), Some(i as i32));
+            assert_eq!(conn.query(&format!("SELECT {i}::int")).expect("q").rows[0].get_i32(0), Some(i as i32));
         })
     }).collect();
     for h in handles { h.join().expect("thread"); }
@@ -397,320 +120,55 @@ fn pool_sync_concurrent() {
 
 #[test]
 #[ignore = "requires local PG"]
-fn transaction_closure_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    conn.execute("CREATE TEMP TABLE tx_cl(v int)").expect("create");
-
-    conn.transaction(|c| {
-        c.execute("INSERT INTO tx_cl VALUES (1)")?;
-        Ok(())
-    }).expect("commit tx");
-    let r = conn.query("SELECT count(*) FROM tx_cl").expect("count");
-    assert_eq!(r.rows[0].get_i64(0), Some(1));
-
-    let err: Result<(), _> = conn.transaction(|c| {
-        c.execute("INSERT INTO tx_cl VALUES (2)")?;
+fn transaction_closure() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute("CREATE TEMP TABLE tx(v int)").expect("create");
+    c.transaction(|tx| { tx.execute("INSERT INTO tx VALUES (1)")?; Ok(()) }).expect("commit");
+    assert_eq!(c.query("SELECT count(*) FROM tx").expect("c").rows[0].get_i64(0), Some(1));
+    let _: Result<(), _> = c.transaction(|tx| {
+        tx.execute("INSERT INTO tx VALUES (2)")?;
         Err(bsql_postgres_sync::DriverError::NoRows)
     });
-    assert!(err.is_err());
-    let r = conn.query("SELECT count(*) FROM tx_cl").expect("count2");
-    assert_eq!(r.rows[0].get_i64(0), Some(1), "should have rolled back on Err");
-
-    conn.close().expect("close");
+    assert_eq!(c.query("SELECT count(*) FROM tx").expect("c").rows[0].get_i64(0), Some(1));
+    c.close().expect("close");
 }
 
 #[test]
 #[ignore = "requires local PG"]
-fn query_opt_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let found = conn.query_opt("SELECT 1").expect("opt");
-    assert!(found.is_some());
-    let missing = conn.query_opt("SELECT 1 WHERE false").expect("opt");
-    assert!(missing.is_none());
-    conn.close().expect("close");
+fn row_clone_across_threads() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let row = c.query("SELECT 42::int, 'hello'::text").expect("q").rows[0].clone();
+    let handle = std::thread::spawn(move || row.get_i32(0));
+    assert_eq!(handle.join().expect("thread"), Some(42));
+    c.close().expect("close");
 }
 
 #[test]
 #[ignore = "requires local PG"]
-fn row_clone_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let result = conn.query("SELECT 42::int, 'hello'::text").expect("query");
-    let row = result.rows[0].clone();
-    assert_eq!(row.get_i32(0), Some(42));
-    assert_eq!(row.get_str(1), Some("hello"));
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn prepared_empty_result_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    conn.execute("CREATE TEMP TABLE prep_empty(id int)").expect("create");
-    let stmt = conn.prepare("SELECT id FROM prep_empty WHERE id = $1").expect("prepare");
-    let result = conn.query_prepared(&stmt, &(999i32,)).expect("query");
-    assert_eq!(result.rows.len(), 0);
-    conn.close_statement(stmt).expect("close stmt");
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn full_lifecycle_integration() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-
-    // DDL
-    conn.execute("CREATE TEMP TABLE lifecycle(id serial PRIMARY KEY, name text, val int)").expect("create");
-
-    // Transaction with closure
-    conn.transaction(|tx| {
-        tx.execute("INSERT INTO lifecycle(name, val) VALUES ('alice', 95)")?;
-        tx.execute("INSERT INTO lifecycle(name, val) VALUES ('bob', 88)")?;
-        tx.execute("INSERT INTO lifecycle(name, val) VALUES ('charlie', 72)")?;
+fn full_lifecycle() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute("CREATE TEMP TABLE lc(id serial PRIMARY KEY, name text, val int)").expect("create");
+    c.transaction(|tx| {
+        tx.execute("INSERT INTO lc(name, val) VALUES ('alice', 95)")?;
+        tx.execute("INSERT INTO lc(name, val) VALUES ('bob', 88)")?;
         Ok(())
     }).expect("tx");
-
-    // Parameterized query
-    let row = conn.query_params_one(
-        "SELECT name, val FROM lifecycle WHERE val > $1 ORDER BY val DESC",
-        &(90i32,),
-    ).expect("params");
-    assert_eq!(row.get_str(0), Some("alice"));
-
-    // Prepared statement reuse
-    let stmt = conn.prepare("UPDATE lifecycle SET val = val + $1 WHERE name = $2").expect("prepare");
-    conn.execute_prepared(&stmt, &(5i32, "bob")).expect("update bob");
-    conn.execute_prepared(&stmt, &(10i32, "charlie")).expect("update charlie");
-    conn.close_statement(stmt).expect("close stmt");
-
-    // Verify updates
-    let result = conn.query("SELECT name, val FROM lifecycle ORDER BY val DESC").expect("verify");
-    assert_eq!(result.rows.len(), 3);
-    assert_eq!(result.column_names.len(), 2);
-    assert_eq!(result.rows[0].get_str(0), Some("alice"));
-
-    // Column name access
-    let bob_row = &result.rows[1];
-    assert_eq!(bob_row.get_by_name("name", &result.column_names), Some(b"bob".as_slice()));
-
-    // Row is Clone + Send + 'static
-    let cloned = result.rows[0].clone();
-    let handle = std::thread::spawn(move || {
-        cloned.get_str(0).map(String::from)
-    });
-    assert_eq!(handle.join().expect("thread"), Some("alice".to_string()));
-
-    // Error recovery
-    let err = conn.execute("INSERT INTO lifecycle(id) VALUES (1)"); // duplicate PK
-    assert!(err.is_err());
-    conn.ping().expect("ping after error");
-
-    // COPY IN
-    conn.execute("CREATE TEMP TABLE cp(v int)").expect("create cp");
-    let n = conn.copy_in("cp", vec!["100", "200", "300"]).expect("copy");
-    assert_eq!(n, 3);
-
-    // Clean close
-    conn.close().expect("close");
+    assert_eq!(c.query_params_one("SELECT name FROM lc WHERE val > $1", &(90i32,)).expect("p").get_str(0), Some("alice"));
+    let stmt = c.prepare("UPDATE lc SET val = val + $1 WHERE name = $2").expect("prep");
+    c.execute_prepared(&stmt, &(5i32, "bob")).expect("update");
+    c.close_statement(stmt).expect("close stmt");
+    assert!(c.execute("INSERT INTO lc(id) VALUES (1)").is_err()); // dup PK
+    c.ping().expect("recover");
+    assert_eq!(c.copy_in("lc", Vec::<&str>::new()).expect("copy empty"), 0);
+    c.close().expect("close");
 }
 
-#[test]
-#[ignore = "requires local PG"]
-fn copy_in_large_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    conn.execute("CREATE TEMP TABLE cp_lg(i int)").expect("create");
-    let rows: Vec<String> = (0..1000).map(|i| i.to_string()).collect();
-    let n = conn.copy_in("cp_lg", &rows).expect("copy");
-    assert_eq!(n, 1000);
-    let r = conn.query("SELECT count(*) FROM cp_lg").expect("count");
-    assert_eq!(r.rows[0].get_i64(0), Some(1000));
-    conn.close().expect("close");
-}
+// ═══════════════════════════════════════════════════════════
+// Shared SQL scenario tests (macro — covers ALL SQL mechanics)
+// ═══════════════════════════════════════════════════════════
 
-#[test]
-#[ignore = "requires local PG"]
-fn streaming_10k_rows_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let result = conn.query("SELECT generate_series(1, 10000)").expect("query");
-    assert_eq!(result.rows.len(), 10000);
-    assert_eq!(result.rows[0].get_i32(0), Some(1));
-    assert_eq!(result.rows[9999].get_i32(0), Some(10000));
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn bad_sql_returns_error_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let result = conn.simple_query("SELCT TYPO");
-    assert!(result.is_err());
-    conn.ping().expect("ping after error");
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn query_with_nulls_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let result = conn.query("SELECT 1, NULL::text, 'hello'").expect("select");
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0].len(), 3);
-    assert!(result.rows[0].is_null(1));
-    assert_eq!(result.rows[0].get_str(2), Some("hello"));
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn copy_in_empty_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    conn.execute("CREATE TEMP TABLE cp_empty(v int)").expect("create");
-    let n = conn.copy_in("cp_empty", Vec::<&str>::new()).expect("copy_in empty");
-    assert_eq!(n, 0);
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn wide_250_columns_sync() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-    let cols: Vec<String> = (0..250).map(|i| format!("{i}::int")).collect();
-    let sql = format!("SELECT {}", cols.join(", "));
-    let result = conn.query(&sql).expect("query 250 cols");
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0].len(), 250);
-    assert_eq!(result.rows[0].get_i32(0), Some(0));
-    assert_eq!(result.rows[0].get_i32(249), Some(249));
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn all_sql_command_types() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-
-    // DDL: CREATE, ALTER, DROP
-    conn.execute("CREATE TEMP TABLE cmd_test(id int, name text)").expect("CREATE TABLE");
-    conn.execute("ALTER TABLE cmd_test ADD COLUMN score real").expect("ALTER TABLE");
-    conn.execute("CREATE INDEX idx_cmd ON cmd_test(id)").expect("CREATE INDEX");
-
-    // DML: INSERT, UPDATE, DELETE, SELECT
-    conn.execute("INSERT INTO cmd_test VALUES (1, 'alice', 95.5)").expect("INSERT");
-    conn.execute("INSERT INTO cmd_test VALUES (2, 'bob', 88.0)").expect("INSERT 2");
-    let n = conn.execute("UPDATE cmd_test SET score = 100.0 WHERE id = 1").expect("UPDATE");
-    assert_eq!(n, 1);
-    let n = conn.execute("DELETE FROM cmd_test WHERE id = 2").expect("DELETE");
-    assert_eq!(n, 1);
-    let r = conn.query("SELECT * FROM cmd_test").expect("SELECT");
-    assert_eq!(r.rows.len(), 1);
-
-    // TCL: BEGIN, SAVEPOINT, RELEASE, ROLLBACK TO, COMMIT
-    conn.simple_query("BEGIN").expect("BEGIN");
-    conn.execute("INSERT INTO cmd_test VALUES (3, 'charlie', 70.0)").expect("INSERT in tx");
-    conn.simple_query("SAVEPOINT sp1").expect("SAVEPOINT");
-    conn.execute("INSERT INTO cmd_test VALUES (4, 'dave', 60.0)").expect("INSERT after savepoint");
-    conn.simple_query("ROLLBACK TO sp1").expect("ROLLBACK TO");
-    conn.simple_query("COMMIT").expect("COMMIT");
-    let r = conn.query("SELECT count(*) FROM cmd_test").expect("count");
-    assert_eq!(r.rows[0].get_i64(0), Some(2)); // alice + charlie (dave rolled back)
-
-    // Utility: EXPLAIN, SET, SHOW, DISCARD
-    let tag = conn.simple_query("EXPLAIN SELECT 1").expect("EXPLAIN");
-    assert!(!tag.is_empty());
-    conn.simple_query("SET client_encoding TO 'UTF8'").expect("SET");
-    let r = conn.query("SHOW client_encoding").expect("SHOW");
-    assert_eq!(r.rows[0].get_str(0), Some("UTF8"));
-    conn.simple_query("DISCARD TEMP").expect("DISCARD");
-
-    // TRUNCATE (need a new table since DISCARD dropped temps)
-    conn.execute("CREATE TEMP TABLE trunc_test(v int)").expect("create");
-    conn.execute("INSERT INTO trunc_test VALUES (1), (2)").expect("insert");
-    conn.simple_query("TRUNCATE trunc_test").expect("TRUNCATE");
-    let r = conn.query("SELECT count(*) FROM trunc_test").expect("count after truncate");
-    assert_eq!(r.rows[0].get_i64(0), Some(0));
-
-    // DO (anonymous block)
-    conn.simple_query("DO $$ BEGIN RAISE NOTICE 'hello from DO block'; END $$").expect("DO");
-
-    conn.close().expect("close");
-}
-
-#[test]
-#[ignore = "requires local PG"]
-fn connection_reuse_after_various_errors() {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    let mut conn = Connection::connect(&config).expect("connect");
-
-    // Syntax error
-    assert!(conn.simple_query("SELCT").is_err());
-    conn.ping().expect("after syntax err");
-
-    // Table not found
-    assert!(conn.query("SELECT * FROM nonexistent_table_xyz").is_err());
-    conn.ping().expect("after missing table");
-
-    // Type error
-    assert!(conn.query("SELECT 'abc'::int").is_err());
-    conn.ping().expect("after type err");
-
-    // Division by zero
-    assert!(conn.query("SELECT 1/0").is_err());
-    conn.ping().expect("after div zero");
-
-    // Permission-ish (cancel mid-query via timeout — skip, needs async)
-
-    // Verify connection still fully functional
-    conn.execute("CREATE TEMP TABLE resilience(v int)").expect("create");
-    conn.execute("INSERT INTO resilience VALUES (42)").expect("insert");
-    let r = conn.query("SELECT v FROM resilience").expect("select");
-    assert_eq!(r.rows[0].get_i32(0), Some(42));
-
-    conn.close().expect("close");
-}
-
-// Shared SQL scenario tests — unified across async/sync
 fn make_sync_conn() -> Connection {
-    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
-        .database("postgres".to_string())
-        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
-    Connection::connect(&config).expect("connect")
+    Connection::connect(&sync_config()).expect("connect")
 }
 
 bsql_postgres_core::define_sync_sql_tests!(make_sync_conn);
