@@ -390,3 +390,5 @@ fn sql_date_and_interval() {
 
     }; // end macro
 }
+
+// Additional scenario added outside macro for special cases

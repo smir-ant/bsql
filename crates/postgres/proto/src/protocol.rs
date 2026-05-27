@@ -4743,6 +4743,16 @@ where
                             break;
                         }
                         _ => {
+                            if tag_byte == crate::wire::TAG_DATA_ROW.byte()
+                                && matches!(
+                                    *state,
+                                    ProtoState::SimpleQueryStreamingRows { .. }
+                                        | ProtoState::BindExecuteStreamingRows { .. }
+                                        | ProtoState::BindExecuteAwaitingDataOrCompleteSelect { .. }
+                                )
+                            {
+                                break;
+                            }
                             fail_inflight_no_readbuf(
                                 state,
                                 ProtocolError::FrameTooLarge { declared },

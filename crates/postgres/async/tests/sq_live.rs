@@ -171,3 +171,79 @@ async fn full_lifecycle() {
     c.ping().await.expect("recover");
     c.close().await.expect("close");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local PG"]
+async fn pool_stress_100_tasks() {
+    use bsql_postgres_async::Pool;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let pool = Pool::new(config, 5).await.expect("pool");
+    let handles: Vec<_> = (0..100u32).map(|i| {
+        let p = pool.clone();
+        tokio::spawn(async move {
+            let mut c = p.get().await.expect("get");
+            let r = c.query(&format!("SELECT {i}::int, pg_backend_pid()")).await.expect("q");
+            assert_eq!(r.rows[0].get_i32(0), Some(i as i32));
+        })
+    }).collect();
+    let mut ok = 0u32;
+    for h in handles { if h.await.is_ok() { ok += 1; } }
+    assert_eq!(ok, 100, "all 100 tasks should succeed");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn one_connection_everything() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    // DDL
+    c.execute("CREATE TEMP TABLE omni(id serial PRIMARY KEY, name text, val int, active bool)").await.expect("create");
+    c.execute("CREATE INDEX ON omni(val)").await.expect("index");
+
+    // DML
+    c.execute("INSERT INTO omni(name, val, active) VALUES ('a', 10, true)").await.expect("ins");
+    c.execute("INSERT INTO omni(name, val, active) VALUES ('b', 20, false)").await.expect("ins");
+    c.execute("INSERT INTO omni(name, val, active) VALUES ('c', 30, true)").await.expect("ins");
+    c.execute_params("INSERT INTO omni(name, val, active) VALUES ($1, $2, $3)", &("d", 40i32, true)).await.expect("params");
+
+    // Query
+    let r = c.query("SELECT count(*) FROM omni").await.expect("count");
+    assert_eq!(r.rows[0].get_i64(0), Some(4));
+
+    // Query with params
+    let r = c.query_params("SELECT name FROM omni WHERE val > $1 ORDER BY val", &(15i32,)).await.expect("qp");
+    assert_eq!(r.rows.len(), 3);
+
+    // Prepared
+    let stmt = c.prepare("SELECT name, val FROM omni WHERE active = $1 ORDER BY val").await.expect("prep");
+    let r = c.query_prepared(&stmt, &(true,)).await.expect("qprep");
+    assert_eq!(r.rows.len(), 3);
+    c.close_statement(stmt).await.expect("close stmt");
+
+    // Transaction (begin/commit)
+    c.begin().await.expect("begin");
+    c.execute("UPDATE omni SET val = val * 2 WHERE active").await.expect("update");
+    c.commit().await.expect("commit");
+    let r = c.query("SELECT SUM(val) FROM omni").await.expect("sum");
+    assert_eq!(r.rows[0].get_i64(0), Some(180));
+
+    // Error + recovery
+    assert!(c.query("SELECT * FROM nonexistent").await.is_err());
+    c.ping().await.expect("recover");
+
+    // COPY IN
+    c.execute("CREATE TEMP TABLE cp_omni(v int)").await.expect("create cp");
+    c.copy_in("cp_omni", vec!["1", "2", "3"]).await.expect("copy");
+
+    // Column names
+    let r = c.query("SELECT id, name, val FROM omni LIMIT 1").await.expect("cols");
+    assert_eq!(&*r.column_names, &["id", "name", "val"]);
+
+    // Row clone across task
+    let row = c.query("SELECT 'final'::text").await.expect("q").rows[0].clone();
+    let v = tokio::task::spawn(async move { row.get_str(0).map(String::from) }).await.expect("spawn");
+    assert_eq!(v, Some("final".to_string()));
+
+    c.close().await.expect("close");
+}

@@ -172,3 +172,116 @@ fn make_sync_conn() -> Connection {
 }
 
 bsql_postgres_core::define_sync_sql_tests!(make_sync_conn);
+
+#[test]
+#[ignore = "requires local PG"]
+fn pool_stress_100_tasks() {
+    use bsql_postgres_sync::Pool;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let pool = Pool::new(config, 3);
+
+    let handles: Vec<_> = (0..100u32).map(|i| {
+        let p = pool.clone();
+        std::thread::spawn(move || {
+            let mut c = p.get().expect("get");
+            let r = c.query(&format!("SELECT {i}::int, pg_backend_pid()")).expect("q");
+            assert_eq!(r.rows[0].get_i32(0), Some(i as i32));
+        })
+    }).collect();
+    let mut ok = 0u32;
+    for h in handles {
+        if h.join().is_ok() { ok += 1; }
+    }
+    assert_eq!(ok, 100, "all 100 tasks should succeed");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn one_connection_everything() {
+    // Single connection exercises every feature sequentially
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    // DDL
+    c.execute("CREATE TEMP TABLE omni(id serial PRIMARY KEY, name text, val int, active bool)").expect("create");
+    c.execute("CREATE INDEX ON omni(val)").expect("index");
+
+    // DML via execute
+    c.execute("INSERT INTO omni(name, val, active) VALUES ('a', 10, true)").expect("ins");
+    c.execute("INSERT INTO omni(name, val, active) VALUES ('b', 20, false)").expect("ins");
+    c.execute("INSERT INTO omni(name, val, active) VALUES ('c', 30, true)").expect("ins");
+
+    // DML via execute_params (uses typed binary encoding)
+    c.execute_params("INSERT INTO omni(name, val, active) VALUES ($1, $2, $3)", &("d", 40i32, true)).expect("params");
+
+    // Query
+    let r = c.query("SELECT count(*) FROM omni").expect("count");
+    assert_eq!(r.rows[0].get_i64(0), Some(4));
+
+    // Query with params
+    let r = c.query_params("SELECT name FROM omni WHERE val > $1 ORDER BY val", &(15i32,)).expect("qp");
+    assert_eq!(r.rows.len(), 3); // b, c, d
+
+    // Prepared
+    let stmt = c.prepare("SELECT name, val FROM omni WHERE active = $1 ORDER BY val").expect("prep");
+    let r = c.query_prepared(&stmt, &(true,)).expect("qprep");
+    assert_eq!(r.rows.len(), 3); // a, c, d
+    c.close_statement(stmt).expect("close stmt");
+
+    // Transaction
+    c.transaction(|tx| {
+        tx.execute("UPDATE omni SET val = val * 2 WHERE active")?;
+        Ok(())
+    }).expect("tx");
+    let r = c.query("SELECT SUM(val) FROM omni").expect("sum");
+    // a:20 + b:20(unchanged) + c:60 + d:80 = 180
+    assert_eq!(r.rows[0].get_i64(0), Some(180));
+
+    // Error + recovery
+    assert!(c.query("SELECT * FROM nonexistent").is_err());
+    c.ping().expect("recover");
+
+    // COPY IN
+    c.execute("CREATE TEMP TABLE cp_omni(v int)").expect("create cp");
+    c.copy_in("cp_omni", vec!["1", "2", "3"]).expect("copy");
+
+    // Column names
+    let r = c.query("SELECT id, name, val FROM omni LIMIT 1").expect("cols");
+    assert_eq!(&*r.column_names, &["id", "name", "val"]);
+
+    // Row clone across thread
+    let row = c.query("SELECT 'final'::text").expect("q").rows[0].clone();
+    let v = std::thread::spawn(move || row.get_str(0).map(String::from)).join().expect("thread");
+    assert_eq!(v, Some("final".to_string()));
+
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn wide_250_columns() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let cols: Vec<String> = (0..250u32).map(|i| format!("{i}::int AS col_{i}")).collect();
+    let sql = format!("SELECT {}", cols.join(", "));
+    let r = c.query(&sql).expect("250 cols");
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.column_names.len(), 250);
+    assert_eq!(r.rows[0].get_i32(0), Some(0));
+    assert_eq!(r.rows[0].get_i32(249), Some(249));
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn wide_500_columns() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let cols: Vec<String> = (0..500u32).map(|i| format!("{i}::int AS col_{i}")).collect();
+    let sql = format!("SELECT {}", cols.join(", "));
+    let r = c.query(&sql).expect("500 cols");
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.column_names.len(), 500);
+    assert_eq!(r.rows[0].get_i32(0), Some(0));
+    assert_eq!(r.rows[0].get_i32(499), Some(499));
+    c.close().expect("close");
+}

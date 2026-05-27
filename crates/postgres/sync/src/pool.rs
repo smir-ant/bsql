@@ -12,10 +12,14 @@ pub struct Pool {
 
 struct PoolInner {
     config: ConnectConfig,
-    connections: Mutex<VecDeque<Connection>>,
+    state: Mutex<PoolState>,
     available: Condvar,
     max_size: usize,
-    checked_out: Mutex<usize>,
+}
+
+struct PoolState {
+    connections: VecDeque<Connection>,
+    checked_out: usize,
 }
 
 impl Pool {
@@ -23,63 +27,64 @@ impl Pool {
         Self {
             inner: Arc::new(PoolInner {
                 config,
-                connections: Mutex::new(VecDeque::with_capacity(max_size)),
+                state: Mutex::new(PoolState {
+                    connections: VecDeque::with_capacity(max_size),
+                    checked_out: 0,
+                }),
                 available: Condvar::new(),
                 max_size,
-                checked_out: Mutex::new(0),
             }),
         }
     }
 
     pub fn get(&self) -> Result<PooledConnection, DriverError> {
-        loop {
-            {
-                let mut conns = self.inner.connections.lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                while let Some(conn) = conns.pop_front() {
+        let should_create = {
+            let mut state = self.inner.state.lock()
+                .unwrap_or_else(|e| e.into_inner());
+            loop {
+                while let Some(conn) = state.connections.pop_front() {
                     if conn.is_healthy() {
-                        let mut out = self.inner.checked_out.lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        *out += 1;
+                        state.checked_out += 1;
                         return Ok(PooledConnection {
                             conn: Some(conn),
                             pool: self.inner.clone(),
                         });
                     }
                 }
+
+                if state.connections.len() + state.checked_out < self.inner.max_size {
+                    state.checked_out += 1;
+                    break true;
+                }
+
+                state = self.inner.available.wait(state)
+                    .unwrap_or_else(|e| e.into_inner());
             }
+        };
 
-            let out = self.inner.checked_out.lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let total_conns = {
-                let conns = self.inner.connections.lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                conns.len() + *out
-            };
-            drop(out);
-
-            if total_conns < self.inner.max_size {
-                let conn = Connection::connect(&self.inner.config)?;
-                let mut out = self.inner.checked_out.lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                *out += 1;
-                return Ok(PooledConnection {
+        if should_create {
+            match Connection::connect(&self.inner.config) {
+                Ok(conn) => Ok(PooledConnection {
                     conn: Some(conn),
                     pool: self.inner.clone(),
-                });
+                }),
+                Err(e) => {
+                    let mut state = self.inner.state.lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    state.checked_out -= 1;
+                    self.inner.available.notify_one();
+                    Err(e)
+                }
             }
-
-            let conns = self.inner.connections.lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let _conns = self.inner.available.wait(conns)
-                .unwrap_or_else(|e| e.into_inner());
+        } else {
+            unreachable!()
         }
     }
 
     pub fn idle_count(&self) -> usize {
-        self.inner.connections.lock()
+        self.inner.state.lock()
             .unwrap_or_else(|e| e.into_inner())
-            .len()
+            .connections.len()
     }
 
     pub fn max_size(&self) -> usize {
@@ -114,14 +119,13 @@ impl DerefMut for PooledConnection {
 impl Drop for PooledConnection {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            let mut out = self.pool.checked_out.lock()
+            let mut state = self.pool.state.lock()
                 .unwrap_or_else(|e| e.into_inner());
-            *out = out.saturating_sub(1);
-
-            if conn.is_healthy()
-                && let Ok(mut conns) = self.pool.connections.lock() {
-                    conns.push_back(conn);
-                }
+            state.checked_out = state.checked_out.saturating_sub(1);
+            if conn.is_healthy() {
+                state.connections.push_back(conn);
+            }
+            drop(state);
             self.pool.available.notify_one();
         }
     }
