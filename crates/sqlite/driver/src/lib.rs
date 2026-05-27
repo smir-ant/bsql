@@ -4,5 +4,5 @@
 mod connection;
 mod error;
 
-pub use connection::{Connection, FromText, QueryResult, Row};
+pub use connection::{Connection, FromText, QueryResult, Row, SqliteValue};
 pub use error::SqliteError;

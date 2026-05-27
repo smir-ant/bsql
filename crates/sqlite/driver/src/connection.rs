@@ -27,43 +27,91 @@ pub struct QueryResult {
     pub column_names: Vec<String>,
 }
 
+/// Native SQLite value — no double-conversion.
+#[derive(Debug, Clone)]
+pub enum SqliteValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct Row {
-    columns: Vec<Option<Vec<u8>>>,
+    columns: Vec<SqliteValue>,
 }
 
 impl Row {
     pub fn get_str(&self, idx: usize) -> Option<&str> {
-        self.columns.get(idx)?.as_deref().and_then(|b| core::str::from_utf8(b).ok())
+        match self.columns.get(idx)? {
+            SqliteValue::Text(s) => Some(s.as_str()),
+            SqliteValue::Null => None,
+            _ => None,
+        }
+    }
+
+    /// Get text representation of any value type.
+    pub fn get_text(&self, idx: usize) -> Option<String> {
+        match self.columns.get(idx)? {
+            SqliteValue::Text(s) => Some(s.clone()),
+            SqliteValue::Integer(n) => Some(n.to_string()),
+            SqliteValue::Real(f) => Some(f.to_string()),
+            SqliteValue::Blob(_) => None,
+            SqliteValue::Null => None,
+        }
     }
 
     pub fn get_i32(&self, idx: usize) -> Option<i32> {
-        self.get_str(idx)?.parse().ok()
+        match self.columns.get(idx)? {
+            SqliteValue::Integer(n) => i32::try_from(*n).ok(),
+            SqliteValue::Text(s) => s.parse().ok(),
+            _ => None,
+        }
     }
 
     pub fn get_i64(&self, idx: usize) -> Option<i64> {
-        self.get_str(idx)?.parse().ok()
+        match self.columns.get(idx)? {
+            SqliteValue::Integer(n) => Some(*n),
+            SqliteValue::Text(s) => s.parse().ok(),
+            _ => None,
+        }
     }
 
     pub fn get_f64(&self, idx: usize) -> Option<f64> {
-        self.get_str(idx)?.parse().ok()
+        match self.columns.get(idx)? {
+            SqliteValue::Real(f) => Some(*f),
+            SqliteValue::Integer(n) => Some(*n as f64),
+            SqliteValue::Text(s) => s.parse().ok(),
+            _ => None,
+        }
     }
 
     pub fn get_bool(&self, idx: usize) -> Option<bool> {
-        match self.get_str(idx)? {
-            "1" | "true" | "TRUE" => Some(true),
-            "0" | "false" | "FALSE" => Some(false),
+        match self.columns.get(idx)? {
+            SqliteValue::Integer(0) => Some(false),
+            SqliteValue::Integer(1) => Some(true),
+            SqliteValue::Text(s) => match s.as_str() {
+                "1" | "true" | "TRUE" => Some(true),
+                "0" | "false" | "FALSE" => Some(false),
+                _ => None,
+            },
             _ => None,
         }
     }
 
     pub fn get_raw(&self, idx: usize) -> Option<&[u8]> {
-        self.columns.get(idx)?.as_deref()
+        match self.columns.get(idx)? {
+            SqliteValue::Text(s) => Some(s.as_bytes()),
+            SqliteValue::Blob(b) => Some(b.as_slice()),
+            SqliteValue::Integer(n) => None, // no raw bytes for integers
+            _ => None,
+        }
     }
 
     pub fn is_null(&self, idx: usize) -> bool {
-        matches!(self.columns.get(idx), Some(None))
+        matches!(self.columns.get(idx), Some(SqliteValue::Null) | None)
     }
 
     pub fn len(&self) -> usize {
@@ -75,7 +123,8 @@ impl Row {
     }
 
     pub fn get<T: FromText>(&self, idx: usize) -> Option<T> {
-        T::from_text(self.get_str(idx)?)
+        let text = self.get_text(idx)?;
+        T::from_text(&text)
     }
 
     pub fn get_by_name<'a>(&'a self, name: &str, column_names: &[String]) -> Option<&'a [u8]> {
@@ -211,17 +260,13 @@ fn read_row(row: &rusqlite::Row<'_>, col_count: usize) -> Result<Row, SqliteErro
     let mut columns = Vec::with_capacity(col_count);
     for i in 0..col_count {
         let val: Value = row.get(i)?;
-        columns.push(value_to_bytes(val));
+        columns.push(match val {
+            Value::Null => SqliteValue::Null,
+            Value::Integer(n) => SqliteValue::Integer(n),
+            Value::Real(f) => SqliteValue::Real(f),
+            Value::Text(s) => SqliteValue::Text(s),
+            Value::Blob(b) => SqliteValue::Blob(b),
+        });
     }
     Ok(Row { columns })
-}
-
-fn value_to_bytes(val: Value) -> Option<Vec<u8>> {
-    match val {
-        Value::Null => None,
-        Value::Integer(n) => Some(n.to_string().into_bytes()),
-        Value::Real(f) => Some(f.to_string().into_bytes()),
-        Value::Text(s) => Some(s.into_bytes()),
-        Value::Blob(b) => Some(b),
-    }
 }

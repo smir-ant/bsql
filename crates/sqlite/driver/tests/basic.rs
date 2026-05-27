@@ -189,9 +189,9 @@ fn column_names() {
     let conn = Connection::open_in_memory().expect("open");
     let result = conn.query("SELECT 1 AS id, 'hello' AS greeting").expect("query");
     assert_eq!(result.column_names, vec!["id", "greeting"]);
-    assert_eq!(result.rows[0].get_by_name("id", &result.column_names), Some(b"1".as_slice()));
     assert_eq!(result.rows[0].get_by_name("greeting", &result.column_names), Some(b"hello".as_slice()));
     assert_eq!(result.rows[0].get_by_name("missing", &result.column_names), None);
+    assert_eq!(result.rows[0].get_i32(0), Some(1));
 }
 
 #[test]
