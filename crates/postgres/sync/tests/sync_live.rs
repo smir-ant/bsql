@@ -397,30 +397,27 @@ fn pool_sync_concurrent() {
 
 #[test]
 #[ignore = "requires local PG"]
-fn transaction_raii_sync() {
+fn transaction_closure_sync() {
     let config = ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
         .ssl_mode(bsql_postgres_sync::SslMode::Disable);
     let mut conn = Connection::connect(&config).expect("connect");
-    conn.execute("CREATE TEMP TABLE tx_raii(v int)").expect("create");
+    conn.execute("CREATE TEMP TABLE tx_cl(v int)").expect("create");
 
-    // Committed transaction
-    {
-        let mut tx = conn.transaction().expect("begin");
-        tx.execute("INSERT INTO tx_raii VALUES (1)").expect("insert");
-        tx.commit().expect("commit");
-    }
-    let r = conn.query("SELECT count(*) FROM tx_raii").expect("count");
+    conn.transaction(|c| {
+        c.execute("INSERT INTO tx_cl VALUES (1)")?;
+        Ok(())
+    }).expect("commit tx");
+    let r = conn.query("SELECT count(*) FROM tx_cl").expect("count");
     assert_eq!(r.rows[0].get_i64(0), Some(1));
 
-    // Dropped transaction → auto-rollback
-    {
-        let mut tx = conn.transaction().expect("begin2");
-        tx.execute("INSERT INTO tx_raii VALUES (2)").expect("insert2");
-        // drop without commit
-    }
-    let r = conn.query("SELECT count(*) FROM tx_raii").expect("count2");
-    assert_eq!(r.rows[0].get_i64(0), Some(1), "should have auto-rolled back");
+    let err: Result<(), _> = conn.transaction(|c| {
+        c.execute("INSERT INTO tx_cl VALUES (2)")?;
+        Err(bsql_postgres_sync::DriverError::NoRows)
+    });
+    assert!(err.is_err());
+    let r = conn.query("SELECT count(*) FROM tx_cl").expect("count2");
+    assert_eq!(r.rows[0].get_i64(0), Some(1), "should have rolled back on Err");
 
     conn.close().expect("close");
 }

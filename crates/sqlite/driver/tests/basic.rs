@@ -235,43 +235,42 @@ fn unicode_values() {
 }
 
 #[test]
-fn transaction_raii_commit() {
+fn transaction_closure_commit() {
     let conn = Connection::open_in_memory().expect("open");
     conn.execute("CREATE TABLE t(v int)").expect("create");
-    {
-        let tx = conn.transaction().expect("begin");
-        tx.execute("INSERT INTO t VALUES (1)").expect("insert");
-        tx.commit().expect("commit");
-    }
+    conn.transaction(|c| {
+        c.execute("INSERT INTO t VALUES (1)")?;
+        Ok(())
+    }).expect("tx");
     let r = conn.query("SELECT count(*) FROM t").expect("count");
     assert_eq!(r.rows[0].get_i64(0), Some(1));
 }
 
 #[test]
-fn transaction_raii_rollback_on_drop() {
+fn transaction_closure_rollback_on_err() {
     let conn = Connection::open_in_memory().expect("open");
     conn.execute("CREATE TABLE t(v int)").expect("create");
     conn.execute("INSERT INTO t VALUES (1)").expect("seed");
-    {
-        let tx = conn.transaction().expect("begin");
-        tx.execute("INSERT INTO t VALUES (2)").expect("insert");
-        // tx drops without commit — auto-rollback
-    }
+    let err: Result<(), _> = conn.transaction(|c| {
+        c.execute("INSERT INTO t VALUES (2)")?;
+        Err(bsql_sqlite::SqliteError::Query("forced".to_string()))
+    });
+    assert!(err.is_err());
     let r = conn.query("SELECT count(*) FROM t").expect("count");
     assert_eq!(r.rows[0].get_i64(0), Some(1), "should have rolled back");
 }
 
 #[test]
-fn transaction_raii_explicit_rollback() {
+fn transaction_closure_return_value() {
     let conn = Connection::open_in_memory().expect("open");
     conn.execute("CREATE TABLE t(v int)").expect("create");
-    {
-        let tx = conn.transaction().expect("begin");
-        tx.execute("INSERT INTO t VALUES (1)").expect("insert");
-        tx.rollback().expect("rollback");
-    }
-    let r = conn.query("SELECT count(*) FROM t").expect("count");
-    assert_eq!(r.rows[0].get_i64(0), Some(0));
+    let count = conn.transaction(|c| {
+        c.execute("INSERT INTO t VALUES (1)")?;
+        c.execute("INSERT INTO t VALUES (2)")?;
+        let r = c.query("SELECT count(*) FROM t")?;
+        Ok(r.rows[0].get_i64(0).unwrap_or(0))
+    }).expect("tx");
+    assert_eq!(count, 2);
 }
 
 #[test]

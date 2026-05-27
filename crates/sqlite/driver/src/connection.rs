@@ -189,53 +189,21 @@ impl Connection {
         Ok(())
     }
 
-    /// Begin a transaction and return an RAII guard.
-    /// The guard rolls back on Drop if not committed.
-    pub fn transaction(&self) -> Result<Transaction<'_>, SqliteError> {
+    /// Execute a closure within a transaction. COMMIT on Ok, ROLLBACK on Err.
+    /// Tier-1 safety: transaction boundary = closure scope.
+    pub fn transaction<R>(
+        &self,
+        f: impl FnOnce(&Self) -> Result<R, SqliteError>,
+    ) -> Result<R, SqliteError> {
         self.inner.execute_batch("BEGIN")?;
-        Ok(Transaction { conn: self, committed: false })
+        match f(self) {
+            Ok(val) => { self.inner.execute_batch("COMMIT")?; Ok(val) }
+            Err(e) => { let _ = self.inner.execute_batch("ROLLBACK"); Err(e) }
+        }
     }
 
     pub fn close(self) -> Result<(), SqliteError> {
         self.inner.close().map_err(|(_conn, e)| SqliteError::Query(e.to_string()))
-    }
-}
-
-/// RAII transaction guard. Rolls back on Drop if not committed.
-pub struct Transaction<'conn> {
-    conn: &'conn Connection,
-    committed: bool,
-}
-
-impl<'conn> Transaction<'conn> {
-    pub fn execute(&self, sql: &str) -> Result<usize, SqliteError> {
-        self.conn.execute(sql)
-    }
-
-    pub fn execute_params(&self, sql: &str, params: &[&str]) -> Result<usize, SqliteError> {
-        self.conn.execute_params(sql, params)
-    }
-
-    pub fn query(&self, sql: &str) -> Result<QueryResult, SqliteError> {
-        self.conn.query(sql)
-    }
-
-    pub fn commit(mut self) -> Result<(), SqliteError> {
-        self.committed = true;
-        self.conn.commit()
-    }
-
-    pub fn rollback(mut self) -> Result<(), SqliteError> {
-        self.committed = true;
-        self.conn.rollback()
-    }
-}
-
-impl Drop for Transaction<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = self.conn.inner.execute_batch("ROLLBACK");
-        }
     }
 }
 

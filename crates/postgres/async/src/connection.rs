@@ -371,6 +371,20 @@ impl Connection {
     pub async fn commit(&mut self) -> Result<(), DriverError> { self.simple_query("COMMIT").await?; Ok(()) }
     pub async fn rollback(&mut self) -> Result<(), DriverError> { self.simple_query("ROLLBACK").await?; Ok(()) }
 
+    /// Execute an async closure within a transaction. COMMIT on Ok, ROLLBACK on Err.
+    /// Tier-1 safety: transaction boundary = closure scope.
+    pub async fn transaction<R, F, Fut>(&mut self, f: F) -> Result<R, DriverError>
+    where
+        F: FnOnce(&mut Self) -> Fut,
+        Fut: std::future::Future<Output = Result<R, DriverError>>,
+    {
+        self.simple_query("BEGIN").await?;
+        match f(self).await {
+            Ok(val) => { self.simple_query("COMMIT").await?; Ok(val) }
+            Err(e) => { let _ = self.simple_query("ROLLBACK").await; Err(e) }
+        }
+    }
+
     pub async fn listen(&mut self, channel: &str) -> Result<(), DriverError> {
         self.simple_query(&format!("LISTEN {channel}")).await?; Ok(())
     }
