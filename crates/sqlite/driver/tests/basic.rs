@@ -282,3 +282,29 @@ fn typed_get_from_text() {
     assert_eq!(row.get::<f64>(1), Some(3.14));
     assert_eq!(row.get::<String>(2), Some("hello".to_string()));
 }
+
+#[test]
+fn execute_batch_multi_statement() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute_batch("
+        CREATE TABLE a(v int);
+        CREATE TABLE b(v int);
+        INSERT INTO a VALUES (1);
+        INSERT INTO b VALUES (2);
+    ").expect("batch");
+    let r1 = conn.query("SELECT v FROM a").expect("a");
+    let r2 = conn.query("SELECT v FROM b").expect("b");
+    assert_eq!(r1.rows[0].get_i64(0), Some(1));
+    assert_eq!(r2.rows[0].get_i64(0), Some(2));
+}
+
+#[test]
+fn native_integer_access() {
+    let conn = Connection::open_in_memory().expect("open");
+    let r = conn.query("SELECT 42, 3.14, NULL").expect("query");
+    let row = &r.rows[0];
+    assert_eq!(row.get_i64(0), Some(42));
+    assert_eq!(row.get_f64(1), Some(3.14));
+    assert_eq!(row.get_f64(0), Some(42.0)); // Integer → f64 coercion
+    assert!(row.is_null(2));
+}

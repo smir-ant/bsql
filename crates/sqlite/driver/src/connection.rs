@@ -251,6 +251,11 @@ impl Connection {
         }
     }
 
+    /// Execute multiple SQL statements separated by semicolons.
+    pub fn execute_batch(&self, sql: &str) -> Result<(), SqliteError> {
+        self.inner.execute_batch(sql).map_err(SqliteError::from)
+    }
+
     pub fn close(self) -> Result<(), SqliteError> {
         self.inner.close().map_err(|(_conn, e)| SqliteError::Query(e.to_string()))
     }

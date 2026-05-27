@@ -421,3 +421,46 @@ fn transaction_closure_sync() {
 
     conn.close().expect("close");
 }
+
+#[test]
+#[ignore = "requires local PG"]
+fn query_opt_sync() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+    let found = conn.query_opt("SELECT 1").expect("opt");
+    assert!(found.is_some());
+    let missing = conn.query_opt("SELECT 1 WHERE false").expect("opt");
+    assert!(missing.is_none());
+    conn.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn row_clone_sync() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+    let result = conn.query("SELECT 42::int, 'hello'::text").expect("query");
+    let row = result.rows[0].clone();
+    assert_eq!(row.get_i32(0), Some(42));
+    assert_eq!(row.get_str(1), Some("hello"));
+    conn.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn prepared_empty_result_sync() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Disable);
+    let mut conn = Connection::connect(&config).expect("connect");
+    conn.execute("CREATE TEMP TABLE prep_empty(id int)").expect("create");
+    let stmt = conn.prepare("SELECT id FROM prep_empty WHERE id = $1").expect("prepare");
+    let result = conn.query_prepared(&stmt, &(999i32,)).expect("query");
+    assert_eq!(result.rows.len(), 0);
+    conn.close_statement(stmt).expect("close stmt");
+    conn.close().expect("close");
+}
