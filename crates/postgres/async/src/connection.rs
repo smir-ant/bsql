@@ -157,6 +157,7 @@ impl Connection {
         self.session.iter_rows(|rs| {
             let n_cols = rs.current_row_desc().map_or(0, |d| d.len());
             let mut ab = bsql_postgres_core::ArenaBuilder::new(n_cols);
+            let mut in_chunk = false;
             loop {
                 match rs.col_next() {
                     bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
@@ -166,6 +167,7 @@ impl Connection {
                         ab.push_null();
                     }
                     bsql_postgres_proto::ColEvent::EndRow => {
+                        in_chunk = false;
                         ab.end_row();
                     }
                     bsql_postgres_proto::ColEvent::EndQuery { .. } => {
@@ -180,9 +182,12 @@ impl Connection {
                                 continue;
                             }
                         }
-                    bsql_postgres_proto::ColEvent::Chunk { bytes, .. }
-                    | bsql_postgres_proto::ColEvent::ChunkEnd { bytes, .. } => {
+                    bsql_postgres_proto::ColEvent::Chunk { bytes, .. } => {
+                        if in_chunk { ab.extend_last(bytes); } else { ab.push_value(bytes); in_chunk = true; }
+                    }
+                    bsql_postgres_proto::ColEvent::ChunkEnd { bytes, .. } => {
                         ab.extend_last(bytes);
+                        in_chunk = false;
                     }
                     _ => {}
                 }

@@ -274,14 +274,17 @@ fn wide_250_columns() {
 
 #[test]
 #[ignore = "requires local PG"]
-fn wide_500_columns() {
+fn wide_columns() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    let cols: Vec<String> = (0..500u32).map(|i| format!("{i}::int AS col_{i}")).collect();
-    let sql = format!("SELECT {}", cols.join(", "));
-    let r = c.query(&sql).expect("500 cols");
-    assert_eq!(r.rows.len(), 1);
-    assert_eq!(r.column_names.len(), 500);
-    assert_eq!(r.rows[0].get_i32(0), Some(0));
-    assert_eq!(r.rows[0].get_i32(499), Some(499));
+    for n in [250u32, 500, 600, 800, 1000, 1600] {
+        let cols: Vec<String> = (0..n).map(|i| format!("{i}::int AS col_{i}")).collect();
+        let sql = format!("SELECT {}", cols.join(", "));
+        let r = c.query(&sql).unwrap_or_else(|e| panic!("{n} cols failed: {e}"));
+        assert_eq!(r.rows.len(), 1, "rows at {n} cols");
+        assert_eq!(r.column_names.len(), usize::try_from(n).unwrap(), "col names at {n}");
+        assert_eq!(r.rows[0].get_i32(0), Some(0), "first col at {n}");
+        let last = usize::try_from(n.saturating_sub(1)).unwrap();
+        assert_eq!(r.rows[0].get_i32(last), Some(n.saturating_sub(1) as i32), "last col at {n}");
+    }
     c.close().expect("close");
 }
