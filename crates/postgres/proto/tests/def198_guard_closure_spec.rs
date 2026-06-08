@@ -141,10 +141,7 @@ fn def198_simple_query_awaiting_classifies_busy() {
 
     let reply = proto.next_reply_id::<QueryKind>();
     proto.push_or_panic(
-        bsql_postgres_proto::push_command::SimpleQuery {
-            sql: "SELECT 1",
-            reply,
-        },
+        bsql_postgres_proto::push_command::SimpleQuery::new("SELECT 1", reply),
         &mut wb,
     );
 

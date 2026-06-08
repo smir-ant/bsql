@@ -26,7 +26,7 @@ fn select_1_offline_via_advance_then_iter_rows() {
     let q_reply = active.next_reply_id::<bsql_postgres_proto::reply_id::QueryKind>();
     let guard = active.as_ready().unwrap();
     let _actions = guard.push_command(
-        bsql_postgres_proto::push_command::SimpleQuery { sql: "SELECT 1", reply: q_reply },
+        bsql_postgres_proto::push_command::SimpleQuery::new("SELECT 1", q_reply),
         &mut wb,
     ).unwrap();
 

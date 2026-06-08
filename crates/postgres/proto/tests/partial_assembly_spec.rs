@@ -192,10 +192,7 @@ fn large_negotiate_protocol_version_frame(extra_option_name_len: usize) -> std::
 #[track_caller]
 fn push_simple_query(proto: &mut PgProtocol<bsql_postgres_proto::ActivePhase>, reply: ReplyId<QueryKind>, wb: &mut WriteBuf) {
     proto.push_or_panic(
-        bsql_postgres_proto::push_command::SimpleQuery {
-            sql: "SELECT 1",
-            reply,
-        },
+        bsql_postgres_proto::push_command::SimpleQuery::new("SELECT 1", reply),
         wb,
     );
     let bytes = wb.as_bytes();

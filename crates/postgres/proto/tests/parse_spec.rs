@@ -95,11 +95,7 @@ fn parse_setup(
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
     proto.push_or_panic(
-        bsql_postgres_proto::push_command::Parse {
-            stmt_name,
-            sql: sql_text,
-            reply,
-        },
+        bsql_postgres_proto::push_command::Parse::new(stmt_name, sql_text, reply),
         wb,
     );
     let bytes = wb.as_bytes();

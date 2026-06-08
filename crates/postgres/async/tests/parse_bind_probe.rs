@@ -22,11 +22,7 @@ fn parse_then_bind_execute_offline() {
     let pr = active.next_reply_id::<bsql_postgres_proto::reply_id::ParseKind>();
     let guard = active.as_ready().unwrap();
     let actions = guard.push_command(
-        bsql_postgres_proto::push_command::Parse {
-            stmt_name: bsql_postgres_proto::StmtName::default(),
-            sql: "INSERT INTO t VALUES ($1)",
-            reply: pr,
-        }, &mut wb).unwrap();
+        bsql_postgres_proto::push_command::Parse::new(bsql_postgres_proto::StmtName::default(), "INSERT INTO t VALUES ($1)", pr), &mut wb).unwrap();
     eprintln!("parse actions: {}", actions.len());
 
     // Simulate ParseComplete + RFQ

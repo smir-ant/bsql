@@ -106,6 +106,7 @@ dependencies = [
  "sha2",
  "simdutf8",
  "subtle",
+ "trybuild",
  "zeroize",
 ]
 

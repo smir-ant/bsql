@@ -80,6 +80,13 @@ base64ct = { workspace = true }
 # lib stays no_std. See workspace `Cargo.toml`.
 criterion = { workspace = true }
 
+# `trybuild` — golden compile-fail harness for the sole-path injection
+# seam: proves an EXTERNAL crate cannot struct-literal-construct
+# `SimpleQuery` / `Parse` (the `sql` field is `pub(crate)` → E0451), so the
+# only construction route is the explicit `::new` seam. Same harness
+# pattern as the derive crate's hostile-bypass probes. Dev-only.
+trybuild = { workspace = true }
+
 # -- Bench targets --
 # `harness = false` disables the default libtest bench runner; we
 # use criterion's own main-function runner instead (generates HTML

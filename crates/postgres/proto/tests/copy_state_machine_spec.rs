@@ -81,10 +81,7 @@ fn copy_out_full_cycle_state_transitions() {
     let (reply, _raw) = mint_reply::<bsql_postgres_proto::QueryKind>(&mut proto);
 
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "COPY users TO STDOUT",
-            reply,
-        },
+        SimpleQuery::new("COPY users TO STDOUT", reply),
         &mut wb,
     );
 
@@ -144,10 +141,7 @@ fn copy_in_full_cycle_state_transitions() {
     let (reply, _raw) = mint_reply::<bsql_postgres_proto::QueryKind>(&mut proto);
 
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "COPY users FROM STDIN",
-            reply,
-        },
+        SimpleQuery::new("COPY users FROM STDIN", reply),
         &mut wb,
     );
 
@@ -193,10 +187,7 @@ fn copy_out_data_chunks_surface_via_action() {
     let (reply, _raw) = mint_reply::<bsql_postgres_proto::QueryKind>(&mut proto);
 
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "COPY users TO STDOUT",
-            reply,
-        },
+        SimpleQuery::new("COPY users TO STDOUT", reply),
         &mut wb,
     );
 
@@ -250,10 +241,7 @@ fn copy_in_full_push_cycle() {
     let (reply, _raw) = mint_reply::<bsql_postgres_proto::QueryKind>(&mut proto);
 
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "COPY users FROM STDIN",
-            reply,
-        },
+        SimpleQuery::new("COPY users FROM STDIN", reply),
         &mut wb,
     );
 
@@ -333,10 +321,7 @@ fn push_copy_fail_rejects_embedded_nul() {
     let mut wb = WriteBuf::new();
     let (reply, _raw) = mint_reply::<bsql_postgres_proto::QueryKind>(&mut proto);
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "COPY users FROM STDIN",
-            reply,
-        },
+        SimpleQuery::new("COPY users FROM STDIN", reply),
         &mut wb,
     );
     let frame_g = copy_response_frame(TAG_COPY_IN_RESPONSE.byte(), 0, 1);
@@ -359,10 +344,7 @@ fn copy_out_rejects_malformed_response_header() {
     let (reply, _raw) = mint_reply::<bsql_postgres_proto::QueryKind>(&mut proto);
 
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "COPY users TO STDOUT",
-            reply,
-        },
+        SimpleQuery::new("COPY users TO STDOUT", reply),
         &mut wb,
     );
 
@@ -428,10 +410,7 @@ fn push_copy_fail_embedded_nul_rejects() {
     // Enter CopyInActive state via server CopyInResponse.
     let (reply, _raw) = mint_reply::<bsql_postgres_proto::QueryKind>(&mut proto);
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "COPY users FROM STDIN",
-            reply,
-        },
+        SimpleQuery::new("COPY users FROM STDIN", reply),
         &mut wb,
     );
     let gin = copy_response_frame(TAG_COPY_IN_RESPONSE.byte(), 0, 1);
@@ -456,10 +435,7 @@ fn push_copy_done_happy_path() {
 
     let (reply, _raw) = mint_reply::<bsql_postgres_proto::QueryKind>(&mut proto);
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "COPY users FROM STDIN",
-            reply,
-        },
+        SimpleQuery::new("COPY users FROM STDIN", reply),
         &mut wb,
     );
     let gin = copy_response_frame(TAG_COPY_IN_RESPONSE.byte(), 0, 1);
@@ -482,10 +458,7 @@ fn push_copy_fail_happy_path() {
 
     let (reply, _raw) = mint_reply::<bsql_postgres_proto::QueryKind>(&mut proto);
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "COPY users FROM STDIN",
-            reply,
-        },
+        SimpleQuery::new("COPY users FROM STDIN", reply),
         &mut wb,
     );
     let gin = copy_response_frame(TAG_COPY_IN_RESPONSE.byte(), 0, 1);

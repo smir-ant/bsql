@@ -54,10 +54,7 @@ fn batch_two_dml_statements_surfaces_intermediate() {
     // opaque to the protocol (server interprets); we exercise the
     // RESPONSE-side state machine.
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "BEGIN; COMMIT;",
-            reply,
-        },
+        SimpleQuery::new("BEGIN; COMMIT;", reply),
         &mut wb,
     );
 
@@ -112,10 +109,7 @@ fn batch_three_statements_surfaces_two_intermediates() {
     let (reply, _raw) = mint_reply::<bsql_postgres_proto::QueryKind>(&mut proto);
 
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "BEGIN; UPDATE t SET x=1; COMMIT;",
-            reply,
-        },
+        SimpleQuery::new("BEGIN; UPDATE t SET x=1; COMMIT;", reply),
         &mut wb,
     );
 
@@ -173,10 +167,7 @@ fn batch_with_empty_query_response_in_middle() {
     // as BEGIN + empty + COMMIT. Server emits CommandComplete("BEGIN")
     // + EmptyQueryResponse + CommandComplete("COMMIT") + RFQ.
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "BEGIN;;COMMIT;",
-            reply,
-        },
+        SimpleQuery::new("BEGIN;;COMMIT;", reply),
         &mut wb,
     );
 
@@ -233,10 +224,7 @@ fn single_statement_batch_no_intermediates() {
     let (reply, _raw) = mint_reply::<bsql_postgres_proto::QueryKind>(&mut proto);
 
     proto.push_or_panic(
-        SimpleQuery {
-            sql: "SELECT 1",
-            reply,
-        },
+        SimpleQuery::new("SELECT 1", reply),
         &mut wb,
     );
 

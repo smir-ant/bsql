@@ -936,11 +936,7 @@ fn describe_after_completed_parse_starts_clean() {
     use bsql_postgres_proto::ParseKind;
     let parse_reply = proto.next_reply_id::<ParseKind>();
     proto.push_or_panic(
-        bsql_postgres_proto::push_command::Parse {
-            stmt_name: stmt_unnamed(),
-            sql: "SELECT 1",
-            reply: parse_reply,
-        },
+        bsql_postgres_proto::push_command::Parse::new(stmt_unnamed(), "SELECT 1", parse_reply),
         &mut wb,
     );
     // Verify Parse+Sync layout.

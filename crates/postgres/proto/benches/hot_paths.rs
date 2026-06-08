@@ -303,10 +303,7 @@ fn bench_iter_rows_per_row_throughput(c: &mut Criterion) {
                 let mut wb = WriteBuf::new();
                 let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
-                    bsql_postgres_proto::push_command::SimpleQuery {
-                        sql: "SELECT x",
-                        reply,
-                    },
+                    bsql_postgres_proto::push_command::SimpleQuery::new("SELECT x", reply),
                     &mut wb,
                 );
                 let _ = black_box(push_out);
@@ -439,10 +436,7 @@ fn bench_iter_10cols_large_5kb_row(c: &mut Criterion) {
                 let mut wb = WriteBuf::new();
                 let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
-                    bsql_postgres_proto::push_command::SimpleQuery {
-                        sql: "SELECT x",
-                        reply,
-                    },
+                    bsql_postgres_proto::push_command::SimpleQuery::new("SELECT x", reply),
                     &mut wb,
                 );
                 let _ = black_box(push_out);
@@ -568,10 +562,7 @@ fn bench_iter_jsonb_1mb_streaming(c: &mut Criterion) {
                 let mut wb = WriteBuf::new();
                 let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
-                    bsql_postgres_proto::push_command::SimpleQuery {
-                        sql: "SELECT x",
-                        reply,
-                    },
+                    bsql_postgres_proto::push_command::SimpleQuery::new("SELECT x", reply),
                     &mut wb,
                 );
                 let _ = black_box(push_out);
@@ -667,10 +658,7 @@ fn bench_col_next_per_event_cost(c: &mut Criterion) {
                 let mut wb = WriteBuf::new();
                 let reply = proto.next_reply_id::<QueryKind>();
                 let push_out = proto.bench_push_or_panic(
-                    bsql_postgres_proto::push_command::SimpleQuery {
-                        sql: "SELECT x",
-                        reply,
-                    },
+                    bsql_postgres_proto::push_command::SimpleQuery::new("SELECT x", reply),
                     &mut wb,
                 );
                 let _ = black_box(push_out);
@@ -1849,10 +1837,7 @@ fn bench_interleaved_streaming(c: &mut Criterion) {
                 let mut wb = WriteBuf::new();
                 let reply = proto.next_reply_id::<QueryKind>();
                 let _ = proto.bench_push_or_panic(
-                    bsql_postgres_proto::push_command::SimpleQuery {
-                        sql: "SELECT x",
-                        reply,
-                    },
+                    bsql_postgres_proto::push_command::SimpleQuery::new("SELECT x", reply),
                     &mut wb,
                 );
                 let _ = proto.feed_bytes(&rowdesc, &mut wb);

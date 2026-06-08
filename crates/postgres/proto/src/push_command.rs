@@ -268,9 +268,33 @@ impl PushCommand for Ping {
 #[must_use = "a SimpleQuery has no effect until passed to push_command"]
 pub struct SimpleQuery<'a> {
     /// SQL text — borrowed; any length, zero-copy on the wire.
-    pub sql: &'a str,
+    ///
+    /// `pub(crate)`: external construction must go through
+    /// [`SimpleQuery::new`], so a bare `SimpleQuery { sql, .. }` struct
+    /// literal from another crate is a compile error (E0451). This is the
+    /// sole-path injection seam — there is no struct-literal back-door that
+    /// lets arbitrary runtime text reach the wire.
+    pub(crate) sql: &'a str,
     /// Correlator for the reply.
     pub reply: ReplyId<QueryKind>,
+}
+
+impl<'a> SimpleQuery<'a> {
+    /// Construct a Simple-Query command from raw SQL text.
+    ///
+    /// **Internal construction seam.** The safe, intended path is the
+    /// `prepared!` / `fragment!` macro or the Fragment builder, which admit
+    /// only validated SQL literals, closed identifiers, and `$N` params.
+    /// Hand-calling this with interpolated user data reintroduces SQL
+    /// injection — **tier-3-by-discipline**: cross-crate proc-macro hygiene
+    /// plus `forbid(unsafe_code)` cannot make the constructor unreachable,
+    /// but the `pub(crate)` `sql` field makes external struct-literal
+    /// construction a compile error (E0451), so this is the single explicit,
+    /// greppable raw-SQL entry point.
+    #[inline]
+    pub fn new(sql: &'a str, reply: ReplyId<QueryKind>) -> Self {
+        Self { sql, reply }
+    }
 }
 
 impl sealed::PushCommandSealed for SimpleQuery<'_> {}
@@ -310,9 +334,26 @@ pub struct Parse<'a> {
     /// per PG convention) or a validated `StmtName`.
     pub stmt_name: StmtName,
     /// SQL text — borrowed; any length, zero-copy on the wire.
-    pub sql: &'a str,
+    ///
+    /// `pub(crate)`: external construction must go through [`Parse::new`]
+    /// (same sole-path injection seam as [`SimpleQuery::new`]); a bare
+    /// `Parse { sql, .. }` struct literal from another crate is E0451.
+    pub(crate) sql: &'a str,
     /// Correlator for the reply.
     pub reply: ReplyId<ParseKind>,
+}
+
+impl<'a> Parse<'a> {
+    /// Construct a Parse command from a statement name + raw SQL text.
+    ///
+    /// **Internal construction seam** — same contract as
+    /// [`SimpleQuery::new`]: the safe path is the macro / Fragment builder;
+    /// this is the single explicit raw-SQL entry point (tier-3-by-discipline,
+    /// with external struct-literal construction blocked at compile time).
+    #[inline]
+    pub fn new(stmt_name: StmtName, sql: &'a str, reply: ReplyId<ParseKind>) -> Self {
+        Self { stmt_name, sql, reply }
+    }
 }
 
 impl sealed::PushCommandSealed for Parse<'_> {}

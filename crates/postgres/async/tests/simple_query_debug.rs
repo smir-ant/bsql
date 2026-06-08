@@ -29,10 +29,7 @@ fn simple_query_offline_create_table() {
     let q_reply = active.next_reply_id::<bsql_postgres_proto::reply_id::QueryKind>();
     let guard = active.as_ready().unwrap();
     let actions = guard.push_command(
-        bsql_postgres_proto::push_command::SimpleQuery {
-            sql: "CREATE TEMP TABLE x(i int)",
-            reply: q_reply,
-        },
+        bsql_postgres_proto::push_command::SimpleQuery::new("CREATE TEMP TABLE x(i int)", q_reply),
         &mut wb,
     ).unwrap();
 

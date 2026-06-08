@@ -334,10 +334,7 @@ fn scenario_iter_rows_100() {
     let reply = proto.next_reply_id::<QueryKind>();
     let push_out = bench_push_or_panic(
         &mut proto,
-        bsql_postgres_proto::push_command::SimpleQuery {
-            sql: "SELECT x",
-            reply,
-        },
+        bsql_postgres_proto::push_command::SimpleQuery::new("SELECT x", reply),
         &mut wb,
     );
     let _ = black_box(push_out);

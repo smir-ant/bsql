@@ -149,10 +149,7 @@ fn simple_query_setup(
     wb: &mut WriteBuf,
 ) -> std::vec::Vec<u8> {
     proto.push_or_panic(
-        bsql_postgres_proto::push_command::SimpleQuery {
-            sql: "SELECT 1",
-            reply,
-        },
+        bsql_postgres_proto::push_command::SimpleQuery::new("SELECT 1", reply),
         wb,
     );
     let bytes = wb.as_bytes();

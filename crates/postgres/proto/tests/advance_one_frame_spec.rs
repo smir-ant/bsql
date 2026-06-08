@@ -231,10 +231,7 @@ fn row_description_transitions_to_streaming_rows_event() {
     let mut wb = WriteBuf::new();
     let reply = proto.next_reply_id::<QueryKind>();
     proto.push_or_panic(
-        bsql_postgres_proto::push_command::SimpleQuery {
-            sql: "SELECT 1",
-            reply,
-        },
+        bsql_postgres_proto::push_command::SimpleQuery::new("SELECT 1", reply),
         &mut wb,
     );
 

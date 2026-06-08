@@ -56,7 +56,7 @@ fn empty_query_response_with_non_zero_body_classifies() {
     let sql = "SELECT 1";
     let reply = query_id(&mut proto);
     proto.push_or_panic(
-        bsql_postgres_proto::push_command::SimpleQuery { sql, reply },
+        bsql_postgres_proto::push_command::SimpleQuery::new(sql, reply),
         &mut wb,
     );
     // SimpleQuery emits a 'Q' frame; non-empty `wb` verifies the
@@ -99,7 +99,7 @@ fn parse_complete_with_non_zero_body_classifies() {
     let sql = "SELECT 1";
     let reply = parse_id(&mut proto);
     proto.push_or_panic(
-        bsql_postgres_proto::push_command::Parse { stmt_name: stmt, sql, reply },
+        bsql_postgres_proto::push_command::Parse::new(stmt, sql, reply),
         &mut wb,
     );
     // Parse emits a 'P' frame + 5 B Sync; non-empty `wb` confirms.

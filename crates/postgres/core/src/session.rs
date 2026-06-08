@@ -352,7 +352,7 @@ impl Session {
 
     pub fn push_simple_query(&mut self, sql: &str) -> Result<usize, DriverError> {
         let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::QueryKind>();
-        self.push_and_collect(bsql_postgres_proto::push_command::SimpleQuery { sql, reply })
+        self.push_and_collect(bsql_postgres_proto::push_command::SimpleQuery::new(sql, reply))
     }
 
     pub fn push_ping(&mut self) -> Result<usize, DriverError> {
@@ -366,7 +366,7 @@ impl Session {
         let stmt_name = bsql_postgres_proto::StmtName::try_from_str(&format!("_bsql_{id}"))
             .map_err(|_| DriverError::Config("generated stmt name invalid"))?;
         let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::ParseKind>();
-        let n = self.push_and_collect(bsql_postgres_proto::push_command::Parse { stmt_name, sql, reply })?;
+        let n = self.push_and_collect(bsql_postgres_proto::push_command::Parse::new(stmt_name, sql, reply))?;
         Ok((n, stmt_name))
     }
 
