@@ -306,16 +306,32 @@ pub(crate) enum DispatchOutcome {
     },
 }
 
+/// The next protocol state + the side-effect outcome a dispatch arm
+/// produces. Returning this by value makes "forgot to install the
+/// successor state" a compile error (an arm has no value to return
+/// without naming `next`) — the placeholder-Idle hazard is gone.
+///
+/// Built once per dispatched frame; consumed at the single tail of
+/// [`dispatch`], which writes `*state = next` and returns `outcome`.
+/// Every match arm and every sub-dispatcher (`dispatch_auth_*`,
+/// `advance_to_*`, [`install_errored`]) returns a `Transition` so
+/// the successor state is structurally inseparable from the outcome.
+pub(crate) struct Transition {
+    pub(crate) next: ProtoState,
+    pub(crate) outcome: DispatchOutcome,
+}
+
 /// `#[cold] #[inline]` helper centralising every
 /// `DispatchOutcome::Errored` construction **plus** the
-/// `*state = ProtoState::Errored(...)` install.
+/// `ProtoState::Errored(...)` successor.
 ///
-/// A naive shape where the helper only returns `DispatchOutcome`
-/// and the caller writes `*state = ProtoState::Errored(kind)` in
-/// the outer match arm would leave the seam open: an arm could
-/// forget to set Errored while returning `DispatchOutcome::Errored`.
-/// Installing the terminal state inside the helper keeps the seam
-/// tight.
+/// Returns a [`Transition`] whose `next` is the terminal
+/// `ProtoState::Errored(kind)` and whose `outcome` is the
+/// `DispatchOutcome::Errored`. Because the successor state rides
+/// inside the returned `Transition`, an arm that calls
+/// `install_errored` cannot return `DispatchOutcome::Errored`
+/// without also naming the Errored successor — the seam stays
+/// tight by construction.
 ///
 /// The `#[cold]` marker tells LLVM to push the Errored-path basic
 /// block out of the hot-path I-cache footprint; `#[inline]` keeps
@@ -326,10 +342,9 @@ pub(crate) enum DispatchOutcome {
 #[cold]
 #[inline]
 fn install_errored(
-    state: &mut ProtoState,
     reply_id: Option<core::num::NonZeroU64>,
     cause: ProtocolError,
-) -> DispatchOutcome {
+) -> Transition {
     // .b: `install_errored` does NOT park the cause into
     // the slot — that happens at materialise time when the
     // `StagedAction::FailReply { id, cause }` is transformed into the
@@ -337,12 +352,14 @@ fn install_errored(
     // the staged surface avoids threading `fail_cause_slot` through
     // every `compute_push_*` signature.
     //
-    // `install_errored`'s sole responsibility: write the Errored
+    // `install_errored`'s sole responsibility: name the Errored
     // state transition. The Caller-Drains-Cause discipline ensures
     // dispatch arms always pair `install_errored` with downstream
     // `StagedAction::FailReply` emission carrying the same cause.
-    *state = ProtoState::Errored(cause.state_kind());
-    DispatchOutcome::Errored { reply_id, cause }
+    Transition {
+        next: ProtoState::Errored(cause.state_kind()),
+        outcome: DispatchOutcome::Errored { reply_id, cause },
+    }
 }
 
 /// Zero-body-payload validator for PG §55.7 frames that carry no
@@ -408,27 +425,31 @@ fn validate_empty_body(
 /// entirely and shrinks the per-row hot-path by removing the dual
 /// arena lookup.
 ///
-/// # State by `&mut`
+/// # State by `&mut`, successor by `Transition`
 ///
 /// Dispatch takes `state: &mut ProtoState`, snaps the previous
 /// state via `core::mem::replace(state, ProtoState::Idle)` for
-/// pattern matching, then each arm writes `*state = new_state`
-/// directly — one store, no round trip. A naive
-/// `dispatch(prev: ProtoState) -> DispatchOutcome::Advanced* {
+/// pattern matching, then each arm RETURNS a [`Transition`] naming
+/// its successor state. The single tail (`*state = t.next; t.outcome`)
+/// performs the one and only state write — one store, no round trip.
+/// A naive `dispatch(prev: ProtoState) -> DispatchOutcome::Advanced* {
 /// new_state, ... }` shape would pay two 712 B memcpies per
 /// dispatch iteration — on 1M-row SELECT workloads, ~1.4 GB stack
 /// traffic purely for state round-tripping (and LLVM does NOT
 /// optimise it because `ProtoState` carries a non-trivial-move
-/// password buffer).
+/// password buffer). The `Transition` carries the successor by value
+/// too, but the move folds into the tail store (no intermediate
+/// `*state` writes anywhere else).
 ///
-/// Invariant: EVERY match arm must either (a) assign `*state =
-/// new_state` before returning `AdvancedSilent`/`AdvancedWithAction`,
-/// or (b) delegate to [`install_errored`] which installs
-/// `ProtoState::Errored(...)`. Forgetting to assign leaves state
-/// at the placeholder `Idle` — a silent regression class the
-/// compiler cannot catch. Mitigation: arm-body coverage tests
-/// across all transitions (the existing test suite exercises every
-/// `(state, tag)` pair reachable in the state machine).
+/// Invariant (now compiler-enforced): EVERY match arm must produce a
+/// [`Transition`] naming its successor — either inline
+/// (`Transition { next, outcome }`) or via a helper
+/// ([`install_errored`], the `dispatch_auth_*` sub-dispatchers, the
+/// `advance_to_*` helpers) that itself returns a `Transition`. An arm
+/// that forgot to name its successor has no value to return and fails
+/// to type-check — the prior placeholder-Idle hazard (silent
+/// transition to `Idle` on a missed `*state =`) is gone. The existing
+/// test suite still exercises every reachable `(state, tag)` pair.
 #[allow(
     clippy::too_many_arguments,
     reason = "Slot threading across the per-frame dispatch boundary \
@@ -492,17 +513,19 @@ pub(crate) fn dispatch(
     column_names_slot: &mut Option<alloc::boxed::Box<[alloc::string::String]>>,
 ) -> DispatchOutcome {
     // Snap owned prev for pattern matching; state slot holds the
-    // explicit `ProtoState::Idle` placeholder during the match.
-    // Every match arm below MUST `*state = <transition>` before
-    // returning a non-Errored outcome; `install_errored` handles
-    // Errored transitions.
+    // explicit `ProtoState::Idle` placeholder transiently — but no
+    // arm writes `*state`. Every arm instead RETURNS a `Transition`
+    // naming its successor state; the single tail write below installs
+    // `t.next`. An arm with no successor to name cannot produce a
+    // value of type `Transition`, so "forgot to install the state" is
+    // now a compile error, not a silent Idle regression.
     //
     // Use `mem::replace` (not `mem::take`) to make the placeholder
     // explicit — `mem::take` silently relies on the `Default` impl
     // returning `Idle`, and a future `Default` change could swap
     // placeholder semantics under us.
     let prev = core::mem::replace(state, ProtoState::Idle);
-    let outcome = match (prev, tag) {
+    let t: Transition = match (prev, tag) {
         // =============================================================
         // Ping flow
         // =============================================================
@@ -524,22 +547,24 @@ pub(crate) fn dispatch(
                         tx_status_slot,
                         tx_status,
                     );
-                    *state = ProtoState::Idle;
-                    DispatchOutcome::AdvancedWithAction {
-                        action: crate::action::deliver(
-                            id,
-                            crate::action::PongPayload,
-                        ),
+                    Transition {
+                        next: ProtoState::Idle,
+                        outcome: DispatchOutcome::AdvancedWithAction {
+                            action: crate::action::deliver(
+                                id,
+                                crate::action::PongPayload,
+                            ),
+                        },
                     }
                 }
-                Err(payload_len) => install_errored(state, Some(id.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
+                Err(payload_len) => install_errored(Some(id.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
             }
         }
         (ProtoState::PingAwaitingRfq(id), TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            install_errored(state, Some(id.consume()), cause)
+            install_errored(Some(id.consume()), cause)
         }
-        (ProtoState::PingAwaitingRfq(id), other) => install_errored(state, Some(id.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::PingAwaitingRfq(id), other) => install_errored(Some(id.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // ConnectingStartupTrust — awaiting AuthenticationOk
@@ -548,16 +573,16 @@ pub(crate) fn dispatch(
         // classification.)
         // =============================================================
         (ProtoState::ConnectingStartupTrust { reply }, TAG_AUTHENTICATION) => {
-            dispatch_auth_in_startup_trust(state, reply, payload)
+            dispatch_auth_in_startup_trust(reply, payload)
         }
         (ProtoState::ConnectingStartupTrust { reply }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            install_errored(state, Some(reply.consume()), cause)
+            install_errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingStartupTrust { reply }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
+            install_errored(Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
         }
-        (ProtoState::ConnectingStartupTrust { reply }, other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::ConnectingStartupTrust { reply }, other) => install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // ConnectingStartupScram — awaiting AuthenticationSASL
@@ -572,16 +597,16 @@ pub(crate) fn dispatch(
             // the variant — variant-carries-field is tier-1 compile
             // (CREDO §1). No drift classifier needed: the variant
             // cannot exist without its SCRAM session.
-            dispatch_auth_in_startup_scram(state, reply, scram, payload, reserved)
+            dispatch_auth_in_startup_scram(reply, scram, payload, reserved)
         }
         (ProtoState::ConnectingStartupScram { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            install_errored(state, Some(reply.consume()), cause)
+            install_errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingStartupScram { reply, .. }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
+            install_errored(Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
         }
-        (ProtoState::ConnectingStartupScram { reply, .. }, other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::ConnectingStartupScram { reply, .. }, other) => install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // ConnectingStartupCleartext — awaiting
@@ -598,29 +623,29 @@ pub(crate) fn dispatch(
             // Box into the per-variant dispatcher, which builds the
             // `PasswordMessage` frame and drops the Box at scope end
             // (Drop chain scrubs the password bytes).
-            dispatch_auth_in_startup_cleartext(state, reply, password, payload, reserved)
+            dispatch_auth_in_startup_cleartext(reply, password, payload, reserved)
         }
         (ProtoState::ConnectingStartupCleartext { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            install_errored(state, Some(reply.consume()), cause)
+            install_errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingStartupCleartext { reply, .. }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
+            install_errored(Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
         }
-        (ProtoState::ConnectingStartupCleartext { reply, .. }, other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::ConnectingStartupCleartext { reply, .. }, other) => install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // ConnectingCleartextAwaitingAuthOk — PasswordMessage sent;
         // awaiting AuthenticationOk.
         // =============================================================
         (ProtoState::ConnectingCleartextAwaitingAuthOk(reply), TAG_AUTHENTICATION) => {
-            dispatch_auth_ok_after_cleartext(state, reply, payload)
+            dispatch_auth_ok_after_cleartext(reply, payload)
         }
         (ProtoState::ConnectingCleartextAwaitingAuthOk(reply), TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            install_errored(state, Some(reply.consume()), cause)
+            install_errored(Some(reply.consume()), cause)
         }
-        (ProtoState::ConnectingCleartextAwaitingAuthOk(reply), other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::ConnectingCleartextAwaitingAuthOk(reply), other) => install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // ConnectingStartupMd5 — awaiting AuthenticationMD5Password.
@@ -635,29 +660,29 @@ pub(crate) fn dispatch(
             // dispatcher; the Box drops at function-return through
             // the ZeroizeOnDrop chain (Box::drop → md5 state drop →
             // Sensitive::drop → Password::drop).
-            dispatch_auth_in_startup_md5(state, reply, handshake, payload, reserved)
+            dispatch_auth_in_startup_md5(reply, handshake, payload, reserved)
         }
         (ProtoState::ConnectingStartupMd5 { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            install_errored(state, Some(reply.consume()), cause)
+            install_errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingStartupMd5 { reply, .. }, TAG_NEGOTIATE_PROTOCOL_VERSION) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
+            install_errored(Some(reply.consume()), ProtocolError::UnsupportedProtocolOption)
         }
-        (ProtoState::ConnectingStartupMd5 { reply, .. }, other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::ConnectingStartupMd5 { reply, .. }, other) => install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // ConnectingMd5AwaitingAuthOk — PasswordMessage sent;
         // awaiting AuthenticationOk.
         // =============================================================
         (ProtoState::ConnectingMd5AwaitingAuthOk(reply), TAG_AUTHENTICATION) => {
-            dispatch_auth_ok_after_md5(state, reply, payload)
+            dispatch_auth_ok_after_md5(reply, payload)
         }
         (ProtoState::ConnectingMd5AwaitingAuthOk(reply), TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            install_errored(state, Some(reply.consume()), cause)
+            install_errored(Some(reply.consume()), cause)
         }
-        (ProtoState::ConnectingMd5AwaitingAuthOk(reply), other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::ConnectingMd5AwaitingAuthOk(reply), other) => install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // SCRAM: awaiting server-first-message
@@ -681,7 +706,6 @@ pub(crate) fn dispatch(
             // firing `ScramSession::Drop` with `ZeroizeOnDrop` scrub
             // of the password.
             dispatch_auth_sasl_continue(
-                state,
                 reply,
                 &scram,
                 payload,
@@ -690,10 +714,10 @@ pub(crate) fn dispatch(
         }
         (ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            install_errored(state, Some(reply.consume()), cause)
+            install_errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingScramAwaitingServerFirst { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
@@ -708,27 +732,27 @@ pub(crate) fn dispatch(
         ) => {
             // `expected_server_sig` destructured inline — tier-1
             // variant-carries-field.
-            dispatch_auth_sasl_final(state, reply, *expected_server_sig, payload, error_arena_slot)
+            dispatch_auth_sasl_final(reply, *expected_server_sig, payload, error_arena_slot)
         }
         (ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            install_errored(state, Some(reply.consume()), cause)
+            install_errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingScramAwaitingServerFinal { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
         // SCRAM: awaiting AuthenticationOk after server sig verified
         // =============================================================
         (ProtoState::ConnectingScramAwaitingAuthOk(reply), TAG_AUTHENTICATION) => {
-            dispatch_auth_ok_after_scram(state, reply, payload)
+            dispatch_auth_ok_after_scram(reply, payload)
         }
         (ProtoState::ConnectingScramAwaitingAuthOk(reply), TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            install_errored(state, Some(reply.consume()), cause)
+            install_errored(Some(reply.consume()), cause)
         }
-        (ProtoState::ConnectingScramAwaitingAuthOk(reply), other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::ConnectingScramAwaitingAuthOk(reply), other) => install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // Post-auth: waiting for BackendKeyData
@@ -743,21 +767,23 @@ pub(crate) fn dispatch(
                     // Wrap the secret_key in Sensitive so the
                     // variant's storage scrubs on drop (state
                     // transition).
-                    *state = ProtoState::ConnectingPostAuthHaveKey {
-                        reply,
-                        pid,
-                        secret_key: crate::sensitive::Sensitive::new(secret_key),
-                    };
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::ConnectingPostAuthHaveKey {
+                            reply,
+                            pid,
+                            secret_key: crate::sensitive::Sensitive::new(secret_key),
+                        },
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::ConnectingPostAuthAwaitingKey(reply), TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            install_errored(state, Some(reply.consume()), cause)
+            install_errored(Some(reply.consume()), cause)
         }
-        (ProtoState::ConnectingPostAuthAwaitingKey(reply), other) => install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::ConnectingPostAuthAwaitingKey(reply), other) => install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // Post-auth: have BackendKeyData, waiting for ReadyForQuery
@@ -852,37 +878,39 @@ pub(crate) fn dispatch(
                         tx_status_slot,
                         tx_status,
                     );
-                    *state = ProtoState::HandshakeReady {
-                        pid,
-                        secret_key: crate::sensitive::Sensitive::new(*secret_key_inner),
-                    };
-                    DispatchOutcome::AdvancedWithAction {
-                        action: crate::action::deliver(
-                            reply,
-                            crate::action::StartupCompletePayload {
-                                pid,
-                                secret_key: *secret_key_inner,
-                                // exception: tx_status
-                                // kept inline ONLY on StartupComplete
-                                // because Connecting phase has no
-                                // persistent slot. Other Reply variants
-                                // strip the field; callers query via
-                                // PgProtocol::terminal_tx_status post-
-                                // into_active().
-                                tx_status,
-                            },
-                        ),
+                    Transition {
+                        next: ProtoState::HandshakeReady {
+                            pid,
+                            secret_key: crate::sensitive::Sensitive::new(*secret_key_inner),
+                        },
+                        outcome: DispatchOutcome::AdvancedWithAction {
+                            action: crate::action::deliver(
+                                reply,
+                                crate::action::StartupCompletePayload {
+                                    pid,
+                                    secret_key: *secret_key_inner,
+                                    // exception: tx_status
+                                    // kept inline ONLY on StartupComplete
+                                    // because Connecting phase has no
+                                    // persistent slot. Other Reply variants
+                                    // strip the field; callers query via
+                                    // PgProtocol::terminal_tx_status post-
+                                    // into_active().
+                                    tx_status,
+                                },
+                            ),
+                        },
                     }
                 }
-                Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
+                Err(payload_len) => install_errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
             }
         }
         (ProtoState::ConnectingPostAuthHaveKey { reply, .. }, TAG_ERROR_RESPONSE) => {
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            install_errored(state, Some(reply.consume()), cause)
+            install_errored(Some(reply.consume()), cause)
         }
         (ProtoState::ConnectingPostAuthHaveKey { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
@@ -918,17 +946,19 @@ pub(crate) fn dispatch(
                         row_desc,
                     );
                     *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
-                    *state = ProtoState::SimpleQueryStreamingRows { reply };
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::SimpleQueryStreamingRows { reply },
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_COMMAND_COMPLETE) => {
             // DML path: no RowDescription frame fired, so
             // row_desc_slot remained `None` since the last Idle
             // entry — materialise emits Reply with `row_desc = None`.
-            advance_to_awaiting_rfq(state, reply, payload, command_tag_slot)
+            advance_to_awaiting_rfq(reply, payload, command_tag_slot)
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_EMPTY_QUERY_RESPONSE) => {
             // PG §55.7 EmptyQueryResponse has a zero-body payload.
@@ -947,14 +977,16 @@ pub(crate) fn dispatch(
                             crate::command_tag::CommandTag::EMPTY,
                         ),
                     );
-                    *state = ProtoState::SimpleQueryAwaitingRfq { reply };
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::SimpleQueryAwaitingRfq { reply },
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         // COPY entry points: 'H' = CopyOutResponse,
         // 'G' = CopyInResponse. Parse + validate the header (format
@@ -966,23 +998,27 @@ pub(crate) fn dispatch(
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_COPY_OUT_RESPONSE) => {
             match crate::decode::parse_copy_response_header(payload) {
                 Ok(_header) => {
-                    *state = ProtoState::SimpleQueryCopyOutStreaming(reply);
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::SimpleQueryCopyOutStreaming(reply),
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_COPY_IN_RESPONSE) => {
             match crate::decode::parse_copy_response_header(payload) {
                 Ok(_header) => {
-                    *state = ProtoState::SimpleQueryCopyInActive(reply);
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::SimpleQueryCopyInActive(reply),
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // COPY OUT state-machine arms.
@@ -1008,46 +1044,52 @@ pub(crate) fn dispatch(
             };
             match arena.alloc(payload_bytes) {
                 Some(chunk_ref) => {
-                    *state = ProtoState::SimpleQueryCopyOutStreaming(reply);
-                    DispatchOutcome::AdvancedWithAction {
-                        action: crate::action::StagedAction::CopyDataChunk { chunk_ref },
+                    Transition {
+                        next: ProtoState::SimpleQueryCopyOutStreaming(reply),
+                        outcome: DispatchOutcome::AdvancedWithAction {
+                            action: crate::action::StagedAction::CopyDataChunk { chunk_ref },
+                        },
                     }
                 }
                 None => {
                     // Arena exhausted (rare; per-cycle cap).
                     core::hint::cold_path();
-                    *state = ProtoState::SimpleQueryCopyOutStreaming(reply);
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::SimpleQueryCopyOutStreaming(reply),
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
             }
         }
         (ProtoState::SimpleQueryCopyOutStreaming(reply), TAG_COPY_DONE) => {
             match validate_empty_body(payload, TAG_COPY_DONE) {
                 Ok(()) => {
-                    *state = ProtoState::SimpleQueryCopyOutAwaitingCC(reply);
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::SimpleQueryCopyOutAwaitingCC(reply),
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryCopyOutStreaming(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         (ProtoState::SimpleQueryCopyOutStreaming(reply), other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // CopyOutAwaitingCC: server sends `CommandComplete` carrying
         // the row count (e.g. `"COPY 1000"`), transitions into the
         // standard `SimpleQueryAwaitingRfq` tail state.
         (ProtoState::SimpleQueryCopyOutAwaitingCC(reply), TAG_COMMAND_COMPLETE) => {
-            advance_to_awaiting_rfq(state, reply, payload, command_tag_slot)
+            advance_to_awaiting_rfq(reply, payload, command_tag_slot)
         }
         (ProtoState::SimpleQueryCopyOutAwaitingCC(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         (ProtoState::SimpleQueryCopyOutAwaitingCC(reply), other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // COPY IN state-machine arms.
@@ -1059,13 +1101,13 @@ pub(crate) fn dispatch(
         // the client's `CopyDone`. State stays in `CopyInActive`
         // through the entire client push phase.
         (ProtoState::SimpleQueryCopyInActive(reply), TAG_COMMAND_COMPLETE) => {
-            advance_to_awaiting_rfq(state, reply, payload, command_tag_slot)
+            advance_to_awaiting_rfq(reply, payload, command_tag_slot)
         }
         (ProtoState::SimpleQueryCopyInActive(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         (ProtoState::SimpleQueryCopyInActive(reply), other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // StreamingRows: C / E — any other tag (including DataRow
@@ -1081,13 +1123,13 @@ pub(crate) fn dispatch(
             // (parked by the 'T' arm earlier in this query).
             // AwaitingRfq → Z → Idle. Materialise reads the slot
             // directly — no flag to set.
-            advance_to_awaiting_rfq(state, reply, payload, command_tag_slot)
+            advance_to_awaiting_rfq(reply, payload, command_tag_slot)
         }
         (ProtoState::SimpleQueryStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         (ProtoState::SimpleQueryStreamingRows { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // AwaitingRfq: Z is the only legal frame
@@ -1100,15 +1142,17 @@ pub(crate) fn dispatch(
                         tx_status_slot,
                         tx_status,
                     );
-                    *state = ProtoState::Idle;
-                    DispatchOutcome::AdvancedWithAction {
-                        action: crate::action::deliver(
-                            reply,
-                            crate::action::StagedQueryCompletePayload::Completed,
-                        ),
+                    Transition {
+                        next: ProtoState::Idle,
+                        outcome: DispatchOutcome::AdvancedWithAction {
+                            action: crate::action::deliver(
+                                reply,
+                                crate::action::StagedQueryCompletePayload::Completed,
+                            ),
+                        },
                     }
                 }
-                Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
+                Err(payload_len) => install_errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
             }
         }
         // multi-statement batch: PG SimpleQuery accepts
@@ -1144,27 +1188,33 @@ pub(crate) fn dispatch(
                         command_tags_arena_slot,
                     )
                     .alloc(prior_tag);
-                    let Some(prior_tag_ref) = prior_tag_ref else {
-                        return install_errored(
-                            state,
+                    // Arena-overflow (arch-dead) names the Errored
+                    // successor via `install_errored` as the arm value
+                    // — flows to the single tail write, no early return.
+                    match prior_tag_ref {
+                        None => install_errored(
                             Some(reply.consume()),
                             ProtocolError::InternalCrateBug {
                                 locus: crate::error::CrateBugLocus::CommandTagsArenaOverflow,
                             },
-                        );
-                    };
-                    _command_complete_dispatch_leaf::park_command_tag_at_dispatch(
-                        command_tag_slot,
-                        alloc::boxed::Box::new(new_tag),
-                    );
-                    *state = ProtoState::SimpleQueryAwaitingRfq { reply };
-                    DispatchOutcome::AdvancedWithAction {
-                        action: crate::action::StagedAction::IntermediateCommandComplete {
-                            tag_ref: prior_tag_ref,
-                        },
+                        ),
+                        Some(prior_tag_ref) => {
+                            _command_complete_dispatch_leaf::park_command_tag_at_dispatch(
+                                command_tag_slot,
+                                alloc::boxed::Box::new(new_tag),
+                            );
+                            Transition {
+                                next: ProtoState::SimpleQueryAwaitingRfq { reply },
+                                outcome: DispatchOutcome::AdvancedWithAction {
+                                    action: crate::action::StagedAction::IntermediateCommandComplete {
+                                        tag_ref: prior_tag_ref,
+                                    },
+                                },
+                            }
+                        }
                     }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitingRfq { reply }, TAG_ROW_DESCRIPTION) => {
@@ -1183,28 +1233,31 @@ pub(crate) fn dispatch(
                         command_tags_arena_slot,
                     )
                     .alloc(prior_tag);
-                    let Some(prior_tag_ref) = prior_tag_ref else {
-                        return install_errored(
-                            state,
+                    match prior_tag_ref {
+                        None => install_errored(
                             Some(reply.consume()),
                             ProtocolError::InternalCrateBug {
                                 locus: crate::error::CrateBugLocus::CommandTagsArenaOverflow,
                             },
-                        );
-                    };
-                    _row_description_dispatch_leaf::park_row_description_at_dispatch(
-                        row_desc_slot,
-                        row_desc,
-                    );
-                    *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
-                    *state = ProtoState::SimpleQueryStreamingRows { reply };
-                    DispatchOutcome::AdvancedWithAction {
-                        action: crate::action::StagedAction::IntermediateCommandComplete {
-                            tag_ref: prior_tag_ref,
-                        },
+                        ),
+                        Some(prior_tag_ref) => {
+                            _row_description_dispatch_leaf::park_row_description_at_dispatch(
+                                row_desc_slot,
+                                row_desc,
+                            );
+                            *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
+                            Transition {
+                                next: ProtoState::SimpleQueryStreamingRows { reply },
+                                outcome: DispatchOutcome::AdvancedWithAction {
+                                    action: crate::action::StagedAction::IntermediateCommandComplete {
+                                        tag_ref: prior_tag_ref,
+                                    },
+                                },
+                            }
+                        }
                     }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitingRfq { reply }, TAG_EMPTY_QUERY_RESPONSE) => {
@@ -1222,27 +1275,30 @@ pub(crate) fn dispatch(
                         command_tags_arena_slot,
                     )
                     .alloc(prior_tag);
-                    let Some(prior_tag_ref) = prior_tag_ref else {
-                        return install_errored(
-                            state,
+                    match prior_tag_ref {
+                        None => install_errored(
                             Some(reply.consume()),
                             ProtocolError::InternalCrateBug {
                                 locus: crate::error::CrateBugLocus::CommandTagsArenaOverflow,
                             },
-                        );
-                    };
-                    _command_complete_dispatch_leaf::park_command_tag_at_dispatch(
-                        command_tag_slot,
-                        alloc::boxed::Box::new(crate::command_tag::CommandTag::EMPTY),
-                    );
-                    *state = ProtoState::SimpleQueryAwaitingRfq { reply };
-                    DispatchOutcome::AdvancedWithAction {
-                        action: crate::action::StagedAction::IntermediateCommandComplete {
-                            tag_ref: prior_tag_ref,
-                        },
+                        ),
+                        Some(prior_tag_ref) => {
+                            _command_complete_dispatch_leaf::park_command_tag_at_dispatch(
+                                command_tag_slot,
+                                alloc::boxed::Box::new(crate::command_tag::CommandTag::EMPTY),
+                            );
+                            Transition {
+                                next: ProtoState::SimpleQueryAwaitingRfq { reply },
+                                outcome: DispatchOutcome::AdvancedWithAction {
+                                    action: crate::action::StagedAction::IntermediateCommandComplete {
+                                        tag_ref: prior_tag_ref,
+                                    },
+                                },
+                            }
+                        }
                     }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::SimpleQueryAwaitingRfq { reply, .. }, TAG_ERROR_RESPONSE) => {
@@ -1250,10 +1306,10 @@ pub(crate) fn dispatch(
             // path. Intermediate tags up to this point are observable
             // via the stream; the final reply is FailReply, NOT
             // QueryComplete with the last successful tag.
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         (ProtoState::SimpleQueryAwaitingRfq { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // DrainRfqAfterError: consume Z → Idle, with full tx_status
@@ -1271,18 +1327,19 @@ pub(crate) fn dispatch(
             // form is user-banned per no-underscore-vars feedback).
             match parse_rfq_payload(payload) {
                 Ok(_) => {
-                    *state = ProtoState::Idle;
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::Idle,
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
                 Err(payload_len) => install_errored(
-                    state,
                     None,
                     ProtocolError::MalformedReadyForQuery { payload_len },
                 ),
             }
         }
         (ProtoState::DrainRfqAfterError, other) => {
-            install_errored(state, None, ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(None, ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
@@ -1303,10 +1360,12 @@ pub(crate) fn dispatch(
             // PG §55.7 ParseComplete body must be empty.
             match validate_empty_body(payload, TAG_PARSE_COMPLETE) {
                 Ok(()) => {
-                    *state = ProtoState::ParseAwaitingRfq(reply);
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::ParseAwaitingRfq(reply),
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::ParseAwaitingParseComplete(reply), TAG_ERROR_RESPONSE) => {
@@ -1315,16 +1374,18 @@ pub(crate) fn dispatch(
             // `DrainRfqAfterError` variant — both drain
             // the same trailing RFQ pattern).
             let cause = parse_error_response(payload, crate::protocol::error_arena_or_init(error_arena_slot)).into_protocol_error();
-            *state = ProtoState::DrainRfqAfterError;
-            DispatchOutcome::AdvancedWithAction {
+            Transition {
+                next: ProtoState::DrainRfqAfterError,
+                outcome: DispatchOutcome::AdvancedWithAction {
                 action: StagedAction::FailReply {
                     id: reply.consume(),
                     cause,
                 },
+            },
             }
         }
         (ProtoState::ParseAwaitingParseComplete(reply), other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         (ProtoState::ParseAwaitingRfq(reply), TAG_READY_FOR_QUERY) => {
@@ -1334,19 +1395,21 @@ pub(crate) fn dispatch(
                         tx_status_slot,
                         tx_status,
                     );
-                    *state = ProtoState::Idle;
-                    DispatchOutcome::AdvancedWithAction {
-                        action: crate::action::deliver(
-                            reply,
-                            crate::action::ParseCompletePayload,
-                        ),
+                    Transition {
+                        next: ProtoState::Idle,
+                        outcome: DispatchOutcome::AdvancedWithAction {
+                            action: crate::action::deliver(
+                                reply,
+                                crate::action::ParseCompletePayload,
+                            ),
+                        },
                     }
                 }
-                Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
+                Err(payload_len) => install_errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
             }
         }
         (ProtoState::ParseAwaitingRfq(reply), other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
@@ -1387,10 +1450,12 @@ pub(crate) fn dispatch(
             // PG §55.7 BindComplete body must be empty.
             match validate_empty_body(payload, TAG_BIND_COMPLETE) {
                 Ok(()) => {
-                    *state = ProtoState::BindExecuteAwaitingCommandCompleteDml(reply);
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::BindExecuteAwaitingCommandCompleteDml(reply),
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         // The prepared! macro path bundles Parse + Bind + Execute +
@@ -1406,12 +1471,13 @@ pub(crate) fn dispatch(
         // (and the next BindComplete frame would be UnexpectedFrame).
         (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), TAG_PARSE_COMPLETE) => {
             if payload.is_empty() {
-                *state = ProtoState::BindExecuteAwaitingBindCompleteDml(reply);
-                DispatchOutcome::AdvancedSilent
+                Transition {
+                    next: ProtoState::BindExecuteAwaitingBindCompleteDml(reply),
+                    outcome: DispatchOutcome::AdvancedSilent,
+                }
             } else {
                 let payload_len = payload.len();
                 install_errored(
-                    state,
                     Some(reply.consume()),
                     ProtocolError::UnexpectedFrameBody {
                         tag: TAG_PARSE_COMPLETE,
@@ -1421,10 +1487,10 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         (ProtoState::BindExecuteAwaitingBindCompleteDml(reply), other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), TAG_COMMAND_COMPLETE) => {
@@ -1435,22 +1501,24 @@ pub(crate) fn dispatch(
                         command_tag_slot,
                         alloc::boxed::Box::new(parsed),
                     );
-                    *state = ProtoState::BindExecuteAwaitingRfqDml { reply };
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::BindExecuteAwaitingRfqDml { reply },
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), TAG_PORTAL_SUSPENDED) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_PORTAL_SUSPENDED })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_PORTAL_SUSPENDED })
         }
         (ProtoState::BindExecuteAwaitingCommandCompleteDml(reply), other) => {
             // Includes 'D' (DataRow) — structurally no schema here,
             // server emitting rows is a wire violation.
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         (
@@ -1466,18 +1534,20 @@ pub(crate) fn dispatch(
                 // the slot at the Z arm → Reply::QueryComplete with
                 // `command_tag: &'r CommandTag`. :
                 // tx_status now also in slot (parked above).
-                *state = ProtoState::Idle;
-                DispatchOutcome::AdvancedWithAction {
+                Transition {
+                    next: ProtoState::Idle,
+                    outcome: DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
                         reply,
                         crate::action::StagedQueryCompletePayload::Completed,
                     ),
+                },
                 }
             }
-            Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
+            Err(payload_len) => install_errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
         },
         (ProtoState::BindExecuteAwaitingRfqDml { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // ─── SELECT path ───
@@ -1489,11 +1559,12 @@ pub(crate) fn dispatch(
             // PG §55.7 BindComplete body must be empty.
             match validate_empty_body(payload, TAG_BIND_COMPLETE) {
                 Ok(()) => {
-                    *state =
-                        ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply };
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply },
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         // The prepared! macro path mirrors the DML arm above: the
@@ -1506,12 +1577,13 @@ pub(crate) fn dispatch(
         // entry forces the write-back).
         (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply }, TAG_PARSE_COMPLETE) => {
             if payload.is_empty() {
-                *state = ProtoState::BindExecuteAwaitingBindCompleteSelect { reply };
-                DispatchOutcome::AdvancedSilent
+                Transition {
+                    next: ProtoState::BindExecuteAwaitingBindCompleteSelect { reply },
+                    outcome: DispatchOutcome::AdvancedSilent,
+                }
             } else {
                 let payload_len = payload.len();
                 install_errored(
-                    state,
                     Some(reply.consume()),
                     ProtocolError::UnexpectedFrameBody {
                         tag: TAG_PARSE_COMPLETE,
@@ -1521,10 +1593,10 @@ pub(crate) fn dispatch(
             }
         }
         (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         (ProtoState::BindExecuteAwaitingBindCompleteSelect { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // BindExecuteAwaitingDataOrCompleteSelect: DataRow via
@@ -1534,9 +1606,9 @@ pub(crate) fn dispatch(
         (
             ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply },
             TAG_COMMAND_COMPLETE,
-        ) => advance_to_bindexecute_awaiting_rfq_select(state, reply, payload, command_tag_slot),
+        ) => advance_to_bindexecute_awaiting_rfq_select(reply, payload, command_tag_slot),
         (ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         // PortalSuspended before any DataRow is valid PG §55.2.7 —
         // server may emit PortalSuspended immediately if the cap is
@@ -1549,14 +1621,16 @@ pub(crate) fn dispatch(
         ) => {
             match validate_empty_body(payload, TAG_PORTAL_SUSPENDED) {
                 Ok(()) => {
-                    *state = ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply };
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply },
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::BindExecuteAwaitingDataOrCompleteSelect { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // BindExecuteStreamingRows: DataRow via `feed_bytes`
@@ -1564,10 +1638,10 @@ pub(crate) fn dispatch(
         // below (see SimpleQueryStreamingRows for the full
         // rationale).
         (ProtoState::BindExecuteStreamingRows { reply }, TAG_COMMAND_COMPLETE) => {
-            advance_to_bindexecute_awaiting_rfq_select(state, reply, payload, command_tag_slot)
+            advance_to_bindexecute_awaiting_rfq_select(reply, payload, command_tag_slot)
         }
         (ProtoState::BindExecuteStreamingRows { reply, .. }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         // PortalSuspended ('s') — alternative terminal frame to
         // CommandComplete when `FetchRows::Chunked(N)` hit the row
@@ -1577,14 +1651,16 @@ pub(crate) fn dispatch(
         (ProtoState::BindExecuteStreamingRows { reply }, TAG_PORTAL_SUSPENDED) => {
             match validate_empty_body(payload, TAG_PORTAL_SUSPENDED) {
                 Ok(()) => {
-                    *state = ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply };
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply },
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::BindExecuteStreamingRows { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // BindExecuteAwaitingRfqAfterSuspended terminal arms.
@@ -1597,21 +1673,23 @@ pub(crate) fn dispatch(
                     tx_status_slot,
                     tx_status,
                 );
-                *state = ProtoState::Idle;
-                DispatchOutcome::AdvancedWithAction {
+                Transition {
+                    next: ProtoState::Idle,
+                    outcome: DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
                         reply,
                         crate::action::StagedQueryCompletePayload::Suspended,
                     ),
+                },
                 }
             }
-            Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
+            Err(payload_len) => install_errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
         },
         (ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply }, TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         (ProtoState::BindExecuteAwaitingRfqAfterSuspended { reply }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         (
@@ -1627,18 +1705,20 @@ pub(crate) fn dispatch(
                 // row_desc_slot. : tx_status in slot.
                 // Materialise reads command_tag + row_desc slots at Z;
                 // callers query tx_status via terminal_tx_status.
-                *state = ProtoState::Idle;
-                DispatchOutcome::AdvancedWithAction {
-                    action: crate::action::deliver(
-                        reply,
-                        crate::action::StagedQueryCompletePayload::Completed,
-                    ),
+                Transition {
+                    next: ProtoState::Idle,
+                    outcome: DispatchOutcome::AdvancedWithAction {
+                        action: crate::action::deliver(
+                            reply,
+                            crate::action::StagedQueryCompletePayload::Completed,
+                        ),
+                    },
                 }
             }
-            Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
+            Err(payload_len) => install_errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
         },
         (ProtoState::BindExecuteAwaitingRfqSelect { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
@@ -1683,19 +1763,21 @@ pub(crate) fn dispatch(
                         param_oids_slot,
                         param_oids,
                     );
-                    *state = ProtoState::DescribeStatementAwaitingRowDescOrNoData {
-                        reply,
-                    };
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::DescribeStatementAwaitingRowDescOrNoData {
+                            reply,
+                        },
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::DescribeStatementAwaitingParamDesc(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         (ProtoState::DescribeStatementAwaitingParamDesc(reply), other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // Stage 2: awaiting RowDescription or NoData.
@@ -1713,10 +1795,12 @@ pub(crate) fn dispatch(
                     row_desc,
                 );
                 *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
-                *state = ProtoState::DescribeStatementAwaitingRfq { reply };
-                DispatchOutcome::AdvancedSilent
+                Transition {
+                    next: ProtoState::DescribeStatementAwaitingRfq { reply },
+                    outcome: DispatchOutcome::AdvancedSilent,
+                }
             }
-            Err(cause) => install_errored(state, Some(reply.consume()), cause),
+            Err(cause) => install_errored(Some(reply.consume()), cause),
         },
         (
             ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply },
@@ -1727,18 +1811,20 @@ pub(crate) fn dispatch(
             // and emits Reply::DescribeStatementComplete with `NoData`.
             match validate_empty_body(payload, TAG_NO_DATA) {
                 Ok(()) => {
-                    *state = ProtoState::DescribeStatementAwaitingRfq { reply };
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::DescribeStatementAwaitingRfq { reply },
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (
             ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. },
             TAG_ERROR_RESPONSE,
-        ) => advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot)),
+        ) => advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot)),
         (ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // Stage 3: awaiting ReadyForQuery — deliver the terminal
@@ -1764,18 +1850,20 @@ pub(crate) fn dispatch(
                     tx_status_slot,
                     tx_status,
                 );
-                *state = ProtoState::Idle;
-                DispatchOutcome::AdvancedWithAction {
+                Transition {
+                    next: ProtoState::Idle,
+                    outcome: DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
                         reply,
                         crate::action::StagedDescribeStatementCompletePayload,
                     ),
+                },
                 }
             }
-            Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
+            Err(payload_len) => install_errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
         },
         (ProtoState::DescribeStatementAwaitingRfq { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // ─── Portal-describe path ───
@@ -1791,10 +1879,12 @@ pub(crate) fn dispatch(
                         row_desc,
                     );
                     *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
-                    *state = ProtoState::DescribePortalAwaitingRfq { reply };
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::DescribePortalAwaitingRfq { reply },
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_NO_DATA) => {
@@ -1803,17 +1893,19 @@ pub(crate) fn dispatch(
             // emits NoData.
             match validate_empty_body(payload, TAG_NO_DATA) {
                 Ok(()) => {
-                    *state = ProtoState::DescribePortalAwaitingRfq { reply };
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::DescribePortalAwaitingRfq { reply },
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // Stage 2: awaiting ReadyForQuery — deliver portal reply.
@@ -1828,18 +1920,20 @@ pub(crate) fn dispatch(
                     tx_status_slot,
                     tx_status,
                 );
-                *state = ProtoState::Idle;
-                DispatchOutcome::AdvancedWithAction {
+                Transition {
+                    next: ProtoState::Idle,
+                    outcome: DispatchOutcome::AdvancedWithAction {
                     action: crate::action::deliver(
                         reply,
                         crate::action::StagedDescribePortalCompletePayload,
                     ),
+                },
                 }
             }
-            Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
+            Err(payload_len) => install_errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
         },
         (ProtoState::DescribePortalAwaitingRfq { reply, .. }, other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
@@ -1867,17 +1961,19 @@ pub(crate) fn dispatch(
             // payload that doesn't match the empty-body invariant.
             match validate_empty_body(payload, TAG_CLOSE_COMPLETE) {
                 Ok(()) => {
-                    *state = ProtoState::CloseAwaitingRfq(reply);
-                    DispatchOutcome::AdvancedSilent
+                    Transition {
+                        next: ProtoState::CloseAwaitingRfq(reply),
+                        outcome: DispatchOutcome::AdvancedSilent,
+                    }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         (ProtoState::CloseAwaitingComplete(reply), TAG_ERROR_RESPONSE) => {
-            advance_to_drain_after_error(state, reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
+            advance_to_drain_after_error(reply.consume(), payload, crate::protocol::error_arena_or_init(error_arena_slot))
         }
         (ProtoState::CloseAwaitingComplete(reply), other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // Stage 2: awaiting ReadyForQuery — deliver the terminal
@@ -1886,25 +1982,27 @@ pub(crate) fn dispatch(
         (ProtoState::CloseAwaitingRfq(reply), TAG_READY_FOR_QUERY) => {
             match parse_rfq_payload(payload) {
                 Ok(_tx_status) => {
-                    *state = ProtoState::Idle;
-                    DispatchOutcome::AdvancedWithAction {
-                        action: crate::action::deliver(
-                            reply,
-                            crate::action::CloseCompletePayload,
-                        ),
+                    Transition {
+                        next: ProtoState::Idle,
+                        outcome: DispatchOutcome::AdvancedWithAction {
+                            action: crate::action::deliver(
+                                reply,
+                                crate::action::CloseCompletePayload,
+                            ),
+                        },
                     }
                 }
-                Err(payload_len) => install_errored(state, Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
+                Err(payload_len) => install_errored(Some(reply.consume()), ProtocolError::MalformedReadyForQuery { payload_len }),
             }
         }
         (ProtoState::CloseAwaitingRfq(reply), other) => {
-            install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
+            install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: other })
         }
 
         // =============================================================
         // Idle — unsolicited frames are out-of-spec
         // =============================================================
-        (ProtoState::Idle, other) => install_errored(state, None, ProtocolError::UnexpectedFrame { tag: other }),
+        (ProtoState::Idle, other) => install_errored(None, ProtocolError::UnexpectedFrame { tag: other }),
 
         // =============================================================
         // HandshakeReady — transition-signal write target
@@ -1924,8 +2022,10 @@ pub(crate) fn dispatch(
             // at the legitimate consumer (`into_active`). A defensive
             // install_errored here would scrub the cancel-key
             // material before the wrapper had a chance to surface it.
-            *state = ProtoState::HandshakeReady { pid, secret_key };
-            DispatchOutcome::AdvancedSilent
+            Transition {
+                next: ProtoState::HandshakeReady { pid, secret_key },
+                outcome: DispatchOutcome::AdvancedSilent,
+            }
         }
 
         // =============================================================
@@ -1941,12 +2041,18 @@ pub(crate) fn dispatch(
         // would still land here classified, not UB. Missing arm
         // would be a compile error by match exhaustiveness.
         // =============================================================
-        (ProtoState::Errored(original), _) => {
-            *state = ProtoState::Errored(original);
-            DispatchOutcome::AdvancedSilent
-        }
+        (ProtoState::Errored(original), _) => Transition {
+            next: ProtoState::Errored(original),
+            outcome: DispatchOutcome::AdvancedSilent,
+        },
     };
 
+    // Single tail write: install the successor state named by the
+    // match arm, then return its outcome. This is the ONLY `*state =`
+    // in the whole dispatch path — the placeholder Idle set by the
+    // `mem::replace` above lived only transiently between the replace
+    // and this line.
+    //
     // No separate `scram_state` cleanup needed: the
     // `mem::replace(state, ProtoState::Idle)` above consumed the
     // SCRAM variant by value, and if the arm ended in Errored the
@@ -1955,7 +2061,8 @@ pub(crate) fn dispatch(
     // Variant-carries-field (CREDO §1) makes this automatic: there
     // is no separate slot that could linger past the state
     // transition.
-    outcome
+    *state = t.next;
+    t.outcome
 }
 
 // -----------------------------------------------------------------
@@ -2015,21 +2122,22 @@ fn auth_sub_code(payload: &[u8]) -> Result<(crate::wire::AuthSubCode, &[u8]), Pr
 /// because the Scram variant of the state has its own handler —
 /// per-variant dispatchers carry the tier-1 compile guarantee.
 fn dispatch_auth_in_startup_trust(
-    state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
     payload: &[u8],
-) -> DispatchOutcome {
+) -> Transition {
     let (code, _rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
-            return install_errored(state, Some(reply.consume()), cause)
+            return install_errored(Some(reply.consume()), cause)
         }
     };
 
     match code {
         crate::wire::AuthSubCode::Ok => {
-            *state = ProtoState::ConnectingPostAuthAwaitingKey(reply);
-            DispatchOutcome::AdvancedSilent
+            Transition {
+                next: ProtoState::ConnectingPostAuthAwaitingKey(reply),
+                outcome: DispatchOutcome::AdvancedSilent,
+            }
         }
         // Any non-Ok auth code means the server expects an auth
         // method this Trust connection is not configured for:
@@ -2042,7 +2150,7 @@ fn dispatch_auth_in_startup_trust(
             | crate::wire::AuthSubCode::Md5Password
             | crate::wire::AuthSubCode::Sasl
             | crate::wire::AuthSubCode::SaslContinue
-            | crate::wire::AuthSubCode::SaslFinal) => install_errored(state,
+            | crate::wire::AuthSubCode::SaslFinal) => install_errored(
             Some(reply.consume()),
             ProtocolError::UnsupportedAuthMethod { sub_code: crate::error::AuthSubCodeClass::KnownButWrong(other) },
         ),
@@ -2056,23 +2164,22 @@ fn dispatch_auth_in_startup_trust(
 /// without asking for the password is an auth-method mismatch on
 /// the server side (client expected SCRAM).
 fn dispatch_auth_in_startup_scram(
-    state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
     mut scram: alloc::boxed::Box<crate::scram::session::ScramSession>,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> DispatchOutcome {
+) -> Transition {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
-            return install_errored(state, Some(reply.consume()), cause)
+            return install_errored(Some(reply.consume()), cause)
         }
     };
 
     match code {
         crate::wire::AuthSubCode::Sasl => {
             if !mechanism_list_contains_scram(rest) {
-                return install_errored(state, Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::NoSupportedMechanism));
+                return install_errored(Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::NoSupportedMechanism));
             }
 
             // Build client-first-message and SASLInitialResponse.
@@ -2090,15 +2197,17 @@ fn dispatch_auth_in_startup_scram(
             // per SCRAM connection" invariant.
             match build_sasl_initial_response(&mut scram, reserved) {
                 Ok(range) => {
-                    *state = ProtoState::ConnectingScramAwaitingServerFirst {
-                        reply,
-                        scram,
-                    };
-                    DispatchOutcome::AdvancedWithAction {
-                        action: StagedAction::SendBytesRange(range),
+                    Transition {
+                        next: ProtoState::ConnectingScramAwaitingServerFirst {
+                            reply,
+                            scram,
+                        },
+                        outcome: DispatchOutcome::AdvancedWithAction {
+                            action: StagedAction::SendBytesRange(range),
+                        },
                     }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         // Any non-`Sasl` auth code in this state is an auth-method
@@ -2115,7 +2224,7 @@ fn dispatch_auth_in_startup_scram(
             | crate::wire::AuthSubCode::CleartextPassword
             | crate::wire::AuthSubCode::Md5Password
             | crate::wire::AuthSubCode::SaslContinue
-            | crate::wire::AuthSubCode::SaslFinal) => install_errored(state,
+            | crate::wire::AuthSubCode::SaslFinal) => install_errored(
             Some(reply.consume()),
             ProtocolError::UnsupportedAuthMethod { sub_code: crate::error::AuthSubCodeClass::KnownButWrong(other) },
         ),
@@ -2287,21 +2396,20 @@ fn build_sasl_initial_response(
 // per SCRAM handshake: 0 allocs + 1 Box-free (the consolidated
 // `Box<ScramSession>`).
 fn dispatch_auth_sasl_continue(
-    state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
     scram: &crate::scram::session::ScramSession,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> DispatchOutcome {
+) -> Transition {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
-            return install_errored(state, Some(reply.consume()), cause)
+            return install_errored(Some(reply.consume()), cause)
         }
     };
 
     if !matches!(code, crate::wire::AuthSubCode::SaslContinue) {
-        return install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
+        return install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
     }
 
     // `rest` is the server-first-message body.
@@ -2309,7 +2417,7 @@ fn dispatch_auth_sasl_continue(
         match crate::scram::wire::parse_server_first(rest, scram.client_nonce_b64.as_slice()) {
             Ok(sf) => sf,
             Err(e) => {
-                return install_errored(state, Some(reply.consume()), ProtocolError::from_scram_no_text(e));
+                return install_errored(Some(reply.consume()), ProtocolError::from_scram_no_text(e));
             }
         };
 
@@ -2323,7 +2431,7 @@ fn dispatch_auth_sasl_continue(
         ) {
             Ok(v) => v,
             Err(e) => {
-                return install_errored(state, Some(reply.consume()), ProtocolError::from_scram_no_text(e));
+                return install_errored(Some(reply.consume()), ProtocolError::from_scram_no_text(e));
             }
         };
 
@@ -2361,7 +2469,7 @@ fn dispatch_auth_sasl_continue(
     });
     let (proof, expected_server_sig) = match proof_result {
         Ok(v) => v,
-        Err(e) => return install_errored(state, Some(reply.consume()), ProtocolError::from_scram_no_text(e)),
+        Err(e) => return install_errored(Some(reply.consume()), ProtocolError::from_scram_no_text(e)),
     };
 
     // Base64-encode proof.
@@ -2377,13 +2485,13 @@ fn dispatch_auth_sasl_continue(
         match crate::scram::wire::base64_encode_to_buf(proof.as_ref(), proof_b64_buf.as_mut()) {
             Ok(n) => n,
             Err(_) => {
-                return install_errored(state, Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow))
+                return install_errored(Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow))
             }
         };
     let proof_b64 = match proof_b64_buf.get(..proof_b64_len) {
         Some(s) => s,
         None => {
-            return install_errored(state, Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow))
+            return install_errored(Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow))
         }
     };
 
@@ -2405,7 +2513,7 @@ fn dispatch_auth_sasl_continue(
     ) {
         Ok(v) => v,
         Err(e) => {
-            return install_errored(state, Some(reply.consume()), ProtocolError::from_scram_no_text(e));
+            return install_errored(Some(reply.consume()), ProtocolError::from_scram_no_text(e));
         }
     };
 
@@ -2427,7 +2535,7 @@ fn dispatch_auth_sasl_continue(
             // failed.
             use zeroize::Zeroize;
             client_final_msg.as_mut_slice().zeroize();
-            return install_errored(state, Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow));
+            return install_errored(Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::BufferOverflow));
         }
     }
     // Scrub the password-correlated client_final_msg contents now
@@ -2445,7 +2553,7 @@ fn dispatch_auth_sasl_continue(
     // `EmptyWriteRange` if triggered.
     let range = match crate::action::WriteRange::from_write_span(start, reserved) {
         Ok(r) => r,
-        Err(cause) => return install_errored(state, Some(reply.consume()), cause),
+        Err(cause) => return install_errored(Some(reply.consume()), cause),
     };
 
     // `expected_server_sig` moves INTO the variant — tier-1
@@ -2454,32 +2562,33 @@ fn dispatch_auth_sasl_continue(
     // NOT needed by the next state; its drop here fires
     // `ZeroizeOnDrop` — password material scrubbed exactly when
     // the handshake no longer needs it.
-    *state = ProtoState::ConnectingScramAwaitingServerFinal {
+    Transition {
+        next: ProtoState::ConnectingScramAwaitingServerFinal {
         reply,
         expected_server_sig: alloc::boxed::Box::new(expected_server_sig),
-    };
-    DispatchOutcome::AdvancedWithAction {
+    },
+        outcome: DispatchOutcome::AdvancedWithAction {
         action: StagedAction::SendBytesRange(range),
+    },
     }
 }
 
 /// Dispatch AuthenticationSASLFinal (server-final-message).
 fn dispatch_auth_sasl_final(
-    state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
     expected_server_sig: crate::scram::types::SecretDigest,
     payload: &[u8],
     error_arena_slot: &mut Option<alloc::boxed::Box<crate::error_arena::ErrorArena>>,
-) -> DispatchOutcome {
+) -> Transition {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
-            return install_errored(state, Some(reply.consume()), cause)
+            return install_errored(Some(reply.consume()), cause)
         }
     };
 
     if !matches!(code, crate::wire::AuthSubCode::SaslFinal) {
-        return install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
+        return install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
     }
 
     // Parse server-final-message.
@@ -2493,42 +2602,45 @@ fn dispatch_auth_sasl_final(
         Ok(sig) => sig,
         Err(e) => {
             let cause = crate::error_arena::scram_error_to_protocol_error(e, error_arena_slot);
-            return install_errored(state, Some(reply.consume()), cause);
+            return install_errored(Some(reply.consume()), cause);
         }
     };
 
     // Constant-time comparison.
     if !bool::from(expected_server_sig.ct_eq(&received_sig)) {
-        return install_errored(state, Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::SignatureMismatch));
+        return install_errored(Some(reply.consume()), ProtocolError::scram_no_text(crate::scram::wire::ScramFailureClass::SignatureMismatch));
     }
 
     // Signature matches. Await AuthenticationOk.
-    *state = ProtoState::ConnectingScramAwaitingAuthOk(reply);
-    DispatchOutcome::AdvancedSilent
+    Transition {
+        next: ProtoState::ConnectingScramAwaitingAuthOk(reply),
+        outcome: DispatchOutcome::AdvancedSilent,
+    }
 }
 
 /// Dispatch AuthenticationOk after SCRAM verification.
 fn dispatch_auth_ok_after_scram(
-    state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
     payload: &[u8],
-) -> DispatchOutcome {
+) -> Transition {
     // AuthOk has no trailing data; destructure with anonymous `_`
     // pattern (pattern-discard, not a `_`-prefixed identifier —
     // allowed by the `no underscore vars` discipline).
     let code = match auth_sub_code(payload) {
         Ok((code, _)) => code,
         Err(cause) => {
-            return install_errored(state, Some(reply.consume()), cause)
+            return install_errored(Some(reply.consume()), cause)
         }
     };
 
     if !matches!(code, crate::wire::AuthSubCode::Ok) {
-        return install_errored(state, Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
+        return install_errored(Some(reply.consume()), ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION });
     }
 
-    *state = ProtoState::ConnectingPostAuthAwaitingKey(reply);
-    DispatchOutcome::AdvancedSilent
+    Transition {
+        next: ProtoState::ConnectingPostAuthAwaitingKey(reply),
+        outcome: DispatchOutcome::AdvancedSilent,
+    }
 }
 
 // -----------------------------------------------------------------
@@ -2554,16 +2666,15 @@ fn dispatch_auth_ok_after_scram(
 /// error path the Box drops at function return through the same
 /// chain.
 fn dispatch_auth_in_startup_cleartext(
-    state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
     password: alloc::boxed::Box<crate::sensitive::Sensitive<crate::password::Password>>,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> DispatchOutcome {
+) -> Transition {
     let (code, _rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
-            return install_errored(state, Some(reply.consume()), cause)
+            return install_errored(Some(reply.consume()), cause)
         }
     };
 
@@ -2575,12 +2686,14 @@ fn dispatch_auth_in_startup_cleartext(
             // return after this arm, scrubbing the password bytes.
             match build_password_message(&password, reserved) {
                 Ok(range) => {
-                    *state = ProtoState::ConnectingCleartextAwaitingAuthOk(reply);
-                    DispatchOutcome::AdvancedWithAction {
-                        action: StagedAction::SendBytesRange(range),
+                    Transition {
+                        next: ProtoState::ConnectingCleartextAwaitingAuthOk(reply),
+                        outcome: DispatchOutcome::AdvancedWithAction {
+                            action: StagedAction::SendBytesRange(range),
+                        },
                     }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         // Any other auth code in this state is an auth-method
@@ -2590,7 +2703,7 @@ fn dispatch_auth_in_startup_cleartext(
             | crate::wire::AuthSubCode::Md5Password
             | crate::wire::AuthSubCode::Sasl
             | crate::wire::AuthSubCode::SaslContinue
-            | crate::wire::AuthSubCode::SaslFinal) => install_errored(state,
+            | crate::wire::AuthSubCode::SaslFinal) => install_errored(
             Some(reply.consume()),
             ProtocolError::UnsupportedAuthMethod { sub_code: crate::error::AuthSubCodeClass::KnownButWrong(other) },
         ),
@@ -2604,27 +2717,27 @@ fn dispatch_auth_in_startup_cleartext(
 /// acceptable; any other code or any other frame-tag is an
 /// `UnexpectedFrame` protocol error.
 fn dispatch_auth_ok_after_cleartext(
-    state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
     payload: &[u8],
-) -> DispatchOutcome {
+) -> Transition {
     let code = match auth_sub_code(payload) {
         Ok((code, _)) => code,
         Err(cause) => {
-            return install_errored(state, Some(reply.consume()), cause)
+            return install_errored(Some(reply.consume()), cause)
         }
     };
 
     if !matches!(code, crate::wire::AuthSubCode::Ok) {
         return install_errored(
-            state,
             Some(reply.consume()),
             ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION },
         );
     }
 
-    *state = ProtoState::ConnectingPostAuthAwaitingKey(reply);
-    DispatchOutcome::AdvancedSilent
+    Transition {
+        next: ProtoState::ConnectingPostAuthAwaitingKey(reply),
+        outcome: DispatchOutcome::AdvancedSilent,
+    }
 }
 
 /// Build the `PasswordMessage` frame for cleartext-password auth.
@@ -2700,16 +2813,15 @@ fn build_password_message(
 /// password-derived intermediate buffer in `Zeroizing<>` so
 /// nothing leaks even transiently.
 fn dispatch_auth_in_startup_md5(
-    state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
     handshake: alloc::boxed::Box<crate::md5::Md5HandshakeState>,
     payload: &[u8],
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
-) -> DispatchOutcome {
+) -> Transition {
     let (code, rest) = match auth_sub_code(payload) {
         Ok(pair) => pair,
         Err(cause) => {
-            return install_errored(state, Some(reply.consume()), cause)
+            return install_errored(Some(reply.consume()), cause)
         }
     };
 
@@ -2725,7 +2837,6 @@ fn dispatch_auth_in_startup_md5(
                 Ok(s) => s,
                 Err(_) => {
                     return install_errored(
-                        state,
                         Some(reply.consume()),
                         ProtocolError::MalformedAuthentication {
                             payload_len: payload.len(),
@@ -2740,12 +2851,14 @@ fn dispatch_auth_in_startup_md5(
             // scrubs password.
             match build_md5_password_message(&handshake, salt, reserved) {
                 Ok(range) => {
-                    *state = ProtoState::ConnectingMd5AwaitingAuthOk(reply);
-                    DispatchOutcome::AdvancedWithAction {
-                        action: StagedAction::SendBytesRange(range),
+                    Transition {
+                        next: ProtoState::ConnectingMd5AwaitingAuthOk(reply),
+                        outcome: DispatchOutcome::AdvancedWithAction {
+                            action: StagedAction::SendBytesRange(range),
+                        },
                     }
                 }
-                Err(cause) => install_errored(state, Some(reply.consume()), cause),
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
         // Any other auth code in this state is an auth-method
@@ -2755,7 +2868,7 @@ fn dispatch_auth_in_startup_md5(
             | crate::wire::AuthSubCode::CleartextPassword
             | crate::wire::AuthSubCode::Sasl
             | crate::wire::AuthSubCode::SaslContinue
-            | crate::wire::AuthSubCode::SaslFinal) => install_errored(state,
+            | crate::wire::AuthSubCode::SaslFinal) => install_errored(
             Some(reply.consume()),
             ProtocolError::UnsupportedAuthMethod { sub_code: crate::error::AuthSubCodeClass::KnownButWrong(other) },
         ),
@@ -2767,27 +2880,27 @@ fn dispatch_auth_in_startup_md5(
 /// [`dispatch_auth_ok_after_cleartext`] /
 /// [`dispatch_auth_ok_after_scram`].
 fn dispatch_auth_ok_after_md5(
-    state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::StartupKind>,
     payload: &[u8],
-) -> DispatchOutcome {
+) -> Transition {
     let code = match auth_sub_code(payload) {
         Ok((code, _)) => code,
         Err(cause) => {
-            return install_errored(state, Some(reply.consume()), cause)
+            return install_errored(Some(reply.consume()), cause)
         }
     };
 
     if !matches!(code, crate::wire::AuthSubCode::Ok) {
         return install_errored(
-            state,
             Some(reply.consume()),
             ProtocolError::UnexpectedFrame { tag: TAG_AUTHENTICATION },
         );
     }
 
-    *state = ProtoState::ConnectingPostAuthAwaitingKey(reply);
-    DispatchOutcome::AdvancedSilent
+    Transition {
+        next: ProtoState::ConnectingPostAuthAwaitingKey(reply),
+        outcome: DispatchOutcome::AdvancedSilent,
+    }
 }
 
 /// Build the `PasswordMessage` frame for MD5-password auth.
@@ -3249,11 +3362,10 @@ pub(crate) fn parse_and_alloc_notice(
 /// never fired a 'T' arm, so the slot is None; SELECT did, so it is
 /// Some).
 fn advance_to_awaiting_rfq(
-    state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
     command_tag_slot: &mut crate::command_tag_slot::CommandTagSlotCell,
-) -> DispatchOutcome {
+) -> Transition {
     // : typed parser + slot park. Classified on malformed
     // (missing NUL / embedded NUL) per pre-contract.
     match crate::command_tag::parse_command_tag_bytes(payload) {
@@ -3262,10 +3374,12 @@ fn advance_to_awaiting_rfq(
                 command_tag_slot,
                 alloc::boxed::Box::new(parsed),
             );
-            *state = ProtoState::SimpleQueryAwaitingRfq { reply };
-            DispatchOutcome::AdvancedSilent
+            Transition {
+                next: ProtoState::SimpleQueryAwaitingRfq { reply },
+                outcome: DispatchOutcome::AdvancedSilent,
+            }
         }
-        Err(cause) => install_errored(state, Some(reply.consume()), cause),
+        Err(cause) => install_errored(Some(reply.consume()), cause),
     }
 }
 
@@ -3279,11 +3393,10 @@ fn advance_to_awaiting_rfq(
 /// The DML path's 'C' transition is inlined directly in the
 /// dispatch arm (one call-site only) and doesn't need a helper.
 fn advance_to_bindexecute_awaiting_rfq_select(
-    state: &mut ProtoState,
     reply: ReplyId<crate::reply_id::QueryKind>,
     payload: &[u8],
     command_tag_slot: &mut crate::command_tag_slot::CommandTagSlotCell,
-) -> DispatchOutcome {
+) -> Transition {
     // : parse + park via slot pattern; classified on malformed.
     match crate::command_tag::parse_command_tag_bytes(payload) {
         Ok(parsed) => {
@@ -3291,10 +3404,12 @@ fn advance_to_bindexecute_awaiting_rfq_select(
                 command_tag_slot,
                 alloc::boxed::Box::new(parsed),
             );
-            *state = ProtoState::BindExecuteAwaitingRfqSelect { reply };
-            DispatchOutcome::AdvancedSilent
+            Transition {
+                next: ProtoState::BindExecuteAwaitingRfqSelect { reply },
+                outcome: DispatchOutcome::AdvancedSilent,
+            }
         }
-        Err(cause) => install_errored(state, Some(reply.consume()), cause),
+        Err(cause) => install_errored(Some(reply.consume()), cause),
     }
 }
 
@@ -3327,18 +3442,19 @@ fn advance_to_bindexecute_awaiting_rfq_select(
 #[cold]
 #[inline]
 fn advance_to_drain_after_error(
-    state: &mut ProtoState,
     raw_id: core::num::NonZeroU64,
     payload: &[u8],
     error_arena: &mut crate::error_arena::ErrorArena,
-) -> DispatchOutcome {
+) -> Transition {
     let cause = parse_error_response(payload, error_arena).into_protocol_error();
-    *state = ProtoState::DrainRfqAfterError;
-    DispatchOutcome::AdvancedWithAction {
+    Transition {
+        next: ProtoState::DrainRfqAfterError,
+        outcome: DispatchOutcome::AdvancedWithAction {
         action: StagedAction::FailReply {
             id: raw_id,
             cause,
         },
+    },
     }
 }
 
