@@ -1,0 +1,5 @@
+error[E0599]: no variant, associated function, or constant named `Raw` found for enum `BoundValue` in the current scope
+ --> tests/ui/boundvalue_no_raw.rs:8:25
+  |
+8 |     let _ = BoundValue::Raw(String::from("1; DROP"));
+  |                         ^^^ variant, associated function, or constant not found in `BoundValue`

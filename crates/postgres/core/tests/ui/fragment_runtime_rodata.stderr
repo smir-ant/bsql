@@ -1,0 +1,12 @@
+error[E0597]: `runtime` does not live long enough
+  --> tests/ui/fragment_runtime_rodata.rs:11:56
+   |
+10 |     let runtime = String::from("DROP TABLE users");
+   |         ------- binding `runtime` declared here
+11 |     let _ = Fragment::__from_chunks(vec![Chunk::Rodata(&runtime)]);
+   |                                                        ^^^^^^^^
+   |                                                        |
+   |                                                        borrowed value does not live long enough
+   |                                                        this usage requires that `runtime` is borrowed for `'static`
+12 | }
+   | - `runtime` dropped here while still borrowed

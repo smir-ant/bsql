@@ -1,0 +1,5 @@
+error: fragment!: the skeleton has 2 `{}` hole(s) but 1 argument(s) were supplied — every hole consumes exactly one positional argument.
+ --> tests/ui/fragment_arity_mismatch.rs:8:23
+  |
+8 |     let _ = fragment!("a = {} AND b = {}", 1i32);
+  |                       ^^^^^^^^^^^^^^^^^^^

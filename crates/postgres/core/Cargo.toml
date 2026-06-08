@@ -8,6 +8,13 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 bsql-postgres-proto = { path = "../proto" }
+# Proc-macro pair-crate. Hosts `fragment!` — the literal-SQL-skeleton
+# lexer that builds a `Fragment` value (slice 2 of the dynamic-SQL
+# builder). The macro emits `::bsql_postgres_core::fragment::*` paths
+# resolved at this crate's compile site via the `extern crate self`
+# alias at the lib root. Acyclic: the derive lib target depends only on
+# syn/quote/proc-macro2/sha2 — never on core or proto.
+bsql-postgres-derive = { path = "../derive", version = "1.0.0-alpha.0" }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = "0.26"
 zeroize = { version = "1", default-features = false, features = ["zeroize_derive", "alloc"] }

@@ -1,0 +1,23 @@
+error[E0277]: `Evil` cannot be bound into a fragment hole
+ --> tests/ui/fragment_hole_struct.rs:9:33
+  |
+9 |     let _ = fragment!("x = {}", Evil);
+  |             --------------------^^^^-
+  |             |                   |
+  |             |                   unsatisfied trait bound
+  |             required by a bound introduced by this call
+  |
+help: the trait `IntoBound` is not implemented for `Evil`
+ --> tests/ui/fragment_hole_struct.rs:6:1
+  |
+6 | struct Evil;
+  | ^^^^^^^^^^^
+  = note: a `{}` hole accepts exactly one of: i16, i32, i64, u32, bool, &str, String — there is no raw-text interpolation path
+  = help: the following other types implement trait `IntoBound`:
+            &str
+            String
+            bool
+            i16
+            i32
+            i64
+            u32

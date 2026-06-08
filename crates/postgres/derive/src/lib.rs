@@ -77,6 +77,11 @@ mod sql_lexer;
 mod extract;
 mod typemap;
 
+// `fragment!` proc-macro: lexes a literal SQL skeleton with `{}` value
+// holes into a `bsql_postgres_core::fragment::Fragment` expression. The
+// entry (`fragment(...)`) lives at the bottom of this file.
+mod fragment_macro;
+
 /// `#[derive(Pristine)]` — derives the
 /// `bsql_postgres_proto::pristine::Pristine` trait impl plus an inherent
 /// `__pristine_const(&self) -> bool` const fn.
@@ -515,6 +520,35 @@ fn is_phantom_data(ty: &Type) -> bool {
 #[proc_macro]
 pub fn prepared(input: TokenStream) -> TokenStream {
     prepared_impl(input.into())
+        .unwrap_or_else(|e| e.to_compile_error())
+        .into()
+}
+
+/// `fragment!("SELECT ... WHERE x = {} AND y = {}", a, b)` — build a
+/// runtime [`Fragment`] value from a literal SQL skeleton with typed `{}`
+/// value holes.
+///
+/// The literal text between holes is kept verbatim as `&'static str`
+/// `.rodata`; each `{}` consumes the next positional argument, encodes it
+/// as a binary `$N` bind via `IntoBound`, and becomes a positional hole.
+/// `{{` / `}}` are `format!`-style escapes for literal braces.
+///
+/// The first argument MUST be a string literal — the sanctioned static
+/// spine, the one greppable bridge (tier-3-by-discipline, like
+/// `SimpleQuery::new`). A runtime `String`, an identifier, or an
+/// expression as the first argument is a compile error: there is no
+/// runtime-string -> SQL path. A non-bindable hole type (`f64`, a foreign
+/// struct, …) is `E0277` — the hole accepts exactly `i16`, `i32`, `i64`,
+/// `u32`, `bool`, `&str`, `String`.
+///
+/// `$N` is derived at `Fragment::build`, never stored, so two fragments
+/// compose by structural concatenation with automatic, contiguous
+/// renumbering — see [`bsql_postgres_core::fragment`].
+///
+/// [`Fragment`]: bsql_postgres_core::fragment::Fragment
+#[proc_macro]
+pub fn fragment(input: TokenStream) -> TokenStream {
+    fragment_macro::fragment_impl(input.into())
         .unwrap_or_else(|e| e.to_compile_error())
         .into()
 }
