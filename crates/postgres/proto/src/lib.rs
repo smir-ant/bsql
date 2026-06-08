@@ -274,6 +274,9 @@ pub mod protocol;
 pub mod push_command;
 pub mod row_stream;
 pub mod reply_id;
+pub mod sink;
+
+pub use sink::{Flow, Sink};
 
 // Tier-1 row_desc_slot write provenance. Crate-internal module; no
 // public re-exports.
