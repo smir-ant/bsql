@@ -1,0 +1,21 @@
+error[E0038]: the trait `Col` is not dyn compatible
+ --> tests/ui/col_not_dyn.rs:9:18
+  |
+9 | fn take_dyn(_c: &dyn Col) {}
+  |                  ^^^^^^^ `Col` is not dyn compatible
+  |
+  = note: the trait is not dyn compatible because it requires `Self: Sized`
+  = note: for a trait to be dyn compatible it needs to allow building a vtable
+          for more information, visit <https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility>
+  = help: only type `t::id` implements `Col`; consider using it directly instead.
+
+error[E0038]: the trait `Col` is not dyn compatible
+  --> tests/ui/col_not_dyn.rs:12:14
+   |
+12 |     take_dyn(&t::id);
+   |              ^^^^^^ `Col` is not dyn compatible
+   |
+   = note: the trait is not dyn compatible because it requires `Self: Sized`
+   = note: for a trait to be dyn compatible it needs to allow building a vtable
+           for more information, visit <https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility>
+   = help: only type `t::id` implements `Col`; consider using it directly instead.

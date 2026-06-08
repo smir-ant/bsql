@@ -11,3 +11,12 @@ bsql-postgres-proto = { path = "../proto" }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = "0.26"
 zeroize = { version = "1", default-features = false, features = ["zeroize_derive", "alloc"] }
+
+# `trybuild` — golden compile-fail harness for the `Col` identifier
+# vocabulary. The closed identifier/type universe and the typed-eq guard
+# are tier-1 compiler invariants; their durable documentation (Part III-C)
+# is a locked `.stderr` set, not a runtime test. Drift in a diagnostic
+# (e.g. a contributor weakening a seal or the `as_sql` return type) trips
+# the golden mismatch instead of silently passing.
+[dev-dependencies]
+trybuild = { workspace = true }

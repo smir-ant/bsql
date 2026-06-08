@@ -75,6 +75,7 @@ version = "0.1.0-alpha.0"
 dependencies = [
  "bsql-postgres-proto",
  "rustls",
+ "trybuild",
  "webpki-roots 0.26.11",
  "zeroize",
 ]

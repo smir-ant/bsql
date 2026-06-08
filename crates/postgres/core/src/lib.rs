@@ -9,6 +9,7 @@
 
 pub mod test_scenarios;
 
+pub mod col;
 pub mod config;
 pub mod error;
 pub mod owned_row;
@@ -16,6 +17,7 @@ pub mod session;
 pub mod ssl;
 pub mod types;
 
+pub use col::{AsIdent, Col, ColType, Text, UnknownColumn};
 pub use config::{ConnectConfig, SslMode};
 pub use error::{DbError, DriverError};
 pub use owned_row::{OwnedRow, OwnedRowTooLarge};

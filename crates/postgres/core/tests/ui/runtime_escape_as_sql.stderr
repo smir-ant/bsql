@@ -1,0 +1,8 @@
+error[E0515]: cannot return value referencing local variable `runtime`
+  --> tests/ui/runtime_escape_as_sql.rs:21:9
+   |
+21 |         runtime.as_str()
+   |         -------^^^^^^^^^
+   |         |
+   |         returns a value referencing data owned by the current function
+   |         `runtime` is borrowed here

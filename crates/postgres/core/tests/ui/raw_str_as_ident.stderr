@@ -1,0 +1,20 @@
+error[E0277]: the trait bound `&str: AsIdent` is not satisfied
+  --> tests/ui/raw_str_as_ident.rs:15:25
+   |
+15 |     let _ = needs_ident("name; DROP TABLE t; --");
+   |             ----------- ^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Col` is not implemented for `&str`
+   |             |
+   |             required by a bound introduced by this call
+   |
+help: the trait `Col` is implemented for `id`
+  --> tests/ui/raw_str_as_ident.rs:7:1
+   |
+ 7 | bsql_postgres_core::columns! { t => [ id: i32 ] }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `&str` to implement `AsIdent`
+note: required by a bound in `needs_ident`
+  --> tests/ui/raw_str_as_ident.rs:9:19
+   |
+ 9 | fn needs_ident<I: AsIdent>(i: I) -> &'static str {
+   |                   ^^^^^^^ required by this bound in `needs_ident`
+   = note: this error originates in the macro `bsql_postgres_core::columns` (in Nightly builds, run with -Z macro-backtrace for more info)
