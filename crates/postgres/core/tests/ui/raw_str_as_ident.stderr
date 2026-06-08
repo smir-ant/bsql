@@ -1,4 +1,4 @@
-error[E0277]: the trait bound `&str: AsIdent` is not satisfied
+error[E0277]: `&str` is not a SQL column identifier usable here
   --> tests/ui/raw_str_as_ident.rs:15:25
    |
 15 |     let _ = needs_ident("name; DROP TABLE t; --");
@@ -6,6 +6,7 @@ error[E0277]: the trait bound `&str: AsIdent` is not satisfied
    |             |
    |             required by a bound introduced by this call
    |
+   = note: an identifier hole (e.g. `order_by`) accepts a `columns!`-minted `Col` marker or a `DynCol` — there is no raw-`&str` -> identifier path
 help: the trait `Col` is implemented for `id`
   --> tests/ui/raw_str_as_ident.rs:7:1
    |

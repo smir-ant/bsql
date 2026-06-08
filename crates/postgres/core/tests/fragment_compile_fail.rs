@@ -80,3 +80,87 @@ fn macro_rejects_runtime_string_skeleton() {
 fn macro_rejects_arity_mismatch() {
     trybuild::TestCases::new().compile_fail("tests/ui/fragment_arity_mismatch.rs");
 }
+
+// ---------------------------------------------------------------------
+// SLICE 3 — the typed combinator surface.
+// ---------------------------------------------------------------------
+
+/// THE MAKE-OR-BREAK GUARD = E0308. A `&str` value bound against an `i16`
+/// column (`users::age.gt("oops")`) does not unify with the column's value
+/// type and is a compile error. This is the "better than sqlx" payoff:
+/// compile-time column↔value type checking.
+#[test]
+fn wrong_typed_predicate_value_str_on_i16_is_e0308() {
+    trybuild::TestCases::new().compile_fail("tests/ui/pred_str_on_i16.rs");
+}
+
+/// TYPED GUARD = E0308. An `i32` value bound against a `Text` column (value
+/// type `&str`) is a compile error.
+#[test]
+fn wrong_typed_predicate_value_i32_on_text_is_e0308() {
+    trybuild::TestCases::new().compile_fail("tests/ui/pred_i32_on_text.rs");
+}
+
+/// TYPED GUARD = E0308. A `Text` column's value type is `&str`, not an owned
+/// `String`; binding a `String` is a compile error.
+#[test]
+fn owned_string_on_text_column_is_e0308() {
+    trybuild::TestCases::new().compile_fail("tests/ui/pred_string_on_text.rs");
+}
+
+/// TYPED GUARD = E0308. An `i32` value bound against a `bool` column is a
+/// compile error.
+#[test]
+fn int_on_bool_column_is_e0308() {
+    trybuild::TestCases::new().compile_fail("tests/ui/pred_int_on_bool.rs");
+}
+
+/// NO SILENT WIDENING = E0308 (literal form). An `i32` *literal* bound
+/// against an `i16` column is a compile error — the guard never widens.
+#[test]
+fn wrong_int_width_literal_is_e0308() {
+    trybuild::TestCases::new().compile_fail("tests/ui/pred_i32_literal_on_i16.rs");
+}
+
+/// NO SILENT WIDENING = E0308 (binding form). An `i32` *variable* bound
+/// against an `i16` column is a compile error; rustc suggests `try_into`.
+#[test]
+fn wrong_int_width_binding_is_e0308() {
+    trybuild::TestCases::new().compile_fail("tests/ui/pred_i32_var_on_i16.rs");
+}
+
+/// OUT-OF-RANGE LITERAL. An unsuffixed literal that infers to the column's
+/// value type (`i16`) but does not fit is rejected by `overflowing_literals`.
+#[test]
+fn out_of_range_literal_for_column_type_is_rejected() {
+    trybuild::TestCases::new().compile_fail("tests/ui/pred_overflow_i16.rs");
+}
+
+/// NO-RAW-STR WALL = E0277. `order_by` accepts `impl AsIdent` — a `Col`
+/// marker or a `DynCol`, never a raw `&str`. There is no raw-`&str` ->
+/// identifier path through ordering.
+#[test]
+fn order_by_raw_str_is_e0277() {
+    trybuild::TestCases::new().compile_fail("tests/ui/order_by_raw_str.rs");
+}
+
+/// NO-RAW-STR WALL = E0277. An owned `String` is likewise not an `AsIdent`.
+#[test]
+fn order_by_owned_string_is_e0277() {
+    trybuild::TestCases::new().compile_fail("tests/ui/order_by_string.rs");
+}
+
+/// THE DROPPED PRECEDENCE FOOTGUN = E0599. There is intentionally no
+/// `or_where` on the builder (it would silently mis-precedence
+/// `A AND B OR C`); `OR` is expressed via `Predicate::or`, which wraps.
+#[test]
+fn no_or_where_on_builder_is_e0599() {
+    trybuild::TestCases::new().compile_fail("tests/ui/no_or_where.rs");
+}
+
+/// A PREDICATE IS NOT A STATEMENT = E0599. A `Predicate` (boolean
+/// expression) cannot be `build()`-assembled; only a `Fragment` can.
+#[test]
+fn predicate_has_no_build_is_e0599() {
+    trybuild::TestCases::new().compile_fail("tests/ui/predicate_not_buildable.rs");
+}

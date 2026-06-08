@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/ui/pred_i32_on_text.rs:11:28
+   |
+11 |     let _ = users::name.eq(5i32);
+   |                         -- ^^^^ expected `&str`, found `i32`
+   |                         |
+   |                         arguments to this method are incorrect
+   |
+note: method defined here
+  --> src/fragment.rs
+   |
+   |     fn eq<'v>(self, v: <Self::Ty as ColType>::Value<'v>) -> Predicate
+   |        ^^

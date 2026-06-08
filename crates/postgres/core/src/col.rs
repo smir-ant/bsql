@@ -212,6 +212,10 @@ pub trait Col: col_seal::Sealed + Copy + 'static {
 /// blanket impl below) and a runtime [`DynCol`] bridge (via the per-table
 /// impl the [`columns!`](crate::columns) macro emits). Used by combinator
 /// holes — like `order_by` — that need an identifier but not its type.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a SQL column identifier usable here",
+    note = "an identifier hole (e.g. `order_by`) accepts a `columns!`-minted `Col` marker or a `DynCol` — there is no raw-`&str` -> identifier path"
+)]
 pub trait AsIdent {
     /// The identifier's SQL text as a `.rodata` literal.
     fn ident(&self) -> &'static str;

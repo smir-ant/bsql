@@ -26,7 +26,7 @@ pub mod ssl;
 pub mod types;
 
 pub use col::{AsIdent, Col, ColType, Text, UnknownColumn};
-pub use fragment::{Assembled, BoundValue, Fragment, IntoBound};
+pub use fragment::{Assembled, BoundValue, ColPredicate, Dir, Fragment, IntoBound, Predicate};
 
 /// `fragment!("SELECT ... WHERE x = {}", value)` — build a [`Fragment`]
 /// value from a literal SQL skeleton with typed `{}` value holes.

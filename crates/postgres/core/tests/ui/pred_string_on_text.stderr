@@ -1,0 +1,17 @@
+error[E0308]: mismatched types
+  --> tests/ui/pred_string_on_text.rs:12:28
+   |
+12 |     let _ = users::name.eq(String::from("a"));
+   |                         -- ^^^^^^^^^^^^^^^^^ expected `&str`, found `String`
+   |                         |
+   |                         arguments to this method are incorrect
+   |
+note: method defined here
+  --> src/fragment.rs
+   |
+   |     fn eq<'v>(self, v: <Self::Ty as ColType>::Value<'v>) -> Predicate
+   |        ^^
+help: consider borrowing here
+   |
+12 |     let _ = users::name.eq(&String::from("a"));
+   |                            +

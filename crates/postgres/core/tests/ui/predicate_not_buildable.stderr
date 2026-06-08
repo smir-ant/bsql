@@ -1,0 +1,5 @@
+error[E0599]: no method named `build` found for struct `Predicate` in the current scope
+  --> tests/ui/predicate_not_buildable.rs:12:32
+   |
+12 |     let _ = users::id.eq(1i32).build();
+   |                                ^^^^^ method not found in `Predicate`
