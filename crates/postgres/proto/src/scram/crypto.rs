@@ -41,10 +41,21 @@ type HmacSha256 = Hmac<Sha256>;
 /// at `parse_server_first` before this function is called.
 ///
 /// The result is wrapped in `Zeroizing` for scrub-on-drop.
-fn salted_password(password: &[u8], salt: &[u8], iterations: u32) -> Zeroizing<[u8; 32]> {
+///
+/// Uses the **fallible** `pbkdf2::pbkdf2` (typed `Err` on the
+/// architecturally-dead key-length path) rather than the infallible
+/// `pbkdf2_hmac`, matching the fail-closed discipline of [`hmac_sha256`]:
+/// crypto primitives never silently degrade — the `Err` path is visible
+/// in the type system and propagates as `ScramError::HmacKeyRejected`.
+fn salted_password(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+) -> Result<Zeroizing<[u8; 32]>, ScramError> {
     let mut out = Zeroizing::new([0u8; 32]);
-    pbkdf2::pbkdf2_hmac::<Sha256>(password, salt, iterations, out.as_mut());
-    out
+    pbkdf2::pbkdf2::<HmacSha256>(password, salt, iterations, out.as_mut())
+        .map_err(|_| ScramError::HmacKeyRejected)?;
+    Ok(out)
 }
 
 /// HMAC-SHA-256(key, message) → 32 bytes.
@@ -195,7 +206,7 @@ pub fn compute_client_proof(
     server_first: &[u8],
     client_final_without_proof: &[u8],
 ) -> Result<(Zeroizing<[u8; 32]>, SecretDigest), ScramError> {
-    let salted_pw = salted_password(password, salt, iterations);
+    let salted_pw = salted_password(password, salt, iterations)?;
 
     // Propagate HMAC errors as typed `ScramError::HmacKeyRejected`
     // rather than silently computing over zeros. All four HMAC calls
