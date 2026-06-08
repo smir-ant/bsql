@@ -4107,6 +4107,64 @@ impl PgProtocol<ActivePhase> {
         self.inner.advance_one_frame(&mut self.extras, write_buf)
     }
 
+    /// Drive the protocol forward, surfacing each output event to `sink`
+    /// — the borrowing-visitor surface (converged §2.2). Loops the
+    /// single-frame pull [`Self::advance_one_frame`], translating each
+    /// [`FeedEvent`](crate::action::FeedEvent) into exactly one
+    /// [`Sink`](crate::sink::Sink) callback, until the buffer is exhausted
+    /// ([`DriveStatus::NeedMore`](crate::sink::DriveStatus)), the command
+    /// completes (`Idle`), row streaming begins (`Streaming`), the
+    /// connection goes terminal (`Closed`), or the host asks to stop
+    /// (`Stopped`).
+    ///
+    /// Runs ALONGSIDE `feed_bytes`/`OutActions` during the §2.2 migration
+    /// — purely additive, so existing callers and tests are untouched.
+    /// Row events are not yet surfaced here (the host still pulls rows via
+    /// `col_next` on `Streaming`); they fold into `drive` with the unified
+    /// engine/cursor.
+    pub fn drive<S: crate::sink::Sink>(
+        &mut self,
+        write_buf: &mut WriteBuf,
+        sink: &mut S,
+    ) -> crate::sink::DriveStatus {
+        use crate::action::FeedEvent;
+        use crate::sink::{DriveStatus, Flow};
+        loop {
+            // `(flow, terminal)`: every arm yields the Sink's flow-control
+            // (Flow is `#[must_use]`; the crate forbids `let _ = …`), plus
+            // whether the event closes the connection.
+            let (flow, terminal) = match self.advance_one_frame(write_buf) {
+                FeedEvent::Idle => return DriveStatus::Idle,
+                FeedEvent::NeedMoreBytes => return DriveStatus::NeedMore,
+                FeedEvent::StreamingRows => return DriveStatus::Streaming,
+                FeedEvent::SendBytes(bytes) => (sink.on_send(bytes), false),
+                FeedEvent::Deliver(id, reply) => (sink.on_deliver(id, &reply), false),
+                FeedEvent::Fail(id) => (sink.on_fail(id), true),
+                FeedEvent::Close => (sink.on_close(), true),
+                FeedEvent::Notice(notice_ref) => (
+                    match self.get_notice(notice_ref) {
+                        Ok(payload) => sink.on_notice(payload),
+                        Err(_) => Flow::Continue,
+                    },
+                    false,
+                ),
+                FeedEvent::Notify { pid, notif_ref } => (
+                    match self.get_notification(notif_ref) {
+                        Ok(payload) => sink.on_notify(pid, payload),
+                        Err(_) => Flow::Continue,
+                    },
+                    false,
+                ),
+            };
+            if terminal {
+                return DriveStatus::Closed;
+            }
+            if flow == Flow::Stop {
+                return DriveStatus::Stopped;
+            }
+        }
+    }
+
     /// Feed inbound wire bytes.
     ///
     /// Returns the action list — bounded by [`MAX_ACTIONS_PER_CALL`].

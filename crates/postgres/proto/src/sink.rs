@@ -41,6 +41,28 @@ pub enum Flow {
     Stop,
 }
 
+/// Outcome of one [`PgProtocol::drive`](crate::PgProtocol) pump: why the
+/// driver loop returned control to the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "the host must act on the drive outcome (read more / stream rows / close)"]
+pub enum DriveStatus {
+    /// All buffered frames for the in-flight command were consumed and the
+    /// protocol is back to Ready/Idle.
+    Idle,
+    /// The read buffer is exhausted; the host must read more bytes from the
+    /// socket, feed them, and call `drive` again.
+    NeedMore,
+    /// The protocol entered row streaming; the host pulls rows (`col_next`)
+    /// before re-driving. (Row events move into `drive` itself once the
+    /// unified engine/cursor lands.)
+    Streaming,
+    /// Terminal: a `Fail` or `Close` was delivered; the host should close
+    /// the socket.
+    Closed,
+    /// A [`Sink`] callback returned [`Flow::Stop`]; the host asked to stop.
+    Stopped,
+}
+
 /// Receives protocol output events, one at a time, each borrowed in place.
 ///
 /// Every method defaults to [`Flow::Continue`] (ignore-and-continue), so a
@@ -71,9 +93,14 @@ pub trait Sink {
         Flow::Continue
     }
 
-    /// An asynchronous `NotificationResponse` (LISTEN/NOTIFY), borrowed
-    /// from the read buffer.
-    fn on_notify(&mut self, _payload: &crate::notifications_arena::NotificationPayload) -> Flow {
+    /// An asynchronous `NotificationResponse` (LISTEN/NOTIFY): `pid` is the
+    /// notifying backend's process id, `payload` (channel + message) is
+    /// borrowed from the read buffer.
+    fn on_notify(
+        &mut self,
+        _pid: i32,
+        _payload: &crate::notifications_arena::NotificationPayload,
+    ) -> Flow {
         Flow::Continue
     }
 

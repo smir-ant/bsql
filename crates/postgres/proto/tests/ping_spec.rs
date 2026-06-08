@@ -171,6 +171,58 @@ fn ping_from_idle_emits_sync_bytes() {
     drain_pending_ping(&mut proto, &mut wb);
 }
 
+/// Invariant (§2.2 visitor surface): driving the same buffered
+/// `ReadyForQuery` through `PgProtocol::drive` delivers the Pong via
+/// `Sink::on_deliver` (same correlator, same `Reply::Pong`) and returns
+/// `DriveStatus::Idle`. Proves the new borrowing-visitor output surface
+/// is wired end-to-end, parallel to the `feed_bytes`/`OutActions` path
+/// exercised by the test below.
+#[test]
+fn drive_delivers_pong_via_sink() {
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = bsql_postgres_proto::WriteBuf::new();
+    let (reply, ping_raw) = mint_reply::<PingKind>(&mut proto);
+    ping_setup(&mut proto, reply, &mut wb);
+
+    // Buffer the RFQ, then DRIVE it through the Sink surface.
+    match proto.feed_inbound(&rfq_frame(b'I')) {
+        Ok(()) => {}
+        Err(e) => panic!("feed_inbound failed: {e:?}"),
+    }
+
+    struct CaptureSink {
+        delivered: Option<NonZeroU64>,
+        pong: bool,
+    }
+    impl bsql_postgres_proto::Sink for CaptureSink {
+        fn on_deliver(
+            &mut self,
+            id: NonZeroU64,
+            reply: &Reply,
+        ) -> bsql_postgres_proto::Flow {
+            self.delivered = Some(id);
+            self.pong = matches!(reply, Reply::Pong(_));
+            bsql_postgres_proto::Flow::Continue
+        }
+    }
+
+    let mut sink = CaptureSink { delivered: None, pong: false };
+    let status = proto.drive(&mut wb, &mut sink);
+
+    assert_eq!(
+        status,
+        bsql_postgres_proto::sink::DriveStatus::Idle,
+        "ping RFQ fully consumed via drive → Idle",
+    );
+    assert_eq!(
+        sink.delivered,
+        Some(ping_raw),
+        "Sink::on_deliver routed the ping correlator unchanged",
+    );
+    assert!(sink.pong, "delivered Reply::Pong via the Sink surface");
+    assert!(matches!(proto.state(), ActiveState::Idle));
+}
+
 /// Invariant (spec): feeding a complete `ReadyForQuery` frame while
 /// awaiting a ping reply emits `DeliverReply { value: Pong { tx_status } }`,
 /// carries the correct status byte, returns state to `Idle`, and leaves
