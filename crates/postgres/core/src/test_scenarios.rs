@@ -6,7 +6,6 @@
 /// ```
 ///
 /// Each scenario tests one SQL mechanism. All use one connection.
-
 #[macro_export]
 macro_rules! define_sync_sql_tests {
     ($config_fn:expr) => {

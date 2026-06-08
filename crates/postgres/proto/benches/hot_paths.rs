@@ -1950,9 +1950,9 @@ fn bench_advance_one_frame_ping(c: &mut Criterion) {
                     wb,
                 );
                 let _ = black_box(push_out);
-                proto.feed_inbound(black_box(&rfq));
+                let _ = proto.feed_inbound(black_box(&rfq));
                 let event = proto.advance_one_frame(wb);
-                black_box(event);
+                let _ = black_box(event);
             },
             BatchSize::SmallInput,
         );

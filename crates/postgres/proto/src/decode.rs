@@ -3247,9 +3247,9 @@ mod format_code_set_tests {
     // Display surface, parser integration, and the wide-RowDesc
     // bit-pack round-trip.
 
-    /// `OutOfRange::Display` carries the offending idx + max — used
-    /// by future operator diagnostics. Pin the format so a body swap
-    /// (idx vs max) is caught.
+    // `OutOfRange::Display` carries the offending idx + max — used
+    // by future operator diagnostics. Pin the format so a body swap
+    // (idx vs max) is caught.
     // FormatCodeSet and OutOfRange deleted — format codes now stored
     // as trailing u32 words in RowDesc's Box<[u32]>.
 

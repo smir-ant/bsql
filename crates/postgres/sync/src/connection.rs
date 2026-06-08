@@ -9,7 +9,10 @@ use bsql_postgres_proto::FeedEvent;
 
 enum Stream {
     Plain(TcpStream),
-    Tls(rustls::StreamOwned<rustls::ClientConnection, TcpStream>),
+    // Boxed: a rustls TLS stream is far larger than a bare TcpStream; boxing
+    // the rare TLS variant keeps `Stream` (and `Connection`) small. The deref
+    // is per-syscall, not per-row — negligible.
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
 }
 
 impl Stream {
@@ -95,7 +98,7 @@ impl Connection {
             bsql_postgres_core::ssl::SslProbe::Accepted { tls_config, server_name } => {
                 let tls_conn = rustls::ClientConnection::new(tls_config, server_name)
                     .map_err(|e| DriverError::Io(std::io::Error::other(format!("TLS: {e}"))))?;
-                Ok(Stream::Tls(rustls::StreamOwned::new(tls_conn, tcp)))
+                Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(tls_conn, tcp))))
             }
             bsql_postgres_core::ssl::SslProbe::PlainTcp => Ok(Stream::Plain(tcp)),
         }
@@ -126,7 +129,11 @@ impl Connection {
                     for _ in 0..5 {
                         if self.session.is_healthy() { break; }
                         if let Ok(n) = self.stream.read(&mut self.read_buf)
-                            && n > 0 { let _ = self.session.feed(&self.read_buf[..n]); }
+                            && n > 0
+                            && self.session.feed(&self.read_buf[..n]).is_err()
+                        {
+                            break;
+                        }
                         self.session.drain_to_idle();
                     }
                     return Err(e);
@@ -380,7 +387,6 @@ impl Connection {
         let actions = self.session.proto.feed_bytes(&[], &mut self.session.wb);
         let had_fail = actions.as_slice().iter()
             .any(|a| matches!(a, bsql_postgres_proto::Action::FailReply { .. }));
-        drop(actions);
         if had_fail {
             let err = self.session.proto.fail_cause()
                 .map(|&c| self.session.classify_error(c))
@@ -388,7 +394,11 @@ impl Connection {
             for _ in 0..5 {
                 if self.session.is_healthy() { break; }
                 if let Ok(n) = self.stream.read(&mut self.read_buf)
-                    && n > 0 { let _ = self.session.feed(&self.read_buf[..n]); }
+                    && n > 0
+                    && self.session.feed(&self.read_buf[..n]).is_err()
+                {
+                    break;
+                }
                 self.session.drain_to_idle();
             }
             return Err(err);

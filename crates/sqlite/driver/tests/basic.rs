@@ -77,12 +77,12 @@ fn null_handling() {
 #[test]
 fn typed_access() {
     let conn = Connection::open_in_memory().expect("open");
-    let result = conn.query("SELECT 42, 3.14, 'text', 1, 0").expect("select");
+    let result = conn.query("SELECT 42, 2.5, 'text', 1, 0").expect("select");
     let row = &result.rows[0];
 
     assert_eq!(row.get_i32(0), Some(42));
     assert_eq!(row.get_i64(0), Some(42));
-    assert_eq!(row.get_f64(1), Some(3.14));
+    assert_eq!(row.get_f64(1), Some(2.5));
     assert_eq!(row.get_str(2), Some("text"));
     assert_eq!(row.get_bool(3), Some(true));
     assert_eq!(row.get_bool(4), Some(false));
@@ -276,10 +276,10 @@ fn transaction_closure_return_value() {
 #[test]
 fn typed_get_from_text() {
     let conn = Connection::open_in_memory().expect("open");
-    let r = conn.query("SELECT 42, 3.14, 'hello'").expect("query");
+    let r = conn.query("SELECT 42, 2.5, 'hello'").expect("query");
     let row = &r.rows[0];
     assert_eq!(row.get::<i32>(0), Some(42));
-    assert_eq!(row.get::<f64>(1), Some(3.14));
+    assert_eq!(row.get::<f64>(1), Some(2.5));
     assert_eq!(row.get::<String>(2), Some("hello".to_string()));
 }
 
@@ -301,10 +301,10 @@ fn execute_batch_multi_statement() {
 #[test]
 fn native_integer_access() {
     let conn = Connection::open_in_memory().expect("open");
-    let r = conn.query("SELECT 42, 3.14, NULL").expect("query");
+    let r = conn.query("SELECT 42, 2.5, NULL").expect("query");
     let row = &r.rows[0];
     assert_eq!(row.get_i64(0), Some(42));
-    assert_eq!(row.get_f64(1), Some(3.14));
+    assert_eq!(row.get_f64(1), Some(2.5));
     assert_eq!(row.get_f64(0), Some(42.0)); // Integer → f64 coercion
     assert!(row.is_null(2));
 }

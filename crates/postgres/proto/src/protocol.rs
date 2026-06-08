@@ -6386,7 +6386,6 @@ impl PgProtocol<ActivePhase> {
     /// cycle that produced them — after the next call, stale refs
     /// return `Err(ArenaError::Stale)`.
     #[inline]
-    #[must_use]
     pub fn get_notice(
         &self,
         r: crate::notices_arena::NoticeRef,

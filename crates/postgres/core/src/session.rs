@@ -221,7 +221,6 @@ impl Session {
             }
         }
         let was_empty = actions.as_slice().is_empty();
-        drop(actions);
 
         if had_close { return PumpAction::Error(DriverError::NotReady); }
         if had_fail {
@@ -282,8 +281,7 @@ impl Session {
         if let bsql_postgres_proto::ProtocolError::ServerErrorResponse {
             severity, code, details_ref,
         } = cause {
-            let sev = severity.map(|s| s.as_str().to_string())
-                .unwrap_or_else(|| "ERROR".to_string());
+            let sev = severity.map(|s| s.as_str().to_string());
             let sqlstate = code.as_str().trim().to_string();
             let (msg, det, hnt) = match self.proto.get_server_error(details_ref) {
                 Ok(bsql_postgres_proto::ErrorPayload::ServerError { message, detail, hint }) => {

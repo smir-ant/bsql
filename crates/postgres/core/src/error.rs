@@ -4,7 +4,10 @@ use std::fmt;
 #[derive(Debug, Clone)]
 pub struct DbError {
     pub code: String,
-    pub severity: String,
+    /// Server-reported severity. `None` when the server omitted it or it was
+    /// unrecognized — never fabricated. (Display falls back to "ERROR" for
+    /// presentation only; the stored value stays honest.)
+    pub severity: Option<String>,
     pub message: String,
     pub detail: Option<String>,
     pub hint: Option<String>,
@@ -12,7 +15,7 @@ pub struct DbError {
 
 impl fmt::Display for DbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {} ({})", self.severity, self.message, self.code)?;
+        write!(f, "{}: {} ({})", self.severity.as_deref().unwrap_or("ERROR"), self.message, self.code)?;
         if let Some(ref d) = self.detail
             && !d.is_empty() { write!(f, "\nDETAIL: {d}")?; }
         if let Some(ref h) = self.hint

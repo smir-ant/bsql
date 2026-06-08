@@ -7,7 +7,10 @@ use tokio::net::TcpStream;
 
 enum Stream {
     Plain(TcpStream),
-    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+    // Boxed: a rustls TLS stream is far larger than a bare TcpStream; boxing
+    // the rare TLS variant keeps `Stream` (and `Connection`) small. The deref
+    // is per-syscall, not per-row — negligible.
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
 impl Stream {
@@ -85,7 +88,7 @@ impl Connection {
                     .map_err(|e| DriverError::Io(std::io::Error::new(
                         std::io::ErrorKind::ConnectionRefused, format!("TLS: {e}"),
                     )))?;
-                Ok(Stream::Tls(tls_stream))
+                Ok(Stream::Tls(Box::new(tls_stream)))
             }
             bsql_postgres_core::ssl::SslProbe::PlainTcp => Ok(Stream::Plain(tcp)),
         }
@@ -117,7 +120,11 @@ impl Connection {
                     for _ in 0..5 {
                         if self.session.is_healthy() { break; }
                         if let Ok(n) = self.stream.read(&mut self.read_buf).await
-                            && n > 0 { let _ = self.session.feed(&self.read_buf[..n]); }
+                            && n > 0
+                            && self.session.feed(&self.read_buf[..n]).is_err()
+                        {
+                            break;
+                        }
                         self.session.drain_to_idle();
                     }
                     return Err(e);
@@ -308,8 +315,9 @@ impl Connection {
     pub async fn commit(&mut self) -> Result<(), DriverError> { self.simple_query("COMMIT").await?; Ok(()) }
     pub async fn rollback(&mut self) -> Result<(), DriverError> { self.simple_query("ROLLBACK").await?; Ok(()) }
 
-    /// Execute an async closure within a transaction. COMMIT on Ok, ROLLBACK on Err.
-    /// Tier-1 safety: transaction boundary = closure scope.
+    // Async transactions: use begin()/commit()/rollback().
+    // A closure-based transaction() (like the sync driver's) needs an async
+    // closure borrowing &mut self, which on stable Rust requires Box<dyn Future>.
     // Note: async closures with borrowed &mut self don't work in stable Rust
     // without Box<dyn Future>. Use begin()/commit()/rollback() for async
     // transactions. The sync driver has a proper closure-based transaction()
@@ -364,7 +372,6 @@ impl Connection {
         let actions = self.session.proto.feed_bytes(&[], &mut self.session.wb);
         let had_fail = actions.as_slice().iter()
             .any(|a| matches!(a, bsql_postgres_proto::Action::FailReply { .. }));
-        drop(actions);
         if had_fail {
             let err = self.session.proto.fail_cause()
                 .map(|&c| self.session.classify_error(c))
