@@ -1215,6 +1215,16 @@ pub struct TextFmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BinaryFmt;
 
+// Footprint anchors (tier-1, build-time): the format markers are pure
+// type-level tags and MUST stay zero-sized — a `Cell<F>` carries `F`
+// by value, so any accidental field on a marker would inflate every
+// decoded cell. Pinned at module scope so the contract fires at
+// `cargo check` (incl. for never-instantiated markers), not only under
+// `cargo test`. Supersedes the former `assert_eq!(size_of) == 0` test
+// pins (the const anchor is strictly stronger — build-time + align).
+crate::wire_pin!(TextFmt, size = 0, align = 1);
+crate::wire_pin!(BinaryFmt, size = 0, align = 1);
+
 impl format_marker_sealed::FmtSealed for TextFmt {}
 impl format_marker_sealed::FmtSealed for BinaryFmt {}
 
@@ -3979,12 +3989,6 @@ mod decode_format_tests {
         assert!(matches!(r, Err(DecodeError::BinaryLengthMismatch { expected_len: 4, .. })));
     }
 
-    #[test]
-    fn marker_zero_sized() {
-        // ZST property — markers carry zero runtime cost.
-        assert_eq!(core::mem::size_of::<TextFmt>(), 0);
-        assert_eq!(core::mem::size_of::<BinaryFmt>(), 0);
-    }
 }
 
 #[cfg(test)]

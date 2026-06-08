@@ -206,7 +206,7 @@ pub trait PushCommand: sealed::PushCommandSealed {
 ///
 /// # Size
 ///
-/// `size_of::<Ping>()` = 16 B (just the [`ReplyId<PingKind>`]). A
+/// `size_of::<Ping>()` = 8 B (just the [`ReplyId<PingKind>`]). A
 /// runtime `PgCommand` enum sized to its largest variant would move
 /// 2176 B by value on every Ping push.
 #[derive(Debug)]
@@ -216,6 +216,21 @@ pub struct Ping {
     /// [`crate::Reply::Pong`] back to the caller.
     pub reply: ReplyId<PingKind>,
 }
+
+// Footprint anchors (tier-1, build-time). `Ping` is the smallest
+// command and MUST carry only its correlator — no padding, no extra
+// field. The relational pin preserves the "minimal" intent (Ping ==
+// ReplyId<PingKind>) robustly across any ReplyId change; the exact pin
+// fixes the absolute envelope and the alignment that the relational
+// form leaves implicit. These fire at `cargo check` (incl. when no
+// `Ping` is ever constructed), superseding the former `cfg(test)`
+// `ping_is_minimal` relational assert (the const anchor is strictly
+// stronger — build-time, never-instantiated, + align).
+const _: () = assert!(
+    core::mem::size_of::<Ping>() == core::mem::size_of::<ReplyId<PingKind>>(),
+    "Ping must carry only ReplyId<PingKind> — no padding / extra fields.",
+);
+crate::wire_pin!(Ping, size = 8, align = 8);
 
 impl Ping {
     /// Construct a new [`Ping`] with the given reply correlator.
@@ -1001,45 +1016,32 @@ where
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Size pins — per-command-struct drift guards
+// Outbound-command footprint anchors (tier-1, build-time)
+//
+// Exact size + align pins for every non-type-generic outbound command,
+// co-located in one block. Each fires at `cargo check` even when the
+// command is never constructed — strictly stronger than the former
+// `cfg(test)` size asserts (which were size-only, run-time, and only
+// covered a type if someone remembered to write the test).
+//
+// `&'a str` SQL is the load-bearing shape for SimpleQuery/Parse: the
+// borrow keeps them small. Re-embedding owned SQL would balloon Parse
+// from 96 B to ~2132 B and trip its anchor immediately.
+//
+// `Ping` is pinned above, next to its definition. The type-generic
+// commands `BindExecute<P>` / `BindPrepared<P, R>` are deliberately NOT
+// pinned here: their footprint is a function of the param/row type
+// parameters, so a single literal would be meaningless (see the
+// per-monomorph `<= 144 B` bound documented on `BindPrepared`).
 // ═════════════════════════════════════════════════════════════════════
 
-#[cfg(test)]
-mod size_pins {
-    use super::*;
-
-    /// Tier-1 drift guard: `Ping` is the smallest command. Pin its
-    /// size at the ReplyId baseline (16 B on aarch64-darwin); a
-    /// regression that grew Ping by adding a field would surface here.
-    #[test]
-    fn ping_is_minimal() {
-        assert_eq!(
-            core::mem::size_of::<Ping>(),
-            core::mem::size_of::<ReplyId<PingKind>>(),
-            "Ping must carry only ReplyId — no padding/extra fields",
-        );
-    }
-
-    /// Tier-1 drift guard: Parse + SimpleQuery sizes are bounded at
-    /// "small" (≤ 128 B for Parse, ≤ 64 B for SimpleQuery). `&'a str`
-    /// SQL is the load-bearing shape — re-embedding owned SQL would
-    /// surface here dramatically (jump from ~96 B to ~2132 B for
-    /// Parse).
-    #[test]
-    fn parse_and_simple_query_carry_no_inline_sql() {
-        let parse_size = core::mem::size_of::<Parse<'static>>();
-        let simple_query_size = core::mem::size_of::<SimpleQuery<'static>>();
-        assert!(
-            parse_size <= 128,
-            "Parse must be ≤ 128 B (no inline SQL); got {parse_size} B. \
-             A regression to ~2132 B would mean an owned-Sql field came back.",
-        );
-        assert!(
-            simple_query_size <= 64,
-            "SimpleQuery must be ≤ 64 B; got {simple_query_size} B.",
-        );
-    }
-}
+crate::wire_pin!(SimpleQuery<'static>, size = 24, align = 8);
+crate::wire_pin!(Parse<'static>, size = 96, align = 8);
+crate::wire_pin!(DescribeStatement, size = 80, align = 8);
+crate::wire_pin!(DescribePortal, size = 80, align = 8);
+crate::wire_pin!(CloseStatement, size = 80, align = 8);
+crate::wire_pin!(ClosePortal, size = 80, align = 8);
+crate::wire_pin!(ExecutePortal<'static>, size = 40, align = 8);
 
 // ═════════════════════════════════════════════════════════════════════
 // Hostile-witness seal pin

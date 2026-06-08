@@ -579,6 +579,103 @@ const _: fn() = || {
     <protocol::PgProtocol<protocol::ActivePhase> as AmbiguousIfSync<_>>::assert_not_sync();
 };
 
+/// Pin the **footprint** (`size_of` AND `align_of`) of a wire type at
+/// build time — a layout drift becomes an `E0080` const-eval failure,
+/// not a silent regression and not a `cargo test`-only catch.
+///
+/// # Why both dimensions
+///
+/// The crate already carries ~60 module-level `const _: () =
+/// assert!(size_of::<T>() == N, …)` anchors. Those catch a *size*
+/// change but are **blind to alignment / niche drift**: a type can keep
+/// its byte count while its alignment changes (e.g. a field reorder that
+/// raises `align` from 4 to 8 without growing `size`, or a niche being
+/// lost). `align_of` is the dimension the size-only anchors miss. This
+/// macro pins both in one place so the two cannot drift apart.
+///
+/// # Tier
+///
+/// **Tier-1, build-time (CREDO §0).** The emitted item is a free-standing
+/// `const _: () = { … }` — it is **not** behind any `#[cfg(test)]`, so the
+/// compiler evaluates it during `cargo check` / `cargo build`, **including
+/// for types that are constructed nowhere in the binary**. A `cargo
+/// test`-only `assert_eq!(size_of…)` is strictly weaker: it fires only
+/// when the test binary runs and only for a type whose author remembered
+/// to write the test. This anchor needs neither.
+///
+/// Runtime cost is **zero**: the `const _` item is fully asm-erased; it
+/// emits no code (verified via the post-LTO codegen diff — adding anchors
+/// is ASM-neutral).
+///
+/// # Lifetime-generic wire types
+///
+/// `size_of` / `align_of` require a concrete type. For a wire type with a
+/// borrow parameter, pin a `'static` instantiation (the crate idiom — see
+/// the [`action::Action<'static>`] / [`action::FeedEvent<'static>`]
+/// anchors below):
+///
+/// ```
+/// # use bsql_postgres_proto::wire_pin;
+/// # struct Frame<'a> { body: &'a [u8] }
+/// wire_pin!(Frame<'static>, size = 16, align = 8);
+/// ```
+///
+/// # Residual (named honestly)
+///
+/// This macro makes the *contract it is asked to enforce* tier-1, but it
+/// does **not** force a brand-new wire type to carry one. The crate *does*
+/// have a generic outbound chokepoint — [`ReadyGuard::push_command<C:
+/// PushCommand>`](crate::guard) — yet routing a type through it still
+/// cannot force a pin: (a) a use-site bound (`C: PushCommand + Wire`) is
+/// checked only at monomorphisation, i.e. for *routed* types, which loses
+/// the never-instantiated guarantee that is the whole point; (b) a
+/// `PushCommand: Wire` supertrait cannot force per-impl evaluation either —
+/// Rust does not const-evaluate an *unused* associated const at the impl
+/// site, so each type would still need a per-type opt-in const reference,
+/// no stronger than this macro; and (c) `#[repr(…)]` is a built-in
+/// attribute with no negative reasoning ("every `#[repr]` type must impl
+/// `Wire`" is inexpressible). So "every wire type must be pinned" stays
+/// author-discipline (tier-3); the pin a type *does* carry is tier-1.
+///
+/// # Drift is a build failure
+///
+/// A wrong pin (or a layout change that invalidates a correct pin) aborts
+/// the build with `E0080`:
+///
+/// ```compile_fail,E0080
+/// use bsql_postgres_proto::wire_pin;
+/// #[repr(C)]
+/// struct Drifted { a: u32, b: u32, c: u32 } // 12 B actual
+/// wire_pin!(Drifted, size = 8, align = 4);   // pinned 8 → E0080
+/// fn main() {}
+/// ```
+///
+/// …and a size-preserving *alignment* drift, which the size-only anchors
+/// cannot see, also aborts:
+///
+/// ```compile_fail,E0080
+/// use bsql_postgres_proto::wire_pin;
+/// #[repr(C, align(8))]
+/// struct AlignDrifted { a: u32, b: u32 } // 8 B, align 8
+/// wire_pin!(AlignDrifted, size = 8, align = 4); // pinned align 4 → E0080
+/// fn main() {}
+/// ```
+#[macro_export]
+macro_rules! wire_pin {
+    ($t:ty, size = $n:expr, align = $a:expr $(,)?) => {
+        const _: () = {
+            assert!(
+                core::mem::size_of::<$t>() == $n,
+                concat!("WIRE FOOTPRINT DRIFT (size) for ", stringify!($t))
+            );
+            assert!(
+                core::mem::align_of::<$t>() == $a,
+                concat!("WIRE FOOTPRINT DRIFT (align) for ", stringify!($t))
+            );
+        };
+    };
+}
+
 // ---------------------------------------------------------------------
 // Tier-1 compile gates on enum / struct **size**.
 //
@@ -628,7 +725,12 @@ const _: () = assert!(
 
 // Tight-range size asserts. Bound BOTH directions to catch field
 // additions (upper) AND accidental field removals (lower). Exact
-// pins where reproducible cross-platform.
+// pins where reproducible cross-platform. The companion **alignment**
+// manifest (further down, just before the Drop-semantics gates) pins
+// `align_of` for every type covered here — size alone is blind to a
+// size-preserving alignment / niche drift. New small fixed-layout wire
+// types should additionally use the [`wire_pin!`] macro (size + align
+// in one co-located anchor).
 const _: () = assert!(
     core::mem::size_of::<error::ProtocolError>() == 24,
     "ProtocolError exact size — 24 B post-\
@@ -1060,6 +1162,79 @@ const _: () = assert!(
      Larger sizes regress consumer crate .rodata footprint and \
      LLVM whole-crate codegen heuristics.",
 );
+
+// ---------------------------------------------------------------------
+// Tier-1 compile gates on enum / struct **alignment**.
+//
+// The size anchors above pin `size_of` but are BLIND to alignment /
+// niche drift: a type can keep its byte count while its `align_of`
+// changes — e.g. a field reorder that raises align 4 → 8 without
+// growing the size, an added `#[repr(align(N))]`, or a lost niche.
+// Alignment governs how a type packs inside an enum variant and how a
+// `[T]` strides; a silent align bump can re-pad an outer struct (a
+// real footprint regression that the size pin on the *inner* type
+// would not see). These exact `align_of` pins close that dimension for
+// every type the size manifest covers. Exact `==` (align is exact, not
+// ranged, even where the size pin is `<=`). Reference target:
+// aarch64-apple-darwin; per-target `#[cfg(...)]` blocks land in the
+// same commit that adds another target. Zero runtime cost (asm-erased).
+const _: () = {
+    use core::mem::align_of;
+    // 8-aligned: every type whose dominant field is a pointer, u64
+    // niche-donor (NonZeroU64 ids), or i32/u32 cluster padded to 8.
+    assert!(align_of::<error::ProtocolError>() == 8, "ProtocolError align drift");
+    assert!(align_of::<action::Action<'static>>() == 8, "Action align drift");
+    assert!(align_of::<state::ProtoState>() == 8, "ProtoState align drift");
+    assert!(align_of::<command::PgCommand>() == 8, "PgCommand align drift");
+    assert!(
+        align_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 8,
+        "PgProtocol<Active> align drift",
+    );
+    assert!(
+        align_of::<protocol::PgProtocol<protocol::ConnectingPhase>>() == 8,
+        "PgProtocol<Connecting> align drift",
+    );
+    assert!(
+        align_of::<protocol::PgProtocol<protocol::ClosedPhase>>() == 8,
+        "PgProtocol<Closed> align drift",
+    );
+    assert!(align_of::<protocol::ClosedInner>() == 8, "ClosedInner align drift");
+    assert!(align_of::<dispatch::DispatchOutcome>() == 8, "DispatchOutcome align drift");
+    assert!(align_of::<action::OutActions<'static>>() == 8, "OutActions align drift");
+    assert!(align_of::<action::PushFailure>() == 8, "PushFailure align drift");
+    assert!(
+        align_of::<Option<action::PushFailure>>() == 8,
+        "Option<PushFailure> align drift",
+    );
+    assert!(align_of::<action::FeedEvent<'static>>() == 8, "FeedEvent align drift");
+    assert!(
+        align_of::<Option<action::FeedEvent<'static>>>() == 8,
+        "Option<FeedEvent> align drift",
+    );
+    assert!(
+        align_of::<prepared::PreparedQuery<(i32,), (i32, &'static str)>>() == 8,
+        "PreparedQuery align drift",
+    );
+    assert!(
+        align_of::<reply_id::ReplyId<reply_id::PingKind>>() == 8,
+        "ReplyId<PingKind> align drift",
+    );
+    // 4-aligned: Reply's dominant variant is an i32/i32/u8 cluster.
+    assert!(align_of::<action::Reply>() == 4, "Reply align drift");
+    // ZSTs: align 1 (the uninhabited / unit phase markers).
+    assert!(
+        align_of::<protocol::PgProtocol<protocol::DisconnectedPhase>>() == 1,
+        "PgProtocol<Disconnected> align drift",
+    );
+    assert!(
+        align_of::<protocol::PgProtocol<protocol::SslNegotiatingPhase>>() == 1,
+        "PgProtocol<SslNegotiating> align drift",
+    );
+    assert!(
+        align_of::<protocol::DisconnectedInner>() == 1,
+        "DisconnectedInner align drift",
+    );
+};
 
 // ---------------------------------------------------------------------
 // Tier-1 compile gates on Drop semantics.

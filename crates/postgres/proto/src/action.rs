@@ -359,6 +359,15 @@ const _: () = assert!(
     core::mem::size_of::<WriteRange>() == core::mem::size_of::<NonEmptyRange>(),
     "WriteRange size regression — must equal NonEmptyRange (4 B).",
 );
+// Exact footprint anchors (tier-1, build-time). The relational anchor
+// above pins WriteRange == NonEmptyRange but does NOT pin the absolute
+// 4-byte envelope, the alignment, or the `Option` niche. These do —
+// firing at `cargo check`, superseding the former `cfg(test)`
+// `assert_eq!(size_of) == 4` pins (build-time + align is strictly
+// stronger). `Option<WriteRange>` must stay 4 B: the `NonZeroU16` len
+// inside `NonEmptyRange` donates the niche for the `None` discriminant.
+crate::wire_pin!(WriteRange, size = 4, align = 2);
+crate::wire_pin!(Option<WriteRange>, size = 4, align = 2);
 
 #[cfg(test)]
 mod range_newtype_tests {
@@ -390,18 +399,6 @@ mod range_newtype_tests {
         let slice: &[u8] = range.apply(bytes).unwrap_or(&[]);
         let byte = slice.first().copied().unwrap_or(0);
         assert_eq!(byte, 0x42, "WriteRange apply round-trips the pushed byte");
-    }
-
-    /// Drift pin — WriteRange is 4 bytes (identical layout to
-    /// `NonEmptyRange`; no phantom).
-    #[test]
-    fn write_range_sizes_match_raw() {
-        assert_eq!(core::mem::size_of::<WriteRange>(), 4);
-        assert_eq!(
-            core::mem::size_of::<Option<WriteRange>>(),
-            4,
-            "Option<WriteRange> must niche-pack on NonZeroU16 inside NonEmptyRange.len",
-        );
     }
 
     /// `inner()` accessor round-trip.
