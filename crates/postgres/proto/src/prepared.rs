@@ -29,11 +29,11 @@
 //! format-code block (`n_format_codes = 1, formats = [Text]` for
 //! N ≥ 1; `n_format_codes = 0` for N = 0). All-text default —
 //! text is the safer choice for ad-hoc primitive types and matches
-//! today's [`DecodeFormat<TextFmt>`] matrix.
+//! today's [`Cell<TextFmt>`](crate::decode::Cell) matrix.
 
 use core::marker::PhantomData;
 
-use crate::decode::{DecodeError, DecodeFormat, FormatCode, TextFmt};
+use crate::decode::{Cell, DecodeError, FormatCode, TextFmt};
 use crate::params::ParamsWriter;
 
 mod sealed {
@@ -69,8 +69,8 @@ mod sealed {
 ///
 /// # `ARITY` and `OIDS`
 ///
-/// Per-impl: tuple arity and per-element [`DecodeFormat::OID`] are
-/// drift-pinned. A future schema change that desynced the OID list
+/// Per-impl: tuple arity and per-element [`Cell::OID`](crate::decode::Cell)
+/// are drift-pinned. A future schema change that desynced the OID list
 /// fails the build.
 ///
 /// # NULL handling
@@ -115,7 +115,7 @@ pub trait RowDecode: sealed::RowDecodeSealed + Sized {
     /// # Errors
     ///
     /// [`DecodeError`] when any per-column byte body fails its
-    /// type's `DecodeFormat::decode`. The first failing column
+    /// type's `Cell::decode`. The first failing column
     /// short-circuits the row decode.
     fn decode<'a>(
         bytes_per_col: &[Option<&'a [u8]>],
@@ -134,7 +134,7 @@ pub trait RowDecode: sealed::RowDecodeSealed + Sized {
 //      type to its at-`'a` borrowing shape.
 //
 // `ColTextAt<'a>` is sealed crate-internal; only the primitive
-// `DecodeFormat<'a, TextFmt>`-impl types have it.
+// `Cell<'a, TextFmt>`-impl types have it.
 
 /// Crate-internal projection: marker type → at-`'a` decoded type.
 /// `i32 → i32` (no lifetime), `&'static str → &'a str`, etc.
@@ -155,7 +155,7 @@ pub trait ColTextAt<'a>: col_text_at_sealed::Sealed {
     /// The type decoded from text-format bytes at lifetime `'a`.
     type At;
     /// PG OID for this column type (drift-pinned against
-    /// `DecodeFormat::OID` per impl).
+    /// `Cell::OID` per impl).
     const OID: u32;
     /// Decode a single column body.
     fn decode_at(bytes: &'a [u8]) -> Result<Self::At, DecodeError>;
@@ -174,10 +174,10 @@ macro_rules! col_text_at_primitive {
             impl col_text_at_sealed::Sealed for $t {}
             impl<'a> ColTextAt<'a> for $t {
                 type At = $t;
-                const OID: u32 = <$t as DecodeFormat<'a, TextFmt>>::OID;
+                const OID: u32 = <$t as Cell<'a, TextFmt>>::OID;
                 #[inline]
                 fn decode_at(bytes: &'a [u8]) -> Result<Self::At, DecodeError> {
-                    <$t as DecodeFormat<'a, TextFmt>>::decode(bytes)
+                    <$t as Cell<'a, TextFmt>>::decode(bytes)
                 }
             }
         )+
@@ -191,10 +191,10 @@ col_text_at_primitive!(i16, i32, i64, u32, bool);
 impl col_text_at_sealed::Sealed for &'static str {}
 impl<'a> ColTextAt<'a> for &'static str {
     type At = &'a str;
-    const OID: u32 = <&'static str as DecodeFormat<'static, TextFmt>>::OID;
+    const OID: u32 = <&'static str as Cell<'static, TextFmt>>::OID;
     #[inline]
     fn decode_at(bytes: &'a [u8]) -> Result<Self::At, DecodeError> {
-        <&'a str as DecodeFormat<'a, TextFmt>>::decode(bytes)
+        <&'a str as Cell<'a, TextFmt>>::decode(bytes)
     }
 }
 
@@ -632,7 +632,7 @@ mod tests {
         assert_eq!(<Sixteen as RowDecode>::OIDS.len(), 16);
     }
 
-    /// Decode forwards to per-element `DecodeFormat<TextFmt>`. The
+    /// Decode forwards to per-element `Cell<TextFmt>`. The
     /// GAT projection substitutes the input lifetime for `&'static str`.
     #[test]
     fn row_decode_text_smoke() {

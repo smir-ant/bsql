@@ -790,7 +790,7 @@ fn bench_push_ping(c: &mut Criterion) {
 // Covers what happens AFTER `RowStream::next_row_bytes` hands raw
 // row bytes to the caller: `DataRowRef::parse` (column-count header
 // parse), `ColumnsIter` per-column length-prefix walk, and
-// `FromPgText::from_pg_text` typed decoding.
+// `Cell<TextFmt>::decode` typed decoding.
 //
 // Real per-row latency on row-bearing responses is dominated by
 // per-column work (parse + iterate + decode), not frame dispatch.
@@ -930,7 +930,7 @@ fn bench_data_row_parse(c: &mut Criterion) {
 /// Bench: `DataRowRef::parse` + `ColumnsIter` walk WITHOUT typed
 /// decode. Measures the per-column length-prefix walk + slice
 /// returns. Subtract this from the typed-decode benches below to
-/// isolate the FromPgText decode cost.
+/// isolate the Cell<TextFmt> decode cost.
 fn bench_iter_columns_raw(c: &mut Criterion) {
     use bsql_postgres_proto::decode::DataRowRef;
 
@@ -960,10 +960,10 @@ fn bench_iter_columns_raw(c: &mut Criterion) {
 }
 
 /// Bench: full per-column decode for 5 i32 columns via
-/// `FromPgText`. Production-relevant cost on `SELECT id, ... FROM ...`
+/// `Cell<TextFmt>`. Production-relevant cost on `SELECT id, ... FROM ...`
 /// queries with integer columns.
 fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
-    use bsql_postgres_proto::decode::{DataRowRef, FromPgText};
+    use bsql_postgres_proto::decode::{Cell, DataRowRef, TextFmt};
 
     let mut group = c.benchmark_group("column_decode");
     const N_COLS: u16 = 5;
@@ -980,7 +980,7 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
             let mut sum: i64 = 0;
             for col in row.columns() {
                 if let Ok(Some(bytes)) = col
-                    && let Ok(v) = i32::from_pg_text(bytes)
+                    && let Ok(v) = <i32 as Cell<TextFmt>>::decode(bytes)
                 {
                     sum = sum.saturating_add(i64::from(v));
                 }
@@ -1008,7 +1008,7 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
             let mut sum: i64 = 0;
             for col in row.columns() {
                 if let Ok(Some(bytes)) = col
-                    && let Ok(v) = i32::from_pg_text(bytes)
+                    && let Ok(v) = <i32 as Cell<TextFmt>>::decode(bytes)
                 {
                     sum = sum.saturating_add(i64::from(v));
                 }
@@ -1025,8 +1025,8 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
 ///
 /// `parse_short_uint_swar` is exposed as an opt-in helper at the
 /// `decode` module surface, NOT integrated into
-/// `<i32 as FromPgText>::from_pg_text`. Two prior attempts to
-/// embed the SWAR inside `from_pg_text` regressed adjacent benches
+/// `<i32 as Cell<TextFmt>>::decode`. Two prior attempts to
+/// embed the SWAR inside the text decoder regressed adjacent benches
 /// (Attempt 1: text +4-7%, 8-digit +5.2% from icache pressure;
 /// Attempt 2: `iter_5cols_decode_i32_common_values` +31% from
 /// `SimplifyCFG` merging dispatch with the common-value
@@ -1035,7 +1035,7 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
 /// This bench measures the realistic call shape: the caller knows
 /// (via SQL type info) the column is a short unsigned integer
 /// and tries the fast-path first, falling back to the generic
-/// `from_pg_text` on miss. The 4-digit body shape (`1234` ×5
+/// `Cell<TextFmt>::decode` on miss. The 4-digit body shape (`1234` ×5
 /// columns) exercises the SWAR path. Hit-case target: ~17-20 ns
 /// per row vs ~30+ ns for the generic 4-digit decode.
 ///
@@ -1043,9 +1043,9 @@ fn bench_iter_columns_5x_int4_decode(c: &mut Criterion) {
 /// `42_000_000`, generic decode) and `iter_5cols_decode_i32_common_values`
 /// (common-value fast-path on `0`/`1`/`-1`). The SWAR helper is
 /// orthogonal to both — caller-routed dispatch decoupled from the
-/// `from_pg_text` body.
+/// text decoder body.
 fn bench_iter_columns_5x_int4_swar_short(c: &mut Criterion) {
-    use bsql_postgres_proto::decode::{DataRowRef, FromPgText, parse_short_uint_swar};
+    use bsql_postgres_proto::decode::{Cell, DataRowRef, TextFmt, parse_short_uint_swar};
 
     let mut group = c.benchmark_group("column_decode");
     const N_COLS: u16 = 5;
@@ -1073,7 +1073,7 @@ fn bench_iter_columns_5x_int4_swar_short(c: &mut Criterion) {
                     // generic path covers everything else.
                     let v = parse_short_uint_swar(bytes)
                         .and_then(|u| i32::try_from(u).ok())
-                        .or_else(|| i32::from_pg_text(bytes).ok());
+                        .or_else(|| <i32 as Cell<TextFmt>>::decode(bytes).ok());
                     if let Some(v) = v {
                         sum = sum.saturating_add(i64::from(v));
                     }
@@ -1097,7 +1097,7 @@ fn bench_iter_columns_5x_int4_swar_short(c: &mut Criterion) {
 /// len-19 maximum). Realistic analogues: unix timestamps, customer
 /// IDs, transaction IDs.
 fn bench_iter_columns_5x_int4_swar_long(c: &mut Criterion) {
-    use bsql_postgres_proto::decode::{DataRowRef, FromPgText, parse_long_uint_swar};
+    use bsql_postgres_proto::decode::{Cell, DataRowRef, TextFmt, parse_long_uint_swar};
 
     let mut group = c.benchmark_group("column_decode");
     const N_COLS: u16 = 5;
@@ -1121,7 +1121,7 @@ fn bench_iter_columns_5x_int4_swar_long(c: &mut Criterion) {
                     // mid-band. Sign handling falls back to generic.
                     let v = parse_long_uint_swar(bytes)
                         .and_then(|u| i32::try_from(u).ok())
-                        .or_else(|| i32::from_pg_text(bytes).ok());
+                        .or_else(|| <i32 as Cell<TextFmt>>::decode(bytes).ok());
                     if let Some(v) = v {
                         sum = sum.saturating_add(i64::from(v));
                     }
@@ -1252,7 +1252,7 @@ fn bench_parse_pg_bool_swar(c: &mut Criterion) {
 ///    Forces the validator off the ASCII fast-path; SIMD vs scalar
 ///    delta is largest on this shape.
 fn bench_iter_columns_5x_text_decode(c: &mut Criterion) {
-    use bsql_postgres_proto::decode::{DataRowRef, FromPgText};
+    use bsql_postgres_proto::decode::{Cell, DataRowRef, TextFmt};
 
     let mut group = c.benchmark_group("column_decode");
     const N_COLS: u16 = 5;
@@ -1286,7 +1286,7 @@ fn bench_iter_columns_5x_text_decode(c: &mut Criterion) {
             let mut total_chars: usize = 0;
             for col in row.columns() {
                 if let Ok(Some(bytes)) = col
-                    && let Ok(s) = <&str>::from_pg_text(bytes)
+                    && let Ok(s) = <&str as Cell<TextFmt>>::decode(bytes)
                 {
                     total_chars = total_chars.saturating_add(s.len());
                 }
@@ -1304,7 +1304,7 @@ fn bench_iter_columns_5x_text_decode(c: &mut Criterion) {
             let mut total_chars: usize = 0;
             for col in row.columns() {
                 if let Ok(Some(bytes)) = col
-                    && let Ok(s) = <&str>::from_pg_text(bytes)
+                    && let Ok(s) = <&str as Cell<TextFmt>>::decode(bytes)
                 {
                     total_chars = total_chars.saturating_add(s.len());
                 }
@@ -1322,7 +1322,7 @@ fn bench_iter_columns_5x_text_decode(c: &mut Criterion) {
             let mut total_chars: usize = 0;
             for col in row.columns() {
                 if let Ok(Some(bytes)) = col
-                    && let Ok(s) = <&str>::from_pg_text(bytes)
+                    && let Ok(s) = <&str as Cell<TextFmt>>::decode(bytes)
                 {
                     total_chars = total_chars.saturating_add(s.len());
                 }
@@ -1338,7 +1338,7 @@ fn bench_iter_columns_5x_text_decode(c: &mut Criterion) {
 /// `col_len == -1` shortcut path in `ColumnsIter::next` (
 /// A5/B10 sign-path collapse).
 fn bench_iter_columns_with_nulls(c: &mut Criterion) {
-    use bsql_postgres_proto::decode::{DataRowRef, FromPgText};
+    use bsql_postgres_proto::decode::{Cell, DataRowRef, TextFmt};
 
     let mut group = c.benchmark_group("column_decode");
     // 5 value cols + 5 null cols = 10 total
@@ -1359,7 +1359,7 @@ fn bench_iter_columns_with_nulls(c: &mut Criterion) {
             for col in row.columns() {
                 match col {
                     Ok(Some(bytes)) => {
-                        if let Ok(v) = i32::from_pg_text(bytes) {
+                        if let Ok(v) = <i32 as Cell<TextFmt>>::decode(bytes) {
                             sum = sum.saturating_add(i64::from(v));
                         }
                     }
@@ -1961,7 +1961,7 @@ criterion_group!(
     bench_iter_columns_raw,
     bench_iter_columns_5x_int4_decode,
     // Caller-routed SWAR fast-path for 4-digit
-    // unsigned integers; opt-in helper, decoupled from `from_pg_text`.
+    // unsigned integers; opt-in helper, decoupled from `Cell<TextFmt>::decode`.
     bench_iter_columns_5x_int4_swar_short,
     bench_iter_columns_5x_text_decode,
     bench_iter_columns_with_nulls,

@@ -132,7 +132,7 @@ extern crate self as bsql_postgres_proto;
 // contain `unsafe` blocks, ranked by audit-trust risk:
 //
 // 1. `simdutf8` (~v0.1) — SIMD-accelerated UTF-8 validation.
-//    Used by `<&str as FromPgText>::from_pg_text` (decode.rs).
+//    Used by `<&str as Cell<TextFmt>>::decode` (decode.rs).
 //    Surface: NEON / SSE intrinsic invocations + alignment-aware
 //    chunking. Audit-trust class: **ecosystem-tested** (1M+
 //    downloads/month, multiple production users including
@@ -379,8 +379,8 @@ pub use buf::{AdvancePastEnd, ReadBuf, ReadBufFull, ReadBufN};
 // `compute_push` test dispatcher.
 pub use command::FetchRows;
 pub use decode::{
-    BinaryFmt, ColumnDesc, ColumnsIter, CopyFormat, CopyHeader, DataRowRef, DecodeError,
-    DecodeFormat, FormatCode, FormatCodeMarker, FromPgText, MAX_ROW_COLUMNS,
+    BinaryFmt, Cell, ColumnDesc, ColumnsIter, CopyFormat, CopyHeader, DataRowRef, DecodeError,
+    Fmt, FormatCode, MAX_ROW_COLUMNS,
     RowDesc, RowDescBorrow, RowDescColumnsIter, TextFmt, decode_with_format, oids,
     parse_long_uint_swar, parse_pg_bool_swar, parse_short_uint_swar, validate_utf8_swar,
 };

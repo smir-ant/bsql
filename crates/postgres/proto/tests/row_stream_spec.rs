@@ -52,8 +52,8 @@
 #![deny(unused_must_use, unused_lifetimes)]
 
 use bsql_postgres_proto::{
-    Action, ActiveState, ColEvent, ColumnDesc, DataRowRef, FormatCode, FromPgText, PgProtocol,
-    ProtocolError, QueryKind, Reply, ReplyId, WriteBuf, oids,
+    Action, ActiveState, Cell, ColEvent, ColumnDesc, DataRowRef, FormatCode, PgProtocol,
+    ProtocolError, QueryKind, Reply, ReplyId, TextFmt, WriteBuf, oids,
     wire::{
         TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_ERROR_RESPONSE, TAG_QUERY, TAG_READY_FOR_QUERY,
         TAG_ROW_DESCRIPTION,
@@ -598,8 +598,8 @@ fn rows_across_multiple_feed_calls() {
 ///
 /// Caller-side decoding from `Got { bytes }` per column is the
 /// canonical Sub-A path; this test pins that `Got::bytes` is the
-/// raw column body (text or binary) ready for `FromPgText` /
-/// `FromPgBinary`.
+/// raw column body (text or binary) ready for `Cell<TextFmt>` /
+/// `Cell<BinaryFmt>`.
 #[test]
 fn got_bytes_decode_per_column() {
     let mut proto = fresh_active_via_trust_handshake();
@@ -671,7 +671,7 @@ fn got_bytes_decode_per_column() {
 // ==================================================================
 
 /// Invariant: full decode round-trip — push a SELECT, server replies
-/// with typed rows, caller uses `Got { bytes }` + `FromPgText` to
+/// with typed rows, caller uses `Got { bytes }` + `Cell<TextFmt>` to
 /// reconstruct Rust values. User-level API that Phase 2 macros target.
 #[test]
 fn end_to_end_decode_typed_row() {
@@ -752,14 +752,14 @@ fn end_to_end_decode_typed_row() {
             match stream.col_next() {
                 ColEvent::Got { idx, bytes } => match idx {
                     0 => {
-                        let Ok(v) = i32::from_pg_text(bytes) else {
-                            panic!("i32::from_pg_text")
+                        let Ok(v) = <i32 as Cell<TextFmt>>::decode(bytes) else {
+                            panic!("i32 Cell<TextFmt>::decode")
                         };
                         decoded_id = Some(v);
                     }
                     1 => {
-                        let Ok(s) = <&str>::from_pg_text(bytes) else {
-                            panic!("str::from_pg_text")
+                        let Ok(s) = <&str as Cell<TextFmt>>::decode(bytes) else {
+                            panic!("str Cell<TextFmt>::decode")
                         };
                         decoded_name = Some(std::string::String::from(s));
                     }

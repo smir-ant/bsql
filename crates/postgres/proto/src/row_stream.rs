@@ -48,7 +48,7 @@
 //!
 //! - `Got { idx, bytes }` — a complete column body arrived inline
 //!   (column fit in the current read-buf headroom). Caller decodes
-//!   via `crate::decode::FromPgText` / `FromPgBinary`.
+//!   via `crate::decode::Cell` (`TextFmt` / `BinaryFmt`).
 //! - `Null { idx }` — column was the PG SQL NULL sentinel (`len = -1`).
 //! - `EndRow` — the row's last column emitted; caller can perform
 //!   per-row aggregation before the next row begins.
@@ -129,8 +129,8 @@ pub enum ColEvent<'a> {
     /// A complete column body arrived inline. `bytes` is the raw
     /// PG-protocol body (text for `FormatCode::Text`, binary for
     /// `FormatCode::Binary`); decode via the
-    /// [`crate::decode::FromPgText`] / [`crate::decode::FromPgBinary`]
-    /// traits.
+    /// [`crate::decode::Cell`] trait (with the `TextFmt` / `BinaryFmt`
+    /// format markers).
     Got {
         /// Zero-based column index within the row.
         idx: u16,

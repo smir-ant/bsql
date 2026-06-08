@@ -877,8 +877,8 @@ pub enum DecodeError {
     /// bytes, or 5). Binary-path classification — separate from
     /// [`Self::TruncatedColumnData`] which reports row-scoped
     /// truncation with a column index. Binary decoders run per-column
-    /// through [`FromPgBinary`] and don't know the column index at
-    /// their call site; this variant is honest about that.
+    /// through [`Cell<BinaryFmt>`](Cell) and don't know the column
+    /// index at their call site; this variant is honest about that.
     BinaryLengthMismatch {
         /// Bytes the decoder expected (fixed-size for ints / bool).
         expected_len: u8,
@@ -1158,15 +1158,84 @@ impl ExactSizeIterator for ColumnsIter<'_> {}
 impl core::iter::FusedIterator for ColumnsIter<'_> {}
 
 // ════════════════════════════════════════════════════════════════════
-// Text-format decoders
+// Cell — unified value-decode trait (text + binary, one surface)
 // ════════════════════════════════════════════════════════════════════
+//
+// `Cell<'a, F: Fmt>` is the SOLE column-value decode trait. It is
+// keyed on a zero-sized format marker `F` (`TextFmt` / `BinaryFmt`)
+// so one trait covers both PG wire formats. The body for each
+// (Rust-type, format) pair lives directly in the corresponding
+// `Cell` impl — there is no separate text-only / binary-only trait
+// forwarded to. PG's text format (the default for Simple Query)
+// encodes values as ASCII-ish strings; PG's binary format
+// (Bind-selected in Extended Query) uses big-endian fixed-width
+// ints, a single 0/1 byte for bool, and raw UTF-8 for text.
+//
+// Six primitive types implement `Cell` for BOTH markers:
+// i16 / i32 / i64 / u32 / bool / &str.
 
-/// PostgreSQL **text-format** column decoder for a Rust type.
+mod format_marker_sealed {
+    pub trait FmtSealed {}
+}
+
+/// Type-level marker corresponding to a [`FormatCode`] wire variant.
 ///
-/// PG's text format — the default for Simple Query — encodes all
-/// values as ASCII-ish strings (`"42"`, `"t"`, `"hello"`). This
-/// trait's implementations wrap `core::str::from_utf8` and
-/// `FromStr`-style parses with type-specific error classification.
+/// Two implementors exist, sealed inside this crate: [`TextFmt`] and
+/// [`BinaryFmt`]. The corresponding runtime [`FormatCode`] value is
+/// available via the [`Self::WIRE`] constant — used by the runtime
+/// dispatcher [`decode_with_format`] to bridge the runtime
+/// `FormatCode` from `RowDescription` to the static format marker.
+///
+/// Downstream crates cannot implement this trait (sealed); the
+/// closed set matches the PG wire spec (§55.2.2) which permits
+/// only two format codes. A future PG major-version revision adding
+/// a third format code would be a breaking-change major version
+/// of this crate.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a `Fmt` marker",
+    label = "valid markers are `TextFmt` (PG `FormatCode::Text`, wire byte 0) and `BinaryFmt` (PG `FormatCode::Binary`, wire byte 1)",
+    note = "`Fmt` is sealed — the closed set matches PG protocol spec §55.2.2 which permits exactly these two format codes; a third would be a major-version breaking change"
+)]
+pub trait Fmt: format_marker_sealed::FmtSealed {
+    /// Runtime [`FormatCode`] value this marker corresponds to.
+    const WIRE: FormatCode;
+}
+
+/// Type-level marker for [`FormatCode::Text`] (wire byte `0`).
+///
+/// Zero-sized; used as the format type parameter on [`Cell`].
+/// See [`Fmt`] for the closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TextFmt;
+
+/// Type-level marker for [`FormatCode::Binary`] (wire byte `1`).
+///
+/// Zero-sized; used as the format type parameter on [`Cell`].
+/// See [`Fmt`] for the closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BinaryFmt;
+
+impl format_marker_sealed::FmtSealed for TextFmt {}
+impl format_marker_sealed::FmtSealed for BinaryFmt {}
+
+impl Fmt for TextFmt {
+    const WIRE: FormatCode = FormatCode::Text;
+}
+impl Fmt for BinaryFmt {
+    const WIRE: FormatCode = FormatCode::Binary;
+}
+
+/// Unified PG column-value decoder, generic over the wire format
+/// marker `F`.
+///
+/// `Cell<'a, F>` is implemented in-crate for each (Rust type, wire
+/// format) pair the crate supports out of the box — the cartesian
+/// product of `{i16, i32, i64, u32, bool, &str} × {TextFmt, BinaryFmt}`.
+/// `Cell` is **deliberately not sealed**: a downstream crate may add
+/// `impl Cell<'a, F> for ItsOwnType` to decode `chrono`/`uuid`/`decimal`
+/// (or any other) types, supplying its own `OID` + `decode`. The closed
+/// set is the wire *format* (`Fmt` is sealed: only `TextFmt`/`BinaryFmt`),
+/// not the type set. In-crate type coverage widens with follow-ups.
 ///
 /// # Lifetime
 ///
@@ -1174,24 +1243,40 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 /// `&str` the output borrows the input directly (zero-copy). For
 /// owned types like `i32` / `bool`, `'a` is phantom.
 ///
-/// # Usage
+/// # Type-level pair check
 ///
-/// The example models the crate's own discipline — no `unwrap()`
-/// / `panic!()` in the happy path.
-/// `cols.next()` returns `Option<Result<Option<&[u8]>, DecodeError>>`
-/// and is matched structurally via `let Some(...) else`. Real user
-/// code can adapt to its own error strategy (`?` into custom errors,
-/// slogged through the `query!` macro, etc.).
+/// Calling `<T as Cell<F>>::decode(bytes)` requires `T` to implement
+/// `Cell<F>`. A missing pair (e.g. a hypothetical type with only
+/// text support but caller tries `<T as Cell<BinaryFmt>>::decode`)
+/// is a compile error, NOT a runtime classification. This **closes**
+/// the runtime "format-OID mismatch" classification at the type
+/// level.
+///
+/// # OID drift-pin
+///
+/// Every impl exposes a `const OID: u32` matching the PG catalog
+/// type it decodes (drift-pinned against [`oids`] via const-assert).
+/// The same Rust type targets the SAME OID across both format
+/// markers — a refactor that skewed text against binary fails the
+/// build.
+///
+/// # Errors
+///
+/// - [`DecodeError::NonUtf8`] for non-UTF-8 bytes on decoders that
+///   require UTF-8 validation (`&str`).
+/// - integer types → [`DecodeError::IntParse`] (text) /
+///   [`DecodeError::BinaryLengthMismatch`] (binary, wrong width).
+/// - `bool` → [`DecodeError::BoolParse`].
 ///
 /// The doc-test below is COMPILE-CHECKED — a future refactor that
-/// alters `DataRowRef::parse`, `ColumnsIter::next`, the `FromPgText`
-/// trait shape, or `DecodeError` variants fails the build in CI.
-/// The example operates directly on `row_bytes: &[u8]` — the raw
-/// PostgreSQL DataRow body the protocol surfaces via its row-streaming
-/// API (`RowStream::col_next`, etc.).
+/// alters `DataRowRef::parse`, `ColumnsIter::next`, the `Cell`
+/// trait shape, or `DecodeError` variants fails the build. The
+/// example operates directly on `row_bytes: &[u8]` — the raw
+/// PostgreSQL DataRow body the protocol surfaces via its
+/// row-streaming API (`RowStream::col_next`, etc.).
 ///
 /// ```rust
-/// use bsql_postgres_proto::{DataRowRef, DecodeError, FromPgText};
+/// use bsql_postgres_proto::{Cell, DataRowRef, DecodeError, TextFmt};
 ///
 /// fn decode_id_and_name<'a>(row_bytes: &'a [u8])
 ///     -> Result<Option<(Option<i32>, Option<&'a str>)>, DecodeError>
@@ -1203,10 +1288,12 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 ///     // `Option::None` from the inner `Ok(None)` = SQL NULL.
 ///     // Both surface via structural match, no `unwrap()`.
 ///     let Some(id_result) = cols.next() else { return Ok(None) };
-///     let id: Option<i32> = id_result?.map(i32::from_pg_text).transpose()?;
+///     let id: Option<i32> =
+///         id_result?.map(<i32 as Cell<TextFmt>>::decode).transpose()?;
 ///
 ///     let Some(name_result) = cols.next() else { return Ok(None) };
-///     let name: Option<&'a str> = name_result?.map(<&'a str>::from_pg_text).transpose()?;
+///     let name: Option<&'a str> =
+///         name_result?.map(<&'a str as Cell<TextFmt>>::decode).transpose()?;
 ///
 ///     // Return the decoded pair (per-column NULL preserved via `Option`).
 ///     // The example never silently defaults — every absence is explicit
@@ -1214,48 +1301,18 @@ impl core::iter::FusedIterator for ColumnsIter<'_> {}
 ///     Ok(Some((id, name)))
 /// }
 /// ```
-///
-/// # Error
-///
-/// [`DecodeError::NonUtf8`] for non-UTF-8 bytes on decoders that
-/// genuinely require UTF-8 validation (`&str`, `Vec<u8>`).
-/// Type-specific parse errors:
-/// - integer types → [`DecodeError::IntParse`] (single-pass
-///   ASCII-digit parser treats non-digit bytes uniformly;
-///   non-ASCII/non-UTF-8 input classifies as `IntParse`, NOT
-///   `NonUtf8`, because UTF-8 validation is skipped as redundant
-///   for the strict-ASCII integer grammar).
-/// - `bool` → [`DecodeError::BoolParse`]
-///
-/// # Binary format
-///
-/// For PG binary-format columns (selected via Bind in Extended
-/// Query), the parallel [`FromPgBinary`] trait carries the binary
-/// codec. Text vs binary dispatch at the caller level via
-/// `ColumnDesc::format_code`.
-//
-// `FromPgText` is NOT sealed — downstream crates may implement it
-// for their own types (e.g. `chrono::DateTime`, `uuid::Uuid`). The
-// diagnostic still pays off: the bare bound failure routes a user
-// who tries `let row: (MyType,) = ...;` (where `MyType` lacks the
-// impl) to the standard extension contract.
 #[diagnostic::on_unimplemented(
-    message = "`{Self}` cannot be decoded from PG text-format bytes",
-    label = "missing `impl<'a> FromPgText<'a> for {Self}`",
-    note = "implement `FromPgText` for your type to use it as a decoded column value, or use one of the crate-provided primitive types (`i16`, `i32`, `i64`, `u32`, `bool`, `&'a str`) which already implement it"
+    message = "`{Self}` cannot be decoded from PG `{F}` bytes",
+    label = "the (type, format) pair `({Self}, {F})` is not in the supported decode matrix",
+    note = "the in-crate decode matrix covers `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}`; for other types add `impl Cell<'a, F> for {Self}` supplying its `OID` + `decode` (the trait is not sealed)"
 )]
-pub trait FromPgText<'a>: Sized {
-    /// PG type OID this text decoder targets.
-    ///
-    /// Parallel to [`FromPgBinary::OID`] and [`EncodeBinary::OID`].
-    /// Enables compile-time validation that a Rust type chosen by
-    /// the user matches the PG catalog OID the server declared in
-    /// `RowDescription` — independent of which format
-    /// (text/binary) the column uses.
+pub trait Cell<'a, F: Fmt>: Sized {
+    /// PG type OID this (type, format) pair targets. Pinned via
+    /// const-assert against [`oids`].
     const OID: u32;
 
-    /// Decode the column's text-format bytes.
-    fn from_pg_text(bytes: &'a [u8]) -> Result<Self, DecodeError>;
+    /// Decode the column's bytes in the format specified by `F`.
+    fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError>;
 }
 
 // Dedicated ASCII-digit integer parser.
@@ -1447,7 +1504,7 @@ macro_rules! parse_pg_int_unsigned {
 /// [`i16::try_from`] (or similar) when narrowing.
 ///
 /// For general integer decoding without short-int knowledge,
-/// continue using `<T as FromPgText>::from_pg_text` — that path
+/// continue using `<T as Cell<TextFmt>>::decode` — that path
 /// preserves the common-value cache and the widened-accumulator
 /// digit loop.
 ///
@@ -1459,8 +1516,8 @@ macro_rules! parse_pg_int_unsigned {
 ///
 /// # Why this is opt-in (architectural rationale)
 ///
-/// Two prior attempts embedded this fast-path INSIDE `<i32 as
-/// FromPgText>::from_pg_text`:
+/// Two prior attempts embedded this fast-path INSIDE
+/// `<i32 as Cell<TextFmt>>::decode`:
 ///
 /// - Attempt 1 (`#[inline(always)]`): 4-digit −38% but 8-digit
 ///   +5.2%, text +4-7% — icache pressure from the 252 B → 776 B
@@ -1471,8 +1528,8 @@ macro_rules! parse_pg_int_unsigned {
 ///   SWAR length-dispatch with the common-value `match`,
 ///   pessimising the cache-hit prologue.
 ///
-/// Decoupling SWAR placement from `from_pg_text`'s body size
-/// eliminates the LLVM heuristic shift entirely. `from_pg_text`
+/// Decoupling SWAR placement from the text decoder's body size
+/// eliminates the LLVM heuristic shift entirely. The text decoder
 /// stays byte-identical; the helper is a separate symbol the
 /// caller invokes when type knowledge justifies the fast-path.
 ///
@@ -1774,11 +1831,11 @@ pub fn validate_utf8_swar(bytes: &[u8]) -> Option<()> {
 /// - `b"false"` → `Some(false)` (extended input form)
 ///
 /// Returns `None` for every other byte slice. Caller falls back to
-/// their generic decoder (typically [`FromPgText`] for `bool`).
+/// their generic decoder (typically [`Cell<TextFmt>`](Cell) for `bool`).
 ///
 /// # Why a dedicated helper
 ///
-/// The standard [`FromPgText`] for `bool` matches only `b"t"`/`b"f"`
+/// The standard [`Cell<TextFmt>`](Cell) for `bool` matches only `b"t"`/`b"f"`
 /// (PG's SELECT output format). Callers that ALSO need to accept
 /// the longer literal forms (e.g. when decoding COPY-from-stdin
 /// text streams, where PG accepts both short and long bool forms)
@@ -1842,10 +1899,10 @@ pub fn parse_pg_bool_swar(bytes: &[u8]) -> Option<bool> {
 // −2 ns/col, miss case +0 to +1 ns/col on the 8-digit `42_000_000`
 // shape (within criterion noise).
 
-impl FromPgText<'_> for i16 {
+impl Cell<'_, TextFmt> for i16 {
     const OID: u32 = oids::INT2;
     #[inline]
-    fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         // Fast-paths: literal-byte equality bypasses digit loop on
         // the three most-common values. Match-on-slice folds to a
         // 3-arm jump table at -O2 / LTO=fat (workspace setting).
@@ -1865,10 +1922,10 @@ impl FromPgText<'_> for i16 {
     }
 }
 
-impl FromPgText<'_> for i32 {
+impl Cell<'_, TextFmt> for i32 {
     const OID: u32 = oids::INT4;
     #[inline]
-    fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         // Fast-paths — see the family comment above i16's impl for
         // rationale.
         match bytes {
@@ -1887,10 +1944,10 @@ impl FromPgText<'_> for i32 {
     }
 }
 
-impl FromPgText<'_> for i64 {
+impl Cell<'_, TextFmt> for i64 {
     const OID: u32 = oids::INT8;
     #[inline]
-    fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         // Fast-paths — see the family comment above i16's impl for
         // rationale.
         match bytes {
@@ -1910,10 +1967,10 @@ impl FromPgText<'_> for i64 {
     }
 }
 
-impl FromPgText<'_> for u32 {
+impl Cell<'_, TextFmt> for u32 {
     const OID: u32 = oids::OID;
     #[inline]
-    fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         match bytes {
             b"0" => return Ok(0),
             b"1" => return Ok(1),
@@ -1926,10 +1983,10 @@ impl FromPgText<'_> for u32 {
 /// PG boolean text format: `"t"` = true, `"f"` = false. Anything
 /// else (including `"true"`, `"TRUE"`, `"1"`, `"0"`) classifies as
 /// [`DecodeError::BoolParse`] — PG is strict about its own format.
-impl FromPgText<'_> for bool {
+impl Cell<'_, TextFmt> for bool {
     const OID: u32 = oids::BOOL;
     #[inline]
-    fn from_pg_text(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         match bytes {
             b"t" => Ok(true),
             b"f" => Ok(false),
@@ -1939,7 +1996,7 @@ impl FromPgText<'_> for bool {
 }
 
 /// Text column as `&str` — zero-copy, validates UTF-8 only.
-impl<'a> FromPgText<'a> for &'a str {
+impl<'a> Cell<'a, TextFmt> for &'a str {
     const OID: u32 = oids::TEXT;
     /// SIMD-accelerated UTF-8 validation via `simdutf8`.
     ///
@@ -1969,80 +2026,47 @@ impl<'a> FromPgText<'a> for &'a str {
     /// `simdutf8::basic::Utf8Error` is discriminator-only;
     /// collapsed to `DecodeError::NonUtf8` here.
     #[inline]
-    fn from_pg_text(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+    fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
         simdutf8::basic::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
     }
 }
 
 // ═════════════════════════════════════════════════════════════════
-// FromPgBinary — parallel to FromPgText for PG binary-format
-// columns (Extended Query Bind-selected per-parameter).
+// Cell<BinaryFmt> — PG binary-format column decoders (Extended
+// Query Bind-selected per-parameter).
 //
 // Binary format byte layout matches PG §55.7 — fixed-size ints
 // are big-endian two's complement, `bool` is a single byte 0/1,
 // `text` is raw UTF-8 bytes. Every impl's `OID` const is drift-
 // pinned against `oids::*` to catch type-mapping bugs at build
 // time.
-// ═════════════════════════════════════════════════════════════════
-
-/// Decode a column's binary-format bytes into a typed Rust value.
-///
-/// Parallel to [`FromPgText`]; the caller dispatches between text
-/// and binary decoders based on [`ColumnDesc::format_code`].
-/// Extended Query selects binary via the Bind frame's per-param /
-/// per-result format-code arrays; Simple Query always uses text.
-///
-/// # OID drift-pin
-///
-/// Every impl exposes a `const OID: u32` matching the PG type it
-/// decodes. The crate's [`oids`] module is drift-pinned against the
-/// canonical PG catalog (`pg_type.dat`); a const-assert per impl
-/// verifies `<T as FromPgBinary>::OID == oids::X` at build time.
-/// A future refactor that breaks the type↔OID mapping fails the
-/// build, not at runtime.
-///
-/// # Sealed
-///
-/// The `sealed::FromPgBinarySealed` supertrait is module-private
-/// — downstream crates cannot impl the trait for their own Rust
-/// types. The binary-codec surface is a fixed set of primitives;
-/// wider types (arrays, uuid, timestamp) land with their dedicated
-/// follow-ups.
-#[diagnostic::on_unimplemented(
-    message = "`{Self}` does not implement `FromPgBinary` (cannot decode from PG binary format)",
-    label = "supported binary-decode types are `i16`, `i32`, `i64`, `bool`, `&str`",
-    note = "`FromPgBinary` is sealed — extend by adding a `from_pg_binary_int!` invocation in `decode.rs`; downstream `impl FromPgBinary for ...` is forbidden by the sealed supertrait"
-)]
-pub trait FromPgBinary<'a>: Sized + sealed::FromPgBinarySealed {
-    /// PG type OID this decoder handles. Drift-pinned against
-    /// [`oids`] via const-assert.
-    const OID: u32;
-
-    /// Decode the column's binary-format bytes.
-    ///
-    /// # Errors
-    ///
-    /// - [`DecodeError::TruncatedColumnData`] — input length doesn't
-    ///   match the type's fixed size (for fixed-size types).
-    /// - [`DecodeError::BoolParse`] — byte outside `{0, 1}` for `bool`.
-    /// - [`DecodeError::NonUtf8`] — non-UTF-8 bytes for `&str` / text.
-    fn from_pg_binary(bytes: &'a [u8]) -> Result<Self, DecodeError>;
-}
+//
+// The caller dispatches between text and binary decoders based on
+// [`ColumnDesc::format_code`]. Extended Query selects binary via
+// the Bind frame's per-param / per-result format-code arrays;
+// Simple Query always uses text.
+//
+// # OID drift-pin
+//
+// Every impl exposes a `const OID: u32` matching the PG type it
+// decodes. The crate's [`oids`] module is drift-pinned against the
+// canonical PG catalog (`pg_type.dat`); a const-assert per impl
+// verifies `<T as Cell<BinaryFmt>>::OID == oids::X` at build time.
+// A future refactor that breaks the type↔OID mapping fails the
+// build, not at runtime.
 
 mod sealed {
-    pub trait FromPgBinarySealed {}
     pub trait EncodeBinarySealed {}
 }
 
 // Fixed-size signed integer decoders: N bytes big-endian.
-macro_rules! impl_from_pg_binary_int {
+macro_rules! impl_cell_binary_int {
     ($($t:ty, $oid:expr, $n:literal),+ $(,)?) => {
         $(
-            impl sealed::FromPgBinarySealed for $t {}
-            impl FromPgBinary<'_> for $t {
+            impl Cell<'_, BinaryFmt> for $t {
                 const OID: u32 = $oid;
                 #[inline]
-                fn from_pg_binary(bytes: &[u8]) -> Result<Self, DecodeError> {
+                fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
                     // Binary fixed-size ints: exactly N bytes. Any
                     // other length is classified via
                     // `BinaryLengthMismatch` — a per-type honest error
@@ -2066,7 +2090,7 @@ macro_rules! impl_from_pg_binary_int {
     };
 }
 
-impl_from_pg_binary_int!(
+impl_cell_binary_int!(
     i16, oids::INT2, 2,
     i32, oids::INT4, 4,
     i64, oids::INT8, 8,
@@ -2077,11 +2101,10 @@ impl_from_pg_binary_int!(
 /// Wrong byte length classifies as [`DecodeError::BinaryLengthMismatch`];
 /// length-1 with an out-of-range byte classifies as
 /// [`DecodeError::BoolParse`].
-impl sealed::FromPgBinarySealed for bool {}
-impl FromPgBinary<'_> for bool {
+impl Cell<'_, BinaryFmt> for bool {
     const OID: u32 = oids::BOOL;
     #[inline]
-    fn from_pg_binary(bytes: &[u8]) -> Result<Self, DecodeError> {
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         match bytes {
             [0] => Ok(false),
             [1] => Ok(true),
@@ -2105,18 +2128,18 @@ impl FromPgBinary<'_> for bool {
 /// path) is O(N). Under `#![forbid(unsafe_code)]` validation cannot be
 /// skipped — `core::str::from_utf8_unchecked` is unsafe and inaccessible.
 /// Callers who need to bypass should hold the bytes as `&[u8]` (via a
-/// separate `FromPgBinary<Target = &[u8]>` impl — not implemented today)
-/// and validate externally if / when they need a `&str`.
+/// separate `Cell<'a, BinaryFmt, …>` impl projecting to `&[u8]` — not
+/// implemented today) and validate externally if / when they need a
+/// `&str`.
 ///
 /// PG binary `text` is NOMINALLY UTF-8 per `client_encoding`; a buggy
 /// server / misconfigured encoding setting could produce invalid bytes.
 /// The Err path classifies as [`DecodeError::NonUtf8`] without
 /// panicking — consistent with the column-level safety contract.
-impl sealed::FromPgBinarySealed for &str {}
-impl<'a> FromPgBinary<'a> for &'a str {
+impl<'a> Cell<'a, BinaryFmt> for &'a str {
     const OID: u32 = oids::TEXT;
     #[inline]
-    fn from_pg_binary(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+    fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
         simdutf8::basic::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)
     }
 }
@@ -2125,245 +2148,43 @@ impl<'a> FromPgBinary<'a> for &'a str {
 // same Rust type MUST target the same PG type OID. A refactor that
 // breaks this breaks the build.
 //
-// `FromPgText` carries `OID` too; the three traits
-// (text / binary / encode) form a closed symmetry family. Adding
-// a new Rust type that impls any ONE of these forces matching
-// impls + identical OIDs across all three, verified here.
+// `Cell<TextFmt>` and `Cell<BinaryFmt>` both carry `OID`; the
+// unified trait + `EncodeBinary` form a closed symmetry family.
+// Adding a new Rust type forces matching impls + identical OIDs
+// across all of them, verified here.
 const _: () = {
-    assert!(<i16 as FromPgBinary>::OID == oids::INT2);
-    assert!(<i32 as FromPgBinary>::OID == oids::INT4);
-    assert!(<i64 as FromPgBinary>::OID == oids::INT8);
-    assert!(<u32 as FromPgBinary>::OID == oids::OID);
-    assert!(<bool as FromPgBinary>::OID == oids::BOOL);
-    assert!(<&str as FromPgBinary>::OID == oids::TEXT);
+    assert!(<i16 as Cell<BinaryFmt>>::OID == oids::INT2);
+    assert!(<i32 as Cell<BinaryFmt>>::OID == oids::INT4);
+    assert!(<i64 as Cell<BinaryFmt>>::OID == oids::INT8);
+    assert!(<u32 as Cell<BinaryFmt>>::OID == oids::OID);
+    assert!(<bool as Cell<BinaryFmt>>::OID == oids::BOOL);
+    assert!(<&str as Cell<BinaryFmt>>::OID == oids::TEXT);
     // Text↔binary OID symmetry: the same Rust type MUST target the
     // same PG type OID across text and binary decoders. A refactor
     // that skewed one against the other would mean the same Rust
     // type decoded differently depending on `ColumnDesc::format_code`
     // — a classification bug. Pinned below.
-    assert!(<i16 as FromPgText>::OID == <i16 as FromPgBinary>::OID);
-    assert!(<i32 as FromPgText>::OID == <i32 as FromPgBinary>::OID);
-    assert!(<i64 as FromPgText>::OID == <i64 as FromPgBinary>::OID);
-    assert!(<u32 as FromPgText>::OID == <u32 as FromPgBinary>::OID);
-    assert!(<bool as FromPgText>::OID == <bool as FromPgBinary>::OID);
-    assert!(<&str as FromPgText>::OID == <&str as FromPgBinary>::OID);
+    assert!(<i16 as Cell<TextFmt>>::OID == <i16 as Cell<BinaryFmt>>::OID);
+    assert!(<i32 as Cell<TextFmt>>::OID == <i32 as Cell<BinaryFmt>>::OID);
+    assert!(<i64 as Cell<TextFmt>>::OID == <i64 as Cell<BinaryFmt>>::OID);
+    assert!(<u32 as Cell<TextFmt>>::OID == <u32 as Cell<BinaryFmt>>::OID);
+    assert!(<bool as Cell<TextFmt>>::OID == <bool as Cell<BinaryFmt>>::OID);
+    assert!(<&str as Cell<TextFmt>>::OID == <&str as Cell<BinaryFmt>>::OID);
 };
 
-// ═════════════════════════════════════════════════════════════════
-// Compile-time FormatCode × Type matrix.
-//
-// Type-level encoding of which (FormatCode, Rust-type) pairs are
-// valid for column decoding. Currently every primitive type
-// (i16/i32/i64/u32/bool/&str) implements BOTH text and binary
-// decoders — the matrix closes the runtime "is this (T, F) pair
-// supported" classification at the type level so any future type
-// with text-only OR binary-only support automatically rejects the
-// missing-format dispatch at compile time.
-//
-// Tier impact: caller dispatch on (T, F) is **tier-1 by-
-// construction** — a static `DecodeFormat<F>` bound is the
-// type-system check; missing impl == compile error.
-//
-// Additive — does NOT replace [`FromPgText`] / [`FromPgBinary`].
-// Both legacy traits remain (caller can still invoke
-// `T::from_pg_text` or `T::from_pg_binary` directly). DecodeFormat
-// is the new generic-F-parameterised dispatch surface; impls
-// forward to the underlying legacy trait.
-// ═════════════════════════════════════════════════════════════════
-
-mod format_marker_sealed {
-    pub trait FormatCodeMarkerSealed {}
-    pub trait DecodeFormatSealed<F> {}
-}
-
-/// Type-level marker corresponding to a [`FormatCode`] wire variant.
-///
-/// Two implementors exist, sealed inside this crate: [`TextFmt`] and
-/// [`BinaryFmt`]. The corresponding runtime [`FormatCode`] value is
-/// available via the [`Self::WIRE`] constant — used by the runtime
-/// dispatcher [`decode_with_format`] to bridge the runtime
-/// `FormatCode` from `RowDescription` to the static format marker.
-///
-/// Downstream crates cannot implement this trait (sealed); the
-/// closed set matches the PG wire spec (§55.2.2) which permits
-/// only two format codes. A future PG major-version revision adding
-/// a third format code would be a breaking-change major version
-/// of this crate.
-#[diagnostic::on_unimplemented(
-    message = "`{Self}` is not a `FormatCodeMarker`",
-    label = "valid markers are `TextFmt` (PG `FormatCode::Text`, wire byte 0) and `BinaryFmt` (PG `FormatCode::Binary`, wire byte 1)",
-    note = "`FormatCodeMarker` is sealed — the closed set matches PG protocol spec §55.2.2 which permits exactly these two format codes; a third would be a major-version breaking change"
-)]
-pub trait FormatCodeMarker: format_marker_sealed::FormatCodeMarkerSealed {
-    /// Runtime [`FormatCode`] value this marker corresponds to.
-    const WIRE: FormatCode;
-}
-
-/// Type-level marker for [`FormatCode::Text`] (wire byte `0`).
-///
-/// Zero-sized; used as the format type parameter on
-/// [`DecodeFormat`]. See [`FormatCodeMarker`] for the closed set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TextFmt;
-
-/// Type-level marker for [`FormatCode::Binary`] (wire byte `1`).
-///
-/// Zero-sized; used as the format type parameter on
-/// [`DecodeFormat`]. See [`FormatCodeMarker`] for the closed set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BinaryFmt;
-
-impl format_marker_sealed::FormatCodeMarkerSealed for TextFmt {}
-impl format_marker_sealed::FormatCodeMarkerSealed for BinaryFmt {}
-
-impl FormatCodeMarker for TextFmt {
-    const WIRE: FormatCode = FormatCode::Text;
-}
-impl FormatCodeMarker for BinaryFmt {
-    const WIRE: FormatCode = FormatCode::Binary;
-}
-
-/// Type-level format-parameterised decoder.
-///
-/// Generic over `F: FormatCodeMarker` — the static format marker.
-/// Implemented for each (Rust type, wire format) pair the crate
-/// supports. Sealed via `format_marker_sealed::DecodeFormatSealed`;
-/// downstream crates cannot add impls for their own types. Wider
-/// type coverage (date, time, uuid, decimal) lands with future
-/// follow-ups.
-///
-/// # Type-level pair check
-///
-/// Calling `<T as DecodeFormat<F>>::decode(bytes)` requires T to
-/// implement DecodeFormat`<F>`. A missing pair (e.g. a hypothetical
-/// type with only text support but caller tries
-/// `<T as DecodeFormat<BinaryFmt>>::decode`) is a compile error,
-/// NOT a runtime classification. This **closes** the runtime
-/// "format-OID mismatch" classification at the type level.
-///
-/// # OID symmetry
-///
-/// Each impl's `OID` matches the corresponding [`FromPgText::OID`]
-/// or [`FromPgBinary::OID`] for the same Rust type — pinned via
-/// const-asserts after every impl block below. A drift in OID
-/// between DecodeFormat and the legacy traits fails compilation.
-///
-/// # Forwarding
-///
-/// Each impl forwards to the matching legacy trait
-/// ([`FromPgText`] for `F = TextFmt`, [`FromPgBinary`] for
-/// `F = BinaryFmt`) — no behavior change, no new decode paths.
-/// DecodeFormat is purely a dispatch-surface refinement.
-#[diagnostic::on_unimplemented(
-    message = "`{Self}` does not implement `DecodeFormat<'_, {F}>`",
-    label = "the (type, format) pair `({Self}, {F})` is not in the supported decode matrix",
-    note = "`DecodeFormat` is sealed — supported pairs are the cartesian product of `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}`. Extend by adding a `decode_format_impl!` invocation in `decode.rs`; downstream `impl DecodeFormat for ...` is forbidden by the sealed supertrait"
-)]
-pub trait DecodeFormat<'a, F: FormatCodeMarker>:
-    Sized + format_marker_sealed::DecodeFormatSealed<F>
-{
-    /// PG type OID this (type, format) pair targets.
-    ///
-    /// Pinned via const-assert to match the corresponding
-    /// [`FromPgText::OID`] / [`FromPgBinary::OID`].
-    const OID: u32;
-
-    /// Decode the column's bytes in the format specified by `F`.
-    ///
-    /// Forwards to [`FromPgText::from_pg_text`] (for `F = TextFmt`)
-    /// or [`FromPgBinary::from_pg_binary`] (for `F = BinaryFmt`).
-    fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError>;
-}
-
-// DecodeFormat impls — six primitive types × two format markers
-// = 12 impls. Macro avoids 12 copies of the same boilerplate.
-macro_rules! impl_decode_format_text {
-    ($($t:ty),+ $(,)?) => {
-        $(
-            impl format_marker_sealed::DecodeFormatSealed<TextFmt> for $t {}
-            impl<'a> DecodeFormat<'a, TextFmt> for $t {
-                const OID: u32 = <$t as FromPgText<'a>>::OID;
-                #[inline]
-                fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
-                    <$t as FromPgText<'a>>::from_pg_text(bytes)
-                }
-            }
-        )+
-    };
-}
-
-macro_rules! impl_decode_format_binary {
-    ($($t:ty),+ $(,)?) => {
-        $(
-            impl format_marker_sealed::DecodeFormatSealed<BinaryFmt> for $t {}
-            impl<'a> DecodeFormat<'a, BinaryFmt> for $t {
-                const OID: u32 = <$t as FromPgBinary<'a>>::OID;
-                #[inline]
-                fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
-                    <$t as FromPgBinary<'a>>::from_pg_binary(bytes)
-                }
-            }
-        )+
-    };
-}
-
-impl_decode_format_text!(i16, i32, i64, u32, bool);
-impl_decode_format_binary!(i16, i32, i64, u32, bool);
-
-// `&str` has a non-trivial lifetime in both legacy traits; macro
-// substitution would tangle the `'a` bindings. Hand-rolled below.
-impl format_marker_sealed::DecodeFormatSealed<TextFmt> for &str {}
-impl<'a> DecodeFormat<'a, TextFmt> for &'a str {
-    const OID: u32 = <&'a str as FromPgText<'a>>::OID;
-    #[inline]
-    fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
-        <&'a str as FromPgText<'a>>::from_pg_text(bytes)
-    }
-}
-
-impl format_marker_sealed::DecodeFormatSealed<BinaryFmt> for &str {}
-impl<'a> DecodeFormat<'a, BinaryFmt> for &'a str {
-    const OID: u32 = <&'a str as FromPgBinary<'a>>::OID;
-    #[inline]
-    fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
-        <&'a str as FromPgBinary<'a>>::from_pg_binary(bytes)
-    }
-}
-
-// Compile-time OID drift pin between DecodeFormat and the legacy
-// FromPgText/FromPgBinary traits. A future refactor that touched
-// one side without the other (or assigned a stale OID constant to
-// a new DecodeFormat impl) fails the build.
+// Marker WIRE constants match the FormatCode variant they encode.
 const _: () = {
-    // Text-format OID pins.
-    assert!(<i16 as DecodeFormat<TextFmt>>::OID == <i16 as FromPgText>::OID);
-    assert!(<i32 as DecodeFormat<TextFmt>>::OID == <i32 as FromPgText>::OID);
-    assert!(<i64 as DecodeFormat<TextFmt>>::OID == <i64 as FromPgText>::OID);
-    assert!(<u32 as DecodeFormat<TextFmt>>::OID == <u32 as FromPgText>::OID);
-    assert!(<bool as DecodeFormat<TextFmt>>::OID == <bool as FromPgText>::OID);
-    assert!(<&str as DecodeFormat<TextFmt>>::OID == <&str as FromPgText>::OID);
-
-    // Binary-format OID pins.
-    assert!(<i16 as DecodeFormat<BinaryFmt>>::OID == <i16 as FromPgBinary>::OID);
-    assert!(<i32 as DecodeFormat<BinaryFmt>>::OID == <i32 as FromPgBinary>::OID);
-    assert!(<i64 as DecodeFormat<BinaryFmt>>::OID == <i64 as FromPgBinary>::OID);
-    assert!(<u32 as DecodeFormat<BinaryFmt>>::OID == <u32 as FromPgBinary>::OID);
-    assert!(<bool as DecodeFormat<BinaryFmt>>::OID == <bool as FromPgBinary>::OID);
-    assert!(<&str as DecodeFormat<BinaryFmt>>::OID == <&str as FromPgBinary>::OID);
-
-    // Marker WIRE constants match the FormatCode variant they encode.
-    assert!(matches!(<TextFmt as FormatCodeMarker>::WIRE, FormatCode::Text));
-    assert!(matches!(<BinaryFmt as FormatCodeMarker>::WIRE, FormatCode::Binary));
+    assert!(matches!(<TextFmt as Fmt>::WIRE, FormatCode::Text));
+    assert!(matches!(<BinaryFmt as Fmt>::WIRE, FormatCode::Binary));
 };
 
 /// Runtime [`FormatCode`] → static dispatch helper.
 ///
 /// Bridges the runtime `FormatCode` value carried in
 /// `RowDescription` / [`ColumnDesc::format_code`] to the
-/// compile-time [`DecodeFormat`] dispatch surface. Requires `T`
-/// to implement **both** [`DecodeFormat<TextFmt>`] **and**
-/// [`DecodeFormat<BinaryFmt>`] — the common case for every
-/// primitive type.
+/// compile-time [`Cell`] dispatch surface. Requires `T` to
+/// implement **both** [`Cell<TextFmt>`] **and** [`Cell<BinaryFmt>`]
+/// — the common case for every primitive type.
 ///
 /// A future type with only one format impl cannot be dispatched
 /// via this function (compile error at the trait-bound check),
@@ -2373,10 +2194,10 @@ const _: () = {
 ///
 /// # Why not a `match` on `FormatCode`?
 ///
-/// Caller could inline `match fmt { Text => T::decode::<TextFmt>(b),
-/// Binary => T::decode::<BinaryFmt>(b) }` — that's exactly what
-/// this helper centralises. The win is one canonical dispatch site
-/// (per-callsite ad-hoc matches would diverge over time; one
+/// Caller could inline `match fmt { Text => <T as Cell<TextFmt>>::decode(b),
+/// Binary => <T as Cell<BinaryFmt>>::decode(b) }` — that's exactly
+/// what this helper centralises. The win is one canonical dispatch
+/// site (per-callsite ad-hoc matches would diverge over time; one
 /// helper stays drift-pinned).
 ///
 /// # Exhaustive over [`FormatCode`]
@@ -2391,25 +2212,25 @@ pub fn decode_with_format<'a, T>(
     fmt: FormatCode,
 ) -> Result<T, DecodeError>
 where
-    T: DecodeFormat<'a, TextFmt> + DecodeFormat<'a, BinaryFmt>,
+    T: Cell<'a, TextFmt> + Cell<'a, BinaryFmt>,
 {
     match fmt {
-        FormatCode::Text => <T as DecodeFormat<'a, TextFmt>>::decode(bytes),
-        FormatCode::Binary => <T as DecodeFormat<'a, BinaryFmt>>::decode(bytes),
+        FormatCode::Text => <T as Cell<'a, TextFmt>>::decode(bytes),
+        FormatCode::Binary => <T as Cell<'a, BinaryFmt>>::decode(bytes),
     }
 }
 
 // ═════════════════════════════════════════════════════════════════
 // EncodeBinary — PG binary format write path (mirror of
-// `FromPgBinary`). Used by `ParamsWriter` to serialise parameter
+// `Cell<BinaryFmt>`). Used by `ParamsWriter` to serialise parameter
 // values into the Bind frame's per-param length+bytes layout.
 // ═════════════════════════════════════════════════════════════════
 
 /// Encode a Rust value into PG binary format bytes, directly into
 /// a [`crate::write_buf::WriteBuf`].
 ///
-/// Parallel to [`FromPgBinary`] — the `OID` constants pair up
-/// across the two traits so a future `query!` macro can check
+/// Parallel to [`Cell<BinaryFmt>`](Cell) — the `OID` constants pair
+/// up across the two traits so a future `query!` macro can check
 /// param-type OIDs against the `Parse`-time schema fingerprint at
 /// compile time.
 ///
@@ -2419,8 +2240,8 @@ where
 ///
 /// # Sealed
 ///
-/// Same seal discipline as [`FromPgBinary`] — downstream crates
-/// cannot add impls for their own types.
+/// Same seal discipline as [`Cell`] — downstream crates cannot add
+/// impls for their own types.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not implement `EncodeBinary` (cannot encode to PG binary format)",
     label = "supported binary-encode types are `i16`, `i32`, `i64`, `bool`, `&str`",
@@ -2429,7 +2250,7 @@ where
 pub trait EncodeBinary: sealed::EncodeBinarySealed {
     /// PG type OID this encoder produces. Drift-pinned against
     /// [`oids`] and cross-asserted against the matching
-    /// [`FromPgBinary`] impl.
+    /// [`Cell<BinaryFmt>`](Cell) impl.
     const OID: u32;
 
     /// Write the encoded bytes into `dst`. The caller is responsible
@@ -2506,7 +2327,7 @@ impl EncodeBinary for &str {
 }
 
 // Drift-pins: every EncodeBinary impl's OID matches the
-// corresponding FromPgBinary impl AND the canonical `oids::*`
+// corresponding `Cell<BinaryFmt>` impl AND the canonical `oids::*`
 // constant. One const-block pins the whole set.
 const _: () = {
     assert!(<i16 as EncodeBinary>::OID == oids::INT2);
@@ -2516,12 +2337,12 @@ const _: () = {
     assert!(<bool as EncodeBinary>::OID == oids::BOOL);
     assert!(<&str as EncodeBinary>::OID == oids::TEXT);
     // Cross-trait symmetry (text-format OID ≡ binary-format OID ≡ catalog OID).
-    assert!(<i16 as EncodeBinary>::OID == <i16 as FromPgBinary>::OID);
-    assert!(<i32 as EncodeBinary>::OID == <i32 as FromPgBinary>::OID);
-    assert!(<i64 as EncodeBinary>::OID == <i64 as FromPgBinary>::OID);
-    assert!(<u32 as EncodeBinary>::OID == <u32 as FromPgBinary>::OID);
-    assert!(<bool as EncodeBinary>::OID == <bool as FromPgBinary>::OID);
-    assert!(<&str as EncodeBinary>::OID == <&str as FromPgBinary>::OID);
+    assert!(<i16 as EncodeBinary>::OID == <i16 as Cell<BinaryFmt>>::OID);
+    assert!(<i32 as EncodeBinary>::OID == <i32 as Cell<BinaryFmt>>::OID);
+    assert!(<i64 as EncodeBinary>::OID == <i64 as Cell<BinaryFmt>>::OID);
+    assert!(<u32 as EncodeBinary>::OID == <u32 as Cell<BinaryFmt>>::OID);
+    assert!(<bool as EncodeBinary>::OID == <bool as Cell<BinaryFmt>>::OID);
+    assert!(<&str as EncodeBinary>::OID == <&str as Cell<BinaryFmt>>::OID);
 };
 
 /// PostgreSQL built-in type OID constants for the subset the
@@ -2529,7 +2350,7 @@ const _: () = {
 /// `https://github.com/postgres/postgres/blob/master/src/include/catalog/pg_type.dat`.
 ///
 /// Callers match these against [`ColumnDesc::type_oid`] to
-/// dispatch the right [`FromPgText`] impl. A future `query!`
+/// dispatch the right [`Cell`] impl. A future `query!`
 /// macro consumes this mapping at compile time via generated
 /// decoders.
 ///
@@ -3052,17 +2873,17 @@ mod data_row_tests {
 
 #[cfg(test)]
 mod from_pg_text_tests {
-    //! `FromPgText` impls — per-type text-format decoding plus the
+    //! `Cell<TextFmt>` impls — per-type text-format decoding plus the
     //! bad-path classification matrix (non-UTF-8, unparsable digits,
     //! overflow, non-canonical bool).
 
     use super::*;
 
-    /// **One invariant, one test**: `i32::from_pg_text` correctly
-    /// maps PG text representation into the Result<i32, DecodeError>
-    /// contract — happy paths, overflow, malformed digits, non-ASCII.
-    /// An arm-body swap in my impl (e.g., returning `NonUtf8` for
-    /// overflow) fails this table.
+    /// **One invariant, one test**: `<i32 as Cell<TextFmt>>::decode`
+    /// correctly maps PG text representation into the
+    /// Result<i32, DecodeError> contract — happy paths, overflow,
+    /// malformed digits, non-ASCII. An arm-body swap in my impl
+    /// (e.g., returning `NonUtf8` for overflow) fails this table.
     ///
     /// Non-ASCII/non-UTF-8 bytes classify as `IntParse` (not
     /// `NonUtf8`): the single-pass ASCII-digit parser treats ANY
@@ -3075,27 +2896,27 @@ mod from_pg_text_tests {
     #[test]
     fn i32_decoder_matrix() {
         // Happy paths.
-        assert!(matches!(i32::from_pg_text(b"0"), Ok(0)));
-        assert!(matches!(i32::from_pg_text(b"42"), Ok(42)));
-        assert!(matches!(i32::from_pg_text(b"-17"), Ok(-17)));
-        assert!(matches!(i32::from_pg_text(b"+17"), Ok(17)));
-        assert!(matches!(i32::from_pg_text(b"2147483647"), Ok(i32::MAX)));
-        assert!(matches!(i32::from_pg_text(b"-2147483648"), Ok(i32::MIN)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(b"0"), Ok(0)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(b"42"), Ok(42)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(b"-17"), Ok(-17)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(b"+17"), Ok(17)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(b"2147483647"), Ok(i32::MAX)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(b"-2147483648"), Ok(i32::MIN)));
 
         // Overflow → IntParse.
-        assert!(matches!(i32::from_pg_text(b"2147483648"), Err(DecodeError::IntParse)));
-        assert!(matches!(i32::from_pg_text(b"-2147483649"), Err(DecodeError::IntParse)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(b"2147483648"), Err(DecodeError::IntParse)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(b"-2147483649"), Err(DecodeError::IntParse)));
 
         // Garbage → IntParse (empty, non-digit, trailing, whitespace).
-        assert!(matches!(i32::from_pg_text(b""), Err(DecodeError::IntParse)));
-        assert!(matches!(i32::from_pg_text(b"abc"), Err(DecodeError::IntParse)));
-        assert!(matches!(i32::from_pg_text(b"12a"), Err(DecodeError::IntParse)));
-        assert!(matches!(i32::from_pg_text(b" 12"), Err(DecodeError::IntParse)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(b""), Err(DecodeError::IntParse)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(b"abc"), Err(DecodeError::IntParse)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(b"12a"), Err(DecodeError::IntParse)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(b" 12"), Err(DecodeError::IntParse)));
 
         // Non-ASCII bytes → IntParse (single-pass ASCII-digit
         // validator treats any non-digit byte uniformly).
-        assert!(matches!(i32::from_pg_text(&[0xFF]), Err(DecodeError::IntParse)));
-        assert!(matches!(i32::from_pg_text(&[0xC3, 0x28]), Err(DecodeError::IntParse)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(&[0xFF]), Err(DecodeError::IntParse)));
+        assert!(matches!(<i32 as Cell<TextFmt>>::decode(&[0xC3, 0x28]), Err(DecodeError::IntParse)));
     }
 
     /// Tier-3 closure for the common-value fast-paths. The fast-
@@ -3115,26 +2936,26 @@ mod from_pg_text_tests {
     #[test]
     fn common_value_fast_paths_pin_correctness() {
         // i16 fast-paths.
-        assert_eq!(i16::from_pg_text(b"0"), Ok(0i16));
-        assert_eq!(i16::from_pg_text(b"1"), Ok(1i16));
-        assert_eq!(i16::from_pg_text(b"-1"), Ok(-1i16));
+        assert_eq!(<i16 as Cell<TextFmt>>::decode(b"0"), Ok(0i16));
+        assert_eq!(<i16 as Cell<TextFmt>>::decode(b"1"), Ok(1i16));
+        assert_eq!(<i16 as Cell<TextFmt>>::decode(b"-1"), Ok(-1i16));
         // i32 fast-paths.
-        assert_eq!(i32::from_pg_text(b"0"), Ok(0i32));
-        assert_eq!(i32::from_pg_text(b"1"), Ok(1i32));
-        assert_eq!(i32::from_pg_text(b"-1"), Ok(-1i32));
+        assert_eq!(<i32 as Cell<TextFmt>>::decode(b"0"), Ok(0i32));
+        assert_eq!(<i32 as Cell<TextFmt>>::decode(b"1"), Ok(1i32));
+        assert_eq!(<i32 as Cell<TextFmt>>::decode(b"-1"), Ok(-1i32));
         // i64 fast-paths.
-        assert_eq!(i64::from_pg_text(b"0"), Ok(0i64));
-        assert_eq!(i64::from_pg_text(b"1"), Ok(1i64));
-        assert_eq!(i64::from_pg_text(b"-1"), Ok(-1i64));
+        assert_eq!(<i64 as Cell<TextFmt>>::decode(b"0"), Ok(0i64));
+        assert_eq!(<i64 as Cell<TextFmt>>::decode(b"1"), Ok(1i64));
+        assert_eq!(<i64 as Cell<TextFmt>>::decode(b"-1"), Ok(-1i64));
 
         // Near-misses that MUST fall through to the digit loop and
         // return correctly (not the fast-path's literal). A bug
         // where fast-path matched too eagerly would break these.
-        assert_eq!(i32::from_pg_text(b"01"), Ok(1i32)); // leading zero
-        assert_eq!(i32::from_pg_text(b"10"), Ok(10i32));
-        assert_eq!(i32::from_pg_text(b"-10"), Ok(-10i32));
-        assert_eq!(i32::from_pg_text(b"+1"), Ok(1i32)); // explicit +
-        assert_eq!(i32::from_pg_text(b"+0"), Ok(0i32));
+        assert_eq!(<i32 as Cell<TextFmt>>::decode(b"01"), Ok(1i32)); // leading zero
+        assert_eq!(<i32 as Cell<TextFmt>>::decode(b"10"), Ok(10i32));
+        assert_eq!(<i32 as Cell<TextFmt>>::decode(b"-10"), Ok(-10i32));
+        assert_eq!(<i32 as Cell<TextFmt>>::decode(b"+1"), Ok(1i32)); // explicit +
+        assert_eq!(<i32 as Cell<TextFmt>>::decode(b"+0"), Ok(0i32));
     }
 
     /// **One invariant, one test**: parallel `i16` / `i64` / `u32`
@@ -3144,31 +2965,31 @@ mod from_pg_text_tests {
     #[test]
     fn other_integer_decoders_matrix() {
         // i16 boundaries.
-        assert!(matches!(i16::from_pg_text(b"32767"), Ok(i16::MAX)));
-        assert!(matches!(i16::from_pg_text(b"-32768"), Ok(i16::MIN)));
-        assert!(matches!(i16::from_pg_text(b"32768"), Err(DecodeError::IntParse)));
+        assert!(matches!(<i16 as Cell<TextFmt>>::decode(b"32767"), Ok(i16::MAX)));
+        assert!(matches!(<i16 as Cell<TextFmt>>::decode(b"-32768"), Ok(i16::MIN)));
+        assert!(matches!(<i16 as Cell<TextFmt>>::decode(b"32768"), Err(DecodeError::IntParse)));
 
         // i64 boundaries.
-        assert!(matches!(i64::from_pg_text(b"9223372036854775807"), Ok(i64::MAX)));
-        assert!(matches!(i64::from_pg_text(b"9223372036854775808"), Err(DecodeError::IntParse)));
+        assert!(matches!(<i64 as Cell<TextFmt>>::decode(b"9223372036854775807"), Ok(i64::MAX)));
+        assert!(matches!(<i64 as Cell<TextFmt>>::decode(b"9223372036854775808"), Err(DecodeError::IntParse)));
 
         // u32 boundaries + negative rejection.
-        assert!(matches!(u32::from_pg_text(b"0"), Ok(0)));
-        assert!(matches!(u32::from_pg_text(b"4294967295"), Ok(u32::MAX)));
-        assert!(matches!(u32::from_pg_text(b"4294967296"), Err(DecodeError::IntParse)));
-        assert!(matches!(u32::from_pg_text(b"-1"), Err(DecodeError::IntParse)));
+        assert!(matches!(<u32 as Cell<TextFmt>>::decode(b"0"), Ok(0)));
+        assert!(matches!(<u32 as Cell<TextFmt>>::decode(b"4294967295"), Ok(u32::MAX)));
+        assert!(matches!(<u32 as Cell<TextFmt>>::decode(b"4294967296"), Err(DecodeError::IntParse)));
+        assert!(matches!(<u32 as Cell<TextFmt>>::decode(b"-1"), Err(DecodeError::IntParse)));
     }
 
-    /// **One invariant, one test**: `bool::from_pg_text` accepts
-    /// **exactly** PG's canonical `"t"` / `"f"` wire form — nothing
-    /// else. PG server is strict on wire format; lax parsers that
-    /// accept `"true"` / `"1"` / etc. would mask protocol desync if
-    /// the server ever switched to a non-standard encoding.
+    /// **One invariant, one test**: `<bool as Cell<TextFmt>>::decode`
+    /// accepts **exactly** PG's canonical `"t"` / `"f"` wire form —
+    /// nothing else. PG server is strict on wire format; lax parsers
+    /// that accept `"true"` / `"1"` / etc. would mask protocol desync
+    /// if the server ever switched to a non-standard encoding.
     #[test]
     fn bool_decoder_matrix() {
         // Canonical accepts.
-        assert!(matches!(bool::from_pg_text(b"t"), Ok(true)));
-        assert!(matches!(bool::from_pg_text(b"f"), Ok(false)));
+        assert!(matches!(<bool as Cell<TextFmt>>::decode(b"t"), Ok(true)));
+        assert!(matches!(<bool as Cell<TextFmt>>::decode(b"f"), Ok(false)));
 
         // Every non-canonical form (including common false-friends
         // from SQL literal contexts) must classify as BoolParse, NOT
@@ -3178,20 +2999,20 @@ mod from_pg_text_tests {
             &b"1"[..], &b"0"[..], &b"yes"[..], &b"no"[..], &b""[..],
         ] {
             assert!(
-                matches!(bool::from_pg_text(bad), Err(DecodeError::BoolParse)),
+                matches!(<bool as Cell<TextFmt>>::decode(bad), Err(DecodeError::BoolParse)),
                 "expected BoolParse for {bad:?}",
             );
         }
     }
 
-    /// **One invariant, one test**: `&str::from_pg_text` is a
-    /// zero-copy UTF-8 validator. Output pointer must equal input
+    /// **One invariant, one test**: `<&str as Cell<TextFmt>>::decode`
+    /// is a zero-copy UTF-8 validator. Output pointer must equal input
     /// pointer (no internal copy); non-UTF-8 input classifies as
     /// `NonUtf8`; empty input is valid.
     #[test]
     fn str_decoder_matrix() {
         let bytes: &[u8] = b"hello world";
-        let result = <&str>::from_pg_text(bytes);
+        let result = <&str as Cell<TextFmt>>::decode(bytes);
         assert!(matches!(result, Ok("hello world")));
         if let Ok(s) = result {
             // Zero-copy invariant — the returned &str borrows the
@@ -3200,10 +3021,10 @@ mod from_pg_text_tests {
         }
 
         // Empty is valid.
-        assert!(matches!(<&str>::from_pg_text(b""), Ok("")));
+        assert!(matches!(<&str as Cell<TextFmt>>::decode(b""), Ok("")));
 
         // Non-UTF-8 (lone continuation byte).
-        assert!(matches!(<&str>::from_pg_text(&[0x80]), Err(DecodeError::NonUtf8)));
+        assert!(matches!(<&str as Cell<TextFmt>>::decode(&[0x80]), Err(DecodeError::NonUtf8)));
     }
 
     // OID drift-pin is tier-1 compile — see `decode::oids::const _`
@@ -4030,48 +3851,47 @@ mod parse_pg_bool_swar_tests {
 
 #[cfg(test)]
 mod decode_format_tests {
-    //! Type-level (T, F) pair dispatch via the generic-F
-    //! `DecodeFormat<F>` trait.
+    //! Type-level (T, F) pair dispatch via the unified generic-F
+    //! `Cell<F>` trait.
     //!
     //! Tests cover:
-    //! - each `(T, F)` pair round-trips correctly (12 cases:
-    //!   6 primitive types × 2 format markers),
-    //! - OID consistency between `DecodeFormat<F>::OID` and the
-    //!   corresponding `FromPgText::OID` / `FromPgBinary::OID`
-    //!   (additional to the compile-time const-asserts above; these
-    //!   runtime checks pin the assert blocks against accidental
-    //!   removal),
-    //! - `FormatCodeMarker::WIRE` produces correct `FormatCode`,
+    //! - each `(T, F)` pair round-trips correctly (14 cases:
+    //!   7 type slots × 2 format markers),
+    //! - OID consistency between `Cell<F>::OID` and the canonical
+    //!   `oids::*` constants (additional to the compile-time
+    //!   const-asserts above; these runtime checks pin the assert
+    //!   blocks against accidental removal),
+    //! - `Fmt::WIRE` produces correct `FormatCode`,
     //! - `decode_with_format` dispatches the right impl on a
     //!   runtime `FormatCode`.
     use super::*;
 
     #[test]
     fn markers_wire_consts() {
-        assert_eq!(<TextFmt as FormatCodeMarker>::WIRE, FormatCode::Text);
-        assert_eq!(<BinaryFmt as FormatCodeMarker>::WIRE, FormatCode::Binary);
+        assert_eq!(<TextFmt as Fmt>::WIRE, FormatCode::Text);
+        assert_eq!(<BinaryFmt as Fmt>::WIRE, FormatCode::Binary);
     }
 
     #[test]
     fn text_round_trips() {
-        assert_eq!(<i16 as DecodeFormat<TextFmt>>::decode(b"42"), Ok(42_i16));
-        assert_eq!(<i32 as DecodeFormat<TextFmt>>::decode(b"-1234567"), Ok(-1_234_567_i32));
-        assert_eq!(<i64 as DecodeFormat<TextFmt>>::decode(b"9223372036854775807"), Ok(9_223_372_036_854_775_807_i64));
-        assert_eq!(<u32 as DecodeFormat<TextFmt>>::decode(b"4294967295"), Ok(u32::MAX));
-        assert_eq!(<bool as DecodeFormat<TextFmt>>::decode(b"t"), Ok(true));
-        assert_eq!(<bool as DecodeFormat<TextFmt>>::decode(b"f"), Ok(false));
-        assert_eq!(<&str as DecodeFormat<TextFmt>>::decode(b"hello"), Ok("hello"));
+        assert_eq!(<i16 as Cell<TextFmt>>::decode(b"42"), Ok(42_i16));
+        assert_eq!(<i32 as Cell<TextFmt>>::decode(b"-1234567"), Ok(-1_234_567_i32));
+        assert_eq!(<i64 as Cell<TextFmt>>::decode(b"9223372036854775807"), Ok(9_223_372_036_854_775_807_i64));
+        assert_eq!(<u32 as Cell<TextFmt>>::decode(b"4294967295"), Ok(u32::MAX));
+        assert_eq!(<bool as Cell<TextFmt>>::decode(b"t"), Ok(true));
+        assert_eq!(<bool as Cell<TextFmt>>::decode(b"f"), Ok(false));
+        assert_eq!(<&str as Cell<TextFmt>>::decode(b"hello"), Ok("hello"));
     }
 
     #[test]
     fn binary_round_trips() {
-        assert_eq!(<i16 as DecodeFormat<BinaryFmt>>::decode(&42_i16.to_be_bytes()), Ok(42_i16));
-        assert_eq!(<i32 as DecodeFormat<BinaryFmt>>::decode(&(-1_234_567_i32).to_be_bytes()), Ok(-1_234_567_i32));
-        assert_eq!(<i64 as DecodeFormat<BinaryFmt>>::decode(&i64::MAX.to_be_bytes()), Ok(i64::MAX));
-        assert_eq!(<u32 as DecodeFormat<BinaryFmt>>::decode(&u32::MAX.to_be_bytes()), Ok(u32::MAX));
-        assert_eq!(<bool as DecodeFormat<BinaryFmt>>::decode(&[1]), Ok(true));
-        assert_eq!(<bool as DecodeFormat<BinaryFmt>>::decode(&[0]), Ok(false));
-        assert_eq!(<&str as DecodeFormat<BinaryFmt>>::decode(b"hello"), Ok("hello"));
+        assert_eq!(<i16 as Cell<BinaryFmt>>::decode(&42_i16.to_be_bytes()), Ok(42_i16));
+        assert_eq!(<i32 as Cell<BinaryFmt>>::decode(&(-1_234_567_i32).to_be_bytes()), Ok(-1_234_567_i32));
+        assert_eq!(<i64 as Cell<BinaryFmt>>::decode(&i64::MAX.to_be_bytes()), Ok(i64::MAX));
+        assert_eq!(<u32 as Cell<BinaryFmt>>::decode(&u32::MAX.to_be_bytes()), Ok(u32::MAX));
+        assert_eq!(<bool as Cell<BinaryFmt>>::decode(&[1]), Ok(true));
+        assert_eq!(<bool as Cell<BinaryFmt>>::decode(&[0]), Ok(false));
+        assert_eq!(<&str as Cell<BinaryFmt>>::decode(b"hello"), Ok("hello"));
     }
 
     #[test]
@@ -4079,54 +3899,53 @@ mod decode_format_tests {
         // Runtime double-check of the compile-time const-asserts.
         // Removing the assert block would not be caught by compile,
         // but THIS test would still fail.
-        assert_eq!(<i16 as DecodeFormat<TextFmt>>::OID, <i16 as FromPgText>::OID);
-        assert_eq!(<i32 as DecodeFormat<TextFmt>>::OID, <i32 as FromPgText>::OID);
-        assert_eq!(<i64 as DecodeFormat<TextFmt>>::OID, <i64 as FromPgText>::OID);
-        assert_eq!(<u32 as DecodeFormat<TextFmt>>::OID, <u32 as FromPgText>::OID);
-        assert_eq!(<bool as DecodeFormat<TextFmt>>::OID, <bool as FromPgText>::OID);
-        assert_eq!(<&str as DecodeFormat<TextFmt>>::OID, <&str as FromPgText>::OID);
+        assert_eq!(<i16 as Cell<TextFmt>>::OID, oids::INT2);
+        assert_eq!(<i32 as Cell<TextFmt>>::OID, oids::INT4);
+        assert_eq!(<i64 as Cell<TextFmt>>::OID, oids::INT8);
+        assert_eq!(<u32 as Cell<TextFmt>>::OID, oids::OID);
+        assert_eq!(<bool as Cell<TextFmt>>::OID, oids::BOOL);
+        assert_eq!(<&str as Cell<TextFmt>>::OID, oids::TEXT);
     }
 
     #[test]
     fn oid_consistency_binary() {
-        assert_eq!(<i16 as DecodeFormat<BinaryFmt>>::OID, <i16 as FromPgBinary>::OID);
-        assert_eq!(<i32 as DecodeFormat<BinaryFmt>>::OID, <i32 as FromPgBinary>::OID);
-        assert_eq!(<i64 as DecodeFormat<BinaryFmt>>::OID, <i64 as FromPgBinary>::OID);
-        assert_eq!(<u32 as DecodeFormat<BinaryFmt>>::OID, <u32 as FromPgBinary>::OID);
-        assert_eq!(<bool as DecodeFormat<BinaryFmt>>::OID, <bool as FromPgBinary>::OID);
-        assert_eq!(<&str as DecodeFormat<BinaryFmt>>::OID, <&str as FromPgBinary>::OID);
+        assert_eq!(<i16 as Cell<BinaryFmt>>::OID, oids::INT2);
+        assert_eq!(<i32 as Cell<BinaryFmt>>::OID, oids::INT4);
+        assert_eq!(<i64 as Cell<BinaryFmt>>::OID, oids::INT8);
+        assert_eq!(<u32 as Cell<BinaryFmt>>::OID, oids::OID);
+        assert_eq!(<bool as Cell<BinaryFmt>>::OID, oids::BOOL);
+        assert_eq!(<&str as Cell<BinaryFmt>>::OID, oids::TEXT);
     }
 
     #[test]
     fn oid_text_binary_symmetry() {
         // Same Rust type → same PG type OID across text/binary.
-        // (Already const-asserted on the legacy FromPgText/FromPgBinary
-        // pair; mirrored here on the new DecodeFormat surface for
-        // explicit runtime drift detection.)
+        // (Already const-asserted on the `Cell<TextFmt>`/`Cell<BinaryFmt>`
+        // pair; mirrored here for explicit runtime drift detection.)
         assert_eq!(
-            <i16 as DecodeFormat<TextFmt>>::OID,
-            <i16 as DecodeFormat<BinaryFmt>>::OID,
-            "i16 OID skew between text and binary DecodeFormat impls",
+            <i16 as Cell<TextFmt>>::OID,
+            <i16 as Cell<BinaryFmt>>::OID,
+            "i16 OID skew between text and binary Cell impls",
         );
         assert_eq!(
-            <i32 as DecodeFormat<TextFmt>>::OID,
-            <i32 as DecodeFormat<BinaryFmt>>::OID,
+            <i32 as Cell<TextFmt>>::OID,
+            <i32 as Cell<BinaryFmt>>::OID,
         );
         assert_eq!(
-            <i64 as DecodeFormat<TextFmt>>::OID,
-            <i64 as DecodeFormat<BinaryFmt>>::OID,
+            <i64 as Cell<TextFmt>>::OID,
+            <i64 as Cell<BinaryFmt>>::OID,
         );
         assert_eq!(
-            <u32 as DecodeFormat<TextFmt>>::OID,
-            <u32 as DecodeFormat<BinaryFmt>>::OID,
+            <u32 as Cell<TextFmt>>::OID,
+            <u32 as Cell<BinaryFmt>>::OID,
         );
         assert_eq!(
-            <bool as DecodeFormat<TextFmt>>::OID,
-            <bool as DecodeFormat<BinaryFmt>>::OID,
+            <bool as Cell<TextFmt>>::OID,
+            <bool as Cell<BinaryFmt>>::OID,
         );
         assert_eq!(
-            <&str as DecodeFormat<TextFmt>>::OID,
-            <&str as DecodeFormat<BinaryFmt>>::OID,
+            <&str as Cell<TextFmt>>::OID,
+            <&str as Cell<BinaryFmt>>::OID,
         );
     }
 
@@ -4152,7 +3971,7 @@ mod decode_format_tests {
 
     #[test]
     fn decode_with_format_propagates_errors() {
-        // Invalid text bool — `from_pg_text` returns `BoolParse`.
+        // Invalid text bool — `Cell<TextFmt>::decode` returns `BoolParse`.
         let r: Result<bool, _> = decode_with_format(b"yes", FormatCode::Text);
         assert!(matches!(r, Err(DecodeError::BoolParse)));
         // Invalid binary i32 (wrong length) — `BinaryLengthMismatch`.
@@ -4174,28 +3993,28 @@ mod session_2025_05_25_tests {
 
     #[test]
     fn u32_from_pg_text_common_value_zero() {
-        assert!(matches!(<u32 as FromPgText>::from_pg_text(b"0"), Ok(0)));
+        assert!(matches!(<u32 as Cell<TextFmt>>::decode(b"0"), Ok(0)));
     }
 
     #[test]
     fn u32_from_pg_text_common_value_one() {
-        assert!(matches!(<u32 as FromPgText>::from_pg_text(b"1"), Ok(1)));
+        assert!(matches!(<u32 as Cell<TextFmt>>::decode(b"1"), Ok(1)));
     }
 
     #[test]
     fn u32_from_pg_text_regular_value() {
-        assert!(matches!(<u32 as FromPgText>::from_pg_text(b"42"), Ok(42)));
+        assert!(matches!(<u32 as Cell<TextFmt>>::decode(b"42"), Ok(42)));
     }
 
     #[test]
     fn str_from_pg_binary_valid_utf8() {
-        assert!(matches!(<&str as FromPgBinary>::from_pg_binary(b"hello"), Ok("hello")));
+        assert!(matches!(<&str as Cell<BinaryFmt>>::decode(b"hello"), Ok("hello")));
     }
 
     #[test]
     fn str_from_pg_binary_invalid_utf8() {
         let bytes: &[u8] = &[0xFF, 0xFE];
-        assert!(<&str as FromPgBinary>::from_pg_binary(bytes).is_err());
+        assert!(<&str as Cell<BinaryFmt>>::decode(bytes).is_err());
     }
 }
 

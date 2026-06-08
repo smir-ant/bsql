@@ -717,7 +717,7 @@ pub enum ProtocolError {
     /// chunked bytes.
     ChunkedColumnInTypedRow,
 
-    /// A per-column `DecodeFormat::decode` call returned an error
+    /// A per-column `Cell::decode` call returned an error
     /// during a typed `collect_tuple` row assembly. The inner
     /// [`crate::decode::DecodeError`] is the root cause (bad UTF-8,
     /// IntParse, NullInNonNullColumn, etc.). The connection itself
