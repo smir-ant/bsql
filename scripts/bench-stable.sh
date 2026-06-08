@@ -242,10 +242,10 @@ run_bench() {
     # criterion harness. The filter (if given) goes first, before
     # the criterion flags.
     if [[ -n "$filter" ]]; then
-        "${LOWER_PRIORITY[@]}" cargo bench -p bsql-pg-proto \
+        "${LOWER_PRIORITY[@]}" cargo bench -p bsql-postgres-proto \
             --bench hot_paths -- "$filter" "${crit_args[@]}"
     else
-        "${LOWER_PRIORITY[@]}" cargo bench -p bsql-pg-proto \
+        "${LOWER_PRIORITY[@]}" cargo bench -p bsql-postgres-proto \
             --bench hot_paths -- "${crit_args[@]}"
     fi
 }

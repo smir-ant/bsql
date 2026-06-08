@@ -52,7 +52,7 @@
 # # Examples
 #
 #   # Wrap an existing cargo bench run.
-#   scripts/bench-cpu-time.sh -- cargo bench -p bsql-pg-proto --bench hot_paths
+#   scripts/bench-cpu-time.sh -- cargo bench -p bsql-postgres-proto --bench hot_paths
 #
 #   # Wrap bench-stable.sh save in one call.
 #   scripts/bench-cpu-time.sh stable-wrap before-md5
@@ -79,7 +79,7 @@ Usage:
       Sanity check: run /usr/bin/time -p sleep 0.5.
 
 Examples:
-  scripts/bench-cpu-time.sh -- cargo bench -p bsql-pg-proto --bench hot_paths
+  scripts/bench-cpu-time.sh -- cargo bench -p bsql-postgres-proto --bench hot_paths
   scripts/bench-cpu-time.sh stable-wrap before-md5
 EOF
     exit 1

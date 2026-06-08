@@ -127,7 +127,7 @@ CMD="${1:-}"
 # deallocs=<d> bytes=<b>`. Order from the bench harness is
 # stable (see alloc_counts.rs `fn main`).
 run_alloc_bench() {
-    cargo bench -p bsql-pg-proto --bench alloc_counts 2>&1 \
+    cargo bench -p bsql-postgres-proto --bench alloc_counts 2>&1 \
         | grep '^ALLOC_BENCH ' \
         | sed 's/^ALLOC_BENCH //'
 }

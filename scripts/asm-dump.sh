@@ -44,11 +44,11 @@ cd "$WORKSPACE"
 # `-C debuginfo=0` keeps the .s file from being polluted with debug
 # directives that obscure the actual instructions.
 echo "[asm-dump] cargo rustc --release --emit=asm ..." >&2
-cargo rustc -p bsql-pg-proto --release --lib -- --emit=asm \
+cargo rustc -p bsql-postgres-proto --release --lib -- --emit=asm \
     -C debuginfo=0 \
     >/dev/null 2>&1 || {
     echo "[asm-dump] cargo rustc failed; rerun without redirects:" >&2
-    echo "  cargo rustc -p bsql-pg-proto --release --lib -- --emit=asm -C debuginfo=0" >&2
+    echo "  cargo rustc -p bsql-postgres-proto --release --lib -- --emit=asm -C debuginfo=0" >&2
     exit 1
 }
 
@@ -58,7 +58,7 @@ ASM_FILE="$(ls -t target/release/deps/bsql_pg_proto-*.s 2>/dev/null | head -1)"
 if [[ -z "$ASM_FILE" ]]; then
     echo "[asm-dump] No .s file found in target/release/deps/" >&2
     echo "[asm-dump] cargo rustc may have been a no-op cache hit. Touch source:" >&2
-    echo "  touch crates/bsql-pg-proto/src/lib.rs && rerun" >&2
+    echo "  touch crates/postgres/proto/src/lib.rs && rerun" >&2
     exit 1
 fi
 echo "[asm-dump] using $ASM_FILE" >&2
