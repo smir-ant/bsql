@@ -71,6 +71,13 @@ pub enum DriverError {
     /// the protocol's notification arena. The notification definitely arrived;
     /// dropping it silently would lose an event the caller is waiting on.
     NotificationUnavailable,
+    /// A socket read needed to complete an in-flight command exceeded the
+    /// configured read timeout. The protocol is mid-exchange — it had consumed
+    /// every buffered byte and was awaiting a server reply that did not arrive
+    /// in time. Surfaced as a distinct, classified error rather than a generic
+    /// I/O failure (the cause is a deadline, not a broken pipe) and never as a
+    /// silent stop (which would truncate the result).
+    Timeout,
 }
 
 impl fmt::Display for DriverError {
@@ -90,6 +97,7 @@ impl fmt::Display for DriverError {
             Self::TimeoutOverflow => write!(f, "requested timeout overflows the monotonic clock"),
             Self::RowDescriptionMissing => write!(f, "row stream produced rows with no column description; result cannot be decoded"),
             Self::NotificationUnavailable => write!(f, "NOTIFY frame observed but its payload could not be resolved"),
+            Self::Timeout => write!(f, "read timed out while awaiting a server reply mid-command"),
         }
     }
 }
@@ -110,7 +118,8 @@ impl std::error::Error for DriverError {
             | Self::NonUtf8Payload
             | Self::TimeoutOverflow
             | Self::RowDescriptionMissing
-            | Self::NotificationUnavailable => None,
+            | Self::NotificationUnavailable
+            | Self::Timeout => None,
         }
     }
 }

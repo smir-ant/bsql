@@ -292,11 +292,28 @@ impl Session {
     pub fn drain_streaming(&mut self) -> bool {
         self.proto.iter_rows(&mut self.wb, |stream| {
             loop {
+                // Snapshot buffered bytes before each step so a `NeedMore` can be
+                // classified: a strict decrease means a frame was consumed and
+                // more buffered frames remain (e.g. the trailing ReadyForQuery
+                // after a just-consumed CommandComplete) — keep draining bytes
+                // already in hand. No change means a wire read is genuinely
+                // required. Without this, the first `NeedMore` would report
+                // "need bytes" while the terminal frames sit unconsumed in the
+                // buffer, and the caller's blocking read would stall on a wire
+                // that owes nothing.
+                let unread_before = stream.unread_len();
                 match stream.col_next() {
                     bsql_postgres_proto::ColEvent::EndQuery { .. } => return true,
-                    // No I/O here: report that more bytes are required rather
-                    // than spinning. The driver reads and feeds, then re-enters.
-                    bsql_postgres_proto::ColEvent::NeedMore => return false,
+                    bsql_postgres_proto::ColEvent::NeedMore => {
+                        // Strict decrease ⇒ progress on buffered bytes ⇒ re-enter
+                        // (no I/O). Bounded: each re-entry consumes ≥1 byte, so
+                        // this cannot spin. Otherwise report that more wire bytes
+                        // are required; the driver reads and feeds, then re-enters.
+                        if stream.unread_len() < unread_before {
+                            continue;
+                        }
+                        return false;
+                    }
                     _ => {}
                 }
             }

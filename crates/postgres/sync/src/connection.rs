@@ -43,6 +43,29 @@ impl Stream {
     }
 }
 
+/// Map a read I/O error to a classified [`DriverError`].
+///
+/// A blocking read that fires its configured timeout returns
+/// [`std::io::ErrorKind::WouldBlock`] (or `TimedOut` on some platforms). These
+/// reads are only ever issued mid-command, after the protocol has drained every
+/// buffered byte and is genuinely waiting on the wire — so a timeout here means
+/// the server owes a reply that never arrived in time. That is a deadline, not a
+/// broken connection, so it maps to [`DriverError::Timeout`] (tier-3 classified)
+/// rather than being folded into a generic `Io`. The read loop never issues a
+/// read once the protocol has signalled completion, so this timeout cannot fire
+/// on the happy path.
+fn classify_read_error(e: std::io::Error) -> DriverError {
+    match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => DriverError::Timeout,
+        _ => DriverError::Io(e),
+    }
+}
+
+/// Read into `buf`, classifying a timeout as [`DriverError::Timeout`].
+fn read_classify_timeout(stream: &mut Stream, buf: &mut [u8]) -> Result<usize, DriverError> {
+    stream.read(buf).map_err(classify_read_error)
+}
+
 /// Sync PostgreSQL connection — thin adapter over Session.
 pub struct Connection {
     session: Session,
@@ -118,7 +141,12 @@ impl Connection {
                     self.stream.write_all(&bytes)?;
                 }
                 PumpAction::NeedRead => {
-                    let n = self.stream.read(&mut self.read_buf)?;
+                    // A read is issued only when the protocol has exhausted its
+                    // buffered bytes and the exchange is not yet complete, so a
+                    // read that times out here is a genuine mid-exchange timeout
+                    // (the server owes a reply that never arrived). Classify it
+                    // rather than masquerading as a generic I/O error.
+                    let n = read_classify_timeout(&mut self.stream, &mut self.read_buf)?;
                     if n == 0 { return Err(DriverError::Io(std::io::Error::other("server closed"))); }
                     self.session.feed(&self.read_buf[..n])?;
                 }
@@ -128,11 +156,14 @@ impl Connection {
                         Some(ref mut r) => self.collect_streaming(r)?,
                         None => {
                             // Discard a streaming result we did not ask for.
-                            // `drain_streaming` is sans-IO; supply bytes here
-                            // when it needs them. A clean server close mid-drain
+                            // `drain_streaming` is sans-IO and consumes every
+                            // buffered frame before reporting it needs more, so a
+                            // read here is only issued when the wire genuinely owes
+                            // bytes; a read-timeout is therefore a classified
+                            // mid-exchange Timeout. A clean server close mid-drain
                             // is a stall, not a successful drain.
                             while !self.session.drain_streaming() {
-                                let n = self.stream.read(&mut self.read_buf)?;
+                                let n = read_classify_timeout(&mut self.stream, &mut self.read_buf)?;
                                 if n == 0 { return Err(DriverError::StreamStalled); }
                                 self.session.feed(&self.read_buf[..n])?;
                             }
@@ -175,6 +206,12 @@ impl Connection {
             let mut ab = bsql_postgres_core::ArenaBuilder::new(n_cols);
             let mut in_chunk = false;
             loop {
+                // Snapshot of buffered bytes before this step, used by the
+                // `NeedMore` arm to tell a silent state advance (the protocol
+                // consumed a frame and can keep draining buffered bytes) apart
+                // from a genuine need for more wire bytes (no progress possible
+                // from the buffer alone).
+                let unread_before = rs.unread_len();
                 match rs.col_next() {
                     bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
                         ab.push_value(bytes);
@@ -191,12 +228,30 @@ impl Connection {
                         return Ok(());
                     }
                     bsql_postgres_proto::ColEvent::NeedMore => {
-                        // Read the next wire bytes on demand and feed them. A
-                        // read error, a clean mid-stream EOF, or a rejected feed
-                        // all fail loud rather than silently truncating the rows.
+                        // `NeedMore` is raised both when a frame was just consumed
+                        // and more complete frames remain buffered (a silent state
+                        // advance — e.g. the trailing ReadyForQuery sitting after a
+                        // just-consumed CommandComplete), and when the buffer is
+                        // exhausted or holds only a partial frame. A strict decrease
+                        // in buffered bytes means the former: re-enter `col_next` to
+                        // drain the buffer toward its terminal (`EndQuery`) without
+                        // touching the socket — issuing a read here would block on a
+                        // wire that owes nothing, since the completion bytes are
+                        // already in hand. Stopping on the protocol's terminal — not
+                        // on a read-timeout — is what keeps the result honest. The
+                        // strict-decrease guard also makes re-entry terminating:
+                        // each one consumes at least one byte, so the loop cannot
+                        // spin on an incomplete frame.
+                        if rs.unread_len() < unread_before {
+                            continue;
+                        }
+                        // No progress was possible from the buffer, so more wire
+                        // bytes are genuinely required. A read error, a clean
+                        // mid-stream EOF, a read-timeout, or a rejected feed all
+                        // fail loud (each a distinct classified error) rather than
+                        // silently truncating the rows.
                         let cap = feed_cap.max(1).min(read_buf.len());
-                        let n = stream.read(&mut read_buf[..cap])
-                            .map_err(DriverError::Io)?;
+                        let n = read_classify_timeout(stream, &mut read_buf[..cap])?;
                         if n == 0 { return Err(DriverError::StreamStalled); }
                         if rs.feed(&read_buf[..n]).is_err() {
                             return Err(DriverError::StreamStalled);
@@ -486,5 +541,32 @@ impl Drop for Connection {
     fn drop(&mut self) {
         if self.terminated { return; }
         let _ = self.stream.write_all(&[b'X', 0, 0, 0, 4]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_read_error;
+    use bsql_postgres_core::DriverError;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn read_timeout_classifies_as_timeout() {
+        // A read-timeout surfaces as WouldBlock (most platforms) or TimedOut.
+        // Both must map to the classified Timeout, never a generic Io — a
+        // deadline is not a broken connection.
+        for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+            assert!(
+                matches!(classify_read_error(Error::from(kind)), DriverError::Timeout),
+                "{kind:?} must classify as Timeout",
+            );
+        }
+    }
+
+    #[test]
+    fn other_read_errors_stay_io() {
+        // A genuine I/O failure is not a timeout and must not be relabelled.
+        let e = classify_read_error(Error::from(ErrorKind::ConnectionReset));
+        assert!(matches!(e, DriverError::Io(_)), "ConnectionReset must stay Io");
     }
 }

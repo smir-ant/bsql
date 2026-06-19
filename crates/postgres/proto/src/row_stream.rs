@@ -388,6 +388,26 @@ impl<'p, 'w> RowStream<'p, 'w> {
         }
     }
 
+    /// Number of unconsumed inbound bytes still held in the protocol's read
+    /// buffer.
+    ///
+    /// [`Self::col_next`] returns [`ColEvent::NeedMore`] for two distinct
+    /// reasons: the buffer is genuinely exhausted or holds only a partial frame
+    /// (the driver must read more wire bytes), or a frame was just consumed and
+    /// more complete frames remain buffered (a silent state advance — the driver
+    /// must re-enter `col_next` without reading). Comparing this count before
+    /// and after a `col_next` that returned `NeedMore` disambiguates the two: a
+    /// strict decrease means the protocol made progress on bytes already in hand
+    /// (re-enter); no change means a read is genuinely required (otherwise the
+    /// re-entry would spin on a partial frame). The strict-decrease guard also
+    /// bounds re-entries — each consumes at least one byte — so the loop cannot
+    /// busy-spin.
+    #[inline]
+    #[must_use]
+    pub fn unread_len(&self) -> usize {
+        self.proto.read_buf_unread_len()
+    }
+
     /// Get the current row's schema descriptor.
     ///
     /// Returns `None` outside a row-streaming state. Schema is
