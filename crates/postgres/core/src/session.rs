@@ -191,69 +191,116 @@ impl Session {
 
     /// One step of the pump loop. Returns what the I/O adapter
     /// should do next. If `Send`, bytes are in `self.pending_bytes()`.
+    ///
+    /// Completion is *terminal-based*: the pump reports [`PumpAction::Done`]
+    /// only when the protocol has actually reached its idle/ready terminal
+    /// for the in-flight command — i.e. that command's `CommandComplete`
+    /// **and** the trailing `ReadyForQuery` have been consumed. A bare
+    /// `connection_status() == Ready` snapshot drives the decision, but it is
+    /// re-read *after* every byte-processing pass so it can never be observed
+    /// against a half-consumed reply.
+    ///
+    /// Asynchronous, non-terminal frames a command's reply may interleave —
+    /// `NoticeResponse` (a WARNING/NOTICE/INFO/DEBUG/LOG), `ParameterStatus`,
+    /// `NotificationResponse` (`LISTEN`/`NOTIFY`) — are surfaced by the
+    /// protocol as their own actions and never count as completion. They
+    /// are not silently discarded: the protocol stages them and the wrapper
+    /// resolves them via the notices/notifications arenas. Critically, the
+    /// arrival of such a frame *before* the command's terminal must not be
+    /// mistaken for "the command finished" — the protocol is still `Busy`,
+    /// so the pump keeps draining toward the terminal instead of reporting
+    /// `Done` with an empty (uncaptured) command tag.
     pub fn pump_step(&mut self) -> PumpAction {
-        if Self::is_streaming(self.proto.state()) {
-            return PumpAction::Streaming;
-        }
-
-        match self.proto.connection_status() {
-            bsql_postgres_proto::ConnectionStatus::Ready => return PumpAction::Done,
-            bsql_postgres_proto::ConnectionStatus::Errored(_) => {
-                return PumpAction::Error(DriverError::NotReady);
+        loop {
+            if Self::is_streaming(self.proto.state()) {
+                return PumpAction::Streaming;
             }
-            _ => {}
-        }
 
-        let actions = self.proto.feed_bytes(&[], &mut self.wb);
-        let mut had_fail = false;
-        let mut had_close = false;
-        let mut has_send = false;
-        self.buf.clear();
-        for action in actions.as_slice() {
-            match action {
-                bsql_postgres_proto::Action::SendBytes(bytes) => {
-                    self.buf.extend_from_slice(bytes);
-                    has_send = true;
+            match self.proto.connection_status() {
+                // The command's terminal (`CommandComplete` + `ReadyForQuery`)
+                // has been consumed — the protocol is genuinely idle. This is
+                // the ONLY path to `Done`; it is decided on a freshly re-read
+                // status, never on the mere presence of staged actions.
+                bsql_postgres_proto::ConnectionStatus::Ready => return PumpAction::Done,
+                bsql_postgres_proto::ConnectionStatus::Errored(_) => {
+                    return PumpAction::Error(DriverError::NotReady);
                 }
-                bsql_postgres_proto::Action::FailReply { .. } => { had_fail = true; }
-                bsql_postgres_proto::Action::CloseSocket => { had_close = true; }
                 _ => {}
             }
-        }
-        let was_empty = actions.as_slice().is_empty();
 
-        if had_close { return PumpAction::Error(DriverError::NotReady); }
-        if had_fail {
-            let err = match self.proto.fail_cause() {
-                Some(&c) => self.classify_error(c),
-                // A failure definitely occurred (FailReply was emitted) but the
-                // protocol parked no classified cause. Report that precise
-                // condition rather than mislabelling it as "not ready".
-                None => DriverError::UnclassifiedFailure,
-            };
-            // Best-effort recovery to Ready so the connection can be reused.
-            // The server error is returned regardless; if the drain did not
-            // reach Ready, `is_healthy()` reports false and the pool evicts the
-            // connection — the outcome is observable, never silently assumed.
-            let _drained_to_ready = self.drain_to_idle();
-            return PumpAction::Error(err);
-        }
+            // Snapshot buffered bytes before processing so a non-terminal
+            // outcome can be classified: a strict decrease means a frame was
+            // consumed (e.g. a NoticeResponse, or a frame past the per-call
+            // staging budget) and more buffered frames may remain — re-enter
+            // the loop and keep draining toward the terminal without touching
+            // the socket. No change means the buffer holds nothing actionable
+            // and the wire genuinely owes the command's terminal bytes.
+            let unread_before = self.proto.unread().len();
 
-        if has_send {
-            return PumpAction::Send;
-        }
+            let actions = self.proto.feed_bytes(&[], &mut self.wb);
+            let mut had_fail = false;
+            let mut had_close = false;
+            let mut has_send = false;
+            self.buf.clear();
+            for action in actions.as_slice() {
+                match action {
+                    bsql_postgres_proto::Action::SendBytes(bytes) => {
+                        self.buf.extend_from_slice(bytes);
+                        has_send = true;
+                    }
+                    bsql_postgres_proto::Action::FailReply { .. } => { had_fail = true; }
+                    bsql_postgres_proto::Action::CloseSocket => { had_close = true; }
+                    // NoticeResponse / NotificationResponse / ParameterStatus and
+                    // other non-terminal actions: the protocol has already staged
+                    // them into its arenas (surfaced, not dropped). They do not
+                    // signal command completion, so they fall through to the
+                    // terminal re-check at the top of the loop.
+                    _ => {}
+                }
+            }
 
-        if Self::is_streaming(self.proto.state()) {
-            return PumpAction::Streaming;
-        }
+            if had_close { return PumpAction::Error(DriverError::NotReady); }
+            if had_fail {
+                let err = match self.proto.fail_cause() {
+                    Some(&c) => self.classify_error(c),
+                    // A failure definitely occurred (FailReply was emitted) but the
+                    // protocol parked no classified cause. Report that precise
+                    // condition rather than mislabelling it as "not ready".
+                    None => DriverError::UnclassifiedFailure,
+                };
+                // Best-effort recovery to Ready so the connection can be reused.
+                // The server error is returned regardless; if the drain did not
+                // reach Ready, `is_healthy()` reports false and the pool evicts the
+                // connection — the outcome is observable, never silently assumed.
+                let _drained_to_ready = self.drain_to_idle();
+                return PumpAction::Error(err);
+            }
 
-        if was_empty && !matches!(self.proto.connection_status(),
-            bsql_postgres_proto::ConnectionStatus::Ready)
-        {
+            if has_send {
+                return PumpAction::Send;
+            }
+
+            if Self::is_streaming(self.proto.state()) {
+                return PumpAction::Streaming;
+            }
+
+            // The processing pass made progress on already-buffered bytes but
+            // the command's terminal is not yet reached. Re-enter to drain the
+            // rest of the buffer (a trailing frame after a just-consumed
+            // NoticeResponse, or frames deferred past the per-call staging
+            // budget) before deciding we need the wire. Each re-entry consumes
+            // at least one byte, so the loop is bounded — it cannot spin.
+            if self.proto.unread().len() < unread_before {
+                continue;
+            }
+
+            // No actionable bytes remain buffered and the protocol has not
+            // reached its terminal: the server still owes the command's
+            // `CommandComplete` + `ReadyForQuery`. Hand control to the I/O
+            // layer to read them. This is the only non-terminal exit, and it
+            // blocks on a wire that genuinely owes bytes — never a busy wait.
             return PumpAction::NeedRead;
         }
-
-        PumpAction::Done
     }
 
     /// Pump empty bytes to advance toward `Ready` using only data already

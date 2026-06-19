@@ -454,6 +454,59 @@ fn sql_error_zoo() {
     c.close().expect("close");
 }
 
+// A command whose reply interleaves an asynchronous NoticeResponse
+// (WARNING/NOTICE) ahead of its `CommandComplete` must not make the pump
+// report completion early. Were it to do so, the command's tag would be
+// captured empty and the protocol would still be `Busy` when the NEXT
+// command is pushed — the follow-up would then fail `NotReady`. This pins
+// the terminal-based completion contract: the NOTICE-bearing statement
+// reports its correct tag AND the following command succeeds.
+#[test]
+#[ignore = "requires local PG"]
+fn notice_then_command_recovers() {
+    let mut c = $config_fn();
+
+    let real = format!("notice_real_{}", std::process::id());
+    let ghost = format!("notice_ghost_{}", std::process::id());
+    // Pre-clean any residue from a crashed prior run (idempotent).
+    let _ = c.simple_query(&format!("DROP TABLE IF EXISTS {real}"));
+
+    // (1) NOTICE path: DROP TABLE IF EXISTS on a non-existent table makes PG
+    // emit a NoticeResponse ("table ... does not exist, skipping") ahead of
+    // CommandComplete. The tag must still be captured, and the immediately
+    // following command must succeed (not NotReady).
+    for _ in 0..16 {
+        let tag = c.simple_query(&format!("DROP TABLE IF EXISTS {ghost}"))
+            .expect("drop-if-exists with NOTICE must not error");
+        assert_eq!(tag, "DROP TABLE", "NOTICE-bearing DROP must report its tag, not empty");
+        // The very next command would observe a `Busy` protocol if the pump
+        // had reported Done prematurely.
+        c.ping().expect("ping after NOTICE must not be NotReady");
+        let r = c.query("SELECT 1::int").expect("SELECT after NOTICE must succeed");
+        assert_eq!(r.rows[0].get_i32(0), Some(1));
+    }
+
+    // (2) WARNING path: a nested BEGIN makes PG emit a WARNING NoticeResponse
+    // ("there is already a transaction in progress"). The ROLLBACK that
+    // follows is the exact statement that flaked as `NotReady` before the fix.
+    for _ in 0..16 {
+        c.simple_query("BEGIN").expect("begin");
+        let warn_tag = c.simple_query("BEGIN").expect("nested BEGIN warns, never errors");
+        assert_eq!(warn_tag, "BEGIN", "WARNING-bearing BEGIN must report its tag");
+        c.simple_query("ROLLBACK").expect("rollback after WARNING must not be NotReady");
+    }
+
+    // (3) Tag-capture correctness on a real DROP: a NOTICE never appears, so
+    // this confirms the fix did not regress ordinary tag capture.
+    c.execute(&format!("CREATE TABLE {real}(x int)")).expect("create");
+    let tag = c.simple_query(&format!("DROP TABLE {real}")).expect("drop real");
+    assert_eq!(tag, "DROP TABLE", "real DROP must report DROP TABLE tag");
+
+    // Cleanup.
+    let _ = c.simple_query(&format!("DROP TABLE IF EXISTS {real}"));
+    c.close().expect("close");
+}
+
 #[test]
 #[ignore = "requires local PG"]
 fn sql_extreme_values() {
