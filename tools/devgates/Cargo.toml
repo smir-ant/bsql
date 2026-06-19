@@ -1,0 +1,23 @@
+[package]
+name = "bsql-devgates"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Dev-only measurement and verification harness for the bsql workspace: a counting GlobalAlloc and a raw-memory probe. The sole sanctioned home for unsafe in the workspace — every SHIPPED crate is unsafe-free, with unsafe consolidated here behind a publish=false boundary."
+
+# Never published. This crate exists only to host the dev-only unsafe
+# building blocks (the allocation counter and the post-drop memory probe)
+# that benches and zeroize-verification tests need. Consolidating that
+# unsafe HERE means the alloc bench is now unsafe-free and the five
+# zeroize tests share ONE audited unsafe read instead of five copies. It
+# deliberately does NOT set `lints.workspace = true`, so it is exempt from
+# the workspace lint floor and can hold the `unsafe impl GlobalAlloc`.
+publish = false
+
+[dependencies]
+
+# This crate intentionally does NOT set `lints.workspace = true`: it is
+# the one workspace member exempt from the forbid floor, precisely so it
+# can contain the `unsafe impl GlobalAlloc` and the raw-pointer probe.
+# It carries its own crate-root lint posture in `src/lib.rs` instead.

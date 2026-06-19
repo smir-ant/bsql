@@ -87,6 +87,13 @@ criterion = { workspace = true }
 # pattern as the derive crate's hostile-bypass probes. Dev-only.
 trybuild = { workspace = true }
 
+# `bsql-devgates` — dev-only harness hosting the workspace's only
+# `unsafe`: the counting `#[global_allocator]` used by the `alloc_counts`
+# bench (which is now unsafe-free), and the raw-memory `probe_bytes`
+# shared by the five zeroize-verification tests so they audit ONE unsafe
+# read instead of five copies.
+bsql-devgates = { path = "../../../tools/devgates" }
+
 # -- Bench targets --
 # `harness = false` disables the default libtest bench runner; we
 # use criterion's own main-function runner instead (generates HTML
@@ -102,10 +109,22 @@ harness = false
 # Allocation-traffic measurement bench (B-layer of `BENCHMARKING.md`
 # stack). Companion to `hot_paths.rs` criterion ns/op timings —
 # `alloc_counts.rs` reports deterministic alloc / dealloc / bytes
-# per scenario via a `#[global_allocator]` wrapper around `System`.
-# `harness = false` because we provide our own `fn main()`; criterion
-# is not used (each scenario runs exactly once for an integer answer
-# instead of statistically-sampled millions of iterations).
+# per scenario via `bsql_devgates::CountingAllocator` installed as the
+# `#[global_allocator]`. `harness = false` because we provide our own
+# `fn main()`; criterion is not used (each scenario runs exactly once
+# for an integer answer instead of statistically-sampled millions of
+# iterations). The `unsafe impl GlobalAlloc` lives in `bsql-devgates`,
+# so this bench file contains zero `unsafe`.
 [[bench]]
 name = "alloc_counts"
 harness = false
+
+# This crate KEEPS its stricter crate-root forbid-bundle in `src/lib.rs`
+# (the full no_std panic/index/arith/cast wall, including
+# `#![forbid(unsafe_code)]`). `lints.workspace = true` adds the workspace
+# FORBID floor on top — they coexist (a double-forbid of the same lint is
+# not a conflict). This crate opts out of the tier-4 `disallowed_methods`
+# ledger at its crate root (it uses the sanctioned dead-arm `.unwrap_or*`
+# shape under that stricter wall, not silent data fallbacks).
+[lints]
+workspace = true

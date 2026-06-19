@@ -2,6 +2,7 @@
 //! protocol robustness. Each test pins a finding that a happy-path-
 //! only suite would not cover.
 
+#![allow(clippy::disallowed_methods, reason = "test/bench harness — fixtures use the sanctioned try_from(..).unwrap_or(SAT) / slice.get(..).unwrap_or(&[]) dead-arm shape, not production data fallbacks")]
 use bsql_postgres_proto::{
     Action, ActiveState, ConnectingState, PgProtocol, WriteBuf, error::ProtocolError,
 };

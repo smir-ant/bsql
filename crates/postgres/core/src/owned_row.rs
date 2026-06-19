@@ -130,10 +130,17 @@ impl OwnedRow {
     /// Number of columns.
     #[must_use]
     pub fn col_count(&self) -> usize {
-        // Unreachable fallback: `data` is always a valid header (sole ctor).
-        read_u32(&self.data, 0)
+        // Dead-arm fallback, not a silent data substitution: `data` is only
+        // ever produced by this type's sole constructor, which always writes
+        // a valid 4-byte column-count header first, so `read_u32(.., 0)` is
+        // always `Some` and the `usize::try_from` widening never fails on a
+        // >=32-bit target. The `0` is the forbid-bundle-compliant landing for
+        // a branch unreachable under the type's own invariant.
+        #[allow(clippy::disallowed_methods, reason = "dead arm under the sole-constructor invariant (header always present, widening infallible on >=32-bit); 0 is the unreachable landing, not a data default")]
+        let count = read_u32(&self.data, 0)
             .and_then(|c| usize::try_from(c).ok())
-            .unwrap_or(0)
+            .unwrap_or(0);
+        count
     }
 
     /// Access one cell.

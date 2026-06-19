@@ -52,6 +52,17 @@
     clippy::integer_division
 )]
 #![deny(unused_must_use, unused_lifetimes, missing_docs)]
+// Opt out of the workspace tier-4 `disallowed_methods` ledger. Like the
+// proto crate, this proc-macro crate enforces a stricter, whole-crate
+// forbid-bundle (above: unwrap/expect/panic/as/arithmetic class) and uses
+// the `try_from(..).unwrap_or(SATURATION)` dead-arm shape as the
+// sanctioned forbid-bundle-compliant form (e.g. clamping a parsed param
+// count into a wire u16), not as a silent data fallback — so the
+// per-site ledger that fits the driver crates would be noise here.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "stricter whole-crate forbid-bundle; .unwrap_or* is the sanctioned dead-arm shape for parse-time wire-field clamping, not a silent data fallback"
+)]
 
 // `alloc` crate is implicitly available in proc-macro context
 // (proc-macro crates compile with full `std`), but the explicit

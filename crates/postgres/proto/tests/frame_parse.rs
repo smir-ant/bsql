@@ -46,6 +46,7 @@
 )]
 #![deny(unused_must_use, unused_lifetimes, unused_variables)]
 
+#![allow(clippy::disallowed_methods, reason = "test/bench harness — fixtures use the sanctioned try_from(..).unwrap_or(SAT) / slice.get(..).unwrap_or(&[]) dead-arm shape, not production data fallbacks")]
 use bsql_postgres_proto::{HeaderParse, MAX_FRAME_LEN_FIELD, parse_header};
 
 /// Category (1) — classification pin.

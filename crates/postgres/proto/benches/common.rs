@@ -20,6 +20,12 @@
     dead_code,
     reason = "shared bench helper module — not every bench file uses every helper"
 )]
+#![allow(clippy::disallowed_methods, reason = "bench harness — fixture builders use the sanctioned try_from(..).unwrap_or(SAT) dead-arm shape, not production data fallbacks")]
+// Bench fixture builders panic on malformed synthetic input. Benches are
+// never `#[test]` context, so the floor's `allow-panic-in-tests` carve-out
+// never applies here; the panic is the loud fixture-failure signal, not a
+// silent production fallback.
+#![allow(clippy::panic, reason = "bench harness — fixture builders panic on malformed synthetic input as the loud failure signal; benches are never `#[test]` context so the in-tests carve-out cannot reach them, and a bench fixture has no production data-fallback path")]
 
 use bsql_postgres_proto::{
     ActivePhase, Credentials, DisconnectedPhase, Ident, IntoActiveError, PgProtocol, StartupKind,

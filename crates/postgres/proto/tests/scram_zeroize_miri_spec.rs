@@ -34,35 +34,20 @@
 //! Run with: `cargo +nightly miri test --test scram_zeroize_miri_spec`
 //! (requires Miri: `rustup component add miri --toolchain nightly`).
 
-#![allow(unsafe_code)]
+// This crate uses `unsafe` to probe memory after a drop — a verification
+// technique that cannot be expressed in safe Rust. The raw-pointer read
+// itself lives in the audited `bsql_devgates::probe_bytes`; the
+// `unsafe { }` call blocks below discharge its safety contract (each
+// captured pointer points into this test function's still-live stack
+// frame, which Miri verifies).
+#![allow(
+    unsafe_code,
+    reason = "post-drop memory verification has no sound safe wrapper — a safe fn taking `*const u8` would let any safe caller read arbitrary memory; the raw read lives in the audited `bsql_devgates::probe_bytes` and each captured pointer points into this test function's still-live stack frame, which Miri verifies"
+)]
 
+use bsql_devgates::probe_bytes as read_bytes_at;
 use bsql_postgres_proto::password::Password;
 use bsql_postgres_proto::sensitive::Sensitive;
-
-/// Probe the Password's internal `buf` field via a known-address read.
-/// Returns true if ALL bytes at that location are zero.
-///
-/// This function is `unsafe` because it reads memory at a raw pointer
-/// after the Password has been dropped — relying on the stack frame
-/// not having been overwritten yet. Valid pattern under Miri, which
-/// verifies the memory is still live (within the test function's
-/// stack frame) at the time of read.
-///
-/// # Safety
-///
-/// Caller must ensure:
-/// - `ptr` points to a valid (possibly dropped) `[u8; N]` buffer.
-/// - The buffer's stack frame has not been reused since drop.
-/// - `N <= 1024` (upper bound covers MAX_PASSWORD_LEN).
-unsafe fn read_bytes_at(ptr: *const u8, len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        // SAFETY: caller invariants above.
-        let byte = unsafe { ptr.add(i).read() };
-        out.push(byte);
-    }
-    out
-}
 
 /// Dropping a Password zeros its backing buffer.
 ///

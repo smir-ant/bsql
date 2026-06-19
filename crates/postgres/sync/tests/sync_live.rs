@@ -1,4 +1,14 @@
 #![forbid(unsafe_code)]
+// Live integration test harness. The `.unwrap_or_else(|e| panic!(..))` and
+// `.unwrap_or(0)` calls below are test assertions that surface failures
+// loudly (they panic / are followed by an `assert!`), not silent
+// production data fallbacks, so the tier-4 ledger does not apply here.
+#![allow(clippy::disallowed_methods, reason = "test harness — .unwrap_or* here panics or feeds an assert!, surfacing failure loudly; not a silent production fallback")]
+// The `make_sync_conn` fixture helper below is not a `#[test]` fn, so the
+// floor's `allow-expect-in-tests` carve-out (keyed on `#[test]` context)
+// does not reach it; the `expect` is the loud connect-failure signal a
+// test wants, not a silent production fallback.
+#![allow(clippy::expect_used, clippy::unwrap_in_result, reason = "test harness — the connection-fixture helper expects a live PG and panics loudly on failure (the intended test signal); it is not a `#[test]` fn so the in-tests carve-out cannot reach it, and there is no production data-fallback path")]
 use bsql_postgres_sync::{ConnectConfig, Connection};
 
 fn sync_config() -> ConnectConfig {

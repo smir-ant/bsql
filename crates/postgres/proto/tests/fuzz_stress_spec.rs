@@ -42,6 +42,7 @@
 //! subdirectory with its own CI job. Not required for v1.0 ship —
 //! this file covers the robustness class via property-style tests.
 
+#![allow(clippy::disallowed_methods, reason = "test/bench harness — fixtures use the sanctioned try_from(..).unwrap_or(SAT) / slice.get(..).unwrap_or(&[]) dead-arm shape, not production data fallbacks")]
 use bsql_postgres_proto::{
     frame::{parse_header, HeaderParse, READ_BUF_CAP},
     reply_id::PingKind,

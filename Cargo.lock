@@ -60,6 +60,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsql-devgates"
+version = "0.0.0"
+
+[[package]]
 name = "bsql-postgres-async"
 version = "0.1.0-alpha.0"
 dependencies = [
@@ -96,6 +100,7 @@ name = "bsql-postgres-proto"
 version = "1.0.0-alpha.0"
 dependencies = [
  "base64ct",
+ "bsql-devgates",
  "bsql-postgres-derive",
  "criterion",
  "getrandom",

@@ -36,6 +36,11 @@ impl Pool {
         permit.forget();
 
         {
+            // Mutex poison recovery, not a data fallback: a poisoned lock means
+            // another thread panicked while holding it; `into_inner` recovers the
+            // guard so the pool keeps operating rather than propagating the panic.
+            // The connection set it guards is observed and acted on as normal.
+            #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
             let mut conns = self.inner.connections.lock()
                 .unwrap_or_else(|e| e.into_inner());
             while let Some(conn) = conns.pop_front() {
@@ -62,9 +67,11 @@ impl Pool {
     }
 
     pub fn idle_count(&self) -> usize {
-        self.inner.connections.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len()
+        // Mutex poison recovery (see `get`), not a data fallback.
+        #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+        let conns = self.inner.connections.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        conns.len()
     }
 
     pub fn max_size(&self) -> usize {
@@ -107,6 +114,7 @@ impl Drop for PooledConnection {
                 // does, so a healthy connection is always returned (never
                 // silently discarded on poison while the permit is added back,
                 // which would diverge capacity from the connection set).
+                #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
                 let mut conns = self.pool.connections.lock()
                     .unwrap_or_else(|e| e.into_inner());
                 conns.push_back(conn);

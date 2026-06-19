@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+#![allow(clippy::disallowed_methods, reason = "test/bench harness — fixtures use the sanctioned try_from(..).unwrap_or(SAT) / slice.get(..).unwrap_or(&[]) dead-arm shape, not production data fallbacks")]
 use bsql_postgres_proto::{
     Action, Reply, WriteBuf,
     push_command::SimpleQuery,

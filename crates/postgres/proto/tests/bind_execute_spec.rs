@@ -22,6 +22,12 @@
     clippy::integer_division
 )]
 #![deny(unused_must_use, unused_lifetimes)]
+// Fixture-builder helper fns below panic on malformed synthetic input.
+// Integration-test helpers run WITHOUT `cfg(test)`, so the floor's
+// `allow-panic-in-tests` carve-out (keyed on `#[test]` context) cannot
+// reach them; the panic is the loud test-failure signal, not a silent
+// production fallback.
+#![allow(clippy::panic, reason = "test harness — fixture builders panic on malformed synthetic input as the loud test-failure signal, not as a silent production fallback; integration-test helper fns are not in `#[test]` context so the in-tests carve-out cannot reach them")]
 
 use bsql_postgres_proto::{
     Action, ActiveState, ConnectionStatus, FetchRows, PortalName, ProtocolError,

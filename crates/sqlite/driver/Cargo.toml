@@ -13,3 +13,7 @@ license = "MIT OR Apache-2.0"
 # Audit-trust class: ecosystem standard (100M+ downloads), maintained
 # by the rusqlite working group.
 rusqlite = { version = "0.33", features = ["bundled"] }
+
+# Inherit the workspace FORBID floor (the two-tier lint wall).
+[lints]
+workspace = true

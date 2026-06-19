@@ -72,3 +72,11 @@ trybuild = { workspace = true }
 # This crate is intentionally minimal — proc-macro logic is
 # ergonomic-discipline, not runtime-perf code. Per CREDO §4.4,
 # every dep here is justified inline.
+
+# Inherit the workspace FORBID floor. This crate KEEPS its stricter
+# crate-root forbid-bundle in `src/lib.rs`; the floor coexists with it.
+# It opts out of the tier-4 `disallowed_methods` ledger at its crate
+# root (it uses the sanctioned `try_from(..).unwrap_or(SAT)` dead-arm
+# shape under its own stricter forbid-bundle, not silent data fallbacks).
+[lints]
+workspace = true

@@ -33,26 +33,19 @@
 //! stacked-borrows model:
 //!   - `cargo +nightly miri test --test secret_bounded_str_spec`
 
-#![allow(unsafe_code)]
+// This crate uses `unsafe` to probe memory after a drop — a verification
+// technique that cannot be expressed in safe Rust. The raw-pointer read
+// itself lives in the audited `bsql_devgates::probe_bytes`; the
+// `unsafe { }` call blocks below discharge its safety contract (each
+// captured pointer stays valid inside this test function's frame).
+#![allow(
+    unsafe_code,
+    reason = "post-drop memory verification has no sound safe wrapper — a safe fn taking `*const u8` would let any safe caller read arbitrary memory; the raw read lives in the audited `bsql_devgates::probe_bytes` and each captured pointer stays valid inside this test function's own frame"
+)]
+#![allow(clippy::disallowed_methods, reason = "test harness — .unwrap_or here is a diagnostic default for a position()-of-first-nonzero assertion, not a silent production fallback")]
 
+use bsql_devgates::probe_bytes;
 use bsql_postgres_proto::SecretBoundedStr;
-
-/// Read `len` bytes at `ptr` into a Vec. Read-only.
-///
-/// # Safety
-///
-/// Caller must ensure:
-/// - `ptr..ptr+len` is within a single live allocation.
-/// - Bytes were previously written (no MaybeUninit reads).
-unsafe fn probe_bytes(ptr: *const u8, len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        // SAFETY: caller invariants above.
-        let byte = unsafe { ptr.add(i).read() };
-        out.push(byte);
-    }
-    out
-}
 
 // =================================================================
 // Functional — constructors / accessors mirror BoundedStr<N>.

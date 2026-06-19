@@ -51,15 +51,20 @@
 //! this bench target only.
 
 #![allow(missing_docs, reason = "bench harness — descriptive fn names + module docstring suffice")]
+#![allow(clippy::disallowed_methods, reason = "bench harness — fixture builders use the sanctioned try_from(..).unwrap_or(SAT) dead-arm shape, not production data fallbacks")]
+// Bench fixture builders panic on malformed synthetic input. Benches are
+// never `#[test]` context, so the floor's `allow-panic-in-tests` carve-out
+// never applies here; the panic is the loud fixture-failure signal, not a
+// silent production fallback.
+#![allow(clippy::panic, reason = "bench harness — fixture builders panic on malformed synthetic input as the loud failure signal; benches are never `#[test]` context so the in-tests carve-out cannot reach them, and a bench fixture has no production data-fallback path")]
 
 extern crate alloc;
 
+use bsql_devgates::CountingAllocator;
 use bsql_postgres_proto::{
     reply_id::{PingKind, QueryKind},
     PgProtocol, PushFailure, WriteBuf,
 };
-use core::sync::atomic::{AtomicUsize, Ordering};
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 
 mod common;
@@ -69,114 +74,14 @@ use common::fresh_active_via_trust_handshake;
 // Counting allocator.
 // ---------------------------------------------------------------
 //
-// Wraps the platform `System` allocator with three monotonic
-// counters. We use `Relaxed` ordering because:
-//   1. The bench is single-threaded — no inter-thread visibility
-//      concerns.
-//   2. Even if the bench were multithreaded, we'd only need the
-//      counter increments to be atomic w.r.t. each other, not
-//      ordered w.r.t. other memory operations.
-// `Relaxed` is the cheapest atomic — no fence emitted.
-
-struct CountingAllocator {
-    inner: System,
-    allocs: AtomicUsize,
-    deallocs: AtomicUsize,
-    bytes_allocated: AtomicUsize,
-}
-
-impl CountingAllocator {
-    const fn new() -> Self {
-        Self {
-            inner: System,
-            allocs: AtomicUsize::new(0),
-            deallocs: AtomicUsize::new(0),
-            bytes_allocated: AtomicUsize::new(0),
-        }
-    }
-
-    fn snapshot(&self) -> AllocSnapshot {
-        AllocSnapshot {
-            allocs: self.allocs.load(Ordering::Relaxed),
-            deallocs: self.deallocs.load(Ordering::Relaxed),
-            bytes_allocated: self.bytes_allocated.load(Ordering::Relaxed),
-        }
-    }
-}
-
-// SAFETY: `CountingAllocator` forwards every alloc / dealloc /
-// realloc call to `System` unchanged. The atomic counters are
-// pure side effect (Relaxed loads/stores cannot reorder w.r.t.
-// the System call in any way that affects allocator semantics).
-// The only requirement on `GlobalAlloc` impls is that
-// alloc/dealloc honor the Layout — we delegate that to System.
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.allocs.fetch_add(1, Ordering::Relaxed);
-        self.bytes_allocated
-            .fetch_add(layout.size(), Ordering::Relaxed);
-        // SAFETY: layout is forwarded unchanged from caller, who
-        // is responsible for its validity per GlobalAlloc contract.
-        unsafe { self.inner.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.deallocs.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: ptr+layout pair forwarded unchanged from caller.
-        unsafe { self.inner.dealloc(ptr, layout) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        self.allocs.fetch_add(1, Ordering::Relaxed);
-        self.bytes_allocated
-            .fetch_add(layout.size(), Ordering::Relaxed);
-        // SAFETY: same as alloc — Layout forwarded unchanged.
-        unsafe { self.inner.alloc_zeroed(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // Realloc counts as 1 alloc + 1 dealloc for our purposes
-        // (the moral equivalent at the allocator API). bytes only
-        // increases for the delta vs old size.
-        self.allocs.fetch_add(1, Ordering::Relaxed);
-        self.deallocs.fetch_add(1, Ordering::Relaxed);
-        // Saturating in case realloc shrinks (new_size < old) —
-        // we never decrement the cumulative bytes counter.
-        if new_size > layout.size() {
-            self.bytes_allocated
-                .fetch_add(new_size - layout.size(), Ordering::Relaxed);
-        }
-        // SAFETY: ptr+layout+new_size triple forwarded unchanged.
-        unsafe { self.inner.realloc(ptr, layout, new_size) }
-    }
-}
+// The `unsafe impl GlobalAlloc` lives in `bsql-devgates` — a dev-only
+// workspace member that is exempt from the workspace lint floor. This
+// bench installs it as the process `#[global_allocator]` and brackets
+// each scenario with `snapshot()` calls, so the bench file itself holds
+// zero `unsafe` (the crate's own `#![forbid(unsafe_code)]` covers it).
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator::new();
-
-#[derive(Copy, Clone)]
-struct AllocSnapshot {
-    allocs: usize,
-    deallocs: usize,
-    bytes_allocated: usize,
-}
-
-impl AllocSnapshot {
-    fn delta(self, prior: Self) -> AllocDelta {
-        AllocDelta {
-            allocs: self.allocs.saturating_sub(prior.allocs),
-            deallocs: self.deallocs.saturating_sub(prior.deallocs),
-            bytes: self.bytes_allocated.saturating_sub(prior.bytes_allocated),
-        }
-    }
-}
-
-#[derive(Copy, Clone)]
-struct AllocDelta {
-    allocs: usize,
-    deallocs: usize,
-    bytes: usize,
-}
 
 // ---------------------------------------------------------------
 // Scenario harness.

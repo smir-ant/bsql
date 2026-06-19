@@ -453,6 +453,7 @@ impl Session {
         // `rows_or_zero` projection makes that an exhaustive mapping over the
         // tag variants, not a default-valued fallback. With no command observed
         // yet, zero rows have been affected so far — also a definite answer.
+        #[allow(clippy::disallowed_methods, reason = "not a silent fallback: a countless command (DDL / transaction control) affected exactly 0 rows by SQL definition, and 'no command observed yet' likewise means 0 rows affected so far — the None arm is a definite SQL answer, not a default masking a failure")]
         self.proto.current_command_tag()
             .map_or(0, bsql_postgres_proto::command_tag::CommandTag::rows_or_zero)
     }
@@ -589,6 +590,10 @@ impl Session {
 
     pub fn build_query_result(&self, rows: Vec<Row>) -> QueryResult {
         let column_names = self.extract_column_names();
+        // An empty result set has 0 columns by definition; the None arm is the
+        // SQL-correct width of a zero-row result, not a default masking a missing
+        // column count (a non-empty result always exposes its width via row 0).
+        #[allow(clippy::disallowed_methods, reason = "not a silent fallback: an empty result set has 0 columns by SQL definition, so the None arm is the correct width of a zero-row result, not a default masking a failure")]
         let column_count = rows.first().map_or(0, |r| r.len());
         let command_tag = self.extract_command_tag();
         QueryResult { rows, command_tag, column_count, column_names }
@@ -596,6 +601,10 @@ impl Session {
 
     pub fn build_query_result_from_stmt(&self, rows: Vec<Row>, stmt: &PreparedStatement) -> QueryResult {
         let column_names = stmt.column_names.clone();
+        // An empty result set has 0 columns by definition; the None arm is the
+        // SQL-correct width of a zero-row result, not a default masking a missing
+        // column count (a non-empty result always exposes its width via row 0).
+        #[allow(clippy::disallowed_methods, reason = "not a silent fallback: an empty result set has 0 columns by SQL definition, so the None arm is the correct width of a zero-row result, not a default masking a failure")]
         let column_count = rows.first().map_or(0, |r| r.len());
         let command_tag = self.extract_command_tag();
         QueryResult { rows, command_tag, column_count, column_names }

@@ -1,0 +1,58 @@
+# Tier-4 silent-fallback ledger.
+#
+# `clippy::unwrap_used` catches `.unwrap()` / `.expect()` but NOT the
+# `.unwrap_or*` family — the methods that silently substitute a default
+# value for a missing/error result. That silent-substitution is the
+# tier-4 ("happens not to fail") class the project forbids. This config
+# bans the whole family; the floor (`[workspace.lints.clippy]
+# disallowed_methods = "deny"`) sets the level. Every legitimate
+# non-silent use carries a scoped `#[allow(clippy::disallowed_methods,
+# reason = "...")]` stating the constraint that makes it safe — so each
+# fallback is either a compile error or a greppable, reasoned exception.
+#
+# `proto` and `derive` opt out at their crate root: they enforce a
+# STRICTER, whole-crate forbid-bundle (which forbids the entire
+# unwrap/expect/panic/as/arithmetic class) and centralise the
+# `try_from(..).unwrap_or(SATURATION)` / `slice.get(..).unwrap_or(&[])`
+# dead-arm shape behind a single-audit-point helper module. There the
+# `.unwrap_or*` shape is the sanctioned forbid-bundle-compliant dead arm,
+# not a silent data fallback, so a per-site ledger would be noise rather
+# than signal.
+
+# Test carve-outs for the production FORBID floor's panic-class lints.
+# `clippy::{panic,unwrap_used,expect_used}` and `indexing_slicing` are in
+# the workspace floor (production-only). Test / bench code legitimately
+# panics / unwraps / indexes — a failed `unwrap()` in a test IS the loud
+# failure signal, the opposite of a silent production fallback. These
+# switches scope the panic-class lints to non-test code only, so the
+# floor stays a true production fortress without forbidding the panic that
+# makes a test assert. Clippy treats `#[test]` fns, `#[cfg(test)]`
+# modules, AND integration-test crates under `tests/` (compiled with
+# `--test`) as test context; the carve-out reaches all three.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+disallowed-methods = [
+    { path = "std::option::Option::unwrap_or", reason = "tier-4 silent-fallback ban — substitutes a default for None without a visible failure; permitted only via a scoped allow stating why the fallback is not silent" },
+    { path = "std::option::Option::unwrap_or_default", reason = "tier-4 silent-fallback ban — substitutes Default::default() for None silently" },
+    { path = "std::option::Option::unwrap_or_else", reason = "tier-4 silent-fallback ban — substitutes a computed default for None; permitted only via a scoped allow (e.g. mutex poison recovery)" },
+    { path = "core::result::Result::unwrap_or", reason = "tier-4 silent-fallback ban — substitutes a default for Err without surfacing the error" },
+    { path = "core::result::Result::unwrap_or_default", reason = "tier-4 silent-fallback ban — substitutes Default::default() for Err silently" },
+    { path = "core::result::Result::unwrap_or_else", reason = "tier-4 silent-fallback ban — substitutes a computed default for Err; permitted only via a scoped allow (e.g. mutex poison recovery)" },
+    # `map_or` / `map_or_else` are the same silent-substitution shape the
+    # `unwrap_or*` ban targets: `opt.map_or(default, f)` is exactly
+    # `opt.map(f).unwrap_or(default)`, and `res.map_or(default, f)` swallows
+    # the `Err` just like `unwrap_or`. Banning them closes the family gap so
+    # a silent fallback cannot slip in via the combinator spelling.
+    { path = "core::option::Option::map_or", reason = "tier-4 silent-fallback ban — `opt.map_or(default, f)` == `opt.map(f).unwrap_or(default)`, substitutes a default for None without a visible failure" },
+    { path = "core::option::Option::map_or_else", reason = "tier-4 silent-fallback ban — `opt.map_or_else(default_fn, f)` substitutes a computed default for None silently" },
+    { path = "core::result::Result::map_or", reason = "tier-4 silent-fallback ban — `res.map_or(default, f)` substitutes a default for Err without surfacing the error" },
+    { path = "core::result::Result::map_or_else", reason = "tier-4 silent-fallback ban — `res.map_or_else(err_fn, f)` substitutes a computed default for Err silently" },
+    # `clippy::exit` (in the floor) is silent inside `impl` methods and `fn
+    # main` by clippy's design, so it cannot fire on this method-dominated
+    # codebase. The disallowed-methods ledger is context-agnostic and fires
+    # everywhere, making the ban real rather than theatre.
+    { path = "std::process::exit", reason = "process::exit skips Drop, so secret-zeroizing types never scrub and resources never release, and it bypasses normal error propagation — terminate by returning an error to the caller" },
+]

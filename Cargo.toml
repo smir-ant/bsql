@@ -8,6 +8,10 @@ members = [
     "crates/postgres/async",
     "crates/postgres/sync",
     "crates/sqlite/driver",
+    # Dev-only harness; `publish = false`. Hosts the workspace's only
+    # `unsafe` (counting allocator + memory probe) and deliberately does
+    # NOT inherit the forbid floor — see `[workspace.lints]` below.
+    "tools/devgates",
 ]
 
 [workspace.package]
@@ -20,6 +24,179 @@ repository = "https://github.com/smir-ant/bsql"
 # Crates are added one-by-one as the rebuild rolls out. The
 # workspace currently hosts `bsql-pg-proto` (sans-I/O wire-protocol
 # state machine) + `bsql-pg-proto-derive` (proc-macro).
+
+# ============================================================================
+# Two-tier lint wall.
+# ============================================================================
+#
+# TIER A — the floor below. Inherited by every SHIPPED crate (all seven:
+# bsql, postgres-{proto,derive,core,async,sync}, sqlite) via
+# `lints.workspace = true` in its `Cargo.toml`. Only `tools/devgates`
+# (dev-only, `publish = false`) opts out entirely — it hosts the
+# workspace's sole `unsafe`.
+#
+# The floor has TWO levels, and the split is load-bearing:
+#
+#   * `forbid` band — the un-bypassable core. Under `forbid` a future
+#     `#[allow(<floor lint>)]` is a hard `E0453` compile error ("overruled
+#     by previous forbid"), so these lints cannot be silenced anywhere in
+#     a floor-inheriting crate. Used for lints with ZERO violations across
+#     ALL targets (lib + tests + benches) AND no legitimate need for a
+#     scoped exception. The KEYSTONE `allow_attributes_without_reason` is
+#     here: it makes every `#[allow]` in the workspace carry an explicit
+#     `reason`, so the `deny` band below stays tamper-evident (a bare
+#     `#[allow(clippy::disallowed_methods)]` that would silently reopen the
+#     tier-4 ledger now fails to compile).
+#
+#   * `deny` band — production fortress lints that legitimately fire in
+#     TEST / BENCH code (`panic`, `unwrap_used`, `expect_used`,
+#     `unwrap_in_result`, plus the `disallowed_methods` ledger). A failed
+#     `unwrap()` in a test IS the loud failure signal — the opposite of a
+#     silent production fallback — so these are scoped to non-test code via
+#     `allow-{unwrap,expect,panic,indexing-slicing}-in-tests = true` in
+#     `clippy.toml`. They MUST be `deny`, not `forbid`: clippy implements
+#     the in-tests carve-out by injecting an internal `#[allow(...)]` into
+#     `#[test]`/`#[cfg(test)]` context, and a `forbid` level turns that
+#     injected allow into `E0453`. The same applies to the per-helper
+#     reasoned `#![allow(...)]` that integration-test helper fns require
+#     (Cargo compiles `tests/*.rs` helper fns WITHOUT `cfg(test)`, so the
+#     carve-out misses them — each such helper / bench module carries a
+#     scoped `#![allow(clippy::panic, reason = "...")]`). Under `deny`,
+#     production stays un-panicked while the keystone forces every test
+#     exception to state, in code, why it is safe.
+#
+# Why `unsafe_code` is NOT in this floor, despite being the headline
+# safety lint:
+#   - A `forbid` floor forbids ANY later level-setting of the lint,
+#     including `#[allow]`, anywhere in a floor-inheriting crate (E0453).
+#   - Five dev-only zeroize-verification test crates in
+#     `crates/postgres/proto/tests/*_staleness_spec.rs` +
+#     `scram_zeroize_miri_spec.rs` probe memory AFTER a value is dropped.
+#     That read is inherently `unsafe` at the CALL SITE (it dereferences a
+#     caller-held raw pointer into freed/dropped storage); there is no
+#     SOUND safe wrapper (a safe fn taking `*const u8` would let any safe
+#     caller read arbitrary memory). So those crates keep a reasoned
+#     `#![allow(unsafe_code, reason = "...")]` (the keystone requires the
+#     reason), which a `forbid` floor would turn into E0453.
+#   - Therefore `unsafe_code` is enforced PER-CRATE instead: every shipped
+#     lib carries `#![forbid(unsafe_code)]` at its own crate root (so all
+#     PRODUCTION code is unsafe-free and un-bypassable within the lib), and
+#     the only `unsafe` left in the whole workspace is consolidated into
+#     `tools/devgates` — the bench's counting allocator and the single
+#     audited memory-probe the five tests now share. It is promoted into
+#     this floor the moment those tests can be expressed unsafe-free.
+#
+# How proto / derive relate to the floor (NOT an opt-out like devgates):
+# both INHERIT the full Tier-A floor via `lints.workspace = true`, AND
+# keep their own STRICTER crate-root forbid-bundle in `src/lib.rs` (the
+# no_std panic / index / arith / cast wall + `#![forbid(unsafe_code)]`).
+# A double-forbid of the same lint is not a conflict, so the two coexist.
+# Their ONLY divergence from the floor is a single crate-root reasoned
+# `#![allow(clippy::disallowed_methods, reason = "...")]` that opts out of
+# the `deny`-level tier-4 LEDGER (not the floor): under the stricter
+# whole-crate forbid-bundle the `try_from(..).unwrap_or(SAT)` /
+# `slice.get(..).unwrap_or(&[])` shape is the sanctioned dead-arm, not a
+# silent data fallback, so a per-site ledger there would be noise.
+#
+# TIER B — heavier lints that CURRENTLY have violations are intentionally
+# kept OUT of this floor (forcing them now would, e.g., demand documenting
+# hundreds of public items that later engine slices rewrite or delete —
+# documenting corpses). They are rolled into the floor per-slice as
+# modules stabilize. Counts below are measured @ this base across
+# `--workspace --all-targets` with every crate-root forbid-bundle
+# OVERRIDDEN to `warn` (i.e. the naive count of what would fire if the
+# floor adopted the lint with no per-crate suppression; proto/derive
+# already forbid most of these at their crate root, so the production
+# total is far lower):
+#   missing_docs (~275: fields/methods/modules/etc.),
+#   let_underscore_must_use (~99), arithmetic_side_effects (38),
+#   as_conversions (18), unreachable (17), indexing_slicing (~21 outside
+#   the in-tests carve-out), let_underscore_drop (22),
+#   missing_debug_implementations (13), cast_possible_truncation (~5),
+#   cast_possible_wrap (~5), float_cmp (2). (`panic`, `unwrap_used`,
+#   `expect_used`, `unwrap_in_result` are NO LONGER deferred — they are in
+#   the `deny` band of the floor above, production-scoped via the
+#   in-tests carve-outs.) Plus, although ZERO-violation now, two lints
+#   stay out because a forbid floor forbids the explicit level that code
+#   we don't own or want to touch already sets:
+#   `unused_variables` (the `#[derive(Zeroize, ZeroizeOnDrop)]` macro emits
+#   an internal `#[allow(unused_variables)]` → E0453) and
+#   `missing_copy_implementations` (proto's crate root sets
+#   `#![warn(missing_copy_implementations)]`; warn-after-forbid → E0453).
+
+[workspace.lints.rust]
+# Zero-violation-now, conflict-free safety/correctness rust lints.
+# Dead lifetime parameters — zero-violation now.
+unused_lifetimes = "forbid"
+# Edition-2024 pattern-binding change that can silently alter semantics.
+rust_2024_incompatible_pat = "forbid"
+
+[workspace.lints.clippy]
+# Zero-violation-now clippy safety/correctness lints.
+# `mem::forget` skips Drop — a real way to leak secret-zeroizing types.
+mem_forget = "forbid"
+todo = "forbid"
+unimplemented = "forbid"
+cast_sign_loss = "forbid"
+integer_division = "forbid"
+# KEYSTONE — makes every `#[allow]` in a floor-inheriting crate carry an
+# explicit `reason = "..."`. Without it a future bare
+# `#[allow(clippy::disallowed_methods)]` would silently reopen the tier-4
+# ledger hole below; with it, that bare allow is a compile error. So the
+# whole wall becomes tamper-evident: any suppression must state, in code,
+# the constraint that makes it safe. `forbid`, so it cannot itself be
+# disabled. Zero-violation now (every existing allow already has a reason).
+allow_attributes_without_reason = "forbid"
+# PRODUCTION PANIC-CLASS FORTRESS. These ban every panic-able expression
+# in production (non-test) code; a panic in shipped code is the tier-4
+# "happens not to fail" class the project bans. Test / bench code
+# legitimately panics — a failed `unwrap()` in a test IS the loud failure
+# signal — so the `allow-{unwrap,expect,panic,indexing-slicing}-in-tests =
+# true` switches in `clippy.toml` scope these to non-test code only.
+#
+# Level is `deny`, NOT `forbid`, and the distinction is load-bearing:
+# clippy implements the `*-in-tests` carve-out by injecting an internal
+# `#[allow(clippy::panic)]` (etc.) into `#[test]`/`#[cfg(test)]` context.
+# A `forbid` level turns that injected allow into a hard `E0453`
+# ("allow … incompatible with previous forbid"), so `forbid` + the
+# carve-out cannot coexist — and the same applies to the per-helper-module
+# reasoned `#![allow(...)]` that integration-test helper fns (which are NOT
+# in `#[test]` context, so the carve-out misses them) require. `deny` keeps
+# production un-panicked while letting the keystone above (every override
+# carries a `reason`) make each test exception greppable and justified.
+# Measured: zero PRODUCTION (non-test, non-helper) violations across all
+# shipped crates (proto/derive already forbid these at their stricter
+# crate root).
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+# Additional zero-violation safety lints (measured 0 across --workspace
+# --all-targets). These have no legitimate test-context exception, so they
+# stay at `forbid`:
+#   `unwrap_in_result` — an `unwrap`/`expect` inside a fn that already
+#       returns Result/Option is a panic where a `?` would propagate. (Has
+#       the same in-tests carve-out as unwrap/expect, so it is `deny`.)
+#   `lossy_float_literal` — a float literal whose value the type cannot
+#       represent exactly is silently rounded (a quiet correctness drift).
+#   `char_lit_as_u8` — `'x' as u8` truncates non-ASCII chars silently;
+#       byte literals (`b'x'`) are the unambiguous spelling.
+#   `exit` — `process::exit` skips Drop (so secret-zeroizing types never
+#       scrub) and bypasses normal error propagation.
+#   `wildcard_dependencies` — a `*` version requirement defeats the
+#       pinned-dependency policy (a transitive bump can land unreviewed).
+unwrap_in_result = "deny"
+lossy_float_literal = "forbid"
+char_lit_as_u8 = "forbid"
+exit = "forbid"
+wildcard_dependencies = "forbid"
+# TIER-4 LEDGER (silent-fallback ban). `unwrap_used` does NOT catch the
+# `.unwrap_or*` family; the banned methods are listed in the root
+# `clippy.toml`. This level is `deny`, NOT `forbid`, on purpose: the
+# ledger needs scoped `#[allow(clippy::disallowed_methods, reason=...)]`
+# overrides at the handful of legitimate non-silent fallback sites
+# (mutex poison-recovery, a Display default label, a sole-ctor dead arm).
+# `forbid` would make those reasoned exceptions impossible.
+disallowed_methods = "deny"
 
 [workspace.dependencies]
 # Every addition is justified inline:

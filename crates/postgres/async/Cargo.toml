@@ -11,3 +11,8 @@ bsql-postgres-core = { path = "../core" }
 bsql-postgres-proto = { path = "../proto" }
 tokio = { version = "1", features = ["net", "io-util", "macros", "rt", "rt-multi-thread", "time", "sync"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+# Inherit the workspace FORBID floor (the two-tier lint wall). The pool's
+# mutex poison-recovery fallbacks carry scoped allows in `src/pool.rs`.
+[lints]
+workspace = true

@@ -37,6 +37,7 @@
 )]
 #![deny(unused_must_use, unused_lifetimes)]
 
+#![allow(clippy::disallowed_methods, reason = "test/bench harness — fixtures use the sanctioned try_from(..).unwrap_or(SAT) / slice.get(..).unwrap_or(&[]) dead-arm shape, not production data fallbacks")]
 use bsql_postgres_proto::{
     Action, ActiveState, ApplicationName, ConnectingState, ConnectionStatus, Credentials, DatabaseName,
     Ident, IdentError, PgProtocol, PingKind, ProtocolError, SessionParams,

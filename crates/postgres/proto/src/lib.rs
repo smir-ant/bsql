@@ -98,6 +98,19 @@
     rust_2024_incompatible_pat
 )]
 #![warn(missing_debug_implementations, missing_copy_implementations)]
+// Opt out of the workspace tier-4 `disallowed_methods` ledger. This
+// crate enforces a STRICTER, whole-crate forbid-bundle (above: it forbids
+// the entire unwrap/expect/panic/as/arithmetic class) and centralises the
+// `try_from(..).unwrap_or(SATURATION)` / `slice.get(..).unwrap_or(&[])`
+// dead-arm shape behind the single-audit-point `narrow` module. In this
+// crate the `.unwrap_or*` shape is the sanctioned forbid-bundle-compliant
+// dead arm (the saturation is loud-fail-closed, the `&[]` arm is provably
+// dead under the preceding bounds check), not a silent data fallback — so
+// the per-site ledger that fits the driver crates would be noise here.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "stricter whole-crate forbid-bundle + single-audit-point narrowing; .unwrap_or* is the sanctioned dead-arm shape, not a silent data fallback"
+)]
 
 // `bsql-pg-proto` is `no_std + alloc`. The crate uses `Box<T>` in
 // state variants to externalise large inline payloads — SCRAM/MD5/

@@ -39,6 +39,10 @@ impl Pool {
 
     pub fn get(&self) -> Result<PooledConnection, DriverError> {
         let should_create = {
+            // Mutex poison recovery, not a data fallback: a poisoned lock means
+            // another thread panicked while holding it; `into_inner` recovers
+            // the guarded pool state so the pool keeps operating.
+            #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
             let mut state = self.inner.state.lock()
                 .unwrap_or_else(|e| e.into_inner());
             loop {
@@ -57,8 +61,12 @@ impl Pool {
                     break true;
                 }
 
-                state = self.inner.available.wait(state)
+                // Condvar poison recovery, not a data fallback: same reasoning
+                // as the lock above — recover the guarded state and keep waiting.
+                #[allow(clippy::disallowed_methods, reason = "condvar poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+                let recovered = self.inner.available.wait(state)
                     .unwrap_or_else(|e| e.into_inner());
+                state = recovered;
             }
         };
 
@@ -69,6 +77,8 @@ impl Pool {
                     pool: self.inner.clone(),
                 }),
                 Err(e) => {
+                    // Mutex poison recovery (see `get` entry), not a data fallback.
+                    #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
                     let mut state = self.inner.state.lock()
                         .unwrap_or_else(|e| e.into_inner());
                     state.checked_out -= 1;
@@ -82,9 +92,11 @@ impl Pool {
     }
 
     pub fn idle_count(&self) -> usize {
-        self.inner.state.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .connections.len()
+        // Mutex poison recovery (see `get`), not a data fallback.
+        #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+        let state = self.inner.state.lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.connections.len()
     }
 
     pub fn max_size(&self) -> usize {
@@ -119,6 +131,8 @@ impl DerefMut for PooledConnection {
 impl Drop for PooledConnection {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
+            // Mutex poison recovery (see `get`), not a data fallback.
+            #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
             let mut state = self.pool.state.lock()
                 .unwrap_or_else(|e| e.into_inner());
             // `checked_out` is incremented once per checkout and decremented

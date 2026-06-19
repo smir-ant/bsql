@@ -19,6 +19,14 @@
 
 #![allow(dead_code, reason = "shared helper module — not every test uses every helper")]
 
+#![allow(clippy::disallowed_methods, reason = "test/bench harness — fixtures use the sanctioned try_from(..).unwrap_or(SAT) / slice.get(..).unwrap_or(&[]) dead-arm shape, not production data fallbacks")]
+// The fixture builders below panic on malformed input. Cargo compiles
+// integration-test helper modules WITHOUT `cfg(test)`, so the floor's
+// `allow-panic-in-tests` carve-out (which keys off `#[test]` context) does
+// not reach these non-`#[test]` helpers. The panic IS the loud failure
+// signal — a broken fixture aborts the test — the opposite of a silent
+// production fallback.
+#![allow(clippy::panic, clippy::unwrap_in_result, reason = "test helper harness — fixture builders panic on malformed input as the loud test-failure signal, not as a silent production fallback; integration-test helpers are not in `#[test]` context so the in-tests carve-out cannot reach them")]
 use bsql_postgres_proto::{
     Action, ActivePhase, Credentials, DisconnectedPhase, FetchRows, HeaderParse, Ident,
     IntoActiveError, OutActions, PgProtocol, PortalName, PushFailure, QueryKind, ReplyId,

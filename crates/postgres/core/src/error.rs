@@ -15,7 +15,14 @@ pub struct DbError {
 
 impl fmt::Display for DbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {} ({})", self.severity.as_deref().unwrap_or("ERROR"), self.message, self.code)?;
+        // The fallback is a presentation default for the optional `severity`
+        // header field, not a data value: PG omits `severity` only on
+        // malformed/legacy ErrorResponse frames, and the message + SQLSTATE
+        // it labels are always printed in full alongside it. Nothing is
+        // hidden — the literal labels a severity-less error as "ERROR".
+        #[allow(clippy::disallowed_methods, reason = "presentation default for an absent severity header; the message and SQLSTATE are still printed in full, so no data is dropped")]
+        let severity = self.severity.as_deref().unwrap_or("ERROR");
+        write!(f, "{}: {} ({})", severity, self.message, self.code)?;
         if let Some(ref d) = self.detail
             && !d.is_empty() { write!(f, "\nDETAIL: {d}")?; }
         if let Some(ref h) = self.hint

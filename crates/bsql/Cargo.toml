@@ -16,3 +16,7 @@ sqlite = ["dep:bsql-sqlite"]
 bsql-postgres-async = { path = "../postgres/async", optional = true }
 bsql-postgres-sync = { path = "../postgres/sync", optional = true }
 bsql-sqlite = { path = "../sqlite/driver", optional = true }
+
+# Inherit the workspace FORBID floor (the two-tier lint wall).
+[lints]
+workspace = true

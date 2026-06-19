@@ -41,7 +41,11 @@
 // or implement the trait, so the visibility "leakage" is purely
 // cosmetic. Suppressed at module scope so every per-command impl
 // inherits the allow.
-#![allow(private_interfaces, private_bounds)]
+#![allow(
+    private_interfaces,
+    private_bounds,
+    reason = "the sealed `PushCommand` trait exposes `pub(crate)` types (StagedAction, BrandedWriteReserved, StateSetter, RowDescSlotCell) that external crates can neither name nor implement against, so the reported visibility leak is unreachable cosmetic noise rather than a real public-API surface"
+)]
 
 use crate::command::FetchRows;
 use crate::ident::{PortalName, StmtName};

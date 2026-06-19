@@ -32,6 +32,7 @@
 // Compile-time pin: const-callable from the consumer side. If the
 // re-export demotes to non-const or to `pub(crate)`, this fails to
 // build before any test runs.
+#![allow(clippy::disallowed_methods, reason = "test/bench harness — fixtures use the sanctioned try_from(..).unwrap_or(SAT) / slice.get(..).unwrap_or(&[]) dead-arm shape, not production data fallbacks")]
 const _ASSERT_LEN: () = assert!(
     bsql_postgres_proto::SSL_REQUEST_WIRE_BYTES.len() == 8,
     "SSLRequest packet is 8 bytes: length(4) + version(4)",

@@ -60,6 +60,7 @@
               The crate-internal forbid bundle does not extend to tests/."
 )]
 
+#![allow(clippy::disallowed_methods, reason = "test/bench harness — fixtures use the sanctioned try_from(..).unwrap_or(SAT) / slice.get(..).unwrap_or(&[]) dead-arm shape, not production data fallbacks")]
 extern crate alloc;
 use alloc::collections::BTreeSet;
 use alloc::format;
