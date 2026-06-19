@@ -108,6 +108,28 @@ impl CommandTag {
             Self::Other(_) => None,
         }
     }
+
+    /// Returns the affected-row count, projecting a tag with no row-count
+    /// semantics ([`CommandTag::Other`] — DDL, transaction control) to `0`,
+    /// the SQL-standard "rows affected" for such a statement.
+    ///
+    /// This is an exhaustive projection of the typed tag, not a fallback: every
+    /// variant maps to a definite count, and the zero for `Other` is the
+    /// correct answer, not a default masking a missing value.
+    #[inline]
+    #[must_use]
+    pub const fn rows_or_zero(&self) -> u64 {
+        match self {
+            Self::Insert { rows }
+            | Self::Update { rows }
+            | Self::Delete { rows }
+            | Self::Select { rows }
+            | Self::Fetch { rows }
+            | Self::Move { rows }
+            | Self::Copy { rows } => *rows,
+            Self::Other(_) => 0,
+        }
+    }
 }
 
 impl Default for CommandTag {
@@ -137,7 +159,7 @@ impl core::fmt::Display for CommandTag {
 
 /// Parse the `'C'` (CommandComplete) body bytes into a typed
 /// [`CommandTag`]. Wire-malformed inputs (missing trailing NUL,
-/// embedded NUL) are classified as
+/// embedded NUL, non-UTF-8 content) are classified as
 /// [`crate::error::ProtocolError::MalformedCommandComplete`].
 /// Well-formed but unrecognised shapes fall to
 /// [`CommandTag::Other`].
@@ -157,7 +179,13 @@ pub(crate) fn parse_command_tag_bytes(
     }
     let s = match core::str::from_utf8(bytes) {
         Ok(s) => s,
-        Err(_) => return Ok(CommandTag::Other(BoundedStr::from_str_truncating(""))),
+        // A non-UTF-8 tag is malformed content, not an empty tag. Classify it
+        // loudly instead of discarding it into an empty `Other`.
+        Err(_) => {
+            return Err(crate::error::ProtocolError::MalformedCommandComplete {
+                payload_len: body.len(),
+            });
+        }
     };
 
     if let Some(suffix) = s.strip_prefix("SELECT ")
@@ -299,5 +327,23 @@ mod tests {
             parse_command_tag_bytes(b"\0"),
             Ok(CommandTag::Other(_))
         ));
+    }
+
+    #[test]
+    fn non_utf8_tag_classifies_malformed() {
+        // A NUL-terminated but non-UTF-8 tag is malformed content; it must be
+        // classified, never silently collapsed into an empty `Other`.
+        assert!(matches!(
+            parse_command_tag_bytes(&[0xFF, 0xFE, 0]),
+            Err(crate::error::ProtocolError::MalformedCommandComplete { .. })
+        ));
+    }
+
+    #[test]
+    fn rows_or_zero_projects_counted_and_countless() {
+        assert_eq!(CommandTag::Insert { rows: 5 }.rows_or_zero(), 5);
+        assert_eq!(CommandTag::Select { rows: 12 }.rows_or_zero(), 12);
+        // A countless tag projects to zero rows affected.
+        assert_eq!(CommandTag::EMPTY.rows_or_zero(), 0);
     }
 }

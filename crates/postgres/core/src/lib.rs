@@ -20,4 +20,4 @@ pub use config::{ConnectConfig, SslMode};
 pub use error::{DbError, DriverError};
 pub use owned_row::{OwnedRow, OwnedRowTooLarge};
 pub use session::{Handshake, HandshakeAction, PumpAction, Session};
-pub use types::{ArenaBuilder, FromText, Notification, PreparedStatement, QueryResult, Row};
+pub use types::{ArenaBuilder, FromText, Notification, PreparedStatement, QueryResult, Row, RowTooLarge};

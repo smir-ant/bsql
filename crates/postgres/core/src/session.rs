@@ -224,10 +224,18 @@ impl Session {
 
         if had_close { return PumpAction::Error(DriverError::NotReady); }
         if had_fail {
-            let err = self.proto.fail_cause()
-                .map(|&c| self.classify_error(c))
-                .unwrap_or(DriverError::NotReady);
-            self.drain_to_idle();
+            let err = match self.proto.fail_cause() {
+                Some(&c) => self.classify_error(c),
+                // A failure definitely occurred (FailReply was emitted) but the
+                // protocol parked no classified cause. Report that precise
+                // condition rather than mislabelling it as "not ready".
+                None => DriverError::UnclassifiedFailure,
+            };
+            // Best-effort recovery to Ready so the connection can be reused.
+            // The server error is returned regardless; if the drain did not
+            // reach Ready, `is_healthy()` reports false and the pool evicts the
+            // connection — the outcome is observable, never silently assumed.
+            let _drained_to_ready = self.drain_to_idle();
             return PumpAction::Error(err);
         }
 
@@ -248,24 +256,51 @@ impl Session {
         PumpAction::Done
     }
 
-    pub fn drain_to_idle(&mut self) {
+    /// Pump empty bytes to advance toward `Ready` using only data already
+    /// buffered in the protocol. Returns `true` if `Ready` was reached. The
+    /// caller must treat a `false` result as "connection not drained" (e.g.
+    /// mark it unhealthy so a pool evicts it) — never assume a clean drain.
+    ///
+    /// If a drain step wants to send bytes (this sans-IO Session cannot deliver
+    /// them), the drain is reported as incomplete (`false`) rather than claiming
+    /// success while silently discarding those bytes.
+    #[must_use]
+    pub fn drain_to_idle(&mut self) -> bool {
         for _ in 0..10 {
-            let _ = self.proto.feed_bytes(&[], &mut self.wb);
+            let actions = self.proto.feed_bytes(&[], &mut self.wb);
+            let wants_send = actions.as_slice().iter().any(|a|
+                matches!(a, bsql_postgres_proto::Action::SendBytes(_)));
+            if wants_send {
+                // Bytes need to go to the wire, but draining is I/O-less here.
+                // Do not pretend the connection is clean.
+                return false;
+            }
             if matches!(self.proto.connection_status(),
-                bsql_postgres_proto::ConnectionStatus::Ready) { return; }
+                bsql_postgres_proto::ConnectionStatus::Ready) { return true; }
         }
+        false
     }
 
-    pub fn drain_streaming(&mut self) {
+    /// Discard a streaming result without materialising rows, consuming only
+    /// bytes already buffered in the protocol. Returns `true` when the stream
+    /// ended (`EndQuery`); `false` when the protocol needs more bytes that the
+    /// caller (which owns the socket) must read and feed before re-entering.
+    ///
+    /// This never blocks or spins: it is sans-IO, so on `NeedMore` it returns
+    /// promptly instead of looping with no progress.
+    #[must_use]
+    pub fn drain_streaming(&mut self) -> bool {
         self.proto.iter_rows(&mut self.wb, |stream| {
             loop {
                 match stream.col_next() {
-                    bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
-                    bsql_postgres_proto::ColEvent::NeedMore => continue,
+                    bsql_postgres_proto::ColEvent::EndQuery { .. } => return true,
+                    // No I/O here: report that more bytes are required rather
+                    // than spinning. The driver reads and feeds, then re-enters.
+                    bsql_postgres_proto::ColEvent::NeedMore => return false,
                     _ => {}
                 }
             }
-        });
+        })
     }
 
     /// Enter iter_rows — caller provides the closure. Both sync and
@@ -290,7 +325,17 @@ impl Session {
                     let h = { let s = hint.as_str(); if s.is_empty() { None } else { Some(s.to_string()) } };
                     (m, d, h)
                 }
-                _ => (String::new(), None, None),
+                // The server sent an ErrorResponse (we have a SQLSTATE), but the
+                // detail payload could not be retrieved as the expected
+                // ServerError shape (stale/empty arena, or a non-matching
+                // payload variant). Surface a classified marker message rather
+                // than a blank string that would masquerade as "the server sent
+                // an empty message" — the absence of detail is itself a fact.
+                Ok(_) | Err(_) => (
+                    String::from("<error message unavailable>"),
+                    None,
+                    None,
+                ),
             };
             return DriverError::Db(DbError { code: sqlstate, severity: sev, message: msg, detail: det, hint: hnt });
         }
@@ -298,18 +343,54 @@ impl Session {
     }
 
     pub fn extract_command_tag(&self) -> String {
-        let mut tag = String::new();
-        if let Some(t) = self.proto.current_command_tag() {
-            use core::fmt::Write;
-            let _ = write!(tag, "{}", t);
+        // `ToString` is infallible for the tag's `Display`, so there is no
+        // `write!` Result to discard here. No tag observed = empty string.
+        match self.proto.current_command_tag() {
+            Some(t) => t.to_string(),
+            None => String::new(),
         }
-        tag
     }
 
     pub fn extract_column_names(&self) -> Arc<[String]> {
-        self.proto.current_column_names()
-            .map(|s| Arc::from(s.to_vec().into_boxed_slice()))
-            .unwrap_or_else(|| Arc::from(Vec::new().into_boxed_slice()))
+        // No RowDescription observed = a command that describes no columns
+        // (e.g. an INSERT/UPDATE without RETURNING). An empty name list is the
+        // correct typed answer for that case, not a fallback hiding a failure.
+        match self.proto.current_column_names() {
+            Some(s) => Arc::from(s.to_vec().into_boxed_slice()),
+            None => Arc::from(Vec::new().into_boxed_slice()),
+        }
+    }
+
+    /// The number of rows affected by the most recent command, if the command
+    /// reports a row count.
+    ///
+    /// Reads the typed [`CommandTag`] directly — no string re-parsing, so there
+    /// is no parse step that could silently fail. Counted commands
+    /// (`INSERT`/`UPDATE`/`DELETE`/`SELECT`/`FETCH`/`MOVE`/`COPY`) yield
+    /// `Some(count)` with the server's exact `u64` count. Commands with no
+    /// row-count semantics (DDL, transaction control), or no command observed
+    /// yet, yield `None` — an honest "no count", never a fabricated zero.
+    ///
+    /// [`CommandTag`]: bsql_postgres_proto::command_tag::CommandTag
+    #[must_use]
+    pub fn affected_rows(&self) -> Option<u64> {
+        self.proto.current_command_tag().and_then(|t| t.rows())
+    }
+
+    /// The number of rows affected by the most recent command, projecting a
+    /// command that reports no row count (DDL, transaction control) to `0` —
+    /// the SQL-standard "rows affected" for such a statement. This is a typed
+    /// projection of [`Self::affected_rows`], not a fallback masking a failure:
+    /// the parse cannot fail (the count comes from the typed `CommandTag`), and
+    /// the absence of a count is itself a definite answer.
+    #[must_use]
+    pub fn affected_rows_or_zero(&self) -> u64 {
+        // A countless command affected zero rows by SQL definition; the typed
+        // `rows_or_zero` projection makes that an exhaustive mapping over the
+        // tag variants, not a default-valued fallback. With no command observed
+        // yet, zero rows have been affected so far — also a definite answer.
+        self.proto.current_command_tag()
+            .map_or(0, bsql_postgres_proto::command_tag::CommandTag::rows_or_zero)
     }
 
     pub fn is_healthy(&self) -> bool {

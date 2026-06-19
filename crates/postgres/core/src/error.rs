@@ -42,6 +42,35 @@ pub enum DriverError {
     SslRefused,
     NoRows,
     Config(&'static str),
+    /// A result row exceeded the 32-bit on-arena bounds (more columns,
+    /// offset, or cell length than `u32`/`u16` can address). Never silently
+    /// truncated — the row is rejected so no corrupted bytes are surfaced.
+    RowTooLarge,
+    /// The streaming row collector could not make progress: the protocol
+    /// asked for more bytes but none could be supplied (premature server
+    /// close mid-stream, or a feed the protocol rejected). Surfacing this
+    /// instead of spinning or truncating keeps the result honest.
+    StreamStalled,
+    /// A `FailReply` was observed but the protocol carried no classified
+    /// cause for it. A failure definitely occurred; its detail is absent —
+    /// distinct from the connection merely being not-ready.
+    UnclassifiedFailure,
+    /// A server payload (NOTIFY message, command tag, column name) was not
+    /// valid UTF-8, so it could not be decoded losslessly. Returned instead
+    /// of substituting Unicode replacement characters.
+    NonUtf8Payload,
+    /// The requested timeout is so large that adding it to the current clock
+    /// instant would overflow. Surfaced instead of panicking.
+    TimeoutOverflow,
+    /// A row stream produced row data but the column schema needed to size and
+    /// interpret each row was absent. Without it every cell would silently read
+    /// as 0-column / `None`; the row count and contents cannot be trusted, so
+    /// the result is rejected rather than returned hollow.
+    RowDescriptionMissing,
+    /// A NOTIFY frame was observed but its payload could not be resolved from
+    /// the protocol's notification arena. The notification definitely arrived;
+    /// dropping it silently would lose an event the caller is waiting on.
+    NotificationUnavailable,
 }
 
 impl fmt::Display for DriverError {
@@ -54,6 +83,13 @@ impl fmt::Display for DriverError {
             Self::SslRefused => write!(f, "server refused SSL"),
             Self::NoRows => write!(f, "query returned no rows"),
             Self::Config(msg) => write!(f, "config error: {msg}"),
+            Self::RowTooLarge => write!(f, "result row too large to represent (exceeds 32-bit arena bounds)"),
+            Self::StreamStalled => write!(f, "row stream stalled: server provided no further data mid-stream"),
+            Self::UnclassifiedFailure => write!(f, "server reported a failure with no classified cause"),
+            Self::NonUtf8Payload => write!(f, "server payload was not valid UTF-8"),
+            Self::TimeoutOverflow => write!(f, "requested timeout overflows the monotonic clock"),
+            Self::RowDescriptionMissing => write!(f, "row stream produced rows with no column description; result cannot be decoded"),
+            Self::NotificationUnavailable => write!(f, "NOTIFY frame observed but its payload could not be resolved"),
         }
     }
 }
@@ -64,8 +100,24 @@ impl std::error::Error for DriverError {
             Self::Db(e) => Some(e),
             Self::Protocol(e) => Some(e),
             Self::Io(e) => Some(e),
-            Self::NotReady | Self::SslRefused | Self::NoRows | Self::Config(_) => None,
+            Self::NotReady
+            | Self::SslRefused
+            | Self::NoRows
+            | Self::Config(_)
+            | Self::RowTooLarge
+            | Self::StreamStalled
+            | Self::UnclassifiedFailure
+            | Self::NonUtf8Payload
+            | Self::TimeoutOverflow
+            | Self::RowDescriptionMissing
+            | Self::NotificationUnavailable => None,
         }
+    }
+}
+
+impl From<crate::types::RowTooLarge> for DriverError {
+    fn from(_: crate::types::RowTooLarge) -> Self {
+        Self::RowTooLarge
     }
 }
 

@@ -310,6 +310,17 @@ fn native_integer_access() {
 }
 
 #[test]
+fn get_f64_rejects_inexact_integer() {
+    let conn = Connection::open_in_memory().expect("open");
+    // An integer beyond f64's lossless integer range must not be returned as a
+    // rounded approximation: get_f64 yields None ("read it as an integer").
+    let r = conn.query("SELECT 9007199254740993").expect("query");
+    let row = &r.rows[0];
+    assert_eq!(row.get_i64(0), Some(9_007_199_254_740_993));
+    assert_eq!(row.get_f64(0), None);
+}
+
+#[test]
 fn full_lifecycle_integration() {
     let conn = Connection::open_in_memory().expect("open");
 

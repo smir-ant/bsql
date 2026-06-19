@@ -7,6 +7,16 @@ pub enum SqliteError {
         code: Option<i32>,
         message: String,
     },
+    /// A transaction closure failed and the subsequent `ROLLBACK` also failed,
+    /// leaving the connection in an indeterminate transactional state. Both the
+    /// original cause and the rollback failure are preserved — neither is
+    /// silently dropped.
+    TransactionRollbackFailed {
+        /// The error the user's closure returned (the primary cause).
+        original: Box<SqliteError>,
+        /// The error the cleanup `ROLLBACK` returned.
+        rollback: Box<SqliteError>,
+    },
 }
 
 impl SqliteError {
@@ -36,6 +46,10 @@ impl core::fmt::Display for SqliteError {
             Self::Query(msg) => write!(f, "sqlite: {msg}"),
             Self::Sqlite { code: Some(c), message } => write!(f, "sqlite error {c}: {message}"),
             Self::Sqlite { code: None, message } => write!(f, "sqlite: {message}"),
+            Self::TransactionRollbackFailed { original, rollback } => write!(
+                f,
+                "transaction failed ({original}) and ROLLBACK also failed ({rollback})",
+            ),
         }
     }
 }

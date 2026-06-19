@@ -49,6 +49,10 @@ pub struct Connection {
     stream: Stream,
     read_buf: Vec<u8>,
     terminated: bool,
+    /// Set when a recovery action (e.g. transaction ROLLBACK) failed and the
+    /// connection may be left in an indeterminate state. `is_healthy()` returns
+    /// false while poisoned so a pool structurally cannot reuse it.
+    poisoned: bool,
 }
 
 impl Connection {
@@ -80,7 +84,7 @@ impl Connection {
                 }
                 bsql_postgres_core::HandshakeAction::Done => {
                     let session = hs.finish()?;
-                    return Ok(Self { session, stream, read_buf: buf, terminated: false });
+                    return Ok(Self { session, stream, read_buf: buf, terminated: false, poisoned: false });
                 }
                 bsql_postgres_core::HandshakeAction::Error(e) => return Err(e),
             }
@@ -122,10 +126,23 @@ impl Connection {
                 PumpAction::Streaming => {
                     match rows {
                         Some(ref mut r) => self.collect_streaming(r)?,
-                        None => self.session.drain_streaming(),
+                        None => {
+                            // Discard a streaming result we did not ask for.
+                            // `drain_streaming` is sans-IO; supply bytes here
+                            // when it needs them. A clean server close mid-drain
+                            // is a stall, not a successful drain.
+                            while !self.session.drain_streaming() {
+                                let n = self.stream.read(&mut self.read_buf)?;
+                                if n == 0 { return Err(DriverError::StreamStalled); }
+                                self.session.feed(&self.read_buf[..n])?;
+                            }
+                        }
                     }
                 }
                 PumpAction::Error(e) => {
+                    // Best-effort recovery; the drain outcome is observed via the
+                    // next is_healthy() check and an unrecovered connection stays
+                    // unhealthy for pool eviction. The error is returned anyway.
                     for _ in 0..5 {
                         if self.session.is_healthy() { break; }
                         if let Ok(n) = self.stream.read(&mut self.read_buf)
@@ -134,7 +151,7 @@ impl Connection {
                         {
                             break;
                         }
-                        self.session.drain_to_idle();
+                        let _reached_ready = self.session.drain_to_idle();
                     }
                     return Err(e);
                 }
@@ -147,8 +164,14 @@ impl Connection {
         let stream = &mut self.stream;
         let read_buf = &mut self.read_buf;
 
-        self.session.iter_rows(|rs| {
-            let n_cols = rs.current_row_desc().map_or(0, |d| d.len());
+        let collected: Result<(), DriverError> = self.session.iter_rows(|rs| {
+            // The column schema sizes the arena and identifies each cell. If it
+            // is absent, every row would silently decode as 0 columns (all
+            // get_* return None). Fail loud rather than return hollow rows.
+            let n_cols = match rs.current_row_desc() {
+                Some(d) => d.len(),
+                None => return Err(DriverError::RowDescriptionMissing),
+            };
             let mut ab = bsql_postgres_core::ArenaBuilder::new(n_cols);
             let mut in_chunk = false;
             loop {
@@ -164,38 +187,19 @@ impl Connection {
                         ab.end_row();
                     }
                     bsql_postgres_proto::ColEvent::EndQuery { .. } => {
-                        *rows = ab.finish();
-                        return;
+                        *rows = ab.finish()?;
+                        return Ok(());
                     }
                     bsql_postgres_proto::ColEvent::NeedMore => {
-                        match rs.col_next() {
-                            bsql_postgres_proto::ColEvent::EndQuery { .. } => {
-                                *rows = ab.finish();
-                                return;
-                            }
-                            bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
-                                ab.push_value(bytes);
-                                continue;
-                            }
-                            bsql_postgres_proto::ColEvent::NeedMore => {
-                                let cap = feed_cap.max(1).min(read_buf.len());
-                                let Ok(n) = stream.read(&mut read_buf[..cap]) else { return };
-                                if n == 0 { return; }
-                                let _ = rs.feed(&read_buf[..n]);
-                            }
-                            other => {
-                                match other {
-                                    bsql_postgres_proto::ColEvent::Null { .. } => ab.push_null(),
-                                    bsql_postgres_proto::ColEvent::EndRow => { in_chunk = false; ab.end_row(); }
-                                    bsql_postgres_proto::ColEvent::Chunk { bytes, .. } => {
-                                        if in_chunk { ab.extend_last(bytes); } else { ab.push_value(bytes); in_chunk = true; }
-                                    }
-                                    bsql_postgres_proto::ColEvent::ChunkEnd { bytes, .. } => {
-                                        ab.extend_last(bytes); in_chunk = false;
-                                    }
-                                    _ => {}
-                                }
-                            }
+                        // Read the next wire bytes on demand and feed them. A
+                        // read error, a clean mid-stream EOF, or a rejected feed
+                        // all fail loud rather than silently truncating the rows.
+                        let cap = feed_cap.max(1).min(read_buf.len());
+                        let n = stream.read(&mut read_buf[..cap])
+                            .map_err(DriverError::Io)?;
+                        if n == 0 { return Err(DriverError::StreamStalled); }
+                        if rs.feed(&read_buf[..n]).is_err() {
+                            return Err(DriverError::StreamStalled);
                         }
                     }
                     bsql_postgres_proto::ColEvent::Chunk { bytes, .. } => {
@@ -205,11 +209,14 @@ impl Connection {
                         ab.extend_last(bytes);
                         in_chunk = false;
                     }
-                    _ => {}
+                    // Forward-compat guard: `ColEvent` is `#[non_exhaustive]`.
+                    // An unrecognised event cannot be decoded into a row safely,
+                    // so fail loud instead of silently dropping it.
+                    _ => return Err(DriverError::StreamStalled),
                 }
             }
         });
-        Ok(())
+        collected
     }
 
     // --- Public API ---
@@ -228,8 +235,10 @@ impl Connection {
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<u64, DriverError> {
-        let tag = self.simple_query(sql)?;
-        Ok(tag.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0))
+        self.session.push_simple_query(sql)?;
+        self.stream.write_all(self.session.pending_bytes())?;
+        self.pump(None)?;
+        Ok(self.session.affected_rows_or_zero())
     }
 
     pub fn query(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
@@ -276,16 +285,21 @@ impl Connection {
         self.session.push_bind_execute(stmt, params)?;
         self.stream.write_all(self.session.pending_bytes())?;
         self.pump(None)?;
-        let tag = self.session.extract_command_tag();
-        Ok(tag.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0))
+        Ok(self.session.affected_rows_or_zero())
     }
 
     pub fn query_params<P: bsql_postgres_proto::params::ParamsWriter>(
         &mut self, sql: &str, params: &P,
     ) -> Result<QueryResult, DriverError> {
         let stmt = self.prepare(sql)?;
-        let result = self.query_prepared(&stmt, params)?;
-        let _ = self.close_statement(stmt);
+        let result = self.query_prepared(&stmt, params);
+        // Always attempt the CLOSE so the statement is released. The primary op
+        // error dominates by design: if `result` is Err, `result?` returns it
+        // and the CLOSE Result is dropped. A CLOSE failure surfaces only when
+        // the primary op SUCCEEDED, so it is never lost behind a real failure.
+        let close = self.close_statement(stmt);
+        let result = result?;
+        close?;
         Ok(result)
     }
 
@@ -311,9 +325,12 @@ impl Connection {
         &mut self, sql: &str, params: &P,
     ) -> Result<u64, DriverError> {
         let stmt = self.prepare(sql)?;
-        let result = self.execute_prepared(&stmt, params)?;
-        let _ = self.close_statement(stmt);
-        Ok(result)
+        let result = self.execute_prepared(&stmt, params);
+        // Always attempt the CLOSE, but never drop its Result.
+        let close = self.close_statement(stmt);
+        let count = result?;
+        close?;
+        Ok(count)
     }
 
     pub fn begin(&mut self) -> Result<(), DriverError> { self.simple_query("BEGIN")?; Ok(()) }
@@ -329,7 +346,16 @@ impl Connection {
         self.simple_query("BEGIN")?;
         match f(self) {
             Ok(val) => { self.simple_query("COMMIT")?; Ok(val) }
-            Err(e) => { let _ = self.simple_query("ROLLBACK"); Err(e) }
+            Err(e) => {
+                // The caller's error is the primary cause to return. But a
+                // failed ROLLBACK leaves the connection inside an open
+                // transaction — poison it so a pool cannot silently reuse a
+                // connection carrying a dangling transaction.
+                if self.simple_query("ROLLBACK").is_err() {
+                    self.poisoned = true;
+                }
+                Err(e)
+            }
         }
     }
 
@@ -344,7 +370,11 @@ impl Connection {
     pub fn recv_notification(
         &mut self, timeout: std::time::Duration,
     ) -> Result<Option<bsql_postgres_core::Notification>, DriverError> {
-        let deadline = std::time::Instant::now() + timeout;
+        // A near-MAX timeout would overflow `Instant + Duration` and panic;
+        // classify it instead of crashing the thread.
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(DriverError::TimeoutOverflow)?;
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() { return Ok(None); }
@@ -354,16 +384,25 @@ impl Connection {
                 Ok(n) => {
                     self.session.feed(&self.read_buf[..n])?;
                     let event = self.session.proto.advance_one_frame(&mut self.session.wb);
-                    if let FeedEvent::Notify { notif_ref, pid } = event
-                        && let Ok(payload) = self.session.proto.get_notification(notif_ref) {
-                            self.stream.set_read_timeout(Some(std::time::Duration::from_secs(
-                                10)))?;
-                            return Ok(Some(bsql_postgres_core::Notification {
-                                channel: payload.channel.as_str().to_string(),
-                                payload: String::from_utf8_lossy(&payload.payload).into_owned(),
-                                pid,
-                            }));
-                        }
+                    if let FeedEvent::Notify { notif_ref, pid } = event {
+                        self.stream.set_read_timeout(Some(std::time::Duration::from_secs(
+                            10)))?;
+                        // The frame announced a notification; its payload must
+                        // resolve. An unresolvable ref means the event would be
+                        // lost silently — fail loud instead of dropping it.
+                        let payload = self.session.proto.get_notification(notif_ref)
+                            .map_err(|_| DriverError::NotificationUnavailable)?;
+                        // A non-UTF-8 NOTIFY payload is surfaced as a
+                        // classified error rather than silently rewritten
+                        // with Unicode replacement characters.
+                        let payload_text = core::str::from_utf8(&payload.payload)
+                            .map_err(|_| DriverError::NonUtf8Payload)?;
+                        return Ok(Some(bsql_postgres_core::Notification {
+                            channel: payload.channel.as_str().to_string(),
+                            payload: payload_text.to_string(),
+                            pid,
+                        }));
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut => {
@@ -388,9 +427,12 @@ impl Connection {
         let had_fail = actions.as_slice().iter()
             .any(|a| matches!(a, bsql_postgres_proto::Action::FailReply { .. }));
         if had_fail {
-            let err = self.session.proto.fail_cause()
-                .map(|&c| self.session.classify_error(c))
-                .unwrap_or(DriverError::NotReady);
+            let err = match self.session.proto.fail_cause() {
+                Some(&c) => self.session.classify_error(c),
+                // A failure occurred but no classified cause was parked; report
+                // that precisely rather than mislabelling it as "not ready".
+                None => DriverError::UnclassifiedFailure,
+            };
             for _ in 0..5 {
                 if self.session.is_healthy() { break; }
                 if let Ok(n) = self.stream.read(&mut self.read_buf)
@@ -399,7 +441,7 @@ impl Connection {
                 {
                     break;
                 }
-                self.session.drain_to_idle();
+                let _reached_ready = self.session.drain_to_idle();
             }
             return Err(err);
         }
@@ -424,11 +466,10 @@ impl Connection {
         self.session.wb.clear();
 
         self.pump(None)?;
-        let tag = self.session.extract_command_tag();
-        Ok(tag.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0))
+        Ok(self.session.affected_rows_or_zero())
     }
 
-    pub fn is_healthy(&self) -> bool { self.session.is_healthy() }
+    pub fn is_healthy(&self) -> bool { !self.poisoned && self.session.is_healthy() }
     pub fn server_version(&self) -> Option<&str> { self.session.server_version() }
     pub fn backend_pid(&self) -> i32 { self.session.backend_pid() }
 

@@ -111,21 +111,31 @@ impl ConnectConfig {
         let mut timeout = 10u64;
         if let Some(q) = query {
             for param in q.split('&') {
-                if let Some((k, v)) = param.split_once('=') {
-                    match k {
-                        "sslmode" => {
-                            ssl_mode = match v {
-                                "disable" => SslMode::Disable,
-                                "prefer" => SslMode::Prefer,
-                                "require" => SslMode::Require,
-                                other => return Err(format!("unknown sslmode: {other}")),
-                            };
-                        }
-                        "connect_timeout" => {
-                            timeout = v.parse().map_err(|_| format!("invalid timeout: {v}"))?;
-                        }
-                        _ => {}
+                // A parameter with no `=` carries no value. Silently skipping it
+                // would, for `?sslmode`, keep the default `prefer` and downgrade
+                // SSL without the caller knowing. Reject it loudly instead.
+                let (k, v) = match param.split_once('=') {
+                    Some(kv) => kv,
+                    None => return Err(format!("malformed DSN parameter (missing '='): {param}")),
+                };
+                match k {
+                    "sslmode" => {
+                        ssl_mode = match v {
+                            "disable" => SslMode::Disable,
+                            "prefer" => SslMode::Prefer,
+                            "require" => SslMode::Require,
+                            other => return Err(format!("unknown sslmode: {other}")),
+                        };
                     }
+                    "connect_timeout" => {
+                        timeout = v.parse().map_err(|_| format!("invalid timeout: {v}"))?;
+                    }
+                    // An unrecognised key is a misconfiguration (e.g. a
+                    // typo'd `sslmod=require` that would otherwise silently
+                    // leave the default `prefer`, downgrading security).
+                    // Reject it loudly, consistent with how an unknown
+                    // sslmode VALUE is already rejected above.
+                    other => return Err(format!("unknown DSN parameter: {other}")),
                 }
             }
         }
@@ -144,23 +154,64 @@ impl ConnectConfig {
     /// Construct from environment variables.
     ///
     /// Reads: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE`.
-    /// Falls back to defaults: host=localhost, port=5432, user=current OS user.
-    pub fn from_env() -> Self {
-        let host = std::env::var("PGHOST").unwrap_or_else(|_| "localhost".to_string());
-        let port = std::env::var("PGPORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(5432);
-        let user = std::env::var("PGUSER")
-            .unwrap_or_else(|_| std::env::var("USER").unwrap_or_else(|_| "postgres".to_string()));
-        let database = std::env::var("PGDATABASE").ok();
-        let password = std::env::var("PGPASSWORD").ok();
-        let ssl_mode = match std::env::var("PGSSLMODE").as_deref() {
-            Ok("disable") => SslMode::Disable,
-            Ok("require") => SslMode::Require,
-            _ => SslMode::Prefer,
+    ///
+    /// A variable that is **absent** falls back to a documented default
+    /// (host=localhost, port=5432, user=`$USER` then `postgres`,
+    /// sslmode=prefer). A variable that is **present but malformed** is a real
+    /// misconfiguration and is rejected with `Err` — a typo'd `PGPORT=abc` or
+    /// `PGSSLMODE=requ1re` never silently degrades to a default that could send
+    /// the connection to the wrong port or strip SSL.
+    pub fn from_env() -> Result<Self, String> {
+        use std::env::VarError;
+
+        let host = match std::env::var("PGHOST") {
+            Ok(h) => h,
+            Err(VarError::NotPresent) => "localhost".to_string(),
+            Err(VarError::NotUnicode(_)) => return Err("PGHOST is not valid UTF-8".to_string()),
         };
-        Self {
+
+        let port = match std::env::var("PGPORT") {
+            Ok(p) => p.parse::<u16>().map_err(|_| format!("invalid PGPORT: {p}"))?,
+            Err(VarError::NotPresent) => 5432,
+            Err(VarError::NotUnicode(_)) => return Err("PGPORT is not valid UTF-8".to_string()),
+        };
+
+        let user = match std::env::var("PGUSER") {
+            Ok(u) => u,
+            Err(VarError::NotPresent) => match std::env::var("USER") {
+                Ok(u) => u,
+                Err(VarError::NotPresent) => "postgres".to_string(),
+                Err(VarError::NotUnicode(_)) => return Err("USER is not valid UTF-8".to_string()),
+            },
+            Err(VarError::NotUnicode(_)) => return Err("PGUSER is not valid UTF-8".to_string()),
+        };
+
+        let database = match std::env::var("PGDATABASE") {
+            Ok(d) => Some(d),
+            Err(VarError::NotPresent) => None,
+            Err(VarError::NotUnicode(_)) => return Err("PGDATABASE is not valid UTF-8".to_string()),
+        };
+
+        let password = match std::env::var("PGPASSWORD") {
+            Ok(p) => Some(p),
+            Err(VarError::NotPresent) => None,
+            Err(VarError::NotUnicode(_)) => return Err("PGPASSWORD is not valid UTF-8".to_string()),
+        };
+
+        let ssl_mode = match std::env::var("PGSSLMODE") {
+            Ok(v) => match v.as_str() {
+                "disable" => SslMode::Disable,
+                "prefer" => SslMode::Prefer,
+                "require" => SslMode::Require,
+                // A typo here would otherwise silently fall to `prefer`, which
+                // permits an SSL-stripping downgrade. Reject it loudly.
+                other => return Err(format!("unknown PGSSLMODE: {other}")),
+            },
+            Err(VarError::NotPresent) => SslMode::Prefer,
+            Err(VarError::NotUnicode(_)) => return Err("PGSSLMODE is not valid UTF-8".to_string()),
+        };
+
+        Ok(Self {
             host,
             port,
             user,
@@ -168,7 +219,7 @@ impl ConnectConfig {
             password_inner: password.map(zeroize::Zeroizing::new),
             connect_timeout_secs: 10,
             ssl_mode,
-        }
+        })
     }
 
     /// Construct with required fields. Port defaults to 5432.
@@ -214,5 +265,44 @@ impl ConnectConfig {
     pub fn password(mut self, pw: impl Into<String>) -> Self {
         self.password_inner = Some(zeroize::Zeroizing::new(pw.into()));
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dsn_rejects_unknown_parameter() {
+        // A typo'd parameter (e.g. `sslmod` for `sslmode`) must be rejected, not
+        // silently ignored — silently ignoring it would leave the default mode.
+        let err = ConnectConfig::from_dsn("postgres://u@h?sslmod=require");
+        assert!(err.is_err(), "unknown DSN parameter must be rejected");
+    }
+
+    #[test]
+    fn dsn_accepts_known_parameters() {
+        // `expect`/`unwrap` are crate-denied even in tests; match instead.
+        let cfg = match ConnectConfig::from_dsn(
+            "postgres://u@h:5433/db?sslmode=require&connect_timeout=3",
+        ) {
+            Ok(c) => c,
+            Err(e) => panic!("valid DSN must parse: {e}"),
+        };
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.ssl_mode, SslMode::Require);
+        assert_eq!(cfg.connect_timeout_secs, 3);
+    }
+
+    #[test]
+    fn dsn_rejects_unknown_sslmode_value() {
+        assert!(ConnectConfig::from_dsn("postgres://u@h?sslmode=verify-full").is_err());
+    }
+
+    #[test]
+    fn dsn_rejects_valueless_parameter() {
+        // `?sslmode` with no value would silently keep the default `prefer`,
+        // downgrading SSL. A parameter missing `=` must be rejected loudly.
+        assert!(ConnectConfig::from_dsn("postgres://u@h?sslmode").is_err());
     }
 }

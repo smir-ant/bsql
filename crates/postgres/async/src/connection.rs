@@ -112,11 +112,24 @@ impl Connection {
                 PumpAction::Streaming => {
                     match rows {
                         Some(ref mut r) => self.collect_streaming(r).await?,
-                        None => self.session.drain_streaming(),
+                        None => {
+                            // Discard a streaming result we did not ask for.
+                            // `drain_streaming` is sans-IO; when it reports it
+                            // needs more bytes, read and feed them here. A clean
+                            // server close mid-drain is a stall, not a success.
+                            while !self.session.drain_streaming() {
+                                let n = self.stream.read(&mut self.read_buf).await?;
+                                if n == 0 { return Err(DriverError::StreamStalled); }
+                                self.session.feed(&self.read_buf[..n])?;
+                            }
+                        }
                     }
                 }
                 PumpAction::Error(e) => {
-                    // Try to drain trailing RFQ so connection recovers.
+                    // Try to drain trailing RFQ so the connection recovers. The
+                    // drain outcome is observed on the next loop's is_healthy()
+                    // check; an unrecovered connection stays unhealthy and the
+                    // pool evicts it. The original error is returned regardless.
                     for _ in 0..5 {
                         if self.session.is_healthy() { break; }
                         if let Ok(n) = self.stream.read(&mut self.read_buf).await
@@ -125,7 +138,7 @@ impl Connection {
                         {
                             break;
                         }
-                        self.session.drain_to_idle();
+                        let _reached_ready = self.session.drain_to_idle();
                     }
                     return Err(e);
                 }
@@ -134,35 +147,67 @@ impl Connection {
     }
 
     async fn collect_streaming(&mut self, rows: &mut Vec<Row>) -> Result<(), DriverError> {
-        // Pre-buffer: read remaining response bytes before entering iter_rows.
-        // Proto's connection_status tells us when all data is buffered.
+        // Pre-buffer remaining response bytes before entering iter_rows.
+        //
+        // NOTE: the byte-window scan for the ReadyForQuery marker is a
+        // best-effort read-ahead heuristic, not a frame-aware boundary; the
+        // sound terminator is the protocol's `EndQuery` event consumed below.
+        // Read errors are propagated rather than silently stopping the buffer,
+        // and a prebuffer that ends short surfaces as a classified stall in the
+        // iter_rows loop instead of a silent truncation or an endless spin.
         let mut prebuf = Vec::new();
         let probe = std::time::Duration::from_millis(10);
         match tokio::time::timeout(probe, self.stream.read(&mut self.read_buf)).await {
-            Ok(Ok(n)) if n > 0 => {
+            Ok(Ok(0)) => return Err(DriverError::Io(std::io::Error::other("server closed mid-stream"))),
+            Ok(Ok(n)) => {
                 prebuf.extend_from_slice(&self.read_buf[..n]);
                 let mut scan_from = 0usize;
-                while !prebuf.get(scan_from..).unwrap_or(&[])
-                    .windows(5).any(|w| w[0] == b'Z' && w[1..5] == [0, 0, 0, 5])
-                {
+                loop {
+                    let tail = match prebuf.get(scan_from..) {
+                        Some(t) => t,
+                        // scan_from is derived from prebuf.len(), so this slice
+                        // is always in range; treat the impossible None as "no
+                        // marker yet" and keep reading rather than dropping data.
+                        None => &[],
+                    };
+                    if tail.windows(5).any(|w| w[0] == b'Z' && w[1..5] == [0, 0, 0, 5]) {
+                        break;
+                    }
                     scan_from = prebuf.len().saturating_sub(4);
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
                         self.stream.read(&mut self.read_buf),
                     ).await {
-                        Ok(Ok(n)) if n > 0 => prebuf.extend_from_slice(&self.read_buf[..n]),
-                        _ => break,
+                        // Clean EOF mid-stream: stop reading ahead. Any
+                        // unsatisfied NeedMore below becomes a classified stall.
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => prebuf.extend_from_slice(&self.read_buf[..n]),
+                        // A hard read error must not be swallowed.
+                        Ok(Err(e)) => return Err(DriverError::Io(e)),
+                        // Read-ahead timeout: stop buffering; remaining bytes (if
+                        // any) are required below and a stall is reported there.
+                        Err(_) => break,
                     }
                 }
             }
-            _ => {}
+            // Initial-probe read error is a real failure, not "no data".
+            Ok(Err(e)) => return Err(DriverError::Io(e)),
+            // Initial-probe timeout: no bytes ready yet; the iter_rows loop will
+            // classify any unsatisfied NeedMore as a stall.
+            Err(_) => {}
         }
 
         let mut pos = 0usize;
         let feed_cap = self.session.feed_capacity();
         let prebuf_slice = prebuf.as_slice();
-        self.session.iter_rows(|rs| {
-            let n_cols = rs.current_row_desc().map_or(0, |d| d.len());
+        let collected: Result<(), DriverError> = self.session.iter_rows(|rs| {
+            // The column schema sizes the arena and identifies each cell. If it
+            // is absent, every row would silently decode as 0 columns (all
+            // get_* return None). Fail loud rather than return hollow rows.
+            let n_cols = match rs.current_row_desc() {
+                Some(d) => d.len(),
+                None => return Err(DriverError::RowDescriptionMissing),
+            };
             let mut ab = bsql_postgres_core::ArenaBuilder::new(n_cols);
             let mut in_chunk = false;
             loop {
@@ -178,17 +223,23 @@ impl Connection {
                         ab.end_row();
                     }
                     bsql_postgres_proto::ColEvent::EndQuery { .. } => {
-                        *rows = ab.finish();
-                        return;
+                        *rows = ab.finish()?;
+                        return Ok(());
                     }
-                    bsql_postgres_proto::ColEvent::NeedMore
-                        if pos < prebuf_slice.len() => {
-                            let end = (pos + feed_cap).min(prebuf_slice.len());
-                            if rs.feed(&prebuf_slice[pos..end]).is_ok() {
-                                pos = end;
-                                continue;
-                            }
+                    bsql_postgres_proto::ColEvent::NeedMore => {
+                        // Feed the next prebuffered slice. If the prebuffer is
+                        // exhausted (or the protocol rejects the feed), no more
+                        // bytes can be supplied here — fail loud instead of
+                        // spinning forever or returning truncated rows.
+                        if pos >= prebuf_slice.len() {
+                            return Err(DriverError::StreamStalled);
                         }
+                        let end = (pos + feed_cap).min(prebuf_slice.len());
+                        if rs.feed(&prebuf_slice[pos..end]).is_err() {
+                            return Err(DriverError::StreamStalled);
+                        }
+                        pos = end;
+                    }
                     bsql_postgres_proto::ColEvent::Chunk { bytes, .. } => {
                         if in_chunk { ab.extend_last(bytes); } else { ab.push_value(bytes); in_chunk = true; }
                     }
@@ -196,11 +247,15 @@ impl Connection {
                         ab.extend_last(bytes);
                         in_chunk = false;
                     }
-                    _ => {}
+                    // Forward-compat guard: `ColEvent` is `#[non_exhaustive]`.
+                    // An event this driver does not recognise cannot be decoded
+                    // into a row safely, so fail loud instead of silently
+                    // dropping it (which would truncate the result).
+                    _ => return Err(DriverError::StreamStalled),
                 }
             }
         });
-        Ok(())
+        collected
     }
 
     // --- Public API (thin wrappers over Session + pump) ---
@@ -219,17 +274,23 @@ impl Connection {
     }
 
     pub async fn execute(&mut self, sql: &str) -> Result<u64, DriverError> {
-        let tag = self.simple_query(sql).await?;
-        Ok(tag.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0))
+        self.session.push_simple_query(sql)?;
+        self.stream.write_all(self.session.pending_bytes()).await?;
+        self.pump(None).await?;
+        Ok(self.session.affected_rows_or_zero())
     }
 
     pub async fn execute_params<P: bsql_postgres_proto::params::ParamsWriter>(
         &mut self, sql: &str, params: &P,
     ) -> Result<u64, DriverError> {
         let stmt = self.prepare(sql).await?;
-        let result = self.execute_prepared(&stmt, params).await?;
-        let _ = self.close_statement(stmt).await;
-        Ok(result)
+        let result = self.execute_prepared(&stmt, params).await;
+        // Always attempt the CLOSE, but never drop its Result: if the primary op
+        // succeeded yet CLOSE failed, the connection is suspect — surface that.
+        let close = self.close_statement(stmt).await;
+        let count = result?;
+        close?;
+        Ok(count)
     }
 
     pub async fn query(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
@@ -278,16 +339,21 @@ impl Connection {
         self.session.push_bind_execute(stmt, params)?;
         self.stream.write_all(self.session.pending_bytes()).await?;
         self.pump(None).await?;
-        let tag = self.session.extract_command_tag();
-        Ok(tag.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0))
+        Ok(self.session.affected_rows_or_zero())
     }
 
     pub async fn query_params<P: bsql_postgres_proto::params::ParamsWriter>(
         &mut self, sql: &str, params: &P,
     ) -> Result<QueryResult, DriverError> {
         let stmt = self.prepare(sql).await?;
-        let result = self.query_prepared(&stmt, params).await?;
-        let _ = self.close_statement(stmt).await;
+        let result = self.query_prepared(&stmt, params).await;
+        // Always attempt the CLOSE so the statement is released. The primary op
+        // error dominates by design: if `result` is Err, `result?` returns it
+        // and the CLOSE Result is dropped. A CLOSE failure surfaces only when
+        // the primary op SUCCEEDED, so it is never lost behind a real failure.
+        let close = self.close_statement(stmt).await;
+        let result = result?;
+        close?;
         Ok(result)
     }
 
@@ -334,7 +400,11 @@ impl Connection {
     pub async fn recv_notification(
         &mut self, timeout: std::time::Duration,
     ) -> Result<Option<Notification>, DriverError> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        // A near-MAX timeout would overflow `Instant + Duration` and panic;
+        // classify it instead of crashing the task.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(DriverError::TimeoutOverflow)?;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() { return Ok(None); }
@@ -343,14 +413,23 @@ impl Connection {
                 Ok(Ok(n)) => {
                     self.session.feed(&self.read_buf[..n])?;
                     let event = self.session.proto.advance_one_frame(&mut self.session.wb);
-                    if let FeedEvent::Notify { notif_ref, pid } = event
-                        && let Ok(payload) = self.session.proto.get_notification(notif_ref) {
-                            return Ok(Some(Notification {
-                                channel: payload.channel.as_str().to_string(),
-                                payload: String::from_utf8_lossy(&payload.payload).into_owned(),
-                                pid,
-                            }));
-                        }
+                    if let FeedEvent::Notify { notif_ref, pid } = event {
+                        // The frame announced a notification; its payload must
+                        // resolve. An unresolvable ref means the event would be
+                        // lost silently — fail loud instead of dropping it.
+                        let payload = self.session.proto.get_notification(notif_ref)
+                            .map_err(|_| DriverError::NotificationUnavailable)?;
+                        // A non-UTF-8 NOTIFY payload is surfaced as a
+                        // classified error rather than silently rewritten
+                        // with Unicode replacement characters.
+                        let payload_text = core::str::from_utf8(&payload.payload)
+                            .map_err(|_| DriverError::NonUtf8Payload)?;
+                        return Ok(Some(Notification {
+                            channel: payload.channel.as_str().to_string(),
+                            payload: payload_text.to_string(),
+                            pid,
+                        }));
+                    }
                 }
                 Ok(Err(e)) => return Err(DriverError::Io(e)),
                 Err(_) => return Ok(None),
@@ -373,10 +452,13 @@ impl Connection {
         let had_fail = actions.as_slice().iter()
             .any(|a| matches!(a, bsql_postgres_proto::Action::FailReply { .. }));
         if had_fail {
-            let err = self.session.proto.fail_cause()
-                .map(|&c| self.session.classify_error(c))
-                .unwrap_or(DriverError::NotReady);
-            self.session.drain_to_idle();
+            let err = match self.session.proto.fail_cause() {
+                Some(&c) => self.session.classify_error(c),
+                // A failure occurred but no classified cause was parked; report
+                // that precisely rather than mislabelling it as "not ready".
+                None => DriverError::UnclassifiedFailure,
+            };
+            let _reached_ready = self.session.drain_to_idle();
             return Err(err);
         }
 
@@ -400,8 +482,7 @@ impl Connection {
         self.session.wb.clear();
 
         self.pump(None).await?;
-        let tag = self.session.extract_command_tag();
-        Ok(tag.rsplit(' ').next().and_then(|s| s.parse().ok()).unwrap_or(0))
+        Ok(self.session.affected_rows_or_zero())
     }
 
     pub fn is_healthy(&self) -> bool { self.session.is_healthy() }

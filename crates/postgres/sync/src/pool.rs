@@ -121,7 +121,16 @@ impl Drop for PooledConnection {
         if let Some(conn) = self.conn.take() {
             let mut state = self.pool.state.lock()
                 .unwrap_or_else(|e| e.into_inner());
-            state.checked_out = state.checked_out.saturating_sub(1);
+            // `checked_out` is incremented once per checkout and decremented
+            // once here per drop, so it is always >= 1 at this point. A checked
+            // decrement with a debug assertion makes any accounting bug fail
+            // loud in debug builds instead of being masked by a silent
+            // saturate-to-zero; Drop cannot return an error, so release builds
+            // hold the floor at zero rather than underflow.
+            match state.checked_out.checked_sub(1) {
+                Some(n) => state.checked_out = n,
+                None => debug_assert!(false, "pool checked_out underflow on connection return"),
+            }
             if conn.is_healthy() {
                 state.connections.push_back(conn);
             }

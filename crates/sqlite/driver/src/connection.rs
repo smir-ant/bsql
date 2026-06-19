@@ -82,7 +82,19 @@ impl Row {
     pub fn get_f64(&self, idx: usize) -> Option<f64> {
         match self.columns.get(idx)? {
             SqliteValue::Real(f) => Some(*f),
-            SqliteValue::Integer(n) => Some(*n as f64),
+            // Convert an integer to f64 only when it is exactly representable.
+            // f64 has a 53-bit mantissa, so every integer in the closed range
+            // [-(2^53), 2^53] round-trips through f64 with no loss. The bound
+            // check below proves the value lies in that range; the `as f64`
+            // cast is therefore exact and lossless on that domain (not a
+            // silent truncation). A larger integer is not returned as a
+            // rounded approximation — `None` is the honest "not cleanly
+            // convertible, read it as an integer instead" signal.
+            SqliteValue::Integer(n) if (-(1i64 << 53)..=(1i64 << 53)).contains(n) => {
+                // `*n` is proven within [-(2^53), 2^53]; `as f64` is exact here.
+                Some(*n as f64)
+            }
+            SqliteValue::Integer(_) => None,
             SqliteValue::Text(s) => s.parse().ok(),
             _ => None,
         }
@@ -247,7 +259,17 @@ impl Connection {
         self.inner.execute_batch("BEGIN")?;
         match f(self) {
             Ok(val) => { self.inner.execute_batch("COMMIT")?; Ok(val) }
-            Err(e) => { let _ = self.inner.execute_batch("ROLLBACK"); Err(e) }
+            Err(e) => match self.inner.execute_batch("ROLLBACK") {
+                // ROLLBACK undid the transaction: return the closure's error.
+                Ok(()) => Err(e),
+                // ROLLBACK also failed: the connection is in an indeterminate
+                // transactional state. Preserve both causes rather than
+                // silently dropping the rollback failure.
+                Err(rb) => Err(SqliteError::TransactionRollbackFailed {
+                    original: Box::new(e),
+                    rollback: Box::new(SqliteError::from(rb)),
+                }),
+            },
         }
     }
 
@@ -274,4 +296,50 @@ fn read_row(row: &rusqlite::Row<'_>, col_count: usize) -> Result<Row, SqliteErro
         });
     }
     Ok(Row { columns })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Row, SqliteValue};
+
+    fn int_row(n: i64) -> Row {
+        Row { columns: vec![SqliteValue::Integer(n)] }
+    }
+
+    #[test]
+    fn get_f64_accepts_two_pow_53_exactly() {
+        // 2^53 is the largest magnitude that round-trips through f64's 53-bit
+        // mantissa exactly; it must convert (not be rejected as out of range).
+        let two_pow_53: i64 = 9_007_199_254_740_992;
+        let row = int_row(two_pow_53);
+        match row.get_f64(0) {
+            Some(v) => {
+                assert_eq!(v, two_pow_53 as f64);
+                // Round-trips back to the exact integer with no loss.
+                assert_eq!(v as i64, two_pow_53);
+            }
+            None => panic!("2^53 must convert exactly to f64"),
+        }
+    }
+
+    #[test]
+    fn get_f64_accepts_large_in_range_integers() {
+        // These are all within [-(2^53), 2^53] and exactly representable, yet
+        // the old i32-only guard wrongly rejected them.
+        for n in [4_000_000_000_i64, 1_000_000_000_000, -1_000_000_000_000] {
+            let row = int_row(n);
+            match row.get_f64(0) {
+                Some(v) => assert_eq!(v, n as f64),
+                None => panic!("in-range integer {n} must convert to f64"),
+            }
+        }
+    }
+
+    #[test]
+    fn get_f64_rejects_above_two_pow_53() {
+        // 2^53 + 1 is the first integer that f64 cannot represent exactly;
+        // returning a rounded value would be a silent loss, so expect None.
+        let above: i64 = 9_007_199_254_740_993;
+        assert!(int_row(above).get_f64(0).is_none(), "2^53+1 is not exact in f64");
+    }
 }

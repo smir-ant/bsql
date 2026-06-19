@@ -102,10 +102,15 @@ impl DerefMut for PooledConnection {
 impl Drop for PooledConnection {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            if conn.is_healthy()
-                && let Ok(mut conns) = self.pool.connections.lock() {
-                    conns.push_back(conn);
-                }
+            if conn.is_healthy() {
+                // Recover from a poisoned lock the same way the rest of the pool
+                // does, so a healthy connection is always returned (never
+                // silently discarded on poison while the permit is added back,
+                // which would diverge capacity from the connection set).
+                let mut conns = self.pool.connections.lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                conns.push_back(conn);
+            }
             self.pool.semaphore.add_permits(1);
         }
     }

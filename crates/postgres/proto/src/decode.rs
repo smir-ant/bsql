@@ -535,23 +535,34 @@ pub(crate) fn parse_row_description(
 /// Same wire format as [`parse_row_description`] but only extracts
 /// the NUL-terminated name strings, skipping OID/format metadata.
 /// Returns one `String` per column in wire order.
-pub fn parse_column_names(payload: &[u8]) -> alloc::vec::Vec<alloc::string::String> {
+///
+/// A non-UTF-8 column name is wire-malformed: the name feeds by-name lookups,
+/// so a lossy substitution would silently corrupt the identifier. It is
+/// classified as [`crate::error::ProtocolError::MalformedRowDescription`]
+/// instead of being rewritten with replacement characters.
+pub fn parse_column_names(
+    payload: &[u8],
+) -> Result<alloc::vec::Vec<alloc::string::String>, crate::error::ProtocolError> {
+    let malformed = || crate::error::ProtocolError::MalformedRowDescription {
+        payload_len: payload.len(),
+    };
     let Some((count_bytes, mut rest)) = payload.split_first_chunk::<2>() else {
-        return alloc::vec::Vec::new();
+        return Ok(alloc::vec::Vec::new());
     };
     let n_i16 = i16::from_be_bytes(*count_bytes);
     let Ok(n) = usize::try_from(n_i16) else {
-        return alloc::vec::Vec::new();
+        return Ok(alloc::vec::Vec::new());
     };
     let mut names = alloc::vec::Vec::with_capacity(n);
     for _ in 0..n {
         let Some(nul_pos) = rest.iter().position(|&b| b == 0) else { break };
-        let name_bytes = rest.get(..nul_pos).unwrap_or(&[]);
-        names.push(alloc::string::String::from_utf8_lossy(name_bytes).into_owned());
+        let name_bytes = rest.get(..nul_pos).ok_or_else(malformed)?;
+        let name = core::str::from_utf8(name_bytes).map_err(|_| malformed())?;
+        names.push(alloc::string::String::from(name));
         let skip = nul_pos.saturating_add(1).saturating_add(18);
         rest = rest.get(skip..).unwrap_or(&[]);
     }
-    names
+    Ok(names)
 }
 
 /// Parse a `ParameterDescription` payload (body of the `'t'`

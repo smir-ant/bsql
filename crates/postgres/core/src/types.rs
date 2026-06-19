@@ -19,15 +19,19 @@ impl ColSlot {
         Self { offset: 0, len_plus_one: None }
     }
 
-    fn value(offset: u32, len: u32) -> Self {
-        Self {
-            offset,
-            len_plus_one: NonZeroU32::new(len.saturating_add(1)),
-        }
+    /// Build a value slot from an offset and a pre-encoded `len + 1`.
+    /// `len_plus_one` is constructed by [`ArenaBuilder`] after a checked
+    /// `len + 1` that already rejected `len == u32::MAX`, so this constructor
+    /// never sees a saturated or wrapped value — the bad state is unrepresentable
+    /// here by the time it is reached.
+    fn value(offset: u32, len_plus_one: NonZeroU32) -> Self {
+        Self { offset, len_plus_one: Some(len_plus_one) }
     }
 
     fn byte_len(&self) -> Option<u32> {
-        Some(self.len_plus_one?.get().saturating_sub(1))
+        // `len_plus_one` is always a checked `len + 1 >= 1`, so `- 1` cannot
+        // underflow. The `?` propagates SQL NULL (no value), not an error.
+        self.len_plus_one?.get().checked_sub(1)
     }
 }
 
@@ -104,33 +108,83 @@ impl Row {
     }
 }
 
+// ─── RowTooLarge ────────────────────────────────────────────
+
+/// A result row (or the whole arena) could not be represented within the
+/// 32-bit on-arena fields: more columns than `u16`, or a cell offset/length
+/// that overflows `u32`. Construction fails loudly instead of saturating to a
+/// sentinel that would silently mis-address subsequent cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowTooLarge;
+
+impl core::fmt::Display for RowTooLarge {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("result row too large to encode (exceeds 32-bit arena bounds)")
+    }
+}
+
+impl std::error::Error for RowTooLarge {}
+
 // ─── ArenaBuilder ───────────────────────────────────────────
 
 /// Builds the shared arena during streaming. One builder per query.
-/// finish() seals and produces the Arc-shared arena + Row handles.
+/// `finish()` seals and produces the Arc-shared arena + Row handles.
+///
+/// Any cell offset/length or column count that would overflow the 32-bit
+/// arena fields sets a sticky overflow flag rather than saturating; `finish()`
+/// converts that flag into [`RowTooLarge`] so a too-large result fails loudly
+/// instead of returning silently corrupted rows.
 pub struct ArenaBuilder {
     data: Vec<u8>,
     slots: Vec<ColSlot>,
     n_cols: u16,
     rows_finished: u32,
+    /// Set when a bound was exceeded; sealed into a `RowTooLarge` by `finish()`.
+    overflow: bool,
 }
 
 impl ArenaBuilder {
+    /// Create a builder for a row shape with `n_cols` columns. A column count
+    /// that does not fit `u16` marks the builder overflowed; `finish()` then
+    /// fails loudly instead of mis-indexing rows against a truncated count.
     pub fn new(n_cols: usize) -> Self {
-        let n = u16::try_from(n_cols).unwrap_or(u16::MAX);
+        let (n, overflow) = match u16::try_from(n_cols) {
+            Ok(n) => (n, false),
+            Err(_) => (0, true),
+        };
         Self {
             data: Vec::new(),
             slots: Vec::new(),
             n_cols: n,
             rows_finished: 0,
+            overflow,
         }
     }
 
     pub fn push_value(&mut self, bytes: &[u8]) {
-        let offset = u32::try_from(self.data.len()).unwrap_or(u32::MAX);
-        let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        self.data.extend_from_slice(bytes);
-        self.slots.push(ColSlot::value(offset, len));
+        // Offset and `len + 1` must both fit u32 (a NULL is encoded by the
+        // niche, so a real value needs `len + 1 >= 1`). On overflow, record a
+        // NULL placeholder and mark the builder so `finish()` fails loudly —
+        // never a saturated offset/length that would mis-address bytes.
+        let Ok(offset) = u32::try_from(self.data.len()) else {
+            self.overflow = true;
+            self.slots.push(ColSlot::null());
+            return;
+        };
+        let len_plus_one = u32::try_from(bytes.len())
+            .ok()
+            .and_then(|len| len.checked_add(1))
+            .and_then(NonZeroU32::new);
+        match len_plus_one {
+            Some(lp1) => {
+                self.data.extend_from_slice(bytes);
+                self.slots.push(ColSlot::value(offset, lp1));
+            }
+            None => {
+                self.overflow = true;
+                self.slots.push(ColSlot::null());
+            }
+        }
     }
 
     pub fn push_null(&mut self) {
@@ -139,12 +193,24 @@ impl ArenaBuilder {
 
     /// Extend the last pushed column's data (for chunked columns).
     pub fn extend_last(&mut self, bytes: &[u8]) {
-        self.data.extend_from_slice(bytes);
         if let Some(slot) = self.slots.last_mut()
             && let Some(old_len) = slot.byte_len()
         {
-            let extra = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-            *slot = ColSlot::value(slot.offset, old_len.saturating_add(extra));
+            // New total `old_len + extra`, then `+ 1` for the niche encoding,
+            // all checked. On overflow mark the builder; do not saturate.
+            let new_lp1 = u32::try_from(bytes.len())
+                .ok()
+                .and_then(|extra| old_len.checked_add(extra))
+                .and_then(|total| total.checked_add(1))
+                .and_then(NonZeroU32::new);
+            match new_lp1 {
+                Some(lp1) => {
+                    self.data.extend_from_slice(bytes);
+                    let offset = slot.offset;
+                    *slot = ColSlot::value(offset, lp1);
+                }
+                None => self.overflow = true,
+            }
         }
     }
 
@@ -152,8 +218,12 @@ impl ArenaBuilder {
         self.rows_finished += 1;
     }
 
-    /// Seal the arena and produce Row handles.
-    pub fn finish(self) -> Vec<Row> {
+    /// Seal the arena and produce Row handles. Fails with [`RowTooLarge`] if
+    /// any column count, offset, or length overflowed the 32-bit fields.
+    pub fn finish(self) -> Result<Vec<Row>, RowTooLarge> {
+        if self.overflow {
+            return Err(RowTooLarge);
+        }
         let n_rows = self.rows_finished;
         let arena = Arc::new(ArenaInner {
             data: self.data,
@@ -161,9 +231,9 @@ impl ArenaBuilder {
             n_cols: self.n_cols,
             _n_rows: n_rows,
         });
-        (0..n_rows)
+        Ok((0..n_rows)
             .map(|i| Row { arena: arena.clone(), row_idx: i })
-            .collect()
+            .collect())
     }
 }
 
@@ -220,4 +290,46 @@ pub struct Notification {
     pub channel: String,
     pub payload: String,
     pub pid: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arena_builder_round_trips_values_and_nulls() {
+        let mut ab = ArenaBuilder::new(2);
+        ab.push_value(b"hi");
+        ab.push_null();
+        ab.end_row();
+        let rows = match ab.finish() {
+            Ok(r) => r,
+            Err(e) => panic!("unexpected overflow: {e}"),
+        };
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get_raw(0), Some(&b"hi"[..]));
+        assert!(row.is_null(1));
+    }
+
+    #[test]
+    fn arena_builder_extend_last_concatenates() {
+        let mut ab = ArenaBuilder::new(1);
+        ab.push_value(b"foo");
+        ab.extend_last(b"bar");
+        ab.end_row();
+        let rows = match ab.finish() {
+            Ok(r) => r,
+            Err(e) => panic!("unexpected overflow: {e}"),
+        };
+        assert_eq!(rows[0].get_raw(0), Some(&b"foobar"[..]));
+    }
+
+    #[test]
+    fn arena_builder_rejects_too_many_columns() {
+        // A column count beyond u16 cannot be addressed by the slot index; the
+        // builder must fail loud at finish(), never saturate and mis-index.
+        let ab = ArenaBuilder::new(usize::from(u16::MAX) + 1);
+        assert_eq!(ab.finish().map(|_| ()), Err(RowTooLarge));
+    }
 }

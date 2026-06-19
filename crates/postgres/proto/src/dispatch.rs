@@ -939,18 +939,23 @@ pub(crate) fn dispatch(
 
         // AwaitingFirstResponse: T / C / I / E — any other tag is desync
         (ProtoState::SimpleQueryAwaitingFirstResponse(reply), TAG_ROW_DESCRIPTION) => {
+            // Parse the row description first; only walk the payload a second
+            // time for column names when the first parse succeeded.
             match crate::decode::parse_row_description(payload) {
-                Ok(row_desc) => {
-                    _row_description_dispatch_leaf::park_row_description_at_dispatch(
-                        row_desc_slot,
-                        row_desc,
-                    );
-                    *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
-                    Transition {
-                        next: ProtoState::SimpleQueryStreamingRows { reply },
-                        outcome: DispatchOutcome::AdvancedSilent,
+                Ok(row_desc) => match crate::decode::parse_column_names(payload) {
+                    Ok(column_names) => {
+                        _row_description_dispatch_leaf::park_row_description_at_dispatch(
+                            row_desc_slot,
+                            row_desc,
+                        );
+                        *column_names_slot = Some(column_names.into_boxed_slice());
+                        Transition {
+                            next: ProtoState::SimpleQueryStreamingRows { reply },
+                            outcome: DispatchOutcome::AdvancedSilent,
+                        }
                     }
-                }
+                    Err(cause) => install_errored(Some(reply.consume()), cause),
+                },
                 Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
@@ -1241,18 +1246,23 @@ pub(crate) fn dispatch(
                             },
                         ),
                         Some(prior_tag_ref) => {
-                            _row_description_dispatch_leaf::park_row_description_at_dispatch(
-                                row_desc_slot,
-                                row_desc,
-                            );
-                            *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
-                            Transition {
-                                next: ProtoState::SimpleQueryStreamingRows { reply },
-                                outcome: DispatchOutcome::AdvancedWithAction {
-                                    action: crate::action::StagedAction::IntermediateCommandComplete {
-                                        tag_ref: prior_tag_ref,
-                                    },
-                                },
+                            match crate::decode::parse_column_names(payload) {
+                                Ok(column_names) => {
+                                    _row_description_dispatch_leaf::park_row_description_at_dispatch(
+                                        row_desc_slot,
+                                        row_desc,
+                                    );
+                                    *column_names_slot = Some(column_names.into_boxed_slice());
+                                    Transition {
+                                        next: ProtoState::SimpleQueryStreamingRows { reply },
+                                        outcome: DispatchOutcome::AdvancedWithAction {
+                                            action: crate::action::StagedAction::IntermediateCommandComplete {
+                                                tag_ref: prior_tag_ref,
+                                            },
+                                        },
+                                    }
+                                }
+                                Err(cause) => install_errored(Some(reply.consume()), cause),
                             }
                         }
                     }
@@ -1788,20 +1798,27 @@ pub(crate) fn dispatch(
         (
             ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply },
             TAG_ROW_DESCRIPTION,
-        ) => match crate::decode::parse_row_description(payload) {
-            Ok(row_desc) => {
-                _row_description_dispatch_leaf::park_row_description_at_dispatch(
-                    row_desc_slot,
-                    row_desc,
-                );
-                *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
-                Transition {
-                    next: ProtoState::DescribeStatementAwaitingRfq { reply },
-                    outcome: DispatchOutcome::AdvancedSilent,
-                }
+        ) => {
+            // Parse the row description first; only walk the payload a second
+            // time for column names when the first parse succeeded.
+            match crate::decode::parse_row_description(payload) {
+                Ok(row_desc) => match crate::decode::parse_column_names(payload) {
+                    Ok(column_names) => {
+                        _row_description_dispatch_leaf::park_row_description_at_dispatch(
+                            row_desc_slot,
+                            row_desc,
+                        );
+                        *column_names_slot = Some(column_names.into_boxed_slice());
+                        Transition {
+                            next: ProtoState::DescribeStatementAwaitingRfq { reply },
+                            outcome: DispatchOutcome::AdvancedSilent,
+                        }
+                    }
+                    Err(cause) => install_errored(Some(reply.consume()), cause),
+                },
+                Err(cause) => install_errored(Some(reply.consume()), cause),
             }
-            Err(cause) => install_errored(Some(reply.consume()), cause),
-        },
+        }
         (
             ProtoState::DescribeStatementAwaitingRowDescOrNoData { reply },
             TAG_NO_DATA,
@@ -1871,19 +1888,23 @@ pub(crate) fn dispatch(
         // Stage 1: awaiting RowDescription or NoData (no ParamDesc).
         (ProtoState::DescribePortalAwaitingRowDescOrNoData(reply), TAG_ROW_DESCRIPTION) => {
             // Parsed schema lands in PgProtocol::row_desc_slot —
-            // single source of truth.
+            // single source of truth. Parse the row description first; only
+            // walk the payload a second time for column names on success.
             match crate::decode::parse_row_description(payload) {
-                Ok(row_desc) => {
-                    _row_description_dispatch_leaf::park_row_description_at_dispatch(
-                        row_desc_slot,
-                        row_desc,
-                    );
-                    *column_names_slot = Some(crate::decode::parse_column_names(payload).into_boxed_slice());
-                    Transition {
-                        next: ProtoState::DescribePortalAwaitingRfq { reply },
-                        outcome: DispatchOutcome::AdvancedSilent,
+                Ok(row_desc) => match crate::decode::parse_column_names(payload) {
+                    Ok(column_names) => {
+                        _row_description_dispatch_leaf::park_row_description_at_dispatch(
+                            row_desc_slot,
+                            row_desc,
+                        );
+                        *column_names_slot = Some(column_names.into_boxed_slice());
+                        Transition {
+                            next: ProtoState::DescribePortalAwaitingRfq { reply },
+                            outcome: DispatchOutcome::AdvancedSilent,
+                        }
                     }
-                }
+                    Err(cause) => install_errored(Some(reply.consume()), cause),
+                },
                 Err(cause) => install_errored(Some(reply.consume()), cause),
             }
         }
