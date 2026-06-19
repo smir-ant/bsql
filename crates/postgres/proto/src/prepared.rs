@@ -23,17 +23,23 @@
 //! this crate ends and the user's `unsafe` contract or `.rodata`
 //! memory protection begins.
 //!
-//! # Format choice — text in v1.0
+//! # Wire format — binary-uniform
 //!
-//! The macro emits `bind_execute_prefix` with the compact
-//! format-code block (`n_format_codes = 1, formats = [Text]` for
-//! N ≥ 1; `n_format_codes = 0` for N = 0). All-text default —
-//! text is the safer choice for ad-hoc primitive types and matches
-//! today's [`Cell<TextFmt>`](crate::decode::Cell) matrix.
+//! Params AND results are uniformly PostgreSQL binary on this path.
+//! The macro's baked `bind_execute_prefix` carries ONLY the portal NUL
+//! and stmt-name NUL — it bakes NO format/count bytes. The param
+//! format-code block, `n_params`, the param values, and the
+//! `n_result_formats = 1, [Binary]` result trailer are emitted at
+//! frame-build time. The declared param formats are written straight
+//! from [`ParamsWriter::FORMATS`](crate::params::ParamsWriter::FORMATS)
+//! — the same const the encoder pins to `write_params` — so the
+//! declared format and the encoded value share one source and cannot
+//! drift. Decoding mirrors the choice: every column goes through
+//! [`Cell<BinaryFmt>`](crate::decode::Cell).
 
 use core::marker::PhantomData;
 
-use crate::decode::{Cell, DecodeError, FormatCode, TextFmt};
+use crate::decode::{BinaryFmt, Cell, DecodeError, FormatCode};
 use crate::params::ParamsWriter;
 
 mod sealed {
@@ -91,7 +97,7 @@ mod sealed {
 // the user».
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid prepared-query row type",
-    label = "valid row types are tuples `()` through `(T1, T2, ..., T16)` where each Ti implements `ColTextAt`",
+    label = "valid row types are tuples `()` through `(T1, T2, ..., T16)` where each Ti implements `ColCellAt`",
     note = "`RowDecode` is sealed — only the crate-internal tuple impls (arity 0..=16) over primitive cell types (`i16`, `i32`, `i64`, `u32`, `bool`, `&'static str`) can satisfy it; downstream `impl RowDecode for ...` is forbidden by construction"
 )]
 pub trait RowDecode: sealed::RowDecodeSealed + Sized {
@@ -130,11 +136,11 @@ pub trait RowDecode: sealed::RowDecodeSealed + Sized {
 // For each arity N we generate two trait impls:
 //   1. Static marker `(T1, ..., TN)` (e.g., `(i32, &'static str)`).
 //   2. The Row<'a> projection substitutes the static lifetime for `'a`
-//      using a helper trait `ColTextAt<'a>` that maps the marker
+//      using a helper trait `ColCellAt<'a>` that maps the marker
 //      type to its at-`'a` borrowing shape.
 //
-// `ColTextAt<'a>` is sealed crate-internal; only the primitive
-// `Cell<'a, TextFmt>`-impl types have it.
+// `ColCellAt<'a>` is sealed crate-internal; only the primitive
+// `Cell<'a, BinaryFmt>`-impl types have it.
 
 /// Crate-internal projection: marker type → at-`'a` decoded type.
 /// `i32 → i32` (no lifetime), `&'static str → &'a str`, etc.
@@ -142,17 +148,17 @@ pub trait RowDecode: sealed::RowDecodeSealed + Sized {
 // Structural diagnostic for the cell-type rejection path. Without
 // the attribute, a `prepared!("... ROW (i64, u64)")` or similar
 // with `u64` (banned — see `prepared_unsupported_types/numeric.rs`)
-// emits the bare «trait bound `u64: col_text_at_sealed::Sealed` is
+// emits the bare «trait bound `u64: col_cell_at_sealed::Sealed` is
 // not satisfied» message — the sealed module is private, so the
 // contributor cannot inspect the candidates. The attribute below
 // routes them to the supported list directly.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a supported prepared-query row cell type",
     label = "supported cell types are `i16`, `i32`, `i64`, `u32`, `bool`, and `&'static str` (rendered as `&'a str` at decode time)",
-    note = "`ColTextAt` is sealed — extend the supported set by adding a `col_text_at_primitive!` invocation in `prepared.rs`; downstream `impl ColTextAt for ...` is forbidden by construction"
+    note = "`ColCellAt` is sealed — extend the supported set by adding a `col_cell_at_primitive!` invocation in `prepared.rs`; downstream `impl ColCellAt for ...` is forbidden by construction"
 )]
-pub trait ColTextAt<'a>: col_text_at_sealed::Sealed {
-    /// The type decoded from text-format bytes at lifetime `'a`.
+pub trait ColCellAt<'a>: col_cell_at_sealed::Sealed {
+    /// The type decoded from binary-format column bytes at lifetime `'a`.
     type At;
     /// PG OID for this column type (drift-pinned against
     /// `Cell::OID` per impl).
@@ -161,40 +167,40 @@ pub trait ColTextAt<'a>: col_text_at_sealed::Sealed {
     fn decode_at(bytes: &'a [u8]) -> Result<Self::At, DecodeError>;
 }
 
-mod col_text_at_sealed {
+mod col_cell_at_sealed {
     /// Module-private seal — only this crate's primitive impls.
     pub trait Sealed {}
 }
 
 // Primitive markers: i16/i32/i64/u32/bool — At = Self, lifetime
 // transparent.
-macro_rules! col_text_at_primitive {
+macro_rules! col_cell_at_primitive {
     ($($t:ty),+ $(,)?) => {
         $(
-            impl col_text_at_sealed::Sealed for $t {}
-            impl<'a> ColTextAt<'a> for $t {
+            impl col_cell_at_sealed::Sealed for $t {}
+            impl<'a> ColCellAt<'a> for $t {
                 type At = $t;
-                const OID: u32 = <$t as Cell<'a, TextFmt>>::OID;
+                const OID: u32 = <$t as Cell<'a, BinaryFmt>>::OID;
                 #[inline]
                 fn decode_at(bytes: &'a [u8]) -> Result<Self::At, DecodeError> {
-                    <$t as Cell<'a, TextFmt>>::decode(bytes)
+                    <$t as Cell<'a, BinaryFmt>>::decode(bytes)
                 }
             }
         )+
     };
 }
 
-col_text_at_primitive!(i16, i32, i64, u32, bool);
+col_cell_at_primitive!(i16, i32, i64, u32, bool);
 
 // `&'static str` marker: At = &'a str, lifetime substituted at the
 // decode site.
-impl col_text_at_sealed::Sealed for &'static str {}
-impl<'a> ColTextAt<'a> for &'static str {
+impl col_cell_at_sealed::Sealed for &'static str {}
+impl<'a> ColCellAt<'a> for &'static str {
     type At = &'a str;
-    const OID: u32 = <&'static str as Cell<'static, TextFmt>>::OID;
+    const OID: u32 = <&'static str as Cell<'static, BinaryFmt>>::OID;
     #[inline]
     fn decode_at(bytes: &'a [u8]) -> Result<Self::At, DecodeError> {
-        <&'a str as Cell<'a, TextFmt>>::decode(bytes)
+        <&'a str as Cell<'a, BinaryFmt>>::decode(bytes)
     }
 }
 
@@ -220,18 +226,18 @@ macro_rules! row_decode_impl {
     ($count:literal, [$($t:ident : $idx:tt),+ $(,)?]) => {
         impl<$($t),+> sealed::RowDecodeSealed for ($($t,)+)
         where
-            $($t: for<'a> ColTextAt<'a>,)+
+            $($t: for<'a> ColCellAt<'a>,)+
         {}
 
         impl<$($t),+> RowDecode for ($($t,)+)
         where
-            $($t: for<'a> ColTextAt<'a>,)+
+            $($t: for<'a> ColCellAt<'a>,)+
         {
             const ARITY: u16 = $count;
             const OIDS: &'static [u32] = &[
-                $(<$t as ColTextAt<'static>>::OID,)+
+                $(<$t as ColCellAt<'static>>::OID,)+
             ];
-            type Row<'a> = ($(<$t as ColTextAt<'a>>::At,)+);
+            type Row<'a> = ($(<$t as ColCellAt<'a>>::At,)+);
             #[inline]
             fn decode<'a>(
                 bytes_per_col: &[Option<&'a [u8]>],
@@ -241,7 +247,7 @@ macro_rules! row_decode_impl {
                     $({
                         let slot = bytes_per_col.get($idx).copied().flatten()
                             .ok_or(DecodeError::NullInNonNullColumn)?;
-                        <$t as ColTextAt<'a>>::decode_at(slot)?
+                        <$t as ColCellAt<'a>>::decode_at(slot)?
                     },)+
                 ))
             }
@@ -356,11 +362,13 @@ where
     /// per-param OID list are all static). Emitted as
     /// `&'static [u8]` into the consumer crate's `.rodata`.
     pub(crate) parse_template: &'static [u8],
-    /// Pre-built Bind-frame prefix bytes. Covers `'B'`, length
-    /// placeholder, empty portal, stmt_name, compact format-code
-    /// block, and `n_params`. The runtime appends per-param values
-    /// (via `args.write_params(...)`) and the n_result_formats
-    /// trailer at execute time, then patches the length.
+    /// Pre-built Bind-frame prefix bytes — empty portal NUL + stmt_name
+    /// NUL ONLY. The runtime appends the param format-code block,
+    /// `n_params`, the per-param values, and the result-format trailer
+    /// at execute time (all from the argument tuple's `ParamsWriter`),
+    /// then patches the length. The prefix bakes NO format/count bytes:
+    /// the format declaration must come from the same source that
+    /// encodes the values.
     pub(crate) bind_execute_prefix: &'static [u8],
     /// `PhantomData<fn(Params) -> Row>` — invariant in both type
     /// parameters; zero size.
@@ -558,15 +566,17 @@ where
 // Static trailer bytes for the Bind frame.
 //
 // PG §55.2.2: after the per-param payload comes
-// `n_result_formats: u16_be`. v1 uses `0` (all-text default). A
-// future binary-result extension would conditionally expand this
-// to `1, [Binary]` for prepared queries electing binary.
+// `n_result_formats: u16_be` followed by that many format codes. The
+// macro path elects binary results for EVERY column via the compact
+// form (one code applied to all): `n_result_formats = 1, [Binary]`.
+// The synthetic `RowDesc` (all-binary) and `RowDecode`'s
+// `Cell<BinaryFmt>` decode are pinned to the same choice.
 // ═════════════════════════════════════════════════════════════════════
 
-/// `[0x00, 0x00]` — the static 2-byte `n_result_formats = 0`
-/// trailer for the Bind frame. Stable bytes; LLVM places this in
-/// `.rodata` and the action layer emits via `SendBytesStatic`.
-pub(crate) const BIND_N_RESULT_FORMATS_ZERO: [u8; 2] = [0, 0];
+/// `[0x00, 0x01, 0x00, 0x01]` — the static 4-byte
+/// `n_result_formats = 1, formats = [Binary]` trailer for the Bind
+/// frame. Stable bytes; LLVM places this in `.rodata`.
+pub(crate) const BIND_RESULT_FORMATS_ALL_BINARY: [u8; 4] = [0, 1, 0, 1];
 
 /// `'E', 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00` —
 /// the static 10-byte Execute frame for the empty-portal +
@@ -587,7 +597,7 @@ pub(crate) const EXECUTE_EMPTY_PORTAL_NO_LIMIT: [u8; 10] = [
 ];
 
 // Compile-time pins for the static byte arrays.
-const _: () = assert!(BIND_N_RESULT_FORMATS_ZERO.len() == 2);
+const _: () = assert!(BIND_RESULT_FORMATS_ALL_BINARY.len() == 4);
 const _: () = assert!(EXECUTE_EMPTY_PORTAL_NO_LIMIT.len() == 10);
 const _: () = assert!(EXECUTE_EMPTY_PORTAL_NO_LIMIT[0] == b'E');
 const _: () = assert!(EXECUTE_EMPTY_PORTAL_NO_LIMIT[4] == 9); // length field
@@ -632,15 +642,15 @@ mod tests {
         assert_eq!(<Sixteen as RowDecode>::OIDS.len(), 16);
     }
 
-    /// Decode forwards to per-element `Cell<TextFmt>`. The
+    /// Decode forwards to per-element `Cell<BinaryFmt>`. The
     /// GAT projection substitutes the input lifetime for `&'static str`.
     #[test]
-    fn row_decode_text_smoke() {
-        // PG text format for i32: ASCII decimal.
-        let col0: &[u8] = b"42";
+    fn row_decode_binary_smoke() {
+        // PG binary format for i32: 4-byte big-endian.
+        let col0: &[u8] = &42_i32.to_be_bytes();
         let col1: &[u8] = b"hello";
         let bytes: [Option<&[u8]>; 2] = [Some(col0), Some(col1)];
-        let formats: [FormatCode; 2] = [FormatCode::Text; 2];
+        let formats: [FormatCode; 2] = [FormatCode::Binary; 2];
         let result = <(i32, &'static str) as RowDecode>::decode(&bytes, &formats);
         assert!(matches!(result, Ok((42_i32, "hello"))));
     }
@@ -649,7 +659,7 @@ mod tests {
     #[test]
     fn row_decode_null_in_required_column_errors() {
         let bytes: [Option<&[u8]>; 1] = [None];
-        let formats: [FormatCode; 1] = [FormatCode::Text];
+        let formats: [FormatCode; 1] = [FormatCode::Binary];
         let result = <(i32,) as RowDecode>::decode(&bytes, &formats);
         assert!(matches!(result, Err(DecodeError::NullInNonNullColumn)));
     }
@@ -657,7 +667,7 @@ mod tests {
     /// Static byte trailers match expected layout.
     #[test]
     fn static_trailer_bytes_layout() {
-        assert_eq!(&BIND_N_RESULT_FORMATS_ZERO, &[0, 0]);
+        assert_eq!(&BIND_RESULT_FORMATS_ALL_BINARY, &[0, 1, 0, 1]);
         assert_eq!(
             &EXECUTE_EMPTY_PORTAL_NO_LIMIT,
             &[b'E', 0, 0, 0, 9, 0, 0, 0, 0, 0]

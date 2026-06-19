@@ -29,7 +29,7 @@ extern crate std;
 use bsql_postgres_proto::{
     prepared, FetchRows, PreparedQuery, ProtocolError, QueryKind, RowDecode, WriteBuf,
     wire::{
-        TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_PARSE_COMPLETE,
+        TAG_BIND, TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_PARSE_COMPLETE,
         TAG_READY_FOR_QUERY,
     },
 };
@@ -231,8 +231,8 @@ fn e7_collect_tuple_decodes_rows() {
     let mut server_bytes: std::vec::Vec<u8> = std::vec::Vec::new();
     server_bytes.extend_from_slice(&parse_complete_frame());
     server_bytes.extend_from_slice(&bind_complete_frame());
-    server_bytes.extend_from_slice(&data_row_frame(&[b"42", b"alice"]));
-    server_bytes.extend_from_slice(&data_row_frame(&[b"43", b"bob"]));
+    server_bytes.extend_from_slice(&data_row_frame(&[&42_i32.to_be_bytes(), b"alice"]));
+    server_bytes.extend_from_slice(&data_row_frame(&[&43_i32.to_be_bytes(), b"bob"]));
     server_bytes.extend_from_slice(&command_complete_frame(b"SELECT 2"));
     server_bytes.extend_from_slice(&rfq_frame(b'I'));
 
@@ -325,4 +325,196 @@ fn e9_execute_prepared_requires_idle() {
     let mut proto = fresh_active_via_trust_handshake();
     // Idle at construction → as_ready returns Some.
     assert!(proto.as_ready().is_some(), "fresh proto must be Idle");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// E10 — format-conjunction pin: the Bind frame's DECLARED param
+// format codes must equal `ParamsWriter::FORMATS` (the trait whose
+// `write_params` actually encodes the values), AND each param payload
+// must round-trip through THIS CRATE'S OWN decoder for the declared
+// format. This is the structural test that makes the old bug
+// (declared Text, encoded Binary) impossible to reintroduce silently:
+// the check parses the REAL outbound Bind frame, so canned bytes
+// cannot fool it. A drift would surface as either a FORMATS mismatch
+// or a failed round-trip.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Read a big-endian `u16` at `off` from `buf`, or `None` if short.
+fn be_u16(buf: &[u8], off: usize) -> Option<u16> {
+    let a = *buf.get(off)?;
+    let b = *buf.get(off.checked_add(1)?)?;
+    Some(u16::from_be_bytes([a, b]))
+}
+
+/// Read a big-endian `i16` at `off` from `buf`, or `None` if short.
+fn be_i16(buf: &[u8], off: usize) -> Option<i16> {
+    be_u16(buf, off).map(|v| i16::from_be_bytes(v.to_be_bytes()))
+}
+
+/// Read a big-endian `i32` at `off` from `buf`, or `None` if short.
+fn be_i32(buf: &[u8], off: usize) -> Option<i32> {
+    let a = *buf.get(off)?;
+    let b = *buf.get(off.checked_add(1)?)?;
+    let c = *buf.get(off.checked_add(2)?)?;
+    let d = *buf.get(off.checked_add(3)?)?;
+    Some(i32::from_be_bytes([a, b, c, d]))
+}
+
+/// Advance `off` past a NUL-terminated string in `buf`, returning the
+/// offset of the byte AFTER the NUL.
+fn skip_cstr(buf: &[u8], mut off: usize) -> Option<usize> {
+    loop {
+        let byte = *buf.get(off)?;
+        off = off.checked_add(1)?;
+        if byte == 0 {
+            return Some(off);
+        }
+    }
+}
+
+#[test]
+fn e10_bind_declared_formats_match_value_encoding() {
+    use bsql_postgres_proto::decode::{BinaryFmt, Cell, FormatCode, TextFmt};
+    use bsql_postgres_proto::params::ParamsWriter;
+
+    let mut proto = fresh_active_via_trust_handshake();
+    let mut wb = WriteBuf::new();
+    let (reply, _raw) = mint_reply::<QueryKind>(&mut proto);
+    let ready = match proto.as_ready() {
+        Some(g) => g,
+        None => panic!("expected Idle"),
+    };
+    let sent_param: i32 = 42;
+    let actions = match ready.execute_prepared(
+        &Q_SELECT_BY_ID,
+        (sent_param,),
+        FetchRows::All,
+        reply,
+        &mut wb,
+    ) {
+        Ok(a) => a,
+        Err(failure) => panic!("execute_prepared failed: {failure:?}"),
+    };
+
+    // Concatenate ALL outbound bytes, then locate the Bind frame.
+    let mut out: std::vec::Vec<u8> = std::vec::Vec::new();
+    for a in actions.as_slice() {
+        if let bsql_postgres_proto::Action::SendBytes(chunk) = a {
+            out.extend_from_slice(chunk);
+        }
+    }
+
+    // Walk frames: tag u8 | len i32_be (self-inclusive, covers len+body)
+    // | body. The body is `len - 4` bytes after the 5-byte header.
+    let mut i = 0usize;
+    let mut bind_body: Option<std::vec::Vec<u8>> = None;
+    while let (Some(&tag), Some(len_i32)) = (out.get(i), be_i32(&out, i.saturating_add(1))) {
+        let Ok(len) = usize::try_from(len_i32) else {
+            panic!("negative frame length");
+        };
+        let body_start = i.saturating_add(5);
+        let Some(body_len) = len.checked_sub(4) else {
+            panic!("frame length below header minimum");
+        };
+        let body_end = body_start.saturating_add(body_len);
+        let Some(body) = out.get(body_start..body_end) else {
+            panic!("frame body exceeds outbound bytes");
+        };
+        if tag == TAG_BIND.byte() {
+            bind_body = Some(body.to_vec());
+            break;
+        }
+        i = i.saturating_add(1).saturating_add(len);
+    }
+    let Some(body) = bind_body else {
+        panic!("no Bind frame in outbound bytes");
+    };
+
+    // Parse Bind body: portal NUL | stmt NUL | n_fmt u16 | codes |
+    // n_params u16 | (len i32, bytes)* | n_result_formats u16 | codes.
+    let Some(after_portal) = skip_cstr(&body, 0) else {
+        panic!("malformed portal name");
+    };
+    let Some(mut j) = skip_cstr(&body, after_portal) else {
+        panic!("malformed stmt name");
+    };
+    let Some(n_fmt) = be_u16(&body, j).map(usize::from) else {
+        panic!("missing n_format_codes");
+    };
+    j = j.saturating_add(2);
+    let mut declared: std::vec::Vec<FormatCode> = std::vec::Vec::new();
+    for _ in 0..n_fmt {
+        let Some(code) = be_i16(&body, j) else {
+            panic!("truncated format code");
+        };
+        j = j.saturating_add(2);
+        match FormatCode::try_from_wire_i16(code) {
+            Ok(fc) => declared.push(fc),
+            Err(raw) => panic!("illegal format code {raw}"),
+        }
+    }
+    let Some(n_params) = be_u16(&body, j).map(usize::from) else {
+        panic!("missing n_params");
+    };
+    j = j.saturating_add(2);
+
+    // PG compact form: a single code applies to all params. The full
+    // form has one code per param. Normalise to an effective per-param
+    // list either way.
+    let effective: std::vec::Vec<FormatCode> = if declared.len() == 1 {
+        std::iter::repeat_n(declared.first().copied(), n_params)
+            .flatten()
+            .collect()
+    } else {
+        declared.clone()
+    };
+
+    // PIN 1: declared formats == ParamsWriter::FORMATS (the same source
+    // that encoded the values). This is the conjunction that kills the
+    // declared-vs-encoded drift class.
+    assert_eq!(
+        effective.as_slice(),
+        <(i32,) as ParamsWriter>::FORMATS,
+        "Bind frame declares formats that differ from ParamsWriter::FORMATS",
+    );
+
+    // PIN 2: the param payload decodes via the crate's OWN decoder for
+    // the DECLARED format and round-trips the bound value. Under the old
+    // bug (declared Text, encoded Binary) this fails: the 4 binary bytes
+    // of 42 do not parse as the ASCII decimal text "42".
+    let Some(plen) = be_i32(&body, j) else {
+        panic!("missing param length");
+    };
+    j = j.saturating_add(4);
+    let Ok(plen_usize) = usize::try_from(plen) else {
+        panic!("unexpected NULL param");
+    };
+    let Some(pbytes) = body.get(j..j.saturating_add(plen_usize)) else {
+        panic!("param payload exceeds body");
+    };
+    j = j.saturating_add(plen_usize);
+    let Some(first_fmt) = effective.first().copied() else {
+        panic!("no effective param format");
+    };
+    let decoded = match first_fmt {
+        FormatCode::Binary => <i32 as Cell<BinaryFmt>>::decode(pbytes),
+        FormatCode::Text => <i32 as Cell<TextFmt>>::decode(pbytes),
+    };
+    assert_eq!(
+        decoded.ok(),
+        Some(sent_param),
+        "param payload does not round-trip under its DECLARED format",
+    );
+
+    // PIN 3: result-format trailer = n=1, [Binary] — matches the
+    // synthetic RowDesc + RowDecode binary regime.
+    let Some(n_res) = be_u16(&body, j) else {
+        panic!("missing n_result_formats");
+    };
+    j = j.saturating_add(2);
+    assert_eq!(n_res, 1, "expected compact result-format block");
+    let Some(res_code) = be_i16(&body, j) else {
+        panic!("missing result format code");
+    };
+    assert_eq!(res_code, 1, "macro path must elect binary results");
 }

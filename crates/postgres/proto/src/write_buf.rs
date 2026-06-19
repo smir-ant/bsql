@@ -199,7 +199,9 @@ pub const fn max_bind_message_size() -> usize {
         .saturating_add(2) // n_params
         .saturating_add(crate::params::MAX_PARAMS_ARITY.saturating_mul(4)) // per-param length prefixes
         .saturating_add(crate::params::MAX_PARAMS_DATA_TOTAL) // param data
-        .saturating_add(2) // n_result_formats (currently 0; field always present)
+        .saturating_add(4) // n_result_formats + 1 code: worst case is the
+        // prepared path's `1, [Binary]` (4 bytes); the non-macro path's
+        // `n_result_formats = 0` (2 bytes) fits within this.
 }
 
 /// Worst-case byte size of a PostgreSQL `Execute` (`'E'`) frame —

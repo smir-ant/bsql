@@ -547,6 +547,37 @@ impl Session {
         Ok(total)
     }
 
+    /// Drive the `prepared!` macro path: a single Parse, Bind, Execute,
+    /// Sync round trip from a content-addressed `PreparedQuery`. Both
+    /// params and results use PostgreSQL binary format; the param format
+    /// declaration is taken from the same `ParamsWriter` that encodes the
+    /// values, so the two cannot drift.
+    pub fn push_execute_prepared_macro<P, R>(
+        &mut self,
+        q: &'static bsql_postgres_proto::PreparedQuery<P, R>,
+        args: P,
+    ) -> Result<usize, DriverError>
+    where
+        P: bsql_postgres_proto::params::ParamsWriter + 'static,
+        R: bsql_postgres_proto::RowDecode + 'static,
+    {
+        let reply = self.proto.next_reply_id::<bsql_postgres_proto::reply_id::QueryKind>();
+        let guard = self.proto.as_ready().ok_or(DriverError::NotReady)?;
+        let actions = guard.execute_prepared(
+            q, args, bsql_postgres_proto::FetchRows::All, reply, &mut self.wb,
+        ).map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        let mut total = 0usize;
+        self.buf.clear();
+        for action in actions.as_slice() {
+            if let bsql_postgres_proto::Action::SendBytes(bytes) = action {
+                self.buf.extend_from_slice(bytes);
+                total += bytes.len();
+            }
+        }
+        self.wb.clear();
+        Ok(total)
+    }
+
     pub fn finish_prepare(&self, stmt_name: bsql_postgres_proto::StmtName) -> PreparedStatement {
         let row_desc = match self.proto.current_described_rows() {
             bsql_postgres_proto::DescribedRows::Rows(b) => Some(b.to_owned()),

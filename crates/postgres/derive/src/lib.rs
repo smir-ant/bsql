@@ -722,53 +722,35 @@ fn build_parse_template_bytes(
 }
 
 /// Build the byte array of the Bind frame's BODY prefix (everything
-/// after the `'B'` tag + length, before the per-param values), per
+/// after the `'B'` tag + length, before the format-code block), per
 /// PG §55.2.2:
 ///
 /// ```text
-/// portal_NUL | stmt_name_NUL | format-code-block | n_params_u16_be
+/// portal_NUL | stmt_name_NUL
 /// ```
 ///
 /// - `portal_NUL` is the empty-portal sentinel (`0x00`).
 /// - `stmt_name_NUL` is the macro's content-addressed stmt_name +
 ///   trailing NUL.
-/// - `format-code-block` uses PG's compact form: for N=0 send
-///   `n_format_codes=0`; for N≥1 send `n_format_codes=1, codes=[0]`
-///   (one Text code applied to all params, per PG §55.7 compact form).
-/// - `n_params_u16_be` is the parameter count.
 ///
-/// The runtime path is:
-///   1. Write `'B'` tag.
-///   2. Open `with_length_prefix` scope (allocates 4 bytes for the
-///      length, patches at scope exit).
-///   3. Write the prefix bytes returned by this function.
-///   4. Append per-param values via `args.write_params(...)`.
-///   5. Write the `n_result_formats = 0` trailer
-///      ([`crate::prepared::BIND_N_RESULT_FORMATS_ZERO`]).
-///   6. Close `with_length_prefix` — length patched automatically.
-///
-/// This split keeps the macro's emitted bytes parameter-agnostic and
-/// reuses the existing `with_length_prefix` infrastructure (no new
-/// `patch_u32_be_at` helper needed).
+/// The param format-code block, `n_params`, the per-param values, and
+/// the result-format trailer are ALL emitted at frame-build time from
+/// the `ParamsWriter` impl of the argument tuple (`FORMATS`, `COUNT`,
+/// `write_params`). The macro deliberately bakes NO format/count bytes:
+/// the declared param formats and the actual value encoding must come
+/// from ONE source so they cannot drift. Baking the format here would
+/// re-state the encoding choice in a second place; the only place that
+/// knows how a value is encoded is the encoder, so the encoder's trait
+/// is also the sole declarer of the format on the wire.
 fn build_bind_execute_prefix_bytes(
     stmt_name: &str,
-    params: &[extract::ParamSpec],
+    _params: &[extract::ParamSpec],
 ) -> alloc::vec::Vec<u8> {
     let stmt_name_bytes = stmt_name.as_bytes();
-    let n_params_u16 = u16::try_from(params.len()).unwrap_or(0);
     let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(32);
     out.push(0); // empty portal NUL
     out.extend_from_slice(stmt_name_bytes);
     out.push(0); // stmt_name NUL
-    // Compact format-code block per PG §55.7 + protocol.rs:4809:
-    if n_params_u16 == 0 {
-        out.extend_from_slice(&0u16.to_be_bytes()); // n_format_codes = 0
-    } else {
-        // n_format_codes = 1, formats[0] = 0 (Text).
-        out.extend_from_slice(&1u16.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
-    }
-    out.extend_from_slice(&n_params_u16.to_be_bytes());
     out
 }
 

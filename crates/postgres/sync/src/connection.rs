@@ -343,6 +343,26 @@ impl Connection {
         Ok(self.session.affected_rows_or_zero())
     }
 
+    /// Execute a `prepared!` macro query in one Parse + Bind + Execute +
+    /// Sync round trip. Params and results are uniformly binary, with the
+    /// declared param format derived from the same `ParamsWriter` that
+    /// encodes the values. Returns the affected-row count. Use for writes
+    /// (`INSERT`/`UPDATE`/`DELETE`) with no `RETURNING` rows.
+    pub fn execute_prepared_macro<P, R>(
+        &mut self,
+        q: &'static bsql_postgres_proto::PreparedQuery<P, R>,
+        params: P,
+    ) -> Result<u64, DriverError>
+    where
+        P: bsql_postgres_proto::params::ParamsWriter + 'static,
+        R: bsql_postgres_proto::RowDecode + 'static,
+    {
+        self.session.push_execute_prepared_macro(q, params)?;
+        self.stream.write_all(self.session.pending_bytes())?;
+        self.pump(None)?;
+        Ok(self.session.affected_rows_or_zero())
+    }
+
     pub fn query_params<P: bsql_postgres_proto::params::ParamsWriter>(
         &mut self, sql: &str, params: &P,
     ) -> Result<QueryResult, DriverError> {

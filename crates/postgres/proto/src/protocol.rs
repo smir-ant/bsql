@@ -8869,9 +8869,11 @@ pub(crate) fn compute_push_bind_prepared_idle_only<'sql, P, R>(
     // Step 1: stage the pre-baked Parse template.
     let parse_template: &'sql [u8] = q.parse_template;
     // Step 2: build the Bind frame in-place — copy the static prefix
-    // into `reserved`, append per-param values via ParamsWriter,
-    // append the static `n_result_formats = 0` trailer, and patch
-    // the length prefix.
+    // (portal + stmt NUL only) into `reserved`, append the param
+    // format-code block + n_params (from `ParamsWriter::FORMATS`/COUNT)
+    // and per-param values (from the same `ParamsWriter`), append the
+    // static `n_result_formats = 1, [Binary]` trailer, and patch the
+    // length prefix.
     let bind_range_result = build_bind_prepared_frame(reserved, q.bind_execute_prefix, &args);
     let bind_range = try_builder!(bind_range_result, setter, reply, staged);
 
@@ -8880,10 +8882,11 @@ pub(crate) fn compute_push_bind_prepared_idle_only<'sql, P, R>(
     let post_install = if q.row_oids.is_empty() {
         crate::push_command::BindExecutePostInstall::Dml { reply }
     } else {
-        // Synthesise a RowDesc from `q.row_oids` (all-text format).
-        // The macro's row_oids list is small (≤ 16) and bounded by
-        // MAX_ROW_COLUMNS = 1600; the construction is infallible at
-        // runtime.
+        // Synthesise a RowDesc from `q.row_oids` (all-binary format,
+        // matching the `n_result_formats = 1, [Binary]` the Bind frame
+        // declares). The macro's row_oids list is small (≤ 16) and
+        // bounded by MAX_ROW_COLUMNS = 1600; the construction is
+        // infallible at runtime.
         let row_desc = match build_synthetic_row_desc(q.row_oids) {
             Ok(desc) => desc,
             Err(cause) => {
@@ -8936,11 +8939,22 @@ pub(crate) fn compute_push_bind_prepared_idle_only<'sql, P, R>(
 /// 1. `'B'` tag (1 byte).
 /// 2. Length prefix (4 bytes, BE, self-inclusive) — patched by
 ///    `with_length_prefix`.
-/// 3. Macro-baked `prefix` bytes (portal NUL + stmt_name NUL +
-///    compact format-code block + n_params).
-/// 4. Per-param values from `args.write_params(...)`.
-/// 5. `n_result_formats = 0` trailer (2 bytes,
-///    [`crate::prepared::BIND_N_RESULT_FORMATS_ZERO`]).
+/// 3. Macro-baked `prefix` bytes (portal NUL + stmt_name NUL ONLY —
+///    the macro bakes NO format/count bytes).
+/// 4. Param format-code block (`n_format_codes` + per-param codes) and
+///    `n_params`, both derived from `P: ParamsWriter`. The format codes
+///    are written by reading `P::FORMATS` — the SAME `&'static
+///    [FormatCode]` const that the encoder macro pins to `write_params`.
+///    The bytes on the wire that DECLARE each param's format are
+///    therefore produced from the one array that also dictates how
+///    `write_params` encodes the value. A declared-vs-encoded mismatch
+///    is unrepresentable: there is no second statement of the format to
+///    drift against.
+/// 5. Per-param values from `args.write_params(...)`.
+/// 6. `n_result_formats = 1, [Binary]` trailer (4 bytes,
+///    [`crate::prepared::BIND_RESULT_FORMATS_ALL_BINARY`]) — the macro
+///    path elects binary results for every column; the synthetic
+///    `RowDesc` and `RowDecode`'s binary decode match this choice.
 fn build_bind_prepared_frame<P>(
     reserved: &mut crate::write_buf::BrandedWriteReserved<'_>,
     prefix: &[u8],
@@ -8957,12 +8971,25 @@ where
     let mut params_err: Option<ProtocolError> = None;
     reserved.with_length_prefix(|w| {
         w.push_bytes(prefix)?;
+        // Param format-code block in PG §55.7 full form: one code per
+        // parameter, emitted straight from `P::FORMATS`. This is the
+        // single source of truth — the encoder macro builds `FORMATS`
+        // and `write_params` from the same `$t` repetition, so the
+        // declared formats and the encoded values cannot disagree.
+        // `n_format_codes` equals `P::COUNT` (== `P::FORMATS.len()`,
+        // const-asserted in `params.rs`). For N = 0 this writes
+        // `n_format_codes = 0` and no codes — PG's all-default form.
+        w.push_u16_be(P::COUNT)?;
+        for fc in P::FORMATS {
+            w.push_i16_be(fc.as_wire_i16())?;
+        }
+        w.push_u16_be(P::COUNT)?;
         if args.write_params(w.as_write_buf_mut()).is_err() {
             params_err = Some(ProtocolError::InternalCrateBug {
                 locus: crate::error::CrateBugLocus::ParamsWriterOverflow,
             });
         }
-        w.push_bytes(&crate::prepared::BIND_N_RESULT_FORMATS_ZERO)?;
+        w.push_bytes(&crate::prepared::BIND_RESULT_FORMATS_ALL_BINARY)?;
         Ok(())
     })?;
     if let Some(err) = params_err {
@@ -8973,7 +9000,8 @@ where
 
 /// Build a synthetic [`crate::decode::RowDesc`] from a static OID
 /// list for the `prepared!` macro's path. All columns use
-/// [`FormatCode::Text`] (text format in v1).
+/// [`crate::decode::FormatCode::Binary`] — matching the
+/// `BIND_RESULT_FORMATS_ALL_BINARY` trailer the Bind frame declares.
 ///
 /// Bounded above by [`crate::decode::MAX_ROW_COLUMNS`] = 32. The
 /// macro's RowDecode trait impls cap arity at 16 < 32, so this
@@ -8987,7 +9015,7 @@ fn build_synthetic_row_desc(
     // (parses wire bytes). For the macro path we synthesise directly
     // via a helper on `RowDesc` itself — exposed `pub(crate)` for
     // the prepared module to use.
-    crate::decode::RowDesc::from_static_oids_text_format(oids)
+    crate::decode::RowDesc::from_static_oids_binary_format(oids)
 }
 
 // No `is_busy_in_flight(&ProtoState) -> bool` helper. A naive

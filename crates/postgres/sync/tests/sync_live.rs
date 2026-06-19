@@ -441,3 +441,75 @@ fn connection_resilience_marathon() {
 
     c.close().expect("close");
 }
+
+// ═══════════════════════════════════════════════════════════
+// prepared! macro path — binary-uniform Bind frame.
+//
+// REGRESSION GATE: before the binary-uniform fix, the macro path
+// declared param format = Text in the Bind frame while encoding the
+// value as binary. PostgreSQL then rejected any non-string param
+// (e.g. an i32 sent as 4 binary bytes interpreted as ASCII decimal)
+// with `invalid input syntax for type integer`. This test prepares an
+// INSERT carrying i32 / i64 / bool params through `execute_prepared_macro`
+// and asserts: (1) the write succeeds, (2) the affected-row count is
+// correct, (3) the stored values read back exactly. Post-fix it passes;
+// pre-fix the INSERT errors at the server.
+// ═══════════════════════════════════════════════════════════
+
+#[test]
+#[ignore = "requires local PG"]
+fn prepared_macro_insert_binary_params_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    // A `prepared!` query is content-addressed and fixed at compile
+    // time, so its table name cannot carry the per-process suffix. To
+    // keep concurrent live runs isolated WITHOUT a shared object name,
+    // create a process-unique SCHEMA and point `search_path` at it: the
+    // fixed UNQUALIFIED table name in the prepared SQL resolves to this
+    // session's private schema. Object names stay unique per process.
+    let schema = format!("bsql_s3_prep_{}", std::process::id());
+
+    c.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).expect("drop schema pre");
+    c.execute(&format!("CREATE SCHEMA {schema}")).expect("create schema");
+    c.execute(&format!("SET search_path TO {schema}")).expect("set search_path");
+
+    c.execute(
+        "CREATE TABLE prep_target (n int4 NOT NULL, big int8 NOT NULL, flag bool NOT NULL)",
+    )
+    .expect("create table");
+
+    // Fixed, content-addressed prepared INSERT. Params: i32, i64, bool.
+    // R = () — no RETURNING, so this routes through the DML post-install
+    // and yields an affected-row count. The unqualified `prep_target`
+    // resolves via `search_path` to this process's schema.
+    const Q_INSERT: bsql_postgres_proto::PreparedQuery<(i32, i64, bool), ()> =
+        bsql_postgres_proto::prepared!(
+            "INSERT INTO prep_target (n, big, flag) \
+             VALUES ($1::int4, $2::int8, $3::bool)"
+        );
+
+    let sent_n: i32 = 42;
+    let sent_big: i64 = 9_000_000_000;
+    let sent_flag: bool = true;
+
+    // EXECUTE via the macro path — the exact wire path that carried the
+    // declared-Text / encoded-Binary bug. Pre-fix this errors at the
+    // server with `invalid input syntax for type integer`.
+    let affected = c
+        .execute_prepared_macro(&Q_INSERT, (sent_n, sent_big, sent_flag))
+        .expect("prepared macro INSERT must succeed (binary-uniform Bind)");
+    assert_eq!(affected, 1, "INSERT must affect exactly one row");
+
+    // Read the row back via the simple-query text path to confirm the
+    // server actually stored the binary-encoded values correctly.
+    let r = c.query("SELECT n, big, flag FROM prep_target").expect("read-back query");
+    assert_eq!(r.rows.len(), 1, "exactly one row stored");
+    assert_eq!(r.rows[0].get_i32(0), Some(sent_n), "i32 param stored correctly");
+    assert_eq!(r.rows[0].get_i64(1), Some(sent_big), "i64 param stored correctly");
+    assert_eq!(r.rows[0].get_bool(2), Some(sent_flag), "bool param stored correctly");
+
+    // Cleanup: DROP IF EXISTS at end (schema CASCADE removes the table).
+    c.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).expect("drop schema post");
+
+    c.close().expect("close");
+}

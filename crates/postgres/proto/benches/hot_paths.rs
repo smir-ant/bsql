@@ -1475,9 +1475,10 @@ fn bench_prepared_query_push(c: &mut Criterion) {
 // same input shape (one i32 param, 2-column schema, fetch-all,
 // push-only fresh PgProtocol per iter) but routes through the
 // runtime `BindExecute` path that constructs the Bind frame body
-// (portal NUL + stmt_name NUL + compact format-code block +
-// n_params header + per-param values) on every call. The prepared
-// path bakes that prefix at macro-expand time.
+// (portal NUL + stmt_name NUL + format-code block + n_params header
+// + per-param values) on every call. The prepared path bakes the
+// portal + stmt_name prefix at macro-expand time; it emits the
+// format-code block + n_params from `ParamsWriter` at push time.
 //
 // Delta interpretation:
 //   prepared `execute_prepared` time − this bench's time

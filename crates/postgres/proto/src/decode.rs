@@ -210,8 +210,11 @@ impl RowDesc {
         })
     }
 
-    /// Synthesise from a static OID list with all-text format codes.
-    pub(crate) fn from_static_oids_text_format(
+    /// Synthesise from a static OID list with all-binary format codes
+    /// — the `prepared!` macro path declares `n_result_formats = 1,
+    /// [Binary]` in its Bind frame, so the synthetic descriptor must
+    /// say Binary for every column.
+    pub(crate) fn from_static_oids_binary_format(
         oids: &[u32],
     ) -> Result<Self, crate::error::ProtocolError> {
         let n = oids.len();
@@ -230,6 +233,15 @@ impl RowDesc {
         for (i, &oid) in oids.iter().enumerate() {
             if let Some(slot) = v.get_mut(1usize.saturating_add(i)) {
                 *slot = oid;
+            }
+        }
+        // All-binary format bitmap: bit i = 1 for every column.
+        let bits_start = 1usize.saturating_add(n);
+        for i in 0..n {
+            let word_idx = i >> 5;
+            let bit_idx = i & 31;
+            if let Some(word) = v.get_mut(bits_start.saturating_add(word_idx)) {
+                *word |= 1u32 << bit_idx;
             }
         }
         Ok(Self {
@@ -4085,15 +4097,15 @@ mod rowdesc_box_tests {
     }
 
     #[test]
-    fn static_oids_all_text() {
+    fn static_oids_all_binary() {
         let oids: &[u32] = &[23, 25, 16];
-        let rd = RowDesc::from_static_oids_text_format(oids);
+        let rd = RowDesc::from_static_oids_binary_format(oids);
         assert!(rd.is_ok());
         let rd = match rd { Ok(r) => r, Err(_) => return };
         assert_eq!(rd.len(), 3);
-        assert!(matches!(rd.format_code(0), Some(FormatCode::Text)));
-        assert!(matches!(rd.format_code(1), Some(FormatCode::Text)));
-        assert!(matches!(rd.format_code(2), Some(FormatCode::Text)));
+        assert!(matches!(rd.format_code(0), Some(FormatCode::Binary)));
+        assert!(matches!(rd.format_code(1), Some(FormatCode::Binary)));
+        assert!(matches!(rd.format_code(2), Some(FormatCode::Binary)));
     }
 }
 
