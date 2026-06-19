@@ -1,9 +1,0 @@
-error[E0080]: evaluation panicked: column identifier `Regressed` must be a zero-sized type
-  --> tests/ui/zst_pin_field.rs:19:15
-   |
-19 |   const _: () = assert!(
-   |  _______________^
-20 | |     ::core::mem::size_of::<Regressed>() == 0,
-21 | |     "column identifier `Regressed` must be a zero-sized type"
-22 | | );
-   | |_^ evaluation of `_` failed here

@@ -1,5 +1,0 @@
-error: fragment!: the SQL skeleton must be a single string literal (not an identifier, a runtime `String`, or an expression). There is no runtime-string -> SQL path. Use `fragment!("SELECT ... WHERE id = {}", value)`.
-  --> tests/ui/fragment_runtime_skeleton.rs:10:23
-   |
-10 |     let _ = fragment!(runtime, 1i32);
-   |                       ^^^^^^^

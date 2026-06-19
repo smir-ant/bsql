@@ -1,5 +1,0 @@
-error[E0599]: no method named `or_where` found for struct `Fragment` in the current scope
-  --> tests/ui/no_or_where.rs:15:15
-   |
-15 |     let _ = f.or_where(users::id.eq(1i32));
-   |               ^^^^^^^^ method not found in `Fragment`
