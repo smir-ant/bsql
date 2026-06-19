@@ -15,39 +15,49 @@ macros ethos, verification strategy, and roadmap live in one place:
 
 ## Current state
 
-Three crates live in the workspace:
+A theoretical-limit rebuild is executing a master plan on the `rebuild`
+branch (see `reforge.md` and the in-repo plan). The workspace is:
 
-| Crate | Description | Status |
-|-------|-------------|--------|
-| [`bsql-postgres-proto`](crates/bsql-pg-proto/) | Sans-IO PG wire protocol state machine (`no_std + alloc`, `#![forbid(unsafe_code)]`) | Feature-complete for v1 |
-| [`bsql-pg-proto-derive`](crates/bsql-pg-proto-derive/) | Proc-macro pair (`#[derive(Pristine)]`) | Shipped |
-| [`bsql-postgres`](crates/bsql-postgres/) | Async driver (tokio + rustls) | Alpha — [README](crates/postgres/driver/README.md) |
+| Crate | Path | Description |
+|-------|------|-------------|
+| `bsql` | [`crates/bsql/`](crates/bsql/) | Umbrella facade: re-exports `bsql::pg`, `bsql::pg_sync`, `bsql::sqlite` |
+| `bsql-postgres-proto` | [`crates/postgres/proto/`](crates/postgres/proto/) | Sans-IO PG wire protocol state machine (`no_std + alloc`, `#![forbid(unsafe_code)]`) |
+| `bsql-postgres-core` | [`crates/postgres/core/`](crates/postgres/core/) | Shared `Session` + types; the `pump_step → PumpAction` loop both drivers share |
+| `bsql-postgres-async` | [`crates/postgres/async/`](crates/postgres/async/) | Async driver (tokio + rustls) — [README](crates/postgres/async/README.md) |
+| `bsql-postgres-sync` | [`crates/postgres/sync/`](crates/postgres/sync/) | Sync driver (`std::net`, no tokio) |
+| `bsql-postgres-derive` | [`crates/postgres/derive/`](crates/postgres/derive/) | Proc-macro for `prepared!` statements |
+| `bsql-sqlite` | [`crates/sqlite/driver/`](crates/sqlite/driver/) | Embedded SQLite driver |
 
-### bsql-postgres-proto highlights
-- PgProtocol<Active>: 296 B per connection
-- push_command/ping: 46 ns
-- SimpleQuery, Extended Query, COPY, LISTEN/NOTIFY, Describe, Close, Terminate
-- SCRAM-SHA-256 + MD5 + Cleartext + Trust authentication
-- SSL negotiation typestate (0 B runtime cost)
-- No fixed column/param caps (exact-size Box<[u32]>)
-- 673 tests, bench-verified 0 regressions
+### Tests
 
-### bsql-postgres highlights
-- Connect (Trust + SCRAM + TLS via rustls)
-- query / query_one / query_opt / simple_query / execute
-- Typed Row access: `row.get::<i32>(0)`
-- DSN parsing + env var config
-- 29 tests live-tested against real PostgreSQL
+Measured @ branch `rebuild` (commit 8eb9276), reproducible by grep:
 
-The crate is `no_std`, forbids `unsafe`, runs the full clippy forbid
-bundle, and passes a hand-rolled 100 000-iteration randomized fuzz of
-the frame-header parser. `cargo test -p bsql-pg-proto` runs 19 tests
-in < 50 ms.
+- 861 `#[test]` / `#[tokio::test]` functions across the workspace.
+- 57 of those are `#[ignore]` live tests that need a local PostgreSQL
+  (18 async via `--test sq_live`, 19 sync via `--test sync_live`).
 
-Remaining Phase 1 sub-phases (1b–1f) land
-`bsql-backend`, SCRAM-SHA-256, the full command set, streaming,
-COPY / LISTEN / NOTIFY, and the async `run_io` wrapper — in that
-order.
+```bash
+cargo check --workspace                                            # full build
+cargo test -p bsql-sqlite                                          # SQLite (no PG needed)
+cargo test -p bsql-postgres-async --test sq_live   -- --ignored   # async PG (needs local PG)
+cargo test -p bsql-postgres-sync  --test sync_live -- --ignored   # sync PG (needs local PG)
+```
+
+Safety floor: every driver crate is `#![forbid(unsafe_code)]` and runs
+the clippy forbid bundle (`unwrap_used` / `expect_used` denied).
+
+## Direction
+
+- **Query API = pure SQL text.** SQL lives as text in a future
+  compile-checked `query!` macro, validated at `cargo build` against the
+  schema replayed from migration DDL — typos, type mismatches, and
+  forgotten nullability become compile errors. There are no method
+  combinators: the diesel-style Fragment/Col builder was tried and
+  reverted. SQL is a language, not an AST-builder.
+- **Wire format = binary-uniform.** `ParamsWriter` is the sole format
+  authority; `prepared!` params are binary-encoded uniformly.
+- **No CI.** Gates run locally via `cargo` plus a planned `devgates`
+  crate. There are no GitHub Actions and none are planned.
 
 ## One-line goal
 

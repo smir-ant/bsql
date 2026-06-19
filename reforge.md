@@ -29,6 +29,22 @@
 
 **Live decision tracker.** Файл `deferred.md` в корне репозитория — **живой реестр** каждого отложенного variant'а, tier-downgrade'а и interim-решения. Когда читаешь секцию `reforge.md` про конкретный инвариант или компонент, **перекрёстно сверяйся с `deferred.md`** на предмет актуального статуса. Если документы расходятся — **`deferred.md` побеждает**: он источник правды в реальном времени, `reforge.md` — план на бумаге. Особенно смотри секцию 7 `deferred.md` («Audit-driven architectural commits») — там жёсткие обязательства которые конкретизируют или пересматривают пункты этого документа.
 
+> **ПРИМЕЧАНИЕ:** `deferred.md` **заморожен** на последней записи (DEF-284, 2026-05-20) и **больше не является живой очередью работ** — он ссылается на до-rebuild имена крейтов (`bsql-pg-proto`, `bsql-driver-*`). Живая очередь теперь — мастер-план rebuild'а (см. course-correction ниже). `deferred.md` остаётся как архив отложенных решений и unstable-Rust блокеров.
+
+---
+
+## Course-correction (2026-06, ветка `rebuild`)
+
+Этот блок фиксирует решения, которые **уточняют или отменяют** части ниже. Где блок и старый раздел конфликтуют — **побеждает этот блок** (он новее и code-verified). Старые разделы помечены инлайн как `SUPERSEDED:` вместо удаления — история сохраняется.
+
+Идёт перезапуск к теоретическому пределу (safety + zero-cost + maintainability), исполняется мастер-план rebuild. Load-bearing решения:
+
+- **(a) Query API = чистый SQL-текст.** Финальный API — SQL как текст внутри compile-checked макроса `query!`, валидируемого на этапе сборки против схемы, воспроизведённой из migration DDL. **Method-combinator парадигма (diesel-стиль Fragment/Col `.filter().eq()`) была реализована и ОТКАЧЕНА** — владелец её отверг. Это согласуется с §2 («Не query builder», «Не runtime SQL constructor»); §2 остаётся в силе. Не вводить runtime SQL-builder заново.
+- **(b) Wire-формат binary-uniform.** Путь `prepared!` кодирует параметры в binary единообразно; **`ParamsWriter` — единственный авторитет формата** (нет per-call text/binary дрейфа).
+- **(c) НЕТ CI.** GitHub Actions нет и не будет — мандат владельца. Гейты гоняются локально (`cargo` + планируемый крейт `devgates`). `SUPERSEDED:` все CI-предписания ниже (§95–§98: nightly CI, cargo-deny CI, differential CI) заменяются локальными devgates-гейтами.
+- **(d) Фактический layout крейтов** (измерено @ `rebuild`): `crates/{bsql, postgres/{proto,core,async,sync,derive}, sqlite/driver}`; пакеты `bsql`, `bsql-postgres-{proto,core,async,sync,derive}`, `bsql-sqlite`. Это **SUPERSEDES** stale граф §6 (`bsql-macros` / `bsql-arena` / `bsql-core` / `bsql-backend` / `bsql-pg-proto` / `bsql-driver-*` — те имена не существуют в коде).
+- **(e) Тулчейн запинен** на rustc 1.96.0 (`rust-toolchain.toml`), не «1.95 stable» как в §5.1 — trybuild/clippy goldens фиксируют диагностику дословно.
+
 ---
 
 # Часть I — Конституция
@@ -342,6 +358,8 @@ Tier-1 щит — не монолит. У него есть **узкие швы*
 
 ### §5.1. MSRV: 1.95 stable
 
+> **SUPERSEDED (course-correction e):** тулчейн запинен на **rustc 1.96.0** (`rust-toolchain.toml`, channel = "1.96.0"); «в CI» неприменимо — CI нет.
+
 Фиксируется в `Cargo.toml` через `rust-version`, в CI через `rust-toolchain.toml`.
 
 Latest stable выбран намеренно: CREDO §0 требует использовать **все доступные compile-time механизмы**. Старая MSRV означает отказ от инструментов:
@@ -442,6 +460,8 @@ Features stable в MSRV 1.95 (или earlier) которые bsql активно
 **MSRV bump policy:** поднимается **сразу** когда stable Rust release дает feature, которая closes a tier-1 gap или снимает workaround в codebase. Не consensus-driven, не «wait for ecosystem» — CREDO §0 takes priority over backward compatibility breadth.
 
 ## §6. Crate graph
+
+> **SUPERSEDED (course-correction d):** имена крейтов ниже (`bsql-macros`, `bsql-arena`, `bsql-core`, `bsql-backend`, `bsql-pg-proto`, `bsql-driver-postgres`, `bsql-driver-sqlite`) — план на бумаге и **в коде НЕ существуют**. Фактический layout @ `rebuild`: `crates/{bsql, postgres/{proto,core,async,sync,derive}, sqlite/driver}`; пакеты `bsql`, `bsql-postgres-{proto,core,async,sync,derive}`, `bsql-sqlite`. Async и sync — это `postgres/async` + `postgres/sync` поверх общего `postgres/core` (`pump_step → PumpAction`), а не `bsql-driver-*-sync`. Граф ниже оставлен как роль-карта (facade → macros → core → backend → per-backend), но имена читать через эту поправку.
 
 ### §6.1. Overview
 
@@ -3376,6 +3396,8 @@ Mutates operators (`+` → `-`, `<` → `>`, etc.) and drops statements. Runs te
 Policy: **kill rate ≥ 85%** для wire-path crates. PR breaking threshold — block.
 
 ## §95. cargo-deny / cargo-audit / cargo-vet
+
+> **SUPERSEDED (course-correction c):** §95–§98 предписывают CI (nightly CI, cargo-deny CI gate, differential nightly). **CI в проекте нет и не будет** — мандат владельца. Эти проверки гоняются локально (`cargo` + планируемый крейт `devgates`). Читать «CI gate» / «nightly CI» ниже как «локальный devgates-гейт».
 
 - **cargo-deny** — CI gate. Policy: RustSec advisory clean, whitelist licenses, no duplicate versions. Config in `deny.toml`.
 - **cargo-audit** — subset (CVE-only); redundant с `cargo-deny`, не используется separately.

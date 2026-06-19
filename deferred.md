@@ -1,5 +1,16 @@
 # Deferred Items Registry
 
+> **FROZEN & SUPERSEDED (2026-06, branch `rebuild`).** This file is
+> **no longer the live work queue.** Its last entry is DEF-284
+> (2026-05-20), and it predates the theoretical-limit rebuild — it
+> cites pre-rebuild crate paths (`bsql-pg-proto`, `bsql-driver-*`,
+> `bsql-backend`, `bsql-arena`) that **do not exist** in the current
+> code (actual layout: `crates/{bsql, postgres/{proto,core,async,sync,
+> derive}, sqlite/driver}`). The live work queue is now the rebuild
+> master plan (see `reforge.md` course-correction). This registry is
+> kept as an **archive** of deferred decisions and unstable-Rust
+> blockers; do not add new DEF entries here. History is preserved.
+
 Active registry of **OPEN work items**, unstable-Rust blockers, and
 measurement-rejected decisions. For full per-DEF history see
 `git log` — commit messages capture the detail.
