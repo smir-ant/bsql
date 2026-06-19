@@ -1,4 +1,4 @@
-use bsql_postgres_proto::{PgProtocol, WriteBuf, FeedEvent};
+use bsql_postgres_proto::{Action, FeedEvent, PgProtocol, Reply, WriteBuf};
 
 #[test]
 fn select_1_offline_via_advance_then_iter_rows() {
@@ -17,7 +17,21 @@ fn select_1_offline_via_advance_then_iter_rows() {
     resp.extend_from_slice(&[b'K', 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0, 2]);
     resp.extend_from_slice(&[b'Z', 0, 0, 0, 5, b'I']);
     connecting.feed_inbound(&resp).unwrap();
-    connecting.feed_bytes(&[], &mut wb);
+    // The empty-input drain completes the handshake: it emits EXACTLY ONE
+    // action, the StartupComplete delivery (the precondition `into_active`
+    // checks). The single-element slice pattern enforces both at once —
+    // length 1 AND the variant — so a drain that regressed to emit any
+    // spurious extra action would fail here. This also honours
+    // `feed_bytes`'s must-use contract and proves the terminal transition
+    // actually fired.
+    let drain = connecting.feed_bytes(&[], &mut wb);
+    assert!(
+        matches!(
+            drain.as_slice(),
+            [Action::DeliverReply { value: Reply::StartupComplete(_), .. }]
+        ),
+        "handshake drain must emit exactly one action: StartupComplete delivery"
+    );
     let mut active = match connecting.into_active() {
         Ok(a) => a, Err(_) => panic!("into_active failed")
     };
@@ -91,10 +105,10 @@ fn select_1_offline_via_advance_then_iter_rows() {
                         eprintln!("  col_next[{i}]: {ev:?}");
                         match ev {
                             bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
-                            bsql_postgres_proto::ColEvent::NeedMore => { continue;
-                                eprintln!("  NeedMore inside iter_rows!");
-                                return;
-                            }
+                            // Transient: the terminal frames are already buffered,
+                            // so the next `col_next` resolves to `EndQuery` — keep
+                            // walking rather than bailing.
+                            bsql_postgres_proto::ColEvent::NeedMore => continue,
                             _ => {}
                         }
                     }
@@ -113,10 +127,10 @@ fn select_1_offline_via_advance_then_iter_rows() {
                             eprintln!("    col_next[{i}]: {ev:?}");
                             match ev {
                                 bsql_postgres_proto::ColEvent::EndQuery { .. } => return,
-                                bsql_postgres_proto::ColEvent::NeedMore => { continue;
-                                    eprintln!("    NeedMore!");
-                                    return;
-                                }
+                                // Transient: the terminal frames are already buffered,
+                                // so the next `col_next` resolves to `EndQuery` — keep
+                                // walking rather than bailing.
+                                bsql_postgres_proto::ColEvent::NeedMore => continue,
                                 _ => {}
                             }
                         }

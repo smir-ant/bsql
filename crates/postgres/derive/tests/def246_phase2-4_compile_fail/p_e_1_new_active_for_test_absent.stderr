@@ -1,8 +1,8 @@
-error[E0599]: no function or associated item named `new_active_for_test` found for struct `PgProtocol<P>` in the current scope
+error[E0599]: no associated function or constant named `new_active_for_test` found for struct `PgProtocol<P>` in the current scope
   --> tests/def246_phase2-4_compile_fail/p_e_1_new_active_for_test_absent.rs:12:30
    |
 12 |     let _proto = PgProtocol::new_active_for_test();
-   |                              ^^^^^^^^^^^^^^^^^^^ function or associated item not found in `PgProtocol<_>`
+   |                              ^^^^^^^^^^^^^^^^^^^ associated function or constant not found in `PgProtocol<_>`
    |
 note: if you're trying to build a new `PgProtocol<_>`, consider using `protocol::_proto_init_leaf::<impl PgProtocol<DisconnectedPhase>>::new` which returns `PgProtocol<DisconnectedPhase>`
   --> $WORKSPACE/crates/postgres/proto/src/protocol.rs

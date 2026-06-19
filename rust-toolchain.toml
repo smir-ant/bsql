@@ -1,0 +1,10 @@
+# Pins the exact compiler every build, clippy gate, and trybuild golden
+# is verified against. The goldens capture rustc diagnostic text verbatim,
+# so the patch version is fixed (not "stable" or "1.96") to keep them
+# deterministic. `minimal` + an explicit `clippy` makes the installed
+# toolchain identical on every machine regardless of the ambient rustup
+# profile; clippy is required because the workspace lint gate runs it.
+[toolchain]
+channel = "1.96.0"
+components = ["clippy"]
+profile = "minimal"
