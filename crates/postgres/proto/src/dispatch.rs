@@ -29,6 +29,13 @@
 //! `InboundTagClass::Unknown` catch-all branch add indirection LLVM
 //! cannot fold out. Hypothesis falsified.
 //!
+//! Re-confirmed deterministically (no timing run needed) by a normalized
+//! post-LTO codegen diff of the linked release binary: the dense-enum
+//! form emits the SAME jump table as the byte switch plus one extra
+//! dependent load (the classify-byte read), and `dispatch` is entered
+//! several times per query — the delta sits below the alloc/asm gate's
+//! resolution. Codegen evidence, independent of the host's timing noise.
+//!
 //! If you are tempted to re-open this: first produce a NEW criterion
 //! measurement refuting the rejection result (different machine,
 //! different LLVM, or architectural change in the dispatch loop) —
