@@ -8,9 +8,14 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 bsql-postgres-proto = { path = "../proto" }
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
-webpki-roots = "0.26"
-zeroize = { version = "1", default-features = false, features = ["zeroize_derive", "alloc"] }
+rustls = { workspace = true }
+# `webpki-roots` 1.0 ships the Mozilla CA root bundle as the
+# `TLS_SERVER_ROOTS` slice consumed in `src/ssl.rs`. The 0.26 line is a
+# thin re-export shim over 1.0.x, so depending on 0.26 dragged BOTH
+# 0.26.11 and 1.0.x into the lock; pinning 1.0 directly collapses the
+# graph to a single entry (same `TLS_SERVER_ROOTS` API).
+webpki-roots = { workspace = true }
+zeroize = { workspace = true, features = ["alloc"] }
 
 # Inherit the workspace FORBID floor (the two-tier lint wall). The two
 # legitimate tier-4 fallback sites in this crate (a Display default

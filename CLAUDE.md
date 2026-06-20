@@ -43,10 +43,22 @@ crates/
 
 ```bash
 cargo check --workspace              # full build
+cargo clippy --workspace --all-targets   # lint wall — must be 0 warnings
+cargo test --workspace               # unit + integration (non-ignored)
+cargo test --workspace --doc         # doctests
+cargo test -p bsql-devgates --test deps_pin   # dependency-frontier gate
 cargo test -p bsql-sqlite            # SQLite (no PG needed)
 cargo test -p bsql-postgres-async --test sq_live -- --ignored    # async PG (needs local PG)
 cargo test -p bsql-postgres-sync --test sync_live -- --ignored   # sync PG (needs local PG)
 ```
+
+The `deps_pin` gate (`tools/devgates/tests/deps_pin.rs`) pins the resolved
+dependency set (parsed from `Cargo.lock`) to a committed golden, and bans any
+NEW crate resolving to two versions. An accidental dependency addition or a
+version drift fails it. A deliberate dependency change is a reviewed golden
+diff, regenerated with `BSQL_DEPS_PIN=overwrite cargo test -p bsql-devgates
+--test deps_pin` (mirroring `TRYBUILD=overwrite`), and must be justified in the
+root `Cargo.toml` `[workspace.dependencies]` policy block.
 
 PG tests require: PostgreSQL on localhost:5432, user `smir-ant`, database `postgres`, trust auth.
 SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in pg_hba.conf.

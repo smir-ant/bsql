@@ -33,3 +33,9 @@ crates/*/.bsql/
 
 TODO
 *.txt
+
+# The deps_pin gate's goldens ARE source of truth (like the trybuild
+# `.stderr` goldens): they pin the resolved dependency set and the
+# allowed version-duplications, and the gate fails on any drift. They
+# must be committed despite the broad `*.txt` ignore above.
+!tools/devgates/tests/deps_goldens/*.txt

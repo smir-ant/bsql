@@ -11,8 +11,9 @@ license = "MIT OR Apache-2.0"
 # SQLite from source via `libsqlite3-sys`, removing system-library
 # dependency and ensuring version consistency across platforms.
 # Audit-trust class: ecosystem standard (100M+ downloads), maintained
-# by the rusqlite working group.
-rusqlite = { version = "0.33", features = ["bundled"] }
+# by the rusqlite working group. Version pinned in the root
+# `[workspace.dependencies]` policy block (single source of truth).
+rusqlite = { workspace = true }
 
 # Inherit the workspace FORBID floor (the two-tier lint wall).
 [lints]

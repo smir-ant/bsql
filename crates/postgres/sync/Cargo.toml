@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 bsql-postgres-core = { path = "../core" }
 bsql-postgres-proto = { path = "../proto" }
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls = { workspace = true }
 
 # Inherit the workspace FORBID floor (the two-tier lint wall). The pool's
 # mutex/condvar poison-recovery fallbacks carry scoped allows in

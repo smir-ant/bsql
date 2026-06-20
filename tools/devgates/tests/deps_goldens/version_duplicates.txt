@@ -1,0 +1,2 @@
+hashbrown 0.15.5, 0.17.1
+windows-sys 0.52.0, 0.61.2

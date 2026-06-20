@@ -9,10 +9,27 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 bsql-postgres-core = { path = "../core" }
 bsql-postgres-proto = { path = "../proto" }
-tokio = { version = "1", features = ["net", "io-util", "macros", "rt", "rt-multi-thread", "time", "sync"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# LIB feature set is the minimal I/O surface the driver compiles against:
+# `net` (TcpStream), `io-util` (Async{Read,Write}Ext), `time` (timeouts),
+# `sync` (the pool's Semaphore/Mutex). `macros` / `rt` / `rt-multi-thread`
+# are deliberately NOT here — the library never spawns tasks or runs a
+# runtime, so it must not force a runtime flavor on consumers. Those
+# features live in `[dev-dependencies]` below for the `#[tokio::test]`
+# suites only. Proven by `cargo check -p bsql-postgres-async`.
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
+tokio-rustls = { workspace = true }
 
 # Inherit the workspace FORBID floor (the two-tier lint wall). The pool's
 # mutex poison-recovery fallbacks carry scoped allows in `src/pool.rs`.
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The async integration/unit suites use `#[tokio::test]`, which expands to
+# a `#[test]` fn that builds and blocks on a runtime — that needs the
+# `macros` (the attribute), `rt` (current-thread runtime), and
+# `rt-multi-thread` (the multi-thread flavor some tests select) features.
+# The library itself needs NONE of these (verified by compiling the lib
+# with the trimmed feature set above), so keeping them dev-only means a
+# consumer of this driver is free to pick any runtime / runtime flavor.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
