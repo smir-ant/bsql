@@ -741,21 +741,9 @@ const _: () = assert!(
 // pins where reproducible cross-platform. The companion **alignment**
 // manifest (further down, just before the Drop-semantics gates) pins
 // `align_of` for every type covered here — size alone is blind to a
-// size-preserving alignment / niche drift. New small fixed-layout wire
-// types should additionally use the [`wire_pin!`] macro (size + align
-// in one co-located anchor).
-const _: () = assert!(
-    core::mem::size_of::<error::ProtocolError>() == 24,
-    "ProtocolError exact size — 24 B post-\
-     (SCRAM externalisation). ServerErrorResponse carries \
-     `details_ref: ErrorRef` (8 B); ScramHandshakeFailure carries \
-     `class: ScramFailureClass (8 B) + detail: Option<ErrorRef> (8 B)`. \
-     Pre-shape was 72 B dominated by `Scram(ScramError)` whose \
-     `ServerScramError` variant (carrying `message: BoundedStr<64>`) \
-     was ~68 B inline. Externalisation into `ErrorPayload::Scram` \
-     drops the dominator. Exact pin catches any variant growth / \
-     layout drift.",
-);
+// size-preserving alignment / niche drift. Small fixed-layout wire
+// types instead use the [`wire_pin!`] macro (size + align in one
+// co-located anchor at the type's definition).
 const _: () = assert!(
     core::mem::size_of::<action::Action<'static>>() == 24,
     "Action<'_> exact size — 24 B post-.b + \
@@ -810,55 +798,6 @@ const _: () = assert!(
     "ReplyId<K> size regression — the `PhantomData<fn() -> K>` kind \
      tag is zero-size; ReplyId's footprint is u64 value + bool \
      delivered + padding. Did a bookkeeping field get added?",
-);
-// RowDesc lives in `PgProtocol::row_desc_slot` (single source of
-// truth); state variants do not carry schema. A naive shape would
-// have parallel `schema_present: bool` for SimpleQuery and
-// `DescribedRowsStaged` enum for Describe paths — these would
-// duplicate `PgProtocol::row_desc_slot.is_some()` and be tier-2
-// by-discipline. The slot-as-single-source shape is tier-1
-// by-construction.
-//
-// Exact `==` pin (rather than range) narrows drift surface to a
-// single arithmetic identity. Cross-platform: pinned for reference
-// target aarch64-apple-darwin; per-target `#[cfg(...)]` blocks
-// would land in the same commit that adds another target to CI.
-const _: () = assert!(
-    core::mem::size_of::<state::ProtoState>() == 24,
-    "ProtoState exact size pin: row_desc_slot externalised on \
-     PgProtocol; schema-presence flags deleted (`row_desc_slot. \
-     is_some()` is single source of truth); `param_oids` heap-boxed \
-     on DescribeStatement* variants (mirror of SCRAM/MD5/Cleartext \
-     pattern). \
-     \
-     Layout on aarch64-apple-darwin: dominant variants are now the \
-     `BoundedStr<32>`-bearing ones — `SimpleQueryAwaitingRfq` / \
-     `BindExecuteAwaitingRfqDml` / `BindExecuteAwaitingRfqSelect`. \
-     Shape: `ReplyId<_>` (8 B; NonZeroU64 + ZST PhantomData) + \
-     `BoundedStr<32>` (~36 B: 2 B len + 32 B buf + tail-pad to align 2) \
-     + 1 B variant discriminant + alignment → 48 B. \
-     \
-     Other notable variants: \
-     - SCRAM `ConnectingScramAwaitingServerFirst` / `…ServerFinal` — \
-       Box (8 B) or SecretDigest (32 B) + ReplyId (8 B) + discriminant \
-       → ~24–48 B. \
-     - DescribeStatement* — ReplyId (8 B) + `Box<ParamOids>` (8 B) + \
-       discriminant → ~24 B (post-boxing). \
-     - Streaming variants — ReplyId (8 B) + discriminant → ~16 B. \
-     \
-     Per-row hot-path single state-projection retrieves just the \
-     reply id; the descriptor is fetched via the protocol's \
-     `current_row_desc` slot (one immutable borrow, no per-row \
-     state match for the desc field). \
-     \
-     **The dominant constraint is now `BoundedStr<32>` command_tag.** \
-     A refactor that wants to shrink ProtoState further should target \
-     command_tag arity, or move command_tag off the variant entirely \
-     (e.g. into a slot pattern, mirror of row_desc_slot). \
-     \
-     If a refactor changes this number on aarch64-apple-darwin, \
-     update both the literal AND the layout comment above (drift-pin \
-     CREDO §3 discipline).",
 );
 const _: () = assert!(
     core::mem::size_of::<command::PgCommand>() <= 2176,
@@ -1187,17 +1126,18 @@ const _: () = assert!(
 // `[T]` strides; a silent align bump can re-pad an outer struct (a
 // real footprint regression that the size pin on the *inner* type
 // would not see). These exact `align_of` pins close that dimension for
-// every type the size manifest covers. Exact `==` (align is exact, not
-// ranged, even where the size pin is `<=`). Reference target:
-// aarch64-apple-darwin; per-target `#[cfg(...)]` blocks land in the
-// same commit that adds another target. Zero runtime cost (asm-erased).
+// the engine-internal types whose size is pinned by the size manifest
+// above; the stable wire/error/state types instead carry their own
+// co-located `wire_pin!` anchor (size + align together). Exact `==`
+// (align is exact, not ranged, even where the size pin is `<=`).
+// Reference target: aarch64-apple-darwin; per-target `#[cfg(...)]`
+// blocks land in the same commit that adds another target. Zero
+// runtime cost (asm-erased).
 const _: () = {
     use core::mem::align_of;
     // 8-aligned: every type whose dominant field is a pointer, u64
     // niche-donor (NonZeroU64 ids), or i32/u32 cluster padded to 8.
-    assert!(align_of::<error::ProtocolError>() == 8, "ProtocolError align drift");
     assert!(align_of::<action::Action<'static>>() == 8, "Action align drift");
-    assert!(align_of::<state::ProtoState>() == 8, "ProtoState align drift");
     assert!(align_of::<command::PgCommand>() == 8, "PgCommand align drift");
     assert!(
         align_of::<protocol::PgProtocol<protocol::ActivePhase>>() == 8,

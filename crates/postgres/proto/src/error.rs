@@ -284,38 +284,24 @@ const _: () = assert!(
 );
 
 // -----------------------------------------------------------------
-// ProtocolError (below)
+// ProtocolError footprint anchor (co-located at the definition).
 // -----------------------------------------------------------------
-
-// Colocated drift-pin.
 //
-// ProtocolError exact size must stay 24 B (post-).
-// Variant growth here cascades into `Action<'w,'r>` (32 B),
-// `OutActions = [Action; 9] + len` (296 B), and `StreamItem<'a>`.
-// The pin catches:
+// A wrong pin — or any layout change that invalidates a correct pin —
+// aborts the build with E0080. Both size and align are pinned in one
+// anchor: a field reorder can keep the byte count while changing the
+// alignment, and the size dimension alone is blind to that.
 //
-//   • New payload field on any variant that exceeds the 24 B budget.
-//   • Refactor that re-inlines the 288 B bounded strings into
-//     `ServerErrorResponse` (defeating the ErrorArena externalisation).
-//   • Refactor that re-inlines `BoundedStr<64>` into
-//     `ScramHandshakeFailure` (defeating the SCRAM-text
-// externalisation introduced by ).
-//   • Alignment-driven padding bumps from field ordering changes.
-//
-// The complementary `Action` / `OutActions` pins live in lib.rs
-// alongside the full cascade measurements; pin-in-error.rs catches
-// drift AT the variant-definition site (Fail-Fast locality) rather
-// than at first use.
-const _: () = assert!(
-    core::mem::size_of::<ProtocolError>() == 24,
- "ProtocolError exact size — 24 B (post-). \
-     Variant shape change detected. Audit each variant payload: \
-     ServerErrorResponse should carry ErrorRef (8 B), not inline \
-     BoundedStr<N>; ScramHandshakeFailure should carry \
-     ScramFailureClass (8 B) + Option<ErrorRef> (8 B), not inline \
-     ScramError (formerly 68 B via BoundedStr<64>). See lib.rs \
-     cascade pins (Action / OutActions) for downstream impact.",
-);
+// Constraint shape (24 B, align 8): error payloads that would inline
+// large bounded strings are externalised into the error arena, so the
+// dominant variant stays pointer-sized:
+//   • ServerErrorResponse carries `details_ref: ErrorRef` (8 B), not
+//     an inline `BoundedStr<N>`.
+//   • ScramHandshakeFailure carries `ScramFailureClass` (8 B) +
+//     `Option<ErrorRef>` (8 B), not an inline `ScramError`.
+// Re-inlining either payload, or adding a variant body over the
+// 24 B budget, trips this anchor.
+crate::wire_pin!(ProtocolError, size = 24, align = 8);
 
 
 /// A classified failure on the wire protocol.

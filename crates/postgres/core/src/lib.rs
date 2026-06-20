@@ -11,6 +11,7 @@ pub mod test_scenarios;
 
 pub mod config;
 pub mod error;
+pub mod footprint;
 pub mod owned_row;
 pub mod session;
 pub mod ssl;

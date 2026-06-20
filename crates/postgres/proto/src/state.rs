@@ -905,6 +905,20 @@ pub enum ProtoState {
     Errored(StateErrorKind),
 }
 
+// Footprint anchor (co-located at the definition). A wrong pin — or any
+// layout change that invalidates a correct pin — aborts the build with
+// E0080. Size and align are pinned together: a field reorder can keep
+// the byte count while changing the alignment, which the size dimension
+// alone cannot see.
+//
+// Constraint shape (24 B, align 8): state variants do NOT carry a
+// `RowDesc` — schema lives in `PgProtocol::row_desc_slot` as the single
+// source of truth. Cold per-variant payloads (param OIDs, SCRAM digests)
+// are heap-boxed, so the dominant variant stays an inflight `ReplyId`
+// (8 B) plus a small boxed/inline tail. A refactor that re-inlines a
+// large per-variant payload, or adds a schema-presence field, trips this.
+crate::wire_pin!(ProtoState, size = 24, align = 8);
+
 impl ProtoState {
     /// Consume `self` and return the raw `NonZeroU64` of the typed
     /// [`ReplyId<_>`] in flight for this state, or `None` if no

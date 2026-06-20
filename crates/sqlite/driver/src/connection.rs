@@ -27,6 +27,9 @@ pub struct QueryResult {
     pub column_names: Vec<String>,
 }
 
+// Footprint pin: two Vecs (3 words each) + a usize column count.
+crate::footprint_pin!(QueryResult, size = 56, align = 8);
+
 /// Native SQLite value — no double-conversion.
 #[derive(Debug, Clone)]
 pub enum SqliteValue {
@@ -37,11 +40,20 @@ pub enum SqliteValue {
     Blob(Vec<u8>),
 }
 
+// Footprint pin: sized by the widest variant — Text(String) / Blob(Vec<u8>),
+// each 3 words — plus the discriminant. A new variant carrying a wider payload
+// would widen every cell; the pin catches it.
+crate::footprint_pin!(SqliteValue, size = 32, align = 8);
+
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct Row {
     columns: Vec<SqliteValue>,
 }
+
+// Footprint pin: a single Vec<SqliteValue> (3 words). A row is one heap
+// allocation of native values; the pin keeps the handle a bare Vec.
+crate::footprint_pin!(Row, size = 24, align = 8);
 
 impl Row {
     pub fn get_str(&self, idx: usize) -> Option<&str> {

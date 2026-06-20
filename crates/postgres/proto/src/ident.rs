@@ -523,10 +523,10 @@ const _: () = assert!(
     core::mem::size_of::<Option<ApplicationName>>() == 130,
     "Option<ApplicationName> must be 130 B (niche)",
 );
-const _: () = assert!(
-    core::mem::size_of::<StmtName>() == 65,
-    "StmtName must be 65 B (BoundedU8<63> len)",
-);
+// Co-located footprint anchor (size + align together): 65 B, align 1
+// (63 B buf + BoundedU8<63> len + was_lossy flag, no alignment padding).
+// A lost niche or a widened len type trips this at the definition site.
+crate::wire_pin!(StmtName, size = 65, align = 1);
 const _: () = assert!(
     core::mem::size_of::<PortalName>() == 65,
     "PortalName must be 65 B (BoundedU8<63> len)",

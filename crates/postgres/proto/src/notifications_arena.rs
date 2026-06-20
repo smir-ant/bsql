@@ -88,6 +88,11 @@ pub struct NotificationRef {
     generation: u16,
 }
 
+// Footprint pin: a bounded slot index byte + a u16 generation = 4 B, align 2.
+// This is a Copy handle into the per-cycle arena, not the payload itself; the
+// pin keeps it pointer-free and word-small.
+crate::wire_pin!(NotificationRef, size = 4, align = 2);
+
 /// Multi-slot notifications arena.
 ///
 /// One arena per `PgProtocol` instance, lazy-allocated on first

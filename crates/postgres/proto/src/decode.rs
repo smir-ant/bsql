@@ -165,6 +165,12 @@ pub struct RowDesc {
     data: alloc::boxed::Box<[u32]>,
 }
 
+// Footprint pin: a single `Box<[u32]>` (fat pointer = ptr + len). The whole
+// column schema lives in one heap allocation; this pin keeps the handle a fat
+// pointer and catches a field addition that would widen every prepared
+// statement and row-stream that holds a RowDesc.
+crate::wire_pin!(RowDesc, size = 16, align = 8);
+
 impl RowDesc {
     /// Construct from pre-parsed OIDs and format codes.
     pub(crate) fn from_parts(

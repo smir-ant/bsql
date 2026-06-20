@@ -196,6 +196,13 @@ pub struct ErrorRef {
     generation: u32,
 }
 
+// Co-located footprint anchor (size + align together): 8 B, align 4
+// (u32 generation + NonZeroU8 slot + 3 B padding to align 4). Adding a
+// non-niche field, or widening the layout past 8 B, trips this at the
+// definition site. `Option<ErrorRef>` niche-packs to the same 8 B; that
+// relation is pinned separately below.
+crate::wire_pin!(ErrorRef, size = 8, align = 4);
+
 /// Classified failure from `ErrorArena::get` / [`crate::PgProtocol::get_server_error`].
 ///
 /// Distinguishes two failure modes: empty slot vs stale generation.
@@ -616,22 +623,15 @@ impl core::fmt::Display for DisplayError<'_> {
 
 // ─── Drift pins — invariant guardrails ────────────────────────────
 
-// Size pin: ErrorRef is 8 bytes: u32 generation + NonZeroU8 slot
-// marker + 3 B struct padding (u32 alignment).
-const _: () = assert!(
-    core::mem::size_of::<ErrorRef>() == 8,
-    "ErrorRef should be 8 bytes (NonZeroU8 slot + u32 generation + \
-     padding). If changed, update ServerErrorResponse.details_ref \
-     budget + PgProtocol.error_arena footprint estimate in \
-     error_arena.rs docs.",
-);
+// `ErrorRef` itself (8 B, align 4) is pinned by the co-located
+// `wire_pin!` anchor at the type definition above.
 
 // Exact-equality pin on Option<ErrorRef>. A relative pin
 // (`size_of::<Option<ErrorRef>>() == size_of::<ErrorRef>()`) would
 // be a weak shield — a non-niche field added to ErrorRef can
 // coincidentally keep the relation while regressing footprint (both
 // sides grow in lockstep). The two pins together shield:
-//   • Absolute size drift on ErrorRef itself (pin above): 8 B exact.
+//   • Absolute size drift on ErrorRef itself (anchor above): 8 B exact.
 //   • Absolute size drift on Option<ErrorRef>: 8 B exact (this pin).
 //   • Niche collapse (if Option ever stops niche-packing, this would
 //     trip via the 8 vs 16 byte budget — Option<{u32,u8,padding}>

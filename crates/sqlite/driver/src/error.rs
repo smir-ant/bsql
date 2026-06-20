@@ -19,6 +19,12 @@ pub enum SqliteError {
     },
 }
 
+// Footprint pin: sized by the widest variant — `Sqlite { code: Option<i32>,
+// message: String }` (the boxed TransactionRollbackFailed variant is two words
+// of Box, smaller than the String+Option payload). A new wide variant would
+// show up here.
+crate::footprint_pin!(SqliteError, size = 32, align = 8);
+
 impl SqliteError {
     /// Check if this is a constraint violation (SQLITE_CONSTRAINT = 19).
     pub fn is_constraint_violation(&self) -> bool {

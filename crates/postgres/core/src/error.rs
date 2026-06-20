@@ -33,6 +33,12 @@ impl fmt::Display for DbError {
 
 impl std::error::Error for DbError {}
 
+// Footprint pin: five owned String / Option<String> fields (code, severity,
+// message, detail, hint). DbError is the structured server-error payload; its
+// size is the dominant variant of DriverError, so pinning it documents the
+// error path's footprint and catches a field addition.
+crate::footprint_pin!(DbError, size = 120, align = 8);
+
 impl DbError {
     pub fn is_code(&self, code: &str) -> bool { self.code == code }
     pub fn is_unique_violation(&self) -> bool { self.code == "23505" }
@@ -86,6 +92,12 @@ pub enum DriverError {
     /// silent stop (which would truncate the result).
     Timeout,
 }
+
+// Footprint pin: a sum type whose size is set by its widest variant,
+// Db(DbError). The many fieldless variants (NotReady, NoRows, Timeout, …) cost
+// nothing beyond the discriminant; the pin documents that the error enum is no
+// wider than its DbError payload and catches a new wide variant.
+crate::footprint_pin!(DriverError, size = 120, align = 8);
 
 impl fmt::Display for DriverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

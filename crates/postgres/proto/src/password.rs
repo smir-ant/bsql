@@ -98,6 +98,11 @@ pub enum PasswordError {
 
 impl core::error::Error for PasswordError {}
 
+// Footprint pin: sized by the `TooLong { len: usize }` variant (a usize payload
+// plus the discriminant). A new variant carrying a wider payload would show up
+// here.
+crate::wire_pin!(PasswordError, size = 16, align = 8);
+
 impl fmt::Display for PasswordError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -20,6 +20,10 @@ pub enum SslMode {
     Require,
 }
 
+// Footprint pin: a 3-variant fieldless enum is a single discriminant byte. A
+// variant accidentally carrying data would widen it; the pin catches that.
+crate::footprint_pin!(SslMode, size = 1, align = 1);
+
 
 /// Connection configuration.
 ///
@@ -36,6 +40,13 @@ pub struct ConnectConfig {
     pub connect_timeout_secs: u64,
     pub ssl_mode: SslMode,
 }
+
+// Footprint pin: four owned Strings/Option<String> (host, user, database,
+// password) plus a u16 port, a u64 timeout, and the SslMode byte. Config is
+// built once per connection, so its size is not hot — but pinning it keeps a
+// silently-added field on the review surface, and the password is a
+// Zeroizing<String> whose 3-word shape must not regress.
+crate::footprint_pin!(ConnectConfig, size = 112, align = 8);
 
 impl ConnectConfig {
     pub fn password_str(&self) -> Option<&str> {

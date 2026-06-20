@@ -42,6 +42,9 @@ impl core::fmt::Display for OwnedRowTooLarge {
 
 impl std::error::Error for OwnedRowTooLarge {}
 
+// Footprint pin: a zero-size error marker — pure type identity, no data.
+crate::footprint_pin!(OwnedRowTooLarge, size = 0, align = 1);
+
 /// A single-allocation owned row. See the module docs for the layout.
 #[derive(Debug, Clone)]
 #[must_use]
@@ -187,8 +190,12 @@ fn write_u32(buf: &mut [u8], at: usize, v: u32) -> Option<()> {
     Some(())
 }
 
-// One allocation: an `OwnedRow` is exactly a `Box<[u8]>` (pointer + len).
+// One allocation: an `OwnedRow` is exactly a `Box<[u8]>` (pointer + len). This
+// relative assert proves the single-allocation invariant; the absolute
+// footprint pin below captures the concrete baseline size + alignment so a
+// drift (e.g. an added field) is comparable and fails the build.
 const _: () = assert!(core::mem::size_of::<OwnedRow>() == core::mem::size_of::<Box<[u8]>>());
+crate::footprint_pin!(OwnedRow, size = 16, align = 8);
 
 // The owned escape must be freely shareable across threads and outlive any
 // borrow — this is the entire reason it exists.

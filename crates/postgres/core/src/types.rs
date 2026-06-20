@@ -61,6 +61,11 @@ pub struct Row {
     row_idx: u32,
 }
 
+// Footprint pin: Row is one Arc pointer + a u32 row index, niche-free.
+// Keeping it pointer-sized + a word is what makes Clone an Arc refcount bump
+// and lets a row cross threads as a 16-byte handle.
+crate::footprint_pin!(Row, size = 16, align = 8);
+
 impl Row {
     pub fn get_raw(&self, col: usize) -> Option<&[u8]> {
         let inner = &*self.arena;
@@ -124,6 +129,11 @@ impl core::fmt::Display for RowTooLarge {
 }
 
 impl std::error::Error for RowTooLarge {}
+
+// Footprint pin: a zero-size error marker — it carries no data, only its type
+// identity. A field accidentally added here would make every fallible row-build
+// `Result` wider; the ZST pin catches that.
+crate::footprint_pin!(RowTooLarge, size = 0, align = 1);
 
 // ─── ArenaBuilder ───────────────────────────────────────────
 
@@ -249,6 +259,11 @@ pub struct QueryResult {
     pub column_names: Arc<[String]>,
 }
 
+// Footprint pin: a Vec (3 words) + a String (3 words) + a usize + an Arc<[_]>
+// (2 words, fat pointer). A new field, or swapping a field to a wider owned
+// type, shows up here.
+crate::footprint_pin!(QueryResult, size = 72, align = 8);
+
 // ─── FromText ───────────────────────────────────────────────
 
 pub trait FromText: Sized {
@@ -278,6 +293,12 @@ pub struct PreparedStatement {
     pub column_names: Arc<[String]>,
 }
 
+// Footprint pin: dominated by the inline StmtName (a fixed 63-byte bounded
+// string + length) plus Option<RowDesc> and an Arc<[String]>. The inline name
+// is what avoids a heap allocation per prepared statement; if that bounded
+// capacity changed, this pin would move.
+crate::footprint_pin!(PreparedStatement, size = 104, align = 8);
+
 impl PreparedStatement {
     pub fn returns_rows(&self) -> bool { self.row_desc.is_some() }
     pub fn column_names(&self) -> &[String] { &self.column_names }
@@ -291,6 +312,11 @@ pub struct Notification {
     pub payload: String,
     pub pid: i32,
 }
+
+// Footprint pin: two owned Strings (3 words each) + an i32 backend PID. The
+// strings are owned so a Notification outlives the read buffer it was decoded
+// from; the pin documents that owned shape.
+crate::footprint_pin!(Notification, size = 56, align = 8);
 
 #[cfg(test)]
 mod tests {
