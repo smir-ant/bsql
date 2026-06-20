@@ -60,6 +60,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsql-build"
+version = "1.0.0-alpha.0"
+dependencies = [
+ "sqlparser",
+]
+
+[[package]]
 name = "bsql-devgates"
 version = "0.0.0"
 
@@ -122,6 +129,24 @@ dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
  "rustls",
+]
+
+[[package]]
+name = "bsql-query-fixture"
+version = "0.0.0"
+dependencies = [
+ "bsql-build",
+ "bsql-query-macros",
+ "trybuild",
+]
+
+[[package]]
+name = "bsql-query-macros"
+version = "1.0.0-alpha.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -473,6 +498,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "log"
+version = "0.4.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -749,6 +780,15 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.62.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c6d1b651dc4edf07eead2a0c6c78016ce971bc2c10da5266861b13f25e7cec"
+dependencies = [
+ "log",
 ]
 
 [[package]]

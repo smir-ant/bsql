@@ -1,0 +1,31 @@
+[package]
+name = "bsql-build"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build-time helper for bsql's compile-checked query API: parses a consumer crate's migration DDL into a column catalog and exposes it to the query proc-macro. Used ONLY in a consumer's [build-dependencies]; never a runtime dependency of any shipped bsql crate."
+keywords = ["postgres", "sql", "schema", "build", "migrations"]
+categories = ["database", "development-tools::build-utils"]
+
+[dependencies]
+# `sqlparser` — the SQL grammar. BUILD-TIME ONLY. This crate is a
+# build-dependency helper; nothing here is ever linked into a shipped
+# library's runtime closure (the `runtime_graph_pin` gate in
+# tools/devgates proves both this crate and `sqlparser` are absent from
+# every shipped crate's `cargo tree -e normal` runtime graph; `deps_pin`
+# pins only the package set and cannot see the build-vs-runtime
+# distinction). We never hand-roll a SQL parser: faithful DDL grammar
+# coverage (CREATE TABLE / ALTER TABLE column ops, quoting, type aliases)
+# is expert-domain work that drifts from the spec the moment we own it.
+# Apache-2.0, zero `unsafe` in its parser core. `default-features =
+# false` drops the optional `serde`/`visitor` derives we do not use,
+# keeping the build-time surface minimal.
+sqlparser = { workspace = true }
+
+# Inherit the workspace FORBID floor. This is a shipped (publishable)
+# helper crate — consumers add it to `[build-dependencies]` — so it
+# carries the full lint wall like every other non-devgates member.
+[lints]
+workspace = true

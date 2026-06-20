@@ -8,10 +8,27 @@ members = [
     "crates/postgres/async",
     "crates/postgres/sync",
     "crates/sqlite/driver",
+    # Build-time helper for the compile-checked query API. A publishable
+    # crate consumers add to `[build-dependencies]` ONLY — NEVER a runtime
+    # dependency of any shipped library. The `runtime_graph_pin` gate
+    # (tools/devgates) parses each shipped crate's `cargo tree -e normal`
+    # and proves `bsql-build` and `sqlparser` (its only dep) are absent
+    # from every shipped crate's runtime graph. (`deps_pin` pins only the
+    # lockfile package SET, which is dependency-kind-blind, so it cannot
+    # see the build-vs-runtime boundary on its own.) Parses migration DDL
+    # into a column catalog.
+    "crates/build",
+    # Proc-macro that reads the build-generated catalog at expansion and
+    # validates referenced `table.column` pairs against the real schema.
+    "crates/query-macros",
     # Dev-only harness; `publish = false`. Hosts the workspace's only
     # `unsafe` (counting allocator + memory probe) and deliberately does
     # NOT inherit the forbid floor — see `[workspace.lints]` below.
     "tools/devgates",
+    # Fixture consumer exercising the migrations -> catalog -> schema_check!
+    # chain end-to-end (real build.rs + migrations dir + freshness tests).
+    # `publish = false`; not a shipped crate.
+    "tools/query_fixture",
 ]
 
 [workspace.package]
@@ -374,6 +391,24 @@ trybuild = { version = "1" }
 syn = { version = "2", default-features = false, features = ["proc-macro", "derive", "parsing", "printing"] }
 quote = { version = "1", default-features = false }
 proc-macro2 = { version = "1", default-features = false, features = ["proc-macro"] }
+
+# `sqlparser` — SQL grammar for the compile-checked query API.
+# **BUILD-TIME ONLY.** Used solely by `bsql-build` (a `[build-dependencies]`
+# helper) to replay a consumer crate's migration DDL into a column
+# catalog at build time. It is NEVER a runtime dependency of any shipped
+# library — the `runtime_graph_pin` gate (tools/devgates) parses each
+# shipped crate's `cargo tree -e normal` and proves `sqlparser` (and
+# `bsql-build`, the only edge that reaches it) is absent from every
+# shipped crate's runtime graph. (The `deps_pin` gate pins only the
+# lockfile package SET and is dependency-kind-blind, so it cannot prove
+# the build-vs-runtime boundary on its own.) We never
+# hand-roll a SQL parser: faithful DDL grammar coverage (quoting, type
+# aliases, CREATE/ALTER column ops) is expert-domain work that drifts
+# from the spec the instant we own it. Apache-2.0, no `unsafe` in the
+# parser core. `default-features = false` drops the optional
+# `serde`/`visitor`/`recursive-protection` features we do not use,
+# keeping the build-time surface (and its transitive closure) minimal.
+sqlparser = { version = "0.62", default-features = false }
 
 # --- Build profiles ---
 #

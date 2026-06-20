@@ -1,0 +1,35 @@
+[package]
+name = "bsql-query-fixture"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Fixture consumer exercising the bsql compile-checked query chain end-to-end: a real build.rs calling bsql-build over a migrations/ directory, then schema_check! validating table.column references against the build-generated catalog. Hosts the freshness tests. Never published."
+
+# Not a shipped crate; it exists only to prove the migrations -> catalog
+# -> proc-macro chain (including no-stale-cache freshness) works for a
+# REAL consumer that has the build.rs.
+publish = false
+
+[dependencies]
+# The query proc-macro under test. (Runtime/expansion only — it ships no
+# runtime types.)
+bsql-query-macros = { path = "../../crates/query-macros" }
+
+[build-dependencies]
+# BUILD-DEPENDENCY ONLY. This is the exact placement a real consumer
+# uses: bsql-build parses this crate's migrations/ into the catalog at
+# build time. Because it lives in [build-dependencies] (not
+# [dependencies]), `sqlparser` never enters this crate's runtime closure.
+bsql-build = { path = "../../crates/build" }
+
+[dev-dependencies]
+# trybuild drives the compile-fail goldens (unknown column rejected) and
+# the freshness transitions (a removed column makes a once-valid
+# reference fail to compile).
+trybuild = { workspace = true }
+
+# Inherit the workspace FORBID floor / lint wall like every other
+# non-devgates member.
+[lints]
+workspace = true

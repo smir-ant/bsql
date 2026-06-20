@@ -1,0 +1,34 @@
+[package]
+name = "bsql-query-macros"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Proc-macro foundation for bsql's compile-checked query API. Reads the schema catalog generated at build time by bsql-build and validates referenced table.column pairs against the real migration-replayed schema, emitting compile_error for unknown tables/columns. Reads its input only at expansion; ships no runtime types."
+keywords = ["postgres", "sql", "schema", "macro", "compile-time"]
+categories = ["database", "rust-patterns"]
+
+# proc-macro = true: this crate can only export proc-macro entry points.
+# It reads the build-generated catalog (via the BSQL_SCHEMA_CATALOG
+# rustc-env channel the consumer's build.rs sets) at EXPANSION time. It
+# has NO runtime dependencies and is never linked into a consumer's
+# runtime closure beyond the macro-expansion phase.
+[lib]
+proc-macro = true
+
+[dependencies]
+# Standard proc-macro toolchain. Ecosystem-standard (1B+ downloads
+# each); transitive `unsafe` for token-stream manipulation is bounded
+# and well-audited (CREDO §11). The catalog itself is parsed with plain
+# `str` operations (line-oriented text), so NO serialization dependency
+# is pulled in to read it.
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }
+
+# Inherit the workspace FORBID floor (the lint wall). This crate carries
+# its own stricter crate-root forbid-bundle in `src/lib.rs`, which
+# coexists with the floor.
+[lints]
+workspace = true

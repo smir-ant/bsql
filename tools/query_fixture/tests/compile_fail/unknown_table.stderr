@@ -1,0 +1,5 @@
+error: schema_check!: unknown table `widgets` — it is not defined by any migration. Known tables: [accounts, audit, orders, users]
+ --> tests/compile_fail/unknown_table.rs:3:38
+  |
+3 |     bsql_query_macros::schema_check!(widgets.id);
+  |                                      ^^^^^^^
