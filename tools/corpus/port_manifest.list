@@ -1,0 +1,39 @@
+# PORT-not-fixturize manifest.
+#
+# The differential-replay corpus (this crate) can express MANY of the engine's
+# per-flow spec tests as data fixtures. But a class of spec tests CANNOT be
+# expressed as a differential-replay fixture, because they assert properties
+# that are invisible at the observable-I/O seam the corpus replays through:
+#
+#   * memory-zeroize / drop-witness / post-drop probe behaviour
+#     (secret bytes are scrubbed on drop — not observable in wire output),
+#   * footprint / size pins and other compile-fail (trybuild) goldens
+#     (a type's size or a diagnostic — not a runtime observation),
+#   * sole-path / staleness compile-and-probe properties
+#     (a build-time guarantee or an arena-reuse staleness check).
+#
+# Those families MUST be kept as real tests (or rewritten in place) — never
+# replaced by a corpus fixture, which could not carry the same guarantee, and
+# never deleted. This file is the machine-checkable record of that rule: the
+# `manifest_families_still_exist` test in tests/manifest.rs asserts every listed
+# file is still present on disk, so an accidental deletion that removes one fails
+# the gate loudly.
+#
+# This file is named `.list` (not `.txt`) on purpose: the repo's `.gitignore`
+# ignores `*.txt` except the deps_pin goldens, so a `.txt` manifest here would
+# be silently untracked. A non-`.txt` extension keeps it committed without
+# editing the root ignore file.
+#
+# Format: one `family_name = relative/path/from/repo/root` per line; blank lines
+# and `#` comment lines are ignored.
+
+scram_fuzz_spec = crates/postgres/proto/tests/scram_fuzz_spec.rs
+fuzz_stress_spec = crates/postgres/proto/tests/fuzz_stress_spec.rs
+scram_zeroize_miri_spec = crates/postgres/proto/tests/scram_zeroize_miri_spec.rs
+zeroize_coverage_spec = crates/postgres/proto/tests/zeroize_coverage_spec.rs
+footprint_drift_compile_fail = crates/postgres/proto/tests/footprint_drift_compile_fail.rs
+sole_path_compile_fail = crates/postgres/proto/tests/sole_path_compile_fail.rs
+buf_compact_staleness_spec = crates/postgres/proto/tests/buf_compact_staleness_spec.rs
+error_arena_staleness_spec = crates/postgres/proto/tests/error_arena_staleness_spec.rs
+session_params_staleness_spec = crates/postgres/proto/tests/session_params_staleness_spec.rs
+secret_bounded_str_spec = crates/postgres/proto/tests/secret_bounded_str_spec.rs

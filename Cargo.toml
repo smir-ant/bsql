@@ -29,6 +29,17 @@ members = [
     # chain end-to-end (real build.rs + migrations dir + freshness tests).
     # `publish = false`; not a shipped crate.
     "tools/query_fixture",
+    # Dev-only differential-replay corpus: a Rust-native typed corpus of
+    # PostgreSQL wire transcripts replayed through an observable-I/O Adapter
+    # seam over the public sans-IO `Session`. Proves engine behavioural
+    # equivalence across a rebuild — the same corpus stays green on the
+    # current engine and any future re-implementation, because its
+    # Adapter/ObservedRun types name ONLY observable values (client wire
+    # bytes + public outcomes), never an internal engine type. `publish =
+    # false`; never in any shipped crate's runtime graph (so
+    # `runtime_graph_pin` is unaffected); adds NO new external dependency
+    # (core + proto + the already-present tokio).
+    "tools/corpus",
 ]
 
 [workspace.package]
