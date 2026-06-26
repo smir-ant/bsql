@@ -1,0 +1,5 @@
+error: query!: two output columns are both named `id`; the generated typed row cannot have two fields by one name. Disambiguate with an `AS` alias (e.g. `... AS id_2`).
+ --> tests/compile_fail/query_duplicate_column.rs:5:36
+  |
+5 |     bsql_query_macros::query!(Row, "SELECT id, id FROM users");
+  |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^

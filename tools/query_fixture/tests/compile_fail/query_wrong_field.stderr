@@ -1,0 +1,7 @@
+error[E0609]: no field `nope` on type `Row`
+ --> tests/compile_fail/query_wrong_field.rs:6:7
+  |
+6 |     r.nope
+  |       ^^^^ unknown field
+  |
+  = note: available field is: `id`

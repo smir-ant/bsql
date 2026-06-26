@@ -30,4 +30,17 @@ fn unknown_reference_is_compile_error() {
     // A table renamed away by `ALTER TABLE ... RENAME TO` no longer
     // resolves under its OLD name — the freshness guarantee for renames.
     t.compile_fail("tests/compile_fail/renamed_away_table.rs");
+
+    // `query!` compile-fail surface. Two are schema-typing errors the
+    // inference engine surfaces as `compile_error!` (an unknown column, an
+    // uncast parameter); two are the typed record doing its job (a missing
+    // field is E0609, a wrong-typed field is E0308) — proving the emitted
+    // record is genuinely typed, not a `Vec<String>` escape hatch.
+    t.compile_fail("tests/compile_fail/query_unknown_column.rs");
+    t.compile_fail("tests/compile_fail/query_uncast_param.rs");
+    t.compile_fail("tests/compile_fail/query_wrong_field.rs");
+    t.compile_fail("tests/compile_fail/query_type_mismatch.rs");
+    // A duplicate output column name cannot become two record fields of
+    // one name — surfaced as a compile_error, never silently collapsed.
+    t.compile_fail("tests/compile_fail/query_duplicate_column.rs");
 }

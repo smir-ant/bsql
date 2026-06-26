@@ -27,6 +27,19 @@ proc-macro2 = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
 
+# `bsql-build` — the build-time catalog + SQL inference engine. This
+# proc-macro calls `bsql_build::infer_query` at EXPANSION time to type a
+# `query!` SQL literal against the migration-replayed schema, and
+# `bsql_build::parse_catalog` to rebuild the catalog from the text the
+# consumer's build script wrote. This is a NORMAL dependency here, but
+# this crate is itself build-time-only (a `proc-macro` lib that ships no
+# runtime types); the `runtime_graph_pin` gate proves `bsql-build` and
+# its `sqlparser` edge stay ABSENT from every SHIPPED crate's `-e normal`
+# runtime graph, because no shipped crate depends on `bsql-query-macros`.
+# The emitted code references ONLY the shipped runtime decode primitives
+# in `bsql-postgres-proto`, never this crate or `bsql-build`.
+bsql-build = { path = "../build" }
+
 # Inherit the workspace FORBID floor (the lint wall). This crate carries
 # its own stricter crate-root forbid-bundle in `src/lib.rs`, which
 # coexists with the floor.

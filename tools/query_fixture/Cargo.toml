@@ -16,6 +16,13 @@ publish = false
 # runtime types.)
 bsql-query-macros = { path = "../../crates/query-macros" }
 
+# The SHIPPED runtime decode primitives the `query!` macro's emitted code
+# references (`DataRowRef`, `ColumnsIter`, `Cell<BinaryFmt>`,
+# `DecodeError`). This is the exact runtime dependency a real consumer of
+# `query!` carries — the build-time `bsql-build` / `sqlparser` never enter
+# this crate's runtime closure (they are a `[build-dependencies]` edge).
+bsql-postgres-proto = { path = "../../crates/postgres/proto" }
+
 [build-dependencies]
 # BUILD-DEPENDENCY ONLY. This is the exact placement a real consumer
 # uses: bsql-build parses this crate's migrations/ into the catalog at
@@ -28,6 +35,12 @@ bsql-build = { path = "../../crates/build" }
 # the freshness transitions (a removed column makes a once-valid
 # reference fail to compile).
 trybuild = { workspace = true }
+
+# `bsql-devgates` — dev-only harness hosting the workspace's counting
+# allocator. The `query!` allocation test installs it as the test
+# binary's `#[global_allocator]` to prove the borrowed decode of an
+# all-fixed row allocates nothing. Dev-only; never in any runtime closure.
+bsql-devgates = { path = "../devgates" }
 
 # Inherit the workspace FORBID floor / lint wall like every other
 # non-devgates member.

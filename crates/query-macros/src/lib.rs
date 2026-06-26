@@ -45,8 +45,8 @@
 // through explicit `match` / `?`, never a default-substituting combinator.
 
 use proc_macro::TokenStream;
-use proc_macro2::Span;
-use quote::quote;
+use proc_macro2::{Literal, Span, TokenStream as TokenStream2};
+use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, Token};
 
@@ -232,5 +232,507 @@ impl Catalog {
         columns.sort_unstable();
         columns.dedup();
         columns.join(", ")
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// query! — typed-record twins + DataRow-payload decode
+// ════════════════════════════════════════════════════════════════════
+//
+// `query!(Name, "<SQL>")` types one SQL query against the schema replayed
+// from the consumer's migrations and emits two typed records plus their
+// decoders. Expansion calls `bsql_build::infer_query` (the build-time SQL
+// inference engine) to obtain the output row shape and the `$N` parameter
+// types. The EMITTED code references ONLY the shipped runtime decode
+// primitives in `bsql-postgres-proto` (`DataRowRef`, `ColumnsIter`,
+// `Cell<BinaryFmt>`, `DecodeError`) — never this crate or `bsql-build`,
+// so a consumer's runtime closure carries no build-time query toolchain.
+
+/// Compile-checked, schema-typed query record generator.
+///
+/// `query!(Name, "<SQL>")` parses the SQL string literal at expansion,
+/// infers its output row shape and parameter types against the schema
+/// replayed from the consumer's migration DDL (via the build-generated
+/// catalog), and emits two typed-record types plus their decoders:
+///
+/// * `Name` — the borrowed, zero-copy record: one field per projected
+///   output column, where a `text` column borrows the input bytes as
+///   `&str` (so the borrowed decode allocates nothing). It carries a
+///   `<'q>` lifetime only when it has a borrowing (`text`) field.
+/// * `NameOwned` — the owned twin: the same fields, but `text` columns
+///   are `String`.
+///
+/// A `NOT NULL` column maps to `T`; a nullable column maps to
+/// `Option<T>`. Each type has a `decode` associated fn that turns a raw
+/// `DataRow` payload (the wire bytes after the field-count header) into
+/// the record, reusing the shipped binary decoders in
+/// `bsql-postgres-proto`. A `NULL` arriving in a `NOT NULL`-typed column
+/// is a classified `DecodeError::NullInNonNullColumn`, never a silent
+/// default or a panic.
+///
+/// Any SQL that does not type-check — an unknown table/column, a
+/// duplicate output column name, or an expression/parameter whose type
+/// cannot be inferred without an explicit cast — is a `compile_error!`
+/// carrying the inference engine's message.
+#[proc_macro]
+pub fn query(input: TokenStream) -> TokenStream {
+    match query_impl(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// `query!(Name, "SQL")` input: a record base name and a SQL string.
+struct QueryInput {
+    name: Ident,
+    sql: syn::LitStr,
+}
+
+impl Parse for QueryInput {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let name: Ident = input.parse()?;
+        let _comma: Token![,] = input.parse()?;
+        let sql: syn::LitStr = input.parse()?;
+        if !input.is_empty() {
+            return Err(input.error(
+                "query!: expected exactly `Name, \"SQL\"` — a record name, a \
+                 comma, and one SQL string literal",
+            ));
+        }
+        Ok(QueryInput { name, sql })
+    }
+}
+
+fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
+    let QueryInput { name, sql } = syn::parse2(input)?;
+    let sql_text = sql.value();
+    let sql_span = sql.span();
+
+    // Rebuild the catalog the consumer's build.rs wrote (fail-closed on a
+    // missing/unreadable/corrupt catalog).
+    let catalog = load_build_catalog(name.span())?;
+
+    // Type the query against the schema. Any inference failure — unknown
+    // table/column, duplicate output column, an uncast expression or
+    // parameter — is surfaced verbatim as a compile error pointed at the
+    // SQL literal. There is no "assume a type" path.
+    let shape = bsql_build::infer_query(&catalog, &sql_text)
+        .map_err(|err| syn::Error::new(sql_span, format!("query!: {err}")))?;
+
+    emit_records(&name, &shape.columns)
+}
+
+/// Read the catalog text via the rustc-env channel and rebuild the
+/// `bsql_build::Catalog`. Fail-closed: an absent env var, an unreadable
+/// file, or a corrupt catalog is a `compile_error!` — never a silent pass
+/// against a missing schema (which would be the stale-schema blind spot
+/// this design exists to remove).
+fn load_build_catalog(span: Span) -> syn::Result<bsql_build::Catalog> {
+    let path = std::env::var(CATALOG_ENV_VAR).map_err(|_| {
+        syn::Error::new(
+            span,
+            format!(
+                "query!: the schema catalog environment variable \
+                 `{CATALOG_ENV_VAR}` is not set. The consumer crate must have \
+                 a `build.rs` calling `bsql_build::emit_catalog(..)` (and \
+                 `bsql-build` in its `[build-dependencies]`). Refusing to type \
+                 a query against a missing schema."
+            ),
+        )
+    })?;
+    let text = std::fs::read_to_string(&path).map_err(|err| {
+        syn::Error::new(
+            span,
+            format!(
+                "query!: cannot read the schema catalog at `{path}`: {err}. The \
+                 catalog is generated by `bsql-build` into OUT_DIR at build \
+                 time; an unreadable catalog fails closed rather than typing a \
+                 query against an unknown schema."
+            ),
+        )
+    })?;
+    bsql_build::parse_catalog(&text).map_err(|err| {
+        syn::Error::new(
+            span,
+            format!("query!: the schema catalog at `{path}` is malformed: {err}"),
+        )
+    })
+}
+
+/// The fixed binary width (in bytes) of a column type, as `(usize, i32)`
+/// for the const-generic chunk length and the length-prefix comparison.
+/// `text` is variable-width and has no fixed size.
+fn fixed_width(ty: bsql_build::RustType) -> Option<(usize, i32)> {
+    use bsql_build::RustType;
+    match ty {
+        RustType::I16 => Some((2, 2)),
+        RustType::I32 => Some((4, 4)),
+        RustType::I64 => Some((8, 8)),
+        RustType::U32 => Some((4, 4)),
+        RustType::Bool => Some((1, 1)),
+        RustType::Text => None,
+    }
+}
+
+/// The Rust type used as the `Cell<BinaryFmt>` `Self` in a decode call
+/// (`text` decodes through `&str`, borrowing the input bytes).
+fn cell_marker(ty: bsql_build::RustType) -> TokenStream2 {
+    use bsql_build::RustType;
+    match ty {
+        RustType::I16 => quote!(i16),
+        RustType::I32 => quote!(i32),
+        RustType::I64 => quote!(i64),
+        RustType::U32 => quote!(u32),
+        RustType::Bool => quote!(bool),
+        RustType::Text => quote!(&str),
+    }
+}
+
+/// A record field's Rust type. Borrowed text is `&'q str`; owned text is
+/// `String`; a nullable column is wrapped in `Option<..>`.
+fn field_type(ty: bsql_build::RustType, nullable: bool, is_owned: bool) -> TokenStream2 {
+    use bsql_build::RustType;
+    let base = match ty {
+        RustType::I16 => quote!(i16),
+        RustType::I32 => quote!(i32),
+        RustType::I64 => quote!(i64),
+        RustType::U32 => quote!(u32),
+        RustType::Bool => quote!(bool),
+        RustType::Text => {
+            if is_owned {
+                quote!(::std::string::String)
+            } else {
+                quote!(&'q str)
+            }
+        }
+    };
+    if nullable {
+        quote!(::core::option::Option<#base>)
+    } else {
+        base
+    }
+}
+
+/// Build a field identifier from an output column name, using a raw
+/// identifier for a Rust keyword (`type` -> `r#type`). A name that is not
+/// a valid identifier at all is a loud error (alias it in the SQL).
+fn make_field_ident(name: &str, span: Span) -> syn::Result<Ident> {
+    if let Ok(id) = syn::parse_str::<Ident>(name) {
+        return Ok(id);
+    }
+    if let Ok(id) = syn::parse_str::<Ident>(&format!("r#{name}")) {
+        return Ok(id);
+    }
+    Err(syn::Error::new(
+        span,
+        format!(
+            "query!: output column name `{name}` is not a valid Rust \
+             identifier; alias it in the SQL with `AS <valid_name>`"
+        ),
+    ))
+}
+
+/// Emit the borrowed + owned record twins and their `decode` fns.
+fn emit_records(
+    name: &Ident,
+    columns: &[bsql_build::InferredColumn],
+) -> syn::Result<TokenStream2> {
+    use bsql_build::RustType;
+
+    let owned_name = format_ident!("{}Owned", name);
+
+    // One field identifier per output column. A duplicate output column
+    // name is already a loud `InferError::DuplicateOutputColumn` from the
+    // inference engine; the Rust "two fields, one name" rule (E0124) is
+    // the structural backstop.
+    let mut field_idents = Vec::with_capacity(columns.len());
+    // Per-column 0-based index, as a `u8` for the `TruncatedColumnLen`
+    // diagnostic on a short row. Bounded loudly so the cast is never lossy.
+    let mut col_idx_u8 = Vec::with_capacity(columns.len());
+    for (idx, col) in columns.iter().enumerate() {
+        field_idents.push(make_field_ident(&col.name, name.span())?);
+        match u8::try_from(idx) {
+            Ok(value) => col_idx_u8.push(value),
+            Err(_) => {
+                return Err(syn::Error::new(
+                    name.span(),
+                    "query!: more than 256 output columns are not supported",
+                ))
+            }
+        }
+    }
+
+    // The `DataRow` column-count header value (an `i16`). Bounded loudly
+    // by the same > 256 guard as the column indices above.
+    let n_i16: i16 = match i16::try_from(columns.len()) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(syn::Error::new(
+                name.span(),
+                "query!: more than 256 output columns are not supported",
+            ))
+        }
+    };
+
+    let has_text = columns.iter().any(|c| matches!(c.ty, RustType::Text));
+    // The vectorized fast path applies only when every column is a
+    // fixed-width binary type AND none is nullable: a NULL or a
+    // variable-width column would shift every later column's offset, so
+    // const offsets only hold under both conditions.
+    let all_fixed_not_null = columns
+        .iter()
+        .all(|c| !c.nullable && fixed_width(c.ty).is_some());
+
+    let borrowed_fields = field_idents.iter().zip(columns).map(|(id, col)| {
+        let ty = field_type(col.ty, col.nullable, false);
+        quote! { #id: #ty }
+    });
+    let owned_fields = field_idents.iter().zip(columns).map(|(id, col)| {
+        let ty = field_type(col.ty, col.nullable, true);
+        quote! { #id: #ty }
+    });
+
+    // The borrowed record carries `<'q>` ONLY when it has a borrowing
+    // (text) field — otherwise the lifetime would be unused, which the
+    // workspace `unused_lifetimes` floor forbids.
+    let borrowed_generics = if has_text { quote!(<'q>) } else { quote!() };
+    let borrowed_input = if has_text {
+        quote!(body: &'q [u8])
+    } else {
+        quote!(body: &[u8])
+    };
+
+    let borrowed_body =
+        decode_body(&field_idents, columns, &col_idx_u8, n_i16, all_fixed_not_null, false);
+    let owned_body =
+        decode_body(&field_idents, columns, &col_idx_u8, n_i16, all_fixed_not_null, true);
+
+    let allow_reason = "generated typed-record fields are the query's output row shape; a consumer may read any subset of the columns";
+
+    Ok(quote! {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        #[allow(dead_code, reason = #allow_reason)]
+        pub struct #name #borrowed_generics {
+            #(#borrowed_fields),*
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        #[allow(dead_code, reason = #allow_reason)]
+        pub struct #owned_name {
+            #(#owned_fields),*
+        }
+
+        impl #borrowed_generics #name #borrowed_generics {
+            /// Decode one raw `DataRow` payload (the wire bytes after the
+            /// field-count header) into the borrowed record. Borrowed
+            /// `text` columns alias the input bytes — zero allocation.
+            pub fn decode(#borrowed_input)
+                -> ::core::result::Result<Self, ::bsql_postgres_proto::DecodeError>
+            {
+                #borrowed_body
+            }
+        }
+
+        impl #owned_name {
+            /// Decode one raw `DataRow` payload (the wire bytes after the
+            /// field-count header) into the owned record.
+            pub fn decode(body: &[u8])
+                -> ::core::result::Result<Self, ::bsql_postgres_proto::DecodeError>
+            {
+                #owned_body
+            }
+        }
+    })
+}
+
+/// The body of one `decode` fn: the optional vectorized fast path (only
+/// for an all-fixed-width, all-NOT-NULL row) followed by the general
+/// per-cell path (which classifies NULL / variable-width / oversized
+/// rows). When the fast path is not eligible, only the per-cell path is
+/// emitted.
+fn decode_body(
+    field_idents: &[Ident],
+    columns: &[bsql_build::InferredColumn],
+    col_idx_u8: &[u8],
+    n_i16: i16,
+    all_fixed_not_null: bool,
+    is_owned: bool,
+) -> TokenStream2 {
+    let per_cell = per_cell_path(field_idents, columns, col_idx_u8, is_owned);
+    if all_fixed_not_null {
+        let fast = fast_path(field_idents, columns, n_i16);
+        quote! {
+            #fast
+            #per_cell
+        }
+    } else {
+        per_cell
+    }
+}
+
+/// The vectorized all-fixed-width path: the whole `DataRow` body is the
+/// 2-byte count header plus, per column, a 4-byte length prefix and a
+/// fixed-width payload, with no NULL and no variable column — so the body
+/// is exactly `2 + TOTAL` bytes and every column sits at a constant
+/// offset. The body length is validated once; each column's length prefix
+/// is checked against its fixed width and its payload read at a const
+/// offset. ANY deviation (a NULL, a wrong width, an oversized or
+/// truncated row) `break`s to the general per-cell path, which classifies
+/// it precisely — so this path can never mask an error, only accelerate
+/// the well-formed case.
+fn fast_path(
+    field_idents: &[Ident],
+    columns: &[bsql_build::InferredColumn],
+    n_i16: i16,
+) -> TokenStream2 {
+    // Count header value (i16) and the exact post-header byte total.
+    let n = columns.len();
+    let n_i16 = Literal::i16_suffixed(n_i16);
+    let mut total: usize = 0;
+    for col in columns {
+        if let Some((width, _)) = fixed_width(col.ty) {
+            total = total.saturating_add(4).saturating_add(width);
+        }
+    }
+    let total_lit = Literal::usize_unsuffixed(total);
+
+    let col_stmts = field_idents.iter().zip(columns).enumerate().map(|(i, (id, col))| {
+        let is_last = i + 1 == n;
+        // The trailing remainder after the LAST column's payload is
+        // unused (we return right after), so bind it to `_`; earlier
+        // remainders feed the next column.
+        let trailing = if is_last { quote!(_) } else { quote!(__after) };
+        match fixed_width(col.ty) {
+            Some((width, width_i32)) => {
+                let width_lit = Literal::usize_unsuffixed(width);
+                let width_i32_lit = Literal::i32_suffixed(width_i32);
+                let marker = cell_marker(col.ty);
+                quote! {
+                    let ::core::option::Option::Some((__len, __after)) =
+                        __after.split_first_chunk::<4>() else { break 'fast };
+                    if i32::from_be_bytes(*__len) != #width_i32_lit { break 'fast; }
+                    let ::core::option::Option::Some((__data, #trailing)) =
+                        __after.split_first_chunk::<#width_lit>() else { break 'fast };
+                    let #id = match <#marker as ::bsql_postgres_proto::Cell<
+                        ::bsql_postgres_proto::BinaryFmt,
+                    >>::decode(__data) {
+                        ::core::result::Result::Ok(__value) => __value,
+                        ::core::result::Result::Err(__err) =>
+                            return ::core::result::Result::Err(__err),
+                    };
+                }
+            }
+            // Unreachable: `fast_path` is only emitted when every column
+            // is fixed-width. If a non-fixed column ever reached here, the
+            // correct behaviour is to defer to the per-cell path — never a
+            // silent misread — so break out.
+            None => quote! { break 'fast; },
+        }
+    });
+
+    quote! {
+        'fast: {
+            let ::core::option::Option::Some((__count, __after)) =
+                body.split_first_chunk::<2>() else { break 'fast };
+            if i16::from_be_bytes(*__count) != #n_i16 { break 'fast; }
+            if __after.len() != #total_lit { break 'fast; }
+            #(#col_stmts)*
+            return ::core::result::Result::Ok(Self { #(#field_idents),* });
+        }
+    }
+}
+
+/// The general per-cell path: walk the row column by column via the
+/// shipped `DataRowRef` / `ColumnsIter`, decoding each cell with
+/// `Cell<BinaryFmt>`. This covers NULL (a NULL in a NOT-NULL column is a
+/// classified `NullInNonNullColumn`; a nullable column becomes
+/// `Option<T>`), variable-width `text`, and an oversized / truncated row
+/// (each malformed shape surfaces a classified `DecodeError`). No silent
+/// default, no panic.
+fn per_cell_path(
+    field_idents: &[Ident],
+    columns: &[bsql_build::InferredColumn],
+    col_idx_u8: &[u8],
+    is_owned: bool,
+) -> TokenStream2 {
+    if columns.is_empty() {
+        // No projected columns: validate the row body and build the empty
+        // record. `parse` still fails closed on a malformed count header.
+        return quote! {
+            ::bsql_postgres_proto::DataRowRef::parse(body)?;
+            ::core::result::Result::Ok(Self {})
+        };
+    }
+
+    let stmts = field_idents
+        .iter()
+        .zip(columns)
+        .zip(col_idx_u8)
+        .map(|((id, col), idx)| {
+            let idx_lit = Literal::u8_suffixed(*idx);
+            let value = per_cell_value_expr(col.ty, col.nullable, is_owned);
+            quote! {
+                let __cell = match ::core::iter::Iterator::next(&mut __cols) {
+                    ::core::option::Option::Some(__result) => __result?,
+                    // The row declared fewer columns than the query
+                    // projects: a classified short-row error, never a
+                    // silently-defaulted field.
+                    ::core::option::Option::None => return ::core::result::Result::Err(
+                        ::bsql_postgres_proto::DecodeError::TruncatedColumnLen {
+                            column_idx: #idx_lit,
+                        },
+                    ),
+                };
+                let #id = #value;
+            }
+        });
+
+    quote! {
+        let __row = ::bsql_postgres_proto::DataRowRef::parse(body)?;
+        let mut __cols = ::bsql_postgres_proto::DataRowRef::columns(&__row);
+        #(#stmts)*
+        ::core::result::Result::Ok(Self { #(#field_idents),* })
+    }
+}
+
+/// One per-cell column value expression. A NOT-NULL column returns the
+/// decoded value or a classified `NullInNonNullColumn` on NULL; a
+/// nullable column returns `Some(value)` / `None`.
+fn per_cell_value_expr(ty: bsql_build::RustType, nullable: bool, is_owned: bool) -> TokenStream2 {
+    let decode_expr = decode_call_expr(ty, is_owned);
+    if nullable {
+        quote! {
+            match __cell {
+                ::core::option::Option::Some(__bytes) =>
+                    ::core::option::Option::Some(#decode_expr),
+                ::core::option::Option::None => ::core::option::Option::None,
+            }
+        }
+    } else {
+        quote! {
+            match __cell {
+                ::core::option::Option::Some(__bytes) => #decode_expr,
+                // A NULL in a NOT-NULL-typed column: a classified
+                // decode error, never a silent default or panic.
+                ::core::option::Option::None => return ::core::result::Result::Err(
+                    ::bsql_postgres_proto::DecodeError::NullInNonNullColumn,
+                ),
+            }
+        }
+    }
+}
+
+/// The decode call for one non-NULL cell body (`__bytes`). Owned `text`
+/// copies the borrowed `&str` into a `String`; every other type decodes
+/// directly through `Cell<BinaryFmt>`.
+fn decode_call_expr(ty: bsql_build::RustType, is_owned: bool) -> TokenStream2 {
+    use bsql_build::RustType;
+    let marker = cell_marker(ty);
+    let raw = quote! {
+        <#marker as ::bsql_postgres_proto::Cell<::bsql_postgres_proto::BinaryFmt>>::decode(__bytes)?
+    };
+    match (ty, is_owned) {
+        (RustType::Text, true) => quote! { ::std::string::String::from(#raw) },
+        _ => raw,
     }
 }

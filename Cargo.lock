@@ -145,6 +145,8 @@ name = "bsql-query-fixture"
 version = "0.0.0"
 dependencies = [
  "bsql-build",
+ "bsql-devgates",
+ "bsql-postgres-proto",
  "bsql-query-macros",
  "trybuild",
 ]
@@ -153,6 +155,7 @@ dependencies = [
 name = "bsql-query-macros"
 version = "1.0.0-alpha.0"
 dependencies = [
+ "bsql-build",
  "proc-macro2",
  "quote",
  "syn",
