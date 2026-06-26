@@ -64,7 +64,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+mod infer;
+
+pub use infer::{infer_query, InferError, InferredColumn, QueryShape, RustType};
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -100,6 +104,17 @@ pub struct ColumnInfo {
 pub struct Catalog {
     /// table name -> (column name -> column info).
     pub tables: BTreeMap<String, BTreeMap<String, ColumnInfo>>,
+    /// table name -> the SET of columns forming that table's PRIMARY KEY
+    /// (case-folded to match the column keys), declared either at column
+    /// level (`id BIGINT PRIMARY KEY`) or at table level
+    /// (`PRIMARY KEY (a, b)`), or added later by `ALTER TABLE ... ADD
+    /// PRIMARY KEY (...)`. A table with no primary key has no entry. The
+    /// set is used to decide functional dependency in an aggregate query: a
+    /// relation whose ENTIRE primary key appears in the `GROUP BY` set
+    /// determines all of its columns. A `BTreeSet` is order-independent
+    /// (membership is all the coverage check needs) and keeps the serialized
+    /// form byte-deterministic.
+    pub primary_keys: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// A build-time failure. Every variant is fatal: the consumer's
@@ -329,6 +344,18 @@ fn descend(dir: &Path, walk: &mut Walk) -> Result<(), BuildError> {
     Ok(())
 }
 
+/// Test-only re-export of [`replay_file`] so the sibling `infer` module's
+/// unit tests can build a [`Catalog`] from DDL strings without duplicating
+/// the parse/replay path.
+#[cfg(test)]
+pub(crate) fn replay_file_for_test(
+    catalog: &mut Catalog,
+    path: &Path,
+    sql: &str,
+) -> Result<(), BuildError> {
+    replay_file(catalog, path, sql)
+}
+
 /// Parse and replay every statement in one migration file.
 fn replay_file(catalog: &mut Catalog, path: &Path, sql: &str) -> Result<(), BuildError> {
     let dialect = PostgreSqlDialect {};
@@ -358,7 +385,7 @@ fn replay_statement(
     match statement {
         Statement::CreateTable(create) => replay_create_table(catalog, path, create),
         Statement::AlterTable(alter) => {
-            let table = object_name_leaf(&alter.name);
+            let table = replay_relation_key(&alter.name, path)?;
             for op in alter.operations {
                 replay_alter_op(catalog, path, &table, op)?;
             }
@@ -370,8 +397,12 @@ fn replay_statement(
             ..
         } => {
             for name in names {
-                let table = object_name_leaf(&name);
+                let table = replay_relation_key(&name, path)?;
                 catalog.tables.remove(&table);
+                // The primary-key record is keyed by the same table name, so
+                // it is removed alongside the columns; leaving it would let a
+                // later same-named table inherit a stale key.
+                catalog.primary_keys.remove(&table);
             }
             Ok(())
         }
@@ -383,8 +414,8 @@ fn replay_statement(
         // resolving.
         Statement::RenameTable(renames) => {
             for rename in renames {
-                let from = object_name_leaf(&rename.old_name);
-                let to = object_name_leaf(&rename.new_name);
+                let from = replay_relation_key(&rename.old_name, path)?;
+                let to = replay_relation_key(&rename.new_name, path)?;
                 rekey_table(catalog, path, &from, to)?;
             }
             Ok(())
@@ -406,7 +437,7 @@ fn replay_create_table(
     path: &Path,
     create: sqlparser::ast::CreateTable,
 ) -> Result<(), BuildError> {
-    let table = object_name_leaf(&create.name);
+    let table = replay_relation_key(&create.name, path)?;
 
     // Forms whose columns this replay does NOT derive. Registering them as
     // an empty (or merged) table would silently hide every column they
@@ -484,23 +515,57 @@ fn replay_create_table(
     }
 
     let mut columns: BTreeMap<String, ColumnInfo> = BTreeMap::new();
-    // PRIMARY KEY can be declared at table level: `PRIMARY KEY (a, b)`.
-    // Those columns are NOT NULL in PostgreSQL.
-    let mut pk_columns: Vec<String> = Vec::new();
+    // The PRIMARY KEY can be declared in exactly one of two places: at COLUMN
+    // level (`id BIGINT PRIMARY KEY`) on a single column, or at TABLE level
+    // (`PRIMARY KEY (a, b)`) over one or more columns. PostgreSQL allows AT
+    // MOST ONE primary key per table ("multiple primary keys for table are not
+    // allowed"), so a second declaration in either place is a migration error
+    // this replay rejects loudly rather than silently keeping one and dropping
+    // the other (which would record a wrong key set). Whichever form declares
+    // it, those columns are NOT NULL in PostgreSQL.
+    //
+    // `pk_columns` is `Some(set)` once the single primary key has been seen.
+    let mut pk_columns: Option<BTreeSet<String>> = None;
+    let mut set_pk = |names: Vec<String>| -> Result<(), BuildError> {
+        if pk_columns.is_some() {
+            return Err(BuildError::Replay {
+                path: path.to_path_buf(),
+                message: format!(
+                    "CREATE TABLE `{table}` declares more than one PRIMARY KEY. \
+                     PostgreSQL allows at most one primary key per table."
+                ),
+            });
+        }
+        pk_columns = Some(names.into_iter().collect());
+        Ok(())
+    };
     for constraint in &create.constraints {
         if let TableConstraint::PrimaryKey(pk) = constraint {
-            for name in index_column_names(&pk.columns) {
-                pk_columns.push(name);
-            }
+            set_pk(index_column_names(&pk.columns))?;
+        }
+    }
+    for column in &create.columns {
+        if column_is_primary_key(column) {
+            set_pk(vec![fold_ident(&column.name)])?;
         }
     }
     for column in &create.columns {
         let info = column_info(column);
         columns.insert(fold_ident(&column.name), info);
     }
-    for pk in pk_columns {
-        if let Some(info) = columns.get_mut(&pk) {
-            info.not_null = true;
+    if let Some(pk) = pk_columns {
+        for name in &pk {
+            if let Some(info) = columns.get_mut(name) {
+                info.not_null = true;
+            }
+        }
+        // Record the key only when it names at least one resolvable column. A
+        // table-level `PRIMARY KEY` over solely functional-index expressions
+        // (which carry no plain column name) yields an empty set; an empty PK
+        // set would spuriously "cover" every column under the functional-
+        // dependency rule, so it is omitted rather than stored.
+        if !pk.is_empty() {
+            catalog.primary_keys.insert(table.clone(), pk);
         }
     }
     catalog.tables.insert(table, columns);
@@ -521,6 +586,12 @@ fn rekey_table(
         path: path.to_path_buf(),
         message: format!("RENAME of unknown table `{from}`: no such table"),
     })?;
+    // Re-key the primary-key record under the new table name so the functional
+    // dependency continues to resolve after a rename. A table with no primary
+    // key has no entry to move.
+    if let Some(pk) = catalog.primary_keys.remove(from) {
+        catalog.primary_keys.insert(to.clone(), pk);
+    }
     catalog.tables.insert(to, columns);
     Ok(())
 }
@@ -543,7 +614,7 @@ fn replay_alter_op(
     if let AlterTableOperation::RenameTable { table_name } = op {
         let to = match table_name {
             RenameTableNameKind::To(name) | RenameTableNameKind::As(name) => {
-                object_name_leaf(&name)
+                replay_relation_key(&name, path)?
             }
         };
         return rekey_table(catalog, path, table, to);
@@ -574,6 +645,17 @@ fn replay_alter_op(
                         ),
                     });
                 }
+                // Dropping a column that is part of the primary key drops the
+                // whole primary key in PostgreSQL (the key can no longer be
+                // formed). The recorded key would otherwise name a column that
+                // no longer exists and could falsely satisfy the functional
+                // dependency, so the entire record is removed. `primary_keys`
+                // is a field disjoint from the `columns` borrow above.
+                if let Some(pk) = catalog.primary_keys.get(table)
+                    && pk.contains(&name)
+                {
+                    catalog.primary_keys.remove(table);
+                }
             }
             Ok(())
         }
@@ -582,13 +664,23 @@ fn replay_alter_op(
             new_column_name,
         } => {
             let old = fold_ident(&old_column_name);
+            let new = fold_ident(&new_column_name);
             let info = columns.remove(&old).ok_or_else(|| BuildError::Replay {
                 path: path.to_path_buf(),
                 message: format!(
                     "RENAME COLUMN `{old}` on table `{table}`: no such column"
                 ),
             })?;
-            columns.insert(fold_ident(&new_column_name), info);
+            columns.insert(new.clone(), info);
+            // A renamed column that is part of the primary key keeps its
+            // membership under the new name, so the functional dependency
+            // continues to resolve after the rename. `primary_keys` is a
+            // field disjoint from the `columns` borrow above.
+            if let Some(pk) = catalog.primary_keys.get_mut(table)
+                && pk.remove(&old)
+            {
+                pk.insert(new);
+            }
             Ok(())
         }
         AlterTableOperation::AlterColumn { column_name, op } => {
@@ -622,14 +714,34 @@ fn replay_alter_op(
         }
         // A table-level constraint add. Only a PRIMARY KEY changes a
         // column's {type, nullability} shape (its columns become NOT
-        // NULL); every other constraint kind (UNIQUE, CHECK, FOREIGN KEY)
-        // is shape-irrelevant to this catalog.
+        // NULL) and establishes the table's primary key; every other
+        // constraint kind (UNIQUE, CHECK, FOREIGN KEY) is shape-irrelevant
+        // to this catalog. A second PRIMARY KEY (one already exists) is a
+        // migration error PostgreSQL rejects ("multiple primary keys ... are
+        // not allowed"), so it is loud rather than a silent overwrite of the
+        // recorded key. `primary_keys` is a field disjoint from the `columns`
+        // borrow above.
         AlterTableOperation::AddConstraint { constraint, .. } => {
             if let TableConstraint::PrimaryKey(pk) = constraint {
-                for name in index_column_names(&pk.columns) {
-                    if let Some(info) = columns.get_mut(&name) {
+                let names = index_column_names(&pk.columns);
+                for name in &names {
+                    if let Some(info) = columns.get_mut(name) {
                         info.not_null = true;
                     }
+                }
+                let key: BTreeSet<String> = names.into_iter().collect();
+                if !key.is_empty() {
+                    if catalog.primary_keys.contains_key(table) {
+                        return Err(BuildError::Replay {
+                            path: path.to_path_buf(),
+                            message: format!(
+                                "ALTER TABLE `{table}` ADD PRIMARY KEY: a primary \
+                                 key already exists. PostgreSQL allows at most one \
+                                 primary key per table."
+                            ),
+                        });
+                    }
+                    catalog.primary_keys.insert(table.to_string(), key);
                 }
             }
             Ok(())
@@ -677,6 +789,15 @@ fn replay_alter_op(
         // error, never a silent pass.
         //
         // Constraints / keys / indexes (other than PK add, handled above).
+        // `DROP CONSTRAINT <name>` carries only the constraint NAME, not its
+        // kind, so this replay cannot tell whether the dropped constraint is
+        // the primary key. It is treated as shape-irrelevant — the same
+        // name-blind boundary the catalog already applies to a column's
+        // NOT NULL flag, which a `DROP CONSTRAINT` on the primary key would
+        // likewise leave set. The primary key established by `CREATE TABLE`,
+        // `ALTER TABLE ADD PRIMARY KEY`, a `DROP COLUMN` of a key member, and
+        // a `RENAME COLUMN` of a key member are all tracked exactly; only the
+        // name-only `DROP CONSTRAINT` form sits outside that boundary.
         AlterTableOperation::DropConstraint { .. }
         | AlterTableOperation::ValidateConstraint { .. }
         | AlterTableOperation::RenameConstraint { .. }
@@ -734,6 +855,16 @@ fn replay_alter_op(
         // arm is unreachable but keeps the match exhaustive without a `_`.
         AlterTableOperation::RenameTable { .. } => Ok(()),
     }
+}
+
+/// Whether a column definition carries a column-level `PRIMARY KEY` option
+/// (`id BIGINT PRIMARY KEY`). A column-level primary key names exactly this
+/// one column as the table's primary key.
+fn column_is_primary_key(column: &ColumnDef) -> bool {
+    column
+        .options
+        .iter()
+        .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
 }
 
 /// Extract the `{ pg_type, not_null }` shape from a column definition.
@@ -820,6 +951,20 @@ fn fold_ident(ident: &Ident) -> String {
     }
 }
 
+/// Whether a leading schema qualifier folds to the default `public` schema,
+/// using the SAME PostgreSQL case rule the catalog applies everywhere
+/// ([`fold_ident`]): an UNQUOTED `public` folds case-insensitively (so
+/// `PUBLIC` matches), and a double-quoted `"public"` matches only when its
+/// preserved-case value is exactly `public` (so `"PUBLIC"` does NOT).
+///
+/// The catalog has a single namespace — the DDL replay keys every table by its
+/// bare name — so a qualifier that folds to `public` is the explicit spelling
+/// of that one namespace and is dropped, while any other schema names a
+/// dimension the catalog does not model and stays loud at the caller.
+fn schema_part_folds_to_public(schema: &Ident) -> bool {
+    fold_ident(schema) == "public"
+}
+
 /// The trailing identifier of an `ObjectName`, case-folded (drops any
 /// schema/database qualifier; the catalog keys tables by their bare name
 /// for the current scope).
@@ -833,20 +978,73 @@ fn object_name_leaf(name: &ObjectName) -> String {
     }
 }
 
+/// Resolve a DDL relation `ObjectName` to its catalog key, LOUD on any
+/// qualifier the single-namespace catalog cannot model.
+///
+/// The catalog keys every table by its bare name, so a relation is keyed only
+/// when it is:
+///
+/// * a 1-part bare name (`widgets`), folded to its leaf; or
+/// * a 2-part name whose leading qualifier folds to the default `public`
+///   schema (`public.widgets`, `"public".widgets`), folded to its leaf.
+///
+/// A NON-`public` schema (`wrongschema.widgets`) or a 3+-part path
+/// (`db.schema.widgets`) names a namespace dimension the catalog does not
+/// model. Silently re-keying it to the bare leaf would catalog the table under
+/// a name a bare query resolves to — but in PostgreSQL that table lives in a
+/// different schema and a bare query hits `public` instead, so the catalog
+/// would be wrong. It is a loud [`BuildError::Replay`] naming the FULL path
+/// (symmetric with the query-side relation resolver), never a silently-wrong
+/// catalog. This mirrors the relation resolver: `public.X` and bare `X` both
+/// key to `X`.
+fn replay_relation_key(name: &ObjectName, path: &Path) -> Result<String, BuildError> {
+    let loud = || BuildError::Replay {
+        path: path.to_path_buf(),
+        message: format!(
+            "relation `{name}` is schema-qualified with a schema this \
+             single-namespace catalog does not model. Only a bare name or the \
+             default `public` schema is keyed; a non-public schema or a \
+             multi-part path names a namespace dimension the catalog cannot \
+             carry. Define the table in the default schema, or reference it \
+             unqualified."
+        ),
+    };
+    match name.0.as_slice() {
+        [only] => only.as_ident().map(fold_ident).ok_or_else(loud),
+        [schema, table] => {
+            let schema = schema.as_ident().ok_or_else(loud)?;
+            if schema_part_folds_to_public(schema) {
+                table.as_ident().map(fold_ident).ok_or_else(loud)
+            } else {
+                Err(loud())
+            }
+        }
+        _ => Err(loud()),
+    }
+}
+
 /// Serialize the catalog to the line-oriented text format the query
 /// proc-macro parses. One column per line:
 ///
 /// ```text
-/// <table>\t<column>\t<pg_type>\t<0|1 not_null>
+/// <table>\t<column>\t<pg_type>\t<0|1 not_null>\t<0|1 primary_key>
 /// ```
 ///
 /// Sorted (via `BTreeMap`) so output is byte-deterministic. The format
 /// is parsed with `str::lines` + `split('\t')` — no deserialization
-/// dependency, fully greppable, and stable across builds.
+/// dependency, fully greppable, and stable across builds. The trailing
+/// primary-key field reconstructs each table's key SET as the columns
+/// whose flag is `1`; a reader that needs only table/column existence
+/// ignores it.
 fn serialize(catalog: &Catalog) -> String {
     let mut out = String::new();
     for (table, columns) in &catalog.tables {
+        let pk = catalog.primary_keys.get(table);
         for (column, info) in columns {
+            let is_pk = match pk {
+                Some(set) => set.contains(column),
+                None => false,
+            };
             out.push_str(table);
             out.push('\t');
             out.push_str(column);
@@ -854,6 +1052,14 @@ fn serialize(catalog: &Catalog) -> String {
             out.push_str(&info.pg_type);
             out.push('\t');
             out.push(if info.not_null { '1' } else { '0' });
+            // A fifth field marks whether the column is part of the table's
+            // PRIMARY KEY (`1`) or not (`0`). The reading proc-macro splits on
+            // tabs and consumes only the leading table/column fields, so this
+            // trailing field is ignored by it while still carrying the key for
+            // a reader that reconstructs the primary-key SET from the `1`
+            // columns of each table.
+            out.push('\t');
+            out.push(if is_pk { '1' } else { '0' });
             out.push('\n');
         }
     }
@@ -946,6 +1152,122 @@ mod tests {
         assert!(!cat.tables.contains_key("t"));
     }
 
+    // ── PRIMARY KEY tracking ───────────────────────────────────────────
+
+    fn pk(cat: &Catalog, table: &str) -> Vec<String> {
+        match cat.primary_keys.get(table) {
+            Some(set) => set.iter().cloned().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn column_level_primary_key_is_recorded() {
+        let cat = catalog_from(&["CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)"]);
+        assert_eq!(pk(&cat, "t"), vec!["id".to_string()]);
+        // PK implies NOT NULL.
+        assert!(cat.tables["t"]["id"].not_null);
+    }
+
+    #[test]
+    fn table_level_composite_primary_key_is_recorded() {
+        let cat = catalog_from(&["CREATE TABLE t (a INT, b INT, c TEXT, PRIMARY KEY (a, b))"]);
+        assert_eq!(pk(&cat, "t"), vec!["a".to_string(), "b".to_string()]);
+        assert!(cat.tables["t"]["a"].not_null);
+        assert!(cat.tables["t"]["b"].not_null);
+        assert!(!cat.tables["t"]["c"].not_null);
+    }
+
+    #[test]
+    fn no_primary_key_has_no_record() {
+        let cat = catalog_from(&["CREATE TABLE t (a INT, b INT)"]);
+        assert!(!cat.primary_keys.contains_key("t"));
+    }
+
+    #[test]
+    fn multiple_primary_keys_is_loud() {
+        // Two column-level PKs.
+        let msg = replay_err(&["CREATE TABLE t (a INT PRIMARY KEY, b INT PRIMARY KEY)"]);
+        assert!(msg.contains("more than one PRIMARY KEY"), "got: {msg}");
+        // Column-level PK plus a table-level PK.
+        let msg = replay_err(&["CREATE TABLE t (a INT PRIMARY KEY, b INT, PRIMARY KEY (b))"]);
+        assert!(msg.contains("more than one PRIMARY KEY"), "got: {msg}");
+    }
+
+    #[test]
+    fn alter_add_primary_key_is_recorded() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a INT NOT NULL, b INT)",
+            "ALTER TABLE t ADD PRIMARY KEY (a)",
+        ]);
+        assert_eq!(pk(&cat, "t"), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn alter_add_second_primary_key_is_loud() {
+        let msg = replay_err(&[
+            "CREATE TABLE t (a INT PRIMARY KEY, b INT NOT NULL)",
+            "ALTER TABLE t ADD PRIMARY KEY (b)",
+        ]);
+        assert!(msg.contains("a primary key already exists"), "got: {msg}");
+    }
+
+    #[test]
+    fn dropping_a_primary_key_column_drops_the_key() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a INT PRIMARY KEY, b INT)",
+            "ALTER TABLE t DROP COLUMN a",
+        ]);
+        assert!(!cat.primary_keys.contains_key("t"), "key removed with col");
+    }
+
+    #[test]
+    fn dropping_one_composite_key_column_drops_the_whole_key() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a INT, b INT, c TEXT, PRIMARY KEY (a, b))",
+            "ALTER TABLE t DROP COLUMN a",
+        ]);
+        assert!(!cat.primary_keys.contains_key("t"), "whole key removed");
+    }
+
+    #[test]
+    fn renaming_a_primary_key_column_follows_the_key() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a INT PRIMARY KEY, b INT)",
+            "ALTER TABLE t RENAME COLUMN a TO aa",
+        ]);
+        assert_eq!(pk(&cat, "t"), vec!["aa".to_string()]);
+    }
+
+    #[test]
+    fn renaming_a_table_moves_its_primary_key() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a INT PRIMARY KEY, b INT)",
+            "ALTER TABLE t RENAME TO u",
+        ]);
+        assert!(!cat.primary_keys.contains_key("t"));
+        assert_eq!(pk(&cat, "u"), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn dropping_a_table_removes_its_primary_key() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a INT PRIMARY KEY, b INT)",
+            "DROP TABLE t",
+        ]);
+        assert!(!cat.primary_keys.contains_key("t"));
+    }
+
+    #[test]
+    fn recreating_a_dropped_table_does_not_inherit_a_stale_key() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a INT PRIMARY KEY, b INT)",
+            "DROP TABLE t",
+            "CREATE TABLE t (a INT, b INT)",
+        ]);
+        assert!(!cat.primary_keys.contains_key("t"), "no stale key");
+    }
+
     #[test]
     fn alter_unknown_table_is_error() {
         let mut cat = Catalog::default();
@@ -985,8 +1307,28 @@ mod tests {
     fn serialize_is_deterministic_and_tab_separated() {
         let cat = catalog_from(&["CREATE TABLE t (b INT, a TEXT NOT NULL)"]);
         let s = serialize(&cat);
-        // Columns sorted: a before b.
-        assert_eq!(s, "t\ta\ttext\t1\nt\tb\tint4\t0\n");
+        // Columns sorted: a before b. No primary key, so the trailing
+        // PK field is `0` on every row.
+        assert_eq!(s, "t\ta\ttext\t1\t0\nt\tb\tint4\t0\t0\n");
+    }
+
+    #[test]
+    fn serialize_marks_primary_key_columns() {
+        // A column-level PK and a composite table-level PK both serialize
+        // their key columns with the trailing PK field set to `1`, and
+        // non-key columns to `0`.
+        let cat = catalog_from(&[
+            "CREATE TABLE one (id BIGINT PRIMARY KEY, name TEXT NOT NULL)",
+            "CREATE TABLE two (a INT, b INT, c TEXT, PRIMARY KEY (a, b))",
+        ]);
+        let s = serialize(&cat);
+        // `one`: id is the PK (1), name is not (0).
+        assert!(s.contains("one\tid\tint8\t1\t1\n"));
+        assert!(s.contains("one\tname\ttext\t1\t0\n"));
+        // `two`: a and b are the composite PK (1), c is not (0).
+        assert!(s.contains("two\ta\tint4\t1\t1\n"));
+        assert!(s.contains("two\tb\tint4\t1\t1\n"));
+        assert!(s.contains("two\tc\ttext\t0\t0\n"));
     }
 
     #[test]
@@ -1007,6 +1349,83 @@ mod tests {
     fn rename_unknown_table_is_error() {
         let msg = replay_err(&["ALTER TABLE ghost RENAME TO spirit"]);
         assert!(msg.contains("unknown table"), "got: {msg}");
+    }
+
+    #[test]
+    fn create_table_public_qualified_keys_to_bare_name() {
+        // `public.X` and `"public".X` both name the default schema PostgreSQL
+        // resolves a bare reference to; the catalog keys them to bare `X`,
+        // symmetric with the query-side resolver.
+        for ddl in [
+            "CREATE TABLE public.widgets (wid INT)",
+            "CREATE TABLE PUBLIC.widgets (wid INT)",
+            "CREATE TABLE \"public\".widgets (wid INT)",
+        ] {
+            let cat = catalog_from(&[ddl]);
+            assert!(cat.tables.contains_key("widgets"), "keyed to bare name: {ddl}");
+        }
+    }
+
+    #[test]
+    fn create_table_nonpublic_schema_is_loud_and_names_path() {
+        // A non-`public` schema is a namespace the single-namespace catalog
+        // cannot model: silently re-keying `wrongschema.widgets` to bare
+        // `widgets` would catalog a table a bare query would wrongly resolve.
+        // It is a loud Replay error naming the full path, never silent.
+        let msg = replay_err(&["CREATE TABLE wrongschema.widgets (wid INT)"]);
+        assert!(
+            msg.contains("wrongschema") && msg.contains("does not model"),
+            "must name the path loudly: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_table_quoted_uppercase_public_schema_is_loud() {
+        // A quoted `"PUBLIC"` keeps its upper case, so it is a distinct schema
+        // (not the default `public`); it is loud.
+        let msg = replay_err(&["CREATE TABLE \"PUBLIC\".widgets (wid INT)"]);
+        assert!(msg.contains("does not model"), "got: {msg}");
+    }
+
+    #[test]
+    fn create_table_three_part_path_is_loud() {
+        // A 3-part `db.schema.table` path names a database dimension the
+        // catalog does not model; it is loud.
+        let msg = replay_err(&["CREATE TABLE mydb.public.widgets (wid INT)"]);
+        assert!(msg.contains("does not model"), "got: {msg}");
+    }
+
+    #[test]
+    fn alter_nonpublic_schema_table_is_loud() {
+        // The same loud-on-non-public rule applies to ALTER TABLE's relation
+        // key, so an ALTER cannot silently target a re-keyed bare table.
+        let msg = replay_err(&[
+            "CREATE TABLE widgets (wid INT)",
+            "ALTER TABLE wrongschema.widgets ADD COLUMN extra INT",
+        ]);
+        assert!(msg.contains("does not model"), "got: {msg}");
+    }
+
+    #[test]
+    fn drop_nonpublic_schema_table_is_loud() {
+        // DROP TABLE's relation key is loud on a non-public schema too.
+        let msg = replay_err(&[
+            "CREATE TABLE widgets (wid INT)",
+            "DROP TABLE wrongschema.widgets",
+        ]);
+        assert!(msg.contains("does not model"), "got: {msg}");
+    }
+
+    #[test]
+    fn rename_to_nonpublic_schema_is_loud() {
+        // The MySQL-style `RENAME TABLE old TO new` and the PostgreSQL
+        // `ALTER TABLE old RENAME TO new` target are both loud on a non-public
+        // schema, so a rename cannot move a table into an unmodeled namespace.
+        let msg = replay_err(&[
+            "CREATE TABLE widgets (wid INT)",
+            "RENAME TABLE widgets TO wrongschema.gadgets",
+        ]);
+        assert!(msg.contains("does not model"), "got: {msg}");
     }
 
     #[test]
