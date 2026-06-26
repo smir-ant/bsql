@@ -435,7 +435,7 @@ pub use pristine::Pristine;
 // — the trait + type live in the type namespace, the macro in the
 // macro namespace.
 pub use bsql_postgres_derive::prepared;
-pub use prepared::{PreparedQuery, RowDecode};
+pub use prepared::{PreparedQuery, QueryFingerprint, RowDecode};
 pub use state::ProtoState;
 // Per-phase state enums for the `<ConnectingPhase>` /
 // `<ActivePhase>` / `<ClosedPhase>` API. ConnectingState is the

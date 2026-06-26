@@ -319,7 +319,18 @@ fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     let shape = bsql_build::infer_query(&catalog, &sql_text)
         .map_err(|err| syn::Error::new(sql_span, format!("query!: {err}")))?;
 
-    emit_records(&name, &shape.columns)
+    // The typed-record twins (borrowed + owned) and their decoders.
+    let records = emit_records(&name, &shape.columns)?;
+    // The const wire artifact: the uninhabited fingerprint carrier, its
+    // `QueryFingerprint` impl (the baked Parse / Bind-prefix templates +
+    // OID lists, all derived from the inferred shape), and the validated
+    // `PreparedQuery` const minted through the proto-owned `run` boundary.
+    let wire = emit_wire_artifact(&name, &sql_text, &shape)?;
+
+    Ok(quote! {
+        #records
+        #wire
+    })
 }
 
 /// Read the catalog text via the rustc-env channel and rebuild the
@@ -735,4 +746,293 @@ fn decode_call_expr(ty: bsql_build::RustType, is_owned: bool) -> TokenStream2 {
         (RustType::Text, true) => quote! { ::std::string::String::from(#raw) },
         _ => raw,
     }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// query! — const wire artifact + fingerprint seal
+// ════════════════════════════════════════════════════════════════════
+//
+// In addition to the typed-record twins above, `query!` emits the
+// compile-time wire artifact: the pre-baked `Parse` / `Bind`-prefix byte
+// templates, the parameter / row OID lists, and the content-addressed
+// statement name — all derived from the inferred `QueryShape`. The
+// artifact is delivered as an uninhabited carrier type + a
+// `QueryFingerprint` impl, and the `PreparedQuery` const is minted
+// through the proto-owned `run::<Carrier>()` boundary, which forces the
+// VALIDATING constructor in the runtime crate. A drift between the baked
+// wire bytes and the declared parameter / row types is a const-eval
+// failure (`error[E0080]`); a fabricated artifact cannot compile.
+
+/// The PostgreSQL type OID for a supported Rust type. This is the
+/// `RustType -> OID` map, verified against the runtime crate's
+/// `oids::*` constants (`int2`/INT2 = 21, `int4`/INT4 = 23,
+/// `int8`/INT8 = 20, `oid`/OID = 26, `bool`/BOOL = 16, `text`/TEXT =
+/// 25). The numeric value is needed to bake the OID bytes into the
+/// `Parse` template; the matching `oids::*` const path (below) is what
+/// the emitted OID slices reference, and the runtime crate's validating
+/// constructor cross-checks the two so they cannot drift.
+fn rust_type_oid(ty: bsql_build::RustType) -> u32 {
+    use bsql_build::RustType;
+    match ty {
+        RustType::I16 => 21,
+        RustType::I32 => 23,
+        RustType::I64 => 20,
+        RustType::U32 => 26,
+        RustType::Bool => 16,
+        RustType::Text => 25,
+    }
+}
+
+/// The `oids::*` const path token for a Rust type — emitted into the
+/// `PARAM_OIDS` / `ROW_OIDS` slices so they resolve through the runtime
+/// crate's pinned OID constants (rather than restating raw integers).
+fn oid_path(ty: bsql_build::RustType) -> TokenStream2 {
+    use bsql_build::RustType;
+    match ty {
+        RustType::I16 => quote!(::bsql_postgres_proto::oids::INT2),
+        RustType::I32 => quote!(::bsql_postgres_proto::oids::INT4),
+        RustType::I64 => quote!(::bsql_postgres_proto::oids::INT8),
+        RustType::U32 => quote!(::bsql_postgres_proto::oids::OID),
+        RustType::Bool => quote!(::bsql_postgres_proto::oids::BOOL),
+        RustType::Text => quote!(::bsql_postgres_proto::oids::TEXT),
+    }
+}
+
+/// The `'static`-lifetime tuple-element marker for the `Params` / `Row`
+/// type-level tuples. `text` is `&'static str` (the static-placeholder
+/// lifetime idiom the runtime decoders project to `&'a str`). Used only
+/// for OID / arity pinning, so a nullable column maps to its base
+/// marker (NULL handling lives in the typed records, not here).
+fn tuple_marker(ty: bsql_build::RustType) -> TokenStream2 {
+    use bsql_build::RustType;
+    match ty {
+        RustType::I16 => quote!(i16),
+        RustType::I32 => quote!(i32),
+        RustType::I64 => quote!(i64),
+        RustType::U32 => quote!(u32),
+        RustType::Bool => quote!(bool),
+        RustType::Text => quote!(&'static str),
+    }
+}
+
+/// Build a tuple-type token stream from element markers. Arity 0 ->
+/// `()`; arity 1 -> `(T0,)` (the trailing comma is load-bearing);
+/// arity >= 2 -> `(T0, T1, ...)`.
+fn tuple_type(markers: &[TokenStream2]) -> TokenStream2 {
+    match markers {
+        [] => quote!(()),
+        [single] => quote!((#single,)),
+        many => quote!((#(#many),*)),
+    }
+}
+
+/// Emit the const wire artifact for one query: the uninhabited carrier
+/// type, its `QueryFingerprint` impl (baked templates + OID lists), the
+/// `wire_pin!` footprint guard, and the validated `PreparedQuery` const.
+fn emit_wire_artifact(
+    name: &Ident,
+    sql: &str,
+    shape: &bsql_build::QueryShape,
+) -> syn::Result<TokenStream2> {
+    // The runtime `ParamsWriter` / `RowDecode` impls (and the whole
+    // prepared-statement wire path) cover tuple arity 0..=16. A query
+    // outside that envelope is a loud rejection, not a silent
+    // truncation or an opaque trait-bound error.
+    if shape.params.len() > 16 {
+        return Err(syn::Error::new(
+            name.span(),
+            format!(
+                "query!: {} parameters — the prepared-query wire path \
+                 supports at most 16 `$N` parameters",
+                shape.params.len()
+            ),
+        ));
+    }
+    if shape.columns.len() > 16 {
+        return Err(syn::Error::new(
+            name.span(),
+            format!(
+                "query!: {} result columns — the prepared-query wire path \
+                 supports at most 16 projected columns",
+                shape.columns.len()
+            ),
+        ));
+    }
+
+    let carrier = format_ident!("{}Query", name);
+
+    // Content-addressed statement name: SHA-256 of the SQL text,
+    // truncated to 96 bits, hex-encoded, prefixed. Two distinct queries
+    // cannot share a name without colliding their content addresses.
+    let stmt_name = sha256_96_stmt_name(sql);
+
+    // Type-level Params / Row tuples (markers), and the matching OID
+    // path slices. Params come from the inferred `$N` types; Row from
+    // the projected columns (base marker — nullability is the records'
+    // concern, not the wire OID's).
+    let param_markers: Vec<TokenStream2> =
+        shape.params.iter().map(|ty| tuple_marker(*ty)).collect();
+    let row_markers: Vec<TokenStream2> =
+        shape.columns.iter().map(|c| tuple_marker(c.ty)).collect();
+    let params_tuple = tuple_type(&param_markers);
+    let row_tuple = tuple_type(&row_markers);
+
+    let param_oid_paths = shape.params.iter().map(|ty| oid_path(*ty));
+    let row_oid_paths = shape.columns.iter().map(|c| oid_path(c.ty));
+
+    // Numeric param OIDs for baking the Parse template's OID section.
+    let param_oid_values: Vec<u32> =
+        shape.params.iter().map(|ty| rust_type_oid(*ty)).collect();
+
+    // Pre-baked wire byte templates.
+    let parse_template_bytes = build_parse_template_bytes(&stmt_name, sql, &param_oid_values)?;
+    let bind_prefix_bytes = build_bind_execute_prefix_bytes(&stmt_name);
+    let parse_template_lit = byte_array_literal(&parse_template_bytes);
+    let bind_prefix_lit = byte_array_literal(&bind_prefix_bytes);
+
+    let carrier_doc = format!(
+        "Uninhabited fingerprint carrier for the `{name}` query. Its \
+         [`QueryFingerprint`](::bsql_postgres_proto::QueryFingerprint) \
+         impl holds the const wire artifact; \
+         [`{carrier}::PREPARED`](Self::PREPARED) is the validated \
+         prepared query minted through the proto-owned `run` boundary."
+    );
+    let prepared_doc = format!(
+        "The validated, content-addressed prepared query for `{name}`, \
+         minted at compile time through the proto-owned `run` boundary. \
+         Its wire bytes are const-checked against the declared parameter \
+         and row types; a drift is a build error."
+    );
+    let allow_reason =
+        "the generated prepared-query artifact is part of the query's public surface; a consumer may use any subset of it";
+
+    Ok(quote! {
+        #[doc = #carrier_doc]
+        #[allow(dead_code, reason = #allow_reason)]
+        pub enum #carrier {}
+
+        impl ::bsql_postgres_proto::QueryFingerprint for #carrier {
+            type Params = #params_tuple;
+            type Row = #row_tuple;
+            const SQL: &'static str = #sql;
+            const STMT_NAME: &'static str = #stmt_name;
+            const PARAM_OIDS: &'static [u32] = &[ #( #param_oid_paths ),* ];
+            const ROW_OIDS: &'static [u32] = &[ #( #row_oid_paths ),* ];
+            const PARSE_TEMPLATE: &'static [u8] = #parse_template_lit;
+            const BIND_EXECUTE_PREFIX: &'static [u8] = #bind_prefix_lit;
+        }
+
+        impl #carrier {
+            #[doc = #prepared_doc]
+            #[allow(dead_code, reason = #allow_reason)]
+            pub const PREPARED: ::bsql_postgres_proto::PreparedQuery<#params_tuple, #row_tuple> =
+                ::bsql_postgres_proto::prepared::run::<#carrier>();
+        }
+
+        // Footprint guard on the artifact: the carrier is a zero-size,
+        // value-less marker; the wire data lives in `.rodata`.
+        ::bsql_postgres_proto::wire_pin!(#carrier, size = 0, align = 1);
+    })
+}
+
+/// SHA-256 of the SQL bytes, truncated to 96 bits, hex-encoded, and
+/// prefixed -> the content-addressed statement name `bsql_q_<24hex>`.
+fn sha256_96_stmt_name(sql: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(sql.as_bytes());
+    let mut name = String::with_capacity(31);
+    name.push_str("bsql_q_");
+    for byte in digest.iter().take(12) {
+        name.push(hex_char(byte >> 4));
+        name.push(hex_char(byte & 0x0F));
+    }
+    name
+}
+
+/// One lowercase hex digit for a 0..=15 nibble.
+fn hex_char(nibble: u8) -> char {
+    match nibble {
+        0..=9 => char::from(b'0'.saturating_add(nibble)),
+        10..=15 => char::from(b'a'.saturating_add(nibble.saturating_sub(10))),
+        // Unreachable for a masked nibble; fail to a stable digit
+        // rather than panic (the input is always `>> 4` or `& 0x0F`).
+        _ => '0',
+    }
+}
+
+/// Build the `Parse`-frame template bytes (PG §55.2.2):
+///
+/// ```text
+/// b'P' | len_i32_be | stmt_name | NUL | sql | NUL | n_param_types_i16_be |
+///   oid_i32_be × n
+/// ```
+///
+/// The length field is self-inclusive (counts itself and the body, but
+/// not the leading tag byte). Sizes are computed with saturating /
+/// checked arithmetic and a loud overflow rejection — never a wrapped
+/// or truncated length.
+fn build_parse_template_bytes(
+    stmt_name: &str,
+    sql: &str,
+    param_oids: &[u32],
+) -> syn::Result<Vec<u8>> {
+    let stmt_bytes = stmt_name.as_bytes();
+    let sql_bytes = sql.as_bytes();
+    // length = 4 (self) + stmt_name + NUL + sql + NUL + 2 (n_param_types)
+    //          + 4 × n
+    let length_usize = 4usize
+        .saturating_add(stmt_bytes.len())
+        .saturating_add(1)
+        .saturating_add(sql_bytes.len())
+        .saturating_add(1)
+        .saturating_add(2)
+        .saturating_add(4usize.saturating_mul(param_oids.len()));
+    // The PG length field is an i32; a query whose Parse frame would
+    // exceed that is a loud rejection, not a wrapped length on the wire.
+    let length_u32 = u32::try_from(length_usize).map_err(|_| {
+        syn::Error::new(
+            Span::call_site(),
+            "query!: SQL too large to encode in a single Parse frame",
+        )
+    })?;
+    let n_params_u16 = u16::try_from(param_oids.len()).map_err(|_| {
+        syn::Error::new(
+            Span::call_site(),
+            "query!: more than 65535 parameters cannot be encoded",
+        )
+    })?;
+    let mut out: Vec<u8> = Vec::with_capacity(length_usize.saturating_add(1));
+    out.push(b'P');
+    out.extend_from_slice(&length_u32.to_be_bytes());
+    out.extend_from_slice(stmt_bytes);
+    out.push(0);
+    out.extend_from_slice(sql_bytes);
+    out.push(0);
+    out.extend_from_slice(&n_params_u16.to_be_bytes());
+    for oid in param_oids {
+        out.extend_from_slice(&oid.to_be_bytes());
+    }
+    Ok(out)
+}
+
+/// Build the `Bind`-frame prefix bytes: the empty-portal NUL followed by
+/// the content-addressed statement name and its NUL. The param
+/// format-code block, value block, and result-format trailer are NOT
+/// baked here — they are emitted at frame-build time from the runtime
+/// `ParamsWriter`, the sole binary-format authority, so the declared
+/// format and the encoded value cannot drift.
+fn build_bind_execute_prefix_bytes(stmt_name: &str) -> Vec<u8> {
+    let stmt_bytes = stmt_name.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(stmt_bytes.len().saturating_add(2));
+    out.push(0); // empty portal NUL
+    out.extend_from_slice(stmt_bytes);
+    out.push(0); // stmt_name NUL
+    out
+}
+
+/// Emit a `&[u8]` byte-array literal token stream. LLVM hoists the
+/// resulting `const` slice into the consumer crate's `.rodata`.
+fn byte_array_literal(bytes: &[u8]) -> TokenStream2 {
+    let lits = bytes.iter().map(|b| Literal::u8_unsuffixed(*b));
+    quote! { &[ #( #lits ),* ] }
 }

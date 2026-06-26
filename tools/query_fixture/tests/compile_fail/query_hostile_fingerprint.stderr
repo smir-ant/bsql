@@ -1,0 +1,31 @@
+error[E0080]: evaluation panicked: PreparedQuery param OID list does not match the parameter tuple's declared OIDs
+  --> tests/compile_fail/query_hostile_fingerprint.rs:29:38
+   |
+29 | const Q: PreparedQuery<(i32,), ()> = run::<Hostile>();
+   |                                      ^^^^^^^^^^^^^^^^ evaluation of `Q` failed inside this call
+   |
+note: inside `bsql_postgres_proto::prepared::run::<Hostile>`
+  --> $WORKSPACE/crates/postgres/proto/src/prepared.rs
+   |
+   | /     new_prepared_query::<Q::Params, Q::Row>(
+   | |         <Q as QueryFingerprint>::SQL,
+   | |         <Q as QueryFingerprint>::STMT_NAME,
+   | |         <Q as QueryFingerprint>::PARAM_OIDS,
+...  |
+   | |         <Q as QueryFingerprint>::BIND_EXECUTE_PREFIX,
+   | |     )
+   | |_____^
+note: inside `bsql_postgres_proto::prepared::new_prepared_query::<(i32,), ()>`
+  --> $RUST/core/src/panic.rs
+   |
+   |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+   |
+  ::: $WORKSPACE/crates/postgres/proto/src/prepared.rs
+   |
+   | /     assert!(
+   | |         oids_equal(param_oids, <P as ParamsWriter>::OIDS),
+   | |         "PreparedQuery param OID list does not match the parameter \
+   | |          tuple's declared OIDs",
+   | |     );
+   | |_____- in this macro invocation

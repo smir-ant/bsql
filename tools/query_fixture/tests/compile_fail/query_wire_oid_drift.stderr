@@ -1,0 +1,27 @@
+error[E0080]: evaluation panicked: PreparedQuery param OID list does not match the parameter tuple's declared OIDs
+  --> tests/compile_fail/query_wire_oid_drift.rs:15:38
+   |
+15 |   const Q: PreparedQuery<(i32,), ()> = new_prepared_query::<(i32,), ()>(
+   |  ______________________________________^
+16 | |     "SELECT $1::int4",
+17 | |     "bsql_q_drift",
+18 | |     &[99],
+...  |
+21 | |     &[0, 0],
+22 | | );
+   | |_^ evaluation of `Q` failed inside this call
+   |
+note: inside `bsql_postgres_proto::prepared::new_prepared_query::<(i32,), ()>`
+  --> $RUST/core/src/panic.rs
+   |
+   |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+   |
+  ::: $WORKSPACE/crates/postgres/proto/src/prepared.rs
+   |
+   | /     assert!(
+   | |         oids_equal(param_oids, <P as ParamsWriter>::OIDS),
+   | |         "PreparedQuery param OID list does not match the parameter \
+   | |          tuple's declared OIDs",
+   | |     );
+   | |_____- in this macro invocation

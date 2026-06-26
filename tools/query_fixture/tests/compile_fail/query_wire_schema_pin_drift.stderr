@@ -1,0 +1,27 @@
+error[E0080]: evaluation panicked: PreparedQuery Parse-frame template OID section does not match the declared param OIDs
+  --> tests/compile_fail/query_wire_schema_pin_drift.rs:28:38
+   |
+28 |   const Q: PreparedQuery<(i32,), ()> = new_prepared_query::<(i32,), ()>(
+   |  ______________________________________^
+29 | |     "q",
+30 | |     "s",
+31 | |     &[bsql_postgres_proto::oids::INT4],
+...  |
+34 | |     &[0, 0],
+35 | | );
+   | |_^ evaluation of `Q` failed inside this call
+   |
+note: inside `bsql_postgres_proto::prepared::new_prepared_query::<(i32,), ()>`
+  --> $RUST/core/src/panic.rs
+   |
+   |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+   |
+  ::: $WORKSPACE/crates/postgres/proto/src/prepared.rs
+   |
+   | /     assert!(
+   | |         parse_template_oid_section_matches(parse_template, param_oids, stmt_name, sql),
+   | |         "PreparedQuery Parse-frame template OID section does not match \
+   | |          the declared param OIDs",
+   | |     );
+   | |_____- in this macro invocation

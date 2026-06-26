@@ -10,9 +10,16 @@
 //!   impl that pairs a prepared query with its argument tuple at the
 //!   call site.
 //! - `new_prepared_query<P, R>(...)` — the only constructor for
-//!   `PreparedQuery`. Crate-internal visibility on the function +
-//!   `pub(crate)` fields on the struct close the direct-construction
-//!   hostile probes.
+//!   `PreparedQuery`, and a VALIDATING one: it cross-checks every wire
+//!   argument against the declared `P` / `R` type-level shape and fails
+//!   const-evaluation (`error[E0080]`) on any drift. There is no
+//!   unchecked twin. Combined with the struct's `pub(crate)` fields
+//!   (direct literal construction from outside fails `error[E0451]`),
+//!   a fabricated artifact that lies about its shape cannot compile.
+//! - [`QueryFingerprint`] + [`run`] — the uninhabited-carrier path. A
+//!   query macro emits a zero-size carrier type plus its wire artifact
+//!   as a `QueryFingerprint` impl; `run::<Q>()` is the only way to mint
+//!   the `PreparedQuery`, forcing the validating constructor.
 //!
 //! # Tier-1 SQL injection closure
 //!
@@ -466,76 +473,46 @@ where
     }
 }
 
-/// Crate-internal constructor — the ONLY sanctioned path to mint
-/// a [`PreparedQuery`]. Called exclusively by the macro's
-/// expansion. The `#[doc(hidden)]` attribute keeps it out of public
-/// docs; `pub` visibility is required for the macro's expansion
-/// site (which is in the consumer crate, not this one).
+/// Validating constructor — the ONLY path to mint a
+/// [`PreparedQuery`]. Both query-generating macros route their
+/// `const` expansion through here; there is no unchecked twin.
+/// The `#[doc(hidden)]` attribute keeps it out of public docs; `pub`
+/// visibility is required because the macro's expansion lands in the
+/// consumer crate, not this one.
 ///
-/// # Tier-1 SQL-injection closure
+/// # Validating: malformed construction is a build error
 ///
-/// `pub fn` is the macro's escape hatch. **Audit-trust class**:
-/// this function is "macro plumbing" — the only documented caller
-/// is the `prepared!` macro. A hostile caller invoking
-/// `new_prepared_query` directly is bypassing the macro's lex +
-/// validation pipeline — but they get exactly what they invoke:
-/// the static bytes the macro would emit, with whatever SQL they
-/// chose to construct. CREDO §0 tier-3 documented-discipline
-/// boundary: the macro is the contracted path; direct calls are
-/// out-of-scope adversarial usage that doesn't affect the
-/// SQL-injection class for users who follow the contract.
+/// Every argument is cross-checked against the type-level shape the
+/// caller declared (`P` / `R`). A drift is a const-evaluation failure
+/// (`error[E0080]`) when the result binds to a `const` — never a
+/// silently-wrong artifact:
 ///
-/// # Why this is not tier-1 closed
+/// - the param OID list must equal the parameter tuple's declared
+///   OIDs (`<P as ParamsWriter>::OIDS`) — element for element;
+/// - the row OID list must equal the row tuple's declared OIDs
+///   (`<R as RowDecode>::OIDS`);
+/// - the parameter formats are uniformly binary
+///   (`<P as ParamsWriter>::FORMATS`) — the binary-uniform wire
+///   contract, where `ParamsWriter` is the sole format authority;
+/// - the pre-baked `Parse`-frame template's trailing parameter-OID
+///   section (its `n_param_types` count and per-param OID words) must
+///   match the param OID list — so the wire bytes cannot lie about
+///   the parameter types they declare to the server.
 ///
-/// A naive "macro-only call" closure via `pub(in crate::prepared)
-/// mod _macro_token { pub struct PreparedMacroSeal(()); }` parameter
-/// is unsound under stable-Rust proc-macro hygiene +
-/// `#![forbid(unsafe_code)]`:
+/// Because the OID-list lengths are themselves pinned to the tuple
+/// arity inside [`ParamsWriter`] / [`RowDecode`], an arity mismatch is
+/// caught transitively by the element-wise OID comparison.
 ///
-///   - Macro expansion runs in the **caller's hygiene context**. The
-///     emitted code references `::bsql_postgres_proto::...` paths but enjoys
-///     no privileged access to private items in the macro-defining
-///     crate — same visibility rules as any external code.
-///   - A seal with a private field (`PreparedMacroSeal(())`) can only
-///     be constructed inside `mod prepared`. Neither the user crate
-///     nor the macro's emitted code (which lives in the user crate)
-///     can construct it.
-///   - Exposing a `pub const __MACRO_SEAL: PreparedMacroSeal =
-///     PreparedMacroSeal(());` re-export is reachable by hand-written
-///     user code too — friction-based deflection, not type-safe
-///     enforcement. Same effective tier as the current `pub fn`.
-///   - Compile-time `(file!(), line!(), column!())` fingerprint as
-///     a const-generic str triple — requires unstable
-///     `feature(adt_const_params)` / unstable const-generic strings.
-///     Off-table for stable v1.0.
-///   - `macro_rules!` `$crate::` does NOT grant cross-crate access
-///     to `pub(crate)` items — hygiene resolves the path but the
-///     visibility check still fires at the external use site.
+/// # What this closes, and the honest boundary
 ///
-/// **Conclusion**: tier-1 closure of the macro-only-call contract is
-/// not expressible in stable-Rust safe code with cross-crate proc-
-/// macros. The current shape is the optimum under the constraint
-/// set: `#[doc(hidden)]` + `pub` (macro plumbing), `__BSQL_PREPARED_*`
-/// const naming + double-underscore hygiene (macro internals signal),
-/// `PreparedQuery`'s `pub(crate)` fields (direct struct init from
-/// external crates fails E0451 — closes the OTHER bypass leg).
-///
-/// **Defense-in-depth that IS expressible** (not pursued this cycle —
-/// deferred for a future Tier-4 sweep):
-///   - Add a `__macro_internals` umbrella module re-exporting all
-///     macro-required types under one ugly path (#40 Cluster B).
-///   - Add a `#[track_caller]` runtime debug check that logs/panics
-///     if `new_prepared_query` is called from outside a `const`
-///     context (heuristic; macro emits inside `const` block).
-///   - Add lint-level `unused-must-use` enforcement via a typed
-///     `MustGoThroughMacro` ZST inside `PreparedQuery` (cosmetic).
-///
-/// Conclusion: class remains tier-3 by-discipline documented; the
-/// discipline is "go through the macro, do not hand-call
-/// `new_prepared_query`". CREDO §0 documented-discipline boundary
-/// holds. SQL-injection class for users-who-follow-the-contract
-/// remains tier-1-by-construction via the macro's lex +
-/// cast-annotation validation pipeline.
+/// Direct construction of a *lying* artifact — one whose wire bytes
+/// disagree with its declared `P` / `R` — is now a compile error. The
+/// remaining surface is a caller who hand-builds a *self-consistent*
+/// artifact with their own literal SQL: that is identical to writing
+/// the SQL literal in the macro, i.e. the caller authoring their own
+/// query, not untrusted runtime data crossing the boundary. The
+/// injection class (a runtime string becoming SQL) stays closed
+/// because every entry takes only `&'static str`.
 #[doc(hidden)]
 #[inline]
 #[must_use]
@@ -551,6 +528,25 @@ where
     P: ParamsWriter,
     R: RowDecode,
 {
+    assert!(
+        oids_equal(param_oids, <P as ParamsWriter>::OIDS),
+        "PreparedQuery param OID list does not match the parameter \
+         tuple's declared OIDs",
+    );
+    assert!(
+        oids_equal(row_oids, <R as RowDecode>::OIDS),
+        "PreparedQuery row OID list does not match the row tuple's \
+         declared OIDs",
+    );
+    assert!(
+        all_formats_binary(<P as ParamsWriter>::FORMATS),
+        "PreparedQuery parameter formats must be uniformly binary",
+    );
+    assert!(
+        parse_template_oid_section_matches(parse_template, param_oids, stmt_name, sql),
+        "PreparedQuery Parse-frame template OID section does not match \
+         the declared param OIDs",
+    );
     PreparedQuery {
         sql,
         stmt_name,
@@ -560,6 +556,185 @@ where
         bind_execute_prefix,
         _phantom: PhantomData,
     }
+}
+
+/// Const element-wise equality of two `u32` (OID) slices — no
+/// indexing (the crate forbids `clippy::indexing_slicing`), walked in
+/// lockstep via `split_first`.
+const fn oids_equal(left: &[u32], right: &[u32]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let (mut a, mut b) = (left, right);
+    loop {
+        match (a.split_first(), b.split_first()) {
+            (Some((x, a_rest)), Some((y, b_rest))) => {
+                if *x != *y {
+                    return false;
+                }
+                a = a_rest;
+                b = b_rest;
+            }
+            (None, None) => return true,
+            // Lengths were equality-checked above; this arm is
+            // structurally unreachable but returns the fail-closed
+            // answer rather than asserting.
+            _ => return false,
+        }
+    }
+}
+
+/// Const check that every parameter format code is
+/// [`FormatCode::Binary`] — the binary-uniform wire contract.
+const fn all_formats_binary(formats: &[FormatCode]) -> bool {
+    let mut rest = formats;
+    loop {
+        match rest.split_first() {
+            Some((code, tail)) => {
+                if !matches!(code, FormatCode::Binary) {
+                    return false;
+                }
+                rest = tail;
+            }
+            None => return true,
+        }
+    }
+}
+
+/// Const validation that the pre-baked `Parse`-frame template carries
+/// exactly the declared parameter OIDs in its trailing
+/// `n_param_types` + per-param OID section.
+///
+/// `Parse` wire layout (PG §55.2.2):
+///
+/// ```text
+/// b'P' | len_i32_be(4) | stmt_name | NUL | sql | NUL |
+///   n_param_types_i16_be(2) | oid_i32_be(4) × n
+/// ```
+///
+/// The full byte length is recomputed from the known parts; a
+/// mismatch (or a drifted OID / count in the tail) fails closed.
+/// No indexing and no panicking arithmetic — bounds come from
+/// `split_at` / `split_first_chunk`, sizes from saturating ops.
+const fn parse_template_oid_section_matches(
+    template: &[u8],
+    param_oids: &[u32],
+    stmt_name: &'static str,
+    sql: &'static str,
+) -> bool {
+    let n = param_oids.len();
+    // tag(1) + len(4) + stmt_name + NUL(1) + sql + NUL(1)
+    //   + n_param_types(2) + oid(4)·n
+    let expected_len = 1usize
+        .saturating_add(4)
+        .saturating_add(stmt_name.len())
+        .saturating_add(1)
+        .saturating_add(sql.len())
+        .saturating_add(1)
+        .saturating_add(2)
+        .saturating_add(4usize.saturating_mul(n));
+    if template.len() != expected_len {
+        return false;
+    }
+    // The trailing section is the last n_param_types(2) + oid(4)·n bytes.
+    let tail_len = 2usize.saturating_add(4usize.saturating_mul(n));
+    let (_, tail) = template.split_at(template.len().saturating_sub(tail_len));
+    let (declared_count, mut oid_bytes) = match tail.split_first_chunk::<2>() {
+        Some((count_bytes, rest)) => (u16::from_be_bytes(*count_bytes), rest),
+        None => return false,
+    };
+    // Walk the per-param OID words against `param_oids` in lockstep,
+    // counting consumed words in u16 space (so the declared count is
+    // compared without a usize→u16 cast, which the crate's `as`-ban
+    // and non-const `try_from` both rule out).
+    let mut rest = param_oids;
+    let mut consumed: u16 = 0;
+    loop {
+        match (oid_bytes.split_first_chunk::<4>(), rest.split_first()) {
+            (Some((oid_word, ob_rest)), Some((want, r_rest))) => {
+                if u32::from_be_bytes(*oid_word) != *want {
+                    return false;
+                }
+                oid_bytes = ob_rest;
+                rest = r_rest;
+                consumed = consumed.saturating_add(1);
+            }
+            (None, None) => return declared_count == consumed,
+            _ => return false,
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Fingerprint carrier + run boundary
+// ═════════════════════════════════════════════════════════════════════
+
+/// Per-query fingerprint carrier.
+///
+/// A query-generating macro emits ONE uninhabited carrier type per
+/// query (a zero-size, value-less marker) together with one
+/// `impl QueryFingerprint` for it. The impl carries the whole `const`
+/// wire artifact — the SQL text, its content-addressed statement name,
+/// the parameter / row OID lists, and the pre-baked `Parse` /
+/// `Bind`-prefix byte templates — plus the parameter and row tuple
+/// types at the type level.
+///
+/// [`run`] is the only way to turn a carrier into a
+/// [`PreparedQuery`], and it forces the validating constructor
+/// ([`new_prepared_query`]). A carrier whose wire bytes drift from its
+/// type-level shape therefore fails const-evaluation (`error[E0080]`)
+/// at the `run::<Q>()` site.
+///
+/// The trait is intentionally NOT sealed: the carrier and its impl are
+/// emitted in the consumer crate, so a seal would be unsatisfiable
+/// from there (and a re-exported seal token would be hand-reachable —
+/// deflection, not enforcement). The load-bearing guarantee is the
+/// const validator behind [`run`], not the openness of this trait.
+pub trait QueryFingerprint {
+    /// Parameter tuple type — pins the `$N` Rust types at the type
+    /// level and supplies the declared parameter OIDs / formats.
+    type Params: ParamsWriter;
+    /// Row tuple type — pins the projected column Rust types and the
+    /// declared row OIDs.
+    type Row: RowDecode;
+    /// SQL text (lives in the consumer crate's `.rodata`).
+    const SQL: &'static str;
+    /// Content-addressed statement name (a hash of [`Self::SQL`]).
+    const STMT_NAME: &'static str;
+    /// Parameter OID list, one entry per `$N`.
+    const PARAM_OIDS: &'static [u32];
+    /// Projected-column OID list.
+    const ROW_OIDS: &'static [u32];
+    /// Pre-baked `Parse`-frame template bytes.
+    const PARSE_TEMPLATE: &'static [u8];
+    /// Pre-baked `Bind`-frame prefix bytes (portal NUL + stmt-name
+    /// NUL); the param format block / values / result-format trailer
+    /// are emitted at frame-build time from [`Self::Params`].
+    const BIND_EXECUTE_PREFIX: &'static [u8];
+}
+
+/// Mint the [`PreparedQuery`] for a fingerprint carrier `Q`.
+///
+/// The ONLY path from a [`QueryFingerprint`] carrier to a usable
+/// [`PreparedQuery`]. It forces [`new_prepared_query`], so the
+/// carrier's wire bytes are validated against its declared `Params` /
+/// `Row` at const-evaluation — a fabricated or drifted carrier is a
+/// build error (`error[E0080]`), not a silently-wrong query.
+#[doc(hidden)]
+#[inline]
+#[must_use]
+pub const fn run<Q>() -> PreparedQuery<Q::Params, Q::Row>
+where
+    Q: QueryFingerprint,
+{
+    new_prepared_query::<Q::Params, Q::Row>(
+        <Q as QueryFingerprint>::SQL,
+        <Q as QueryFingerprint>::STMT_NAME,
+        <Q as QueryFingerprint>::PARAM_OIDS,
+        <Q as QueryFingerprint>::ROW_OIDS,
+        <Q as QueryFingerprint>::PARSE_TEMPLATE,
+        <Q as QueryFingerprint>::BIND_EXECUTE_PREFIX,
+    )
 }
 
 // ═════════════════════════════════════════════════════════════════════

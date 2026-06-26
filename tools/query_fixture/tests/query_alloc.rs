@@ -66,6 +66,20 @@ fn borrowed_decode_is_zero_alloc_owned_text_allocates() {
     black_box(&owned_text);
     let owned_text_allocs = after.delta(before).allocs;
 
+    // (4) The const wire artifact lives entirely in `.rodata`: reading the
+    // pre-baked Parse template, Bind prefix, and OID lists off
+    // `<Name>Query::PREPARED` borrows `&'static` slices and allocates
+    // nothing. (The `const` is materialised at compile time.)
+    let before = ALLOC.snapshot();
+    let q = black_box(OrderKeyQuery::PREPARED);
+    let wire_len = q.parse_template_for_test().len()
+        + q.bind_execute_prefix_for_test().len()
+        + q.param_oids().len()
+        + q.row_oids().len();
+    let after = ALLOC.snapshot();
+    black_box(wire_len);
+    let wire_allocs = after.delta(before).allocs;
+
     assert_eq!(
         fixed_allocs, 0,
         "borrowed all-fixed decode must not allocate (got {fixed_allocs})"
@@ -77,5 +91,9 @@ fn borrowed_decode_is_zero_alloc_owned_text_allocates() {
     assert!(
         owned_text_allocs >= 1,
         "owned text decode is expected to allocate the String (got {owned_text_allocs})"
+    );
+    assert_eq!(
+        wire_allocs, 0,
+        "reading the const .rodata wire artifact must not allocate (got {wire_allocs})"
     );
 }

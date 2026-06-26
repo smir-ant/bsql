@@ -43,4 +43,18 @@ fn unknown_reference_is_compile_error() {
     // A duplicate output column name cannot become two record fields of
     // one name — surfaced as a compile_error, never silently collapsed.
     t.compile_fail("tests/compile_fail/query_duplicate_column.rs");
+
+    // `query!` const wire-artifact + fingerprint-seal surface.
+    //   * The validating constructor rejects a param-OID drift
+    //     (E0080) — there is no unchecked twin.
+    //   * The SCHEMA_PIN check rejects a baked Parse template whose OID
+    //     section drifts from the declared param OIDs (E0080).
+    //   * Layer 1 of the seal: a direct struct-literal fabrication is
+    //     E0451 (private fields).
+    //   * Layer 2 of the seal: a hand-written fingerprint carrier that
+    //     lies about its shape fails through the `run` boundary (E0080).
+    t.compile_fail("tests/compile_fail/query_wire_oid_drift.rs");
+    t.compile_fail("tests/compile_fail/query_wire_schema_pin_drift.rs");
+    t.compile_fail("tests/compile_fail/query_hostile_construction.rs");
+    t.compile_fail("tests/compile_fail/query_hostile_fingerprint.rs");
 }
