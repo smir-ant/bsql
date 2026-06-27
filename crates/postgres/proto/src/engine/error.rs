@@ -7,6 +7,7 @@
 //! scripted in-memory transport without the core ever naming `std`.
 
 use super::flush::SendOverrun;
+use super::ingest::{IngestCommitOverflow, IngestFull};
 
 /// Failure surface returned by every engine verb.
 ///
@@ -34,4 +35,27 @@ pub enum EngineError<E> {
     /// Carries the [`SendOverrun`](super::SendOverrun) detail from
     /// [`SendBuf::advance`](super::SendBuf::advance).
     SendOverrun(SendOverrun),
+    /// The inbound ingest buffer had no room for the next read even after
+    /// reclaiming its consumed prefix and escaping to its heap tier — a wire
+    /// frame larger than the bounded buffer. Carries the
+    /// [`IngestFull`](super::IngestFull) detail from
+    /// [`IngestBuf::read_slot`](super::IngestBuf::read_slot). The buffer cannot
+    /// grow, so this is classified rather than looped on (which would spin) or
+    /// skipped (which would desync the framing).
+    IngestFull(IngestFull),
+    /// A committed read count would push the ingest fill watermark past the
+    /// buffer capacity — a transport that reported writing more bytes than the
+    /// lent slot held. Carries the
+    /// [`IngestCommitOverflow`](super::IngestCommitOverflow) detail from
+    /// [`IngestBuf::commit`](super::IngestBuf::commit); classified rather than
+    /// silently truncated.
+    IngestCommitOverflow(IngestCommitOverflow),
+    /// The transport read returned `Ok(0)` — the peer closed the connection —
+    /// while a wire frame was still incomplete. The pump reads only when the
+    /// framing reports it lacks a whole frame, so a zero-length read can only
+    /// mean the in-flight response can never complete; it is classified as a
+    /// broken connection, never retried (which would spin) and never treated as
+    /// a clean boundary (which would silently truncate the response). The
+    /// read-side mirror of [`WriteZero`](Self::WriteZero).
+    UnexpectedEof,
 }

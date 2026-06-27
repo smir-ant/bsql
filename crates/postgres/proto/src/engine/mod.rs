@@ -30,6 +30,7 @@ mod dispatch_connecting;
 mod error;
 mod flush;
 mod ingest;
+mod pump;
 mod seams;
 
 pub use dispatch_active::ActiveEngine;
@@ -37,6 +38,7 @@ pub use dispatch_connecting::{ConnFail, ConnectingEngine};
 pub use error::EngineError;
 pub use flush::{flush, SendBuf, SendOverrun};
 pub use ingest::{IngestBuf, IngestCommitOverflow, IngestFull};
+pub use pump::{poll_once, pump_active_to_boundary, Boundary, SpuriousPending, Surface};
 pub use seams::{
     absurd, engine_observe_no_seam, engine_observe_via_seam, Live, Never, NoObserver, Observer,
     Transport,
@@ -345,4 +347,40 @@ const _: fn() = || {
         Ok::<(), EngineError<core::convert::Infallible>>(())
     };
     need_send(&threaded);
+};
+
+// PUMP-FUTURE-SEND gate. The active pump's future must be `Send` — the async
+// driver polls it across task boundaries. The closure is never called; its body
+// is type-checked at build time. It instantiates `pump_active_to_boundary` at
+// the witness transport, the default observer, and a function-pointer sink (the
+// simplest `Send` sink), isolating the future's `Send`-ness to the pump's own
+// captures (engine, transport, send buffer, observer borrow).
+const _: fn() = || {
+    fn need_send<F: Send>(_: &F) {}
+
+    fn witness_sink(_: Surface<'_>) -> core::ops::ControlFlow<()> {
+        core::ops::ControlFlow::Continue(())
+    }
+    // Coerce the fn item to a fn pointer via the typed binding (not an `as`
+    // cast — the forbid wall bars `as`); the anonymous lifetime makes it the
+    // higher-ranked `for<'e> fn(Surface<'e>)` the sink bound requires.
+    let sink: fn(Surface<'_>) -> core::ops::ControlFlow<()> = witness_sink;
+
+    let mut active = ActiveEngine::from_handshake(
+        0_i32,
+        crate::sensitive::Sensitive::new(0_i32),
+        crate::action::TxStatus::Idle,
+        IngestBuf::new(),
+    );
+    let mut transport = WitnessTransport;
+    let mut send_buf = SendBuf::new();
+    let obs = NoObserver;
+
+    need_send(&pump_active_to_boundary(
+        &mut active,
+        &mut transport,
+        &mut send_buf,
+        &obs,
+        sink,
+    ));
 };

@@ -84,7 +84,7 @@ use super::Event;
 /// fixed-size control frames (`Sync`, `ReadyForQuery`, `ParseComplete`,
 /// `BindComplete`, …) and typical narrow `DataRow`s all fit, so the common
 /// OLTP path never escapes.
-const INGEST_INLINE_CAP: usize = 128;
+pub(crate) const INGEST_INLINE_CAP: usize = 128;
 
 /// Single-residence two-tier inbound ingest buffer.
 ///
