@@ -1,0 +1,173 @@
+//! The seam primitives the engine is built from.
+//!
+//! Four of the five load-bearing seams live here; the fifth (the
+//! [`Engine`](super::Engine) shell) composes them in the module root.
+//!
+//! 1. [`Never`] + [`absurd`] — the uninhabited carrier for
+//!    phase-impossible wire frames. A frame the type system cannot rule
+//!    out by *omission* is funnelled through `absurd`, never a wildcard
+//!    `_` arm.
+//! 2. [`Observer`] (sealed) + [`NoObserver`] — the zero-cost policy seam
+//!    carried by every verb. The default policy is a ZST whose hooks
+//!    inline to nothing; a non-default policy reuses the identical verb
+//!    surface (no second signature pass).
+//! 3. [`Transport`] — the driver-facing I/O seam (RPITIT + `Send`, with
+//!    an associated [`Error`](Transport::Error) type so the `#![no_std]`
+//!    core never bakes in a concrete I/O error).
+//! 4. [`Live`] — the branded, non-`Clone`, linear liveness token.
+
+use core::future::Future;
+use core::marker::PhantomData;
+
+/// Private sealing witness. A trait in a private module cannot be named —
+/// let alone implemented — by a downstream crate, so [`Observer`] is
+/// closed to exactly the policies this crate blesses.
+mod sealed {
+    /// Implemented only for this crate's blessed observer policies.
+    pub trait Sealed {}
+}
+
+// ===========================================================================
+// 1. Never + absurd
+// ===========================================================================
+
+/// Uninhabited carrier for phase-impossible wire frames.
+///
+/// A frame that cannot occur in the current protocol phase has no
+/// constructor in that phase's event enum; the residual catch routes the
+/// impossible byte through [`absurd`] rather than a silent wildcard `_`,
+/// so a genuinely-reachable new frame is a loud compile error, never a
+/// dropped event.
+#[derive(Clone, Copy, Debug)]
+pub enum Never {}
+
+/// Consume the impossible. The empty `match` is total because [`Never`]
+/// has no inhabitants, so this can produce any `T` without fabricating a
+/// value.
+#[inline(always)]
+pub fn absurd<T>(n: Never) -> T {
+    match n {}
+}
+
+// ===========================================================================
+// 2. Observer (sealed) + NoObserver
+// ===========================================================================
+
+/// Sealed observer-policy seam carried by every verb through the engine
+/// type parameter.
+///
+/// Sealed via a private supertrait: a downstream crate can neither name
+/// nor implement the private `sealed::Sealed` witness, so the set of
+/// policies is closed to the ones this crate blesses. The bound has no
+/// runtime footprint — a
+/// generic verb monomorphised at [`NoObserver`] is identical to one with
+/// no seam at all.
+pub trait Observer: sealed::Sealed {
+    /// Invoked once per inbound data row, lending the row's wire payload.
+    fn on_row(&self, row: &[u8]);
+    /// Invoked once per completed command, lending the command tag bytes.
+    fn on_complete(&self, tag: &[u8]);
+}
+
+/// The default zero-cost policy: a ZST whose hooks are inlined no-ops.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoObserver;
+
+impl sealed::Sealed for NoObserver {}
+
+impl Observer for NoObserver {
+    #[inline(always)]
+    fn on_row(&self, _row: &[u8]) {}
+    #[inline(always)]
+    fn on_complete(&self, _tag: &[u8]) {}
+}
+
+/// The real engine pattern: a generic [`Observer`] hook threaded through a
+/// hot loop. Monomorphised at [`NoObserver`] by
+/// [`engine_observe_via_seam`], it must lower to the same instructions as
+/// the seam-free [`engine_observe_no_seam`] baseline.
+#[inline(always)]
+fn observe_generic<O: Observer>(obs: &O, state: &mut usize, row: &[u8]) {
+    *state = core::hint::black_box(*state).wrapping_add(row.len());
+    obs.on_row(row);
+}
+
+/// Witness: the observer hook reached through the generic seam, fixed at
+/// the [`NoObserver`] ZST policy. The asm-identity gate proves this is
+/// instruction-for-instruction identical to [`engine_observe_no_seam`].
+#[inline(never)]
+pub fn engine_observe_via_seam(state: &mut usize, row: &[u8]) {
+    observe_generic(&NoObserver, state, row);
+}
+
+/// Witness: the same computation with no observer seam at all — the
+/// hand-written baseline the seam must match.
+#[inline(never)]
+pub fn engine_observe_no_seam(state: &mut usize, row: &[u8]) {
+    *state = core::hint::black_box(*state).wrapping_add(row.len());
+}
+
+// ===========================================================================
+// 3. Transport
+// ===========================================================================
+
+/// The driver-facing I/O seam.
+///
+/// Return-position `impl Future` (RPITIT) keeps the seam allocation- and
+/// `dyn`-free; the explicit `+ Send` makes the verb futures `Send` without
+/// an `async fn` trait method (whose `Send`-ness cannot be named at the
+/// call site). The associated [`Error`](Self::Error) type lets the
+/// `#![no_std]` core surface a transport failure without ever naming a
+/// concrete I/O error — a `std`-backed socket, a TLS layer, or a scripted
+/// in-memory transport each choose their own.
+pub trait Transport: Send {
+    /// The transport's own failure type. Travels through
+    /// [`EngineError::Transport`](super::EngineError::Transport) so the
+    /// core never bakes in `std::io::Error`.
+    type Error;
+
+    /// Read available bytes into `buf`, returning the count written.
+    fn read<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> impl Future<Output = Result<usize, Self::Error>> + Send + 'a;
+
+    /// Write the whole of `buf`, returning once every byte is flushed.
+    fn write_all<'a>(
+        &'a mut self,
+        buf: &'a [u8],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+}
+
+// ===========================================================================
+// 4. Live — branded linear liveness token
+// ===========================================================================
+
+/// Branded, non-`Clone`, linear liveness token.
+///
+/// Invariant in `'b` (the `fn(&'b ()) -> &'b ()` brand): each session
+/// scope mints a fresh, unforgeable `'b`, so a token cannot drive a
+/// foreign session's engine. Every verb consumes the token and returns it
+/// only on a clean protocol boundary, so the type system enforces
+/// at-most-one in-flight command per connection: reuse after a verb
+/// consumes it is a move error, not a runtime panic.
+///
+/// A ZST — the linearity and the brand are purely type-level, with zero
+/// runtime footprint.
+///
+/// Deliberately not `Clone`/`Copy`: copying a token would let a consumed
+/// one be reused, defeating the at-most-one-command-in-flight discipline.
+#[derive(Debug)]
+pub struct Live<'b> {
+    _brand: PhantomData<fn(&'b ()) -> &'b ()>,
+}
+
+impl<'b> Live<'b> {
+    /// Mint a token bound to the caller's brand `'b`. Crate-internal: only
+    /// a session scope may mint a token, so downstream code cannot forge
+    /// one out of thin air.
+    #[inline(always)]
+    pub(crate) fn new_in_scope() -> Self {
+        Self { _brand: PhantomData }
+    }
+}

@@ -253,6 +253,12 @@ pub mod command;
 pub mod cancel;
 pub mod decode;
 mod dispatch;
+// Strangler-engine scaffold: a new session engine + its five seams,
+// grown alongside the live `dispatch`/`protocol` path without disturbing
+// it. Purely additive — no new dependency, no `#[cfg]` gate, and the same
+// `#![no_std]` forbid-bundle as the rest of the crate. Nothing here is yet
+// wired into the live state machine.
+pub mod engine;
 pub mod error;
 pub(crate) mod error_arena;
 pub use error_arena::{ArenaError, DisplayError, ErrorPayload, ErrorRef};
