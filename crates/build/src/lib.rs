@@ -66,11 +66,18 @@
 
 mod dynamics;
 mod infer;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 
 pub use dynamics::{
     infer_dynamic_query, DynamicError, DynamicShape, OrderByVariant, ParamShape, WireVariant,
 };
 pub use infer::{infer_query, InferError, InferredColumn, QueryShape, RustType};
+#[cfg(feature = "sqlite")]
+pub use sqlite::{
+    emit_sqlite_template, verify_sqlite_conformance, SqliteConformanceError,
+    SQLITE_TEMPLATE_ENV_VAR, SQLITE_TEMPLATE_FILE_NAME,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -139,6 +146,14 @@ pub enum BuildError {
     WriteCatalog { path: PathBuf, source: std::io::Error },
     /// A required environment variable (`OUT_DIR`) was absent.
     MissingEnv { var: &'static str },
+    /// Creating or removing the SQLite template database in `OUT_DIR`
+    /// failed. (Only constructible under the `sqlite` feature.)
+    SqliteTemplate { message: String },
+    /// SQLite could not replay a migration's DDL into the template database
+    /// — an unmodelable migration form (e.g. an `ALTER COLUMN ... SET NOT
+    /// NULL`, which SQLite does not support). Never silently skipped. (Only
+    /// constructible under the `sqlite` feature.)
+    SqliteReplay { path: PathBuf, message: String },
 }
 
 impl fmt::Display for BuildError {
@@ -173,6 +188,17 @@ impl fmt::Display for BuildError {
                 f,
                 "bsql-build: required environment variable {var} is not set \
                  (this fn must be called from a Cargo build script)"
+            ),
+            BuildError::SqliteTemplate { message } => {
+                write!(f, "bsql-build: SQLite template database error: {message}")
+            }
+            BuildError::SqliteReplay { path, message } => write!(
+                f,
+                "bsql-build: SQLite cannot replay migration {}: {message}. A \
+                 migration DDL form SQLite cannot execute is a build error \
+                 (define the schema in a SQLite-portable form, or do not \
+                 target SQLite).",
+                path.display()
             ),
         }
     }

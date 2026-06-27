@@ -24,6 +24,35 @@ categories = ["database", "development-tools::build-utils"]
 # keeping the build-time surface minimal.
 sqlparser = { workspace = true }
 
+# `rusqlite` — safe Rust bindings to SQLite, BUILD-TIME ONLY and OPTIONAL
+# (behind the `sqlite` feature). When a consumer also targets SQLite, this
+# crate replays the consumer's migration DDL into an in-memory/file SQLite
+# template database at build time, then — at `query!` expansion — opens it
+# under a deny-all-but-readonly authorizer to cross-check that real
+# SQLite's `prepare_v2` + decltype/table_info agree with the type +
+# nullability lattice. It is reachable ONLY through `bsql-build` (a
+# `[build-dependencies]` helper) and the build-time-only query proc-macro,
+# so it never enters a shipped library's runtime closure (the
+# `runtime_graph_pin` gate proves `bsql-build` itself is absent from every
+# shipped crate's `cargo tree -e normal` graph). It is the SAME pinned
+# package + version already resolved for `bsql-sqlite` (the shipped
+# embedded driver), so it adds NO new package to the lockfile frontier.
+# Extra features over the workspace `bundled` pin: `column_decltype` (read
+# a prepared statement's per-result-column declared type) and `hooks` (the
+# `sqlite3_set_authorizer` safe callback) — both are pure-Rust leaf
+# features that pull in no further packages. We never hand-roll a SQLite
+# engine: faithful SQL execution + planner introspection is exactly the
+# expert-domain work the embedded engine owns.
+rusqlite = { workspace = true, optional = true, features = ["column_decltype", "hooks"] }
+
+[features]
+# `sqlite` — opt in to the build-time SQLite validation backend. Pulls the
+# (build-time-only) `rusqlite` edge above. A PG-only consumer leaves it off
+# and never compiles SQLite. The query proc-macro enables it on this crate
+# when its own `sqlite` feature is on, so the conformance entry point is
+# available only where SQLite is actually targeted.
+sqlite = ["dep:rusqlite"]
+
 # Inherit the workspace FORBID floor. This is a shipped (publishable)
 # helper crate — consumers add it to `[build-dependencies]` — so it
 # carries the full lint wall like every other non-devgates member.

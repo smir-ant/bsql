@@ -47,6 +47,22 @@ bsql-build = { path = "../build" }
 # resolved set. Build-time-only, like the rest of this proc-macro crate.
 sha2 = { workspace = true }
 
+[features]
+# `sqlite` — turn on the build-time SQLite conformance cross-check inside
+# `query!`. It enables `bsql-build`'s `sqlite` feature (the build-time-only
+# `rusqlite` edge) so the proc-macro can call `verify_sqlite_conformance`
+# at expansion. A consumer that also targets SQLite enables this feature
+# AND calls `bsql_build::emit_sqlite_template` in its `build.rs`; the
+# cross-check then runs for every `query!`. A PG-only consumer leaves it
+# off and compiles no SQLite. Even with the feature on, the cross-check is
+# skipped unless the `BSQL_SQLITE_TEMPLATE` env channel is present, so a
+# consumer whose `build.rs` did not emit a template is never affected. This
+# crate is itself build-time-only (a proc-macro that ships no runtime
+# types), so the `runtime_graph_pin` boundary is unaffected: no shipped
+# crate depends on it, so `rusqlite`-at-validation never enters a shipped
+# runtime graph.
+sqlite = ["bsql-build/sqlite"]
+
 # Inherit the workspace FORBID floor (the lint wall). This crate carries
 # its own stricter crate-root forbid-bundle in `src/lib.rs`, which
 # coexists with the floor.

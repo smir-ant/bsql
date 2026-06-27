@@ -1,0 +1,47 @@
+[package]
+name = "bsql-query-sqlite-fixture"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Fixture consumer exercising the bsql SQLite build-time validation backend end-to-end: a real build.rs replays a SQLite-portable migrations/ directory into both the PostgreSQL catalog AND an in-memory→OUT_DIR SQLite template DB, then query! validates each query under a deny-all-but-readonly authorizer and cross-checks that real SQLite's prepare_v2 + decltype/table_info agree with the inference lattice. Hosts the SQLite conformance + scan-on-toggle trybuild gate. Never published."
+
+# Not a shipped crate; it exists only to prove the SQLite build-time
+# validation chain (template DB -> readonly authorizer -> decltype/lattice
+# conformance -> scan-on-toggle) works for a REAL consumer that targets
+# SQLite. Mirrors `tools/query_fixture` (the PostgreSQL-only twin).
+publish = false
+
+[dependencies]
+# The query proc-macro, with its SQLite conformance cross-check ENABLED:
+# turning on the `sqlite` feature pulls the build-time-only SQLite
+# validation toolchain so `query!` cross-checks every query against the
+# template DB. (Runtime/expansion only — it ships no runtime types.)
+bsql-query-macros = { path = "../../crates/query-macros", features = ["sqlite"] }
+
+# The SHIPPED runtime decode primitives the `query!` macro's emitted code
+# references. The build-time SQLite toolchain (rusqlite, bsql-build,
+# sqlparser) never enters this crate's runtime closure — it is reachable
+# only through the `[build-dependencies]` edge below and the build-time-only
+# proc-macro.
+bsql-postgres-proto = { path = "../../crates/postgres/proto" }
+
+[build-dependencies]
+# BUILD-DEPENDENCY ONLY, with the `sqlite` feature on: bsql-build both
+# replays this crate's migrations/ into the PostgreSQL catalog AND replays
+# the SAME migrations into a SQLite template database in OUT_DIR. Because it
+# lives in [build-dependencies], neither sqlparser nor rusqlite enters this
+# crate's runtime closure.
+bsql-build = { path = "../../crates/build", features = ["sqlite"] }
+
+[dev-dependencies]
+# trybuild drives the SQLite gate: a conforming query compiles; an unknown
+# table/column, invalid SQL, a lattice/SQLite type-or-nullability
+# disagreement, and an unacknowledged full-scan-on-toggle each fail to
+# compile with a pinned diagnostic.
+trybuild = { workspace = true }
+
+# Inherit the workspace FORBID floor / lint wall like every other
+# non-devgates member.
+[lints]
+workspace = true

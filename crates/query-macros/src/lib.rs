@@ -305,8 +305,15 @@ impl Parse for QueryInput {
 
 fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     let QueryInput { name, sql } = syn::parse2(input)?;
-    let sql_text = sql.value();
     let sql_span = sql.span();
+
+    // Strip the recognized `/* bsql:allow-scan: <reason> */` directive (if
+    // present) from the SQL before anything else, so it never reaches the
+    // inference engine or the baked wire bytes (the content address stays
+    // identical whether or not a query is acknowledged). Its presence is the
+    // per-query acknowledgment of a known full-scan-on-toggle and is consumed
+    // only by the SQLite conformance cross-check below.
+    let (sql_text, scan_acknowledged) = strip_scan_ack(&sql.value());
 
     // Rebuild the catalog the consumer's build.rs wrote (fail-closed on a
     // missing/unreadable/corrupt catalog).
@@ -333,9 +340,95 @@ fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     // `ORDER BY` allow-set — the closed selector enum.
     let wire = emit_dynamic_wire(&name, &shape)?;
 
+    // SQLite conformance cross-check (only when this crate's `sqlite` feature
+    // is on AND the consumer's build.rs emitted a template). It opens the
+    // build-time SQLite template under a deny-all-but-readonly authorizer and
+    // asserts real SQLite's `prepare`+decltype/table_info agree with the
+    // lattice's per-column (type, nullable), and that no OPTIONAL toggle
+    // forces an unacknowledged full-table scan. A disagreement is a loud
+    // `compile_error!`.
+    #[cfg(feature = "sqlite")]
+    verify_sqlite(sql_span, &shape, scan_acknowledged)?;
+    // Without the `sqlite` feature there is no SQLite target, so the
+    // acknowledgment flag is consumed here (the directive was already
+    // stripped from the SQL above). This is a plain bool, not a dropped
+    // fallible result.
+    #[cfg(not(feature = "sqlite"))]
+    let _ = scan_acknowledged;
+
     Ok(quote! {
         #records
         #wire
+    })
+}
+
+/// Strip the recognized `/* bsql:allow-scan[: reason] */` acknowledgment
+/// directive from a query string. Returns the cleaned SQL and whether the
+/// directive was present. Only the FIRST block comment that contains the
+/// marker is removed; ordinary block comments are left untouched. An
+/// unterminated block comment is left as-is for the downstream parser to
+/// report.
+fn strip_scan_ack(sql: &str) -> (String, bool) {
+    const MARKER: &str = "bsql:allow-scan";
+    let mut search_from = 0usize;
+    while let Some(rel) = sql.get(search_from..).and_then(|s| s.find("/*")) {
+        let open = search_from + rel;
+        let after_open = open + 2;
+        let Some(crel) = sql.get(after_open..).and_then(|s| s.find("*/")) else {
+            // Unterminated comment: nothing safe to strip.
+            break;
+        };
+        let close = after_open + crel;
+        let is_marker = sql
+            .get(after_open..close)
+            .is_some_and(|inner| inner.to_ascii_lowercase().contains(MARKER));
+        if is_marker {
+            let mut cleaned = String::with_capacity(sql.len());
+            if let Some(head) = sql.get(..open) {
+                cleaned.push_str(head);
+            }
+            if let Some(tail) = sql.get(close + 2..) {
+                cleaned.push_str(tail);
+            }
+            return (cleaned, true);
+        }
+        search_from = close + 2;
+    }
+    (sql.to_string(), false)
+}
+
+/// Run the build-time SQLite conformance cross-check for one query, when
+/// the consumer emitted a SQLite template database (the
+/// `BSQL_SQLITE_TEMPLATE` rustc-env channel is present). When no template
+/// was emitted the consumer does not target SQLite, so there is nothing to
+/// conform against — the inference lattice already validated the query, so
+/// this returns `Ok(())` (it is not a skipped schema check, it is the
+/// absence of a SQLite target).
+#[cfg(feature = "sqlite")]
+fn verify_sqlite(
+    span: Span,
+    shape: &bsql_build::DynamicShape,
+    scan_acknowledged: bool,
+) -> syn::Result<()> {
+    let path = match std::env::var(bsql_build::SQLITE_TEMPLATE_ENV_VAR) {
+        Ok(path) => path,
+        Err(_) => return Ok(()),
+    };
+    bsql_build::verify_sqlite_conformance(
+        std::path::Path::new(&path),
+        shape,
+        scan_acknowledged,
+    )
+    .map_err(|err| {
+        syn::Error::new(
+            span,
+            format!(
+                "query!: SQLite conformance failure: {err} — the query types \
+                 against the schema but does not conform to real SQLite \
+                 (validated at build time against the migration-replayed \
+                 template database)."
+            ),
+        )
     })
 }
 

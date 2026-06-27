@@ -29,6 +29,14 @@ members = [
     # chain end-to-end (real build.rs + migrations dir + freshness tests).
     # `publish = false`; not a shipped crate.
     "tools/query_fixture",
+    # Fixture consumer exercising the SQLite build-time validation backend:
+    # a real build.rs replays a SQLite-portable migrations dir into both the
+    # PostgreSQL catalog AND an OUT_DIR SQLite template DB, then query!
+    # cross-checks each query (deny-all-but-readonly authorizer + decltype /
+    # table_info vs the inference lattice + scan-on-toggle). Hosts the SQLite
+    # conformance trybuild gate. `publish = false`; not a shipped crate; adds
+    # NO new external package (rusqlite is already resolved for bsql-sqlite).
+    "tools/query_sqlite_fixture",
     # Dev-only differential-replay corpus: a Rust-native typed corpus of
     # PostgreSQL wire transcripts replayed through an observable-I/O Adapter
     # seam over the public sans-IO `Session`. Proves engine behavioural

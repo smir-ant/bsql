@@ -1,0 +1,5 @@
+error: query!: SQLite conformance failure: a dynamic OPTIONAL(...) toggle filter forces a full-table scan at runtime (SCAN users). The `$N IS NULL OR ...` form cannot use an index, so enabling the filter scans the whole table. Add an index that serves the enabled filter, or acknowledge the scan with a `/* bsql:allow-scan: <reason> */` marker in the query and a documented return plan. — the query types against the schema but does not conform to real SQLite (validated at build time against the migration-replayed template database).
+ --> tests/compile_fail/scan_on_toggle.rs:7:36
+  |
+7 |     bsql_query_macros::query!(Row, "SELECT id FROM users WHERE OPTIONAL(name = $1)");
+  |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

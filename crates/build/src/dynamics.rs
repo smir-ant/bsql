@@ -88,6 +88,27 @@ pub struct WireVariant {
     /// The lowered, plain-PostgreSQL SQL baked into this variant's
     /// prepared-query wire artifact.
     pub wire_sql: String,
+    /// The lowered SQL the inference engine actually typed for this variant
+    /// — `OPTIONAL(p)` collapsed to `(p)` and `ANY($N)` collapsed to `$N`
+    /// (the toggle / array sugar removed). This is the portable form: it
+    /// has no PostgreSQL-only `= ANY($N)` array operator, so the build-time
+    /// SQLite backend can `prepare_v2` it to cross-check that real SQLite
+    /// agrees with the lattice on this variant's row shape. (The `wire_sql`
+    /// above keeps `ANY($N)`, which only PostgreSQL accepts.)
+    pub infer_sql: String,
+    /// The lowered SQL the SQLite full-scan-on-toggle check `EXPLAIN QUERY
+    /// PLAN`s for this variant — `OPTIONAL(p)` kept in its toggle form
+    /// (`$N IS NULL OR p`, so the plan reflects what the enabled filter
+    /// actually does to the index), but `ANY($N)` collapsed to `$N` (the
+    /// SAME collapse `infer_sql` applies). This is the SQLite-PREPARABLE
+    /// toggle form: it keeps the toggle the scan check must see, yet drops
+    /// the PostgreSQL-only `= ANY($N)` operator — which SQLite parses as a
+    /// call to an unknown function `ANY` and rejects, falsely failing a
+    /// valid OPTIONAL + `= ANY($M)` query. `wire_sql` keeps both forms (it
+    /// is the bytes baked for PostgreSQL); `infer_sql` drops both (it is the
+    /// portable row-shape prepare); this drops only `ANY` and keeps the
+    /// toggle.
+    pub scan_sql: String,
 }
 
 /// The fully resolved dynamic shape of one `query!` invocation.
@@ -154,6 +175,8 @@ pub fn infer_dynamic_query(catalog: &Catalog, sql: &str) -> Result<DynamicShape,
                 params,
                 variants: vec![WireVariant {
                     wire_sql: pre.wire_base,
+                    infer_sql: pre.infer_base,
+                    scan_sql: pre.scan_base,
                 }],
                 order_by: None,
             })
@@ -190,6 +213,8 @@ pub fn infer_dynamic_query(catalog: &Catalog, sql: &str) -> Result<DynamicShape,
                 }
                 variants.push(WireVariant {
                     wire_sql: format!("{} ORDER BY {}", pre.wire_base, option.clause),
+                    infer_sql: infer_sql.clone(),
+                    scan_sql: format!("{} ORDER BY {}", pre.scan_base, option.clause),
                 });
                 order_variants.push(OrderByVariant {
                     variant_ident: option.variant_ident.clone(),
@@ -267,6 +292,12 @@ struct Preprocessed {
     /// SQL baked on the wire: `OPTIONAL(p)` -> `($N IS NULL OR p)`,
     /// `ANY($N)` kept, the `ORDER BY { ... }` block removed.
     wire_base: String,
+    /// SQL the SQLite scan check `EXPLAIN QUERY PLAN`s: `OPTIONAL(p)` ->
+    /// `($N IS NULL OR p)` (toggle kept), `ANY($N)` -> `$N` (collapsed, as
+    /// `infer_base` does), the `ORDER BY { ... }` block removed. The toggle
+    /// the scan check must see, without the PostgreSQL-only `= ANY($N)`
+    /// SQLite cannot prepare.
+    scan_base: String,
     /// 1-based positions toggled to `Option<T>`.
     optional_positions: Vec<usize>,
     /// 1-based positions that are a single array parameter.
@@ -284,15 +315,32 @@ struct OrderByOption {
 /// Lower the dynamic sugar textually. See the module docs for the forms.
 fn preprocess(sql: &str) -> Result<Preprocessed, DynamicError> {
     let (prefix, order_by) = split_order_by_allow_set(sql)?;
-    let (infer_base, wire_base, optional_positions, array_positions) =
-        expand_markers(prefix)?;
+    let expanded = expand_markers(prefix)?;
     Ok(Preprocessed {
-        infer_base,
-        wire_base,
-        optional_positions,
-        array_positions,
+        infer_base: expanded.infer,
+        wire_base: expanded.wire,
+        scan_base: expanded.scan,
+        optional_positions: expanded.optional_positions,
+        array_positions: expanded.array_positions,
         order_by,
     })
+}
+
+/// The textual result of expanding the `OPTIONAL(...)` / `= ANY($N)`
+/// markers in one SQL prefix: the three lowered SQL forms (differing only
+/// at the markers) plus the toggled / array `$N` positions discovered.
+struct Expanded {
+    /// `OPTIONAL(p)` -> `(p)`, `ANY($N)` -> `$N` (the portable infer form).
+    infer: String,
+    /// `OPTIONAL(p)` -> `($N IS NULL OR p)`, `ANY($N)` kept (the PG wire form).
+    wire: String,
+    /// `OPTIONAL(p)` -> `($N IS NULL OR p)`, `ANY($N)` -> `$N` (the
+    /// SQLite-preparable scan form).
+    scan: String,
+    /// 1-based positions toggled to `Option<T>`.
+    optional_positions: Vec<usize>,
+    /// 1-based positions that are a single array parameter.
+    array_positions: Vec<usize>,
 }
 
 /// Split off a trailing `ORDER BY { ... }` allow-set block, if present.
@@ -429,14 +477,26 @@ fn is_plain_identifier(name: &str) -> bool {
 }
 
 /// Expand the `OPTIONAL(...)` and `= ANY($N)` markers in `sql`, producing
-/// the inference SQL, the wire SQL, and the toggled / array `$N`
-/// positions. Untouched SQL is spliced through byte-for-byte.
-fn expand_markers(
-    sql: &str,
-) -> Result<(String, String, Vec<usize>, Vec<usize>), DynamicError> {
+/// the inference SQL, the wire SQL, the SQLite scan-check SQL, and the
+/// toggled / array `$N` positions. Untouched SQL is spliced through
+/// byte-for-byte into all three forms.
+///
+/// The three forms differ ONLY at the two markers, derived in one pass so
+/// they cannot drift:
+///
+/// | marker        | infer        | wire                 | scan                 |
+/// |---------------|--------------|----------------------|----------------------|
+/// | `OPTIONAL(p)` | `(p)`        | `($N IS NULL OR p)`  | `($N IS NULL OR p)`  |
+/// | `ANY($N)`     | `$N`         | `ANY($N)`            | `$N`                 |
+///
+/// `scan` keeps the toggle (so the plan reflects the enabled filter) but
+/// collapses `ANY` (so SQLite can prepare it — `= ANY($N)` is parsed by
+/// SQLite as a call to an unknown function `ANY`).
+fn expand_markers(sql: &str) -> Result<Expanded, DynamicError> {
     let bytes = sql.as_bytes();
     let mut infer = String::with_capacity(sql.len());
     let mut wire = String::with_capacity(sql.len());
+    let mut scan = String::with_capacity(sql.len());
     let mut optional_positions = Vec::new();
     let mut array_positions = Vec::new();
 
@@ -485,15 +545,16 @@ fn expand_markers(
             let inner = &sql[paren_open + 1..paren_close];
             let position = sole_placeholder(inner)?;
             // flush the verbatim run before the marker
-            flush(&mut infer, &mut wire, sql, copied, i);
+            flush(&mut infer, &mut wire, &mut scan, sql, copied, i);
             infer.push('(');
             infer.push_str(inner);
             infer.push(')');
-            wire.push_str("($");
-            wire.push_str(&position.to_string());
-            wire.push_str(" IS NULL OR ");
-            wire.push_str(inner);
-            wire.push(')');
+            // wire AND scan keep the toggle form `($N IS NULL OR p)`: the
+            // scan check must see the toggle to detect the index-defeating
+            // plan; wire bakes it for PostgreSQL.
+            let toggle = format!("(${position} IS NULL OR {inner})");
+            wire.push_str(&toggle);
+            scan.push_str(&toggle);
             optional_positions.push(position);
             i = paren_close + 1;
             copied = i;
@@ -508,10 +569,12 @@ fn expand_markers(
             // `ANY(ARRAY[...])`, a subquery, etc. is left untouched — the
             // inference engine types it directly.
             if let Some(position) = bare_placeholder(inner) {
-                flush(&mut infer, &mut wire, sql, copied, i);
-                // inference: drop the ANY wrapper, leaving `... $N`
-                infer.push('$');
-                infer.push_str(&position.to_string());
+                flush(&mut infer, &mut wire, &mut scan, sql, copied, i);
+                // inference AND scan: drop the ANY wrapper, leaving `... $N`
+                // (SQLite cannot prepare `= ANY($N)`).
+                let collapsed = format!("${position}");
+                infer.push_str(&collapsed);
+                scan.push_str(&collapsed);
                 // wire: keep `ANY($N)` verbatim (`i` is the ASCII `A`
                 // of `ANY`, `paren_close` the matching `)` — both
                 // `char` boundaries).
@@ -525,17 +588,24 @@ fn expand_markers(
 
         i += 1;
     }
-    flush(&mut infer, &mut wire, sql, copied, bytes.len());
-    Ok((infer, wire, optional_positions, array_positions))
+    flush(&mut infer, &mut wire, &mut scan, sql, copied, bytes.len());
+    Ok(Expanded {
+        infer,
+        wire,
+        scan,
+        optional_positions,
+        array_positions,
+    })
 }
 
-/// Flush `sql[start..end]` verbatim into both outputs. `start`/`end` are
-/// always flush points at marker boundaries (ASCII positions), so they
+/// Flush `sql[start..end]` verbatim into all three outputs. `start`/`end`
+/// are always flush points at marker boundaries (ASCII positions), so they
 /// sit on `char` boundaries.
-fn flush(infer: &mut String, wire: &mut String, sql: &str, start: usize, end: usize) {
+fn flush(infer: &mut String, wire: &mut String, scan: &mut String, sql: &str, start: usize, end: usize) {
     let slice = &sql[start..end];
     infer.push_str(slice);
     wire.push_str(slice);
+    scan.push_str(slice);
 }
 
 /// If `bytes[pos..]` begins with the keyword `kw` (ASCII case-insensitive)
@@ -809,6 +879,7 @@ mod tests {
         let pre = preprocess("SELECT id FROM orders WHERE id = $1").expect("preprocess");
         assert_eq!(pre.infer_base, "SELECT id FROM orders WHERE id = $1");
         assert_eq!(pre.wire_base, "SELECT id FROM orders WHERE id = $1");
+        assert_eq!(pre.scan_base, "SELECT id FROM orders WHERE id = $1");
         assert!(pre.optional_positions.is_empty());
         assert!(pre.array_positions.is_empty());
         assert!(pre.order_by.is_none());
@@ -823,6 +894,11 @@ mod tests {
             pre.wire_base,
             "SELECT id FROM orders WHERE ($1 IS NULL OR total = $1)"
         );
+        // No `ANY`, so the scan form is the wire form: the toggle is kept.
+        assert_eq!(
+            pre.scan_base,
+            "SELECT id FROM orders WHERE ($1 IS NULL OR total = $1)"
+        );
         assert_eq!(pre.optional_positions, vec![1]);
     }
 
@@ -831,7 +907,37 @@ mod tests {
         let pre = preprocess("SELECT id FROM orders WHERE id = ANY($1)").expect("preprocess");
         assert_eq!(pre.infer_base, "SELECT id FROM orders WHERE id = $1");
         assert_eq!(pre.wire_base, "SELECT id FROM orders WHERE id = ANY($1)");
+        // No toggle, so the scan form collapses `ANY` like the infer form:
+        // SQLite cannot prepare `= ANY($1)`.
+        assert_eq!(pre.scan_base, "SELECT id FROM orders WHERE id = $1");
         assert_eq!(pre.array_positions, vec![1]);
+    }
+
+    #[test]
+    fn optional_and_any_scan_base_preserves_toggle_collapses_any() {
+        // The reachable dynamic combination: an OPTIONAL($1) toggle AND a
+        // `= ANY($2)` in-list on DIFFERENT params. The scan form must keep
+        // the toggle (so the plan reflects the enabled filter) yet collapse
+        // `= ANY($2)` to `= $2` (so SQLite can prepare it — `= ANY($2)` is
+        // parsed by SQLite as a call to an unknown function `ANY`).
+        let pre = preprocess(
+            "SELECT id FROM orders WHERE OPTIONAL(total = $1) AND user_id = ANY($2)",
+        )
+        .expect("preprocess");
+        assert_eq!(
+            pre.infer_base,
+            "SELECT id FROM orders WHERE (total = $1) AND user_id = $2"
+        );
+        assert_eq!(
+            pre.wire_base,
+            "SELECT id FROM orders WHERE ($1 IS NULL OR total = $1) AND user_id = ANY($2)"
+        );
+        assert_eq!(
+            pre.scan_base,
+            "SELECT id FROM orders WHERE ($1 IS NULL OR total = $1) AND user_id = $2"
+        );
+        assert_eq!(pre.optional_positions, vec![1]);
+        assert_eq!(pre.array_positions, vec![2]);
     }
 
     #[test]

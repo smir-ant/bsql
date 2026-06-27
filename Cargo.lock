@@ -63,6 +63,7 @@ dependencies = [
 name = "bsql-build"
 version = "1.0.0-alpha.0"
 dependencies = [
+ "rusqlite",
  "sqlparser",
 ]
 
@@ -160,6 +161,16 @@ dependencies = [
  "quote",
  "sha2",
  "syn",
+]
+
+[[package]]
+name = "bsql-query-sqlite-fixture"
+version = "0.0.0"
+dependencies = [
+ "bsql-build",
+ "bsql-postgres-proto",
+ "bsql-query-macros",
+ "trybuild",
 ]
 
 [[package]]

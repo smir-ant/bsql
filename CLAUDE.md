@@ -97,12 +97,14 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 
 - `#![forbid(unsafe_code)]` on all driver crates
 - Every SHIPPED crate is unsafe-free (`#![forbid(unsafe_code)]` at its own root).
-  `unsafe` exists in exactly two `publish = false` (never-shipped) places: the
+  `unsafe` exists only in `publish = false` (never-shipped) places: the
   `tools/devgates` building blocks (the counting allocator + the post-drop memory
-  probe), and one justified `std::env::set_var` in the `tools/query_fixture`
-  trybuild test (`tests/compile_fail.rs`) — `set_var` is `unsafe` in edition 2024,
-  used once, serially, before any trybuild child is spawned, with a `SAFETY`
-  comment. Neither is in a shipped artifact.
+  probe), and one justified `std::env::set_var` in each of the two consumer-fixture
+  trybuild tests (`tools/query_fixture/tests/compile_fail.rs` and
+  `tools/query_sqlite_fixture/tests/sqlite_gate.rs`, which forward the build-emitted
+  catalog / SQLite-template rustc-env channels into the spawned trybuild children) —
+  `set_var` is `unsafe` in edition 2024, used once, serially, before any trybuild
+  child is spawned, with a `SAFETY` comment. None is in a shipped artifact.
 - `#![deny(clippy::unwrap_used, clippy::expect_used)]` on all driver crates
 - Static assertions: `Connection: Send`, `Row: Send + Sync + 'static`, `Pool: Send + Sync`
 - NULL = `Option<NonZeroU32>` (compiler-enforced, no sentinel)
