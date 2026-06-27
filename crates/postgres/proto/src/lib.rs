@@ -279,6 +279,14 @@ pub(crate) mod md5;
 pub(crate) mod narrow;
 pub mod params;
 pub mod password;
+// The decided server-side plan-cache mode for dynamic param-toggle
+// queries (a `const` marker the connection-setup / pool-reset paths
+// consume). See [`plan_mode`].
+pub mod plan_mode;
+// Compile-time budgets for the `query!` macro's dynamic forms (toggled
+// filters / runtime ORDER BY orderings). The generated code asserts
+// against these; an over-budget query is `error[E0080]`.
+pub mod query_budget;
 // Runtime support for the `prepared!` proc-macro. Hosts
 // `PreparedQuery<P, R>`, the `RowDecode` sealed trait, and the
 // `new_prepared_query` macro-plumbing constructor.
@@ -435,6 +443,9 @@ pub use pristine::Pristine;
 // — the trait + type live in the type namespace, the macro in the
 // macro namespace.
 pub use bsql_postgres_derive::prepared;
+pub use plan_mode::{
+    PlanCacheMode, PLAN_CACHE_MODE, RESET_PLAN_CACHE_MODE_SQL, SET_PLAN_CACHE_MODE_SQL,
+};
 pub use prepared::{PreparedQuery, QueryFingerprint, RowDecode};
 pub use state::ProtoState;
 // Per-phase state enums for the `<ConnectingPhase>` /

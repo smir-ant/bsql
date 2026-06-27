@@ -1,0 +1,5 @@
+error: query!: relation `orders` has no column `nonexistent`
+ --> tests/compile_fail/query_order_by_unknown_column.rs:6:36
+  |
+6 |     bsql_query_macros::query!(Row, "SELECT id FROM orders ORDER BY { nonexistent ASC }");
+  |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

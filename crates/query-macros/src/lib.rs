@@ -312,20 +312,26 @@ fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     // missing/unreadable/corrupt catalog).
     let catalog = load_build_catalog(name.span())?;
 
-    // Type the query against the schema. Any inference failure — unknown
-    // table/column, duplicate output column, an uncast expression or
-    // parameter — is surfaced verbatim as a compile error pointed at the
-    // SQL literal. There is no "assume a type" path.
-    let shape = bsql_build::infer_query(&catalog, &sql_text)
+    // Lower the dynamic sugar (`OPTIONAL(...)`, `= ANY($N)`, runtime
+    // `ORDER BY { ... }`) and type the result against the schema. Any
+    // failure — a malformed sugar marker, an unknown table/column, a
+    // duplicate output column, an uncast expression or parameter — is
+    // surfaced verbatim as a compile error pointed at the SQL literal.
+    // There is no "assume a type" path. A query with NO dynamic sugar
+    // lowers to itself byte-for-byte, so its wire artifact is identical to
+    // the non-dynamic path.
+    let shape = bsql_build::infer_dynamic_query(&catalog, &sql_text)
         .map_err(|err| syn::Error::new(sql_span, format!("query!: {err}")))?;
 
     // The typed-record twins (borrowed + owned) and their decoders.
     let records = emit_records(&name, &shape.columns)?;
-    // The const wire artifact: the uninhabited fingerprint carrier, its
-    // `QueryFingerprint` impl (the baked Parse / Bind-prefix templates +
-    // OID lists, all derived from the inferred shape), and the validated
-    // `PreparedQuery` const minted through the proto-owned `run` boundary.
-    let wire = emit_wire_artifact(&name, &sql_text, &shape)?;
+    // The const wire artifact(s): the uninhabited fingerprint carrier(s),
+    // their `QueryFingerprint` impl(s) (baked Parse / Bind-prefix templates
+    // + OID lists, all derived from the lowered shape), the validated
+    // `PreparedQuery` const(s) minted through the proto-owned `run`
+    // boundary, the dynamic-form budget assertions, and — for a runtime
+    // `ORDER BY` allow-set — the closed selector enum.
+    let wire = emit_dynamic_wire(&name, &shape)?;
 
     Ok(quote! {
         #records
@@ -826,18 +832,88 @@ fn tuple_type(markers: &[TokenStream2]) -> TokenStream2 {
     }
 }
 
-/// Emit the const wire artifact for one query: the uninhabited carrier
-/// type, its `QueryFingerprint` impl (baked templates + OID lists), the
-/// `wire_pin!` footprint guard, and the validated `PreparedQuery` const.
-fn emit_wire_artifact(
+/// The array (`T[]`) OID for an element type — for a single array
+/// parameter feeding a `col = ANY($N)` in-list. Verified against PG
+/// `pg_type.typarray`; cross-checked against the runtime crate's
+/// `oids::*_ARRAY` constants by the const validator.
+fn array_oid(ty: bsql_build::RustType) -> u32 {
+    use bsql_build::RustType;
+    match ty {
+        RustType::I16 => 1005,
+        RustType::I32 => 1007,
+        RustType::I64 => 1016,
+        RustType::U32 => 1028,
+        RustType::Bool => 1000,
+        RustType::Text => 1009,
+    }
+}
+
+/// The `oids::*_ARRAY` const path token for an element type's array OID.
+fn array_oid_path(ty: bsql_build::RustType) -> TokenStream2 {
+    use bsql_build::RustType;
+    match ty {
+        RustType::I16 => quote!(::bsql_postgres_proto::oids::INT2_ARRAY),
+        RustType::I32 => quote!(::bsql_postgres_proto::oids::INT4_ARRAY),
+        RustType::I64 => quote!(::bsql_postgres_proto::oids::INT8_ARRAY),
+        RustType::U32 => quote!(::bsql_postgres_proto::oids::OID_ARRAY),
+        RustType::Bool => quote!(::bsql_postgres_proto::oids::BOOL_ARRAY),
+        RustType::Text => quote!(::bsql_postgres_proto::oids::TEXT_ARRAY),
+    }
+}
+
+/// The `'static`-lifetime type-level marker for one parameter tuple
+/// element. A toggled optional filter is `Option<T>` (passing `None`
+/// disables it); a `= ANY($N)` in-list is the array slice `&'static [T]`;
+/// a plain scalar is `T`.
+fn param_tuple_marker(shape: bsql_build::ParamShape) -> TokenStream2 {
+    use bsql_build::ParamShape;
+    match shape {
+        ParamShape::Scalar(ty) => tuple_marker(ty),
+        ParamShape::Optional(ty) => {
+            let inner = tuple_marker(ty);
+            quote!(::core::option::Option<#inner>)
+        }
+        ParamShape::Array(ty) => {
+            let elem = tuple_marker(ty);
+            quote!(&'static [#elem])
+        }
+    }
+}
+
+/// The numeric OID baked into the Parse template for one parameter. A
+/// toggled `Option<T>` keeps the scalar OID (a SQL NULL is typed by its
+/// column); a `= ANY($N)` array uses the element type's array OID.
+fn param_oid_value(shape: bsql_build::ParamShape) -> u32 {
+    use bsql_build::ParamShape;
+    match shape {
+        ParamShape::Scalar(ty) | ParamShape::Optional(ty) => rust_type_oid(ty),
+        ParamShape::Array(ty) => array_oid(ty),
+    }
+}
+
+/// The `oids::*` const path token emitted into `PARAM_OIDS` for one
+/// parameter — the runtime const validator cross-checks it against the
+/// `ParamsWriter` tuple's declared OIDs.
+fn param_oid_path(shape: bsql_build::ParamShape) -> TokenStream2 {
+    use bsql_build::ParamShape;
+    match shape {
+        ParamShape::Scalar(ty) | ParamShape::Optional(ty) => oid_path(ty),
+        ParamShape::Array(ty) => array_oid_path(ty),
+    }
+}
+
+/// Emit every const wire artifact for one (possibly dynamic) query: the
+/// dynamic-form budget assertions, then either ONE carrier (no runtime
+/// `ORDER BY` allow-set) or one carrier per allowed ordering plus the
+/// closed selector enum the caller picks from at runtime.
+fn emit_dynamic_wire(
     name: &Ident,
-    sql: &str,
-    shape: &bsql_build::QueryShape,
+    shape: &bsql_build::DynamicShape,
 ) -> syn::Result<TokenStream2> {
     // The runtime `ParamsWriter` / `RowDecode` impls (and the whole
     // prepared-statement wire path) cover tuple arity 0..=16. A query
-    // outside that envelope is a loud rejection, not a silent
-    // truncation or an opaque trait-bound error.
+    // outside that envelope is a loud rejection, not a silent truncation
+    // or an opaque trait-bound error.
     if shape.params.len() > 16 {
         return Err(syn::Error::new(
             name.span(),
@@ -859,33 +935,156 @@ fn emit_wire_artifact(
         ));
     }
 
-    let carrier = format_ident!("{}Query", name);
-
-    // Content-addressed statement name: SHA-256 of the SQL text,
-    // truncated to 96 bits, hex-encoded, prefixed. Two distinct queries
-    // cannot share a name without colliding their content addresses.
-    let stmt_name = sha256_96_stmt_name(sql);
-
-    // Type-level Params / Row tuples (markers), and the matching OID
-    // path slices. Params come from the inferred `$N` types; Row from
-    // the projected columns (base marker — nullability is the records'
-    // concern, not the wire OID's).
+    // Type-level Params / Row tuples (markers), shared across every wire
+    // variant — only the ORDER BY differs between variants. Params come
+    // from the lowered `$N` shapes (scalar / Option / array); Row from the
+    // projected columns (base marker — nullability is the records' concern,
+    // not the wire OID's).
     let param_markers: Vec<TokenStream2> =
-        shape.params.iter().map(|ty| tuple_marker(*ty)).collect();
+        shape.params.iter().map(|p| param_tuple_marker(*p)).collect();
     let row_markers: Vec<TokenStream2> =
         shape.columns.iter().map(|c| tuple_marker(c.ty)).collect();
     let params_tuple = tuple_type(&param_markers);
     let row_tuple = tuple_type(&row_markers);
 
-    let param_oid_paths = shape.params.iter().map(|ty| oid_path(*ty));
-    let row_oid_paths = shape.columns.iter().map(|c| oid_path(c.ty));
+    // Dynamic-form budgets, enforced at const-evaluation: an over-budget
+    // query is `error[E0080]` at the `query!` site (never a silent
+    // truncation of filters / orderings). Within budget the assert is a
+    // no-op the optimizer drops.
+    let n_optional = shape
+        .params
+        .iter()
+        .filter(|p| matches!(p, bsql_build::ParamShape::Optional(_)))
+        .count();
+    let n_optional_lit = Literal::usize_unsuffixed(n_optional);
+    let n_variants_lit = Literal::usize_unsuffixed(shape.variants.len());
+    let budget = quote! {
+        const _: () = ::core::assert!(
+            #n_optional_lit <= ::bsql_postgres_proto::query_budget::MAX_OPTIONAL_FILTERS,
+            "query!: too many OPTIONAL(...) toggled filters in one query",
+        );
+        const _: () = ::core::assert!(
+            #n_variants_lit <= ::bsql_postgres_proto::query_budget::MAX_ORDER_BY_VARIANTS,
+            "query!: too many runtime ORDER BY orderings in one query",
+        );
+    };
 
-    // Numeric param OIDs for baking the Parse template's OID section.
-    let param_oid_values: Vec<u32> =
-        shape.params.iter().map(|ty| rust_type_oid(*ty)).collect();
+    match &shape.order_by {
+        // No runtime ORDER BY allow-set: one carrier named `{Name}Query`
+        // (identical to the non-dynamic path).
+        None => {
+            let variant = shape.variants.first().ok_or_else(|| {
+                syn::Error::new(name.span(), "query!: internal error — no wire variant")
+            })?;
+            let carrier = format_ident!("{}Query", name);
+            let one = emit_carrier(
+                &carrier,
+                name,
+                &variant.wire_sql,
+                &shape.params,
+                &shape.columns,
+                &params_tuple,
+                &row_tuple,
+            )?;
+            Ok(quote! {
+                #budget
+                #one
+            })
+        }
+        // A runtime ORDER BY allow-set: one carrier per ordering plus a
+        // closed selector enum. The caller picks a variant at runtime; an
+        // ordering outside the set cannot be named (the enum has only the
+        // declared variants), and no SQL string is built.
+        Some(orderings) => {
+            let mut carriers: Vec<TokenStream2> = Vec::with_capacity(orderings.len());
+            let mut variant_idents: Vec<Ident> = Vec::with_capacity(orderings.len());
+            let mut carrier_idents: Vec<Ident> = Vec::with_capacity(orderings.len());
+            for (ordering, variant) in orderings.iter().zip(shape.variants.iter()) {
+                let variant_ident = format_ident!("{}", ordering.variant_ident);
+                let carrier = format_ident!("{}{}Query", name, ordering.variant_ident);
+                let emitted = emit_carrier(
+                    &carrier,
+                    name,
+                    &variant.wire_sql,
+                    &shape.params,
+                    &shape.columns,
+                    &params_tuple,
+                    &row_tuple,
+                )?;
+                carriers.push(emitted);
+                variant_idents.push(variant_ident);
+                carrier_idents.push(carrier);
+            }
+            let enum_ident = format_ident!("{}OrderBy", name);
+            let enum_doc = format!(
+                "Runtime `ORDER BY` selector for the `{name}` query — a CLOSED \
+                 allow-set of orderings. Pick one variant at runtime; \
+                 [`{enum_ident}::prepared`](Self::prepared) returns its baked, \
+                 content-addressed prepared query. An ordering outside the set \
+                 cannot be named (no SQL string is built, so there is no \
+                 injection surface)."
+            );
+            let prepared_doc =
+                "The baked prepared query for the selected ordering.".to_string();
+            let allow_reason = "the generated ORDER BY selector is part of the query's public surface; a consumer may use any subset of its variants";
+            let selector = quote! {
+                #[doc = #enum_doc]
+                #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+                #[allow(dead_code, reason = #allow_reason)]
+                pub enum #enum_ident {
+                    #(#variant_idents),*
+                }
+
+                impl #enum_ident {
+                    #[doc = #prepared_doc]
+                    #[allow(dead_code, reason = #allow_reason)]
+                    #[must_use]
+                    pub const fn prepared(
+                        self,
+                    ) -> ::bsql_postgres_proto::PreparedQuery<#params_tuple, #row_tuple> {
+                        match self {
+                            #( Self::#variant_idents => #carrier_idents::PREPARED, )*
+                        }
+                    }
+                }
+            };
+            Ok(quote! {
+                #budget
+                #(#carriers)*
+                #selector
+            })
+        }
+    }
+}
+
+/// Emit ONE const wire artifact: the uninhabited carrier type, its
+/// `QueryFingerprint` impl (baked Parse / Bind-prefix templates + OID
+/// lists, derived from the lowered shape), the validated `PreparedQuery`
+/// const minted through the proto-owned `run` boundary, and the
+/// `wire_pin!` footprint guard.
+fn emit_carrier(
+    carrier: &Ident,
+    name: &Ident,
+    wire_sql: &str,
+    params: &[bsql_build::ParamShape],
+    columns: &[bsql_build::InferredColumn],
+    params_tuple: &TokenStream2,
+    row_tuple: &TokenStream2,
+) -> syn::Result<TokenStream2> {
+    // Content-addressed statement name: SHA-256 of the (lowered) SQL text,
+    // truncated to 96 bits, hex-encoded, prefixed. Two distinct queries
+    // cannot share a name without colliding their content addresses.
+    let stmt_name = sha256_96_stmt_name(wire_sql);
+
+    let param_oid_paths = params.iter().map(|p| param_oid_path(*p));
+    let row_oid_paths = columns.iter().map(|c| oid_path(c.ty));
+
+    // Numeric param OIDs for baking the Parse template's OID section (an
+    // array param bakes its array OID; a toggled Option keeps its scalar).
+    let param_oid_values: Vec<u32> = params.iter().map(|p| param_oid_value(*p)).collect();
 
     // Pre-baked wire byte templates.
-    let parse_template_bytes = build_parse_template_bytes(&stmt_name, sql, &param_oid_values)?;
+    let parse_template_bytes = build_parse_template_bytes(&stmt_name, wire_sql, &param_oid_values)?;
     let bind_prefix_bytes = build_bind_execute_prefix_bytes(&stmt_name);
     let parse_template_lit = byte_array_literal(&parse_template_bytes);
     let bind_prefix_lit = byte_array_literal(&bind_prefix_bytes);
@@ -914,7 +1113,7 @@ fn emit_wire_artifact(
         impl ::bsql_postgres_proto::QueryFingerprint for #carrier {
             type Params = #params_tuple;
             type Row = #row_tuple;
-            const SQL: &'static str = #sql;
+            const SQL: &'static str = #wire_sql;
             const STMT_NAME: &'static str = #stmt_name;
             const PARAM_OIDS: &'static [u32] = &[ #( #param_oid_paths ),* ];
             const ROW_OIDS: &'static [u32] = &[ #( #row_oid_paths ),* ];

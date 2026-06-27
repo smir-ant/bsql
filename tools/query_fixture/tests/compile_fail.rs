@@ -57,4 +57,25 @@ fn unknown_reference_is_compile_error() {
     t.compile_fail("tests/compile_fail/query_wire_schema_pin_drift.rs");
     t.compile_fail("tests/compile_fail/query_hostile_construction.rs");
     t.compile_fail("tests/compile_fail/query_hostile_fingerprint.rs");
+
+    // `query!` DYNAMIC-form surface.
+    //   * The optional-filter budget is a const-eval cap: nine
+    //     `OPTIONAL(...)` filters exceed `MAX_OPTIONAL_FILTERS = 8`
+    //     (`error[E0080]`) — never a silent truncation.
+    //   * The runtime ORDER BY budget is the matching const-eval cap:
+    //     seventeen orderings exceed `MAX_ORDER_BY_VARIANTS = 16`
+    //     (`error[E0080]`) — never a silent truncation of orderings.
+    //   * A runtime ORDER BY option naming a non-existent column is a
+    //     schema-typing `compile_error!` (the ordering is inference-
+    //     validated, so it cannot fall "outside" the real columns).
+    //   * The runtime ORDER BY selector is a CLOSED enum: an undeclared
+    //     ordering is `error[E0599]` (no such variant) — unrepresentable,
+    //     so no SQL string is built and there is no injection surface.
+    t.compile_fail("tests/compile_fail/query_optional_budget_exceeded.rs");
+    t.compile_fail("tests/compile_fail/query_order_by_budget_exceeded.rs");
+    t.compile_fail("tests/compile_fail/query_order_by_unknown_column.rs");
+    t.compile_fail("tests/compile_fail/query_order_by_outside_allow_set.rs");
+
+    // Every valid dynamic form type-checks at macro expansion.
+    t.pass("tests/compile_pass/query_dynamics_ok.rs");
 }

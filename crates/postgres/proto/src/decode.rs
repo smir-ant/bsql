@@ -2365,6 +2365,121 @@ impl EncodeBinary for &str {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════
+// One-dimensional array encoders — the wire form of a single array
+// parameter passed to a `col = ANY($N)` in-list.
+// ════════════════════════════════════════════════════════════════════
+//
+// PostgreSQL binary array layout (`src/backend/utils/adt/arrayfuncs.c`,
+// `array_send`), for a one-dimensional array with lower bound 1:
+//
+// ```text
+//   ndim:        i32_be = 1
+//   has_null:    i32_be = 0   (this encoder never emits NULL elements)
+//   element_oid: i32_be       (the scalar element type's OID)
+//   dim_len:     i32_be = N   (the element count)
+//   lower_bound: i32_be = 1
+//   per element: { len_i32_be, body_bytes }   (no NULL: len >= 0)
+// ```
+//
+// The outer per-parameter length prefix is NOT written here — the caller
+// (`ParamEncoder::write_param`) wraps `encode_to` in
+// `with_i32_length_prefixed_body`, exactly as for every scalar param, so
+// the array param is binary-uniform with the rest of the Bind frame.
+
+/// Write the one-dimensional PG binary array header + each element body,
+/// length-prefixed. Shared by every element type's array `encode_to`.
+/// `T: EncodeBinary` supplies both the per-element bytes and the element
+/// type OID, so the header's `element_oid` can never disagree with the
+/// bytes that follow.
+#[inline]
+fn encode_array_1d<T: EncodeBinary>(
+    elems: &[T],
+    dst: &mut crate::write_buf::WriteBuf,
+) -> Result<(), crate::write_buf::WriteBufFull> {
+    // An empty array is PG's canonical zero-dimension form: `array_send`
+    // writes `ndim = 0` with NO dimension or lower-bound words (verified
+    // byte-for-byte against `array_send('{}'::int8[])`). Matching it keeps
+    // this encoder a faithful `array_send` replica for every length.
+    if elems.is_empty() {
+        dst.push_i32_be(0)?; // ndim = 0
+        dst.push_i32_be(0)?; // has_null = 0
+        dst.push_u32_be(<T as EncodeBinary>::OID)?; // element OID
+        return Ok(());
+    }
+    dst.push_i32_be(1)?; // ndim = 1
+    dst.push_i32_be(0)?; // has_null = 0 (no NULL elements on this path)
+    // element OID as 4 bytes; every supported element OID is < 2^31, so a
+    // u32 write and an i32 write are byte-identical — `push_u32_be` keeps
+    // the value un-cast.
+    dst.push_u32_be(<T as EncodeBinary>::OID)?;
+    // A slice longer than i32::MAX cannot be length-encoded; that is a
+    // loud `Err` (it overflows the wire's i32 dim field), never a wrapped
+    // length. In practice the bounded send buffer is exhausted long first.
+    let dim_len = i32::try_from(elems.len()).map_err(|_| crate::write_buf::WriteBufFull)?;
+    dst.push_i32_be(dim_len)?; // dimension length
+    dst.push_i32_be(1)?; // lower bound = 1
+    for elem in elems {
+        dst.with_i32_length_prefixed_body(|w| elem.encode_to(w))?;
+    }
+    Ok(())
+}
+
+/// Generate `EncodeBinary` for `&[T]` over a fixed-width element `T`,
+/// with the array's own OID. The seal mirrors the scalar impls so a
+/// downstream crate cannot introduce its own array encoder.
+macro_rules! impl_encode_binary_array {
+    ($($elem:ty => $array_oid:expr),+ $(,)?) => {
+        $(
+            impl<'array> sealed::EncodeBinarySealed for &'array [$elem] {}
+            impl<'array> EncodeBinary for &'array [$elem] {
+                const OID: u32 = $array_oid;
+                #[inline]
+                fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+                    -> Result<(), crate::write_buf::WriteBufFull>
+                {
+                    encode_array_1d::<$elem>(self, dst)
+                }
+            }
+        )+
+    };
+}
+
+impl_encode_binary_array!(
+    i16 => oids::INT2_ARRAY,
+    i32 => oids::INT4_ARRAY,
+    i64 => oids::INT8_ARRAY,
+    u32 => oids::OID_ARRAY,
+    bool => oids::BOOL_ARRAY,
+);
+
+/// `text[]` array of borrowed strings. Each element is the same UTF-8
+/// body the scalar `&str` encoder writes, length-prefixed by
+/// `encode_array_1d`.
+impl sealed::EncodeBinarySealed for &[&str] {}
+impl EncodeBinary for &[&str] {
+    const OID: u32 = oids::TEXT_ARRAY;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        encode_array_1d::<&str>(self, dst)
+    }
+}
+
+// Drift-pins: every array EncodeBinary impl's OID matches the canonical
+// array `oids::*` constant, and the header's element OID matches the
+// scalar element's OID (so the declared element type can never disagree
+// with the element bytes `encode_array_1d` writes).
+const _: () = {
+    assert!(<&[i16] as EncodeBinary>::OID == oids::INT2_ARRAY);
+    assert!(<&[i32] as EncodeBinary>::OID == oids::INT4_ARRAY);
+    assert!(<&[i64] as EncodeBinary>::OID == oids::INT8_ARRAY);
+    assert!(<&[u32] as EncodeBinary>::OID == oids::OID_ARRAY);
+    assert!(<&[bool] as EncodeBinary>::OID == oids::BOOL_ARRAY);
+    assert!(<&[&str] as EncodeBinary>::OID == oids::TEXT_ARRAY);
+};
+
 // Drift-pins: every EncodeBinary impl's OID matches the
 // corresponding `Cell<BinaryFmt>` impl AND the canonical `oids::*`
 // constant. One const-block pins the whole set.
@@ -2435,6 +2550,25 @@ pub mod oids {
     /// `jsonb`.
     pub const JSONB: u32 = 3802;
 
+    // ── Array (`T[]`) type OIDs, for a single array parameter sent to a
+    //    `col = ANY($N)` in-list. Each is the `typarray` of the matching
+    //    scalar above (PG `pg_type.typarray`). The drift-pin block below
+    //    asserts each against its canonical catalog value, so a swapped
+    //    pair (e.g. `INT4_ARRAY` set to the `_int8` value) fails the build.
+
+    /// `bool[]` (`_bool`).
+    pub const BOOL_ARRAY: u32 = 1000;
+    /// `int2[]` (`_int2`).
+    pub const INT2_ARRAY: u32 = 1005;
+    /// `int4[]` (`_int4`).
+    pub const INT4_ARRAY: u32 = 1007;
+    /// `text[]` (`_text`).
+    pub const TEXT_ARRAY: u32 = 1009;
+    /// `int8[]` (`_int8`).
+    pub const INT8_ARRAY: u32 = 1016;
+    /// `oid[]` (`_oid`).
+    pub const OID_ARRAY: u32 = 1028;
+
     // Tier-1 compile drift-pin against the canonical PG catalog
     // (src/include/catalog/pg_type.dat). A typo in any constant
     // above breaks the build here — no runtime test needed.
@@ -2456,6 +2590,14 @@ pub mod oids {
         assert!(TIMESTAMPTZ == 1184, "oids::TIMESTAMPTZ drift from pg_type.dat");
         assert!(UUID == 2950, "oids::UUID drift from pg_type.dat");
         assert!(JSONB == 3802, "oids::JSONB drift from pg_type.dat");
+        // Array OIDs, verified against `pg_type` (`typname` -> `typarray`)
+        // on PostgreSQL 15.
+        assert!(BOOL_ARRAY == 1000, "oids::BOOL_ARRAY drift from pg_type.dat");
+        assert!(INT2_ARRAY == 1005, "oids::INT2_ARRAY drift from pg_type.dat");
+        assert!(INT4_ARRAY == 1007, "oids::INT4_ARRAY drift from pg_type.dat");
+        assert!(TEXT_ARRAY == 1009, "oids::TEXT_ARRAY drift from pg_type.dat");
+        assert!(INT8_ARRAY == 1016, "oids::INT8_ARRAY drift from pg_type.dat");
+        assert!(OID_ARRAY == 1028, "oids::OID_ARRAY drift from pg_type.dat");
     };
 }
 

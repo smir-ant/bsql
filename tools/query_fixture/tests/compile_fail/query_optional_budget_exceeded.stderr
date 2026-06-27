@@ -1,0 +1,11 @@
+error[E0080]: evaluation panicked: query!: too many OPTIONAL(...) toggled filters in one query
+  --> tests/compile_fail/query_optional_budget_exceeded.rs:6:5
+   |
+ 6 | /     bsql_query_macros::query!(
+ 7 | |         Row,
+ 8 | |         "SELECT id FROM orders WHERE \
+ 9 | |          OPTIONAL(total = $1) OR OPTIONAL(total = $2) OR OPTIONAL(total = $3) OR \
+10 | |          OPTIONAL(total = $4) OR OPTIONAL(total = $5) OR OPTIONAL(total = $6) OR \
+11 | |          OPTIONAL(total = $7) OR OPTIONAL(total = $8) OR OPTIONAL(total = $9)"
+12 | |     );
+   | |_____^ evaluation of `main::_` failed here

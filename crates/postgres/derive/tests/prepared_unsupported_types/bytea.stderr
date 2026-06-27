@@ -25,12 +25,12 @@ error[E0277]: `&'static [u8]` does not implement `EncodeBinary` (cannot encode t
    = help: the trait `EncodeBinary` is not implemented for `&'static [u8]`
    = note: `EncodeBinary` is sealed — extend by adding `impl EncodeBinary for ...` for the new type in `decode.rs` after extending the supported-OID matrix; downstream `impl EncodeBinary for ...` is forbidden by construction
    = help: the following other types implement trait `EncodeBinary`:
-             &str
-             bool
-             i16
-             i32
-             i64
-             u32
+             &[&str]
+             &[bool]
+             &[i16]
+             &[i32]
+             &[i64]
+             &[u32]
    = note: required for `&'static [u8]` to implement `ParamEncoder`
    = note: required for `(&'static [u8],)` to implement `ParamsWriter`
 note: required by a bound in `PreparedQuery`
@@ -51,12 +51,12 @@ error[E0277]: `&'static [u8]` does not implement `EncodeBinary` (cannot encode t
    = help: the trait `EncodeBinary` is not implemented for `&'static [u8]`
    = note: `EncodeBinary` is sealed — extend by adding `impl EncodeBinary for ...` for the new type in `decode.rs` after extending the supported-OID matrix; downstream `impl EncodeBinary for ...` is forbidden by construction
    = help: the following other types implement trait `EncodeBinary`:
-             &str
-             bool
-             i16
-             i32
-             i64
-             u32
+             &[&str]
+             &[bool]
+             &[i16]
+             &[i32]
+             &[i64]
+             &[u32]
    = note: required for `&'static [u8]` to implement `ParamEncoder`
    = note: required for `(&'static [u8],)` to implement `ParamsWriter`
 note: required by a bound in `PreparedQuery`

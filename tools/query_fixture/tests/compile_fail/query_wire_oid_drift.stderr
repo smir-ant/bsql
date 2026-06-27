@@ -25,3 +25,15 @@ note: inside `bsql_postgres_proto::prepared::new_prepared_query::<(i32,), ()>`
    | |          tuple's declared OIDs",
    | |     );
    | |_____- in this macro invocation
+
+note: erroneous constant encountered
+  --> tests/compile_fail/query_wire_oid_drift.rs:25:14
+   |
+25 |     let _ = &Q;
+   |              ^
+
+note: erroneous constant encountered
+  --> tests/compile_fail/query_wire_oid_drift.rs:25:13
+   |
+25 |     let _ = &Q;
+   |             ^^

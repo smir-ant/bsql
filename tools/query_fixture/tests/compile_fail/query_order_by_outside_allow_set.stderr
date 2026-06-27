@@ -1,0 +1,8 @@
+error[E0599]: no variant, associated function, or constant named `TotalDesc` found for enum `SortedOrderBy` in the current scope
+ --> tests/compile_fail/query_order_by_outside_allow_set.rs:9:28
+  |
+6 | bsql_query_macros::query!(Sorted, "SELECT id FROM orders ORDER BY { id ASC | id DESC }");
+  | -------------------------------- variant, associated function, or constant `TotalDesc` not found for this enum
+...
+9 |     let _ = SortedOrderBy::TotalDesc.prepared();
+  |                            ^^^^^^^^^ variant, associated function, or constant not found in `SortedOrderBy`

@@ -64,8 +64,12 @@
 
 #![forbid(unsafe_code)]
 
+mod dynamics;
 mod infer;
 
+pub use dynamics::{
+    infer_dynamic_query, DynamicError, DynamicShape, OrderByVariant, ParamShape, WireVariant,
+};
 pub use infer::{infer_query, InferError, InferredColumn, QueryShape, RustType};
 
 use std::collections::{BTreeMap, BTreeSet};

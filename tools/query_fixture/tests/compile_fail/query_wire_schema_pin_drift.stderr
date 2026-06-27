@@ -25,3 +25,15 @@ note: inside `bsql_postgres_proto::prepared::new_prepared_query::<(i32,), ()>`
    | |          the declared param OIDs",
    | |     );
    | |_____- in this macro invocation
+
+note: erroneous constant encountered
+  --> tests/compile_fail/query_wire_schema_pin_drift.rs:38:14
+   |
+38 |     let _ = &Q;
+   |              ^
+
+note: erroneous constant encountered
+  --> tests/compile_fail/query_wire_schema_pin_drift.rs:38:13
+   |
+38 |     let _ = &Q;
+   |             ^^

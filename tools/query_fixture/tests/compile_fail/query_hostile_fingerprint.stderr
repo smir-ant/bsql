@@ -29,3 +29,15 @@ note: inside `bsql_postgres_proto::prepared::new_prepared_query::<(i32,), ()>`
    | |          tuple's declared OIDs",
    | |     );
    | |_____- in this macro invocation
+
+note: erroneous constant encountered
+  --> tests/compile_fail/query_hostile_fingerprint.rs:32:14
+   |
+32 |     let _ = &Q;
+   |              ^
+
+note: erroneous constant encountered
+  --> tests/compile_fail/query_hostile_fingerprint.rs:32:13
+   |
+32 |     let _ = &Q;
+   |             ^^

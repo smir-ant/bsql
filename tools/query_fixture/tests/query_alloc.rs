@@ -21,6 +21,8 @@
 use std::hint::black_box;
 
 use bsql_devgates::CountingAllocator;
+use bsql_postgres_proto::params::ParamsWriter;
+use bsql_postgres_proto::WriteBuf;
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator::new();
@@ -29,6 +31,14 @@ static ALLOC: CountingAllocator = CountingAllocator::new();
 // NOT-NULL text row.
 bsql_query_macros::query!(OrderKey, "SELECT id, user_id FROM orders");
 bsql_query_macros::query!(UserNames, "SELECT id, email FROM users");
+
+// Dynamic forms: a toggled optional filter, a `= ANY($1)` array in-list,
+// and a runtime ORDER BY allow-set. Their wire artifacts are const, so
+// reading them — and encoding the array param into the heapless send
+// buffer — must allocate nothing.
+bsql_query_macros::query!(OptUser, "SELECT id FROM users WHERE OPTIONAL(id = $1)");
+bsql_query_macros::query!(AnyOrders, "SELECT id FROM orders WHERE id = ANY($1)");
+bsql_query_macros::query!(SortedOrders, "SELECT id FROM orders ORDER BY { id ASC | id DESC }");
 
 const ORDER_KEY_ROW: &[u8] = &[
     0x00, 0x02, // 2 columns
@@ -80,6 +90,32 @@ fn borrowed_decode_is_zero_alloc_owned_text_allocates() {
     black_box(wire_len);
     let wire_allocs = after.delta(before).allocs;
 
+    // (5) The DYNAMIC forms are const wire too: reading the toggled-filter,
+    // `= ANY($1)`, and ORDER BY-selected prepared queries off `.rodata`
+    // allocates nothing.
+    let before = ALLOC.snapshot();
+    let dyn_len = black_box(OptUserQuery::PREPARED).param_oids().len()
+        + black_box(AnyOrdersQuery::PREPARED).param_oids().len()
+        + black_box(SortedOrdersOrderBy::IdAsc.prepared())
+            .parse_template_for_test()
+            .len()
+        + black_box(SortedOrdersOrderBy::IdDesc.prepared())
+            .parse_template_for_test()
+            .len();
+    let after = ALLOC.snapshot();
+    black_box(dyn_len);
+    let dyn_wire_allocs = after.delta(before).allocs;
+
+    // (6) Encoding a `= ANY($1)` array parameter writes into the heapless
+    // send buffer — zero allocations.
+    let before = ALLOC.snapshot();
+    let mut buf = WriteBuf::new();
+    let encode_result = (&[1i64, 2i64, 3i64][..],).write_params(&mut buf);
+    let after = ALLOC.snapshot();
+    black_box(&encode_result);
+    black_box(buf.as_bytes().len());
+    let array_encode_allocs = after.delta(before).allocs;
+
     assert_eq!(
         fixed_allocs, 0,
         "borrowed all-fixed decode must not allocate (got {fixed_allocs})"
@@ -95,5 +131,17 @@ fn borrowed_decode_is_zero_alloc_owned_text_allocates() {
     assert_eq!(
         wire_allocs, 0,
         "reading the const .rodata wire artifact must not allocate (got {wire_allocs})"
+    );
+    assert_eq!(
+        dyn_wire_allocs, 0,
+        "reading the dynamic-form const wire artifacts must not allocate (got {dyn_wire_allocs})"
+    );
+    assert!(
+        encode_result.is_ok(),
+        "array param must fit the heapless send buffer"
+    );
+    assert_eq!(
+        array_encode_allocs, 0,
+        "encoding a `= ANY($1)` array param must not allocate (got {array_encode_allocs})"
     );
 }
