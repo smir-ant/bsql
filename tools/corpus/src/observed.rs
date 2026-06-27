@@ -33,46 +33,139 @@ pub struct ObservedRun {
     /// key order. A duplicate `ParameterStatus` for one key collapses to the
     /// engine's retained value — that collapse is the pinned observable.
     pub parameter_statuses: Vec<(String, String)>,
+    /// Count of `ParameterStatus` keys the engine could not classify into its
+    /// projected key set and silently dropped. A key outside the projected
+    /// set (e.g. `standard_conforming_strings`, `IntervalStyle`) is NOT
+    /// surfaced in `parameter_statuses`; the engine only counts it. Surfacing
+    /// the count makes "the engine saw N keys it does not model" observable —
+    /// a future engine that begins projecting one of those keys diverges here.
+    pub unknown_parameter_status_count: u32,
     /// Asynchronous `NotificationResponse` (`LISTEN`/`NOTIFY`) events
     /// surfaced during any step, in arrival order.
     pub notifications: Vec<ObservedNotify>,
+    /// The backend process ID from the `BackendKeyData` (`'K'`) frame, read
+    /// from the public cancel-request surface. `Some(pid)` once a session is
+    /// active; `None` when no session was produced (disconnected / failed
+    /// handshake). The secret cancel key is intentionally NOT observed — the
+    /// engine redacts it and a leaked cancel authenticator is a capability
+    /// leak, so only the non-secret PID is part of the observable contract.
+    pub backend_pid: Option<i32>,
+    /// The connection's final `ReadyForQuery` transaction-status indicator
+    /// (`'I'` idle / `'T'` in a transaction block / `'E'` failed transaction),
+    /// read after the last step. Collapsed to `Idle` when no session became
+    /// active. Distinct from `terminal`: a connection can be `Ready` (reusable)
+    /// yet sit in an open or failed transaction.
+    pub tx_status: ObservedTxStatus,
     /// The connection's end state after the last step.
     pub terminal: ObservedStatus,
 }
 
 /// A successfully completed command's observable result.
+///
+/// A single command's reply is a SEQUENCE of result sets, one per SQL
+/// statement the server delineated (a PG simple-query `Q` frame accepts a
+/// `;`-separated batch like `"UPDATE …; INSERT …; SELECT …"` and emits one
+/// `CommandComplete` per statement before a single final `ReadyForQuery`).
+/// `result_sets` captures that per-statement structure so a mis-delineation
+/// (flattening N statements into one, dropping or reordering an intermediate
+/// statement's tag) is caught — rather than keeping only the final tag and
+/// flattening every statement's rows into one undifferentiated list.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ObservedOk {
-    /// The server `CommandComplete` tag (e.g. `"SELECT 1"`, `"INSERT 0 1"`),
-    /// or the empty string for a command that reports none (e.g. `Ping`).
+    /// One entry per SQL statement the server delineated in this command's
+    /// reply, in statement order. A single-statement command produces exactly
+    /// one entry; a multi-statement batch produces one per statement (each
+    /// non-final statement's tag arrives as an intermediate command-complete,
+    /// the final statement's via the terminal). A command that completes with
+    /// no statement (e.g. `Ping`, a bare `Parse`/`Describe`/`Close`) produces
+    /// a single degenerate entry with an empty tag and no rows.
+    pub result_sets: Vec<ObservedResultSet>,
+    /// COPY-OUT data chunks (PG §55.2.6), in arrival order, each the raw body
+    /// of one `CopyData` (`'d'`) frame. Empty for any command that is not a
+    /// `COPY … TO STDOUT`. The chunk boundaries are the server's, preserved
+    /// verbatim — a re-chunking is an observable change.
+    pub copy_out: Vec<Vec<u8>>,
+}
+
+/// One SQL statement's observable result within a command's reply.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObservedResultSet {
+    /// The server `CommandComplete` tag for this statement (e.g. `"SELECT 1"`,
+    /// `"INSERT 0 1"`, `"UPDATE 3"`), or the empty string for a statement that
+    /// reports none (an empty query, or a command with no statement-level tag).
     pub command_tag: String,
-    /// Column names from the most recent `RowDescription`, or empty for a
-    /// command that describes no columns.
+    /// Column names from this statement's `RowDescription`, or empty for a
+    /// statement that describes no columns. For the extended-protocol
+    /// bind/execute path the names are not re-surfaced at execute time, so
+    /// this is empty there even for a row-bearing statement — a pinned quirk.
     pub column_names: Vec<String>,
-    /// Result rows as RAW per-column bytes. `None` is SQL `NULL`; `Some(bytes)`
-    /// is the column's wire bytes verbatim. Values are NOT decoded to typed
-    /// Rust values: decode policy diverges between engines, so the raw bytes
-    /// are the stable observable.
+    /// Per-column PostgreSQL type OIDs from this statement's `RowDescription`,
+    /// positionally aligned with `column_names`. Empty when no description was
+    /// observed. Decode is OID-driven, so the OIDs are a first-class
+    /// observable, not metadata to discard.
+    pub type_oids: Vec<u32>,
+    /// Result rows as RAW per-column bytes. `None` is SQL `NULL` (wire
+    /// `len = -1`); `Some(bytes)` is the column's wire bytes verbatim —
+    /// including `Some(Vec::new())` for an empty but non-NULL value (wire
+    /// `len = 0`), which is DISTINCT from `None`. Values are NOT decoded to
+    /// typed Rust values: decode policy diverges between engines, so the raw
+    /// bytes are the stable observable.
     pub rows: Vec<Vec<Option<Vec<u8>>>>,
-    /// The server's affected-row count, when the command reports one
-    /// (`INSERT`/`UPDATE`/`DELETE`/`SELECT`/…); `None` for a command with no
-    /// row-count semantics (DDL, transaction control) or none observed.
+    /// The server's affected-row count, when the statement reports one
+    /// (`INSERT`/`UPDATE`/`DELETE`/`SELECT`/`COPY`/…); `None` for a statement
+    /// with no row-count semantics (DDL, transaction control) or none observed.
     pub affected_rows: Option<u64>,
+    /// `true` when the server paused this statement at a row cap with
+    /// `PortalSuspended` (PG §55.2.7) instead of completing it — the result of
+    /// a row-limited `Execute` (`max_rows > 0`). A suspended statement carries
+    /// the rows fetched so far and no `CommandComplete` tag; the portal stays
+    /// open. `false` for every normally-completed statement.
+    pub portal_suspended: bool,
 }
 
 /// A failed command's observable result — a server error carries its
 /// SQLSTATE, a protocol/transport failure carries a stable classification.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the Server variant is the dominant error observable and carries the full PG §55.7 diagnostic field set by value; this is a dev-only comparison value constructed once per error fixture and compared by `==`, so the size spread is immaterial — boxing would only obscure the fixture literals with a `Box::new` wrapper"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObservedErr {
     /// The server sent an `ErrorResponse`. The SQLSTATE, severity (when the
-    /// server included it), and message are the cross-engine observable.
+    /// server included it), message, and the optional diagnostic fields are
+    /// the cross-engine observable.
+    ///
+    /// Fields the CURRENT engine does not parse (`position`, `schema`,
+    /// `table`, `column`, `constraint`) are surfaced as `None` even when the
+    /// wire frame carried them — that "the engine drops this field" is itself
+    /// a pinned observable, so a future engine that begins surfacing one
+    /// diverges here loudly.
     Server {
         /// 5-character SQLSTATE code.
         sqlstate: String,
         /// Server-reported severity, `None` when omitted.
         severity: Option<String>,
-        /// Human-readable message text.
+        /// Human-readable message text (`M` field).
         message: String,
+        /// Optional secondary detail (`D` field), `None` when absent/empty.
+        detail: Option<String>,
+        /// Optional hint (`H` field), `None` when absent/empty.
+        hint: Option<String>,
+        /// Optional cursor position (`P` field). The current engine does not
+        /// parse it — always `None` (pinned absence).
+        position: Option<String>,
+        /// Optional schema name (`s` field). Not parsed by the current engine
+        /// — always `None` (pinned absence).
+        schema: Option<String>,
+        /// Optional table name (`t` field). Not parsed by the current engine
+        /// — always `None` (pinned absence).
+        table: Option<String>,
+        /// Optional column name (`c` field). Not parsed by the current engine
+        /// — always `None` (pinned absence).
+        column: Option<String>,
+        /// Optional constraint name (`n` field). Not parsed by the current
+        /// engine — always `None` (pinned absence).
+        constraint: Option<String>,
     },
     /// A protocol-level or transport-level failure with no server SQLSTATE,
     /// classified to a stable, engine-independent tag.
@@ -102,6 +195,22 @@ pub enum ProtocolFailureKind {
     /// A push (request build) was rejected because the connection was not
     /// ready to accept a command.
     NotReady,
+}
+
+/// The `ReadyForQuery` transaction-status indicator (PG §55.7).
+///
+/// Names the observable transaction state, not an internal engine enum, so it
+/// survives a rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObservedTxStatus {
+    /// `'I'` — idle, no transaction block in progress.
+    #[default]
+    Idle,
+    /// `'T'` — inside an explicit or implicit transaction block.
+    InTransaction,
+    /// `'E'` — the current transaction failed; commands are rejected until
+    /// `ROLLBACK`.
+    Failed,
 }
 
 /// One server notice surfaced to the client.

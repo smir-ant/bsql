@@ -16,21 +16,58 @@
 
 use crate::frames;
 use crate::observed::{
-    ObservedErr, ObservedNotice, ObservedNotify, ObservedOk, ObservedRun, ObservedStatus,
-    ProtocolFailureKind, TerminalErrorKind,
+    ObservedErr, ObservedNotice, ObservedNotify, ObservedOk, ObservedResultSet, ObservedRun,
+    ObservedStatus, ObservedTxStatus, ProtocolFailureKind, TerminalErrorKind,
 };
 use crate::transcript::{ChunkSchedule, ClientRequest, ParamSpec, Setup, Step, Transcript};
 
-/// A `Ready`/`Ok`-terminal observed run with the given client bytes and ok body.
+/// The backend PID pinned by the canonical trust handshake (`backend_key_data(4321, …)`),
+/// surfaced for every `ActiveViaTrustHandshake` transcript.
+const TRUST_BACKEND_PID: i32 = 4321;
+
+/// A `Ready` observed run reached via the canonical trust handshake, with the
+/// given client bytes and `Ok` body. Defaults: no notices/notifications/params,
+/// the trust-handshake backend PID, idle transaction.
 fn ready_ok(client_bytes: Vec<u8>, ok: ObservedOk) -> ObservedRun {
     ObservedRun {
         client_bytes,
         outcome: Ok(ok),
         notices: Vec::new(),
         parameter_statuses: Vec::new(),
+        unknown_parameter_status_count: 0,
         notifications: Vec::new(),
+        backend_pid: Some(TRUST_BACKEND_PID),
+        tx_status: ObservedTxStatus::Idle,
         terminal: ObservedStatus::Ready,
     }
+}
+
+/// One result set (a single SQL statement's observable result), not suspended.
+fn rs(
+    command_tag: &str,
+    column_names: &[&str],
+    type_oids: &[u32],
+    rows: Vec<Vec<Option<Vec<u8>>>>,
+    affected_rows: Option<u64>,
+) -> ObservedResultSet {
+    ObservedResultSet {
+        command_tag: command_tag.to_string(),
+        column_names: column_names.iter().map(|s| (*s).to_string()).collect(),
+        type_oids: type_oids.to_vec(),
+        rows,
+        affected_rows,
+        portal_suspended: false,
+    }
+}
+
+/// An `ObservedOk` with a single result set and no COPY output.
+fn ok_one(result_set: ObservedResultSet) -> ObservedOk {
+    ObservedOk { result_sets: vec![result_set], copy_out: Vec::new() }
+}
+
+/// An `ObservedOk` with an explicit result-set sequence (multi-statement).
+fn ok_sets(result_sets: Vec<ObservedResultSet>) -> ObservedOk {
+    ObservedOk { result_sets, copy_out: Vec::new() }
 }
 
 /// The expected client wire for a `SimpleQuery` (`Q` + len + sql + NUL) — the
@@ -78,15 +115,13 @@ pub fn seed() -> Vec<Transcript> {
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ready_ok(
             simple_query_wire("SELECT n, v FROM t"),
-            ObservedOk {
-                command_tag: "SELECT 2".to_string(),
-                column_names: vec!["n".to_string(), "v".to_string()],
-                rows: vec![
-                    vec![cell(b"1"), cell(b"alpha")],
-                    vec![cell(b"2"), None],
-                ],
-                affected_rows: Some(2),
-            },
+            ok_one(rs(
+                "SELECT 2",
+                &["n", "v"],
+                &[23, 25],
+                vec![vec![cell(b"1"), cell(b"alpha")], vec![cell(b"2"), None]],
+                Some(2),
+            )),
         ),
     });
 
@@ -105,12 +140,7 @@ pub fn seed() -> Vec<Transcript> {
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ready_ok(
             simple_query_wire("SELECT n FROM t WHERE false"),
-            ObservedOk {
-                command_tag: "SELECT 0".to_string(),
-                column_names: vec!["n".to_string()],
-                rows: Vec::new(),
-                affected_rows: Some(0),
-            },
+            ok_one(rs("SELECT 0", &["n"], &[23], Vec::new(), Some(0))),
         ),
     });
 
@@ -128,12 +158,7 @@ pub fn seed() -> Vec<Transcript> {
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ready_ok(
             simple_query_wire("CREATE TABLE t (n int)"),
-            ObservedOk {
-                command_tag: "CREATE TABLE".to_string(),
-                column_names: Vec::new(),
-                rows: Vec::new(),
-                affected_rows: None,
-            },
+            ok_one(rs("CREATE TABLE", &[], &[], Vec::new(), None)),
         ),
     });
 
@@ -174,12 +199,13 @@ pub fn seed() -> Vec<Transcript> {
                 0, 95, 98, 115, 113, 108, 95, 48, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 4, 0, 0, 0, 7, 0, 0,
                 69, 0, 0, 0, 9, 0, 0, 0, 0, 0, 83, 0, 0, 0, 4,
             ],
-            ObservedOk {
-                command_tag: "SELECT 1".to_string(),
-                column_names: Vec::new(),
-                rows: vec![vec![cell(b"7"), cell(b"alice")]],
-                affected_rows: Some(1),
-            },
+            ok_one(rs(
+                "SELECT 1",
+                &[],
+                &[23, 25],
+                vec![vec![cell(b"7"), cell(b"alice")]],
+                Some(1),
+            )),
         ),
     });
 
@@ -209,12 +235,7 @@ pub fn seed() -> Vec<Transcript> {
                 76, 85, 69, 83, 32, 40, 36, 49, 41, 0, 0, 0, 83, 0, 0, 0, 4, 68, 0, 0, 0, 13, 83,
                 95, 98, 115, 113, 108, 95, 48, 0, 83, 0, 0, 0, 4,
             ],
-            ObservedOk {
-                command_tag: String::new(),
-                column_names: Vec::new(),
-                rows: Vec::new(),
-                affected_rows: None,
-            },
+            ok_one(rs("", &[], &[], Vec::new(), None)),
         ),
     });
 
@@ -254,12 +275,7 @@ pub fn seed() -> Vec<Transcript> {
                 113, 108, 95, 48, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 3, 98, 111, 98, 0, 0, 69, 0, 0, 0,
                 9, 0, 0, 0, 0, 0, 83, 0, 0, 0, 4,
             ],
-            ObservedOk {
-                command_tag: "INSERT 0 1".to_string(),
-                column_names: Vec::new(),
-                rows: Vec::new(),
-                affected_rows: Some(1),
-            },
+            ok_one(rs("INSERT 0 1", &[], &[], Vec::new(), Some(1))),
         ),
     });
 
@@ -292,12 +308,7 @@ pub fn seed() -> Vec<Transcript> {
                 0, 0, 0, 83, 0, 0, 0, 4, 68, 0, 0, 0, 13, 83, 95, 98, 115, 113, 108, 95, 48, 0, 83,
                 0, 0, 0, 4, 67, 0, 0, 0, 13, 83, 95, 98, 115, 113, 108, 95, 48, 0, 83, 0, 0, 0, 4,
             ],
-            ObservedOk {
-                command_tag: String::new(),
-                column_names: Vec::new(),
-                rows: Vec::new(),
-                affected_rows: None,
-            },
+            ok_one(rs("", &[], &[], Vec::new(), None)),
         ),
     });
 
@@ -328,12 +339,7 @@ pub fn seed() -> Vec<Transcript> {
                 0, 1, 0, 1, 0, 0, 0, 4, 0, 0, 0, 42, 0, 1, 0, 1, 69, 0, 0, 0, 9, 0, 0, 0, 0, 0, 83,
                 0, 0, 0, 4,
             ],
-            ObservedOk {
-                command_tag: "SELECT 1".to_string(),
-                column_names: Vec::new(),
-                rows: vec![vec![cell(b"42"), cell(b"neo")]],
-                affected_rows: Some(1),
-            },
+            ok_one(rs("SELECT 1", &[], &[23, 25], vec![vec![cell(b"42"), cell(b"neo")]], Some(1))),
         ),
     });
 
@@ -346,18 +352,14 @@ pub fn seed() -> Vec<Transcript> {
             frames::ready_for_query(frames::TX_IDLE),
         )],
         chunk_schedule: ChunkSchedule::AllAtOnce,
-        expect: ready_ok(
-            vec![83, 0, 0, 0, 4],
-            ObservedOk {
-                command_tag: String::new(),
-                column_names: Vec::new(),
-                rows: Vec::new(),
-                affected_rows: None,
-            },
-        ),
+        expect: ready_ok(vec![83, 0, 0, 0, 4], ok_one(rs("", &[], &[], Vec::new(), None))),
     });
 
-    // ── 10. multi_statement (row-bearing): SELECT 1; SELECT 2 ──
+    // ── 10. multi_statement row-FIRST (SELECT 1; SELECT 2): the current engine
+    //        FLATTENS a row-first batch into one result set via the row-stream
+    //        pull (the intermediate boundary is swallowed inside iter_rows). The
+    //        pin documents that flattening; fixture 18 shows the boundaries the
+    //        engine DOES delineate (when the row-bearing statement is last). ──
     out.push(Transcript {
         name: "multi_statement_select",
         setup: Setup::ActiveViaTrustHandshake,
@@ -376,12 +378,13 @@ pub fn seed() -> Vec<Transcript> {
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ready_ok(
             simple_query_wire("SELECT 1; SELECT 2"),
-            ObservedOk {
-                command_tag: "SELECT 1".to_string(),
-                column_names: vec!["b".to_string()],
-                rows: vec![vec![cell(b"1")], vec![cell(b"2")]],
-                affected_rows: Some(1),
-            },
+            ok_one(rs(
+                "SELECT 1",
+                &["b"],
+                &[23],
+                vec![vec![cell(b"1")], vec![cell(b"2")]],
+                Some(1),
+            )),
         ),
     });
 
@@ -400,19 +403,17 @@ pub fn seed() -> Vec<Transcript> {
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ObservedRun {
             client_bytes: simple_query_wire("DROP TABLE IF EXISTS ghost"),
-            outcome: Ok(ObservedOk {
-                command_tag: "DROP TABLE".to_string(),
-                column_names: Vec::new(),
-                rows: Vec::new(),
-                affected_rows: None,
-            }),
+            outcome: Ok(ok_one(rs("DROP TABLE", &[], &[], Vec::new(), None))),
             notices: vec![ObservedNotice {
                 severity: "NOTICE".to_string(),
                 sqlstate: "00000".to_string(),
                 message: "table \"ghost\" does not exist, skipping".to_string(),
             }],
             parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 0,
             notifications: Vec::new(),
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
         },
     });
@@ -434,19 +435,17 @@ pub fn seed() -> Vec<Transcript> {
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ObservedRun {
             client_bytes: simple_query_wire("SELECT 1"),
-            outcome: Ok(ObservedOk {
-                command_tag: "SELECT 1".to_string(),
-                column_names: vec!["a".to_string()],
-                rows: vec![vec![cell(b"1")]],
-                affected_rows: Some(1),
-            }),
+            outcome: Ok(ok_one(rs("SELECT 1", &["a"], &[23], vec![vec![cell(b"1")]], Some(1)))),
             notices: Vec::new(),
             parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 0,
             notifications: vec![ObservedNotify {
                 pid: 99,
                 channel: "chan".to_string(),
                 payload: b"hello".to_vec(),
             }],
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
         },
     });
@@ -469,10 +468,20 @@ pub fn seed() -> Vec<Transcript> {
                 sqlstate: "42601".to_string(),
                 severity: Some("ERROR".to_string()),
                 message: "syntax error at or near \"SELCT\"".to_string(),
+                detail: None,
+                hint: None,
+                position: None,
+                schema: None,
+                table: None,
+                column: None,
+                constraint: None,
             }),
             notices: Vec::new(),
             parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 0,
             notifications: Vec::new(),
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
         },
     });
@@ -488,7 +497,10 @@ pub fn seed() -> Vec<Transcript> {
             outcome: Ok(ObservedOk::default()),
             notices: Vec::new(),
             parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 0,
             notifications: Vec::new(),
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Closed,
         },
     });
@@ -517,7 +529,10 @@ pub fn seed() -> Vec<Transcript> {
                 ("server_version".to_string(), "17.2".to_string()),
                 ("application_name".to_string(), "corpus_app".to_string()),
             ],
+            unknown_parameter_status_count: 0,
             notifications: Vec::new(),
+            backend_pid: Some(1),
+            tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
         },
     });
@@ -538,12 +553,7 @@ pub fn seed() -> Vec<Transcript> {
         chunk_schedule: ChunkSchedule::OneBytePerRead,
         expect: ready_ok(
             simple_query_wire("SELECT v FROM t"),
-            ObservedOk {
-                command_tag: "SELECT 1".to_string(),
-                column_names: vec!["v".to_string()],
-                rows: vec![vec![cell(b"chunky")]],
-                affected_rows: Some(1),
-            },
+            ok_one(rs("SELECT 1", &["v"], &[25], vec![vec![cell(b"chunky")]], Some(1))),
         ),
     });
 
@@ -563,13 +573,384 @@ pub fn seed() -> Vec<Transcript> {
         chunk_schedule: ChunkSchedule::SplitHeaders,
         expect: ready_ok(
             simple_query_wire("SELECT v FROM t"),
+            ok_one(rs("SELECT 1", &["v"], &[25], vec![vec![cell(b"chunky")]], Some(1))),
+        ),
+    });
+
+    // ── 18. multi_statement DELINEATED (UPDATE; INSERT; SELECT): the row-bearing
+    //        statement is LAST, so the engine surfaces each prior statement's tag
+    //        as its own intermediate result set (UPDATE 3, INSERT 0 1) before the
+    //        final SELECT's rows + tag — the per-statement boundaries are pinned,
+    //        so flattening / dropping / reordering a statement is caught. ──
+    out.push(Transcript {
+        name: "multi_statement_delineated",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![Step::new(
+            ClientRequest::SimpleQuery(
+                "UPDATE t SET v=1; INSERT INTO t DEFAULT VALUES; SELECT id FROM t".to_string(),
+            ),
+            frames::concat(&[
+                frames::command_complete("UPDATE 3"),
+                frames::command_complete("INSERT 0 1"),
+                frames::row_description(&[("id", frames::OID_INT4)]),
+                frames::data_row(&[Some(b"10")]),
+                frames::data_row(&[Some(b"11")]),
+                frames::command_complete("SELECT 2"),
+                frames::ready_for_query(frames::TX_IDLE),
+            ]),
+        )],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ready_ok(
+            simple_query_wire("UPDATE t SET v=1; INSERT INTO t DEFAULT VALUES; SELECT id FROM t"),
+            ok_sets(vec![
+                rs("UPDATE 3", &[], &[], Vec::new(), Some(3)),
+                rs("INSERT 0 1", &[], &[], Vec::new(), Some(1)),
+                rs(
+                    "SELECT 2",
+                    &["id"],
+                    &[23],
+                    vec![vec![cell(b"10")], vec![cell(b"11")]],
+                    Some(2),
+                ),
+            ]),
+        ),
+    });
+
+    // ── 19. empty-string cell vs NULL cell (also: a 2nd NULL fixture). A row
+    //        with an empty-but-not-NULL `Some(b"")` cell, a NULL cell, and a
+    //        normal cell — `Some(Vec::new())` is DISTINCT from `None`. ──
+    out.push(Transcript {
+        name: "empty_string_vs_null",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![Step::new(
+            ClientRequest::SimpleQuery("SELECT e, n, v FROM t".to_string()),
+            frames::concat(&[
+                frames::row_description(&[
+                    ("e", frames::OID_TEXT),
+                    ("n", frames::OID_TEXT),
+                    ("v", frames::OID_TEXT),
+                ]),
+                frames::data_row(&[Some(b""), None, Some(b"x")]),
+                frames::command_complete("SELECT 1"),
+                frames::ready_for_query(frames::TX_IDLE),
+            ]),
+        )],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ready_ok(
+            simple_query_wire("SELECT e, n, v FROM t"),
+            ok_one(rs(
+                "SELECT 1",
+                &["e", "n", "v"],
+                &[25, 25, 25],
+                vec![vec![Some(Vec::new()), None, cell(b"x")]],
+                Some(1),
+            )),
+        ),
+    });
+
+    // ── 20. RFQ transaction status 'T' (in a transaction block) ──
+    out.push(Transcript {
+        name: "tx_status_in_transaction",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![Step::new(
+            ClientRequest::SimpleQuery("BEGIN".to_string()),
+            frames::concat(&[
+                frames::command_complete("BEGIN"),
+                frames::ready_for_query(frames::TX_IN_TX),
+            ]),
+        )],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ObservedRun {
+            client_bytes: simple_query_wire("BEGIN"),
+            outcome: Ok(ok_one(rs("BEGIN", &[], &[], Vec::new(), None))),
+            notices: Vec::new(),
+            parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 0,
+            notifications: Vec::new(),
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::InTransaction,
+            terminal: ObservedStatus::Ready,
+        },
+    });
+
+    // ── 21. RFQ transaction status 'E' (failed transaction). A wire-legal
+    //        CommandComplete + RFQ('E') exercises the engine's parking of the
+    //        failed-transaction status (the only path that parks tx_status is a
+    //        successful command's terminal RFQ; a mid-batch error drains without
+    //        parking, so the 'E' parse path is reached with this synthetic but
+    //        wire-legal sequence). ──
+    out.push(Transcript {
+        name: "tx_status_failed",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![Step::new(
+            ClientRequest::SimpleQuery("SAVEPOINT s".to_string()),
+            frames::concat(&[
+                frames::command_complete("SAVEPOINT"),
+                frames::ready_for_query(frames::TX_FAILED),
+            ]),
+        )],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ObservedRun {
+            client_bytes: simple_query_wire("SAVEPOINT s"),
+            outcome: Ok(ok_one(rs("SAVEPOINT", &[], &[], Vec::new(), None))),
+            notices: Vec::new(),
+            parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 0,
+            notifications: Vec::new(),
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Failed,
+            terminal: ObservedStatus::Ready,
+        },
+    });
+
+    // ── 22. server error with the full diagnostic field set on the wire. The
+    //        engine surfaces detail + hint (and sqlstate/severity/message); the
+    //        position/schema/table/column/constraint fields are dropped by the
+    //        current engine — pinned as `None` (their absence is the observable). ──
+    out.push(Transcript {
+        name: "server_error_full_fields",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![Step::new(
+            ClientRequest::SimpleQuery("INSERT INTO users (id) VALUES (1)".to_string()),
+            frames::concat(&[
+                frames::error_response_fields(&[
+                    (b'S', "ERROR"),
+                    (b'C', "23505"),
+                    (b'M', "duplicate key value violates unique constraint \"users_pkey\""),
+                    (b'D', "Key (id)=(1) already exists."),
+                    (b'H', "Use a different id."),
+                    (b'P', "13"),
+                    (b's', "public"),
+                    (b't', "users"),
+                    (b'c', "id"),
+                    (b'n', "users_pkey"),
+                ]),
+                frames::ready_for_query(frames::TX_IDLE),
+            ]),
+        )],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ObservedRun {
+            client_bytes: simple_query_wire("INSERT INTO users (id) VALUES (1)"),
+            outcome: Err(ObservedErr::Server {
+                sqlstate: "23505".to_string(),
+                severity: Some("ERROR".to_string()),
+                message: "duplicate key value violates unique constraint \"users_pkey\"".to_string(),
+                detail: Some("Key (id)=(1) already exists.".to_string()),
+                hint: Some("Use a different id.".to_string()),
+                position: None,
+                schema: None,
+                table: None,
+                column: None,
+                constraint: None,
+            }),
+            notices: Vec::new(),
+            parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 0,
+            notifications: Vec::new(),
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Idle,
+            terminal: ObservedStatus::Ready,
+        },
+    });
+
+    // ── 23. ParameterStatus keys beyond the engine's projected set: the engine
+    //        does not surface them in `parameter_statuses`, but counts them. ──
+    out.push(Transcript {
+        name: "unknown_parameter_status",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![Step::new(
+            ClientRequest::SimpleQuery("SET extra_float_digits = 3".to_string()),
+            frames::concat(&[
+                frames::parameter_status("standard_conforming_strings", "on"),
+                frames::parameter_status("IntervalStyle", "postgres"),
+                frames::command_complete("SET"),
+                frames::ready_for_query(frames::TX_IDLE),
+            ]),
+        )],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ObservedRun {
+            client_bytes: simple_query_wire("SET extra_float_digits = 3"),
+            outcome: Ok(ok_one(rs("SET", &[], &[], Vec::new(), None))),
+            notices: Vec::new(),
+            parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 2,
+            notifications: Vec::new(),
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Idle,
+            terminal: ObservedStatus::Ready,
+        },
+    });
+
+    // ── 24. COPY OUT sub-protocol: CopyOutResponse + CopyData* + CopyDone +
+    //        CommandComplete. The per-frame copy chunks are surfaced verbatim. ──
+    out.push(Transcript {
+        name: "copy_out",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![Step::new(
+            ClientRequest::SimpleQuery("COPY t TO STDOUT".to_string()),
+            frames::concat(&[
+                frames::copy_out_response(1),
+                frames::copy_data(b"row1\n"),
+                frames::copy_data(b"row2\n"),
+                frames::copy_done(),
+                frames::command_complete("COPY 2"),
+                frames::ready_for_query(frames::TX_IDLE),
+            ]),
+        )],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ready_ok(
+            simple_query_wire("COPY t TO STDOUT"),
             ObservedOk {
-                command_tag: "SELECT 1".to_string(),
-                column_names: vec!["v".to_string()],
-                rows: vec![vec![cell(b"chunky")]],
-                affected_rows: Some(1),
+                result_sets: vec![rs("COPY 2", &[], &[], Vec::new(), Some(2))],
+                copy_out: vec![b"row1\n".to_vec(), b"row2\n".to_vec()],
             },
         ),
+    });
+
+    // ── 25. EmptyQueryResponse: an empty SQL statement. The engine accepts it
+    //        and reports an empty command tag (no error). ──
+    out.push(Transcript {
+        name: "empty_query",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![Step::new(
+            ClientRequest::SimpleQuery(String::new()),
+            frames::concat(&[
+                frames::empty_query_response(),
+                frames::ready_for_query(frames::TX_IDLE),
+            ]),
+        )],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ready_ok(
+            simple_query_wire(""),
+            ok_one(rs("", &[], &[], Vec::new(), None)),
+        ),
+    });
+
+    // ── 26. row-limited Execute (max_rows) → PortalSuspended (PG §55.2.7). The
+    //        portal pauses at the cap with the rows fetched so far; the final
+    //        result set is flagged `portal_suspended`. ──
+    out.push(Transcript {
+        name: "portal_suspend_row_limited",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![
+            Step::new(
+                ClientRequest::Prepare("SELECT id FROM t".to_string()),
+                frames::concat(&[frames::parse_complete(), frames::ready_for_query(frames::TX_IDLE)]),
+            ),
+            Step::new(
+                ClientRequest::DescribeStatement,
+                frames::concat(&[
+                    frames::parameter_description(&[]),
+                    frames::row_description(&[("id", frames::OID_INT4)]),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            ),
+            Step::new(
+                ClientRequest::BindExecuteRowLimited { params: ParamSpec::None, max_rows: 2 },
+                frames::concat(&[
+                    frames::bind_complete(),
+                    frames::data_row(&[Some(b"10")]),
+                    frames::data_row(&[Some(b"11")]),
+                    frames::portal_suspended(),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            ),
+        ],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ready_ok(
+            // Baked from the real engine via the capture harness: Parse+Sync,
+            // Describe+Sync, Bind+Execute(max_rows=2)+Sync.
+            vec![
+                80, 0, 0, 0, 31, 95, 98, 115, 113, 108, 95, 48, 0, 83, 69, 76, 69, 67, 84, 32, 105,
+                100, 32, 70, 82, 79, 77, 32, 116, 0, 0, 0, 83, 0, 0, 0, 4, 68, 0, 0, 0, 13, 83, 95,
+                98, 115, 113, 108, 95, 48, 0, 83, 0, 0, 0, 4, 66, 0, 0, 0, 19, 0, 95, 98, 115, 113,
+                108, 95, 48, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 9, 0, 0, 0, 0, 2, 83, 0, 0, 0, 4,
+            ],
+            ObservedOk {
+                result_sets: vec![ObservedResultSet {
+                    command_tag: String::new(),
+                    column_names: Vec::new(),
+                    type_oids: vec![23],
+                    rows: vec![vec![cell(b"10")], vec![cell(b"11")]],
+                    affected_rows: None,
+                    portal_suspended: true,
+                }],
+                copy_out: Vec::new(),
+            },
+        ),
+    });
+
+    // ── 27. >=2 NoticeResponse in one reply (also: a 2nd notices fixture). Two
+    //        notices with DISTINCT fields, so dropping/reordering the 2nd is
+    //        caught. ──
+    out.push(Transcript {
+        name: "notices_two",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![Step::new(
+            ClientRequest::SimpleQuery("VACUUM t".to_string()),
+            frames::concat(&[
+                frames::notice_response("WARNING", "01000", "first warning"),
+                frames::notice_response("NOTICE", "00000", "second notice"),
+                frames::command_complete("VACUUM"),
+                frames::ready_for_query(frames::TX_IDLE),
+            ]),
+        )],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ObservedRun {
+            client_bytes: simple_query_wire("VACUUM t"),
+            outcome: Ok(ok_one(rs("VACUUM", &[], &[], Vec::new(), None))),
+            notices: vec![
+                ObservedNotice {
+                    severity: "WARNING".to_string(),
+                    sqlstate: "01000".to_string(),
+                    message: "first warning".to_string(),
+                },
+                ObservedNotice {
+                    severity: "NOTICE".to_string(),
+                    sqlstate: "00000".to_string(),
+                    message: "second notice".to_string(),
+                },
+            ],
+            parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 0,
+            notifications: Vec::new(),
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Idle,
+            terminal: ObservedStatus::Ready,
+        },
+    });
+
+    // ── 28. >=2 NotificationResponse in one reply (also: a 2nd notifications
+    //        fixture). Two notifications with DISTINCT pid/channel/payload. ──
+    out.push(Transcript {
+        name: "notifications_two",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![Step::new(
+            ClientRequest::SimpleQuery("SELECT 1".to_string()),
+            frames::concat(&[
+                frames::notification_response(11, "alpha", "first"),
+                frames::notification_response(22, "beta", "second"),
+                frames::row_description(&[("a", frames::OID_INT4)]),
+                frames::data_row(&[Some(b"1")]),
+                frames::command_complete("SELECT 1"),
+                frames::ready_for_query(frames::TX_IDLE),
+            ]),
+        )],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ObservedRun {
+            client_bytes: simple_query_wire("SELECT 1"),
+            outcome: Ok(ok_one(rs("SELECT 1", &["a"], &[23], vec![vec![cell(b"1")]], Some(1)))),
+            notices: Vec::new(),
+            parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 0,
+            notifications: vec![
+                ObservedNotify { pid: 11, channel: "alpha".to_string(), payload: b"first".to_vec() },
+                ObservedNotify { pid: 22, channel: "beta".to_string(), payload: b"second".to_vec() },
+            ],
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Idle,
+            terminal: ObservedStatus::Ready,
+        },
     });
 
     out
@@ -604,15 +985,13 @@ pub fn adversarial() -> Vec<Transcript> {
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ObservedRun {
             client_bytes: simple_query_wire("SET application_name = 'x'"),
-            outcome: Ok(ObservedOk {
-                command_tag: "SET".to_string(),
-                column_names: Vec::new(),
-                rows: Vec::new(),
-                affected_rows: None,
-            }),
+            outcome: Ok(ok_one(rs("SET", &[], &[], Vec::new(), None))),
             notices: Vec::new(),
             parameter_statuses: vec![("application_name".to_string(), "second".to_string())],
+            unknown_parameter_status_count: 0,
             notifications: Vec::new(),
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
         },
     });
@@ -640,7 +1019,10 @@ pub fn adversarial() -> Vec<Transcript> {
             outcome: Err(ObservedErr::Protocol(ProtocolFailureKind::Unclassified)),
             notices: Vec::new(),
             parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 0,
             notifications: Vec::new(),
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Errored(TerminalErrorKind::Protocol),
         },
     });
@@ -667,7 +1049,10 @@ pub fn adversarial() -> Vec<Transcript> {
             outcome: Err(ObservedErr::Protocol(ProtocolFailureKind::HandshakeFailed)),
             notices: Vec::new(),
             parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 0,
             notifications: Vec::new(),
+            backend_pid: None,
+            tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Errored(TerminalErrorKind::Handshake),
         },
     });

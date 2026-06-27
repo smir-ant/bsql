@@ -88,6 +88,18 @@ pub enum ClientRequest {
     /// Bind + Execute + Sync the most recently prepared statement with these
     /// parameters.
     BindExecute(ParamSpec),
+    /// Bind + Execute + Sync the most recently prepared statement with these
+    /// parameters and a ROW CAP (`Execute.max_rows = max_rows`, PG §55.2.7).
+    /// The server may answer with `PortalSuspended` once `max_rows` rows are
+    /// produced, leaving the portal open — the row-limited / portal-suspend
+    /// path. `max_rows` must be non-zero (zero is the unlimited `BindExecute`
+    /// case); a zero cap is reported as a not-ready push failure.
+    BindExecuteRowLimited {
+        /// The bind parameters.
+        params: ParamSpec,
+        /// The `Execute.max_rows` cap. Must be > 0.
+        max_rows: u32,
+    },
     /// Close the most recently prepared statement (`Close` + `Sync`).
     CloseStatement,
     /// Execute the corpus-local `prepared!` demo query (binary params) with a

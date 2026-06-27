@@ -50,8 +50,8 @@ pub mod transport;
 
 pub use adapter::Adapter;
 pub use observed::{
-    ObservedErr, ObservedNotice, ObservedNotify, ObservedOk, ObservedRun, ObservedStatus,
-    ProtocolFailureKind, TerminalErrorKind,
+    ObservedErr, ObservedNotice, ObservedNotify, ObservedOk, ObservedResultSet, ObservedRun,
+    ObservedStatus, ObservedTxStatus, ProtocolFailureKind, TerminalErrorKind,
 };
 pub use sans_io::SansIoAdapter;
 pub use transcript::{

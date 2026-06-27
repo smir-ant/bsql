@@ -19,9 +19,10 @@
 
 use bsql_postgres_proto::wire::{
     TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE,
-    TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE,
-    TAG_NO_DATA, TAG_NOTICE_RESPONSE, TAG_NOTIFICATION_RESPONSE, TAG_PARAMETER_DESCRIPTION,
-    TAG_PARAMETER_STATUS, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
+    TAG_COMMAND_COMPLETE, TAG_COPY_DATA, TAG_COPY_DONE, TAG_COPY_OUT_RESPONSE, TAG_DATA_ROW,
+    TAG_EMPTY_QUERY_RESPONSE, TAG_ERROR_RESPONSE, TAG_NO_DATA, TAG_NOTICE_RESPONSE,
+    TAG_NOTIFICATION_RESPONSE, TAG_PARAMETER_DESCRIPTION, TAG_PARAMETER_STATUS, TAG_PARSE_COMPLETE,
+    TAG_PORTAL_SUSPENDED, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
 
 /// PostgreSQL `int4` OID for the `text` type — the column type used by the
@@ -35,6 +36,13 @@ pub const OID_INT4: i32 = 23;
 pub const TX_IDLE: u8 = b'I';
 /// Transaction-status byte for `ReadyForQuery`: `T` = in a transaction block.
 pub const TX_IN_TX: u8 = b'T';
+/// Transaction-status byte for `ReadyForQuery`: `E` = failed transaction
+/// (commands are rejected until `ROLLBACK`).
+pub const TX_FAILED: u8 = b'E';
+
+/// `CopyData` body format byte: `0` = textual COPY (the common
+/// `COPY … TO STDOUT` default).
+pub const COPY_FORMAT_TEXT: u8 = 0;
 
 /// Wrap `body` in a PG frame: tag byte + 4-byte big-endian length (the length
 /// counts itself but not the tag) + body.
@@ -234,6 +242,64 @@ pub fn notification_response(pid: i32, channel: &str, payload: &str) -> Vec<u8> 
     body.extend_from_slice(payload.as_bytes());
     body.push(0);
     frame(TAG_NOTIFICATION_RESPONSE.byte(), &body)
+}
+
+/// `PortalSuspended`: tag `s`, empty body (PG §55.2.7 — a row-limited
+/// `Execute` paused at its `max_rows` cap before the portal exhausted).
+#[must_use]
+pub fn portal_suspended() -> Vec<u8> {
+    frame(TAG_PORTAL_SUSPENDED.byte(), &[])
+}
+
+/// `CopyOutResponse`: tag `H`, `format` byte + column count(i16) + per-column
+/// format(i16). The minimal textual COPY header has format `0` and `n_cols`
+/// columns each with format `0`.
+#[must_use]
+pub fn copy_out_response(n_cols: i16) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(COPY_FORMAT_TEXT);
+    body.extend_from_slice(&n_cols.to_be_bytes());
+    for _ in 0..n_cols.max(0) {
+        body.extend_from_slice(&0i16.to_be_bytes());
+    }
+    frame(TAG_COPY_OUT_RESPONSE.byte(), &body)
+}
+
+/// `CopyData`: tag `d`, the raw chunk body verbatim (one row of textual COPY
+/// output, or an arbitrary binary slice).
+#[must_use]
+pub fn copy_data(bytes: &[u8]) -> Vec<u8> {
+    frame(TAG_COPY_DATA.byte(), bytes)
+}
+
+/// `CopyDone`: tag `c`, empty body — the server signals no more `CopyData`
+/// follows.
+#[must_use]
+pub fn copy_done() -> Vec<u8> {
+    frame(TAG_COPY_DONE.byte(), &[])
+}
+
+/// Build an `ErrorResponse` / `NoticeResponse` body from an explicit list of
+/// `(field_byte, text)` pairs plus the terminating `\0`. Lets a fixture carry
+/// the full PG §55.7 diagnostic field set (`D` detail, `H` hint, `P` position,
+/// `s` schema, `t` table, `c` column, `n` constraint, …) in wire order.
+#[must_use]
+pub fn diagnostic_fields(fields: &[(u8, &str)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (tag, text) in fields {
+        body.push(*tag);
+        body.extend_from_slice(text.as_bytes());
+        body.push(0);
+    }
+    body.push(0); // field-list terminator
+    body
+}
+
+/// `ErrorResponse` with an explicit field list (for fixtures exercising the
+/// full diagnostic field set). Tag `E`.
+#[must_use]
+pub fn error_response_fields(fields: &[(u8, &str)]) -> Vec<u8> {
+    frame(TAG_ERROR_RESPONSE.byte(), &diagnostic_fields(fields))
 }
 
 /// Concatenate several frames into one server-reply byte stream.
