@@ -1,0 +1,11 @@
+error[E0499]: cannot borrow `buf` as mutable more than once at a time
+  --> tests/engine_ingest/fail_slot_held.rs:11:19
+   |
+ 9 |     let slot = buf.read_slot(64).expect("first slot");
+   |                --- first mutable borrow occurs here
+10 |     // Second mutating call while the first lent slot is still live:
+11 |     let _second = buf.read_slot(64).expect("second slot");
+   |                   ^^^ second mutable borrow occurs here
+...
+14 |     slot[0] = 1;
+   |     ------- first borrow later used here

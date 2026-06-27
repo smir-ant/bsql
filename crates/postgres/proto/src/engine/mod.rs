@@ -26,9 +26,11 @@
 //! later additive steps.
 
 mod error;
+mod ingest;
 mod seams;
 
 pub use error::EngineError;
+pub use ingest::{IngestBuf, IngestCommitOverflow, IngestFull};
 pub use seams::{
     absurd, engine_observe_no_seam, engine_observe_via_seam, Live, Never, NoObserver, Observer,
     Transport,
