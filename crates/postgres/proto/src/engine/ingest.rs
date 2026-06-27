@@ -363,6 +363,83 @@ impl IngestBuf {
         Event::Row(body)
     }
 
+    /// Locate and consume one complete frame, returning its 1-byte tag and
+    /// the active-buffer offset range of its body (the bytes after the
+    /// 5-byte header).
+    ///
+    /// This is the connecting-phase counterpart to
+    /// [`next_event`](Self::next_event): it surfaces the wire tag byte
+    /// (the connecting dispatch keys on it to classify each auth/startup
+    /// frame) and a `(body_start, body_end)` range rather than a borrow, so
+    /// the caller can dispatch (mutating other fields) and then re-borrow
+    /// the body via [`frame_body`](Self::frame_body) without holding a read
+    /// borrow across the mutation. The framing rules are identical to
+    /// `next_event` — a 1-byte tag plus a big-endian, length-inclusive
+    /// `u32` length field — with the same memory-safety/bounding properties
+    /// (a sub-minimum length yields an out-of-order, hence empty, body
+    /// range; an over-capacity length parks at perpetual `None`).
+    ///
+    /// The returned offsets are valid until the next compacting call
+    /// ([`read_slot`](Self::read_slot)); pair with [`frame_body`] before any
+    /// such call. Yields `None` when fewer than a whole frame is buffered.
+    ///
+    /// [`frame_body`]: Self::frame_body
+    pub fn take_frame(&mut self) -> Option<(u8, usize, usize)> {
+        let cursor = usize::from(self.cursor);
+        let filled = usize::from(self.filled);
+        let unread = filled.saturating_sub(cursor);
+        if unread < HEADER_LEN {
+            return None;
+        }
+        // The tag is the first byte of the frame at the read cursor.
+        let tag = match self.active().get(cursor) {
+            Some(&t) => t,
+            // Dead: `unread >= HEADER_LEN >= 1` guarantees the byte exists.
+            None => return None,
+        };
+        // Length field = the 4 bytes after the 1-byte tag, big-endian and
+        // length-inclusive (it counts itself plus the body).
+        let len_lo = cursor.saturating_add(1);
+        let len_hi = cursor.saturating_add(HEADER_LEN);
+        let arr: [u8; 4] = match self.active().get(len_lo..len_hi) {
+            Some(bytes) => match bytes.try_into() {
+                Ok(arr) => arr,
+                // Dead: the slice is exactly 4 bytes (`HEADER_LEN - 1`).
+                Err(_) => return None,
+            },
+            // Dead: `unread >= HEADER_LEN` guarantees the slice exists.
+            None => return None,
+        };
+        let body_len = usize_from_u32(u32::from_be_bytes(arr));
+        // Whole frame = 1 tag byte + the length-inclusive remainder.
+        let total = body_len.saturating_add(1);
+        if unread < total {
+            return None;
+        }
+        let body_start = cursor.saturating_add(HEADER_LEN);
+        let body_end = cursor.saturating_add(total);
+        // Advance the cursor past the whole frame. `total <= unread`, so
+        // `cursor + total <= filled <= u16::MAX`; the dead arms avoid `as`.
+        let new_cursor = usize::from(self.cursor).checked_add(total)?;
+        let new_cursor = u16::try_from(new_cursor).ok()?;
+        self.cursor = new_cursor;
+        Some((tag, body_start, body_end))
+    }
+
+    /// Borrow a frame body by the offset range returned from
+    /// [`take_frame`](Self::take_frame).
+    ///
+    /// The bytes are physically resident until the next compacting call
+    /// ([`read_slot`](Self::read_slot)) relocates them; the offsets are
+    /// stable across the intervening dispatch (`commit` only advances a
+    /// watermark, never compacts). An out-of-range pair returns the empty
+    /// slice — never an out-of-bounds read.
+    #[inline]
+    #[must_use]
+    pub fn frame_body(&self, start: usize, end: usize) -> &[u8] {
+        self.active().get(start..end).unwrap_or(&[])
+    }
+
     /// Active-tier capacity in bytes.
     #[inline]
     #[must_use]

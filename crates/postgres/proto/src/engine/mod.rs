@@ -25,10 +25,12 @@
 //! (and footprint-pinned); the producers that emit those events compose in
 //! later additive steps.
 
+mod dispatch_connecting;
 mod error;
 mod ingest;
 mod seams;
 
+pub use dispatch_connecting::{ActiveEngine, ConnFail, ConnectingEngine};
 pub use error::EngineError;
 pub use ingest::{IngestBuf, IngestCommitOverflow, IngestFull};
 pub use seams::{

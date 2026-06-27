@@ -1,0 +1,5 @@
+error[E0599]: no method named `backend_pid` found for reference `&ConnectingEngine` in the current scope
+ --> tests/engine_connecting/fail_active_verb_on_connecting.rs:8:12
+  |
+8 |     engine.backend_pid()
+  |            ^^^^^^^^^^^ method not found in `&ConnectingEngine`
