@@ -132,10 +132,55 @@ pub trait Transport: Send {
         buf: &'a mut [u8],
     ) -> impl Future<Output = Result<usize, Self::Error>> + Send + 'a;
 
-    /// Write the whole of `buf`, returning once every byte is flushed.
-    fn write_all<'a>(
+    /// One write attempt, mirroring a single `poll_write`.
+    ///
+    /// Returns the number of bytes the transport accepted, which **may be
+    /// partial** (`0 < n <= buf.len()`), or stays `Pending` (would-block)
+    /// having accepted **zero** bytes. The result is atomic by cancellation:
+    /// `Ready(Ok(n))` means exactly `n` bytes are committed to the socket and
+    /// `Pending` means none are, so a future dropped at this await never tears
+    /// the engine's send cursor.
+    ///
+    /// This is deliberately **not** a write-the-whole-buffer call: looping
+    /// until the buffer is drained is the engine's job (it owns the send
+    /// cursor, so the loop is cancellation-safe), not the transport's. An
+    /// implementation must not internally retry — one attempt, one result.
+    /// `Ok(0)` for a non-empty `buf` signals a stalled/broken transport and
+    /// the engine classifies it as an error.
+    fn write<'a>(
         &'a mut self,
         buf: &'a [u8],
+    ) -> impl Future<Output = Result<usize, Self::Error>> + Send + 'a;
+
+    /// Drive any transport-internal buffered bytes to the socket.
+    ///
+    /// [`write`](Self::write) moves bytes *into* the transport; a buffering
+    /// transport (a TLS layer that encrypts plaintext into an internal
+    /// record) may still hold bytes that have not reached the socket. The
+    /// engine calls `flush` once after its send buffer is drained so a partial
+    /// wire frame cannot be left dangling — without it, a buffering transport
+    /// would silently truncate the last frame and the peer would hang. A
+    /// plaintext socket transport has no internal buffer and returns `Ok(())`.
+    ///
+    /// Required, not defaulted: a no-op default would let a buffering
+    /// transport compile while silently failing to drain its buffer (the
+    /// truncation this method exists to prevent), so every implementation
+    /// states its flush semantics explicitly.
+    fn flush<'a>(
+        &'a mut self,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+
+    /// Begin an orderly teardown of the write side.
+    ///
+    /// For a TLS transport this sends `close_notify` (and flushes the
+    /// resulting record), so the peer can distinguish a clean close from a
+    /// truncation attack; for a plaintext socket it shuts down the write half
+    /// (or returns `Ok(())`). Completing the read/write/flush/shutdown quartet
+    /// here lets a TLS/socket implementation bind the whole seam once. Like
+    /// [`flush`](Self::flush) it is required rather than defaulted, so a TLS
+    /// implementation cannot silently omit `close_notify`.
+    fn shutdown<'a>(
+        &'a mut self,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 }
 

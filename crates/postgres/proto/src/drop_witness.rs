@@ -296,6 +296,13 @@ impl<const N: usize> CrateZeroizeSecret for crate::buf::ReadBufN<N> {}
 impl sealed::Sealed for crate::buf::ReadBuf {}
 impl CrateZeroizeSecret for crate::buf::ReadBuf {}
 
+// `bsql-pg-proto::engine::SendBuf` — engine-owned outbound send buffer.
+// Manual Drop impl scrubs the FULL `Vec` capacity (`self.buf.zeroize()`),
+// including the spare capacity where `reset`'s truncate leaves already-sent
+// secret residue.
+impl sealed::Sealed for crate::engine::SendBuf {}
+impl CrateZeroizeSecret for crate::engine::SendBuf {}
+
 // `bsql-pg-proto::engine::IngestBuf` — two-tier single-residence ingest
 // buffer. Manual Drop impl zeroizes BOTH the inline array and the heap-Box
 // array (if escaped) once on teardown.

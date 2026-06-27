@@ -16,9 +16,19 @@ impl Transport for T0 {
     ) -> impl Future<Output = Result<usize, Infallible>> + Send + 'a {
         ready(Ok(0))
     }
-    fn write_all<'a>(
+    fn write<'a>(
         &'a mut self,
         _buf: &'a [u8],
+    ) -> impl Future<Output = Result<usize, Infallible>> + Send + 'a {
+        ready(Ok(0))
+    }
+    fn flush<'a>(
+        &'a mut self,
+    ) -> impl Future<Output = Result<(), Infallible>> + Send + 'a {
+        ready(Ok(()))
+    }
+    fn shutdown<'a>(
+        &'a mut self,
     ) -> impl Future<Output = Result<(), Infallible>> + Send + 'a {
         ready(Ok(()))
     }

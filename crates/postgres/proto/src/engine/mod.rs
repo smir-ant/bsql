@@ -28,12 +28,14 @@
 mod dispatch_active;
 mod dispatch_connecting;
 mod error;
+mod flush;
 mod ingest;
 mod seams;
 
 pub use dispatch_active::ActiveEngine;
 pub use dispatch_connecting::{ConnFail, ConnectingEngine};
 pub use error::EngineError;
+pub use flush::{flush, SendBuf, SendOverrun};
 pub use ingest::{IngestBuf, IngestCommitOverflow, IngestFull};
 pub use seams::{
     absurd, engine_observe_no_seam, engine_observe_via_seam, Live, Never, NoObserver, Observer,
@@ -282,9 +284,23 @@ impl Transport for WitnessTransport {
     }
 
     #[inline(always)]
-    fn write_all<'a>(
+    fn write<'a>(
         &'a mut self,
         _buf: &'a [u8],
+    ) -> impl core::future::Future<Output = Result<usize, Self::Error>> + Send + 'a {
+        core::future::ready(Ok(0))
+    }
+
+    #[inline(always)]
+    fn flush<'a>(
+        &'a mut self,
+    ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send + 'a {
+        core::future::ready(Ok(()))
+    }
+
+    #[inline(always)]
+    fn shutdown<'a>(
+        &'a mut self,
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + Send + 'a {
         core::future::ready(Ok(()))
     }
@@ -306,6 +322,15 @@ const _: fn() = || {
     assert_send::<NoObserver>();
     assert_send::<EngineError<core::convert::Infallible>>();
     assert_send::<Engine<'static, WitnessTransport, NoObserver>>();
+    assert_send::<SendBuf>();
+    assert_send::<SendOverrun>();
+
+    // The outbound drain future must be `Send` — the async driver polls it
+    // across task boundaries. It composes the (Send) transport write future
+    // over a `&mut SendBuf`, so it is Send when the transport is.
+    let mut send_buf = SendBuf::new();
+    let mut flush_transport = WitnessTransport;
+    need_send(&flush(&mut send_buf, &mut flush_transport));
 
     let mut engine: Engine<'static, WitnessTransport, NoObserver> =
         Engine::new_in_scope(WitnessTransport, NoObserver);

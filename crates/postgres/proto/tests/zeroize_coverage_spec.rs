@@ -77,6 +77,7 @@ use alloc::string::{String, ToString};
 const SRC_FILES: &[(&str, &str)] = &[
     ("src/buf.rs", include_str!("../src/buf.rs")),
     ("src/drop_witness.rs", include_str!("../src/drop_witness.rs")),
+    ("src/engine/flush.rs", include_str!("../src/engine/flush.rs")),
     ("src/engine/ingest.rs", include_str!("../src/engine/ingest.rs")),
     ("src/error_arena.rs", include_str!("../src/error_arena.rs")),
     ("src/ident.rs", include_str!("../src/ident.rs")),

@@ -1,12 +1,12 @@
 error[E0521]: borrowed data escapes outside of closure
-  --> tests/engine_linearity/fail_brand_cross.rs:42:30
+  --> tests/engine_linearity/fail_brand_cross.rs:52:30
    |
-39 |     session(T0, |mut _e1, live1| {
+49 |     session(T0, |mut _e1, live1| {
    |                           ----- `live1` declared here, outside of the closure body
-40 |         session(T0, |mut e2, _live2| {
+50 |         session(T0, |mut e2, _live2| {
    |                      ------ `e2` is a reference that is only valid in the closure body
-41 |             // Drive session-2's engine with session-1's branded token:
-42 |             let _ = block_on(e2.begin(live1));
+51 |             // Drive session-2's engine with session-1's branded token:
+52 |             let _ = block_on(e2.begin(live1));
    |                              ^^^^^^^^^^^^^^^ `e2` escapes the closure body here
    |
    = note: requirement occurs because of the type `Live<'_>`, which makes the generic argument `'_` invariant
@@ -14,10 +14,10 @@ error[E0521]: borrowed data escapes outside of closure
    = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
 
 error: lifetime may not live long enough
-  --> tests/engine_linearity/fail_brand_cross.rs:42:30
+  --> tests/engine_linearity/fail_brand_cross.rs:52:30
    |
-39 |     session(T0, |mut _e1, live1| {
+49 |     session(T0, |mut _e1, live1| {
    |                  ------- has type `Engine<'1, T0>`
 ...
-42 |             let _ = block_on(e2.begin(live1));
+52 |             let _ = block_on(e2.begin(live1));
    |                              ^^^^^^^^^^^^^^^ argument requires that `'1` must outlive `'static`
