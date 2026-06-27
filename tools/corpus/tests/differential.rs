@@ -29,7 +29,7 @@
 mod engine_adapter;
 
 use bsql_corpus::{
-    Adapter, ObservedErr, ObservedOk, ObservedRun, ObservedStatus, ObservedTxStatus,
+    Adapter, ClientRequest, ObservedErr, ObservedOk, ObservedRun, ObservedStatus, ObservedTxStatus,
     ProtocolFailureKind, SansIoAdapter, Setup, TerminalErrorKind, Transcript, corpus, frames,
 };
 use bsql_postgres_proto::wire::TAG_AUTHENTICATION;
@@ -228,3 +228,147 @@ fn handshake_differential_a1_a2_agree() {
         assert_eq!(a2, t.expect, "A2 pin mismatch on `{}`", t.name);
     }
 }
+
+// ===========================================================================
+// ACTIVE DIFFERENTIAL — Adapter#1 (live drain/col_next) vs Adapter#2 (pull).
+// ===========================================================================
+
+/// The active subset the pull twin covers: `ActiveViaTrustHandshake`
+/// transcripts whose every step is a *pull-drivable* request — the simple-query
+/// flow plus the extended query protocol (`Prepare`/`DescribeStatement`/
+/// `DescribePortal`/`BindExecute`/`BindExecuteRowLimited`/`ResumeExecute`/
+/// `CloseStatement`/`ExecutePreparedDemo`). A bind/execute reply re-sends no
+/// `RowDescription`, so its column OIDs come from the preceding `Describe` (or
+/// the macro's compile-time schema), which the adapter threads from the request
+/// tag, not the client wire.
+///
+/// Exclusions, each for a STRUCTURAL reason (never "rare"/"atypical"):
+/// - `multi_statement_select`: the live engine FLATTENS a row-FIRST `;`-batch
+///   through its `iter_rows` pull into a single result set, whereas the
+///   cleanly-delineated pull surfaces one result set per statement — the two
+///   disagree on result-set structure by construction (the documented A1-only
+///   flattening quirk).
+/// - `Ping` / `Terminate` steps: filtered out by the request-kind set. A `Ping`
+///   reply is a bare `ReadyForQuery` with no `CommandComplete`, so the live
+///   engine synthesises a degenerate result set the response-driven pull (which
+///   emits a result set only per delivered command boundary) does not; a
+///   `Terminate` has no server reply at all (a socket close, not a response).
+fn active_pull_corpus() -> Vec<Transcript> {
+    let mut out: Vec<Transcript> = Vec::new();
+    for t in corpus::seed().into_iter().chain(corpus::adversarial()) {
+        if !matches!(t.setup, Setup::ActiveViaTrustHandshake) || t.steps.is_empty() {
+            continue;
+        }
+        let all_pull_drivable = t.steps.iter().all(|s| {
+            matches!(
+                s.request,
+                ClientRequest::SimpleQuery(_)
+                    | ClientRequest::Prepare(_)
+                    | ClientRequest::DescribeStatement
+                    | ClientRequest::DescribePortal
+                    | ClientRequest::BindExecute(_)
+                    | ClientRequest::BindExecuteRowLimited { .. }
+                    | ClientRequest::ResumeExecute
+                    | ClientRequest::CloseStatement
+                    | ClientRequest::ExecutePreparedDemo(_)
+            )
+        });
+        if all_pull_drivable && t.name != "multi_statement_select" {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// The response projection compared across A1 and A2(pull): everything an active
+/// pull observes EXCEPT `client_bytes` — the response-driven pull engine emits
+/// no request frames, so the outbound wire is not part of its observable.
+fn response_view(run: &ObservedRun) -> ObservedRun {
+    let mut view = run.clone();
+    view.client_bytes = Vec::new();
+    view
+}
+
+/// Guard: the active subset is non-empty and carries the ROW/NOTICE/NOTIFY/PARAM
+/// /COPY representatives the pull twin is meant to exercise.
+#[test]
+fn active_pull_corpus_is_representative() {
+    let corpus = active_pull_corpus();
+    assert!(
+        corpus.len() >= 12,
+        "expected the active pull subset to be non-trivial, found {}",
+        corpus.len(),
+    );
+    for required in [
+        "simple_query_select_rows",     // ROW
+        "notice_during_query",          // NOTICE
+        "notification_during_query",    // NOTIFY
+        "unknown_parameter_status",     // PARAM
+        "copy_out",                     // COPY
+        "multi_statement_delineated",   // multi-statement delineation
+        "server_error_recovers",        // recoverable error
+        // Extended query protocol — the completeness fix's new coverage.
+        "prepare_describe_bind_select", // Parse + Describe(rows) + Bind/Execute SELECT
+        "parse_describe_nodata",        // Parse + Describe(NoData)
+        "prepare_bind_dml",             // Parse + Describe(NoData) + Bind/Execute DML
+        "prepare_close",                // Parse + Describe + Close
+        "prepared_macro",               // combined Parse+Bind+Execute macro path
+        "portal_suspend_row_limited",   // row-limited Execute → PortalSuspended
+        "portal_resume_after_suspend",  // Describe(PORTAL) + bare-Execute resume
+        "oversize_command_complete",    // Sub-B oversize CommandComplete (tag from prefix)
+    ] {
+        assert!(
+            corpus.iter().any(|t| t.name == required),
+            "active pull subset missing representative fixture `{required}`",
+        );
+    }
+    // The flattening quirk fixture is deliberately excluded.
+    assert!(
+        !corpus.iter().any(|t| t.name == "multi_statement_select"),
+        "multi_statement_select (A1 flattening quirk) must stay out of the pull subset",
+    );
+    // Ping (bare RFQ, no command boundary) and Terminate (no server reply) are
+    // not pull-drivable and must stay excluded.
+    assert!(
+        !corpus.iter().any(|t| t.name == "ping"),
+        "ping (bare ReadyForQuery, no command boundary) must stay out of the pull subset",
+    );
+    assert!(
+        !corpus.iter().any(|t| t.name == "terminate"),
+        "terminate (no server reply) must stay out of the pull subset",
+    );
+}
+
+#[test]
+fn active_differential_a1_a2_pull_agree() {
+    let sync = SansIoAdapter::sync();
+    let async_twin = SansIoAdapter::async_twin();
+    let engine = EngineAdapter::new();
+
+    for t in active_pull_corpus() {
+        let a1_sync = sync.run(&t);
+        let a1_async = async_twin.run(&t);
+        let a2_pull = engine.pull(&t);
+
+        // A1 twin equivalence + pin (the full observable, including client bytes).
+        assert_eq!(a1_sync, a1_async, "A1 sync/async divergence on `{}`", t.name);
+        assert_eq!(a1_sync, t.expect, "A1 pin mismatch on `{}`", t.name);
+
+        // The pull twin agrees with the live engine on the RESPONSE projection
+        // (rows + tags + OIDs, notices, notifications, parameter statuses,
+        // copy-out, transaction status, terminal, outcome) for every fixture.
+        assert_eq!(
+            response_view(&a2_pull),
+            response_view(&a1_sync),
+            "A2(pull) vs A1 response divergence on `{}`",
+            t.name,
+        );
+        assert_eq!(
+            response_view(&a2_pull),
+            response_view(&t.expect),
+            "A2(pull) vs pin response divergence on `{}`",
+            t.name,
+        );
+    }
+}
+

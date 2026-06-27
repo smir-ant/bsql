@@ -40,7 +40,7 @@
 
 use alloc::boxed::Box;
 
-use super::{AuthEvent, IngestBuf, IngestCommitOverflow, IngestFull};
+use super::{ActiveEngine, AuthEvent, IngestBuf, IngestCommitOverflow, IngestFull};
 use crate::action::TxStatus;
 use crate::ident::{ApplicationName, DatabaseName, Ident, PodBytes};
 use crate::md5::Md5HandshakeState;
@@ -407,60 +407,15 @@ impl ConnectingEngine {
             }
             ConnPhase::Transient => return Err(self),
         };
-        Ok(ActiveEngine {
-            backend_pid: parts.pid,
-            secret_key: parts.secret_key,
-            tx_status: parts.tx_status,
-        })
-    }
-}
-
-// ===========================================================================
-// The active engine handle (post-handshake)
-// ===========================================================================
-
-/// The active-phase engine handle produced by
-/// [`ConnectingEngine::into_active`].
-///
-/// Carries the non-secret backend pid, the redacted cancel-key authenticator,
-/// and the terminal transaction status. The active-phase verbs
-/// ([`backend_pid`](Self::backend_pid), [`tx_status`](Self::tx_status),
-/// [`with_secret_key`](Self::with_secret_key)) are absent on
-/// [`ConnectingEngine`] — calling one on a connecting handle is a
-/// method-not-found compile error (E0599), the typestate proof that a query
-/// cannot be issued before the handshake completes.
-#[derive(Debug)]
-pub struct ActiveEngine {
-    backend_pid: i32,
-    secret_key: Sensitive<i32>,
-    tx_status: TxStatus,
-}
-
-impl ActiveEngine {
-    /// The backend process id from `BackendKeyData` — the non-secret half of
-    /// the cancel key, safe to surface.
-    #[inline]
-    #[must_use]
-    pub fn backend_pid(&self) -> i32 {
-        self.backend_pid
-    }
-
-    /// The terminal `ReadyForQuery` transaction-status indicator.
-    #[inline]
-    #[must_use]
-    pub fn tx_status(&self) -> TxStatus {
-        self.tx_status
-    }
-
-    /// Closure-scope access to the backend cancel-key authenticator.
-    ///
-    /// The secret never escapes the call (HRTB-bounded, mirroring the crate's
-    /// [`Sensitive::with_inner`] pattern); the cancel-request builder consumes
-    /// it here. The observable handshake capture deliberately never calls this
-    /// — a leaked cancel authenticator is a capability leak.
-    #[inline]
-    pub fn with_secret_key<R>(&self, f: impl FnOnce(i32) -> R) -> R {
-        self.secret_key.with_inner(|key| f(*key))
+        // Carry the single-residence ingest buffer forward: any active-phase
+        // frames the server pipelined after the handshake terminal are already
+        // resident, so the active engine resumes framing without a re-read.
+        Ok(ActiveEngine::from_handshake(
+            parts.pid,
+            parts.secret_key,
+            parts.tx_status,
+            self.ingest,
+        ))
     }
 }
 

@@ -25,12 +25,14 @@
 //! (and footprint-pinned); the producers that emit those events compose in
 //! later additive steps.
 
+mod dispatch_active;
 mod dispatch_connecting;
 mod error;
 mod ingest;
 mod seams;
 
-pub use dispatch_connecting::{ActiveEngine, ConnFail, ConnectingEngine};
+pub use dispatch_active::ActiveEngine;
+pub use dispatch_connecting::{ConnFail, ConnectingEngine};
 pub use error::EngineError;
 pub use ingest::{IngestBuf, IngestCommitOverflow, IngestFull};
 pub use seams::{
@@ -98,6 +100,14 @@ pub enum Event<'e> {
     Notify(&'e [u8]),
     /// A `ParameterStatus` report, lending its raw key/value payload.
     ParamStatus(&'e [u8]),
+    /// A row-limited `Execute` paused at its cap: the server sent
+    /// `PortalSuspended` instead of `CommandComplete`. The rows delivered
+    /// before this are the prefix fetched so far; the portal stays open on
+    /// the server (resumable with a bare `Execute`) and there is no command
+    /// tag. A typed terminal distinct from [`Deliver`](Self::Deliver) — the
+    /// pull analog of the live engine's `Reply::QuerySuspended` discriminator,
+    /// not a side-channel flag.
+    Suspended,
     /// One `DataRow`, lending the whole row payload as a single borrow.
     Row(&'e [u8]),
     /// One chunk of a row that exceeded the inline buffer, lending the

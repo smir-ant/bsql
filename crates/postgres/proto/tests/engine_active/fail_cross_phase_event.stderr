@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/engine_active/fail_cross_phase_event.rs:12:21
+   |
+12 |     want_auth_event(engine.next_event());
+   |     --------------- ^^^^^^^^^^^^^^^^^^^ expected `AuthEvent<'_>`, found `Event<'_>`
+   |     |
+   |     arguments to this function are incorrect
+   |
+note: function defined here
+  --> tests/engine_active/fail_cross_phase_event.rs:7:4
+   |
+ 7 | fn want_auth_event(_: AuthEvent<'_>) {}
+   |    ^^^^^^^^^^^^^^^ ----------------

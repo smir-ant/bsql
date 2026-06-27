@@ -279,6 +279,17 @@ fn push_request(session: &mut Session, run: &mut RunState, request: &ClientReque
                 None => PushOutcome::Failed(ObservedErr::Protocol(ProtocolFailureKind::NotReady)),
             }
         }
+        ClientRequest::DescribePortal => match push_describe_portal(session) {
+            Ok(bytes) => PushOutcome::Drive(bytes),
+            Err(e) => PushOutcome::Failed(driver_error_to_observed(e)),
+        },
+        ClientRequest::ResumeExecute => match run.last_prepared.as_ref() {
+            Some(stmt) => match push_execute_portal_resume(session, stmt) {
+                Ok(bytes) => PushOutcome::Drive(bytes),
+                Err(e) => PushOutcome::Failed(driver_error_to_observed(e)),
+            },
+            None => PushOutcome::Failed(ObservedErr::Protocol(ProtocolFailureKind::NotReady)),
+        },
         ClientRequest::CloseStatement => match run.last_prepared.take() {
             Some(stmt) => match session.push_close_statement(stmt) {
                 Ok(_) => PushOutcome::Drive(session.pending_bytes().to_vec()),
@@ -359,6 +370,67 @@ fn bind_row_limited_emit<P: ParamsWriter>(
                 stmt.row_desc.clone(),
                 FetchRows::Chunked(cap),
                 reply,
+                &mut session.wb,
+            )
+            .map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        for action in actions.as_slice() {
+            if let Action::SendBytes(bytes) = action {
+                out.extend_from_slice(bytes);
+            }
+        }
+    }
+    session.wb.clear();
+    Ok(out)
+}
+
+/// Push a bare `Execute` + `Sync` resuming the open unnamed portal to
+/// completion (`FetchRows::All`) via the public proto guard — the bare-Execute
+/// resume path (no `Bind`, so no `BindComplete`). The portal's schema is
+/// re-supplied from the prepared statement (the protocol clears its row_desc
+/// slot between command cycles). Returns the staged client bytes.
+fn push_execute_portal_resume(
+    session: &mut Session,
+    stmt: &PreparedStatement,
+) -> Result<Vec<u8>, DriverError> {
+    let reply = session.proto.next_reply_id::<bsql_postgres_proto::reply_id::QueryKind>();
+    let portal = PortalName::default();
+    let mut out = Vec::new();
+    {
+        let guard = session.proto.as_ready().ok_or(DriverError::NotReady)?;
+        let actions = guard
+            .push_command(
+                bsql_postgres_proto::push_command::ExecutePortal {
+                    portal_name: &portal,
+                    row_desc: stmt.row_desc.clone(),
+                    fetch: FetchRows::All,
+                    reply,
+                },
+                &mut session.wb,
+            )
+            .map_err(|pf| DriverError::Protocol(*pf.cause))?;
+        for action in actions.as_slice() {
+            if let Action::SendBytes(bytes) = action {
+                out.extend_from_slice(bytes);
+            }
+        }
+    }
+    session.wb.clear();
+    Ok(out)
+}
+
+/// Push a portal `Describe` + `Sync` for the open unnamed portal via the public
+/// proto guard. A portal describe answers with `RowDescription`/`NoData` and no
+/// `ParameterDescription`. Returns the staged client bytes.
+fn push_describe_portal(session: &mut Session) -> Result<Vec<u8>, DriverError> {
+    let reply =
+        session.proto.next_reply_id::<bsql_postgres_proto::reply_id::DescribePortalKind>();
+    let portal = PortalName::default();
+    let mut out = Vec::new();
+    {
+        let guard = session.proto.as_ready().ok_or(DriverError::NotReady)?;
+        let actions = guard
+            .push_command(
+                bsql_postgres_proto::push_command::DescribePortal { portal_name: portal, reply },
                 &mut session.wb,
             )
             .map_err(|pf| DriverError::Protocol(*pf.cause))?;

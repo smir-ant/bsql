@@ -84,6 +84,29 @@ fn cell(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(bytes.to_vec())
 }
 
+/// A `CommandComplete` whose tag body exceeds the engine read-buffer cap,
+/// forcing the oversize stream-and-truncate (Sub-B) path. The tag is a long
+/// non-verb string ending in the wire `\0`; it fits within the 8 KiB oversize
+/// prefix, so the tag parses (truncated to `CommandTag::Other`'s 32-byte cap)
+/// and the command boundary transitions. Body length (4201) is above
+/// READ_BUF_CAP (4096) and below the 8 KiB prefix.
+fn oversize_command_complete() -> Vec<u8> {
+    let mut body = vec![b'X'; 4200];
+    body.push(0);
+    frames::frame(b'C', &body)
+}
+
+/// The command tag both engines yield for [`oversize_command_complete`]: the
+/// long `X` tag, parsed from the oversize prefix and truncated to
+/// `CommandTag::Other`'s 32-byte `BoundedStr` with the `…` overflow marker —
+/// 29 bytes of `X` + the 3-byte UTF-8 `…` = 32 bytes. Both engines share the
+/// tag parser and the bounded string, so they agree on this byte-for-byte.
+fn oversize_cc_tag() -> String {
+    let mut tag = "X".repeat(29);
+    tag.push('…');
+    tag
+}
+
 /// The representative seed corpus. Expected values are the pinned current-
 /// engine observations (see module docs).
 #[must_use]
@@ -951,6 +974,105 @@ pub fn seed() -> Vec<Transcript> {
             tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
         },
+    });
+
+    // ── 29. portal Describe + bare-Execute RESUME after a suspend. A row-limited
+    //        Execute suspends (portal open); the open portal is then Described
+    //        (RowDescription, NO ParameterDescription) and resumed with a bare
+    //        Execute (no Bind → no BindComplete) that fetches the rest to
+    //        completion. Exercises the portal-Describe and resume seams. ──
+    out.push(Transcript {
+        name: "portal_resume_after_suspend",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![
+            Step::new(
+                ClientRequest::Prepare("SELECT id FROM t".to_string()),
+                frames::concat(&[frames::parse_complete(), frames::ready_for_query(frames::TX_IDLE)]),
+            ),
+            Step::new(
+                ClientRequest::DescribeStatement,
+                frames::concat(&[
+                    frames::parameter_description(&[]),
+                    frames::row_description(&[("id", frames::OID_INT4)]),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            ),
+            Step::new(
+                ClientRequest::BindExecuteRowLimited { params: ParamSpec::None, max_rows: 2 },
+                frames::concat(&[
+                    frames::bind_complete(),
+                    frames::data_row(&[Some(b"10")]),
+                    frames::data_row(&[Some(b"11")]),
+                    frames::portal_suspended(),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            ),
+            Step::new(
+                ClientRequest::DescribePortal,
+                frames::concat(&[
+                    frames::row_description(&[("id", frames::OID_INT4)]),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            ),
+            Step::new(
+                ClientRequest::ResumeExecute,
+                frames::concat(&[
+                    frames::data_row(&[Some(b"12")]),
+                    frames::data_row(&[Some(b"13")]),
+                    frames::command_complete("SELECT 2"),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            ),
+        ],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ready_ok(
+            // Baked from the real engine via the capture harness: Parse+Sync,
+            // Describe+Sync, Bind+Execute(max_rows=2)+Sync, Describe(P)+Sync,
+            // Execute(All)+Sync.
+            vec![
+                80, 0, 0, 0, 31, 95, 98, 115, 113, 108, 95, 48, 0, 83, 69, 76, 69, 67, 84, 32, 105,
+                100, 32, 70, 82, 79, 77, 32, 116, 0, 0, 0, 83, 0, 0, 0, 4, 68, 0, 0, 0, 13, 83, 95,
+                98, 115, 113, 108, 95, 48, 0, 83, 0, 0, 0, 4, 66, 0, 0, 0, 19, 0, 95, 98, 115, 113,
+                108, 95, 48, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 9, 0, 0, 0, 0, 2, 83, 0, 0, 0, 4, 68,
+                0, 0, 0, 6, 80, 0, 83, 0, 0, 0, 4, 69, 0, 0, 0, 9, 0, 0, 0, 0, 0, 83, 0, 0, 0, 4,
+            ],
+            ok_one(rs(
+                "SELECT 2",
+                &[],
+                &[23],
+                vec![vec![cell(b"12")], vec![cell(b"13")]],
+                Some(2),
+            )),
+        ),
+    });
+
+    // ── 30. oversize CommandComplete (forces the Sub-B stream-and-truncate
+    //        path). The tag is parsed from the frame's OWN 8 KiB prefix and the
+    //        command boundary transitions — not a stale tag, not a teardown.
+    //        Pinned to OneBytePerRead: the bounded ingest buffer drains between
+    //        reads, so the >buffer frame streams. Under AllAtOnce/SplitHeaders
+    //        the adapter feeds the whole >buffer chunk before it can drain and
+    //        both engines report TransportExhausted — a buffer-feed-model
+    //        artifact, not a protocol property, so this fixture is excluded from
+    //        the seed schedule-invariance check (see tests/seed.rs). ──
+    out.push(Transcript {
+        name: "oversize_command_complete",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![Step::new(
+            ClientRequest::SimpleQuery("VACUUM big".to_string()),
+            frames::concat(&[
+                oversize_command_complete(),
+                frames::ready_for_query(frames::TX_IDLE),
+            ]),
+        )],
+        chunk_schedule: ChunkSchedule::OneBytePerRead,
+        // Baked from the real engine via the capture harness (twins agree): the
+        // oversize tag parses + truncates to the 32-byte `…`-marked tag, the
+        // command boundary transitions, and the trailing RFQ recovers to Ready.
+        expect: ready_ok(
+            simple_query_wire("VACUUM big"),
+            ok_one(rs(&oversize_cc_tag(), &[], &[], Vec::new(), None)),
+        ),
     });
 
     out

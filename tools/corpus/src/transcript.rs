@@ -100,6 +100,15 @@ pub enum ClientRequest {
         /// The `Execute.max_rows` cap. Must be > 0.
         max_rows: u32,
     },
+    /// Describe the currently open (unnamed) PORTAL (`Describe` + `Sync`).
+    /// A portal describe answers with `RowDescription`/`NoData` and — unlike a
+    /// statement describe — NO `ParameterDescription`. Requires a portal opened
+    /// by a prior `Bind` (e.g. a suspended row-limited `Execute`).
+    DescribePortal,
+    /// Resume the currently open (unnamed) PORTAL with a bare `Execute` + `Sync`
+    /// (no `Bind`, so no `BindComplete`), fetching the remaining rows to
+    /// completion. Used after a `PortalSuspended` to fetch the next batch.
+    ResumeExecute,
     /// Close the most recently prepared statement (`Close` + `Sync`).
     CloseStatement,
     /// Execute the corpus-local `prepared!` demo query (binary params) with a

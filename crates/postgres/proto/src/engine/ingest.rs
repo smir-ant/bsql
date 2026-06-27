@@ -68,7 +68,7 @@
 //! outstanding borrow: by the time a mutating call runs, no borrow from a
 //! prior one is alive.
 
-use crate::frame::{HEADER_LEN, READ_BUF_CAP};
+use crate::frame::{parse_header, HeaderParse, HEADER_LEN, READ_BUF_CAP};
 use crate::narrow::usize_from_u32;
 use alloc::boxed::Box;
 use core::fmt;
@@ -438,6 +438,52 @@ impl IngestBuf {
     #[must_use]
     pub fn frame_body(&self, start: usize, end: usize) -> &[u8] {
         self.active().get(start..end).unwrap_or(&[])
+    }
+
+    /// Inspect the leading header of the unread region without consuming.
+    ///
+    /// The framing counterpart to [`take_frame`](Self::take_frame) for the
+    /// oversize path: a [`HeaderParse::FrameTooLarge`] verdict (a frame whose
+    /// wire footprint exceeds [`READ_BUF_CAP`], so the whole frame can never
+    /// reside in this bounded buffer) tells the caller to switch from
+    /// whole-frame buffering to bounded-chunk streaming before any byte of the
+    /// body is demanded. Pure inspection — no cursor movement.
+    #[inline]
+    #[must_use]
+    pub fn peek_header(&self) -> HeaderParse {
+        parse_header(self.unread())
+    }
+
+    /// The first unread byte — the frame tag — or `None` when the buffer is
+    /// drained. Used by the oversize path to classify a [`HeaderParse::
+    /// FrameTooLarge`] frame (whose verdict carries only the declared length)
+    /// by its tag before streaming.
+    #[inline]
+    #[must_use]
+    pub fn peek_tag(&self) -> Option<u8> {
+        self.unread().first().copied()
+    }
+
+    /// Consume up to `max` unread bytes from the cursor, returning the
+    /// active-buffer offset range of the bytes consumed for an in-place
+    /// re-borrow via [`frame_body`](Self::frame_body).
+    ///
+    /// The bounded-chunk primitive the oversize streaming paths are built on:
+    /// a frame larger than the buffer is drained `min(unread, max)` bytes at a
+    /// time, each chunk re-borrowed in place (the bytes stay resident until the
+    /// next compacting [`read_slot`](Self::read_slot)). Returns `None` when no
+    /// bytes are unread. No allocation, no copy — only the cursor advances.
+    #[inline]
+    pub fn take_chunk(&mut self, max: usize) -> Option<(usize, usize)> {
+        let cursor = usize::from(self.cursor);
+        let take = self.unread_len().min(max);
+        if take == 0 {
+            return None;
+        }
+        let end = cursor.saturating_add(take);
+        // `end <= filled <= cap <= u16::MAX`; the dead arm avoids an `as` cast.
+        self.cursor = u16::try_from(end).unwrap_or(self.cursor);
+        Some((cursor, end))
     }
 
     /// Active-tier capacity in bytes.
