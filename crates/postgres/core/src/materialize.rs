@@ -26,6 +26,28 @@ use bsql_postgres_proto::engine::Surface;
 use crate::error::{DbError, DriverError};
 use crate::types::{ArenaBuilder, Notification, Row};
 
+/// A collector that parks a server `ErrorResponse` for a driver's settle step
+/// to classify.
+///
+/// Both result-collecting shapes implement it: the Arc-arena
+/// [`ResultCollector`] (the dynamic simple-query path) and the typed-row
+/// [`RowsBuilder`](crate::RowsBuilder) (the compile-checked `query!` path). A
+/// driver's `settle` is generic over this seam, so one token-management path —
+/// restore the linear token on an alive `Ok`, map a `ServerErrored` status to
+/// the parked [`DbError`], leave the connection dead on a fatal `Err` — serves
+/// both result shapes with no duplicated, drift-prone copy.
+pub trait DbErrorSink {
+    /// Take the parsed server error parked from a [`Surface::Fail`], if one was
+    /// observed during the pump. Consumes it (a second call returns `None`).
+    fn take_db_error(&mut self) -> Option<DbError>;
+}
+
+impl DbErrorSink for ResultCollector {
+    fn take_db_error(&mut self) -> Option<DbError> {
+        self.db_error.take()
+    }
+}
+
 /// The fully materialised result of a row-collecting verb.
 #[derive(Debug)]
 pub struct CollectedResult {
@@ -44,8 +66,9 @@ pub struct CollectedResult {
 /// Construct with [`new`](Self::new), feed every surface event with
 /// [`feed`](Self::feed), then read the metadata accessors and call
 /// [`finish`](Self::finish) (which consumes the collector) for the rows. A
-/// server error parked from [`Surface::Fail`] is read with
-/// [`take_db_error`](Self::take_db_error).
+/// server error parked from [`Surface::Fail`] is read through the
+/// [`DbErrorSink`] seam (the same seam the driver's settle step uses for both
+/// this collector and the typed-row builder).
 #[derive(Default)]
 pub struct ResultCollector {
     builder: Option<ArenaBuilder>,
@@ -129,11 +152,6 @@ impl ResultCollector {
     #[must_use]
     pub fn column_names(&self) -> &[String] {
         &self.column_names
-    }
-
-    /// Take the parsed server error, if a [`Surface::Fail`] was observed.
-    pub fn take_db_error(&mut self) -> Option<DbError> {
-        self.db_error.take()
     }
 
     /// Seal the arena and produce the [`CollectedResult`].
@@ -241,7 +259,7 @@ fn read_be_i32(buf: &[u8], cursor: &mut usize) -> Option<i32> {
 /// decoded with replacement of any non-UTF-8 bytes (display text, mirroring the
 /// engine's lossy bounded-string handling), so a malformed field never aborts
 /// the whole error.
-fn parse_error_response(body: &[u8]) -> DbError {
+pub(crate) fn parse_error_response(body: &[u8]) -> DbError {
     let mut code = String::new();
     let mut severity: Option<String> = None;
     let mut message = String::new();

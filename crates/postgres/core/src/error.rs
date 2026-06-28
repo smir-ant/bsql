@@ -1,5 +1,7 @@
 use std::fmt;
 
+use bsql_postgres_proto::DecodeError;
+
 /// Structured PostgreSQL error with SQLSTATE code.
 #[derive(Debug, Clone)]
 pub struct DbError {
@@ -97,6 +99,23 @@ pub enum DriverError {
     /// count. A well-formed server never sends this; it is rejected loudly
     /// rather than decoded into silently mis-addressed cells.
     RowDecodeFailed,
+    /// A typed `query!` row failed to decode into its compile-time record shape
+    /// (a NULL in a NOT-NULL column, a wrong binary width, a truncated body).
+    /// Carries the classified [`DecodeError`]. Decode runs AFTER the verb
+    /// settled the connection to a clean idle, so this never harms the
+    /// connection — it is a value returned to the caller, never a silent
+    /// default.
+    Decode(DecodeError),
+    /// A typed `query!` result carried a row that exceeded the engine's inline
+    /// buffer and was streamed in chunks. The bounded typed decoder needs one
+    /// contiguous payload per row, so an oversize row is a classified error
+    /// rather than a silently truncated or reassembled record.
+    OversizeRow,
+    /// A typed `query_one` matched MORE than one row. The exactly-one contract
+    /// rejects a multi-row result loudly rather than silently returning the
+    /// first row (which would mask a query that is not as selective as the
+    /// caller assumed).
+    TooManyRows,
 }
 
 // Footprint pin: a sum type whose size is set by its widest variant,
@@ -123,6 +142,9 @@ impl fmt::Display for DriverError {
             Self::Timeout => write!(f, "read timed out while awaiting a server reply mid-command"),
             Self::SpuriousPending => write!(f, "single-poll executor: engine future returned Pending over a blocking transport"),
             Self::RowDecodeFailed => write!(f, "server DataRow did not match its declared column framing"),
+            Self::Decode(e) => write!(f, "typed row decode failed: {e}"),
+            Self::OversizeRow => write!(f, "typed query result carried an oversize row that exceeds the bounded decoder's contiguous-payload requirement"),
+            Self::TooManyRows => write!(f, "query_one matched more than one row"),
         }
     }
 }
@@ -132,6 +154,7 @@ impl std::error::Error for DriverError {
         match self {
             Self::Db(e) => Some(e),
             Self::Io(e) => Some(e),
+            Self::Decode(e) => Some(e),
             Self::NotReady
             | Self::SslRefused
             | Self::NoRows
@@ -144,8 +167,16 @@ impl std::error::Error for DriverError {
             | Self::NotificationUnavailable
             | Self::Timeout
             | Self::SpuriousPending
-            | Self::RowDecodeFailed => None,
+            | Self::RowDecodeFailed
+            | Self::OversizeRow
+            | Self::TooManyRows => None,
         }
+    }
+}
+
+impl From<DecodeError> for DriverError {
+    fn from(e: DecodeError) -> Self {
+        Self::Decode(e)
     }
 }
 

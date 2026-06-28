@@ -31,7 +31,7 @@ mod pool;
 mod transport;
 
 pub use bsql_postgres_core::{
-    ConnectConfig, DbError, DriverError, FromText, Notification, QueryResult, Row, SslMode,
+    ConnectConfig, DbError, DriverError, FromText, Notification, QueryResult, Row, Rows, SslMode,
 };
 
 pub use connection::{Connection, PreparedStatement};

@@ -196,6 +196,10 @@ pub mod sensitive;
 // `bsql-pg-proto-derive`.
 pub mod pristine;
 pub mod state;
+// The bridge trait from a compile-checked `query!` carrier to its prepared
+// query + typed-record decoders. Consumed by the drivers' typed `query`
+// method; implemented by the `query!` macro in the consumer crate.
+pub mod typed_query;
 pub mod wire;
 pub mod write_buf;
 
@@ -233,6 +237,7 @@ pub use plan_mode::{
     PlanCacheMode, PLAN_CACHE_MODE, RESET_PLAN_CACHE_MODE_SQL, SET_PLAN_CACHE_MODE_SQL,
 };
 pub use prepared::{PreparedQuery, QueryFingerprint, RowDecode};
+pub use typed_query::TypedQuery;
 // The connecting-phase engine state enum.
 pub use state::ConnectingState;
 // Top-level re-export of the user-facing `Terminate` wire literal.

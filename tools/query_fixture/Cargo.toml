@@ -42,6 +42,30 @@ trybuild = { workspace = true }
 # all-fixed row allocates nothing. Dev-only; never in any runtime closure.
 bsql-devgates = { path = "../devgates" }
 
+# The drivers — DEV-ONLY, for the live `query!` round-trip tests (`#[ignore]`,
+# need local PG) that exercise the full pipeline macro -> TypedQuery ->
+# query_params -> prebuffer -> typed decode, and for the `Rows<Q>` escape-wall
+# trybuild golden (which names `bsql_postgres_sync::Rows`). Both are already
+# resolved workspace members, so these dev edges add NO package to the lockfile
+# (`deps_pin` unchanged) and are excluded from every shipped crate's runtime
+# graph (`runtime_graph_pin` unchanged — dev edges are not `-e normal`).
+bsql-postgres-sync = { path = "../../crates/postgres/sync" }
+bsql-postgres-async = { path = "../../crates/postgres/async" }
+
+# `bsql-postgres-core` — DEV-ONLY, for the OFFLINE no-swallow test that drives a
+# `RowsBuilder` with hand-built (malformed + well-formed) row bytes and asserts
+# `Rows::iter()` yields a per-row `Err(DecodeError)` without a panic. Already
+# resolved transitively via the drivers, so this dev edge adds no package to the
+# lockfile (`deps_pin` unchanged) and is excluded from every shipped crate's
+# runtime graph (`runtime_graph_pin` unchanged).
+bsql-postgres-core = { path = "../../crates/postgres/core" }
+
+# `tokio` — DEV-ONLY, for the `#[tokio::test]` async live round-trip. The
+# `macros`/`rt`/`rt-multi-thread` features are exactly the set the async
+# driver's own `#[tokio::test]` suite enables, so feature unification adds no
+# package to the lockfile.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
 # Inherit the workspace FORBID floor / lint wall like every other
 # non-devgates member.
 [lints]

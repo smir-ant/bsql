@@ -145,8 +145,12 @@ version = "0.0.0"
 dependencies = [
  "bsql-build",
  "bsql-devgates",
+ "bsql-postgres-async",
+ "bsql-postgres-core",
  "bsql-postgres-proto",
+ "bsql-postgres-sync",
  "bsql-query-macros",
+ "tokio",
  "trybuild",
 ]
 

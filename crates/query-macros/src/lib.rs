@@ -241,12 +241,14 @@ impl Catalog {
 //
 // `query!(Name, "<SQL>")` types one SQL query against the schema replayed
 // from the consumer's migrations and emits two typed records plus their
-// decoders. Expansion calls `bsql_build::infer_query` (the build-time SQL
-// inference engine) to obtain the output row shape and the `$N` parameter
-// types. The EMITTED code references ONLY the shipped runtime decode
-// primitives in `bsql-postgres-proto` (`DataRowRef`, `ColumnsIter`,
-// `Cell<BinaryFmt>`, `DecodeError`) — never this crate or `bsql-build`,
-// so a consumer's runtime closure carries no build-time query toolchain.
+// decoders, the const wire artifact, and the `TypedQuery` execution bridge.
+// Expansion calls `bsql_build::infer_query` (the build-time SQL inference
+// engine) to obtain the output row shape and the `$N` parameter types. The
+// EMITTED code references ONLY the shipped runtime primitives in
+// `bsql-postgres-proto` (`DataRowRef`, `ColumnsIter`, `Cell<BinaryFmt>`,
+// `DecodeError`, `QueryFingerprint`, `PreparedQuery`, `TypedQuery`) — never
+// this crate or `bsql-build`, so a consumer's runtime closure carries no
+// build-time query toolchain.
 
 /// Compile-checked, schema-typed query record generator.
 ///
@@ -1198,6 +1200,18 @@ fn emit_carrier(
     let allow_reason =
         "the generated prepared-query artifact is part of the query's public surface; a consumer may use any subset of it";
 
+    // The borrowed record's GAT projection. A query that projects a `text`
+    // column makes the borrowed record carry `<'q>` (it borrows the input
+    // bytes); a query with no text column makes the record lifetime-free, so
+    // the `TypedQuery::Record<'q>` GAT leaves `'q` unused (verified to compile).
+    let owned_name = format_ident!("{}Owned", name);
+    let has_text = columns.iter().any(|c| matches!(c.ty, bsql_build::RustType::Text));
+    let record_ty = if has_text {
+        quote!(#name<'q>)
+    } else {
+        quote!(#name)
+    };
+
     Ok(quote! {
         #[doc = #carrier_doc]
         #[allow(dead_code, reason = #allow_reason)]
@@ -1219,6 +1233,32 @@ fn emit_carrier(
             #[allow(dead_code, reason = #allow_reason)]
             pub const PREPARED: ::bsql_postgres_proto::PreparedQuery<#params_tuple, #row_tuple> =
                 ::bsql_postgres_proto::prepared::run::<#carrier>();
+        }
+
+        // The execution bridge: ties this carrier to its prepared query and
+        // the typed-record decoders, so a driver's `query::<#carrier>()` runs
+        // the query and yields the macro's typed records. `PREPARED` is minted
+        // through the proto-owned `run` boundary (re-running the const
+        // validator, free + .rodata-deduped) rather than reaching the inherent
+        // const above — referencing `#carrier::PREPARED` here would be
+        // ambiguous between the inherent and this trait const.
+        impl ::bsql_postgres_proto::TypedQuery for #carrier {
+            type Params = #params_tuple;
+            type Row = #row_tuple;
+            type Record<'q> = #record_ty;
+            type Owned = #owned_name;
+            const PREPARED: ::bsql_postgres_proto::PreparedQuery<#params_tuple, #row_tuple> =
+                ::bsql_postgres_proto::prepared::run::<#carrier>();
+            fn decode_borrowed(body: &[u8])
+                -> ::core::result::Result<Self::Record<'_>, ::bsql_postgres_proto::DecodeError>
+            {
+                #name::decode(body)
+            }
+            fn decode_owned(body: &[u8])
+                -> ::core::result::Result<Self::Owned, ::bsql_postgres_proto::DecodeError>
+            {
+                #owned_name::decode(body)
+            }
         }
 
         // Footprint guard on the artifact: the carrier is a zero-size,

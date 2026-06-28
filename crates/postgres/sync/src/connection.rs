@@ -31,7 +31,8 @@ use std::time::Duration;
 use bsql_postgres_core::materialize::{self, ResultCollector};
 use bsql_postgres_core::tls::{self, TlsError, TlsTransport, Wire};
 use bsql_postgres_core::{
-    ConnectConfig, DriverError, Notification, QueryResult, Row, SslMode,
+    ConnectConfig, DbErrorSink, DriverError, Notification, QueryResult, Row, Rows, RowsBuilder,
+    SslMode,
 };
 use bsql_postgres_proto::engine::{
     self, CommandStatus, ConnFail, Engine, EngineError, Live, NoObserver, NotifyStatus, Outcome,
@@ -40,6 +41,7 @@ use bsql_postgres_proto::engine::{
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
     Credentials, DatabaseName, Ident, Password, PreparedQuery, RowDecode, Sensitive, StmtName,
+    TypedQuery,
 };
 
 use crate::transport::SyncSocket;
@@ -205,7 +207,7 @@ impl Connection {
     fn settle(
         &mut self,
         polled: Polled<Outcome<'static, CommandStatus>>,
-        collector: &mut ResultCollector,
+        collector: &mut impl DbErrorSink,
     ) -> Result<(), DriverError> {
         match polled {
             Ok(Ok(Outcome { live, status })) => {
@@ -409,6 +411,85 @@ impl Connection {
         }));
         self.settle(polled, &mut collector)?;
         Ok(collector.affected())
+    }
+
+    /// Run a compile-checked `query!` and collect its TYPED rows.
+    ///
+    /// `Q` is a `query!`-generated carrier (e.g. `FooQuery`); the returned
+    /// [`Rows<Q>`] decodes lazily into the macro's typed records — borrowed
+    /// (zero-copy text) via [`Rows::iter`], or owned via [`Rows::into_owned`].
+    ///
+    /// Named `query_typed` (not `query`) because the dynamic
+    /// [`query`](Self::query)`(sql: &str)` already occupies that name; this is
+    /// the compile-checked, schema-typed counterpart.
+    ///
+    /// The Parse + Bind + Execute + Sync runs over the macro's const wire
+    /// artifact ([`Q::PREPARED`](TypedQuery::PREPARED)). The sink that collects
+    /// rows into the prebuffer is INFALLIBLE (it copies bytes, never failing in
+    /// a way the engine sink could report), and the connection is settled to a
+    /// clean idle and repooled BEFORE any row is decoded — so a per-row decode
+    /// failure is a [`Rows::iter`] item / [`Rows::into_owned`] error, never a
+    /// connection fault. An oversize (chunk-streamed) row is a classified
+    /// [`DriverError::OversizeRow`] (the bounded decoder needs one contiguous
+    /// payload), never a silent truncation.
+    ///
+    /// # Limitation: one execution per carrier per connection
+    ///
+    /// Each call re-Parses this query's content-addressed prepared statement on
+    /// the wire, so running the SAME `query!` carrier more than once on a single
+    /// connection — including a reused pooled connection — currently fails with a
+    /// duplicate-prepared-statement server error (SQLSTATE `42P05`). The failure
+    /// is LOUD — a [`DriverError::Db`] — and the connection stays healthy and
+    /// pooled (it is recoverable, not fatal). Per-connection statement caching,
+    /// which will also enable cross-call server-side plan reuse, will remove this
+    /// limitation.
+    pub fn query_typed<Q: TypedQuery>(&mut self, params: Q::Params) -> Result<Rows<Q>, DriverError> {
+        let live = self.take_live()?;
+        let mut builder = RowsBuilder::new();
+        let polled = engine::poll_once(self.engine.query_params(live, &Q::PREPARED, params, |s| {
+            builder.feed(s);
+            ControlFlow::Continue(())
+        }));
+        self.settle(polled, &mut builder)?;
+        // The connection is now idle + pooled. An oversize row cannot be decoded
+        // contiguously by the bounded path; classify it loudly.
+        if builder.saw_oversize() {
+            return Err(DriverError::OversizeRow);
+        }
+        Ok(builder.finish::<Q>())
+    }
+
+    /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
+    /// owned record.
+    ///
+    /// Returns the `'static` owned twin so the row outlives the result buffer.
+    /// Zero rows is [`DriverError::NoRows`]; more than one is
+    /// [`DriverError::TooManyRows`] (loud, never a silently-taken first row).
+    /// Named `query_one_typed` for the same reason as
+    /// [`query_typed`](Self::query_typed).
+    ///
+    /// # Limitation: one execution per carrier per connection
+    ///
+    /// Like [`query_typed`](Self::query_typed), this re-Parses the query's
+    /// content-addressed prepared statement on each call, so running the SAME
+    /// `query!` carrier more than once on a single connection currently fails
+    /// with a duplicate-prepared-statement server error (SQLSTATE `42P05`, a loud
+    /// [`DriverError::Db`]; the connection stays healthy and pooled).
+    /// Per-connection statement caching will remove this limitation.
+    pub fn query_one_typed<Q: TypedQuery>(
+        &mut self,
+        params: Q::Params,
+    ) -> Result<Q::Owned, DriverError> {
+        let rows = self.query_typed::<Q>(params)?;
+        match rows.len() {
+            0 => Err(DriverError::NoRows),
+            1 => rows
+                .into_owned()?
+                .into_iter()
+                .next()
+                .ok_or(DriverError::NoRows),
+            _ => Err(DriverError::TooManyRows),
+        }
     }
 
     /// Prepare, query, and close a runtime SQL statement with params.

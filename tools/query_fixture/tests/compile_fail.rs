@@ -76,6 +76,12 @@ fn unknown_reference_is_compile_error() {
     t.compile_fail("tests/compile_fail/query_order_by_unknown_column.rs");
     t.compile_fail("tests/compile_fail/query_order_by_outside_allow_set.rs");
 
+    // `query!` typed-execution surface (the bounded `Rows<Q>` path).
+    //   * A borrowed record from `Rows::iter()` borrows the `Rows` buffer, so it
+    //     cannot outlive it: dropping the `Rows` while a borrowed record is held
+    //     is `error[E0505]` — the compiler-enforced escape wall.
+    t.compile_fail("tests/compile_fail/query_rows_escape.rs");
+
     // Every valid dynamic form type-checks at macro expansion.
     t.pass("tests/compile_pass/query_dynamics_ok.rs");
 }
