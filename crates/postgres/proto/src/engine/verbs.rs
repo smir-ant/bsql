@@ -54,6 +54,18 @@
 //! verb (a row-capped `Execute` that returns [`Boundary::Suspended`] and a
 //! resume verb) is surfaced here yet. It is a deferred verb, not a gap in the
 //! framing: the dispatch handles the wire; only the verb wrapper is absent.
+//!
+//! # Deferred: graceful close (`terminate`)
+//!
+//! No terminate/close verb is surfaced here yet. The PostgreSQL graceful close
+//! is a `Terminate` frame (`'X'`, a 5-byte tag-only frame `[b'X', 0, 0, 0, 4]`)
+//! sent to the server, then a transport-level shutdown; the engine currently
+//! offers only [`Transport::shutdown`](super::Transport::shutdown) (the
+//! transport-level close, no `Terminate` on the wire). To replicate a graceful
+//! close, a terminate verb must push the `Terminate` frame, flush it, call
+//! `Transport::shutdown`, and consume the [`Live`](super::Live) token (ideally
+//! into a `Closed` phase so the connection cannot be re-driven). It is a deferred
+//! verb, not a framing gap.
 
 use alloc::vec::Vec;
 use core::ops::ControlFlow;

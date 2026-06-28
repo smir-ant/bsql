@@ -24,14 +24,20 @@
     clippy::panic,
     reason = "test harness — a fixture mismatch is a loud assertion failure, the sanctioned test-failure signal"
 )]
+#![allow(
+    clippy::print_stdout,
+    reason = "the coverage guard prints the fixture -> adapter table as its report"
+)]
 
 #[path = "../src/engine_transport.rs"]
 mod engine_transport;
 #[path = "../src/engine_adapter.rs"]
 mod engine_adapter;
+#[path = "../src/falsify.rs"]
+mod falsify;
 
 use bsql_corpus::{
-    Adapter, ClientRequest, ObservedErr, ObservedOk, ObservedRun, ObservedStatus, ObservedTxStatus,
+    Adapter, ObservedErr, ObservedOk, ObservedRun, ObservedStatus, ObservedTxStatus,
     ProtocolFailureKind, SansIoAdapter, Setup, TerminalErrorKind, Transcript, corpus, frames,
 };
 use bsql_postgres_proto::wire::TAG_AUTHENTICATION;
@@ -244,51 +250,18 @@ fn handshake_differential_a1_a2_agree() {
 /// the macro's compile-time schema), which the adapter threads from the request
 /// tag, not the client wire.
 ///
-/// Exclusions, each for a STRUCTURAL reason (never "rare"/"atypical"):
-/// - `multi_statement_select`: the live engine FLATTENS a row-FIRST `;`-batch
-///   through its `iter_rows` pull into a single result set, whereas the
-///   cleanly-delineated pull surfaces one result set per statement — the two
-///   disagree on result-set structure by construction (the documented A1-only
-///   flattening quirk).
-/// - `Ping` / `Terminate` steps: filtered out by the request-kind set. A `Ping`
-///   reply is a bare `ReadyForQuery` with no `CommandComplete`, so the live
-///   engine synthesises a degenerate result set the response-driven pull (which
-///   emits a result set only per delivered command boundary) does not; a
-///   `Terminate` has no server reply at all (a socket close, not a response).
+/// The pull subset — the single source of truth lives in [`falsify`], shared
+/// with the Adapter#2 falsifier so the two tests measure the identical partition.
+/// Its exclusions (the `multi_statement_select` flattening quirk, the
+/// non-pull-drivable `Ping`/`Terminate` steps) are documented there.
 fn active_pull_corpus() -> Vec<Transcript> {
-    let mut out: Vec<Transcript> = Vec::new();
-    for t in corpus::seed().into_iter().chain(corpus::adversarial()) {
-        if !matches!(t.setup, Setup::ActiveViaTrustHandshake) || t.steps.is_empty() {
-            continue;
-        }
-        let all_pull_drivable = t.steps.iter().all(|s| {
-            matches!(
-                s.request,
-                ClientRequest::SimpleQuery(_)
-                    | ClientRequest::Prepare(_)
-                    | ClientRequest::DescribeStatement
-                    | ClientRequest::DescribePortal
-                    | ClientRequest::BindExecute(_)
-                    | ClientRequest::BindExecuteRowLimited { .. }
-                    | ClientRequest::ResumeExecute
-                    | ClientRequest::CloseStatement
-                    | ClientRequest::ExecutePreparedDemo(_)
-            )
-        });
-        if all_pull_drivable && t.name != "multi_statement_select" {
-            out.push(t);
-        }
-    }
-    out
+    falsify::active_pull_corpus()
 }
 
-/// The response projection compared across A1 and A2(pull): everything an active
-/// pull observes EXCEPT `client_bytes` — the response-driven pull engine emits
-/// no request frames, so the outbound wire is not part of its observable.
+/// The response projection compared across A1 and A2(pull) — shared via
+/// [`falsify`].
 fn response_view(run: &ObservedRun) -> ObservedRun {
-    let mut view = run.clone();
-    view.client_bytes = Vec::new();
-    view
+    falsify::response_view(run)
 }
 
 /// Guard: the active subset is non-empty and carries the ROW/NOTICE/NOTIFY/PARAM
@@ -383,36 +356,12 @@ fn active_differential_a1_a2_pull_agree() {
 /// requests that map 1:1 onto a single bundling verb, so the verbs' outbound wire
 /// is byte-comparable against Adapter#1's push wire.
 ///
-/// Exclusions, each STRUCTURAL (never "rare"/"atypical"):
-/// - The fine-grained extended fixtures (separate `Prepare`/`DescribeStatement`/
-///   `DescribePortal`/`BindExecute`/`ResumeExecute`/`CloseStatement` steps) are
-///   filtered out by the request-kind set: each such step is its own Sync, while
-///   the bundling verbs (`prepare` = Parse+Describe+1 Sync, `query_params` =
-///   Parse+Bind+Execute+1 Sync) decompose the wire differently by construction.
-///   Those fixtures stay on `A2.pull`, which compares the response only.
-/// - `multi_statement_select`: the live engine FLATTENS a row-first `;`-batch
-///   into one result set; the verb's clean per-statement delineation produces
-///   several — the same documented A1-only flattening quirk the pull subset
-///   excludes (a result divergence by construction, not a wire one).
+/// The verb subset — the single source of truth lives in [`falsify`], shared
+/// with the Adapter#2 falsifier. Its exclusions (the fine-grained extended
+/// fixtures whose Sync bundling differs, the `multi_statement_select` flattening
+/// quirk) are documented there.
 fn verb_client_byte_corpus() -> Vec<Transcript> {
-    let mut out: Vec<Transcript> = Vec::new();
-    for t in corpus::seed().into_iter().chain(corpus::adversarial()) {
-        if !matches!(t.setup, Setup::ActiveViaTrustHandshake) || t.steps.is_empty() {
-            continue;
-        }
-        let all_byte_comparable = t.steps.iter().all(|s| {
-            matches!(
-                s.request,
-                ClientRequest::SimpleQuery(_)
-                    | ClientRequest::Ping
-                    | ClientRequest::ExecutePreparedDemo(_)
-            )
-        });
-        if all_byte_comparable && t.name != "multi_statement_select" {
-            out.push(t);
-        }
-    }
-    out
+    falsify::verb_client_byte_corpus()
 }
 
 /// Guard: the verb subset is non-empty and carries each representative the verb
@@ -532,6 +481,130 @@ fn verb_differential_has_teeth() {
     assert_ne!(
         a2_verb, result_tampered,
         "result comparison must catch a tampered command tag",
+    );
+}
+
+// ===========================================================================
+// FULL-CORPUS COVERAGE GUARD — every fixture is under at least one Adapter#2
+// differential subset, or is a DOCUMENTED structural exclusion. A future fixture
+// that escapes all subsets without an explicit structural reason fails here, so a
+// new fixture cannot silently slip past the old-vs-new comparison.
+// ===========================================================================
+
+/// The set of fixture names some Adapter#2 differential subset covers — the
+/// union of the handshake-only, pull, and verb subsets (all from the single
+/// source of truth in [`falsify`]).
+fn differential_covered_names() -> std::collections::BTreeSet<&'static str> {
+    let mut covered = std::collections::BTreeSet::new();
+    for t in falsify::handshake_only_corpus() {
+        covered.insert(t.name);
+    }
+    for t in falsify::active_pull_corpus() {
+        covered.insert(t.name);
+    }
+    for t in falsify::verb_client_byte_corpus() {
+        covered.insert(t.name);
+    }
+    covered
+}
+
+#[test]
+fn full_corpus_coverage_no_fixture_escapes() {
+    let covered = differential_covered_names();
+    let excluded: std::collections::BTreeSet<&str> = falsify::STRUCTURAL_EXCLUSIONS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+
+    // Per-surface membership, for the coverage table + the per-fixture audit.
+    let pull: std::collections::BTreeSet<&str> = falsify::active_pull_corpus()
+        .iter()
+        .map(|t| t.name)
+        .collect();
+    let verb: std::collections::BTreeSet<&str> = falsify::verb_client_byte_corpus()
+        .iter()
+        .map(|t| t.name)
+        .collect();
+    let handshake: std::collections::BTreeSet<&str> = falsify::handshake_only_corpus()
+        .iter()
+        .map(|t| t.name)
+        .collect();
+
+    // The coverage report: fixture -> covering Adapter#2 surfaces.
+    println!("\n=== FULL-CORPUS DIFFERENTIAL COVERAGE ===");
+    println!("{:<36} Adapter#2 surfaces", "fixture");
+    println!("{}", "-".repeat(72));
+    for t in falsify::full_corpus() {
+        let mut tags: Vec<&str> = Vec::new();
+        if handshake.contains(t.name) {
+            tags.push("handshake");
+        }
+        if pull.contains(t.name) {
+            tags.push("pull");
+        }
+        if verb.contains(t.name) {
+            tags.push("verb");
+        }
+        let label = if tags.is_empty() {
+            "EXCLUDED (structural — A1 only)".to_string()
+        } else {
+            tags.join(" + ")
+        };
+        println!("{:<36} {label}", t.name);
+    }
+    println!("{}", "-".repeat(72));
+
+    // 1. Every full-corpus fixture is covered by at least one surface OR is a
+    //    documented structural exclusion — never neither (a silent escape).
+    for t in falsify::full_corpus() {
+        let is_covered = covered.contains(t.name);
+        let is_excluded = excluded.contains(t.name);
+        assert!(
+            is_covered || is_excluded,
+            "fixture `{}` is in NO Adapter#2 differential subset and is not a \
+             documented structural exclusion — it escapes every old-vs-new \
+             comparison. Add it to a differential subset, or add a STRUCTURAL \
+             (not convenience) exclusion to falsify::STRUCTURAL_EXCLUSIONS.",
+            t.name,
+        );
+        // 2. An exclusion must name a GENUINELY uncovered fixture: a fixture that
+        //    is both covered and listed is a stale/redundant exclusion.
+        assert!(
+            !(is_covered && is_excluded),
+            "fixture `{}` is both covered by a differential subset AND listed as \
+             a structural exclusion — remove the stale exclusion",
+            t.name,
+        );
+    }
+
+    // 3. Every structural-exclusion entry names a real corpus fixture and carries
+    //    a reason (no typo'd / unreasoned allowlist entry).
+    let corpus_names: std::collections::BTreeSet<&str> =
+        falsify::full_corpus().iter().map(|t| t.name).collect();
+    for (name, reason) in falsify::STRUCTURAL_EXCLUSIONS {
+        assert!(
+            corpus_names.contains(name),
+            "structural exclusion `{name}` names no corpus fixture (stale allowlist entry)",
+        );
+        assert!(
+            !reason.trim().is_empty(),
+            "structural exclusion `{name}` carries no reason",
+        );
+    }
+
+    // 4. The guard is not vacuous: the corpus is non-trivial and the documented
+    //    exclusions are exactly the two known structural gaps.
+    assert!(
+        falsify::full_corpus().len() >= 30,
+        "expected a non-trivial corpus, found {}",
+        falsify::full_corpus().len(),
+    );
+    let expected_exclusions: std::collections::BTreeSet<&str> =
+        ["multi_statement_select", "terminate"].into_iter().collect();
+    assert_eq!(
+        excluded, expected_exclusions,
+        "the documented structural exclusions changed; review the coverage report \
+         and update this guard + the reasons in falsify::STRUCTURAL_EXCLUSIONS",
     );
 }
 
