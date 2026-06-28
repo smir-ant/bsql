@@ -1,66 +1,47 @@
-//! Seed-corpus replay: every fixture runs on BOTH twins of Adapter#1, and
-//! each must (a) match its pinned `expect` and (b) agree across twins — the
-//! differential-equivalence property that generalises to a future engine.
+//! Seed-corpus regression on the NEW engine: every seed fixture, replayed
+//! through whichever observable surface drives it (connecting `run`,
+//! response-driven `pull`, or client-byte-emitting `verb`), must reproduce its
+//! committed golden (`Transcript::expect`) — the frozen behaviour the pinned
+//! goldens captured. A fixture no surface drives is a documented structural
+//! exclusion, so no fixture is silently unobserved.
 //!
-//! Each fixture is ALSO replayed under all three transport chunk schedules to
-//! prove the observation is fragmentation-invariant (partial-frame resumption:
-//! one byte per read, header/body split) — axis-5 coverage applied corpus-wide.
+//! Each fixture is ALSO replayed under all three transport chunk schedules
+//! (all-at-once, one byte per read, header/body split) to prove the observation
+//! is fragmentation-invariant: partial-frame resumption never changes the
+//! outcome. The verb surface additionally cross-checks the two active surfaces
+//! agree on the response projection (surface equivalence).
 
-#![allow(
-    clippy::panic,
-    reason = "test harness — a fixture mismatch is the loud test-failure signal, not a production fallback; integration-test bodies are not in `#[test]` context so the in-tests carve-out cannot reach the assert helper"
-)]
+#[path = "../src/engine_transport.rs"]
+mod engine_transport;
+#[path = "../src/engine_adapter.rs"]
+mod engine_adapter;
+#[path = "../src/falsify.rs"]
+mod falsify;
+#[path = "../src/a2_oracle.rs"]
+mod a2_oracle;
 
-use bsql_corpus::{Adapter, ChunkSchedule, SansIoAdapter, Transcript, corpus};
+use bsql_corpus::corpus;
 
-/// Assert a transcript matches its pin on both twins and that the twins agree.
-fn assert_pinned_and_equivalent(t: &Transcript) {
-    let a = SansIoAdapter::sync().run(t);
-    let b = SansIoAdapter::async_twin().run(t);
-    assert_eq!(a, b, "twin divergence on `{}`", t.name);
-    assert_eq!(a, t.expect, "pin mismatch (sync) on `{}`", t.name);
-    assert_eq!(b, t.expect, "pin mismatch (async) on `{}`", t.name);
-}
-
-/// Replay `t` under each chunk schedule; the observation must be identical to
-/// `t`'s own (so partial-frame fragmentation never changes the outcome) and
-/// must agree across twins under every schedule.
-fn assert_schedule_invariant(t: &Transcript) {
-    let baseline = SansIoAdapter::sync().run(t);
-    for schedule in [
-        ChunkSchedule::AllAtOnce,
-        ChunkSchedule::OneBytePerRead,
-        ChunkSchedule::SplitHeaders,
-    ] {
-        let mut variant = t.clone();
-        variant.chunk_schedule = schedule;
-        let s = SansIoAdapter::sync().run(&variant);
-        let a = SansIoAdapter::async_twin().run(&variant);
-        assert_eq!(s, a, "twin divergence on `{}` under {schedule:?}", t.name);
-        assert_eq!(
-            s, baseline,
-            "schedule {schedule:?} changed the observation on `{}`",
-            t.name
-        );
-    }
-}
+use a2_oracle::A2Oracle;
 
 #[test]
-fn seed_corpus_green_on_both_twins() {
+fn seed_corpus_matches_golden_on_new_engine() {
+    let oracle = A2Oracle::new();
     let seed = corpus::seed();
     assert!(seed.len() >= 12, "seed corpus must be representative (>=12 fixtures)");
     for t in &seed {
-        assert_pinned_and_equivalent(t);
+        oracle.assert_matches_golden(t);
     }
 }
 
 #[test]
 fn seed_corpus_is_schedule_invariant() {
+    let oracle = A2Oracle::new();
     for t in &corpus::seed() {
         // An oversize frame (larger than the bounded ingest buffer) is NOT
-        // fragmentation-invariant under the adapter's feed-whole-chunk model:
+        // fragmentation-invariant under the engine's feed-whole-chunk model:
         // AllAtOnce / SplitHeaders feed the >buffer chunk before the engine can
-        // drain it and both engines report a transport stall, whereas
+        // drain it and the engine reports a transport stall, whereas
         // OneBytePerRead streams it to completion. That split is a
         // buffer-feed-model artifact, not a protocol property, so these
         // oversize-inbound fixtures (each pinned to OneBytePerRead) are exempt
@@ -73,6 +54,6 @@ fn seed_corpus_is_schedule_invariant() {
         ) {
             continue;
         }
-        assert_schedule_invariant(t);
+        oracle.assert_schedule_invariant(t);
     }
 }

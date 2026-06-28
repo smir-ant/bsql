@@ -76,7 +76,7 @@ impl Transport for EngineScriptTransport {
         // Capture synchronously before the future is created — no lock is held
         // across an await. A poisoned mutex is impossible single-threaded; the
         // dropped write would surface as a client-bytes mismatch in the
-        // differential, never a silent corruption.
+        // regression, never a silent corruption.
         if let Ok(mut sink) = self.captured.lock() {
             sink.extend_from_slice(buf);
         }

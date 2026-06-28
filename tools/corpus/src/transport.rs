@@ -1,20 +1,12 @@
-//! Scripted transports honouring a [`ChunkSchedule`].
+//! Transport chunk fragmentation honouring a [`ChunkSchedule`].
 //!
 //! [`split_into_chunks`] fragments a server-reply byte stream per the schedule
-//! into a chunk queue. The SYNC twin pops chunks directly from a
-//! [`ChunkQueue`]; the ASYNC twin reads them through a [`ScriptedReader`]
-//! (`AsyncRead`) and writes captured client bytes through a [`ScriptedWriter`]
-//! (`AsyncWrite`). Both feed the *same* chunk fragmentation, so the resulting
-//! observation must match across twins — the chunk schedule fragments READS,
-//! never the observed outcome.
-
-use std::collections::VecDeque;
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+//! into a chunk list. The engine adapter feeds those chunks to the engine under
+//! test, so one fixture replays under several fragmentations — the chunk
+//! schedule fragments READS, never the observed outcome (fragmentation
+//! invariance is asserted corpus-wide).
 
 use bsql_postgres_proto::{HeaderParse, parse_header};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::transcript::ChunkSchedule;
 
@@ -85,99 +77,4 @@ fn split_headers(bytes: &[u8]) -> Vec<Vec<u8>> {
         offset = frame_end;
     }
     chunks
-}
-
-/// A FIFO of scripted read chunks. Shared shape behind both twins.
-#[derive(Debug, Default)]
-pub struct ChunkQueue {
-    chunks: VecDeque<Vec<u8>>,
-}
-
-impl ChunkQueue {
-    /// Build from a pre-fragmented chunk list.
-    #[must_use]
-    pub fn new(chunks: Vec<Vec<u8>>) -> Self {
-        Self { chunks: chunks.into() }
-    }
-
-    /// Pop the next scripted chunk, or `None` when exhausted.
-    pub fn next_chunk(&mut self) -> Option<Vec<u8>> {
-        self.chunks.pop_front()
-    }
-
-    /// True when no chunks remain.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
-    }
-}
-
-/// `AsyncRead` over a scripted chunk queue: each `poll_read` delivers at most
-/// the next chunk's bytes. When the queue is empty it returns `Ready(Ok(()))`
-/// with an unfilled buffer — i.e. EOF (read of 0). Genuinely drives the async
-/// path: the engine's reads go through `poll_read`.
-#[derive(Debug, Default)]
-pub struct ScriptedReader {
-    queue: ChunkQueue,
-}
-
-impl ScriptedReader {
-    /// Build from a pre-fragmented chunk list.
-    #[must_use]
-    pub fn new(chunks: Vec<Vec<u8>>) -> Self {
-        Self { queue: ChunkQueue::new(chunks) }
-    }
-}
-
-impl AsyncRead for ScriptedReader {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        // `ScriptedReader` is `Unpin` (only a `VecDeque`), so a safe `get_mut`
-        // suffices — no `unsafe` pin projection.
-        let this = self.get_mut();
-        if let Some(mut chunk) = this.queue.next_chunk() {
-            let cap = buf.remaining();
-            if chunk.len() <= cap {
-                buf.put_slice(&chunk);
-            } else {
-                // Chunk larger than the read buffer's headroom: deliver what
-                // fits and push the remainder back so no bytes are lost.
-                let tail = chunk.split_off(cap);
-                buf.put_slice(&chunk);
-                this.queue.chunks.push_front(tail);
-            }
-        }
-        // Empty queue ⇒ leave `buf` untouched ⇒ the caller's `read` returns 0
-        // (EOF for this step).
-        Poll::Ready(Ok(()))
-    }
-}
-
-/// `AsyncWrite` capturing every client byte into an in-memory buffer.
-#[derive(Debug, Default)]
-pub struct ScriptedWriter {
-    /// Captured client→server bytes, in write order.
-    pub captured: Vec<u8>,
-}
-
-impl AsyncWrite for ScriptedWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.get_mut().captured.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
 }

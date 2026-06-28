@@ -37,16 +37,15 @@ members = [
     # conformance trybuild gate. `publish = false`; not a shipped crate; adds
     # NO new external package (rusqlite is already resolved for bsql-sqlite).
     "tools/query_sqlite_fixture",
-    # Dev-only differential-replay corpus: a Rust-native typed corpus of
-    # PostgreSQL wire transcripts replayed through an observable-I/O Adapter
-    # seam over the public sans-IO `Session`. Proves engine behavioural
-    # equivalence across a rebuild — the same corpus stays green on the
-    # current engine and any future re-implementation, because its
-    # Adapter/ObservedRun types name ONLY observable values (client wire
-    # bytes + public outcomes), never an internal engine type. `publish =
-    # false`; never in any shipped crate's runtime graph (so
-    # `runtime_graph_pin` is unaffected); adds NO new external dependency
-    # (core + proto + the already-present tokio).
+    # Dev-only replay corpus: a Rust-native typed corpus of PostgreSQL wire
+    # transcripts replayed through an observable-I/O Adapter seam over the
+    # public sans-IO `engine`. Pins engine behaviour against committed
+    # `ObservedRun` goldens — the same corpus pins one engine now and any
+    # future re-implementation later, because its Adapter/ObservedRun types
+    # name ONLY observable values (client wire bytes + public outcomes),
+    # never an internal engine type. `publish = false`; never in any shipped
+    # crate's runtime graph (so `runtime_graph_pin` is unaffected); adds NO
+    # new external dependency (proto only — no async runtime).
     "tools/corpus",
 ]
 

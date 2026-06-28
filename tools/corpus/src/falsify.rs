@@ -1,12 +1,13 @@
-//! Shared differential-corpus infrastructure: the canonical corpus partitions
-//! each Adapter#2 surface covers, the documented structural exclusions, and the
-//! response projection.
+//! Shared corpus-partition infrastructure: the canonical corpus partitions each
+//! engine surface covers, the documented structural exclusions, and the response
+//! projection.
 //!
 //! This is the SINGLE source of truth for which fixture is driven by which
-//! Adapter#2 surface. Both the handshake/active differentials (`differential.rs`)
-//! and the Adapter#2 falsifier (`falsifier_a2.rs`) read these functions, so the
-//! falsifier measures exactly the subsets the differentials prove — a partition
-//! cannot drift between the two tests.
+//! engine surface. The surface-integrity tests (`surfaces.rs`), the per-fixture
+//! regression (`seed.rs` / `adversarial.rs`), and the falsifier
+//! (`falsifier_a2.rs`) all read these functions, so the falsifier measures
+//! exactly the subsets the regression proves — a partition cannot drift between
+//! the tests.
 //!
 //! It is a `src/` file compiled INTO each consuming test crate via
 //! `#[path = "../src/falsify.rs"] mod falsify;` (the same pattern
@@ -16,7 +17,7 @@
 
 #![allow(
     dead_code,
-    reason = "shared differential infrastructure compiled into multiple test crates via `#[path]`; each crate uses a different subset (the differentials read the corpus partitions, the falsifiers read the mutation battery), so not every item is read in every crate — the established shared-test-helper-module pattern"
+    reason = "shared corpus-partition infrastructure compiled into multiple test crates via `#[path]`; each crate uses a different subset (the regression / surface tests read the corpus partitions, the falsifier reads the mutation battery), so not every item is read in every crate — the established shared-test-helper-module pattern"
 )]
 
 use bsql_corpus::{
@@ -38,14 +39,14 @@ pub fn full_corpus() -> Vec<Transcript> {
 }
 
 /// The handshake/startup subset: the empty-step (handshake-only) fixtures of the
-/// full corpus, which Adapter#2's connecting path
+/// full corpus, which the engine's connecting surface
 /// ([`EngineAdapter::run`](crate::engine_adapter::EngineAdapter)) drives.
 ///
-/// A stepped fixture is NOT here: Adapter#2's connecting path observes only the
+/// A stepped fixture is NOT here: the connecting surface observes only the
 /// handshake outcome, so comparing it against a full-run pin would diverge by
-/// construction. This is the real-corpus portion of the differential's
-/// `handshake_corpus` (the locally authored handshake fixtures live only in the
-/// differential test and are not part of the validated corpus).
+/// construction. This is the real-corpus portion of the surface tests'
+/// `handshake_corpus` (the locally authored handshake fixtures live only in
+/// `surfaces.rs` and are not part of the validated corpus).
 #[must_use]
 pub fn handshake_only_corpus() -> Vec<Transcript> {
     full_corpus()
@@ -54,26 +55,26 @@ pub fn handshake_only_corpus() -> Vec<Transcript> {
         .collect()
 }
 
-/// The active subset the pull twin covers: `ActiveViaTrustHandshake` transcripts
-/// whose every step is a *pull-drivable* request — the simple-query flow plus the
-/// extended query protocol (`Prepare`/`DescribeStatement`/`DescribePortal`/
-/// `BindExecute`/`BindExecuteRowLimited`/`ResumeExecute`/`CloseStatement`/
-/// `ExecutePreparedDemo`). A bind/execute reply re-sends no `RowDescription`, so
-/// its column OIDs come from the preceding `Describe` (or the macro's
-/// compile-time schema), which the adapter threads from the request tag, not the
-/// client wire.
+/// The active subset the pull surface covers: `ActiveViaTrustHandshake`
+/// transcripts whose every step is a *pull-drivable* request — the simple-query
+/// flow plus the extended query protocol (`Prepare`/`DescribeStatement`/
+/// `DescribePortal`/`BindExecute`/`BindExecuteRowLimited`/`ResumeExecute`/
+/// `CloseStatement`/`ExecutePreparedDemo`). A bind/execute reply re-sends no
+/// `RowDescription`, so its column OIDs come from the preceding `Describe` (or
+/// the macro's compile-time schema), which the adapter threads from the request
+/// tag, not the client wire.
 ///
 /// Exclusions, each for a STRUCTURAL reason (never "rare"/"atypical"):
-/// - `multi_statement_select`: the live engine FLATTENS a row-FIRST `;`-batch
-///   through its `iter_rows` pull into a single result set, whereas the
-///   cleanly-delineated pull surfaces one result set per statement — the two
-///   disagree on result-set structure by construction (the documented A1-only
-///   flattening quirk). `multi_statement_delineated` covers clean delineation.
+/// - `multi_statement_select`: the old engine FLATTENS a row-FIRST `;`-batch
+///   through its `iter_rows` pull into a single result set (frozen in the
+///   golden), whereas the cleanly-delineated pull surface produces one result
+///   set per statement — the two disagree on result-set structure by
+///   construction (the documented old-engine flattening quirk).
+///   `multi_statement_delineated` covers clean delineation.
 /// - `Ping` / `Terminate` steps: filtered out by the request-kind set. A `Ping`
-///   reply is a bare `ReadyForQuery` with no `CommandComplete`, so the live
-///   engine synthesises a degenerate result set the response-driven pull does
-///   not; a `Terminate` has no server reply at all (a socket close, not a
-///   response).
+///   reply is a bare `ReadyForQuery` with no `CommandComplete`, so the golden
+///   carries a degenerate result set the response-driven pull does not; a
+///   `Terminate` has no server reply at all (a socket close, not a response).
 #[must_use]
 pub fn active_pull_corpus() -> Vec<Transcript> {
     let mut out: Vec<Transcript> = Vec::new();
@@ -105,12 +106,12 @@ pub fn active_pull_corpus() -> Vec<Transcript> {
 /// The client-bytes-comparable subset: `ActiveViaTrustHandshake` transcripts
 /// whose every step is one of `{SimpleQuery, Ping, ExecutePreparedDemo, Terminate}`
 /// — the requests that map 1:1 onto a single bundling verb, so the verbs'
-/// outbound wire is byte-comparable against Adapter#1's push wire. `Terminate`
-/// belongs here (not the pull subset): it IS a verb (`terminate`), and the verb
-/// twin puts the byte-identical `Terminate` frame on the wire then transitions to
-/// the closed phase — the `Closed` terminal observable Adapter#1 produces. The
-/// pull twin, which emits no client wire, still reproduces the response-side
-/// `Closed` observable for the verb differential's `verb`-vs-`pull` cross-check.
+/// outbound wire is byte-comparable against the golden's client bytes.
+/// `Terminate` belongs here (not the pull subset): it IS a verb (`terminate`),
+/// and the verb surface puts the byte-identical `Terminate` frame on the wire
+/// then transitions to the closed phase — the `Closed` terminal the golden
+/// carries. The pull surface, which emits no client wire, still reproduces the
+/// response-side `Closed` observable for the verb/pull cross-check.
 ///
 /// Exclusions, each STRUCTURAL (never "rare"/"atypical"):
 /// - The fine-grained extended fixtures (separate `Prepare`/`DescribeStatement`/
@@ -118,11 +119,12 @@ pub fn active_pull_corpus() -> Vec<Transcript> {
 ///   filtered out by the request-kind set: each such step is its own Sync, while
 ///   the bundling verbs (`prepare` = Parse+Describe+1 Sync, `query_params` =
 ///   Parse+Bind+Execute+1 Sync) decompose the wire differently by construction.
-///   Those fixtures stay on the pull twin, which compares the response only.
-/// - `multi_statement_select`: the live engine FLATTENS a row-first `;`-batch
-///   into one result set; the verb's clean per-statement delineation produces
-///   several — the same documented A1-only flattening quirk the pull subset
-///   excludes (a result divergence by construction, not a wire one).
+///   Those fixtures stay on the pull surface, which compares the response only.
+/// - `multi_statement_select`: the old engine FLATTENS a row-first `;`-batch
+///   into one result set (frozen in the golden); the verb's clean per-statement
+///   delineation produces several — the same documented old-engine flattening
+///   quirk the pull subset excludes (a result divergence by construction, not a
+///   wire one).
 #[must_use]
 pub fn verb_client_byte_corpus() -> Vec<Transcript> {
     let mut out: Vec<Transcript> = Vec::new();
@@ -146,28 +148,29 @@ pub fn verb_client_byte_corpus() -> Vec<Transcript> {
     out
 }
 
-/// Fixtures NO Adapter#2 surface can drive, each excluded for a STRUCTURAL
+/// Fixtures NO engine surface can drive, each excluded for a STRUCTURAL
 /// (construction) reason — never frequency/convenience. Each entry is
 /// `(fixture name, reason)`; the coverage guard asserts every entry names a real
-/// corpus fixture that is genuinely in none of the differential subsets, so a
-/// stale or convenience exclusion fails the build.
+/// corpus fixture that is genuinely in none of the surface subsets, so a stale
+/// or convenience exclusion fails the build.
 pub const STRUCTURAL_EXCLUSIONS: &[(&str, &str)] = &[
     (
         "multi_statement_select",
-        "A1 row-first `;`-batch flattening quirk: the live engine flattens a \
-         row-FIRST batch into one result set via iter_rows, while every \
-         cleanly-delineated Adapter#2 surface produces one result set per \
-         statement — a result-structure divergence by construction. Clean \
+        "old-engine row-first `;`-batch flattening quirk: the golden was \
+         captured from the old engine, which flattens a row-FIRST batch into one \
+         result set via iter_rows, while every cleanly-delineated engine surface \
+         produces one result set per statement — a result-structure divergence \
+         by construction, so no surface can reproduce this golden. Clean \
          multi-statement delineation IS covered (multi_statement_delineated, \
          under both pull and verb). CUTOVER BEHAVIOR CHANGE: the new engine \
          delineates one result set per statement (the more correct shape) where \
-         the old engine flattens a row-first `;`-batch into a single result set, \
-         so a consumer relying on the old flattened shape sees a different \
+         the old engine flattened a row-first `;`-batch into a single result \
+         set, so a consumer relying on the old flattened shape sees a different \
          result-set COUNT after the cutover.",
     ),
 ];
 
-/// The response projection compared across A1 and A2(pull): everything an active
+/// The response projection compared on the pull surface: everything an active
 /// pull observes EXCEPT `client_bytes` — the response-driven pull engine emits
 /// no request frames, so the outbound wire is not part of its observable.
 #[must_use]
@@ -182,11 +185,10 @@ pub fn response_view(run: &ObservedRun) -> ObservedRun {
 // ===========================================================================
 //
 // Each [`Mutation`] models one realistic engine defect as a transform on the
-// observable [`ObservedRun`] the corpus compares against. The A1 falsifier
-// (`falsifier.rs`) and the Adapter#2 falsifier (`falsifier_a2.rs`) both run this
-// ONE battery, so an engine rebuild is measured against the identical defect set
-// — a mutation cannot be caught by one falsifier's list and missing from the
-// other's.
+// observable [`ObservedRun`] the corpus compares against. The falsifier
+// (`falsifier_a2.rs`) runs this battery against every engine surface, so the
+// new engine's discriminating power is measured directly against the modeled
+// defect set rather than inherited by faith.
 
 /// One injected engine defect: a name, a class, whether it is a previously-MISSED
 /// blind-spot class (which must now be CAUGHT), and the mutation transform.

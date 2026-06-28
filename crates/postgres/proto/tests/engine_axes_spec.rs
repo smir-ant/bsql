@@ -141,9 +141,10 @@ const SRC_INGEST: &str = "crates/postgres/proto/src/engine/ingest.rs";
 const SRC_PUMP: &str = "crates/postgres/proto/src/engine/pump.rs";
 const SRC_ERROR: &str = "crates/postgres/proto/src/engine/error.rs";
 const SRC_LIB: &str = "crates/postgres/proto/src/lib.rs";
-// Differential-replay corpus (the observable-I/O oracle).
-const DIFFERENTIAL: &str = "tools/corpus/tests/differential.rs";
-const FALSIFIER: &str = "tools/corpus/tests/falsifier.rs";
+// Replay corpus (the observable-I/O oracle over the frozen goldens).
+const SEED: &str = "tools/corpus/tests/seed.rs";
+const SURFACES: &str = "tools/corpus/tests/surfaces.rs";
+const FALSIFIER: &str = "tools/corpus/tests/falsifier_a2.rs";
 const ADVERSARIAL: &str = "tools/corpus/tests/adversarial.rs";
 
 const A1: &str = "Cardinality";
@@ -182,8 +183,8 @@ const SECTION7: &[Row] = &[
         ("query_one_rejects_two_rows", VERBS),
         ("query_opt_accepts_zero_and_one_but_rejects_two", VERBS),
     ])),
-    r(1, A1, "cross-fixture cardinality (differential oracle)",
-        Ev::Test("active_differential_a1_a2_pull_agree", DIFFERENTIAL)),
+    r(1, A1, "cross-fixture cardinality (engine vs frozen goldens)",
+        Ev::Test("seed_corpus_matches_golden_on_new_engine", SEED)),
     // ---- Axis 2 — Presence ----------------------------------------------
     r(2, A2, "all fields / none / partial", Ev::Tests(&[
         ("prepare_surfaces_recovered_schema", VERBS),
@@ -191,7 +192,7 @@ const SECTION7: &[Row] = &[
         ("partial_assembly_one_byte_per_read", ACTIVE),
     ])),
     r(2, A2, "DUPLICATE (frame sent twice — what wins?)", Ev::Tests(&[
-        ("adversarial_fixtures_pinned_on_both_twins", ADVERSARIAL),
+        ("adversarial_fixtures_match_golden_on_new_engine", ADVERSARIAL),
         ("second_row_description_tears_down", ACTIVE),
     ])),
     r(2, A2, "unexpected frame / tag", Ev::Tests(&[
@@ -230,7 +231,7 @@ const SECTION7: &[Row] = &[
         ("truncated_at_every_offset_yields_needmore_never_misclassifies", HOSTILE),
         ("partial_assembly_one_byte_per_read", ACTIVE),
         ("pong_delivered_via_byte_at_a_time_fragmentation", AUDIT),
-        ("active_differential_a1_a2_pull_agree", DIFFERENTIAL),
+        ("seed_corpus_is_schedule_invariant", SEED),
     ])),
     r(4, A4, "mid-transition drop|cancel (Connecting→Active never across await)", Ev::Tests(&[
         ("flush_unrolls_at_every_drop_point_with_byte_identical_resume", FLUSH_CANCEL),
@@ -262,7 +263,7 @@ const SECTION7: &[Row] = &[
         ("active_protocol_violation_pumps_to_boundary_closed", HOSTILE),
     ])),
     r(5, A5, "adversarial coverage strength (corpus falsifier kill-rate)",
-        Ev::Test("corpus_falsifier_catch_rate", FALSIFIER)),
+        Ev::Test("a2_falsifier_catch_rate", FALSIFIER)),
     // ---- Axis 6 — Size --------------------------------------------------
     r(6, A6, "zero bytes (Ok(0) read / drained buffer)", Ev::Tests(&[
         ("unexpected_eof_is_classified", PUMP),
@@ -331,8 +332,8 @@ const SECTION7: &[Row] = &[
     ])),
     // ---- Axis 9 — Platform ----------------------------------------------
     r(9, A9, "endianness (wire big-endian, exact bytes pinned)", Ev::Tests(&[
-        ("active_differential_a1_a2_verb_agree", DIFFERENTIAL),
-        ("verb_differential_has_teeth", DIFFERENTIAL),
+        ("seed_corpus_matches_golden_on_new_engine", SEED),
+        ("verb_surface_has_teeth", SURFACES),
     ])),
     r(9, A9, "alignment (size + align pinned together)",
         Ev::Test("align_drift_is_e0080", FOOTPRINT_CF)),

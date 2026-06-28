@@ -1,18 +1,23 @@
-//! Adapter#2 — the bridge from a transcript to the NEW strangler engine's
-//! connecting path (handshake-only).
+//! The bridge from a transcript to the `bsql_postgres_proto::engine` under test.
 //!
-//! [`EngineAdapter`] drives the new `bsql_postgres_proto::engine`
-//! [`ConnectingEngine`] over a transcript's scripted server bytes and reports
-//! the same observable [`ObservedRun`] that Adapter#1 returns — restricted to
-//! the handshake-relevant fields (client startup/auth bytes, parameter
-//! statuses, backend pid, terminal status, transaction status). It is the
-//! analogue of `SansIoAdapter`'s drain, but instead of the live `Session`
-//! pump it feeds the fixture bytes through the engine's single-residence
-//! `read_slot`/`commit` ingest and drives `next_auth_event()` by hand.
+//! [`EngineAdapter`] exposes three observable surfaces, each driving a
+//! transcript's scripted server bytes and returning the observable
+//! [`ObservedRun`] the regression compares against the pinned golden:
 //!
-//! For non-connecting fixtures (those with client steps) this adapter is not
-//! wired — it observes the handshake outcome only. The differential test
-//! restricts itself to the handshake/startup subset accordingly.
+//! - [`EngineAdapter::run`] — the connecting path ([`ConnectingEngine`]):
+//!   handshake-only, surfacing the client startup/auth bytes, parameter
+//!   statuses, backend pid, transaction status, and terminal. It feeds the
+//!   fixture bytes through the engine's single-residence `read_slot`/`commit`
+//!   ingest and drives `next_auth_event()` by hand.
+//! - [`EngineAdapter::pull`] — the active response surface: it reaches an active
+//!   handle through the trust handshake then hand-feeds each step's server
+//!   frames, surfacing the full response (result sets, notices, notifications,
+//!   parameter statuses, copy-out, transaction status, terminal) but no client
+//!   wire (it is response-driven).
+//! - [`EngineAdapter::verb`] — the active verb surface: it calls the engine's
+//!   real verbs over a scripted [`Transport`](bsql_postgres_proto::engine::Transport),
+//!   so the captured outbound wire is the verbs' actual request bytes (the full
+//!   observable, including `client_bytes`).
 
 use std::sync::{Arc, Mutex};
 
@@ -39,15 +44,15 @@ use bsql_corpus::transcript::{ClientRequest, Setup, Step, Transcript};
 use bsql_corpus::transport::split_into_chunks;
 
 /// The backend PID pinned by the canonical trust handshake — mirrors the
-/// constant Adapter#1 surfaces for `ActiveViaTrustHandshake` transcripts.
+/// constant the pinned golden carries for `ActiveViaTrustHandshake` transcripts.
 const TRUST_BACKEND_PID: i32 = 4321;
 
 /// Result-column type OIDs of the corpus-local prepared-statement demo query
 /// (`SELECT id::int4, name::text`): `int4` (23) then `text` (25). The macro
 /// path re-sends no `RowDescription`, so the executed rows are surfaced against
 /// this compile-time schema — threaded into the engine the same way a statement
-/// `Describe`'s recovered schema is. A drift here is caught by the differential
-/// (Adapter#1 surfaces the macro's real OIDs).
+/// `Describe`'s recovered schema is. A drift here is caught by the regression
+/// (the pinned golden carries the macro's real OIDs).
 const DEMO_RESULT_OIDS: [u32; 2] = [23, 25];
 
 /// Adapter over the new engine's connecting path. Handshake-only.
@@ -64,16 +69,15 @@ impl EngineAdapter {
     /// Drive a transcript's ACTIVE phase through the new engine's pull surface
     /// and project the observable outcome.
     ///
-    /// The active-phase twin of [`SansIoAdapter`](bsql_corpus::SansIoAdapter)'s
-    /// drain + `col_next`: it reaches an active handle through the canonical
-    /// trust handshake, then feeds each step's scripted server bytes through the
-    /// active engine's `read_slot`/`commit` ingest and drives `next_event()` by
-    /// hand — no `Transport`, no pump. It captures the SAME [`ObservedRun`]
-    /// response fields Adapter#1 does (per-statement result sets with rows /
+    /// The active response surface: it reaches an active handle through the
+    /// canonical trust handshake, then feeds each step's scripted server bytes
+    /// through the active engine's `read_slot`/`commit` ingest and drives
+    /// `next_event()` by hand — no `Transport`, no pump. It captures the
+    /// [`ObservedRun`] response fields (per-statement result sets with rows /
     /// tags / OIDs, notices, notifications, parameter statuses, copy-out chunks,
     /// transaction status, terminal) — except `client_bytes`: the pull engine is
-    /// response-driven and emits no request frames, so the differential
-    /// compares the response projection.
+    /// response-driven and emits no request frames, so the regression compares
+    /// the response projection.
     ///
     /// Scoped to `ActiveViaTrustHandshake` transcripts whose steps are the
     /// pull-drivable request kinds: the simple-query flow plus the extended
@@ -81,9 +85,9 @@ impl EngineAdapter {
     /// `BindExecuteRowLimited`/`CloseStatement`/`ExecutePreparedDemo`). State is
     /// reconstructed from each request's TAG (seating the engine via its
     /// `begin_*` seam) plus the server frames — no client wire is encoded. A
-    /// `Terminate` carries no server reply, so the pull twin records its `Closed`
-    /// terminal directly (the observable is fully request-determined); it is the
-    /// verb twin that puts the `Terminate` frame on the wire.
+    /// `Terminate` carries no server reply, so the pull surface records its
+    /// `Closed` terminal directly (the observable is fully request-determined);
+    /// it is the verb surface that puts the `Terminate` frame on the wire.
     #[must_use]
     pub fn pull(&self, transcript: &Transcript) -> ObservedRun {
         run_pull(transcript)
@@ -120,9 +124,9 @@ impl Adapter for EngineAdapter {
     }
 }
 
-/// The canonical minimal trust handshake reply (mirrors Adapter#1's): an
-/// `AuthenticationOk` + `BackendKeyData` + `ReadyForQuery(idle)` chain with no
-/// `ParameterStatus`, so the session's parameter set starts empty.
+/// The canonical minimal trust handshake reply (the shape the trust goldens
+/// pin): an `AuthenticationOk` + `BackendKeyData` + `ReadyForQuery(idle)` chain
+/// with no `ParameterStatus`, so the session's parameter set starts empty.
 fn canonical_handshake_reply() -> Vec<u8> {
     frames::concat(&[
         frames::auth_ok(),
@@ -135,7 +139,7 @@ fn canonical_handshake_reply() -> Vec<u8> {
 /// observable outcome.
 fn run_handshake(transcript: &Transcript) -> ObservedRun {
     // The server bytes to feed, and whether the client startup/auth bytes
-    // count toward the observable (Adapter#1 discards them for the canonical
+    // count toward the observable (the golden discards them for the canonical
     // trust setup, records them for a scripted startup).
     let (server_bytes, record_client) = match &transcript.setup {
         Setup::ActiveViaTrustHandshake => (canonical_handshake_reply(), false),
@@ -144,15 +148,15 @@ fn run_handshake(transcript: &Transcript) -> ObservedRun {
     };
 
     // The corpus connects as user "corpus", no database / application_name,
-    // Trust credentials (the corpus has no password configured) — identical to
-    // Adapter#1's `corpus_config`.
+    // Trust credentials (the corpus has no password configured) — the trust
+    // connection the goldens were captured under.
     let user = match Ident::try_from_str("corpus") {
         Ok(user) => user,
         Err(_) => return failed_run(Vec::new()),
     };
     // The sole outbound residence: the startup packet and any auth response are
     // queued here. It is never flushed in this in-memory adapter, so `pending()`
-    // accumulates the full client wire (startup ++ auth) the differential reads.
+    // accumulates the full client wire (startup ++ auth) the regression reads.
     let mut send_buf = SendBuf::new();
     let mut engine = match ConnectingEngine::start(&mut send_buf, &user, None, None, Credentials::Trust) {
         Ok(engine) => engine,
@@ -309,8 +313,8 @@ fn map_tx_status(status: TxStatus) -> ObservedTxStatus {
 }
 
 /// Project the accumulated session parameters into the ordered observable
-/// (key, value) list — the same fixed-key projection Adapter#1 applies, over
-/// the same `SessionParams` ingest, so the two adapters agree by construction.
+/// (key, value) list — the same fixed-key projection the golden was captured
+/// under, over the engine's `SessionParams` ingest.
 fn observe_param_statuses(params: &SessionParams) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     if let Some(v) = params.server_version.as_ref() {
@@ -352,7 +356,7 @@ fn bool_on_off(b: bool) -> String {
 }
 
 // ===========================================================================
-// Adapter#2 — active-phase pull twin
+// Active-phase pull surface
 // ===========================================================================
 
 /// An owned snapshot of one pulled [`Event`], taken before its borrow of the
@@ -481,7 +485,7 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
         // extended-protocol verb seats its matching state. `Ping` is a bare
         // `Sync` whose `ReadyForQuery` lands at `Idle` with no command boundary —
         // no seat, and the per-step degenerate-result-set synthesis below mirrors
-        // Adapter#1's statement-less result set.
+        // the golden's statement-less result set.
         match &step.request {
             ClientRequest::SimpleQuery(_) | ClientRequest::Ping => {}
             ClientRequest::Prepare(_) => active.begin_parse(),
@@ -498,9 +502,9 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
             }
             // A client-initiated graceful close carries no server reply, so there
             // is nothing to pull: the observable is fully determined by the
-            // request. Record the Closed terminal directly (the response-side twin
-            // of the live engine setting Closed on the terminate push) and end the
-            // run — `outcome` stays `Ok(default)`, matching Adapter#1's pin.
+            // request. Record the Closed terminal directly (the response-side
+            // analogue of the engine setting Closed on the terminate push) and end
+            // the run — `outcome` stays `Ok(default)`, matching the golden's pin.
             ClientRequest::Terminate => {
                 terminal = ObservedStatus::Closed;
                 break;
@@ -535,7 +539,7 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
             None => {
                 // A step that reached its boundary with no command-complete (a
                 // bare-`Sync` `Ping`) delivered no result set; synthesise the
-                // degenerate one Adapter#1 produces for a statement-less
+                // degenerate one the golden carries for a statement-less
                 // `ReadyForQuery`. Never fires for a step that completes a command
                 // (every such step delivers at least one result set).
                 if scratch.result_sets.is_empty() {
@@ -555,7 +559,7 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
 
     ObservedRun {
         // The response-driven pull engine emits no request frames; the
-        // differential compares the response projection, not client bytes.
+        // regression compares the response projection, not client bytes.
         client_bytes: Vec::new(),
         outcome,
         notices,
@@ -815,7 +819,7 @@ fn parse_diagnostic_notice(body: &[u8]) -> Option<ObservedNotice> {
 
 /// Parse an `ErrorResponse` body into the observable server error. The current
 /// engine surfaces severity/SQLSTATE/message/detail/hint; the remaining PG
-/// §55.7 fields are pinned absent (`None`) to match Adapter#1.
+/// §55.7 fields are pinned absent (`None`) to match the golden.
 fn parse_server_error(body: &[u8]) -> ObservedErr {
     let fields = parse_diagnostic_fields(body);
     ObservedErr::Server {
@@ -848,13 +852,13 @@ fn parse_notification(body: &[u8]) -> Option<ObservedNotify> {
 }
 
 // ===========================================================================
-// Adapter#2 — active-phase verb twin (real verbs over a scripted Transport)
+// Active-phase verb surface (real verbs over a scripted Transport)
 // ===========================================================================
 
-/// The corpus-local `prepared!` demo query — the SAME SQL text the live adapter
-/// (`sans_io::Q_DEMO`) prepares, so the content-addressed statement name, baked
-/// Parse template, and Bind prefix are byte-identical. `ExecutePreparedDemo` maps
-/// to the `query_params` macro-execute verb over this query.
+/// The corpus-local `prepared!` demo query — its SQL text fixes the
+/// content-addressed statement name, baked Parse template, and Bind prefix the
+/// goldens pin. `ExecutePreparedDemo` maps to the `query_params` macro-execute
+/// verb over this query.
 static Q_DEMO_VERB: PreparedQuery<(i32,), (i32, &'static str)> =
     prepared!("SELECT id::int4, name::text FROM demo WHERE id = $1::int4");
 
@@ -903,7 +907,7 @@ fn run_verb(transcript: &Transcript) -> ObservedRun {
 
     // The whole scripted reply stream: handshake ++ each step's reply, fragmented
     // per the transcript schedule (so partial-frame resumption is exercised
-    // exactly as the pull/A1 twins do).
+    // exactly as the pull surface does).
     let mut script = canonical_handshake_reply();
     for step in &transcript.steps {
         script.extend_from_slice(&step.server_reply);
@@ -946,7 +950,7 @@ fn run_verb_body<'b>(
         _ => return None,
     };
     // Drop the handshake's outbound wire; from here the capture is the verb wire
-    // (mirrors Adapter#1 discarding the trust handshake's client bytes).
+    // (the trust handshake's client bytes are not part of the observable).
     if let Ok(mut sink) = captured.lock() {
         sink.clear();
     }
@@ -963,7 +967,7 @@ fn run_verb_body<'b>(
         // A graceful close ends the session: the verb consumes the linear token
         // and returns no `Live`, so it cannot thread through `drive_verb_step`.
         // Drive it here, record the Closed terminal, and stop — the `Terminate`
-        // frame is captured as the client wire (matching Adapter#1's push).
+        // frame is captured as the client wire (matching the golden's client bytes).
         if matches!(step.request, ClientRequest::Terminate) {
             terminal = match poll_once(engine.terminate(live)) {
                 Ok(Ok(())) => ObservedStatus::Closed,
@@ -989,7 +993,7 @@ fn run_verb_body<'b>(
                     CommandStatus::Completed => {
                         // A bare-`Sync` ping reaches its boundary with no
                         // command-complete, so no result set was delivered;
-                        // synthesise the degenerate result set Adapter#1 produces
+                        // synthesise the degenerate result set the golden carries
                         // for a `ReadyForQuery` with no statement.
                         if cap.result_sets.is_empty() {
                             cap.result_sets.push(ObservedResultSet::default());
@@ -1003,10 +1007,10 @@ fn run_verb_body<'b>(
                         // A RECOVERABLE server error: the verb drained the
                         // recovering RFQ and handed the token back, so the
                         // connection survives and the run CONTINUES to the next
-                        // step (the recovery the differential must cover). The
+                        // step (the recovery the regression must cover). The
                         // surfaced error becomes this step's outcome; a following
                         // step overwrites it (the run's outcome is the last
-                        // step's, exactly as Adapter#1 projects it). `terminal`
+                        // step's, exactly as the golden projects it). `terminal`
                         // stays `Ready` — the connection is not torn down.
                         outcome = Err(match cap.fail.take() {
                             Some(server) => server,
@@ -1175,7 +1179,7 @@ fn flatten_verb(
     }
 }
 
-/// Canonical PG name for a parsed encoding. Mirrors Adapter#1's mapping; the
+/// Canonical PG name for a parsed encoding. Mirrors the golden's mapping; the
 /// non-exhaustive wildcard yields a stable placeholder (never a silent drop).
 fn encoding_name(enc: &Encoding) -> String {
     match enc {

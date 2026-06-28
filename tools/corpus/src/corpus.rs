@@ -2,17 +2,18 @@
 //! covering the engine's request flows. Adding a fixture is adding a value to
 //! [`seed`]; no adapter code changes for the data-driven request kinds.
 //!
-//! Each transcript's `expect` is the observable result PINNED from the current
-//! engine: captured by replaying through [`crate::SansIoAdapter`] and recording
-//! exactly what it produced (the `capture` dev test prints these), never
-//! assumed. The corpus test asserts both `adapter.run(t) == t.expect` (the pin,
-//! which a future engine must also satisfy) and `sync.run(t) == async.run(t)`
-//! (the cross-twin equivalence that generalises to that future engine).
+//! Each transcript's `expect` is the observable result PINNED from the real
+//! engine: captured by replaying through the engine and recording exactly what
+//! it produced, never assumed. The regression asserts `adapter.run(t) ==
+//! t.expect` (the pin, which any engine under test must satisfy) and replays
+//! each fixture under several transport chunk schedules (the
+//! fragmentation-invariance that generalises across engines).
 //!
 //! The client-wire bytes in `expect` are committed verbatim so a change to the
 //! engine's outbound encoding (statement-name scheme, frame layout) is a loud
-//! pin failure, not a silent drift. Re-bake with the `capture` dev test only as
-//! a reviewed change.
+//! pin failure, not a silent drift. Re-bake only as a reviewed change, reading
+//! the new value off the failing regression's assert diff against the engine
+//! under test.
 
 use crate::frames;
 use crate::observed::{
@@ -102,7 +103,7 @@ fn oversize_command_complete() -> Vec<u8> {
 /// scratch frame. A valid `SELECT 1 AS n` with a trailing line comment padding
 /// it well past the cap (~3 KiB) — the outbound bytes must be byte-identical to
 /// the whole-frame builder's output. There was previously NO offline test for
-/// large SQL; this is the differential's guard for it.
+/// large SQL; this is the regression's guard for it.
 fn large_simple_sql() -> String {
     let mut sql = String::from("SELECT 1 AS n -- ");
     // 380 * 8 = 3040 bytes of comment → frame body well over the ~2176 cap.
@@ -902,8 +903,8 @@ pub fn seed() -> Vec<Transcript> {
         ],
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ready_ok(
-            // Baked from the real engine via the capture harness: Parse+Sync,
-            // Describe+Sync, Bind+Execute(max_rows=2)+Sync.
+            // Baked from the real engine (recorded as the pinned golden):
+            // Parse+Sync, Describe+Sync, Bind+Execute(max_rows=2)+Sync.
             vec![
                 80, 0, 0, 0, 31, 95, 98, 115, 113, 108, 95, 48, 0, 83, 69, 76, 69, 67, 84, 32, 105,
                 100, 32, 70, 82, 79, 77, 32, 116, 0, 0, 0, 83, 0, 0, 0, 4, 68, 0, 0, 0, 13, 83, 95,
@@ -1047,9 +1048,9 @@ pub fn seed() -> Vec<Transcript> {
         ],
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ready_ok(
-            // Baked from the real engine via the capture harness: Parse+Sync,
-            // Describe+Sync, Bind+Execute(max_rows=2)+Sync, Describe(P)+Sync,
-            // Execute(All)+Sync.
+            // Baked from the real engine (recorded as the pinned golden):
+            // Parse+Sync, Describe+Sync, Bind+Execute(max_rows=2)+Sync,
+            // Describe(P)+Sync, Execute(All)+Sync.
             vec![
                 80, 0, 0, 0, 31, 95, 98, 115, 113, 108, 95, 48, 0, 83, 69, 76, 69, 67, 84, 32, 105,
                 100, 32, 70, 82, 79, 77, 32, 116, 0, 0, 0, 83, 0, 0, 0, 4, 68, 0, 0, 0, 13, 83, 95,
@@ -1087,7 +1088,7 @@ pub fn seed() -> Vec<Transcript> {
             ]),
         )],
         chunk_schedule: ChunkSchedule::OneBytePerRead,
-        // Baked from the real engine via the capture harness (twins agree): the
+        // Baked from the real engine (recorded as the pinned golden): the
         // oversize tag parses + truncates to the 32-byte `…`-marked tag, the
         // command boundary transitions, and the trailing RFQ recovers to Ready.
         expect: ready_ok(
@@ -1098,7 +1099,7 @@ pub fn seed() -> Vec<Transcript> {
 
     // ── 32. large simple-query SQL (> the bounded outbound frame builder) ──
     // The SQL body exceeds the ~2176-byte scratch-frame cap, so the engine must
-    // stream it onto the growable send buffer; the differential pins the
+    // stream it onto the growable send buffer; the regression pins the
     // outbound Q frame byte-for-byte, proving large SQL streams identically.
     out.push(Transcript {
         name: "large_simple_query_sql",
@@ -1164,10 +1165,10 @@ pub fn seed() -> Vec<Transcript> {
     // ── 34b. recovery-WINDOW frames: notice + param-status BETWEEN the error
     // and the recovering RFQ must still surface ──
     // The error step's reply interleaves a NoticeResponse + ParameterStatus AFTER
-    // the ErrorResponse but BEFORE the recovering ReadyForQuery. Both engines must
+    // the ErrorResponse but BEFORE the recovering ReadyForQuery. The engine must
     // surface them on the recovered run. TEETH: the new engine's verb path drains
-    // the recovery window with the CALLER's sink (not a noop), so a verb twin that
-    // dropped these would diverge from A1 (which captures them during its drain).
+    // the recovery window with the CALLER's sink (not a noop), so a verb path that
+    // dropped these would diverge from the pinned golden.
     // This is the wire-legal recovery-window interleaving the async cutover's
     // notice/GUC-tracking sink would otherwise miss.
     out.push(Transcript {
@@ -1219,12 +1220,12 @@ pub fn seed() -> Vec<Transcript> {
     // ── 34. error → recover → success on the SAME connection (observable) ──
     // A query that server-errors, THEN a follow-up query that succeeds on the
     // same connection — the model-agnostic observable that the connection
-    // recovered. Both engines run BOTH steps (the run's outcome is the last
+    // recovered. The engine runs BOTH steps (the run's outcome is the last
     // step's success; reaching it requires threading the recovered token past
     // the error), so a regression that consumed the token on a recoverable error
-    // would fail to reach step 2 and diverge. The Adapter#2 verb twin now drives
-    // this through the real recovery (Ok(ServerErrored) → continue), so the
-    // differential covers the recover path the old `recover`-verb hole hid.
+    // would fail to reach step 2 and diverge. The verb surface drives this
+    // through the real recovery (Ok(ServerErrored) → continue), so the
+    // regression covers the recover path the old `recover`-verb hole hid.
     out.push(Transcript {
         name: "error_then_success_same_connection",
         setup: Setup::ActiveViaTrustHandshake,

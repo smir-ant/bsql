@@ -12,11 +12,12 @@ use crate::transcript::Transcript;
 
 /// Replay a transcript against one engine and report the observable result.
 ///
-/// The single entry point of the differential-replay oracle. For the current
-/// engine the implementor is [`crate::SansIoAdapter`]; a future rebuilt engine
-/// supplies its own implementor. The corpus asserts both
-/// `adapter.run(t) == t.expect` (pin) and, across two adapters,
-/// `a.run(t) == b.run(t)` (equivalence).
+/// The single entry point of the replay oracle. The implementor over the
+/// engine under test lives in the test crates (`src/engine_adapter.rs`,
+/// compiled in via `#[path]`); a future rebuilt engine supplies its own. The
+/// corpus asserts `adapter.run(t) == t.expect` (the pinned golden); across two
+/// adapters, `a.run(t) == b.run(t)` proves two engines agree (the differential
+/// that gated the engine cutover).
 pub trait Adapter {
     /// Replay `transcript` and return the observable outcome.
     fn run(&self, transcript: &Transcript) -> ObservedRun;

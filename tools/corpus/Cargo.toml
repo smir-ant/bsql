@@ -4,7 +4,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
-description = "Dev-only differential-replay corpus: a Rust-native typed corpus of PostgreSQL wire transcripts replayed through an observable-I/O Adapter seam. Proves behavioural equivalence of the engine across a rebuild: the SAME corpus stays green on the current sans-IO engine and on any future re-implementation, because the Adapter/ObservedRun types name ONLY observable values (client wire bytes + public outcomes), never an internal engine type."
+description = "Dev-only replay corpus: a Rust-native typed corpus of PostgreSQL wire transcripts replayed through an observable-I/O Adapter seam. Pins engine behaviour against committed ObservedRun goldens — the same corpus pins one engine now and any future re-implementation later, because the Adapter/ObservedRun types name ONLY observable values (client wire bytes + public outcomes), never an internal engine type."
 
 # Never published. This crate is a verification harness, not a shipped
 # artifact: it depends on the engine ONLY through public surface and the
@@ -16,26 +16,16 @@ description = "Dev-only differential-replay corpus: a Rust-native typed corpus o
 publish = false
 
 [dependencies]
-# Drive the public sans-IO `Session` pump (new / feed / iter_rows /
-# connection_status) and the public `Handshake` connect flow. No internal
-# engine type crosses the Adapter seam — only `Session`'s public methods.
-bsql-postgres-core = { path = "../../crates/postgres/core" }
 # Build client request frames + server reply frames from the public wire
 # vocabulary (`wire::TAG_*`, `parse_header`) and the public `prepared!`
-# macro / `PreparedQuery` for the binary-param path.
+# macro / `PreparedQuery` for the binary-param path. The engine adapter
+# (test-side, `#[path]`-included) also drives the public sans-IO
+# `engine::{ConnectingEngine, ActiveEngine}` + verb surface via `poll_once`
+# over a synchronous scripted `Transport` — no async runtime is needed.
 bsql-postgres-proto = { path = "../../crates/postgres/proto" }
-# The async twin runs the same `Session` under a current-thread runtime
-# via `block_on` over a scripted `AsyncRead` / `AsyncWrite`, so the corpus
-# test body stays synchronous while genuinely exercising the async path.
-# `rt` = the current-thread `Runtime`; `io-util` = `Async{Read,Write}Ext`
-# + `ReadBuf`. NO `net` / `time` — the scripted duplex is fully in-memory
-# and never touches the I/O driver or timers. Already a workspace
-# dependency; this member adds NO new external crate to `Cargo.lock`.
-tokio = { workspace = true, features = ["rt", "io-util"] }
 
 # Inherit the workspace FORBID floor (the two-tier lint wall). This dev
-# crate needs no `unsafe` (the scripted `AsyncRead`/`AsyncWrite` use the
-# safe `ReadBuf::put_slice` API), so it keeps `#![forbid(unsafe_code)]` at
+# crate needs no `unsafe`, so it keeps `#![forbid(unsafe_code)]` at
 # its own root like every shipped crate. The fixture-builder helpers
 # panic on malformed synthetic input (the sanctioned loud-fail signal,
 # not a production fallback); each carries a scoped reasoned allow.

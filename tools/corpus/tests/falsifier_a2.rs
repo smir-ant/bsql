@@ -1,28 +1,26 @@
-//! ADAPTER#2 FALSIFIER — strength measurement for the NEW engine's observations.
+//! ENGINE FALSIFIER — strength measurement for the engine's observations.
 //!
-//! The A1 falsifier (`falsifier.rs`) proves the corpus is a strong oracle for the
-//! LIVE engine: it injects each modeled defect into the observed run and confirms
-//! the corpus would go red. This test re-runs the SAME battery against the NEW
-//! strangler engine's observations, so the rebuilt engine's discriminating power
-//! is measured directly — never inherited from the old engine by faith.
+//! It injects each modeled defect into the engine's observed run and confirms
+//! the regression would go red, so the engine's discriminating power is measured
+//! directly against the modeled defect set rather than asserted by faith.
 //!
-//! Method, per Adapter#2 surface (`pull` / `verb` / `handshake`), over the subset
+//! Method, per engine surface (`pull` / `verb` / `handshake`), over the subset
 //! that surface drives (the single source of truth in [`falsify`], shared with
-//! the differentials so the partition cannot drift):
+//! the surface tests so the partition cannot drift):
 //!
-//! 1. Establish the baseline by running the REAL new engine and asserting its
-//!    projected observation EQUALS the pin — re-proving the differential through
-//!    the engine, so the catch counts are tied to the actual engine, not to the
-//!    `expect` literals.
+//! 1. Establish the baseline by running the REAL engine and asserting its
+//!    projected observation EQUALS the pin — re-proving the per-fixture
+//!    regression through the engine, so the catch counts are tied to the actual
+//!    engine, not to the `expect` literals.
 //! 2. For each mutation, mark it CAUGHT for that surface if the mutated baseline
 //!    diverges from the pin on >=1 fixture (the surface's observation is
 //!    discriminating enough to notice the defect). A mutation that is a no-op on
 //!    every in-subset fixture is MISSED by that surface.
-//! 3. The A2 oracle is the UNION across surfaces: a defect a real new-engine bug
-//!    would introduce is caught iff SOME Adapter#2 surface catches it.
+//! 3. The engine oracle is the UNION across surfaces: a defect a real engine bug
+//!    would introduce is caught iff SOME surface catches it.
 //!
 //! The `pull` surface uses the response projection ([`falsify::response_view`]) —
-//! it emits no request frames, exactly as the pull differential compares — so the
+//! it emits no request frames, exactly as the pull regression compares — so the
 //! outbound-wire mutations are structurally outside its observable (the verb /
 //! handshake surfaces, which DO carry client bytes, catch those).
 
@@ -50,12 +48,13 @@ fn full_view(run: &ObservedRun) -> ObservedRun {
     run.clone()
 }
 
-/// Per-mutation CAUGHT mask for one Adapter#2 surface.
+/// Per-mutation CAUGHT mask for one engine surface.
 ///
 /// First asserts, per fixture, that the surface's REAL projected observation
-/// equals the pin (the differential, re-proven through the engine — the teeth
-/// that ties the catch counts to actual engine behaviour). Then a mutation is
-/// CAUGHT iff the mutated baseline diverges from the pin on >=1 in-subset fixture.
+/// equals the pin (the per-fixture regression, re-proven through the engine —
+/// the teeth that ties the catch counts to actual engine behaviour). Then a
+/// mutation is CAUGHT iff the mutated baseline diverges from the pin on >=1
+/// in-subset fixture.
 fn surface_catch(
     label: &str,
     subset: &[Transcript],
@@ -74,7 +73,7 @@ fn surface_catch(
             project(&observed),
             project(&t.expect),
             "{label}: the new engine's observation diverges from the pin on `{}` \
-             (the differential must hold before the falsifier is meaningful)",
+             (the regression must hold before the falsifier is meaningful)",
             t.name,
         );
         baselines.push(observed);
@@ -107,7 +106,7 @@ fn a2_falsifier_catch_rate() {
     let handshake_subset = handshake_only_corpus();
 
     // The pull surface emits no request frames, so it observes the RESPONSE
-    // projection (matching the pull differential). The verb / handshake surfaces
+    // projection (matching the pull regression). The verb / handshake surfaces
     // put client bytes on the wire, so they observe the full observable.
     let pull = surface_catch(
         "pull",
@@ -125,13 +124,13 @@ fn a2_falsifier_catch_rate() {
         &muts,
     );
 
-    // The A2 oracle: a defect is caught iff SOME surface catches it.
+    // The engine oracle: a defect is caught iff SOME surface catches it.
     let union: Vec<bool> = (0..total)
         .map(|i| pull[i] || verb[i] || handshake[i])
         .collect();
 
     // ── report ──
-    println!("\n=== ADAPTER#2 FALSIFIER (new engine discriminating power) ===");
+    println!("\n=== ENGINE FALSIFIER (engine discriminating power) ===");
     println!(
         "subsets: pull {} fixtures, verb {} fixtures, handshake {} fixtures (of {} total)",
         pull_subset.len(),
@@ -178,7 +177,7 @@ fn a2_falsifier_catch_rate() {
         pct(hs_caught)
     );
     println!(
-        "A2 UNION CAUGHT {union_caught}/{total} = {:.1}%",
+        "ENGINE UNION CAUGHT {union_caught}/{total} = {:.1}%",
         pct(union_caught)
     );
 
@@ -188,31 +187,31 @@ fn a2_falsifier_catch_rate() {
         .filter(|(_, c)| !**c)
         .map(|(m, _)| m.name)
         .collect();
-    println!("A2 union NOT caught: {uncaught:?}\n");
+    println!("engine union NOT caught: {uncaught:?}\n");
 
-    // 1. The A2 oracle now catches EVERY modeled defect — the previous
+    // 1. The engine oracle now catches EVERY modeled defect — the previous
     //    `closed_to_ready` blind spot is closed. That mutation flips a `Closed`
-    //    terminal; the `terminate` verb landed, so the verb twin drives a real
+    //    terminal; the `terminate` verb landed, so the verb surface drives a real
     //    graceful close (the `Terminate` frame on the wire → the engine's closed
-    //    phase → the `Closed` terminal observable) and the pull twin reproduces
+    //    phase → the `Closed` terminal observable) and the pull surface reproduces
     //    the same response-side `Closed`, so flipping it to `Ready` now diverges.
     //    There is no longer any structural terminate gap.
     assert_eq!(
         uncaught,
         Vec::<&str>::new(),
-        "the A2 oracle's blind spots changed; investigate before relaxing \
+        "the engine oracle's blind spots changed; investigate before relaxing \
          (a NEW miss is a real engine discrimination gap, not a test to weaken)",
     );
 
-    // 2. 100% — the A2 union now catches every modeled defect, matching A1's
-    //    catch rate. The ≥92% floor below is kept as a redundant lower bound.
+    // 2. 100% — the engine union now catches every modeled defect. The ≥92%
+    //    floor below is kept as a redundant lower bound.
     assert!(
         union_caught.saturating_mul(100) >= total.saturating_mul(92),
-        "A2 union catch rate {union_caught}/{total} below the 92% floor",
+        "engine union catch rate {union_caught}/{total} below the 92% floor",
     );
     assert_eq!(
         union_caught, total,
-        "expected the A2 union to catch every modeled defect (no structural gap remains)",
+        "expected the engine union to catch every modeled defect (no structural gap remains)",
     );
 
     // 2b. Every previously-MISSED blind-spot class the corpus was widened to catch
@@ -226,7 +225,7 @@ fn a2_falsifier_catch_rate() {
         .collect();
     assert!(
         blind_uncaught.is_empty(),
-        "the A2 oracle misses widened blind-spot classes: {blind_uncaught:?}",
+        "the engine oracle misses widened blind-spot classes: {blind_uncaught:?}",
     );
 
     // 3. Teeth: the framework genuinely distinguishes CAUGHT from MISSED — the
@@ -246,7 +245,7 @@ fn a2_falsifier_catch_rate() {
          distinguishing caught from missed",
     );
     // And those same mutations ARE caught by the union (via verb / handshake),
-    // so the miss is a per-surface projection boundary, never an A2 oracle gap.
+    // so the miss is a per-surface projection boundary, never an engine oracle gap.
     for name in ["flip_first_client_byte", "drop_last_client_byte", "clear_client_bytes"] {
         let caught_by_union = muts
             .iter()
@@ -254,7 +253,7 @@ fn a2_falsifier_catch_rate() {
             .any(|(m, c)| m.name == name && *c);
         assert!(
             caught_by_union,
-            "client-byte mutation `{name}` must be caught by the A2 union (verb / handshake observe client bytes)",
+            "client-byte mutation `{name}` must be caught by the engine union (verb / handshake observe client bytes)",
         );
     }
 }

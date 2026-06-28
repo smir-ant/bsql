@@ -71,9 +71,7 @@ dependencies = [
 name = "bsql-corpus"
 version = "0.0.0"
 dependencies = [
- "bsql-postgres-core",
  "bsql-postgres-proto",
- "tokio",
 ]
 
 [[package]]
