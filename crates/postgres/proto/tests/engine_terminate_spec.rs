@@ -85,6 +85,9 @@ impl CaptureServer {
 
 impl Transport for CaptureServer {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
 
     fn read<'a>(
         &'a mut self,
@@ -159,6 +162,10 @@ impl FailingServer {
 
 impl Transport for FailingServer {
     type Error = TestIoError;
+    fn is_would_block(_err: &Self::Error) -> bool {
+        // `TestIoError` models a hard transport failure, never a read deadline.
+        false
+    }
 
     fn read<'a>(
         &'a mut self,

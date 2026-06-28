@@ -74,9 +74,14 @@ pub(crate) fn build_simple_query_header(wb: &mut WriteBuf, sql_len: u32) -> Resu
 
 /// `'P'` Parse frame: `tag | len | stmt_name NUL | sql NUL | n_param_types=0`.
 ///
-/// No parameter-type OIDs are declared (`n_param_types = 0`): the server infers
-/// them. This is the runtime prepare path; the compile-checked `prepared!` macro
-/// bakes its own Parse template (with OIDs) consumed verbatim elsewhere.
+/// `#[cfg(test)]` — the byte-twin REFERENCE only. The production prepare path
+/// streams the SQL via [`build_parse_header`] + the send buffer (so a large SQL
+/// never has to fit the bounded [`WriteBuf`]); this whole-frame builder produces
+/// byte-identical output for SQL that fits, so it is kept as the reference the
+/// `protocol.rs` byte-twin pins against (and the in-module twin chains the
+/// streaming assembly to it). No parameter-type OIDs are declared
+/// (`n_param_types = 0`): the server infers them.
+#[cfg(test)]
 #[inline]
 pub(crate) fn build_parse(
     wb: &mut WriteBuf,
@@ -90,6 +95,43 @@ pub(crate) fn build_parse(
         w.push_i16_be(0)
     })
 }
+
+/// `'P'` Parse frame HEADER only: `tag | len | stmt_name NUL`, where `len` is the
+/// self-inclusive `4 + (stmt_name_len + 1) + (sql_len + 1) + 2` (the length
+/// field, the NUL-terminated statement name, the NUL-terminated SQL, and the
+/// `n_param_types = 0` trailer). The SQL body, its NUL, and the 2-byte
+/// zero-param-types trailer ([`PARSE_SQL_TRAILER`]) are queued directly onto the
+/// send buffer by the caller, so a multi-kilobyte prepared SQL never has to fit
+/// the bounded [`WriteBuf`] — the same header-in-scratch / body-on-send-buffer
+/// split the simple-query and `CopyData` paths use. No parameter-type OIDs are
+/// declared (the server infers them); the compile-checked `prepared!` macro bakes
+/// its own Parse template (with OIDs) enqueued verbatim elsewhere. `Err` only if
+/// the computed length overflows `u32`.
+#[inline]
+pub(crate) fn build_parse_header(
+    wb: &mut WriteBuf,
+    stmt_name: &[u8],
+    sql_len: u32,
+) -> Result<(), WriteBufFull> {
+    wb.push_u8(TAG_PARSE.byte())?;
+    let stmt_len = u32::try_from(stmt_name.len()).map_err(|_| WriteBufFull)?;
+    // Self-inclusive length: 4 (len field) + stmt_name + NUL + sql + NUL +
+    // n_param_types(2). Checked throughout (the forbid wall bars wrapping add).
+    let len = 4u32
+        .checked_add(stmt_len)
+        .and_then(|v| v.checked_add(1))
+        .and_then(|v| v.checked_add(sql_len))
+        .and_then(|v| v.checked_add(1))
+        .and_then(|v| v.checked_add(2))
+        .ok_or(WriteBufFull)?;
+    wb.push_u32_be(len)?;
+    wb.push_nul_terminated(stmt_name)
+}
+
+/// The trailing bytes the streaming Parse path queues after the SQL body: the
+/// SQL's NUL terminator + `n_param_types = 0` (i16 BE) — completing the frame the
+/// [`build_parse_header`] header opened.
+pub(super) const PARSE_SQL_TRAILER: [u8; 3] = [0, 0, 0];
 
 /// `'D'` Describe-statement frame: `tag | len | 'S' | stmt_name NUL`.
 #[inline]
@@ -233,4 +275,66 @@ pub(crate) fn build_copy_data_header(
     wb.push_u8(crate::wire::TAG_COPY_DATA.byte())?;
     let len = body_len.checked_add(4).ok_or(WriteBufFull)?;
     wb.push_u32_be(len)
+}
+
+#[cfg(test)]
+mod parse_stream_twin {
+    //! Byte-twin for the streaming Parse assembly: the production prepare path
+    //! emits `build_parse_header(stmt, sql_len)` (into scratch) ++ `sql` ++
+    //! [`PARSE_SQL_TRAILER`] onto the send buffer. This proves that assembly is
+    //! byte-identical to the whole-frame [`build_parse`] (which the `protocol.rs`
+    //! byte-twin in turn pins to the proven `build_parse_message_cfgtest`), so the
+    //! streaming path is transitively byte-correct — AND that a multi-kilobyte SQL
+    //! that would overflow the bounded `WriteBuf` builds without `WriteBufFull`.
+
+    use super::{build_parse, build_parse_header, PARSE_SQL_TRAILER};
+    use crate::write_buf::WriteBuf;
+    use alloc::string::ToString;
+    use alloc::vec::Vec;
+
+    /// Assemble the streaming Parse path into a flat byte vector.
+    fn streamed(stmt: &[u8], sql: &[u8]) -> Vec<u8> {
+        let sql_len = u32::try_from(sql.len()).expect("sql fits u32");
+        let mut header = WriteBuf::new();
+        build_parse_header(&mut header, stmt, sql_len).expect("header fits scratch");
+        let mut out = Vec::new();
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(sql);
+        out.extend_from_slice(&PARSE_SQL_TRAILER);
+        out
+    }
+
+    /// Assemble the whole-frame reference into a flat byte vector.
+    fn whole(stmt: &[u8], sql: &[u8]) -> Vec<u8> {
+        let mut wb = WriteBuf::new();
+        build_parse(&mut wb, stmt, sql).expect("whole frame fits scratch");
+        wb.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn streamed_parse_matches_whole_frame_for_small_sql() {
+        let stmt = b"_bsql_0";
+        let sql = b"SELECT id, name FROM demo WHERE id = $1";
+        let s = streamed(stmt, sql);
+        let w = whole(stmt, sql);
+        assert_eq!(s.first().copied(), Some(b'P'), "non-vacuous: 'P' frame");
+        assert_eq!(s, w, "streamed Parse must equal the whole-frame reference");
+    }
+
+    #[test]
+    fn streamed_parse_builds_large_sql_without_overflow() {
+        // A multi-kilobyte SQL: the whole-frame builder would overflow the bounded
+        // WriteBuf, but the streaming header is tiny (tag + len + stmt NUL) and
+        // the SQL rides the send buffer, so the header builds with no WriteBufFull.
+        let stmt = b"_bsql_big";
+        let sql = "SELECT 1 -- ".to_string() + &"x".repeat(3000);
+        let s = streamed(stmt, sql.as_bytes());
+        // Framing is correct: 'P' tag, and the self-inclusive length matches the
+        // emitted byte count (len field counts itself + everything after the tag).
+        assert_eq!(s.first().copied(), Some(b'P'));
+        let len_bytes: [u8; 4] = s.get(1..5).expect("len field").try_into().expect("4 bytes");
+        let declared = u32::from_be_bytes(len_bytes);
+        let actual = u32::try_from(s.len().checked_sub(1).expect("tag")).expect("fits u32");
+        assert_eq!(declared, actual, "self-inclusive Parse length must match the body");
+    }
 }

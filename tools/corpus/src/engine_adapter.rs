@@ -17,8 +17,8 @@
 use std::sync::{Arc, Mutex};
 
 use bsql_postgres_proto::engine::{
-    poll_once, session, ActiveEngine, AuthEvent, ConnectingEngine, Engine, EngineError, Event, Live,
-    NoObserver, SendBuf, Surface,
+    poll_once, session, ActiveEngine, AuthEvent, CommandStatus, ConnectingEngine, Engine,
+    EngineError, Event, Live, NoObserver, Outcome, SendBuf, Surface,
 };
 use bsql_postgres_proto::{
     prepared, Credentials, Encoding, Ident, PreparedQuery, SessionParams, TxStatus,
@@ -982,18 +982,38 @@ fn run_verb_body<'b>(
             &mut notices,
             &mut notifications,
         ) {
-            Ok(next) => {
+            Ok(Outcome { live: next, status }) => {
+                // Either status returns the token — the connection is alive.
                 live = next;
-                // A bare-`Sync` ping reaches its boundary with no command-complete,
-                // so no result set was delivered; synthesise the degenerate result
-                // set Adapter#1 produces for a `ReadyForQuery` with no statement.
-                if cap.result_sets.is_empty() {
-                    cap.result_sets.push(ObservedResultSet::default());
+                match status {
+                    CommandStatus::Completed => {
+                        // A bare-`Sync` ping reaches its boundary with no
+                        // command-complete, so no result set was delivered;
+                        // synthesise the degenerate result set Adapter#1 produces
+                        // for a `ReadyForQuery` with no statement.
+                        if cap.result_sets.is_empty() {
+                            cap.result_sets.push(ObservedResultSet::default());
+                        }
+                        outcome = Ok(ObservedOk {
+                            result_sets: cap.result_sets,
+                            copy_out: cap.copy_out,
+                        });
+                    }
+                    CommandStatus::ServerErrored => {
+                        // A RECOVERABLE server error: the verb drained the
+                        // recovering RFQ and handed the token back, so the
+                        // connection survives and the run CONTINUES to the next
+                        // step (the recovery the differential must cover). The
+                        // surfaced error becomes this step's outcome; a following
+                        // step overwrites it (the run's outcome is the last
+                        // step's, exactly as Adapter#1 projects it). `terminal`
+                        // stays `Ready` — the connection is not torn down.
+                        outcome = Err(match cap.fail.take() {
+                            Some(server) => server,
+                            None => ObservedErr::Protocol(ProtocolFailureKind::Unclassified),
+                        });
+                    }
                 }
-                outcome = Ok(ObservedOk {
-                    result_sets: cap.result_sets,
-                    copy_out: cap.copy_out,
-                });
             }
             Err(engine_err) => {
                 let (err, end) = classify_verb_error(engine_err, cap.fail.take());
@@ -1001,7 +1021,7 @@ fn run_verb_body<'b>(
                 if let Some(end) = end {
                     terminal = end;
                 }
-                // The error consumed the linear token; no further steps run.
+                // A FATAL error consumed the linear token; no further steps run.
                 break;
             }
         }
@@ -1039,7 +1059,7 @@ fn drive_verb_step<'b>(
     params: &mut SessionParams,
     notices: &mut Vec<ObservedNotice>,
     notifications: &mut Vec<ObservedNotify>,
-) -> Result<Live<'b>, EngineError<Infallible>> {
+) -> Result<Outcome<'b, CommandStatus>, EngineError<Infallible>> {
     let sink = |surface: Surface<'_>| {
         fold_surface(surface, cap, params, notices, notifications);
         ControlFlow::Continue(())
@@ -1051,8 +1071,12 @@ fn drive_verb_step<'b>(
             flatten_verb(poll_once(engine.query_params(live, &Q_DEMO_VERB, (*id,), sink)))
         }
         // `run_verb` filters to the three kinds above; the rest are unreachable
-        // here. Return the token untouched rather than fabricate an error.
-        _ => Ok(live),
+        // here. Return the token untouched (a clean completion) rather than
+        // fabricate an error.
+        _ => Ok(Outcome {
+            live,
+            status: CommandStatus::Completed,
+        }),
     }
 }
 
@@ -1106,27 +1130,30 @@ fn fold_surface(
     }
 }
 
-/// Map a verb error to the observable outcome + (optional) terminal override. A
-/// server error is recoverable (terminal stays `Ready`, the surfaced raw error
-/// drives the outcome); a protocol violation tears the connection down.
+/// Map a FATAL verb error to the observable outcome + terminal override. A
+/// recoverable server error no longer reaches here — the verb returns it as
+/// `Ok(Outcome { status: ServerErrored })`, handled by the caller (the run
+/// continues). Every `Err` from a verb now means the connection was torn down,
+/// so it sets the `Errored` terminal; a server-error cause surfaced on the sink
+/// before the teardown is preferred over the generic protocol-failure marker.
 fn classify_verb_error(
     err: EngineError<Infallible>,
     captured_fail: Option<ObservedErr>,
 ) -> (ObservedErr, Option<ObservedStatus>) {
     match err {
+        // A `ServerError` here is the rare drain-during-recovery teardown (a
+        // SECOND error while consuming the recovering RFQ), not the common
+        // recoverable error (which returns `Ok(ServerErrored)`); a server cause
+        // surfaced before the teardown is preferred over the generic marker.
         EngineError::ServerError => {
             let out = match captured_fail {
                 Some(server) => server,
                 None => ObservedErr::Protocol(ProtocolFailureKind::Unclassified),
             };
-            (out, None)
+            (out, Some(ObservedStatus::Errored(TerminalErrorKind::Protocol)))
         }
-        EngineError::ProtocolViolation => (
-            ObservedErr::Protocol(ProtocolFailureKind::Unclassified),
-            Some(ObservedStatus::Errored(TerminalErrorKind::Protocol)),
-        ),
-        // Transport / framing / phase / row-count errors: a non-recoverable
-        // failure of the command. Classified, never silently dropped.
+        // Protocol teardown / framing / phase / row-count / spurious-pending: a
+        // non-recoverable command failure. Classified, never silently dropped.
         _ => (
             ObservedErr::Protocol(ProtocolFailureKind::Unclassified),
             Some(ObservedStatus::Errored(TerminalErrorKind::Protocol)),
@@ -1137,8 +1164,11 @@ fn classify_verb_error(
 /// Flatten a single-poll verb result; a `Pending` from an always-ready transport
 /// is a broken harness, surfaced as a protocol failure (never spun on).
 fn flatten_verb(
-    polled: Result<Result<Live<'_>, EngineError<Infallible>>, bsql_postgres_proto::engine::SpuriousPending>,
-) -> Result<Live<'_>, EngineError<Infallible>> {
+    polled: Result<
+        Result<Outcome<'_, CommandStatus>, EngineError<Infallible>>,
+        bsql_postgres_proto::engine::SpuriousPending,
+    >,
+) -> Result<Outcome<'_, CommandStatus>, EngineError<Infallible>> {
     match polled {
         Ok(inner) => inner,
         Err(_) => Err(EngineError::SpuriousPending),

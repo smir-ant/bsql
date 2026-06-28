@@ -291,6 +291,10 @@ fn active_pull_corpus_is_representative() {
         "portal_suspend_row_limited",   // row-limited Execute → PortalSuspended
         "portal_resume_after_suspend",  // Describe(PORTAL) + bare-Execute resume
         "oversize_command_complete",    // Sub-B oversize CommandComplete (tag from prefix)
+        "large_simple_query_sql",       // SQL > the bounded outbound frame builder
+        "oversize_wide_row_description", // Sub-C oversize RowDescription accumulate (chunked)
+        "error_then_success_same_connection", // recover: error then success, same connection
+        "recovery_window_notice_and_param", // notice + param in the recovery window surface
     ] {
         assert!(
             corpus.iter().any(|t| t.name == required),
@@ -383,8 +387,12 @@ fn verb_client_byte_corpus_is_representative() {
         "terminate",                     // graceful close (Terminate frame → Closed)
         "multi_statement_delineated",    // per-statement delineation
         "copy_out",                      // COPY OUT
-        "server_error_recovers",         // recoverable server error
+        "server_error_recovers",         // recoverable server error (single step)
         "adversarial_second_row_description", // protocol teardown
+        "large_simple_query_sql",        // SQL > the bounded outbound frame builder
+        "oversize_wide_row_description", // Sub-C oversize RowDescription accumulate (chunked)
+        "error_then_success_same_connection", // recover exercised via the real verb surface
+        "recovery_window_notice_and_param", // recovery-window notice + param surface via verb drain
     ] {
         assert!(
             corpus.iter().any(|t| t.name == required),

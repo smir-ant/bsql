@@ -6,9 +6,12 @@
 //! [`Connection`] owns an `Engine` over a `Wire<SyncSocket>` and drives each
 //! verb with the engine's single-poll executor over the blocking socket. The
 //! linear `Live` token the engine threads is held as the connection's health
-//! bit (`Some` = reusable, `None` = dead); a recoverable server error reclaims
-//! it via the engine's `recover` verb, so a query-level error never kills the
-//! connection.
+//! bit (`Some` = reusable, `None` = dead). The engine's tier-1 error model
+//! returns the token inside `Ok(Outcome { live, status })` whenever the
+//! connection is alive — including on a recoverable server error (reported as
+//! `CommandStatus::ServerErrored`, the connection already drained to a clean
+//! idle) — so a query-level error never kills the connection and there is no
+//! separate token-reclaim step.
 //!
 //! # Footprint regime
 //!

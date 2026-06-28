@@ -364,6 +364,18 @@ where
                 return Ok(HandshakeOutcome::Failed(reason));
             }
             HandshakeProgress::AuthResponse => flush(send_buf, transport).await?,
+            // The startup `ParameterStatus` GUCs (server_version, client_encoding,
+            // integer_datetimes, …) are currently dropped on the connect path:
+            // `next_handshake_step` discards the payload. The sync driver
+            // recovers `server_version` with a one-round-trip `SHOW` as the
+            // interim. SURFACING them for free (accumulate into a `SessionParams`
+            // the `ConnectingEngine` carries across `into_active`, exposed via an
+            // `Engine` accessor, dropping the `SHOW` RTT) is a deferred
+            // optimization: it threads a new field through the handshake dispatch
+            // and the `from_handshake` signature, which is out of scope for the
+            // error-model cutover. The corpus's `next_auth_event` path already
+            // captures these (`AuthEvent::ParamStatus`), so the surfacing work is
+            // a connect-path mirror of an existing parse.
             HandshakeProgress::ParamStatus => {}
             HandshakeProgress::NeedMore => {
                 // A response built during a silent intermediate (the SASL
@@ -474,6 +486,9 @@ mod hook_tests {
 
     impl Transport for ScriptReader {
         type Error = Infallible;
+        fn is_would_block(err: &Self::Error) -> bool {
+            match *err {}
+        }
         fn read<'a>(
             &'a mut self,
             buf: &'a mut [u8],

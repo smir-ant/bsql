@@ -102,6 +102,9 @@ struct ReadyTransport {
 
 impl Transport for ReadyTransport {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
     fn read<'a>(
         &'a mut self,
         buf: &'a mut [u8],
@@ -132,6 +135,9 @@ struct BlockingReadTransport;
 
 impl Transport for BlockingReadTransport {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
     fn read<'a>(
         &'a mut self,
         _buf: &'a mut [u8],

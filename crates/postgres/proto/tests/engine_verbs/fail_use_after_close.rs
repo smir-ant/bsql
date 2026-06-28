@@ -13,6 +13,9 @@ struct T0;
 
 impl Transport for T0 {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
     fn read<'a>(
         &'a mut self,
         _buf: &'a mut [u8],
@@ -59,7 +62,7 @@ fn main() {
         let live = block_on(e.connect(live)).unwrap();
         let stmt = PreparedStatement::new(StmtName::try_from_str("s").unwrap(), Vec::new());
         // First close consumes the statement:
-        let live = block_on(e.close_statement(live, stmt, sink)).unwrap();
+        let live = block_on(e.close_statement(live, stmt, sink)).unwrap().live;
         // Reuse the CLOSED (moved) statement — use of moved value:
         let _ = block_on(e.close_statement(live, stmt, sink));
     });

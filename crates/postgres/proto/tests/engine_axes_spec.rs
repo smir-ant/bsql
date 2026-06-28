@@ -411,7 +411,7 @@ const SECTION7: &[Row] = &[
 const SECTION7_AXES: usize = 12;
 /// `crate::wire_pin!(` footprint-pin invocations across `engine/`.
 /// Reproduce: `grep -rho 'crate::wire_pin!(' crates/postgres/proto/src/engine/*.rs | wc -l`
-const WIRE_PINS: usize = 24;
+const WIRE_PINS: usize = 28;
 /// Variants of `EngineError<E>` (the classified error taxonomy).
 /// Reproduce: count the upper-case-leading lines inside the `pub enum
 /// EngineError<E> { .. }` block in `engine/error.rs`.
@@ -422,7 +422,7 @@ const ENGINE_ERROR_VARIANTS: usize = 14;
 const ACTIVE_VERBS: usize = 16;
 /// `core::hint::cold_path()` classified-branch markers across `engine/`.
 /// Reproduce: `grep -rho 'core::hint::cold_path()' crates/postgres/proto/src/engine/*.rs | wc -l`
-const COLD_CLASSIFIED_BRANCHES: usize = 34;
+const COLD_CLASSIFIED_BRANCHES: usize = 36;
 /// `#[non_exhaustive]` attribute lines across `engine/`.
 /// Reproduce: `grep -rcE '^#\[non_exhaustive\]' crates/postgres/proto/src/engine/*.rs` (summed)
 const NON_EXHAUSTIVE_ATTRS: usize = 4;

@@ -1,11 +1,27 @@
 //! The active-phase verb surface.
 //!
 //! Each verb has the same shape: `&mut self` plus the linear [`Live`] token in,
-//! `Result<Live, EngineError>` out (the error path consumes the token — a failed
-//! command yields no reusable connection). Results are surfaced through a
-//! [`Surface`] sink, not returned: the sans-I/O core is `no_std` and cannot name
-//! a typed `Row`, so it lends RAW wire bytes and the typed layer above
-//! (`query!` decode / `QueryResult`) owns the typing.
+//! `Result<Outcome<St>, EngineError>` out. The token rides the `Ok` arm inside
+//! the [`Outcome`] whenever the connection is ALIVE — both on a clean completion
+//! and on a *recoverable* server error (the verb drains the recovering
+//! `ReadyForQuery` to a clean idle, then reports
+//! [`CommandStatus::ServerErrored`]; the error details already reached the caller
+//! via the sink). `Err(EngineError)` is reserved for a FATAL outcome: the
+//! connection is dead and the token is consumed. This is the tier-1 model —
+//! token returned in `Ok` ⟺ connection alive; token consumed (no return) ⟺
+//! connection dead — and it is why there is NO separate token-minting recovery
+//! verb: a verb returns its one token only inside `Ok`, so the
+//! "exactly one `Live` ⟺ at-most-one-command-in-flight" invariant stays
+//! compile-enforced. Results are surfaced through a [`Surface`] sink, not
+//! returned: the sans-I/O core is `no_std` and cannot name a typed `Row`, so it
+//! lends RAW wire bytes and the typed layer above (`query!` decode /
+//! `QueryResult`) owns the typing.
+//!
+//! [`recv_notification`](Engine::recv_notification) returns an
+//! `Outcome<NotifyStatus>` instead — it has no recoverable-server-error axis (it
+//! issues no command), only whether a notification arrived
+//! ([`Received`](NotifyStatus::Received)) or the wait was quiet/timed-out
+//! ([`Quiet`](NotifyStatus::Quiet)).
 //!
 //! The sole exception to the return shape is [`terminate`](Engine::terminate),
 //! the session-ending verb: it consumes the token and returns
@@ -81,8 +97,8 @@ use core::ops::ControlFlow;
 use super::error::{EngineError, ExpectedRowCount, RowCountViolation};
 use super::frames;
 use super::pump::{poll_once, pump_active_to_boundary, Boundary, SpuriousPending, Surface};
-use super::seams::{absurd, Live, Never, Observer, Transport};
-use super::{Engine, Phase, SendBuf};
+use super::seams::{absurd, CommandStatus, Live, Never, NotifyStatus, Observer, Outcome, Transport};
+use super::{ActiveEngine, Engine, Phase, SendBuf};
 use crate::ident::{Ident, StmtName};
 use crate::params::ParamsWriter;
 use crate::prepared::{PreparedQuery, RowDecode};
@@ -159,16 +175,89 @@ fn enqueue_frame<E>(
     Ok(())
 }
 
-/// Map a *collect-all* pump boundary to the verb's idle result.
+/// Pump a *collect-all* command to its boundary and resolve the
+/// [`CommandStatus`], draining a recoverable server error's owed
+/// `ReadyForQuery` so the linear token can ride back in `Ok`.
+///
+/// - `Boundary::Idle` → [`Completed`](CommandStatus::Completed): the command
+///   completed at a clean idle.
+/// - `Boundary::Failed` → RECOVERABLE: the server sent an `ErrorResponse`
+///   (whose raw bytes the sink already saw) and owes a trailing
+///   `ReadyForQuery`. The verb DRAINS that one frame to a clean idle (the
+///   request was already flushed, so the entry flush is a no-op) and reports
+///   [`ServerErrored`](CommandStatus::ServerErrored) — the connection survives,
+///   so the token rides `Ok`.
+/// - `Boundary::Closed`/`Suspended`, or any non-`Idle` boundary while draining
+///   → FATAL `Err`: the connection is dead and the token is consumed.
 ///
 /// `Boundary` is `#[non_exhaustive]`, but this is a within-crate match, so every
-/// arm is enumerated with no wildcard — a future boundary forces a decision here.
-/// At `B = Never` the [`Stopped`](Boundary::Stopped) value is uninhabited and is
+/// arm is enumerated with no wildcard — a future boundary forces a decision. At
+/// `B = Never` the [`Stopped`](Boundary::Stopped) value is uninhabited and is
 /// discharged by [`absurd`], never a `unreachable!()`.
-#[inline]
-fn classify_idle<E>(boundary: Boundary<Never>) -> Result<(), EngineError<E>> {
+async fn drive_to_outcome<T, O, S>(
+    active: &mut ActiveEngine,
+    transport: &mut T,
+    send_buf: &mut SendBuf,
+    obs: &O,
+    mut sink: S,
+) -> Result<CommandStatus, EngineError<T::Error>>
+where
+    T: Transport,
+    O: Observer,
+    S: FnMut(Surface<'_>) -> ControlFlow<Never>,
+{
+    // Pass the caller's sink by `&mut` so it survives the first pump and can be
+    // reused for the recovery drain below. `&mut S` is itself `FnMut`, so this is
+    // the identical sink type at `B = Never`, not a fresh one.
+    let boundary = pump_active_to_boundary(active, transport, send_buf, obs, &mut sink).await?;
     match boundary {
-        Boundary::Idle => Ok(()),
+        Boundary::Idle => Ok(CommandStatus::Completed),
+        Boundary::Failed => {
+            core::hint::cold_path();
+            // Drain the recovering `ReadyForQuery` the server owes after the
+            // `ErrorResponse`. The prior request was already flushed, so the
+            // pump's entry flush is a no-op and only the trailing frames are read.
+            // Thread the CALLER's sink (not a noop) through the drain: a
+            // wire-legal `NoticeResponse` / `ParameterStatus` / `NotificationResponse`
+            // arriving in the recovery window (after the error, before the RFQ)
+            // must still surface, not be silently dropped. The sink is
+            // `B = Never` (Continue-only), so it cannot `Break` and therefore
+            // cannot change the drain's boundary — the drain still reaches `Idle`
+            // for the `ServerErrored` outcome.
+            let drained =
+                pump_active_to_boundary(active, transport, send_buf, obs, &mut sink).await?;
+            classify_drained(drained)
+        }
+        Boundary::Closed => {
+            core::hint::cold_path();
+            Err(EngineError::ProtocolViolation)
+        }
+        Boundary::Suspended => {
+            core::hint::cold_path();
+            Err(EngineError::UnexpectedSuspend)
+        }
+        Boundary::Stopped(never) => absurd(never),
+    }
+}
+
+/// Classify the boundary reached while DRAINING a recoverable error's owed
+/// `ReadyForQuery`. A clean `Idle` is the recovered
+/// [`ServerErrored`](CommandStatus::ServerErrored) outcome; any other boundary
+/// means the recovery protocol was violated (a second error, a teardown, an
+/// unexpected suspend) and is fatal — the connection is dead, the token is
+/// consumed.
+///
+/// On which arm a malformed "second error during recovery" lands: the active
+/// dispatch tears the connection down on an out-of-phase frame, so a wire-legal
+/// frame the engine deems illegal in the recovering state reaches `Boundary::Closed`
+/// → `ProtocolViolation`; only a genuine second `ErrorResponse` framed by the
+/// server reaches `Boundary::Failed` → `ServerError`. Both are fatal here (the
+/// token is consumed either way), so the arm distinction is descriptive, not a
+/// behavioural fork.
+#[inline]
+fn classify_drained<E>(boundary: Boundary<Never>) -> Result<CommandStatus, EngineError<E>> {
+    match boundary {
+        Boundary::Idle => Ok(CommandStatus::ServerErrored),
         Boundary::Failed => {
             core::hint::cold_path();
             Err(EngineError::ServerError)
@@ -185,13 +274,29 @@ fn classify_idle<E>(boundary: Boundary<Never>) -> Result<(), EngineError<E>> {
     }
 }
 
-/// Flatten a single-poll result into the verb error surface.
+/// Flatten a single-poll [`Outcome`] result into the bare-token error surface
+/// used by the synchronous [`transaction`](Engine::transaction) wrapper: a clean
+/// [`Completed`](CommandStatus::Completed) yields the threaded token; a
+/// [`ServerErrored`](CommandStatus::ServerErrored) is an error to the
+/// transaction (a failed `BEGIN`/`COMMIT`/body aborts it), so it surfaces as
+/// [`EngineError::ServerError`] and the connection is dropped.
 #[inline]
 fn flatten_poll<'b, E>(
-    polled: Result<Result<Live<'b>, EngineError<E>>, SpuriousPending>,
+    polled: Result<Result<Outcome<'b, CommandStatus>, EngineError<E>>, SpuriousPending>,
 ) -> Result<Live<'b>, EngineError<E>> {
     match polled {
-        Ok(inner) => inner,
+        Ok(Ok(Outcome {
+            live,
+            status: CommandStatus::Completed,
+        })) => Ok(live),
+        Ok(Ok(Outcome {
+            status: CommandStatus::ServerErrored,
+            ..
+        })) => {
+            core::hint::cold_path();
+            Err(EngineError::ServerError)
+        }
+        Ok(Err(e)) => Err(e),
         Err(SpuriousPending) => {
             core::hint::cold_path();
             Err(EngineError::SpuriousPending)
@@ -211,7 +316,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         &mut self,
         live: Live<'b>,
         sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
@@ -225,9 +330,8 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
-        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
-        classify_idle(boundary)?;
-        Ok(live)
+        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        Ok(Outcome { live, status })
     }
 
     /// Issue a simple-query (`'Q'`) command. A `;`-separated batch surfaces one
@@ -246,12 +350,12 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         live: Live<'b>,
         sql: &str,
         sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
-        self.run_simple(sql, sink).await?;
-        Ok(live)
+        let status = self.run_simple(sql, sink).await?;
+        Ok(Outcome { live, status })
     }
 
     /// Issue a single row-returning query (`'Q'`). Rows surface as
@@ -267,12 +371,12 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         live: Live<'b>,
         sql: &str,
         sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
-        self.run_simple(sql, sink).await?;
-        Ok(live)
+        let status = self.run_simple(sql, sink).await?;
+        Ok(Outcome { live, status })
     }
 
     /// Issue a query expected to return exactly one row. Identical wire to
@@ -289,26 +393,32 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         live: Live<'b>,
         sql: &str,
         mut sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
         let mut rows = 0usize;
-        self.run_simple(sql, |surface| {
-            if matches!(surface, Surface::Row(_)) {
-                rows = rows.saturating_add(1);
+        let status = self
+            .run_simple(sql, |surface| {
+                if matches!(surface, Surface::Row(_)) {
+                    rows = rows.saturating_add(1);
+                }
+                sink(surface)
+            })
+            .await?;
+        // A server error aborted the command before its rows: the failure (not a
+        // row-count violation) is the outcome, so the guard is skipped. The
+        // row-count contract applies only to a cleanly completed command.
+        match status {
+            CommandStatus::ServerErrored => Ok(Outcome { live, status }),
+            CommandStatus::Completed if rows == 1 => Ok(Outcome { live, status }),
+            CommandStatus::Completed => {
+                core::hint::cold_path();
+                Err(EngineError::RowCount(RowCountViolation {
+                    expected: ExpectedRowCount::ExactlyOne,
+                    got: rows,
+                }))
             }
-            sink(surface)
-        })
-        .await?;
-        if rows == 1 {
-            Ok(live)
-        } else {
-            core::hint::cold_path();
-            Err(EngineError::RowCount(RowCountViolation {
-                expected: ExpectedRowCount::ExactlyOne,
-                got: rows,
-            }))
         }
     }
 
@@ -324,26 +434,30 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         live: Live<'b>,
         sql: &str,
         mut sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
         let mut rows = 0usize;
-        self.run_simple(sql, |surface| {
-            if matches!(surface, Surface::Row(_)) {
-                rows = rows.saturating_add(1);
+        let status = self
+            .run_simple(sql, |surface| {
+                if matches!(surface, Surface::Row(_)) {
+                    rows = rows.saturating_add(1);
+                }
+                sink(surface)
+            })
+            .await?;
+        // A server error aborts the row-count guard (see `query_one`).
+        match status {
+            CommandStatus::ServerErrored => Ok(Outcome { live, status }),
+            CommandStatus::Completed if rows <= 1 => Ok(Outcome { live, status }),
+            CommandStatus::Completed => {
+                core::hint::cold_path();
+                Err(EngineError::RowCount(RowCountViolation {
+                    expected: ExpectedRowCount::AtMostOne,
+                    got: rows,
+                }))
             }
-            sink(surface)
-        })
-        .await?;
-        if rows <= 1 {
-            Ok(live)
-        } else {
-            core::hint::cold_path();
-            Err(EngineError::RowCount(RowCountViolation {
-                expected: ExpectedRowCount::AtMostOne,
-                got: rows,
-            }))
         }
     }
 
@@ -359,16 +473,21 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         live: Live<'b>,
         sql: &str,
         sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
-        self.run_simple(sql, sink).await?;
-        Ok(live)
+        let status = self.run_simple(sql, sink).await?;
+        Ok(Outcome { live, status })
     }
 
-    /// Shared simple-query (`'Q'`) drive: compact, build, pump to a clean idle.
-    async fn run_simple<S>(&mut self, sql: &str, sink: S) -> Result<(), EngineError<T::Error>>
+    /// Shared simple-query (`'Q'`) drive: compact, build, pump to a boundary,
+    /// draining a recoverable error to a clean idle (see [`drive_to_outcome`]).
+    async fn run_simple<S>(
+        &mut self,
+        sql: &str,
+        sink: S,
+    ) -> Result<CommandStatus, EngineError<T::Error>>
     where
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
@@ -396,8 +515,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         enqueue_frame(send_buf, |wb| frames::build_simple_query_header(wb, sql_len))?;
         send_buf.enqueue(sql_bytes);
         send_buf.enqueue(&[0]);
-        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
-        classify_idle(boundary)
+        drive_to_outcome(active, transport, send_buf, &*obs, sink).await
     }
 
     /// Prepare a statement: `Parse` + statement `Describe` + a single `Sync`. The
@@ -419,7 +537,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         stmt_name: &StmtName,
         sql: &str,
         sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
@@ -432,17 +550,30 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
-        enqueue_frame(send_buf, |wb| {
-            frames::build_parse(wb, stmt_name.as_bytes(), sql.as_bytes())
+        // Stream the SQL body onto the (growable) send buffer rather than copying
+        // it into the bounded `WriteBuf`: only the Parse header (tag + length +
+        // statement name) is built into the scratch buffer, so a multi-kilobyte
+        // prepared SQL is not capped at `MAX_OWNED_SEND_LEN`. The flushed bytes —
+        // header, SQL, NUL + zero-param-types trailer — are contiguous and
+        // byte-identical to the whole-frame builder (proven by the parse-stream
+        // byte-twin).
+        let sql_bytes = sql.as_bytes();
+        let sql_len = u32::try_from(sql_bytes.len()).map_err(|_| {
+            core::hint::cold_path();
+            EngineError::FrameTooLong
         })?;
+        enqueue_frame(send_buf, |wb| {
+            frames::build_parse_header(wb, stmt_name.as_bytes(), sql_len)
+        })?;
+        send_buf.enqueue(sql_bytes);
+        send_buf.enqueue(&frames::PARSE_SQL_TRAILER);
         enqueue_frame(send_buf, |wb| {
             frames::build_describe_statement(wb, stmt_name.as_bytes())
         })?;
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
         active.begin_prepare();
-        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
-        classify_idle(boundary)?;
-        Ok(live)
+        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        Ok(Outcome { live, status })
     }
 
     /// Execute a prepared statement returning rows: `Bind` + `Execute` + `Sync`.
@@ -459,13 +590,13 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         stmt: &PreparedStatement,
         params: P,
         sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         P: ParamsWriter,
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
-        self.run_bind_execute(stmt, &params, sink).await?;
-        Ok(live)
+        let status = self.run_bind_execute(stmt, &params, sink).await?;
+        Ok(Outcome { live, status })
     }
 
     /// Execute a prepared statement for its side effect: `Bind` + `Execute` +
@@ -482,13 +613,13 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         stmt: &PreparedStatement,
         params: P,
         sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         P: ParamsWriter,
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
-        self.run_bind_execute(stmt, &params, sink).await?;
-        Ok(live)
+        let status = self.run_bind_execute(stmt, &params, sink).await?;
+        Ok(Outcome { live, status })
     }
 
     /// Shared `Bind` + `Execute` + `Sync` drive over a named prepared statement.
@@ -497,7 +628,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         stmt: &PreparedStatement,
         params: &P,
         sink: S,
-    ) -> Result<(), EngineError<T::Error>>
+    ) -> Result<CommandStatus, EngineError<T::Error>>
     where
         P: ParamsWriter,
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
@@ -518,8 +649,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         enqueue_frame(send_buf, |wb| frames::build_execute(wb, b"", 0))?;
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
         active.begin_bind_execute(stmt.result_oids());
-        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
-        classify_idle(boundary)
+        drive_to_outcome(active, transport, send_buf, &*obs, sink).await
     }
 
     /// Parse, bind, execute and sync a compile-checked query in one round trip:
@@ -541,7 +671,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         q: &PreparedQuery<P, R>,
         args: P,
         sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         P: ParamsWriter,
         R: RowDecode,
@@ -566,9 +696,8 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         send_buf.enqueue(&crate::prepared::EXECUTE_EMPTY_PORTAL_NO_LIMIT);
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
         active.begin_parse_bind_execute(q.row_oids);
-        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
-        classify_idle(boundary)?;
-        Ok(live)
+        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        Ok(Outcome { live, status })
     }
 
     /// Close a prepared statement: `Close` + `Sync`. Consumes the
@@ -583,7 +712,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         live: Live<'b>,
         stmt: PreparedStatement,
         sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
@@ -601,11 +730,10 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         })?;
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
         active.begin_close();
-        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
-        classify_idle(boundary)?;
+        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
         // `stmt` is owned here and dropped at scope end — it cannot be reused by
         // the caller (it was moved in). The borrow above ended before the pump.
-        Ok(live)
+        Ok(Outcome { live, status })
     }
 
     /// `COPY <table> FROM STDIN`: issue the COPY command, stream client
@@ -638,7 +766,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         sql: &str,
         mut data: impl FnMut() -> Option<&'d [u8]>,
         sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
@@ -663,9 +791,8 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
             super::flush::flush(send_buf, transport).await?;
         }
         send_buf.enqueue(&frames::COPY_DONE_WIRE);
-        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
-        classify_idle(boundary)?;
-        Ok(live)
+        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        Ok(Outcome { live, status })
     }
 
     /// Subscribe to a notification channel: `LISTEN <channel>` (`'Q'`). The
@@ -680,7 +807,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         live: Live<'b>,
         channel: &Ident,
         sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
@@ -694,9 +821,8 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
         enqueue_frame(send_buf, |wb| frames::build_listen(wb, channel.as_bytes()))?;
-        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
-        classify_idle(boundary)?;
-        Ok(live)
+        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        Ok(Outcome { live, status })
     }
 
     /// Receive the next asynchronous notification: a single pull that breaks on
@@ -704,16 +830,33 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     /// stays driver-side. The caller's sink stops the pump on a notification
     /// (`B = ()`).
     ///
+    /// Returns an [`Outcome`] (the token rides `Ok`) with a [`NotifyStatus`]:
+    /// [`Received`](NotifyStatus::Received) when the pull stopped on a
+    /// notification (its payload reached the sink), or
+    /// [`Quiet`](NotifyStatus::Quiet) when the pull reached a clean boundary or
+    /// the read TIMED OUT before any notification — a *would-block* read
+    /// deadline. The deadline is detected via
+    /// [`Transport::is_would_block`](super::Transport::is_would_block) (the
+    /// `#![no_std]` core cannot inspect the opaque transport error itself) and is
+    /// NOT a failure: the connection consumed nothing within the deadline, so it
+    /// stays at its prior clean boundary and the token rides back — no separate
+    /// token-minting recovery is needed.
+    ///
     /// # Errors
     ///
-    /// - [`EngineError::ServerError`] / [`EngineError::ProtocolViolation`] —
-    ///   a server error or teardown was observed instead.
-    /// - the pump's transport / framing errors.
+    /// - [`EngineError::ServerError`] — a server `ErrorResponse` arrived while
+    ///   waiting. This is FATAL here (unlike a command verb's recoverable error):
+    ///   `recv_notification` issues no command, so no recovering `ReadyForQuery`
+    ///   is owed to drain — the connection's command/response correlation is
+    ///   broken, so the token is consumed.
+    /// - [`EngineError::ProtocolViolation`] / [`EngineError::UnexpectedSuspend`]
+    ///   — a teardown or unexpected suspend was observed.
+    /// - the pump's transport / framing errors (other than a would-block read).
     pub async fn recv_notification<S>(
         &mut self,
         live: Live<'b>,
         sink: S,
-    ) -> Result<Live<'b>, EngineError<T::Error>>
+    ) -> Result<Outcome<'b, NotifyStatus>, EngineError<T::Error>>
     where
         S: FnMut(Surface<'_>) -> ControlFlow<()>,
     {
@@ -725,11 +868,38 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
             ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
+        let boundary = match pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await
+        {
+            Ok(boundary) => boundary,
+            Err(e) => {
+                // A would-block / timed-out READ is a quiet deadline, not a
+                // failure: the deadline elapsed mid-read, so the connection stays
+                // alive with its ingest state preserved — either a clean boundary
+                // (nothing arrived) or a partial frame that the next read resumes
+                // — and the token rides back. Any other transport/framing error
+                // is fatal.
+                if let EngineError::Transport(inner) = &e
+                    && T::is_would_block(inner)
+                {
+                    return Ok(Outcome {
+                        live,
+                        status: NotifyStatus::Quiet,
+                    });
+                }
+                return Err(e);
+            }
+        };
         match boundary {
-            // A notification stopped the pull, or the connection reached a clean
-            // boundary with none yet — either way the connection is reusable.
-            Boundary::Stopped(()) | Boundary::Idle => Ok(live),
+            // A notification stopped the pull (its payload reached the sink).
+            Boundary::Stopped(()) => Ok(Outcome {
+                live,
+                status: NotifyStatus::Received,
+            }),
+            // A clean boundary with no notification yet — reusable and quiet.
+            Boundary::Idle => Ok(Outcome {
+                live,
+                status: NotifyStatus::Quiet,
+            }),
             Boundary::Failed => {
                 core::hint::cold_path();
                 Err(EngineError::ServerError)
@@ -742,73 +912,6 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
                 core::hint::cold_path();
                 Err(EngineError::UnexpectedSuspend)
             }
-        }
-    }
-
-    /// Reclaim the linear liveness token after a verb consumed it on a
-    /// *recoverable* failure — a server `ErrorResponse` (the recoverable
-    /// query-level error a verb reports as [`EngineError::ServerError`]) or a
-    /// `recv_notification` read that timed out with no notification.
-    ///
-    /// A failed verb consumes its token (the error path returns no token) yet
-    /// leaves the connection reusable: a server error parks the engine at the
-    /// command's recovering `ReadyForQuery` (still owed), and a notification
-    /// read timeout leaves it clean-idle. Without a way to re-acquire the token
-    /// the connection would be unusable after any query-level error —
-    /// `at-most-one-command-in-flight` cannot mint a replacement from outside
-    /// the crate. This drives the engine to its clean idle boundary (consuming
-    /// the owed `ReadyForQuery`) and mints a fresh token; when already clean-idle
-    /// with nothing buffered it mints immediately without touching the wire.
-    ///
-    /// # Contract
-    ///
-    /// Call ONLY when no live token is outstanding (the prior verb consumed it)
-    /// and the failure was recoverable. The minted token re-establishes
-    /// at-most-one-command-in-flight: the prior command has completed (with an
-    /// error), so exactly one token exists again. Invoking this while a command's
-    /// reply is genuinely still in flight would drain that reply into the
-    /// noop sink; the driver invokes it only on the recoverable-error path.
-    ///
-    /// # Errors
-    ///
-    /// - [`EngineError::WrongPhase`] — the engine is not in its active phase.
-    /// - [`EngineError::ServerError`] / [`EngineError::ProtocolViolation`] — a
-    ///   further error or teardown was observed while draining to the boundary.
-    /// - the pump's transport / framing errors.
-    pub async fn recover(&mut self) -> Result<Live<'b>, EngineError<T::Error>> {
-        let Self {
-            transport,
-            obs,
-            phase,
-            send_buf,
-            ..
-        } = self;
-        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        // Already at a clean boundary (e.g. a timed-out notification read consumed
-        // nothing): mint without I/O. Pumping here would block on a wire that
-        // owes no bytes.
-        if active.at_clean_idle() {
-            return Ok(Live::new_in_scope());
-        }
-        // Otherwise the recovering `ReadyForQuery` of the failed command is owed;
-        // drain to it. The prior command's request was already flushed, so the
-        // send buffer is drained and the pump's entry flush is a no-op.
-        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, noop_sink).await?;
-        match boundary {
-            Boundary::Idle => Ok(Live::new_in_scope()),
-            Boundary::Failed => {
-                core::hint::cold_path();
-                Err(EngineError::ServerError)
-            }
-            Boundary::Closed => {
-                core::hint::cold_path();
-                Err(EngineError::ProtocolViolation)
-            }
-            Boundary::Suspended => {
-                core::hint::cold_path();
-                Err(EngineError::UnexpectedSuspend)
-            }
-            Boundary::Stopped(never) => absurd(never),
         }
     }
 
@@ -824,6 +927,18 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     /// and the server rolls the transaction back when the socket closes. To abort
     /// deliberately while keeping the connection, the caller commits a no-op or
     /// issues `ROLLBACK` as its own verb.
+    ///
+    /// Note the recoverable-error nuance: a verb returns its token in
+    /// `Ok(Outcome { status: ServerErrored })` on a recoverable server error, but
+    /// [`flatten_poll`] maps that to `Err(ServerError)` for `transaction`'s
+    /// bare-token threading — so a recoverable error inside `BEGIN`/`COMMIT`/the
+    /// body still aborts and DROPS the token here. This proto `transaction`
+    /// therefore diverges from the sync DRIVER's `transaction`, which on a body
+    /// error issues a best-effort `ROLLBACK` and KEEPS the connection pooled (its
+    /// outcome rides the driver's health bit). The driver shape is the deliberate
+    /// one for pooled connections; this proto form is the cancellation-safe
+    /// single-poll primitive. The async transaction-*guard* (Drop → `ROLLBACK`)
+    /// lands in a later slice.
     ///
     /// Sync-only in THIS form (a constraint of the closure-based shape, not a
     /// permanent impossibility). A closure-based async form would have to hold

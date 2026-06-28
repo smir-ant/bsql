@@ -46,6 +46,9 @@ impl ChunkSink {
 
 impl Transport for ChunkSink {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
     fn read<'a>(
         &'a mut self,
         _buf: &'a mut [u8],

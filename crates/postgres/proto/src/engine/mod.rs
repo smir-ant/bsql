@@ -84,8 +84,8 @@ pub use pump::{
     SpuriousPending, Surface,
 };
 pub use seams::{
-    absurd, engine_observe_no_seam, engine_observe_via_seam, Live, Never, NoObserver, Observer,
-    Transport,
+    absurd, engine_observe_no_seam, engine_observe_via_seam, CommandStatus, Live, Never,
+    NoObserver, NotifyStatus, Observer, Outcome, Transport,
 };
 pub use verbs::PreparedStatement;
 
@@ -622,6 +622,14 @@ impl Transport for WitnessTransport {
     type Error = core::convert::Infallible;
 
     #[inline(always)]
+    fn is_would_block(err: &Self::Error) -> bool {
+        // `Infallible` is uninhabited: no error value exists, so the question is
+        // vacuous — the empty match proves the branch unreachable, no fabricated
+        // bool.
+        match *err {}
+    }
+
+    #[inline(always)]
     fn read<'a>(
         &'a mut self,
         _buf: &'a mut [u8],
@@ -699,12 +707,14 @@ const _: fn() = || {
         let live = engine.connect(live).await?;
         let live = engine
             .ping(live, |_s: Surface<'_>| core::ops::ControlFlow::Continue(()))
-            .await?;
+            .await?
+            .live;
         let live = engine
             .simple_query(live, "SELECT 1", |_s: Surface<'_>| {
                 core::ops::ControlFlow::Continue(())
             })
-            .await?;
+            .await?
+            .live;
         // Consume the token at the clean boundary; the brand must not escape the
         // async scope.
         let _ = live;
@@ -838,6 +848,10 @@ mod connect_scrub_tests {
 
     impl Transport for StaticServer {
         type Error = Infallible;
+
+        fn is_would_block(err: &Self::Error) -> bool {
+            match *err {}
+        }
 
         fn read<'a>(
             &'a mut self,

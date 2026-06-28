@@ -42,6 +42,9 @@ struct AcceptAll;
 
 impl bsql_postgres_proto::engine::Transport for AcceptAll {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
     fn read<'a>(
         &'a mut self,
         _buf: &'a mut [u8],
@@ -78,6 +81,9 @@ impl ChunkRecorder {
 
 impl bsql_postgres_proto::engine::Transport for ChunkRecorder {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
     fn read<'a>(
         &'a mut self,
         _buf: &'a mut [u8],
@@ -105,6 +111,9 @@ struct WriteZeroSink;
 
 impl bsql_postgres_proto::engine::Transport for WriteZeroSink {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
     fn read<'a>(
         &'a mut self,
         _buf: &'a mut [u8],
@@ -131,6 +140,9 @@ struct OverAccept;
 
 impl bsql_postgres_proto::engine::Transport for OverAccept {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
     fn read<'a>(
         &'a mut self,
         _buf: &'a mut [u8],
@@ -344,6 +356,10 @@ impl OpLog {
 
 impl bsql_postgres_proto::engine::Transport for OpLog {
     type Error = IoFault;
+    fn is_would_block(_err: &Self::Error) -> bool {
+        // `IoFault` models a hard write/IO fault, never a read deadline.
+        false
+    }
     fn read<'a>(
         &'a mut self,
         _buf: &'a mut [u8],
@@ -381,6 +397,9 @@ struct FailAfterPartial {
 
 impl bsql_postgres_proto::engine::Transport for FailAfterPartial {
     type Error = IoFault;
+    fn is_would_block(_err: &Self::Error) -> bool {
+        false
+    }
     fn read<'a>(
         &'a mut self,
         _buf: &'a mut [u8],

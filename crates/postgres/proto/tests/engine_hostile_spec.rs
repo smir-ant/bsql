@@ -328,6 +328,9 @@ impl ScriptedTransport {
 
 impl Transport for ScriptedTransport {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
 
     fn read<'a>(
         &'a mut self,

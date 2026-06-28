@@ -40,6 +40,10 @@ impl EngineScriptTransport {
 impl Transport for EngineScriptTransport {
     type Error = Infallible;
 
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
+
     fn read<'a>(
         &'a mut self,
         buf: &'a mut [u8],

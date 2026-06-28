@@ -420,25 +420,6 @@ impl ActiveEngine {
         self.command_tag.as_ref()
     }
 
-    /// True when the engine sits at a clean command boundary ([`Idle`]) with no
-    /// inbound bytes buffered.
-    ///
-    /// The reclaim path uses this to decide whether re-acquiring the liveness
-    /// token requires a pump. After a *recoverable* server `ErrorResponse` the
-    /// engine is parked at `DrainAfterError` with the command's trailing
-    /// `ReadyForQuery` still owed — not clean-idle — so the reclaim drains that
-    /// one frame to the boundary. After a read that timed out before any byte
-    /// arrived the engine is clean-idle with an empty buffer, so the reclaim
-    /// mints a token WITHOUT a pump (a pump here would block on a wire that owes
-    /// nothing).
-    ///
-    /// [`Idle`]: ActiveState::Idle
-    #[inline]
-    #[must_use]
-    pub(super) fn at_clean_idle(&self) -> bool {
-        matches!(self.state, ActiveState::Idle) && self.ingest.unread_len() == 0
-    }
-
     // ── Extended-query-protocol state-entry seam ──────────────────────────
     //
     // The pull engine is response-driven, so an extended-protocol exchange

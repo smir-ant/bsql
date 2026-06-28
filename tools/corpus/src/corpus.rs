@@ -96,6 +96,27 @@ fn oversize_command_complete() -> Vec<u8> {
     frames::frame(b'C', &body)
 }
 
+/// A simple-query SQL text larger than the engine's bounded outbound frame
+/// builder (`MAX_OWNED_SEND_LEN ≈ 2176`), forcing the path that streams the SQL
+/// body onto the growable send buffer rather than copying it into the bounded
+/// scratch frame. A valid `SELECT 1 AS n` with a trailing line comment padding
+/// it well past the cap (~3 KiB) — the outbound bytes must be byte-identical to
+/// the whole-frame builder's output. There was previously NO offline test for
+/// large SQL; this is the differential's guard for it.
+fn large_simple_sql() -> String {
+    let mut sql = String::from("SELECT 1 AS n -- ");
+    // 380 * 8 = 3040 bytes of comment → frame body well over the ~2176 cap.
+    sql.push_str(&"padding ".repeat(380));
+    sql
+}
+
+/// The column count for the oversize-wide-RowDescription fixture: 300 `int4`
+/// columns ≈ 7.2 KiB of RowDescription, comfortably over `READ_BUF_CAP` (4096),
+/// so the inbound RowDescription cannot whole-buffer — the new engine gathers it
+/// via its Sub-C accumulator and the old engine via its streaming row_desc
+/// parser, and they must decode it identically.
+const WIDE_COLUMNS: usize = 300;
+
 /// The command tag both engines yield for [`oversize_command_complete`]: the
 /// long `X` tag, parsed from the oversize prefix and truncated to
 /// `CommandTag::Other`'s 32-byte `BoundedStr` with the `…` overflow marker —
@@ -1073,6 +1094,176 @@ pub fn seed() -> Vec<Transcript> {
             simple_query_wire("VACUUM big"),
             ok_one(rs(&oversize_cc_tag(), &[], &[], Vec::new(), None)),
         ),
+    });
+
+    // ── 32. large simple-query SQL (> the bounded outbound frame builder) ──
+    // The SQL body exceeds the ~2176-byte scratch-frame cap, so the engine must
+    // stream it onto the growable send buffer; the differential pins the
+    // outbound Q frame byte-for-byte, proving large SQL streams identically.
+    out.push(Transcript {
+        name: "large_simple_query_sql",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![Step::new(
+            ClientRequest::SimpleQuery(large_simple_sql()),
+            frames::concat(&[
+                frames::row_description(&[("n", frames::OID_INT4)]),
+                frames::data_row(&[Some(b"1")]),
+                frames::command_complete("SELECT 1"),
+                frames::ready_for_query(frames::TX_IDLE),
+            ]),
+        )],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ready_ok(
+            simple_query_wire(&large_simple_sql()),
+            ok_one(rs("SELECT 1", &["n"], &[23], vec![vec![cell(b"1")]], Some(1))),
+        ),
+    });
+
+    // ── 33. oversize WIDE RowDescription (> READ_BUF_CAP) under chunked reads ──
+    // 300 int4 columns (~7.2 KiB RowDescription) driven OneBytePerRead exercises
+    // the new engine's Sub-C accumulate AND the partial-read path the async
+    // cutover's Pending logic will hit; the old engine's streaming row_desc
+    // parser must decode it byte-identically. Pinned to OneBytePerRead and exempt
+    // from the schedule-invariance check (an oversize inbound frame is not
+    // fragmentation-invariant under the feed-whole-chunk model — see
+    // oversize_command_complete).
+    {
+        let wide_cols: Vec<(String, i32)> = (0..WIDE_COLUMNS)
+            .map(|i| (format!("col_{i}"), frames::OID_INT4))
+            .collect();
+        let wide_col_refs: Vec<(&str, i32)> =
+            wide_cols.iter().map(|(name, oid)| (name.as_str(), *oid)).collect();
+        let wide_names: Vec<&str> = wide_cols.iter().map(|(name, _)| name.as_str()).collect();
+        let wide_oids: Vec<u32> = vec![23u32; WIDE_COLUMNS];
+        let wide_cell_vals: Vec<Vec<u8>> =
+            (0..WIDE_COLUMNS).map(|i| i.to_string().into_bytes()).collect();
+        let wide_cells: Vec<Option<&[u8]>> =
+            wide_cell_vals.iter().map(|c| Some(c.as_slice())).collect();
+        let wide_row: Vec<Option<Vec<u8>>> =
+            wide_cell_vals.iter().map(|c| Some(c.clone())).collect();
+        out.push(Transcript {
+            name: "oversize_wide_row_description",
+            setup: Setup::ActiveViaTrustHandshake,
+            steps: vec![Step::new(
+                ClientRequest::SimpleQuery("SELECT wide".to_string()),
+                frames::concat(&[
+                    frames::row_description(&wide_col_refs),
+                    frames::data_row(&wide_cells),
+                    frames::command_complete("SELECT 1"),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            )],
+            chunk_schedule: ChunkSchedule::OneBytePerRead,
+            expect: ready_ok(
+                simple_query_wire("SELECT wide"),
+                ok_one(rs("SELECT 1", &wide_names, &wide_oids, vec![wide_row], Some(1))),
+            ),
+        });
+    }
+
+    // ── 34b. recovery-WINDOW frames: notice + param-status BETWEEN the error
+    // and the recovering RFQ must still surface ──
+    // The error step's reply interleaves a NoticeResponse + ParameterStatus AFTER
+    // the ErrorResponse but BEFORE the recovering ReadyForQuery. Both engines must
+    // surface them on the recovered run. TEETH: the new engine's verb path drains
+    // the recovery window with the CALLER's sink (not a noop), so a verb twin that
+    // dropped these would diverge from A1 (which captures them during its drain).
+    // This is the wire-legal recovery-window interleaving the async cutover's
+    // notice/GUC-tracking sink would otherwise miss.
+    out.push(Transcript {
+        name: "recovery_window_notice_and_param",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![
+            Step::new(
+                ClientRequest::SimpleQuery("SELCT 1".to_string()),
+                frames::concat(&[
+                    frames::error_response("ERROR", "42601", "syntax error at or near \"SELCT\""),
+                    frames::notice_response("WARNING", "01000", "recovery-window notice"),
+                    frames::parameter_status("application_name", "recovered_app"),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            ),
+            Step::new(
+                ClientRequest::SimpleQuery("SELECT 1 AS n".to_string()),
+                frames::concat(&[
+                    frames::row_description(&[("n", frames::OID_INT4)]),
+                    frames::data_row(&[Some(b"1")]),
+                    frames::command_complete("SELECT 1"),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            ),
+        ],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ObservedRun {
+            client_bytes: frames::concat(&[
+                simple_query_wire("SELCT 1"),
+                simple_query_wire("SELECT 1 AS n"),
+            ]),
+            outcome: Ok(ok_one(rs("SELECT 1", &["n"], &[23], vec![vec![cell(b"1")]], Some(1)))),
+            // The recovery-window NoticeResponse surfaced (captured during the drain).
+            notices: vec![ObservedNotice {
+                severity: "WARNING".to_string(),
+                sqlstate: "01000".to_string(),
+                message: "recovery-window notice".to_string(),
+            }],
+            // The recovery-window ParameterStatus surfaced + tracked.
+            parameter_statuses: vec![("application_name".to_string(), "recovered_app".to_string())],
+            unknown_parameter_status_count: 0,
+            notifications: Vec::new(),
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Idle,
+            terminal: ObservedStatus::Ready,
+        },
+    });
+
+    // ── 34. error → recover → success on the SAME connection (observable) ──
+    // A query that server-errors, THEN a follow-up query that succeeds on the
+    // same connection — the model-agnostic observable that the connection
+    // recovered. Both engines run BOTH steps (the run's outcome is the last
+    // step's success; reaching it requires threading the recovered token past
+    // the error), so a regression that consumed the token on a recoverable error
+    // would fail to reach step 2 and diverge. The Adapter#2 verb twin now drives
+    // this through the real recovery (Ok(ServerErrored) → continue), so the
+    // differential covers the recover path the old `recover`-verb hole hid.
+    out.push(Transcript {
+        name: "error_then_success_same_connection",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![
+            Step::new(
+                ClientRequest::SimpleQuery("SELCT 1".to_string()),
+                frames::concat(&[
+                    frames::error_response("ERROR", "42601", "syntax error at or near \"SELCT\""),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            ),
+            Step::new(
+                ClientRequest::SimpleQuery("SELECT 1 AS n".to_string()),
+                frames::concat(&[
+                    frames::row_description(&[("n", frames::OID_INT4)]),
+                    frames::data_row(&[Some(b"1")]),
+                    frames::command_complete("SELECT 1"),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            ),
+        ],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ObservedRun {
+            // The accumulated outbound wire: both statements' Q frames in order.
+            client_bytes: frames::concat(&[
+                simple_query_wire("SELCT 1"),
+                simple_query_wire("SELECT 1 AS n"),
+            ]),
+            // The run's outcome is the LAST step's — the follow-up's success,
+            // reachable only because the connection recovered from the error.
+            outcome: Ok(ok_one(rs("SELECT 1", &["n"], &[23], vec![vec![cell(b"1")]], Some(1)))),
+            notices: Vec::new(),
+            parameter_statuses: Vec::new(),
+            unknown_parameter_status_count: 0,
+            notifications: Vec::new(),
+            backend_pid: Some(TRUST_BACKEND_PID),
+            tx_status: ObservedTxStatus::Idle,
+            terminal: ObservedStatus::Ready,
+        },
     });
 
     out

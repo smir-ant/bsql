@@ -93,6 +93,9 @@ impl StaticServer {
 
 impl Transport for StaticServer {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
 
     fn read<'a>(
         &'a mut self,
@@ -186,7 +189,7 @@ impl<T: Transport<Error = Infallible>> Holder<T> {
     /// Drive `ping` through the stored handle — same take/run/re-park cycle.
     fn ping(&mut self) -> Result<(), EngineError<Infallible>> {
         let live = self.live.take().expect("token present between verbs");
-        let live = block_on(self.engine.ping(live, drop_sink))?;
+        let live = block_on(self.engine.ping(live, drop_sink))?.live;
         self.live = Some(live);
         Ok(())
     }
@@ -224,7 +227,7 @@ fn open_owned_threads_two_sequential_verbs() {
     // active state is read back afterwards.
     let threaded: Result<(), EngineError<Infallible>> = block_on(async {
         let live = engine.connect(live).await?;
-        let live = engine.ping(live, drop_sink).await?;
+        let live = engine.ping(live, drop_sink).await?.live;
         // Consume the token at the clean boundary; it must not escape the scope.
         let _ = live;
         Ok(())
@@ -275,7 +278,7 @@ fn open_owned_with_default_policy_threads() {
 
     let threaded: Result<(), EngineError<Infallible>> = block_on(async {
         let live = engine.connect(live).await?;
-        let live = engine.ping(live, drop_sink).await?;
+        let live = engine.ping(live, drop_sink).await?.live;
         let _ = live;
         Ok(())
     });

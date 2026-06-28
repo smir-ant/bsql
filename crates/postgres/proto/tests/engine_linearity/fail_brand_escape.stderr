@@ -1,7 +1,7 @@
 error: lifetime may not live long enough
-  --> tests/engine_linearity/fail_brand_escape.rs:40:82
+  --> tests/engine_linearity/fail_brand_escape.rs:43:82
    |
-40 |     let _escaped = session(T0, &user, None, None, Credentials::Trust, |_e, live| live);
+43 |     let _escaped = session(T0, &user, None, None, Credentials::Trust, |_e, live| live);
    |                                                                        --      - ^^^^ returning this value requires that `'1` must outlive `'2`
    |                                                                        |       |
    |                                                                        |       return type of closure is Live<'2>

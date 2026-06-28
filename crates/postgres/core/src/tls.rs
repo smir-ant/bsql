@@ -545,6 +545,20 @@ impl<Inner: Transport> Drop for TlsTransport<Inner> {
 impl<Inner: Transport> Transport for TlsTransport<Inner> {
     type Error = TlsError<Inner::Error>;
 
+    fn is_would_block(err: &Self::Error) -> bool {
+        match err {
+            // Delegate a socket-level deadline to the inner transport; a
+            // TLS-protocol error is a genuine failure, never a read deadline.
+            TlsError::Socket(inner) => Inner::is_would_block(inner),
+            TlsError::Tls(_)
+            | TlsError::RecordOversize { .. }
+            | TlsError::EncryptExhausted
+            | TlsError::WriteZero
+            | TlsError::ClosedDuringHandshake
+            | TlsError::UnexpectedState => false,
+        }
+    }
+
     fn read<'a>(
         &'a mut self,
         buf: &'a mut [u8],

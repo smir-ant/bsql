@@ -1,11 +1,11 @@
 error[E0382]: use of moved value: `stmt`
-  --> tests/engine_verbs/fail_use_after_close.rs:64:50
+  --> tests/engine_verbs/fail_use_after_close.rs:67:50
    |
-60 |         let stmt = PreparedStatement::new(StmtName::try_from_str("s").unwrap(), Vec::new());
+63 |         let stmt = PreparedStatement::new(StmtName::try_from_str("s").unwrap(), Vec::new());
    |             ---- move occurs because `stmt` has type `PreparedStatement`, which does not implement the `Copy` trait
-61 |         // First close consumes the statement:
-62 |         let live = block_on(e.close_statement(live, stmt, sink)).unwrap();
+64 |         // First close consumes the statement:
+65 |         let live = block_on(e.close_statement(live, stmt, sink)).unwrap().live;
    |                                                     ---- value moved here
-63 |         // Reuse the CLOSED (moved) statement — use of moved value:
-64 |         let _ = block_on(e.close_statement(live, stmt, sink));
+66 |         // Reuse the CLOSED (moved) statement — use of moved value:
+67 |         let _ = block_on(e.close_statement(live, stmt, sink));
    |                                                  ^^^^ value used here after move

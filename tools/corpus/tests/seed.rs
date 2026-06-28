@@ -62,10 +62,15 @@ fn seed_corpus_is_schedule_invariant() {
         // AllAtOnce / SplitHeaders feed the >buffer chunk before the engine can
         // drain it and both engines report a transport stall, whereas
         // OneBytePerRead streams it to completion. That split is a
-        // buffer-feed-model artifact, not a protocol property, so this single
-        // fixture (pinned to OneBytePerRead) is exempt from the corpus-wide
-        // invariance check.
-        if t.name == "oversize_command_complete" {
+        // buffer-feed-model artifact, not a protocol property, so these
+        // oversize-inbound fixtures (each pinned to OneBytePerRead) are exempt
+        // from the corpus-wide invariance check: `oversize_command_complete`
+        // (Sub-B CommandComplete) and `oversize_wide_row_description` (Sub-C
+        // RowDescription accumulate).
+        if matches!(
+            t.name,
+            "oversize_command_complete" | "oversize_wide_row_description"
+        ) {
             continue;
         }
         assert_schedule_invariant(t);

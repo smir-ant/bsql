@@ -1,10 +1,12 @@
 //! Active-phase verb-surface behavioural spec.
 //!
-//! Drives each of the 15 token-threading verbs (the session-ending `terminate`
+//! Drives each of the 14 token-threading verbs (the session-ending `terminate`
 //! has its own spec, `engine_terminate_spec`) over a scripted (always-ready)
-//! transport via the
-//! synchronous single-poll helper, asserting the verb reaches the right boundary
-//! and surfaces the right results. The row-count guards
+//! transport via the synchronous single-poll helper, asserting the verb reaches
+//! the right boundary and surfaces the right results. Each returns the linear
+//! token inside an `Outcome { live, status }` on an alive boundary — a clean
+//! `Completed`, or a recoverable `ServerErrored` (the connection survived). The
+//! row-count guards
 //! ([`query_one`](bsql_postgres_proto::engine::Engine::query_one) /
 //! [`query_opt`](bsql_postgres_proto::engine::Engine::query_opt)) are exercised at
 //! their boundary cases (0/1/2 rows). The use-after-close compile error has its
@@ -22,8 +24,8 @@ use core::future::{ready, Future};
 use core::ops::ControlFlow;
 
 use bsql_postgres_proto::engine::{
-    poll_once, session, Engine, EngineError, ExpectedRowCount, Live, NoObserver, PreparedStatement,
-    SpuriousPending, Surface, Transport,
+    poll_once, session, CommandStatus, Engine, EngineError, ExpectedRowCount, Live, NoObserver,
+    NotifyStatus, Outcome, PreparedStatement, SpuriousPending, Surface, Transport,
 };
 use bsql_postgres_proto::wire::{
     TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE,
@@ -168,6 +170,9 @@ impl StaticServer {
 
 impl Transport for StaticServer {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
     fn read<'a>(
         &'a mut self,
         buf: &'a mut [u8],
@@ -190,6 +195,79 @@ impl Transport for StaticServer {
         ready(Ok(()))
     }
     fn shutdown<'a>(&'a mut self) -> impl Future<Output = Result<(), Infallible>> + Send + 'a {
+        ready(Ok(()))
+    }
+}
+
+/// A read error carrying a would-block classification — the seam
+/// `Transport::is_would_block` reads to decide a quiet deadline vs a fatal
+/// failure. A struct (not `Infallible`) so the scripted server can actually
+/// PRODUCE an error to exercise the would-block→Quiet path.
+#[derive(Debug)]
+struct ClassifiedReadErr {
+    would_block: bool,
+}
+
+/// One scripted read step: serve bytes, or fail with a classified error.
+enum ReadStep {
+    Bytes(Vec<u8>),
+    Fail { would_block: bool },
+}
+
+/// A transport whose reads follow a script of byte-serves and classified
+/// failures, so the `recv_notification` would-block→Quiet (and fatal→Err) paths
+/// are deterministic over a single-poll drive. write/flush/shutdown succeed.
+struct PhasedReadServer {
+    steps: std::collections::VecDeque<ReadStep>,
+}
+
+impl Transport for PhasedReadServer {
+    type Error = ClassifiedReadErr;
+
+    fn is_would_block(err: &Self::Error) -> bool {
+        err.would_block
+    }
+
+    fn read<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> impl Future<Output = Result<usize, Self::Error>> + Send + 'a {
+        let result = match self.steps.front_mut() {
+            Some(ReadStep::Bytes(bytes)) => {
+                let n = bytes.len().min(buf.len());
+                if let (Some(dst), Some(src)) = (buf.get_mut(..n), bytes.get(..n)) {
+                    dst.copy_from_slice(src);
+                }
+                if n == bytes.len() {
+                    self.steps.pop_front();
+                } else {
+                    bytes.drain(..n);
+                }
+                Ok(n)
+            }
+            Some(ReadStep::Fail { would_block }) => {
+                let would_block = *would_block;
+                self.steps.pop_front();
+                Err(ClassifiedReadErr { would_block })
+            }
+            // Script exhausted ⇒ EOF.
+            None => Ok(0),
+        };
+        ready(result)
+    }
+
+    fn write<'a>(
+        &'a mut self,
+        buf: &'a [u8],
+    ) -> impl Future<Output = Result<usize, Self::Error>> + Send + 'a {
+        ready(Ok(buf.len()))
+    }
+
+    fn flush<'a>(&'a mut self) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        ready(Ok(()))
+    }
+
+    fn shutdown<'a>(&'a mut self) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
         ready(Ok(()))
     }
 }
@@ -280,11 +358,23 @@ fn parse_row(body: &[u8]) -> Vec<Option<Vec<u8>>> {
 
 // ─────────────────────────── harness ───────────────────────────
 
+/// Flatten a single-poll [`Outcome`] verb result to the threaded token,
+/// asserting a clean [`CommandStatus::Completed`]. A `ServerErrored` outcome or
+/// any `EngineError` surfaces as an `Err` so the call site's `.expect(..)` fails
+/// loudly — the helper is for tests that expect a clean completion.
 fn flatten<'b>(
-    polled: Result<Result<Live<'b>, EngineError<Infallible>>, SpuriousPending>,
+    polled: Result<Result<Outcome<'b, CommandStatus>, EngineError<Infallible>>, SpuriousPending>,
 ) -> Result<Live<'b>, EngineError<Infallible>> {
     match polled {
-        Ok(inner) => inner,
+        Ok(Ok(Outcome {
+            live,
+            status: CommandStatus::Completed,
+        })) => Ok(live),
+        Ok(Ok(Outcome {
+            status: CommandStatus::ServerErrored,
+            ..
+        })) => Err(EngineError::ServerError),
+        Ok(Err(e)) => Err(e),
         Err(SpuriousPending) => panic!("blocking transport returned Pending"),
     }
 }
@@ -303,7 +393,13 @@ fn run<R: 'static>(
         None,
         Credentials::Trust,
         |mut engine, live| {
-            let live = flatten(poll_once(engine.connect(live))).expect("connect");
+            // `connect` is the handshake verb — it returns the bare `Live`, not an
+            // `Outcome` (no recoverable-server-error axis at handshake time).
+            let live = match poll_once(engine.connect(live)) {
+                Ok(Ok(live)) => live,
+                Ok(Err(e)) => panic!("connect failed: {e:?}"),
+                Err(SpuriousPending) => panic!("blocking transport returned Pending"),
+            };
             body(&mut engine, live)
         },
     )
@@ -498,6 +594,41 @@ fn prepare_nodata_surfaces_empty_row_schema() {
 }
 
 #[test]
+fn prepare_large_sql_does_not_overflow() {
+    // A >2 KiB prepared SQL: the Parse path streams the SQL onto the send buffer
+    // (build_parse_header + body), so it must NOT fail with FrameTooLong the way
+    // the old whole-frame build_parse would. The reply is a normal prepare
+    // completion; the verb reaches a clean Completed outcome.
+    let big_sql = "SELECT id, name FROM t WHERE id = $1 -- ".to_string() + &"x".repeat(3000);
+    let script = concat(&[
+        handshake(),
+        parse_complete(),
+        parameter_description(&[23]),
+        row_description(&[("id", 23), ("name", 25)]),
+        rfq(b'I'),
+    ]);
+    let (completed, oids) = run(script, |e, live| {
+        let name = StmtName::try_from_str("big").expect("stmt name");
+        let mut cap = Cap::default();
+        let outcome = poll_once(e.prepare(live, &name, &big_sql, cap.sink()));
+        let completed = matches!(
+            outcome,
+            Ok(Ok(Outcome {
+                status: CommandStatus::Completed,
+                ..
+            }))
+        );
+        let oids = match cap.delivers.first() {
+            Some(deliver) => deliver.1.clone(),
+            None => Vec::new(),
+        };
+        (completed, oids)
+    });
+    assert!(completed, "a >2 KiB prepared SQL must prepare without FrameTooLong");
+    assert_eq!(oids, vec![23, 25], "the recovered schema must still surface");
+}
+
+#[test]
 fn query_prepared_streams_rows() {
     // Bind + Execute + Sync → BindComplete, DataRow, CommandComplete, RFQ.
     let script = concat(&[
@@ -628,14 +759,105 @@ fn listen_subscribes() {
 #[test]
 fn recv_notification_breaks_on_first_notify() {
     let script = concat(&[handshake(), notification(99, "events", "payload")]);
-    let cap = run(script, |e, live| {
+    let (cap, received) = run(script, |e, live| {
         let mut cap = Cap::default();
-        let live =
-            flatten(poll_once(e.recv_notification(live, break_on_notify(&mut cap)))).expect("recv");
-        let _ = live;
-        cap
+        // A notification stops the pull: the outcome is `Received`, and the token
+        // rides back in `Ok`.
+        let received = match poll_once(e.recv_notification(live, break_on_notify(&mut cap))) {
+            Ok(Ok(Outcome {
+                live,
+                status: NotifyStatus::Received,
+            })) => {
+                let _ = live;
+                true
+            }
+            _ => false,
+        };
+        (cap, received)
     });
+    assert!(received, "a notification must yield the Received outcome");
     assert_eq!(cap.notifies.len(), 1);
+}
+
+#[test]
+fn recv_notification_would_block_is_quiet_and_recovers() {
+    // The new `is_would_block` seam's main path: a would-block / timed-out read
+    // makes `recv_notification` return `Ok(Outcome { Quiet })` (the token rides
+    // back, the connection is alive) rather than consuming the token. After a
+    // fresh active engine settles at idle, its first `next_event` is `NeedMore`
+    // (an empty buffer drives a read — see dispatch_active::drive), so the
+    // scripted would-block read IS reached.
+    let user = Ident::try_from_str("verbs").expect("ident");
+    let steps = std::collections::VecDeque::from(vec![
+        ReadStep::Bytes(handshake()),         // connect consumes this
+        ReadStep::Fail { would_block: true }, // recv_notification's read times out
+        ReadStep::Bytes(rfq(b'I')),           // the follow-up ping's Sync reply
+    ]);
+    let (quiet, follow_ok) = session(
+        PhasedReadServer { steps },
+        &user,
+        None,
+        None,
+        Credentials::Trust,
+        |mut e, live| {
+            let live = match poll_once(e.connect(live)) {
+                Ok(Ok(live)) => live,
+                other => panic!("connect: {other:?}"),
+            };
+            let mut cap = Cap::default();
+            let (quiet, live) = match poll_once(e.recv_notification(live, break_on_notify(&mut cap)))
+            {
+                Ok(Ok(Outcome {
+                    live,
+                    status: NotifyStatus::Quiet,
+                })) => (true, live),
+                other => panic!("expected Quiet, got {other:?}"),
+            };
+            // The connection survived the quiet deadline — a follow-up verb works.
+            let follow_ok = matches!(
+                poll_once(e.ping(live, |_s: Surface<'_>| ControlFlow::Continue(()))),
+                Ok(Ok(Outcome {
+                    status: CommandStatus::Completed,
+                    ..
+                }))
+            );
+            (quiet, follow_ok)
+        },
+    )
+    .expect("session assembles");
+    assert!(quiet, "a would-block read must yield NotifyStatus::Quiet");
+    assert!(follow_ok, "the connection must stay alive after a quiet deadline");
+}
+
+#[test]
+fn recv_notification_fatal_read_error_is_err() {
+    // Teeth for the seam: a read error that `is_would_block` classifies as NOT a
+    // deadline is fatal — `recv_notification` returns `Err`, consuming the token.
+    let user = Ident::try_from_str("verbs").expect("ident");
+    let steps = std::collections::VecDeque::from(vec![
+        ReadStep::Bytes(handshake()),
+        ReadStep::Fail { would_block: false }, // a genuine transport failure
+    ]);
+    let is_fatal_err = session(
+        PhasedReadServer { steps },
+        &user,
+        None,
+        None,
+        Credentials::Trust,
+        |mut e, live| {
+            let live = match poll_once(e.connect(live)) {
+                Ok(Ok(live)) => live,
+                other => panic!("connect: {other:?}"),
+            };
+            let mut cap = Cap::default();
+            matches!(
+                poll_once(e.recv_notification(live, break_on_notify(&mut cap))),
+                Ok(Err(EngineError::Transport(ClassifiedReadErr { would_block: false })))
+            )
+        },
+    )
+    .expect("session assembles");
+    assert!(is_fatal_err, "a non-would-block read error must be a fatal Err");
 }
 
 #[test]
@@ -665,28 +887,36 @@ fn transaction_begin_body_commit() {
 
 #[test]
 fn server_error_is_classified() {
+    // A recoverable server error is reported via the ALIVE outcome
+    // (`Ok(Outcome { status: ServerErrored })`) — the token rides back, the
+    // error details rode the sink. The verb itself drained the recovering RFQ.
     let script = concat(&[
         handshake(),
         error_response("ERROR", "42601", "syntax error"),
         rfq(b'I'),
     ]);
-    let (is_server_err, fail_surfaced) = run(script, |e, live| {
+    let (is_server_errored, fail_surfaced) = run(script, |e, live| {
         let mut cap = Cap::default();
         let result = poll_once(e.simple_query(live, "SELCT 1", cap.sink()));
-        (
-            matches!(result, Ok(Err(EngineError::ServerError))),
-            cap.fails,
-        )
+        let is_server_errored = matches!(
+            result,
+            Ok(Ok(Outcome {
+                status: CommandStatus::ServerErrored,
+                ..
+            }))
+        );
+        (is_server_errored, cap.fails)
     });
-    assert!(is_server_err);
+    assert!(is_server_errored, "a syntax error must yield the ServerErrored outcome");
     assert_eq!(fail_surfaced, 1);
 }
 
 #[test]
-fn recover_after_server_error_reclaims_usable_token() {
-    // A recoverable server error consumes the token but leaves the connection
-    // drainable to its recovering RFQ. `recover` drains it, mints a fresh token,
-    // and a follow-up command succeeds — the connection survived the error.
+fn server_error_returns_token_for_same_connection_followup() {
+    // The tier-1 recovery: a recoverable server error returns the linear token
+    // IN `Ok` (the verb drained the recovering RFQ to a clean idle itself), so a
+    // follow-up command runs on the SAME connection with NO separate token mint —
+    // the only token-minting surface is the session constructor.
     let script = concat(&[
         handshake(),
         error_response("ERROR", "42601", "syntax error"),
@@ -694,43 +924,51 @@ fn recover_after_server_error_reclaims_usable_token() {
         command_complete("SELECT 1"),
         rfq(b'I'),
     ]);
-    let (first_is_server_err, reclaimed, follow_ok, follow_delivers) = run(script, |e, live| {
+    let (first_server_errored, follow_ok, follow_delivers) = run(script, |e, live| {
         let mut cap1 = Cap::default();
-        let first = poll_once(e.simple_query(live, "SELCT", cap1.sink()));
-        let first_is_server_err = matches!(first, Ok(Err(EngineError::ServerError)));
-        // The failed verb consumed the token; reclaim it.
-        let (reclaimed, follow_ok, follow_delivers) = match poll_once(e.recover()) {
-            Ok(Ok(live)) => {
-                let mut cap2 = Cap::default();
-                let follow = poll_once(e.simple_query(live, "SELECT 1", cap2.sink()));
-                (true, matches!(follow, Ok(Ok(_))), cap2.delivers.len())
-            }
-            _ => (false, false, 0),
-        };
-        (first_is_server_err, reclaimed, follow_ok, follow_delivers)
+        // The errored verb hands the token back inside `Ok`.
+        let (first_server_errored, live) =
+            match poll_once(e.simple_query(live, "SELCT", cap1.sink())) {
+                Ok(Ok(Outcome {
+                    live,
+                    status: CommandStatus::ServerErrored,
+                })) => (true, live),
+                other => panic!("expected ServerErrored outcome, got {other:?}"),
+            };
+        // Reuse that very token — no `recover`, no re-mint — for the follow-up.
+        let mut cap2 = Cap::default();
+        let follow = poll_once(e.simple_query(live, "SELECT 1", cap2.sink()));
+        let follow_ok = matches!(
+            follow,
+            Ok(Ok(Outcome {
+                status: CommandStatus::Completed,
+                ..
+            }))
+        );
+        (first_server_errored, follow_ok, cap2.delivers.len())
     });
-    assert!(first_is_server_err, "the syntax error must classify as ServerError");
-    assert!(reclaimed, "recover must reclaim a token after a recoverable error");
-    assert!(follow_ok, "the follow-up command must succeed on the recovered connection");
+    assert!(first_server_errored, "the syntax error must yield ServerErrored");
+    assert!(follow_ok, "the follow-up command must complete on the recovered connection");
     assert_eq!(follow_delivers, 1, "the follow-up command must deliver its result");
 }
 
 #[test]
-fn recover_after_teardown_does_not_resurrect() {
+fn teardown_consumes_token_no_resurrect() {
     // A protocol violation (a `BindComplete` with no command in flight) tears the
-    // connection down. `recover` must NOT mint a token for a dead connection — it
-    // drains to a non-Idle boundary and returns a classified error.
+    // connection down: the verb returns `Err(ProtocolViolation)`, CONSUMING the
+    // token (none rides back). With `recover` removed there is no token-minting
+    // surface to resurrect a dead connection — the at-most-one-Live invariant is
+    // back to tier-1, enforced by the absence of any free mint. A follow-up verb
+    // is impossible: the linear token is gone, so this cannot even be expressed
+    // (the compile-fail trybuild goldens pin the move-error half).
     let script = concat(&[handshake(), bind_complete()]);
-    let (is_proto_violation, recover_refused) = run(script, |e, live| {
+    let is_proto_violation = run(script, |e, live| {
         let mut cap = Cap::default();
         let result = poll_once(e.simple_query(live, "SELECT 1", cap.sink()));
-        let is_proto_violation = matches!(result, Ok(Err(EngineError::ProtocolViolation)));
-        // recover must refuse to resurrect: `Ok(Err(_))` = no token minted.
-        let recover_refused = matches!(poll_once(e.recover()), Ok(Err(_)));
-        (is_proto_violation, recover_refused)
+        // The token was moved into `simple_query` and not returned (fatal Err).
+        matches!(result, Ok(Err(EngineError::ProtocolViolation)))
     });
-    assert!(is_proto_violation, "an out-of-phase BindComplete must tear down");
-    assert!(recover_refused, "recover must not resurrect a torn-down connection");
+    assert!(is_proto_violation, "an out-of-phase BindComplete must tear down (token consumed)");
 }
 
 #[test]

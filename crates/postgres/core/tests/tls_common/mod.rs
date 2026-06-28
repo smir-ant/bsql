@@ -349,6 +349,10 @@ impl MockInner {
 impl Transport for MockInner {
     type Error = std::convert::Infallible;
 
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
+
     fn read<'a>(
         &'a mut self,
         buf: &'a mut [u8],

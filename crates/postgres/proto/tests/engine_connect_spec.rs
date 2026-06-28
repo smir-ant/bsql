@@ -115,6 +115,9 @@ impl StaticServer {
 
 impl Transport for StaticServer {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
 
     fn read<'a>(
         &'a mut self,
@@ -242,6 +245,9 @@ impl ScramServer {
 
 impl Transport for ScramServer {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
 
     fn read<'a>(
         &'a mut self,

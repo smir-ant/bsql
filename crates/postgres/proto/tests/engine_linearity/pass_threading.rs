@@ -19,6 +19,9 @@ struct ScriptServer {
 
 impl Transport for ScriptServer {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
     fn read<'a>(
         &'a mut self,
         buf: &'a mut [u8],
@@ -86,7 +89,7 @@ fn main() {
     let ok = session(server, &user, None, None, Credentials::Trust, |mut e, live| {
         block_on(async move {
             let live = e.connect(live).await?;
-            let live = e.ping(live, drop_sink).await?;
+            let live = e.ping(live, drop_sink).await?.live;
             let _ = live;
             Ok::<(), EngineError<Infallible>>(())
         })

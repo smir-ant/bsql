@@ -213,6 +213,30 @@ pub trait Transport: Send {
     /// script's `Infallible` and a socket's I/O error are already `Send`.
     type Error: Send;
 
+    /// Classify a transport error as a would-block / timed-out read — a *read
+    /// deadline*, not a broken connection.
+    ///
+    /// An **associated function** (no `self`): would-block-ness is a property of
+    /// the error VALUE, not of the transport instance, and the engine holds the
+    /// error (returned from a failed [`read`](Self::read)) but not necessarily a
+    /// live transport reference at the classification point, so the engine calls
+    /// `T::is_would_block(&e)`. This is the one error question the `#![no_std]`
+    /// core cannot answer itself — it never names a concrete I/O error, so each
+    /// transport classifies its own. [`recv_notification`](super::Engine::recv_notification)
+    /// uses it to distinguish a quiet deadline (return the liveness token in
+    /// `Ok`, no notification — the connection is alive) from a genuine transport
+    /// failure (consume the token — the connection is dead).
+    ///
+    /// Required, not defaulted (the [`flush`](Self::flush)/[`shutdown`](Self::shutdown)
+    /// discipline): a `false` default would let a socket transport that CAN time
+    /// out compile while silently misclassifying every read deadline as a fatal
+    /// failure — a connection wrongly evicted, or `recv_notification` never
+    /// reporting "no notification". Each transport states its semantics: a socket
+    /// matches `WouldBlock`/`TimedOut`; an infallible script's `Infallible`
+    /// answers the question vacuously (`match *err {}`); a wrapper delegates to
+    /// its inner classifier.
+    fn is_would_block(err: &Self::Error) -> bool;
+
     /// Read available bytes into `buf`, returning the count written.
     fn read<'a>(
         &'a mut self,
@@ -303,3 +327,93 @@ impl<'b> Live<'b> {
         Self { _brand: PhantomData }
     }
 }
+
+// ===========================================================================
+// 5. Outcome — the alive-verb return carrier (token rides Ok)
+// ===========================================================================
+
+/// The successful return of a token-threading verb: the linear [`Live`] token
+/// rides back on the `Ok` arm together with the protocol [`status`](Self::status)
+/// the command reached.
+///
+/// # The tier-1 reason the token rides `Ok`
+///
+/// A verb consumes its `Live` and returns one ONLY when the connection is alive
+/// and reusable. Two alive outcomes exist: a clean completion and a *recoverable*
+/// server error (an `ErrorResponse` the server recovers from via the trailing
+/// `ReadyForQuery`, leaving the connection at a clean idle). Both must hand the
+/// token back. A linear token cannot be threaded through an `Err` arm — `?` drops
+/// the error value, so a token returned in `Err` would be unreachable — so the
+/// ONLY shape that keeps the "exactly one `Live` ⟺ at-most-one-command-in-flight"
+/// invariant tier-1 (compile-enforced) across a recoverable error is to return
+/// the token in `Ok`, tagged with whether the command completed or server-errored.
+/// `Err(EngineError)` is then reserved for a FATAL outcome alone: the connection
+/// is dead, the token is consumed and not returned. The previous shape minted a
+/// fresh token through a separate, token-LESS `recover` verb, which structurally
+/// permitted minting a second token for one engine — a tier-1→tier-4 hole this
+/// carrier closes.
+///
+/// Generic over the status `St` so each verb names exactly its reachable outcome
+/// set ([`CommandStatus`] for the collect-all command verbs, [`NotifyStatus`] for
+/// `recv_notification`) — a verb's caller never faces an outcome the verb cannot
+/// produce. [`Live`] is a ZST, so `Outcome<St>` is the size of `St` alone (one
+/// byte for both status enums).
+#[derive(Debug)]
+#[must_use = "the linear Live token rides in the Outcome; dropping it drops the connection"]
+pub struct Outcome<'b, St> {
+    /// The linear liveness token, threaded back because the connection is alive.
+    pub live: Live<'b>,
+    /// The protocol status the command reached (completion vs recoverable error,
+    /// or — for `recv_notification` — whether a notification arrived).
+    pub status: St,
+}
+
+// `Live<'b>` is a ZST, so `Outcome<St>` is byte-identical to `St`. Pinned at both
+// real instantiations (the verb-status families) — one byte each. Generic over
+// `St`, so there is no single canonical size; these two are every shape a verb
+// constructs.
+crate::wire_pin!(Outcome<'static, CommandStatus>, size = 1, align = 1);
+crate::wire_pin!(Outcome<'static, NotifyStatus>, size = 1, align = 1);
+
+/// The protocol status of a collect-all command verb's alive outcome.
+///
+/// A closed (NOT `#[non_exhaustive]`) two-state tag: the driver and corpus match
+/// it exhaustively, so a future variant forces a decision at every call site
+/// rather than silently falling into a wildcard. Both outcomes mean the
+/// connection is ALIVE — the distinction is whether the command completed cleanly
+/// or hit a recoverable server error (whose details rode the verb's sink as
+/// `Surface::Fail` before the verb drained the recovering `ReadyForQuery`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandStatus {
+    /// A clean `ReadyForQuery` idle boundary — the command completed without a
+    /// server error.
+    Completed,
+    /// A server `ErrorResponse` the connection recovered from: the verb drained
+    /// the trailing `ReadyForQuery` to a clean idle before returning, so the
+    /// token is reusable. The error details already reached the caller via the
+    /// sink; this variant only SIGNALS the recoverable failure.
+    ServerErrored,
+}
+
+// A two-state tag — one byte, no payload.
+crate::wire_pin!(CommandStatus, size = 1, align = 1);
+
+/// The protocol status of `recv_notification`'s alive outcome.
+///
+/// A closed two-state tag (matched exhaustively, like [`CommandStatus`]). The
+/// notification PAYLOAD rides the verb's sink (the borrowed bytes cannot be
+/// owned by the `#![no_std]` core); this status only signals whether the pull
+/// stopped on a notification or reached a quiet boundary. A server error during
+/// a notification wait is FATAL (the verb issues no command, so no recovering
+/// `ReadyForQuery` is owed to drain), reported as an `Err`, not a status here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyStatus {
+    /// A `NotificationResponse` stopped the pull (its payload rode the sink).
+    Received,
+    /// The pull reached a clean boundary or timed out (a would-block read
+    /// deadline) before any notification — the connection is alive and quiet.
+    Quiet,
+}
+
+// A two-state tag — one byte, no payload.
+crate::wire_pin!(NotifyStatus, size = 1, align = 1);

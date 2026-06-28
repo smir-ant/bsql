@@ -47,6 +47,18 @@ impl Transport for SyncSocket {
     type Error = io::Error;
 
     #[inline]
+    fn is_would_block(err: &io::Error) -> bool {
+        // A blocking socket with `SO_RCVTIMEO`/`SO_SNDTIMEO` set surfaces a read
+        // deadline as `WouldBlock` (BSD `EAGAIN`/`EWOULDBLOCK`) or `TimedOut`
+        // (`ETIMEDOUT`); both mean "no data within the deadline", not a broken
+        // connection. Every other `io::ErrorKind` is a genuine failure.
+        matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        )
+    }
+
+    #[inline]
     fn read<'a>(
         &'a mut self,
         buf: &'a mut [u8],
@@ -101,6 +113,21 @@ impl<S: Transport> Transport for Wire<S> {
     /// The arm-uniform error union: a plaintext socket error rides
     /// [`TlsError::Socket`]; the TLS arm's error already is this type.
     type Error = TlsError<S::Error>;
+
+    #[inline]
+    fn is_would_block(err: &Self::Error) -> bool {
+        match err {
+            // A socket-level error (either arm) is classified by the inner
+            // transport; a TLS-protocol error is never a recoverable deadline.
+            TlsError::Socket(inner) => S::is_would_block(inner),
+            TlsError::Tls(_)
+            | TlsError::RecordOversize { .. }
+            | TlsError::EncryptExhausted
+            | TlsError::WriteZero
+            | TlsError::ClosedDuringHandshake
+            | TlsError::UnexpectedState => false,
+        }
+    }
 
     // The forwarding arms are `async fn` (which satisfies the trait's RPITIT
     // `+ Send` bound — the compiler checks the future is `Send`); the explicit

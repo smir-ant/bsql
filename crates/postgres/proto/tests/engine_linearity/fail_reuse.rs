@@ -9,6 +9,9 @@ struct T0;
 
 impl Transport for T0 {
     type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
     fn read<'a>(
         &'a mut self,
         _buf: &'a mut [u8],

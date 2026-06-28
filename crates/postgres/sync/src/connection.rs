@@ -9,12 +9,16 @@
 //! # Token lifecycle and recovery (the health bit)
 //!
 //! `self.live` is the health bit: `Some` = the connection is at a clean boundary
-//! and reusable, `None` = a verb failed fatally and the connection is dead. A
-//! *recoverable* server error (a query-level `ErrorResponse`) is NOT fatal: the
-//! verb consumes the token but the connection survives, so [`settle`] drains the
-//! recovering `ReadyForQuery` and reclaims a fresh token via
-//! [`Engine::recover`], keeping `self.live` `Some` while returning the parsed
-//! [`DbError`]. A transport/protocol/EOF failure leaves `self.live` `None`.
+//! and reusable, `None` = a verb failed fatally and the connection is dead. The
+//! engine's tier-1 error model decides the bit: a verb returns its linear `Live`
+//! token inside `Ok(Outcome { live, status })` whenever the connection is ALIVE
+//! — including on a *recoverable* server error (a query-level `ErrorResponse`),
+//! which the verb drains to a clean idle itself and reports as
+//! [`CommandStatus::ServerErrored`]. So [`settle`] ALWAYS restores `self.live`
+//! from an `Ok` outcome (no separate token reclaim), then maps a `ServerErrored`
+//! status to `Err(DriverError::Db)` while keeping the connection pooled. Only a
+//! FATAL `Err(EngineError)` (transport/protocol/EOF) — or a `SpuriousPending` —
+//! leaves `self.live` `None`.
 //!
 //! [`settle`]: Connection::settle
 
@@ -30,8 +34,8 @@ use bsql_postgres_core::{
     ConnectConfig, DriverError, Notification, QueryResult, Row, SslMode,
 };
 use bsql_postgres_proto::engine::{
-    self, ConnFail, Engine, EngineError, Live, NoObserver, PreparedStatement as WireStatement,
-    SpuriousPending, Surface,
+    self, CommandStatus, ConnFail, Engine, EngineError, Live, NoObserver, NotifyStatus, Outcome,
+    PreparedStatement as WireStatement, SpuriousPending, Surface,
 };
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
@@ -188,42 +192,43 @@ impl Connection {
         self.live.take().ok_or(DriverError::NotReady)
     }
 
-    /// Classify a verb's single-poll outcome and manage the token.
+    /// Classify a command verb's single-poll [`Outcome`] and manage the token.
     ///
-    /// On success the token is restored. On a recoverable server error the
-    /// connection is drained to its recovering boundary and a fresh token
-    /// reclaimed (so the connection stays usable), returning the parsed
-    /// [`DbError`]. On a fatal error the token stays gone (`self.live == None`),
-    /// so [`is_healthy`](Self::is_healthy) reports the connection dead.
-    fn settle(&mut self, polled: Polled<Live<'static>>, collector: &mut ResultCollector) -> Result<(), DriverError> {
+    /// An `Ok` outcome ALWAYS restores the token — the connection is alive
+    /// whether the command completed or recovered from a server error (the verb
+    /// already drained the recovering `ReadyForQuery`). A
+    /// [`CommandStatus::ServerErrored`] then surfaces the parsed [`DbError`] the
+    /// collector captured from the raw `ErrorResponse`, while the connection
+    /// stays pooled. A fatal `Err` (transport/protocol/EOF) or a
+    /// `SpuriousPending` leaves the token gone (`self.live == None`), so
+    /// [`is_healthy`](Self::is_healthy) reports the connection dead — no separate
+    /// token-reclaim step exists.
+    fn settle(
+        &mut self,
+        polled: Polled<Outcome<'static, CommandStatus>>,
+        collector: &mut ResultCollector,
+    ) -> Result<(), DriverError> {
         match polled {
-            Ok(Ok(live)) => {
+            Ok(Ok(Outcome { live, status })) => {
+                // The connection is alive on either status — restore the token.
                 self.live = Some(live);
-                Ok(())
+                match status {
+                    CommandStatus::Completed => Ok(()),
+                    CommandStatus::ServerErrored => {
+                        // The pump surfaced the raw `ErrorResponse` to the sink
+                        // before the failure boundary, so the collector holds the
+                        // parsed cause; the connection stays pooled.
+                        match collector.take_db_error() {
+                            Some(db) => Err(DriverError::Db(db)),
+                            None => Err(DriverError::UnclassifiedFailure),
+                        }
+                    }
+                }
             }
-            Ok(Err(EngineError::ServerError)) => {
-                // The pump surfaced the raw `ErrorResponse` to the sink before the
-                // failure boundary, so the collector holds the parsed cause.
-                let err = match collector.take_db_error() {
-                    Some(db) => DriverError::Db(db),
-                    None => DriverError::UnclassifiedFailure,
-                };
-                self.reclaim_token();
-                Err(err)
-            }
+            // Fatal: the verb consumed the token and the connection is dead.
+            // `self.live` was taken before the verb and is not restored.
             Ok(Err(other)) => Err(lift_engine_error(other)),
             Err(SpuriousPending) => Err(DriverError::SpuriousPending),
-        }
-    }
-
-    /// Reclaim the token after a recoverable failure: drain the recovering
-    /// `ReadyForQuery` (or mint immediately when already clean-idle). On a
-    /// recovery failure the connection stays dead (`self.live` stays `None`).
-    fn reclaim_token(&mut self) {
-        // On a recovery failure `self.live` stays `None` — the correct dead-state
-        // outcome, encoded in the health bit rather than swallowed.
-        if let Ok(Ok(live)) = engine::poll_once(self.engine.recover()) {
-            self.live = Some(live);
         }
     }
 
@@ -544,8 +549,11 @@ impl Connection {
     /// Returns `Ok(None)` if the deadline passes with no notification (the
     /// connection stays alive). The wait is bounded by setting the socket read
     /// timeout on the control handle; a read-timeout on the engine's reads then
-    /// surfaces as a transport `WouldBlock`/`TimedOut`, classified here as "no
-    /// notification" and the token reclaimed.
+    /// surfaces inside the engine (via [`Transport::is_would_block`]) as the
+    /// [`NotifyStatus::Quiet`] outcome — the token rides back in `Ok`, so the
+    /// connection stays alive with no separate reclaim.
+    ///
+    /// [`Transport::is_would_block`]: bsql_postgres_proto::engine::Transport::is_would_block
     pub fn recv_notification(
         &mut self,
         timeout: Duration,
@@ -566,22 +574,22 @@ impl Connection {
         // classifying, so a notification result is not lost to a restore failure.
         let restore = self.socket_ctl.set_read_timeout(Some(self.read_timeout));
         match polled {
-            Ok(Ok(live)) => {
+            Ok(Ok(Outcome { live, status })) => {
+                // Alive on either status — the would-block deadline is the Quiet
+                // outcome, handled inside the engine, so the token rides back.
                 self.live = Some(live);
                 restore.map_err(DriverError::Io)?;
-                match captured {
-                    Some(Ok(notification)) => Ok(Some(notification)),
-                    Some(Err(e)) => Err(e),
-                    None => Ok(None),
+                match status {
+                    NotifyStatus::Received => match captured {
+                        Some(Ok(notification)) => Ok(Some(notification)),
+                        Some(Err(e)) => Err(e),
+                        // `Received` means the sink broke on a `Notify`, so the
+                        // capture is set; an empty capture is a classified
+                        // inconsistency, never a silent `None`.
+                        None => Err(DriverError::UnclassifiedFailure),
+                    },
+                    NotifyStatus::Quiet => Ok(None),
                 }
-            }
-            Ok(Err(EngineError::Transport(e))) if is_timeout(&e) => {
-                // No notification within the deadline; the read timed out before
-                // consuming anything, so the connection is alive — reclaim the
-                // token (a clean-idle reclaim mints without further I/O).
-                self.reclaim_token();
-                restore.map_err(DriverError::Io)?;
-                Ok(None)
             }
             Ok(Err(other)) => {
                 restore.map_err(DriverError::Io)?;
@@ -678,20 +686,11 @@ fn flatten_poll<T>(polled: Polled<T>) -> Result<T, DriverError> {
     }
 }
 
-/// Is `e` a read-timeout (a deadline, not a broken connection)?
-fn is_timeout(e: &WireError) -> bool {
-    matches!(
-        e,
-        TlsError::Socket(io)
-            if matches!(io.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
-    )
-}
-
-/// Lift an [`EngineError`] over the wire transport to a classified
-/// [`DriverError`]. The recoverable `ServerError` is handled by [`settle`] and
-/// is the dead arm here.
-///
-/// [`settle`]: Connection::settle
+/// Lift a FATAL [`EngineError`] over the wire transport to a classified
+/// [`DriverError`]. A recoverable server error never reaches here — the verb
+/// returns it as [`CommandStatus::ServerErrored`] inside `Ok`, which
+/// [`settle`](Connection::settle) maps to `DriverError::Db` — so the
+/// `ServerError` arm is the fatal drain-during-recovery case alone.
 fn lift_engine_error(e: EngineError<WireError>) -> DriverError {
     match e {
         EngineError::Transport(t) => lift_tls_error(t),

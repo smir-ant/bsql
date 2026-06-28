@@ -1,10 +1,10 @@
 error[E0382]: use of moved value: `token`
-  --> tests/engine_linearity/fail_reuse.rs:54:39
+  --> tests/engine_linearity/fail_reuse.rs:57:39
    |
-51 |         let token = block_on(e.connect(live)).unwrap();
+54 |         let token = block_on(e.connect(live)).unwrap();
    |             ----- move occurs because `token` has type `Live<'_>`, which does not implement the `Copy` trait
-52 |         let _next = block_on(e.connect(token)).unwrap();
+55 |         let _next = block_on(e.connect(token)).unwrap();
    |                                        ----- value moved here
-53 |         // Reuse the ALREADY-CONSUMED token — use of moved value:
-54 |         let _bad = block_on(e.connect(token)).unwrap();
+56 |         // Reuse the ALREADY-CONSUMED token — use of moved value:
+57 |         let _bad = block_on(e.connect(token)).unwrap();
    |                                       ^^^^^ value used here after move
