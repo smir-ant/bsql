@@ -7,6 +7,11 @@
 //! a typed `Row`, so it lends RAW wire bytes and the typed layer above
 //! (`query!` decode / `QueryResult`) owns the typing.
 //!
+//! The sole exception to the return shape is [`terminate`](Engine::terminate),
+//! the session-ending verb: it consumes the token and returns
+//! `Result<(), EngineError>` — no token comes back, because there is no reusable
+//! connection after a graceful close.
+//!
 //! # The disjoint split-borrow (mandatory)
 //!
 //! Every I/O verb destructures `&mut self` into its four fields
@@ -35,6 +40,9 @@
 //! caller-stop boundary is uninhabited — consumed via [`absurd`], never a
 //! wildcard. The lone breakable verb is [`recv_notification`](Engine::recv_notification)
 //! (`B = ()`), whose sink stops the pump on the first notification.
+//! [`terminate`](Engine::terminate) is outside this taxonomy entirely: it drives
+//! no pump and takes no sink (its frame elicits no server reply), so it has no
+//! caller-stop boundary to classify.
 //!
 //! # Schema surfacing (cutover composition)
 //!
@@ -55,17 +63,17 @@
 //! resume verb) is surfaced here yet. It is a deferred verb, not a gap in the
 //! framing: the dispatch handles the wire; only the verb wrapper is absent.
 //!
-//! # Deferred: graceful close (`terminate`)
+//! # Graceful close (`terminate`)
 //!
-//! No terminate/close verb is surfaced here yet. The PostgreSQL graceful close
-//! is a `Terminate` frame (`'X'`, a 5-byte tag-only frame `[b'X', 0, 0, 0, 4]`)
-//! sent to the server, then a transport-level shutdown; the engine currently
-//! offers only [`Transport::shutdown`](super::Transport::shutdown) (the
-//! transport-level close, no `Terminate` on the wire). To replicate a graceful
-//! close, a terminate verb must push the `Terminate` frame, flush it, call
-//! `Transport::shutdown`, and consume the [`Live`](super::Live) token (ideally
-//! into a `Closed` phase so the connection cannot be re-driven). It is a deferred
-//! verb, not a framing gap.
+//! The PostgreSQL graceful close is a `Terminate` frame (`'X'`, a 5-byte
+//! tag-only frame `[b'X', 0, 0, 0, 4]`) sent to the server, then a
+//! transport-level shutdown. [`terminate`](Engine::terminate) issues exactly
+//! that: it pushes the `Terminate` frame, drains it with
+//! [`flush`](super::flush), calls
+//! [`Transport::shutdown`](super::Transport::shutdown), and consumes the
+//! [`Live`](super::Live) token into the engine's closed phase so the connection
+//! cannot be re-driven — a verb after it is a move error, and any phase accessor
+//! is a classified [`WrongPhase`](super::WrongPhase).
 
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
@@ -74,7 +82,7 @@ use super::error::{EngineError, ExpectedRowCount, RowCountViolation};
 use super::frames;
 use super::pump::{poll_once, pump_active_to_boundary, Boundary, SpuriousPending, Surface};
 use super::seams::{absurd, Live, Never, Observer, Transport};
-use super::{Engine, SendBuf};
+use super::{Engine, Phase, SendBuf};
 use crate::ident::{Ident, StmtName};
 use crate::params::ParamsWriter;
 use crate::prepared::{PreparedQuery, RowDecode};
@@ -761,6 +769,85 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         let (value, live) = body(self, live)?;
         let live = flatten_poll(poll_once(self.simple_query(live, "COMMIT", noop_sink)))?;
         Ok((value, live))
+    }
+
+    /// Gracefully close the session: push the PostgreSQL `Terminate` frame
+    /// (`'X'`, the 5-byte tag-only frame), drain it to the wire, then shut the
+    /// transport's write side down — the orderly close a driver issues on
+    /// `close()` / `Drop`.
+    ///
+    /// Consumes the linear [`Live`](super::Live) token and returns NO token: the
+    /// session is over, so there is no reusable connection. A verb after
+    /// `terminate` is therefore a move error (no token to thread) AND — because
+    /// the engine transitions to its closed phase — a classified
+    /// [`EngineError::WrongPhase`] on any path that does not need the token (the
+    /// [`backend_pid`](Self::backend_pid) / [`tx_status`](Self::tx_status)
+    /// accessors). The two protections are independent: neither a stale token nor
+    /// a `&mut self` reborrow can re-drive a closed connection.
+    ///
+    /// Unlike the request-issuing verbs this drives no pump and takes no sink: the
+    /// `Terminate` frame elicits no server reply (the server closes the socket),
+    /// so there is nothing to read. It flushes the frame and shuts down, nothing
+    /// more.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::WrongPhase`] — `terminate` was called when the engine was
+    ///   not active (already closed, still connecting, or mid-transition).
+    /// - [`EngineError::Transport`] — the transport reported a write/flush failure
+    ///   while draining the frame, or a failure shutting the write side down.
+    /// - [`EngineError::WriteZero`] / [`EngineError::SendOverrun`] — from the
+    ///   flush drain (see [`flush`](super::flush)).
+    pub async fn terminate(&mut self, live: Live<'b>) -> Result<(), EngineError<T::Error>> {
+        // The disjoint split-borrow the crate's verbs use. `phase` is borrowed
+        // only for the wrong-phase classification (the reborrow ends immediately),
+        // the flush/shutdown awaits borrow ONLY `transport` + `send_buf`, and the
+        // closed-phase write in the synchronous tail then writes through the still-
+        // live, disjoint `&mut phase` binding — no reborrow of `self` (it would
+        // alias the field borrows held across the awaits) and no `&mut self`
+        // helper (which would alias the whole engine, E0499). The token `live` is
+        // a ZST moved in up front.
+        let Self {
+            transport,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        // Classify a non-active terminate before touching the wire. The reborrow
+        // of `*phase` ends here (NLL), so the closed-phase write below cannot
+        // alias it.
+        phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        // The prior command drained at its idle boundary, so `reset` empties the
+        // buffer while retaining the allocation. Queue the static `Terminate`
+        // literal (the sole wire authority for this parameterless frame) and drain
+        // it to the socket.
+        send_buf.reset();
+        send_buf.enqueue(&crate::wire::TERMINATE_WIRE_BYTES);
+        // Past the active check the connection is dead REGARDLESS of a transport
+        // error: the token is already committed to this close. So the flush and
+        // (best-effort) shutdown are attempted without an early `?`, then
+        // `Phase::Closed` is recorded UNCONDITIONALLY, and only THEN is the first
+        // failure propagated. This makes the closed phase a TOTAL post-active
+        // invariant — a failed `terminate` can never leave the engine `Active`
+        // with stale accessors returning `Ok`.
+        let flush_res = super::flush::flush(send_buf, transport).await;
+        // Orderly write-side teardown (TLS `close_notify` / socket FIN), attempted
+        // even if the flush errored — the socket is going away either way. A
+        // transport failure here is classified, never swallowed.
+        let shutdown_res = transport.shutdown().await.map_err(EngineError::Transport);
+        // Synchronous tail: the connection is dead. Record the closed phase so a
+        // post-close accessor classifies `WrongPhase`. `phase` is disjoint from
+        // the (now-released) `transport` / `send_buf` borrows, so this write is
+        // valid here.
+        *phase = Phase::Closed;
+        // The linear token is consumed, not returned — a verb after `terminate`
+        // is a move error. `Live` is a ZST, so this is purely type-level.
+        let _ = live;
+        // Propagate the first failure (flush before shutdown); the engine is
+        // already closed, so the error reports the cause without reviving it.
+        flush_res?;
+        shutdown_res?;
+        Ok(())
     }
 }
 

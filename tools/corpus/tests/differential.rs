@@ -380,6 +380,7 @@ fn verb_client_byte_corpus_is_representative() {
         "simple_query_select_rows",      // SimpleQuery rows
         "ping",                          // Ping (bare RFQ, degenerate boundary)
         "prepared_macro",                // ExecutePreparedDemo (query_params)
+        "terminate",                     // graceful close (Terminate frame → Closed)
         "multi_statement_delineated",    // per-statement delineation
         "copy_out",                      // COPY OUT
         "server_error_recovers",         // recoverable server error
@@ -600,7 +601,7 @@ fn full_corpus_coverage_no_fixture_escapes() {
         falsify::full_corpus().len(),
     );
     let expected_exclusions: std::collections::BTreeSet<&str> =
-        ["multi_statement_select", "terminate"].into_iter().collect();
+        ["multi_statement_select"].into_iter().collect();
     assert_eq!(
         excluded, expected_exclusions,
         "the documented structural exclusions changed; review the coverage report \

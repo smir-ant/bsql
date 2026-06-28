@@ -103,9 +103,14 @@ pub fn active_pull_corpus() -> Vec<Transcript> {
 }
 
 /// The client-bytes-comparable subset: `ActiveViaTrustHandshake` transcripts
-/// whose every step is one of `{SimpleQuery, Ping, ExecutePreparedDemo}` — the
-/// requests that map 1:1 onto a single bundling verb, so the verbs' outbound wire
-/// is byte-comparable against Adapter#1's push wire.
+/// whose every step is one of `{SimpleQuery, Ping, ExecutePreparedDemo, Terminate}`
+/// — the requests that map 1:1 onto a single bundling verb, so the verbs'
+/// outbound wire is byte-comparable against Adapter#1's push wire. `Terminate`
+/// belongs here (not the pull subset): it IS a verb (`terminate`), and the verb
+/// twin puts the byte-identical `Terminate` frame on the wire then transitions to
+/// the closed phase — the `Closed` terminal observable Adapter#1 produces. The
+/// pull twin, which emits no client wire, still reproduces the response-side
+/// `Closed` observable for the verb differential's `verb`-vs-`pull` cross-check.
 ///
 /// Exclusions, each STRUCTURAL (never "rare"/"atypical"):
 /// - The fine-grained extended fixtures (separate `Prepare`/`DescribeStatement`/
@@ -131,6 +136,7 @@ pub fn verb_client_byte_corpus() -> Vec<Transcript> {
                 ClientRequest::SimpleQuery(_)
                     | ClientRequest::Ping
                     | ClientRequest::ExecutePreparedDemo(_)
+                    | ClientRequest::Terminate
             )
         });
         if all_byte_comparable && t.name != "multi_statement_select" {
@@ -158,14 +164,6 @@ pub const STRUCTURAL_EXCLUSIONS: &[(&str, &str)] = &[
          the old engine flattens a row-first `;`-batch into a single result set, \
          so a consumer relying on the old flattened shape sees a different \
          result-set COUNT after the cutover.",
-    ),
-    (
-        "terminate",
-        "The strangler engine exposes no terminate verb / Terminate frame \
-         builder yet, and a Terminate carries no server reply — so neither the \
-         response-driven pull nor the verb path can produce its `Closed` \
-         terminal observable. Covered by Adapter#1 only until a terminate verb \
-         lands.",
     ),
 ];
 

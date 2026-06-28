@@ -81,8 +81,9 @@ impl EngineAdapter {
     /// `BindExecuteRowLimited`/`CloseStatement`/`ExecutePreparedDemo`). State is
     /// reconstructed from each request's TAG (seating the engine via its
     /// `begin_*` seam) plus the server frames — no client wire is encoded. A
-    /// `Ping` (bare `ReadyForQuery`) or `Terminate` (no reply) is not
-    /// pull-drivable and reports a failed run.
+    /// `Terminate` carries no server reply, so the pull twin records its `Closed`
+    /// terminal directly (the observable is fully request-determined); it is the
+    /// verb twin that puts the `Terminate` frame on the wire.
     #[must_use]
     pub fn pull(&self, transcript: &Transcript) -> ObservedRun {
         run_pull(transcript)
@@ -480,8 +481,7 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
         // extended-protocol verb seats its matching state. `Ping` is a bare
         // `Sync` whose `ReadyForQuery` lands at `Idle` with no command boundary —
         // no seat, and the per-step degenerate-result-set synthesis below mirrors
-        // Adapter#1's statement-less result set. `Terminate` (no server reply at
-        // all) is not pull-drivable; reaching one reports not-ready.
+        // Adapter#1's statement-less result set.
         match &step.request {
             ClientRequest::SimpleQuery(_) | ClientRequest::Ping => {}
             ClientRequest::Prepare(_) => active.begin_parse(),
@@ -496,7 +496,15 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
             ClientRequest::ExecutePreparedDemo(_) => {
                 active.begin_parse_bind_execute(&DEMO_RESULT_OIDS)
             }
-            ClientRequest::Terminate => return failed_run(Vec::new()),
+            // A client-initiated graceful close carries no server reply, so there
+            // is nothing to pull: the observable is fully determined by the
+            // request. Record the Closed terminal directly (the response-side twin
+            // of the live engine setting Closed on the terminate push) and end the
+            // run — `outcome` stays `Ok(default)`, matching Adapter#1's pin.
+            ClientRequest::Terminate => {
+                terminal = ObservedStatus::Closed;
+                break;
+            }
         }
 
         let mut scratch = drive_step(
@@ -871,7 +879,7 @@ impl VerbCapture {
 }
 
 /// Whether every step of `transcript` is in the client-bytes-comparable verb
-/// subset `{SimpleQuery, Ping, ExecutePreparedDemo}`.
+/// subset `{SimpleQuery, Ping, ExecutePreparedDemo, Terminate}`.
 fn all_steps_verb_drivable(transcript: &Transcript) -> bool {
     transcript.steps.iter().all(|s| {
         matches!(
@@ -879,6 +887,7 @@ fn all_steps_verb_drivable(transcript: &Transcript) -> bool {
             ClientRequest::SimpleQuery(_)
                 | ClientRequest::Ping
                 | ClientRequest::ExecutePreparedDemo(_)
+                | ClientRequest::Terminate
         )
     })
 }
@@ -951,6 +960,18 @@ fn run_verb_body<'b>(
 
     let mut live = live;
     for step in &transcript.steps {
+        // A graceful close ends the session: the verb consumes the linear token
+        // and returns no `Live`, so it cannot thread through `drive_verb_step`.
+        // Drive it here, record the Closed terminal, and stop — the `Terminate`
+        // frame is captured as the client wire (matching Adapter#1's push).
+        if matches!(step.request, ClientRequest::Terminate) {
+            terminal = match poll_once(engine.terminate(live)) {
+                Ok(Ok(())) => ObservedStatus::Closed,
+                // A transport/phase failure on close: classified, never dropped.
+                _ => ObservedStatus::Errored(TerminalErrorKind::Protocol),
+            };
+            break;
+        }
         let mut cap = VerbCapture::new();
         match drive_verb_step(
             engine,

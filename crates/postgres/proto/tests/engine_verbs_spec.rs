@@ -1,6 +1,8 @@
 //! Active-phase verb-surface behavioural spec.
 //!
-//! Drives each of the 15 verbs over a scripted (always-ready) transport via the
+//! Drives each of the 15 token-threading verbs (the session-ending `terminate`
+//! has its own spec, `engine_terminate_spec`) over a scripted (always-ready)
+//! transport via the
 //! synchronous single-poll helper, asserting the verb reaches the right boundary
 //! and surfaces the right results. The row-count guards
 //! ([`query_one`](bsql_postgres_proto::engine::Engine::query_one) /

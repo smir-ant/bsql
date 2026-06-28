@@ -118,6 +118,7 @@ const PUMP: &str = "crates/postgres/proto/tests/engine_pump_spec.rs";
 const ACTIVE: &str = "crates/postgres/proto/tests/engine_active_spec.rs";
 const VERBS: &str = "crates/postgres/proto/tests/engine_verbs_spec.rs";
 const CONNECT: &str = "crates/postgres/proto/tests/engine_connect_spec.rs";
+const TERMINATE: &str = "crates/postgres/proto/tests/engine_terminate_spec.rs";
 const CONNECTING: &str = "crates/postgres/proto/tests/engine_connecting_spec.rs";
 const FLUSH_CANCEL: &str = "crates/postgres/proto/tests/engine_flush_cancel.rs";
 const FLUSH_ALLOC: &str = "crates/postgres/proto/tests/engine_flush_alloc.rs";
@@ -303,6 +304,10 @@ const SECTION7: &[Row] = &[
         ("failed_terminal_surfaces_error_then_returns_failed", PUMP),
         ("server_error_is_classified", VERBS),
     ])),
+    r(7, A7, "graceful close (terminate → Closed; post-close accessor classified)", Ev::Tests(&[
+        ("terminate_sends_frame_shuts_down_and_closes", TERMINATE),
+        ("accessor_after_terminate_is_wrong_phase", TERMINATE),
+    ])),
     r(7, A7, "post-consume (move-after-consume is a compile error)",
         Ev::Test("use_after_close_is_e0382", VERBS_CF)),
     r(7, A7, "phase-typed events (an active event is not an auth event)",
@@ -411,9 +416,10 @@ const WIRE_PINS: usize = 24;
 /// Reproduce: count the upper-case-leading lines inside the `pub enum
 /// EngineError<E> { .. }` block in `engine/error.rs`.
 const ENGINE_ERROR_VARIANTS: usize = 14;
-/// Active-phase verbs (each threads the linear `Live` token).
+/// Active-phase verbs (each takes the linear `Live` token; all return it save the
+/// session-ending `terminate`, which consumes it into the closed phase).
 /// Reproduce: `grep -c "live: Live<'b>" crates/postgres/proto/src/engine/verbs.rs`
-const ACTIVE_VERBS: usize = 15;
+const ACTIVE_VERBS: usize = 16;
 /// `core::hint::cold_path()` classified-branch markers across `engine/`.
 /// Reproduce: `grep -rho 'core::hint::cold_path()' crates/postgres/proto/src/engine/*.rs | wc -l`
 const COLD_CLASSIFIED_BRANCHES: usize = 29;

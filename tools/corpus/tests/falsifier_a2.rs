@@ -190,29 +190,29 @@ fn a2_falsifier_catch_rate() {
         .collect();
     println!("A2 union NOT caught: {uncaught:?}\n");
 
-    // 1. The A2 oracle catches every modeled defect EXCEPT exactly one, and that
-    //    one is the falsifier shadow of the documented `terminate` structural
-    //    exclusion: `closed_to_ready` flips a `Closed` terminal, but no Adapter#2
-    //    surface can produce a `Closed` observable (the strangler engine has no
-    //    terminate verb yet, and a Terminate carries no server reply). When a
-    //    terminate verb lands, this assertion fails and forces the gap closed.
+    // 1. The A2 oracle now catches EVERY modeled defect — the previous
+    //    `closed_to_ready` blind spot is closed. That mutation flips a `Closed`
+    //    terminal; the `terminate` verb landed, so the verb twin drives a real
+    //    graceful close (the `Terminate` frame on the wire → the engine's closed
+    //    phase → the `Closed` terminal observable) and the pull twin reproduces
+    //    the same response-side `Closed`, so flipping it to `Ready` now diverges.
+    //    There is no longer any structural terminate gap.
     assert_eq!(
         uncaught,
-        vec!["closed_to_ready"],
+        Vec::<&str>::new(),
         "the A2 oracle's blind spots changed; investigate before relaxing \
          (a NEW miss is a real engine discrimination gap, not a test to weaken)",
     );
 
-    // 2. The ≥92% floor (target 100% — match A1's 70/70). The single structural
-    //    gap above leaves the union at total-1.
+    // 2. 100% — the A2 union now catches every modeled defect, matching A1's
+    //    catch rate. The ≥92% floor below is kept as a redundant lower bound.
     assert!(
         union_caught.saturating_mul(100) >= total.saturating_mul(92),
         "A2 union catch rate {union_caught}/{total} below the 92% floor",
     );
     assert_eq!(
-        union_caught,
-        total - 1,
-        "expected the A2 union to catch all but the one structural terminate gap",
+        union_caught, total,
+        "expected the A2 union to catch every modeled defect (no structural gap remains)",
     );
 
     // 2b. Every previously-MISSED blind-spot class the corpus was widened to catch

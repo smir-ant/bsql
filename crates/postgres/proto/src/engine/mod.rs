@@ -240,12 +240,17 @@ pub struct EngineNoObs<'b, T> {
 }
 
 /// The engine's protocol phase: the connecting handshake brain, the active
-/// post-handshake handle, or the move-out placeholder occupied only during the
-/// synchronous Connecting→Active swap.
+/// post-handshake handle, the move-out placeholder occupied only during the
+/// synchronous Connecting→Active swap, or the terminal closed state a graceful
+/// [`terminate`](Engine::terminate) leaves behind.
 ///
 /// The two live phases overlay one another (a single [`IngestBuf`] is carried
 /// across the transition by [`ConnectingEngine::into_active`], never doubled),
-/// so the engine is sized by its larger phase, not their sum.
+/// so the engine is sized by its larger phase, not their sum. [`Closed`](Phase::Closed)
+/// is a unit variant — it adds no bytes (the discriminant already spans the live
+/// phases) — and routes through the same cold wrong-phase arm as the non-active
+/// phases, so a verb or accessor after a graceful close is a classified
+/// [`WrongPhase`], never a silent no-op.
 #[derive(Debug)]
 enum Phase {
     /// Driving the startup/auth handshake.
@@ -257,6 +262,13 @@ enum Phase {
     /// synchronous tail. Never held across an `.await` and never observed by a
     /// caller (the swap completes before the next suspension point).
     Transitioning,
+    /// The terminal state a graceful [`terminate`](Engine::terminate) leaves: the
+    /// `Terminate` frame has been pushed and the transport shut down, so the
+    /// connection is dead. Every verb consumed its linear token, so a verb after
+    /// `terminate` is already a move error; this variant additionally classifies
+    /// any phase accessor (`backend_pid` / `tx_status`) as [`WrongPhase`] rather
+    /// than reviving a closed connection. Entered only by `terminate`; never left.
+    Closed,
 }
 
 impl Phase {
@@ -265,7 +277,7 @@ impl Phase {
     fn as_active(&self) -> Result<&ActiveEngine, WrongPhase> {
         match self {
             Phase::Active(active) => Ok(active),
-            Phase::Connecting(_) | Phase::Transitioning => {
+            Phase::Connecting(_) | Phase::Transitioning | Phase::Closed => {
                 core::hint::cold_path();
                 Err(WrongPhase)
             }
@@ -283,7 +295,7 @@ impl Phase {
     fn as_active_mut(&mut self) -> Result<&mut ActiveEngine, WrongPhase> {
         match self {
             Phase::Active(active) => Ok(active),
-            Phase::Connecting(_) | Phase::Transitioning => {
+            Phase::Connecting(_) | Phase::Transitioning | Phase::Closed => {
                 core::hint::cold_path();
                 Err(WrongPhase)
             }
@@ -384,7 +396,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         let outcome = {
             let conn = match phase {
                 Phase::Connecting(conn) => conn,
-                Phase::Active(_) | Phase::Transitioning => {
+                Phase::Active(_) | Phase::Transitioning | Phase::Closed => {
                     core::hint::cold_path();
                     return Err(EngineError::WrongPhase(WrongPhase));
                 }
@@ -433,7 +445,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
                         core::hint::cold_path();
                         Err(EngineError::WrongPhase(WrongPhase))
                     }
-                    Phase::Transitioning => {
+                    Phase::Transitioning | Phase::Closed => {
                         core::hint::cold_path();
                         Err(EngineError::WrongPhase(WrongPhase))
                     }
