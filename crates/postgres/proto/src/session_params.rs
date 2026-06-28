@@ -71,7 +71,7 @@ const MAX_ENCODING_NAME_LEN: usize = 32;
 ///
 /// PG supports ~42 encodings; this enum lists the ones common in
 /// practice with an `Other(..)` fallback carrying the raw bytes
-/// for faithful round-trip. Unlike [`crate::error::Severity`]
+/// for faithful round-trip. Unlike `crate::error::Severity`
 /// whose unknown-variant discards bytes, [`Encoding::Other`]
 /// preserves them — so a consumer can still introspect an
 /// unexpected server encoding without information loss.
@@ -300,7 +300,7 @@ fn parse_pg_bool(value: &[u8]) -> Option<bool> {
 ///
 /// Populated during the post-authentication handshake from
 /// `ParameterStatus` messages. Read-only after handshake
-/// completes. Accessible via [`crate::PgProtocol::session_params`].
+/// completes. Accessible via `crate::PgProtocol::session_params`.
 ///
 /// Fixed struct, no map, no overflow class.
 ///

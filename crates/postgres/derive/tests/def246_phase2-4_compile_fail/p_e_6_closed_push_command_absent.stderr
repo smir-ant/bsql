@@ -1,5 +1,0 @@
-error[E0599]: no method named `push_command` found for struct `PgProtocol<P>` in the current scope
-  --> tests/def246_phase2-4_compile_fail/p_e_6_closed_push_command_absent.rs:43:20
-   |
-43 |     let _ = closed.push_command();
-   |                    ^^^^^^^^^^^^ method not found in `PgProtocol<ClosedPhase>`

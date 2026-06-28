@@ -26,14 +26,37 @@
 #
 # Format: one `family_name = relative/path/from/repo/root` per line; blank lines
 # and `#` comment lines are ignored.
+#
+# The families that probed the retired push-path engine's internals were
+# removed when that engine was deleted — the machinery they pinned no longer
+# exists. Two of them carried properties that still matter on the sans-IO
+# engine and were PORTED to real successor specs (registered below), not merely
+# relabelled:
+#   * buf_compact_staleness_spec  → engine_ingest_residue_spec. The old test
+#     pinned a POSITIVE residue-scrub (ReadBuf::compact zeroed the abandoned
+#     tail). IngestBuf replaces that with zero-once + a `filled` watermark:
+#     the read side (`unread`) only ever sees `active[cursor..filled]`, so a
+#     stale spare byte is never PUBLISHED (no per-read scrub needed). The new
+#     spec proves that residue property behaviourally. (engine_ingest_memset_guard
+#     is a DIFFERENT, complementary gate — a source-scan forbidding a per-read
+#     memset on the hot path — not the residue property; the earlier note that
+#     conflated them was imprecise.)
+#   * fuzz_stress_spec            → engine_active_fuzz_spec. The randomised
+#     xorshift byte-stream fuzzing (parse_header 100K + the active ingest
+#     framer 10K) was lost in the cutover; engine_hostile_spec is STRUCTURED
+#     (non-random) adversarial coverage, not a substitute. The new spec ports
+#     the PRNG + iteration counts to the live targets.
+# The remaining three had no surviving property to port:
+#   * sole_path_compile_fail      → engine_linearity_compile_fail (construction sealing)
+#   * error_arena_staleness_spec  → (error arena deleted; engine surfaces errors via EngineError)
+#   * session_params_staleness_spec → (the PgProtocol Box-slot deleted; SessionParams the type stays)
+# scram_fuzz_spec was REWRITTEN IN PLACE to drive the new connecting engine
+# (its SCRAM-parser-robustness property is a carve-out, not push-path-specific).
 
 scram_fuzz_spec = crates/postgres/proto/tests/scram_fuzz_spec.rs
-fuzz_stress_spec = crates/postgres/proto/tests/fuzz_stress_spec.rs
 scram_zeroize_miri_spec = crates/postgres/proto/tests/scram_zeroize_miri_spec.rs
 zeroize_coverage_spec = crates/postgres/proto/tests/zeroize_coverage_spec.rs
 footprint_drift_compile_fail = crates/postgres/proto/tests/footprint_drift_compile_fail.rs
-sole_path_compile_fail = crates/postgres/proto/tests/sole_path_compile_fail.rs
-buf_compact_staleness_spec = crates/postgres/proto/tests/buf_compact_staleness_spec.rs
-error_arena_staleness_spec = crates/postgres/proto/tests/error_arena_staleness_spec.rs
-session_params_staleness_spec = crates/postgres/proto/tests/session_params_staleness_spec.rs
 secret_bounded_str_spec = crates/postgres/proto/tests/secret_bounded_str_spec.rs
+engine_ingest_residue_spec = crates/postgres/proto/tests/engine_ingest_residue_spec.rs
+engine_active_fuzz_spec = crates/postgres/proto/tests/engine_active_fuzz_spec.rs

@@ -4,14 +4,14 @@
 //! byte size and alignment of every stable public type is pinned to its
 //! measured value, and any drift fails the build. Two macros carry the regime:
 //!
-//! - [`footprint_pin!`] pins a **nameable** type's `size_of` *and* `align_of`
+//! - [`crate::footprint_pin`] pins a **nameable** type's `size_of` *and* `align_of`
 //!   with a free-standing `const _: () = { … }` item. A drift turns one of the
 //!   emitted `assert!`s false and aborts the build with an `E0080` const-eval
 //!   failure — **at `cargo check`, including for a type constructed nowhere**.
 //!   This is the strongest possible gate: it needs neither a test run nor a
 //!   construction site.
 //!
-//! - [`future_pin!`] pins the `size_of_val` of a **concrete future** produced
+//! - [`crate::future_pin`] pins the `size_of_val` of a **concrete future** produced
 //!   by an `async fn` or async block. A future's type is *unnameable* and its
 //!   size is *not* const-evaluable (you cannot call the `async fn` in a `const`
 //!   context — `E0015`), so there is no `E0080` path here. The strongest
@@ -22,13 +22,13 @@
 //!
 //! A bare `size_of` anchor is blind to a **size-preserving alignment drift**: a
 //! field reorder can raise `align` from 4 to 8 without changing the byte count,
-//! or a niche can be lost while the size holds. [`footprint_pin!`] pins both in
+//! or a niche can be lost while the size holds. [`crate::footprint_pin`] pins both in
 //! one co-located anchor so the two cannot drift apart.
 //!
 //! # Runtime cost
 //!
-//! Zero. [`footprint_pin!`] emits a `const _: ()` item that is fully erased by
-//! codegen. [`future_pin!`] emits a `#[cfg(test)]`-gated `#[test]` that exists
+//! Zero. [`crate::footprint_pin`] emits a `const _: ()` item that is fully erased by
+//! codegen. [`crate::future_pin`] emits a `#[cfg(test)]`-gated `#[test]` that exists
 //! only in the test binary.
 //!
 //! # Baseline footprint (measured @ aarch64-apple-darwin, rustc 1.96.0)
@@ -142,7 +142,7 @@ macro_rules! footprint_pin {
 ///
 /// A future's type is unnameable and its size is **not** const-evaluable (the
 /// producing `async fn` cannot be called in a `const` context — `E0015`), so
-/// there is no `E0080` compile-time path for it the way [`footprint_pin!`] has
+/// there is no `E0080` compile-time path for it the way [`crate::footprint_pin`] has
 /// for a nameable type. A `cargo test` assertion is the strongest gate
 /// available: it fires whenever the test binary runs, catching any growth of
 /// the state-machine the `async fn` lowers to (an added `.await`, a wider

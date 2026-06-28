@@ -49,7 +49,6 @@ impl DbError {
 #[derive(Debug)]
 pub enum DriverError {
     Db(DbError),
-    Protocol(bsql_postgres_proto::ProtocolError),
     Io(std::io::Error),
     NotReady,
     SslRefused,
@@ -59,11 +58,6 @@ pub enum DriverError {
     /// offset, or cell length than `u32`/`u16` can address). Never silently
     /// truncated — the row is rejected so no corrupted bytes are surfaced.
     RowTooLarge,
-    /// The streaming row collector could not make progress: the protocol
-    /// asked for more bytes but none could be supplied (premature server
-    /// close mid-stream, or a feed the protocol rejected). Surfacing this
-    /// instead of spinning or truncating keeps the result honest.
-    StreamStalled,
     /// A `FailReply` was observed but the protocol carried no classified
     /// cause for it. A failure definitely occurred; its detail is absent —
     /// distinct from the connection merely being not-ready.
@@ -115,14 +109,12 @@ impl fmt::Display for DriverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Db(e) => write!(f, "{e}"),
-            Self::Protocol(e) => write!(f, "protocol error: {e}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::NotReady => write!(f, "connection not ready"),
             Self::SslRefused => write!(f, "server refused SSL"),
             Self::NoRows => write!(f, "query returned no rows"),
             Self::Config(msg) => write!(f, "config error: {msg}"),
             Self::RowTooLarge => write!(f, "result row too large to represent (exceeds 32-bit arena bounds)"),
-            Self::StreamStalled => write!(f, "row stream stalled: server provided no further data mid-stream"),
             Self::UnclassifiedFailure => write!(f, "server reported a failure with no classified cause"),
             Self::NonUtf8Payload => write!(f, "server payload was not valid UTF-8"),
             Self::TimeoutOverflow => write!(f, "requested timeout overflows the monotonic clock"),
@@ -139,14 +131,12 @@ impl std::error::Error for DriverError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Db(e) => Some(e),
-            Self::Protocol(e) => Some(e),
             Self::Io(e) => Some(e),
             Self::NotReady
             | Self::SslRefused
             | Self::NoRows
             | Self::Config(_)
             | Self::RowTooLarge
-            | Self::StreamStalled
             | Self::UnclassifiedFailure
             | Self::NonUtf8Payload
             | Self::TimeoutOverflow
@@ -167,9 +157,6 @@ impl From<crate::types::RowTooLarge> for DriverError {
 
 impl From<std::io::Error> for DriverError {
     fn from(e: std::io::Error) -> Self { Self::Io(e) }
-}
-impl From<bsql_postgres_proto::ProtocolError> for DriverError {
-    fn from(e: bsql_postgres_proto::ProtocolError) -> Self { Self::Protocol(e) }
 }
 impl From<DbError> for DriverError {
     fn from(e: DbError) -> Self { Self::Db(e) }

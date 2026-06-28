@@ -60,6 +60,7 @@ cargo test --workspace               # unit + integration (non-ignored)
 cargo test --workspace --doc         # doctests
 cargo test -p bsql-devgates --test deps_pin            # dependency-frontier gate
 cargo test -p bsql-devgates --test runtime_graph_pin   # build-time-only boundary gate
+cargo test -p bsql-devgates --test doc_links           # intra-doc-link wall (broken-link deny)
 cargo test -p bsql-sqlite            # SQLite (no PG needed)
 cargo test -p bsql-postgres-async --test sq_live -- --ignored    # async PG (needs local PG)
 cargo test -p bsql-postgres-sync --test sync_live -- --ignored   # sync PG (needs local PG)
@@ -82,6 +83,17 @@ covers that blind spot: it parses each shipped crate's `cargo tree -e normal`
 `[build-dependencies]` into a shipped crate's `[dependencies]` would leak
 `sqlparser` into the runtime/forbid closure; `deps_pin` stays green on that, but
 `runtime_graph_pin` turns red.
+
+The `doc_links` gate (`tools/devgates/tests/doc_links.rs`) is the intra-doc-link
+wall: it runs `cargo doc --workspace --no-deps` with
+`RUSTDOCFLAGS=-D rustdoc::broken_intra_doc_links` (in a dedicated
+`CARGO_TARGET_DIR` to avoid contending for the parent build lock) and asserts
+the doc build succeeds. A doc comment that links to a symbol a deletion removed
+(`cargo build`/`clippy`/`cargo test` never resolve intra-doc links) fails this
+gate the moment it lands. Scope: the PUBLIC documented surface of every member
+(a `--document-private-items` tightening is a follow-up — it currently surfaces
+unrelated pre-existing private-doc rot in the build-time inference crate + an
+engine `super::flush` ambiguity).
 
 PG tests require: PostgreSQL on localhost:5432, user `smir-ant`, database `postgres`, trust auth.
 SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in pg_hba.conf.

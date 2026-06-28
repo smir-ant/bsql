@@ -14,9 +14,8 @@
 //!   DELETE, WITH ...}. DDL is rejected.
 //!
 //! Output: `(Vec<ParamSpec>, Vec<ColumnSpec>)` — one entry per
-//! placeholder (`$N`) and per result column. The macro consumes
-//! these in [`crate::lib::prepared`] to build the `PreparedQuery`
-//! struct literal.
+//! placeholder (`$N`) and per result column. The `prepared!` macro
+//! consumes these to build the `PreparedQuery` struct literal.
 //!
 //! # Tier discipline
 //!

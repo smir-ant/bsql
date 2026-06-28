@@ -78,7 +78,7 @@
 //!
 //! ```text
 //! bsql-pg-proto        — sans-IO wire protocol state machine (no_std)
-//! bsql-postgres-core   — Session + types + config + SSL (shared)
+//! bsql-postgres-core   — engine materialiser + types + config + SSL (shared)
 //! bsql-postgres-async  — tokio thin adapter (~550 LoC)
 //! bsql-postgres-sync   — std::net thin adapter (~560 LoC)
 //! bsql-sqlite          — embedded SQLite driver (~340 LoC)

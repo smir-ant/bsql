@@ -49,40 +49,20 @@ fn core_stable_public_types_match_baseline() {
     }
 }
 
-/// Per-connection resident footprint estimate.
+/// Per-connection resident footprint anchor.
 ///
-/// The live memory a single open PostgreSQL connection holds, excluding the
-/// OS-kernel socket buffers (which the driver does not allocate):
-///
-/// ```text
-///   component                       bytes   where
-///   read buffer (Vec<u8>)            4096   heap, fixed at connect (READ_BUF_CAP)
-///   Session (holds the protocol      2528   inline in Connection
-///     state machine + pump scratch)
-///   ----------------------------------------
-///   ≈ 6.6 KB resident per idle connection
-/// ```
-///
-/// `Session` is a transitional type (the protocol state machine plus pump
-/// scratch); it is slated to shrink when a unified engine replaces the per-driver
-/// pump. The 4096-byte read buffer is a tuning constant (`READ_BUF_CAP`), pinned
-/// in `bsql-postgres-proto`, not a type footprint. This estimate is recorded as
-/// a comparison anchor; the live `Session` size is asserted here so a regression
-/// in the dominant resident component is visible.
+/// The dominant heap component a single open PostgreSQL connection holds,
+/// excluding the OS-kernel socket buffers (which the driver does not allocate),
+/// is the engine's read buffer — a fixed `READ_BUF_CAP`-byte allocation made
+/// once per connection. The constant is pinned in `bsql-postgres-proto`; this
+/// re-asserts it from the consumer side so a tuning change lands on the review
+/// surface here too.
 #[test]
 fn per_connection_resident_estimate() {
     // The read buffer is a fixed 4 KiB allocation made once per connection.
     assert_eq!(
         bsql_postgres_proto::READ_BUF_CAP, 4096,
         "per-connection read buffer size changed; update the resident estimate"
-    );
-    // The dominant inline component. This is a transitional (pre-engine) type;
-    // the pin tracks the current cost so a regression before the rewrite is
-    // visible, and is regenerated when the engine type lands.
-    assert_eq!(
-        size_of::<bsql_postgres_core::Session>(),
-        2528,
-        "Session inline size changed; update the per-connection resident estimate"
     );
 }
 

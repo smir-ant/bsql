@@ -5,8 +5,7 @@
 //!
 //! Without a uniform witness, zeroize-on-drop verification stays
 //! **tier-2 by-discipline**: manual memory-probe tests (e.g.
-//! `scram_zeroize_miri_spec.rs`, `error_arena_staleness_spec.rs`,
-//! `session_params_staleness_spec.rs`, `secret_bounded_str_spec.rs`)
+//! `scram_zeroize_miri_spec.rs`, `secret_bounded_str_spec.rs`)
 //! cover SOME secret-bearing types via `unsafe`-pointer reads of
 //! post-Drop memory, all `#[ignore]`-gated (run only via
 //! `cargo test -- --ignored` or `cargo miri test`). Other secret-
@@ -284,18 +283,6 @@ pub(crate) trait CrateZeroizeSecret: sealed::Sealed {}
 // originating definition site.
 // ─────────────────────────────────────────────────────────────────────
 
-// `bsql-pg-proto::buf::ReadBufN<N>` — manual Drop impl at `buf.rs:382`.
-// Carries `inner.as_mut_slice().zeroize()` body.
-impl<const N: usize> sealed::Sealed for crate::buf::ReadBufN<N> {}
-impl<const N: usize> CrateZeroizeSecret for crate::buf::ReadBufN<N> {}
-
-// `bsql-pg-proto::buf::ReadBuf` — two-tier inline+heap buffer.
-// Manual Drop impl zeroizes BOTH inline storage and heap-Box
-// contents (if escaped). Inline path is the common case (frames
-// ≤ 256 B); heap escape on first overflow.
-impl sealed::Sealed for crate::buf::ReadBuf {}
-impl CrateZeroizeSecret for crate::buf::ReadBuf {}
-
 // `bsql-pg-proto::engine::SendBuf` — engine-owned outbound send buffer.
 // Manual Drop impl scrubs the FULL `Vec` capacity (`self.buf.zeroize()`),
 // including the spare capacity where `reset`'s truncate leaves already-sent
@@ -308,11 +295,6 @@ impl CrateZeroizeSecret for crate::engine::SendBuf {}
 // array (if escaped) once on teardown.
 impl sealed::Sealed for crate::engine::IngestBuf {}
 impl CrateZeroizeSecret for crate::engine::IngestBuf {}
-
-// `bsql-pg-proto::error_arena::ErrorPayload` — `derive(ZeroizeOnDrop)`
-// at `error_arena.rs:129`. Carries 3× `SecretBoundedStr<N>` fields.
-impl sealed::Sealed for crate::error_arena::ErrorPayload {}
-impl CrateZeroizeSecret for crate::error_arena::ErrorPayload {}
 
 // `bsql-pg-proto::ident::SecretBoundedStr<N>` — manual `impl Zeroize`
 // at `ident.rs:702` + manual `impl Drop` at `ident.rs:711`. Drop body

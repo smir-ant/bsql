@@ -75,11 +75,9 @@ use alloc::string::{String, ToString};
 ///
 /// Order: alphabetical by path for diff stability.
 const SRC_FILES: &[(&str, &str)] = &[
-    ("src/buf.rs", include_str!("../src/buf.rs")),
     ("src/drop_witness.rs", include_str!("../src/drop_witness.rs")),
     ("src/engine/flush.rs", include_str!("../src/engine/flush.rs")),
     ("src/engine/ingest.rs", include_str!("../src/engine/ingest.rs")),
-    ("src/error_arena.rs", include_str!("../src/error_arena.rs")),
     ("src/ident.rs", include_str!("../src/ident.rs")),
     ("src/md5.rs", include_str!("../src/md5.rs")),
     ("src/password.rs", include_str!("../src/password.rs")),
@@ -570,9 +568,7 @@ fn manifest_covers_every_zeroize_on_drop_secret_type() {
 
 /// Sanity: the discovered set is non-empty. Catches a regression
 /// that breaks the source-scan logic (e.g., regex pattern drift).
-/// The crate has at least 6 `derive(ZeroizeOnDrop)` types and 2
-/// manual `impl Drop` with `.zeroize()`. If we discover zero, the
-/// scanner is broken, not the source.
+/// If we discover zero, the scanner is broken, not the source.
 #[test]
 fn source_scanner_finds_at_least_baseline_count() {
     let discovered = discover_zeroize_types();
@@ -580,8 +576,8 @@ fn source_scanner_finds_at_least_baseline_count() {
         discovered.len() >= 8,
         "zeroize-on-drop source scanner regressed: discovered only {} types \
          but baseline is ≥ 8 (Password, Sensitive, ScramSession, \
-         SecretDigest, Md5HandshakeState, ErrorPayload, SecretBoundedStr, \
-         ReadBufN, WriteBuf). Discovered: {discovered:?}",
+         SecretDigest, Md5HandshakeState, SecretBoundedStr, WriteBuf, \
+         SendBuf, IngestBuf). Discovered: {discovered:?}",
         discovered.len(),
     );
 }

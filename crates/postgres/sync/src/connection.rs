@@ -161,12 +161,12 @@ impl Connection {
         if config.ssl_mode == SslMode::Disable {
             return Ok(Wire::Plain(SyncSocket::new(tcp)));
         }
-        let (ssl_bytes, ssl_proto) = bsql_postgres_core::ssl::ssl_request_bytes();
+        let ssl_bytes = bsql_postgres_core::ssl::ssl_request_bytes();
         let mut tcp = tcp;
         Write::write_all(&mut tcp, ssl_bytes)?;
         let mut response = [0u8; 1];
         Read::read_exact(&mut tcp, &mut response)?;
-        match bsql_postgres_core::ssl::classify_ssl_response(ssl_proto, response[0], config)? {
+        match bsql_postgres_core::ssl::classify_ssl_response(response[0], config)? {
             bsql_postgres_core::ssl::SslProbe::Accepted { server_name } => {
                 // Use the provider-explicit ring config from `shared_client_config`:
                 // under the ring-only crypto pin a bare `ClientConfig::builder()`

@@ -94,31 +94,6 @@ trybuild = { workspace = true }
 # read instead of five copies.
 bsql-devgates = { path = "../../../tools/devgates" }
 
-# -- Bench targets --
-# `harness = false` disables the default libtest bench runner; we
-# use criterion's own main-function runner instead (generates HTML
-# reports + statistical analysis in target/criterion).
-#
-# No `required-features` — the bench file uses public-API only
-# (`feed_inbound` + `criterion::iter_batched`); no crate-internal
-# hooks needed. Run with plain `cargo bench`.
-[[bench]]
-name = "hot_paths"
-harness = false
-
-# Allocation-traffic measurement bench (B-layer of `BENCHMARKING.md`
-# stack). Companion to `hot_paths.rs` criterion ns/op timings —
-# `alloc_counts.rs` reports deterministic alloc / dealloc / bytes
-# per scenario via `bsql_devgates::CountingAllocator` installed as the
-# `#[global_allocator]`. `harness = false` because we provide our own
-# `fn main()`; criterion is not used (each scenario runs exactly once
-# for an integer answer instead of statistically-sampled millions of
-# iterations). The `unsafe impl GlobalAlloc` lives in `bsql-devgates`,
-# so this bench file contains zero `unsafe`.
-[[bench]]
-name = "alloc_counts"
-harness = false
-
 # This crate KEEPS its stricter crate-root forbid-bundle in `src/lib.rs`
 # (the full no_std panic/index/arith/cast wall, including
 # `#![forbid(unsafe_code)]`). `lints.workspace = true` adds the workspace

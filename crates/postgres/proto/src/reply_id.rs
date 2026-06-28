@@ -1,110 +1,34 @@
 //! Typed opaque correlator for in-flight commands.
 //!
-//! `bsql-pg-proto` is `no_std` and oblivious to async runtimes; it cannot
-//! own `tokio::sync::oneshot::Sender`s itself. Instead, each
-//! a command from `push_command` carries a [`ReplyId<K>`] that the upstream
-//! wrapper crate uses as the key in its pending-replies table.
-//!
-//! # Kind-parameterisation
-//!
-//! [`ReplyId<K>`] is parameterised by a marker type `K: ReplyKind`
-//! that binds the **expected payload** via an associated type
-//! `ReplyKind::Payload`. The only way to produce a
-//! `StagedAction::DeliverReply` carrying payload `P` is through
-//! `crate::action::deliver`, whose signature is
-//! `fn deliver<K: ReplyKind>(id: ReplyId<K>, payload: K::Payload) -> StagedAction`
-//! — passing a `ReplyId<PingKind>` and a `StartupCompletePayload`
-//! is a type error at the call site, not a runtime misroute.
-//!
-//! Without kind-parameterisation, a dispatcher emitting
-//! `Action::DeliverReply { id: ping_id, value: Reply::StartupComplete
-//! { .. } }` would compile cleanly — the value type erases the moment
-//! it lands in the `Reply` sum. The wrapper's `HashMap<NonZeroU64,
-//! oneshot::Sender<Reply>>` would silently route a Pong-sender a
-//! StartupComplete payload. The kind tag closes that seam tier-1 at
-//! compile time.
-//!
-//! The `crate::action::DeliverReplyEntry` struct that backs the
-//! variant has module-private fields so direct struct-literal
-//! construction outside the sanctioned path is also a compile error —
-//! not just a convention.
+//! [`ReplyId<K>`] is the nominal handle a connecting/active flow carries to
+//! correlate a pushed command with its eventual reply. The kind parameter
+//! `K: ReplyKind` is a sealed, uninhabited tag (`PingKind`, `StartupKind`, …)
+//! that statically names the command shape — the connecting engine mints a
+//! `ReplyId<StartupKind>` for the handshake, and the kind tag set is fixed at
+//! the crate boundary.
 //!
 //! # Sealing
 //!
-//! `ReplyKind` is sealed (via the private `sealed::Sealed`
-//! supertrait) so external code cannot introduce new kinds. Each
-//! PG command carries exactly one kind, known statically at the
-//! crate level; new kinds land with new commands in later sub-phases.
+//! `ReplyKind` is sealed (via the private `sealed::Sealed` supertrait) so
+//! external code cannot introduce new kinds. Each PG command carries exactly
+//! one kind, known statically at the crate level.
 //!
 //! # ID provenance
 //!
 //! `ReplyId<K>` wraps a [`NonZeroU64`]:
 //!
-//! 1. **Niche optimization.** `Option<ReplyId<K>>` stays the same
-//!    size as `ReplyId<K>` itself (the `NonZeroU64` niche, since the
-//!    `delivered: bool` is not in the discriminant).
-//! 2. **No sentinel collision.** Zero is reserved as "no ID"; the
-//!    constructor refuses it.
-//!
-//! `bsql-pg-proto` mints IDs internally via [`crate::PgProtocol::next_reply_id`]:
-//!
-//! - **External fabrication: tier-1 by-visibility.** `ReplyId::from_raw`
-//!   is `pub(crate)` — external crates cannot construct a `ReplyId<K>`.
-//!   The sole public mint is [`crate::PgProtocol::next_reply_id`]
-//!   `<K: ReplyKind>(&mut self) -> ReplyId<K>`.
-//! - **Cross-instance monotonicity: tier-2 by atomic-fetch_add.**
-//!   The mint counter is a `static AtomicU64` inside
-//!   `next_reply_id` (mod-private). `fetch_add(1, Relaxed)` gives
-//!   globally-unique IDs across all `PgProtocol` instances and
-//!   threads — stronger than per-instance uniqueness. Saturating
-//!   `u64` add — architecturally-distant ceiling (~10^19 mints
-//!   process-wide). The counter is NOT a `PgProtocol` field: an
-//!   inline `u64` field grows the struct 520 → 528 B and shifts the
-//!   LLVM whole-crate heuristic +6% on the `iter_10cols` decode
-//!   bench. Linear types would lift this to tier-1 ("counter has
-//!   never returned this value"); not available in stable Rust.
-//! - **Niche optimization preserved.** `Option<ReplyId<K>>` stays the
-//!   same size as `ReplyId<K>` itself (the `NonZeroU64` niche).
-//! - **No sentinel collision.** Zero is reserved as "no ID"; the
-//!   constructor refuses it.
+//! 1. **Niche optimization.** `Option<ReplyId<K>>` stays the same size as
+//!    `ReplyId<K>` itself (the `NonZeroU64` niche, since the `delivered: bool`
+//!    is not in the discriminant).
+//! 2. **No sentinel collision.** Zero is reserved as "no ID"; the constructor
+//!    refuses it.
+//! 3. **External fabrication: tier-1 by-visibility.** `ReplyId::from_raw` is
+//!    `pub(crate)` — external crates cannot construct a `ReplyId<K>`.
 
 use core::fmt;
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
 
-/// Canonical sentinel raw value for a
-/// [`crate::action::PushFailure::id`] field on a `PushFailure` whose
-/// `cause` is an [`crate::error::ProtocolError::InternalCrateBug`] and
-/// where no real in-flight `ReplyId` is associated.
-///
-/// # Why a distinct sentinel
-///
-/// A naive `NonZeroU64::MIN` (= raw value `1`) sentinel is
-/// **byte-identical** with the legitimate first `ReplyId` minted by
-/// [`crate::PgProtocol::next_reply_id`] (the static atomic counter
-/// returns `NonZeroU64::new(1)` on its first call). Monitoring code
-/// that distinguishes "CrateBug-classified failure" vs "first-command
-/// genuine failure" by inspecting the id alone would false-positive
-/// every connection's first command.
-///
-/// `CRATE_BUG_REPLY_ID_SENTINEL = NonZeroU64::MAX` (raw value
-/// `u64::MAX`) cannot collide with legitimate minting except at the
-/// saturation edge of the global counter — architecturally distant
-/// (~10^19 mints process-wide) AND immediately followed by an
-/// Errored-state transition (`install_errored_replyid_saturation`)
-/// that drops the connection — so the sentinel can collide with a
-/// legitimate id only in a fully-quiescent test fixture that
-/// explicitly pre-loads the counter to `u64::MAX − 1`. Production
-/// wrappers never observe the collision.
-///
-/// # Monitoring contract
-///
-/// Wrappers SHOULD prefer matching on `push_failure.cause` (typed
-/// [`crate::error::ProtocolError`] variant) over inspecting
-/// `push_failure.id` for classifier disambiguation. This sentinel is
-/// the secondary signal, intended for log-line readability and for
-/// the very-rare wrapper that lacks a typed-cause inspection path.
-pub(crate) const CRATE_BUG_REPLY_ID_SENTINEL: NonZeroU64 = NonZeroU64::MAX;
 
 /// Seal for [`ReplyKind`] — external crates cannot introduce new
 /// kinds. Each supported PG command-kind is part of this module's
@@ -134,28 +58,6 @@ mod sealed {
     note = "`ReplyKind` is sealed — the kind tag set is fixed at the crate boundary; downstream `impl ReplyKind for ...` is forbidden by construction"
 )]
 pub trait ReplyKind: sealed::Sealed {
-    /// The typed STAGED payload constructed at dispatch time. Must
-    /// convert to the internal [`crate::action::StagedReply`] sum.
-    ///
-    /// # Staged vs public payload split
-    ///
-    /// The dispatch site constructs the staged payload (lifetime-free,
-    /// no `&'r RowDesc` borrows); materialise converts to the public
-    /// `Reply<'r>` by borrowing `PgProtocol::row_desc_slot` directly.
-    /// The slot's `is_some()` IS the schema-presence fact (single
-    /// source of truth, tier-1 by-construction) — a duplicate
-    /// `schema_present: bool` flag would split that source of truth.
-    /// The kind-payload pairing is preserved — `ReplyId<K>` still
-    /// constrains what payload the dispatcher can stage, and the
-    /// `Into<StagedReply>` bound keeps the seal one-way.
-    ///
-    /// For schema-less kinds (Ping, Startup, Parse, Close),
-    /// StagedPayload == PublicPayload (no schema to borrow). For
-    /// schema-bearing kinds (Query, DescribeStatement,
-    /// DescribePortal), StagedPayload is the crate-private
-    /// `Staged*Payload` struct.
-    type StagedPayload: Into<crate::action::StagedReply> + Copy + fmt::Debug + 'static;
-
     /// Human-readable name for Debug output — `"Ping"`,
     /// `"Startup"`, etc.
     const NAME: &'static str;
@@ -163,25 +65,23 @@ pub trait ReplyKind: sealed::Sealed {
 
 /// Kind marker for `push_command::Ping` replies.
 ///
-/// Payload type: [`crate::action::PongPayload`]. A dispatcher that
+/// Payload type: `crate::action::PongPayload`. A dispatcher that
 /// emits a non-`Pong` payload via a `ReplyId<PingKind>` fails to
 /// type-check at the construction site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PingKind {}
 impl sealed::Sealed for PingKind {}
 impl ReplyKind for PingKind {
-    type StagedPayload = crate::action::PongPayload;
     const NAME: &'static str = "Ping";
 }
 
 /// Kind marker for `push_command::Startup` replies.
 ///
-/// Payload type: [`crate::action::StartupCompletePayload`].
+/// Payload type: `crate::action::StartupCompletePayload`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupKind {}
 impl sealed::Sealed for StartupKind {}
 impl ReplyKind for StartupKind {
-    type StagedPayload = crate::action::StartupCompletePayload;
     const NAME: &'static str = "Startup";
 }
 
@@ -193,7 +93,7 @@ impl ReplyKind for StartupKind {
 
 /// Kind marker for `push_command::SimpleQuery` and
 /// `push_command::BindExecute` replies. Payload type:
-/// [`crate::action::QueryCompletePayload`].
+/// `crate::action::QueryCompletePayload`.
 ///
 /// Delivered on the terminal `CommandComplete` + `ReadyForQuery`
 /// pair after the row stream (which is emitted separately via
@@ -202,34 +102,31 @@ impl ReplyKind for StartupKind {
 pub enum QueryKind {}
 impl sealed::Sealed for QueryKind {}
 impl ReplyKind for QueryKind {
-    type StagedPayload = crate::action::StagedQueryCompletePayload;
     const NAME: &'static str = "Query";
 }
 
 /// Kind marker for `push_command::Parse` replies. Payload:
-/// [`crate::action::ParseCompletePayload`] (ZST).
+/// `crate::action::ParseCompletePayload` (ZST).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseKind {}
 impl sealed::Sealed for ParseKind {}
 impl ReplyKind for ParseKind {
-    type StagedPayload = crate::action::ParseCompletePayload;
     const NAME: &'static str = "Parse";
 }
 
 /// Kind marker for `push_command::CloseStatement` / `CloseP portal`
-/// replies. Payload: [`crate::action::CloseCompletePayload`]
+/// replies. Payload: `crate::action::CloseCompletePayload`
 /// (ZST).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseKind {}
 impl sealed::Sealed for CloseKind {}
 impl ReplyKind for CloseKind {
-    type StagedPayload = crate::action::CloseCompletePayload;
     const NAME: &'static str = "Close";
 }
 
 /// Kind marker for `push_command::DescribeStatement` replies.
 ///
-/// Payload type: [`crate::action::DescribeStatementCompletePayload`] —
+/// Payload type: `crate::action::DescribeStatementCompletePayload` —
 /// carries `param_oids` (PG's `ParameterDescription`), `rows`
 /// (`RowDescription` → `Rows(..)` / `NoData` → `NoData`), and
 /// `tx_status` from the trailing RFQ.
@@ -244,13 +141,12 @@ impl ReplyKind for CloseKind {
 pub enum DescribeStatementKind {}
 impl sealed::Sealed for DescribeStatementKind {}
 impl ReplyKind for DescribeStatementKind {
-    type StagedPayload = crate::action::StagedDescribeStatementCompletePayload;
     const NAME: &'static str = "DescribeStatement";
 }
 
 /// Kind marker for `push_command::DescribePortal` replies.
 ///
-/// Payload type: [`crate::action::DescribePortalCompletePayload`] —
+/// Payload type: `crate::action::DescribePortalCompletePayload` —
 /// no `param_oids` (portals are already bound; parameters are
 /// fixed at Bind time and do not appear in a portal-Describe
 /// response per PG §55.2.2).
@@ -258,7 +154,6 @@ impl ReplyKind for DescribeStatementKind {
 pub enum DescribePortalKind {}
 impl sealed::Sealed for DescribePortalKind {}
 impl ReplyKind for DescribePortalKind {
-    type StagedPayload = crate::action::StagedDescribePortalCompletePayload;
     const NAME: &'static str = "DescribePortal";
 }
 
@@ -331,7 +226,7 @@ impl<K: ReplyKind> ReplyId<K> {
     ///
     /// `pub(crate)` only. External crates cannot construct a
     /// `ReplyId<K>`; the sole public mint is
-    /// [`crate::PgProtocol::next_reply_id`]. This closes the
+    /// `crate::PgProtocol::next_reply_id`. This closes the
     /// "external fabrication" tier-3 seam — fabrication is
     /// impossible from outside this crate (visibility tier-1). A
     /// `pub` constructor would let the wrapper crate (or any
@@ -341,7 +236,7 @@ impl<K: ReplyKind> ReplyId<K> {
     /// # Internal mint contract (tier-2 by-construction)
     ///
     /// Production callers (lib-internal) get the witness via
-    /// [`crate::PgProtocol::next_reply_id`], which uses a static
+    /// `crate::PgProtocol::next_reply_id`, which uses a static
     /// `AtomicU64` counter (mod-private) with `fetch_add(1, Relaxed)`
     /// — globally unique across all `PgProtocol` instances and
     /// threads. Cross-instance monotonicity is stronger than
@@ -395,43 +290,6 @@ impl<K: ReplyKind> ReplyId<K> {
 // mint sites (Disconnected / Connecting / Active phases).
 // ═════════════════════════════════════════════════════════════════════
 
-/// Mint a [`NonZeroU64`] from `prev.saturating_add(1)`.
-///
-/// # Floor invariant (const-asserted)
-///
-/// `saturating_add(1)` of any `u64` returns a value `≥ 1`:
-/// - `u64::MAX.saturating_add(1) == u64::MAX` (saturates at `MAX`)
-/// - `0_u64.saturating_add(1) == 1`
-///
-/// The two `const _: () = assert!(…)` lines below pin both bounds
-/// at compile time. The `NonZeroU64::new(raw).unwrap_or(MIN)` arm
-/// is therefore architecturally dead (build-time-pinned). A future
-/// edit swapping `saturating_add` for `wrapping_add` (which CAN
-/// produce `0`) leaves the const-asserts intact but **silently
-/// activates the dead arm** — there is no `unsafe`-free way on
-/// stable Rust to convert `u64 → NonZeroU64` without a runtime
-/// branch. The const-asserts capture the invariant; the dead arm
-/// remains as a clippy-`unwrap_used`-compliant landing pad.
-///
-/// # Mint sites
-///
-/// - `<DisconnectedPhase>::next_reply_id` — pre-handshake mint
-///   (no inner state for a saturation classifier).
-/// - `ConnectingInner::next_reply_id` — handshake-window mint
-///   (`install_errored_replyid_saturation` fires on `raw_old ==
-///   u64::MAX` BEFORE this helper, so the saturation case is
-///   classified at the call site).
-/// - `ActiveInner::next_reply_id` — active-phase mint (same
-///   saturation classifier pattern as Connecting).
-///
-/// All three sites share the contract via this helper.
-#[inline]
-pub(crate) fn saturating_inc_to_nonzero(prev: u64) -> NonZeroU64 {
-    const _: () = assert!(u64::MAX.saturating_add(1) >= 1);
-    const _: () = assert!(0_u64.saturating_add(1) >= 1);
-    let raw = prev.saturating_add(1);
-    NonZeroU64::new(raw).unwrap_or(NonZeroU64::MIN)
-}
 
 // No `Drop` impl on `ReplyId<K>` — a `Drop` containing
 // `assert!(self.delivered, ...)` would be a tier-2 runtime guard
@@ -505,47 +363,4 @@ mod reply_id_semantics {
         startup.consume();
     }
 
-    /// Category (2) — tier-1 verification: the
-    /// `CRATE_BUG_REPLY_ID_SENTINEL` is distinct from the legitimate
-    /// first id minted by `next_reply_id`.
-    ///
-    /// A `NonZeroU64::MIN` (= raw `1`) sentinel would be byte-
-    /// identical with the legitimate first id returned by
-    /// `next_reply_id` (the static atomic counter starts at 0 and the
-    /// first `fetch_add(1) + saturating_add(1)` produces 1) — a
-    /// monitoring system distinguishing CrateBug failures from
-    /// genuine first-command failures by inspecting `push_failure.id`
-    /// alone would false-positive every connection's first command.
-    ///
-    /// The current sentinel is `NonZeroU64::MAX`. The legitimate
-    /// first id is `NonZeroU64::new(1).unwrap()` = `MIN`; the
-    /// sentinel is `MAX` — provably distinct.
-    #[test]
-    fn crate_bug_sentinel_distinct_from_first_mint() {
-        // Legitimate first mint by `next_reply_id` cannot be
-        // observed directly here (`next_reply_id` is on PgProtocol,
-        // and the static counter is process-global), but the FIRST
-        // value emitted by an atomic counter starting at 0 with
-        // `fetch_add(1, Relaxed)` followed by `saturating_add(1)` is
-        // provably `1` = `NonZeroU64::MIN`. Pin the distinctness
-        // against that known value.
-        let first_mint_shape: NonZeroU64 = NonZeroU64::MIN;
-        assert_ne!(
-            CRATE_BUG_REPLY_ID_SENTINEL,
-            first_mint_shape,
-            "CRATE_BUG_REPLY_ID_SENTINEL must be distinct from the \
-             legitimate first id (NonZeroU64::MIN) — a colliding \
-             sentinel would cause monitoring systems to false-\
-             positive every first-command genuine failure as CrateBug",
-        );
-        // Pin the exact value so a future edit that changes the
-        // sentinel surfaces here loudly (and motivates updating the
-        // monitoring contract docstring on the const).
-        assert_eq!(
-            CRATE_BUG_REPLY_ID_SENTINEL,
-            NonZeroU64::MAX,
-            "CRATE_BUG_REPLY_ID_SENTINEL is canonical at NonZeroU64::MAX \
-             — see reply_id.rs docstring",
-        );
-    }
 }

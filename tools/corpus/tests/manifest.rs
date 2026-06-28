@@ -2,12 +2,21 @@
 //!
 //! `port_manifest.list` records the spec-test families that must be kept (or
 //! rewritten in place) rather than replaced with a corpus fixture — because
-//! they assert properties (memory-zeroize, footprint/size, compile-fail
-//! diagnostics, arena-staleness) that are invisible at the observable-I/O seam
-//! the corpus replays through. This test mechanically enforces the rule: every
-//! listed file must still exist on disk, and the ten known families must all be
-//! listed. An accidental deletion of one, or a manifest edit that drops a
-//! family, fails loudly here.
+//! they assert properties (memory-zeroize/residue, footprint/size, compile-fail
+//! diagnostics, randomised robustness) that are invisible at the observable-I/O
+//! seam the corpus replays through. This test mechanically enforces the rule:
+//! every listed file must still exist on disk, and the seven known families
+//! must all be listed. An accidental deletion of one, or a manifest edit that
+//! drops a family, fails loudly here.
+//!
+//! When the retired push-path engine was deleted, its internal-probe families
+//! went too. Two carried properties that still matter and were PORTED to real
+//! successor specs on the sans-IO engine — `buf_compact_staleness_spec` →
+//! `engine_ingest_residue_spec` (the watermark residue property) and
+//! `fuzz_stress_spec` → `engine_active_fuzz_spec` (the randomised PRNG fuzz of
+//! `parse_header` + the active ingest framer). The other three
+//! (`sole_path_compile_fail`, `error_arena_staleness_spec`,
+//! `session_params_staleness_spec`) had no surviving property to port.
 
 #![allow(
     clippy::panic,
@@ -16,20 +25,17 @@
 
 use std::path::{Path, PathBuf};
 
-/// The ten families the manifest must always list. Pinned here so a manifest
+/// The seven families the manifest must always list. Pinned here so a manifest
 /// edit that silently drops a line is caught even if the dropped file still
 /// happens to exist on disk.
 const REQUIRED_FAMILIES: &[&str] = &[
     "scram_fuzz_spec",
-    "fuzz_stress_spec",
     "scram_zeroize_miri_spec",
     "zeroize_coverage_spec",
     "footprint_drift_compile_fail",
-    "sole_path_compile_fail",
-    "buf_compact_staleness_spec",
-    "error_arena_staleness_spec",
-    "session_params_staleness_spec",
     "secret_bounded_str_spec",
+    "engine_ingest_residue_spec",
+    "engine_active_fuzz_spec",
 ];
 
 /// Walk up from this crate's manifest dir until the directory that holds

@@ -130,8 +130,7 @@ const INGEST_CF: &str = "crates/postgres/proto/tests/engine_ingest_compile_fail.
 const ACTIVE_CF: &str = "crates/postgres/proto/tests/engine_active_compile_fail.rs";
 const VERBS_CF: &str = "crates/postgres/proto/tests/engine_verbs_compile_fail.rs";
 const FOOTPRINT_CF: &str = "crates/postgres/proto/tests/footprint_drift_compile_fail.rs";
-const SOLE_PATH_CF: &str = "crates/postgres/proto/tests/sole_path_compile_fail.rs";
-const AUDIT: &str = "crates/postgres/proto/tests/audit_coverage_spec.rs";
+const FRAME: &str = "crates/postgres/proto/tests/frame_parse.rs";
 const ZEROIZE: &str = "crates/postgres/proto/tests/zeroize_coverage_spec.rs";
 const MIRI: &str = "crates/postgres/proto/tests/scram_zeroize_miri_spec.rs";
 // In-crate `#[cfg(test)]` modules (proven by the same `cargo test`).
@@ -230,7 +229,6 @@ const SECTION7: &[Row] = &[
     r(4, A4, "split byte-by-byte / mid-frame / mid-header", Ev::Tests(&[
         ("truncated_at_every_offset_yields_needmore_never_misclassifies", HOSTILE),
         ("partial_assembly_one_byte_per_read", ACTIVE),
-        ("pong_delivered_via_byte_at_a_time_fragmentation", AUDIT),
         ("seed_corpus_is_schedule_invariant", SEED),
     ])),
     r(4, A4, "mid-transition drop|cancel (Connecting→Active never across await)", Ev::Tests(&[
@@ -270,8 +268,8 @@ const SECTION7: &[Row] = &[
         ("need_more_when_buffer_drained", CONNECTING),
     ])),
     r(6, A6, "max (cap-1, cap, cap+1)", Ev::Tests(&[
-        ("max_length_notice_frame_is_consumed_cleanly", AUDIT),
-        ("parse_header_boundary_cap_is_exact", AUDIT),
+        ("minimal_legal_header_parses_ok", FRAME),
+        ("length_above_max_is_frame_too_large", FRAME),
         ("oversize_control_frame_tears_down", ACTIVE),
     ])),
     r(6, A6, "declared length != actual", Ev::Tests(&[
@@ -390,7 +388,8 @@ const SECTION7: &[Row] = &[
          scrubbed on Drop (proven by the zeroize rows above).")),
     // ---- Axis 12 — Fallback / recovery ----------------------------------
     r(12, A12, "no tier-4 silent default (forbid bundle + sealed construction)", Ev::Tests(&[
-        ("struct_literal_construction_is_sealed", SOLE_PATH_CF),
+        ("foreign_brand_is_rejected", LINEARITY_CF),
+        ("brand_cannot_escape_scope", LINEARITY_CF),
     ])),
     r(12, A12, "every non-happy branch classified (cold-path discipline)",
         Ev::Src("core::hint::cold_path()", SRC_PUMP)),

@@ -378,37 +378,6 @@ const _: () = {
     assert!(matches!(<(Option<bool>,) as ParamsWriter>::OIDS, [crate::decode::oids::BOOL]));
 };
 
-/// Test-only `ParamsWriter` impl that always returns
-/// `Err(WriteBufFull)` from `write_params`.
-///
-/// Used by `protocol.rs`'s internal tests to exercise the
-/// classified-Err routing from `build_bind_message` through
-/// `CrateBugLocus::ParamsWriterOverflow` and into the `FailReply +
-/// CloseSocket + Errored` end-to-end path. Sealed impl is only
-/// possible inside this module (seal is module-private); re-export
-/// via `pub(crate)` so `protocol.rs` can reference the type.
-#[cfg(test)]
-pub(crate) struct OverflowParams;
-
-#[cfg(test)]
-impl sealed::ParamsWriterSealed for OverflowParams {}
-
-#[cfg(test)]
-impl ParamsWriter for OverflowParams {
-    const COUNT: u16 = 1;
-    const FORMATS: &'static [FormatCode] = &[FormatCode::Binary];
-    /// Placeholder OID — irrelevant for the classified-Err test
-    /// path because the Err fires before any OID is consumed.
-    const OIDS: &'static [u32] = &[crate::decode::oids::INT4];
-
-    /// Always errors. Simulates a buggy / adversarial user impl
-    /// whose `write_params` overflows its advertised budget.
-    #[inline]
-    fn write_params(&self, _dst: &mut WriteBuf) -> Result<(), WriteBufFull> {
-        Err(WriteBufFull)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Runtime smoke-tests — complement the module-level const

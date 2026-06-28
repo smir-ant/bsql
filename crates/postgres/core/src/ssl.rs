@@ -23,10 +23,10 @@ pub enum SslProbe {
     PlainTcp,
 }
 
-/// Prepare the SSL request bytes (8 bytes, static).
-pub fn ssl_request_bytes() -> (&'static [u8; 8], bsql_postgres_proto::PgProtocol<bsql_postgres_proto::SslNegotiatingPhase>) {
-    let proto = bsql_postgres_proto::PgProtocol::new();
-    proto.push_ssl_request()
+/// The static 8-byte PostgreSQL `SSLRequest` packet to write before reading the
+/// server's 1-byte reply (classify it with [`classify_ssl_response`]).
+pub fn ssl_request_bytes() -> &'static [u8; 8] {
+    &bsql_postgres_proto::SSL_REQUEST_WIRE_BYTES
 }
 
 /// Classify the server's 1-byte SSL response into an [`SslProbe`].
@@ -34,24 +34,25 @@ pub fn ssl_request_bytes() -> (&'static [u8; 8], bsql_postgres_proto::PgProtocol
 /// On acceptance, derives the verified `server_name` from `config.host` (the TLS
 /// config is built once per process by [`tls::shared_client_config`], not here).
 /// On refusal, honours `SslMode`: `Require` is a hard [`DriverError::SslRefused`];
-/// `Prefer` warns in debug builds and falls back to plain TCP.
+/// `Prefer` warns in debug builds and falls back to plain TCP. Any other byte
+/// (a server `ErrorResponse` start, or an out-of-protocol value) is a hard
+/// [`DriverError::Io`] — never a silent fallback.
 ///
 /// [`tls::shared_client_config`]: crate::tls::shared_client_config
 pub fn classify_ssl_response(
-    ssl_proto: bsql_postgres_proto::PgProtocol<bsql_postgres_proto::SslNegotiatingPhase>,
     response_byte: u8,
     config: &ConnectConfig,
 ) -> Result<SslProbe, DriverError> {
-    let classified = ssl_proto.classify_ssl_response(response_byte);
-    match classified {
-        bsql_postgres_proto::SslClassified::Accepted(_) => {
+    use bsql_postgres_proto::wire::SslNegotiationOutcome;
+    match bsql_postgres_proto::wire::classify_ssl_response_byte(response_byte) {
+        SslNegotiationOutcome::Accepted => {
             let server_name: rustls::pki_types::ServerName<'_> = config.host.as_str().try_into()
                 .map_err(|_| DriverError::Config("invalid server name for TLS"))?;
             Ok(SslProbe::Accepted {
                 server_name: server_name.to_owned(),
             })
         }
-        bsql_postgres_proto::SslClassified::Refused(_) => {
+        SslNegotiationOutcome::Refused => {
             if config.ssl_mode == SslMode::Require {
                 return Err(DriverError::SslRefused);
             }
@@ -60,6 +61,9 @@ pub fn classify_ssl_response(
                 Use SslMode::Require for production over untrusted networks.");
             Ok(SslProbe::PlainTcp)
         }
+        // `ErrorIncoming` (a server `ErrorResponse` start), `InvalidByte`, or any
+        // future-added outcome (`SslNegotiationOutcome` is `#[non_exhaustive]`):
+        // fail closed — never a silent fallback to plain TCP.
         _ => Err(DriverError::Io(std::io::Error::other("unexpected SSL response"))),
     }
 }

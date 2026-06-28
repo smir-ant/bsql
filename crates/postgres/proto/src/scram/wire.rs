@@ -290,7 +290,7 @@ pub enum ScramError {
 /// embedding. Carries every variant's identity + small payloads
 /// (iteration counts) inline, but **never** the `ServerScramError`
 /// text — that text is externalised into
-/// `crate::error_arena::ErrorArena` via an [`crate::error_arena::ErrorRef`]
+/// `crate::error_arena::ErrorArena` via an `crate::error_arena::ErrorRef`
 /// alongside the class.
 ///
 /// # Why a parallel enum rather than mutating `ScramError`
@@ -367,11 +367,11 @@ impl ScramError {
     /// (only present for [`ScramError::ServerScramError`]).
     ///
     /// Callers in `dispatch.rs` use this to convert wire-layer SCRAM
-    /// errors into the slim [`crate::error::ProtocolError::ScramHandshakeFailure`]
+    /// errors into the slim `crate::error::ProtocolError::ScramHandshakeFailure`
     /// form: the text (when present) is alloc'd into
     /// `crate::error_arena::ErrorArena` via
-    /// [`crate::error_arena::ErrorPayload::Scram`], and the resulting
-    /// [`crate::error_arena::ErrorRef`] threads into the
+    /// `crate::error_arena::ErrorPayload::Scram`, and the resulting
+    /// `crate::error_arena::ErrorRef` threads into the
     /// `ProtocolError::ScramHandshakeFailure.detail` field.
     ///
     /// # Total
@@ -542,7 +542,7 @@ pub(crate) fn build_client_first_message(
 /// and [`crate::scram::types::SecretDigest`], then dropped at function
 /// return. It never crosses a `feed_bytes` / `push_command` boundary.
 /// The state that DOES persist to the next call
-/// ([`crate::ProtoState::ConnectingScramAwaitingServerFinal`]) carries
+/// (`crate::ProtoState::ConnectingScramAwaitingServerFinal`) carries
 /// only the POD `SecretDigest` — the `heapless::Vec` fields here
 /// never propagate Drop into the state enum.
 ///

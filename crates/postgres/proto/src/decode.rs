@@ -5,7 +5,7 @@
 //! per-column format codes; each `DataRow` frame carries the column
 //! values. This module parses `RowDescription` into [`RowDesc`]
 //! (shared between the row-streaming `ColEvent` API and
-//! [`crate::Reply::QueryComplete`]) and hosts the typed-decoder
+//! `crate::Reply::QueryComplete`) and hosts the typed-decoder
 //! primitives that materialise column bytes into Rust types.
 //!
 //! # Why POD + bounded capacity
@@ -216,44 +216,6 @@ impl RowDesc {
         })
     }
 
-    /// Synthesise from a static OID list with all-binary format codes
-    /// — the `prepared!` macro path declares `n_result_formats = 1,
-    /// [Binary]` in its Bind frame, so the synthetic descriptor must
-    /// say Binary for every column.
-    pub(crate) fn from_static_oids_binary_format(
-        oids: &[u32],
-    ) -> Result<Self, crate::error::ProtocolError> {
-        let n = oids.len();
-        let k = n.div_ceil(32);
-        let total = 1usize.saturating_add(n).saturating_add(k);
-        let mut v = alloc::vec![0u32; total];
-        let Ok(n_u32) = u32::try_from(n) else {
-            return Err(crate::error::ProtocolError::TooManyColumns {
-                count: n,
-                max: MAX_ROW_COLUMNS,
-            });
-        };
-        if let Some(slot) = v.get_mut(0) {
-            *slot = n_u32;
-        }
-        for (i, &oid) in oids.iter().enumerate() {
-            if let Some(slot) = v.get_mut(1usize.saturating_add(i)) {
-                *slot = oid;
-            }
-        }
-        // All-binary format bitmap: bit i = 1 for every column.
-        let bits_start = 1usize.saturating_add(n);
-        for i in 0..n {
-            let word_idx = i >> 5;
-            let bit_idx = i & 31;
-            if let Some(word) = v.get_mut(bits_start.saturating_add(word_idx)) {
-                *word |= 1u32 << bit_idx;
-            }
-        }
-        Ok(Self {
-            data: v.into_boxed_slice(),
-        })
-    }
 
     /// Empty descriptor (0 columns).
     pub fn empty() -> Self {
@@ -374,82 +336,6 @@ impl ExactSizeIterator for RowDescColumnsIter<'_> {}
 impl core::iter::FusedIterator for RowDescColumnsIter<'_> {}
 
 
-/// Lifetime-bound borrow of a [`RowDesc`].
-#[derive(Debug, Clone, Copy)]
-pub struct RowDescBorrow<'r> {
-    inner: &'r RowDesc,
-}
-
-impl<'r> RowDescBorrow<'r> {
-    #[inline]
-    #[must_use]
-    pub(crate) fn from_ref(inner: &'r RowDesc) -> Self {
-        Self { inner }
-    }
-
-    /// Column count as u16.
-    #[inline]
-    #[must_use]
-    pub fn n_columns(&self) -> u16 {
-        self.inner.n_columns()
-    }
-
-    /// Column count as usize.
-    #[inline]
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Whether the descriptor is empty.
-    #[inline]
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// PG type OID for column `idx`.
-    #[inline]
-    #[must_use]
-    pub fn type_oid(&self, idx: usize) -> Option<u32> {
-        self.inner.type_oid(idx)
-    }
-
-    /// Format code for column `idx`.
-    #[inline]
-    #[must_use]
-    pub fn format_code(&self, idx: usize) -> Option<FormatCode> {
-        self.inner.format_code(idx)
-    }
-
-    /// Column descriptor for column `idx`.
-    #[inline]
-    #[must_use]
-    pub fn get(&self, idx: usize) -> Option<ColumnDesc> {
-        self.inner.get(idx)
-    }
-
-    /// Iterate over populated columns.
-    #[inline]
-    #[must_use]
-    pub fn columns_iter(&self) -> RowDescColumnsIter<'_> {
-        self.inner.columns_iter()
-    }
-
-    /// Clone the underlying `RowDesc` into an owned value.
-    #[inline]
-    #[must_use]
-    pub fn to_owned(&self) -> RowDesc {
-        self.inner.clone()
-    }
-}
-
-impl PartialEq for RowDescBorrow<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.inner == other.inner
-    }
-}
-impl Eq for RowDescBorrow<'_> {}
 
 impl fmt::Display for FormatCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -581,75 +467,6 @@ pub fn parse_column_names(
         rest = rest.get(skip..).unwrap_or(&[]);
     }
     Ok(names)
-}
-
-/// Parse a `ParameterDescription` payload (body of the `'t'`
-/// frame, after the 5-byte header) into a
-/// [`crate::action::ParamOids`].
-///
-/// Wire layout (PG §55.2.2):
-/// ```text
-///   int16  parameter_count
-///   for each parameter:
-///     int32  type_oid
-/// ```
-///
-/// # Error classifications
-///
-/// - [`crate::error::ProtocolError::MalformedParameterDescription`] —
-///   payload shorter than the 2-byte count header, negative count,
-///   or body length does not match `count × 4`.
-/// - [`crate::error::ProtocolError::TooManyParameters`] — count
-///   exceeds [`crate::params::MAX_PARAMS_ARITY`] (16). A statement
-///   with more placeholders can be Parsed by the server but cannot
-///   be Bound against by this crate, so the describe result is
-///   useless downstream — fail loudly at parse time.
-///
-/// Cold path — called once per statement-level Describe reply.
-#[cold]
-pub(crate) fn parse_parameter_description(
-    payload: &[u8],
-) -> Result<crate::action::ParamOids, crate::error::ProtocolError> {
-    use crate::error::ProtocolError;
-    let malformed = || ProtocolError::MalformedParameterDescription {
-        payload_len: payload.len(),
-    };
-
-    // parameter_count: i16 BE at offset 0.
-    let (count_bytes, rest) = payload.split_first_chunk::<2>().ok_or_else(malformed)?;
-    let n_params_i16 = i16::from_be_bytes(*count_bytes);
-    if n_params_i16 < 0 {
-        return Err(malformed());
-    }
-    // `n_params_i16 >= 0`, so `u16::try_from` is infallible (widening
-    // from non-negative i16). Keep Result chain for panic-ban
-    // discipline.
-    let n_params = u16::try_from(n_params_i16).map_err(|_| malformed())?;
-    let n_params_usize = usize::from(n_params);
-
-    // Body length must exactly equal `count × 4` (one i32 per OID).
-    // Trailing bytes imply wire corruption; short body implies the
-    // declared count lies. Both classify as framing error.
-    let expected_body_len = n_params_usize.checked_mul(4).ok_or_else(malformed)?;
-    if rest.len() != expected_body_len {
-        return Err(malformed());
-    }
-
-    // `split_first_chunk::<4>()` returns a typed
-    // `Option<(&[u8; 4], &[u8])>` — no dead `_ =>` fallback arm
-    // needed. The `Option::None` path is architecturally dead (the
-    // body-length check above proves remaining bytes suffice) yet
-    // surfaces as `Err(malformed())` rather than `unreachable!()`
-    // (forbid-bundle).
-    let mut oids = alloc::vec::Vec::with_capacity(n_params_usize);
-    let mut cursor = rest;
-    for _i in 0..n_params_usize {
-        let (chunk, tail) = cursor.split_first_chunk::<4>().ok_or_else(malformed)?;
-        oids.push(u32::from_be_bytes(*chunk));
-        cursor = tail;
-    }
-
-    Ok(crate::action::ParamOids::from_slice(&oids))
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -977,7 +794,7 @@ impl fmt::Display for DecodeError {
 ///
 /// `'a` borrows the body bytes. Typically obtained from
 /// the row-streaming `ColEvent` pull API, in which case `'a` is
-/// the `'r` lifetime of the owning [`crate::OutActions`]. The
+/// the `'r` lifetime of the owning `crate::OutActions`. The
 /// iterator yields column slices that share this borrow — no
 /// copying, no allocation.
 #[derive(Debug, Clone, Copy)]
@@ -4244,17 +4061,6 @@ mod rowdesc_box_tests {
         assert!(matches!(rd.format_code(32), Some(FormatCode::Text)));
     }
 
-    #[test]
-    fn static_oids_all_binary() {
-        let oids: &[u32] = &[23, 25, 16];
-        let rd = RowDesc::from_static_oids_binary_format(oids);
-        assert!(rd.is_ok());
-        let rd = match rd { Ok(r) => r, Err(_) => return };
-        assert_eq!(rd.len(), 3);
-        assert!(matches!(rd.format_code(0), Some(FormatCode::Binary)));
-        assert!(matches!(rd.format_code(1), Some(FormatCode::Binary)));
-        assert!(matches!(rd.format_code(2), Some(FormatCode::Binary)));
-    }
 }
 
 #[cfg(test)]
@@ -4297,29 +4103,4 @@ mod parse_edge_case_tests {
         assert!(parse_row_description(payload).is_err());
     }
 
-    #[test]
-    fn parse_parameter_description_zero_params() {
-        let payload: &[u8] = &[0, 0]; // i16 BE = 0
-        let result = parse_parameter_description(payload);
-        assert!(result.is_ok());
-        let po = match result { Ok(p) => p, Err(_) => return };
-        assert_eq!(po.len(), 0);
-        assert!(po.is_empty());
-    }
-
-    #[test]
-    fn parse_parameter_description_three_params() {
-        let mut payload = alloc::vec::Vec::new();
-        payload.extend_from_slice(&3i16.to_be_bytes());
-        payload.extend_from_slice(&23u32.to_be_bytes());  // int4
-        payload.extend_from_slice(&25u32.to_be_bytes());  // text
-        payload.extend_from_slice(&16u32.to_be_bytes());  // bool
-        let result = parse_parameter_description(&payload);
-        assert!(result.is_ok());
-        let po = match result { Ok(p) => p, Err(_) => return };
-        assert_eq!(po.len(), 3);
-        assert!(matches!(po.get(0), Some(23)));
-        assert!(matches!(po.get(1), Some(25)));
-        assert!(matches!(po.get(2), Some(16)));
-    }
 }

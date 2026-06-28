@@ -91,10 +91,10 @@ pub const TAG_READY_FOR_QUERY: InboundTag = InboundTag::from_byte(b'Z');
 
 /// Backend `ErrorResponse` message tag (`'E'`).
 ///
-/// A server-side error. Variable-length payload of typed fields. The
-/// dispatcher's [`parse_error_response`][crate::error::ProtocolError::ServerErrorResponse]
-/// extracts severity / code / message / detail / hint into a typed
-/// `ServerErrorResponse` classification.
+/// A server-side error. Variable-length payload of typed fields. The engine
+/// surfaces it through the connecting-phase `Fail` event / active-phase
+/// `Surface`, and the driver renders severity / code / message / detail / hint
+/// into its typed `DbError`.
 pub const TAG_ERROR_RESPONSE: InboundTag = InboundTag::from_byte(b'E');
 
 /// The complete `Sync` frame on the wire.
@@ -104,7 +104,7 @@ pub const TAG_ERROR_RESPONSE: InboundTag = InboundTag::from_byte(b'E');
 /// the tag).
 ///
 /// This is a `&'static [u8]` because the message is parameter-free; we
-/// ship it via a zero-copy static reference through [`crate::action::Action::SendBytes`].
+/// ship it via a zero-copy static reference through `crate::action::Action::SendBytes`.
 ///
 /// # Visibility
 ///
@@ -167,17 +167,10 @@ pub const TAG_NOTICE_RESPONSE: InboundTag = InboundTag::from_byte(b'N');
 /// notifier's process id) + CSTR `channel` name + CSTR `payload`.
 /// Any post-startup state can receive one at any time.
 ///
-/// Per , the pre-dispatch filter in `feed_bytes` parses the
-/// frame and allocates a [`NotificationPayload`] in the
-/// `notifications_arena`, emitting [`Action::Notify { pid, notif_ref }`]
-/// in the same OutActions stream as other side-effects. The wrapper
-/// resolves `notif_ref` via [`PgProtocol::get_notification`] within
-/// the same OutActions iteration cycle (gen-tagged refs become
-/// `Err(ArenaError::Stale)` on the next `feed_bytes` cycle).
-///
-/// [`NotificationPayload`]: crate::notifications_arena::NotificationPayload
-/// [`Action::Notify { pid, notif_ref }`]: crate::action::Action::Notify
-/// [`PgProtocol::get_notification`]: crate::PgProtocol::get_notification
+/// The engine's `recv_notification` verb pulls one of these frames, lending
+/// the `(pid, channel, payload)` to the driver, which owns it into a
+/// `Notification` value; an `'A'` arriving mid-command is handled by the
+/// active-phase ingest the same way as any other asynchronous frame.
 pub const TAG_NOTIFICATION_RESPONSE: InboundTag = InboundTag::from_byte(b'A');
 
 // ---------------------------------------------------------------
@@ -900,7 +893,7 @@ pub const CANCEL_REQUEST_VERSION: u32 = 80877102;
 /// edit reshaping the encoded packet fails at build time.
 ///
 /// `pub(crate)` because the constant is an internal composition
-/// primitive used by [`crate::cancel`] for its own const-pins, plus
+/// primitive used by `crate::cancel` for its own const-pins, plus
 /// referenced directly inside [`cancel_request_bytes`] as the
 /// length-field source-of-truth (single binding for all four
 /// length-related sites).
@@ -1018,7 +1011,7 @@ pub enum SslNegotiationOutcome {
     /// follow on the wire. The driver should buffer the consumed
     /// `'E'` byte plus the rest, then route through the normal
     /// frame parser ([`crate::parse_header`] +
-    /// [`crate::PgProtocol::feed_bytes`]) to surface the typed
+    /// `crate::PgProtocol::feed_bytes`) to surface the typed
     /// error.
     ///
     /// Pre-TLS errors are typically auth-config issues (the server
@@ -1232,7 +1225,7 @@ const _: () = assert!(
 ///
 /// `pid` and `secret_key` come from the `BackendKeyData` ('K')
 /// frame the server emits during startup (captured in the
-/// [`crate::ProtoState::ConnectingPostAuthHaveKey`] variant; a
+/// `crate::ProtoState::ConnectingPostAuthHaveKey` variant; a
 /// future driver wrapper can surface them on a `Connection`
 /// typestate).
 ///
@@ -1250,7 +1243,7 @@ const _: () = assert!(
 /// emit `ErrorResponse` with code `57014` (query_canceled) +
 /// `ReadyForQuery`, or simply complete normally if the cancel
 /// arrived too late. That handling lives in the regular
-/// [`crate::PgProtocol::feed_bytes`] dispatch path on the
+/// `crate::PgProtocol::feed_bytes` dispatch path on the
 /// original connection.
 ///
 /// # Tier impact

@@ -58,7 +58,7 @@
 //!
 //! A naive shape would define three near-identical newtypes
 //! (`Ident`, `DatabaseName`, `ApplicationName`) each wrapping a
-//! `heapless::Vec<u8, N>`, plus [`crate::error::BoundedStr<N>`] —
+//! `heapless::Vec<u8, N>`, plus [`crate::ident::BoundedStr<N>`] —
 //! a fourth, slightly different wrapper carrying a `[u8; N] + u16`
 //! form. The four would share ~300 LoC of validation, accessors,
 //! and `Debug`/`Display` impls.
@@ -997,7 +997,7 @@ impl DescribeName for PortalName {
 /// `Default`. Used in state fields instead of `heapless::Vec<u8, N>`
 /// to avoid propagating the blanket `Vec::drop` (empty body for
 /// `u8`, but `needs_drop = true`) up into
-/// [`crate::state::ProtoState`].
+/// `crate::state::ProtoState`.
 // Clone/Copy/PartialEq/Eq are impl'd manually for the LenT-generic
 // form below — derives don't mix well with generic-over-LenT bounds
 // when the trait bound itself constrains the field type.

@@ -50,7 +50,7 @@ use md5::{Digest, Md5};
 use zeroize::Zeroizing;
 
 /// Bundled MD5-handshake state — username + password — carried
-/// inside [`crate::state::ProtoState::ConnectingStartupMd5`] via a
+/// inside `crate::state::ProtoState::ConnectingStartupMd5` via a
 /// single `Box`. Mirrors the SCRAM single-Box handshake pattern.
 ///
 /// # Drop chain
@@ -148,7 +148,7 @@ const _: () = assert!(
 /// # Output
 ///
 /// `Zeroizing<[u8; 35]>` — owned, scrubs on drop. The caller
-/// (typically [`crate::dispatch`] PasswordMessage builder)
+/// (typically `crate::dispatch` PasswordMessage builder)
 /// appends the trailing NUL to form the wire body.
 ///
 /// Returning an owned array (vs writing through `&mut [u8; 35]`)

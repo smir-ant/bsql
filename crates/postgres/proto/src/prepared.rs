@@ -6,9 +6,6 @@
 //! - [`PreparedQuery<Params, Row>`] — content-addressed prepared SQL
 //!   query with type-level parameter and row-shape pinning.
 //! - [`RowDecode`] — sealed trait for tuple-arity row decoding.
-//! - [`BindPrepared`](crate::push_command::BindPrepared) — `PushCommand`
-//!   impl that pairs a prepared query with its argument tuple at the
-//!   call site.
 //! - `new_prepared_query<P, R>(...)` — the only constructor for
 //!   `PreparedQuery`, and a VALIDATING one: it cross-checks every wire
 //!   argument against the declared `P` / `R` type-level shape and fails

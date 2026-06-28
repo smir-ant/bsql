@@ -7,8 +7,8 @@
 //! The `Trust`/`ScramPassword` discrimination happens inside
 //! `crate::PgProtocol::push_command` — specifically the
 //! `compute_push_startup` branch that routes a Trust command into
-//! [`crate::state::ProtoState::ConnectingStartupTrust`] and a Scram
-//! command into [`crate::state::ProtoState::ConnectingStartupScram`].
+//! [`crate::state::ConnectingState::StartupTrust`] and a Scram
+//! command into [`crate::state::ConnectingState::StartupScram`].
 //! From that point on, the state machine has *two disjoint pre-auth
 //! state variants* and the dispatcher's arms are type-split:
 //! the Trust arm can only receive `AuthenticationOk`, the Scram arm
@@ -34,7 +34,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// struct prints as `ScramSession { password: <REDACTED> }`.
 ///
 /// `pub` visibility with a fully `pub(crate)` surface: the type is
-/// visible through [`crate::ProtoState::ConnectingScramAwaitingServerFirst`]'s
+/// visible through `crate::ProtoState::ConnectingScramAwaitingServerFirst`'s
 /// `scram` field (which is `pub` by enum-variant rules), but every
 /// constructor and accessor is crate-internal. External code sees
 /// an opaque handle — matching `ConnectingScramAwaitingServerFirst

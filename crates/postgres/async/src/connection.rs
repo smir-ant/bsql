@@ -176,12 +176,12 @@ impl Connection {
         if config.ssl_mode == SslMode::Disable {
             return Ok(Wire::Plain(TokioSocket::new(tcp, Arc::clone(deadline))));
         }
-        let (ssl_bytes, ssl_proto) = bsql_postgres_core::ssl::ssl_request_bytes();
+        let ssl_bytes = bsql_postgres_core::ssl::ssl_request_bytes();
         let mut tcp = tcp;
         tcp.write_all(ssl_bytes).await?;
         let mut response = [0u8; 1];
         tcp.read_exact(&mut response).await?;
-        match bsql_postgres_core::ssl::classify_ssl_response(ssl_proto, response[0], config)? {
+        match bsql_postgres_core::ssl::classify_ssl_response(response[0], config)? {
             SslProbe::Accepted { server_name } => {
                 // Use the provider-explicit ring config (the workspace pins
                 // rustls to ring only, so the bare `ClientConfig::builder()` has

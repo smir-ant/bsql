@@ -22,11 +22,7 @@
 //! # Layout
 //!
 //! Dominator is `Other(BoundedStr<32>)` at 36 B + disc + pad ≈ 40 B
-//! with default repr aligned to 8 (from `u64 rows`). Used inside a
-//! slot (`crate::command_tag_slot::CommandTagSlotCell`) mirror of
-//! `crate::param_oids_slot::ParamOidsSlotCell` — the
-//! slot stores `Option<Box<CommandTag>>` so state variants carry
-//! only the `ReplyId<K>` correlator.
+//! with default repr aligned to 8 (from `u64 rows`).
 //!
 //! # `u64` for `rows`
 //!
