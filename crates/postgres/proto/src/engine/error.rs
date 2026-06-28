@@ -105,6 +105,16 @@ pub enum EngineError<E> {
     SpuriousPending,
 }
 
+// Pinned at the representative `E = Infallible` — the witness type the engine's
+// own `Send`/seam gates name, and the `#![no_std]` core's canonical
+// instantiation (a real driver supplies its own `Transport::Error`). With the
+// `Transport(E)` variant uninhabited, this captures the *non-transport* error
+// envelope: the widest variant is `IngestFull(IngestFull)` (a 24 B body —
+// IngestFull's three usize fields dominate IngestCommitOverflow/SendOverrun/
+// RowCount's 16 B) plus the discriminant → 32. Generic over `E`, so there is no
+// single canonical size; a driver's real `E` adds at most `size_of::<E>()`.
+crate::wire_pin!(EngineError<core::convert::Infallible>, size = 32, align = 8);
+
 /// The row-count contract a guard verb enforces — the expectation half of a
 /// [`RowCountViolation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +149,11 @@ impl core::fmt::Display for RowCountViolation {
 }
 
 impl core::error::Error for RowCountViolation {}
+
+// A two-state tag — one byte, no payload.
+crate::wire_pin!(ExpectedRowCount, size = 1, align = 1);
+// `ExpectedRowCount` tag (1) + `got: usize` (8), aligned to 8 → 16 B.
+crate::wire_pin!(RowCountViolation, size = 16, align = 8);
 
 /// A verb or accessor was invoked in the wrong protocol phase.
 ///

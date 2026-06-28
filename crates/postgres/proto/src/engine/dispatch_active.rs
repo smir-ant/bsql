@@ -298,6 +298,13 @@ pub struct ActiveEngine {
     command_tag: Option<CommandTag>,
 }
 
+// Stack footprint of the active handle: the carried-forward `IngestBuf` (144)
+// dominates, plus the pid/secret/tx-status scalars, the two `Option<Box<…>>` /
+// `Vec` handles (schema + oversize prefix, heap-backed), and the `command_tag`.
+// The result-schema and oversize bytes live off-stack behind those handles. A
+// field addition lands here as a reviewed footprint drift.
+crate::wire_pin!(ActiveEngine, size = 280, align = 8);
+
 impl ActiveEngine {
     /// Construct the active engine at handshake completion, carrying the
     /// connecting engine's ingest buffer forward (any pipelined active frames

@@ -53,6 +53,10 @@ pub fn absurd<T>(n: Never) -> T {
     match n {}
 }
 
+// Uninhabited carrier: zero-sized, the niche that lets `Boundary<Never>` fold
+// its `Stopped` arm into the discriminant (see the `Boundary` pins in `pump`).
+crate::wire_pin!(Never, size = 0, align = 1);
+
 // ===========================================================================
 // 2. Observer (sealed) + NoObserver
 // ===========================================================================

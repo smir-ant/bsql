@@ -367,6 +367,9 @@ impl fmt::Display for SendOverrun {
     }
 }
 
+// Two `usize` detail fields (committed, pending) → 16 B.
+crate::wire_pin!(SendOverrun, size = 16, align = 8);
+
 /// Drain `send_buf` to the transport: the engine-owned, cancellation-safe
 /// flush loop.
 ///

@@ -596,6 +596,13 @@ impl fmt::Debug for IngestBuf {
     }
 }
 
+// Stack footprint: the `[u8; INGEST_INLINE_CAP]` inline tier (128) + the
+// `Option<Box<…>>` heap-tier pointer (8) + the `u16` cursor/filled watermarks
+// (2+2, padded) = 144 B. The heap tier's bytes live behind the `Box`, off-stack.
+// A change to `INGEST_INLINE_CAP` or a field reshape lands here as a reviewed
+// drift, so the inbound buffer's resident cost stays on the review surface.
+crate::wire_pin!(IngestBuf, size = 144, align = 8);
+
 /// Returned by [`IngestBuf::read_slot`] when no room remains for the wanted
 /// bytes even after reclaiming the consumed prefix and escaping to the heap
 /// tier — a wire frame larger than the bounded buffer. The engine treats
@@ -622,6 +629,9 @@ impl fmt::Display for IngestFull {
     }
 }
 
+// Three `usize` detail fields (attempted, available, cap) → 24 B.
+crate::wire_pin!(IngestFull, size = 24, align = 8);
+
 /// Returned by [`IngestBuf::commit`] when the committed count would push the
 /// fill watermark past the active capacity — a caller that committed more
 /// bytes than the slot it was lent.
@@ -644,6 +654,9 @@ impl fmt::Display for IngestCommitOverflow {
         )
     }
 }
+
+// Two `usize` detail fields (committed, available) → 16 B.
+crate::wire_pin!(IngestCommitOverflow, size = 16, align = 8);
 
 #[cfg(test)]
 mod drop_witness_tests {

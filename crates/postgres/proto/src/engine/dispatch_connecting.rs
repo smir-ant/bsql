@@ -120,6 +120,10 @@ impl ConnFail {
     }
 }
 
+// The widest variant is `Scram(ScramFailureClass)`; the `UnexpectedFrame { tag }`
+// u8 and the unit causes ride the discriminant → 8 B, align 4.
+crate::wire_pin!(ConnFail, size = 8, align = 4);
+
 // ===========================================================================
 // Engine phase + dispatch outcome
 // ===========================================================================
@@ -219,6 +223,10 @@ pub(crate) enum HandshakeProgress {
     Failed(ConnFail),
 }
 
+// `pub(crate)` pump-facing surface. Widest variant is `Failed(ConnFail)` (8/4);
+// the four unit steps ride the discriminant.
+crate::wire_pin!(HandshakeProgress, size = 8, align = 4);
+
 #[inline]
 fn advance(state: ConnectingState) -> ConnDispatch {
     ConnDispatch {
@@ -263,6 +271,13 @@ pub struct ConnectingEngine {
     ingest: IngestBuf,
     phase: ConnPhase,
 }
+
+// Stack footprint: the single-residence `IngestBuf` (144) + the `ConnPhase`
+// enum. `ConnPhase` is sized by its widest variant — the password/SCRAM
+// handshake state is `Box`-externalised inside `ConnectingState`, so the live
+// handshake material lives off-stack and the engine's own footprint stays
+// bounded. A field reshape lands here as a reviewed drift.
+crate::wire_pin!(ConnectingEngine, size = 168, align = 8);
 
 impl ConnectingEngine {
     /// Begin a handshake: queue the `StartupMessage` onto `send_buf` and seat

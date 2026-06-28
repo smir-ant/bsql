@@ -128,6 +128,10 @@ impl PreparedStatement {
     }
 }
 
+// The `StmtName` fixed buffer (65) + the result-OID `Vec` handle (24), padded to
+// 96. The OID bytes live behind the `Vec`, off-stack.
+crate::wire_pin!(PreparedStatement, size = 96, align = 8);
+
 /// Build one frame into a transient scrub-on-drop scratch buffer and queue it.
 ///
 /// `WriteBuf` is `heapless` (a stack array), so this allocates nothing on the

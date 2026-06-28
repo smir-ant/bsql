@@ -112,6 +112,15 @@ pub enum Boundary<B = super::Never> {
     Stopped(B),
 }
 
+// Pinned at both real instantiations. `Boundary<Never>` is the *collect-all*
+// shape the thirteen Continue-only verbs use — `Stopped(Never)` is uninhabited
+// and folds into the discriminant, so it is one byte. `Boundary<()>` is the
+// *breakable* shape `recv_notification` uses; `()` is a ZST so the discriminant
+// still fits one byte. Generic over `B`, so there is no single canonical size —
+// these two are every shape a verb actually constructs.
+crate::wire_pin!(Boundary<super::Never>, size = 1, align = 1);
+crate::wire_pin!(Boundary<()>, size = 1, align = 1);
+
 /// The terminal of [`pump_connecting_to_ready`] — the handshake either
 /// completed or failed.
 ///
@@ -128,6 +137,10 @@ pub enum HandshakeOutcome {
     /// The handshake failed, carrying the classified [`ConnFail`] cause.
     Failed(ConnFail),
 }
+
+// One fat-niche enum over `ConnFail` (its 8/4 footprint dominates); the four
+// unit outcomes ride the discriminant.
+crate::wire_pin!(HandshakeOutcome, size = 8, align = 4);
 
 /// One surfaceable active-phase event, lent to the pump's sink and consumed
 /// within that call — the borrow never escapes the sink invocation, which is
@@ -168,6 +181,11 @@ pub enum Surface<'e> {
     /// The `COPY` stream is complete.
     CopyDone,
 }
+
+// The widest variant is `Deliver { tag, oids, names }` — an `Option<&CommandTag>`
+// (8) plus two slice fat-pointers (16 each) = 40 B body, tail-padded with the
+// discriminant to 48. The single-borrow payload variants are one fat slice (16).
+crate::wire_pin!(Surface<'static>, size = 48, align = 8);
 
 /// Drive the active engine to its next protocol [`Boundary`] over `transport`.
 ///

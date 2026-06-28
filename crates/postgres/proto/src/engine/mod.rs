@@ -24,6 +24,39 @@
 //! The [`Event`] / [`AuthEvent`] pull-event vocabulary is *declared* here
 //! (and footprint-pinned); the producers that emit those events compose in
 //! later additive steps.
+//!
+//! # §7 edge-case discipline — the twelve-axis pass
+//!
+//! Every non-trivial engine component is walked across the project canon's
+//! twelve edge-case axes, and each axis (and each material sub-point) is
+//! resolved EITHER by a concrete green gate/test OR by an explicit, justified
+//! "not applicable" — silence on an applicable axis is itself a violation. The
+//! twelve axes are: **Cardinality**, **Presence**, **Concurrency**,
+//! **Temporal**, **Trust level**, **Size**, **State lifecycle**, **Resource
+//! pressure**, **Platform**, **Failure composition**, **Memory-leak /
+//! ownership**, and **Fallback / recovery**.
+//!
+//! The pass is not free prose that can rot: the authoritative per-sub-point
+//! citation table, and the tests that mechanically prove every cited test/gate
+//! actually exists (so the table can never claim coverage that does not),
+//! live in the `engine_axes_spec` integration test. That spec also re-derives
+//! the engine's load-bearing census counts (footprint pins, error variants,
+//! verbs, cold-classified branches, `#[non_exhaustive]` surfaces) from the
+//! source so a drift in any of them fails the build.
+//!
+//! # Footprint pins
+//!
+//! Every engine surface type carries a co-located [`wire_pin!`](crate::wire_pin)
+//! anchor (`size_of` + `align_of` together) at its FINAL size, so a layout
+//! drift is an `E0080` build failure — even for a type constructed nowhere.
+//! Types generic over a parameter with no canonical size are pinned at their
+//! real instantiations ([`Boundary`] at `Never` and `()`, [`EngineError`] at
+//! the witness `Infallible`); the [`Engine`] shell is held by the
+//! ZST-observer size-identity gate below (it is generic over the transport, so
+//! it has no single canonical size). [`EngineNoObs`] — the `#[doc(hidden)]`
+//! control half of that gate — is likewise not pinned absolutely: it is defined
+//! to equal [`Engine`] minus the observer field, so the identity gate IS its
+//! pin; an absolute pin would be circular.
 
 mod dispatch_active;
 mod dispatch_connecting;
