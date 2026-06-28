@@ -14,8 +14,8 @@
 //!    frames (no wildcard `_` arms).
 //! 2. [`Observer`] (sealed) + [`NoObserver`] — the zero-cost policy seam
 //!    carried by every verb.
-//! 3. [`Transport`] — the driver-facing I/O seam (RPITIT + `Send`, with an
-//!    associated [`Error`](Transport::Error) type).
+//! 3. [`Transport`] — the driver-facing I/O seam (RPITIT + `Send`, with a
+//!    `Send`-bounded associated [`Error`](Transport::Error) type).
 //! 4. [`Live`] — the branded, non-`Clone`, linear liveness token, minted
 //!    by [`session`] / [`session_with`].
 //! 5. [`Engine`] — the session shell that composes the above, carrying the
@@ -523,6 +523,92 @@ where
     Ok(body(engine, live))
 }
 
+/// Open an owned session handle over `transport` with the default
+/// [`NoObserver`] policy: the same connecting-phase priming as [`session`],
+/// but the primed [`Engine`] and its linear [`Live`] token are *returned* to
+/// the caller instead of lent to a `for<'b>` closure.
+///
+/// Use this when the engine must be **stored** — held in a struct, parked in a
+/// pool, moved between calls. A poolable connection that keeps the engine plus
+/// an `Option<Live<'static>>` across method calls cannot use [`session`]: that
+/// API's `for<'b>` brand is *generative* (each call mints a fresh, invariant
+/// `'b`), so the token and the engine are trapped inside the closure scope —
+/// returning or storing either is a lifetime error. `open_owned` instead pins
+/// the brand at `'static`, the one lifetime that outlives a pool, so the handle
+/// can be owned for as long as the caller needs.
+///
+/// # Brand tradeoff (a constraint, state it plainly)
+///
+/// The generative `for<'b>` brand of [`session`] makes *cross-connection*
+/// isolation tier-1: a token minted in one session has a brand no other
+/// session shares, so using connection A's token on connection B's engine is a
+/// compile error. Pinning the brand at `'static` gives every `open_owned`
+/// handle the *same* brand, so that compile-time cross-connection wall is gone
+/// — cross-connection isolation drops to tier-2-by-encapsulation: the owner
+/// (a driver connection) keeps the engine and its `Live` private in one struct
+/// and never hands the bare token out, so no caller can mix two connections'
+/// tokens in the first place. *Within* a connection the linearity stays tier-1:
+/// [`Live`] is non-`Clone`, every verb consumes it and returns it only on a
+/// clean boundary, so at-most-one-command-in-flight is still a move-checked
+/// invariant, not a runtime guard. [`session`] / [`session_with`] remain the
+/// scoped tier-1 API for callers that do *not* need to store the handle; prefer
+/// them when the engine's whole life fits in one scope.
+///
+/// # Errors
+///
+/// As [`session`]: [`ConnFail`] if assembling the startup packet overflows the
+/// bounded frame assembler (structurally unreachable for the bounded
+/// identifier newtypes, but propagated honestly rather than discharged with a
+/// panic-able unwrap).
+#[inline]
+pub fn open_owned<T>(
+    transport: T,
+    user: &Ident,
+    database: Option<&DatabaseName>,
+    app_name: Option<&ApplicationName>,
+    credentials: Credentials,
+) -> Result<(Engine<'static, T, NoObserver>, Live<'static>), ConnFail>
+where
+    T: Transport,
+{
+    let mut send_buf = SendBuf::new();
+    let conn = ConnectingEngine::start(&mut send_buf, user, database, app_name, credentials)?;
+    let engine = Engine::new_in_scope(transport, NoObserver, send_buf, Phase::Connecting(conn));
+    let live = Live::new_in_scope();
+    Ok((engine, live))
+}
+
+/// Open an owned session handle with a caller-chosen [`Observer`] policy.
+///
+/// Identical priming and `'static`-brand tradeoff to [`open_owned`] (read its
+/// brand-tradeoff note); the same verb surface serves the non-default policy
+/// with no signature change — only the returned engine's observer type differs.
+/// Mirrors the [`session`] / [`session_with`] pair: [`open_owned`] is the
+/// default-policy entry, this is the policy-carrying one.
+///
+/// # Errors
+///
+/// As [`open_owned`].
+#[inline]
+pub fn open_owned_with<T, O>(
+    transport: T,
+    observer: O,
+    user: &Ident,
+    database: Option<&DatabaseName>,
+    app_name: Option<&ApplicationName>,
+    credentials: Credentials,
+) -> Result<(Engine<'static, T, O>, Live<'static>), ConnFail>
+where
+    T: Transport,
+    O: Observer,
+{
+    let mut send_buf = SendBuf::new();
+    let conn = ConnectingEngine::start(&mut send_buf, user, database, app_name, credentials)?;
+    let engine = Engine::new_in_scope(transport, observer, send_buf, Phase::Connecting(conn));
+    let live = Live::new_in_scope();
+    Ok((engine, live))
+}
+
 // ===========================================================================
 // Compile-time seam-composition gates
 // ===========================================================================
@@ -581,6 +667,11 @@ const _: fn() = || {
     assert_send::<Live<'static>>();
     assert_send::<NoObserver>();
     assert_send::<EngineError<core::convert::Infallible>>();
+    // The `Transport::Error: Send` bound, locked at a concrete transport: a
+    // wrapper transport's error union is `Send` only when the inner `Error` is,
+    // so the bound must hold for every blessed transport, not just by trait
+    // declaration.
+    assert_send::<<WitnessTransport as Transport>::Error>();
     assert_send::<Engine<'static, WitnessTransport, NoObserver>>();
     assert_send::<SendBuf>();
     assert_send::<SendOverrun>();

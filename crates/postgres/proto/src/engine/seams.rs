@@ -12,8 +12,9 @@
 //!    inline to nothing; a non-default policy reuses the identical verb
 //!    surface (no second signature pass).
 //! 3. [`Transport`] — the driver-facing I/O seam (RPITIT + `Send`, with
-//!    an associated [`Error`](Transport::Error) type so the `#![no_std]`
-//!    core never bakes in a concrete I/O error).
+//!    a `Send`-bounded associated [`Error`](Transport::Error) type so the
+//!    `#![no_std]` core never bakes in a concrete I/O error and a wrapper
+//!    transport's error union stays `Send`).
 //! 4. [`Live`] — the branded, non-`Clone`, linear liveness token.
 
 use core::future::Future;
@@ -201,7 +202,16 @@ pub trait Transport: Send {
     /// The transport's own failure type. Travels through
     /// [`EngineError::Transport`](super::EngineError::Transport) so the
     /// core never bakes in `std::io::Error`.
-    type Error;
+    ///
+    /// Bounded `Send`: the seam's I/O futures are themselves `+ Send` (the
+    /// async driver polls them across task boundaries), and a generic wrapper
+    /// transport layered over an inner `Transport` defines its own error union
+    /// — `enum E<Inner> { Socket(Inner::Error), Layer(..) }` — which is `Send`
+    /// only when the inner `Error` is `Send`. Without this bound such a wrapper
+    /// fails to compile (`E0277`: the inner error cannot be sent between
+    /// threads). The bound is free for every concrete transport: an infallible
+    /// script's `Infallible` and a socket's I/O error are already `Send`.
+    type Error: Send;
 
     /// Read available bytes into `buf`, returning the count written.
     fn read<'a>(
