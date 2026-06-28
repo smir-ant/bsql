@@ -14,7 +14,7 @@
 //! wired — it observes the handshake outcome only. The differential test
 //! restricts itself to the handshake/startup subset accordingly.
 
-use bsql_postgres_proto::engine::{ActiveEngine, AuthEvent, ConnectingEngine, Event};
+use bsql_postgres_proto::engine::{ActiveEngine, AuthEvent, ConnectingEngine, Event, SendBuf};
 use bsql_postgres_proto::{Credentials, Encoding, Ident, SessionParams, TxStatus};
 
 use bsql_corpus::adapter::Adapter;
@@ -119,7 +119,11 @@ fn run_handshake(transcript: &Transcript) -> ObservedRun {
         Ok(user) => user,
         Err(_) => return failed_run(Vec::new()),
     };
-    let mut engine = match ConnectingEngine::start(&user, None, None, Credentials::Trust) {
+    // The sole outbound residence: the startup packet and any auth response are
+    // queued here. It is never flushed in this in-memory adapter, so `pending()`
+    // accumulates the full client wire (startup ++ auth) the differential reads.
+    let mut send_buf = SendBuf::new();
+    let mut engine = match ConnectingEngine::start(&mut send_buf, &user, None, None, Credentials::Trust) {
         Ok(engine) => engine,
         Err(_) => return failed_run(Vec::new()),
     };
@@ -131,7 +135,7 @@ fn run_handshake(transcript: &Transcript) -> ObservedRun {
     loop {
         // The borrow of the lent frame ends with each match arm; capture only
         // the owned signal needed after it.
-        let need_more = match engine.next_auth_event() {
+        let need_more = match engine.next_auth_event(&mut send_buf) {
             AuthEvent::Ready => {
                 ready = true;
                 break;
@@ -165,9 +169,11 @@ fn run_handshake(transcript: &Transcript) -> ObservedRun {
     }
 
     // Capture the outbound client bytes AFTER driving (any auth response is
-    // appended to the startup packet). Discarded for the canonical trust setup.
+    // queued after the startup packet). The send buffer is never flushed here,
+    // so `pending()` is the full client wire. Discarded for the canonical trust
+    // setup.
     let client_bytes = if record_client {
-        engine.client_bytes().to_vec()
+        send_buf.pending().to_vec()
     } else {
         Vec::new()
     };
@@ -613,12 +619,13 @@ fn drive_step(
 /// Reach an active engine through the canonical trust handshake.
 fn setup_active() -> Option<ActiveEngine> {
     let user = Ident::try_from_str("corpus").ok()?;
-    let mut conn = ConnectingEngine::start(&user, None, None, Credentials::Trust).ok()?;
+    let mut send_buf = SendBuf::new();
+    let mut conn = ConnectingEngine::start(&mut send_buf, &user, None, None, Credentials::Trust).ok()?;
     let mut chunks =
         split_into_chunks(&canonical_handshake_reply(), bsql_corpus::ChunkSchedule::AllAtOnce)
             .into_iter();
     loop {
-        match conn.next_auth_event() {
+        match conn.next_auth_event(&mut send_buf) {
             AuthEvent::Ready => break,
             AuthEvent::Fail(_) => return None,
             AuthEvent::ParamStatus(_)

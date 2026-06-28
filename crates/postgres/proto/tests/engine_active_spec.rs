@@ -28,7 +28,7 @@
     reason = "integration-test helpers (the feed pump, handshake construction) use unwrap/expect/panic as the loud failure signal; clippy's allow-in-tests carve-out reaches #[test] fns but not the free helper fns this file factors out"
 )]
 
-use bsql_postgres_proto::engine::{ActiveEngine, AuthEvent, ConnectingEngine, Event};
+use bsql_postgres_proto::engine::{ActiveEngine, AuthEvent, ConnectingEngine, Event, SendBuf};
 use bsql_postgres_proto::frame::READ_BUF_CAP;
 use bsql_postgres_proto::wire::{
     TAG_COMMAND_COMPLETE, TAG_COPY_DATA, TAG_COPY_DONE, TAG_COPY_OUT_RESPONSE, TAG_DATA_ROW,
@@ -265,12 +265,13 @@ fn drive(engine: &mut ActiveEngine, bytes: &[u8], chunk: usize) -> Vec<Ev> {
 /// Reach an active engine through the canonical trust handshake.
 fn active_engine() -> ActiveEngine {
     let user = Ident::try_from_str("corpus").expect("ident");
-    let mut conn =
-        ConnectingEngine::start(&user, None, None, Credentials::Trust).expect("start handshake");
+    let mut send_buf = SendBuf::new();
+    let mut conn = ConnectingEngine::start(&mut send_buf, &user, None, None, Credentials::Trust)
+        .expect("start handshake");
     let hs = concat(&[auth_ok(), backend_key(4321, 8765), ready_for_query(b'I')]);
     feed_conn(&mut conn, &hs);
     loop {
-        match conn.next_auth_event() {
+        match conn.next_auth_event(&mut send_buf) {
             AuthEvent::Ready => break,
             AuthEvent::NeedMore => panic!("handshake exhausted before Ready"),
             AuthEvent::Fail(_) => panic!("handshake failed"),

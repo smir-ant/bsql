@@ -82,9 +82,16 @@
 //! this byte cursor. The slow-peer / zero-window case (a peer that stops
 //! reading, so a write would block indefinitely) is likewise a verb-layer
 //! bound, not a buffer concern: [`SendBuf`] holds only locally-produced bytes,
-//! so no peer can force its growth. Steady state allocates nothing:
-//! [`reset`](SendBuf::reset) retains the backing capacity, so a follow-on
-//! batch that fits reuses it with no reallocation.
+//! so no peer can force its growth.
+//!
+//! Reaching the zero-allocation steady state is a constraint on the layer above:
+//! every capacity-reclaiming method ([`reset`](SendBuf::reset),
+//! [`scrub_drained`](SendBuf::scrub_drained)) retains the backing allocation, so
+//! a follow-on batch that fits reuses it with no reallocation — but that holds
+//! only once a compaction point actually runs between batches.
+//! [`scrub_drained`](SendBuf::scrub_drained) is that point at handshake
+//! completion (it also erases the handshake's secret-bearing wire, see below);
+//! a per-command compaction in the active phase is that layer's responsibility.
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -180,6 +187,31 @@ impl SendBuf {
         self.sent == self.buf.len()
     }
 
+    /// The whole queued region (`buf[..len]`), independent of the send cursor —
+    /// the bytes physically resident in the live part of the backing store.
+    ///
+    /// Test-only probe: it exposes the live queued bytes (where a flushed-but-
+    /// not-scrubbed handshake wire — incl. the SCRAM proof — would still sit,
+    /// since [`pending`](Self::pending) skips the already-sent prefix) so a test
+    /// can assert the secret is gone after [`scrub_drained`](Self::scrub_drained).
+    /// The Vec's zeroized spare beyond `len` is not safely readable (it is
+    /// formally uninitialized to `Vec`), so the probe covers the live region; the
+    /// spare scrub is covered by the zeroize-coverage manifest.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn queued(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// The backing allocation's capacity — test-only, to assert the
+    /// capacity-retaining property of [`scrub_drained`](Self::scrub_drained) /
+    /// [`reset`](Self::reset).
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
     /// Commit `n` bytes the transport just accepted, advancing the send
     /// cursor.
     ///
@@ -212,6 +244,39 @@ impl SendBuf {
             }
         };
         Ok(())
+    }
+
+    /// Scrub the **entire backing store** and empty the buffer, retaining the
+    /// allocated capacity for the next batch.
+    ///
+    /// Zeroizes the full capacity (the queued bytes — which after a handshake
+    /// include the SCRAM client proof and the password message — plus any spare),
+    /// then truncates the length to zero and rewinds the cursor. Unlike the
+    /// teardown [`Drop`] scrub, this runs *mid-lifetime*: it is the prompt scrub
+    /// that erases the handshake's secret-bearing wire at handshake completion so
+    /// it does not linger in the buffer for the rest of the connection, while
+    /// keeping the allocation so the active phase reuses it with no realloc.
+    ///
+    /// # Precondition
+    ///
+    /// Only valid when the buffer is [`is_drained`](Self::is_drained): it scrubs
+    /// the whole backing, so any **unsent** tail would be lost. The sole caller
+    /// invokes it at the handshake-ready boundary, where the last outbound frame
+    /// has already been flushed; a `debug_assert` pins that invariant in debug
+    /// builds (it is a programming-error check, not a runtime fallback — there is
+    /// no recovery branch).
+    #[inline]
+    pub(crate) fn scrub_drained(&mut self) {
+        debug_assert!(
+            self.is_drained(),
+            "scrub_drained called with an unsent tail; it scrubs the whole backing and would lose those bytes",
+        );
+        use zeroize::Zeroize;
+        // Zero the full capacity (queued secret bytes + spare), then drop the
+        // length and rewind the cursor. `clear` keeps the allocation.
+        self.buf.zeroize();
+        self.buf.clear();
+        self.sent = 0;
     }
 
     /// Drop the already-sent prefix and rewind the cursor, retaining the
@@ -360,6 +425,47 @@ pub async fn flush<T: Transport>(
     // to the mid-drain cursor unroll.
     transport.flush().await.map_err(EngineError::Transport)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod scrub_drained_tests {
+    //! Mid-lifetime scrub contract for [`SendBuf::scrub_drained`]: it empties the
+    //! queued region (so a flushed secret-bearing wire does not linger) and
+    //! retains the backing allocation (so the next phase reuses it). The
+    //! byte-level full-capacity zeroize is the same `Vec::zeroize` the teardown
+    //! `Drop` runs (covered by the zeroize-coverage manifest); the Vec's spare
+    //! beyond `len` is not safely readable, so this asserts the live region is
+    //! cleared and the allocation kept. The connect call-site teeth (the scrub
+    //! actually runs at handshake completion) live in `engine::connect_scrub_tests`.
+
+    use super::SendBuf;
+
+    #[test]
+    fn scrub_drained_empties_queued_region_and_retains_capacity() {
+        let mut sb = SendBuf::new();
+        let secret = b"scram-client-proof-and-password-message-bytes";
+        sb.enqueue(secret);
+        // The queued region holds the secret before the scrub.
+        assert_eq!(sb.queued(), secret);
+        // Mark fully sent so the drained precondition holds.
+        let pending = sb.pending_len();
+        assert!(sb.advance(pending).is_ok());
+        assert!(sb.is_drained());
+        let cap = sb.capacity();
+
+        sb.scrub_drained();
+
+        // The secret-bearing queued region is gone, the buffer is empty and
+        // drained, and the allocation is retained for reuse.
+        assert!(sb.queued().is_empty(), "queued region not cleared");
+        assert!(sb.pending().is_empty());
+        assert!(sb.is_drained());
+        assert_eq!(sb.capacity(), cap, "capacity not retained across scrub");
+
+        // The retained allocation accepts a follow-on batch.
+        sb.enqueue(b"next-phase-frame");
+        assert_eq!(sb.queued(), b"next-phase-frame");
+    }
 }
 
 #[cfg(test)]

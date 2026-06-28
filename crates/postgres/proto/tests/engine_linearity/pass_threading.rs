@@ -3,6 +3,7 @@
 // `&mut engine` across both `await`s (the R4 self-referential-async shape),
 // and is consumed at the end without escaping the scope.
 use bsql_postgres_proto::engine::{session, EngineError, Transport};
+use bsql_postgres_proto::{Credentials, Ident};
 use core::convert::Infallible;
 use core::future::{ready, Future};
 
@@ -47,7 +48,8 @@ fn block_on<F: Future>(f: F) -> F::Output {
 }
 
 fn main() {
-    let ok = session(T0, |mut e, live| {
+    let user = Ident::try_from_str("brand").unwrap();
+    let ok = session(T0, &user, None, None, Credentials::Trust, |mut e, live| {
         block_on(async move {
             let live = e.begin(live).await?;
             let live = e.commit(live).await?;
@@ -55,6 +57,7 @@ fn main() {
             Ok::<(), EngineError<Infallible>>(())
         })
         .is_ok()
-    });
+    })
+    .unwrap();
     assert!(ok);
 }

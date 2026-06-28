@@ -13,6 +13,7 @@ use bsql_postgres_proto::engine::{
     session, session_with, Engine, EngineError, EngineNoObs, Event, Live, NoObserver, Transport,
     AuthEvent,
 };
+use bsql_postgres_proto::{Credentials, Ident};
 use core::convert::Infallible;
 use core::future::{ready, Future};
 
@@ -65,14 +66,17 @@ fn block_on<F: Future>(f: F) -> F::Output {
 /// lives only on the engine type + the token) is what makes this compile.
 #[test]
 fn r4_two_sequential_async_verbs_thread_one_token() {
-    let outcome: Result<(), EngineError<Infallible>> = session(TestTransport, |mut e, live| {
-        block_on(async move {
-            let live = e.begin(live).await?;
-            let live = e.commit(live).await?;
-            let _consumed = live;
-            Ok(())
+    let user = Ident::try_from_str("test").expect("ident");
+    let outcome: Result<(), EngineError<Infallible>> =
+        session(TestTransport, &user, None, None, Credentials::Trust, |mut e, live| {
+            block_on(async move {
+                let live = e.begin(live).await?;
+                let live = e.commit(live).await?;
+                let _consumed = live;
+                Ok(())
+            })
         })
-    });
+        .expect("startup packet assembles");
     assert!(outcome.is_ok());
 }
 
@@ -80,12 +84,15 @@ fn r4_two_sequential_async_verbs_thread_one_token() {
 /// returned by each verb and fed to the next.
 #[test]
 fn verbs_thread_token_one_await_each() {
-    let threaded = session(TestTransport, |mut e, live| {
-        let live = block_on(e.begin(live)).expect("begin");
-        let live = block_on(e.commit(live)).expect("commit");
-        let _consumed = live;
-        true
-    });
+    let user = Ident::try_from_str("test").expect("ident");
+    let threaded =
+        session(TestTransport, &user, None, None, Credentials::Trust, |mut e, live| {
+            let live = block_on(e.begin(live)).expect("begin");
+            let live = block_on(e.commit(live)).expect("commit");
+            let _consumed = live;
+            true
+        })
+        .expect("startup packet assembles");
     assert!(threaded);
 }
 
@@ -93,11 +100,21 @@ fn verbs_thread_token_one_await_each() {
 /// policy through the identical verb surface — no signature change.
 #[test]
 fn session_with_threads_explicit_policy() {
-    let threaded = session_with(TestTransport, NoObserver, |mut e, live| {
-        let live = block_on(e.begin(live)).expect("begin");
-        let _consumed = live;
-        true
-    });
+    let user = Ident::try_from_str("test").expect("ident");
+    let threaded = session_with(
+        TestTransport,
+        NoObserver,
+        &user,
+        None,
+        None,
+        Credentials::Trust,
+        |mut e, live| {
+            let live = block_on(e.begin(live)).expect("begin");
+            let _consumed = live;
+            true
+        },
+    )
+    .expect("startup packet assembles");
     assert!(threaded);
 }
 

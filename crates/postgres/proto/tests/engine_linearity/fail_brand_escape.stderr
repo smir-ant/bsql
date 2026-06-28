@@ -1,11 +1,11 @@
 error: lifetime may not live long enough
-  --> tests/engine_linearity/fail_brand_escape.rs:38:43
+  --> tests/engine_linearity/fail_brand_escape.rs:40:82
    |
-38 |     let _escaped = session(T0, |_e, live| live);
-   |                                 --      - ^^^^ returning this value requires that `'1` must outlive `'2`
-   |                                 |       |
-   |                                 |       return type of closure is Live<'2>
-   |                                 has type `Engine<'1, T0>`
+40 |     let _escaped = session(T0, &user, None, None, Credentials::Trust, |_e, live| live);
+   |                                                                        --      - ^^^^ returning this value requires that `'1` must outlive `'2`
+   |                                                                        |       |
+   |                                                                        |       return type of closure is Live<'2>
+   |                                                                        has type `Engine<'1, T0>`
    |
    = note: requirement occurs because of the type `Live<'_>`, which makes the generic argument `'_` invariant
    = note: the struct `Live<'b>` is invariant over the parameter `'b`

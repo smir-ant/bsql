@@ -1,6 +1,7 @@
 // EXPECT: E0382 — `Live<'b>` is a linear token; reusing it after a verb
 // consumes it is a use-of-moved-value error.
 use bsql_postgres_proto::engine::{session, Transport};
+use bsql_postgres_proto::{Credentials, Ident};
 use core::convert::Infallible;
 use core::future::{ready, Future};
 
@@ -45,7 +46,8 @@ fn block_on<F: Future>(f: F) -> F::Output {
 }
 
 fn main() {
-    session(T0, |mut e, live| {
+    let user = Ident::try_from_str("brand").unwrap();
+    let _ = session(T0, &user, None, None, Credentials::Trust, |mut e, live| {
         let token = block_on(e.begin(live)).unwrap();
         let _next = block_on(e.commit(token)).unwrap();
         // Reuse the ALREADY-CONSUMED token — use of moved value:

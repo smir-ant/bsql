@@ -8,6 +8,7 @@
 
 use super::flush::SendOverrun;
 use super::ingest::{IngestCommitOverflow, IngestFull};
+use super::ConnFail;
 
 /// Failure surface returned by every engine verb.
 ///
@@ -58,4 +59,36 @@ pub enum EngineError<E> {
     /// a clean boundary (which would silently truncate the response). The
     /// read-side mirror of [`WriteZero`](Self::WriteZero).
     UnexpectedEof,
+    /// The handshake terminated unsuccessfully — a server `ErrorResponse`
+    /// during connect, an auth method the configured credentials cannot
+    /// satisfy, a SCRAM/MD5 failure, or a wire-illegal connecting frame.
+    /// Carries the classified [`ConnFail`] cause. Classified rather than
+    /// retried (the handshake cannot recover) or swallowed.
+    Handshake(ConnFail),
+    /// A verb was invoked in a protocol phase that does not support it — e.g.
+    /// [`connect`](super::Engine::connect) after the engine is already active,
+    /// or an active-phase accessor before the handshake completed. A classified
+    /// error, never a panic; carries the zero-sized [`WrongPhase`] marker.
+    WrongPhase(WrongPhase),
 }
+
+/// A verb or accessor was invoked in the wrong protocol phase.
+///
+/// Zero-sized: the violation is binary (the engine was not in the phase the
+/// call requires), so there is no detail to carry. Returned directly by the
+/// engine's phase-query accessors
+/// ([`backend_pid`](super::Engine::backend_pid) /
+/// [`tx_status`](super::Engine::tx_status)) and carried by
+/// [`EngineError::WrongPhase`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrongPhase;
+
+impl core::fmt::Display for WrongPhase {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("engine verb invoked in the wrong protocol phase")
+    }
+}
+
+impl core::error::Error for WrongPhase {}
+
+crate::wire_pin!(WrongPhase, size = 0, align = 1);

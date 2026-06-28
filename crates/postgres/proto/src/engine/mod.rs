@@ -35,16 +35,26 @@ mod seams;
 
 pub use dispatch_active::ActiveEngine;
 pub use dispatch_connecting::{ConnFail, ConnectingEngine};
-pub use error::EngineError;
+// Crate-internal: the non-borrowing handshake-step pull the connecting pump
+// consumes (not part of the public surface).
+pub(crate) use dispatch_connecting::HandshakeProgress;
+pub use error::{EngineError, WrongPhase};
 pub use flush::{flush, SendBuf, SendOverrun};
 pub use ingest::{IngestBuf, IngestCommitOverflow, IngestFull};
-pub use pump::{poll_once, pump_active_to_boundary, Boundary, SpuriousPending, Surface};
+pub use pump::{
+    poll_once, pump_active_to_boundary, pump_connecting_to_ready, Boundary, HandshakeOutcome,
+    SpuriousPending, Surface,
+};
 pub use seams::{
     absurd, engine_observe_no_seam, engine_observe_via_seam, Live, Never, NoObserver, Observer,
     Transport,
 };
 
 use core::marker::PhantomData;
+
+use crate::action::TxStatus;
+use crate::ident::{ApplicationName, DatabaseName, Ident};
+use crate::password::Credentials;
 
 // ===========================================================================
 // Pull-event vocabulary (declared; producers compose later)
@@ -151,16 +161,19 @@ crate::wire_pin!(AuthEvent<'static>, size = 24, align = 8);
 /// `async` scope uncompilable.
 #[derive(Debug)]
 pub struct Engine<'b, T, O = NoObserver> {
-    #[expect(
-        dead_code,
-        reason = "I/O seam stored at engine birth; the scaffold verbs perform no exchange, so the field is write-only until the ingest/flush pump reads it to drive the wire"
-    )]
     transport: T,
     #[expect(
         dead_code,
-        reason = "observer policy stored at engine birth; write-only until the row/complete dispatch hooks invoke it"
+        reason = "observer policy stored at engine birth; write-only until the active-phase row/complete dispatch hooks invoke it"
     )]
     obs: O,
+    /// The single persistent outbound residence: the startup packet, every auth
+    /// response, and (later) request frames are queued here and drained by the
+    /// flush loop.
+    send_buf: SendBuf,
+    /// The engine's current protocol phase. Born [`Phase::Connecting`];
+    /// [`connect`](Self::connect) drives it to [`Phase::Active`].
+    phase: Phase,
     _brand: PhantomData<fn(&'b ()) -> &'b ()>,
 }
 
@@ -175,7 +188,51 @@ pub struct EngineNoObs<'b, T> {
         reason = "size-identity control field mirroring Engine's transport; exists only so the ZST-observer-is-free size comparison has a like-for-like layout"
     )]
     transport: T,
+    #[expect(
+        dead_code,
+        reason = "size-identity control field mirroring Engine's send_buf; exists only for the like-for-like layout comparison"
+    )]
+    send_buf: SendBuf,
+    #[expect(
+        dead_code,
+        reason = "size-identity control field mirroring Engine's phase; exists only for the like-for-like layout comparison"
+    )]
+    phase: Phase,
     _brand: PhantomData<fn(&'b ()) -> &'b ()>,
+}
+
+/// The engine's protocol phase: the connecting handshake brain, the active
+/// post-handshake handle, or the move-out placeholder occupied only during the
+/// synchronous Connecting→Active swap.
+///
+/// The two live phases overlay one another (a single [`IngestBuf`] is carried
+/// across the transition by [`ConnectingEngine::into_active`], never doubled),
+/// so the engine is sized by its larger phase, not their sum.
+#[derive(Debug)]
+enum Phase {
+    /// Driving the startup/auth handshake.
+    Connecting(ConnectingEngine),
+    /// Handshake complete; ready for active-phase verbs.
+    Active(ActiveEngine),
+    /// The [`core::mem::replace`] placeholder held only between the move-out of
+    /// the connecting engine and the move-in of the active engine, inside one
+    /// synchronous tail. Never held across an `.await` and never observed by a
+    /// caller (the swap completes before the next suspension point).
+    Transitioning,
+}
+
+impl Phase {
+    /// Borrow the active-phase handle, or classify a wrong-phase access.
+    #[inline]
+    fn as_active(&self) -> Result<&ActiveEngine, WrongPhase> {
+        match self {
+            Phase::Active(active) => Ok(active),
+            Phase::Connecting(_) | Phase::Transitioning => {
+                core::hint::cold_path();
+                Err(WrongPhase)
+            }
+        }
+    }
 }
 
 // "NoObserver is free" — the ZST observer field adds zero bytes. A
@@ -193,19 +250,142 @@ crate::wire_pin!(Live<'static>, size = 0, align = 1);
 crate::wire_pin!(NoObserver, size = 0, align = 1);
 
 impl<'b, T, O> Engine<'b, T, O> {
-    /// Construct the engine shell from an already-prepared transport and
-    /// observer policy, branded to the caller's session scope `'b`.
+    /// Construct the engine shell from an already-prepared transport, observer
+    /// policy, primed outbound buffer, and initial phase, branded to the
+    /// caller's session scope `'b`.
     #[inline(always)]
-    fn new_in_scope(transport: T, obs: O) -> Self {
+    fn new_in_scope(transport: T, obs: O, send_buf: SendBuf, phase: Phase) -> Self {
         Self {
             transport,
             obs,
+            send_buf,
+            phase,
             _brand: PhantomData,
         }
+    }
+
+    /// The backend process id reported by `BackendKeyData` at handshake
+    /// completion — the non-secret half of the cancel key.
+    ///
+    /// Returns [`WrongPhase`] before [`connect`](Self::connect) has driven the
+    /// engine into its active phase: the value does not exist until the
+    /// handshake completes, so the absence is a classified error, not a sentinel.
+    #[inline]
+    pub fn backend_pid(&self) -> Result<i32, WrongPhase> {
+        Ok(self.phase.as_active()?.backend_pid())
+    }
+
+    /// The current `ReadyForQuery` transaction-status indicator.
+    ///
+    /// Returns [`WrongPhase`] before the engine is active (see
+    /// [`backend_pid`](Self::backend_pid)).
+    #[inline]
+    pub fn tx_status(&self) -> Result<TxStatus, WrongPhase> {
+        Ok(self.phase.as_active()?.tx_status())
     }
 }
 
 impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
+    /// Drive the startup/auth handshake to completion, transitioning the engine
+    /// from its connecting phase to active.
+    ///
+    /// The first verb a session body calls. It flushes the startup packet
+    /// (primed onto the engine's send buffer at construction), drives the
+    /// connecting pump over the transport until the server reports a clean
+    /// `ReadyForQuery`, then — in one synchronous tail, never across an
+    /// `.await` — swaps the connecting engine out for the active one. The linear
+    /// liveness token is consumed and returned only on success; on any failure
+    /// it is dropped (the connection is dead).
+    ///
+    /// The engine fields are split-borrowed disjointly (`transport` / `send_buf`
+    /// / `phase`) so the pump can drive the in-place connecting engine over the
+    /// transport while the phase still owns it; the `Transitioning` placeholder
+    /// bridges the move-out/move-in pair in the synchronous tail.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Handshake`] — the handshake failed (server error,
+    ///   unsupported auth method, SCRAM/MD5 failure, wire-illegal frame),
+    ///   carrying the classified cause.
+    /// - [`EngineError::WrongPhase`] — `connect` was called when the engine was
+    ///   not in its connecting phase (e.g. already active).
+    /// - [`EngineError::Transport`] / [`EngineError::UnexpectedEof`] /
+    ///   [`EngineError::WriteZero`] / [`EngineError::SendOverrun`] /
+    ///   [`EngineError::IngestFull`] / [`EngineError::IngestCommitOverflow`] —
+    ///   from the connecting pump (see
+    ///   [`pump_connecting_to_ready`](crate::engine::pump_connecting_to_ready)).
+    pub async fn connect(&mut self, live: Live<'b>) -> Result<Live<'b>, EngineError<T::Error>> {
+        // Disjoint split-borrow: the pump drives the in-place connecting engine
+        // over the transport + send buffer; routing through a `&mut self` phase
+        // helper would alias these borrows (E0499).
+        let Self {
+            transport,
+            send_buf,
+            phase,
+            ..
+        } = self;
+
+        let outcome = {
+            let conn = match phase {
+                Phase::Connecting(conn) => conn,
+                Phase::Active(_) | Phase::Transitioning => {
+                    core::hint::cold_path();
+                    return Err(EngineError::WrongPhase(WrongPhase));
+                }
+            };
+            pump_connecting_to_ready(conn, transport, send_buf).await?
+        };
+
+        match outcome {
+            HandshakeOutcome::Failed(cause) => {
+                core::hint::cold_path();
+                Err(EngineError::Handshake(cause))
+            }
+            HandshakeOutcome::Ready => {
+                // Erase the handshake's secret-bearing outbound wire (the SCRAM
+                // client proof / password message) from the send buffer NOW that
+                // the handshake is complete — restoring the prompt scrub the
+                // single-residence rework would otherwise defer to connection
+                // close. The buffer is provably drained here: the pump flushes
+                // every outbound frame before it reports `Ready`. This also drops
+                // the accumulated handshake wire so it is not carried into the
+                // active phase, while retaining the allocation for reuse.
+                send_buf.scrub_drained();
+                // Synchronous tail: move the connecting engine out behind the
+                // `Transitioning` placeholder, convert it, move the active engine
+                // in — no `.await` between, so `Transitioning` is never observed.
+                match core::mem::replace(phase, Phase::Transitioning) {
+                    Phase::Connecting(conn) => match conn.into_active() {
+                        Ok(active) => {
+                            *phase = Phase::Active(active);
+                            Ok(live)
+                        }
+                        Err(conn) => {
+                            // `into_active` fails only before `Ready`; the pump
+                            // reported `Ready`, so this is unreachable — restore
+                            // and classify rather than panic on the dead arm.
+                            *phase = Phase::Connecting(conn);
+                            core::hint::cold_path();
+                            Err(EngineError::WrongPhase(WrongPhase))
+                        }
+                    },
+                    // The phase was `Connecting` an instant ago (the pump borrowed
+                    // it in place and never replaces it); these are unreachable
+                    // but the `mem::replace` match must be exhaustive.
+                    Phase::Active(active) => {
+                        *phase = Phase::Active(active);
+                        core::hint::cold_path();
+                        Err(EngineError::WrongPhase(WrongPhase))
+                    }
+                    Phase::Transitioning => {
+                        core::hint::cold_path();
+                        Err(EngineError::WrongPhase(WrongPhase))
+                    }
+                }
+            }
+        }
+    }
+
     /// Verb-shaped seam that consumes and returns the linear liveness
     /// token. The body performs no wire exchange — it pins the verb
     /// signature (`&mut self` plus `Live<'b>` in, `Result<Live<'b>,
@@ -228,41 +408,70 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
 
 /// Open a session over `transport` with the default [`NoObserver`] policy.
 ///
+/// Primes the engine in its connecting phase: the `StartupMessage` for
+/// `user`/`database`/`application_name`/`credentials` is queued onto the
+/// engine's send buffer, and the body's first verb is
+/// [`connect`](Engine::connect), which drives the handshake.
+///
 /// `body` is `for<'b>`, so each call mints a *fresh, invariant* brand: the
 /// [`Live`] token handed to the body cannot escape the scope (returning it
 /// is a lifetime error) and cannot be confused with another session's
 /// token (a foreign brand is a type error).
+///
+/// # Errors
+///
+/// [`ConnFail`] if assembling the startup packet overflows the bounded frame
+/// assembler — structurally unreachable for the bounded identifier newtypes
+/// (a `write_buf` const-assert proves it), but propagated honestly: the
+/// constructor is `Result`-typed and the forbid wall bars discharging it with a
+/// panic-able unwrap. On `Ok`, the inner value is the body's own return.
 #[inline]
 pub fn session<T, R>(
     transport: T,
+    user: &Ident,
+    database: Option<&DatabaseName>,
+    app_name: Option<&ApplicationName>,
+    credentials: Credentials,
     body: impl for<'b> FnOnce(Engine<'b, T, NoObserver>, Live<'b>) -> R,
-) -> R
+) -> Result<R, ConnFail>
 where
     T: Transport,
 {
-    let engine = Engine::new_in_scope(transport, NoObserver);
+    let mut send_buf = SendBuf::new();
+    let conn = ConnectingEngine::start(&mut send_buf, user, database, app_name, credentials)?;
+    let engine = Engine::new_in_scope(transport, NoObserver, send_buf, Phase::Connecting(conn));
     let live = Live::new_in_scope();
-    body(engine, live)
+    Ok(body(engine, live))
 }
 
 /// Open a session with a caller-chosen [`Observer`] policy.
 ///
-/// Identical scoping to [`session`]; the same verb surface serves the
-/// non-default policy with no signature change — only the constructed
-/// engine's observer type differs.
+/// Identical scoping and connecting-phase priming to [`session`]; the same verb
+/// surface serves the non-default policy with no signature change — only the
+/// constructed engine's observer type differs.
+///
+/// # Errors
+///
+/// As [`session`].
 #[inline]
 pub fn session_with<T, O, R>(
     transport: T,
     observer: O,
+    user: &Ident,
+    database: Option<&DatabaseName>,
+    app_name: Option<&ApplicationName>,
+    credentials: Credentials,
     body: impl for<'b> FnOnce(Engine<'b, T, O>, Live<'b>) -> R,
-) -> R
+) -> Result<R, ConnFail>
 where
     T: Transport,
     O: Observer,
 {
-    let engine = Engine::new_in_scope(transport, observer);
+    let mut send_buf = SendBuf::new();
+    let conn = ConnectingEngine::start(&mut send_buf, user, database, app_name, credentials)?;
+    let engine = Engine::new_in_scope(transport, observer, send_buf, Phase::Connecting(conn));
     let live = Live::new_in_scope();
-    body(engine, live)
+    Ok(body(engine, live))
 }
 
 // ===========================================================================
@@ -334,11 +543,16 @@ const _: fn() = || {
     let mut flush_transport = WitnessTransport;
     need_send(&flush(&mut send_buf, &mut flush_transport));
 
+    // The phase value is irrelevant to `Send`-ness (which depends only on the
+    // field TYPES); `Transitioning` is the lightest placeholder for this
+    // compile-only witness (the closure is never executed).
     let mut engine: Engine<'static, WitnessTransport, NoObserver> =
-        Engine::new_in_scope(WitnessTransport, NoObserver);
+        Engine::new_in_scope(WitnessTransport, NoObserver, SendBuf::new(), Phase::Transitioning);
     let live = Live::new_in_scope();
 
     let threaded = async move {
+        // The connect verb's future must be `Send` too — it leads the body.
+        let live = engine.connect(live).await?;
         let live = engine.begin(live).await?;
         let live = engine.commit(live).await?;
         // Consume the token at the clean boundary; the brand must not
@@ -383,4 +597,153 @@ const _: fn() = || {
         &obs,
         sink,
     ));
+
+    // The connecting pump's future must be `Send` for the same reason. It is a
+    // pub free function the drivers call directly, so witness it independently
+    // of the active pump (a real connecting engine, seated for Trust auth).
+    let user = match crate::ident::Ident::try_from_str("w") {
+        Ok(user) => user,
+        Err(_) => return,
+    };
+    let mut conn_send_buf = SendBuf::new();
+    let mut conn = match ConnectingEngine::start(
+        &mut conn_send_buf,
+        &user,
+        None,
+        None,
+        crate::password::Credentials::Trust,
+    ) {
+        Ok(conn) => conn,
+        Err(_) => return,
+    };
+    let mut conn_transport = WitnessTransport;
+    need_send(&pump_connecting_to_ready(
+        &mut conn,
+        &mut conn_transport,
+        &mut conn_send_buf,
+    ));
 };
+
+#[cfg(test)]
+mod connect_scrub_tests {
+    //! Connect call-site teeth for the handshake-completion secret scrub.
+    //!
+    //! After [`connect`](super::Engine::connect) reaches the active phase, the
+    //! handshake's secret-bearing outbound wire must be gone from the send
+    //! buffer's queued region — restoring the prompt scrub the single-residence
+    //! rework would otherwise defer to connection close. This drives a real
+    //! `connect` over a static scripted server and reads the engine's private
+    //! `send_buf` directly (an integration test cannot: the field is private and
+    //! the queued-region probe is `#[cfg(test)] pub(crate)`).
+    //!
+    //! The credential here is MD5 (its reply does not depend on the client
+    //! nonce, so a static script suffices) and the secret is the MD5 password
+    //! message; the `scrub_drained` call it exercises is credential-agnostic, so
+    //! it clears the SCRAM client proof on the SCRAM path identically. Removing
+    //! the `scrub_drained` call in `connect` leaves the queued wire resident and
+    //! turns this RED.
+
+    use alloc::vec::Vec;
+    use core::convert::Infallible;
+    use core::future::{ready, Future};
+
+    use super::{poll_once, session, Transport};
+    use crate::wire::{TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_READY_FOR_QUERY};
+    use crate::{Credentials, Ident, Password, Sensitive};
+
+    /// Build a tagged, length-prefixed wire frame. `try_from` is infallible for
+    /// these tiny fixtures; the saturating dead arm keeps the helper free of an
+    /// unwrap.
+    fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(body.len().saturating_add(5));
+        out.push(tag);
+        let len = u32::try_from(body.len().saturating_add(4)).unwrap_or(0);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// The canonical MD5 handshake reply: a salt challenge, then
+    /// `AuthenticationOk` + `BackendKeyData` + `ReadyForQuery`.
+    fn md5_reply() -> Vec<u8> {
+        let mut salt_body = 5_i32.to_be_bytes().to_vec();
+        salt_body.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let mut key_body = 4321_i32.to_be_bytes().to_vec();
+        key_body.extend_from_slice(&8765_i32.to_be_bytes());
+
+        let mut reply = Vec::new();
+        reply.extend_from_slice(&frame(TAG_AUTHENTICATION.byte(), &salt_body));
+        reply.extend_from_slice(&frame(TAG_AUTHENTICATION.byte(), &0_i32.to_be_bytes()));
+        reply.extend_from_slice(&frame(TAG_BACKEND_KEY_DATA.byte(), &key_body));
+        reply.extend_from_slice(&frame(TAG_READY_FOR_QUERY.byte(), b"I"));
+        reply
+    }
+
+    /// Static scripted server: `read` drains a fixed reply; writes are accepted
+    /// and discarded; every op resolves synchronously (one-poll).
+    struct StaticServer {
+        inbound: Vec<u8>,
+        cursor: usize,
+    }
+
+    impl Transport for StaticServer {
+        type Error = Infallible;
+
+        fn read<'a>(
+            &'a mut self,
+            buf: &'a mut [u8],
+        ) -> impl Future<Output = Result<usize, Infallible>> + Send + 'a {
+            let n = (self.inbound.len().saturating_sub(self.cursor)).min(buf.len());
+            let end = self.cursor.saturating_add(n);
+            if let (Some(dst), Some(src)) = (buf.get_mut(..n), self.inbound.get(self.cursor..end)) {
+                dst.copy_from_slice(src);
+            }
+            self.cursor = end;
+            ready(Ok(n))
+        }
+
+        fn write<'a>(
+            &'a mut self,
+            buf: &'a [u8],
+        ) -> impl Future<Output = Result<usize, Infallible>> + Send + 'a {
+            ready(Ok(buf.len()))
+        }
+
+        fn flush<'a>(&'a mut self) -> impl Future<Output = Result<(), Infallible>> + Send + 'a {
+            ready(Ok(()))
+        }
+
+        fn shutdown<'a>(&'a mut self) -> impl Future<Output = Result<(), Infallible>> + Send + 'a {
+            ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn connect_scrubs_secret_outbound_wire_at_handshake_completion() {
+        // Result threading instead of unwrap/expect: a fixture or handshake
+        // failure surfaces as a non-`Ok(true)` value the final assert rejects.
+        let scrubbed = match (Ident::try_from_str("corpus"), Password::try_from_str("hunter2")) {
+            (Ok(user), Ok(password)) => {
+                let creds = Credentials::Md5Password(Sensitive::new(password));
+                let server = StaticServer {
+                    inbound: md5_reply(),
+                    cursor: 0,
+                };
+                session(server, &user, None, None, creds, |mut engine, live| {
+                    match poll_once(engine.connect(live)) {
+                        // Reached active: the secret-bearing handshake wire must be
+                        // gone from the live queued region of the send buffer.
+                        Ok(Ok(_live)) => engine.send_buf.queued().is_empty(),
+                        _ => false,
+                    }
+                })
+            }
+            _ => Ok(false),
+        };
+        assert_eq!(
+            scrubbed,
+            Ok(true),
+            "connect must reach active and scrub the secret-bearing handshake wire from send_buf",
+        );
+    }
+}

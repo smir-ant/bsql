@@ -2,6 +2,7 @@
 // engine. The two `session(..)` scopes mint distinct, invariant brands, so
 // passing one scope's `Live` to the other's engine is a lifetime error.
 use bsql_postgres_proto::engine::{session, Transport};
+use bsql_postgres_proto::{Credentials, Ident};
 use core::convert::Infallible;
 use core::future::{ready, Future};
 
@@ -46,8 +47,9 @@ fn block_on<F: Future>(f: F) -> F::Output {
 }
 
 fn main() {
-    session(T0, |mut _e1, live1| {
-        session(T0, |mut e2, _live2| {
+    let user = Ident::try_from_str("brand").unwrap();
+    let _ = session(T0, &user, None, None, Credentials::Trust, |mut _e1, live1| {
+        let _ = session(T0, &user, None, None, Credentials::Trust, |mut e2, _live2| {
             // Drive session-2's engine with session-1's branded token:
             let _ = block_on(e2.begin(live1));
         });

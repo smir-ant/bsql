@@ -17,16 +17,29 @@
 //! [`crate::scram::crypto`]), the MD5 digest ([`crate::md5`]), the password
 //! containers ([`crate::password`]), and the typed auth sub-code classifier
 //! ([`crate::wire::AuthSubCode`]). This dispatch only threads them through the
-//! connecting state machine and assembles the outbound frames into the
-//! engine's [`WriteBuf`] via the public `push_*` surface. No crypto is
+//! connecting state machine and assembles each outbound frame into a transient
+//! [`WriteBuf`] frame assembler via the public `push_*` surface, then queues
+//! the assembled bytes on the caller's persistent [`SendBuf`]. No crypto is
 //! hand-rolled here.
+//!
+//! # Single outbound residence
+//!
+//! The connecting engine owns no persistent outbound buffer. Every frame —
+//! the startup packet and each auth response — is assembled into a short-lived
+//! [`WriteBuf`] (scrub-on-drop, so a password-correlated assembly never
+//! outlives the build) and immediately copied onto the caller's [`SendBuf`],
+//! which is the sole outbound queue threaded through the flush loop. The SCRAM
+//! client proof therefore lands only in the transient assembler (scrubbed when
+//! it drops / is cleared for the next frame) and in [`SendBuf`] (scrubbed over
+//! its full backing capacity on teardown).
 //!
 //! # Pull surface
 //!
 //! [`ConnectingEngine::next_auth_event`] is the borrowing pull: it locates one
-//! inbound frame in the [`IngestBuf`], runs the consuming dispatch, writes any
-//! outbound auth response, and returns the next [`AuthEvent`] borrowing the
-//! read buffer. Silent intermediate frames (`AuthenticationOk`,
+//! inbound frame in the [`IngestBuf`], runs the consuming dispatch, queues any
+//! outbound auth response onto the caller's [`SendBuf`], and returns the next
+//! [`AuthEvent`] borrowing the read buffer. Silent intermediate frames
+//! (`AuthenticationOk`,
 //! `BackendKeyData`, the client-initiated SASL exchange) loop internally; the
 //! caller sees only the seven connecting events. Completion is a dispatch
 //! return value — [`ConnPhase::Ready`] reached through `ConnEvent::Ready` —
@@ -40,7 +53,7 @@
 
 use alloc::boxed::Box;
 
-use super::{ActiveEngine, AuthEvent, IngestBuf, IngestCommitOverflow, IngestFull};
+use super::{ActiveEngine, AuthEvent, IngestBuf, IngestCommitOverflow, IngestFull, SendBuf};
 use crate::action::TxStatus;
 use crate::ident::{ApplicationName, DatabaseName, Ident, PodBytes};
 use crate::md5::Md5HandshakeState;
@@ -165,22 +178,45 @@ enum ConnEvent {
     Ready,
     /// Server `ErrorResponse` — lend the raw body.
     ServerFail,
-    /// A protocol-level violation with no server body to lend.
-    ProtoFail,
+    /// A protocol-level violation with no server body to lend, carrying its
+    /// classified cause.
+    ProtoFail(ConnFail),
 }
 
 /// Non-borrowing result of the silent-frame drive loop. The payload-lending
-/// variants carry the active-buffer offset range of the frame to re-borrow.
+/// variants carry the active-buffer offset range of the frame to re-borrow;
+/// [`ProtoFail`](Self::ProtoFail) carries the classified cause directly.
 #[derive(Debug, Clone, Copy)]
 enum DriveOutcome {
     NeedMore,
     Ready,
     Cleartext,
     Md5 { salt: [u8; 4] },
-    ProtoFail,
+    ProtoFail(ConnFail),
     SaslContinue { start: usize, end: usize },
     ParamStatus { start: usize, end: usize },
     ServerFail { start: usize, end: usize },
+}
+
+/// Non-borrowing handshake progress for the connecting pump.
+///
+/// The pump classifies one connecting step but never needs the lent frame
+/// bodies the public [`AuthEvent`] carries — only whether to flush a queued
+/// response, read more, keep pulling, or stop. This drops every borrow, so the
+/// pump can act across an `.await` with no borrow to end first, and carries the
+/// classified [`ConnFail`] directly on failure (no unreachable `Option`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum HandshakeProgress {
+    /// The framing buffer is drained — read one chunk.
+    NeedMore,
+    /// An auth-challenge response was queued — flush it to the wire.
+    AuthResponse,
+    /// A non-response intermediate (e.g. `ParameterStatus`) — keep pulling.
+    ParamStatus,
+    /// Handshake complete — ready to transition to the active phase.
+    Ready,
+    /// The handshake failed, carrying the classified cause.
+    Failed(ConnFail),
 }
 
 #[inline]
@@ -195,7 +231,7 @@ fn advance(state: ConnectingState) -> ConnDispatch {
 fn fail(reason: ConnFail) -> ConnDispatch {
     ConnDispatch {
         next: ConnPhase::Failed(reason),
-        event: ConnEvent::ProtoFail,
+        event: ConnEvent::ProtoFail(reason),
     }
 }
 
@@ -213,9 +249,11 @@ fn server_fail() -> ConnDispatch {
 
 /// The connecting-phase session engine.
 ///
-/// Holds the single-residence inbound [`IngestBuf`], the outbound [`WriteBuf`]
-/// (carrying the startup packet and any auth response), and the current
-/// [`ConnPhase`]. Feed scripted/socket bytes through
+/// Holds the single-residence inbound [`IngestBuf`] and the current
+/// [`ConnPhase`]. It owns no outbound buffer: the startup packet and every auth
+/// response are queued onto the caller's [`SendBuf`] (passed to
+/// [`start`](Self::start) and [`next_auth_event`](Self::next_auth_event)), the
+/// sole outbound residence. Feed scripted/socket bytes through
 /// [`read_slot`](Self::read_slot) + [`commit`](Self::commit), drive the
 /// handshake with [`next_auth_event`](Self::next_auth_event), and transition to
 /// the active phase with [`into_active`](Self::into_active) once
@@ -223,27 +261,37 @@ fn server_fail() -> ConnDispatch {
 #[derive(Debug)]
 pub struct ConnectingEngine {
     ingest: IngestBuf,
-    write: WriteBuf,
     phase: ConnPhase,
 }
 
 impl ConnectingEngine {
-    /// Begin a handshake: build the `StartupMessage` into the write buffer and
-    /// seat the initial connecting state for the chosen credentials.
+    /// Begin a handshake: queue the `StartupMessage` onto `send_buf` and seat
+    /// the initial connecting state for the chosen credentials.
     ///
-    /// The startup packet is byte-identical to the live protocol's
-    /// `build_startup_message` (PG §55.2.1): a 4-byte length prefix wrapping
-    /// the 3.0 protocol version, the `user`/`database`/`application_name`
-    /// parameters, and the trailing empty-key NUL.
+    /// The startup packet is assembled into a transient [`WriteBuf`] (scrubbed
+    /// on drop) and copied onto `send_buf` — the caller's persistent outbound
+    /// queue, drained by the flush loop. It is byte-identical to the live
+    /// protocol's `build_startup_message` (PG §55.2.1): a 4-byte length prefix
+    /// wrapping the 3.0 protocol version, the `user`/`database`/
+    /// `application_name` parameters, and the trailing empty-key NUL.
+    ///
+    /// Returns [`ConnFail::BufferOverflow`] only if the startup packet exceeds
+    /// the bounded assembler — structurally unreachable for the bounded `Ident`/
+    /// `DatabaseName`/`ApplicationName` newtypes (the `MAX_OWNED_SEND_LEN >=
+    /// max_startup_message_size()` const-assert in `write_buf` proves a fresh
+    /// assembler always fits), but propagated honestly rather than discharged
+    /// with a panic-able unwrap.
     pub fn start(
+        send_buf: &mut SendBuf,
         user: &Ident,
         database: Option<&DatabaseName>,
         app_name: Option<&ApplicationName>,
         credentials: Credentials,
     ) -> Result<Self, ConnFail> {
-        let mut write = WriteBuf::new();
-        build_startup_message(&mut write, user, database, app_name)
+        let mut scratch = WriteBuf::new();
+        build_startup_message(&mut scratch, user, database, app_name)
             .map_err(|_| ConnFail::BufferOverflow)?;
+        send_buf.enqueue(scratch.as_bytes());
         // Exactly one in-flight startup; the reply id is a fixed seed (the
         // connecting engine never multiplexes the handshake).
         let reply = ReplyId::<StartupKind>::from_raw(core::num::NonZeroU64::MIN);
@@ -267,7 +315,6 @@ impl ConnectingEngine {
         };
         Ok(Self {
             ingest: IngestBuf::new(),
-            write,
             phase: ConnPhase::Handshaking(state),
         })
     }
@@ -287,36 +334,50 @@ impl ConnectingEngine {
         self.ingest.commit(n)
     }
 
-    /// The outbound client bytes accumulated so far: the startup packet plus
-    /// any auth response the dispatch generated. The flush loop that drains
-    /// this to a socket is built separately; here it is captured for replay.
-    #[inline]
-    #[must_use]
-    pub fn client_bytes(&self) -> &[u8] {
-        self.write.as_bytes()
+    /// Pull the next non-borrowing handshake step — the connecting pump's pull.
+    ///
+    /// Runs the same dispatch as [`next_auth_event`](Self::next_auth_event) but
+    /// projects the outcome to a [`HandshakeProgress`] that drops every frame
+    /// borrow (the pump needs only the classification) and carries the
+    /// classified [`ConnFail`] directly on failure — so the pump never holds a
+    /// borrow across its follow-on `flush`/`read` and the handshake outcome
+    /// needs no unreachable `Option`.
+    pub(crate) fn next_handshake_step(&mut self, send_buf: &mut SendBuf) -> HandshakeProgress {
+        match self.drive_to_event(send_buf) {
+            DriveOutcome::NeedMore => HandshakeProgress::NeedMore,
+            DriveOutcome::Ready => HandshakeProgress::Ready,
+            DriveOutcome::Cleartext
+            | DriveOutcome::Md5 { .. }
+            | DriveOutcome::SaslContinue { .. } => HandshakeProgress::AuthResponse,
+            DriveOutcome::ParamStatus { .. } => HandshakeProgress::ParamStatus,
+            DriveOutcome::ProtoFail(reason) => HandshakeProgress::Failed(reason),
+            // A server `ErrorResponse` during connect — the cause is fixed.
+            DriveOutcome::ServerFail { .. } => HandshakeProgress::Failed(ConnFail::ServerError),
+        }
     }
 
     /// Pull the next connecting event, borrowing the read buffer.
     ///
-    /// Locates one complete frame, runs the consuming dispatch (writing any
-    /// outbound auth response into the engine's [`WriteBuf`]), and returns the
-    /// classified [`AuthEvent`]. Expected intermediate frames loop internally;
-    /// the caller sees only [`AuthEvent::NeedMore`] (buffer drained),
+    /// Locates one complete frame, runs the consuming dispatch (queuing any
+    /// outbound auth response onto `send_buf`), and returns the classified
+    /// [`AuthEvent`]. Expected intermediate frames loop internally; the caller
+    /// sees only [`AuthEvent::NeedMore`] (buffer drained),
     /// [`AuthEvent::AuthCleartext`] / [`AuthEvent::AuthMd5`] /
     /// [`AuthEvent::AuthSaslContinue`] (auth steps), [`AuthEvent::ParamStatus`],
     /// [`AuthEvent::Ready`], or [`AuthEvent::Fail`].
     ///
     /// Two-phase to keep the borrow checker honest: the silent-frame loop in
-    /// [`drive_to_event`](Self::drive_to_event) consumes frames and mutates the
-    /// disjoint `phase` / `write` fields without holding a read borrow, then
-    /// the payload-lending events re-borrow the just-consumed frame body here.
-    pub fn next_auth_event(&mut self) -> AuthEvent<'_> {
-        match self.drive_to_event() {
+    /// [`drive_to_event`](Self::drive_to_event) consumes frames, queues outbound
+    /// bytes onto the disjoint `send_buf`, and mutates `phase` without holding a
+    /// read borrow; the `send_buf`/ingest borrows end before the payload-lending
+    /// events re-borrow the just-consumed frame body here.
+    pub fn next_auth_event(&mut self, send_buf: &mut SendBuf) -> AuthEvent<'_> {
+        match self.drive_to_event(send_buf) {
             DriveOutcome::NeedMore => AuthEvent::NeedMore,
             DriveOutcome::Ready => AuthEvent::Ready,
             DriveOutcome::Cleartext => AuthEvent::AuthCleartext,
             DriveOutcome::Md5 { salt } => AuthEvent::AuthMd5 { salt },
-            DriveOutcome::ProtoFail => AuthEvent::Fail(&[]),
+            DriveOutcome::ProtoFail(_) => AuthEvent::Fail(&[]),
             DriveOutcome::SaslContinue { start, end } => {
                 AuthEvent::AuthSaslContinue(self.ingest.frame_body(start, end))
             }
@@ -336,12 +397,21 @@ impl ConnectingEngine {
     /// caller). No read borrow is held across a loop iteration, so the
     /// per-iteration `take_frame` + dispatch mutation compiles without the
     /// returns-a-loop-borrow E0499.
-    fn drive_to_event(&mut self) -> DriveOutcome {
+    ///
+    /// Each dispatched frame's outbound response (if any) is assembled into one
+    /// reusable transient [`WriteBuf`] and copied onto `send_buf`. The assembler
+    /// is [`clear`](crate::write_buf::WriteBuf::clear)ed before each frame —
+    /// which scrubs the previous frame's bytes (the SCRAM proof among them)
+    /// before the slot is reused — and scrubs its final contents on drop; the
+    /// queued copies live on `send_buf` (scrubbed over full capacity on
+    /// teardown).
+    fn drive_to_event(&mut self, send_buf: &mut SendBuf) -> DriveOutcome {
+        let mut scratch = WriteBuf::new();
         loop {
             // Terminal phases are idempotent and never consume a frame.
             match &self.phase {
                 ConnPhase::Ready(_) => return DriveOutcome::Ready,
-                ConnPhase::Failed(_) => return DriveOutcome::ProtoFail,
+                ConnPhase::Failed(reason) => return DriveOutcome::ProtoFail(*reason),
                 ConnPhase::Handshaking(_) | ConnPhase::Transient => {}
             }
 
@@ -361,14 +431,26 @@ impl ConnectingEngine {
                 }
                 ConnPhase::Failed(reason) => {
                     self.phase = ConnPhase::Failed(reason);
-                    return DriveOutcome::ProtoFail;
+                    return DriveOutcome::ProtoFail(reason);
                 }
-                ConnPhase::Transient => return DriveOutcome::ProtoFail,
+                // A frame arriving while the phase is the move-out placeholder is
+                // an inconsistent internal state; classify it with the real
+                // offending tag (no fabricated cause).
+                ConnPhase::Transient => {
+                    return DriveOutcome::ProtoFail(ConnFail::UnexpectedFrame { tag })
+                }
             };
 
             let payload = self.ingest.frame_body(start, end);
+            // Empty (and scrub) the assembler, build this frame's response into
+            // it, then queue the bytes before the next iteration reuses the slot.
+            scratch.clear();
             let dispatch =
-                dispatch_connecting(state, InboundTag::from_byte(tag), payload, &mut self.write);
+                dispatch_connecting(state, InboundTag::from_byte(tag), payload, &mut scratch);
+            let response = scratch.as_bytes();
+            if !response.is_empty() {
+                send_buf.enqueue(response);
+            }
             self.phase = dispatch.next;
             match dispatch.event {
                 ConnEvent::Silent => continue,
@@ -378,7 +460,7 @@ impl ConnectingEngine {
                 ConnEvent::ParamStatus => return DriveOutcome::ParamStatus { start, end },
                 ConnEvent::Ready => return DriveOutcome::Ready,
                 ConnEvent::ServerFail => return DriveOutcome::ServerFail { start, end },
-                ConnEvent::ProtoFail => return DriveOutcome::ProtoFail,
+                ConnEvent::ProtoFail(reason) => return DriveOutcome::ProtoFail(reason),
             }
         }
     }

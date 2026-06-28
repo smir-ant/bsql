@@ -2,6 +2,7 @@
 // cannot escape its `session()` scope, so the closure cannot return the
 // branded liveness token.
 use bsql_postgres_proto::engine::{session, Transport};
+use bsql_postgres_proto::{Credentials, Ident};
 use core::convert::Infallible;
 use core::future::{ready, Future};
 
@@ -34,6 +35,7 @@ impl Transport for T0 {
 }
 
 fn main() {
+    let user = Ident::try_from_str("brand").unwrap();
     // Try to smuggle the branded liveness token OUT of the for<'b> scope:
-    let _escaped = session(T0, |_e, live| live);
+    let _escaped = session(T0, &user, None, None, Credentials::Trust, |_e, live| live);
 }

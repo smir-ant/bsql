@@ -55,7 +55,9 @@ use crate::frame::READ_BUF_CAP;
 
 use super::flush::flush;
 use super::seams::{Observer, Transport};
-use super::{ActiveEngine, EngineError, Event, SendBuf};
+use super::{
+    ActiveEngine, ConnFail, ConnectingEngine, EngineError, Event, HandshakeProgress, SendBuf,
+};
 
 /// Initial per-read request width handed to
 /// [`ActiveEngine::read_slot`](super::ActiveEngine::read_slot).
@@ -98,6 +100,23 @@ pub enum Boundary {
     /// connection is clean and reusable: reporting a caller-requested stop as
     /// `Idle` would falsely claim a reusable connection.
     Stopped,
+}
+
+/// The terminal of [`pump_connecting_to_ready`] — the handshake either
+/// completed or failed.
+///
+/// Non-borrowing: it carries no reference into the ingest buffer, so the
+/// [`connect`](super::Engine::connect) verb that receives it can re-borrow the
+/// engine freely for the synchronous Connecting→Active swap. `#[non_exhaustive]`
+/// so a future outcome can be added without breaking a downstream `match`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HandshakeOutcome {
+    /// `AuthenticationOk` + `BackendKeyData` + a clean `ReadyForQuery` were
+    /// observed: the connection is ready to transition to the active phase.
+    Ready,
+    /// The handshake failed, carrying the classified [`ConnFail`] cause.
+    Failed(ConnFail),
 }
 
 /// One surfaceable active-phase event, lent to the pump's sink and consumed
@@ -260,6 +279,88 @@ where
         if let ControlFlow::Break(()) = sink(surface) {
             core::hint::cold_path();
             return Ok(Boundary::Stopped);
+        }
+    }
+}
+
+/// Drive the connecting engine to its handshake terminal over `transport`.
+///
+/// Flushes the startup packet (queued onto `send_buf` by
+/// [`ConnectingEngine::start`](super::ConnectingEngine::start)), then loops on
+/// [`ConnectingEngine::next_handshake_step`](super::ConnectingEngine::next_handshake_step):
+/// on an [`AuthResponse`](HandshakeProgress::AuthResponse) drain the queued
+/// response; on [`ParameterStatus`](HandshakeProgress::ParamStatus) keep
+/// pulling; on [`NeedMore`](HandshakeProgress::NeedMore) flush any still-queued
+/// response (the SASL initial response is queued without surfacing an auth
+/// event) before reading one chunk into the connecting ingest buffer; on
+/// [`Ready`](HandshakeProgress::Ready) / [`Failed`](HandshakeProgress::Failed)
+/// return the [`HandshakeOutcome`]. No observer is involved — the handshake
+/// carries no rows or completions.
+///
+/// [`HandshakeProgress`] is non-borrowing, so each step's classification (and
+/// the classified [`ConnFail`] on failure) outlives the `send_buf`/ingest
+/// borrows with no borrow to end before the follow-on `flush`/`read`.
+///
+/// # Errors
+///
+/// - [`EngineError::Transport`](super::EngineError::Transport) — the transport
+///   reported a read, write, or flush failure (its own error, carried verbatim).
+/// - [`EngineError::WriteZero`](super::EngineError::WriteZero) /
+///   [`EngineError::SendOverrun`](super::EngineError::SendOverrun) — from a
+///   flush (see [`flush`](super::flush)).
+/// - [`EngineError::UnexpectedEof`](super::EngineError::UnexpectedEof) — the
+///   transport returned `Ok(0)` while the handshake was still incomplete (peer
+///   closed mid-handshake).
+/// - [`EngineError::IngestFull`](super::EngineError::IngestFull) — a connecting
+///   frame larger than the bounded ingest buffer.
+/// - [`EngineError::IngestCommitOverflow`](super::EngineError::IngestCommitOverflow)
+///   — a transport that reported reading more than the lent slot held.
+pub async fn pump_connecting_to_ready<T>(
+    conn: &mut ConnectingEngine,
+    transport: &mut T,
+    send_buf: &mut SendBuf,
+) -> Result<HandshakeOutcome, EngineError<T::Error>>
+where
+    T: Transport,
+{
+    // Drain the startup packet enqueued at construction, before the first read.
+    flush(send_buf, transport).await?;
+
+    let mut want = INITIAL_READ_WANT;
+
+    loop {
+        match conn.next_handshake_step(send_buf) {
+            HandshakeProgress::Ready => return Ok(HandshakeOutcome::Ready),
+            HandshakeProgress::Failed(reason) => {
+                core::hint::cold_path();
+                return Ok(HandshakeOutcome::Failed(reason));
+            }
+            HandshakeProgress::AuthResponse => flush(send_buf, transport).await?,
+            HandshakeProgress::ParamStatus => {}
+            HandshakeProgress::NeedMore => {
+                // A response built during a silent intermediate (the SASL
+                // initial response is queued without surfacing an auth event)
+                // must reach the wire before we block on the server's reply.
+                if !send_buf.is_drained() {
+                    flush(send_buf, transport).await?;
+                }
+                let slot = conn.read_slot(want).map_err(EngineError::IngestFull)?;
+                let slot_len = slot.len();
+                let n = transport.read(slot).await.map_err(EngineError::Transport)?;
+                if n == 0 {
+                    // Zero bytes while the handshake is incomplete: the peer
+                    // closed before it could finish. Never retried, never a
+                    // clean boundary.
+                    core::hint::cold_path();
+                    return Err(EngineError::UnexpectedEof);
+                }
+                conn.commit(n).map_err(EngineError::IngestCommitOverflow)?;
+                if n == slot_len {
+                    // The slot filled — a larger burst (e.g. many
+                    // `ParameterStatus` frames) follows; widen the next request.
+                    want = want.saturating_mul(2).min(READ_BUF_CAP);
+                }
+            }
         }
     }
 }

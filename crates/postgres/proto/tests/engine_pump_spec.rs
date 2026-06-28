@@ -265,12 +265,13 @@ fn alloc_to_string(tag: &bsql_postgres_proto::command_tag::CommandTag) -> String
 /// Reach an active engine through the canonical trust handshake.
 fn active_engine() -> ActiveEngine {
     let user = Ident::try_from_str("corpus").expect("ident");
-    let mut conn =
-        ConnectingEngine::start(&user, None, None, Credentials::Trust).expect("start handshake");
+    let mut send_buf = SendBuf::new();
+    let mut conn = ConnectingEngine::start(&mut send_buf, &user, None, None, Credentials::Trust)
+        .expect("start handshake");
     let hs = concat(&[auth_ok(), backend_key(4321, 8765), ready_for_query(b'I')]);
     feed_conn(&mut conn, &hs);
     loop {
-        match conn.next_auth_event() {
+        match conn.next_auth_event(&mut send_buf) {
             AuthEvent::Ready => break,
             AuthEvent::NeedMore => panic!("handshake exhausted before Ready"),
             AuthEvent::Fail(_) => panic!("handshake failed"),
