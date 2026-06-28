@@ -70,7 +70,75 @@ pub enum EngineError<E> {
     /// or an active-phase accessor before the handshake completed. A classified
     /// error, never a panic; carries the zero-sized [`WrongPhase`] marker.
     WrongPhase(WrongPhase),
+    /// The server reported an `ErrorResponse` for the in-flight command (a
+    /// recoverable query-level error: the connection drains to its recovering
+    /// `ReadyForQuery`). The raw `ErrorResponse` body was surfaced to the verb's
+    /// sink before this error (so the typed layer above reads its SQLSTATE);
+    /// this variant marks the command as failed without re-wrapping those bytes.
+    /// Distinct from [`ProtocolViolation`](Self::ProtocolViolation): a server
+    /// error is recoverable, a protocol violation tears the connection down.
+    ServerError,
+    /// The engine tore the connection down on an out-of-phase / wire-illegal
+    /// frame (the active pump returned [`Boundary::Closed`](super::Boundary::Closed)).
+    /// The socket must be closed; the connection is not reusable. Classified
+    /// rather than retried or silently ignored.
+    ProtocolViolation,
+    /// A `PortalSuspended` arrived for a command the verb did not row-limit — a
+    /// row cap appeared where none was requested. Classified rather than treated
+    /// as a clean completion (which would silently drop the open portal).
+    UnexpectedSuspend,
+    /// A row-count guard verb ([`query_one`](super::Engine::query_one) /
+    /// [`query_opt`](super::Engine::query_opt)) observed a row count outside its
+    /// contract. Carries the [`RowCountViolation`] detail (which guard, and the
+    /// count actually seen). A reachable caller-facing misuse, not a defensive
+    /// check of an impossible event.
+    RowCount(RowCountViolation),
+    /// An outbound request frame did not fit the bounded frame builder — the SQL
+    /// text or the encoded parameters exceeded the engine's fixed outbound
+    /// capacity. Classified rather than silently truncated.
+    FrameTooLong,
+    /// A synchronous single-poll verb ([`transaction`](super::Engine::transaction))
+    /// drove a future that returned `Poll::Pending` — the transport was not
+    /// blocking as the single-poll contract requires. The
+    /// [`SpuriousPending`](super::SpuriousPending) read-side analog for the verb
+    /// layer.
+    SpuriousPending,
 }
+
+/// The row-count contract a guard verb enforces — the expectation half of a
+/// [`RowCountViolation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedRowCount {
+    /// [`query_one`](super::Engine::query_one): exactly one row.
+    ExactlyOne,
+    /// [`query_opt`](super::Engine::query_opt): at most one row.
+    AtMostOne,
+}
+
+/// A row-count guard verb observed a count outside its contract.
+///
+/// Carries both the [`expected`](Self::expected) contract and the count actually
+/// surfaced, so the caller's message names the exact violation without a
+/// stringly-typed reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowCountViolation {
+    /// The contract the verb enforces.
+    pub expected: ExpectedRowCount,
+    /// The number of rows the command actually surfaced.
+    pub got: usize,
+}
+
+impl core::fmt::Display for RowCountViolation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let expected = match self.expected {
+            ExpectedRowCount::ExactlyOne => "exactly one row",
+            ExpectedRowCount::AtMostOne => "at most one row",
+        };
+        write!(f, "row-count guard expected {}, got {}", expected, self.got)
+    }
+}
+
+impl core::error::Error for RowCountViolation {}
 
 /// A verb or accessor was invoked in the wrong protocol phase.
 ///

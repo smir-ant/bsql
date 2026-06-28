@@ -10597,3 +10597,182 @@ mod compute_push_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod engine_frame_byte_twin {
+    //! Byte-twin gate: each engine-local active frame builder
+    //! (`crate::engine::frames`) must produce wire BYTE-IDENTICAL to the proven
+    //! `protocol.rs` encoder for the same inputs. The new sans-I/O engine writes
+    //! its frames through its own builders; this pins them to the established
+    //! encoders so a future edit to either cannot silently diverge the wire (a
+    //! divergence would otherwise surface only against a live server). This is a
+    //! `#[cfg(test)]` module — the shipped (non-test) old engine is byte-identical.
+    //!
+    //! The builders with no `protocol.rs` twin (`build_listen`,
+    //! `build_copy_data_header`) are pinned to a hand-computed golden.
+
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::{
+        build_bind_message, build_bind_prepared_frame, build_close_message, build_describe_message,
+        build_execute_message, build_parse_message_cfgtest, build_query_message_cfgtest,
+    };
+    use crate::command::FetchRows;
+    use crate::engine::frames;
+    use crate::ident::{PortalName, Sql, StmtName};
+    use crate::wire::{CloseTargetByte, DescribeTargetByte};
+    use crate::write_buf::{BrandedWriteReserved, WriteBuf};
+
+    /// A valid test statement name (`StmtName` is a validating newtype, so its
+    /// construction is fallible; a failure fails the test loudly).
+    fn twin_stmt() -> StmtName {
+        let parsed = StmtName::try_from_str("bsql_p_demo");
+        assert!(parsed.is_ok(), "twin statement name must be valid");
+        // The assertion above already failed the test on `Err`; the default is a
+        // dead arm (`.unwrap_or_default` is the crate's sanctioned no-panic shape).
+        parsed.unwrap_or_default()
+    }
+
+    fn twin_sql() -> Sql {
+        Sql::from_str_truncating("SELECT id, name FROM demo WHERE id = $1")
+    }
+
+    /// Run a `protocol.rs` builder into a fresh `WriteBuf` and return the whole
+    /// frame bytes (a builder writes the frame from offset 0 into a fresh buffer).
+    fn proto_frame<F>(build: F) -> Vec<u8>
+    where
+        F: FnOnce(&mut BrandedWriteReserved<'_>) -> bool,
+    {
+        let mut write_buf = WriteBuf::new();
+        write_buf.with_branded(|mut wb| {
+            let ok = {
+                let mut reserved = wb.reserve();
+                build(&mut reserved)
+            };
+            assert!(ok, "protocol.rs builder must produce a frame");
+            wb.into_bytes().to_vec()
+        })
+    }
+
+    /// Run an engine-local builder into a fresh `WriteBuf` and return its bytes.
+    fn engine_frame<F>(build: F) -> Vec<u8>
+    where
+        F: FnOnce(&mut WriteBuf) -> bool,
+    {
+        let mut wb = WriteBuf::new();
+        let ok = build(&mut wb);
+        assert!(ok, "engine builder must produce a frame");
+        wb.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn simple_query_wire_is_byte_identical() {
+        let sql = twin_sql();
+        let proto = proto_frame(|r| build_query_message_cfgtest(&sql, r).is_ok());
+        let engine = engine_frame(|wb| frames::build_simple_query(wb, sql.as_bytes()).is_ok());
+        assert_eq!(proto.first().copied(), Some(b'Q'), "non-vacuous: 'Q' frame");
+        assert_eq!(engine, proto, "build_simple_query vs build_query_message_cfgtest");
+    }
+
+    #[test]
+    fn parse_wire_is_byte_identical() {
+        let stmt = twin_stmt();
+        let sql = twin_sql();
+        let proto = proto_frame(|r| build_parse_message_cfgtest(&stmt, &sql, r).is_ok());
+        let engine =
+            engine_frame(|wb| frames::build_parse(wb, stmt.as_bytes(), sql.as_bytes()).is_ok());
+        assert_eq!(proto.first().copied(), Some(b'P'), "non-vacuous: 'P' frame");
+        assert_eq!(engine, proto, "build_parse vs build_parse_message_cfgtest");
+    }
+
+    #[test]
+    fn describe_statement_wire_is_byte_identical() {
+        let stmt = twin_stmt();
+        let proto =
+            proto_frame(|r| build_describe_message(DescribeTargetByte::Statement, &stmt, r).is_ok());
+        let engine = engine_frame(|wb| frames::build_describe_statement(wb, stmt.as_bytes()).is_ok());
+        assert_eq!(proto.first().copied(), Some(b'D'), "non-vacuous: 'D' frame");
+        assert_eq!(engine, proto, "build_describe_statement vs build_describe_message");
+    }
+
+    #[test]
+    fn close_statement_wire_is_byte_identical() {
+        let stmt = twin_stmt();
+        let proto =
+            proto_frame(|r| build_close_message(CloseTargetByte::Statement, &stmt, r).is_ok());
+        let engine = engine_frame(|wb| frames::build_close_statement(wb, stmt.as_bytes()).is_ok());
+        assert_eq!(proto.first().copied(), Some(b'C'), "non-vacuous: 'C' frame");
+        assert_eq!(engine, proto, "build_close_statement vs build_close_message");
+    }
+
+    #[test]
+    fn execute_wire_is_byte_identical() {
+        let portal = PortalName::default();
+        let proto = proto_frame(|r| build_execute_message(&portal, FetchRows::All, r).is_ok());
+        let engine = engine_frame(|wb| frames::build_execute(wb, portal.as_bytes(), 0).is_ok());
+        assert_eq!(proto.first().copied(), Some(b'E'), "non-vacuous: 'E' frame");
+        assert_eq!(engine, proto, "build_execute vs build_execute_message");
+
+        // Teeth: the twin comparison is byte-sensitive.
+        let mut tampered = engine.clone();
+        if let Some(last) = tampered.last_mut() {
+            *last ^= 0xFF;
+        }
+        assert_ne!(tampered, proto, "execute twin must catch a one-byte divergence");
+    }
+
+    #[test]
+    fn bind_wire_is_byte_identical_zero_and_one_param() {
+        let portal = PortalName::default();
+        let stmt = twin_stmt();
+
+        // 0 params.
+        let proto0 = proto_frame(|r| build_bind_message(&portal, &stmt, &(), r).is_ok());
+        let engine0 =
+            engine_frame(|wb| frames::build_bind(wb, portal.as_bytes(), stmt.as_bytes(), &()).is_ok());
+        assert_eq!(proto0.first().copied(), Some(b'B'), "non-vacuous: 'B' frame");
+        assert_eq!(engine0, proto0, "build_bind vs build_bind_message (0 params)");
+
+        // 1 param.
+        let proto1 = proto_frame(|r| build_bind_message(&portal, &stmt, &(7_i32,), r).is_ok());
+        let engine1 = engine_frame(|wb| {
+            frames::build_bind(wb, portal.as_bytes(), stmt.as_bytes(), &(7_i32,)).is_ok()
+        });
+        assert_eq!(engine1, proto1, "build_bind vs build_bind_message (1 param)");
+
+        // Teeth: the twin comparison is byte-sensitive.
+        let mut tampered = engine1.clone();
+        if let Some(last) = tampered.last_mut() {
+            *last ^= 0xFF;
+        }
+        assert_ne!(tampered, proto1, "bind twin must catch a one-byte divergence");
+    }
+
+    #[test]
+    fn bind_prepared_wire_is_byte_identical() {
+        // The macro's Bind prefix: empty portal NUL + content-addressed stmt NUL.
+        let prefix: &[u8] = b"\0bsql_p_demo\0";
+        let proto = proto_frame(|r| build_bind_prepared_frame(r, prefix, &(7_i32,)).is_ok());
+        let engine = engine_frame(|wb| frames::build_bind_prepared(wb, prefix, &(7_i32,)).is_ok());
+        assert_eq!(proto.first().copied(), Some(b'B'), "non-vacuous: 'B' frame");
+        assert_eq!(engine, proto, "build_bind_prepared vs build_bind_prepared_frame");
+    }
+
+    #[test]
+    fn listen_wire_matches_golden() {
+        // 'Q' | len=18 (4 self + "LISTEN " (7) + "events" (6) + NUL (1)) | body.
+        let mut golden = vec![b'Q', 0, 0, 0, 18];
+        golden.extend_from_slice(b"LISTEN events\0");
+        let engine = engine_frame(|wb| frames::build_listen(wb, b"events").is_ok());
+        assert_eq!(engine, golden, "build_listen golden");
+    }
+
+    #[test]
+    fn copy_data_header_matches_golden() {
+        // 'd' | (body_len + 4) BE = 9 for a 5-byte body.
+        let golden = vec![b'd', 0, 0, 0, 9];
+        let engine = engine_frame(|wb| frames::build_copy_data_header(wb, 5).is_ok());
+        assert_eq!(engine, golden, "build_copy_data_header golden");
+    }
+}

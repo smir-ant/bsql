@@ -173,7 +173,7 @@ fn pump_over_blocking_transport_resolves_in_one_poll() {
     let mut send_buf = SendBuf::new();
     let obs = NoObserver;
 
-    let boundary = poll_once(pump_active_to_boundary(
+    let boundary: Boundary<()> = poll_once(pump_active_to_boundary(
         &mut engine,
         &mut transport,
         &mut send_buf,
@@ -202,7 +202,7 @@ fn pump_over_pending_read_classifies_spurious_pending() {
     let mut send_buf = SendBuf::new();
     let obs = NoObserver;
 
-    let result = poll_once(pump_active_to_boundary(
+    let result: Result<Result<Boundary<()>, _>, _> = poll_once(pump_active_to_boundary(
         &mut engine,
         &mut transport,
         &mut send_buf,

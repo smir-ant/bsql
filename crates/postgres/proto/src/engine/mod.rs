@@ -29,16 +29,21 @@ mod dispatch_active;
 mod dispatch_connecting;
 mod error;
 mod flush;
+// Crate-internal (never re-exported publicly): the active frame builders, exposed
+// `pub(crate)` only so the in-crate byte-twin test can pin them byte-identical to
+// the proven `protocol.rs` encoders. Not part of the public engine surface.
+pub(crate) mod frames;
 mod ingest;
 mod pump;
 mod seams;
+mod verbs;
 
 pub use dispatch_active::ActiveEngine;
 pub use dispatch_connecting::{ConnFail, ConnectingEngine};
 // Crate-internal: the non-borrowing handshake-step pull the connecting pump
 // consumes (not part of the public surface).
 pub(crate) use dispatch_connecting::HandshakeProgress;
-pub use error::{EngineError, WrongPhase};
+pub use error::{EngineError, ExpectedRowCount, RowCountViolation, WrongPhase};
 pub use flush::{flush, SendBuf, SendOverrun};
 pub use ingest::{IngestBuf, IngestCommitOverflow, IngestFull};
 pub use pump::{
@@ -49,6 +54,7 @@ pub use seams::{
     absurd, engine_observe_no_seam, engine_observe_via_seam, Live, Never, NoObserver, Observer,
     Transport,
 };
+pub use verbs::PreparedStatement;
 
 use core::marker::PhantomData;
 
@@ -162,10 +168,9 @@ crate::wire_pin!(AuthEvent<'static>, size = 24, align = 8);
 #[derive(Debug)]
 pub struct Engine<'b, T, O = NoObserver> {
     transport: T,
-    #[expect(
-        dead_code,
-        reason = "observer policy stored at engine birth; write-only until the active-phase row/complete dispatch hooks invoke it"
-    )]
+    /// The observer policy, threaded as a disjoint borrow to the active pump's
+    /// row/completion hooks by every I/O verb. At the default [`NoObserver`] it
+    /// is a ZST (see the `Engine == EngineNoObs` size-identity gate below).
     obs: O,
     /// The single persistent outbound residence: the startup packet, every auth
     /// response, and (later) request frames are queued here and drained by the
@@ -225,6 +230,24 @@ impl Phase {
     /// Borrow the active-phase handle, or classify a wrong-phase access.
     #[inline]
     fn as_active(&self) -> Result<&ActiveEngine, WrongPhase> {
+        match self {
+            Phase::Active(active) => Ok(active),
+            Phase::Connecting(_) | Phase::Transitioning => {
+                core::hint::cold_path();
+                Err(WrongPhase)
+            }
+        }
+    }
+
+    /// Mutably borrow the active-phase handle, or classify a wrong-phase access.
+    ///
+    /// The verbs call this on the *destructured* `phase` field (never through a
+    /// `&mut self` helper), so the returned `&mut ActiveEngine` is a borrow
+    /// disjoint from the engine's `transport`/`send_buf`/`obs` fields — the four
+    /// simultaneous disjoint borrows the active pump needs. A `self.active_mut()`
+    /// helper would borrow the whole engine and alias them (E0499).
+    #[inline]
+    fn as_active_mut(&mut self) -> Result<&mut ActiveEngine, WrongPhase> {
         match self {
             Phase::Active(active) => Ok(active),
             Phase::Connecting(_) | Phase::Transitioning => {
@@ -385,25 +408,6 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
             }
         }
     }
-
-    /// Verb-shaped seam that consumes and returns the linear liveness
-    /// token. The body performs no wire exchange — it pins the verb
-    /// signature (`&mut self` plus `Live<'b>` in, `Result<Live<'b>,
-    /// EngineError>` out) the I/O-bearing verbs are built on, and proves
-    /// the token threads through `&mut self` without coupling the engine
-    /// borrow to the brand.
-    #[inline]
-    pub async fn begin(&mut self, live: Live<'b>) -> Result<Live<'b>, EngineError<T::Error>> {
-        Ok(live)
-    }
-
-    /// Verb-shaped seam mirroring [`begin`](Self::begin); together they
-    /// witness a linear token threading through two sequential verbs in one
-    /// `async` scope.
-    #[inline]
-    pub async fn commit(&mut self, live: Live<'b>) -> Result<Live<'b>, EngineError<T::Error>> {
-        Ok(live)
-    }
 }
 
 /// Open a session over `transport` with the default [`NoObserver`] policy.
@@ -551,13 +555,23 @@ const _: fn() = || {
     let live = Live::new_in_scope();
 
     let threaded = async move {
-        // The connect verb's future must be `Send` too — it leads the body.
+        // Each verb's future must be `Send` (the async driver polls them across
+        // task boundaries), and the linear token threads through three SEQUENTIAL
+        // `await`s while this one `async` scope holds `&mut engine` across all of
+        // them — the shape that would not compile if a verb coupled the engine
+        // borrow to the brand.
         let live = engine.connect(live).await?;
-        let live = engine.begin(live).await?;
-        let live = engine.commit(live).await?;
-        // Consume the token at the clean boundary; the brand must not
-        // escape the async scope.
-        let _consumed = live;
+        let live = engine
+            .ping(live, |_s: Surface<'_>| core::ops::ControlFlow::Continue(()))
+            .await?;
+        let live = engine
+            .simple_query(live, "SELECT 1", |_s: Surface<'_>| {
+                core::ops::ControlFlow::Continue(())
+            })
+            .await?;
+        // Consume the token at the clean boundary; the brand must not escape the
+        // async scope.
+        let _ = live;
         Ok::<(), EngineError<core::convert::Infallible>>(())
     };
     need_send(&threaded);

@@ -6,8 +6,8 @@ error[E0521]: borrowed data escapes outside of closure
 52 |         let _ = session(T0, &user, None, None, Credentials::Trust, |mut e2, _live2| {
    |                                                                     ------ `e2` is a reference that is only valid in the closure body
 53 |             // Drive session-2's engine with session-1's branded token:
-54 |             let _ = block_on(e2.begin(live1));
-   |                              ^^^^^^^^^^^^^^^ `e2` escapes the closure body here
+54 |             let _ = block_on(e2.connect(live1));
+   |                              ^^^^^^^^^^^^^^^^^ `e2` escapes the closure body here
    |
    = note: requirement occurs because of the type `Live<'_>`, which makes the generic argument `'_` invariant
    = note: the struct `Live<'b>` is invariant over the parameter `'b`
@@ -22,8 +22,8 @@ error[E0521]: borrowed data escapes outside of closure
    |                                                                 `_e1` is a reference that is only valid in the closure body
    |                                                                 has type `Engine<'1, T0>`
 ...
-54 |             let _ = block_on(e2.begin(live1));
-   |                              ^^^^^^^^^^^^^^^
+54 |             let _ = block_on(e2.connect(live1));
+   |                              ^^^^^^^^^^^^^^^^^
    |                              |
    |                              `_e1` escapes the closure body here
    |                              argument requires that `'1` must outlive `'static`

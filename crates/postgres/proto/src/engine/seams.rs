@@ -42,7 +42,7 @@ mod sealed {
 /// impossible byte through [`absurd`] rather than a silent wildcard `_`,
 /// so a genuinely-reachable new frame is a loud compile error, never a
 /// dropped event.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Never {}
 
 /// Consume the impossible. The empty `match` is total because [`Never`]

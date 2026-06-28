@@ -77,9 +77,18 @@ const INITIAL_READ_WANT: usize = super::ingest::INGEST_INLINE_CAP;
 /// Non-borrowing: it carries no reference into the ingest buffer, so the verb
 /// that receives it can re-borrow the engine freely. `#[non_exhaustive]` so a
 /// future boundary can be added without breaking a downstream `match`.
+///
+/// Generic over the sink's break payload `B` (see the `sink` parameter of
+/// [`pump_active_to_boundary`]). The default [`Never`](super::Never) is the
+/// *collect-all* shape: a sink that only ever [`Continue`](ControlFlow::Continue)s
+/// makes [`Stopped`](Self::Stopped) carry an uninhabited value, so the variant is
+/// statically unreachable and folds into the discriminant — `Boundary<Never>` is
+/// one byte, and a verb consumes the impossible arm with
+/// [`absurd`](super::absurd), never a `unreachable!()`/wildcard. A breakable verb
+/// (e.g. notification receive) fixes `B = ()` so the sink can stop the pump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Boundary {
+pub enum Boundary<B = super::Never> {
     /// A clean `ReadyForQuery` — the connection is idle and reusable.
     Idle,
     /// A row-limited `Execute` paused at its cap (`PortalSuspended`): the portal
@@ -93,13 +102,14 @@ pub enum Boundary {
     /// The engine tore the connection down (a protocol violation / out-of-phase
     /// frame); the socket must be closed.
     Closed,
-    /// The sink returned [`ControlFlow::Break`], requesting an early stop. The
-    /// connection is NOT at a protocol boundary — unread frames may remain
-    /// buffered or on the wire — so recovery (drain or close) is the caller's
-    /// responsibility. Distinct from [`Idle`](Self::Idle), which alone means the
-    /// connection is clean and reusable: reporting a caller-requested stop as
-    /// `Idle` would falsely claim a reusable connection.
-    Stopped,
+    /// The sink returned [`ControlFlow::Break`], requesting an early stop,
+    /// carrying the break payload. The connection is NOT at a protocol boundary
+    /// — unread frames may remain buffered or on the wire — so recovery (drain
+    /// or close) is the caller's responsibility. Distinct from
+    /// [`Idle`](Self::Idle), which alone means the connection is clean and
+    /// reusable: reporting a caller-requested stop as `Idle` would falsely claim
+    /// a reusable connection. At `B = Never` this variant is uninhabited.
+    Stopped(B),
 }
 
 /// The terminal of [`pump_connecting_to_ready`] — the handshake either
@@ -189,17 +199,17 @@ pub enum Surface<'e> {
 ///   larger than the bounded ingest buffer.
 /// - [`EngineError::IngestCommitOverflow`](super::EngineError::IngestCommitOverflow)
 ///   — a transport that reported reading more than the lent slot held.
-pub async fn pump_active_to_boundary<T, O, S>(
+pub async fn pump_active_to_boundary<T, O, S, B>(
     active: &mut ActiveEngine,
     transport: &mut T,
     send_buf: &mut SendBuf,
     obs: &O,
     mut sink: S,
-) -> Result<Boundary, EngineError<T::Error>>
+) -> Result<Boundary<B>, EngineError<T::Error>>
 where
     T: Transport,
     O: Observer,
-    S: FnMut(Surface<'_>) -> ControlFlow<()>,
+    S: FnMut(Surface<'_>) -> ControlFlow<B>,
 {
     // Drain the enqueued request once, before the first read.
     flush(send_buf, transport).await?;
@@ -243,9 +253,9 @@ where
                 // the verb maps to its error. A sink break still wins as an
                 // explicit caller stop.
                 return match sink(Surface::Fail(body)) {
-                    ControlFlow::Break(()) => {
+                    ControlFlow::Break(b) => {
                         core::hint::cold_path();
-                        Ok(Boundary::Stopped)
+                        Ok(Boundary::Stopped(b))
                     }
                     ControlFlow::Continue(()) => Ok(Boundary::Failed),
                 };
@@ -276,9 +286,9 @@ where
             Event::CopyDone => Surface::CopyDone,
         };
 
-        if let ControlFlow::Break(()) = sink(surface) {
+        if let ControlFlow::Break(b) = sink(surface) {
             core::hint::cold_path();
-            return Ok(Boundary::Stopped);
+            return Ok(Boundary::Stopped(b));
         }
     }
 }
@@ -493,7 +503,7 @@ mod hook_tests {
         let mut send_buf = SendBuf::new();
         let obs = CountingObserver::new();
 
-        let outcome = poll_once(pump_active_to_boundary(
+        let outcome: Result<Result<Boundary<()>, _>, _> = poll_once(pump_active_to_boundary(
             &mut engine,
             &mut transport,
             &mut send_buf,

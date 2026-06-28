@@ -174,6 +174,12 @@ enum ActiveState {
     // — the response-driven analog of the live engine's push-seated post-state.
     /// A bare `Parse` was issued; awaiting `ParseComplete` (`'1'`).
     ParseAwaitingParseComplete,
+    /// A combined `Parse`+`Describe`(statement)+`Sync` bundle (the runtime
+    /// prepare path) was issued; awaiting `ParseComplete` (`'1'`), which is
+    /// followed by the `Describe` answer (`ParameterDescription`, then
+    /// `RowDescription`/`NoData`) rather than the Sync boundary — so it advances
+    /// silently into the describe phase.
+    ParseDescribeStmtAwaitingParseComplete,
     /// A combined Parse+Bind+Execute bundle (the prepared-statement macro path)
     /// was issued; awaiting `ParseComplete` (`'1'`), which is followed by
     /// `BindComplete` rather than the Sync boundary.
@@ -399,6 +405,20 @@ impl ActiveEngine {
         self.state = ActiveState::ParseAwaitingParseComplete;
     }
 
+    /// Seat the engine to await a combined `Parse`+`Describe`(statement)+`Sync`
+    /// bundle (the runtime prepare path): `ParseComplete`, then the statement
+    /// `Describe`'s `ParameterDescription` + `RowDescription`/`NoData`, then the
+    /// single Sync `ReadyForQuery`. The recovered result schema is surfaced via
+    /// [`current_type_oids`](Self::current_type_oids) /
+    /// [`current_column_names`](Self::current_column_names) at the describe's
+    /// delivery, so a later `Bind`+`Execute` can thread the OIDs back in. Clears
+    /// the per-statement columns so a prior statement's schema cannot leak.
+    #[inline]
+    pub fn begin_prepare(&mut self) {
+        self.reset_columns();
+        self.state = ActiveState::ParseDescribeStmtAwaitingParseComplete;
+    }
+
     /// Seat the engine to await a statement `Describe`'s reply
     /// (`ParameterDescription`, then `RowDescription` or `NoData`). The
     /// recovered result schema is surfaced via
@@ -552,6 +572,7 @@ impl ActiveEngine {
                 | ActiveState::CopyInActive
                 | ActiveState::DrainAfterError
                 | ActiveState::ParseAwaitingParseComplete
+                | ActiveState::ParseDescribeStmtAwaitingParseComplete
                 | ActiveState::ParseBindExecuteAwaitingParseComplete
                 | ActiveState::DescribeStmtAwaitingParamDesc
                 | ActiveState::DescribeAwaitingRowDescOrNoData
@@ -627,6 +648,9 @@ impl ActiveEngine {
             ActiveState::DrainAfterError => self.step_drain_after_error(tag, start, end),
             ActiveState::ParseAwaitingParseComplete => {
                 self.step_parse_awaiting_parse_complete(tag, start, end)
+            }
+            ActiveState::ParseDescribeStmtAwaitingParseComplete => {
+                self.step_parse_describe_awaiting_parse_complete(tag, start, end)
             }
             ActiveState::ParseBindExecuteAwaitingParseComplete => {
                 self.step_parse_bind_execute_awaiting_parse_complete(tag, start, end)
@@ -745,6 +769,26 @@ impl ActiveEngine {
     ) -> ActiveOutcome {
         match tag {
             T_PARSE_COMPLETE => self.deliver_empty(ActiveState::ExtendedAwaitingRfq),
+            T_ERROR => self.fail_recoverable(start, end),
+            _ => self.teardown(),
+        }
+    }
+
+    /// `ParseDescribeStmtAwaitingParseComplete` — a combined
+    /// Parse+Describe(statement)+Sync bundle: `ParseComplete` here is followed by
+    /// the statement `Describe` answer (`ParameterDescription`, …), not the Sync
+    /// boundary, so it advances silently into the describe phase.
+    fn step_parse_describe_awaiting_parse_complete(
+        &mut self,
+        tag: u8,
+        start: usize,
+        end: usize,
+    ) -> ActiveOutcome {
+        match tag {
+            T_PARSE_COMPLETE => {
+                self.state = ActiveState::DescribeStmtAwaitingParamDesc;
+                ActiveOutcome::Silent
+            }
             T_ERROR => self.fail_recoverable(start, end),
             _ => self.teardown(),
         }
@@ -1150,6 +1194,7 @@ impl ActiveEngine {
             ActiveState::CopyOut
             | ActiveState::DrainAfterError
             | ActiveState::ParseAwaitingParseComplete
+            | ActiveState::ParseDescribeStmtAwaitingParseComplete
             | ActiveState::ParseBindExecuteAwaitingParseComplete
             | ActiveState::DescribeStmtAwaitingParamDesc
             | ActiveState::DescribeAwaitingRowDescOrNoData

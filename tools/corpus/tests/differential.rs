@@ -25,6 +25,8 @@
     reason = "test harness — a fixture mismatch is a loud assertion failure, the sanctioned test-failure signal"
 )]
 
+#[path = "../src/engine_transport.rs"]
+mod engine_transport;
 #[path = "../src/engine_adapter.rs"]
 mod engine_adapter;
 
@@ -370,5 +372,166 @@ fn active_differential_a1_a2_pull_agree() {
             t.name,
         );
     }
+}
+
+// ===========================================================================
+// ACTIVE VERB DIFFERENTIAL — Adapter#1 (live push) vs Adapter#2 (real verbs).
+// ===========================================================================
+
+/// The client-bytes-comparable subset: `ActiveViaTrustHandshake` transcripts
+/// whose every step is one of `{SimpleQuery, Ping, ExecutePreparedDemo}` — the
+/// requests that map 1:1 onto a single bundling verb, so the verbs' outbound wire
+/// is byte-comparable against Adapter#1's push wire.
+///
+/// Exclusions, each STRUCTURAL (never "rare"/"atypical"):
+/// - The fine-grained extended fixtures (separate `Prepare`/`DescribeStatement`/
+///   `DescribePortal`/`BindExecute`/`ResumeExecute`/`CloseStatement` steps) are
+///   filtered out by the request-kind set: each such step is its own Sync, while
+///   the bundling verbs (`prepare` = Parse+Describe+1 Sync, `query_params` =
+///   Parse+Bind+Execute+1 Sync) decompose the wire differently by construction.
+///   Those fixtures stay on `A2.pull`, which compares the response only.
+/// - `multi_statement_select`: the live engine FLATTENS a row-first `;`-batch
+///   into one result set; the verb's clean per-statement delineation produces
+///   several — the same documented A1-only flattening quirk the pull subset
+///   excludes (a result divergence by construction, not a wire one).
+fn verb_client_byte_corpus() -> Vec<Transcript> {
+    let mut out: Vec<Transcript> = Vec::new();
+    for t in corpus::seed().into_iter().chain(corpus::adversarial()) {
+        if !matches!(t.setup, Setup::ActiveViaTrustHandshake) || t.steps.is_empty() {
+            continue;
+        }
+        let all_byte_comparable = t.steps.iter().all(|s| {
+            matches!(
+                s.request,
+                ClientRequest::SimpleQuery(_)
+                    | ClientRequest::Ping
+                    | ClientRequest::ExecutePreparedDemo(_)
+            )
+        });
+        if all_byte_comparable && t.name != "multi_statement_select" {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Guard: the verb subset is non-empty and carries each representative the verb
+/// twin exists to exercise — a row-returning SimpleQuery, a bare Ping (the
+/// degenerate command boundary), the prepared-macro path, multi-statement
+/// delineation, a recoverable server error, and a protocol teardown.
+#[test]
+fn verb_client_byte_corpus_is_representative() {
+    let corpus = verb_client_byte_corpus();
+    assert!(
+        corpus.len() >= 8,
+        "expected the verb subset to be non-trivial, found {}",
+        corpus.len(),
+    );
+    for required in [
+        "simple_query_select_rows",      // SimpleQuery rows
+        "ping",                          // Ping (bare RFQ, degenerate boundary)
+        "prepared_macro",                // ExecutePreparedDemo (query_params)
+        "multi_statement_delineated",    // per-statement delineation
+        "copy_out",                      // COPY OUT
+        "server_error_recovers",         // recoverable server error
+        "adversarial_second_row_description", // protocol teardown
+    ] {
+        assert!(
+            corpus.iter().any(|t| t.name == required),
+            "verb subset missing representative fixture `{required}`",
+        );
+    }
+    // The flattening quirk must stay out (it diverges by construction).
+    assert!(
+        !corpus.iter().any(|t| t.name == "multi_statement_select"),
+        "multi_statement_select (A1 flattening quirk) must stay out of the verb subset",
+    );
+    // Ping IS in the verb subset (unlike the pull subset) — the verb path
+    // synthesises the degenerate result set Adapter#1 produces.
+    assert!(
+        corpus.iter().any(|t| t.name == "ping"),
+        "ping must be in the verb subset (its client bytes are comparable)",
+    );
+}
+
+#[test]
+fn active_differential_a1_a2_verb_agree() {
+    let sync = SansIoAdapter::sync();
+    let async_twin = SansIoAdapter::async_twin();
+    let engine = EngineAdapter::new();
+
+    for t in verb_client_byte_corpus() {
+        let a1_sync = sync.run(&t);
+        let a1_async = async_twin.run(&t);
+        let a2_verb = engine.verb(&t);
+        let a2_pull = engine.pull(&t);
+
+        // A1 twin equivalence + pin (the full observable, including client bytes).
+        assert_eq!(a1_sync, a1_async, "A1 sync/async divergence on `{}`", t.name);
+        assert_eq!(a1_sync, t.expect, "A1 pin mismatch on `{}`", t.name);
+
+        // The verb twin agrees with the live engine on the FULL observable —
+        // INCLUDING client_bytes: the verbs put byte-identical request wire on
+        // the socket as Adapter#1's push path.
+        assert_eq!(a2_verb, a1_sync, "A2(verb) vs A1 divergence on `{}`", t.name);
+        assert_eq!(a2_verb, t.expect, "A2(verb) pin mismatch on `{}`", t.name);
+
+        // The two Adapter#2 paths agree on the response projection (the pull twin
+        // emits no client wire, so the client bytes are not comparable there).
+        assert_eq!(
+            response_view(&a2_verb),
+            response_view(&a2_pull),
+            "A2(verb) vs A2(pull) response divergence on `{}`",
+            t.name,
+        );
+    }
+}
+
+/// Teeth: the verb differential's full-equality assertion is sensitive to BOTH
+/// the request wire and the surfaced result. A tampered client-byte stream or a
+/// tampered result set is NOT equal to the verb twin's output — so an injected
+/// divergence in a verb's wire or result fails the differential.
+#[test]
+fn verb_differential_has_teeth() {
+    let engine = EngineAdapter::new();
+    let select = corpus::seed()
+        .into_iter()
+        .find(|t| t.name == "simple_query_select_rows")
+        .expect("simple_query_select_rows fixture present");
+
+    let a2_verb = engine.verb(&select);
+
+    // The verb path actually emitted the request wire (a simple-query frame).
+    assert!(
+        !a2_verb.client_bytes.is_empty(),
+        "verb twin must capture the request wire",
+    );
+    assert_eq!(
+        a2_verb.client_bytes.first().copied(),
+        Some(b'Q'),
+        "a simple-query verb must emit a 'Q' frame",
+    );
+
+    // Tooth 1: a single flipped client byte breaks the byte-identity assertion.
+    let mut wire_tampered = a2_verb.clone();
+    if let Some(last) = wire_tampered.client_bytes.last_mut() {
+        *last ^= 0xFF;
+    }
+    assert_ne!(
+        a2_verb, wire_tampered,
+        "client-byte comparison must catch a flipped request byte",
+    );
+
+    // Tooth 2: a tampered command tag breaks the result assertion.
+    let mut result_tampered = a2_verb.clone();
+    if let Ok(ok) = &mut result_tampered.outcome
+        && let Some(rs) = ok.result_sets.first_mut()
+    {
+        rs.command_tag.push_str("_TAMPERED");
+    }
+    assert_ne!(
+        a2_verb, result_tampered,
+        "result comparison must catch a tampered command tag",
+    );
 }
 

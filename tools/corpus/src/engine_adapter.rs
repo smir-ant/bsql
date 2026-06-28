@@ -14,8 +14,20 @@
 //! wired — it observes the handshake outcome only. The differential test
 //! restricts itself to the handshake/startup subset accordingly.
 
-use bsql_postgres_proto::engine::{ActiveEngine, AuthEvent, ConnectingEngine, Event, SendBuf};
-use bsql_postgres_proto::{Credentials, Encoding, Ident, SessionParams, TxStatus};
+use std::sync::{Arc, Mutex};
+
+use bsql_postgres_proto::engine::{
+    poll_once, session, ActiveEngine, AuthEvent, ConnectingEngine, Engine, EngineError, Event, Live,
+    NoObserver, SendBuf, Surface,
+};
+use bsql_postgres_proto::{
+    prepared, Credentials, Encoding, Ident, PreparedQuery, SessionParams, TxStatus,
+};
+
+use core::convert::Infallible;
+use core::ops::ControlFlow;
+
+use crate::engine_transport::{ClientCapture, EngineScriptTransport};
 
 use bsql_corpus::adapter::Adapter;
 use bsql_corpus::frames;
@@ -74,6 +86,24 @@ impl EngineAdapter {
     #[must_use]
     pub fn pull(&self, transcript: &Transcript) -> ObservedRun {
         run_pull(transcript)
+    }
+
+    /// Drive a transcript through the new engine's REAL verbs over a scripted
+    /// [`Transport`](bsql_postgres_proto::engine::Transport), capturing the FULL
+    /// [`ObservedRun`] INCLUDING `client_bytes`.
+    ///
+    /// Unlike [`pull`](Self::pull) (which hand-feeds the engine's framing and
+    /// emits no client wire), this calls `connect` then each step's verb via
+    /// `poll_once` over an always-ready scripted transport, so the captured
+    /// outbound wire is the verbs' actual request bytes. Scoped to the
+    /// client-bytes-comparable subset — `ActiveViaTrustHandshake` transcripts
+    /// whose every step is in `{SimpleQuery, Ping, ExecutePreparedDemo}`; the
+    /// fine-grained extended fixtures (separate `Prepare`/`Describe`/`Bind` steps
+    /// = three Syncs) do not map to the bundling verbs and stay on
+    /// [`pull`](Self::pull). A transcript outside the subset reports a failed run.
+    #[must_use]
+    pub fn verb(&self, transcript: &Transcript) -> ObservedRun {
+        run_verb(transcript)
     }
 }
 
@@ -447,12 +477,13 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
         // Seat the engine into the awaiting-state matching this request before
         // draining its reply — the response-driven analog of a push. SimpleQuery
         // needs no seat (`Idle` is the awaiting-first-response state); each
-        // extended-protocol verb seats its matching state. `Ping` (a bare
-        // `ReadyForQuery`, no command boundary) and `Terminate` (no server
-        // reply) are not pull-drivable and the corpus filter excludes them;
-        // reaching one here is reported as not-ready rather than mis-driven.
+        // extended-protocol verb seats its matching state. `Ping` is a bare
+        // `Sync` whose `ReadyForQuery` lands at `Idle` with no command boundary —
+        // no seat, and the per-step degenerate-result-set synthesis below mirrors
+        // Adapter#1's statement-less result set. `Terminate` (no server reply at
+        // all) is not pull-drivable; reaching one reports not-ready.
         match &step.request {
-            ClientRequest::SimpleQuery(_) => {}
+            ClientRequest::SimpleQuery(_) | ClientRequest::Ping => {}
             ClientRequest::Prepare(_) => active.begin_parse(),
             ClientRequest::DescribeStatement => active.begin_describe_statement(),
             ClientRequest::DescribePortal => active.begin_describe_portal(),
@@ -465,10 +496,10 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
             ClientRequest::ExecutePreparedDemo(_) => {
                 active.begin_parse_bind_execute(&DEMO_RESULT_OIDS)
             }
-            ClientRequest::Ping | ClientRequest::Terminate => return failed_run(Vec::new()),
+            ClientRequest::Terminate => return failed_run(Vec::new()),
         }
 
-        let scratch = drive_step(
+        let mut scratch = drive_step(
             &mut active,
             step,
             transcript.chunk_schedule,
@@ -493,10 +524,20 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
 
         outcome = match scratch.step_err {
             Some(err) => Err(err),
-            None => Ok(ObservedOk {
-                result_sets: scratch.result_sets,
-                copy_out: scratch.copy_out,
-            }),
+            None => {
+                // A step that reached its boundary with no command-complete (a
+                // bare-`Sync` `Ping`) delivered no result set; synthesise the
+                // degenerate one Adapter#1 produces for a statement-less
+                // `ReadyForQuery`. Never fires for a step that completes a command
+                // (every such step delivers at least one result set).
+                if scratch.result_sets.is_empty() {
+                    scratch.result_sets.push(ObservedResultSet::default());
+                }
+                Ok(ObservedOk {
+                    result_sets: scratch.result_sets,
+                    copy_out: scratch.copy_out,
+                })
+            }
         };
         if let Some(end) = scratch.terminal {
             terminal = end;
@@ -796,6 +837,291 @@ fn parse_notification(body: &[u8]) -> Option<ObservedNotify> {
     };
     let payload = after.get(..payload_end)?.to_vec();
     Some(ObservedNotify { pid, channel, payload })
+}
+
+// ===========================================================================
+// Adapter#2 — active-phase verb twin (real verbs over a scripted Transport)
+// ===========================================================================
+
+/// The corpus-local `prepared!` demo query — the SAME SQL text the live adapter
+/// (`sans_io::Q_DEMO`) prepares, so the content-addressed statement name, baked
+/// Parse template, and Bind prefix are byte-identical. `ExecutePreparedDemo` maps
+/// to the `query_params` macro-execute verb over this query.
+static Q_DEMO_VERB: PreparedQuery<(i32,), (i32, &'static str)> =
+    prepared!("SELECT id::int4, name::text FROM demo WHERE id = $1::int4");
+
+/// Per-step accumulator for the verb runner (the verb owns the pump loop, so its
+/// sink folds surfaces into here rather than a manual pull loop).
+struct VerbCapture {
+    result_sets: Vec<ObservedResultSet>,
+    pending_rows: Vec<Vec<Option<Vec<u8>>>>,
+    copy_out: Vec<Vec<u8>>,
+    fail: Option<ObservedErr>,
+}
+
+impl VerbCapture {
+    fn new() -> Self {
+        Self {
+            result_sets: Vec::new(),
+            pending_rows: Vec::new(),
+            copy_out: Vec::new(),
+            fail: None,
+        }
+    }
+}
+
+/// Whether every step of `transcript` is in the client-bytes-comparable verb
+/// subset `{SimpleQuery, Ping, ExecutePreparedDemo}`.
+fn all_steps_verb_drivable(transcript: &Transcript) -> bool {
+    transcript.steps.iter().all(|s| {
+        matches!(
+            s.request,
+            ClientRequest::SimpleQuery(_)
+                | ClientRequest::Ping
+                | ClientRequest::ExecutePreparedDemo(_)
+        )
+    })
+}
+
+/// Drive one transcript through the real verbs, capturing the full observable.
+fn run_verb(transcript: &Transcript) -> ObservedRun {
+    if !matches!(transcript.setup, Setup::ActiveViaTrustHandshake)
+        || transcript.steps.is_empty()
+        || !all_steps_verb_drivable(transcript)
+    {
+        return failed_run(Vec::new());
+    }
+
+    // The whole scripted reply stream: handshake ++ each step's reply, fragmented
+    // per the transcript schedule (so partial-frame resumption is exercised
+    // exactly as the pull/A1 twins do).
+    let mut script = canonical_handshake_reply();
+    for step in &transcript.steps {
+        script.extend_from_slice(&step.server_reply);
+    }
+    let chunks = split_into_chunks(&script, transcript.chunk_schedule);
+
+    let captured: ClientCapture = Arc::new(Mutex::new(Vec::new()));
+    let transport = EngineScriptTransport::new(chunks, Arc::clone(&captured));
+
+    let user = match Ident::try_from_str("corpus") {
+        Ok(user) => user,
+        Err(_) => return failed_run(Vec::new()),
+    };
+    let body_captured = Arc::clone(&captured);
+
+    let observed = session(
+        transport,
+        &user,
+        None,
+        None,
+        Credentials::Trust,
+        move |mut engine, live| run_verb_body(&mut engine, live, transcript, &body_captured),
+    );
+
+    match observed {
+        Ok(Some(run)) => run,
+        _ => failed_run(Vec::new()),
+    }
+}
+
+/// The session-scoped verb drive: connect, then each step's verb, then project.
+fn run_verb_body<'b>(
+    engine: &mut Engine<'b, EngineScriptTransport, NoObserver>,
+    live: Live<'b>,
+    transcript: &Transcript,
+    captured: &ClientCapture,
+) -> Option<ObservedRun> {
+    let live = match poll_once(engine.connect(live)) {
+        Ok(Ok(live)) => live,
+        _ => return None,
+    };
+    // Drop the handshake's outbound wire; from here the capture is the verb wire
+    // (mirrors Adapter#1 discarding the trust handshake's client bytes).
+    if let Ok(mut sink) = captured.lock() {
+        sink.clear();
+    }
+
+    let backend_pid = engine.backend_pid().ok();
+    let mut params = SessionParams::new();
+    let mut notices: Vec<ObservedNotice> = Vec::new();
+    let mut notifications: Vec<ObservedNotify> = Vec::new();
+    let mut outcome: Result<ObservedOk, ObservedErr> = Ok(ObservedOk::default());
+    let mut terminal = ObservedStatus::Ready;
+
+    let mut live = live;
+    for step in &transcript.steps {
+        let mut cap = VerbCapture::new();
+        match drive_verb_step(
+            engine,
+            live,
+            &step.request,
+            &mut cap,
+            &mut params,
+            &mut notices,
+            &mut notifications,
+        ) {
+            Ok(next) => {
+                live = next;
+                // A bare-`Sync` ping reaches its boundary with no command-complete,
+                // so no result set was delivered; synthesise the degenerate result
+                // set Adapter#1 produces for a `ReadyForQuery` with no statement.
+                if cap.result_sets.is_empty() {
+                    cap.result_sets.push(ObservedResultSet::default());
+                }
+                outcome = Ok(ObservedOk {
+                    result_sets: cap.result_sets,
+                    copy_out: cap.copy_out,
+                });
+            }
+            Err(engine_err) => {
+                let (err, end) = classify_verb_error(engine_err, cap.fail.take());
+                outcome = Err(err);
+                if let Some(end) = end {
+                    terminal = end;
+                }
+                // The error consumed the linear token; no further steps run.
+                break;
+            }
+        }
+    }
+
+    let tx_status = match engine.tx_status() {
+        Ok(status) => map_tx_status(status),
+        Err(_) => ObservedTxStatus::Idle,
+    };
+    let client_bytes = match captured.lock() {
+        Ok(sink) => sink.clone(),
+        Err(_) => Vec::new(),
+    };
+
+    Some(ObservedRun {
+        client_bytes,
+        outcome,
+        notices,
+        parameter_statuses: observe_param_statuses(&params),
+        unknown_parameter_status_count: u32::from(params.n_unknown_dropped),
+        notifications,
+        backend_pid,
+        tx_status,
+        terminal,
+    })
+}
+
+/// Call the verb matching `request`, threading the linear token; its sink folds
+/// surfaces into `cap` and the run-level accumulators.
+fn drive_verb_step<'b>(
+    engine: &mut Engine<'b, EngineScriptTransport, NoObserver>,
+    live: Live<'b>,
+    request: &ClientRequest,
+    cap: &mut VerbCapture,
+    params: &mut SessionParams,
+    notices: &mut Vec<ObservedNotice>,
+    notifications: &mut Vec<ObservedNotify>,
+) -> Result<Live<'b>, EngineError<Infallible>> {
+    let sink = |surface: Surface<'_>| {
+        fold_surface(surface, cap, params, notices, notifications);
+        ControlFlow::Continue(())
+    };
+    match request {
+        ClientRequest::SimpleQuery(sql) => flatten_verb(poll_once(engine.simple_query(live, sql, sink))),
+        ClientRequest::Ping => flatten_verb(poll_once(engine.ping(live, sink))),
+        ClientRequest::ExecutePreparedDemo(id) => {
+            flatten_verb(poll_once(engine.query_params(live, &Q_DEMO_VERB, (*id,), sink)))
+        }
+        // `run_verb` filters to the three kinds above; the rest are unreachable
+        // here. Return the token untouched rather than fabricate an error.
+        _ => Ok(live),
+    }
+}
+
+/// Fold one surfaced event into the per-step capture and run-level accumulators —
+/// the verb-sink analog of the pull runner's `drive_step` arms.
+fn fold_surface(
+    surface: Surface<'_>,
+    cap: &mut VerbCapture,
+    params: &mut SessionParams,
+    notices: &mut Vec<ObservedNotice>,
+    notifications: &mut Vec<ObservedNotify>,
+) {
+    match surface {
+        Surface::Row(body) => cap.pending_rows.push(parse_data_row(body)),
+        Surface::Deliver { tag, oids, names } => {
+            let (command_tag, affected_rows) = match tag {
+                Some(t) => (t.to_string(), t.rows()),
+                None => (String::new(), None),
+            };
+            cap.result_sets.push(ObservedResultSet {
+                command_tag,
+                column_names: names.to_vec(),
+                type_oids: oids.to_vec(),
+                rows: core::mem::take(&mut cap.pending_rows),
+                affected_rows,
+                portal_suspended: false,
+            });
+        }
+        Surface::Notice(body) => {
+            if let Some(notice) = parse_diagnostic_notice(body) {
+                notices.push(notice);
+            }
+        }
+        Surface::Notify(body) => {
+            if let Some(notify) = parse_notification(body) {
+                notifications.push(notify);
+            }
+        }
+        Surface::ParamStatus(body) => {
+            if let Some((key, value)) = split_parameter_status(body) {
+                params.set(key, value);
+            }
+        }
+        Surface::CopyData(body) => cap.copy_out.push(body.to_vec()),
+        Surface::Fail(body) => {
+            if cap.fail.is_none() {
+                cap.fail = Some(parse_server_error(body));
+            }
+        }
+        Surface::RowChunk(_) | Surface::RowChunkEnd | Surface::CopyDone => {}
+    }
+}
+
+/// Map a verb error to the observable outcome + (optional) terminal override. A
+/// server error is recoverable (terminal stays `Ready`, the surfaced raw error
+/// drives the outcome); a protocol violation tears the connection down.
+fn classify_verb_error(
+    err: EngineError<Infallible>,
+    captured_fail: Option<ObservedErr>,
+) -> (ObservedErr, Option<ObservedStatus>) {
+    match err {
+        EngineError::ServerError => {
+            let out = match captured_fail {
+                Some(server) => server,
+                None => ObservedErr::Protocol(ProtocolFailureKind::Unclassified),
+            };
+            (out, None)
+        }
+        EngineError::ProtocolViolation => (
+            ObservedErr::Protocol(ProtocolFailureKind::Unclassified),
+            Some(ObservedStatus::Errored(TerminalErrorKind::Protocol)),
+        ),
+        // Transport / framing / phase / row-count errors: a non-recoverable
+        // failure of the command. Classified, never silently dropped.
+        _ => (
+            ObservedErr::Protocol(ProtocolFailureKind::Unclassified),
+            Some(ObservedStatus::Errored(TerminalErrorKind::Protocol)),
+        ),
+    }
+}
+
+/// Flatten a single-poll verb result; a `Pending` from an always-ready transport
+/// is a broken harness, surfaced as a protocol failure (never spun on).
+fn flatten_verb(
+    polled: Result<Result<Live<'_>, EngineError<Infallible>>, bsql_postgres_proto::engine::SpuriousPending>,
+) -> Result<Live<'_>, EngineError<Infallible>> {
+    match polled {
+        Ok(inner) => inner,
+        Err(_) => Err(EngineError::SpuriousPending),
+    }
 }
 
 /// Canonical PG name for a parsed encoding. Mirrors Adapter#1's mapping; the

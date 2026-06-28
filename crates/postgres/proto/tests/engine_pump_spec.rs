@@ -305,7 +305,7 @@ fn run<O: Observer, S: FnMut(Surface<'_>) -> ControlFlow<()>>(
     send_buf: &mut SendBuf,
     obs: &O,
     sink: S,
-) -> Result<Boundary, EngineError<Infallible>> {
+) -> Result<Boundary<()>, EngineError<Infallible>> {
     // A blocking transport never yields `Pending`, so `SpuriousPending` here is
     // a broken harness — a panic, not the returned protocol `Result`.
     match poll_once(pump_active_to_boundary(active, transport, send_buf, obs, sink)) {
@@ -517,7 +517,7 @@ fn sink_break_stops_early_with_stopped_boundary() {
     })
     .expect("no engine error");
 
-    assert_eq!(boundary, Boundary::Stopped);
+    assert_eq!(boundary, Boundary::Stopped(()));
     // The sink saw exactly one row before breaking; the pump stopped there.
     assert_eq!(seen, 1);
 }

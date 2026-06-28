@@ -8,34 +8,77 @@
 //! the build-time `const` gates in the engine source).
 
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::expect_used,
+    reason = "test harness — a fixture/handshake failure is a loud assertion, the sanctioned test-failure signal"
+)]
 
 use bsql_postgres_proto::engine::{
-    session, session_with, Engine, EngineError, EngineNoObs, Event, Live, NoObserver, Transport,
-    AuthEvent,
+    session, session_with, Engine, EngineError, EngineNoObs, Event, Live, NoObserver, Surface,
+    Transport, AuthEvent,
 };
+use bsql_postgres_proto::wire::{TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_READY_FOR_QUERY};
 use bsql_postgres_proto::{Credentials, Ident};
 use core::convert::Infallible;
 use core::future::{ready, Future};
+use core::ops::ControlFlow;
 
-/// Minimal always-ready transport. The scaffold verbs perform no exchange,
-/// so the I/O methods are never driven — they exist only to satisfy
-/// `T: Transport`. Built from `core::future::ready`, so there is no manual
-/// async block (and thus no `Transport`-shape boilerplate to lint).
-struct TestTransport;
+/// Build a tagged, length-prefixed wire frame (`tag | len(self+body) | body`).
+fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 5);
+    out.push(tag);
+    let len = u32::try_from(body.len() + 4).expect("frame body fits a u32 length");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
 
-impl Transport for TestTransport {
+/// The canonical trust handshake reply (`AuthenticationOk` + `BackendKeyData` +
+/// `ReadyForQuery`), followed by one extra `ReadyForQuery` answering the ping's
+/// `Sync`, so a `connect` then a `ping` both drain to a clean idle.
+fn handshake_then_ping_reply() -> Vec<u8> {
+    let mut key_body = 4321_i32.to_be_bytes().to_vec();
+    key_body.extend_from_slice(&8765_i32.to_be_bytes());
+    let mut reply = Vec::new();
+    reply.extend_from_slice(&frame(TAG_AUTHENTICATION.byte(), &0_i32.to_be_bytes()));
+    reply.extend_from_slice(&frame(TAG_BACKEND_KEY_DATA.byte(), &key_body));
+    reply.extend_from_slice(&frame(TAG_READY_FOR_QUERY.byte(), b"I"));
+    reply.extend_from_slice(&frame(TAG_READY_FOR_QUERY.byte(), b"I"));
+    reply
+}
+
+/// Static scripted server: `read` drains a fixed reply from a cursor; writes are
+/// accepted and discarded; every op resolves synchronously (one-poll).
+struct StaticServer {
+    inbound: Vec<u8>,
+    cursor: usize,
+}
+
+impl StaticServer {
+    fn new(inbound: Vec<u8>) -> Self {
+        Self { inbound, cursor: 0 }
+    }
+}
+
+impl Transport for StaticServer {
     type Error = Infallible;
     fn read<'a>(
         &'a mut self,
-        _buf: &'a mut [u8],
+        buf: &'a mut [u8],
     ) -> impl Future<Output = Result<usize, Infallible>> + Send + 'a {
-        ready(Ok(0))
+        let n = (self.inbound.len() - self.cursor).min(buf.len());
+        let end = self.cursor + n;
+        if let (Some(dst), Some(src)) = (buf.get_mut(..n), self.inbound.get(self.cursor..end)) {
+            dst.copy_from_slice(src);
+        }
+        self.cursor = end;
+        ready(Ok(n))
     }
     fn write<'a>(
         &'a mut self,
-        _buf: &'a [u8],
+        buf: &'a [u8],
     ) -> impl Future<Output = Result<usize, Infallible>> + Send + 'a {
-        ready(Ok(0))
+        ready(Ok(buf.len()))
     }
     fn flush<'a>(&'a mut self) -> impl Future<Output = Result<(), Infallible>> + Send + 'a {
         ready(Ok(()))
@@ -59,20 +102,28 @@ fn block_on<F: Future>(f: F) -> F::Output {
     }
 }
 
+/// A Continue-only sink — the R4 tests assert token threading, not surfaced
+/// data.
+fn drop_sink(_surface: Surface<'_>) -> ControlFlow<bsql_postgres_proto::engine::Never> {
+    ControlFlow::Continue(())
+}
+
 /// R4: a single linear token threads through TWO sequential `await`s inside
 /// one `async` scope that holds `&mut engine` across both — the shape that
 /// would not compile if the verbs coupled the engine borrow to the brand
 /// (`&'b mut Engine<'b>`). Decoupling (verbs take `&mut self`; the brand
-/// lives only on the engine type + the token) is what makes this compile.
+/// lives only on the engine type + the token) is what makes this compile. The
+/// verbs are real (`connect` then `ping`) driven over a scripted server.
 #[test]
 fn r4_two_sequential_async_verbs_thread_one_token() {
     let user = Ident::try_from_str("test").expect("ident");
+    let server = StaticServer::new(handshake_then_ping_reply());
     let outcome: Result<(), EngineError<Infallible>> =
-        session(TestTransport, &user, None, None, Credentials::Trust, |mut e, live| {
+        session(server, &user, None, None, Credentials::Trust, |mut e, live| {
             block_on(async move {
-                let live = e.begin(live).await?;
-                let live = e.commit(live).await?;
-                let _consumed = live;
+                let live = e.connect(live).await?;
+                let live = e.ping(live, drop_sink).await?;
+                let _ = live;
                 Ok(())
             })
         })
@@ -85,11 +136,12 @@ fn r4_two_sequential_async_verbs_thread_one_token() {
 #[test]
 fn verbs_thread_token_one_await_each() {
     let user = Ident::try_from_str("test").expect("ident");
+    let server = StaticServer::new(handshake_then_ping_reply());
     let threaded =
-        session(TestTransport, &user, None, None, Credentials::Trust, |mut e, live| {
-            let live = block_on(e.begin(live)).expect("begin");
-            let live = block_on(e.commit(live)).expect("commit");
-            let _consumed = live;
+        session(server, &user, None, None, Credentials::Trust, |mut e, live| {
+            let live = block_on(e.connect(live)).expect("connect");
+            let live = block_on(e.ping(live, drop_sink)).expect("ping");
+            let _ = live;
             true
         })
         .expect("startup packet assembles");
@@ -101,16 +153,18 @@ fn verbs_thread_token_one_await_each() {
 #[test]
 fn session_with_threads_explicit_policy() {
     let user = Ident::try_from_str("test").expect("ident");
+    let server = StaticServer::new(handshake_then_ping_reply());
     let threaded = session_with(
-        TestTransport,
+        server,
         NoObserver,
         &user,
         None,
         None,
         Credentials::Trust,
         |mut e, live| {
-            let live = block_on(e.begin(live)).expect("begin");
-            let _consumed = live;
+            let live = block_on(e.connect(live)).expect("connect");
+            let live = block_on(e.ping(live, drop_sink)).expect("ping");
+            let _ = live;
             true
         },
     )
