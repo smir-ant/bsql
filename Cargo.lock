@@ -94,6 +94,7 @@ dependencies = [
 name = "bsql-postgres-core"
 version = "0.1.0-alpha.0"
 dependencies = [
+ "bsql-devgates",
  "bsql-postgres-proto",
  "rustls",
  "webpki-roots",

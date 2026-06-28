@@ -15,6 +15,7 @@ pub mod footprint;
 pub mod owned_row;
 pub mod session;
 pub mod ssl;
+pub mod tls;
 pub mod types;
 
 pub use config::{ConnectConfig, SslMode};

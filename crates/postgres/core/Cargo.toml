@@ -17,6 +17,16 @@ rustls = { workspace = true }
 webpki-roots = { workspace = true }
 zeroize = { workspace = true, features = ["alloc"] }
 
+[dev-dependencies]
+# `bsql-devgates` — dev-only harness hosting the workspace's only `unsafe`:
+# the counting `#[global_allocator]` used by the `tls_alloc_gate` integration
+# test to prove the inbound-decrypt cost is bounded (does not grow per record)
+# and the outbound `write` path is 0-alloc. Already a resolved workspace
+# member, so this dev edge adds no package to the lockfile (`deps_pin`
+# unchanged) and is excluded from every shipped crate's runtime graph
+# (`runtime_graph_pin` unchanged — dev edges are not `-e normal`).
+bsql-devgates = { path = "../../../tools/devgates" }
+
 # Inherit the workspace FORBID floor (the two-tier lint wall). The two
 # legitimate tier-4 fallback sites in this crate (a Display default
 # severity label, a sole-ctor dead arm) carry scoped allows in `src/`.
