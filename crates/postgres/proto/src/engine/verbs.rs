@@ -381,7 +381,21 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
-        enqueue_frame(send_buf, |wb| frames::build_simple_query(wb, sql.as_bytes()))?;
+        // Stream the SQL body directly onto the (growable) send buffer rather
+        // than copying it into the bounded `WriteBuf`: only the 5-byte header is
+        // built into the scratch buffer, so a multi-kilobyte query (a large
+        // literal INSERT, a wide column projection) is not capped at
+        // `MAX_OWNED_SEND_LEN`. The flushed bytes — header, SQL, NUL — are
+        // contiguous on the send buffer, byte-identical to the whole-frame
+        // builder's output.
+        let sql_bytes = sql.as_bytes();
+        let sql_len = u32::try_from(sql_bytes.len()).map_err(|_| {
+            core::hint::cold_path();
+            EngineError::FrameTooLong
+        })?;
+        enqueue_frame(send_buf, |wb| frames::build_simple_query_header(wb, sql_len))?;
+        send_buf.enqueue(sql_bytes);
+        send_buf.enqueue(&[0]);
         let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
         classify_idle(boundary)
     }
@@ -728,6 +742,73 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
                 core::hint::cold_path();
                 Err(EngineError::UnexpectedSuspend)
             }
+        }
+    }
+
+    /// Reclaim the linear liveness token after a verb consumed it on a
+    /// *recoverable* failure — a server `ErrorResponse` (the recoverable
+    /// query-level error a verb reports as [`EngineError::ServerError`]) or a
+    /// `recv_notification` read that timed out with no notification.
+    ///
+    /// A failed verb consumes its token (the error path returns no token) yet
+    /// leaves the connection reusable: a server error parks the engine at the
+    /// command's recovering `ReadyForQuery` (still owed), and a notification
+    /// read timeout leaves it clean-idle. Without a way to re-acquire the token
+    /// the connection would be unusable after any query-level error —
+    /// `at-most-one-command-in-flight` cannot mint a replacement from outside
+    /// the crate. This drives the engine to its clean idle boundary (consuming
+    /// the owed `ReadyForQuery`) and mints a fresh token; when already clean-idle
+    /// with nothing buffered it mints immediately without touching the wire.
+    ///
+    /// # Contract
+    ///
+    /// Call ONLY when no live token is outstanding (the prior verb consumed it)
+    /// and the failure was recoverable. The minted token re-establishes
+    /// at-most-one-command-in-flight: the prior command has completed (with an
+    /// error), so exactly one token exists again. Invoking this while a command's
+    /// reply is genuinely still in flight would drain that reply into the
+    /// noop sink; the driver invokes it only on the recoverable-error path.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::WrongPhase`] — the engine is not in its active phase.
+    /// - [`EngineError::ServerError`] / [`EngineError::ProtocolViolation`] — a
+    ///   further error or teardown was observed while draining to the boundary.
+    /// - the pump's transport / framing errors.
+    pub async fn recover(&mut self) -> Result<Live<'b>, EngineError<T::Error>> {
+        let Self {
+            transport,
+            obs,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        // Already at a clean boundary (e.g. a timed-out notification read consumed
+        // nothing): mint without I/O. Pumping here would block on a wire that
+        // owes no bytes.
+        if active.at_clean_idle() {
+            return Ok(Live::new_in_scope());
+        }
+        // Otherwise the recovering `ReadyForQuery` of the failed command is owed;
+        // drain to it. The prior command's request was already flushed, so the
+        // send buffer is drained and the pump's entry flush is a no-op.
+        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, noop_sink).await?;
+        match boundary {
+            Boundary::Idle => Ok(Live::new_in_scope()),
+            Boundary::Failed => {
+                core::hint::cold_path();
+                Err(EngineError::ServerError)
+            }
+            Boundary::Closed => {
+                core::hint::cold_path();
+                Err(EngineError::ProtocolViolation)
+            }
+            Boundary::Suspended => {
+                core::hint::cold_path();
+                Err(EngineError::UnexpectedSuspend)
+            }
+            Boundary::Stopped(never) => absurd(never),
         }
     }
 

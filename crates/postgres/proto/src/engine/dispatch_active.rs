@@ -135,6 +135,20 @@ const T_CLOSE_COMPLETE: u8 = TAG_CLOSE_COMPLETE.byte();
 /// buffer is the whole footprint.
 const OVERSIZE_PREFIX_CAP: usize = 8192;
 
+/// Hard ceiling on the bytes the Sub-C accumulator gathers for an oversize
+/// `RowDescription` before the declared length is rejected as hostile/buggy.
+///
+/// Unlike Sub-A (bounded `RowChunk` streaming) and Sub-B (bounded 8 KiB prefix),
+/// the Sub-C accumulator MUST parse the whole frame, so an uncapped accumulate
+/// would let a server's declared `u32` length (up to ~4 GiB) drive the client to
+/// OOM. The legitimate ceiling is tiny: PostgreSQL caps a result at 1664
+/// columns, and a `RowDescription` field is `name (<= 63 + 1 NUL) + 18 fixed`
+/// bytes, so the absolute worst case is ~1664 * 82 ≈ 133 KiB. This 1 MiB bound
+/// clears that with ~7x headroom while bounding a hostile declared length to a
+/// small per-frame allocation; beyond it the frame is a classified teardown
+/// (reject-before-allocate), exactly like any other oversize control frame.
+const MAX_ROW_DESC_ACCUM: usize = 1 << 20;
+
 // ===========================================================================
 // Active-phase state machine
 // ===========================================================================
@@ -241,7 +255,8 @@ enum ActiveOutcome {
     CopyData(Lend, usize, usize),
 }
 
-/// Sub-A (`DataRow`) vs Sub-B (streaming-eligible non-`D`) oversize handling.
+/// Sub-A (`DataRow`) vs Sub-B (streaming-eligible non-`D`) vs Sub-C
+/// (parse-whole control frame) oversize handling.
 #[derive(Debug, Clone, Copy)]
 enum OversizeMode {
     /// Stream the row body as `RowChunk` / `RowChunkEnd`.
@@ -249,6 +264,10 @@ enum OversizeMode {
     /// Keep a bounded prefix, count-and-skip the tail, then surface the
     /// truncated event classified by `surfaced_tag`.
     SubB,
+    /// Gather the whole body into the growable accumulator, then parse it (a
+    /// wide `RowDescription`: every column's OID and name is load-bearing, so it
+    /// can be neither truncated like Sub-B nor streamed piecewise like Sub-A).
+    Accumulate,
 }
 
 /// State of an in-progress oversize frame. `Copy` so the drive loop can lift it
@@ -290,6 +309,11 @@ pub struct ActiveEngine {
     /// Bounded truncation prefix for Sub-B; allocated lazily on first oversize
     /// streaming-eligible frame.
     prefix: Option<Box<[u8; OVERSIZE_PREFIX_CAP]>>,
+    /// Growable accumulator for a Sub-C parse-whole oversize frame (a wide
+    /// `RowDescription`): the whole body is gathered here across reads, then
+    /// parsed. Empty except while such a frame is in flight; scrubbed on drop
+    /// (it holds raw inbound wire bytes — column names).
+    oversize_accum: Vec<u8>,
     /// Per-column type OIDs of the current statement's `RowDescription`.
     col_oids: Vec<u32>,
     /// Per-column names of the current statement's `RowDescription`.
@@ -299,11 +323,11 @@ pub struct ActiveEngine {
 }
 
 // Stack footprint of the active handle: the carried-forward `IngestBuf` (144)
-// dominates, plus the pid/secret/tx-status scalars, the two `Option<Box<…>>` /
-// `Vec` handles (schema + oversize prefix, heap-backed), and the `command_tag`.
-// The result-schema and oversize bytes live off-stack behind those handles. A
-// field addition lands here as a reviewed footprint drift.
-crate::wire_pin!(ActiveEngine, size = 280, align = 8);
+// dominates, plus the pid/secret/tx-status scalars, the `Option<Box<…>>` /
+// `Vec` handles (schema, oversize prefix, the Sub-C accumulator), and the
+// `command_tag`. The result-schema and oversize bytes live off-stack behind
+// those handles. A field addition lands here as a reviewed footprint drift.
+crate::wire_pin!(ActiveEngine, size = 304, align = 8);
 
 impl ActiveEngine {
     /// Construct the active engine at handshake completion, carrying the
@@ -323,6 +347,7 @@ impl ActiveEngine {
             state: ActiveState::Idle,
             oversize: None,
             prefix: None,
+            oversize_accum: Vec::new(),
             col_oids: Vec::new(),
             col_names: Vec::new(),
             command_tag: None,
@@ -393,6 +418,25 @@ impl ActiveEngine {
     #[must_use]
     pub fn last_command_tag(&self) -> Option<&CommandTag> {
         self.command_tag.as_ref()
+    }
+
+    /// True when the engine sits at a clean command boundary ([`Idle`]) with no
+    /// inbound bytes buffered.
+    ///
+    /// The reclaim path uses this to decide whether re-acquiring the liveness
+    /// token requires a pump. After a *recoverable* server `ErrorResponse` the
+    /// engine is parked at `DrainAfterError` with the command's trailing
+    /// `ReadyForQuery` still owed — not clean-idle — so the reclaim drains that
+    /// one frame to the boundary. After a read that timed out before any byte
+    /// arrived the engine is clean-idle with an empty buffer, so the reclaim
+    /// mints a token WITHOUT a pump (a pump here would block on a wire that owes
+    /// nothing).
+    ///
+    /// [`Idle`]: ActiveState::Idle
+    #[inline]
+    #[must_use]
+    pub(super) fn at_clean_idle(&self) -> bool {
+        matches!(self.state, ActiveState::Idle) && self.ingest.unread_len() == 0
     }
 
     // ── Extended-query-protocol state-entry seam ──────────────────────────
@@ -921,19 +965,22 @@ impl ActiveEngine {
 
     /// `RowDescription` → record columns/OIDs, open the row stream (silent).
     fn open_row_stream(&mut self, start: usize, end: usize) -> ActiveOutcome {
-        let body = self.ingest.frame_body(start, end);
-        let oids = match parse_row_description(body) {
-            Ok(rd) => rd.columns_iter().map(|c| c.type_oid).collect::<Vec<u32>>(),
-            Err(_) => return self.teardown(),
-        };
-        let names = match parse_column_names(body) {
-            Ok(names) => names,
-            Err(_) => return self.teardown(),
-        };
-        self.col_oids = oids;
-        self.col_names = names;
-        self.state = ActiveState::StreamingRows;
-        ActiveOutcome::Silent
+        let parsed = parse_row_desc_owned(self.ingest.frame_body(start, end));
+        self.apply_open_row_stream(parsed)
+    }
+
+    /// Open the row stream from a parsed schema (or tear down on a parse fail).
+    /// Shared by the in-buffer and Sub-C-accumulated `RowDescription` paths.
+    fn apply_open_row_stream(&mut self, parsed: Option<(Vec<u32>, Vec<String>)>) -> ActiveOutcome {
+        match parsed {
+            Some((oids, names)) => {
+                self.col_oids = oids;
+                self.col_names = names;
+                self.state = ActiveState::StreamingRows;
+                ActiveOutcome::Silent
+            }
+            None => self.teardown(),
+        }
     }
 
     /// `DataRow` → lend the whole row body (it fit the buffer; the oversize
@@ -991,18 +1038,64 @@ impl ActiveEngine {
     /// a later `Bind`+`Execute` against the same statement can thread the OIDs
     /// back in via [`begin_bind_execute`](Self::begin_bind_execute).
     fn record_described_rows(&mut self, start: usize, end: usize) -> ActiveOutcome {
-        let body = self.ingest.frame_body(start, end);
-        let oids = match parse_row_description(body) {
-            Ok(rd) => rd.columns_iter().map(|c| c.type_oid).collect::<Vec<u32>>(),
-            Err(_) => return self.teardown(),
-        };
-        let names = match parse_column_names(body) {
-            Ok(names) => names,
-            Err(_) => return self.teardown(),
-        };
-        self.col_oids = oids;
-        self.col_names = names;
-        self.deliver_empty(ActiveState::ExtendedAwaitingRfq)
+        let parsed = parse_row_desc_owned(self.ingest.frame_body(start, end));
+        self.apply_record_described_rows(parsed)
+    }
+
+    /// Record a `Describe`'s recovered schema (or tear down on a parse fail).
+    /// Shared by the in-buffer and Sub-C-accumulated `RowDescription` paths.
+    fn apply_record_described_rows(
+        &mut self,
+        parsed: Option<(Vec<u32>, Vec<String>)>,
+    ) -> ActiveOutcome {
+        match parsed {
+            Some((oids, names)) => {
+                self.col_oids = oids;
+                self.col_names = names;
+                self.deliver_empty(ActiveState::ExtendedAwaitingRfq)
+            }
+            None => self.teardown(),
+        }
+    }
+
+    /// Append one drained chunk of an oversize Sub-C frame to the accumulator.
+    /// Disjoint field borrows: the ingest read and the accumulator write touch
+    /// different fields of `self`.
+    fn append_oversize_accum(&mut self, start: usize, end: usize) {
+        let src = self.ingest.frame_body(start, end);
+        self.oversize_accum.extend_from_slice(src);
+    }
+
+    /// Dispatch a fully-accumulated oversize `RowDescription` by the current
+    /// command phase — the Sub-C analog of the per-state `'T'` arms. Mirrors
+    /// exactly where an in-buffer `RowDescription` is legal (open a row stream at
+    /// `Idle`/`AwaitingRfq`, record a describe answer at the describe wait); any
+    /// other phase is the same classified teardown as the in-buffer path.
+    fn dispatch_accumulated_row_desc(&mut self) -> ActiveOutcome {
+        match self.state {
+            ActiveState::Idle | ActiveState::AwaitingRfq => {
+                let parsed = parse_row_desc_owned(&self.oversize_accum);
+                self.apply_open_row_stream(parsed)
+            }
+            ActiveState::DescribeAwaitingRowDescOrNoData => {
+                let parsed = parse_row_desc_owned(&self.oversize_accum);
+                self.apply_record_described_rows(parsed)
+            }
+            ActiveState::StreamingRows
+            | ActiveState::CopyOut
+            | ActiveState::CopyOutAwaitingCc
+            | ActiveState::CopyInActive
+            | ActiveState::DrainAfterError
+            | ActiveState::ParseAwaitingParseComplete
+            | ActiveState::ParseDescribeStmtAwaitingParseComplete
+            | ActiveState::ParseBindExecuteAwaitingParseComplete
+            | ActiveState::DescribeStmtAwaitingParamDesc
+            | ActiveState::BindAwaitingBindComplete
+            | ActiveState::BindAwaitingData
+            | ActiveState::ExtendedAwaitingRfq
+            | ActiveState::CloseAwaitingComplete
+            | ActiveState::Failed => self.teardown(),
+        }
     }
 
     /// `CopyOutResponse` → validate the header, open COPY OUT (silent).
@@ -1096,6 +1189,30 @@ impl ActiveEngine {
                 prefix_len: 0,
             });
             ActiveOutcome::Silent
+        } else if tag == T_ROW_DESC {
+            // A wide `RowDescription` exceeded the bounded buffer. It cannot be
+            // truncated (Sub-B) — every column's type OID and name drives decode
+            // — nor streamed as chunks (Sub-A) — it is consumed internally, not
+            // surfaced. Gather the whole body into the growable accumulator, then
+            // parse it once complete.
+            //
+            // Reject-BEFORE-allocate: a declared length beyond the legitimate
+            // ceiling is a hostile/buggy server, classified as a teardown rather
+            // than driven into an unbounded allocation. The cap is checked here,
+            // the sole place Accumulate is entered, so it covers every active
+            // phase that reaches a RowDescription.
+            if body_len > MAX_ROW_DESC_ACCUM {
+                core::hint::cold_path();
+                return self.teardown();
+            }
+            self.oversize_accum.clear();
+            self.oversize = Some(OversizeStream {
+                mode: OversizeMode::Accumulate,
+                body_remaining: body_len,
+                surfaced_tag: tag,
+                prefix_len: 0,
+            });
+            ActiveOutcome::Silent
         } else if is_streaming_eligible(tag) {
             if self.prefix.is_none() {
                 self.prefix = Some(Box::new([0u8; OVERSIZE_PREFIX_CAP]));
@@ -1133,6 +1250,23 @@ impl ActiveEngine {
                         os.body_remaining = os.body_remaining.saturating_sub(took);
                         self.oversize = Some(os);
                         ActiveOutcome::RowChunk(Lend::Ingest, start, end)
+                    }
+                }
+            }
+            OversizeMode::Accumulate => {
+                if os.body_remaining == 0 {
+                    self.oversize = None;
+                    return self.dispatch_accumulated_row_desc();
+                }
+                match self.ingest.take_chunk(os.body_remaining) {
+                    None => ActiveOutcome::NeedMore,
+                    Some((start, end)) => {
+                        let took = end.saturating_sub(start);
+                        self.append_oversize_accum(start, end);
+                        os.body_remaining = os.body_remaining.saturating_sub(took);
+                        self.oversize = Some(os);
+                        // Keep gathering — the frame is dispatched only at body end.
+                        ActiveOutcome::Silent
                     }
                 }
             }
@@ -1257,6 +1391,23 @@ impl ActiveEngine {
     }
 }
 
+/// Parse a `RowDescription` body into owned column type OIDs + names, or `None`
+/// when the body is wire-malformed. Owned (not borrowed), so the caller can
+/// mutate `self` after the parse — and so the same parse serves both the
+/// in-buffer body (`IngestBuf::frame_body`) and the Sub-C accumulator (a `Vec`).
+#[inline]
+fn parse_row_desc_owned(body: &[u8]) -> Option<(Vec<u32>, Vec<String>)> {
+    let oids = match parse_row_description(body) {
+        Ok(rd) => rd.columns_iter().map(|c| c.type_oid).collect::<Vec<u32>>(),
+        Err(_) => return None,
+    };
+    let names = match parse_column_names(body) {
+        Ok(names) => names,
+        Err(_) => return None,
+    };
+    Some((oids, names))
+}
+
 /// Is `tag` a payload-bearing non-`DataRow` frame whose oversize is absorbed
 /// via the Sub-B prefix-and-truncate path? Control frames (whose oversize is a
 /// protocol impossibility) are excluded — those tear the connection down.
@@ -1290,5 +1441,8 @@ impl Drop for ActiveEngine {
         if let Some(prefix) = &mut self.prefix {
             prefix.as_mut_slice().zeroize();
         }
+        // The Sub-C accumulator holds raw inbound RowDescription bytes (column
+        // names); scrub them like the Sub-B prefix.
+        self.oversize_accum.zeroize();
     }
 }

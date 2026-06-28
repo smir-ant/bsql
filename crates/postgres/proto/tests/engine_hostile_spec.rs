@@ -517,19 +517,44 @@ fn oversize_datarow_just_over_cap_streams_and_completes() {
     assert_eq!(events.last(), Some(&Ev::Idle), "the command reaches idle");
 }
 
-/// An oversize frame whose tag is NOT streaming-eligible (here a `RowDescription`
-/// that exceeds the buffer) is a classified teardown — the engine refuses it
-/// rather than buffer it unbounded or skip it.
+/// An oversize frame whose tag is neither streaming-eligible (Sub-B) nor a
+/// parse-whole `RowDescription` (Sub-C) is a classified teardown — the engine
+/// refuses it rather than buffer it unbounded or skip it. A `ReadyForQuery`
+/// (whose body is always a single status byte) is an unambiguous protocol
+/// impossibility when oversize. (An oversize `RowDescription` is NOT a teardown
+/// — it accumulates whole via Sub-C; see the `engine_verbs_spec` coverage.)
 #[test]
 fn oversize_non_streaming_tag_tears_down() {
     let mut engine = active_engine();
-    // declared 8000 (> READ_BUF_CAP - 1) with a RowDescription tag, in Idle.
-    let oversize = frame_declared(TAG_ROW_DESCRIPTION.byte(), 8000, &[0u8; 16]);
+    // declared 8000 (> READ_BUF_CAP - 1) with a ReadyForQuery tag, in Idle.
+    let oversize = frame_declared(TAG_READY_FOR_QUERY.byte(), 8000, &[0u8; 16]);
     let events = drive(&mut engine, &oversize, 64);
     assert_eq!(
         events,
         vec![Ev::Close],
-        "an oversize control frame (not streaming-eligible) must tear down",
+        "an oversize control frame (not streaming-eligible, not Sub-C) must tear down",
+    );
+}
+
+/// An oversize `RowDescription` whose declared length is ABSURD (~4 GiB) is a
+/// classified teardown, NOT an attempt to accumulate gigabytes. The Sub-C
+/// accumulate path is bounded by `MAX_ROW_DESC_ACCUM` and rejects-before-allocate
+/// when the declared body exceeds it — so a hostile/buggy server cannot drive the
+/// client to OOM (the property Sub-A and Sub-B already guarantee). The legitimate
+/// wide case (300 columns, far under the cap) still accumulates and decodes — see
+/// `oversize_row_description_accumulates_and_decodes` in engine_verbs_spec.
+#[test]
+fn oversize_row_description_absurd_declared_tears_down() {
+    let mut engine = active_engine();
+    // declared = u32::MAX (the wire maximum) with a RowDescription tag, in Idle.
+    // body_len far exceeds MAX_ROW_DESC_ACCUM (1 MiB), so the engine must refuse
+    // before allocating, not begin gathering ~4 GiB.
+    let oversize = frame_declared(TAG_ROW_DESCRIPTION.byte(), u32::MAX, &[0u8; 64]);
+    let events = drive(&mut engine, &oversize, 64);
+    assert_eq!(
+        events,
+        vec![Ev::Close],
+        "an oversize RowDescription beyond the Sub-C cap must tear down, never accumulate",
     );
 }
 

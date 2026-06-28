@@ -683,6 +683,95 @@ fn server_error_is_classified() {
 }
 
 #[test]
+fn recover_after_server_error_reclaims_usable_token() {
+    // A recoverable server error consumes the token but leaves the connection
+    // drainable to its recovering RFQ. `recover` drains it, mints a fresh token,
+    // and a follow-up command succeeds — the connection survived the error.
+    let script = concat(&[
+        handshake(),
+        error_response("ERROR", "42601", "syntax error"),
+        rfq(b'I'),
+        command_complete("SELECT 1"),
+        rfq(b'I'),
+    ]);
+    let (first_is_server_err, reclaimed, follow_ok, follow_delivers) = run(script, |e, live| {
+        let mut cap1 = Cap::default();
+        let first = poll_once(e.simple_query(live, "SELCT", cap1.sink()));
+        let first_is_server_err = matches!(first, Ok(Err(EngineError::ServerError)));
+        // The failed verb consumed the token; reclaim it.
+        let (reclaimed, follow_ok, follow_delivers) = match poll_once(e.recover()) {
+            Ok(Ok(live)) => {
+                let mut cap2 = Cap::default();
+                let follow = poll_once(e.simple_query(live, "SELECT 1", cap2.sink()));
+                (true, matches!(follow, Ok(Ok(_))), cap2.delivers.len())
+            }
+            _ => (false, false, 0),
+        };
+        (first_is_server_err, reclaimed, follow_ok, follow_delivers)
+    });
+    assert!(first_is_server_err, "the syntax error must classify as ServerError");
+    assert!(reclaimed, "recover must reclaim a token after a recoverable error");
+    assert!(follow_ok, "the follow-up command must succeed on the recovered connection");
+    assert_eq!(follow_delivers, 1, "the follow-up command must deliver its result");
+}
+
+#[test]
+fn recover_after_teardown_does_not_resurrect() {
+    // A protocol violation (a `BindComplete` with no command in flight) tears the
+    // connection down. `recover` must NOT mint a token for a dead connection — it
+    // drains to a non-Idle boundary and returns a classified error.
+    let script = concat(&[handshake(), bind_complete()]);
+    let (is_proto_violation, recover_refused) = run(script, |e, live| {
+        let mut cap = Cap::default();
+        let result = poll_once(e.simple_query(live, "SELECT 1", cap.sink()));
+        let is_proto_violation = matches!(result, Ok(Err(EngineError::ProtocolViolation)));
+        // recover must refuse to resurrect: `Ok(Err(_))` = no token minted.
+        let recover_refused = matches!(poll_once(e.recover()), Ok(Err(_)));
+        (is_proto_violation, recover_refused)
+    });
+    assert!(is_proto_violation, "an out-of-phase BindComplete must tear down");
+    assert!(recover_refused, "recover must not resurrect a torn-down connection");
+}
+
+#[test]
+fn oversize_row_description_accumulates_and_decodes() {
+    // A RowDescription wider than the bounded ingest buffer (READ_BUF_CAP = 4096)
+    // is gathered whole via the Sub-C accumulator and parsed — every column's OID
+    // and name surfaces, and the row decodes against it. 300 int4 columns is
+    // ~7.2 KB, comfortably oversize.
+    const N: usize = 300;
+    let cols: Vec<(String, i32)> = (0..N).map(|i| (format!("col_{i}"), 23_i32)).collect();
+    let col_refs: Vec<(&str, i32)> = cols.iter().map(|(name, oid)| (name.as_str(), *oid)).collect();
+    let cells_owned: Vec<Vec<u8>> = (0..N).map(|i| i.to_string().into_bytes()).collect();
+    let cells: Vec<Option<&[u8]>> = cells_owned.iter().map(|c| Some(c.as_slice())).collect();
+    let script = concat(&[
+        handshake(),
+        row_description(&col_refs),
+        data_row(&cells),
+        command_complete("SELECT 1"),
+        rfq(b'I'),
+    ]);
+    let (rows, deliver_oids, deliver_names, row_cells) = run(script, |e, live| {
+        let mut cap = Cap::default();
+        let outcome = poll_once(e.query(live, "SELECT wide", cap.sink()));
+        assert!(matches!(outcome, Ok(Ok(_))), "the wide query must reach a clean Idle");
+        let (oids, names) = match cap.delivers.last() {
+            Some((_, oids, names)) => (oids.len(), names.len()),
+            None => (0, 0),
+        };
+        let row_cells = match cap.row_cells.last() {
+            Some(cells) => cells.len(),
+            None => 0,
+        };
+        (cap.rows, oids, names, row_cells)
+    });
+    assert_eq!(rows, 1, "exactly one row surfaces");
+    assert_eq!(deliver_oids, N, "all {N} column OIDs are recovered from the oversize RowDescription");
+    assert_eq!(deliver_names, N, "all {N} column names are recovered");
+    assert_eq!(row_cells, N, "the row decodes against all {N} columns");
+}
+
+#[test]
 fn verb_before_connect_is_wrong_phase() {
     // A verb on a still-connecting engine classifies WrongPhase before any I/O.
     let user = Ident::try_from_str("verbs").expect("ident");

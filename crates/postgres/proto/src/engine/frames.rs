@@ -58,6 +58,20 @@ pub(crate) fn build_simple_query(wb: &mut WriteBuf, sql: &[u8]) -> Result<(), Wr
     })
 }
 
+/// `'Q'` simple-query frame HEADER only: `tag | len`, where `len` is the
+/// self-inclusive `4 + sql_len + 1` (the length field, the SQL body, and the
+/// trailing NUL). The SQL body and the NUL are queued directly onto the send
+/// buffer by the caller, so a multi-kilobyte query never has to fit the bounded
+/// [`WriteBuf`] — the same header-in-scratch / body-on-send-buffer split the
+/// `CopyData` path uses. `Err` only if `4 + sql_len + 1` overflows `u32`.
+#[inline]
+pub(crate) fn build_simple_query_header(wb: &mut WriteBuf, sql_len: u32) -> Result<(), WriteBufFull> {
+    wb.push_u8(TAG_QUERY.byte())?;
+    // Self-inclusive length: 4 (the length field) + sql_len + 1 (the NUL).
+    let len = sql_len.checked_add(5).ok_or(WriteBufFull)?;
+    wb.push_u32_be(len)
+}
+
 /// `'P'` Parse frame: `tag | len | stmt_name NUL | sql NUL | n_param_types=0`.
 ///
 /// No parameter-type OIDs are declared (`n_param_types = 0`): the server infers

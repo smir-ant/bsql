@@ -91,6 +91,18 @@ pub enum DriverError {
     /// I/O failure (the cause is a deadline, not a broken pipe) and never as a
     /// silent stop (which would truncate the result).
     Timeout,
+    /// A synchronous single-poll driver drove an engine future that returned
+    /// `Poll::Pending` — the transport was not blocking, violating the
+    /// single-poll executor contract. Over a blocking socket this is
+    /// structurally impossible; it is classified rather than spun on, deadlocked
+    /// on, or unwrapped. The driver-level analog of the engine's
+    /// `SpuriousPending` marker.
+    SpuriousPending,
+    /// A server `DataRow`'s bytes did not match its declared column framing — a
+    /// per-column length running past the frame body, or a negative column
+    /// count. A well-formed server never sends this; it is rejected loudly
+    /// rather than decoded into silently mis-addressed cells.
+    RowDecodeFailed,
 }
 
 // Footprint pin: a sum type whose size is set by its widest variant,
@@ -117,6 +129,8 @@ impl fmt::Display for DriverError {
             Self::RowDescriptionMissing => write!(f, "row stream produced rows with no column description; result cannot be decoded"),
             Self::NotificationUnavailable => write!(f, "NOTIFY frame observed but its payload could not be resolved"),
             Self::Timeout => write!(f, "read timed out while awaiting a server reply mid-command"),
+            Self::SpuriousPending => write!(f, "single-poll executor: engine future returned Pending over a blocking transport"),
+            Self::RowDecodeFailed => write!(f, "server DataRow did not match its declared column framing"),
         }
     }
 }
@@ -138,7 +152,9 @@ impl std::error::Error for DriverError {
             | Self::TimeoutOverflow
             | Self::RowDescriptionMissing
             | Self::NotificationUnavailable
-            | Self::Timeout => None,
+            | Self::Timeout
+            | Self::SpuriousPending
+            | Self::RowDecodeFailed => None,
         }
     }
 }
