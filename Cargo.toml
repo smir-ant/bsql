@@ -338,10 +338,12 @@ webpki-roots = { version = "1.0", default-features = false }
 # the async crate's own `[dev-dependencies]`, NOT forced on consumers.
 tokio = { version = "1", default-features = false }
 
-# `tokio-rustls` — glues rustls onto tokio's async I/O for the encrypted
-# async transport. `ring` provider to match the `rustls` pin above
-# (no aws-lc-rs C toolchain dependency).
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# NOTE: `tokio-rustls` was removed when the async driver cut over to the
+# engine's sans-IO `core::tls::TlsTransport` (rustls::unbuffered, ring-explicit,
+# shared with the blocking driver). Both drivers now wrap their socket in that
+# one transport, so the tokio-rustls glue is dead. `rustls` (the pinned entry
+# above) stays — it is the crypto authority `core::tls` builds on for both
+# drivers.
 
 # `rusqlite` — safe Rust bindings to SQLite for the embedded backend.
 # The `bundled` feature compiles SQLite from source (via

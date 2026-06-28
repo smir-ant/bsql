@@ -1,512 +1,783 @@
-use bsql_postgres_core::{
-    ConnectConfig, DriverError, Notification, PreparedStatement,
-    PumpAction, QueryResult, Row, Session, SslMode,
-};
-use bsql_postgres_proto::FeedEvent;
+//! The tokio async PostgreSQL connection, driven through the sans-IO engine.
+//!
+//! A [`Connection`] owns an [`Engine`] over a [`Wire<TokioSocket>`] plus the
+//! linear liveness token the engine's verbs thread. Every public async method
+//! takes the token, drives one verb over the tokio transport with `.await` (the
+//! pump future suspends on a real `Pending` and is woken by tokio's reactor), and
+//! returns it on a clean boundary — so at-most-one-command-in-flight is a
+//! move-checked invariant.
+//!
+//! # Token lifecycle and recovery (the health bit)
+//!
+//! `self.live` is the health bit: `Some` = the connection is at a clean boundary
+//! and reusable, `None` = a verb failed fatally and the connection is dead. The
+//! engine's tier-1 error model decides the bit: a verb returns its linear `Live`
+//! token inside `Ok(Outcome { live, status })` whenever the connection is ALIVE
+//! — including on a *recoverable* server error (a query-level `ErrorResponse`),
+//! which the verb drains to a clean idle itself and reports as
+//! [`CommandStatus::ServerErrored`]. So [`settle`] ALWAYS restores `self.live`
+//! from an `Ok` outcome (no separate token reclaim), then maps a `ServerErrored`
+//! status to `Err(DriverError::Db)` while keeping the connection pooled. Only a
+//! FATAL `Err(EngineError)` (transport/protocol/EOF) leaves `self.live` `None`.
+//!
+//! [`settle`]: Connection::settle
+
+use core::ops::ControlFlow;
+use std::io;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 
-enum Stream {
-    Plain(TcpStream),
-    // Boxed: a rustls TLS stream is far larger than a bare TcpStream; boxing
-    // the rare TLS variant keeps `Stream` (and `Connection`) small. The deref
-    // is per-syscall, not per-row — negligible.
-    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+use bsql_postgres_core::materialize::{self, ResultCollector};
+use bsql_postgres_core::ssl::SslProbe;
+use bsql_postgres_core::tls::{self, TlsError, TlsTransport, Wire};
+use bsql_postgres_core::{
+    ConnectConfig, DriverError, Notification, QueryResult, Row, SslMode,
+};
+use bsql_postgres_proto::engine::{
+    self, CommandStatus, ConnFail, Engine, EngineError, Live, NoObserver, NotifyStatus, Outcome,
+    PreparedStatement as WireStatement, Surface,
+};
+use bsql_postgres_proto::params::ParamsWriter;
+use bsql_postgres_proto::{
+    Credentials, DatabaseName, Ident, Password, PreparedQuery, RowDecode, Sensitive, StmtName,
+};
+
+use crate::transport::{ReadDeadline, TokioSocket};
+
+/// The plaintext-or-TLS transport the engine is monomorphic over.
+type AsyncWire = Wire<TokioSocket>;
+/// The arm-uniform transport error: a plaintext socket error rides
+/// [`TlsError::Socket`]; the TLS arm's error already is this type.
+type WireError = TlsError<io::Error>;
+/// The owned, poolable engine handle (branded `'static`).
+type AsyncEngine = Engine<'static, AsyncWire, NoObserver>;
+
+/// A prepared statement handle.
+///
+/// Carries the engine's wire-level statement handle (statement name + recovered
+/// result OIDs) plus the column names captured at prepare time — the extended
+/// execute reply does not re-send them, so a prepared query's `QueryResult`
+/// draws its names from here. Move-only: [`close_statement`] consumes it by
+/// value, so a use after close is a compile error (E0382), not a runtime
+/// use-after-close.
+///
+/// [`close_statement`]: Connection::close_statement
+#[derive(Debug)]
+pub struct PreparedStatement {
+    inner: WireStatement,
+    column_names: Arc<[String]>,
 }
 
-impl Stream {
-    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        match self { Self::Plain(s) => s.write_all(buf).await, Self::Tls(s) => s.write_all(buf).await }
-    }
-    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        use tokio::io::AsyncReadExt;
-        match self { Self::Plain(s) => s.read(buf).await, Self::Tls(s) => s.read(buf).await }
-    }
-    async fn shutdown(&mut self) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        match self { Self::Plain(s) => s.shutdown().await, Self::Tls(s) => s.shutdown().await }
-    }
+/// Non-secret session facts captured at connect time.
+struct SessionParams {
+    server_version: Option<String>,
+    backend_pid: i32,
 }
 
-/// Async PostgreSQL connection — thin adapter over Session.
+/// A tokio async PostgreSQL connection over the sans-IO engine.
+///
+/// # Graceful close
+///
+/// Call [`close`](Self::close) to issue the PostgreSQL `Terminate` and shut the
+/// write side down. `Drop` cannot `.await`, so a dropped (un-`close`d) connection
+/// relies on the OS socket close (a FIN/RST the server reaps) rather than a
+/// graceful `Terminate` — the standard async-Rust limitation, since there is no
+/// async `Drop` on stable. Pooled connections are returned, not dropped, so the
+/// graceful path is the common one.
 pub struct Connection {
-    session: Session,
-    stream: Stream,
-    read_buf: Vec<u8>,
-    terminated: bool,
+    engine: AsyncEngine,
+    /// The liveness token, or `None` when the connection is dead. The health bit.
+    live: Option<Live<'static>>,
+    /// Shared with the [`TokioSocket`] the engine owns: the driver arms an
+    /// absolute read deadline here before [`recv_notification`](Self::recv_notification)
+    /// and disarms it after, so a notification wait times out from inside the read
+    /// (never by dropping the verb future, which would strand the linear token).
+    read_deadline: Arc<ReadDeadline>,
+    params: SessionParams,
+    stmt_counter: u32,
 }
 
 impl Connection {
+    /// Open a connection: TCP connect, optional TLS negotiation, then the
+    /// startup/auth handshake through the engine.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`DriverError`] for any pre-connect validation, transport,
+    /// TLS, or handshake failure — never a panic.
     pub async fn connect(config: &ConnectConfig) -> Result<Self, DriverError> {
         let addr = format!("{}:{}", config.host, config.port);
-        let timeout = std::time::Duration::from_secs(config.connect_timeout_secs);
+        let timeout = Duration::from_secs(config.connect_timeout_secs);
         let tcp = tokio::time::timeout(timeout, TcpStream::connect(&addr))
             .await
-            .map_err(|_| DriverError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut, "connection timed out",
-            )))??;
+            .map_err(|_| {
+                DriverError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "connection timed out",
+                ))
+            })??;
 
-        let mut stream = Self::negotiate_ssl(tcp, config).await?;
+        // The read-deadline cell shared with the socket the engine will own.
+        let read_deadline = Arc::new(ReadDeadline::new());
+        let wire = Self::build_wire(tcp, config, &read_deadline).await?;
 
-        let (startup_bytes, mut hs) = bsql_postgres_core::Handshake::begin(config)?;
-        stream.write_all(&startup_bytes).await?;
-
-        let mut buf = vec![0u8; 4096];
-        loop {
-            match hs.step() {
-                bsql_postgres_core::HandshakeAction::Send => {
-                    stream.write_all(hs.pending_bytes()).await?;
-                }
-                bsql_postgres_core::HandshakeAction::NeedRead => {
-                    let n = stream.read(&mut buf).await?;
-                    if n == 0 { return Err(DriverError::Io(std::io::Error::other("server closed"))); }
-                    hs.feed(&buf[..n])?;
-                }
-                bsql_postgres_core::HandshakeAction::Done => {
-                    let session = hs.finish()?;
-                    return Ok(Self { session, stream, read_buf: buf, terminated: false });
-                }
-                bsql_postgres_core::HandshakeAction::Error(e) => return Err(e),
+        let user = Ident::try_from_str(&config.user)
+            .map_err(|_| DriverError::Config("invalid user name"))?;
+        let database = match &config.database {
+            Some(d) => Some(
+                DatabaseName::try_from_str(d)
+                    .map_err(|_| DriverError::Config("invalid database name"))?,
+            ),
+            None => None,
+        };
+        let credentials = match config.password_str() {
+            Some(pw) => {
+                let password = Password::try_from_str(pw)
+                    .map_err(|_| DriverError::Config("invalid password"))?;
+                Credentials::ScramPassword(Sensitive::new(password))
             }
-        }
+            None => Credentials::Trust,
+        };
+
+        let (mut engine, live) =
+            engine::open_owned(wire, &user, database.as_ref(), None, credentials)
+                .map_err(lift_conn_fail)?;
+        let live = engine.connect(live).await.map_err(lift_engine_error)?;
+        let backend_pid = engine.backend_pid().map_err(|_| DriverError::NotReady)?;
+
+        let mut conn = Self {
+            engine,
+            live: Some(live),
+            read_deadline,
+            params: SessionParams {
+                server_version: None,
+                backend_pid,
+            },
+            stmt_counter: 0,
+        };
+        // The new engine drops the startup `ParameterStatus` frames (the connect
+        // pump surfaces them to nothing), so `server_version` is recovered with a
+        // one-round-trip `SHOW` rather than carried from the handshake.
+        conn.params.server_version = conn.fetch_server_version().await?;
+        Ok(conn)
     }
 
-    async fn negotiate_ssl(tcp: TcpStream, config: &ConnectConfig) -> Result<Stream, DriverError> {
+    /// Build the plaintext or TLS wire, performing the PG `SSLRequest`
+    /// negotiation on the raw socket when SSL is wanted.
+    async fn build_wire(
+        tcp: TcpStream,
+        config: &ConnectConfig,
+        deadline: &Arc<ReadDeadline>,
+    ) -> Result<AsyncWire, DriverError> {
         if config.ssl_mode == SslMode::Disable {
-            return Ok(Stream::Plain(tcp));
+            return Ok(Wire::Plain(TokioSocket::new(tcp, Arc::clone(deadline))));
         }
         let (ssl_bytes, ssl_proto) = bsql_postgres_core::ssl::ssl_request_bytes();
         let mut tcp = tcp;
-        { use tokio::io::AsyncWriteExt; tcp.write_all(ssl_bytes).await?; }
+        tcp.write_all(ssl_bytes).await?;
         let mut response = [0u8; 1];
-        { use tokio::io::AsyncReadExt; tcp.read_exact(&mut response).await?; }
-
+        tcp.read_exact(&mut response).await?;
         match bsql_postgres_core::ssl::classify_ssl_response(ssl_proto, response[0], config)? {
-            bsql_postgres_core::ssl::SslProbe::Accepted { tls_config, server_name } => {
-                let connector = tokio_rustls::TlsConnector::from(tls_config);
-                let tls_stream = connector.connect(server_name, tcp).await
-                    .map_err(|e| DriverError::Io(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused, format!("TLS: {e}"),
-                    )))?;
-                Ok(Stream::Tls(Box::new(tls_stream)))
+            SslProbe::Accepted { server_name } => {
+                // Use the provider-explicit ring config (the workspace pins
+                // rustls to ring only, so the bare `ClientConfig::builder()` has
+                // no default provider to resolve). The server name comes from the
+                // probe; the config from `shared_client_config`.
+                let cfg = tls::shared_client_config()
+                    .map_err(|e| DriverError::Io(io::Error::other(format!("TLS config: {e}"))))?;
+                let socket = TokioSocket::new(tcp, Arc::clone(deadline));
+                let tls = TlsTransport::connect(socket, cfg, server_name)
+                    .await
+                    .map_err(lift_tls_error)?;
+                Ok(Wire::Tls(Box::new(tls)))
             }
-            bsql_postgres_core::ssl::SslProbe::PlainTcp => Ok(Stream::Plain(tcp)),
+            SslProbe::PlainTcp => Ok(Wire::Plain(TokioSocket::new(tcp, Arc::clone(deadline)))),
         }
     }
 
-    // --- Pump adapter: 15-line async I/O loop ---
+    /// Take the liveness token, or classify a dead connection.
+    fn take_live(&mut self) -> Result<Live<'static>, DriverError> {
+        self.live.take().ok_or(DriverError::NotReady)
+    }
 
-    async fn pump(&mut self, mut rows: Option<&mut Vec<Row>>) -> Result<(), DriverError> {
-        loop {
-            match self.session.pump_step() {
-                PumpAction::Send => {
-                    let bytes = self.session.pending_bytes().to_vec();
-                    self.stream.write_all(&bytes).await?;
-                }
-                PumpAction::NeedRead => {
-                    let n = self.stream.read(&mut self.read_buf).await?;
-                    if n == 0 { return Err(DriverError::Io(std::io::Error::other("server closed"))); }
-                    self.session.feed(&self.read_buf[..n])?;
-                }
-                PumpAction::Done => return Ok(()),
-                PumpAction::Streaming => {
-                    match rows {
-                        Some(ref mut r) => self.collect_streaming(r).await?,
-                        None => {
-                            // Discard a streaming result we did not ask for.
-                            // `drain_streaming` is sans-IO; when it reports it
-                            // needs more bytes, read and feed them here. A clean
-                            // server close mid-drain is a stall, not a success.
-                            while !self.session.drain_streaming() {
-                                let n = self.stream.read(&mut self.read_buf).await?;
-                                if n == 0 { return Err(DriverError::StreamStalled); }
-                                self.session.feed(&self.read_buf[..n])?;
-                            }
+    /// Classify a command verb's [`Outcome`] and manage the token.
+    ///
+    /// An `Ok` outcome ALWAYS restores the token — the connection is alive
+    /// whether the command completed or recovered from a server error (the verb
+    /// already drained the recovering `ReadyForQuery`). A
+    /// [`CommandStatus::ServerErrored`] then surfaces the parsed [`DbError`] the
+    /// collector captured from the raw `ErrorResponse`, while the connection
+    /// stays pooled. A fatal `Err` (transport/protocol/EOF) leaves the token gone
+    /// (`self.live == None`), so [`is_healthy`](Self::is_healthy) reports the
+    /// connection dead — no separate token-reclaim step exists.
+    ///
+    /// [`DbError`]: bsql_postgres_core::DbError
+    fn settle(
+        &mut self,
+        outcome: Result<Outcome<'static, CommandStatus>, EngineError<WireError>>,
+        collector: &mut ResultCollector,
+    ) -> Result<(), DriverError> {
+        match outcome {
+            Ok(Outcome { live, status }) => {
+                // The connection is alive on either status — restore the token.
+                self.live = Some(live);
+                match status {
+                    CommandStatus::Completed => Ok(()),
+                    CommandStatus::ServerErrored => {
+                        // The pump surfaced the raw `ErrorResponse` to the sink
+                        // before the failure boundary, so the collector holds the
+                        // parsed cause; the connection stays pooled.
+                        match collector.take_db_error() {
+                            Some(db) => Err(DriverError::Db(db)),
+                            None => Err(DriverError::UnclassifiedFailure),
                         }
                     }
-                }
-                PumpAction::Error(e) => {
-                    // Try to drain trailing RFQ so the connection recovers. The
-                    // drain outcome is observed on the next loop's is_healthy()
-                    // check; an unrecovered connection stays unhealthy and the
-                    // pool evicts it. The original error is returned regardless.
-                    for _ in 0..5 {
-                        if self.session.is_healthy() { break; }
-                        if let Ok(n) = self.stream.read(&mut self.read_buf).await
-                            && n > 0
-                            && self.session.feed(&self.read_buf[..n]).is_err()
-                        {
-                            break;
-                        }
-                        let _reached_ready = self.session.drain_to_idle();
-                    }
-                    return Err(e);
                 }
             }
+            // Fatal: the verb consumed the token and the connection is dead.
+            // `self.live` was taken before the verb and is not restored.
+            Err(other) => Err(lift_engine_error(other)),
         }
     }
 
-    async fn collect_streaming(&mut self, rows: &mut Vec<Row>) -> Result<(), DriverError> {
-        // Pre-buffer remaining response bytes before entering iter_rows.
-        //
-        // NOTE: the byte-window scan for the ReadyForQuery marker is a
-        // best-effort read-ahead heuristic, not a frame-aware boundary; the
-        // sound terminator is the protocol's `EndQuery` event consumed below.
-        // Read errors are propagated rather than silently stopping the buffer,
-        // and a prebuffer that ends short surfaces as a classified stall in the
-        // iter_rows loop instead of a silent truncation or an endless spin.
-        let mut prebuf = Vec::new();
-        let probe = std::time::Duration::from_millis(10);
-        match tokio::time::timeout(probe, self.stream.read(&mut self.read_buf)).await {
-            Ok(Ok(0)) => return Err(DriverError::Io(std::io::Error::other("server closed mid-stream"))),
-            Ok(Ok(n)) => {
-                prebuf.extend_from_slice(&self.read_buf[..n]);
-                let mut scan_from = 0usize;
-                loop {
-                    let tail = match prebuf.get(scan_from..) {
-                        Some(t) => t,
-                        // scan_from is derived from prebuf.len(), so this slice
-                        // is always in range; treat the impossible None as "no
-                        // marker yet" and keep reading rather than dropping data.
-                        None => &[],
-                    };
-                    if tail.windows(5).any(|w| w[0] == b'Z' && w[1..5] == [0, 0, 0, 5]) {
-                        break;
-                    }
-                    scan_from = prebuf.len().saturating_sub(4);
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        self.stream.read(&mut self.read_buf),
-                    ).await {
-                        // Clean EOF mid-stream: stop reading ahead. Any
-                        // unsatisfied NeedMore below becomes a classified stall.
-                        Ok(Ok(0)) => break,
-                        Ok(Ok(n)) => prebuf.extend_from_slice(&self.read_buf[..n]),
-                        // A hard read error must not be swallowed.
-                        Ok(Err(e)) => return Err(DriverError::Io(e)),
-                        // Read-ahead timeout: stop buffering; remaining bytes (if
-                        // any) are required below and a stall is reported there.
-                        Err(_) => break,
-                    }
-                }
-            }
-            // Initial-probe read error is a real failure, not "no data".
-            Ok(Err(e)) => return Err(DriverError::Io(e)),
-            // Initial-probe timeout: no bytes ready yet; the iter_rows loop will
-            // classify any unsatisfied NeedMore as a stall.
-            Err(_) => {}
-        }
-
-        let mut pos = 0usize;
-        let feed_cap = self.session.feed_capacity();
-        let prebuf_slice = prebuf.as_slice();
-        let collected: Result<(), DriverError> = self.session.iter_rows(|rs| {
-            // The column schema sizes the arena and identifies each cell. If it
-            // is absent, every row would silently decode as 0 columns (all
-            // get_* return None). Fail loud rather than return hollow rows.
-            let n_cols = match rs.current_row_desc() {
-                Some(d) => d.len(),
-                None => return Err(DriverError::RowDescriptionMissing),
-            };
-            let mut ab = bsql_postgres_core::ArenaBuilder::new(n_cols);
-            let mut in_chunk = false;
-            loop {
-                match rs.col_next() {
-                    bsql_postgres_proto::ColEvent::Got { bytes, .. } => {
-                        ab.push_value(bytes);
-                    }
-                    bsql_postgres_proto::ColEvent::Null { .. } => {
-                        ab.push_null();
-                    }
-                    bsql_postgres_proto::ColEvent::EndRow => {
-                        in_chunk = false;
-                        ab.end_row();
-                    }
-                    bsql_postgres_proto::ColEvent::EndQuery { .. } => {
-                        *rows = ab.finish()?;
-                        return Ok(());
-                    }
-                    bsql_postgres_proto::ColEvent::NeedMore => {
-                        // Feed the next prebuffered slice. If the prebuffer is
-                        // exhausted (or the protocol rejects the feed), no more
-                        // bytes can be supplied here — fail loud instead of
-                        // spinning forever or returning truncated rows.
-                        if pos >= prebuf_slice.len() {
-                            return Err(DriverError::StreamStalled);
-                        }
-                        let end = (pos + feed_cap).min(prebuf_slice.len());
-                        if rs.feed(&prebuf_slice[pos..end]).is_err() {
-                            return Err(DriverError::StreamStalled);
-                        }
-                        pos = end;
-                    }
-                    bsql_postgres_proto::ColEvent::Chunk { bytes, .. } => {
-                        if in_chunk { ab.extend_last(bytes); } else { ab.push_value(bytes); in_chunk = true; }
-                    }
-                    bsql_postgres_proto::ColEvent::ChunkEnd { bytes, .. } => {
-                        ab.extend_last(bytes);
-                        in_chunk = false;
-                    }
-                    // Forward-compat guard: `ColEvent` is `#[non_exhaustive]`.
-                    // An event this driver does not recognise cannot be decoded
-                    // into a row safely, so fail loud instead of silently
-                    // dropping it (which would truncate the result).
-                    _ => return Err(DriverError::StreamStalled),
-                }
-            }
-        });
-        collected
+    /// Generate a fresh, unique prepared-statement name.
+    fn next_stmt_name(&mut self) -> Result<StmtName, DriverError> {
+        let id = self.stmt_counter;
+        self.stmt_counter = self.stmt_counter.wrapping_add(1);
+        StmtName::try_from_str(&format!("_bsql_{id}"))
+            .map_err(|_| DriverError::Config("generated statement name invalid"))
     }
 
-    // --- Public API (thin wrappers over Session + pump) ---
-
-    pub async fn ping(&mut self) -> Result<(), DriverError> {
-        self.session.push_ping()?;
-        self.stream.write_all(self.session.pending_bytes()).await?;
-        self.pump(None).await
+    /// Recover the server version with a one-round-trip `SHOW server_version`.
+    async fn fetch_server_version(&mut self) -> Result<Option<String>, DriverError> {
+        let result = self.query("SHOW server_version").await?;
+        Ok(match result.rows.first() {
+            Some(row) => row.get_str(0).map(String::from),
+            None => None,
+        })
     }
 
-    pub async fn simple_query(&mut self, sql: &str) -> Result<String, DriverError> {
-        self.session.push_simple_query(sql)?;
-        self.stream.write_all(self.session.pending_bytes()).await?;
-        self.pump(None).await?;
-        Ok(self.session.extract_command_tag())
-    }
-
-    pub async fn execute(&mut self, sql: &str) -> Result<u64, DriverError> {
-        self.session.push_simple_query(sql)?;
-        self.stream.write_all(self.session.pending_bytes()).await?;
-        self.pump(None).await?;
-        Ok(self.session.affected_rows_or_zero())
-    }
-
-    pub async fn execute_params<P: bsql_postgres_proto::params::ParamsWriter>(
-        &mut self, sql: &str, params: &P,
-    ) -> Result<u64, DriverError> {
-        let stmt = self.prepare(sql).await?;
-        let result = self.execute_prepared(&stmt, params).await;
-        // Always attempt the CLOSE, but never drop its Result: if the primary op
-        // succeeded yet CLOSE failed, the connection is suspect — surface that.
-        let close = self.close_statement(stmt).await;
-        let count = result?;
-        close?;
-        Ok(count)
-    }
-
-    pub async fn query(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
-        self.session.push_simple_query(sql)?;
-        self.stream.write_all(self.session.pending_bytes()).await?;
-        let mut rows = Vec::new();
-        self.pump(Some(&mut rows)).await?;
-        Ok(self.session.build_query_result(rows))
-    }
-
-    pub async fn query_one(&mut self, sql: &str) -> Result<Row, DriverError> {
-        let r = self.query(sql).await?;
-        r.rows.into_iter().next().ok_or(DriverError::NoRows)
-    }
-
-    pub async fn query_opt(&mut self, sql: &str) -> Result<Option<Row>, DriverError> {
-        let r = self.query(sql).await?;
-        Ok(r.rows.into_iter().next())
-    }
-
-    pub async fn prepare(&mut self, sql: &str) -> Result<PreparedStatement, DriverError> {
-        let (_, stmt_name) = self.session.push_prepare(sql)?;
-        self.stream.write_all(self.session.pending_bytes()).await?;
-        self.pump(None).await?;
-
-        self.session.push_describe_statement(stmt_name)?;
-        self.stream.write_all(self.session.pending_bytes()).await?;
-        self.pump(None).await?;
-
-        Ok(self.session.finish_prepare(stmt_name))
-    }
-
-    pub async fn query_prepared<P: bsql_postgres_proto::params::ParamsWriter>(
-        &mut self, stmt: &PreparedStatement, params: &P,
+    /// Build a [`QueryResult`] from a finished collector, optionally overriding
+    /// the column names (the prepared path supplies the names captured at
+    /// prepare time, since the execute reply re-sends none).
+    fn build_query_result(
+        collector: ResultCollector,
+        names_override: Option<Arc<[String]>>,
     ) -> Result<QueryResult, DriverError> {
-        self.session.push_bind_execute(stmt, params)?;
-        self.stream.write_all(self.session.pending_bytes()).await?;
-        let mut rows = Vec::new();
-        self.pump(Some(&mut rows)).await?;
-        Ok(self.session.build_query_result_from_stmt(rows, stmt))
+        let collected = collector.finish()?;
+        // An empty result set has 0 columns by definition; a non-empty one
+        // exposes its width via row 0.
+        let column_count = match collected.rows.first() {
+            Some(row) => row.len(),
+            None => 0,
+        };
+        let column_names = match names_override {
+            Some(names) => names,
+            None => Arc::from(collected.column_names.into_boxed_slice()),
+        };
+        Ok(QueryResult {
+            rows: collected.rows,
+            command_tag: collected.command_tag,
+            column_count,
+            column_names,
+        })
     }
 
-    pub async fn execute_prepared<P: bsql_postgres_proto::params::ParamsWriter>(
-        &mut self, stmt: &PreparedStatement, params: &P,
+    // ── Public API ────────────────────────────────────────────────────────
+
+    /// Round-trip a `Sync` to confirm the connection is live.
+    pub async fn ping(&mut self) -> Result<(), DriverError> {
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .ping(live, |s| {
+                collector.feed(s);
+                ControlFlow::Continue(())
+            })
+            .await;
+        self.settle(outcome, &mut collector)
+    }
+
+    /// Issue a simple query, returning the command tag string.
+    pub async fn simple_query(&mut self, sql: &str) -> Result<String, DriverError> {
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .simple_query(live, sql, |s| {
+                collector.feed(s);
+                ControlFlow::Continue(())
+            })
+            .await;
+        self.settle(outcome, &mut collector)?;
+        Ok(collector.command_tag().to_string())
+    }
+
+    /// Execute a non-row command, returning the affected-row count.
+    pub async fn execute(&mut self, sql: &str) -> Result<u64, DriverError> {
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .execute(live, sql, |s| {
+                collector.feed(s);
+                ControlFlow::Continue(())
+            })
+            .await;
+        self.settle(outcome, &mut collector)?;
+        Ok(collector.affected())
+    }
+
+    /// Run a row-returning query (text result columns).
+    pub async fn query(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .query(live, sql, |s| {
+                collector.feed(s);
+                ControlFlow::Continue(())
+            })
+            .await;
+        self.settle(outcome, &mut collector)?;
+        Self::build_query_result(collector, None)
+    }
+
+    /// Run a query returning the first row, or [`DriverError::NoRows`].
+    pub async fn query_one(&mut self, sql: &str) -> Result<Row, DriverError> {
+        self.query(sql)
+            .await?
+            .rows
+            .into_iter()
+            .next()
+            .ok_or(DriverError::NoRows)
+    }
+
+    /// Run a query returning the first row if any.
+    pub async fn query_opt(&mut self, sql: &str) -> Result<Option<Row>, DriverError> {
+        Ok(self.query(sql).await?.rows.into_iter().next())
+    }
+
+    /// Prepare a statement: `Parse` + `Describe` + `Sync`, recovering the result
+    /// schema for later `Bind`+`Execute`.
+    pub async fn prepare(&mut self, sql: &str) -> Result<PreparedStatement, DriverError> {
+        let stmt_name = self.next_stmt_name()?;
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .prepare(live, &stmt_name, sql, |s| {
+                collector.feed(s);
+                ControlFlow::Continue(())
+            })
+            .await;
+        self.settle(outcome, &mut collector)?;
+        let result_oids = collector.oids().to_vec();
+        let column_names: Arc<[String]> =
+            Arc::from(collector.column_names().to_vec().into_boxed_slice());
+        Ok(PreparedStatement {
+            inner: WireStatement::new(stmt_name, result_oids),
+            column_names,
+        })
+    }
+
+    /// Execute a prepared statement returning rows.
+    ///
+    /// The `Copy` bound is vacuous: every `ParamsWriter` is a tuple of `Copy`
+    /// scalars / `&str` / slices, so this excludes no caller; it lets the
+    /// borrowed params be passed to the engine by value with no clone.
+    pub async fn query_prepared<P: ParamsWriter + Copy>(
+        &mut self,
+        stmt: &PreparedStatement,
+        params: &P,
+    ) -> Result<QueryResult, DriverError> {
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .query_prepared(live, &stmt.inner, *params, |s| {
+                collector.feed(s);
+                ControlFlow::Continue(())
+            })
+            .await;
+        self.settle(outcome, &mut collector)?;
+        Self::build_query_result(collector, Some(stmt.column_names.clone()))
+    }
+
+    /// Execute a prepared statement for its side effect, returning the affected
+    /// count. See [`query_prepared`](Self::query_prepared) on the `Copy` bound.
+    pub async fn execute_prepared<P: ParamsWriter + Copy>(
+        &mut self,
+        stmt: &PreparedStatement,
+        params: &P,
     ) -> Result<u64, DriverError> {
-        self.session.push_bind_execute(stmt, params)?;
-        self.stream.write_all(self.session.pending_bytes()).await?;
-        self.pump(None).await?;
-        Ok(self.session.affected_rows_or_zero())
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .execute_prepared(live, &stmt.inner, *params, |s| {
+                collector.feed(s);
+                ControlFlow::Continue(())
+            })
+            .await;
+        self.settle(outcome, &mut collector)?;
+        Ok(collector.affected())
     }
 
-    pub async fn query_params<P: bsql_postgres_proto::params::ParamsWriter>(
-        &mut self, sql: &str, params: &P,
+    /// Execute a `prepared!` macro query in one Parse+Bind+Execute+Sync round
+    /// trip (binary-uniform params and results), returning the affected count.
+    pub async fn execute_prepared_macro<P, R>(
+        &mut self,
+        q: &'static PreparedQuery<P, R>,
+        params: P,
+    ) -> Result<u64, DriverError>
+    where
+        P: ParamsWriter + 'static,
+        R: RowDecode + 'static,
+    {
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .query_params(live, q, params, |s| {
+                collector.feed(s);
+                ControlFlow::Continue(())
+            })
+            .await;
+        self.settle(outcome, &mut collector)?;
+        Ok(collector.affected())
+    }
+
+    /// Prepare, query, and close a runtime SQL statement with params.
+    pub async fn query_params<P: ParamsWriter + Copy>(
+        &mut self,
+        sql: &str,
+        params: &P,
     ) -> Result<QueryResult, DriverError> {
         let stmt = self.prepare(sql).await?;
         let result = self.query_prepared(&stmt, params).await;
         // Always attempt the CLOSE so the statement is released. The primary op
-        // error dominates by design: if `result` is Err, `result?` returns it
-        // and the CLOSE Result is dropped. A CLOSE failure surfaces only when
-        // the primary op SUCCEEDED, so it is never lost behind a real failure.
+        // error dominates: if `result` is Err, `result?` returns it and the CLOSE
+        // Result is dropped; a CLOSE failure surfaces only when the primary op
+        // SUCCEEDED.
         let close = self.close_statement(stmt).await;
         let result = result?;
         close?;
         Ok(result)
     }
 
-    pub async fn query_params_one<P: bsql_postgres_proto::params::ParamsWriter>(
-        &mut self, sql: &str, params: &P,
+    /// Like [`query_params`](Self::query_params), returning the first row.
+    pub async fn query_params_one<P: ParamsWriter + Copy>(
+        &mut self,
+        sql: &str,
+        params: &P,
     ) -> Result<Row, DriverError> {
-        let r = self.query_params(sql, params).await?;
-        r.rows.into_iter().next().ok_or(DriverError::NoRows)
+        self.query_params(sql, params)
+            .await?
+            .rows
+            .into_iter()
+            .next()
+            .ok_or(DriverError::NoRows)
     }
 
-    pub async fn query_params_opt<P: bsql_postgres_proto::params::ParamsWriter>(
-        &mut self, sql: &str, params: &P,
+    /// Like [`query_params`](Self::query_params), returning the first row if any.
+    pub async fn query_params_opt<P: ParamsWriter + Copy>(
+        &mut self,
+        sql: &str,
+        params: &P,
     ) -> Result<Option<Row>, DriverError> {
-        let r = self.query_params(sql, params).await?;
-        Ok(r.rows.into_iter().next())
+        Ok(self.query_params(sql, params).await?.rows.into_iter().next())
     }
 
+    /// Prepare, execute, and close a runtime SQL statement with params.
+    pub async fn execute_params<P: ParamsWriter + Copy>(
+        &mut self,
+        sql: &str,
+        params: &P,
+    ) -> Result<u64, DriverError> {
+        let stmt = self.prepare(sql).await?;
+        let result = self.execute_prepared(&stmt, params).await;
+        let close = self.close_statement(stmt).await;
+        let count = result?;
+        close?;
+        Ok(count)
+    }
+
+    /// Close a prepared statement, consuming it (use-after-close is a move
+    /// error).
     pub async fn close_statement(&mut self, stmt: PreparedStatement) -> Result<(), DriverError> {
-        self.session.push_close_statement(stmt)?;
-        self.stream.write_all(self.session.pending_bytes()).await?;
-        self.pump(None).await
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .close_statement(live, stmt.inner, |s| {
+                collector.feed(s);
+                ControlFlow::Continue(())
+            })
+            .await;
+        self.settle(outcome, &mut collector)
     }
 
-    pub async fn begin(&mut self) -> Result<(), DriverError> { self.simple_query("BEGIN").await?; Ok(()) }
-    pub async fn commit(&mut self) -> Result<(), DriverError> { self.simple_query("COMMIT").await?; Ok(()) }
-    pub async fn rollback(&mut self) -> Result<(), DriverError> { self.simple_query("ROLLBACK").await?; Ok(()) }
-
-    // Async transactions: use begin()/commit()/rollback().
-    // A closure-based transaction() (like the sync driver's) needs an async
-    // closure borrowing &mut self, which on stable Rust requires Box<dyn Future>.
-    // Note: async closures with borrowed &mut self don't work in stable Rust
-    // without Box<dyn Future>. Use begin()/commit()/rollback() for async
-    // transactions. The sync driver has a proper closure-based transaction()
-    // because sync closures don't have this limitation.
-
-    pub async fn listen(&mut self, channel: &str) -> Result<(), DriverError> {
-        self.simple_query(&format!("LISTEN {channel}")).await?; Ok(())
+    /// `BEGIN` a transaction.
+    pub async fn begin(&mut self) -> Result<(), DriverError> {
+        self.simple_query("BEGIN").await?;
+        Ok(())
     }
 
-    pub async fn unlisten(&mut self, channel: &str) -> Result<(), DriverError> {
-        self.simple_query(&format!("UNLISTEN {channel}")).await?; Ok(())
+    /// `COMMIT` the current transaction.
+    pub async fn commit(&mut self) -> Result<(), DriverError> {
+        self.simple_query("COMMIT").await?;
+        Ok(())
     }
 
-    pub async fn recv_notification(
-        &mut self, timeout: std::time::Duration,
-    ) -> Result<Option<Notification>, DriverError> {
-        // A near-MAX timeout would overflow `Instant + Duration` and panic;
-        // classify it instead of crashing the task.
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or(DriverError::TimeoutOverflow)?;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() { return Ok(None); }
-            match tokio::time::timeout(remaining, self.stream.read(&mut self.read_buf)).await {
-                Ok(Ok(0)) => return Err(DriverError::Io(std::io::Error::other("server closed"))),
-                Ok(Ok(n)) => {
-                    self.session.feed(&self.read_buf[..n])?;
-                    let event = self.session.proto.advance_one_frame(&mut self.session.wb);
-                    if let FeedEvent::Notify { notif_ref, pid } = event {
-                        // The frame announced a notification; its payload must
-                        // resolve. An unresolvable ref means the event would be
-                        // lost silently — fail loud instead of dropping it.
-                        let payload = self.session.proto.get_notification(notif_ref)
-                            .map_err(|_| DriverError::NotificationUnavailable)?;
-                        // A non-UTF-8 NOTIFY payload is surfaced as a
-                        // classified error rather than silently rewritten
-                        // with Unicode replacement characters.
-                        let payload_text = core::str::from_utf8(&payload.payload)
-                            .map_err(|_| DriverError::NonUtf8Payload)?;
-                        return Ok(Some(Notification {
-                            channel: payload.channel.as_str().to_string(),
-                            payload: payload_text.to_string(),
-                            pid,
-                        }));
-                    }
-                }
-                Ok(Err(e)) => return Err(DriverError::Io(e)),
-                Err(_) => return Ok(None),
+    /// `ROLLBACK` the current transaction.
+    pub async fn rollback(&mut self) -> Result<(), DriverError> {
+        self.simple_query("ROLLBACK").await?;
+        Ok(())
+    }
+
+    /// Run `f` inside a transaction: `COMMIT` on `Ok`, best-effort `ROLLBACK` on
+    /// `Err`, KEEPING the connection on a recoverable error.
+    ///
+    /// `f` is an async closure borrowing `&mut Self`, so the body can run any
+    /// sequence of the connection's async verbs and the transaction holds no
+    /// object to leak — the boundary is the call scope. On a body error the
+    /// caller's error dominates and a best-effort `ROLLBACK` is issued; its
+    /// outcome is already encoded in the liveness token, so a *recoverable* body
+    /// error (the connection survives) is rolled back and the connection stays
+    /// reusable, while a fatal one leaves it dead (which
+    /// [`is_healthy`](Self::is_healthy) reports so a pool evicts it).
+    ///
+    /// There is no `Drop`-based async transaction guard: `Drop` cannot `.await`,
+    /// so a guard could not issue an async `ROLLBACK`. The async closure form is
+    /// the cancellation-correct shape — if the returned future is dropped
+    /// mid-body, no `COMMIT` runs and the server rolls the transaction back when
+    /// the socket later closes.
+    pub async fn transaction<R, F>(&mut self, f: F) -> Result<R, DriverError>
+    where
+        F: AsyncFnOnce(&mut Self) -> Result<R, DriverError>,
+    {
+        self.simple_query("BEGIN").await?;
+        match f(self).await {
+            Ok(value) => {
+                self.simple_query("COMMIT").await?;
+                Ok(value)
+            }
+            Err(e) => {
+                // Best-effort rollback; the outcome rides the liveness token, so
+                // it is explicitly discarded. The caller's error `e` dominates.
+                drop(self.simple_query("ROLLBACK").await);
+                Err(e)
             }
         }
     }
 
-    pub async fn copy_in(
-        &mut self, table: &str,
-        rows_data: impl IntoIterator<Item = impl AsRef<str>>,
-    ) -> Result<u64, DriverError> {
-        self.session.push_simple_query(&format!("COPY {table} FROM STDIN"))?;
-        self.stream.write_all(self.session.pending_bytes()).await?;
-
-        // Read CopyInResponse
-        let n = self.stream.read(&mut self.read_buf).await?;
-        if n == 0 { return Err(DriverError::Io(std::io::Error::other("server closed"))); }
-        self.session.feed(&self.read_buf[..n])?;
-        let actions = self.session.proto.feed_bytes(&[], &mut self.session.wb);
-        let had_fail = actions.as_slice().iter()
-            .any(|a| matches!(a, bsql_postgres_proto::Action::FailReply { .. }));
-        if had_fail {
-            let err = match self.session.proto.fail_cause() {
-                Some(&c) => self.session.classify_error(c),
-                // A failure occurred but no classified cause was parked; report
-                // that precisely rather than mislabelling it as "not ready".
-                None => DriverError::UnclassifiedFailure,
-            };
-            let _reached_ready = self.session.drain_to_idle();
-            return Err(err);
-        }
-
-        for row in rows_data {
-            let line = row.as_ref();
-            let mut data = line.as_bytes().to_vec();
-            data.push(b'\n');
-            let bytes = self.session.proto.push_copy_data(&data, &mut self.session.wb)
-                .map_err(|e| DriverError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput, format!("{e}"),
-                )))?;
-            self.stream.write_all(bytes).await?;
-            self.session.wb.clear();
-        }
-
-        let done_bytes = self.session.proto.push_copy_done(&mut self.session.wb)
-            .map_err(|e| DriverError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput, format!("{e}"),
-            )))?;
-        self.stream.write_all(done_bytes).await?;
-        self.session.wb.clear();
-
-        self.pump(None).await?;
-        Ok(self.session.affected_rows_or_zero())
+    /// Subscribe to a `LISTEN` channel (the name is validated as an identifier,
+    /// so it cannot inject SQL).
+    pub async fn listen(&mut self, channel: &str) -> Result<(), DriverError> {
+        let channel = Ident::try_from_str(channel)
+            .map_err(|_| DriverError::Config("invalid channel name"))?;
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .listen(live, &channel, |s| {
+                collector.feed(s);
+                ControlFlow::Continue(())
+            })
+            .await;
+        self.settle(outcome, &mut collector)
     }
 
-    pub fn is_healthy(&self) -> bool { self.session.is_healthy() }
-    pub fn server_version(&self) -> Option<&str> { self.session.server_version() }
-    pub fn backend_pid(&self) -> i32 { self.session.backend_pid() }
-
-    pub async fn close(&mut self) -> Result<(), DriverError> {
-        if self.terminated { return Ok(()); }
-        self.terminated = true;
-        self.stream.write_all(&[b'X', 0, 0, 0, 4]).await?;
-        self.stream.shutdown().await?;
+    /// Unsubscribe from a `LISTEN` channel (validated, no injection).
+    pub async fn unlisten(&mut self, channel: &str) -> Result<(), DriverError> {
+        let channel = Ident::try_from_str(channel)
+            .map_err(|_| DriverError::Config("invalid channel name"))?;
+        self.simple_query(&format!("UNLISTEN {}", channel.as_str()))
+            .await?;
         Ok(())
+    }
+
+    /// Wait up to `timeout` for the next asynchronous notification.
+    ///
+    /// Returns `Ok(None)` if the deadline passes with no notification (the
+    /// connection stays alive). The wait is bounded by arming an absolute read
+    /// deadline on the socket the engine owns (shared via [`read_deadline`]); a
+    /// deadline elapsed mid-read surfaces inside the engine (via
+    /// [`Transport::is_would_block`]) as the [`NotifyStatus::Quiet`] outcome — the
+    /// token rides back in `Ok`, so the connection stays alive with no separate
+    /// reclaim. The deadline lives in the read, NOT in a `timeout` wrapping this
+    /// future, so a timed-out wait never drops the verb future and strands the
+    /// linear token.
+    ///
+    /// [`read_deadline`]: Connection::read_deadline
+    /// [`Transport::is_would_block`]: bsql_postgres_proto::engine::Transport::is_would_block
+    pub async fn recv_notification(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<Notification>, DriverError> {
+        // Validate the fallible input (a near-MAX timeout would overflow
+        // `Instant + Duration`) BEFORE taking the token — like every other verb,
+        // so a `TimeoutOverflow` returns Err with the connection still alive
+        // (the token stays in `self.live`), never falsely marking it dead.
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(DriverError::TimeoutOverflow)?;
+        let live = self.take_live()?;
+        self.read_deadline.arm(deadline);
+        let mut captured: Option<Result<Notification, DriverError>> = None;
+        let outcome = self
+            .engine
+            .recv_notification(live, |s| {
+                if let Surface::Notify(body) = s {
+                    captured = Some(materialize::parse_notification(body));
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            })
+            .await;
+        // Disarm before classifying, so a later verb's reads are deadline-free.
+        self.read_deadline.disarm();
+        match outcome {
+            Ok(Outcome { live, status }) => {
+                // Alive on either status — the would-block deadline is the Quiet
+                // outcome, handled inside the engine, so the token rides back.
+                self.live = Some(live);
+                match status {
+                    NotifyStatus::Received => match captured {
+                        Some(Ok(notification)) => Ok(Some(notification)),
+                        Some(Err(e)) => Err(e),
+                        // `Received` means the sink broke on a `Notify`, so the
+                        // capture is set; an empty capture is a classified
+                        // inconsistency, never a silent `None`.
+                        None => Err(DriverError::UnclassifiedFailure),
+                    },
+                    NotifyStatus::Quiet => Ok(None),
+                }
+            }
+            Err(other) => Err(lift_engine_error(other)),
+        }
+    }
+
+    /// `COPY <table> FROM STDIN`, streaming each row as a `CopyData` chunk.
+    pub async fn copy_in(
+        &mut self,
+        table: &str,
+        rows_data: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<u64, DriverError> {
+        let sql = format!("COPY {table} FROM STDIN");
+        // Materialise each row + a trailing newline into an owned store the data
+        // closure yields slices from: the engine's `data` callback borrows for
+        // one fixed lifetime, so the rows must outlive the call. One allocation
+        // per row; the engine flushes each chunk, so the send buffer stays
+        // bounded.
+        let store: Vec<Vec<u8>> = rows_data
+            .into_iter()
+            .map(|row| {
+                let mut bytes = row.as_ref().as_bytes().to_vec();
+                bytes.push(b'\n');
+                bytes
+            })
+            .collect();
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let mut rows = store.iter();
+        let outcome = self
+            .engine
+            .copy_in(
+                live,
+                &sql,
+                || rows.next().map(Vec::as_slice),
+                |s| {
+                    collector.feed(s);
+                    ControlFlow::Continue(())
+                },
+            )
+            .await;
+        self.settle(outcome, &mut collector)?;
+        Ok(collector.affected())
+    }
+
+    /// Whether the connection is at a clean boundary and reusable.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// The server version reported at connect, if recovered.
+    #[must_use]
+    pub fn server_version(&self) -> Option<&str> {
+        self.params.server_version.as_deref()
+    }
+
+    /// The backend process id from `BackendKeyData`.
+    #[must_use]
+    pub fn backend_pid(&self) -> i32 {
+        self.params.backend_pid
+    }
+
+    /// Gracefully close the connection (`Terminate` + shutdown). Idempotent.
+    pub async fn close(&mut self) -> Result<(), DriverError> {
+        match self.live.take() {
+            Some(live) => self.engine.terminate(live).await.map_err(lift_engine_error),
+            None => Ok(()),
+        }
     }
 }
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        if self.terminated { return; }
-        // Best-effort Terminate via non-blocking try_write.
-        // Can't .await in Drop — this is the sync fallback.
-        let terminate = [b'X', 0, 0, 0, 4];
-        match &self.stream {
-            Stream::Plain(tcp) => { let _ = tcp.try_write(&terminate); }
-            Stream::Tls(_) => {} // TLS needs async — skip, OS RST will clean up
+/// Lift a FATAL [`EngineError`] over the wire transport to a classified
+/// [`DriverError`]. A recoverable server error never reaches here — the verb
+/// returns it as [`CommandStatus::ServerErrored`] inside `Ok`, which
+/// [`settle`](Connection::settle) maps to `DriverError::Db` — so the
+/// `ServerError` arm is the fatal drain-during-recovery case alone.
+fn lift_engine_error(e: EngineError<WireError>) -> DriverError {
+    match e {
+        EngineError::Transport(t) => lift_tls_error(t),
+        EngineError::Handshake(cf) => lift_conn_fail(cf),
+        EngineError::WrongPhase(_) => DriverError::NotReady,
+        EngineError::UnexpectedEof => {
+            DriverError::Io(io::Error::other("server closed the connection"))
         }
+        EngineError::ServerError => DriverError::UnclassifiedFailure,
+        EngineError::ProtocolViolation => {
+            DriverError::Io(io::Error::other("protocol violation; connection torn down"))
+        }
+        // `EngineError` is `#[non_exhaustive]`; the remaining framing/flush
+        // faults (WriteZero / SendOverrun / IngestFull / IngestCommitOverflow /
+        // UnexpectedSuspend / RowCount / FrameTooLong / SpuriousPending) surface
+        // as classified I/O carrying the engine's own detail.
+        other => DriverError::Io(io::Error::other(format!("engine error: {other:?}"))),
+    }
+}
+
+/// Lift a wire transport error to a [`DriverError`].
+fn lift_tls_error(e: WireError) -> DriverError {
+    match e {
+        TlsError::Socket(io) => match io.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => DriverError::Timeout,
+            _ => DriverError::Io(io),
+        },
+        // Preserve the TLS error verbatim as the source of a classified I/O error.
+        other => DriverError::Io(io::Error::other(other)),
+    }
+}
+
+/// Lift a handshake failure to a [`DriverError`].
+fn lift_conn_fail(cf: ConnFail) -> DriverError {
+    match cf {
+        ConnFail::UnsupportedAuthMethod => {
+            DriverError::Config("server requested an unsupported authentication method")
+        }
+        ConnFail::ServerError => {
+            DriverError::Io(io::Error::other("server returned an error during startup"))
+        }
+        // `ConnFail` is `#[non_exhaustive]`; the malformed-frame / SCRAM /
+        // overflow causes surface as I/O carrying the classified detail.
+        other => DriverError::Io(io::Error::other(format!("handshake failed: {other:?}"))),
     }
 }

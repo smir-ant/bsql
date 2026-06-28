@@ -10,14 +10,19 @@ license = "MIT OR Apache-2.0"
 bsql-postgres-core = { path = "../core" }
 bsql-postgres-proto = { path = "../proto" }
 # LIB feature set is the minimal I/O surface the driver compiles against:
-# `net` (TcpStream), `io-util` (Async{Read,Write}Ext), `time` (timeouts),
-# `sync` (the pool's Semaphore/Mutex). `macros` / `rt` / `rt-multi-thread`
-# are deliberately NOT here — the library never spawns tasks or runs a
-# runtime, so it must not force a runtime flavor on consumers. Those
-# features live in `[dev-dependencies]` below for the `#[tokio::test]`
-# suites only. Proven by `cargo check -p bsql-postgres-async`.
+# `net` (TcpStream), `io-util` (Async{Read,Write}Ext), `time` (timeouts +
+# the recv_notification read deadline), `sync` (the pool's Semaphore/Mutex).
+# `macros` / `rt` / `rt-multi-thread` are deliberately NOT here — the library
+# never spawns tasks or runs a runtime, so it must not force a runtime flavor
+# on consumers. Those features live in `[dev-dependencies]` below for the
+# `#[tokio::test]` suites only. Proven by `cargo check -p bsql-postgres-async`.
+#
+# No `tokio-rustls`: TLS is the engine's sans-IO `core::tls::TlsTransport`
+# (rustls::unbuffered, ring-explicit), shared with the blocking driver — the
+# async driver wraps `tokio::net::TcpStream` in that transport, never the
+# tokio-rustls glue. `rustls` itself is not a direct dependency: the driver
+# composes `core::tls` / `core::ssl` and names no rustls type.
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
-tokio-rustls = { workspace = true }
 
 # Inherit the workspace FORBID floor (the two-tier lint wall). The pool's
 # mutex poison-recovery fallbacks carry scoped allows in `src/pool.rs`.

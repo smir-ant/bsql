@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bsql_postgres_core::materialize::{self, ResultCollector};
-use bsql_postgres_core::tls::{self, TlsError, TlsTransport};
+use bsql_postgres_core::tls::{self, TlsError, TlsTransport, Wire};
 use bsql_postgres_core::{
     ConnectConfig, DriverError, Notification, QueryResult, Row, SslMode,
 };
@@ -42,7 +42,7 @@ use bsql_postgres_proto::{
     Credentials, DatabaseName, Ident, Password, PreparedQuery, RowDecode, Sensitive, StmtName,
 };
 
-use crate::transport::{SyncSocket, Wire};
+use crate::transport::SyncSocket;
 
 /// The plaintext-or-TLS transport the engine is monomorphic over.
 type SyncWire = Wire<SyncSocket>;
@@ -167,12 +167,11 @@ impl Connection {
         let mut response = [0u8; 1];
         Read::read_exact(&mut tcp, &mut response)?;
         match bsql_postgres_core::ssl::classify_ssl_response(ssl_proto, response[0], config)? {
-            bsql_postgres_core::ssl::SslProbe::Accepted { server_name, .. } => {
-                // Use the provider-explicit ring config, NOT the probe's bare
-                // `ClientConfig::builder()` tls_config: under the ring-only crypto
-                // pin the bare builder installs no default provider and would
-                // fault at the handshake. The server name comes from the probe;
-                // the config comes from `shared_client_config`.
+            bsql_postgres_core::ssl::SslProbe::Accepted { server_name } => {
+                // Use the provider-explicit ring config from `shared_client_config`:
+                // under the ring-only crypto pin a bare `ClientConfig::builder()`
+                // installs no default provider and would fault at the handshake.
+                // The server name comes from the probe.
                 let cfg = tls::shared_client_config()
                     .map_err(|e| DriverError::Io(io::Error::other(format!("TLS config: {e}"))))?;
                 let socket = SyncSocket::new(tcp);

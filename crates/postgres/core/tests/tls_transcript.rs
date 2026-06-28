@@ -23,6 +23,8 @@
 
 mod tls_common;
 
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tls_common::{block_on, test_client_config, test_server_name, LoopbackInner, MockInner};
@@ -179,5 +181,114 @@ fn shutdown_emits_close_notify() {
     assert!(
         state.lock().expect("lock").server_closed,
         "server observed a clean close_notify (not a truncation)"
+    );
+}
+
+// ===========================================================================
+// Would-block read must not corrupt the inbound ciphertext staging buffer.
+// ===========================================================================
+
+/// A [`MockInner`] wrapper that returns ONE would-block read on demand (the
+/// recv_notification deadline analog), then delegates to the real loopback. Its
+/// `wb` flag is shared so a test can arm it AFTER the handshake (the inner is
+/// moved into the `TlsTransport` by `connect`, out of the test's reach otherwise).
+#[derive(Clone)]
+struct WouldBlockOnceInner {
+    inner: MockInner,
+    wb: Arc<AtomicBool>,
+}
+
+impl Transport for WouldBlockOnceInner {
+    type Error = std::io::Error;
+
+    fn is_would_block(err: &std::io::Error) -> bool {
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    }
+
+    async fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Result<usize, std::io::Error> {
+        if self.wb.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        // `MockInner` is `Infallible`, so the error arm is unreachable.
+        match self.inner.read(buf).await {
+            Ok(n) => Ok(n),
+            Err(e) => match e {},
+        }
+    }
+
+    async fn write<'a>(&'a mut self, buf: &'a [u8]) -> Result<usize, std::io::Error> {
+        match self.inner.write(buf).await {
+            Ok(n) => Ok(n),
+            Err(e) => match e {},
+        }
+    }
+
+    fn flush<'a>(&'a mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send + 'a {
+        std::future::ready(Ok(()))
+    }
+
+    fn shutdown<'a>(&'a mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send + 'a {
+        std::future::ready(Ok(()))
+    }
+}
+
+/// Connect a `TlsTransport` over a would-block-once loopback and settle the
+/// server to the data phase. Returns the ready transport, the server-state
+/// handle, and the shared would-block arm.
+fn connect_wb_pair() -> (
+    TlsTransport<WouldBlockOnceInner>,
+    Arc<Mutex<LoopbackInner>>,
+    Arc<AtomicBool>,
+) {
+    let (mock, state) = MockInner::new();
+    let wb = Arc::new(AtomicBool::new(false));
+    let inner = WouldBlockOnceInner {
+        inner: mock,
+        wb: Arc::clone(&wb),
+    };
+    let transport = block_on(TlsTransport::connect(
+        inner,
+        test_client_config(),
+        test_server_name(),
+    ))
+    .expect("TLS handshake completes inside connect()");
+    state.lock().expect("lock").pump_server();
+    (transport, state, wb)
+}
+
+#[test]
+fn would_block_read_does_not_corrupt_staging() {
+    // The recv_notification deadline path: a would-block read returns the
+    // classified error, and the NEXT read must still decrypt a real record — i.e.
+    // the would-block left the inbound ciphertext staging buffer uncorrupted (no
+    // zero-padding from the abandoned read window). On the pre-fix code the second
+    // read fails with a TLS error (the 0x00-content-type zeros poison the record
+    // stream); this test FAILS before the fix and PASSES after it.
+    let (mut transport, state, wb) = connect_wb_pair();
+    let msg: Vec<u8> = (0..200usize).map(|i| (i % 251) as u8).collect();
+    state.lock().expect("lock").server_send_app(&msg); // a real encrypted record on the wire
+
+    // Arm a single would-block read.
+    wb.store(true, Ordering::SeqCst);
+    let mut buf = vec![0u8; 16 * 1024];
+    match block_on(transport.read(&mut buf)) {
+        Err(e) => assert!(
+            TlsTransport::<WouldBlockOnceInner>::is_would_block(&e),
+            "the armed deadline must surface as a would-block read, got {e:?}"
+        ),
+        Ok(n) => panic!("expected a would-block read, got Ok({n})"),
+    }
+
+    // The would-block must not have polluted the ciphertext staging buffer: the
+    // next read decrypts the real record cleanly.
+    let n = block_on(transport.read(&mut buf))
+        .expect("a read after a would-block must decrypt the real record (staging uncorrupted)");
+    assert_eq!(
+        &buf[..n],
+        &msg[..],
+        "the real record decrypts after the would-block — staging was not corrupted"
     );
 }

@@ -98,7 +98,6 @@ termcolor 1.4.1
 tinytemplate 1.2.1
 tokio 1.52.3
 tokio-macros 2.7.0
-tokio-rustls 0.26.4
 toml 1.1.2+spec-1.1.0
 toml_datetime 1.1.1+spec-1.1.0
 toml_parser 1.1.2+spec-1.1.0

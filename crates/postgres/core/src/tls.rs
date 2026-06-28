@@ -412,11 +412,19 @@ impl<Inner: Transport> TlsTransport<Inner> {
         // Zero-fill the read window (no `unsafe` uninit read); the socket
         // overwrites the bytes it returns and the tail is truncated away.
         self.staging.resize(base + RECV_CHUNK, 0);
-        let n = self
-            .inner
-            .read(&mut self.staging[base..])
-            .await
-            .map_err(TlsError::Socket)?;
+        // INVARIANT: `staging` is restored to `base` on ANY read error so a
+        // recoverable would-block (the recv_notification deadline elapsing) leaves
+        // the ciphertext buffer byte-identical — the abandoned read window's zeros
+        // must never linger, or the next `process_tls_records` would read a 0x00
+        // content-type and tear the connection down. The success path stays
+        // zero-copy (read straight into `staging`).
+        let n = match self.inner.read(&mut self.staging[base..]).await {
+            Ok(n) => n,
+            Err(e) => {
+                self.staging.truncate(base);
+                return Err(TlsError::Socket(e));
+            }
+        };
         self.staging.truncate(base + n);
         Ok(n)
     }
@@ -579,6 +587,96 @@ impl<Inner: Transport> Transport for TlsTransport<Inner> {
 
     fn shutdown<'a>(&'a mut self) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
         self.shutdown_impl()
+    }
+}
+
+// ===========================================================================
+// Wire — the plaintext-or-TLS transport multiplexer
+// ===========================================================================
+
+/// A plaintext-or-TLS transport that itself implements [`Transport`], so a
+/// driver's engine stays monomorphic over a single `Wire<S>` type whether the
+/// connection ended up plaintext or wrapped in TLS.
+///
+/// It is an `enum { Plain, Tls }` that forwards each [`Transport`] op to the
+/// active arm — the role a per-driver `Stream` enum used to play, now behind the
+/// engine's seam and shared by every driver (blocking and async) so the
+/// multiplexer exists once. `S` is the inner byte transport (a blocking or async
+/// socket); the TLS arm wraps it in a [`TlsTransport`].
+///
+/// The error union is [`TlsError<S::Error>`] for both arms: the TLS arm's error
+/// already is that type, and a plaintext socket error rides [`TlsError::Socket`].
+/// Reusing the TLS error union (rather than minting a third `enum WireError`)
+/// avoids the double-wrapping a bespoke union would create — `TlsError` already
+/// nests the inner socket error in its `Socket` variant — and inherits its
+/// `Send`-when-inner-is-`Send` property, which keeps the verb futures `Send`.
+pub enum Wire<S: Transport> {
+    /// Plaintext socket.
+    Plain(S),
+    /// TLS over the socket (`rustls::unbuffered`, driven by the engine pump).
+    ///
+    /// Boxed: the TLS state (rustls connection + record buffers) dwarfs a bare
+    /// socket, so boxing the rare TLS arm keeps `Wire` — and the `Engine` that
+    /// embeds it — small for the plaintext common case. The deref is per
+    /// syscall, never per row.
+    Tls(Box<TlsTransport<S>>),
+}
+
+impl<S: Transport> Transport for Wire<S> {
+    /// The arm-uniform error union: a plaintext socket error rides
+    /// [`TlsError::Socket`]; the TLS arm's error already is this type.
+    type Error = TlsError<S::Error>;
+
+    #[inline]
+    fn is_would_block(err: &Self::Error) -> bool {
+        match err {
+            // A socket-level error (either arm) is classified by the inner
+            // transport; a TLS-protocol error is never a recoverable deadline.
+            TlsError::Socket(inner) => S::is_would_block(inner),
+            TlsError::Tls(_)
+            | TlsError::RecordOversize { .. }
+            | TlsError::EncryptExhausted
+            | TlsError::WriteZero
+            | TlsError::ClosedDuringHandshake
+            | TlsError::UnexpectedState => false,
+        }
+    }
+
+    // The forwarding arms are `async fn` (which satisfies the trait's RPITIT
+    // `+ Send` bound — the compiler checks the future is `Send`); the explicit
+    // `<'a>` matches the trait's single-lifetime signature (self and buf share
+    // it). The active arm's inner future is awaited in place; the plaintext
+    // arm's error is lifted onto the shared union.
+    #[inline]
+    async fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Result<usize, Self::Error> {
+        match self {
+            Wire::Plain(s) => s.read(buf).await.map_err(TlsError::Socket),
+            Wire::Tls(t) => t.read(buf).await,
+        }
+    }
+
+    #[inline]
+    async fn write<'a>(&'a mut self, buf: &'a [u8]) -> Result<usize, Self::Error> {
+        match self {
+            Wire::Plain(s) => s.write(buf).await.map_err(TlsError::Socket),
+            Wire::Tls(t) => t.write(buf).await,
+        }
+    }
+
+    #[inline]
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        match self {
+            Wire::Plain(s) => s.flush().await.map_err(TlsError::Socket),
+            Wire::Tls(t) => t.flush().await,
+        }
+    }
+
+    #[inline]
+    async fn shutdown(&mut self) -> Result<(), Self::Error> {
+        match self {
+            Wire::Plain(s) => s.shutdown().await.map_err(TlsError::Socket),
+            Wire::Tls(t) => t.shutdown().await,
+        }
     }
 }
 

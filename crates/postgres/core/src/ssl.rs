@@ -1,11 +1,22 @@
 use crate::config::{ConnectConfig, SslMode};
 use crate::error::DriverError;
 
-/// SSL probe result after sending the SSL request byte and reading response.
+/// SSL probe result after sending the SSL request bytes and reading the
+/// server's one-byte reply.
+///
+/// On [`Accepted`](SslProbe::Accepted) the caller wraps the socket in TLS using
+/// the provider-explicit config from [`tls::shared_client_config`] and the
+/// `server_name` carried here. The probe does NOT build a `rustls::ClientConfig`
+/// itself: the workspace pins rustls to the ring provider only, so a bare
+/// `ClientConfig::builder()` would install no default provider and fault at the
+/// handshake — every driver uses the single `shared_client_config` (ring-explicit)
+/// instead.
+///
+/// [`tls::shared_client_config`]: crate::tls::shared_client_config
 pub enum SslProbe {
-    /// Server accepted SSL. Caller should wrap TCP in TLS.
+    /// Server accepted SSL. The caller wraps the socket in TLS to `server_name`.
     Accepted {
-        tls_config: std::sync::Arc<rustls::ClientConfig>,
+        /// The verified server name for the TLS handshake (from `config.host`).
         server_name: rustls::pki_types::ServerName<'static>,
     },
     /// Server refused SSL. Caller continues with plain TCP.
@@ -18,7 +29,14 @@ pub fn ssl_request_bytes() -> (&'static [u8; 8], bsql_postgres_proto::PgProtocol
     proto.push_ssl_request()
 }
 
-/// Classify the server's 1-byte SSL response and build TLS config if accepted.
+/// Classify the server's 1-byte SSL response into an [`SslProbe`].
+///
+/// On acceptance, derives the verified `server_name` from `config.host` (the TLS
+/// config is built once per process by [`tls::shared_client_config`], not here).
+/// On refusal, honours `SslMode`: `Require` is a hard [`DriverError::SslRefused`];
+/// `Prefer` warns in debug builds and falls back to plain TCP.
+///
+/// [`tls::shared_client_config`]: crate::tls::shared_client_config
 pub fn classify_ssl_response(
     ssl_proto: bsql_postgres_proto::PgProtocol<bsql_postgres_proto::SslNegotiatingPhase>,
     response_byte: u8,
@@ -27,15 +45,9 @@ pub fn classify_ssl_response(
     let classified = ssl_proto.classify_ssl_response(response_byte);
     match classified {
         bsql_postgres_proto::SslClassified::Accepted(_) => {
-            let mut root_store = rustls::RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let tls_config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
             let server_name: rustls::pki_types::ServerName<'_> = config.host.as_str().try_into()
                 .map_err(|_| DriverError::Config("invalid server name for TLS"))?;
             Ok(SslProbe::Accepted {
-                tls_config: std::sync::Arc::new(tls_config),
                 server_name: server_name.to_owned(),
             })
         }

@@ -346,3 +346,79 @@ pub fn parse_notification(body: &[u8]) -> Result<Notification, DriverError> {
         pid,
     })
 }
+
+#[cfg(test)]
+mod parse_notification_tests {
+    //! `parse_notification` runs on UNTRUSTED server bytes, so its error branches
+    //! (the structurally-malformed `NotificationUnavailable` and the
+    //! non-UTF-8 `NonUtf8Payload`, which is rejected rather than lossily
+    //! substituted because a payload is application data, not display text) are
+    //! exercised here with byte literals — no live PG.
+
+    use super::parse_notification;
+    use crate::error::DriverError;
+
+    /// Assemble a `NotificationResponse` body: `[i32 pid][channel\0][payload\0]`.
+    fn body(pid: i32, channel: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut b = pid.to_be_bytes().to_vec();
+        b.extend_from_slice(channel);
+        b.push(0);
+        b.extend_from_slice(payload);
+        b.push(0);
+        b
+    }
+
+    #[test]
+    fn parses_a_well_formed_notification() {
+        let n = parse_notification(&body(4242, b"chan", b"payload")).expect("parses");
+        assert_eq!(n.pid, 4242);
+        assert_eq!(n.channel, "chan");
+        assert_eq!(n.payload, "payload");
+    }
+
+    #[test]
+    fn empty_channel_and_payload_parse() {
+        let n = parse_notification(&body(1, b"", b"")).expect("parses");
+        assert_eq!(n.channel, "");
+        assert_eq!(n.payload, "");
+        assert_eq!(n.pid, 1);
+    }
+
+    #[test]
+    fn non_utf8_payload_is_classified_not_substituted() {
+        // A lone 0xFF is invalid UTF-8; the payload is rejected, not substituted.
+        let b = body(1, b"chan", &[0xff]);
+        assert!(matches!(
+            parse_notification(&b),
+            Err(DriverError::NonUtf8Payload)
+        ));
+    }
+
+    #[test]
+    fn non_utf8_channel_is_classified() {
+        let b = body(1, &[0xff], b"payload");
+        assert!(matches!(
+            parse_notification(&b),
+            Err(DriverError::NonUtf8Payload)
+        ));
+    }
+
+    #[test]
+    fn truncated_body_is_unavailable() {
+        // Fewer than 4 bytes — no room for the pid.
+        assert!(matches!(
+            parse_notification(&[0, 0]),
+            Err(DriverError::NotificationUnavailable)
+        ));
+        // pid present but the channel has no NUL terminator.
+        assert!(matches!(
+            parse_notification(&[0, 0, 0, 1, b'c', b'h']),
+            Err(DriverError::NotificationUnavailable)
+        ));
+        // channel terminated, but the payload has no NUL terminator.
+        assert!(matches!(
+            parse_notification(&[0, 0, 0, 1, b'c', 0, b'p']),
+            Err(DriverError::NotificationUnavailable)
+        ));
+    }
+}

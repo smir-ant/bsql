@@ -193,6 +193,45 @@ async fn pool_stress_100_tasks() {
 
 #[tokio::test]
 #[ignore = "requires local PG"]
+async fn transaction_commit_and_recoverable_rollback() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+    c.execute("CREATE TEMP TABLE tx_demo(v int)").await.expect("create");
+
+    // Commit path: both inserts land.
+    c.transaction(async |conn| {
+        conn.execute("INSERT INTO tx_demo VALUES (1)").await?;
+        conn.execute("INSERT INTO tx_demo VALUES (2)").await?;
+        Ok(())
+    })
+    .await
+    .expect("transaction commits");
+    assert_eq!(
+        c.query("SELECT count(*) FROM tx_demo").await.expect("count").rows[0].get_i64(0),
+        Some(2)
+    );
+
+    // Recoverable-error rollback path: a body error rolls back AND keeps the
+    // connection pooled (the Outcome model — a query-level error never kills it).
+    let result: Result<(), _> = c
+        .transaction(async |conn| {
+            conn.execute("INSERT INTO tx_demo VALUES (3)").await?;
+            conn.execute("SELECT * FROM nonexistent_xyz").await?; // recoverable server error
+            Ok(())
+        })
+        .await;
+    assert!(result.is_err(), "a body error aborts the transaction");
+    assert!(c.is_healthy(), "the connection survives a recoverable tx body error");
+    assert_eq!(
+        c.query("SELECT count(*) FROM tx_demo").await.expect("count").rows[0].get_i64(0),
+        Some(2),
+        "the failed transaction rolled back (row 3 is gone)"
+    );
+    c.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
 async fn one_connection_everything() {
     let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
     let mut c = Connection::connect(&config).await.expect("connect");
