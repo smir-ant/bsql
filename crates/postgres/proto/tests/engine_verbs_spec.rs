@@ -24,8 +24,8 @@ use core::future::{ready, Future};
 use core::ops::ControlFlow;
 
 use bsql_postgres_proto::engine::{
-    poll_once, session, CommandStatus, Engine, EngineError, ExpectedRowCount, Live, NoObserver,
-    NotifyStatus, Outcome, PreparedStatement, SpuriousPending, Surface, Transport,
+    poll_once, session, Boundary, CommandStatus, Engine, EngineError, ExpectedRowCount, Live,
+    NoObserver, NotifyStatus, Outcome, PreparedStatement, SpuriousPending, Surface, Transport,
 };
 use bsql_postgres_proto::wire::{
     TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE,
@@ -703,6 +703,106 @@ fn query_params_runs_the_macro_path() {
     assert_eq!(cap.delivers.len(), 1);
     // The macro's compile-time row OIDs (int4, text).
     assert_eq!(cap.delivers[0].1, vec![23, 25]);
+}
+
+#[test]
+fn query_params_break_streams_all_reaches_idle() {
+    // MISS wire, then 3 DataRows. The breakable sink never breaks, so the pump
+    // reaches a clean Idle — the streaming peer's completion boundary.
+    let script = concat(&[
+        handshake(),
+        close_complete(),
+        parse_complete(),
+        bind_complete(),
+        data_row(&[Some(b"1"), Some(b"a")]),
+        data_row(&[Some(b"2"), Some(b"b")]),
+        data_row(&[Some(b"3"), Some(b"c")]),
+        command_complete("SELECT 3"),
+        rfq(b'I'),
+    ]);
+    let rows = run(script, |e, live| {
+        let mut rows = 0usize;
+        let outcome = poll_once(e.query_params_break(live, &Q_DEMO, (42_i32,), |s| {
+            if matches!(s, Surface::Row(_)) {
+                rows += 1;
+            }
+            ControlFlow::<()>::Continue(())
+        }));
+        match outcome {
+            Ok(Ok(Outcome { live, status })) => {
+                assert!(
+                    matches!(status, Boundary::Idle),
+                    "a fully-streamed result reaches Idle, got {status:?}"
+                );
+                let _ = live;
+            }
+            other => panic!("expected Ok(Idle), got {other:?}"),
+        }
+        rows
+    });
+    assert_eq!(rows, 3, "every row streamed to the sink");
+}
+
+#[test]
+fn query_params_break_stops_early_then_drain_reclaims_and_reuses() {
+    // MISS wire + 3 DataRows + CommandComplete + first RFQ; then a SECOND RFQ for
+    // the follow-up ping that proves the connection is reusable after the drain.
+    let script = concat(&[
+        handshake(),
+        close_complete(),
+        parse_complete(),
+        bind_complete(),
+        data_row(&[Some(b"1"), Some(b"a")]),
+        data_row(&[Some(b"2"), Some(b"b")]),
+        data_row(&[Some(b"3"), Some(b"c")]),
+        command_complete("SELECT 3"),
+        rfq(b'I'),
+        rfq(b'I'),
+    ]);
+    let (seen, drained, reused) = run(script, |e, live| {
+        // Break on the FIRST row.
+        let mut seen = 0usize;
+        let outcome = poll_once(e.query_params_break(live, &Q_DEMO, (42_i32,), |s| {
+            if matches!(s, Surface::Row(_)) {
+                seen += 1;
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }));
+        let live = match outcome {
+            Ok(Ok(Outcome { live, status })) => {
+                assert!(
+                    matches!(status, Boundary::Stopped(())),
+                    "an early break reaches Stopped, got {status:?}"
+                );
+                live
+            }
+            other => panic!("expected Ok(Stopped), got {other:?}"),
+        };
+        // The connection is DIRTY: drain the remaining 2 DataRows + CommandComplete
+        // + RFQ to a clean idle, sending nothing.
+        let live = match poll_once(e.drain(live)) {
+            Ok(Ok(Outcome {
+                live,
+                status: CommandStatus::Completed,
+            })) => live,
+            other => panic!("drain must reclaim to a clean Completed idle, got {other:?}"),
+        };
+        let drained = true;
+        // Reuse proof: a follow-up ping round-trips on the SAME connection.
+        let reused = matches!(
+            poll_once(e.ping(live, |_s| ControlFlow::Continue(()))),
+            Ok(Ok(Outcome {
+                status: CommandStatus::Completed,
+                ..
+            }))
+        );
+        (seen, drained, reused)
+    });
+    assert_eq!(seen, 1, "the sink broke after exactly the first row");
+    assert!(drained, "the drain reclaimed the dirty connection");
+    assert!(reused, "a follow-up verb succeeds on the drained connection");
 }
 
 /// A scripted server that ALSO records every byte the engine writes, into a

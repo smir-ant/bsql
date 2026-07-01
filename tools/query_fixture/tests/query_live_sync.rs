@@ -23,6 +23,8 @@
     reason = "live test harness — expect/unwrap surface failures loudly; not production fallbacks"
 )]
 
+use core::ops::ControlFlow;
+
 use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 // One column, fixed-width, NOT NULL -> the borrowed record carries no lifetime
@@ -58,6 +60,23 @@ bsql_query_macros::query!(RepeatLit, "SELECT 100::int4 AS n");
 bsql_query_macros::query!(TxLit, "SELECT 11::int4 AS n");
 bsql_query_macros::query!(MultiTxLit, "SELECT 22::int4 AS n");
 bsql_query_macros::query!(HealLit, "SELECT 33::int4 AS n");
+// A five-row VALUES stream for the `query_each` streaming / early-break probes.
+bsql_query_macros::query!(
+    StreamAll,
+    "SELECT n FROM (VALUES (1::int4), (2), (3), (4), (5)) AS t(n)"
+);
+// A distinct five-row stream for the transaction probe (distinct SQL -> distinct
+// content-addressed statement, so it does not collide with StreamAll).
+bsql_query_macros::query!(
+    StreamTx,
+    "SELECT n FROM (VALUES (10::int4), (20), (30), (40), (50)) AS t(n)"
+);
+// A param-filtered stream: `$1` caps the rows returned, exercising `query_each`
+// with a bound parameter.
+bsql_query_macros::query!(
+    StreamParam,
+    "SELECT n FROM (VALUES (1::int4), (2), (3), (4), (5)) AS t(n) WHERE n <= $1::int4"
+);
 
 fn sync_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -312,6 +331,101 @@ fn same_carrier_across_many_transactions_succeeds() {
             .unwrap_or_else(|e| panic!("transaction {i} must commit, got {e:?}"));
         assert_eq!(n, 1, "transaction {i}: one row");
     }
+    c.close().expect("close");
+}
+
+/// STREAMING: `query_each` hands every row to the closure and returns `Ok(None)`
+/// when the result is fully streamed (exhausted). Constant memory: nothing is
+/// accumulated by the driver — the test itself collects, but the connection path
+/// buffers no rows.
+#[test]
+#[ignore = "requires local PG"]
+fn query_each_streams_all_returns_none() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let mut collected = Vec::new();
+    let done = c
+        .query_each::<StreamAllQuery, _, _>((), |rec| {
+            collected.push(rec.n);
+            ControlFlow::<()>::Continue(())
+        })
+        .expect("query_each streams");
+    assert_eq!(done, None, "a fully-streamed result returns Ok(None)");
+    assert_eq!(collected, vec![1, 2, 3, 4, 5], "every row, in order");
+    c.close().expect("close");
+}
+
+/// EARLY BREAK + DRAIN RECLAIM: `on_row` returns `Break` at row 3 of 5. The call
+/// returns `Ok(Some(..))`, the connection is DRAINED back to a clean idle (stays
+/// healthy), and a FOLLOW-UP query on the SAME connection succeeds — proving the
+/// drain left the connection reusable.
+#[test]
+#[ignore = "requires local PG"]
+fn query_each_break_early_drains_and_reuses() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let mut collected = Vec::new();
+    let stopped = c
+        .query_each::<StreamAllQuery, _, _>((), |rec| {
+            collected.push(rec.n);
+            if rec.n == 3 {
+                ControlFlow::Break(rec.n)
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .expect("query_each with an early break");
+    assert_eq!(stopped, Some(3), "the break payload rides Ok(Some(..))");
+    assert_eq!(collected, vec![1, 2, 3], "rows up to and including the break");
+    assert!(
+        c.is_healthy(),
+        "an early break leaves the connection healthy (drained to a clean idle)"
+    );
+    // The drain left the connection clean: a follow-up typed query works.
+    let owned = c
+        .query_one::<OneQuery>(())
+        .expect("follow-up query on the reused connection");
+    assert_eq!(owned.n, 1, "the reused connection returns correct data");
+    c.close().expect("close");
+}
+
+/// TRANSACTION + REPEAT: `query_each` runs INSIDE a transaction and is repeated
+/// (the same carrier, several transactions) — the statement cache's
+/// Close-before-Parse makes every run succeed with no `duplicate_prepared_statement`
+/// (42P05).
+#[test]
+#[ignore = "requires local PG"]
+fn query_each_inside_transaction_and_repeated() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    for i in 0..5 {
+        let sum = c
+            .transaction(|tx| {
+                let mut total = 0i64;
+                tx.query_each::<StreamTxQuery, _, _>((), |rec| {
+                    total += i64::from(rec.n);
+                    ControlFlow::<()>::Continue(())
+                })?;
+                Ok(total)
+            })
+            .unwrap_or_else(|e| panic!("transaction {i} must commit, got {e:?}"));
+        assert_eq!(sum, 150, "transaction {i}: 10+20+30+40+50");
+    }
+    assert!(c.is_healthy(), "connection healthy after repeated in-tx streams");
+    c.close().expect("close");
+}
+
+/// PARAM: `query_each` binds `$1` (the cap) and streams the filtered rows.
+#[test]
+#[ignore = "requires local PG"]
+fn query_each_with_param_streams_filtered() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let mut collected = Vec::new();
+    let done = c
+        .query_each::<StreamParamQuery, _, _>((3,), |rec| {
+            collected.push(rec.n);
+            ControlFlow::<()>::Continue(())
+        })
+        .expect("query_each with a bound param");
+    assert_eq!(done, None, "fully streamed");
+    assert_eq!(collected, vec![1, 2, 3], "only rows where n <= $1 (=3)");
     c.close().expect("close");
 }
 

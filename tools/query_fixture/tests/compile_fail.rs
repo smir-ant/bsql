@@ -80,7 +80,11 @@ fn unknown_reference_is_compile_error() {
     //   * A borrowed record from `Rows::iter()` borrows the `Rows` buffer, so it
     //     cannot outlive it: dropping the `Rows` while a borrowed record is held
     //     is `error[E0505]` — the compiler-enforced escape wall.
+    //   * The STREAMING peer: a record handed to a `query_each` closure cannot
+    //     escape it — stashing it in an outer `Vec` violates the `for<'q>` HRTB
+    //     (borrowed data escapes) — the streaming escape wall.
     t.compile_fail("tests/compile_fail/query_rows_escape.rs");
+    t.compile_fail("tests/compile_fail/query_each_escape.rs");
 
     // Every valid dynamic form type-checks at macro expansion.
     t.pass("tests/compile_pass/query_dynamics_ok.rs");

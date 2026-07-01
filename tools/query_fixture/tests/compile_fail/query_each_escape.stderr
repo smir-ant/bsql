@@ -1,0 +1,13 @@
+error[E0521]: borrowed data escapes outside of closure
+  --> tests/compile_fail/query_each_escape.rs:23:9
+   |
+21 |     let mut v = Vec::new();
+   |         ----- `v` declared here, outside of the closure body
+22 |     let _ = conn.query_each::<EscapeQuery, _, _>((), |row| {
+   |                                                       --- `row` is a reference that is only valid in the closure body
+23 |         v.push(row);
+   |         ^^^^^^^^^^^ `row` escapes the closure body here
+   |
+   = note: requirement occurs because of a mutable reference to `Vec<Escape<'_>>`
+   = note: mutable references are invariant over their type parameter
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance

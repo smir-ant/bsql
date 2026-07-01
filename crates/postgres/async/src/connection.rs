@@ -35,17 +35,17 @@ use bsql_postgres_core::materialize::{self, ResultCollector};
 use bsql_postgres_core::ssl::SslProbe;
 use bsql_postgres_core::tls::{self, TlsError, TlsTransport, Wire};
 use bsql_postgres_core::{
-    ConnectConfig, DbErrorSink, DriverError, Notification, QueryResult, Row, Rows, RowsBuilder,
-    SslMode,
+    ConnectConfig, DbError, DbErrorSink, DriverError, Notification, QueryResult, Row, Rows,
+    RowsBuilder, SslMode,
 };
 use bsql_postgres_proto::engine::{
-    self, CommandStatus, ConnFail, Engine, EngineError, Live, NoObserver, NotifyStatus, Outcome,
-    PreparedStatement as WireStatement, Surface,
+    self, Boundary, CommandStatus, ConnFail, Engine, EngineError, Live, NoObserver, NotifyStatus,
+    Outcome, PreparedStatement as WireStatement, Surface,
 };
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
-    Credentials, DatabaseName, Ident, Password, PreparedQuery, RowDecode, Sensitive, StmtName,
-    TypedQuery,
+    Credentials, DatabaseName, DecodeError, Ident, Password, PreparedQuery, RowDecode, Sensitive,
+    StmtName, TypedQuery,
 };
 
 use crate::transport::{ReadDeadline, TokioSocket};
@@ -57,6 +57,21 @@ type AsyncWire = Wire<TokioSocket>;
 type WireError = TlsError<io::Error>;
 /// The owned, poolable engine handle (branded `'static`).
 type AsyncEngine = Engine<'static, AsyncWire, NoObserver>;
+
+/// Why the streaming [`query_each`](Connection::query_each) sink stopped the pump
+/// early — the break payload it hands to the engine's breakable verb.
+///
+/// Two DISTINCT constructors keep a per-row typed-decode failure and a
+/// caller-requested stop impossible to conflate: the pump boundary's `Stopped`
+/// payload alone says which happened, so the driver never has to cross-reference a
+/// side channel to know why the stream ended. Only ever constructed on the cold
+/// break path (a stack value), never on the per-row hot path.
+enum Stop<E> {
+    /// A row's bytes did not match the query's compile-time record shape.
+    Decode(DecodeError),
+    /// The caller's `on_row` returned [`ControlFlow::Break`], carrying its payload.
+    User(E),
+}
 
 /// A prepared statement handle.
 ///
@@ -534,6 +549,160 @@ impl Connection {
                 .next()
                 .ok_or(DriverError::NoRows),
             _ => Err(DriverError::TooManyRows),
+        }
+    }
+
+    /// Stream a compile-checked `query!`'s rows one at a time to `on_row` in
+    /// CONSTANT memory — the streaming peer of [`query`](Self::query).
+    ///
+    /// Where [`query`](Self::query) buffers the whole result into a [`Rows<Q>`],
+    /// this decodes each `DataRow` as it arrives (borrowed, zero-copy: a text
+    /// column is `&str` into the transient ingest buffer) and hands the record to
+    /// `on_row`, accumulating NOTHING — so a colossal result streams without
+    /// growing memory (0 heap allocations per row, and none per result beyond the
+    /// connection's already-allocated buffers).
+    ///
+    /// `on_row` returns [`ControlFlow`]: [`Continue`](ControlFlow::Continue) to
+    /// keep streaming, or [`Break(e)`](ControlFlow::Break) to stop early. The
+    /// borrowed record CANNOT escape the closure — the `for<'q>` bound is the
+    /// compiler-enforced escape wall (an attempt to stash a record in an outer
+    /// collection is a borrow error).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(None)` — the result was streamed to completion (every row seen).
+    /// - `Ok(Some(e))` — `on_row` returned [`Break(e)`](ControlFlow::Break); the
+    ///   stream stopped early and the connection was drained back to a clean idle,
+    ///   so it stays healthy and reusable.
+    /// - `Err(DriverError::Decode(..))` — a row failed to decode into its
+    ///   compile-time record shape; the stream stopped, the connection was drained,
+    ///   and it stays healthy — a decode failure is LOUD, never swallowed nor
+    ///   defaulted, and never harms the connection.
+    /// - `Err(DriverError::Db(..))` — the server reported an error mid-stream (a
+    ///   runtime fault a build-time schema check cannot catch); the connection was
+    ///   drained and stays healthy.
+    /// - `Err(DriverError::OversizeRow)` — a row exceeded the engine's inline
+    ///   buffer and streamed in chunks the bounded decoder cannot reassemble; rows
+    ///   before it were still delivered to `on_row`, then the classified error is
+    ///   returned (never a silent truncation).
+    /// - other `Err` — a fatal transport/protocol fault; the connection is dead.
+    ///
+    /// # Early-abort cost
+    ///
+    /// A [`Break`](ControlFlow::Break) of a colossal result still READS (and
+    /// discards) the remaining rows to reach the clean idle boundary that makes the
+    /// connection reusable — O(remaining rows). A true constant-time early abort
+    /// (a server-side row-limited portal) is a distinct, deferred capability.
+    ///
+    /// Shares [`query`](Self::query)'s server-side plan reuse: the statement is
+    /// Parsed once per connection and reused thereafter.
+    pub async fn query_each<Q, F, E>(
+        &mut self,
+        params: Q::Params,
+        mut on_row: F,
+    ) -> Result<Option<E>, DriverError>
+    where
+        Q: TypedQuery,
+        F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E>,
+    {
+        let live = self.take_live()?;
+        // Captured across the streaming sink; read after the verb settles.
+        let mut db_error: Option<DbError> = None;
+        let mut oversize = false;
+        let outcome = self
+            .engine
+            .query_params_break(live, &Q::PREPARED, params, |surface| match surface {
+                Surface::Row(body) => match Q::decode_borrowed(body) {
+                    // The record borrows the transient ingest buffer; `on_row`
+                    // consumes it in-scope (the `for<'q>` wall forbids escape).
+                    Ok(rec) => match on_row(rec) {
+                        ControlFlow::Continue(()) => ControlFlow::Continue(()),
+                        ControlFlow::Break(e) => ControlFlow::Break(Stop::User(e)),
+                    },
+                    // A decode failure is LOUD: stop the pump, never Continue past
+                    // it and never substitute a default.
+                    Err(de) => ControlFlow::Break(Stop::Decode(de)),
+                },
+                // Capture the server error's cause, then let the pump reach its
+                // `Failed` boundary so the connection can be drained to idle.
+                Surface::Fail(body) => {
+                    db_error = Some(materialize::parse_error_response(body));
+                    ControlFlow::Continue(())
+                }
+                // An oversize row streams as chunks the bounded typed decoder
+                // cannot reassemble; flag it for a classified `OversizeRow` after
+                // the stream ends — never reassemble, never truncate.
+                Surface::RowChunk(_) | Surface::RowChunkEnd => {
+                    oversize = true;
+                    ControlFlow::Continue(())
+                }
+                // Asynchronous / COPY / delivery frames are not stream rows.
+                _ => ControlFlow::Continue(()),
+            })
+            .await;
+
+        // The token rides `Ok` on any ALIVE boundary; a fatal is `Err`.
+        let (live, boundary) = match outcome {
+            Ok(Outcome { live, status }) => (live, status),
+            Err(other) => return Err(lift_engine_error(other)),
+        };
+        match boundary {
+            Boundary::Idle => {
+                // Streamed to completion at a clean idle — no drain needed.
+                self.live = Some(live);
+                if oversize {
+                    return Err(DriverError::OversizeRow);
+                }
+                Ok(None)
+            }
+            Boundary::Failed => {
+                // Server error mid-stream: drain the recovering `ReadyForQuery`,
+                // then surface the parsed cause. Connection stays alive + pooled.
+                self.drain_to_idle(live).await?;
+                match db_error {
+                    Some(db) => Err(DriverError::Db(db)),
+                    None => Err(DriverError::UnclassifiedFailure),
+                }
+            }
+            Boundary::Stopped(Stop::User(e)) => {
+                // Caller broke early: drain to reclaim, then report the stop value.
+                self.drain_to_idle(live).await?;
+                if oversize {
+                    return Err(DriverError::OversizeRow);
+                }
+                Ok(Some(e))
+            }
+            Boundary::Stopped(Stop::Decode(de)) => {
+                // A per-row decode failure broke the stream: drain to reclaim, then
+                // surface the loud classified decode error.
+                self.drain_to_idle(live).await?;
+                Err(DriverError::Decode(de))
+            }
+            // `query_params_break` maps Closed/Suspended to a fatal `Err`, so they
+            // never ride an `Ok` outcome; `Boundary` is `#[non_exhaustive]`, so
+            // this classified arm also covers any future boundary. The token is
+            // dropped (not restored), so the connection is left dead + evictable.
+            _ => Err(DriverError::Io(io::Error::other(
+                "unexpected protocol boundary from a streaming query",
+            ))),
+        }
+    }
+
+    /// Drain a connection left DIRTY by an early stop of a streaming query to a
+    /// clean idle boundary, restoring the token. Sends nothing (the request was
+    /// already flushed). A fatal transport/protocol fault during the drain kills
+    /// the connection (the token is consumed, `self.live` stays `None`), never
+    /// swallowed.
+    async fn drain_to_idle(&mut self, live: Live<'static>) -> Result<(), DriverError> {
+        match self.engine.drain(live).await {
+            // The drain reached a clean idle — its own status is irrelevant (even a
+            // second recoverable server error means the connection is back at idle
+            // and reusable), so only the token matters. Restore it.
+            Ok(Outcome { live, .. }) => {
+                self.live = Some(live);
+                Ok(())
+            }
+            Err(other) => Err(lift_engine_error(other)),
         }
     }
 

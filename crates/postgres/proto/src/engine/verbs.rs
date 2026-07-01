@@ -305,6 +305,86 @@ fn flatten_poll<'b, E>(
     }
 }
 
+/// Stage a compile-checked query's request bytes and seat the awaiting state —
+/// the pre-drive half SHARED by [`query_params`](Engine::query_params) (collect-
+/// all, `B = Never`) and [`query_params_break`](Engine::query_params_break)
+/// (breakable, `B = user`), so the two verbs cannot drift in their cache decision
+/// or their wire framing (a drift would resurrect the duplicate-statement error
+/// this path exists to prevent).
+///
+/// Decides the cache HIT/MISS from the recorded set, then builds the wire: on a
+/// MISS a `Close`(statement) + the baked `Parse` template + `Bind` + `Execute` +
+/// `Sync` — the leading `Close` makes the re-`Parse` idempotent (a `Close` of a
+/// nonexistent statement is a wire no-op), so no duplicate-statement error is
+/// possible in any case; on a HIT a bare `Bind` + `Execute` + `Sync` reusing the
+/// server-side plan. Seats the matching awaiting state (a MISS awaits
+/// `CloseComplete` first, a HIT awaits `BindComplete` directly — seating the wrong
+/// one would deadlock on an ack that never comes). Returns whether this is a plan
+/// REUSE (HIT), which the caller threads into [`settle_statement_cache`] for the
+/// post-drive bookkeeping.
+fn stage_compiled_query<P, R, E>(
+    active: &mut ActiveEngine,
+    send_buf: &mut SendBuf,
+    q: &PreparedQuery<P, R>,
+    args: &P,
+) -> Result<bool, EngineError<E>>
+where
+    P: ParamsWriter,
+    R: RowDecode,
+{
+    let reuse = active.is_statement_parsed(q.stmt_name);
+    send_buf.reset();
+    if !reuse {
+        enqueue_frame(send_buf, |wb| {
+            frames::build_close_statement(wb, q.stmt_name.as_bytes())
+        })?;
+        send_buf.enqueue(q.parse_template);
+    }
+    enqueue_frame(send_buf, |wb| {
+        frames::build_bind_prepared(wb, q.bind_execute_prefix, args)
+    })?;
+    send_buf.enqueue(&crate::prepared::EXECUTE_EMPTY_PORTAL_NO_LIMIT);
+    send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
+    if reuse {
+        active.begin_bind_execute(q.row_oids);
+    } else {
+        active.begin_close_parse_bind_execute(q.row_oids);
+    }
+    Ok(reuse)
+}
+
+/// The post-drive statement-cache bookkeeping SHARED by the compile-checked query
+/// verbs (see [`stage_compiled_query`]).
+///
+/// - A HIT (`reuse`) that server-errored means the recorded statement was dropped
+///   out of band (`DISCARD ALL` / `DEALLOCATE`) → EVICT it, so the next use is a
+///   self-healing MISS that re-creates it. The error itself already rode the sink.
+/// - A MISS that completed at a clean idle (`completed_at_idle` AND the connection
+///   is back at [`TxStatus::Idle`] — the wrapping transaction, if any, committed)
+///   is durable → RECORD it for future HITs.
+/// - Anything else (a MISS still inside a transaction, or a command that neither
+///   completed cleanly nor server-errored — e.g. an early caller STOP mid-stream)
+///   records nothing: correctness never depends on the cache (the MISS path
+///   re-creates the statement), so it is simply left a future MISS.
+fn settle_statement_cache<P, R>(
+    active: &mut ActiveEngine,
+    q: &PreparedQuery<P, R>,
+    reuse: bool,
+    completed_at_idle: bool,
+    server_errored: bool,
+) where
+    P: ParamsWriter,
+    R: RowDecode,
+{
+    if reuse {
+        if server_errored {
+            active.evict_statement(q.stmt_name);
+        }
+    } else if completed_at_idle && matches!(active.tx_status(), TxStatus::Idle) {
+        active.record_statement_parsed(q.stmt_name);
+    }
+}
+
 impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     /// Drain a `Sync` and await the connection's `ReadyForQuery` — a liveness
     /// round trip. Surfaces nothing on a quiet connection; any asynchronous
@@ -709,54 +789,161 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
             ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        // HIT: this connection recorded this content-addressed statement as
-        // durable — send a bare Bind+Execute+Sync and reuse the server plan.
-        let reuse = active.is_statement_parsed(q.stmt_name);
-        send_buf.reset();
-        if !reuse {
-            // MISS: lead with a Close of this statement name so the re-Parse is
-            // idempotent — a Close of a nonexistent statement is a wire no-op, so
-            // this re-creates the statement whether or not the server still holds
-            // it (never a duplicate-statement error), then the macro's baked Parse
-            // template installs it. The Bind+Execute+Sync tail below is identical
-            // to the HIT path.
-            enqueue_frame(send_buf, |wb| {
-                frames::build_close_statement(wb, q.stmt_name.as_bytes())
-            })?;
-            send_buf.enqueue(q.parse_template);
-        }
-        enqueue_frame(send_buf, |wb| {
-            frames::build_bind_prepared(wb, q.bind_execute_prefix, &args)
-        })?;
-        send_buf.enqueue(&crate::prepared::EXECUTE_EMPTY_PORTAL_NO_LIMIT);
-        send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
-        // Seat the awaiting state to MATCH the wire: a HIT sends no Close/Parse
-        // (await BindComplete directly); a MISS leads with CloseComplete then
-        // ParseComplete. Seating the wrong one would deadlock on an ack that
-        // never comes.
-        if reuse {
-            active.begin_bind_execute(q.row_oids);
-        } else {
-            active.begin_close_parse_bind_execute(q.row_oids);
-        }
+        let reuse = stage_compiled_query(active, send_buf, q, &args)?;
         let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
-        if reuse {
-            // A reuse that the server rejected means the recorded statement was
-            // dropped out of band — evict it so the NEXT use is a MISS that
-            // re-creates it (self-heal). The error itself already rode the sink.
-            if matches!(status, CommandStatus::ServerErrored) {
-                active.evict_statement(q.stmt_name);
+        settle_statement_cache(
+            active,
+            q,
+            reuse,
+            matches!(status, CommandStatus::Completed),
+            matches!(status, CommandStatus::ServerErrored),
+        );
+        Ok(Outcome { live, status })
+    }
+
+    /// Run a compile-checked query with a BREAKABLE sink — the CONSTANT-MEMORY
+    /// STREAMING peer of [`query_params`](Self::query_params).
+    ///
+    /// Identical wire and statement-cache logic (both share
+    /// [`stage_compiled_query`] / [`settle_statement_cache`], so neither the
+    /// Close-before-Parse MISS path nor the plan-reuse HIT path can drift between
+    /// the two verbs), but the sink may [`Break`](ControlFlow::Break) — carrying a
+    /// user payload `B` — to stop the pump early. Rows surface as
+    /// [`Surface::Row`] one at a time against the query's compile-time OIDs;
+    /// nothing is accumulated, so a colossal result streams in bounded memory.
+    ///
+    /// Returns the RAW [`Boundary`] the pump reached, inside the [`Outcome`] whose
+    /// token rides `Ok` because the connection is ALIVE (whether at a clean
+    /// boundary or dirty):
+    ///
+    /// - [`Boundary::Idle`] — the result streamed to completion; the connection is
+    ///   clean and reusable, and the statement is recorded for plan reuse.
+    /// - [`Boundary::Failed`] — a server `ErrorResponse` arrived (its raw bytes
+    ///   reached the sink first, which [`Continue`](ControlFlow::Continue)d); the
+    ///   connection is DIRTY (the recovering `ReadyForQuery` is still owed) and the
+    ///   caller must [`drain`](Self::drain) it before reuse.
+    /// - [`Boundary::Stopped`] — the sink [`Break`](ControlFlow::Break)ed early;
+    ///   the connection is DIRTY (unread rows + `CommandComplete` +
+    ///   `ReadyForQuery` remain on the wire) and the caller must
+    ///   [`drain`](Self::drain) it to reclaim it. The statement is NOT recorded
+    ///   (the command has not completed), so a later use is a self-correcting MISS.
+    ///
+    /// [`Boundary::Closed`] / [`Boundary::Suspended`] are FATAL and surface as
+    /// `Err` (the token is consumed), so they never ride an `Ok` [`Outcome`] — the
+    /// tier-1 rule "token in `Ok` ⟺ connection alive" holds even for a dirty-but-
+    /// alive connection.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::ProtocolViolation`] / [`EngineError::UnexpectedSuspend`] —
+    ///   a teardown or unexpected suspend; the connection is dead, the token is
+    ///   consumed.
+    /// - As [`query_params`](Self::query_params) for the wire-building / transport
+    ///   faults.
+    pub async fn query_params_break<P, R, S, B>(
+        &mut self,
+        live: Live<'b>,
+        q: &PreparedQuery<P, R>,
+        args: P,
+        sink: S,
+    ) -> Result<Outcome<'b, Boundary<B>>, EngineError<T::Error>>
+    where
+        P: ParamsWriter,
+        R: RowDecode,
+        S: FnMut(Surface<'_>) -> ControlFlow<B>,
+    {
+        let Self {
+            transport,
+            obs,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        let reuse = stage_compiled_query(active, send_buf, q, &args)?;
+        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
+        match boundary {
+            Boundary::Idle => {
+                settle_statement_cache(active, q, reuse, true, false);
+                Ok(Outcome {
+                    live,
+                    status: Boundary::Idle,
+                })
             }
-        } else if matches!(status, CommandStatus::Completed)
-            && matches!(active.tx_status(), TxStatus::Idle)
-        {
-            // Record the name for future HITs only when it is provably durable:
-            // the command completed AND the connection is back at a clean idle
-            // (the wrapping transaction committed). A name Parsed inside an open
-            // transaction is left unrecorded — correctness holds regardless (the
-            // MISS path re-creates it), this only defers the plan-reuse win.
-            active.record_statement_parsed(q.stmt_name);
+            Boundary::Failed => {
+                core::hint::cold_path();
+                settle_statement_cache(active, q, reuse, false, true);
+                Ok(Outcome {
+                    live,
+                    status: Boundary::Failed,
+                })
+            }
+            // The caller broke early: the connection is alive but DIRTY. The
+            // statement cache is left untouched (the command has not completed —
+            // recording it would need the not-yet-seen `ReadyForQuery`), so a later
+            // use is a self-correcting MISS. The caller drains to reclaim.
+            Boundary::Stopped(b) => Ok(Outcome {
+                live,
+                status: Boundary::Stopped(b),
+            }),
+            Boundary::Closed => {
+                core::hint::cold_path();
+                Err(EngineError::ProtocolViolation)
+            }
+            Boundary::Suspended => {
+                core::hint::cold_path();
+                Err(EngineError::UnexpectedSuspend)
+            }
         }
+    }
+
+    /// Reclaim a connection left DIRTY by an early stop of
+    /// [`query_params_break`](Self::query_params_break) — a
+    /// [`Boundary::Stopped`] (caller break) or [`Boundary::Failed`] (server error)
+    /// — by draining its remaining reply frames to a clean idle boundary.
+    /// `B = Never`.
+    ///
+    /// Sends NOTHING: the request (`Bind`+`Execute`+`Sync`, or the MISS's
+    /// `Close`+`Parse`+…+`Sync`) was already flushed by the verb that left the
+    /// connection dirty, so the trailing `ReadyForQuery` is already owed on the
+    /// wire — this only READS the unread rows + `CommandComplete` +
+    /// `ReadyForQuery` (or, after a `Failed`, the single recovering
+    /// `ReadyForQuery`) with a noop sink, draining a recoverable error to a clean
+    /// idle exactly like the collect-all verbs.
+    ///
+    /// Returns the [`CommandStatus`] the drain reached inside an [`Outcome`]; a
+    /// caller that only needs the connection back keeps the token and ignores the
+    /// status. This makes the drain-to-idle a driver-visible reclaim step, not an
+    /// engine-internal side effect.
+    ///
+    /// This is the O(remaining-rows) reclaim: an early break of a colossal result
+    /// still reads (and discards) the remainder to reach the clean boundary. A
+    /// true constant-time early abort (a row-limited `Execute` paused at
+    /// [`Boundary::Suspended`], then a portal `Close`) is a distinct, deferred
+    /// capability — the dispatch already classifies `PortalSuspended`, but no
+    /// row-capped verb is surfaced yet.
+    ///
+    /// # Errors
+    ///
+    /// As [`ping`](Self::ping): a transport/framing fault during the drain is
+    /// FATAL — the connection is dead and the token is consumed, never swallowed.
+    pub async fn drain(
+        &mut self,
+        live: Live<'b>,
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>> {
+        let Self {
+            transport,
+            obs,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        // No `reset`/`enqueue`: the request was already flushed by the verb that
+        // left the connection dirty. `drive_to_outcome`'s entry flush drains the
+        // (already-empty) send buffer as a no-op, then reads the owed reply frames
+        // to a clean idle.
+        let status = drive_to_outcome(active, transport, send_buf, &*obs, noop_sink).await?;
         Ok(Outcome { live, status })
     }
 

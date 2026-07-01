@@ -16,6 +16,8 @@
     reason = "live test harness — expect/unwrap surface failures loudly; not production fallbacks"
 )]
 
+use core::ops::ControlFlow;
+
 use bsql_postgres_async::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 bsql_query_macros::query!(One, "SELECT 1::int4 AS n");
@@ -31,6 +33,14 @@ bsql_query_macros::query!(RepeatLit, "SELECT 100::int4 AS n");
 bsql_query_macros::query!(TxLit, "SELECT 11::int4 AS n");
 bsql_query_macros::query!(MultiTxLit, "SELECT 22::int4 AS n");
 bsql_query_macros::query!(HealLit, "SELECT 33::int4 AS n");
+bsql_query_macros::query!(
+    StreamAll,
+    "SELECT n FROM (VALUES (1::int4), (2), (3), (4), (5)) AS t(n)"
+);
+bsql_query_macros::query!(
+    StreamParam,
+    "SELECT n FROM (VALUES (1::int4), (2), (3), (4), (5)) AS t(n) WHERE n <= $1::int4"
+);
 
 fn async_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -273,5 +283,100 @@ async fn discard_all_then_reuse_errors_once_then_self_heals() {
         .await
         .expect("self-heal: the next use re-creates the statement and succeeds");
     assert_eq!(healed.len(), 1);
+    c.close().await.expect("close");
+}
+
+/// STREAMING: `query_each` hands every row to the closure and returns `Ok(None)`
+/// on a fully-streamed result.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn query_each_streams_all_returns_none() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let mut collected = Vec::new();
+    let done = c
+        .query_each::<StreamAllQuery, _, _>((), |rec| {
+            collected.push(rec.n);
+            ControlFlow::<()>::Continue(())
+        })
+        .await
+        .expect("query_each streams");
+    assert_eq!(done, None, "a fully-streamed result returns Ok(None)");
+    assert_eq!(collected, vec![1, 2, 3, 4, 5], "every row, in order");
+    c.close().await.expect("close");
+}
+
+/// EARLY BREAK + DRAIN RECLAIM: break at row 3 of 5 -> `Ok(Some(..))`, the
+/// connection is drained to a clean idle and a follow-up query on the SAME
+/// connection succeeds.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn query_each_break_early_drains_and_reuses() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let mut collected = Vec::new();
+    let stopped = c
+        .query_each::<StreamAllQuery, _, _>((), |rec| {
+            collected.push(rec.n);
+            if rec.n == 3 {
+                ControlFlow::Break(rec.n)
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .await
+        .expect("query_each with an early break");
+    assert_eq!(stopped, Some(3), "the break payload rides Ok(Some(..))");
+    assert_eq!(collected, vec![1, 2, 3], "rows up to and including the break");
+    assert!(
+        c.is_healthy(),
+        "an early break leaves the connection healthy (drained to a clean idle)"
+    );
+    let owned = c
+        .query_one::<OneQuery>(())
+        .await
+        .expect("follow-up query on the reused connection");
+    assert_eq!(owned.n, 1, "the reused connection returns correct data");
+    c.close().await.expect("close");
+}
+
+/// TRANSACTION + REPEAT: `query_each` inside a transaction, repeated — the
+/// statement cache's Close-before-Parse makes every run succeed (no 42P05).
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn query_each_inside_transaction_and_repeated() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    for i in 0..5 {
+        let sum = c
+            .transaction(async |tx| {
+                let mut total = 0i64;
+                tx.query_each::<StreamAllQuery, _, _>((), |rec| {
+                    total += i64::from(rec.n);
+                    ControlFlow::<()>::Continue(())
+                })
+                .await?;
+                Ok(total)
+            })
+            .await
+            .unwrap_or_else(|e| panic!("transaction {i} must commit, got {e:?}"));
+        assert_eq!(sum, 15, "transaction {i}: 1+2+3+4+5");
+    }
+    assert!(c.is_healthy(), "connection healthy after repeated in-tx streams");
+    c.close().await.expect("close");
+}
+
+/// PARAM: `query_each` binds `$1` (the cap) and streams the filtered rows.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn query_each_with_param_streams_filtered() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let mut collected = Vec::new();
+    let done = c
+        .query_each::<StreamParamQuery, _, _>((3,), |rec| {
+            collected.push(rec.n);
+            ControlFlow::<()>::Continue(())
+        })
+        .await
+        .expect("query_each with a bound param");
+    assert_eq!(done, None, "fully streamed");
+    assert_eq!(collected, vec![1, 2, 3], "only rows where n <= $1 (=3)");
     c.close().await.expect("close");
 }

@@ -259,7 +259,7 @@ fn read_be_i32(buf: &[u8], cursor: &mut usize) -> Option<i32> {
 /// decoded with replacement of any non-UTF-8 bytes (display text, mirroring the
 /// engine's lossy bounded-string handling), so a malformed field never aborts
 /// the whole error.
-pub(crate) fn parse_error_response(body: &[u8]) -> DbError {
+pub fn parse_error_response(body: &[u8]) -> DbError {
     let mut code = String::new();
     let mut severity: Option<String> = None;
     let mut message = String::new();
