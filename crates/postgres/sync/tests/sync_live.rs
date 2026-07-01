@@ -36,7 +36,7 @@ fn connect_and_ping() {
 #[ignore = "requires local PG"]
 fn streaming_1k_rows() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    let r = c.query("SELECT generate_series(1, 1000)").expect("query");
+    let r = c.query_sql("SELECT generate_series(1, 1000)").expect("query");
     assert_eq!(r.rows.len(), 1000);
     assert_eq!(r.rows[0].get_i32(0), Some(1));
     assert_eq!(r.rows[999].get_i32(0), Some(1000));
@@ -47,7 +47,7 @@ fn streaming_1k_rows() {
 #[ignore = "requires local PG"]
 fn streaming_10k_rows() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    let r = c.query("SELECT generate_series(1, 10000)").expect("query");
+    let r = c.query_sql("SELECT generate_series(1, 10000)").expect("query");
     assert_eq!(r.rows.len(), 10000);
     assert_eq!(r.rows[9999].get_i32(0), Some(10000));
     c.close().expect("close");
@@ -59,14 +59,14 @@ fn error_recovery_and_resilience() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     // 4 different error types, all recover
     assert!(c.simple_query("SELCT").is_err());
-    assert!(c.query("SELECT * FROM nonexistent_xyz").is_err());
-    assert!(c.query("SELECT 'abc'::int").is_err());
-    assert!(c.query("SELECT 1/0").is_err());
+    assert!(c.query_sql("SELECT * FROM nonexistent_xyz").is_err());
+    assert!(c.query_sql("SELECT 'abc'::int").is_err());
+    assert!(c.query_sql("SELECT 1/0").is_err());
     c.ping().expect("ping after 4 errors");
     // Full CRUD still works
-    c.execute("CREATE TEMP TABLE resilience(v int)").expect("create");
-    c.execute("INSERT INTO resilience VALUES (42)").expect("insert");
-    assert_eq!(c.query("SELECT v FROM resilience").expect("select").rows[0].get_i32(0), Some(42));
+    c.execute_sql("CREATE TEMP TABLE resilience(v int)").expect("create");
+    c.execute_sql("INSERT INTO resilience VALUES (42)").expect("insert");
+    assert_eq!(c.query_sql("SELECT v FROM resilience").expect("select").rows[0].get_i32(0), Some(42));
     c.close().expect("close");
 }
 
@@ -74,12 +74,12 @@ fn error_recovery_and_resilience() {
 #[ignore = "requires local PG"]
 fn prepared_reuse_after_constraint_violation() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    c.execute("CREATE TEMP TABLE pr_err(id int PRIMARY KEY)").expect("create");
+    c.execute_sql("CREATE TEMP TABLE pr_err(id int PRIMARY KEY)").expect("create");
     let stmt = c.prepare("INSERT INTO pr_err VALUES ($1)").expect("prepare");
     c.execute_prepared(&stmt, &(1i32,)).expect("insert 1");
     assert!(c.execute_prepared(&stmt, &(1i32,)).is_err());
     c.execute_prepared(&stmt, &(2i32,)).expect("insert 2 after error");
-    assert_eq!(c.query("SELECT count(*) FROM pr_err").expect("count").rows[0].get_i64(0), Some(2));
+    assert_eq!(c.query_sql("SELECT count(*) FROM pr_err").expect("count").rows[0].get_i64(0), Some(2));
     c.close_statement(stmt).expect("close stmt");
     c.close().expect("close");
 }
@@ -88,10 +88,10 @@ fn prepared_reuse_after_constraint_violation() {
 #[ignore = "requires local PG"]
 fn copy_in() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    c.execute("CREATE TEMP TABLE cp(id int, name text)").expect("create");
+    c.execute_sql("CREATE TEMP TABLE cp(id int, name text)").expect("create");
     assert_eq!(c.copy_in("cp", vec!["1\talice", "2\tbob"]).expect("copy"), 2);
     assert_eq!(c.copy_in("cp", Vec::<&str>::new()).expect("copy empty"), 0);
-    c.execute("CREATE TEMP TABLE cp_lg(i int)").expect("create lg");
+    c.execute_sql("CREATE TEMP TABLE cp_lg(i int)").expect("create lg");
     let rows: Vec<String> = (0..1000).map(|i| i.to_string()).collect();
     assert_eq!(c.copy_in("cp_lg", &rows).expect("copy 1000"), 1000);
     c.close().expect("close");
@@ -122,7 +122,7 @@ fn pool() {
         let p = pool.clone();
         std::thread::spawn(move || {
             let mut conn = p.get().expect("get");
-            assert_eq!(conn.query(&format!("SELECT {i}::int")).expect("q").rows[0].get_i32(0), Some(i as i32));
+            assert_eq!(conn.query_sql(&format!("SELECT {i}::int")).expect("q").rows[0].get_i32(0), Some(i as i32));
         })
     }).collect();
     for h in handles { h.join().expect("thread"); }
@@ -132,14 +132,14 @@ fn pool() {
 #[ignore = "requires local PG"]
 fn transaction_closure() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    c.execute("CREATE TEMP TABLE tx(v int)").expect("create");
-    c.transaction(|tx| { tx.execute("INSERT INTO tx VALUES (1)")?; Ok(()) }).expect("commit");
-    assert_eq!(c.query("SELECT count(*) FROM tx").expect("c").rows[0].get_i64(0), Some(1));
+    c.execute_sql("CREATE TEMP TABLE tx(v int)").expect("create");
+    c.transaction(|tx| { tx.execute_sql("INSERT INTO tx VALUES (1)")?; Ok(()) }).expect("commit");
+    assert_eq!(c.query_sql("SELECT count(*) FROM tx").expect("c").rows[0].get_i64(0), Some(1));
     let _: Result<(), _> = c.transaction(|tx| {
-        tx.execute("INSERT INTO tx VALUES (2)")?;
+        tx.execute_sql("INSERT INTO tx VALUES (2)")?;
         Err(bsql_postgres_sync::DriverError::NoRows)
     });
-    assert_eq!(c.query("SELECT count(*) FROM tx").expect("c").rows[0].get_i64(0), Some(1));
+    assert_eq!(c.query_sql("SELECT count(*) FROM tx").expect("c").rows[0].get_i64(0), Some(1));
     c.close().expect("close");
 }
 
@@ -147,7 +147,7 @@ fn transaction_closure() {
 #[ignore = "requires local PG"]
 fn row_clone_across_threads() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    let row = c.query("SELECT 42::int, 'hello'::text").expect("q").rows[0].clone();
+    let row = c.query_sql("SELECT 42::int, 'hello'::text").expect("q").rows[0].clone();
     let handle = std::thread::spawn(move || row.get_i32(0));
     assert_eq!(handle.join().expect("thread"), Some(42));
     c.close().expect("close");
@@ -157,17 +157,17 @@ fn row_clone_across_threads() {
 #[ignore = "requires local PG"]
 fn full_lifecycle() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    c.execute("CREATE TEMP TABLE lc(id serial PRIMARY KEY, name text, val int)").expect("create");
+    c.execute_sql("CREATE TEMP TABLE lc(id serial PRIMARY KEY, name text, val int)").expect("create");
     c.transaction(|tx| {
-        tx.execute("INSERT INTO lc(name, val) VALUES ('alice', 95)")?;
-        tx.execute("INSERT INTO lc(name, val) VALUES ('bob', 88)")?;
+        tx.execute_sql("INSERT INTO lc(name, val) VALUES ('alice', 95)")?;
+        tx.execute_sql("INSERT INTO lc(name, val) VALUES ('bob', 88)")?;
         Ok(())
     }).expect("tx");
     assert_eq!(c.query_params_one("SELECT name FROM lc WHERE val > $1", &(90i32,)).expect("p").get_str(0), Some("alice"));
     let stmt = c.prepare("UPDATE lc SET val = val + $1 WHERE name = $2").expect("prep");
     c.execute_prepared(&stmt, &(5i32, "bob")).expect("update");
     c.close_statement(stmt).expect("close stmt");
-    assert!(c.execute("INSERT INTO lc(id) VALUES (1)").is_err()); // dup PK
+    assert!(c.execute_sql("INSERT INTO lc(id) VALUES (1)").is_err()); // dup PK
     c.ping().expect("recover");
     assert_eq!(c.copy_in("lc", Vec::<&str>::new()).expect("copy empty"), 0);
     c.close().expect("close");
@@ -196,7 +196,7 @@ fn pool_stress_100_tasks() {
         let p = pool.clone();
         std::thread::spawn(move || {
             let mut c = p.get().expect("get");
-            let r = c.query(&format!("SELECT {i}::int, pg_backend_pid()")).expect("q");
+            let r = c.query_sql(&format!("SELECT {i}::int, pg_backend_pid()")).expect("q");
             assert_eq!(r.rows[0].get_i32(0), Some(i as i32));
         })
     }).collect();
@@ -214,19 +214,19 @@ fn one_connection_everything() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
     // DDL
-    c.execute("CREATE TEMP TABLE omni(id serial PRIMARY KEY, name text, val int, active bool)").expect("create");
-    c.execute("CREATE INDEX ON omni(val)").expect("index");
+    c.execute_sql("CREATE TEMP TABLE omni(id serial PRIMARY KEY, name text, val int, active bool)").expect("create");
+    c.execute_sql("CREATE INDEX ON omni(val)").expect("index");
 
     // DML via execute
-    c.execute("INSERT INTO omni(name, val, active) VALUES ('a', 10, true)").expect("ins");
-    c.execute("INSERT INTO omni(name, val, active) VALUES ('b', 20, false)").expect("ins");
-    c.execute("INSERT INTO omni(name, val, active) VALUES ('c', 30, true)").expect("ins");
+    c.execute_sql("INSERT INTO omni(name, val, active) VALUES ('a', 10, true)").expect("ins");
+    c.execute_sql("INSERT INTO omni(name, val, active) VALUES ('b', 20, false)").expect("ins");
+    c.execute_sql("INSERT INTO omni(name, val, active) VALUES ('c', 30, true)").expect("ins");
 
     // DML via execute_params (uses typed binary encoding)
     c.execute_params("INSERT INTO omni(name, val, active) VALUES ($1, $2, $3)", &("d", 40i32, true)).expect("params");
 
     // Query
-    let r = c.query("SELECT count(*) FROM omni").expect("count");
+    let r = c.query_sql("SELECT count(*) FROM omni").expect("count");
     assert_eq!(r.rows[0].get_i64(0), Some(4));
 
     // Query with params
@@ -241,27 +241,27 @@ fn one_connection_everything() {
 
     // Transaction
     c.transaction(|tx| {
-        tx.execute("UPDATE omni SET val = val * 2 WHERE active")?;
+        tx.execute_sql("UPDATE omni SET val = val * 2 WHERE active")?;
         Ok(())
     }).expect("tx");
-    let r = c.query("SELECT SUM(val) FROM omni").expect("sum");
+    let r = c.query_sql("SELECT SUM(val) FROM omni").expect("sum");
     // a:20 + b:20(unchanged) + c:60 + d:80 = 180
     assert_eq!(r.rows[0].get_i64(0), Some(180));
 
     // Error + recovery
-    assert!(c.query("SELECT * FROM nonexistent").is_err());
+    assert!(c.query_sql("SELECT * FROM nonexistent").is_err());
     c.ping().expect("recover");
 
     // COPY IN
-    c.execute("CREATE TEMP TABLE cp_omni(v int)").expect("create cp");
+    c.execute_sql("CREATE TEMP TABLE cp_omni(v int)").expect("create cp");
     c.copy_in("cp_omni", vec!["1", "2", "3"]).expect("copy");
 
     // Column names
-    let r = c.query("SELECT id, name, val FROM omni LIMIT 1").expect("cols");
+    let r = c.query_sql("SELECT id, name, val FROM omni LIMIT 1").expect("cols");
     assert_eq!(&*r.column_names, &["id", "name", "val"]);
 
     // Row clone across thread
-    let row = c.query("SELECT 'final'::text").expect("q").rows[0].clone();
+    let row = c.query_sql("SELECT 'final'::text").expect("q").rows[0].clone();
     let v = std::thread::spawn(move || row.get_str(0).map(String::from)).join().expect("thread");
     assert_eq!(v, Some("final".to_string()));
 
@@ -275,7 +275,7 @@ fn wide_columns() {
     for n in [250u32, 500, 600, 800, 1000, 1600] {
         let cols: Vec<String> = (0..n).map(|i| format!("{i}::int AS col_{i}")).collect();
         let sql = format!("SELECT {}", cols.join(", "));
-        let r = c.query(&sql).unwrap_or_else(|e| panic!("{n} cols failed: {e}"));
+        let r = c.query_sql(&sql).unwrap_or_else(|e| panic!("{n} cols failed: {e}"));
         assert_eq!(r.rows.len(), 1, "rows at {n} cols");
         assert_eq!(r.column_names.len(), usize::try_from(n).unwrap(), "col names at {n}");
         assert_eq!(r.rows[0].get_i32(0), Some(0), "first col at {n}");
@@ -289,7 +289,7 @@ fn wide_columns() {
 #[ignore = "requires local PG"]
 fn prepared_statement_edge_cases() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    c.execute("CREATE TEMP TABLE ps_edge(id int, v text)").expect("create");
+    c.execute_sql("CREATE TEMP TABLE ps_edge(id int, v text)").expect("create");
 
     // Prepare, execute 0 times, close
     let stmt = c.prepare("INSERT INTO ps_edge VALUES ($1, $2)").expect("prep");
@@ -300,7 +300,7 @@ fn prepared_statement_edge_cases() {
     for i in 0..50i32 {
         c.execute_prepared(&stmt, &(i, format!("v{i}").as_str())).expect("exec");
     }
-    assert_eq!(c.query("SELECT count(*) FROM ps_edge").expect("c").rows[0].get_i64(0), Some(50));
+    assert_eq!(c.query_sql("SELECT count(*) FROM ps_edge").expect("c").rows[0].get_i64(0), Some(50));
     c.close_statement(stmt).expect("close");
 
     // Prepare SELECT, query many times
@@ -327,7 +327,7 @@ fn prepared_statement_edge_cases() {
     c.close_statement(s3).expect("close s3");
 
     // Error in prepared doesn't break statement
-    c.execute("CREATE TEMP TABLE ps_uk(id int UNIQUE)").expect("create");
+    c.execute_sql("CREATE TEMP TABLE ps_uk(id int UNIQUE)").expect("create");
     let stmt = c.prepare("INSERT INTO ps_uk VALUES ($1)").expect("prep");
     c.execute_prepared(&stmt, &(1i32,)).expect("ok");
     assert!(c.execute_prepared(&stmt, &(1i32,)).is_err()); // dup
@@ -343,9 +343,9 @@ fn copy_in_edge_cases() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
     // COPY 0 rows
-    c.execute("CREATE TEMP TABLE cp_edge(id int, name text)").expect("create");
+    c.execute_sql("CREATE TEMP TABLE cp_edge(id int, name text)").expect("create");
     assert_eq!(c.copy_in("cp_edge", Vec::<&str>::new()).expect("empty"), 0);
-    assert_eq!(c.query("SELECT count(*) FROM cp_edge").expect("c").rows[0].get_i64(0), Some(0));
+    assert_eq!(c.query_sql("SELECT count(*) FROM cp_edge").expect("c").rows[0].get_i64(0), Some(0));
 
     // COPY 1 row
     assert_eq!(c.copy_in("cp_edge", vec!["1\tone"]).expect("one"), 1);
@@ -356,7 +356,7 @@ fn copy_in_edge_cases() {
     // COPY many rows
     let big: Vec<String> = (0..5000).map(|i| format!("{i}\tname_{i}")).collect();
     assert_eq!(c.copy_in("cp_edge", &big).expect("5k"), 5000);
-    assert_eq!(c.query("SELECT count(*) FROM cp_edge").expect("c").rows[0].get_i64(0), Some(5002));
+    assert_eq!(c.query_sql("SELECT count(*) FROM cp_edge").expect("c").rows[0].get_i64(0), Some(5002));
 
     // COPY into non-existent table — use fresh connection (COPY error recovery
     // sometimes leaves connection in unrecoverable state under parallel load)
@@ -374,25 +374,25 @@ fn streaming_edge_cases() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
     // 0 rows streaming (query returns no DataRow)
-    c.execute("CREATE TEMP TABLE empty_stream(v int)").expect("create");
-    let r = c.query("SELECT * FROM empty_stream").expect("empty");
+    c.execute_sql("CREATE TEMP TABLE empty_stream(v int)").expect("create");
+    let r = c.query_sql("SELECT * FROM empty_stream").expect("empty");
     assert_eq!(r.rows.len(), 0);
 
     // 1 row streaming
-    c.execute("INSERT INTO empty_stream VALUES (42)").expect("ins");
-    let r = c.query("SELECT * FROM empty_stream").expect("one");
+    c.execute_sql("INSERT INTO empty_stream VALUES (42)").expect("ins");
+    let r = c.query_sql("SELECT * FROM empty_stream").expect("one");
     assert_eq!(r.rows.len(), 1);
     assert_eq!(r.rows[0].get_i32(0), Some(42));
 
     // Large value via SQL literal (params limited to 1024 bytes)
     let big_val = "X".repeat(50_000);
-    c.execute("CREATE TEMP TABLE big_val(v text)").expect("create");
-    c.execute(&format!("INSERT INTO big_val VALUES ('{big_val}')")).expect("ins");
-    let r = c.query("SELECT v FROM big_val").expect("q");
+    c.execute_sql("CREATE TEMP TABLE big_val(v text)").expect("create");
+    c.execute_sql(&format!("INSERT INTO big_val VALUES ('{big_val}')")).expect("ins");
+    let r = c.query_sql("SELECT v FROM big_val").expect("q");
     assert_eq!(r.rows[0].get_str(0).map(|s| s.len()), Some(50_000));
 
     // Many columns with NULLs
-    let r = c.query("SELECT NULL::int, 1::int, NULL::text, 'a'::text, NULL::bool, true").expect("mixed nulls");
+    let r = c.query_sql("SELECT NULL::int, 1::int, NULL::text, 'a'::text, NULL::bool, true").expect("mixed nulls");
     assert!(r.rows[0].is_null(0));
     assert_eq!(r.rows[0].get_i32(1), Some(1));
     assert!(r.rows[0].is_null(2));
@@ -401,9 +401,9 @@ fn streaming_edge_cases() {
     assert_eq!(r.rows[0].get_bool(5), Some(true));
 
     // Query after error mid-stream should recover
-    assert!(c.query("SELECT 1/0 FROM generate_series(1,10)").is_err());
+    assert!(c.query_sql("SELECT 1/0 FROM generate_series(1,10)").is_err());
     c.ping().expect("recover after mid-stream error");
-    let r = c.query("SELECT 1::int").expect("after recover");
+    let r = c.query_sql("SELECT 1::int").expect("after recover");
     assert_eq!(r.rows[0].get_i32(0), Some(1));
 
     c.close().expect("close");
@@ -417,9 +417,9 @@ fn connection_resilience_marathon() {
     // 50 alternating errors and successes
     for i in 0..50u32 {
         if i % 2 == 0 {
-            assert!(c.query("SELECT * FROM nonexistent_marathon").is_err());
+            assert!(c.query_sql("SELECT * FROM nonexistent_marathon").is_err());
         } else {
-            assert_eq!(c.query(&format!("SELECT {i}::int")).expect("q").rows[0].get_i32(0), Some(i as i32));
+            assert_eq!(c.query_sql(&format!("SELECT {i}::int")).expect("q").rows[0].get_i32(0), Some(i as i32));
         }
     }
     c.ping().expect("after marathon");
@@ -430,21 +430,21 @@ fn connection_resilience_marathon() {
     }
 
     // Error → recover → success cycle
-    c.execute("CREATE TEMP TABLE IF NOT EXISTS marathon_t(v int)").expect("create");
+    c.execute_sql("CREATE TEMP TABLE IF NOT EXISTS marathon_t(v int)").expect("create");
     for i in 0..20u32 {
         assert!(c.simple_query("INVALID SQL GIBBERISH").is_err());
         c.ping().unwrap_or_else(|e| panic!("ping after err #{i}: {e}"));
-        c.execute("INSERT INTO marathon_t VALUES (1)").unwrap_or_else(|e| panic!("ins #{i}: {e}"));
-        assert!(c.query("SELECT 'bad'::int").is_err());
+        c.execute_sql("INSERT INTO marathon_t VALUES (1)").unwrap_or_else(|e| panic!("ins #{i}: {e}"));
+        assert!(c.query_sql("SELECT 'bad'::int").is_err());
         c.ping().unwrap_or_else(|e| panic!("ping2 #{i}: {e}"));
-        let r = c.query("SELECT count(*) FROM marathon_t").unwrap_or_else(|e| panic!("count #{i}: {e}"));
+        let r = c.query_sql("SELECT count(*) FROM marathon_t").unwrap_or_else(|e| panic!("count #{i}: {e}"));
         assert!(r.rows[0].get_i64(0).unwrap_or(0) > 0);
     }
 
     // Verify connection is still fully functional
-    c.execute("CREATE TEMP TABLE final_check(a int, b text, c bool)").expect("create");
-    c.execute("INSERT INTO final_check VALUES (1, 'hello', true)").expect("ins");
-    let r = c.query("SELECT * FROM final_check").expect("final");
+    c.execute_sql("CREATE TEMP TABLE final_check(a int, b text, c bool)").expect("create");
+    c.execute_sql("INSERT INTO final_check VALUES (1, 'hello', true)").expect("ins");
+    let r = c.query_sql("SELECT * FROM final_check").expect("final");
     assert_eq!(r.rows[0].get_i32(0), Some(1));
     assert_eq!(r.rows[0].get_str(1), Some("hello"));
     assert_eq!(r.rows[0].get_bool(2), Some(true));
@@ -460,7 +460,7 @@ fn connection_resilience_marathon() {
 // value as binary. PostgreSQL then rejected any non-string param
 // (e.g. an i32 sent as 4 binary bytes interpreted as ASCII decimal)
 // with `invalid input syntax for type integer`. This test prepares an
-// INSERT carrying i32 / i64 / bool params through `execute_prepared_macro`
+// INSERT carrying i32 / i64 / bool params through `execute`
 // and asserts: (1) the write succeeds, (2) the affected-row count is
 // correct, (3) the stored values read back exactly. Post-fix it passes;
 // pre-fix the INSERT errors at the server.
@@ -479,11 +479,11 @@ fn prepared_macro_insert_binary_params_round_trip() {
     // session's private schema. Object names stay unique per process.
     let schema = format!("bsql_s3_prep_{}", std::process::id());
 
-    c.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).expect("drop schema pre");
-    c.execute(&format!("CREATE SCHEMA {schema}")).expect("create schema");
-    c.execute(&format!("SET search_path TO {schema}")).expect("set search_path");
+    c.execute_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).expect("drop schema pre");
+    c.execute_sql(&format!("CREATE SCHEMA {schema}")).expect("create schema");
+    c.execute_sql(&format!("SET search_path TO {schema}")).expect("set search_path");
 
-    c.execute(
+    c.execute_sql(
         "CREATE TABLE prep_target (n int4 NOT NULL, big int8 NOT NULL, flag bool NOT NULL)",
     )
     .expect("create table");
@@ -506,20 +506,20 @@ fn prepared_macro_insert_binary_params_round_trip() {
     // declared-Text / encoded-Binary bug. Pre-fix this errors at the
     // server with `invalid input syntax for type integer`.
     let affected = c
-        .execute_prepared_macro(&Q_INSERT, (sent_n, sent_big, sent_flag))
+        .execute(&Q_INSERT, (sent_n, sent_big, sent_flag))
         .expect("prepared macro INSERT must succeed (binary-uniform Bind)");
     assert_eq!(affected, 1, "INSERT must affect exactly one row");
 
     // Read the row back via the simple-query text path to confirm the
     // server actually stored the binary-encoded values correctly.
-    let r = c.query("SELECT n, big, flag FROM prep_target").expect("read-back query");
+    let r = c.query_sql("SELECT n, big, flag FROM prep_target").expect("read-back query");
     assert_eq!(r.rows.len(), 1, "exactly one row stored");
     assert_eq!(r.rows[0].get_i32(0), Some(sent_n), "i32 param stored correctly");
     assert_eq!(r.rows[0].get_i64(1), Some(sent_big), "i64 param stored correctly");
     assert_eq!(r.rows[0].get_bool(2), Some(sent_flag), "bool param stored correctly");
 
     // Cleanup: DROP IF EXISTS at end (schema CASCADE removes the table).
-    c.execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).expect("drop schema post");
+    c.execute_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).expect("drop schema post");
 
     c.close().expect("close");
 }

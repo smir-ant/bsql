@@ -358,12 +358,19 @@ pub fn seed() -> Vec<Transcript> {
     });
 
     // ── 8. prepared! macro path (binary params, synthetic row desc) ──
+    //        First use of the statement on this connection is a cache MISS, so the
+    //        client wire leads with a Close(statement) before the Parse — the
+    //        Close makes the re-Parse idempotent (Close of a nonexistent statement
+    //        is a wire no-op), eliminating the duplicate-statement error for a
+    //        name the server may still hold. The server answers CloseComplete
+    //        before ParseComplete accordingly.
     out.push(Transcript {
         name: "prepared_macro",
         setup: Setup::ActiveViaTrustHandshake,
         steps: vec![Step::new(
             ClientRequest::ExecutePreparedDemo(42),
             frames::concat(&[
+                frames::close_complete(),
                 frames::parse_complete(),
                 frames::bind_complete(),
                 frames::data_row(&[Some(b"42"), Some(b"neo")]),
@@ -373,13 +380,78 @@ pub fn seed() -> Vec<Transcript> {
         )],
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ready_ok(
+            // MISS wire: Close(statement) frame (tag 'C'=67, name `bsql_p_…`)
+            // FIRST, then the baked Parse (tag 'P'=80), Bind, Execute, Sync.
             vec![
-                80, 0, 0, 0, 100, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48, 100, 50,
-                100, 57, 52, 98, 99, 51, 52, 55, 55, 50, 100, 52, 97, 52, 98, 97, 0, 83, 69, 76, 69,
-                67, 84, 32, 105, 100, 58, 58, 105, 110, 116, 52, 44, 32, 110, 97, 109, 101, 58, 58,
-                116, 101, 120, 116, 32, 70, 82, 79, 77, 32, 100, 101, 109, 111, 32, 87, 72, 69, 82,
-                69, 32, 105, 100, 32, 61, 32, 36, 49, 58, 58, 105, 110, 116, 52, 0, 0, 1, 0, 0, 0,
-                23, 66, 0, 0, 0, 55, 0, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48,
+                67, 0, 0, 0, 37, 83, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48, 100,
+                50, 100, 57, 52, 98, 99, 51, 52, 55, 55, 50, 100, 52, 97, 52, 98, 97, 0, 80, 0, 0,
+                0, 100, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48, 100, 50, 100, 57,
+                52, 98, 99, 51, 52, 55, 55, 50, 100, 52, 97, 52, 98, 97, 0, 83, 69, 76, 69, 67, 84,
+                32, 105, 100, 58, 58, 105, 110, 116, 52, 44, 32, 110, 97, 109, 101, 58, 58, 116,
+                101, 120, 116, 32, 70, 82, 79, 77, 32, 100, 101, 109, 111, 32, 87, 72, 69, 82, 69,
+                32, 105, 100, 32, 61, 32, 36, 49, 58, 58, 105, 110, 116, 52, 0, 0, 1, 0, 0, 0, 23,
+                66, 0, 0, 0, 55, 0, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48, 100,
+                50, 100, 57, 52, 98, 99, 51, 52, 55, 55, 50, 100, 52, 97, 52, 98, 97, 0, 0, 1, 0, 1,
+                0, 1, 0, 0, 0, 4, 0, 0, 0, 42, 0, 1, 0, 1, 69, 0, 0, 0, 9, 0, 0, 0, 0, 0, 83, 0, 0,
+                0, 4,
+            ],
+            ok_one(rs("SELECT 1", &[], &[23, 25], vec![vec![cell(b"42"), cell(b"neo")]], Some(1))),
+        ),
+    });
+
+    // ── 8b. prepared! macro path REUSE (second call is a cache HIT) ──
+    //        Two `ExecutePreparedDemo` steps on ONE connection: the first is a
+    //        cache MISS (Close+Parse+Bind+Execute+Sync), the second a HIT — a bare
+    //        Bind+Execute+Sync with NO Close and NO Parse (the server-side plan is
+    //        reused). This pins the reuse wire so a regression on the reuse branch
+    //        is caught by the differential (and, via the client-bytes mutations,
+    //        by the falsifier). The run's observable is the corpus's last-step
+    //        projection (the HIT's result set); `client_bytes` accumulates both
+    //        steps' wire (miss ++ hit).
+    out.push(Transcript {
+        name: "prepared_macro_reuse",
+        setup: Setup::ActiveViaTrustHandshake,
+        steps: vec![
+            // Step 1 (MISS): CloseComplete, ParseComplete, BindComplete, row, CC, RFQ.
+            Step::new(
+                ClientRequest::ExecutePreparedDemo(42),
+                frames::concat(&[
+                    frames::close_complete(),
+                    frames::parse_complete(),
+                    frames::bind_complete(),
+                    frames::data_row(&[Some(b"42"), Some(b"neo")]),
+                    frames::command_complete("SELECT 1"),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            ),
+            // Step 2 (HIT): BindComplete, row, CC, RFQ (no CloseComplete/ParseComplete).
+            Step::new(
+                ClientRequest::ExecutePreparedDemo(42),
+                frames::concat(&[
+                    frames::bind_complete(),
+                    frames::data_row(&[Some(b"42"), Some(b"neo")]),
+                    frames::command_complete("SELECT 1"),
+                    frames::ready_for_query(frames::TX_IDLE),
+                ]),
+            ),
+        ],
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ready_ok(
+            // Accumulated wire across both steps: step 1 MISS (Close+Parse+Bind+
+            // Execute+Sync) then step 2 HIT (bare Bind+Execute+Sync — the trailing
+            // `66 ('B') …` frame carries NO Close 'C' and NO Parse 'P').
+            vec![
+                67, 0, 0, 0, 37, 83, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48, 100,
+                50, 100, 57, 52, 98, 99, 51, 52, 55, 55, 50, 100, 52, 97, 52, 98, 97, 0, 80, 0, 0,
+                0, 100, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48, 100, 50, 100, 57,
+                52, 98, 99, 51, 52, 55, 55, 50, 100, 52, 97, 52, 98, 97, 0, 83, 69, 76, 69, 67, 84,
+                32, 105, 100, 58, 58, 105, 110, 116, 52, 44, 32, 110, 97, 109, 101, 58, 58, 116,
+                101, 120, 116, 32, 70, 82, 79, 77, 32, 100, 101, 109, 111, 32, 87, 72, 69, 82, 69,
+                32, 105, 100, 32, 61, 32, 36, 49, 58, 58, 105, 110, 116, 52, 0, 0, 1, 0, 0, 0, 23,
+                66, 0, 0, 0, 55, 0, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48, 100,
+                50, 100, 57, 52, 98, 99, 51, 52, 55, 55, 50, 100, 52, 97, 52, 98, 97, 0, 0, 1, 0, 1,
+                0, 1, 0, 0, 0, 4, 0, 0, 0, 42, 0, 1, 0, 1, 69, 0, 0, 0, 9, 0, 0, 0, 0, 0, 83, 0, 0,
+                0, 4, 66, 0, 0, 0, 55, 0, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48,
                 100, 50, 100, 57, 52, 98, 99, 51, 52, 55, 55, 50, 100, 52, 97, 52, 98, 97, 0, 0, 1,
                 0, 1, 0, 1, 0, 0, 0, 4, 0, 0, 0, 42, 0, 1, 0, 1, 69, 0, 0, 0, 9, 0, 0, 0, 0, 0, 83,
                 0, 0, 0, 4,

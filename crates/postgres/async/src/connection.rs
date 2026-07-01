@@ -256,7 +256,7 @@ impl Connection {
 
     /// Recover the server version with a one-round-trip `SHOW server_version`.
     async fn fetch_server_version(&mut self) -> Result<Option<String>, DriverError> {
-        let result = self.query("SHOW server_version").await?;
+        let result = self.query_sql("SHOW server_version").await?;
         Ok(match result.rows.first() {
             Some(row) => row.get_str(0).map(String::from),
             None => None,
@@ -320,8 +320,9 @@ impl Connection {
         Ok(collector.command_tag().to_string())
     }
 
-    /// Execute a non-row command, returning the affected-row count.
-    pub async fn execute(&mut self, sql: &str) -> Result<u64, DriverError> {
+    /// Execute a non-row runtime-SQL command, returning the affected-row count.
+    /// The compile-checked counterpart is [`execute`](Self::execute).
+    pub async fn execute_sql(&mut self, sql: &str) -> Result<u64, DriverError> {
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let outcome = self
@@ -335,8 +336,9 @@ impl Connection {
         Ok(collector.affected())
     }
 
-    /// Run a row-returning query (text result columns).
-    pub async fn query(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
+    /// Run a row-returning runtime-SQL query (text result columns). The
+    /// compile-checked, typed counterpart is [`query`](Self::query).
+    pub async fn query_sql(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let outcome = self
@@ -350,9 +352,10 @@ impl Connection {
         Self::build_query_result(collector, None)
     }
 
-    /// Run a query returning the first row, or [`DriverError::NoRows`].
-    pub async fn query_one(&mut self, sql: &str) -> Result<Row, DriverError> {
-        self.query(sql)
+    /// Run a runtime-SQL query returning the first row, or [`DriverError::NoRows`].
+    /// The compile-checked counterpart is [`query_one`](Self::query_one).
+    pub async fn query_one_sql(&mut self, sql: &str) -> Result<Row, DriverError> {
+        self.query_sql(sql)
             .await?
             .rows
             .into_iter()
@@ -360,9 +363,9 @@ impl Connection {
             .ok_or(DriverError::NoRows)
     }
 
-    /// Run a query returning the first row if any.
+    /// Run a runtime-SQL query returning the first row if any.
     pub async fn query_opt(&mut self, sql: &str) -> Result<Option<Row>, DriverError> {
-        Ok(self.query(sql).await?.rows.into_iter().next())
+        Ok(self.query_sql(sql).await?.rows.into_iter().next())
     }
 
     /// Prepare a statement: `Parse` + `Describe` + `Sync`, recovering the result
@@ -431,9 +434,13 @@ impl Connection {
         Ok(collector.affected())
     }
 
-    /// Execute a `prepared!` macro query in one Parse+Bind+Execute+Sync round
-    /// trip (binary-uniform params and results), returning the affected count.
-    pub async fn execute_prepared_macro<P, R>(
+    /// Execute a compile-checked `prepared!`/`query!` query for its side effect,
+    /// returning the affected-row count (binary-uniform params).
+    ///
+    /// The flagship typed `execute`: Parses the content-addressed statement once
+    /// per connection, then reuses the server-side plan (a bare Bind + Execute)
+    /// on repeats. The runtime-SQL escape hatch is [`execute_sql`](Self::execute_sql).
+    pub async fn execute<P, R>(
         &mut self,
         q: &'static PreparedQuery<P, R>,
         params: P,
@@ -455,15 +462,15 @@ impl Connection {
         Ok(collector.affected())
     }
 
-    /// Run a compile-checked `query!` and collect its TYPED rows.
+    /// Run a compile-checked `query!` and collect its TYPED rows — the flagship
+    /// parameterised query.
     ///
     /// `Q` is a `query!`-generated carrier (e.g. `FooQuery`); the returned
     /// [`Rows<Q>`] decodes lazily into the macro's typed records — borrowed
     /// (zero-copy text) via [`Rows::iter`], or owned via [`Rows::into_owned`].
-    ///
-    /// Named `query_typed` (not `query`) because the dynamic
-    /// [`query`](Self::query)`(sql: &str)` already occupies that name; this is
-    /// the compile-checked, schema-typed counterpart.
+    /// SQL is validated against the schema at build time, params are bound in
+    /// binary, rows decode into the macro's records. The runtime-SQL escape
+    /// hatch is [`query_sql`](Self::query_sql).
     ///
     /// The Parse + Bind + Execute + Sync runs over the macro's const wire
     /// artifact ([`Q::PREPARED`](TypedQuery::PREPARED)). The sink that collects
@@ -475,17 +482,15 @@ impl Connection {
     /// [`DriverError::OversizeRow`] (the bounded decoder needs one contiguous
     /// payload), never a silent truncation.
     ///
-    /// # Limitation: one execution per carrier per connection
+    /// # Server-side plan reuse
     ///
-    /// Each call re-Parses this query's content-addressed prepared statement on
-    /// the wire, so running the SAME `query!` carrier more than once on a single
-    /// connection — including a reused pooled connection — currently fails with a
-    /// duplicate-prepared-statement server error (SQLSTATE `42P05`). The failure
-    /// is LOUD — a [`DriverError::Db`] — and the connection stays healthy and
-    /// pooled (it is recoverable, not fatal). Per-connection statement caching,
-    /// which will also enable cross-call server-side plan reuse, will remove this
-    /// limitation.
-    pub async fn query_typed<Q: TypedQuery>(
+    /// Repeating the same `query!` on one connection always works — including a
+    /// reused pooled connection, inside a transaction, and across transactions:
+    /// correctness never depends on the cache. A first (or otherwise uncached) use
+    /// safely (re)creates the prepared statement, and once it is durable
+    /// (committed / autocommit) later uses reuse the server-side plan with a bare
+    /// Bind + Execute. There is no duplicate-prepared-statement footgun.
+    pub async fn query<Q: TypedQuery>(
         &mut self,
         params: Q::Params,
     ) -> Result<Rows<Q>, DriverError> {
@@ -512,23 +517,15 @@ impl Connection {
     ///
     /// Returns the `'static` owned twin so the row outlives the result buffer.
     /// Zero rows is [`DriverError::NoRows`]; more than one is
-    /// [`DriverError::TooManyRows`] (loud, never a silently-taken first row).
-    /// Named `query_one_typed` for the same reason as
-    /// [`query_typed`](Self::query_typed).
-    ///
-    /// # Limitation: one execution per carrier per connection
-    ///
-    /// Like [`query_typed`](Self::query_typed), this re-Parses the query's
-    /// content-addressed prepared statement on each call, so running the SAME
-    /// `query!` carrier more than once on a single connection currently fails
-    /// with a duplicate-prepared-statement server error (SQLSTATE `42P05`, a loud
-    /// [`DriverError::Db`]; the connection stays healthy and pooled).
-    /// Per-connection statement caching will remove this limitation.
-    pub async fn query_one_typed<Q: TypedQuery>(
+    /// [`DriverError::TooManyRows`] (loud, never a silently-taken first row). The
+    /// typed counterpart to the runtime-SQL
+    /// [`query_one_sql`](Self::query_one_sql); shares [`query`](Self::query)'s
+    /// server-side plan reuse.
+    pub async fn query_one<Q: TypedQuery>(
         &mut self,
         params: Q::Params,
     ) -> Result<Q::Owned, DriverError> {
-        let rows = self.query_typed::<Q>(params).await?;
+        let rows = self.query::<Q>(params).await?;
         match rows.len() {
             0 => Err(DriverError::NoRows),
             1 => rows

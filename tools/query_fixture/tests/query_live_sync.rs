@@ -6,11 +6,11 @@
 //! prebuffer -> typed decode back to the macro's records.
 //!
 //! Every query is a LITERAL `SELECT` needing no table, so it validates trivially
-//! against the migration catalog and needs no live schema setup. Each distinct
-//! `query!` carrier is executed AT MOST ONCE per connection — the macro path
-//! Parses a named, content-addressed statement on every call, and re-Parsing the
-//! same name in one session is a server error, so distinct round-trips use
-//! distinct carriers (distinct SQL -> distinct content address).
+//! against the migration catalog and needs no live schema setup. A connection
+//! Parses each content-addressed statement ONCE and reuses the server-side plan
+//! on every later call (the per-connection statement cache), so the same carrier
+//! can run any number of times on one connection — proven below by a loop, a
+//! `pg_prepared_statements` count, and a pooled-connection reuse loop.
 //!
 //! Run with: `cargo test -p bsql-query-fixture --test query_live_sync -- --ignored`
 #![forbid(unsafe_code)]
@@ -23,13 +23,13 @@
     reason = "live test harness — expect/unwrap surface failures loudly; not production fallbacks"
 )]
 
-use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, SslMode};
+use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 // One column, fixed-width, NOT NULL -> the borrowed record carries no lifetime
 // (`One { n: i32 }`) and decodes through the vectorized fast path.
 bsql_query_macros::query!(One, "SELECT 1::int4 AS n");
-// A distinct literal so `query_one_typed` can run on the SAME connection without
-// re-Parsing `One`'s content-addressed statement name.
+// A distinct literal (distinct SQL -> distinct content address) — a second shape
+// for `query_one`.
 bsql_query_macros::query!(Seven, "SELECT 7::int4 AS n");
 // One TEXT column, NOT NULL -> the borrowed record carries `<'q>` and `s` aliases
 // the prebuffer (`Hi<'q> { s: &'q str }`).
@@ -37,10 +37,10 @@ bsql_query_macros::query!(Hi, "SELECT 'hello'::text AS s");
 // Multi-row via a `VALUES` derived table (no real table needed). The `int4` cast
 // on the first row types the column; `n` is NOT NULL.
 bsql_query_macros::query!(Nums, "SELECT n FROM (VALUES (10::int4), (20), (30)) AS t(n)");
-// Zero rows (a literal SELECT filtered out) -> `query_one_typed` must classify
+// Zero rows (a literal SELECT filtered out) -> `query_one` must classify
 // `NoRows`.
 bsql_query_macros::query!(NoneRow, "SELECT 1::int4 AS n WHERE false");
-// Multi-row again (distinct SQL) -> `query_one_typed` must classify `TooManyRows`.
+// Multi-row again (distinct SQL) -> `query_one` must classify `TooManyRows`.
 bsql_query_macros::query!(Many, "SELECT n FROM (VALUES (1::int4), (2)) AS t(n)");
 // An INT param -> exercises the `(i32,)` binary-bind path end-to-end.
 bsql_query_macros::query!(Echo, "SELECT $1::int4 AS n");
@@ -52,8 +52,12 @@ bsql_query_macros::query!(WithNull, "SELECT NULL::int4 AS n");
 // A `VALUES` column with a NULL row -> nullable `Option<i32>`, carrying BOTH a
 // present value (`Some`) and a NULL (`None`) in one result.
 bsql_query_macros::query!(MaybeNum, "SELECT n FROM (VALUES (7::int4), (NULL)) AS t(n)");
-// A distinct literal for the repeat-call limitation probe.
+// A distinct literal for the repeat / plan-reuse probes.
 bsql_query_macros::query!(RepeatLit, "SELECT 100::int4 AS n");
+// Distinct literals for the transactional 42P05-gone probes.
+bsql_query_macros::query!(TxLit, "SELECT 11::int4 AS n");
+bsql_query_macros::query!(MultiTxLit, "SELECT 22::int4 AS n");
+bsql_query_macros::query!(HealLit, "SELECT 33::int4 AS n");
 
 fn sync_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -62,14 +66,14 @@ fn sync_config() -> ConnectConfig {
 }
 
 /// (a) The minimal no-schema case: `SELECT 1::int4 AS n` round-trips to a typed
-/// record `One { n: 1 }`, and `query_one_typed` yields the owned twin. Proves the
+/// record `One { n: 1 }`, and `query_one` yields the owned twin. Proves the
 /// whole pipeline with zero schema setup.
 #[test]
 #[ignore = "requires local PG"]
 fn typed_literal_select_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    let rows = c.query_typed::<OneQuery>(()).expect("query_typed One");
+    let rows = c.query::<OneQuery>(()).expect("query One");
     assert_eq!(rows.len(), 1, "exactly one row");
     let rec = rows
         .iter()
@@ -78,9 +82,9 @@ fn typed_literal_select_round_trip() {
         .expect("row decodes");
     assert_eq!(rec.n, 1, "SELECT 1::int4 must decode to n == 1");
 
-    // `query_one_typed` returns the OWNED twin (outlives the buffer). Distinct
+    // `query_one` returns the OWNED twin (outlives the buffer). Distinct
     // carrier (`Seven`) so its statement name does not collide with `One`.
-    let owned = c.query_one_typed::<SevenQuery>(()).expect("query_one_typed Seven");
+    let owned = c.query_one::<SevenQuery>(()).expect("query_one Seven");
     assert_eq!(owned.n, 7, "SELECT 7::int4 must decode to n == 7");
 
     c.close().expect("close");
@@ -93,7 +97,7 @@ fn typed_literal_select_round_trip() {
 fn typed_text_column_borrows_zero_copy() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    let rows = c.query_typed::<HiQuery>(()).expect("query_typed Hi");
+    let rows = c.query::<HiQuery>(()).expect("query Hi");
     assert_eq!(rows.len(), 1);
     let rec = rows
         .iter()
@@ -113,7 +117,7 @@ fn typed_text_column_borrows_zero_copy() {
 fn typed_multi_row_iter_and_into_owned() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    let rows = c.query_typed::<NumsQuery>(()).expect("query_typed Nums");
+    let rows = c.query::<NumsQuery>(()).expect("query Nums");
     assert_eq!(rows.len(), 3, "three VALUES rows");
 
     // iter() yields all three, in order.
@@ -132,20 +136,20 @@ fn typed_multi_row_iter_and_into_owned() {
     c.close().expect("close");
 }
 
-/// `query_one_typed` is EXACTLY-one: zero rows -> `NoRows`, more than one ->
+/// `query_one` is EXACTLY-one: zero rows -> `NoRows`, more than one ->
 /// `TooManyRows` (never a silently-taken first row).
 #[test]
 #[ignore = "requires local PG"]
-fn query_one_typed_classifies_zero_and_many() {
+fn query_one_classifies_zero_and_many() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    let none = c.query_one_typed::<NoneRowQuery>(());
+    let none = c.query_one::<NoneRowQuery>(());
     assert!(
         matches!(none, Err(DriverError::NoRows)),
         "zero rows must be NoRows, got {none:?}"
     );
 
-    let many = c.query_one_typed::<ManyQuery>(());
+    let many = c.query_one::<ManyQuery>(());
     assert!(
         matches!(many, Err(DriverError::TooManyRows)),
         "two rows must be TooManyRows, got {many:?}"
@@ -165,14 +169,14 @@ fn typed_params_int_and_text_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
     let n = c
-        .query_one_typed::<EchoQuery>((42,))
-        .expect("query_one_typed Echo(42)");
+        .query_one::<EchoQuery>((42,))
+        .expect("query_one Echo(42)");
     assert_eq!(n.n, 42, "int4 param 42 must round-trip");
 
     // A `&'static str` literal binds through the text-param path.
     let s = c
-        .query_one_typed::<EchoSQuery>(("hi",))
-        .expect("query_one_typed EchoS(\"hi\")");
+        .query_one::<EchoSQuery>(("hi",))
+        .expect("query_one EchoS(\"hi\")");
     assert_eq!(s.s, "hi", "text param \"hi\" must round-trip");
 
     c.close().expect("close");
@@ -187,48 +191,153 @@ fn typed_nullable_column_decodes_none_and_some() {
 
     // `NULL::int4` is nullable -> the field is `Option<i32>`; the value is None.
     let only_null = c
-        .query_one_typed::<WithNullQuery>(())
-        .expect("query_one_typed WithNull");
+        .query_one::<WithNullQuery>(())
+        .expect("query_one WithNull");
     assert_eq!(only_null.n, None, "NULL::int4 must decode to None");
 
     // A VALUES column with a NULL row carries Some(7) then None.
-    let rows = c.query_typed::<MaybeNumQuery>(()).expect("query_typed MaybeNum");
+    let rows = c.query::<MaybeNumQuery>(()).expect("query MaybeNum");
     let vals: Vec<Option<i32>> = rows.iter().map(|r| r.expect("decodes").n).collect();
     assert_eq!(vals, vec![Some(7), None], "Some(value) then None on an Option column");
 
     c.close().expect("close");
 }
 
-/// The repeat-call limitation, documented on `query_typed`/`query_one_typed`:
-/// running the SAME `query!` carrier twice on ONE connection re-Parses its
-/// content-addressed prepared statement, so the second call fails LOUD with a
-/// `duplicate_prepared_statement` server error (SQLSTATE 42P05) — AND the
-/// connection stays healthy + pooled (the error is recoverable, not fatal).
+/// The 42P05-is-gone proof: the SAME `query!` carrier run in a loop on ONE
+/// connection SUCCEEDS every time. Before the per-connection statement cache this
+/// failed on call #2 with `duplicate_prepared_statement` (42P05); now the Parse
+/// happens once and calls 2..N reuse the server-side plan.
 #[test]
 #[ignore = "requires local PG"]
-fn repeat_same_carrier_fails_loud_and_stays_healthy() {
+fn same_carrier_loops_without_42p05() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-
-    // First call Parses + runs fine.
-    let first = c.query_typed::<RepeatLitQuery>(()).expect("first call succeeds");
-    assert_eq!(first.len(), 1);
-
-    // Second call re-Parses the same statement name -> 42P05.
-    let second = c.query_typed::<RepeatLitQuery>(());
-    match second {
-        Err(DriverError::Db(ref db)) => assert!(
-            db.is_code("42P05"),
-            "expected duplicate_prepared_statement (42P05), got SQLSTATE {}",
-            db.code
-        ),
-        other => panic!("expected a duplicate-prepared-statement Db error, got {other:?}"),
+    for i in 0..100 {
+        let r = c
+            .query::<RepeatLitQuery>(())
+            .unwrap_or_else(|e| panic!("iteration {i} must succeed, got {e:?}"));
+        assert_eq!(r.len(), 1, "iteration {i}: one row");
+        let rec = r.iter().next().expect("row").expect("decodes");
+        assert_eq!(rec.n, 100, "iteration {i}: n == 100");
     }
+    assert!(c.is_healthy(), "connection healthy after 100 reuse runs");
+    c.close().expect("close");
+}
 
-    // The connection survives the recoverable error: a DIFFERENT carrier still
-    // runs on the same connection.
-    assert!(c.is_healthy(), "connection stays healthy after the 42P05");
-    let after = c.query_one_typed::<SevenQuery>(()).expect("a fresh carrier still works");
-    assert_eq!(after.n, 7);
+/// PLAN-REUSE OBSERVABLE: after running the same carrier several times on one
+/// connection, the server holds EXACTLY ONE prepared statement — proof the Parse
+/// happened once. A fresh connection starts with zero prepared statements (the
+/// connect handshake + `SHOW server_version` use only simple queries), so the
+/// single entry is this carrier's content-addressed statement.
+#[test]
+#[ignore = "requires local PG"]
+fn plan_is_parsed_once_and_persists() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    for _ in 0..5 {
+        assert_eq!(c.query::<RepeatLitQuery>(()).expect("run").len(), 1);
+    }
+    let result = c
+        .query_sql("SELECT count(*)::int4 FROM pg_prepared_statements")
+        .expect("count prepared statements");
+    let count = result
+        .rows
+        .first()
+        .expect("count row")
+        .get_i32(0)
+        .expect("count value");
+    assert_eq!(
+        count, 1,
+        "the query! must be Parsed exactly once and persist for the session"
+    );
+    c.close().expect("close");
+}
 
+/// POOL REUSE + invalidation correctness: with `max_size = 1` every checkout
+/// returns the SAME physical connection (the pool does NOT reset on return, so
+/// the statement cache persists with it). Looping checkout -> same query! ->
+/// return stays green across many iterations, on one stable backend pid — proof
+/// the cache stays in sync with the server's prepared-statement set across pool
+/// checkouts (no stale-cache Bind-to-missing).
+#[test]
+#[ignore = "requires local PG"]
+fn pooled_connection_reuses_parsed_plan() {
+    let pool = Pool::new(sync_config(), 1);
+    let mut pid: Option<i32> = None;
+    for i in 0..20 {
+        let mut c = pool.get().unwrap_or_else(|e| panic!("checkout {i}: {e:?}"));
+        let this_pid = c.backend_pid();
+        match pid {
+            None => pid = Some(this_pid),
+            Some(p) => {
+                assert_eq!(p, this_pid, "checkout {i} must reuse the one physical connection")
+            }
+        }
+        let r = c
+            .query::<RepeatLitQuery>(())
+            .unwrap_or_else(|e| panic!("checkout {i}: {e:?}"));
+        assert_eq!(r.len(), 1, "checkout {i}: one row");
+        // `c` drops here -> returned to the pool (no reset), cache persists.
+    }
+}
+
+/// 42P05-GONE (transactional): a `query!` first used INSIDE a committed
+/// transaction, then used again at Idle, SUCCEEDS. Before Close-before-Parse this
+/// was a duplicate-prepared-statement error (the in-tx Parse committed, then the
+/// idle reuse re-Parsed the still-present name).
+#[test]
+#[ignore = "requires local PG"]
+fn query_inside_committed_transaction_then_idle_succeeds() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let n = c
+        .transaction(|tx| Ok(tx.query::<TxLitQuery>(())?.len()))
+        .expect("transaction commits");
+    assert_eq!(n, 1, "the in-transaction query! runs");
+    // The SAME carrier at Idle after the commit — Close-before-Parse re-creates
+    // the (still-present) statement, so this succeeds instead of a 42P05.
+    let again = c
+        .query::<TxLitQuery>(())
+        .expect("same carrier after commit must succeed (was 42P05)");
+    assert_eq!(again.len(), 1);
+    c.close().expect("close");
+}
+
+/// 42P05-GONE (across transactions): the SAME `query!` used inside MANY sequential
+/// transactions all SUCCEED. Before the fix, transaction #2 failed with 42P05.
+#[test]
+#[ignore = "requires local PG"]
+fn same_carrier_across_many_transactions_succeeds() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    for i in 0..20 {
+        let n = c
+            .transaction(|tx| Ok(tx.query::<MultiTxLitQuery>(())?.len()))
+            .unwrap_or_else(|e| panic!("transaction {i} must commit, got {e:?}"));
+        assert_eq!(n, 1, "transaction {i}: one row");
+    }
+    c.close().expect("close");
+}
+
+/// DISCARD ALL self-heal: after a recorded statement is dropped out of band, the
+/// next reuse errors ONCE (loud, classified) and the connection stays healthy;
+/// the call after that re-creates the statement (cache MISS -> Close+Parse) and
+/// succeeds — a self-heal, never a persistent poison.
+#[test]
+#[ignore = "requires local PG"]
+fn discard_all_then_reuse_errors_once_then_self_heals() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    // Record the statement (autocommit MISS completes at Idle -> recorded).
+    assert_eq!(c.query::<HealLitQuery>(()).expect("first use records").len(), 1);
+    // Drop ALL prepared statements out of band (a non-row command).
+    c.execute_sql("DISCARD ALL").expect("discard all");
+    // The next reuse hits the now-missing statement: ONE loud classified error.
+    let poisoned = c.query::<HealLitQuery>(());
+    assert!(
+        matches!(poisoned, Err(DriverError::Db(_))),
+        "reuse over a dropped statement must be a loud Db error, got {poisoned:?}"
+    );
+    assert!(c.is_healthy(), "connection stays healthy (recoverable error)");
+    // The call AFTER that is a MISS (the name was evicted) -> re-created -> works.
+    let healed = c
+        .query::<HealLitQuery>(())
+        .expect("self-heal: the next use re-creates the statement and succeeds");
+    assert_eq!(healed.len(), 1);
     c.close().expect("close");
 }

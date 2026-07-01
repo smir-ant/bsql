@@ -198,6 +198,15 @@ enum ActiveState {
     /// was issued; awaiting `ParseComplete` (`'1'`), which is followed by
     /// `BindComplete` rather than the Sync boundary.
     ParseBindExecuteAwaitingParseComplete,
+    /// A cache-MISS macro path led with a `Close`(statement)+Parse+Bind+Execute
+    /// bundle; awaiting the leading `CloseComplete` (`'3'`), which is followed by
+    /// the `ParseComplete` of the trailing `Parse` — so it advances silently into
+    /// [`ParseBindExecuteAwaitingParseComplete`](Self::ParseBindExecuteAwaitingParseComplete).
+    /// The leading `Close` makes the re-`Parse` idempotent (a `Close` of a
+    /// nonexistent statement is a wire no-op), so a name the server may still
+    /// hold — one first Parsed inside a since-committed transaction, hence not
+    /// yet recorded — is re-created without a duplicate-statement error.
+    CloseParseBindExecuteAwaitingCloseComplete,
     /// A statement `Describe` was issued; awaiting `ParameterDescription`
     /// (`'t'`), which always precedes the row-or-no-data answer.
     DescribeStmtAwaitingParamDesc,
@@ -320,14 +329,35 @@ pub struct ActiveEngine {
     col_names: Vec<String>,
     /// The most recent statement's `CommandComplete` tag.
     command_tag: Option<CommandTag>,
+    /// Content-addressed names of the prepared statements this connection has
+    /// Parsed and that are DURABLE on the server.
+    ///
+    /// A name is recorded here IFF the server currently holds that prepared
+    /// statement on this physical connection: it is added only after its `Parse`
+    /// completed at a clean idle (so the implicit/explicit transaction wrapping
+    /// the `Parse` committed and no rollback can have dropped it), and it is
+    /// removed only by [`clear_statement_cache`](Self::clear_statement_cache)
+    /// (the hook a session reset drives). A statement first Parsed inside an open
+    /// transaction is deliberately NOT recorded, so the set can never name a
+    /// statement a rollback removed. The membership therefore lets a repeat of
+    /// the same content-addressed query reuse the server-side plan with a bare
+    /// `Bind`+`Execute` (skipping the duplicate `Parse` the server would reject),
+    /// while a recorded name can never point at a statement the server lacks.
+    ///
+    /// Bounded by the number of distinct compile-checked queries the binary runs
+    /// on this connection (a statically finite set), so it cannot grow without
+    /// bound; the names are short `'static` references into the consumer's
+    /// `.rodata`, so the entries are bare fat pointers, not owned strings.
+    parsed_statements: Vec<&'static str>,
 }
 
 // Stack footprint of the active handle: the carried-forward `IngestBuf` (144)
 // dominates, plus the pid/secret/tx-status scalars, the `Option<Box<…>>` /
-// `Vec` handles (schema, oversize prefix, the Sub-C accumulator), and the
-// `command_tag`. The result-schema and oversize bytes live off-stack behind
-// those handles. A field addition lands here as a reviewed footprint drift.
-crate::wire_pin!(ActiveEngine, size = 304, align = 8);
+// `Vec` handles (schema, oversize prefix, the Sub-C accumulator, the prepared-
+// statement-name cache), and the `command_tag`. The result-schema, oversize,
+// and cached-name bytes live off-stack behind those handles. A field addition
+// lands here as a reviewed footprint drift.
+crate::wire_pin!(ActiveEngine, size = 328, align = 8);
 
 impl ActiveEngine {
     /// Construct the active engine at handshake completion, carrying the
@@ -351,6 +381,7 @@ impl ActiveEngine {
             col_oids: Vec::new(),
             col_names: Vec::new(),
             command_tag: None,
+            parsed_statements: Vec::new(),
         }
     }
 
@@ -418,6 +449,67 @@ impl ActiveEngine {
     #[must_use]
     pub fn last_command_tag(&self) -> Option<&CommandTag> {
         self.command_tag.as_ref()
+    }
+
+    // ── Per-connection prepared-statement cache ───────────────────────────
+    //
+    // The membership invariant: a content-addressed name is present IFF the
+    // server currently holds that prepared statement on this physical
+    // connection. The recorder enforces one direction (record only a durable
+    // Parse); nothing in this engine drops a server-side statement out of band,
+    // so the other direction holds for the connection's whole life unless a
+    // caller resets the session, in which case it drives `clear_statement_cache`.
+
+    /// Whether a prepared statement with this content-addressed name has already
+    /// been Parsed and is durable on this connection — so a fresh `Parse` of it
+    /// would be a server-side `duplicate_prepared_statement`, and a bare
+    /// `Bind`+`Execute` can reuse the existing server plan instead.
+    #[inline]
+    #[must_use]
+    pub fn is_statement_parsed(&self, stmt_name: &'static str) -> bool {
+        // Linear scan over a statically-bounded set (one entry per distinct
+        // compile-checked query this connection runs); the names are short and
+        // few, so this is cheaper than a hashed set and allocates nothing on the
+        // hit path. `contains` compares str CONTENTS (not pointer identity), so
+        // two call sites that emit the same content-addressed query share one
+        // server-side statement.
+        self.parsed_statements.contains(&stmt_name)
+    }
+
+    /// Record that the prepared statement with this content-addressed name is now
+    /// Parsed and durable on this connection.
+    ///
+    /// The caller records ONLY a name whose `Parse` completed at a clean idle —
+    /// a statement first Parsed inside an open transaction is left unrecorded (a
+    /// rollback could drop it on some servers) — so the recorded set can never
+    /// name a statement the server has dropped.
+    #[inline]
+    pub fn record_statement_parsed(&mut self, stmt_name: &'static str) {
+        // The caller checks `is_statement_parsed` before issuing the `Parse`, so a
+        // name reaches here at most once; a defensive de-dup would be dead code.
+        self.parsed_statements.push(stmt_name);
+    }
+
+    /// Forget every recorded prepared-statement name — the hook a session reset
+    /// (`DISCARD ALL` / `DEALLOCATE ALL`) drives so the cache cannot outlive the
+    /// server-side statements it names.
+    #[inline]
+    pub fn clear_statement_cache(&mut self) {
+        self.parsed_statements.clear();
+    }
+
+    /// Drop one recorded name from the cache.
+    ///
+    /// Driven when a REUSE (bare `Bind`+`Execute` over a recorded name) hit a
+    /// server error — most likely the statement was dropped out of band
+    /// (`DISCARD ALL` / `DEALLOCATE`). Evicting it means the NEXT use of the name
+    /// is a cache MISS, which the Close-before-Parse miss path re-creates safely
+    /// (idempotently) — so the connection self-heals instead of poisoning every
+    /// later reuse. The error itself is still surfaced loudly; this only prunes
+    /// the stale cache entry, never retries.
+    #[inline]
+    pub fn evict_statement(&mut self, stmt_name: &str) {
+        self.parsed_statements.retain(|name| *name != stmt_name);
     }
 
     // ── Extended-query-protocol state-entry seam ──────────────────────────
@@ -505,6 +597,20 @@ impl ActiveEngine {
     pub fn begin_parse_bind_execute(&mut self, result_oids: &[u32]) {
         self.seat_schema(result_oids);
         self.state = ActiveState::ParseBindExecuteAwaitingParseComplete;
+    }
+
+    /// Seat the engine to await the cache-MISS macro path's reply: a leading
+    /// `Close`(statement)+Parse+Bind+Execute bundle → `CloseComplete`,
+    /// `ParseComplete`, `BindComplete`, then the executed rows under one Sync.
+    /// The leading `Close` makes the re-`Parse` idempotent (a `Close` of a
+    /// nonexistent statement is a wire no-op), so a name the server may still
+    /// hold is re-created without a duplicate-statement error. Threads the
+    /// compile-time row schema exactly like
+    /// [`begin_parse_bind_execute`](Self::begin_parse_bind_execute).
+    #[inline]
+    pub fn begin_close_parse_bind_execute(&mut self, result_oids: &[u32]) {
+        self.seat_schema(result_oids);
+        self.state = ActiveState::CloseParseBindExecuteAwaitingCloseComplete;
     }
 
     /// Seat the engine to await a bare `Execute`'s reply — a resume of an open
@@ -606,6 +712,7 @@ impl ActiveEngine {
                 | ActiveState::ParseAwaitingParseComplete
                 | ActiveState::ParseDescribeStmtAwaitingParseComplete
                 | ActiveState::ParseBindExecuteAwaitingParseComplete
+                | ActiveState::CloseParseBindExecuteAwaitingCloseComplete
                 | ActiveState::DescribeStmtAwaitingParamDesc
                 | ActiveState::DescribeAwaitingRowDescOrNoData
                 | ActiveState::BindAwaitingBindComplete
@@ -686,6 +793,9 @@ impl ActiveEngine {
             }
             ActiveState::ParseBindExecuteAwaitingParseComplete => {
                 self.step_parse_bind_execute_awaiting_parse_complete(tag, start, end)
+            }
+            ActiveState::CloseParseBindExecuteAwaitingCloseComplete => {
+                self.step_close_parse_bind_execute_awaiting_close_complete(tag, start, end)
             }
             ActiveState::DescribeStmtAwaitingParamDesc => {
                 self.step_describe_awaiting_param_desc(tag, start, end)
@@ -838,6 +948,28 @@ impl ActiveEngine {
         match tag {
             T_PARSE_COMPLETE => {
                 self.state = ActiveState::BindAwaitingBindComplete;
+                ActiveOutcome::Silent
+            }
+            T_ERROR => self.fail_recoverable(start, end),
+            _ => self.teardown(),
+        }
+    }
+
+    /// `CloseParseBindExecuteAwaitingCloseComplete` — the cache-MISS macro path
+    /// leads with a `Close`(statement) so the trailing `Parse` is idempotent (a
+    /// `Close` of a nonexistent statement is a wire no-op). The `CloseComplete`
+    /// here is followed by the `ParseComplete` of that trailing `Parse`, so it
+    /// advances silently into the existing Parse+Bind+Execute chain — reusing that
+    /// whole proven state sequence rather than duplicating it.
+    fn step_close_parse_bind_execute_awaiting_close_complete(
+        &mut self,
+        tag: u8,
+        start: usize,
+        end: usize,
+    ) -> ActiveOutcome {
+        match tag {
+            T_CLOSE_COMPLETE => {
+                self.state = ActiveState::ParseBindExecuteAwaitingParseComplete;
                 ActiveOutcome::Silent
             }
             T_ERROR => self.fail_recoverable(start, end),
@@ -1070,6 +1202,7 @@ impl ActiveEngine {
             | ActiveState::ParseAwaitingParseComplete
             | ActiveState::ParseDescribeStmtAwaitingParseComplete
             | ActiveState::ParseBindExecuteAwaitingParseComplete
+            | ActiveState::CloseParseBindExecuteAwaitingCloseComplete
             | ActiveState::DescribeStmtAwaitingParamDesc
             | ActiveState::BindAwaitingBindComplete
             | ActiveState::BindAwaitingData
@@ -1318,6 +1451,7 @@ impl ActiveEngine {
             | ActiveState::ParseAwaitingParseComplete
             | ActiveState::ParseDescribeStmtAwaitingParseComplete
             | ActiveState::ParseBindExecuteAwaitingParseComplete
+            | ActiveState::CloseParseBindExecuteAwaitingCloseComplete
             | ActiveState::DescribeStmtAwaitingParamDesc
             | ActiveState::DescribeAwaitingRowDescOrNoData
             | ActiveState::BindAwaitingBindComplete

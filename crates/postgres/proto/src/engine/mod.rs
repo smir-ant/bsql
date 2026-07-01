@@ -351,6 +351,26 @@ impl<'b, T, O> Engine<'b, T, O> {
     pub fn tx_status(&self) -> Result<TxStatus, WrongPhase> {
         Ok(self.phase.as_active()?.tx_status())
     }
+
+    /// Forget the per-connection prepared-statement cache (a no-op unless the
+    /// engine is active).
+    ///
+    /// The cache records which content-addressed statements
+    /// [`query_params`](Self::query_params) has Parsed and that are durable on
+    /// this physical connection, so a repeat reuses the server-side plan with a
+    /// bare `Bind`+`Execute`. Drive this in lockstep with any session reset that
+    /// drops the server's prepared statements (`DISCARD ALL` / `DEALLOCATE ALL`):
+    /// without it a later reuse would `Bind` to a statement the server no longer
+    /// holds. The drivers' connection pool does NOT issue such a reset on return,
+    /// so the cache persists with the physical connection across pool checkouts —
+    /// which is the cross-checkout server-side plan reuse — and this hook serves
+    /// callers that manage statements out of band.
+    #[inline]
+    pub fn clear_statement_cache(&mut self) {
+        if let Phase::Active(active) = &mut self.phase {
+            active.clear_statement_cache();
+        }
+    }
 }
 
 impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {

@@ -16,8 +16,8 @@
 //!
 //! let mut conn = Connection::connect(&config).await?;
 //!
-//! // Simple query
-//! let result = conn.query("SELECT id, name FROM users").await?;
+//! // Runtime-SQL query (the typed flagship is `query::<Q>` with `query!`)
+//! let result = conn.query_sql("SELECT id, name FROM users").await?;
 //! for row in &result.rows {
 //!     let id: i32 = row.get_i32(0).unwrap();
 //!     let name: &str = row.get_str(1).unwrap();
@@ -38,8 +38,8 @@
 //!
 //! // Transactions (tier-1 safety: closure scope = transaction boundary)
 //! conn.transaction(|tx| async {
-//!     tx.execute("INSERT INTO log VALUES ('start')").await?;
-//!     tx.execute("UPDATE counter SET n = n + 1").await?;
+//!     tx.execute_sql("INSERT INTO log VALUES ('start')").await?;
+//!     tx.execute_sql("UPDATE counter SET n = n + 1").await?;
 //!     Ok(()) // → COMMIT. Err → ROLLBACK.
 //! }).await?;
 //! ```
@@ -54,7 +54,7 @@
 //!     .ssl_mode(SslMode::Disable);
 //!
 //! let mut conn = Connection::connect(&config)?;
-//! let result = conn.query("SELECT 1 + 1 AS answer")?;
+//! let result = conn.query_sql("SELECT 1 + 1 AS answer")?;
 //! assert_eq!(result.rows[0].get_i32(0), Some(2));
 //! conn.close()?;
 //! ```

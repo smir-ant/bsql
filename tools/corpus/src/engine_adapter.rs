@@ -478,6 +478,13 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
     // into the engine via `begin_bind_execute`.
     let mut described_oids: Vec<u32> = Vec::new();
 
+    // Mirror the engine's per-connection prepared-statement cache for the macro
+    // path: the FIRST `ExecutePreparedDemo` on this connection is a cache MISS
+    // (Close+Parse+Bind+Execute), later ones are HITs (bare Bind+Execute). The
+    // verb surface makes this decision inside `query_params`; the pull surface
+    // reconstructs it here so the two surfaces stay response-equivalent.
+    let mut demo_parsed = false;
+
     for step in &transcript.steps {
         // Seat the engine into the awaiting-state matching this request before
         // draining its reply — the response-driven analog of a push. SimpleQuery
@@ -497,8 +504,17 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
             }
             ClientRequest::ResumeExecute => active.begin_execute(&described_oids),
             ClientRequest::CloseStatement => active.begin_close(),
+            // Cache MISS (first use) leads with a Close(statement) before the
+            // Parse (idempotent re-Parse) → seat close-parse-bind-execute (reply
+            // leads with CloseComplete then ParseComplete). A HIT (later use) is a
+            // bare Bind+Execute → seat bind-execute (reply leads with BindComplete).
             ClientRequest::ExecutePreparedDemo(_) => {
-                active.begin_parse_bind_execute(&DEMO_RESULT_OIDS)
+                if demo_parsed {
+                    active.begin_bind_execute(&DEMO_RESULT_OIDS);
+                } else {
+                    active.begin_close_parse_bind_execute(&DEMO_RESULT_OIDS);
+                    demo_parsed = true;
+                }
             }
             // A client-initiated graceful close carries no server reply, so there
             // is nothing to pull: the observable is fully determined by the

@@ -117,7 +117,7 @@ fn config() -> ConnectConfig {
 
 /// Join an `EXPLAIN` result's plan-text rows into one string.
 fn explain(conn: &mut Connection, sql: &str) -> String {
-    let result = conn.query(sql).expect("EXPLAIN runs");
+    let result = conn.query_sql(sql).expect("EXPLAIN runs");
     let mut lines = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
         if let Some(line) = row.get_str(0) {
@@ -133,7 +133,7 @@ fn plan_counts(conn: &mut Connection, name: &str) -> (i64, i64) {
     let sql = format!(
         "SELECT generic_plans, custom_plans FROM pg_prepared_statements WHERE name = '{name}'"
     );
-    let result = conn.query(&sql).expect("read plan counts");
+    let result = conn.query_sql(&sql).expect("read plan counts");
     let row = result.rows.first().expect("prepared statement is present");
     (
         row.get_i64(0).expect("generic_plans is an integer"),
@@ -146,7 +146,7 @@ fn plan_counts(conn: &mut Connection, name: &str) -> (i64, i64) {
 /// `pg_prepared_statements`.
 fn run_execs(conn: &mut Connection, execute_sql: &str, n: usize) {
     for _ in 0..n {
-        let _ = conn.query(execute_sql).expect("execute prepared form");
+        let _ = conn.query_sql(execute_sql).expect("execute prepared form");
     }
 }
 
@@ -176,17 +176,17 @@ fn dynamic_filter_plan_mode_evidence() {
     // (one row per value) and a low-selectivity indexed column `bucket`
     // (`g % 4`, ~25% of rows per value, the shape that drives a bitmap
     // scan).
-    conn.execute(
+    conn.execute_sql(
         "CREATE TEMP TABLE toggle_demo (id int4 PRIMARY KEY, v int4 NOT NULL, bucket int4 NOT NULL)",
     )
     .expect("create temp table");
-    conn.execute("INSERT INTO toggle_demo SELECT g, g, g % 4 FROM generate_series(1, 100000) g")
+    conn.execute_sql("INSERT INTO toggle_demo SELECT g, g, g % 4 FROM generate_series(1, 100000) g")
         .expect("seed rows");
-    conn.execute("CREATE INDEX toggle_demo_v_idx ON toggle_demo (v)")
+    conn.execute_sql("CREATE INDEX toggle_demo_v_idx ON toggle_demo (v)")
         .expect("create v index");
-    conn.execute("CREATE INDEX toggle_demo_bucket_idx ON toggle_demo (bucket)")
+    conn.execute_sql("CREATE INDEX toggle_demo_bucket_idx ON toggle_demo (bucket)")
         .expect("create bucket index");
-    conn.execute("ANALYZE toggle_demo").expect("analyze");
+    conn.execute_sql("ANALYZE toggle_demo").expect("analyze");
 
     // Confirm the session is on PostgreSQL's DEFAULT mode — the whole point
     // is that no override is needed.
@@ -196,7 +196,7 @@ fn dynamic_filter_plan_mode_evidence() {
     // ---- (1) High-selectivity toggle under DEFAULT auto: well past the
     //          5-execution switchover window, auto keeps the per-execution
     //          custom plan and uses the index. --------------------------
-    conn.execute("PREPARE tog(int4) AS SELECT id FROM toggle_demo WHERE ($1 IS NULL OR v = $1)")
+    conn.execute_sql("PREPARE tog(int4) AS SELECT id FROM toggle_demo WHERE ($1 IS NULL OR v = $1)")
         .expect("prepare toggle form");
     run_execs(&mut conn, "EXECUTE tog(42)", 12);
     assert_auto_kept_custom(&mut conn, "tog", 12);
@@ -221,7 +221,7 @@ fn dynamic_filter_plan_mode_evidence() {
     //          absence of any generic option. The seq-scan cost
     //          (0.00..1791.00) is the documented figure this fixture
     //          reproduces. -----------------------------------------------
-    conn.execute("SET plan_cache_mode = force_generic_plan")
+    conn.execute_sql("SET plan_cache_mode = force_generic_plan")
         .expect("force generic");
     let forced_generic = explain(&mut conn, "EXPLAIN EXECUTE tog(42)");
     eprintln!("--- force_generic_plan, EXPLAIN EXECUTE tog(42) ---\n{forced_generic}");
@@ -241,15 +241,15 @@ fn dynamic_filter_plan_mode_evidence() {
         !forced_generic.contains("Index Scan"),
         "the forced generic plan must not use the index; got:\n{forced_generic}"
     );
-    conn.execute("RESET plan_cache_mode").expect("reset mode");
-    conn.execute("DEALLOCATE tog").expect("deallocate toggle form");
+    conn.execute_sql("RESET plan_cache_mode").expect("reset mode");
+    conn.execute_sql("DEALLOCATE tog").expect("deallocate toggle form");
 
     // ---- (3) Adversarial NULL-warmup: run the DISABLED (NULL) form first
     //          to raise the average custom-plan cost (each NULL exec folds
     //          to a whole-table scan), then ENABLE it. auto must still keep
     //          the custom index plan — the high average custom cost does
     //          not lure it into the index-losing generic plan. ----------
-    conn.execute("PREPARE tog2(int4) AS SELECT id FROM toggle_demo WHERE ($1 IS NULL OR v = $1)")
+    conn.execute_sql("PREPARE tog2(int4) AS SELECT id FROM toggle_demo WHERE ($1 IS NULL OR v = $1)")
         .expect("prepare null-warmup form");
     run_execs(&mut conn, "EXECUTE tog2(NULL)", 6);
     run_execs(&mut conn, "EXECUTE tog2(42)", 8);
@@ -266,13 +266,13 @@ fn dynamic_filter_plan_mode_evidence() {
         !tog2_plan.contains("Seq Scan"),
         "the NULL warmup must not push the enabled form onto a seq scan; got:\n{tog2_plan}"
     );
-    conn.execute("DEALLOCATE tog2").expect("deallocate null-warmup form");
+    conn.execute_sql("DEALLOCATE tog2").expect("deallocate null-warmup form");
 
     // ---- (4) Adversarial low-selectivity value: `bucket = 1` matches ~25%
     //          of the table, so the index is used via a BITMAP scan rather
     //          than a plain Index Scan. auto keeps the custom bitmap plan;
     //          it does not fall back to the generic full scan. ----------
-    conn.execute(
+    conn.execute_sql(
         "PREPARE tog3(int4) AS SELECT id FROM toggle_demo WHERE ($1 IS NULL OR bucket = $1)",
     )
     .expect("prepare low-selectivity form");
@@ -301,13 +301,13 @@ fn dynamic_filter_plan_mode_evidence() {
         !tog3_plan.contains("Seq Scan"),
         "auto must not degrade the low-selectivity form to a seq scan; got:\n{tog3_plan}"
     );
-    conn.execute("DEALLOCATE tog3").expect("deallocate low-selectivity form");
+    conn.execute_sql("DEALLOCATE tog3").expect("deallocate low-selectivity form");
 
     // ---- (5) Adversarial multi-toggle: two optional filters in one form,
     //          driven through every enable/disable combination. auto keeps
     //          each enabled filter on its index (v → Index Scan, bucket →
     //          Bitmap) and adopts no generic plan. ----------------------
-    conn.execute(
+    conn.execute_sql(
         "PREPARE togm(int4, int4) AS SELECT id FROM toggle_demo \
          WHERE ($1 IS NULL OR v = $1) AND ($2 IS NULL OR bucket = $2)",
     )
@@ -343,7 +343,7 @@ fn dynamic_filter_plan_mode_evidence() {
         !togm_bucket.contains("Seq Scan"),
         "the bucket-enabled multi-toggle must not degrade to a seq scan; got:\n{togm_bucket}"
     );
-    conn.execute("DEALLOCATE togm").expect("deallocate multi-toggle form");
+    conn.execute_sql("DEALLOCATE togm").expect("deallocate multi-toggle form");
 
     // ---- (6) Collateral: a plain `WHERE id = $1` lookup. Under auto its
     //          generic plan is cached and reused (Index Cond shows `$1`).
@@ -351,7 +351,7 @@ fn dynamic_filter_plan_mode_evidence() {
     //          execution (Index Cond shows the literal `42`) — real
     //          planning cost, for no benefit. This is why the session-wide
     //          override was rejected. -----------------------------------
-    conn.execute("PREPARE pk(int4) AS SELECT v FROM toggle_demo WHERE id = $1")
+    conn.execute_sql("PREPARE pk(int4) AS SELECT v FROM toggle_demo WHERE id = $1")
         .expect("prepare plain lookup");
     run_execs(&mut conn, "EXECUTE pk(42)", 12);
     let (pk_generic, pk_custom) = plan_counts(&mut conn, "pk");
@@ -370,11 +370,11 @@ fn dynamic_filter_plan_mode_evidence() {
         pk_auto.contains("id = $1"),
         "under auto the plain lookup uses the cached GENERIC plan (placeholder $1); got:\n{pk_auto}"
     );
-    conn.execute("DEALLOCATE pk").expect("deallocate plain lookup");
+    conn.execute_sql("DEALLOCATE pk").expect("deallocate plain lookup");
 
-    conn.execute("SET plan_cache_mode = force_custom_plan")
+    conn.execute_sql("SET plan_cache_mode = force_custom_plan")
         .expect("force custom");
-    conn.execute("PREPARE pk2(int4) AS SELECT v FROM toggle_demo WHERE id = $1")
+    conn.execute_sql("PREPARE pk2(int4) AS SELECT v FROM toggle_demo WHERE id = $1")
         .expect("prepare plain lookup under force_custom");
     run_execs(&mut conn, "EXECUTE pk2(42)", 12);
     let (pk2_generic, pk2_custom) = plan_counts(&mut conn, "pk2");
@@ -393,8 +393,8 @@ fn dynamic_filter_plan_mode_evidence() {
         pk_custom_plan.contains("id = 42"),
         "under force_custom_plan the plain lookup is re-planned per execution (literal 42); got:\n{pk_custom_plan}"
     );
-    conn.execute("RESET plan_cache_mode").expect("reset mode");
-    conn.execute("DEALLOCATE pk2").expect("deallocate plain lookup");
+    conn.execute_sql("RESET plan_cache_mode").expect("reset mode");
+    conn.execute_sql("DEALLOCATE pk2").expect("deallocate plain lookup");
     conn.close().expect("close");
 
     // The baked marker the engine applies must be the measured winner:

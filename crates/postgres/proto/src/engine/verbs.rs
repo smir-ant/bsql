@@ -99,6 +99,7 @@ use super::frames;
 use super::pump::{poll_once, pump_active_to_boundary, Boundary, SpuriousPending, Surface};
 use super::seams::{absurd, CommandStatus, Live, Never, NotifyStatus, Observer, Outcome, Transport};
 use super::{ActiveEngine, Engine, Phase, SendBuf};
+use crate::action::TxStatus;
 use crate::ident::{Ident, StmtName};
 use crate::params::ParamsWriter;
 use crate::prepared::{PreparedQuery, RowDecode};
@@ -652,15 +653,38 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         drive_to_outcome(active, transport, send_buf, &*obs, sink).await
     }
 
-    /// Parse, bind, execute and sync a compile-checked query in one round trip:
-    /// the `prepared!`/`query!` macro path. Emits the baked `Parse` template, a
-    /// `Bind` built from the argument tuple's [`ParamsWriter`] (binary params and
-    /// binary result columns), the macro's `Execute`, and one `Sync` — byte-
-    /// identical to the crate's macro-execute push. Rows surface against the
-    /// query's compile-time row OIDs. `B = Never`.
+    /// Run a compile-checked query — the `prepared!`/`query!` macro path —
+    /// reusing this connection's already-Parsed server-side plan on a repeat.
+    ///
+    /// On a cache HIT (this connection has RECORDED this content-addressed
+    /// statement as durable) this emits only `Bind`+`Execute`+`Sync` — skipping
+    /// the `Parse` and reusing the server-side plan. On a cache MISS (first use,
+    /// or a name evicted after a reuse error) it emits a `Close`(statement) +
+    /// the baked `Parse` template + `Bind` + `Execute` + one `Sync`, as ONE
+    /// pipelined batch (one round trip). The leading `Close` makes the re-`Parse`
+    /// IDEMPOTENT: a `Close` of a nonexistent statement is a wire no-op, so the
+    /// name is (re)created whether or not the server currently holds it — no
+    /// duplicate-statement error is possible in any case (first use, repeat, or a
+    /// name first Parsed inside a since-committed transaction). Rows surface
+    /// against the query's compile-time row OIDs. `B = Never`.
     ///
     /// `q` is the `PreparedQuery` the macro produces from the SQL text — the
     /// project's sole parameterised-query entry point (no runtime SQL builder).
+    ///
+    /// # Cache soundness
+    ///
+    /// The MISS path is correct unconditionally (Close-before-Parse re-creates
+    /// the statement regardless of prior state), so correctness never depends on
+    /// the record rule. The record rule governs only the plan-reuse OPTIMIZATION:
+    /// a name is recorded (→ future HIT) ONLY when its command completed and the
+    /// connection is back at [`TxStatus::Idle`] — the wrapping transaction
+    /// committed, so the statement is durable — so a HIT (which skips `Close` and
+    /// `Parse`) can never `Bind` to a statement the server lacks. If a recorded
+    /// statement is nonetheless dropped out of band (`DISCARD ALL` /
+    /// `DEALLOCATE`), the resulting reuse error is surfaced loudly AND the name is
+    /// EVICTED, so the next use is a MISS that re-creates it — a self-heal, never
+    /// a silent retry. [`clear_statement_cache`](Self::clear_statement_cache) is
+    /// the up-front hook for a known session reset.
     ///
     /// # Errors
     ///
@@ -685,18 +709,54 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
             ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        // HIT: this connection recorded this content-addressed statement as
+        // durable — send a bare Bind+Execute+Sync and reuse the server plan.
+        let reuse = active.is_statement_parsed(q.stmt_name);
         send_buf.reset();
-        // The macro bakes the complete Parse frame (named, content-addressed,
-        // with param OIDs) and the Bind prefix; reuse them verbatim for byte
-        // identity with the crate's macro-execute path.
-        send_buf.enqueue(q.parse_template);
+        if !reuse {
+            // MISS: lead with a Close of this statement name so the re-Parse is
+            // idempotent — a Close of a nonexistent statement is a wire no-op, so
+            // this re-creates the statement whether or not the server still holds
+            // it (never a duplicate-statement error), then the macro's baked Parse
+            // template installs it. The Bind+Execute+Sync tail below is identical
+            // to the HIT path.
+            enqueue_frame(send_buf, |wb| {
+                frames::build_close_statement(wb, q.stmt_name.as_bytes())
+            })?;
+            send_buf.enqueue(q.parse_template);
+        }
         enqueue_frame(send_buf, |wb| {
             frames::build_bind_prepared(wb, q.bind_execute_prefix, &args)
         })?;
         send_buf.enqueue(&crate::prepared::EXECUTE_EMPTY_PORTAL_NO_LIMIT);
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
-        active.begin_parse_bind_execute(q.row_oids);
+        // Seat the awaiting state to MATCH the wire: a HIT sends no Close/Parse
+        // (await BindComplete directly); a MISS leads with CloseComplete then
+        // ParseComplete. Seating the wrong one would deadlock on an ack that
+        // never comes.
+        if reuse {
+            active.begin_bind_execute(q.row_oids);
+        } else {
+            active.begin_close_parse_bind_execute(q.row_oids);
+        }
         let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        if reuse {
+            // A reuse that the server rejected means the recorded statement was
+            // dropped out of band — evict it so the NEXT use is a MISS that
+            // re-creates it (self-heal). The error itself already rode the sink.
+            if matches!(status, CommandStatus::ServerErrored) {
+                active.evict_statement(q.stmt_name);
+            }
+        } else if matches!(status, CommandStatus::Completed)
+            && matches!(active.tx_status(), TxStatus::Idle)
+        {
+            // Record the name for future HITs only when it is provably durable:
+            // the command completed AND the connection is back at a clean idle
+            // (the wrapping transaction committed). A name Parsed inside an open
+            // transaction is left unrecorded — correctness holds regardless (the
+            // MISS path re-creates it), this only defers the plan-reuse win.
+            active.record_statement_parsed(q.stmt_name);
+        }
         Ok(Outcome { live, status })
     }
 

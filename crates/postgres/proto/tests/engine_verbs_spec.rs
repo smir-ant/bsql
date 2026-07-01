@@ -681,10 +681,11 @@ static Q_DEMO: PreparedQuery<(i32,), (i32, &'static str)> =
 
 #[test]
 fn query_params_runs_the_macro_path() {
-    // Parse + Bind + Execute + Sync → ParseComplete, BindComplete, DataRow,
-    // CommandComplete, RFQ.
+    // First use is a cache MISS: Close + Parse + Bind + Execute + Sync →
+    // CloseComplete, ParseComplete, BindComplete, DataRow, CommandComplete, RFQ.
     let script = concat(&[
         handshake(),
+        close_complete(),
         parse_complete(),
         bind_complete(),
         data_row(&[Some(b"42"), Some(b"alice")]),
@@ -702,6 +703,237 @@ fn query_params_runs_the_macro_path() {
     assert_eq!(cap.delivers.len(), 1);
     // The macro's compile-time row OIDs (int4, text).
     assert_eq!(cap.delivers[0].1, vec![23, 25]);
+}
+
+/// A scripted server that ALSO records every byte the engine writes, into a
+/// shared buffer the test reads between calls — so the outbound wire of each
+/// `query_params` call can be inspected. Reads drain a fixed script (like
+/// [`StaticServer`]); writes append to the shared recorder.
+struct RecordingServer {
+    inbound: Vec<u8>,
+    cursor: usize,
+    written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl Transport for RecordingServer {
+    type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
+    fn read<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> impl Future<Output = Result<usize, Infallible>> + Send + 'a {
+        let n = (self.inbound.len() - self.cursor).min(buf.len());
+        let end = self.cursor + n;
+        if let (Some(dst), Some(src)) = (buf.get_mut(..n), self.inbound.get(self.cursor..end)) {
+            dst.copy_from_slice(src);
+        }
+        self.cursor = end;
+        ready(Ok(n))
+    }
+    fn write<'a>(
+        &'a mut self,
+        buf: &'a [u8],
+    ) -> impl Future<Output = Result<usize, Infallible>> + Send + 'a {
+        // Record synchronously, then yield a ready future (no lock across await).
+        self.written.lock().expect("recorder lock").extend_from_slice(buf);
+        ready(Ok(buf.len()))
+    }
+    fn flush<'a>(&'a mut self) -> impl Future<Output = Result<(), Infallible>> + Send + 'a {
+        ready(Ok(()))
+    }
+    fn shutdown<'a>(&'a mut self) -> impl Future<Output = Result<(), Infallible>> + Send + 'a {
+        ready(Ok(()))
+    }
+}
+
+/// The Close-statement frame for a name, built the same way the engine's
+/// `frames::build_close_statement` does: `'C' | len | 'S' | name | NUL`.
+fn close_statement_frame(name: &str) -> Vec<u8> {
+    let mut body = vec![b'S'];
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
+    frame(b'C', &body)
+}
+
+#[test]
+fn query_params_miss_close_parses_hit_reuses_and_reparses_after_clear() {
+    // The per-connection prepared-statement cache, proven at the byte level:
+    //   call 1 (MISS) -> Close + Parse + Bind + Execute + Sync
+    //   call 2 (HIT)  -> Bind + Execute + Sync only  (no Close, no Parse)
+    //   clear_statement_cache()
+    //   call 3 (MISS again) -> Close + Parse + Bind + Execute + Sync  (== call 1)
+    // The MISS leads with a Close so the re-Parse is idempotent (a Close of a
+    // nonexistent statement is a wire no-op) — this is what eliminates 42P05 in
+    // ALL cases, including a name first Parsed inside a since-committed
+    // transaction. The HIT skips both Close and Parse, reusing the server plan.
+    // The server replies match: MISS -> CloseComplete + ParseComplete + …;
+    // HIT -> BindComplete + … (no CloseComplete, no ParseComplete).
+    let user = Ident::try_from_str("verbs").expect("ident");
+    let inbound = concat(&[
+        handshake(),
+        // call 1 (MISS): Close+Parse+Bind+Execute -> CloseComplete, ParseComplete, BindComplete, row, CC, RFQ
+        close_complete(),
+        parse_complete(),
+        bind_complete(),
+        data_row(&[Some(b"42"), Some(b"alice")]),
+        command_complete("SELECT 1"),
+        rfq(b'I'),
+        // call 2 (HIT): Bind+Execute only -> BindComplete, row, CC, RFQ
+        bind_complete(),
+        data_row(&[Some(b"42"), Some(b"alice")]),
+        command_complete("SELECT 1"),
+        rfq(b'I'),
+        // call 3 (MISS again, after clear): CloseComplete, ParseComplete, …
+        close_complete(),
+        parse_complete(),
+        bind_complete(),
+        data_row(&[Some(b"42"), Some(b"alice")]),
+        command_complete("SELECT 1"),
+        rfq(b'I'),
+    ]);
+    let recorder = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let server = RecordingServer {
+        inbound,
+        cursor: 0,
+        written: std::sync::Arc::clone(&recorder),
+    };
+    // `from` is always a prior snapshot of the (monotonically growing) recorder
+    // length, so the range is in-bounds by construction.
+    let read_written = |from: usize| -> Vec<u8> {
+        recorder.lock().expect("recorder lock")[from..].to_vec()
+    };
+    let len_written = || recorder.lock().expect("recorder lock").len();
+
+    let (w1, w2, w3) = session(server, &user, None, None, Credentials::Trust, |mut e, live| {
+        let live = match poll_once(e.connect(live)) {
+            Ok(Ok(live)) => live,
+            other => panic!("connect: {other:?}"),
+        };
+        // Each call's outbound wire is captured by slicing the recorder at call
+        // boundaries (the Bind+Execute+Sync tail is byte-identical every call).
+        let base = len_written();
+        let mut cap1 = Cap::default();
+        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap1.sink())))
+            .expect("call 1 (miss)");
+        let after1 = len_written();
+        let w1 = read_written(base);
+
+        let mut cap2 = Cap::default();
+        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap2.sink())))
+            .expect("call 2 (reuse) must succeed");
+        let w2 = read_written(after1);
+        let after2 = len_written();
+
+        // Invalidate the cache (the session-reset hook) — call 3 must miss again.
+        e.clear_statement_cache();
+        let mut cap3 = Cap::default();
+        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap3.sink())))
+            .expect("call 3 (after clear)");
+        let w3 = read_written(after2);
+        let _ = live;
+        (w1, w2, w3)
+    })
+    .expect("session assembles");
+
+    let parse_template = Q_DEMO.parse_template_for_test();
+    let close_frame = close_statement_frame(Q_DEMO.stmt_name());
+    // MISS wire == Close ++ Parse ++ (the HIT's Bind+Execute+Sync tail).
+    assert_eq!(
+        w1,
+        [close_frame.as_slice(), parse_template, w2.as_slice()].concat(),
+        "call 1 (miss) == Close ++ Parse template ++ (Bind+Execute+Sync)"
+    );
+    assert!(w1.starts_with(close_frame.as_slice()), "miss leads with the Close frame");
+    assert!(
+        w1.windows(parse_template.len()).any(|w| w == parse_template),
+        "miss carries the Parse template"
+    );
+    // HIT wire carries NEITHER a Close nor a Parse — a bare Bind+Execute+Sync.
+    assert!(!w2.starts_with(close_frame.as_slice()), "hit must NOT send a Close");
+    assert!(
+        !w2.windows(parse_template.len()).any(|w| w == parse_template),
+        "hit must NOT re-send the Parse (server plan reused)"
+    );
+    // After clear_statement_cache the next call is a MISS again: call 3 == call 1.
+    assert_eq!(w3, w1, "after clear, the wire returns to the miss (Close+Parse+Bind+Execute)");
+}
+
+#[test]
+fn query_params_reuse_error_evicts_so_next_use_reparses() {
+    // EVICT-ON-REUSE-ServerErrored: a recorded statement dropped out of band
+    // (DISCARD ALL) makes the next reuse (bare Bind) fail; the name is EVICTED so
+    // the call AFTER that is a MISS (Close+Parse) that re-creates it — self-heal,
+    // never a persistent poison.
+    //   call 1 (MISS)  -> Close+Parse+Bind+Execute, records the name
+    //   call 2 (HIT)   -> Bind+Execute, server ErrorResponse (stmt gone) -> evict
+    //   call 3 (MISS)  -> Close+Parse+Bind+Execute again (re-created, healed)
+    let user = Ident::try_from_str("verbs").expect("ident");
+    let inbound = concat(&[
+        handshake(),
+        // call 1 (MISS): CloseComplete, ParseComplete, BindComplete, row, CC, RFQ
+        close_complete(),
+        parse_complete(),
+        bind_complete(),
+        data_row(&[Some(b"42"), Some(b"alice")]),
+        command_complete("SELECT 1"),
+        rfq(b'I'),
+        // call 2 (HIT): the reused statement is gone -> ErrorResponse + RFQ
+        error_response("ERROR", "26000", "prepared statement \"x\" does not exist"),
+        rfq(b'I'),
+        // call 3 (MISS after evict): CloseComplete, ParseComplete, BindComplete, row, CC, RFQ
+        close_complete(),
+        parse_complete(),
+        bind_complete(),
+        data_row(&[Some(b"42"), Some(b"alice")]),
+        command_complete("SELECT 1"),
+        rfq(b'I'),
+    ]);
+    let recorder = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let server = RecordingServer {
+        inbound,
+        cursor: 0,
+        written: std::sync::Arc::clone(&recorder),
+    };
+    let read_written = |from: usize| -> Vec<u8> {
+        recorder.lock().expect("recorder lock")[from..].to_vec()
+    };
+    let len_written = || recorder.lock().expect("recorder lock").len();
+
+    let (call2_errored, w3, w1) = session(server, &user, None, None, Credentials::Trust, |mut e, live| {
+        let live = match poll_once(e.connect(live)) {
+            Ok(Ok(live)) => live,
+            other => panic!("connect: {other:?}"),
+        };
+        let base = len_written();
+        let mut cap1 = Cap::default();
+        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap1.sink())))
+            .expect("call 1 (miss) records");
+        let after1 = len_written();
+        let w1 = read_written(base);
+
+        // call 2 (HIT) hits the dropped statement: a recoverable ServerErrored.
+        let mut cap2 = Cap::default();
+        let (call2_errored, live) = match poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap2.sink())) {
+            Ok(Ok(Outcome { live, status: CommandStatus::ServerErrored })) => (true, live),
+            other => panic!("expected call 2 ServerErrored (dropped stmt), got {other:?}"),
+        };
+        let after2 = len_written();
+
+        // call 3 must be a MISS (Close+Parse) — the evict healed the cache.
+        let mut cap3 = Cap::default();
+        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap3.sink())))
+            .expect("call 3 (miss, self-healed)");
+        let w3 = read_written(after2);
+        let _ = (after1, live);
+        (call2_errored, w3, w1)
+    })
+    .expect("session assembles");
+
+    assert!(call2_errored, "the reuse over a dropped statement is a recoverable ServerErrored");
+    // call 3 re-creates via Close+Parse (== the original miss wire) — self-heal.
+    assert_eq!(w3, w1, "after eviction the next use re-Parses (miss wire), not a poisoned bare Bind");
 }
 
 #[test]
