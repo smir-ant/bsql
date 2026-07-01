@@ -1,0 +1,14 @@
+error: usage of an `unsafe` block
+  --> tests/compile_fail/query_seal_unsafe_fabricate.rs:35:44
+   |
+35 |       let _hostile: &PreparedQuery<(), ()> = unsafe {
+   |  ____________________________________________^
+36 | |         &*(&mirror as *const Mirror as *const PreparedQuery<(), ()>)
+37 | |     };
+   | |_____^
+   |
+note: the lint level is defined here
+  --> tests/compile_fail/query_seal_unsafe_fabricate.rs:8:11
+   |
+ 8 | #![forbid(unsafe_code)]
+   |           ^^^^^^^^^^^

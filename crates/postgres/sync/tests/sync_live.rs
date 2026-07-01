@@ -452,31 +452,97 @@ fn connection_resilience_marathon() {
     c.close().expect("close");
 }
 
+/// Re-derive the PG `Parse`-frame template bytes for a statement:
+/// `b'P' | len_i32_be | stmt\0 | sql\0 | n_params_i16_be | oid_i32_be × n`.
+/// The length field is self-inclusive (covers everything after the tag byte).
+const fn build_parse_template<const N: usize>(stmt: &str, sql: &str, oids: &[u32]) -> [u8; N] {
+    let mut buf = [0u8; N];
+    let stmt_b = stmt.as_bytes();
+    let sql_b = sql.as_bytes();
+    let len_be = ((N - 1) as u32).to_be_bytes();
+    buf[0] = b'P';
+    buf[1] = len_be[0];
+    buf[2] = len_be[1];
+    buf[3] = len_be[2];
+    buf[4] = len_be[3];
+    let mut i = 5;
+    let mut j = 0;
+    while j < stmt_b.len() {
+        buf[i] = stmt_b[j];
+        i += 1;
+        j += 1;
+    }
+    buf[i] = 0;
+    i += 1;
+    j = 0;
+    while j < sql_b.len() {
+        buf[i] = sql_b[j];
+        i += 1;
+        j += 1;
+    }
+    buf[i] = 0;
+    i += 1;
+    let n_be = (oids.len() as u16).to_be_bytes();
+    buf[i] = n_be[0];
+    i += 1;
+    buf[i] = n_be[1];
+    i += 1;
+    j = 0;
+    while j < oids.len() {
+        let ob = oids[j].to_be_bytes();
+        buf[i] = ob[0];
+        buf[i + 1] = ob[1];
+        buf[i + 2] = ob[2];
+        buf[i + 3] = ob[3];
+        i += 4;
+        j += 1;
+    }
+    buf
+}
+
+/// Re-derive the `Bind`-frame prefix bytes: `empty_portal_NUL | stmt\0`. The
+/// param format block, values, and result-format trailer are appended by the
+/// engine at frame-build time from the argument tuple's `ParamsWriter`.
+const fn build_bind_prefix<const N: usize>(stmt: &str) -> [u8; N] {
+    let mut buf = [0u8; N];
+    let stmt_b = stmt.as_bytes();
+    // buf[0] is the empty-portal NUL (already 0).
+    let mut i = 1;
+    let mut j = 0;
+    while j < stmt_b.len() {
+        buf[i] = stmt_b[j];
+        i += 1;
+        j += 1;
+    }
+    // Final byte is the stmt-name NUL (already 0).
+    buf
+}
+
 // ═══════════════════════════════════════════════════════════
-// prepared! macro path — binary-uniform Bind frame.
+// PreparedQuery execute path — binary-uniform Bind frame.
 //
-// REGRESSION GATE: before the binary-uniform fix, the macro path
-// declared param format = Text in the Bind frame while encoding the
-// value as binary. PostgreSQL then rejected any non-string param
-// (e.g. an i32 sent as 4 binary bytes interpreted as ASCII decimal)
-// with `invalid input syntax for type integer`. This test prepares an
-// INSERT carrying i32 / i64 / bool params through `execute`
-// and asserts: (1) the write succeeds, (2) the affected-row count is
-// correct, (3) the stored values read back exactly. Post-fix it passes;
-// pre-fix the INSERT errors at the server.
+// REGRESSION GATE: before the binary-uniform fix, this path declared
+// param format = Text in the Bind frame while encoding the value as
+// binary. PostgreSQL then rejected any non-string param (e.g. an i32
+// sent as 4 binary bytes interpreted as ASCII decimal) with `invalid
+// input syntax for type integer`. This test prepares an INSERT carrying
+// i32 / i64 / bool params through `execute` and asserts: (1) the write
+// succeeds, (2) the affected-row count is correct, (3) the stored values
+// read back exactly. Post-fix it passes; pre-fix the INSERT errors at
+// the server.
 // ═══════════════════════════════════════════════════════════
 
 #[test]
 #[ignore = "requires local PG"]
-fn prepared_macro_insert_binary_params_round_trip() {
+fn prepared_query_insert_binary_params_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    // A `prepared!` query is content-addressed and fixed at compile
-    // time, so its table name cannot carry the per-process suffix. To
-    // keep concurrent live runs isolated WITHOUT a shared object name,
-    // create a process-unique SCHEMA and point `search_path` at it: the
-    // fixed UNQUALIFIED table name in the prepared SQL resolves to this
-    // session's private schema. Object names stay unique per process.
+    // A content-addressed `PreparedQuery` fixes its SQL at compile time,
+    // so its table name cannot carry the per-process suffix. To keep
+    // concurrent live runs isolated WITHOUT a shared object name, create a
+    // process-unique SCHEMA and point `search_path` at it: the fixed
+    // UNQUALIFIED table name in the prepared SQL resolves to this session's
+    // private schema. Object names stay unique per process.
     let schema = format!("bsql_s3_prep_{}", std::process::id());
 
     c.execute_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).expect("drop schema pre");
@@ -492,10 +558,34 @@ fn prepared_macro_insert_binary_params_round_trip() {
     // R = () — no RETURNING, so this routes through the DML post-install
     // and yields an affected-row count. The unqualified `prep_target`
     // resolves via `search_path` to this process's schema.
+    //
+    // Built through `new_prepared_query`, the sole validating constructor
+    // for a `PreparedQuery` (the compile-checked `query!` macro routes
+    // through it in consumer crates with a migration catalog; this driver
+    // test has no catalog, so it hands the constructor the wire bytes
+    // directly). The bytes are a real PG Parse/Bind frame that PostgreSQL
+    // parses on the wire; the constructor's const validator rejects any OID
+    // drift between the baked template and the declared parameter tuple.
+    const INSERT_SQL: &str =
+        "INSERT INTO prep_target (n, big, flag) VALUES ($1::int4, $2::int8, $3::bool)";
+    const INSERT_STMT: &str = "bsql_p_df4cc122f1840fe04c5a6ed3";
+    // int4 = 23, int8 = 20, bool = 16.
+    const INSERT_PARAM_OIDS: &[u32] = &[23, 20, 16];
+    const INSERT_ROW_OIDS: &[u32] = &[];
+    const INSERT_PARSE_LEN: usize =
+        1 + 4 + INSERT_STMT.len() + 1 + INSERT_SQL.len() + 1 + 2 + 4 * INSERT_PARAM_OIDS.len();
+    const INSERT_PARSE: [u8; INSERT_PARSE_LEN] =
+        build_parse_template::<INSERT_PARSE_LEN>(INSERT_STMT, INSERT_SQL, INSERT_PARAM_OIDS);
+    const INSERT_BIND_LEN: usize = 1 + INSERT_STMT.len() + 1;
+    const INSERT_BIND: [u8; INSERT_BIND_LEN] = build_bind_prefix::<INSERT_BIND_LEN>(INSERT_STMT);
     const Q_INSERT: bsql_postgres_proto::PreparedQuery<(i32, i64, bool), ()> =
-        bsql_postgres_proto::prepared!(
-            "INSERT INTO prep_target (n, big, flag) \
-             VALUES ($1::int4, $2::int8, $3::bool)"
+        bsql_postgres_proto::prepared::new_prepared_query::<(i32, i64, bool), ()>(
+            INSERT_SQL,
+            INSERT_STMT,
+            INSERT_PARAM_OIDS,
+            INSERT_ROW_OIDS,
+            &INSERT_PARSE,
+            &INSERT_BIND,
         );
 
     let sent_n: i32 = 42;

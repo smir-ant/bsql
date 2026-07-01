@@ -1,0 +1,10 @@
+error[E0616]: field `stmt_name` of struct `PreparedQuery` is private
+  --> tests/compile_fail/query_seal_stmt_name_read.rs:12:58
+   |
+12 |     let _hostile: &str = SealStmtNameReadQuery::PREPARED.stmt_name;
+   |                                                          ^^^^^^^^^ private field
+   |
+help: a method `stmt_name` also exists, call it with parentheses
+   |
+12 |     let _hostile: &str = SealStmtNameReadQuery::PREPARED.stmt_name();
+   |                                                                   ++

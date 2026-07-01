@@ -70,8 +70,8 @@ impl Step {
 ///
 /// Each variant maps to one public `Session` push method (or the public
 /// Terminate wire literal). Data-driven variants make "adding a fixture =
-/// adding a data value"; the prepared-macro variant exercises the
-/// `prepared!` binary-param path through a single corpus-local static query.
+/// adding a data value"; the `ExecutePreparedDemo` variant exercises the
+/// binary-param query path through a single corpus-local static query.
 #[derive(Debug, Clone)]
 pub enum ClientRequest {
     /// A simple-query (`Q`) text command.
@@ -111,9 +111,9 @@ pub enum ClientRequest {
     ResumeExecute,
     /// Close the most recently prepared statement (`Close` + `Sync`).
     CloseStatement,
-    /// Execute the corpus-local `prepared!` demo query (binary params) with a
-    /// single `int4` argument. Exercises the macro path's Parse+Bind+Execute
-    /// +Sync round trip.
+    /// Execute the corpus-local demo query (binary params) with a single
+    /// `int4` argument. Exercises the compile-checked query path's Parse+
+    /// Bind+Execute+Sync round trip.
     ExecutePreparedDemo(i32),
     /// Send the Terminate (`X`) wire literal. No server reply; the connection
     /// is closed.

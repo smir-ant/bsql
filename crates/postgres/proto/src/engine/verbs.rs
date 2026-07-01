@@ -66,7 +66,7 @@
 //! [`Surface::Deliver`] at the `CommandComplete` boundary — i.e. AFTER the rows.
 //! So a RUNTIME-untyped consumer (one without a compile-time row type) buffers
 //! the raw [`Surface::Row`] payloads as they arrive and decodes them at
-//! `Deliver`, once the OIDs are known. The compile-time `query!`/`prepared!`
+//! `Deliver`, once the OIDs are known. The compile-time `query!`
 //! path is unaffected: it knows the row shape statically and decodes each row
 //! against `R: RowDecode` as it arrives, never consulting the surfaced OIDs.
 //!
@@ -605,7 +605,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     /// passed `stmt_name` and the OIDs. `B = Never`.
     ///
     /// The single-`Sync` bundling recovers the parameter and row descriptions in
-    /// one round trip; the `prepared!`/`query!` macro path recovers its schema at
+    /// one round trip; the `query!` macro path recovers its schema at
     /// compile time and does not use this verb.
     ///
     /// # Errors
@@ -733,7 +733,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         drive_to_outcome(active, transport, send_buf, &*obs, sink).await
     }
 
-    /// Run a compile-checked query — the `prepared!`/`query!` macro path —
+    /// Run a compile-checked query — the `query!` macro path —
     /// reusing this connection's already-Parsed server-side plan on a repeat.
     ///
     /// On a cache HIT (this connection has RECORDED this content-addressed

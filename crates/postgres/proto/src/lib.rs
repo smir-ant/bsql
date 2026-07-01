@@ -28,7 +28,7 @@
 //!   secret-bearing types.
 //! - [`ident`] / [`write_buf`] / [`params`] / [`command_tag`] / [`reply_id`]
 //!   — bounded wire builders and typed correlators.
-//! - [`mod@prepared`] — runtime support for the `prepared!` proc-macro.
+//! - [`mod@prepared`] — runtime support for the compile-checked `query!` macro.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -166,9 +166,9 @@ pub mod plan_mode;
 // filters / runtime ORDER BY orderings). The generated code asserts
 // against these; an over-budget query is `error[E0080]`.
 pub mod query_budget;
-// Runtime support for the `prepared!` proc-macro. Hosts
+// Runtime support for the compile-checked `query!` macro. Hosts
 // `PreparedQuery<P, R>`, the `RowDecode` sealed trait, and the
-// `new_prepared_query` macro-plumbing constructor.
+// `new_prepared_query` validating constructor the macro routes through.
 pub mod prepared;
 pub mod reply_id;
 
@@ -229,10 +229,6 @@ pub use session_params::{Encoding, OtherEncoding, SessionParams};
 // (type vs macro), so identical-name re-exports do NOT collide.
 pub use bsql_postgres_derive::Pristine;
 pub use pristine::Pristine;
-// Top-level re-export of `prepared!` + `PreparedQuery` + `RowDecode`.
-// The macro lives in `bsql-pg-proto-derive` (proc-macros must live in a
-// `proc-macro = true` crate); the runtime types live here.
-pub use bsql_postgres_derive::prepared;
 pub use plan_mode::{
     PlanCacheMode, PLAN_CACHE_MODE, RESET_PLAN_CACHE_MODE_SQL, SET_PLAN_CACHE_MODE_SQL,
 };

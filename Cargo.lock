@@ -105,7 +105,6 @@ dependencies = [
  "bsql-postgres-proto",
  "proc-macro2",
  "quote",
- "sha2",
  "syn",
  "trybuild",
 ]

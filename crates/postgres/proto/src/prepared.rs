@@ -1,7 +1,7 @@
 //! `PreparedQuery<P, R>` runtime type + `RowDecode` trait.
 //!
-//! This module hosts the runtime artefacts that the `prepared!`
-//! proc-macro produces struct literals of:
+//! This module hosts the runtime artefacts the compile-checked `query!`
+//! macro produces struct literals of:
 //!
 //! - [`PreparedQuery<Params, Row>`] — content-addressed prepared SQL
 //!   query with type-level parameter and row-shape pinning.
@@ -149,13 +149,12 @@ pub trait RowDecode: sealed::RowDecodeSealed + Sized {
 /// Crate-internal projection: marker type → at-`'a` decoded type.
 /// `i32 → i32` (no lifetime), `&'static str → &'a str`, etc.
 //
-// Structural diagnostic for the cell-type rejection path. Without
-// the attribute, a `prepared!("... ROW (i64, u64)")` or similar
-// with `u64` (banned — see `prepared_unsupported_types/numeric.rs`)
-// emits the bare «trait bound `u64: col_cell_at_sealed::Sealed` is
-// not satisfied» message — the sealed module is private, so the
-// contributor cannot inspect the candidates. The attribute below
-// routes them to the supported list directly.
+// Structural diagnostic for the cell-type rejection path. Without the
+// attribute, a `query!` whose inferred row carries an unsupported cell
+// type (e.g. `u64`) emits the bare «trait bound `u64:
+// col_cell_at_sealed::Sealed` is not satisfied» message — the sealed
+// module is private, so the contributor cannot inspect the candidates.
+// The attribute below routes them to the supported list directly.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a supported prepared-query row cell type",
     label = "supported cell types are `i16`, `i32`, `i64`, `u32`, `bool`, and `&'static str` (rendered as `&'a str` at decode time)",
@@ -284,7 +283,7 @@ row_decode_impl!(16, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9
 /// Compile-time prepared PostgreSQL query with type-level parameter
 /// and row-shape binding.
 ///
-/// **Construct only via the [`prepared`](macro@crate::prepared) macro.** All fields
+/// **Construct only via the compile-checked `query!` macro.** All fields
 /// are `pub(crate)` and there is no public constructor. The macro
 /// emits a struct literal through the crate-internal
 /// [`new_prepared_query`] which has `#[doc(hidden)]` visibility and

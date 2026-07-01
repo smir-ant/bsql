@@ -17,8 +17,8 @@ publish = false
 
 [dependencies]
 # Build client request frames + server reply frames from the public wire
-# vocabulary (`wire::TAG_*`, `parse_header`) and the public `prepared!`
-# macro / `PreparedQuery` for the binary-param path. The engine adapter
+# vocabulary (`wire::TAG_*`, `parse_header`) and the public `PreparedQuery`
+# (minted via `new_prepared_query`) for the binary-param path. The engine adapter
 # (test-side, `#[path]`-included) also drives the public sans-IO
 # `engine::{ConnectingEngine, ActiveEngine}` + verb surface via `poll_once`
 # over a synchronous scripted `Transport` — no async runtime is needed.

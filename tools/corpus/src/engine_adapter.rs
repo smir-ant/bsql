@@ -25,8 +25,9 @@ use bsql_postgres_proto::engine::{
     poll_once, session, ActiveEngine, AuthEvent, CommandStatus, ConnectingEngine, Engine,
     EngineError, Event, Live, NoObserver, Outcome, SendBuf, Surface,
 };
+use bsql_postgres_proto::prepared::new_prepared_query;
 use bsql_postgres_proto::{
-    prepared, Credentials, Encoding, Ident, PreparedQuery, SessionParams, TxStatus,
+    Credentials, Encoding, Ident, PreparedQuery, SessionParams, TxStatus,
 };
 
 use core::convert::Infallible;
@@ -871,12 +872,105 @@ fn parse_notification(body: &[u8]) -> Option<ObservedNotify> {
 // Active-phase verb surface (real verbs over a scripted Transport)
 // ===========================================================================
 
-/// The corpus-local `prepared!` demo query — its SQL text fixes the
-/// content-addressed statement name, baked Parse template, and Bind prefix the
-/// goldens pin. `ExecutePreparedDemo` maps to the `query_params` macro-execute
-/// verb over this query.
+/// The corpus-local demo query — its SQL text fixes the content-addressed
+/// statement name, baked Parse template, and Bind prefix the goldens pin.
+/// `ExecutePreparedDemo` maps to the `query_params` macro-execute verb over this
+/// query.
+///
+/// Minted through `new_prepared_query`, the sole validating constructor for a
+/// `PreparedQuery` (the compile-checked `query!` macro routes through it in
+/// consumer crates that have a migration catalog; this corpus has none, so it
+/// hands the constructor the wire bytes directly). The `build_parse_template` /
+/// `build_bind_prefix` helpers re-derive the exact PG frame layout, and the
+/// constructor's const validator rejects any OID drift between the baked
+/// template and the declared parameter tuple. The statement name is the
+/// SHA-256-96 content address of the SQL, so the driven wire is byte-for-byte
+/// identical to what a query macro bakes — which is why the goldens are stable.
+const DEMO_SQL: &str = "SELECT id::int4, name::text FROM demo WHERE id = $1::int4";
+const DEMO_STMT: &str = "bsql_p_a6ff70d2d94bc34772d4a4ba";
+const DEMO_PARAM_OIDS: &[u32] = &[23];
+const DEMO_PARSE_LEN: usize =
+    1 + 4 + DEMO_STMT.len() + 1 + DEMO_SQL.len() + 1 + 2 + 4 * DEMO_PARAM_OIDS.len();
+const DEMO_PARSE: [u8; DEMO_PARSE_LEN] =
+    build_parse_template::<DEMO_PARSE_LEN>(DEMO_STMT, DEMO_SQL, DEMO_PARAM_OIDS);
+const DEMO_BIND_LEN: usize = 1 + DEMO_STMT.len() + 1;
+const DEMO_BIND: [u8; DEMO_BIND_LEN] = build_bind_prefix::<DEMO_BIND_LEN>(DEMO_STMT);
+
 static Q_DEMO_VERB: PreparedQuery<(i32,), (i32, &'static str)> =
-    prepared!("SELECT id::int4, name::text FROM demo WHERE id = $1::int4");
+    new_prepared_query::<(i32,), (i32, &'static str)>(
+        DEMO_SQL,
+        DEMO_STMT,
+        DEMO_PARAM_OIDS,
+        &DEMO_RESULT_OIDS,
+        &DEMO_PARSE,
+        &DEMO_BIND,
+    );
+
+/// Re-derive the PG `Parse`-frame template bytes for a statement:
+/// `b'P' | len_i32_be | stmt\0 | sql\0 | n_params_i16_be | oid_i32_be × n`.
+/// The length field is self-inclusive (covers everything after the tag byte).
+const fn build_parse_template<const N: usize>(stmt: &str, sql: &str, oids: &[u32]) -> [u8; N] {
+    let mut buf = [0u8; N];
+    let stmt_b = stmt.as_bytes();
+    let sql_b = sql.as_bytes();
+    let len_be = ((N - 1) as u32).to_be_bytes();
+    buf[0] = b'P';
+    buf[1] = len_be[0];
+    buf[2] = len_be[1];
+    buf[3] = len_be[2];
+    buf[4] = len_be[3];
+    let mut i = 5;
+    let mut j = 0;
+    while j < stmt_b.len() {
+        buf[i] = stmt_b[j];
+        i += 1;
+        j += 1;
+    }
+    buf[i] = 0;
+    i += 1;
+    j = 0;
+    while j < sql_b.len() {
+        buf[i] = sql_b[j];
+        i += 1;
+        j += 1;
+    }
+    buf[i] = 0;
+    i += 1;
+    let n_be = (oids.len() as u16).to_be_bytes();
+    buf[i] = n_be[0];
+    i += 1;
+    buf[i] = n_be[1];
+    i += 1;
+    j = 0;
+    while j < oids.len() {
+        let ob = oids[j].to_be_bytes();
+        buf[i] = ob[0];
+        buf[i + 1] = ob[1];
+        buf[i + 2] = ob[2];
+        buf[i + 3] = ob[3];
+        i += 4;
+        j += 1;
+    }
+    buf
+}
+
+/// Re-derive the `Bind`-frame prefix bytes: `empty_portal_NUL | stmt\0`. The
+/// param format block, values, and result-format trailer are appended by the
+/// engine at frame-build time from the argument tuple's `ParamsWriter`.
+const fn build_bind_prefix<const N: usize>(stmt: &str) -> [u8; N] {
+    let mut buf = [0u8; N];
+    let stmt_b = stmt.as_bytes();
+    // buf[0] is the empty-portal NUL (already 0).
+    let mut i = 1;
+    let mut j = 0;
+    while j < stmt_b.len() {
+        buf[i] = stmt_b[j];
+        i += 1;
+        j += 1;
+    }
+    // Final byte is the stmt-name NUL (already 0).
+    buf
+}
 
 /// Per-step accumulator for the verb runner (the verb owns the pump loop, so its
 /// sink folds surfaces into here rather than a manual pull loop).

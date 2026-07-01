@@ -32,7 +32,8 @@ use bsql_postgres_proto::wire::{
     TAG_COPY_IN_RESPONSE, TAG_DATA_ROW, TAG_ERROR_RESPONSE, TAG_NOTIFICATION_RESPONSE, TAG_NO_DATA,
     TAG_PARAMETER_DESCRIPTION, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
-use bsql_postgres_proto::{prepared, Credentials, Ident, PreparedQuery, StmtName};
+use bsql_postgres_proto::prepared::new_prepared_query;
+use bsql_postgres_proto::{Credentials, Ident, PreparedQuery, StmtName};
 
 // ─────────────────────────── frame builders ───────────────────────────
 
@@ -676,8 +677,104 @@ fn execute_prepared_completes_dml() {
     assert_eq!(cap.delivers[0].0.as_deref(), Some("DELETE 2"));
 }
 
+// ── Demo prepared query, built through the sole validating constructor ──
+//
+// `new_prepared_query` is the ONLY way to mint a `PreparedQuery` (the seal —
+// there is no unchecked twin). In consumer crates the compile-checked `query!`
+// macro routes its `const` expansion through it; this proto-level engine test
+// has no migration catalog, so it hands the constructor the wire bytes for the
+// same demo query directly. The `build_parse_template` / `build_bind_prefix`
+// helpers below re-derive the exact PG frame layout, and the constructor's
+// const validator cross-checks the baked OID section against the declared
+// parameter tuple — so a drifted template is a build error, not a silent lie.
+// The statement name is the SHA-256-96 content address of the SQL (identical to
+// what the query macro bakes), keeping the driven wire byte-for-byte authentic.
+const DEMO_SQL: &str = "SELECT id::int4, name::text FROM demo WHERE id = $1::int4";
+const DEMO_STMT: &str = "bsql_p_a6ff70d2d94bc34772d4a4ba";
+const DEMO_PARAM_OIDS: &[u32] = &[23];
+const DEMO_ROW_OIDS: &[u32] = &[23, 25];
+const DEMO_PARSE_LEN: usize =
+    1 + 4 + DEMO_STMT.len() + 1 + DEMO_SQL.len() + 1 + 2 + 4 * DEMO_PARAM_OIDS.len();
+const DEMO_PARSE: [u8; DEMO_PARSE_LEN] =
+    build_parse_template::<DEMO_PARSE_LEN>(DEMO_STMT, DEMO_SQL, DEMO_PARAM_OIDS);
+const DEMO_BIND_LEN: usize = 1 + DEMO_STMT.len() + 1;
+const DEMO_BIND: [u8; DEMO_BIND_LEN] = build_bind_prefix::<DEMO_BIND_LEN>(DEMO_STMT);
+
 static Q_DEMO: PreparedQuery<(i32,), (i32, &'static str)> =
-    prepared!("SELECT id::int4, name::text FROM demo WHERE id = $1::int4");
+    new_prepared_query::<(i32,), (i32, &'static str)>(
+        DEMO_SQL,
+        DEMO_STMT,
+        DEMO_PARAM_OIDS,
+        DEMO_ROW_OIDS,
+        &DEMO_PARSE,
+        &DEMO_BIND,
+    );
+
+/// Re-derive the PG `Parse`-frame template bytes for a statement:
+/// `b'P' | len_i32_be | stmt\0 | sql\0 | n_params_i16_be | oid_i32_be × n`.
+/// The length field is self-inclusive (covers everything after the tag byte).
+const fn build_parse_template<const N: usize>(stmt: &str, sql: &str, oids: &[u32]) -> [u8; N] {
+    let mut buf = [0u8; N];
+    let stmt_b = stmt.as_bytes();
+    let sql_b = sql.as_bytes();
+    let len_be = ((N - 1) as u32).to_be_bytes();
+    buf[0] = b'P';
+    buf[1] = len_be[0];
+    buf[2] = len_be[1];
+    buf[3] = len_be[2];
+    buf[4] = len_be[3];
+    let mut i = 5;
+    let mut j = 0;
+    while j < stmt_b.len() {
+        buf[i] = stmt_b[j];
+        i += 1;
+        j += 1;
+    }
+    buf[i] = 0;
+    i += 1;
+    j = 0;
+    while j < sql_b.len() {
+        buf[i] = sql_b[j];
+        i += 1;
+        j += 1;
+    }
+    buf[i] = 0;
+    i += 1;
+    let n_be = (oids.len() as u16).to_be_bytes();
+    buf[i] = n_be[0];
+    i += 1;
+    buf[i] = n_be[1];
+    i += 1;
+    j = 0;
+    while j < oids.len() {
+        let ob = oids[j].to_be_bytes();
+        buf[i] = ob[0];
+        buf[i + 1] = ob[1];
+        buf[i + 2] = ob[2];
+        buf[i + 3] = ob[3];
+        i += 4;
+        j += 1;
+    }
+    buf
+}
+
+/// Re-derive the `Bind`-frame prefix bytes: `empty_portal_NUL | stmt\0`. The
+/// param format block, values, and result-format trailer are appended by the
+/// engine at frame-build time from the argument tuple's `ParamsWriter`.
+const fn build_bind_prefix<const N: usize>(stmt: &str) -> [u8; N] {
+    let mut buf = [0u8; N];
+    let stmt_b = stmt.as_bytes();
+    // buf[0] is the empty-portal NUL (already 0).
+    let mut i = 1;
+    let mut j = 0;
+    while j < stmt_b.len() {
+        buf[i] = stmt_b[j];
+        i += 1;
+        j += 1;
+    }
+    // Final byte is the stmt-name NUL (already 0).
+    buf
+}
 
 #[test]
 fn query_params_runs_the_macro_path() {

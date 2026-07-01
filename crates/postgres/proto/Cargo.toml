@@ -45,9 +45,8 @@ subtle = { workspace = true }
 zeroize = { workspace = true }
 simdutf8 = { workspace = true }
 
-# Pair-crate hosting `#[derive(Pristine)]` and the `prepared!`
-# proc-macro. Standard Rust convention (mirror
-# `serde`/`serde-derive`, `zeroize`/`zeroize-derive`). The derive
+# Pair-crate hosting `#[derive(Pristine)]`. Standard Rust convention
+# (mirror `serde`/`serde-derive`, `zeroize`/`zeroize-derive`). The derive
 # crate is pulled in for proc-macro expansion only — its
 # transitive deps (`syn`/`quote`/`proc-macro2`) live in the
 # proc-macro pair-crate boundary and do NOT propagate to runtime

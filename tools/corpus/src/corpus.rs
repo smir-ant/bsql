@@ -357,7 +357,7 @@ pub fn seed() -> Vec<Transcript> {
         ),
     });
 
-    // ── 8. prepared! macro path (binary params, synthetic row desc) ──
+    // ── 8. compile-checked query path (binary params, synthetic row desc) ──
     //        First use of the statement on this connection is a cache MISS, so the
     //        client wire leads with a Close(statement) before the Parse — the
     //        Close makes the re-Parse idempotent (Close of a nonexistent statement
@@ -399,7 +399,7 @@ pub fn seed() -> Vec<Transcript> {
         ),
     });
 
-    // ── 8b. prepared! macro path REUSE (second call is a cache HIT) ──
+    // ── 8b. compile-checked query path REUSE (second call is a cache HIT) ──
     //        Two `ExecutePreparedDemo` steps on ONE connection: the first is a
     //        cache MISS (Close+Parse+Bind+Execute+Sync), the second a HIT — a bare
     //        Bind+Execute+Sync with NO Close and NO Parse (the server-side plan is

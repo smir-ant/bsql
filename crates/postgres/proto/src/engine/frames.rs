@@ -104,7 +104,7 @@ pub(crate) fn build_parse(
 /// send buffer by the caller, so a multi-kilobyte prepared SQL never has to fit
 /// the bounded [`WriteBuf`] — the same header-in-scratch / body-on-send-buffer
 /// split the simple-query and `CopyData` paths use. No parameter-type OIDs are
-/// declared (the server infers them); the compile-checked `prepared!` macro bakes
+/// declared (the server infers them); the compile-checked `query!` macro bakes
 /// its own Parse template (with OIDs) enqueued verbatim elsewhere. `Err` only if
 /// the computed length overflows `u32`.
 #[inline]

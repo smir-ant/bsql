@@ -25,7 +25,7 @@ branch (see `reforge.md` and the in-repo plan). The workspace is:
 | `bsql-postgres-core` | [`crates/postgres/core/`](crates/postgres/core/) | Shared `Session` + types; the `pump_step → PumpAction` loop both drivers share |
 | `bsql-postgres-async` | [`crates/postgres/async/`](crates/postgres/async/) | Async driver (tokio + rustls) — [README](crates/postgres/async/README.md) |
 | `bsql-postgres-sync` | [`crates/postgres/sync/`](crates/postgres/sync/) | Sync driver (`std::net`, no tokio) |
-| `bsql-postgres-derive` | [`crates/postgres/derive/`](crates/postgres/derive/) | Proc-macro for `prepared!` statements |
+| `bsql-postgres-derive` | [`crates/postgres/derive/`](crates/postgres/derive/) | Proc-macro for `#[derive(Pristine)]` struct-freshness checks |
 | `bsql-sqlite` | [`crates/sqlite/driver/`](crates/sqlite/driver/) | Embedded SQLite driver |
 
 ### Tests
@@ -55,7 +55,7 @@ the clippy forbid bundle (`unwrap_used` / `expect_used` denied).
   combinators: the diesel-style Fragment/Col builder was tried and
   reverted. SQL is a language, not an AST-builder.
 - **Wire format = binary-uniform.** `ParamsWriter` is the sole format
-  authority; `prepared!` params are binary-encoded uniformly.
+  authority; `query!` params are binary-encoded uniformly.
 - **No CI.** Gates run locally via `cargo` plus a planned `devgates`
   crate. There are no GitHub Actions and none are planned.
 

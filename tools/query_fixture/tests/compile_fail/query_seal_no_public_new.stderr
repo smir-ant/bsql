@@ -1,0 +1,5 @@
+error[E0599]: no associated function or constant named `new` found for struct `PreparedQuery<Params, Row>` in the current scope
+  --> tests/compile_fail/query_seal_no_public_new.rs:13:58
+   |
+13 |     let _hostile: PreparedQuery<(), ()> = PreparedQuery::new(
+   |                                                          ^^^ associated function or constant not found in `PreparedQuery<_, _>`

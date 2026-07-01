@@ -1,7 +1,0 @@
-error: prepared!: SQL must be a single string literal (not an identifier, expression, or macro invocation). Use `prepared!("SELECT ...")`. Note: `concat!("a", "b")` is NOT accepted at the proc-macro level — proc-macros see their arguments as raw token-streams before other macros expand. Use one literal.
-  --> tests/prepared_compile_fail/p6_runtime_string_into_macro.rs:41:37
-   |
-41 |     let _q: PreparedQuery<(), ()> = prepared!(hostile);
-   |                                     ^^^^^^^^^^^^^^^^^^
-   |
-   = note: this error originates in the macro `prepared` (in Nightly builds, run with -Z macro-backtrace for more info)

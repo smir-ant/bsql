@@ -1,5 +1,0 @@
-error[E0308]: mismatched types
-  --> tests/prepared_compile_fail/p7_arg_type_mismatch.rs:81:57
-   |
-81 |         let _ = block_on(e.query_params(live, &Q_INT4, ("hostile",), sink));
-   |                                                         ^^^^^^^^^ expected `i32`, found `&str`

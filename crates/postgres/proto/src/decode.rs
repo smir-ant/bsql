@@ -731,8 +731,8 @@ pub enum DecodeError {
         /// Bytes actually received.
         actual_len: u16,
     },
-    /// Server emitted SQL NULL (len = -1) for a column the
-    /// `prepared!` row tuple typed as non-Option. The macro infers
+    /// Server emitted SQL NULL (len = -1) for a column the `query!`
+    /// row tuple typed as non-Option. The macro infers
     /// non-NULL semantics from the Rust type (`i32` vs
     /// `Option<i32>`); if the schema admits NULL, the user types
     /// `Option<T>` in the row tuple. Wide-typed nullable support
@@ -777,7 +777,7 @@ impl fmt::Display for DecodeError {
                 "binary column byte length mismatch: expected {expected_len}, got {actual_len}",
             ),
             Self::NullInNonNullColumn => f.write_str(
-                "server emitted SQL NULL for a column the prepared! row tuple typed as non-Option \
+                "server emitted SQL NULL for a column the query! row tuple typed as non-Option \
                  — use Option<T> in the row tuple if the schema admits NULL",
             ),
         }

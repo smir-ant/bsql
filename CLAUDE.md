@@ -10,7 +10,7 @@ A theoretical-limit rebuild is underway on branch `rebuild` (master plan
   migration DDL. There are **NO** method combinators — the diesel-style
   Fragment/Col combinator paradigm was tried and **reverted** (owner rejected
   `.filter().eq()` builders). Do not reintroduce a runtime SQL builder.
-- **Wire format = binary-uniform.** The `prepared!` path encodes every param in
+- **Wire format = binary-uniform.** The compile-checked `query!` path encodes every param in
   binary; `ParamsWriter` is the **sole** format authority (no per-call
   text/binary drift).
 - **NO CI.** There are no GitHub Actions and the owner mandates none. Gates run
@@ -44,7 +44,7 @@ crates/
     core/            — shared Session + types (2450 LoC)
     async/           — tokio async driver (661 LoC)
     sync/            — std::net sync driver (760 LoC)
-    derive/          — proc-macro for prepared! statements (2472 LoC)
+    derive/          — proc-macro for `#[derive(Pristine)]` struct-freshness checks
   sqlite/
     driver/          — embedded SQLite driver (423 LoC)
 ```

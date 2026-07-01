@@ -58,6 +58,29 @@ fn unknown_reference_is_compile_error() {
     t.compile_fail("tests/compile_fail/query_hostile_construction.rs");
     t.compile_fail("tests/compile_fail/query_hostile_fingerprint.rs");
 
+    // `PreparedQuery` seal hostile-probe matrix. The type is minted only by
+    // the validating constructor the `query!` macro routes through; these
+    // pin that every other minting / mutation / fabrication path is a
+    // compile error. Field privacy is `error[E0616]`, the absence of a
+    // public `new` is `error[E0599]`, an external struct literal is
+    // `error[E0451]`, a hostile `ParamsWriter` impl is `error[E0277]`
+    // (sealed super-trait), and every `unsafe` fabrication / mutation route
+    // is barred by each probe's `#![forbid(unsafe_code)]` (the language half
+    // of the OS-boundary closure). `query!` requiring a string literal —
+    // a runtime string is rejected at expansion — closes the injection
+    // class at the macro input.
+    t.compile_fail("tests/compile_fail/query_seal_no_public_new.rs");
+    t.compile_fail("tests/compile_fail/query_seal_field_read.rs");
+    t.compile_fail("tests/compile_fail/query_seal_unsafe_field_mutate.rs");
+    t.compile_fail("tests/compile_fail/query_seal_unsafe_fabricate.rs");
+    t.compile_fail("tests/compile_fail/query_seal_hostile_paramswriter.rs");
+    t.compile_fail("tests/compile_fail/query_seal_box_leak.rs");
+    t.compile_fail("tests/compile_fail/query_seal_mem_transmute.rs");
+    t.compile_fail("tests/compile_fail/query_seal_stmt_name_read.rs");
+    t.compile_fail("tests/compile_fail/query_seal_wire_template.rs");
+    t.compile_fail("tests/compile_fail/query_arg_type_mismatch.rs");
+    t.compile_fail("tests/compile_fail/query_runtime_string.rs");
+
     // `query!` DYNAMIC-form surface.
     //   * The optional-filter budget is a const-eval cap: nine
     //     `OPTIONAL(...)` filters exceed `MAX_OPTIONAL_FILTERS = 8`

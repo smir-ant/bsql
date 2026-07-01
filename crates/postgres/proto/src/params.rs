@@ -105,13 +105,12 @@ mod sealed {
 /// apply to it, so the dedicated `Option` impl is the only
 /// candidate.
 //
-// Structural diagnostic for sealed-trait E0277. A user writing
-// `prepared!("SELECT $1", (u64,))` (banned — see
-// `prepared_unsupported_types/numeric.rs`) hits a bound failure on
-// `u64: ParamEncoderSealed` — the sealed module is private, so the
-// contributor cannot enumerate candidates from the failed bound. The
-// attribute below routes them to the supported set + the `EncodeBinary`
-// extension path directly.
+// Structural diagnostic for sealed-trait E0277. A `query!` whose
+// inferred parameter carries an unsupported type (e.g. `u64`) hits a
+// bound failure on `u64: ParamEncoderSealed` — the sealed module is
+// private, so the contributor cannot enumerate candidates from the
+// failed bound. The attribute below routes them to the supported set +
+// the `EncodeBinary` extension path directly.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid prepared-query parameter type",
     label = "valid parameter types are those that implement `EncodeBinary` (e.g. `i16`, `i32`, `i64`, `bool`, `&str`) or `Option<T>` over such a type",
@@ -181,11 +180,10 @@ pub const MAX_PARAMS_DATA_TOTAL: usize = 1024;
 /// analysis. `ParamsWriter` is sealed; the impls in this module
 /// cover tuple arity `0..=16`.
 //
-// Structural diagnostic for sealed-trait E0277. A user passing a
-// non-tuple value (e.g. `prepared!("...", my_struct)`) or a tuple of
-// arity > 16 hits `T: ParamsWriterSealed` failure with the bare
-// bound message. The attribute below routes them to the tuple-shape
-// contract.
+// Structural diagnostic for sealed-trait E0277. A parameter value that
+// is not a supported tuple (e.g. a bare struct) or a tuple of arity >
+// 16 hits `T: ParamsWriterSealed` failure with the bare bound message.
+// The attribute below routes them to the tuple-shape contract.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid parameter tuple for a prepared query",
     label = "expected a tuple `()` through `(T1, T2, ..., T16)` where each Ti implements `ParamEncoder`",

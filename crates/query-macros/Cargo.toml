@@ -42,9 +42,9 @@ bsql-build = { path = "../build" }
 
 # `sha2` — content-addresses each `query!` SQL into its prepared
 # statement name (a SHA-256 truncated to 96 bits). Already a workspace
-# dependency (SCRAM-SHA-256 in the proto crate, the `prepared!` statement
-# name in the derive crate); reusing it here adds no new package to the
-# resolved set. Build-time-only, like the rest of this proc-macro crate.
+# dependency (SCRAM-SHA-256 in the proto crate); reusing it here adds no
+# new package to the resolved set. Build-time-only, like the rest of this
+# proc-macro crate.
 sha2 = { workspace = true }
 
 [features]

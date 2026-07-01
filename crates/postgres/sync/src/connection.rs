@@ -410,7 +410,7 @@ impl Connection {
         Ok(collector.affected())
     }
 
-    /// Execute a compile-checked `prepared!`/`query!` query for its side effect,
+    /// Execute a compile-checked `query!` query for its side effect,
     /// returning the affected-row count (binary-uniform params).
     ///
     /// The flagship typed `execute`: Parses the content-addressed statement once
