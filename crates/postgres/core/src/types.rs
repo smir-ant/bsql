@@ -349,26 +349,6 @@ impl FromText for String {
     fn from_text(s: &str) -> Option<Self> { Some(s.to_string()) }
 }
 
-// ─── PreparedStatement ──────────────────────────────────────
-
-#[derive(Debug)]
-pub struct PreparedStatement {
-    pub stmt_name: bsql_postgres_proto::StmtName,
-    pub row_desc: Option<bsql_postgres_proto::decode::RowDesc>,
-    pub column_names: Arc<[String]>,
-}
-
-// Footprint pin: dominated by the inline StmtName (a fixed 63-byte bounded
-// string + length) plus Option<RowDesc> and an Arc<[String]>. The inline name
-// is what avoids a heap allocation per prepared statement; if that bounded
-// capacity changed, this pin would move.
-crate::footprint_pin!(PreparedStatement, size = 104, align = 8);
-
-impl PreparedStatement {
-    pub fn returns_rows(&self) -> bool { self.row_desc.is_some() }
-    pub fn column_names(&self) -> &[String] { &self.column_names }
-}
-
 // ─── Notification ───────────────────────────────────────────
 
 #[derive(Debug, Clone)]

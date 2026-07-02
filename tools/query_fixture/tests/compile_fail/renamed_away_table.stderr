@@ -1,5 +1,0 @@
-error: schema_check!: unknown table `legacy_accounts` — it is not defined by any migration. Known tables: [accounts, audit, orders, users, wide]
- --> tests/compile_fail/renamed_away_table.rs:6:38
-  |
-6 |     bsql_query_macros::schema_check!(legacy_accounts.id);
-  |                                      ^^^^^^^^^^^^^^^

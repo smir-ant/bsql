@@ -25,7 +25,7 @@ members = [
     # `unsafe` (counting allocator + memory probe) and deliberately does
     # NOT inherit the forbid floor — see `[workspace.lints]` below.
     "tools/devgates",
-    # Fixture consumer exercising the migrations -> catalog -> schema_check!
+    # Fixture consumer exercising the migrations -> catalog -> query!
     # chain end-to-end (real build.rs + migrations dir + freshness tests).
     # `publish = false`; not a shipped crate.
     "tools/query_fixture",

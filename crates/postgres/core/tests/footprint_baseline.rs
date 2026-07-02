@@ -20,8 +20,7 @@
 use core::mem::{align_of, size_of};
 
 use bsql_postgres_core::{
-    ArenaSealError, ConnectConfig, DbError, DriverError, Notification, OwnedRow, OwnedRowTooLarge,
-    PreparedStatement, QueryResult, Row, SslMode,
+    ArenaSealError, ConnectConfig, DbError, DriverError, Notification, QueryResult, Row, SslMode,
 };
 
 /// `(size, align)` baseline for every stable public type of `bsql-postgres-core`.
@@ -32,14 +31,11 @@ fn core_stable_public_types_match_baseline() {
     // (measured size, measured align, expected size, expected align, name)
     let rows: &[(usize, usize, usize, usize, &str)] = &[
         (size_of::<Row>(), align_of::<Row>(), 16, 8, "Row"),
-        (size_of::<OwnedRow>(), align_of::<OwnedRow>(), 16, 8, "OwnedRow"),
-        (size_of::<OwnedRowTooLarge>(), align_of::<OwnedRowTooLarge>(), 0, 1, "OwnedRowTooLarge"),
         (size_of::<ArenaSealError>(), align_of::<ArenaSealError>(), 1, 1, "ArenaSealError"),
         (size_of::<DriverError>(), align_of::<DriverError>(), 120, 8, "DriverError"),
         (size_of::<DbError>(), align_of::<DbError>(), 120, 8, "DbError"),
         (size_of::<ConnectConfig>(), align_of::<ConnectConfig>(), 112, 8, "ConnectConfig"),
         (size_of::<SslMode>(), align_of::<SslMode>(), 1, 1, "SslMode"),
-        (size_of::<PreparedStatement>(), align_of::<PreparedStatement>(), 104, 8, "PreparedStatement"),
         (size_of::<Notification>(), align_of::<Notification>(), 56, 8, "Notification"),
         (size_of::<QueryResult>(), align_of::<QueryResult>(), 72, 8, "QueryResult"),
     ];

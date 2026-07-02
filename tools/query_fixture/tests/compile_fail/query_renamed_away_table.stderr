@@ -1,0 +1,5 @@
+error: query!: unknown table or alias `legacy_accounts` in this query
+ --> tests/compile_fail/query_renamed_away_table.rs:6:36
+  |
+6 |     bsql_query_macros::query!(Row, "SELECT id FROM legacy_accounts");
+  |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

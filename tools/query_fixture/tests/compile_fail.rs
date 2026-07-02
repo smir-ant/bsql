@@ -1,4 +1,4 @@
-//! trybuild goldens: an unknown table / column reference is a
+//! trybuild goldens: a `query!` against an unknown table / column is a
 //! `compile_error!`, not a silent pass.
 //!
 //! trybuild compiles each `compile_fail/*.rs` as its own crate via a
@@ -25,17 +25,22 @@ fn unknown_reference_is_compile_error() {
         std::env::set_var("BSQL_SCHEMA_CATALOG", env!("BSQL_SCHEMA_CATALOG"));
     }
     let t = trybuild::TestCases::new();
-    t.compile_fail("tests/compile_fail/unknown_column.rs");
-    t.compile_fail("tests/compile_fail/unknown_table.rs");
-    // A table renamed away by `ALTER TABLE ... RENAME TO` no longer
-    // resolves under its OLD name — the freshness guarantee for renames.
-    t.compile_fail("tests/compile_fail/renamed_away_table.rs");
 
-    // `query!` compile-fail surface. Two are schema-typing errors the
-    // inference engine surfaces as `compile_error!` (an unknown column, an
-    // uncast parameter); two are the typed record doing its job (a missing
-    // field is E0609, a wrong-typed field is E0308) — proving the emitted
-    // record is genuinely typed, not a `Vec<String>` escape hatch.
+    // `query!` schema-resolution surface: a reference the inference engine
+    // cannot resolve against the migration-replayed catalog is a
+    // `compile_error!` at the SQL literal, never a silent pass.
+    //   * An unknown table is `InferError::UnknownRelation`.
+    //   * A table renamed away by `ALTER TABLE ... RENAME TO` no longer
+    //     resolves under its OLD name — the same `UnknownRelation`, which is
+    //     the freshness guarantee for renames (the old name was re-keyed out
+    //     of the catalog).
+    //   * An unknown column is `InferError::UnknownColumn`.
+    //   * An uncast parameter is a schema-typing error.
+    //   * A missing / wrong-typed record field is the typed record doing its
+    //     job (E0609 / E0308) — proving the emitted record is genuinely
+    //     typed, not a `Vec<String>` escape hatch.
+    t.compile_fail("tests/compile_fail/query_unknown_table.rs");
+    t.compile_fail("tests/compile_fail/query_renamed_away_table.rs");
     t.compile_fail("tests/compile_fail/query_unknown_column.rs");
     t.compile_fail("tests/compile_fail/query_uncast_param.rs");
     t.compile_fail("tests/compile_fail/query_wrong_field.rs");

@@ -13,7 +13,6 @@ pub mod config;
 pub mod error;
 pub mod footprint;
 pub mod materialize;
-pub mod owned_row;
 pub mod sql_ident;
 pub mod ssl;
 pub mod tls;
@@ -25,8 +24,5 @@ pub mod types;
 pub use config::{ConnectConfig, SslMode};
 pub use error::{DbError, DriverError};
 pub use materialize::{CollectedResult, DbErrorSink, ResultCollector};
-pub use owned_row::{OwnedRow, OwnedRowTooLarge};
 pub use typed_rows::{Rows, RowsBuilder};
-pub use types::{
-    ArenaBuilder, ArenaSealError, FromText, Notification, PreparedStatement, QueryResult, Row,
-};
+pub use types::{ArenaBuilder, ArenaSealError, FromText, Notification, QueryResult, Row};

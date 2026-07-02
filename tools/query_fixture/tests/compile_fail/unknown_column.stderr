@@ -1,5 +1,0 @@
-error: schema_check!: table `users` has no column `nope`. Known columns: [bio, email, id, name]
- --> tests/compile_fail/unknown_column.rs:3:44
-  |
-3 |     bsql_query_macros::schema_check!(users.nope);
-  |                                            ^^^^

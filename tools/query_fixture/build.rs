@@ -6,7 +6,7 @@
 //!     recompiles),
 //!   * replays the DDL into a column catalog,
 //!   * writes the catalog to OUT_DIR and sets the `BSQL_SCHEMA_CATALOG`
-//!     rustc-env channel the `schema_check!` macro reads at expansion.
+//!     rustc-env channel the `query!` macro reads at expansion.
 //!
 //! Any error is propagated (fail the build) — never swallowed.
 

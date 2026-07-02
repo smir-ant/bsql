@@ -1,0 +1,5 @@
+error: query!: unknown table or alias `widgets` in this query
+ --> tests/compile_fail/query_unknown_table.rs:4:36
+  |
+4 |     bsql_query_macros::query!(Row, "SELECT id FROM widgets");
+  |                                    ^^^^^^^^^^^^^^^^^^^^^^^^
