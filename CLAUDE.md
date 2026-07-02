@@ -2,10 +2,14 @@
 
 ## Direction (2026 rebuild)
 
-A theoretical-limit rebuild is underway on branch `rebuild` (master plan
-`reforge.md` + the rebuild plan). Load-bearing decisions for any new session:
+The theoretical-limit rebuild's core has landed: the compile-checked
+`query!` flagship, the PostgreSQL async + sync drivers, and the embedded
+SQLite backend all ship today, reachable through the single `bsql` umbrella
+crate. `reforge.md` (the original blueprint) and `CREDO.md` (its principles)
+are now **historical** — this file and the code are the source of truth.
+Load-bearing decisions for any new session:
 
-- **Query API = PURE SQL TEXT.** SQL lives as text in a future compile-checked
+- **Query API = PURE SQL TEXT.** SQL lives as text in the compile-checked
   `query!` macro, validated at build time against the schema replayed from
   migration DDL. There are **NO** method combinators — the diesel-style
   Fragment/Col combinator paradigm was tried and **reverted** (owner rejected
@@ -20,7 +24,9 @@ A theoretical-limit rebuild is underway on branch `rebuild` (master plan
 - **Compile-checked query API.** SQL references are validated at build time
   against the schema replayed from the consumer's migration `*.sql` by
   `bsql-build` (a `[build-dependencies]` helper) into a catalog the
-  `bsql-query-macros` proc-macro reads. **Guarantee boundary:** the catalog
+  `bsql-query-macros` proc-macro reads. The whole flagship is reachable
+  through the single `bsql` crate with `features = ["macros"]` — a consumer
+  hand-wires nothing (see Build & test). **Guarantee boundary:** the catalog
   matches the migration FILES, not the live database. A migration applied
   out-of-band (e.g. by hand in `psql`) without a corresponding file is invisible
   by design — but this is strictly stronger than a live-introspection cache that
@@ -38,18 +44,20 @@ A theoretical-limit rebuild is underway on branch `rebuild` (master plan
 
 ```
 crates/
-  bsql/              — umbrella re-export (bsql::pg, bsql::pg_sync, bsql::sqlite)  — 113 LoC
+  bsql/              — umbrella facade + query! re-export (bsql::pg, ::pg_sync, ::sqlite)  — 173 LoC
   postgres/
-    proto/           — sans-IO wire protocol state machine (no_std, ~49.3K LoC)
-    core/            — shared Session + types (2450 LoC)
-    async/           — tokio async driver (661 LoC)
-    sync/            — std::net sync driver (760 LoC)
-    derive/          — proc-macro for `#[derive(Pristine)]` struct-freshness checks
+    proto/           — sans-IO wire protocol + session engine (no_std + alloc)  — 24813 LoC
+    core/            — shared engine materializer + types + config + TLS + Rows  — 3776 LoC
+    async/           — tokio async driver (thin adapter over the engine)  — 1711 LoC
+    sync/            — std::net sync driver (thin adapter over the engine)  — 1534 LoC
+    derive/          — proc-macro for `#[derive(Pristine)]` struct-freshness checks  — 416 LoC
   sqlite/
-    driver/          — embedded SQLite driver (423 LoC)
+    driver/          — embedded SQLite driver (bundled rusqlite)  — 1010 LoC
+  build/             — BUILD-DEP: migration DDL → schema catalog (+ SQLite template)  — 32862 LoC
+  query-macros/      — PROC-MACRO: reads the catalog, types/validates query!  — 1285 LoC
 ```
 
-(src LoC measured @ branch `work/s2b` base 8eb9276 via `find … -name '*.rs' -exec cat {} + | wc -l`, post-Fragment-revert. Package names: `bsql`, `bsql-postgres-{proto,core,async,sync,derive}`, `bsql-sqlite`.)
+(src LoC measured @ HEAD 67882617 via, per crate, `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by ~13K lines of inference tests in `src/infer.rs`. Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync,derive}`, `bsql-sqlite`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-sqlite-fixture`, `bsql-corpus`.)
 
 ## Build & test
 
@@ -64,7 +72,32 @@ cargo test -p bsql-devgates --test doc_links           # intra-doc-link wall (br
 cargo test -p bsql-sqlite            # SQLite (no PG needed)
 cargo test -p bsql-postgres-async --test sq_live -- --ignored    # async PG (needs local PG)
 cargo test -p bsql-postgres-sync --test sync_live -- --ignored   # sync PG (needs local PG)
+cargo test -p bsql-query-fixture --test query_live_async -- --ignored  # live query! (async, needs PG)
+cargo test -p bsql-query-fixture --test query_live_sync  -- --ignored  # live query! (sync, needs PG)
 ```
+
+**Consumer wiring — the `query!` flagship.** A consumer reaches the whole
+compile-checked query API through the single `bsql` crate: add it with
+`features = ["macros", "postgres-async"]` (or `postgres-sync`) to
+`[dependencies]`, add `bsql-build` to `[build-dependencies]`, and add a
+one-line `build.rs`:
+
+```rust
+fn main() -> Result<(), bsql_build::BuildError> {
+    bsql_build::emit("migrations")   // replays migrations/ into the catalog
+}
+```
+
+Then `bsql::query!(Name, "<SQL>")` types the SQL at build time against that
+catalog and emits the `Name` record + the `NameQuery` carrier (which
+implements the umbrella's re-exported `bsql::TypedQuery`); an unknown
+column is a `compile_error!`. The macro's expansion names only
+`::bsql::__rt::…` paths (a `#[doc(hidden)]` internal module), so no other
+dependency is needed at compile time — `bsql-query-macros` is a host-only
+proc-macro and never enters the runtime binary. `emit` also emits the
+SQLite conformance template when the build-dep's `sqlite` feature is on; a
+PostgreSQL-only build can call `bsql_build::emit_catalog("migrations")`
+instead. `tools/query_fixture` is the end-to-end proof of this shape.
 
 The `deps_pin` gate (`tools/devgates/tests/deps_pin.rs`) pins the resolved
 dependency set (parsed from `Cargo.lock`) to a committed golden, and bans any
@@ -107,10 +140,10 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 
 ## Architecture
 
-- **Sans-IO core** (`bsql-postgres-proto`): wire protocol with zero I/O dependencies. State machine driven by `feed_bytes`/`advance_one_frame`.
-- **Session** (`bsql-postgres-core`): pump state machine wrapping PgProtocol. Both drivers use identical `pump_step() → PumpAction` loop.
-- **Drivers** are thin I/O adapters (~15-line pump loop each). Difference: `.await` on async, blocking on sync.
-- **Row** uses Arc-shared arena: 4 heap allocations per entire QueryResult (not per row). Row is 16 bytes, `'static + Clone + Send + Sync`.
+- **Sans-IO engine** (`bsql-postgres-proto`, `engine` module): the session engine with zero I/O dependencies (`no_std + alloc`). Its seams: `Transport` (the driver-facing I/O seam, RPITIT + `Send`), `Live` (a branded, non-`Clone`, linear liveness token minted by `engine::session` / `session_with`), an `Observer` policy seam, and the `Never` carrier for phase-impossible frames. Protocol logic lives here; the driver only supplies bytes.
+- **Core** (`bsql-postgres-core`): the shared result materializer, the dynamic `Row` / `QueryResult` types, `ConnectConfig`, TLS config, and the typed `Rows` / `RowsBuilder` containers. Both drivers build on it.
+- **Drivers** are thin I/O adapters implementing the `Transport` seam over the one engine. Difference: `.await` on async, blocking on sync.
+- **Rows.** The dynamic `Row` (from `query_sql` etc.) is 16 bytes (`'static + Clone + Send + Sync`) over an `Arc`-shared arena: 4 heap allocations per whole `QueryResult`, regardless of row count. The typed `Rows<Q>` (from the `query!` flagship) is 2 allocations per result and 0 per row (borrowed, zero-copy decode).
 
 ## Safety invariants
 

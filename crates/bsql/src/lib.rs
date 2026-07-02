@@ -74,16 +74,38 @@
 //! assert_eq!(row.get_i64(0), Some(42));
 //! ```
 //!
+//! ## The compile-checked `query!` flagship (feature `macros`)
+//!
+//! With `features = ["macros"]` and `bsql-build` in `[build-dependencies]`
+//! (plus a one-line `build.rs` calling `bsql_build::emit("migrations")`),
+//! `query!` types SQL at build time against the schema replayed from the
+//! consumer's migration files. A wrong column or type is a compile error.
+//!
+//! ```rust,ignore
+//! // Emits the `UsersById` record + the `UsersByIdQuery` carrier, typed
+//! // against `migrations/`. `SELECT nope FROM users` would not compile.
+//! bsql::query!(UsersById, "SELECT id, email FROM users WHERE id = $1");
+//! ```
+//!
+//! The carrier implements the re-exported `TypedQuery`; a driver's typed
+//! entry points execute it and return a `Rows` of decoded records.
+//!
 //! ## Architecture
 //!
 //! ```text
-//! bsql-pg-proto        — sans-IO wire protocol state machine (no_std)
-//! bsql-postgres-core   — engine materialiser + types + config + SSL (shared)
-//! bsql-postgres-async  — tokio thin adapter (~550 LoC)
-//! bsql-postgres-sync   — std::net thin adapter (~560 LoC)
-//! bsql-sqlite          — embedded SQLite driver (~340 LoC)
-//! bsql                 — umbrella re-export crate
+//! bsql-postgres-proto  — sans-IO wire protocol + session engine (no_std + alloc)
+//! bsql-postgres-core   — engine materializer + types + config + TLS + Rows (shared)
+//! bsql-postgres-async  — tokio thin adapter over the engine
+//! bsql-postgres-sync   — std::net thin adapter over the engine
+//! bsql-sqlite          — embedded SQLite driver (bundled rusqlite)
+//! bsql                 — this umbrella facade + query! re-export
 //! ```
+//!
+//! The compile-checked `query!` toolchain is build-time only:
+//! `bsql-build` (a `[build-dependencies]` helper) replays a consumer's
+//! migration DDL into a schema catalog, and the `bsql-query-macros`
+//! proc-macro types each `query!` against it. Neither enters a consumer's
+//! runtime binary.
 //!
 //! ## Safety guarantees
 //!
