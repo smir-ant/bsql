@@ -113,7 +113,7 @@ mod sealed {
 // the `EncodeBinary` extension path directly.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid prepared-query parameter type",
-    label = "valid parameter types are those that implement `EncodeBinary` (e.g. `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `&str`, `&[u8]`, or a `&[T]` array) or `Option<T>` over such a type",
+    label = "valid parameter types are those that implement `EncodeBinary` (e.g. `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `&str`, `&[u8]`, `Uuid`, `Timestamptz`, `Timestamp`, `Json`, `Jsonb`, or a `&[T]` array) or `Option<T>` over such a type",
     note = "`ParamEncoder` is sealed — extend the supported set by adding `impl EncodeBinary for ...` in `decode.rs`; downstream `impl ParamEncoder for ...` is forbidden by construction"
 )]
 pub trait ParamEncoder: sealed::ParamEncoderSealed {

@@ -171,6 +171,19 @@ pub use bsql_query_macros::query;
 #[cfg(feature = "macros")]
 pub use bsql_postgres_proto::{DecodeError, PreparedQuery, QueryFingerprint, TypedQuery};
 
+/// Dependency-free bsql-native types a `query!` record field carries for a
+/// PostgreSQL `uuid` / `timestamptz` / `timestamp` / `json` / `jsonb` column
+/// — the always-available core that lets `query!` type a real schema without
+/// pulling in `uuid` / `time` / `serde_json`. [`Uuid`] round-trips its
+/// hyphenated hex text; [`Timestamptz`] exposes an exact Unix-epoch
+/// conversion; [`Timestamp`] is the zone-less peer; [`Json`] / [`Jsonb`]
+/// surface the document's UTF-8 text verbatim. Ergonomic external-crate
+/// integrations are a deferred, feature-flagged follow-up.
+#[cfg(feature = "macros")]
+pub use bsql_postgres_proto::{
+    Json, Jsonb, Timestamp, Timestamptz, Uuid, UuidParseError,
+};
+
 /// Bounded / streaming typed result containers a driver's typed-query
 /// entry points return: [`Rows`] holds one query's decoded rows;
 /// [`RowsBuilder`] is its prebuffer.
@@ -191,7 +204,7 @@ pub use bsql_postgres_core::{Rows, RowsBuilder};
 pub mod __rt {
     pub use bsql_postgres_proto::wire_pin;
     pub use bsql_postgres_proto::{
-        BinaryFmt, Cell, DataRowRef, DecodeError, PreparedQuery, QueryFingerprint, TypedQuery,
-        oids, prepared, query_budget,
+        BinaryFmt, Cell, DataRowRef, DecodeError, Json, Jsonb, PreparedQuery, QueryFingerprint,
+        Timestamp, Timestamptz, TypedQuery, Uuid, oids, prepared, query_budget,
     };
 }

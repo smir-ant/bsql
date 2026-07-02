@@ -151,6 +151,11 @@ pub(crate) mod md5;
 pub(crate) mod narrow;
 pub mod params;
 pub mod password;
+// Dep-free bsql-native semantic types (`Uuid`, `Timestamptz`, `Timestamp`,
+// `Json`, `Jsonb`) the compile-checked `query!` path decodes without any
+// external crate. Their `Cell`/`EncodeBinary` impls live in `decode.rs` and
+// their `ColCellAt` row-tuple markers in `prepared.rs`, beside their peers.
+pub mod pgtypes;
 // The decided server-side plan-cache mode for dynamic param-toggle
 // queries (a `const` marker the connection-setup / pool-reset paths
 // consume). See [`plan_mode`].
@@ -198,6 +203,7 @@ pub use decode::{
     RowDesc, RowDescColumnsIter, TextFmt, decode_with_format, oids,
     parse_long_uint_swar, parse_pg_bool_swar, parse_short_uint_swar, validate_utf8_swar,
 };
+pub use pgtypes::{Json, Jsonb, Timestamp, Timestamptz, Uuid, UuidParseError};
 pub use error::{ErrorKind, ProtocolError, StateErrorKind};
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
 pub use ident::{

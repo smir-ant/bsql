@@ -337,9 +337,13 @@ fn fixed_width(ty: bsql_build::RustType) -> Option<(usize, i32)> {
         // fast path exactly like the integers.
         RustType::F32 => Some((4, 4)),
         RustType::F64 => Some((8, 8)),
-        // `text` and `bytea` are variable-width — no fixed size, decoded on
-        // the per-cell path.
-        RustType::Text | RustType::Bytea => None,
+        // `uuid` is a fixed 16-byte payload; the two timestamp types are a
+        // fixed 8-byte `i64` — all join the const-offset fast path.
+        RustType::Uuid => Some((16, 16)),
+        RustType::Timestamptz | RustType::Timestamp => Some((8, 8)),
+        // `text` / `bytea` / `json` / `jsonb` are variable-width — no fixed
+        // size, decoded on the per-cell path.
+        RustType::Text | RustType::Bytea | RustType::Json | RustType::Jsonb => None,
     }
 }
 
@@ -358,6 +362,13 @@ fn cell_marker(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::Text => quote!(&str),
         // `bytea` decodes through `&[u8]`, borrowing the input bytes.
         RustType::Bytea => quote!(&[u8]),
+        // bsql-native value types decode by value through their own
+        // `Cell<BinaryFmt>` impl.
+        RustType::Uuid => quote!(::bsql::__rt::Uuid),
+        RustType::Timestamptz => quote!(::bsql::__rt::Timestamptz),
+        RustType::Timestamp => quote!(::bsql::__rt::Timestamp),
+        RustType::Json => quote!(::bsql::__rt::Json),
+        RustType::Jsonb => quote!(::bsql::__rt::Jsonb),
     }
 }
 
@@ -407,6 +418,15 @@ fn field_type(ty: bsql_build::RustType, nullable: bool, is_owned: bool) -> Token
                 quote!(&'q [u8])
             }
         }
+        // bsql-native value types are self-owning, so the borrowed and owned
+        // twins carry the SAME field type (no lifetime, no copy-out). The
+        // `Copy` scalars alias nothing; `json` / `jsonb` own a `String` (the
+        // decoder validates + copies the UTF-8 text either way).
+        RustType::Uuid => quote!(::bsql::Uuid),
+        RustType::Timestamptz => quote!(::bsql::Timestamptz),
+        RustType::Timestamp => quote!(::bsql::Timestamp),
+        RustType::Json => quote!(::bsql::Json),
+        RustType::Jsonb => quote!(::bsql::Jsonb),
     };
     if nullable {
         quote!(::core::option::Option<#base>)
@@ -783,6 +803,11 @@ fn rust_type_oid(ty: bsql_build::RustType) -> u32 {
         RustType::F32 => 700,
         RustType::F64 => 701,
         RustType::Bytea => 17,
+        RustType::Uuid => 2950,
+        RustType::Timestamptz => 1184,
+        RustType::Timestamp => 1114,
+        RustType::Json => 114,
+        RustType::Jsonb => 3802,
     }
 }
 
@@ -801,6 +826,11 @@ fn oid_path(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::F32 => quote!(::bsql::__rt::oids::FLOAT4),
         RustType::F64 => quote!(::bsql::__rt::oids::FLOAT8),
         RustType::Bytea => quote!(::bsql::__rt::oids::BYTEA),
+        RustType::Uuid => quote!(::bsql::__rt::oids::UUID),
+        RustType::Timestamptz => quote!(::bsql::__rt::oids::TIMESTAMPTZ),
+        RustType::Timestamp => quote!(::bsql::__rt::oids::TIMESTAMP),
+        RustType::Json => quote!(::bsql::__rt::oids::JSON),
+        RustType::Jsonb => quote!(::bsql::__rt::oids::JSONB),
     }
 }
 
@@ -821,6 +851,13 @@ fn tuple_marker(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::F64 => quote!(f64),
         RustType::Text => quote!(&'static str),
         RustType::Bytea => quote!(&'static [u8]),
+        // Value-typed markers (no lifetime): the same type serves the
+        // `'static` type-level tuple and the at-`'a` decode.
+        RustType::Uuid => quote!(::bsql::__rt::Uuid),
+        RustType::Timestamptz => quote!(::bsql::__rt::Timestamptz),
+        RustType::Timestamp => quote!(::bsql::__rt::Timestamp),
+        RustType::Json => quote!(::bsql::__rt::Json),
+        RustType::Jsonb => quote!(::bsql::__rt::Jsonb),
     }
 }
 
@@ -851,6 +888,11 @@ fn array_oid(ty: bsql_build::RustType) -> u32 {
         RustType::F32 => 1021,
         RustType::F64 => 1022,
         RustType::Bytea => 1001,
+        RustType::Uuid => 2951,
+        RustType::Timestamptz => 1185,
+        RustType::Timestamp => 1115,
+        RustType::Json => 199,
+        RustType::Jsonb => 3807,
     }
 }
 
@@ -867,6 +909,11 @@ fn array_oid_path(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::F32 => quote!(::bsql::__rt::oids::FLOAT4_ARRAY),
         RustType::F64 => quote!(::bsql::__rt::oids::FLOAT8_ARRAY),
         RustType::Bytea => quote!(::bsql::__rt::oids::BYTEA_ARRAY),
+        RustType::Uuid => quote!(::bsql::__rt::oids::UUID_ARRAY),
+        RustType::Timestamptz => quote!(::bsql::__rt::oids::TIMESTAMPTZ_ARRAY),
+        RustType::Timestamp => quote!(::bsql::__rt::oids::TIMESTAMP_ARRAY),
+        RustType::Json => quote!(::bsql::__rt::oids::JSON_ARRAY),
+        RustType::Jsonb => quote!(::bsql::__rt::oids::JSONB_ARRAY),
     }
 }
 

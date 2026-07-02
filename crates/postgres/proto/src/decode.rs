@@ -34,6 +34,8 @@
 
 use core::fmt;
 
+use crate::pgtypes::{Json, Jsonb, Timestamp, Timestamptz, Uuid};
+
 /// Maximum columns per result-set. Queries returning more columns
 /// classify as [`crate::ProtocolError::TooManyColumns`] — the
 /// connection stays alive (recoverable), the user retries with a
@@ -738,6 +740,16 @@ pub enum DecodeError {
     /// `Option<T>` in the row tuple. Wide-typed nullable support
     /// (`Option<T>` row impls) is a planned follow-up.
     NullInNonNullColumn,
+    /// A binary `jsonb` column's leading version header is invalid. The
+    /// `jsonb` binary wire form is a single version byte (currently always
+    /// `1`) followed by the UTF-8 text; `version` is the offending byte, or
+    /// `None` when the body was empty (no version byte at all). A future
+    /// PostgreSQL `jsonb` version would land here as `Some(v)` rather than
+    /// being silently mis-decoded.
+    JsonbHeaderInvalid {
+        /// The leading byte found, or `None` for an empty body.
+        version: Option<u8>,
+    },
 }
 
 // Additive `core::error::Error` impl; matches the crate-wide
@@ -780,6 +792,13 @@ impl fmt::Display for DecodeError {
                 "server emitted SQL NULL for a column the query! row tuple typed as non-Option \
                  — use Option<T> in the row tuple if the schema admits NULL",
             ),
+            Self::JsonbHeaderInvalid { version: Some(v) } => write!(
+                f,
+                "jsonb binary version header byte is {v}, expected 1",
+            ),
+            Self::JsonbHeaderInvalid { version: None } => {
+                f.write_str("jsonb binary body is empty (missing the version header byte)")
+            }
         }
     }
 }
@@ -1160,7 +1179,7 @@ impl Fmt for BinaryFmt {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be decoded from PG `{F}` bytes",
     label = "the (type, format) pair `({Self}, {F})` is not in the supported decode matrix",
-    note = "the in-crate decode matrix covers `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}`, plus `{{f32, f64, &[u8]}}` for `BinaryFmt` only (the binary-uniform wire path); for other types add `impl Cell<'a, F> for {Self}` supplying its `OID` + `decode` (the trait is not sealed)"
+    note = "the in-crate decode matrix covers `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}`, plus `{{f32, f64, &[u8], Uuid, Timestamptz, Timestamp, Json, Jsonb}}` for `BinaryFmt` only (the binary-uniform wire path); for other types add `impl Cell<'a, F> for {Self}` supplying its `OID` + `decode` (the trait is not sealed)"
 )]
 pub trait Cell<'a, F: Fmt>: Sized {
     /// PG type OID this (type, format) pair targets. Pinned via
@@ -2027,6 +2046,96 @@ impl<'a> Cell<'a, BinaryFmt> for &'a [u8] {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════
+// bsql-native semantic types — dependency-free `uuid` / `timestamptz` /
+// `timestamp` decode (defined in `crate::pgtypes`). Each is a fixed-width
+// binary payload, so a wrong length is classified via
+// `BinaryLengthMismatch` exactly like the scalar integers above — never a
+// silent truncation.
+// ════════════════════════════════════════════════════════════════════
+
+/// PG binary `uuid`: exactly 16 raw bytes. A wrong length is classified.
+impl Cell<'_, BinaryFmt> for Uuid {
+    const OID: u32 = oids::UUID;
+    #[inline]
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let arr: &[u8; 16] = bytes
+            .first_chunk::<16>()
+            .filter(|_| bytes.len() == 16)
+            .ok_or_else(|| DecodeError::BinaryLengthMismatch {
+                expected_len: 16,
+                actual_len: crate::narrow::u16_from_usize_under_u16_bound(bytes.len()),
+            })?;
+        Ok(Uuid::from_bytes(*arr))
+    }
+}
+
+/// PG binary `timestamptz`: an `i64` microsecond count since the PG epoch
+/// (2000-01-01 UTC), 8 big-endian bytes. A wrong length is classified.
+impl Cell<'_, BinaryFmt> for Timestamptz {
+    const OID: u32 = oids::TIMESTAMPTZ;
+    #[inline]
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let arr: &[u8; 8] = bytes
+            .first_chunk::<8>()
+            .filter(|_| bytes.len() == 8)
+            .ok_or_else(|| DecodeError::BinaryLengthMismatch {
+                expected_len: 8,
+                actual_len: crate::narrow::u16_from_usize_under_u16_bound(bytes.len()),
+            })?;
+        Ok(Timestamptz::from_micros(i64::from_be_bytes(*arr)))
+    }
+}
+
+/// PG binary `timestamp` (naive): the same 8-byte `i64` micros as
+/// `timestamptz`, but zone-less. A wrong length is classified.
+impl Cell<'_, BinaryFmt> for Timestamp {
+    const OID: u32 = oids::TIMESTAMP;
+    #[inline]
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let arr: &[u8; 8] = bytes
+            .first_chunk::<8>()
+            .filter(|_| bytes.len() == 8)
+            .ok_or_else(|| DecodeError::BinaryLengthMismatch {
+                expected_len: 8,
+                actual_len: crate::narrow::u16_from_usize_under_u16_bound(bytes.len()),
+            })?;
+        Ok(Timestamp::from_micros(i64::from_be_bytes(*arr)))
+    }
+}
+
+/// PG binary `json`: the raw UTF-8 JSON text (no framing). Validated as
+/// UTF-8, then owned — bsql does not parse the JSON structure.
+impl Cell<'_, BinaryFmt> for Json {
+    const OID: u32 = oids::JSON;
+    #[inline]
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let text = simdutf8::basic::from_utf8(bytes).map_err(|_| DecodeError::NonUtf8)?;
+        Ok(Json::new(alloc::string::String::from(text)))
+    }
+}
+
+/// PG binary `jsonb`: a leading version byte (must be `1`) followed by the
+/// UTF-8 JSON text. The version byte is validated and stripped; a version
+/// other than `1`, or an empty body, is classified — never silently
+/// accepted or mis-read.
+impl Cell<'_, BinaryFmt> for Jsonb {
+    const OID: u32 = oids::JSONB;
+    #[inline]
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        match bytes.split_first() {
+            Some((&1, rest)) => {
+                let text = simdutf8::basic::from_utf8(rest).map_err(|_| DecodeError::NonUtf8)?;
+                Ok(Jsonb::new(alloc::string::String::from(text)))
+            }
+            Some((&version, _)) => {
+                Err(DecodeError::JsonbHeaderInvalid { version: Some(version) })
+            }
+            None => Err(DecodeError::JsonbHeaderInvalid { version: None }),
+        }
+    }
+}
+
 // Compile-time symmetry pins: text and binary decoders for the
 // same Rust type MUST target the same PG type OID. A refactor that
 // breaks this breaks the build.
@@ -2048,6 +2157,12 @@ const _: () = {
     assert!(<f32 as Cell<BinaryFmt>>::OID == oids::FLOAT4);
     assert!(<f64 as Cell<BinaryFmt>>::OID == oids::FLOAT8);
     assert!(<&[u8] as Cell<BinaryFmt>>::OID == oids::BYTEA);
+    // bsql-native semantic types (binary-only, no text-format twin).
+    assert!(<Uuid as Cell<BinaryFmt>>::OID == oids::UUID);
+    assert!(<Timestamptz as Cell<BinaryFmt>>::OID == oids::TIMESTAMPTZ);
+    assert!(<Timestamp as Cell<BinaryFmt>>::OID == oids::TIMESTAMP);
+    assert!(<Json as Cell<BinaryFmt>>::OID == oids::JSON);
+    assert!(<Jsonb as Cell<BinaryFmt>>::OID == oids::JSONB);
     // Text↔binary OID symmetry: the same Rust type MUST target the
     // same PG type OID across text and binary decoders. A refactor
     // that skewed one against the other would mean the same Rust
@@ -2133,7 +2248,7 @@ where
 /// impls for their own types.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not implement `EncodeBinary` (cannot encode to PG binary format)",
-    label = "supported binary-encode types are `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `&str`, `&[u8]` (and their one-dimensional `&[T]` array forms)",
+    label = "supported binary-encode types are `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `&str`, `&[u8]`, `Uuid`, `Timestamptz`, `Timestamp`, `Json`, `Jsonb` (and, for the scalar wire types, their one-dimensional `&[T]` array forms)",
     note = "`EncodeBinary` is sealed — extend by adding `impl EncodeBinary for ...` for the new type in `decode.rs` after extending the supported-OID matrix; downstream `impl EncodeBinary for ...` is forbidden by construction"
 )]
 pub trait EncodeBinary: sealed::EncodeBinarySealed {
@@ -2249,6 +2364,72 @@ impl EncodeBinary for &[u8] {
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_bytes(self)
+    }
+}
+
+// bsql-native semantic-type encoders — the mirror of the `Cell<BinaryFmt>`
+// decoders above, so a `uuid` / `timestamptz` / `timestamp` value can bind
+// as a `$N` parameter. The seal mirrors the scalar impls.
+
+/// `uuid` encoder — the 16 raw bytes, verbatim.
+impl sealed::EncodeBinarySealed for Uuid {}
+impl EncodeBinary for Uuid {
+    const OID: u32 = oids::UUID;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_bytes(self.as_bytes())
+    }
+}
+
+/// `timestamptz` encoder — the `i64` PG-epoch micros, big-endian.
+impl sealed::EncodeBinarySealed for Timestamptz {}
+impl EncodeBinary for Timestamptz {
+    const OID: u32 = oids::TIMESTAMPTZ;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_i64_be(self.as_micros())
+    }
+}
+
+/// `timestamp` (naive) encoder — the `i64` PG-epoch micros, big-endian.
+impl sealed::EncodeBinarySealed for Timestamp {}
+impl EncodeBinary for Timestamp {
+    const OID: u32 = oids::TIMESTAMP;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_i64_be(self.as_micros())
+    }
+}
+
+/// `json` encoder — the raw UTF-8 JSON text, verbatim (no framing).
+impl sealed::EncodeBinarySealed for Json {}
+impl EncodeBinary for Json {
+    const OID: u32 = oids::JSON;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_bytes(self.as_str().as_bytes())
+    }
+}
+
+/// `jsonb` encoder — the leading version byte (`1`) followed by the UTF-8
+/// JSON text, mirroring the decoder's header contract exactly.
+impl sealed::EncodeBinarySealed for Jsonb {}
+impl EncodeBinary for Jsonb {
+    const OID: u32 = oids::JSONB;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_u8(1)?;
+        dst.push_bytes(self.as_str().as_bytes())
     }
 }
 
@@ -2399,6 +2580,12 @@ const _: () = {
     assert!(<f32 as EncodeBinary>::OID == oids::FLOAT4);
     assert!(<f64 as EncodeBinary>::OID == oids::FLOAT8);
     assert!(<&[u8] as EncodeBinary>::OID == oids::BYTEA);
+    // bsql-native semantic types.
+    assert!(<Uuid as EncodeBinary>::OID == oids::UUID);
+    assert!(<Timestamptz as EncodeBinary>::OID == oids::TIMESTAMPTZ);
+    assert!(<Timestamp as EncodeBinary>::OID == oids::TIMESTAMP);
+    assert!(<Json as EncodeBinary>::OID == oids::JSON);
+    assert!(<Jsonb as EncodeBinary>::OID == oids::JSONB);
     // Cross-trait symmetry (encode OID ≡ binary-decode OID ≡ catalog OID).
     assert!(<i16 as EncodeBinary>::OID == <i16 as Cell<BinaryFmt>>::OID);
     assert!(<i32 as EncodeBinary>::OID == <i32 as Cell<BinaryFmt>>::OID);
@@ -2409,6 +2596,11 @@ const _: () = {
     assert!(<f32 as EncodeBinary>::OID == <f32 as Cell<BinaryFmt>>::OID);
     assert!(<f64 as EncodeBinary>::OID == <f64 as Cell<BinaryFmt>>::OID);
     assert!(<&[u8] as EncodeBinary>::OID == <&[u8] as Cell<BinaryFmt>>::OID);
+    assert!(<Uuid as EncodeBinary>::OID == <Uuid as Cell<BinaryFmt>>::OID);
+    assert!(<Timestamptz as EncodeBinary>::OID == <Timestamptz as Cell<BinaryFmt>>::OID);
+    assert!(<Timestamp as EncodeBinary>::OID == <Timestamp as Cell<BinaryFmt>>::OID);
+    assert!(<Json as EncodeBinary>::OID == <Json as Cell<BinaryFmt>>::OID);
+    assert!(<Jsonb as EncodeBinary>::OID == <Jsonb as Cell<BinaryFmt>>::OID);
 };
 
 /// PostgreSQL built-in type OID constants for the subset the
@@ -2457,9 +2649,11 @@ pub mod oids {
     pub const TIMESTAMP: u32 = 1114;
     /// `timestamptz` — timestamp with time zone.
     pub const TIMESTAMPTZ: u32 = 1184;
+    /// `json` — JSON document stored as text.
+    pub const JSON: u32 = 114;
     /// `uuid`.
     pub const UUID: u32 = 2950;
-    /// `jsonb`.
+    /// `jsonb` — binary JSON (leading version byte + text).
     pub const JSONB: u32 = 3802;
 
     // ── Array (`T[]`) type OIDs, for a single array parameter sent to a
@@ -2486,6 +2680,16 @@ pub mod oids {
     pub const FLOAT8_ARRAY: u32 = 1022;
     /// `oid[]` (`_oid`).
     pub const OID_ARRAY: u32 = 1028;
+    /// `timestamp[]` (`_timestamp`).
+    pub const TIMESTAMP_ARRAY: u32 = 1115;
+    /// `timestamptz[]` (`_timestamptz`).
+    pub const TIMESTAMPTZ_ARRAY: u32 = 1185;
+    /// `json[]` (`_json`).
+    pub const JSON_ARRAY: u32 = 199;
+    /// `jsonb[]` (`_jsonb`).
+    pub const JSONB_ARRAY: u32 = 3807;
+    /// `uuid[]` (`_uuid`).
+    pub const UUID_ARRAY: u32 = 2951;
 
     // Tier-1 compile drift-pin against the canonical PG catalog
     // (src/include/catalog/pg_type.dat). A typo in any constant
@@ -2506,6 +2710,7 @@ pub mod oids {
         assert!(VARCHAR == 1043, "oids::VARCHAR drift from pg_type.dat");
         assert!(TIMESTAMP == 1114, "oids::TIMESTAMP drift from pg_type.dat");
         assert!(TIMESTAMPTZ == 1184, "oids::TIMESTAMPTZ drift from pg_type.dat");
+        assert!(JSON == 114, "oids::JSON drift from pg_type.dat");
         assert!(UUID == 2950, "oids::UUID drift from pg_type.dat");
         assert!(JSONB == 3802, "oids::JSONB drift from pg_type.dat");
         // Array OIDs, verified against `pg_type` (`typname` -> `typarray`)
@@ -2519,6 +2724,11 @@ pub mod oids {
         assert!(FLOAT4_ARRAY == 1021, "oids::FLOAT4_ARRAY drift from pg_type.dat");
         assert!(FLOAT8_ARRAY == 1022, "oids::FLOAT8_ARRAY drift from pg_type.dat");
         assert!(OID_ARRAY == 1028, "oids::OID_ARRAY drift from pg_type.dat");
+        assert!(TIMESTAMP_ARRAY == 1115, "oids::TIMESTAMP_ARRAY drift from pg_type.dat");
+        assert!(TIMESTAMPTZ_ARRAY == 1185, "oids::TIMESTAMPTZ_ARRAY drift from pg_type.dat");
+        assert!(JSON_ARRAY == 199, "oids::JSON_ARRAY drift from pg_type.dat");
+        assert!(JSONB_ARRAY == 3807, "oids::JSONB_ARRAY drift from pg_type.dat");
+        assert!(UUID_ARRAY == 2951, "oids::UUID_ARRAY drift from pg_type.dat");
     };
 }
 
@@ -4267,4 +4477,106 @@ mod parse_edge_case_tests {
         assert!(parse_row_description(payload).is_err());
     }
 
+}
+
+#[cfg(test)]
+mod semantic_type_decode_tests {
+    //! Direct `Cell<BinaryFmt>::decode` bad-path classification for the
+    //! bsql-native semantic types. Seals the no-swallow contract on every
+    //! malformed arm BY TEST (not by inspection): each wrong-shape payload is
+    //! a specific classified `DecodeError`, never a silent default, panic, or
+    //! truncation. The crate-root forbid bundle bans `unwrap`/`expect`/`panic`
+    //! even in tests, so classification is asserted via `matches!`.
+    use super::{BinaryFmt, Cell, DecodeError};
+    use crate::pgtypes::{Json, Jsonb, Timestamp, Timestamptz, Uuid};
+
+    #[test]
+    fn timestamptz_wrong_length_is_classified() {
+        // 7 bytes for an 8-byte `i64` micros payload.
+        let seven = [0u8; 7];
+        let decoded = <Timestamptz as Cell<BinaryFmt>>::decode(&seven);
+        assert!(matches!(
+            decoded,
+            Err(DecodeError::BinaryLengthMismatch { expected_len: 8, actual_len: 7 })
+        ));
+        // The naive `timestamp` shares the width contract.
+        assert!(matches!(
+            <Timestamp as Cell<BinaryFmt>>::decode(&seven),
+            Err(DecodeError::BinaryLengthMismatch { expected_len: 8, actual_len: 7 })
+        ));
+    }
+
+    #[test]
+    fn uuid_over_length_is_classified() {
+        // 17 bytes: `first_chunk::<16>` SUCCEEDS, then the `bytes.len() == 16`
+        // filter rejects — the distinct over-length branch (an under-length
+        // 15-byte payload fails `first_chunk` instead).
+        let seventeen = [0u8; 17];
+        assert!(matches!(
+            <Uuid as Cell<BinaryFmt>>::decode(&seventeen),
+            Err(DecodeError::BinaryLengthMismatch { expected_len: 16, actual_len: 17 })
+        ));
+        // Under-length is classified too (the `first_chunk` failure branch).
+        let fifteen = [0u8; 15];
+        assert!(matches!(
+            <Uuid as Cell<BinaryFmt>>::decode(&fifteen),
+            Err(DecodeError::BinaryLengthMismatch { expected_len: 16, actual_len: 15 })
+        ));
+    }
+
+    #[test]
+    fn json_non_utf8_is_classified() {
+        // A lone 0xFF continuation byte is not valid UTF-8.
+        let bad = [0xFFu8, 0x00, 0x01];
+        assert!(matches!(
+            <Json as Cell<BinaryFmt>>::decode(&bad),
+            Err(DecodeError::NonUtf8)
+        ));
+    }
+
+    #[test]
+    fn jsonb_empty_body_is_classified_missing_version() {
+        // A zero-length body has no leading version byte at all.
+        let empty: &[u8] = &[];
+        assert!(matches!(
+            <Jsonb as Cell<BinaryFmt>>::decode(empty),
+            Err(DecodeError::JsonbHeaderInvalid { version: None })
+        ));
+    }
+
+    #[test]
+    fn jsonb_wrong_version_byte_is_classified() {
+        // Leading byte 2 (a future/unknown jsonb version) — classified with
+        // the offending byte, never silently decoded as text.
+        let v2: &[u8] = &[0x02, b'{', b'}'];
+        assert!(matches!(
+            <Jsonb as Cell<BinaryFmt>>::decode(v2),
+            Err(DecodeError::JsonbHeaderInvalid { version: Some(2) })
+        ));
+    }
+
+    #[test]
+    fn jsonb_non_utf8_after_version_is_classified() {
+        // Valid version byte, but the text after it is not UTF-8.
+        let bad: &[u8] = &[0x01, 0xFF, 0xFE];
+        assert!(matches!(
+            <Jsonb as Cell<BinaryFmt>>::decode(bad),
+            Err(DecodeError::NonUtf8)
+        ));
+    }
+
+    #[test]
+    fn well_formed_payloads_decode() {
+        // The happy paths, so the bad-path asserts above are not vacuously
+        // green against a decoder that rejects everything.
+        assert!(matches!(
+            <Timestamptz as Cell<BinaryFmt>>::decode(&1_000_000_i64.to_be_bytes()),
+            Ok(v) if v.as_micros() == 1_000_000
+        ));
+        assert!(<Uuid as Cell<BinaryFmt>>::decode(&[0u8; 16]).is_ok());
+        assert!(matches!(
+            <Jsonb as Cell<BinaryFmt>>::decode(&[0x01, b'{', b'}']),
+            Ok(ref v) if v.as_str() == "{}"
+        ));
+    }
 }

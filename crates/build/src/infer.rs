@@ -121,6 +121,19 @@ pub enum RustType {
     /// PostgreSQL `bytea` (arbitrary byte string, decoding to the same
     /// Rust `Vec<u8>` / `&[u8]`).
     Bytea,
+    /// PostgreSQL `uuid` -> the dep-free `bsql::Uuid` (16-byte value).
+    Uuid,
+    /// PostgreSQL `timestamptz` -> the dep-free `bsql::Timestamptz`
+    /// (microseconds since 2000-01-01 UTC).
+    Timestamptz,
+    /// PostgreSQL `timestamp` (naive) -> the dep-free `bsql::Timestamp`
+    /// (zone-less microseconds since 2000-01-01).
+    Timestamp,
+    /// PostgreSQL `json` -> the dep-free `bsql::Json` (raw UTF-8 text).
+    Json,
+    /// PostgreSQL `jsonb` -> the dep-free `bsql::Jsonb` (version byte +
+    /// UTF-8 text on the wire).
+    Jsonb,
 }
 
 impl RustType {
@@ -139,6 +152,11 @@ impl RustType {
             // The OWNED spelling (the borrowed twin is `&[u8]`), mirroring
             // `Text -> String` owned / `&str` borrowed.
             RustType::Bytea => "Vec<u8>",
+            RustType::Uuid => "bsql::Uuid",
+            RustType::Timestamptz => "bsql::Timestamptz",
+            RustType::Timestamp => "bsql::Timestamp",
+            RustType::Json => "bsql::Json",
+            RustType::Jsonb => "bsql::Jsonb",
         }
     }
 }
@@ -172,6 +190,15 @@ fn rust_type_for_pg(pg_type: &str) -> Option<RustType> {
         "float4" => Some(RustType::F32),
         "float8" => Some(RustType::F64),
         "bytea" => Some(RustType::Bytea),
+        // Dep-free bsql-native semantic types. `timestamptz` and the naive
+        // `timestamp` share a wire shape but distinct catalog OIDs, so they
+        // map to distinct Rust types (`canonical_type` distinguishes them
+        // structurally from the `WITH TIME ZONE` / `TZ` grammar).
+        "uuid" => Some(RustType::Uuid),
+        "timestamptz" => Some(RustType::Timestamptz),
+        "timestamp" => Some(RustType::Timestamp),
+        "json" => Some(RustType::Json),
+        "jsonb" => Some(RustType::Jsonb),
         _ => None,
     }
 }
@@ -9754,7 +9781,15 @@ fn common_type(a: RustType, b: RustType) -> Option<RustType> {
         | RustType::Text
         | RustType::F32
         | RustType::F64
-        | RustType::Bytea => None,
+        | RustType::Bytea
+        // The bsql-native semantic types merge only when identical (handled
+        // by the `a == b` early return); there is no widening ladder for
+        // them, so any cross-type pairing is a loud cast-required error.
+        | RustType::Uuid
+        | RustType::Timestamptz
+        | RustType::Timestamp
+        | RustType::Json
+        | RustType::Jsonb => None,
     };
     match (rank(a), rank(b)) {
         (Some(ra), Some(rb)) => {
@@ -17033,6 +17068,151 @@ mod tests {
         match err {
             InferError::UnsupportedPgType { pg_type, .. } => assert_eq!(pg_type, "numeric"),
             other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    // ── dep-free bsql-native type widening ──────────────────────────────
+
+    #[test]
+    fn uuid_column_types_to_uuid() {
+        let ddl = "CREATE TABLE ev (id UUID PRIMARY KEY, prev UUID)";
+        let s = shape(&[ddl], "SELECT id, prev FROM ev").expect("uuid supported");
+        assert_eq!(
+            s.columns,
+            vec![col("id", RustType::Uuid, false), col("prev", RustType::Uuid, true)],
+        );
+    }
+
+    #[test]
+    fn timestamp_variants_map_to_distinct_types() {
+        // Both the compact `TIMESTAMPTZ` and the verbose
+        // `TIMESTAMP WITH TIME ZONE` canonicalise to the zoned type; the
+        // naive `TIMESTAMP` maps to the distinct zone-less type.
+        let ddl = "CREATE TABLE t ( \
+            a TIMESTAMPTZ NOT NULL, \
+            b TIMESTAMP WITH TIME ZONE NOT NULL, \
+            c TIMESTAMP NOT NULL, \
+            d TIMESTAMP WITHOUT TIME ZONE NOT NULL )";
+        let s = shape(&[ddl], "SELECT a, b, c, d FROM t").expect("timestamps supported");
+        assert_eq!(
+            s.columns,
+            vec![
+                col("a", RustType::Timestamptz, false),
+                col("b", RustType::Timestamptz, false),
+                col("c", RustType::Timestamp, false),
+                col("d", RustType::Timestamp, false),
+            ],
+        );
+    }
+
+    #[test]
+    fn json_and_jsonb_columns_map_to_distinct_types() {
+        let ddl = "CREATE TABLE d (id INT PRIMARY KEY, body JSONB NOT NULL, note JSON)";
+        let s = shape(&[ddl], "SELECT body, note FROM d").expect("json/jsonb supported");
+        assert_eq!(
+            s.columns,
+            vec![col("body", RustType::Jsonb, false), col("note", RustType::Json, true)],
+        );
+    }
+
+    #[test]
+    fn widened_types_infer_through_casts() {
+        // A literal cast to each widened type types without a catalog column.
+        let s = shape(
+            &[USERS],
+            "SELECT '00000000-0000-0000-0000-000000000000'::uuid AS u, \
+             '2000-01-01 00:00:00+00'::timestamptz AS t",
+        )
+        .expect("uuid + timestamptz casts");
+        assert_eq!(
+            s.columns,
+            vec![col("u", RustType::Uuid, false), col("t", RustType::Timestamptz, false)],
+        );
+    }
+
+    #[test]
+    fn widened_type_as_param_infers_from_column() {
+        // A `$1` compared to a uuid PK infers the parameter as `uuid`.
+        let ddl = "CREATE TABLE ev (id UUID PRIMARY KEY)";
+        let s = shape(&[ddl], "SELECT id FROM ev WHERE id = $1").expect("uuid param");
+        assert_eq!(s.params, vec![RustType::Uuid]);
+    }
+
+    #[test]
+    fn every_array_spelling_is_loud_not_silently_scalar() {
+        // Arrays are a deferred slice: EVERY array column — compact or
+        // verbose, of any element type, any dimensionality — must be a loud
+        // `UnsupportedPgType`, NEVER silently typed as its scalar element.
+        //
+        // The verbose multi-word spellings are the regression guard: a
+        // head-word split drops the `[]` (and the zone) and would collapse
+        // `TIMESTAMP WITH TIME ZONE[]` to a scalar `timestamp`. The
+        // `canonical_type` array arm renders `<element>[]` structurally, so
+        // `rust_type_for_pg` returns `None` for all of these.
+        for (decl, canonical_array) in [
+            ("TIMESTAMPTZ[]", "timestamptz[]"),
+            ("TIMESTAMP WITH TIME ZONE[]", "timestamptz[]"),
+            ("TIMESTAMP[]", "timestamp[]"),
+            ("TIMESTAMP WITHOUT TIME ZONE[]", "timestamp[]"),
+            ("INT4[]", "int4[]"),
+            ("DOUBLE PRECISION[]", "float8[]"),
+            ("CHARACTER VARYING[]", "varchar[]"),
+            ("UUID[]", "uuid[]"),
+            ("NUMERIC[]", "numeric[]"),
+            ("INT4[][]", "int4[][]"),
+        ] {
+            let ddl = format!("CREATE TABLE t (id INT PRIMARY KEY, a {decl} NOT NULL)");
+            let err = shape(&[ddl.as_str()], "SELECT a FROM t")
+                .expect_err(&format!("`{decl}` array column must be loud, not scalar"));
+            match err {
+                InferError::UnsupportedPgType { pg_type, .. } => assert_eq!(
+                    pg_type, canonical_array,
+                    "`{decl}` must canonicalise to the array type `{canonical_array}`",
+                ),
+                other => panic!("`{decl}` must be UnsupportedPgType, got {other:?}"),
+            }
+        }
+        // The SCALAR forms still resolve (no over-broad rejection): the array
+        // arm fires only for a real `DataType::Array`.
+        let ddl = "CREATE TABLE t ( \
+            a TIMESTAMPTZ NOT NULL, \
+            b TIMESTAMP WITH TIME ZONE NOT NULL, \
+            c TIMESTAMP NOT NULL )";
+        let s = shape(&[ddl], "SELECT a, b, c FROM t").expect("scalars still supported");
+        assert_eq!(
+            s.columns,
+            vec![
+                col("a", RustType::Timestamptz, false),
+                col("b", RustType::Timestamptz, false),
+                col("c", RustType::Timestamp, false),
+            ],
+        );
+    }
+
+    #[test]
+    fn still_unsupported_types_stay_loud() {
+        // The fail-closed contract holds for types NOT in the widened set:
+        // `date`, `time`, `numeric`, and `interval` are still a loud
+        // `UnsupportedPgType`, never silently mapped.
+        for (ddl, name) in [
+            ("CREATE TABLE t (d DATE NOT NULL)", "date"),
+            ("CREATE TABLE t (n NUMERIC NOT NULL)", "numeric"),
+            ("CREATE TABLE t (i INTERVAL NOT NULL)", "interval"),
+        ] {
+            let err = shape(&[ddl], "SELECT * FROM t");
+            // `*` is its own error; use a named column instead.
+            let _ = err;
+            let col_name = match name {
+                "date" => "d",
+                "numeric" => "n",
+                _ => "i",
+            };
+            let sql = format!("SELECT {col_name} FROM t");
+            let err = shape(&[ddl], &sql).expect_err("still unsupported");
+            assert!(
+                matches!(err, InferError::UnsupportedPgType { .. }),
+                "{name} must stay unsupported, got {err:?}",
+            );
         }
     }
 

@@ -18,6 +18,7 @@
 
 use core::ops::ControlFlow;
 
+use bsql::{Timestamptz, Uuid};
 use bsql_postgres_async::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 bsql::query!(One, "SELECT 1::int4 AS n");
@@ -71,6 +72,18 @@ bsql::query!(
     ByteaAny,
     r"SELECT b FROM (VALUES ('\x01'::bytea), ('\x02'::bytea), ('\x03'::bytea)) t(b) WHERE b = ANY($1)"
 );
+
+// ── widened bsql-native types: uuid / timestamptz / timestamp ─────────────
+bsql::query!(
+    UuidLit,
+    "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid AS u"
+);
+bsql::query!(TsLit, "SELECT '2000-01-01 00:00:01+00'::timestamptz AS t");
+bsql::query!(TsNaiveLit, "SELECT '2000-01-01 00:00:02'::timestamp AS t");
+bsql::query!(EchoUuid, "SELECT $1::uuid AS u");
+bsql::query!(EchoTs, "SELECT $1::timestamptz AS t");
+bsql::query!(JsonLit, "SELECT '{\"k\":1}'::json AS j");
+bsql::query!(JsonbLit, "SELECT '[1,2,3]'::jsonb AS j");
 
 fn async_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -606,5 +619,59 @@ async fn bytea_array_any_bind_round_trip() {
     let mut got: Vec<Vec<u8>> = rows.iter().map(|r| r.expect("row decodes").b.to_vec()).collect();
     got.sort_unstable();
     assert_eq!(got, vec![vec![0x01u8], vec![0x03u8]], "bytea[] ANY($1)");
+    c.close().await.expect("close");
+}
+
+/// WIDENING (uuid): a `uuid` column decodes to its canonical hex form.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_uuid_column_round_trips() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let row = c.query_one::<UuidLitQuery>(()).await.expect("query_one UuidLit");
+    assert_eq!(row.u.to_string(), "550e8400-e29b-41d4-a716-446655440000");
+    c.close().await.expect("close");
+}
+
+/// WIDENING (timestamptz / timestamp): decode + exact epoch conversion.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_timestamp_columns_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let tz = c.query_one::<TsLitQuery>(()).await.expect("query_one TsLit");
+    assert_eq!(tz.t.to_unix_micros(), Some(946_684_801_000_000));
+    let naive = c.query_one::<TsNaiveLitQuery>(()).await.expect("query_one TsNaiveLit");
+    assert_eq!(naive.t.as_micros(), 2_000_000);
+    c.close().await.expect("close");
+}
+
+/// WIDENING (params): a `bsql::Uuid` and a `bsql::Timestamptz` bind and echo.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_uuid_and_timestamptz_params_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let u = Uuid::from_bytes([
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00,
+        0x00,
+    ]);
+    let echoed = c.query_one::<EchoUuidQuery>((u,)).await.expect("query_one EchoUuid");
+    assert_eq!(echoed.u, u);
+
+    let ts = Timestamptz::from_micros(1_000_000);
+    let echoed_ts = c.query_one::<EchoTsQuery>((ts,)).await.expect("query_one EchoTs");
+    assert_eq!(echoed_ts.t, ts);
+    assert_eq!(echoed_ts.t.to_unix_micros(), Some(946_684_801_000_000));
+    c.close().await.expect("close");
+}
+
+/// WIDENING (json / jsonb): text surfaced verbatim (json) / past the version
+/// byte (jsonb), plus a jsonb param round-trip.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_json_and_jsonb_columns_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let j = c.query_one::<JsonLitQuery>(()).await.expect("query_one JsonLit");
+    assert_eq!(j.j.as_str(), r#"{"k":1}"#);
+    let jb = c.query_one::<JsonbLitQuery>(()).await.expect("query_one JsonbLit");
+    assert_eq!(jb.j.as_str(), "[1, 2, 3]");
     c.close().await.expect("close");
 }

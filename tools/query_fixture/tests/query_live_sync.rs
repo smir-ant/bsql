@@ -25,6 +25,7 @@
 
 use core::ops::ControlFlow;
 
+use bsql::{Timestamptz, Uuid};
 use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 // One column, fixed-width, NOT NULL -> the borrowed record carries no lifetime
@@ -120,6 +121,26 @@ bsql::query!(
     ByteaAny,
     r"SELECT b FROM (VALUES ('\x01'::bytea), ('\x02'::bytea), ('\x03'::bytea)) t(b) WHERE b = ANY($1)"
 );
+
+// ── widened bsql-native types: uuid / timestamptz / timestamp ─────────────
+// Literal casts (no schema): each proves PG's binary wire for that type
+// materialises into the dep-free bsql-native record field.
+bsql::query!(
+    UuidLit,
+    "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid AS u"
+);
+bsql::query!(TsLit, "SELECT '2000-01-01 00:00:01+00'::timestamptz AS t");
+bsql::query!(TsNaiveLit, "SELECT '2000-01-01 00:00:02'::timestamp AS t");
+// Param round-trips: a `bsql::Uuid` / `bsql::Timestamptz` binds through the
+// binary `ParamsWriter` path and echoes back.
+bsql::query!(EchoUuid, "SELECT $1::uuid AS u");
+bsql::query!(EchoTs, "SELECT $1::timestamptz AS t");
+// json / jsonb literal columns — `jsonb` proves the leading version byte is
+// stripped byte-correct. (A json/jsonb PARAM is out of scope this slice: the
+// `TypedQuery::Params: Copy` bound rejects a `String`-backed param tuple; a
+// by-reference param path is a deferred follow-up.)
+bsql::query!(JsonLit, "SELECT '{\"k\":1}'::json AS j");
+bsql::query!(JsonbLit, "SELECT '[1,2,3]'::jsonb AS j");
 
 fn sync_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -705,5 +726,76 @@ fn discard_all_then_reuse_errors_once_then_self_heals() {
         .query::<HealLitQuery>(())
         .expect("self-heal: the next use re-creates the statement and succeeds");
     assert_eq!(healed.len(), 1);
+    c.close().expect("close");
+}
+
+/// WIDENING (uuid): a `uuid` column decodes to the exact 16 bytes and
+/// round-trips its canonical hyphenated hex form.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_uuid_column_round_trips() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let row = c.query_one::<UuidLitQuery>(()).expect("query_one UuidLit");
+    assert_eq!(
+        row.u.to_string(),
+        "550e8400-e29b-41d4-a716-446655440000",
+        "uuid decodes to its canonical hex form"
+    );
+    c.close().expect("close");
+}
+
+/// WIDENING (timestamptz / timestamp): the `i64` micro count decodes to the
+/// bsql-native timestamp; `to_unix_micros` matches the known UTC instant.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_timestamp_columns_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    // 2000-01-01 00:00:01 UTC = 1 s after the PG epoch = Unix 946_684_801 s.
+    let tz = c.query_one::<TsLitQuery>(()).expect("query_one TsLit");
+    assert_eq!(
+        tz.t.to_unix_micros(),
+        Some(946_684_801_000_000),
+        "timestamptz decodes to the exact UTC instant"
+    );
+    // Naive `timestamp` 2000-01-01 00:00:02 = 2 s after the epoch, zone-less.
+    let naive = c.query_one::<TsNaiveLitQuery>(()).expect("query_one TsNaiveLit");
+    assert_eq!(naive.t.as_micros(), 2_000_000, "naive timestamp is raw micros");
+    c.close().expect("close");
+}
+
+/// WIDENING (params): a `bsql::Uuid` and a `bsql::Timestamptz` bind through
+/// the binary `ParamsWriter` path and echo back exactly.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_uuid_and_timestamptz_params_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let u = Uuid::from_bytes([
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00,
+        0x00,
+    ]);
+    let echoed = c.query_one::<EchoUuidQuery>((u,)).expect("query_one EchoUuid");
+    assert_eq!(echoed.u, u, "uuid param round-trips");
+
+    let ts = Timestamptz::from_micros(1_000_000);
+    let echoed_ts = c.query_one::<EchoTsQuery>((ts,)).expect("query_one EchoTs");
+    assert_eq!(echoed_ts.t, ts, "timestamptz param round-trips");
+    assert_eq!(echoed_ts.t.to_unix_micros(), Some(946_684_801_000_000));
+    c.close().expect("close");
+}
+
+/// WIDENING (json / jsonb): a `json` column surfaces its text verbatim; a
+/// `jsonb` column decodes past the version byte. PG may re-serialise jsonb
+/// with normalised spacing, so the jsonb assertions check the parsed content
+/// rather than exact bytes.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_json_and_jsonb_columns_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let j = c.query_one::<JsonLitQuery>(()).expect("query_one JsonLit");
+    assert_eq!(j.j.as_str(), r#"{"k":1}"#, "json text is surfaced verbatim");
+
+    let jb = c.query_one::<JsonbLitQuery>(()).expect("query_one JsonbLit");
+    // jsonb round-trips through PG's canonical spacing: `[1, 2, 3]`.
+    assert_eq!(jb.j.as_str(), "[1, 2, 3]", "jsonb decodes past the version byte");
     c.close().expect("close");
 }

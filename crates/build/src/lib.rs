@@ -957,6 +957,43 @@ fn column_info(column: &ColumnDef) -> ColumnInfo {
 /// `pg_type` consumers for Rust-type inference carry their own
 /// exhaustive mapping with its own fail-closed contract.
 fn canonical_type(data_type: &sqlparser::ast::DataType) -> String {
+    use sqlparser::ast::{ArrayElemTypeDef, DataType, TimezoneInfo};
+    // ARRAY types must be canonicalised STRUCTURALLY, as `<element>[]`, never
+    // via the rendered head word. The head-word split (on ' ' / '(') drops the
+    // trailing `[]` for any MULTI-WORD element spelling —
+    // `TIMESTAMP WITH TIME ZONE[]` yields head `timestamp`,
+    // `DOUBLE PRECISION[]` yields `double`, `CHARACTER VARYING[]` yields
+    // `character` — which would collapse an ARRAY column to its SCALAR element
+    // type: a silently-wrong catalog (a `timestamptz[]` column typed as a
+    // scalar 8-byte `timestamp`, with the scalar OID baked into the wire).
+    // Rendering the array form explicitly keeps it OUTSIDE `rust_type_for_pg`'s
+    // supported set, so EVERY array spelling — compact or verbose, any element
+    // type, any dimensionality — is a loud `UnsupportedPgType` rather than a
+    // silent mis-type. When 1-D array support lands, `rust_type_for_pg` gains
+    // the matching `<element>[]` arm; until then all arrays fail closed.
+    if let DataType::Array(elem) = data_type {
+        return match elem {
+            ArrayElemTypeDef::SquareBracket(inner, _)
+            | ArrayElemTypeDef::AngleBracket(inner)
+            | ArrayElemTypeDef::Parenthesis(inner) => format!("{}[]", canonical_type(inner)),
+            // An untyped `ARRAY` (no element type) has no element to
+            // canonicalise; a bare `array` marker has no supported arm either.
+            ArrayElemTypeDef::None => "array".to_string(),
+        };
+    }
+    // Temporal types must be distinguished STRUCTURALLY, not by the rendered
+    // head word: `TIMESTAMP WITH TIME ZONE` and the compact `TIMESTAMPTZ`
+    // both denote `timestamptz`, but the verbose form's head word is
+    // `timestamp`, which would silently collapse the zone away. Match on the
+    // parsed `TimezoneInfo` so every spelling of the zoned type canonicalises
+    // to `timestamptz` and the zone-less type to `timestamp`.
+    if let DataType::Timestamp(_, tz) = data_type {
+        return match tz {
+            TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => "timestamptz",
+            TimezoneInfo::None | TimezoneInfo::WithoutTimeZone => "timestamp",
+        }
+        .to_string();
+    }
     let rendered = data_type.to_string().to_ascii_lowercase();
     // Normalise on the leading word (strip length/precision args like
     // `varchar(50)` -> `varchar`, `numeric(10,2)` -> `numeric`).
