@@ -167,7 +167,8 @@ impl IngestBuf {
         }
     }
 
-    /// Lend a writable tail slice the socket reads directly into.
+    /// Lend the full writable tail of the active tier for the socket to read
+    /// directly into.
     ///
     /// Single-residence ingest, lend side. The returned `&mut [u8]` is part
     /// of this buffer's own storage, so a `socket.read(slot)` writes the
@@ -175,12 +176,25 @@ impl IngestBuf {
     /// `read_slot` with a [`commit`](Self::commit) of the count the socket
     /// reported.
     ///
+    /// `want` is the caller's *minimum* room requirement, not a cap on the
+    /// lend: it drives the two-tier escape decision (and the [`IngestFull`]
+    /// surface), while the slice handed back is the tier's **entire**
+    /// remaining spare so one `socket.read` fills as much as is available in a
+    /// single syscall. The socket returns only what it has (`n <= slot.len()`),
+    /// so lending the whole spare never over-reads — it only removes the
+    /// per-read cap that would otherwise force a stream to trickle in across
+    /// many small reads. This is why a response that overflows the inline tier
+    /// drains in about two reads (one inline-fill, one heap-fill) rather than a
+    /// doubling ramp of them, with no change to what any read parses.
+    ///
     /// Drives the two-tier escape **before** lending: if the wanted total
     /// (`filled + want`) would exceed the inline tier and the buffer is
     /// still inline, the live bytes are moved into a freshly-allocated,
     /// zeroed heap array first, so the lent slot — and therefore the
     /// socket's bytes — land in the post-escape storage deterministically
-    /// from `want`.
+    /// from `want`. A `want` bounded by the inline tier keeps a whole
+    /// response that fits inline in the inline tier (no escape, no
+    /// allocation); a larger response escapes on the read that overflows it.
     ///
     /// Returns [`IngestFull`] when no room remains even after reclaiming the
     /// consumed prefix and escaping to the heap tier (a wire frame larger
@@ -203,20 +217,25 @@ impl IngestBuf {
         }
 
         let cap = self.active_cap();
-        let room = cap.saturating_sub(filled);
-        let grow = want.min(room);
+        // Lend the tier's whole remaining spare, not `want.min(room)`: the
+        // socket opportunistically fills the offered slot in one syscall and
+        // reports the actual count, so offering more never over-reads but does
+        // collapse a large response's read count. `want` has already done its
+        // job (compaction + the escape decision above); it is not a lend cap.
+        let grow = cap.saturating_sub(filled);
         if grow == 0 {
             core::hint::cold_path();
             return Err(IngestFull {
                 attempted: want,
-                available: room,
+                available: grow,
                 cap,
             });
         }
         let end = filled.saturating_add(grow);
-        // `filled..end` is within `active_cap` by the `grow = want.min(room)`
-        // clamp; the `unwrap_or(&mut [])` arm is therefore dead and exists
-        // only to satisfy the no-indexing forbid wall.
+        // `filled..end == filled..cap` is within the active tier by
+        // construction (`grow = cap - filled`); the `unwrap_or(&mut [])` arm
+        // is therefore dead and exists only to satisfy the no-indexing forbid
+        // wall.
         Ok(self.active_mut().get_mut(filled..end).unwrap_or(&mut []))
     }
 

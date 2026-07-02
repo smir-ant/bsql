@@ -51,7 +51,6 @@ use core::ops::ControlFlow;
 use core::task::{Context, Poll};
 
 use crate::command_tag::CommandTag;
-use crate::frame::READ_BUF_CAP;
 
 use super::flush::flush;
 use super::seams::{Observer, Transport};
@@ -59,18 +58,26 @@ use super::{
     ActiveEngine, ConnFail, ConnectingEngine, EngineError, Event, HandshakeProgress, SendBuf,
 };
 
-/// Initial per-read request width handed to
+/// The constant per-read *minimum room* the pump requests from
 /// [`ActiveEngine::read_slot`](super::ActiveEngine::read_slot).
 ///
-/// Bound to the ingest buffer's inline-tier width (single source of truth) so a
-/// command whose entire response fits inline is read in a single syscall and
-/// never escapes to the heap tier; a read that fills the offered slot signals a
-/// larger response, so the request doubles (saturating, capped at the heap tier)
-/// to amortise the syscall cost of a row stream. Coupling to the const keeps the
-/// inline-fit property intact if the tier width is ever changed. A mismatch
-/// would only be a sizing nuance, never a correctness issue — a too-small start
-/// costs an extra read, a too-large start escapes early.
-const INITIAL_READ_WANT: usize = super::ingest::INGEST_INLINE_CAP;
+/// It is not a read size — `read_slot` lends the active tier's *whole*
+/// remaining spare so one `socket.read` fills as much as is available in a
+/// single syscall (there is no doubling ramp). `want` serves one purpose: it
+/// drives the inline→heap escape decision, which is `filled + want > inline
+/// tier`.
+///
+/// Bound to the inline-tier width (single source of truth) so that escape fires
+/// exactly when the inline tier proved insufficient: on the first read the
+/// buffer is empty (`0 + want == inline cap`, not greater), so the read stays
+/// inline and a whole response that fits inline never escapes and never
+/// allocates; the next read that still needs more finds `filled > 0`
+/// (`filled + inline cap > inline cap`) and escapes to the heap tier, where the
+/// full-spare lend drains the rest in one read. A response overflowing the
+/// inline tier therefore takes about two reads — one inline-fill, one heap-fill
+/// — instead of a doubling ramp. Coupling to the const keeps that boundary exact
+/// if the tier width is ever changed.
+const READ_WANT: usize = super::ingest::INGEST_INLINE_CAP;
 
 /// The protocol boundary at which [`pump_active_to_boundary`] returns.
 ///
@@ -232,8 +239,6 @@ where
     // Drain the enqueued request once, before the first read.
     flush(send_buf, transport).await?;
 
-    let mut want = INITIAL_READ_WANT;
-
     loop {
         // The borrowing `Event` is confined to this `match`: arms either diverge
         // (read / return a boundary) before binding any payload, or yield a
@@ -242,8 +247,11 @@ where
         // free of an E0499 conflict.
         let surface = match active.next_event() {
             Event::NeedMore => {
-                let slot = active.read_slot(want).map_err(EngineError::IngestFull)?;
-                let slot_len = slot.len();
+                // `read_slot` lends the active tier's whole remaining spare, so
+                // this one read fills as much as the socket has in a single
+                // syscall — no doubling ramp. `READ_WANT` only drives the
+                // inline→heap escape decision (see its doc).
+                let slot = active.read_slot(READ_WANT).map_err(EngineError::IngestFull)?;
                 let n = transport
                     .read(slot)
                     .await
@@ -256,11 +264,6 @@ where
                     return Err(EngineError::UnexpectedEof);
                 }
                 active.commit(n).map_err(EngineError::IngestCommitOverflow)?;
-                if n == slot_len {
-                    // The slot filled — the response is larger than offered, so
-                    // widen the next request to amortise reads on a stream.
-                    want = want.saturating_mul(2).min(READ_BUF_CAP);
-                }
                 continue;
             }
             Event::Idle => return Ok(Boundary::Idle),
@@ -354,8 +357,6 @@ where
     // Drain the startup packet enqueued at construction, before the first read.
     flush(send_buf, transport).await?;
 
-    let mut want = INITIAL_READ_WANT;
-
     loop {
         match conn.next_handshake_step(send_buf) {
             HandshakeProgress::Ready => return Ok(HandshakeOutcome::Ready),
@@ -380,8 +381,11 @@ where
                 if !send_buf.is_drained() {
                     flush(send_buf, transport).await?;
                 }
-                let slot = conn.read_slot(want).map_err(EngineError::IngestFull)?;
-                let slot_len = slot.len();
+                // `read_slot` lends the whole remaining tier spare, so this one
+                // read drains as much of the handshake burst as the socket has
+                // in a single syscall — no doubling ramp. `READ_WANT` only
+                // drives the inline→heap escape decision (see its doc).
+                let slot = conn.read_slot(READ_WANT).map_err(EngineError::IngestFull)?;
                 let n = transport.read(slot).await.map_err(EngineError::Transport)?;
                 if n == 0 {
                     // Zero bytes while the handshake is incomplete: the peer
@@ -391,11 +395,6 @@ where
                     return Err(EngineError::UnexpectedEof);
                 }
                 conn.commit(n).map_err(EngineError::IngestCommitOverflow)?;
-                if n == slot_len {
-                    // The slot filled — a larger burst (e.g. many
-                    // `ParameterStatus` frames) follows; widen the next request.
-                    want = want.saturating_mul(2).min(READ_BUF_CAP);
-                }
             }
         }
     }
