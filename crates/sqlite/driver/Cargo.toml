@@ -15,6 +15,21 @@ license = "MIT OR Apache-2.0"
 # `[workspace.dependencies]` policy block (single source of truth).
 rusqlite = { workspace = true }
 
+[dev-dependencies]
+# `trybuild` — pins the EXACT compiler diagnostic for the streaming
+# `query_each` no-escape wall: a `BorrowedRow` borrow that tries to escape
+# the callback is a committed `.stderr` golden, so a regression that lets a
+# borrowed row leak is a loud test failure. Workspace-pinned dev-only crate,
+# already resolved in the lockfile; adds no new package.
+trybuild = { workspace = true }
+
+# `bsql-devgates` — the counting global allocator, used to PROVE the
+# streaming `query_each` path is constant-memory (per-row allocations are
+# zero, independent of row count). `publish = false`, path dependency,
+# already a resolved workspace member; adds no new package and never enters
+# the runtime graph (dev-dependency only).
+bsql-devgates = { path = "../../../tools/devgates" }
+
 # Inherit the workspace FORBID floor (the two-tier lint wall).
 [lints]
 workspace = true

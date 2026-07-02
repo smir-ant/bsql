@@ -349,7 +349,23 @@ tokio = { version = "1", default-features = false }
 # `libsqlite3-sys`), removing the system-library dependency and pinning
 # the engine version across platforms. Ecosystem standard (100M+
 # downloads), maintained by the rusqlite working group.
-rusqlite = { version = "0.33", features = ["bundled"] }
+#
+# Pinned to the 0.37 line (bumped from 0.33). The bump is deliberately
+# CONSERVATIVE, not "latest": rusqlite 0.40 makes `ffi-sqlite-wasm-rs`
+# a DEFAULT feature, which drags the entire `wasm-bindgen` + `sqlite-wasm-rs`
+# + `js-sys` crate family into the lockfile (even on native targets it
+# resolves into `Cargo.lock`) — a new dependency family this native
+# embedded backend has no use for. Suppressing it needs
+# `default-features = false` AND still churns `hashlink`/`hashbrown`/
+# `foldhash` versions. 0.37 keeps the exact `features = ["bundled"]`
+# surface and a MINIMAL lockfile diff: ONLY `rusqlite 0.33 -> 0.37` and
+# `libsqlite3-sys 0.31 -> 0.35` change — `hashlink`, `fallible-iterator`,
+# `fallible-streaming-iterator`, `hashbrown`, `foldhash`, `bitflags`,
+# `smallvec` all stay pinned, and NO new package and NO new version
+# duplicate appears (`deps_pin` golden diff is exactly those two lines).
+# The 0.37 API is what the driver's zero-copy `ValueRef` read path is
+# built on (`Row::get_ref` + `ValueRef` storage-class variants).
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 # `simdutf8` — SIMD-accelerated UTF-8 validation. Drives
 # `<&str as FromPgText>::from_pg_text` for text-format column bytes

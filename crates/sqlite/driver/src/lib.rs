@@ -15,10 +15,13 @@
 //!
 //! ```text
 //!   TYPE           size  align
-//!   Row              24      8   one Vec<SqliteValue>
+//!   Row              24      8   one Vec<SqliteValue> (eager, owned)
+//!   BorrowedRow       8      8   one &rusqlite::Row (streaming, zero-copy)
 //!   SqliteValue      32      8   widest variant Text(String)/Blob(Vec<u8>)
+//!   ValueRef         24      8   widest variant Text/Blob (&[u8] fat pointer)
+//!   Type              1      1   five field-less storage-class variants
 //!   QueryResult      56      8   Vec<Row> + usize + Vec<String>
-//!   SqliteError      32      8   String-carrying variants
+//!   SqliteError      32      8   String-carrying variants (niche-packed tag)
 //! ```
 
 /// Pin the `size_of` AND `align_of` of a nameable type at build time — a
@@ -46,6 +49,8 @@ pub(crate) use footprint_pin;
 
 mod connection;
 mod error;
+mod value;
 
-pub use connection::{Connection, FromText, QueryResult, Row, SqliteValue};
+pub use connection::{BorrowedRow, Connection, QueryResult, Row};
 pub use error::SqliteError;
+pub use value::{FromColumn, SqliteValue, Type, ValueRef};
