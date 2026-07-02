@@ -43,7 +43,7 @@
 
 use core::marker::PhantomData;
 
-use crate::decode::{BinaryFmt, Cell, DecodeError, FormatCode};
+use crate::decode::{ArrayElement, BinaryFmt, Cell, DecodeError, FormatCode};
 use crate::params::ParamsWriter;
 use crate::pgtypes::{Json, Jsonb, Timestamp, Timestamptz, Uuid};
 
@@ -233,6 +233,21 @@ impl<'a> ColCellAt<'a> for &'static [u8] {
     #[inline]
     fn decode_at(bytes: &'a [u8]) -> Result<Self::At, DecodeError> {
         <&'a [u8] as Cell<'a, BinaryFmt>>::decode(bytes)
+    }
+}
+
+// A `query!` 1-D array column marker (`Vec<Option<T>>`): `At = Self` (the
+// element is owned, so the decoded value carries no borrow), the OID is the
+// element type's `T[]` array OID, and `decode_at` routes through the array
+// `Cell` decoder. Sealed via the element being an `ArrayElement` (itself a
+// sealed set), so a downstream `Vec<Option<_>>` cannot be a rogue row cell.
+impl<T: ArrayElement> col_cell_at_sealed::Sealed for alloc::vec::Vec<Option<T>> {}
+impl<'a, T: ArrayElement> ColCellAt<'a> for alloc::vec::Vec<Option<T>> {
+    type At = alloc::vec::Vec<Option<T>>;
+    const OID: u32 = <T as ArrayElement>::ARRAY_OID;
+    #[inline]
+    fn decode_at(bytes: &'a [u8]) -> Result<Self::At, DecodeError> {
+        <alloc::vec::Vec<Option<T>> as Cell<'a, BinaryFmt>>::decode(bytes)
     }
 }
 

@@ -95,6 +95,90 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::{canonical_type, fold_ident, object_name_leaf, schema_part_folds_to_public, Catalog};
 
+/// The element type of a one-dimensional array column (`T[]`) — exactly the
+/// scalar [`RustType`] set. A `RustType` cannot nest (it is a flat `Copy`
+/// enum), so an array's element is always a scalar: a MULTI-dimensional array
+/// (`int4[][]`) is structurally unrepresentable here and stays a loud
+/// [`InferError::UnsupportedPgType`], as does an array of an unsupported
+/// element type (`numeric[]`). This mirror enum is the price of keeping
+/// `RustType` `Copy` while making every `match RustType` compiler-forced to
+/// handle the array case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElemType {
+    /// `int2[]` element.
+    I16,
+    /// `int4[]` element.
+    I32,
+    /// `int8[]` element.
+    I64,
+    /// `oid[]` element.
+    U32,
+    /// `bool[]` element.
+    Bool,
+    /// `text[]` (and the `varchar`/`char` family) element.
+    Text,
+    /// `float4[]` element.
+    F32,
+    /// `float8[]` element.
+    F64,
+    /// `bytea[]` element.
+    Bytea,
+    /// `uuid[]` element.
+    Uuid,
+    /// `timestamptz[]` element.
+    Timestamptz,
+    /// `timestamp[]` element.
+    Timestamp,
+    /// `json[]` element.
+    Json,
+    /// `jsonb[]` element.
+    Jsonb,
+}
+
+impl ElemType {
+    /// The scalar [`RustType`] this array element decodes as.
+    #[must_use]
+    pub fn as_scalar(self) -> RustType {
+        match self {
+            ElemType::I16 => RustType::I16,
+            ElemType::I32 => RustType::I32,
+            ElemType::I64 => RustType::I64,
+            ElemType::U32 => RustType::U32,
+            ElemType::Bool => RustType::Bool,
+            ElemType::Text => RustType::Text,
+            ElemType::F32 => RustType::F32,
+            ElemType::F64 => RustType::F64,
+            ElemType::Bytea => RustType::Bytea,
+            ElemType::Uuid => RustType::Uuid,
+            ElemType::Timestamptz => RustType::Timestamptz,
+            ElemType::Timestamp => RustType::Timestamp,
+            ElemType::Json => RustType::Json,
+            ElemType::Jsonb => RustType::Jsonb,
+        }
+    }
+
+    /// The `Vec<Option<..>>` source spelling for diagnostics — the owned
+    /// record-field form of this element's 1-D array.
+    fn array_rust_name(self) -> &'static str {
+        match self {
+            ElemType::I16 => "Vec<Option<i16>>",
+            ElemType::I32 => "Vec<Option<i32>>",
+            ElemType::I64 => "Vec<Option<i64>>",
+            ElemType::U32 => "Vec<Option<u32>>",
+            ElemType::Bool => "Vec<Option<bool>>",
+            ElemType::Text => "Vec<Option<String>>",
+            ElemType::F32 => "Vec<Option<f32>>",
+            ElemType::F64 => "Vec<Option<f64>>",
+            ElemType::Bytea => "Vec<Option<Vec<u8>>>",
+            ElemType::Uuid => "Vec<Option<bsql::Uuid>>",
+            ElemType::Timestamptz => "Vec<Option<bsql::Timestamptz>>",
+            ElemType::Timestamp => "Vec<Option<bsql::Timestamp>>",
+            ElemType::Json => "Vec<Option<bsql::Json>>",
+            ElemType::Jsonb => "Vec<Option<bsql::Jsonb>>",
+        }
+    }
+}
+
 /// A Rust type the runtime can decode. This is the **v1 supported set** —
 /// every catalog `pg_type` an inferred column may carry maps to exactly
 /// one of these, and any catalog type outside the set is a loud
@@ -134,6 +218,12 @@ pub enum RustType {
     /// PostgreSQL `jsonb` -> the dep-free `bsql::Jsonb` (version byte +
     /// UTF-8 text on the wire).
     Jsonb,
+    /// A one-dimensional PostgreSQL array (`T[]`) of a scalar element ->
+    /// `Vec<Option<T>>`. The outer `Vec` is the array; each element is
+    /// `Option<T>` because a PG array may always contain NULL elements. The
+    /// whole array column's own nullability rides the column's `nullable`
+    /// flag (a nullable array column is `Option<Vec<Option<T>>>`).
+    Array(ElemType),
 }
 
 impl RustType {
@@ -157,6 +247,7 @@ impl RustType {
             RustType::Timestamp => "bsql::Timestamp",
             RustType::Json => "bsql::Json",
             RustType::Jsonb => "bsql::Jsonb",
+            RustType::Array(elem) => elem.array_rust_name(),
         }
     }
 }
@@ -176,29 +267,47 @@ impl fmt::Display for RustType {
 /// [`InferError::UnsupportedPgType`]. A type is never silently mapped —
 /// that is the whole point of the fail-closed contract.
 fn rust_type_for_pg(pg_type: &str) -> Option<RustType> {
+    // A one-dimensional array (`canonical_type` renders it structurally as
+    // `<element>[]`). Strip exactly ONE `[]` and map the element as a SCALAR:
+    // if the remaining spelling still ends in `[]` (a multi-dimensional array
+    // `int4[][]`), the scalar element map returns `None` and the whole array
+    // stays a loud `UnsupportedPgType` — never silently flattened. An array
+    // of an unsupported element (`numeric[]`) is loud for the same reason.
+    if let Some(element) = pg_type.strip_suffix("[]") {
+        return scalar_elem_for_pg(element).map(RustType::Array);
+    }
+    scalar_elem_for_pg(pg_type).map(ElemType::as_scalar)
+}
+
+/// The fail-closed scalar `pg_type -> ElemType` map — the single source of
+/// truth for the supported SCALAR set, used both for a scalar column and for
+/// a 1-D array's element. `None` for any type outside the set, INCLUDING any
+/// array spelling (which carries a `[]` suffix and is not a scalar), so a
+/// multi-dimensional array's inner `<elem>[]` maps to `None`.
+fn scalar_elem_for_pg(pg_type: &str) -> Option<ElemType> {
     match pg_type {
-        "int2" => Some(RustType::I16),
-        "int4" => Some(RustType::I32),
-        "int8" => Some(RustType::I64),
-        "oid" => Some(RustType::U32),
-        "bool" => Some(RustType::Bool),
+        "int2" => Some(ElemType::I16),
+        "int4" => Some(ElemType::I32),
+        "int8" => Some(ElemType::I64),
+        "oid" => Some(ElemType::U32),
+        "bool" => Some(ElemType::Bool),
         // `text` and the catalog's `varchar`/`char` canonicalisation all
         // decode to the same Rust string type.
-        "text" | "varchar" | "char" | "bpchar" => Some(RustType::Text),
+        "text" | "varchar" | "char" | "bpchar" => Some(ElemType::Text),
         // `real`/`float4` and `double precision`/`float8` are already
         // alias-collapsed to `float4`/`float8` by `canonical_type`.
-        "float4" => Some(RustType::F32),
-        "float8" => Some(RustType::F64),
-        "bytea" => Some(RustType::Bytea),
+        "float4" => Some(ElemType::F32),
+        "float8" => Some(ElemType::F64),
+        "bytea" => Some(ElemType::Bytea),
         // Dep-free bsql-native semantic types. `timestamptz` and the naive
         // `timestamp` share a wire shape but distinct catalog OIDs, so they
         // map to distinct Rust types (`canonical_type` distinguishes them
         // structurally from the `WITH TIME ZONE` / `TZ` grammar).
-        "uuid" => Some(RustType::Uuid),
-        "timestamptz" => Some(RustType::Timestamptz),
-        "timestamp" => Some(RustType::Timestamp),
-        "json" => Some(RustType::Json),
-        "jsonb" => Some(RustType::Jsonb),
+        "uuid" => Some(ElemType::Uuid),
+        "timestamptz" => Some(ElemType::Timestamptz),
+        "timestamp" => Some(ElemType::Timestamp),
+        "json" => Some(ElemType::Json),
+        "jsonb" => Some(ElemType::Jsonb),
         _ => None,
     }
 }
@@ -271,6 +380,15 @@ pub enum InferError {
     /// A catalog column's `pg_type` is outside the v1 supported set. It is
     /// named here and never silently mapped; cast it to a supported type.
     UnsupportedPgType { pg_type: String, context: String },
+    /// A `$N` parameter was inferred to have a 1-D array type (e.g. `WHERE
+    /// arr_col = $1`). An array-typed scalar parameter is not supported by
+    /// `query!`: the typed parameter tuple requires `Copy`, which `Vec<_>` is
+    /// not. This is a loud, honest rejection — never a silently-mistyped
+    /// parameter — directing the user to the supported array-parameter form
+    /// (`col = ANY($N)`, which binds an array slice) or to binding the
+    /// elements individually. `param` names the placeholder; `element` is the
+    /// array's element type spelling.
+    ArrayParam { param: String, element: String },
     /// A non-positional placeholder (`?`) — only numbered `$N` parameters
     /// are supported, since position is what binds a type.
     NonPositionalParam(String),
@@ -768,6 +886,14 @@ impl fmt::Display for InferError {
                  set (int2, int4, int8, oid, bool, text). It is never \
                  silently mapped; cast it to a supported type in the SQL \
                  (e.g. `col::text`)."
+            ),
+            InferError::ArrayParam { param, element } => write!(
+                f,
+                "parameter `{param}` was inferred to be an array type \
+                 (`{element}`), which `query!` does not support as a scalar \
+                 parameter (the typed parameter tuple requires `Copy`, which \
+                 `Vec<_>` is not). Use `col = ANY({param})` to bind an array \
+                 slice, or bind the elements individually."
             ),
             InferError::NonPositionalParam(found) => write!(
                 f,
@@ -9789,7 +9915,13 @@ fn common_type(a: RustType, b: RustType) -> Option<RustType> {
         | RustType::Timestamptz
         | RustType::Timestamp
         | RustType::Json
-        | RustType::Jsonb => None,
+        | RustType::Jsonb
+        // Arrays never widen across a merge: two array sides reconcile ONLY
+        // when identical (the `a == b` early return above), so an
+        // array-vs-scalar or two distinct-element arrays are a loud
+        // cast-required — matching PostgreSQL, which has no implicit array
+        // element-type widening on a set-op / join merge.
+        | RustType::Array(_) => None,
     };
     match (rank(a), rank(b)) {
         (Some(ra), Some(rb)) => {
@@ -14509,6 +14641,17 @@ impl<'c> ParamWalker<'c> {
     /// Re-recording the SAME type is idempotent.
     fn record(&mut self, position: usize, ty: RustType) -> Result<(), InferError> {
         self.seen.insert(position, ());
+        // A `$N` inferred to be an array type (e.g. `WHERE arr_col = $1`) is a
+        // loud rejection: an array-typed scalar parameter is not `Copy`, so
+        // the typed parameter tuple cannot carry it. Fail closed here (the
+        // single choke point for every param type) rather than emit a
+        // `Vec<_>` param that trips a confusing downstream `Copy` bound.
+        if let RustType::Array(_) = ty {
+            return Err(InferError::ArrayParam {
+                param: format!("${position}"),
+                element: ty.rust_name().to_string(),
+            });
+        }
         match self.typed.get(&position) {
             Some(&existing) if existing != ty => match common_type(existing, ty) {
                 // Reconcilable widths: store the wider, which binds safely for
@@ -16137,6 +16280,11 @@ mod tests {
         // The OWNED spelling; the borrowed twin is `&[u8]`, mirroring
         // `Text -> String` / `&str`.
         assert_eq!(RustType::Bytea.rust_name(), "Vec<u8>");
+        // A 1-D array's diagnostic spelling is its `Vec<Option<..>>` form.
+        assert_eq!(RustType::Array(ElemType::I32).rust_name(), "Vec<Option<i32>>");
+        assert_eq!(RustType::Array(ElemType::Text).rust_name(), "Vec<Option<String>>");
+        assert_eq!(RustType::Array(ElemType::Bytea).rust_name(), "Vec<Option<Vec<u8>>>");
+        assert_eq!(RustType::Array(ElemType::Uuid).rust_name(), "Vec<Option<bsql::Uuid>>");
     }
 
     #[test]
@@ -17139,54 +17287,113 @@ mod tests {
     }
 
     #[test]
-    fn every_array_spelling_is_loud_not_silently_scalar() {
-        // Arrays are a deferred slice: EVERY array column — compact or
-        // verbose, of any element type, any dimensionality — must be a loud
-        // `UnsupportedPgType`, NEVER silently typed as its scalar element.
-        //
-        // The verbose multi-word spellings are the regression guard: a
-        // head-word split drops the `[]` (and the zone) and would collapse
-        // `TIMESTAMP WITH TIME ZONE[]` to a scalar `timestamp`. The
-        // `canonical_type` array arm renders `<element>[]` structurally, so
-        // `rust_type_for_pg` returns `None` for all of these.
+    fn one_dim_arrays_of_supported_elements_resolve() {
+        // A 1-D array of a supported element type resolves to
+        // `RustType::Array(element)`. The verbose multi-word spellings are the
+        // regression guard: `canonical_type` renders `<element>[]`
+        // structurally (a head-word split would drop the `[]` and the zone),
+        // so `TIMESTAMP WITH TIME ZONE[]` canonicalises to `timestamptz[]` ->
+        // `Array(Timestamptz)`, NEVER a scalar `timestamp`.
+        for (decl, expected) in [
+            ("INT2[]", RustType::Array(ElemType::I16)),
+            ("INT4[]", RustType::Array(ElemType::I32)),
+            ("INT8[]", RustType::Array(ElemType::I64)),
+            ("BOOL[]", RustType::Array(ElemType::Bool)),
+            ("TEXT[]", RustType::Array(ElemType::Text)),
+            ("CHARACTER VARYING[]", RustType::Array(ElemType::Text)),
+            ("REAL[]", RustType::Array(ElemType::F32)),
+            ("DOUBLE PRECISION[]", RustType::Array(ElemType::F64)),
+            ("BYTEA[]", RustType::Array(ElemType::Bytea)),
+            ("UUID[]", RustType::Array(ElemType::Uuid)),
+            ("TIMESTAMPTZ[]", RustType::Array(ElemType::Timestamptz)),
+            ("TIMESTAMP WITH TIME ZONE[]", RustType::Array(ElemType::Timestamptz)),
+            ("TIMESTAMP[]", RustType::Array(ElemType::Timestamp)),
+            ("TIMESTAMP WITHOUT TIME ZONE[]", RustType::Array(ElemType::Timestamp)),
+            ("JSON[]", RustType::Array(ElemType::Json)),
+            ("JSONB[]", RustType::Array(ElemType::Jsonb)),
+        ] {
+            let ddl = format!("CREATE TABLE t (id INT PRIMARY KEY, a {decl} NOT NULL)");
+            let s = match shape(&[ddl.as_str()], "SELECT a FROM t") {
+                Ok(s) => s,
+                Err(e) => panic!("`{decl}` 1-D array must resolve, got {e:?}"),
+            };
+            assert_eq!(s.columns, vec![col("a", expected, false)], "`{decl}`");
+        }
+    }
+
+    #[test]
+    fn multidim_and_unsupported_element_arrays_stay_loud() {
+        // Fail-closed: a MULTI-dimensional array (element still ends in `[]`
+        // after stripping one) and an array of an UNSUPPORTED element
+        // (`numeric[]`) both stay a loud `UnsupportedPgType` — never silently
+        // flattened to 1-D or mapped to a scalar.
         for (decl, canonical_array) in [
-            ("TIMESTAMPTZ[]", "timestamptz[]"),
-            ("TIMESTAMP WITH TIME ZONE[]", "timestamptz[]"),
-            ("TIMESTAMP[]", "timestamp[]"),
-            ("TIMESTAMP WITHOUT TIME ZONE[]", "timestamp[]"),
-            ("INT4[]", "int4[]"),
-            ("DOUBLE PRECISION[]", "float8[]"),
-            ("CHARACTER VARYING[]", "varchar[]"),
-            ("UUID[]", "uuid[]"),
             ("NUMERIC[]", "numeric[]"),
             ("INT4[][]", "int4[][]"),
+            ("TEXT[][]", "text[][]"),
+            ("NUMERIC[][]", "numeric[][]"),
         ] {
             let ddl = format!("CREATE TABLE t (id INT PRIMARY KEY, a {decl} NOT NULL)");
             let err = shape(&[ddl.as_str()], "SELECT a FROM t")
-                .expect_err(&format!("`{decl}` array column must be loud, not scalar"));
+                .expect_err(&format!("`{decl}` must stay loud"));
             match err {
                 InferError::UnsupportedPgType { pg_type, .. } => assert_eq!(
                     pg_type, canonical_array,
-                    "`{decl}` must canonicalise to the array type `{canonical_array}`",
+                    "`{decl}` must canonicalise to `{canonical_array}`",
                 ),
                 other => panic!("`{decl}` must be UnsupportedPgType, got {other:?}"),
             }
         }
-        // The SCALAR forms still resolve (no over-broad rejection): the array
-        // arm fires only for a real `DataType::Array`.
-        let ddl = "CREATE TABLE t ( \
-            a TIMESTAMPTZ NOT NULL, \
-            b TIMESTAMP WITH TIME ZONE NOT NULL, \
-            c TIMESTAMP NOT NULL )";
-        let s = shape(&[ddl], "SELECT a, b, c FROM t").expect("scalars still supported");
+    }
+
+    #[test]
+    fn array_column_nullability_rides_the_column() {
+        // The element `Option<T>` is intrinsic (not tracked here); the COLUMN's
+        // own nullability follows the `NOT NULL` flag. `tags` is NOT NULL ->
+        // `nullable = false`; `labels` is nullable -> `nullable = true`.
+        let ddl = "CREATE TABLE t (id INT PRIMARY KEY, tags INT4[] NOT NULL, labels TEXT[])";
+        let s = shape(&[ddl], "SELECT tags, labels FROM t").expect("array columns");
         assert_eq!(
             s.columns,
             vec![
-                col("a", RustType::Timestamptz, false),
-                col("b", RustType::Timestamptz, false),
-                col("c", RustType::Timestamp, false),
+                col("tags", RustType::Array(ElemType::I32), false),
+                col("labels", RustType::Array(ElemType::Text), true),
             ],
         );
+    }
+
+    #[test]
+    fn one_dim_array_infers_through_a_cast() {
+        // A literal cast to a 1-D array type resolves offline (no table).
+        let s = shape(&[USERS], "SELECT '{1,2,3}'::int4[] AS xs")
+            .expect("int4[] cast");
+        assert_eq!(s.columns, vec![col("xs", RustType::Array(ElemType::I32), false)]);
+    }
+
+    #[test]
+    fn multidim_array_cast_stays_loud() {
+        let err = shape(&[USERS], "SELECT '{{1}}'::int4[][] AS xs")
+            .expect_err("int4[][] cast must be loud");
+        assert!(
+            matches!(err, InferError::UnsupportedPgType { ref pg_type, .. } if pg_type == "int4[][]"),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn array_typed_param_is_a_loud_rejection() {
+        // A `$N` inferred as an array type (comparing a whole array column to a
+        // bind) is a loud `ArrayParam`, not a silently-mistyped `Vec<_>` param.
+        let ddl = "CREATE TABLE t (id INT PRIMARY KEY, tags INT4[] NOT NULL)";
+        let err = shape(&[ddl], "SELECT id FROM t WHERE tags = $1")
+            .expect_err("array-typed param must be loud");
+        match err {
+            InferError::ArrayParam { param, element } => {
+                assert_eq!(param, "$1");
+                assert_eq!(element, "Vec<Option<i32>>");
+            }
+            other => panic!("expected ArrayParam, got {other:?}"),
+        }
     }
 
     #[test]

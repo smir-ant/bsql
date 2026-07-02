@@ -72,7 +72,7 @@ mod sqlite;
 pub use dynamics::{
     infer_dynamic_query, DynamicError, DynamicShape, OrderByVariant, ParamShape, WireVariant,
 };
-pub use infer::{infer_query, InferError, InferredColumn, QueryShape, RustType};
+pub use infer::{infer_query, ElemType, InferError, InferredColumn, QueryShape, RustType};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
     emit_sqlite_template, verify_sqlite_conformance, SqliteConformanceError,
@@ -966,11 +966,17 @@ fn canonical_type(data_type: &sqlparser::ast::DataType) -> String {
     // `character` — which would collapse an ARRAY column to its SCALAR element
     // type: a silently-wrong catalog (a `timestamptz[]` column typed as a
     // scalar 8-byte `timestamp`, with the scalar OID baked into the wire).
-    // Rendering the array form explicitly keeps it OUTSIDE `rust_type_for_pg`'s
-    // supported set, so EVERY array spelling — compact or verbose, any element
-    // type, any dimensionality — is a loud `UnsupportedPgType` rather than a
-    // silent mis-type. When 1-D array support lands, `rust_type_for_pg` gains
-    // the matching `<element>[]` arm; until then all arrays fail closed.
+    // Rendering the array form explicitly as `<element>[]` is what lets
+    // `rust_type_for_pg` decide the boundary correctly: a ONE-dimensional array
+    // of a SUPPORTED element (`int4[]`, `text[]`, `uuid[]`, …) resolves to
+    // `RustType::Array(element)` (decoding to `Vec<Option<T>>`); a
+    // MULTI-dimensional array (`int4[][]`, whose element still renders with a
+    // `[]` suffix) and an array of an UNSUPPORTED element (`numeric[]`) stay a
+    // loud `UnsupportedPgType`, and an array-typed `$N` parameter is a loud
+    // `ArrayParam`. The structural rendering is what makes that split reliable —
+    // a head-word split would drop the `[]` (and the zone) and silently collapse
+    // an array column to its scalar element (a `timestamptz[]` typed as a scalar
+    // 8-byte `timestamp`), a mis-type this arm forecloses.
     if let DataType::Array(elem) = data_type {
         return match elem {
             ArrayElemTypeDef::SquareBracket(inner, _)

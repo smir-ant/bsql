@@ -750,6 +750,39 @@ pub enum DecodeError {
         /// The leading byte found, or `None` for an empty body.
         version: Option<u8>,
     },
+    /// A binary array column declares a dimensionality other than the
+    /// supported forms. The `query!` array decoders model a ONE-dimensional
+    /// array (`T[]`, decoding to `Vec<Option<T>>`); PostgreSQL sends `ndim = 0`
+    /// for an empty array (accepted, decodes to an empty `Vec`) and `ndim = 1`
+    /// for a populated one. Any other `ndim` (a multi-dimensional `int4[][]`,
+    /// or a negative/garbage header) is classified here rather than silently
+    /// flattened — a `2`-dimensional array is NOT the same value as a 1-D one,
+    /// so mis-reading it would be a silently-wrong decode.
+    ArrayMultiDim {
+        /// The offending dimension count from the array header.
+        ndim: i32,
+    },
+    /// A binary array column's header declares an element type OID that does
+    /// not match the element type the row tuple decodes as. The array wire
+    /// header carries the element OID explicitly; the decoder cross-checks it
+    /// against `<T as ArrayElement>::OID` and refuses to decode a `text[]`
+    /// payload as an `int4[]` (or any element mismatch) — a classified error,
+    /// never a reinterpretation of the wrong element bytes.
+    ArrayElemOidMismatch {
+        /// The element OID the row tuple's element type expects.
+        expected: u32,
+        /// The element OID found in the array wire header.
+        found: u32,
+    },
+    /// A binary array column's payload does not frame EXACTLY — a truncated or
+    /// malformed array frame. Covers too FEW bytes (for the fixed header words,
+    /// a per-dimension pair, an element's 4-byte length prefix, or an element
+    /// body of the declared length), a negative element length other than the
+    /// `-1` NULL sentinel, a negative dimension length, AND a length SURPLUS
+    /// (trailing bytes past the last declared element, or past an empty array's
+    /// header). Classified rather than yielding a partial / defaulted array or
+    /// silently ignoring the surplus.
+    ArrayTruncated,
 }
 
 // Additive `core::error::Error` impl; matches the crate-wide
@@ -798,6 +831,17 @@ impl fmt::Display for DecodeError {
             ),
             Self::JsonbHeaderInvalid { version: None } => {
                 f.write_str("jsonb binary body is empty (missing the version header byte)")
+            }
+            Self::ArrayMultiDim { ndim } => write!(
+                f,
+                "array column has {ndim} dimensions; only 1-D arrays (ndim 0 = empty, ndim 1) are supported",
+            ),
+            Self::ArrayElemOidMismatch { expected, found } => write!(
+                f,
+                "array element type OID mismatch: header declares {found}, decoder expects {expected}",
+            ),
+            Self::ArrayTruncated => {
+                f.write_str("array column payload is truncated or malformed")
             }
         }
     }
@@ -2135,6 +2179,246 @@ impl Cell<'_, BinaryFmt> for Jsonb {
         }
     }
 }
+
+// ════════════════════════════════════════════════════════════════════
+// One-dimensional array decoders — `T[]` decoding to `Vec<Option<T>>`.
+// ════════════════════════════════════════════════════════════════════
+//
+// PostgreSQL binary array layout (`src/backend/utils/adt/arrayfuncs.c`,
+// `array_send`), for a one-dimensional array:
+//
+// ```text
+//   ndim:        i32_be    (0 = empty array, 1 = one dimension)
+//   flags:       i32_be    (bit 0 = has-null; IGNORED — NULL is detected
+//                           per element from a `-1` length, never trusted
+//                           from this flag)
+//   element_oid: i32_be    (the scalar element type's OID)
+//   per dim:     { dim_len: i32_be, lower_bound: i32_be }   (ndim pairs;
+//                           NONE for ndim = 0; lower_bound IGNORED)
+//   per element: { len: i32_be, body }   (len == -1 => SQL NULL => None)
+// ```
+//
+// The element order in the `Vec` is the wire order; the lower bound is
+// array metadata that does not change the element sequence, so it is read
+// and discarded. A dimension count other than `{0, 1}` is a classified
+// [`DecodeError::ArrayMultiDim`] — a multi-dimensional array is a distinct
+// value and is never silently flattened.
+
+/// An owned Rust type that can be one element of a `query!` array column.
+///
+/// The array `Cell` decoder (`Vec<Option<T>>`) is generic over this trait:
+/// each element is decoded into an OWNED value (so the whole `Vec` owns its
+/// contents and the borrowed / owned record twins carry the same field type),
+/// the element's [`OID`](Self::OID) is cross-checked against the array wire
+/// header, and the array's own OID comes from [`ARRAY_OID`](Self::ARRAY_OID).
+///
+/// # Sealed
+///
+/// The trait is sealed (`array_elem_sealed`): the element set is exactly the
+/// `query!`-supported scalar types, and a downstream crate cannot introduce a
+/// rogue array element type. Because the trait is not lifetime-parameterised,
+/// the element is always owned — a `text[]` element is a `String`, a `bytea[]`
+/// element a `Vec<u8>`; the value types are themselves.
+pub trait ArrayElement: Sized + array_elem_sealed::Sealed {
+    /// The element (scalar) type's PG OID — cross-checked against the array
+    /// wire header's declared element OID. Drift-pinned against
+    /// [`Cell<BinaryFmt>::OID`](Cell) for the borrowed peer type.
+    const OID: u32;
+    /// This element type's `T[]` array OID. Drift-pinned against the
+    /// canonical `oids::*_ARRAY` constant.
+    const ARRAY_OID: u32;
+    /// Decode ONE array element body into an owned value. Reuses the scalar
+    /// binary decoder, then owns the result where the scalar peer borrowed.
+    fn decode_elem(bytes: &[u8]) -> Result<Self, DecodeError>;
+}
+
+mod array_elem_sealed {
+    /// Module-private seal — only this crate's supported element types.
+    pub trait Sealed {}
+}
+
+/// Decode a one-dimensional PG binary array body into `Vec<Option<T>>`.
+/// Shared by every element type's array `Cell` impl. A wrong dimensionality,
+/// an element-OID mismatch, or a truncated payload is a classified
+/// [`DecodeError`] — never a partial, flattened, or defaulted array.
+fn decode_array_1d<T: ArrayElement>(
+    bytes: &[u8],
+) -> Result<alloc::vec::Vec<Option<T>>, DecodeError> {
+    let (ndim_bytes, rest) =
+        bytes.split_first_chunk::<4>().ok_or(DecodeError::ArrayTruncated)?;
+    let ndim = i32::from_be_bytes(*ndim_bytes);
+    // `flags` (bit 0 = has-null) is read and discarded: NULL elements are
+    // detected per element from a `-1` length, never trusted from this flag.
+    let (_flags, rest) = rest.split_first_chunk::<4>().ok_or(DecodeError::ArrayTruncated)?;
+    let (elem_oid_bytes, rest) =
+        rest.split_first_chunk::<4>().ok_or(DecodeError::ArrayTruncated)?;
+    let elem_oid = u32::from_be_bytes(*elem_oid_bytes);
+    // The declared element OID must match the type the row tuple decodes as,
+    // so a `text[]` payload is never reinterpreted as `int4[]` bytes. Checked
+    // BEFORE the `ndim == 0` early return, so even an empty array enforces the
+    // element-type contract (defense-in-depth symmetry — an empty `text[]`
+    // header decoded as `int4[]` is a classified mismatch, not a silent
+    // `Ok(empty)`).
+    if elem_oid != <T as ArrayElement>::OID {
+        return Err(DecodeError::ArrayElemOidMismatch {
+            expected: <T as ArrayElement>::OID,
+            found: elem_oid,
+        });
+    }
+    // ndim 0 is PG's canonical empty array — no dimension pair, no elements.
+    if ndim == 0 {
+        // No-swallow: nothing may follow the three fixed header words of an
+        // empty array; trailing bytes are a malformed frame, not ignored.
+        if !rest.is_empty() {
+            return Err(DecodeError::ArrayTruncated);
+        }
+        return Ok(alloc::vec::Vec::new());
+    }
+    if ndim != 1 {
+        return Err(DecodeError::ArrayMultiDim { ndim });
+    }
+    let (dim_len_bytes, rest) =
+        rest.split_first_chunk::<4>().ok_or(DecodeError::ArrayTruncated)?;
+    let dim_len = i32::from_be_bytes(*dim_len_bytes);
+    // The lower bound is array metadata; the element order is the wire order,
+    // so it is read and discarded.
+    let (_lower_bound, mut rest) =
+        rest.split_first_chunk::<4>().ok_or(DecodeError::ArrayTruncated)?;
+    // A negative dimension length is a malformed header (classified, never a
+    // wrapped or saturated count).
+    let n = usize::try_from(dim_len).map_err(|_| DecodeError::ArrayTruncated)?;
+    // Pre-size, but cap the reservation at the remaining byte count so a
+    // hostile `dim_len` cannot trigger a huge speculative allocation: every
+    // element consumes at least its 4-byte length prefix, so there can be no
+    // more elements than remaining bytes. `.min` avoids a division.
+    let mut out = alloc::vec::Vec::with_capacity(n.min(rest.len()));
+    for _ in 0..n {
+        let (len_bytes, after_len) =
+            rest.split_first_chunk::<4>().ok_or(DecodeError::ArrayTruncated)?;
+        let elem_len = i32::from_be_bytes(*len_bytes);
+        // -1 is the wire NULL sentinel — an honest `None` element.
+        if elem_len == -1 {
+            out.push(None);
+            rest = after_len;
+            continue;
+        }
+        // Any other negative length is malformed (classified).
+        let elem_len = usize::try_from(elem_len).map_err(|_| DecodeError::ArrayTruncated)?;
+        let (body, after_body) =
+            after_len.split_at_checked(elem_len).ok_or(DecodeError::ArrayTruncated)?;
+        out.push(Some(<T as ArrayElement>::decode_elem(body)?));
+        rest = after_body;
+    }
+    // No-swallow: the element bodies must consume the payload EXACTLY. Trailing
+    // bytes past the last declared element are a malformed / hostile frame, not
+    // silently ignored — mirroring the fixed-width scalar decoders, which
+    // reject any length surplus (never a partial read of a longer body).
+    if !rest.is_empty() {
+        return Err(DecodeError::ArrayTruncated);
+    }
+    Ok(out)
+}
+
+/// A `query!` array column decodes to an owned `Vec<Option<T>>`: the outer
+/// `Vec` owns its elements, and each element is `Option<T>` because a PG array
+/// may always contain NULL elements. The array's OID is the element type's
+/// `T[]` OID; the header's declared element OID is cross-checked.
+impl<'a, T: ArrayElement> Cell<'a, BinaryFmt> for alloc::vec::Vec<Option<T>> {
+    const OID: u32 = <T as ArrayElement>::ARRAY_OID;
+    #[inline]
+    fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+        decode_array_1d::<T>(bytes)
+    }
+}
+
+// ── ArrayElement impls — the supported element set. Each reuses the scalar
+//    binary decoder for the element body, owning the result where the scalar
+//    peer borrows (`text` -> `String`, `bytea` -> `Vec<u8>`). ──
+
+/// Generate `ArrayElement` for a value-typed element (`At = Self`): the
+/// element decode is exactly the scalar `Cell<BinaryFmt>` decode.
+macro_rules! impl_array_element_value {
+    ($($t:ty => $array_oid:expr),+ $(,)?) => {
+        $(
+            impl array_elem_sealed::Sealed for $t {}
+            impl ArrayElement for $t {
+                const OID: u32 = <$t as Cell<'_, BinaryFmt>>::OID;
+                const ARRAY_OID: u32 = $array_oid;
+                #[inline]
+                fn decode_elem(bytes: &[u8]) -> Result<Self, DecodeError> {
+                    <$t as Cell<'_, BinaryFmt>>::decode(bytes)
+                }
+            }
+        )+
+    };
+}
+
+impl_array_element_value!(
+    i16 => oids::INT2_ARRAY,
+    i32 => oids::INT4_ARRAY,
+    i64 => oids::INT8_ARRAY,
+    u32 => oids::OID_ARRAY,
+    bool => oids::BOOL_ARRAY,
+    f32 => oids::FLOAT4_ARRAY,
+    f64 => oids::FLOAT8_ARRAY,
+    Uuid => oids::UUID_ARRAY,
+    Timestamptz => oids::TIMESTAMPTZ_ARRAY,
+    Timestamp => oids::TIMESTAMP_ARRAY,
+    Json => oids::JSON_ARRAY,
+    Jsonb => oids::JSONB_ARRAY,
+);
+
+/// `text[]` element — the owned `String` peer of the borrowed `&str` scalar
+/// decoder (the outer `Vec` allocates regardless, so the element owns its
+/// UTF-8 bytes rather than borrowing the row body).
+impl array_elem_sealed::Sealed for alloc::string::String {}
+impl ArrayElement for alloc::string::String {
+    const OID: u32 = <&str as Cell<'_, BinaryFmt>>::OID;
+    const ARRAY_OID: u32 = oids::TEXT_ARRAY;
+    #[inline]
+    fn decode_elem(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Ok(alloc::string::String::from(<&str as Cell<'_, BinaryFmt>>::decode(bytes)?))
+    }
+}
+
+/// `bytea[]` element — the owned `Vec<u8>` peer of the borrowed `&[u8]` scalar
+/// decoder.
+impl array_elem_sealed::Sealed for alloc::vec::Vec<u8> {}
+impl ArrayElement for alloc::vec::Vec<u8> {
+    const OID: u32 = <&[u8] as Cell<'_, BinaryFmt>>::OID;
+    const ARRAY_OID: u32 = oids::BYTEA_ARRAY;
+    #[inline]
+    fn decode_elem(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Ok(<[u8]>::to_vec(<&[u8] as Cell<'_, BinaryFmt>>::decode(bytes)?))
+    }
+}
+
+// Drift-pins: every array `Cell` impl's OID matches the canonical array
+// `oids::*_ARRAY` constant, AND each `ArrayElement::OID` (the wire-header
+// element check) matches the borrowed scalar peer's `Cell<BinaryFmt>::OID`.
+// One const-block pins the whole set — a wrong array OID or a wrong element
+// OID fails the build, not a live decode.
+const _: () = {
+    assert!(<alloc::vec::Vec<Option<i16>> as Cell<BinaryFmt>>::OID == oids::INT2_ARRAY);
+    assert!(<alloc::vec::Vec<Option<i32>> as Cell<BinaryFmt>>::OID == oids::INT4_ARRAY);
+    assert!(<alloc::vec::Vec<Option<i64>> as Cell<BinaryFmt>>::OID == oids::INT8_ARRAY);
+    assert!(<alloc::vec::Vec<Option<u32>> as Cell<BinaryFmt>>::OID == oids::OID_ARRAY);
+    assert!(<alloc::vec::Vec<Option<bool>> as Cell<BinaryFmt>>::OID == oids::BOOL_ARRAY);
+    assert!(<alloc::vec::Vec<Option<f32>> as Cell<BinaryFmt>>::OID == oids::FLOAT4_ARRAY);
+    assert!(<alloc::vec::Vec<Option<f64>> as Cell<BinaryFmt>>::OID == oids::FLOAT8_ARRAY);
+    assert!(<alloc::vec::Vec<Option<Uuid>> as Cell<BinaryFmt>>::OID == oids::UUID_ARRAY);
+    assert!(<alloc::vec::Vec<Option<Timestamptz>> as Cell<BinaryFmt>>::OID == oids::TIMESTAMPTZ_ARRAY);
+    assert!(<alloc::vec::Vec<Option<Timestamp>> as Cell<BinaryFmt>>::OID == oids::TIMESTAMP_ARRAY);
+    assert!(<alloc::vec::Vec<Option<Json>> as Cell<BinaryFmt>>::OID == oids::JSON_ARRAY);
+    assert!(<alloc::vec::Vec<Option<Jsonb>> as Cell<BinaryFmt>>::OID == oids::JSONB_ARRAY);
+    assert!(<alloc::vec::Vec<Option<alloc::string::String>> as Cell<BinaryFmt>>::OID == oids::TEXT_ARRAY);
+    assert!(<alloc::vec::Vec<Option<alloc::vec::Vec<u8>>> as Cell<BinaryFmt>>::OID == oids::BYTEA_ARRAY);
+    // Element-OID (wire header check) ≡ borrowed scalar peer's Cell OID.
+    assert!(<i32 as ArrayElement>::OID == <i32 as Cell<BinaryFmt>>::OID);
+    assert!(<alloc::string::String as ArrayElement>::OID == <&str as Cell<BinaryFmt>>::OID);
+    assert!(<alloc::vec::Vec<u8> as ArrayElement>::OID == <&[u8] as Cell<BinaryFmt>>::OID);
+    assert!(<Uuid as ArrayElement>::OID == <Uuid as Cell<BinaryFmt>>::OID);
+};
 
 // Compile-time symmetry pins: text and binary decoders for the
 // same Rust type MUST target the same PG type OID. A refactor that
@@ -4578,5 +4862,175 @@ mod semantic_type_decode_tests {
             <Jsonb as Cell<BinaryFmt>>::decode(&[0x01, b'{', b'}']),
             Ok(ref v) if v.as_str() == "{}"
         ));
+    }
+}
+
+#[cfg(test)]
+mod array_decode_tests {
+    //! One-dimensional PG binary array decode (`Vec<Option<T>>`): the happy
+    //! path with a NULL element, the empty `ndim = 0` form, and the classified
+    //! bad paths (multi-dimensional, element-OID mismatch, truncated).
+
+    extern crate alloc;
+    use super::*;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// Append an `i32` big-endian word.
+    fn push_i32(out: &mut Vec<u8>, v: i32) {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+
+    /// Build a 1-D PG binary array body from `(elem_oid, elements)`, each
+    /// element `Some(bytes)` (non-NULL) or `None` (wire `-1`). `ndim` and
+    /// `flags` are supplied explicitly so bad-path fixtures can set them.
+    fn build_array(ndim: i32, elem_oid: u32, elems: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_i32(&mut out, ndim);
+        push_i32(&mut out, 0); // flags — ignored by the decoder
+        out.extend_from_slice(&elem_oid.to_be_bytes());
+        if ndim == 0 {
+            return out; // empty array: no dimension pair, no elements
+        }
+        push_i32(&mut out, crate::test_fixtures::fixture_i32(elems.len())); // dim_len
+        push_i32(&mut out, 1); // lower bound
+        for elem in elems {
+            match elem {
+                Some(body) => {
+                    push_i32(&mut out, crate::test_fixtures::fixture_i32(body.len()));
+                    out.extend_from_slice(body);
+                }
+                None => push_i32(&mut out, -1),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn int4_array_happy_with_null_element() {
+        let one = 1i32.to_be_bytes();
+        let three = 3i32.to_be_bytes();
+        let wire = build_array(1, oids::INT4, &[Some(&one), None, Some(&three)]);
+        let got = <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&wire);
+        assert!(matches!(
+            got,
+            Ok(ref v) if v.as_slice() == [Some(1i32), None, Some(3i32)]
+        ));
+    }
+
+    #[test]
+    fn text_array_owned_elements_with_null() {
+        let wire = build_array(1, oids::TEXT, &[Some(b"hi"), None, Some(b"z")]);
+        let got = <Vec<Option<String>> as Cell<BinaryFmt>>::decode(&wire);
+        // Owned `String` elements, with the middle element an honest `None`.
+        let expected: Vec<Option<String>> =
+            alloc::vec![Some(String::from("hi")), None, Some(String::from("z"))];
+        assert!(matches!(got, Ok(ref v) if *v == expected));
+    }
+
+    #[test]
+    fn empty_array_ndim_zero() {
+        let wire = build_array(0, oids::INT4, &[]);
+        let got = <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&wire);
+        assert!(matches!(got, Ok(ref v) if v.is_empty()));
+    }
+
+    #[test]
+    fn multidim_array_is_classified() {
+        let wire = build_array(2, oids::INT4, &[]);
+        let got = <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&wire);
+        assert!(matches!(got, Err(DecodeError::ArrayMultiDim { ndim: 2 })));
+    }
+
+    #[test]
+    fn element_oid_mismatch_is_classified() {
+        // Header says `text` (25) but we decode as `int4[]`.
+        let wire = build_array(1, oids::TEXT, &[Some(b"x")]);
+        let got = <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&wire);
+        assert!(matches!(
+            got,
+            Err(DecodeError::ArrayElemOidMismatch { expected, found })
+                if expected == oids::INT4 && found == oids::TEXT
+        ));
+    }
+
+    #[test]
+    fn truncated_header_is_classified() {
+        // Only two of the three fixed header words present.
+        let mut wire = Vec::new();
+        push_i32(&mut wire, 1);
+        push_i32(&mut wire, 0);
+        let got = <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&wire);
+        assert!(matches!(got, Err(DecodeError::ArrayTruncated)));
+    }
+
+    #[test]
+    fn truncated_element_body_is_classified() {
+        // Declares a 4-byte element but supplies only 2 bytes.
+        let mut wire = build_array(1, oids::INT4, &[]);
+        // Overwrite dim_len (0) with 1 and append a bogus short element.
+        // Rebuild cleanly instead: header + one element claiming 4 bytes.
+        wire.clear();
+        push_i32(&mut wire, 1);
+        push_i32(&mut wire, 0);
+        wire.extend_from_slice(&oids::INT4.to_be_bytes());
+        push_i32(&mut wire, 1); // dim_len
+        push_i32(&mut wire, 1); // lower bound
+        push_i32(&mut wire, 4); // element declares 4 bytes...
+        wire.extend_from_slice(&[0u8, 0u8]); // ...but only 2 present
+        let got = <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&wire);
+        assert!(matches!(got, Err(DecodeError::ArrayTruncated)));
+    }
+
+    #[test]
+    fn wrong_element_width_is_classified() {
+        // A well-framed array whose element body is the wrong width for the
+        // element decoder (`int4` needs 4 bytes, gets 2) surfaces the scalar
+        // decoder's classified length mismatch — never a silent truncation.
+        let mut wire = Vec::new();
+        push_i32(&mut wire, 1);
+        push_i32(&mut wire, 0);
+        wire.extend_from_slice(&oids::INT4.to_be_bytes());
+        push_i32(&mut wire, 1);
+        push_i32(&mut wire, 1);
+        push_i32(&mut wire, 2); // element is 2 bytes (present)
+        wire.extend_from_slice(&[0u8, 1u8]);
+        let got = <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&wire);
+        assert!(matches!(
+            got,
+            Err(DecodeError::BinaryLengthMismatch { expected_len: 4, actual_len: 2 })
+        ));
+    }
+
+    #[test]
+    fn trailing_bytes_past_last_element_are_classified() {
+        // A fully-valid 1-D array with EXTRA bytes after the last declared
+        // element is a surplus / malformed frame — classified, not silently
+        // ignored (the no-swallow guarantee on the array path).
+        let ten = 10i32.to_be_bytes();
+        let mut wire = build_array(1, oids::INT4, &[Some(&ten)]);
+        wire.extend_from_slice(&[0xDE, 0xAD]); // surplus trailing bytes
+        let got = <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&wire);
+        assert!(
+            matches!(got, Err(DecodeError::ArrayTruncated)),
+            "trailing bytes past the last element must be classified, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn empty_array_with_mismatched_elem_oid_is_classified() {
+        // An EMPTY array (ndim 0) whose header declares a `text` element OID,
+        // decoded as `int4[]`, enforces the element-type contract even though
+        // it carries no element bytes — a classified mismatch, not `Ok(empty)`.
+        let wire = build_array(0, oids::TEXT, &[]);
+        let got = <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&wire);
+        assert!(
+            matches!(
+                got,
+                Err(DecodeError::ArrayElemOidMismatch { expected, found })
+                    if expected == oids::INT4 && found == oids::TEXT
+            ),
+            "an empty text[] header decoded as int4[] must be classified, got {got:?}"
+        );
     }
 }

@@ -85,6 +85,12 @@ bsql::query!(EchoTs, "SELECT $1::timestamptz AS t");
 bsql::query!(JsonLit, "SELECT '{\"k\":1}'::json AS j");
 bsql::query!(JsonbLit, "SELECT '[1,2,3]'::jsonb AS j");
 
+// ── 1-D array result columns (see the sync twin) ─────────────────────────
+bsql::query!(IntArrayLit, "SELECT ARRAY[10, NULL, 30]::int4[] AS xs");
+bsql::query!(TextArrayLit, "SELECT ARRAY['a', NULL, 'c']::text[] AS xs");
+bsql::query!(NullArrayLit, "SELECT NULL::int4[] AS xs");
+bsql::query!(EmptyArrayLit, "SELECT ARRAY[]::int4[] AS xs");
+
 fn async_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
@@ -673,5 +679,31 @@ async fn typed_json_and_jsonb_columns_round_trip() {
     assert_eq!(j.j.as_str(), r#"{"k":1}"#);
     let jb = c.query_one::<JsonbLitQuery>(()).await.expect("query_one JsonbLit");
     assert_eq!(jb.j.as_str(), "[1, 2, 3]");
+    c.close().await.expect("close");
+}
+
+/// ARRAYS (async twin): a real `int4[]` / `text[]` with a NULL element decode
+/// to `Vec<Option<T>>`; a NULL whole array to `None`; an empty array to an
+/// empty `Vec`.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_array_columns_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+
+    let ints = c.query_one::<IntArrayLitQuery>(()).await.expect("query_one IntArrayLit");
+    assert_eq!(ints.xs, Some(vec![Some(10), None, Some(30)]));
+
+    let labels = c.query_one::<TextArrayLitQuery>(()).await.expect("query_one TextArrayLit");
+    assert_eq!(
+        labels.xs,
+        Some(vec![Some(String::from("a")), None, Some(String::from("c"))])
+    );
+
+    let none = c.query_one::<NullArrayLitQuery>(()).await.expect("query_one NullArrayLit");
+    assert_eq!(none.xs, None);
+
+    let empty = c.query_one::<EmptyArrayLitQuery>(()).await.expect("query_one EmptyArrayLit");
+    assert_eq!(empty.xs, Some(Vec::<Option<i32>>::new()));
+
     c.close().await.expect("close");
 }

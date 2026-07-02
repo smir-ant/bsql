@@ -142,6 +142,15 @@ bsql::query!(EchoTs, "SELECT $1::timestamptz AS t");
 bsql::query!(JsonLit, "SELECT '{\"k\":1}'::json AS j");
 bsql::query!(JsonbLit, "SELECT '[1,2,3]'::jsonb AS j");
 
+// ── 1-D array result columns: `int4[]` / `text[]` decode to
+//    `Vec<Option<T>>` (with an honest NULL element), and a NULL WHOLE array
+//    (a NULL cast, typed nullable) to `Option<Vec<Option<T>>> == None`.
+//    Literal casts, so no migration / live schema is needed.
+bsql::query!(IntArrayLit, "SELECT ARRAY[10, NULL, 30]::int4[] AS xs");
+bsql::query!(TextArrayLit, "SELECT ARRAY['a', NULL, 'c']::text[] AS xs");
+bsql::query!(NullArrayLit, "SELECT NULL::int4[] AS xs");
+bsql::query!(EmptyArrayLit, "SELECT ARRAY[]::int4[] AS xs");
+
 fn sync_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
@@ -797,5 +806,42 @@ fn typed_json_and_jsonb_columns_round_trip() {
     let jb = c.query_one::<JsonbLitQuery>(()).expect("query_one JsonbLit");
     // jsonb round-trips through PG's canonical spacing: `[1, 2, 3]`.
     assert_eq!(jb.j.as_str(), "[1, 2, 3]", "jsonb decodes past the version byte");
+    c.close().expect("close");
+}
+
+/// ARRAYS: a real `int4[]` and `text[]` (each with a NULL middle element)
+/// decode to `Vec<Option<T>>` with an honest `None` element; a NULL WHOLE
+/// array decodes to `None`; an empty array to an empty `Vec`. The server sends
+/// its real `array_send` bytes, so this proves the wire decode end-to-end
+/// against PostgreSQL.
+///
+/// The literal `ARRAY[...]::T[]` cast is inferred NULLABLE (the conservative,
+/// over-nullable direction — never silently non-null), so each column is
+/// `Option<Vec<Option<T>>>`; the NOT-NULL `Vec<Option<T>>` whole-array shape is
+/// covered by the `array_rows` catalog columns in `query_arrays`.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_array_columns_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    // int4[] with a NULL element -> the `Vec` carries an honest `None`.
+    let ints = c.query_one::<IntArrayLitQuery>(()).expect("query_one IntArrayLit");
+    assert_eq!(ints.xs, Some(vec![Some(10), None, Some(30)]));
+
+    // text[] with a NULL element -> owned `String`s with a `None`.
+    let labels = c.query_one::<TextArrayLitQuery>(()).expect("query_one TextArrayLit");
+    assert_eq!(
+        labels.xs,
+        Some(vec![Some(String::from("a")), None, Some(String::from("c"))])
+    );
+
+    // A NULL WHOLE array -> None.
+    let none = c.query_one::<NullArrayLitQuery>(()).expect("query_one NullArrayLit");
+    assert_eq!(none.xs, None);
+
+    // An empty array (PG ndim = 0) -> an empty `Vec`.
+    let empty = c.query_one::<EmptyArrayLitQuery>(()).expect("query_one EmptyArrayLit");
+    assert_eq!(empty.xs, Some(Vec::<Option<i32>>::new()));
+
     c.close().expect("close");
 }

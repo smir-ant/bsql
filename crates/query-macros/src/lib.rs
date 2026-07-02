@@ -344,6 +344,9 @@ fn fixed_width(ty: bsql_build::RustType) -> Option<(usize, i32)> {
         // `text` / `bytea` / `json` / `jsonb` are variable-width — no fixed
         // size, decoded on the per-cell path.
         RustType::Text | RustType::Bytea | RustType::Json | RustType::Jsonb => None,
+        // A 1-D array is variable-width (a length-prefixed header plus
+        // per-element bodies) — decoded on the per-cell path.
+        RustType::Array(_) => None,
     }
 }
 
@@ -369,12 +372,46 @@ fn cell_marker(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::Timestamp => quote!(::bsql::__rt::Timestamp),
         RustType::Json => quote!(::bsql::__rt::Json),
         RustType::Jsonb => quote!(::bsql::__rt::Jsonb),
+        // A 1-D array decodes through the blanket `Cell<BinaryFmt>` for
+        // `Vec<Option<T>>` over the OWNED element type — the array `Vec`
+        // allocates regardless, so each element owns its value (`text[]` ->
+        // `String`, `bytea[]` -> `Vec<u8>`).
+        RustType::Array(elem) => {
+            let e = array_elem_marker(elem);
+            quote!(::std::vec::Vec<::core::option::Option<#e>>)
+        }
+    }
+}
+
+/// The OWNED element type token for a 1-D array's `Cell` / row-tuple marker
+/// (`Vec<Option<#elem>>`). The value types use the `__rt` decode path (the
+/// same type the scalar `cell_marker` names); `text` / `bytea` elements are
+/// the owned `String` / `Vec<u8>`.
+fn array_elem_marker(elem: bsql_build::ElemType) -> TokenStream2 {
+    use bsql_build::ElemType;
+    match elem {
+        ElemType::I16 => quote!(i16),
+        ElemType::I32 => quote!(i32),
+        ElemType::I64 => quote!(i64),
+        ElemType::U32 => quote!(u32),
+        ElemType::Bool => quote!(bool),
+        ElemType::F32 => quote!(f32),
+        ElemType::F64 => quote!(f64),
+        ElemType::Text => quote!(::std::string::String),
+        ElemType::Bytea => quote!(::std::vec::Vec<u8>),
+        ElemType::Uuid => quote!(::bsql::__rt::Uuid),
+        ElemType::Timestamptz => quote!(::bsql::__rt::Timestamptz),
+        ElemType::Timestamp => quote!(::bsql::__rt::Timestamp),
+        ElemType::Json => quote!(::bsql::__rt::Json),
+        ElemType::Jsonb => quote!(::bsql::__rt::Jsonb),
     }
 }
 
 /// Whether a column type borrows the input bytes in the borrowed record
 /// (so the record must carry `<'q>`): the string type `text` and the
-/// byte-string type `bytea`. Every fixed-width scalar is by-value.
+/// byte-string type `bytea`. Every fixed-width scalar is by-value, and a
+/// 1-D array is self-owning (`Vec<Option<T>>` owns its elements), so an
+/// array column never borrows.
 fn borrows_input(ty: bsql_build::RustType) -> bool {
     use bsql_build::RustType;
     matches!(ty, RustType::Text | RustType::Bytea)
@@ -383,10 +420,16 @@ fn borrows_input(ty: bsql_build::RustType) -> bool {
 /// Whether a column type implements `Eq` (so the generated record can
 /// derive it). Every supported type does EXCEPT the IEEE-754 floats:
 /// `f32`/`f64` are only `PartialEq` (NaN is not reflexively equal), so a
-/// record carrying a float column derives `PartialEq` but NOT `Eq`.
+/// record carrying a float column derives `PartialEq` but NOT `Eq`. A 1-D
+/// array follows its element: `Vec<Option<f32>>` is `PartialEq` but not
+/// `Eq`, every other element array is `Eq`.
 fn type_impls_eq(ty: bsql_build::RustType) -> bool {
     use bsql_build::RustType;
-    !matches!(ty, RustType::F32 | RustType::F64)
+    match ty {
+        RustType::F32 | RustType::F64 => false,
+        RustType::Array(elem) => type_impls_eq(elem.as_scalar()),
+        _ => true,
+    }
 }
 
 /// A record field's Rust type. A borrowing column is `&'q _` in the
@@ -427,6 +470,16 @@ fn field_type(ty: bsql_build::RustType, nullable: bool, is_owned: bool) -> Token
         RustType::Timestamp => quote!(::bsql::Timestamp),
         RustType::Json => quote!(::bsql::Json),
         RustType::Jsonb => quote!(::bsql::Jsonb),
+        // A 1-D array column is `Vec<Option<T>>`: the element `Option<T>`
+        // (a PG array element may always be NULL) is INTRINSIC and does not
+        // depend on the column's own nullability. Both record twins carry the
+        // same self-owning type (the element is the OWNED scalar field type —
+        // `String` for `text[]`, `Vec<u8>` for `bytea[]`, the value types
+        // themselves). A NULL WHOLE array rides the outer `Option` below.
+        RustType::Array(elem) => {
+            let element = field_type(elem.as_scalar(), false, true);
+            quote!(::std::vec::Vec<::core::option::Option<#element>>)
+        }
     };
     if nullable {
         quote!(::core::option::Option<#base>)
@@ -808,6 +861,11 @@ fn rust_type_oid(ty: bsql_build::RustType) -> u32 {
         RustType::Timestamp => 1114,
         RustType::Json => 114,
         RustType::Jsonb => 3802,
+        // A 1-D array's parameter OID is the element type's `T[]` array OID.
+        // Reached only via a result-column OID (`oid_path`) over a scalar
+        // element; a `$N` array param is rejected by inference, so this arm
+        // never bakes into a param slice.
+        RustType::Array(elem) => array_oid(elem.as_scalar()),
     }
 }
 
@@ -831,6 +889,10 @@ fn oid_path(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::Timestamp => quote!(::bsql::__rt::oids::TIMESTAMP),
         RustType::Json => quote!(::bsql::__rt::oids::JSON),
         RustType::Jsonb => quote!(::bsql::__rt::oids::JSONB),
+        // A 1-D array result column's OID is the element type's `T[]` array
+        // OID const path — the same const the runtime `ColCellAt` OID resolves
+        // to, so the validator cross-check holds.
+        RustType::Array(elem) => array_oid_path(elem.as_scalar()),
     }
 }
 
@@ -858,6 +920,13 @@ fn tuple_marker(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::Timestamp => quote!(::bsql::__rt::Timestamp),
         RustType::Json => quote!(::bsql::__rt::Json),
         RustType::Jsonb => quote!(::bsql::__rt::Jsonb),
+        // A 1-D array row-tuple marker is `Vec<Option<OwnedElem>>` — its
+        // `ColCellAt::OID` is the element's `T[]` array OID, matching the
+        // `oid_path` above.
+        RustType::Array(elem) => {
+            let e = array_elem_marker(elem);
+            quote!(::std::vec::Vec<::core::option::Option<#e>>)
+        }
     }
 }
 
@@ -872,10 +941,12 @@ fn tuple_type(markers: &[TokenStream2]) -> TokenStream2 {
     }
 }
 
-/// The array (`T[]`) OID for an element type — for a single array
-/// parameter feeding a `col = ANY($N)` in-list. Verified against PG
-/// `pg_type.typarray`; cross-checked against the runtime crate's
-/// `oids::*_ARRAY` constants by the const validator.
+/// The array (`T[]`) OID for a SCALAR element type — for a single array
+/// parameter feeding a `col = ANY($N)` in-list, and for a 1-D array result
+/// column (via [`oid_path`] / [`rust_type_oid`], which pass the array's
+/// scalar element). Verified against PG `pg_type.typarray`; cross-checked
+/// against the runtime crate's `oids::*_ARRAY` constants by the const
+/// validator.
 fn array_oid(ty: bsql_build::RustType) -> u32 {
     use bsql_build::RustType;
     match ty {
@@ -893,6 +964,14 @@ fn array_oid(ty: bsql_build::RustType) -> u32 {
         RustType::Timestamp => 1115,
         RustType::Json => 199,
         RustType::Jsonb => 3807,
+        // An array-of-array has no single element array OID. This arm is
+        // structurally dead: every caller passes a SCALAR element (the result
+        // path via `elem.as_scalar()`; the `= ANY($N)` param path over a
+        // scalar column), and an array-typed `$N` param is rejected by
+        // inference. The fail-closed `0` is not a valid PG OID, so if one ever
+        // reached the wire it would fail the const validator's OID cross-check
+        // (`error[E0080]`) rather than bake a plausible-but-wrong OID.
+        RustType::Array(_) => 0,
     }
 }
 
@@ -914,6 +993,10 @@ fn array_oid_path(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::Timestamp => quote!(::bsql::__rt::oids::TIMESTAMP_ARRAY),
         RustType::Json => quote!(::bsql::__rt::oids::JSON_ARRAY),
         RustType::Jsonb => quote!(::bsql::__rt::oids::JSONB_ARRAY),
+        // Structurally dead (see `array_oid`): a `0u32` fail-closed literal
+        // that would fail the validator's OID cross-check rather than bake a
+        // plausible-but-wrong array-OID const path.
+        RustType::Array(_) => quote!(0u32),
     }
 }
 
