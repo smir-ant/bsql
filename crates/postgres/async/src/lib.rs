@@ -48,7 +48,10 @@ pub use pool::{Pool, PooledConnection};
 
 // Tier-1 static assertions: Connection is Send (its futures cross .await points
 // and are spawned by the pool's concurrent tasks). Row is Send + Sync + 'static
-// (Arc-shared arena). Pool is Send + Sync.
+// (Arc-shared arena). Pool is Send + Sync. PooledConnection is Send + 'static —
+// it OWNS the connection (via `Option`) plus an `Arc` to the pool, so it can be
+// moved across `.await` and into spawned tasks; a borrow-based guard would not
+// be, which is why the pool keeps the owned handle.
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _assert_sync<T: Sync>() {}
@@ -60,5 +63,7 @@ const _: () = {
         _assert_static::<Row>();
         _assert_send::<Pool>();
         _assert_sync::<Pool>();
+        _assert_send::<PooledConnection>();
+        _assert_static::<PooledConnection>();
     }
 };

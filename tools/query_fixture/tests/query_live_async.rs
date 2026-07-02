@@ -232,31 +232,97 @@ async fn plan_is_parsed_once_and_persists() {
     c.close().await.expect("close");
 }
 
-/// POOL REUSE + invalidation correctness: `max_size = 1` forces every checkout to
-/// reuse the SAME physical connection (the pool does NOT reset on return, so the
-/// statement cache persists with it). Looping checkout -> same query! -> return
-/// stays green on one stable backend pid — no stale-cache Bind-to-missing.
+/// THE RESET-vs-STATEMENT-CACHE CONSISTENCY PROOF: `max_size = 1` forces every
+/// checkout to reuse the SAME physical connection. The pool RESETS a reused
+/// connection on acquire, but the reset is TARGETED — it keeps prepared
+/// statements — so the per-connection statement cache stays consistent with the
+/// server's prepared-statement set. Looping checkout -> reset -> same query! ->
+/// return must stay green (no 42P05 duplicate-prepare, no Bind-to-missing) on one
+/// stable backend pid, and the server must hold the statement EXACTLY ONCE the
+/// whole time (parsed once, survives every reset).
 #[tokio::test]
 #[ignore = "requires local PG"]
-async fn pooled_connection_reuses_parsed_plan() {
+async fn pooled_connection_reset_keeps_parsed_plan() {
     let pool = Pool::new(async_config(), 1).await.expect("pool");
     let mut pid: Option<i32> = None;
     for i in 0..20 {
         let mut c = pool.get().await.unwrap_or_else(|e| panic!("checkout {i}: {e:?}"));
-        let this_pid = c.backend_pid();
+        let this_pid = c.conn().expect("live").backend_pid();
         match pid {
             None => pid = Some(this_pid),
             Some(p) => {
                 assert_eq!(p, this_pid, "checkout {i} must reuse the one physical connection")
             }
         }
+        // Same carrier every checkout: after the on-acquire reset, this must still
+        // reuse the server-side plan (no re-Parse -> no 42P05).
         let r = c
+            .conn_mut()
+            .expect("live")
             .query::<RepeatLitQuery>(())
             .await
             .unwrap_or_else(|e| panic!("checkout {i}: {e:?}"));
         assert_eq!(r.len(), 1, "checkout {i}: one row");
-        // `c` drops here -> returned to the pool (no reset), cache persists.
+        // The targeted reset KEEPS statements: the server holds it exactly once,
+        // never zero (dropped) and never more than one (re-Parsed under a new name).
+        let count = c
+            .conn_mut()
+            .expect("live")
+            .query_sql("SELECT count(*)::int4 FROM pg_prepared_statements")
+            .await
+            .unwrap_or_else(|e| panic!("checkout {i} count: {e:?}"))
+            .rows
+            .first()
+            .expect("count row")
+            .get_i32(0)
+            .expect("count value");
+        assert_eq!(count, 1, "checkout {i}: statement kept across reset (parsed once)");
+        // `c` drops here -> returned to the pool dirty; the NEXT checkout resets it
+        // (keeping the statement), and this loop proves the cache stays consistent.
     }
+}
+
+/// THE ROLLBACK-BRANCH + CACHE PROOF: a connection returned mid-transaction
+/// (tx_status != Idle) makes the on-acquire reset take its ROLLBACK-prefixed
+/// branch. That branch must abort the open transaction AND keep the cached
+/// prepared statement, so a reused `query!` on the reacquired (same physical)
+/// connection still succeeds (no 42P05) and the server holds it exactly once.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pooled_reset_rolls_back_open_tx_and_keeps_plan() {
+    let pool = Pool::new(async_config(), 1).await.expect("pool");
+    let pid = {
+        let mut c = pool.get().await.expect("get1");
+        let conn = c.conn_mut().expect("live1");
+        let pid = conn.backend_pid();
+        // Cache the statement durably (autocommit), THEN open a transaction and
+        // leave it open, so the connection is returned with tx_status = 'T'.
+        assert_eq!(conn.query::<RepeatLitQuery>(()).await.expect("first use caches").len(), 1);
+        conn.begin().await.expect("begin (leaves the tx open)");
+        pid
+    }; // dropped mid-transaction -> returned to the pool with an OPEN transaction
+    // Reacquire the SAME physical connection: the on-acquire reset takes its
+    // ROLLBACK-prefixed branch (tx_status != Idle), aborting the open tx while
+    // KEEPING the cached statement.
+    let mut c = pool.get().await.expect("get2");
+    let conn = c.conn_mut().expect("live2");
+    assert_eq!(conn.backend_pid(), pid, "max_size=1 must reuse the same physical connection");
+    // Reuse the cached statement: must succeed (the ROLLBACK-reset kept it, no 42P05).
+    assert_eq!(
+        conn.query::<RepeatLitQuery>(()).await.expect("reuse after rollback-reset").len(),
+        1
+    );
+    // The server still holds it exactly once (kept across the ROLLBACK-prefixed reset).
+    let count = conn
+        .query_sql("SELECT count(*)::int4 FROM pg_prepared_statements")
+        .await
+        .expect("count")
+        .rows
+        .first()
+        .expect("count row")
+        .get_i32(0)
+        .expect("count value");
+    assert_eq!(count, 1, "the ROLLBACK-prefixed reset kept the cached plan (parsed once)");
 }
 
 /// 42P05-GONE (transactional): a `query!` first used inside a committed

@@ -116,6 +116,14 @@ pub enum DriverError {
     /// first row (which would mask a query that is not as selective as the
     /// caller assumed).
     TooManyRows,
+    /// A pooled connection could not be acquired within the pool's configured
+    /// acquire deadline: every connection was checked out and the pool was at
+    /// its `max_size`, so no permit became free in time. Surfaced as a distinct
+    /// backpressure signal rather than blocking forever — the caller can shed
+    /// load, retry with backoff, or fail fast. Distinct from
+    /// [`Timeout`](Self::Timeout) (a read deadline mid-command) and from
+    /// [`NotReady`](Self::NotReady) (a specific connection is dead).
+    PoolTimeout,
 }
 
 // Footprint pin: a sum type whose size is set by its widest variant,
@@ -145,6 +153,7 @@ impl fmt::Display for DriverError {
             Self::Decode(e) => write!(f, "typed row decode failed: {e}"),
             Self::OversizeRow => write!(f, "typed query result carried an oversize row that exceeds the bounded decoder's contiguous-payload requirement"),
             Self::TooManyRows => write!(f, "query_one matched more than one row"),
+            Self::PoolTimeout => write!(f, "timed out acquiring a pooled connection; the pool is exhausted"),
         }
     }
 }
@@ -169,7 +178,8 @@ impl std::error::Error for DriverError {
             | Self::SpuriousPending
             | Self::RowDecodeFailed
             | Self::OversizeRow
-            | Self::TooManyRows => None,
+            | Self::TooManyRows
+            | Self::PoolTimeout => None,
         }
     }
 }

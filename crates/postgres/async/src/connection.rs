@@ -45,7 +45,7 @@ use bsql_postgres_proto::engine::{
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
     Credentials, DatabaseName, DecodeError, Ident, Password, PreparedQuery, RowDecode, Sensitive,
-    StmtName, TypedQuery,
+    StmtName, TxStatus, TypedQuery,
 };
 
 use crate::transport::{ReadDeadline, TokioSocket};
@@ -853,6 +853,63 @@ impl Connection {
             .map_err(|_| DriverError::Config("invalid channel name"))?;
         self.simple_query(&format!("UNLISTEN {}", channel.as_str()))
             .await?;
+        Ok(())
+    }
+
+    /// Reset all BLEEDABLE session state so this connection can be safely reused
+    /// by a different logical user, WITHOUT dropping prepared statements.
+    ///
+    /// Clears, in one simple-query round trip:
+    /// - session GUCs incl. `search_path` (`RESET ALL`),
+    /// - the session authorization / role (`SET SESSION AUTHORIZATION DEFAULT`),
+    /// - open cursors / portals (`CLOSE ALL`),
+    /// - `LISTEN` subscriptions (`UNLISTEN *`),
+    /// - held advisory locks (`pg_advisory_unlock_all`),
+    /// - temporary tables (`DISCARD TEMP`),
+    /// - cached sequence state (`DISCARD SEQUENCES`).
+    ///
+    /// A leading `ROLLBACK` is issued ONLY when the connection is inside a
+    /// transaction — decided from the transaction status cached on the last
+    /// `ReadyForQuery`, so it costs no extra round trip and emits no
+    /// "no transaction in progress" notice on the common idle path — so a
+    /// connection returned mid-transaction is aborted rather than leaking an
+    /// open or failed transaction (locks, uncommitted rows) to the next user.
+    ///
+    /// # Prepared statements are deliberately KEPT
+    ///
+    /// The command set is `DISCARD ALL` MINUS `DEALLOCATE ALL` and
+    /// `DISCARD PLANS`. Prepared statements are content-addressed query plans,
+    /// safe to share across logical users; keeping them preserves the
+    /// server-side plan reuse across pool checkouts (a repeat of the same typed
+    /// query on a reused connection stays a bare Bind + Execute, never a
+    /// re-Parse — and never a `42P05` duplicate-prepared-statement error). Because
+    /// no statement is dropped, the per-connection statement cache stays
+    /// consistent with the server's prepared-statement set with NO cache
+    /// invalidation — this method does NOT clear it. (A hypothetical
+    /// `DISCARD ALL` reset WOULD drop the server's statements and so would
+    /// require the cache be cleared in lockstep to avoid a later Bind to a
+    /// missing statement.)
+    ///
+    /// # Errors
+    ///
+    /// Any transport / server error is returned classified. The connection pool
+    /// evicts a connection whose reset failed rather than handing out an
+    /// un-reset (still-dirty) one.
+    pub async fn reset_session(&mut self) -> Result<(), DriverError> {
+        // The targeted reset: DISCARD ALL minus DEALLOCATE ALL / DISCARD PLANS,
+        // so prepared statements AND their cached plans survive.
+        const RESET: &str = "SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; \
+             UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
+        // Prefixed with ROLLBACK for the in-transaction case (RESET ALL etc. would
+        // otherwise run inside — or be rejected by — the open/failed transaction).
+        const RESET_WITH_ROLLBACK: &str = "ROLLBACK; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; \
+             CLOSE ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
+        let sql = if matches!(self.engine.tx_status(), Ok(TxStatus::Idle)) {
+            RESET
+        } else {
+            RESET_WITH_ROLLBACK
+        };
+        self.simple_query(sql).await?;
         Ok(())
     }
 

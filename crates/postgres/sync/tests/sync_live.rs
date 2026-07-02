@@ -116,16 +116,93 @@ fn listen_notify() {
 fn pool() {
     use bsql_postgres_sync::Pool;
     let pool = Pool::new(sync_config(), 3);
-    let mut c = pool.get().expect("get"); c.ping().expect("ping"); drop(c);
+    let mut c = pool.get().expect("get");
+    c.conn_mut().expect("live").ping().expect("ping");
+    drop(c);
     assert_eq!(pool.idle_count(), 1);
     let handles: Vec<_> = (0..10u32).map(|i| {
         let p = pool.clone();
         std::thread::spawn(move || {
             let mut conn = p.get().expect("get");
-            assert_eq!(conn.query_sql(&format!("SELECT {i}::int")).expect("q").rows[0].get_i32(0), Some(i as i32));
+            assert_eq!(conn.conn_mut().expect("live").query_sql(&format!("SELECT {i}::int")).expect("q").rows[0].get_i32(0), Some(i as i32));
         })
     }).collect();
     for h in handles { h.join().expect("thread"); }
+}
+
+// ── S23 pool hardening (reset-on-return, acquire timeout, health eviction) ──
+
+#[test]
+#[ignore = "requires local PG"]
+fn pool_reset_on_return_no_bleed() {
+    // A GUC and a temp table set by one checkout must NOT survive to the next
+    // checkout of the SAME physical connection.
+    use bsql_postgres_sync::Pool;
+    let pool = Pool::new(sync_config(), 1); // max_size=1 forces reuse
+    let pid1 = {
+        let mut c = pool.get().expect("get1");
+        let conn = c.conn_mut().expect("live1");
+        let pid = conn.backend_pid();
+        conn.execute_sql("SET search_path TO 'pg_temp'").expect("set guc");
+        conn.execute_sql("CREATE TEMP TABLE bleed_probe(x int)").expect("temp");
+        conn.execute_sql("LISTEN bleed_chan").expect("listen");
+        pid
+    }; // returned to pool (dirty)
+    let mut c = pool.get().expect("get2");
+    let conn = c.conn_mut().expect("live2");
+    assert_eq!(conn.backend_pid(), pid1, "max_size=1 must reuse the SAME physical connection");
+    let sp = conn.query_sql("SHOW search_path").expect("show").rows[0]
+        .get_str(0).map(String::from);
+    assert_ne!(sp.as_deref(), Some("pg_temp"), "search_path GUC bled across checkout");
+    let n = conn.query_sql("SELECT count(*) FROM pg_tables WHERE tablename='bleed_probe'")
+        .expect("tmp").rows[0].get_i64(0);
+    assert_eq!(n, Some(0), "temp table bled across checkout");
+    // LISTEN channel gone (UNLISTEN * ran in the reset).
+    let listening = conn
+        .query_sql("SELECT count(*)::int8 FROM pg_listening_channels() AS c(chan) WHERE chan='bleed_chan'")
+        .expect("listen check").rows[0].get_i64(0);
+    assert_eq!(listening, Some(0), "LISTEN channel bled across checkout");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn pool_acquire_timeout_not_hang() {
+    // Exhaust a max_size=1 pool by holding the one connection; a second get with a
+    // short deadline returns PoolTimeout rather than blocking forever.
+    use bsql_postgres_sync::Pool;
+    use std::time::{Duration, Instant};
+    let pool = Pool::new(sync_config(), 1);
+    let _held = pool.get().expect("hold the one connection");
+    let start = Instant::now();
+    let err = pool.get_timeout(Duration::from_millis(200));
+    let elapsed = start.elapsed();
+    assert!(matches!(err, Err(bsql_postgres_sync::DriverError::PoolTimeout)),
+        "exhausted pool must return PoolTimeout, got {err:?}");
+    assert!(elapsed < Duration::from_secs(5), "must not hang (took {elapsed:?})");
+    drop(_held);
+    let mut c = pool.get_timeout(Duration::from_secs(5)).expect("get after release");
+    c.conn_mut().expect("live").ping().expect("ping");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn pool_evicts_dead_connection() {
+    // A connection killed server-side is not handed back out; the pool creates a
+    // fresh, healthy one instead.
+    use bsql_postgres_sync::Pool;
+    let pool = Pool::new(sync_config(), 1);
+    let dead_pid = {
+        let mut c = pool.get().expect("get");
+        let conn = c.conn_mut().expect("live");
+        let pid = conn.backend_pid();
+        let _ = conn.execute_sql(&format!("SELECT pg_terminate_backend({pid})"));
+        pid
+    };
+    let mut c = pool.get().expect("get fresh");
+    let conn = c.conn_mut().expect("live fresh");
+    conn.ping().expect("fresh connection is healthy");
+    assert!(conn.backend_pid() != dead_pid || conn.is_healthy(),
+        "a fresh healthy connection is served after eviction");
 }
 
 #[test]
@@ -196,7 +273,7 @@ fn pool_stress_100_tasks() {
         let p = pool.clone();
         std::thread::spawn(move || {
             let mut c = p.get().expect("get");
-            let r = c.query_sql(&format!("SELECT {i}::int, pg_backend_pid()")).expect("q");
+            let r = c.conn_mut().expect("live").query_sql(&format!("SELECT {i}::int, pg_backend_pid()")).expect("q");
             assert_eq!(r.rows[0].get_i32(0), Some(i as i32));
         })
     }).collect();

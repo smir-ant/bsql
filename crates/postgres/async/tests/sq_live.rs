@@ -100,7 +100,9 @@ async fn pool_basic() {
     use bsql_postgres_async::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
     let pool = Pool::new(config, 3).await.expect("pool");
-    let mut c = pool.get().await.expect("get"); c.ping().await.expect("ping"); drop(c);
+    let mut c = pool.get().await.expect("get");
+    c.conn_mut().expect("live").ping().await.expect("ping");
+    drop(c);
     assert_eq!(pool.idle_count(), 1);
 }
 
@@ -114,10 +116,138 @@ async fn pool_concurrent() {
         let p = pool.clone();
         tokio::spawn(async move {
             let mut c = p.get().await.expect("get");
-            assert_eq!(c.query_sql(&format!("SELECT {i}::int")).await.expect("q").rows[0].get_i32(0), Some(i as i32));
+            assert_eq!(c.conn_mut().expect("live").query_sql(&format!("SELECT {i}::int")).await.expect("q").rows[0].get_i32(0), Some(i as i32));
         })
     }).collect();
     for h in handles { h.await.expect("task"); }
+}
+
+// ── S23 pool hardening (reset-on-return, acquire timeout, health eviction) ──
+
+// The reset-vs-statement-cache CONSISTENCY proof (the same `query!` reused across
+// pooled checkouts, asserting the server holds it exactly once) needs the
+// build-time catalog env that `query!` requires, so it lives in the query fixture
+// (`pooled_connection_reset_keeps_parsed_plan`). Here we prove isolation
+// (no-bleed), backpressure (acquire timeout), and health eviction directly.
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pool_reset_on_return_no_bleed() {
+    // A GUC and a temp table set by one checkout must NOT survive to the next
+    // checkout of the SAME physical connection.
+    use bsql_postgres_async::Pool;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let pool = Pool::new(config, 1).await.expect("pool"); // max_size=1 forces reuse
+    let pid1 = {
+        let mut c = pool.get().await.expect("get1");
+        let conn = c.conn_mut().expect("live1");
+        let pid = conn.backend_pid();
+        conn.execute_sql("SET search_path TO 'pg_temp'").await.expect("set guc");
+        conn.execute_sql("CREATE TEMP TABLE bleed_probe(x int)").await.expect("temp");
+        conn.execute_sql("LISTEN bleed_chan").await.expect("listen");
+        pid
+    }; // returned to pool (dirty)
+    let mut c = pool.get().await.expect("get2");
+    let conn = c.conn_mut().expect("live2");
+    assert_eq!(conn.backend_pid(), pid1, "max_size=1 must reuse the SAME physical connection");
+    // GUC reset to default (not pg_temp).
+    let sp = conn.query_sql("SHOW search_path").await.expect("show").rows[0]
+        .get_str(0).map(String::from);
+    assert_ne!(sp.as_deref(), Some("pg_temp"), "search_path GUC bled across checkout");
+    // Temp table gone.
+    let n = conn.query_sql("SELECT count(*) FROM pg_tables WHERE tablename='bleed_probe'")
+        .await.expect("tmp").rows[0].get_i64(0);
+    assert_eq!(n, Some(0), "temp table bled across checkout");
+    // LISTEN channel gone (UNLISTEN * ran in the reset).
+    let listening = conn
+        .query_sql("SELECT count(*)::int8 FROM pg_listening_channels() AS c(chan) WHERE chan='bleed_chan'")
+        .await.expect("listen check").rows[0].get_i64(0);
+    assert_eq!(listening, Some(0), "LISTEN channel bled across checkout");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pool_get_cancellation_returns_permit() {
+    // Regression proof for the permit-leak-on-cancellation bug: dropping a get()
+    // future mid-reset must return the capacity permit, not leak it. With
+    // max_size=1, a single leaked permit would make the pool permanently
+    // PoolTimeout; this asserts a subsequent get() still succeeds.
+    use bsql_postgres_async::Pool;
+    use std::time::Duration;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let pool = Pool::new(config, 1).await.expect("pool");
+    // Warm one connection into the idle set so the next get() takes the RESET
+    // path: its first poll acquires the (now-free) permit synchronously, then the
+    // reset round-trip suspends — so the future is Pending after one poll.
+    {
+        let mut c = pool.get().await.expect("warm");
+        c.conn_mut().expect("live").ping().await.expect("ping");
+    } // returned to idle; the permit is free again
+    // Deterministically cancel the get() mid-reset: `biased` polls it first (it
+    // acquires the permit, then suspends at the reset -> Pending), then the
+    // always-ready branch wins and DROPS the get() future — regardless of load or
+    // timer granularity. (A zero-duration `timeout` is NOT reliable here: a fast
+    // reset can finish before the zero-delay timer registers as elapsed.)
+    tokio::select! {
+        biased;
+        _ = pool.get() => panic!("get() must not complete before the ready branch (its reset suspends)"),
+        () = std::future::ready(()) => {}
+    }
+    // If the permit leaked on that cancellation, this is a PoolTimeout; if the
+    // owned permit was returned on drop, capacity is restored and get() succeeds.
+    let mut c = pool
+        .get_timeout(Duration::from_secs(5))
+        .await
+        .expect("capacity must be restored after a cancelled get() (no permit leak)");
+    c.conn_mut().expect("live").ping().await.expect("ping after cancellation");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pool_acquire_timeout_not_hang() {
+    // Exhaust a max_size=1 pool by holding the one connection; a second get with
+    // a short deadline returns PoolTimeout rather than blocking forever.
+    use bsql_postgres_async::Pool;
+    use std::time::{Duration, Instant};
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let pool = Pool::new(config, 1).await.expect("pool");
+    let _held = pool.get().await.expect("hold the one connection");
+    let start = Instant::now();
+    let err = pool.get_timeout(Duration::from_millis(200)).await;
+    let elapsed = start.elapsed();
+    assert!(matches!(err, Err(bsql_postgres_async::DriverError::PoolTimeout)),
+        "exhausted pool must return PoolTimeout, got {err:?}");
+    assert!(elapsed < Duration::from_secs(5), "must not hang (took {elapsed:?})");
+    // After the held connection returns, a subsequent get succeeds.
+    drop(_held);
+    let mut c = pool.get_timeout(Duration::from_secs(5)).await.expect("get after release");
+    c.conn_mut().expect("live").ping().await.expect("ping");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pool_evicts_dead_connection() {
+    // A connection killed server-side is not handed back out; the pool creates a
+    // fresh, healthy one instead.
+    use bsql_postgres_async::Pool;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let pool = Pool::new(config, 1).await.expect("pool");
+    let dead_pid = {
+        let mut c = pool.get().await.expect("get");
+        let conn = c.conn_mut().expect("live");
+        let pid = conn.backend_pid();
+        // Terminate THIS backend from itself: the next command sees a dead socket.
+        let _ = conn.execute_sql(&format!("SELECT pg_terminate_backend({pid})")).await;
+        // The connection is now unhealthy; returning it should NOT re-pool it.
+        pid
+    };
+    // The dead connection was evicted on return (not re-pooled) or on acquire; a
+    // fresh healthy connection is produced.
+    let mut c = pool.get().await.expect("get fresh");
+    let conn = c.conn_mut().expect("live fresh");
+    conn.ping().await.expect("fresh connection is healthy");
+    assert!(conn.backend_pid() != dead_pid || conn.is_healthy(),
+        "a fresh healthy connection is served after eviction");
 }
 
 #[tokio::test]
@@ -182,7 +312,7 @@ async fn pool_stress_100_tasks() {
         let p = pool.clone();
         tokio::spawn(async move {
             let mut c = p.get().await.expect("get");
-            let r = c.query_sql(&format!("SELECT {i}::int, pg_backend_pid()")).await.expect("q");
+            let r = c.conn_mut().expect("live").query_sql(&format!("SELECT {i}::int, pg_backend_pid()")).await.expect("q");
             assert_eq!(r.rows[0].get_i32(0), Some(i as i32));
         })
     }).collect();

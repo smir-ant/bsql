@@ -48,5 +48,9 @@ const _: () = {
         _assert_static::<Row>();
         _assert_send::<Pool>();
         _assert_sync::<Pool>();
+        // PooledConnection owns the connection + an Arc to the pool, so it is
+        // Send + 'static (movable across threads), not a borrow-based guard.
+        _assert_send::<PooledConnection>();
+        _assert_static::<PooledConnection>();
     }
 };
