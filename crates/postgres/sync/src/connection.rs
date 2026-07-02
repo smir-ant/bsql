@@ -102,8 +102,10 @@ pub struct Connection {
     /// A `try_clone` of the underlying socket, used ONLY to set the read timeout
     /// for [`recv_notification`](Self::recv_notification): the engine owns the
     /// I/O socket, but a dup'd handle shares the same kernel socket, so a
-    /// timeout set here applies to the engine's reads too.
-    socket_ctl: TcpStream,
+    /// timeout set here applies to the engine's reads too. `None` for an
+    /// in-memory testkit connection, which has no socket and never blocks — the
+    /// read-timeout arming is then a no-op.
+    socket_ctl: Option<TcpStream>,
     /// The steady-state read timeout, restored after a notification wait.
     read_timeout: Duration,
     params: SessionParams,
@@ -166,8 +168,55 @@ impl Connection {
         Ok(Self {
             engine,
             live: Some(live),
-            socket_ctl,
+            socket_ctl: Some(socket_ctl),
             read_timeout,
+            params: SessionParams {
+                server_version,
+                backend_pid,
+            },
+            stmt_counter: 0,
+        })
+    }
+
+    /// Open a connection over an in-memory
+    /// [`FakeTransport`](bsql_postgres_core::testkit::FakeTransport) instead of a
+    /// socket — the testkit entry point, the sync twin of the async
+    /// `connect_fake`.
+    ///
+    /// It drives the real startup/auth handshake and every subsequent verb
+    /// through the SAME engine the TCP path uses (single-poll: the fake never
+    /// blocks, so `poll_once` resolves on the first poll), so the returned
+    /// `Connection` is a genuine connection — same methods, same decode — backed
+    /// by the fake's scripted replies with no network. There is no SSL
+    /// negotiation (the fake is plaintext by construction), so `connect_fake`
+    /// skips the socket build entirely and plugs the fake straight into the
+    /// `Wire::Fake` arm. `socket_ctl` is `None`: there is no socket to arm a read
+    /// timeout on, and the fake never blocks.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`DriverError`] if the fake's handshake bytes are not a clean
+    /// trust-auth chain the engine accepts — never a panic.
+    #[cfg(feature = "testkit")]
+    pub fn connect_fake(
+        fake: bsql_postgres_core::testkit::FakeTransport,
+    ) -> Result<Self, DriverError> {
+        let wire: SyncWire = Wire::Fake(Box::new(fake));
+        let user = Ident::try_from_str("bsql_testkit")
+            .map_err(|_| DriverError::Config("invalid testkit user name"))?;
+        let (mut engine, live) = engine::open_owned(wire, &user, None, None, Credentials::Trust)
+            .map_err(lift_conn_fail)?;
+        let live = flatten_poll(engine::poll_once(engine.connect(live)))?;
+        let backend_pid = engine.backend_pid().map_err(|_| DriverError::NotReady)?;
+        let server_version = engine
+            .server_version()
+            .map_err(|_| DriverError::NotReady)?
+            .map(str::to_owned);
+        Ok(Self {
+            engine,
+            live: Some(live),
+            socket_ctl: None,
+            read_timeout: Duration::from_secs(0),
             params: SessionParams {
                 server_version,
                 backend_pid,
@@ -878,9 +927,11 @@ impl Connection {
         // stranding it and bricking a connection nothing touched on the wire.
         // Mirrors the validate-fallible-input-before-take_live discipline of
         // every other verb.
-        self.socket_ctl
-            .set_read_timeout(Some(timeout))
-            .map_err(DriverError::Io)?;
+        // No socket (an in-memory testkit connection) → no timeout to arm; the
+        // fake never blocks, so the wait is vacuous.
+        if let Some(ctl) = &self.socket_ctl {
+            ctl.set_read_timeout(Some(timeout)).map_err(DriverError::Io)?;
+        }
         let live = self.take_live()?;
         let mut captured: Option<Result<Notification, DriverError>> = None;
         let polled = engine::poll_once(self.engine.recv_notification(live, |s| {
@@ -892,7 +943,11 @@ impl Connection {
         }));
         // Restore the steady-state timeout for subsequent verbs before
         // classifying, so a notification result is not lost to a restore failure.
-        let restore = self.socket_ctl.set_read_timeout(Some(self.read_timeout));
+        // A socketless testkit connection has nothing to restore.
+        let restore = match &self.socket_ctl {
+            Some(ctl) => ctl.set_read_timeout(Some(self.read_timeout)),
+            None => Ok(()),
+        };
         match polled {
             Ok(Ok(Outcome { live, status })) => {
                 // Alive on either status — the would-block deadline is the Quiet

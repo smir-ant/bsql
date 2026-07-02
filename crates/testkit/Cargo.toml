@@ -7,11 +7,15 @@ description = "Deterministic in-memory fake PostgreSQL for testing bsql driver c
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# The testkit turns on the `testkit` feature of both the async driver (for the
-# `Connection::connect_fake` entry) and core (for `FakeTransport` + the reply
-# encoder). Both are already resolved workspace members, so this adds NO new
-# external package to the lockfile — only the `bsql-testkit` package itself.
+# The testkit turns on the `testkit` feature of both drivers (for the
+# `Connection::connect_fake` entry — async and sync) and core (for
+# `FakeTransport` + the reply encoder). All are already resolved workspace
+# members, so this adds NO new external package to the lockfile — only the
+# `bsql-testkit` package itself. Both drivers are pulled so one fake backs
+# either driver (the twin-driver discipline: `connect` for async,
+# `connect_sync` for sync).
 bsql-postgres-async = { path = "../postgres/async", features = ["testkit"] }
+bsql-postgres-sync = { path = "../postgres/sync", features = ["testkit"] }
 bsql-postgres-core = { path = "../postgres/core", features = ["testkit"] }
 
 # Inherit the workspace FORBID floor (the two-tier lint wall).

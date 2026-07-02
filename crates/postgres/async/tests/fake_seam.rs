@@ -21,7 +21,7 @@
 
 use bsql_postgres_async::Connection;
 use bsql_postgres_core::testkit::wire::{self, OID_INT8, TX_IDLE};
-use bsql_postgres_core::testkit::{FakeScript, FakeTransport};
+use bsql_postgres_core::testkit::{FakeScript, FakeTransport, QueryReply};
 
 /// A trust-auth handshake reply: `AuthenticationOk` + `ParameterStatus` +
 /// `BackendKeyData` + `ReadyForQuery(idle)`.
@@ -34,29 +34,46 @@ fn handshake() -> Vec<u8> {
     ])
 }
 
-/// A two-row `int8` result for `SELECT id FROM users`.
-fn users_reply() -> Vec<u8> {
-    wire::concat(&[
+/// A two-row `int8` result for `SELECT id FROM users`, in both protocols: text
+/// for the simple path, binary for the extended path.
+fn users_reply() -> QueryReply {
+    let simple = wire::concat(&[
         wire::row_description(&[("id".to_owned(), OID_INT8)]).expect("row description"),
         wire::data_row(&[Some(b"1".to_vec())]).expect("data row 1"),
         wire::data_row(&[Some(b"2".to_vec())]).expect("data row 2"),
         wire::command_complete("SELECT 2").expect("command complete"),
         wire::ready_for_query(TX_IDLE).expect("ready for query"),
-    ])
+    ]);
+    let extended = wire::concat(&[
+        wire::data_row(&[Some(wire::binary_int8(1))]).expect("data row 1"),
+        wire::data_row(&[Some(wire::binary_int8(2))]).expect("data row 2"),
+        wire::command_complete("SELECT 2").expect("command complete"),
+    ]);
+    QueryReply { simple, extended }
 }
 
-fn error_reply(sqlstate: &str, message: &str) -> Vec<u8> {
-    wire::concat(&[
+fn error_reply(sqlstate: &str, message: &str) -> QueryReply {
+    let simple = wire::concat(&[
         wire::error_response("ERROR", sqlstate, message).expect("error response"),
         wire::ready_for_query(TX_IDLE).expect("ready for query"),
-    ])
+    ]);
+    let extended = wire::error_response("ERROR", sqlstate, message).expect("error response");
+    QueryReply { simple, extended }
 }
 
 fn script() -> FakeScript {
     FakeScript {
         handshake: handshake(),
         queries: vec![("SELECT id FROM users".to_owned(), users_reply())],
-        unmatched_reply: error_reply("XX000", "no scripted reply"),
+        unmatched_simple: wire::concat(&[
+            wire::error_response("ERROR", "XX000", "no scripted reply").expect("error response"),
+            wire::ready_for_query(TX_IDLE).expect("ready for query"),
+        ]),
+        unmatched_extended: wire::error_response("ERROR", "XX000", "no scripted reply")
+            .expect("error response"),
+        parse_complete: wire::parse_complete().expect("parse complete"),
+        bind_complete: wire::bind_complete().expect("bind complete"),
+        close_complete: wire::close_complete().expect("close complete"),
         unsupported_error: wire::error_response("ERROR", "0A000", "extended protocol unsupported")
             .expect("error response"),
         ready_for_query: wire::ready_for_query(TX_IDLE).expect("ready for query"),

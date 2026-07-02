@@ -29,21 +29,29 @@
 //! # }
 //! ```
 //!
-//! # Scope (MVP)
+//! # Scope
 //!
-//! Handles the trust-auth handshake, scripted **simple** queries
-//! ([`query_sql`](bsql_postgres_async::Connection::query_sql)), and scripted
-//! errors. An unscripted query or an extended-protocol message (the
-//! compile-checked `query!` path) is answered with a loud, classified
-//! `ErrorResponse` — never a silent empty result or a hang. Multi-query
-//! scripting, expectations (`assert_all_queried`), COPY/LISTEN, and the sync
-//! driver are not yet supported.
+//! Handles the trust-auth handshake, scripted queries over BOTH the simple
+//! protocol ([`query_sql`](bsql_postgres_async::Connection::query_sql)) and the
+//! compile-checked `query!` extended protocol — one
+//! [`fake.on(sql)`](FakePostgres::on)`.returns(...)` script answers both — plus
+//! scripted errors. An unscripted query is answered with a loud, classified
+//! `ErrorResponse` — never a silent empty result or a hang. The runtime
+//! `prepare`/`describe` extended path, multi-query scripting, expectations
+//! (`assert_all_queried`), and COPY/LISTEN are not yet supported.
+//!
+//! Scriptable cell types are [`FakeValue`]'s vocabulary — `bigint` (`i64`),
+//! `integer` (`i32`), `text` (`&str`/`String`), `boolean`, and NULL. A column of
+//! any other type (e.g. `uuid`, `timestamptz`, `json`, an array) is not yet
+//! scriptable: `rows!` rejects it at compile time (no `From` into `FakeValue`),
+//! so reach for a supported column type rather than hand-encoding a value.
 
 use bsql_postgres_async::Connection;
+use bsql_postgres_sync::Connection as SyncConnection;
 use bsql_postgres_core::testkit::wire::{
     self, FakeEncodeError, OID_BOOL, OID_INT4, OID_INT8, OID_TEXT, TX_IDLE,
 };
-use bsql_postgres_core::testkit::{FakeScript, FakeTransport};
+use bsql_postgres_core::testkit::{FakeScript, FakeTransport, QueryReply};
 use bsql_postgres_core::DriverError;
 
 /// A single scripted column value, rendered to PostgreSQL text wire format.
@@ -110,13 +118,29 @@ impl FakeValue {
         }
     }
 
-    /// The value in PostgreSQL text wire format, or `None` for a SQL `NULL`.
+    /// The value in PostgreSQL TEXT wire format, or `None` for a SQL `NULL`.
+    /// Used by the simple-query (`query_sql`) reply path.
     fn render(&self) -> Option<Vec<u8>> {
         match self {
             Self::Int8(v) => Some(v.to_string().into_bytes()),
             Self::Int4(v) => Some(v.to_string().into_bytes()),
             Self::Text(s) => Some(s.clone().into_bytes()),
             Self::Bool(b) => Some(if *b { b"t".to_vec() } else { b"f".to_vec() }),
+            Self::Null => None,
+        }
+    }
+
+    /// The value in PostgreSQL BINARY wire format, or `None` for a SQL `NULL`.
+    /// Used by the extended-query (`query!`) reply path — the flagship decodes
+    /// each cell via `Cell<BinaryFmt>`, so the bytes must be binary, not text.
+    /// Each variant delegates to the [`wire`] encoder the round-trip test there
+    /// proves wire-correct against the real decoder.
+    fn render_binary(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Int8(v) => Some(wire::binary_int8(*v)),
+            Self::Int4(v) => Some(wire::binary_int4(*v)),
+            Self::Text(s) => Some(wire::binary_text(s)),
+            Self::Bool(b) => Some(wire::binary_bool(*b)),
             Self::Null => None,
         }
     }
@@ -244,7 +268,8 @@ impl FakePostgres {
         }
     }
 
-    /// Open a real [`Connection`] backed by this fake — no socket, no network.
+    /// Open a real async [`Connection`] backed by this fake — no socket, no
+    /// network.
     ///
     /// # Errors
     ///
@@ -256,16 +281,38 @@ impl FakePostgres {
         Ok(conn)
     }
 
+    /// Open a real blocking [`SyncConnection`] backed by this fake — no socket,
+    /// no network. The sync twin of [`connect`](Self::connect): the same script
+    /// backs either driver.
+    ///
+    /// # Errors
+    ///
+    /// [`TestkitError`] if a scripted reply cannot be encoded (an oversized
+    /// value or ragged rows) or the driver rejects the fake handshake.
+    pub fn connect_sync(&self) -> Result<SyncConnection, TestkitError> {
+        let script = self.build_script()?;
+        let conn = SyncConnection::connect_fake(FakeTransport::new(script))?;
+        Ok(conn)
+    }
+
     /// Encode the whole script to the pre-built reply bytes the fake serves.
     fn build_script(&self) -> Result<FakeScript, TestkitError> {
         let handshake = encode_handshake(&self.server_version, self.backend_pid)?;
         let mut queries = Vec::with_capacity(self.responses.len());
         for (sql, reply) in &self.responses {
-            let bytes = match reply {
-                ScriptedReply::Rows(rows) => encode_rows(rows)?,
-                ScriptedReply::Error { sqlstate, message } => encode_error(sqlstate, message)?,
+            // One scripted reply answers both protocols: a simple-query byte
+            // stream and an extended-query Execute payload.
+            let query_reply = match reply {
+                ScriptedReply::Rows(rows) => QueryReply {
+                    simple: encode_rows_simple(rows)?,
+                    extended: encode_rows_extended(rows)?,
+                },
+                ScriptedReply::Error { sqlstate, message } => QueryReply {
+                    simple: encode_error_simple(sqlstate, message)?,
+                    extended: encode_error_extended(sqlstate, message)?,
+                },
             };
-            queries.push((sql.trim().to_owned(), bytes));
+            queries.push((sql.trim().to_owned(), query_reply));
         }
         let scripted = self
             .responses
@@ -273,31 +320,38 @@ impl FakePostgres {
             .map(|(sql, _)| format!("{sql:?}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let unmatched = encode_error(
-            "XX000",
-            &format!(
-                "bsql-testkit: no scripted reply for the received query. \
-                 Scripted queries: [{scripted}]. \
-                 Add fake.on(<sql>).returns(...) to script it."
-            ),
-        )?;
-        // The extended-protocol error is served WITHOUT a trailing
-        // ReadyForQuery: the fake emits it once for the batch's first message,
-        // then supplies the single `ready_for_query` when the batch's Sync
-        // arrives (PostgreSQL's error-then-skip-to-Sync recovery), so a failed
-        // extended op leaves the connection clean.
+        let unmatched_message = format!(
+            "bsql-testkit: no scripted reply for the received query. \
+             Scripted queries: [{scripted}]. \
+             Add fake.on(<sql>).returns(...) to script it."
+        );
+        let unmatched_simple = encode_error_simple("XX000", &unmatched_message)?;
+        // The extended unmatched error is a bare ErrorResponse (no trailing
+        // ReadyForQuery): it rides the Execute, and the batch's Sync supplies the
+        // ReadyForQuery — so an unscripted `query!` is a loud classified error,
+        // never a silent empty result.
+        let unmatched_extended = encode_error_extended("XX000", &unmatched_message)?;
+        // The unsupported error is served for a frontend message the fake does
+        // not model (a Describe/Flush — the runtime `prepare` path), WITHOUT a
+        // trailing ReadyForQuery: the fake emits it once, then supplies the
+        // single `ready_for_query` at the batch's Sync (PostgreSQL's
+        // error-then-skip-to-Sync recovery), so the connection stays clean.
         let unsupported_error = wire::error_response(
             "ERROR",
             "0A000",
-            "bsql-testkit: this in-memory fake supports the simple-query protocol \
-             (query_sql) only; the compile-checked query! (extended query) protocol \
-             is not supported yet.",
+            "bsql-testkit: this in-memory fake supports the simple-query \
+             (query_sql) and compile-checked query! protocols; the runtime \
+             prepare / describe extended path is not supported.",
         )?;
         let ready_for_query = wire::ready_for_query(TX_IDLE)?;
         Ok(FakeScript {
             handshake,
             queries,
-            unmatched_reply: unmatched,
+            unmatched_simple,
+            unmatched_extended,
+            parse_complete: wire::parse_complete()?,
+            bind_complete: wire::bind_complete()?,
+            close_complete: wire::close_complete()?,
             unsupported_error,
             ready_for_query,
         })
@@ -360,9 +414,10 @@ fn columns(rows: &[Vec<FakeValue>]) -> Vec<(String, i32)> {
         .collect()
 }
 
-/// Encode a scripted result set: `RowDescription` + `DataRow`s +
-/// `CommandComplete` + `ReadyForQuery`.
-fn encode_rows(rows: &ScriptedRows) -> Result<Vec<u8>, TestkitError> {
+/// Validate that every row has the established column width, returning the
+/// derived `(name, oid)` columns. A ragged grid cannot be represented on the
+/// wire (a single-width `RowDescription`), so it is a loud error.
+fn checked_columns(rows: &ScriptedRows) -> Result<Vec<(String, i32)>, TestkitError> {
     let cols = columns(&rows.rows);
     for row in &rows.rows {
         if row.len() != cols.len() {
@@ -372,6 +427,13 @@ fn encode_rows(rows: &ScriptedRows) -> Result<Vec<u8>, TestkitError> {
             });
         }
     }
+    Ok(cols)
+}
+
+/// Encode a scripted result set for the SIMPLE-query protocol:
+/// `RowDescription` + text `DataRow`s + `CommandComplete` + `ReadyForQuery`.
+fn encode_rows_simple(rows: &ScriptedRows) -> Result<Vec<u8>, TestkitError> {
+    let cols = checked_columns(rows)?;
     let mut frames = Vec::with_capacity(rows.rows.len().saturating_add(3));
     frames.push(wire::row_description(&cols)?);
     for row in &rows.rows {
@@ -383,13 +445,40 @@ fn encode_rows(rows: &ScriptedRows) -> Result<Vec<u8>, TestkitError> {
     Ok(wire::concat(&frames))
 }
 
-/// Encode a scripted `ErrorResponse` + `ReadyForQuery`.
-fn encode_error(sqlstate: &str, message: &str) -> Result<Vec<u8>, TestkitError> {
+/// Encode a scripted result set as the EXTENDED-query Execute PAYLOAD: binary
+/// `DataRow`s + `CommandComplete`, with NO `RowDescription` (the extended path
+/// sends no Describe, so the real server sends none either) and NO trailing
+/// `ReadyForQuery` (the fake's framer emits the acknowledgements before and the
+/// `Sync`'s `ReadyForQuery` after). The flagship `query!` decodes each cell via
+/// `Cell<BinaryFmt>`, so the cells are rendered in binary.
+fn encode_rows_extended(rows: &ScriptedRows) -> Result<Vec<u8>, TestkitError> {
+    // Reuse the same ragged-rows validation as the simple path; the extended
+    // path advertises no column metadata, so only the check matters here.
+    checked_columns(rows)?;
+    let mut frames = Vec::with_capacity(rows.rows.len().saturating_add(1));
+    for row in &rows.rows {
+        let cells: Vec<Option<Vec<u8>>> = row.iter().map(FakeValue::render_binary).collect();
+        frames.push(wire::data_row(&cells)?);
+    }
+    frames.push(wire::command_complete(&format!("SELECT {}", rows.rows.len()))?);
+    Ok(wire::concat(&frames))
+}
+
+/// Encode a scripted `ErrorResponse` + `ReadyForQuery` for the SIMPLE protocol.
+fn encode_error_simple(sqlstate: &str, message: &str) -> Result<Vec<u8>, TestkitError> {
     let frames = [
         wire::error_response("ERROR", sqlstate, message)?,
         wire::ready_for_query(TX_IDLE)?,
     ];
     Ok(wire::concat(&frames))
+}
+
+/// Encode a scripted `ErrorResponse` as the EXTENDED-query Execute payload — a
+/// bare frame with no trailing `ReadyForQuery` (the `Sync` supplies it). The
+/// engine drives it `BindAwaitingData -> fail_recoverable -> drain -> RFQ`, so
+/// a scripted error surfaces loudly and the connection recovers clean.
+fn encode_error_extended(sqlstate: &str, message: &str) -> Result<Vec<u8>, TestkitError> {
+    Ok(wire::error_response("ERROR", sqlstate, message)?)
 }
 
 /// Encode the trust-auth handshake chain the fake serves for the startup packet.

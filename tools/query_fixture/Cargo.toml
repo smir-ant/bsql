@@ -62,6 +62,16 @@ bsql-devgates = { path = "../devgates" }
 bsql-postgres-sync = { path = "../../crates/postgres/sync" }
 bsql-postgres-async = { path = "../../crates/postgres/async" }
 
+# `bsql-testkit` — DEV-ONLY, for the flagship-against-the-fake demo: a real
+# `query!` typed query runs over the in-memory fake PostgreSQL with NO network,
+# proving the fake's binary DataRow bytes decode into the typed record. It
+# enables the `testkit` feature on both drivers transitively (feature
+# unification), so `connect_fake` is reachable. Already a resolved workspace
+# member, so this dev edge adds no package to the lockfile (`deps_pin`
+# unchanged) and is excluded from every shipped crate's runtime graph
+# (`runtime_graph_pin` unchanged — dev edges are not `-e normal`).
+bsql-testkit = { path = "../../crates/testkit" }
+
 # `bsql-postgres-core` — DEV-ONLY, for the OFFLINE no-swallow test that drives a
 # `RowsBuilder` with hand-built (malformed + well-formed) row bytes and asserts
 # `Rows::iter()` yields a per-row `Err(DecodeError)` without a panic. Already

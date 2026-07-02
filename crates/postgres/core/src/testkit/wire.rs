@@ -12,8 +12,9 @@
 use std::vec::Vec;
 
 use bsql_postgres_proto::wire::{
-    TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_COMMAND_COMPLETE, TAG_DATA_ROW,
-    TAG_ERROR_RESPONSE, TAG_PARAMETER_STATUS, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
+    TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE, TAG_DATA_ROW,
+    TAG_ERROR_RESPONSE, TAG_PARAMETER_STATUS, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY,
+    TAG_ROW_DESCRIPTION,
 };
 
 /// PostgreSQL type OID for `int8` (`bigint`) — the wire type a scripted `i64`
@@ -229,4 +230,141 @@ pub fn concat(frames: &[Vec<u8>]) -> Vec<u8> {
         out.extend_from_slice(f);
     }
     out
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Binary result-format cells.
+//
+// The compile-checked `query!` path is binary-uniform: its `Bind` elects
+// binary results for every column, and its emitted decoder reads each cell
+// via `Cell<BinaryFmt>`. So an extended-query `DataRow` the fake serves must
+// carry BINARY cell bytes, not the text bytes the simple-query path uses.
+// The [`data_row`] frame itself is format-agnostic (a column count plus each
+// cell's `(len, bytes)`); only the CELL bytes differ, so these helpers render
+// the bytes and [`data_row`] wraps them unchanged.
+//
+// Each encoder mirrors the exact layout `Cell<BinaryFmt>::decode` reads
+// (`<T>::from_be_bytes` for the fixed-width scalars). The round-trip tests
+// below prove that by decoding the produced bytes with the REAL decoder — a
+// wrong layout is a failing test, never a silently-wrong fake.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// PG binary `int8` (`bigint`): 8 big-endian bytes — the bytes
+/// `Cell<BinaryFmt> for i64` reads via `i64::from_be_bytes`.
+#[must_use]
+pub fn binary_int8(v: i64) -> Vec<u8> {
+    v.to_be_bytes().to_vec()
+}
+
+/// PG binary `int4` (`integer`): 4 big-endian bytes — the bytes
+/// `Cell<BinaryFmt> for i32` reads via `i32::from_be_bytes`.
+#[must_use]
+pub fn binary_int4(v: i32) -> Vec<u8> {
+    v.to_be_bytes().to_vec()
+}
+
+/// PG binary `bool`: one byte, `0` = false, `1` = true — exactly what
+/// `Cell<BinaryFmt> for bool` accepts.
+#[must_use]
+pub fn binary_bool(v: bool) -> Vec<u8> {
+    std::vec![u8::from(v)]
+}
+
+/// PG binary `text`: raw UTF-8 bytes, verbatim — what
+/// `Cell<BinaryFmt> for &str` borrows (it only validates UTF-8). Identical
+/// to the text-format rendering for `text`, but named for the binary path so
+/// the call site reads honestly.
+#[must_use]
+pub fn binary_text(s: &str) -> Vec<u8> {
+    s.as_bytes().to_vec()
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Extended-protocol acknowledgement frames.
+//
+// Each is a bodyless frame the server sends to acknowledge one extended-query
+// frontend message: `ParseComplete` after a `Parse`, `BindComplete` after a
+// `Bind`, `CloseComplete` after a `Close`. The fake emits one per matching
+// message, so an extended batch's reply is byte-for-byte what the real engine
+// expects at each step.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// `ParseComplete`: tag `1`, empty body — sent after a successful `Parse`.
+///
+/// # Errors
+///
+/// Never in practice — the body is empty; the `Result` mirrors [`frame`].
+pub fn parse_complete() -> Result<Vec<u8>, FakeEncodeError> {
+    frame(TAG_PARSE_COMPLETE.byte(), &[])
+}
+
+/// `BindComplete`: tag `2`, empty body — sent after a successful `Bind`.
+///
+/// # Errors
+///
+/// Never in practice — the body is empty; the `Result` mirrors [`frame`].
+pub fn bind_complete() -> Result<Vec<u8>, FakeEncodeError> {
+    frame(TAG_BIND_COMPLETE.byte(), &[])
+}
+
+/// `CloseComplete`: tag `3`, empty body — sent after a successful `Close`.
+///
+/// The tag byte is the literal `b'3'` (PostgreSQL protocol §55.7): proto's
+/// `TAG_CLOSE_COMPLETE` is `pub(crate)`, so it is not importable here, and
+/// this keeps the proto crate byte-untouched. The `TAG_CLOSE_COMPLETE.byte()
+/// == b'3'` drift-pin in proto guards the constant on its side.
+///
+/// # Errors
+///
+/// Never in practice — the body is empty; the `Result` mirrors [`frame`].
+pub fn close_complete() -> Result<Vec<u8>, FakeEncodeError> {
+    frame(b'3', &[])
+}
+
+#[cfg(test)]
+mod tests {
+    //! The fake's binary cell bytes MUST be exactly what the flagship
+    //! `query!` decoder reads. These offline round-trips prove that by
+    //! decoding each encoder's output with the REAL `Cell<BinaryFmt>` — no
+    //! engine, no network. A wrong byte layout fails here, so a wire-incorrect
+    //! binary encoding is impossible to ship.
+
+    use bsql_postgres_proto::{BinaryFmt, Cell};
+
+    use super::{binary_bool, binary_int4, binary_int8, binary_text};
+
+    #[test]
+    fn binary_int8_round_trips_through_the_real_decoder() {
+        for v in [0_i64, 1, -1, 42, i64::MIN, i64::MAX] {
+            let bytes = binary_int8(v);
+            assert_eq!(bytes.len(), 8, "int8 is 8 wire bytes");
+            assert_eq!(<i64 as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+    }
+
+    #[test]
+    fn binary_int4_round_trips_through_the_real_decoder() {
+        for v in [0_i32, 1, -1, 42, i32::MIN, i32::MAX] {
+            let bytes = binary_int4(v);
+            assert_eq!(bytes.len(), 4, "int4 is 4 wire bytes");
+            assert_eq!(<i32 as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+    }
+
+    #[test]
+    fn binary_bool_round_trips_through_the_real_decoder() {
+        for v in [false, true] {
+            let bytes = binary_bool(v);
+            assert_eq!(bytes.len(), 1, "bool is 1 wire byte");
+            assert_eq!(<bool as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+    }
+
+    #[test]
+    fn binary_text_round_trips_through_the_real_decoder() {
+        for v in ["", "alice", "hello world", "über"] {
+            let bytes = binary_text(v);
+            assert_eq!(<&str as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+    }
 }
