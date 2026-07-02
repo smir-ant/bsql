@@ -24,7 +24,7 @@
 mod tls_common;
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tls_common::{block_on, test_client_config, test_server_name, LoopbackInner, MockInner};
@@ -290,5 +290,121 @@ fn would_block_read_does_not_corrupt_staging() {
         &buf[..n],
         &msg[..],
         "the real record decrypts after the would-block — staging was not corrupted"
+    );
+}
+
+/// A [`MockInner`] wrapper that returns ONE would-block read AFTER a set number
+/// of successful reads (a mid-stream deadline), then delegates. Unlike
+/// [`WouldBlockOnceInner`] (which fires on the very first read, with an empty
+/// staging buffer), this places the deadline once a PARTIAL record has already
+/// accumulated past the watermark — the watermark model's load-bearing case.
+#[derive(Clone)]
+struct WouldBlockAfterInner {
+    inner: MockInner,
+    /// Reads left before the single would-block fires; `0` = disarmed. The
+    /// fire-read stores `0`, so exactly one would-block is produced.
+    countdown: Arc<AtomicUsize>,
+}
+
+impl Transport for WouldBlockAfterInner {
+    type Error = std::io::Error;
+
+    fn is_would_block(err: &std::io::Error) -> bool {
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    }
+
+    async fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Result<usize, std::io::Error> {
+        let c = self.countdown.load(Ordering::SeqCst);
+        if c == 1 {
+            self.countdown.store(0, Ordering::SeqCst); // disarm after firing once
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        if c > 1 {
+            self.countdown.store(c - 1, Ordering::SeqCst);
+        }
+        // `MockInner` is `Infallible`, so the error arm is unreachable.
+        match self.inner.read(buf).await {
+            Ok(n) => Ok(n),
+            Err(e) => match e {},
+        }
+    }
+
+    async fn write<'a>(&'a mut self, buf: &'a [u8]) -> Result<usize, std::io::Error> {
+        match self.inner.write(buf).await {
+            Ok(n) => Ok(n),
+            Err(e) => match e {},
+        }
+    }
+
+    fn flush<'a>(&'a mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send + 'a {
+        std::future::ready(Ok(()))
+    }
+
+    fn shutdown<'a>(&'a mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send + 'a {
+        std::future::ready(Ok(()))
+    }
+}
+
+#[test]
+fn would_block_mid_record_preserves_partial_residue() {
+    // The watermark model's load-bearing cancel-safety case: a deadline that
+    // elapses AFTER a partial record has accumulated in staging
+    // (staging_filled > 0). The abandoned read window sits past that non-zero
+    // watermark; advancing the watermark only on a successful read is what keeps
+    // the accumulated partial residue byte-identical across the would-block. If
+    // the watermark were corrupted (residue truncated, or the abandoned window's
+    // bytes admitted into the valid range), the record would fail to reassemble.
+    let (mock, state) = MockInner::new();
+    let countdown = Arc::new(AtomicUsize::new(0));
+    let inner = WouldBlockAfterInner {
+        inner: mock,
+        countdown: Arc::clone(&countdown),
+    };
+    let mut transport = block_on(TlsTransport::connect(
+        inner,
+        test_client_config(),
+        test_server_name(),
+    ))
+    .expect("TLS handshake completes inside connect()");
+    state.lock().expect("lock").pump_server();
+
+    // Stage one ~200-byte app record and force it to arrive 8 ciphertext bytes
+    // per socket read, so several reads accumulate a partial record before the
+    // whole record is present.
+    let msg: Vec<u8> = (0..200usize).map(|i| (i % 251) as u8).collect();
+    {
+        let mut g = state.lock().expect("lock");
+        g.server_send_app(&msg);
+        g.recv_cap = 8;
+    }
+
+    // Fire the would-block on the 6th socket read: 5 successful 8-byte reads
+    // (40 bytes of partial record accumulated at staging_filled) precede it.
+    countdown.store(6, Ordering::SeqCst);
+    let mut buf = vec![0u8; 16 * 1024];
+    match block_on(transport.read(&mut buf)) {
+        Err(e) => assert!(
+            TlsTransport::<WouldBlockAfterInner>::is_would_block(&e),
+            "the mid-record deadline must surface as a would-block read, got {e:?}"
+        ),
+        Ok(n) => panic!("expected a mid-record would-block, got Ok({n})"),
+    }
+
+    // Resume: the accumulated partial residue survived the would-block, so the
+    // remaining bytes complete the record and it decrypts exactly.
+    let mut got = Vec::new();
+    while got.len() < msg.len() {
+        let n = block_on(transport.read(&mut buf))
+            .expect("reads after the mid-record would-block must reassemble the record");
+        assert!(n > 0, "read made no progress after the would-block");
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(
+        got, msg,
+        "the record reassembled and decrypted after a would-block that hit mid-record — \
+         the partial residue past the watermark was preserved byte-identically"
     );
 }

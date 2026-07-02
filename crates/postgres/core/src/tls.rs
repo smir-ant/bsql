@@ -25,11 +25,15 @@
 //!   `flush` drains the queue to the socket, advancing `out_sent`; the cursor
 //!   survives a dropped `flush` future, so a resumed flush continues from the
 //!   first unsent byte and never re-sends a committed prefix.
-//! - **inbound ciphertext staging** (`staging` + `staging_start`). `read` pulls
-//!   socket bytes here; `rustls` consumes whole records from here and yields
-//!   each record's plaintext as an **owned chunk** (the measured +1 allocation,
-//!   not an in-place borrow); the consumed prefix is front-drained by advancing
-//!   `staging_start`, compacted lazily before the next socket read.
+//! - **inbound ciphertext staging** (`staging` + `staging_start` +
+//!   `staging_filled`). A fixed-capacity buffer, zero-filled ONCE at
+//!   construction; the valid ciphertext is `staging[staging_start..staging_filled]`,
+//!   decoupled from `Vec::len` by the `staging_filled` watermark. `read` pulls
+//!   socket bytes straight into the already-initialized spare region past the
+//!   watermark (no per-read zero-fill); `rustls` consumes whole records and
+//!   yields each record's plaintext as an **owned chunk** (the measured +1
+//!   allocation, not an in-place borrow); the consumed prefix is front-drained
+//!   by advancing `staging_start`, compacted before the next socket read.
 //! - **inbound plaintext** (`plaintext` + `plaintext_start`). Decrypted
 //!   payloads accumulate here and are copied out to the caller incrementally,
 //!   so a caller buffer smaller than a record loses no bytes.
@@ -72,9 +76,36 @@ const MAX_PLAINTEXT_PER_RECORD: usize = 16384;
 /// scratch never grows and `write` allocates nothing per call.
 const TLS_RECORD_SCRATCH: usize = 16384 + 256;
 
-/// Bytes requested from the socket per inbound read. One max record, so a
-/// whole record is typically pulled in a single `read` syscall.
+/// Guaranteed minimum spare read window past the inbound watermark. The staging
+/// buffer is sized so every socket read gets at least this many initialized
+/// bytes to read into (one max record, so a whole record is typically pulled in
+/// a single `read`) without a per-read zero-fill.
 const RECV_CHUNK: usize = 16384;
+
+/// The largest TLS record that can appear on the wire: RFC 8446 §5.2 caps
+/// `TLSCiphertext.length` at `2^14 + 256`, plus the 5-byte record header.
+/// `rustls` rejects any record whose header claims more, so the unconsumed
+/// partial-record residue left in staging after a pump is always strictly less
+/// than this — the bound that lets the staging buffer be a fixed size.
+const MAX_CIPHERTEXT_RECORD: usize = 5 + 16384 + 256;
+
+/// Fixed inbound staging capacity, allocated and zero-filled EXACTLY ONCE per
+/// connection (in [`TlsTransport::with_conn`]). Sized so that after compaction
+/// the unconsumed residue (`< MAX_CIPHERTEXT_RECORD`) plus a full [`RECV_CHUNK`]
+/// read window always fits: the socket reads straight into the buffer's
+/// already-initialized spare region past the `staging_filled` watermark, so no
+/// per-read memset is ever needed and the buffer never reallocates in steady
+/// state.
+const STAGING_CAP: usize = MAX_CIPHERTEXT_RECORD + RECV_CHUNK;
+
+// The read window past the watermark is `staging[staging_filled..]`, and
+// `staging_filled` (the unconsumed residue after compaction) is `<
+// MAX_CIPHERTEXT_RECORD` because `rustls` rejects an over-length record. Hence
+// the spare window is always `> STAGING_CAP - MAX_CIPHERTEXT_RECORD ==
+// RECV_CHUNK > 0`: a socket read never gets an empty window (which would read as
+// a false EOF).
+const _: () = assert!(STAGING_CAP > MAX_CIPHERTEXT_RECORD);
+const _: () = assert!(STAGING_CAP - MAX_CIPHERTEXT_RECORD == RECV_CHUNK);
 
 // ===========================================================================
 // Errors
@@ -261,10 +292,17 @@ pub struct TlsTransport<Inner: Transport> {
     /// front are already written (the cancel-safe send cursor).
     out_buf: Vec<u8>,
     out_sent: usize,
-    /// Inbound ciphertext pulled from the socket; `rustls` decrypts it in
-    /// place. `staging_start` bytes from the front are already consumed.
+    /// Inbound ciphertext staging: a fixed-capacity ([`STAGING_CAP`]) buffer
+    /// zero-filled once at construction. The valid ciphertext is
+    /// `staging[staging_start..staging_filled]`: `staging_start` bytes from the
+    /// front are already consumed by `rustls`, and `staging_filled` (the
+    /// watermark, decoupled from `Vec::len`, which stays at `STAGING_CAP`) marks
+    /// the end of ciphertext actually read from the socket. The spare region
+    /// `staging[staging_filled..]` is initialized capacity the socket reads into
+    /// with no per-read zero-fill.
     staging: Vec<u8>,
     staging_start: usize,
+    staging_filled: usize,
     /// Decrypted inbound plaintext awaiting copy-out; `plaintext_start` bytes
     /// from the front are already delivered to the caller.
     plaintext: Vec<u8>,
@@ -278,7 +316,7 @@ impl<Inner: Transport> fmt::Debug for TlsTransport<Inner> {
         // Buffer *contents* (plaintext + ciphertext) are deliberately omitted.
         f.debug_struct("TlsTransport")
             .field("out_pending", &(self.out_buf.len() - self.out_sent))
-            .field("staging_pending", &(self.staging.len() - self.staging_start))
+            .field("staging_pending", &(self.staging_filled - self.staging_start))
             .field("plaintext_pending", &(self.plaintext.len() - self.plaintext_start))
             .finish_non_exhaustive()
     }
@@ -327,8 +365,13 @@ impl<Inner: Transport> TlsTransport<Inner> {
             inner,
             out_buf: Vec::new(),
             out_sent: 0,
-            staging: Vec::new(),
+            // The ONE-TIME inbound zero-fill (grow-once): a fixed, fully
+            // initialized buffer the socket reads into past the watermark, so
+            // `recv_more` never re-zeros a read window. O(STAGING_CAP) once per
+            // connection, never per read.
+            staging: vec![0u8; STAGING_CAP],
             staging_start: 0,
+            staging_filled: 0,
             plaintext: Vec::new(),
             plaintext_start: 0,
             scratch: Box::new([0u8; TLS_RECORD_SCRATCH]),
@@ -350,18 +393,21 @@ impl<Inner: Transport> TlsTransport<Inner> {
         self.out_sent = 0;
     }
 
-    /// Drop the consumed prefix of the inbound staging buffer (same front-drain
-    /// as [`reclaim_out`](Self::reclaim_out)), preserving any partial record.
+    /// Reclaim the consumed prefix of the inbound staging buffer by moving the
+    /// unconsumed ciphertext `[staging_start..staging_filled]` down to the front
+    /// and rewinding the watermark. The buffer itself stays at its fixed
+    /// [`STAGING_CAP`] length (never truncated), so its spare region past the
+    /// rewound watermark remains initialized capacity for the next read — no
+    /// re-zeroing. Moves only the valid bytes; it never introduces any byte into
+    /// the valid range, so a failed read that ran this first leaves the valid
+    /// ciphertext content intact.
     fn compact_staging(&mut self) {
         if self.staging_start == 0 {
             return;
         }
-        if self.staging_start >= self.staging.len() {
-            self.staging.clear();
-        } else {
-            self.staging.copy_within(self.staging_start.., 0);
-            self.staging.truncate(self.staging.len() - self.staging_start);
-        }
+        self.staging
+            .copy_within(self.staging_start..self.staging_filled, 0);
+        self.staging_filled -= self.staging_start;
         self.staging_start = 0;
     }
 
@@ -404,28 +450,31 @@ impl<Inner: Transport> TlsTransport<Inner> {
         Ok(())
     }
 
-    /// Pull more ciphertext from the socket into the staging buffer. Returns
-    /// the byte count (0 = clean EOF).
+    /// Pull more ciphertext from the socket into the staging buffer's
+    /// already-initialized spare region past the `staging_filled` watermark.
+    /// Returns the byte count (0 = clean EOF).
+    ///
+    /// No per-read zero-fill: the buffer is fixed and zero-filled once at
+    /// construction, so the socket reads straight into initialized capacity and
+    /// we only advance the watermark by the bytes returned.
+    ///
+    /// Cancel-safe by construction. The valid ciphertext is exactly
+    /// `staging[staging_start..staging_filled]`; the read window
+    /// `staging[staging_filled..]` is OUTSIDE it. `staging_filled` is advanced
+    /// only after a successful read, so a read error (a recoverable would-block:
+    /// the recv_notification deadline elapsing surfaces as a socket error)
+    /// returns before the `+= n` and leaves the valid ciphertext content intact.
+    /// Whatever the abandoned read may have written past the watermark is never
+    /// in the valid range, so a stale `0x00` there can never be misread as a
+    /// record content-type — no correction step is needed.
     async fn recv_more(&mut self) -> Result<usize, TlsError<Inner::Error>> {
         self.compact_staging();
-        let base = self.staging.len();
-        // Zero-fill the read window (no `unsafe` uninit read); the socket
-        // overwrites the bytes it returns and the tail is truncated away.
-        self.staging.resize(base + RECV_CHUNK, 0);
-        // INVARIANT: `staging` is restored to `base` on ANY read error so a
-        // recoverable would-block (the recv_notification deadline elapsing) leaves
-        // the ciphertext buffer byte-identical — the abandoned read window's zeros
-        // must never linger, or the next `process_tls_records` would read a 0x00
-        // content-type and tear the connection down. The success path stays
-        // zero-copy (read straight into `staging`).
-        let n = match self.inner.read(&mut self.staging[base..]).await {
-            Ok(n) => n,
-            Err(e) => {
-                self.staging.truncate(base);
-                return Err(TlsError::Socket(e));
-            }
-        };
-        self.staging.truncate(base + n);
+        let n = self
+            .inner
+            .read(&mut self.staging[self.staging_filled..])
+            .await
+            .map_err(TlsError::Socket)?;
+        self.staging_filled += n;
         Ok(n)
     }
 
@@ -433,7 +482,7 @@ impl<Inner: Transport> TlsTransport<Inner> {
         loop {
             let signal = pump_inbound(
                 &mut self.conn,
-                &mut self.staging[..],
+                &mut self.staging[..self.staging_filled],
                 &mut self.staging_start,
                 &mut self.out_buf,
                 &mut self.plaintext,
@@ -485,7 +534,7 @@ impl<Inner: Transport> TlsTransport<Inner> {
             //    record and does not grow; only the extra residence remains.
             let signal = pump_inbound(
                 &mut self.conn,
-                &mut self.staging[..],
+                &mut self.staging[..self.staging_filled],
                 &mut self.staging_start,
                 &mut self.out_buf,
                 &mut self.plaintext,
