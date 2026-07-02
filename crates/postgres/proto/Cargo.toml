@@ -9,6 +9,11 @@ description = "PostgreSQL wire-protocol state machine — pure sync, no_std, no 
 keywords = ["postgres", "postgresql", "wire", "protocol", "sans-io"]
 categories = ["database", "no-std", "parser-implementations"]
 
+# Explicit bench discovery: `benches/common.rs` is a shared fixture module
+# (`mod common;`-included by the bench), NOT a bench target of its own. Turning
+# auto-discovery off keeps it from being picked up as a phantom target.
+autobenches = false
+
 # `bsql-postgres-proto` is the sans-I/O kernel: pure synchronous state
 # machine, zero I/O, zero allocator, zero async runtime. It runs
 # inside an async wrapper (`bsql-driver-postgres`, ships in 1e),
@@ -18,21 +23,14 @@ categories = ["database", "no-std", "parser-implementations"]
 [features]
 default = []
 
-# No `bench-hooks` feature. A naive shape would gate
-# `#[doc(hidden)] pub fn` hooks on `PgProtocol` behind a cargo
-# feature that downstream users could enable in their Cargo.toml
-# (tier-3 by-discipline; CREDO §1 absolute-safety violation
-# surface). Instead:
-#   - The dispatch-bypass read append is the public
-#     `feed_inbound(bytes) -> Result<(), ReadBufFull>` — benches use
-#     it directly.
-#   - Per-iter reset is `criterion::iter_batched(setup, routine,
-#     BatchSize)` — setup builds a fresh proto per iter (untimed);
-#     routine measures the timed window only.
-#
-# Tier closure: feature physically absent → no leak surface possible.
-# Downstream consumers cannot enable (nothing to enable). Tier-1
-# by-elimination.
+# No `bench-hooks` feature. A naive shape would gate `#[doc(hidden)] pub fn`
+# test/bench hooks behind a cargo feature that downstream users could enable in
+# their Cargo.toml (tier-3 by-discipline; CREDO §1 absolute-safety violation
+# surface). Instead the benches drive the PUBLIC engine surface only — a session
+# over an in-process scripted `Transport` — and reach a fresh, primed engine per
+# iteration through `criterion::iter_batched` (setup builds + primes the engine
+# UNTIMED; the routine measures the single timed round-trip). Tier closure: the
+# feature is physically absent, so there is no leak surface to enable.
 
 [dependencies]
 heapless = { workspace = true }
@@ -75,8 +73,12 @@ getrandom = { workspace = true }
 # visibility anti-pattern.
 base64ct = { workspace = true }
 
-# `criterion` — bench harness. Dev-only; benches compile with std,
-# lib stays no_std. See workspace `Cargo.toml`.
+# `criterion` — ns/op statistical bench harness for the `hot_paths` bench.
+# Dev-only; the bench target compiles with std while the lib stays no_std. See
+# workspace `Cargo.toml` for the tool-choice rationale (criterion kept over
+# divan/manual: its transitive tail is already trimmed to a handful of dev-only
+# packages via `default-features = false`, and the asm/bench scripts speak its
+# `--bench <name>` / baseline vocabulary directly).
 criterion = { workspace = true }
 
 # `trybuild` — golden compile-fail harness for the sole-path injection
@@ -87,10 +89,10 @@ criterion = { workspace = true }
 trybuild = { workspace = true }
 
 # `bsql-devgates` — dev-only harness hosting the workspace's only
-# `unsafe`: the counting `#[global_allocator]` used by the `alloc_counts`
-# bench (which is now unsafe-free), and the raw-memory `probe_bytes`
-# shared by the five zeroize-verification tests so they audit ONE unsafe
-# read instead of five copies.
+# `unsafe`: the counting `#[global_allocator]` installed by the deterministic
+# allocation gates (`engine_*_alloc`, `engine_read_ramp_spec`) and the
+# raw-memory `probe_bytes` shared by the zeroize-verification tests so they
+# audit ONE unsafe read instead of five copies.
 bsql-devgates = { path = "../../../tools/devgates" }
 
 # This crate KEEPS its stricter crate-root forbid-bundle in `src/lib.rs`
@@ -102,3 +104,11 @@ bsql-devgates = { path = "../../../tools/devgates" }
 # shape under that stricter wall, not silent data fallbacks).
 [lints]
 workspace = true
+
+# `harness = false` disables the default libtest bench runner: the `hot_paths`
+# bench provides its own `criterion_main!` entry point. It uses the public
+# engine API only (a session over the in-process scripted transport in
+# `benches/common.rs`), so it needs no crate features.
+[[bench]]
+name = "hot_paths"
+harness = false

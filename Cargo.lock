@@ -149,6 +149,7 @@ dependencies = [
  "bsql-postgres-proto",
  "bsql-postgres-sync",
  "bsql-query-macros",
+ "criterion",
  "tokio",
  "trybuild",
 ]

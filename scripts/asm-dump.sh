@@ -54,7 +54,7 @@ cargo rustc -p bsql-postgres-proto --release --lib -- --emit=asm \
 
 # Find the most recent .s file. cargo rustc emits one per crate,
 # named with the metadata hash. Newest mtime is the one we just built.
-ASM_FILE="$(ls -t target/release/deps/bsql_pg_proto-*.s 2>/dev/null | head -1)"
+ASM_FILE="$(ls -t target/release/deps/bsql_postgres_proto-*.s 2>/dev/null | head -1)"
 if [[ -z "$ASM_FILE" ]]; then
     echo "[asm-dump] No .s file found in target/release/deps/" >&2
     echo "[asm-dump] cargo rustc may have been a no-op cache hit. Touch source:" >&2
@@ -64,7 +64,7 @@ fi
 echo "[asm-dump] using $ASM_FILE" >&2
 
 # Locate matching symbols. Mangled symbols look like
-# `__ZN13bsql_pg_proto8...11materialise17h<hash>E:` on macOS
+# `__ZN19bsql_postgres_proto...11materialise17h<hash>E:` on macOS
 # (double underscore) and `_ZN...E:` on Linux (single underscore).
 # We anchor on the symbol declaration line (ends with `E:`).
 SYMBOL_LINES="$(grep -E "^_+ZN.*${PATTERN}.*17h[0-9a-f]+E:\$" "$ASM_FILE" || true)"

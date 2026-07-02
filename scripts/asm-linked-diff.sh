@@ -22,6 +22,9 @@ set -uo pipefail
 
 BENCH="${1:-hot_paths}"
 REF="${2:-HEAD}"
+# Package hosting the bench. Default is the proto crate's `hot_paths`; set
+# `PKG=bsql-query-fixture` to target the `typed_decode` bench.
+PKG="${PKG:-bsql-postgres-proto}"
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT" || exit 1
 TMP="$(mktemp -d)"
@@ -41,8 +44,8 @@ norm() {
 
 build_and_dump() {
     # $1 = destination normalized dump
-    cargo bench -p bsql-postgres-proto --bench "$BENCH" --no-run >/dev/null 2>&1 \
-        || { echo "[asm-linked] build failed for $BENCH" >&2; return 1; }
+    cargo bench -p "$PKG" --bench "$BENCH" --no-run >/dev/null 2>&1 \
+        || { echo "[asm-linked] build failed for $PKG/$BENCH" >&2; return 1; }
     local bin
     bin="$(ls -t "target/release/deps/${BENCH}"-* 2>/dev/null | grep -vE '\.(d|dSYM)$' | head -1)"
     [ -n "$bin" ] || { echo "[asm-linked] no $BENCH binary found" >&2; return 1; }
@@ -73,7 +76,7 @@ git checkout -q "$ORIG"
 trap - EXIT
 
 echo "============================================================"
-echo "post-LTO codegen diff: bench=$BENCH  current=$ORIG  ref=$REF"
+echo "post-LTO codegen diff: pkg=$PKG bench=$BENCH  current=$ORIG  ref=$REF"
 echo "  before: $(wc -l <"$TMP/before.s" | tr -d ' ') normalized lines"
 echo "  after:  $(wc -l <"$TMP/after.s" | tr -d ' ') normalized lines"
 echo "============================================================"
