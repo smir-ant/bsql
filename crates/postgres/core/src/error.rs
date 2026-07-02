@@ -60,6 +60,15 @@ pub enum DriverError {
     /// offset, or cell length than `u32`/`u16` can address). Never silently
     /// truncated — the row is rejected so no corrupted bytes are surfaced.
     RowTooLarge,
+    /// A single `simple_query` / `query_sql` batch contained multiple
+    /// statements whose result rows had DIFFERENT column counts. A single
+    /// result set has one uniform row shape whose fixed stride addresses every
+    /// cell; a batch mixing widths cannot be represented as one result set
+    /// without reading cells from the wrong offsets, so it is rejected loudly
+    /// rather than returned with silently mis-addressed data. Run the
+    /// statements separately (each yields its own result), or ensure the
+    /// batch's row-returning statements share a column shape.
+    MixedResultWidth,
     /// A `FailReply` was observed but the protocol carried no classified
     /// cause for it. A failure definitely occurred; its detail is absent —
     /// distinct from the connection merely being not-ready.
@@ -142,6 +151,7 @@ impl fmt::Display for DriverError {
             Self::NoRows => write!(f, "query returned no rows"),
             Self::Config(msg) => write!(f, "config error: {msg}"),
             Self::RowTooLarge => write!(f, "result row too large to represent (exceeds 32-bit arena bounds)"),
+            Self::MixedResultWidth => write!(f, "multi-statement batch mixed result-row widths; a single result set cannot represent statements returning different column counts — run them separately"),
             Self::UnclassifiedFailure => write!(f, "server reported a failure with no classified cause"),
             Self::NonUtf8Payload => write!(f, "server payload was not valid UTF-8"),
             Self::TimeoutOverflow => write!(f, "requested timeout overflows the monotonic clock"),
@@ -169,6 +179,7 @@ impl std::error::Error for DriverError {
             | Self::NoRows
             | Self::Config(_)
             | Self::RowTooLarge
+            | Self::MixedResultWidth
             | Self::UnclassifiedFailure
             | Self::NonUtf8Payload
             | Self::TimeoutOverflow
@@ -190,9 +201,12 @@ impl From<DecodeError> for DriverError {
     }
 }
 
-impl From<crate::types::RowTooLarge> for DriverError {
-    fn from(_: crate::types::RowTooLarge) -> Self {
-        Self::RowTooLarge
+impl From<crate::types::ArenaSealError> for DriverError {
+    fn from(e: crate::types::ArenaSealError) -> Self {
+        match e {
+            crate::types::ArenaSealError::TooLarge => Self::RowTooLarge,
+            crate::types::ArenaSealError::MixedRowWidth => Self::MixedResultWidth,
+        }
     }
 }
 

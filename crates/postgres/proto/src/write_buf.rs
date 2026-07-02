@@ -48,6 +48,8 @@ pub const MAX_OWNED_SEND_LEN: usize = 2176;
 /// # Drift-guarded inputs
 ///
 /// - `user` (key `"user"`, 4 bytes): value up to [`crate::ident::MAX_IDENT_LEN`].
+/// - `client_encoding` (key `"client_encoding"`, 15 bytes): fixed value
+///   `"UTF8"` (4 bytes), always sent to pin the session to UTF-8.
 /// - `database` (key `"database"`, 8 bytes): value up to [`crate::ident::MAX_IDENT_LEN`].
 /// - `application_name` (key `"application_name"`, 16 bytes): value
 ///   up to [`crate::ident::MAX_APP_NAME_LEN`].
@@ -64,6 +66,10 @@ pub const fn max_startup_message_size() -> usize {
         .saturating_add(4) // "user"
         .saturating_add(1) // NUL
         .saturating_add(crate::ident::MAX_IDENT_LEN)
+        .saturating_add(1) // NUL
+        .saturating_add(15) // "client_encoding"
+        .saturating_add(1) // NUL
+        .saturating_add(4) // "UTF8"
         .saturating_add(1) // NUL
         .saturating_add(8) // "database"
         .saturating_add(1) // NUL

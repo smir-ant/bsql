@@ -44,7 +44,7 @@
 //!   Row                         16      8   Arc pointer + u32 row index
 //!   OwnedRow                    16      8   one Box<[u8]> (ptr + len)
 //!   OwnedRowTooLarge             0      1   ZST error marker
-//!   RowTooLarge                  0      1   ZST error marker
+//!   ArenaSealError               1      1   2-variant seal-error enum
 //!   DriverError                120      8   Db(DbError) dominates
 //!   DbError                    120      8   5 String/Option<String> fields
 //!   ConnectConfig              112      8   host/user/db/password Strings

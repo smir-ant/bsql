@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bsql_postgres_core::materialize::{self, ResultCollector};
+use bsql_postgres_core::sql_ident;
 use bsql_postgres_core::tls::{self, TlsError, TlsTransport, Wire};
 use bsql_postgres_core::{
     ConnectConfig, DbError, DbErrorSink, DriverError, Notification, QueryResult, Row, Rows,
@@ -772,9 +773,14 @@ impl Connection {
         }
     }
 
-    /// Subscribe to a `LISTEN` channel (the name is validated as an identifier,
-    /// so it cannot inject SQL).
+    /// Subscribe to a `LISTEN` channel.
+    ///
+    /// The channel name is interpolated into `LISTEN <channel>`, so it is
+    /// validated as an unquoted identifier BEFORE interpolation — an
+    /// injection-shaped name is a classified [`DriverError::Config`], never
+    /// spliced into SQL.
     pub fn listen(&mut self, channel: &str) -> Result<(), DriverError> {
+        sql_ident::validate_identifier(channel)?;
         let channel = Ident::try_from_str(channel)
             .map_err(|_| DriverError::Config("invalid channel name"))?;
         let live = self.take_live()?;
@@ -786,8 +792,14 @@ impl Connection {
         self.settle(polled, &mut collector)
     }
 
-    /// Unsubscribe from a `LISTEN` channel (validated, no injection).
+    /// Unsubscribe from a `LISTEN` channel.
+    ///
+    /// The channel name is interpolated into `UNLISTEN <channel>`, so it is
+    /// validated as an unquoted identifier BEFORE interpolation — an
+    /// injection-shaped name is a classified [`DriverError::Config`], never
+    /// spliced into SQL.
     pub fn unlisten(&mut self, channel: &str) -> Result<(), DriverError> {
+        sql_ident::validate_identifier(channel)?;
         let channel = Ident::try_from_str(channel)
             .map_err(|_| DriverError::Config("invalid channel name"))?;
         self.simple_query(&format!("UNLISTEN {}", channel.as_str()))?;
@@ -865,10 +877,16 @@ impl Connection {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<Notification>, DriverError> {
-        let live = self.take_live()?;
+        // Arm the fallible read timeout BEFORE taking the linear token, so a
+        // failed `set_read_timeout` syscall (e.g. the OS rejects a zero
+        // Duration) returns Err with the token still in `self.live` — never
+        // stranding it and bricking a connection nothing touched on the wire.
+        // Mirrors the validate-fallible-input-before-take_live discipline of
+        // every other verb.
         self.socket_ctl
             .set_read_timeout(Some(timeout))
             .map_err(DriverError::Io)?;
+        let live = self.take_live()?;
         let mut captured: Option<Result<Notification, DriverError>> = None;
         let polled = engine::poll_once(self.engine.recv_notification(live, |s| {
             if let Surface::Notify(body) = s {
@@ -910,11 +928,17 @@ impl Connection {
     }
 
     /// `COPY <table> FROM STDIN`, streaming each row as a `CopyData` chunk.
+    ///
+    /// `COPY` has no parameterized form for the target table, so `table` is
+    /// interpolated into the SQL. It is validated as an unquoted identifier
+    /// (optionally `schema.table`) BEFORE interpolation — an injection-shaped
+    /// string is a classified [`DriverError::Config`], never spliced into SQL.
     pub fn copy_in(
         &mut self,
         table: &str,
         rows_data: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<u64, DriverError> {
+        sql_ident::validate_table(table)?;
         let sql = format!("COPY {table} FROM STDIN");
         // Materialise each row + a trailing newline into an owned store the data
         // closure yields slices from: the engine's `data` callback borrows for

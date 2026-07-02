@@ -638,7 +638,9 @@ pub fn seed() -> Vec<Transcript> {
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ObservedRun {
             client_bytes: vec![
-                0, 0, 0, 21, 0, 3, 0, 0, 117, 115, 101, 114, 0, 99, 111, 114, 112, 117, 115, 0, 0,
+                0, 0, 0, 42, 0, 3, 0, 0, 117, 115, 101, 114, 0, 99, 111, 114, 112, 117, 115, 0,
+                99, 108, 105, 101, 110, 116, 95, 101, 110, 99, 111, 100, 105, 110, 103, 0, 85, 84,
+                70, 56, 0, 0,
             ],
             outcome: Ok(ObservedOk::default()),
             notices: Vec::new(),
@@ -1430,7 +1432,9 @@ pub fn adversarial() -> Vec<Transcript> {
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ObservedRun {
             client_bytes: vec![
-                0, 0, 0, 21, 0, 3, 0, 0, 117, 115, 101, 114, 0, 99, 111, 114, 112, 117, 115, 0, 0,
+                0, 0, 0, 42, 0, 3, 0, 0, 117, 115, 101, 114, 0, 99, 111, 114, 112, 117, 115, 0,
+                99, 108, 105, 101, 110, 116, 95, 101, 110, 99, 111, 100, 105, 110, 103, 0, 85, 84,
+                70, 56, 0, 0,
             ],
             outcome: Err(ObservedErr::Protocol(ProtocolFailureKind::HandshakeFailed)),
             notices: Vec::new(),

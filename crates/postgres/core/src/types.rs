@@ -113,27 +113,53 @@ impl Row {
     }
 }
 
-// ─── RowTooLarge ────────────────────────────────────────────
+// ─── ArenaSealError ─────────────────────────────────────────
 
-/// A result row (or the whole arena) could not be represented within the
-/// 32-bit on-arena fields: more columns than `u16`, or a cell offset/length
-/// that overflows `u32`. Construction fails loudly instead of saturating to a
-/// sentinel that would silently mis-address subsequent cells.
+/// Why sealing an [`ArenaBuilder`] into [`Row`] handles failed.
+///
+/// The arena addresses every cell by a single per-row stride (`n_cols`), so it
+/// can only faithfully represent rows that all share that shape and fit its
+/// 32-bit fields. Both failure modes are rejected loudly at
+/// [`ArenaBuilder::finish`] rather than sealed into an arena that would
+/// mis-address or truncate cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RowTooLarge;
+pub enum ArenaSealError {
+    /// A result row (or the whole arena) could not be represented within the
+    /// 32-bit on-arena fields: more columns than `u16`, or a cell offset/length
+    /// that overflows `u32`. Rejected instead of saturating to a sentinel that
+    /// would silently mis-address subsequent cells.
+    TooLarge,
+    /// The rows fed to one arena did not all have the same column count. A
+    /// single arena's fixed stride addresses row `r` column `c` at slot
+    /// `n_cols * r + c`; a row whose width differs from the first would
+    /// mis-address every following cell. A heterogeneous batch — a
+    /// multi-statement `simple_query` whose statements return different column
+    /// counts — is therefore rejected rather than returned with cells read from
+    /// the wrong offsets. The uniform-width invariant `finish` relies on is thus
+    /// held by construction: the builder never seals a non-uniform arena.
+    MixedRowWidth,
+}
 
-impl core::fmt::Display for RowTooLarge {
+impl core::fmt::Display for ArenaSealError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("result row too large to encode (exceeds 32-bit arena bounds)")
+        match self {
+            Self::TooLarge => {
+                f.write_str("result row too large to encode (exceeds 32-bit arena bounds)")
+            }
+            Self::MixedRowWidth => f.write_str(
+                "result rows had different column counts \
+                 (a mixed-width multi-statement batch cannot be one result set)",
+            ),
+        }
     }
 }
 
-impl std::error::Error for RowTooLarge {}
+impl std::error::Error for ArenaSealError {}
 
-// Footprint pin: a zero-size error marker — it carries no data, only its type
-// identity. A field accidentally added here would make every fallible row-build
-// `Result` wider; the ZST pin catches that.
-crate::footprint_pin!(RowTooLarge, size = 0, align = 1);
+// Footprint pin: a fieldless two-variant enum — one discriminant byte, no
+// payload. A future variant carrying data would widen every fallible row-build
+// `Result`; the pin catches that.
+crate::footprint_pin!(ArenaSealError, size = 1, align = 1);
 
 // ─── ArenaBuilder ───────────────────────────────────────────
 
@@ -142,15 +168,33 @@ crate::footprint_pin!(RowTooLarge, size = 0, align = 1);
 ///
 /// Any cell offset/length or column count that would overflow the 32-bit
 /// arena fields sets a sticky overflow flag rather than saturating; `finish()`
-/// converts that flag into [`RowTooLarge`] so a too-large result fails loudly
-/// instead of returning silently corrupted rows.
+/// converts that flag into [`ArenaSealError::TooLarge`] so a too-large result
+/// fails loudly instead of returning silently corrupted rows.
+///
+/// # Uniform-width invariant
+///
+/// Every sealed arena addresses cells by the fixed stride `n_cols` (row `r`,
+/// column `c` lives at slot `n_cols * r + c`). The builder therefore records
+/// the column count of each row and refuses to seal an arena whose rows are not
+/// all `n_cols` wide: a differing row sets a sticky mismatch flag that
+/// `finish()` converts into [`ArenaSealError::MixedRowWidth`]. This makes the
+/// stride correct **by construction** — a heterogeneous batch cannot produce
+/// mis-addressed cells, only a loud error.
 pub struct ArenaBuilder {
     data: Vec<u8>,
     slots: Vec<ColSlot>,
     n_cols: u16,
     rows_finished: u32,
-    /// Set when a bound was exceeded; sealed into a `RowTooLarge` by `finish()`.
+    /// Columns pushed for the row currently being built (since the last
+    /// `end_row`). Checked against `n_cols` at `end_row` to enforce the
+    /// uniform-width invariant.
+    cols_in_row: u32,
+    /// Set when a bound was exceeded; sealed into [`ArenaSealError::TooLarge`]
+    /// by `finish()`.
     overflow: bool,
+    /// Set when a completed row's column count differed from `n_cols`; sealed
+    /// into [`ArenaSealError::MixedRowWidth`] by `finish()`.
+    width_mismatch: bool,
 }
 
 impl ArenaBuilder {
@@ -167,11 +211,15 @@ impl ArenaBuilder {
             slots: Vec::new(),
             n_cols: n,
             rows_finished: 0,
+            cols_in_row: 0,
             overflow,
+            width_mismatch: false,
         }
     }
 
     pub fn push_value(&mut self, bytes: &[u8]) {
+        // Count this column toward the current row's width (checked at end_row).
+        self.cols_in_row = self.cols_in_row.saturating_add(1);
         // Offset and `len + 1` must both fit u32 (a NULL is encoded by the
         // niche, so a real value needs `len + 1 >= 1`). On overflow, record a
         // NULL placeholder and mark the builder so `finish()` fails loudly —
@@ -198,6 +246,8 @@ impl ArenaBuilder {
     }
 
     pub fn push_null(&mut self) {
+        // Count this column toward the current row's width (checked at end_row).
+        self.cols_in_row = self.cols_in_row.saturating_add(1);
         self.slots.push(ColSlot::null());
     }
 
@@ -225,14 +275,29 @@ impl ArenaBuilder {
     }
 
     pub fn end_row(&mut self) {
-        self.rows_finished += 1;
+        // Enforce the uniform-width invariant: a completed row must contribute
+        // exactly `n_cols` slots, or the fixed stride would mis-address it.
+        if self.cols_in_row != u32::from(self.n_cols) {
+            self.width_mismatch = true;
+        }
+        self.cols_in_row = 0;
+        self.rows_finished = self.rows_finished.saturating_add(1);
     }
 
-    /// Seal the arena and produce Row handles. Fails with [`RowTooLarge`] if
-    /// any column count, offset, or length overflowed the 32-bit fields.
-    pub fn finish(self) -> Result<Vec<Row>, RowTooLarge> {
+    /// Seal the arena and produce Row handles.
+    ///
+    /// # Errors
+    ///
+    /// [`ArenaSealError::TooLarge`] if any column count, offset, or length
+    /// overflowed the 32-bit fields; [`ArenaSealError::MixedRowWidth`] if the
+    /// fed rows did not all have the same column count (which would mis-address
+    /// cells against the arena's single stride).
+    pub fn finish(self) -> Result<Vec<Row>, ArenaSealError> {
         if self.overflow {
-            return Err(RowTooLarge);
+            return Err(ArenaSealError::TooLarge);
+        }
+        if self.width_mismatch {
+            return Err(ArenaSealError::MixedRowWidth);
         }
         let n_rows = self.rows_finished;
         let arena = Arc::new(ArenaInner {
@@ -356,6 +421,42 @@ mod tests {
         // A column count beyond u16 cannot be addressed by the slot index; the
         // builder must fail loud at finish(), never saturate and mis-index.
         let ab = ArenaBuilder::new(usize::from(u16::MAX) + 1);
-        assert_eq!(ab.finish().map(|_| ()), Err(RowTooLarge));
+        assert_eq!(ab.finish().map(|_| ()), Err(ArenaSealError::TooLarge));
+    }
+
+    #[test]
+    fn arena_builder_rejects_mixed_row_width() {
+        // The first row (1 col) establishes the stride; a following 2-col row
+        // would make `get_raw` read cells from the wrong offsets. The builder
+        // must reject the heterogeneous arena at finish() rather than seal it.
+        let mut ab = ArenaBuilder::new(1);
+        ab.push_value(b"a");
+        ab.end_row();
+        ab.push_value(b"x");
+        ab.push_value(b"y");
+        ab.end_row();
+        assert_eq!(ab.finish().map(|_| ()), Err(ArenaSealError::MixedRowWidth));
+    }
+
+    #[test]
+    fn arena_builder_accepts_uniform_multi_row() {
+        // Uniform-width rows across several `end_row`s seal cleanly — the width
+        // guard must not reject a well-formed multi-row result.
+        let mut ab = ArenaBuilder::new(2);
+        ab.push_value(b"a");
+        ab.push_null();
+        ab.end_row();
+        ab.push_value(b"b");
+        ab.push_value(b"c");
+        ab.end_row();
+        let rows = match ab.finish() {
+            Ok(r) => r,
+            Err(e) => panic!("unexpected seal error: {e}"),
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get_raw(0), Some(&b"a"[..]));
+        assert!(rows[0].is_null(1));
+        assert_eq!(rows[1].get_raw(0), Some(&b"b"[..]));
+        assert_eq!(rows[1].get_raw(1), Some(&b"c"[..]));
     }
 }

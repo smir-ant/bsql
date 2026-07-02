@@ -38,8 +38,10 @@ use bsql_postgres_proto::wire::{
 use bsql_postgres_proto::{Credentials, Ident, Password, Sensitive, TxStatus};
 
 /// The exact byte length of the `user=corpus` startup packet — the offset at
-/// which any outbound auth response begins in the client wire.
-const STARTUP_LEN: usize = 21;
+/// which any outbound auth response begins in the client wire. Includes the
+/// always-sent `client_encoding=UTF8` parameter (21-byte user-only prefix + a
+/// 21-byte `client_encoding\0UTF8\0` pair).
+const STARTUP_LEN: usize = 42;
 
 // ─────────────────────────── frame builders ───────────────────────────
 

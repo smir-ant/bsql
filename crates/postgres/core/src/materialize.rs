@@ -158,8 +158,11 @@ impl ResultCollector {
     ///
     /// # Errors
     ///
-    /// [`DriverError::RowDecodeFailed`] if any fed row was wire-malformed, or
-    /// [`DriverError::RowTooLarge`] if the arena exceeded its 32-bit bounds.
+    /// [`DriverError::RowDecodeFailed`] if any fed row was wire-malformed;
+    /// [`DriverError::RowTooLarge`] if the arena exceeded its 32-bit bounds; or
+    /// [`DriverError::MixedResultWidth`] if a multi-statement batch delivered
+    /// rows of differing column counts (which the single arena's fixed stride
+    /// cannot represent without mis-addressing cells).
     pub fn finish(self) -> Result<CollectedResult, DriverError> {
         if let Some(e) = self.decode_error {
             return Err(e);
@@ -363,6 +366,66 @@ pub fn parse_notification(body: &[u8]) -> Result<Notification, DriverError> {
         payload,
         pid,
     })
+}
+
+#[cfg(test)]
+mod result_collector_width_tests {
+    //! A single `simple_query` batch surfaces one [`Surface::Deliver`] per
+    //! statement and each statement's rows as [`Surface::Row`]. When two
+    //! statements return DIFFERENT column counts, flattening their rows into
+    //! one fixed-stride arena would mis-address cells — so the collector must
+    //! reject the batch with [`DriverError::MixedResultWidth`], never return
+    //! silently wrong data. These tests drive the collector with hand-built
+    //! `DataRow` bodies (no live PG).
+
+    use bsql_postgres_proto::engine::Surface;
+
+    use super::ResultCollector;
+    use crate::error::DriverError;
+
+    /// Assemble a `DataRow` body: `[i16 n_cols][per col: i32 len][bytes]`, one
+    /// column per element (no NULLs — length-prefixed cell bytes).
+    fn row_body(cells: &[&[u8]]) -> Vec<u8> {
+        let n_cols = i16::try_from(cells.len()).expect("test row within i16");
+        let mut body = n_cols.to_be_bytes().to_vec();
+        for cell in cells {
+            let len = i32::try_from(cell.len()).expect("test cell within i32");
+            body.extend_from_slice(&len.to_be_bytes());
+            body.extend_from_slice(cell);
+        }
+        body
+    }
+
+    #[test]
+    fn mixed_width_multi_statement_is_rejected() {
+        // `SELECT 1; SELECT 'a','b'; SELECT 'z'` shape: widths 1, 2, 1. The
+        // first row locks the stride at 1; the 2-col row would make row 2 read
+        // from the wrong offset. Must be a loud error, not wrong data.
+        let mut c = ResultCollector::new();
+        c.feed(Surface::Row(&row_body(&[b"1"])));
+        c.feed(Surface::Row(&row_body(&[b"a", b"b"])));
+        c.feed(Surface::Row(&row_body(&[b"z"])));
+        assert!(
+            matches!(c.finish(), Err(DriverError::MixedResultWidth)),
+            "a mixed-width batch must be rejected as MixedResultWidth",
+        );
+    }
+
+    #[test]
+    fn uniform_width_multi_statement_reads_correctly() {
+        // Same width across statements: rows flatten into one arena whose fixed
+        // stride addresses every cell correctly. This is the case the width
+        // guard must NOT reject.
+        let mut c = ResultCollector::new();
+        c.feed(Surface::Row(&row_body(&[b"1", b"one"])));
+        c.feed(Surface::Row(&row_body(&[b"2", b"two"])));
+        let result = c.finish().expect("uniform-width rows seal cleanly");
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].get_raw(0), Some(&b"1"[..]));
+        assert_eq!(result.rows[0].get_raw(1), Some(&b"one"[..]));
+        assert_eq!(result.rows[1].get_raw(0), Some(&b"2"[..]));
+        assert_eq!(result.rows[1].get_raw(1), Some(&b"two"[..]));
+    }
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ pub mod error;
 pub mod footprint;
 pub mod materialize;
 pub mod owned_row;
+pub mod sql_ident;
 pub mod ssl;
 pub mod tls;
 // The bounded, typed result of a compile-checked `query!` — `Rows<Q>` plus the
@@ -26,4 +27,6 @@ pub use error::{DbError, DriverError};
 pub use materialize::{CollectedResult, DbErrorSink, ResultCollector};
 pub use owned_row::{OwnedRow, OwnedRowTooLarge};
 pub use typed_rows::{Rows, RowsBuilder};
-pub use types::{ArenaBuilder, FromText, Notification, PreparedStatement, QueryResult, Row, RowTooLarge};
+pub use types::{
+    ArenaBuilder, ArenaSealError, FromText, Notification, PreparedStatement, QueryResult, Row,
+};

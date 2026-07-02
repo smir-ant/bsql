@@ -57,6 +57,110 @@ async fn error_recovery_and_resilience() {
 
 #[tokio::test]
 #[ignore = "requires local PG"]
+async fn client_encoding_pinned_to_utf8_and_roundtrips_non_ascii() {
+    // The startup message forces client_encoding=UTF8 so the driver's UTF-8
+    // TEXT decode is correct regardless of the server's default encoding.
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    let enc = c.query_sql("SHOW client_encoding").await.expect("show").rows[0]
+        .get_str(0)
+        .map(String::from);
+    assert_eq!(enc.as_deref(), Some("UTF8"), "startup must pin client_encoding=UTF8");
+
+    // Non-ASCII (Cyrillic + emoji) round-trips byte-exact under the pinned UTF-8.
+    let text = "Привет, мир 🌍";
+    let r = c.query_sql(&format!("SELECT '{text}'::text")).await.expect("query");
+    assert_eq!(r.rows[0].get_str(0), Some(text));
+    c.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn mixed_width_multi_statement_is_rejected_not_misaddressed() {
+    // A single simple-query batch whose statements return DIFFERENT column
+    // counts cannot be one fixed-stride result set without mis-addressing
+    // cells. It must be a loud MixedResultWidth error, never silent wrong data.
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    let mixed = c.query_sql("SELECT 1::int4; SELECT 'a'::text, 'b'::text").await;
+    assert!(
+        matches!(mixed, Err(bsql_postgres_async::DriverError::MixedResultWidth)),
+        "mixed-width batch must be rejected as MixedResultWidth, got {mixed:?}",
+    );
+    // The protocol completed cleanly (both statements ran server-side); only the
+    // client-side result shape is rejected, so the connection stays reusable.
+    assert!(c.is_healthy(), "connection stays healthy after a rejected result shape");
+    assert_eq!(
+        c.query_sql("SELECT 7::int4").await.expect("follow-up query works").rows[0].get_i32(0),
+        Some(7),
+    );
+
+    // A UNIFORM-width multi-statement batch is fine: rows flatten into one arena
+    // whose single stride addresses every cell correctly.
+    let uniform = c.query_sql("SELECT 1::int4; SELECT 2::int4").await.expect("uniform batch");
+    assert_eq!(uniform.rows.len(), 2);
+    assert_eq!(uniform.rows[0].get_i32(0), Some(1));
+    assert_eq!(uniform.rows[1].get_i32(0), Some(2));
+    c.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn listen_unlisten_reject_injection_shaped_channel() {
+    // LISTEN/UNLISTEN interpolate the channel name; an injection-shaped name
+    // must be a classified Config error, never spliced into SQL.
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    let hostile_listen = c.listen("ch; DROP TABLE x --").await;
+    assert!(
+        matches!(hostile_listen, Err(bsql_postgres_async::DriverError::Config(_))),
+        "hostile LISTEN channel must be rejected as Config, got {hostile_listen:?}",
+    );
+    let hostile_unlisten = c.unlisten("ch\"; --").await;
+    assert!(
+        matches!(hostile_unlisten, Err(bsql_postgres_async::DriverError::Config(_))),
+        "hostile UNLISTEN channel must be rejected as Config, got {hostile_unlisten:?}",
+    );
+    assert!(c.is_healthy(), "rejection happens before the wire is touched");
+
+    // A legitimate channel still works.
+    c.listen("bsql_valid_ch").await.expect("legit listen");
+    c.unlisten("bsql_valid_ch").await.expect("legit unlisten");
+    c.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn copy_in_rejects_injection_and_accepts_schema_qualified() {
+    // `COPY` interpolates the table name; an injection-shaped table must be a
+    // classified Config error, never spliced into SQL and executed.
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cp_inj(id int4)").await.expect("create");
+
+    let hostile = c.copy_in("cp_inj; DROP TABLE cp_inj --", vec!["1"]).await;
+    assert!(
+        matches!(hostile, Err(bsql_postgres_async::DriverError::Config(_))),
+        "an injection-shaped table must be rejected as Config, got {hostile:?}",
+    );
+    // Validation runs before the wire is touched, so the connection is untouched.
+    assert!(c.is_healthy(), "connection stays healthy after a rejected table name");
+    // The injected DROP never ran — the table still exists — and a legit copy works.
+    assert_eq!(c.copy_in("cp_inj", vec!["1", "2"]).await.expect("legit copy"), 2);
+    // A schema-qualified `schema.table` is accepted.
+    assert_eq!(c.copy_in("pg_temp.cp_inj", vec!["3"]).await.expect("schema-qualified copy"), 1);
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_inj").await.expect("count").rows[0].get_i64(0),
+        Some(3),
+    );
+    c.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
 async fn prepared_reuse_after_constraint_violation() {
     let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
     let mut c = Connection::connect(&config).await.expect("connect");
@@ -122,7 +226,7 @@ async fn pool_concurrent() {
     for h in handles { h.await.expect("task"); }
 }
 
-// ── S23 pool hardening (reset-on-return, acquire timeout, health eviction) ──
+// ── pool hardening (reset-on-return, acquire timeout, health eviction) ──
 
 // The reset-vs-statement-cache CONSISTENCY proof (the same `query!` reused across
 // pooled checkouts, asserting the server holds it exactly once) needs the
@@ -163,6 +267,86 @@ async fn pool_reset_on_return_no_bleed() {
         .query_sql("SELECT count(*)::int8 FROM pg_listening_channels() AS c(chan) WHERE chan='bleed_chan'")
         .await.expect("listen check").rows[0].get_i64(0);
     assert_eq!(listening, Some(0), "LISTEN channel bled across checkout");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn cancelled_transaction_is_rolled_back_before_reuse() {
+    // A `transaction()` future dropped mid-body (after BEGIN + a write, before
+    // COMMIT/ROLLBACK) returns its connection to the pool still inside the
+    // transaction. There is no async Drop guard (Drop cannot `.await`), so the
+    // safety net is the pool's reset-on-acquire, which prepends ROLLBACK when
+    // the connection is not Idle. This proves the next user never runs inside
+    // the stale tx and the uncommitted write is discarded.
+    //
+    // DECISIVE: with max_size=1 the re-acquired connection is the SAME physical
+    // one that did the (uncommitted) INSERT. If the reset did NOT roll back, that
+    // connection would still be in its own transaction and would SEE its own
+    // uncommitted row (count = 1). count = 0 therefore proves ROLLBACK ran.
+    use bsql_postgres_async::{DriverError, Pool};
+    let mk_config =
+        || ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+
+    // A persistent (non-temp) table: temp tables would be dropped by the reset's
+    // DISCARD TEMP, and we need the row survival to be decided by tx state alone.
+    {
+        let mut setup = Connection::connect(&mk_config()).await.expect("connect setup");
+        setup.execute_sql("DROP TABLE IF EXISTS bsql_tx_cancel_rollback").await.expect("drop old");
+        setup.execute_sql("CREATE TABLE bsql_tx_cancel_rollback(id int4)").await.expect("create");
+        setup.close().await.expect("close setup");
+    }
+
+    let pool = Pool::new(mk_config(), 1).await.expect("pool"); // max_size=1 forces reuse
+    let pid1;
+    {
+        let mut guard = pool.get().await.expect("acquire 1");
+        pid1 = guard.conn_mut().expect("live1").backend_pid();
+
+        // Run a transaction that BEGINs + INSERTs, signals, then hangs. When the
+        // signal arrives (post-INSERT, parked between verbs with the token
+        // restored), `select!` drops the transaction future → cancellation
+        // exactly at that point. Deterministic — driven by the signal, not a timer.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let fut = guard.conn_mut().expect("live1").transaction(async move |c| {
+            c.execute_sql("INSERT INTO bsql_tx_cancel_rollback VALUES (1)").await?;
+            let _ = tx.send(());
+            std::future::pending::<()>().await;
+            Ok::<(), DriverError>(())
+        });
+        tokio::select! {
+            biased;
+            r = fut => panic!("the transaction must not complete: {r:?}"),
+            _ = rx => {} // INSERT done + signaled → select drops `fut` (cancel mid-tx)
+        }
+        // The token was restored between verbs, so the connection is alive —
+        // the pool will RESET it (not evict it) on the next acquire.
+        assert!(guard.conn_mut().expect("live1").is_healthy(), "connection alive after cancel");
+        // guard drops here → the mid-transaction connection returns to the pool.
+    }
+
+    let mut guard2 = pool.get().await.expect("acquire 2");
+    let conn = guard2.conn_mut().expect("live2");
+    assert_eq!(conn.backend_pid(), pid1, "max_size=1 must reuse the SAME physical connection");
+    let count = conn
+        .query_sql("SELECT count(*) FROM bsql_tx_cancel_rollback")
+        .await
+        .expect("count")
+        .rows[0]
+        .get_i64(0);
+    assert_eq!(
+        count,
+        Some(0),
+        "the cancelled transaction's uncommitted INSERT must have been rolled back on acquire; \
+         a nonzero count would mean the reused connection is still inside the stale transaction",
+    );
+    // The connection is clean and fully usable.
+    let probe = conn.query_sql("SELECT 1::int4").await.expect("reusable after reset");
+    assert_eq!(probe.rows[0].get_i32(0), Some(1));
+    drop(guard2);
+
+    let mut cleanup = Connection::connect(&mk_config()).await.expect("connect cleanup");
+    cleanup.execute_sql("DROP TABLE IF EXISTS bsql_tx_cancel_rollback").await.expect("drop table");
+    cleanup.close().await.expect("close cleanup");
 }
 
 #[tokio::test]

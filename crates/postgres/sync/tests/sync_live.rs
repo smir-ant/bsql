@@ -72,6 +72,125 @@ fn error_recovery_and_resilience() {
 
 #[test]
 #[ignore = "requires local PG"]
+fn recv_notification_failed_read_timeout_does_not_strand_the_token() {
+    // A zero Duration is rejected by the OS `set_read_timeout` syscall. That
+    // fallible call runs BEFORE the linear liveness token is taken, so its
+    // failure returns Err with the connection still alive — it must NOT be
+    // bricked, because nothing touched the wire.
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let r = c.recv_notification(std::time::Duration::ZERO);
+    assert!(r.is_err(), "a zero-duration read timeout is rejected by the OS");
+    assert!(
+        c.is_healthy(),
+        "a failed set_read_timeout must not strand the linear token / brick the connection",
+    );
+    // Prove it is genuinely reusable after the rejected timeout.
+    c.ping().expect("connection still usable");
+    assert_eq!(c.query_sql("SELECT 5::int4").expect("query").rows[0].get_i32(0), Some(5));
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn client_encoding_pinned_to_utf8_and_roundtrips_non_ascii() {
+    // The startup message forces client_encoding=UTF8 so the driver's UTF-8
+    // TEXT decode is correct regardless of the server's default encoding.
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    let enc = c.query_sql("SHOW client_encoding").expect("show").rows[0]
+        .get_str(0)
+        .map(String::from);
+    assert_eq!(enc.as_deref(), Some("UTF8"), "startup must pin client_encoding=UTF8");
+
+    // Non-ASCII (Cyrillic + emoji) round-trips byte-exact under the pinned UTF-8.
+    let text = "Привет, мир 🌍";
+    let r = c.query_sql(&format!("SELECT '{text}'::text")).expect("query");
+    assert_eq!(r.rows[0].get_str(0), Some(text));
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn mixed_width_multi_statement_is_rejected_not_misaddressed() {
+    // A single simple-query batch whose statements return DIFFERENT column
+    // counts cannot be one fixed-stride result set without mis-addressing
+    // cells. It must be a loud MixedResultWidth error, never silent wrong data.
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    let mixed = c.query_sql("SELECT 1::int4; SELECT 'a'::text, 'b'::text");
+    assert!(
+        matches!(mixed, Err(bsql_postgres_sync::DriverError::MixedResultWidth)),
+        "mixed-width batch must be rejected as MixedResultWidth, got {mixed:?}",
+    );
+    // The protocol completed cleanly (both statements ran server-side); only the
+    // client-side result shape is rejected, so the connection stays reusable.
+    assert!(c.is_healthy(), "connection stays healthy after a rejected result shape");
+    assert_eq!(
+        c.query_sql("SELECT 7::int4").expect("follow-up query works").rows[0].get_i32(0),
+        Some(7),
+    );
+
+    // A UNIFORM-width multi-statement batch is fine.
+    let uniform = c.query_sql("SELECT 1::int4; SELECT 2::int4").expect("uniform batch");
+    assert_eq!(uniform.rows.len(), 2);
+    assert_eq!(uniform.rows[0].get_i32(0), Some(1));
+    assert_eq!(uniform.rows[1].get_i32(0), Some(2));
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn listen_unlisten_reject_injection_shaped_channel() {
+    // LISTEN/UNLISTEN interpolate the channel name; an injection-shaped name
+    // must be a classified Config error, never spliced into SQL.
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    let hostile_listen = c.listen("ch; DROP TABLE x --");
+    assert!(
+        matches!(hostile_listen, Err(bsql_postgres_sync::DriverError::Config(_))),
+        "hostile LISTEN channel must be rejected as Config, got {hostile_listen:?}",
+    );
+    let hostile_unlisten = c.unlisten("ch\"; --");
+    assert!(
+        matches!(hostile_unlisten, Err(bsql_postgres_sync::DriverError::Config(_))),
+        "hostile UNLISTEN channel must be rejected as Config, got {hostile_unlisten:?}",
+    );
+    assert!(c.is_healthy(), "rejection happens before the wire is touched");
+
+    // A legitimate channel still works.
+    c.listen("bsql_valid_ch").expect("legit listen");
+    c.unlisten("bsql_valid_ch").expect("legit unlisten");
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn copy_in_rejects_injection_and_accepts_schema_qualified() {
+    // `COPY` interpolates the table name; an injection-shaped table must be a
+    // classified Config error, never spliced into SQL and executed.
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cp_inj(id int4)").expect("create");
+
+    let hostile = c.copy_in("cp_inj; DROP TABLE cp_inj --", vec!["1"]);
+    assert!(
+        matches!(hostile, Err(bsql_postgres_sync::DriverError::Config(_))),
+        "an injection-shaped table must be rejected as Config, got {hostile:?}",
+    );
+    // Validation runs before the wire is touched, so the connection is untouched.
+    assert!(c.is_healthy(), "connection stays healthy after a rejected table name");
+    // The injected DROP never ran — the table still exists — and a legit copy works.
+    assert_eq!(c.copy_in("cp_inj", vec!["1", "2"]).expect("legit copy"), 2);
+    // A schema-qualified `schema.table` is accepted.
+    assert_eq!(c.copy_in("pg_temp.cp_inj", vec!["3"]).expect("schema-qualified copy"), 1);
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_inj").expect("count").rows[0].get_i64(0),
+        Some(3),
+    );
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
 fn prepared_reuse_after_constraint_violation() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     c.execute_sql("CREATE TEMP TABLE pr_err(id int PRIMARY KEY)").expect("create");
@@ -130,7 +249,7 @@ fn pool() {
     for h in handles { h.join().expect("thread"); }
 }
 
-// ── S23 pool hardening (reset-on-return, acquire timeout, health eviction) ──
+// ── pool hardening (reset-on-return, acquire timeout, health eviction) ──
 
 #[test]
 #[ignore = "requires local PG"]

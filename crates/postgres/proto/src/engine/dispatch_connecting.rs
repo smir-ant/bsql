@@ -532,6 +532,13 @@ fn build_startup_message(
         w.push_u32_be(PROTOCOL_VERSION_3_0)?;
         w.push_nul_terminated(b"user")?;
         w.push_nul_terminated(user.as_bytes())?;
+        // Pin the session to UTF-8 regardless of the server's default
+        // client_encoding. The driver decodes every TEXT value as UTF-8
+        // (`str::from_utf8`); on a LATIN1 / SQL_ASCII server that assumption
+        // would otherwise be silently violated. Forcing UTF8 here makes the
+        // decode correct by construction.
+        w.push_nul_terminated(b"client_encoding")?;
+        w.push_nul_terminated(b"UTF8")?;
         if let Some(db) = database {
             w.push_nul_terminated(b"database")?;
             w.push_nul_terminated(db.as_bytes())?;

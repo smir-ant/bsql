@@ -43,7 +43,8 @@ const SCRAM_FUZZ_ITERS: u32 = 5_000;
 /// Byte length of the `user=corpus` startup packet — the offset at which the
 /// `SASLInitialResponse` begins in the client wire (mirrors
 /// `engine_connecting_spec`'s constant; the username below is `corpus`).
-const STARTUP_LEN: usize = 21;
+/// Includes the always-sent `client_encoding=UTF8` parameter.
+const STARTUP_LEN: usize = 42;
 
 // ─────────────────────────── PRNG ───────────────────────────
 

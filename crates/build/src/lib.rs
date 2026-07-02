@@ -920,8 +920,8 @@ fn column_info(column: &ColumnDef) -> ColumnInfo {
 /// (e.g. `BIGINT` -> `int8`, `INTEGER` -> `int4`). Unrecognised types
 /// pass through as their lowercased rendered form rather than being
 /// dropped — fail-open on the type *string* is acceptable here because
-/// the type is opaque to S9's table.column existence check; later
-/// slices that consume `pg_type` for Rust-type inference add their own
+/// the type is opaque to the table.column existence check; the
+/// `pg_type` consumers for Rust-type inference carry their own
 /// exhaustive mapping with its own fail-closed contract.
 fn canonical_type(data_type: &sqlparser::ast::DataType) -> String {
     let rendered = data_type.to_string().to_ascii_lowercase();

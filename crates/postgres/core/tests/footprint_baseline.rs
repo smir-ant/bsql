@@ -20,8 +20,8 @@
 use core::mem::{align_of, size_of};
 
 use bsql_postgres_core::{
-    ConnectConfig, DbError, DriverError, Notification, OwnedRow, OwnedRowTooLarge,
-    PreparedStatement, QueryResult, Row, RowTooLarge, SslMode,
+    ArenaSealError, ConnectConfig, DbError, DriverError, Notification, OwnedRow, OwnedRowTooLarge,
+    PreparedStatement, QueryResult, Row, SslMode,
 };
 
 /// `(size, align)` baseline for every stable public type of `bsql-postgres-core`.
@@ -34,7 +34,7 @@ fn core_stable_public_types_match_baseline() {
         (size_of::<Row>(), align_of::<Row>(), 16, 8, "Row"),
         (size_of::<OwnedRow>(), align_of::<OwnedRow>(), 16, 8, "OwnedRow"),
         (size_of::<OwnedRowTooLarge>(), align_of::<OwnedRowTooLarge>(), 0, 1, "OwnedRowTooLarge"),
-        (size_of::<RowTooLarge>(), align_of::<RowTooLarge>(), 0, 1, "RowTooLarge"),
+        (size_of::<ArenaSealError>(), align_of::<ArenaSealError>(), 1, 1, "ArenaSealError"),
         (size_of::<DriverError>(), align_of::<DriverError>(), 120, 8, "DriverError"),
         (size_of::<DbError>(), align_of::<DbError>(), 120, 8, "DbError"),
         (size_of::<ConnectConfig>(), align_of::<ConnectConfig>(), 112, 8, "ConnectConfig"),

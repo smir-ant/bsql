@@ -48,10 +48,18 @@ const TRUST_BACKEND_PID: i32 = 4321;
 
 /// The exact `StartupMessage` wire for the corpus's `user=corpus` (no database,
 /// no application_name) connection — the recorded client bytes for any scripted
-/// startup transcript.
+/// startup transcript. Carries the always-sent `client_encoding=UTF8` parameter
+/// after `user`.
 fn startup_wire() -> Vec<u8> {
     vec![
-        0, 0, 0, 21, 0, 3, 0, 0, 117, 115, 101, 114, 0, 99, 111, 114, 112, 117, 115, 0, 0,
+        0, 0, 0, 42, // length prefix (includes itself)
+        0, 3, 0, 0, // protocol version 3.0
+        117, 115, 101, 114, 0, // "user\0"
+        99, 111, 114, 112, 117, 115, 0, // "corpus\0"
+        // "client_encoding\0"
+        99, 108, 105, 101, 110, 116, 95, 101, 110, 99, 111, 100, 105, 110, 103, 0,
+        85, 84, 70, 56, 0, // "UTF8\0"
+        0, // trailing empty-key NUL
     ]
 }
 

@@ -32,6 +32,7 @@ use tokio::net::TcpStream;
 use tokio::time::Instant;
 
 use bsql_postgres_core::materialize::{self, ResultCollector};
+use bsql_postgres_core::sql_ident;
 use bsql_postgres_core::ssl::SslProbe;
 use bsql_postgres_core::tls::{self, TlsError, TlsTransport, Wire};
 use bsql_postgres_core::{
@@ -830,9 +831,14 @@ impl Connection {
         }
     }
 
-    /// Subscribe to a `LISTEN` channel (the name is validated as an identifier,
-    /// so it cannot inject SQL).
+    /// Subscribe to a `LISTEN` channel.
+    ///
+    /// The channel name is interpolated into `LISTEN <channel>`, so it is
+    /// validated as an unquoted identifier BEFORE interpolation — an
+    /// injection-shaped name is a classified [`DriverError::Config`], never
+    /// spliced into SQL.
     pub async fn listen(&mut self, channel: &str) -> Result<(), DriverError> {
+        sql_ident::validate_identifier(channel)?;
         let channel = Ident::try_from_str(channel)
             .map_err(|_| DriverError::Config("invalid channel name"))?;
         let live = self.take_live()?;
@@ -847,8 +853,14 @@ impl Connection {
         self.settle(outcome, &mut collector)
     }
 
-    /// Unsubscribe from a `LISTEN` channel (validated, no injection).
+    /// Unsubscribe from a `LISTEN` channel.
+    ///
+    /// The channel name is interpolated into `UNLISTEN <channel>`, so it is
+    /// validated as an unquoted identifier BEFORE interpolation — an
+    /// injection-shaped name is a classified [`DriverError::Config`], never
+    /// spliced into SQL.
     pub async fn unlisten(&mut self, channel: &str) -> Result<(), DriverError> {
+        sql_ident::validate_identifier(channel)?;
         let channel = Ident::try_from_str(channel)
             .map_err(|_| DriverError::Config("invalid channel name"))?;
         self.simple_query(&format!("UNLISTEN {}", channel.as_str()))
@@ -975,11 +987,17 @@ impl Connection {
     }
 
     /// `COPY <table> FROM STDIN`, streaming each row as a `CopyData` chunk.
+    ///
+    /// `COPY` has no parameterized form for the target table, so `table` is
+    /// interpolated into the SQL. It is validated as an unquoted identifier
+    /// (optionally `schema.table`) BEFORE interpolation — an injection-shaped
+    /// string is a classified [`DriverError::Config`], never spliced into SQL.
     pub async fn copy_in(
         &mut self,
         table: &str,
         rows_data: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<u64, DriverError> {
+        sql_ident::validate_table(table)?;
         let sql = format!("COPY {table} FROM STDIN");
         // Materialise each row + a trailing newline into an owned store the data
         // closure yields slices from: the engine's `data` callback borrows for

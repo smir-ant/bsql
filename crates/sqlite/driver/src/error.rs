@@ -110,20 +110,55 @@ pub enum SqliteError {
 // carrying a wider payload would widen it and trip this pin.
 crate::footprint_pin!(SqliteError, size = 32, align = 8);
 
+/// Low 8 bits of a SQLite extended result code — its PRIMARY code.
+///
+/// SQLite reports errors as EXTENDED codes of the form `primary | (sub << 8)`
+/// (e.g. `SQLITE_CONSTRAINT_UNIQUE = 2067` extends `SQLITE_CONSTRAINT = 19`,
+/// `SQLITE_BUSY_SNAPSHOT = 517` extends `SQLITE_BUSY = 5`). The primary code
+/// is the low byte; masking recovers the class from any subtype.
+const PRIMARY_CODE_MASK: i32 = 0xFF;
+
+/// Primary `SQLITE_BUSY`.
+const PRIMARY_BUSY: i32 = 5;
+
+/// Primary `SQLITE_CONSTRAINT`.
+const PRIMARY_CONSTRAINT: i32 = 19;
+
 impl SqliteError {
-    /// Check if this is a constraint violation (SQLITE_CONSTRAINT = 19).
+    /// The PRIMARY SQLite result code carried by a [`SqliteError::Sqlite`], if
+    /// any. [`From<rusqlite::Error>`] stores the full EXTENDED code; this masks
+    /// it to the low-byte primary so a class predicate matches every subtype.
+    fn primary_code(&self) -> Option<i32> {
+        match self {
+            Self::Sqlite { code: Some(c), .. } => Some(*c & PRIMARY_CODE_MASK),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a constraint violation (primary `SQLITE_CONSTRAINT`).
+    ///
+    /// Matches on the PRIMARY code, so every specific constraint the engine
+    /// reports as an extended code — `UNIQUE` (2067), `NOT NULL` (1299),
+    /// `FOREIGN KEY` (787), `PRIMARY KEY` (1555), `CHECK` (275), … — is
+    /// recognised, not just a bare `19`.
     #[must_use]
     pub fn is_constraint_violation(&self) -> bool {
-        matches!(self, Self::Sqlite { code: Some(c), .. } if *c == 19)
+        self.primary_code() == Some(PRIMARY_CONSTRAINT)
     }
 
-    /// Check if this is a busy/locked error (SQLITE_BUSY = 5).
+    /// Check if this is a busy/locked error (primary `SQLITE_BUSY`).
+    ///
+    /// Matches on the PRIMARY code, so `SQLITE_BUSY_SNAPSHOT` (517) — the code
+    /// the driver's default WAL journaling yields on a write conflict — counts
+    /// as busy, not just a bare `5`.
     #[must_use]
     pub fn is_busy(&self) -> bool {
-        matches!(self, Self::Sqlite { code: Some(c), .. } if *c == 5)
+        self.primary_code() == Some(PRIMARY_BUSY)
     }
 
-    /// SQLite error code, if available.
+    /// SQLite EXTENDED error code, if available (the full `primary | sub << 8`;
+    /// the specific subtype is preserved here — only the boolean class
+    /// predicates mask to the primary code).
     #[must_use]
     pub fn code(&self) -> Option<i32> {
         match self {
