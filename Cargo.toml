@@ -7,6 +7,11 @@ members = [
     "crates/postgres/async",
     "crates/postgres/sync",
     "crates/sqlite/driver",
+    # Consumer-facing testkit: a deterministic in-memory fake PostgreSQL a
+    # consumer runs its driver-using tests against with no network. Publishable;
+    # turns on the `testkit` feature of the async driver + core (the `Wire::Fake`
+    # transport arm), which are gated OFF in a production build.
+    "crates/testkit",
     # Build-time helper for the compile-checked query API. A publishable
     # crate consumers add to `[build-dependencies]` ONLY — NEVER a runtime
     # dependency of any shipped library. The `runtime_graph_pin` gate

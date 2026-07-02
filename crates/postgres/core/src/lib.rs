@@ -15,6 +15,11 @@ pub mod footprint;
 pub mod materialize;
 pub mod sql_ident;
 pub mod ssl;
+// The in-memory fake PostgreSQL backend behind the engine's transport seam.
+// Feature-gated OFF by default so the real transport path — and the shipped
+// runtime closure — is untouched unless a consumer opts into the testkit.
+#[cfg(feature = "testkit")]
+pub mod testkit;
 pub mod tls;
 // The bounded, typed result of a compile-checked `query!` — `Rows<Q>` plus the
 // `RowsBuilder` prebuffer collector both drivers feed.

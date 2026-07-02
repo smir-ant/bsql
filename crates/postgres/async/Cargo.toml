@@ -6,6 +6,15 @@ rust-version = "1.95"
 description = "Async PostgreSQL driver built on bsql-pg-proto sans-IO state machine"
 license = "MIT OR Apache-2.0"
 
+[features]
+# `testkit` — expose `Connection::connect_fake`, which drives the full
+# startup/query engine path over the in-memory `core::testkit::FakeTransport`
+# instead of a socket. OFF by default: it only turns on the core `testkit`
+# feature (the `Wire::Fake` arm) and adds a feature-gated constructor; the real
+# TCP/TLS `connect` path and every other method are untouched. The
+# consumer-facing `bsql-testkit` crate turns this on.
+testkit = ["bsql-postgres-core/testkit"]
+
 [dependencies]
 bsql-postgres-core = { path = "../core" }
 bsql-postgres-proto = { path = "../proto" }

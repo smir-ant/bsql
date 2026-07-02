@@ -136,6 +136,13 @@ pub mod sqlite {
     pub use bsql_sqlite::*;
 }
 
+#[cfg(feature = "testkit")]
+pub mod testkit {
+    //! Deterministic in-memory fake PostgreSQL for testing driver code with no
+    //! network. Gated OFF by default so a production build never pulls it.
+    pub use bsql_testkit::*;
+}
+
 // ════════════════════════════════════════════════════════════════════
 // Compile-checked query API (feature `macros`)
 // ════════════════════════════════════════════════════════════════════

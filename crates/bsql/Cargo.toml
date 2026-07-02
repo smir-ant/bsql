@@ -12,6 +12,12 @@ postgres-async = ["dep:bsql-postgres-async"]
 postgres-sync = ["dep:bsql-postgres-sync"]
 sqlite = ["dep:bsql-sqlite"]
 
+# `testkit` — the deterministic in-memory fake PostgreSQL (`bsql::testkit`), for
+# testing driver code with no network. NON-default: a production build never
+# pulls it. It turns on the async driver's + core's `testkit` feature (the
+# `Wire::Fake` transport arm), so it composes with the `postgres-async` backend.
+testkit = ["dep:bsql-testkit"]
+
 # `macros` — the compile-checked query API, reachable through this one crate.
 # It re-exports the `query!` proc-macro plus every runtime primitive the
 # macro's expansion names (via the hidden `__rt` module) and the user-facing
@@ -37,6 +43,10 @@ macros-sqlite = ["macros", "bsql-query-macros/sqlite"]
 bsql-postgres-async = { path = "../postgres/async", optional = true }
 bsql-postgres-sync = { path = "../postgres/sync", optional = true }
 bsql-sqlite = { path = "../sqlite/driver", optional = true }
+
+# Behind `testkit` only — the in-memory fake PostgreSQL. It re-enables the async
+# driver's + core's `testkit` feature, so it is inert unless a consumer opts in.
+bsql-testkit = { path = "../testkit", optional = true }
 
 # Behind `macros` only. `bsql-query-macros` is a proc-macro (host-only,
 # compile-time); `bsql-postgres-proto` (sans-IO decode primitives the macro's

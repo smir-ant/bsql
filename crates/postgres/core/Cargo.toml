@@ -6,6 +6,16 @@ rust-version = "1.95"
 description = "Shared types and Session for bsql PostgreSQL drivers (async + sync)"
 license = "MIT OR Apache-2.0"
 
+[features]
+# `testkit` — the in-memory fake PostgreSQL backend (`testkit::FakeTransport`)
+# plus the `Wire::Fake` arm that plugs it behind the engine's transport seam.
+# OFF by default: a production consumer that never uses the fake pays nothing
+# and does not compile the extra arm, so the real plaintext/TLS transport path
+# stays byte-identical. Additive and dependency-free (the reply encoder is built
+# over the already-present proto wire vocabulary). The consumer-facing
+# `bsql-testkit` crate turns this on.
+testkit = []
+
 [dependencies]
 bsql-postgres-proto = { path = "../proto" }
 rustls = { workspace = true }

@@ -220,6 +220,52 @@ impl Connection {
         }
     }
 
+    /// Open a connection over an in-memory
+    /// [`FakeTransport`](bsql_postgres_core::testkit::FakeTransport) instead of a
+    /// socket — the testkit entry point.
+    ///
+    /// It drives the real startup/auth handshake and every subsequent verb
+    /// through the SAME engine the TCP path uses, so the returned `Connection`
+    /// is a genuine connection — same methods, same decode — backed by the
+    /// fake's scripted replies with no network. There is no SSL negotiation
+    /// (the fake is plaintext by construction), so `connect_fake` skips the
+    /// socket build entirely and plugs the fake straight into the `Wire::Fake`
+    /// arm.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`DriverError`] if the fake's handshake bytes are not a
+    /// clean trust-auth chain the engine accepts — never a panic.
+    #[cfg(feature = "testkit")]
+    pub async fn connect_fake(
+        fake: bsql_postgres_core::testkit::FakeTransport,
+    ) -> Result<Self, DriverError> {
+        let wire: AsyncWire = Wire::Fake(Box::new(fake));
+        // The fake never blocks, so it ignores the read deadline; a fresh
+        // disarmed cell satisfies the struct invariant.
+        let read_deadline = Arc::new(ReadDeadline::new());
+        let user = Ident::try_from_str("bsql_testkit")
+            .map_err(|_| DriverError::Config("invalid testkit user name"))?;
+        let (mut engine, live) = engine::open_owned(wire, &user, None, None, Credentials::Trust)
+            .map_err(lift_conn_fail)?;
+        let live = engine.connect(live).await.map_err(lift_engine_error)?;
+        let backend_pid = engine.backend_pid().map_err(|_| DriverError::NotReady)?;
+        let server_version = engine
+            .server_version()
+            .map_err(|_| DriverError::NotReady)?
+            .map(str::to_owned);
+        Ok(Self {
+            engine,
+            live: Some(live),
+            read_deadline,
+            params: SessionParams {
+                server_version,
+                backend_pid,
+            },
+            stmt_counter: 0,
+        })
+    }
+
     /// Take the liveness token, or classify a dead connection.
     fn take_live(&mut self) -> Result<Live<'static>, DriverError> {
         self.live.take().ok_or(DriverError::NotReady)

@@ -669,6 +669,16 @@ pub enum Wire<S: Transport> {
     /// embeds it — small for the plaintext common case. The deref is per
     /// syscall, never per row.
     Tls(Box<TlsTransport<S>>),
+    /// An in-memory fake PostgreSQL backend ([`crate::testkit::FakeTransport`]),
+    /// plugged in behind this same seam for tests — no socket, no network.
+    ///
+    /// Boxed so the plaintext/TLS `Wire` size is unchanged (a bare pointer, no
+    /// bigger than the `Tls` arm), and feature-gated so it does not exist at all
+    /// in a production build: the real transport path stays byte-identical. `S`
+    /// is unused in this arm — the fake carries its own buffers — so a
+    /// `Wire<TokioSocket>` can be in the `Fake` arm with no socket present.
+    #[cfg(feature = "testkit")]
+    Fake(Box<crate::testkit::FakeTransport>),
 }
 
 impl<S: Transport> Transport for Wire<S> {
@@ -701,6 +711,11 @@ impl<S: Transport> Transport for Wire<S> {
         match self {
             Wire::Plain(s) => s.read(buf).await.map_err(TlsError::Socket),
             Wire::Tls(t) => t.read(buf).await,
+            // The fake is infallible (`Infallible` error): the empty match
+            // coerces the never type onto the shared error union, no fabricated
+            // error value.
+            #[cfg(feature = "testkit")]
+            Wire::Fake(f) => f.read(buf).await.map_err(|e| match e {}),
         }
     }
 
@@ -709,6 +724,8 @@ impl<S: Transport> Transport for Wire<S> {
         match self {
             Wire::Plain(s) => s.write(buf).await.map_err(TlsError::Socket),
             Wire::Tls(t) => t.write(buf).await,
+            #[cfg(feature = "testkit")]
+            Wire::Fake(f) => f.write(buf).await.map_err(|e| match e {}),
         }
     }
 
@@ -717,6 +734,8 @@ impl<S: Transport> Transport for Wire<S> {
         match self {
             Wire::Plain(s) => s.flush().await.map_err(TlsError::Socket),
             Wire::Tls(t) => t.flush().await,
+            #[cfg(feature = "testkit")]
+            Wire::Fake(f) => f.flush().await.map_err(|e| match e {}),
         }
     }
 
@@ -725,6 +744,8 @@ impl<S: Transport> Transport for Wire<S> {
         match self {
             Wire::Plain(s) => s.shutdown().await.map_err(TlsError::Socket),
             Wire::Tls(t) => t.shutdown().await,
+            #[cfg(feature = "testkit")]
+            Wire::Fake(f) => f.shutdown().await.map_err(|e| match e {}),
         }
     }
 }

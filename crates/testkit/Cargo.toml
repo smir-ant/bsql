@@ -1,0 +1,25 @@
+[package]
+name = "bsql-testkit"
+version = "0.1.0-alpha.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Deterministic in-memory fake PostgreSQL for testing bsql driver code with no network"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# The testkit turns on the `testkit` feature of both the async driver (for the
+# `Connection::connect_fake` entry) and core (for `FakeTransport` + the reply
+# encoder). Both are already resolved workspace members, so this adds NO new
+# external package to the lockfile — only the `bsql-testkit` package itself.
+bsql-postgres-async = { path = "../postgres/async", features = ["testkit"] }
+bsql-postgres-core = { path = "../postgres/core", features = ["testkit"] }
+
+# Inherit the workspace FORBID floor (the two-tier lint wall).
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The demo test uses `#[tokio::test]`. Like the async driver, the LIBRARY needs
+# no runtime (`connect`/`query_sql` only `.await`, never spawn), so tokio is a
+# dev-only edge — a consumer of the testkit brings its own runtime.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
