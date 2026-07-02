@@ -3,5 +3,5 @@
 // inference-validated against the migration-replayed schema, so an
 // ordering "outside the allow-set" of real columns cannot compile.
 fn main() {
-    bsql_query_macros::query!(Row, "SELECT id FROM orders ORDER BY { nonexistent ASC }");
+    bsql::query!(Row, "SELECT id FROM orders ORDER BY { nonexistent ASC }");
 }

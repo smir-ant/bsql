@@ -2,9 +2,9 @@
 // (type, nullable) agrees between the inference lattice and real SQLite.
 // The OPTIONAL(...) toggle's full scan is acknowledged with the recognized
 // marker, so it is accepted.
-bsql_query_macros::query!(Ok1, "SELECT id, email, name FROM users");
-bsql_query_macros::query!(Ok2, "SELECT id, user_id, total FROM orders");
-bsql_query_macros::query!(
+bsql::query!(Ok1, "SELECT id, email, name FROM users");
+bsql::query!(Ok2, "SELECT id, user_id, total FROM orders");
+bsql::query!(
     Ok3,
     "SELECT id FROM users WHERE OPTIONAL(name = $1) \
      /* bsql:allow-scan: small lookup table; revisit when it grows */"
@@ -16,7 +16,7 @@ bsql_query_macros::query!(
 // `users.name`, the conformance nullability check applies only to a genuine
 // base-column reference (an expression has no SQLite decltype). The aliased
 // expression is left to the lattice, so this valid query is ACCEPTED.
-bsql_query_macros::query!(Ok4, "SELECT COALESCE(name, 'x') AS name FROM users");
+bsql::query!(Ok4, "SELECT COALESCE(name, 'x') AS name FROM users");
 
 // An OPTIONAL($1) toggle combined with a `= ANY($2)` in-list on a DIFFERENT
 // param. The full-scan check runs on a SQLite-preparable SCAN form: the
@@ -25,7 +25,7 @@ bsql_query_macros::query!(Ok4, "SELECT COALESCE(name, 'x') AS name FROM users");
 // function `ANY`). The toggle's scan is acknowledged, so it is ACCEPTED — this
 // is the valid OPTIONAL + `= ANY($M)` combination the wire-form scan check
 // used to falsely reject.
-bsql_query_macros::query!(
+bsql::query!(
     Ok5,
     "SELECT id FROM users WHERE OPTIONAL(name = $1) AND id = ANY($2) \
      /* bsql:allow-scan: small lookup table; revisit when it grows */"

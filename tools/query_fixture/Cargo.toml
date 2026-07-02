@@ -12,16 +12,15 @@ description = "Fixture consumer exercising the bsql compile-checked query chain 
 publish = false
 
 [dependencies]
-# The query proc-macro under test. (Runtime/expansion only — it ships no
-# runtime types.)
-bsql-query-macros = { path = "../../crates/query-macros" }
-
-# The SHIPPED runtime decode primitives the `query!` macro's emitted code
-# references (`DataRowRef`, `ColumnsIter`, `Cell<BinaryFmt>`,
-# `DecodeError`). This is the exact runtime dependency a real consumer of
-# `query!` carries — the build-time `bsql-build` / `sqlparser` never enter
-# this crate's runtime closure (they are a `[build-dependencies]` edge).
-bsql-postgres-proto = { path = "../../crates/postgres/proto" }
+# The umbrella crate, and the ONLY runtime dependency of this fixture's own
+# code (`src/lib.rs`). Reaching the flagship `query!` through `bsql` alone —
+# `bsql::query!`, whose expansion names only `::bsql::__rt::` paths — is the
+# whole point this fixture proves: a real consumer hand-wires nothing. The
+# build-time `bsql-build` / `sqlparser` stay in `[build-dependencies]`, and
+# `bsql-query-macros` (a host-only proc-macro pulled by the `macros` feature)
+# never enters this crate's runtime closure. `default-features = false` keeps
+# the runtime surface minimal — just the compile-checked query API, no driver.
+bsql = { path = "../../crates/bsql", default-features = false, features = ["macros"] }
 
 [build-dependencies]
 # BUILD-DEPENDENCY ONLY. This is the exact placement a real consumer
@@ -35,6 +34,17 @@ bsql-build = { path = "../../crates/build" }
 # the freshness transitions (a removed column makes a once-valid
 # reference fail to compile).
 trybuild = { workspace = true }
+
+# `bsql-postgres-proto` — DEV-ONLY. The fixture's own consumer code
+# (`src/lib.rs`) reaches everything through `bsql` alone; these WHITE-BOX
+# tests deliberately poke sans-IO internals (`params::ParamsWriter`,
+# `WriteBuf`, `engine::*`, the seal's `prepared::new_prepared_query`) that a
+# real consumer never touches, so they name the proto crate directly. Already
+# a resolved workspace member (pulled at runtime by `bsql`'s `macros` feature
+# and by the driver dev-deps), so this dev edge adds no package to the
+# lockfile (`deps_pin` unchanged) and is excluded from every shipped crate's
+# runtime graph (`runtime_graph_pin` unchanged — dev edges are not `-e normal`).
+bsql-postgres-proto = { path = "../../crates/postgres/proto" }
 
 # `bsql-devgates` — dev-only harness hosting the workspace's counting
 # allocator. The `query!` allocation test installs it as the test

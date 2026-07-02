@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-bsql_query_macros::query!(SealWireTemplate, "SELECT id FROM users");
+bsql::query!(SealWireTemplate, "SELECT id FROM users");
 
 fn main() {
     let _hostile_bytes: &[u8] = SealWireTemplateQuery::PREPARED.parse_template;

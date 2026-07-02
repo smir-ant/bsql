@@ -1,7 +1,7 @@
 error[E0080]: evaluation panicked: query!: too many runtime ORDER BY orderings in one query
   --> tests/compile_fail/query_order_by_budget_exceeded.rs:7:5
    |
- 7 | /     bsql_query_macros::query!(
+ 7 | /     bsql::query!(
  8 | |         Row,
  9 | |         "SELECT id FROM wide ORDER BY { \
 10 | |          c1 ASC | c2 ASC | c3 ASC | c4 ASC | c5 ASC | c6 ASC | \

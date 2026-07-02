@@ -1,5 +1,5 @@
 error: query!: relation `users` has no column `nope`
- --> tests/compile_fail/unknown_column.rs:4:36
+ --> tests/compile_fail/unknown_column.rs:4:23
   |
-4 |     bsql_query_macros::query!(Row, "SELECT nope FROM users");
-  |                                    ^^^^^^^^^^^^^^^^^^^^^^^^
+4 |     bsql::query!(Row, "SELECT nope FROM users");
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^

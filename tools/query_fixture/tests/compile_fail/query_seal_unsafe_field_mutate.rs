@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-bsql_query_macros::query!(SealUnsafeMutate, "SELECT id FROM users");
+bsql::query!(SealUnsafeMutate, "SELECT id FROM users");
 
 fn main() {
     unsafe {

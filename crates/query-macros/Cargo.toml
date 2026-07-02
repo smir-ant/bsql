@@ -52,11 +52,14 @@ sha2 = { workspace = true }
 # `query!`. It enables `bsql-build`'s `sqlite` feature (the build-time-only
 # `rusqlite` edge) so the proc-macro can call `verify_sqlite_conformance`
 # at expansion. A consumer that also targets SQLite enables this feature
-# AND calls `bsql_build::emit_sqlite_template` in its `build.rs`; the
-# cross-check then runs for every `query!`. A PG-only consumer leaves it
-# off and compiles no SQLite. Even with the feature on, the cross-check is
-# skipped unless the `BSQL_SQLITE_TEMPLATE` env channel is present, so a
-# consumer whose `build.rs` did not emit a template is never affected. This
+# AND calls `bsql_build::emit` (with `bsql-build`'s `sqlite` feature) in its
+# `build.rs`; the cross-check then runs for every `query!`. A PG-only consumer
+# leaves it off and compiles no SQLite. With the feature on: a build that
+# emitted a template runs the cross-check; a build that DECLARED a SQLite
+# target (the `BSQL_SQLITE_TARGET` marker) but emitted no template is a loud
+# `compile_error!`, never a silent skip; a build that declared no target (e.g.
+# a PostgreSQL-only sibling reached by feature unification in the same
+# workspace) is unaffected. This
 # crate is itself build-time-only (a proc-macro that ships no runtime
 # types), so the `runtime_graph_pin` boundary is unaffected: no shipped
 # crate depends on it, so `rusqlite`-at-validation never enters a shipped

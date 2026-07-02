@@ -13,18 +13,16 @@ description = "Fixture consumer exercising the bsql SQLite build-time validation
 publish = false
 
 [dependencies]
-# The query proc-macro, with its SQLite conformance cross-check ENABLED:
-# turning on the `sqlite` feature pulls the build-time-only SQLite
-# validation toolchain so `query!` cross-checks every query against the
-# template DB. (Runtime/expansion only — it ships no runtime types.)
-bsql-query-macros = { path = "../../crates/query-macros", features = ["sqlite"] }
-
-# The SHIPPED runtime decode primitives the `query!` macro's emitted code
-# references. The build-time SQLite toolchain (rusqlite, bsql-build,
-# sqlparser) never enters this crate's runtime closure — it is reachable
-# only through the `[build-dependencies]` edge below and the build-time-only
-# proc-macro.
-bsql-postgres-proto = { path = "../../crates/postgres/proto" }
+# The umbrella crate, and the ONLY runtime dependency of this fixture's own
+# code. `macros` reaches the flagship `query!` (its expansion names only
+# `::bsql::__rt::` paths); `macros-sqlite` turns ON the macro's build-time
+# SQLite conformance cross-check (pulling the build-time-only SQLite
+# validation toolchain, host/expansion only). This is the exact wiring a real
+# SQLite-targeting consumer uses: `bsql` with `["macros", "macros-sqlite"]`
+# plus the `[build-dependencies]` catalog+template generator below. The
+# build-time SQLite toolchain (rusqlite, bsql-build, sqlparser) never enters
+# this crate's runtime closure — `bsql-query-macros` is a host-only proc-macro.
+bsql = { path = "../../crates/bsql", default-features = false, features = ["macros", "macros-sqlite"] }
 
 [build-dependencies]
 # BUILD-DEPENDENCY ONLY, with the `sqlite` feature on: bsql-build both

@@ -13,18 +13,18 @@
 // All-portable row: `id` is a NOT NULL `BIGINT` (the PK), `email` is a NOT
 // NULL `TEXT`, `name` is a nullable `TEXT`. SQLite agrees on all three
 // (the PK is reconciled to NOT NULL despite SQLite's table_info quirk).
-bsql_query_macros::query!(UserRow, "SELECT id, email, name FROM users");
+bsql::query!(UserRow, "SELECT id, email, name FROM users");
 
 // Mixed nullability: `id`/`user_id` NOT NULL `int8`, `total` nullable
 // `int4`. SQLite's decltype + table_info agree with the lattice.
-bsql_query_macros::query!(OrderRow, "SELECT id, user_id, total FROM orders");
+bsql::query!(OrderRow, "SELECT id, user_id, total FROM orders");
 
 // A dynamic OPTIONAL(...) toggle filter whose enabled form forces a
 // full-table scan (the `$1 IS NULL OR ...` shape defeats every index). The
 // scan is ACKNOWLEDGED with the recognized marker + a documented return
 // plan, so the conformance check accepts it. (Without the marker this is a
 // build error — see the trybuild gate.)
-bsql_query_macros::query!(
+bsql::query!(
     OptUser,
     "SELECT id, email FROM users WHERE OPTIONAL(name = $1) \
      /* bsql:allow-scan: `users` is a small lookup table, so a full scan \

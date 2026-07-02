@@ -55,7 +55,10 @@ name = "bsql"
 version = "0.1.0-alpha.0"
 dependencies = [
  "bsql-postgres-async",
+ "bsql-postgres-core",
+ "bsql-postgres-proto",
  "bsql-postgres-sync",
+ "bsql-query-macros",
  "bsql-sqlite",
 ]
 
@@ -142,13 +145,13 @@ dependencies = [
 name = "bsql-query-fixture"
 version = "0.0.0"
 dependencies = [
+ "bsql",
  "bsql-build",
  "bsql-devgates",
  "bsql-postgres-async",
  "bsql-postgres-core",
  "bsql-postgres-proto",
  "bsql-postgres-sync",
- "bsql-query-macros",
  "criterion",
  "tokio",
  "trybuild",
@@ -169,9 +172,8 @@ dependencies = [
 name = "bsql-query-sqlite-fixture"
 version = "0.0.0"
 dependencies = [
+ "bsql",
  "bsql-build",
- "bsql-postgres-proto",
- "bsql-query-macros",
  "trybuild",
 ]
 

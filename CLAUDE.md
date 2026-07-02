@@ -77,11 +77,18 @@ the package SET and is dependency-kind-blind — it cannot tell a runtime edge
 from a build edge.
 
 The `runtime_graph_pin` gate (`tools/devgates/tests/runtime_graph_pin.rs`)
-covers that blind spot: it parses each shipped crate's `cargo tree -e normal`
-(runtime) graph and asserts the build-time-only query toolchain — `sqlparser`,
-`bsql-build`, `bsql-query-macros` — is absent. Moving `bsql-build` from
+covers that blind spot: it parses each shipped crate's
+`cargo tree --all-features -e normal,no-proc-macro` (runtime) graph and asserts
+the build-time-only SQL-parsing libraries — `sqlparser` and `bsql-build` — are
+absent. `--all-features` makes the check exhaustive (it activates the umbrella
+crate's non-default `macros` feature, which pulls the `bsql-query-macros`
+proc-macro); `no-proc-macro` models runtime LINKAGE faithfully (a proc-macro
+runs in the compiler and is never linked into the consumer's runtime binary, so
+the host-only `bsql -> bsql-query-macros` edge — and `bsql-build` / `sqlparser`
+reached only through it — is correctly excluded). Moving `bsql-build` from
 `[build-dependencies]` into a shipped crate's `[dependencies]` would leak
-`sqlparser` into the runtime/forbid closure; `deps_pin` stays green on that, but
+`sqlparser` into the runtime/forbid closure via a NORMAL-library edge that
+`no-proc-macro` does NOT prune; `deps_pin` stays green on that, but
 `runtime_graph_pin` turns red.
 
 The `doc_links` gate (`tools/devgates/tests/doc_links.rs`) is the intra-doc-link

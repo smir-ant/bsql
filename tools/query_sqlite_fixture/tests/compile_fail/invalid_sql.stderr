@@ -1,5 +1,5 @@
 error: query!: SQL parse error: sql parser error: Expected: identifier, found: EOF
- --> tests/compile_fail/invalid_sql.rs:4:36
+ --> tests/compile_fail/invalid_sql.rs:4:23
   |
-4 |     bsql_query_macros::query!(Row, "SELECT id FROM");
-  |                                    ^^^^^^^^^^^^^^^^
+4 |     bsql::query!(Row, "SELECT id FROM");
+  |                       ^^^^^^^^^^^^^^^^

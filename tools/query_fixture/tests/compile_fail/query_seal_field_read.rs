@@ -5,7 +5,7 @@
 //! field itself is private. The query is built by the compile-checked
 //! `query!` macro — the seal holds for the sanctioned builder's output.
 
-bsql_query_macros::query!(SealFieldRead, "SELECT id FROM users");
+bsql::query!(SealFieldRead, "SELECT id FROM users");
 
 fn main() {
     let _hostile: &str = SealFieldReadQuery::PREPARED.sql;

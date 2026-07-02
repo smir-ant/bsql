@@ -4,5 +4,5 @@
 // loud compile error. Adding a `/* bsql:allow-scan: <reason> */` marker
 // (see the compile_pass case) would accept it.
 fn main() {
-    bsql_query_macros::query!(Row, "SELECT id FROM users WHERE OPTIONAL(name = $1)");
+    bsql::query!(Row, "SELECT id FROM users WHERE OPTIONAL(name = $1)");
 }

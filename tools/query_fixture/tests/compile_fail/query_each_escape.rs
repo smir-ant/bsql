@@ -13,7 +13,7 @@ use core::ops::ControlFlow;
 
 use bsql_postgres_sync::Connection;
 
-bsql_query_macros::query!(Escape, "SELECT 'x'::text AS s");
+bsql::query!(Escape, "SELECT 'x'::text AS s");
 
 fn escape(conn: &mut Connection) {
     // `v` outlives the closure. Pushing the borrowed record into it would let the

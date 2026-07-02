@@ -6,7 +6,7 @@
 //! of the SQL (`bsql_q_<24 hex>`); its length is pinned by the `query!` wire
 //! tests.
 
-bsql_query_macros::query!(SealStmtNameRead, "SELECT id FROM users");
+bsql::query!(SealStmtNameRead, "SELECT id FROM users");
 
 fn main() {
     let _hostile: &str = SealStmtNameReadQuery::PREPARED.stmt_name;

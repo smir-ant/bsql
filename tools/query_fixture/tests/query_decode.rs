@@ -22,16 +22,16 @@ use bsql_postgres_proto::DecodeError;
 // All-fixed-width, all-NOT-NULL row: both columns are `int8` (the PK and
 // a NOT NULL FK), so the borrowed record carries no lifetime and the
 // decode emits the vectorized fast path.
-bsql_query_macros::query!(OrderKey, "SELECT id, user_id FROM orders");
+bsql::query!(OrderKey, "SELECT id, user_id FROM orders");
 
 // Mixed: `id` is NOT NULL `int8`, `total` is nullable `int4`, `status` is
 // nullable `text`. The text column makes the borrowed record carry `<'q>`
 // and forces the per-cell decode path.
-bsql_query_macros::query!(OrderRow, "SELECT id, total, status FROM orders");
+bsql::query!(OrderRow, "SELECT id, total, status FROM orders");
 
 // NOT-NULL text: `id` `int8`, `email` NOT NULL `text`. The borrowed
 // `email` aliases the input bytes (zero-copy).
-bsql_query_macros::query!(UserNames, "SELECT id, email FROM users");
+bsql::query!(UserNames, "SELECT id, email FROM users");
 
 // ── canned DataRow payloads ────────────────────────────────────────────
 

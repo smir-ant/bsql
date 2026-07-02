@@ -29,51 +29,51 @@ use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 // One column, fixed-width, NOT NULL -> the borrowed record carries no lifetime
 // (`One { n: i32 }`) and decodes through the vectorized fast path.
-bsql_query_macros::query!(One, "SELECT 1::int4 AS n");
+bsql::query!(One, "SELECT 1::int4 AS n");
 // A distinct literal (distinct SQL -> distinct content address) — a second shape
 // for `query_one`.
-bsql_query_macros::query!(Seven, "SELECT 7::int4 AS n");
+bsql::query!(Seven, "SELECT 7::int4 AS n");
 // One TEXT column, NOT NULL -> the borrowed record carries `<'q>` and `s` aliases
 // the prebuffer (`Hi<'q> { s: &'q str }`).
-bsql_query_macros::query!(Hi, "SELECT 'hello'::text AS s");
+bsql::query!(Hi, "SELECT 'hello'::text AS s");
 // Multi-row via a `VALUES` derived table (no real table needed). The `int4` cast
 // on the first row types the column; `n` is NOT NULL.
-bsql_query_macros::query!(Nums, "SELECT n FROM (VALUES (10::int4), (20), (30)) AS t(n)");
+bsql::query!(Nums, "SELECT n FROM (VALUES (10::int4), (20), (30)) AS t(n)");
 // Zero rows (a literal SELECT filtered out) -> `query_one` must classify
 // `NoRows`.
-bsql_query_macros::query!(NoneRow, "SELECT 1::int4 AS n WHERE false");
+bsql::query!(NoneRow, "SELECT 1::int4 AS n WHERE false");
 // Multi-row again (distinct SQL) -> `query_one` must classify `TooManyRows`.
-bsql_query_macros::query!(Many, "SELECT n FROM (VALUES (1::int4), (2)) AS t(n)");
+bsql::query!(Many, "SELECT n FROM (VALUES (1::int4), (2)) AS t(n)");
 // An INT param -> exercises the `(i32,)` binary-bind path end-to-end.
-bsql_query_macros::query!(Echo, "SELECT $1::int4 AS n");
+bsql::query!(Echo, "SELECT $1::int4 AS n");
 // A TEXT param -> exercises the `&str` binary-bind path end-to-end.
-bsql_query_macros::query!(EchoS, "SELECT $1::text AS s");
+bsql::query!(EchoS, "SELECT $1::text AS s");
 // A NULL cast -> the inference engine types it nullable, so the record field is
 // `Option<i32>`; it must decode to `None`.
-bsql_query_macros::query!(WithNull, "SELECT NULL::int4 AS n");
+bsql::query!(WithNull, "SELECT NULL::int4 AS n");
 // A `VALUES` column with a NULL row -> nullable `Option<i32>`, carrying BOTH a
 // present value (`Some`) and a NULL (`None`) in one result.
-bsql_query_macros::query!(MaybeNum, "SELECT n FROM (VALUES (7::int4), (NULL)) AS t(n)");
+bsql::query!(MaybeNum, "SELECT n FROM (VALUES (7::int4), (NULL)) AS t(n)");
 // A distinct literal for the repeat / plan-reuse probes.
-bsql_query_macros::query!(RepeatLit, "SELECT 100::int4 AS n");
+bsql::query!(RepeatLit, "SELECT 100::int4 AS n");
 // Distinct literals for the transactional 42P05-gone probes.
-bsql_query_macros::query!(TxLit, "SELECT 11::int4 AS n");
-bsql_query_macros::query!(MultiTxLit, "SELECT 22::int4 AS n");
-bsql_query_macros::query!(HealLit, "SELECT 33::int4 AS n");
+bsql::query!(TxLit, "SELECT 11::int4 AS n");
+bsql::query!(MultiTxLit, "SELECT 22::int4 AS n");
+bsql::query!(HealLit, "SELECT 33::int4 AS n");
 // A five-row VALUES stream for the `query_each` streaming / early-break probes.
-bsql_query_macros::query!(
+bsql::query!(
     StreamAll,
     "SELECT n FROM (VALUES (1::int4), (2), (3), (4), (5)) AS t(n)"
 );
 // A distinct five-row stream for the transaction probe (distinct SQL -> distinct
 // content-addressed statement, so it does not collide with StreamAll).
-bsql_query_macros::query!(
+bsql::query!(
     StreamTx,
     "SELECT n FROM (VALUES (10::int4), (20), (30), (40), (50)) AS t(n)"
 );
 // A param-filtered stream: `$1` caps the rows returned, exercising `query_each`
 // with a bound parameter.
-bsql_query_macros::query!(
+bsql::query!(
     StreamParam,
     "SELECT n FROM (VALUES (1::int4), (2), (3), (4), (5)) AS t(n) WHERE n <= $1::int4"
 );
@@ -81,20 +81,20 @@ bsql_query_macros::query!(
 // ── widened types: float4 / float8 / bytea ──────────────────────────────
 // Two fixed-width floats, NOT NULL -> the const-offset fast path; `1.5`/`2.5`
 // are exact in IEEE-754 so `==` is an exact comparison.
-bsql_query_macros::query!(Fl, "SELECT 1.5::float8 AS x, 2.5::float4 AS y");
+bsql::query!(Fl, "SELECT 1.5::float8 AS x, 2.5::float4 AS y");
 // A NULL float -> the record field is `Option<f64>`, decoding to `None`.
-bsql_query_macros::query!(NullFloat, "SELECT NULL::float8 AS x");
+bsql::query!(NullFloat, "SELECT NULL::float8 AS x");
 // A `bytea` literal -> borrowed `&'q [u8]` (aliases the prebuffer) / owned
 // `Vec<u8>` (copies), mirroring `text`.
-bsql_query_macros::query!(Bytes, r"SELECT '\xDEADBEEF'::bytea AS b");
+bsql::query!(Bytes, r"SELECT '\xDEADBEEF'::bytea AS b");
 // A float8 param -> the `(f64,)` binary-bind path end-to-end.
-bsql_query_macros::query!(EchoF, "SELECT $1::float8 AS x");
+bsql::query!(EchoF, "SELECT $1::float8 AS x");
 // A bytea param -> the `(&[u8],)` binary-bind path end-to-end.
-bsql_query_macros::query!(EchoB, "SELECT $1::bytea AS b");
+bsql::query!(EchoB, "SELECT $1::bytea AS b");
 // A mixed row: fixed int + fixed floats + variable bytea -> the presence of a
 // variable column disables the all-fixed fast path, so the WHOLE row decodes on
 // the per-cell path (proving the fast/per-cell split handles the mix).
-bsql_query_macros::query!(
+bsql::query!(
     Mixed,
     r"SELECT 7::int4 AS i, 2.5::float4 AS f, 8.5::float8 AS g, '\x0102'::bytea AS b"
 );
@@ -104,19 +104,19 @@ bsql_query_macros::query!(
 //    per-element length-prefix) that `encode_array_1d` writes. VALUES-derived
 //    so no migration is needed; the element type differs per query, exercising
 //    a distinct array element OID + element width each time.
-bsql_query_macros::query!(
+bsql::query!(
     FloatAny,
     "SELECT x FROM (VALUES (1.5::float8), (2.5::float8), (3.5::float8)) t(x) WHERE x = ANY($1)"
 );
-bsql_query_macros::query!(
+bsql::query!(
     Float4Any,
     "SELECT x FROM (VALUES (1.5::float4), (2.5::float4), (3.5::float4)) t(x) WHERE x = ANY($1)"
 );
-bsql_query_macros::query!(
+bsql::query!(
     IntAny,
     "SELECT n FROM (VALUES (10::int8), (20::int8), (30::int8)) t(n) WHERE n = ANY($1)"
 );
-bsql_query_macros::query!(
+bsql::query!(
     ByteaAny,
     r"SELECT b FROM (VALUES ('\x01'::bytea), ('\x02'::bytea), ('\x03'::bytea)) t(b) WHERE b = ANY($1)"
 );

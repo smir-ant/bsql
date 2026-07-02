@@ -4,7 +4,7 @@
 // `const` assertion fails const-evaluation (`error[E0080]`) — a loud build
 // error, never a silent truncation of orderings.
 fn main() {
-    bsql_query_macros::query!(
+    bsql::query!(
         Row,
         "SELECT id FROM wide ORDER BY { \
          c1 ASC | c2 ASC | c3 ASC | c4 ASC | c5 ASC | c6 ASC | \

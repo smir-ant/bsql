@@ -13,7 +13,7 @@ use core::convert::Infallible;
 use core::future::{ready, Future};
 use core::ops::ControlFlow;
 
-bsql_query_macros::query!(SealArgMismatch, "SELECT id FROM users WHERE id = $1");
+bsql::query!(SealArgMismatch, "SELECT id FROM users WHERE id = $1");
 
 struct T0;
 

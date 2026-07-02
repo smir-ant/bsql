@@ -20,54 +20,54 @@ use core::ops::ControlFlow;
 
 use bsql_postgres_async::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
-bsql_query_macros::query!(One, "SELECT 1::int4 AS n");
-bsql_query_macros::query!(Seven, "SELECT 7::int4 AS n");
-bsql_query_macros::query!(Hi, "SELECT 'hello'::text AS s");
-bsql_query_macros::query!(Nums, "SELECT n FROM (VALUES (10::int4), (20), (30)) AS t(n)");
-bsql_query_macros::query!(Many, "SELECT n FROM (VALUES (1::int4), (2)) AS t(n)");
-bsql_query_macros::query!(Echo, "SELECT $1::int4 AS n");
-bsql_query_macros::query!(EchoS, "SELECT $1::text AS s");
-bsql_query_macros::query!(WithNull, "SELECT NULL::int4 AS n");
-bsql_query_macros::query!(MaybeNum, "SELECT n FROM (VALUES (7::int4), (NULL)) AS t(n)");
-bsql_query_macros::query!(RepeatLit, "SELECT 100::int4 AS n");
-bsql_query_macros::query!(TxLit, "SELECT 11::int4 AS n");
-bsql_query_macros::query!(MultiTxLit, "SELECT 22::int4 AS n");
-bsql_query_macros::query!(HealLit, "SELECT 33::int4 AS n");
-bsql_query_macros::query!(
+bsql::query!(One, "SELECT 1::int4 AS n");
+bsql::query!(Seven, "SELECT 7::int4 AS n");
+bsql::query!(Hi, "SELECT 'hello'::text AS s");
+bsql::query!(Nums, "SELECT n FROM (VALUES (10::int4), (20), (30)) AS t(n)");
+bsql::query!(Many, "SELECT n FROM (VALUES (1::int4), (2)) AS t(n)");
+bsql::query!(Echo, "SELECT $1::int4 AS n");
+bsql::query!(EchoS, "SELECT $1::text AS s");
+bsql::query!(WithNull, "SELECT NULL::int4 AS n");
+bsql::query!(MaybeNum, "SELECT n FROM (VALUES (7::int4), (NULL)) AS t(n)");
+bsql::query!(RepeatLit, "SELECT 100::int4 AS n");
+bsql::query!(TxLit, "SELECT 11::int4 AS n");
+bsql::query!(MultiTxLit, "SELECT 22::int4 AS n");
+bsql::query!(HealLit, "SELECT 33::int4 AS n");
+bsql::query!(
     StreamAll,
     "SELECT n FROM (VALUES (1::int4), (2), (3), (4), (5)) AS t(n)"
 );
-bsql_query_macros::query!(
+bsql::query!(
     StreamParam,
     "SELECT n FROM (VALUES (1::int4), (2), (3), (4), (5)) AS t(n) WHERE n <= $1::int4"
 );
 
 // ── widened types: float4 / float8 / bytea ──────────────────────────────
-bsql_query_macros::query!(Fl, "SELECT 1.5::float8 AS x, 2.5::float4 AS y");
-bsql_query_macros::query!(NullFloat, "SELECT NULL::float8 AS x");
-bsql_query_macros::query!(Bytes, r"SELECT '\xDEADBEEF'::bytea AS b");
-bsql_query_macros::query!(EchoF, "SELECT $1::float8 AS x");
-bsql_query_macros::query!(EchoB, "SELECT $1::bytea AS b");
-bsql_query_macros::query!(
+bsql::query!(Fl, "SELECT 1.5::float8 AS x, 2.5::float4 AS y");
+bsql::query!(NullFloat, "SELECT NULL::float8 AS x");
+bsql::query!(Bytes, r"SELECT '\xDEADBEEF'::bytea AS b");
+bsql::query!(EchoF, "SELECT $1::float8 AS x");
+bsql::query!(EchoB, "SELECT $1::bytea AS b");
+bsql::query!(
     Mixed,
     r"SELECT 7::int4 AS i, 2.5::float4 AS f, 8.5::float8 AS g, '\x0102'::bytea AS b"
 );
 
 // ── widened ARRAY params: `col = ANY($1)` — see the sync file for the wire
 //    rationale (the `array_send` bytes must reach PG byte-correct).
-bsql_query_macros::query!(
+bsql::query!(
     FloatAny,
     "SELECT x FROM (VALUES (1.5::float8), (2.5::float8), (3.5::float8)) t(x) WHERE x = ANY($1)"
 );
-bsql_query_macros::query!(
+bsql::query!(
     Float4Any,
     "SELECT x FROM (VALUES (1.5::float4), (2.5::float4), (3.5::float4)) t(x) WHERE x = ANY($1)"
 );
-bsql_query_macros::query!(
+bsql::query!(
     IntAny,
     "SELECT n FROM (VALUES (10::int8), (20::int8), (30::int8)) t(n) WHERE n = ANY($1)"
 );
-bsql_query_macros::query!(
+bsql::query!(
     ByteaAny,
     r"SELECT b FROM (VALUES ('\x01'::bytea), ('\x02'::bytea), ('\x03'::bytea)) t(b) WHERE b = ANY($1)"
 );

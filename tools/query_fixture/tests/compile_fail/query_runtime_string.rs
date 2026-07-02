@@ -7,6 +7,6 @@
 
 fn main() {
     let user_input = "SELECT id FROM users";
-    bsql_query_macros::query!(RuntimeSql, user_input);
+    bsql::query!(RuntimeSql, user_input);
     let _ = user_input;
 }

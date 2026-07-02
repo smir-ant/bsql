@@ -3,7 +3,7 @@
 // const-evaluation (`error[E0080]`) — a loud build error, never a silent
 // truncation of filters.
 fn main() {
-    bsql_query_macros::query!(
+    bsql::query!(
         Row,
         "SELECT id FROM orders WHERE \
          OPTIONAL(total = $1) OR OPTIONAL(total = $2) OR OPTIONAL(total = $3) OR \

@@ -3,5 +3,5 @@
 // conformance cross-check turns that leaf-map divergence into a loud
 // compile error — the query is not portable to SQLite.
 fn main() {
-    bsql_query_macros::query!(Row, "SELECT thing_id FROM widgets");
+    bsql::query!(Row, "SELECT thing_id FROM widgets");
 }

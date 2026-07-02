@@ -111,3 +111,63 @@ pub mod sqlite {
     //! Embedded SQLite driver.
     pub use bsql_sqlite::*;
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Compile-checked query API (feature `macros`)
+// ════════════════════════════════════════════════════════════════════
+//
+// This is the whole reason a consumer needs ONE crate: `bsql::query!`
+// validates SQL against the migration-replayed schema at build time and
+// emits typed records + a content-addressed prepared query. The macro's
+// expansion names ONLY `::bsql::__rt::` paths, so a consumer depends on
+// `bsql` (with `features = ["macros"]`) and nothing else at compile time —
+// no hand-wiring of the proc-macro and the sans-IO decode crate.
+
+/// The compile-checked, schema-typed query macro.
+///
+/// `query!(Name, "<SQL>")` types the SQL against the schema replayed from
+/// the consumer's migration DDL (via the catalog `bsql-build` generates in
+/// the consumer's `build.rs`) and emits two typed-record types plus their
+/// decoders, the const wire artifact, and the [`TypedQuery`] execution
+/// bridge. An unknown table/column — or any query that does not type-check
+/// — is a `compile_error!`.
+///
+/// The expansion references only the runtime primitives re-exported here,
+/// so a consumer depending on `bsql` with `features = ["macros"]` needs no
+/// other dependency to reach the flagship. See the module-level examples
+/// for the required one-line `build.rs`.
+#[cfg(feature = "macros")]
+pub use bsql_query_macros::query;
+
+/// The typed-query execution bridge, the const-checked prepared-query
+/// artifact, its build-time fingerprint, and the classified decode error —
+/// the user-facing types a `query!`-generated carrier is built from. A
+/// driver's typed-query entry points execute a `query!` carrier through
+/// these.
+#[cfg(feature = "macros")]
+pub use bsql_postgres_proto::{DecodeError, PreparedQuery, QueryFingerprint, TypedQuery};
+
+/// Bounded / streaming typed result containers a driver's typed-query
+/// entry points return: [`Rows`] holds one query's decoded rows;
+/// [`RowsBuilder`] is its prebuffer.
+#[cfg(feature = "macros")]
+pub use bsql_postgres_core::{Rows, RowsBuilder};
+
+/// Runtime support the `query!` expansion names.
+///
+/// NOT a stable API and NOT for direct use — every item here exists solely
+/// so the code `query!` emits (`::bsql::__rt::...`) resolves through the
+/// single `bsql` dependency. The set is exactly the sans-IO decode / wire
+/// primitives the macro references: the decode cell + format markers, the
+/// raw-row reader, the classified decode error, the fingerprint / prepared
+/// / typed-query traits, the OID and query-budget constants, and the
+/// `wire_pin!` footprint guard.
+#[cfg(feature = "macros")]
+#[doc(hidden)]
+pub mod __rt {
+    pub use bsql_postgres_proto::wire_pin;
+    pub use bsql_postgres_proto::{
+        BinaryFmt, Cell, DataRowRef, DecodeError, PreparedQuery, QueryFingerprint, TypedQuery,
+        oids, prepared, query_budget,
+    };
+}

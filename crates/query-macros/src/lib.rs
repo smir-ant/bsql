@@ -62,11 +62,15 @@ const CATALOG_ENV_VAR: &str = "BSQL_SCHEMA_CATALOG";
 // decoders, the const wire artifact, and the `TypedQuery` execution bridge.
 // Expansion calls `bsql_build::infer_query` (the build-time SQL inference
 // engine) to obtain the output row shape and the `$N` parameter types. The
-// EMITTED code references ONLY the shipped runtime primitives in
-// `bsql-postgres-proto` (`DataRowRef`, `ColumnsIter`, `Cell<BinaryFmt>`,
-// `DecodeError`, `QueryFingerprint`, `PreparedQuery`, `TypedQuery`) — never
-// this crate or `bsql-build`, so a consumer's runtime closure carries no
-// build-time query toolchain.
+// EMITTED code references ONLY `::bsql::__rt::` paths — the umbrella crate's
+// hidden re-export of the shipped runtime primitives (`DataRowRef`,
+// `Cell<BinaryFmt>`, `DecodeError`, `QueryFingerprint`, `PreparedQuery`,
+// `TypedQuery`, the OID / query-budget constants, and the `wire_pin!`
+// footprint guard). A consumer therefore depends on `bsql` (with
+// `features = ["macros"]`) and nothing else to reach the flagship, and its
+// runtime closure carries no build-time query toolchain: `bsql-query-macros`
+// is a host-only proc-macro and never emits a reference to itself or to
+// `bsql-build`.
 
 /// Compile-checked, schema-typed query record generator.
 ///
@@ -85,8 +89,8 @@ const CATALOG_ENV_VAR: &str = "BSQL_SCHEMA_CATALOG";
 /// A `NOT NULL` column maps to `T`; a nullable column maps to
 /// `Option<T>`. Each type has a `decode` associated fn that turns a raw
 /// `DataRow` payload (the wire bytes after the field-count header) into
-/// the record, reusing the shipped binary decoders in
-/// `bsql-postgres-proto`. A `NULL` arriving in a `NOT NULL`-typed column
+/// the record, reusing the shipped binary decoders re-exported by the
+/// umbrella crate. A `NULL` arriving in a `NOT NULL`-typed column
 /// is a classified `DecodeError::NullInNonNullColumn`, never a silent
 /// default or a panic.
 ///
@@ -219,11 +223,18 @@ fn strip_scan_ack(sql: &str) -> (String, bool) {
 
 /// Run the build-time SQLite conformance cross-check for one query, when
 /// the consumer emitted a SQLite template database (the
-/// `BSQL_SQLITE_TEMPLATE` rustc-env channel is present). When no template
-/// was emitted the consumer does not target SQLite, so there is nothing to
-/// conform against — the inference lattice already validated the query, so
-/// this returns `Ok(())` (it is not a skipped schema check, it is the
-/// absence of a SQLite target).
+/// `BSQL_SQLITE_TEMPLATE` rustc-env channel is present).
+///
+/// When no template channel is present, the outcome depends on whether the
+/// consumer's build DECLARED a SQLite target (the `BSQL_SQLITE_TARGET`
+/// marker the build helper sets from the same call that emits the template):
+///
+/// * marker absent — a deliberately PostgreSQL-only build. There is no
+///   SQLite target to conform against, so this returns `Ok(())` (it is not a
+///   skipped schema check, it is the absence of a SQLite target).
+/// * marker present — a SQLite target was declared but its template never
+///   reached expansion. That is a loud `compile_error!`, never a silent
+///   disengage of the conformance oracle.
 #[cfg(feature = "sqlite")]
 fn verify_sqlite(
     span: Span,
@@ -232,7 +243,29 @@ fn verify_sqlite(
 ) -> syn::Result<()> {
     let path = match std::env::var(bsql_build::SQLITE_TEMPLATE_ENV_VAR) {
         Ok(path) => path,
-        Err(_) => return Ok(()),
+        // No template channel. Distinguish a deliberate PostgreSQL-only build
+        // (no SQLite target declared → nothing to conform against) from a
+        // consumer who DECLARED a SQLite target but whose template never
+        // reached expansion. The build helper sets `BSQL_SQLITE_TARGET` from
+        // the SAME call that emits the template, so its presence WITHOUT a
+        // template is a loud misconfiguration (a hand-written `build.rs` that
+        // declared the target but did not emit, or a corrupted OUT_DIR), never
+        // a silent disengage of the SQLite conformance oracle.
+        Err(_) => {
+            return match std::env::var(bsql_build::SQLITE_TARGET_ENV_VAR) {
+                Ok(_) => Err(syn::Error::new(
+                    span,
+                    "query!: this build declared a SQLite conformance target but \
+                     no SQLite template reached expansion. The consumer's \
+                     `build.rs` must call `bsql_build::emit(migrations)` (or \
+                     `bsql_build::emit_sqlite_template(migrations)`) with \
+                     `bsql-build`'s `sqlite` feature enabled in \
+                     `[build-dependencies]`. Refusing to type a query without \
+                     the SQLite conformance oracle it was told to run.",
+                )),
+                Err(_) => Ok(()),
+            };
+        }
     };
     bsql_build::verify_sqlite_conformance(
         std::path::Path::new(&path),
@@ -503,7 +536,7 @@ fn emit_records(
             /// field-count header) into the borrowed record. Borrowed
             /// `text` columns alias the input bytes — zero allocation.
             pub fn decode(#borrowed_input)
-                -> ::core::result::Result<Self, ::bsql_postgres_proto::DecodeError>
+                -> ::core::result::Result<Self, ::bsql::__rt::DecodeError>
             {
                 #borrowed_body
             }
@@ -513,7 +546,7 @@ fn emit_records(
             /// Decode one raw `DataRow` payload (the wire bytes after the
             /// field-count header) into the owned record.
             pub fn decode(body: &[u8])
-                -> ::core::result::Result<Self, ::bsql_postgres_proto::DecodeError>
+                -> ::core::result::Result<Self, ::bsql::__rt::DecodeError>
             {
                 #owned_body
             }
@@ -589,8 +622,8 @@ fn fast_path(
                     if i32::from_be_bytes(*__len) != #width_i32_lit { break 'fast; }
                     let ::core::option::Option::Some((__data, #trailing)) =
                         __after.split_first_chunk::<#width_lit>() else { break 'fast };
-                    let #id = match <#marker as ::bsql_postgres_proto::Cell<
-                        ::bsql_postgres_proto::BinaryFmt,
+                    let #id = match <#marker as ::bsql::__rt::Cell<
+                        ::bsql::__rt::BinaryFmt,
                     >>::decode(__data) {
                         ::core::result::Result::Ok(__value) => __value,
                         ::core::result::Result::Err(__err) =>
@@ -635,7 +668,7 @@ fn per_cell_path(
         // No projected columns: validate the row body and build the empty
         // record. `parse` still fails closed on a malformed count header.
         return quote! {
-            ::bsql_postgres_proto::DataRowRef::parse(body)?;
+            ::bsql::__rt::DataRowRef::parse(body)?;
             ::core::result::Result::Ok(Self {})
         };
     }
@@ -654,7 +687,7 @@ fn per_cell_path(
                     // projects: a classified short-row error, never a
                     // silently-defaulted field.
                     ::core::option::Option::None => return ::core::result::Result::Err(
-                        ::bsql_postgres_proto::DecodeError::TruncatedColumnLen {
+                        ::bsql::__rt::DecodeError::TruncatedColumnLen {
                             column_idx: #idx_lit,
                         },
                     ),
@@ -664,8 +697,8 @@ fn per_cell_path(
         });
 
     quote! {
-        let __row = ::bsql_postgres_proto::DataRowRef::parse(body)?;
-        let mut __cols = ::bsql_postgres_proto::DataRowRef::columns(&__row);
+        let __row = ::bsql::__rt::DataRowRef::parse(body)?;
+        let mut __cols = ::bsql::__rt::DataRowRef::columns(&__row);
         #(#stmts)*
         ::core::result::Result::Ok(Self { #(#field_idents),* })
     }
@@ -691,7 +724,7 @@ fn per_cell_value_expr(ty: bsql_build::RustType, nullable: bool, is_owned: bool)
                 // A NULL in a NOT-NULL-typed column: a classified
                 // decode error, never a silent default or panic.
                 ::core::option::Option::None => return ::core::result::Result::Err(
-                    ::bsql_postgres_proto::DecodeError::NullInNonNullColumn,
+                    ::bsql::__rt::DecodeError::NullInNonNullColumn,
                 ),
             }
         }
@@ -705,7 +738,7 @@ fn decode_call_expr(ty: bsql_build::RustType, is_owned: bool) -> TokenStream2 {
     use bsql_build::RustType;
     let marker = cell_marker(ty);
     let raw = quote! {
-        <#marker as ::bsql_postgres_proto::Cell<::bsql_postgres_proto::BinaryFmt>>::decode(__bytes)?
+        <#marker as ::bsql::__rt::Cell<::bsql::__rt::BinaryFmt>>::decode(__bytes)?
     };
     match (ty, is_owned) {
         (RustType::Text, true) => quote! { ::std::string::String::from(#raw) },
@@ -759,15 +792,15 @@ fn rust_type_oid(ty: bsql_build::RustType) -> u32 {
 fn oid_path(ty: bsql_build::RustType) -> TokenStream2 {
     use bsql_build::RustType;
     match ty {
-        RustType::I16 => quote!(::bsql_postgres_proto::oids::INT2),
-        RustType::I32 => quote!(::bsql_postgres_proto::oids::INT4),
-        RustType::I64 => quote!(::bsql_postgres_proto::oids::INT8),
-        RustType::U32 => quote!(::bsql_postgres_proto::oids::OID),
-        RustType::Bool => quote!(::bsql_postgres_proto::oids::BOOL),
-        RustType::Text => quote!(::bsql_postgres_proto::oids::TEXT),
-        RustType::F32 => quote!(::bsql_postgres_proto::oids::FLOAT4),
-        RustType::F64 => quote!(::bsql_postgres_proto::oids::FLOAT8),
-        RustType::Bytea => quote!(::bsql_postgres_proto::oids::BYTEA),
+        RustType::I16 => quote!(::bsql::__rt::oids::INT2),
+        RustType::I32 => quote!(::bsql::__rt::oids::INT4),
+        RustType::I64 => quote!(::bsql::__rt::oids::INT8),
+        RustType::U32 => quote!(::bsql::__rt::oids::OID),
+        RustType::Bool => quote!(::bsql::__rt::oids::BOOL),
+        RustType::Text => quote!(::bsql::__rt::oids::TEXT),
+        RustType::F32 => quote!(::bsql::__rt::oids::FLOAT4),
+        RustType::F64 => quote!(::bsql::__rt::oids::FLOAT8),
+        RustType::Bytea => quote!(::bsql::__rt::oids::BYTEA),
     }
 }
 
@@ -825,15 +858,15 @@ fn array_oid(ty: bsql_build::RustType) -> u32 {
 fn array_oid_path(ty: bsql_build::RustType) -> TokenStream2 {
     use bsql_build::RustType;
     match ty {
-        RustType::I16 => quote!(::bsql_postgres_proto::oids::INT2_ARRAY),
-        RustType::I32 => quote!(::bsql_postgres_proto::oids::INT4_ARRAY),
-        RustType::I64 => quote!(::bsql_postgres_proto::oids::INT8_ARRAY),
-        RustType::U32 => quote!(::bsql_postgres_proto::oids::OID_ARRAY),
-        RustType::Bool => quote!(::bsql_postgres_proto::oids::BOOL_ARRAY),
-        RustType::Text => quote!(::bsql_postgres_proto::oids::TEXT_ARRAY),
-        RustType::F32 => quote!(::bsql_postgres_proto::oids::FLOAT4_ARRAY),
-        RustType::F64 => quote!(::bsql_postgres_proto::oids::FLOAT8_ARRAY),
-        RustType::Bytea => quote!(::bsql_postgres_proto::oids::BYTEA_ARRAY),
+        RustType::I16 => quote!(::bsql::__rt::oids::INT2_ARRAY),
+        RustType::I32 => quote!(::bsql::__rt::oids::INT4_ARRAY),
+        RustType::I64 => quote!(::bsql::__rt::oids::INT8_ARRAY),
+        RustType::U32 => quote!(::bsql::__rt::oids::OID_ARRAY),
+        RustType::Bool => quote!(::bsql::__rt::oids::BOOL_ARRAY),
+        RustType::Text => quote!(::bsql::__rt::oids::TEXT_ARRAY),
+        RustType::F32 => quote!(::bsql::__rt::oids::FLOAT4_ARRAY),
+        RustType::F64 => quote!(::bsql::__rt::oids::FLOAT8_ARRAY),
+        RustType::Bytea => quote!(::bsql::__rt::oids::BYTEA_ARRAY),
     }
 }
 
@@ -936,11 +969,11 @@ fn emit_dynamic_wire(
     let n_variants_lit = Literal::usize_unsuffixed(shape.variants.len());
     let budget = quote! {
         const _: () = ::core::assert!(
-            #n_optional_lit <= ::bsql_postgres_proto::query_budget::MAX_OPTIONAL_FILTERS,
+            #n_optional_lit <= ::bsql::__rt::query_budget::MAX_OPTIONAL_FILTERS,
             "query!: too many OPTIONAL(...) toggled filters in one query",
         );
         const _: () = ::core::assert!(
-            #n_variants_lit <= ::bsql_postgres_proto::query_budget::MAX_ORDER_BY_VARIANTS,
+            #n_variants_lit <= ::bsql::__rt::query_budget::MAX_ORDER_BY_VARIANTS,
             "query!: too many runtime ORDER BY orderings in one query",
         );
     };
@@ -1017,7 +1050,7 @@ fn emit_dynamic_wire(
                     #[must_use]
                     pub const fn prepared(
                         self,
-                    ) -> ::bsql_postgres_proto::PreparedQuery<#params_tuple, #row_tuple> {
+                    ) -> ::bsql::__rt::PreparedQuery<#params_tuple, #row_tuple> {
                         match self {
                             #( Self::#variant_idents => #carrier_idents::PREPARED, )*
                         }
@@ -1067,7 +1100,7 @@ fn emit_carrier(
 
     let carrier_doc = format!(
         "Uninhabited fingerprint carrier for the `{name}` query. Its \
-         [`QueryFingerprint`](::bsql_postgres_proto::QueryFingerprint) \
+         [`QueryFingerprint`](::bsql::QueryFingerprint) \
          impl holds the const wire artifact; \
          [`{carrier}::PREPARED`](Self::PREPARED) is the validated \
          prepared query minted through the proto-owned `run` boundary."
@@ -1099,7 +1132,7 @@ fn emit_carrier(
         #[allow(dead_code, reason = #allow_reason)]
         pub enum #carrier {}
 
-        impl ::bsql_postgres_proto::QueryFingerprint for #carrier {
+        impl ::bsql::__rt::QueryFingerprint for #carrier {
             type Params = #params_tuple;
             type Row = #row_tuple;
             const SQL: &'static str = #wire_sql;
@@ -1113,8 +1146,8 @@ fn emit_carrier(
         impl #carrier {
             #[doc = #prepared_doc]
             #[allow(dead_code, reason = #allow_reason)]
-            pub const PREPARED: ::bsql_postgres_proto::PreparedQuery<#params_tuple, #row_tuple> =
-                ::bsql_postgres_proto::prepared::run::<#carrier>();
+            pub const PREPARED: ::bsql::__rt::PreparedQuery<#params_tuple, #row_tuple> =
+                ::bsql::__rt::prepared::run::<#carrier>();
         }
 
         // The execution bridge: ties this carrier to its prepared query and
@@ -1124,20 +1157,20 @@ fn emit_carrier(
         // validator, free + .rodata-deduped) rather than reaching the inherent
         // const above — referencing `#carrier::PREPARED` here would be
         // ambiguous between the inherent and this trait const.
-        impl ::bsql_postgres_proto::TypedQuery for #carrier {
+        impl ::bsql::__rt::TypedQuery for #carrier {
             type Params = #params_tuple;
             type Row = #row_tuple;
             type Record<'q> = #record_ty;
             type Owned = #owned_name;
-            const PREPARED: ::bsql_postgres_proto::PreparedQuery<#params_tuple, #row_tuple> =
-                ::bsql_postgres_proto::prepared::run::<#carrier>();
+            const PREPARED: ::bsql::__rt::PreparedQuery<#params_tuple, #row_tuple> =
+                ::bsql::__rt::prepared::run::<#carrier>();
             fn decode_borrowed(body: &[u8])
-                -> ::core::result::Result<Self::Record<'_>, ::bsql_postgres_proto::DecodeError>
+                -> ::core::result::Result<Self::Record<'_>, ::bsql::__rt::DecodeError>
             {
                 #name::decode(body)
             }
             fn decode_owned(body: &[u8])
-                -> ::core::result::Result<Self::Owned, ::bsql_postgres_proto::DecodeError>
+                -> ::core::result::Result<Self::Owned, ::bsql::__rt::DecodeError>
             {
                 #owned_name::decode(body)
             }
@@ -1145,7 +1178,7 @@ fn emit_carrier(
 
         // Footprint guard on the artifact: the carrier is a zero-size,
         // value-less marker; the wire data lives in `.rodata`.
-        ::bsql_postgres_proto::wire_pin!(#carrier, size = 0, align = 1);
+        ::bsql::__rt::wire_pin!(#carrier, size = 0, align = 1);
     })
 }
 

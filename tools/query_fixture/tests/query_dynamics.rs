@@ -17,18 +17,18 @@ use bsql_postgres_proto::oids;
 
 // Toggled optional filter: `id` is `int8`, so `$1` types from it and
 // becomes `Option<i64>`. The baked param OID is the scalar `INT8`.
-bsql_query_macros::query!(
+bsql::query!(
     OptUser,
     "SELECT id, email FROM users WHERE OPTIONAL(id = $1)"
 );
 
 // `= ANY($1)` in-list: `id` is `int8`, so the single array parameter is
 // `&[i64]` and the baked param OID is `INT8_ARRAY`.
-bsql_query_macros::query!(AnyOrders, "SELECT id FROM orders WHERE id = ANY($1)");
+bsql::query!(AnyOrders, "SELECT id FROM orders WHERE id = ANY($1)");
 
 // `= ANY($1)` over a text column: the array parameter is `&[&str]` and the
 // param OID is `TEXT_ARRAY`.
-bsql_query_macros::query!(
+bsql::query!(
     AnyEmails,
     "SELECT id FROM users WHERE email = ANY($1)"
 );
@@ -36,7 +36,7 @@ bsql_query_macros::query!(
 // Runtime ORDER BY allow-set: three orderings over `orders`, one bound
 // scalar parameter (`user_id` is `int8`). The macro emits the selector
 // enum `SortedOrdersOrderBy { IdAsc, TotalDesc, IdDesc }`.
-bsql_query_macros::query!(
+bsql::query!(
     SortedOrders,
     "SELECT id, total FROM orders WHERE user_id = $1 ORDER BY { id ASC | total DESC | id DESC }"
 );

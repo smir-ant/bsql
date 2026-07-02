@@ -1,5 +1,5 @@
 error: expected string literal
-  --> tests/compile_fail/query_runtime_string.rs:10:43
+  --> tests/compile_fail/query_runtime_string.rs:10:30
    |
-10 |     bsql_query_macros::query!(RuntimeSql, user_input);
-   |                                           ^^^^^^^^^^
+10 |     bsql::query!(RuntimeSql, user_input);
+   |                              ^^^^^^^^^^

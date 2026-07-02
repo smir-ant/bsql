@@ -33,7 +33,7 @@ use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, SslMode};
 // Two `int8 NOT NULL` columns -> the all-fixed-width record `MalStream { id,
 // user_id }` (both `i64`). `orders.id` / `orders.user_id` exist in the fixture's
 // migrations, so this validates against the build catalog.
-bsql_query_macros::query!(MalStream, "SELECT id, user_id FROM orders");
+bsql::query!(MalStream, "SELECT id, user_id FROM orders");
 
 // ─────────────────────────── frame builders ───────────────────────────
 

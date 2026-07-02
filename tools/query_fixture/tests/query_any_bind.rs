@@ -36,7 +36,7 @@ use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::WriteBuf;
 
 // The macro that lowers `id = ANY($1)` to a single `int8[]` array param.
-bsql_query_macros::query!(AnyInts, "SELECT id FROM orders WHERE id = ANY($1)");
+bsql::query!(AnyInts, "SELECT id FROM orders WHERE id = ANY($1)");
 
 /// Encode one parameter tuple's Bind param-value block to bytes.
 fn encode<P: ParamsWriter>(params: &P) -> Vec<u8> {

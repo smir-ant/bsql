@@ -11,7 +11,7 @@
 
 use bsql_postgres_sync::Rows;
 
-bsql_query_macros::query!(Escape, "SELECT 'x'::text AS s");
+bsql::query!(Escape, "SELECT 'x'::text AS s");
 
 fn escape(rows: Rows<EscapeQuery>) {
     // `held` borrows `rows` (its `s` field aliases the prebuffer).

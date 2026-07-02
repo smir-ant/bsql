@@ -15,11 +15,11 @@ use bsql_postgres_proto::oids;
 // One `$1` parameter (the `int8` PK) and two projected columns
 // (`int8` PK + NOT NULL `text`). Exercises the param-OID section of the
 // Parse template and a text-bearing row.
-bsql_query_macros::query!(UserById, "SELECT id, email FROM users WHERE id = $1");
+bsql::query!(UserById, "SELECT id, email FROM users WHERE id = $1");
 
 // No parameters; two `int8` columns. Exercises the zero-param Parse tail
 // (n_param_types = 0, no OID words).
-bsql_query_macros::query!(OrderKey, "SELECT id, user_id FROM orders");
+bsql::query!(OrderKey, "SELECT id, user_id FROM orders");
 
 #[test]
 fn parse_template_is_deterministic_one_param() {

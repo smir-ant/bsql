@@ -12,10 +12,41 @@ postgres-async = ["dep:bsql-postgres-async"]
 postgres-sync = ["dep:bsql-postgres-sync"]
 sqlite = ["dep:bsql-sqlite"]
 
+# `macros` — the compile-checked query API, reachable through this one crate.
+# It re-exports the `query!` proc-macro plus every runtime primitive the
+# macro's expansion names (via the hidden `__rt` module) and the user-facing
+# query types (`TypedQuery`, `Rows`, `PreparedQuery`, ...). Additive and
+# BACKEND-INDEPENDENT: it pulls the proc-macro + the sans-IO decode/typed-row
+# primitives, not any driver, so it composes with any (or no) backend feature.
+# Executing a `query!` still needs a backend (`postgres-async`/`postgres-sync`)
+# to obtain a `Connection`; the macro, typed records, and `PreparedQuery` are
+# available without one. `bsql-query-macros` is a PROC-MACRO (host-only,
+# compile-time), so it is never linked into a consumer's runtime binary — the
+# `runtime_graph_pin` gate models this with `-e no-proc-macro`.
+macros = ["dep:bsql-query-macros", "dep:bsql-postgres-proto", "dep:bsql-postgres-core"]
+
+# `macros-sqlite` — turn on the `query!` macro's build-time SQLite conformance
+# cross-check. Orthogonal to the `sqlite` RUNTIME driver feature above: this is
+# purely the compile-time oracle. A consumer targeting SQLite for compile-checked
+# queries enables this AND, in `[build-dependencies]`, `bsql-build` with its
+# `sqlite` feature so `bsql_build::emit(..)` emits the template channel the
+# cross-check consumes.
+macros-sqlite = ["macros", "bsql-query-macros/sqlite"]
+
 [dependencies]
 bsql-postgres-async = { path = "../postgres/async", optional = true }
 bsql-postgres-sync = { path = "../postgres/sync", optional = true }
 bsql-sqlite = { path = "../sqlite/driver", optional = true }
+
+# Behind `macros` only. `bsql-query-macros` is a proc-macro (host-only,
+# compile-time); `bsql-postgres-proto` (sans-IO decode primitives the macro's
+# emitted code names) and `bsql-postgres-core` (`Rows`/`RowsBuilder`) carry the
+# query-API runtime surface. All three are already resolved workspace members
+# (proto/core via the drivers, query-macros via the fixtures), so `deps_pin`'s
+# package SET is unchanged; these are the umbrella re-export edges.
+bsql-query-macros = { path = "../query-macros", optional = true }
+bsql-postgres-proto = { path = "../postgres/proto", optional = true }
+bsql-postgres-core = { path = "../postgres/core", optional = true }
 
 # Inherit the workspace FORBID floor (the two-tier lint wall).
 [lints]

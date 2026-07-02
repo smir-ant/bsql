@@ -76,7 +76,7 @@ pub use infer::{infer_query, InferError, InferredColumn, QueryShape, RustType};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
     emit_sqlite_template, verify_sqlite_conformance, SqliteConformanceError,
-    SQLITE_TEMPLATE_ENV_VAR, SQLITE_TEMPLATE_FILE_NAME,
+    SQLITE_TARGET_ENV_VAR, SQLITE_TEMPLATE_ENV_VAR, SQLITE_TEMPLATE_FILE_NAME,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -215,9 +215,13 @@ impl std::error::Error for BuildError {
     }
 }
 
-/// The complete build-script entry point.
+/// Emit the PostgreSQL schema catalog channel.
 ///
-/// Call this from a consumer crate's `build.rs`:
+/// This is the PostgreSQL-only building block; most consumers call the
+/// single-line [`emit`] instead, which layers the SQLite template on top
+/// under the `sqlite` feature. Call this directly for a build that is
+/// deliberately PostgreSQL-only (it never emits a SQLite template and so
+/// never engages the SQLite conformance oracle):
 ///
 /// ```no_run
 /// fn main() -> Result<(), bsql_build::BuildError> {
@@ -278,6 +282,35 @@ pub fn emit_catalog(migrations_dir: impl AsRef<Path>) -> Result<(), BuildError> 
         catalog_path.display()
     );
 
+    Ok(())
+}
+
+/// The one-line build-script entry point for a bsql consumer.
+///
+/// Call this from a consumer crate's `build.rs`:
+///
+/// ```no_run
+/// fn main() -> Result<(), bsql_build::BuildError> {
+///     bsql_build::emit("migrations")
+/// }
+/// ```
+///
+/// It always [`emit_catalog`]s the PostgreSQL schema catalog. When this
+/// crate's `sqlite` feature is enabled — a consumer targeting SQLite adds
+/// `bsql-build = { features = ["sqlite"] }` to `[build-dependencies]` — it
+/// ALSO emits the SQLite conformance template (via `emit_sqlite_template`),
+/// from the SAME call. Enabling the SQLite target and emitting its template are
+/// therefore INSEPARABLE: there is no separate build-script step to leave
+/// out, so the compile-checked SQLite conformance oracle can never silently
+/// disengage because a consumer forgot a second call.
+///
+/// Returns `Err` (failing the build) on any I/O, parse, or replay error —
+/// including, under the `sqlite` feature, a migration form SQLite cannot
+/// replay. Nothing carrying schema shape is ever silently skipped.
+pub fn emit(migrations_dir: impl AsRef<Path>) -> Result<(), BuildError> {
+    emit_catalog(&migrations_dir)?;
+    #[cfg(feature = "sqlite")]
+    emit_sqlite_template(&migrations_dir)?;
     Ok(())
 }
 

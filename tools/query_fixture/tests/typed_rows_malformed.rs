@@ -24,7 +24,7 @@ use bsql_postgres_proto::DecodeError;
 
 // Two `int8 NOT NULL` columns -> the all-fixed-width record `Mal { id, user_id }`
 // (both `i64`). `orders.id` / `orders.user_id` exist in the fixture's migrations.
-bsql_query_macros::query!(Mal, "SELECT id, user_id FROM orders");
+bsql::query!(Mal, "SELECT id, user_id FROM orders");
 
 /// A well-formed 2x`int8` `DataRow` body: `[count=2][len=8][i64=42][len=8][i64=7]`.
 const GOOD: &[u8] = &[

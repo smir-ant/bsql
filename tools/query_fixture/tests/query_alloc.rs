@@ -29,16 +29,16 @@ static ALLOC: CountingAllocator = CountingAllocator::new();
 
 // Same shapes as the decode fixtures: an all-fixed-width row and a
 // NOT-NULL text row.
-bsql_query_macros::query!(OrderKey, "SELECT id, user_id FROM orders");
-bsql_query_macros::query!(UserNames, "SELECT id, email FROM users");
+bsql::query!(OrderKey, "SELECT id, user_id FROM orders");
+bsql::query!(UserNames, "SELECT id, email FROM users");
 
 // Dynamic forms: a toggled optional filter, a `= ANY($1)` array in-list,
 // and a runtime ORDER BY allow-set. Their wire artifacts are const, so
 // reading them — and encoding the array param into the heapless send
 // buffer — must allocate nothing.
-bsql_query_macros::query!(OptUser, "SELECT id FROM users WHERE OPTIONAL(id = $1)");
-bsql_query_macros::query!(AnyOrders, "SELECT id FROM orders WHERE id = ANY($1)");
-bsql_query_macros::query!(SortedOrders, "SELECT id FROM orders ORDER BY { id ASC | id DESC }");
+bsql::query!(OptUser, "SELECT id FROM users WHERE OPTIONAL(id = $1)");
+bsql::query!(AnyOrders, "SELECT id FROM orders WHERE id = ANY($1)");
+bsql::query!(SortedOrders, "SELECT id FROM orders ORDER BY { id ASC | id DESC }");
 
 const ORDER_KEY_ROW: &[u8] = &[
     0x00, 0x02, // 2 columns

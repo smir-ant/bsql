@@ -1,5 +1,5 @@
 error: query!: the type of parameter `$1` cannot be inferred from its position. Add an explicit cast in the SQL (e.g. `$1::int4`) so the parameter has a known type — this is never guessed.
- --> tests/compile_fail/query_uncast_param.rs:5:36
+ --> tests/compile_fail/query_uncast_param.rs:5:23
   |
-5 |     bsql_query_macros::query!(Row, "SELECT $1 FROM users");
-  |                                    ^^^^^^^^^^^^^^^^^^^^^^
+5 |     bsql::query!(Row, "SELECT $1 FROM users");
+  |                       ^^^^^^^^^^^^^^^^^^^^^^

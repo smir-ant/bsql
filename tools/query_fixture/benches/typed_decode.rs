@@ -35,8 +35,8 @@ use criterion::{criterion_group, criterion_main, Criterion};
 // both `int8 NOT NULL` (the all-fixed row); `users.id` / `users.email` are
 // `int8`/`text NOT NULL` (the per-cell row). Both validate against the build
 // catalog replayed from this crate's migrations.
-bsql_query_macros::query!(OrderKey, "SELECT id, user_id FROM orders");
-bsql_query_macros::query!(UserNames, "SELECT id, email FROM users");
+bsql::query!(OrderKey, "SELECT id, user_id FROM orders");
+bsql::query!(UserNames, "SELECT id, email FROM users");
 
 const ORDER_KEY_ROW: &[u8] = &[
     0x00, 0x02, // 2 columns

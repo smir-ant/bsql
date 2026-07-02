@@ -43,7 +43,7 @@ static ALLOC: CountingAllocator = CountingAllocator::new();
 // An all-fixed-width (two `int8 NOT NULL`) row: the borrowed decode reads
 // primitives at const offsets and allocates nothing. `orders.id` / `orders.user_id`
 // exist in the fixture's migrations.
-bsql_query_macros::query!(Stream, "SELECT id, user_id FROM orders");
+bsql::query!(Stream, "SELECT id, user_id FROM orders");
 
 // ─────────────────────────── frame builders ───────────────────────────
 

@@ -79,9 +79,18 @@ pub const SQLITE_TEMPLATE_FILE_NAME: &str = "bsql_sqlite_template.db";
 
 /// The environment variable, set via `cargo:rustc-env`, that carries the
 /// absolute path of the generated SQLite template database to the query
-/// proc-macro. Presence of this variable is what tells the proc-macro the
-/// consumer also targets SQLite, so the conformance cross-check runs.
+/// proc-macro. When present, the conformance cross-check opens this template
+/// and runs.
 pub const SQLITE_TEMPLATE_ENV_VAR: &str = "BSQL_SQLITE_TEMPLATE";
+
+/// The environment variable, set via `cargo:rustc-env`, that DECLARES the
+/// consumer targets SQLite for compile-checked queries. [`emit_sqlite_template`]
+/// sets it as its first channel. It exists so a missing template is a LOUD
+/// build error rather than a silent disengage: if this marker is present but
+/// [`SQLITE_TEMPLATE_ENV_VAR`] is not, the query proc-macro emits a
+/// `compile_error!` (the build declared a SQLite target but no usable template
+/// reached expansion) instead of silently skipping the conformance oracle.
+pub const SQLITE_TARGET_ENV_VAR: &str = "BSQL_SQLITE_TARGET";
 
 /// Replay a consumer's migration `*.sql` tree into a fresh SQLite template
 /// database in `OUT_DIR`, and set the `BSQL_SQLITE_TEMPLATE` rustc-env
@@ -112,6 +121,12 @@ pub const SQLITE_TEMPLATE_ENV_VAR: &str = "BSQL_SQLITE_TEMPLATE";
 pub fn emit_sqlite_template(migrations_dir: impl AsRef<Path>) -> Result<(), BuildError> {
     let manifest = crate::env_path("CARGO_MANIFEST_DIR")?;
     let dir = manifest.join(migrations_dir.as_ref());
+
+    // Declare the SQLite conformance target FIRST, before any fallible step.
+    // This is the per-consumer signal the query proc-macro keys on to turn a
+    // missing template into a loud build error instead of a silent skip: once
+    // a build declares this target, the template channel must reach expansion.
+    println!("cargo:rustc-env={SQLITE_TARGET_ENV_VAR}=1");
 
     let walk = crate::scan_sql_tree(&dir)?;
     for directory in &walk.dirs {

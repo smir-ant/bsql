@@ -1,5 +1,5 @@
 error: query!: SQLite conformance failure: type conformance failure on column `thing_id`: the inference lattice typed it `u32`, but SQLite's declared type is `OID` (no portable SQLite type). The shared type lattice forks from SQLite only on PostgreSQL-only leaves (e.g. `oid`); this query is not portable to SQLite. — the query types against the schema but does not conform to real SQLite (validated at build time against the migration-replayed template database).
- --> tests/compile_fail/type_disagreement.rs:6:36
+ --> tests/compile_fail/type_disagreement.rs:6:23
   |
-6 |     bsql_query_macros::query!(Row, "SELECT thing_id FROM widgets");
-  |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+6 |     bsql::query!(Row, "SELECT thing_id FROM widgets");
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
