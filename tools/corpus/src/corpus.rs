@@ -34,9 +34,7 @@ fn ready_ok(client_bytes: Vec<u8>, ok: ObservedOk) -> ObservedRun {
         client_bytes,
         outcome: Ok(ok),
         notices: Vec::new(),
-        parameter_statuses: Vec::new(),
-        unknown_parameter_status_count: 0,
-        notifications: Vec::new(),
+        parameter_statuses: Vec::new(),        notifications: Vec::new(),
         backend_pid: Some(TRUST_BACKEND_PID),
         tx_status: ObservedTxStatus::Idle,
         terminal: ObservedStatus::Ready,
@@ -526,9 +524,7 @@ pub fn seed() -> Vec<Transcript> {
                 sqlstate: "00000".to_string(),
                 message: "table \"ghost\" does not exist, skipping".to_string(),
             }],
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 0,
-            notifications: Vec::new(),
+            parameter_statuses: Vec::new(),            notifications: Vec::new(),
             backend_pid: Some(TRUST_BACKEND_PID),
             tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
@@ -554,9 +550,7 @@ pub fn seed() -> Vec<Transcript> {
             client_bytes: simple_query_wire("SELECT 1"),
             outcome: Ok(ok_one(rs("SELECT 1", &["a"], &[23], vec![vec![cell(b"1")]], Some(1)))),
             notices: Vec::new(),
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 0,
-            notifications: vec![ObservedNotify {
+            parameter_statuses: Vec::new(),            notifications: vec![ObservedNotify {
                 pid: 99,
                 channel: "chan".to_string(),
                 payload: b"hello".to_vec(),
@@ -594,9 +588,7 @@ pub fn seed() -> Vec<Transcript> {
                 constraint: None,
             }),
             notices: Vec::new(),
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 0,
-            notifications: Vec::new(),
+            parameter_statuses: Vec::new(),            notifications: Vec::new(),
             backend_pid: Some(TRUST_BACKEND_PID),
             tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
@@ -613,9 +605,7 @@ pub fn seed() -> Vec<Transcript> {
             client_bytes: vec![88, 0, 0, 0, 4],
             outcome: Ok(ObservedOk::default()),
             notices: Vec::new(),
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 0,
-            notifications: Vec::new(),
+            parameter_statuses: Vec::new(),            notifications: Vec::new(),
             backend_pid: Some(TRUST_BACKEND_PID),
             tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Closed,
@@ -647,9 +637,7 @@ pub fn seed() -> Vec<Transcript> {
             parameter_statuses: vec![
                 ("server_version".to_string(), "17.2".to_string()),
                 ("application_name".to_string(), "corpus_app".to_string()),
-            ],
-            unknown_parameter_status_count: 0,
-            notifications: Vec::new(),
+            ],            notifications: Vec::new(),
             backend_pid: Some(1),
             tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
@@ -783,9 +771,7 @@ pub fn seed() -> Vec<Transcript> {
             client_bytes: simple_query_wire("BEGIN"),
             outcome: Ok(ok_one(rs("BEGIN", &[], &[], Vec::new(), None))),
             notices: Vec::new(),
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 0,
-            notifications: Vec::new(),
+            parameter_statuses: Vec::new(),            notifications: Vec::new(),
             backend_pid: Some(TRUST_BACKEND_PID),
             tx_status: ObservedTxStatus::InTransaction,
             terminal: ObservedStatus::Ready,
@@ -813,9 +799,7 @@ pub fn seed() -> Vec<Transcript> {
             client_bytes: simple_query_wire("SAVEPOINT s"),
             outcome: Ok(ok_one(rs("SAVEPOINT", &[], &[], Vec::new(), None))),
             notices: Vec::new(),
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 0,
-            notifications: Vec::new(),
+            parameter_statuses: Vec::new(),            notifications: Vec::new(),
             backend_pid: Some(TRUST_BACKEND_PID),
             tx_status: ObservedTxStatus::Failed,
             terminal: ObservedStatus::Ready,
@@ -863,17 +847,16 @@ pub fn seed() -> Vec<Transcript> {
                 constraint: None,
             }),
             notices: Vec::new(),
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 0,
-            notifications: Vec::new(),
+            parameter_statuses: Vec::new(),            notifications: Vec::new(),
             backend_pid: Some(TRUST_BACKEND_PID),
             tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
         },
     });
 
-    // ── 23. ParameterStatus keys beyond the engine's projected set: the engine
-    //        does not surface them in `parameter_statuses`, but counts them. ──
+    // ── 23. ParameterStatus keys beyond the commonly-modeled set: the engine
+    //        lends every `ParameterStatus` frame raw, so both keys are surfaced
+    //        in `parameter_statuses` in arrival order (no known-key projection). ──
     out.push(Transcript {
         name: "unknown_parameter_status",
         setup: Setup::ActiveViaTrustHandshake,
@@ -891,8 +874,10 @@ pub fn seed() -> Vec<Transcript> {
             client_bytes: simple_query_wire("SET extra_float_digits = 3"),
             outcome: Ok(ok_one(rs("SET", &[], &[], Vec::new(), None))),
             notices: Vec::new(),
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 2,
+            parameter_statuses: vec![
+                ("standard_conforming_strings".to_string(), "on".to_string()),
+                ("IntervalStyle".to_string(), "postgres".to_string()),
+            ],
             notifications: Vec::new(),
             backend_pid: Some(TRUST_BACKEND_PID),
             tx_status: ObservedTxStatus::Idle,
@@ -1030,9 +1015,7 @@ pub fn seed() -> Vec<Transcript> {
                     message: "second notice".to_string(),
                 },
             ],
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 0,
-            notifications: Vec::new(),
+            parameter_statuses: Vec::new(),            notifications: Vec::new(),
             backend_pid: Some(TRUST_BACKEND_PID),
             tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
@@ -1060,9 +1043,7 @@ pub fn seed() -> Vec<Transcript> {
             client_bytes: simple_query_wire("SELECT 1"),
             outcome: Ok(ok_one(rs("SELECT 1", &["a"], &[23], vec![vec![cell(b"1")]], Some(1)))),
             notices: Vec::new(),
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 0,
-            notifications: vec![
+            parameter_statuses: Vec::new(),            notifications: vec![
                 ObservedNotify { pid: 11, channel: "alpha".to_string(), payload: b"first".to_vec() },
                 ObservedNotify { pid: 22, channel: "beta".to_string(), payload: b"second".to_vec() },
             ],
@@ -1282,9 +1263,7 @@ pub fn seed() -> Vec<Transcript> {
                 message: "recovery-window notice".to_string(),
             }],
             // The recovery-window ParameterStatus surfaced + tracked.
-            parameter_statuses: vec![("application_name".to_string(), "recovered_app".to_string())],
-            unknown_parameter_status_count: 0,
-            notifications: Vec::new(),
+            parameter_statuses: vec![("application_name".to_string(), "recovered_app".to_string())],            notifications: Vec::new(),
             backend_pid: Some(TRUST_BACKEND_PID),
             tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
@@ -1332,9 +1311,7 @@ pub fn seed() -> Vec<Transcript> {
             // reachable only because the connection recovered from the error.
             outcome: Ok(ok_one(rs("SELECT 1", &["n"], &[23], vec![vec![cell(b"1")]], Some(1)))),
             notices: Vec::new(),
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 0,
-            notifications: Vec::new(),
+            parameter_statuses: Vec::new(),            notifications: Vec::new(),
             backend_pid: Some(TRUST_BACKEND_PID),
             tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Ready,
@@ -1356,8 +1333,9 @@ pub fn seed() -> Vec<Transcript> {
 pub fn adversarial() -> Vec<Transcript> {
     let mut out = Vec::new();
 
-    // (1) Duplicate ParameterStatus for one key in a single reply. PINNED:
-    // latest value wins ("second"); the command still completes Ready.
+    // (1) Duplicate ParameterStatus for one key in a single reply. PINNED: the
+    // engine lends BOTH frames raw (it retains no map), so both appear in arrival
+    // order ("first" then "second"); the command still completes Ready.
     out.push(Transcript {
         name: "adversarial_dup_parameter_status",
         setup: Setup::ActiveViaTrustHandshake,
@@ -1375,8 +1353,10 @@ pub fn adversarial() -> Vec<Transcript> {
             client_bytes: simple_query_wire("SET application_name = 'x'"),
             outcome: Ok(ok_one(rs("SET", &[], &[], Vec::new(), None))),
             notices: Vec::new(),
-            parameter_statuses: vec![("application_name".to_string(), "second".to_string())],
-            unknown_parameter_status_count: 0,
+            parameter_statuses: vec![
+                ("application_name".to_string(), "first".to_string()),
+                ("application_name".to_string(), "second".to_string()),
+            ],
             notifications: Vec::new(),
             backend_pid: Some(TRUST_BACKEND_PID),
             tx_status: ObservedTxStatus::Idle,
@@ -1406,9 +1386,7 @@ pub fn adversarial() -> Vec<Transcript> {
             client_bytes: simple_query_wire("SELECT v FROM t"),
             outcome: Err(ObservedErr::Protocol(ProtocolFailureKind::Unclassified)),
             notices: Vec::new(),
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 0,
-            notifications: Vec::new(),
+            parameter_statuses: Vec::new(),            notifications: Vec::new(),
             backend_pid: Some(TRUST_BACKEND_PID),
             tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Errored(TerminalErrorKind::Protocol),
@@ -1438,9 +1416,7 @@ pub fn adversarial() -> Vec<Transcript> {
             ],
             outcome: Err(ObservedErr::Protocol(ProtocolFailureKind::HandshakeFailed)),
             notices: Vec::new(),
-            parameter_statuses: Vec::new(),
-            unknown_parameter_status_count: 0,
-            notifications: Vec::new(),
+            parameter_statuses: Vec::new(),            notifications: Vec::new(),
             backend_pid: None,
             tx_status: ObservedTxStatus::Idle,
             terminal: ObservedStatus::Errored(TerminalErrorKind::Handshake),

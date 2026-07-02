@@ -3,7 +3,6 @@ resolver = "3"
 members = [
     "crates/bsql",
     "crates/postgres/proto",
-    "crates/postgres/derive",
     "crates/postgres/core",
     "crates/postgres/async",
     "crates/postgres/sync",
@@ -56,16 +55,12 @@ rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/smir-ant/bsql"
 
-# Crates are added one-by-one as the rebuild rolls out. The
-# workspace currently hosts `bsql-pg-proto` (sans-I/O wire-protocol
-# state machine) + `bsql-pg-proto-derive` (proc-macro).
-
 # ============================================================================
 # Two-tier lint wall.
 # ============================================================================
 #
-# TIER A — the floor below. Inherited by every SHIPPED crate (all seven:
-# bsql, postgres-{proto,derive,core,async,sync}, sqlite) via
+# TIER A — the floor below. Inherited by every SHIPPED crate (all six:
+# bsql, postgres-{proto,core,async,sync}, sqlite) via
 # `lints.workspace = true` in its `Cargo.toml`. Only `tools/devgates`
 # (dev-only, `publish = false`) opts out entirely — it hosts the
 # workspace's sole `unsafe`.
@@ -121,12 +116,12 @@ repository = "https://github.com/smir-ant/bsql"
 #     audited memory-probe the five tests now share. It is promoted into
 #     this floor the moment those tests can be expressed unsafe-free.
 #
-# How proto / derive relate to the floor (NOT an opt-out like devgates):
-# both INHERIT the full Tier-A floor via `lints.workspace = true`, AND
-# keep their own STRICTER crate-root forbid-bundle in `src/lib.rs` (the
+# How proto relates to the floor (NOT an opt-out like devgates): it
+# INHERITS the full Tier-A floor via `lints.workspace = true`, AND
+# keeps its own STRICTER crate-root forbid-bundle in `src/lib.rs` (the
 # no_std panic / index / arith / cast wall + `#![forbid(unsafe_code)]`).
 # A double-forbid of the same lint is not a conflict, so the two coexist.
-# Their ONLY divergence from the floor is a single crate-root reasoned
+# Its ONLY divergence from the floor is a single crate-root reasoned
 # `#![allow(clippy::disallowed_methods, reason = "...")]` that opts out of
 # the `deny`-level tier-4 LEDGER (not the floor): under the stricter
 # whole-crate forbid-bundle the `try_from(..).unwrap_or(SAT)` /
@@ -140,8 +135,8 @@ repository = "https://github.com/smir-ant/bsql"
 # modules stabilize. Counts below are measured @ this base across
 # `--workspace --all-targets` with every crate-root forbid-bundle
 # OVERRIDDEN to `warn` (i.e. the naive count of what would fire if the
-# floor adopted the lint with no per-crate suppression; proto/derive
-# already forbid most of these at their crate root, so the production
+# floor adopted the lint with no per-crate suppression; proto
+# already forbids most of these at its crate root, so the production
 # total is far lower):
 #   missing_docs (~275: fields/methods/modules/etc.),
 #   let_underscore_must_use (~99), arithmetic_side_effects (38),
@@ -200,7 +195,7 @@ allow_attributes_without_reason = "forbid"
 # production un-panicked while letting the keystone above (every override
 # carries a `reason`) make each test exception greppable and justified.
 # Measured: zero PRODUCTION (non-test, non-helper) violations across all
-# shipped crates (proto/derive already forbid these at their stricter
+# shipped crates (proto already forbids these at its stricter
 # crate root).
 panic = "deny"
 unwrap_used = "deny"
@@ -395,8 +390,8 @@ criterion = { version = "0.5", default-features = false, features = ["html_repor
 
 # `trybuild` — `compile_fail` golden harness for the workspace's
 # hostile-bypass probes (the `PreparedQuery` seal matrix in
-# `bsql-query-fixture`) and the broader set of schema-validation and
-# derive compile-fail probes across the workspace.
+# `bsql-query-fixture`) and the broader set of schema-validation
+# compile-fail probes across the workspace.
 # Pins the EXACT compiler diagnostic for each forbidden user pattern
 # (e.g., `error[E0451]: field 'sql' of struct 'PreparedQuery' is
 # private`). A future contributor whose change perturbs the
@@ -418,13 +413,15 @@ criterion = { version = "0.5", default-features = false, features = ["html_repor
 # meaningfully shrink it for dev-deps).
 trybuild = { version = "1" }
 
-# Proc-macro toolchain used ONLY by `bsql-pg-proto-derive`
-# (proc-macro pair-crate for `bsql-pg-proto`). `bsql-pg-proto`
-# itself never depends on these — they live entirely behind the
-# pair-crate boundary. Audit-trust class: **expert-domain ecosystem
-# standard** (1B+ downloads each, embedded in the Rust toolchain
-# ecosystem; transitive `unsafe` for token-stream manipulation is
-# bounded and well-audited). Pinned majors per CREDO §4.4.
+# Proc-macro toolchain used by `bsql-query-macros` (the host-only
+# proc-macro that types/validates the compile-checked `query!` API).
+# It is a proc-macro crate that runs in the compiler and is never
+# linked into a consumer's runtime binary, so these deps live entirely
+# behind the proc-macro boundary — the `runtime_graph_pin` gate proves
+# no shipped crate's runtime graph reaches them. Audit-trust class:
+# **expert-domain ecosystem standard** (1B+ downloads each, embedded in
+# the Rust toolchain ecosystem; transitive `unsafe` for token-stream
+# manipulation is bounded and well-audited). Pinned majors per CREDO §4.4.
 syn = { version = "2", default-features = false, features = ["proc-macro", "derive", "parsing", "printing"] }
 quote = { version = "1", default-features = false }
 proc-macro2 = { version = "1", default-features = false, features = ["proc-macro"] }

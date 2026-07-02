@@ -102,23 +102,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "bsql-postgres-derive"
-version = "1.0.0-alpha.0"
-dependencies = [
- "bsql-postgres-proto",
- "proc-macro2",
- "quote",
- "syn",
- "trybuild",
-]
-
-[[package]]
 name = "bsql-postgres-proto"
 version = "1.0.0-alpha.0"
 dependencies = [
  "base64ct",
  "bsql-devgates",
- "bsql-postgres-derive",
  "criterion",
  "getrandom",
  "heapless",

@@ -96,13 +96,6 @@
 // without an allocator should use Trust-auth (no Box allocated).
 extern crate alloc;
 
-// Self-alias enables generated code from `bsql-pg-proto-derive`
-// (e.g. `#[derive(Pristine)]`) to reference
-// `::bsql_postgres_proto::pristine::Pristine` via its absolute path —
-// resolves the same way both inside this crate AND in downstream
-// user crates. Standard Rust derive-pair convention.
-extern crate self as bsql_postgres_proto;
-
 // **Transitive-`unsafe` audit-trust chain**.
 //
 // `bsql-pg-proto` itself uses `#![forbid(unsafe_code)]` (above). Every line
@@ -177,9 +170,6 @@ pub mod reply_id;
 pub mod command_tag;
 
 pub mod scram;
-// Accumulator for the server's `ParameterStatus` (`'S'`) key/value pairs
-// observed during/after the handshake (server_version, client_encoding, …).
-pub mod session_params;
 // Test-only `DropCounter` machinery + sealed `CrateZeroizeSecret`
 // manifest. The exhaustiveness gate fails build-time if the
 // manifest drifts from src; per-type DropCounter witnesses run on
@@ -192,9 +182,6 @@ pub(crate) mod drop_witness;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 pub mod sensitive;
-// Pristine trait paired with `#[derive(Pristine)]` from
-// `bsql-pg-proto-derive`.
-pub mod pristine;
 pub mod state;
 // The bridge trait from a compile-checked `query!` carrier to its prepared
 // query + typed-record decoders. Consumed by the drivers' typed `query`
@@ -223,12 +210,6 @@ pub use reply_id::{
     ReplyId, ReplyKind, StartupKind,
 };
 pub use sensitive::Sensitive;
-pub use session_params::{Encoding, OtherEncoding, SessionParams};
-// Re-export the `Pristine` trait + matching derive macro under one
-// name. Rust trait and derive macro live in DIFFERENT namespaces
-// (type vs macro), so identical-name re-exports do NOT collide.
-pub use bsql_postgres_derive::Pristine;
-pub use pristine::Pristine;
 pub use plan_mode::{
     PlanCacheMode, PLAN_CACHE_MODE, RESET_PLAN_CACHE_MODE_SQL, SET_PLAN_CACHE_MODE_SQL,
 };

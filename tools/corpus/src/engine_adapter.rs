@@ -26,9 +26,7 @@ use bsql_postgres_proto::engine::{
     EngineError, Event, Live, NoObserver, Outcome, SendBuf, Surface,
 };
 use bsql_postgres_proto::prepared::new_prepared_query;
-use bsql_postgres_proto::{
-    Credentials, Encoding, Ident, PreparedQuery, SessionParams, TxStatus,
-};
+use bsql_postgres_proto::{Credentials, Ident, PreparedQuery, TxStatus};
 
 use core::convert::Infallible;
 use core::ops::ControlFlow;
@@ -165,7 +163,7 @@ fn run_handshake(transcript: &Transcript) -> ObservedRun {
     };
 
     let mut chunks = split_into_chunks(&server_bytes, transcript.chunk_schedule).into_iter();
-    let mut params = SessionParams::new();
+    let mut params: Vec<(String, String)> = Vec::new();
     let mut ready = false;
 
     loop {
@@ -178,8 +176,8 @@ fn run_handshake(transcript: &Transcript) -> ObservedRun {
             }
             AuthEvent::Fail(_) => break,
             AuthEvent::ParamStatus(payload) => {
-                if let Some((key, value)) = split_parameter_status(payload) {
-                    params.set(key, value);
+                if let Some(kv) = observe_parameter_status(payload) {
+                    params.push(kv);
                 }
                 false
             }
@@ -218,7 +216,7 @@ fn run_handshake(transcript: &Transcript) -> ObservedRun {
         match engine.into_active() {
             Ok(active) => ready_run(
                 client_bytes,
-                &params,
+                params,
                 active.backend_pid(),
                 active.tx_status(),
             ),
@@ -255,7 +253,9 @@ fn feed_chunk(engine: &mut ConnectingEngine, chunk: &[u8]) -> bool {
 }
 
 /// Split a `ParameterStatus` payload (`key\0value\0`) into its key/value byte
-/// slices.
+/// slices. `None` when the payload carries no NUL separator (a malformed frame
+/// with no key/value structure — no fixture emits one, and there is no partial
+/// key to surface).
 fn split_parameter_status(payload: &[u8]) -> Option<(&[u8], &[u8])> {
     let key_end = payload.iter().position(|&byte| byte == 0)?;
     let key = &payload[..key_end];
@@ -268,10 +268,30 @@ fn split_parameter_status(payload: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((key, value))
 }
 
-/// A `Ready` observed run reached via the handshake.
+/// Observe one raw `ParameterStatus` frame exactly as the engine lends it: the
+/// key/value bytes decoded to owned strings, no normalization, no known-key
+/// projection. This is the raw shape the shipped engine surfaces — every GUC the
+/// server sends, in arrival order, with the wire spelling PG chose.
+///
+/// Text decode is `from_utf8_lossy` — the same idiom the sibling diagnostic /
+/// notification parsers use: an invalid byte becomes a visible U+FFFD rather
+/// than silently dropping the parameter (PG GUC values are ASCII in practice, so
+/// this never fires for the fixtures). A payload with no NUL separator has no
+/// (key, value) to surface, so `None` is skipped by the caller — mirroring how a
+/// malformed `NotificationResponse` is skipped in [`parse_notification`].
+fn observe_parameter_status(payload: &[u8]) -> Option<(String, String)> {
+    let (key, value) = split_parameter_status(payload)?;
+    Some((
+        String::from_utf8_lossy(key).into_owned(),
+        String::from_utf8_lossy(value).into_owned(),
+    ))
+}
+
+/// A `Ready` observed run reached via the handshake. `parameter_statuses` is the
+/// raw (key, value) list the engine lent, in arrival order.
 fn ready_run(
     client_bytes: Vec<u8>,
-    params: &SessionParams,
+    parameter_statuses: Vec<(String, String)>,
     backend_pid: i32,
     tx_status: TxStatus,
 ) -> ObservedRun {
@@ -279,8 +299,7 @@ fn ready_run(
         client_bytes,
         outcome: Ok(ObservedOk::default()),
         notices: Vec::new(),
-        parameter_statuses: observe_param_statuses(params),
-        unknown_parameter_status_count: u32::from(params.n_unknown_dropped),
+        parameter_statuses,
         notifications: Vec::new(),
         backend_pid: Some(backend_pid),
         tx_status: map_tx_status(tx_status),
@@ -295,7 +314,6 @@ fn failed_run(client_bytes: Vec<u8>) -> ObservedRun {
         outcome: Err(ObservedErr::Protocol(ProtocolFailureKind::HandshakeFailed)),
         notices: Vec::new(),
         parameter_statuses: Vec::new(),
-        unknown_parameter_status_count: 0,
         notifications: Vec::new(),
         backend_pid: None,
         tx_status: ObservedTxStatus::Idle,
@@ -310,49 +328,6 @@ fn map_tx_status(status: TxStatus) -> ObservedTxStatus {
         TxStatus::Idle => ObservedTxStatus::Idle,
         TxStatus::InTransaction => ObservedTxStatus::InTransaction,
         TxStatus::Failed => ObservedTxStatus::Failed,
-    }
-}
-
-/// Project the accumulated session parameters into the ordered observable
-/// (key, value) list — the same fixed-key projection the golden was captured
-/// under, over the engine's `SessionParams` ingest.
-fn observe_param_statuses(params: &SessionParams) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    if let Some(v) = params.server_version.as_ref() {
-        out.push(("server_version".to_string(), v.as_str().to_string()));
-    }
-    if let Some(enc) = params.server_encoding.as_ref() {
-        out.push(("server_encoding".to_string(), encoding_name(enc)));
-    }
-    if let Some(enc) = params.client_encoding.as_ref() {
-        out.push(("client_encoding".to_string(), encoding_name(enc)));
-    }
-    if let Some(v) = params.application_name.as_ref() {
-        out.push(("application_name".to_string(), v.as_str().to_string()));
-    }
-    if let Some(b) = params.is_superuser {
-        out.push(("is_superuser".to_string(), bool_on_off(b)));
-    }
-    if let Some(v) = params.session_authorization.as_ref() {
-        out.push(("session_authorization".to_string(), v.as_str().to_string()));
-    }
-    if let Some(v) = params.date_style.as_ref() {
-        out.push(("DateStyle".to_string(), v.as_str().to_string()));
-    }
-    if let Some(b) = params.integer_datetimes {
-        out.push(("integer_datetimes".to_string(), bool_on_off(b)));
-    }
-    if let Some(v) = params.time_zone.as_ref() {
-        out.push(("TimeZone".to_string(), v.as_str().to_string()));
-    }
-    out
-}
-
-fn bool_on_off(b: bool) -> String {
-    if b {
-        "on".to_string()
-    } else {
-        "off".to_string()
     }
 }
 
@@ -467,7 +442,7 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
     };
 
     let backend_pid = active.backend_pid();
-    let mut params = SessionParams::new();
+    let mut params: Vec<(String, String)> = Vec::new();
     let mut notices: Vec<ObservedNotice> = Vec::new();
     let mut notifications: Vec<ObservedNotify> = Vec::new();
     let mut outcome: Result<ObservedOk, ObservedErr> = Ok(ObservedOk::default());
@@ -580,8 +555,7 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
         client_bytes: Vec::new(),
         outcome,
         notices,
-        parameter_statuses: observe_param_statuses(&params),
-        unknown_parameter_status_count: u32::from(params.n_unknown_dropped),
+        parameter_statuses: params,
         notifications,
         backend_pid: Some(backend_pid),
         tx_status: map_tx_status(active.tx_status()),
@@ -595,7 +569,7 @@ fn drive_step(
     active: &mut ActiveEngine,
     step: &Step,
     schedule: bsql_corpus::ChunkSchedule,
-    params: &mut SessionParams,
+    params: &mut Vec<(String, String)>,
     notices: &mut Vec<ObservedNotice>,
     notifications: &mut Vec<ObservedNotify>,
 ) -> PullStep {
@@ -669,8 +643,8 @@ fn drive_step(
                 }
             }
             PullEvent::ParamStatus(raw) => {
-                if let Some((key, value)) = split_parameter_status(&raw) {
-                    params.set(key, value);
+                if let Some(kv) = observe_parameter_status(&raw) {
+                    params.push(kv);
                 }
             }
             PullEvent::CopyData(bytes) => scratch.copy_out.push(bytes),
@@ -1066,7 +1040,7 @@ fn run_verb_body<'b>(
     }
 
     let backend_pid = engine.backend_pid().ok();
-    let mut params = SessionParams::new();
+    let mut params: Vec<(String, String)> = Vec::new();
     let mut notices: Vec<ObservedNotice> = Vec::new();
     let mut notifications: Vec<ObservedNotify> = Vec::new();
     let mut outcome: Result<ObservedOk, ObservedErr> = Ok(ObservedOk::default());
@@ -1154,8 +1128,7 @@ fn run_verb_body<'b>(
         client_bytes,
         outcome,
         notices,
-        parameter_statuses: observe_param_statuses(&params),
-        unknown_parameter_status_count: u32::from(params.n_unknown_dropped),
+        parameter_statuses: params,
         notifications,
         backend_pid,
         tx_status,
@@ -1170,7 +1143,7 @@ fn drive_verb_step<'b>(
     live: Live<'b>,
     request: &ClientRequest,
     cap: &mut VerbCapture,
-    params: &mut SessionParams,
+    params: &mut Vec<(String, String)>,
     notices: &mut Vec<ObservedNotice>,
     notifications: &mut Vec<ObservedNotify>,
 ) -> Result<Outcome<'b, CommandStatus>, EngineError<Infallible>> {
@@ -1199,7 +1172,7 @@ fn drive_verb_step<'b>(
 fn fold_surface(
     surface: Surface<'_>,
     cap: &mut VerbCapture,
-    params: &mut SessionParams,
+    params: &mut Vec<(String, String)>,
     notices: &mut Vec<ObservedNotice>,
     notifications: &mut Vec<ObservedNotify>,
 ) {
@@ -1230,8 +1203,8 @@ fn fold_surface(
             }
         }
         Surface::ParamStatus(body) => {
-            if let Some((key, value)) = split_parameter_status(body) {
-                params.set(key, value);
+            if let Some(kv) = observe_parameter_status(body) {
+                params.push(kv);
             }
         }
         Surface::CopyData(body) => cap.copy_out.push(body.to_vec()),
@@ -1286,23 +1259,5 @@ fn flatten_verb(
     match polled {
         Ok(inner) => inner,
         Err(_) => Err(EngineError::SpuriousPending),
-    }
-}
-
-/// Canonical PG name for a parsed encoding. Mirrors the golden's mapping; the
-/// non-exhaustive wildcard yields a stable placeholder (never a silent drop).
-fn encoding_name(enc: &Encoding) -> String {
-    match enc {
-        Encoding::Utf8 => "UTF8".to_string(),
-        Encoding::SqlAscii => "SQL_ASCII".to_string(),
-        Encoding::Latin1 => "LATIN1".to_string(),
-        Encoding::Latin9 => "LATIN9".to_string(),
-        Encoding::Win1252 => "WIN1252".to_string(),
-        Encoding::EucJp => "EUC_JP".to_string(),
-        Encoding::EucKr => "EUC_KR".to_string(),
-        Encoding::Big5 => "BIG5".to_string(),
-        Encoding::Gb18030 => "GB18030".to_string(),
-        Encoding::Other(o) => String::from_utf8_lossy(o.as_bytes()).into_owned(),
-        _ => "<unknown-encoding>".to_string(),
     }
 }

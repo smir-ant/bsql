@@ -54,7 +54,6 @@ use std::process::Command;
 const SHIPPED_CRATES: &[&str] = &[
     "bsql",
     "bsql-postgres-proto",
-    "bsql-postgres-derive",
     "bsql-postgres-core",
     "bsql-postgres-async",
     "bsql-postgres-sync",

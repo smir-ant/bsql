@@ -49,7 +49,7 @@
 # The remaining three had no surviving property to port:
 #   * sole_path_compile_fail      → engine_linearity_compile_fail (construction sealing)
 #   * error_arena_staleness_spec  → (error arena deleted; engine surfaces errors via EngineError)
-#   * session_params_staleness_spec → (the PgProtocol Box-slot deleted; SessionParams the type stays)
+#   * session_params_staleness_spec → (the PgProtocol Box-slot deleted; SessionParams the type deleted too)
 # scram_fuzz_spec was REWRITTEN IN PLACE to drive the new connecting engine
 # (its SCRAM-parser-robustness property is a carve-out, not push-path-specific).
 

@@ -11,7 +11,6 @@ bsql-corpus 0.0.0
 bsql-devgates 0.0.0
 bsql-postgres-async 0.1.0-alpha.0
 bsql-postgres-core 0.1.0-alpha.0
-bsql-postgres-derive 1.0.0-alpha.0
 bsql-postgres-proto 1.0.0-alpha.0
 bsql-postgres-sync 0.1.0-alpha.0
 bsql-query-fixture 0.0.0

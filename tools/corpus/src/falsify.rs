@@ -334,12 +334,6 @@ pub fn battery() -> Vec<Mutation> {
         M { name: "backend_pid_to_none", class: "backend_pid", blind_spot_probe: true,
             apply: |r| { if r.backend_pid.is_some() { r.backend_pid = None; } } },
 
-        // ── ParameterStatus keys beyond the projected set (BLIND-SPOT) ──
-        M { name: "unknown_param_count_to_zero", class: "unknown_param", blind_spot_probe: true,
-            apply: |r| { if r.unknown_parameter_status_count != 0 { r.unknown_parameter_status_count = 0; } } },
-        M { name: "unknown_param_count_plus_one", class: "unknown_param", blind_spot_probe: true,
-            apply: |r| { r.unknown_parameter_status_count = r.unknown_parameter_status_count.wrapping_add(1); } },
-
         // ── notices ──
         M { name: "drop_all_notices", class: "notices", blind_spot_probe: false,
             apply: |r| { if !r.notices.is_empty() { r.notices.clear(); } } },
@@ -404,9 +398,12 @@ pub fn battery() -> Vec<Mutation> {
             apply: |r| { if let Err(ObservedErr::Protocol(k @ ProtocolFailureKind::HandshakeFailed)) = &mut r.outcome { *k = ProtocolFailureKind::Unclassified; } } },
 
         // ── parameter statuses ──
+        // The engine lends every ParameterStatus frame raw, in arrival order, so
+        // these model dropping the set, collapsing a duplicate frame's distinct
+        // value, corrupting a value, and reordering the arrival sequence.
         M { name: "drop_param_statuses", class: "param_status", blind_spot_probe: false,
             apply: |r| { if !r.parameter_statuses.is_empty() { r.parameter_statuses.clear(); } } },
-        M { name: "dup_keep_first_not_latest", class: "param_status", blind_spot_probe: false,
+        M { name: "dup_second_value_collapsed", class: "param_status", blind_spot_probe: false,
             apply: |r| { for (_, v) in &mut r.parameter_statuses { if v == "second" { *v = "first".to_string(); } } } },
         M { name: "change_param_value", class: "param_status", blind_spot_probe: false,
             apply: |r| { if let Some((_, v)) = r.parameter_statuses.first_mut() { v.push_str("_x"); } } },

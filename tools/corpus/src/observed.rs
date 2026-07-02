@@ -28,18 +28,12 @@ pub struct ObservedRun {
     /// (e.g. one arriving during the auth handshake) does NOT appear here —
     /// that absence is itself a pinned observable.
     pub notices: Vec<ObservedNotice>,
-    /// The connection's accumulated parameter status set (key, value) read
-    /// from the public session-parameter surface after the run, in a fixed
-    /// key order. A duplicate `ParameterStatus` for one key collapses to the
-    /// engine's retained value — that collapse is the pinned observable.
+    /// Every `ParameterStatus` (key, value) the engine surfaced during the run,
+    /// in arrival order, decoded raw from the wire — the exact frames the engine
+    /// lends, with no known-key projection and no normalization. A duplicate
+    /// `ParameterStatus` for one key appears as two entries (the engine surfaces
+    /// each frame; it retains no map), so a dropped or reordered frame diverges.
     pub parameter_statuses: Vec<(String, String)>,
-    /// Count of `ParameterStatus` keys the engine could not classify into its
-    /// projected key set and silently dropped. A key outside the projected
-    /// set (e.g. `standard_conforming_strings`, `IntervalStyle`) is NOT
-    /// surfaced in `parameter_statuses`; the engine only counts it. Surfacing
-    /// the count makes "the engine saw N keys it does not model" observable —
-    /// a future engine that begins projecting one of those keys diverges here.
-    pub unknown_parameter_status_count: u32,
     /// Asynchronous `NotificationResponse` (`LISTEN`/`NOTIFY`) events
     /// surfaced during any step, in arrival order.
     pub notifications: Vec<ObservedNotify>,

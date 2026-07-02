@@ -43,14 +43,6 @@ subtle = { workspace = true }
 zeroize = { workspace = true }
 simdutf8 = { workspace = true }
 
-# Pair-crate hosting `#[derive(Pristine)]`. Standard Rust convention
-# (mirror `serde`/`serde-derive`, `zeroize`/`zeroize-derive`). The derive
-# crate is pulled in for proc-macro expansion only — its
-# transitive deps (`syn`/`quote`/`proc-macro2`) live in the
-# proc-macro pair-crate boundary and do NOT propagate to runtime
-# users of `bsql-postgres-proto`.
-bsql-postgres-derive = { path = "../derive", version = "1.0.0-alpha.0" }
-
 # `getrandom` is a dev/test dependency for deterministic nonce
 # injection in tests. Production nonce generation uses it too, but
 # behind a cfg — the no_std, no_alloc contract is preserved because
@@ -84,8 +76,7 @@ criterion = { workspace = true }
 # `trybuild` — golden compile-fail harness for the sole-path injection
 # seam: proves an EXTERNAL crate cannot struct-literal-construct
 # `SimpleQuery` / `Parse` (the `sql` field is `pub(crate)` → E0451), so the
-# only construction route is the explicit `::new` seam. Same harness
-# pattern as the derive crate's hostile-bypass probes. Dev-only.
+# only construction route is the explicit `::new` seam. Dev-only.
 trybuild = { workspace = true }
 
 # `bsql-devgates` — dev-only harness hosting the workspace's only

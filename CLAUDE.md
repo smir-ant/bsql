@@ -44,20 +44,19 @@ Load-bearing decisions for any new session:
 
 ```
 crates/
-  bsql/              — umbrella facade + query! re-export (bsql::pg, ::pg_sync, ::sqlite)  — 173 LoC
+  bsql/              — umbrella facade + query! re-export (bsql::pg, ::pg_sync, ::sqlite)  — 197 LoC
   postgres/
-    proto/           — sans-IO wire protocol + session engine (no_std + alloc)  — 24813 LoC
-    core/            — shared engine materializer + types + config + TLS + Rows  — 3776 LoC
-    async/           — tokio async driver (thin adapter over the engine)  — 1711 LoC
-    sync/            — std::net sync driver (thin adapter over the engine)  — 1534 LoC
-    derive/          — proc-macro for `#[derive(Pristine)]` struct-freshness checks  — 416 LoC
+    proto/           — sans-IO wire protocol + session engine (no_std + alloc)  — 24245 LoC
+    core/            — shared engine materializer + types + config + TLS + Rows  — 4169 LoC
+    async/           — tokio async driver (thin adapter over the engine)  — 1705 LoC
+    sync/            — std::net sync driver (thin adapter over the engine)  — 1529 LoC
   sqlite/
     driver/          — embedded SQLite driver (bundled rusqlite)  — 1010 LoC
   build/             — BUILD-DEP: migration DDL → schema catalog (+ SQLite template)  — 32862 LoC
   query-macros/      — PROC-MACRO: reads the catalog, types/validates query!  — 1285 LoC
 ```
 
-(src LoC measured @ HEAD 67882617 via, per crate, `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by ~13K lines of inference tests in `src/infer.rs`. Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync,derive}`, `bsql-sqlite`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-sqlite-fixture`, `bsql-corpus`.)
+(src LoC measured per crate via `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by ~13K lines of inference tests in `src/infer.rs`. Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync}`, `bsql-sqlite`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-sqlite-fixture`, `bsql-corpus`.)
 
 ## Build & test
 

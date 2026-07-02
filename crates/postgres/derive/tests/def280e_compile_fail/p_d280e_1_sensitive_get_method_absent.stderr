@@ -1,5 +1,0 @@
-error[E0599]: no method named `get` found for struct `Sensitive<T>` in the current scope
-  --> tests/def280e_compile_fail/p_d280e_1_sensitive_get_method_absent.rs:22:15
-   |
-22 |     let _ = s.get();
-   |               ^^^ method not found in `Sensitive<i32>`

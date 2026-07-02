@@ -191,7 +191,7 @@ All measured at commit `67882617` in this worktree:
 - **Source LoC** (per shipped crate `src/`; the largest, `bsql-build`, is
   dominated by an inline `#[cfg(test)]` inference test module):
   ```bash
-  for d in crates/bsql crates/postgres/{proto,core,async,sync,derive} \
+  for d in crates/bsql crates/postgres/{proto,core,async,sync} \
            crates/sqlite/driver crates/build crates/query-macros; do
     printf '%-28s %s\n' "$d" \
       "$(find "$d/src" -name '*.rs' -exec cat {} + | wc -l)"

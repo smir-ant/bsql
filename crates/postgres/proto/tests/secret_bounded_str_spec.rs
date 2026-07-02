@@ -4,8 +4,8 @@
 //! # Scope
 //!
 //! `SecretBoundedStr<N>` is the foundation type for closing the
-//! staleness-leak class in `ErrorPayload` + `SessionParams`
-//! sensitive fields. Its Drop fires `BoundedStr::zeroize_in_place`
+//! staleness-leak class in `ErrorPayload` sensitive fields. Its Drop
+//! fires `BoundedStr::zeroize_in_place`
 //! which scrubs `buf + len + was_lossy_flag` to zero. This file
 //! pins:
 //!

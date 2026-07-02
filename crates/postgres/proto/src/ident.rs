@@ -551,8 +551,8 @@ const _: () = assert!(
 // type is forbidden by Rust. Splitting sensitive vs non-sensitive
 // bounded strings keeps the hot-path types (`Ident`, `StmtName`,
 // `Sql`, non-secret `BoundedStr`) Copy-fast while sensitive types
-// (used in `ErrorPayload` / `SessionParams` sensitive fields) get
-// the Drop-chain guarantee.
+// (used in `ErrorPayload` sensitive fields) get the Drop-chain
+// guarantee.
 //
 // **Implementation**: thin wrapper around `BoundedStr<N>` (storage
 // reuse, no duplicated truncation/UTF-8 logic). The wrapper is
