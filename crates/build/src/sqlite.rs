@@ -561,6 +561,18 @@ fn sqlite_rust_type(decltype: &str) -> Option<RustType> {
         "smallint" | "int2" => Some(RustType::I16),
         "boolean" | "bool" => Some(RustType::Bool),
         "text" | "varchar" | "char" | "character" | "bpchar" | "clob" => Some(RustType::Text),
+        // SQLite has exactly ONE floating type: 8-byte REAL (= Rust `f64`).
+        // Every float spelling (`real`, `float`, `double precision`,
+        // `float4`, `float8`) resolves to it. A PostgreSQL `float8` /
+        // `double precision` column (lattice `f64`) therefore AGREES; a
+        // PostgreSQL `float4` / `real` column (lattice `f32`) does NOT — its
+        // 4-byte width has no SQLite equivalent, so the conformance check
+        // flags the genuine divergence loudly rather than reading 8 SQLite
+        // bytes into an `f32`.
+        "real" | "float" | "double" | "float4" | "float8" => Some(RustType::F64),
+        // `bytea`'s SQLite peer is BLOB — an opaque byte string, decoding to
+        // the same `Vec<u8>` / `&[u8]`.
+        "blob" => Some(RustType::Bytea),
         _ => None,
     }
 }
@@ -690,8 +702,28 @@ mod tests {
         assert_eq!(sqlite_rust_type("TEXT"), Some(RustType::Text));
         assert_eq!(sqlite_rust_type("VARCHAR(50)"), Some(RustType::Text));
         assert_eq!(sqlite_rust_type("BOOLEAN"), Some(RustType::Bool));
+        // Every SQLite float spelling resolves to the single 8-byte REAL
+        // type = `f64`; `blob` is the `bytea` peer.
+        assert_eq!(sqlite_rust_type("REAL"), Some(RustType::F64));
+        assert_eq!(sqlite_rust_type("FLOAT8"), Some(RustType::F64));
+        assert_eq!(sqlite_rust_type("DOUBLE PRECISION"), Some(RustType::F64));
+        // A `float4` / `real` column resolves to 8-byte REAL on SQLite (f64),
+        // so it does NOT equal the lattice's `f32` — the differential oracle
+        // catches that divergence via `Type` mismatch, not by mapping here.
+        assert_eq!(sqlite_rust_type("FLOAT4"), Some(RustType::F64));
+        assert_eq!(sqlite_rust_type("BLOB"), Some(RustType::Bytea));
         // The one fork: oid has no SQLite equivalent.
         assert_eq!(sqlite_rust_type("OID"), None);
+    }
+
+    #[test]
+    fn sqlite_float4_column_diverges_from_lattice_f32() {
+        // A migration column typed `float4` in the catalog is `f32` in the
+        // lattice; the SQLite peer resolves the same column to 8-byte REAL
+        // (`f64`). The conformance oracle must flag this — silently reading 8
+        // SQLite bytes into an `f32` decoder would be wrong.
+        assert_ne!(sqlite_rust_type("FLOAT4"), Some(RustType::F32));
+        assert_eq!(sqlite_rust_type("FLOAT8"), Some(RustType::F64));
     }
 
     #[test]

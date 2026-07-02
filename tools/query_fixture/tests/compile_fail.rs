@@ -40,6 +40,10 @@ fn unknown_reference_is_compile_error() {
     t.compile_fail("tests/compile_fail/query_uncast_param.rs");
     t.compile_fail("tests/compile_fail/query_wrong_field.rs");
     t.compile_fail("tests/compile_fail/query_type_mismatch.rs");
+    // The widened `{f32, f64, bytea}` types keep the wrong-type wall: a
+    // `float4` column's record field is `f32`, and using it where an `f64`
+    // is expected is E0308 — widening did not weaken the type safety.
+    t.compile_fail("tests/compile_fail/query_float_type_mismatch.rs");
     // A duplicate output column name cannot become two record fields of
     // one name — surfaced as a compile_error, never silently collapsed.
     t.compile_fail("tests/compile_fail/query_duplicate_column.rs");

@@ -42,6 +42,36 @@ bsql_query_macros::query!(
     "SELECT n FROM (VALUES (1::int4), (2), (3), (4), (5)) AS t(n) WHERE n <= $1::int4"
 );
 
+// ── widened types: float4 / float8 / bytea ──────────────────────────────
+bsql_query_macros::query!(Fl, "SELECT 1.5::float8 AS x, 2.5::float4 AS y");
+bsql_query_macros::query!(NullFloat, "SELECT NULL::float8 AS x");
+bsql_query_macros::query!(Bytes, r"SELECT '\xDEADBEEF'::bytea AS b");
+bsql_query_macros::query!(EchoF, "SELECT $1::float8 AS x");
+bsql_query_macros::query!(EchoB, "SELECT $1::bytea AS b");
+bsql_query_macros::query!(
+    Mixed,
+    r"SELECT 7::int4 AS i, 2.5::float4 AS f, 8.5::float8 AS g, '\x0102'::bytea AS b"
+);
+
+// ── widened ARRAY params: `col = ANY($1)` — see the sync file for the wire
+//    rationale (the `array_send` bytes must reach PG byte-correct).
+bsql_query_macros::query!(
+    FloatAny,
+    "SELECT x FROM (VALUES (1.5::float8), (2.5::float8), (3.5::float8)) t(x) WHERE x = ANY($1)"
+);
+bsql_query_macros::query!(
+    Float4Any,
+    "SELECT x FROM (VALUES (1.5::float4), (2.5::float4), (3.5::float4)) t(x) WHERE x = ANY($1)"
+);
+bsql_query_macros::query!(
+    IntAny,
+    "SELECT n FROM (VALUES (10::int8), (20::int8), (30::int8)) t(n) WHERE n = ANY($1)"
+);
+bsql_query_macros::query!(
+    ByteaAny,
+    r"SELECT b FROM (VALUES ('\x01'::bytea), ('\x02'::bytea), ('\x03'::bytea)) t(b) WHERE b = ANY($1)"
+);
+
 fn async_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
@@ -378,5 +408,140 @@ async fn query_each_with_param_streams_filtered() {
         .expect("query_each with a bound param");
     assert_eq!(done, None, "fully streamed");
     assert_eq!(collected, vec![1, 2, 3], "only rows where n <= $1 (=3)");
+    c.close().await.expect("close");
+}
+
+/// WIDENING (float4/float8): two fixed-width float columns round-trip exactly.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_float_columns_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let owned = c.query_one::<FlQuery>(()).await.expect("query_one Fl");
+    assert_eq!(owned.x, 1.5_f64, "float8 1.5 exact");
+    assert_eq!(owned.y, 2.5_f32, "float4 2.5 exact");
+    c.close().await.expect("close");
+}
+
+/// WIDENING (nullable float): `NULL::float8` -> `Option<f64>` -> None.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_nullable_float_decodes_none() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let owned = c
+        .query_one::<NullFloatQuery>(())
+        .await
+        .expect("query_one NullFloat");
+    assert_eq!(owned.x, None, "NULL::float8 -> None");
+    c.close().await.expect("close");
+}
+
+/// WIDENING (bytea): borrowed `&[u8]` and owned `Vec<u8>` both decode the bytes.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_bytea_column_borrowed_and_owned() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+
+    let rows = c.query::<BytesQuery>(()).await.expect("query Bytes");
+    let rec = rows.iter().next().expect("one row").expect("row decodes");
+    assert_eq!(rec.b, &[0xDE, 0xAD, 0xBE, 0xEF], "borrowed &[u8]");
+
+    let owned = c.query_one::<BytesQuery>(()).await.expect("query_one Bytes");
+    assert_eq!(owned.b, vec![0xDE, 0xAD, 0xBE, 0xEF], "owned Vec<u8>");
+    c.close().await.expect("close");
+}
+
+/// WIDENING (params): a `float8` and a `&[u8]` bind through `ParamsWriter`.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_float_and_bytea_params_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+
+    let f = c
+        .query_one::<EchoFQuery>((1.25_f64,))
+        .await
+        .expect("query_one EchoF(1.25)");
+    assert_eq!(f.x, 1.25_f64, "float8 param 1.25");
+
+    let b = c
+        .query_one::<EchoBQuery>((&[1u8, 2, 3][..],))
+        .await
+        .expect("query_one EchoB([1,2,3])");
+    assert_eq!(b.b, vec![1u8, 2, 3], "bytea param [1,2,3]");
+    c.close().await.expect("close");
+}
+
+/// WIDENING (mixed row): int + float4 + float8 + bytea on the per-cell path.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_mixed_fixed_and_variable_row() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let rows = c.query::<MixedQuery>(()).await.expect("query Mixed");
+    let rec = rows.iter().next().expect("one row").expect("row decodes");
+    assert_eq!(rec.i, 7);
+    assert_eq!(rec.f, 2.5_f32);
+    assert_eq!(rec.g, 8.5_f64);
+    assert_eq!(rec.b, &[0x01, 0x02]);
+    c.close().await.expect("close");
+}
+
+/// WIDENING ARRAY (float8[]): `x = ANY($1)` binds a `&[f64]` array over the
+/// wire; sorted before the exact compare (VALUES+ANY order is unspecified).
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn float8_array_any_bind_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let rows = c
+        .query::<FloatAnyQuery>((&[1.5_f64, 3.5][..],))
+        .await
+        .expect("query FloatAny");
+    let mut got: Vec<f64> = rows.iter().map(|r| r.expect("row decodes").x).collect();
+    got.sort_by(f64::total_cmp);
+    assert_eq!(got, vec![1.5_f64, 3.5], "float8[] ANY($1)");
+    c.close().await.expect("close");
+}
+
+/// WIDENING ARRAY (float4[]): distinct element OID (700) + 4-byte width.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn float4_array_any_bind_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let rows = c
+        .query::<Float4AnyQuery>((&[2.5_f32, 3.5][..],))
+        .await
+        .expect("query Float4Any");
+    let mut got: Vec<f32> = rows.iter().map(|r| r.expect("row decodes").x).collect();
+    got.sort_by(f32::total_cmp);
+    assert_eq!(got, vec![2.5_f32, 3.5], "float4[] ANY($1)");
+    c.close().await.expect("close");
+}
+
+/// WIDENING ARRAY (int8[]): the previously offline-only `col = ANY($1)` pattern.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn int8_array_any_bind_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let rows = c
+        .query::<IntAnyQuery>((&[10i64, 30][..],))
+        .await
+        .expect("query IntAny");
+    let mut got: Vec<i64> = rows.iter().map(|r| r.expect("row decodes").n).collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![10i64, 30], "int8[] ANY($1)");
+    c.close().await.expect("close");
+}
+
+/// WIDENING ARRAY (bytea[]): the variable-length element shape (`&[&[u8]]`).
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn bytea_array_any_bind_round_trip() {
+    const BYTEA_ARG: &[&[u8]] = &[b"\x01", b"\x03"];
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let rows = c
+        .query::<ByteaAnyQuery>((BYTEA_ARG,))
+        .await
+        .expect("query ByteaAny");
+    let mut got: Vec<Vec<u8>> = rows.iter().map(|r| r.expect("row decodes").b.to_vec()).collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![vec![0x01u8], vec![0x03u8]], "bytea[] ANY($1)");
     c.close().await.expect("close");
 }

@@ -482,7 +482,13 @@ fn fixed_width(ty: bsql_build::RustType) -> Option<(usize, i32)> {
         RustType::I64 => Some((8, 8)),
         RustType::U32 => Some((4, 4)),
         RustType::Bool => Some((1, 1)),
-        RustType::Text => None,
+        // IEEE-754 floats are fixed-width, so they join the const-offset
+        // fast path exactly like the integers.
+        RustType::F32 => Some((4, 4)),
+        RustType::F64 => Some((8, 8)),
+        // `text` and `bytea` are variable-width — no fixed size, decoded on
+        // the per-cell path.
+        RustType::Text | RustType::Bytea => None,
     }
 }
 
@@ -496,12 +502,34 @@ fn cell_marker(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::I64 => quote!(i64),
         RustType::U32 => quote!(u32),
         RustType::Bool => quote!(bool),
+        RustType::F32 => quote!(f32),
+        RustType::F64 => quote!(f64),
         RustType::Text => quote!(&str),
+        // `bytea` decodes through `&[u8]`, borrowing the input bytes.
+        RustType::Bytea => quote!(&[u8]),
     }
 }
 
-/// A record field's Rust type. Borrowed text is `&'q str`; owned text is
-/// `String`; a nullable column is wrapped in `Option<..>`.
+/// Whether a column type borrows the input bytes in the borrowed record
+/// (so the record must carry `<'q>`): the string type `text` and the
+/// byte-string type `bytea`. Every fixed-width scalar is by-value.
+fn borrows_input(ty: bsql_build::RustType) -> bool {
+    use bsql_build::RustType;
+    matches!(ty, RustType::Text | RustType::Bytea)
+}
+
+/// Whether a column type implements `Eq` (so the generated record can
+/// derive it). Every supported type does EXCEPT the IEEE-754 floats:
+/// `f32`/`f64` are only `PartialEq` (NaN is not reflexively equal), so a
+/// record carrying a float column derives `PartialEq` but NOT `Eq`.
+fn type_impls_eq(ty: bsql_build::RustType) -> bool {
+    use bsql_build::RustType;
+    !matches!(ty, RustType::F32 | RustType::F64)
+}
+
+/// A record field's Rust type. A borrowing column is `&'q _` in the
+/// borrowed record and owned (`String` / `Vec<u8>`) in the owned twin; a
+/// nullable column is wrapped in `Option<..>`.
 fn field_type(ty: bsql_build::RustType, nullable: bool, is_owned: bool) -> TokenStream2 {
     use bsql_build::RustType;
     let base = match ty {
@@ -510,11 +538,22 @@ fn field_type(ty: bsql_build::RustType, nullable: bool, is_owned: bool) -> Token
         RustType::I64 => quote!(i64),
         RustType::U32 => quote!(u32),
         RustType::Bool => quote!(bool),
+        RustType::F32 => quote!(f32),
+        RustType::F64 => quote!(f64),
         RustType::Text => {
             if is_owned {
                 quote!(::std::string::String)
             } else {
                 quote!(&'q str)
+            }
+        }
+        // `bytea` mirrors `text`: owned `Vec<u8>` copies the DataRow
+        // payload, borrowed `&'q [u8]` aliases it.
+        RustType::Bytea => {
+            if is_owned {
+                quote!(::std::vec::Vec<u8>)
+            } else {
+                quote!(&'q [u8])
             }
         }
     };
@@ -549,8 +588,6 @@ fn emit_records(
     name: &Ident,
     columns: &[bsql_build::InferredColumn],
 ) -> syn::Result<TokenStream2> {
-    use bsql_build::RustType;
-
     let owned_name = format_ident!("{}Owned", name);
 
     // One field identifier per output column. A duplicate output column
@@ -586,7 +623,7 @@ fn emit_records(
         }
     };
 
-    let has_text = columns.iter().any(|c| matches!(c.ty, RustType::Text));
+    let has_borrowed = columns.iter().any(|c| borrows_input(c.ty));
     // The vectorized fast path applies only when every column is a
     // fixed-width binary type AND none is nullable: a NULL or a
     // variable-width column would shift every later column's offset, so
@@ -605,10 +642,10 @@ fn emit_records(
     });
 
     // The borrowed record carries `<'q>` ONLY when it has a borrowing
-    // (text) field — otherwise the lifetime would be unused, which the
-    // workspace `unused_lifetimes` floor forbids.
-    let borrowed_generics = if has_text { quote!(<'q>) } else { quote!() };
-    let borrowed_input = if has_text {
+    // (text / bytea) field — otherwise the lifetime would be unused, which
+    // the workspace `unused_lifetimes` floor forbids.
+    let borrowed_generics = if has_borrowed { quote!(<'q>) } else { quote!() };
+    let borrowed_input = if has_borrowed {
         quote!(body: &'q [u8])
     } else {
         quote!(body: &[u8])
@@ -621,14 +658,23 @@ fn emit_records(
 
     let allow_reason = "generated typed-record fields are the query's output row shape; a consumer may read any subset of the columns";
 
+    // `Eq` is derived only when EVERY column type implements it; a record with
+    // a float column derives `PartialEq` but not `Eq` (`f32`/`f64` are not
+    // `Eq`). Both twins share the same column set, so one decision covers both.
+    let derives = if columns.iter().all(|c| type_impls_eq(c.ty)) {
+        quote!(Debug, Clone, PartialEq, Eq)
+    } else {
+        quote!(Debug, Clone, PartialEq)
+    };
+
     Ok(quote! {
-        #[derive(Debug, Clone, PartialEq, Eq)]
+        #[derive(#derives)]
         #[allow(dead_code, reason = #allow_reason)]
         pub struct #name #borrowed_generics {
             #(#borrowed_fields),*
         }
 
-        #[derive(Debug, Clone, PartialEq, Eq)]
+        #[derive(#derives)]
         #[allow(dead_code, reason = #allow_reason)]
         pub struct #owned_name {
             #(#owned_fields),*
@@ -845,6 +891,8 @@ fn decode_call_expr(ty: bsql_build::RustType, is_owned: bool) -> TokenStream2 {
     };
     match (ty, is_owned) {
         (RustType::Text, true) => quote! { ::std::string::String::from(#raw) },
+        // Owned `bytea` copies the borrowed `&[u8]` into a `Vec<u8>`.
+        (RustType::Bytea, true) => quote! { <[u8]>::to_vec(#raw) },
         _ => raw,
     }
 }
@@ -881,6 +929,9 @@ fn rust_type_oid(ty: bsql_build::RustType) -> u32 {
         RustType::U32 => 26,
         RustType::Bool => 16,
         RustType::Text => 25,
+        RustType::F32 => 700,
+        RustType::F64 => 701,
+        RustType::Bytea => 17,
     }
 }
 
@@ -896,6 +947,9 @@ fn oid_path(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::U32 => quote!(::bsql_postgres_proto::oids::OID),
         RustType::Bool => quote!(::bsql_postgres_proto::oids::BOOL),
         RustType::Text => quote!(::bsql_postgres_proto::oids::TEXT),
+        RustType::F32 => quote!(::bsql_postgres_proto::oids::FLOAT4),
+        RustType::F64 => quote!(::bsql_postgres_proto::oids::FLOAT8),
+        RustType::Bytea => quote!(::bsql_postgres_proto::oids::BYTEA),
     }
 }
 
@@ -912,7 +966,10 @@ fn tuple_marker(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::I64 => quote!(i64),
         RustType::U32 => quote!(u32),
         RustType::Bool => quote!(bool),
+        RustType::F32 => quote!(f32),
+        RustType::F64 => quote!(f64),
         RustType::Text => quote!(&'static str),
+        RustType::Bytea => quote!(&'static [u8]),
     }
 }
 
@@ -940,6 +997,9 @@ fn array_oid(ty: bsql_build::RustType) -> u32 {
         RustType::U32 => 1028,
         RustType::Bool => 1000,
         RustType::Text => 1009,
+        RustType::F32 => 1021,
+        RustType::F64 => 1022,
+        RustType::Bytea => 1001,
     }
 }
 
@@ -953,6 +1013,9 @@ fn array_oid_path(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::U32 => quote!(::bsql_postgres_proto::oids::OID_ARRAY),
         RustType::Bool => quote!(::bsql_postgres_proto::oids::BOOL_ARRAY),
         RustType::Text => quote!(::bsql_postgres_proto::oids::TEXT_ARRAY),
+        RustType::F32 => quote!(::bsql_postgres_proto::oids::FLOAT4_ARRAY),
+        RustType::F64 => quote!(::bsql_postgres_proto::oids::FLOAT8_ARRAY),
+        RustType::Bytea => quote!(::bsql_postgres_proto::oids::BYTEA_ARRAY),
     }
 }
 
@@ -1200,13 +1263,14 @@ fn emit_carrier(
     let allow_reason =
         "the generated prepared-query artifact is part of the query's public surface; a consumer may use any subset of it";
 
-    // The borrowed record's GAT projection. A query that projects a `text`
-    // column makes the borrowed record carry `<'q>` (it borrows the input
-    // bytes); a query with no text column makes the record lifetime-free, so
-    // the `TypedQuery::Record<'q>` GAT leaves `'q` unused (verified to compile).
+    // The borrowed record's GAT projection. A query that projects a
+    // borrowing (`text` / `bytea`) column makes the borrowed record carry
+    // `<'q>` (it borrows the input bytes); a query with no borrowing column
+    // makes the record lifetime-free, so the `TypedQuery::Record<'q>` GAT
+    // leaves `'q` unused (verified to compile).
     let owned_name = format_ident!("{}Owned", name);
-    let has_text = columns.iter().any(|c| matches!(c.ty, bsql_build::RustType::Text));
-    let record_ty = if has_text {
+    let has_borrowed = columns.iter().any(|c| borrows_input(c.ty));
+    let record_ty = if has_borrowed {
         quote!(#name<'q>)
     } else {
         quote!(#name)

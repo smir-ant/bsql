@@ -114,6 +114,13 @@ pub enum RustType {
     /// PostgreSQL `text` (and the `varchar` / `char` family, which decode
     /// to the same Rust `String` / `&str`).
     Text,
+    /// PostgreSQL `float4` / `real` (4-byte IEEE-754).
+    F32,
+    /// PostgreSQL `float8` / `double precision` (8-byte IEEE-754).
+    F64,
+    /// PostgreSQL `bytea` (arbitrary byte string, decoding to the same
+    /// Rust `Vec<u8>` / `&[u8]`).
+    Bytea,
 }
 
 impl RustType {
@@ -127,6 +134,11 @@ impl RustType {
             RustType::U32 => "u32",
             RustType::Bool => "bool",
             RustType::Text => "String",
+            RustType::F32 => "f32",
+            RustType::F64 => "f64",
+            // The OWNED spelling (the borrowed twin is `&[u8]`), mirroring
+            // `Text -> String` owned / `&str` borrowed.
+            RustType::Bytea => "Vec<u8>",
         }
     }
 }
@@ -155,6 +167,11 @@ fn rust_type_for_pg(pg_type: &str) -> Option<RustType> {
         // `text` and the catalog's `varchar`/`char` canonicalisation all
         // decode to the same Rust string type.
         "text" | "varchar" | "char" | "bpchar" => Some(RustType::Text),
+        // `real`/`float4` and `double precision`/`float8` are already
+        // alias-collapsed to `float4`/`float8` by `canonical_type`.
+        "float4" => Some(RustType::F32),
+        "float8" => Some(RustType::F64),
+        "bytea" => Some(RustType::Bytea),
         _ => None,
     }
 }
@@ -9726,7 +9743,18 @@ fn common_type(a: RustType, b: RustType) -> Option<RustType> {
         RustType::I16 => Some(0u8),
         RustType::I32 => Some(1),
         RustType::I64 => Some(2),
-        RustType::U32 | RustType::Bool | RustType::Text => None,
+        // Only the integer ladder widens across a USING/NATURAL merge. The
+        // floats and `bytea` (like `oid`/`bool`/`text`) carry no such
+        // ordering here: two sides merge ONLY when identical (the `a == b`
+        // early return above), and any cross-type pairing is a loud
+        // cast-required error — never a silent widen (e.g. `float4` with
+        // `float8`, or an integer with a float).
+        RustType::U32
+        | RustType::Bool
+        | RustType::Text
+        | RustType::F32
+        | RustType::F64
+        | RustType::Bytea => None,
     };
     match (rank(a), rank(b)) {
         (Some(ra), Some(rb)) => {
@@ -16059,6 +16087,95 @@ mod tests {
                 col("column_2", RustType::Bool, false),
                 col("column_3", RustType::Text, false),
             ]
+        );
+    }
+
+    // ── float4 / float8 / bytea widening ───────────────────────────────
+
+    const METRICS: &str = "CREATE TABLE metrics (id BIGINT PRIMARY KEY, \
+         ratio REAL NOT NULL, precise DOUBLE PRECISION, payload BYTEA)";
+
+    #[test]
+    fn rust_name_of_widened_types() {
+        assert_eq!(RustType::F32.rust_name(), "f32");
+        assert_eq!(RustType::F64.rust_name(), "f64");
+        // The OWNED spelling; the borrowed twin is `&[u8]`, mirroring
+        // `Text -> String` / `&str`.
+        assert_eq!(RustType::Bytea.rust_name(), "Vec<u8>");
+    }
+
+    #[test]
+    fn float_and_bytea_columns_take_catalog_type_and_nullability() {
+        let s = shape(&[METRICS], "SELECT ratio, precise, payload FROM metrics").expect("ok");
+        assert_eq!(
+            s.columns,
+            vec![
+                col("ratio", RustType::F32, false), // REAL NOT NULL
+                col("precise", RustType::F64, true), // DOUBLE PRECISION, nullable
+                col("payload", RustType::Bytea, true), // BYTEA, nullable
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_float_and_bytea_casts_type_from_target() {
+        // `float8` / `double precision`, `float4` / `real`, `bytea`.
+        let f8 = shape(&[USERS], "SELECT 1.5::float8 AS x FROM users").expect("ok");
+        assert_eq!(f8.columns, vec![col("x", RustType::F64, false)]);
+        let dp = shape(&[USERS], "SELECT 1.5::double precision AS x FROM users").expect("ok");
+        assert_eq!(dp.columns, vec![col("x", RustType::F64, false)]);
+        let f4 = shape(&[USERS], "SELECT 2.5::float4 AS y FROM users").expect("ok");
+        assert_eq!(f4.columns, vec![col("y", RustType::F32, false)]);
+        let re = shape(&[USERS], "SELECT 2.5::real AS y FROM users").expect("ok");
+        assert_eq!(re.columns, vec![col("y", RustType::F32, false)]);
+        let by = shape(&[USERS], r"SELECT '\xDEADBEEF'::bytea AS b FROM users").expect("ok");
+        assert_eq!(by.columns, vec![col("b", RustType::Bytea, false)]);
+    }
+
+    #[test]
+    fn bare_float_literal_stays_loud_out_of_scope() {
+        // An unadorned `1.5` is PostgreSQL `numeric`, NOT `float8` — the wire
+        // bytes are numeric, not IEEE-754 — so it stays a loud cast-required
+        // error rather than being silently mapped to `f64`.
+        let err = shape(&[USERS], "SELECT 1.5 AS x FROM users").expect_err("must be loud");
+        assert!(
+            matches!(err, InferError::CastRequired { .. }),
+            "bare float literal must be cast-required, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn float_and_bytea_params_infer_from_column_comparison() {
+        let f = shape(&[METRICS], "SELECT id FROM metrics WHERE precise = $1").expect("ok");
+        assert_eq!(f.params, vec![RustType::F64]);
+        let b = shape(&[METRICS], "SELECT id FROM metrics WHERE payload = $1").expect("ok");
+        assert_eq!(b.params, vec![RustType::Bytea]);
+    }
+
+    #[test]
+    fn float_and_bytea_param_casts_pin_the_type() {
+        let f = shape(&[USERS], "SELECT id FROM users WHERE id = $1::int8 AND name = $2 \
+             OR $3::float8 > 0 AND $4::bytea IS NOT NULL")
+            .expect("ok");
+        assert_eq!(
+            f.params,
+            vec![RustType::I64, RustType::Text, RustType::F64, RustType::Bytea]
+        );
+    }
+
+    #[test]
+    fn cross_float_join_merge_is_loud_not_silently_widened() {
+        // `float4` and `float8` USING-merge to no common type in this model
+        // (only the integer ladder widens) — a loud cast-required error, never
+        // a silent float widen.
+        let ddl = &[
+            "CREATE TABLE a (k REAL NOT NULL)",
+            "CREATE TABLE b (k DOUBLE PRECISION NOT NULL)",
+        ];
+        let err = shape(ddl, "SELECT k FROM a JOIN b USING (k)").expect_err("must be loud");
+        assert!(
+            matches!(err, InferError::CastRequired { .. }),
+            "float4/float8 merge must be loud, got {err:?}"
         );
     }
 
@@ -25877,10 +25994,12 @@ mod tests {
     #[test]
     fn within_group_on_ordered_set_aggregate_does_not_raise_not_ordered_set() {
         // The WITHIN GROUP gate must NOT reject an ordered-set / hypothetical-set
-        // aggregate. These functions are still engine-loud for an ORTHOGONAL
-        // reason (their result type — float8, or a return type the engine does
-        // not model — is outside the v1 supported set), but the error must NOT be
-        // the not-ordered-set diagnostic: the clause itself is permitted.
+        // aggregate. These BARE forms are still engine-loud for an ORTHOGONAL
+        // reason — the engine does not infer these aggregates' return types by
+        // name, so with no explicit cast to pin the output column there is no
+        // modeled type (a `::float8` cast would rescue the float-returning ones,
+        // but these are bare) — yet the error must NOT be the not-ordered-set
+        // diagnostic: the clause itself is permitted.
         for sql in [
             "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY age) FROM users",
             "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY age) FROM users",

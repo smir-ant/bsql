@@ -193,7 +193,9 @@ macro_rules! col_cell_at_primitive {
     };
 }
 
-col_cell_at_primitive!(i16, i32, i64, u32, bool);
+// `f32`/`f64` are value-typed like the integers: At = Self, lifetime
+// transparent (the IEEE-754 payload is decoded by value, not borrowed).
+col_cell_at_primitive!(i16, i32, i64, u32, bool, f32, f64);
 
 // `&'static str` marker: At = &'a str, lifetime substituted at the
 // decode site.
@@ -204,6 +206,19 @@ impl<'a> ColCellAt<'a> for &'static str {
     #[inline]
     fn decode_at(bytes: &'a [u8]) -> Result<Self::At, DecodeError> {
         <&'a str as Cell<'a, BinaryFmt>>::decode(bytes)
+    }
+}
+
+// `&'static [u8]` marker (`bytea`): At = &'a [u8], lifetime substituted
+// at the decode site — the byte-string peer of the `&'static str`
+// marker above.
+impl col_cell_at_sealed::Sealed for &'static [u8] {}
+impl<'a> ColCellAt<'a> for &'static [u8] {
+    type At = &'a [u8];
+    const OID: u32 = <&'static [u8] as Cell<'static, BinaryFmt>>::OID;
+    #[inline]
+    fn decode_at(bytes: &'a [u8]) -> Result<Self::At, DecodeError> {
+        <&'a [u8] as Cell<'a, BinaryFmt>>::decode(bytes)
     }
 }
 

@@ -1160,7 +1160,7 @@ impl Fmt for BinaryFmt {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be decoded from PG `{F}` bytes",
     label = "the (type, format) pair `({Self}, {F})` is not in the supported decode matrix",
-    note = "the in-crate decode matrix covers `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}`; for other types add `impl Cell<'a, F> for {Self}` supplying its `OID` + `decode` (the trait is not sealed)"
+    note = "the in-crate decode matrix covers `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}`, plus `{{f32, f64, &[u8]}}` for `BinaryFmt` only (the binary-uniform wire path); for other types add `impl Cell<'a, F> for {Self}` supplying its `OID` + `decode` (the trait is not sealed)"
 )]
 pub trait Cell<'a, F: Fmt>: Sized {
     /// PG type OID this (type, format) pair targets. Pinned via
@@ -1915,15 +1915,21 @@ mod sealed {
     pub trait EncodeBinarySealed {}
 }
 
-// Fixed-size signed integer decoders: N bytes big-endian.
-macro_rules! impl_cell_binary_int {
+// Fixed-size big-endian scalar decoders: N bytes, reinterpreted via
+// `from_be_bytes`. Covers the two's-complement integers AND the
+// IEEE-754 floats (`f32`/`f64`) — the byte-level operation is
+// identical (`from_be_bytes` reads exactly N big-endian bytes and
+// reinterprets them; for floats that is the IEEE-754 bit pattern PG
+// sends), so one macro serves both. A wrong length is classified,
+// never silently truncated or widened.
+macro_rules! impl_cell_binary_fixed_be {
     ($($t:ty, $oid:expr, $n:literal),+ $(,)?) => {
         $(
             impl Cell<'_, BinaryFmt> for $t {
                 const OID: u32 = $oid;
                 #[inline]
                 fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-                    // Binary fixed-size ints: exactly N bytes. Any
+                    // Binary fixed-size scalar: exactly N bytes. Any
                     // other length is classified via
                     // `BinaryLengthMismatch` — a per-type honest error
                     // that doesn't lie about a column index the decoder
@@ -1946,11 +1952,16 @@ macro_rules! impl_cell_binary_int {
     };
 }
 
-impl_cell_binary_int!(
+impl_cell_binary_fixed_be!(
     i16, oids::INT2, 2,
     i32, oids::INT4, 4,
     i64, oids::INT8, 8,
     u32, oids::OID, 4,
+    // IEEE-754: PG `float4` is 4 big-endian bytes, `float8` is 8. Read
+    // the EXACT width and reinterpret the bits — never a lossy `as`
+    // narrowing between the two widths.
+    f32, oids::FLOAT4, 4,
+    f64, oids::FLOAT8, 8,
 );
 
 /// PG binary `bool`: one byte — `0` = false, `1` = true.
@@ -2000,6 +2011,22 @@ impl<'a> Cell<'a, BinaryFmt> for &'a str {
     }
 }
 
+/// PG binary `bytea`: the raw column bytes, verbatim. Zero-copy borrow.
+///
+/// `bytea` has no internal structure on the binary wire — the column
+/// body IS the byte string — so decode is the identity on the input
+/// slice: every length (including empty) is valid and nothing is
+/// validated, copied, or reinterpreted. This is the byte-string peer of
+/// the `&str` decoder above, minus the UTF-8 check (`bytea` carries
+/// arbitrary bytes, not text).
+impl<'a> Cell<'a, BinaryFmt> for &'a [u8] {
+    const OID: u32 = oids::BYTEA;
+    #[inline]
+    fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+        Ok(bytes)
+    }
+}
+
 // Compile-time symmetry pins: text and binary decoders for the
 // same Rust type MUST target the same PG type OID. A refactor that
 // breaks this breaks the build.
@@ -2015,6 +2042,12 @@ const _: () = {
     assert!(<u32 as Cell<BinaryFmt>>::OID == oids::OID);
     assert!(<bool as Cell<BinaryFmt>>::OID == oids::BOOL);
     assert!(<&str as Cell<BinaryFmt>>::OID == oids::TEXT);
+    // Binary-only types (no text-format twin — the compile-checked
+    // query path is binary-uniform, and no shipped decoder reads these
+    // from the simple-query text format).
+    assert!(<f32 as Cell<BinaryFmt>>::OID == oids::FLOAT4);
+    assert!(<f64 as Cell<BinaryFmt>>::OID == oids::FLOAT8);
+    assert!(<&[u8] as Cell<BinaryFmt>>::OID == oids::BYTEA);
     // Text↔binary OID symmetry: the same Rust type MUST target the
     // same PG type OID across text and binary decoders. A refactor
     // that skewed one against the other would mean the same Rust
@@ -2100,7 +2133,7 @@ where
 /// impls for their own types.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not implement `EncodeBinary` (cannot encode to PG binary format)",
-    label = "supported binary-encode types are `i16`, `i32`, `i64`, `bool`, `&str`",
+    label = "supported binary-encode types are `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `&str`, `&[u8]` (and their one-dimensional `&[T]` array forms)",
     note = "`EncodeBinary` is sealed — extend by adding `impl EncodeBinary for ...` for the new type in `decode.rs` after extending the supported-OID matrix; downstream `impl EncodeBinary for ...` is forbidden by construction"
 )]
 pub trait EncodeBinary: sealed::EncodeBinarySealed {
@@ -2179,6 +2212,43 @@ impl EncodeBinary for &str {
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_bytes(self.as_bytes())
+    }
+}
+
+// IEEE-754 float encoders: the big-endian bit pattern PG expects
+// (`float4` = 4 bytes, `float8` = 8), written verbatim. `to_be_bytes`
+// is the exact inverse of the `from_be_bytes` decoders above, so a
+// round-trip is bit-identical — no width coercion, no lossy `as`.
+macro_rules! impl_encode_binary_float {
+    ($($t:ty, $oid:expr),+ $(,)?) => {
+        $(
+            impl sealed::EncodeBinarySealed for $t {}
+            impl EncodeBinary for $t {
+                const OID: u32 = $oid;
+                #[inline]
+                fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+                    -> Result<(), crate::write_buf::WriteBufFull>
+                {
+                    dst.push_bytes(&self.to_be_bytes())
+                }
+            }
+        )+
+    };
+}
+
+impl_encode_binary_float!(f32, oids::FLOAT4, f64, oids::FLOAT8);
+
+/// `&[u8]` encoder — raw `bytea` bytes, verbatim (the byte-string peer
+/// of the `&str` encoder, without the UTF-8 assumption). Every length,
+/// including empty, is a valid `bytea` body.
+impl sealed::EncodeBinarySealed for &[u8] {}
+impl EncodeBinary for &[u8] {
+    const OID: u32 = oids::BYTEA;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_bytes(self)
     }
 }
 
@@ -2268,6 +2338,8 @@ impl_encode_binary_array!(
     i64 => oids::INT8_ARRAY,
     u32 => oids::OID_ARRAY,
     bool => oids::BOOL_ARRAY,
+    f32 => oids::FLOAT4_ARRAY,
+    f64 => oids::FLOAT8_ARRAY,
 );
 
 /// `text[]` array of borrowed strings. Each element is the same UTF-8
@@ -2284,6 +2356,20 @@ impl EncodeBinary for &[&str] {
     }
 }
 
+/// `bytea[]` array of borrowed byte strings. Each element is the same
+/// raw body the scalar `&[u8]` encoder writes, length-prefixed by
+/// `encode_array_1d` — the byte-string peer of the `&[&str]` array.
+impl sealed::EncodeBinarySealed for &[&[u8]] {}
+impl EncodeBinary for &[&[u8]] {
+    const OID: u32 = oids::BYTEA_ARRAY;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        encode_array_1d::<&[u8]>(self, dst)
+    }
+}
+
 // Drift-pins: every array EncodeBinary impl's OID matches the canonical
 // array `oids::*` constant, and the header's element OID matches the
 // scalar element's OID (so the declared element type can never disagree
@@ -2295,6 +2381,9 @@ const _: () = {
     assert!(<&[u32] as EncodeBinary>::OID == oids::OID_ARRAY);
     assert!(<&[bool] as EncodeBinary>::OID == oids::BOOL_ARRAY);
     assert!(<&[&str] as EncodeBinary>::OID == oids::TEXT_ARRAY);
+    assert!(<&[f32] as EncodeBinary>::OID == oids::FLOAT4_ARRAY);
+    assert!(<&[f64] as EncodeBinary>::OID == oids::FLOAT8_ARRAY);
+    assert!(<&[&[u8]] as EncodeBinary>::OID == oids::BYTEA_ARRAY);
 };
 
 // Drift-pins: every EncodeBinary impl's OID matches the
@@ -2307,13 +2396,19 @@ const _: () = {
     assert!(<u32 as EncodeBinary>::OID == oids::OID);
     assert!(<bool as EncodeBinary>::OID == oids::BOOL);
     assert!(<&str as EncodeBinary>::OID == oids::TEXT);
-    // Cross-trait symmetry (text-format OID ≡ binary-format OID ≡ catalog OID).
+    assert!(<f32 as EncodeBinary>::OID == oids::FLOAT4);
+    assert!(<f64 as EncodeBinary>::OID == oids::FLOAT8);
+    assert!(<&[u8] as EncodeBinary>::OID == oids::BYTEA);
+    // Cross-trait symmetry (encode OID ≡ binary-decode OID ≡ catalog OID).
     assert!(<i16 as EncodeBinary>::OID == <i16 as Cell<BinaryFmt>>::OID);
     assert!(<i32 as EncodeBinary>::OID == <i32 as Cell<BinaryFmt>>::OID);
     assert!(<i64 as EncodeBinary>::OID == <i64 as Cell<BinaryFmt>>::OID);
     assert!(<u32 as EncodeBinary>::OID == <u32 as Cell<BinaryFmt>>::OID);
     assert!(<bool as EncodeBinary>::OID == <bool as Cell<BinaryFmt>>::OID);
     assert!(<&str as EncodeBinary>::OID == <&str as Cell<BinaryFmt>>::OID);
+    assert!(<f32 as EncodeBinary>::OID == <f32 as Cell<BinaryFmt>>::OID);
+    assert!(<f64 as EncodeBinary>::OID == <f64 as Cell<BinaryFmt>>::OID);
+    assert!(<&[u8] as EncodeBinary>::OID == <&[u8] as Cell<BinaryFmt>>::OID);
 };
 
 /// PostgreSQL built-in type OID constants for the subset the
@@ -2375,6 +2470,8 @@ pub mod oids {
 
     /// `bool[]` (`_bool`).
     pub const BOOL_ARRAY: u32 = 1000;
+    /// `bytea[]` (`_bytea`).
+    pub const BYTEA_ARRAY: u32 = 1001;
     /// `int2[]` (`_int2`).
     pub const INT2_ARRAY: u32 = 1005;
     /// `int4[]` (`_int4`).
@@ -2383,6 +2480,10 @@ pub mod oids {
     pub const TEXT_ARRAY: u32 = 1009;
     /// `int8[]` (`_int8`).
     pub const INT8_ARRAY: u32 = 1016;
+    /// `float4[]` (`_float4`).
+    pub const FLOAT4_ARRAY: u32 = 1021;
+    /// `float8[]` (`_float8`).
+    pub const FLOAT8_ARRAY: u32 = 1022;
     /// `oid[]` (`_oid`).
     pub const OID_ARRAY: u32 = 1028;
 
@@ -2410,10 +2511,13 @@ pub mod oids {
         // Array OIDs, verified against `pg_type` (`typname` -> `typarray`)
         // on PostgreSQL 15.
         assert!(BOOL_ARRAY == 1000, "oids::BOOL_ARRAY drift from pg_type.dat");
+        assert!(BYTEA_ARRAY == 1001, "oids::BYTEA_ARRAY drift from pg_type.dat");
         assert!(INT2_ARRAY == 1005, "oids::INT2_ARRAY drift from pg_type.dat");
         assert!(INT4_ARRAY == 1007, "oids::INT4_ARRAY drift from pg_type.dat");
         assert!(TEXT_ARRAY == 1009, "oids::TEXT_ARRAY drift from pg_type.dat");
         assert!(INT8_ARRAY == 1016, "oids::INT8_ARRAY drift from pg_type.dat");
+        assert!(FLOAT4_ARRAY == 1021, "oids::FLOAT4_ARRAY drift from pg_type.dat");
+        assert!(FLOAT8_ARRAY == 1022, "oids::FLOAT8_ARRAY drift from pg_type.dat");
         assert!(OID_ARRAY == 1028, "oids::OID_ARRAY drift from pg_type.dat");
     };
 }
@@ -3890,6 +3994,66 @@ mod decode_format_tests {
         assert_eq!(<bool as Cell<BinaryFmt>>::decode(&[1]), Ok(true));
         assert_eq!(<bool as Cell<BinaryFmt>>::decode(&[0]), Ok(false));
         assert_eq!(<&str as Cell<BinaryFmt>>::decode(b"hello"), Ok("hello"));
+    }
+
+    #[test]
+    fn binary_round_trips_float_and_bytea() {
+        // f32 / f64: exact IEEE-754 big-endian bytes, compared BIT-for-bit (a
+        // wire round-trip must be bit-identical — and the crate forbids the
+        // float `==` a value comparison would need).
+        assert_eq!(
+            <f32 as Cell<BinaryFmt>>::decode(&1.5_f32.to_be_bytes()).map(f32::to_bits),
+            Ok(1.5_f32.to_bits()),
+        );
+        assert_eq!(
+            <f64 as Cell<BinaryFmt>>::decode(&1234.5_f64.to_be_bytes()).map(f64::to_bits),
+            Ok(1234.5_f64.to_bits()),
+        );
+        // bytea: the identity on the column body — every length, including empty.
+        assert_eq!(
+            <&[u8] as Cell<BinaryFmt>>::decode(&[0xDE, 0xAD, 0xBE, 0xEF]),
+            Ok(&[0xDE, 0xAD, 0xBE, 0xEF][..]),
+        );
+        assert_eq!(<&[u8] as Cell<BinaryFmt>>::decode(&[]), Ok(&[][..]));
+    }
+
+    #[test]
+    fn binary_float_wrong_length_is_classified() {
+        // A 4-byte body for an f64 (or 8 for an f32) is a classified length
+        // error — never a silent width coercion between the two float widths.
+        assert!(matches!(
+            <f64 as Cell<BinaryFmt>>::decode(&[0, 0, 0, 0]),
+            Err(DecodeError::BinaryLengthMismatch { expected_len: 8, actual_len: 4 }),
+        ));
+        assert!(matches!(
+            <f32 as Cell<BinaryFmt>>::decode(&[0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(DecodeError::BinaryLengthMismatch { expected_len: 4, actual_len: 8 }),
+        ));
+    }
+
+    #[test]
+    fn encode_binary_float_and_bytea_round_trips() {
+        // `encode_to` writes exactly the bytes the decoder reads back.
+        let mut buf = crate::write_buf::WriteBuf::new();
+        assert!(<f64 as EncodeBinary>::encode_to(&3.25_f64, &mut buf).is_ok());
+        assert_eq!(
+            <f64 as Cell<BinaryFmt>>::decode(buf.as_bytes()).map(f64::to_bits),
+            Ok(3.25_f64.to_bits()),
+        );
+
+        let mut buf = crate::write_buf::WriteBuf::new();
+        assert!(<f32 as EncodeBinary>::encode_to(&0.5_f32, &mut buf).is_ok());
+        assert_eq!(
+            <f32 as Cell<BinaryFmt>>::decode(buf.as_bytes()).map(f32::to_bits),
+            Ok(0.5_f32.to_bits()),
+        );
+
+        let mut buf = crate::write_buf::WriteBuf::new();
+        assert!(<&[u8] as EncodeBinary>::encode_to(&&[1u8, 2, 3][..], &mut buf).is_ok());
+        assert_eq!(
+            <&[u8] as Cell<BinaryFmt>>::decode(buf.as_bytes()),
+            Ok(&[1u8, 2, 3][..]),
+        );
     }
 
     #[test]

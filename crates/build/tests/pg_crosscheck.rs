@@ -622,20 +622,25 @@ fn engine_matches_live_pg() {
         // Ordered-set / hypothetical-set aggregates WITH a valid `WITHIN GROUP`:
         // PG ACCEPTS these (the WITHIN GROUP clause is well-placed), and the
         // engine PERMITS the clause too — it does NOT raise the
-        // not-ordered-set error. They are nonetheless engine-loud for an
-        // ORTHOGONAL reason: their result type is `float8` (a type the v1
-        // catalog does not model) or a return type the engine cannot infer, so
-        // the type pass rejects them at the unsupported-type boundary. That
-        // boundary is unrelated to the WITHIN GROUP rule (a focused unit test
-        // asserts the error here is NOT `WithinGroupNotOrderedSet`), so they sit
-        // in the UnmodelableLoud category — PG-OK, engine-loud-orthogonally.
-        (Pg::UnmodelableLoud, "percentile_cont WITHIN GROUP", "SELECT (percentile_cont(0.5) WITHIN GROUP (ORDER BY age))::float8 FROM s10k_users"),
+        // not-ordered-set error. The verdict now splits on the OUTPUT type:
+        //   * When the aggregate is wrapped in an explicit `::float8` cast, the
+        //     cast PINS the output column type to `float8` — a type the catalog
+        //     now models (`f64`). The inner clause is still fully validated
+        //     (columns resolved, WITHIN GROUP placement checked), and the cast
+        //     is the documented "materialise the unmodelable return with an
+        //     explicit cast" escape hatch — so PG and the engine now AGREE (Ok).
+        //   * The BARE forms (`percentile_disc`/`mode` -> the ORDER BY column's
+        //     type, `rank`/`dense_rank` -> bigint) carry a return type the
+        //     engine does not infer for these names, so with no cast to pin it
+        //     they stay engine-loud at the unsupported-return boundary
+        //     (a focused unit test asserts this is NOT `WithinGroupNotOrderedSet`).
+        (Pg::Ok, "percentile_cont WITHIN GROUP ::float8", "SELECT (percentile_cont(0.5) WITHIN GROUP (ORDER BY age))::float8 FROM s10k_users"),
         (Pg::UnmodelableLoud, "percentile_disc WITHIN GROUP", "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY age) FROM s10k_users"),
         (Pg::UnmodelableLoud, "mode WITHIN GROUP", "SELECT mode() WITHIN GROUP (ORDER BY age) FROM s10k_users"),
         (Pg::UnmodelableLoud, "rank hypothetical WITHIN GROUP", "SELECT rank(5) WITHIN GROUP (ORDER BY age) FROM s10k_users"),
         (Pg::UnmodelableLoud, "dense_rank hypothetical WITHIN GROUP", "SELECT dense_rank(5) WITHIN GROUP (ORDER BY age) FROM s10k_users"),
-        (Pg::UnmodelableLoud, "percent_rank hypothetical WITHIN GROUP", "SELECT (percent_rank(5) WITHIN GROUP (ORDER BY age))::float8 FROM s10k_users"),
-        (Pg::UnmodelableLoud, "cume_dist hypothetical WITHIN GROUP", "SELECT (cume_dist(5) WITHIN GROUP (ORDER BY age))::float8 FROM s10k_users"),
+        (Pg::Ok, "percent_rank hypothetical WITHIN GROUP ::float8", "SELECT (percent_rank(5) WITHIN GROUP (ORDER BY age))::float8 FROM s10k_users"),
+        (Pg::Ok, "cume_dist hypothetical WITHIN GROUP ::float8", "SELECT (cume_dist(5) WITHIN GROUP (ORDER BY age))::float8 FROM s10k_users"),
 
         // No-column-list INSERT $N: PG types each position from declaration
         // order, but the catalog has no positional order, so the engine is

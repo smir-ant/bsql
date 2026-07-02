@@ -78,6 +78,49 @@ bsql_query_macros::query!(
     "SELECT n FROM (VALUES (1::int4), (2), (3), (4), (5)) AS t(n) WHERE n <= $1::int4"
 );
 
+// ── widened types: float4 / float8 / bytea ──────────────────────────────
+// Two fixed-width floats, NOT NULL -> the const-offset fast path; `1.5`/`2.5`
+// are exact in IEEE-754 so `==` is an exact comparison.
+bsql_query_macros::query!(Fl, "SELECT 1.5::float8 AS x, 2.5::float4 AS y");
+// A NULL float -> the record field is `Option<f64>`, decoding to `None`.
+bsql_query_macros::query!(NullFloat, "SELECT NULL::float8 AS x");
+// A `bytea` literal -> borrowed `&'q [u8]` (aliases the prebuffer) / owned
+// `Vec<u8>` (copies), mirroring `text`.
+bsql_query_macros::query!(Bytes, r"SELECT '\xDEADBEEF'::bytea AS b");
+// A float8 param -> the `(f64,)` binary-bind path end-to-end.
+bsql_query_macros::query!(EchoF, "SELECT $1::float8 AS x");
+// A bytea param -> the `(&[u8],)` binary-bind path end-to-end.
+bsql_query_macros::query!(EchoB, "SELECT $1::bytea AS b");
+// A mixed row: fixed int + fixed floats + variable bytea -> the presence of a
+// variable column disables the all-fixed fast path, so the WHOLE row decodes on
+// the per-cell path (proving the fast/per-cell split handles the mix).
+bsql_query_macros::query!(
+    Mixed,
+    r"SELECT 7::int4 AS i, 2.5::float4 AS f, 8.5::float8 AS g, '\x0102'::bytea AS b"
+);
+
+// ── widened ARRAY params: `col = ANY($1)` sends a one-dimensional array over
+//    the wire, so PG must accept the `array_send` bytes (element-OID header +
+//    per-element length-prefix) that `encode_array_1d` writes. VALUES-derived
+//    so no migration is needed; the element type differs per query, exercising
+//    a distinct array element OID + element width each time.
+bsql_query_macros::query!(
+    FloatAny,
+    "SELECT x FROM (VALUES (1.5::float8), (2.5::float8), (3.5::float8)) t(x) WHERE x = ANY($1)"
+);
+bsql_query_macros::query!(
+    Float4Any,
+    "SELECT x FROM (VALUES (1.5::float4), (2.5::float4), (3.5::float4)) t(x) WHERE x = ANY($1)"
+);
+bsql_query_macros::query!(
+    IntAny,
+    "SELECT n FROM (VALUES (10::int8), (20::int8), (30::int8)) t(n) WHERE n = ANY($1)"
+);
+bsql_query_macros::query!(
+    ByteaAny,
+    r"SELECT b FROM (VALUES ('\x01'::bytea), ('\x02'::bytea), ('\x03'::bytea)) t(b) WHERE b = ANY($1)"
+);
+
 fn sync_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
@@ -426,6 +469,155 @@ fn query_each_with_param_streams_filtered() {
         .expect("query_each with a bound param");
     assert_eq!(done, None, "fully streamed");
     assert_eq!(collected, vec![1, 2, 3], "only rows where n <= $1 (=3)");
+    c.close().expect("close");
+}
+
+/// WIDENING (float4/float8): two fixed-width float columns round-trip through the
+/// const-offset fast path; the exactly-representable literals compare with `==`.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_float_columns_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let owned = c.query_one::<FlQuery>(()).expect("query_one Fl");
+    assert_eq!(owned.x, 1.5_f64, "float8 1.5 must round-trip exactly");
+    assert_eq!(owned.y, 2.5_f32, "float4 2.5 must round-trip exactly");
+    c.close().expect("close");
+}
+
+/// WIDENING (nullable float): `NULL::float8` types `Option<f64>` and decodes None.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_nullable_float_decodes_none() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let owned = c
+        .query_one::<NullFloatQuery>(())
+        .expect("query_one NullFloat");
+    assert_eq!(owned.x, None, "NULL::float8 must decode to None");
+    c.close().expect("close");
+}
+
+/// WIDENING (bytea): a `bytea` column decodes to the exact bytes both borrowed
+/// (`&[u8]`, zero-copy from the prebuffer) and owned (`Vec<u8>`, copied).
+#[test]
+#[ignore = "requires local PG"]
+fn typed_bytea_column_borrowed_and_owned() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    let rows = c.query::<BytesQuery>(()).expect("query Bytes");
+    let rec = rows.iter().next().expect("one row").expect("row decodes");
+    assert_eq!(
+        rec.b,
+        &[0xDE, 0xAD, 0xBE, 0xEF],
+        "borrowed &[u8] aliases the 4 payload bytes"
+    );
+
+    let owned = c.query_one::<BytesQuery>(()).expect("query_one Bytes");
+    assert_eq!(
+        owned.b,
+        vec![0xDE, 0xAD, 0xBE, 0xEF],
+        "owned Vec<u8> copies the 4 bytes"
+    );
+    c.close().expect("close");
+}
+
+/// WIDENING (params): a `float8` value and a `&[u8]` value bind through the
+/// binary `ParamsWriter` path and echo back exactly.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_float_and_bytea_params_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    let f = c
+        .query_one::<EchoFQuery>((1.25_f64,))
+        .expect("query_one EchoF(1.25)");
+    assert_eq!(f.x, 1.25_f64, "float8 param 1.25 must round-trip");
+
+    let b = c
+        .query_one::<EchoBQuery>((&[1u8, 2, 3][..],))
+        .expect("query_one EchoB([1,2,3])");
+    assert_eq!(b.b, vec![1u8, 2, 3], "bytea param [1,2,3] must round-trip");
+    c.close().expect("close");
+}
+
+/// WIDENING (mixed row): int + float4 + float8 + bytea in one row decode
+/// correctly on the per-cell path (a variable column present).
+#[test]
+#[ignore = "requires local PG"]
+fn typed_mixed_fixed_and_variable_row() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let rows = c.query::<MixedQuery>(()).expect("query Mixed");
+    let rec = rows.iter().next().expect("one row").expect("row decodes");
+    assert_eq!(rec.i, 7, "int column");
+    assert_eq!(rec.f, 2.5_f32, "float4 column");
+    assert_eq!(rec.g, 8.5_f64, "float8 column");
+    assert_eq!(rec.b, &[0x01, 0x02], "bytea column");
+    c.close().expect("close");
+}
+
+/// WIDENING ARRAY (float8[]): `x = ANY($1)` binds a `&[f64]` — the primary
+/// proof that the `float8[]` `array_send` bytes reach real PG byte-correct (not
+/// just offline-composed). VALUES+ANY row order is unspecified, so the result is
+/// sorted before the exact compare.
+#[test]
+#[ignore = "requires local PG"]
+fn float8_array_any_bind_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let rows = c
+        .query::<FloatAnyQuery>((&[1.5_f64, 3.5][..],))
+        .expect("query FloatAny");
+    let mut got: Vec<f64> = rows.iter().map(|r| r.expect("row decodes").x).collect();
+    got.sort_by(f64::total_cmp);
+    assert_eq!(got, vec![1.5_f64, 3.5], "float8[] ANY($1) returns the matching rows");
+    c.close().expect("close");
+}
+
+/// WIDENING ARRAY (float4[]): a distinct element OID (700) and 4-byte element
+/// width from `float8[]` — a separate live proof of the `float4[]` header.
+#[test]
+#[ignore = "requires local PG"]
+fn float4_array_any_bind_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let rows = c
+        .query::<Float4AnyQuery>((&[2.5_f32, 3.5][..],))
+        .expect("query Float4Any");
+    let mut got: Vec<f32> = rows.iter().map(|r| r.expect("row decodes").x).collect();
+    got.sort_by(f32::total_cmp);
+    assert_eq!(got, vec![2.5_f32, 3.5], "float4[] ANY($1) returns the matching rows");
+    c.close().expect("close");
+}
+
+/// WIDENING ARRAY (int8[]): the `col = ANY($1)` pattern was OFFLINE-only until
+/// now (byte-golden `query_any_bind`); this exercises it live.
+#[test]
+#[ignore = "requires local PG"]
+fn int8_array_any_bind_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let rows = c
+        .query::<IntAnyQuery>((&[10i64, 30][..],))
+        .expect("query IntAny");
+    let mut got: Vec<i64> = rows.iter().map(|r| r.expect("row decodes").n).collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![10i64, 30], "int8[] ANY($1) returns the matching rows");
+    c.close().expect("close");
+}
+
+/// WIDENING ARRAY (bytea[]): the variable-length element shape (`&[&[u8]]`) —
+/// each element is length-prefixed, unlike the fixed-width float/int arrays.
+#[test]
+#[ignore = "requires local PG"]
+fn bytea_array_any_bind_round_trip() {
+    const BYTEA_ARG: &[&[u8]] = &[b"\x01", b"\x03"];
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let rows = c
+        .query::<ByteaAnyQuery>((BYTEA_ARG,))
+        .expect("query ByteaAny");
+    let mut got: Vec<Vec<u8>> = rows.iter().map(|r| r.expect("row decodes").b.to_vec()).collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![vec![0x01u8], vec![0x03u8]],
+        "bytea[] ANY($1) returns the matching rows"
+    );
     c.close().expect("close");
 }
 
