@@ -261,7 +261,10 @@ impl Connection {
     fn fetch_server_version(&mut self) -> Result<Option<String>, DriverError> {
         let result = self.query_sql("SHOW server_version")?;
         Ok(match result.rows.first() {
-            Some(row) => row.get_str(0).map(String::from),
+            // The `?` propagates a classified `ColumnError` (a non-UTF-8 or
+            // out-of-range column) into `DriverError` rather than silently
+            // dropping it; the inner `Option` carries a legitimate SQL NULL.
+            Some(row) => row.get_str(0)?.map(String::from),
             None => None,
         })
     }

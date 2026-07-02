@@ -421,10 +421,10 @@ mod result_collector_width_tests {
         c.feed(Surface::Row(&row_body(&[b"2", b"two"])));
         let result = c.finish().expect("uniform-width rows seal cleanly");
         assert_eq!(result.rows.len(), 2);
-        assert_eq!(result.rows[0].get_raw(0), Some(&b"1"[..]));
-        assert_eq!(result.rows[0].get_raw(1), Some(&b"one"[..]));
-        assert_eq!(result.rows[1].get_raw(0), Some(&b"2"[..]));
-        assert_eq!(result.rows[1].get_raw(1), Some(&b"two"[..]));
+        assert_eq!(result.rows[0].get_raw(0), Ok(Some(&b"1"[..])));
+        assert_eq!(result.rows[0].get_raw(1), Ok(Some(&b"one"[..])));
+        assert_eq!(result.rows[1].get_raw(0), Ok(Some(&b"2"[..])));
+        assert_eq!(result.rows[1].get_raw(1), Ok(Some(&b"two"[..])));
     }
 }
 

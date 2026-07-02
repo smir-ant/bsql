@@ -226,8 +226,7 @@ async fn plan_is_parsed_once_and_persists() {
         .rows
         .first()
         .expect("count row")
-        .get_i32(0)
-        .expect("count value");
+        .get_i32(0).expect("count decodes").expect("count value");
     assert_eq!(count, 1, "the query! must be Parsed exactly once and persist");
     c.close().await.expect("close");
 }
@@ -274,8 +273,7 @@ async fn pooled_connection_reset_keeps_parsed_plan() {
             .rows
             .first()
             .expect("count row")
-            .get_i32(0)
-            .expect("count value");
+            .get_i32(0).expect("count decodes").expect("count value");
         assert_eq!(count, 1, "checkout {i}: statement kept across reset (parsed once)");
         // `c` drops here -> returned to the pool dirty; the NEXT checkout resets it
         // (keeping the statement), and this loop proves the cache stays consistent.
@@ -320,8 +318,7 @@ async fn pooled_reset_rolls_back_open_tx_and_keeps_plan() {
         .rows
         .first()
         .expect("count row")
-        .get_i32(0)
-        .expect("count value");
+        .get_i32(0).expect("count decodes").expect("count value");
     assert_eq!(count, 1, "the ROLLBACK-prefixed reset kept the cached plan (parsed once)");
 }
 

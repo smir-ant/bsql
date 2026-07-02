@@ -120,7 +120,7 @@ fn explain(conn: &mut Connection, sql: &str) -> String {
     let result = conn.query_sql(sql).expect("EXPLAIN runs");
     let mut lines = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
-        if let Some(line) = row.get_str(0) {
+        if let Ok(Some(line)) = row.get_str(0) {
             lines.push(line.to_string());
         }
     }
@@ -136,8 +136,8 @@ fn plan_counts(conn: &mut Connection, name: &str) -> (i64, i64) {
     let result = conn.query_sql(&sql).expect("read plan counts");
     let row = result.rows.first().expect("prepared statement is present");
     (
-        row.get_i64(0).expect("generic_plans is an integer"),
-        row.get_i64(1).expect("custom_plans is an integer"),
+        row.get_i64(0).expect("generic_plans decodes").expect("generic_plans present"),
+        row.get_i64(1).expect("custom_plans decodes").expect("custom_plans present"),
     )
 }
 

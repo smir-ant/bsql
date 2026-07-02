@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
-use bsql_postgres_async::{ConnectConfig, Connection};
+use bsql_postgres_async::{ColumnError, ConnectConfig, Connection};
+use bsql_postgres_proto::DecodeError;
 
 // ═══════════════════════════════════════════════════════════
 // Driver-specific tests (async I/O, TLS, pool, protocol)
@@ -25,7 +26,42 @@ async fn streaming_1k_rows() {
     let mut c = Connection::connect(&config).await.expect("connect");
     let r = c.query_sql("SELECT generate_series(1, 1000)").await.expect("q");
     assert_eq!(r.rows.len(), 1000);
-    assert_eq!(r.rows[999].get_i32(0), Some(1000));
+    assert_eq!(r.rows[999].get_i32(0), Ok(Some(1000)));
+    c.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn dynamic_getter_classifies_null_and_decode_error_over_the_wire() {
+    // End-to-end proof that the dynamic getter's classification survives the real
+    // PG text wire (not just the offline arena): every outcome is a distinct value.
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    // (1) A real SQL NULL is `Ok(None)` FROM THE GETTER ITSELF — distinct from
+    // `is_null`. This proves the typed getter classifies NULL as a present-but-
+    // absent value, never conflated with a decode failure or out-of-range.
+    let r = c.query_sql("SELECT NULL::int4").await.expect("null query");
+    assert_eq!(r.rows[0].get_i32(0), Ok(None));
+    assert!(r.rows[0].is_null(0));
+
+    // (2) An `i32` read of genuinely non-numeric text ('x') is a classified `Err`
+    // over the real wire — exactly the failure the retired `.parse().ok()` hid as
+    // a silent `None`. Assert the EXACT classified variant, not `.is_err()`.
+    let r = c.query_sql("SELECT 'x'::text").await.expect("text query");
+    assert_eq!(
+        r.rows[0].get_i32(0),
+        Err(ColumnError::Decode(DecodeError::IntParse)),
+    );
+    // A `bool` read of the same non-bool text classifies too (`BoolParse`),
+    // proving the classification holds across decoders on the real wire.
+    assert_eq!(
+        r.rows[0].get_bool(0),
+        Err(ColumnError::Decode(DecodeError::BoolParse)),
+    );
+    // Read as text the same column is a legitimate value — text is text.
+    assert_eq!(r.rows[0].get_str(0), Ok(Some("x")));
+
     c.close().await.expect("close");
 }
 
@@ -51,7 +87,7 @@ async fn error_recovery_and_resilience() {
     c.ping().await.expect("recover");
     c.execute_sql("CREATE TEMP TABLE res(v int)").await.expect("create");
     c.execute_sql("INSERT INTO res VALUES (42)").await.expect("insert");
-    assert_eq!(c.query_sql("SELECT v FROM res").await.expect("q").rows[0].get_i32(0), Some(42));
+    assert_eq!(c.query_sql("SELECT v FROM res").await.expect("q").rows[0].get_i32(0), Ok(Some(42)));
     c.close().await.expect("close");
 }
 
@@ -65,13 +101,14 @@ async fn client_encoding_pinned_to_utf8_and_roundtrips_non_ascii() {
 
     let enc = c.query_sql("SHOW client_encoding").await.expect("show").rows[0]
         .get_str(0)
+        .expect("client_encoding decodes")
         .map(String::from);
     assert_eq!(enc.as_deref(), Some("UTF8"), "startup must pin client_encoding=UTF8");
 
     // Non-ASCII (Cyrillic + emoji) round-trips byte-exact under the pinned UTF-8.
     let text = "Привет, мир 🌍";
     let r = c.query_sql(&format!("SELECT '{text}'::text")).await.expect("query");
-    assert_eq!(r.rows[0].get_str(0), Some(text));
+    assert_eq!(r.rows[0].get_str(0), Ok(Some(text)));
     c.close().await.expect("close");
 }
 
@@ -94,15 +131,15 @@ async fn mixed_width_multi_statement_is_rejected_not_misaddressed() {
     assert!(c.is_healthy(), "connection stays healthy after a rejected result shape");
     assert_eq!(
         c.query_sql("SELECT 7::int4").await.expect("follow-up query works").rows[0].get_i32(0),
-        Some(7),
+        Ok(Some(7)),
     );
 
     // A UNIFORM-width multi-statement batch is fine: rows flatten into one arena
     // whose single stride addresses every cell correctly.
     let uniform = c.query_sql("SELECT 1::int4; SELECT 2::int4").await.expect("uniform batch");
     assert_eq!(uniform.rows.len(), 2);
-    assert_eq!(uniform.rows[0].get_i32(0), Some(1));
-    assert_eq!(uniform.rows[1].get_i32(0), Some(2));
+    assert_eq!(uniform.rows[0].get_i32(0), Ok(Some(1)));
+    assert_eq!(uniform.rows[1].get_i32(0), Ok(Some(2)));
     c.close().await.expect("close");
 }
 
@@ -154,7 +191,7 @@ async fn copy_in_rejects_injection_and_accepts_schema_qualified() {
     assert_eq!(c.copy_in("pg_temp.cp_inj", vec!["3"]).await.expect("schema-qualified copy"), 1);
     assert_eq!(
         c.query_sql("SELECT count(*) FROM cp_inj").await.expect("count").rows[0].get_i64(0),
-        Some(3),
+        Ok(Some(3)),
     );
     c.close().await.expect("close");
 }
@@ -220,7 +257,7 @@ async fn pool_concurrent() {
         let p = pool.clone();
         tokio::spawn(async move {
             let mut c = p.get().await.expect("get");
-            assert_eq!(c.conn_mut().expect("live").query_sql(&format!("SELECT {i}::int")).await.expect("q").rows[0].get_i32(0), Some(i as i32));
+            assert_eq!(c.conn_mut().expect("live").query_sql(&format!("SELECT {i}::int")).await.expect("q").rows[0].get_i32(0), Ok(Some(i as i32)));
         })
     }).collect();
     for h in handles { h.await.expect("task"); }
@@ -256,16 +293,16 @@ async fn pool_reset_on_return_no_bleed() {
     assert_eq!(conn.backend_pid(), pid1, "max_size=1 must reuse the SAME physical connection");
     // GUC reset to default (not pg_temp).
     let sp = conn.query_sql("SHOW search_path").await.expect("show").rows[0]
-        .get_str(0).map(String::from);
+        .get_str(0).expect("search_path decodes").map(String::from);
     assert_ne!(sp.as_deref(), Some("pg_temp"), "search_path GUC bled across checkout");
     // Temp table gone.
     let n = conn.query_sql("SELECT count(*) FROM pg_tables WHERE tablename='bleed_probe'")
-        .await.expect("tmp").rows[0].get_i64(0);
+        .await.expect("tmp").rows[0].get_i64(0).expect("count decodes");
     assert_eq!(n, Some(0), "temp table bled across checkout");
     // LISTEN channel gone (UNLISTEN * ran in the reset).
     let listening = conn
         .query_sql("SELECT count(*)::int8 FROM pg_listening_channels() AS c(chan) WHERE chan='bleed_chan'")
-        .await.expect("listen check").rows[0].get_i64(0);
+        .await.expect("listen check").rows[0].get_i64(0).expect("listen count decodes");
     assert_eq!(listening, Some(0), "LISTEN channel bled across checkout");
 }
 
@@ -332,7 +369,8 @@ async fn cancelled_transaction_is_rolled_back_before_reuse() {
         .await
         .expect("count")
         .rows[0]
-        .get_i64(0);
+        .get_i64(0)
+        .expect("count decodes");
     assert_eq!(
         count,
         Some(0),
@@ -341,7 +379,7 @@ async fn cancelled_transaction_is_rolled_back_before_reuse() {
     );
     // The connection is clean and fully usable.
     let probe = conn.query_sql("SELECT 1::int4").await.expect("reusable after reset");
-    assert_eq!(probe.rows[0].get_i32(0), Some(1));
+    assert_eq!(probe.rows[0].get_i32(0), Ok(Some(1)));
     drop(guard2);
 
     let mut cleanup = Connection::connect(&mk_config()).await.expect("connect cleanup");
@@ -440,7 +478,7 @@ async fn row_send_across_await() {
     let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
     let mut c = Connection::connect(&config).await.expect("connect");
     let row = c.query_sql("SELECT 42::int").await.expect("q").rows[0].clone();
-    assert_eq!(tokio::task::spawn(async move { row.get_i32(0) }).await.expect("spawn"), Some(42));
+    assert_eq!(tokio::task::spawn(async move { row.get_i32(0).expect("i32 decodes") }).await.expect("spawn"), Some(42));
     c.close().await.expect("close");
 }
 
@@ -450,7 +488,7 @@ async fn scram_auth() {
     let config = ConnectConfig::new("127.0.0.1", "bsql_test_scram")
         .database("postgres".to_string()).password("test_password_123".to_string());
     let mut c = Connection::connect(&config).await.expect("SCRAM");
-    assert_eq!(c.query_sql("SELECT current_user").await.expect("q").rows[0].get_raw(0), Some(b"bsql_test_scram".as_slice()));
+    assert_eq!(c.query_sql("SELECT current_user").await.expect("q").rows[0].get_raw(0), Ok(Some(b"bsql_test_scram".as_slice())));
     c.close().await.expect("close");
 }
 
@@ -477,7 +515,7 @@ async fn full_lifecycle() {
     c.execute_sql("INSERT INTO lc(name, val) VALUES ('bob', 88)").await.expect("ins");
     c.commit().await.expect("commit");
     assert_eq!(c.query_params_one("SELECT name FROM lc WHERE val > $1", &(90i32,))
-        .await.expect("p").get_str(0), Some("alice"));
+        .await.expect("p").get_str(0), Ok(Some("alice")));
     let stmt = c.prepare("UPDATE lc SET val = val + $1 WHERE name = $2").await.expect("prep");
     c.execute_prepared(&stmt, &(5i32, "bob")).await.expect("update");
     c.close_statement(stmt).await.expect("close stmt");
@@ -497,7 +535,7 @@ async fn pool_stress_100_tasks() {
         tokio::spawn(async move {
             let mut c = p.get().await.expect("get");
             let r = c.conn_mut().expect("live").query_sql(&format!("SELECT {i}::int, pg_backend_pid()")).await.expect("q");
-            assert_eq!(r.rows[0].get_i32(0), Some(i as i32));
+            assert_eq!(r.rows[0].get_i32(0), Ok(Some(i as i32)));
         })
     }).collect();
     let mut ok = 0u32;
@@ -522,7 +560,7 @@ async fn transaction_commit_and_recoverable_rollback() {
     .expect("transaction commits");
     assert_eq!(
         c.query_sql("SELECT count(*) FROM tx_demo").await.expect("count").rows[0].get_i64(0),
-        Some(2)
+        Ok(Some(2))
     );
 
     // Recoverable-error rollback path: a body error rolls back AND keeps the
@@ -538,7 +576,7 @@ async fn transaction_commit_and_recoverable_rollback() {
     assert!(c.is_healthy(), "the connection survives a recoverable tx body error");
     assert_eq!(
         c.query_sql("SELECT count(*) FROM tx_demo").await.expect("count").rows[0].get_i64(0),
-        Some(2),
+        Ok(Some(2)),
         "the failed transaction rolled back (row 3 is gone)"
     );
     c.close().await.expect("close");
@@ -562,7 +600,7 @@ async fn one_connection_everything() {
 
     // Query
     let r = c.query_sql("SELECT count(*) FROM omni").await.expect("count");
-    assert_eq!(r.rows[0].get_i64(0), Some(4));
+    assert_eq!(r.rows[0].get_i64(0), Ok(Some(4)));
 
     // Query with params
     let r = c.query_params("SELECT name FROM omni WHERE val > $1 ORDER BY val", &(15i32,)).await.expect("qp");
@@ -579,7 +617,7 @@ async fn one_connection_everything() {
     c.execute_sql("UPDATE omni SET val = val * 2 WHERE active").await.expect("update");
     c.commit().await.expect("commit");
     let r = c.query_sql("SELECT SUM(val) FROM omni").await.expect("sum");
-    assert_eq!(r.rows[0].get_i64(0), Some(180));
+    assert_eq!(r.rows[0].get_i64(0), Ok(Some(180)));
 
     // Error + recovery
     assert!(c.query_sql("SELECT * FROM nonexistent").await.is_err());
@@ -595,7 +633,7 @@ async fn one_connection_everything() {
 
     // Row clone across task
     let row = c.query_sql("SELECT 'final'::text").await.expect("q").rows[0].clone();
-    let v = tokio::task::spawn(async move { row.get_str(0).map(String::from) }).await.expect("spawn");
+    let v = tokio::task::spawn(async move { row.get_str(0).expect("final decodes").map(String::from) }).await.expect("spawn");
     assert_eq!(v, Some("final".to_string()));
 
     c.close().await.expect("close");

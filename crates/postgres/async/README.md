@@ -94,18 +94,24 @@ let config = ConnectConfig::from_env();
 
 ### Row access
 
-```rust
-// Generic (recommended)
-let id: i32 = row.get(0).unwrap();
-let name: String = row.get(1).unwrap();
+Every typed getter returns `Result<Option<T>, ColumnError>`, keeping each
+outcome distinct: `Ok(Some(v))` = value, `Ok(None)` = SQL `NULL`, and `Err(..)`
+= out-of-range or a classified decode failure (never a silently-swallowed
+`None`).
 
-// Specific
-row.get_i32(0)    row.get_i64(0)    row.get_f64(0)
-row.get_str(0)    row.get_bool(0)   row.get_raw(0)
+```rust
+// Generic — decodes through the classified Cell<TextFmt> matrix
+let id: Option<i32> = row.get::<i32>(0)?;      // Ok(None) = SQL NULL
+let name: Option<&str> = row.get::<&str>(1)?;  // zero-copy &str
+
+// Named accessors (same classified return shape)
+row.get_i32(0)?   row.get_i64(0)?   row.get_f64(0)?
+row.get_str(0)?   row.get_bool(0)?  row.get_raw(0)?
 row.is_null(0)    row.len()
 ```
 
-Supported types via `FromText`: `i16`, `i32`, `i64`, `f32`, `f64`, `bool`, `String`.
+Generic `get::<T>` covers `i16`, `i32`, `i64`, `u32`, `bool`, `&str` via the
+classified `Cell<TextFmt>` decoder; `get_f64` adds the text-float path.
 
 ## Architecture
 

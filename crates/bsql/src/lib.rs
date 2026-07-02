@@ -19,8 +19,10 @@
 //! // Runtime-SQL query (the typed flagship is `query::<Q>` with `query!`)
 //! let result = conn.query_sql("SELECT id, name FROM users").await?;
 //! for row in &result.rows {
-//!     let id: i32 = row.get_i32(0).unwrap();
-//!     let name: &str = row.get_str(1).unwrap();
+//!     // Each getter returns `Result<Option<T>, ColumnError>`: `?` propagates a
+//!     // classified decode/out-of-range error, the inner `Option` is SQL NULL.
+//!     let id: i32 = row.get_i32(0)?.expect("id is NOT NULL");
+//!     let name: &str = row.get_str(1)?.expect("name is NOT NULL");
 //!     println!("{id}: {name}");
 //! }
 //!
@@ -55,7 +57,7 @@
 //!
 //! let mut conn = Connection::connect(&config)?;
 //! let result = conn.query_sql("SELECT 1 + 1 AS answer")?;
-//! assert_eq!(result.rows[0].get_i32(0), Some(2));
+//! assert_eq!(result.rows[0].get_i32(0), Ok(Some(2)));
 //! conn.close()?;
 //! ```
 //!

@@ -47,6 +47,72 @@ impl DbError {
     pub fn is_foreign_key_violation(&self) -> bool { self.code == "23503" }
 }
 
+/// Why reading a typed value from a dynamic [`Row`](crate::Row) column failed.
+///
+/// A dynamic (`query_sql`) result carries no compile-time schema, so a single
+/// column read has several MUTUALLY-EXCLUSIVE outcomes. This type keeps each one
+/// distinct — none is ever collapsed into another:
+///
+/// - the value decoded → `Ok(Some(v))` (not an error);
+/// - the column is SQL `NULL` → `Ok(None)` (not an error — a dynamic read is
+///   nullable-by-default, since the column's nullability is unknown without a
+///   schema);
+/// - the column index is past the row's width →
+///   [`OutOfRange`](Self::OutOfRange);
+/// - a by-name lookup found no such column →
+///   [`UnknownColumn`](Self::UnknownColumn);
+/// - the bytes did not decode as the requested Rust type →
+///   [`Decode`](Self::Decode) (carrying proto's classified [`DecodeError`]) or,
+///   for a text floating-point column, [`FloatParse`](Self::FloatParse).
+///
+/// The retired getters returned `Option<T>` built from `.parse().ok()`, which
+/// collapsed NULL, decode-failure, and out-of-range into a single `None` and
+/// silently swallowed the parse error. This type exists so that collapse cannot
+/// happen: every outcome is a distinct, inspectable value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnError {
+    /// The requested column index is `>=` the row's column count.
+    OutOfRange {
+        /// The requested (zero-based) column index.
+        col: usize,
+        /// The row's actual column count.
+        n_cols: usize,
+    },
+    /// A by-name lookup found no column with the requested name in the result.
+    UnknownColumn,
+    /// The column bytes did not decode as the requested Rust type — a parse
+    /// error, non-UTF-8, or a truncated body. Carries proto's classified
+    /// [`DecodeError`].
+    Decode(DecodeError),
+    /// A text floating-point column's bytes are valid UTF-8 but did not parse as
+    /// the requested floating type. PostgreSQL's binary-uniform typed path never
+    /// decodes a float from text, so this text-float classification lives at the
+    /// driver layer rather than in proto's `Cell` decode matrix.
+    FloatParse,
+}
+
+impl fmt::Display for ColumnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutOfRange { col, n_cols } => {
+                write!(f, "column index {col} out of range for a {n_cols}-column row")
+            }
+            Self::UnknownColumn => f.write_str("no column with the requested name in this result"),
+            Self::Decode(e) => write!(f, "column decode failed: {e}"),
+            Self::FloatParse => f.write_str("column text is not a valid floating-point number"),
+        }
+    }
+}
+
+impl std::error::Error for ColumnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decode(e) => Some(e),
+            Self::OutOfRange { .. } | Self::UnknownColumn | Self::FloatParse => None,
+        }
+    }
+}
+
 /// Driver-level error.
 #[derive(Debug)]
 pub enum DriverError {
@@ -133,6 +199,13 @@ pub enum DriverError {
     /// [`Timeout`](Self::Timeout) (a read deadline mid-command) and from
     /// [`NotReady`](Self::NotReady) (a specific connection is dead).
     PoolTimeout,
+    /// Reading a typed value from a dynamic [`Row`](crate::Row) column failed.
+    /// Carries the classified [`ColumnError`] — SQL NULL, out-of-range,
+    /// unknown-name, or a decode failure — so a bad dynamic read surfaces as a
+    /// distinct, inspectable value and never a silently-swallowed `None`. This is
+    /// the dynamic (`query_sql`) counterpart to [`Decode`](Self::Decode), which
+    /// classifies the compile-checked `query!` path.
+    Column(ColumnError),
 }
 
 // Footprint pin: a sum type whose size is set by its widest variant,
@@ -164,6 +237,7 @@ impl fmt::Display for DriverError {
             Self::OversizeRow => write!(f, "typed query result carried an oversize row that exceeds the bounded decoder's contiguous-payload requirement"),
             Self::TooManyRows => write!(f, "query_one matched more than one row"),
             Self::PoolTimeout => write!(f, "timed out acquiring a pooled connection; the pool is exhausted"),
+            Self::Column(e) => write!(f, "{e}"),
         }
     }
 }
@@ -174,6 +248,7 @@ impl std::error::Error for DriverError {
             Self::Db(e) => Some(e),
             Self::Io(e) => Some(e),
             Self::Decode(e) => Some(e),
+            Self::Column(e) => Some(e),
             Self::NotReady
             | Self::SslRefused
             | Self::NoRows
@@ -198,6 +273,12 @@ impl std::error::Error for DriverError {
 impl From<DecodeError> for DriverError {
     fn from(e: DecodeError) -> Self {
         Self::Decode(e)
+    }
+}
+
+impl From<ColumnError> for DriverError {
+    fn from(e: ColumnError) -> Self {
+        Self::Column(e)
     }
 }
 

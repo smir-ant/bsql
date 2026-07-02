@@ -1,6 +1,10 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use bsql_postgres_proto::{Cell, DecodeError, TextFmt};
+
+use crate::error::ColumnError;
+
 // ─── Column slot ────────────────────────────────────────────
 
 /// Per-column metadata. 8 bytes, niche-packed.
@@ -67,49 +71,182 @@ pub struct Row {
 crate::footprint_pin!(Row, size = 16, align = 8);
 
 impl Row {
-    pub fn get_raw(&self, col: usize) -> Option<&[u8]> {
+    /// Raw bytes of column `col`.
+    ///
+    /// - `Ok(Some(bytes))` — a non-NULL column's raw payload (borrowed from the
+    ///   arena, zero-copy).
+    /// - `Ok(None)` — the column is SQL `NULL`.
+    /// - `Err(ColumnError::OutOfRange { .. })` — `col` is `>=` the row's column
+    ///   count.
+    ///
+    /// SQL NULL and out-of-range are DISTINCT outcomes — never both collapsed
+    /// into a single `None`, which is exactly the ambiguity the previous
+    /// `Option<&[u8]>` return carried.
+    pub fn get_raw(&self, col: usize) -> Result<Option<&[u8]>, ColumnError> {
         let inner = &*self.arena;
-        let n = usize::from(inner.n_cols);
-        if col >= n { return None; }
-        let base = usize::try_from(self.row_idx).ok()?.checked_mul(n)?;
-        let slot = inner.slots.get(base.checked_add(col)?)?;
-        let len = usize::try_from(slot.byte_len()?).ok()?;
-        let start = usize::try_from(slot.offset).ok()?;
-        inner.data.get(start..start.checked_add(len)?)
+        let n_cols = usize::from(inner.n_cols);
+        if col >= n_cols {
+            return Err(ColumnError::OutOfRange { col, n_cols });
+        }
+        // Uniform-width arena: slot `(row_idx, col)` lives at
+        // `row_idx * n_cols + col`, which `ArenaBuilder::finish` guarantees is
+        // `< slots.len()` and whose value slot always resolves to in-bounds
+        // data. The checked arithmetic and `.get()` below therefore cannot fail
+        // for an in-range column on a well-formed arena; a `None` here would mean
+        // the arena's construction invariant was violated (architecturally
+        // unreachable). It is fail-closed to a classified decode error — never an
+        // out-of-bounds index, and never a fabricated NULL that would mask the
+        // inconsistency — mirroring the typed row-body path's `TruncatedRow`
+        // fail-closed shape.
+        let corrupt = || ColumnError::Decode(DecodeError::TruncatedRow);
+        let row_base = usize::try_from(self.row_idx).map_err(|_| corrupt())?;
+        let slot_idx = row_base
+            .checked_mul(n_cols)
+            .and_then(|b| b.checked_add(col))
+            .ok_or_else(corrupt)?;
+        let slot = inner.slots.get(slot_idx).ok_or_else(corrupt)?;
+        let byte_len = match slot.byte_len() {
+            // NULL is encoded by the slot's niche — a real absence, distinct from
+            // any error path above.
+            None => return Ok(None),
+            Some(l) => l,
+        };
+        let len = usize::try_from(byte_len).map_err(|_| corrupt())?;
+        let start = usize::try_from(slot.offset).map_err(|_| corrupt())?;
+        let end = start.checked_add(len).ok_or_else(corrupt)?;
+        let bytes = inner.data.get(start..end).ok_or_else(corrupt)?;
+        Ok(Some(bytes))
     }
 
-    pub fn get_str(&self, col: usize) -> Option<&str> {
-        core::str::from_utf8(self.get_raw(col)?).ok()
+    /// Decode column `col` into any type proto's classified text-decode matrix
+    /// covers (`i16`, `i32`, `i64`, `u32`, `bool`, `&str`).
+    ///
+    /// This is the single routing point for the typed accessors: it fetches the
+    /// raw bytes (propagating SQL NULL as `Ok(None)` and out-of-range as
+    /// `Err(ColumnError::OutOfRange)`) and decodes them through
+    /// [`Cell<TextFmt>`](bsql_postgres_proto::Cell) — the same classified decoder
+    /// the compile-checked `query!` path uses. A byte sequence that does not
+    /// parse as `T` is a classified `Err(ColumnError::Decode(..))`, never a
+    /// silently-swallowed `None`.
+    ///
+    /// - `Ok(Some(v))` — decoded value.
+    /// - `Ok(None)` — SQL `NULL` (a dynamic read is nullable-by-default).
+    /// - `Err(ColumnError::OutOfRange { .. })` — index past the row's width.
+    /// - `Err(ColumnError::Decode(..))` — the bytes did not decode as `T`.
+    ///
+    /// Floating-point columns are read through the sibling methods
+    /// [`get_f32`](Self::get_f32) / [`get_f64`](Self::get_f64), not this generic:
+    /// PG's binary-uniform typed path never decodes a float from text, so proto's
+    /// `Cell<TextFmt>` matrix has no float member — the two `get_fNN` methods are
+    /// the classified `float4` / `float8` text path, with the same zero-swallow
+    /// discipline.
+    pub fn get<'a, T>(&'a self, col: usize) -> Result<Option<T>, ColumnError>
+    where
+        T: Cell<'a, TextFmt>,
+    {
+        match self.get_raw(col)? {
+            None => Ok(None),
+            Some(bytes) => T::decode(bytes).map(Some).map_err(ColumnError::Decode),
+        }
     }
 
-    pub fn get_i32(&self, col: usize) -> Option<i32> { self.get_str(col)?.parse().ok() }
-    pub fn get_i64(&self, col: usize) -> Option<i64> { self.get_str(col)?.parse().ok() }
-    pub fn get_f64(&self, col: usize) -> Option<f64> { self.get_str(col)?.parse().ok() }
-
-    pub fn get_bool(&self, col: usize) -> Option<bool> {
-        match self.get_str(col)? { "t" => Some(true), "f" => Some(false), _ => None }
+    /// Decode column `col` as UTF-8 text (`&str`), zero-copy.
+    ///
+    /// Non-UTF-8 bytes are a classified `Err(ColumnError::Decode(NonUtf8))` —
+    /// the previous `.ok()` on `from_utf8` silently dropped that failure.
+    pub fn get_str(&self, col: usize) -> Result<Option<&str>, ColumnError> {
+        self.get::<&str>(col)
     }
 
+    /// Decode column `col` as `i32` (PG `int4` text format).
+    pub fn get_i32(&self, col: usize) -> Result<Option<i32>, ColumnError> {
+        self.get::<i32>(col)
+    }
+
+    /// Decode column `col` as `i64` (PG `int8` text format).
+    pub fn get_i64(&self, col: usize) -> Result<Option<i64>, ColumnError> {
+        self.get::<i64>(col)
+    }
+
+    /// Decode column `col` as `bool` (PG boolean text format: `"t"` / `"f"`).
+    pub fn get_bool(&self, col: usize) -> Result<Option<bool>, ColumnError> {
+        self.get::<bool>(col)
+    }
+
+    /// Decode column `col` as `f32` (PG `float4` text format).
+    ///
+    /// The `float4` sibling of [`get_f64`](Self::get_f64), with the exact same
+    /// classified hand-path: PostgreSQL's binary-uniform typed path never decodes
+    /// a float from text, so proto's `Cell` matrix has no text-float decoder and
+    /// this driver-layer decoder is the sole classified `float4` text path. UTF-8
+    /// is validated (`Err(ColumnError::Decode(NonUtf8))`) and a non-float parse is
+    /// a classified `Err(ColumnError::FloatParse)` — never a swallowed `None`.
+    /// Accepts PG's `NaN` / `Infinity` / `-Infinity` spellings (Rust's `f32`
+    /// parser is case-insensitive on those).
+    pub fn get_f32(&self, col: usize) -> Result<Option<f32>, ColumnError> {
+        match self.get_raw(col)? {
+            None => Ok(None),
+            Some(bytes) => {
+                let text = core::str::from_utf8(bytes)
+                    .map_err(|_| ColumnError::Decode(DecodeError::NonUtf8))?;
+                let value: f32 = text.parse().map_err(|_| ColumnError::FloatParse)?;
+                Ok(Some(value))
+            }
+        }
+    }
+
+    /// Decode column `col` as `f64` (PG `float8` text format).
+    ///
+    /// PostgreSQL's binary-uniform typed path never decodes a float from text, so
+    /// proto's `Cell` matrix has no text-float decoder; this driver-layer decoder
+    /// is the sole classified `float8` text path (its `float4` peer is
+    /// [`get_f32`](Self::get_f32) — the float story is symmetric). UTF-8 is
+    /// validated (`Err(ColumnError::Decode(NonUtf8))`) and a non-float parse is a
+    /// classified `Err(ColumnError::FloatParse)` — never a swallowed `None`.
+    /// Accepts PG's `NaN` / `Infinity` / `-Infinity` spellings (Rust's `f64`
+    /// parser is case-insensitive on those).
+    pub fn get_f64(&self, col: usize) -> Result<Option<f64>, ColumnError> {
+        match self.get_raw(col)? {
+            None => Ok(None),
+            Some(bytes) => {
+                let text = core::str::from_utf8(bytes)
+                    .map_err(|_| ColumnError::Decode(DecodeError::NonUtf8))?;
+                let value: f64 = text.parse().map_err(|_| ColumnError::FloatParse)?;
+                Ok(Some(value))
+            }
+        }
+    }
+
+    /// Whether column `col` exists AND is SQL `NULL`.
+    ///
+    /// Returns `false` for a present value and for an out-of-range index (an
+    /// absent column is not a NULL value). Use [`get_raw`](Self::get_raw) to tell
+    /// out-of-range (`Err`) from NULL (`Ok(None)`) — this helper deliberately
+    /// answers only the narrow "is this in-range column NULL?" question.
     pub fn is_null(&self, col: usize) -> bool {
-        let inner = &*self.arena;
-        let n = usize::from(inner.n_cols);
-        if col >= n { return true; }
-        let Ok(row_idx) = usize::try_from(self.row_idx) else { return true; };
-        let base = row_idx * n;
-        inner.slots.get(base + col)
-            .is_none_or(|s| s.len_plus_one.is_none())
+        matches!(self.get_raw(col), Ok(None))
     }
 
     pub fn len(&self) -> usize { usize::from(self.arena.n_cols) }
     pub fn is_empty(&self) -> bool { self.arena.n_cols == 0 }
 
-    pub fn get_by_name<'a>(&'a self, name: &str, column_names: &[String]) -> Option<&'a [u8]> {
-        let idx = column_names.iter().position(|n| n == name)?;
-        self.get_raw(idx)
-    }
-
-    pub fn get<T: FromText>(&self, col: usize) -> Option<T> {
-        T::from_text(self.get_str(col)?)
+    /// Decode the column named `name` (resolved against `column_names`) into any
+    /// type proto's classified text-decode matrix covers.
+    ///
+    /// - `Err(ColumnError::UnknownColumn)` — no column with that name.
+    /// - otherwise identical to [`get`](Self::get) for the resolved index.
+    pub fn get_by_name<'a, T>(
+        &'a self,
+        name: &str,
+        column_names: &[String],
+    ) -> Result<Option<T>, ColumnError>
+    where
+        T: Cell<'a, TextFmt>,
+    {
+        match column_names.iter().position(|n| n == name) {
+            Some(idx) => self.get::<T>(idx),
+            None => Err(ColumnError::UnknownColumn),
+        }
     }
 }
 
@@ -329,26 +466,6 @@ pub struct QueryResult {
 // type, shows up here.
 crate::footprint_pin!(QueryResult, size = 72, align = 8);
 
-// ─── FromText ───────────────────────────────────────────────
-
-pub trait FromText: Sized {
-    fn from_text(s: &str) -> Option<Self>;
-}
-
-impl FromText for i16 { fn from_text(s: &str) -> Option<Self> { s.parse().ok() } }
-impl FromText for i32 { fn from_text(s: &str) -> Option<Self> { s.parse().ok() } }
-impl FromText for i64 { fn from_text(s: &str) -> Option<Self> { s.parse().ok() } }
-impl FromText for f32 { fn from_text(s: &str) -> Option<Self> { s.parse().ok() } }
-impl FromText for f64 { fn from_text(s: &str) -> Option<Self> { s.parse().ok() } }
-impl FromText for bool {
-    fn from_text(s: &str) -> Option<Self> {
-        match s { "t" => Some(true), "f" => Some(false), _ => None }
-    }
-}
-impl FromText for String {
-    fn from_text(s: &str) -> Option<Self> { Some(s.to_string()) }
-}
-
 // ─── Notification ───────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -379,7 +496,7 @@ mod tests {
         };
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
-        assert_eq!(row.get_raw(0), Some(&b"hi"[..]));
+        assert_eq!(row.get_raw(0), Ok(Some(&b"hi"[..])));
         assert!(row.is_null(1));
     }
 
@@ -393,7 +510,7 @@ mod tests {
             Ok(r) => r,
             Err(e) => panic!("unexpected overflow: {e}"),
         };
-        assert_eq!(rows[0].get_raw(0), Some(&b"foobar"[..]));
+        assert_eq!(rows[0].get_raw(0), Ok(Some(&b"foobar"[..])));
     }
 
     #[test]
@@ -434,9 +551,155 @@ mod tests {
             Err(e) => panic!("unexpected seal error: {e}"),
         };
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].get_raw(0), Some(&b"a"[..]));
+        assert_eq!(rows[0].get_raw(0), Ok(Some(&b"a"[..])));
         assert!(rows[0].is_null(1));
-        assert_eq!(rows[1].get_raw(0), Some(&b"b"[..]));
-        assert_eq!(rows[1].get_raw(1), Some(&b"c"[..]));
+        assert_eq!(rows[1].get_raw(0), Ok(Some(&b"b"[..])));
+        assert_eq!(rows[1].get_raw(1), Ok(Some(&b"c"[..])));
+    }
+
+    /// Build a one-row arena whose single column holds `bytes` (non-NULL).
+    fn one_col_row(bytes: &[u8]) -> Vec<Row> {
+        let mut ab = ArenaBuilder::new(1);
+        ab.push_value(bytes);
+        ab.end_row();
+        match ab.finish() {
+            Ok(r) => r,
+            Err(e) => panic!("unexpected seal error: {e}"),
+        }
+    }
+
+    #[test]
+    fn typed_read_distinguishes_null_value_and_out_of_range() {
+        // One row, two columns: col 0 = "42" (value), col 1 = SQL NULL. Every
+        // outcome of a dynamic read must be a DISTINCT value — the old
+        // `Option<T>` return collapsed all three of these into a bare `None`.
+        let mut ab = ArenaBuilder::new(2);
+        ab.push_value(b"42");
+        ab.push_null();
+        ab.end_row();
+        let rows = match ab.finish() {
+            Ok(r) => r,
+            Err(e) => panic!("unexpected seal error: {e}"),
+        };
+        let row = &rows[0];
+        // Present value → Ok(Some).
+        assert_eq!(row.get_i32(0), Ok(Some(42)));
+        // SQL NULL → Ok(None) — a value that happens to be absent, NOT an error.
+        assert_eq!(row.get_i32(1), Ok(None));
+        // Index past the row's width → a classified error, NOT a fake NULL.
+        assert_eq!(row.get_i32(2), Err(ColumnError::OutOfRange { col: 2, n_cols: 2 }));
+    }
+
+    #[test]
+    fn garbage_int_read_is_classified_not_swallowed() {
+        // RED (old behaviour): `get_i32` was `get_str(col)?.parse().ok()`, so a
+        // column holding non-integer text ("hello") parsed to `None` — silently
+        // swallowed and INDISTINGUISHABLE from a SQL NULL.
+        //
+        // GREEN (now): the same read is a classified
+        // `Err(ColumnError::Decode(DecodeError::IntParse))`. The value-was-NULL
+        // outcome (`Ok(None)`) and the bytes-were-garbage outcome (`Err(..)`) are
+        // now different values a caller can branch on.
+        let rows = one_col_row(b"hello");
+        assert_eq!(
+            rows[0].get_i32(0),
+            Err(ColumnError::Decode(DecodeError::IntParse)),
+        );
+    }
+
+    #[test]
+    fn wrong_rust_type_for_column_surfaces_a_classified_error() {
+        // Asking for the WRONG Rust type on the text wire surfaces as a classified
+        // decode error rather than a silent misparse: an integer column decoded as
+        // `bool` is `BoolParse`; a boolean column decoded as `i32` is `IntParse`.
+        // (On the text wire every column is ASCII, so reading an int column as
+        // `&str` is a legitimate text read — verified below — which is why a
+        // separate OID pre-check adds little on this path.)
+        let int_row = one_col_row(b"42");
+        assert_eq!(
+            int_row[0].get_bool(0),
+            Err(ColumnError::Decode(DecodeError::BoolParse)),
+        );
+        // The same int column read as text is a valid read, not an error.
+        assert_eq!(int_row[0].get_str(0), Ok(Some("42")));
+
+        let bool_row = one_col_row(b"t");
+        assert_eq!(
+            bool_row[0].get_i32(0),
+            Err(ColumnError::Decode(DecodeError::IntParse)),
+        );
+        assert_eq!(bool_row[0].get_bool(0), Ok(Some(true)));
+    }
+
+    #[test]
+    fn non_utf8_text_read_is_classified() {
+        // A lone 0xFF is not valid UTF-8; reading it as `&str` is a classified
+        // `NonUtf8`, never a swallowed `None` (the old `get_str` did `.ok()` on
+        // `from_utf8`).
+        let rows = one_col_row(&[0xff]);
+        assert_eq!(
+            rows[0].get_str(0),
+            Err(ColumnError::Decode(DecodeError::NonUtf8)),
+        );
+    }
+
+    #[test]
+    fn float_read_classifies_null_value_and_parse_failure() {
+        // Float text decode: value → Ok(Some), NULL → Ok(None), non-float text →
+        // a classified FloatParse (never a swallowed None).
+        let mut ab = ArenaBuilder::new(3);
+        ab.push_value(b"2.5");
+        ab.push_null();
+        ab.push_value(b"not-a-float");
+        ab.end_row();
+        let rows = match ab.finish() {
+            Ok(r) => r,
+            Err(e) => panic!("unexpected seal error: {e}"),
+        };
+        let row = &rows[0];
+        assert_eq!(row.get_f64(0), Ok(Some(2.5)));
+        assert_eq!(row.get_f64(1), Ok(None));
+        assert_eq!(row.get_f64(2), Err(ColumnError::FloatParse));
+        // PG float specials parse through the same path.
+        let specials = one_col_row(b"NaN");
+        assert!(matches!(specials[0].get_f64(0), Ok(Some(v)) if v.is_nan()));
+    }
+
+    #[test]
+    fn f32_read_mirrors_f64_classification() {
+        // `get_f32` is the `float4` sibling of `get_f64` with the identical
+        // classified hand-path: value → Ok(Some), NULL → Ok(None), non-float text
+        // → FloatParse, non-UTF-8 → Decode(NonUtf8). No swallowed None anywhere.
+        let mut ab = ArenaBuilder::new(4);
+        ab.push_value(b"2.5");
+        ab.push_null();
+        ab.push_value(b"not-a-float");
+        ab.push_value(&[0xff]);
+        ab.end_row();
+        let rows = match ab.finish() {
+            Ok(r) => r,
+            Err(e) => panic!("unexpected seal error: {e}"),
+        };
+        let row = &rows[0];
+        assert_eq!(row.get_f32(0), Ok(Some(2.5)));
+        assert_eq!(row.get_f32(1), Ok(None));
+        assert_eq!(row.get_f32(2), Err(ColumnError::FloatParse));
+        assert_eq!(row.get_f32(3), Err(ColumnError::Decode(DecodeError::NonUtf8)));
+        // Out-of-range stays a classified error, distinct from NULL.
+        assert_eq!(row.get_f32(4), Err(ColumnError::OutOfRange { col: 4, n_cols: 4 }));
+        // PG float specials parse through the same path.
+        let specials = one_col_row(b"-Infinity");
+        assert!(matches!(specials[0].get_f32(0), Ok(Some(v)) if v.is_infinite() && v < 0.0));
+    }
+
+    #[test]
+    fn get_by_name_resolves_or_classifies_unknown() {
+        let rows = one_col_row(b"alice");
+        let names = vec!["name".to_string()];
+        assert_eq!(rows[0].get_by_name::<&str>("name", &names), Ok(Some("alice")));
+        assert_eq!(
+            rows[0].get_by_name::<&str>("missing", &names),
+            Err(ColumnError::UnknownColumn),
+        );
     }
 }

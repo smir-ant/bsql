@@ -40,7 +40,7 @@ mod transport;
 
 // Re-export shared types from core.
 pub use bsql_postgres_core::{
-    ConnectConfig, DbError, DriverError, FromText, Notification, QueryResult, Row, Rows, SslMode,
+    ColumnError, ConnectConfig, DbError, DriverError, Notification, QueryResult, Row, Rows, SslMode,
 };
 
 pub use connection::{Connection, PreparedStatement};

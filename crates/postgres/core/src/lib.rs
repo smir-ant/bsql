@@ -22,7 +22,7 @@ pub mod typed_rows;
 pub mod types;
 
 pub use config::{ConnectConfig, SslMode};
-pub use error::{DbError, DriverError};
+pub use error::{ColumnError, DbError, DriverError};
 pub use materialize::{CollectedResult, DbErrorSink, ResultCollector};
 pub use typed_rows::{Rows, RowsBuilder};
-pub use types::{ArenaBuilder, ArenaSealError, FromText, Notification, QueryResult, Row};
+pub use types::{ArenaBuilder, ArenaSealError, Notification, QueryResult, Row};
