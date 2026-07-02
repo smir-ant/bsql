@@ -14,7 +14,15 @@ async fn connect_and_ping() {
     let mut c = Connection::connect(&config).await.expect("connect");
     c.ping().await.expect("ping");
     assert!(c.is_healthy());
-    assert!(c.server_version().is_some());
+    // `server_version` is captured from the handshake `ParameterStatus` — no
+    // `SHOW server_version` round-trip. Assert it is present and plausible (a PG
+    // version string starts with the major-version digit), proving the captured
+    // value matches what the deleted `SHOW` returned.
+    let version = c.server_version().expect("server_version captured from handshake");
+    assert!(
+        version.as_bytes().first().is_some_and(u8::is_ascii_digit),
+        "server_version should start with the major-version digit, got {version:?}"
+    );
     assert!(c.backend_pid() > 0);
     c.close().await.expect("close");
 }

@@ -387,6 +387,60 @@ fn trust_connect_with_parameter_status_tail_reaches_active() {
     assert_eq!(connect_active(server, Credentials::Trust), (4321, TxStatus::Idle));
 }
 
+/// The connecting engine captures `server_version` from the startup
+/// `ParameterStatus` reports and exposes it via `Engine::server_version` once
+/// active — the value a `SHOW server_version` would return, recovered for free
+/// from the handshake. `client_encoding` / `DateStyle` are sent too but not
+/// captured (no consumer), and no `SHOW` is ever issued by the engine.
+#[test]
+fn connect_captures_server_version_from_handshake() {
+    let server = StaticServer::new(concat(&[
+        auth_ok(),
+        parameter_status("server_version", "17.2 (Debian 17.2-1.pgdg120+1)"),
+        parameter_status("client_encoding", "UTF8"),
+        parameter_status("DateStyle", "ISO, MDY"),
+        backend_key(4321, 8765),
+        ready_for_query(b'I'),
+    ]));
+    let user = Ident::try_from_str("corpus").expect("ident");
+    let version = session(server, &user, None, None, Credentials::Trust, |mut engine, live| {
+        let _live = poll_once(engine.connect(live))
+            .expect("blocking transport resolves in a single poll")
+            .expect("handshake reaches active");
+        engine
+            .server_version()
+            .expect("server_version readable once active")
+            .map(str::to_owned)
+    })
+    .expect("startup packet assembles");
+    assert_eq!(version.as_deref(), Some("17.2 (Debian 17.2-1.pgdg120+1)"));
+}
+
+/// A handshake with no `server_version` report leaves `server_version` as
+/// `None` — honest absence, never a fabricated value (and never a hidden `SHOW`
+/// fallback that would resurrect the round-trip).
+#[test]
+fn connect_without_server_version_report_is_none() {
+    let server = StaticServer::new(concat(&[
+        auth_ok(),
+        parameter_status("client_encoding", "UTF8"),
+        backend_key(4321, 8765),
+        ready_for_query(b'I'),
+    ]));
+    let user = Ident::try_from_str("corpus").expect("ident");
+    let version = session(server, &user, None, None, Credentials::Trust, |mut engine, live| {
+        let _live = poll_once(engine.connect(live))
+            .expect("blocking transport resolves in a single poll")
+            .expect("handshake reaches active");
+        engine
+            .server_version()
+            .expect("server_version readable once active")
+            .map(str::to_owned)
+    })
+    .expect("startup packet assembles");
+    assert_eq!(version, None);
+}
+
 /// MD5 handshake: the server's salt is fixed, so the client's MD5 response is
 /// deterministic and the reply is a static script. `connect` reaches active.
 #[test]

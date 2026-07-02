@@ -288,8 +288,9 @@ fn same_carrier_loops_without_42p05() {
 /// PLAN-REUSE OBSERVABLE: after running the same carrier several times on one
 /// connection, the server holds EXACTLY ONE prepared statement — proof the Parse
 /// happened once. A fresh connection starts with zero prepared statements (the
-/// connect handshake + `SHOW server_version` use only simple queries), so the
-/// single entry is this carrier's content-addressed statement.
+/// connect handshake issues no query — `server_version` is captured from the
+/// handshake `ParameterStatus`, not fetched), so the single entry is this
+/// carrier's content-addressed statement.
 #[test]
 #[ignore = "requires local PG"]
 fn plan_is_parsed_once_and_persists() {

@@ -45,36 +45,26 @@ fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// AuthenticationOk + BackendKeyData + ReadyForQuery — the trust handshake.
+/// A `ParameterStatus` ('S') report: `key\0value\0`.
+fn parameter_status(key: &str, value: &str) -> Vec<u8> {
+    let mut body = key.as_bytes().to_vec();
+    body.push(0);
+    body.extend_from_slice(value.as_bytes());
+    body.push(0);
+    frame(b'S', &body)
+}
+
+/// AuthenticationOk + a `server_version` `ParameterStatus` + BackendKeyData +
+/// ReadyForQuery — the trust handshake as a real server sends it. `connect`
+/// captures `server_version` from the report, so no `SHOW` round-trip follows.
 fn handshake() -> Vec<u8> {
     let mut key = 4321_i32.to_be_bytes().to_vec();
     key.extend_from_slice(&8765_i32.to_be_bytes());
     let mut out = frame(b'R', &0_i32.to_be_bytes());
+    out.extend_from_slice(&parameter_status("server_version", "16.0"));
     out.extend_from_slice(&frame(b'K', &key));
     out.extend_from_slice(&frame(b'Z', b"I"));
     out
-}
-
-/// A one-text-column `RowDescription` for the connect-time `SHOW server_version`.
-fn row_description_text(name: &str, oid: i32) -> Vec<u8> {
-    let mut body = 1_i16.to_be_bytes().to_vec();
-    body.extend_from_slice(name.as_bytes());
-    body.push(0);
-    body.extend_from_slice(&0_i32.to_be_bytes()); // table oid
-    body.extend_from_slice(&1_i16.to_be_bytes()); // column attr
-    body.extend_from_slice(&oid.to_be_bytes()); // type oid
-    body.extend_from_slice(&(-1_i16).to_be_bytes()); // type len
-    body.extend_from_slice(&(-1_i32).to_be_bytes()); // type mod
-    body.extend_from_slice(&0_i16.to_be_bytes()); // format (text)
-    frame(b'T', &body)
-}
-
-/// A single-text-cell `DataRow`.
-fn data_row_text(value: &str) -> Vec<u8> {
-    let mut body = 1_i16.to_be_bytes().to_vec();
-    body.extend_from_slice(&i32::try_from(value.len()).expect("len").to_be_bytes());
-    body.extend_from_slice(value.as_bytes());
-    frame(b'D', &body)
 }
 
 fn command_complete(tag: &str) -> Vec<u8> {
@@ -110,17 +100,13 @@ fn malformed_int8_row() -> Vec<u8> {
     frame(b'D', &body)
 }
 
-/// The full scripted server reply: handshake, the connect-time `SHOW
-/// server_version` result, the streaming query's MISS reply (one GOOD row then a
-/// MALFORMED row, then CommandComplete + ReadyForQuery for the drain to reach),
-/// and finally the follow-up ping's ReadyForQuery.
+/// The full scripted server reply: handshake (with `server_version` captured
+/// from its `ParameterStatus`, so no connect-time `SHOW` follows), the streaming
+/// query's MISS reply (one GOOD row then a MALFORMED row, then CommandComplete +
+/// ReadyForQuery for the drain to reach), and finally the follow-up ping's
+/// ReadyForQuery.
 fn server_script() -> Vec<u8> {
     let mut out = handshake();
-    // Connect-time `SHOW server_version`.
-    out.extend_from_slice(&row_description_text("server_version", 25));
-    out.extend_from_slice(&data_row_text("16.0"));
-    out.extend_from_slice(&command_complete("SHOW"));
-    out.extend_from_slice(&rfq());
     // query_each MISS reply.
     out.extend_from_slice(&frame(b'3', &[])); // CloseComplete
     out.extend_from_slice(&frame(b'1', &[])); // ParseComplete

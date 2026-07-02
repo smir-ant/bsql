@@ -104,9 +104,9 @@ fn param_status(key: &str, value: &str) -> Vec<u8> {
 }
 
 /// AuthenticationOk, a realistic run of startup GUC `ParameterStatus` frames
-/// (the engine's `connect` IGNORES these — they are captured driver-side on the
-/// pull surface, not by the connect verb — so they must add no allocation),
-/// BackendKeyData, ReadyForQuery(Idle).
+/// (the engine's `connect` captures `server_version` from these into one owned
+/// `String` and ignores the rest — no consumer), BackendKeyData,
+/// ReadyForQuery(Idle).
 fn handshake() -> Vec<u8> {
     let mut out = frame(b'R', &0_i32.to_be_bytes());
     for (k, v) in [
@@ -261,15 +261,23 @@ fn no_op_sink(surface: Surface<'_>) -> ControlFlow<Never> {
 /// active) over a REALISTIC reply (AuthenticationOk + eight startup GUC
 /// `ParameterStatus` frames + BackendKeyData + ReadyForQuery).
 ///
-/// The current value is **1** — and it is NOT `ParameterStatus` string storage
-/// (the engine's `connect` ignores those; they are captured driver-side on the
-/// pull surface). It is the connecting ingest buffer's ONE-TIME heap escape: a
-/// realistic handshake reply exceeds the 128-byte inline ingest tier, so the
-/// buffer escapes to a heap array exactly once. An honest number that reveals a
-/// real cost — a later slice that sizes the connecting inline tier to fit a
-/// typical handshake would drive this to 0 (a proven RED→GREEN), and must then
-/// lower this pin.
-const HANDSHAKE_ALLOC_PIN: usize = 1;
+/// The current value is **2**, both honest one-time costs:
+///
+/// 1. The connecting ingest buffer's ONE-TIME heap escape: a realistic
+///    handshake reply exceeds the 128-byte inline ingest tier, so the buffer
+///    escapes to a heap array exactly once. (A later slice that sizes the
+///    connecting inline tier to fit a typical handshake would drive this to 0.)
+/// 2. The captured `server_version` `String` — the value a `SHOW server_version`
+///    would return, now carried from the handshake for free. This one owned
+///    allocation replaces the old post-connect `SHOW` round-trip, which cost a
+///    full network round-trip PLUS a whole `QueryResult` (four allocations) to
+///    recover the same string. Trading one cold-path `String` for a round-trip
+///    is a large net win, so this pin rises by one rather than the round-trip
+///    being kept.
+///
+/// An honest baseline, not an aspirational zero. A later slice that trims either
+/// cost must lower this pin — a visible, reviewed number.
+const HANDSHAKE_ALLOC_PIN: usize = 2;
 
 #[test]
 fn handshake_budget_pinned_and_cache_hit_is_zero_alloc() {

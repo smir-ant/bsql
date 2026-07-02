@@ -343,6 +343,19 @@ impl<'b, T, O> Engine<'b, T, O> {
         Ok(self.phase.as_active()?.backend_pid())
     }
 
+    /// The `server_version` GUC captured from the startup `ParameterStatus`
+    /// reports during the handshake — the version string a `SHOW server_version`
+    /// would return, recovered for free without the round-trip.
+    ///
+    /// Returns [`WrongPhase`] before [`connect`](Self::connect) has driven the
+    /// engine active. Once active, `Ok(Some(_))` is the captured version and
+    /// `Ok(None)` means the server sent no `server_version` report (honest
+    /// absence — never a fabricated value).
+    #[inline]
+    pub fn server_version(&self) -> Result<Option<&str>, WrongPhase> {
+        Ok(self.phase.as_active()?.server_version())
+    }
+
     /// The current `ReadyForQuery` transaction-status indicator.
     ///
     /// Returns [`WrongPhase`] before the engine is active (see
@@ -765,6 +778,7 @@ const _: fn() = || {
         crate::sensitive::Sensitive::new(0_i32),
         crate::action::TxStatus::Idle,
         IngestBuf::new(),
+        None,
     );
     let mut transport = WitnessTransport;
     let mut send_buf = SendBuf::new();

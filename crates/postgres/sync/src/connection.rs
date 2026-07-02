@@ -154,23 +154,26 @@ impl Connection {
                 .map_err(lift_conn_fail)?;
         let live = flatten_poll(engine::poll_once(engine.connect(live)))?;
         let backend_pid = engine.backend_pid().map_err(|_| DriverError::NotReady)?;
+        // The engine captured `server_version` from the startup `ParameterStatus`
+        // reports during the handshake, so it is read here for free — no
+        // `SHOW server_version` round-trip. `None` if the server sent no such
+        // report (honest absence, not a fabricated value).
+        let server_version = engine
+            .server_version()
+            .map_err(|_| DriverError::NotReady)?
+            .map(str::to_owned);
 
-        let mut conn = Self {
+        Ok(Self {
             engine,
             live: Some(live),
             socket_ctl,
             read_timeout,
             params: SessionParams {
-                server_version: None,
+                server_version,
                 backend_pid,
             },
             stmt_counter: 0,
-        };
-        // The new engine drops the startup `ParameterStatus` frames (the connect
-        // pump surfaces them to nothing), so `server_version` is recovered with a
-        // one-round-trip `SHOW` rather than carried from the handshake.
-        conn.params.server_version = conn.fetch_server_version()?;
-        Ok(conn)
+        })
     }
 
     /// Build the plaintext or TLS wire, performing the PG `SSLRequest`
@@ -257,17 +260,6 @@ impl Connection {
             .map_err(|_| DriverError::Config("generated statement name invalid"))
     }
 
-    /// Recover the server version with a one-round-trip `SHOW server_version`.
-    fn fetch_server_version(&mut self) -> Result<Option<String>, DriverError> {
-        let result = self.query_sql("SHOW server_version")?;
-        Ok(match result.rows.first() {
-            // The `?` propagates a classified `ColumnError` (a non-UTF-8 or
-            // out-of-range column) into `DriverError` rather than silently
-            // dropping it; the inner `Option` carries a legitimate SQL NULL.
-            Some(row) => row.get_str(0)?.map(String::from),
-            None => None,
-        })
-    }
 
     /// Build a [`QueryResult`] from a finished collector, optionally overriding
     /// the column names (the prepared path supplies the names captured at

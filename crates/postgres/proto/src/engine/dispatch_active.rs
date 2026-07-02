@@ -329,6 +329,19 @@ pub struct ActiveEngine {
     col_names: Vec<String>,
     /// The most recent statement's `CommandComplete` tag.
     command_tag: Option<CommandTag>,
+    /// The `server_version` GUC captured from the startup `ParameterStatus`
+    /// reports during the handshake and carried across
+    /// [`ConnectingEngine::into_active`](super::ConnectingEngine::into_active).
+    /// Read via [`server_version`](Self::server_version); `None` if the server
+    /// sent no such report. This is what lets the driver skip the post-connect
+    /// `SHOW server_version` round-trip.
+    ///
+    /// Off the hot path: written once at `from_handshake` and read only through
+    /// the cold accessor, never inside `next_event`/`drive`. Its footprint cost
+    /// is therefore an offset shift with no hot-loop codegen effect — that
+    /// coldness, not the Observer-seam `engine_asm_identity` witness (which is
+    /// blind to this struct's layout), is what keeps the active path unperturbed.
+    server_version: Option<String>,
     /// Content-addressed names of the prepared statements this connection has
     /// Parsed and that are DURABLE on the server.
     ///
@@ -354,10 +367,12 @@ pub struct ActiveEngine {
 // Stack footprint of the active handle: the carried-forward `IngestBuf` (144)
 // dominates, plus the pid/secret/tx-status scalars, the `Option<Box<…>>` /
 // `Vec` handles (schema, oversize prefix, the Sub-C accumulator, the prepared-
-// statement-name cache), and the `command_tag`. The result-schema, oversize,
-// and cached-name bytes live off-stack behind those handles. A field addition
-// lands here as a reviewed footprint drift.
-crate::wire_pin!(ActiveEngine, size = 328, align = 8);
+// statement-name cache), the `command_tag`, and the captured `server_version`
+// (`Option<String>`, 24 B — the version text itself is off-stack behind the
+// `String`). The result-schema, oversize, and cached-name bytes live off-stack
+// behind those handles. A field addition lands here as a reviewed footprint
+// drift.
+crate::wire_pin!(ActiveEngine, size = 352, align = 8);
 
 impl ActiveEngine {
     /// Construct the active engine at handshake completion, carrying the
@@ -368,6 +383,7 @@ impl ActiveEngine {
         secret_key: Sensitive<i32>,
         tx_status: TxStatus,
         ingest: IngestBuf,
+        server_version: Option<String>,
     ) -> Self {
         Self {
             backend_pid,
@@ -381,6 +397,7 @@ impl ActiveEngine {
             col_oids: Vec::new(),
             col_names: Vec::new(),
             command_tag: None,
+            server_version,
             parsed_statements: Vec::new(),
         }
     }
@@ -391,6 +408,17 @@ impl ActiveEngine {
     #[must_use]
     pub fn backend_pid(&self) -> i32 {
         self.backend_pid
+    }
+
+    /// The `server_version` GUC reported during the handshake, or `None` if the
+    /// server sent no `server_version` `ParameterStatus`.
+    ///
+    /// Captured for free from the startup reports, so a driver reads the server
+    /// version here rather than issuing a `SHOW server_version` round-trip.
+    #[inline]
+    #[must_use]
+    pub fn server_version(&self) -> Option<&str> {
+        self.server_version.as_deref()
     }
 
     /// The current `ReadyForQuery` transaction-status indicator, updated at each

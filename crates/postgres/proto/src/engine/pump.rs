@@ -364,18 +364,14 @@ where
                 return Ok(HandshakeOutcome::Failed(reason));
             }
             HandshakeProgress::AuthResponse => flush(send_buf, transport).await?,
-            // The startup `ParameterStatus` GUCs (server_version, client_encoding,
-            // integer_datetimes, …) are currently dropped on the connect path:
-            // `next_handshake_step` discards the payload. The sync driver
-            // recovers `server_version` with a one-round-trip `SHOW` as the
-            // interim. SURFACING them for free (accumulate into a `SessionParams`
-            // the `ConnectingEngine` carries across `into_active`, exposed via an
-            // `Engine` accessor, dropping the `SHOW` RTT) is a deferred
-            // optimization: it threads a new field through the handshake dispatch
-            // and the `from_handshake` signature, which is out of scope for the
-            // error-model cutover. The corpus's `next_auth_event` path already
-            // captures these (`AuthEvent::ParamStatus`), so the surfacing work is
-            // a connect-path mirror of an existing parse.
+            // The startup `ParameterStatus` reports keep the pump pulling. The
+            // connecting engine captures `server_version` from them as they pass
+            // (in `drive_to_event`, the choke point `next_handshake_step` funnels
+            // through), carries it across `into_active`, and exposes it via
+            // `Engine::server_version` — so a driver reads the server version for
+            // free from the handshake instead of a `SHOW server_version`
+            // round-trip. The other GUCs are not captured here (no consumer); the
+            // pump simply keeps pulling.
             HandshakeProgress::ParamStatus => {}
             HandshakeProgress::NeedMore => {
                 // A response built during a silent intermediate (the SASL
@@ -514,7 +510,13 @@ mod hook_tests {
     }
 
     fn active() -> ActiveEngine {
-        ActiveEngine::from_handshake(0_i32, Sensitive::new(0_i32), TxStatus::Idle, IngestBuf::new())
+        ActiveEngine::from_handshake(
+            0_i32,
+            Sensitive::new(0_i32),
+            TxStatus::Idle,
+            IngestBuf::new(),
+            None,
+        )
     }
 
     /// The pump fires `on_row` once per whole row and `on_complete` once per

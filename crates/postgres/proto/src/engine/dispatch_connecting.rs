@@ -52,6 +52,7 @@
 )]
 
 use alloc::boxed::Box;
+use alloc::string::String;
 
 use super::{ActiveEngine, AuthEvent, IngestBuf, IngestCommitOverflow, IngestFull, SendBuf};
 use crate::action::TxStatus;
@@ -251,6 +252,26 @@ fn server_fail() -> ConnDispatch {
     }
 }
 
+/// Extract one `ParameterStatus` GUC value by key, decoded as UTF-8.
+///
+/// A `ParameterStatus` body is `key\0value\0` — two NUL-terminated C strings
+/// (PG §55.7). Returns the owned value when `key` matches and the value is
+/// valid UTF-8. A key mismatch, a missing NUL separator/terminator (malformed
+/// frame), or a non-UTF-8 value all yield `None` — honest absence, never a
+/// lossy substitution. `server_version` is always ASCII, so the UTF-8 arm
+/// never rejects a real report; the check exists so a corrupt/injected frame
+/// degrades to absence rather than a mangled string.
+fn param_status_value(body: &[u8], key: &[u8]) -> Option<String> {
+    let key_end = body.iter().position(|&b| b == 0)?;
+    if body.get(..key_end)? != key {
+        return None;
+    }
+    let value_field = body.get(key_end.checked_add(1)?..)?;
+    let value_end = value_field.iter().position(|&b| b == 0)?;
+    let value = value_field.get(..value_end)?;
+    core::str::from_utf8(value).ok().map(String::from)
+}
+
 // ===========================================================================
 // The connecting engine
 // ===========================================================================
@@ -270,14 +291,25 @@ fn server_fail() -> ConnDispatch {
 pub struct ConnectingEngine {
     ingest: IngestBuf,
     phase: ConnPhase,
+    /// The `server_version` GUC captured from the startup `ParameterStatus`
+    /// reports the server sends during the handshake, before the first
+    /// `ReadyForQuery`. Owned (not a borrow into `ingest`, which is refilled by
+    /// active-phase reads after `into_active`) so it outlives the handshake and
+    /// rides into the [`ActiveEngine`], where the driver reads it via
+    /// [`super::Engine::server_version`] — deleting the post-connect
+    /// `SHOW server_version` round-trip. `None` if the server sent no
+    /// `server_version` report (spec-guaranteed for protocol 3.0, so honest
+    /// absence, never a fabricated fallback).
+    server_version: Option<String>,
 }
 
 // Stack footprint: the single-residence `IngestBuf` (144) + the `ConnPhase`
-// enum. `ConnPhase` is sized by its widest variant — the password/SCRAM
-// handshake state is `Box`-externalised inside `ConnectingState`, so the live
-// handshake material lives off-stack and the engine's own footprint stays
-// bounded. A field reshape lands here as a reviewed drift.
-crate::wire_pin!(ConnectingEngine, size = 168, align = 8);
+// enum + the captured `server_version` (`Option<String>`, 24 B). `ConnPhase` is
+// sized by its widest variant — the password/SCRAM handshake state is
+// `Box`-externalised inside `ConnectingState`, so the live handshake material
+// lives off-stack and the engine's own footprint stays bounded. A field reshape
+// lands here as a reviewed drift.
+crate::wire_pin!(ConnectingEngine, size = 192, align = 8);
 
 impl ConnectingEngine {
     /// Begin a handshake: queue the `StartupMessage` onto `send_buf` and seat
@@ -331,6 +363,7 @@ impl ConnectingEngine {
         Ok(Self {
             ingest: IngestBuf::new(),
             phase: ConnPhase::Handshaking(state),
+            server_version: None,
         })
     }
 
@@ -472,7 +505,23 @@ impl ConnectingEngine {
                 ConnEvent::Cleartext => return DriveOutcome::Cleartext,
                 ConnEvent::Md5 { salt } => return DriveOutcome::Md5 { salt },
                 ConnEvent::SaslContinue => return DriveOutcome::SaslContinue { start, end },
-                ConnEvent::ParamStatus => return DriveOutcome::ParamStatus { start, end },
+                ConnEvent::ParamStatus => {
+                    // Capture `server_version` from the GUC key/value before the
+                    // pump drops the report — the driver reads it via the active
+                    // accessor instead of a post-connect `SHOW`. Parsed here, the
+                    // single choke point both `next_handshake_step` (pump) and
+                    // `next_auth_event` (corpus) funnel through, so neither's
+                    // signature grows. First writer wins: `server_version` is sent
+                    // once, but the guard keeps a hostile duplicate from
+                    // reallocating.
+                    if self.server_version.is_none() {
+                        let body = self.ingest.frame_body(start, end);
+                        if let Some(value) = param_status_value(body, b"server_version") {
+                            self.server_version = Some(value);
+                        }
+                    }
+                    return DriveOutcome::ParamStatus { start, end };
+                }
                 ConnEvent::Ready => return DriveOutcome::Ready,
                 ConnEvent::ServerFail => return DriveOutcome::ServerFail { start, end },
                 ConnEvent::ProtoFail(reason) => return DriveOutcome::ProtoFail(reason),
@@ -506,12 +555,15 @@ impl ConnectingEngine {
         };
         // Carry the single-residence ingest buffer forward: any active-phase
         // frames the server pipelined after the handshake terminal are already
-        // resident, so the active engine resumes framing without a re-read.
+        // resident, so the active engine resumes framing without a re-read. The
+        // captured `server_version` moves with it (a plain field move out of the
+        // consumed `self` — `ConnectingEngine` has no `Drop`).
         Ok(ActiveEngine::from_handshake(
             parts.pid,
             parts.secret_key,
             parts.tx_status,
             self.ingest,
+            self.server_version,
         ))
     }
 }
