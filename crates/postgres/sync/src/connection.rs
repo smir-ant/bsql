@@ -88,6 +88,67 @@ pub struct PreparedStatement {
     column_names: Arc<[String]>,
 }
 
+/// A lending `COPY … FROM STDIN` writer, handed to the closure of
+/// [`copy_in_with`](Connection::copy_in_with).
+///
+/// Borrows the connection's engine for the copy's duration and streams each
+/// row/chunk as one `CopyData` frame flushed straight to the socket — nothing is
+/// buffered, so a bulk load of millions of rows runs in CONSTANT memory (0 heap
+/// growth per row; one reused scratch buffer for [`write_row`](Self::write_row)'s
+/// trailing newline).
+///
+/// The writer never closes the copy itself: [`copy_in_with`](Connection::copy_in_with)
+/// owns the terminal step, sending `CopyDone` when the closure returns `Ok` and
+/// `CopyFail` when it returns `Err`, so an early error recovers the connection
+/// rather than stranding it in copy mode.
+///
+/// No `Debug`: it borrows the connection's engine (a live socket / TLS session),
+/// which is not `Debug` — the same reason [`Connection`] carries none.
+pub struct CopyInWriter<'e> {
+    engine: &'e mut SyncEngine,
+    /// Reused across [`write_row`](Self::write_row) calls so appending the row
+    /// separator costs no per-row allocation.
+    scratch: Vec<u8>,
+}
+
+impl CopyInWriter<'_> {
+    /// Stream one `CopyData` frame with `chunk` as its verbatim body, flushed to
+    /// the socket. Zero-copy: the bytes are queued directly. For text `COPY`,
+    /// `chunk` is raw copy-format bytes — the caller controls row boundaries and
+    /// framing.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`DriverError`] on a transport fault (the connection is then
+    /// dead) or a [`SpuriousPending`] over a blocking socket; never a panic.
+    pub fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), DriverError> {
+        match engine::poll_once(self.engine.copy_in_write(chunk)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(other)) => Err(lift_engine_error(other)),
+            Err(SpuriousPending) => Err(DriverError::SpuriousPending),
+        }
+    }
+
+    /// Stream one text-`COPY` row: `row`'s bytes followed by a `\n` separator, as
+    /// one `CopyData` frame. A convenience over [`write_chunk`](Self::write_chunk)
+    /// that reuses an internal scratch buffer for the newline (no per-row
+    /// allocation).
+    ///
+    /// # Errors
+    ///
+    /// As [`write_chunk`](Self::write_chunk).
+    pub fn write_row(&mut self, row: &[u8]) -> Result<(), DriverError> {
+        self.scratch.clear();
+        self.scratch.extend_from_slice(row);
+        self.scratch.push(b'\n');
+        match engine::poll_once(self.engine.copy_in_write(&self.scratch)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(other)) => Err(lift_engine_error(other)),
+            Err(SpuriousPending) => Err(DriverError::SpuriousPending),
+        }
+    }
+}
+
 /// Non-secret session facts captured at connect time.
 struct SessionParams {
     server_version: Option<String>,
@@ -977,46 +1038,209 @@ impl Connection {
         }
     }
 
-    /// `COPY <table> FROM STDIN`, streaming each row as a `CopyData` chunk.
+    /// `COPY <table> FROM STDIN`, bulk-loading `rows_data` in CONSTANT memory —
+    /// the ergonomic batch form of [`copy_in_with`](Self::copy_in_with).
+    ///
+    /// Each item is streamed as one text-`COPY` row (its bytes + a `\n`) through
+    /// the lending writer, so the rows are NOT pre-collected: a lazy iterator of
+    /// millions of rows loads without materialising them all. Returns the
+    /// server's affected-row count (`COPY n`).
     ///
     /// `COPY` has no parameterized form for the target table, so `table` is
     /// interpolated into the SQL. It is validated as an unquoted identifier
     /// (optionally `schema.table`) BEFORE interpolation — an injection-shaped
     /// string is a classified [`DriverError::Config`], never spliced into SQL.
+    ///
+    /// # Errors
+    ///
+    /// A row rejected by the server (a bad value, a constraint violation) is a
+    /// classified [`DriverError::Db`], and the connection RECOVERS to a clean
+    /// idle (it stays pooled). A transport fault is fatal.
     pub fn copy_in(
         &mut self,
         table: &str,
         rows_data: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<u64, DriverError> {
+        self.copy_in_with(table, |w| {
+            for row in rows_data {
+                w.write_row(row.as_ref().as_bytes())?;
+            }
+            Ok(())
+        })
+    }
+
+    /// `COPY <table> FROM STDIN` with a scoped streaming writer: run `f` against a
+    /// [`CopyInWriter`], then finish (`CopyDone`) if it returns `Ok` or abort
+    /// (`CopyFail`) if it returns `Err`. The CONSTANT-MEMORY, cancellation-safe
+    /// bulk-load primitive.
+    ///
+    /// `f` may interleave arbitrary work between rows and `write_chunk` /
+    /// `write_row` each stream one `CopyData` frame flushed to the socket —
+    /// nothing accumulates, so any row count loads in bounded memory.
+    ///
+    /// # Cancellation and recovery
+    ///
+    /// The terminal step is owned here, not by the writer's `Drop`:
+    ///
+    /// - `f` returns `Ok(())` → `CopyDone`; the server's `COPY n` count is
+    ///   returned and the connection stays clean and pooled.
+    /// - `f` returns `Err(e)` (the caller abandoned the copy mid-stream) →
+    ///   `CopyFail`; the server tears the COPY down and the verb drains the
+    ///   recovering `ReadyForQuery`, so the connection is RECOVERABLE (a
+    ///   subsequent query works). The caller's `e` is returned.
+    ///
+    /// `table` is validated as an identifier (see [`copy_in`](Self::copy_in)).
+    ///
+    /// # Errors
+    ///
+    /// A server rejection at `CopyDone` (a bad row / constraint) is a recoverable
+    /// [`DriverError::Db`]; `f`'s own error is returned verbatim; a transport
+    /// fault is fatal.
+    pub fn copy_in_with<F>(&mut self, table: &str, f: F) -> Result<u64, DriverError>
+    where
+        F: FnOnce(&mut CopyInWriter<'_>) -> Result<(), DriverError>,
+    {
         sql_ident::validate_table(table)?;
         let sql = format!("COPY {table} FROM STDIN");
-        // Materialise each row + a trailing newline into an owned store the data
-        // closure yields slices from: the engine's `data` callback borrows for
-        // one fixed lifetime, so the rows must outlive the call. One allocation
-        // per row (matching the prior driver); the engine flushes each chunk, so
-        // the send buffer stays bounded.
-        let store: Vec<Vec<u8>> = rows_data
-            .into_iter()
-            .map(|row| {
-                let mut bytes = row.as_ref().as_bytes().to_vec();
-                bytes.push(b'\n');
-                bytes
-            })
-            .collect();
         let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let mut rows = store.iter();
-        let polled = engine::poll_once(self.engine.copy_in(
-            live,
-            &sql,
-            || rows.next().map(Vec::as_slice),
-            |s| {
-                collector.feed(s);
+        // A transport fault while issuing the COPY command is fatal: the token is
+        // dropped (not restored), so the connection is dead — never swallowed.
+        match engine::poll_once(self.engine.copy_in_begin(&sql)) {
+            Ok(Ok(())) => {}
+            Ok(Err(other)) => return Err(lift_engine_error(other)),
+            Err(SpuriousPending) => return Err(DriverError::SpuriousPending),
+        }
+        let body = {
+            let mut writer = CopyInWriter {
+                engine: &mut self.engine,
+                scratch: Vec::new(),
+            };
+            f(&mut writer)
+            // `writer` is dropped here, releasing the `&mut self.engine` borrow.
+        };
+        match body {
+            Ok(()) => {
+                let mut collector = ResultCollector::new();
+                let polled = engine::poll_once(self.engine.copy_in_finish(live, |s| {
+                    collector.feed(s);
+                    ControlFlow::Continue(())
+                }));
+                // `settle` restores the token on either status and maps a server
+                // rejection (a bad row surfaced at `CopyDone`) to `DriverError::Db`
+                // with the connection kept pooled.
+                self.settle(polled, &mut collector)?;
+                Ok(collector.affected())
+            }
+            Err(e) => {
+                // The caller abandoned the copy: send `CopyFail` to reclaim the
+                // connection. The server ALWAYS answers `CopyFail` with an
+                // `ErrorResponse` + `ReadyForQuery`, so the abort's `ServerErrored`
+                // status is EXPECTED, not a fault — the token is restored and the
+                // caller's `e` dominates. A transport fault during the abort means
+                // the socket is truly broken; the token stays gone (connection
+                // dead) and `e` still dominates.
+                if let Ok(Ok(Outcome { live, .. })) =
+                    engine::poll_once(self.engine.copy_in_abort(
+                        live,
+                        b"client aborted COPY",
+                        |_s: Surface<'_>| ControlFlow::Continue(()),
+                    ))
+                {
+                    self.live = Some(live);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// `COPY <table> TO STDOUT`, streaming each row to `on_chunk` in CONSTANT
+    /// memory — the bulk-unload peer of [`copy_in`](Self::copy_in).
+    ///
+    /// Each server `CopyData` frame (one text-`COPY` row, `\n`-terminated) is
+    /// handed to `on_chunk` as a borrowed slice into the transient ingest buffer;
+    /// nothing is accumulated, so a colossal unload streams without growing
+    /// memory. The borrowed chunk CANNOT escape the closure (the `for<'q>` on the
+    /// bound is the compiler-enforced escape wall).
+    ///
+    /// `on_chunk` returns [`ControlFlow`]: [`Continue`](ControlFlow::Continue) to
+    /// keep streaming, or [`Break(e)`](ControlFlow::Break) to stop early.
+    ///
+    /// `table` is validated as an identifier (see [`copy_in`](Self::copy_in)).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(None)` — the unload streamed to completion; the connection is clean
+    ///   and pooled.
+    /// - `Ok(Some(e))` — `on_chunk` returned [`Break(e)`](ControlFlow::Break); the
+    ///   stream stopped early and the connection was drained back to a clean idle,
+    ///   so it stays healthy and reusable.
+    /// - `Err(DriverError::Db(..))` — the server reported an error mid-unload; the
+    ///   connection was drained and stays healthy.
+    /// - other `Err` — a fatal transport/protocol fault; the connection is dead.
+    ///
+    /// # Early-abort cost
+    ///
+    /// A [`Break`](ControlFlow::Break) still READS (and discards) the remaining
+    /// `CopyData` to reach the clean idle that makes the connection reusable —
+    /// O(remaining rows).
+    pub fn copy_out<F, E>(
+        &mut self,
+        table: &str,
+        mut on_chunk: F,
+    ) -> Result<Option<E>, DriverError>
+    where
+        F: for<'q> FnMut(&'q [u8]) -> ControlFlow<E>,
+    {
+        sql_ident::validate_table(table)?;
+        let sql = format!("COPY {table} TO STDOUT");
+        let live = self.take_live()?;
+        // Captured across the streaming sink; read after the verb settles.
+        let mut db_error: Option<DbError> = None;
+        let polled = engine::poll_once(self.engine.copy_out(live, &sql, |surface| match surface {
+            // The chunk borrows the transient ingest buffer; `on_chunk` consumes
+            // it in-scope (the `for<'q>` wall forbids escape).
+            Surface::CopyData(body) => on_chunk(body),
+            // Capture the server error's cause, then let the pump reach its
+            // `Failed` boundary so the connection can be drained to idle.
+            Surface::Fail(body) => {
+                db_error = Some(materialize::parse_error_response(body));
                 ControlFlow::Continue(())
-            },
-        ));
-        self.settle(polled, &mut collector)?;
-        Ok(collector.affected())
+            }
+            // `CopyDone`, the `COPY n` `Deliver`, and asynchronous frames are not
+            // unload rows.
+            _ => ControlFlow::Continue(()),
+        }));
+
+        // The token rides `Ok` on any ALIVE boundary; a fatal is `Err`.
+        let (live, boundary) = match polled {
+            Ok(Ok(Outcome { live, status })) => (live, status),
+            Ok(Err(other)) => return Err(lift_engine_error(other)),
+            Err(SpuriousPending) => return Err(DriverError::SpuriousPending),
+        };
+        match boundary {
+            Boundary::Idle => {
+                self.live = Some(live);
+                Ok(None)
+            }
+            Boundary::Failed => {
+                self.drain_to_idle(live)?;
+                match db_error {
+                    Some(db) => Err(DriverError::Db(db)),
+                    None => Err(DriverError::UnclassifiedFailure),
+                }
+            }
+            Boundary::Stopped(e) => {
+                self.drain_to_idle(live)?;
+                Ok(Some(e))
+            }
+            // `copy_out` maps Closed/Suspended to a fatal `Err`, so they never ride
+            // an `Ok` outcome; `Boundary` is `#[non_exhaustive]`, so this classified
+            // arm also covers any future boundary. The token is dropped, so the
+            // connection is left dead + evictable.
+            _ => Err(DriverError::Io(io::Error::other(
+                "unexpected protocol boundary from a streaming COPY OUT",
+            ))),
+        }
     }
 
     /// Whether the connection is at a clean boundary and reusable.

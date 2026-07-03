@@ -43,7 +43,7 @@ pub use bsql_postgres_core::{
     ColumnError, ConnectConfig, DbError, DriverError, Notification, QueryResult, Row, Rows, SslMode,
 };
 
-pub use connection::{Connection, PreparedStatement};
+pub use connection::{Connection, CopyInWriter, PreparedStatement};
 pub use pool::{Pool, PooledConnection};
 
 // Tier-1 static assertions: Connection is Send (its futures cross .await points

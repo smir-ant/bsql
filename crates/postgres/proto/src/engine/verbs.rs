@@ -983,35 +983,103 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         Ok(Outcome { live, status })
     }
 
-    /// `COPY <table> FROM STDIN`: issue the COPY command, stream client
-    /// `CopyData` frames (each chunk yielded by `data`, flushed as produced to
-    /// bound the send buffer), then `CopyDone`, and pump for the server acks.
-    /// `B = Never`.
+    /// Open a `COPY … FROM STDIN`: issue the COPY command and flush it, entering
+    /// the client-streaming phase. The token-less half of the streaming COPY-in
+    /// trio ([`copy_in_write`](Self::copy_in_write) then
+    /// [`copy_in_finish`](Self::copy_in_finish) / [`copy_in_abort`](Self::copy_in_abort)).
     ///
-    /// `data` yields successive chunks borrowing a caller-owned store; each is
-    /// framed (the header into the bounded scratch buffer, the body queued
-    /// directly so an oversize chunk needs no scratch room) and flushed. The
-    /// server's `CopyInResponse` is consumed silently; the trailing
-    /// `CommandComplete` + `ReadyForQuery` close the command.
+    /// Sends only the COPY command; it does NOT read the server's `CopyInResponse`
+    /// (`'G'`). That optimistic write-ahead is sound: between `CopyInResponse` and
+    /// the post-`CopyDone` `CommandComplete` the server produces nothing, and if
+    /// the COPY command itself fails (bad table, parse error) the server sends
+    /// `ErrorResponse` + `ReadyForQuery` and then IGNORES the client's stray
+    /// `CopyData`/`CopyDone`/`CopyFail` (PG's frontend accepts-but-discards them
+    /// out of copy mode), so the write-ahead cannot deadlock and the owed reply
+    /// is consumed by whichever of `copy_in_finish` / `copy_in_abort` closes the
+    /// stream.
     ///
-    /// Constraint: each chunk is flushed as produced, so the send buffer stays
-    /// bounded (no whole-COPY buffering); a batched-flush variant (coalesce N
-    /// chunks per write) is a future throughput option, not a correctness one.
-    /// Assumption: all client `CopyData` is written before any server reply is
-    /// read. This is sound for `COPY … FROM STDIN` — the server produces nothing
-    /// between `CopyInResponse` and the post-`CopyDone` `CommandComplete`, so the
-    /// optimistic write-ahead cannot deadlock; it would NOT hold for a
-    /// request/response interleaving (none exists on the COPY-in path).
+    /// Takes no [`Live`] token: it does not reach a protocol boundary (the
+    /// command spans the whole write-then-finish sequence), so the caller holds
+    /// the token across the streaming writes and hands it to
+    /// `copy_in_finish` / `copy_in_abort`. A wrong-phase call is a classified
+    /// [`WrongPhase`](EngineError::WrongPhase), never a misframe.
     ///
     /// # Errors
     ///
     /// As [`simple_query`](Self::simple_query) (`FrameTooLong` covers an oversize
-    /// COPY command).
-    pub async fn copy_in<'d, S>(
+    /// COPY command; a transport fault while flushing is fatal).
+    pub async fn copy_in_begin(&mut self, sql: &str) -> Result<(), EngineError<T::Error>> {
+        let Self {
+            transport,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        // Phase gate only — the flush needs no `active` handle (nothing is read).
+        phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        send_buf.reset();
+        enqueue_frame(send_buf, |wb| frames::build_simple_query(wb, sql.as_bytes()))?;
+        super::flush::flush(send_buf, transport).await
+    }
+
+    /// Stream one `CopyData` (`'d'`) frame for an open COPY-in and flush it, so
+    /// the send buffer stays bounded (no whole-COPY buffering — constant memory
+    /// regardless of row count). Token-less: the caller holds the [`Live`] token
+    /// across writes.
+    ///
+    /// The header is framed into the bounded scratch buffer; the `chunk` body is
+    /// queued directly onto the send buffer, so an oversize chunk needs no
+    /// scratch room. A batched-flush variant (coalesce N chunks per write) is a
+    /// future throughput option, not a correctness one.
+    ///
+    /// # Errors
+    ///
+    /// [`FrameTooLong`](EngineError::FrameTooLong) if the chunk exceeds a `u32`
+    /// body length; a transport fault while flushing is fatal (as
+    /// [`simple_query`](Self::simple_query)).
+    pub async fn copy_in_write(&mut self, chunk: &[u8]) -> Result<(), EngineError<T::Error>> {
+        let Self {
+            transport,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        // Reclaim the PREVIOUS frame's (fully drained) bytes before queuing this
+        // one, so the send buffer stays bounded to a single chunk across the whole
+        // stream — the constant-memory invariant. Without this the buffer would
+        // grow by every frame's bytes (the cursor advances on flush but the
+        // backing store is not compacted), silently making a million-row COPY
+        // O(rows) in memory. `reset` keeps the capacity, so a same-size follow-on
+        // chunk reuses it with zero reallocation.
+        send_buf.reset();
+        let body_len = u32::try_from(chunk.len()).map_err(|_| {
+            core::hint::cold_path();
+            EngineError::FrameTooLong
+        })?;
+        enqueue_frame(send_buf, |wb| frames::build_copy_data_header(wb, body_len))?;
+        send_buf.enqueue(chunk);
+        super::flush::flush(send_buf, transport).await
+    }
+
+    /// Close an open COPY-in cleanly: send `CopyDone` (`'c'`) and pump for the
+    /// server's `CommandComplete` + `ReadyForQuery`, returning the [`Live`] token
+    /// with the [`CommandStatus`] the command reached. `B = Never`.
+    ///
+    /// The trailing `CommandComplete` carries the `COPY n` tag (surfaced to
+    /// `sink` at its `Deliver`), so the caller reads the affected-row count. A
+    /// server `ErrorResponse` here — a constraint/type violation the server
+    /// detected while ingesting the streamed rows — is the RECOVERABLE
+    /// [`ServerErrored`](CommandStatus::ServerErrored): the verb drains the owed
+    /// `ReadyForQuery` to a clean idle before returning the token, exactly like
+    /// the collect-all command verbs.
+    ///
+    /// # Errors
+    ///
+    /// As [`simple_query`](Self::simple_query).
+    pub async fn copy_in_finish<S>(
         &mut self,
         live: Live<'b>,
-        sql: &str,
-        mut data: impl FnMut() -> Option<&'d [u8]>,
         sink: S,
     ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
@@ -1025,21 +1093,127 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
             ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        // Reclaim the last streamed chunk's drained bytes, then enqueue the
+        // `CopyDone` literal onto the empty buffer; `drive_to_outcome`'s entry
+        // flush sends it before reading the acks.
         send_buf.reset();
-        enqueue_frame(send_buf, |wb| frames::build_simple_query(wb, sql.as_bytes()))?;
-        super::flush::flush(send_buf, transport).await?;
-        while let Some(chunk) = data() {
-            let body_len = u32::try_from(chunk.len()).map_err(|_| {
-                core::hint::cold_path();
-                EngineError::FrameTooLong
-            })?;
-            enqueue_frame(send_buf, |wb| frames::build_copy_data_header(wb, body_len))?;
-            send_buf.enqueue(chunk);
-            super::flush::flush(send_buf, transport).await?;
-        }
         send_buf.enqueue(&frames::COPY_DONE_WIRE);
         let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
         Ok(Outcome { live, status })
+    }
+
+    /// Abort an open COPY-in: send `CopyFail` (`'f'`) carrying `reason`, then pump
+    /// to reclaim the connection to a clean idle, returning the [`Live`] token.
+    /// `B = Never`.
+    ///
+    /// The server responds to `CopyFail` with an `ErrorResponse` echoing `reason`
+    /// and then a recovering `ReadyForQuery`; the verb drains that to
+    /// [`ServerErrored`](CommandStatus::ServerErrored) — which for an abort is the
+    /// EXPECTED outcome (the caller chose to fail the COPY), not a fault. The
+    /// connection is alive and reusable, so the token rides `Ok`. This is the
+    /// cancellation-recovery path: a client that abandons a COPY-in mid-stream
+    /// calls this so the server tears down the COPY and the connection is
+    /// immediately reusable rather than stranded in copy mode.
+    ///
+    /// # Errors
+    ///
+    /// As [`simple_query`](Self::simple_query) (`FrameTooLong` covers an oversize
+    /// reason; a transport fault is fatal).
+    pub async fn copy_in_abort<S>(
+        &mut self,
+        live: Live<'b>,
+        reason: &[u8],
+        sink: S,
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
+    where
+        S: FnMut(Surface<'_>) -> ControlFlow<Never>,
+    {
+        let Self {
+            transport,
+            obs,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        // Reclaim any last streamed chunk's drained bytes, then enqueue `CopyFail`.
+        send_buf.reset();
+        enqueue_frame(send_buf, |wb| frames::build_copy_fail(wb, reason))?;
+        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        Ok(Outcome { live, status })
+    }
+
+    /// Run a `COPY … TO STDOUT` with a BREAKABLE sink — the CONSTANT-MEMORY
+    /// STREAMING reader. Each server `CopyData` (`'d'`) frame surfaces to `sink`
+    /// as [`Surface::CopyData`] one at a time; nothing is accumulated, so a
+    /// colossal unload streams in bounded memory. The trailing `CopyDone` (`'c'`)
+    /// surfaces as [`Surface::CopyDone`] and the closing `CommandComplete` as
+    /// [`Surface::Deliver`] (`COPY n`).
+    ///
+    /// Returns the RAW [`Boundary`] the pump reached inside the [`Outcome`], whose
+    /// token rides `Ok` because the connection is ALIVE (clean or dirty),
+    /// mirroring [`query_params_break`](Self::query_params_break):
+    ///
+    /// - [`Boundary::Idle`] — the unload streamed to completion; clean + reusable.
+    /// - [`Boundary::Failed`] — a server `ErrorResponse` arrived (its bytes reached
+    ///   the sink first); the connection is DIRTY and the caller must
+    ///   [`drain`](Self::drain) it.
+    /// - [`Boundary::Stopped`] — the sink [`Break`](ControlFlow::Break)ed early; the
+    ///   connection is DIRTY (unread `CopyData` + `CopyDone` + acks remain) and the
+    ///   caller must [`drain`](Self::drain) it.
+    ///
+    /// [`Boundary::Closed`] / [`Boundary::Suspended`] are FATAL and surface as `Err`.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::ProtocolViolation`] / [`EngineError::UnexpectedSuspend`] for a
+    /// teardown / unexpected suspend; otherwise as
+    /// [`simple_query`](Self::simple_query) for the wire-building / transport faults.
+    pub async fn copy_out<S, B>(
+        &mut self,
+        live: Live<'b>,
+        sql: &str,
+        sink: S,
+    ) -> Result<Outcome<'b, Boundary<B>>, EngineError<T::Error>>
+    where
+        S: FnMut(Surface<'_>) -> ControlFlow<B>,
+    {
+        let Self {
+            transport,
+            obs,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        send_buf.reset();
+        enqueue_frame(send_buf, |wb| frames::build_simple_query(wb, sql.as_bytes()))?;
+        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
+        match boundary {
+            Boundary::Idle => Ok(Outcome {
+                live,
+                status: Boundary::Idle,
+            }),
+            Boundary::Failed => {
+                core::hint::cold_path();
+                Ok(Outcome {
+                    live,
+                    status: Boundary::Failed,
+                })
+            }
+            Boundary::Stopped(b) => Ok(Outcome {
+                live,
+                status: Boundary::Stopped(b),
+            }),
+            Boundary::Closed => {
+                core::hint::cold_path();
+                Err(EngineError::ProtocolViolation)
+            }
+            Boundary::Suspended => {
+                core::hint::cold_path();
+                Err(EngineError::UnexpectedSuspend)
+            }
+        }
     }
 
     /// Subscribe to a notification channel: `LISTEN <channel>` (`'Q'`). The

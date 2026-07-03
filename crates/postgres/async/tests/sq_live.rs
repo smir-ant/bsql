@@ -646,3 +646,177 @@ async fn one_connection_everything() {
 
     c.close().await.expect("close");
 }
+
+// ─────────────────────────── COPY (streaming) ───────────────────────────
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn copy_round_trip_in_then_out() {
+    // The flagship: stream rows IN via the scoped writer, then stream them back
+    // OUT and assert the round-trip is byte-faithful.
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cp_rt(id int4, name text)")
+        .await
+        .expect("create");
+
+    // COPY IN via the streaming writer, interleaving arbitrary logic between rows.
+    let n = c
+        .copy_in_with("cp_rt", async |w| {
+            for i in 1..=3i32 {
+                // Text COPY row: tab-separated columns.
+                w.write_row(format!("{i}\tname{i}").as_bytes()).await?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("copy_in_with");
+    assert_eq!(n, 3, "COPY IN reports 3 affected rows");
+
+    // COPY OUT streams each row back as a `\n`-terminated text-COPY line.
+    let mut out: Vec<String> = Vec::new();
+    let broke: Option<core::convert::Infallible> = c
+        .copy_out("cp_rt", |chunk| {
+            out.push(String::from_utf8(chunk.to_vec()).expect("utf8"));
+            core::ops::ControlFlow::Continue(())
+        })
+        .await
+        .expect("copy_out");
+    assert!(broke.is_none(), "streamed to completion");
+    let mut sorted = out.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        vec!["1\tname1\n".to_string(), "2\tname2\n".to_string(), "3\tname3\n".to_string()],
+    );
+    // The connection is clean and reusable after both directions.
+    assert!(c.is_healthy());
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_rt").await.expect("count").rows[0].get_i64(0),
+        Ok(Some(3)),
+    );
+    c.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn copy_in_abort_mid_stream_recovers() {
+    // A copy_in_with whose closure ERRORS mid-stream must send CopyFail so the
+    // server tears the COPY down and the connection is RECOVERABLE.
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cp_ab(id int4)").await.expect("create");
+
+    let aborted = c
+        .copy_in_with("cp_ab", async |w| {
+            w.write_row(b"1").await?;
+            w.write_row(b"2").await?;
+            // Abandon the copy mid-stream.
+            Err(bsql_postgres_async::DriverError::Config("caller aborted"))
+        })
+        .await;
+    assert!(
+        matches!(aborted, Err(bsql_postgres_async::DriverError::Config("caller aborted"))),
+        "the caller's error dominates, got {aborted:?}",
+    );
+
+    // The connection recovered: a subsequent query works, and the aborted rows
+    // were NOT committed (CopyFail rolls the COPY back).
+    assert!(c.is_healthy(), "connection recovered after the mid-stream abort");
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_ab").await.expect("count").rows[0].get_i64(0),
+        Ok(Some(0)),
+        "an aborted COPY commits no rows",
+    );
+    // And a fresh copy into the same table still works.
+    assert_eq!(c.copy_in("cp_ab", vec!["7", "8"]).await.expect("recopy"), 2);
+    c.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn copy_in_failed_command_recovers() {
+    // The failed-COPY-COMMAND write-ahead path: the COPY targets a non-existent
+    // (but valid-identifier) table, so the server sends ErrorResponse instead of
+    // CopyInResponse and never enters copy mode. The client's optimistic CopyData
+    // + CopyDone are accepted-but-discarded, and `copy_in_finish` drives to a
+    // recoverable `ServerErrored` — proving the async driver's OWN settle/recovery
+    // wiring for this branch (the sync twin proves it in `copy_in_edge_cases`).
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    let failed = c.copy_in("table_that_does_not_exist_async", vec!["1\ta"]).await;
+    assert!(
+        matches!(failed, Err(bsql_postgres_async::DriverError::Db(_))),
+        "a COPY into a missing table is a classified Db error, got {failed:?}",
+    );
+    // The connection recovered on the SAME connection — no fresh connection needed.
+    assert!(c.is_healthy(), "connection recovers to a clean idle after a failed COPY command");
+    c.ping().await.expect("ping recovers on the same connection");
+    assert_eq!(
+        c.query_sql("SELECT 1::int4").await.expect("query").rows[0].get_i32(0),
+        Ok(Some(1)),
+        "a follow-up query works on the recovered connection",
+    );
+    c.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn copy_out_early_break_recovers() {
+    // Breaking out of copy_out early drains the remaining rows to a clean idle;
+    // the connection stays reusable.
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cp_brk(id int4)").await.expect("create");
+    let rows: Vec<String> = (0..1000).map(|i| i.to_string()).collect();
+    assert_eq!(c.copy_in("cp_brk", &rows).await.expect("seed"), 1000);
+
+    // Stop after the first chunk.
+    let mut seen = 0u32;
+    let broke: Option<u32> = c
+        .copy_out("cp_brk", |_chunk| {
+            seen += 1;
+            core::ops::ControlFlow::Break(seen)
+        })
+        .await
+        .expect("copy_out");
+    assert_eq!(broke, Some(1), "broke on the first row");
+    // Drained + reusable.
+    assert!(c.is_healthy());
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_brk").await.expect("count").rows[0].get_i64(0),
+        Ok(Some(1000)),
+    );
+    c.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn copy_in_streaming_bulk_constant_memory() {
+    // Constant-memory witness: stream 100k rows through the writer WITHOUT
+    // building a Vec of them all — a lazy generator feeds the writer one row at a
+    // time. The driver holds only the reused scratch buffer + the bounded send
+    // buffer, never the 100k rows.
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cp_bulk(id int8, payload text)")
+        .await
+        .expect("create");
+    const N: i64 = 100_000;
+    let n = c
+        .copy_in_with("cp_bulk", async |w| {
+            for i in 0..N {
+                w.write_row(format!("{i}\tpayload-row-{i}").as_bytes()).await?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("bulk copy_in");
+    assert_eq!(n, u64::try_from(N).expect("N fits u64"));
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_bulk").await.expect("count").rows[0].get_i64(0),
+        Ok(Some(N)),
+    );
+    c.close().await.expect("close");
+}

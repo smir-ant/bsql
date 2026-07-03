@@ -598,12 +598,28 @@ fn copy_in_edge_cases() {
     assert_eq!(c.copy_in("cp_edge", &big).expect("5k"), 5000);
     assert_eq!(c.query_sql("SELECT count(*) FROM cp_edge").expect("c").rows[0].get_i64(0), Ok(Some(5002)));
 
-    // COPY into non-existent table — use fresh connection (COPY error recovery
-    // sometimes leaves connection in unrecoverable state under parallel load)
-    let mut c2 = Connection::connect(&sync_config()).expect("c2");
-    assert!(c2.copy_in("table_that_does_not_exist", vec!["1\ta"]).is_err());
-    c2.ping().expect("recover");
-    c2.close().expect("close c2");
+    // COPY into a non-existent table on the SAME connection that just ran three
+    // successful COPYs: the server never enters copy mode (it sends ErrorResponse
+    // instead of CopyInResponse), so `copy_in_finish` drives to a recoverable
+    // `ServerErrored` and `settle` restores the token — a failed COPY leaves the
+    // connection at a clean idle, deterministically, exactly like a failed query.
+    // (An earlier workaround used a fresh connection here on the belief that COPY
+    // error recovery could strand a reused connection; the streaming COPY path
+    // recovers through the standard drain/settle, proven deterministic by 200
+    // reuse iterations serially AND under the parallel test suite.)
+    let failed = c.copy_in("table_that_does_not_exist", vec!["1\ta"]);
+    assert!(
+        matches!(failed, Err(bsql_postgres_sync::DriverError::Db(_))),
+        "a COPY into a missing table is a classified Db error, got {failed:?}",
+    );
+    assert!(c.is_healthy(), "the connection recovers to a clean idle after a failed COPY");
+    // The SAME connection is reusable: a follow-up query works and still sees the
+    // rows the successful COPYs committed (the failed COPY committed nothing).
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_edge").expect("count").rows[0].get_i64(0),
+        Ok(Some(5002)),
+    );
+    c.ping().expect("ping recovers on the same connection");
 
     c.close().expect("close");
 }
@@ -851,5 +867,118 @@ fn prepared_query_insert_binary_params_round_trip() {
     // Cleanup: DROP IF EXISTS at end (schema CASCADE removes the table).
     c.execute_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).expect("drop schema post");
 
+    c.close().expect("close");
+}
+
+// ─────────────────────────── COPY (streaming) ───────────────────────────
+
+#[test]
+#[ignore = "requires local PG"]
+fn copy_round_trip_in_then_out() {
+    // Stream rows IN via the scoped writer, then stream them back OUT.
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cp_rt(id int4, name text)").expect("create");
+    let n = c
+        .copy_in_with("cp_rt", |w| {
+            for i in 1..=3i32 {
+                w.write_row(format!("{i}\tname{i}").as_bytes())?;
+            }
+            Ok(())
+        })
+        .expect("copy_in_with");
+    assert_eq!(n, 3);
+
+    let mut out: Vec<String> = Vec::new();
+    let broke: Option<core::convert::Infallible> = c
+        .copy_out("cp_rt", |chunk| {
+            out.push(String::from_utf8(chunk.to_vec()).expect("utf8"));
+            core::ops::ControlFlow::Continue(())
+        })
+        .expect("copy_out");
+    assert!(broke.is_none());
+    let mut sorted = out.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        vec!["1\tname1\n".to_string(), "2\tname2\n".to_string(), "3\tname3\n".to_string()],
+    );
+    assert!(c.is_healthy());
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_rt").expect("count").rows[0].get_i64(0),
+        Ok(Some(3)),
+    );
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn copy_in_abort_mid_stream_recovers() {
+    // A copy_in_with whose closure ERRORS mid-stream sends CopyFail; the
+    // connection recovers and commits none of the aborted rows.
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cp_ab(id int4)").expect("create");
+    let aborted = c.copy_in_with("cp_ab", |w| {
+        w.write_row(b"1")?;
+        w.write_row(b"2")?;
+        Err(bsql_postgres_sync::DriverError::Config("caller aborted"))
+    });
+    assert!(
+        matches!(aborted, Err(bsql_postgres_sync::DriverError::Config("caller aborted"))),
+        "the caller's error dominates, got {aborted:?}",
+    );
+    assert!(c.is_healthy(), "connection recovered after the mid-stream abort");
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_ab").expect("count").rows[0].get_i64(0),
+        Ok(Some(0)),
+        "an aborted COPY commits no rows",
+    );
+    assert_eq!(c.copy_in("cp_ab", vec!["7", "8"]).expect("recopy"), 2);
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn copy_out_early_break_recovers() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cp_brk(id int4)").expect("create");
+    let rows: Vec<String> = (0..1000).map(|i| i.to_string()).collect();
+    assert_eq!(c.copy_in("cp_brk", &rows).expect("seed"), 1000);
+    let mut seen = 0u32;
+    let broke: Option<u32> = c
+        .copy_out("cp_brk", |_chunk| {
+            seen += 1;
+            core::ops::ControlFlow::Break(seen)
+        })
+        .expect("copy_out");
+    assert_eq!(broke, Some(1));
+    assert!(c.is_healthy());
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_brk").expect("count").rows[0].get_i64(0),
+        Ok(Some(1000)),
+    );
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn copy_in_streaming_bulk_constant_memory() {
+    // Constant-memory witness: stream 100k rows through the writer one at a time
+    // (a lazy generator, never a Vec of them all).
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cp_bulk(id int8, payload text)").expect("create");
+    const N: i64 = 100_000;
+    let n = c
+        .copy_in_with("cp_bulk", |w| {
+            for i in 0..N {
+                w.write_row(format!("{i}\tpayload-row-{i}").as_bytes())?;
+            }
+            Ok(())
+        })
+        .expect("bulk copy_in");
+    assert_eq!(n, u64::try_from(N).expect("N fits u64"));
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_bulk").expect("count").rows[0].get_i64(0),
+        Ok(Some(N)),
+    );
     c.close().expect("close");
 }

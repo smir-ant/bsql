@@ -277,6 +277,20 @@ pub(crate) fn build_copy_data_header(
     wb.push_u32_be(len)
 }
 
+/// `'f'` CopyFail frame: `tag | len | reason | NUL`. Aborts an in-progress
+/// COPY IN from the client; the server echoes the reason in its `ErrorResponse`
+/// and then returns to idle (PG §55.7). The length prefix (self-inclusive) is
+/// `4 + reason.len() + 1`. `Err` only if the reason plus framing overflows the
+/// bounded [`WriteBuf`] — a classified frame-too-long, never a silent truncation.
+#[inline]
+pub(crate) fn build_copy_fail(wb: &mut WriteBuf, reason: &[u8]) -> Result<(), WriteBufFull> {
+    wb.push_u8(crate::wire::TAG_COPY_FAIL_OUTBOUND.byte())?;
+    wb.with_length_prefix(|w| {
+        w.push_bytes(reason)?;
+        w.push_u8(0)
+    })
+}
+
 #[cfg(test)]
 mod parse_stream_twin {
     //! Byte-twin for the streaming Parse assembly: the production prepare path

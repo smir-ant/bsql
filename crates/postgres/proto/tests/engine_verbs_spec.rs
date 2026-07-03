@@ -29,7 +29,8 @@ use bsql_postgres_proto::engine::{
 };
 use bsql_postgres_proto::wire::{
     TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE,
-    TAG_COPY_IN_RESPONSE, TAG_DATA_ROW, TAG_ERROR_RESPONSE, TAG_NOTIFICATION_RESPONSE, TAG_NO_DATA,
+    TAG_COPY_DATA, TAG_COPY_DONE, TAG_COPY_IN_RESPONSE, TAG_COPY_OUT_RESPONSE, TAG_DATA_ROW,
+    TAG_ERROR_RESPONSE, TAG_NOTIFICATION_RESPONSE, TAG_NO_DATA,
     TAG_PARAMETER_DESCRIPTION, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
 use bsql_postgres_proto::prepared::new_prepared_query;
@@ -132,6 +133,19 @@ fn no_data() -> Vec<u8> {
 fn copy_in_response() -> Vec<u8> {
     // overall format = 0 (text), num columns = 0.
     frame(TAG_COPY_IN_RESPONSE.byte(), &[0, 0, 0])
+}
+
+fn copy_out_response() -> Vec<u8> {
+    // overall format = 0 (text), num columns = 0.
+    frame(TAG_COPY_OUT_RESPONSE.byte(), &[0, 0, 0])
+}
+
+fn copy_data(bytes: &[u8]) -> Vec<u8> {
+    frame(TAG_COPY_DATA.byte(), bytes)
+}
+
+fn copy_done() -> Vec<u8> {
+    frame(TAG_COPY_DONE.byte(), &[])
 }
 
 fn notification(pid: i32, channel: &str, payload: &str) -> Vec<u8> {
@@ -1155,20 +1169,77 @@ fn copy_in_streams_data_and_completes() {
         rfq(b'I'),
     ]);
     let cap = run(script, |e, live| {
-        let chunks: [&[u8]; 2] = [b"row1\n", b"row2\n"];
-        let mut it = chunks.into_iter();
         let mut cap = Cap::default();
-        let live = flatten(poll_once(e.copy_in(
-            live,
-            "COPY t FROM STDIN",
-            || it.next(),
-            cap.sink(),
-        )))
-        .expect("copy_in");
+        // begin + per-chunk writes + finish — the streaming trio. `begin` and the
+        // writes are token-less; `copy_in_finish` returns the token.
+        poll_once(e.copy_in_begin("COPY t FROM STDIN"))
+            .expect("poll")
+            .expect("begin");
+        poll_once(e.copy_in_write(b"row1\n"))
+            .expect("poll")
+            .expect("write1");
+        poll_once(e.copy_in_write(b"row2\n"))
+            .expect("poll")
+            .expect("write2");
+        let live = flatten(poll_once(e.copy_in_finish(live, cap.sink()))).expect("finish");
         let _ = live;
         cap
     });
     assert_eq!(cap.delivers.len(), 1);
+    assert_eq!(cap.delivers[0].0.as_deref(), Some("COPY 2"));
+}
+
+#[test]
+fn copy_in_abort_sends_copy_fail_and_recovers() {
+    // After CopyFail the server replies ErrorResponse (echoing the reason) + RFQ;
+    // the abort drains it to a clean idle and rides the token back in `Ok`.
+    let script = concat(&[
+        handshake(),
+        copy_in_response(),
+        error_response("ERROR", "57014", "COPY from stdin failed: client aborted COPY"),
+        rfq(b'I'),
+    ]);
+    let (status, fails) = run(script, |e, live| {
+        let mut cap = Cap::default();
+        poll_once(e.copy_in_begin("COPY t FROM STDIN"))
+            .expect("poll")
+            .expect("begin");
+        poll_once(e.copy_in_write(b"partial"))
+            .expect("poll")
+            .expect("write");
+        let outcome = poll_once(e.copy_in_abort(live, b"client aborted COPY", cap.sink()))
+            .expect("poll")
+            .expect("abort");
+        // A CopyFail always yields a ServerErrored recovery — the connection is
+        // alive (token in Ok), so the abort is a successful reclaim, not a fault.
+        (outcome.status, cap.fails)
+    });
+    assert_eq!(status, CommandStatus::ServerErrored);
+    assert_eq!(fails, 1, "the server's abort ErrorResponse surfaced to the sink");
+}
+
+#[test]
+fn copy_out_streams_each_chunk_then_completes() {
+    let script = concat(&[
+        handshake(),
+        copy_out_response(),
+        copy_data(b"row1\n"),
+        copy_data(b"row2\n"),
+        copy_done(),
+        command_complete("COPY 2"),
+        rfq(b'I'),
+    ]);
+    let cap = run(script, |e, live| {
+        let mut cap = Cap::default();
+        // Continue-only sink (B = Never): the unload streams to a clean idle.
+        let outcome = poll_once(e.copy_out(live, "COPY t TO STDOUT", cap.sink()))
+            .expect("poll")
+            .expect("copy_out");
+        assert!(matches!(outcome.status, Boundary::Idle));
+        let _ = outcome.live;
+        cap
+    });
+    assert_eq!(cap.copy_data, vec![b"row1\n".to_vec(), b"row2\n".to_vec()]);
     assert_eq!(cap.delivers[0].0.as_deref(), Some("COPY 2"));
 }
 

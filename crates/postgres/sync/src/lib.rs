@@ -34,7 +34,7 @@ pub use bsql_postgres_core::{
     ColumnError, ConnectConfig, DbError, DriverError, Notification, QueryResult, Row, Rows, SslMode,
 };
 
-pub use connection::{Connection, PreparedStatement};
+pub use connection::{Connection, CopyInWriter, PreparedStatement};
 pub use pool::{Pool, PooledConnection};
 
 const _: () = {

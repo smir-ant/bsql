@@ -419,10 +419,10 @@ const ENGINE_ERROR_VARIANTS: usize = 14;
 /// Active-phase verbs (each takes the linear `Live` token; all return it save the
 /// session-ending `terminate`, which consumes it into the closed phase).
 /// Reproduce: `grep -c "live: Live<'b>" crates/postgres/proto/src/engine/verbs.rs`
-const ACTIVE_VERBS: usize = 18;
+const ACTIVE_VERBS: usize = 20;
 /// `core::hint::cold_path()` classified-branch markers across `engine/`.
 /// Reproduce: `grep -rho 'core::hint::cold_path()' crates/postgres/proto/src/engine/*.rs | wc -l`
-const COLD_CLASSIFIED_BRANCHES: usize = 39;
+const COLD_CLASSIFIED_BRANCHES: usize = 42;
 /// `#[non_exhaustive]` attribute lines across `engine/`.
 /// Reproduce: `grep -rcE '^#\[non_exhaustive\]' crates/postgres/proto/src/engine/*.rs` (summed)
 const NON_EXHAUSTIVE_ATTRS: usize = 4;
