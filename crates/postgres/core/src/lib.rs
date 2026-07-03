@@ -13,6 +13,9 @@ pub mod config;
 pub mod error;
 pub mod footprint;
 pub mod materialize;
+// The per-connection notification ledger (a bounded, counted no-drop buffer)
+// and the sink adapter that captures every surfaced notification into it.
+pub mod notify;
 pub mod sql_ident;
 pub mod ssl;
 // The in-memory fake PostgreSQL backend behind the engine's transport seam.
@@ -29,5 +32,6 @@ pub mod types;
 pub use config::{ConnectConfig, SslMode};
 pub use error::{ColumnError, DbError, DriverError};
 pub use materialize::{CollectedResult, DbErrorSink, ResultCollector};
+pub use notify::{capture_notify, NotificationLedger, TypedNotification};
 pub use typed_rows::{Rows, RowsBuilder};
 pub use types::{ArenaBuilder, ArenaSealError, Notification, QueryResult, Row};

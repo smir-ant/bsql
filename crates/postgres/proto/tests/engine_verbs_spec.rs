@@ -893,7 +893,7 @@ fn query_params_break_stops_early_then_drain_reclaims_and_reuses() {
         };
         // The connection is DIRTY: drain the remaining 2 DataRows + CommandComplete
         // + RFQ to a clean idle, sending nothing.
-        let live = match poll_once(e.drain(live)) {
+        let live = match poll_once(e.drain(live, |_s| ControlFlow::Continue(()))) {
             Ok(Ok(Outcome {
                 live,
                 status: CommandStatus::Completed,

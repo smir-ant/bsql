@@ -35,10 +35,13 @@
 //! protocol ([`query_sql`](bsql_postgres_async::Connection::query_sql)) and the
 //! compile-checked `query!` extended protocol — one
 //! [`fake.on(sql)`](FakePostgres::on)`.returns(...)` script answers both — plus
-//! scripted errors. An unscripted query is answered with a loud, classified
-//! `ErrorResponse` — never a silent empty result or a hang. The runtime
-//! `prepare`/`describe` extended path, multi-query scripting, expectations
-//! (`assert_all_queried`), and COPY/LISTEN are not yet supported.
+//! scripted errors. A query reply can also carry interleaved asynchronous
+//! `NOTIFY`s (via [`Responder::notifying`]) — the pending-notification
+//! interleaving the real backend does — so a test can prove the driver captures
+//! a notification arriving DURING a query. An unscripted query is answered with a
+//! loud, classified `ErrorResponse` — never a silent empty result or a hang. The
+//! runtime `prepare`/`describe` extended path, multi-query scripting,
+//! expectations (`assert_all_queried`), and COPY are not yet supported.
 //!
 //! Scriptable cell types are [`FakeValue`]'s vocabulary — `bigint` (`i64`),
 //! `integer` (`i32`), `text` (`&str`/`String`), `boolean`, and NULL. A column of
@@ -176,11 +179,31 @@ macro_rules! rows {
     };
 }
 
-/// A scripted reply to one query: either a result set or a server error.
+/// One asynchronous `NOTIFY` scripted to arrive DURING a query's reply — the
+/// interleaving the real backend does when a `NOTIFY` is pending while a command
+/// runs. Used to prove the driver captures it rather than dropping it.
+#[derive(Debug, Clone)]
+struct ScriptedNotification {
+    pid: i32,
+    channel: String,
+    payload: String,
+}
+
+/// A scripted reply to one query: either a result set (optionally with
+/// notifications interleaved into its reply stream) or a server error.
 #[derive(Debug, Clone)]
 enum ScriptedReply {
-    Rows(ScriptedRows),
-    Error { sqlstate: String, message: String },
+    Rows {
+        rows: ScriptedRows,
+        /// Notifications spliced into the reply stream, after the rows and before
+        /// the terminating `CommandComplete` — so the driver's query pump surfaces
+        /// each `Surface::Notify` mid-command.
+        notifications: Vec<ScriptedNotification>,
+    },
+    Error {
+        sqlstate: String,
+        message: String,
+    },
 }
 
 /// Why building or connecting a [`FakePostgres`] failed.
@@ -265,6 +288,7 @@ impl FakePostgres {
         Responder {
             fake: self,
             sql: sql.into(),
+            notifications: Vec::new(),
         }
     }
 
@@ -303,9 +327,9 @@ impl FakePostgres {
             // One scripted reply answers both protocols: a simple-query byte
             // stream and an extended-query Execute payload.
             let query_reply = match reply {
-                ScriptedReply::Rows(rows) => QueryReply {
-                    simple: encode_rows_simple(rows)?,
-                    extended: encode_rows_extended(rows)?,
+                ScriptedReply::Rows { rows, notifications } => QueryReply {
+                    simple: encode_rows_simple(rows, notifications)?,
+                    extended: encode_rows_extended(rows, notifications)?,
                 },
                 ScriptedReply::Error { sqlstate, message } => QueryReply {
                     simple: encode_error_simple(sqlstate, message)?,
@@ -371,12 +395,34 @@ impl Default for FakePostgres {
 pub struct Responder<'a> {
     fake: &'a mut FakePostgres,
     sql: String,
+    notifications: Vec<ScriptedNotification>,
 }
 
 impl Responder<'_> {
-    /// Script this query to return the given rows.
+    /// Script an asynchronous `NOTIFY` to arrive DURING this query's reply — the
+    /// interleaving the real backend does when a notification is pending while a
+    /// command runs. Chainable before [`returns`](Self::returns); the driver's
+    /// query pump surfaces each as a `Surface::Notify` mid-command, and a correct
+    /// driver captures it into its notification ledger rather than dropping it.
+    pub fn notifying(mut self, pid: i32, channel: impl Into<String>, payload: impl Into<String>) -> Self {
+        self.notifications.push(ScriptedNotification {
+            pid,
+            channel: channel.into(),
+            payload: payload.into(),
+        });
+        self
+    }
+
+    /// Script this query to return the given rows (plus any notifications added
+    /// with [`notifying`](Self::notifying) interleaved into the reply stream).
     pub fn returns(self, rows: ScriptedRows) {
-        self.fake.responses.push((self.sql, ScriptedReply::Rows(rows)));
+        self.fake.responses.push((
+            self.sql,
+            ScriptedReply::Rows {
+                rows,
+                notifications: self.notifications,
+            },
+        ));
     }
 
     /// Script this query to fail with a PostgreSQL `ErrorResponse` — the driver
@@ -430,16 +476,33 @@ fn checked_columns(rows: &ScriptedRows) -> Result<Vec<(String, i32)>, TestkitErr
     Ok(cols)
 }
 
+/// Render each scripted notification to its `NotificationResponse` wire frame.
+fn notification_frames(
+    notifications: &[ScriptedNotification],
+) -> Result<Vec<Vec<u8>>, TestkitError> {
+    notifications
+        .iter()
+        .map(|n| Ok(wire::notification_response(n.pid, &n.channel, &n.payload)?))
+        .collect()
+}
+
 /// Encode a scripted result set for the SIMPLE-query protocol:
-/// `RowDescription` + text `DataRow`s + `CommandComplete` + `ReadyForQuery`.
-fn encode_rows_simple(rows: &ScriptedRows) -> Result<Vec<u8>, TestkitError> {
+/// `RowDescription` + text `DataRow`s + interleaved `NotificationResponse`s +
+/// `CommandComplete` + `ReadyForQuery`. The notifications ride after the rows and
+/// before the command boundary, so the driver's query pump surfaces each one
+/// mid-command.
+fn encode_rows_simple(
+    rows: &ScriptedRows,
+    notifications: &[ScriptedNotification],
+) -> Result<Vec<u8>, TestkitError> {
     let cols = checked_columns(rows)?;
-    let mut frames = Vec::with_capacity(rows.rows.len().saturating_add(3));
+    let mut frames = Vec::with_capacity(rows.rows.len().saturating_add(notifications.len()).saturating_add(3));
     frames.push(wire::row_description(&cols)?);
     for row in &rows.rows {
         let cells: Vec<Option<Vec<u8>>> = row.iter().map(FakeValue::render).collect();
         frames.push(wire::data_row(&cells)?);
     }
+    frames.extend(notification_frames(notifications)?);
     frames.push(wire::command_complete(&format!("SELECT {}", rows.rows.len()))?);
     frames.push(wire::ready_for_query(TX_IDLE)?);
     Ok(wire::concat(&frames))
@@ -451,15 +514,19 @@ fn encode_rows_simple(rows: &ScriptedRows) -> Result<Vec<u8>, TestkitError> {
 /// `ReadyForQuery` (the fake's framer emits the acknowledgements before and the
 /// `Sync`'s `ReadyForQuery` after). The flagship `query!` decodes each cell via
 /// `Cell<BinaryFmt>`, so the cells are rendered in binary.
-fn encode_rows_extended(rows: &ScriptedRows) -> Result<Vec<u8>, TestkitError> {
+fn encode_rows_extended(
+    rows: &ScriptedRows,
+    notifications: &[ScriptedNotification],
+) -> Result<Vec<u8>, TestkitError> {
     // Reuse the same ragged-rows validation as the simple path; the extended
     // path advertises no column metadata, so only the check matters here.
     checked_columns(rows)?;
-    let mut frames = Vec::with_capacity(rows.rows.len().saturating_add(1));
+    let mut frames = Vec::with_capacity(rows.rows.len().saturating_add(notifications.len()).saturating_add(1));
     for row in &rows.rows {
         let cells: Vec<Option<Vec<u8>>> = row.iter().map(FakeValue::render_binary).collect();
         frames.push(wire::data_row(&cells)?);
     }
+    frames.extend(notification_frames(notifications)?);
     frames.push(wire::command_complete(&format!("SELECT {}", rows.rows.len()))?);
     Ok(wire::concat(&frames))
 }

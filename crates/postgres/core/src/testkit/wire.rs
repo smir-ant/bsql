@@ -13,8 +13,8 @@ use std::vec::Vec;
 
 use bsql_postgres_proto::wire::{
     TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE, TAG_DATA_ROW,
-    TAG_ERROR_RESPONSE, TAG_PARAMETER_STATUS, TAG_PARSE_COMPLETE, TAG_READY_FOR_QUERY,
-    TAG_ROW_DESCRIPTION,
+    TAG_ERROR_RESPONSE, TAG_NOTIFICATION_RESPONSE, TAG_PARAMETER_STATUS, TAG_PARSE_COMPLETE,
+    TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
 
 /// PostgreSQL type OID for `int8` (`bigint`) — the wire type a scripted `i64`
@@ -220,6 +220,25 @@ pub fn error_response(severity: &str, sqlstate: &str, message: &str) -> Result<V
     body.push(0);
     body.push(0); // field-list terminator
     frame(TAG_ERROR_RESPONSE.byte(), &body)
+}
+
+/// `NotificationResponse`: tag `A`, `[i32 pid][channel\0][payload\0]` — the
+/// asynchronous `LISTEN`/`NOTIFY` frame. Spliced into a query's reply stream, it
+/// scripts a notification arriving DURING a query (the interleaving the real
+/// backend does), so a test can prove the driver captures it rather than dropping
+/// it. The body layout is exactly what
+/// [`parse_notification`](crate::materialize::parse_notification) reads.
+///
+/// # Errors
+///
+/// [`FakeEncodeError::FrameTooLarge`] for a pathologically large channel/payload.
+pub fn notification_response(pid: i32, channel: &str, payload: &str) -> Result<Vec<u8>, FakeEncodeError> {
+    let mut body = pid.to_be_bytes().to_vec();
+    body.extend_from_slice(channel.as_bytes());
+    body.push(0);
+    body.extend_from_slice(payload.as_bytes());
+    body.push(0);
+    frame(TAG_NOTIFICATION_RESPONSE.byte(), &body)
 }
 
 /// Concatenate several frames into one server-reply byte stream.

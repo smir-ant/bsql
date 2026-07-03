@@ -908,8 +908,18 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     /// connection dirty, so the trailing `ReadyForQuery` is already owed on the
     /// wire — this only READS the unread rows + `CommandComplete` +
     /// `ReadyForQuery` (or, after a `Failed`, the single recovering
-    /// `ReadyForQuery`) with a noop sink, draining a recoverable error to a clean
-    /// idle exactly like the collect-all verbs.
+    /// `ReadyForQuery`), draining a recoverable error to a clean idle exactly like
+    /// the collect-all verbs.
+    ///
+    /// The `sink` sees every surface read during the reclaim. The discarded rows
+    /// are of no interest, so the caller passes a Continue-only sink — but a
+    /// wire-legal asynchronous frame (`NotificationResponse`, `NoticeResponse`,
+    /// `ParameterStatus`) can ride the drained remainder, and it MUST still
+    /// surface, exactly as it does through every other verb's sink and through
+    /// [`drive_to_outcome`]'s own recovery drain: the reclaim reads real wire
+    /// bytes, so a notification arriving in that window is not the driver's to
+    /// silently drop. `B = Never`, so the sink is Continue-only and cannot change
+    /// the drain's boundary.
     ///
     /// Returns the [`CommandStatus`] the drain reached inside an [`Outcome`]; a
     /// caller that only needs the connection back keeps the token and ignores the
@@ -927,10 +937,14 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     ///
     /// As [`ping`](Self::ping): a transport/framing fault during the drain is
     /// FATAL — the connection is dead and the token is consumed, never swallowed.
-    pub async fn drain(
+    pub async fn drain<S>(
         &mut self,
         live: Live<'b>,
-    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>> {
+        sink: S,
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
+    where
+        S: FnMut(Surface<'_>) -> ControlFlow<Never>,
+    {
         let Self {
             transport,
             obs,
@@ -942,8 +956,9 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         // No `reset`/`enqueue`: the request was already flushed by the verb that
         // left the connection dirty. `drive_to_outcome`'s entry flush drains the
         // (already-empty) send buffer as a no-op, then reads the owed reply frames
-        // to a clean idle.
-        let status = drive_to_outcome(active, transport, send_buf, &*obs, noop_sink).await?;
+        // to a clean idle — threading the caller's sink so an async frame in the
+        // drained remainder still surfaces, never a silent drop.
+        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
         Ok(Outcome { live, status })
     }
 

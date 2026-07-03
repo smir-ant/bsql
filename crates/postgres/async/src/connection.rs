@@ -23,6 +23,7 @@
 //! [`settle`]: Connection::settle
 
 use core::ops::ControlFlow;
+use core::str::FromStr;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,8 +37,8 @@ use bsql_postgres_core::sql_ident;
 use bsql_postgres_core::ssl::SslProbe;
 use bsql_postgres_core::tls::{self, TlsError, TlsTransport, Wire};
 use bsql_postgres_core::{
-    ConnectConfig, DbError, DbErrorSink, DriverError, Notification, QueryResult, Row, Rows,
-    RowsBuilder, SslMode,
+    capture_notify, ConnectConfig, DbError, DbErrorSink, DriverError, NotificationLedger,
+    Notification, QueryResult, Row, Rows, RowsBuilder, SslMode, TypedNotification,
 };
 use bsql_postgres_proto::engine::{
     self, Boundary, CommandStatus, ConnFail, Engine, EngineError, Live, NoObserver, NotifyStatus,
@@ -180,6 +181,13 @@ pub struct Connection {
     read_deadline: Arc<ReadDeadline>,
     params: SessionParams,
     stmt_counter: u32,
+    /// The bounded, counted no-drop buffer of asynchronous notifications. Every
+    /// verb's sink is wrapped with [`capture_notify`] so a `NOTIFY` arriving on
+    /// any command's response stream is buffered here rather than dropped;
+    /// [`recv_notification`](Self::recv_notification) drains it front-first, and
+    /// [`reset_session`](Self::reset_session) clears it so a pooled connection
+    /// never delivers a prior user's notifications to the next.
+    notifications: NotificationLedger,
 }
 
 impl Connection {
@@ -247,6 +255,7 @@ impl Connection {
                 backend_pid,
             },
             stmt_counter: 0,
+            notifications: NotificationLedger::new(),
         })
     }
 
@@ -326,6 +335,7 @@ impl Connection {
                 backend_pid,
             },
             stmt_counter: 0,
+            notifications: NotificationLedger::new(),
         })
     }
 
@@ -416,10 +426,10 @@ impl Connection {
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .ping(live, |s| {
+            .ping(live, capture_notify(&mut self.notifications, |s| {
                 collector.feed(s);
                 ControlFlow::Continue(())
-            })
+            }))
             .await;
         self.settle(outcome, &mut collector)
     }
@@ -430,10 +440,10 @@ impl Connection {
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .simple_query(live, sql, |s| {
+            .simple_query(live, sql, capture_notify(&mut self.notifications, |s| {
                 collector.feed(s);
                 ControlFlow::Continue(())
-            })
+            }))
             .await;
         self.settle(outcome, &mut collector)?;
         Ok(collector.command_tag().to_string())
@@ -446,10 +456,10 @@ impl Connection {
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .execute(live, sql, |s| {
+            .execute(live, sql, capture_notify(&mut self.notifications, |s| {
                 collector.feed(s);
                 ControlFlow::Continue(())
-            })
+            }))
             .await;
         self.settle(outcome, &mut collector)?;
         Ok(collector.affected())
@@ -462,10 +472,10 @@ impl Connection {
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .query(live, sql, |s| {
+            .query(live, sql, capture_notify(&mut self.notifications, |s| {
                 collector.feed(s);
                 ControlFlow::Continue(())
-            })
+            }))
             .await;
         self.settle(outcome, &mut collector)?;
         Self::build_query_result(collector, None)
@@ -495,10 +505,10 @@ impl Connection {
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .prepare(live, &stmt_name, sql, |s| {
+            .prepare(live, &stmt_name, sql, capture_notify(&mut self.notifications, |s| {
                 collector.feed(s);
                 ControlFlow::Continue(())
-            })
+            }))
             .await;
         self.settle(outcome, &mut collector)?;
         let result_oids = collector.oids().to_vec();
@@ -524,10 +534,10 @@ impl Connection {
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .query_prepared(live, &stmt.inner, *params, |s| {
+            .query_prepared(live, &stmt.inner, *params, capture_notify(&mut self.notifications, |s| {
                 collector.feed(s);
                 ControlFlow::Continue(())
-            })
+            }))
             .await;
         self.settle(outcome, &mut collector)?;
         Self::build_query_result(collector, Some(stmt.column_names.clone()))
@@ -544,10 +554,10 @@ impl Connection {
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .execute_prepared(live, &stmt.inner, *params, |s| {
+            .execute_prepared(live, &stmt.inner, *params, capture_notify(&mut self.notifications, |s| {
                 collector.feed(s);
                 ControlFlow::Continue(())
-            })
+            }))
             .await;
         self.settle(outcome, &mut collector)?;
         Ok(collector.affected())
@@ -572,10 +582,10 @@ impl Connection {
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .query_params(live, q, params, |s| {
+            .query_params(live, q, params, capture_notify(&mut self.notifications, |s| {
                 collector.feed(s);
                 ControlFlow::Continue(())
-            })
+            }))
             .await;
         self.settle(outcome, &mut collector)?;
         Ok(collector.affected())
@@ -617,10 +627,10 @@ impl Connection {
         let mut builder = RowsBuilder::new();
         let outcome = self
             .engine
-            .query_params(live, &Q::PREPARED, params, |s| {
+            .query_params(live, &Q::PREPARED, params, capture_notify(&mut self.notifications, |s| {
                 builder.feed(s);
                 ControlFlow::Continue(())
-            })
+            }))
             .await;
         self.settle(outcome, &mut builder)?;
         // The connection is now idle + pooled. An oversize row cannot be decoded
@@ -715,7 +725,7 @@ impl Connection {
         let mut oversize = false;
         let outcome = self
             .engine
-            .query_params_break(live, &Q::PREPARED, params, |surface| match surface {
+            .query_params_break(live, &Q::PREPARED, params, capture_notify(&mut self.notifications, |surface| match surface {
                 Surface::Row(body) => match Q::decode_borrowed(body) {
                     // The record borrows the transient ingest buffer; `on_row`
                     // consumes it in-scope (the `for<'q>` wall forbids escape).
@@ -740,9 +750,11 @@ impl Connection {
                     oversize = true;
                     ControlFlow::Continue(())
                 }
-                // Asynchronous / COPY / delivery frames are not stream rows.
+                // COPY / delivery / other async frames are not stream rows (a
+                // NOTIFY is captured into the ledger by the wrapper above this
+                // match, so it never reaches here to be dropped).
                 _ => ControlFlow::Continue(()),
-            })
+            }))
             .await;
 
         // The token rides `Ok` on any ALIVE boundary; a fatal is `Err`.
@@ -798,7 +810,18 @@ impl Connection {
     /// the connection (the token is consumed, `self.live` stays `None`), never
     /// swallowed.
     async fn drain_to_idle(&mut self, live: Live<'static>) -> Result<(), DriverError> {
-        match self.engine.drain(live).await {
+        // Thread the capture adapter through the reclaim: a NOTIFY riding the
+        // drained remainder (a colossal result's tail on an early break, or the
+        // recovery window after a server error) is buffered — or shed-counted at
+        // overflow — never silently dropped. The reclaim reads real wire bytes
+        // exactly like any other verb, so its sink captures notifications too.
+        let outcome = self
+            .engine
+            .drain(live, capture_notify(&mut self.notifications, |_s: Surface<'_>| {
+                ControlFlow::Continue(())
+            }))
+            .await;
+        match outcome {
             // The drain reached a clean idle — its own status is irrelevant (even a
             // second recoverable server error means the connection is back at idle
             // and reusable), so only the token matters. Restore it.
@@ -872,10 +895,10 @@ impl Connection {
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .close_statement(live, stmt.inner, |s| {
+            .close_statement(live, stmt.inner, capture_notify(&mut self.notifications, |s| {
                 collector.feed(s);
                 ControlFlow::Continue(())
-            })
+            }))
             .await;
         self.settle(outcome, &mut collector)
     }
@@ -948,10 +971,10 @@ impl Connection {
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .listen(live, &channel, |s| {
+            .listen(live, &channel, capture_notify(&mut self.notifications, |s| {
                 collector.feed(s);
                 ControlFlow::Continue(())
-            })
+            }))
             .await;
         self.settle(outcome, &mut collector)
     }
@@ -1025,10 +1048,21 @@ impl Connection {
             RESET_WITH_ROLLBACK
         };
         self.simple_query(sql).await?;
+        // Clear the notification ledger AFTER the reset round trip: `UNLISTEN *`
+        // (above) stops new notifications, and this discards every notification
+        // captured before or during the reset — so a pooled connection never
+        // delivers a prior user's notifications to the next. Done last so a
+        // notification that rode the reset's own response stream is cleared too.
+        self.notifications.clear();
         Ok(())
     }
 
     /// Wait up to `timeout` for the next asynchronous notification.
+    ///
+    /// Drains the per-connection notification ledger FIRST: a notification that
+    /// already arrived — captured by any earlier verb whose response stream it
+    /// rode, or by a prior wait — returns immediately with NO round trip. Only
+    /// when the ledger is empty does this wait on the socket.
     ///
     /// Returns `Ok(None)` if the deadline passes with no notification (the
     /// connection stays alive). The wait is bounded by arming an absolute read
@@ -1040,12 +1074,22 @@ impl Connection {
     /// future, so a timed-out wait never drops the verb future and strands the
     /// linear token.
     ///
+    /// # Errors
+    ///
+    /// A malformed or non-UTF-8 buffered notification surfaces here as a
+    /// classified [`DriverError`] (it is still removed from the ledger, so it
+    /// cannot wedge the buffer) — never a silent drop.
+    ///
     /// [`read_deadline`]: Connection::read_deadline
     /// [`Transport::is_would_block`]: bsql_postgres_proto::engine::Transport::is_would_block
     pub async fn recv_notification(
         &mut self,
         timeout: Duration,
     ) -> Result<Option<Notification>, DriverError> {
+        // An already-arrived notification returns without touching the socket.
+        if let Some(buffered) = self.notifications.drain_one() {
+            return buffered.map(Some);
+        }
         // Validate the fallible input (a near-MAX timeout would overflow
         // `Instant + Duration`) BEFORE taking the token — like every other verb,
         // so a `TimeoutOverflow` returns Err with the connection still alive
@@ -1055,12 +1099,14 @@ impl Connection {
             .ok_or(DriverError::TimeoutOverflow)?;
         let live = self.take_live()?;
         self.read_deadline.arm(deadline);
-        let mut captured: Option<Result<Notification, DriverError>> = None;
+        let ledger = &mut self.notifications;
         let outcome = self
             .engine
             .recv_notification(live, |s| {
                 if let Surface::Notify(body) = s {
-                    captured = Some(materialize::parse_notification(body));
+                    // Capture into the ledger (the same buffer every verb feeds),
+                    // then stop the pump — the notification is what we waited for.
+                    ledger.capture(body);
                     return ControlFlow::Break(());
                 }
                 ControlFlow::Continue(())
@@ -1074,18 +1120,74 @@ impl Connection {
                 // outcome, handled inside the engine, so the token rides back.
                 self.live = Some(live);
                 match status {
-                    NotifyStatus::Received => match captured {
-                        Some(Ok(notification)) => Ok(Some(notification)),
-                        Some(Err(e)) => Err(e),
-                        // `Received` means the sink broke on a `Notify`, so the
-                        // capture is set; an empty capture is a classified
-                        // inconsistency, never a silent `None`.
+                    // `Received` means the sink broke on a `Notify`, so the ledger
+                    // holds it; drain it front-first. An empty ledger here is a
+                    // classified inconsistency, never a silent `None`.
+                    NotifyStatus::Received => match self.notifications.drain_one() {
+                        Some(res) => res.map(Some),
                         None => Err(DriverError::UnclassifiedFailure),
                     },
                     NotifyStatus::Quiet => Ok(None),
                 }
             }
             Err(other) => Err(lift_engine_error(other)),
+        }
+    }
+
+    /// The count of asynchronous notifications currently buffered in the ledger
+    /// and awaiting [`recv_notification`](Self::recv_notification).
+    #[must_use]
+    pub fn buffered_notifications(&self) -> usize {
+        self.notifications.len()
+    }
+
+    /// The total number of asynchronous notifications ever captured on this
+    /// connection (buffered, drained, or shed) — monotonic. Compare successive
+    /// reads to detect a gap.
+    #[must_use]
+    pub fn notifications_received(&self) -> u64 {
+        self.notifications.received()
+    }
+
+    /// The number of asynchronous notifications SHED because the bounded ledger
+    /// was full — monotonic. Non-zero means notifications were lost to the bound;
+    /// the loss is LOUD (visible here), never a silent drop.
+    #[must_use]
+    pub fn notifications_shed(&self) -> u64 {
+        self.notifications.shed()
+    }
+
+    /// Wait up to `timeout` for the next notification, parsing its payload into an
+    /// application type `T` — the typed peer of
+    /// [`recv_notification`](Self::recv_notification).
+    ///
+    /// A subscriber `LISTEN`s to a channel, then reads decoded values: the raw
+    /// payload string is parsed via `T`'s [`FromStr`](core::str::FromStr). Any
+    /// `T: FromStr` works (a std scalar, or a consumer's own enum) — dep-free, no
+    /// serialization framework. Use the untyped
+    /// [`recv_notification`](Self::recv_notification) when the payload is a plain
+    /// string. This is channel-agnostic: it types whatever notification arrives,
+    /// so a subscriber that wants a single type per channel `LISTEN`s to one
+    /// channel per connection.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::PayloadParse`] (carrying the raw payload) if the payload does
+    /// not parse into `T` — a LOUD classified error, never a silently-dropped or
+    /// defaulted notification. The notification is still removed from the ledger.
+    /// Other errors as [`recv_notification`](Self::recv_notification).
+    pub async fn recv_notification_as<T: FromStr>(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<TypedNotification<T>>, DriverError> {
+        match self.recv_notification(timeout).await? {
+            Some(n) => match n.payload.parse::<T>() {
+                Ok(payload) => Ok(Some(TypedNotification { channel: n.channel, payload, pid: n.pid })),
+                // The payload string moves into the classified error — the failure
+                // is inspectable, never swallowed.
+                Err(_) => Err(DriverError::PayloadParse(n.payload)),
+            },
+            None => Ok(None),
         }
     }
 
@@ -1182,10 +1284,10 @@ impl Connection {
                 let mut collector = ResultCollector::new();
                 let outcome = self
                     .engine
-                    .copy_in_finish(live, |s| {
+                    .copy_in_finish(live, capture_notify(&mut self.notifications, |s| {
                         collector.feed(s);
                         ControlFlow::Continue(())
-                    })
+                    }))
                     .await;
                 // `settle` restores the token on either status and maps a server
                 // rejection (a bad row surfaced at `CopyDone`) to `DriverError::Db`
@@ -1203,9 +1305,9 @@ impl Connection {
                 // token stays gone (connection dead) and `e` still dominates.
                 if let Ok(Outcome { live, .. }) = self
                     .engine
-                    .copy_in_abort(live, b"client aborted COPY", |_s: Surface<'_>| {
+                    .copy_in_abort(live, b"client aborted COPY", capture_notify(&mut self.notifications, |_s: Surface<'_>| {
                         ControlFlow::Continue(())
-                    })
+                    }))
                     .await
                 {
                     self.live = Some(live);
@@ -1260,7 +1362,7 @@ impl Connection {
         let mut db_error: Option<DbError> = None;
         let outcome = self
             .engine
-            .copy_out(live, &sql, |surface| match surface {
+            .copy_out(live, &sql, capture_notify(&mut self.notifications, |surface| match surface {
                 // The chunk borrows the transient ingest buffer; `on_chunk`
                 // consumes it in-scope (the `for<'q>` wall forbids escape).
                 Surface::CopyData(body) => on_chunk(body),
@@ -1270,10 +1372,11 @@ impl Connection {
                     db_error = Some(materialize::parse_error_response(body));
                     ControlFlow::Continue(())
                 }
-                // `CopyDone`, the `COPY n` `Deliver`, and asynchronous frames are
-                // not unload rows.
+                // `CopyDone`, the `COPY n` `Deliver`, and other async frames are
+                // not unload rows (a NOTIFY is captured into the ledger by the
+                // wrapper above this match, so it never reaches here to be dropped).
                 _ => ControlFlow::Continue(()),
-            })
+            }))
             .await;
 
         // The token rides `Ok` on any ALIVE boundary; a fatal is `Err`.

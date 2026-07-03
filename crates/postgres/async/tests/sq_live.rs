@@ -245,6 +245,67 @@ async fn listen_notify() {
 
 #[tokio::test]
 #[ignore = "requires local PG"]
+async fn notify_interleaved_with_a_query_is_captured_not_dropped() {
+    // The no-drop witness on a real server: a CONCURRENT session NOTIFYs while
+    // the listener is between commands; the server then delivers that pending
+    // notification INTERLEAVED with the listener's next query response. Before the
+    // ledger this was dropped by the result collector; now it is buffered.
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut listener = Connection::connect(&config).await.expect("l");
+    let mut notifier = Connection::connect(&config).await.expect("n");
+    listener.listen("bsql_interleave_ch").await.expect("listen");
+    // The NOTIFY commits on the notifier BEFORE the listener runs its query, so it
+    // is pending and rides the listener's SELECT response deterministically.
+    notifier.simple_query("NOTIFY bsql_interleave_ch, 'mid-query'").await.expect("notify");
+
+    // A perfectly ordinary query on the listener — its response carries the
+    // pending notification. The query still returns its own row unaffected.
+    let r = listener.query_sql("SELECT 1::int4").await.expect("query");
+    assert_eq!(r.rows[0].get_i32(0), Ok(Some(1)));
+
+    // The smoking gun: the notification was captured DURING that query.
+    assert!(
+        listener.buffered_notifications() >= 1,
+        "the interleaved NOTIFY was captured during the query, not dropped"
+    );
+    // And it drains from the ledger without another wait.
+    let n = listener
+        .recv_notification(std::time::Duration::from_secs(5))
+        .await.expect("recv").expect("notif");
+    assert_eq!(n.payload, "mid-query");
+    assert_eq!(n.channel, "bsql_interleave_ch");
+    listener.close().await.expect("close"); notifier.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn reset_session_clears_the_notification_ledger() {
+    // A pooled connection that captured a notification must NOT deliver it to the
+    // next user after a reset.
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut listener = Connection::connect(&config).await.expect("l");
+    let mut notifier = Connection::connect(&config).await.expect("n");
+    listener.listen("bsql_reset_ch").await.expect("listen");
+    notifier.simple_query("NOTIFY bsql_reset_ch, 'prior-user'").await.expect("notify");
+    let r = listener.query_sql("SELECT 1::int4").await.expect("query"); // captures the notify
+    assert_eq!(r.rows[0].get_i32(0), Ok(Some(1)));
+    assert!(listener.buffered_notifications() >= 1, "captured before reset");
+
+    // Reset (as the pool does on checkout): UNLISTEN * + clear the ledger.
+    listener.reset_session().await.expect("reset");
+    assert_eq!(listener.buffered_notifications(), 0, "reset cleared the ledger");
+
+    // The next user's recv finds nothing — over a REAL socket this is a would-block
+    // that surfaces as a quiet None, never the prior user's notification.
+    let none = listener
+        .recv_notification(std::time::Duration::from_millis(200))
+        .await.expect("recv");
+    assert!(none.is_none(), "a reset connection must not deliver a prior notification");
+    listener.close().await.expect("close"); notifier.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
 async fn pool_basic() {
     use bsql_postgres_async::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());

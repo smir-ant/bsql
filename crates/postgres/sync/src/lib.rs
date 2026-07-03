@@ -32,6 +32,7 @@ mod transport;
 
 pub use bsql_postgres_core::{
     ColumnError, ConnectConfig, DbError, DriverError, Notification, QueryResult, Row, Rows, SslMode,
+    TypedNotification,
 };
 
 pub use connection::{Connection, CopyInWriter, PreparedStatement};

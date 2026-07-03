@@ -276,6 +276,54 @@ fn listen_notify() {
 
 #[test]
 #[ignore = "requires local PG"]
+fn notify_interleaved_with_a_query_is_captured_not_dropped() {
+    // The no-drop witness on a real server: a concurrent session NOTIFYs while the
+    // listener is between commands; the server delivers that pending notification
+    // INTERLEAVED with the listener's next query response — captured, not dropped.
+    let mut listener = Connection::connect(&sync_config()).expect("listener");
+    let mut notifier = Connection::connect(&sync_config()).expect("notifier");
+    listener.listen("bsql_sync_interleave_ch").expect("listen");
+    notifier.simple_query("NOTIFY bsql_sync_interleave_ch, 'mid-query'").expect("notify");
+
+    let r = listener.query_sql("SELECT 1::int4").expect("query");
+    assert_eq!(r.rows[0].get_i32(0), Ok(Some(1)));
+
+    assert!(
+        listener.buffered_notifications() >= 1,
+        "the interleaved NOTIFY was captured during the query, not dropped"
+    );
+    let n = listener.recv_notification(std::time::Duration::from_secs(5))
+        .expect("recv").expect("notif");
+    assert_eq!(n.payload, "mid-query");
+    assert_eq!(n.channel, "bsql_sync_interleave_ch");
+    listener.close().expect("close"); notifier.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
+fn reset_session_clears_the_notification_ledger() {
+    // A pooled connection that captured a notification must NOT deliver it to the
+    // next user after a reset.
+    let mut listener = Connection::connect(&sync_config()).expect("listener");
+    let mut notifier = Connection::connect(&sync_config()).expect("notifier");
+    listener.listen("bsql_sync_reset_ch").expect("listen");
+    notifier.simple_query("NOTIFY bsql_sync_reset_ch, 'prior-user'").expect("notify");
+    let r = listener.query_sql("SELECT 1::int4").expect("query"); // captures the notify
+    assert_eq!(r.rows[0].get_i32(0), Ok(Some(1)));
+    assert!(listener.buffered_notifications() >= 1, "captured before reset");
+
+    listener.reset_session().expect("reset");
+    assert_eq!(listener.buffered_notifications(), 0, "reset cleared the ledger");
+
+    let none = listener
+        .recv_notification(std::time::Duration::from_millis(200))
+        .expect("recv");
+    assert!(none.is_none(), "a reset connection must not deliver a prior notification");
+    listener.close().expect("close"); notifier.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
 fn pool() {
     use bsql_postgres_sync::Pool;
     let pool = Pool::new(sync_config(), 3);

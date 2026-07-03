@@ -206,6 +206,12 @@ pub enum DriverError {
     /// the dynamic (`query_sql`) counterpart to [`Decode`](Self::Decode), which
     /// classifies the compile-checked `query!` path.
     Column(ColumnError),
+    /// A typed notification's payload did not parse into the requested type via
+    /// its [`FromStr`](core::str::FromStr) impl. Carries the raw payload string so
+    /// the failure is inspectable, never a silently-dropped notification — the
+    /// typed-subscription counterpart to a decode failure. The notification was
+    /// still removed from the ledger, so it cannot wedge the buffer.
+    PayloadParse(String),
 }
 
 // Footprint pin: a sum type whose size is set by its widest variant,
@@ -238,6 +244,9 @@ impl fmt::Display for DriverError {
             Self::TooManyRows => write!(f, "query_one matched more than one row"),
             Self::PoolTimeout => write!(f, "timed out acquiring a pooled connection; the pool is exhausted"),
             Self::Column(e) => write!(f, "{e}"),
+            Self::PayloadParse(payload) => {
+                write!(f, "notification payload did not parse into the requested type: {payload:?}")
+            }
         }
     }
 }
@@ -265,7 +274,8 @@ impl std::error::Error for DriverError {
             | Self::RowDecodeFailed
             | Self::OversizeRow
             | Self::TooManyRows
-            | Self::PoolTimeout => None,
+            | Self::PoolTimeout
+            | Self::PayloadParse(_) => None,
         }
     }
 }
