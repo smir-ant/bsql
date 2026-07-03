@@ -61,6 +61,23 @@
 //! would let a wrong catalog pass, which is exactly the blind spot this
 //! design exists to remove. A DDL form we cannot model faithfully is a
 //! loud build error, never a silently-wrong catalog.
+//!
+//! # Destructive-migration acknowledgement
+//!
+//! A migration that irreversibly destroys data — a `DROP TABLE` (drops every
+//! row) or an `ALTER TABLE ... DROP COLUMN` (drops a column's data) — must be
+//! ACKNOWLEDGED in the migration file: a `-- bsql:ack-destructive` comment on
+//! the line(s) immediately preceding the statement. An unacknowledged
+//! destructive statement is a loud [`BuildError::UnackedDestructiveMigration`]
+//! that fails the build, catching an ACCIDENTAL data-loss migration at compile
+//! time instead of in production. The set is deliberately conservative (only
+//! unambiguous destruction): a `RENAME`, an `ADD COLUMN`, or a `DROP NOT NULL`
+//! preserves data and needs no acknowledgement, so a developer is never trained
+//! to blanket-acknowledge safe DDL. The acknowledgement is parsed with the SQL
+//! tokenizer, so the marker text inside a string literal cannot forge one, and
+//! the marker must genuinely precede the destructive statement. The
+//! acknowledgement per statement is the only override — there is no wholesale
+//! opt-out that could silently pre-accept a future accidental destruction.
 
 #![forbid(unsafe_code)]
 
@@ -88,10 +105,11 @@ use std::path::{Path, PathBuf};
 
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ColumnDef, ColumnOption, Expr, Ident, IndexColumn,
-    ObjectName, RenameTableNameKind, Statement, TableConstraint,
+    ObjectName, ObjectType, RenameTableNameKind, Statement, TableConstraint,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 /// The basename of the catalog file written into `OUT_DIR`.
 pub const CATALOG_FILE_NAME: &str = "bsql_schema_catalog.txt";
@@ -144,7 +162,14 @@ pub struct Catalog {
 
 /// A build-time failure. Every variant is fatal: the consumer's
 /// `build.rs` propagates it and the build fails (fail-closed).
-#[derive(Debug)]
+///
+/// Its [`fmt::Debug`] renders the same actionable message as its
+/// [`fmt::Display`]. This is deliberate: a consumer's `build.rs` is
+/// `fn main() -> Result<(), BuildError>`, and Rust's `Termination` for a
+/// `Result` prints the error with `Debug`, so delegating `Debug` to `Display`
+/// is what surfaces the full, human-readable guidance (which statement, which
+/// file and line, and exactly how to fix it) at the point a build actually
+/// fails — rather than a bare struct dump that omits the remedy.
 pub enum BuildError {
     /// The migrations directory is missing or could not be listed.
     MigrationsDir { path: PathBuf, source: std::io::Error },
@@ -182,6 +207,37 @@ pub enum BuildError {
     /// bridged to different targets. Register one bridge for the family. Loud,
     /// never a silent last-wins. `first` / `second` are the two colliding keys.
     ConflictingBridge { first: String, second: String },
+    /// A migration statement that irreversibly destroys data (a `DROP TABLE`
+    /// or an `ALTER TABLE ... DROP COLUMN`) was replayed without an explicit
+    /// acknowledgement. Data-destroying DDL must be acknowledged in the
+    /// migration itself — a `-- bsql:ack-destructive` comment on the line(s)
+    /// immediately preceding the statement — so an ACCIDENTAL destructive
+    /// migration fails the build instead of silently shipping.
+    ///
+    /// `file` is the migration; `line` is the 1-based line of the statement's
+    /// first token; `statement` is a short description of what it destroys.
+    /// The [`fmt::Display`] spells out the exact acknowledgement syntax. Loud,
+    /// never a warning — a warning scrolls past and reopens the accidental-loss
+    /// blind spot this gate closes.
+    UnackedDestructiveMigration {
+        /// The migration file containing the unacknowledged statement.
+        file: PathBuf,
+        /// A short description of the destructive statement (e.g.
+        /// `DROP TABLE users` or `ALTER TABLE orders DROP COLUMN total`).
+        statement: String,
+        /// The 1-based source line of the statement's first token.
+        line: u64,
+    },
+}
+
+impl fmt::Debug for BuildError {
+    // Delegate to `Display`: a build script's `fn main() -> Result<(),
+    // BuildError>` is printed by the `Termination` impl using `Debug`, so this
+    // is what puts the actionable message (including how to fix it) in front of
+    // the developer whose build failed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 impl fmt::Display for BuildError {
@@ -244,6 +300,23 @@ impl fmt::Display for BuildError {
                  they resolve to the same native pivot type, which bsql decodes \
                  identically (same wire OID, same decoder). Register a single \
                  bridge for the family rather than two that disagree."
+            ),
+            BuildError::UnackedDestructiveMigration {
+                file,
+                statement,
+                line,
+            } => write!(
+                f,
+                "bsql-build: unacknowledged destructive migration in {} at line \
+                 {line}: `{statement}` irreversibly destroys data. If this is \
+                 intentional, acknowledge it by placing the comment \
+                 `{ACK_MARKER_SYNTAX}` on the line(s) immediately before the \
+                 statement (optionally followed by a reason, e.g. \
+                 `{ACK_MARKER_SYNTAX} dropped after export to cold storage`). \
+                 The acknowledgement must directly precede THIS statement: one \
+                 before another statement, or the marker text inside a string \
+                 literal, does not count.",
+                file.display()
             ),
         }
     }
@@ -845,10 +918,323 @@ fn replay_file(catalog: &mut Catalog, path: &Path, sql: &str) -> Result<(), Buil
             path: path.to_path_buf(),
             message: err.to_string(),
         })?;
+    // Gate irreversible data destruction BEFORE any statement mutates the
+    // catalog: a `DROP TABLE` / `DROP COLUMN` without a co-located
+    // acknowledgement fails the build rather than silently discarding data.
+    enforce_destructive_acks(path, sql, &statements)?;
     for statement in statements {
         replay_statement(catalog, path, statement)?;
     }
     Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Destructive-migration acknowledgement gate.
+// ════════════════════════════════════════════════════════════════════════
+//
+// A migration that irreversibly destroys data must be ACKNOWLEDGED in the
+// migration file, with a `-- bsql:ack-destructive` comment on the line(s)
+// immediately preceding the statement. An unacknowledged destructive statement
+// is a loud [`BuildError::UnackedDestructiveMigration`] that fails the
+// consumer's build, catching an ACCIDENTAL destructive migration at compile
+// time instead of in production.
+//
+// The COMPLETE destructive set (each destroys irreversible BASE data — no
+// query reconstructs the lost rows — and is classified purely by the destroying
+// VERB, independent of the catalog):
+//
+//   * `DROP TABLE`                     — drops every row of a table.
+//   * `ALTER TABLE ... DROP COLUMN`    — drops a column's data.
+//   * `DROP SCHEMA ... CASCADE`        — drops every table (and all their rows)
+//                                        in the schema; a strictly larger loss
+//                                        than one `DROP TABLE`.
+//   * `TRUNCATE`                       — drops every row of the named table(s).
+//   * `DROP DATABASE`                  — drops an entire database.
+//
+// The set is deliberately CONSERVATIVE — over-flagging safe DDL would train
+// developers to blanket-acknowledge everything, defeating the gate. These are
+// DELIBERATELY excluded (each omission is documented here so it is auditable,
+// never a silent gap):
+//
+//   * `RENAME`, `ADD COLUMN`, `SET`/`DROP NOT NULL`, a bare `ALTER COLUMN`
+//     option change — data is preserved, so no acknowledgement.
+//   * `DROP SCHEMA` without `CASCADE` (RESTRICT, the default) — it FAILS on a
+//     non-empty schema, so it cannot accidentally destroy data; only the
+//     `CASCADE` form is flagged.
+//   * `DROP MATERIALIZED VIEW` / `DROP VIEW` / `DROP INDEX` — a view is virtual
+//     and an index/materialized view is DERIVED: its rows are reconstructible
+//     from the base tables via the object's own definition, so dropping it is
+//     recoverable, not irreversible base-data loss. (A materialized view can be
+//     expensive to REFRESH, but "expensive to rebuild" is not "data destroyed";
+//     flagging it would over-flag a common cache-management operation.)
+//   * A LOSSY `ALTER COLUMN ... TYPE` (a narrowing that can truncate) — NOT yet
+//     flagged: soundly classifying "lossy" needs a type-width lattice (e.g.
+//     `int8 -> int4` loses high bits, `int4 -> int8` is a safe widening) whose
+//     subtleties (float precision, `numeric` scale) would over- or under-flag.
+//     A clean future extension to `destructive_statement`.
+//
+// The acknowledgement is parsed GLASS-FREE via the SQL tokenizer, never a
+// hand-rolled text scan: `Tokenizer::tokenize_with_location` classifies string
+// literals, dollar-quoted bodies, and comments correctly, so the marker text
+// inside a string literal is a string token (not a comment) and cannot forge an
+// acknowledgement, a `;` inside a string is not a statement separator, and the
+// marker must genuinely precede the destructive statement (not a different one).
+
+/// The exact acknowledgement marker a migration author writes as an SQL comment
+/// immediately before a destructive statement, e.g. `-- bsql:ack-destructive`.
+/// Shown verbatim in [`BuildError::UnackedDestructiveMigration`].
+const ACK_MARKER_SYNTAX: &str = "-- bsql:ack-destructive";
+
+/// The bare marker token an acknowledgement comment must LEAD with (the
+/// [`ACK_MARKER_SYNTAX`] without its `--` comment prefix), matched against a
+/// comment's content by [`comment_is_ack`].
+const ACK_MARKER: &str = "bsql:ack-destructive";
+
+/// Render one or more object names as a comma-separated list for a destructive
+/// statement's human description.
+fn render_object_names(names: &[ObjectName]) -> String {
+    names
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Classify a statement as irreversibly data-destroying, returning a short
+/// human description of WHAT it destroys, or `None` for a non-destructive
+/// statement. This single function is the whole destructive SET: extend it
+/// (e.g. for a lossy `ALTER COLUMN ... TYPE`) in exactly one place. The complete
+/// set and its deliberate exclusions are documented on the module section above.
+///
+/// The classification is purely SYNTACTIC — independent of whether the target
+/// is in the replayed catalog. A `DROP TABLE users` where `users` came from an
+/// out-of-band migration is invisible to the catalog yet still destroys the
+/// live table's data, so the destroying VERB is what requires acknowledgement,
+/// not the catalog's model of it. `IF EXISTS` does not change that: if the
+/// object exists, its data is destroyed.
+fn destructive_statement(statement: &Statement) -> Option<String> {
+    match statement {
+        Statement::Drop {
+            object_type: ObjectType::Table,
+            names,
+            ..
+        } => Some(format!("DROP TABLE {}", render_object_names(names))),
+        // `DROP SCHEMA ... CASCADE` drops every table (and all their rows) in
+        // the schema. Only the CASCADE form: RESTRICT / the default fail on a
+        // non-empty schema, so they cannot accidentally destroy data.
+        Statement::Drop {
+            object_type: ObjectType::Schema,
+            names,
+            cascade: true,
+            ..
+        } => Some(format!("DROP SCHEMA {} CASCADE", render_object_names(names))),
+        // `DROP DATABASE` drops an entire database.
+        Statement::Drop {
+            object_type: ObjectType::Database,
+            names,
+            ..
+        } => Some(format!("DROP DATABASE {}", render_object_names(names))),
+        // `TRUNCATE` drops every row of the named table(s).
+        Statement::Truncate(truncate) => {
+            let targets = truncate
+                .table_names
+                .iter()
+                .map(|target| target.name.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("TRUNCATE {targets}"))
+        }
+        Statement::AlterTable(alter) => {
+            // An `ALTER TABLE` may carry several operations; describe every
+            // `DROP COLUMN` among them. One acknowledgement covers the whole
+            // statement (the co-located comment precedes it), and the developer
+            // sees the `DROP COLUMN` they are acknowledging in that statement.
+            let dropped: Vec<String> = alter
+                .operations
+                .iter()
+                .filter_map(|op| match op {
+                    AlterTableOperation::DropColumn { column_names, .. } => Some(
+                        column_names
+                            .iter()
+                            .map(|ident| ident.value.clone())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
+                    _ => None,
+                })
+                .collect();
+            if dropped.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "ALTER TABLE {} DROP COLUMN {}",
+                    alter.name,
+                    dropped.join(", ")
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// One parsed statement's acknowledgement metadata, correlated by index with
+/// the parser's `Vec<Statement>`: the 1-based source line of its first token
+/// and whether a valid acknowledgement comment precedes it.
+#[derive(Debug)]
+struct StatementAck {
+    /// The 1-based source line of the statement's first significant token.
+    line: u64,
+    /// Whether an acknowledgement marker comment sits in this statement's
+    /// leading trivia (the comments after the previous statement's terminating
+    /// `;`, or the file start, up to this statement's first significant token).
+    acked: bool,
+}
+
+/// Fail the build if any statement irreversibly destroys data without a
+/// co-located acknowledgement. Runs before the replay so nothing mutates the
+/// catalog on the destructive path.
+///
+/// The classification (`destructive_statement`) comes from the parsed AST; the
+/// acknowledgement layout (`scan_statement_acks`) comes from the token stream.
+/// They are correlated by statement index — both enumerate statements in source
+/// order, so the k-th token-derived boundary is the k-th parsed statement.
+fn enforce_destructive_acks(
+    path: &Path,
+    sql: &str,
+    statements: &[Statement],
+) -> Result<(), BuildError> {
+    // Fast path: the token scan runs only when the file actually contains a
+    // destructive statement (the overwhelming common case is none).
+    if !statements
+        .iter()
+        .any(|s| destructive_statement(s).is_some())
+    {
+        return Ok(());
+    }
+
+    let acks = scan_statement_acks(path, sql)?;
+
+    // The token-derived statement boundaries must align 1:1 with the parser's
+    // statements (both walk the same tokens in source order; no DDL statement
+    // we model carries a top-level `;`). A mismatch would mean the two views
+    // disagree — never for valid parsed DDL — so it fails closed rather than
+    // risk mis-attributing an acknowledgement to the wrong statement.
+    if acks.len() != statements.len() {
+        return Err(BuildError::Replay {
+            path: path.to_path_buf(),
+            message: format!(
+                "the destructive-migration acknowledgement scan found {} \
+                 statement boundaries but the parser produced {} statements. \
+                 This is a bsql-build bug; please report it with the migration \
+                 that triggered it.",
+                acks.len(),
+                statements.len()
+            ),
+        });
+    }
+
+    for (statement, ack) in statements.iter().zip(&acks) {
+        if let Some(description) = destructive_statement(statement)
+            && !ack.acked
+        {
+            return Err(BuildError::UnackedDestructiveMigration {
+                file: path.to_path_buf(),
+                statement: description,
+                line: ack.line,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Tokenize the migration (retaining comments and locations) and, for each
+/// statement in source order, record its first-token line and whether an
+/// acknowledgement marker sits in its leading trivia.
+///
+/// Uses the SQL tokenizer — never a hand-rolled scan — so a `;` inside a string
+/// literal is not a separator, and the marker text inside a string literal is a
+/// string token, not a comment: neither can spoof an acknowledgement. A
+/// statement's leading trivia is the comments after the previous statement's
+/// terminating `;` (or the file start), so an acknowledgement before a DIFFERENT
+/// statement does not carry over — an intervening statement resets it.
+fn scan_statement_acks(path: &Path, sql: &str) -> Result<Vec<StatementAck>, BuildError> {
+    let dialect = PostgreSqlDialect {};
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(|err| BuildError::Parse {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?;
+
+    let mut acks: Vec<StatementAck> = Vec::new();
+    // Whether the current statement's first significant token has been seen
+    // (so later comments in it are NOT leading trivia for the next statement).
+    let mut in_statement = false;
+    // Whether an acknowledgement marker has appeared in the leading trivia of
+    // the statement about to begin.
+    let mut pending_ack = false;
+
+    for token in &tokens {
+        match &token.token {
+            // End of the file's token stream; carries no statement.
+            Token::EOF => {}
+            // Whitespace and comments. A comment in LEADING position (before the
+            // upcoming statement's first significant token) may acknowledge it.
+            Token::Whitespace(ws) => {
+                if !in_statement
+                    && let Some(text) = comment_text(ws)
+                    && comment_is_ack(text)
+                {
+                    pending_ack = true;
+                }
+            }
+            // A statement separator: close the current statement and reset the
+            // leading trivia for the next one (so an acknowledgement never
+            // carries across a statement boundary).
+            Token::SemiColon => {
+                in_statement = false;
+                pending_ack = false;
+            }
+            // Any other token is significant. The FIRST such token after a
+            // separator (or the file start) begins a new statement; its leading
+            // trivia — hence its acknowledgement — is whatever accumulated in
+            // `pending_ack`.
+            _ => {
+                if !in_statement {
+                    acks.push(StatementAck {
+                        line: token.span.start.line,
+                        acked: pending_ack,
+                    });
+                    in_statement = true;
+                    pending_ack = false;
+                }
+            }
+        }
+    }
+    Ok(acks)
+}
+
+/// The text content of a comment token (without its delimiters), or `None` for
+/// non-comment whitespace. Both single-line (`-- ...`) and block (`/* ... */`)
+/// comments can carry the acknowledgement marker.
+fn comment_text(ws: &Whitespace) -> Option<&str> {
+    match ws {
+        Whitespace::SingleLineComment { comment, .. } => Some(comment),
+        Whitespace::MultiLineComment(text) => Some(text),
+        Whitespace::Space | Whitespace::Newline | Whitespace::Tab => None,
+    }
+}
+
+/// Whether a comment's content is a valid destructive-migration acknowledgement:
+/// its trimmed text must LEAD with the exact [`ACK_MARKER`] token, followed by
+/// end-of-comment or ASCII whitespace (so an optional reason may follow). This
+/// rejects a forged near-match (`bsql:ack-destructivex`) and a marker that is
+/// not the comment's leading content (`reason: bsql:ack-destructive`).
+fn comment_is_ack(content: &str) -> bool {
+    match content.trim_start().strip_prefix(ACK_MARKER) {
+        Some(rest) => rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace()),
+        None => false,
+    }
 }
 
 /// Replay one DDL statement. DDL we model (`CREATE TABLE`,
@@ -873,7 +1259,7 @@ fn replay_statement(
             Ok(())
         }
         Statement::Drop {
-            object_type: sqlparser::ast::ObjectType::Table,
+            object_type: ObjectType::Table,
             names,
             ..
         } => {
@@ -887,6 +1273,46 @@ fn replay_statement(
             }
             Ok(())
         }
+        // `DROP SCHEMA ... CASCADE` removes every table in the named schema.
+        // This catalog admits only default-schema (`public`) tables — a
+        // non-public table is a loud error at CREATE — so a CASCADE drop of
+        // `public` removes the ENTIRE catalog, while dropping any other schema
+        // removes tables the catalog never modeled (a faithful no-op here).
+        // Modeling this keeps the catalog correct after the drop instead of
+        // leaving stale tables a `query!` would resolve against a relation the
+        // schema drop removed (the silently-wrong-catalog blind spot). A
+        // non-CASCADE (RESTRICT / default) schema drop FAILS on a non-empty
+        // schema, so it never silently removes modeled tables; leaving the
+        // catalog unchanged is consistent with the server (the drop either
+        // fails or removes an empty schema).
+        Statement::Drop {
+            object_type: ObjectType::Schema,
+            names,
+            cascade,
+            ..
+        } => {
+            if cascade {
+                for name in &names {
+                    if drop_schema_targets_public(name) {
+                        catalog.tables.clear();
+                        catalog.primary_keys.clear();
+                    }
+                }
+            }
+            Ok(())
+        }
+        // `DROP DATABASE` and `TRUNCATE` require acknowledgement (they destroy
+        // base data), but neither changes this catalog's table SHAPE: `TRUNCATE`
+        // removes ROWS, not columns; `DROP DATABASE` targets a DIFFERENT
+        // database object — a session cannot drop the database it is connected
+        // to, which is the one these migrations build — so the modeled
+        // database's tables are unchanged. A no-op here is faithful, not a
+        // silent skip of shape this catalog models.
+        Statement::Drop {
+            object_type: ObjectType::Database,
+            ..
+        }
+        | Statement::Truncate(_) => Ok(()),
         // `RENAME TABLE old TO new [, ...]` (the MySQL spelling; the
         // PostgreSQL spelling is `ALTER TABLE old RENAME TO new`, handled
         // in `replay_alter_op`). This carries table shape: skipping it
@@ -1489,6 +1915,20 @@ fn schema_part_folds_to_public(schema: &Ident) -> bool {
     fold_ident(schema) == "public"
 }
 
+/// Whether a `DROP SCHEMA` names the single namespace this catalog models — the
+/// default `public` schema — using the same case rule as everywhere else
+/// ([`schema_part_folds_to_public`]). A `DROP SCHEMA public CASCADE` removes
+/// every modeled table (the replay admits only default-schema tables), so this
+/// decides whether such a drop clears the catalog. A multi-part or
+/// non-identifier schema path (`db.app`) names a namespace the catalog does not
+/// model, so it targets no modeled table here.
+fn drop_schema_targets_public(name: &ObjectName) -> bool {
+    match name.0.as_slice() {
+        [only] => only.as_ident().is_some_and(schema_part_folds_to_public),
+        _ => false,
+    }
+}
+
 /// The trailing identifier of an `ObjectName`, case-folded (drops any
 /// schema/database qualifier; the catalog keys tables by their bare name
 /// for the current scope).
@@ -1739,6 +2179,14 @@ mod tests {
         panic!("expected a fail-closed Replay error, but every statement replayed");
     }
 
+    /// Prefix a destructive statement with the acknowledgement marker, so a
+    /// replay-SEMANTICS test (not testing the destructive gate itself) passes
+    /// the gate. The dedicated gate tests below exercise the acknowledged /
+    /// unacknowledged / spoofed paths directly.
+    fn acked(sql: &str) -> String {
+        format!("{ACK_MARKER_SYNTAX}\n{sql}")
+    }
+
     #[test]
     fn create_table_records_columns_and_nullability() {
         let cat = catalog_from(&[
@@ -1756,7 +2204,7 @@ mod tests {
         let cat = catalog_from(&[
             "CREATE TABLE t (a INT)",
             "ALTER TABLE t ADD COLUMN b TEXT NOT NULL",
-            "ALTER TABLE t DROP COLUMN a",
+            acked("ALTER TABLE t DROP COLUMN a").as_str(),
         ]);
         let t = cat.tables.get("t").expect("t");
         assert!(!t.contains_key("a"), "a was dropped");
@@ -1792,7 +2240,7 @@ mod tests {
 
     #[test]
     fn drop_table_removes_it() {
-        let cat = catalog_from(&["CREATE TABLE t (a INT)", "DROP TABLE t"]);
+        let cat = catalog_from(&["CREATE TABLE t (a INT)", acked("DROP TABLE t").as_str()]);
         assert!(!cat.tables.contains_key("t"));
     }
 
@@ -1860,7 +2308,7 @@ mod tests {
     fn dropping_a_primary_key_column_drops_the_key() {
         let cat = catalog_from(&[
             "CREATE TABLE t (a INT PRIMARY KEY, b INT)",
-            "ALTER TABLE t DROP COLUMN a",
+            acked("ALTER TABLE t DROP COLUMN a").as_str(),
         ]);
         assert!(!cat.primary_keys.contains_key("t"), "key removed with col");
     }
@@ -1869,7 +2317,7 @@ mod tests {
     fn dropping_one_composite_key_column_drops_the_whole_key() {
         let cat = catalog_from(&[
             "CREATE TABLE t (a INT, b INT, c TEXT, PRIMARY KEY (a, b))",
-            "ALTER TABLE t DROP COLUMN a",
+            acked("ALTER TABLE t DROP COLUMN a").as_str(),
         ]);
         assert!(!cat.primary_keys.contains_key("t"), "whole key removed");
     }
@@ -1897,7 +2345,7 @@ mod tests {
     fn dropping_a_table_removes_its_primary_key() {
         let cat = catalog_from(&[
             "CREATE TABLE t (a INT PRIMARY KEY, b INT)",
-            "DROP TABLE t",
+            acked("DROP TABLE t").as_str(),
         ]);
         assert!(!cat.primary_keys.contains_key("t"));
     }
@@ -1906,7 +2354,7 @@ mod tests {
     fn recreating_a_dropped_table_does_not_inherit_a_stale_key() {
         let cat = catalog_from(&[
             "CREATE TABLE t (a INT PRIMARY KEY, b INT)",
-            "DROP TABLE t",
+            acked("DROP TABLE t").as_str(),
             "CREATE TABLE t (a INT, b INT)",
         ]);
         assert!(!cat.primary_keys.contains_key("t"), "no stale key");
@@ -1931,12 +2379,299 @@ mod tests {
     fn drop_unknown_column_is_error() {
         let mut cat = Catalog::default();
         replay_file(&mut cat, Path::new("a.sql"), "CREATE TABLE t (a INT)").expect("create");
-        let err = replay_file(&mut cat, Path::new("b.sql"), "ALTER TABLE t DROP COLUMN gone")
+        // Acknowledged, so the gate passes and the replay reaches the
+        // fail-closed "no such column" error this test pins.
+        let err = replay_file(&mut cat, Path::new("b.sql"), &acked("ALTER TABLE t DROP COLUMN gone"))
             .expect_err("must fail closed");
         match err {
             BuildError::Replay { message, .. } => assert!(message.contains("no such column")),
             other => panic!("wrong error: {other:?}"),
         }
+    }
+
+    // ── Destructive-migration acknowledgement gate ─────────────────────
+
+    /// Replay one migration file's SQL into a fresh catalog, returning the
+    /// error (panicking if it unexpectedly succeeds).
+    fn gate_err(sql: &str) -> BuildError {
+        let mut cat = Catalog::default();
+        replay_file(&mut cat, Path::new("m.sql"), sql).expect_err("expected a fail-closed error")
+    }
+
+    /// Replay one migration file's SQL into a fresh catalog (panicking on any
+    /// error), returning the catalog — for asserting an ACKNOWLEDGED
+    /// destructive statement's effect on the schema.
+    fn gate_ok(sql: &str) -> Catalog {
+        let mut cat = Catalog::default();
+        replay_file(&mut cat, Path::new("m.sql"), sql).expect("replay");
+        cat
+    }
+
+    /// Assert the error is an unacknowledged-destructive error whose
+    /// description contains `needle`, returning the reported source line.
+    fn expect_unacked(err: BuildError, needle: &str) -> u64 {
+        match err {
+            BuildError::UnackedDestructiveMigration {
+                statement, line, ..
+            } => {
+                assert!(
+                    statement.contains(needle),
+                    "description `{statement}` missing `{needle}`"
+                );
+                line
+            }
+            other => panic!("expected UnackedDestructiveMigration, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unacked_drop_table_fails_the_build() {
+        let line = expect_unacked(
+            gate_err("CREATE TABLE t (a INT);\nDROP TABLE t;"),
+            "DROP TABLE t",
+        );
+        assert_eq!(line, 2, "the DROP is on line 2");
+    }
+
+    #[test]
+    fn unacked_drop_column_fails_the_build() {
+        expect_unacked(
+            gate_err("CREATE TABLE t (a INT, b INT);\nALTER TABLE t DROP COLUMN a;"),
+            "ALTER TABLE t DROP COLUMN a",
+        );
+    }
+
+    #[test]
+    fn unacked_drop_table_if_exists_still_fails() {
+        // `IF EXISTS` does not change destructiveness: if the table exists, its
+        // data is destroyed.
+        expect_unacked(gate_err("DROP TABLE IF EXISTS t;"), "DROP TABLE t");
+    }
+
+    #[test]
+    fn acked_drop_table_removes_it_from_the_catalog() {
+        // The acknowledged DROP passes the gate AND still replays: the table is
+        // gone from the catalog.
+        let cat = gate_ok("CREATE TABLE t (a INT);\n-- bsql:ack-destructive\nDROP TABLE t;");
+        assert!(!cat.tables.contains_key("t"), "acked drop removed the table");
+    }
+
+    #[test]
+    fn acked_drop_column_removes_it_from_the_catalog() {
+        let cat = gate_ok(
+            "CREATE TABLE t (a INT, b INT);\n\
+             -- bsql:ack-destructive\n\
+             ALTER TABLE t DROP COLUMN a;",
+        );
+        assert!(!cat.tables["t"].contains_key("a"), "column a dropped");
+        assert!(cat.tables["t"].contains_key("b"), "column b kept");
+    }
+
+    #[test]
+    fn ack_with_a_trailing_reason_counts() {
+        let cat = gate_ok(
+            "CREATE TABLE t (a INT);\n\
+             -- bsql:ack-destructive dropped after export to cold storage\n\
+             DROP TABLE t;",
+        );
+        assert!(!cat.tables.contains_key("t"));
+    }
+
+    #[test]
+    fn ack_in_a_block_comment_counts() {
+        let cat = gate_ok("CREATE TABLE t (a INT);\n/* bsql:ack-destructive */\nDROP TABLE t;");
+        assert!(!cat.tables.contains_key("t"));
+    }
+
+    #[test]
+    fn drop_column_among_other_ops_needs_one_ack() {
+        // One acknowledgement covers a statement whose ops include a DROP
+        // COLUMN; the remaining ops still apply.
+        let cat = gate_ok(
+            "CREATE TABLE t (a INT, b INT);\n\
+             -- bsql:ack-destructive\n\
+             ALTER TABLE t DROP COLUMN a, ADD COLUMN c INT;",
+        );
+        assert!(!cat.tables["t"].contains_key("a"), "a dropped");
+        assert!(cat.tables["t"].contains_key("c"), "c added");
+
+        // Without the acknowledgement, the same statement fails.
+        expect_unacked(
+            gate_err("CREATE TABLE t (a INT, b INT);\nALTER TABLE t DROP COLUMN a, ADD COLUMN c INT;"),
+            "DROP COLUMN a",
+        );
+    }
+
+    #[test]
+    fn non_destructive_migrations_need_no_ack() {
+        // CREATE, ADD COLUMN, RENAME TABLE / COLUMN, SET / DROP NOT NULL, and a
+        // (deferred) ALTER COLUMN TYPE all preserve data — none needs an
+        // acknowledgement, so over-flagging them (which would train blanket
+        // acking) is foreclosed.
+        let cat = gate_ok(
+            "CREATE TABLE t (a INT NOT NULL, b INT);\n\
+             ALTER TABLE t ADD COLUMN c TEXT NOT NULL;\n\
+             ALTER TABLE t ALTER COLUMN a DROP NOT NULL;\n\
+             ALTER TABLE t ALTER COLUMN b SET NOT NULL;\n\
+             ALTER TABLE t ALTER COLUMN b TYPE BIGINT;\n\
+             ALTER TABLE t RENAME COLUMN c TO d;\n\
+             ALTER TABLE t RENAME TO u;",
+        );
+        let u = cat.tables.get("u").expect("renamed table u");
+        assert!(u.contains_key("a") && u.contains_key("b") && u.contains_key("d"));
+    }
+
+    #[test]
+    fn unacked_drop_schema_cascade_fails_the_build() {
+        expect_unacked(
+            gate_err("CREATE TABLE t (a INT);\nDROP SCHEMA public CASCADE;"),
+            "DROP SCHEMA public CASCADE",
+        );
+    }
+
+    #[test]
+    fn unacked_truncate_fails_the_build() {
+        expect_unacked(
+            gate_err("CREATE TABLE t (a INT);\nTRUNCATE t;"),
+            "TRUNCATE t",
+        );
+        // The `TRUNCATE TABLE a, b` spelling is flagged too.
+        expect_unacked(
+            gate_err("CREATE TABLE a (x INT);\nCREATE TABLE b (y INT);\nTRUNCATE TABLE a, b;"),
+            "TRUNCATE a, b",
+        );
+    }
+
+    #[test]
+    fn unacked_drop_database_fails_the_build() {
+        expect_unacked(gate_err("DROP DATABASE olddb;"), "DROP DATABASE olddb");
+    }
+
+    #[test]
+    fn acked_truncate_succeeds_and_keeps_the_table_shape() {
+        // TRUNCATE removes ROWS, not the table's {column} shape, so the catalog
+        // is unchanged (a faithful no-op) — the table still resolves.
+        let cat = gate_ok("CREATE TABLE t (a INT, b TEXT);\n-- bsql:ack-destructive\nTRUNCATE t;");
+        let t = cat.tables.get("t").expect("t still present after TRUNCATE");
+        assert!(t.contains_key("a") && t.contains_key("b"));
+    }
+
+    #[test]
+    fn acked_drop_database_succeeds_and_keeps_the_catalog() {
+        // DROP DATABASE targets a DIFFERENT database object than the one the
+        // migrations build, so the modeled tables are untouched (faithful).
+        let cat = gate_ok("CREATE TABLE t (a INT);\n-- bsql:ack-destructive\nDROP DATABASE olddb;");
+        assert!(cat.tables.contains_key("t"), "modeled table unaffected");
+    }
+
+    #[test]
+    fn acked_drop_schema_public_cascade_clears_the_catalog() {
+        // The catalog admits only default-schema tables, so DROP SCHEMA public
+        // CASCADE removes ALL of them — the replay MODELS this (rather than
+        // leaving a silently-wrong catalog with stale tables). A table created
+        // AFTER the drop resolves; one from before does not.
+        let cat = gate_ok(
+            "CREATE TABLE gone_a (x INT);\n\
+             CREATE TABLE gone_b (y INT PRIMARY KEY);\n\
+             -- bsql:ack-destructive\n\
+             DROP SCHEMA public CASCADE;\n\
+             CREATE TABLE kept (z INT);",
+        );
+        assert!(!cat.tables.contains_key("gone_a"), "pre-drop table removed");
+        assert!(!cat.tables.contains_key("gone_b"), "pre-drop table removed");
+        assert!(
+            !cat.primary_keys.contains_key("gone_b"),
+            "pre-drop primary key removed"
+        );
+        assert!(cat.tables.contains_key("kept"), "post-drop table resolves");
+    }
+
+    #[test]
+    fn acked_drop_schema_nonpublic_cascade_keeps_modeled_tables() {
+        // A CASCADE drop of a schema the catalog does not model touches no
+        // modeled table (all modeled tables live in the default schema).
+        let cat = gate_ok(
+            "CREATE TABLE t (a INT);\n\
+             -- bsql:ack-destructive\n\
+             DROP SCHEMA archived CASCADE;",
+        );
+        assert!(cat.tables.contains_key("t"), "default-schema table kept");
+    }
+
+    #[test]
+    fn deliberately_excluded_drops_need_no_ack() {
+        // DROP SCHEMA without CASCADE (RESTRICT / default fails on a non-empty
+        // schema), and DROP of a DERIVED/virtual object (materialized view,
+        // view, index) whose rows are reconstructible from its definition, are
+        // deliberately NOT flagged — none needs an acknowledgement.
+        for sql in [
+            "DROP SCHEMA empty_ns;",
+            "DROP SCHEMA empty_ns RESTRICT;",
+            "DROP MATERIALIZED VIEW mv;",
+            "DROP VIEW v;",
+            "DROP INDEX idx;",
+        ] {
+            let mut cat = Catalog::default();
+            replay_file(&mut cat, Path::new("m.sql"), sql)
+                .expect("excluded drop needs no acknowledgement");
+        }
+    }
+
+    #[test]
+    fn ack_marker_inside_a_string_literal_does_not_count() {
+        // The marker text lives inside a prior statement's STRING LITERAL, not
+        // in the DROP's leading comment — the tokenizer classifies it as a
+        // string token, so it cannot forge an acknowledgement.
+        expect_unacked(
+            gate_err(
+                "CREATE TABLE audit (msg TEXT);\n\
+                 INSERT INTO audit (msg) VALUES ('-- bsql:ack-destructive');\n\
+                 DROP TABLE audit;",
+            ),
+            "DROP TABLE audit",
+        );
+    }
+
+    #[test]
+    fn ack_before_a_different_statement_does_not_count() {
+        // The acknowledgement precedes the CREATE, not the DROP; an intervening
+        // statement resets the leading trivia, so the DROP is unacknowledged.
+        expect_unacked(
+            gate_err(
+                "-- bsql:ack-destructive\n\
+                 CREATE TABLE t (a INT);\n\
+                 DROP TABLE t;",
+            ),
+            "DROP TABLE t",
+        );
+    }
+
+    #[test]
+    fn forged_near_match_marker_does_not_count() {
+        // A near-match that is not the exact marker token is not an
+        // acknowledgement.
+        for forged in [
+            "-- bsql:ack-destructivexyz\nDROP TABLE t;",
+            "-- please bsql:ack-destructive\nDROP TABLE t;",
+            "-- ack-destructive\nDROP TABLE t;",
+        ] {
+            expect_unacked(gate_err(forged), "DROP TABLE t");
+        }
+    }
+
+    #[test]
+    fn unacked_error_message_is_actionable() {
+        let err = gate_err("CREATE TABLE t (a INT);\nDROP TABLE t;");
+        let rendered = err.to_string();
+        // Names the file, the line, the destructive statement, and the exact
+        // acknowledgement syntax to add.
+        assert!(rendered.contains("m.sql"), "names the file: {rendered}");
+        assert!(rendered.contains("line 2"), "names the line: {rendered}");
+        assert!(rendered.contains("DROP TABLE t"), "names the statement: {rendered}");
+        assert!(
+            rendered.contains("-- bsql:ack-destructive"),
+            "spells the ack syntax: {rendered}"
+        );
     }
 
     #[test]
@@ -2053,9 +2788,11 @@ mod tests {
     #[test]
     fn drop_nonpublic_schema_table_is_loud() {
         // DROP TABLE's relation key is loud on a non-public schema too.
+        // Acknowledged, so the gate passes and the replay reaches the
+        // schema-qualification error this test pins.
         let msg = replay_err(&[
             "CREATE TABLE widgets (wid INT)",
-            "DROP TABLE wrongschema.widgets",
+            acked("DROP TABLE wrongschema.widgets").as_str(),
         ]);
         assert!(msg.contains("does not model"), "got: {msg}");
     }
