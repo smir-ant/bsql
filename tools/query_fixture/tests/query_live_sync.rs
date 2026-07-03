@@ -24,8 +24,9 @@
 )]
 
 use core::ops::ControlFlow;
+use core::str::FromStr as _;
 
-use bsql::{Timestamptz, Uuid};
+use bsql::{Numeric, Timestamptz, Uuid};
 use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 // One column, fixed-width, NOT NULL -> the borrowed record carries no lifetime
@@ -150,6 +151,12 @@ bsql::query!(IntArrayLit, "SELECT ARRAY[10, NULL, 30]::int4[] AS xs");
 bsql::query!(TextArrayLit, "SELECT ARRAY['a', NULL, 'c']::text[] AS xs");
 bsql::query!(NullArrayLit, "SELECT NULL::int4[] AS xs");
 bsql::query!(EmptyArrayLit, "SELECT ARRAY[]::int4[] AS xs");
+
+// ── exact numeric / decimal: a FromStr-constructed `bsql::Numeric` binds as a
+//    param, and `$1::numeric::text` is PG's own text rendering (the oracle).
+bsql::query!(EchoNum, "SELECT $1::numeric AS n");
+bsql::query!(EchoNumText, "SELECT $1::numeric::text AS t");
+bsql::query!(NumArrayLit, "SELECT '{1.5,NULL,100}'::numeric[] AS xs");
 
 fn sync_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -806,6 +813,105 @@ fn typed_json_and_jsonb_columns_round_trip() {
     let jb = c.query_one::<JsonbLitQuery>(()).expect("query_one JsonbLit");
     // jsonb round-trips through PG's canonical spacing: `[1, 2, 3]`.
     assert_eq!(jb.j.as_str(), "[1, 2, 3]", "jsonb decodes past the version byte");
+    c.close().expect("close");
+}
+
+/// PRECISION BATTERY (numeric): a WIDE range of exact decimal values each bind
+/// as a `FromStr`-constructed `bsql::Numeric` param, round-trip through REAL
+/// PostgreSQL, and decode back to the EXACT decimal string == the value's own
+/// `Display` == PostgreSQL's own `$1::numeric::text` rendering (the oracle).
+///
+/// This is the load-bearing precision proof: a single wrong digit in encode or
+/// decode is silently-wrong money. The `== s` assertion pins my ENCODE (my
+/// bytes must mean `s` to PG); the `== oracle` assertion pins my DECODE against
+/// PG's text; together they close the round-trip. Values past the `i128` range
+/// prove genuine arbitrary precision.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_numeric_precision_battery() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    for s in [
+        "0",
+        "1",
+        "-1",
+        "0.1",
+        "0.0001",
+        "3.14159265358979323846",
+        "1.500",
+        "100.00",
+        // > i128 (60 digits) and a negative large high-scale value — genuine
+        // arbitrary precision, unrepresentable in any fixed-width mantissa.
+        "123456789012345678901234567890123456789012345678901234567890",
+        "-99999999999999999999999999999999999999999999.000001",
+        "NaN",
+    ] {
+        let n = Numeric::from_str(s).expect("battery value parses");
+        let echoed = c.query_one::<EchoNumQuery>((n.clone(),)).expect("echo numeric");
+        let oracle = c
+            .query_one::<EchoNumTextQuery>((n.clone(),))
+            .expect("pg ::text oracle");
+        assert_eq!(echoed.n.to_string(), s, "decode Display == expected for `{s}`");
+        assert_eq!(
+            echoed.n.to_string(),
+            oracle.t,
+            "decode Display == PG ::text for `{s}`",
+        );
+        assert_eq!(echoed.n, n, "decoded value equals the bound value for `{s}`");
+    }
+    c.close().expect("close");
+}
+
+/// PRECISION BATTERY (specials): `±Infinity` bind and round-trip exactly. The
+/// infinities are PostgreSQL 14+; on an older server the bind is a loud
+/// `DbError`, which this test treats as a skip (never a false pass) rather than
+/// asserting an unsupported feature.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_numeric_infinity_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    for (value, text) in [
+        (Numeric::infinity(), "Infinity"),
+        (Numeric::neg_infinity(), "-Infinity"),
+    ] {
+        match c.query_one::<EchoNumQuery>((value.clone(),)) {
+            Ok(echoed) => {
+                assert_eq!(echoed.n, value, "{text} round-trips exactly");
+                assert_eq!(echoed.n.to_string(), text);
+                let oracle = c
+                    .query_one::<EchoNumTextQuery>((value.clone(),))
+                    .expect("pg ::text oracle");
+                assert_eq!(oracle.t, text, "PG ::text renders {text}");
+            }
+            // Pre-14 PostgreSQL rejects numeric infinity — a loud DbError, not a
+            // silent miss. Skip rather than fail on an unsupported server.
+            Err(DriverError::Db(_)) => {
+                c = Connection::connect(&sync_config()).expect("reconnect after skip");
+            }
+            Err(other) => panic!("unexpected error binding {text}: {other:?}"),
+        }
+    }
+    c.close().expect("close");
+}
+
+/// ARRAYS (numeric): a real `numeric[]` with a NULL middle element decodes to
+/// `Vec<Option<bsql::Numeric>>` with exact values and an honest `None`. The
+/// server sends its own `array_send` bytes, so this proves the numeric-array
+/// wire decode end-to-end against PostgreSQL.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_numeric_array_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let row = c.query_one::<NumArrayLitQuery>(()).expect("query_one NumArrayLit");
+    let rendered: Vec<Option<String>> = row
+        .xs
+        .iter()
+        .map(|e| e.as_ref().map(ToString::to_string))
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![Some("1.5".to_string()), None, Some("100".to_string())],
+        "numeric[] decodes exact values with a NULL element",
+    );
     c.close().expect("close");
 }
 

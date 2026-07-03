@@ -196,7 +196,7 @@ pub enum BuildError {
     /// A [`CatalogBuilder::bridge`] named a `pg_type` with no native pivot: it
     /// is not a canonical PostgreSQL type name in the natively-supported set
     /// (a typo like `timestamptzz`, or a natively-unsupported type like
-    /// `numeric` that a column would itself reject). A bridge reshapes a native
+    /// `inet` that a column would itself reject). A bridge reshapes a native
     /// decoded value, so a type with no native decoder cannot be bridged.
     /// Loud, never silently ignored. `pg_type` is the offending key.
     UnknownBridgeType { pg_type: String },
@@ -291,8 +291,9 @@ impl fmt::Display for BuildError {
                  reshapes a natively-decoded value, so its `pg_type` must be \
                  one of the natively-supported canonical names (int2, int4, \
                  int8, oid, bool, text, varchar, float4, float8, bytea, uuid, \
-                 timestamptz, timestamp, json, jsonb). A natively-unsupported \
-                 type (e.g. numeric) has no native decoder to bridge from."
+                 timestamptz, timestamp, json, jsonb, numeric). A natively-\
+                 unsupported type (e.g. inet) has no native decoder to bridge \
+                 from."
             ),
             BuildError::ConflictingBridge { first, second } => write!(
                 f,
@@ -538,10 +539,10 @@ impl CatalogBuilder {
     ///
     /// `pg_type` must be a canonical PostgreSQL type name with a native bsql
     /// pivot (int2, int4, int8, oid, bool, text, varchar, float4, float8,
-    /// bytea, uuid, timestamptz, timestamp, json, jsonb); a bridge on an
-    /// element type ALSO reshapes each element of that type's 1-D array
+    /// bytea, uuid, timestamptz, timestamp, json, jsonb, numeric); a bridge on
+    /// an element type ALSO reshapes each element of that type's 1-D array
     /// (`timestamptz[]` -> `Vec<Option<target>>`). A typo or a natively
-    /// unsupported type (e.g. `numeric`) is a loud [`BuildError`] at
+    /// unsupported type (e.g. `inet`) is a loud [`BuildError`] at
     /// [`emit`](Self::emit).
     ///
     /// `target_type_path` and `converter_fn_path` are Rust paths that resolve
@@ -3057,12 +3058,23 @@ mod tests {
             BuildError::UnknownBridgeType { ref pg_type } if pg_type == "timestamptzz"
         ));
         // A natively-unsupported type has no pivot to bridge from.
-        let err = validate_bridges(&[bspec("numeric", "rust_decimal::Decimal", "d")], &cat)
-            .expect_err("numeric has no native pivot");
+        let err = validate_bridges(&[bspec("inet", "ipnet::IpNet", "d")], &cat)
+            .expect_err("inet has no native pivot");
         assert!(matches!(
             err,
-            BuildError::UnknownBridgeType { ref pg_type } if pg_type == "numeric"
+            BuildError::UnknownBridgeType { ref pg_type } if pg_type == "inet"
         ));
+    }
+
+    #[test]
+    fn numeric_is_bridgeable() {
+        // `numeric` now has a native pivot (`bsql::Numeric`), so a consumer can
+        // bridge it into a decimal crate — the arbitrary-precision value is the
+        // faithful pivot the converter reshapes from.
+        let cat = catalog_from(&["CREATE TABLE t (amount NUMERIC NOT NULL)"]);
+        validate_bridges(&[bspec("numeric", "rust_decimal::Decimal", "crate::to_decimal")], &cat)
+            .expect("numeric bridges from its native pivot");
+        assert!(scalar_rust_type_for_pg("numeric").is_some(), "numeric has a native pivot");
     }
 
     #[test]
@@ -3119,8 +3131,10 @@ mod tests {
         assert_eq!(scalar, array, "a `T[]` column shares its element's pivot");
         // A multi-dimensional array has no bridgeable pivot.
         assert_eq!(column_pivot("timestamptz[][]"), None);
-        // An unsupported type has none either.
-        assert_eq!(column_pivot("numeric"), None);
+        // A supported scalar (now including `numeric`) resolves to a pivot.
+        assert!(column_pivot("numeric").is_some());
+        // An unsupported type has none.
+        assert_eq!(column_pivot("inet"), None);
     }
 
     #[test]

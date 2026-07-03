@@ -29,10 +29,11 @@
 //!   nullable (an empty group yields one NULL row); `bool_and` / `bool_or`
 //!   / `every` -> `bool`, nullable.
 //! * `SUM` / `AVG` / `array_agg` / `string_agg` / … -> a **loud
-//!   cast-required error**: their result type (PostgreSQL `numeric` for
-//!   `sum(int8)`, an array for `array_agg`, …) is outside the v1 supported
-//!   set (`i16`/`i32`/`i64`/`u32`/`bool`/`text`), so it is pinned with an
-//!   explicit `::cast`, never guessed.
+//!   cast-required error**: their result type DEPENDS on the argument's type
+//!   (`sum(int4)` -> `int8`, `sum(int8)` -> `numeric`, `sum(float8)` ->
+//!   `float8`, `array_agg` -> an array, …), and pinning it needs the
+//!   argument's resolved type, so it is pinned with an explicit `::cast`,
+//!   never guessed.
 //! * A bare literal -> its type, not nullable.
 //! * An explicit `CAST(expr AS type)` / `expr::type` -> the cast target's
 //!   type; nullable unless the inner expression is a non-null literal.
@@ -100,7 +101,7 @@ use crate::{canonical_type, fold_ident, object_name_leaf, schema_part_folds_to_p
 /// enum), so an array's element is always a scalar: a MULTI-dimensional array
 /// (`int4[][]`) is structurally unrepresentable here and stays a loud
 /// [`InferError::UnsupportedPgType`], as does an array of an unsupported
-/// element type (`numeric[]`). This mirror enum is the price of keeping
+/// element type (`inet[]`). This mirror enum is the price of keeping
 /// `RustType` `Copy` while making every `match RustType` compiler-forced to
 /// handle the array case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +134,8 @@ pub enum ElemType {
     Json,
     /// `jsonb[]` element.
     Jsonb,
+    /// `numeric[]` element.
+    Numeric,
 }
 
 impl ElemType {
@@ -154,6 +157,7 @@ impl ElemType {
             ElemType::Timestamp => RustType::Timestamp,
             ElemType::Json => RustType::Json,
             ElemType::Jsonb => RustType::Jsonb,
+            ElemType::Numeric => RustType::Numeric,
         }
     }
 
@@ -175,6 +179,7 @@ impl ElemType {
             ElemType::Timestamp => "Vec<Option<bsql::Timestamp>>",
             ElemType::Json => "Vec<Option<bsql::Json>>",
             ElemType::Jsonb => "Vec<Option<bsql::Jsonb>>",
+            ElemType::Numeric => "Vec<Option<bsql::Numeric>>",
         }
     }
 }
@@ -218,6 +223,9 @@ pub enum RustType {
     /// PostgreSQL `jsonb` -> the dep-free `bsql::Jsonb` (version byte +
     /// UTF-8 text on the wire).
     Jsonb,
+    /// PostgreSQL `numeric` / `decimal` -> the dep-free `bsql::Numeric`
+    /// (exact, arbitrary-precision decimal).
+    Numeric,
     /// A one-dimensional PostgreSQL array (`T[]`) of a scalar element ->
     /// `Vec<Option<T>>`. The outer `Vec` is the array; each element is
     /// `Option<T>` because a PG array may always contain NULL elements. The
@@ -247,6 +255,7 @@ impl RustType {
             RustType::Timestamp => "bsql::Timestamp",
             RustType::Json => "bsql::Json",
             RustType::Jsonb => "bsql::Jsonb",
+            RustType::Numeric => "bsql::Numeric",
             RustType::Array(elem) => elem.array_rust_name(),
         }
     }
@@ -272,7 +281,7 @@ fn rust_type_for_pg(pg_type: &str) -> Option<RustType> {
     // if the remaining spelling still ends in `[]` (a multi-dimensional array
     // `int4[][]`), the scalar element map returns `None` and the whole array
     // stays a loud `UnsupportedPgType` — never silently flattened. An array
-    // of an unsupported element (`numeric[]`) is loud for the same reason.
+    // of an unsupported element (`inet[]`) is loud for the same reason.
     if let Some(element) = pg_type.strip_suffix("[]") {
         return scalar_elem_for_pg(element).map(RustType::Array);
     }
@@ -288,7 +297,7 @@ fn rust_type_for_pg(pg_type: &str) -> Option<RustType> {
 /// `uuid`, `json`), and it fires on the native pivot [`RustType`] that type
 /// decodes as. It uses the exact same [`scalar_elem_for_pg`] map the column
 /// inference uses, so a bridge and a column agree on what a canonical type
-/// resolves to. A type with no native pivot (e.g. `numeric`, which is a loud
+/// resolves to. A type with no native pivot (e.g. `inet`, which is a loud
 /// [`InferError::UnsupportedPgType`] as a column) returns `None`: it cannot be
 /// bridged, because there is no native decoded value for the converter to
 /// reshape.
@@ -326,6 +335,9 @@ fn scalar_elem_for_pg(pg_type: &str) -> Option<ElemType> {
         "timestamp" => Some(ElemType::Timestamp),
         "json" => Some(ElemType::Json),
         "jsonb" => Some(ElemType::Jsonb),
+        // `numeric` / `decimal` (alias-collapsed to `numeric` by
+        // `canonical_type`) -> the dep-free exact-decimal `bsql::Numeric`.
+        "numeric" => Some(ElemType::Numeric),
         _ => None,
     }
 }
@@ -2132,7 +2144,7 @@ impl ScopeRelation {
     /// unless this relation sits on the null-extended side of an outer join, in
     /// which case it is nullable — the same `!not_null || outer_nullable` rule
     /// [`resolve_column`](Self::resolve_column) applies, but yielded for an
-    /// UNSUPPORTED-typed column too: a cast over such a column (`numeric_col`
+    /// UNSUPPORTED-typed column too: a cast over such a column (`inet_col`
     /// rescued by `::text`) names a supported output type, so its result's
     /// nullability is the column's nullability even though the column's own
     /// type is unsupported.
@@ -2786,7 +2798,7 @@ impl<'a> ScopeChain<'a> {
     /// is definitive; `None` leaves the caller conservatively nullable (a merge
     /// with an unsupported-typed side, or a reference the existence pass has
     /// already rejected). INDEPENDENT of type support, so a cast that rescues an
-    /// unsupported-typed column (`numeric_col::text`) still carries that
+    /// unsupported-typed column (`inet_col::text`) still carries that
     /// column's nullability. This never errors for the same reason as
     /// [`resolve_unqualified_type`](Self::resolve_unqualified_type): an
     /// absent/ambiguous reference was already rejected loudly by the existence
@@ -9934,6 +9946,7 @@ fn common_type(a: RustType, b: RustType) -> Option<RustType> {
         | RustType::Timestamp
         | RustType::Json
         | RustType::Jsonb
+        | RustType::Numeric
         // Arrays never widen across a merge: two array sides reconcile ONLY
         // when identical (the `a == b` early return above), so an
         // array-vs-scalar or two distinct-element arrays are a loud
@@ -11130,8 +11143,11 @@ fn infer_compound_ident(
 fn infer_literal(value: &Value) -> Result<(RustType, bool), InferError> {
     match value {
         Value::Number(text, _) => {
-            // A fractional / exponent literal has no supported scalar in the
-            // v1 set, so it must be cast. We never silently widen.
+            // A fractional / exponent literal is PostgreSQL `numeric`, whose
+            // wire bytes are NOT IEEE-754; it must carry an explicit cast
+            // (`1.5::numeric` -> the exact `bsql::Numeric`, `1.5::float8` ->
+            // `f64`) rather than being silently mapped to a float. We never
+            // silently widen an unadorned decimal literal.
             if text.contains('.') || text.contains('e') || text.contains('E') {
                 return Err(InferError::CastRequired {
                     what: format!("numeric literal `{text}`"),
@@ -11450,7 +11466,7 @@ fn peel_cast_layers(expr: &Expr) -> &Expr {
 /// Validate that a column/compound reference inside a cast EXISTS in scope,
 /// returning the resolution error if not. Only existence is checked, not
 /// type support: the cast supplies the output type, so casting an
-/// otherwise-unsupported column (`numeric_col::text`) is exactly how a
+/// otherwise-unsupported column (`inet_col::text`) is exactly how a
 /// caller rescues it — rejecting it on the inner type would defeat the
 /// cast. A non-reference expression (literal, fn call, arithmetic) under a
 /// cast is accepted (the cast names the type).
@@ -11496,17 +11512,19 @@ fn infer_function(func: &sqlparser::ast::Function) -> Result<(RustType, bool), I
         // COUNT(*) and COUNT(expr) are always i64 NOT NULL.
         "count" => Ok((RustType::I64, false)),
         // Aggregates over a possibly-empty group: an empty group yields one
-        // NULL row, so the result is nullable. We can confidently type the
-        // numeric ones whose result type is fixed regardless of input:
-        //   * sum/avg over the supported integers widen, but PG's exact
-        //     result type (numeric for sum(int8) etc.) is outside the v1
-        //     set, so we DEMAND a cast rather than guess.
+        // NULL row, so the result is nullable. We only type the ones whose
+        // result type is fixed regardless of the argument's type:
+        //   * sum/avg return DIFFERENT types by input (sum(int2/int4) ->
+        //     int8, sum(int8/numeric) -> numeric, sum(float8) -> float8), and
+        //     pinning that needs the argument's resolved type (scope), which
+        //     this path lacks — so we DEMAND an explicit cast rather than
+        //     guess. This is unrelated to which types bsql supports.
         // MIN/MAX preserve the argument type; bool_and/bool_or -> bool.
         "min" | "max" => infer_minmax(func),
         "bool_and" | "bool_or" | "every" => Ok((RustType::Bool, true)),
-        // Sum/avg/array_agg/string_agg/etc.: result type is not in the v1
-        // supported set (numeric / array / text-with-unknown-null), so a
-        // cast is required to pin it.
+        // Sum/avg/array_agg/string_agg/etc.: the result type depends on the
+        // argument (and can be array / text-with-unknown-null), so a cast is
+        // required to pin it.
         _ => Err(InferError::CastRequired {
             what: format!("function call `{}(…)`", name),
         }),
@@ -16863,12 +16881,23 @@ mod tests {
 
     #[test]
     fn cast_to_unsupported_type_is_loud() {
-        let err = shape(&[USERS], "SELECT age::numeric AS a FROM users")
+        let err = shape(&[USERS], "SELECT age::inet AS a FROM users")
             .expect_err("unsupported cast target");
         match err {
-            InferError::UnsupportedPgType { pg_type, .. } => assert_eq!(pg_type, "numeric"),
+            InferError::UnsupportedPgType { pg_type, .. } => assert_eq!(pg_type, "inet"),
             other => panic!("wrong error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn cast_to_numeric_types_as_numeric() {
+        // `numeric` / `decimal` is a supported column type -> `bsql::Numeric`.
+        // `age` is nullable, and a cast preserves the column's nullability.
+        let s = shape(&[USERS], "SELECT age::numeric AS a FROM users").expect("numeric supported");
+        assert_eq!(s.columns, vec![col("a", RustType::Numeric, true)]);
+        let d =
+            shape(&[USERS], "SELECT age::decimal AS a FROM users").expect("decimal alias supported");
+        assert_eq!(d.columns, vec![col("a", RustType::Numeric, true)]);
     }
 
     // ── cast-required: arithmetic ───────────────────────────────────────
@@ -17229,12 +17258,27 @@ mod tests {
 
     #[test]
     fn unsupported_column_type_is_loud() {
-        let ddl = "CREATE TABLE t (id INT PRIMARY KEY, price NUMERIC NOT NULL)";
-        let err = shape(&[ddl], "SELECT price FROM t").expect_err("numeric unsupported");
+        let ddl = "CREATE TABLE t (id INT PRIMARY KEY, addr INET NOT NULL)";
+        let err = shape(&[ddl], "SELECT addr FROM t").expect_err("inet unsupported");
         match err {
-            InferError::UnsupportedPgType { pg_type, .. } => assert_eq!(pg_type, "numeric"),
+            InferError::UnsupportedPgType { pg_type, .. } => assert_eq!(pg_type, "inet"),
             other => panic!("wrong error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn numeric_column_types_to_numeric() {
+        // `numeric` / `decimal` columns (with or without a precision/scale
+        // typmod) all decode to the dep-free exact `bsql::Numeric`.
+        let ddl = "CREATE TABLE t (id INT PRIMARY KEY, price NUMERIC NOT NULL, qty DECIMAL(10,2))";
+        let s = shape(&[ddl], "SELECT price, qty FROM t").expect("numeric supported");
+        assert_eq!(
+            s.columns,
+            vec![
+                col("price", RustType::Numeric, false),
+                col("qty", RustType::Numeric, true),
+            ],
+        );
     }
 
     // ── dep-free bsql-native type widening ──────────────────────────────
@@ -17329,6 +17373,8 @@ mod tests {
             ("TIMESTAMP WITHOUT TIME ZONE[]", RustType::Array(ElemType::Timestamp)),
             ("JSON[]", RustType::Array(ElemType::Json)),
             ("JSONB[]", RustType::Array(ElemType::Jsonb)),
+            ("NUMERIC[]", RustType::Array(ElemType::Numeric)),
+            ("DECIMAL[]", RustType::Array(ElemType::Numeric)),
         ] {
             let ddl = format!("CREATE TABLE t (id INT PRIMARY KEY, a {decl} NOT NULL)");
             let s = match shape(&[ddl.as_str()], "SELECT a FROM t") {
@@ -17343,10 +17389,10 @@ mod tests {
     fn multidim_and_unsupported_element_arrays_stay_loud() {
         // Fail-closed: a MULTI-dimensional array (element still ends in `[]`
         // after stripping one) and an array of an UNSUPPORTED element
-        // (`numeric[]`) both stay a loud `UnsupportedPgType` — never silently
+        // (`inet[]`) both stay a loud `UnsupportedPgType` — never silently
         // flattened to 1-D or mapped to a scalar.
         for (decl, canonical_array) in [
-            ("NUMERIC[]", "numeric[]"),
+            ("INET[]", "inet[]"),
             ("INT4[][]", "int4[][]"),
             ("TEXT[][]", "text[][]"),
             ("NUMERIC[][]", "numeric[][]"),
@@ -17417,11 +17463,11 @@ mod tests {
     #[test]
     fn still_unsupported_types_stay_loud() {
         // The fail-closed contract holds for types NOT in the widened set:
-        // `date`, `time`, `numeric`, and `interval` are still a loud
-        // `UnsupportedPgType`, never silently mapped.
+        // `date`, `inet`, and `interval` are still a loud `UnsupportedPgType`,
+        // never silently mapped.
         for (ddl, name) in [
             ("CREATE TABLE t (d DATE NOT NULL)", "date"),
-            ("CREATE TABLE t (n NUMERIC NOT NULL)", "numeric"),
+            ("CREATE TABLE t (a INET NOT NULL)", "inet"),
             ("CREATE TABLE t (i INTERVAL NOT NULL)", "interval"),
         ] {
             let err = shape(&[ddl], "SELECT * FROM t");
@@ -17429,7 +17475,7 @@ mod tests {
             let _ = err;
             let col_name = match name {
                 "date" => "d",
-                "numeric" => "n",
+                "inet" => "a",
                 _ => "i",
             };
             let sql = format!("SELECT {col_name} FROM t");

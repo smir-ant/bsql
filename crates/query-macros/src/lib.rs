@@ -486,7 +486,13 @@ fn fixed_width(ty: bsql_build::RustType) -> Option<(usize, i32)> {
         RustType::Timestamptz | RustType::Timestamp => Some((8, 8)),
         // `text` / `bytea` / `json` / `jsonb` are variable-width — no fixed
         // size, decoded on the per-cell path.
-        RustType::Text | RustType::Bytea | RustType::Json | RustType::Jsonb => None,
+        // `numeric` is variable-width (a base-10000 digit-group payload) — no
+        // fixed size, decoded on the per-cell path.
+        RustType::Text
+        | RustType::Bytea
+        | RustType::Json
+        | RustType::Jsonb
+        | RustType::Numeric => None,
         // A 1-D array is variable-width (a length-prefixed header plus
         // per-element bodies) — decoded on the per-cell path.
         RustType::Array(_) => None,
@@ -515,6 +521,7 @@ fn cell_marker(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::Timestamp => quote!(::bsql::__rt::Timestamp),
         RustType::Json => quote!(::bsql::__rt::Json),
         RustType::Jsonb => quote!(::bsql::__rt::Jsonb),
+        RustType::Numeric => quote!(::bsql::__rt::Numeric),
         // A 1-D array decodes through the blanket `Cell<BinaryFmt>` for
         // `Vec<Option<T>>` over the OWNED element type — the array `Vec`
         // allocates regardless, so each element owns its value (`text[]` ->
@@ -547,6 +554,7 @@ fn array_elem_marker(elem: bsql_build::ElemType) -> TokenStream2 {
         ElemType::Timestamp => quote!(::bsql::__rt::Timestamp),
         ElemType::Json => quote!(::bsql::__rt::Json),
         ElemType::Jsonb => quote!(::bsql::__rt::Jsonb),
+        ElemType::Numeric => quote!(::bsql::__rt::Numeric),
     }
 }
 
@@ -613,6 +621,7 @@ fn field_type(ty: bsql_build::RustType, nullable: bool, is_owned: bool) -> Token
         RustType::Timestamp => quote!(::bsql::Timestamp),
         RustType::Json => quote!(::bsql::Json),
         RustType::Jsonb => quote!(::bsql::Jsonb),
+        RustType::Numeric => quote!(::bsql::Numeric),
         // A 1-D array column is `Vec<Option<T>>`: the element `Option<T>`
         // (a PG array element may always be NULL) is INTRINSIC and does not
         // depend on the column's own nullability. Both record twins carry the
@@ -1124,6 +1133,7 @@ fn rust_type_oid(ty: bsql_build::RustType) -> u32 {
         RustType::Timestamp => 1114,
         RustType::Json => 114,
         RustType::Jsonb => 3802,
+        RustType::Numeric => 1700,
         // A 1-D array's parameter OID is the element type's `T[]` array OID.
         // Reached only via a result-column OID (`oid_path`) over a scalar
         // element; a `$N` array param is rejected by inference, so this arm
@@ -1152,6 +1162,7 @@ fn oid_path(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::Timestamp => quote!(::bsql::__rt::oids::TIMESTAMP),
         RustType::Json => quote!(::bsql::__rt::oids::JSON),
         RustType::Jsonb => quote!(::bsql::__rt::oids::JSONB),
+        RustType::Numeric => quote!(::bsql::__rt::oids::NUMERIC),
         // A 1-D array result column's OID is the element type's `T[]` array
         // OID const path — the same const the runtime `ColCellAt` OID resolves
         // to, so the validator cross-check holds.
@@ -1183,6 +1194,7 @@ fn tuple_marker(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::Timestamp => quote!(::bsql::__rt::Timestamp),
         RustType::Json => quote!(::bsql::__rt::Json),
         RustType::Jsonb => quote!(::bsql::__rt::Jsonb),
+        RustType::Numeric => quote!(::bsql::__rt::Numeric),
         // A 1-D array row-tuple marker is `Vec<Option<OwnedElem>>` — its
         // `ColCellAt::OID` is the element's `T[]` array OID, matching the
         // `oid_path` above.
@@ -1227,6 +1239,7 @@ fn array_oid(ty: bsql_build::RustType) -> u32 {
         RustType::Timestamp => 1115,
         RustType::Json => 199,
         RustType::Jsonb => 3807,
+        RustType::Numeric => 1231,
         // An array-of-array has no single element array OID. This arm is
         // structurally dead: every caller passes a SCALAR element (the result
         // path via `elem.as_scalar()`; the `= ANY($N)` param path over a
@@ -1256,6 +1269,7 @@ fn array_oid_path(ty: bsql_build::RustType) -> TokenStream2 {
         RustType::Timestamp => quote!(::bsql::__rt::oids::TIMESTAMP_ARRAY),
         RustType::Json => quote!(::bsql::__rt::oids::JSON_ARRAY),
         RustType::Jsonb => quote!(::bsql::__rt::oids::JSONB_ARRAY),
+        RustType::Numeric => quote!(::bsql::__rt::oids::NUMERIC_ARRAY),
         // Structurally dead (see `array_oid`): a `0u32` fail-closed literal
         // that would fail the validator's OID cross-check rather than bake a
         // plausible-but-wrong array-OID const path.

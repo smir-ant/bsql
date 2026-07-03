@@ -45,7 +45,7 @@ use core::marker::PhantomData;
 
 use crate::decode::{ArrayElement, BinaryFmt, Cell, DecodeError, FormatCode};
 use crate::params::ParamsWriter;
-use crate::pgtypes::{Json, Jsonb, Timestamp, Timestamptz, Uuid};
+use crate::pgtypes::{Json, Jsonb, Numeric, Timestamp, Timestamptz, Uuid};
 
 mod sealed {
     /// Module-private seal for [`super::RowDecode`]. Only the
@@ -103,7 +103,7 @@ mod sealed {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid prepared-query row type",
     label = "valid row types are tuples `()` through `(T1, T2, ..., T16)` where each Ti implements `ColCellAt`",
-    note = "`RowDecode` is sealed — only the crate-internal tuple impls (arity 0..=16) over the supported cell types (`i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `Uuid`, `Timestamptz`, `Timestamp`, `Json`, `Jsonb`, `&'static str`, `&'static [u8]`) can satisfy it; downstream `impl RowDecode for ...` is forbidden by construction"
+    note = "`RowDecode` is sealed — only the crate-internal tuple impls (arity 0..=16) over the supported cell types (`i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `Uuid`, `Timestamptz`, `Timestamp`, `Json`, `Jsonb`, `Numeric`, `&'static str`, `&'static [u8]`) can satisfy it; downstream `impl RowDecode for ...` is forbidden by construction"
 )]
 pub trait RowDecode: sealed::RowDecodeSealed + Sized {
     /// Number of columns this row carries.
@@ -158,7 +158,7 @@ pub trait RowDecode: sealed::RowDecodeSealed + Sized {
 // The attribute below routes them to the supported list directly.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a supported prepared-query row cell type",
-    label = "supported cell types are `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `Uuid`, `Timestamptz`, `Timestamp`, `Json`, `Jsonb`, `&'static str`, and `&'static [u8]` (rendered as `&'a str` / `&'a [u8]` at decode time)",
+    label = "supported cell types are `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `Uuid`, `Timestamptz`, `Timestamp`, `Json`, `Jsonb`, `Numeric`, `&'static str`, and `&'static [u8]` (rendered as `&'a str` / `&'a [u8]` at decode time)",
     note = "`ColCellAt` is sealed — extend the supported set by adding a `col_cell_at_primitive!` invocation in `prepared.rs`; downstream `impl ColCellAt for ...` is forbidden by construction"
 )]
 pub trait ColCellAt<'a>: col_cell_at_sealed::Sealed {
@@ -210,6 +210,13 @@ col_cell_at_primitive!(Uuid, Timestamptz, Timestamp);
 // `col_cell_at_primitive!` shape applies — the macro imposes no `Copy`
 // bound, only `Cell<'a, BinaryFmt>`.
 col_cell_at_primitive!(Json, Jsonb);
+
+// `numeric` is `Box<[u16]>`-backed (owned, arbitrary-precision): `At = Self`,
+// lifetime transparent (the decoder copies the digit groups, so the row value
+// owns its payload). The `col_cell_at_primitive!` shape imposes no `Copy`
+// bound — only `Cell<'a, BinaryFmt>` — so the non-`Copy` `Numeric` is a valid
+// row cell.
+col_cell_at_primitive!(Numeric);
 
 // `&'static str` marker: At = &'a str, lifetime substituted at the
 // decode site.

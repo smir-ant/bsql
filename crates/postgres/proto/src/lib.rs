@@ -203,7 +203,9 @@ pub use decode::{
     RowDesc, RowDescColumnsIter, TextFmt, decode_with_format, oids,
     parse_long_uint_swar, parse_pg_bool_swar, parse_short_uint_swar, validate_utf8_swar,
 };
-pub use pgtypes::{Json, Jsonb, Timestamp, Timestamptz, Uuid, UuidParseError};
+pub use pgtypes::{
+    Json, Jsonb, Numeric, NumericParseError, Timestamp, Timestamptz, Uuid, UuidParseError,
+};
 pub use error::{ErrorKind, ProtocolError, StateErrorKind};
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
 pub use ident::{

@@ -9,7 +9,9 @@
 // does not reach it; the `expect` is the loud connect-failure signal a
 // test wants, not a silent production fallback.
 #![allow(clippy::expect_used, clippy::unwrap_in_result, reason = "test harness — the connection-fixture helper expects a live PG and panics loudly on failure (the intended test signal); it is not a `#[test]` fn so the in-tests carve-out cannot reach it, and there is no production data-fallback path")]
-use bsql_postgres_proto::DecodeError;
+use core::str::FromStr as _;
+
+use bsql_postgres_proto::{DecodeError, Json, Numeric};
 use bsql_postgres_sync::{ColumnError, ConnectConfig, Connection};
 
 fn sync_config() -> ConnectConfig {
@@ -38,6 +40,38 @@ fn connect_and_ping() {
         "server_version should start with the major-version digit, got {version:?}"
     );
     assert!(c.backend_pid() > 0);
+    c.close().expect("close");
+}
+
+/// WITNESS: the RUNTIME-SQL escape hatch binds a NON-`Copy` owned param — a
+/// `Numeric` and a `Json` — exactly as the compile-checked `query!` path does.
+/// Before the runtime path was relaxed off `P: ParamsWriter + Copy`,
+/// `&(numeric,)` was a hard `E0277`; now it compiles and round-trips through
+/// real PG, closing the typed-vs-runtime asymmetry (both borrow the param
+/// tuple to the engine).
+#[test]
+#[ignore = "requires local PG"]
+fn runtime_path_binds_non_copy_params() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    let n = Numeric::from_str("12.3400").expect("numeric parses");
+    let row = c
+        .query_params_one("SELECT $1::numeric AS n", &(n,))
+        .expect("numeric param binds via the runtime path");
+    assert_eq!(row.get_str(0), Ok(Some("12.3400")));
+
+    let j = Json::new(String::from(r#"{"k":1}"#));
+    let row = c
+        .query_params_one("SELECT $1::json AS j", &(j,))
+        .expect("json param binds via the runtime path");
+    assert_eq!(row.get_str(0), Ok(Some(r#"{"k":1}"#)));
+
+    let n2 = Numeric::from_str("1").expect("numeric parses");
+    let affected = c
+        .execute_params("SELECT $1::numeric", &(n2,))
+        .expect("numeric param binds via execute_params");
+    let _ = affected;
+
     c.close().expect("close");
 }
 

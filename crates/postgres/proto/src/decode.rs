@@ -34,7 +34,7 @@
 
 use core::fmt;
 
-use crate::pgtypes::{Json, Jsonb, Timestamp, Timestamptz, Uuid};
+use crate::pgtypes::{Json, Jsonb, Numeric, Timestamp, Timestamptz, Uuid};
 
 /// Maximum columns per result-set. Queries returning more columns
 /// classify as [`crate::ProtocolError::TooManyColumns`] — the
@@ -783,6 +783,41 @@ pub enum DecodeError {
     /// header). Classified rather than yielding a partial / defaulted array or
     /// silently ignoring the surplus.
     ArrayTruncated,
+    /// A binary `numeric` column's payload does not frame EXACTLY. The wire
+    /// form is four `i16` header words (`ndigits`, `weight`, `sign`, `dscale`)
+    /// followed by `ndigits` base-10000 digit groups (two bytes each); this
+    /// covers a body too SHORT for the header or the declared digit count, AND
+    /// a length SURPLUS (trailing bytes past the last digit group). Classified
+    /// rather than yielding a partial or defaulted value — a numeric decode bug
+    /// is silently-wrong money.
+    NumericTruncated,
+    /// A binary `numeric` column's sign word is not one of the recognised
+    /// values (`0x0000` positive, `0x4000` negative, `0xC000` NaN, `0xD000`
+    /// +Infinity, `0xF000` -Infinity). An unknown sign is classified, never
+    /// mapped to a plausible-but-wrong value.
+    NumericInvalidSign {
+        /// The offending sign word from the wire header.
+        sign: u16,
+    },
+    /// A binary `numeric` column carries a base-10000 digit group outside the
+    /// valid range `0..=9999`. Each group must be a four-decimal-digit value; a
+    /// larger group is a malformed / hostile frame, classified rather than
+    /// producing a value with an impossible digit.
+    NumericDigitOutOfRange {
+        /// The offending digit-group value.
+        digit: u16,
+    },
+    /// A binary `numeric` column's display scale carries a bit outside the
+    /// 14-bit range PostgreSQL's wire format permits (`dscale & 0x3FFF !=
+    /// dscale`). PostgreSQL's `numeric_recv` REJECTS such a value ("invalid
+    /// scale in external \"numeric\" value") rather than masking it, so bsql
+    /// classifies it too: a well-formed server never sends a scale beyond
+    /// 16383, and silently masking a hostile high-bit scale would reinterpret
+    /// it into a different (wrong) rendering — a silently-wrong decode.
+    NumericInvalidScale {
+        /// The offending display-scale word from the wire header.
+        dscale: u16,
+    },
 }
 
 // Additive `core::error::Error` impl; matches the crate-wide
@@ -843,6 +878,21 @@ impl fmt::Display for DecodeError {
             Self::ArrayTruncated => {
                 f.write_str("array column payload is truncated or malformed")
             }
+            Self::NumericTruncated => {
+                f.write_str("numeric column payload is truncated or malformed")
+            }
+            Self::NumericInvalidSign { sign } => write!(
+                f,
+                "numeric column sign word {sign:#06x} is not one of 0x0000/0x4000/0xC000/0xD000/0xF000",
+            ),
+            Self::NumericDigitOutOfRange { digit } => write!(
+                f,
+                "numeric column base-10000 digit group {digit} is out of range (must be 0..=9999)",
+            ),
+            Self::NumericInvalidScale { dscale } => write!(
+                f,
+                "numeric column display scale {dscale} exceeds the wire format's 14-bit range (0..=16383)",
+            ),
         }
     }
 }
@@ -1223,7 +1273,7 @@ impl Fmt for BinaryFmt {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be decoded from PG `{F}` bytes",
     label = "the (type, format) pair `({Self}, {F})` is not in the supported decode matrix",
-    note = "the in-crate decode matrix covers `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}`, plus `{{f32, f64, &[u8], Uuid, Timestamptz, Timestamp, Json, Jsonb}}` for `BinaryFmt` only (the binary-uniform wire path); for other types add `impl Cell<'a, F> for {Self}` supplying its `OID` + `decode` (the trait is not sealed)"
+    note = "the in-crate decode matrix covers `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}`, plus `{{f32, f64, &[u8], Uuid, Timestamptz, Timestamp, Json, Jsonb, Numeric}}` for `BinaryFmt` only (the binary-uniform wire path); for other types add `impl Cell<'a, F> for {Self}` supplying its `OID` + `decode` (the trait is not sealed)"
 )]
 pub trait Cell<'a, F: Fmt>: Sized {
     /// PG type OID this (type, format) pair targets. Pinned via
@@ -2180,6 +2230,110 @@ impl Cell<'_, BinaryFmt> for Jsonb {
     }
 }
 
+/// PG binary `numeric` (`src/backend/utils/adt/numeric.c`, `numeric_recv`):
+/// four `i16` header words — `ndigits`, `weight`, `sign`, `dscale` — followed
+/// by `ndigits` base-10000 digit groups (two bytes each, `0..=9999`).
+///
+/// `ndigits` is read as an unsigned count (`u16`): a large value's group count
+/// can exceed `i16::MAX`, and PostgreSQL itself reads it through a `uint16`, so
+/// a signed read would misinterpret a valid huge numeric. The `sign` word
+/// classifies the value (`0x0000` positive, `0x4000` negative, `0xC000` NaN,
+/// `0xD000` +Infinity, `0xF000` -Infinity); an unknown sign, an out-of-range
+/// digit group, and any length surplus / shortfall are classified — a numeric
+/// decode bug is silently-wrong money.
+impl Cell<'_, BinaryFmt> for Numeric {
+    const OID: u32 = oids::NUMERIC;
+    #[inline]
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let (ndigits_be, rest) = bytes
+            .split_first_chunk::<2>()
+            .ok_or(DecodeError::NumericTruncated)?;
+        let ndigits = u16::from_be_bytes(*ndigits_be);
+        let (weight_be, rest) = rest
+            .split_first_chunk::<2>()
+            .ok_or(DecodeError::NumericTruncated)?;
+        let weight = i16::from_be_bytes(*weight_be);
+        let (sign_be, rest) = rest
+            .split_first_chunk::<2>()
+            .ok_or(DecodeError::NumericTruncated)?;
+        let sign = u16::from_be_bytes(*sign_be);
+        let (dscale_be, rest) = rest
+            .split_first_chunk::<2>()
+            .ok_or(DecodeError::NumericTruncated)?;
+        let dscale = u16::from_be_bytes(*dscale_be);
+        // Match `numeric_recv` EXACTLY: it REJECTS a display scale with any bit
+        // outside the 14-bit `NUMERIC_DSCALE_MASK` range ("invalid scale in
+        // external numeric value"), rather than masking it. A well-formed
+        // server never sends such a scale; a hostile high-bit scale is a
+        // classified error, never silently masked into a different rendering.
+        // Applied for every value (finite AND special), as `numeric_recv` does.
+        if dscale & NUMERIC_DSCALE_MASK != dscale {
+            return Err(DecodeError::NumericInvalidScale { dscale });
+        }
+
+        // The non-finite specials carry no digit groups; a trailing body is a
+        // malformed frame (no-swallow), not silently ignored.
+        let negative = match sign {
+            NUMERIC_SIGN_POS => false,
+            NUMERIC_SIGN_NEG => true,
+            NUMERIC_SIGN_NAN | NUMERIC_SIGN_PINF | NUMERIC_SIGN_NINF => {
+                if !rest.is_empty() || ndigits != 0 {
+                    return Err(DecodeError::NumericTruncated);
+                }
+                return Ok(match sign {
+                    NUMERIC_SIGN_NAN => Numeric::nan(),
+                    NUMERIC_SIGN_PINF => Numeric::infinity(),
+                    // The remaining arm is `NUMERIC_SIGN_NINF` — the outer match
+                    // already excluded every other value.
+                    _ => Numeric::neg_infinity(),
+                });
+            }
+            other => return Err(DecodeError::NumericInvalidSign { sign: other }),
+        };
+
+        let n = usize::from(ndigits);
+        // Cap the reservation at the remaining byte count so a hostile
+        // `ndigits` cannot trigger a huge speculative allocation: each group is
+        // two bytes, so there can be no more groups than remaining bytes.
+        let mut digits = alloc::vec::Vec::with_capacity(n.min(rest.len()));
+        let mut cur = rest;
+        for _ in 0..n {
+            let (group_be, next) = cur
+                .split_first_chunk::<2>()
+                .ok_or(DecodeError::NumericTruncated)?;
+            let group = u16::from_be_bytes(*group_be);
+            if group >= NUMERIC_NBASE {
+                return Err(DecodeError::NumericDigitOutOfRange { digit: group });
+            }
+            digits.push(group);
+            cur = next;
+        }
+        // No-swallow: the digit groups must consume the payload EXACTLY.
+        if !cur.is_empty() {
+            return Err(DecodeError::NumericTruncated);
+        }
+        Ok(Numeric::finite(
+            negative,
+            weight,
+            dscale,
+            digits.into_boxed_slice(),
+        ))
+    }
+}
+
+/// The `sign` word values from `src/backend/utils/adt/numeric.h`.
+const NUMERIC_SIGN_POS: u16 = 0x0000;
+const NUMERIC_SIGN_NEG: u16 = 0x4000;
+const NUMERIC_SIGN_NAN: u16 = 0xC000;
+const NUMERIC_SIGN_PINF: u16 = 0xD000;
+const NUMERIC_SIGN_NINF: u16 = 0xF000;
+/// One past the largest base-10000 digit group (`NBASE`).
+const NUMERIC_NBASE: u16 = 10_000;
+/// The 14-bit mask PostgreSQL's `numeric_recv` validates the wire display scale
+/// against (`NUMERIC_DSCALE_MASK`). A scale with any higher bit set is rejected.
+const NUMERIC_DSCALE_MASK: u16 = 0x3FFF;
+const _: () = assert!(NUMERIC_DSCALE_MASK == 16383);
+
 // ════════════════════════════════════════════════════════════════════
 // One-dimensional array decoders — `T[]` decoding to `Vec<Option<T>>`.
 // ════════════════════════════════════════════════════════════════════
@@ -2366,6 +2520,7 @@ impl_array_element_value!(
     Timestamp => oids::TIMESTAMP_ARRAY,
     Json => oids::JSON_ARRAY,
     Jsonb => oids::JSONB_ARRAY,
+    Numeric => oids::NUMERIC_ARRAY,
 );
 
 /// `text[]` element — the owned `String` peer of the borrowed `&str` scalar
@@ -2411,6 +2566,7 @@ const _: () = {
     assert!(<alloc::vec::Vec<Option<Timestamp>> as Cell<BinaryFmt>>::OID == oids::TIMESTAMP_ARRAY);
     assert!(<alloc::vec::Vec<Option<Json>> as Cell<BinaryFmt>>::OID == oids::JSON_ARRAY);
     assert!(<alloc::vec::Vec<Option<Jsonb>> as Cell<BinaryFmt>>::OID == oids::JSONB_ARRAY);
+    assert!(<alloc::vec::Vec<Option<Numeric>> as Cell<BinaryFmt>>::OID == oids::NUMERIC_ARRAY);
     assert!(<alloc::vec::Vec<Option<alloc::string::String>> as Cell<BinaryFmt>>::OID == oids::TEXT_ARRAY);
     assert!(<alloc::vec::Vec<Option<alloc::vec::Vec<u8>>> as Cell<BinaryFmt>>::OID == oids::BYTEA_ARRAY);
     // Element-OID (wire header check) ≡ borrowed scalar peer's Cell OID.
@@ -2447,6 +2603,7 @@ const _: () = {
     assert!(<Timestamp as Cell<BinaryFmt>>::OID == oids::TIMESTAMP);
     assert!(<Json as Cell<BinaryFmt>>::OID == oids::JSON);
     assert!(<Jsonb as Cell<BinaryFmt>>::OID == oids::JSONB);
+    assert!(<Numeric as Cell<BinaryFmt>>::OID == oids::NUMERIC);
     // Text↔binary OID symmetry: the same Rust type MUST target the
     // same PG type OID across text and binary decoders. A refactor
     // that skewed one against the other would mean the same Rust
@@ -2532,7 +2689,7 @@ where
 /// impls for their own types.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not implement `EncodeBinary` (cannot encode to PG binary format)",
-    label = "supported binary-encode types are `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `&str`, `&[u8]`, `Uuid`, `Timestamptz`, `Timestamp`, `Json`, `Jsonb` (and, for the scalar wire types, their one-dimensional `&[T]` array forms)",
+    label = "supported binary-encode types are `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `&str`, `&[u8]`, `Uuid`, `Timestamptz`, `Timestamp`, `Json`, `Jsonb`, `Numeric` (and, for the scalar wire types, their one-dimensional `&[T]` array forms)",
     note = "`EncodeBinary` is sealed — extend by adding `impl EncodeBinary for ...` for the new type in `decode.rs` after extending the supported-OID matrix; downstream `impl EncodeBinary for ...` is forbidden by construction"
 )]
 pub trait EncodeBinary: sealed::EncodeBinarySealed {
@@ -2717,6 +2874,51 @@ impl EncodeBinary for Jsonb {
     }
 }
 
+/// `numeric` encoder — the four `i16` header words then the base-10000 digit
+/// groups, the exact inverse of the [`Cell<BinaryFmt>`](Cell) decoder above, so
+/// a value round-trips bit-for-bit. `ndigits` is written as `u16` (PostgreSQL
+/// reads it through a `uint16`), `weight` as `i16`, and `sign` / `dscale` as
+/// their wire words derived from the value's classification.
+impl sealed::EncodeBinarySealed for Numeric {}
+impl EncodeBinary for Numeric {
+    const OID: u32 = oids::NUMERIC;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        let digits = self.base_10000_digits();
+        // A group count past `u16::MAX` cannot be wire-encoded; that is a loud
+        // `Err` (fail-closed), never a wrapped count. A `FromStr` / decoded
+        // value can never reach it (its `weight` overflows `i16` first), so
+        // this landing pad is dead in practice.
+        let ndigits =
+            u16::try_from(digits.len()).map_err(|_| crate::write_buf::WriteBufFull)?;
+        let sign: u16 = if self.is_nan() {
+            NUMERIC_SIGN_NAN
+        } else if self.is_infinite() {
+            if self.is_negative() {
+                NUMERIC_SIGN_NINF
+            } else {
+                NUMERIC_SIGN_PINF
+            }
+        } else if self.is_negative() {
+            NUMERIC_SIGN_NEG
+        } else {
+            NUMERIC_SIGN_POS
+        };
+        dst.push_u16_be(ndigits)?;
+        dst.push_i16_be(self.weight())?;
+        dst.push_u16_be(sign)?;
+        // `dscale` is `0..=16383`, so its `u16` bytes are exactly the `i16`
+        // dscale PostgreSQL reads (it never sets a sign bit).
+        dst.push_u16_be(self.scale())?;
+        for &group in digits {
+            dst.push_u16_be(group)?;
+        }
+        Ok(())
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════
 // One-dimensional array encoders — the wire form of a single array
 // parameter passed to a `col = ANY($N)` in-list.
@@ -2805,6 +3007,7 @@ impl_encode_binary_array!(
     bool => oids::BOOL_ARRAY,
     f32 => oids::FLOAT4_ARRAY,
     f64 => oids::FLOAT8_ARRAY,
+    Numeric => oids::NUMERIC_ARRAY,
 );
 
 /// `text[]` array of borrowed strings. Each element is the same UTF-8
@@ -2849,6 +3052,7 @@ const _: () = {
     assert!(<&[f32] as EncodeBinary>::OID == oids::FLOAT4_ARRAY);
     assert!(<&[f64] as EncodeBinary>::OID == oids::FLOAT8_ARRAY);
     assert!(<&[&[u8]] as EncodeBinary>::OID == oids::BYTEA_ARRAY);
+    assert!(<&[Numeric] as EncodeBinary>::OID == oids::NUMERIC_ARRAY);
 };
 
 // Drift-pins: every EncodeBinary impl's OID matches the
@@ -2870,6 +3074,7 @@ const _: () = {
     assert!(<Timestamp as EncodeBinary>::OID == oids::TIMESTAMP);
     assert!(<Json as EncodeBinary>::OID == oids::JSON);
     assert!(<Jsonb as EncodeBinary>::OID == oids::JSONB);
+    assert!(<Numeric as EncodeBinary>::OID == oids::NUMERIC);
     // Cross-trait symmetry (encode OID ≡ binary-decode OID ≡ catalog OID).
     assert!(<i16 as EncodeBinary>::OID == <i16 as Cell<BinaryFmt>>::OID);
     assert!(<i32 as EncodeBinary>::OID == <i32 as Cell<BinaryFmt>>::OID);
@@ -2885,6 +3090,7 @@ const _: () = {
     assert!(<Timestamp as EncodeBinary>::OID == <Timestamp as Cell<BinaryFmt>>::OID);
     assert!(<Json as EncodeBinary>::OID == <Json as Cell<BinaryFmt>>::OID);
     assert!(<Jsonb as EncodeBinary>::OID == <Jsonb as Cell<BinaryFmt>>::OID);
+    assert!(<Numeric as EncodeBinary>::OID == <Numeric as Cell<BinaryFmt>>::OID);
 };
 
 /// PostgreSQL built-in type OID constants for the subset the
@@ -2939,6 +3145,8 @@ pub mod oids {
     pub const UUID: u32 = 2950;
     /// `jsonb` — binary JSON (leading version byte + text).
     pub const JSONB: u32 = 3802;
+    /// `numeric` / `decimal` — arbitrary-precision exact decimal.
+    pub const NUMERIC: u32 = 1700;
 
     // ── Array (`T[]`) type OIDs, for a single array parameter sent to a
     //    `col = ANY($N)` in-list. Each is the `typarray` of the matching
@@ -2974,6 +3182,8 @@ pub mod oids {
     pub const JSONB_ARRAY: u32 = 3807;
     /// `uuid[]` (`_uuid`).
     pub const UUID_ARRAY: u32 = 2951;
+    /// `numeric[]` (`_numeric`).
+    pub const NUMERIC_ARRAY: u32 = 1231;
 
     // Tier-1 compile drift-pin against the canonical PG catalog
     // (src/include/catalog/pg_type.dat). A typo in any constant
@@ -2997,6 +3207,7 @@ pub mod oids {
         assert!(JSON == 114, "oids::JSON drift from pg_type.dat");
         assert!(UUID == 2950, "oids::UUID drift from pg_type.dat");
         assert!(JSONB == 3802, "oids::JSONB drift from pg_type.dat");
+        assert!(NUMERIC == 1700, "oids::NUMERIC drift from pg_type.dat");
         // Array OIDs, verified against `pg_type` (`typname` -> `typarray`)
         // on PostgreSQL 15.
         assert!(BOOL_ARRAY == 1000, "oids::BOOL_ARRAY drift from pg_type.dat");
@@ -3013,6 +3224,7 @@ pub mod oids {
         assert!(JSON_ARRAY == 199, "oids::JSON_ARRAY drift from pg_type.dat");
         assert!(JSONB_ARRAY == 3807, "oids::JSONB_ARRAY drift from pg_type.dat");
         assert!(UUID_ARRAY == 2951, "oids::UUID_ARRAY drift from pg_type.dat");
+        assert!(NUMERIC_ARRAY == 1231, "oids::NUMERIC_ARRAY drift from pg_type.dat");
     };
 }
 
@@ -4862,6 +5074,166 @@ mod semantic_type_decode_tests {
             <Jsonb as Cell<BinaryFmt>>::decode(&[0x01, b'{', b'}']),
             Ok(ref v) if v.as_str() == "{}"
         ));
+    }
+}
+
+#[cfg(test)]
+mod numeric_wire_tests {
+    //! `numeric` binary wire round-trip + byte-layout + bad-path classification.
+    //! Precision-critical: a numeric decode bug is silently-wrong money, so the
+    //! encode/decode identity is proven for a WIDE battery (including
+    //! arbitrary-precision past `i128`, `NaN`, `±Infinity`), the decode is
+    //! pinned against hand-built PostgreSQL wire bytes (not just self-consistent
+    //! with the encoder), and every malformed frame is a specific classified
+    //! `DecodeError`, never a panic or silent value.
+    extern crate alloc;
+    use super::{BinaryFmt, Cell, DecodeError, EncodeBinary};
+    use crate::pgtypes::Numeric;
+    use crate::write_buf::WriteBuf;
+    use alloc::string::ToString as _;
+    use alloc::vec::Vec;
+    use core::str::FromStr as _;
+
+    /// Encode a `Numeric` to its binary wire bytes.
+    fn encode(n: &Numeric) -> Vec<u8> {
+        let mut buf = WriteBuf::new();
+        assert!(n.encode_to(&mut buf).is_ok(), "encode fits the buffer");
+        buf.as_bytes().to_vec()
+    }
+
+    /// Every battery value survives encode -> decode as the IDENTITY, and the
+    /// decoded value renders the same string — the bit-exact round-trip proof,
+    /// dependency-free.
+    #[test]
+    fn encode_decode_round_trips_identity() {
+        for s in [
+            "0",
+            "1",
+            "-1",
+            "0.1",
+            "0.0001",
+            "3.14159265358979323846",
+            "1.500",
+            "0.000",
+            "-123456789012345678901234567890", // > i128 magnitude
+            "9999999999999999999999999999999999999999.0001",
+            "100000001", // interior zero group
+            "NaN",
+            "Infinity",
+            "-Infinity",
+        ] {
+            let original = Numeric::from_str(s).expect("battery value parses");
+            let bytes = encode(&original);
+            let decoded =
+                <Numeric as Cell<BinaryFmt>>::decode(&bytes).expect("wire bytes decode");
+            assert_eq!(decoded, original, "round-trip identity failed for {s}");
+            assert_eq!(decoded.to_string(), s, "round-trip display failed for {s}");
+        }
+    }
+
+    /// Decode is pinned against HAND-BUILT PostgreSQL wire bytes (`1.5` =
+    /// ndigits 2, weight 0, sign 0x0000, dscale 1, digits [1, 5000]) — proving
+    /// the byte layout matches `numeric_send`, not merely the encoder.
+    #[test]
+    fn decode_matches_hand_built_pg_bytes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u16.to_be_bytes()); // ndigits
+        bytes.extend_from_slice(&0i16.to_be_bytes()); // weight
+        bytes.extend_from_slice(&0x0000u16.to_be_bytes()); // sign = positive
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // dscale
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // digit group 0
+        bytes.extend_from_slice(&5000u16.to_be_bytes()); // digit group 1
+        let decoded = <Numeric as Cell<BinaryFmt>>::decode(&bytes).expect("decodes");
+        assert_eq!(decoded.to_string(), "1.5");
+        assert_eq!(decoded, Numeric::from_str("1.5").expect("parses"));
+    }
+
+    /// The special sign words decode to the correct non-finite value.
+    #[test]
+    fn decode_specials() {
+        for (sign, expected) in [
+            (0xC000u16, Numeric::nan()),
+            (0xD000u16, Numeric::infinity()),
+            (0xF000u16, Numeric::neg_infinity()),
+        ] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&0u16.to_be_bytes()); // ndigits = 0
+            bytes.extend_from_slice(&0i16.to_be_bytes()); // weight
+            bytes.extend_from_slice(&sign.to_be_bytes());
+            bytes.extend_from_slice(&0u16.to_be_bytes()); // dscale
+            let decoded = <Numeric as Cell<BinaryFmt>>::decode(&bytes).expect("decodes");
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    /// Every malformed frame is a CLASSIFIED error, never a panic or a value
+    /// with an impossible digit.
+    #[test]
+    fn decode_bad_paths_classified() {
+        // Too short for the 8-byte header.
+        assert!(matches!(
+            <Numeric as Cell<BinaryFmt>>::decode(&[0, 0, 0, 0, 0]),
+            Err(DecodeError::NumericTruncated)
+        ));
+        // Unknown sign word.
+        let mut bad_sign = Vec::new();
+        bad_sign.extend_from_slice(&0u16.to_be_bytes());
+        bad_sign.extend_from_slice(&0i16.to_be_bytes());
+        bad_sign.extend_from_slice(&0x1234u16.to_be_bytes());
+        bad_sign.extend_from_slice(&0u16.to_be_bytes());
+        assert!(matches!(
+            <Numeric as Cell<BinaryFmt>>::decode(&bad_sign),
+            Err(DecodeError::NumericInvalidSign { sign: 0x1234 })
+        ));
+        // A digit group >= 10000.
+        let mut bad_digit = Vec::new();
+        bad_digit.extend_from_slice(&1u16.to_be_bytes()); // ndigits = 1
+        bad_digit.extend_from_slice(&0i16.to_be_bytes());
+        bad_digit.extend_from_slice(&0u16.to_be_bytes());
+        bad_digit.extend_from_slice(&0u16.to_be_bytes());
+        bad_digit.extend_from_slice(&10_000u16.to_be_bytes()); // out of range
+        assert!(matches!(
+            <Numeric as Cell<BinaryFmt>>::decode(&bad_digit),
+            Err(DecodeError::NumericDigitOutOfRange { digit: 10_000 })
+        ));
+        // Trailing surplus past the declared digit groups (no-swallow).
+        let mut surplus = Vec::new();
+        surplus.extend_from_slice(&0u16.to_be_bytes()); // ndigits = 0
+        surplus.extend_from_slice(&0i16.to_be_bytes());
+        surplus.extend_from_slice(&0u16.to_be_bytes());
+        surplus.extend_from_slice(&0u16.to_be_bytes());
+        surplus.extend_from_slice(&0xABu16.to_be_bytes()); // one group too many
+        assert!(matches!(
+            <Numeric as Cell<BinaryFmt>>::decode(&surplus),
+            Err(DecodeError::NumericTruncated)
+        ));
+    }
+
+    /// A display scale with a bit above the 14-bit `NUMERIC_DSCALE_MASK` range
+    /// is REJECTED, exactly as PostgreSQL's `numeric_recv` does ("invalid scale
+    /// in external numeric value") — never silently masked into a different
+    /// rendering. `0x8001` has the high bit set, so it is classified rather than
+    /// stored verbatim (which would render 32769 fractional digits) or masked to
+    /// `0x0001` (which would silently accept a frame PG rejects).
+    #[test]
+    fn decode_rejects_high_bit_dscale() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // ndigits = 1
+        bytes.extend_from_slice(&0i16.to_be_bytes()); // weight
+        bytes.extend_from_slice(&0x0000u16.to_be_bytes()); // sign = positive
+        bytes.extend_from_slice(&0x8001u16.to_be_bytes()); // dscale, high bit set
+        bytes.extend_from_slice(&5u16.to_be_bytes()); // one digit group
+        assert!(matches!(
+            <Numeric as Cell<BinaryFmt>>::decode(&bytes),
+            Err(DecodeError::NumericInvalidScale { dscale: 0x8001 })
+        ));
+        // The largest in-range scale (16383) is accepted.
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&0u16.to_be_bytes()); // ndigits = 0 (zero value)
+        ok.extend_from_slice(&0i16.to_be_bytes());
+        ok.extend_from_slice(&0x0000u16.to_be_bytes());
+        ok.extend_from_slice(&0x3FFFu16.to_be_bytes()); // dscale = 16383
+        assert!(<Numeric as Cell<BinaryFmt>>::decode(&ok).is_ok());
     }
 }
 

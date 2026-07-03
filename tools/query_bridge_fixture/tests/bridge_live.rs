@@ -20,7 +20,7 @@
     reason = "live test harness — expect/unwrap surface failures loudly; not production fallbacks"
 )]
 
-use bsql_query_bridge_fixture::bridge::MyTs;
+use bsql_query_bridge_fixture::bridge::{MyDecimal, MyTs};
 
 // A `timestamptz` at the PostgreSQL epoch (2000-01-01 00:00:00 UTC) -> 0 raw
 // micros -> the bridged `MyTs(0)`.
@@ -33,6 +33,9 @@ bsql::query!(
     LiveUuid,
     "SELECT '01234567-89ab-cdef-fedc-ba9876543210'::uuid AS id"
 );
+// A `numeric` literal -> the bridged `MyDecimal` holding the exact decimal
+// text, proving the arbitrary-precision pivot bridges through real wire bytes.
+bsql::query!(LiveNumeric, "SELECT '1234.5600'::numeric AS amount");
 
 const EXPECTED_UUID: [u8; 16] = [
     0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
@@ -57,6 +60,11 @@ fn sync_bridged_columns_round_trip() {
     let id_row = c.query_one::<LiveUuidQuery>(()).expect("query_one LiveUuid");
     let id: uuid::Uuid = id_row.id;
     assert_eq!(id, uuid::Uuid::from_bytes(EXPECTED_UUID));
+
+    // `numeric` -> the dep-free `MyDecimal` target, exact decimal text.
+    let amt = c.query_one::<LiveNumericQuery>(()).expect("query_one LiveNumeric");
+    let amount: MyDecimal = amt.amount;
+    assert_eq!(amount, MyDecimal("1234.5600".to_string()), "numeric -> exact MyDecimal");
 
     c.close().expect("close");
 }
@@ -84,6 +92,13 @@ async fn async_bridged_columns_round_trip() {
         .expect("query_one LiveUuid");
     let id: uuid::Uuid = id_row.id;
     assert_eq!(id, uuid::Uuid::from_bytes(EXPECTED_UUID));
+
+    let amt = c
+        .query_one::<LiveNumericQuery>(())
+        .await
+        .expect("query_one LiveNumeric");
+    let amount: MyDecimal = amt.amount;
+    assert_eq!(amount, MyDecimal("1234.5600".to_string()), "numeric -> exact MyDecimal");
 
     c.close().await.expect("close");
 }

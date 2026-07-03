@@ -522,10 +522,11 @@ impl Connection {
 
     /// Execute a prepared statement returning rows.
     ///
-    /// The `Copy` bound is vacuous: every `ParamsWriter` is a tuple of `Copy`
-    /// scalars / `&str` / slices, so this excludes no caller; it lets the
-    /// borrowed params be passed to the engine by value with no clone.
-    pub async fn query_prepared<P: ParamsWriter + Copy>(
+    /// The params are borrowed all the way to the engine (which serialises them
+    /// through `ParamsWriter::write_params` by reference), so a non-`Copy`
+    /// owned param — a `Numeric`, a `Json` / `Jsonb`, a `String` — binds here
+    /// exactly as it does through the compile-checked `query!` path.
+    pub async fn query_prepared<P: ParamsWriter>(
         &mut self,
         stmt: &PreparedStatement,
         params: &P,
@@ -534,7 +535,7 @@ impl Connection {
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .query_prepared(live, &stmt.inner, *params, capture_notify(&mut self.notifications, |s| {
+            .query_prepared(live, &stmt.inner, params, capture_notify(&mut self.notifications, |s| {
                 collector.feed(s);
                 ControlFlow::Continue(())
             }))
@@ -544,8 +545,10 @@ impl Connection {
     }
 
     /// Execute a prepared statement for its side effect, returning the affected
-    /// count. See [`query_prepared`](Self::query_prepared) on the `Copy` bound.
-    pub async fn execute_prepared<P: ParamsWriter + Copy>(
+    /// count. Params are borrowed to the engine (see
+    /// [`query_prepared`](Self::query_prepared)), so a non-`Copy` owned param
+    /// binds here too.
+    pub async fn execute_prepared<P: ParamsWriter>(
         &mut self,
         stmt: &PreparedStatement,
         params: &P,
@@ -554,7 +557,7 @@ impl Connection {
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .execute_prepared(live, &stmt.inner, *params, capture_notify(&mut self.notifications, |s| {
+            .execute_prepared(live, &stmt.inner, params, capture_notify(&mut self.notifications, |s| {
                 collector.feed(s);
                 ControlFlow::Continue(())
             }))
@@ -834,7 +837,7 @@ impl Connection {
     }
 
     /// Prepare, query, and close a runtime SQL statement with params.
-    pub async fn query_params<P: ParamsWriter + Copy>(
+    pub async fn query_params<P: ParamsWriter>(
         &mut self,
         sql: &str,
         params: &P,
@@ -852,7 +855,7 @@ impl Connection {
     }
 
     /// Like [`query_params`](Self::query_params), returning the first row.
-    pub async fn query_params_one<P: ParamsWriter + Copy>(
+    pub async fn query_params_one<P: ParamsWriter>(
         &mut self,
         sql: &str,
         params: &P,
@@ -866,7 +869,7 @@ impl Connection {
     }
 
     /// Like [`query_params`](Self::query_params), returning the first row if any.
-    pub async fn query_params_opt<P: ParamsWriter + Copy>(
+    pub async fn query_params_opt<P: ParamsWriter>(
         &mut self,
         sql: &str,
         params: &P,
@@ -875,7 +878,7 @@ impl Connection {
     }
 
     /// Prepare, execute, and close a runtime SQL statement with params.
-    pub async fn execute_params<P: ParamsWriter + Copy>(
+    pub async fn execute_params<P: ParamsWriter>(
         &mut self,
         sql: &str,
         params: &P,

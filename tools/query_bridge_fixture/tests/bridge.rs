@@ -16,7 +16,7 @@
 //! wrong OID would be an `error[E0080]` (the guarantee rides the native pivot,
 //! untouched by the bridge).
 
-use bsql_query_bridge_fixture::bridge::MyTs;
+use bsql_query_bridge_fixture::bridge::{MyDecimal, MyTs};
 
 // All-fixed-width, all-NOT-NULL, BOTH columns bridged: `id` (uuid, 16 bytes)
 // and `created` (timestamptz, 8 bytes). This exercises the vectorized fast path
@@ -31,6 +31,12 @@ bsql::query!(
     FullRow,
     "SELECT id, created, updated, tstamps, label FROM events"
 );
+
+// The numeric-bridged columns: scalar (`amount` -> MyDecimal), nullable
+// (`refund` -> Option<MyDecimal>), and array-element (`rates` ->
+// Vec<Option<MyDecimal>>). Proves the variable-width, arbitrary-precision
+// `bsql::Numeric` pivot reshapes into the consumer's decimal type.
+bsql::query!(Decimals, "SELECT amount, refund, rates FROM events");
 
 // ── compile-time FIELD-TYPE assertions ──────────────────────────────────
 // Each binding type-checks only because the emitted field type is the BARE
@@ -49,6 +55,13 @@ fn _field_types_full_row(r: FullRowOwned) {
     let _updated: Option<MyTs> = r.updated;
     let _tstamps: Vec<Option<MyTs>> = r.tstamps;
     let _label: String = r.label;
+}
+
+#[allow(dead_code, reason = "compile-time type witnesses; never called")]
+fn _field_types_decimals(r: DecimalsOwned) {
+    let _amount: MyDecimal = r.amount;
+    let _refund: Option<MyDecimal> = r.refund;
+    let _rates: Vec<Option<MyDecimal>> = r.rates;
 }
 
 // ── byte builders ────────────────────────────────────────────────────────
@@ -174,4 +187,68 @@ fn null_in_not_null_bridged_column_is_still_classified() {
 fn oid_validator_runs_with_bridges_present() {
     let _two = TwoFixedQuery::PREPARED;
     let _full = FullRowQuery::PREPARED;
+    let _dec = DecimalsQuery::PREPARED;
+}
+
+// ── numeric bridge witnesses ─────────────────────────────────────────────
+
+/// A `numeric` binary wire payload: `ndigits · weight · sign · dscale` then the
+/// base-10000 digit groups.
+fn numeric(weight: i16, sign: u16, dscale: u16, digits: &[u16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(digits.len() as u16).to_be_bytes());
+    out.extend_from_slice(&weight.to_be_bytes());
+    out.extend_from_slice(&sign.to_be_bytes());
+    out.extend_from_slice(&dscale.to_be_bytes());
+    for &d in digits {
+        out.extend_from_slice(&d.to_be_bytes());
+    }
+    out
+}
+
+/// A 1-D `numeric[]` binary array payload (`None` = a NULL element).
+fn numeric_array(elems: &[Option<Vec<u8>>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&i32be(1)); // ndim
+    out.extend_from_slice(&i32be(0)); // flags
+    out.extend_from_slice(&i32be(1700)); // element OID = numeric
+    out.extend_from_slice(&i32be(elems.len() as i32));
+    out.extend_from_slice(&i32be(1)); // lower bound
+    for elem in elems {
+        match elem {
+            Some(body) => out.extend_from_slice(&cell(body)),
+            None => out.extend_from_slice(&i32be(-1)),
+        }
+    }
+    out
+}
+
+#[test]
+fn numeric_columns_decode_into_the_bridged_decimal() {
+    // amount = 1.50, refund = NULL, rates = { 0.0001, NULL, 100 }.
+    let amount = numeric(0, 0x0000, 2, &[1, 5000]); // 1.50
+    let rate_a = numeric(-1, 0x0000, 4, &[1]); // 0.0001
+    let rate_c = numeric(0, 0x0000, 0, &[100]); // 100
+    let rates = numeric_array(&[Some(rate_a), None, Some(rate_c)]);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&(3i16).to_be_bytes()); // 3 columns
+    body.extend_from_slice(&cell(&amount)); // amount (NOT NULL)
+    body.extend_from_slice(&i32be(-1)); // refund = SQL NULL
+    body.extend_from_slice(&cell(&rates)); // rates
+
+    let row = DecimalsOwned::decode(&body).expect("decodes");
+    // The BARE target type, exact decimal text reshaped by the converter.
+    assert_eq!(row.amount, MyDecimal("1.50".to_string()));
+    // Nullable bridged column: SQL NULL -> None.
+    assert_eq!(row.refund, None);
+    // Array-element bridge: the converter is applied per present element.
+    assert_eq!(
+        row.rates,
+        vec![
+            Some(MyDecimal("0.0001".to_string())),
+            None,
+            Some(MyDecimal("100".to_string())),
+        ],
+    );
 }

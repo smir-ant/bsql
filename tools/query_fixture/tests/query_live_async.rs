@@ -17,8 +17,9 @@
 )]
 
 use core::ops::ControlFlow;
+use core::str::FromStr as _;
 
-use bsql::{Timestamptz, Uuid};
+use bsql::{Numeric, Timestamptz, Uuid};
 use bsql_postgres_async::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 bsql::query!(One, "SELECT 1::int4 AS n");
@@ -90,6 +91,11 @@ bsql::query!(IntArrayLit, "SELECT ARRAY[10, NULL, 30]::int4[] AS xs");
 bsql::query!(TextArrayLit, "SELECT ARRAY['a', NULL, 'c']::text[] AS xs");
 bsql::query!(NullArrayLit, "SELECT NULL::int4[] AS xs");
 bsql::query!(EmptyArrayLit, "SELECT ARRAY[]::int4[] AS xs");
+
+// ── exact numeric / decimal (see the sync twin) ──────────────────────────
+bsql::query!(EchoNum, "SELECT $1::numeric AS n");
+bsql::query!(EchoNumText, "SELECT $1::numeric::text AS t");
+bsql::query!(NumArrayLit, "SELECT '{1.5,NULL,100}'::numeric[] AS xs");
 
 fn async_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -679,6 +685,102 @@ async fn typed_json_and_jsonb_columns_round_trip() {
     assert_eq!(j.j.as_str(), r#"{"k":1}"#);
     let jb = c.query_one::<JsonbLitQuery>(()).await.expect("query_one JsonbLit");
     assert_eq!(jb.j.as_str(), "[1, 2, 3]");
+    c.close().await.expect("close");
+}
+
+/// PRECISION BATTERY (numeric, async twin): the exact decimal battery binds a
+/// `FromStr`-constructed `bsql::Numeric` param, round-trips through REAL PG, and
+/// decodes to the exact string == `Display` == PG's `$1::numeric::text` oracle.
+/// See the sync twin for the full rationale (a wrong digit is silent-wrong
+/// money; values past `i128` prove arbitrary precision).
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_numeric_precision_battery() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    for s in [
+        "0",
+        "1",
+        "-1",
+        "0.1",
+        "0.0001",
+        "3.14159265358979323846",
+        "1.500",
+        "100.00",
+        "123456789012345678901234567890123456789012345678901234567890",
+        "-99999999999999999999999999999999999999999999.000001",
+        "NaN",
+    ] {
+        let n = Numeric::from_str(s).expect("battery value parses");
+        let echoed = c
+            .query_one::<EchoNumQuery>((n.clone(),))
+            .await
+            .expect("echo numeric");
+        let oracle = c
+            .query_one::<EchoNumTextQuery>((n.clone(),))
+            .await
+            .expect("pg ::text oracle");
+        assert_eq!(echoed.n.to_string(), s, "decode Display == expected for `{s}`");
+        assert_eq!(
+            echoed.n.to_string(),
+            oracle.t,
+            "decode Display == PG ::text for `{s}`",
+        );
+        assert_eq!(echoed.n, n, "decoded value equals the bound value for `{s}`");
+    }
+    c.close().await.expect("close");
+}
+
+/// PRECISION BATTERY (specials, async twin): `±Infinity` round-trip; a pre-14
+/// server's loud `DbError` is a skip, never a false pass.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_numeric_infinity_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    for (value, text) in [
+        (Numeric::infinity(), "Infinity"),
+        (Numeric::neg_infinity(), "-Infinity"),
+    ] {
+        match c.query_one::<EchoNumQuery>((value.clone(),)).await {
+            Ok(echoed) => {
+                assert_eq!(echoed.n, value, "{text} round-trips exactly");
+                assert_eq!(echoed.n.to_string(), text);
+                let oracle = c
+                    .query_one::<EchoNumTextQuery>((value.clone(),))
+                    .await
+                    .expect("pg ::text oracle");
+                assert_eq!(oracle.t, text, "PG ::text renders {text}");
+            }
+            Err(DriverError::Db(_)) => {
+                c = Connection::connect(&async_config())
+                    .await
+                    .expect("reconnect after skip");
+            }
+            Err(other) => panic!("unexpected error binding {text}: {other:?}"),
+        }
+    }
+    c.close().await.expect("close");
+}
+
+/// ARRAYS (numeric, async twin): a real `numeric[]` with a NULL middle element
+/// decodes to `Vec<Option<bsql::Numeric>>` with exact values.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_numeric_array_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    let row = c
+        .query_one::<NumArrayLitQuery>(())
+        .await
+        .expect("query_one NumArrayLit");
+    let rendered: Vec<Option<String>> = row
+        .xs
+        .iter()
+        .map(|e| e.as_ref().map(ToString::to_string))
+        .collect();
+    assert_eq!(
+        rendered,
+        vec![Some("1.5".to_string()), None, Some("100".to_string())],
+        "numeric[] decodes exact values with a NULL element",
+    );
     c.close().await.expect("close");
 }
 

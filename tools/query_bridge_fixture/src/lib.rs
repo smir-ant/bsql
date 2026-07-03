@@ -1,6 +1,6 @@
 //! Fixture consumer for the external-type bridge.
 //!
-//! This crate's `build.rs` registers two bridges (see it), keyed on canonical
+//! This crate's `build.rs` registers three bridges (see it), keyed on canonical
 //! PostgreSQL types, whose targets and converters this module provides. A
 //! consumer wires the bridge ONCE (in `build.rs` + these free functions) and
 //! then EVERY `query!` across the crate decodes the bridged columns into the
@@ -34,5 +34,24 @@ pub mod bridge {
     #[must_use]
     pub fn to_uuid(v: bsql::Uuid) -> uuid::Uuid {
         uuid::Uuid::from_bytes(*v.as_bytes())
+    }
+
+    /// A dep-free stand-in for an external decimal type (e.g. what
+    /// `rust_decimal::Decimal` / `bigdecimal::BigDecimal` would be in a real
+    /// consumer). It is foreign to bsql, so it could not be reached by an
+    /// `impl bsql::Cell for MyDecimal` (E0117) — the free-fn converter below is
+    /// the orphan-proof seam. It holds the EXACT decimal text, so no precision
+    /// is lost bridging an arbitrary-precision `numeric` (a decimal crate with
+    /// bounded precision would be the consumer's own tradeoff, not bsql's).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MyDecimal(pub String);
+
+    /// The `numeric` bridge converter: reshape the native, arbitrary-precision
+    /// `bsql::Numeric` into the fixture-local `MyDecimal` by taking its exact
+    /// decimal text. Infallible — the exact string is a total function of the
+    /// value (the consumer owns the choice of how much precision to keep).
+    #[must_use]
+    pub fn to_decimal(v: bsql::Numeric) -> MyDecimal {
+        MyDecimal(v.to_string())
     }
 }

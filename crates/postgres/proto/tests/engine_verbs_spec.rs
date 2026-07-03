@@ -659,7 +659,7 @@ fn query_prepared_streams_rows() {
             vec![23, 25],
         );
         let mut cap = Cap::default();
-        let live = flatten(poll_once(e.query_prepared(live, &stmt, (7_i32,), cap.sink())))
+        let live = flatten(poll_once(e.query_prepared(live, &stmt, &(7_i32,), cap.sink())))
             .expect("query_prepared");
         let _ = live;
         cap
@@ -682,7 +682,7 @@ fn execute_prepared_completes_dml() {
         let stmt =
             PreparedStatement::new(StmtName::try_from_str("s1").expect("stmt"), Vec::new());
         let mut cap = Cap::default();
-        let live = flatten(poll_once(e.execute_prepared(live, &stmt, (1_i32,), cap.sink())))
+        let live = flatten(poll_once(e.execute_prepared(live, &stmt, &(1_i32,), cap.sink())))
             .expect("execute_prepared");
         let _ = live;
         cap

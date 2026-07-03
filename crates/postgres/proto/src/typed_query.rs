@@ -61,10 +61,19 @@ use crate::prepared::{PreparedQuery, RowDecode};
 ///   row can outlive the prebuffer.
 pub trait TypedQuery {
     /// The parameter tuple marker — the `$N` Rust types, supplying the wire
-    /// param OIDs / formats. `Copy` is vacuous (every `ParamsWriter` tuple is a
-    /// tuple of `Copy` scalars / `&str` / slices), and lets the params be passed
-    /// to the engine by value with no clone.
-    type Params: ParamsWriter + Copy;
+    /// param OIDs / formats.
+    ///
+    /// Bounded on [`ParamsWriter`] only — NOT `Copy`. A param can be a non-`Copy`
+    /// owned value (a `Numeric`, whose arbitrary-precision digit payload is
+    /// heap-backed; a `Json` / `Jsonb` string), and the typed execution path
+    /// moves the whole tuple into the engine by value and serialises it once
+    /// through [`ParamsWriter::write_params`] — it is never copied or re-bound,
+    /// so `Copy` was unnecessary and would exclude these owned params. The
+    /// runtime-SQL `query_prepared` / `query_params` / `execute_params` escape
+    /// hatch mirrors this: it borrows the param tuple all the way to the engine
+    /// (`&P`), so it too binds a non-`Copy` owned param — the two paths are
+    /// symmetric, with no `Copy`-only asymmetry between them.
+    type Params: ParamsWriter;
     /// The row tuple marker — the projected column Rust types, supplying the
     /// wire row OIDs.
     type Row: RowDecode;

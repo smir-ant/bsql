@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
+use core::str::FromStr as _;
+
 use bsql_postgres_async::{ColumnError, ConnectConfig, Connection};
-use bsql_postgres_proto::DecodeError;
+use bsql_postgres_proto::{DecodeError, Json, Numeric};
 
 // ═══════════════════════════════════════════════════════════
 // Driver-specific tests (async I/O, TLS, pool, protocol)
@@ -24,6 +26,46 @@ async fn connect_and_ping() {
         "server_version should start with the major-version digit, got {version:?}"
     );
     assert!(c.backend_pid() > 0);
+    c.close().await.expect("close");
+}
+
+/// WITNESS: the RUNTIME-SQL escape hatch (`query_params` / `execute_params`)
+/// binds a NON-`Copy` owned param — a `Numeric` and a `Json` — exactly as the
+/// compile-checked `query!` path does. Before the runtime path was relaxed off
+/// `P: ParamsWriter + Copy`, `&(numeric,)` was a hard `E0277` (`Numeric` is not
+/// `Copy`); now it compiles and round-trips through real PG. This closes the
+/// typed-vs-runtime asymmetry (both borrow the param tuple to the engine).
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn runtime_path_binds_non_copy_params() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    // A non-`Copy` `Numeric` param binds through the runtime dynamic path and
+    // echoes back exactly (read as text — the dynamic Row is text-format).
+    let n = Numeric::from_str("12.3400").expect("numeric parses");
+    let row = c
+        .query_params_one("SELECT $1::numeric AS n", &(n,))
+        .await
+        .expect("numeric param binds via the runtime path");
+    assert_eq!(row.get_str(0), Ok(Some("12.3400")));
+
+    // A non-`Copy` `Json` param likewise.
+    let j = Json::new(String::from(r#"{"k":1}"#));
+    let row = c
+        .query_params_one("SELECT $1::json AS j", &(j,))
+        .await
+        .expect("json param binds via the runtime path");
+    assert_eq!(row.get_str(0), Ok(Some(r#"{"k":1}"#)));
+
+    // The side-effect twin: a non-`Copy` param through `execute_params`.
+    let n2 = Numeric::from_str("1").expect("numeric parses");
+    let affected = c
+        .execute_params("SELECT $1::numeric", &(n2,))
+        .await
+        .expect("numeric param binds via execute_params");
+    let _ = affected;
+
     c.close().await.expect("close");
 }
 

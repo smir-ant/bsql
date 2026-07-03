@@ -669,14 +669,14 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         &mut self,
         live: Live<'b>,
         stmt: &PreparedStatement,
-        params: P,
+        params: &P,
         sink: S,
     ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         P: ParamsWriter,
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
-        let status = self.run_bind_execute(stmt, &params, sink).await?;
+        let status = self.run_bind_execute(stmt, params, sink).await?;
         Ok(Outcome { live, status })
     }
 
@@ -692,14 +692,14 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         &mut self,
         live: Live<'b>,
         stmt: &PreparedStatement,
-        params: P,
+        params: &P,
         sink: S,
     ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
         P: ParamsWriter,
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
-        let status = self.run_bind_execute(stmt, &params, sink).await?;
+        let status = self.run_bind_execute(stmt, params, sink).await?;
         Ok(Outcome { live, status })
     }
 
