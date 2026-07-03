@@ -279,6 +279,24 @@ fn rust_type_for_pg(pg_type: &str) -> Option<RustType> {
     scalar_elem_for_pg(pg_type).map(ElemType::as_scalar)
 }
 
+/// The scalar [`RustType`] a canonical PostgreSQL type name resolves to, or
+/// `None` for a type outside the natively-supported SCALAR set (INCLUDING any
+/// array spelling, which is not a scalar).
+///
+/// This is the public resolver a bridge registration keys through: an external
+/// type override is keyed on the canonical PG type (e.g. `timestamptz`,
+/// `uuid`, `json`), and it fires on the native pivot [`RustType`] that type
+/// decodes as. It uses the exact same [`scalar_elem_for_pg`] map the column
+/// inference uses, so a bridge and a column agree on what a canonical type
+/// resolves to. A type with no native pivot (e.g. `numeric`, which is a loud
+/// [`InferError::UnsupportedPgType`] as a column) returns `None`: it cannot be
+/// bridged, because there is no native decoded value for the converter to
+/// reshape.
+#[must_use]
+pub fn scalar_rust_type_for_pg(pg_type: &str) -> Option<RustType> {
+    scalar_elem_for_pg(pg_type).map(ElemType::as_scalar)
+}
+
 /// The fail-closed scalar `pg_type -> ElemType` map — the single source of
 /// truth for the supported SCALAR set, used both for a scalar column and for
 /// a 1-D array's element. `None` for any type outside the set, INCLUDING any

@@ -33,6 +33,13 @@ members = [
     # chain end-to-end (real build.rs + migrations dir + freshness tests).
     # `publish = false`; not a shipped crate.
     "tools/query_fixture",
+    # Fixture consumer exercising the external-type bridge: a real build.rs
+    # calling the `CatalogBuilder` to register bridges (a dep-free fixture-local
+    # stand-in type AND the real `uuid` crate), then query! decoding columns
+    # directly into those consumer-chosen types. Proves the free-fn orphan-proof
+    # seam + that the OID-drift guarantee rides the native pivot untouched.
+    # `publish = false`; not a shipped crate; the only crate that names `uuid`.
+    "tools/query_bridge_fixture",
     # Fixture consumer exercising the SQLite build-time validation backend:
     # a real build.rs replays a SQLite-portable migrations dir into both the
     # PostgreSQL catalog AND an OUT_DIR SQLite template DB, then query!
@@ -384,6 +391,18 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # `is_x86_feature_detected!`); in no_std we fall through to
 # simdutf8's scalar fast-path (still faster than `core::str::from_utf8`).
 simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neon"] }
+
+# `uuid` — DEV-ONLY, test-only. Used solely by the `bsql-query-bridge-fixture`
+# test crate (`publish = false`) to prove the external-type bridge against a
+# REAL foreign crate: a `query!` `uuid` column decodes directly into
+# `uuid::Uuid` via an infallible free-fn converter, with bsql depending on and
+# forcing nothing (the bridge target/converter travel as strings). It is NOT a
+# dependency of any shipped crate — no shipped `Cargo.toml` names it, so it
+# stays out of every runtime graph. `default-features = false` keeps it to the
+# dep-free core `Uuid` type (`from_bytes`), adding a single package to the
+# lockfile with zero transitive deps. This is the "no forced crate" proof: bsql
+# ships zero new external dependency; only the test fixture gains this edge.
+uuid = { version = "1", default-features = false }
 
 # `criterion` — benchmark harness. Dev-only dependency;
 # benches compile with std enabled (criterion requires std) while

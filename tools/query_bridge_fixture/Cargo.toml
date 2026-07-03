@@ -1,0 +1,50 @@
+[package]
+name = "bsql-query-bridge-fixture"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Fixture consumer exercising the external-type bridge end-to-end: a real build.rs calling bsql_build::Catalog::from_migrations(..).bridge(..).emit(), then query! decoding columns directly into consumer-chosen external types (a dep-free fixture-local stand-in AND the real uuid crate). Never published."
+
+# Not a shipped crate; it exists only to prove the external-type bridge chain
+# (build.rs CatalogBuilder.bridge -> catalog + bridges channel -> query!) works
+# for a REAL consumer, dep-free (the stand-in) and against a real crate (uuid).
+publish = false
+
+[dependencies]
+# The umbrella crate: `query!` + the native `bsql::Timestamptz` / `bsql::Uuid`
+# the converter free functions take. `default-features = false, features =
+# ["macros"]` keeps the runtime surface to just the compile-checked query API.
+bsql = { path = "../../crates/bsql", default-features = false, features = ["macros"] }
+
+# `uuid` — the REAL external crate the `uuid` column bridges into. It is used
+# ONLY by this fixture's converter (`bridge::to_uuid`, which the bridge names by
+# string path) — bsql itself depends on NOTHING here. `default-features = false`
+# keeps it to the dep-free core `Uuid` type. This is the "no forced crate"
+# proof: bsql ships zero new external dependency; only this publish=false test
+# fixture gains the edge (and it never enters any shipped crate's runtime graph).
+uuid = { workspace = true }
+
+[build-dependencies]
+# BUILD-DEPENDENCY ONLY, exactly as a real consumer places it. This fixture
+# calls the richer `Catalog::from_migrations(..).bridge(..).emit()` builder.
+bsql-build = { path = "../../crates/build" }
+
+[dev-dependencies]
+# The drivers — DEV-ONLY, for the live bridged round-trip tests (`#[ignore]`,
+# need local PG) that prove a bridged column round-trips through real PG into
+# the target type. Already resolved workspace members, so these dev edges add no
+# package to the lockfile and never enter any shipped crate's runtime graph.
+bsql-postgres-sync = { path = "../../crates/postgres/sync" }
+bsql-postgres-async = { path = "../../crates/postgres/async" }
+
+# `bsql-postgres-proto` — DEV-ONLY, for `DecodeError` in the offline byte-decode
+# tests. Already resolved transitively via `bsql`'s `macros` feature.
+bsql-postgres-proto = { path = "../../crates/postgres/proto" }
+
+# `tokio` — DEV-ONLY, for the `#[tokio::test]` async live round-trip.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+# Inherit the workspace FORBID floor / lint wall.
+[lints]
+workspace = true

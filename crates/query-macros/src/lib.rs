@@ -53,6 +53,11 @@ use syn::{Ident, Token};
 /// The rustc-env variable that `bsql-build` sets to the catalog's path.
 const CATALOG_ENV_VAR: &str = "BSQL_SCHEMA_CATALOG";
 
+/// The rustc-env variable `bsql_build::CatalogBuilder::emit` sets to the
+/// external-type bridge file's path. Absent when the consumer uses the plain
+/// `emit` / `emit_catalog` free functions (no bridges — the native types).
+const BRIDGES_ENV_VAR: &str = "BSQL_TYPE_BRIDGES";
+
 // ════════════════════════════════════════════════════════════════════
 // query! — typed-record twins + DataRow-payload decode
 // ════════════════════════════════════════════════════════════════════
@@ -143,6 +148,11 @@ fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     // missing/unreadable/corrupt catalog).
     let catalog = load_build_catalog(name.span())?;
 
+    // The external-type bridges (possibly empty): each remaps a column of a
+    // given native pivot type into a consumer-chosen target type via an
+    // infallible converter free function. Fail-closed on a corrupt channel.
+    let bridges = load_bridges(name.span())?;
+
     // Lower the dynamic sugar (`OPTIONAL(...)`, `= ANY($N)`, runtime
     // `ORDER BY { ... }`) and type the result against the schema. Any
     // failure — a malformed sugar marker, an unknown table/column, a
@@ -155,14 +165,14 @@ fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
         .map_err(|err| syn::Error::new(sql_span, format!("query!: {err}")))?;
 
     // The typed-record twins (borrowed + owned) and their decoders.
-    let records = emit_records(&name, &shape.columns)?;
+    let records = emit_records(&name, &shape.columns, &bridges)?;
     // The const wire artifact(s): the uninhabited fingerprint carrier(s),
     // their `QueryFingerprint` impl(s) (baked Parse / Bind-prefix templates
     // + OID lists, all derived from the lowered shape), the validated
     // `PreparedQuery` const(s) minted through the proto-owned `run`
     // boundary, the dynamic-form budget assertions, and — for a runtime
     // `ORDER BY` allow-set — the closed selector enum.
-    let wire = emit_dynamic_wire(&name, &shape)?;
+    let wire = emit_dynamic_wire(&name, &shape, &bridges)?;
 
     // SQLite conformance cross-check (only when this crate's `sqlite` feature
     // is on AND the consumer's build.rs emitted a template). It opens the
@@ -320,6 +330,139 @@ fn load_build_catalog(span: Span) -> syn::Result<bsql_build::Catalog> {
             format!("query!: the schema catalog at `{path}` is malformed: {err}"),
         )
     })
+}
+
+/// One resolved external-type bridge: the native pivot type it fires on, the
+/// consumer's target type, and the infallible converter free-fn path. The
+/// bridge reshapes only the record FIELD VALUE; the wire OID / const validator
+/// ride the native pivot, so an OID drift is still a build error.
+struct BridgeEntry {
+    /// The native pivot `RustType` this bridge fires on (a scalar column of
+    /// this type, or a 1-D array whose element is this type).
+    rust_type: bsql_build::RustType,
+    /// The consumer's target field type (parsed from the registered string).
+    target: syn::Type,
+    /// The consumer's converter path: `fn(NativeOwned) -> Target`.
+    converter: syn::Path,
+}
+
+/// The resolved set of external-type bridges for this build (possibly empty).
+struct Bridges {
+    entries: Vec<BridgeEntry>,
+}
+
+impl Bridges {
+    /// The bridge firing on a SCALAR column of native pivot `ty`, if any.
+    fn scalar(&self, ty: bsql_build::RustType) -> Option<&BridgeEntry> {
+        self.entries.iter().find(|entry| entry.rust_type == ty)
+    }
+
+    /// The bridge firing on the ELEMENT of a 1-D array column, if any.
+    fn element(&self, elem: bsql_build::ElemType) -> Option<&BridgeEntry> {
+        self.scalar(elem.as_scalar())
+    }
+
+    /// The bridge firing on a column of type `ty` (scalar directly, or array
+    /// per element), plus whether `ty` is an array (so the target is wrapped
+    /// `Vec<Option<Target>>` and the converter is applied per element).
+    fn for_column(&self, ty: bsql_build::RustType) -> Option<(&BridgeEntry, bool)> {
+        match ty {
+            bsql_build::RustType::Array(elem) => self.element(elem).map(|entry| (entry, true)),
+            scalar => self.scalar(scalar).map(|entry| (entry, false)),
+        }
+    }
+}
+
+/// Read the external-type bridges via the rustc-env channel. An absent channel
+/// (the consumer used the plain `emit` / `emit_catalog` free functions) yields
+/// an EMPTY set — identical to the prior native-only behavior. Fail-closed on
+/// an unreadable / corrupt file, an unknown pg-type, a conflict, or an
+/// unparsable target/converter path — never a silently-dropped bridge (which
+/// would decode a column the consumer chose to bridge back into the native
+/// type).
+fn load_bridges(span: Span) -> syn::Result<Bridges> {
+    let path = match std::env::var(BRIDGES_ENV_VAR) {
+        Ok(path) => path,
+        // No channel: the consumer registered no bridges. Native types.
+        Err(_) => return Ok(Bridges { entries: Vec::new() }),
+    };
+    let text = std::fs::read_to_string(&path).map_err(|err| {
+        syn::Error::new(
+            span,
+            format!(
+                "query!: cannot read the external-type bridge file at `{path}`: \
+                 {err}. It is generated by `bsql_build::CatalogBuilder::emit` into \
+                 OUT_DIR; an unreadable bridge file fails closed rather than \
+                 silently decoding a bridged column back into its native type."
+            ),
+        )
+    })?;
+    let specs = bsql_build::parse_bridges(&text).map_err(|err| {
+        syn::Error::new(
+            span,
+            format!("query!: the external-type bridge file at `{path}` is malformed: {err}"),
+        )
+    })?;
+
+    let mut entries: Vec<BridgeEntry> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let rust_type =
+            bsql_build::scalar_rust_type_for_pg(&spec.pg_type).ok_or_else(|| {
+                syn::Error::new(
+                    span,
+                    format!(
+                        "query!: external-type bridge for `{}` has no native pivot \
+                         (it is not a natively-supported canonical PostgreSQL type)",
+                        spec.pg_type
+                    ),
+                )
+            })?;
+        if entries.iter().any(|entry| entry.rust_type == rust_type) {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "query!: two external-type bridges resolve to the same native \
+                     pivot type (one is `{}`); bsql decodes them identically, so \
+                     they cannot bridge to different targets",
+                    spec.pg_type
+                ),
+            ));
+        }
+        let target: syn::Type = syn::parse_str(&spec.target_type_path).map_err(|err| {
+            syn::Error::new(
+                span,
+                format!(
+                    "query!: external-type bridge target `{}` is not a valid Rust \
+                     type: {err}",
+                    spec.target_type_path
+                ),
+            )
+        })?;
+        let converter: syn::Path = syn::parse_str(&spec.converter_fn_path).map_err(|err| {
+            syn::Error::new(
+                span,
+                format!(
+                    "query!: external-type bridge converter `{}` is not a valid Rust \
+                     path: {err}",
+                    spec.converter_fn_path
+                ),
+            )
+        })?;
+        entries.push(BridgeEntry {
+            rust_type,
+            target,
+            converter,
+        });
+    }
+    Ok(Bridges { entries })
+}
+
+/// Whether a column borrows the input bytes in the borrowed record — a `text`
+/// / `bytea` column that is NOT bridged. A bridged column decodes into an
+/// owned target (the converter takes the owned native value), so it never
+/// borrows, exactly like the self-owning value types.
+fn column_borrows(ty: bsql_build::RustType, bridges: &Bridges) -> bool {
+    borrows_input(ty) && bridges.for_column(ty).is_none()
 }
 
 /// The fixed binary width (in bytes) of a column type, as `(usize, i32)`
@@ -488,6 +631,39 @@ fn field_type(ty: bsql_build::RustType, nullable: bool, is_owned: bool) -> Token
     }
 }
 
+/// A record field's Rust type, honoring an external-type bridge. A bridged
+/// scalar column becomes the BARE target type (both record twins — the target
+/// is self-owning); a bridged array column becomes `Vec<Option<Target>>` (the
+/// element `Option` is intrinsic to a PG array). An unbridged column falls
+/// through to [`field_type`] (the native type, borrowed / owned per twin). A
+/// nullable column wraps the base in `Option<..>`.
+fn field_type_bridged(
+    ty: bsql_build::RustType,
+    nullable: bool,
+    is_owned: bool,
+    bridges: &Bridges,
+) -> TokenStream2 {
+    let base = match bridges.for_column(ty) {
+        // Bridged: the target field type is the SAME for both twins (the
+        // target owns its value; the converter takes the owned native value).
+        Some((entry, is_array)) => {
+            let target = &entry.target;
+            if is_array {
+                quote!(::std::vec::Vec<::core::option::Option<#target>>)
+            } else {
+                quote!(#target)
+            }
+        }
+        // Unbridged: the native base type (non-null; the Option wrap is below).
+        None => field_type(ty, false, is_owned),
+    };
+    if nullable {
+        quote!(::core::option::Option<#base>)
+    } else {
+        base
+    }
+}
+
 /// Build a field identifier from an output column name, using a raw
 /// identifier for a Rust keyword (`type` -> `r#type`). A name that is not
 /// a valid identifier at all is a loud error (alias it in the SQL).
@@ -511,6 +687,7 @@ fn make_field_ident(name: &str, span: Span) -> syn::Result<Ident> {
 fn emit_records(
     name: &Ident,
     columns: &[bsql_build::InferredColumn],
+    bridges: &Bridges,
 ) -> syn::Result<TokenStream2> {
     let owned_name = format_ident!("{}Owned", name);
 
@@ -547,21 +724,23 @@ fn emit_records(
         }
     };
 
-    let has_borrowed = columns.iter().any(|c| borrows_input(c.ty));
+    let has_borrowed = columns.iter().any(|c| column_borrows(c.ty, bridges));
     // The vectorized fast path applies only when every column is a
     // fixed-width binary type AND none is nullable: a NULL or a
     // variable-width column would shift every later column's offset, so
-    // const offsets only hold under both conditions.
+    // const offsets only hold under both conditions. A bridge does NOT
+    // change the wire shape (the native pivot is decoded, then reshaped), so
+    // eligibility keys on the NATIVE fixed width exactly as before.
     let all_fixed_not_null = columns
         .iter()
         .all(|c| !c.nullable && fixed_width(c.ty).is_some());
 
     let borrowed_fields = field_idents.iter().zip(columns).map(|(id, col)| {
-        let ty = field_type(col.ty, col.nullable, false);
+        let ty = field_type_bridged(col.ty, col.nullable, false, bridges);
         quote! { #id: #ty }
     });
     let owned_fields = field_idents.iter().zip(columns).map(|(id, col)| {
-        let ty = field_type(col.ty, col.nullable, true);
+        let ty = field_type_bridged(col.ty, col.nullable, true, bridges);
         quote! { #id: #ty }
     });
 
@@ -575,17 +754,37 @@ fn emit_records(
         quote!(body: &[u8])
     };
 
-    let borrowed_body =
-        decode_body(&field_idents, columns, &col_idx_u8, n_i16, all_fixed_not_null, false);
-    let owned_body =
-        decode_body(&field_idents, columns, &col_idx_u8, n_i16, all_fixed_not_null, true);
+    let borrowed_body = decode_body(
+        &field_idents,
+        columns,
+        &col_idx_u8,
+        n_i16,
+        all_fixed_not_null,
+        false,
+        bridges,
+    );
+    let owned_body = decode_body(
+        &field_idents,
+        columns,
+        &col_idx_u8,
+        n_i16,
+        all_fixed_not_null,
+        true,
+        bridges,
+    );
 
     let allow_reason = "generated typed-record fields are the query's output row shape; a consumer may read any subset of the columns";
 
     // `Eq` is derived only when EVERY column type implements it; a record with
     // a float column derives `PartialEq` but not `Eq` (`f32`/`f64` are not
-    // `Eq`). Both twins share the same column set, so one decision covers both.
-    let derives = if columns.iter().all(|c| type_impls_eq(c.ty)) {
+    // `Eq`). A BRIDGED column's target `Eq`-ness is unknown to the macro (e.g.
+    // `serde_json::Value` is `PartialEq` but not `Eq`), so a bridged column is
+    // conservatively treated as non-`Eq`. Both twins share the same column set,
+    // so one decision covers both.
+    let derives = if columns
+        .iter()
+        .all(|c| bridges.for_column(c.ty).is_none() && type_impls_eq(c.ty))
+    {
         quote!(Debug, Clone, PartialEq, Eq)
     } else {
         quote!(Debug, Clone, PartialEq)
@@ -639,10 +838,11 @@ fn decode_body(
     n_i16: i16,
     all_fixed_not_null: bool,
     is_owned: bool,
+    bridges: &Bridges,
 ) -> TokenStream2 {
-    let per_cell = per_cell_path(field_idents, columns, col_idx_u8, is_owned);
+    let per_cell = per_cell_path(field_idents, columns, col_idx_u8, is_owned, bridges);
     if all_fixed_not_null {
-        let fast = fast_path(field_idents, columns, n_i16);
+        let fast = fast_path(field_idents, columns, n_i16, bridges);
         quote! {
             #fast
             #per_cell
@@ -666,6 +866,7 @@ fn fast_path(
     field_idents: &[Ident],
     columns: &[bsql_build::InferredColumn],
     n_i16: i16,
+    bridges: &Bridges,
 ) -> TokenStream2 {
     // Count header value (i16) and the exact post-header byte total.
     let n = columns.len();
@@ -689,19 +890,31 @@ fn fast_path(
                 let width_lit = Literal::usize_unsuffixed(width);
                 let width_i32_lit = Literal::i32_suffixed(width_i32);
                 let marker = cell_marker(col.ty);
+                // The native decoded value. A bridged fixed-width column (a
+                // value-type / primitive — `text` / `bytea` / arrays are not
+                // fixed-width, so they never reach this path) reshapes it with
+                // the converter; the native decode itself is unchanged.
+                let bound = match bridges.scalar(col.ty) {
+                    Some(entry) => {
+                        let conv = &entry.converter;
+                        quote! { #conv(__native) }
+                    }
+                    None => quote! { __native },
+                };
                 quote! {
                     let ::core::option::Option::Some((__len, __after)) =
                         __after.split_first_chunk::<4>() else { break 'fast };
                     if i32::from_be_bytes(*__len) != #width_i32_lit { break 'fast; }
                     let ::core::option::Option::Some((__data, #trailing)) =
                         __after.split_first_chunk::<#width_lit>() else { break 'fast };
-                    let #id = match <#marker as ::bsql::__rt::Cell<
+                    let __native = match <#marker as ::bsql::__rt::Cell<
                         ::bsql::__rt::BinaryFmt,
                     >>::decode(__data) {
                         ::core::result::Result::Ok(__value) => __value,
                         ::core::result::Result::Err(__err) =>
                             return ::core::result::Result::Err(__err),
                     };
+                    let #id = #bound;
                 }
             }
             // Unreachable: `fast_path` is only emitted when every column
@@ -736,6 +949,7 @@ fn per_cell_path(
     columns: &[bsql_build::InferredColumn],
     col_idx_u8: &[u8],
     is_owned: bool,
+    bridges: &Bridges,
 ) -> TokenStream2 {
     if columns.is_empty() {
         // No projected columns: validate the row body and build the empty
@@ -752,7 +966,7 @@ fn per_cell_path(
         .zip(col_idx_u8)
         .map(|((id, col), idx)| {
             let idx_lit = Literal::u8_suffixed(*idx);
-            let value = per_cell_value_expr(col.ty, col.nullable, is_owned);
+            let value = per_cell_value_expr(col.ty, col.nullable, is_owned, bridges);
             quote! {
                 let __cell = match ::core::iter::Iterator::next(&mut __cols) {
                     ::core::option::Option::Some(__result) => __result?,
@@ -780,8 +994,13 @@ fn per_cell_path(
 /// One per-cell column value expression. A NOT-NULL column returns the
 /// decoded value or a classified `NullInNonNullColumn` on NULL; a
 /// nullable column returns `Some(value)` / `None`.
-fn per_cell_value_expr(ty: bsql_build::RustType, nullable: bool, is_owned: bool) -> TokenStream2 {
-    let decode_expr = decode_call_expr(ty, is_owned);
+fn per_cell_value_expr(
+    ty: bsql_build::RustType,
+    nullable: bool,
+    is_owned: bool,
+    bridges: &Bridges,
+) -> TokenStream2 {
+    let decode_expr = decode_value_expr_bridged(ty, is_owned, bridges);
     if nullable {
         quote! {
             match __cell {
@@ -818,6 +1037,50 @@ fn decode_call_expr(ty: bsql_build::RustType, is_owned: bool) -> TokenStream2 {
         // Owned `bytea` copies the borrowed `&[u8]` into a `Vec<u8>`.
         (RustType::Bytea, true) => quote! { <[u8]>::to_vec(#raw) },
         _ => raw,
+    }
+}
+
+/// One non-NULL cell body (`__bytes`) decoded into the record field value,
+/// honoring an external-type bridge. An unbridged column is the native
+/// [`decode_call_expr`]. A bridged SCALAR column applies the converter to the
+/// OWNED native value: `conv(<owned native decode>)` (the converter takes the
+/// owned native type, so a bridged `text` column materializes its `String`
+/// first — it is no longer zero-copy, exactly like the owned twin). A bridged
+/// ARRAY column decodes the native `Vec<Option<NativeElem>>` and applies the
+/// converter per element, yielding `Vec<Option<Target>>` — the whole-column
+/// `Option` (for a nullable array) is added by the caller. The reshape is a
+/// free-fn call the optimizer inlines away; the wire decode is unchanged.
+fn decode_value_expr_bridged(
+    ty: bsql_build::RustType,
+    is_owned: bool,
+    bridges: &Bridges,
+) -> TokenStream2 {
+    match bridges.for_column(ty) {
+        None => decode_call_expr(ty, is_owned),
+        Some((entry, false)) => {
+            // Scalar bridge: reshape the OWNED native value (same for both
+            // record twins, since the target owns its value).
+            let conv = &entry.converter;
+            let native = decode_call_expr(ty, true);
+            quote! { #conv(#native) }
+        }
+        Some((entry, true)) => {
+            // Array-element bridge: decode the native `Vec<Option<NativeElem>>`,
+            // then map the converter over each present element.
+            let conv = &entry.converter;
+            let target = &entry.target;
+            let marker = cell_marker(ty);
+            quote! {
+                ::core::iter::Iterator::collect::<
+                    ::std::vec::Vec<::core::option::Option<#target>>,
+                >(::core::iter::Iterator::map(
+                    ::core::iter::IntoIterator::into_iter(
+                        <#marker as ::bsql::__rt::Cell<::bsql::__rt::BinaryFmt>>::decode(__bytes)?,
+                    ),
+                    |__elem| ::core::option::Option::map(__elem, #conv),
+                ))
+            }
+        }
     }
 }
 
@@ -1041,6 +1304,16 @@ fn param_oid_path(shape: bsql_build::ParamShape) -> TokenStream2 {
     }
 }
 
+/// The type-level `Params` / `Row` tuple markers, shared across every wire
+/// variant of one query (only the runtime `ORDER BY` SQL differs between
+/// variants). Bundled so the per-carrier emit takes one argument for both.
+struct TypeTuples {
+    /// The `Params` tuple type (from the lowered `$N` shapes).
+    params: TokenStream2,
+    /// The `Row` tuple type (from the projected columns' native markers).
+    row: TokenStream2,
+}
+
 /// Emit every const wire artifact for one (possibly dynamic) query: the
 /// dynamic-form budget assertions, then either ONE carrier (no runtime
 /// `ORDER BY` allow-set) or one carrier per allowed ordering plus the
@@ -1048,6 +1321,7 @@ fn param_oid_path(shape: bsql_build::ParamShape) -> TokenStream2 {
 fn emit_dynamic_wire(
     name: &Ident,
     shape: &bsql_build::DynamicShape,
+    bridges: &Bridges,
 ) -> syn::Result<TokenStream2> {
     // The runtime `ParamsWriter` / `RowDecode` impls (and the whole
     // prepared-statement wire path) cover tuple arity 0..=16. A query
@@ -1083,8 +1357,10 @@ fn emit_dynamic_wire(
         shape.params.iter().map(|p| param_tuple_marker(*p)).collect();
     let row_markers: Vec<TokenStream2> =
         shape.columns.iter().map(|c| tuple_marker(c.ty)).collect();
-    let params_tuple = tuple_type(&param_markers);
-    let row_tuple = tuple_type(&row_markers);
+    let tuples = TypeTuples {
+        params: tuple_type(&param_markers),
+        row: tuple_type(&row_markers),
+    };
 
     // Dynamic-form budgets, enforced at const-evaluation: an over-budget
     // query is `error[E0080]` at the `query!` site (never a silent
@@ -1122,8 +1398,8 @@ fn emit_dynamic_wire(
                 &variant.wire_sql,
                 &shape.params,
                 &shape.columns,
-                &params_tuple,
-                &row_tuple,
+                &tuples,
+                bridges,
             )?;
             Ok(quote! {
                 #budget
@@ -1147,8 +1423,8 @@ fn emit_dynamic_wire(
                     &variant.wire_sql,
                     &shape.params,
                     &shape.columns,
-                    &params_tuple,
-                    &row_tuple,
+                    &tuples,
+                    bridges,
                 )?;
                 carriers.push(emitted);
                 variant_idents.push(variant_ident);
@@ -1166,6 +1442,8 @@ fn emit_dynamic_wire(
             let prepared_doc =
                 "The baked prepared query for the selected ordering.".to_string();
             let allow_reason = "the generated ORDER BY selector is part of the query's public surface; a consumer may use any subset of its variants";
+            let params_tuple = &tuples.params;
+            let row_tuple = &tuples.row;
             let selector = quote! {
                 #[doc = #enum_doc]
                 #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
@@ -1207,9 +1485,11 @@ fn emit_carrier(
     wire_sql: &str,
     params: &[bsql_build::ParamShape],
     columns: &[bsql_build::InferredColumn],
-    params_tuple: &TokenStream2,
-    row_tuple: &TokenStream2,
+    tuples: &TypeTuples,
+    bridges: &Bridges,
 ) -> syn::Result<TokenStream2> {
+    let params_tuple = &tuples.params;
+    let row_tuple = &tuples.row;
     // Content-addressed statement name: SHA-256 of the (lowered) SQL text,
     // truncated to 96 bits, hex-encoded, prefixed. Two distinct queries
     // cannot share a name without colliding their content addresses.
@@ -1248,9 +1528,11 @@ fn emit_carrier(
     // borrowing (`text` / `bytea`) column makes the borrowed record carry
     // `<'q>` (it borrows the input bytes); a query with no borrowing column
     // makes the record lifetime-free, so the `TypedQuery::Record<'q>` GAT
-    // leaves `'q` unused (verified to compile).
+    // leaves `'q` unused (verified to compile). A bridged `text` / `bytea`
+    // column decodes into an owned target, so it does NOT borrow — the same
+    // rule `emit_records` applies, so both agree on whether `<'q>` appears.
     let owned_name = format_ident!("{}Owned", name);
-    let has_borrowed = columns.iter().any(|c| borrows_input(c.ty));
+    let has_borrowed = columns.iter().any(|c| column_borrows(c.ty, bridges));
     let record_ty = if has_borrowed {
         quote!(#name<'q>)
     } else {

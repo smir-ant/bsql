@@ -56,7 +56,7 @@ crates/
   query-macros/      — PROC-MACRO: reads the catalog, types/validates query!  — 1285 LoC
 ```
 
-(src LoC measured per crate via `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by ~13K lines of inference tests in `src/infer.rs`. Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync}`, `bsql-sqlite`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-sqlite-fixture`, `bsql-corpus`.)
+(src LoC measured per crate via `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by ~13K lines of inference tests in `src/infer.rs`. Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync}`, `bsql-sqlite`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-bridge-fixture`, `bsql-query-sqlite-fixture`, `bsql-corpus`.)
 
 ## Build & test
 
@@ -97,6 +97,22 @@ proc-macro and never enters the runtime binary. `emit` also emits the
 SQLite conformance template when the build-dep's `sqlite` feature is on; a
 PostgreSQL-only build can call `bsql_build::emit_catalog("migrations")`
 instead. `tools/query_fixture` is the end-to-end proof of this shape.
+
+**External-type bridges (optional).** A consumer can make `query!` decode a
+column directly into a chosen EXTERNAL crate type (`chrono::DateTime`,
+`uuid::Uuid`, `serde_json::Value`, …) with bsql depending on and forcing
+NOTHING. The build.rs uses the richer builder — `Catalog::from_migrations(dir)
+.bridge(pg_type, target_type_path, converter_fn_path).emit()` (or `.emit_catalog()`
+for a PostgreSQL-only build) — keyed on the canonical PG type; the consumer
+supplies one INFALLIBLE converter free function per bridged type
+(`fn(bsql::Timestamptz) -> chrono::DateTime<Utc>`). The target type and
+converter travel as STRINGS, so `bsql-build` / `bsql-query-macros` gain no
+external dependency. The free function is the orphan-proof seam: a consumer
+cannot `impl bsql::Cell for chrono::DateTime` (E0117 — both foreign), but a free
+fn compiles for any foreign target. The bridge reshapes ONLY the record field
+value; the row OID list and the const validator ride the native pivot, so the
+compile-time OID-drift guarantee (E0080) is untouched.
+`tools/query_bridge_fixture` is the end-to-end proof.
 
 The `deps_pin` gate (`tools/devgates/tests/deps_pin.rs`) pins the resolved
 dependency set (parsed from `Cargo.lock`) to a committed golden, and bans any

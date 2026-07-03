@@ -13,6 +13,7 @@ bsql-postgres-async 0.1.0-alpha.0
 bsql-postgres-core 0.1.0-alpha.0
 bsql-postgres-proto 1.0.0-alpha.0
 bsql-postgres-sync 0.1.0-alpha.0
+bsql-query-bridge-fixture 0.0.0
 bsql-query-fixture 0.0.0
 bsql-query-macros 1.0.0-alpha.0
 bsql-query-sqlite-fixture 0.0.0
@@ -106,6 +107,7 @@ trybuild 1.0.116
 typenum 1.19.0
 unicode-ident 1.0.24
 untrusted 0.9.0
+uuid 1.23.4
 vcpkg 0.2.15
 version_check 0.9.5
 walkdir 2.5.0

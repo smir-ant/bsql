@@ -72,7 +72,10 @@ mod sqlite;
 pub use dynamics::{
     infer_dynamic_query, DynamicError, DynamicShape, OrderByVariant, ParamShape, WireVariant,
 };
-pub use infer::{infer_query, ElemType, InferError, InferredColumn, QueryShape, RustType};
+pub use infer::{
+    infer_query, scalar_rust_type_for_pg, ElemType, InferError, InferredColumn, QueryShape,
+    RustType,
+};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
     emit_sqlite_template, verify_sqlite_conformance, SqliteConformanceError,
@@ -96,6 +99,17 @@ pub const CATALOG_FILE_NAME: &str = "bsql_schema_catalog.txt";
 /// The environment variable, set via `cargo:rustc-env`, that carries the
 /// absolute path of the generated catalog to the query proc-macro.
 pub const CATALOG_ENV_VAR: &str = "BSQL_SCHEMA_CATALOG";
+
+/// The basename of the external-type bridge file written into `OUT_DIR` by
+/// [`CatalogBuilder::emit`].
+pub const BRIDGES_FILE_NAME: &str = "bsql_type_bridges.txt";
+
+/// The environment variable, set via `cargo:rustc-env` by
+/// [`CatalogBuilder::emit`], that carries the absolute path of the generated
+/// external-type bridge file to the query proc-macro. Absent when a consumer
+/// uses the plain [`emit`] / [`emit_catalog`] free functions (no bridges), in
+/// which case `query!` decodes into the dep-free native types.
+pub const BRIDGES_ENV_VAR: &str = "BSQL_TYPE_BRIDGES";
 
 /// A column's replayed shape: its canonical PostgreSQL type name and
 /// whether the schema marks it `NOT NULL`.
@@ -154,6 +168,20 @@ pub enum BuildError {
     /// NULL`, which SQLite does not support). Never silently skipped. (Only
     /// constructible under the `sqlite` feature.)
     SqliteReplay { path: PathBuf, message: String },
+    /// A [`CatalogBuilder::bridge`] named a `pg_type` with no native pivot: it
+    /// is not a canonical PostgreSQL type name in the natively-supported set
+    /// (a typo like `timestamptzz`, or a natively-unsupported type like
+    /// `numeric` that a column would itself reject). A bridge reshapes a native
+    /// decoded value, so a type with no native decoder cannot be bridged.
+    /// Loud, never silently ignored. `pg_type` is the offending key.
+    UnknownBridgeType { pg_type: String },
+    /// Two [`CatalogBuilder::bridge`] registrations collide: either the same
+    /// `pg_type` twice, or two distinct canonical types (e.g. `text` and
+    /// `varchar`) that resolve to the SAME native pivot type — which bsql
+    /// decodes identically (same wire OID, same decoder), so they cannot be
+    /// bridged to different targets. Register one bridge for the family. Loud,
+    /// never a silent last-wins. `first` / `second` are the two colliding keys.
+    ConflictingBridge { first: String, second: String },
 }
 
 impl fmt::Display for BuildError {
@@ -199,6 +227,23 @@ impl fmt::Display for BuildError {
                  (define the schema in a SQLite-portable form, or do not \
                  target SQLite).",
                 path.display()
+            ),
+            BuildError::UnknownBridgeType { pg_type } => write!(
+                f,
+                "bsql-build: cannot bridge PostgreSQL type `{pg_type}`: it is \
+                 not a canonical type name with a native bsql pivot. A bridge \
+                 reshapes a natively-decoded value, so its `pg_type` must be \
+                 one of the natively-supported canonical names (int2, int4, \
+                 int8, oid, bool, text, varchar, float4, float8, bytea, uuid, \
+                 timestamptz, timestamp, json, jsonb). A natively-unsupported \
+                 type (e.g. numeric) has no native decoder to bridge from."
+            ),
+            BuildError::ConflictingBridge { first, second } => write!(
+                f,
+                "bsql-build: conflicting bridges for `{first}` and `{second}`: \
+                 they resolve to the same native pivot type, which bsql decodes \
+                 identically (same wire OID, same decoder). Register a single \
+                 bridge for the family rather than two that disagree."
             ),
         }
     }
@@ -254,20 +299,36 @@ pub fn emit_catalog(migrations_dir: impl AsRef<Path>) -> Result<(), BuildError> 
     // `rerun-if-changed` for EVERY directory (the root and each nested
     // one) is what makes ADD/DELETE of a migration at ANY depth recompile
     // dependents. `include_str!` tracks file CONTENT only — that is the
-    // stale-schema blind spot this closes at every level.
+    // stale-schema blind spot this closes at every level. The per-file
+    // directives (content tracking: EDIT recompiles) are the belt.
+    emit_rerun_directives(&walk);
+
+    let catalog = catalog_from_walk(&walk)?;
+    write_catalog(&catalog)?;
+    Ok(())
+}
+
+/// Emit the `cargo:rerun-if-changed` directives for a walked migrations tree:
+/// one per directory (membership: ADD/DELETE of a migration at any depth
+/// recompiles) and one per file (content: EDIT recompiles). Shared by
+/// [`emit_catalog`] and [`CatalogBuilder::emit`].
+fn emit_rerun_directives(walk: &Walk) {
     for directory in &walk.dirs {
         println!("cargo:rerun-if-changed={}", directory.display());
     }
     for file in &walk.files {
-        // Per-file content tracking (belt): EDITING a file recompiles.
         println!("cargo:rerun-if-changed={}", file.display());
     }
+}
 
-    let catalog = catalog_from_walk(&walk)?;
-
+/// Serialize the catalog to `OUT_DIR/bsql_schema_catalog.txt` and set the
+/// `BSQL_SCHEMA_CATALOG` rustc-env channel the query proc-macro reads. The
+/// sole catalog-writing path, shared by [`emit_catalog`] and
+/// [`CatalogBuilder::emit`].
+fn write_catalog(catalog: &Catalog) -> Result<(), BuildError> {
     let out_dir = env_path("OUT_DIR")?;
     let catalog_path = out_dir.join(CATALOG_FILE_NAME);
-    let serialized = serialize(&catalog);
+    let serialized = serialize(catalog);
     std::fs::write(&catalog_path, serialized).map_err(|source| BuildError::WriteCatalog {
         path: catalog_path.clone(),
         source,
@@ -281,7 +342,6 @@ pub fn emit_catalog(migrations_dir: impl AsRef<Path>) -> Result<(), BuildError> 
         "cargo:rustc-env={CATALOG_ENV_VAR}={}",
         catalog_path.display()
     );
-
     Ok(())
 }
 
@@ -312,6 +372,364 @@ pub fn emit(migrations_dir: impl AsRef<Path>) -> Result<(), BuildError> {
     #[cfg(feature = "sqlite")]
     emit_sqlite_template(&migrations_dir)?;
     Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// External-type bridges: decode `query!` columns into a consumer-chosen
+// external crate type, with bsql depending on and forcing nothing.
+// ════════════════════════════════════════════════════════════════════════
+//
+// A consumer registers a bridge keyed on a canonical PostgreSQL type, giving
+// the TARGET TYPE PATH and an INFALLIBLE converter FREE FUNCTION path, both as
+// STRINGS — so this build helper (and the proc-macro) depend on no external
+// type crate. The free function is the orphan-proof seam: a consumer cannot
+// `impl bsql::Cell for chrono::DateTime` (E0117 — both are foreign), but a
+// free `fn ts(v: bsql::Timestamptz) -> chrono::DateTime<Utc>` compiles for any
+// foreign target. The bridge reshapes only the RECORD FIELD VALUE; the wire
+// decode, the row OID list, and the const validator all continue to ride the
+// NATIVE pivot type, so the compile-time OID-drift guarantee is untouched.
+
+/// A builder over the migration-replayed [`Catalog`] that additionally
+/// registers external-type bridges, then emits both channels the query
+/// proc-macro reads: the schema catalog AND the bridge overrides.
+///
+/// This is the richer form of the [`emit`] / [`emit_catalog`] free functions:
+/// use it when a consumer wants `query!` to decode one or more columns into a
+/// chosen external crate type (e.g. `chrono::DateTime`, `uuid::Uuid`,
+/// `serde_json::Value`) instead of the dep-free native types. bsql depends on
+/// and forces NOTHING: the target type and converter travel as strings, and
+/// the consumer supplies one infallible converter free function per bridged
+/// type.
+///
+/// ```no_run
+/// fn main() -> Result<(), bsql_build::BuildError> {
+///     bsql_build::Catalog::from_migrations("migrations")?
+///         .bridge("timestamptz", "chrono::DateTime<chrono::Utc>", "crate::bridge::ts")
+///         .bridge("uuid", "uuid::Uuid", "crate::bridge::uuid")
+///         .emit()
+/// }
+/// ```
+#[derive(Debug)]
+pub struct CatalogBuilder {
+    /// The replayed schema, built once at construction.
+    catalog: Catalog,
+    /// The walked migration tree, kept so `emit` can re-emit the
+    /// `rerun-if-changed` directives without a second walk.
+    walk: Walk,
+    /// The original (manifest-relative) migrations dir argument, kept so the
+    /// SQLite template emit can re-resolve it. Only the `sqlite`-feature
+    /// `emit` path reads it, so the field exists only under that feature.
+    #[cfg(feature = "sqlite")]
+    migrations_dir: PathBuf,
+    /// The registered bridges, in registration order.
+    bridges: Vec<BridgeSpec>,
+}
+
+impl Catalog {
+    /// Begin a [`CatalogBuilder`] by replaying a consumer's `migrations/`
+    /// directory into a [`Catalog`], the same way [`emit_catalog`] does.
+    ///
+    /// `migrations_dir` is resolved relative to the consumer crate's
+    /// `CARGO_MANIFEST_DIR` (so this must be called from a `build.rs`). It
+    /// walks the tree once (recursing into subdirectories) and replays every
+    /// `*.sql` file into the catalog; any I/O, parse, or replay error fails
+    /// closed as a [`BuildError`]. Chain [`CatalogBuilder::bridge`] calls,
+    /// then [`CatalogBuilder::emit`].
+    ///
+    /// # Errors
+    ///
+    /// A [`BuildError`] on a missing `CARGO_MANIFEST_DIR`, an unreadable
+    /// migrations directory or file, a parse error, or a replay error.
+    pub fn from_migrations(migrations_dir: impl AsRef<Path>) -> Result<CatalogBuilder, BuildError> {
+        let rel = migrations_dir.as_ref();
+        let manifest = env_path("CARGO_MANIFEST_DIR")?;
+        let dir = manifest.join(rel);
+        let walk = scan_sql_tree(&dir)?;
+        let catalog = catalog_from_walk(&walk)?;
+        Ok(CatalogBuilder {
+            catalog,
+            walk,
+            #[cfg(feature = "sqlite")]
+            migrations_dir: rel.to_path_buf(),
+            bridges: Vec::new(),
+        })
+    }
+}
+
+impl CatalogBuilder {
+    /// Register an external-type bridge: every `query!` column whose type is
+    /// the canonical PostgreSQL type `pg_type` decodes into `target_type_path`
+    /// (the BARE target type — no `.0`, no `.into()`, no annotation at the
+    /// query site) by applying the infallible converter free function at
+    /// `converter_fn_path` to the native decoded value.
+    ///
+    /// `pg_type` must be a canonical PostgreSQL type name with a native bsql
+    /// pivot (int2, int4, int8, oid, bool, text, varchar, float4, float8,
+    /// bytea, uuid, timestamptz, timestamp, json, jsonb); a bridge on an
+    /// element type ALSO reshapes each element of that type's 1-D array
+    /// (`timestamptz[]` -> `Vec<Option<target>>`). A typo or a natively
+    /// unsupported type (e.g. `numeric`) is a loud [`BuildError`] at
+    /// [`emit`](Self::emit).
+    ///
+    /// `target_type_path` and `converter_fn_path` are Rust paths that resolve
+    /// at the `query!` call site in the CONSUMER crate: `target_type_path` is
+    /// the field type (e.g. `chrono::DateTime<chrono::Utc>`); `converter_fn_path`
+    /// is a `fn(NativeOwned) -> Target` (e.g. `crate::bridge::ts`, where the
+    /// native owned type is `bsql::Timestamptz`). bsql depends on neither —
+    /// they travel as strings and are resolved by the consumer's own
+    /// dependencies. A path that does not resolve is a normal build error at
+    /// the `query!` site.
+    #[must_use]
+    pub fn bridge(
+        mut self,
+        pg_type: &str,
+        target_type_path: &str,
+        converter_fn_path: &str,
+    ) -> Self {
+        self.bridges.push(BridgeSpec {
+            pg_type: pg_type.to_string(),
+            target_type_path: target_type_path.to_string(),
+            converter_fn_path: converter_fn_path.to_string(),
+        });
+        self
+    }
+
+    /// Validate the registered bridges, then emit both proc-macro channels:
+    /// the schema catalog (as [`emit_catalog`]) and the external-type bridge
+    /// overrides (`BSQL_TYPE_BRIDGES`). Under the `sqlite` feature it ALSO
+    /// emits the SQLite conformance template, exactly as [`emit`] does — the
+    /// builder analogue of the [`emit`] free function.
+    ///
+    /// # Errors
+    ///
+    /// A [`BuildError::UnknownBridgeType`] for a bridge whose `pg_type` has no
+    /// native pivot, a [`BuildError::ConflictingBridge`] for two bridges that
+    /// resolve to the same native pivot, any catalog I/O error, or (under the
+    /// `sqlite` feature) a SQLite replay error.
+    pub fn emit(self) -> Result<(), BuildError> {
+        self.emit_channels()?;
+        #[cfg(feature = "sqlite")]
+        emit_sqlite_template(&self.migrations_dir)?;
+        Ok(())
+    }
+
+    /// Validate the registered bridges, then emit the PostgreSQL schema catalog
+    /// and the external-type bridge overrides, WITHOUT the SQLite conformance
+    /// template — the builder analogue of the [`emit_catalog`] free function.
+    /// Use this for a deliberately PostgreSQL-only build (e.g. one bridging to
+    /// a type that has no portable SQLite form), so no SQLite target is ever
+    /// declared regardless of whether the `sqlite` feature happens to be
+    /// activated by feature unification in the surrounding build graph.
+    ///
+    /// # Errors
+    ///
+    /// A [`BuildError::UnknownBridgeType`] for a bridge whose `pg_type` has no
+    /// native pivot, a [`BuildError::ConflictingBridge`] for two bridges that
+    /// resolve to the same native pivot, or any catalog / bridge I/O error.
+    pub fn emit_catalog(self) -> Result<(), BuildError> {
+        self.emit_channels()
+    }
+
+    /// The shared core of [`emit`](Self::emit) / [`emit_catalog`](Self::emit_catalog):
+    /// validate the bridges, emit the rerun directives, and write both the
+    /// catalog and the bridge channels. Never touches the SQLite template.
+    fn emit_channels(&self) -> Result<(), BuildError> {
+        validate_bridges(&self.bridges, &self.catalog)?;
+        emit_rerun_directives(&self.walk);
+        write_catalog(&self.catalog)?;
+        write_bridges(&self.bridges)?;
+        Ok(())
+    }
+}
+
+/// Validate the registered bridges against the natively-supported set and each
+/// other. Each `pg_type` must resolve to a native pivot [`RustType`]
+/// ([`BuildError::UnknownBridgeType`] otherwise); no two bridges may resolve
+/// to the SAME pivot ([`BuildError::ConflictingBridge`]). A bridge whose
+/// `pg_type` matches no table column in the catalog is a clear `cargo:warning`
+/// (it may still apply to a CAST result), never a silent drop.
+fn validate_bridges(bridges: &[BridgeSpec], catalog: &Catalog) -> Result<(), BuildError> {
+    // (resolved pivot rust_name, the pg_type key that produced it) — to catch
+    // two distinct keys colliding on one native pivot.
+    let mut resolved: Vec<(&'static str, &str)> = Vec::with_capacity(bridges.len());
+    for bridge in bridges {
+        let pivot = infer::scalar_rust_type_for_pg(&bridge.pg_type).ok_or_else(|| {
+            BuildError::UnknownBridgeType {
+                pg_type: bridge.pg_type.clone(),
+            }
+        })?;
+        let pivot_name = pivot.rust_name();
+        if let Some((_, first)) = resolved.iter().find(|(name, _)| *name == pivot_name) {
+            return Err(BuildError::ConflictingBridge {
+                first: (*first).to_string(),
+                second: bridge.pg_type.clone(),
+            });
+        }
+        resolved.push((pivot_name, &bridge.pg_type));
+
+        if !catalog_uses_pivot(catalog, pivot) {
+            // A clear diagnostic (not a silent ignore): the bridge is still
+            // emitted — it may legitimately apply to a CAST result the catalog
+            // does not enumerate — but a bridge that matches no table column is
+            // worth surfacing (it is often a typo in the type name). The match
+            // is keyed on the RESOLVED native pivot, NOT the raw pg_type string,
+            // so it reflects the exact family the bridge fires on at the query!
+            // site: `text` and `varchar` share `RustType::Text`, so a
+            // `.bridge("text")` over a `varchar`-only schema (which it DOES fire
+            // on) does not spuriously warn.
+            println!(
+                "cargo:warning=bsql-build: bridge for `{}` matches no table \
+                 column in the catalog (it still applies to a CAST result of \
+                 that type, if any).",
+                bridge.pg_type
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The native pivot [`RustType`] a catalog column's canonical `pg_type`
+/// resolves to for bridge-matching: a scalar column resolves directly; a 1-D
+/// array column (`text[]`) resolves to its ELEMENT pivot, because a bridge on
+/// the element type fires per element on that array. `None` for a type with no
+/// native pivot (a multi-dimensional array, or an unsupported type).
+fn column_pivot(pg_type: &str) -> Option<RustType> {
+    if let Some(element) = pg_type.strip_suffix("[]") {
+        // An array column fires the element-type bridge; `scalar_rust_type_for_pg`
+        // rejects any remaining `[]` (a multi-dimensional array), so `text[][]`
+        // stays `None`.
+        return scalar_rust_type_for_pg(element);
+    }
+    scalar_rust_type_for_pg(pg_type)
+}
+
+/// Whether any catalog table column resolves to the given native pivot type
+/// — as a scalar column OR as the element of a 1-D array column. Keyed on the
+/// RESOLVED pivot (not the raw `pg_type` string) so it agrees with the query!
+/// firing rule, which matches on the native pivot: `text` and `varchar` both
+/// resolve to `RustType::Text`, so a `varchar` column counts as a match for a
+/// `text` bridge (and vice versa) — the two never disagree with each other.
+fn catalog_uses_pivot(catalog: &Catalog, pivot: RustType) -> bool {
+    catalog.tables.values().any(|columns| {
+        columns
+            .values()
+            .any(|info| column_pivot(&info.pg_type) == Some(pivot))
+    })
+}
+
+/// Serialize the bridges to `OUT_DIR/bsql_type_bridges.txt` and set the
+/// `BSQL_TYPE_BRIDGES` rustc-env channel. Each line is
+/// `pg_type\ttarget_type_path\tconverter_fn_path`. When there are no bridges
+/// the file is empty and the channel still points at it (the macro then reads
+/// an empty override set — identical to the no-bridge free-fn path).
+fn write_bridges(bridges: &[BridgeSpec]) -> Result<(), BuildError> {
+    let out_dir = env_path("OUT_DIR")?;
+    let bridges_path = out_dir.join(BRIDGES_FILE_NAME);
+    let serialized = serialize_bridges(bridges);
+    std::fs::write(&bridges_path, serialized).map_err(|source| BuildError::WriteCatalog {
+        path: bridges_path.clone(),
+        source,
+    })?;
+    println!(
+        "cargo:rustc-env={BRIDGES_ENV_VAR}={}",
+        bridges_path.display()
+    );
+    Ok(())
+}
+
+/// Serialize bridges to the tab-separated line format `write_bridges` writes
+/// and [`parse_bridges`] reads back. Sorted by `pg_type` for byte-determinism.
+/// The target/converter paths carry no tab or newline (they are Rust paths),
+/// so the format is unambiguous.
+fn serialize_bridges(bridges: &[BridgeSpec]) -> String {
+    let mut sorted: Vec<&BridgeSpec> = bridges.iter().collect();
+    sorted.sort_by(|a, b| a.pg_type.cmp(&b.pg_type));
+    let mut out = String::new();
+    for bridge in sorted {
+        out.push_str(&bridge.pg_type);
+        out.push('\t');
+        out.push_str(&bridge.target_type_path);
+        out.push('\t');
+        out.push_str(&bridge.converter_fn_path);
+        out.push('\n');
+    }
+    out
+}
+
+/// One parsed external-type bridge, as the query proc-macro reads it back from
+/// the `BSQL_TYPE_BRIDGES` channel via [`parse_bridges`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeSpec {
+    /// The canonical PostgreSQL type key.
+    pub pg_type: String,
+    /// The consumer's target type path.
+    pub target_type_path: String,
+    /// The consumer's converter free-fn path.
+    pub converter_fn_path: String,
+}
+
+/// A failure parsing the line-oriented bridge file back into [`BridgeSpec`]s.
+/// The file is machine-generated by [`CatalogBuilder::emit`], so a malformed
+/// line means the build-script channel is corrupt — a loud error, never a
+/// silently dropped bridge (which would reopen the native type for a column
+/// the consumer chose to bridge).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeParseError {
+    /// The 1-based line number of the malformed line.
+    pub line: usize,
+    /// How many tab-separated fields were found (expected exactly 3).
+    pub fields: usize,
+}
+
+impl fmt::Display for BridgeParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "type-bridge file line {} has {} tab-separated field(s), expected \
+             exactly 3 (pg_type, target_type_path, converter_fn_path). The \
+             file is machine-generated; a malformed line means the \
+             build-script channel is corrupt.",
+            self.line, self.fields
+        )
+    }
+}
+
+impl std::error::Error for BridgeParseError {}
+
+/// Parse the line-oriented bridge text [`serialize_bridges`] produced back
+/// into [`BridgeSpec`]s (the inverse of the emit path). Each non-empty line is
+/// `pg_type\ttarget_type_path\tconverter_fn_path`. A blank final line (from a
+/// trailing newline) is skipped; every other line MUST have exactly three
+/// tab-separated fields, or a loud [`BridgeParseError`].
+///
+/// # Errors
+///
+/// [`BridgeParseError`] when a non-empty line does not have exactly three
+/// tab-separated fields.
+pub fn parse_bridges(text: &str) -> Result<Vec<BridgeSpec>, BridgeParseError> {
+    let mut specs = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let number = idx.saturating_add(1);
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [pg_type, target, converter] = match fields.as_slice() {
+            [a, b, c] => [*a, *b, *c],
+            other => {
+                return Err(BridgeParseError {
+                    line: number,
+                    fields: other.len(),
+                })
+            }
+        };
+        specs.push(BridgeSpec {
+            pg_type: pg_type.to_string(),
+            target_type_path: target.to_string(),
+            converter_fn_path: converter.to_string(),
+        });
+    }
+    Ok(specs)
 }
 
 /// Build the [`Catalog`] from a directory of migration `*.sql` files,
@@ -351,7 +769,7 @@ fn env_path(var: &'static str) -> Result<PathBuf, BuildError> {
 
 /// The result of walking the migrations tree: every `*.sql` file (at any
 /// depth, in deterministic path order) and every directory visited.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Walk {
     /// `*.sql` files, sorted by full path so replay order is stable and
     /// independent of filesystem iteration order.
@@ -1868,5 +2286,131 @@ mod tests {
             err,
             CatalogParseError::BoolFlag { field: "not_null", .. }
         ));
+    }
+
+    // ─── External-type bridges ──────────────────────────────────────────
+
+    fn bspec(pg: &str, target: &str, conv: &str) -> BridgeSpec {
+        BridgeSpec {
+            pg_type: pg.to_string(),
+            target_type_path: target.to_string(),
+            converter_fn_path: conv.to_string(),
+        }
+    }
+
+    #[test]
+    fn bridge_distinct_native_pivots_validate() {
+        let cat = catalog_from(&["CREATE TABLE t (a TIMESTAMPTZ, b UUID, c JSONB)"]);
+        let bridges = [
+            bspec("timestamptz", "chrono::DateTime<chrono::Utc>", "crate::ts"),
+            bspec("uuid", "uuid::Uuid", "crate::uuid"),
+            bspec("jsonb", "serde_json::Value", "crate::jsonb"),
+        ];
+        validate_bridges(&bridges, &cat).expect("distinct pivots validate");
+    }
+
+    #[test]
+    fn bridge_unknown_pg_type_is_loud() {
+        let cat = Catalog::default();
+        // A typo — not a canonical name.
+        let err = validate_bridges(&[bspec("timestamptzz", "X", "y")], &cat)
+            .expect_err("typo must fail closed");
+        assert!(matches!(
+            err,
+            BuildError::UnknownBridgeType { ref pg_type } if pg_type == "timestamptzz"
+        ));
+        // A natively-unsupported type has no pivot to bridge from.
+        let err = validate_bridges(&[bspec("numeric", "rust_decimal::Decimal", "d")], &cat)
+            .expect_err("numeric has no native pivot");
+        assert!(matches!(
+            err,
+            BuildError::UnknownBridgeType { ref pg_type } if pg_type == "numeric"
+        ));
+    }
+
+    #[test]
+    fn bridge_array_key_is_rejected() {
+        // The bridge key is the INNER element type; an array spelling has no
+        // scalar pivot and is loud.
+        let err = validate_bridges(&[bspec("timestamptz[]", "X", "y")], &Catalog::default())
+            .expect_err("array key must fail closed");
+        assert!(matches!(err, BuildError::UnknownBridgeType { .. }));
+    }
+
+    #[test]
+    fn bridge_conflicting_pivot_is_loud() {
+        // `text` and `varchar` decode identically in bsql (same native pivot,
+        // same wire OID) — two DIFFERENT targets is a loud conflict.
+        let cat = catalog_from(&["CREATE TABLE t (a TEXT, b VARCHAR(9))"]);
+        let err = validate_bridges(
+            &[
+                bspec("text", "smol_str::SmolStr", "crate::a"),
+                bspec("varchar", "compact_str::CompactString", "crate::b"),
+            ],
+            &cat,
+        )
+        .expect_err("same-pivot conflict must fail closed");
+        assert!(matches!(err, BuildError::ConflictingBridge { .. }));
+    }
+
+    #[test]
+    fn bridge_unused_advisory_is_pivot_keyed_not_string_keyed() {
+        // A catalog with ONLY a `varchar` column (no `text` column).
+        let cat = catalog_from(&["CREATE TABLE t (a VARCHAR(9))"]);
+        let text_pivot = scalar_rust_type_for_pg("text").expect("text has a pivot");
+        let varchar_pivot = scalar_rust_type_for_pg("varchar").expect("varchar has a pivot");
+        // `text` and `varchar` collapse to the SAME native pivot, so a
+        // `.bridge("text")` DOES fire on the `varchar` column — and therefore
+        // must NOT be advised as "matches no table column".
+        assert_eq!(text_pivot, varchar_pivot);
+        assert!(
+            catalog_uses_pivot(&cat, text_pivot),
+            "a `text` bridge fires on a varchar column (same pivot) — no advisory"
+        );
+        // A pivot NO column uses still counts as unmatched (the advisory fires).
+        let uuid_pivot = scalar_rust_type_for_pg("uuid").expect("uuid has a pivot");
+        assert!(
+            !catalog_uses_pivot(&cat, uuid_pivot),
+            "no column resolves to the uuid pivot — the advisory still fires"
+        );
+    }
+
+    #[test]
+    fn column_pivot_resolves_scalar_and_array_element_to_the_same_pivot() {
+        let scalar = column_pivot("timestamptz").expect("scalar pivot");
+        let array = column_pivot("timestamptz[]").expect("array element pivot");
+        assert_eq!(scalar, array, "a `T[]` column shares its element's pivot");
+        // A multi-dimensional array has no bridgeable pivot.
+        assert_eq!(column_pivot("timestamptz[][]"), None);
+        // An unsupported type has none either.
+        assert_eq!(column_pivot("numeric"), None);
+    }
+
+    #[test]
+    fn bridge_serialize_round_trips() {
+        let bridges = [
+            bspec("uuid", "uuid::Uuid", "crate::bridge::uuid"),
+            bspec("timestamptz", "chrono::DateTime<chrono::Utc>", "crate::bridge::ts"),
+        ];
+        let text = serialize_bridges(&bridges);
+        // Deterministic: sorted by pg_type (`timestamptz` before `uuid`).
+        assert!(text.starts_with("timestamptz\t"));
+        let parsed = parse_bridges(&text).expect("round-trips");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].pg_type, "timestamptz");
+        assert_eq!(parsed[0].target_type_path, "chrono::DateTime<chrono::Utc>");
+        assert_eq!(parsed[0].converter_fn_path, "crate::bridge::ts");
+        assert_eq!(parsed[1].pg_type, "uuid");
+    }
+
+    #[test]
+    fn parse_bridges_empty_is_empty() {
+        assert!(parse_bridges("").expect("empty parses").is_empty());
+    }
+
+    #[test]
+    fn parse_bridges_wrong_field_count_is_loud() {
+        let err = parse_bridges("uuid\tuuid::Uuid\n").expect_err("must fail closed");
+        assert_eq!(err.fields, 2);
     }
 }

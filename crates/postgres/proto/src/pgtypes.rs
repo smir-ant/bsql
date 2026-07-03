@@ -10,11 +10,15 @@
 //!
 //! Each type is a thin newtype over the value PostgreSQL puts on the binary
 //! wire — no calendar math, no JSON parsing, no allocation beyond what the
-//! payload requires. Ergonomic integrations with the wider ecosystem
-//! (`uuid::Uuid`, `time::OffsetDateTime`, `serde_json::Value`) are a
-//! deliberately-deferred, feature-flagged follow-up (see the module-level
-//! note in [`crate::decode`]); the types here are the always-available core
-//! and add **no** dependency.
+//! payload requires. To decode a column straight into a wider-ecosystem type
+//! (`uuid::Uuid`, `time::OffsetDateTime`, `chrono::DateTime`,
+//! `serde_json::Value`, …), a consumer registers a build-time **external-type
+//! bridge**: a converter free function `fn(bsql::Timestamptz) -> Target`, and
+//! `query!` then decodes that column directly into `Target`. The bridge is not
+//! feature-flagged and forces no dependency — the target type and converter
+//! travel as strings through the build catalog, so bsql itself depends on no
+//! external crate. The types here are the always-available dep-free core these
+//! bridges convert **from**.
 //!
 //! # Where the trait impls live
 //!
@@ -40,11 +44,12 @@ use core::str::FromStr;
 ///
 /// # When to use / when not
 ///
-/// Use this to decode a `uuid` column dependency-free. If you already depend
-/// on the `uuid` crate and want `uuid::Uuid` fields, that is the planned
-/// feature-flagged integration — this type is the always-available core, not
-/// a replacement for a full UUID library (it deliberately has no v4/v7
-/// generation, no versioning inspection).
+/// Use this to decode a `uuid` column dependency-free. To decode straight into
+/// `uuid::Uuid` fields instead, register a build-time external-type bridge
+/// (a `fn(bsql::Uuid) -> uuid::Uuid` converter, e.g.
+/// `uuid::Uuid::from_bytes(*v.as_bytes())`) — bsql forces no dependency. This
+/// type is the always-available core, not a replacement for a full UUID library
+/// (it deliberately has no v4/v7 generation, no versioning inspection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Uuid([u8; 16]);
 
@@ -190,7 +195,8 @@ impl FromStr for Uuid {
 /// conversion.
 ///
 /// This is a dependency-free value carrier, not a calendar library: it does
-/// not format a human date (that is the deferred `time`-crate integration).
+/// not format a human date (for that, register an external-type bridge to a
+/// `chrono::DateTime` / `time::OffsetDateTime` via a converter free function).
 /// It exposes the raw microsecond count and an honest Unix-epoch conversion
 /// so the epoch offset is not a footgun.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -266,7 +272,8 @@ impl Timestamptz {
 /// There is deliberately no `to_unix_micros` here — converting a
 /// zone-less wall clock to a Unix instant would require assuming a zone,
 /// which would be a silent lie. Use [`Self::as_micros`] and apply your own
-/// zone knowledge, or the deferred `time`-crate integration.
+/// zone knowledge, or register an external-type bridge to a naive-datetime type
+/// (e.g. `chrono::NaiveDateTime`) via a converter free function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Timestamp(i64);
 
@@ -294,9 +301,10 @@ impl Timestamp {
 /// bsql is deliberately **dependency-free** here: it does NOT parse,
 /// validate, or canonicalise the JSON structure — the exact bytes PostgreSQL
 /// sends (which the server already validated as well-formed JSON on the way
-/// in) are surfaced as a UTF-8 string via [`Self::as_str`]. If you want a
-/// parsed `serde_json::Value`, that is the planned feature-flagged
-/// integration; this type is the always-available core.
+/// in) are surfaced as a UTF-8 string via [`Self::as_str`]. To decode straight
+/// into a parsed `serde_json::Value` (or `sonic_rs::Value`), register an
+/// external-type bridge via a converter free function; this type is the
+/// always-available dep-free core.
 ///
 /// The `json` wire form is the raw text (no framing), unlike [`Jsonb`] which
 /// carries a leading version byte.
