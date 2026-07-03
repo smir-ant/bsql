@@ -29,14 +29,40 @@ so there is no per-call text/binary drift and no injection surface.
   schema your migration `*.sql` files describe.
 - **Binary-uniform wire.** `ParamsWriter` is the sole encoding authority;
   `query!` binds every parameter in binary.
+- **Streaming `COPY`.** `copy_in` / `copy_in_with` bulk-load a table in
+  constant memory (no per-row heap growth — one reused scratch buffer) and
+  `copy_out` streams a table back the same way. Both drivers, PostgreSQL
+  text copy format, the table name validated as a SQL identifier.
+- **Typed `LISTEN` / `NOTIFY`.** `listen` subscribes; `recv_notification`
+  (or `recv_notification_as::<T>` for a `FromStr`-parsed payload) delivers
+  the notifications. A `NOTIFY` that arrives *during* a query is captured in
+  a counted, no-drop notification ledger — never silently dropped. Both
+  drivers.
+- **External-type bridges.** `query!` can decode a column straight into a
+  consumer-chosen external crate type (`chrono::DateTime`, `uuid::Uuid`,
+  `serde_json::Value`, …) with `bsql` depending on and forcing nothing: the
+  `build.rs` registers `.bridge(pg_type, target_path, converter_fn_path)` and
+  the consumer supplies one infallible free-function converter — the
+  orphan-proof seam. (CLAUDE.md documents it under *External-type bridges*.)
+- **Destructive-migration acknowledgement gate.** A migration that
+  irreversibly destroys data — `DROP TABLE`, `ALTER TABLE … DROP COLUMN`,
+  `DROP SCHEMA … CASCADE`, `TRUNCATE`, or `DROP DATABASE` — is a **build
+  error** unless a co-located `-- bsql:ack-destructive` comment
+  acknowledges it, so accidental data loss is caught at compile time.
+- **An in-memory fake PostgreSQL test kit** (`bsql-testkit`). A consumer
+  tests real driver code — `query_sql` *and* the compile-checked `query!`
+  flagship — against a deterministic in-memory fake, with no network and no
+  server, over either the async or the sync driver.
 - **A safety floor enforced by the compiler**, not by convention (see
   [Safety floor](#safety-floor)).
 
-Not yet shipped (do not assume these exist): a `COPY` fast path, automatic
-N+1 detection, a migration runner, a test kit. The macro validates against
-your migration **files**, not a live database — a schema change applied
-by hand in `psql` without a migration file is invisible by design (the
-committed migration set is the source of truth).
+Not yet shipped (do not assume these exist): automatic N+1 detection, and a
+live migration **runner**. The build-time schema validation and the
+destructive-migration acknowledgement gate ship, but there is no
+`bsql migrate` command that applies migrations to a running database. The
+macro validates against your migration **files**, not a live database — a
+schema change applied by hand in `psql` without a migration file is
+invisible by design (the committed migration set is the source of truth).
 
 ## The one-crate consumer story
 
@@ -107,7 +133,7 @@ of row count). See the crate-root docs of `bsql` / `bsql-postgres-async` /
 
 ## Crate layout
 
-Nine publishable crates and four never-published (`publish = false`) dev
+Nine publishable crates and five never-published (`publish = false`) dev
 tools. *(members: root `Cargo.toml` `[workspace] members`; package names /
 publish flags: `grep -m1 '^name\|^publish' <member>/Cargo.toml`.)*
 
@@ -118,8 +144,8 @@ publish flags: `grep -m1 '^name\|^publish' <member>/Cargo.toml`.)*
 | `bsql-postgres-core` | [`crates/postgres/core/`](crates/postgres/core/) | Shared across both drivers: result materializer, dynamic `Row` / `QueryResult` types, `ConnectConfig`, TLS config, and `Rows` / `RowsBuilder`. |
 | `bsql-postgres-async` | [`crates/postgres/async/`](crates/postgres/async/) | tokio async driver — a thin I/O adapter over the engine. |
 | `bsql-postgres-sync` | [`crates/postgres/sync/`](crates/postgres/sync/) | `std::net` blocking driver — a thin I/O adapter over the engine. |
-| `bsql-postgres-derive` | [`crates/postgres/derive/`](crates/postgres/derive/) | Internal proc-macro for `#[derive(Pristine)]` struct-freshness checks. A build helper, not a consumer-facing feature. |
 | `bsql-sqlite` | [`crates/sqlite/driver/`](crates/sqlite/driver/) | Embedded SQLite driver over bundled `rusqlite`. |
+| `bsql-testkit` | [`crates/testkit/`](crates/testkit/) | Deterministic in-memory fake PostgreSQL. Tests real driver code (`query_sql` and the compile-checked `query!` path) against scripted replies over both drivers — no network, no server. Enables the drivers' + core's off-by-default `testkit` feature (the `Wire::Fake` transport arm). |
 | `bsql-build` | [`crates/build/`](crates/build/) | **Build-time only.** Replays migration DDL into the schema catalog (and, under its `sqlite` feature, a SQLite conformance template). A `[build-dependencies]` helper — never a runtime dependency. |
 | `bsql-query-macros` | [`crates/query-macros/`](crates/query-macros/) | **Host-only proc-macro.** Reads the build catalog and types / validates each `query!`, emitting the typed records. Runs in the compiler; never linked into a consumer's runtime binary. |
 
@@ -130,7 +156,9 @@ crate's runtime graph — the `runtime_graph_pin` gate proves this.
 Dev-only tools (`publish = false`, not shipped): `bsql-devgates`
 (the local gates + counting allocator, the workspace's only `unsafe`),
 `bsql-query-fixture` and `bsql-query-sqlite-fixture` (real consumers that
-exercise the migrations → catalog → `query!` chain end-to-end), and
+exercise the migrations → catalog → `query!` chain end-to-end),
+`bsql-query-bridge-fixture` (a real consumer proving the external-type
+bridge — `query!` decoding a column into a consumer-chosen type), and
 `bsql-corpus` (a replay corpus pinning engine behaviour against goldens).
 
 ## Safety floor
@@ -177,27 +205,27 @@ cargo test -p bsql-query-fixture  --test query_live_sync  -- --ignored  # live q
 
 ### Measured facts (reproduce them)
 
-All measured at commit `67882617` in this worktree:
+All measured at commit `a6577cd0` in this worktree:
 
-- **1573 test functions** — `1516` `#[test]` + `57` `#[tokio::test]`
-  (including `tokio::test(flavor = …)` variants). Of these, **125 are
+- **1734 test functions** — `1644` `#[test]` + `90` `#[tokio::test]`
+  (including `tokio::test(flavor = …)` variants). Of these, **152 are
   `#[ignore]` live suites** that require a running database.
   ```bash
   find . -path ./target -prune -o -name '*.rs' -print0 \
-    | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l   # 1573
+    | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l   # 1734
   find . -path ./target -prune -o -name '*.rs' -print0 \
-    | xargs -0 grep -hE '^[[:space:]]*#\[ignore'        | wc -l   # 125
+    | xargs -0 grep -hE '^[[:space:]]*#\[ignore'        | wc -l   # 152
   ```
 - **Source LoC** (per shipped crate `src/`; the largest, `bsql-build`, is
   dominated by an inline `#[cfg(test)]` inference test module):
   ```bash
   for d in crates/bsql crates/postgres/{proto,core,async,sync} \
-           crates/sqlite/driver crates/build crates/query-macros; do
+           crates/sqlite/driver crates/testkit crates/build crates/query-macros; do
     printf '%-28s %s\n' "$d" \
       "$(find "$d/src" -name '*.rs' -exec cat {} + | wc -l)"
   done
-  # bsql 173 · proto 24813 · core 3776 · async 1711 · sync 1534
-  # derive 416 · sqlite/driver 1010 · build 32862 · query-macros 1285
+  # bsql 217 · proto 25765 · core 5817 · async 2095 · sync 1910
+  # sqlite/driver 1010 · testkit 560 · build 34591 · query-macros 1697
   ```
 
 ## Sources of truth
