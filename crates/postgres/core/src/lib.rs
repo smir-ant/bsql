@@ -13,6 +13,11 @@ pub mod config;
 pub mod error;
 pub mod footprint;
 pub mod materialize;
+// The per-connection N+1 query detector — a diagnostics-only, zero-cost-off
+// tracker. Compiled only under the `n1-detect` feature; a default build has no
+// tracker type, no field, and no query-path branch.
+#[cfg(feature = "n1-detect")]
+pub mod n1;
 // The per-connection notification ledger (a bounded, counted no-drop buffer)
 // and the sink adapter that captures every surfaced notification into it.
 pub mod notify;
@@ -32,6 +37,8 @@ pub mod types;
 pub use config::{validate_startup_params, ConnectConfig, SslMode};
 pub use error::{ColumnError, DbError, DriverError};
 pub use materialize::{CollectedResult, DbErrorSink, ResultCollector};
+#[cfg(feature = "n1-detect")]
+pub use n1::{N1Report, N1Tracker};
 pub use notify::{capture_notify, NotificationLedger, TypedNotification};
 pub use typed_rows::{Rows, RowsBuilder};
 pub use types::{ArenaBuilder, ArenaSealError, Notification, QueryResult, Row};

@@ -68,3 +68,23 @@ const _: () = {
         _assert_static::<PooledConnection>();
     }
 };
+
+// Tier-1 static assertion: the flagship typed query future stays `Send` so it
+// remains spawnable — the property the pool relies on. This holds in BOTH
+// builds: as a plain `async fn` (default), and as the `n1-detect` reshape
+// `fn -> impl Future + '_`, whose bare RPIT return type LEAKS the concrete
+// future's auto-traits (a boxed `dyn Future` would not). The reshape thus adds
+// no explicit `Send` bound and constrains no caller; `Send` is preserved exactly
+// as the `async fn` had it (given `Send` params). Type-checked, never run.
+const _: () = {
+    fn _assert_query_future_send<Q: bsql_postgres_proto::TypedQuery>(
+        conn: &mut Connection,
+        params: Q::Params,
+    ) where
+        Q::Params: Send,
+    {
+        fn _is_send<T: Send>(_: &T) {}
+        let fut = conn.query::<Q>(params);
+        _is_send(&fut);
+    }
+};

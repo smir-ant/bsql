@@ -47,7 +47,7 @@ crates/
   bsql/              — umbrella facade + query! re-export + #[bsql::test] harness (bsql::pg, ::pg_sync, ::sqlite)  — 675 LoC
   postgres/
     proto/           — sans-IO wire protocol + session engine (no_std + alloc)  — 25765 LoC
-    core/            — shared engine materializer + types + config + TLS + Rows + notify ledger  — 5817 LoC
+    core/            — shared engine materializer + types + config + TLS + Rows + notify ledger + N+1 detector  — 6861 LoC
     async/           — tokio async driver (thin adapter over the engine)  — 2095 LoC
     sync/            — std::net sync driver (thin adapter over the engine)  — 1910 LoC
   sqlite/
@@ -78,6 +78,10 @@ cargo clippy -p bsql --features test-harness --all-targets              # lint t
 cargo test  -p bsql --features test-harness --lib                       # harness unit tests (offline)
 BSQL_TEST_DSN=postgres://USER@localhost/postgres \
   cargo test -p bsql-test-harness-fixture -- --ignored                  # live #[bsql::test] isolation witness (needs PG)
+cargo clippy --workspace --features n1-detect --all-targets             # lint the (non-default) N+1 detector reshape
+cargo test  -p bsql-postgres-core --features n1-detect --lib n1::       # N1Tracker offline unit tests
+BSQL_TEST_DSN=postgres://USER@localhost/postgres \
+  cargo test -p bsql-query-fixture --features n1-detect -- --ignored    # live N+1-detection witness (needs PG)
 ```
 
 **Consumer wiring — the `query!` flagship.** A consumer reaches the whole
@@ -163,6 +167,35 @@ production build pulls neither the runtime nor the harness.
 `tools/test_harness_fixture` is the end-to-end proof (parallel isolation over
 both drivers, a mixed async+sync file, teardown on success and on panic, the loud
 unset-DSN error).
+
+**N+1 query detection — `conn.n1_report()` (feature `n1-detect`).** A consumer
+enables `bsql` (or a driver crate) with `features = ["n1-detect"]` to detect the
+classic N+1 anti-pattern: the SAME `query!` query executed repeatedly from the
+SAME source line (once per row of a prior result). Each typed verb records its
+`(sql, call-site)` pair; when a pair repeats past a threshold (25) WITHIN one
+logical operation, `conn.n1_report()` returns an `N1Report { sql, file, line,
+count }` for it — the source line comes from `#[track_caller]`. The detector is
+**diagnostics-only** (it never batches, blocks, errors, or alters a result — a
+false positive is at most a spurious report) and **zero-cost when off**: the
+feature is default-OFF, so a production build compiles no `Connection` field, no
+query-path branch, and no `#[track_caller]` ABI cost — the typed verbs stay
+byte-identical `async fn`s (async driver) / blocking `fn`s (sync driver). Because
+`#[track_caller]` is a no-op-with-warning on `async fn`, the `n1-detect` build of
+the async driver reshapes the four typed verbs to `#[track_caller] fn -> impl
+Future + 'a` with a sync prologue that captures `Location::caller()` before the
+`async move` block; the prologue keeps `clippy::manual_async_fn` from firing (so
+NO `#[allow]`/`#[expect]` is needed in either feature state), and the bare RPIT
+return type LEAKS the concrete future's `Send` (a static assertion pins it), so
+every existing `.await` call site — and the pool — is unaffected. The recency
+window is a fixed inline array (no per-query allocation) reset at each
+logical-operation boundary (commit/rollback, `transaction`, `reset_session`), so
+repetition ACROSS operations is forgiven while a per-row loop WITHIN one is
+caught. Keyed on the `(sql-pointer, call-site-pointer)` composite so two distinct
+call sites of the same query are never conflated. No external dependency (a cargo
+feature only). The `tools/query_fixture` `n1-detect` feature + its
+`tests/n1_detect_live.rs` are the end-to-end proof (N+1 flagged with source +
+count, no false positive on a one-shot or across distinct lines, all results
+still correct).
 
 The `deps_pin` gate (`tools/devgates/tests/deps_pin.rs`) pins the resolved
 dependency set (parsed from `Cargo.lock`) to a committed golden, and bans any

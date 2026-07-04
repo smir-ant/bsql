@@ -12,6 +12,14 @@ postgres-async = ["dep:bsql-postgres-async"]
 postgres-sync = ["dep:bsql-postgres-sync"]
 sqlite = ["dep:bsql-sqlite"]
 
+# `n1-detect` — turn on the diagnostics-only N+1 query detector on whichever
+# PostgreSQL driver(s) are enabled (`conn.n1_report()`). OFF by default: a
+# production build compiles no tracker field and no query-path branch. The `?`
+# activates the feature ONLY on an already-enabled driver, so it composes with
+# any backend selection and pulls no driver a consumer did not already ask for.
+# Adds no external dependency (a cargo feature only).
+n1-detect = ["bsql-postgres-async?/n1-detect", "bsql-postgres-sync?/n1-detect"]
+
 # `testkit` — the deterministic in-memory fake PostgreSQL (`bsql::testkit`), for
 # testing driver code with no network. NON-default: a production build never
 # pulls it. It turns on the async driver's + core's `testkit` feature (the

@@ -16,6 +16,13 @@ license = "MIT OR Apache-2.0"
 # `bsql-testkit` crate turns this on.
 testkit = []
 
+# `n1-detect` — the diagnostics-only N+1 query detector (`n1::N1Tracker`,
+# `n1::N1Report`). OFF by default: a production build compiles no tracker type,
+# so the drivers' `Connection` gains no field and no query-path branch. Additive
+# and dependency-free (the tracker is a fixed inline window + a `Vec` of reports,
+# no external crate). Both drivers turn this on through their own `n1-detect`.
+n1-detect = []
+
 [dependencies]
 bsql-postgres-proto = { path = "../proto" }
 rustls = { workspace = true }

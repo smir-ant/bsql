@@ -180,6 +180,14 @@ pub struct Connection {
     /// [`reset_session`](Self::reset_session) clears it so a pooled connection
     /// never delivers a prior user's notifications to the next.
     notifications: NotificationLedger,
+    /// The diagnostics-only N+1 query detector. Present ONLY under the
+    /// `n1-detect` feature — a default build has no such field, so the flagship
+    /// typed verbs stay byte-identical and the connection footprint is
+    /// unchanged. Each typed verb feeds it its `(sql, call-site)` pair; a
+    /// logical-operation boundary (commit/rollback, session reset) clears its
+    /// recency window. Read via [`n1_report`](Self::n1_report).
+    #[cfg(feature = "n1-detect")]
+    n1_tracker: bsql_postgres_core::N1Tracker,
 }
 
 impl Connection {
@@ -247,6 +255,8 @@ impl Connection {
             },
             stmt_counter: 0,
             notifications: NotificationLedger::new(),
+            #[cfg(feature = "n1-detect")]
+            n1_tracker: bsql_postgres_core::N1Tracker::new(),
         })
     }
 
@@ -295,6 +305,8 @@ impl Connection {
             },
             stmt_counter: 0,
             notifications: NotificationLedger::new(),
+            #[cfg(feature = "n1-detect")]
+            n1_tracker: bsql_postgres_core::N1Tracker::new(),
         })
     }
 
@@ -537,6 +549,7 @@ impl Connection {
     /// The flagship typed `execute`: Parses the content-addressed statement once
     /// per connection, then reuses the server-side plan (a bare Bind + Execute)
     /// on repeats. The runtime-SQL escape hatch is [`execute_sql`](Self::execute_sql).
+    #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn execute<P, R>(
         &mut self,
         q: &'static PreparedQuery<P, R>,
@@ -546,6 +559,9 @@ impl Connection {
         P: ParamsWriter + 'static,
         R: RowDecode + 'static,
     {
+        // Diagnostics-only N+1 record at the CALL site; compiled out when off.
+        #[cfg(feature = "n1-detect")]
+        self.n1_record(q.sql(), core::panic::Location::caller());
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let polled = engine::poll_once(self.engine.query_params(live, q, params, capture_notify(&mut self.notifications, |s| {
@@ -584,7 +600,20 @@ impl Connection {
     /// safely (re)creates the prepared statement, and once it is durable
     /// (committed / autocommit) later uses reuse the server-side plan with a bare
     /// Bind + Execute. There is no duplicate-prepared-statement footgun.
+    #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query<Q: TypedQuery>(&mut self, params: Q::Params) -> Result<Rows<Q>, DriverError> {
+        // Diagnostics-only N+1 record at the CALL site (`#[track_caller]` makes
+        // `Location::caller()` report the caller). Compiled out when off — the
+        // method is then byte-identical to a bare delegation.
+        #[cfg(feature = "n1-detect")]
+        self.n1_record(Q::PREPARED.sql(), core::panic::Location::caller());
+        self.query_collect::<Q>(params)
+    }
+
+    /// The verb body shared by [`query`](Self::query) and the engine of
+    /// [`query_one`](Self::query_one). Collects a typed result into a
+    /// [`Rows<Q>`] prebuffer; classifies an oversize row loudly.
+    fn query_collect<Q: TypedQuery>(&mut self, params: Q::Params) -> Result<Rows<Q>, DriverError> {
         let live = self.take_live()?;
         let mut builder = RowsBuilder::new();
         let polled = engine::poll_once(self.engine.query_params(live, &Q::PREPARED, params, capture_notify(&mut self.notifications, |s| {
@@ -609,11 +638,17 @@ impl Connection {
     /// typed counterpart to the runtime-SQL
     /// [`query_one_sql`](Self::query_one_sql); shares [`query`](Self::query)'s
     /// server-side plan reuse.
+    #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_one<Q: TypedQuery>(
         &mut self,
         params: Q::Params,
     ) -> Result<Q::Owned, DriverError> {
-        let rows = self.query::<Q>(params)?;
+        // Record at THIS call site, then reuse the shared body directly (NOT the
+        // public `query`) so the N+1 count is attributed once, here, rather than
+        // double-counted through an inner verb. Compiled out when off.
+        #[cfg(feature = "n1-detect")]
+        self.n1_record(Q::PREPARED.sql(), core::panic::Location::caller());
+        let rows = self.query_collect::<Q>(params)?;
         match rows.len() {
             0 => Err(DriverError::NoRows),
             1 => rows
@@ -669,6 +704,7 @@ impl Connection {
     ///
     /// Shares [`query`](Self::query)'s server-side plan reuse: the statement is
     /// Parsed once per connection and reused thereafter.
+    #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_each<Q, F, E>(
         &mut self,
         params: Q::Params,
@@ -678,6 +714,9 @@ impl Connection {
         Q: TypedQuery,
         F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E>,
     {
+        // Diagnostics-only N+1 record at the CALL site; compiled out when off.
+        #[cfg(feature = "n1-detect")]
+        self.n1_record(Q::PREPARED.sql(), core::panic::Location::caller());
         let live = self.take_live()?;
         // Captured across the streaming sink; read after the verb settles.
         let mut db_error: Option<DbError> = None;
@@ -860,6 +899,33 @@ impl Connection {
         self.settle(polled, &mut collector)
     }
 
+    /// Feed one typed-verb execution to the N+1 detector (diagnostics-only).
+    /// Records nothing that steers control flow — the query result is computed
+    /// independently, so a spurious record can never change behaviour.
+    #[cfg(feature = "n1-detect")]
+    fn n1_record(&mut self, sql: &'static str, caller: &'static core::panic::Location<'static>) {
+        self.n1_tracker.record(sql, caller);
+    }
+
+    /// The N+1 anti-patterns detected on this connection so far — one entry per
+    /// `(query, source line)` site that ran more times than the detector's
+    /// threshold within a single logical operation.
+    ///
+    /// Present ONLY under the `n1-detect` feature. Purely diagnostic: the driver
+    /// builds this ledger as a side effect of running the typed verbs
+    /// ([`query`](Self::query), [`query_one`](Self::query_one),
+    /// [`query_each`](Self::query_each), [`execute`](Self::execute)) and never
+    /// acts on it, so enabling detection cannot change what any query returns.
+    /// The recency window is cleared at each logical-operation boundary
+    /// (commit/rollback, [`reset_session`](Self::reset_session)) so repetition
+    /// ACROSS operations is forgiven; the returned ledger itself persists for the
+    /// connection's life.
+    #[cfg(feature = "n1-detect")]
+    #[must_use]
+    pub fn n1_report(&self) -> &[bsql_postgres_core::N1Report] {
+        self.n1_tracker.report()
+    }
+
     /// `BEGIN` a transaction.
     pub fn begin(&mut self) -> Result<(), DriverError> {
         self.simple_query("BEGIN")?;
@@ -869,12 +935,19 @@ impl Connection {
     /// `COMMIT` the current transaction.
     pub fn commit(&mut self) -> Result<(), DriverError> {
         self.simple_query("COMMIT")?;
+        // A committed transaction is a logical-operation boundary: forget the
+        // N+1 recency window so a query repeated in the NEXT operation is not
+        // conflated with this one. Diagnostics-only.
+        #[cfg(feature = "n1-detect")]
+        self.n1_tracker.reset();
         Ok(())
     }
 
     /// `ROLLBACK` the current transaction.
     pub fn rollback(&mut self) -> Result<(), DriverError> {
         self.simple_query("ROLLBACK")?;
+        #[cfg(feature = "n1-detect")]
+        self.n1_tracker.reset();
         Ok(())
     }
 
@@ -890,7 +963,7 @@ impl Connection {
         f: impl FnOnce(&mut Self) -> Result<R, DriverError>,
     ) -> Result<R, DriverError> {
         self.simple_query("BEGIN")?;
-        match f(self) {
+        let result = match f(self) {
             Ok(value) => {
                 self.simple_query("COMMIT")?;
                 Ok(value)
@@ -901,7 +974,12 @@ impl Connection {
                 drop(self.simple_query("ROLLBACK"));
                 Err(e)
             }
-        }
+        };
+        // Either terminator closes a logical operation: forget the N+1 recency
+        // window so the next operation starts fresh. Diagnostics-only.
+        #[cfg(feature = "n1-detect")]
+        self.n1_tracker.reset();
+        result
     }
 
     /// Subscribe to a `LISTEN` channel.
@@ -997,6 +1075,11 @@ impl Connection {
         // delivers a prior user's notifications to the next. Done last so a
         // notification that rode the reset's own response stream is cleared too.
         self.notifications.clear();
+        // A pool session reset is the strongest logical-operation boundary: the
+        // connection is about to serve a new logical user, so forget the N+1
+        // recency window (the accumulated report ledger persists). Diagnostics-only.
+        #[cfg(feature = "n1-detect")]
+        self.n1_tracker.reset();
         Ok(())
     }
 

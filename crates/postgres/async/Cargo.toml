@@ -15,6 +15,14 @@ license = "MIT OR Apache-2.0"
 # consumer-facing `bsql-testkit` crate turns this on.
 testkit = ["bsql-postgres-core/testkit"]
 
+# `n1-detect` — the diagnostics-only N+1 query detector. OFF by default: a
+# production build gains no `Connection` field, no query-path branch, and no
+# `#[track_caller]` ABI cost — the typed verbs stay byte-identical `async fn`s.
+# When on, it turns on the core `n1-detect` feature (the `N1Tracker` type) and
+# reshapes the typed verbs to capture their `#[track_caller]` call site. Adds no
+# external dependency.
+n1-detect = ["bsql-postgres-core/n1-detect"]
+
 [dependencies]
 bsql-postgres-core = { path = "../core" }
 bsql-postgres-proto = { path = "../proto" }
