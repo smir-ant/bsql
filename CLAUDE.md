@@ -69,6 +69,7 @@ cargo test --workspace --doc         # doctests
 cargo test -p bsql-devgates --test deps_pin            # dependency-frontier gate
 cargo test -p bsql-devgates --test runtime_graph_pin   # build-time-only boundary gate
 cargo test -p bsql-devgates --test doc_links           # intra-doc-link wall (broken-link deny)
+cargo test -p bsql-postgres-proto --test engine_hotpath_codegen  # next_event codegen-stability gate (panic-free + instruction ceiling)
 cargo test -p bsql-sqlite            # SQLite (no PG needed)
 cargo test -p bsql-postgres-async --test sq_live -- --ignored    # async PG (needs local PG)
 cargo test -p bsql-postgres-sync --test sync_live -- --ignored   # sync PG (needs local PG)
@@ -232,6 +233,35 @@ gate the moment it lands. Scope: the PUBLIC documented surface of every member
 (a `--document-private-items` tightening is a follow-up — it currently surfaces
 unrelated pre-existing private-doc rot in the build-time inference crate + an
 engine `super::flush` ambiguity).
+
+The `engine_hotpath_codegen` gate
+(`crates/postgres/proto/tests/engine_hotpath_codegen.rs`) pins the *compiled
+shape* of the inbound hot dispatch `ActiveEngine::next_event` (the pull-cursor
+every verb turns socket bytes through). Reusing the asm-dump machinery — emit
+release assembly for the proto lib into a dedicated `CARGO_TARGET_DIR`
+(no-contention, like `doc_links`), then extract `next_event`'s instruction body
+between its definition label and its `.cfi_endproc` — it asserts two robust
+properties. (1) **No reachable panic / unwind edge**: the body must contain ZERO
+references to the `core::panicking` family (`panic`, `panic_bounds_check`,
+`panic_fmt`, …), `rust_begin_unwind`, or `_Unwind_Resume` — a machine-level
+proof, strictly stronger than the source `deny(indexing_slicing)` /
+`deny(panic)` floor, that no bounds-check or panic survived optimization in the
+dispatch's own frame. A regression that reintroduced an un-elidable `arr[i]` or
+a fallible `unwrap` on the hot path turns this red. (2) **Instruction-count
+ceiling**: the body must compile to no more than a committed golden
+(`tests/hotpath_goldens/next_event_insn_ceiling.txt`), which fails only on real
+GROWTH (bloat, a cold helper newly inlined into the hot frame, a slipped-in
+branch) and is deterministic on the pinned toolchain; a deliberate change is a
+reviewed golden diff regenerated with `BSQL_HOTPATH_PIN=overwrite` (mirroring
+`TRYBUILD=overwrite`). Deliberately NOT an exact-asm golden (brittle to any
+unrelated scheduling shift), and deliberately NOT a whole-body no-alloc claim:
+`next_event`'s COLD control-frame branches (RowDescription schema parse, oversize
+buffering) legitimately allocate, so the alloc family is documented, not gated —
+the HOT DataRow arm's zero-allocation is proven separately by
+`engine_query_alloc` (which drives `query_params` through `pump_active`, and
+`pump_active` surfaces every row via `next_event`). Complements
+`engine_asm_identity` (which pins the zero-cost observer seam) — that gate is
+blind to `next_event`'s body; this one covers it.
 
 PG tests require: PostgreSQL on localhost:5432, user `smir-ant`, database `postgres`, trust auth.
 SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in pg_hba.conf.

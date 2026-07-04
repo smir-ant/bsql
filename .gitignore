@@ -39,3 +39,8 @@ TODO
 # allowed version-duplications, and the gate fails on any drift. They
 # must be committed despite the broad `*.txt` ignore above.
 !tools/devgates/tests/deps_goldens/*.txt
+
+# The next_event codegen gate's instruction-count ceiling is likewise a
+# committed source-of-truth golden (regenerated with `BSQL_HOTPATH_PIN=overwrite`),
+# so it too must survive the broad `*.txt` ignore above.
+!crates/postgres/proto/tests/hotpath_goldens/*.txt
