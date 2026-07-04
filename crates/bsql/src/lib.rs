@@ -227,17 +227,22 @@ pub mod __rt {
 // Schema-per-test isolation (feature `test-harness`)
 // ════════════════════════════════════════════════════════════════════
 //
-// `#[bsql::test]` over an `async fn(conn: &mut bsql::pg::Connection)` runs the
-// test in its own freshly-created PostgreSQL schema and drops that schema on
-// exit — even on panic. Two such tests run in parallel against the same server
-// without interfering, because each connection's connect-time `search_path`
-// pins every unqualified name to its own schema. Built on the async driver and
-// a per-test tokio runtime, so it is gated OFF by default: a production build
-// never pulls the runtime or the harness.
+// `#[bsql::test]` over a test taking a single connection runs it in its own
+// freshly-created PostgreSQL schema and drops that schema on exit — even on
+// panic. Two such tests run in parallel against the same server without
+// interfering, because each connection's connect-time `search_path` pins every
+// unqualified name to its own schema. It works over BOTH drivers: an `async fn`
+// test (`conn: &mut bsql::pg::Connection`) rides the async driver behind a
+// per-test tokio runtime, and a plain `fn` test
+// (`conn: &mut bsql::pg_sync::Connection`) rides the blocking driver with no
+// runtime. Gated OFF by default: a production build never pulls the runtime or
+// the harness.
 
-/// Run an integration test in its own isolated PostgreSQL schema.
+/// Run an integration test in its own isolated PostgreSQL schema — over the
+/// async OR the sync driver.
 ///
-/// Applied to an `async fn` taking a single `conn: &mut bsql::pg::Connection`:
+/// Applied to an `async fn` taking a single `conn: &mut bsql::pg::Connection`
+/// (runs over the async driver) …
 ///
 /// ```rust,ignore
 /// #[bsql::test]
@@ -246,6 +251,20 @@ pub mod __rt {
 ///     // ... assertions, all inside an isolated schema ...
 /// }   // schema auto-dropped, even if the test panics
 /// ```
+///
+/// … or to a plain `fn` taking a single `conn: &mut bsql::pg_sync::Connection`
+/// (runs over the blocking driver, no runtime):
+///
+/// ```rust,ignore
+/// #[bsql::test]
+/// fn creates_a_user(conn: &mut bsql::pg_sync::Connection) {
+///     conn.execute_sql("CREATE TABLE users (id int)").unwrap();
+/// }   // schema auto-dropped, even if the test panics
+/// ```
+///
+/// The `async`-ness of the function selects the driver; the connection argument
+/// type must match (an `async fn` taking a sync connection, or a plain `fn`
+/// taking an async connection, is a compile error, never a mis-expansion).
 ///
 /// The harness connects to the server named by the `BSQL_TEST_DSN` environment
 /// variable (a *test* variable, deliberately distinct from an application's
@@ -260,14 +279,16 @@ pub use bsql_query_macros::test;
 /// Runtime support the `#[bsql::test]` expansion names.
 ///
 /// NOT a stable API and NOT for direct use — the `#[bsql::test]` expansion
-/// resolves `::bsql::__test_rt::run_schema_isolated_test` through the single
-/// `bsql` dependency. Compiled only under the non-default `test-harness`
+/// resolves `::bsql::__test_rt::run_schema_isolated_test` (async body) or
+/// `::bsql::__test_rt::run_schema_isolated_test_sync` (sync body) through the
+/// single `bsql` dependency. Compiled only under the non-default `test-harness`
 /// feature.
 #[cfg(feature = "test-harness")]
 #[doc(hidden)]
 pub mod __test_rt {
     pub use crate::test_harness::{
-        DSN_ENV, resolve_base_config, run_schema_isolated_test, schema_exists,
+        DSN_ENV, resolve_base_config, run_schema_isolated_test, run_schema_isolated_test_sync,
+        schema_exists, schema_exists_sync,
     };
 }
 

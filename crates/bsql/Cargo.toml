@@ -40,17 +40,20 @@ macros = ["dep:bsql-query-macros", "dep:bsql-postgres-proto", "dep:bsql-postgres
 macros-sqlite = ["macros", "bsql-query-macros/sqlite"]
 
 # `test-harness` — the `#[bsql::test]` schema-per-test isolation attribute plus
-# its runtime (`::bsql::__test_rt`). It pulls the `#[bsql::test]` proc-macro, the
-# async driver (for `Connection` / `ConnectConfig`), `bsql-postgres-core` (the
+# its runtime (`::bsql::__test_rt`). It pulls the `#[bsql::test]` proc-macro,
+# BOTH drivers (the async driver for an `async fn` test, the sync driver for a
+# plain `fn` test — the attribute is a twin over both), `bsql-postgres-core` (the
 # `sql_ident` identifier validator that keeps the spliced schema name
 # injection-safe), and a per-test tokio runtime (`rt` + the `net`/`time` drivers
-# the async connection needs). TEST-SUPPORT and NON-default: a production build
-# never pulls the runtime or the harness. All four deps are already resolved
-# workspace members (proto/core/async via the drivers, query-macros via the
-# fixtures, tokio via the async driver), so this adds no package to the lockfile.
+# the async connection needs; the sync path uses no runtime). TEST-SUPPORT and
+# NON-default: a production build never pulls the runtime or the harness. All
+# deps are already resolved workspace members (proto/core/async/sync via the
+# drivers, query-macros via the fixtures, tokio via the async driver), so this
+# adds no package to the lockfile.
 test-harness = [
     "dep:bsql-query-macros",
     "postgres-async",
+    "postgres-sync",
     "dep:bsql-postgres-core",
     "dep:tokio",
 ]

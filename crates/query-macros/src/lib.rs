@@ -1752,29 +1752,39 @@ fn byte_array_literal(bytes: &[u8]) -> TokenStream2 {
 // it through the single `bsql` crate. Both macros are host-only token
 // transformers sharing the syn/quote toolchain, which is why they share a crate.
 
-/// Run an integration test in its own isolated PostgreSQL schema.
+/// Run an integration test in its own isolated PostgreSQL schema — over the
+/// async OR the sync driver.
 ///
 /// Applied to an `async fn` taking a single `conn: &mut bsql::pg::Connection`,
-/// it emits a `#[test]` that connects to the server named by the `BSQL_TEST_DSN`
-/// environment variable, creates a unique schema, runs the body against a
-/// connection pinned to that schema (via its connect-time `search_path`), and
-/// drops the schema on exit — even if the test panics. Two `#[bsql::test]`
-/// tests run in parallel without interfering, because each sees only its own
-/// schema.
+/// it runs the body over the async driver; applied to a plain `fn` taking a
+/// single `conn: &mut bsql::pg_sync::Connection`, it runs the body over the
+/// blocking driver (no runtime). Either way it emits a `#[test]` that connects
+/// to the server named by the `BSQL_TEST_DSN` environment variable, creates a
+/// unique schema, runs the body against a connection pinned to that schema (via
+/// its connect-time `search_path`), and drops the schema on exit — even if the
+/// test panics. Two `#[bsql::test]` tests run in parallel without interfering,
+/// because each sees only its own schema.
 ///
 /// ```rust,ignore
 /// #[bsql::test]
 /// async fn creates_a_user(conn: &mut bsql::pg::Connection) {
 ///     conn.execute_sql("CREATE TABLE users (id int)").await.unwrap();
 /// }   // schema auto-dropped, even on panic
+///
+/// #[bsql::test]
+/// fn creates_a_user_sync(conn: &mut bsql::pg_sync::Connection) {
+///     conn.execute_sql("CREATE TABLE users (id int)").unwrap();
+/// }   // same isolation + teardown, over the blocking driver
 /// ```
 ///
 /// The attribute takes no arguments. Other attributes on the function
 /// (`#[ignore]`, `#[should_panic]`, …) are forwarded to the generated `#[test]`.
-/// The function must be `async`, non-generic, return `()`, and take exactly one
-/// `conn: &mut Connection` argument — anything else is a `compile_error!`. A
-/// synchronous `#[bsql::test]` is not yet supported (a loud `compile_error!`,
-/// never a silent mis-expansion).
+/// The function must be non-generic, return `()`, and take exactly one
+/// `conn: &mut Connection` argument — anything else is a `compile_error!`. The
+/// `async`-ness selects the driver; the connection argument type must match it
+/// (an `async fn` with a sync connection, or a plain `fn` with an async
+/// connection, is a type-mismatch compile error against the harness — never a
+/// silent mis-expansion).
 #[proc_macro_attribute]
 pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
     match expand_test(attr.into(), item.into()) {
@@ -1800,13 +1810,14 @@ fn expand_test(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream2, s
 
     let func: syn::ItemFn = syn::parse2(item)?;
 
-    if func.sig.asyncness.is_none() {
-        return Err(syn::Error::new_spanned(
-            func.sig.fn_token,
-            "bsql::test: the test function must be `async` \
-             (a synchronous #[bsql::test] is not yet supported)",
-        ));
-    }
+    // The `async`-ness selects the driver (async fn → async harness, plain fn →
+    // sync harness). Both are otherwise validated identically below; only the
+    // emitted runtime entry point and the closure flavor differ. A connection
+    // argument type that does not match the chosen driver is caught by the
+    // harness's own bound (a type-mismatch compile error), not here — so there
+    // is no mis-expansion.
+    let is_async = func.sig.asyncness.is_some();
+
     if !func.sig.generics.params.is_empty() || func.sig.generics.where_clause.is_some() {
         return Err(syn::Error::new_spanned(
             &func.sig.generics,
@@ -1851,14 +1862,32 @@ fn expand_test(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream2, s
     let name_str = name.to_string();
     let body = &func.block;
 
-    Ok(quote! {
-        #(#attrs)*
-        #[::core::prelude::v1::test]
-        #vis fn #name() {
+    // The only async-vs-sync divergence: the runtime entry point and whether the
+    // body closure is an async closure (returning a future the harness `.await`s)
+    // or a plain closure the harness calls directly. The `#pat: #ty` annotation
+    // rides both, so a connection type that does not match the chosen harness's
+    // bound is a clear compile error at the closure.
+    let call = if is_async {
+        quote! {
             ::bsql::__test_rt::run_schema_isolated_test(
                 #name_str,
                 async move |#pat: #ty| #body,
             );
+        }
+    } else {
+        quote! {
+            ::bsql::__test_rt::run_schema_isolated_test_sync(
+                #name_str,
+                move |#pat: #ty| #body,
+            );
+        }
+    };
+
+    Ok(quote! {
+        #(#attrs)*
+        #[::core::prelude::v1::test]
+        #vis fn #name() {
+            #call
         }
     })
 }

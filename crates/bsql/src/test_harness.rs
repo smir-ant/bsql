@@ -1,10 +1,10 @@
 //! Runtime support for the `#[bsql::test]` schema-per-test isolation attribute.
 //!
-//! NOT a stable API and NOT for direct use — the `#[bsql::test]` expansion
-//! names [`run_schema_isolated_test`] through the hidden `::bsql::__test_rt`
-//! re-export. It is compiled only under the non-default `test-harness` feature,
-//! so a production build never pulls the tokio runtime or the driver this
-//! harness composes.
+//! NOT a stable API and NOT for direct use — the `#[bsql::test]` expansion names
+//! [`run_schema_isolated_test`] (async body) or [`run_schema_isolated_test_sync`]
+//! (blocking body) through the hidden `::bsql::__test_rt` re-export. It is
+//! compiled only under the non-default `test-harness` feature, so a production
+//! build never pulls the runtime or the drivers this harness composes.
 //!
 //! # What one `#[bsql::test]` does
 //!
@@ -14,6 +14,15 @@
 //! its own schema (the connection's connect-time `search_path` pins every
 //! unqualified name to it). The schema name is unique per test invocation and
 //! per process, so a repeated run or a leaked prior schema never collides.
+//!
+//! # Async and sync are twins
+//!
+//! An `async fn` test drives the async driver behind a per-test tokio runtime; a
+//! plain `fn` test drives the blocking driver directly, with no runtime. The two
+//! entry points share ALL the driver-agnostic logic — the DSN resolution, the
+//! unique injection-safe schema name, the schema DDL, and the error type — so a
+//! fix to one can never silently diverge from the other. Only the connect and
+//! the run-the-body steps differ (`.await` versus blocking).
 //!
 //! # The DSN
 //!
@@ -27,8 +36,20 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::env::VarError;
 
-use bsql_postgres_async::{ConnectConfig, Connection, DriverError};
-use bsql_postgres_core::sql_ident;
+use bsql_postgres_core::{ConnectConfig, DriverError, sql_ident};
+
+// The async and sync drivers expose a `Connection` each; the harness composes
+// both, so each is imported under an explicit alias. `ConnectConfig`,
+// `DriverError`, and the `sql_ident` validator live in the shared core, so the
+// driver-agnostic logic below names core — not either driver.
+use bsql_postgres_async::Connection as AsyncConnection;
+use bsql_postgres_sync::Connection as SyncConnection;
+
+// ════════════════════════════════════════════════════════════════════
+// Shared, driver-agnostic core (one definition for both the async and the
+// sync harness — the DSN resolve, the unique schema name, the schema DDL,
+// and the error type).
+// ════════════════════════════════════════════════════════════════════
 
 /// The environment variable naming the PostgreSQL DSN each `#[bsql::test]`
 /// connects to (e.g. `postgres://user@localhost/postgres`).
@@ -51,7 +72,9 @@ const SCHEMA_PREFIX: &str = "bsql_t_";
 /// Process-wide monotonic counter. Together with the process id it makes every
 /// generated schema name unique across parallel tests in one process (the
 /// counter) and across separate runs or a leaked prior schema (the pid) —
-/// deterministically, with no randomness and no `SystemTime` seed.
+/// deterministically, with no randomness and no `SystemTime` seed. Shared by
+/// both harnesses, so an async and a sync test in the same process never draw
+/// the same name.
 static SCHEMA_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A failure setting up (or tearing down) an isolated schema. Surfaced to the
@@ -101,6 +124,8 @@ impl From<DriverError> for HarnessError {
 /// Pure over its argument — it takes the `env::var` result rather than reading
 /// the process environment — so the missing/malformed cases are testable
 /// deterministically without racing parallel tests over a global variable.
+/// Shared by the async and sync entry points, so both classify a missing or
+/// malformed DSN identically.
 fn resolve_dsn(var: Result<String, VarError>) -> Result<ConnectConfig, HarnessError> {
     match var {
         Ok(dsn) => ConnectConfig::from_dsn(&dsn).map_err(HarnessError::DsnParse),
@@ -139,26 +164,27 @@ fn unique_schema_name(test_name: &str) -> String {
     name
 }
 
-/// Create the isolated schema on the (public-search_path) admin connection.
-///
-/// The name is spliced into DDL text — there is no parameterized form for a
-/// schema identifier — so it is validated as a plain unquoted identifier first:
-/// the tier-1 injection guard. A leaked prior schema of the same name (a crashed
-/// run whose teardown never ran, or an OS pid reused after the old process died)
-/// is dropped first, so `CREATE` is idempotent.
-async fn create_isolated_schema(admin: &mut Connection, schema: &str) -> Result<(), HarnessError> {
-    sql_ident::validate_identifier(schema).map_err(HarnessError::SchemaName)?;
-    admin.execute_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await?;
-    admin.execute_sql(&format!("CREATE SCHEMA {schema}")).await?;
-    Ok(())
+/// Validate a generated schema name as a plain unquoted identifier — the tier-1
+/// injection guard applied before the name is spliced into DDL text (there is no
+/// parameterized form for a schema identifier). The name is injection-safe by
+/// construction, so a rejection here is a harness bug, not an expected path.
+/// Shared, so the guard is defined once for both harnesses.
+fn validate_schema_name(schema: &str) -> Result<(), HarnessError> {
+    sql_ident::validate_identifier(schema).map_err(HarnessError::SchemaName)
 }
 
-/// Drop the isolated schema (and everything in it) on the admin connection.
-/// `IF EXISTS` so a double-drop or a never-created schema is not an error.
-async fn drop_isolated_schema(admin: &mut Connection, schema: &str) -> Result<(), HarnessError> {
-    sql_ident::validate_identifier(schema).map_err(HarnessError::SchemaName)?;
-    admin.execute_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).await?;
-    Ok(())
+/// The `DROP SCHEMA IF EXISTS <schema> CASCADE` DDL for `schema`. Shared string
+/// builder, so the async and sync harness splice the identical text — a fix to
+/// one cannot diverge from the other. `IF EXISTS` makes it idempotent (a
+/// double-drop, a never-created schema, or a leaked prior schema of the same
+/// name is not an error).
+fn drop_schema_ddl(schema: &str) -> String {
+    format!("DROP SCHEMA IF EXISTS {schema} CASCADE")
+}
+
+/// The `CREATE SCHEMA <schema>` DDL for `schema`. Shared string builder.
+fn create_schema_ddl(schema: &str) -> String {
+    format!("CREATE SCHEMA {schema}")
 }
 
 /// Surface an unrecoverable harness condition as a loud panic. This is the
@@ -175,8 +201,44 @@ fn harness_fail(args: fmt::Arguments<'_>) -> ! {
     panic!("bsql::test: {args}");
 }
 
-/// Run one `#[bsql::test]` body in a freshly-created, isolated PostgreSQL
-/// schema, dropping that schema on exit even if the body panics.
+/// Resolve the base config the same way the run entry points do, but map the
+/// classified error to its display string so a fixture can assert the
+/// missing/malformed-DSN message without naming an internal type.
+///
+/// NOT a stable API — exists so the "unset DSN is a loud, named error" witness
+/// can be exercised deterministically (no global-env race, no server). Because
+/// the resolver is shared, this witness covers both the async and the sync path.
+#[doc(hidden)]
+pub fn resolve_base_config(var: Result<String, VarError>) -> Result<ConnectConfig, String> {
+    resolve_dsn(var).map_err(|e| e.to_string())
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Async harness — an `async fn` body over the tokio async driver.
+// ════════════════════════════════════════════════════════════════════
+
+/// Create the isolated schema on the (public-search_path) admin connection.
+///
+/// The name is validated as a plain unquoted identifier first (the shared tier-1
+/// injection guard), then the shared DDL is spliced. A leaked prior schema of
+/// the same name (a crashed run whose teardown never ran, or an OS pid reused
+/// after the old process died) is dropped first, so `CREATE` is idempotent.
+async fn create_isolated_schema(admin: &mut AsyncConnection, schema: &str) -> Result<(), HarnessError> {
+    validate_schema_name(schema)?;
+    admin.execute_sql(&drop_schema_ddl(schema)).await?;
+    admin.execute_sql(&create_schema_ddl(schema)).await?;
+    Ok(())
+}
+
+/// Drop the isolated schema (and everything in it) on the admin connection.
+async fn drop_isolated_schema(admin: &mut AsyncConnection, schema: &str) -> Result<(), HarnessError> {
+    validate_schema_name(schema)?;
+    admin.execute_sql(&drop_schema_ddl(schema)).await?;
+    Ok(())
+}
+
+/// Run one `async` `#[bsql::test]` body in a freshly-created, isolated
+/// PostgreSQL schema, dropping that schema on exit even if the body panics.
 ///
 /// Control flow:
 /// 1. Build a current-thread tokio runtime (each test owns its own).
@@ -196,7 +258,7 @@ fn harness_fail(args: fmt::Arguments<'_>) -> ! {
 /// have left mid-statement.
 pub fn run_schema_isolated_test<F>(test_name: &str, body: F)
 where
-    F: AsyncFnOnce(&mut Connection),
+    F: AsyncFnOnce(&mut AsyncConnection),
 {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -209,7 +271,7 @@ where
     };
     let schema = unique_schema_name(test_name);
 
-    let mut admin = match rt.block_on(Connection::connect(&base)) {
+    let mut admin = match rt.block_on(AsyncConnection::connect(&base)) {
         Ok(c) => c,
         Err(e) => harness_fail(format_args!(
             "could not connect the setup connection (via {DSN_ENV}) for schema '{schema}': {e}"
@@ -222,7 +284,7 @@ where
     // The test connection is pinned to the isolated schema via its connect-time
     // search_path, so every unqualified name resolves inside it.
     let test_cfg = base.with_search_path(schema.as_str());
-    let mut test_conn = match rt.block_on(Connection::connect(&test_cfg)) {
+    let mut test_conn = match rt.block_on(AsyncConnection::connect(&test_cfg)) {
         Ok(c) => c,
         Err(e) => {
             // The schema is already created; drop it before failing so a
@@ -273,24 +335,10 @@ where
     }
 }
 
-// ════════════════════════════════════════════════════════════════════
-// Doc-hidden test-support surface (for the harness's own witnesses).
-// ════════════════════════════════════════════════════════════════════
-
-/// Resolve the base config the same way [`run_schema_isolated_test`] does, but
-/// map the classified error to its display string so a fixture can assert the
-/// missing/malformed-DSN message without naming an internal type.
-///
-/// NOT a stable API — exists so the "unset DSN is a loud, named error" witness
-/// can be exercised deterministically (no global-env race, no server).
-#[doc(hidden)]
-pub fn resolve_base_config(var: Result<String, VarError>) -> Result<ConnectConfig, String> {
-    resolve_dsn(var).map_err(|e| e.to_string())
-}
-
 /// Return whether `schema` currently exists on the server named by
-/// [`DSN_ENV`]. Builds its own runtime and admin connection; a loud panic on any
-/// infrastructure failure. NOT a stable API — exists for the teardown witnesses.
+/// [`DSN_ENV`], probed over the async driver. Builds its own runtime and admin
+/// connection; a loud panic on any infrastructure failure. NOT a stable API —
+/// exists for the teardown witnesses.
 #[doc(hidden)]
 pub fn schema_exists(schema: &str) -> bool {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -302,7 +350,7 @@ pub fn schema_exists(schema: &str) -> bool {
         Err(e) => harness_fail(format_args!("{e}")),
     };
     rt.block_on(async {
-        let mut admin = match Connection::connect(&base).await {
+        let mut admin = match AsyncConnection::connect(&base).await {
             Ok(c) => c,
             Err(e) => harness_fail(format_args!("could not connect to check schema '{schema}': {e}")),
         };
@@ -322,6 +370,151 @@ pub fn schema_exists(schema: &str) -> bool {
             other => harness_fail(format_args!("unexpected schema-existence count for '{schema}': {other:?}")),
         }
     })
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Sync harness — a plain `fn` body over the std::net blocking driver. A
+// faithful twin of the async path above: it shares the DSN resolve, the
+// schema name, the DDL, and the error type, and differs only in that it
+// connects and runs the body directly — no tokio runtime, no `.await`.
+// ════════════════════════════════════════════════════════════════════
+
+/// Create the isolated schema on the (public-search_path) admin connection —
+/// the blocking twin of [`create_isolated_schema`]. Same shared validation and
+/// DDL; blocking calls instead of `.await`.
+fn create_isolated_schema_sync(admin: &mut SyncConnection, schema: &str) -> Result<(), HarnessError> {
+    validate_schema_name(schema)?;
+    admin.execute_sql(&drop_schema_ddl(schema))?;
+    admin.execute_sql(&create_schema_ddl(schema))?;
+    Ok(())
+}
+
+/// Drop the isolated schema on the admin connection — the blocking twin of
+/// [`drop_isolated_schema`].
+fn drop_isolated_schema_sync(admin: &mut SyncConnection, schema: &str) -> Result<(), HarnessError> {
+    validate_schema_name(schema)?;
+    admin.execute_sql(&drop_schema_ddl(schema))?;
+    Ok(())
+}
+
+/// Run one synchronous `#[bsql::test]` body in a freshly-created, isolated
+/// PostgreSQL schema, dropping that schema on exit even if the body panics —
+/// the blocking twin of [`run_schema_isolated_test`].
+///
+/// The control flow mirrors the async path exactly, minus the runtime: it
+/// resolves [`DSN_ENV`], connects an admin connection, `CREATE`s the unique
+/// schema, connects the test connection pinned to it, runs `body` inside
+/// [`std::panic::catch_unwind`], and `DROP`s the schema on the admin connection —
+/// always — reconciling a body panic against a teardown failure the same way.
+///
+/// One difference from the async twin: the blocking `Connection` has a `Drop`
+/// (a best-effort, panic-free graceful terminate over the socket). The test
+/// connection is therefore dropped at an explicit point BEFORE the reconcile
+/// below, so its `Drop` never runs during the `resume_unwind` unwind — teardown
+/// and a re-raised body panic can never combine into a double-panic abort.
+pub fn run_schema_isolated_test_sync<F>(test_name: &str, body: F)
+where
+    F: FnOnce(&mut SyncConnection),
+{
+    let base = match resolve_dsn(std::env::var(DSN_ENV)) {
+        Ok(c) => c,
+        Err(e) => harness_fail(format_args!("{e}")),
+    };
+    let schema = unique_schema_name(test_name);
+
+    let mut admin = match SyncConnection::connect(&base) {
+        Ok(c) => c,
+        Err(e) => harness_fail(format_args!(
+            "could not connect the setup connection (via {DSN_ENV}) for schema '{schema}': {e}"
+        )),
+    };
+    if let Err(e) = create_isolated_schema_sync(&mut admin, &schema) {
+        harness_fail(format_args!("could not create isolated schema '{schema}': {e}"));
+    }
+
+    // The test connection is pinned to the isolated schema via its connect-time
+    // search_path, so every unqualified name resolves inside it.
+    let test_cfg = base.with_search_path(schema.as_str());
+    let mut test_conn = match SyncConnection::connect(&test_cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            // The schema is already created; drop it before failing so a
+            // test-connection failure never leaks a schema.
+            match drop_isolated_schema_sync(&mut admin, &schema) {
+                Ok(()) => {}
+                Err(drop_err) => eprintln!(
+                    "bsql::test: WARNING — could not drop schema '{schema}' after a failed \
+                     test-connection setup; it may be leaked: {drop_err}"
+                ),
+            }
+            harness_fail(format_args!(
+                "could not connect the test connection for schema '{schema}': {e}"
+            ));
+        }
+    };
+
+    // Run the body, catching any panic so teardown always runs. The `&mut`
+    // borrow of `test_conn` ends when `catch_unwind` returns.
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut test_conn)));
+
+    // Drop the test connection at THIS controlled point — its (best-effort,
+    // panic-free) `Drop` runs here, never on the `resume_unwind` unwind path.
+    drop(test_conn);
+
+    // Teardown, always, on the never-touched admin connection.
+    let teardown = drop_isolated_schema_sync(&mut admin, &schema);
+
+    match outcome {
+        Ok(()) => {
+            if let Err(e) = teardown {
+                harness_fail(format_args!(
+                    "test body passed but dropping isolated schema '{schema}' failed \
+                     (it may be leaked): {e}"
+                ));
+            }
+        }
+        Err(payload) => {
+            // The body's panic is the primary signal. Surface a teardown failure
+            // loudly, but propagate the original panic (so `#[should_panic]` and
+            // the real failure message survive).
+            if let Err(e) = teardown {
+                eprintln!(
+                    "bsql::test: WARNING — dropping isolated schema '{schema}' failed after the \
+                     test panicked; it may be leaked: {e}"
+                );
+            }
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+/// Return whether `schema` currently exists on the server named by
+/// [`DSN_ENV`], probed over the blocking driver — the sync twin of
+/// [`schema_exists`]. A loud panic on any infrastructure failure. NOT a stable
+/// API — exists for the sync teardown witnesses.
+#[doc(hidden)]
+pub fn schema_exists_sync(schema: &str) -> bool {
+    let base = match resolve_dsn(std::env::var(DSN_ENV)) {
+        Ok(c) => c,
+        Err(e) => harness_fail(format_args!("{e}")),
+    };
+    let mut admin = match SyncConnection::connect(&base) {
+        Ok(c) => c,
+        Err(e) => harness_fail(format_args!("could not connect to check schema '{schema}': {e}")),
+    };
+    // Bind-parameterized — no identifier splice — so any string is safe to probe.
+    let row = match admin.query_params_one(
+        "SELECT count(*) FROM information_schema.schemata WHERE schema_name = $1",
+        &(schema,),
+    ) {
+        Ok(r) => r,
+        Err(e) => harness_fail(format_args!("could not query schema existence for '{schema}': {e}")),
+    };
+    match row.get_i64(0) {
+        Ok(Some(n)) => n > 0,
+        other => harness_fail(format_args!("unexpected schema-existence count for '{schema}': {other:?}")),
+    }
 }
 
 #[cfg(test)]
@@ -385,6 +578,14 @@ mod tests {
     }
 
     #[test]
+    fn schema_ddl_is_built_from_the_validated_name() {
+        // The shared DDL builders splice exactly the name, so the async and sync
+        // harnesses emit identical statements.
+        assert_eq!(drop_schema_ddl("s"), "DROP SCHEMA IF EXISTS s CASCADE");
+        assert_eq!(create_schema_ddl("s"), "CREATE SCHEMA s");
+    }
+
+    #[test]
     fn tokio_block_on_propagates_a_body_panic() {
         // Proves the teardown-on-panic mechanism at the tokio boundary, with no
         // server: a panic inside `block_on` unwinds through it and is caught.
@@ -396,5 +597,15 @@ mod tests {
             rt.block_on(async { panic!("boom from inside the future") })
         }));
         assert!(caught.is_err(), "a panic inside block_on must be catchable");
+    }
+
+    #[test]
+    fn sync_catch_unwind_propagates_a_body_panic() {
+        // The sync twin of the boundary proof: a panic inside a plain closure is
+        // caught (no runtime), so teardown can always run before the re-raise.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("boom from inside the sync body")
+        }));
+        assert!(caught.is_err(), "a panic inside the sync body must be catchable");
     }
 }

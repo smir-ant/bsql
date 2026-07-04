@@ -120,21 +120,27 @@ compile-time OID-drift guarantee (E0080) is untouched.
 `tools/query_bridge_fixture` is the end-to-end proof.
 
 **Schema-per-test isolation — `#[bsql::test]` (feature `test-harness`).** A
-consumer adds `bsql` with `features = ["test-harness"]` and writes an async test
-taking a single connection:
+consumer adds `bsql` with `features = ["test-harness"]` and writes a test taking
+a single connection — `async` over the async driver, or a plain `fn` over the
+blocking driver:
 
 ```rust
 #[bsql::test]
 async fn creates_a_user(conn: &mut bsql::pg::Connection) {
     conn.query_sql("CREATE TABLE users (id int)").await.unwrap();  // in an ISOLATED schema
 }   // schema auto-dropped, even if the test panics
+
+#[bsql::test]
+fn creates_a_user_sync(conn: &mut bsql::pg_sync::Connection) {
+    conn.query_sql("CREATE TABLE users (id int)").unwrap();  // same isolation, blocking driver
+}
 ```
 
 Each `#[bsql::test]` runs in its own freshly-created PostgreSQL schema, so
 tests running in parallel (cargo's default) never interfere — the isolation
 rides the connect-time `search_path` (a startup-packet GUC that survives the
 pool's `RESET ALL`, so a pooled connection cannot escape its schema). The
-attribute wraps the `async fn` in a `#[test]` that connects to the server named
+attribute wraps the function in a `#[test]` that connects to the server named
 by the **`BSQL_TEST_DSN`** environment variable — a test-specific variable,
 deliberately distinct from an application's `DATABASE_URL` because the harness
 creates and drops schemas — creates a unique injection-safe schema
@@ -143,11 +149,20 @@ the `CREATE`/`DROP` DDL), hands the body a connection pinned to it, and drops th
 schema on exit inside a `catch_unwind` so a panicking test still cleans up (the
 original panic is re-raised afterward, so `#[should_panic]` still works). An
 unset `BSQL_TEST_DSN` is a loud panic naming the variable, never a silent skip.
-The attribute lives in the same proc-macro crate as `query!` (both are host-only
-token transformers); the harness runtime lives behind the non-default
-`test-harness` feature, so a production build pulls neither the runtime nor the
-harness. `tools/test_harness_fixture` is the end-to-end proof (parallel
-isolation, teardown on success and on panic, the loud unset-DSN error).
+The `async`-ness selects the driver (async fn → async harness, plain fn → sync
+harness); the connection argument type must match it, or the harness's own bound
+makes it a type-mismatch compile error (never a mis-expansion). The two harnesses
+SHARE all driver-agnostic logic — the DSN resolve, the unique schema-name
+generator, the schema DDL, the injection guard, and the error type — defined once
+and called by both, so a fix to one cannot silently diverge; only connect +
+run-the-body differ (a per-test tokio runtime + `block_on` for async, a direct
+blocking call for sync). The attribute lives in the same proc-macro crate as
+`query!` (both are host-only token transformers); the harness runtime lives
+behind the non-default `test-harness` feature (which pulls BOTH drivers), so a
+production build pulls neither the runtime nor the harness.
+`tools/test_harness_fixture` is the end-to-end proof (parallel isolation over
+both drivers, a mixed async+sync file, teardown on success and on panic, the loud
+unset-DSN error).
 
 The `deps_pin` gate (`tools/devgates/tests/deps_pin.rs`) pins the resolved
 dependency set (parsed from `Cargo.lock`) to a committed golden, and bans any
