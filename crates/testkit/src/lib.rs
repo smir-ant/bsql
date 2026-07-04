@@ -48,21 +48,36 @@
 //! `integer` (`i32`), `text` (`&str` / `String`), `boolean`, `float4` (`f32`),
 //! `float8` (`f64`), `bytea` (`&[u8]` / `Vec<u8>`), `uuid`, `numeric`,
 //! `timestamptz`, `timestamp`, `date`, `time`, `interval`, `json`, `jsonb`, and
-//! NULL (`Option<T>`). The dep-free bsql-native types are scripted through the
-//! very types a consumer decodes into (`bsql::Uuid`, `bsql::Numeric`,
-//! `bsql::Timestamptz`, …). Each type's BINARY bytes — the wire the `query!`
-//! extended path decodes — are produced by the crate's REAL `EncodeBinary`
-//! encoder (the fixed-width / grouped types) or an unbounded raw-byte encoder
-//! (`bytea` / `json` / `jsonb`), so they are byte-identical to a real server's,
-//! proven by a round-trip through the real decoder. A 1-D array is not yet
-//! scriptable; `rows!` rejects an unsupported value at compile time (no `From`
-//! into `FakeValue`), so reach for a supported column type.
+//! NULL (`Option<T>`) — PLUS a one-dimensional array (`T[]`) of any of those
+//! scalars. The dep-free bsql-native types are scripted through the very types
+//! a consumer decodes into (`bsql::Uuid`, `bsql::Numeric`, `bsql::Timestamptz`,
+//! …). Each type's BINARY bytes — the wire the `query!` extended path decodes —
+//! are produced by the crate's REAL `EncodeBinary` encoder (the fixed-width /
+//! grouped types) or an unbounded raw-byte encoder (`bytea` / `json` /
+//! `jsonb`), so they are byte-identical to a real server's, proven by a
+//! round-trip through the real decoder.
+//!
+//! An array cell is scripted as a `Vec<T>` (or `Vec<Option<T>>` to carry a NULL
+//! element) of a supported scalar — `rows![[ vec![10_i32, 20, 30] ]]` for an
+//! `int4[]` column, `rows![[ vec![Some("a"), None] ]]` for a `text[]` with a
+//! NULL element — and decodes back into the `query!` path's `Vec<Option<T>>`.
+//! The element type is uniform by construction (a `Vec<T>` is homogeneous, so a
+//! mixed-type array does not type-check), drawn from the scriptable scalar set
+//! (an unsupported or nested `Vec<Vec<_>>` element has no `From` and is a
+//! compile error), and one-dimensional only (there is no `From` for a
+//! multi-dimensional array). The array's element bytes are the SAME scalar
+//! encoder output, framed with the one-dimensional array header, so a scripted
+//! `int4[]` / `text[]` / `numeric[]` / `uuid[]` decodes byte-for-byte back into
+//! the record — an empty array to an empty `Vec`, a NULL element to a `None`.
 //!
 //! The SIMPLE-query (`query_sql`, text) path is FAIL-CLOSED for any type whose
 //! text form cannot be rendered byte-faithfully to what a real server sends:
 //! `timestamptz` / `timestamp` (binary-only bsql types, no PostgreSQL-ISO text
-//! form) and `float4` / `float8` (Rust's `Display` diverges from PostgreSQL's
-//! `float ::text` for large / small magnitudes and `±Infinity`). A `query_sql`
+//! form), `float4` / `float8` (Rust's `Display` diverges from PostgreSQL's
+//! `float ::text` for large / small magnitudes and `±Infinity`), and EVERY
+//! array (PostgreSQL's `{a,b,NULL}` array text has involved quoting / escaping
+//! and its elements can themselves be unfaithful — and arrays are decoded from
+//! the binary wire anyway). A `query_sql`
 //! over such a cell is a loud, classified `DriverError::Db` naming the faithful
 //! routes — never plausible-but-wrong bytes a consumer could bake into a green
 //! `get_str` assertion (the testkit proves genuine behaviour, not a mock). The
@@ -127,6 +142,35 @@ pub enum FakeValue {
     Json(Json),
     /// A `jsonb` document.
     Jsonb(Jsonb),
+    /// A one-dimensional array (`T[]`) of a UNIFORM scalar element type — the
+    /// element type's scalar OID plus the per-element values (a `None` element
+    /// is a SQL-NULL element). This is the wire shape the compile-checked
+    /// `query!` path decodes into `Vec<Option<T>>`.
+    ///
+    /// Constructed ONLY through the `From<Vec<T>>` / `From<Vec<Option<T>>>`
+    /// impls (below), so:
+    ///
+    /// - the element type is uniform BY CONSTRUCTION — a `Vec<T>` is
+    ///   homogeneous, so a mixed-type array (`vec![1_i32, "x"]`) does not even
+    ///   type-check; and
+    /// - the element type is drawn from the scriptable scalar set — only those
+    ///   types have a `From`, so an unsupported or nested (`Vec<Vec<_>>`)
+    ///   element has no impl and is a compile error.
+    ///
+    /// The variant is `#[non_exhaustive]`, so a consumer cannot build it
+    /// directly (`E0639`); the `From` path is the only door. A mixed-type or
+    /// unsupported-element or multi-dimensional array is therefore not "rejected
+    /// at encode" — it is structurally impossible to construct.
+    #[non_exhaustive]
+    Array {
+        /// The SCALAR element type's PostgreSQL OID (e.g. `wire::OID_INT4` for
+        /// `int4[]`), written into the array wire header and cross-checked by
+        /// the decoder against the row tuple's element type.
+        element_oid: i32,
+        /// The array's elements in wire order; a `None` is a SQL-NULL element.
+        /// Each `Some` is a scalar [`FakeValue`] of the uniform element type.
+        elements: Vec<Option<FakeValue>>,
+    },
     /// A SQL `NULL`.
     Null,
 }
@@ -230,6 +274,77 @@ impl<T: Into<FakeValue>> From<Option<T>> for FakeValue {
     }
 }
 
+/// Generate the array-column ergonomics for one scriptable element type:
+/// `From<Vec<T>>` (every element present) and `From<Vec<Option<T>>>` (a `None`
+/// element is a SQL-NULL element). Each element is mapped through the EXISTING
+/// scalar `From<T> for FakeValue`, so the element vocabulary — and its wire
+/// encoding — is single-sourced; this macro only wraps it in the uniform
+/// `Array` shape with the element type's scalar OID. A `Vec<T>` is homogeneous,
+/// so the element type is uniform by construction, and only the types named
+/// here (the scriptable scalars) get an impl, so an unsupported or nested
+/// element is a missing-impl compile error.
+macro_rules! impl_array_from {
+    ($($t:ty => $oid:expr),+ $(,)?) => {
+        $(
+            impl From<Vec<$t>> for FakeValue {
+                fn from(v: Vec<$t>) -> Self {
+                    Self::array(
+                        $oid,
+                        v.into_iter().map(|x| Some(FakeValue::from(x))).collect(),
+                    )
+                }
+            }
+            impl From<Vec<Option<$t>>> for FakeValue {
+                fn from(v: Vec<Option<$t>>) -> Self {
+                    Self::array(
+                        $oid,
+                        v.into_iter().map(|x| x.map(FakeValue::from)).collect(),
+                    )
+                }
+            }
+        )+
+    };
+}
+
+// Value-typed element scalars — one Rust type per PostgreSQL element type.
+impl_array_from! {
+    i64 => OID_INT8,
+    i32 => OID_INT4,
+    bool => OID_BOOL,
+    f32 => OID_FLOAT4,
+    f64 => OID_FLOAT8,
+    Uuid => OID_UUID,
+    Numeric => OID_NUMERIC,
+    Timestamptz => OID_TIMESTAMPTZ,
+    Timestamp => OID_TIMESTAMP,
+    Date => OID_DATE,
+    Time => OID_TIME,
+    Interval => OID_INTERVAL,
+    Json => OID_JSON,
+    Jsonb => OID_JSONB,
+}
+
+// `text[]` and `bytea[]` each accept BOTH a borrowed and an owned element
+// spelling — the array peers of the scalar `&str` / `String` and `&[u8]` /
+// `Vec<u8>` `From` impls. `Vec<&str>` / `Vec<Vec<u8>>` are distinct types from
+// the scalar `Vec<u8>` (a single `bytea`), so no coherence conflict.
+impl_array_from! {
+    &str => OID_TEXT,
+    String => OID_TEXT,
+    Vec<u8> => OID_BYTEA,
+    &[u8] => OID_BYTEA,
+}
+
+impl FakeValue {
+    /// Build a uniform array cell from an element OID and its per-element
+    /// values (a `None` is a SQL-NULL element). The sole constructor of the
+    /// `#[non_exhaustive]` [`Array`](Self::Array) variant; the `From<Vec<T>>`
+    /// impls funnel through it so every array is built one way.
+    fn array(element_oid: i32, elements: Vec<Option<FakeValue>>) -> Self {
+        Self::Array { element_oid, elements }
+    }
+}
+
 impl FakeValue {
     /// The PostgreSQL type OID this value advertises in `RowDescription`.
     fn oid(&self) -> i32 {
@@ -250,6 +365,19 @@ impl FakeValue {
             Self::Interval(_) => OID_INTERVAL,
             Self::Json(_) => OID_JSON,
             Self::Jsonb(_) => OID_JSONB,
+            // The array column's OWN type OID (its `T[]` OID), derived from the
+            // scalar element OID. The mapping is total over every element OID a
+            // `From<Vec<T>>` can produce, so the `None` arm is unreachable for a
+            // constructed value; it reports the element OID rather than a
+            // fabricated one. This OID reaches the wire only via the simple
+            // path's `RowDescription`, which fails closed for arrays (see
+            // `render`), so it is never actually served today — but it is
+            // reported faithfully so a future faithful array text path is
+            // correct without a change here.
+            Self::Array { element_oid, .. } => match wire::array_oid_for_element(*element_oid) {
+                Some(array_oid) => array_oid,
+                None => *element_oid,
+            },
             Self::Null => OID_TEXT,
         }
     }
@@ -311,6 +439,23 @@ impl FakeValue {
             Self::F64(_) => {
                 return Err(TestkitError::UnfaithfulTextRender { type_name: "float8" });
             }
+            // FAIL-CLOSED — PostgreSQL's array TEXT output (`{a,b,NULL}`) has
+            // involved quoting / escaping rules (an element containing a comma,
+            // brace, quote, backslash, whitespace, an empty string, or the
+            // literal `NULL` must be double-quoted with inner escaping), and its
+            // elements can themselves be unfaithful-text types (`float8[]`,
+            // `timestamptz[]`). Rather than a bespoke, error-prone array text
+            // formatter that could serve bytes a real server never sends, the
+            // simple-query (text) path fails closed for EVERY array — steering
+            // to the compile-checked `query!` (binary) protocol, which is the
+            // ONLY path that decodes arrays anyway (there is no text-format array
+            // decoder). The `query!` (binary) reply for the same script is
+            // byte-exact and unaffected.
+            Self::Array { element_oid, .. } => {
+                return Err(TestkitError::UnfaithfulTextRender {
+                    type_name: wire::array_type_name(*element_oid),
+                });
+            }
             Self::Null => None,
         })
     }
@@ -350,6 +495,24 @@ impl FakeValue {
             Self::Bytea(b) => Some(wire::binary_bytea(b)),
             Self::Json(v) => Some(wire::binary_json(v.as_str())),
             Self::Jsonb(v) => Some(wire::binary_jsonb(v.as_str())),
+            // A 1-D array: render each element through the SAME scalar
+            // `render_binary` (a `None` element, or a NULL-valued element,
+            // becomes a `-1` NULL), then frame the bodies with the array header
+            // via `wire::binary_array` — no element bytes are produced here that
+            // the scalar path did not. The element type is uniform by
+            // construction (the `From<Vec<T>>` door), so the header's element
+            // OID matches every element the decoder reads back.
+            Self::Array { element_oid, elements } => {
+                let mut rendered: Vec<Option<Vec<u8>>> = Vec::with_capacity(elements.len());
+                for elem in elements {
+                    let body = match elem {
+                        None => None,
+                        Some(fv) => fv.render_binary()?,
+                    };
+                    rendered.push(body);
+                }
+                Some(wire::binary_array(*element_oid, &rendered)?)
+            }
             Self::Null => None,
         })
     }
@@ -393,7 +556,10 @@ impl ScriptedRows {
 /// [`FakeValue`] `From` impl — an `i64` / `i32` / `f32` / `f64` / `bool`, a
 /// `&str` / `String`, a `&[u8]` / `Vec<u8>` (`bytea`), a dep-free bsql-native
 /// type (`bsql::Uuid`, `bsql::Numeric`, `bsql::Timestamptz`, `bsql::Date`,
-/// `bsql::Interval`, `bsql::Json`, …), or an `Option<T>` for a `NULL`.
+/// `bsql::Interval`, `bsql::Json`, …), a `Vec<T>` / `Vec<Option<T>>` of any of
+/// those scalars for a one-dimensional array column (`vec![10_i32, 20]` for an
+/// `int4[]`, `vec![Some("a"), None]` for a `text[]` with a NULL element), or an
+/// `Option<T>` for a `NULL`.
 #[macro_export]
 macro_rules! rows {
     ( $( [ $( $cell:expr ),* $(,)? ] ),* $(,)? ) => {

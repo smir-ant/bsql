@@ -63,6 +63,101 @@ pub const OID_JSON: i32 = oid_i32(oids::JSON);
 /// PostgreSQL type OID for `jsonb`. Single-sourced from [`oids::JSONB`].
 pub const OID_JSONB: i32 = oid_i32(oids::JSONB);
 
+// One-dimensional array type OIDs — the OID a `RowDescription` advertises for a
+// `T[]` column, one per scriptable scalar element type. Single-sourced from the
+// `oids::*_ARRAY` table so an array OID can never drift from the scalar it
+// wraps. The wire HEADER of an array carries the SCALAR element OID (e.g.
+// `OID_INT4`); these `_ARRAY` OIDs are the ARRAY column's own type OID.
+
+/// PostgreSQL type OID for `bigint[]` (`int8[]`). Single-sourced from [`oids::INT8_ARRAY`].
+pub const OID_INT8_ARRAY: i32 = oid_i32(oids::INT8_ARRAY);
+/// PostgreSQL type OID for `integer[]` (`int4[]`). Single-sourced from [`oids::INT4_ARRAY`].
+pub const OID_INT4_ARRAY: i32 = oid_i32(oids::INT4_ARRAY);
+/// PostgreSQL type OID for `text[]`. Single-sourced from [`oids::TEXT_ARRAY`].
+pub const OID_TEXT_ARRAY: i32 = oid_i32(oids::TEXT_ARRAY);
+/// PostgreSQL type OID for `boolean[]`. Single-sourced from [`oids::BOOL_ARRAY`].
+pub const OID_BOOL_ARRAY: i32 = oid_i32(oids::BOOL_ARRAY);
+/// PostgreSQL type OID for `real[]` (`float4[]`). Single-sourced from [`oids::FLOAT4_ARRAY`].
+pub const OID_FLOAT4_ARRAY: i32 = oid_i32(oids::FLOAT4_ARRAY);
+/// PostgreSQL type OID for `double precision[]` (`float8[]`). Single-sourced from [`oids::FLOAT8_ARRAY`].
+pub const OID_FLOAT8_ARRAY: i32 = oid_i32(oids::FLOAT8_ARRAY);
+/// PostgreSQL type OID for `bytea[]`. Single-sourced from [`oids::BYTEA_ARRAY`].
+pub const OID_BYTEA_ARRAY: i32 = oid_i32(oids::BYTEA_ARRAY);
+/// PostgreSQL type OID for `uuid[]`. Single-sourced from [`oids::UUID_ARRAY`].
+pub const OID_UUID_ARRAY: i32 = oid_i32(oids::UUID_ARRAY);
+/// PostgreSQL type OID for `numeric[]` (`decimal[]`). Single-sourced from [`oids::NUMERIC_ARRAY`].
+pub const OID_NUMERIC_ARRAY: i32 = oid_i32(oids::NUMERIC_ARRAY);
+/// PostgreSQL type OID for `timestamptz[]`. Single-sourced from [`oids::TIMESTAMPTZ_ARRAY`].
+pub const OID_TIMESTAMPTZ_ARRAY: i32 = oid_i32(oids::TIMESTAMPTZ_ARRAY);
+/// PostgreSQL type OID for `timestamp[]`. Single-sourced from [`oids::TIMESTAMP_ARRAY`].
+pub const OID_TIMESTAMP_ARRAY: i32 = oid_i32(oids::TIMESTAMP_ARRAY);
+/// PostgreSQL type OID for `date[]`. Single-sourced from [`oids::DATE_ARRAY`].
+pub const OID_DATE_ARRAY: i32 = oid_i32(oids::DATE_ARRAY);
+/// PostgreSQL type OID for `time[]`. Single-sourced from [`oids::TIME_ARRAY`].
+pub const OID_TIME_ARRAY: i32 = oid_i32(oids::TIME_ARRAY);
+/// PostgreSQL type OID for `interval[]`. Single-sourced from [`oids::INTERVAL_ARRAY`].
+pub const OID_INTERVAL_ARRAY: i32 = oid_i32(oids::INTERVAL_ARRAY);
+/// PostgreSQL type OID for `json[]`. Single-sourced from [`oids::JSON_ARRAY`].
+pub const OID_JSON_ARRAY: i32 = oid_i32(oids::JSON_ARRAY);
+/// PostgreSQL type OID for `jsonb[]`. Single-sourced from [`oids::JSONB_ARRAY`].
+pub const OID_JSONB_ARRAY: i32 = oid_i32(oids::JSONB_ARRAY);
+
+/// Map a scalar element type OID (e.g. [`OID_INT4`]) to its one-dimensional
+/// `T[]` array OID (e.g. [`OID_INT4_ARRAY`]) — the type OID a `RowDescription`
+/// advertises for an array column. `None` for an OID that is not one of the
+/// fake's scriptable scalar element types (an array OID itself has no entry, so
+/// an array-of-arrays cannot be assigned an OID — multi-dimensional arrays are
+/// not modelled). Single-sourced from the `_ARRAY` constants above, so it
+/// cannot drift from the decoder's supported element set.
+#[must_use]
+pub const fn array_oid_for_element(element_oid: i32) -> Option<i32> {
+    Some(match element_oid {
+        OID_INT8 => OID_INT8_ARRAY,
+        OID_INT4 => OID_INT4_ARRAY,
+        OID_TEXT => OID_TEXT_ARRAY,
+        OID_BOOL => OID_BOOL_ARRAY,
+        OID_FLOAT4 => OID_FLOAT4_ARRAY,
+        OID_FLOAT8 => OID_FLOAT8_ARRAY,
+        OID_BYTEA => OID_BYTEA_ARRAY,
+        OID_UUID => OID_UUID_ARRAY,
+        OID_NUMERIC => OID_NUMERIC_ARRAY,
+        OID_TIMESTAMPTZ => OID_TIMESTAMPTZ_ARRAY,
+        OID_TIMESTAMP => OID_TIMESTAMP_ARRAY,
+        OID_DATE => OID_DATE_ARRAY,
+        OID_TIME => OID_TIME_ARRAY,
+        OID_INTERVAL => OID_INTERVAL_ARRAY,
+        OID_JSON => OID_JSON_ARRAY,
+        OID_JSONB => OID_JSONB_ARRAY,
+        _ => return None,
+    })
+}
+
+/// A human-facing `T[]` type name for a scalar element OID — used only in the
+/// fail-closed simple-query (text) error an array column raises. Defaults to
+/// the generic `"array"` for an OID outside the scriptable scalar set.
+#[must_use]
+pub const fn array_type_name(element_oid: i32) -> &'static str {
+    match element_oid {
+        OID_INT8 => "bigint[]",
+        OID_INT4 => "int4[]",
+        OID_TEXT => "text[]",
+        OID_BOOL => "boolean[]",
+        OID_FLOAT4 => "float4[]",
+        OID_FLOAT8 => "float8[]",
+        OID_BYTEA => "bytea[]",
+        OID_UUID => "uuid[]",
+        OID_NUMERIC => "numeric[]",
+        OID_TIMESTAMPTZ => "timestamptz[]",
+        OID_TIMESTAMP => "timestamp[]",
+        OID_DATE => "date[]",
+        OID_TIME => "time[]",
+        OID_INTERVAL => "interval[]",
+        OID_JSON => "json[]",
+        OID_JSONB => "jsonb[]",
+        _ => "array",
+    }
+}
+
 /// Transaction-status byte for `ReadyForQuery`: `I` = idle (not in a
 /// transaction block) — the only status the MVP fake reports.
 pub const TX_IDLE: u8 = b'I';
@@ -400,6 +495,69 @@ pub fn binary_jsonb(text: &str) -> Vec<u8> {
     out
 }
 
+/// Encode a one-dimensional PostgreSQL binary array body from PRE-RENDERED
+/// element bodies — the exact wire form the `query!` array decoder
+/// (`Cell<BinaryFmt> for Vec<Option<T>>`) reads.
+///
+/// `element_oid` is the SCALAR element type OID written into the array header
+/// (the decoder cross-checks it against the row tuple's element type, refusing
+/// a `text[]` payload decoded as `int4[]`). Each `Some(bytes)` is one element's
+/// binary body — produced by the SCALAR binary encoder ([`binary_int4`],
+/// [`binary_via_encoder`], [`binary_text`], …) and passed through VERBATIM, so
+/// the element bytes can never drift from the scalar decoder that reads them —
+/// and each `None` is a SQL-NULL element (the wire `-1` length sentinel).
+///
+/// Mirrors PostgreSQL's `array_send`: an EMPTY array is the canonical
+/// `ndim = 0` form (three header words: `ndim`, `flags`, `element_oid` — no
+/// dimension pair, nothing after, so an empty array decodes to an empty `Vec`);
+/// a populated one is `ndim = 1`, a `flags` word whose bit 0 is set iff any
+/// element is NULL (the real backend's `has-null` bit — the decoder ignores it
+/// and detects NULL per element, but the fake sets it faithfully), the element
+/// OID, the dimension length, a lower bound of `1`, then each element's
+/// `(len, body)`.
+///
+/// # Errors
+///
+/// [`FakeEncodeError::CellTooLarge`] if an element body — or the element count —
+/// overflows an `i32` wire length/dimension field. Unreachable for a realistic
+/// fixture (the enclosing `DataRow` cell caps the whole array against the same
+/// `i32` limit long first); the `Result` keeps the impossible case honest,
+/// never a wrapped length or a silent truncation.
+pub fn binary_array(
+    element_oid: i32,
+    elements: &[Option<Vec<u8>>],
+) -> Result<Vec<u8>, FakeEncodeError> {
+    let mut body = Vec::new();
+    // PG's canonical empty array: `ndim = 0`, no dimension or lower-bound words.
+    // The decoder's `ndim == 0` path requires NOTHING follows these three header
+    // words, so an empty array is exactly 12 bytes.
+    if elements.is_empty() {
+        body.extend_from_slice(&0i32.to_be_bytes()); // ndim = 0
+        body.extend_from_slice(&0i32.to_be_bytes()); // flags = 0
+        body.extend_from_slice(&element_oid.to_be_bytes());
+        return Ok(body);
+    }
+    let has_null = elements.iter().any(Option::is_none);
+    let flags: i32 = if has_null { 1 } else { 0 };
+    let dim_len = i32::try_from(elements.len()).map_err(|_| FakeEncodeError::CellTooLarge)?;
+    body.extend_from_slice(&1i32.to_be_bytes()); // ndim = 1
+    body.extend_from_slice(&flags.to_be_bytes());
+    body.extend_from_slice(&element_oid.to_be_bytes());
+    body.extend_from_slice(&dim_len.to_be_bytes()); // dimension length
+    body.extend_from_slice(&1i32.to_be_bytes()); // lower bound = 1
+    for elem in elements {
+        match elem {
+            None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(bytes) => {
+                let len = i32::try_from(bytes.len()).map_err(|_| FakeEncodeError::CellTooLarge)?;
+                body.extend_from_slice(&len.to_be_bytes());
+                body.extend_from_slice(bytes);
+            }
+        }
+    }
+    Ok(body)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Extended-protocol acknowledgement frames.
 //
@@ -451,12 +609,15 @@ mod tests {
     //! binary encoding is impossible to ship.
 
     use bsql_postgres_proto::{
-        BinaryFmt, Cell, Date, Interval, Json, Jsonb, Numeric, Time, Timestamp, Timestamptz, Uuid,
+        BinaryFmt, Cell, Date, DecodeError, Interval, Json, Jsonb, Numeric, Time, Timestamp,
+        Timestamptz, Uuid,
     };
 
     use super::{
-        binary_bool, binary_bytea, binary_int4, binary_int8, binary_json, binary_jsonb,
-        binary_text, binary_via_encoder,
+        array_oid_for_element, array_type_name, binary_array, binary_bool, binary_bytea,
+        binary_int4, binary_int8, binary_json, binary_jsonb, binary_text, binary_via_encoder,
+        OID_BYTEA, OID_INT4, OID_INT4_ARRAY, OID_NUMERIC, OID_TEXT, OID_TEXT_ARRAY, OID_UUID,
+        OID_UUID_ARRAY,
     };
 
     #[test]
@@ -590,5 +751,116 @@ mod tests {
                 Ok(Jsonb::new(text.to_owned()))
             );
         }
+    }
+
+    // ── array round-trips: the fake's `binary_array` bytes MUST be exactly what
+    //    the flagship `query!` array decoder (`Cell<BinaryFmt> for
+    //    Vec<Option<T>>`) reads. Each test encodes an array from the SAME scalar
+    //    element encoders the fake uses, then decodes it with the REAL decoder —
+    //    a wrong header, element order, or NULL sentinel fails HERE, so a
+    //    wire-incorrect fake array is impossible to ship. ──
+
+    #[test]
+    fn binary_array_int4_round_trips_with_a_null_element() {
+        // `{10, NULL, 30}` — a populated int4[] with an interior NULL element.
+        let elements = [Some(binary_int4(10)), None, Some(binary_int4(30))];
+        let bytes = binary_array(OID_INT4, &elements).expect("int4[] encodes");
+        assert_eq!(
+            <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&bytes),
+            Ok(vec![Some(10), None, Some(30)])
+        );
+    }
+
+    #[test]
+    fn binary_array_text_round_trips_with_a_null_element() {
+        // `{"a", NULL, "c"}` — decoded elements own their bytes (`String`).
+        let elements = [Some(binary_text("a")), None, Some(binary_text("c"))];
+        let bytes = binary_array(OID_TEXT, &elements).expect("text[] encodes");
+        assert_eq!(
+            <Vec<Option<String>> as Cell<BinaryFmt>>::decode(&bytes),
+            Ok(vec![Some("a".to_owned()), None, Some("c".to_owned())])
+        );
+    }
+
+    #[test]
+    fn binary_array_numeric_round_trips_with_a_null_element() {
+        // `{3.14, NULL}` — each element is the grouped `numeric` binary body from
+        // the real encoder, so a wire mislayout fails the decode.
+        let pi = "3.14".parse::<Numeric>().expect("parse 3.14");
+        let elements = [Some(binary_via_encoder(&pi).expect("numeric elem encodes")), None];
+        let bytes = binary_array(OID_NUMERIC, &elements).expect("numeric[] encodes");
+        assert_eq!(
+            <Vec<Option<Numeric>> as Cell<BinaryFmt>>::decode(&bytes),
+            Ok(vec![Some("3.14".parse::<Numeric>().expect("parse 3.14")), None])
+        );
+    }
+
+    #[test]
+    fn binary_array_uuid_round_trips() {
+        // A populated uuid[] — 16-byte fixed-width elements from the real encoder.
+        let a = Uuid::from_bytes([0x11; 16]);
+        let b = Uuid::from_bytes([0x22; 16]);
+        let elements = [
+            Some(binary_via_encoder(&a).expect("uuid elem encodes")),
+            Some(binary_via_encoder(&b).expect("uuid elem encodes")),
+        ];
+        let bytes = binary_array(OID_UUID, &elements).expect("uuid[] encodes");
+        assert_eq!(
+            <Vec<Option<Uuid>> as Cell<BinaryFmt>>::decode(&bytes),
+            Ok(vec![Some(a), Some(b)])
+        );
+    }
+
+    #[test]
+    fn binary_array_empty_round_trips_to_an_empty_vec() {
+        // PG's canonical empty array (`ndim = 0`) — three header words, nothing
+        // after — decodes to an empty `Vec`.
+        let empty: [Option<Vec<u8>>; 0] = [];
+        let bytes = binary_array(OID_INT4, &empty).expect("empty int4[] encodes");
+        assert_eq!(bytes.len(), 12, "an empty array is exactly the 3 header words");
+        assert_eq!(
+            <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&bytes),
+            Ok(vec![])
+        );
+    }
+
+    #[test]
+    fn binary_array_all_null_elements_round_trips() {
+        // Every element NULL — the `has-null` flag is set and each element is a
+        // `-1` sentinel, all decoded as `None`.
+        let elements = [None, None];
+        let bytes = binary_array(OID_INT4, &elements).expect("all-NULL int4[] encodes");
+        assert_eq!(
+            <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&bytes),
+            Ok(vec![None, None])
+        );
+    }
+
+    #[test]
+    fn binary_array_wrong_element_oid_is_classified_by_the_real_decoder() {
+        // The header's element OID is written FAITHFULLY: encode with a `text`
+        // element OID but int4 bodies, then decode as int4[] — the real decoder
+        // rejects the element-OID mismatch (proving the fake writes the header's
+        // element OID, and the decoder cross-checks it), never reinterprets.
+        let elements = [Some(binary_int4(1))];
+        let bytes = binary_array(OID_TEXT, &elements).expect("encodes");
+        assert_eq!(
+            <Vec<Option<i32>> as Cell<BinaryFmt>>::decode(&bytes),
+            Err(DecodeError::ArrayElemOidMismatch { expected: 23, found: 25 })
+        );
+    }
+
+    #[test]
+    fn array_oid_mapping_is_single_sourced() {
+        // The scalar->array OID map routes each scriptable element to its `_ARRAY`
+        // constant (itself single-sourced from `oids`), and refuses an OID that
+        // is not a scriptable scalar element (an array OID has no entry, so an
+        // array-of-arrays cannot be assigned an OID).
+        assert_eq!(array_oid_for_element(OID_INT4), Some(OID_INT4_ARRAY));
+        assert_eq!(array_oid_for_element(OID_TEXT), Some(OID_TEXT_ARRAY));
+        assert_eq!(array_oid_for_element(OID_UUID), Some(OID_UUID_ARRAY));
+        assert_eq!(array_oid_for_element(OID_INT4_ARRAY), None);
+        assert_eq!(array_type_name(OID_INT4), "int4[]");
+        assert_eq!(array_type_name(OID_BYTEA), "bytea[]");
     }
 }

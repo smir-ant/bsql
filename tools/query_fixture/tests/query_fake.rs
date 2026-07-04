@@ -26,6 +26,16 @@ use bsql_testkit::{rows, FakePostgres};
 
 // `users` (from migrations/): id BIGINT (i64), name TEXT NOT NULL (String).
 bsql::query!(UsersByName, "SELECT id, name FROM users");
+
+// `array_rows` (from migrations/): id INTEGER, ints INT4[] NOT NULL, labels
+// TEXT[] NOT NULL, ids UUID[] NOT NULL, tags TEXT[] (nullable whole array). The
+// record fields type to `Vec<Option<T>>` (a 1-D array; each element may be
+// NULL) and `Option<Vec<Option<String>>>` (the nullable `tags` adds the outer
+// Option) — proven end-to-end below by decoding the fake's binary array bytes.
+bsql::query!(
+    ArrayCols,
+    "SELECT id, ints, labels, ids, tags FROM array_rows"
+);
 // A query the fake will NOT script — to prove an unscripted `query!` is loud.
 bsql::query!(UnscriptedById, "SELECT id FROM users WHERE id = 999");
 
@@ -328,4 +338,116 @@ fn query_macro_decodes_the_full_type_surface_over_the_fake_sync() {
 
     let owned = result.into_owned().expect("into_owned");
     assert_all_types_owned(&owned[0]);
+}
+
+// ── 1-D array columns over the fake, both drivers ──────────────────────────
+
+/// Two witness UUIDs for the `ids` (`uuid[]`) column — chosen values (the fake
+/// serves the scripted bytes, so they need not match any SQL literal).
+const ARRAY_UUID_A: [u8; 16] = [
+    0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+];
+const ARRAY_UUID_B: [u8; 16] = [
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+];
+
+/// The exact SQL the driver puts in the `Parse` message for the array query —
+/// referenced (not re-typed) so the fake's match key equals it byte-for-byte.
+fn array_cols_sql() -> &'static str {
+    <ArrayColsQuery as bsql::TypedQuery>::PREPARED.sql()
+}
+
+/// Two scripted `array_rows` rows covering every array shape the decoder reads:
+/// row 1 has POPULATED arrays with an interior NULL element and a NULL WHOLE
+/// array (`tags`); row 2 has EMPTY arrays and a present nullable array.
+fn array_cols_script() -> bsql_testkit::ScriptedRows {
+    rows![
+        [
+            1_i32,
+            vec![Some(10_i32), None, Some(30)],            // ints: {10, NULL, 30}
+            vec![Some("a"), None, Some("c")],              // labels: {"a", NULL, "c"}
+            vec![Uuid::from_bytes(ARRAY_UUID_A), Uuid::from_bytes(ARRAY_UUID_B)], // ids
+            Option::<Vec<Option<&str>>>::None,             // tags: NULL whole array
+        ],
+        [
+            2_i32,
+            Vec::<i32>::new(),                             // ints: {} (empty)
+            Vec::<&str>::new(),                            // labels: {} (empty)
+            Vec::<Uuid>::new(),                            // ids: {} (empty)
+            Some(vec![Some("hot"), None]),                 // tags: {"hot", NULL}
+        ],
+    ]
+}
+
+/// Assert the two OWNED array records equal the scripted values — shared by the
+/// async + sync witnesses. Every array field decoded from the fake's binary
+/// array bytes: a populated array with a NULL element (`None` in the `Vec`), an
+/// EMPTY array (an empty `Vec`), a NULL whole array (`None`), and a present
+/// nullable array.
+fn assert_array_cols_owned(rows: &[ArrayColsOwned]) {
+    // Row 1 — populated arrays, interior NULL element, NULL whole `tags`.
+    assert_eq!(rows[0].id, 1);
+    assert_eq!(rows[0].ints, vec![Some(10), None, Some(30)]);
+    assert_eq!(
+        rows[0].labels,
+        vec![Some(String::from("a")), None, Some(String::from("c"))]
+    );
+    assert_eq!(
+        rows[0].ids,
+        vec![Some(Uuid::from_bytes(ARRAY_UUID_A)), Some(Uuid::from_bytes(ARRAY_UUID_B))]
+    );
+    assert_eq!(rows[0].tags, None);
+
+    // Row 2 — empty arrays decode to empty `Vec`s; present nullable `tags`.
+    assert_eq!(rows[1].id, 2);
+    assert!(rows[1].ints.is_empty());
+    assert!(rows[1].labels.is_empty());
+    assert!(rows[1].ids.is_empty());
+    assert_eq!(rows[1].tags, Some(vec![Some(String::from("hot")), None]));
+}
+
+/// The moat now covers 1-D ARRAY columns: a real `query!` over the fake decodes
+/// `int4[]` / `text[]` / `uuid[]` (and a nullable `text[]`) from the fake's
+/// BINARY array bytes into `Vec<Option<T>>` / `Option<Vec<Option<T>>>` — with a
+/// NULL element and an empty array — no network.
+#[tokio::test]
+async fn query_macro_decodes_array_columns_over_the_fake() {
+    let mut fake = FakePostgres::new();
+    fake.on(array_cols_sql()).returns(array_cols_script());
+
+    let mut conn = fake.connect().await.expect("connect over the fake");
+    let result = conn
+        .query::<ArrayColsQuery>(())
+        .await
+        .expect("run the array query! over the fake");
+    assert_eq!(result.len(), 2);
+
+    // Borrowed decode: arrays are self-owning, so each field is already owned.
+    let row0 = result.iter().next().expect("row 0").expect("row 0 decodes");
+    assert_eq!(row0.ints, vec![Some(10), None, Some(30)]);
+    assert_eq!(
+        row0.labels,
+        vec![Some(String::from("a")), None, Some(String::from("c"))]
+    );
+    assert_eq!(row0.tags, None);
+
+    // Owned twin: same values across both rows (populated + empty).
+    let owned = result.into_owned().expect("into_owned");
+    assert_array_cols_owned(&owned);
+}
+
+/// The sync twin: the same fake, the same script, the blocking driver.
+#[test]
+fn query_macro_decodes_array_columns_over_the_fake_sync() {
+    let mut fake = FakePostgres::new();
+    fake.on(array_cols_sql()).returns(array_cols_script());
+
+    let mut conn = fake.connect_sync().expect("connect over the fake (sync)");
+    let result = conn
+        .query::<ArrayColsQuery>(())
+        .expect("run the array query! over the fake (sync)");
+    assert_eq!(result.len(), 2);
+
+    let owned = result.into_owned().expect("into_owned");
+    assert_array_cols_owned(&owned);
 }

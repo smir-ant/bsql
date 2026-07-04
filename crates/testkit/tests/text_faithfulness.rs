@@ -76,6 +76,33 @@ async fn query_sql_over_float4_fails_closed() {
     assert_query_sql_fails_closed("SELECT ratio FROM t", rows![[2.5_f32]], "float4").await;
 }
 
+#[tokio::test]
+async fn query_sql_over_an_int4_array_fails_closed() {
+    // Every array fails the text path closed: PostgreSQL's `{a,b,NULL}` array
+    // text has involved quoting / escaping and arrays are decoded from the
+    // binary wire anyway. The error names the `int4[]` element type and the
+    // faithful `query!` route.
+    assert_query_sql_fails_closed(
+        "SELECT ints FROM t",
+        rows![[vec![10_i32, 20, 30]]],
+        "int4[]",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn query_sql_over_a_text_array_fails_closed() {
+    // A `text[]` — whose SCALAR text form IS faithful — still fails closed as an
+    // array, because the array text framing (quoting / escaping) is what the
+    // fake declines to fabricate, not the element rendering.
+    assert_query_sql_fails_closed(
+        "SELECT labels FROM t",
+        rows![[vec![Some("a"), None]]],
+        "text[]",
+    )
+    .await;
+}
+
 /// The sync twin: the same fail-close over the blocking driver.
 #[test]
 fn query_sql_over_timestamptz_fails_closed_sync() {
