@@ -45,7 +45,7 @@ use core::marker::PhantomData;
 
 use crate::decode::{ArrayElement, BinaryFmt, Cell, DecodeError, FormatCode};
 use crate::params::ParamsWriter;
-use crate::pgtypes::{Json, Jsonb, Numeric, Timestamp, Timestamptz, Uuid};
+use crate::pgtypes::{Date, Interval, Json, Jsonb, Numeric, Time, Timestamp, Timestamptz, Uuid};
 
 mod sealed {
     /// Module-private seal for [`super::RowDecode`]. Only the
@@ -103,7 +103,7 @@ mod sealed {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid prepared-query row type",
     label = "valid row types are tuples `()` through `(T1, T2, ..., T16)` where each Ti implements `ColCellAt`",
-    note = "`RowDecode` is sealed — only the crate-internal tuple impls (arity 0..=16) over the supported cell types (`i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `Uuid`, `Timestamptz`, `Timestamp`, `Json`, `Jsonb`, `Numeric`, `&'static str`, `&'static [u8]`) can satisfy it; downstream `impl RowDecode for ...` is forbidden by construction"
+    note = "`RowDecode` is sealed — only the crate-internal tuple impls (arity 0..=16) over the supported cell types (`i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `Uuid`, `Timestamptz`, `Timestamp`, `Date`, `Time`, `Interval`, `Json`, `Jsonb`, `Numeric`, `&'static str`, `&'static [u8]`) can satisfy it; downstream `impl RowDecode for ...` is forbidden by construction"
 )]
 pub trait RowDecode: sealed::RowDecodeSealed + Sized {
     /// Number of columns this row carries.
@@ -158,7 +158,7 @@ pub trait RowDecode: sealed::RowDecodeSealed + Sized {
 // The attribute below routes them to the supported list directly.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a supported prepared-query row cell type",
-    label = "supported cell types are `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `Uuid`, `Timestamptz`, `Timestamp`, `Json`, `Jsonb`, `Numeric`, `&'static str`, and `&'static [u8]` (rendered as `&'a str` / `&'a [u8]` at decode time)",
+    label = "supported cell types are `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `Uuid`, `Timestamptz`, `Timestamp`, `Date`, `Time`, `Interval`, `Json`, `Jsonb`, `Numeric`, `&'static str`, and `&'static [u8]` (rendered as `&'a str` / `&'a [u8]` at decode time)",
     note = "`ColCellAt` is sealed — extend the supported set by adding a `col_cell_at_primitive!` invocation in `prepared.rs`; downstream `impl ColCellAt for ...` is forbidden by construction"
 )]
 pub trait ColCellAt<'a>: col_cell_at_sealed::Sealed {
@@ -198,11 +198,12 @@ macro_rules! col_cell_at_primitive {
 // transparent (the IEEE-754 payload is decoded by value, not borrowed).
 col_cell_at_primitive!(i16, i32, i64, u32, bool, f32, f64);
 
-// bsql-native semantic types (`uuid` / `timestamptz` / `timestamp`) are
-// value-typed too: `Uuid` owns its 16 bytes, the timestamps own an `i64`,
-// so `At = Self` with a transparent lifetime — the row-tuple marker for a
-// `query!` column of one of these types.
-col_cell_at_primitive!(Uuid, Timestamptz, Timestamp);
+// bsql-native semantic types (`uuid` / `timestamptz` / `timestamp` / `date` /
+// `time` / `interval`) are value-typed too: `Uuid` owns its 16 bytes, the
+// timestamps / `time` own an `i64`, `date` an `i32`, `interval` its three
+// fields — so `At = Self` with a transparent lifetime — the row-tuple marker
+// for a `query!` column of one of these types.
+col_cell_at_primitive!(Uuid, Timestamptz, Timestamp, Date, Time, Interval);
 
 // `json` / `jsonb` are String-backed (owned): `At = Self`, lifetime
 // transparent (the decoder validates + copies the UTF-8 text, so the row

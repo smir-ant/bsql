@@ -20,7 +20,7 @@
     reason = "live test harness — expect/unwrap surface failures loudly; not production fallbacks"
 )]
 
-use bsql_query_bridge_fixture::bridge::{MyDecimal, MyTs};
+use bsql_query_bridge_fixture::bridge::{MyDate, MyDecimal, MyTs};
 
 // A `timestamptz` at the PostgreSQL epoch (2000-01-01 00:00:00 UTC) -> 0 raw
 // micros -> the bridged `MyTs(0)`.
@@ -36,6 +36,9 @@ bsql::query!(
 // A `numeric` literal -> the bridged `MyDecimal` holding the exact decimal
 // text, proving the arbitrary-precision pivot bridges through real wire bytes.
 bsql::query!(LiveNumeric, "SELECT '1234.5600'::numeric AS amount");
+// A `date` literal (a leap day) -> the bridged `MyDate`, reshaped from the
+// native `bsql::Date` via the civil conversion through real wire bytes.
+bsql::query!(LiveDate, "SELECT '2000-02-29'::date AS day");
 
 const EXPECTED_UUID: [u8; 16] = [
     0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
@@ -65,6 +68,15 @@ fn sync_bridged_columns_round_trip() {
     let amt = c.query_one::<LiveNumericQuery>(()).expect("query_one LiveNumeric");
     let amount: MyDecimal = amt.amount;
     assert_eq!(amount, MyDecimal("1234.5600".to_string()), "numeric -> exact MyDecimal");
+
+    // `date` -> the dep-free `MyDate` target via the civil conversion.
+    let dt = c.query_one::<LiveDateQuery>(()).expect("query_one LiveDate");
+    let day: MyDate = dt.day;
+    assert_eq!(
+        day,
+        MyDate { year: 2000, month: 2, day: 29 },
+        "date -> MyDate via the civil conversion",
+    );
 
     c.close().expect("close");
 }
@@ -99,6 +111,17 @@ async fn async_bridged_columns_round_trip() {
         .expect("query_one LiveNumeric");
     let amount: MyDecimal = amt.amount;
     assert_eq!(amount, MyDecimal("1234.5600".to_string()), "numeric -> exact MyDecimal");
+
+    let dt = c
+        .query_one::<LiveDateQuery>(())
+        .await
+        .expect("query_one LiveDate");
+    let day: MyDate = dt.day;
+    assert_eq!(
+        day,
+        MyDate { year: 2000, month: 2, day: 29 },
+        "date -> MyDate via the civil conversion",
+    );
 
     c.close().await.expect("close");
 }

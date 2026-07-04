@@ -34,7 +34,7 @@
 
 use core::fmt;
 
-use crate::pgtypes::{Json, Jsonb, Numeric, Timestamp, Timestamptz, Uuid};
+use crate::pgtypes::{Date, Interval, Json, Jsonb, Numeric, Time, Timestamp, Timestamptz, Uuid};
 
 /// Maximum columns per result-set. Queries returning more columns
 /// classify as [`crate::ProtocolError::TooManyColumns`] — the
@@ -1273,7 +1273,7 @@ impl Fmt for BinaryFmt {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be decoded from PG `{F}` bytes",
     label = "the (type, format) pair `({Self}, {F})` is not in the supported decode matrix",
-    note = "the in-crate decode matrix covers `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}`, plus `{{f32, f64, &[u8], Uuid, Timestamptz, Timestamp, Json, Jsonb, Numeric}}` for `BinaryFmt` only (the binary-uniform wire path); for other types add `impl Cell<'a, F> for {Self}` supplying its `OID` + `decode` (the trait is not sealed)"
+    note = "the in-crate decode matrix covers `{{i16, i32, i64, u32, bool, &str}} × {{TextFmt, BinaryFmt}}`, plus `{{f32, f64, &[u8], Uuid, Timestamptz, Timestamp, Date, Time, Interval, Json, Jsonb, Numeric}}` for `BinaryFmt` only (the binary-uniform wire path); for other types add `impl Cell<'a, F> for {Self}` supplying its `OID` + `decode` (the trait is not sealed)"
 )]
 pub trait Cell<'a, F: Fmt>: Sized {
     /// PG type OID this (type, format) pair targets. Pinned via
@@ -2198,6 +2198,69 @@ impl Cell<'_, BinaryFmt> for Timestamp {
     }
 }
 
+/// PG binary `date` (`date_send`): an `i32` day count since 2000-01-01, 4
+/// big-endian bytes (`i32::MAX` / `i32::MIN` are the `±infinity` sentinels,
+/// wrapped faithfully). A wrong length is classified.
+impl Cell<'_, BinaryFmt> for Date {
+    const OID: u32 = oids::DATE;
+    #[inline]
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let arr: &[u8; 4] = bytes
+            .first_chunk::<4>()
+            .filter(|_| bytes.len() == 4)
+            .ok_or_else(|| DecodeError::BinaryLengthMismatch {
+                expected_len: 4,
+                actual_len: crate::narrow::u16_from_usize_under_u16_bound(bytes.len()),
+            })?;
+        Ok(Date::from_days(i32::from_be_bytes(*arr)))
+    }
+}
+
+/// PG binary `time` (`time_send`): an `i64` microsecond count since midnight,
+/// 8 big-endian bytes. A wrong length is classified.
+impl Cell<'_, BinaryFmt> for Time {
+    const OID: u32 = oids::TIME;
+    #[inline]
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let arr: &[u8; 8] = bytes
+            .first_chunk::<8>()
+            .filter(|_| bytes.len() == 8)
+            .ok_or_else(|| DecodeError::BinaryLengthMismatch {
+                expected_len: 8,
+                actual_len: crate::narrow::u16_from_usize_under_u16_bound(bytes.len()),
+            })?;
+        Ok(Time::from_micros(i64::from_be_bytes(*arr)))
+    }
+}
+
+/// PG binary `interval` (`interval_send`): three fixed fields IN WIRE ORDER —
+/// `i64` microseconds, then `i32` days, then `i32` months (16 bytes). The
+/// three fields are stored separately (never collapsed). A wrong length is
+/// classified.
+impl Cell<'_, BinaryFmt> for Interval {
+    const OID: u32 = oids::INTERVAL;
+    #[inline]
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mismatch = || DecodeError::BinaryLengthMismatch {
+            expected_len: 16,
+            actual_len: crate::narrow::u16_from_usize_under_u16_bound(bytes.len()),
+        };
+        // Reject any length but exactly 16 up front; the three field reads
+        // below then cannot fail (their `ok_or` landing pads are dead).
+        if bytes.len() != 16 {
+            return Err(mismatch());
+        }
+        // Wire order: micros (i64), then days (i32), then months (i32).
+        let (micros_be, rest) = bytes.split_first_chunk::<8>().ok_or_else(mismatch)?;
+        let (days_be, months_be) = rest.split_first_chunk::<4>().ok_or_else(mismatch)?;
+        let months_be = months_be.first_chunk::<4>().ok_or_else(mismatch)?;
+        let micros = i64::from_be_bytes(*micros_be);
+        let days = i32::from_be_bytes(*days_be);
+        let months = i32::from_be_bytes(*months_be);
+        Ok(Interval::new(months, days, micros))
+    }
+}
+
 /// PG binary `json`: the raw UTF-8 JSON text (no framing). Validated as
 /// UTF-8, then owned — bsql does not parse the JSON structure.
 impl Cell<'_, BinaryFmt> for Json {
@@ -2521,6 +2584,9 @@ impl_array_element_value!(
     Json => oids::JSON_ARRAY,
     Jsonb => oids::JSONB_ARRAY,
     Numeric => oids::NUMERIC_ARRAY,
+    Date => oids::DATE_ARRAY,
+    Time => oids::TIME_ARRAY,
+    Interval => oids::INTERVAL_ARRAY,
 );
 
 /// `text[]` element — the owned `String` peer of the borrowed `&str` scalar
@@ -2567,6 +2633,9 @@ const _: () = {
     assert!(<alloc::vec::Vec<Option<Json>> as Cell<BinaryFmt>>::OID == oids::JSON_ARRAY);
     assert!(<alloc::vec::Vec<Option<Jsonb>> as Cell<BinaryFmt>>::OID == oids::JSONB_ARRAY);
     assert!(<alloc::vec::Vec<Option<Numeric>> as Cell<BinaryFmt>>::OID == oids::NUMERIC_ARRAY);
+    assert!(<alloc::vec::Vec<Option<Date>> as Cell<BinaryFmt>>::OID == oids::DATE_ARRAY);
+    assert!(<alloc::vec::Vec<Option<Time>> as Cell<BinaryFmt>>::OID == oids::TIME_ARRAY);
+    assert!(<alloc::vec::Vec<Option<Interval>> as Cell<BinaryFmt>>::OID == oids::INTERVAL_ARRAY);
     assert!(<alloc::vec::Vec<Option<alloc::string::String>> as Cell<BinaryFmt>>::OID == oids::TEXT_ARRAY);
     assert!(<alloc::vec::Vec<Option<alloc::vec::Vec<u8>>> as Cell<BinaryFmt>>::OID == oids::BYTEA_ARRAY);
     // Element-OID (wire header check) ≡ borrowed scalar peer's Cell OID.
@@ -2604,6 +2673,9 @@ const _: () = {
     assert!(<Json as Cell<BinaryFmt>>::OID == oids::JSON);
     assert!(<Jsonb as Cell<BinaryFmt>>::OID == oids::JSONB);
     assert!(<Numeric as Cell<BinaryFmt>>::OID == oids::NUMERIC);
+    assert!(<Date as Cell<BinaryFmt>>::OID == oids::DATE);
+    assert!(<Time as Cell<BinaryFmt>>::OID == oids::TIME);
+    assert!(<Interval as Cell<BinaryFmt>>::OID == oids::INTERVAL);
     // Text↔binary OID symmetry: the same Rust type MUST target the
     // same PG type OID across text and binary decoders. A refactor
     // that skewed one against the other would mean the same Rust
@@ -2689,7 +2761,7 @@ where
 /// impls for their own types.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not implement `EncodeBinary` (cannot encode to PG binary format)",
-    label = "supported binary-encode types are `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `&str`, `&[u8]`, `Uuid`, `Timestamptz`, `Timestamp`, `Json`, `Jsonb`, `Numeric` (and, for the scalar wire types, their one-dimensional `&[T]` array forms)",
+    label = "supported binary-encode types are `i16`, `i32`, `i64`, `u32`, `bool`, `f32`, `f64`, `&str`, `&[u8]`, `Uuid`, `Timestamptz`, `Timestamp`, `Date`, `Time`, `Interval`, `Json`, `Jsonb`, `Numeric` (and, for the scalar wire types, their one-dimensional `&[T]` array forms)",
     note = "`EncodeBinary` is sealed — extend by adding `impl EncodeBinary for ...` for the new type in `decode.rs` after extending the supported-OID matrix; downstream `impl EncodeBinary for ...` is forbidden by construction"
 )]
 pub trait EncodeBinary: sealed::EncodeBinarySealed {
@@ -2845,6 +2917,47 @@ impl EncodeBinary for Timestamp {
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_i64_be(self.as_micros())
+    }
+}
+
+/// `date` encoder — the `i32` day count since 2000-01-01, big-endian (the
+/// `±infinity` sentinels ride through unchanged).
+impl sealed::EncodeBinarySealed for Date {}
+impl EncodeBinary for Date {
+    const OID: u32 = oids::DATE;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_i32_be(self.to_days())
+    }
+}
+
+/// `time` encoder — the `i64` microseconds-since-midnight, big-endian.
+impl sealed::EncodeBinarySealed for Time {}
+impl EncodeBinary for Time {
+    const OID: u32 = oids::TIME;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_i64_be(self.as_micros())
+    }
+}
+
+/// `interval` encoder — the three fields IN WIRE ORDER (`i64` micros, `i32`
+/// days, `i32` months), the exact inverse of the [`Cell<BinaryFmt>`](Cell)
+/// decoder so a value round-trips bit-for-bit. The fields are never collapsed.
+impl sealed::EncodeBinarySealed for Interval {}
+impl EncodeBinary for Interval {
+    const OID: u32 = oids::INTERVAL;
+    #[inline]
+    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_i64_be(self.micros())?;
+        dst.push_i32_be(self.days())?;
+        dst.push_i32_be(self.months())
     }
 }
 
@@ -3008,6 +3121,9 @@ impl_encode_binary_array!(
     f32 => oids::FLOAT4_ARRAY,
     f64 => oids::FLOAT8_ARRAY,
     Numeric => oids::NUMERIC_ARRAY,
+    Date => oids::DATE_ARRAY,
+    Time => oids::TIME_ARRAY,
+    Interval => oids::INTERVAL_ARRAY,
 );
 
 /// `text[]` array of borrowed strings. Each element is the same UTF-8
@@ -3053,6 +3169,9 @@ const _: () = {
     assert!(<&[f64] as EncodeBinary>::OID == oids::FLOAT8_ARRAY);
     assert!(<&[&[u8]] as EncodeBinary>::OID == oids::BYTEA_ARRAY);
     assert!(<&[Numeric] as EncodeBinary>::OID == oids::NUMERIC_ARRAY);
+    assert!(<&[Date] as EncodeBinary>::OID == oids::DATE_ARRAY);
+    assert!(<&[Time] as EncodeBinary>::OID == oids::TIME_ARRAY);
+    assert!(<&[Interval] as EncodeBinary>::OID == oids::INTERVAL_ARRAY);
 };
 
 // Drift-pins: every EncodeBinary impl's OID matches the
@@ -3075,6 +3194,9 @@ const _: () = {
     assert!(<Json as EncodeBinary>::OID == oids::JSON);
     assert!(<Jsonb as EncodeBinary>::OID == oids::JSONB);
     assert!(<Numeric as EncodeBinary>::OID == oids::NUMERIC);
+    assert!(<Date as EncodeBinary>::OID == oids::DATE);
+    assert!(<Time as EncodeBinary>::OID == oids::TIME);
+    assert!(<Interval as EncodeBinary>::OID == oids::INTERVAL);
     // Cross-trait symmetry (encode OID ≡ binary-decode OID ≡ catalog OID).
     assert!(<i16 as EncodeBinary>::OID == <i16 as Cell<BinaryFmt>>::OID);
     assert!(<i32 as EncodeBinary>::OID == <i32 as Cell<BinaryFmt>>::OID);
@@ -3091,6 +3213,9 @@ const _: () = {
     assert!(<Json as EncodeBinary>::OID == <Json as Cell<BinaryFmt>>::OID);
     assert!(<Jsonb as EncodeBinary>::OID == <Jsonb as Cell<BinaryFmt>>::OID);
     assert!(<Numeric as EncodeBinary>::OID == <Numeric as Cell<BinaryFmt>>::OID);
+    assert!(<Date as EncodeBinary>::OID == <Date as Cell<BinaryFmt>>::OID);
+    assert!(<Time as EncodeBinary>::OID == <Time as Cell<BinaryFmt>>::OID);
+    assert!(<Interval as EncodeBinary>::OID == <Interval as Cell<BinaryFmt>>::OID);
 };
 
 /// PostgreSQL built-in type OID constants for the subset the
@@ -3147,6 +3272,12 @@ pub mod oids {
     pub const JSONB: u32 = 3802;
     /// `numeric` / `decimal` — arbitrary-precision exact decimal.
     pub const NUMERIC: u32 = 1700;
+    /// `date` — calendar day (days since 2000-01-01).
+    pub const DATE: u32 = 1082;
+    /// `time` — time of day without time zone (microseconds since midnight).
+    pub const TIME: u32 = 1083;
+    /// `interval` — a span of months / days / microseconds.
+    pub const INTERVAL: u32 = 1186;
 
     // ── Array (`T[]`) type OIDs, for a single array parameter sent to a
     //    `col = ANY($N)` in-list. Each is the `typarray` of the matching
@@ -3184,6 +3315,12 @@ pub mod oids {
     pub const UUID_ARRAY: u32 = 2951;
     /// `numeric[]` (`_numeric`).
     pub const NUMERIC_ARRAY: u32 = 1231;
+    /// `date[]` (`_date`).
+    pub const DATE_ARRAY: u32 = 1182;
+    /// `time[]` (`_time`).
+    pub const TIME_ARRAY: u32 = 1183;
+    /// `interval[]` (`_interval`).
+    pub const INTERVAL_ARRAY: u32 = 1187;
 
     // Tier-1 compile drift-pin against the canonical PG catalog
     // (src/include/catalog/pg_type.dat). A typo in any constant
@@ -3208,6 +3345,9 @@ pub mod oids {
         assert!(UUID == 2950, "oids::UUID drift from pg_type.dat");
         assert!(JSONB == 3802, "oids::JSONB drift from pg_type.dat");
         assert!(NUMERIC == 1700, "oids::NUMERIC drift from pg_type.dat");
+        assert!(DATE == 1082, "oids::DATE drift from pg_type.dat");
+        assert!(TIME == 1083, "oids::TIME drift from pg_type.dat");
+        assert!(INTERVAL == 1186, "oids::INTERVAL drift from pg_type.dat");
         // Array OIDs, verified against `pg_type` (`typname` -> `typarray`)
         // on PostgreSQL 15.
         assert!(BOOL_ARRAY == 1000, "oids::BOOL_ARRAY drift from pg_type.dat");
@@ -3225,6 +3365,9 @@ pub mod oids {
         assert!(JSONB_ARRAY == 3807, "oids::JSONB_ARRAY drift from pg_type.dat");
         assert!(UUID_ARRAY == 2951, "oids::UUID_ARRAY drift from pg_type.dat");
         assert!(NUMERIC_ARRAY == 1231, "oids::NUMERIC_ARRAY drift from pg_type.dat");
+        assert!(DATE_ARRAY == 1182, "oids::DATE_ARRAY drift from pg_type.dat");
+        assert!(TIME_ARRAY == 1183, "oids::TIME_ARRAY drift from pg_type.dat");
+        assert!(INTERVAL_ARRAY == 1187, "oids::INTERVAL_ARRAY drift from pg_type.dat");
     };
 }
 
@@ -5234,6 +5377,119 @@ mod numeric_wire_tests {
         ok.extend_from_slice(&0x0000u16.to_be_bytes());
         ok.extend_from_slice(&0x3FFFu16.to_be_bytes()); // dscale = 16383
         assert!(<Numeric as Cell<BinaryFmt>>::decode(&ok).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod temporal_wire_tests {
+    //! `date` / `time` / `interval` binary wire round-trip + byte-layout +
+    //! bad-path classification. A date off-by-one is a wrong calendar day, so
+    //! the decode is pinned against HAND-BUILT PostgreSQL wire bytes (the exact
+    //! `date_send` / `time_send` / `interval_send` layout), the encode/decode
+    //! identity is proven across the sentinels and edge values, and a wrong
+    //! length is a classified `BinaryLengthMismatch`, never a panic or a
+    //! partial read.
+    extern crate alloc;
+    use super::{oids, BinaryFmt, Cell, DecodeError, EncodeBinary};
+    use crate::pgtypes::{Date, Interval, Time};
+    use crate::write_buf::WriteBuf;
+    use alloc::vec::Vec;
+
+    /// Encode any `EncodeBinary` value to its wire bytes.
+    fn encode<T: EncodeBinary>(v: &T) -> Vec<u8> {
+        let mut buf = WriteBuf::new();
+        assert!(v.encode_to(&mut buf).is_ok(), "encode fits the buffer");
+        buf.as_bytes().to_vec()
+    }
+
+    /// `date` encode/decode is the identity across ordinary days, the epoch,
+    /// pre-epoch days, and BOTH `±infinity` sentinels — and the encoded bytes
+    /// are exactly the 4-byte big-endian day count `date_send` emits.
+    #[test]
+    fn date_round_trips_and_matches_wire() {
+        for days in [0_i32, 59, -1, -730_119, 2_921_939, i32::MAX, i32::MIN] {
+            let d = Date::from_days(days);
+            let bytes = encode(&d);
+            assert_eq!(bytes, days.to_be_bytes(), "wire bytes for days {days}");
+            let decoded = <Date as Cell<BinaryFmt>>::decode(&bytes).expect("decodes");
+            assert_eq!(decoded, d, "round-trip identity for days {days}");
+        }
+        assert_eq!(<Date as Cell<BinaryFmt>>::OID, oids::DATE);
+    }
+
+    /// `time` encode/decode is the identity, and the bytes are the 8-byte
+    /// big-endian microsecond count `time_send` emits.
+    #[test]
+    fn time_round_trips_and_matches_wire() {
+        for micros in [0_i64, 45_296_789_012, 86_399_999_999, 86_400_000_000] {
+            let t = Time::from_micros(micros);
+            let bytes = encode(&t);
+            assert_eq!(bytes, micros.to_be_bytes(), "wire bytes for {micros} micros");
+            let decoded = <Time as Cell<BinaryFmt>>::decode(&bytes).expect("decodes");
+            assert_eq!(decoded, t, "round-trip identity for {micros} micros");
+        }
+        assert_eq!(<Time as Cell<BinaryFmt>>::OID, oids::TIME);
+    }
+
+    /// `interval` decode is pinned against HAND-BUILT PostgreSQL wire bytes:
+    /// `1 year 2 mons 3 days 04:05:06` is `interval_send` order micros (i64) =
+    /// 14_706_000_000, days (i32) = 3, months (i32) = 14. The three fields are
+    /// stored separately — never collapsed.
+    #[test]
+    fn interval_decode_matches_hand_built_pg_bytes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&14_706_000_000_i64.to_be_bytes()); // micros
+        bytes.extend_from_slice(&3_i32.to_be_bytes()); // days
+        bytes.extend_from_slice(&14_i32.to_be_bytes()); // months
+        let decoded = <Interval as Cell<BinaryFmt>>::decode(&bytes).expect("decodes");
+        assert_eq!(decoded, Interval::new(14, 3, 14_706_000_000));
+        // And the encoder reproduces those exact 16 bytes.
+        assert_eq!(encode(&decoded), bytes);
+    }
+
+    /// `interval` encode/decode identity over positive / negative / mixed-sign
+    /// field combinations (the three fields are independent).
+    #[test]
+    fn interval_round_trips_identity() {
+        for (months, days, micros) in [
+            (0_i32, 0_i32, 0_i64),
+            (14, 3, 14_706_000_000),
+            (0, -1, 0),
+            (1200, 0, 0),
+            (-14, 0, 0),
+            (0, 1, -1),
+            (10, 3, -14_706_000_000),
+        ] {
+            let i = Interval::new(months, days, micros);
+            let decoded = <Interval as Cell<BinaryFmt>>::decode(&encode(&i)).expect("decodes");
+            assert_eq!(decoded, i, "round-trip for ({months},{days},{micros})");
+        }
+        assert_eq!(<Interval as Cell<BinaryFmt>>::OID, oids::INTERVAL);
+    }
+
+    /// A wrong body length for each fixed-width temporal type is a classified
+    /// `BinaryLengthMismatch` (no panic, no partial read), never accepted.
+    #[test]
+    fn wrong_length_is_classified() {
+        // date wants 4 bytes.
+        assert!(matches!(
+            <Date as Cell<BinaryFmt>>::decode(&[0, 0, 0]),
+            Err(DecodeError::BinaryLengthMismatch { expected_len: 4, actual_len: 3 })
+        ));
+        // time wants 8 bytes.
+        assert!(matches!(
+            <Time as Cell<BinaryFmt>>::decode(&[0, 0, 0, 0]),
+            Err(DecodeError::BinaryLengthMismatch { expected_len: 8, actual_len: 4 })
+        ));
+        // interval wants 16 bytes — both too short and too long are rejected.
+        assert!(matches!(
+            <Interval as Cell<BinaryFmt>>::decode(&[0; 15]),
+            Err(DecodeError::BinaryLengthMismatch { expected_len: 16, actual_len: 15 })
+        ));
+        assert!(matches!(
+            <Interval as Cell<BinaryFmt>>::decode(&[0; 17]),
+            Err(DecodeError::BinaryLengthMismatch { expected_len: 16, actual_len: 17 })
+        ));
     }
 }
 

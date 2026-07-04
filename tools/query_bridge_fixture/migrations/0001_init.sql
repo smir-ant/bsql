@@ -12,5 +12,6 @@ CREATE TABLE events (
     amount   numeric       NOT NULL,   -- bridged -> MyDecimal (variable-width)
     refund   numeric,                  -- bridged, nullable -> Option<MyDecimal>
     rates    numeric[]     NOT NULL,   -- bridged element -> Vec<Option<MyDecimal>>
+    day      date          NOT NULL,   -- bridged -> MyDate (via the civil conversion)
     label    text          NOT NULL    -- UNBRIDGED native -> &str / String
 );

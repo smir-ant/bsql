@@ -19,7 +19,7 @@
 use core::ops::ControlFlow;
 use core::str::FromStr as _;
 
-use bsql::{Numeric, Timestamptz, Uuid};
+use bsql::{Date, Interval, Numeric, Time, Timestamptz, Uuid};
 use bsql_postgres_async::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 bsql::query!(One, "SELECT 1::int4 AS n");
@@ -96,6 +96,24 @@ bsql::query!(EmptyArrayLit, "SELECT ARRAY[]::int4[] AS xs");
 bsql::query!(EchoNum, "SELECT $1::numeric AS n");
 bsql::query!(EchoNumText, "SELECT $1::numeric::text AS t");
 bsql::query!(NumArrayLit, "SELECT '{1.5,NULL,100}'::numeric[] AS xs");
+
+// ── temporal family: date / time / interval (see the sync twin) ──────────
+bsql::query!(EchoDate, "SELECT $1::date AS d");
+bsql::query!(EchoDateText, "SELECT $1::date::text AS t");
+bsql::query!(EchoTime, "SELECT $1::time AS x");
+bsql::query!(EchoTimeText, "SELECT $1::time::text AS t");
+bsql::query!(EchoInterval, "SELECT $1::interval AS i");
+bsql::query!(EchoIntervalText, "SELECT $1::interval::text AS t");
+bsql::query!(DateArrayLit, "SELECT '{2000-01-01,NULL,2000-02-29}'::date[] AS xs");
+bsql::query!(TimeArrayLit, "SELECT '{00:00:00,NULL,23:59:59.999999}'::time[] AS xs");
+bsql::query!(
+    IntervalArrayLit,
+    r#"SELECT '{"1 day",NULL,"-1 day"}'::interval[] AS xs"#
+);
+bsql::query!(
+    DateAny,
+    "SELECT d FROM (VALUES ('2000-01-01'::date), ('2000-02-29'::date), ('9999-12-31'::date)) t(d) WHERE d = ANY($1)"
+);
 
 fn async_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -807,5 +825,115 @@ async fn typed_array_columns_round_trip() {
     let empty = c.query_one::<EmptyArrayLitQuery>(()).await.expect("query_one EmptyArrayLit");
     assert_eq!(empty.xs, Some(Vec::<Option<i32>>::new()));
 
+    c.close().await.expect("close");
+}
+
+/// PRECISION BATTERY (date, async twin): calendar days — epoch, leap day, the
+/// day before the epoch, year 1 AD, a far-future date, plus the ±infinity
+/// sentinels — each round-trip bit-exact against the `$1::date::text` oracle.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_date_precision_battery() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    for s in ["2000-01-01", "2000-02-29", "1999-12-31", "0001-01-01", "9999-12-31"] {
+        let d = Date::from_str(s).expect("date parses");
+        let echoed = c.query_one::<EchoDateQuery>((d,)).await.expect("echo date");
+        let oracle = c.query_one::<EchoDateTextQuery>((d,)).await.expect("oracle");
+        assert_eq!(echoed.d.to_string(), s, "decode Display == expected for `{s}`");
+        assert_eq!(echoed.d.to_string(), oracle.t, "decode Display == PG ::text for `{s}`");
+        assert_eq!(echoed.d, d, "decoded value equals the bound value for `{s}`");
+    }
+    for (value, text) in [(Date::infinity(), "infinity"), (Date::neg_infinity(), "-infinity")] {
+        let echoed = c.query_one::<EchoDateQuery>((value,)).await.expect("echo date inf");
+        let oracle = c.query_one::<EchoDateTextQuery>((value,)).await.expect("oracle");
+        assert_eq!(echoed.d, value, "{text} round-trips exactly");
+        assert_eq!(echoed.d.to_string(), text);
+        assert_eq!(oracle.t, text, "PG ::text renders {text}");
+    }
+    c.close().await.expect("close");
+}
+
+/// PRECISION BATTERY (time, async twin).
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_time_precision_battery() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    for s in ["00:00:00", "12:34:56.789012", "23:59:59.999999", "01:02:03"] {
+        let t = Time::from_str(s).expect("time parses");
+        let echoed = c.query_one::<EchoTimeQuery>((t,)).await.expect("echo time");
+        let oracle = c.query_one::<EchoTimeTextQuery>((t,)).await.expect("oracle");
+        assert_eq!(echoed.x.to_string(), s, "decode Display == expected for `{s}`");
+        assert_eq!(echoed.x.to_string(), oracle.t, "decode Display == PG ::text for `{s}`");
+        assert_eq!(echoed.x, t, "decoded value equals the bound value for `{s}`");
+    }
+    c.close().await.expect("close");
+}
+
+/// PRECISION BATTERY (interval, async twin): the three separate fields
+/// round-trip bit-exact and render PostgreSQL's own `$1::interval::text`.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_interval_precision_battery() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    for (value, text) in [
+        (Interval::new(0, 0, 0), "00:00:00"),
+        (Interval::new(14, 3, 14_706_000_000), "1 year 2 mons 3 days 04:05:06"),
+        (Interval::new(0, -1, 0), "-1 days"),
+        (Interval::new(1200, 0, 0), "100 years"),
+        (Interval::new(0, 0, 3_723_000_000), "01:02:03"),
+        (Interval::new(0, 1, 90_000_000_000), "1 day 25:00:00"),
+        (Interval::new(0, -2, -11_045_678_000), "-2 days -03:04:05.678"),
+        // Mixed-sign: a positive field after a negative one takes a `+` prefix
+        // (PostgreSQL's `is_before` state); the oracle catches any divergence.
+        (Interval::new(-1, 2, 0), "-1 mons +2 days"),
+        (Interval::new(-13, 5, 0), "-1 years -1 mons +5 days"),
+        (Interval::new(1, -2, 0), "1 mon -2 days"),
+        (Interval::new(-1, -2, 10_800_000_000), "-1 mons -2 days +03:00:00"),
+    ] {
+        let echoed = c.query_one::<EchoIntervalQuery>((value,)).await.expect("echo interval");
+        let oracle = c.query_one::<EchoIntervalTextQuery>((value,)).await.expect("oracle");
+        assert_eq!(echoed.i.to_string(), text, "decode Display == expected for `{text}`");
+        assert_eq!(echoed.i.to_string(), oracle.t, "decode Display == PG ::text for `{text}`");
+        assert_eq!(echoed.i, value, "decoded fields equal the bound fields for `{text}`");
+    }
+    c.close().await.expect("close");
+}
+
+/// ARRAYS (temporal, async twin): `date[]` / `time[]` / `interval[]` with a
+/// NULL middle element decode to `Vec<Option<T>>`.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_temporal_arrays_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+
+    let dates = c.query_one::<DateArrayLitQuery>(()).await.expect("date[]");
+    let d: Vec<Option<String>> =
+        dates.xs.iter().map(|e| e.as_ref().map(ToString::to_string)).collect();
+    assert_eq!(d, vec![Some("2000-01-01".to_string()), None, Some("2000-02-29".to_string())]);
+
+    let times = c.query_one::<TimeArrayLitQuery>(()).await.expect("time[]");
+    let t: Vec<Option<String>> =
+        times.xs.iter().map(|e| e.as_ref().map(ToString::to_string)).collect();
+    assert_eq!(t, vec![Some("00:00:00".to_string()), None, Some("23:59:59.999999".to_string())]);
+
+    let spans = c.query_one::<IntervalArrayLitQuery>(()).await.expect("interval[]");
+    let i: Vec<Option<String>> =
+        spans.xs.iter().map(|e| e.as_ref().map(ToString::to_string)).collect();
+    assert_eq!(i, vec![Some("1 day".to_string()), None, Some("-1 days".to_string())]);
+
+    c.close().await.expect("close");
+}
+
+/// ARRAY ENCODE (date[], async twin): `d = ANY($1)` sends a `date[]` frame that
+/// PostgreSQL must accept byte-correct.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn date_array_any_bind_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+    const WANTED: [Date; 2] = [Date::from_days(0), Date::from_days(2_921_939)];
+    let rows = c.query::<DateAnyQuery>((&WANTED[..],)).await.expect("query DateAny");
+    let mut got: Vec<i32> = rows.iter().map(|r| r.expect("row decodes").d.to_days()).collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![0, 2_921_939], "date[] ANY($1) returns the matching rows");
     c.close().await.expect("close");
 }

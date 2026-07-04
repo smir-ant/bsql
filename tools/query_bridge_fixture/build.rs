@@ -13,7 +13,11 @@
 //!     converter travel as strings);
 //!   * `numeric` -> a dep-free FIXTURE-LOCAL `MyDecimal` stand-in, proving the
 //!     variable-width, arbitrary-precision `bsql::Numeric` pivot bridges into a
-//!     consumer's chosen decimal type with no forced dependency.
+//!     consumer's chosen decimal type with no forced dependency;
+//!   * `date` -> a dep-free FIXTURE-LOCAL `MyDate` stand-in built from the
+//!     native `bsql::Date`'s civil conversion, proving the temporal pivot
+//!     bridges into a consumer's calendar-date type (a `chrono::NaiveDate`
+//!     stand-in) with no forced dependency.
 //!
 //! Both target/converter paths name this crate by its own package name so they
 //! resolve from the integration-test crates where `query!` is invoked. Any
@@ -42,6 +46,11 @@ fn main() -> Result<(), bsql_build::BuildError> {
             "numeric",
             "bsql_query_bridge_fixture::bridge::MyDecimal",
             "bsql_query_bridge_fixture::bridge::to_decimal",
+        )
+        .bridge(
+            "date",
+            "bsql_query_bridge_fixture::bridge::MyDate",
+            "bsql_query_bridge_fixture::bridge::to_mydate",
         )
         .emit_catalog()
 }

@@ -179,18 +179,22 @@ pub use bsql_query_macros::query;
 pub use bsql_postgres_proto::{DecodeError, PreparedQuery, QueryFingerprint, TypedQuery};
 
 /// Dependency-free bsql-native types a `query!` record field carries for a
-/// PostgreSQL `uuid` / `timestamptz` / `timestamp` / `json` / `jsonb` column
-/// — the always-available core that lets `query!` type a real schema without
-/// pulling in `uuid` / `time` / `serde_json` / `rust_decimal`. [`Uuid`]
-/// round-trips its hyphenated hex text; [`Timestamptz`] exposes an exact
-/// Unix-epoch conversion; [`Timestamp`] is the zone-less peer; [`Json`] /
+/// PostgreSQL `uuid` / `timestamptz` / `timestamp` / `date` / `time` /
+/// `interval` / `json` / `jsonb` / `numeric` column — the always-available core
+/// that lets `query!` type a real schema without pulling in `uuid` / `chrono` /
+/// `time` / `serde_json` / `rust_decimal`. [`Uuid`] round-trips its hyphenated
+/// hex text; [`Timestamptz`] exposes an exact Unix-epoch conversion;
+/// [`Timestamp`] is the zone-less peer; [`Date`] renders ISO-8601 via a
+/// dependency-free Gregorian conversion; [`Time`] is a microsecond time of day;
+/// [`Interval`] keeps months / days / microseconds separate; [`Json`] /
 /// [`Jsonb`] surface the document's UTF-8 text verbatim; [`Numeric`] is an
-/// exact, arbitrary-precision decimal (money, quantities) that round-trips its
-/// text form. Ergonomic external-crate integrations are a deferred,
-/// feature-flagged follow-up.
+/// exact, arbitrary-precision decimal that round-trips its text form. To decode
+/// straight into an external crate's type instead, register a build-time
+/// external-type bridge — bsql forces no dependency.
 #[cfg(feature = "macros")]
 pub use bsql_postgres_proto::{
-    Json, Jsonb, Numeric, NumericParseError, Timestamp, Timestamptz, Uuid, UuidParseError,
+    Date, DateParseError, Interval, Json, Jsonb, Numeric, NumericParseError, Time, TimeParseError,
+    Timestamp, Timestamptz, Uuid, UuidParseError,
 };
 
 /// Bounded / streaming typed result containers a driver's typed-query
@@ -213,7 +217,8 @@ pub use bsql_postgres_core::{Rows, RowsBuilder};
 pub mod __rt {
     pub use bsql_postgres_proto::wire_pin;
     pub use bsql_postgres_proto::{
-        BinaryFmt, Cell, DataRowRef, DecodeError, Json, Jsonb, Numeric, PreparedQuery,
-        QueryFingerprint, Timestamp, Timestamptz, TypedQuery, Uuid, oids, prepared, query_budget,
+        BinaryFmt, Cell, DataRowRef, Date, DecodeError, Interval, Json, Jsonb, Numeric,
+        PreparedQuery, QueryFingerprint, Time, Timestamp, Timestamptz, TypedQuery, Uuid, oids,
+        prepared, query_budget,
     };
 }

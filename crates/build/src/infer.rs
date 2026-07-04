@@ -136,6 +136,12 @@ pub enum ElemType {
     Jsonb,
     /// `numeric[]` element.
     Numeric,
+    /// `date[]` element.
+    Date,
+    /// `time[]` element.
+    Time,
+    /// `interval[]` element.
+    Interval,
 }
 
 impl ElemType {
@@ -158,6 +164,9 @@ impl ElemType {
             ElemType::Json => RustType::Json,
             ElemType::Jsonb => RustType::Jsonb,
             ElemType::Numeric => RustType::Numeric,
+            ElemType::Date => RustType::Date,
+            ElemType::Time => RustType::Time,
+            ElemType::Interval => RustType::Interval,
         }
     }
 
@@ -180,6 +189,9 @@ impl ElemType {
             ElemType::Json => "Vec<Option<bsql::Json>>",
             ElemType::Jsonb => "Vec<Option<bsql::Jsonb>>",
             ElemType::Numeric => "Vec<Option<bsql::Numeric>>",
+            ElemType::Date => "Vec<Option<bsql::Date>>",
+            ElemType::Time => "Vec<Option<bsql::Time>>",
+            ElemType::Interval => "Vec<Option<bsql::Interval>>",
         }
     }
 }
@@ -226,6 +238,14 @@ pub enum RustType {
     /// PostgreSQL `numeric` / `decimal` -> the dep-free `bsql::Numeric`
     /// (exact, arbitrary-precision decimal).
     Numeric,
+    /// PostgreSQL `date` -> the dep-free `bsql::Date` (days since 2000-01-01).
+    Date,
+    /// PostgreSQL `time` (without time zone) -> the dep-free `bsql::Time`
+    /// (microseconds since midnight).
+    Time,
+    /// PostgreSQL `interval` -> the dep-free `bsql::Interval` (separate
+    /// months / days / microseconds fields).
+    Interval,
     /// A one-dimensional PostgreSQL array (`T[]`) of a scalar element ->
     /// `Vec<Option<T>>`. The outer `Vec` is the array; each element is
     /// `Option<T>` because a PG array may always contain NULL elements. The
@@ -256,6 +276,9 @@ impl RustType {
             RustType::Json => "bsql::Json",
             RustType::Jsonb => "bsql::Jsonb",
             RustType::Numeric => "bsql::Numeric",
+            RustType::Date => "bsql::Date",
+            RustType::Time => "bsql::Time",
+            RustType::Interval => "bsql::Interval",
             RustType::Array(elem) => elem.array_rust_name(),
         }
     }
@@ -338,6 +361,13 @@ fn scalar_elem_for_pg(pg_type: &str) -> Option<ElemType> {
         // `numeric` / `decimal` (alias-collapsed to `numeric` by
         // `canonical_type`) -> the dep-free exact-decimal `bsql::Numeric`.
         "numeric" => Some(ElemType::Numeric),
+        // Dep-free temporal family. `time` is the zone-less time of day; the
+        // zoned `timetz` is a DISTINCT type (`canonical_type` renders it
+        // `timetz` so it stays a loud `UnsupportedPgType`, never collapsed to
+        // `time`). `interval` keeps its three fields separate.
+        "date" => Some(ElemType::Date),
+        "time" => Some(ElemType::Time),
+        "interval" => Some(ElemType::Interval),
         _ => None,
     }
 }
@@ -9947,6 +9977,9 @@ fn common_type(a: RustType, b: RustType) -> Option<RustType> {
         | RustType::Json
         | RustType::Jsonb
         | RustType::Numeric
+        | RustType::Date
+        | RustType::Time
+        | RustType::Interval
         // Arrays never widen across a merge: two array sides reconcile ONLY
         // when identical (the `a == b` early return above), so an
         // array-vs-scalar or two distinct-element arrays are a loud
@@ -17462,22 +17495,15 @@ mod tests {
 
     #[test]
     fn still_unsupported_types_stay_loud() {
-        // The fail-closed contract holds for types NOT in the widened set:
-        // `date`, `inet`, and `interval` are still a loud `UnsupportedPgType`,
-        // never silently mapped.
-        for (ddl, name) in [
-            ("CREATE TABLE t (d DATE NOT NULL)", "date"),
-            ("CREATE TABLE t (a INET NOT NULL)", "inet"),
-            ("CREATE TABLE t (i INTERVAL NOT NULL)", "interval"),
+        // The fail-closed contract holds for types NOT in the supported set:
+        // `inet` and the zoned `timetz` are still a loud `UnsupportedPgType`,
+        // never silently mapped. `timetz` is the load-bearing case — its head
+        // word is `time`, so a head-word collapse would mis-type it as the
+        // naive `time`; `canonical_type` renders it `timetz` so it stays loud.
+        for (ddl, col_name, name) in [
+            ("CREATE TABLE t (a INET NOT NULL)", "a", "inet"),
+            ("CREATE TABLE t (z TIME WITH TIME ZONE NOT NULL)", "z", "timetz"),
         ] {
-            let err = shape(&[ddl], "SELECT * FROM t");
-            // `*` is its own error; use a named column instead.
-            let _ = err;
-            let col_name = match name {
-                "date" => "d",
-                "inet" => "a",
-                _ => "i",
-            };
             let sql = format!("SELECT {col_name} FROM t");
             let err = shape(&[ddl], &sql).expect_err("still unsupported");
             assert!(
@@ -17485,6 +17511,32 @@ mod tests {
                 "{name} must stay unsupported, got {err:?}",
             );
         }
+    }
+
+    #[test]
+    fn temporal_types_are_supported() {
+        // `date` / `time` / `interval` (and their arrays) are the dep-free
+        // temporal native pivots; the naive `time` and zoned `timetz` are
+        // distinguished structurally (the zoned form stays unsupported).
+        let ddl = "CREATE TABLE t ( \
+            d DATE NOT NULL, \
+            tm TIME NOT NULL, \
+            tm2 TIME WITHOUT TIME ZONE, \
+            iv INTERVAL NOT NULL, \
+            ds DATE[], \
+            ivs INTERVAL[] )";
+        let s = shape(&[ddl], "SELECT d, tm, tm2, iv, ds, ivs FROM t").expect("supported");
+        assert_eq!(
+            s.columns,
+            vec![
+                col("d", RustType::Date, false),
+                col("tm", RustType::Time, false),
+                col("tm2", RustType::Time, true),
+                col("iv", RustType::Interval, false),
+                col("ds", RustType::Array(ElemType::Date), true),
+                col("ivs", RustType::Array(ElemType::Interval), true),
+            ],
+        );
     }
 
     #[test]

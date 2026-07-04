@@ -1845,6 +1845,22 @@ fn canonical_type(data_type: &sqlparser::ast::DataType) -> String {
         }
         .to_string();
     }
+    // `TIME WITH TIME ZONE` (`timetz`) is a DISTINCT PostgreSQL type from the
+    // naive `time`, but its rendered head word is `time` — a head-word split
+    // would silently collapse the zone away and type a `timetz` column as the
+    // zone-less `time` (a wrong 12-byte-vs-8-byte wire shape). Match the parsed
+    // `TimezoneInfo` structurally: the zoned spelling canonicalises to `timetz`
+    // (which has no supported native pivot, so it stays a loud
+    // `UnsupportedPgType`), the zone-less one to `time`. The optional precision
+    // (`TIME(3)`) is a typmod that does not change the type OID, so it is
+    // dropped by keeping only the type name.
+    if let DataType::Time(_, tz) = data_type {
+        return match tz {
+            TimezoneInfo::Tz | TimezoneInfo::WithTimeZone => "timetz",
+            TimezoneInfo::None | TimezoneInfo::WithoutTimeZone => "time",
+        }
+        .to_string();
+    }
     let rendered = data_type.to_string().to_ascii_lowercase();
     // Normalise on the leading word (strip length/precision args like
     // `varchar(50)` -> `varchar`, `numeric(10,2)` -> `numeric`).

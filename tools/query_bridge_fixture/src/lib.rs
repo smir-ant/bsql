@@ -54,4 +54,32 @@ pub mod bridge {
     pub fn to_decimal(v: bsql::Numeric) -> MyDecimal {
         MyDecimal(v.to_string())
     }
+
+    /// A dep-free stand-in for an external calendar-date type (e.g. what
+    /// `chrono::NaiveDate` / `time::Date` would be in a real consumer). Foreign
+    /// to bsql, so it could only be reached by the orphan-proof free-fn
+    /// converter below (an `impl bsql::Cell for MyDate` would be E0117). Holds
+    /// the proleptic-Gregorian `(year, month, day)`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct MyDate {
+        /// Astronomical year (`0` = 1 BC).
+        pub year: i32,
+        /// Month `1..=12` (`0` for the `±infinity` sentinels).
+        pub month: u8,
+        /// Day `1..=31` (`0` for the `±infinity` sentinels).
+        pub day: u8,
+    }
+
+    /// The `date` bridge converter: reshape the native `bsql::Date` into the
+    /// fixture-local `MyDate` via the dependency-free civil conversion — exactly
+    /// what a real consumer would do to build a `chrono::NaiveDate`. Infallible:
+    /// the `±infinity` sentinels have no civil date, so the consumer maps them
+    /// to a zeroed `MyDate` (its own total-function choice).
+    #[must_use]
+    pub fn to_mydate(v: bsql::Date) -> MyDate {
+        match v.to_civil() {
+            Some((year, month, day)) => MyDate { year, month, day },
+            None => MyDate { year: 0, month: 0, day: 0 },
+        }
+    }
 }

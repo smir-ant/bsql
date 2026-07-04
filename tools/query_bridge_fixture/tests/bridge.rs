@@ -16,7 +16,7 @@
 //! wrong OID would be an `error[E0080]` (the guarantee rides the native pivot,
 //! untouched by the bridge).
 
-use bsql_query_bridge_fixture::bridge::{MyDecimal, MyTs};
+use bsql_query_bridge_fixture::bridge::{MyDate, MyDecimal, MyTs};
 
 // All-fixed-width, all-NOT-NULL, BOTH columns bridged: `id` (uuid, 16 bytes)
 // and `created` (timestamptz, 8 bytes). This exercises the vectorized fast path
@@ -37,6 +37,11 @@ bsql::query!(
 // Vec<Option<MyDecimal>>). Proves the variable-width, arbitrary-precision
 // `bsql::Numeric` pivot reshapes into the consumer's decimal type.
 bsql::query!(Decimals, "SELECT amount, refund, rates FROM events");
+
+// The `date`-bridged column: the native `bsql::Date` pivot reshapes into the
+// consumer's calendar-date type (`MyDate`) via the civil conversion — proving
+// the temporal pivot bridges with bsql forcing no calendar crate.
+bsql::query!(Dated, "SELECT day FROM events");
 
 // ── compile-time FIELD-TYPE assertions ──────────────────────────────────
 // Each binding type-checks only because the emitted field type is the BARE
@@ -62,6 +67,13 @@ fn _field_types_decimals(r: DecimalsOwned) {
     let _amount: MyDecimal = r.amount;
     let _refund: Option<MyDecimal> = r.refund;
     let _rates: Vec<Option<MyDecimal>> = r.rates;
+}
+
+#[allow(dead_code, reason = "compile-time type witnesses; never called")]
+fn _field_types_dated(r: DatedOwned) {
+    // The `date` column decodes DIRECTLY into the consumer's `MyDate` — no
+    // `.0`, no `.into()`, no annotation at the `query!` site.
+    let _day: MyDate = r.day;
 }
 
 // ── byte builders ────────────────────────────────────────────────────────
@@ -250,5 +262,26 @@ fn numeric_columns_decode_into_the_bridged_decimal() {
             None,
             Some(MyDecimal("100".to_string())),
         ],
+    );
+}
+
+#[test]
+fn date_column_decodes_into_the_bridged_calendar_type() {
+    // day = 2000-02-29 (59 days after the PG date epoch). The 4-byte i32 day
+    // count decodes to the native `bsql::Date`, then the converter reshapes it
+    // into the consumer's `MyDate` via the civil conversion.
+    let mut body = Vec::new();
+    body.extend_from_slice(&(1i16).to_be_bytes()); // 1 column
+    body.extend_from_slice(&cell(&59i32.to_be_bytes())); // day = 59 -> 2000-02-29
+
+    let row = DatedOwned::decode(&body).expect("decodes");
+    assert_eq!(
+        row.day,
+        MyDate {
+            year: 2000,
+            month: 2,
+            day: 29,
+        },
+        "date bridges into the consumer's calendar type via the civil conversion",
     );
 }
