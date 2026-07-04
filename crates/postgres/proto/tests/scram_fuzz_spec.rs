@@ -201,7 +201,7 @@ fn extract_client_nonce(client_bytes: &[u8]) -> Vec<u8> {
 /// its send buffer, or `None` if the offline setup did not settle as expected.
 fn engine_awaiting_server_first() -> Option<(ConnectingEngine, SendBuf)> {
     let mut sb = SendBuf::new();
-    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, None, scram_creds()).ok()?;
+    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, &[], scram_creds()).ok()?;
     if !feed(&mut engine, &auth(10, b"SCRAM-SHA-256\0\0")) {
         return None;
     }

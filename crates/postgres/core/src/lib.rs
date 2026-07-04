@@ -29,7 +29,7 @@ pub mod tls;
 pub mod typed_rows;
 pub mod types;
 
-pub use config::{ConnectConfig, SslMode};
+pub use config::{validate_startup_params, ConnectConfig, SslMode};
 pub use error::{ColumnError, DbError, DriverError};
 pub use materialize::{CollectedResult, DbErrorSink, ResultCollector};
 pub use notify::{capture_notify, NotificationLedger, TypedNotification};

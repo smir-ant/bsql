@@ -161,7 +161,7 @@ async fn a_verb_completes_across_a_pending_read() {
     let server = PendingEachRead { inbound, cursor: 0 };
 
     let (mut engine, live) =
-        engine::open_owned(server, &user, None, None, Credentials::Trust).expect("open");
+        engine::open_owned(server, &user, None, &[], Credentials::Trust).expect("open");
     // connect drives the connecting pump over the Pending-returning transport.
     let live = engine.connect(live).await.expect("connect across pending");
     // A follow-up active verb drives the active pump, also across a Pending read.
@@ -247,7 +247,7 @@ async fn recv_notification_quiet_on_would_block_keeps_the_token() {
         after_cursor: 0,
     };
     let (mut engine, live) =
-        engine::open_owned(server, &user, None, None, Credentials::Trust).expect("open");
+        engine::open_owned(server, &user, None, &[], Credentials::Trust).expect("open");
     let live = engine.connect(live).await.expect("connect");
 
     // The read returns would-block (the deadline): the verb reports Quiet and the
@@ -277,7 +277,7 @@ async fn recv_notification_received_parses_the_payload_and_keeps_the_token() {
     let server = PendingEachRead { inbound, cursor: 0 };
 
     let (mut engine, live) =
-        engine::open_owned(server, &user, None, None, Credentials::Trust).expect("open");
+        engine::open_owned(server, &user, None, &[], Credentials::Trust).expect("open");
     let live = engine.connect(live).await.expect("connect");
 
     // Mirror the driver's capture: a Notify surfaces the raw body, which

@@ -288,7 +288,7 @@ pub fn primed_engine(hit_rows: usize) -> OwnedEngine {
     inbound.extend_from_slice(&miss_reply(1)); // prime: one-row MISS
     inbound.extend_from_slice(&hit_reply(hit_rows)); // the benched HIT
     let (mut engine, live) =
-        open_owned(Script::new(inbound), &user, None, None, Credentials::Trust)
+        open_owned(Script::new(inbound), &user, None, &[], Credentials::Trust)
             .expect("session assembles");
 
     let live = match poll_once(engine.connect(live)) {

@@ -43,6 +43,88 @@ fn connect_and_ping() {
     c.close().expect("close");
 }
 
+/// WITNESS: startup parameters set on the connection config take effect on the
+/// server session. Proven three ways — `SHOW search_path`,
+/// `current_setting('application_name')`, `SHOW statement_timeout` — plus the
+/// load-bearing schema-isolation proof: a connect-time `search_path` resolves
+/// an UNQUALIFIED table into the chosen schema, and SURVIVES the pool-checkout
+/// `RESET ALL` (a startup-packet parameter is the session reset value). Without
+/// a connect-time search_path a pooled connection would silently escape its
+/// schema — the hole this closes.
+#[test]
+#[ignore = "requires local PG"]
+fn startup_params_take_effect() {
+    let schema = format!("bsql_s48_sync_{}", std::process::id());
+
+    // A plain connection (no startup params) provisions the isolated schema.
+    let mut admin = Connection::connect(&sync_config()).expect("admin connect");
+    admin
+        .execute_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .expect("drop stale schema");
+    admin
+        .execute_sql(&format!("CREATE SCHEMA {schema}"))
+        .expect("create schema");
+    admin.close().expect("close admin");
+
+    let cfg = sync_config()
+        .with_search_path(&schema)
+        .with_application_name("bsql_test")
+        .with_startup_param("statement_timeout", "5000");
+    let mut c = Connection::connect(&cfg).expect("connect with startup params");
+
+    // 1) search_path took effect on the session.
+    let sp = c.query_one_sql("SHOW search_path").expect("SHOW search_path");
+    assert_eq!(
+        sp.get_str(0),
+        Ok(Some(schema.as_str())),
+        "connect-time search_path must be the session search_path",
+    );
+
+    // 2) application_name took effect.
+    let an = c
+        .query_one_sql("SELECT current_setting('application_name')")
+        .expect("current_setting(application_name)");
+    assert_eq!(an.get_str(0), Ok(Some("bsql_test")));
+
+    // 3) statement_timeout took effect (PG normalises 5000 ms to "5s").
+    let st = c
+        .query_one_sql("SHOW statement_timeout")
+        .expect("SHOW statement_timeout");
+    assert_eq!(st.get_str(0), Ok(Some("5s")));
+
+    // 4) The isolation primitive: an UNQUALIFIED table resolves into the
+    //    connect-time search_path schema, not the default.
+    c.execute_sql("CREATE TABLE s48_probe (id int)")
+        .expect("create unqualified table");
+    c.execute_sql("INSERT INTO s48_probe VALUES (1)")
+        .expect("insert into unqualified table");
+    let located = c
+        .query_one_sql("SELECT schemaname FROM pg_tables WHERE tablename = 's48_probe'")
+        .expect("locate the probe table");
+    assert_eq!(
+        located.get_str(0),
+        Ok(Some(schema.as_str())),
+        "an unqualified table must land in the connect-time search_path schema",
+    );
+
+    // 5) The connect-time search_path is the session RESET value: it survives
+    //    the pool-checkout RESET ALL, so a pooled connection cannot escape its
+    //    schema.
+    c.reset_session().expect("reset_session (pool checkout)");
+    let sp2 = c
+        .query_one_sql("SHOW search_path")
+        .expect("SHOW search_path after reset");
+    assert_eq!(
+        sp2.get_str(0),
+        Ok(Some(schema.as_str())),
+        "connect-time search_path must survive RESET ALL",
+    );
+
+    c.execute_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        .expect("drop schema");
+    c.close().expect("close");
+}
+
 /// WITNESS: the RUNTIME-SQL escape hatch binds a NON-`Copy` owned param — a
 /// `Numeric` and a `Json` — exactly as the compile-checked `query!` path does.
 /// Before the runtime path was relaxed off `P: ParamsWriter + Copy`,

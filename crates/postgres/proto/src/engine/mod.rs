@@ -92,7 +92,8 @@ pub use verbs::PreparedStatement;
 use core::marker::PhantomData;
 
 use crate::action::TxStatus;
-use crate::ident::{ApplicationName, DatabaseName, Ident};
+use crate::ident::{DatabaseName, Ident};
+use crate::startup::StartupParam;
 use crate::password::Credentials;
 
 // ===========================================================================
@@ -491,8 +492,8 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
 /// Open a session over `transport` with the default [`NoObserver`] policy.
 ///
 /// Primes the engine in its connecting phase: the `StartupMessage` for
-/// `user`/`database`/`application_name`/`credentials` is queued onto the
-/// engine's send buffer, and the body's first verb is
+/// `user`/`database`/`credentials` plus any consumer [`StartupParam`]s is
+/// queued onto the engine's send buffer, and the body's first verb is
 /// [`connect`](Engine::connect), which drives the handshake.
 ///
 /// `body` is `for<'b>`, so each call mints a *fresh, invariant* brand: the
@@ -512,7 +513,7 @@ pub fn session<T, R>(
     transport: T,
     user: &Ident,
     database: Option<&DatabaseName>,
-    app_name: Option<&ApplicationName>,
+    params: &[StartupParam],
     credentials: Credentials,
     body: impl for<'b> FnOnce(Engine<'b, T, NoObserver>, Live<'b>) -> R,
 ) -> Result<R, ConnFail>
@@ -520,7 +521,7 @@ where
     T: Transport,
 {
     let mut send_buf = SendBuf::new();
-    let conn = ConnectingEngine::start(&mut send_buf, user, database, app_name, credentials)?;
+    let conn = ConnectingEngine::start(&mut send_buf, user, database, params, credentials)?;
     let engine = Engine::new_in_scope(transport, NoObserver, send_buf, Phase::Connecting(conn));
     let live = Live::new_in_scope();
     Ok(body(engine, live))
@@ -541,7 +542,7 @@ pub fn session_with<T, O, R>(
     observer: O,
     user: &Ident,
     database: Option<&DatabaseName>,
-    app_name: Option<&ApplicationName>,
+    params: &[StartupParam],
     credentials: Credentials,
     body: impl for<'b> FnOnce(Engine<'b, T, O>, Live<'b>) -> R,
 ) -> Result<R, ConnFail>
@@ -550,7 +551,7 @@ where
     O: Observer,
 {
     let mut send_buf = SendBuf::new();
-    let conn = ConnectingEngine::start(&mut send_buf, user, database, app_name, credentials)?;
+    let conn = ConnectingEngine::start(&mut send_buf, user, database, params, credentials)?;
     let engine = Engine::new_in_scope(transport, observer, send_buf, Phase::Connecting(conn));
     let live = Live::new_in_scope();
     Ok(body(engine, live))
@@ -598,14 +599,14 @@ pub fn open_owned<T>(
     transport: T,
     user: &Ident,
     database: Option<&DatabaseName>,
-    app_name: Option<&ApplicationName>,
+    params: &[StartupParam],
     credentials: Credentials,
 ) -> Result<(Engine<'static, T, NoObserver>, Live<'static>), ConnFail>
 where
     T: Transport,
 {
     let mut send_buf = SendBuf::new();
-    let conn = ConnectingEngine::start(&mut send_buf, user, database, app_name, credentials)?;
+    let conn = ConnectingEngine::start(&mut send_buf, user, database, params, credentials)?;
     let engine = Engine::new_in_scope(transport, NoObserver, send_buf, Phase::Connecting(conn));
     let live = Live::new_in_scope();
     Ok((engine, live))
@@ -628,7 +629,7 @@ pub fn open_owned_with<T, O>(
     observer: O,
     user: &Ident,
     database: Option<&DatabaseName>,
-    app_name: Option<&ApplicationName>,
+    params: &[StartupParam],
     credentials: Credentials,
 ) -> Result<(Engine<'static, T, O>, Live<'static>), ConnFail>
 where
@@ -636,7 +637,7 @@ where
     O: Observer,
 {
     let mut send_buf = SendBuf::new();
-    let conn = ConnectingEngine::start(&mut send_buf, user, database, app_name, credentials)?;
+    let conn = ConnectingEngine::start(&mut send_buf, user, database, params, credentials)?;
     let engine = Engine::new_in_scope(transport, observer, send_buf, Phase::Connecting(conn));
     let live = Live::new_in_scope();
     Ok((engine, live))
@@ -804,7 +805,7 @@ const _: fn() = || {
         &mut conn_send_buf,
         &user,
         None,
-        None,
+        &[],
         crate::password::Credentials::Trust,
     ) {
         Ok(conn) => conn,
@@ -927,7 +928,7 @@ mod connect_scrub_tests {
                     inbound: md5_reply(),
                     cursor: 0,
                 };
-                session(server, &user, None, None, creds, |mut engine, live| {
+                session(server, &user, None, &[], creds, |mut engine, live| {
                     match poll_once(engine.connect(live)) {
                         // Reached active: the secret-bearing handshake wire must be
                         // gone from the live queued region of the send buffer.

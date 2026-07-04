@@ -39,14 +39,33 @@ pub struct ConnectConfig {
     password_inner: Option<zeroize::Zeroizing<String>>,
     pub connect_timeout_secs: u64,
     pub ssl_mode: SslMode,
+    /// Consumer-supplied PostgreSQL startup parameters (GUCs) sent in the
+    /// `StartupMessage` — `search_path`, `application_name`,
+    /// `statement_timeout`, or any GUC. Set via [`with_startup_param`],
+    /// [`with_search_path`], [`with_application_name`]; ordered by insertion.
+    ///
+    /// Stored raw and validated at connect (each pair must be NUL-free,
+    /// bounded, and not a reserved parameter) — consistent with how `user` /
+    /// `database` are validated to their bounded wire types at connect, not at
+    /// the builder. Kept private so the builders are the only entry point; the
+    /// drivers read it via [`startup_params`].
+    ///
+    /// [`with_startup_param`]: ConnectConfig::with_startup_param
+    /// [`with_search_path`]: ConnectConfig::with_search_path
+    /// [`with_application_name`]: ConnectConfig::with_application_name
+    /// [`startup_params`]: ConnectConfig::startup_params
+    startup_params: Vec<(String, String)>,
 }
 
 // Footprint pin: four owned Strings/Option<String> (host, user, database,
-// password) plus a u16 port, a u64 timeout, and the SslMode byte. Config is
+// password) plus a u16 port, a u64 timeout, the SslMode byte, and the
+// startup-params `Vec<(String, String)>` (one 3-word / 24-byte owned handle;
+// its heap buffer is empty until a startup parameter is added). Config is
 // built once per connection, so its size is not hot — but pinning it keeps a
 // silently-added field on the review surface, and the password is a
-// Zeroizing<String> whose 3-word shape must not regress.
-crate::footprint_pin!(ConnectConfig, size = 112, align = 8);
+// Zeroizing<String> whose 3-word shape must not regress. 112 + 24 (the Vec) =
+// 136.
+crate::footprint_pin!(ConnectConfig, size = 136, align = 8);
 
 impl ConnectConfig {
     pub fn password_str(&self) -> Option<&str> {
@@ -63,6 +82,9 @@ impl core::fmt::Debug for ConnectConfig {
             .field("database", &self.database)
             .field("password", &self.password_inner.as_ref().map(|_| "[REDACTED]"))
             .field("ssl_mode", &self.ssl_mode)
+            // Startup parameters are not secret (search_path, application_name,
+            // …), so they are shown in full — consistent with host/user/db.
+            .field("startup_params", &self.startup_params)
             .finish()
     }
 }
@@ -159,6 +181,7 @@ impl ConnectConfig {
             password_inner: password.map(zeroize::Zeroizing::new),
             connect_timeout_secs: timeout,
             ssl_mode,
+            startup_params: Vec::new(),
         })
     }
 
@@ -230,6 +253,7 @@ impl ConnectConfig {
             password_inner: password.map(zeroize::Zeroizing::new),
             connect_timeout_secs: 10,
             ssl_mode,
+            startup_params: Vec::new(),
         })
     }
 
@@ -243,6 +267,7 @@ impl ConnectConfig {
             password_inner: None,
             connect_timeout_secs: 10,
             ssl_mode: SslMode::default(),
+            startup_params: Vec::new(),
         }
     }
 
@@ -277,6 +302,93 @@ impl ConnectConfig {
         self.password_inner = Some(zeroize::Zeroizing::new(pw.into()));
         self
     }
+
+    /// Add a PostgreSQL startup parameter (GUC) sent in the `StartupMessage` —
+    /// e.g. `("statement_timeout", "5000")`, `("timezone", "UTC")`.
+    ///
+    /// The pair is stored raw and validated at connect: a name or value
+    /// containing a NUL byte (unrepresentable in the NUL-delimited wire frame),
+    /// an over-length name/value, or a reserved name (`user`, `database`,
+    /// `client_encoding`, `replication`, `options` — managed by the connection)
+    /// is a classified [`DriverError::Config`](crate::DriverError) at connect,
+    /// never a corrupt packet. Names are case-insensitive to PostgreSQL's GUC
+    /// folding, so the reserved check cannot be bypassed with a different case.
+    ///
+    /// Chainable and order-preserving; setting the same parameter twice sends
+    /// it twice (PostgreSQL applies the last).
+    #[must_use]
+    pub fn with_startup_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.startup_params.push((name.into(), value.into()));
+        self
+    }
+
+    /// Set the session `search_path` on connect (convenience over
+    /// [`with_startup_param`](Self::with_startup_param)`("search_path", …)`).
+    ///
+    /// A connect-time `search_path` is the schema-isolation primitive: it
+    /// travels in the `StartupMessage`, so it is in effect before the first
+    /// query, and it becomes the session's reset value — surviving a pooled
+    /// connection's `RESET ALL` on checkout, so a pooled connection cannot
+    /// silently escape its schema.
+    #[must_use]
+    pub fn with_search_path(self, search_path: impl Into<String>) -> Self {
+        self.with_startup_param("search_path", search_path)
+    }
+
+    /// Set the session `application_name` on connect (convenience over
+    /// [`with_startup_param`](Self::with_startup_param)`("application_name",
+    /// …)`). Surfaces in `pg_stat_activity` and server logs.
+    #[must_use]
+    pub fn with_application_name(self, application_name: impl Into<String>) -> Self {
+        self.with_startup_param("application_name", application_name)
+    }
+
+    /// Borrow the raw, not-yet-validated startup parameters, in insertion
+    /// order. The drivers validate each into a wire `StartupParam` at connect.
+    #[must_use]
+    pub fn startup_params(&self) -> &[(String, String)] {
+        &self.startup_params
+    }
+}
+
+/// Validate a config's raw startup parameters into wire
+/// [`StartupParam`](bsql_postgres_proto::StartupParam)s.
+///
+/// Each `(name, value)` is checked for NUL, over-length, and reserved-name
+/// violations (via the wire-authority constructor); the first failure surfaces
+/// as a classified [`DriverError::Config`](crate::DriverError). Both drivers
+/// call this at connect, BEFORE any startup byte is assembled — so a rejected
+/// parameter can never reach the wire, and the `StartupMessage` can never carry
+/// a NUL or override a reserved parameter.
+///
+/// The wire `StartupParam` carries the precise cause internally
+/// (`StartupParamError`); it is collapsed to a `&'static str` here because
+/// [`DriverError::Config`](crate::DriverError) is the crate's established
+/// pre-connect-validation shape and does not interpolate a dynamic value.
+pub fn validate_startup_params(
+    config: &ConnectConfig,
+) -> Result<Vec<bsql_postgres_proto::StartupParam>, crate::DriverError> {
+    use bsql_postgres_proto::{StartupParam, StartupParamError};
+    config
+        .startup_params()
+        .iter()
+        .map(|(name, value)| {
+            StartupParam::new(name, value).map_err(|err| {
+                crate::DriverError::Config(match err {
+                    StartupParamError::Name(_) => "invalid startup parameter name",
+                    StartupParamError::Value(_) => "invalid startup parameter value",
+                    StartupParamError::Reserved => {
+                        "reserved startup parameter name — user, database, \
+                         client_encoding, replication, and options are managed \
+                         by the connection"
+                    }
+                    // `StartupParamError` is `#[non_exhaustive]`: a future
+                    // rejection class must not silently pass as valid.
+                    _ => "invalid startup parameter",
+                })
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -315,5 +427,91 @@ mod tests {
         // `?sslmode` with no value would silently keep the default `prefer`,
         // downgrading SSL. A parameter missing `=` must be rejected loudly.
         assert!(ConnectConfig::from_dsn("postgres://u@h?sslmode").is_err());
+    }
+
+    #[test]
+    fn startup_param_builders_preserve_order() {
+        let cfg = ConnectConfig::new("localhost", "u")
+            .with_search_path("myschema")
+            .with_startup_param("statement_timeout", "5000")
+            .with_application_name("bsql_test");
+        assert_eq!(
+            cfg.startup_params(),
+            &[
+                ("search_path".to_string(), "myschema".to_string()),
+                ("statement_timeout".to_string(), "5000".to_string()),
+                ("application_name".to_string(), "bsql_test".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_fresh_config_has_no_startup_params() {
+        assert!(ConnectConfig::new("localhost", "u").startup_params().is_empty());
+    }
+
+    #[test]
+    fn validate_accepts_ordinary_params() {
+        let cfg = ConnectConfig::new("localhost", "u")
+            .with_search_path("s")
+            .with_startup_param("statement_timeout", "5000");
+        let wire = match validate_startup_params(&cfg) {
+            Ok(w) => w,
+            Err(e) => panic!("ordinary params must validate: {e}"),
+        };
+        assert_eq!(wire.len(), 2);
+    }
+
+    #[test]
+    fn validate_rejects_nul_in_value_with_classified_error() {
+        // A NUL is unrepresentable in the NUL-delimited StartupMessage; it must
+        // be a classified pre-connect error, never a corrupt packet.
+        let cfg = ConnectConfig::new("localhost", "u").with_startup_param("search_path", "a\0b");
+        match validate_startup_params(&cfg) {
+            Err(crate::DriverError::Config(msg)) => {
+                assert_eq!(msg, "invalid startup parameter value");
+            }
+            other => panic!("a NUL value must be a classified Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_nul_in_name_with_classified_error() {
+        let cfg = ConnectConfig::new("localhost", "u").with_startup_param("a\0b", "x");
+        match validate_startup_params(&cfg) {
+            Err(crate::DriverError::Config(msg)) => {
+                assert_eq!(msg, "invalid startup parameter name");
+            }
+            other => panic!("a NUL name must be a classified Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_reserved_params() {
+        // A consumer must not be able to override session identity or the
+        // pinned client_encoding via a startup parameter.
+        for reserved in ["user", "database", "client_encoding", "replication", "options"] {
+            let cfg = ConnectConfig::new("localhost", "u").with_startup_param(reserved, "x");
+            match validate_startup_params(&cfg) {
+                Err(crate::DriverError::Config(msg)) => assert_eq!(
+                    msg,
+                    "reserved startup parameter name — user, database, \
+                     client_encoding, replication, and options are managed \
+                     by the connection",
+                ),
+                other => panic!("'{reserved}' must be rejected as reserved, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_reserved_check_is_case_insensitive() {
+        // `Client_Encoding=LATIN1` must not slip past and break the UTF-8 pin.
+        let cfg =
+            ConnectConfig::new("localhost", "u").with_startup_param("Client_Encoding", "LATIN1");
+        assert!(matches!(
+            validate_startup_params(&cfg),
+            Err(crate::DriverError::Config(_)),
+        ));
     }
 }

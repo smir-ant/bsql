@@ -157,7 +157,7 @@ fn run_handshake(transcript: &Transcript) -> ObservedRun {
     // queued here. It is never flushed in this in-memory adapter, so `pending()`
     // accumulates the full client wire (startup ++ auth) the regression reads.
     let mut send_buf = SendBuf::new();
-    let mut engine = match ConnectingEngine::start(&mut send_buf, &user, None, None, Credentials::Trust) {
+    let mut engine = match ConnectingEngine::start(&mut send_buf, &user, None, &[], Credentials::Trust) {
         Ok(engine) => engine,
         Err(_) => return failed_run(Vec::new()),
     };
@@ -664,7 +664,7 @@ fn drive_step(
 fn setup_active() -> Option<ActiveEngine> {
     let user = Ident::try_from_str("corpus").ok()?;
     let mut send_buf = SendBuf::new();
-    let mut conn = ConnectingEngine::start(&mut send_buf, &user, None, None, Credentials::Trust).ok()?;
+    let mut conn = ConnectingEngine::start(&mut send_buf, &user, None, &[], Credentials::Trust).ok()?;
     let mut chunks =
         split_into_chunks(&canonical_handshake_reply(), bsql_corpus::ChunkSchedule::AllAtOnce)
             .into_iter();
@@ -1011,7 +1011,7 @@ fn run_verb(transcript: &Transcript) -> ObservedRun {
         transport,
         &user,
         None,
-        None,
+        &[],
         Credentials::Trust,
         move |mut engine, live| run_verb_body(&mut engine, live, transcript, &body_captured),
     );

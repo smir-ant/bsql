@@ -51,8 +51,8 @@ fn block_on<F: Future>(f: F) -> F::Output {
 
 fn main() {
     let user = Ident::try_from_str("brand").unwrap();
-    let _ = session(T0, &user, None, None, Credentials::Trust, |mut _e1, live1| {
-        let _ = session(T0, &user, None, None, Credentials::Trust, |mut e2, _live2| {
+    let _ = session(T0, &user, None, &[], Credentials::Trust, |mut _e1, live1| {
+        let _ = session(T0, &user, None, &[], Credentials::Trust, |mut e2, _live2| {
             // Drive session-2's engine with session-1's branded token:
             let _ = block_on(e2.connect(live1));
         });

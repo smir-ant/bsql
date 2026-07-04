@@ -405,7 +405,7 @@ fn run<R: 'static>(
         StaticServer::new(inbound),
         &user,
         None,
-        None,
+        &[],
         Credentials::Trust,
         |mut engine, live| {
             // `connect` is the handshake verb — it returns the bare `Live`, not an
@@ -1017,7 +1017,7 @@ fn query_params_miss_close_parses_hit_reuses_and_reparses_after_clear() {
     };
     let len_written = || recorder.lock().expect("recorder lock").len();
 
-    let (w1, w2, w3) = session(server, &user, None, None, Credentials::Trust, |mut e, live| {
+    let (w1, w2, w3) = session(server, &user, None, &[], Credentials::Trust, |mut e, live| {
         let live = match poll_once(e.connect(live)) {
             Ok(Ok(live)) => live,
             other => panic!("connect: {other:?}"),
@@ -1112,7 +1112,7 @@ fn query_params_reuse_error_evicts_so_next_use_reparses() {
     };
     let len_written = || recorder.lock().expect("recorder lock").len();
 
-    let (call2_errored, w3, w1) = session(server, &user, None, None, Credentials::Trust, |mut e, live| {
+    let (call2_errored, w3, w1) = session(server, &user, None, &[], Credentials::Trust, |mut e, live| {
         let live = match poll_once(e.connect(live)) {
             Ok(Ok(live)) => live,
             other => panic!("connect: {other:?}"),
@@ -1297,7 +1297,7 @@ fn recv_notification_would_block_is_quiet_and_recovers() {
         PhasedReadServer { steps },
         &user,
         None,
-        None,
+        &[],
         Credentials::Trust,
         |mut e, live| {
             let live = match poll_once(e.connect(live)) {
@@ -1342,7 +1342,7 @@ fn recv_notification_fatal_read_error_is_err() {
         PhasedReadServer { steps },
         &user,
         None,
-        None,
+        &[],
         Credentials::Trust,
         |mut e, live| {
             let live = match poll_once(e.connect(live)) {
@@ -1517,7 +1517,7 @@ fn verb_before_connect_is_wrong_phase() {
         StaticServer::new(handshake()),
         &user,
         None,
-        None,
+        &[],
         Credentials::Trust,
         |mut engine, live| {
             let mut cap = Cap::default();

@@ -86,7 +86,7 @@ fn main() {
     inbound.extend_from_slice(&frame(TAG_READY_FOR_QUERY.byte(), b"I"));
     let server = ScriptServer { inbound, cursor: 0 };
 
-    let ok = session(server, &user, None, None, Credentials::Trust, |mut e, live| {
+    let ok = session(server, &user, None, &[], Credentials::Trust, |mut e, live| {
         block_on(async move {
             let live = e.connect(live).await?;
             let live = e.ping(live, drop_sink).await?.live;

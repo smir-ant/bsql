@@ -249,7 +249,7 @@ fn eager_query_and_reset_prebuffer_allocs_are_pinned() {
     inbound.extend_from_slice(&reset_reply()); // measured reset
 
     let (mut engine, live) =
-        open_owned(Script { inbound, cursor: 0 }, &user, None, None, Credentials::Trust)
+        open_owned(Script { inbound, cursor: 0 }, &user, None, &[], Credentials::Trust)
             .expect("session assembles");
     let live = match poll_once(engine.connect(live)) {
         Ok(Ok(live)) => live,

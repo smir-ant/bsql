@@ -110,6 +110,23 @@ pub const MAX_IDENT_LEN: usize = 63;
 /// like `myapp-worker-pod-abc123def456`.
 pub const MAX_APP_NAME_LEN: usize = 128;
 
+/// Maximum byte length for a startup-parameter (GUC) name.
+///
+/// A GUC name is a PostgreSQL identifier — capped at `NAMEDATALEN - 1 = 63`,
+/// same as [`MAX_IDENT_LEN`]. A distinct const gives [`GucName`] its own
+/// compile-time identity; namespaced GUC names (`myext.myparam`) fit within
+/// the cap.
+pub const MAX_GUC_NAME_LEN: usize = 63;
+
+/// Maximum byte length for a startup-parameter (GUC) value.
+///
+/// GUC values are arbitrary text: a `search_path` schema list, a
+/// `statement_timeout` duration, an `application_name`, and so on. 256 bytes
+/// covers realistic values (a multi-schema search path, a deployment-tagged
+/// application name) with headroom; an over-length value is a loud, classified
+/// rejection at construction, never a silent truncation.
+pub const MAX_GUC_VALUE_LEN: usize = 256;
+
 /// Maximum byte length for a SQL query text. 2 KiB covers typical
 /// statements; anything longer is either a pathological generated
 /// query or a COPY command that uses a different path.
@@ -168,7 +185,7 @@ mod sealed {
 /// `ALLOW_EMPTY` is consulted by validated-constructor impls.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a `FixedStrKind` tag",
-    label = "valid tags are the uninhabited enums `IdentTag`, `DatabaseNameTag`, `ApplicationNameTag`, `BoundedStrTag`, `SqlTag`, `StmtNameTag`, `PortalNameTag`",
+    label = "valid tags are the uninhabited enums `IdentTag`, `DatabaseNameTag`, `ApplicationNameTag`, `BoundedStrTag`, `SqlTag`, `StmtNameTag`, `PortalNameTag`, `GucNameTag`, `GucValueTag`",
     note = "`FixedStrKind` is sealed — the tag set is fixed at the crate boundary; downstream `impl FixedStrKind for ...` is forbidden by construction"
 )]
 pub trait FixedStrKind: sealed::FixedStrKindSealed {
@@ -191,7 +208,7 @@ pub trait FixedStrKind: sealed::FixedStrKindSealed {
 /// **Sealed**: only the crate's own tags can be `Validated`.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` does not opt into the validated constructor path",
-    label = "tags that implement `Validated`: `IdentTag`, `DatabaseNameTag`, `ApplicationNameTag`, `StmtNameTag`, `PortalNameTag`",
+    label = "tags that implement `Validated`: `IdentTag`, `DatabaseNameTag`, `ApplicationNameTag`, `StmtNameTag`, `PortalNameTag`, `GucNameTag`, `GucValueTag`",
     note = "`Validated` is sealed — `BoundedStrTag` and `SqlTag` deliberately do NOT implement it because their construction is truncating (silent truncation with `…` marker), not validating; choose the matching tag or use `from_str_truncating` for those"
 )]
 pub trait Validated: FixedStrKind + sealed::ValidatedSealed {}
@@ -361,6 +378,40 @@ impl FixedStrKind for PortalNameTag {
 impl Validated for PortalNameTag {}
 impl ValidUtf8 for PortalNameTag {}
 
+/// Tag for [`GucName`] — a PostgreSQL startup-parameter (GUC) name.
+/// Validated: **non-empty**, no NUL, max [`MAX_GUC_NAME_LEN`] bytes. A GUC
+/// name is an identifier, so this mirrors [`IdentTag`]'s invariants but is a
+/// distinct compile-time type — the value it pairs with in a startup message
+/// is a [`GucValue`], never confused at the type level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GucNameTag {}
+impl sealed::FixedStrKindSealed for GucNameTag {}
+impl sealed::ValidatedSealed for GucNameTag {}
+impl sealed::ValidUtf8Sealed for GucNameTag {}
+impl FixedStrKind for GucNameTag {
+    const DEBUG_NAME: &'static str = "GucName";
+    const ALLOW_EMPTY: bool = false;
+}
+impl Validated for GucNameTag {}
+impl ValidUtf8 for GucNameTag {}
+
+/// Tag for [`GucValue`] — a PostgreSQL startup-parameter (GUC) value.
+/// Validated: **empty allowed** (`application_name=''` is legal), no NUL, max
+/// [`MAX_GUC_VALUE_LEN`] bytes. The no-NUL invariant is load-bearing: a NUL
+/// inside a value would terminate the NUL-delimited wire field early and
+/// corrupt the `StartupMessage`. Construction rejects it structurally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GucValueTag {}
+impl sealed::FixedStrKindSealed for GucValueTag {}
+impl sealed::ValidatedSealed for GucValueTag {}
+impl sealed::ValidUtf8Sealed for GucValueTag {}
+impl FixedStrKind for GucValueTag {
+    const DEBUG_NAME: &'static str = "GucValue";
+    const ALLOW_EMPTY: bool = true;
+}
+impl Validated for GucValueTag {}
+impl ValidUtf8 for GucValueTag {}
+
 /// POD fixed-capacity byte string with a phantom `Tag` for nominal
 /// typing.
 ///
@@ -486,6 +537,17 @@ pub type StmtName =
 pub type PortalName =
     FixedStr<MAX_PG_NAME_LEN, PortalNameTag, crate::bounded::BoundedU8<MAX_PG_NAME_LEN>>;
 
+/// A PostgreSQL startup-parameter (GUC) name. Capacity [`MAX_GUC_NAME_LEN`]
+/// = 63. Validated: non-empty, no NUL. Uses `BoundedU8<63>` for the niche
+/// win on `Option<GucName>` (mirrors [`Ident`]).
+pub type GucName =
+    FixedStr<MAX_GUC_NAME_LEN, GucNameTag, crate::bounded::BoundedU8<MAX_GUC_NAME_LEN>>;
+
+/// A PostgreSQL startup-parameter (GUC) value. Capacity [`MAX_GUC_VALUE_LEN`]
+/// = 256. Validated: no NUL, may be empty. Uses the default `BoundedU16<N>`
+/// LenT (256 > 254, so the 1-byte `BoundedU8` form does not apply).
+pub type GucValue = FixedStr<MAX_GUC_VALUE_LEN, GucValueTag>;
+
 // ─── Option<T> niche size pins ───────────────────────────────────
 //
 // `len: BoundedU8<63>` (or `BoundedU16<N>`) shrinks the type AND
@@ -530,6 +592,15 @@ crate::wire_pin!(StmtName, size = 65, align = 1);
 const _: () = assert!(
     core::mem::size_of::<PortalName>() == 65,
     "PortalName must be 65 B (BoundedU8<63> len)",
+);
+const _: () = assert!(
+    core::mem::size_of::<GucName>() == 65,
+    "GucName must be 65 B (63 buf + BoundedU8<63> len + was_lossy flag)",
+);
+const _: () = assert!(
+    core::mem::size_of::<GucValue>() == 260,
+    "GucValue must be 260 B (256 buf + BoundedU16<256> len (2) + was_lossy flag (1), \
+     padded to the 2-byte alignment BoundedU16 forces)",
 );
 
 // ═════════════════════════════════════════════════════════════════

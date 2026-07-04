@@ -290,7 +290,7 @@ fn handshake_budget_pinned_and_cache_hit_is_zero_alloc() {
     inbound.extend_from_slice(&hit_reply()); // measured
 
     let (mut engine, live) =
-        open_owned(Script { inbound, cursor: 0 }, &user, None, None, Credentials::Trust)
+        open_owned(Script { inbound, cursor: 0 }, &user, None, &[], Credentials::Trust)
             .expect("session assembles");
 
     // ---- (1) Handshake budget: bracket connect → active. ----

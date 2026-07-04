@@ -37,8 +37,9 @@ use bsql_postgres_core::sql_ident;
 use bsql_postgres_core::ssl::SslProbe;
 use bsql_postgres_core::tls::{self, TlsError, TlsTransport, Wire};
 use bsql_postgres_core::{
-    capture_notify, ConnectConfig, DbError, DbErrorSink, DriverError, NotificationLedger,
-    Notification, QueryResult, Row, Rows, RowsBuilder, SslMode, TypedNotification,
+    capture_notify, validate_startup_params, ConnectConfig, DbError, DbErrorSink, DriverError,
+    NotificationLedger, Notification, QueryResult, Row, Rows, RowsBuilder, SslMode,
+    TypedNotification,
 };
 use bsql_postgres_proto::engine::{
     self, Boundary, CommandStatus, ConnFail, Engine, EngineError, Live, NoObserver, NotifyStatus,
@@ -231,9 +232,10 @@ impl Connection {
             }
             None => Credentials::Trust,
         };
+        let startup_params = validate_startup_params(config)?;
 
         let (mut engine, live) =
-            engine::open_owned(wire, &user, database.as_ref(), None, credentials)
+            engine::open_owned(wire, &user, database.as_ref(), &startup_params, credentials)
                 .map_err(lift_conn_fail)?;
         let live = engine.connect(live).await.map_err(lift_engine_error)?;
         let backend_pid = engine.backend_pid().map_err(|_| DriverError::NotReady)?;
@@ -318,7 +320,7 @@ impl Connection {
         let read_deadline = Arc::new(ReadDeadline::new());
         let user = Ident::try_from_str("bsql_testkit")
             .map_err(|_| DriverError::Config("invalid testkit user name"))?;
-        let (mut engine, live) = engine::open_owned(wire, &user, None, None, Credentials::Trust)
+        let (mut engine, live) = engine::open_owned(wire, &user, None, &[], Credentials::Trust)
             .map_err(lift_conn_fail)?;
         let live = engine.connect(live).await.map_err(lift_engine_error)?;
         let backend_pid = engine.backend_pid().map_err(|_| DriverError::NotReady)?;

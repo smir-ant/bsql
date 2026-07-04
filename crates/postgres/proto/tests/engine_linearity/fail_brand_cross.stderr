@@ -1,10 +1,10 @@
 error[E0521]: borrowed data escapes outside of closure
   --> tests/engine_linearity/fail_brand_cross.rs:57:30
    |
-54 |     let _ = session(T0, &user, None, None, Credentials::Trust, |mut _e1, live1| {
-   |                                                                          ----- `live1` declared here, outside of the closure body
-55 |         let _ = session(T0, &user, None, None, Credentials::Trust, |mut e2, _live2| {
-   |                                                                     ------ `e2` is a reference that is only valid in the closure body
+54 |     let _ = session(T0, &user, None, &[], Credentials::Trust, |mut _e1, live1| {
+   |                                                                         ----- `live1` declared here, outside of the closure body
+55 |         let _ = session(T0, &user, None, &[], Credentials::Trust, |mut e2, _live2| {
+   |                                                                    ------ `e2` is a reference that is only valid in the closure body
 56 |             // Drive session-2's engine with session-1's branded token:
 57 |             let _ = block_on(e2.connect(live1));
    |                              ^^^^^^^^^^^^^^^^^ `e2` escapes the closure body here
@@ -16,11 +16,11 @@ error[E0521]: borrowed data escapes outside of closure
 error[E0521]: borrowed data escapes outside of closure
   --> tests/engine_linearity/fail_brand_cross.rs:57:30
    |
-54 |     let _ = session(T0, &user, None, None, Credentials::Trust, |mut _e1, live1| {
-   |                                                                 -------
-   |                                                                 |
-   |                                                                 `_e1` is a reference that is only valid in the closure body
-   |                                                                 has type `Engine<'1, T0>`
+54 |     let _ = session(T0, &user, None, &[], Credentials::Trust, |mut _e1, live1| {
+   |                                                                -------
+   |                                                                |
+   |                                                                `_e1` is a reference that is only valid in the closure body
+   |                                                                has type `Engine<'1, T0>`
 ...
 57 |             let _ = block_on(e2.connect(live1));
    |                              ^^^^^^^^^^^^^^^^^

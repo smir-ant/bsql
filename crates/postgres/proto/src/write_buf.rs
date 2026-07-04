@@ -38,12 +38,21 @@ use core::fmt;
 ///   + NUL + SQL + NUL + i16 param-type count). Dominates.
 pub const MAX_OWNED_SEND_LEN: usize = 2176;
 
-/// Worst-case byte size of a PostgreSQL `StartupMessage` frame.
+/// Worst-case byte size of the **fixed prefix** of a PostgreSQL
+/// `StartupMessage` frame.
 ///
 /// `StartupMessage` has no tag byte; the 4-byte length prefix includes
 /// itself per PG spec. The body is a fixed 4-byte protocol version
 /// followed by NUL-terminated key/value pairs, ending in a single NUL
 /// terminator.
+///
+/// This computes only the fixed parameters the assembler always emits;
+/// consumer [`crate::startup::StartupParam`]s appended after them are
+/// variable in count and are bounded at assembly time by the caller's
+/// [`WriteBuf`] (an overflow surfaces as `WriteBufFull` →
+/// `ConnFail::BufferOverflow`, never a corrupt frame). The const-assert
+/// below guarantees the fixed prefix — a parameterless connection's whole
+/// packet — always fits.
 ///
 /// # Drift-guarded inputs
 ///
@@ -51,8 +60,6 @@ pub const MAX_OWNED_SEND_LEN: usize = 2176;
 /// - `client_encoding` (key `"client_encoding"`, 15 bytes): fixed value
 ///   `"UTF8"` (4 bytes), always sent to pin the session to UTF-8.
 /// - `database` (key `"database"`, 8 bytes): value up to [`crate::ident::MAX_IDENT_LEN`].
-/// - `application_name` (key `"application_name"`, 16 bytes): value
-///   up to [`crate::ident::MAX_APP_NAME_LEN`].
 ///
 /// Changing any of the inputs without growing [`MAX_OWNED_SEND_LEN`]
 /// fails the `const _` assert below.
@@ -75,16 +82,12 @@ pub const fn max_startup_message_size() -> usize {
         .saturating_add(1) // NUL
         .saturating_add(crate::ident::MAX_IDENT_LEN)
         .saturating_add(1) // NUL
-        .saturating_add(16) // "application_name"
-        .saturating_add(1) // NUL
-        .saturating_add(crate::ident::MAX_APP_NAME_LEN)
-        .saturating_add(1) // NUL
         .saturating_add(1) // trailing empty-key NUL
 }
 
-// Drift guard: bumping any contributing constant (MAX_IDENT_LEN,
-// MAX_APP_NAME_LEN) or adding a StartupMessage parameter without
-// growing MAX_OWNED_SEND_LEN fails the build here.
+// Drift guard: bumping any contributing constant (MAX_IDENT_LEN) or adding a
+// fixed StartupMessage parameter without growing MAX_OWNED_SEND_LEN fails the
+// build here.
 const _: () = assert!(MAX_OWNED_SEND_LEN >= max_startup_message_size());
 
 /// Worst-case byte size of a PostgreSQL `Query` (`'Q'`) frame —

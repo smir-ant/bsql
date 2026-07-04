@@ -169,7 +169,7 @@ struct Holder<T> {
 impl<T: Transport<Error = Infallible>> Holder<T> {
     /// Open an owned handle and store it — proves the returned pair is storable.
     fn open(transport: T, user: &Ident) -> Self {
-        let (engine, live) = open_owned(transport, user, None, None, Credentials::Trust)
+        let (engine, live) = open_owned(transport, user, None, &[], Credentials::Trust)
             .expect("startup packet assembles");
         Self {
             engine,
@@ -220,7 +220,7 @@ fn open_owned_threads_two_sequential_verbs() {
     let user = Ident::try_from_str("owned").expect("ident");
     let server = StaticServer::new(trust_then_ping_script());
     let (mut engine, live) =
-        open_owned(server, &user, None, None, Credentials::Trust).expect("startup packet assembles");
+        open_owned(server, &user, None, &[], Credentials::Trust).expect("startup packet assembles");
 
     // One `async` scope holds `&mut engine` across both `await`s while the single
     // token threads connect→ping; the borrow ends when `block_on` returns, so the
@@ -273,7 +273,7 @@ fn open_owned_with_default_policy_threads() {
     let user = Ident::try_from_str("owned").expect("ident");
     let server = StaticServer::new(trust_then_ping_script());
     let (mut engine, live) =
-        open_owned_with(server, NoObserver, &user, None, None, Credentials::Trust)
+        open_owned_with(server, NoObserver, &user, None, &[], Credentials::Trust)
             .expect("startup packet assembles");
 
     let threaded: Result<(), EngineError<Infallible>> = block_on(async {

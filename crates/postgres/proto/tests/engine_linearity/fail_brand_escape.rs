@@ -40,5 +40,5 @@ impl Transport for T0 {
 fn main() {
     let user = Ident::try_from_str("brand").unwrap();
     // Try to smuggle the branded liveness token OUT of the for<'b> scope:
-    let _escaped = session(T0, &user, None, None, Credentials::Trust, |_e, live| live);
+    let _escaped = session(T0, &user, None, &[], Credentials::Trust, |_e, live| live);
 }

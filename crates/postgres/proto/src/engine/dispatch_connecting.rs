@@ -56,10 +56,11 @@ use alloc::string::String;
 
 use super::{ActiveEngine, AuthEvent, IngestBuf, IngestCommitOverflow, IngestFull, SendBuf};
 use crate::action::TxStatus;
-use crate::ident::{ApplicationName, DatabaseName, Ident, PodBytes};
+use crate::ident::{DatabaseName, Ident, PodBytes};
 use crate::md5::Md5HandshakeState;
 use crate::password::{Credentials, Password};
 use crate::reply_id::{ReplyId, StartupKind};
+use crate::startup::StartupParam;
 use crate::scram::session::ScramSession;
 use crate::scram::types::SecretDigest;
 use crate::scram::wire::{ScramError, ScramFailureClass};
@@ -319,24 +320,27 @@ impl ConnectingEngine {
     /// on drop) and copied onto `send_buf` — the caller's persistent outbound
     /// queue, drained by the flush loop. It is byte-identical to the live
     /// protocol's `build_startup_message` (PG §55.2.1): a 4-byte length prefix
-    /// wrapping the 3.0 protocol version, the `user`/`database`/
-    /// `application_name` parameters, and the trailing empty-key NUL.
+    /// wrapping the 3.0 protocol version, the fixed `user` / pinned
+    /// `client_encoding=UTF8` / optional `database` parameters, each validated
+    /// consumer [`StartupParam`] appended after them, and the trailing
+    /// empty-key NUL.
     ///
-    /// Returns [`ConnFail::BufferOverflow`] only if the startup packet exceeds
-    /// the bounded assembler — structurally unreachable for the bounded `Ident`/
-    /// `DatabaseName`/`ApplicationName` newtypes (the `MAX_OWNED_SEND_LEN >=
-    /// max_startup_message_size()` const-assert in `write_buf` proves a fresh
-    /// assembler always fits), but propagated honestly rather than discharged
-    /// with a panic-able unwrap.
+    /// Returns [`ConnFail::BufferOverflow`] if the startup packet exceeds the
+    /// bounded assembler. For the fixed parameters this is structurally
+    /// unreachable (the `MAX_OWNED_SEND_LEN >= max_startup_message_size()`
+    /// const-assert in `write_buf` proves the fixed prefix always fits); a large
+    /// enough set of consumer `params` can genuinely overflow the bounded frame,
+    /// which is surfaced honestly here rather than discharged with a panic-able
+    /// unwrap.
     pub fn start(
         send_buf: &mut SendBuf,
         user: &Ident,
         database: Option<&DatabaseName>,
-        app_name: Option<&ApplicationName>,
+        params: &[StartupParam],
         credentials: Credentials,
     ) -> Result<Self, ConnFail> {
         let mut scratch = WriteBuf::new();
-        build_startup_message(&mut scratch, user, database, app_name)
+        build_startup_message(&mut scratch, user, database, params)
             .map_err(|_| ConnFail::BufferOverflow)?;
         send_buf.enqueue(scratch.as_bytes());
         // Exactly one in-flight startup; the reply id is a fixed seed (the
@@ -574,11 +578,20 @@ impl ConnectingEngine {
 
 /// Build the `StartupMessage` into `write`. Byte-identical to the live
 /// protocol builder.
+///
+/// Emits the fixed parameters first (`user`, the pinned `client_encoding=UTF8`,
+/// and the optional `database`), then each consumer [`StartupParam`] in order,
+/// then the trailing empty-key NUL. Each `StartupParam` is already validated —
+/// its name/value carry no NUL and no reserved key — so appending them cannot
+/// corrupt the packet or displace a fixed parameter.
+///
+/// With no consumer `params`, the emitted bytes are identical to the
+/// fixed-only packet, so a default connection's wire is unchanged.
 fn build_startup_message(
     write: &mut WriteBuf,
     user: &Ident,
     database: Option<&DatabaseName>,
-    app_name: Option<&ApplicationName>,
+    params: &[StartupParam],
 ) -> Result<(), WriteBufFull> {
     write.with_length_prefix(|w| {
         w.push_u32_be(PROTOCOL_VERSION_3_0)?;
@@ -588,16 +601,17 @@ fn build_startup_message(
         // client_encoding. The driver decodes every TEXT value as UTF-8
         // (`str::from_utf8`); on a LATIN1 / SQL_ASCII server that assumption
         // would otherwise be silently violated. Forcing UTF8 here makes the
-        // decode correct by construction.
+        // decode correct by construction. A consumer cannot override it — the
+        // `client_encoding` key is reserved against `StartupParam`.
         w.push_nul_terminated(b"client_encoding")?;
         w.push_nul_terminated(b"UTF8")?;
         if let Some(db) = database {
             w.push_nul_terminated(b"database")?;
             w.push_nul_terminated(db.as_bytes())?;
         }
-        if let Some(name) = app_name {
-            w.push_nul_terminated(b"application_name")?;
-            w.push_nul_terminated(name.as_bytes())?;
+        for param in params {
+            w.push_nul_terminated(param.name_bytes())?;
+            w.push_nul_terminated(param.value_bytes())?;
         }
         w.push_u8(0)
     })

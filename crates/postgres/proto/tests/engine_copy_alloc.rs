@@ -153,7 +153,7 @@ fn copy_in_write_is_zero_alloc_and_independent_of_row_count() {
     inbound.extend_from_slice(&copy_in_cycle(LARGE)); // measured-large
 
     let (mut engine, live) =
-        open_owned(Script { inbound, cursor: 0 }, &user, None, None, Credentials::Trust)
+        open_owned(Script { inbound, cursor: 0 }, &user, None, &[], Credentials::Trust)
             .expect("session assembles");
 
     let live = match poll_once(engine.connect(live)) {

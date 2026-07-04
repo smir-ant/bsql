@@ -122,7 +122,7 @@ fn r4_two_sequential_async_verbs_thread_one_token() {
     let user = Ident::try_from_str("test").expect("ident");
     let server = StaticServer::new(handshake_then_ping_reply());
     let outcome: Result<(), EngineError<Infallible>> =
-        session(server, &user, None, None, Credentials::Trust, |mut e, live| {
+        session(server, &user, None, &[], Credentials::Trust, |mut e, live| {
             block_on(async move {
                 let live = e.connect(live).await?;
                 let live = e.ping(live, drop_sink).await?.live;
@@ -141,7 +141,7 @@ fn verbs_thread_token_one_await_each() {
     let user = Ident::try_from_str("test").expect("ident");
     let server = StaticServer::new(handshake_then_ping_reply());
     let threaded =
-        session(server, &user, None, None, Credentials::Trust, |mut e, live| {
+        session(server, &user, None, &[], Credentials::Trust, |mut e, live| {
             let live = block_on(e.connect(live)).expect("connect");
             let live = block_on(e.ping(live, drop_sink)).expect("ping").live;
             let _ = live;
@@ -162,7 +162,7 @@ fn session_with_threads_explicit_policy() {
         NoObserver,
         &user,
         None,
-        None,
+        &[],
         Credentials::Trust,
         |mut e, live| {
             let live = block_on(e.connect(live)).expect("connect");

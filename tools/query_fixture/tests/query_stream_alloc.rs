@@ -145,7 +145,7 @@ fn stream_rows(n: usize) -> (usize, usize) {
         Script { inbound, cursor: 0 },
         &user,
         None,
-        None,
+        &[],
         Credentials::Trust,
         |mut engine, live| {
             let live = match poll_once(engine.connect(live)) {

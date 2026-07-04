@@ -211,7 +211,7 @@ fn per_command_read_count_is_pinned() {
 
     let transport = CountingScript::new(vec![handshake(), query_response], Arc::clone(&reads));
     let (mut engine, live) =
-        open_owned(transport, &user, None, None, Credentials::Trust).expect("session assembles");
+        open_owned(transport, &user, None, &[], Credentials::Trust).expect("session assembles");
 
     let live = match poll_once(engine.connect(live)) {
         Ok(Ok(live)) => live,

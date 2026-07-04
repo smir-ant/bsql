@@ -187,6 +187,7 @@ pub(crate) mod drop_witness;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 pub mod sensitive;
+pub mod startup;
 pub mod state;
 // The bridge trait from a compile-checked `query!` carrier to its prepared
 // query + typed-record decoders. Consumed by the drivers' typed `query`
@@ -210,9 +211,10 @@ pub use pgtypes::{
 pub use error::{ErrorKind, ProtocolError, StateErrorKind};
 pub use frame::{HeaderParse, MAX_FRAME_LEN_FIELD, READ_BUF_CAP, parse_header};
 pub use ident::{
-    ApplicationName, DatabaseName, Ident, IdentError, LossyDisplay, LossyText, PortalName,
-    SecretBoundedStr, Sql, StmtName,
+    ApplicationName, DatabaseName, GucName, GucValue, Ident, IdentError, LossyDisplay, LossyText,
+    PortalName, SecretBoundedStr, Sql, StmtName,
 };
+pub use startup::{StartupParam, StartupParamError, RESERVED_NAMES};
 pub use password::{Credentials, Password, PasswordError};
 pub use reply_id::{
     CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind,

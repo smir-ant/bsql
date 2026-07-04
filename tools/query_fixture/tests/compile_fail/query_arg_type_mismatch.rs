@@ -60,7 +60,7 @@ fn sink(_surface: Surface<'_>) -> ControlFlow<Never> {
 
 fn main() {
     let user = Ident::try_from_str("verbs").unwrap();
-    let _ = session(T0, &user, None, None, Credentials::Trust, |mut e, live| {
+    let _ = session(T0, &user, None, &[], Credentials::Trust, |mut e, live| {
         let live = block_on(e.connect(live)).unwrap();
         // Bind a `(&str,)` to a query expecting `(i64,)`: E0308, tuple types
         // are nominally distinct.

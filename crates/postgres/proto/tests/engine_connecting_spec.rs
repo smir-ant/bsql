@@ -145,7 +145,7 @@ fn extract_client_nonce(client_bytes: &[u8]) -> Vec<u8> {
 fn trust_handshake_reaches_ready() {
     let mut sb = SendBuf::new();
     let mut engine =
-        ConnectingEngine::start(&mut sb, &user(), None, None, Credentials::Trust).unwrap();
+        ConnectingEngine::start(&mut sb, &user(), None, &[], Credentials::Trust).unwrap();
     // Startup packet is queued immediately; no auth response yet.
     assert_eq!(sb.pending().len(), STARTUP_LEN);
 
@@ -169,7 +169,7 @@ fn trust_handshake_reaches_ready() {
 fn cleartext_builds_password_message_and_completes() {
     let creds = Credentials::CleartextPassword(password("hunter2"));
     let mut sb = SendBuf::new();
-    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, None, creds).unwrap();
+    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, &[], creds).unwrap();
 
     feed(&mut engine, &auth(3, &[]));
     assert!(matches!(
@@ -196,7 +196,7 @@ fn cleartext_builds_password_message_and_completes() {
 fn md5_builds_password_message_and_completes() {
     let creds = Credentials::Md5Password(password("hunter2"));
     let mut sb = SendBuf::new();
-    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, None, creds).unwrap();
+    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, &[], creds).unwrap();
 
     feed(&mut engine, &auth(5, &[0xde, 0xad, 0xbe, 0xef]));
     assert!(matches!(
@@ -221,7 +221,7 @@ fn md5_builds_password_message_and_completes() {
 fn md5_wrong_length_salt_is_classified_fail() {
     let creds = Credentials::Md5Password(password("hunter2"));
     let mut sb = SendBuf::new();
-    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, None, creds).unwrap();
+    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, &[], creds).unwrap();
     // A 3-byte salt is malformed (PG §55.4 mandates exactly 4).
     feed(&mut engine, &auth(5, &[0x01, 0x02, 0x03]));
     assert!(matches!(engine.next_auth_event(&mut sb), AuthEvent::Fail(_)));
@@ -231,7 +231,7 @@ fn md5_wrong_length_salt_is_classified_fail() {
 fn scram_initial_response_built() {
     let creds = Credentials::ScramPassword(password("hunter2"));
     let mut sb = SendBuf::new();
-    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, None, creds).unwrap();
+    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, &[], creds).unwrap();
 
     // AuthenticationSASL offering SCRAM-SHA-256. The client builds the
     // SASLInitialResponse silently and awaits the server-first-message, so the
@@ -246,7 +246,7 @@ fn scram_initial_response_built() {
 fn scram_continue_builds_sasl_response() {
     let creds = Credentials::ScramPassword(password("pencil"));
     let mut sb = SendBuf::new();
-    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, None, creds).unwrap();
+    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, &[], creds).unwrap();
     feed(&mut engine, &auth(10, b"SCRAM-SHA-256\0\0"));
     assert!(matches!(engine.next_auth_event(&mut sb), AuthEvent::NeedMore));
     let init_len = sb.pending().len();
@@ -277,7 +277,7 @@ fn scram_continue_builds_sasl_response() {
 fn scram_final_signature_mismatch_fails() {
     let creds = Credentials::ScramPassword(password("pencil"));
     let mut sb = SendBuf::new();
-    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, None, creds).unwrap();
+    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, &[], creds).unwrap();
     feed(&mut engine, &auth(10, b"SCRAM-SHA-256\0\0"));
     assert!(matches!(engine.next_auth_event(&mut sb), AuthEvent::NeedMore));
     let nonce = extract_client_nonce(sb.pending());
@@ -302,7 +302,7 @@ fn scram_final_signature_mismatch_fails() {
 fn scram_offered_without_supported_mechanism_fails() {
     let creds = Credentials::ScramPassword(password("hunter2"));
     let mut sb = SendBuf::new();
-    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, None, creds).unwrap();
+    let mut engine = ConnectingEngine::start(&mut sb, &user(), None, &[], creds).unwrap();
     // Server offers only a mechanism the client does not implement.
     feed(&mut engine, &auth(10, b"SCRAM-SHA-256-PLUS\0\0"));
     assert!(matches!(engine.next_auth_event(&mut sb), AuthEvent::Fail(_)));
@@ -312,7 +312,7 @@ fn scram_offered_without_supported_mechanism_fails() {
 fn trust_rejects_sasl_challenge() {
     let mut sb = SendBuf::new();
     let mut engine =
-        ConnectingEngine::start(&mut sb, &user(), None, None, Credentials::Trust).unwrap();
+        ConnectingEngine::start(&mut sb, &user(), None, &[], Credentials::Trust).unwrap();
     feed(&mut engine, &auth(10, b"SCRAM-SHA-256\0\0"));
     assert!(matches!(engine.next_auth_event(&mut sb), AuthEvent::Fail(_)));
 }
@@ -321,7 +321,7 @@ fn trust_rejects_sasl_challenge() {
 fn unexpected_frame_during_connect_is_classified_fail() {
     let mut sb = SendBuf::new();
     let mut engine =
-        ConnectingEngine::start(&mut sb, &user(), None, None, Credentials::Trust).unwrap();
+        ConnectingEngine::start(&mut sb, &user(), None, &[], Credentials::Trust).unwrap();
     // A bare ReadyForQuery before AuthenticationOk is wire-illegal for the
     // startup-trust phase.
     feed(&mut engine, &ready_for_query(b'I'));
@@ -332,7 +332,7 @@ fn unexpected_frame_during_connect_is_classified_fail() {
 fn parameter_status_surfaces_during_post_auth() {
     let mut sb = SendBuf::new();
     let mut engine =
-        ConnectingEngine::start(&mut sb, &user(), None, None, Credentials::Trust).unwrap();
+        ConnectingEngine::start(&mut sb, &user(), None, &[], Credentials::Trust).unwrap();
     feed(&mut engine, &auth_ok());
     feed(&mut engine, &parameter_status("application_name", "demo"));
     feed(&mut engine, &backend_key(1, 2));
@@ -358,7 +358,7 @@ fn parameter_status_surfaces_during_post_auth() {
 fn into_active_before_ready_returns_still_connecting() {
     let mut sb = SendBuf::new();
     let engine =
-        ConnectingEngine::start(&mut sb, &user(), None, None, Credentials::Trust).unwrap();
+        ConnectingEngine::start(&mut sb, &user(), None, &[], Credentials::Trust).unwrap();
     // No bytes fed: the handshake has not completed.
     match engine.into_active() {
         Ok(_) => panic!("into_active must not succeed before the handshake completes"),
@@ -375,7 +375,7 @@ fn into_active_before_ready_returns_still_connecting() {
 fn need_more_when_buffer_drained() {
     let mut sb = SendBuf::new();
     let mut engine =
-        ConnectingEngine::start(&mut sb, &user(), None, None, Credentials::Trust).unwrap();
+        ConnectingEngine::start(&mut sb, &user(), None, &[], Credentials::Trust).unwrap();
     // Nothing fed yet.
     assert!(matches!(engine.next_auth_event(&mut sb), AuthEvent::NeedMore));
 }

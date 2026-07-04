@@ -250,7 +250,7 @@ fn terminate_sends_frame_shuts_down_and_closes() {
         CaptureServer::new(handshake(), Arc::clone(&writes), Arc::clone(&shutdowns)),
         &user,
         None,
-        None,
+        &[],
         Credentials::Trust,
         |mut engine, live| {
             let live = flatten(poll_once(engine.connect(live))).expect("connect reaches active");
@@ -319,7 +319,7 @@ fn accessor_after_terminate_is_wrong_phase() {
         CaptureServer::new(handshake(), Arc::clone(&writes), Arc::clone(&shutdowns)),
         &user,
         None,
-        None,
+        &[],
         Credentials::Trust,
         |mut engine, live| {
             let live = flatten(poll_once(engine.connect(live))).expect("connect");
@@ -348,7 +348,7 @@ fn terminate_from_connecting_is_wrong_phase() {
         CaptureServer::new(handshake(), Arc::clone(&writes), Arc::clone(&shutdowns)),
         &user,
         None,
-        None,
+        &[],
         Credentials::Trust,
         // Deliberately do NOT connect: the engine stays in its connecting phase.
         |mut engine, live| {
@@ -396,7 +396,7 @@ fn terminate_with_flush_error_still_closes_and_propagates() {
         ),
         &user,
         None,
-        None,
+        &[],
         Credentials::Trust,
         |mut engine, live| {
             let live = flatten(poll_once(engine.connect(live))).expect("connect reaches active");
@@ -447,7 +447,7 @@ fn terminate_with_shutdown_error_still_closes_and_propagates() {
         ),
         &user,
         None,
-        None,
+        &[],
         Credentials::Trust,
         |mut engine, live| {
             let live = flatten(poll_once(engine.connect(live))).expect("connect reaches active");

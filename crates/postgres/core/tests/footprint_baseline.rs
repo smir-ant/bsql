@@ -34,7 +34,7 @@ fn core_stable_public_types_match_baseline() {
         (size_of::<ArenaSealError>(), align_of::<ArenaSealError>(), 1, 1, "ArenaSealError"),
         (size_of::<DriverError>(), align_of::<DriverError>(), 120, 8, "DriverError"),
         (size_of::<DbError>(), align_of::<DbError>(), 120, 8, "DbError"),
-        (size_of::<ConnectConfig>(), align_of::<ConnectConfig>(), 112, 8, "ConnectConfig"),
+        (size_of::<ConnectConfig>(), align_of::<ConnectConfig>(), 136, 8, "ConnectConfig"),
         (size_of::<SslMode>(), align_of::<SslMode>(), 1, 1, "SslMode"),
         (size_of::<Notification>(), align_of::<Notification>(), 56, 8, "Notification"),
         (size_of::<QueryResult>(), align_of::<QueryResult>(), 72, 8, "QueryResult"),

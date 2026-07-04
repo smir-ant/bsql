@@ -324,7 +324,7 @@ where
     T: Transport<Error = Infallible>,
 {
     let user = Ident::try_from_str("corpus").expect("ident");
-    session(transport, &user, None, None, creds, |mut engine, live| {
+    session(transport, &user, None, &[], creds, |mut engine, live| {
         let _live = poll_once(engine.connect(live))
             .expect("blocking transport resolves in a single poll")
             .expect("handshake reaches active");
@@ -342,7 +342,7 @@ where
     T: Transport<Error = Infallible>,
 {
     let user = Ident::try_from_str("corpus").expect("ident");
-    session(transport, &user, None, None, creds, |mut engine, live| {
+    session(transport, &user, None, &[], creds, |mut engine, live| {
         poll_once(engine.connect(live))
             .expect("blocking transport resolves in a single poll")
             .expect_err("handshake must fail")
@@ -403,7 +403,7 @@ fn connect_captures_server_version_from_handshake() {
         ready_for_query(b'I'),
     ]));
     let user = Ident::try_from_str("corpus").expect("ident");
-    let version = session(server, &user, None, None, Credentials::Trust, |mut engine, live| {
+    let version = session(server, &user, None, &[], Credentials::Trust, |mut engine, live| {
         let _live = poll_once(engine.connect(live))
             .expect("blocking transport resolves in a single poll")
             .expect("handshake reaches active");
@@ -428,7 +428,7 @@ fn connect_without_server_version_report_is_none() {
         ready_for_query(b'I'),
     ]));
     let user = Ident::try_from_str("corpus").expect("ident");
-    let version = session(server, &user, None, None, Credentials::Trust, |mut engine, live| {
+    let version = session(server, &user, None, &[], Credentials::Trust, |mut engine, live| {
         let _live = poll_once(engine.connect(live))
             .expect("blocking transport resolves in a single poll")
             .expect("handshake reaches active");
@@ -489,7 +489,7 @@ fn connect_when_already_active_is_wrong_phase() {
         ready_for_query(b'I'),
     ]));
     let user = Ident::try_from_str("corpus").expect("ident");
-    let err = session(server, &user, None, None, Credentials::Trust, |mut engine, live| {
+    let err = session(server, &user, None, &[], Credentials::Trust, |mut engine, live| {
         let live = poll_once(engine.connect(live))
             .expect("first connect resolves in one poll")
             .expect("first connect succeeds");
