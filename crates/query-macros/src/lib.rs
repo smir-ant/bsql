@@ -1739,3 +1739,126 @@ fn byte_array_literal(bytes: &[u8]) -> TokenStream2 {
     let lits = bytes.iter().map(|b| Literal::u8_unsuffixed(*b));
     quote! { &[ #( #lits ),* ] }
 }
+
+// ════════════════════════════════════════════════════════════════════
+// #[bsql::test] — schema-per-test isolation attribute
+// ════════════════════════════════════════════════════════════════════
+//
+// A different flavor from `query!` above: `query!` is a build-time SQL typer;
+// `#[bsql::test]` is a pure syntactic transform that wraps one `async fn` in a
+// `#[test]` running it against an isolated PostgreSQL schema. It reads NOTHING
+// at expansion (no catalog, no environment) and emits code naming only the
+// hidden `::bsql::__test_rt::` runtime, so — like `query!` — a consumer reaches
+// it through the single `bsql` crate. Both macros are host-only token
+// transformers sharing the syn/quote toolchain, which is why they share a crate.
+
+/// Run an integration test in its own isolated PostgreSQL schema.
+///
+/// Applied to an `async fn` taking a single `conn: &mut bsql::pg::Connection`,
+/// it emits a `#[test]` that connects to the server named by the `BSQL_TEST_DSN`
+/// environment variable, creates a unique schema, runs the body against a
+/// connection pinned to that schema (via its connect-time `search_path`), and
+/// drops the schema on exit — even if the test panics. Two `#[bsql::test]`
+/// tests run in parallel without interfering, because each sees only its own
+/// schema.
+///
+/// ```rust,ignore
+/// #[bsql::test]
+/// async fn creates_a_user(conn: &mut bsql::pg::Connection) {
+///     conn.execute_sql("CREATE TABLE users (id int)").await.unwrap();
+/// }   // schema auto-dropped, even on panic
+/// ```
+///
+/// The attribute takes no arguments. Other attributes on the function
+/// (`#[ignore]`, `#[should_panic]`, …) are forwarded to the generated `#[test]`.
+/// The function must be `async`, non-generic, return `()`, and take exactly one
+/// `conn: &mut Connection` argument — anything else is a `compile_error!`. A
+/// synchronous `#[bsql::test]` is not yet supported (a loud `compile_error!`,
+/// never a silent mis-expansion).
+#[proc_macro_attribute]
+pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match expand_test(attr.into(), item.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Whether a type is the unit type `()`.
+fn is_unit_type(ty: &syn::Type) -> bool {
+    matches!(ty, syn::Type::Tuple(t) if t.elems.is_empty())
+}
+
+/// Build the `#[bsql::test]` wrapper, or a classified `syn::Error` that becomes
+/// a `compile_error!` at the offending span.
+fn expand_test(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream2, syn::Error> {
+    if !attr.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &attr,
+            "bsql::test: this attribute takes no arguments",
+        ));
+    }
+
+    let func: syn::ItemFn = syn::parse2(item)?;
+
+    if func.sig.asyncness.is_none() {
+        return Err(syn::Error::new_spanned(
+            func.sig.fn_token,
+            "bsql::test: the test function must be `async` \
+             (a synchronous #[bsql::test] is not yet supported)",
+        ));
+    }
+    if !func.sig.generics.params.is_empty() || func.sig.generics.where_clause.is_some() {
+        return Err(syn::Error::new_spanned(
+            &func.sig.generics,
+            "bsql::test: the test function must not be generic",
+        ));
+    }
+    match &func.sig.output {
+        syn::ReturnType::Default => {}
+        syn::ReturnType::Type(_, ty) if is_unit_type(ty.as_ref()) => {}
+        syn::ReturnType::Type(arrow, _) => {
+            return Err(syn::Error::new_spanned(
+                arrow,
+                "bsql::test: the test function must return `()`",
+            ));
+        }
+    }
+
+    // Exactly one argument, `conn: &mut Connection`. The pattern and type are
+    // echoed verbatim into the generated async closure, so the caller's own
+    // `use` for the connection type keeps working.
+    let mut inputs = func.sig.inputs.iter();
+    let (pat, ty) = match (inputs.next(), inputs.next()) {
+        (Some(syn::FnArg::Typed(arg)), None) => (&arg.pat, &arg.ty),
+        (Some(syn::FnArg::Receiver(recv)), _) => {
+            return Err(syn::Error::new_spanned(
+                recv,
+                "bsql::test: the test function must take `conn: &mut Connection`, not `self`",
+            ));
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &func.sig,
+                "bsql::test: the test function must take exactly one argument, \
+                 `conn: &mut Connection`",
+            ));
+        }
+    };
+
+    let attrs = &func.attrs;
+    let vis = &func.vis;
+    let name = &func.sig.ident;
+    let name_str = name.to_string();
+    let body = &func.block;
+
+    Ok(quote! {
+        #(#attrs)*
+        #[::core::prelude::v1::test]
+        #vis fn #name() {
+            ::bsql::__test_rt::run_schema_isolated_test(
+                #name_str,
+                async move |#pat: #ty| #body,
+            );
+        }
+    })
+}

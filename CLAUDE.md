@@ -44,7 +44,7 @@ Load-bearing decisions for any new session:
 
 ```
 crates/
-  bsql/              — umbrella facade + query! re-export (bsql::pg, ::pg_sync, ::sqlite)  — 217 LoC
+  bsql/              — umbrella facade + query! re-export + #[bsql::test] harness (bsql::pg, ::pg_sync, ::sqlite)  — 675 LoC
   postgres/
     proto/           — sans-IO wire protocol + session engine (no_std + alloc)  — 25765 LoC
     core/            — shared engine materializer + types + config + TLS + Rows + notify ledger  — 5817 LoC
@@ -54,10 +54,10 @@ crates/
     driver/          — embedded SQLite driver (bundled rusqlite)  — 1010 LoC
   testkit/           — deterministic in-memory fake PostgreSQL for driver tests (no network)  — 560 LoC
   build/             — BUILD-DEP: migration DDL → schema catalog (+ SQLite template)  — 34591 LoC
-  query-macros/      — PROC-MACRO: reads the catalog, types/validates query!  — 1697 LoC
+  query-macros/      — PROC-MACRO: query! (types/validates against the catalog) + #[bsql::test] (schema-per-test wrapper)  — 1864 LoC
 ```
 
-(src LoC measured per crate via `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by ~13K lines of inference tests in `src/infer.rs`. Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync}`, `bsql-sqlite`, `bsql-testkit`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-bridge-fixture`, `bsql-query-sqlite-fixture`, `bsql-corpus`.)
+(src LoC measured per crate via `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by ~13K lines of inference tests in `src/infer.rs`. Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync}`, `bsql-sqlite`, `bsql-testkit`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-bridge-fixture`, `bsql-query-sqlite-fixture`, `bsql-test-harness-fixture`, `bsql-corpus`.)
 
 ## Build & test
 
@@ -74,6 +74,10 @@ cargo test -p bsql-postgres-async --test sq_live -- --ignored    # async PG (nee
 cargo test -p bsql-postgres-sync --test sync_live -- --ignored   # sync PG (needs local PG)
 cargo test -p bsql-query-fixture --test query_live_async -- --ignored  # live query! (async, needs PG)
 cargo test -p bsql-query-fixture --test query_live_sync  -- --ignored  # live query! (sync, needs PG)
+cargo clippy -p bsql --features test-harness --all-targets              # lint the (non-default) #[bsql::test] harness
+cargo test  -p bsql --features test-harness --lib                       # harness unit tests (offline)
+BSQL_TEST_DSN=postgres://USER@localhost/postgres \
+  cargo test -p bsql-test-harness-fixture -- --ignored                  # live #[bsql::test] isolation witness (needs PG)
 ```
 
 **Consumer wiring — the `query!` flagship.** A consumer reaches the whole
@@ -114,6 +118,36 @@ fn compiles for any foreign target. The bridge reshapes ONLY the record field
 value; the row OID list and the const validator ride the native pivot, so the
 compile-time OID-drift guarantee (E0080) is untouched.
 `tools/query_bridge_fixture` is the end-to-end proof.
+
+**Schema-per-test isolation — `#[bsql::test]` (feature `test-harness`).** A
+consumer adds `bsql` with `features = ["test-harness"]` and writes an async test
+taking a single connection:
+
+```rust
+#[bsql::test]
+async fn creates_a_user(conn: &mut bsql::pg::Connection) {
+    conn.query_sql("CREATE TABLE users (id int)").await.unwrap();  // in an ISOLATED schema
+}   // schema auto-dropped, even if the test panics
+```
+
+Each `#[bsql::test]` runs in its own freshly-created PostgreSQL schema, so
+tests running in parallel (cargo's default) never interfere — the isolation
+rides the connect-time `search_path` (a startup-packet GUC that survives the
+pool's `RESET ALL`, so a pooled connection cannot escape its schema). The
+attribute wraps the `async fn` in a `#[test]` that connects to the server named
+by the **`BSQL_TEST_DSN`** environment variable — a test-specific variable,
+deliberately distinct from an application's `DATABASE_URL` because the harness
+creates and drops schemas — creates a unique injection-safe schema
+(`bsql_t_<pid>_<seq>[_<name>]`, identifier-validated before it is spliced into
+the `CREATE`/`DROP` DDL), hands the body a connection pinned to it, and drops the
+schema on exit inside a `catch_unwind` so a panicking test still cleans up (the
+original panic is re-raised afterward, so `#[should_panic]` still works). An
+unset `BSQL_TEST_DSN` is a loud panic naming the variable, never a silent skip.
+The attribute lives in the same proc-macro crate as `query!` (both are host-only
+token transformers); the harness runtime lives behind the non-default
+`test-harness` feature, so a production build pulls neither the runtime nor the
+harness. `tools/test_harness_fixture` is the end-to-end proof (parallel
+isolation, teardown on success and on panic, the loud unset-DSN error).
 
 The `deps_pin` gate (`tools/devgates/tests/deps_pin.rs`) pins the resolved
 dependency set (parsed from `Cargo.lock`) to a committed golden, and bans any

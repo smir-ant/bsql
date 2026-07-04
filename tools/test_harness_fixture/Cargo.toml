@@ -1,0 +1,24 @@
+[package]
+name = "bsql-test-harness-fixture"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Fixture consumer exercising the #[bsql::test] schema-per-test isolation attribute end-to-end: two parallel isolated tests, teardown-on-success, teardown-on-panic, and the loud unset-DSN error. Never published."
+
+# Not a shipped crate; it exists only to prove the `#[bsql::test]` attribute +
+# harness works for a REAL consumer reaching it through `bsql` alone.
+publish = false
+
+[dependencies]
+# The umbrella crate, and the ONLY dependency: reaching `#[bsql::test]` and its
+# `::bsql::__test_rt` runtime through `bsql` with the `test-harness` feature is
+# the whole point this fixture proves — a real consumer hand-wires nothing (no
+# proc-macro crate, no driver, no tokio). `default-features = false` keeps the
+# surface to exactly the harness + async driver the feature pulls. Already a
+# resolved workspace member, so this adds no external package to the lockfile.
+bsql = { path = "../../crates/bsql", default-features = false, features = ["test-harness"] }
+
+# Inherit the workspace FORBID floor / lint wall like every other member.
+[lints]
+workspace = true

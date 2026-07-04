@@ -222,3 +222,54 @@ pub mod __rt {
         prepared, query_budget,
     };
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Schema-per-test isolation (feature `test-harness`)
+// ════════════════════════════════════════════════════════════════════
+//
+// `#[bsql::test]` over an `async fn(conn: &mut bsql::pg::Connection)` runs the
+// test in its own freshly-created PostgreSQL schema and drops that schema on
+// exit — even on panic. Two such tests run in parallel against the same server
+// without interfering, because each connection's connect-time `search_path`
+// pins every unqualified name to its own schema. Built on the async driver and
+// a per-test tokio runtime, so it is gated OFF by default: a production build
+// never pulls the runtime or the harness.
+
+/// Run an integration test in its own isolated PostgreSQL schema.
+///
+/// Applied to an `async fn` taking a single `conn: &mut bsql::pg::Connection`:
+///
+/// ```rust,ignore
+/// #[bsql::test]
+/// async fn creates_a_user(conn: &mut bsql::pg::Connection) {
+///     conn.execute_sql("CREATE TABLE users (id int)").await.unwrap();
+///     // ... assertions, all inside an isolated schema ...
+/// }   // schema auto-dropped, even if the test panics
+/// ```
+///
+/// The harness connects to the server named by the `BSQL_TEST_DSN` environment
+/// variable (a *test* variable, deliberately distinct from an application's
+/// `DATABASE_URL` — this harness creates and drops schemas), creates a unique
+/// schema, hands the body a connection pinned to it, and drops the schema on
+/// exit. An unset `BSQL_TEST_DSN` is a loud panic naming the variable, never a
+/// silent skip. Other attributes on the function (`#[ignore]`, `#[should_panic]`,
+/// …) are forwarded to the generated `#[test]`.
+#[cfg(feature = "test-harness")]
+pub use bsql_query_macros::test;
+
+/// Runtime support the `#[bsql::test]` expansion names.
+///
+/// NOT a stable API and NOT for direct use — the `#[bsql::test]` expansion
+/// resolves `::bsql::__test_rt::run_schema_isolated_test` through the single
+/// `bsql` dependency. Compiled only under the non-default `test-harness`
+/// feature.
+#[cfg(feature = "test-harness")]
+#[doc(hidden)]
+pub mod __test_rt {
+    pub use crate::test_harness::{
+        DSN_ENV, resolve_base_config, run_schema_isolated_test, schema_exists,
+    };
+}
+
+#[cfg(feature = "test-harness")]
+mod test_harness;

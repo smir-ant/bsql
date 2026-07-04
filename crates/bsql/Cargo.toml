@@ -39,6 +39,22 @@ macros = ["dep:bsql-query-macros", "dep:bsql-postgres-proto", "dep:bsql-postgres
 # cross-check consumes.
 macros-sqlite = ["macros", "bsql-query-macros/sqlite"]
 
+# `test-harness` — the `#[bsql::test]` schema-per-test isolation attribute plus
+# its runtime (`::bsql::__test_rt`). It pulls the `#[bsql::test]` proc-macro, the
+# async driver (for `Connection` / `ConnectConfig`), `bsql-postgres-core` (the
+# `sql_ident` identifier validator that keeps the spliced schema name
+# injection-safe), and a per-test tokio runtime (`rt` + the `net`/`time` drivers
+# the async connection needs). TEST-SUPPORT and NON-default: a production build
+# never pulls the runtime or the harness. All four deps are already resolved
+# workspace members (proto/core/async via the drivers, query-macros via the
+# fixtures, tokio via the async driver), so this adds no package to the lockfile.
+test-harness = [
+    "dep:bsql-query-macros",
+    "postgres-async",
+    "dep:bsql-postgres-core",
+    "dep:tokio",
+]
+
 [dependencies]
 bsql-postgres-async = { path = "../postgres/async", optional = true }
 bsql-postgres-sync = { path = "../postgres/sync", optional = true }
@@ -57,6 +73,13 @@ bsql-testkit = { path = "../testkit", optional = true }
 bsql-query-macros = { path = "../query-macros", optional = true }
 bsql-postgres-proto = { path = "../postgres/proto", optional = true }
 bsql-postgres-core = { path = "../postgres/core", optional = true }
+
+# Behind `test-harness` only — the per-test runtime the `#[bsql::test]` harness
+# builds. `rt` runs the current-thread runtime; `net` + `time` enable the I/O and
+# timer drivers the async connection uses (`enable_all`). No `macros` (the harness
+# owns the runtime with plain `#[test]`, not `#[tokio::test]`). Already resolved
+# for the async driver, so this adds no package to the lockfile.
+tokio = { workspace = true, optional = true, features = ["rt", "net", "time"] }
 
 # Inherit the workspace FORBID floor (the two-tier lint wall).
 [lints]

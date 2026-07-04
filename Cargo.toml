@@ -58,6 +58,12 @@ members = [
     # crate's runtime graph (so `runtime_graph_pin` is unaffected); adds NO
     # new external dependency (proto only — no async runtime).
     "tools/corpus",
+    # Fixture consumer exercising the `#[bsql::test]` schema-per-test isolation
+    # attribute end-to-end through `bsql` alone (the `test-harness` feature):
+    # two parallel isolated tests, teardown on success and on panic, and the
+    # loud unset-DSN error. `publish = false`; not a shipped crate; adds no
+    # external package (only `bsql`, already a resolved member).
+    "tools/test_harness_fixture",
 ]
 
 [workspace.package]
@@ -446,7 +452,11 @@ trybuild = { version = "1" }
 # **expert-domain ecosystem standard** (1B+ downloads each, embedded in
 # the Rust toolchain ecosystem; transitive `unsafe` for token-stream
 # manipulation is bounded and well-audited). Pinned majors per CREDO §4.4.
-syn = { version = "2", default-features = false, features = ["proc-macro", "derive", "parsing", "printing"] }
+# `full` parses whole items (`ItemFn`, `FnArg`, `ReturnType`), which the
+# `#[bsql::test]` attribute macro needs to wrap an annotated `async fn`; the
+# `query!` macro only needs the derive-level nodes. `full` adds no new package
+# to the resolved set — it activates more of syn itself.
+syn = { version = "2", default-features = false, features = ["proc-macro", "derive", "parsing", "printing", "full"] }
 quote = { version = "1", default-features = false }
 proc-macro2 = { version = "1", default-features = false, features = ["proc-macro"] }
 

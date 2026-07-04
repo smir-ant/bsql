@@ -61,6 +61,7 @@ dependencies = [
  "bsql-query-macros",
  "bsql-sqlite",
  "bsql-testkit",
+ "tokio",
 ]
 
 [[package]]
@@ -187,6 +188,13 @@ dependencies = [
  "bsql-devgates",
  "rusqlite",
  "trybuild",
+]
+
+[[package]]
+name = "bsql-test-harness-fixture"
+version = "0.0.0"
+dependencies = [
+ "bsql",
 ]
 
 [[package]]
