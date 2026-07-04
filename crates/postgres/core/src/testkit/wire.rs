@@ -11,21 +11,57 @@
 
 use std::vec::Vec;
 
+use bsql_postgres_proto::decode::{oids, EncodeBinary};
 use bsql_postgres_proto::wire::{
     TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE, TAG_DATA_ROW,
     TAG_ERROR_RESPONSE, TAG_NOTIFICATION_RESPONSE, TAG_PARAMETER_STATUS, TAG_PARSE_COMPLETE,
     TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
+use bsql_postgres_proto::WriteBuf;
+
+/// Reinterpret a PostgreSQL type OID (`u32`, from the proto [`oids`] table) as
+/// the `i32` the `RowDescription` type-oid field carries. Every catalog OID is
+/// far below `2^31`, so the bit reinterpretation is value-preserving; routing
+/// it through `to_le_bytes`/`from_le_bytes` keeps the crate-root forbid-bundle
+/// satisfied (no `as` cast, no arithmetic) and lets each `OID_*` below be
+/// single-sourced from `oids::*` — a wire OID cannot drift from the decoder's.
+const fn oid_i32(oid: u32) -> i32 {
+    i32::from_le_bytes(oid.to_le_bytes())
+}
 
 /// PostgreSQL type OID for `int8` (`bigint`) — the wire type a scripted `i64`
-/// column advertises.
-pub const OID_INT8: i32 = 20;
-/// PostgreSQL type OID for `int4` (`integer`).
-pub const OID_INT4: i32 = 23;
-/// PostgreSQL type OID for `text`.
-pub const OID_TEXT: i32 = 25;
-/// PostgreSQL type OID for `bool`.
-pub const OID_BOOL: i32 = 16;
+/// column advertises. Single-sourced from [`oids::INT8`].
+pub const OID_INT8: i32 = oid_i32(oids::INT8);
+/// PostgreSQL type OID for `int4` (`integer`). Single-sourced from [`oids::INT4`].
+pub const OID_INT4: i32 = oid_i32(oids::INT4);
+/// PostgreSQL type OID for `text`. Single-sourced from [`oids::TEXT`].
+pub const OID_TEXT: i32 = oid_i32(oids::TEXT);
+/// PostgreSQL type OID for `bool`. Single-sourced from [`oids::BOOL`].
+pub const OID_BOOL: i32 = oid_i32(oids::BOOL);
+/// PostgreSQL type OID for `float4` (`real`). Single-sourced from [`oids::FLOAT4`].
+pub const OID_FLOAT4: i32 = oid_i32(oids::FLOAT4);
+/// PostgreSQL type OID for `float8` (`double precision`). Single-sourced from [`oids::FLOAT8`].
+pub const OID_FLOAT8: i32 = oid_i32(oids::FLOAT8);
+/// PostgreSQL type OID for `bytea`. Single-sourced from [`oids::BYTEA`].
+pub const OID_BYTEA: i32 = oid_i32(oids::BYTEA);
+/// PostgreSQL type OID for `uuid`. Single-sourced from [`oids::UUID`].
+pub const OID_UUID: i32 = oid_i32(oids::UUID);
+/// PostgreSQL type OID for `numeric` (`decimal`). Single-sourced from [`oids::NUMERIC`].
+pub const OID_NUMERIC: i32 = oid_i32(oids::NUMERIC);
+/// PostgreSQL type OID for `timestamptz`. Single-sourced from [`oids::TIMESTAMPTZ`].
+pub const OID_TIMESTAMPTZ: i32 = oid_i32(oids::TIMESTAMPTZ);
+/// PostgreSQL type OID for `timestamp`. Single-sourced from [`oids::TIMESTAMP`].
+pub const OID_TIMESTAMP: i32 = oid_i32(oids::TIMESTAMP);
+/// PostgreSQL type OID for `date`. Single-sourced from [`oids::DATE`].
+pub const OID_DATE: i32 = oid_i32(oids::DATE);
+/// PostgreSQL type OID for `time`. Single-sourced from [`oids::TIME`].
+pub const OID_TIME: i32 = oid_i32(oids::TIME);
+/// PostgreSQL type OID for `interval`. Single-sourced from [`oids::INTERVAL`].
+pub const OID_INTERVAL: i32 = oid_i32(oids::INTERVAL);
+/// PostgreSQL type OID for `json`. Single-sourced from [`oids::JSON`].
+pub const OID_JSON: i32 = oid_i32(oids::JSON);
+/// PostgreSQL type OID for `jsonb`. Single-sourced from [`oids::JSONB`].
+pub const OID_JSONB: i32 = oid_i32(oids::JSONB);
 
 /// Transaction-status byte for `ReadyForQuery`: `I` = idle (not in a
 /// transaction block) — the only status the MVP fake reports.
@@ -46,6 +82,13 @@ pub enum FakeEncodeError {
     CountTooLarge,
     /// A single cell value exceeded the `i32` wire length field.
     CellTooLarge,
+    /// A value's BINARY encoding overflowed the bounded encode buffer the
+    /// real outbound frame builder uses (its fixed capacity). Only reachable
+    /// by a value routed through the real [`EncodeBinary`] encoder — in
+    /// practice a `numeric` with thousands of significant digits, which no
+    /// realistic testkit fixture holds. The raw-byte types (`bytea`, `json`,
+    /// `jsonb`) encode into an UNBOUNDED buffer and never reach it.
+    EncodeBufferFull,
 }
 
 impl core::fmt::Display for FakeEncodeError {
@@ -54,6 +97,9 @@ impl core::fmt::Display for FakeEncodeError {
             Self::FrameTooLarge => "fake reply frame body exceeds the u32 wire length field",
             Self::CountTooLarge => "fake reply column/row count exceeds the i16 wire field",
             Self::CellTooLarge => "fake reply cell value exceeds the i32 wire length field",
+            Self::EncodeBufferFull => {
+                "fake reply value's binary encoding exceeds the bounded encode buffer"
+            }
         };
         f.write_str(msg)
     }
@@ -128,10 +174,12 @@ pub fn ready_for_query(tx_status: u8) -> Result<Vec<u8>, FakeEncodeError> {
 /// ignores the field.
 const fn type_size_for_oid(oid: i32) -> i16 {
     match oid {
-        OID_INT8 => 8,
-        OID_INT4 => 4,
+        OID_INT8 | OID_FLOAT8 | OID_TIMESTAMPTZ | OID_TIMESTAMP | OID_TIME => 8,
+        OID_INT4 | OID_FLOAT4 | OID_DATE => 4,
         OID_BOOL => 1,
-        // `text` and anything else the fake does not model as fixed-width.
+        OID_UUID | OID_INTERVAL => 16,
+        // `text`, `bytea`, `numeric`, `json`, `jsonb` (varlena) and anything
+        // else the fake does not model as fixed-width.
         _ => -1,
     }
 }
@@ -298,6 +346,60 @@ pub fn binary_text(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
 }
 
+/// Encode a value's PG BINARY body through the crate's REAL [`EncodeBinary`]
+/// impl — the identical encoder the compile-checked `query!` parameter path
+/// uses. Routing the fake's bytes through it makes them byte-identical to what
+/// a real server round-trips BY CONSTRUCTION, not merely by test: a fixed-width
+/// scalar (`uuid`, `timestamptz`, `date`, …) or the grouped `numeric` layout
+/// can never drift from the [`bsql_postgres_proto::Cell`]`<BinaryFmt>` decoder
+/// that reads it, because there is one encoder, not two. This is the preferred
+/// source for every fixed-width / non-trivially-laid-out type; the raw-byte
+/// types (`bytea`, `json`, `jsonb`) keep their own unbounded helpers below so a
+/// multi-kilobyte fixture stays representable.
+///
+/// # Errors
+///
+/// [`FakeEncodeError::EncodeBufferFull`] if the encoding overflows the bounded
+/// [`WriteBuf`] the real outbound builder uses — reachable only by a `numeric`
+/// with thousands of significant digits, never a realistic fixture. Surfaced as
+/// a classified error, never a panic and never a truncated (wire-illegal) body.
+pub fn binary_via_encoder<T: EncodeBinary>(value: &T) -> Result<Vec<u8>, FakeEncodeError> {
+    let mut buf = WriteBuf::new();
+    value
+        .encode_to(&mut buf)
+        .map_err(|_| FakeEncodeError::EncodeBufferFull)?;
+    Ok(buf.as_bytes().to_vec())
+}
+
+/// PG binary `bytea`: the raw bytes, verbatim — what `Cell<BinaryFmt> for
+/// &[u8]` borrows (every length, including empty, is a valid body). The
+/// byte-string peer of [`binary_text`], and like it UNBOUNDED, so a
+/// multi-kilobyte fixture is representable (unlike the bounded
+/// [`binary_via_encoder`] path).
+#[must_use]
+pub fn binary_bytea(bytes: &[u8]) -> Vec<u8> {
+    bytes.to_vec()
+}
+
+/// PG binary `json`: the raw UTF-8 JSON text, verbatim (no framing) — exactly
+/// what `Cell<BinaryFmt> for Json` reads. Unbounded, like [`binary_text`].
+#[must_use]
+pub fn binary_json(text: &str) -> Vec<u8> {
+    text.as_bytes().to_vec()
+}
+
+/// PG binary `jsonb`: the leading version byte `1` then the UTF-8 JSON text,
+/// mirroring the decoder's header contract exactly — what `Cell<BinaryFmt> for
+/// Jsonb` reads (a version byte other than `1` is a classified decode error).
+/// The version byte is the ONLY difference from [`binary_json`]. Unbounded.
+#[must_use]
+pub fn binary_jsonb(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len().saturating_add(1));
+    out.push(1);
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Extended-protocol acknowledgement frames.
 //
@@ -348,9 +450,14 @@ mod tests {
     //! engine, no network. A wrong byte layout fails here, so a wire-incorrect
     //! binary encoding is impossible to ship.
 
-    use bsql_postgres_proto::{BinaryFmt, Cell};
+    use bsql_postgres_proto::{
+        BinaryFmt, Cell, Date, Interval, Json, Jsonb, Numeric, Time, Timestamp, Timestamptz, Uuid,
+    };
 
-    use super::{binary_bool, binary_int4, binary_int8, binary_text};
+    use super::{
+        binary_bool, binary_bytea, binary_int4, binary_int8, binary_json, binary_jsonb,
+        binary_text, binary_via_encoder,
+    };
 
     #[test]
     fn binary_int8_round_trips_through_the_real_decoder() {
@@ -384,6 +491,104 @@ mod tests {
         for v in ["", "alice", "hello world", "über"] {
             let bytes = binary_text(v);
             assert_eq!(<&str as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+    }
+
+    #[test]
+    fn binary_floats_round_trip_through_the_real_decoder() {
+        for v in [0.0_f32, 1.5, -2.5, f32::MIN, f32::MAX] {
+            let bytes = binary_via_encoder(&v).expect("f32 encodes");
+            assert_eq!(bytes.len(), 4, "float4 is 4 wire bytes");
+            assert_eq!(<f32 as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+        for v in [0.0_f64, 1.5, -2.5, f64::MIN, f64::MAX] {
+            let bytes = binary_via_encoder(&v).expect("f64 encodes");
+            assert_eq!(bytes.len(), 8, "float8 is 8 wire bytes");
+            assert_eq!(<f64 as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+    }
+
+    #[test]
+    fn binary_uuid_round_trips_through_the_real_decoder() {
+        for raw in [[0_u8; 16], [0xFF; 16], *b"0123456789abcdef"] {
+            let v = Uuid::from_bytes(raw);
+            let bytes = binary_via_encoder(&v).expect("uuid encodes");
+            assert_eq!(bytes.len(), 16, "uuid is 16 wire bytes");
+            assert_eq!(<Uuid as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+    }
+
+    #[test]
+    fn binary_numeric_round_trips_through_the_real_decoder() {
+        // A finite decimal, a whole number, zero, a negative, and the special
+        // sentinels — every classification the grouped wire layout carries.
+        let finite = "3.14".parse::<Numeric>().expect("parse 3.14");
+        let big = "12345678901234567890.987654321".parse::<Numeric>().expect("parse big");
+        let neg = "-42".parse::<Numeric>().expect("parse -42");
+        let zero = "0".parse::<Numeric>().expect("parse 0");
+        for v in [finite, big, neg, zero, Numeric::nan(), Numeric::infinity(), Numeric::neg_infinity()] {
+            let bytes = binary_via_encoder(&v).expect("numeric encodes");
+            assert_eq!(<Numeric as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+    }
+
+    #[test]
+    fn binary_temporal_round_trips_through_the_real_decoder() {
+        for v in [Timestamptz::from_micros(1_000_000), Timestamptz::from_micros(i64::MIN), Timestamptz::from_micros(i64::MAX)] {
+            let bytes = binary_via_encoder(&v).expect("timestamptz encodes");
+            assert_eq!(bytes.len(), 8, "timestamptz is 8 wire bytes");
+            assert_eq!(<Timestamptz as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+        for v in [Timestamp::from_micros(0), Timestamp::from_micros(-1), Timestamp::from_micros(123_456_789)] {
+            let bytes = binary_via_encoder(&v).expect("timestamp encodes");
+            assert_eq!(bytes.len(), 8, "timestamp is 8 wire bytes");
+            assert_eq!(<Timestamp as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+        for v in [Date::from_days(0), Date::from_days(59), Date::from_days(-1), Date::infinity(), Date::neg_infinity()] {
+            let bytes = binary_via_encoder(&v).expect("date encodes");
+            assert_eq!(bytes.len(), 4, "date is 4 wire bytes");
+            assert_eq!(<Date as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+        for v in [Time::from_micros(0), Time::from_micros(45_296_789_012)] {
+            let bytes = binary_via_encoder(&v).expect("time encodes");
+            assert_eq!(bytes.len(), 8, "time is 8 wire bytes");
+            assert_eq!(<Time as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+        for v in [Interval::new(0, 0, 0), Interval::new(14, 3, 14_706_000_000), Interval::new(-1, -2, -3)] {
+            let bytes = binary_via_encoder(&v).expect("interval encodes");
+            assert_eq!(bytes.len(), 16, "interval is 16 wire bytes");
+            assert_eq!(<Interval as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+    }
+
+    #[test]
+    fn binary_bytea_round_trips_through_the_real_decoder() {
+        for v in [b"".as_slice(), b"\xDE\xAD\xBE\xEF", b"\x00\x01\x02"] {
+            let bytes = binary_bytea(v);
+            assert_eq!(<&[u8] as Cell<BinaryFmt>>::decode(&bytes), Ok(v));
+        }
+    }
+
+    #[test]
+    fn binary_json_round_trips_through_the_real_decoder() {
+        for text in [r#"{"k":1}"#, "[1,2,3]", "null", r#""über""#] {
+            let bytes = binary_json(text);
+            assert_eq!(
+                <Json as Cell<BinaryFmt>>::decode(&bytes),
+                Ok(Json::new(text.to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn binary_jsonb_round_trips_through_the_real_decoder() {
+        for text in [r#"{"k":1}"#, "[1,2,3]", "null"] {
+            let bytes = binary_jsonb(text);
+            assert_eq!(bytes.first(), Some(&1_u8), "jsonb carries the leading version byte 1");
+            assert_eq!(
+                <Jsonb as Cell<BinaryFmt>>::decode(&bytes),
+                Ok(Jsonb::new(text.to_owned()))
+            );
         }
     }
 }

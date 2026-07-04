@@ -18,6 +18,16 @@ bsql-postgres-async = { path = "../postgres/async", features = ["testkit"] }
 bsql-postgres-sync = { path = "../postgres/sync", features = ["testkit"] }
 bsql-postgres-core = { path = "../postgres/core", features = ["testkit"] }
 
+# The sans-IO wire crate — a DIRECT edge purely to NAME the dep-free bsql-native
+# PG types (`Uuid`, `Numeric`, `Timestamptz`, `Date`, `Interval`, `Json`, …) in
+# `FakeValue`'s scriptable vocabulary. These are the SAME types a consumer scripts
+# via `bsql::Uuid` (the umbrella re-exports proto's), so the `From` impls accept a
+# consumer's value by type identity. proto is already a transitive dependency
+# (via core + both drivers), so this direct edge adds NO package to the lockfile
+# (`deps_pin` unchanged) and no forbidden runtime edge (proto is not sqlparser /
+# bsql-build — `runtime_graph_pin` unchanged).
+bsql-postgres-proto = { path = "../postgres/proto" }
+
 # Inherit the workspace FORBID floor (the two-tier lint wall).
 [lints]
 workspace = true

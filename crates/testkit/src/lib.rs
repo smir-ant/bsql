@@ -43,24 +43,56 @@
 //! runtime `prepare`/`describe` extended path, multi-query scripting,
 //! expectations (`assert_all_queried`), and COPY are not yet supported.
 //!
-//! Scriptable cell types are [`FakeValue`]'s vocabulary — `bigint` (`i64`),
-//! `integer` (`i32`), `text` (`&str`/`String`), `boolean`, and NULL. A column of
-//! any other type (e.g. `uuid`, `timestamptz`, `json`, an array) is not yet
-//! scriptable: `rows!` rejects it at compile time (no `From` into `FakeValue`),
-//! so reach for a supported column type rather than hand-encoding a value.
+//! Scriptable cell types are [`FakeValue`]'s vocabulary — the full scalar
+//! surface the compile-checked `query!` path decodes: `bigint` (`i64`),
+//! `integer` (`i32`), `text` (`&str` / `String`), `boolean`, `float4` (`f32`),
+//! `float8` (`f64`), `bytea` (`&[u8]` / `Vec<u8>`), `uuid`, `numeric`,
+//! `timestamptz`, `timestamp`, `date`, `time`, `interval`, `json`, `jsonb`, and
+//! NULL (`Option<T>`). The dep-free bsql-native types are scripted through the
+//! very types a consumer decodes into (`bsql::Uuid`, `bsql::Numeric`,
+//! `bsql::Timestamptz`, …). Each type's BINARY bytes — the wire the `query!`
+//! extended path decodes — are produced by the crate's REAL `EncodeBinary`
+//! encoder (the fixed-width / grouped types) or an unbounded raw-byte encoder
+//! (`bytea` / `json` / `jsonb`), so they are byte-identical to a real server's,
+//! proven by a round-trip through the real decoder. A 1-D array is not yet
+//! scriptable; `rows!` rejects an unsupported value at compile time (no `From`
+//! into `FakeValue`), so reach for a supported column type.
+//!
+//! The SIMPLE-query (`query_sql`, text) path is FAIL-CLOSED for any type whose
+//! text form cannot be rendered byte-faithfully to what a real server sends:
+//! `timestamptz` / `timestamp` (binary-only bsql types, no PostgreSQL-ISO text
+//! form) and `float4` / `float8` (Rust's `Display` diverges from PostgreSQL's
+//! `float ::text` for large / small magnitudes and `±Infinity`). A `query_sql`
+//! over such a cell is a loud, classified `DriverError::Db` naming the faithful
+//! routes — never plausible-but-wrong bytes a consumer could bake into a green
+//! `get_str` assertion (the testkit proves genuine behaviour, not a mock). The
+//! `query!` (binary) reply for the SAME script is byte-exact and unaffected, so
+//! a `query!` over a scripted `timestamptz` / `float8` works. Every other type's
+//! text rendering is its canonical PostgreSQL `::text` form.
 
 use bsql_postgres_async::Connection;
 use bsql_postgres_sync::Connection as SyncConnection;
 use bsql_postgres_core::testkit::wire::{
-    self, FakeEncodeError, OID_BOOL, OID_INT4, OID_INT8, OID_TEXT, TX_IDLE,
+    self, FakeEncodeError, OID_BOOL, OID_BYTEA, OID_DATE, OID_FLOAT4, OID_FLOAT8, OID_INT4,
+    OID_INT8, OID_INTERVAL, OID_JSON, OID_JSONB, OID_NUMERIC, OID_TEXT, OID_TIME, OID_TIMESTAMP,
+    OID_TIMESTAMPTZ, OID_UUID, TX_IDLE,
 };
 use bsql_postgres_core::testkit::{FakeScript, FakeTransport, QueryReply};
 use bsql_postgres_core::DriverError;
+// The dep-free bsql-native PG types a consumer scripts via `bsql::Uuid` etc.
+// (the umbrella re-exports these very types), named directly from the wire
+// crate so `FakeValue`'s `From` impls accept a consumer's value by type
+// identity. See the proto direct-edge note in `Cargo.toml`.
+use bsql_postgres_proto::{
+    Date, Interval, Json, Jsonb, Numeric, Time, Timestamp, Timestamptz, Uuid,
+};
 
-/// A single scripted column value, rendered to PostgreSQL text wire format.
+/// A single scripted column value, rendered to PostgreSQL text OR binary wire
+/// format (the simple-query and `query!` extended paths respectively).
 ///
 /// Construct through the [`From`] impls (or the [`rows!`] macro), e.g.
-/// `FakeValue::from(1_i64)`. `Option<T>` maps `None` to a SQL `NULL`.
+/// `FakeValue::from(1_i64)` or `FakeValue::from(uuid_value)`. `Option<T>` maps
+/// `None` to a SQL `NULL`.
 #[derive(Debug, Clone)]
 pub enum FakeValue {
     /// A `bigint` (`int8`) value.
@@ -71,6 +103,30 @@ pub enum FakeValue {
     Text(String),
     /// A `boolean` value.
     Bool(bool),
+    /// A `float4` (`real`) value.
+    F32(f32),
+    /// A `float8` (`double precision`) value.
+    F64(f64),
+    /// A `bytea` (raw byte string) value.
+    Bytea(Vec<u8>),
+    /// A `uuid` value.
+    Uuid(Uuid),
+    /// A `numeric` / `decimal` value (exact, arbitrary precision).
+    Numeric(Numeric),
+    /// A `timestamptz` value.
+    Timestamptz(Timestamptz),
+    /// A `timestamp` (zone-less) value.
+    Timestamp(Timestamp),
+    /// A `date` value.
+    Date(Date),
+    /// A `time` value.
+    Time(Time),
+    /// An `interval` value.
+    Interval(Interval),
+    /// A `json` document.
+    Json(Json),
+    /// A `jsonb` document.
+    Jsonb(Jsonb),
     /// A SQL `NULL`.
     Null,
 }
@@ -100,6 +156,71 @@ impl From<bool> for FakeValue {
         Self::Bool(v)
     }
 }
+impl From<f32> for FakeValue {
+    fn from(v: f32) -> Self {
+        Self::F32(v)
+    }
+}
+impl From<f64> for FakeValue {
+    fn from(v: f64) -> Self {
+        Self::F64(v)
+    }
+}
+impl From<&[u8]> for FakeValue {
+    fn from(v: &[u8]) -> Self {
+        Self::Bytea(v.to_vec())
+    }
+}
+impl From<Vec<u8>> for FakeValue {
+    fn from(v: Vec<u8>) -> Self {
+        Self::Bytea(v)
+    }
+}
+impl From<Uuid> for FakeValue {
+    fn from(v: Uuid) -> Self {
+        Self::Uuid(v)
+    }
+}
+impl From<Numeric> for FakeValue {
+    fn from(v: Numeric) -> Self {
+        Self::Numeric(v)
+    }
+}
+impl From<Timestamptz> for FakeValue {
+    fn from(v: Timestamptz) -> Self {
+        Self::Timestamptz(v)
+    }
+}
+impl From<Timestamp> for FakeValue {
+    fn from(v: Timestamp) -> Self {
+        Self::Timestamp(v)
+    }
+}
+impl From<Date> for FakeValue {
+    fn from(v: Date) -> Self {
+        Self::Date(v)
+    }
+}
+impl From<Time> for FakeValue {
+    fn from(v: Time) -> Self {
+        Self::Time(v)
+    }
+}
+impl From<Interval> for FakeValue {
+    fn from(v: Interval) -> Self {
+        Self::Interval(v)
+    }
+}
+impl From<Json> for FakeValue {
+    fn from(v: Json) -> Self {
+        Self::Json(v)
+    }
+}
+impl From<Jsonb> for FakeValue {
+    fn from(v: Jsonb) -> Self {
+        Self::Jsonb(v)
+    }
+}
 impl<T: Into<FakeValue>> From<Option<T>> for FakeValue {
     fn from(v: Option<T>) -> Self {
         match v {
@@ -117,36 +238,137 @@ impl FakeValue {
             Self::Int4(_) => OID_INT4,
             Self::Text(_) => OID_TEXT,
             Self::Bool(_) => OID_BOOL,
+            Self::F32(_) => OID_FLOAT4,
+            Self::F64(_) => OID_FLOAT8,
+            Self::Bytea(_) => OID_BYTEA,
+            Self::Uuid(_) => OID_UUID,
+            Self::Numeric(_) => OID_NUMERIC,
+            Self::Timestamptz(_) => OID_TIMESTAMPTZ,
+            Self::Timestamp(_) => OID_TIMESTAMP,
+            Self::Date(_) => OID_DATE,
+            Self::Time(_) => OID_TIME,
+            Self::Interval(_) => OID_INTERVAL,
+            Self::Json(_) => OID_JSON,
+            Self::Jsonb(_) => OID_JSONB,
             Self::Null => OID_TEXT,
         }
     }
 
     /// The value in PostgreSQL TEXT wire format, or `None` for a SQL `NULL`.
     /// Used by the simple-query (`query_sql`) reply path.
-    fn render(&self) -> Option<Vec<u8>> {
-        match self {
+    ///
+    /// FAIL-CLOSED for any type whose text form the testkit cannot render
+    /// byte-faithfully to what a real PostgreSQL server emits. The testkit's
+    /// contract is that a passing test proves genuine end-to-end behaviour, not
+    /// a mock — so a cell that would serve bytes a real server never sends is a
+    /// classified [`TestkitError::UnfaithfulTextRender`], never a plausible-but-
+    /// wrong string a consumer could bake into a green `get_str` assertion. The
+    /// unfaithful set:
+    ///
+    /// - `timestamptz` / `timestamp`: binary-only bsql types with no
+    ///   PostgreSQL-ISO text form derivable from the value alone (bsql decodes
+    ///   them from the binary wire, by design).
+    /// - `float4` / `float8`: Rust's `Display` diverges from PostgreSQL's
+    ///   `float ::text` for large / small magnitudes (`1e+20`, `1e-10`),
+    ///   subnormals, and `±Infinity` (Rust writes `inf` / full positional
+    ///   digits). A per-value check would mean reimplementing PostgreSQL's float
+    ///   formatter, so the whole type fails closed.
+    ///
+    /// The faithful routes for these types are the compile-checked `query!`
+    /// (binary) protocol — byte-exact via [`render_binary`](Self::render_binary)
+    /// — or a [`Text`](Self::Text) cell carrying the exact text the consumer's
+    /// real PostgreSQL emits.
+    fn render(&self) -> Result<Option<Vec<u8>>, TestkitError> {
+        Ok(match self {
             Self::Int8(v) => Some(v.to_string().into_bytes()),
             Self::Int4(v) => Some(v.to_string().into_bytes()),
             Self::Text(s) => Some(s.clone().into_bytes()),
             Self::Bool(b) => Some(if *b { b"t".to_vec() } else { b"f".to_vec() }),
+            // PostgreSQL `bytea` TEXT output (the default `hex` format) — the
+            // canonical, unambiguous `\x<hex>` form.
+            Self::Bytea(b) => Some(bytea_text_body(b)),
+            // Each renders its UNIQUE, canonical PostgreSQL `::text` form
+            // (verified `== ::text` for every value): uuid hyphenated-lowercase-
+            // hex, numeric exact decimal, date/time/interval ISO, json/jsonb the
+            // consumer's verbatim document text.
+            Self::Uuid(v) => Some(v.to_string().into_bytes()),
+            Self::Numeric(v) => Some(v.to_string().into_bytes()),
+            Self::Date(v) => Some(v.to_string().into_bytes()),
+            Self::Time(v) => Some(v.to_string().into_bytes()),
+            Self::Interval(v) => Some(v.to_string().into_bytes()),
+            Self::Json(v) => Some(v.as_str().as_bytes().to_vec()),
+            Self::Jsonb(v) => Some(v.as_str().as_bytes().to_vec()),
+            // FAIL-CLOSED — no PostgreSQL-faithful text form (see fn doc).
+            Self::Timestamptz(_) => {
+                return Err(TestkitError::UnfaithfulTextRender { type_name: "timestamptz" });
+            }
+            Self::Timestamp(_) => {
+                return Err(TestkitError::UnfaithfulTextRender { type_name: "timestamp" });
+            }
+            Self::F32(_) => {
+                return Err(TestkitError::UnfaithfulTextRender { type_name: "float4" });
+            }
+            Self::F64(_) => {
+                return Err(TestkitError::UnfaithfulTextRender { type_name: "float8" });
+            }
             Self::Null => None,
-        }
+        })
     }
 
     /// The value in PostgreSQL BINARY wire format, or `None` for a SQL `NULL`.
     /// Used by the extended-query (`query!`) reply path — the flagship decodes
     /// each cell via `Cell<BinaryFmt>`, so the bytes must be binary, not text.
-    /// Each variant delegates to the [`wire`] encoder the round-trip test there
-    /// proves wire-correct against the real decoder.
-    fn render_binary(&self) -> Option<Vec<u8>> {
-        match self {
+    ///
+    /// The fixed-width / non-trivially-laid-out types route through the REAL
+    /// [`wire::binary_via_encoder`] — the identical `EncodeBinary` encoder the
+    /// `query!` parameter path uses — so the fake's bytes are byte-identical to
+    /// a real server's BY CONSTRUCTION (a `numeric` grouping or a `date` epoch
+    /// can never drift from the decoder). The raw-byte types encode into an
+    /// unbounded buffer. Every encoder is proven wire-correct by a round-trip
+    /// through the real decoder in the [`wire`] module.
+    ///
+    /// # Errors
+    ///
+    /// [`FakeEncodeError`] only for a value whose binary encoding overflows the
+    /// bounded encode buffer (a `numeric` with thousands of significant digits)
+    /// — never a realistic fixture; surfaced classified, never a panic.
+    fn render_binary(&self) -> Result<Option<Vec<u8>>, FakeEncodeError> {
+        Ok(match self {
             Self::Int8(v) => Some(wire::binary_int8(*v)),
             Self::Int4(v) => Some(wire::binary_int4(*v)),
             Self::Text(s) => Some(wire::binary_text(s)),
             Self::Bool(b) => Some(wire::binary_bool(*b)),
+            Self::F32(v) => Some(wire::binary_via_encoder(v)?),
+            Self::F64(v) => Some(wire::binary_via_encoder(v)?),
+            Self::Uuid(v) => Some(wire::binary_via_encoder(v)?),
+            Self::Numeric(v) => Some(wire::binary_via_encoder(v)?),
+            Self::Timestamptz(v) => Some(wire::binary_via_encoder(v)?),
+            Self::Timestamp(v) => Some(wire::binary_via_encoder(v)?),
+            Self::Date(v) => Some(wire::binary_via_encoder(v)?),
+            Self::Time(v) => Some(wire::binary_via_encoder(v)?),
+            Self::Interval(v) => Some(wire::binary_via_encoder(v)?),
+            Self::Bytea(b) => Some(wire::binary_bytea(b)),
+            Self::Json(v) => Some(wire::binary_json(v.as_str())),
+            Self::Jsonb(v) => Some(wire::binary_jsonb(v.as_str())),
             Self::Null => None,
-        }
+        })
     }
+}
+
+/// PostgreSQL `bytea` TEXT output (the default `hex` format): the two-byte `\x`
+/// prefix followed by the bytes as lowercase hex — the canonical text a
+/// simple-query (`query_sql`) result carries for a `bytea` column, so a
+/// `get_str` over the scripted value reads exactly what a real server sends.
+fn bytea_text_body(bytes: &[u8]) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len().saturating_mul(2).saturating_add(2));
+    out.push(b'\\');
+    out.push(b'x');
+    for &byte in bytes {
+        out.push(HEX[usize::from(byte >> 4)]);
+        out.push(HEX[usize::from(byte & 0x0F)]);
+    }
+    out
 }
 
 /// A scripted result set — a grid of [`FakeValue`] rows. Build it with the
@@ -168,8 +390,10 @@ impl ScriptedRows {
 /// Build a [`ScriptedRows`] from row literals: `rows![[1_i64], [2_i64]]`.
 ///
 /// Each inner `[...]` is one row; each element is any value with a
-/// [`FakeValue`] `From` impl (`i64`, `i32`, `&str`, `String`, `bool`,
-/// `Option<T>` for a `NULL`).
+/// [`FakeValue`] `From` impl — an `i64` / `i32` / `f32` / `f64` / `bool`, a
+/// `&str` / `String`, a `&[u8]` / `Vec<u8>` (`bytea`), a dep-free bsql-native
+/// type (`bsql::Uuid`, `bsql::Numeric`, `bsql::Timestamptz`, `bsql::Date`,
+/// `bsql::Interval`, `bsql::Json`, …), or an `Option<T>` for a `NULL`.
 #[macro_export]
 macro_rules! rows {
     ( $( [ $( $cell:expr ),* $(,)? ] ),* $(,)? ) => {
@@ -223,6 +447,18 @@ pub enum TestkitError {
     /// The driver failed to connect over the fake (a malformed scripted
     /// handshake, surfaced by the real engine).
     Driver(DriverError),
+    /// A cell's type has no PostgreSQL-faithful SIMPLE-query (text) wire form,
+    /// so the `query_sql` reply path fails closed rather than serve bytes a real
+    /// server never sends. The `query!` (binary) reply for the SAME script is
+    /// byte-exact and unaffected; this only fails a `query_sql` over the cell.
+    /// Surfaced to the driver as a classified `DriverError::Db` when the
+    /// simple-query protocol serves the row (so a `query!` over the same script
+    /// stays green). `type_name` is the offending PostgreSQL type.
+    UnfaithfulTextRender {
+        /// The PostgreSQL type whose text form the fake cannot render faithfully
+        /// (e.g. `timestamptz`, `float8`).
+        type_name: &'static str,
+    },
 }
 
 impl core::fmt::Display for TestkitError {
@@ -234,6 +470,15 @@ impl core::fmt::Display for TestkitError {
                 "scripted rows have differing column counts: expected {expected}, found {found}"
             ),
             Self::Driver(e) => write!(f, "fake connect failed: {e}"),
+            Self::UnfaithfulTextRender { type_name } => write!(
+                f,
+                "bsql-testkit: a `{type_name}` column has no PostgreSQL-faithful \
+                 simple-query (text) form — a real server's text bytes cannot be \
+                 reproduced from the value alone, so the query_sql (text) path \
+                 fails closed rather than serve bytes PostgreSQL never sends. Use \
+                 the compile-checked query! (binary) protocol (byte-exact), or \
+                 script a Text cell carrying the exact text your PostgreSQL emits."
+            ),
         }
     }
 }
@@ -328,7 +573,7 @@ impl FakePostgres {
             // stream and an extended-query Execute payload.
             let query_reply = match reply {
                 ScriptedReply::Rows { rows, notifications } => QueryReply {
-                    simple: encode_rows_simple(rows, notifications)?,
+                    simple: encode_rows_simple_faithful(rows, notifications)?,
                     extended: encode_rows_extended(rows, notifications)?,
                 },
                 ScriptedReply::Error { sqlstate, message } => QueryReply {
@@ -486,11 +731,41 @@ fn notification_frames(
         .collect()
 }
 
+/// The SIMPLE-query reply, FAIL-CLOSED on an unfaithful text render.
+///
+/// Wraps [`encode_rows_simple`]: if any cell's type has no PostgreSQL-faithful
+/// text form ([`TestkitError::UnfaithfulTextRender`] — `timestamptz` /
+/// `timestamp` / `float4` / `float8`), the simple-query reply becomes a
+/// classified `ErrorResponse` naming the faithful routes, so a `query_sql` over
+/// the cell is a loud `DriverError::Db`, never silently-wrong text bytes. The
+/// substitution happens HERE (not at [`build_script`](FakePostgres::build_script)
+/// return) on PURPOSE: the EXTENDED (`query!`) reply for the same script is
+/// byte-exact and unaffected, so a `query!` over a scripted `timestamptz` /
+/// `float8` stays green while a `query_sql` over it fails closed. Any OTHER
+/// encode failure (a genuinely oversized value, ragged rows) still propagates.
+fn encode_rows_simple_faithful(
+    rows: &ScriptedRows,
+    notifications: &[ScriptedNotification],
+) -> Result<Vec<u8>, TestkitError> {
+    match encode_rows_simple(rows, notifications) {
+        Ok(bytes) => Ok(bytes),
+        Err(e @ TestkitError::UnfaithfulTextRender { .. }) => {
+            // Fail the SIMPLE (query_sql) path closed with a classified server
+            // error carrying the guidance message. `0A000` = feature_not_supported.
+            encode_error_simple("0A000", &e.to_string())
+        }
+        Err(other) => Err(other),
+    }
+}
+
 /// Encode a scripted result set for the SIMPLE-query protocol:
 /// `RowDescription` + text `DataRow`s + interleaved `NotificationResponse`s +
 /// `CommandComplete` + `ReadyForQuery`. The notifications ride after the rows and
 /// before the command boundary, so the driver's query pump surfaces each one
-/// mid-command.
+/// mid-command. A cell whose type has no PostgreSQL-faithful text form
+/// ([`FakeValue::render`]) makes this fail closed with
+/// [`TestkitError::UnfaithfulTextRender`]; [`encode_rows_simple_faithful`] turns
+/// that into a classified `ErrorResponse` for the wire.
 fn encode_rows_simple(
     rows: &ScriptedRows,
     notifications: &[ScriptedNotification],
@@ -499,7 +774,8 @@ fn encode_rows_simple(
     let mut frames = Vec::with_capacity(rows.rows.len().saturating_add(notifications.len()).saturating_add(3));
     frames.push(wire::row_description(&cols)?);
     for row in &rows.rows {
-        let cells: Vec<Option<Vec<u8>>> = row.iter().map(FakeValue::render).collect();
+        let cells: Vec<Option<Vec<u8>>> =
+            row.iter().map(FakeValue::render).collect::<Result<Vec<_>, _>>()?;
         frames.push(wire::data_row(&cells)?);
     }
     frames.extend(notification_frames(notifications)?);
@@ -523,7 +799,10 @@ fn encode_rows_extended(
     checked_columns(rows)?;
     let mut frames = Vec::with_capacity(rows.rows.len().saturating_add(notifications.len()).saturating_add(1));
     for row in &rows.rows {
-        let cells: Vec<Option<Vec<u8>>> = row.iter().map(FakeValue::render_binary).collect();
+        let cells: Vec<Option<Vec<u8>>> = row
+            .iter()
+            .map(FakeValue::render_binary)
+            .collect::<Result<Vec<_>, _>>()?;
         frames.push(wire::data_row(&cells)?);
     }
     frames.extend(notification_frames(notifications)?);

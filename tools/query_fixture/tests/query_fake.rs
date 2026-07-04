@@ -20,6 +20,7 @@
     reason = "test harness — expect/unwrap surface failures loudly; not production fallbacks"
 )]
 
+use bsql::{Date, Interval, Json, Jsonb, Numeric, Time, Timestamp, Timestamptz, Uuid};
 use bsql_postgres_async::DriverError;
 use bsql_testkit::{rows, FakePostgres};
 
@@ -27,6 +28,54 @@ use bsql_testkit::{rows, FakePostgres};
 bsql::query!(UsersByName, "SELECT id, name FROM users");
 // A query the fake will NOT script — to prove an unscripted `query!` is loud.
 bsql::query!(UnscriptedById, "SELECT id FROM users WHERE id = 999");
+
+// The FULL scalar type surface the compile-checked `query!` path decodes, as
+// literal casts (no table) so each record field types to the exact bsql-native
+// / primitive type. A single row scripted over the fake exercises every new
+// `FakeValue` variant's BINARY wire and asserts it decodes back to the exact
+// scripted value — the moat now covers uuid / numeric / temporal / json /
+// float / bytea, not just int / text / bool.
+bsql::query!(
+    AllTypes,
+    "SELECT \
+     '00000000-0000-0000-0000-000000000000'::uuid AS u, \
+     '3.14'::numeric AS n, \
+     '2000-01-01 00:00:01+00'::timestamptz AS tstz, \
+     '2000-01-01 00:00:02'::timestamp AS ts, \
+     '2000-02-29'::date AS d, \
+     '12:34:56.789012'::time AS tm, \
+     '1 year 2 mons 3 days 04:05:06'::interval AS iv, \
+     '{\"k\":1}'::json AS j, \
+     '[1,2,3]'::jsonb AS jb, \
+     1.5::float8 AS f8, \
+     2.5::float4 AS f4, \
+     '\\xDEADBEEF'::bytea AS by"
+);
+
+/// A recognizable uuid (not the SQL literal's value — the fake matches on the
+/// SQL TEXT and serves the scripted bytes, so the value is ours to choose).
+const WITNESS_UUID: [u8; 16] = [
+    0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
+];
+
+/// The one full-surface row the witness scripts. Each cell is a distinct
+/// bsql-native / primitive value; every `From<..> for FakeValue` is exercised.
+fn all_types_row() -> bsql_testkit::ScriptedRows {
+    rows![[
+        Uuid::from_bytes(WITNESS_UUID),
+        "3.14".parse::<Numeric>().expect("numeric parses"),
+        Timestamptz::from_micros(1_000_000),
+        Timestamp::from_micros(2_000_000),
+        Date::from_days(59), // 2000-02-29 (leap day)
+        Time::from_micros(45_296_789_012), // 12:34:56.789012
+        Interval::new(14, 3, 14_706_000_000), // 1 year 2 mons 3 days 04:05:06
+        Json::new(String::from(r#"{"k":1}"#)),
+        Jsonb::new(String::from("[1,2,3]")),
+        1.5_f64,
+        2.5_f32,
+        [0xDE_u8, 0xAD, 0xBE, 0xEF].as_slice(),
+    ]]
+}
 
 /// The flagship proof: a real `query!` decodes the fake's BINARY rows into the
 /// typed record, asserting the exact field values — no socket, no PostgreSQL.
@@ -200,4 +249,83 @@ fn unscripted_query_macro_is_a_loud_error_then_reuse_works_sync() {
         .expect("the reused connection runs the scripted query!");
     assert_eq!(one.id, 42);
     assert_eq!(one.name, "solo");
+}
+
+// ── the FULL scalar type surface over the fake, both drivers ────────────────
+
+/// The exact SQL the driver puts in the `Parse` message. Referencing
+/// `PREPARED.sql()` (rather than re-typing the literal) guarantees the fake's
+/// match key equals the driver's query byte-for-byte.
+fn all_types_sql() -> &'static str {
+    <AllTypesQuery as bsql::TypedQuery>::PREPARED.sql()
+}
+
+/// Assert every field of the OWNED full-surface record equals the scripted
+/// value — shared by the async + sync witnesses.
+fn assert_all_types_owned(r: &AllTypesOwned) {
+    assert_eq!(r.u, Uuid::from_bytes(WITNESS_UUID));
+    assert_eq!(r.n.to_string(), "3.14");
+    assert_eq!(r.tstz, Timestamptz::from_micros(1_000_000));
+    assert_eq!(r.ts, Timestamp::from_micros(2_000_000));
+    assert_eq!(r.d.to_string(), "2000-02-29");
+    assert_eq!(r.tm.to_string(), "12:34:56.789012");
+    assert_eq!(r.iv.to_string(), "1 year 2 mons 3 days 04:05:06");
+    assert_eq!(r.j.as_str(), r#"{"k":1}"#);
+    assert_eq!(r.jb.as_str(), "[1,2,3]");
+    assert_eq!(r.f8, 1.5);
+    assert_eq!(r.f4, 2.5);
+    assert_eq!(r.by, vec![0xDE_u8, 0xAD, 0xBE, 0xEF]);
+}
+
+/// The moat now covers the FULL scalar surface: a real `query!` over the fake
+/// decodes every new type (uuid / numeric / timestamptz / timestamp / date /
+/// time / interval / json / jsonb / float8 / float4 / bytea) from the fake's
+/// BINARY bytes into the typed record — the exact scripted value, no network.
+#[tokio::test]
+async fn query_macro_decodes_the_full_type_surface_over_the_fake() {
+    let mut fake = FakePostgres::new();
+    fake.on(all_types_sql()).returns(all_types_row());
+
+    let mut conn = fake.connect().await.expect("connect over the fake");
+    let result = conn
+        .query::<AllTypesQuery>(())
+        .await
+        .expect("run the full-surface query! over the fake");
+    assert_eq!(result.len(), 1);
+
+    // Borrowed, zero-copy decode: every field comes straight from the fake's
+    // binary cell bytes; `by` (bytea) aliases the prebuffer as `&[u8]`.
+    let row = result.iter().next().expect("one row").expect("row decodes");
+    assert_eq!(row.u, Uuid::from_bytes(WITNESS_UUID));
+    assert_eq!(row.n.to_string(), "3.14");
+    assert_eq!(row.tstz, Timestamptz::from_micros(1_000_000));
+    assert_eq!(row.ts, Timestamp::from_micros(2_000_000));
+    assert_eq!(row.d.to_string(), "2000-02-29");
+    assert_eq!(row.tm.to_string(), "12:34:56.789012");
+    assert_eq!(row.iv.to_string(), "1 year 2 mons 3 days 04:05:06");
+    assert_eq!(row.j.as_str(), r#"{"k":1}"#);
+    assert_eq!(row.jb.as_str(), "[1,2,3]");
+    assert_eq!(row.f8, 1.5);
+    assert_eq!(row.f4, 2.5);
+    assert_eq!(row.by, [0xDE_u8, 0xAD, 0xBE, 0xEF].as_slice());
+
+    // Owned twin: same values, outliving the prebuffer (`by` copies to Vec<u8>).
+    let owned = result.into_owned().expect("into_owned");
+    assert_all_types_owned(&owned[0]);
+}
+
+/// The sync twin: the same fake, the same script, the blocking driver.
+#[test]
+fn query_macro_decodes_the_full_type_surface_over_the_fake_sync() {
+    let mut fake = FakePostgres::new();
+    fake.on(all_types_sql()).returns(all_types_row());
+
+    let mut conn = fake.connect_sync().expect("connect over the fake (sync)");
+    let result = conn
+        .query::<AllTypesQuery>(())
+        .expect("run the full-surface query! over the fake (sync)");
+    assert_eq!(result.len(), 1);
+
+    let owned = result.into_owned().expect("into_owned");
+    assert_all_types_owned(&owned[0]);
 }

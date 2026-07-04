@@ -195,6 +195,7 @@ version = "0.1.0-alpha.0"
 dependencies = [
  "bsql-postgres-async",
  "bsql-postgres-core",
+ "bsql-postgres-proto",
  "bsql-postgres-sync",
  "tokio",
 ]
