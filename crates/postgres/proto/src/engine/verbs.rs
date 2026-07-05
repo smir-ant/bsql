@@ -98,7 +98,7 @@ use super::pump::{poll_once, pump_active_to_boundary, Boundary, SpuriousPending,
 use super::seams::{absurd, CommandStatus, Live, Never, NotifyStatus, Outcome, Transport};
 use super::{ActiveEngine, Engine, Phase, SendBuf};
 use crate::action::TxStatus;
-use crate::ident::{Ident, StmtName};
+use crate::ident::StmtName;
 use crate::params::ParamsWriter;
 use crate::prepared::{PreparedQuery, RowDecode};
 use crate::write_buf::{WriteBuf, WriteBufFull};
@@ -1337,35 +1337,6 @@ impl<'b, T: Transport> Engine<'b, T> {
                 Err(EngineError::UnexpectedSuspend)
             }
         }
-    }
-
-    /// Subscribe to a notification channel: `LISTEN <channel>` (`'Q'`). The
-    /// channel is a validated [`Ident`], so the name cannot inject SQL.
-    /// `B = Never`.
-    ///
-    /// # Errors
-    ///
-    /// As [`simple_query`](Self::simple_query).
-    pub async fn listen<S>(
-        &mut self,
-        live: Live<'b>,
-        channel: &Ident,
-        sink: S,
-    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
-    where
-        S: FnMut(Surface<'_>) -> ControlFlow<Never>,
-    {
-        let Self {
-            transport,
-            phase,
-            send_buf,
-            ..
-        } = self;
-        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        send_buf.reset();
-        enqueue_frame(send_buf, |wb| frames::build_listen(wb, channel.as_bytes()))?;
-        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
-        Ok(Outcome { live, status })
     }
 
     /// Receive the next asynchronous notification: a single pull that breaks on

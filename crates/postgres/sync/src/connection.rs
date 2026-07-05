@@ -34,7 +34,6 @@ use std::time::Duration;
 use bsql_postgres_core::driver::{
     lift_ca_roots_error, lift_conn_fail, lift_engine_error, lift_tls_error, Core, WireError,
 };
-use bsql_postgres_core::sql_ident;
 use bsql_postgres_core::tls::{self, TlsTransport, Wire};
 use bsql_postgres_core::{
     resolve_endpoint, validate_startup_params, ConnectConfig, DriverError, Endpoint, Notification,
@@ -787,11 +786,12 @@ impl Connection {
     where
         F: FnOnce(&mut CopyInWriter<'_>) -> Result<(), DriverError>,
     {
-        sql_ident::validate_table(table)?;
-        let sql = format!("COPY {table} FROM STDIN");
-        // Take the token and issue the COPY command. On a fault the token is
-        // dropped by `Core` — the connection is dead.
-        let live = drive_sync(engine::poll_once(self.core.copy_in_begin(&sql)))?;
+        // The table splice is validated ONCE, in `Core::copy_in_begin_table`
+        // (the single COPY-in splice site shared by both drivers): an
+        // injection-shaped table is a classified `DriverError::Config` there,
+        // never assembled into SQL. On a fault the token is dropped by `Core` —
+        // the connection is dead.
+        let live = drive_sync(engine::poll_once(self.core.copy_in_begin_table(table)))?;
         let body = {
             let mut writer = CopyInWriter {
                 core: &mut self.core,

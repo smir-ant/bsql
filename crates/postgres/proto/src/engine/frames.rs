@@ -266,21 +266,6 @@ pub(crate) fn build_bind_prepared<P: ParamsWriter>(
     }
 }
 
-/// `'Q'` `LISTEN <channel>` frame: `tag | len | "LISTEN " channel | NUL`.
-///
-/// The channel is a pre-validated identifier (the verb takes an
-/// [`Ident`](crate::ident::Ident)), so the assembled SQL cannot inject — there is
-/// no string interpolation of untrusted text.
-#[inline]
-pub(crate) fn build_listen(wb: &mut WriteBuf, channel: &[u8]) -> Result<(), WriteBufFull> {
-    wb.push_u8(TAG_QUERY.byte())?;
-    wb.with_length_prefix(|w| {
-        w.push_bytes(b"LISTEN ")?;
-        w.push_bytes(channel)?;
-        w.push_u8(0)
-    })
-}
-
 /// `'d'` CopyData frame header: `tag | len`, where `len` is self-inclusive
 /// (`4 + body_len`). The body bytes are queued separately onto the send buffer,
 /// so an oversize COPY chunk never needs to fit the bounded [`WriteBuf`].

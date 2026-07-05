@@ -36,7 +36,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::env::VarError;
 
-use bsql_postgres_core::{ConnectConfig, DriverError, sql_ident};
+use bsql_postgres_core::{ConnectConfig, DriverError, SafeIdent};
 
 // The async and sync drivers expose a `Connection` each; the harness composes
 // both, so each is imported under an explicit alias. `ConnectConfig`,
@@ -166,25 +166,28 @@ fn unique_schema_name(test_name: &str) -> String {
 
 /// Validate a generated schema name as a plain unquoted identifier — the tier-1
 /// injection guard applied before the name is spliced into DDL text (there is no
-/// parameterized form for a schema identifier). The name is injection-safe by
-/// construction, so a rejection here is a harness bug, not an expected path.
-/// Shared, so the guard is defined once for both harnesses.
-fn validate_schema_name(schema: &str) -> Result<(), HarnessError> {
-    sql_ident::validate_identifier(schema).map_err(HarnessError::SchemaName)
+/// parameterized form for a schema identifier). Returns the injection-safe
+/// [`SafeIdent`] the DDL builders splice from, so a raw `&str` can never reach
+/// the `CREATE`/`DROP SCHEMA` text: the type is the proof. The name is
+/// injection-safe by construction, so a rejection here is a harness bug, not an
+/// expected path. Shared, so the guard is defined once for both harnesses.
+fn validate_schema_name(schema: &str) -> Result<SafeIdent<'_>, HarnessError> {
+    SafeIdent::validate(schema).map_err(HarnessError::SchemaName)
 }
 
-/// The `DROP SCHEMA IF EXISTS <schema> CASCADE` DDL for `schema`. Shared string
-/// builder, so the async and sync harness splice the identical text — a fix to
-/// one cannot diverge from the other. `IF EXISTS` makes it idempotent (a
-/// double-drop, a never-created schema, or a leaked prior schema of the same
-/// name is not an error).
-fn drop_schema_ddl(schema: &str) -> String {
-    format!("DROP SCHEMA IF EXISTS {schema} CASCADE")
+/// The `DROP SCHEMA IF EXISTS <schema> CASCADE` DDL for a validated schema
+/// identifier. Shared string builder, so the async and sync harness splice the
+/// identical text — a fix to one cannot diverge from the other. `IF EXISTS`
+/// makes it idempotent (a double-drop, a never-created schema, or a leaked prior
+/// schema of the same name is not an error).
+fn drop_schema_ddl(schema: SafeIdent<'_>) -> String {
+    format!("DROP SCHEMA IF EXISTS {} CASCADE", schema.as_str())
 }
 
-/// The `CREATE SCHEMA <schema>` DDL for `schema`. Shared string builder.
-fn create_schema_ddl(schema: &str) -> String {
-    format!("CREATE SCHEMA {schema}")
+/// The `CREATE SCHEMA <schema>` DDL for a validated schema identifier. Shared
+/// string builder.
+fn create_schema_ddl(schema: SafeIdent<'_>) -> String {
+    format!("CREATE SCHEMA {}", schema.as_str())
 }
 
 /// Surface an unrecoverable harness condition as a loud panic. This is the
@@ -224,7 +227,7 @@ pub fn resolve_base_config(var: Result<String, VarError>) -> Result<ConnectConfi
 /// the same name (a crashed run whose teardown never ran, or an OS pid reused
 /// after the old process died) is dropped first, so `CREATE` is idempotent.
 async fn create_isolated_schema(admin: &mut AsyncConnection, schema: &str) -> Result<(), HarnessError> {
-    validate_schema_name(schema)?;
+    let schema = validate_schema_name(schema)?;
     admin.execute_sql(&drop_schema_ddl(schema)).await?;
     admin.execute_sql(&create_schema_ddl(schema)).await?;
     Ok(())
@@ -232,7 +235,7 @@ async fn create_isolated_schema(admin: &mut AsyncConnection, schema: &str) -> Re
 
 /// Drop the isolated schema (and everything in it) on the admin connection.
 async fn drop_isolated_schema(admin: &mut AsyncConnection, schema: &str) -> Result<(), HarnessError> {
-    validate_schema_name(schema)?;
+    let schema = validate_schema_name(schema)?;
     admin.execute_sql(&drop_schema_ddl(schema)).await?;
     Ok(())
 }
@@ -383,7 +386,7 @@ pub fn schema_exists(schema: &str) -> bool {
 /// the blocking twin of [`create_isolated_schema`]. Same shared validation and
 /// DDL; blocking calls instead of `.await`.
 fn create_isolated_schema_sync(admin: &mut SyncConnection, schema: &str) -> Result<(), HarnessError> {
-    validate_schema_name(schema)?;
+    let schema = validate_schema_name(schema)?;
     admin.execute_sql(&drop_schema_ddl(schema))?;
     admin.execute_sql(&create_schema_ddl(schema))?;
     Ok(())
@@ -392,7 +395,7 @@ fn create_isolated_schema_sync(admin: &mut SyncConnection, schema: &str) -> Resu
 /// Drop the isolated schema on the admin connection — the blocking twin of
 /// [`drop_isolated_schema`].
 fn drop_isolated_schema_sync(admin: &mut SyncConnection, schema: &str) -> Result<(), HarnessError> {
-    validate_schema_name(schema)?;
+    let schema = validate_schema_name(schema)?;
     admin.execute_sql(&drop_schema_ddl(schema))?;
     Ok(())
 }
@@ -562,7 +565,7 @@ mod tests {
             let name = unique_schema_name(test_name);
             assert!(name.len() <= MAX_SCHEMA_LEN, "{name:?} exceeds {MAX_SCHEMA_LEN} bytes");
             assert!(
-                sql_ident::validate_identifier(&name).is_ok(),
+                SafeIdent::validate(&name).is_ok(),
                 "{name:?} (from {test_name:?}) must be a valid unquoted identifier",
             );
             assert!(name.starts_with(SCHEMA_PREFIX), "{name:?} must carry the harness prefix");
@@ -580,9 +583,13 @@ mod tests {
     #[test]
     fn schema_ddl_is_built_from_the_validated_name() {
         // The shared DDL builders splice exactly the name, so the async and sync
-        // harnesses emit identical statements.
-        assert_eq!(drop_schema_ddl("s"), "DROP SCHEMA IF EXISTS s CASCADE");
-        assert_eq!(create_schema_ddl("s"), "CREATE SCHEMA s");
+        // harnesses emit identical statements. The builders take a `SafeIdent`,
+        // so an unvalidated `&str` cannot be spliced — the guard is structural.
+        let Ok(id) = SafeIdent::validate("s") else {
+            panic!("'s' is a valid unquoted identifier");
+        };
+        assert_eq!(drop_schema_ddl(id), "DROP SCHEMA IF EXISTS s CASCADE");
+        assert_eq!(create_schema_ddl(id), "CREATE SCHEMA s");
     }
 
     #[test]

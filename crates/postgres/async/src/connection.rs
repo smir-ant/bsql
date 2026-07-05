@@ -34,7 +34,6 @@ use tokio::time::Instant;
 use bsql_postgres_core::driver::{
     lift_ca_roots_error, lift_conn_fail, lift_engine_error, lift_tls_error, Core,
 };
-use bsql_postgres_core::sql_ident;
 use bsql_postgres_core::ssl::SslProbe;
 use bsql_postgres_core::tls::{self, TlsTransport, Wire};
 use bsql_postgres_core::{
@@ -848,11 +847,12 @@ impl Connection {
     where
         F: AsyncFnOnce(&mut CopyInWriter<'_>) -> Result<(), DriverError>,
     {
-        sql_ident::validate_table(table)?;
-        let sql = format!("COPY {table} FROM STDIN");
-        // Take the token and issue the COPY command. On a fault the token is
-        // dropped by `Core` — the connection is dead.
-        let live = self.core.copy_in_begin(&sql).await?;
+        // The table splice is validated ONCE, in `Core::copy_in_begin_table`
+        // (the single COPY-in splice site shared by both drivers): an
+        // injection-shaped table is a classified `DriverError::Config` there,
+        // never assembled into SQL. On a fault the token is dropped by `Core` —
+        // the connection is dead.
+        let live = self.core.copy_in_begin_table(table).await?;
         let body = {
             let mut writer = CopyInWriter {
                 core: &mut self.core,

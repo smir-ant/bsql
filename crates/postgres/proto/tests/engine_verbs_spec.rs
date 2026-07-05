@@ -1406,11 +1406,14 @@ fn copy_out_streams_each_chunk_then_completes() {
 
 #[test]
 fn listen_subscribes() {
+    // `LISTEN` has no special engine verb: the driver validates the channel into
+    // a `SafeIdent`, assembles `LISTEN <channel>`, and issues it through
+    // `simple_query`. This exercises that same wire (`'Q' | "LISTEN events" | NUL`).
     let script = concat(&[handshake(), command_complete("LISTEN"), rfq(b'I')]);
     let cap = run(script, |e, live| {
-        let chan = Ident::try_from_str("events").expect("chan");
         let mut cap = Cap::default();
-        let live = flatten(poll_once(e.listen(live, &chan, cap.sink()))).expect("listen");
+        let live =
+            flatten(poll_once(e.simple_query(live, "LISTEN events", cap.sink()))).expect("listen");
         let _ = live;
         cap
     });

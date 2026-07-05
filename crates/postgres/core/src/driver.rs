@@ -58,11 +58,11 @@ use bsql_postgres_proto::engine::{
 };
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
-    DecodeError, Ident, PreparedQuery, RowDecode, StmtName, TxStatus, TypedQuery,
+    DecodeError, PreparedQuery, RowDecode, StmtName, TxStatus, TypedQuery,
 };
 
 use crate::materialize::{self, ResultCollector};
-use crate::sql_ident;
+use crate::sql_ident::{self, SafeIdent, SafeTable};
 use crate::tls::{CaRootsError, TlsError, Wire};
 use crate::{
     capture_notify, DbError, DbErrorSink, DriverError, Notification, NotificationLedger,
@@ -942,20 +942,21 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         Ok(())
     }
 
-    /// Subscribe to a `LISTEN` channel. The name is validated as an unquoted
-    /// identifier BEFORE interpolation — an injection-shaped name is a classified
-    /// [`DriverError::Config`], never spliced into SQL.
+    /// Subscribe to a `LISTEN` channel. The name is validated into a
+    /// [`SafeIdent`] — the injection-safe type the SQL is assembled from — so an
+    /// injection-shaped name is a classified [`DriverError::Config`] and CANNOT
+    /// reach the interpolated SQL. The `SafeIdent` (not a raw `&str`) is the
+    /// splice currency, so the "cannot inject" guarantee is structural: the type
+    /// is the proof.
     pub async fn listen(&mut self, channel: &str) -> Result<(), DriverError> {
-        sql_ident::validate_identifier(channel)?;
-        let channel =
-            Ident::try_from_str(channel).map_err(|_| DriverError::Config("invalid channel name"))?;
+        let sql = sql_ident::listen_sql(SafeIdent::validate(channel)?);
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .listen(
+            .simple_query(
                 live,
-                &channel,
+                &sql,
                 capture_notify(&mut self.notifications, |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
@@ -965,14 +966,11 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         self.settle(outcome, &mut collector)
     }
 
-    /// Unsubscribe from a `LISTEN` channel. The name is validated as an unquoted
-    /// identifier BEFORE interpolation (see [`listen`](Self::listen)).
+    /// Unsubscribe from a `LISTEN` channel. The name is validated into a
+    /// [`SafeIdent`] before interpolation (see [`listen`](Self::listen)).
     pub async fn unlisten(&mut self, channel: &str) -> Result<(), DriverError> {
-        sql_ident::validate_identifier(channel)?;
-        let channel =
-            Ident::try_from_str(channel).map_err(|_| DriverError::Config("invalid channel name"))?;
-        self.simple_query(&format!("UNLISTEN {}", channel.as_str()))
-            .await?;
+        let sql = sql_ident::unlisten_sql(SafeIdent::validate(channel)?);
+        self.simple_query(&sql).await?;
         Ok(())
     }
 
@@ -1023,8 +1021,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     where
         F: for<'q> FnMut(&'q [u8]) -> ControlFlow<E>,
     {
-        sql_ident::validate_table(table)?;
-        let sql = format!("COPY {table} TO STDOUT");
+        let sql = sql_ident::copy_out_sql(SafeTable::validate(table)?);
         let live = self.take_live()?;
         let mut db_error: Option<DbError> = None;
         let outcome = self
@@ -1073,11 +1070,29 @@ impl<S: Transport<Error = io::Error>> Core<S> {
 
     // ── COPY IN seam (the per-driver `copy_in_with` orchestrates these) ──────
 
-    /// Begin `COPY <sql> FROM STDIN`: take the liveness token, issue the COPY
-    /// command, and hand the token BACK to the caller to hold across the
-    /// (token-less) streaming writes. On a transport fault the token is dropped —
-    /// the connection is dead. `#[doc(hidden)]`: the per-driver `copy_in_with`
-    /// seam, not a public verb.
+    /// Begin `COPY <table> FROM STDIN`: validate `table` into a [`SafeTable`],
+    /// assemble the injection-safe SQL, and issue the COPY. This is the SINGLE
+    /// splice site for the COPY-in table name — both drivers' `copy_in_with`
+    /// route through it, so the table identifier is validated in exactly one
+    /// place and an injection-shaped name is a classified [`DriverError::Config`]
+    /// that never reaches the wire. `#[doc(hidden)]`: the per-driver
+    /// `copy_in_with` seam, not a public verb.
+    #[doc(hidden)]
+    pub async fn copy_in_begin_table(
+        &mut self,
+        table: &str,
+    ) -> Result<Live<'static>, DriverError> {
+        let sql = sql_ident::copy_in_sql(SafeTable::validate(table)?);
+        self.copy_in_begin(&sql).await
+    }
+
+    /// Begin `COPY <sql> FROM STDIN` from an already-assembled statement: take
+    /// the liveness token, issue the COPY command, and hand the token BACK to the
+    /// caller to hold across the (token-less) streaming writes. On a transport
+    /// fault the token is dropped — the connection is dead. Takes the full SQL
+    /// (the table splice is the caller's responsibility via
+    /// [`copy_in_begin_table`](Self::copy_in_begin_table), the single validated
+    /// entry). `#[doc(hidden)]`.
     #[doc(hidden)]
     pub async fn copy_in_begin(&mut self, sql: &str) -> Result<Live<'static>, DriverError> {
         let live = self.take_live()?;
