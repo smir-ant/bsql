@@ -56,20 +56,28 @@ use alloc::string::String;
 
 use super::{ActiveEngine, AuthEvent, IngestBuf, IngestCommitOverflow, IngestFull, SendBuf};
 use crate::action::TxStatus;
-use crate::ident::{DatabaseName, Ident, PodBytes};
+use crate::ident::{DatabaseName, Ident};
+// `PodBytes` backs the SCRAM session's reused nonce/message leaves — SCRAM-only.
+#[cfg(feature = "scram")]
+use crate::ident::PodBytes;
 use crate::md5::Md5HandshakeState;
 use crate::password::{Credentials, Password};
 use crate::startup::StartupParam;
+#[cfg(feature = "scram")]
 use crate::scram::session::ScramSession;
+#[cfg(feature = "scram")]
 use crate::scram::types::SecretDigest;
+#[cfg(feature = "scram")]
 use crate::scram::wire::{ScramError, ScramFailureClass};
 use crate::sensitive::Sensitive;
 use crate::state::ConnectingState;
 use crate::wire::{
-    AuthSubCode, InboundTag, PROTOCOL_VERSION_3_0, SCRAM_SHA_256_MECHANISM, TAG_AUTHENTICATION,
-    TAG_BACKEND_KEY_DATA, TAG_ERROR_RESPONSE, TAG_PARAMETER_STATUS, TAG_READY_FOR_QUERY,
-    TAG_SASL_RESPONSE,
+    AuthSubCode, InboundTag, PROTOCOL_VERSION_3_0, TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA,
+    TAG_ERROR_RESPONSE, TAG_PARAMETER_STATUS, TAG_READY_FOR_QUERY, TAG_SASL_RESPONSE,
 };
+// The advertised SASL mechanism name — matched only by the SCRAM dispatch.
+#[cfg(feature = "scram")]
+use crate::wire::SCRAM_SHA_256_MECHANISM;
 use crate::write_buf::{WriteBuf, WriteBufFull};
 
 // ===========================================================================
@@ -106,11 +114,15 @@ pub enum ConnFail {
     /// transaction-status byte.
     MalformedReadyForQuery,
     /// A SCRAM-SHA-256 exchange failure, carrying the leaf classification.
+    /// Present only under the default-on `scram` feature — with SCRAM off no
+    /// SCRAM exchange is compiled, so this class can never be produced.
+    #[cfg(feature = "scram")]
     Scram(ScramFailureClass),
     /// The outbound auth response did not fit the bounded write buffer.
     BufferOverflow,
 }
 
+#[cfg(feature = "scram")]
 impl ConnFail {
     /// Collapse a leaf [`ScramError`] into the classified SCRAM failure,
     /// discarding the optional inline text (the connecting surface keeps only
@@ -121,9 +133,14 @@ impl ConnFail {
     }
 }
 
-// The widest variant is `Scram(ScramFailureClass)`; the `UnexpectedFrame { tag }`
-// u8 and the unit causes ride the discriminant → 8 B, align 4.
+// With SCRAM on the widest variant is `Scram(ScramFailureClass)` (`UnexpectedFrame
+// { tag }`'s u8 and the unit causes ride the discriminant) → 8 B, align 4. With
+// SCRAM off the widest payload is `UnexpectedFrame { tag: u8 }`, so the enum
+// shrinks to a 1-byte tag + 1-byte discriminant → 2 B, align 1.
+#[cfg(feature = "scram")]
 crate::wire_pin!(ConnFail, size = 8, align = 4);
+#[cfg(not(feature = "scram"))]
+crate::wire_pin!(ConnFail, size = 2, align = 1);
 
 // ===========================================================================
 // Engine phase + dispatch outcome
@@ -175,7 +192,8 @@ enum ConnEvent {
         /// The server-chosen 4-byte salt.
         salt: [u8; 4],
     },
-    /// SASL continuation — lend the server's challenge frame body.
+    /// SASL continuation — lend the server's challenge frame body. SCRAM-only.
+    #[cfg(feature = "scram")]
     SaslContinue,
     /// A `ParameterStatus` report — lend the raw key/value payload.
     ParamStatus,
@@ -198,6 +216,7 @@ enum DriveOutcome {
     Cleartext,
     Md5 { salt: [u8; 4] },
     ProtoFail(ConnFail),
+    #[cfg(feature = "scram")]
     SaslContinue { start: usize, end: usize },
     ParamStatus { start: usize, end: usize },
     ServerFail { start: usize, end: usize },
@@ -224,9 +243,13 @@ pub(crate) enum HandshakeProgress {
     Failed(ConnFail),
 }
 
-// `pub(crate)` pump-facing surface. Widest variant is `Failed(ConnFail)` (8/4);
-// the four unit steps ride the discriminant.
+// `pub(crate)` pump-facing surface. Widest variant is `Failed(ConnFail)`; the
+// four unit steps ride the discriminant. `ConnFail` is 8 B/4 with SCRAM on and
+// 2 B/1 with SCRAM off, so this shrinks in lock-step.
+#[cfg(feature = "scram")]
 crate::wire_pin!(HandshakeProgress, size = 8, align = 4);
+#[cfg(not(feature = "scram"))]
+crate::wire_pin!(HandshakeProgress, size = 2, align = 1);
 
 #[inline]
 fn advance(state: ConnectingState) -> ConnDispatch {
@@ -348,6 +371,7 @@ impl ConnectingEngine {
         // and no reply id is threaded.
         let state = match credentials {
             Credentials::Trust => ConnectingState::StartupTrust,
+            #[cfg(feature = "scram")]
             Credentials::ScramPassword(password) => ConnectingState::StartupScram {
                 scram: Box::new(ScramSession::from_password(password)),
             },
@@ -395,9 +419,11 @@ impl ConnectingEngine {
         match self.drive_to_event(send_buf) {
             DriveOutcome::NeedMore => HandshakeProgress::NeedMore,
             DriveOutcome::Ready => HandshakeProgress::Ready,
-            DriveOutcome::Cleartext
-            | DriveOutcome::Md5 { .. }
-            | DriveOutcome::SaslContinue { .. } => HandshakeProgress::AuthResponse,
+            DriveOutcome::Cleartext | DriveOutcome::Md5 { .. } => {
+                HandshakeProgress::AuthResponse
+            }
+            #[cfg(feature = "scram")]
+            DriveOutcome::SaslContinue { .. } => HandshakeProgress::AuthResponse,
             DriveOutcome::ParamStatus { .. } => HandshakeProgress::ParamStatus,
             DriveOutcome::ProtoFail(reason) => HandshakeProgress::Failed(reason),
             // A server `ErrorResponse` during connect — the cause is fixed.
@@ -427,6 +453,7 @@ impl ConnectingEngine {
             DriveOutcome::Cleartext => AuthEvent::AuthCleartext,
             DriveOutcome::Md5 { salt } => AuthEvent::AuthMd5 { salt },
             DriveOutcome::ProtoFail(_) => AuthEvent::Fail(&[]),
+            #[cfg(feature = "scram")]
             DriveOutcome::SaslContinue { start, end } => {
                 AuthEvent::AuthSaslContinue(self.ingest.frame_body(start, end))
             }
@@ -505,6 +532,7 @@ impl ConnectingEngine {
                 ConnEvent::Silent => continue,
                 ConnEvent::Cleartext => return DriveOutcome::Cleartext,
                 ConnEvent::Md5 { salt } => return DriveOutcome::Md5 { salt },
+                #[cfg(feature = "scram")]
                 ConnEvent::SaslContinue => return DriveOutcome::SaslContinue { start, end },
                 ConnEvent::ParamStatus => {
                     // Capture `server_version` from the GUC key/value before the
@@ -654,6 +682,7 @@ fn build_md5_password_message(
 /// Build the `SASLInitialResponse`, reusing the SCRAM nonce/message leaves and
 /// populating the session's `client_first_bare` / `client_nonce_b64` in place
 /// (the single `Box<ScramSession>` is reused across the next transition).
+#[cfg(feature = "scram")]
 fn build_sasl_initial_response(
     write: &mut WriteBuf,
     scram: &mut ScramSession,
@@ -692,6 +721,7 @@ fn build_sasl_initial_response(
 /// computation, and return the expected server signature for the final
 /// verification step. `server_first` is the server-first-message body (the
 /// auth frame payload after the 4-byte sub-code).
+#[cfg(feature = "scram")]
 fn build_sasl_response(
     write: &mut WriteBuf,
     scram: &ScramSession,
@@ -791,6 +821,7 @@ fn parse_rfq_tx_status(payload: &[u8]) -> Option<TxStatus> {
 
 /// Does the SASL mechanism list advertise `SCRAM-SHA-256`? Mirror of the live
 /// dispatcher's fast-path + NUL-split fallback.
+#[cfg(feature = "scram")]
 fn mechanism_list_contains_scram(data: &[u8]) -> bool {
     if let Some(rest) = data.strip_prefix(SCRAM_SHA_256_MECHANISM)
         && let Some(&0) = rest.first()
@@ -825,15 +856,19 @@ fn dispatch_connecting(
             dispatch_startup_md5(handshake, tag, payload, write)
         }
         ConnectingState::Md5AwaitingAuthOk => dispatch_await_auth_ok(tag, payload),
+        #[cfg(feature = "scram")]
         ConnectingState::StartupScram { scram } => {
             dispatch_startup_scram(scram, tag, payload, write)
         }
+        #[cfg(feature = "scram")]
         ConnectingState::ScramAwaitingServerFirst { scram } => {
             dispatch_scram_server_first(scram, tag, payload, write)
         }
+        #[cfg(feature = "scram")]
         ConnectingState::ScramAwaitingServerFinal {
             expected_server_sig,
         } => dispatch_scram_server_final(*expected_server_sig, tag, payload),
+        #[cfg(feature = "scram")]
         ConnectingState::ScramAwaitingAuthOk => dispatch_await_auth_ok(tag, payload),
         ConnectingState::PostAuthAwaitingKey => dispatch_post_auth_awaiting_key(tag, payload),
         ConnectingState::PostAuthHaveKey { pid, secret_key } => {
@@ -949,6 +984,7 @@ fn dispatch_startup_md5(
     }
 }
 
+#[cfg(feature = "scram")]
 fn dispatch_startup_scram(
     mut scram: Box<ScramSession>,
     tag: InboundTag,
@@ -987,6 +1023,7 @@ fn dispatch_startup_scram(
     }
 }
 
+#[cfg(feature = "scram")]
 fn dispatch_scram_server_first(
     scram: Box<ScramSession>,
     tag: InboundTag,
@@ -1024,6 +1061,7 @@ fn dispatch_scram_server_first(
     }
 }
 
+#[cfg(feature = "scram")]
 fn dispatch_scram_server_final(
     expected_server_sig: SecretDigest,
     tag: InboundTag,

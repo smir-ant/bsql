@@ -199,7 +199,10 @@ pub enum Credentials {
     /// Password-based authentication (SCRAM-SHA-256).
     ///
     /// The password is wrapped in [`Sensitive`] for zero-on-drop and
-    /// debug redaction.
+    /// debug redaction. Present only under the default-on `scram` feature — with
+    /// SCRAM off the crypto is not compiled, so this credential cannot be built
+    /// (a driver given a password then fails LOUD at connect).
+    #[cfg(feature = "scram")]
     ScramPassword(Sensitive<Password>),
     /// Cleartext password authentication (PG `AuthenticationCleartextPassword`,
     /// sub-code 3).
@@ -264,6 +267,7 @@ impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Trust => f.write_str("Credentials::Trust"),
+            #[cfg(feature = "scram")]
             Self::ScramPassword(_) => f.write_str("Credentials::ScramPassword(<REDACTED>)"),
             Self::CleartextPassword(_) => {
                 f.write_str("Credentials::CleartextPassword(<REDACTED>)")

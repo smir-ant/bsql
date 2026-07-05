@@ -315,13 +315,19 @@ impl CrateZeroizeSecret for crate::password::Password {}
 
 // `bsql-pg-proto::scram::session::ScramSession` — `derive(Zeroize,
 // ZeroizeOnDrop)` at `scram/session.rs:89`. Carries
-// `Sensitive<Password>` + 2× skip-zeroized `PodBytes`.
+// `Sensitive<Password>` + 2× skip-zeroized `PodBytes`. Present only under the
+// `scram` feature — with SCRAM off the type does not exist.
+#[cfg(feature = "scram")]
 impl sealed::Sealed for crate::scram::session::ScramSession {}
+#[cfg(feature = "scram")]
 impl CrateZeroizeSecret for crate::scram::session::ScramSession {}
 
 // `bsql-pg-proto::scram::types::SecretDigest` — `derive(Zeroize,
-// ZeroizeOnDrop)` at `scram/types.rs:22`. Backing `[u8; 32]`.
+// ZeroizeOnDrop)` at `scram/types.rs:22`. Backing `[u8; 32]`. Present only under
+// the `scram` feature.
+#[cfg(feature = "scram")]
 impl sealed::Sealed for crate::scram::types::SecretDigest {}
+#[cfg(feature = "scram")]
 impl CrateZeroizeSecret for crate::scram::types::SecretDigest {}
 
 // `bsql-pg-proto::sensitive::Sensitive<T>` — `derive(Zeroize,

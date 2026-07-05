@@ -145,9 +145,13 @@ pub enum HandshakeOutcome {
     Failed(ConnFail),
 }
 
-// One fat-niche enum over `ConnFail` (its 8/4 footprint dominates); the four
-// unit outcomes ride the discriminant.
+// One fat-niche enum over `ConnFail` (its footprint dominates); the unit
+// outcomes ride the discriminant. `ConnFail` is 8 B/4 with SCRAM on and 2 B/1
+// with SCRAM off, so this shrinks in lock-step.
+#[cfg(feature = "scram")]
 crate::wire_pin!(HandshakeOutcome, size = 8, align = 4);
+#[cfg(not(feature = "scram"))]
+crate::wire_pin!(HandshakeOutcome, size = 2, align = 1);
 
 /// One surfaceable active-phase event, lent to the pump's sink and consumed
 /// within that call — the borrow never escapes the sink invocation, which is

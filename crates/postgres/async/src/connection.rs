@@ -54,8 +54,11 @@ use bsql_postgres_core::{
 use bsql_postgres_proto::engine;
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
-    Credentials, DatabaseName, Ident, Password, PreparedQuery, RowDecode, Sensitive, TypedQuery,
+    Credentials, DatabaseName, Ident, PreparedQuery, RowDecode, TypedQuery,
 };
+// `Password` / `Sensitive` build a `Credentials::ScramPassword` — SCRAM-only.
+#[cfg(feature = "scram")]
+use bsql_postgres_proto::{Password, Sensitive};
 
 use crate::transport::{ReadDeadline, Sock, TokioSocket};
 
@@ -203,10 +206,23 @@ impl Connection {
             None => None,
         };
         let credentials = match config.password_str() {
+            // Password auth is SCRAM-SHA-256 only; with the `scram` feature off
+            // there is no client mechanism to satisfy it, so a supplied password
+            // is a FAIL-LOUD config error at connect — never a silent Trust
+            // attempt (which the server would reject anyway) or a panic.
+            #[cfg(feature = "scram")]
             Some(pw) => {
                 let password = Password::try_from_str(pw)
                     .map_err(|_| DriverError::Config("invalid password"))?;
                 Credentials::ScramPassword(Sensitive::new(password))
+            }
+            #[cfg(not(feature = "scram"))]
+            Some(_) => {
+                return Err(DriverError::Config(
+                    "password authentication needs the `scram` feature \
+                     (SCRAM-SHA-256 support is not compiled in) — enable `scram`, \
+                     or use a trust/peer-authenticated connection",
+                ));
             }
             None => Credentials::Trust,
         };

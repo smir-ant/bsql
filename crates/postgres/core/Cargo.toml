@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 # roots are the out-of-the-box encrypted transport; a localhost / unix-socket /
 # trust-auth deployment that never does TLS drops the ENTIRE ring/rustls subtree
 # with `default-features = false`.
-default = ["tls", "webpki-roots"]
+default = ["tls", "webpki-roots", "scram"]
 
 # `tls` — the rustls-backed encrypted transport: the whole `tls` module
 # (`TlsTransport`, `shared_client_config`, the custom-CA parsers), the `ssl`
@@ -59,8 +59,19 @@ testkit = []
 # no external crate). Both drivers turn this on through their own `n1-detect`.
 n1-detect = []
 
+# `scram` — forward the sans-IO kernel's default-on SCRAM-SHA-256 authentication.
+# DEFAULT-ON. With it OFF the SCRAM-exclusive crypto crates (`sha2`, `hmac`,
+# `pbkdf2`, `base64ct`, `cpufeatures`) leave the runtime graph; a password-bearing
+# connect then fails LOUD at the driver, and Trust auth still works. Forwards to
+# `bsql-postgres-proto` only — this crate pulls no extra dependency of its own.
+scram = ["bsql-postgres-proto/scram"]
+
 [dependencies]
-bsql-postgres-proto = { path = "../proto" }
+# `default-features = false` so this crate (and the drivers/umbrella above it) can
+# DROP proto's default-on `scram` feature; the SCRAM crypto is re-enabled through
+# the `scram` feature above. Without this, proto's default would force SCRAM on
+# for the whole graph, defeating the drop.
+bsql-postgres-proto = { path = "../proto", default-features = false }
 # `rustls` — OPTIONAL, behind the default-on `tls` feature. The pure-Rust TLS
 # stack (ring provider) the `tls` / `ssl` modules build on. With `tls` OFF the
 # whole rustls + ring subtree is neither resolved into a runtime graph nor

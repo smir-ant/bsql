@@ -21,7 +21,36 @@ autobenches = false
 # blocking ad-hoc test — identically. See reforge.md §7.1, §13.
 
 [features]
-default = []
+# DEFAULT-ON `scram`. The standard `cargo build/test -p bsql-postgres-proto`
+# and `cargo test --workspace` (which use each crate's default features) keep the
+# full SCRAM-SHA-256 handshake + its safety-critical zeroize/fuzz coverage. A
+# consumer drops it through the driver chain (each shipped dependent takes proto
+# with `default-features = false` and forwards this feature), so a
+# `--no-default-features` build carries no SCRAM crypto.
+default = ["scram"]
+
+# `scram` — SCRAM-SHA-256 authentication (RFC 5802 / 7677): the whole `scram`
+# module (the RustCrypto composition), the `Credentials::ScramPassword` variant,
+# the four connecting-state SCRAM variants + their dispatch, the `ConnFail::Scram`
+# leaf class, and the SCRAM secret-zeroization drop witnesses. DEFAULT-ON. With it
+# OFF the SCRAM-EXCLUSIVE crypto crates — `sha2`, `hmac`, `pbkdf2`, `base64ct`,
+# `cpufeatures` (a `sha2` edge) — drop from the runtime graph (`md-5`, kept
+# unconditional for MD5 auth, keeps the shared `digest`/`subtle`/`generic-array`
+# stack alive, so ONLY these SCRAM-only crates drop — not the audit's optimistic
+# ~12). `getrandom` drops only when `tls` is also off (rustls/ring keeps it).
+# Trust auth still works OFF; a driver given a password with SCRAM off fails LOUD
+# at connect (`DriverError::Config`), and a Trust client hitting a SCRAM-demanding
+# server already fails with `ConnFail::UnsupportedAuthMethod` — never a panic or a
+# silent auth failure. Optional deps → the golden lock is unchanged (Cargo.lock
+# unions all optional deps; `deps_pin` stays green).
+scram = [
+    "dep:sha2",
+    "dep:hmac",
+    "dep:pbkdf2",
+    "dep:base64ct",
+    "dep:subtle",
+    "dep:getrandom",
+]
 
 # No `bench-hooks` feature. A naive shape would gate `#[doc(hidden)] pub fn`
 # test/bench hooks behind a cargo feature that downstream users could enable in
@@ -34,20 +63,26 @@ default = []
 
 [dependencies]
 heapless = { workspace = true }
-sha2 = { workspace = true }
+# SCRAM-SHA-256 crypto — OPTIONAL, behind the default-on `scram` feature. Each is
+# named only by the `scram`-gated `scram` module, so with SCRAM off they leave the
+# runtime graph. `md-5` (below) is UNCONDITIONAL (MD5 auth) and keeps the shared
+# `digest`/`generic-array`/`subtle` stack resolved, so `subtle` stays in the lock
+# even when its only DIRECT edge (SCRAM's `ConstantTimeEq`) is gated out.
+sha2 = { workspace = true, optional = true }
 md-5 = { workspace = true }
-hmac = { workspace = true }
-pbkdf2 = { workspace = true }
-base64ct = { workspace = true }
-subtle = { workspace = true }
+hmac = { workspace = true, optional = true }
+pbkdf2 = { workspace = true, optional = true }
+base64ct = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
 zeroize = { workspace = true }
 simdutf8 = { workspace = true }
 
-# `getrandom` is a dev/test dependency for deterministic nonce
-# injection in tests. Production nonce generation uses it too, but
-# behind a cfg — the no_std, no_alloc contract is preserved because
-# getrandom provides OS entropy via a thin syscall wrapper.
-getrandom = { workspace = true }
+# `getrandom` — OS entropy for the SCRAM client nonce (never `SystemTime`-seeded).
+# OPTIONAL, behind the default-on `scram` feature: SCRAM is its only proto use, so
+# with SCRAM off it leaves the runtime graph (unless `tls` keeps it via rustls/
+# ring). The no_std / no_alloc contract holds — getrandom is a thin syscall
+# wrapper over OS entropy.
+getrandom = { workspace = true, optional = true }
 
 # `panic = "abort"` is set at the workspace level for `release` so
 # unwinding cannot occur in production. The forbid-bundle in

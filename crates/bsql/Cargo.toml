@@ -7,7 +7,7 @@ description = "Multi-backend SQL toolkit — PostgreSQL and SQLite"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = ["postgres-async", "postgres-sync", "sqlite", "tls", "webpki-roots"]
+default = ["postgres-async", "postgres-sync", "sqlite", "tls", "webpki-roots", "scram"]
 postgres-async = ["dep:bsql-postgres-async"]
 postgres-sync = ["dep:bsql-postgres-sync"]
 sqlite = ["dep:bsql-sqlite"]
@@ -35,6 +35,14 @@ tls = ["bsql-postgres-async?/tls", "bsql-postgres-sync?/tls"]
 # With no baked roots and no custom CA, a TLS connect fails CLOSED at the
 # handshake, never a silent plaintext downgrade.
 webpki-roots = ["tls", "bsql-postgres-async?/webpki-roots", "bsql-postgres-sync?/webpki-roots"]
+
+# `scram` — SCRAM-SHA-256 authentication, DEFAULT-ON. Forwards to whichever
+# PostgreSQL driver(s) are enabled (the `?` activates it ONLY on an already-enabled
+# driver). With it OFF (`default-features = false` and not re-listed) the
+# SCRAM-exclusive crypto crates (`sha2`, `hmac`, `pbkdf2`, `base64ct`,
+# `cpufeatures`) leave the runtime graph; a password-bearing connect then fails
+# LOUD (`DriverError::Config`), and Trust auth still works. SQLite is unaffected.
+scram = ["bsql-postgres-async?/scram", "bsql-postgres-sync?/scram"]
 
 # `n1-detect` — turn on the diagnostics-only N+1 query detector on whichever
 # PostgreSQL driver(s) are enabled (`conn.n1_report()`). OFF by default: a

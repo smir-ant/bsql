@@ -14,7 +14,9 @@
 //! the current variant *is* the correlation — and no id is threaded.
 
 use crate::error::StateErrorKind;
+#[cfg(feature = "scram")]
 use crate::scram::session::ScramSession;
+#[cfg(feature = "scram")]
 use crate::scram::types::SecretDigest;
 
 /// State space reachable during the PostgreSQL connection handshake.
@@ -51,15 +53,19 @@ pub enum ConnectingState {
         handshake: alloc::boxed::Box<crate::md5::Md5HandshakeState>,
     },
     Md5AwaitingAuthOk,
+    #[cfg(feature = "scram")]
     StartupScram {
         scram: alloc::boxed::Box<ScramSession>,
     },
+    #[cfg(feature = "scram")]
     ScramAwaitingServerFirst {
         scram: alloc::boxed::Box<ScramSession>,
     },
+    #[cfg(feature = "scram")]
     ScramAwaitingServerFinal {
         expected_server_sig: alloc::boxed::Box<SecretDigest>,
     },
+    #[cfg(feature = "scram")]
     ScramAwaitingAuthOk,
     PostAuthAwaitingKey,
     PostAuthHaveKey {
@@ -105,15 +111,19 @@ impl core::fmt::Debug for ConnectingState {
             Self::Md5AwaitingAuthOk => {
                 write!(f, "Md5AwaitingAuthOk")
             }
+            #[cfg(feature = "scram")]
             Self::StartupScram { .. } => f
                 .debug_struct("StartupScram")
                 .finish_non_exhaustive(),
+            #[cfg(feature = "scram")]
             Self::ScramAwaitingServerFirst { .. } => f
                 .debug_struct("ScramAwaitingServerFirst")
                 .finish_non_exhaustive(),
+            #[cfg(feature = "scram")]
             Self::ScramAwaitingServerFinal { .. } => f
                 .debug_struct("ScramAwaitingServerFinal")
                 .finish_non_exhaustive(),
+            #[cfg(feature = "scram")]
             Self::ScramAwaitingAuthOk => {
                 write!(f, "ScramAwaitingAuthOk")
             }

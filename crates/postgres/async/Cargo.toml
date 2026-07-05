@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 # DEFAULT-ON. Forwards the core's `tls` + baked-Mozilla-roots defaults; a
 # localhost / unix-socket / trust-auth deployment drops the ENTIRE ring/rustls
 # subtree with `default-features = false`.
-default = ["tls", "webpki-roots"]
+default = ["tls", "webpki-roots", "scram"]
 
 # `tls` — forward the core's default-on rustls-backed encrypted transport. With
 # it OFF (`default-features = false`) the whole ring/rustls subtree is dropped
@@ -45,12 +45,22 @@ testkit = ["bsql-postgres-core/testkit"]
 # external dependency.
 n1-detect = ["bsql-postgres-core/n1-detect"]
 
+# `scram` — forward the default-on SCRAM-SHA-256 authentication. DEFAULT-ON. With
+# it OFF the SCRAM-exclusive crypto crates leave the runtime graph; a
+# password-bearing connect then fails LOUD (`DriverError::Config`) at
+# `Self::connect`, and Trust auth still works. Forwards to core only — no extra
+# direct dependency.
+scram = ["bsql-postgres-core/scram"]
+
 [dependencies]
 # `default-features = false` so the umbrella (and any consumer) can drop core's
 # default-on `webpki-roots` (the baked Mozilla CA blob); the driver re-exposes it
 # through its own default-on `webpki-roots` feature above.
 bsql-postgres-core = { path = "../core", default-features = false }
-bsql-postgres-proto = { path = "../proto" }
+# `default-features = false` so proto's default-on `scram` is droppable through
+# the chain (re-enabled via the `scram` feature above); without it proto's default
+# would force SCRAM on for the whole graph.
+bsql-postgres-proto = { path = "../proto", default-features = false }
 # LIB feature set is the minimal I/O surface the driver compiles against:
 # `net` (TcpStream), `io-util` (Async{Read,Write}Ext), `time` (timeouts +
 # the recv_notification read deadline), `sync` (the pool's Semaphore/Mutex).

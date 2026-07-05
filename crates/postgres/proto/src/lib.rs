@@ -169,6 +169,12 @@ pub mod prepared;
 // frame the active engine reads.
 pub mod command_tag;
 
+// SCRAM-SHA-256 authentication (RFC 5802 / 7677), composed over RustCrypto.
+// Behind the default-on `scram` feature: with it off the SCRAM-exclusive crypto
+// crates leave the build, `Credentials::ScramPassword` and the connecting-state
+// SCRAM variants do not exist, and a Trust connection is the only password-free
+// path (a password with SCRAM off fails loud at the driver).
+#[cfg(feature = "scram")]
 pub mod scram;
 // Test-only `DropCounter` machinery + sealed `CrateZeroizeSecret`
 // manifest. The exhaustiveness gate fails build-time if the
@@ -254,14 +260,18 @@ const _: fn() = || {
     assert_send::<password::Password>();
     assert_send::<password::Credentials>();
     assert_send::<write_buf::WriteBuf>();
+    #[cfg(feature = "scram")]
     assert_send::<scram::types::SecretDigest>();
+    #[cfg(feature = "scram")]
     assert_send::<scram::types::CappedServerNonce>();
     // Typestate wrappers.
+    #[cfg(feature = "scram")]
     assert_send::<scram::session::ScramSession>();
     assert_send::<sensitive::Sensitive<password::Password>>();
     // Error sentinels — small Copy-like types that must stay Send so
     // that Result<T, E> returned across a task boundary compiles.
     assert_send::<write_buf::WriteBufFull>();
+    #[cfg(feature = "scram")]
     assert_send::<scram::types::ServerNonceTooLong>();
     assert_send::<ident::IdentError>();
     assert_send::<password::PasswordError>();
@@ -383,10 +393,12 @@ const _: () = assert!(
     core::mem::needs_drop::<password::Password>(),
     "Password must have Drop for zeroize-on-drop (secret scrub)",
 );
+#[cfg(feature = "scram")]
 const _: () = assert!(
     core::mem::needs_drop::<scram::types::SecretDigest>(),
     "SecretDigest must have Drop for zeroize-on-drop",
 );
+#[cfg(feature = "scram")]
 const _: () = assert!(
     core::mem::needs_drop::<scram::session::ScramSession>(),
     "ScramSession owns Sensitive<Password> — must Drop so the inner zeroize fires",
@@ -411,6 +423,7 @@ const _: () = assert!(
     !core::mem::needs_drop::<write_buf::WriteBufFull>(),
     "WriteBufFull must stay drop-free — error sentinel",
 );
+#[cfg(feature = "scram")]
 const _: () = assert!(
     !core::mem::needs_drop::<scram::types::ServerNonceTooLong>(),
     "ServerNonceTooLong must stay drop-free — error sentinel",

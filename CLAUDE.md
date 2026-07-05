@@ -373,3 +373,22 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   probe compiled out, and `is_encrypted()` is then always `false`. The `tls`-off
   fail-loud is witnessed by `bsql-postgres-sync`'s `tls_off_fail_loud` test
   (`cargo test -p bsql-postgres-sync --no-default-features --test tls_off_fail_loud`).
+- The whole SCRAM-SHA-256 authentication capability is behind the default-on
+  `scram` feature (proto → core → drivers → umbrella; proto keeps
+  `default = ["scram"]` so the standard `cargo test` runs keep the full SCRAM
+  handshake + zeroize/fuzz coverage, and each shipped dependent takes proto with
+  `default-features = false` so a consumer can drop it). With `scram` OFF and
+  `tls` on, exactly FIVE SCRAM-exclusive crates leave the async runtime graph —
+  `sha2`, `hmac`, `pbkdf2`, `base64ct`, `cpufeatures` (41 → 36). `subtle` and
+  `getrandom` are NOT SCRAM-exclusive (rustls/ring keep them), so they drop only
+  when `tls` is ALSO off; `md-5` stays unconditional (MD5 auth). With BOTH `tls`
+  and `scram` off the minimal build is 27 runtime crates (vs 41 default). FAIL-LOUD
+  when off: password auth is SCRAM-only, so a driver given a password with `scram`
+  off is a classified `DriverError::Config` at connect naming the missing feature
+  (Trust auth still works; a Trust client hitting a SCRAM-demanding server already
+  fails with `ConnFail::UnsupportedAuthMethod`) — never a silent auth failure or
+  panic. `ConnFail` shrinks 8 B → 2 B when the SCRAM leaf class is gated out,
+  cascading to `HandshakeProgress` / `HandshakeOutcome` (feature-conditional
+  `wire_pin!` pairs; the engine census counts the cfg-blind source text). The
+  `scram`-off fail-loud is witnessed by `bsql-postgres-sync`'s
+  `scram_off_fail_loud` test.
