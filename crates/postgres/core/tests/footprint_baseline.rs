@@ -32,7 +32,7 @@ fn core_stable_public_types_match_baseline() {
     let rows: &[(usize, usize, usize, usize, &str)] = &[
         (size_of::<Row>(), align_of::<Row>(), 16, 8, "Row"),
         (size_of::<ArenaSealError>(), align_of::<ArenaSealError>(), 1, 1, "ArenaSealError"),
-        (size_of::<DriverError>(), align_of::<DriverError>(), 120, 8, "DriverError"),
+        (size_of::<DriverError>(), align_of::<DriverError>(), 32, 8, "DriverError"),
         (size_of::<DbError>(), align_of::<DbError>(), 120, 8, "DbError"),
         (size_of::<ConnectConfig>(), align_of::<ConnectConfig>(), 136, 8, "ConnectConfig"),
         (size_of::<SslMode>(), align_of::<SslMode>(), 1, 1, "SslMode"),

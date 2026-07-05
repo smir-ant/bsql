@@ -392,7 +392,7 @@ impl Connection {
                         // before the failure boundary, so the collector holds the
                         // parsed cause; the connection stays pooled.
                         match collector.take_db_error() {
-                            Some(db) => Err(DriverError::Db(db)),
+                            Some(db) => Err(DriverError::Db(Box::new(db))),
                             None => Err(DriverError::UnclassifiedFailure),
                         }
                     }
@@ -948,7 +948,7 @@ impl Connection {
                 // then surface the parsed cause. Connection stays alive + pooled.
                 self.drain_to_idle(live).await?;
                 match db_error {
-                    Some(db) => Err(DriverError::Db(db)),
+                    Some(db) => Err(DriverError::Db(Box::new(db))),
                     None => Err(DriverError::UnclassifiedFailure),
                 }
             }
@@ -1612,7 +1612,7 @@ impl Connection {
                 // then surface the parsed cause. Connection stays alive + pooled.
                 self.drain_to_idle(live).await?;
                 match db_error {
-                    Some(db) => Err(DriverError::Db(db)),
+                    Some(db) => Err(DriverError::Db(Box::new(db))),
                     None => Err(DriverError::UnclassifiedFailure),
                 }
             }

@@ -116,7 +116,13 @@ impl std::error::Error for ColumnError {
 /// Driver-level error.
 #[derive(Debug)]
 pub enum DriverError {
-    Db(DbError),
+    /// A structured server error with SQLSTATE. BOXED: `DbError` is by far the
+    /// widest payload (~120 B of owned diagnostic strings), so inlining it would
+    /// make EVERY `Result<T, DriverError>` carry 120 B on its error half — paid
+    /// on the cold half of every fallible driver return. Boxing moves that
+    /// payload behind a pointer: the happy path never allocates, only the cold
+    /// error path does, and `DriverError` shrinks from 120 B to 32 B.
+    Db(Box<DbError>),
     Io(std::io::Error),
     NotReady,
     SslRefused,
@@ -214,11 +220,13 @@ pub enum DriverError {
     PayloadParse(String),
 }
 
-// Footprint pin: a sum type whose size is set by its widest variant,
-// Db(DbError). The many fieldless variants (NotReady, NoRows, Timeout, …) cost
-// nothing beyond the discriminant; the pin documents that the error enum is no
-// wider than its DbError payload and catches a new wide variant.
-crate::footprint_pin!(DriverError, size = 120, align = 8);
+// Footprint pin: a sum type whose size is set by its widest variant. With the
+// dominant `DbError` boxed (`Db(Box<DbError>)` = one pointer), the width is now
+// set by the 24-byte payload variants (`Io`/`Decode`/`Column`/`PayloadParse`)
+// plus the discriminant: 32 B, down from 120 B. Every `Result<T, DriverError>`
+// error half shrinks accordingly. The pin catches a new wide variant that would
+// re-inflate the enum.
+crate::footprint_pin!(DriverError, size = 32, align = 8);
 
 impl fmt::Display for DriverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -254,7 +262,9 @@ impl fmt::Display for DriverError {
 impl std::error::Error for DriverError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Db(e) => Some(e),
+            // Deref past the Box so the source is the `DbError`, not the Box —
+            // identical to the pre-boxing behaviour.
+            Self::Db(e) => Some(e.as_ref()),
             Self::Io(e) => Some(e),
             Self::Decode(e) => Some(e),
             Self::Column(e) => Some(e),
@@ -305,5 +315,48 @@ impl From<std::io::Error> for DriverError {
     fn from(e: std::io::Error) -> Self { Self::Io(e) }
 }
 impl From<DbError> for DriverError {
-    fn from(e: DbError) -> Self { Self::Db(e) }
+    fn from(e: DbError) -> Self { Self::Db(Box::new(e)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_db_error() -> DbError {
+        DbError {
+            code: "23505".to_string(),
+            severity: Some("ERROR".to_string()),
+            message: "duplicate key value violates unique constraint".to_string(),
+            detail: Some("Key (id)=(1) already exists.".to_string()),
+            hint: None,
+        }
+    }
+
+    /// Boxing `Db` is a LAYOUT change only — the Display / Debug / Error impls
+    /// must behave byte-identically to the unboxed variant. In particular
+    /// `source()` must yield the `DbError` itself (deref past the Box), so a
+    /// caller can still downcast to `DbError` and read the SQLSTATE; a regression
+    /// to `Some(e)` (returning the `Box`) would break the downcast.
+    #[test]
+    fn db_variant_display_and_source_survive_boxing() {
+        let db = sample_db_error();
+        let expected_display = db.to_string();
+        let err = DriverError::from(db); // `From<DbError>` boxes it.
+
+        // Display forwards through the Box to the DbError — identical text.
+        assert_eq!(err.to_string(), expected_display);
+        // Debug still renders through the boxed payload.
+        assert!(format!("{err:?}").contains("Db"));
+
+        // `source()` is the DbError itself (not the Box), so classification is
+        // reachable by downcast — the semantics-preservation assertion.
+        let src = std::error::Error::source(&err).expect("Db carries a source");
+        let dberr = src
+            .downcast_ref::<DbError>()
+            .expect("source is the DbError, not the Box wrapping it");
+        assert!(dberr.is_unique_violation());
+
+        // And the layout win: the enum is the shrunk width, payload one pointer.
+        assert_eq!(core::mem::size_of::<DriverError>(), 32);
+    }
 }

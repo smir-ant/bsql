@@ -43,7 +43,7 @@
 //!   TYPE                      size  align
 //!   Row                         16      8   Arc pointer + u32 row index
 //!   ArenaSealError               1      1   2-variant seal-error enum
-//!   DriverError                120      8   Db(DbError) dominates
+//!   DriverError                 32      8   Db(Box<DbError>) — cold path boxes the 120 B DbError
 //!   DbError                    120      8   5 String/Option<String> fields
 //!   ConnectConfig              112      8   host/user/db/password Strings
 //!   SslMode                      1      1   3-variant enum
