@@ -162,15 +162,19 @@ pub struct Connection {
     engine: SyncEngine,
     /// The liveness token, or `None` when the connection is dead. The health bit.
     live: Option<Live<'static>>,
-    /// A `try_clone` of the underlying socket, used ONLY to set the read timeout
-    /// for [`recv_notification`](Self::recv_notification): the engine owns the
-    /// I/O socket, but a dup'd handle shares the same kernel socket, so a
-    /// timeout set here applies to the engine's reads too. `None` for an
+    /// A `try_clone` of the underlying socket, used to arm socket read/write
+    /// timeouts on a fd the engine otherwise owns: the engine owns the I/O
+    /// socket, but a dup'd handle shares the same kernel socket, so a timeout set
+    /// here applies to the engine's own reads and writes. Two callers arm it, and
+    /// both leave it DISARMED on exit: [`connect`](Self::connect) bounds the
+    /// TCP-connect + startup/auth handshake with `connect_timeout`, then disarms
+    /// it so steady-state I/O blocks indefinitely (matching the async driver — a
+    /// slow query must never trip a deadline and kill a healthy connection); and
+    /// [`recv_notification`](Self::recv_notification) arms a bounded read deadline
+    /// for its own poll and restores the disarmed state on exit. `None` for an
     /// in-memory testkit connection, which has no socket and never blocks — the
-    /// read-timeout arming is then a no-op.
+    /// arming is then a no-op.
     socket_ctl: Option<TcpStream>,
-    /// The steady-state read timeout, restored after a notification wait.
-    read_timeout: Duration,
     params: SessionParams,
     stmt_counter: u32,
     /// The bounded, counted no-drop buffer of asynchronous notifications. Every
@@ -201,12 +205,19 @@ impl Connection {
     pub fn connect(config: &ConnectConfig) -> Result<Self, DriverError> {
         let addr = format!("{}:{}", config.host, config.port);
         let tcp = TcpStream::connect(&addr)?;
-        let read_timeout = Duration::from_secs(config.connect_timeout_secs);
-        tcp.set_read_timeout(Some(read_timeout))?;
-        tcp.set_write_timeout(Some(read_timeout))?;
+        // `connect_timeout` bounds ONLY the connect phase — the TCP connect
+        // (above), the TLS `SSLRequest` probe, and the startup/auth handshake —
+        // so a dead or silent server at connect still fails fast. It is armed as
+        // the socket read+write timeout here and DISARMED once the handshake
+        // completes (below): steady-state reads/writes then block indefinitely,
+        // matching the async driver, so a slow query (a long OLAP scan, a lock
+        // wait) can never turn a healthy connection into a fatal timeout.
+        let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
+        tcp.set_read_timeout(Some(connect_timeout))?;
+        tcp.set_write_timeout(Some(connect_timeout))?;
         // The dup'd control handle shares the kernel socket, so a timeout set on
-        // it applies to the engine's reads. Taken before the socket is moved into
-        // the wire / TLS layer.
+        // it applies to the engine's reads/writes. Taken before the socket is
+        // moved into the wire / TLS layer.
         let socket_ctl = tcp.try_clone()?;
 
         let wire = Self::build_wire(tcp, config)?;
@@ -234,6 +245,13 @@ impl Connection {
             engine::open_owned(wire, &user, database.as_ref(), &startup_params, credentials)
                 .map_err(lift_conn_fail)?;
         let live = flatten_poll(engine::poll_once(engine.connect(live)))?;
+        // Handshake complete: disarm the connect-phase deadline so steady-state
+        // reads and writes block indefinitely (async-parity). A slow query must
+        // not become a fatal timeout on a healthy connection; the only remaining
+        // deadline is the bounded one `recv_notification` arms for its own wait,
+        // which it restores to disarmed on exit.
+        socket_ctl.set_read_timeout(None)?;
+        socket_ctl.set_write_timeout(None)?;
         let backend_pid = engine.backend_pid().map_err(|_| DriverError::NotReady)?;
         // The engine captured `server_version` from the startup `ParameterStatus`
         // reports during the handshake, so it is read here for free — no
@@ -248,7 +266,6 @@ impl Connection {
             engine,
             live: Some(live),
             socket_ctl: Some(socket_ctl),
-            read_timeout,
             params: SessionParams {
                 server_version,
                 backend_pid,
@@ -298,7 +315,6 @@ impl Connection {
             engine,
             live: Some(live),
             socket_ctl: None,
-            read_timeout: Duration::from_secs(0),
             params: SessionParams {
                 server_version,
                 backend_pid,
@@ -1134,11 +1150,13 @@ impl Connection {
             }
             ControlFlow::Continue(())
         }));
-        // Restore the steady-state timeout for subsequent verbs before
-        // classifying, so a notification result is not lost to a restore failure.
-        // A socketless testkit connection has nothing to restore.
+        // Disarm the bounded read deadline before classifying, so subsequent
+        // verbs block indefinitely again (the steady-state I/O contract) — the
+        // notification wait's deadline is scoped to this call alone, and a
+        // notification result is not lost to a disarm failure. A socketless
+        // testkit connection has nothing to restore.
         let restore = match &self.socket_ctl {
-            Some(ctl) => ctl.set_read_timeout(Some(self.read_timeout)),
+            Some(ctl) => ctl.set_read_timeout(None),
             None => Ok(()),
         };
         match polled {

@@ -43,6 +43,42 @@ fn connect_and_ping() {
     c.close().expect("close");
 }
 
+/// WITNESS (steady-state timeout): `connect_timeout` gates ONLY the
+/// TCP-connect + startup/auth handshake, NOT steady-state I/O. A query the
+/// server delays LONGER than `connect_timeout` must SUCCEED (not trip a socket
+/// read deadline and kill a healthy connection), and the connection must stay
+/// usable afterwards.
+///
+/// RED before the steady-state-disarm fix: the connect-phase `SO_RCVTIMEO`
+/// stayed armed for the connection's whole life, so a `pg_sleep` beyond the
+/// deadline surfaced as a fatal `DriverError::Timeout`, dropped the linear
+/// token, and bricked a healthy connection — any slow/locked/OLAP query would
+/// churn a pooled connection. GREEN after: steady-state reads block
+/// indefinitely, matching the async driver.
+#[test]
+#[ignore = "requires local PG"]
+fn slow_query_beyond_connect_timeout_survives() {
+    // A short 2s connect deadline; the query then sleeps 3s server-side —
+    // longer than the deadline, so a still-armed steady-state timeout fires.
+    let cfg = sync_config().connect_timeout(2);
+    let mut c = Connection::connect(&cfg).expect("connect (localhost handshake is well within 2s)");
+
+    // The server holds the response for 3s (> the 2s connect deadline). This
+    // must complete, not time out — the load-bearing assertion.
+    let slept = c
+        .query_sql("SELECT pg_sleep(3)")
+        .expect("a query slower than connect_timeout must succeed, not kill the connection");
+    assert_eq!(slept.rows.len(), 1, "pg_sleep returns exactly one (void) row");
+    assert!(c.is_healthy(), "connection stays healthy after a slow query");
+
+    // And it stays usable: a second query round-trips on the same connection.
+    let again = c
+        .query_one_sql("SELECT 'still-usable'")
+        .expect("second query on the same connection after the slow one");
+    assert_eq!(again.get_str(0), Ok(Some("still-usable")));
+    c.close().expect("close");
+}
+
 /// WITNESS: startup parameters set on the connection config take effect on the
 /// server session. Proven three ways — `SHOW search_path`,
 /// `current_setting('application_name')`, `SHOW statement_timeout` — plus the

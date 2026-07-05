@@ -29,6 +29,42 @@ async fn connect_and_ping() {
     c.close().await.expect("close");
 }
 
+/// WITNESS (steady-state timeout parity): the async driver has NO steady-state
+/// read deadline — a query the server delays LONGER than `connect_timeout` must
+/// SUCCEED and leave the connection usable. This is the behaviour the blocking
+/// driver was fixed to mirror (its connect-phase `SO_RCVTIMEO` used to stay
+/// armed and kill a healthy connection on a slow query); pinning it here guards
+/// the two drivers against re-diverging.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn slow_query_beyond_connect_timeout_survives() {
+    // A short 2s connect deadline; the query then sleeps 3s server-side — longer
+    // than the deadline. `connect_timeout` must bound only the connect phase.
+    let cfg = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .connect_timeout(2);
+    let mut c = Connection::connect(&cfg)
+        .await
+        .expect("connect (localhost handshake is well within 2s)");
+
+    // The server holds the response for 3s (> the 2s connect deadline). This must
+    // complete, not time out — the async parity assertion.
+    let slept = c
+        .query_sql("SELECT pg_sleep(3)")
+        .await
+        .expect("a query slower than connect_timeout must succeed on the async driver");
+    assert_eq!(slept.rows.len(), 1, "pg_sleep returns exactly one (void) row");
+    assert!(c.is_healthy(), "connection stays healthy after a slow query");
+
+    // And it stays usable: a second query round-trips on the same connection.
+    let again = c
+        .query_one_sql("SELECT 'still-usable'")
+        .await
+        .expect("second query on the same connection after the slow one");
+    assert_eq!(again.get_str(0), Ok(Some("still-usable")));
+    c.close().await.expect("close");
+}
+
 /// WITNESS: startup parameters set on the connection config take effect on the
 /// server session. Proven three ways — `SHOW search_path`,
 /// `current_setting('application_name')`, `SHOW statement_timeout` — plus the
