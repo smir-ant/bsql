@@ -65,6 +65,68 @@ async fn slow_query_beyond_connect_timeout_survives() {
     c.close().await.expect("close");
 }
 
+/// WITNESS (connect-handshake timeout): a server that ACCEPTS the TCP
+/// connection but never answers the startup/auth handshake must make async
+/// `connect` TIME OUT within ~`connect_timeout` — never hang. The whole connect
+/// sequence (dial + `SSLRequest` probe + TLS + handshake) now rides ONE
+/// `connect_timeout` budget; before, only the TCP dial was bounded, so a silent
+/// server hung connect INDEFINITELY. Deterministic and PG-free (a raw loopback
+/// listener that accepts then stays silent), so it runs in the default suite —
+/// no `#[ignore]`.
+#[tokio::test]
+async fn connect_times_out_on_a_silent_server_never_hangs() {
+    // A raw TCP listener that accepts then never speaks — the "server accepts
+    // TCP, then goes silent on the handshake" case.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let accepter = std::thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            // Discard whatever the client sends (its startup packet) but NEVER
+            // reply; keep reading until the client gives up and closes the socket
+            // (read → 0), so this thread exits promptly once the client times out
+            // rather than on a fixed sleep.
+            let mut sink = [0u8; 512];
+            loop {
+                match std::io::Read::read(&mut sock, &mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        }
+    });
+
+    let cfg = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .port(addr.port())
+        .database("postgres".to_string())
+        // No TLS probe against the fake — target the startup/auth handshake, the
+        // exact step that used to be unbounded.
+        .ssl_mode(bsql_postgres_async::SslMode::Disable)
+        .connect_timeout(1);
+
+    let start = std::time::Instant::now();
+    let result = Connection::connect(&cfg).await;
+    let elapsed = start.elapsed();
+
+    // Load-bearing property: connect RETURNED (did not hang) with a Timeout.
+    // `Connection` is not `Debug` (it holds a live socket), so classify the Ok
+    // side by matching rather than Debug-printing the whole Result.
+    match result {
+        Err(bsql_postgres_async::DriverError::Timeout) => {}
+        Err(other) => {
+            panic!("a silent server must time out; got a different error {other:?} after {elapsed:?}")
+        }
+        Ok(_) => panic!("a silent server must time out, not connect; got Ok after {elapsed:?}"),
+    }
+    // And it fired near the 1s budget, not far past it (generous slack for a
+    // loaded parallel run).
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "connect must time out within ~connect_timeout, took {elapsed:?}",
+    );
+
+    accepter.join().ok();
+}
+
 /// WITNESS: startup parameters set on the connection config take effect on the
 /// server session. Proven three ways — `SHOW search_path`,
 /// `current_setting('application_name')`, `SHOW statement_timeout` — plus the

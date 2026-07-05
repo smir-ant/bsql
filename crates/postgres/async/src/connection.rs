@@ -201,23 +201,47 @@ pub struct Connection {
 
 impl Connection {
     /// Open a connection: TCP connect, optional TLS negotiation, then the
-    /// startup/auth handshake through the engine.
+    /// startup/auth handshake through the engine — the WHOLE sequence bounded by
+    /// `connect_timeout`, measured from the start.
     ///
     /// # Errors
     ///
     /// A classified [`DriverError`] for any pre-connect validation, transport,
-    /// TLS, or handshake failure — never a panic.
+    /// TLS, or handshake failure — never a panic. A connect (dial + `SSLRequest`
+    /// probe + TLS + startup/auth handshake) that does not complete within
+    /// `connect_timeout` is [`DriverError::Timeout`], so a server that accepts the
+    /// TCP connection but never answers the startup packet fails fast rather than
+    /// hanging forever.
     pub async fn connect(config: &ConnectConfig) -> Result<Self, DriverError> {
+        // Bound the ENTIRE connect sequence under ONE `connect_timeout` budget,
+        // measured from the start (a total "connect within N seconds" contract).
+        // Chosen over a per-step timeout (a server slow at each of dial / probe /
+        // TLS / handshake could consume N× the budget) and over the old dial-only
+        // timeout (which left the `SSLRequest` probe, the TLS handshake, and the
+        // startup/auth handshake UNBOUNDED — so a server that accepted TCP then
+        // went silent hung connect forever). One outer timeout is the simplest
+        // shape that closes every hang hole and matches the blocking driver, which
+        // gates the whole handshake under the same budget. On elapse tokio drops
+        // the in-flight future; nothing is stranded, since no `Connection` (and no
+        // reusable liveness token) exists yet.
+        let budget = Duration::from_secs(config.connect_timeout_secs);
+        match tokio::time::timeout(budget, Self::connect_inner(config)).await {
+            Ok(result) => result,
+            // The same class the blocking driver surfaces for a connect-phase
+            // (handshake) timeout, so the two drivers agree.
+            Err(_elapsed) => Err(DriverError::Timeout),
+        }
+    }
+
+    /// The connect sequence proper — TCP dial, optional TLS negotiation, then the
+    /// startup/auth handshake — run UNDER the `connect_timeout` budget by
+    /// [`connect`](Self::connect).
+    async fn connect_inner(config: &ConnectConfig) -> Result<Self, DriverError> {
         let addr = format!("{}:{}", config.host, config.port);
-        let timeout = Duration::from_secs(config.connect_timeout_secs);
-        let tcp = tokio::time::timeout(timeout, TcpStream::connect(&addr))
-            .await
-            .map_err(|_| {
-                DriverError::Io(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "connection timed out",
-                ))
-            })??;
+        // No dial-only timeout here: the caller's single outer budget bounds the
+        // whole sequence, so a black-hole dial elapses into `DriverError::Timeout`
+        // exactly like a silent handshake.
+        let tcp = TcpStream::connect(&addr).await?;
         // Disable Nagle on the data socket for the connection's whole life. Set
         // once here, TCP_NODELAY rides the SAME kernel socket through the
         // `SSLRequest` probe and the TLS wrap — so the actual data socket carries
