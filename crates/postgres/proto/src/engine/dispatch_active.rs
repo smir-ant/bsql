@@ -227,6 +227,32 @@ enum ActiveState {
     /// A `Close` was issued; awaiting `CloseComplete` (`'3'`).
     CloseAwaitingComplete,
 
+    // ── Fused one-round-trip runtime-param path (Parse+Bind+Describe+Execute) ──
+    //
+    // The DYNAMIC (runtime-untyped) query path fuses the whole extended-protocol
+    // exchange into ONE flush — `Parse`(unnamed) + `Bind` + `Describe`(portal) +
+    // `Execute` + `Sync` — so a one-shot parameterised query costs ONE round trip
+    // instead of the three the prepare / bind+execute / close sequence took. The
+    // in-batch `Describe`(portal) makes the server surface the result schema
+    // INLINE (after `BindComplete`, before the `DataRow`s), so the runtime
+    // consumer recovers the OIDs + names it needs with no separate `prepare`
+    // round trip. The unnamed statement is implicitly discarded at the next
+    // `Parse`(unnamed), so no `Close` is needed. These three await-states are the
+    // one-time setup chain before the (existing) `BindAwaitingData` row stream.
+    /// The fused batch was issued; awaiting `ParseComplete` (`'1'`), which is
+    /// followed by `BindComplete` — so it advances silently into the bind phase.
+    FusedAwaitingParseComplete,
+    /// `ParseComplete` seen in the fused batch; awaiting `BindComplete` (`'2'`),
+    /// which is followed by the `Describe`(portal) answer — so it advances
+    /// silently into the row-desc-or-no-data phase.
+    FusedAwaitingBindComplete,
+    /// `BindComplete` seen in the fused batch; awaiting the `Describe`(portal)
+    /// answer — `RowDescription` (`'T'`, the query returns rows) or `NoData`
+    /// (`'n'`, a DML / no-RETURNING command). Either way it captures the recovered
+    /// schema and advances into the (existing) `BindAwaitingData` row stream, so
+    /// the executed rows decode against the INLINE-recovered OIDs.
+    FusedAwaitingRowDescOrNoData,
+
     /// A protocol violation tore the connection down — terminal.
     Failed,
 }
@@ -661,6 +687,23 @@ impl ActiveEngine {
         self.state = ActiveState::CloseAwaitingComplete;
     }
 
+    /// Seat the engine to await the fused one-round-trip runtime-param batch's
+    /// reply: `Parse`(unnamed) + `Bind` + `Describe`(portal) + `Execute` + `Sync`
+    /// → `ParseComplete`, `BindComplete`, then the `Describe`(portal) answer
+    /// (`RowDescription` or `NoData`), then the executed rows and the single Sync
+    /// `ReadyForQuery`.
+    ///
+    /// Unlike [`begin_bind_execute`](Self::begin_bind_execute), this seats NO
+    /// result OIDs — the schema is RECOVERED from the inline `Describe`(portal)
+    /// answer, exactly as the dynamic `prepare` path recovered it from a separate
+    /// `Describe` round trip. Clears the per-statement columns so a prior
+    /// statement's schema cannot leak into a `NoData` (no-row) delivery.
+    #[inline]
+    pub fn begin_fused_parse_bind_describe_execute(&mut self) {
+        self.reset_columns();
+        self.state = ActiveState::FusedAwaitingParseComplete;
+    }
+
     /// Shared bind/execute seating: thread the result schema and await
     /// `BindComplete`.
     #[inline]
@@ -745,7 +788,10 @@ impl ActiveEngine {
                 | ActiveState::BindAwaitingBindComplete
                 | ActiveState::BindAwaitingData
                 | ActiveState::ExtendedAwaitingRfq
-                | ActiveState::CloseAwaitingComplete => {}
+                | ActiveState::CloseAwaitingComplete
+                | ActiveState::FusedAwaitingParseComplete
+                | ActiveState::FusedAwaitingBindComplete
+                | ActiveState::FusedAwaitingRowDescOrNoData => {}
             }
 
             // Continue an in-progress oversize stream before any new framing.
@@ -838,6 +884,15 @@ impl ActiveEngine {
             ActiveState::CloseAwaitingComplete => {
                 self.step_close_awaiting_complete(tag, start, end)
             }
+            // The fused one-round-trip setup chain (ParseComplete → BindComplete →
+            // RowDescription/NoData) routes to ONE cold handler that re-matches the
+            // phase: the whole chain is a one-time-per-query setup before the row
+            // stream, so keeping it a single `#[inline(never)]` call keeps
+            // next_event's hot frame from carrying three more setup arms it never
+            // runs on a DataRow.
+            ActiveState::FusedAwaitingParseComplete
+            | ActiveState::FusedAwaitingBindComplete
+            | ActiveState::FusedAwaitingRowDescOrNoData => self.step_fused(tag, start, end),
             // Unreachable: the drive loop short-circuits `Failed` before
             // calling `step_frame`. Classified, never wildcarded.
             ActiveState::Failed => ActiveOutcome::Close,
@@ -1101,6 +1156,89 @@ impl ActiveEngine {
         }
     }
 
+    /// The fused one-round-trip setup chain, matching the fused sub-phase
+    /// internally so `step_frame` carries ONE cold arm for the whole chain.
+    ///
+    /// - `FusedAwaitingParseComplete`: `ParseComplete` (`'1'`) → silent advance to
+    ///   the bind wait. Any other non-error tag is out-of-phase (teardown).
+    /// - `FusedAwaitingBindComplete`: `BindComplete` (`'2'`) → silent advance to
+    ///   the row-desc-or-no-data wait.
+    /// - `FusedAwaitingRowDescOrNoData`: the `Describe`(portal) answer —
+    ///   `RowDescription` (`'T'`) → capture the recovered schema (OIDs + names)
+    ///   and enter the (existing) `BindAwaitingData` row stream; `NoData` (`'n'`)
+    ///   → clear the columns and enter `BindAwaitingData` for the bare
+    ///   `CommandComplete` of a no-row command.
+    ///
+    /// Every sub-phase classifies a mid-fusion `ErrorResponse` as the recoverable
+    /// [`fail_recoverable`](Self::fail_recoverable) (a `Parse` / `Bind` /
+    /// describe-time error parks a drain to the recovering `ReadyForQuery`, so the
+    /// connection survives), and any other tag as a classified teardown.
+    ///
+    /// `#[inline(never)]`: the whole chain runs at most once per query (before the
+    /// row stream), and its `RowDescription`-capture arm pulls in the
+    /// column-parsing + `Vec` allocation register pressure. Keeping it out of line
+    /// keeps that pressure — and the setup instructions — OFF `next_event`'s hot
+    /// frame: the per-row DataRow arm never reaches here, and next_event's frame
+    /// stays at its lean 128-byte size rather than regrowing to fit this setup.
+    /// Deliberately NOT `#[cold]`: on the pinned toolchain `#[cold]` only enlarges
+    /// the outlined body; `#[inline(never)]` alone already lifts it off the hot
+    /// frame.
+    #[inline(never)]
+    fn step_fused(&mut self, tag: u8, start: usize, end: usize) -> ActiveOutcome {
+        match self.state {
+            ActiveState::FusedAwaitingParseComplete => match tag {
+                T_PARSE_COMPLETE => {
+                    self.state = ActiveState::FusedAwaitingBindComplete;
+                    ActiveOutcome::Silent
+                }
+                T_ERROR => self.fail_recoverable(start, end),
+                _ => self.teardown(),
+            },
+            ActiveState::FusedAwaitingBindComplete => match tag {
+                T_BIND_COMPLETE => {
+                    self.state = ActiveState::FusedAwaitingRowDescOrNoData;
+                    ActiveOutcome::Silent
+                }
+                T_ERROR => self.fail_recoverable(start, end),
+                _ => self.teardown(),
+            },
+            ActiveState::FusedAwaitingRowDescOrNoData => match tag {
+                T_ROW_DESC => {
+                    let parsed = parse_row_desc_owned(self.ingest.frame_body(start, end));
+                    self.apply_fused_row_stream(parsed)
+                }
+                T_NO_DATA => {
+                    self.reset_columns();
+                    self.state = ActiveState::BindAwaitingData;
+                    ActiveOutcome::Silent
+                }
+                T_ERROR => self.fail_recoverable(start, end),
+                _ => self.teardown(),
+            },
+            // `step_frame` only routes the three fused states here; every other
+            // state is dispatched by its own arm. Enumerated (no wildcard) so a
+            // future state cannot silently fall into the fused handler.
+            ActiveState::Idle
+            | ActiveState::StreamingRows
+            | ActiveState::AwaitingRfq
+            | ActiveState::CopyOut
+            | ActiveState::CopyOutAwaitingCc
+            | ActiveState::CopyInActive
+            | ActiveState::DrainAfterError
+            | ActiveState::ParseAwaitingParseComplete
+            | ActiveState::ParseDescribeStmtAwaitingParseComplete
+            | ActiveState::ParseBindExecuteAwaitingParseComplete
+            | ActiveState::CloseParseBindExecuteAwaitingCloseComplete
+            | ActiveState::DescribeStmtAwaitingParamDesc
+            | ActiveState::DescribeAwaitingRowDescOrNoData
+            | ActiveState::BindAwaitingBindComplete
+            | ActiveState::BindAwaitingData
+            | ActiveState::ExtendedAwaitingRfq
+            | ActiveState::CloseAwaitingComplete
+            | ActiveState::Failed => self.teardown(),
+        }
+    }
+
     // ── transition leaves ──
 
     /// `RowDescription` → record columns/OIDs, open the row stream (silent).
@@ -1117,6 +1255,28 @@ impl ActiveEngine {
                 self.col_oids = oids;
                 self.col_names = names;
                 self.state = ActiveState::StreamingRows;
+                ActiveOutcome::Silent
+            }
+            None => self.teardown(),
+        }
+    }
+
+    /// Capture the fused batch's inline `Describe`(portal) schema (OIDs + names)
+    /// and enter the (existing) `BindAwaitingData` row stream — the
+    /// extended-protocol analog of [`apply_open_row_stream`](Self::apply_open_row_stream)
+    /// (which enters the simple-query `StreamingRows` that completes to
+    /// `AwaitingRfq`; the fused path completes to `ExtendedAwaitingRfq` via
+    /// `BindAwaitingData`, one Sync closing one command). The captured columns
+    /// survive the DataRow stream through the `CommandComplete` `Deliver` (reset
+    /// only at the trailing `ReadyForQuery`), so the runtime consumer reads the
+    /// recovered OIDs + names at the delivery exactly as the separate-`prepare`
+    /// path surfaced them. Shared by the in-buffer and Sub-C-accumulated paths.
+    fn apply_fused_row_stream(&mut self, parsed: Option<(Vec<u32>, Vec<String>)>) -> ActiveOutcome {
+        match parsed {
+            Some((oids, names)) => {
+                self.col_oids = oids;
+                self.col_names = names;
+                self.state = ActiveState::BindAwaitingData;
                 ActiveOutcome::Silent
             }
             None => self.teardown(),
@@ -1201,6 +1361,13 @@ impl ActiveEngine {
     /// Append one drained chunk of an oversize Sub-C frame to the accumulator.
     /// Disjoint field borrows: the ingest read and the accumulator write touch
     /// different fields of `self`.
+    ///
+    /// `#[cold]` + `#[inline(never)]`: oversize handling is a rare control-frame
+    /// path (a `RowDescription` wider than the ingest buffer), so it is kept OUT
+    /// of [`next_event`](Self::next_event)'s hot frame rather than inlined into
+    /// the per-row dispatch it never runs on.
+    #[cold]
+    #[inline(never)]
     fn append_oversize_accum(&mut self, start: usize, end: usize) {
         let src = self.ingest.frame_body(start, end);
         self.oversize_accum.extend_from_slice(src);
@@ -1211,6 +1378,11 @@ impl ActiveEngine {
     /// exactly where an in-buffer `RowDescription` is legal (open a row stream at
     /// `Idle`/`AwaitingRfq`, record a describe answer at the describe wait); any
     /// other phase is the same classified teardown as the in-buffer path.
+    ///
+    /// `#[cold]` + `#[inline(never)]`: the Sub-C oversize dispatch is a rare
+    /// control-frame path, kept off [`next_event`](Self::next_event)'s hot frame.
+    #[cold]
+    #[inline(never)]
     fn dispatch_accumulated_row_desc(&mut self) -> ActiveOutcome {
         match self.state {
             ActiveState::Idle | ActiveState::AwaitingRfq => {
@@ -1220,6 +1392,13 @@ impl ActiveEngine {
             ActiveState::DescribeAwaitingRowDescOrNoData => {
                 let parsed = parse_row_desc_owned(&self.oversize_accum);
                 self.apply_record_described_rows(parsed)
+            }
+            // A wide `Describe`(portal) `RowDescription` in the fused batch: capture
+            // the recovered schema and enter the row stream, mirroring the in-buffer
+            // `FusedAwaitingRowDescOrNoData` `'T'` arm.
+            ActiveState::FusedAwaitingRowDescOrNoData => {
+                let parsed = parse_row_desc_owned(&self.oversize_accum);
+                self.apply_fused_row_stream(parsed)
             }
             ActiveState::StreamingRows
             | ActiveState::CopyOut
@@ -1235,6 +1414,9 @@ impl ActiveEngine {
             | ActiveState::BindAwaitingData
             | ActiveState::ExtendedAwaitingRfq
             | ActiveState::CloseAwaitingComplete
+            // A `RowDescription` is never legal while awaiting `'1'` / `'2'`.
+            | ActiveState::FusedAwaitingParseComplete
+            | ActiveState::FusedAwaitingBindComplete
             | ActiveState::Failed => self.teardown(),
         }
     }
@@ -1308,6 +1490,15 @@ impl ActiveEngine {
 
     /// Begin streaming an oversize frame whose footprint exceeds the buffer.
     /// Consumes the header, classifies Sub-A / Sub-B / teardown.
+    ///
+    /// `#[cold]` + `#[inline(never)]`: an oversize frame (a body larger than the
+    /// inline ingest tier) is a rare event. Pulling this and
+    /// [`step_oversize`](Self::step_oversize) out of line keeps the whole oversize
+    /// subtree — begin/step and the prefix/accumulator helpers they reach — OFF
+    /// [`next_event`](Self::next_event)'s hot frame, so the per-row DataRow arm
+    /// does not carry the oversize machinery's stack setup it never executes.
+    #[cold]
+    #[inline(never)]
     fn begin_oversize(&mut self, declared: u32) -> ActiveOutcome {
         // `FrameTooLarge` is only produced with a full header buffered, so the
         // tag byte is present; `0` (a never-legal tag) is the dead fallback.
@@ -1372,6 +1563,11 @@ impl ActiveEngine {
     }
 
     /// Advance an in-progress oversize stream by one step.
+    ///
+    /// `#[cold]` + `#[inline(never)]`: see [`begin_oversize`](Self::begin_oversize)
+    /// — the oversize continuation is kept off the hot frame.
+    #[cold]
+    #[inline(never)]
     fn step_oversize(&mut self) -> ActiveOutcome {
         let mut os = match self.oversize {
             Some(os) => os,
@@ -1496,6 +1692,11 @@ impl ActiveEngine {
             | ActiveState::BindAwaitingBindComplete
             | ActiveState::ExtendedAwaitingRfq
             | ActiveState::CloseAwaitingComplete
+            // A `CommandComplete` is never legal in the fused setup chain — it
+            // arrives only after the describe answer, in `BindAwaitingData`.
+            | ActiveState::FusedAwaitingParseComplete
+            | ActiveState::FusedAwaitingBindComplete
+            | ActiveState::FusedAwaitingRowDescOrNoData
             | ActiveState::Failed => None,
         }
     }

@@ -143,6 +143,23 @@ pub(crate) fn build_describe_statement(wb: &mut WriteBuf, name: &[u8]) -> Result
     })
 }
 
+/// `'D'` Describe-portal frame: `tag | len | 'P' | portal_name NUL`.
+///
+/// A portal describe answers with `RowDescription` (or `NoData`) — and, unlike a
+/// statement describe, NO `ParameterDescription` (the portal is already bound).
+/// Emitted in the fused one-round-trip runtime-param batch
+/// (Parse + Bind + Describe-portal + Execute + Sync) so the result schema
+/// arrives INLINE (right after `BindComplete`, before the `DataRow`s) instead of
+/// on a separate `prepare` round trip.
+#[inline]
+pub(crate) fn build_describe_portal(wb: &mut WriteBuf, portal: &[u8]) -> Result<(), WriteBufFull> {
+    wb.push_u8(TAG_DESCRIBE.byte())?;
+    wb.with_length_prefix(|w| {
+        w.push_u8(DescribeTargetByte::Portal.byte())?;
+        w.push_nul_terminated(portal)
+    })
+}
+
 /// `'C'` Close-statement frame: `tag | len | 'S' | stmt_name NUL`.
 #[inline]
 pub(crate) fn build_close_statement(wb: &mut WriteBuf, name: &[u8]) -> Result<(), WriteBufFull> {

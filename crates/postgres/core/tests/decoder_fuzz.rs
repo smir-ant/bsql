@@ -20,6 +20,11 @@
 //!   decoders (`Vec<Option<T>>` for the full element set, including `text[]` and
 //!   `bytea[]`), and the opt-in SWAR fast-paths.
 //! * `bsql_postgres_proto::pgtypes` — `FromStr` for `Uuid`/`Date`/`Time`/`Numeric`.
+//! * `bsql_postgres_proto::decode` — `parse_row_description` and
+//!   `parse_column_names`, the two parsers that turn an untrusted server
+//!   `RowDescription` (`'T'`) payload into the result schema (OID/format) and the
+//!   column names (reached by the active dispatch and the fused runtime-param
+//!   path's `parse_row_desc_owned`).
 //! * `bsql_postgres_core::materialize::parse_notification`.
 //!
 //! # Design
@@ -380,6 +385,18 @@ fn text_and_misc_decoders() -> Vec<NamedDecoder> {
         ("parse_pg_bool_swar", |b| parse_pg_bool_swar(b).is_some()),
         ("validate_utf8_swar", |b| validate_utf8_swar(b).is_some()),
         ("parse_notification", |b| parse_notification(b).is_ok()),
+        // The two `RowDescription` (`'T'`) parsers: both turn UNTRUSTED server
+        // bytes into a Rust value (the OID/format schema, and the column names) —
+        // reached in production by the active dispatch and the fused runtime-param
+        // path's `parse_row_desc_owned`. Total-by-construction today (no indexing /
+        // unwrap), so they pass immediately; fuzzing them closes the coverage gap
+        // so a FUTURE indexing/unwrap regression (a hostile-server crash) is caught.
+        ("parse_row_description", |b| {
+            bsql_postgres_proto::decode::parse_row_description(b).is_ok()
+        }),
+        ("parse_column_names", |b| {
+            bsql_postgres_proto::decode::parse_column_names(b).is_ok()
+        }),
     ]
 }
 

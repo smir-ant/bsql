@@ -71,6 +71,13 @@ harness = false
 name = "unix_vs_tcp"
 harness = false
 
+# bsql-only round-trip delta: the fused one-round-trip `query_params` vs the
+# explicit three-round-trip prepare/query/close it replaced, on the dynamic
+# (runtime-untyped) one-shot path.
+[[bench]]
+name = "dynamic_oneshot"
+harness = false
+
 # Peak-RSS harnesses — one binary per client so each measured process links and
 # faults in ONLY that client's code (a single arg-selected binary would leave
 # the other clients' code linked-but-cold, muddying the resident figure).

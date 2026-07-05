@@ -738,6 +738,81 @@ impl<'b, T: Transport> Engine<'b, T> {
         drive_to_outcome(active, transport, send_buf, sink).await
     }
 
+    /// Run a one-shot RUNTIME-param query in ONE round trip: `Parse`(unnamed) +
+    /// `Bind` + `Describe`(portal) + `Execute` + `Sync`, fused into a single
+    /// flush. `B = Never`.
+    ///
+    /// This is the dynamic (runtime-untyped) sibling of the compile-checked
+    /// [`query_params`](Self::query_params) flagship. Where a consumer supplies
+    /// SQL text plus params at run time — with no compile-time row type, so the
+    /// result schema (OIDs + names) is only known from the wire — this fuses what
+    /// was three round trips (`prepare` = Parse+Describe+Sync, then
+    /// `Bind`+`Execute`+`Sync`, then `Close`+`Sync`) into ONE. The in-batch
+    /// `Describe`(portal) makes the server surface the `RowDescription` INLINE
+    /// (right after `BindComplete`, before the `DataRow`s), so the recovered
+    /// schema reaches the sink at the [`Surface::Deliver`] exactly as the separate
+    /// `prepare` round trip surfaced it — the materializer above is unchanged.
+    ///
+    /// No `Close`: the unnamed statement/portal are implicitly discarded at the
+    /// next `Parse`(unnamed) / `Bind` (PG §55.2.2), so a following one-shot query
+    /// (or a flagship named-statement query) is unaffected — no
+    /// duplicate-statement error, no leaked server-side plan. Nothing touches the
+    /// per-connection prepared-statement cache (that is the named-statement
+    /// flagship's concern).
+    ///
+    /// A `RowDescription`-less command (a DML / no-RETURNING statement) answers
+    /// the `Describe`(portal) with `NoData`; the dispatch handles both, and a
+    /// mid-fusion `ErrorResponse` (a `Parse` / `Bind` error) is the recoverable
+    /// [`ServerErrored`](CommandStatus::ServerErrored) — the verb drains the owed
+    /// `ReadyForQuery` to a clean idle, so the connection survives and the token
+    /// rides `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// As [`query_prepared`](Self::query_prepared) (`FrameTooLong` covers oversize
+    /// SQL or encoded parameters).
+    pub async fn query_params_fused<P, S>(
+        &mut self,
+        live: Live<'b>,
+        sql: &str,
+        params: &P,
+        sink: S,
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
+    where
+        P: ParamsWriter,
+        S: FnMut(Surface<'_>) -> ControlFlow<Never>,
+    {
+        let Self {
+            transport,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        send_buf.reset();
+        // Parse(unnamed ""): stream the SQL body onto the (growable) send buffer
+        // rather than the bounded scratch, so a multi-kilobyte runtime query is
+        // not capped at MAX_OWNED_SEND_LEN — byte-identical to the `prepare` path's
+        // streaming Parse assembly (proven by the parse-stream byte-twin).
+        let sql_bytes = sql.as_bytes();
+        let sql_len = u32::try_from(sql_bytes.len()).map_err(|_| {
+            core::hint::cold_path();
+            EngineError::FrameTooLong
+        })?;
+        enqueue_frame(send_buf, |wb| frames::build_parse_header(wb, b"", sql_len))?;
+        send_buf.enqueue(sql_bytes);
+        send_buf.enqueue(&frames::PARSE_SQL_TRAILER);
+        // Bind(portal "" from the unnamed statement ""); Describe(portal "");
+        // Execute(portal "", no row limit); Sync — one pipelined batch.
+        enqueue_frame(send_buf, |wb| frames::build_bind(wb, b"", b"", params))?;
+        enqueue_frame(send_buf, |wb| frames::build_describe_portal(wb, b""))?;
+        enqueue_frame(send_buf, |wb| frames::build_execute(wb, b"", 0))?;
+        send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
+        active.begin_fused_parse_bind_describe_execute();
+        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
+        Ok(Outcome { live, status })
+    }
+
     /// Run a compile-checked query — the `query!` macro path —
     /// reusing this connection's already-Parsed server-side plan on a repeat.
     ///

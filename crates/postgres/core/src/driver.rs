@@ -464,21 +464,44 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         Ok(collector.affected())
     }
 
-    /// Prepare, query, and close a runtime SQL statement with params.
+    /// Run a one-shot runtime-SQL query with params in ONE round trip.
+    ///
+    /// Fuses `Parse`(unnamed) + `Bind` + `Describe`(portal) + `Execute` + `Sync`
+    /// into a single flush (see [`Engine::query_params_fused`]), so a one-shot
+    /// parameterised query costs ONE round trip instead of the three the old
+    /// prepare / bind+execute / close sequence took. The result schema (OIDs +
+    /// names) is recovered from the inline `Describe`(portal) `RowDescription`, so
+    /// the [`QueryResult`]'s column names come straight from the collector — no
+    /// separate `prepare` round trip. The unnamed statement is implicitly
+    /// discarded at the next `Parse`, so no `Close` is needed and the
+    /// prepared-statement cache is untouched. For a query executed REPEATEDLY,
+    /// prefer an explicit [`prepare`](Self::prepare) +
+    /// [`query_prepared`](Self::query_prepared) to amortize the parse.
+    ///
+    /// [`Engine::query_params_fused`]: bsql_postgres_proto::engine::Engine::query_params_fused
     pub async fn query_params<P: ParamsWriter>(
         &mut self,
         sql: &str,
         params: &P,
     ) -> Result<QueryResult, DriverError> {
-        let stmt = self.prepare(sql).await?;
-        let result = self.query_prepared(&stmt, params).await;
-        // Always attempt the CLOSE. The primary op error dominates: if `result`
-        // is Err, `result?` returns it and the CLOSE Result is dropped; a CLOSE
-        // failure surfaces only when the primary op SUCCEEDED.
-        let close = self.close_statement(stmt).await;
-        let result = result?;
-        close?;
-        Ok(result)
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .query_params_fused(
+                live,
+                sql,
+                params,
+                capture_notify(&mut self.notifications, |s| {
+                    collector.feed(s);
+                    ControlFlow::Continue(())
+                }),
+            )
+            .await;
+        self.settle(outcome, &mut collector)?;
+        // Names come from the collector (recovered from the inline
+        // `Describe`(portal) `RowDescription`), not a prepared-statement override.
+        Self::build_query_result(collector, None)
     }
 
     /// Like [`query_params`](Self::query_params), returning the first row.
@@ -504,18 +527,34 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         Ok(self.query_params(sql, params).await?.rows.into_iter().next())
     }
 
-    /// Prepare, execute, and close a runtime SQL statement with params.
+    /// Run a one-shot runtime-SQL command with params in ONE round trip,
+    /// returning the affected-row count.
+    ///
+    /// The side-effect twin of [`query_params`](Self::query_params): the same
+    /// fused `Parse`+`Bind`+`Describe`+`Execute`+`Sync` single round trip. A
+    /// no-RETURNING command answers the `Describe`(portal) with `NoData`; the
+    /// affected count rides the `CommandComplete` tag exactly as before.
     pub async fn execute_params<P: ParamsWriter>(
         &mut self,
         sql: &str,
         params: &P,
     ) -> Result<u64, DriverError> {
-        let stmt = self.prepare(sql).await?;
-        let result = self.execute_prepared(&stmt, params).await;
-        let close = self.close_statement(stmt).await;
-        let count = result?;
-        close?;
-        Ok(count)
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .query_params_fused(
+                live,
+                sql,
+                params,
+                capture_notify(&mut self.notifications, |s| {
+                    collector.feed(s);
+                    ControlFlow::Continue(())
+                }),
+            )
+            .await;
+        self.settle(outcome, &mut collector)?;
+        Ok(collector.affected())
     }
 
     /// Close a prepared statement, consuming it (use-after-close is a move error).

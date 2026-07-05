@@ -375,8 +375,13 @@ impl fmt::Display for FormatCode {
 ///   storage).
 /// - [`crate::ProtocolError::UnexpectedFormatCode`] — wire value
 ///   not in `{0, 1}`.
+// `pub` (not `pub(crate)`) so the `decoder_fuzz` total-function gate in
+// `bsql-postgres-core` can drive it directly over the broad untrusted-byte sweep,
+// exactly as it fuzzes the already-`pub` `parse_column_names` sibling below — both
+// parse the same untrusted server `RowDescription` (`'T'`) payload. Visibility
+// only; the parsing logic is untouched.
 #[cold]
-pub(crate) fn parse_row_description(
+pub fn parse_row_description(
     payload: &[u8],
 ) -> Result<RowDesc, crate::error::ProtocolError> {
     use crate::error::ProtocolError;

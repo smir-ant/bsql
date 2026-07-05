@@ -691,6 +691,167 @@ fn execute_prepared_completes_dml() {
     assert_eq!(cap.delivers[0].0.as_deref(), Some("DELETE 2"));
 }
 
+#[test]
+fn query_params_fused_streams_rows_with_inline_schema() {
+    // The fused one-round-trip runtime-param path:
+    // Parse(unnamed)+Bind+Describe(portal)+Execute+Sync → ParseComplete,
+    // BindComplete, RowDescription (INLINE from the portal describe), DataRow,
+    // CommandComplete, RFQ. The recovered schema (OIDs + names) must reach the
+    // sink at the Deliver — exactly as the separate `prepare` round trip
+    // surfaced it, but in ONE round trip.
+    let script = concat(&[
+        handshake(),
+        parse_complete(),
+        bind_complete(),
+        row_description(&[("id", 23), ("name", 25)]),
+        data_row(&[Some(b"7"), Some(b"alice")]),
+        command_complete("SELECT 1"),
+        rfq(b'I'),
+    ]);
+    let cap = run(script, |e, live| {
+        let mut cap = Cap::default();
+        let live = flatten(poll_once(e.query_params_fused(
+            live,
+            "SELECT id, name FROM t WHERE id = $1",
+            &(7_i32,),
+            cap.sink(),
+        )))
+        .expect("query_params_fused");
+        let _ = live;
+        cap
+    });
+    assert_eq!(cap.rows, 1);
+    assert_eq!(cap.delivers.len(), 1);
+    assert_eq!(cap.delivers[0].0.as_deref(), Some("SELECT 1"));
+    // The INLINE-recovered schema: OIDs AND names, not empty (the fused path's
+    // whole reason to send a Describe(portal)).
+    assert_eq!(cap.delivers[0].1, vec![23, 25]);
+    assert_eq!(cap.delivers[0].2, vec!["id".to_string(), "name".to_string()]);
+    // And the row bytes decode against that schema.
+    assert_eq!(cap.row_cells[0][0], Some(b"7".to_vec()));
+    assert_eq!(cap.row_cells[0][1], Some(b"alice".to_vec()));
+}
+
+#[test]
+fn query_params_fused_nodata_for_no_row_command() {
+    // A no-RETURNING command (INSERT): the Describe(portal) answers with NoData
+    // instead of a RowDescription, then the bare CommandComplete. Zero rows, the
+    // affected count rides the tag, and the recovered schema is empty.
+    let script = concat(&[
+        handshake(),
+        parse_complete(),
+        bind_complete(),
+        no_data(),
+        command_complete("INSERT 0 1"),
+        rfq(b'I'),
+    ]);
+    let cap = run(script, |e, live| {
+        let mut cap = Cap::default();
+        let live = flatten(poll_once(e.query_params_fused(
+            live,
+            "INSERT INTO t (name) VALUES ($1)",
+            &("bob",),
+            cap.sink(),
+        )))
+        .expect("query_params_fused nodata");
+        let _ = live;
+        cap
+    });
+    assert_eq!(cap.rows, 0);
+    assert_eq!(cap.delivers.len(), 1);
+    assert_eq!(cap.delivers[0].0.as_deref(), Some("INSERT 0 1"));
+    assert!(cap.delivers[0].1.is_empty(), "a NoData command surfaces no OIDs");
+    assert!(cap.delivers[0].2.is_empty(), "a NoData command surfaces no names");
+}
+
+#[test]
+fn query_params_fused_parse_error_drains_and_recovers() {
+    // A Parse error mid-fusion: the server sends ErrorResponse then (skipping the
+    // rest of the batch to the Sync) ReadyForQuery. The fused dispatch's
+    // FusedAwaitingParseComplete state classifies the error as recoverable, drains
+    // the owed RFQ to a clean idle, and hands the token back in `Ok` — the
+    // connection survives. A follow-up command runs on the SAME connection.
+    let script = concat(&[
+        handshake(),
+        error_response("ERROR", "42601", "syntax error at or near"),
+        rfq(b'I'),
+        command_complete("SELECT 1"),
+        rfq(b'I'),
+    ]);
+    let (server_errored, fail_surfaced, follow_ok) = run(script, |e, live| {
+        let mut cap = Cap::default();
+        let (server_errored, live) = match poll_once(e.query_params_fused(
+            live,
+            "SELCT $1",
+            &(1_i32,),
+            cap.sink(),
+        )) {
+            Ok(Ok(Outcome {
+                live,
+                status: CommandStatus::ServerErrored,
+            })) => (true, live),
+            other => panic!("expected ServerErrored outcome, got {other:?}"),
+        };
+        // Reuse the very same token — the connection is drained + alive.
+        let mut cap2 = Cap::default();
+        let follow = poll_once(e.simple_query(live, "SELECT 1", cap2.sink()));
+        let follow_ok = matches!(
+            follow,
+            Ok(Ok(Outcome {
+                status: CommandStatus::Completed,
+                ..
+            }))
+        );
+        (server_errored, cap.fails, follow_ok)
+    });
+    assert!(server_errored, "a Parse error must yield ServerErrored, not a fatal");
+    assert_eq!(fail_surfaced, 1, "the error bytes must surface once");
+    assert!(follow_ok, "the connection must be reusable after the drained Parse error");
+}
+
+#[test]
+fn query_params_fused_bind_error_drains_and_recovers() {
+    // A Bind error mid-fusion: Parse succeeded (ParseComplete) but Bind failed, so
+    // the server sends ParseComplete, ErrorResponse, ReadyForQuery. The
+    // FusedAwaitingBindComplete state classifies the error as recoverable and
+    // drains to idle — the connection survives with the token in `Ok`.
+    let script = concat(&[
+        handshake(),
+        parse_complete(),
+        error_response("ERROR", "22P02", "invalid input syntax"),
+        rfq(b'I'),
+        command_complete("SELECT 1"),
+        rfq(b'I'),
+    ]);
+    let (server_errored, follow_ok) = run(script, |e, live| {
+        let mut cap = Cap::default();
+        let (server_errored, live) = match poll_once(e.query_params_fused(
+            live,
+            "SELECT $1::int",
+            &("not a number",),
+            cap.sink(),
+        )) {
+            Ok(Ok(Outcome {
+                live,
+                status: CommandStatus::ServerErrored,
+            })) => (true, live),
+            other => panic!("expected ServerErrored outcome, got {other:?}"),
+        };
+        let mut cap2 = Cap::default();
+        let follow = poll_once(e.simple_query(live, "SELECT 1", cap2.sink()));
+        let follow_ok = matches!(
+            follow,
+            Ok(Ok(Outcome {
+                status: CommandStatus::Completed,
+                ..
+            }))
+        );
+        (server_errored, follow_ok)
+    });
+    assert!(server_errored, "a Bind error must yield ServerErrored, not a fatal");
+    assert!(follow_ok, "the connection must be reusable after the drained Bind error");
+}
+
 // ── Demo prepared query, built through the sole validating constructor ──
 //
 // `new_prepared_query` is the ONLY way to mint a `PreparedQuery` (the seal —
