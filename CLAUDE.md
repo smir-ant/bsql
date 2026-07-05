@@ -70,6 +70,7 @@ cargo test -p bsql-devgates --test deps_pin            # dependency-frontier gat
 cargo test -p bsql-devgates --test runtime_graph_pin   # build-time-only boundary gate
 cargo test -p bsql-devgates --test doc_links           # intra-doc-link wall (broken-link deny)
 cargo test -p bsql-postgres-proto --test engine_hotpath_codegen  # next_event codegen-stability gate (panic-free + instruction ceiling)
+cargo test -p bsql-postgres-core --test decoder_fuzz   # decoder total-function gate (dep-free fuzz: no decoder panics on any input)
 cargo test -p bsql-sqlite            # SQLite (no PG needed)
 cargo test -p bsql-postgres-async --test sq_live -- --ignored    # async PG (needs local PG)
 cargo test -p bsql-postgres-sync --test sync_live -- --ignored   # sync PG (needs local PG)
@@ -262,6 +263,30 @@ the HOT DataRow arm's zero-allocation is proven separately by
 `pump_active` surfaces every row via `next_event`). Complements
 `engine_asm_identity` (which pins the zero-cost observer seam) — that gate is
 blind to `next_event`'s body; this one covers it.
+
+The `decoder_fuzz` gate (`crates/postgres/core/tests/decoder_fuzz.rs`) is the
+UNIVERSAL-COVERAGE total-function proof for every decoder that turns untrusted
+server or text bytes into a Rust value: on ANY input — malformed, truncated,
+random, or hostile — the decoder must return `Ok` or a CLASSIFIED `Err`, and
+NEVER panic or abort (a panicking decoder is a real vulnerability — a hostile
+server byte could crash the driver). A hand-rolled xorshift64 PRNG with a FIXED
+seed (no `rand`/`proptest`, no clock — fully reproducible, `deps_pin` unchanged)
+feeds a broad length/content sweep (0 bytes up to 64 KiB, off-by-ones around
+every fixed decoder width, plus semi-structured `numeric`/array frames crafted to
+reach the deep base-10000 digit loop and the per-element length framing) to the
+whole surface: `Cell<BinaryFmt/TextFmt>::decode` for every scalar, the array
+decoders (`Vec<Option<T>>`), the `FromStr` parsers (`Uuid`/`Date`/`Time`/
+`Numeric`), the SWAR fast-paths, and `parse_notification`. Because `cargo test`
+runs the test profile (which inherits `dev` — unwind, unlike the `release`
+`panic="abort"`), each decode runs under `catch_unwind` with a recording hook
+that captures any panic's message + location WITHOUT spamming stderr; a caught
+panic fails the gate reporting the exact decoder + input hex + panic. The gate
+has teeth: a committed self-check routes a deliberately-planted panic through the
+same harness and asserts it is caught + captured (which also confirms the profile
+unwinds — under abort it would abort the binary), and a `total >= 150_000`
+assertion refuses a vacuous pass. The decoders are byte-untouched (this is a
+test); if it ever finds a real panic, the fix is a genuine safety fix (a bounds
+check / classified error) in the decoder, never a suppression.
 
 PG tests require: PostgreSQL on localhost:5432, user `smir-ant`, database `postgres`, trust auth.
 SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in pg_hba.conf.
