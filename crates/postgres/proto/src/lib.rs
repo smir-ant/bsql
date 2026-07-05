@@ -156,10 +156,6 @@ pub mod password;
 // external crate. Their `Cell`/`EncodeBinary` impls live in `decode.rs` and
 // their `ColCellAt` row-tuple markers in `prepared.rs`, beside their peers.
 pub mod pgtypes;
-// The decided server-side plan-cache mode for dynamic param-toggle
-// queries (a `const` marker the connection-setup / pool-reset paths
-// consume). See [`plan_mode`].
-pub mod plan_mode;
 // Compile-time budgets for the `query!` macro's dynamic forms (toggled
 // filters / runtime ORDER BY orderings). The generated code asserts
 // against these; an over-budget query is `error[E0080]`.
@@ -216,9 +212,6 @@ pub use ident::{
 pub use startup::{StartupParam, StartupParamError, RESERVED_NAMES};
 pub use password::{Credentials, Password, PasswordError};
 pub use sensitive::Sensitive;
-pub use plan_mode::{
-    PlanCacheMode, PLAN_CACHE_MODE, RESET_PLAN_CACHE_MODE_SQL, SET_PLAN_CACHE_MODE_SQL,
-};
 pub use prepared::{PreparedQuery, QueryFingerprint, RowDecode};
 pub use typed_query::TypedQuery;
 // The connecting-phase engine state enum.

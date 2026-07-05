@@ -95,17 +95,14 @@
 //!
 //! Rely on PostgreSQL's default `auto`: it already keeps every toggle shape
 //! on the index when enabled and on a full scan when disabled, with zero
-//! override and zero collateral on plain statements. The engine bakes this
-//! as [`bsql_postgres_proto::PLAN_CACHE_MODE`] =
-//! [`bsql_postgres_proto::PlanCacheMode::Auto`], with no `SET` on connect
-//! ([`bsql_postgres_proto::SET_PLAN_CACHE_MODE_SQL`] is `None`) and no
-//! `RESET` on pool return ([`bsql_postgres_proto::RESET_PLAN_CACHE_MODE_SQL`]
-//! is `None`). Session-wide `force_custom_plan` was rejected for its
-//! measured collateral re-plan cost on plain statements.
+//! override and zero collateral on plain statements. The engine therefore
+//! issues NO `plan_cache_mode` `SET` on connect and a pool has nothing to
+//! `RESET` on return — there is no plan-cache knob, because the measurement
+//! shows the default already wins. Session-wide `force_custom_plan` was
+//! rejected for its measured collateral re-plan cost on plain statements.
 //!
 //! This test re-derives the evidence against a live server and asserts the
-//! no-degradation behaviour it records, then pins the baked marker to the
-//! winner.
+//! no-degradation behaviour it records.
 
 use bsql_postgres_sync::{ConnectConfig, Connection, SslMode};
 
@@ -397,12 +394,8 @@ fn dynamic_filter_plan_mode_evidence() {
     conn.execute_sql("DEALLOCATE pk2").expect("deallocate plain lookup");
     conn.close().expect("close");
 
-    // The baked marker the engine applies must be the measured winner:
-    // rely on auto, issue no override on connect, reset nothing on return.
-    assert_eq!(
-        bsql_postgres_proto::PLAN_CACHE_MODE,
-        bsql_postgres_proto::PlanCacheMode::Auto,
-    );
-    assert!(bsql_postgres_proto::SET_PLAN_CACHE_MODE_SQL.is_none());
-    assert!(bsql_postgres_proto::RESET_PLAN_CACHE_MODE_SQL.is_none());
+    // The evidence above is the whole assertion: PostgreSQL's default `auto`
+    // keeps every toggle shape on the index and caches the plain lookup's
+    // generic plan, so the engine relies on it and issues no override —
+    // there is no plan-cache knob to pin.
 }
