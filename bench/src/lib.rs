@@ -8,16 +8,24 @@
 //! lives with that client (in the benches / bins), because the three driver
 //! APIs share no trait.
 
-/// PostgreSQL host. TCP loopback: the rebuild's drivers are TCP-only today (no
-/// unix-socket path), so an apples-to-apples comparison runs EVERY client over
-/// the same loopback TCP — comparing bsql-over-TCP against a competitor over a
-/// unix socket would penalise bsql for a transport it cannot yet use. Loopback
-/// TCP is in-kernel (no wire, no switch), which removes the network as a noise
-/// source; the residual noise is scheduler + allocator, controlled by the
-/// quiet-system + warmup discipline in the scripts.
+/// PostgreSQL host. TCP loopback: the cross-CLIENT comparison runs EVERY client
+/// over the same loopback TCP (the competitor drivers wired here dial TCP), so a
+/// group's bars are apples-to-apples. Loopback TCP is in-kernel (no wire, no
+/// switch), which removes the network as a noise source; the residual noise is
+/// scheduler + allocator, controlled by the quiet-system + warmup discipline in
+/// the scripts. bsql ALSO speaks a unix-domain socket now — the
+/// `unix_vs_tcp` bench isolates the bsql-only transport delta (TCP vs the local
+/// socket the original bsql used) via [`bsql_config`] vs [`bsql_config_unix`].
 pub const PG_HOST: &str = "127.0.0.1";
 /// PostgreSQL port.
 pub const PG_PORT: u16 = 5432;
+/// The directory holding PostgreSQL's unix-domain socket (`<dir>/.s.PGSQL.<port>`).
+/// Homebrew PG on macOS defaults to `/tmp`; a Debian/Ubuntu server uses
+/// `/var/run/postgresql`. Overridable at build time via `BSQL_BENCH_SOCKET_DIR`.
+pub const PG_UNIX_SOCKET_DIR: &str = match option_env!("BSQL_BENCH_SOCKET_DIR") {
+    Some(dir) => dir,
+    None => "/tmp",
+};
 /// PostgreSQL user (trust auth on the local dev server).
 pub const PG_USER: &str = "smir-ant";
 /// PostgreSQL database.
@@ -61,6 +69,17 @@ pub fn bsql_config() -> bsql::pg::ConnectConfig {
         .port(PG_PORT)
         .database(PG_DB)
         .ssl_mode(bsql::pg::SslMode::Disable)
+}
+
+/// A `bsql` `ConnectConfig` for the LOCAL UNIX-DOMAIN socket — the absolute-path
+/// host ([`PG_UNIX_SOCKET_DIR`]) selects `<dir>/.s.PGSQL.<port>` (a unix socket
+/// is plaintext, so no `ssl_mode` override is needed). This is the transport the
+/// original bsql used locally; the `unix_vs_tcp` bench measures it against
+/// [`bsql_config`] to isolate the transport delta.
+pub fn bsql_config_unix() -> bsql::pg::ConnectConfig {
+    bsql::pg::ConnectConfig::new(PG_UNIX_SOCKET_DIR, PG_USER)
+        .port(PG_PORT)
+        .database(PG_DB)
 }
 
 /// Current process peak resident-set size, in bytes.

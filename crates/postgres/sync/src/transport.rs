@@ -1,9 +1,24 @@
 //! The blocking I/O socket behind the engine's [`Transport`] seam.
 //!
-//! [`SyncSocket`] wraps a `std::net::TcpStream`: every `Transport` op is a
-//! single blocking std op, so each future resolves on its FIRST poll (never
-//! `Pending`) and the engine's `poll_once` single-poll executor drives the whole
-//! sans-IO engine over it with no async runtime.
+//! [`SyncSocket`] wraps a [`SyncSock`] — a TCP-or-unix std stream — and presents
+//! it through the engine's [`Transport`] quartet: every op is a single blocking
+//! std op, so each future resolves on its FIRST poll (never `Pending`) and the
+//! engine's `poll_once` single-poll executor drives the whole sans-IO engine over
+//! it with no async runtime.
+//!
+//! # Carrying TCP and unix behind ONE concrete socket type
+//!
+//! A local connection over an absolute-path host is a unix-domain socket
+//! (`std::os::unix::net::UnixStream`); every other host is a `std::net::TcpStream`.
+//! Rather than making the whole `Connection` (a concrete `Core<SyncSocket>` after
+//! the engine collapse) generic over the socket — a generic ripple through every
+//! re-export, the pool, and the static assertions — the duality lives in a single
+//! [`SyncSock`] enum ONE level down. `Connection` and the engine stay monomorphic
+//! over the single `SyncSocket` type; the enum dispatches TCP-vs-unix with one
+//! branch inside each leaf syscall op, a branch the kernel read/write cost dwarfs
+//! (near-zero-cost). A boxed `dyn` transport would instead add a vtable
+//! indirection per syscall, and `Transport`'s async-fn RPITIT is not even
+//! dyn-compatible; the enum is the zero-cost shape.
 //!
 //! The plaintext-or-TLS multiplexer the engine is monomorphic over —
 //! [`Wire`](bsql_postgres_core::tls::Wire) — lives in `bsql-postgres-core`,
@@ -11,27 +26,129 @@
 //! supplies only the blocking socket arm it wraps.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
+use bsql_postgres_core::footprint_pin;
 use bsql_postgres_proto::engine::Transport;
 
-/// A blocking `std::net::TcpStream` presented through the engine's
+/// A blocking std stream that is EITHER a TCP socket or a unix-domain socket.
+///
+/// The two arms carry identical capability — both `std::net::TcpStream` and
+/// `std::os::unix::net::UnixStream` are file-descriptor handles offering the
+/// same `Read`/`Write`, `set_{read,write}_timeout`, `try_clone`, and `shutdown`
+/// — so this enum forwards each to the active arm. It is used for BOTH the
+/// engine-owned data socket (wrapped in [`SyncSocket`]) and the connection's
+/// `try_clone`d control handle (which arms read/write timeouts on a fd the engine
+/// otherwise owns), so the TCP/unix duality is expressed exactly once.
+///
+/// `TCP_NODELAY` is deliberately NOT a method here: it is meaningless on
+/// `AF_UNIX` and is set on the raw `TcpStream` before it is wrapped, so no unix
+/// arm ever needs to skip it.
+pub enum SyncSock {
+    /// A TCP socket (the default, non-path host).
+    Tcp(TcpStream),
+    /// A unix-domain socket (an absolute-path host).
+    Unix(UnixStream),
+}
+
+// A `TcpStream`/`UnixStream` is a 4-byte fd handle; the two-arm enum is that plus
+// a discriminant, rounded to 8. The pin makes the +4 B (over a bare `TcpStream`)
+// the socket duality costs a visible, reviewed number rather than a silent drift.
+footprint_pin!(SyncSock, size = 8, align = 4);
+
+impl SyncSock {
+    /// Set the blocking read timeout on the underlying fd (`None` = block
+    /// indefinitely). Used to bound the connect-phase handshake and each
+    /// `recv_notification` wait, then disarm.
+    #[inline]
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        match self {
+            SyncSock::Tcp(s) => s.set_read_timeout(dur),
+            SyncSock::Unix(s) => s.set_read_timeout(dur),
+        }
+    }
+
+    /// Set the blocking write timeout on the underlying fd (`None` = block
+    /// indefinitely).
+    #[inline]
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        match self {
+            SyncSock::Tcp(s) => s.set_write_timeout(dur),
+            SyncSock::Unix(s) => s.set_write_timeout(dur),
+        }
+    }
+
+    /// Duplicate the fd into a second handle sharing the same kernel socket — so
+    /// a timeout armed on the clone applies to the engine's own reads and writes.
+    #[inline]
+    pub fn try_clone(&self) -> io::Result<SyncSock> {
+        match self {
+            SyncSock::Tcp(s) => s.try_clone().map(SyncSock::Tcp),
+            SyncSock::Unix(s) => s.try_clone().map(SyncSock::Unix),
+        }
+    }
+
+    /// Shut the write half so the peer sees a clean FIN.
+    #[inline]
+    fn shutdown_write(&self) -> io::Result<()> {
+        match self {
+            SyncSock::Tcp(s) => s.shutdown(Shutdown::Write),
+            SyncSock::Unix(s) => s.shutdown(Shutdown::Write),
+        }
+    }
+}
+
+impl Read for SyncSock {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            SyncSock::Tcp(s) => s.read(buf),
+            SyncSock::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for SyncSock {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            SyncSock::Tcp(s) => s.write(buf),
+            SyncSock::Unix(s) => s.write(buf),
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            SyncSock::Tcp(s) => s.flush(),
+            SyncSock::Unix(s) => s.flush(),
+        }
+    }
+}
+
+/// A blocking [`SyncSock`] (TCP or unix) presented through the engine's
 /// [`Transport`] seam.
 ///
 /// Every op is a single blocking std call evaluated eagerly, then handed back as
 /// an already-resolved [`core::future::Ready`] — so the seam's futures never
 /// return `Pending` and `poll_once` completes them in one poll. `write` performs
 /// exactly one `write` syscall (the seam's one-attempt contract — looping is the
-/// engine's job), `flush` is a no-op (a TCP socket has no userspace buffer), and
-/// `shutdown` closes the write half so the peer sees a clean FIN.
+/// engine's job), `flush` is a no-op (a stream socket has no userspace buffer),
+/// and `shutdown` closes the write half so the peer sees a clean FIN.
 pub struct SyncSocket {
-    stream: TcpStream,
+    stream: SyncSock,
 }
 
+// The wrapper is exactly its inner `SyncSock` — the same 8 B — with no added
+// state. Pinned so the wrapper cannot silently grow past the socket it carries.
+footprint_pin!(SyncSocket, size = 8, align = 4);
+
 impl SyncSocket {
-    /// Wrap an already-connected `TcpStream`.
+    /// Wrap an already-connected [`SyncSock`] (a TCP or unix stream).
     #[must_use]
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: SyncSock) -> Self {
         Self { stream }
     }
 }
@@ -75,8 +192,8 @@ impl Transport for SyncSocket {
     fn flush<'a>(
         &'a mut self,
     ) -> impl core::future::Future<Output = Result<(), io::Error>> + Send + 'a {
-        // A plaintext TCP socket holds no userspace buffer, so `flush` has
-        // nothing to drain — `TcpStream`'s `Write::flush` is `Ok(())`.
+        // A plaintext stream socket holds no userspace buffer, so `flush` has
+        // nothing to drain — `Write::flush` is `Ok(())`.
         core::future::ready(Write::flush(&mut self.stream))
     }
 
@@ -84,6 +201,6 @@ impl Transport for SyncSocket {
     fn shutdown<'a>(
         &'a mut self,
     ) -> impl core::future::Future<Output = Result<(), io::Error>> + Send + 'a {
-        core::future::ready(self.stream.shutdown(std::net::Shutdown::Write))
+        core::future::ready(self.stream.shutdown_write())
     }
 }

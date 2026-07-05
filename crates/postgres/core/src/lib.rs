@@ -37,7 +37,7 @@ pub mod tls;
 pub mod typed_rows;
 pub mod types;
 
-pub use config::{validate_startup_params, ConnectConfig, SslMode};
+pub use config::{resolve_endpoint, validate_startup_params, ConnectConfig, Endpoint, SslMode};
 pub use driver::{Core, PreparedStatement};
 pub use error::{ColumnError, DbError, DriverError};
 pub use materialize::{CollectedResult, DbErrorSink, ResultCollector};

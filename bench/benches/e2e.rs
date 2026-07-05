@@ -16,8 +16,9 @@
 //! # Noise control
 //!
 //! - Loopback TCP: no wire, no switch, in-kernel — the network is removed as a
-//!   noise source. (bsql's drivers are TCP-only today, so every client uses TCP
-//!   for fairness; see the README for the unix-socket follow-up.)
+//!   noise source. Every client uses TCP here for fairness (the competitor
+//!   drivers wired in dial TCP); the bsql-only unix-socket transport delta lives
+//!   in the `unix_vs_tcp` bench.
 //! - `bench/setup/pg_setup.sql` disables autovacuum on the bench tables and
 //!   CHECKPOINTs before measuring, so no background vacuum/checkpoint fires
 //!   mid-sample.

@@ -320,6 +320,25 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 - No `expect()` or `unwrap()` in production code
 - Error types: `DriverError::Db(DbError)` for server errors with SQLSTATE, `DriverError::Config` for pre-connect validation, `DriverError::NoRows` for empty results
 - `ConnectConfig` is `#[non_exhaustive]` — construct via `new()` + builder methods
+- Transport (both drivers) is chosen by libpq's rule, centralized once in
+  `core::resolve_endpoint`: an ABSOLUTE-PATH host (begins with `/`, e.g.
+  `ConnectConfig::new("/tmp", …)`, `PGHOST=/var/run/postgresql`, or the DSN
+  `postgresql://u@/db?host=/var/run/postgresql` query parameter — libpq's
+  unix-socket URL form, since the path's leading `/` cannot ride the URL
+  authority) selects a UNIX-DOMAIN socket at `<host>/.s.PGSQL.<port>`; every
+  other host is TCP. A `host=` DSN parameter overrides the authority host (query
+  param wins, libpq parity); an empty authority host with no `host=` is a loud
+  `from_dsn` error naming the fix. The
+  TCP/unix duality lives in a single socket enum ONE level below the concrete
+  `Connection` (`transport::Sock` async, `transport::SyncSock` sync) so
+  `Connection` and the engine stay monomorphic (no new generic, no `dyn`
+  vtable-per-syscall). `TCP_NODELAY` and the `SSLRequest` probe are TCP-only. A
+  unix socket is ALWAYS plaintext (`is_encrypted()` == false — TLS is pointless
+  on a local kernel socket and PostgreSQL does not offer it there), so
+  `SslMode::Require` over a unix host is a fail-loud `DriverError::Config`, and
+  `Prefer` over unix is plaintext with NO downgrade warning (nothing was
+  downgraded). Measured local win: the unix socket is ~2.4–2.9× faster than
+  loopback TCP on the by-PK single-round-trip (`bench/benches/unix_vs_tcp.rs`).
 - `SslMode::Prefer` warns on stderr (debug AND release) when the server refuses
   SSL and it falls back to plain TCP — an SSL downgrade is a security event a
   production build must not hide. A consumer can also assert

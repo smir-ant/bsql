@@ -66,6 +66,11 @@ codegen-units = 1
 name = "e2e"
 harness = false
 
+# bsql-only transport delta: loopback TCP vs the local unix-domain socket.
+[[bench]]
+name = "unix_vs_tcp"
+harness = false
+
 # Peak-RSS harnesses — one binary per client so each measured process links and
 # faults in ONLY that client's code (a single arg-selected binary would leave
 # the other clients' code linked-but-cold, muddying the resident figure).

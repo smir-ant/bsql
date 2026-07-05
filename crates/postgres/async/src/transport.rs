@@ -29,14 +29,88 @@
 //! dropped mid-flight, so the token is never stranded.
 
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpStream, UnixStream};
 use tokio::time::Instant;
 
 use bsql_postgres_proto::engine::Transport;
+
+/// A tokio async stream that is EITHER a TCP socket or a unix-domain socket.
+///
+/// A local connection over an absolute-path host is a `tokio::net::UnixStream`;
+/// every other host is a `tokio::net::TcpStream`. Rather than making the whole
+/// `Connection` (a concrete `Core<TokioSocket>` after the engine collapse)
+/// generic over the socket — a generic ripple through every re-export, the pool,
+/// and the static assertions — the duality lives in this enum ONE level down.
+/// `Connection` and the engine stay monomorphic over the single [`TokioSocket`]
+/// type; the enum forwards its `AsyncRead`/`AsyncWrite` poll to the active arm
+/// with one branch, a branch the reactor + syscall cost dwarfs (near-zero-cost).
+/// A boxed `dyn` transport would instead add a vtable indirection per poll, and
+/// `Transport`'s async-fn RPITIT is not even dyn-compatible; the enum is the
+/// zero-cost shape.
+///
+/// Both tokio streams are `Unpin`, so the `AsyncRead`/`AsyncWrite` forwards use a
+/// safe `Pin::new` re-pin of the active arm (no unsafe pin projection) — the
+/// crate stays `#![forbid(unsafe_code)]`. Presenting the enum through the tokio
+/// I/O traits keeps [`TokioSocket`]'s read-deadline logic byte-identical: it
+/// still calls `self.stream.read(buf).await` on a single `AsyncRead + Unpin`
+/// value, unaware whether the fd underneath is TCP or unix.
+pub enum Sock {
+    /// A TCP socket (the default, non-path host).
+    Tcp(TcpStream),
+    /// A unix-domain socket (an absolute-path host).
+    Unix(UnixStream),
+}
+
+impl AsyncRead for Sock {
+    #[inline]
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // `get_mut` needs `Self: Unpin` (both arms are), so no unsafe projection.
+        match self.get_mut() {
+            Sock::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Sock::Unix(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Sock {
+    #[inline]
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Sock::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            Sock::Unix(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    #[inline]
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Sock::Tcp(s) => Pin::new(s).poll_flush(cx),
+            Sock::Unix(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    #[inline]
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Sock::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            Sock::Unix(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 /// A read deadline shared between the driver and the [`TokioSocket`] the engine
 /// owns.
@@ -105,24 +179,47 @@ impl ReadDeadline {
     }
 }
 
-/// A `tokio::net::TcpStream` presented through the engine's [`Transport`] seam.
+/// A tokio [`Sock`] (TCP or unix) presented through the engine's [`Transport`]
+/// seam.
 ///
 /// Each op is genuinely asynchronous: `read`/`write` return `Pending` until the
 /// socket is ready, so the engine's pump future suspends and is woken by tokio's
 /// reactor — the wakeup path the always-ready scripted transports never exercise.
 /// `write` performs exactly one `poll_write` attempt (the seam's one-attempt
 /// contract — looping is the engine's job), `flush` drives tokio's writer flush
-/// (a no-op for a bare `TcpStream`), and `shutdown` closes the write half so the
-/// peer sees a clean FIN.
+/// (a no-op for a bare stream socket), and `shutdown` closes the write half so
+/// the peer sees a clean FIN.
 pub(crate) struct TokioSocket {
-    stream: TcpStream,
+    stream: Sock,
     deadline: Arc<ReadDeadline>,
 }
 
+// Footprint contract for the socket duality — pinned RELATIVELY, not absolutely.
+//
+// A tokio `TcpStream`/`UnixStream`'s size is a feature-unification-dependent
+// INTERNAL detail (net-only resolves ~16 B; net+rt, as a `cargo test` build
+// unifies via dev-deps, ~40 B), so an absolute `size_of` pin would be brittle
+// and could even disagree between `cargo check` and `cargo test` of this very
+// crate. These relative assertions instead capture exactly what OUR change
+// costs, and hold regardless of tokio's absolute layout:
+//   1. both arms are the same fd-backed size (no arm is secretly larger);
+//   2. `Sock` adds only a single (pointer-sized) discriminant over one stream —
+//      the whole cost of carrying TCP-or-unix;
+//   3. `TokioSocket` adds only the shared read-deadline `Arc` pointer over `Sock`
+//      (no other per-connection state crept in).
+// (The blocking driver's socket rides std types with a stable layout, so it
+// pins its ABSOLUTE 8/4 footprint; the asymmetry is deliberate.)
+const _: () = {
+    use core::mem::size_of;
+    assert!(size_of::<TcpStream>() == size_of::<UnixStream>());
+    assert!(size_of::<Sock>() <= size_of::<TcpStream>() + size_of::<usize>());
+    assert!(size_of::<TokioSocket>() == size_of::<Sock>() + size_of::<Arc<ReadDeadline>>());
+};
+
 impl TokioSocket {
-    /// Wrap an already-connected `TcpStream`, sharing the driver's read-deadline
-    /// cell.
-    pub(crate) fn new(stream: TcpStream, deadline: Arc<ReadDeadline>) -> Self {
+    /// Wrap an already-connected [`Sock`] (a TCP or unix stream), sharing the
+    /// driver's read-deadline cell.
+    pub(crate) fn new(stream: Sock, deadline: Arc<ReadDeadline>) -> Self {
         Self { stream, deadline }
     }
 }
@@ -204,7 +301,7 @@ mod tests {
 
     use bsql_postgres_proto::engine::Transport;
 
-    use super::{ReadDeadline, TokioSocket};
+    use super::{ReadDeadline, Sock, TokioSocket};
 
     #[tokio::test]
     async fn read_honours_an_armed_deadline_then_reads_after_disarm() {
@@ -216,7 +313,7 @@ mod tests {
         let (mut server, _peer) = listener.accept().await.expect("accept");
 
         let deadline = Arc::new(ReadDeadline::new());
-        let mut socket = TokioSocket::new(client, Arc::clone(&deadline));
+        let mut socket = TokioSocket::new(Sock::Tcp(client), Arc::clone(&deadline));
 
         // Arm a short deadline; the silent peer never sends, so the read must time
         // out (not hang, not error fatally).

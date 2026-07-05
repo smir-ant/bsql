@@ -1,13 +1,59 @@
 #![forbid(unsafe_code)]
 use core::str::FromStr as _;
 
-use bsql_postgres_async::{ColumnError, ConnectConfig, Connection};
+use bsql_postgres_async::{ColumnError, ConnectConfig, Connection, DriverError, SslMode};
 use bsql_postgres_proto::{DecodeError, Json, Numeric};
 
 // ═══════════════════════════════════════════════════════════
 // Driver-specific tests (async I/O, TLS, pool, protocol)
 // SQL coverage is in the shared macro at the bottom.
 // ═══════════════════════════════════════════════════════════
+
+/// WITNESS (unix-domain transport): connect over the LOCAL UNIX SOCKET (host is
+/// the socket dir `/tmp`, turned into `<dir>/.s.PGSQL.<port>` by libpq's rule),
+/// round-trip a query, and confirm the connection is plaintext (`is_encrypted()`
+/// == false). This is the transport the original bsql used and the bench baseline
+/// assumed; it proves the new AF_UNIX path end-to-end on the async driver.
+#[tokio::test]
+#[ignore = "requires local PG on a unix socket"]
+async fn connect_over_unix_socket_and_query() {
+    let cfg = ConnectConfig::new("/tmp", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&cfg).await.expect("unix-socket connect");
+    c.ping().await.expect("ping over unix socket");
+    assert!(c.is_healthy());
+    assert!(
+        !c.is_encrypted(),
+        "a unix-domain socket carries no TLS — is_encrypted() must be false"
+    );
+    assert!(c.backend_pid() > 0);
+    // A real decode round-trip over the socket, not just a framing ping.
+    let row = c
+        .query_one_sql("SELECT 'bsql-over-unix'")
+        .await
+        .expect("query over unix socket");
+    assert_eq!(row.get_str(0), Ok(Some("bsql-over-unix")));
+    c.close().await.expect("close");
+}
+
+/// FAIL LOUD: `SslMode::Require` over a unix-domain socket is a classified
+/// `DriverError::Config` — never a silent plaintext downgrade. Needs NO live PG:
+/// the rejection precedes the connect syscall (it still completes within the
+/// `connect_timeout` budget wrapping the sequence).
+#[tokio::test]
+async fn unix_socket_ssl_require_is_a_loud_config_error() {
+    let cfg =
+        ConnectConfig::new("/var/run/postgresql", "u").ssl_mode(SslMode::Require);
+    match Connection::connect(&cfg).await {
+        Err(DriverError::Config(msg)) => assert!(
+            msg.contains("unix-domain socket"),
+            "the error must name the unix-socket cause, got {msg:?}"
+        ),
+        // `Connection` is not `Debug`, so the `Ok` arm cannot print it — the
+        // failure message is explicit instead.
+        Ok(_) => panic!("Require over a unix socket must fail, but a connection opened"),
+        Err(other) => panic!("Require over a unix socket must be a Config error, got {other:?}"),
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires local PG"]

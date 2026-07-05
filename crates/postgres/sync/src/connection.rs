@@ -28,6 +28,7 @@ use core::ops::ControlFlow;
 use core::str::FromStr;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use bsql_postgres_core::driver::{
@@ -36,8 +37,8 @@ use bsql_postgres_core::driver::{
 use bsql_postgres_core::sql_ident;
 use bsql_postgres_core::tls::{self, TlsTransport, Wire};
 use bsql_postgres_core::{
-    validate_startup_params, ConnectConfig, DriverError, Notification, QueryResult, Row, Rows,
-    SslMode, TypedNotification,
+    resolve_endpoint, validate_startup_params, ConnectConfig, DriverError, Endpoint, Notification,
+    QueryResult, Row, Rows, SslMode, TypedNotification,
 };
 use bsql_postgres_proto::engine::{self, EngineError, SpuriousPending};
 use bsql_postgres_proto::params::ParamsWriter;
@@ -45,7 +46,7 @@ use bsql_postgres_proto::{
     Credentials, DatabaseName, Ident, Password, PreparedQuery, RowDecode, Sensitive, TypedQuery,
 };
 
-use crate::transport::SyncSocket;
+use crate::transport::{SyncSock, SyncSocket};
 
 /// The prepared-statement handle (defined once in `bsql-postgres-core`, shared by
 /// both drivers). Re-exported so `bsql_postgres_sync::PreparedStatement` resolves.
@@ -140,47 +141,72 @@ pub struct Connection {
     /// facts + notification ledger (+ the N+1 tracker under `n1-detect`). Every
     /// non-I/O verb is defined on it once and shared with the async driver.
     core: Core<SyncSocket>,
-    /// A `try_clone` of the underlying socket, used to arm socket read/write
-    /// timeouts on a fd the engine otherwise owns: a dup'd handle shares the same
-    /// kernel socket, so a timeout set here applies to the engine's own reads and
-    /// writes. [`connect`](Self::connect) bounds the TCP-connect + handshake with
-    /// `connect_timeout` then disarms it (steady-state I/O blocks indefinitely,
-    /// matching the async driver); [`recv_notification`](Self::recv_notification)
-    /// arms a bounded read deadline for its own poll and restores the disarmed
-    /// state on exit. `None` for an in-memory testkit connection, which never
-    /// blocks — the arming is then a no-op.
-    socket_ctl: Option<TcpStream>,
+    /// A `try_clone` of the underlying socket (TCP or unix), used to arm socket
+    /// read/write timeouts on a fd the engine otherwise owns: a dup'd handle
+    /// shares the same kernel socket, so a timeout set here applies to the
+    /// engine's own reads and writes. [`connect`](Self::connect) bounds the
+    /// connect + handshake with `connect_timeout` then disarms it (steady-state
+    /// I/O blocks indefinitely, matching the async driver);
+    /// [`recv_notification`](Self::recv_notification) arms a bounded read deadline
+    /// for its own poll and restores the disarmed state on exit. `None` for an
+    /// in-memory testkit connection, which never blocks — the arming is then a
+    /// no-op.
+    socket_ctl: Option<SyncSock>,
 }
 
 impl Connection {
-    /// Open a connection: TCP connect, optional TLS negotiation, then the
-    /// startup/auth handshake through the engine.
+    /// Open a connection: TCP or unix-socket connect, optional TLS negotiation,
+    /// then the startup/auth handshake through the engine.
+    ///
+    /// The transport is chosen by libpq's rule: an ABSOLUTE-PATH host (begins
+    /// with `/`) selects a unix-domain socket at `<host>/.s.PGSQL.<port>`; every
+    /// other host is TCP. A unix socket connects PLAINTEXT (TLS is pointless on a
+    /// local kernel socket, and PostgreSQL does not offer it there), so
+    /// [`SslMode::Require`] over a unix host is a fail-loud
+    /// [`DriverError::Config`] rather than a silently-broken TLS contract.
     ///
     /// # Errors
     ///
     /// A classified [`DriverError`] for any pre-connect validation, transport,
     /// TLS, or handshake failure — never a panic.
     pub fn connect(config: &ConnectConfig) -> Result<Self, DriverError> {
-        let addr = format!("{}:{}", config.host, config.port);
-        let tcp = TcpStream::connect(&addr)?;
-        // Disable Nagle on the data socket for the connection's whole life —
-        // Nagle + delayed-ACK can add ~40ms stalls to small writes and COPY-in
-        // streaming; one setsockopt with zero per-op cost.
-        tcp.set_nodelay(true)?;
-        // `connect_timeout` bounds ONLY the connect phase — the TCP connect, the
-        // TLS `SSLRequest` probe, and the startup/auth handshake — armed as the
-        // socket read+write timeout here and DISARMED once the handshake completes
+        let endpoint = resolve_endpoint(&config.host, config.port);
+        // Fail LOUD: TLS cannot be required over a socket that will never do it.
+        // Rejected before the connect syscall — a wasted dial would tell us
+        // nothing, and this is a pre-connect configuration fault.
+        if endpoint.is_unix() && config.ssl_mode == SslMode::Require {
+            return Err(DriverError::Config(
+                "SslMode::Require cannot be honored over a unix-domain socket \
+                 (TLS is not available on a local socket)",
+            ));
+        }
+        let sock = match endpoint {
+            Endpoint::Tcp(addr) => {
+                let tcp = TcpStream::connect(&addr)?;
+                // Disable Nagle on the data socket for the connection's whole life
+                // — Nagle + delayed-ACK can add ~40ms stalls to small writes and
+                // COPY-in streaming; one setsockopt with zero per-op cost. Nagle
+                // is a TCP concept — `AF_UNIX` has no such buffering, so the unix
+                // arm skips it (it is meaningless, not an error).
+                tcp.set_nodelay(true)?;
+                SyncSock::Tcp(tcp)
+            }
+            Endpoint::Unix(path) => SyncSock::Unix(UnixStream::connect(&path)?),
+        };
+        // `connect_timeout` bounds ONLY the connect phase — the SSL `SSLRequest`
+        // probe (TCP only) and the startup/auth handshake — armed as the socket
+        // read+write timeout here and DISARMED once the handshake completes
         // (below): steady-state reads/writes then block indefinitely, matching the
         // async driver, so a slow query can never turn a healthy connection into a
         // fatal timeout.
         let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
-        tcp.set_read_timeout(Some(connect_timeout))?;
-        tcp.set_write_timeout(Some(connect_timeout))?;
+        sock.set_read_timeout(Some(connect_timeout))?;
+        sock.set_write_timeout(Some(connect_timeout))?;
         // The dup'd control handle shares the kernel socket. Taken before the
         // socket is moved into the wire / TLS layer.
-        let socket_ctl = tcp.try_clone()?;
+        let socket_ctl = sock.try_clone()?;
 
-        let wire = Self::build_wire(tcp, config)?;
+        let wire = Self::build_wire(sock, config)?;
         // Snapshot the encryption state from the built wire BEFORE it is moved
         // into the engine.
         let encrypted = wire.is_encrypted();
@@ -267,12 +293,19 @@ impl Connection {
 
     /// Build the plaintext or TLS wire, performing the PG `SSLRequest` negotiation
     /// on the raw socket when SSL is wanted.
-    fn build_wire(tcp: TcpStream, config: &ConnectConfig) -> Result<SyncWire, DriverError> {
-        if config.ssl_mode == SslMode::Disable {
-            return Ok(Wire::Plain(SyncSocket::new(tcp)));
+    ///
+    /// A unix-domain socket is ALWAYS plaintext: TLS over a local kernel socket is
+    /// pointless, PostgreSQL does not offer it there, and `SslMode::Require` +
+    /// unix was already rejected by [`connect`](Self::connect). So the
+    /// `SSLRequest` probe runs only for a TCP socket with SSL wanted; `Prefer`
+    /// over unix is plaintext with no probe and no downgrade warning (nothing was
+    /// downgraded — TLS was never applicable to a local socket).
+    fn build_wire(sock: SyncSock, config: &ConnectConfig) -> Result<SyncWire, DriverError> {
+        if matches!(sock, SyncSock::Unix(_)) || config.ssl_mode == SslMode::Disable {
+            return Ok(Wire::Plain(SyncSocket::new(sock)));
         }
         let ssl_bytes = bsql_postgres_core::ssl::ssl_request_bytes();
-        let mut tcp = tcp;
+        let mut tcp = sock;
         // The armed connect-phase `connect_timeout` firing on a server silent on
         // the `SSLRequest` probe byte is a connect-phase TIMEOUT, classified as
         // such via `lift_probe_io`: the SAME class the async driver and the

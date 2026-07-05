@@ -116,6 +116,26 @@ impl ConnectConfig {
     /// - `postgres://user@host/db` — no password, default port
     /// - `postgres://user:pass@host` — no database (defaults to user)
     /// - `postgres://user@host?sslmode=disable`
+    ///
+    /// # Unix-domain sockets — the `host` query parameter (libpq parity)
+    ///
+    /// A unix socket dir is an absolute path, which cannot ride the URL
+    /// *authority* host slot (its leading `/` is the authority/path delimiter, so
+    /// `postgres://u@/tmp/db` parses `/tmp/db` as the database on an EMPTY host).
+    /// libpq's canonical URL form for a unix socket puts the socket directory in
+    /// the `host` **query parameter** instead — and that is supported here:
+    ///
+    /// - `postgresql://user@/dbname?host=/var/run/postgresql` → unix socket
+    /// - `postgresql://user@/dbname?host=/tmp` → unix socket at `/tmp/.s.PGSQL.<port>`
+    ///
+    /// A `host=` query parameter OVERRIDES the authority host (matching libpq: the
+    /// query parameter wins); it works for a TCP host too
+    /// (`postgres://u@ignored/db?host=realhost`). The authority `port` (or the
+    /// default `5432`) still applies — including to a unix socket's filename.
+    ///
+    /// An EMPTY authority host with no `host=` parameter (`postgres://u@/db`) is a
+    /// loud error naming the `host=` form — never a silent connect to a
+    /// port-only TCP address.
     pub fn from_dsn(dsn: &str) -> Result<Self, String> {
         let s = dsn.strip_prefix("postgres://")
             .or_else(|| dsn.strip_prefix("postgresql://"))
@@ -161,6 +181,10 @@ impl ConnectConfig {
         let mut ssl_mode = SslMode::Prefer;
         let mut timeout = 10u64;
         let mut ca_roots_pem: Option<Arc<[u8]>> = None;
+        // `host=` OVERRIDES the authority host (libpq: the query parameter wins).
+        // The canonical way to name a unix-socket directory in a PG URL, whose
+        // leading `/` cannot ride the authority slot.
+        let mut host_override: Option<String> = None;
         if let Some(q) = query {
             for param in q.split('&') {
                 // A parameter with no `=` carries no value. Silently skipping it
@@ -171,6 +195,16 @@ impl ConnectConfig {
                     None => return Err(format!("malformed DSN parameter (missing '='): {param}")),
                 };
                 match k {
+                    "host" => {
+                        // libpq's unix-socket URL form:
+                        // `postgresql://u@/db?host=/var/run/postgresql`. An
+                        // absolute-path value routes to a unix socket via
+                        // `resolve_endpoint`; a plain name is a TCP host override.
+                        // No percent-decoding: `/` is a legal query-component
+                        // character (RFC 3986 §3.4), so a socket path needs none,
+                        // and a value carrying `&`/`=`/`?` is not a real socket dir.
+                        host_override = Some(v.to_string());
+                    }
                     "sslmode" => {
                         ssl_mode = match v {
                             "disable" => SslMode::Disable,
@@ -203,6 +237,24 @@ impl ConnectConfig {
                     other => return Err(format!("unknown DSN parameter: {other}")),
                 }
             }
+        }
+
+        // The `host=` query parameter (if present) wins over the authority host.
+        let host = match host_override {
+            Some(overridden) => overridden,
+            None => host,
+        };
+        // An empty host is unroutable: `resolve_endpoint("", port)` would yield the
+        // port-only TCP address `:<port>`, a confusing loud connect failure. Reject
+        // it at parse time with the fix — the `host=` form (the only way to name a
+        // unix-socket directory, whose leading `/` cannot ride the URL authority).
+        if host.is_empty() {
+            return Err(
+                "empty host in DSN authority; give the host via the \"host\" query \
+                 parameter — e.g. \"?host=/var/run/postgresql\" for a unix-domain \
+                 socket, or \"?host=db.example.com\" for TCP"
+                    .to_string(),
+            );
         }
 
         Ok(Self {
@@ -433,6 +485,62 @@ impl ConnectConfig {
     }
 }
 
+/// A resolved connection target derived from a [`ConnectConfig`]'s `host` +
+/// `port`, classified by libpq's absolute-path rule.
+///
+/// # The rule
+///
+/// A host that is an ABSOLUTE PATH (begins with `/`) selects a **unix-domain
+/// socket** at `<host>/.s.PGSQL.<port>` rather than TCP/IP — exactly libpq's
+/// convention, so `host=/var/run/postgresql` (or `PGHOST=/tmp`, or
+/// `ConnectConfig::new("/tmp", …)`) connects over the local socket with no TCP,
+/// no Nagle, and no loopback stack. Every other host is a TCP endpoint
+/// `host:port`. Both drivers route through [`resolve_endpoint`], so the rule is
+/// defined once and cannot drift between them.
+///
+/// The abstract-namespace (`@`-prefixed) Linux variant is deliberately NOT
+/// modelled: it is Linux-only and non-portable, and the filesystem-path form is
+/// the one PostgreSQL creates by default on every platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    /// A TCP endpoint — the `host:port` string a driver dials.
+    Tcp(String),
+    /// A unix-domain socket at `<host-dir>/.s.PGSQL.<port>`.
+    Unix(std::path::PathBuf),
+}
+
+impl Endpoint {
+    /// Whether this endpoint is a unix-domain socket.
+    ///
+    /// A driver uses this to gate the TCP-only steps (`TCP_NODELAY`, the
+    /// `SSLRequest` probe) and to reject `SslMode::Require`, which a local socket
+    /// cannot satisfy.
+    #[must_use]
+    #[inline]
+    pub fn is_unix(&self) -> bool {
+        matches!(self, Endpoint::Unix(_))
+    }
+}
+
+/// Resolve a `host` + `port` into an [`Endpoint`] via libpq's absolute-path rule
+/// (see [`Endpoint`]).
+///
+/// Pure and infallible: an absolute-path host yields
+/// [`Endpoint::Unix`]`(<host>/.s.PGSQL.<port>)`, every other host yields
+/// [`Endpoint::Tcp`]`("host:port")`. Whether the resulting socket path or TCP
+/// address actually connects is decided later, by the driver's connect syscall
+/// (a missing socket file or a refused port is a classified transport error
+/// there) — this function only classifies.
+#[must_use]
+pub fn resolve_endpoint(host: &str, port: u16) -> Endpoint {
+    if host.starts_with('/') {
+        // libpq's socket filename: `<dir>/.s.PGSQL.<port>`.
+        Endpoint::Unix(std::path::Path::new(host).join(format!(".s.PGSQL.{port}")))
+    } else {
+        Endpoint::Tcp(format!("{host}:{port}"))
+    }
+}
+
 /// Validate a config's raw startup parameters into wire
 /// [`StartupParam`](bsql_postgres_proto::StartupParam)s.
 ///
@@ -641,5 +749,124 @@ mod tests {
             validate_startup_params(&cfg),
             Err(crate::DriverError::Config(_)),
         ));
+    }
+
+    #[test]
+    fn resolve_endpoint_classifies_tcp_hosts() {
+        // A hostname and a dotted-quad are both TCP endpoints `host:port`.
+        assert_eq!(
+            resolve_endpoint("localhost", 5432),
+            Endpoint::Tcp("localhost:5432".to_string()),
+        );
+        assert_eq!(
+            resolve_endpoint("127.0.0.1", 6000),
+            Endpoint::Tcp("127.0.0.1:6000".to_string()),
+        );
+        assert!(!resolve_endpoint("localhost", 5432).is_unix());
+    }
+
+    #[test]
+    fn resolve_endpoint_classifies_absolute_path_hosts_as_unix() {
+        // libpq's rule: an absolute-path host selects the unix socket at
+        // `<dir>/.s.PGSQL.<port>` — the exact filename PostgreSQL creates.
+        assert_eq!(
+            resolve_endpoint("/tmp", 5432),
+            Endpoint::Unix(std::path::PathBuf::from("/tmp/.s.PGSQL.5432")),
+        );
+        assert_eq!(
+            resolve_endpoint("/var/run/postgresql", 5433),
+            Endpoint::Unix(std::path::PathBuf::from("/var/run/postgresql/.s.PGSQL.5433")),
+        );
+        assert!(resolve_endpoint("/tmp", 5432).is_unix());
+    }
+
+    #[test]
+    fn resolve_endpoint_trailing_slash_and_root_are_unix() {
+        // A trailing slash on the socket dir must not double-up; `Path::join`
+        // handles the separator. Root (`/`) is degenerate but still a path host.
+        assert_eq!(
+            resolve_endpoint("/var/run/postgresql/", 5432),
+            Endpoint::Unix(std::path::PathBuf::from("/var/run/postgresql/.s.PGSQL.5432")),
+        );
+        assert!(resolve_endpoint("/", 5432).is_unix());
+    }
+
+    /// Resolve a parsed DSN's `host`/`port` the way a driver does at connect —
+    /// the offline proof that a DSN reaches the intended [`Endpoint`] without a
+    /// live PG.
+    fn dsn_endpoint(dsn: &str) -> Result<Endpoint, String> {
+        let cfg = ConnectConfig::from_dsn(dsn)?;
+        Ok(resolve_endpoint(&cfg.host, cfg.port))
+    }
+
+    #[test]
+    fn dsn_host_query_param_routes_to_unix_socket() {
+        // WITNESS: libpq's unix-socket URL form — the socket dir rides `?host=`
+        // (its leading `/` cannot ride the authority slot). This is SYMMETRIC with
+        // `PGHOST=/tmp` via `from_env`, closing the constructor asymmetry.
+        assert_eq!(
+            dsn_endpoint("postgresql://user@/db?host=/tmp"),
+            Ok(Endpoint::Unix(std::path::PathBuf::from("/tmp/.s.PGSQL.5432"))),
+        );
+        assert_eq!(
+            dsn_endpoint("postgresql://user@/db?host=/var/run/postgresql"),
+            Ok(Endpoint::Unix(std::path::PathBuf::from(
+                "/var/run/postgresql/.s.PGSQL.5432"
+            ))),
+        );
+    }
+
+    #[test]
+    fn dsn_host_query_param_carries_authority_port_into_the_socket_name() {
+        // The authority `port` applies to the unix socket's filename too (libpq
+        // parity): `@:5433` + `?host=/tmp` → `/tmp/.s.PGSQL.5433`.
+        assert_eq!(
+            dsn_endpoint("postgresql://user@:5433/db?host=/tmp"),
+            Ok(Endpoint::Unix(std::path::PathBuf::from("/tmp/.s.PGSQL.5433"))),
+        );
+    }
+
+    #[test]
+    fn dsn_host_query_param_overrides_authority_host_tcp_parity() {
+        // `host=` wins over the authority host (libpq: the query parameter wins),
+        // and a plain-name value is a TCP host override — not a unix path.
+        let cfg = match ConnectConfig::from_dsn("postgres://u@ignored:5433/db?host=realhost") {
+            Ok(c) => c,
+            Err(e) => panic!("DSN with a host override must parse: {e}"),
+        };
+        assert_eq!(cfg.host, "realhost");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(
+            resolve_endpoint(&cfg.host, cfg.port),
+            Endpoint::Tcp("realhost:5433".to_string()),
+        );
+    }
+
+    #[test]
+    fn dsn_normal_tcp_authority_still_resolves_to_tcp() {
+        // A plain TCP DSN (host in the authority, no `host=`) is unaffected.
+        assert_eq!(
+            dsn_endpoint("postgres://u@db.example.com:6000/app"),
+            Ok(Endpoint::Tcp("db.example.com:6000".to_string())),
+        );
+        assert_eq!(
+            dsn_endpoint("postgres://u@localhost/app"),
+            Ok(Endpoint::Tcp("localhost:5432".to_string())),
+        );
+    }
+
+    #[test]
+    fn dsn_empty_authority_host_without_host_param_is_a_loud_error() {
+        // `postgres://u@/tmp/db` parses `/tmp/db` as the DATABASE on an EMPTY host
+        // (URL grammar: authority ends at the first `/`), which is unroutable.
+        // Reject it at parse time, naming the `host=` fix — never a silent
+        // port-only TCP connect.
+        match ConnectConfig::from_dsn("postgres://u@/tmp/db") {
+            Err(msg) => assert!(
+                msg.contains("host") && msg.contains("query parameter"),
+                "the empty-host error must point at the host= form, got {msg:?}"
+            ),
+            Ok(_) => panic!("an empty authority host must be a loud parse error"),
+        }
     }
 }

@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UnixStream};
 use tokio::time::Instant;
 
 use bsql_postgres_core::driver::{
@@ -38,8 +38,8 @@ use bsql_postgres_core::sql_ident;
 use bsql_postgres_core::ssl::SslProbe;
 use bsql_postgres_core::tls::{self, TlsTransport, Wire};
 use bsql_postgres_core::{
-    validate_startup_params, ConnectConfig, DriverError, Notification, QueryResult, Row, Rows,
-    SslMode, TypedNotification,
+    resolve_endpoint, validate_startup_params, ConnectConfig, DriverError, Endpoint, Notification,
+    QueryResult, Row, Rows, SslMode, TypedNotification,
 };
 use bsql_postgres_proto::engine;
 use bsql_postgres_proto::params::ParamsWriter;
@@ -47,7 +47,7 @@ use bsql_postgres_proto::{
     Credentials, DatabaseName, Ident, Password, PreparedQuery, RowDecode, Sensitive, TypedQuery,
 };
 
-use crate::transport::{ReadDeadline, TokioSocket};
+use crate::transport::{ReadDeadline, Sock, TokioSocket};
 
 /// The prepared-statement handle (defined once in `bsql-postgres-core`, shared by
 /// both drivers). Re-exported so `bsql_postgres_async::PreparedStatement` still
@@ -133,16 +133,23 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Open a connection: TCP connect, optional TLS negotiation, then the
-    /// startup/auth handshake through the engine — the WHOLE sequence bounded by
-    /// `connect_timeout`, measured from the start.
+    /// Open a connection: TCP or unix-socket connect, optional TLS negotiation,
+    /// then the startup/auth handshake through the engine — the WHOLE sequence
+    /// bounded by `connect_timeout`, measured from the start.
+    ///
+    /// The transport is chosen by libpq's rule: an ABSOLUTE-PATH host (begins
+    /// with `/`) selects a unix-domain socket at `<host>/.s.PGSQL.<port>`; every
+    /// other host is TCP. A unix socket connects PLAINTEXT (TLS is pointless on a
+    /// local kernel socket, and PostgreSQL does not offer it there), so
+    /// [`SslMode::Require`] over a unix host is a fail-loud
+    /// [`DriverError::Config`] rather than a silently-broken TLS contract.
     ///
     /// # Errors
     ///
     /// A classified [`DriverError`] for any pre-connect validation, transport,
     /// TLS, or handshake failure — never a panic. A connect that does not complete
     /// within `connect_timeout` is [`DriverError::Timeout`], so a server that
-    /// accepts the TCP connection but never answers the startup packet fails fast
+    /// accepts the connection but never answers the startup packet fails fast
     /// rather than hanging forever.
     pub async fn connect(config: &ConnectConfig) -> Result<Self, DriverError> {
         // Bound the ENTIRE connect sequence under ONE `connect_timeout` budget,
@@ -161,19 +168,13 @@ impl Connection {
     /// The connect sequence proper — run UNDER the `connect_timeout` budget by
     /// [`connect`](Self::connect).
     async fn connect_inner(config: &ConnectConfig) -> Result<Self, DriverError> {
-        let addr = format!("{}:{}", config.host, config.port);
-        // No dial-only timeout: the caller's single outer budget bounds the whole
-        // sequence, so a black-hole dial elapses into `DriverError::Timeout`
-        // exactly like a silent handshake.
-        let tcp = TcpStream::connect(&addr).await?;
-        // Disable Nagle on the data socket for the connection's whole life —
-        // Nagle + delayed-ACK can add ~40ms stalls to small writes and COPY-in
-        // streaming; one setsockopt with zero per-op cost.
-        tcp.set_nodelay(true)?;
-
         // The read-deadline cell shared with the socket the engine will own.
         let read_deadline = Arc::new(ReadDeadline::new());
-        let wire = Self::build_wire(tcp, config, &read_deadline).await?;
+        // Dial the chosen transport (TCP or unix) and build the wire. No
+        // dial-only timeout: the caller's single outer budget bounds the whole
+        // sequence, so a black-hole dial elapses into `DriverError::Timeout`
+        // exactly like a silent handshake.
+        let wire = Self::connect_wire(config, &read_deadline).await?;
         // Snapshot the encryption state from the built wire BEFORE it is moved
         // into the engine.
         let encrypted = wire.is_encrypted();
@@ -217,15 +218,62 @@ impl Connection {
         })
     }
 
-    /// Build the plaintext or TLS wire, performing the PG `SSLRequest`
-    /// negotiation on the raw socket when SSL is wanted.
-    async fn build_wire(
+    /// Dial the transport chosen by [`resolve_endpoint`] and build the
+    /// plaintext-or-TLS wire.
+    ///
+    /// A TCP endpoint disables Nagle and runs the SSL negotiation
+    /// ([`build_tcp_wire`](Self::build_tcp_wire)); a unix-socket endpoint connects
+    /// PLAINTEXT (no `TCP_NODELAY` — meaningless on `AF_UNIX`; no `SSLRequest`
+    /// probe — TLS is not applicable to a local socket). `SslMode::Require` over a
+    /// unix host is a fail-loud [`DriverError::Config`], never a silent plaintext
+    /// downgrade.
+    async fn connect_wire(
+        config: &ConnectConfig,
+        deadline: &Arc<ReadDeadline>,
+    ) -> Result<AsyncWire, DriverError> {
+        match resolve_endpoint(&config.host, config.port) {
+            Endpoint::Tcp(addr) => {
+                let tcp = TcpStream::connect(&addr).await?;
+                // Disable Nagle on the data socket for the connection's whole life
+                // — Nagle + delayed-ACK can add ~40ms stalls to small writes and
+                // COPY-in streaming; one setsockopt with zero per-op cost.
+                tcp.set_nodelay(true)?;
+                Self::build_tcp_wire(tcp, config, deadline).await
+            }
+            Endpoint::Unix(path) => {
+                // Fail LOUD: TLS cannot be required over a socket that will never
+                // do it. A local kernel socket is trusted by filesystem
+                // permissions, not TLS, and PostgreSQL does not offer TLS there.
+                if config.ssl_mode == SslMode::Require {
+                    return Err(DriverError::Config(
+                        "SslMode::Require cannot be honored over a unix-domain socket \
+                         (TLS is not available on a local socket)",
+                    ));
+                }
+                // `Prefer` over unix is plaintext with no probe and no downgrade
+                // warning — nothing was downgraded; TLS was never applicable.
+                let unix = UnixStream::connect(&path).await?;
+                Ok(Wire::Plain(TokioSocket::new(
+                    Sock::Unix(unix),
+                    Arc::clone(deadline),
+                )))
+            }
+        }
+    }
+
+    /// Build the plaintext or TLS wire over an already-connected TCP socket,
+    /// performing the PG `SSLRequest` negotiation on the raw socket when SSL is
+    /// wanted.
+    async fn build_tcp_wire(
         tcp: TcpStream,
         config: &ConnectConfig,
         deadline: &Arc<ReadDeadline>,
     ) -> Result<AsyncWire, DriverError> {
         if config.ssl_mode == SslMode::Disable {
-            return Ok(Wire::Plain(TokioSocket::new(tcp, Arc::clone(deadline))));
+            return Ok(Wire::Plain(TokioSocket::new(
+                Sock::Tcp(tcp),
+                Arc::clone(deadline),
+            )));
         }
         let ssl_bytes = bsql_postgres_core::ssl::ssl_request_bytes();
         let mut tcp = tcp;
@@ -246,13 +294,16 @@ impl Connection {
                         DriverError::Io(io::Error::other(format!("TLS config: {e}")))
                     })?,
                 };
-                let socket = TokioSocket::new(tcp, Arc::clone(deadline));
+                let socket = TokioSocket::new(Sock::Tcp(tcp), Arc::clone(deadline));
                 let tls = TlsTransport::connect(socket, cfg, server_name)
                     .await
                     .map_err(lift_tls_error)?;
                 Ok(Wire::Tls(Box::new(tls)))
             }
-            SslProbe::PlainTcp => Ok(Wire::Plain(TokioSocket::new(tcp, Arc::clone(deadline)))),
+            SslProbe::PlainTcp => Ok(Wire::Plain(TokioSocket::new(
+                Sock::Tcp(tcp),
+                Arc::clone(deadline),
+            ))),
         }
     }
 

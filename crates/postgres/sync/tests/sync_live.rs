@@ -20,9 +20,63 @@ fn sync_config() -> ConnectConfig {
         .ssl_mode(bsql_postgres_sync::SslMode::Disable)
 }
 
+/// A config over the local UNIX-DOMAIN socket: the host is the socket DIRECTORY
+/// (`/tmp` — Homebrew PG's default on macOS), and libpq's rule turns it into the
+/// socket file `<dir>/.s.PGSQL.<port>`. No `sslmode` override needed: a unix
+/// socket is plaintext by construction.
+fn unix_config() -> ConnectConfig {
+    ConnectConfig::new("/tmp", "smir-ant").database("postgres".to_string())
+}
+
 // ═══════════════════════════════════════════════════════════
 // Driver-specific tests (I/O, protocol, infra — not SQL)
 // ═══════════════════════════════════════════════════════════
+
+/// WITNESS (unix-domain transport): connect over the LOCAL UNIX SOCKET (host is
+/// the socket dir `/tmp`), round-trip a query, and confirm the connection is
+/// plaintext (`is_encrypted()` == false — TLS is not applicable to a local
+/// socket). This is the transport the original bsql used and the bench baseline
+/// assumed; it proves the new AF_UNIX path end-to-end on the blocking driver.
+#[test]
+#[ignore = "requires local PG on a unix socket"]
+fn connect_over_unix_socket_and_query() {
+    let mut c = Connection::connect(&unix_config()).expect("unix-socket connect");
+    c.ping().expect("ping over unix socket");
+    assert!(c.is_healthy());
+    assert!(
+        !c.is_encrypted(),
+        "a unix-domain socket carries no TLS — is_encrypted() must be false"
+    );
+    assert!(c.backend_pid() > 0);
+    // A real decode round-trip over the socket, not just a framing ping.
+    let row = c
+        .query_one_sql("SELECT 'bsql-over-unix'")
+        .expect("query over unix socket");
+    assert_eq!(row.get_str(0), Ok(Some("bsql-over-unix")));
+    c.close().expect("close");
+}
+
+/// FAIL LOUD: `SslMode::Require` over a unix-domain socket is a classified
+/// `DriverError::Config` — never a silent plaintext downgrade (TLS is not
+/// available on a local socket, so an unsatisfiable requirement is rejected up
+/// front). Needs NO live PG: the rejection precedes the connect syscall.
+#[test]
+fn unix_socket_ssl_require_is_a_loud_config_error() {
+    let cfg = ConnectConfig::new("/var/run/postgresql", "u")
+        .ssl_mode(bsql_postgres_sync::SslMode::Require);
+    match Connection::connect(&cfg) {
+        Err(bsql_postgres_sync::DriverError::Config(msg)) => {
+            assert!(
+                msg.contains("unix-domain socket"),
+                "the error must name the unix-socket cause, got {msg:?}"
+            );
+        }
+        // `Connection` is not `Debug`, so the `Ok` arm cannot print it — the
+        // failure message is explicit instead.
+        Ok(_) => panic!("Require over a unix socket must fail, but a connection opened"),
+        Err(other) => panic!("Require over a unix socket must be a Config error, got {other:?}"),
+    }
+}
 
 #[test]
 #[ignore = "requires local PG"]
