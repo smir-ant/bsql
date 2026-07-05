@@ -1,0 +1,11 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/safe_ident_ui/safe_ident_no_fabrication.rs:10:13
+   |
+10 |     let _ = SafeIdent("events; DROP TABLE users --");
+   |             ^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> src/sql_ident.rs
+   |
+   | pub struct SafeIdent<'a>(&'a str);
+   |                          ^^^^^^^ private field

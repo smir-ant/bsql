@@ -99,6 +99,7 @@ dependencies = [
  "bsql-devgates",
  "bsql-postgres-proto",
  "rustls",
+ "trybuild",
  "webpki-roots",
  "zeroize",
 ]

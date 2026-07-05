@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/safe_ident_ui/splice_rejects_raw_str.rs:18:29
+   |
+18 |     let _ = splice_into_sql("events; DROP TABLE users --");
+   |             --------------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `SafeIdent<'_>`, found `&str`
+   |             |
+   |             arguments to this function are incorrect
+   |
+note: function defined here
+  --> tests/safe_ident_ui/splice_rejects_raw_str.rs:11:4
+   |
+11 | fn splice_into_sql(_channel: SafeIdent<'_>) -> String {
+   |    ^^^^^^^^^^^^^^^ -----------------------
