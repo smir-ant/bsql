@@ -339,8 +339,7 @@ pub struct ActiveEngine {
     /// Off the hot path: written once at `from_handshake` and read only through
     /// the cold accessor, never inside `next_event`/`drive`. Its footprint cost
     /// is therefore an offset shift with no hot-loop codegen effect — that
-    /// coldness, not the Observer-seam `engine_asm_identity` witness (which is
-    /// blind to this struct's layout), is what keeps the active path unperturbed.
+    /// coldness is what keeps the active path unperturbed.
     server_version: Option<String>,
     /// Content-addressed names of the prepared statements this connection has
     /// Parsed and that are DURABLE on the server.

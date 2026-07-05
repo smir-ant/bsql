@@ -84,8 +84,7 @@ pub use pump::{
     SpuriousPending, Surface,
 };
 pub use seams::{
-    absurd, engine_observe_no_seam, engine_observe_via_seam, CommandStatus, Live, Never,
-    NoObserver, NotifyStatus, Observer, Outcome, Transport,
+    absurd, CommandStatus, Live, Never, NoObserver, NotifyStatus, Observer, Outcome, Transport,
 };
 pub use verbs::PreparedStatement;
 

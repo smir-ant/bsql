@@ -160,31 +160,6 @@ impl Observer for CountingObserver {
     }
 }
 
-/// The real engine pattern: a generic [`Observer`] hook threaded through a
-/// hot loop. Monomorphised at [`NoObserver`] by
-/// [`engine_observe_via_seam`], it must lower to the same instructions as
-/// the seam-free [`engine_observe_no_seam`] baseline.
-#[inline(always)]
-fn observe_generic<O: Observer>(obs: &O, state: &mut usize, row: &[u8]) {
-    *state = core::hint::black_box(*state).wrapping_add(row.len());
-    obs.on_row(row);
-}
-
-/// Witness: the observer hook reached through the generic seam, fixed at
-/// the [`NoObserver`] ZST policy. The asm-identity gate proves this is
-/// instruction-for-instruction identical to [`engine_observe_no_seam`].
-#[inline(never)]
-pub fn engine_observe_via_seam(state: &mut usize, row: &[u8]) {
-    observe_generic(&NoObserver, state, row);
-}
-
-/// Witness: the same computation with no observer seam at all — the
-/// hand-written baseline the seam must match.
-#[inline(never)]
-pub fn engine_observe_no_seam(state: &mut usize, row: &[u8]) {
-    *state = core::hint::black_box(*state).wrapping_add(row.len());
-}
-
 // ===========================================================================
 // 3. Transport
 // ===========================================================================

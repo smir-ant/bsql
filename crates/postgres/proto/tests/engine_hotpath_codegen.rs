@@ -57,16 +57,16 @@
 //!
 //! # Why properties, not an exact-asm golden
 //!
-//! An exact byte-for-byte body golden (as `engine_asm_identity` uses for the
-//! two tiny observer witnesses) is deliberately NOT used for a 1000-instruction
-//! dispatch: it would break on any unrelated instruction-scheduling shift and
-//! teach reviewers to rubber-stamp the diff. Robust *properties* (no panic
-//! edge; a growth ceiling) fail only on a real regression.
+//! An exact byte-for-byte body golden is deliberately NOT used for a
+//! 1000-instruction dispatch: it would break on any unrelated
+//! instruction-scheduling shift and teach reviewers to rubber-stamp the diff.
+//! Robust *properties* (no panic edge; a growth ceiling) fail only on a real
+//! regression.
 //!
 //! # Machinery
 //!
-//! Reuses the project asm foundation (`scripts/asm-dump.sh` /
-//! `engine_asm_identity`): emit release assembly for the proto lib with
+//! Reuses the project asm foundation (`scripts/asm-dump.sh`): emit release
+//! assembly for the proto lib with
 //! `cargo rustc --release --lib -- --emit=asm`, find the newest emitted `.s`,
 //! and extract `next_event`'s instruction body between its definition label and
 //! its `.cfi_endproc`. The nested build writes to a DEDICATED `CARGO_TARGET_DIR`
