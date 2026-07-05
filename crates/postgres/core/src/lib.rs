@@ -10,6 +10,9 @@
 pub mod test_scenarios;
 
 pub mod config;
+// The transport-generic driver engine (`Core<S>`): every non-I/O verb written
+// ONCE, shared by the async and sync drivers, monomorphised per transport.
+pub mod driver;
 pub mod error;
 pub mod footprint;
 pub mod materialize;
@@ -35,6 +38,7 @@ pub mod typed_rows;
 pub mod types;
 
 pub use config::{validate_startup_params, ConnectConfig, SslMode};
+pub use driver::{Core, PreparedStatement};
 pub use error::{ColumnError, DbError, DriverError};
 pub use materialize::{CollectedResult, DbErrorSink, ResultCollector};
 #[cfg(feature = "n1-detect")]
