@@ -47,6 +47,7 @@
 //! and [`recv_notification_inner`](Core::recv_notification_inner) those keep-per-driver
 //! methods orchestrate.
 
+use core::fmt::Write as _;
 use core::ops::ControlFlow;
 use std::io;
 use std::sync::Arc;
@@ -89,6 +90,51 @@ enum Stop<E> {
     Decode(DecodeError),
     /// The caller's `on_row` returned [`ControlFlow::Break`], carrying its payload.
     User(E),
+}
+
+/// A fixed-capacity ASCII sink so a generated prepared-statement name renders
+/// with NO heap allocation (the old `format!` cost one `String` per prepare).
+///
+/// Capacity 16 = the 6-byte `_bsql_` prefix + a `u32`'s at-most-10 decimal
+/// digits, so `write!(_, "_bsql_{id}")` for any `u32` fits exactly and never
+/// overflows. A write past capacity is refused (a `fmt::Error`), never
+/// truncated silently — but with the fixed prefix + a `u32` that is
+/// structurally impossible.
+struct StmtNameBuf {
+    buf: [u8; 16],
+    len: usize,
+}
+
+impl core::fmt::Write for StmtNameBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.len.checked_add(s.len()).ok_or(core::fmt::Error)?;
+        let dst = self.buf.get_mut(self.len..end).ok_or(core::fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+impl StmtNameBuf {
+    /// A fresh empty sink.
+    fn new() -> Self {
+        Self {
+            buf: [0u8; 16],
+            len: 0,
+        }
+    }
+
+    /// The bytes written so far as a `&str`. Every fragment came from a `&str`,
+    /// so `[..len]` is valid UTF-8 by construction; the two failure edges are
+    /// structurally unreachable, so they surface as a classified (fail-closed)
+    /// error rather than a silent fallback.
+    fn as_str(&self) -> Result<&str, DriverError> {
+        let bytes = self
+            .buf
+            .get(..self.len)
+            .ok_or(DriverError::Config("generated statement name invalid"))?;
+        core::str::from_utf8(bytes).map_err(|_| DriverError::Config("generated statement name invalid"))
+    }
 }
 
 /// A prepared statement handle, shared by both drivers.
@@ -220,7 +266,12 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     fn next_stmt_name(&mut self) -> Result<StmtName, DriverError> {
         let id = self.stmt_counter;
         self.stmt_counter = self.stmt_counter.wrapping_add(1);
-        StmtName::try_from_str(&format!("_bsql_{id}"))
+        // Stack-render "_bsql_<id>" into a fixed 16-byte buffer — no heap
+        // `String` / `format!` allocation per prepare.
+        let mut name = StmtNameBuf::new();
+        write!(name, "_bsql_{id}")
+            .map_err(|_| DriverError::Config("generated statement name invalid"))?;
+        StmtName::try_from_str(name.as_str()?)
             .map_err(|_| DriverError::Config("generated statement name invalid"))
     }
 
@@ -232,10 +283,6 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         names_override: Option<Arc<[String]>>,
     ) -> Result<QueryResult, DriverError> {
         let collected = collector.finish()?;
-        let column_count = match collected.rows.first() {
-            Some(row) => row.len(),
-            None => 0,
-        };
         let column_names = match names_override {
             Some(names) => names,
             None => Arc::from(collected.column_names.into_boxed_slice()),
@@ -243,7 +290,6 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         Ok(QueryResult {
             rows: collected.rows,
             command_tag: collected.command_tag,
-            column_count,
             column_names,
         })
     }
@@ -283,7 +329,8 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             )
             .await;
         self.settle(outcome, &mut collector)?;
-        Ok(collector.command_tag().to_string())
+        // Move the already-owned tag out — no clone (the collector is dropped).
+        Ok(collector.into_command_tag())
     }
 
     /// Execute a non-row runtime-SQL command, returning the affected-row count.
@@ -539,10 +586,11 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         self.query_collect::<Q>(params).await
     }
 
-    /// The typed-collect body shared by [`query`](Self::query) and the engine of
-    /// [`query_one`](Self::query_one). Collects a typed result into a [`Rows<Q>`]
-    /// prebuffer; classifies an oversize row loudly. Records nothing — the N+1
-    /// hook fires exactly once in the public verb that called this.
+    /// The typed-collect body behind [`query`](Self::query): collects a typed
+    /// result into a [`Rows<Q>`] prebuffer and classifies an oversize row loudly.
+    /// Records nothing — the N+1 hook fires exactly once in the public verb that
+    /// called this. ([`query_one`](Self::query_one) does NOT route through here:
+    /// it decodes its single row directly off the wire, with no prebuffer.)
     async fn query_collect<Q: TypedQuery>(
         &mut self,
         params: Q::Params,
@@ -573,8 +621,25 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
     /// owned record. Zero rows is [`DriverError::NoRows`]; more than one is
     /// [`DriverError::TooManyRows`]. Under `n1-detect` records the USER call site
-    /// exactly once (reuses the shared typed-collect body directly so the
-    /// count is attributed here, not double-counted through an inner verb).
+    /// exactly once.
+    ///
+    /// Decodes the single expected row DIRECTLY into its owned twin off the wire,
+    /// with NO intermediate prebuffer: the [`query`](Self::query) collect path
+    /// would allocate a [`Rows<Q>`]'s `wire` + `slots` vectors (plus a memcpy of
+    /// the row bytes into `wire`) and then a per-result owned `Vec` — three heap
+    /// allocations and a copy to return ONE record. Instead this streams via the
+    /// engine's breakable verb, decodes the first `Surface::Row` straight into an
+    /// `Option<Q::Owned>` (the owned twin does not borrow the transient ingest
+    /// buffer, so it safely outlives the pump), and BREAKS on a second row.
+    ///
+    /// Error precedence is exactly the old collect-then-count path's: an oversize
+    /// row dominates (it was checked before the count); then a second row is
+    /// [`TooManyRows`](DriverError::TooManyRows) — dominating even a malformed
+    /// first row, since the old `_ => TooManyRows` arm never decoded a >1-row
+    /// result (so a first-row decode failure is PARKED, not raised, while a
+    /// second row is still awaited); a lone malformed row is
+    /// [`Decode`](DriverError::Decode); zero rows is
+    /// [`NoRows`](DriverError::NoRows).
     pub async fn query_one<Q: TypedQuery>(
         &mut self,
         params: Q::Params,
@@ -582,15 +647,100 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ) -> Result<Q::Owned, DriverError> {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::PREPARED.sql(), caller);
-        let rows = self.query_collect::<Q>(params).await?;
-        match rows.len() {
-            0 => Err(DriverError::NoRows),
-            1 => rows
-                .into_owned()?
-                .into_iter()
-                .next()
-                .ok_or(DriverError::NoRows),
-            _ => Err(DriverError::TooManyRows),
+        let live = self.take_live()?;
+        // The single decoded row (owned, so it outlives the pump), plus the
+        // read-after-settle flags the streaming sink parks.
+        let mut row: Option<Q::Owned> = None;
+        let mut seen_first = false;
+        let mut decode_err: Option<DecodeError> = None;
+        let mut db_error: Option<DbError> = None;
+        let mut oversize = false;
+        let outcome = self
+            .engine
+            .query_params_break(
+                live,
+                &Q::PREPARED,
+                params,
+                capture_notify(&mut self.notifications, |surface| match surface {
+                    Surface::Row(body) => {
+                        if seen_first {
+                            // A SECOND row: the caller asked for exactly one, so
+                            // stop the pump — a too-many-rows condition, reported
+                            // after the reclaiming drain below.
+                            return ControlFlow::Break(());
+                        }
+                        seen_first = true;
+                        match Q::decode_owned(body) {
+                            Ok(owned) => row = Some(owned),
+                            // PARK a first-row decode failure — do NOT stop: a
+                            // following row must still surface as too-many, exactly
+                            // as the old collect-all path (which never decoded past
+                            // a >1-row result) classified it.
+                            Err(de) => decode_err = Some(de),
+                        }
+                        ControlFlow::Continue(())
+                    }
+                    // Capture the server error's cause; let the pump reach `Failed`
+                    // so the connection can be drained to idle.
+                    Surface::Fail(body) => {
+                        db_error = Some(materialize::parse_error_response(body));
+                        ControlFlow::Continue(())
+                    }
+                    // An oversize row streams as chunks the bounded typed decoder
+                    // cannot reassemble; flag it for a classified `OversizeRow`
+                    // after the stream ends — never reassemble, never truncate.
+                    Surface::RowChunk(_) | Surface::RowChunkEnd => {
+                        oversize = true;
+                        ControlFlow::Continue(())
+                    }
+                    _ => ControlFlow::Continue(()),
+                }),
+            )
+            .await;
+
+        let (live, boundary) = match outcome {
+            Ok(Outcome { live, status }) => (live, status),
+            Err(other) => return Err(lift_engine_error(other)),
+        };
+        match boundary {
+            Boundary::Idle => {
+                // Streamed to a clean idle — token restored, no drain needed.
+                self.live = Some(live);
+                // Oversize dominates (the collect path checked it before the count).
+                if oversize {
+                    return Err(DriverError::OversizeRow);
+                }
+                match (row, decode_err) {
+                    (Some(owned), _) => Ok(owned),
+                    (None, Some(de)) => Err(DriverError::Decode(de)),
+                    (None, None) => Err(DriverError::NoRows),
+                }
+            }
+            Boundary::Failed => {
+                // Server error: drain the recovering `ReadyForQuery`, then surface
+                // the parsed cause. Connection stays alive + pooled.
+                self.drain_to_idle(live).await?;
+                match db_error {
+                    Some(db) => Err(DriverError::Db(Box::new(db))),
+                    None => Err(DriverError::UnclassifiedFailure),
+                }
+            }
+            Boundary::Stopped(()) => {
+                // Broke on the second row: drain to reclaim, then classify.
+                // Oversize still dominates too-many (matching the collect path).
+                self.drain_to_idle(live).await?;
+                if oversize {
+                    return Err(DriverError::OversizeRow);
+                }
+                Err(DriverError::TooManyRows)
+            }
+            // `query_params_break` maps Closed/Suspended to a fatal `Err`, so they
+            // never ride an `Ok` outcome; `Boundary` is `#[non_exhaustive]`, so
+            // this classified arm also covers any future boundary. The token is
+            // dropped (not restored), leaving the connection dead + evictable.
+            _ => Err(DriverError::Io(io::Error::other(
+                "unexpected protocol boundary from a single-row query",
+            ))),
         }
     }
 
@@ -1183,5 +1333,33 @@ pub fn lift_conn_fail(cf: ConnFail) -> DriverError {
         // `ConnFail` is `#[non_exhaustive]`; the malformed-frame / SCRAM / overflow
         // causes surface as I/O carrying the classified detail.
         other => DriverError::Io(io::Error::other(format!("handshake failed: {other:?}"))),
+    }
+}
+
+#[cfg(test)]
+mod stmt_name_render_tests {
+    //! The generated prepared-statement name is load-bearing: a wrong render
+    //! would break every prepared query. These pin the exact `_bsql_<id>` shape
+    //! the old `format!` produced, now stack-rendered with no heap allocation —
+    //! across the `u32` extremes (0, 1, and `u32::MAX`, the 10-digit boundary
+    //! the 16-byte capacity is sized for).
+    use super::StmtNameBuf;
+    use core::fmt::Write as _;
+
+    fn render(id: u32) -> String {
+        let mut buf = StmtNameBuf::new();
+        write!(buf, "_bsql_{id}").expect("_bsql_<u32> always fits the 16-byte buffer");
+        buf.as_str()
+            .expect("the rendered bytes are valid ASCII")
+            .to_string()
+    }
+
+    #[test]
+    fn renders_the_bsql_prefixed_decimal_name() {
+        assert_eq!(render(0), "_bsql_0");
+        assert_eq!(render(1), "_bsql_1");
+        assert_eq!(render(42), "_bsql_42");
+        // u32::MAX is 10 digits — the widest name (6 + 10 = 16 = capacity).
+        assert_eq!(render(u32::MAX), "_bsql_4294967295");
     }
 }

@@ -210,7 +210,7 @@ impl Connection {
 
     /// Execute a parameterized statement, returning the number of rows changed.
     pub fn execute_params(&self, sql: &str, params: &[&str]) -> Result<usize, SqliteError> {
-        with_param_refs(params, |refs| Ok(self.inner.execute(sql, refs)?))
+        Ok(self.inner.execute(sql, rusqlite::params_from_iter(params))?)
     }
 
     /// Run `sql` and eagerly materialize every row.
@@ -220,7 +220,7 @@ impl Connection {
 
     /// Run a parameterized `sql` and eagerly materialize every row.
     pub fn query_params(&self, sql: &str, params: &[&str]) -> Result<QueryResult, SqliteError> {
-        with_param_refs(params, |refs| self.query_collect(sql, refs))
+        self.query_collect(sql, rusqlite::params_from_iter(params))
     }
 
     /// Shared eager-collect core for [`Self::query`] / [`Self::query_params`].
@@ -273,7 +273,7 @@ impl Connection {
     where
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
     {
-        with_param_refs(params, |refs| self.query_each_collect(sql, refs, on_row))
+        self.query_each_collect(sql, rusqlite::params_from_iter(params), on_row)
     }
 
     /// Shared streaming core for [`Self::query_each`] / [`Self::query_each_params`].
@@ -381,21 +381,6 @@ impl Connection {
             .close()
             .map_err(|(_conn, e)| SqliteError::Query(e.to_string()))
     }
-}
-
-/// Bind `params` (owned as text) and hand the borrowed `ToSql` refs to `f`.
-/// Centralises the one-time boxing so the two parameterized entry points share
-/// it. The boxing is O(params), not O(rows): it happens once per call.
-fn with_param_refs<R>(
-    params: &[&str],
-    f: impl FnOnce(&[&dyn rusqlite::types::ToSql]) -> Result<R, SqliteError>,
-) -> Result<R, SqliteError> {
-    let boxed: Vec<Box<dyn rusqlite::types::ToSql>> = params
-        .iter()
-        .map(|s| Box::new((*s).to_owned()) as Box<dyn rusqlite::types::ToSql>)
-        .collect();
-    let refs: Vec<&dyn rusqlite::types::ToSql> = boxed.iter().map(AsRef::as_ref).collect();
-    f(refs.as_slice())
 }
 
 /// Materialize one row into owned cells, decoding from SQLite's native storage

@@ -116,7 +116,24 @@ impl ResultCollector {
                         self.affected = 0;
                     }
                 }
-                self.oids = oids.to_vec();
+                // Reuse the `oids` Vec SPINE across a multi-statement batch's
+                // successive `Deliver`s: `clear` + `extend_from_slice` keeps the
+                // backing allocation instead of dropping it and allocating a
+                // fresh one per statement, as `= to_vec()` did. This matters
+                // because a delivered statement's OIDs stay cached and ride EVERY
+                // subsequent completion in the batch (e.g. the pooled
+                // `reset_session` round-trip surfaces the `pg_advisory_unlock_all`
+                // OIDs on three `Deliver`s), so the old fresh-Vec-per-`Deliver`
+                // allocated once per repeat where one reused buffer suffices.
+                //
+                // `column_names` deliberately stays `= to_vec()`: it flows into
+                // `build_query_result`'s `Arc::from(_.into_boxed_slice())` on the
+                // HOT `query_sql` path, and `into_boxed_slice()` is free only when
+                // cap == len — which `to_vec` guarantees but `extend`'s amortized
+                // growth (cap 4 for 2 names) does not, so reusing that spine would
+                // trade this cold-path win for a shrink-realloc on the hot path.
+                self.oids.clear();
+                self.oids.extend_from_slice(oids);
                 self.column_names = names.to_vec();
             }
             Surface::Fail(body) => self.db_error = Some(parse_error_response(body)),
@@ -134,6 +151,17 @@ impl ResultCollector {
     #[must_use]
     pub fn command_tag(&self) -> &str {
         &self.command_tag
+    }
+
+    /// Consume the collector, MOVING out the owned command-tag `String`.
+    ///
+    /// For a caller that only needs the tag and drops the rest (the drivers'
+    /// `simple_query` returns it and discards the collector), this hands back the
+    /// already-owned `String` with no clone — one fewer allocation than
+    /// [`command_tag`](Self::command_tag)`().to_string()`.
+    #[must_use]
+    pub fn into_command_tag(self) -> String {
+        self.command_tag
     }
 
     /// The affected-row count captured at the delivery.

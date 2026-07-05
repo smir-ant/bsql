@@ -16,7 +16,8 @@
 //!
 //! # Cost regime
 //!
-//! The recency window is a fixed inline `[Option<_>; 16]` array — no per-query
+//! The recency window is a fixed inline `[WindowSlot; 16]` array (384 B; a
+//! vacant slot is a `count == 0` sentinel, not an `Option`) — no per-query
 //! allocation, no growth. The only heap use is the [`N1Report`] vector, which
 //! stays empty (`Vec::new` does not allocate) until an actual N+1 is detected,
 //! so the common no-N+1 path never allocates.
@@ -64,17 +65,57 @@ const DEFAULT_THRESHOLD: u32 = 25;
 /// queries from one line. The slot deliberately does NOT store `sql`/`file`/
 /// `line`: those are re-supplied on every [`N1Tracker::record`] call, so they
 /// are only needed at the moment the threshold trips, never carried here.
+///
+/// Emptiness rides a `count == 0` SENTINEL rather than an `Option` wrapper: an
+/// occupied slot always has `count >= 1` (inserted at 1, only ever incremented),
+/// so `count == 0` can never be a valid entry. Dropping the `Option`
+/// discriminant and narrowing `last_tick` to `u32` shrinks each slot from 40 to
+/// 24 bytes — the whole 16-slot window from 640 to 384 bytes (see the pin below).
 #[derive(Debug, Clone, Copy)]
 struct WindowSlot {
     /// `sql.as_ptr().addr()` — the query text's data-pointer identity.
     sql_token: usize,
     /// `ptr::from_ref(caller).addr()` — the call site's `Location` identity.
     loc_token: usize,
-    /// Times this key has been recorded since it entered the window.
+    /// Times this key has been recorded since it entered the window. `0` is the
+    /// EMPTY-slot sentinel (see the type docs).
     count: u32,
-    /// The `tick` at the most recent record — the LRU recency stamp.
-    last_tick: u64,
+    /// The `tick` at the most recent record — the LRU recency stamp. A `u32`
+    /// per-connection logical clock: after ~4e9 records within one window it
+    /// wraps, which can only perturb the LRU eviction CHOICE (diagnostics-only,
+    /// a spurious/missed report at worst) — never the `count == 0` emptiness test.
+    last_tick: u32,
 }
+
+impl WindowSlot {
+    /// The empty-slot sentinel (`count == 0` marks an unoccupied slot).
+    const EMPTY: Self = Self {
+        sql_token: 0,
+        loc_token: 0,
+        count: 0,
+        last_tick: 0,
+    };
+
+    /// Whether this slot is unoccupied (the `count == 0` sentinel).
+    const fn is_vacant(&self) -> bool {
+        self.count == 0
+    }
+}
+
+// Footprint pin (compiled ONLY under `n1-detect`): the recency window must stay
+// 384 B — 16 slots of 24 B each (two `usize` pointers + two `u32`s), with NO
+// `Option` discriminant and a `u32` (not `u64`) tick. A drift (a re-added
+// `Option`, a widened field) is an `E0080` const-eval failure at `cargo check`.
+const _: () = {
+    assert!(
+        core::mem::size_of::<WindowSlot>() == 24,
+        "N1 WindowSlot must stay 24 B (no Option, u32 tick)"
+    );
+    assert!(
+        core::mem::size_of::<[WindowSlot; WINDOW]>() == 384,
+        "the N1 recency window must stay 384 B"
+    );
+};
 
 /// The per-connection N+1 detector: a bounded recency window plus the reports it
 /// has produced.
@@ -82,8 +123,9 @@ struct WindowSlot {
 /// See the [module docs](self) for the diagnostics-only, zero-cost-off contract.
 #[derive(Debug)]
 pub struct N1Tracker {
-    /// The bounded recency window of active `(sql, call-site)` keys.
-    window: [Option<WindowSlot>; WINDOW],
+    /// The bounded recency window of active `(sql, call-site)` keys. A vacant
+    /// slot is the `count == 0` sentinel (no `Option` wrapper).
+    window: [WindowSlot; WINDOW],
     /// One report per site that has reached the threshold. Empty (and
     /// unallocated) until the first detection.
     reports: Vec<N1Report>,
@@ -91,7 +133,7 @@ pub struct N1Tracker {
     threshold: u32,
     /// A monotonically increasing logical clock stamped on each record, used to
     /// pick the least-recently-used slot to evict.
-    tick: u64,
+    tick: u32,
 }
 
 impl Default for N1Tracker {
@@ -105,7 +147,7 @@ impl N1Tracker {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            window: [None; WINDOW],
+            window: [WindowSlot::EMPTY; WINDOW],
             reports: Vec::new(),
             threshold: DEFAULT_THRESHOLD,
             tick: 0,
@@ -136,45 +178,42 @@ impl N1Tracker {
     /// Bump the count for `(sql_token, loc_token)` in the window, inserting the
     /// key (evicting the LRU slot if the window is full) if it is new. Returns
     /// the key's new count.
-    fn bump_window(&mut self, sql_token: usize, loc_token: usize, tick: u64) -> u32 {
-        // Existing key: bump in place. `flatten()` skips the empty slots.
-        for slot in self.window.iter_mut().flatten() {
-            if slot.sql_token == sql_token && slot.loc_token == loc_token {
+    fn bump_window(&mut self, sql_token: usize, loc_token: usize, tick: u32) -> u32 {
+        // Existing key: bump in place. Skip vacant slots (the count == 0 sentinel).
+        for slot in self.window.iter_mut() {
+            if !slot.is_vacant() && slot.sql_token == sql_token && slot.loc_token == loc_token {
                 slot.count = slot.count.saturating_add(1);
                 slot.last_tick = tick;
                 return slot.count;
             }
         }
 
-        // New key: reuse the first empty slot, else evict the LRU (min tick).
-        let mut empty: Option<usize> = None;
+        // New key: reuse the first vacant slot, else evict the LRU (min tick
+        // among occupied slots).
+        let mut vacant: Option<usize> = None;
         let mut lru_idx: usize = 0;
-        let mut lru_tick: u64 = u64::MAX;
+        let mut lru_tick: u32 = u32::MAX;
         for (i, slot) in self.window.iter().enumerate() {
-            match slot {
-                None => {
-                    empty = Some(i);
-                    break;
-                }
-                Some(s) => {
-                    if s.last_tick < lru_tick {
-                        lru_tick = s.last_tick;
-                        lru_idx = i;
-                    }
-                }
+            if slot.is_vacant() {
+                vacant = Some(i);
+                break;
+            }
+            if slot.last_tick < lru_tick {
+                lru_tick = slot.last_tick;
+                lru_idx = i;
             }
         }
-        let idx = match empty {
+        let idx = match vacant {
             Some(i) => i,
             None => lru_idx,
         };
         if let Some(target) = self.window.get_mut(idx) {
-            *target = Some(WindowSlot {
+            *target = WindowSlot {
                 sql_token,
                 loc_token,
                 count: 1,
                 last_tick: tick,
-            });
+            };
         }
         1
     }
@@ -213,7 +252,7 @@ impl N1Tracker {
     /// is still caught. The accumulated [`report`](Self::report) is left intact —
     /// it is the connection's running diagnostic ledger.
     pub fn reset(&mut self) {
-        self.window = [None; WINDOW];
+        self.window = [WindowSlot::EMPTY; WINDOW];
     }
 }
 

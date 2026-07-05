@@ -14,11 +14,11 @@
 //! - **`reset_session`** — the driver runs the exact 7-statement idle `RESET`
 //!   batch (`SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; UNLISTEN
 //!   *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES`) via
-//!   `simple_query`, then returns `command_tag().to_string()`. The gate scripts
-//!   the real reply — six tag-only completions PLUS the row-returning
-//!   `pg_advisory_unlock_all` (a `RowDescription` + `DataRow`, surfacing as a
-//!   `Deliver` with non-empty oids/names AND a `Surface::Row`) — and ends with
-//!   the same trailing `command_tag().to_string()`.
+//!   `simple_query`, then returns `into_command_tag()` (moving the owned tag
+//!   out, no clone). The gate scripts the real reply — six tag-only completions
+//!   PLUS the row-returning `pg_advisory_unlock_all` (a `RowDescription` +
+//!   `DataRow`, surfacing as a `Deliver` with non-empty oids/names AND a
+//!   `Surface::Row`) — and ends with the same trailing `into_command_tag()`.
 //!
 //! Driven at the CORE level over an in-process scripted transport (no socket,
 //! no thread — deterministic). SCOPE HONESTY: this reproduces the whole
@@ -229,14 +229,19 @@ const EAGER_QUERY_ALLOC_PIN: usize = 21;
 
 /// PINNED baseline: allocations charged to the WHOLE warm `reset_session()`
 /// round-trip — a fresh `ResultCollector` over the LITERAL 7-statement idle
-/// `RESET` reply, ending with the trailing `command_tag().to_string()`
-/// `simple_query` returns. Currently **24**: one command-tag `String` per
-/// statement (7), plus the row-returning `SELECT pg_advisory_unlock_all()`
-/// (its `Deliver` `oids.to_vec()` + `names.to_vec()` and its `Surface::Row`
-/// `ArenaBuilder`/value push), plus the trailing `to_string()`. The pool pays
-/// this per re-acquire. (The in-transaction `ROLLBACK`-prefixed variant is one
-/// statement longer; the idle path modelled here is the pooled steady state.)
-const RESET_ALLOC_PIN: usize = 24;
+/// `RESET` reply, ending with the trailing `into_command_tag()` `simple_query`
+/// returns. Currently **21**: one command-tag `String` per statement (7 — the
+/// last MOVED out, not cloned), plus the row-returning `SELECT
+/// pg_advisory_unlock_all()`'s `Surface::Row` `ArenaBuilder`/value push and the
+/// ONE `oids`/`names` allocation its delivery needs. The pool pays this per
+/// re-acquire. History: 24 -> 23 when `simple_query` moved the tag out instead
+/// of cloning it; 23 -> 21 when the collector began REUSING the `oids` Vec spine
+/// (`clear` + `extend_from_slice`) instead of a fresh `to_vec()` per `Deliver` —
+/// the `pg_advisory_unlock_all` OIDs stay cached and ride three `Deliver`s in
+/// this batch, so the old code allocated three OID Vecs where one reused buffer
+/// now suffices (-2). (The in-transaction `ROLLBACK`-prefixed variant is one
+/// statement longer — the idle path modelled here is the pooled steady state.)
+const RESET_ALLOC_PIN: usize = 21;
 
 #[test]
 fn eager_query_and_reset_prebuffer_allocs_are_pinned() {
@@ -284,8 +289,8 @@ fn eager_query_and_reset_prebuffer_allocs_are_pinned() {
         reset_allocs, RESET_ALLOC_PIN,
         "reset_session round-trip alloc drifted from its pin ({RESET_ALLOC_PIN}): \
          got {reset_allocs}. This is the literal per-re-acquire reset cost (7 \
-         command-tag strings, the pg_advisory_unlock_all row's Deliver + Row \
-         allocations, and the trailing command_tag().to_string()). Update \
+         command-tag strings — the last MOVED out, not cloned — plus the \
+         pg_advisory_unlock_all row's Deliver + Row allocations). Update \
          RESET_ALLOC_PIN if a change alters it."
     );
 }
@@ -308,16 +313,10 @@ fn run_query<'b>(
     // ── the literal body of Connection::build_query_result(collector, None) ──
     let collected = collector.finish().expect("materialise owned rows");
     assert_eq!(collected.rows.len(), QUERY_ROWS, "all rows materialised");
-    // Mirror build_query_result's exact column_count computation.
-    let column_count = match collected.rows.first() {
-        Some(row) => row.len(),
-        None => 0,
-    };
     let column_names: Arc<[String]> = Arc::from(collected.column_names.into_boxed_slice());
     let result = QueryResult {
         rows: collected.rows,
         command_tag: collected.command_tag,
-        column_count,
         column_names,
     };
     core::hint::black_box(&result);
@@ -326,8 +325,8 @@ fn run_query<'b>(
 
 /// Drive one reset round-trip exactly as the drivers' `reset_session` does: the
 /// real 7-statement idle `RESET` batch via `simple_query`, surfaces fed to a
-/// fresh collector, ending with the same trailing `command_tag().to_string()`
-/// `simple_query` returns (allocated even though `reset_session` discards it).
+/// fresh collector, ending with the same trailing `into_command_tag()`
+/// `simple_query` returns (moved out, even though `reset_session` discards it).
 fn run_reset<'b>(
     engine: &mut bsql_postgres_proto::engine::Engine<'b, Script>,
     live: bsql_postgres_proto::engine::Live<'b>,
@@ -339,8 +338,8 @@ fn run_reset<'b>(
         Ok(Ok(Outcome { live, .. })) => live,
         other => panic!("reset must complete, got {other:?}"),
     };
-    // simple_query returns `Ok(collector.command_tag().to_string())`; reset_session
-    // discards it via `?`, but the String IS allocated on the reset path.
-    core::hint::black_box(collector.command_tag().to_string());
+    // simple_query returns `Ok(collector.into_command_tag())` — it MOVES the
+    // already-owned tag out (no clone). reset_session discards it via `?`.
+    core::hint::black_box(collector.into_command_tag());
     live
 }

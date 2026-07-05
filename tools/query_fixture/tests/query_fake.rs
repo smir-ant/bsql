@@ -142,6 +142,52 @@ async fn query_macro_query_one_over_the_fake() {
     assert_eq!(one.name, "solo");
 }
 
+/// `query_one`'s decode-direct path over ZERO rows is a classified
+/// [`DriverError::NoRows`] (no `Surface::Row` ever arrives → nothing decoded →
+/// `NoRows` at the clean idle boundary), never a silent empty — and the
+/// connection stays healthy.
+#[tokio::test]
+async fn query_one_zero_rows_is_no_rows_over_the_fake() {
+    let mut fake = FakePostgres::new();
+    fake.on("SELECT id, name FROM users").returns(rows![]);
+
+    let mut conn = fake.connect().await.expect("connect over the fake");
+    let err = conn
+        .query_one::<UsersByNameQuery>(())
+        .await
+        .expect_err("zero rows must be a loud NoRows");
+    assert!(matches!(err, DriverError::NoRows), "got: {err:?}");
+    assert!(conn.is_healthy(), "the connection stays healthy after NoRows");
+}
+
+/// `query_one`'s decode-direct path over a MULTI-row result is a classified
+/// [`DriverError::TooManyRows`]: it decodes the first row, then BREAKS on the
+/// second and DRAINS the connection back to a clean idle — so the SAME
+/// connection then runs a following (multi-row-tolerant) `query!` and gets both
+/// rows, proving the reclaiming drain worked.
+#[tokio::test]
+async fn query_one_two_rows_is_too_many_then_reclaims_over_the_fake() {
+    let mut fake = FakePostgres::new();
+    fake.on("SELECT id, name FROM users")
+        .returns(rows![[1_i64, "alice"], [2_i64, "bob"]]);
+
+    let mut conn = fake.connect().await.expect("connect over the fake");
+    let err = conn
+        .query_one::<UsersByNameQuery>(())
+        .await
+        .expect_err("two rows must be a loud TooManyRows");
+    assert!(matches!(err, DriverError::TooManyRows), "got: {err:?}");
+    assert!(conn.is_healthy(), "the connection is reclaimed after TooManyRows");
+
+    // The drain reclaimed it: a following query on the SAME connection returns
+    // BOTH scripted rows.
+    let rows = conn
+        .query::<UsersByNameQuery>(())
+        .await
+        .expect("the reclaimed connection runs the next query!");
+    assert_eq!(rows.len(), 2, "both scripted rows come back after reclaim");
+}
+
 /// An unscripted `query!` is a LOUD classified error, never a silent empty
 /// result — and the connection stays healthy, so a scripted `query!` on the
 /// SAME connection then returns its rows (the reuse invariant).

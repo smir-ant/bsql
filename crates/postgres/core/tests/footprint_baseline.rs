@@ -54,7 +54,7 @@ fn core_stable_public_types_match_baseline() {
         (size_of::<ConnectConfig>(), align_of::<ConnectConfig>(), 152, 8, "ConnectConfig"),
         (size_of::<SslMode>(), align_of::<SslMode>(), 1, 1, "SslMode"),
         (size_of::<Notification>(), align_of::<Notification>(), 56, 8, "Notification"),
-        (size_of::<QueryResult>(), align_of::<QueryResult>(), 72, 8, "QueryResult"),
+        (size_of::<QueryResult>(), align_of::<QueryResult>(), 64, 8, "QueryResult"),
     ];
     for &(sz, al, exp_sz, exp_al, name) in rows {
         assert_eq!(sz, exp_sz, "footprint baseline drift (size) for {name}");

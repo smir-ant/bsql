@@ -451,20 +451,21 @@ impl ArenaBuilder {
 
 // ─── QueryResult ────────────────────────────────────────────
 
-/// Result of a query — rows + command tag + column count.
+/// Result of a query — rows + command tag + column names.
 #[derive(Debug)]
 #[must_use]
 pub struct QueryResult {
     pub rows: Vec<Row>,
     pub command_tag: String,
-    pub column_count: usize,
     pub column_names: Arc<[String]>,
 }
 
-// Footprint pin: a Vec (3 words) + a String (3 words) + a usize + an Arc<[_]>
-// (2 words, fat pointer). A new field, or swapping a field to a wider owned
-// type, shows up here.
-crate::footprint_pin!(QueryResult, size = 72, align = 8);
+// Footprint pin: a Vec (3 words) + a String (3 words) + an Arc<[_]> (2 words,
+// fat pointer) = 8 words = 64 B. A new field, or swapping a field to a wider
+// owned type, shows up here. (An earlier data-row-width `column_count: usize`
+// field was write-only — never read anywhere — and was removed; a caller that
+// needs the column count reads `column_names.len()`.)
+crate::footprint_pin!(QueryResult, size = 64, align = 8);
 
 // ─── Notification ───────────────────────────────────────────
 

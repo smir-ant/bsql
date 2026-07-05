@@ -48,7 +48,7 @@
 //!   ConnectConfig              152      8   host/user/db/password Strings + startup Vec + CA-roots Arc
 //!   SslMode                      1      1   3-variant enum
 //!   Notification                56      8   2 String + i32
-//!   QueryResult                 72      8   Vec<Row> + String + usize + Arc<[String]>
+//!   QueryResult                 64      8   Vec<Row> + String + Arc<[String]>
 //! ```
 //!
 //! Stable wire/error/state types — `bsql-postgres-proto` — carry their own
