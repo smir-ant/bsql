@@ -79,6 +79,67 @@ fn slow_query_beyond_connect_timeout_survives() {
     c.close().expect("close");
 }
 
+/// WITNESS (SSL-probe timeout class parity): a server that ACCEPTS the TCP
+/// connection but stays silent on the `SSLRequest` probe byte must make sync
+/// `connect` report `DriverError::Timeout` — the SAME class the async driver's
+/// connect budget and the post-probe TLS handshake use for a connect-phase
+/// timeout — NOT the generic `Io(TimedOut)` a bare `?` on the raw probe
+/// `read_exact` would yield. Closes a cross-driver class divergence: both fail
+/// fast, but must report the same class. Deterministic + PG-free (a raw loopback
+/// listener that accepts then stays silent), so it runs in the default suite —
+/// no `#[ignore]`.
+///
+/// The non-timeout case (a connection reset on the probe) is NOT remapped: the
+/// classifier's `_ => DriverError::Io(e)` arm keeps every other io error at its
+/// real class, so only a read/write DEADLINE becomes `Timeout`.
+#[test]
+fn ssl_probe_timeout_is_classified_timeout_matching_async() {
+    // A raw TCP listener that accepts then never answers the SSLRequest probe.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let accepter = std::thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            // Read (discard) the client's SSLRequest bytes but NEVER reply; hold
+            // until the client gives up and closes (read → 0), so this thread
+            // exits promptly once the client times out.
+            let mut sink = [0u8; 64];
+            loop {
+                match std::io::Read::read(&mut sock, &mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        }
+    });
+
+    // SSL wanted (the SSLRequest probe path — NOT ssl_mode(Disable)) with a 1s
+    // connect budget, which arms the probe socket's read deadline.
+    let cfg = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .port(addr.port())
+        .database("postgres".to_string())
+        .ssl_mode(bsql_postgres_sync::SslMode::Prefer)
+        .connect_timeout(1);
+
+    let start = std::time::Instant::now();
+    let result = Connection::connect(&cfg);
+    let elapsed = start.elapsed();
+
+    // `Connection` is not Debug — classify by matching, not Debug-printing the Ok.
+    match result {
+        Err(bsql_postgres_sync::DriverError::Timeout) => {}
+        Err(other) => panic!(
+            "an SSL-probe timeout must be DriverError::Timeout (async parity); got {other:?} after {elapsed:?}"
+        ),
+        Ok(_) => panic!("a silent server must time out, not connect; got Ok after {elapsed:?}"),
+    }
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "connect must time out within ~connect_timeout, took {elapsed:?}",
+    );
+
+    accepter.join().ok();
+}
+
 /// WITNESS: startup parameters set on the connection config take effect on the
 /// server session. Proven three ways — `SHOW search_path`,
 /// `current_setting('application_name')`, `SHOW statement_timeout` — plus the

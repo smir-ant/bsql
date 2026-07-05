@@ -341,9 +341,17 @@ impl Connection {
         }
         let ssl_bytes = bsql_postgres_core::ssl::ssl_request_bytes();
         let mut tcp = tcp;
-        Write::write_all(&mut tcp, ssl_bytes)?;
+        // A read/write deadline here — the armed connect-phase `connect_timeout`
+        // firing on a server silent on the `SSLRequest` probe byte — is a
+        // connect-phase TIMEOUT, classified as such via `lift_probe_io`: the SAME
+        // class the async driver and the post-probe TLS handshake (`lift_tls_error`)
+        // surface, so the two drivers agree. A bare `?` here would instead map it
+        // through `From<io::Error>` to the generic `DriverError::Io(TimedOut)` —
+        // the cross-driver divergence this closes. Every other io error keeps its
+        // real class.
+        Write::write_all(&mut tcp, ssl_bytes).map_err(lift_probe_io)?;
         let mut response = [0u8; 1];
-        Read::read_exact(&mut tcp, &mut response)?;
+        Read::read_exact(&mut tcp, &mut response).map_err(lift_probe_io)?;
         match bsql_postgres_core::ssl::classify_ssl_response(response[0], config)? {
             bsql_postgres_core::ssl::SslProbe::Accepted { server_name } => {
                 // Use the provider-explicit ring config from `shared_client_config`:
@@ -1527,6 +1535,26 @@ fn lift_engine_error(e: EngineError<WireError>) -> DriverError {
         // UnexpectedSuspend / RowCount / FrameTooLong / SpuriousPending) surface
         // as classified I/O carrying the engine's own detail.
         other => DriverError::Io(io::Error::other(format!("engine error: {other:?}"))),
+    }
+}
+
+/// Classify an [`io::Error`] from the connect-phase `SSLRequest` probe — the raw
+/// `write_all` / `read_exact` on the bare socket BEFORE the wire is built.
+///
+/// A read/write deadline (the armed connect-phase `connect_timeout` firing on a
+/// server that never answers the probe) surfaces as [`WouldBlock`]/[`TimedOut`]
+/// and is a connect-phase timeout, mapped to [`DriverError::Timeout`] — the SAME
+/// class the async driver's connect budget and the post-probe TLS handshake
+/// ([`lift_tls_error`]) use, so the two drivers agree for a connect-phase
+/// timeout. Every OTHER io error (e.g. a connection reset) keeps its real class
+/// as [`DriverError::Io`]; only the timeout is remapped.
+///
+/// [`WouldBlock`]: io::ErrorKind::WouldBlock
+/// [`TimedOut`]: io::ErrorKind::TimedOut
+fn lift_probe_io(e: io::Error) -> DriverError {
+    match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => DriverError::Timeout,
+        _ => DriverError::Io(e),
     }
 }
 
