@@ -14,8 +14,7 @@
 )]
 
 use bsql_postgres_proto::engine::{
-    session, session_with, Engine, EngineError, EngineNoObs, Event, Live, NoObserver, Surface,
-    Transport, AuthEvent,
+    session, AuthEvent, EngineError, Event, Live, Surface, Transport,
 };
 use bsql_postgres_proto::wire::{TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_READY_FOR_QUERY};
 use bsql_postgres_proto::{Credentials, Ident};
@@ -151,30 +150,6 @@ fn verbs_thread_token_one_await_each() {
     assert!(threaded);
 }
 
-/// `session_with` threads the linear token with a caller-chosen observer
-/// policy through the identical verb surface — no signature change.
-#[test]
-fn session_with_threads_explicit_policy() {
-    let user = Ident::try_from_str("test").expect("ident");
-    let server = StaticServer::new(handshake_then_ping_reply());
-    let threaded = session_with(
-        server,
-        NoObserver,
-        &user,
-        None,
-        &[],
-        Credentials::Trust,
-        |mut e, live| {
-            let live = block_on(e.connect(live)).expect("connect");
-            let live = block_on(e.ping(live, drop_sink)).expect("ping").live;
-            let _ = live;
-            true
-        },
-    )
-    .expect("startup packet assembles");
-    assert!(threaded);
-}
-
 /// The declared pull-event vocabulary holds its pinned 24-byte footprint.
 #[test]
 fn event_and_authevent_are_24_bytes() {
@@ -184,19 +159,8 @@ fn event_and_authevent_are_24_bytes() {
     assert_eq!(core::mem::align_of::<AuthEvent<'static>>(), 8);
 }
 
-/// The branded token and the default observer policy are zero-sized.
+/// The branded liveness token is zero-sized.
 #[test]
-fn live_and_noobserver_are_zero_sized() {
+fn live_is_zero_sized() {
     assert_eq!(core::mem::size_of::<Live<'static>>(), 0);
-    assert_eq!(core::mem::size_of::<NoObserver>(), 0);
-}
-
-/// NoObserver is free: an engine with the default observer is byte-for-byte
-/// identical to the observer-free control type.
-#[test]
-fn engine_with_default_observer_is_free() {
-    assert_eq!(
-        core::mem::size_of::<Engine<'static, [u8; 16], NoObserver>>(),
-        core::mem::size_of::<EngineNoObs<'static, [u8; 16]>>(),
-    );
 }

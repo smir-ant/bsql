@@ -1,36 +1,20 @@
 //! The seam primitives the engine is built from.
 //!
-//! Four of the five load-bearing seams live here; the fifth (the
+//! Three of the four load-bearing seams live here; the fourth (the
 //! [`Engine`](super::Engine) shell) composes them in the module root.
 //!
 //! 1. [`Never`] + [`absurd`] — the uninhabited carrier for
 //!    phase-impossible wire frames. A frame the type system cannot rule
 //!    out by *omission* is funnelled through `absurd`, never a wildcard
 //!    `_` arm.
-//! 2. [`Observer`] (sealed) + [`NoObserver`] — the zero-cost policy seam
-//!    carried by every verb. The default policy is a ZST whose hooks
-//!    inline to nothing; a non-default policy reuses the identical verb
-//!    surface (no second signature pass).
-//! 3. [`Transport`] — the driver-facing I/O seam (RPITIT + `Send`, with
+//! 2. [`Transport`] — the driver-facing I/O seam (RPITIT + `Send`, with
 //!    a `Send`-bounded associated [`Error`](Transport::Error) type so the
 //!    `#![no_std]` core never bakes in a concrete I/O error and a wrapper
 //!    transport's error union stays `Send`).
-//! 4. [`Live`] — the branded, non-`Clone`, linear liveness token.
+//! 3. [`Live`] — the branded, non-`Clone`, linear liveness token.
 
 use core::future::Future;
 use core::marker::PhantomData;
-#[cfg(test)]
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-use crate::command_tag::CommandTag;
-
-/// Private sealing witness. A trait in a private module cannot be named —
-/// let alone implemented — by a downstream crate, so [`Observer`] is
-/// closed to exactly the policies this crate blesses.
-mod sealed {
-    /// Implemented only for this crate's blessed observer policies.
-    pub trait Sealed {}
-}
 
 // ===========================================================================
 // 1. Never + absurd
@@ -59,109 +43,7 @@ pub fn absurd<T>(n: Never) -> T {
 crate::wire_pin!(Never, size = 0, align = 1);
 
 // ===========================================================================
-// 2. Observer (sealed) + NoObserver
-// ===========================================================================
-
-/// Sealed observer-policy seam carried by every verb through the engine
-/// type parameter.
-///
-/// Sealed via a private supertrait: a downstream crate can neither name
-/// nor implement the private `sealed::Sealed` witness, so the set of
-/// policies is closed to the ones this crate blesses. The bound has no
-/// runtime footprint — a
-/// generic verb monomorphised at [`NoObserver`] is identical to one with
-/// no seam at all.
-pub trait Observer: sealed::Sealed {
-    /// Invoked once per inbound *whole* data row, lending the row's wire
-    /// payload. An oversize row that streams as chunks never resides whole, so
-    /// it is surfaced to the pump's sink in pieces and does not invoke this
-    /// hook — whose contract lends a complete row a chunked one cannot honour.
-    fn on_row(&self, row: &[u8]);
-    /// Invoked once per completed command, lending the typed [`CommandTag`] —
-    /// `None` for the tagless extended-protocol acknowledgements
-    /// (`ParseComplete` / `CloseComplete`) and the `Describe` completion, which
-    /// carry no `CommandComplete` tag. The typed tag is lent directly rather
-    /// than its raw wire bytes so the hook reads the affected-row count without
-    /// re-parsing — the crate's by-type discipline (the engine already parsed
-    /// it once).
-    fn on_complete(&self, tag: Option<&CommandTag>);
-}
-
-/// The default zero-cost policy: a ZST whose hooks are inlined no-ops.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoObserver;
-
-impl sealed::Sealed for NoObserver {}
-
-impl Observer for NoObserver {
-    #[inline(always)]
-    fn on_row(&self, _row: &[u8]) {}
-    #[inline(always)]
-    fn on_complete(&self, _tag: Option<&CommandTag>) {}
-}
-
-/// Crate-internal [`Observer`] policy that tallies the rows and completed
-/// commands it observes — instrumentation for the pump's hook-firing test, NOT
-/// part of the public surface ([`NoObserver`] is the only public policy).
-///
-/// The observer seam is sealed (a downstream crate can neither name nor
-/// implement the private witness), so witnessing the hooks fire from outside
-/// the crate is impossible; this `#[cfg(test)]`-only `pub(crate)` policy is how
-/// the crate's own unit test does it, mirroring the crate's other
-/// test-instrumentation (`drop_witness`). It counts
-/// [`on_row`](Observer::on_row) and [`on_complete`](Observer::on_complete) via
-/// relaxed atomics, so it is `Sync` — a future carrying `&CountingObserver`
-/// stays `Send`. The tallies are monotonic and read with
-/// [`rows`](Self::rows) / [`completes`](Self::completes).
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct CountingObserver {
-    rows: AtomicUsize,
-    completes: AtomicUsize,
-}
-
-#[cfg(test)]
-impl CountingObserver {
-    /// Construct a counter with both tallies at zero.
-    #[inline]
-    pub(crate) const fn new() -> Self {
-        Self {
-            rows: AtomicUsize::new(0),
-            completes: AtomicUsize::new(0),
-        }
-    }
-
-    /// The number of [`on_row`](Observer::on_row) invocations observed so far.
-    #[inline]
-    pub(crate) fn rows(&self) -> usize {
-        self.rows.load(Ordering::Relaxed)
-    }
-
-    /// The number of [`on_complete`](Observer::on_complete) invocations observed
-    /// so far.
-    #[inline]
-    pub(crate) fn completes(&self) -> usize {
-        self.completes.load(Ordering::Relaxed)
-    }
-}
-
-#[cfg(test)]
-impl sealed::Sealed for CountingObserver {}
-
-#[cfg(test)]
-impl Observer for CountingObserver {
-    #[inline]
-    fn on_row(&self, _row: &[u8]) {
-        self.rows.fetch_add(1, Ordering::Relaxed);
-    }
-    #[inline]
-    fn on_complete(&self, _tag: Option<&CommandTag>) {
-        self.completes.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-// ===========================================================================
-// 3. Transport
+// 2. Transport
 // ===========================================================================
 
 /// The driver-facing I/O seam.
@@ -271,7 +153,7 @@ pub trait Transport: Send {
 }
 
 // ===========================================================================
-// 4. Live — branded linear liveness token
+// 3. Live — branded linear liveness token
 // ===========================================================================
 
 /// Branded, non-`Clone`, linear liveness token.
@@ -304,7 +186,7 @@ impl<'b> Live<'b> {
 }
 
 // ===========================================================================
-// 5. Outcome — the alive-verb return carrier (token rides Ok)
+// 4. Outcome — the alive-verb return carrier (token rides Ok)
 // ===========================================================================
 
 /// The successful return of a token-threading verb: the linear [`Live`] token

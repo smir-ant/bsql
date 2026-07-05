@@ -5,17 +5,15 @@
 //! (a SELECT row stream), `Suspended` (a row-limited Execute → `PortalSuspended`),
 //! `Failed` (`ErrorResponse`), and `Closed` (an out-of-phase teardown frame) —
 //! and the caller-requested `Stopped` early exit and the classified
-//! `UnexpectedEof`. It witnesses the externally-observable behaviour on the
-//! default [`NoObserver`]: the sink capturing the rows and the `Deliver`
-//! projection read at the delivery, `NeedMore` driving transport reads (under a
-//! partial-read script), and the entry flush draining an enqueued request
-//! exactly once. The observer-hook firing counts (which need a non-default
-//! sealed observer policy, nameable only inside the crate) are covered by a
-//! `#[cfg(test)]` unit test in the engine's `pump` module.
+//! `UnexpectedEof`. It witnesses the externally-observable behaviour: the sink
+//! capturing the rows and the `Deliver` projection read at the delivery,
+//! `NeedMore` driving transport reads (under a partial-read script), and the
+//! entry flush draining an enqueued request exactly once. The per-row /
+//! per-completion surface counts are covered by a `#[cfg(test)]` unit test in
+//! the engine's `pump` module.
 //!
 //! [`pump_active_to_boundary`]: bsql_postgres_proto::engine::pump_active_to_boundary
 //! [`Transport`]: bsql_postgres_proto::engine::Transport
-//! [`NoObserver`]: bsql_postgres_proto::engine::NoObserver
 
 #![forbid(unsafe_code)]
 #![allow(
@@ -31,7 +29,7 @@ use core::ops::ControlFlow;
 
 use bsql_postgres_proto::engine::{
     poll_once, pump_active_to_boundary, ActiveEngine, AuthEvent, Boundary, ConnectingEngine,
-    EngineError, NoObserver, Observer, SendBuf, Surface, Transport,
+    EngineError, SendBuf, Surface, Transport,
 };
 use bsql_postgres_proto::wire::{
     TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE, TAG_DATA_ROW, TAG_ERROR_RESPONSE, TAG_NOTICE_RESPONSE,
@@ -302,16 +300,15 @@ fn feed_conn(engine: &mut ConnectingEngine, bytes: &[u8]) {
 /// Drive the pump once over the always-ready scripted transport (one
 /// [`poll_once`] resolves it). The sink is moved in, so on return its borrow of
 /// any captured state has ended.
-fn run<O: Observer, S: FnMut(Surface<'_>) -> ControlFlow<()>>(
+fn run<S: FnMut(Surface<'_>) -> ControlFlow<()>>(
     active: &mut ActiveEngine,
     transport: &mut ScriptedTransport,
     send_buf: &mut SendBuf,
-    obs: &O,
     sink: S,
 ) -> Result<Boundary<()>, EngineError<Infallible>> {
     // A blocking transport never yields `Pending`, so `SpuriousPending` here is
     // a broken harness — a panic, not the returned protocol `Result`.
-    match poll_once(pump_active_to_boundary(active, transport, send_buf, obs, sink)) {
+    match poll_once(pump_active_to_boundary(active, transport, send_buf, sink)) {
         Ok(result) => result,
         Err(_) => panic!("blocking transport must resolve in a single poll"),
     }
@@ -343,13 +340,11 @@ fn idle_select_drives_rows_deliver_and_flushes_request_once() {
     let mut send_buf = SendBuf::new();
     send_buf.enqueue(&request);
 
-    let obs = NoObserver;
     let mut captured = Captured::default();
     let boundary = run(
         &mut engine,
         &mut transport,
         &mut send_buf,
-        &obs,
         captured.sink(),
     )
     .expect("no engine error");
@@ -374,39 +369,6 @@ fn idle_select_drives_rows_deliver_and_flushes_request_once() {
     assert_eq!(transport.flushes, 1);
 }
 
-/// The default [`NoObserver`] policy compiles and runs through the same flow.
-#[test]
-fn no_observer_path_compiles_and_runs() {
-    let mut engine = active_engine();
-    let d = data_row(&[Some(b"x")]);
-    let reply = concat(&[
-        row_description(&[("c", 25)]),
-        d.clone(),
-        command_complete("SELECT 1"),
-        ready_for_query(b'I'),
-    ]);
-    let mut transport = ScriptedTransport::new(reply, 0);
-    let mut send_buf = SendBuf::new();
-
-    let obs = NoObserver;
-    let mut captured = Captured::default();
-    let boundary = run(
-        &mut engine,
-        &mut transport,
-        &mut send_buf,
-        &obs,
-        captured.sink(),
-    )
-    .expect("no engine error");
-
-    assert_eq!(boundary, Boundary::Idle);
-    assert_eq!(captured.rows, vec![body_of(&d)]);
-    assert_eq!(captured.deliver_tag, Some(Some("SELECT 1".to_string())));
-    // The empty send buffer still flushes exactly once at entry.
-    assert_eq!(transport.flushes, 1);
-    assert!(transport.writes.is_empty());
-}
-
 /// `Suspended` terminal: a row-limited Bind+Execute whose portal hits its cap
 /// (`PortalSuspended`). The rows fetched before the pause are surfaced; the
 /// boundary is `Suspended`, distinct from a completed `Deliver`.
@@ -421,13 +383,11 @@ fn suspended_terminal_on_portal_suspended() {
     let mut transport = ScriptedTransport::new(reply, 0);
     let mut send_buf = SendBuf::new();
 
-    let obs = NoObserver;
     let mut captured = Captured::default();
     let boundary = run(
         &mut engine,
         &mut transport,
         &mut send_buf,
-        &obs,
         captured.sink(),
     )
     .expect("no engine error");
@@ -447,13 +407,11 @@ fn failed_terminal_surfaces_error_then_returns_failed() {
     let mut transport = ScriptedTransport::new(err.clone(), 0);
     let mut send_buf = SendBuf::new();
 
-    let obs = NoObserver;
     let mut captured = Captured::default();
     let boundary = run(
         &mut engine,
         &mut transport,
         &mut send_buf,
-        &obs,
         captured.sink(),
     )
     .expect("no engine error");
@@ -475,13 +433,11 @@ fn closed_terminal_on_out_of_phase_frame() {
     let mut transport = ScriptedTransport::new(teardown, 0);
     let mut send_buf = SendBuf::new();
 
-    let obs = NoObserver;
     let mut captured = Captured::default();
     let boundary = run(
         &mut engine,
         &mut transport,
         &mut send_buf,
-        &obs,
         captured.sink(),
     )
     .expect("no engine error");
@@ -508,9 +464,8 @@ fn sink_break_stops_early_with_stopped_boundary() {
     let mut transport = ScriptedTransport::new(reply, 0);
     let mut send_buf = SendBuf::new();
 
-    let obs = NoObserver;
     let mut seen = 0usize;
-    let boundary = run(&mut engine, &mut transport, &mut send_buf, &obs, |s| {
+    let boundary = run(&mut engine, &mut transport, &mut send_buf, |s| {
         if let Surface::Row(_) = s {
             seen += 1;
             // Stop after the first row.
@@ -535,13 +490,11 @@ fn unexpected_eof_is_classified() {
     let mut transport = ScriptedTransport::new(vec![TAG_DATA_ROW.byte(), 0, 0], 0);
     let mut send_buf = SendBuf::new();
 
-    let obs = NoObserver;
     let mut captured = Captured::default();
     let err = run(
         &mut engine,
         &mut transport,
         &mut send_buf,
-        &obs,
         captured.sink(),
     )
     .expect_err("incomplete frame + EOF must classify");
@@ -566,13 +519,11 @@ fn notice_surfaced_during_select() {
     let mut transport = ScriptedTransport::new(reply, 0);
     let mut send_buf = SendBuf::new();
 
-    let obs = NoObserver;
     let mut captured = Captured::default();
     let boundary = run(
         &mut engine,
         &mut transport,
         &mut send_buf,
-        &obs,
         captured.sink(),
     )
     .expect("no engine error");

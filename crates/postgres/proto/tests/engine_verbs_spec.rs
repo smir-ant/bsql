@@ -25,7 +25,7 @@ use core::ops::ControlFlow;
 
 use bsql_postgres_proto::engine::{
     poll_once, session, Boundary, CommandStatus, Engine, EngineError, ExpectedRowCount, Live,
-    NoObserver, NotifyStatus, Outcome, PreparedStatement, SpuriousPending, Surface, Transport,
+    NotifyStatus, Outcome, PreparedStatement, SpuriousPending, Surface, Transport,
 };
 use bsql_postgres_proto::wire::{
     TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_BIND_COMPLETE, TAG_COMMAND_COMPLETE,
@@ -398,7 +398,7 @@ fn flatten<'b>(
 /// whatever it produces (owned).
 fn run<R: 'static>(
     inbound: Vec<u8>,
-    body: impl for<'b> FnOnce(&mut Engine<'b, StaticServer, NoObserver>, Live<'b>) -> R,
+    body: impl for<'b> FnOnce(&mut Engine<'b, StaticServer>, Live<'b>) -> R,
 ) -> R {
     let user = Ident::try_from_str("verbs").expect("ident");
     session(

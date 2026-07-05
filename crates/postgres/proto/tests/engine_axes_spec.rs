@@ -411,7 +411,7 @@ const SECTION7: &[Row] = &[
 const SECTION7_AXES: usize = 12;
 /// `crate::wire_pin!(` footprint-pin invocations across `engine/`.
 /// Reproduce: `grep -rho 'crate::wire_pin!(' crates/postgres/proto/src/engine/*.rs | wc -l`
-const WIRE_PINS: usize = 28;
+const WIRE_PINS: usize = 27;
 /// Variants of `EngineError<E>` (the classified error taxonomy).
 /// Reproduce: count the upper-case-leading lines inside the `pub enum
 /// EngineError<E> { .. }` block in `engine/error.rs`.

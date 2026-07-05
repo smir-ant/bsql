@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use bsql_postgres_proto::engine::{
     poll_once, session, ActiveEngine, AuthEvent, CommandStatus, ConnectingEngine, Engine,
-    EngineError, Event, Live, NoObserver, Outcome, SendBuf, Surface,
+    EngineError, Event, Live, Outcome, SendBuf, Surface,
 };
 use bsql_postgres_proto::prepared::new_prepared_query;
 use bsql_postgres_proto::{Credentials, Ident, PreparedQuery, TxStatus};
@@ -1024,7 +1024,7 @@ fn run_verb(transcript: &Transcript) -> ObservedRun {
 
 /// The session-scoped verb drive: connect, then each step's verb, then project.
 fn run_verb_body<'b>(
-    engine: &mut Engine<'b, EngineScriptTransport, NoObserver>,
+    engine: &mut Engine<'b, EngineScriptTransport>,
     live: Live<'b>,
     transcript: &Transcript,
     captured: &ClientCapture,
@@ -1139,7 +1139,7 @@ fn run_verb_body<'b>(
 /// Call the verb matching `request`, threading the linear token; its sink folds
 /// surfaces into `cap` and the run-level accumulators.
 fn drive_verb_step<'b>(
-    engine: &mut Engine<'b, EngineScriptTransport, NoObserver>,
+    engine: &mut Engine<'b, EngineScriptTransport>,
     live: Live<'b>,
     request: &ClientRequest,
     cap: &mut VerbCapture,

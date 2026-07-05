@@ -260,9 +260,7 @@ unrelated scheduling shift), and deliberately NOT a whole-body no-alloc claim:
 buffering) legitimately allocate, so the alloc family is documented, not gated —
 the HOT DataRow arm's zero-allocation is proven separately by
 `engine_query_alloc` (which drives `query_params` through `pump_active`, and
-`pump_active` surfaces every row via `next_event`). Complements
-`engine_asm_identity` (which pins the zero-cost observer seam) — that gate is
-blind to `next_event`'s body; this one covers it.
+`pump_active` surfaces every row via `next_event`).
 
 The `decoder_fuzz` gate (`crates/postgres/core/tests/decoder_fuzz.rs`) is the
 UNIVERSAL-COVERAGE total-function proof for every decoder that turns untrusted
@@ -293,7 +291,7 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 
 ## Architecture
 
-- **Sans-IO engine** (`bsql-postgres-proto`, `engine` module): the session engine with zero I/O dependencies (`no_std + alloc`). Its seams: `Transport` (the driver-facing I/O seam, RPITIT + `Send`), `Live` (a branded, non-`Clone`, linear liveness token minted by `engine::session` / `session_with`), an `Observer` policy seam, and the `Never` carrier for phase-impossible frames. Protocol logic lives here; the driver only supplies bytes.
+- **Sans-IO engine** (`bsql-postgres-proto`, `engine` module): the session engine with zero I/O dependencies (`no_std + alloc`). Its seams: `Transport` (the driver-facing I/O seam, RPITIT + `Send`), `Live` (a branded, non-`Clone`, linear liveness token minted by `engine::session`), and the `Never` carrier for phase-impossible frames. Protocol logic lives here; the driver only supplies bytes.
 - **Core** (`bsql-postgres-core`): the shared result materializer, the dynamic `Row` / `QueryResult` types, `ConnectConfig`, TLS config, and the typed `Rows` / `RowsBuilder` containers. Both drivers build on it.
 - **Drivers** are thin I/O adapters implementing the `Transport` seam over the one engine. Difference: `.await` on async, blocking on sync.
 - **Rows.** The dynamic `Row` (from `query_sql` etc.) is 16 bytes (`'static + Clone + Send + Sync`) over an `Arc`-shared arena: 4 heap allocations per whole `QueryResult`, regardless of row count. The typed `Rows<Q>` (from the `query!` flagship) is 2 allocations per result and 0 per row (borrowed, zero-copy decode).

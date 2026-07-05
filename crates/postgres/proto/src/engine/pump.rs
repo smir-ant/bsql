@@ -7,10 +7,10 @@
 //! then repeatedly classifies one inbound frame and reads more bytes when the
 //! framing is short, until the engine reaches a protocol [`Boundary`]. It owns
 //! no state of its own — it borrows the [`ActiveEngine`], the
-//! [`Transport`](super::Transport), the [`SendBuf`], and the
-//! [`Observer`](super::Observer) as parameters, so it composes the I/O loop
-//! without being a method on any of them (the same disjoint-`&mut` shape the
-//! outbound [`flush`](super::flush) free function uses).
+//! [`Transport`](super::Transport), and the [`SendBuf`] as parameters, so it
+//! composes the I/O loop without being a method on any of them (the same
+//! disjoint-`&mut` shape the outbound [`flush`](super::flush) free function
+//! uses).
 //!
 //! # The borrow structure (why drive-to-boundary, not event-at-a-time)
 //!
@@ -53,7 +53,7 @@ use core::task::{Context, Poll};
 use crate::command_tag::CommandTag;
 
 use super::flush::flush;
-use super::seams::{Observer, Transport};
+use super::seams::Transport;
 use super::{
     ActiveEngine, ConnFail, ConnectingEngine, EngineError, Event, HandshakeProgress, SendBuf,
 };
@@ -200,16 +200,14 @@ crate::wire_pin!(Surface<'static>, size = 48, align = 8);
 /// enqueued — the read loop never enqueues, so there is no redundant per-read
 /// flush), then loops: classify one inbound frame via
 /// [`ActiveEngine::next_event`]; on `NeedMore`, read one chunk from `transport`
-/// into the engine's ingest buffer; on a payload event, fire the observer hook
-/// (rows / completions) and hand the [`Surface`] to `sink`; on a boundary,
-/// return.
+/// into the engine's ingest buffer; on a payload event, hand the [`Surface`] to
+/// `sink`; on a boundary, return.
 ///
 /// `sink` consumes each [`Surface`] in the call and returns
 /// [`ControlFlow`]: [`ControlFlow::Break`] stops the pump early and returns
-/// [`Boundary::Stopped`]. The observer's row hook fires for each *whole* row
-/// only; an oversize row is surfaced as [`Surface::RowChunk`] /
-/// [`Surface::RowChunkEnd`] and does not invoke the row hook (see
-/// [`Observer::on_row`](super::Observer::on_row)).
+/// [`Boundary::Stopped`]. A whole row is surfaced as [`Surface::Row`]; an
+/// oversize row that never resides whole is surfaced in pieces as
+/// [`Surface::RowChunk`] / [`Surface::RowChunkEnd`] instead.
 ///
 /// # Errors
 ///
@@ -224,16 +222,14 @@ crate::wire_pin!(Surface<'static>, size = 48, align = 8);
 ///   larger than the bounded ingest buffer.
 /// - [`EngineError::IngestCommitOverflow`](super::EngineError::IngestCommitOverflow)
 ///   — a transport that reported reading more than the lent slot held.
-pub async fn pump_active_to_boundary<T, O, S, B>(
+pub async fn pump_active_to_boundary<T, S, B>(
     active: &mut ActiveEngine,
     transport: &mut T,
     send_buf: &mut SendBuf,
-    obs: &O,
     mut sink: S,
 ) -> Result<Boundary<B>, EngineError<T::Error>>
 where
     T: Transport,
-    O: Observer,
     S: FnMut(Surface<'_>) -> ControlFlow<B>,
 {
     // Drain the enqueued request once, before the first read.
@@ -291,13 +287,9 @@ where
                 let tag = active.last_command_tag();
                 let oids = active.current_type_oids();
                 let names = active.current_column_names();
-                obs.on_complete(tag);
                 Surface::Deliver { tag, oids, names }
             }
-            Event::Row(body) => {
-                obs.on_row(body);
-                Surface::Row(body)
-            }
+            Event::Row(body) => Surface::Row(body),
             Event::Notice(body) => Surface::Notice(body),
             Event::Notify(body) => Surface::Notify(body),
             Event::ParamStatus(body) => Surface::ParamStatus(body),
@@ -325,8 +317,8 @@ where
 /// response (the SASL initial response is queued without surfacing an auth
 /// event) before reading one chunk into the connecting ingest buffer; on
 /// [`Ready`](HandshakeProgress::Ready) / [`Failed`](HandshakeProgress::Failed)
-/// return the [`HandshakeOutcome`]. No observer is involved — the handshake
-/// carries no rows or completions.
+/// return the [`HandshakeOutcome`]. The handshake carries no rows or
+/// completions.
 ///
 /// [`HandshakeProgress`] is non-borrowing, so each step's classification (and
 /// the classified [`ConnFail`] on failure) outlives the `send_buf`/ingest
@@ -455,15 +447,12 @@ crate::wire_pin!(SpuriousPending, size = 0, align = 1);
 
 #[cfg(test)]
 mod hook_tests {
-    //! Hook-firing coverage for the observer seam: drives the pump with the
-    //! crate-internal `CountingObserver` (a non-default sealed observer policy,
-    //! which only crate-internal code can name) and asserts the row/complete
-    //! hooks fire the expected number of times. The externally-observable
-    //! behaviour — rows and the `Deliver` projection captured through the
-    //! `Surface` sink — is covered by the `engine_pump_spec` integration test on
-    //! the default `NoObserver`; only this instrumentation count lives here.
+    //! Per-row / per-completion surfacing coverage: drives the pump over a
+    //! scripted Bind+Execute reply and asserts it surfaces exactly one
+    //! [`Surface::Row`] per whole row and one [`Surface::Deliver`] per completed
+    //! command — the two counts read directly off the [`Surface`] sink the pump
+    //! already feeds, so no separate instrumentation seam is needed.
 
-    use super::super::seams::CountingObserver;
     use super::{poll_once, pump_active_to_boundary, Boundary, Surface};
     use crate::action::TxStatus;
     use crate::engine::{ActiveEngine, IngestBuf, SendBuf, Transport};
@@ -518,10 +507,10 @@ mod hook_tests {
         )
     }
 
-    /// The pump fires `on_row` once per whole row and `on_complete` once per
-    /// completed command.
+    /// The pump surfaces one [`Surface::Row`] per whole row and one
+    /// [`Surface::Deliver`] per completed command.
     #[test]
-    fn observer_hooks_fire_per_row_and_per_completion() {
+    fn pump_surfaces_one_row_and_one_completion() {
         let mut engine = active();
         // Extended Bind+Execute: the issuer seats the result schema; the reply
         // is BindComplete, one DataRow, CommandComplete, ReadyForQuery.
@@ -535,18 +524,29 @@ mod hook_tests {
 
         let mut transport = ScriptReader { inbound };
         let mut send_buf = SendBuf::new();
-        let obs = CountingObserver::new();
 
+        // Count the row and completion surfaces on the sink the pump already
+        // feeds — the same events the deleted observer hooks used to tally,
+        // now read straight off the public `Surface` stream. `saturating_add`
+        // keeps the tally within the crate's checked-arithmetic wall.
+        let mut rows = 0_usize;
+        let mut completes = 0_usize;
         let outcome: Result<Result<Boundary<()>, _>, _> = poll_once(pump_active_to_boundary(
             &mut engine,
             &mut transport,
             &mut send_buf,
-            &obs,
-            |_s: Surface<'_>| ControlFlow::Continue(()),
+            |surface: Surface<'_>| {
+                match surface {
+                    Surface::Row(_) => rows = rows.saturating_add(1),
+                    Surface::Deliver { .. } => completes = completes.saturating_add(1),
+                    _ => {}
+                }
+                ControlFlow::Continue(())
+            },
         ));
 
         assert!(matches!(outcome, Ok(Ok(Boundary::Idle))));
-        assert_eq!(obs.rows(), 1);
-        assert_eq!(obs.completes(), 1);
+        assert_eq!(rows, 1);
+        assert_eq!(completes, 1);
     }
 }

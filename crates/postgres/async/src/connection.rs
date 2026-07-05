@@ -42,8 +42,8 @@ use bsql_postgres_core::{
     TypedNotification,
 };
 use bsql_postgres_proto::engine::{
-    self, Boundary, CommandStatus, ConnFail, Engine, EngineError, Live, NoObserver, NotifyStatus,
-    Outcome, PreparedStatement as WireStatement, Surface,
+    self, Boundary, CommandStatus, ConnFail, Engine, EngineError, Live, NotifyStatus, Outcome,
+    PreparedStatement as WireStatement, Surface,
 };
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
@@ -59,7 +59,7 @@ type AsyncWire = Wire<TokioSocket>;
 /// [`TlsError::Socket`]; the TLS arm's error already is this type.
 type WireError = TlsError<io::Error>;
 /// The owned, poolable engine handle (branded `'static`).
-type AsyncEngine = Engine<'static, AsyncWire, NoObserver>;
+type AsyncEngine = Engine<'static, AsyncWire>;
 
 /// Why the streaming [`query_each`](Connection::query_each) sink stopped the pump
 /// early — the break payload it hands to the engine's breakable verb.

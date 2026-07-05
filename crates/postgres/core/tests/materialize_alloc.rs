@@ -297,7 +297,7 @@ fn eager_query_and_reset_prebuffer_allocs_are_pinned() {
 /// fn; its body is reproduced here field-for-field, since the `QueryResult`
 /// fields are public.)
 fn run_query<'b>(
-    engine: &mut bsql_postgres_proto::engine::Engine<'b, Script, bsql_postgres_proto::engine::NoObserver>,
+    engine: &mut bsql_postgres_proto::engine::Engine<'b, Script>,
     live: bsql_postgres_proto::engine::Live<'b>,
 ) -> bsql_postgres_proto::engine::Live<'b> {
     let mut collector = ResultCollector::new();
@@ -329,7 +329,7 @@ fn run_query<'b>(
 /// fresh collector, ending with the same trailing `command_tag().to_string()`
 /// `simple_query` returns (allocated even though `reset_session` discards it).
 fn run_reset<'b>(
-    engine: &mut bsql_postgres_proto::engine::Engine<'b, Script, bsql_postgres_proto::engine::NoObserver>,
+    engine: &mut bsql_postgres_proto::engine::Engine<'b, Script>,
     live: bsql_postgres_proto::engine::Live<'b>,
 ) -> bsql_postgres_proto::engine::Live<'b> {
     const RESET: &str = "SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; \

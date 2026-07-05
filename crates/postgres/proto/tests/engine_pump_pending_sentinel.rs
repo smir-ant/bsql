@@ -25,7 +25,7 @@ use core::ops::ControlFlow;
 
 use bsql_postgres_proto::engine::{
     poll_once, pump_active_to_boundary, ActiveEngine, AuthEvent, Boundary, ConnectingEngine,
-    NoObserver, SendBuf, SpuriousPending, Surface, Transport,
+    SendBuf, SpuriousPending, Surface, Transport,
 };
 use bsql_postgres_proto::wire::TAG_READY_FOR_QUERY;
 use bsql_postgres_proto::{Credentials, Ident};
@@ -177,13 +177,11 @@ fn pump_over_blocking_transport_resolves_in_one_poll() {
         cursor: 0,
     };
     let mut send_buf = SendBuf::new();
-    let obs = NoObserver;
 
     let boundary: Boundary<()> = poll_once(pump_active_to_boundary(
         &mut engine,
         &mut transport,
         &mut send_buf,
-        &obs,
         |_s: Surface<'_>| ControlFlow::Continue(()),
     ))
     .expect("blocking transport resolves in a single poll")
@@ -206,13 +204,11 @@ fn pump_over_pending_read_classifies_spurious_pending() {
     let mut engine = active_engine();
     let mut transport = BlockingReadTransport;
     let mut send_buf = SendBuf::new();
-    let obs = NoObserver;
 
     let result: Result<Result<Boundary<()>, _>, _> = poll_once(pump_active_to_boundary(
         &mut engine,
         &mut transport,
         &mut send_buf,
-        &obs,
         |_s: Surface<'_>| ControlFlow::Continue(()),
     ));
 

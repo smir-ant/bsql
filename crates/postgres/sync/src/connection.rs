@@ -38,8 +38,8 @@ use bsql_postgres_core::{
     TypedNotification,
 };
 use bsql_postgres_proto::engine::{
-    self, Boundary, CommandStatus, ConnFail, Engine, EngineError, Live, NoObserver, NotifyStatus,
-    Outcome, PreparedStatement as WireStatement, SpuriousPending, Surface,
+    self, Boundary, CommandStatus, ConnFail, Engine, EngineError, Live, NotifyStatus, Outcome,
+    PreparedStatement as WireStatement, SpuriousPending, Surface,
 };
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
@@ -55,7 +55,7 @@ type SyncWire = Wire<SyncSocket>;
 /// [`TlsError::Socket`]; the TLS arm's error already is this type.
 type WireError = TlsError<io::Error>;
 /// The owned, poolable engine handle (branded `'static`).
-type SyncEngine = Engine<'static, SyncWire, NoObserver>;
+type SyncEngine = Engine<'static, SyncWire>;
 /// Result of a single-poll verb drive, before classification.
 type Polled<T> = Result<Result<T, EngineError<WireError>>, SpuriousPending>;
 

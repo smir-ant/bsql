@@ -1,4 +1,4 @@
-//! Owned-handle constructor gate for [`open_owned`] / [`open_owned_with`].
+//! Owned-handle constructor gate for [`open_owned`].
 //!
 //! [`session`](bsql_postgres_proto::engine::session) lends the engine and its
 //! linear [`Live`] token to a `for<'b>` closure: the generative brand traps
@@ -29,7 +29,6 @@
 //! `Option<Live<'static>>`, taken for the duration of a verb and returned after.
 //!
 //! [`open_owned`]: bsql_postgres_proto::engine::open_owned
-//! [`open_owned_with`]: bsql_postgres_proto::engine::open_owned_with
 //! [`Transport`]: bsql_postgres_proto::engine::Transport
 //! [`Live`]: bsql_postgres_proto::engine::Live
 
@@ -46,7 +45,7 @@ use core::future::{ready, Future};
 use core::ops::ControlFlow;
 
 use bsql_postgres_proto::engine::{
-    open_owned, open_owned_with, Engine, EngineError, Live, Never, NoObserver, Surface, Transport,
+    open_owned, Engine, EngineError, Live, Never, Surface, Transport,
 };
 use bsql_postgres_proto::wire::{TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_READY_FOR_QUERY};
 use bsql_postgres_proto::{Credentials, Ident};
@@ -265,27 +264,3 @@ fn open_owned_engine_can_be_stored_in_a_struct() {
     );
 }
 
-/// `open_owned_with` (the policy-carrying owned constructor) at the default
-/// [`NoObserver`] policy primes and threads identically to `open_owned` —
-/// proving the with-observer entry of the pair is wired end-to-end.
-#[test]
-fn open_owned_with_default_policy_threads() {
-    let user = Ident::try_from_str("owned").expect("ident");
-    let server = StaticServer::new(trust_then_ping_script());
-    let (mut engine, live) =
-        open_owned_with(server, NoObserver, &user, None, &[], Credentials::Trust)
-            .expect("startup packet assembles");
-
-    let threaded: Result<(), EngineError<Infallible>> = block_on(async {
-        let live = engine.connect(live).await?;
-        let live = engine.ping(live, drop_sink).await?.live;
-        let _ = live;
-        Ok(())
-    });
-    threaded.expect("open_owned_with must thread the token through connect→ping");
-    assert_eq!(
-        engine.backend_pid(),
-        Ok(4321),
-        "open_owned_with must reach active after the threaded verbs",
-    );
-}

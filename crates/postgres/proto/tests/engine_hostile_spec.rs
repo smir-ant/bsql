@@ -31,7 +31,7 @@ use core::ops::ControlFlow;
 
 use bsql_postgres_proto::engine::{
     poll_once, pump_active_to_boundary, pump_connecting_to_ready, ActiveEngine, AuthEvent, Boundary,
-    ConnFail, ConnectingEngine, Event, HandshakeOutcome, NoObserver, SendBuf, Surface, Transport,
+    ConnFail, ConnectingEngine, Event, HandshakeOutcome, SendBuf, Surface, Transport,
 };
 use bsql_postgres_proto::frame::READ_BUF_CAP;
 use bsql_postgres_proto::wire::{
@@ -812,7 +812,6 @@ fn out_of_phase_or_unknown_tag_tears_down() {
 fn active_protocol_violation_pumps_to_boundary_closed() {
     let mut engine = active_engine();
     let mut send_buf = SendBuf::new();
-    let obs = NoObserver;
     // A bare DataRow in Idle is a protocol violation.
     let mut transport = ScriptedTransport::new(data_row(&[Some(b"x")]), 0);
     let sink = |_: Surface<'_>| -> ControlFlow<()> { ControlFlow::Continue(()) };
@@ -820,7 +819,6 @@ fn active_protocol_violation_pumps_to_boundary_closed() {
         &mut engine,
         &mut transport,
         &mut send_buf,
-        &obs,
         sink,
     )) {
         Ok(Ok(b)) => b,

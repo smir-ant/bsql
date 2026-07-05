@@ -30,13 +30,11 @@
 //!
 //! # The disjoint split-borrow (mandatory)
 //!
-//! Every I/O verb destructures `&mut self` into its four fields
-//! (`transport` / `obs` / `phase` / `send_buf`) so the pump can drive the active
+//! Every I/O verb destructures `&mut self` into its three fields
+//! (`transport` / `phase` / `send_buf`) so the pump can drive the active
 //! engine over the transport while the other fields are borrowed disjointly.
 //! Routing through a `self.active_mut()` helper would alias the whole engine
-//! (E0499); the field-level destructure is the only shape that compiles, and it
-//! is also what keeps the observer hook (`obs`) a borrow disjoint from the phase
-//! it observes.
+//! (E0499); the field-level destructure is the only shape that compiles.
 //!
 //! # Per-command compaction
 //!
@@ -97,7 +95,7 @@ use core::ops::ControlFlow;
 use super::error::{EngineError, ExpectedRowCount, RowCountViolation};
 use super::frames;
 use super::pump::{poll_once, pump_active_to_boundary, Boundary, SpuriousPending, Surface};
-use super::seams::{absurd, CommandStatus, Live, Never, NotifyStatus, Observer, Outcome, Transport};
+use super::seams::{absurd, CommandStatus, Live, Never, NotifyStatus, Outcome, Transport};
 use super::{ActiveEngine, Engine, Phase, SendBuf};
 use crate::action::TxStatus;
 use crate::ident::{Ident, StmtName};
@@ -195,22 +193,20 @@ fn enqueue_frame<E>(
 /// arm is enumerated with no wildcard — a future boundary forces a decision. At
 /// `B = Never` the [`Stopped`](Boundary::Stopped) value is uninhabited and is
 /// discharged by [`absurd`], never a `unreachable!()`.
-async fn drive_to_outcome<T, O, S>(
+async fn drive_to_outcome<T, S>(
     active: &mut ActiveEngine,
     transport: &mut T,
     send_buf: &mut SendBuf,
-    obs: &O,
     mut sink: S,
 ) -> Result<CommandStatus, EngineError<T::Error>>
 where
     T: Transport,
-    O: Observer,
     S: FnMut(Surface<'_>) -> ControlFlow<Never>,
 {
     // Pass the caller's sink by `&mut` so it survives the first pump and can be
     // reused for the recovery drain below. `&mut S` is itself `FnMut`, so this is
     // the identical sink type at `B = Never`, not a fresh one.
-    let boundary = pump_active_to_boundary(active, transport, send_buf, obs, &mut sink).await?;
+    let boundary = pump_active_to_boundary(active, transport, send_buf, &mut sink).await?;
     match boundary {
         Boundary::Idle => Ok(CommandStatus::Completed),
         Boundary::Failed => {
@@ -226,7 +222,7 @@ where
             // cannot change the drain's boundary — the drain still reaches `Idle`
             // for the `ServerErrored` outcome.
             let drained =
-                pump_active_to_boundary(active, transport, send_buf, obs, &mut sink).await?;
+                pump_active_to_boundary(active, transport, send_buf, &mut sink).await?;
             classify_drained(drained)
         }
         Boundary::Closed => {
@@ -385,7 +381,7 @@ fn settle_statement_cache<P, R>(
     }
 }
 
-impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
+impl<'b, T: Transport> Engine<'b, T> {
     /// Drain a `Sync` and await the connection's `ReadyForQuery` — a liveness
     /// round trip. Surfaces nothing on a quiet connection; any asynchronous
     /// `ParameterStatus`/`NoticeResponse` reaches the sink. `B = Never`.
@@ -403,7 +399,6 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
@@ -411,7 +406,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
-        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
         Ok(Outcome { live, status })
     }
 
@@ -574,7 +569,6 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
@@ -596,7 +590,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         enqueue_frame(send_buf, |wb| frames::build_simple_query_header(wb, sql_len))?;
         send_buf.enqueue(sql_bytes);
         send_buf.enqueue(&[0]);
-        drive_to_outcome(active, transport, send_buf, &*obs, sink).await
+        drive_to_outcome(active, transport, send_buf, sink).await
     }
 
     /// Prepare a statement: `Parse` + statement `Describe` + a single `Sync`. The
@@ -624,7 +618,6 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
@@ -653,7 +646,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         })?;
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
         active.begin_prepare();
-        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
         Ok(Outcome { live, status })
     }
 
@@ -716,7 +709,6 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
@@ -730,7 +722,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         enqueue_frame(send_buf, |wb| frames::build_execute(wb, b"", 0))?;
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
         active.begin_bind_execute(stmt.result_oids());
-        drive_to_outcome(active, transport, send_buf, &*obs, sink).await
+        drive_to_outcome(active, transport, send_buf, sink).await
     }
 
     /// Run a compile-checked query — the `query!` macro path —
@@ -783,14 +775,13 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         let reuse = stage_compiled_query(active, send_buf, q, &args)?;
-        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
         settle_statement_cache(
             active,
             q,
@@ -854,14 +845,13 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         let reuse = stage_compiled_query(active, send_buf, q, &args)?;
-        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
+        let boundary = pump_active_to_boundary(active, transport, send_buf, sink).await?;
         match boundary {
             Boundary::Idle => {
                 settle_statement_cache(active, q, reuse, true, false);
@@ -947,7 +937,6 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
@@ -958,7 +947,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         // (already-empty) send buffer as a no-op, then reads the owed reply frames
         // to a clean idle — threading the caller's sink so an async frame in the
         // drained remainder still surfaces, never a silent drop.
-        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
         Ok(Outcome { live, status })
     }
 
@@ -980,7 +969,6 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
@@ -992,7 +980,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         })?;
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
         active.begin_close();
-        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
         // `stmt` is owned here and dropped at scope end — it cannot be reused by
         // the caller (it was moved in). The borrow above ended before the pump.
         Ok(Outcome { live, status })
@@ -1102,7 +1090,6 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
@@ -1113,7 +1100,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         // flush sends it before reading the acks.
         send_buf.reset();
         send_buf.enqueue(&frames::COPY_DONE_WIRE);
-        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
         Ok(Outcome { live, status })
     }
 
@@ -1145,7 +1132,6 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
@@ -1154,7 +1140,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         // Reclaim any last streamed chunk's drained bytes, then enqueue `CopyFail`.
         send_buf.reset();
         enqueue_frame(send_buf, |wb| frames::build_copy_fail(wb, reason))?;
-        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
         Ok(Outcome { live, status })
     }
 
@@ -1195,7 +1181,6 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
@@ -1203,7 +1188,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
         enqueue_frame(send_buf, |wb| frames::build_simple_query(wb, sql.as_bytes()))?;
-        let boundary = pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await?;
+        let boundary = pump_active_to_boundary(active, transport, send_buf, sink).await?;
         match boundary {
             Boundary::Idle => Ok(Outcome {
                 live,
@@ -1249,7 +1234,6 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
@@ -1257,7 +1241,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
         enqueue_frame(send_buf, |wb| frames::build_listen(wb, channel.as_bytes()))?;
-        let status = drive_to_outcome(active, transport, send_buf, &*obs, sink).await?;
+        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
         Ok(Outcome { live, status })
     }
 
@@ -1298,13 +1282,12 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     {
         let Self {
             transport,
-            obs,
             phase,
             send_buf,
             ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        let boundary = match pump_active_to_boundary(active, transport, send_buf, &*obs, sink).await
+        let boundary = match pump_active_to_boundary(active, transport, send_buf, sink).await
         {
             Ok(boundary) => boundary,
             Err(e) => {

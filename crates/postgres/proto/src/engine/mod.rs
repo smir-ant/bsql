@@ -8,18 +8,15 @@
 //! live `dispatch`/`protocol` path; that composition lands as later
 //! additive steps.
 //!
-//! The five load-bearing seams:
+//! The four load-bearing seams:
 //!
 //! 1. [`Never`] + [`absurd`] — uninhabited carrier for phase-impossible
 //!    frames (no wildcard `_` arms).
-//! 2. [`Observer`] (sealed) + [`NoObserver`] — the zero-cost policy seam
-//!    carried by every verb.
-//! 3. [`Transport`] — the driver-facing I/O seam (RPITIT + `Send`, with a
+//! 2. [`Transport`] — the driver-facing I/O seam (RPITIT + `Send`, with a
 //!    `Send`-bounded associated [`Error`](Transport::Error) type).
-//! 4. [`Live`] — the branded, non-`Clone`, linear liveness token, minted
-//!    by [`session`] / [`session_with`].
-//! 5. [`Engine`] — the session shell that composes the above, carrying the
-//!    observer as a defaulted, ZST type parameter.
+//! 3. [`Live`] — the branded, non-`Clone`, linear liveness token, minted
+//!    by [`session`].
+//! 4. [`Engine`] — the session shell that composes the above.
 //!
 //! The [`Event`] / [`AuthEvent`] pull-event vocabulary is *declared* here
 //! (and footprint-pinned); the producers that emit those events compose in
@@ -51,12 +48,9 @@
 //! drift is an `E0080` build failure — even for a type constructed nowhere.
 //! Types generic over a parameter with no canonical size are pinned at their
 //! real instantiations ([`Boundary`] at `Never` and `()`, [`EngineError`] at
-//! the witness `Infallible`); the [`Engine`] shell is held by the
-//! ZST-observer size-identity gate below (it is generic over the transport, so
-//! it has no single canonical size). [`EngineNoObs`] — the `#[doc(hidden)]`
-//! control half of that gate — is likewise not pinned absolutely: it is defined
-//! to equal [`Engine`] minus the observer field, so the identity gate IS its
-//! pin; an absolute pin would be circular.
+//! the witness `Infallible`); the [`Engine`] shell is generic over the
+//! transport, so it has no single canonical size and is not footprint-pinned —
+//! its field layout is exercised by the `Send`-composition gates below.
 
 mod dispatch_active;
 mod dispatch_connecting;
@@ -83,9 +77,7 @@ pub use pump::{
     poll_once, pump_active_to_boundary, pump_connecting_to_ready, Boundary, HandshakeOutcome,
     SpuriousPending, Surface,
 };
-pub use seams::{
-    absurd, CommandStatus, Live, Never, NoObserver, NotifyStatus, Observer, Outcome, Transport,
-};
+pub use seams::{absurd, CommandStatus, Live, Never, NotifyStatus, Outcome, Transport};
 pub use verbs::PreparedStatement;
 
 use core::marker::PhantomData;
@@ -181,15 +173,8 @@ crate::wire_pin!(AuthEvent<'static>, size = 24, align = 8);
 // 5. Engine shell + the session-scope minting functions
 // ===========================================================================
 
-/// The session engine: a transport, an observer policy, and the brand that
-/// ties it to its session-scoped liveness token.
-///
-/// The observer `O` is a defaulted type parameter, so *every* verb is
-/// observer-aware from day one through `self: &mut Engine<'b, T, O>` — no
-/// per-verb generic and no second signature pass when a non-default policy
-/// is introduced. With the default [`NoObserver`], the `obs` field is a
-/// ZST and the engine is byte-identical to one with no observer concept at
-/// all (see the `Engine == EngineNoObs` size-identity gate below).
+/// The session engine: a transport plus the brand that ties it to its
+/// session-scoped liveness token.
 ///
 /// The brand `'b` lives on the engine *type* (so a foreign token cannot
 /// drive it) but the verbs borrow `&mut self`, never `&'b mut self` — the
@@ -199,42 +184,14 @@ crate::wire_pin!(AuthEvent<'static>, size = 24, align = 8);
 /// single borrow for its whole lifetime and make sequential verbs in one
 /// `async` scope uncompilable.
 #[derive(Debug)]
-pub struct Engine<'b, T, O = NoObserver> {
+pub struct Engine<'b, T> {
     transport: T,
-    /// The observer policy, threaded as a disjoint borrow to the active pump's
-    /// row/completion hooks by every I/O verb. At the default [`NoObserver`] it
-    /// is a ZST (see the `Engine == EngineNoObs` size-identity gate below).
-    obs: O,
     /// The single persistent outbound residence: the startup packet, every auth
     /// response, and (later) request frames are queued here and drained by the
     /// flush loop.
     send_buf: SendBuf,
     /// The engine's current protocol phase. Born [`Phase::Connecting`];
     /// [`connect`](Self::connect) drives it to [`Phase::Active`].
-    phase: Phase,
-    _brand: PhantomData<fn(&'b ()) -> &'b ()>,
-}
-
-/// Control type carrying every [`Engine`] field *except* the observer —
-/// used only by the size-identity gate to prove the `obs: O` ZST field
-/// costs zero bytes at the default policy.
-#[derive(Debug)]
-#[doc(hidden)]
-pub struct EngineNoObs<'b, T> {
-    #[expect(
-        dead_code,
-        reason = "size-identity control field mirroring Engine's transport; exists only so the ZST-observer-is-free size comparison has a like-for-like layout"
-    )]
-    transport: T,
-    #[expect(
-        dead_code,
-        reason = "size-identity control field mirroring Engine's send_buf; exists only for the like-for-like layout comparison"
-    )]
-    send_buf: SendBuf,
-    #[expect(
-        dead_code,
-        reason = "size-identity control field mirroring Engine's phase; exists only for the like-for-like layout comparison"
-    )]
     phase: Phase,
     _brand: PhantomData<fn(&'b ()) -> &'b ()>,
 }
@@ -288,7 +245,7 @@ impl Phase {
     ///
     /// The verbs call this on the *destructured* `phase` field (never through a
     /// `&mut self` helper), so the returned `&mut ActiveEngine` is a borrow
-    /// disjoint from the engine's `transport`/`send_buf`/`obs` fields — the four
+    /// disjoint from the engine's `transport`/`send_buf` fields — the
     /// simultaneous disjoint borrows the active pump needs. A `self.active_mut()`
     /// helper would borrow the whole engine and alias them (E0499).
     #[inline]
@@ -303,29 +260,16 @@ impl Phase {
     }
 }
 
-// "NoObserver is free" — the ZST observer field adds zero bytes. A
-// non-trivial transport stand-in (`[u8; 16]`) makes the identity
-// load-bearing rather than the trivial `0 == 0`.
-const _: () = assert!(
-    core::mem::size_of::<Engine<'static, [u8; 16], NoObserver>>()
-        == core::mem::size_of::<EngineNoObs<'static, [u8; 16]>>(),
-    "ZST-observer-is-free invariant broken: Engine<_, NoObserver> must be \
-     byte-identical to the observer-free control type. A non-ZST crept into \
-     the observer seam, or a field was added to one but not the other.",
-);
-
 crate::wire_pin!(Live<'static>, size = 0, align = 1);
-crate::wire_pin!(NoObserver, size = 0, align = 1);
 
-impl<'b, T, O> Engine<'b, T, O> {
-    /// Construct the engine shell from an already-prepared transport, observer
-    /// policy, primed outbound buffer, and initial phase, branded to the
-    /// caller's session scope `'b`.
+impl<'b, T> Engine<'b, T> {
+    /// Construct the engine shell from an already-prepared transport, primed
+    /// outbound buffer, and initial phase, branded to the caller's session
+    /// scope `'b`.
     #[inline(always)]
-    fn new_in_scope(transport: T, obs: O, send_buf: SendBuf, phase: Phase) -> Self {
+    fn new_in_scope(transport: T, send_buf: SendBuf, phase: Phase) -> Self {
         Self {
             transport,
-            obs,
             send_buf,
             phase,
             _brand: PhantomData,
@@ -386,7 +330,7 @@ impl<'b, T, O> Engine<'b, T, O> {
     }
 }
 
-impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
+impl<'b, T: Transport> Engine<'b, T> {
     /// Drive the startup/auth handshake to completion, transitioning the engine
     /// from its connecting phase to active.
     ///
@@ -488,7 +432,7 @@ impl<'b, T: Transport, O: Observer> Engine<'b, T, O> {
     }
 }
 
-/// Open a session over `transport` with the default [`NoObserver`] policy.
+/// Open a session over `transport`.
 ///
 /// Primes the engine in its connecting phase: the `StartupMessage` for
 /// `user`/`database`/`credentials` plus any consumer [`StartupParam`]s is
@@ -514,52 +458,21 @@ pub fn session<T, R>(
     database: Option<&DatabaseName>,
     params: &[StartupParam],
     credentials: Credentials,
-    body: impl for<'b> FnOnce(Engine<'b, T, NoObserver>, Live<'b>) -> R,
+    body: impl for<'b> FnOnce(Engine<'b, T>, Live<'b>) -> R,
 ) -> Result<R, ConnFail>
 where
     T: Transport,
 {
     let mut send_buf = SendBuf::new();
     let conn = ConnectingEngine::start(&mut send_buf, user, database, params, credentials)?;
-    let engine = Engine::new_in_scope(transport, NoObserver, send_buf, Phase::Connecting(conn));
+    let engine = Engine::new_in_scope(transport, send_buf, Phase::Connecting(conn));
     let live = Live::new_in_scope();
     Ok(body(engine, live))
 }
 
-/// Open a session with a caller-chosen [`Observer`] policy.
-///
-/// Identical scoping and connecting-phase priming to [`session`]; the same verb
-/// surface serves the non-default policy with no signature change — only the
-/// constructed engine's observer type differs.
-///
-/// # Errors
-///
-/// As [`session`].
-#[inline]
-pub fn session_with<T, O, R>(
-    transport: T,
-    observer: O,
-    user: &Ident,
-    database: Option<&DatabaseName>,
-    params: &[StartupParam],
-    credentials: Credentials,
-    body: impl for<'b> FnOnce(Engine<'b, T, O>, Live<'b>) -> R,
-) -> Result<R, ConnFail>
-where
-    T: Transport,
-    O: Observer,
-{
-    let mut send_buf = SendBuf::new();
-    let conn = ConnectingEngine::start(&mut send_buf, user, database, params, credentials)?;
-    let engine = Engine::new_in_scope(transport, observer, send_buf, Phase::Connecting(conn));
-    let live = Live::new_in_scope();
-    Ok(body(engine, live))
-}
-
-/// Open an owned session handle over `transport` with the default
-/// [`NoObserver`] policy: the same connecting-phase priming as [`session`],
-/// but the primed [`Engine`] and its linear [`Live`] token are *returned* to
-/// the caller instead of lent to a `for<'b>` closure.
+/// Open an owned session handle over `transport`: the same connecting-phase
+/// priming as [`session`], but the primed [`Engine`] and its linear [`Live`]
+/// token are *returned* to the caller instead of lent to a `for<'b>` closure.
 ///
 /// Use this when the engine must be **stored** — held in a struct, parked in a
 /// pool, moved between calls. A poolable connection that keeps the engine plus
@@ -583,9 +496,9 @@ where
 /// tokens in the first place. *Within* a connection the linearity stays tier-1:
 /// [`Live`] is non-`Clone`, every verb consumes it and returns it only on a
 /// clean boundary, so at-most-one-command-in-flight is still a move-checked
-/// invariant, not a runtime guard. [`session`] / [`session_with`] remain the
-/// scoped tier-1 API for callers that do *not* need to store the handle; prefer
-/// them when the engine's whole life fits in one scope.
+/// invariant, not a runtime guard. [`session`] remains the scoped tier-1 API
+/// for callers that do *not* need to store the handle; prefer it when the
+/// engine's whole life fits in one scope.
 ///
 /// # Errors
 ///
@@ -600,44 +513,13 @@ pub fn open_owned<T>(
     database: Option<&DatabaseName>,
     params: &[StartupParam],
     credentials: Credentials,
-) -> Result<(Engine<'static, T, NoObserver>, Live<'static>), ConnFail>
+) -> Result<(Engine<'static, T>, Live<'static>), ConnFail>
 where
     T: Transport,
 {
     let mut send_buf = SendBuf::new();
     let conn = ConnectingEngine::start(&mut send_buf, user, database, params, credentials)?;
-    let engine = Engine::new_in_scope(transport, NoObserver, send_buf, Phase::Connecting(conn));
-    let live = Live::new_in_scope();
-    Ok((engine, live))
-}
-
-/// Open an owned session handle with a caller-chosen [`Observer`] policy.
-///
-/// Identical priming and `'static`-brand tradeoff to [`open_owned`] (read its
-/// brand-tradeoff note); the same verb surface serves the non-default policy
-/// with no signature change — only the returned engine's observer type differs.
-/// Mirrors the [`session`] / [`session_with`] pair: [`open_owned`] is the
-/// default-policy entry, this is the policy-carrying one.
-///
-/// # Errors
-///
-/// As [`open_owned`].
-#[inline]
-pub fn open_owned_with<T, O>(
-    transport: T,
-    observer: O,
-    user: &Ident,
-    database: Option<&DatabaseName>,
-    params: &[StartupParam],
-    credentials: Credentials,
-) -> Result<(Engine<'static, T, O>, Live<'static>), ConnFail>
-where
-    T: Transport,
-    O: Observer,
-{
-    let mut send_buf = SendBuf::new();
-    let conn = ConnectingEngine::start(&mut send_buf, user, database, params, credentials)?;
-    let engine = Engine::new_in_scope(transport, observer, send_buf, Phase::Connecting(conn));
+    let engine = Engine::new_in_scope(transport, send_buf, Phase::Connecting(conn));
     let live = Live::new_in_scope();
     Ok((engine, live))
 }
@@ -706,14 +588,13 @@ const _: fn() = || {
 
     assert_send::<WitnessTransport>();
     assert_send::<Live<'static>>();
-    assert_send::<NoObserver>();
     assert_send::<EngineError<core::convert::Infallible>>();
     // The `Transport::Error: Send` bound, locked at a concrete transport: a
     // wrapper transport's error union is `Send` only when the inner `Error` is,
     // so the bound must hold for every blessed transport, not just by trait
     // declaration.
     assert_send::<<WitnessTransport as Transport>::Error>();
-    assert_send::<Engine<'static, WitnessTransport, NoObserver>>();
+    assert_send::<Engine<'static, WitnessTransport>>();
     assert_send::<SendBuf>();
     assert_send::<SendOverrun>();
 
@@ -727,8 +608,8 @@ const _: fn() = || {
     // The phase value is irrelevant to `Send`-ness (which depends only on the
     // field TYPES); `Transitioning` is the lightest placeholder for this
     // compile-only witness (the closure is never executed).
-    let mut engine: Engine<'static, WitnessTransport, NoObserver> =
-        Engine::new_in_scope(WitnessTransport, NoObserver, SendBuf::new(), Phase::Transitioning);
+    let mut engine: Engine<'static, WitnessTransport> =
+        Engine::new_in_scope(WitnessTransport, SendBuf::new(), Phase::Transitioning);
     let live = Live::new_in_scope();
 
     let threaded = async move {
@@ -759,9 +640,9 @@ const _: fn() = || {
 // PUMP-FUTURE-SEND gate. The active pump's future must be `Send` — the async
 // driver polls it across task boundaries. The closure is never called; its body
 // is type-checked at build time. It instantiates `pump_active_to_boundary` at
-// the witness transport, the default observer, and a function-pointer sink (the
-// simplest `Send` sink), isolating the future's `Send`-ness to the pump's own
-// captures (engine, transport, send buffer, observer borrow).
+// the witness transport and a function-pointer sink (the simplest `Send` sink),
+// isolating the future's `Send`-ness to the pump's own captures (engine,
+// transport, send buffer).
 const _: fn() = || {
     fn need_send<F: Send>(_: &F) {}
 
@@ -782,13 +663,11 @@ const _: fn() = || {
     );
     let mut transport = WitnessTransport;
     let mut send_buf = SendBuf::new();
-    let obs = NoObserver;
 
     need_send(&pump_active_to_boundary(
         &mut active,
         &mut transport,
         &mut send_buf,
-        &obs,
         sink,
     ));
 

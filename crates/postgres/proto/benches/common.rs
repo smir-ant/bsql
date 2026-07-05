@@ -30,7 +30,7 @@ use core::future::{ready, Future};
 use core::ops::ControlFlow;
 
 use bsql_postgres_proto::engine::{
-    open_owned, poll_once, Engine, Live, NoObserver, Outcome, Surface, Transport,
+    open_owned, poll_once, Engine, Live, Outcome, Surface, Transport,
 };
 use bsql_postgres_proto::prepared::new_prepared_query;
 use bsql_postgres_proto::{Credentials, Ident, PreparedQuery};
@@ -269,7 +269,7 @@ const fn build_bind_prefix<const N: usize>(stmt: &str) -> [u8; N] {
 
 /// The owned engine handle plus its linear token — the shape `open_owned`
 /// returns, threaded through the benched routine.
-pub type OwnedEngine = (Engine<'static, Script, NoObserver>, Live<'static>);
+pub type OwnedEngine = (Engine<'static, Script>, Live<'static>);
 
 /// Build an active engine whose statement cache is PRIMED for [`DEMO_QUERY`],
 /// with the transport cursor positioned at exactly one cache-HIT reply.
