@@ -1227,6 +1227,38 @@ fn copy_round_trip_in_then_out() {
 
 #[test]
 #[ignore = "requires local PG"]
+fn copy_in_large_chunk_passthrough() {
+    // The sync twin of the async large-chunk passthrough: one `write_chunk` body
+    // far exceeding the 64 KiB threshold is streamed DIRECTLY (never buffered).
+    // Prove it is byte-faithful against real PG.
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cp_big(id int8, payload text)").expect("create");
+
+    const ROWS: i64 = 10_000;
+    let mut chunk = String::new();
+    for i in 0..ROWS {
+        chunk.push_str(&format!("{i}\tpayload-row-{i}\n"));
+    }
+    assert!(chunk.len() > 64 * 1024, "the single chunk must exceed the threshold");
+
+    let n = c
+        .copy_in_with("cp_big", |w| w.write_chunk(chunk.as_bytes()))
+        .expect("large-chunk copy_in_with");
+    assert_eq!(n, u64::try_from(ROWS).expect("ROWS fits u64"), "all rows ingested");
+
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_big").expect("count").rows[0].get_i64(0),
+        Ok(Some(ROWS)),
+    );
+    assert_eq!(
+        c.query_sql("SELECT payload FROM cp_big WHERE id = 9999").expect("val").rows[0].get_str(0),
+        Ok(Some("payload-row-9999")),
+    );
+    c.close().expect("close");
+}
+
+#[test]
+#[ignore = "requires local PG"]
 fn copy_in_abort_mid_stream_recovers() {
     // A copy_in_with whose closure ERRORS mid-stream sends CopyFail; the
     // connection recovers and commits none of the aborted rows.

@@ -1046,6 +1046,46 @@ async fn copy_round_trip_in_then_out() {
 
 #[tokio::test]
 #[ignore = "requires local PG"]
+async fn copy_in_large_chunk_passthrough() {
+    // Exercises the LARGE-CHUNK PASSTHROUGH: one `write_chunk` whose body far
+    // exceeds the 64 KiB batched-flush threshold is streamed DIRECTLY from the
+    // borrowed slice (never buffered). Prove the direct-write path is byte-faithful
+    // against real PG: every row lands and a spot-checked value is intact.
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cp_big(id int8, payload text)")
+        .await
+        .expect("create");
+
+    // Build ONE chunk of many text-COPY rows, well over the threshold (~180 KiB).
+    const ROWS: i64 = 10_000;
+    let mut chunk = String::new();
+    for i in 0..ROWS {
+        chunk.push_str(&format!("{i}\tpayload-row-{i}\n"));
+    }
+    assert!(chunk.len() > 64 * 1024, "the single chunk must exceed the threshold");
+
+    let n = c
+        .copy_in_with("cp_big", async |w| w.write_chunk(chunk.as_bytes()).await)
+        .await
+        .expect("large-chunk copy_in_with");
+    assert_eq!(n, u64::try_from(ROWS).expect("ROWS fits u64"), "all rows ingested");
+
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cp_big").await.expect("count").rows[0].get_i64(0),
+        Ok(Some(ROWS)),
+    );
+    // Spot-check a value survived the direct stream faithfully.
+    assert_eq!(
+        c.query_sql("SELECT payload FROM cp_big WHERE id = 9999").await.expect("val").rows[0]
+            .get_str(0),
+        Ok(Some("payload-row-9999")),
+    );
+    c.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
 async fn copy_in_abort_mid_stream_recovers() {
     // A copy_in_with whose closure ERRORS mid-stream must send CopyFail so the
     // server tears the COPY down and the connection is RECOVERABLE.

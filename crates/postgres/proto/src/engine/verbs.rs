@@ -174,6 +174,19 @@ fn enqueue_frame<E>(
     Ok(())
 }
 
+/// The COPY-in batched-flush threshold, in bytes.
+///
+/// Streamed `CopyData` accumulates in the send buffer and is flushed to the
+/// socket only once the pending bytes reach this, so a bulk load of N small
+/// chunks costs about `total_bytes / THRESHOLD` socket writes instead of N — a
+/// 100–1000× reduction in write syscalls on a megarow COPY. A single chunk at or
+/// above this is streamed DIRECTLY from the borrowed slice (never copied into the
+/// buffer), so the buffer never holds a huge body. Because one sub-threshold
+/// chunk is appended before the pending-length check, the buffer is bounded to
+/// strictly under `2 * THRESHOLD` at all times — constant memory regardless of
+/// the total COPY size. 64 KiB matches a typical socket send buffer.
+const COPY_IN_FLUSH_THRESHOLD: usize = 64 * 1024;
+
 /// Pump a *collect-all* command to its boundary and resolve the
 /// [`CommandStatus`], draining a recoverable server error's owed
 /// `ReadyForQuery` so the linear token can ride back in `Ok`.
@@ -1025,15 +1038,28 @@ impl<'b, T: Transport> Engine<'b, T> {
         super::flush::flush(send_buf, transport).await
     }
 
-    /// Stream one `CopyData` (`'d'`) frame for an open COPY-in and flush it, so
-    /// the send buffer stays bounded (no whole-COPY buffering — constant memory
-    /// regardless of row count). Token-less: the caller holds the [`Live`] token
-    /// across writes.
+    /// Stream one `CopyData` (`'d'`) frame for an open COPY-in, BATCHING the flush
+    /// so the socket sees far fewer writes than there are chunks. Token-less: the
+    /// caller holds the [`Live`] token across writes.
     ///
-    /// The header is framed into the bounded scratch buffer; the `chunk` body is
-    /// queued directly onto the send buffer, so an oversize chunk needs no
-    /// scratch room. A batched-flush variant (coalesce N chunks per write) is a
-    /// future throughput option, not a correctness one.
+    /// The framed `CopyData` accumulates in the send buffer; the buffer is flushed
+    /// to the socket only when its pending bytes cross
+    /// [`COPY_IN_FLUSH_THRESHOLD`] (or at `copy_in_finish` / `copy_in_abort`). A
+    /// megarow load of small chunks therefore costs about
+    /// `total_bytes / THRESHOLD` write syscalls instead of one per chunk — a
+    /// 100–1000× reduction — while staying CONSTANT MEMORY: the buffer is bounded
+    /// to under `2 * THRESHOLD` (see the const), never O(rows).
+    ///
+    /// A single chunk at or above the threshold takes the PASSTHROUGH path: any
+    /// accumulated frames plus this chunk's header are flushed, then the chunk
+    /// body is streamed DIRECTLY from the borrowed slice via
+    /// [`write_all`](super::flush::write_all) — it is never copied into the buffer,
+    /// so even a gigabyte chunk costs no buffer growth (and no per-chunk memcpy).
+    ///
+    /// The bytes on the wire are byte-identical to flushing every chunk
+    /// separately (a concatenation of the same `CopyData` frames); only the number
+    /// of socket writes changes. Multiple `CopyData` frames in one write is valid
+    /// PostgreSQL framing.
     ///
     /// # Errors
     ///
@@ -1048,21 +1074,36 @@ impl<'b, T: Transport> Engine<'b, T> {
             ..
         } = self;
         phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        // Reclaim the PREVIOUS frame's (fully drained) bytes before queuing this
-        // one, so the send buffer stays bounded to a single chunk across the whole
-        // stream — the constant-memory invariant. Without this the buffer would
-        // grow by every frame's bytes (the cursor advances on flush but the
-        // backing store is not compacted), silently making a million-row COPY
-        // O(rows) in memory. `reset` keeps the capacity, so a same-size follow-on
-        // chunk reuses it with zero reallocation.
+        // Reclaim a DRAINED prefix (the COPY command from `copy_in_begin`, or a
+        // prior threshold flush's frames) while PRESERVING any accumulated-but-
+        // unflushed frames — `reset` is a no-op when nothing has been sent, so it
+        // drops only fully-sent bytes and keeps the batch under way. This is what
+        // holds the buffer bounded across the whole stream (the constant-memory
+        // invariant); without it the backing store would grow by every drained
+        // frame's bytes.
         send_buf.reset();
         let body_len = u32::try_from(chunk.len()).map_err(|_| {
             core::hint::cold_path();
             EngineError::FrameTooLong
         })?;
+        // The `CopyData` header rides after any accumulated frames in BOTH paths.
         enqueue_frame(send_buf, |wb| frames::build_copy_data_header(wb, body_len))?;
-        send_buf.enqueue(chunk);
-        super::flush::flush(send_buf, transport).await
+        if chunk.len() >= COPY_IN_FLUSH_THRESHOLD {
+            // Passthrough: never copy a large body into the buffer. Flush the
+            // accumulated frames plus this header, then stream the borrowed body
+            // straight to the socket.
+            super::flush::flush(send_buf, transport).await?;
+            super::flush::write_all(transport, chunk).await
+        } else {
+            // Batch: accumulate the framed `CopyData`; flush only when the buffer
+            // crosses the threshold.
+            send_buf.enqueue(chunk);
+            if send_buf.pending_len() >= COPY_IN_FLUSH_THRESHOLD {
+                super::flush::flush(send_buf, transport).await
+            } else {
+                Ok(())
+            }
+        }
     }
 
     /// Close an open COPY-in cleanly: send `CopyDone` (`'c'`) and pump for the
@@ -1095,9 +1136,12 @@ impl<'b, T: Transport> Engine<'b, T> {
             ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        // Reclaim the last streamed chunk's drained bytes, then enqueue the
-        // `CopyDone` literal onto the empty buffer; `drive_to_outcome`'s entry
-        // flush sends it before reading the acks.
+        // Flush the accumulated tail before `CopyDone` — no data left unsent.
+        // `reset` reclaims only a fully-drained prefix (from the last threshold
+        // flush) and PRESERVES any accumulated-but-unflushed `CopyData` (no-op
+        // when nothing has been sent); `CopyDone` is appended after it, and
+        // `drive_to_outcome`'s entry flush sends the accumulated frames followed
+        // by `CopyDone` before reading the acks.
         send_buf.reset();
         send_buf.enqueue(&frames::COPY_DONE_WIRE);
         let status = drive_to_outcome(active, transport, send_buf, sink).await?;
@@ -1137,8 +1181,12 @@ impl<'b, T: Transport> Engine<'b, T> {
             ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        // Reclaim any last streamed chunk's drained bytes, then enqueue `CopyFail`.
-        send_buf.reset();
+        // DISCARD any accumulated-but-unflushed `CopyData`: a `CopyFail` aborts the
+        // whole COPY, so buffered rows are moot — the server would only discard
+        // them, and sending them risks it erroring on a stale row instead of
+        // echoing the caller's abort reason. `clear` drops them (and any drained
+        // prefix), then `CopyFail` is the only frame the entry flush sends.
+        send_buf.clear();
         enqueue_frame(send_buf, |wb| frames::build_copy_fail(wb, reason))?;
         let status = drive_to_outcome(active, transport, send_buf, sink).await?;
         Ok(Outcome { live, status })

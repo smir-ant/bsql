@@ -61,10 +61,13 @@ type AsyncWire = Wire<TokioSocket>;
 /// [`copy_in_with`](Connection::copy_in_with).
 ///
 /// Borrows the connection's [`Core`] for the copy's duration (so no other verb
-/// can run concurrently), and streams each row/chunk as one `CopyData` frame
-/// flushed straight to the socket — nothing is buffered, so a bulk load of
-/// millions of rows runs in CONSTANT memory (0 heap growth per row; one reused
-/// scratch buffer for [`write_row`](Self::write_row)'s trailing newline).
+/// can run concurrently), and streams each row/chunk as one `CopyData` frame.
+/// Frames are BATCHED — accumulated in a bounded send buffer and flushed only
+/// when it crosses a threshold (or at finish) — so a megarow load costs far
+/// fewer socket writes than there are rows, while the buffer stays bounded
+/// (CONSTANT memory, never O(rows); one reused scratch buffer for
+/// [`write_row`](Self::write_row)'s trailing newline). A chunk at or above the
+/// threshold streams directly, never buffered.
 ///
 /// The writer never closes the copy itself: [`copy_in_with`](Connection::copy_in_with)
 /// owns the terminal step (`CopyDone` on `Ok`, `CopyFail` on `Err`), so
@@ -81,10 +84,11 @@ pub struct CopyInWriter<'e> {
 }
 
 impl CopyInWriter<'_> {
-    /// Stream one `CopyData` frame with `chunk` as its verbatim body, flushed to
-    /// the socket. Zero-copy: the bytes are queued directly (no reframing). For
-    /// text `COPY`, `chunk` is raw copy-format bytes — the caller controls row
-    /// boundaries and framing.
+    /// Stream one `CopyData` frame with `chunk` as its verbatim body. Zero-copy:
+    /// the bytes are queued directly, no reframing (a large chunk is streamed
+    /// straight to the socket, never buffered) and the flush is batched (see
+    /// [`CopyInWriter`]). For text `COPY`, `chunk` is raw copy-format bytes — the
+    /// caller controls row boundaries and framing.
     ///
     /// # Errors
     ///
@@ -817,8 +821,9 @@ impl Connection {
     /// bulk-load primitive.
     ///
     /// `f` may interleave arbitrary async work between rows, and `write_chunk` /
-    /// `write_row` each stream one `CopyData` frame flushed to the socket — nothing
-    /// accumulates, so any row count loads in bounded memory.
+    /// `write_row` each frame one `CopyData`; the frames are batched into a bounded
+    /// send buffer and flushed at a threshold (or at finish), so any row count
+    /// loads in bounded memory with far fewer socket writes than rows.
     ///
     /// # Cancellation and recovery
     ///

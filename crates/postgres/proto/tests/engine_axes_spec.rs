@@ -422,7 +422,7 @@ const ENGINE_ERROR_VARIANTS: usize = 14;
 const ACTIVE_VERBS: usize = 20;
 /// `core::hint::cold_path()` classified-branch markers across `engine/`.
 /// Reproduce: `grep -rho 'core::hint::cold_path()' crates/postgres/proto/src/engine/*.rs | wc -l`
-const COLD_CLASSIFIED_BRANCHES: usize = 42;
+const COLD_CLASSIFIED_BRANCHES: usize = 44;
 /// `#[non_exhaustive]` attribute lines across `engine/`.
 /// Reproduce: `grep -rcE '^#\[non_exhaustive\]' crates/postgres/proto/src/engine/*.rs` (summed)
 const NON_EXHAUSTIVE_ATTRS: usize = 4;

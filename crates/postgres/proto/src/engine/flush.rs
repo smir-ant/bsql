@@ -308,6 +308,25 @@ impl SendBuf {
         self.buf.truncate(keep);
         self.sent = 0;
     }
+
+    /// Empty the buffer, DISCARDING any not-yet-sent bytes, retaining the
+    /// backing capacity for the next batch.
+    ///
+    /// Unlike [`reset`](Self::reset) — which PRESERVES the unsent tail (moving it
+    /// to the front) — this drops it. The sole caller is COPY-in abort: a
+    /// `CopyFail` aborts the whole COPY, so any accumulated-but-unflushed
+    /// `CopyData` is moot and must NOT be sent — the server would only discard it,
+    /// and sending it risks the server erroring on a stale buffered row instead of
+    /// echoing the caller's abort reason. The discarded bytes are the
+    /// application's own COPY payload, never auth material; like
+    /// [`reset`](Self::reset) this does not scrub mid-life (the teardown [`Drop`]
+    /// scrubs the full capacity). `clear` keeps the allocation, so the next batch
+    /// reuses it with no reallocation.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.sent = 0;
+    }
 }
 
 /// Scrub the backing store on teardown.
@@ -426,6 +445,77 @@ pub async fn flush<T: Transport>(
     // (a TLS record) to the socket so a partial wire frame is not left
     // dangling. Reached only after the buffer is drained, so it is irrelevant
     // to the mid-drain cursor unroll.
+    transport.flush().await.map_err(EngineError::Transport)?;
+    Ok(())
+}
+
+/// Stream a borrowed byte slice straight to the transport, bypassing
+/// [`SendBuf`] entirely — the COPY-in large-chunk passthrough.
+///
+/// A COPY-in chunk at or above the batching threshold is written DIRECTLY from
+/// the caller's borrowed slice rather than copied into [`SendBuf`], so even a
+/// gigabyte chunk costs no buffer growth: the constant-memory invariant holds
+/// for arbitrarily large chunks, not just small rows. One
+/// [`Transport::write`](super::seams::Transport::write) attempt runs per
+/// iteration and advances a LOCAL cursor (a sub-slice reborrow) SYNCHRONOUSLY —
+/// no `.await` between the resolved write and the advance — then a single
+/// [`Transport::flush`](super::seams::Transport::flush) drives any
+/// transport-internal buffer to the socket. The same drain shape as [`flush`],
+/// over a borrowed slice instead of the owned buffer.
+///
+/// # Cancellation
+///
+/// Unlike [`flush`], the cursor is LOCAL to this future — a borrowed per-call
+/// slice cannot carry an engine-owned resume cursor across calls. A drop
+/// mid-write therefore does not resume; but the only caller (`copy_in_write`,
+/// invoked inside `copy_in_with`) sends NO terminal frame on a drop, abandoning
+/// the connection, so there is nothing to resume onto: the whole-copy drop
+/// contract already leaves a mid-stream drop's connection dead. Within a single
+/// uncancelled call the synchronous advance still guarantees exactly-once byte
+/// accounting.
+///
+/// # Errors
+///
+/// As [`flush`]: [`EngineError::Transport`](super::EngineError::Transport) on a
+/// write/flush fault, [`EngineError::WriteZero`](super::EngineError::WriteZero)
+/// if the transport accepts zero from a non-empty slice, and
+/// [`EngineError::SendOverrun`](super::EngineError::SendOverrun) if it claims to
+/// accept more than it was offered.
+pub async fn write_all<T: Transport>(
+    transport: &mut T,
+    mut bytes: &[u8],
+) -> Result<(), EngineError<T::Error>> {
+    while !bytes.is_empty() {
+        // The sole suspension point, mirroring `flush`'s loop: a single
+        // `Transport::write` attempt over the remaining borrowed tail.
+        let n = transport
+            .write(bytes)
+            .await
+            .map_err(EngineError::Transport)?;
+        if n == 0 {
+            // Non-empty slice, zero accepted: a stalled transport. Never loop on
+            // it and never skip the bytes.
+            core::hint::cold_path();
+            return Err(EngineError::WriteZero);
+        }
+        // Synchronous advance immediately after the write resolves — the same
+        // no-`.await`-between-write-and-advance adjacency `flush` keeps.
+        let pending = bytes.len();
+        bytes = match bytes.get(n..) {
+            Some(rest) => rest,
+            None => {
+                // The transport claimed more than it was offered — a contract
+                // violation, classified rather than allowed to wrap/panic.
+                core::hint::cold_path();
+                return Err(EngineError::SendOverrun(SendOverrun {
+                    committed: n,
+                    pending,
+                }));
+            }
+        };
+    }
+    // Drive any transport-internal buffered bytes (a TLS record) to the socket,
+    // exactly as `flush` does after draining the owned buffer.
     transport.flush().await.map_err(EngineError::Transport)?;
     Ok(())
 }
