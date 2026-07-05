@@ -1,0 +1,86 @@
+# bsql end-to-end / competitor / peak-RSS benchmark harness.
+#
+# This is a STANDALONE cargo project — it declares its own `[workspace]` table
+# so it is NEVER a member of the repo-root workspace. Its competitor dev-deps
+# (tokio-postgres, sqlx) and its `libc` FFI therefore do NOT enter the shipped
+# workspace's `deps_pin` / `runtime_graph_pin` gates or the shipped dependency
+# graph. It depends on the rebuild's `bsql` by PATH.
+#
+# Build/run from inside `bench/`:
+#   cargo bench                       # criterion e2e latency, all clients
+#   cargo run --release --bin rss_bsql_sync   # peak-RSS harness (one client)
+#   cargo test --release -- --ignored         # the RSS regression gate (needs PG)
+#
+# The repo pins rustc 1.96.0 via `../rust-toolchain.toml`, which applies here
+# too (it lives above this dir).
+
+[workspace]
+
+[package]
+name = "bsql-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The rebuild under test — by path. Both PG drivers, no SQLite (unused here).
+bsql = { path = "../crates/bsql", default-features = false, features = [
+    "postgres-async",
+    "postgres-sync",
+] }
+
+# Async runtime. current-thread flavour is what the single-connection benches
+# use (a multi-thread pool would only add scheduler noise + RSS to a one-socket
+# workload).
+tokio = { version = "1", features = ["rt", "net", "macros", "time"] }
+futures = "0.3"
+
+# The Rust competitors the owner cares about most. C-libpq and Go-pgx are a
+# cross-language follow-up (they need a C toolchain / a Go build and a separate
+# process harness); noted in README, not wired here.
+tokio-postgres = "0.7"
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+] }
+
+# Peak-RSS measurement via getrusage(RUSAGE_SELF).ru_maxrss. Bench-only; this is
+# a `publish = false` project outside the shipped graph, so the small justified
+# FFI here never reaches any shipped artifact.
+libc = "0.2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[profile.release]
+# Match a realistic optimized consumer build. LTO + one codegen unit gives the
+# tightest code (and the smallest touched-code RSS) so the comparison reflects
+# each client's true steady-state footprint, not codegen-unit boundaries.
+# `panic` is left at the default `unwind` deliberately: the criterion custom-main
+# bench harness and the RSS regression gate both run under this profile, and
+# unwind tables are cold pages that do not move the resident figure.
+lto = true
+codegen-units = 1
+
+[[bench]]
+name = "e2e"
+harness = false
+
+# Peak-RSS harnesses — one binary per client so each measured process links and
+# faults in ONLY that client's code (a single arg-selected binary would leave
+# the other clients' code linked-but-cold, muddying the resident figure).
+[[bin]]
+name = "rss_bsql_sync"
+path = "src/bin/rss_bsql_sync.rs"
+
+[[bin]]
+name = "rss_bsql_async"
+path = "src/bin/rss_bsql_async.rs"
+
+[[bin]]
+name = "rss_tokio_postgres"
+path = "src/bin/rss_tokio_postgres.rs"
+
+[[bin]]
+name = "rss_sqlx"
+path = "src/bin/rss_sqlx.rs"

@@ -1,6 +1,11 @@
 # Build artifacts
 /target
 
+# Standalone benchmark project build artifacts (bench/ is its own workspace;
+# bench/Cargo.lock IS committed — it pins the competitor versions so the
+# published numbers are reproducible).
+/bench/target
+
 # Editor swap files
 *.swp
 *.swo
