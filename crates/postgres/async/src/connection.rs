@@ -218,6 +218,12 @@ impl Connection {
                     "connection timed out",
                 ))
             })??;
+        // Disable Nagle on the data socket for the connection's whole life. Set
+        // once here, TCP_NODELAY rides the SAME kernel socket through the
+        // `SSLRequest` probe and the TLS wrap — so the actual data socket carries
+        // it post-probe. Nagle + delayed-ACK can add ~40ms stalls to small writes
+        // and COPY-in streaming; this is one setsockopt with zero per-op cost.
+        tcp.set_nodelay(true)?;
 
         // The read-deadline cell shared with the socket the engine will own.
         let read_deadline = Arc::new(ReadDeadline::new());

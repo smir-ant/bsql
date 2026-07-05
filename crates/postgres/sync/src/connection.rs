@@ -205,6 +205,13 @@ impl Connection {
     pub fn connect(config: &ConnectConfig) -> Result<Self, DriverError> {
         let addr = format!("{}:{}", config.host, config.port);
         let tcp = TcpStream::connect(&addr)?;
+        // Disable Nagle on the data socket for the connection's whole life. Set
+        // once here, TCP_NODELAY rides the SAME kernel socket through the
+        // `SSLRequest` probe, the TLS wrap, and the `try_clone` control handle —
+        // so the actual data socket carries it post-probe, post-clone. Nagle +
+        // delayed-ACK can add ~40ms stalls to small writes and COPY-in streaming;
+        // this is one setsockopt with zero per-op cost.
+        tcp.set_nodelay(true)?;
         // `connect_timeout` bounds ONLY the connect phase — the TCP connect
         // (above), the TLS `SSLRequest` probe, and the startup/auth handshake —
         // so a dead or silent server at connect still fails fast. It is armed as
