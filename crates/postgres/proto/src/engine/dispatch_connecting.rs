@@ -59,7 +59,6 @@ use crate::action::TxStatus;
 use crate::ident::{DatabaseName, Ident, PodBytes};
 use crate::md5::Md5HandshakeState;
 use crate::password::{Credentials, Password};
-use crate::reply_id::{ReplyId, StartupKind};
 use crate::startup::StartupParam;
 use crate::scram::session::ScramSession;
 use crate::scram::types::SecretDigest;
@@ -305,12 +304,13 @@ pub struct ConnectingEngine {
 }
 
 // Stack footprint: the single-residence `IngestBuf` (144) + the `ConnPhase`
-// enum + the captured `server_version` (`Option<String>`, 24 B). `ConnPhase` is
-// sized by its widest variant — the password/SCRAM handshake state is
-// `Box`-externalised inside `ConnectingState`, so the live handshake material
-// lives off-stack and the engine's own footprint stays bounded. A field reshape
-// lands here as a reviewed drift.
-crate::wire_pin!(ConnectingEngine, size = 192, align = 8);
+// enum (16 B — its widest variant is `ConnectingState`, no id correlator
+// threaded) + the captured `server_version` (`Option<String>`, 24 B).
+// `ConnPhase` is sized by its widest variant — the password/SCRAM handshake
+// state is `Box`-externalised inside `ConnectingState`, so the live handshake
+// material lives off-stack and the engine's own footprint stays bounded. A
+// field reshape lands here as a reviewed drift.
+crate::wire_pin!(ConnectingEngine, size = 184, align = 8);
 
 impl ConnectingEngine {
     /// Begin a handshake: queue the `StartupMessage` onto `send_buf` and seat
@@ -343,21 +343,18 @@ impl ConnectingEngine {
         build_startup_message(&mut scratch, user, database, params)
             .map_err(|_| ConnFail::BufferOverflow)?;
         send_buf.enqueue(scratch.as_bytes());
-        // Exactly one in-flight startup; the reply id is a fixed seed (the
-        // connecting engine never multiplexes the handshake).
-        let reply = ReplyId::<StartupKind>::from_raw(core::num::NonZeroU64::MIN);
+        // Exactly one in-flight startup — the handshake is strictly serial and
+        // never multiplexed, so the current variant is itself the correlation
+        // and no reply id is threaded.
         let state = match credentials {
-            Credentials::Trust => ConnectingState::StartupTrust { reply },
+            Credentials::Trust => ConnectingState::StartupTrust,
             Credentials::ScramPassword(password) => ConnectingState::StartupScram {
-                reply,
                 scram: Box::new(ScramSession::from_password(password)),
             },
             Credentials::CleartextPassword(password) => ConnectingState::StartupCleartext {
-                reply,
                 password: Box::new(password),
             },
             Credentials::Md5Password(password) => ConnectingState::StartupMd5 {
-                reply,
                 handshake: Box::new(Md5HandshakeState {
                     password,
                     user: *user,
@@ -819,36 +816,29 @@ fn dispatch_connecting(
     write: &mut WriteBuf,
 ) -> ConnDispatch {
     match state {
-        ConnectingState::StartupTrust { reply } => dispatch_startup_trust(reply, tag, payload),
-        ConnectingState::StartupCleartext { reply, password } => {
-            dispatch_startup_cleartext(reply, password, tag, payload, write)
+        ConnectingState::StartupTrust => dispatch_startup_trust(tag, payload),
+        ConnectingState::StartupCleartext { password } => {
+            dispatch_startup_cleartext(password, tag, payload, write)
         }
-        ConnectingState::CleartextAwaitingAuthOk(reply) => {
-            dispatch_await_auth_ok(reply, tag, payload)
+        ConnectingState::CleartextAwaitingAuthOk => dispatch_await_auth_ok(tag, payload),
+        ConnectingState::StartupMd5 { handshake } => {
+            dispatch_startup_md5(handshake, tag, payload, write)
         }
-        ConnectingState::StartupMd5 { reply, handshake } => {
-            dispatch_startup_md5(reply, handshake, tag, payload, write)
+        ConnectingState::Md5AwaitingAuthOk => dispatch_await_auth_ok(tag, payload),
+        ConnectingState::StartupScram { scram } => {
+            dispatch_startup_scram(scram, tag, payload, write)
         }
-        ConnectingState::Md5AwaitingAuthOk(reply) => dispatch_await_auth_ok(reply, tag, payload),
-        ConnectingState::StartupScram { reply, scram } => {
-            dispatch_startup_scram(reply, scram, tag, payload, write)
-        }
-        ConnectingState::ScramAwaitingServerFirst { reply, scram } => {
-            dispatch_scram_server_first(reply, scram, tag, payload, write)
+        ConnectingState::ScramAwaitingServerFirst { scram } => {
+            dispatch_scram_server_first(scram, tag, payload, write)
         }
         ConnectingState::ScramAwaitingServerFinal {
-            reply,
             expected_server_sig,
-        } => dispatch_scram_server_final(reply, *expected_server_sig, tag, payload),
-        ConnectingState::ScramAwaitingAuthOk(reply) => dispatch_await_auth_ok(reply, tag, payload),
-        ConnectingState::PostAuthAwaitingKey(reply) => {
-            dispatch_post_auth_awaiting_key(reply, tag, payload)
+        } => dispatch_scram_server_final(*expected_server_sig, tag, payload),
+        ConnectingState::ScramAwaitingAuthOk => dispatch_await_auth_ok(tag, payload),
+        ConnectingState::PostAuthAwaitingKey => dispatch_post_auth_awaiting_key(tag, payload),
+        ConnectingState::PostAuthHaveKey { pid, secret_key } => {
+            dispatch_post_auth_have_key(pid, secret_key, tag, payload)
         }
-        ConnectingState::PostAuthHaveKey {
-            reply,
-            pid,
-            secret_key,
-        } => dispatch_post_auth_have_key(reply, pid, secret_key, tag, payload),
         // The new engine never parks `HandshakeReady` (completion is the
         // dispatch return + `into_active`), so a frame arriving here is a
         // classified protocol violation. The matched value drops at arm end,
@@ -858,15 +848,11 @@ fn dispatch_connecting(
     }
 }
 
-fn dispatch_startup_trust(
-    reply: ReplyId<StartupKind>,
-    tag: InboundTag,
-    payload: &[u8],
-) -> ConnDispatch {
+fn dispatch_startup_trust(tag: InboundTag, payload: &[u8]) -> ConnDispatch {
     if tag == TAG_AUTHENTICATION {
         match parse_auth_sub_code(payload) {
             AuthCode::Known(AuthSubCode::Ok, _) => {
-                advance(ConnectingState::PostAuthAwaitingKey(reply))
+                advance(ConnectingState::PostAuthAwaitingKey)
             }
             // A Trust client (no password) cannot satisfy any challenge.
             AuthCode::Known(
@@ -888,7 +874,6 @@ fn dispatch_startup_trust(
 }
 
 fn dispatch_startup_cleartext(
-    reply: ReplyId<StartupKind>,
     password: Box<Sensitive<Password>>,
     tag: InboundTag,
     payload: &[u8],
@@ -899,9 +884,9 @@ fn dispatch_startup_cleartext(
             AuthCode::Known(AuthSubCode::CleartextPassword, _) => {
                 match build_cleartext_password_message(write, &password) {
                     Ok(()) => ConnDispatch {
-                        next: ConnPhase::Handshaking(ConnectingState::CleartextAwaitingAuthOk(
-                            reply,
-                        )),
+                        next: ConnPhase::Handshaking(
+                            ConnectingState::CleartextAwaitingAuthOk,
+                        ),
                         event: ConnEvent::Cleartext,
                     },
                     Err(reason) => fail(reason),
@@ -926,7 +911,6 @@ fn dispatch_startup_cleartext(
 }
 
 fn dispatch_startup_md5(
-    reply: ReplyId<StartupKind>,
     handshake: Box<Md5HandshakeState>,
     tag: InboundTag,
     payload: &[u8],
@@ -941,7 +925,7 @@ fn dispatch_startup_md5(
                 };
                 match build_md5_password_message(write, &handshake, salt) {
                     Ok(()) => ConnDispatch {
-                        next: ConnPhase::Handshaking(ConnectingState::Md5AwaitingAuthOk(reply)),
+                        next: ConnPhase::Handshaking(ConnectingState::Md5AwaitingAuthOk),
                         event: ConnEvent::Md5 { salt },
                     },
                     Err(reason) => fail(reason),
@@ -966,7 +950,6 @@ fn dispatch_startup_md5(
 }
 
 fn dispatch_startup_scram(
-    reply: ReplyId<StartupKind>,
     mut scram: Box<ScramSession>,
     tag: InboundTag,
     payload: &[u8],
@@ -982,7 +965,7 @@ fn dispatch_startup_scram(
                     // Client-initiated SASL: the response is in the buffer;
                     // the surfaceable challenge is the server-first that
                     // follows, so this step is a silent intermediate.
-                    Ok(()) => advance(ConnectingState::ScramAwaitingServerFirst { reply, scram }),
+                    Ok(()) => advance(ConnectingState::ScramAwaitingServerFirst { scram }),
                     Err(reason) => fail(reason),
                 }
             }
@@ -1005,7 +988,6 @@ fn dispatch_startup_scram(
 }
 
 fn dispatch_scram_server_first(
-    reply: ReplyId<StartupKind>,
     scram: Box<ScramSession>,
     tag: InboundTag,
     payload: &[u8],
@@ -1017,7 +999,6 @@ fn dispatch_scram_server_first(
                 match build_sasl_response(write, &scram, rest) {
                     Ok(expected_server_sig) => ConnDispatch {
                         next: ConnPhase::Handshaking(ConnectingState::ScramAwaitingServerFinal {
-                            reply,
                             expected_server_sig: Box::new(expected_server_sig),
                         }),
                         event: ConnEvent::SaslContinue,
@@ -1044,7 +1025,6 @@ fn dispatch_scram_server_first(
 }
 
 fn dispatch_scram_server_final(
-    reply: ReplyId<StartupKind>,
     expected_server_sig: SecretDigest,
     tag: InboundTag,
     payload: &[u8],
@@ -1055,7 +1035,7 @@ fn dispatch_scram_server_final(
                 match crate::scram::wire::parse_server_final(rest) {
                     Ok(received_sig) => {
                         if bool::from(expected_server_sig.ct_eq(&received_sig)) {
-                            advance(ConnectingState::ScramAwaitingAuthOk(reply))
+                            advance(ConnectingState::ScramAwaitingAuthOk)
                         } else {
                             fail(ConnFail::Scram(ScramFailureClass::SignatureMismatch))
                         }
@@ -1083,15 +1063,11 @@ fn dispatch_scram_server_final(
 
 /// Shared `AuthenticationOk`-awaiting arm for the cleartext / MD5 / SCRAM
 /// post-response states.
-fn dispatch_await_auth_ok(
-    reply: ReplyId<StartupKind>,
-    tag: InboundTag,
-    payload: &[u8],
-) -> ConnDispatch {
+fn dispatch_await_auth_ok(tag: InboundTag, payload: &[u8]) -> ConnDispatch {
     if tag == TAG_AUTHENTICATION {
         match parse_auth_sub_code(payload) {
             AuthCode::Known(AuthSubCode::Ok, _) => {
-                advance(ConnectingState::PostAuthAwaitingKey(reply))
+                advance(ConnectingState::PostAuthAwaitingKey)
             }
             AuthCode::Known(
                 AuthSubCode::CleartextPassword
@@ -1111,15 +1087,10 @@ fn dispatch_await_auth_ok(
     }
 }
 
-fn dispatch_post_auth_awaiting_key(
-    reply: ReplyId<StartupKind>,
-    tag: InboundTag,
-    payload: &[u8],
-) -> ConnDispatch {
+fn dispatch_post_auth_awaiting_key(tag: InboundTag, payload: &[u8]) -> ConnDispatch {
     if tag == TAG_BACKEND_KEY_DATA {
         match parse_backend_key_data(payload) {
             Some((pid, secret)) => advance(ConnectingState::PostAuthHaveKey {
-                reply,
                 pid,
                 secret_key: Sensitive::new(secret),
             }),
@@ -1127,7 +1098,7 @@ fn dispatch_post_auth_awaiting_key(
         }
     } else if tag == TAG_PARAMETER_STATUS {
         ConnDispatch {
-            next: ConnPhase::Handshaking(ConnectingState::PostAuthAwaitingKey(reply)),
+            next: ConnPhase::Handshaking(ConnectingState::PostAuthAwaitingKey),
             event: ConnEvent::ParamStatus,
         }
     } else if tag == TAG_ERROR_RESPONSE {
@@ -1138,7 +1109,6 @@ fn dispatch_post_auth_awaiting_key(
 }
 
 fn dispatch_post_auth_have_key(
-    reply: ReplyId<StartupKind>,
     pid: i32,
     secret_key: Sensitive<i32>,
     tag: InboundTag,
@@ -1158,11 +1128,7 @@ fn dispatch_post_auth_have_key(
         }
     } else if tag == TAG_PARAMETER_STATUS {
         ConnDispatch {
-            next: ConnPhase::Handshaking(ConnectingState::PostAuthHaveKey {
-                reply,
-                pid,
-                secret_key,
-            }),
+            next: ConnPhase::Handshaking(ConnectingState::PostAuthHaveKey { pid, secret_key }),
             event: ConnEvent::ParamStatus,
         }
     } else if tag == TAG_ERROR_RESPONSE {

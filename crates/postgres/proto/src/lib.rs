@@ -26,8 +26,8 @@
 //! - [`decode`] — column / row decoding from wire bytes.
 //! - [`scram`] / [`md5`] / [`password`] / [`sensitive`] — authentication +
 //!   secret-bearing types.
-//! - [`ident`] / [`write_buf`] / [`params`] / [`command_tag`] / [`reply_id`]
-//!   — bounded wire builders and typed correlators.
+//! - [`ident`] / [`write_buf`] / [`params`] / [`command_tag`] — bounded wire
+//!   builders + typed command/tag parsing.
 //! - [`mod@prepared`] — runtime support for the compile-checked `query!` macro.
 
 #![no_std]
@@ -168,7 +168,6 @@ pub mod query_budget;
 // `PreparedQuery<P, R>`, the `RowDecode` sealed trait, and the
 // `new_prepared_query` validating constructor the macro routes through.
 pub mod prepared;
-pub mod reply_id;
 
 // Typed `CommandTag` enum + wire parser for the `CommandComplete` ('C')
 // frame the active engine reads.
@@ -216,10 +215,6 @@ pub use ident::{
 };
 pub use startup::{StartupParam, StartupParamError, RESERVED_NAMES};
 pub use password::{Credentials, Password, PasswordError};
-pub use reply_id::{
-    CloseKind, DescribePortalKind, DescribeStatementKind, ParseKind, PingKind, QueryKind,
-    ReplyId, ReplyKind, StartupKind,
-};
 pub use sensitive::Sensitive;
 pub use plan_mode::{
     PlanCacheMode, PLAN_CACHE_MODE, RESET_PLAN_CACHE_MODE_SQL, SET_PLAN_CACHE_MODE_SQL,
@@ -258,12 +253,6 @@ const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<action::TxStatus>();
     assert_send::<error::ProtocolError>();
-    // `ReplyId` is generic over `K: ReplyKind`. The nominal kind
-    // parameter is `PhantomData<fn() -> K>` (ZST, unconditionally
-    // `Send + Sync`), so asserting one concrete `K` is sufficient.
-    assert_send::<reply_id::ReplyId<reply_id::PingKind>>();
-    assert_send::<reply_id::ReplyId<reply_id::StartupKind>>();
-    assert_send::<reply_id::ReplyId<reply_id::QueryKind>>();
     assert_send::<state::ConnectingState>();
     // Bounded string types.
     assert_send::<ident::Ident>();
@@ -375,12 +364,6 @@ const _: () = assert!(
      Larger sizes regress consumer crate .rodata footprint and \
      LLVM whole-crate codegen heuristics.",
 );
-const _: () = assert!(
-    core::mem::size_of::<reply_id::ReplyId<reply_id::PingKind>>() <= 24,
-    "ReplyId<K> size regression — the `PhantomData<fn() -> K>` kind \
-     tag is zero-size; ReplyId's footprint is u64 value + bool \
-     delivered + padding. Did a bookkeeping field get added?",
-);
 
 // Alignment pins for the size-pinned engine-facing types.
 const _: () = {
@@ -388,10 +371,6 @@ const _: () = {
     assert!(
         align_of::<prepared::PreparedQuery<(i32,), (i32, &'static str)>>() == 8,
         "PreparedQuery align drift",
-    );
-    assert!(
-        align_of::<reply_id::ReplyId<reply_id::PingKind>>() == 8,
-        "ReplyId<PingKind> align drift",
     );
 };
 
@@ -422,13 +401,6 @@ const _: () = assert!(
 const _: () = assert!(
     core::mem::needs_drop::<sensitive::Sensitive<password::Password>>(),
     "Sensitive<Password> must Drop to trigger ZeroizeOnDrop on the inner",
-);
-// ReplyId<K> has no Drop. A panic-in-Drop "consume-discipline guard"
-// would double-panic under integration-test unwind. Discipline is
-// enforced via `#[must_use]` + integration tests.
-const _: () = assert!(
-    !core::mem::needs_drop::<reply_id::ReplyId<reply_id::PingKind>>(),
-    "ReplyId<K> must stay drop-free — Drop was a footgun.",
 );
 const _: () = assert!(
     !core::mem::needs_drop::<frame::HeaderParse>(),

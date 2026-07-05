@@ -15,7 +15,7 @@
 //! ------                                            ------
 //!   │
 //!   │  StartupMessage (user/db)                ─────►
-//!   │  [state: ConnectingStartupScram { reply }]
+//!   │  [state: ConnectingStartupScram]
 //!   │  [scram_state: Some(Session(ScramSession))]
 //!   │
 //!   │                                           ◄───── AuthenticationSASL('R'/10)
@@ -26,7 +26,7 @@
 //!   │
 //!   │  SASLInitialResponse ('p')               ─────►
 //!   │  "n,,n=user,r=<client_nonce_b64>"
-//!   │  [state: ConnectingScramAwaitingServerFirst { reply }]
+//!   │  [state: ConnectingScramAwaitingServerFirst]
 //!   │  [scram_state: Some(AwaitingFirst {
 //!   │      session, client_first_bare, client_nonce_b64 })]
 //!   │
@@ -46,7 +46,7 @@
 //!   │
 //!   │  SASLResponse ('p')                      ─────►
 //!   │  client-final-message + base64(ClientProof)
-//!   │  [state: ConnectingScramAwaitingServerFinal { reply }]
+//!   │  [state: ConnectingScramAwaitingServerFinal]
 //!   │  [scram_state: Some(AwaitingFinal { expected_server_sig })]
 //!   │
 //!   │                                           ◄───── AuthenticationSASLFinal('R'/12)
@@ -58,7 +58,7 @@
 //!   │
 //!   │                                           ◄───── AuthenticationOk('R'/0)
 //!   │  [dispatch_auth_ok_after_scram:
-//!   │   state → ConnectingPostAuthAwaitingKey(reply);
+//!   │   state → ConnectingPostAuthAwaitingKey;
 //!   │   scram_state cleared naturally (taken + not re-populated)]
 //!   │
 //!   │                                           ◄───── BackendKeyData('K') + RFQ('Z')
