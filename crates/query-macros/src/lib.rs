@@ -465,187 +465,332 @@ fn column_borrows(ty: bsql_build::RustType, bridges: &Bridges) -> bool {
     borrows_input(ty) && bridges.for_column(ty).is_none()
 }
 
-/// The fixed binary width (in bytes) of a column type, as `(usize, i32)`
-/// for the const-generic chunk length and the length-prefix comparison.
-/// `text` is variable-width and has no fixed size.
-fn fixed_width(ty: bsql_build::RustType) -> Option<(usize, i32)> {
-    use bsql_build::RustType;
-    match ty {
-        RustType::I16 => Some((2, 2)),
-        RustType::I32 => Some((4, 4)),
-        RustType::I64 => Some((8, 8)),
-        RustType::U32 => Some((4, 4)),
-        RustType::Bool => Some((1, 1)),
-        // IEEE-754 floats are fixed-width, so they join the const-offset
-        // fast path exactly like the integers.
-        RustType::F32 => Some((4, 4)),
-        RustType::F64 => Some((8, 8)),
-        // `uuid` is a fixed 16-byte payload; the two timestamp types are a
-        // fixed 8-byte `i64` — all join the const-offset fast path.
-        RustType::Uuid => Some((16, 16)),
-        RustType::Timestamptz | RustType::Timestamp => Some((8, 8)),
-        // The temporal family is fixed-width too: `date` a 4-byte `i32`, `time`
-        // an 8-byte `i64`, `interval` a fixed 16-byte three-field record — all
-        // join the const-offset fast path.
-        RustType::Date => Some((4, 4)),
-        RustType::Time => Some((8, 8)),
-        RustType::Interval => Some((16, 16)),
-        // `text` / `bytea` / `json` / `jsonb` are variable-width — no fixed
-        // size, decoded on the per-cell path.
-        // `numeric` is variable-width (a base-10000 digit-group payload) — no
-        // fixed size, decoded on the per-cell path.
-        RustType::Text
-        | RustType::Bytea
-        | RustType::Json
-        | RustType::Jsonb
-        | RustType::Numeric => None,
-        // A 1-D array is variable-width (a length-prefixed header plus
-        // per-element bodies) — decoded on the per-cell path.
-        RustType::Array(_) => None,
-    }
+/// How a column type's borrowed-record field aliases the decode input.
+///
+/// The SOLE axis that distinguishes the value types from the two borrowing
+/// families: it drives the borrowed field spelling (`&'q str` / `&'q [u8]`),
+/// whether the record carries `<'q>`, and the owned-twin copy-out
+/// (`String::from` / `<[u8]>::to_vec`). A new borrow shape is a compile error
+/// at every `match BorrowKind` below (no `_` arm), never a silent default.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BorrowKind {
+    /// A self-owning value type (integers, floats, `bool`, the bsql-native
+    /// value types, and a 1-D array): both record twins carry the SAME field
+    /// type; the decode owns its value.
+    ByValue,
+    /// `text`: the borrowed twin aliases the input as `&'q str`; the owned
+    /// twin copies to `String`.
+    Str,
+    /// `bytea`: the borrowed twin aliases the input as `&'q [u8]`; the owned
+    /// twin copies to `Vec<u8>`.
+    Bytes,
 }
 
-/// The Rust type used as the `Cell<BinaryFmt>` `Self` in a decode call
-/// (`text` decodes through `&str`, borrowing the input bytes).
-fn cell_marker(ty: bsql_build::RustType) -> TokenStream2 {
+/// The SINGLE per-column type descriptor — the sole source of truth for every
+/// per-type facet the `query!` expansion needs.
+///
+/// # Why one descriptor closes the silent mis-decode class
+///
+/// The record decode, the row-tuple marker, and the wire OID all derive from
+/// ONE `ColSpec` row, so they cannot drift:
+///
+/// * [`ColSpec::marker`] is the row-tuple element (whose
+///   `ColCellAt::OID` the runtime const validator pins into `ROW_OIDS`) AND
+///   the type the record decode routes through
+///   (`<marker as ColCellAt>::decode_at`). Decoder and wire OID are therefore
+///   the SAME source: a same-width divergence (e.g. `int4` vs `oid`, both
+///   4 bytes) is either an `error[E0080]` at the const validator (the OID
+///   disagrees with the marker) or a loud `error[E0308]` at the record's
+///   struct literal (the field type disagrees with the decoded value) — never
+///   a wire `-1` silently decoded as `4294967295`.
+/// * [`ColSpec::oid_path`] / [`ColSpec::oid_value`] are the scalar column OID
+///   in its two spellings (the `oids::*` const path baked into the OID slice,
+///   and the numeric value baked into the Parse template), kept together so
+///   they cannot disagree.
+///
+/// Adding a supported PostgreSQL type is adding ONE row to [`col_spec`].
+struct ColSpec {
+    /// The row-tuple + decode marker in `'static` form (`__rt` paths). Feeds
+    /// BOTH the `Row` tuple element and the `ColCellAt::decode_at` decode.
+    marker: TokenStream2,
+    /// The owned record-field base type (public `::bsql::` paths). For
+    /// [`BorrowKind::ByValue`] it is the field type of both twins; for the
+    /// borrowing families it is the OWNED spelling (`String` / `Vec<u8>`),
+    /// with the borrowed spelling derived from [`ColSpec::borrow`].
+    field_owned: TokenStream2,
+    /// How the borrowed twin aliases the input (drives `<'q>` + copy-out).
+    borrow: BorrowKind,
+    /// The scalar column OID's `oids::*` const path (into the OID slices).
+    oid_path: TokenStream2,
+    /// The scalar column OID's numeric value (baked into the Parse template).
+    oid_value: u32,
+    /// The 1-D array (`T[]`) OID's `oids::*_ARRAY` const path.
+    array_oid_path: TokenStream2,
+    /// The 1-D array (`T[]`) OID's numeric value.
+    array_oid_value: u32,
+    /// The fixed binary width `(bytes, i32-length-prefix)` for the const-offset
+    /// fast path, or `None` for a variable-width type.
+    fixed_width: Option<(usize, i32)>,
+    /// Whether the type implements `Eq` (false only for the IEEE-754 floats:
+    /// `NaN` is not reflexively equal).
+    impls_eq: bool,
+}
+
+/// The single source of truth: every per-type facet for one column type.
+///
+/// This is the ONLY exhaustive `match` over the supported type set in the
+/// macro; every other per-type function is a thin projection of one field
+/// here. A new [`bsql_build::RustType`] variant is a non-exhaustive-match
+/// compile error AT THIS TABLE — the author must state its marker, OIDs,
+/// width, borrow shape, and `Eq`-ness in one place — never a distant
+/// misattributed error or a silent fall-through.
+fn col_spec(ty: bsql_build::RustType) -> ColSpec {
     use bsql_build::RustType;
+    // Compact constructor for a self-owning scalar whose row-tuple marker and
+    // owned field spelling coincide (the primitives) or differ only by re-export
+    // path (the bsql-native value types: `marker` on the `__rt` path, `field`
+    // on the public path — the same type either way).
+    let by_value = |marker: TokenStream2,
+                    field: TokenStream2,
+                    oid_path: TokenStream2,
+                    oid_value: u32,
+                    array_oid_path: TokenStream2,
+                    array_oid_value: u32,
+                    fixed_width: Option<(usize, i32)>,
+                    impls_eq: bool| ColSpec {
+        marker,
+        field_owned: field,
+        borrow: BorrowKind::ByValue,
+        oid_path,
+        oid_value,
+        array_oid_path,
+        array_oid_value,
+        fixed_width,
+        impls_eq,
+    };
     match ty {
-        RustType::I16 => quote!(i16),
-        RustType::I32 => quote!(i32),
-        RustType::I64 => quote!(i64),
-        RustType::U32 => quote!(u32),
-        RustType::Bool => quote!(bool),
-        RustType::F32 => quote!(f32),
-        RustType::F64 => quote!(f64),
-        RustType::Text => quote!(&str),
-        // `bytea` decodes through `&[u8]`, borrowing the input bytes.
-        RustType::Bytea => quote!(&[u8]),
-        // bsql-native value types decode by value through their own
-        // `Cell<BinaryFmt>` impl.
-        RustType::Uuid => quote!(::bsql::__rt::Uuid),
-        RustType::Timestamptz => quote!(::bsql::__rt::Timestamptz),
-        RustType::Timestamp => quote!(::bsql::__rt::Timestamp),
-        RustType::Json => quote!(::bsql::__rt::Json),
-        RustType::Jsonb => quote!(::bsql::__rt::Jsonb),
-        RustType::Numeric => quote!(::bsql::__rt::Numeric),
-        RustType::Date => quote!(::bsql::__rt::Date),
-        RustType::Time => quote!(::bsql::__rt::Time),
-        RustType::Interval => quote!(::bsql::__rt::Interval),
-        // A 1-D array decodes through the blanket `Cell<BinaryFmt>` for
-        // `Vec<Option<T>>` over the OWNED element type — the array `Vec`
-        // allocates regardless, so each element owns its value (`text[]` ->
-        // `String`, `bytea[]` -> `Vec<u8>`).
+        RustType::I16 => by_value(
+            quote!(i16), quote!(i16),
+            quote!(::bsql::__rt::oids::INT2), 21,
+            quote!(::bsql::__rt::oids::INT2_ARRAY), 1005,
+            Some((2, 2)), true,
+        ),
+        RustType::I32 => by_value(
+            quote!(i32), quote!(i32),
+            quote!(::bsql::__rt::oids::INT4), 23,
+            quote!(::bsql::__rt::oids::INT4_ARRAY), 1007,
+            Some((4, 4)), true,
+        ),
+        RustType::I64 => by_value(
+            quote!(i64), quote!(i64),
+            quote!(::bsql::__rt::oids::INT8), 20,
+            quote!(::bsql::__rt::oids::INT8_ARRAY), 1016,
+            Some((8, 8)), true,
+        ),
+        RustType::U32 => by_value(
+            quote!(u32), quote!(u32),
+            quote!(::bsql::__rt::oids::OID), 26,
+            quote!(::bsql::__rt::oids::OID_ARRAY), 1028,
+            Some((4, 4)), true,
+        ),
+        RustType::Bool => by_value(
+            quote!(bool), quote!(bool),
+            quote!(::bsql::__rt::oids::BOOL), 16,
+            quote!(::bsql::__rt::oids::BOOL_ARRAY), 1000,
+            Some((1, 1)), true,
+        ),
+        // The IEEE-754 floats are fixed-width value types, but `NaN != NaN`, so
+        // they are `PartialEq` only — a record with a float column cannot derive
+        // `Eq`.
+        RustType::F32 => by_value(
+            quote!(f32), quote!(f32),
+            quote!(::bsql::__rt::oids::FLOAT4), 700,
+            quote!(::bsql::__rt::oids::FLOAT4_ARRAY), 1021,
+            Some((4, 4)), false,
+        ),
+        RustType::F64 => by_value(
+            quote!(f64), quote!(f64),
+            quote!(::bsql::__rt::oids::FLOAT8), 701,
+            quote!(::bsql::__rt::oids::FLOAT8_ARRAY), 1022,
+            Some((8, 8)), false,
+        ),
+        // `uuid` is a fixed 16-byte value; `timestamptz` / `timestamp` a fixed
+        // 8-byte `i64`; `date` a 4-byte `i32`; `time` an 8-byte `i64`;
+        // `interval` a fixed 16-byte three-field record — all self-owning value
+        // types that join the const-offset fast path.
+        RustType::Uuid => by_value(
+            quote!(::bsql::__rt::Uuid), quote!(::bsql::Uuid),
+            quote!(::bsql::__rt::oids::UUID), 2950,
+            quote!(::bsql::__rt::oids::UUID_ARRAY), 2951,
+            Some((16, 16)), true,
+        ),
+        RustType::Timestamptz => by_value(
+            quote!(::bsql::__rt::Timestamptz), quote!(::bsql::Timestamptz),
+            quote!(::bsql::__rt::oids::TIMESTAMPTZ), 1184,
+            quote!(::bsql::__rt::oids::TIMESTAMPTZ_ARRAY), 1185,
+            Some((8, 8)), true,
+        ),
+        RustType::Timestamp => by_value(
+            quote!(::bsql::__rt::Timestamp), quote!(::bsql::Timestamp),
+            quote!(::bsql::__rt::oids::TIMESTAMP), 1114,
+            quote!(::bsql::__rt::oids::TIMESTAMP_ARRAY), 1115,
+            Some((8, 8)), true,
+        ),
+        RustType::Date => by_value(
+            quote!(::bsql::__rt::Date), quote!(::bsql::Date),
+            quote!(::bsql::__rt::oids::DATE), 1082,
+            quote!(::bsql::__rt::oids::DATE_ARRAY), 1182,
+            Some((4, 4)), true,
+        ),
+        RustType::Time => by_value(
+            quote!(::bsql::__rt::Time), quote!(::bsql::Time),
+            quote!(::bsql::__rt::oids::TIME), 1083,
+            quote!(::bsql::__rt::oids::TIME_ARRAY), 1183,
+            Some((8, 8)), true,
+        ),
+        RustType::Interval => by_value(
+            quote!(::bsql::__rt::Interval), quote!(::bsql::Interval),
+            quote!(::bsql::__rt::oids::INTERVAL), 1186,
+            quote!(::bsql::__rt::oids::INTERVAL_ARRAY), 1187,
+            Some((16, 16)), true,
+        ),
+        // `json` / `jsonb` / `numeric` are variable-width, self-owning value
+        // types (String / Box<[u16]>-backed) — decoded on the per-cell path.
+        RustType::Json => by_value(
+            quote!(::bsql::__rt::Json), quote!(::bsql::Json),
+            quote!(::bsql::__rt::oids::JSON), 114,
+            quote!(::bsql::__rt::oids::JSON_ARRAY), 199,
+            None, true,
+        ),
+        RustType::Jsonb => by_value(
+            quote!(::bsql::__rt::Jsonb), quote!(::bsql::Jsonb),
+            quote!(::bsql::__rt::oids::JSONB), 3802,
+            quote!(::bsql::__rt::oids::JSONB_ARRAY), 3807,
+            None, true,
+        ),
+        RustType::Numeric => by_value(
+            quote!(::bsql::__rt::Numeric), quote!(::bsql::Numeric),
+            quote!(::bsql::__rt::oids::NUMERIC), 1700,
+            quote!(::bsql::__rt::oids::NUMERIC_ARRAY), 1231,
+            None, true,
+        ),
+        // `text` borrows the input as `&'q str` (owned twin: `String`);
+        // variable-width, decoded on the per-cell path.
+        RustType::Text => ColSpec {
+            marker: quote!(&'static str),
+            field_owned: quote!(::std::string::String),
+            borrow: BorrowKind::Str,
+            oid_path: quote!(::bsql::__rt::oids::TEXT),
+            oid_value: 25,
+            array_oid_path: quote!(::bsql::__rt::oids::TEXT_ARRAY),
+            array_oid_value: 1009,
+            fixed_width: None,
+            impls_eq: true,
+        },
+        // `bytea` mirrors `text` over bytes: borrows `&'q [u8]` (owned twin:
+        // `Vec<u8>`).
+        RustType::Bytea => ColSpec {
+            marker: quote!(&'static [u8]),
+            field_owned: quote!(::std::vec::Vec<u8>),
+            borrow: BorrowKind::Bytes,
+            oid_path: quote!(::bsql::__rt::oids::BYTEA),
+            oid_value: 17,
+            array_oid_path: quote!(::bsql::__rt::oids::BYTEA_ARRAY),
+            array_oid_value: 1001,
+            fixed_width: None,
+            impls_eq: true,
+        },
+        // A 1-D array (`T[]`) is a self-owning `Vec<Option<T>>` whose OID is the
+        // element's ARRAY OID; it derives entirely from the element's own row.
+        // The element `Option<T>` is intrinsic (a PG array may hold NULLs); the
+        // element is the OWNED form (a `text[]` element is `String`), so the
+        // array marker (`__rt` element path) and array field (public element
+        // path) are the same type, differing only by re-export path — exactly
+        // like the value scalars.
         RustType::Array(elem) => {
-            let e = array_elem_marker(elem);
-            quote!(::std::vec::Vec<::core::option::Option<#e>>)
+            let e = col_spec(elem.as_scalar());
+            // The owned element in both spellings (marker vs field path).
+            let (elem_marker, elem_field) = match e.borrow {
+                BorrowKind::ByValue => (e.marker, e.field_owned),
+                BorrowKind::Str => {
+                    (quote!(::std::string::String), quote!(::std::string::String))
+                }
+                BorrowKind::Bytes => {
+                    (quote!(::std::vec::Vec<u8>), quote!(::std::vec::Vec<u8>))
+                }
+            };
+            ColSpec {
+                marker: quote!(::std::vec::Vec<::core::option::Option<#elem_marker>>),
+                field_owned: quote!(::std::vec::Vec<::core::option::Option<#elem_field>>),
+                borrow: BorrowKind::ByValue,
+                oid_path: e.array_oid_path,
+                oid_value: e.array_oid_value,
+                // An array-of-array has no single element-array OID. Structurally
+                // dead: inference rejects a multi-dimensional array, so this
+                // never bakes into a slice. Fail-closed to a non-OID `0` that
+                // would trip the const validator rather than a plausible-wrong
+                // OID.
+                array_oid_path: quote!(0u32),
+                array_oid_value: 0,
+                fixed_width: None,
+                impls_eq: e.impls_eq,
+            }
         }
     }
 }
 
-/// The OWNED element type token for a 1-D array's `Cell` / row-tuple marker
-/// (`Vec<Option<#elem>>`). The value types use the `__rt` decode path (the
-/// same type the scalar `cell_marker` names); `text` / `bytea` elements are
-/// the owned `String` / `Vec<u8>`.
-fn array_elem_marker(elem: bsql_build::ElemType) -> TokenStream2 {
-    use bsql_build::ElemType;
-    match elem {
-        ElemType::I16 => quote!(i16),
-        ElemType::I32 => quote!(i32),
-        ElemType::I64 => quote!(i64),
-        ElemType::U32 => quote!(u32),
-        ElemType::Bool => quote!(bool),
-        ElemType::F32 => quote!(f32),
-        ElemType::F64 => quote!(f64),
-        ElemType::Text => quote!(::std::string::String),
-        ElemType::Bytea => quote!(::std::vec::Vec<u8>),
-        ElemType::Uuid => quote!(::bsql::__rt::Uuid),
-        ElemType::Timestamptz => quote!(::bsql::__rt::Timestamptz),
-        ElemType::Timestamp => quote!(::bsql::__rt::Timestamp),
-        ElemType::Json => quote!(::bsql::__rt::Json),
-        ElemType::Jsonb => quote!(::bsql::__rt::Jsonb),
-        ElemType::Numeric => quote!(::bsql::__rt::Numeric),
-        ElemType::Date => quote!(::bsql::__rt::Date),
-        ElemType::Time => quote!(::bsql::__rt::Time),
-        ElemType::Interval => quote!(::bsql::__rt::Interval),
-    }
+/// The fixed binary width `(bytes, i32-length)` of a column type for the
+/// const-offset fast path, or `None` for a variable-width type — projected
+/// from the single [`col_spec`] source.
+fn fixed_width(ty: bsql_build::RustType) -> Option<(usize, i32)> {
+    col_spec(ty).fixed_width
 }
 
-/// Whether a column type borrows the input bytes in the borrowed record
-/// (so the record must carry `<'q>`): the string type `text` and the
-/// byte-string type `bytea`. Every fixed-width scalar is by-value, and a
-/// 1-D array is self-owning (`Vec<Option<T>>` owns its elements), so an
-/// array column never borrows.
+/// Whether a column type borrows the input bytes in the borrowed record (so
+/// the record must carry `<'q>`): the string type `text` and the byte-string
+/// type `bytea`. Projected from [`col_spec`]'s borrow shape — exhaustive over
+/// [`BorrowKind`], so a new borrow family forces a decision here.
 fn borrows_input(ty: bsql_build::RustType) -> bool {
-    use bsql_build::RustType;
-    matches!(ty, RustType::Text | RustType::Bytea)
-}
-
-/// Whether a column type implements `Eq` (so the generated record can
-/// derive it). Every supported type does EXCEPT the IEEE-754 floats:
-/// `f32`/`f64` are only `PartialEq` (NaN is not reflexively equal), so a
-/// record carrying a float column derives `PartialEq` but NOT `Eq`. A 1-D
-/// array follows its element: `Vec<Option<f32>>` is `PartialEq` but not
-/// `Eq`, every other element array is `Eq`.
-fn type_impls_eq(ty: bsql_build::RustType) -> bool {
-    use bsql_build::RustType;
-    match ty {
-        RustType::F32 | RustType::F64 => false,
-        RustType::Array(elem) => type_impls_eq(elem.as_scalar()),
-        _ => true,
+    match col_spec(ty).borrow {
+        BorrowKind::ByValue => false,
+        BorrowKind::Str | BorrowKind::Bytes => true,
     }
 }
 
-/// A record field's Rust type. A borrowing column is `&'q _` in the
-/// borrowed record and owned (`String` / `Vec<u8>`) in the owned twin; a
-/// nullable column is wrapped in `Option<..>`.
+/// Whether a column type implements `Eq` (so the generated record can derive
+/// it) — projected from the single [`col_spec`] source. False only for the
+/// IEEE-754 floats (and any array of them): `NaN` is not reflexively equal.
+fn type_impls_eq(ty: bsql_build::RustType) -> bool {
+    col_spec(ty).impls_eq
+}
+
+/// A record field's Rust type — projected from the single [`col_spec`]
+/// source. A borrowing column is `&'q _` in the borrowed record and owned
+/// (`String` / `Vec<u8>`) in the owned twin; a value type / 1-D array carries
+/// the SAME self-owning field type in both twins; a nullable column is wrapped
+/// in `Option<..>`. A drift between this field type and the decoded value (the
+/// `col_spec` marker's `ColCellAt::At`) is a loud `error[E0308]` at the
+/// record's struct literal — never silent.
 fn field_type(ty: bsql_build::RustType, nullable: bool, is_owned: bool) -> TokenStream2 {
-    use bsql_build::RustType;
-    let base = match ty {
-        RustType::I16 => quote!(i16),
-        RustType::I32 => quote!(i32),
-        RustType::I64 => quote!(i64),
-        RustType::U32 => quote!(u32),
-        RustType::Bool => quote!(bool),
-        RustType::F32 => quote!(f32),
-        RustType::F64 => quote!(f64),
-        RustType::Text => {
+    let spec = col_spec(ty);
+    let base = match spec.borrow {
+        // Value types + 1-D arrays: both twins carry the owned self-owning type.
+        BorrowKind::ByValue => spec.field_owned,
+        // `text` / `bytea`: the owned twin copies (`String` / `Vec<u8>`), the
+        // borrowed twin aliases the input.
+        BorrowKind::Str => {
             if is_owned {
-                quote!(::std::string::String)
+                spec.field_owned
             } else {
                 quote!(&'q str)
             }
         }
-        // `bytea` mirrors `text`: owned `Vec<u8>` copies the DataRow
-        // payload, borrowed `&'q [u8]` aliases it.
-        RustType::Bytea => {
+        BorrowKind::Bytes => {
             if is_owned {
-                quote!(::std::vec::Vec<u8>)
+                spec.field_owned
             } else {
                 quote!(&'q [u8])
             }
-        }
-        // bsql-native value types are self-owning, so the borrowed and owned
-        // twins carry the SAME field type (no lifetime, no copy-out). The
-        // `Copy` scalars alias nothing; `json` / `jsonb` own a `String` (the
-        // decoder validates + copies the UTF-8 text either way).
-        RustType::Uuid => quote!(::bsql::Uuid),
-        RustType::Timestamptz => quote!(::bsql::Timestamptz),
-        RustType::Timestamp => quote!(::bsql::Timestamp),
-        RustType::Json => quote!(::bsql::Json),
-        RustType::Jsonb => quote!(::bsql::Jsonb),
-        RustType::Numeric => quote!(::bsql::Numeric),
-        RustType::Date => quote!(::bsql::Date),
-        RustType::Time => quote!(::bsql::Time),
-        RustType::Interval => quote!(::bsql::Interval),
-        // A 1-D array column is `Vec<Option<T>>`: the element `Option<T>`
-        // (a PG array element may always be NULL) is INTRINSIC and does not
-        // depend on the column's own nullability. Both record twins carry the
-        // same self-owning type (the element is the OWNED scalar field type —
-        // `String` for `text[]`, `Vec<u8>` for `bytea[]`, the value types
-        // themselves). A NULL WHOLE array rides the outer `Option` below.
-        RustType::Array(elem) => {
-            let element = field_type(elem.as_scalar(), false, true);
-            quote!(::std::vec::Vec<::core::option::Option<#element>>)
         }
     };
     if nullable {
@@ -913,7 +1058,10 @@ fn fast_path(
             Some((width, width_i32)) => {
                 let width_lit = Literal::usize_unsuffixed(width);
                 let width_i32_lit = Literal::i32_suffixed(width_i32);
-                let marker = cell_marker(col.ty);
+                // The SAME marker the const validator pins the wire OID to —
+                // decoded via `ColCellAt::decode_at`, so the fast path reads the
+                // OID-validated type exactly like the per-cell path.
+                let marker = col_spec(col.ty).marker;
                 // The native decoded value. A bridged fixed-width column (a
                 // value-type / primitive — `text` / `bytea` / arrays are not
                 // fixed-width, so they never reach this path) reshapes it with
@@ -931,9 +1079,7 @@ fn fast_path(
                     if i32::from_be_bytes(*__len) != #width_i32_lit { break 'fast; }
                     let ::core::option::Option::Some((__data, #trailing)) =
                         __after.split_first_chunk::<#width_lit>() else { break 'fast };
-                    let __native = match <#marker as ::bsql::__rt::Cell<
-                        ::bsql::__rt::BinaryFmt,
-                    >>::decode(__data) {
+                    let __native = match <#marker as ::bsql::__rt::ColCellAt<'_>>::decode_at(__data) {
                         ::core::result::Result::Ok(__value) => __value,
                         ::core::result::Result::Err(__err) =>
                             return ::core::result::Result::Err(__err),
@@ -1047,20 +1193,37 @@ fn per_cell_value_expr(
     }
 }
 
-/// The decode call for one non-NULL cell body (`__bytes`). Owned `text`
-/// copies the borrowed `&str` into a `String`; every other type decodes
-/// directly through `Cell<BinaryFmt>`.
+/// The decode call for one non-NULL cell body (`__bytes`).
+///
+/// Decodes through `<marker as ColCellAt>::decode_at` on the SAME marker the
+/// const validator pins the wire OID to (`<marker as ColCellAt>::OID` becomes
+/// `ROW_OIDS`), so the decoded value is definitionally the OID-validated type
+/// — decoder and wire OID are one source and cannot drift. Owned `text` copies
+/// the borrowed `&str` into a `String`, owned `bytea` the `&[u8]` into a
+/// `Vec<u8>`; every value type / array decodes by value. Exhaustive over
+/// [`BorrowKind`] — a new borrow family forces its owned copy-out here.
 fn decode_call_expr(ty: bsql_build::RustType, is_owned: bool) -> TokenStream2 {
-    use bsql_build::RustType;
-    let marker = cell_marker(ty);
+    let spec = col_spec(ty);
+    let marker = spec.marker;
     let raw = quote! {
-        <#marker as ::bsql::__rt::Cell<::bsql::__rt::BinaryFmt>>::decode(__bytes)?
+        <#marker as ::bsql::__rt::ColCellAt<'_>>::decode_at(__bytes)?
     };
-    match (ty, is_owned) {
-        (RustType::Text, true) => quote! { ::std::string::String::from(#raw) },
-        // Owned `bytea` copies the borrowed `&[u8]` into a `Vec<u8>`.
-        (RustType::Bytea, true) => quote! { <[u8]>::to_vec(#raw) },
-        _ => raw,
+    match spec.borrow {
+        BorrowKind::ByValue => raw,
+        BorrowKind::Str => {
+            if is_owned {
+                quote! { ::std::string::String::from(#raw) }
+            } else {
+                raw
+            }
+        }
+        BorrowKind::Bytes => {
+            if is_owned {
+                quote! { <[u8]>::to_vec(#raw) }
+            } else {
+                raw
+            }
+        }
     }
 }
 
@@ -1093,13 +1256,13 @@ fn decode_value_expr_bridged(
             // then map the converter over each present element.
             let conv = &entry.converter;
             let target = &entry.target;
-            let marker = cell_marker(ty);
+            let marker = col_spec(ty).marker;
             quote! {
                 ::core::iter::Iterator::collect::<
                     ::std::vec::Vec<::core::option::Option<#target>>,
                 >(::core::iter::Iterator::map(
                     ::core::iter::IntoIterator::into_iter(
-                        <#marker as ::bsql::__rt::Cell<::bsql::__rt::BinaryFmt>>::decode(__bytes)?,
+                        <#marker as ::bsql::__rt::ColCellAt<'_>>::decode_at(__bytes)?,
                     ),
                     |__elem| ::core::option::Option::map(__elem, #conv),
                 ))
@@ -1124,109 +1287,33 @@ fn decode_value_expr_bridged(
 // failure (`error[E0080]`); a fabricated artifact cannot compile.
 
 /// The PostgreSQL type OID for a supported Rust type. This is the
-/// `RustType -> OID` map, verified against the runtime crate's
-/// `oids::*` constants (`int2`/INT2 = 21, `int4`/INT4 = 23,
-/// `int8`/INT8 = 20, `oid`/OID = 26, `bool`/BOOL = 16, `text`/TEXT =
-/// 25). The numeric value is needed to bake the OID bytes into the
-/// `Parse` template; the matching `oids::*` const path (below) is what
-/// the emitted OID slices reference, and the runtime crate's validating
+/// The scalar column OID numeric value — projected from the single
+/// [`col_spec`] source. Needed to bake the OID bytes into the `Parse`
+/// template; the matching `oids::*` const path ([`oid_path`]) is what the
+/// emitted OID slices reference, and the runtime crate's validating
 /// constructor cross-checks the two so they cannot drift.
 fn rust_type_oid(ty: bsql_build::RustType) -> u32 {
-    use bsql_build::RustType;
-    match ty {
-        RustType::I16 => 21,
-        RustType::I32 => 23,
-        RustType::I64 => 20,
-        RustType::U32 => 26,
-        RustType::Bool => 16,
-        RustType::Text => 25,
-        RustType::F32 => 700,
-        RustType::F64 => 701,
-        RustType::Bytea => 17,
-        RustType::Uuid => 2950,
-        RustType::Timestamptz => 1184,
-        RustType::Timestamp => 1114,
-        RustType::Json => 114,
-        RustType::Jsonb => 3802,
-        RustType::Numeric => 1700,
-        RustType::Date => 1082,
-        RustType::Time => 1083,
-        RustType::Interval => 1186,
-        // A 1-D array's parameter OID is the element type's `T[]` array OID.
-        // Reached only via a result-column OID (`oid_path`) over a scalar
-        // element; a `$N` array param is rejected by inference, so this arm
-        // never bakes into a param slice.
-        RustType::Array(elem) => array_oid(elem.as_scalar()),
-    }
+    col_spec(ty).oid_value
 }
 
 /// The `oids::*` const path token for a Rust type — emitted into the
 /// `PARAM_OIDS` / `ROW_OIDS` slices so they resolve through the runtime
-/// crate's pinned OID constants (rather than restating raw integers).
+/// crate's pinned OID constants. Projected from the single [`col_spec`]
+/// source, so the row-tuple marker (whose `ColCellAt::OID` the const
+/// validator pins to this slice) and this path come from one row.
 fn oid_path(ty: bsql_build::RustType) -> TokenStream2 {
-    use bsql_build::RustType;
-    match ty {
-        RustType::I16 => quote!(::bsql::__rt::oids::INT2),
-        RustType::I32 => quote!(::bsql::__rt::oids::INT4),
-        RustType::I64 => quote!(::bsql::__rt::oids::INT8),
-        RustType::U32 => quote!(::bsql::__rt::oids::OID),
-        RustType::Bool => quote!(::bsql::__rt::oids::BOOL),
-        RustType::Text => quote!(::bsql::__rt::oids::TEXT),
-        RustType::F32 => quote!(::bsql::__rt::oids::FLOAT4),
-        RustType::F64 => quote!(::bsql::__rt::oids::FLOAT8),
-        RustType::Bytea => quote!(::bsql::__rt::oids::BYTEA),
-        RustType::Uuid => quote!(::bsql::__rt::oids::UUID),
-        RustType::Timestamptz => quote!(::bsql::__rt::oids::TIMESTAMPTZ),
-        RustType::Timestamp => quote!(::bsql::__rt::oids::TIMESTAMP),
-        RustType::Json => quote!(::bsql::__rt::oids::JSON),
-        RustType::Jsonb => quote!(::bsql::__rt::oids::JSONB),
-        RustType::Numeric => quote!(::bsql::__rt::oids::NUMERIC),
-        RustType::Date => quote!(::bsql::__rt::oids::DATE),
-        RustType::Time => quote!(::bsql::__rt::oids::TIME),
-        RustType::Interval => quote!(::bsql::__rt::oids::INTERVAL),
-        // A 1-D array result column's OID is the element type's `T[]` array
-        // OID const path — the same const the runtime `ColCellAt` OID resolves
-        // to, so the validator cross-check holds.
-        RustType::Array(elem) => array_oid_path(elem.as_scalar()),
-    }
+    col_spec(ty).oid_path
 }
 
 /// The `'static`-lifetime tuple-element marker for the `Params` / `Row`
-/// type-level tuples. `text` is `&'static str` (the static-placeholder
-/// lifetime idiom the runtime decoders project to `&'a str`). Used only
-/// for OID / arity pinning, so a nullable column maps to its base
-/// marker (NULL handling lives in the typed records, not here).
+/// type-level tuples — projected from the single [`col_spec`] source. This
+/// is the SAME marker the record decode routes through
+/// (`<marker as ColCellAt>::decode_at`), so the decoder and this OID-pinned
+/// row-tuple element cannot disagree. `text` is `&'static str` (the
+/// static-placeholder lifetime idiom the runtime decoders project to
+/// `&'a str`).
 fn tuple_marker(ty: bsql_build::RustType) -> TokenStream2 {
-    use bsql_build::RustType;
-    match ty {
-        RustType::I16 => quote!(i16),
-        RustType::I32 => quote!(i32),
-        RustType::I64 => quote!(i64),
-        RustType::U32 => quote!(u32),
-        RustType::Bool => quote!(bool),
-        RustType::F32 => quote!(f32),
-        RustType::F64 => quote!(f64),
-        RustType::Text => quote!(&'static str),
-        RustType::Bytea => quote!(&'static [u8]),
-        // Value-typed markers (no lifetime): the same type serves the
-        // `'static` type-level tuple and the at-`'a` decode.
-        RustType::Uuid => quote!(::bsql::__rt::Uuid),
-        RustType::Timestamptz => quote!(::bsql::__rt::Timestamptz),
-        RustType::Timestamp => quote!(::bsql::__rt::Timestamp),
-        RustType::Json => quote!(::bsql::__rt::Json),
-        RustType::Jsonb => quote!(::bsql::__rt::Jsonb),
-        RustType::Numeric => quote!(::bsql::__rt::Numeric),
-        RustType::Date => quote!(::bsql::__rt::Date),
-        RustType::Time => quote!(::bsql::__rt::Time),
-        RustType::Interval => quote!(::bsql::__rt::Interval),
-        // A 1-D array row-tuple marker is `Vec<Option<OwnedElem>>` — its
-        // `ColCellAt::OID` is the element's `T[]` array OID, matching the
-        // `oid_path` above.
-        RustType::Array(elem) => {
-            let e = array_elem_marker(elem);
-            quote!(::std::vec::Vec<::core::option::Option<#e>>)
-        }
-    }
+    col_spec(ty).marker
 }
 
 /// Build a tuple-type token stream from element markers. Arity 0 ->
@@ -1240,71 +1327,20 @@ fn tuple_type(markers: &[TokenStream2]) -> TokenStream2 {
     }
 }
 
-/// The array (`T[]`) OID for a SCALAR element type — for a single array
-/// parameter feeding a `col = ANY($N)` in-list, and for a 1-D array result
-/// column (via [`oid_path`] / [`rust_type_oid`], which pass the array's
-/// scalar element). Verified against PG `pg_type.typarray`; cross-checked
+/// The array (`T[]`) OID numeric value for a SCALAR element type — for a
+/// single array parameter feeding a `col = ANY($N)` in-list. Projected from
+/// the single [`col_spec`] source (its `array_oid_value`); cross-checked
 /// against the runtime crate's `oids::*_ARRAY` constants by the const
-/// validator.
+/// validator. An array element (structurally dead: inference rejects a nested
+/// array) yields the fail-closed non-OID `0`.
 fn array_oid(ty: bsql_build::RustType) -> u32 {
-    use bsql_build::RustType;
-    match ty {
-        RustType::I16 => 1005,
-        RustType::I32 => 1007,
-        RustType::I64 => 1016,
-        RustType::U32 => 1028,
-        RustType::Bool => 1000,
-        RustType::Text => 1009,
-        RustType::F32 => 1021,
-        RustType::F64 => 1022,
-        RustType::Bytea => 1001,
-        RustType::Uuid => 2951,
-        RustType::Timestamptz => 1185,
-        RustType::Timestamp => 1115,
-        RustType::Json => 199,
-        RustType::Jsonb => 3807,
-        RustType::Numeric => 1231,
-        RustType::Date => 1182,
-        RustType::Time => 1183,
-        RustType::Interval => 1187,
-        // An array-of-array has no single element array OID. This arm is
-        // structurally dead: every caller passes a SCALAR element (the result
-        // path via `elem.as_scalar()`; the `= ANY($N)` param path over a
-        // scalar column), and an array-typed `$N` param is rejected by
-        // inference. The fail-closed `0` is not a valid PG OID, so if one ever
-        // reached the wire it would fail the const validator's OID cross-check
-        // (`error[E0080]`) rather than bake a plausible-but-wrong OID.
-        RustType::Array(_) => 0,
-    }
+    col_spec(ty).array_oid_value
 }
 
-/// The `oids::*_ARRAY` const path token for an element type's array OID.
+/// The `oids::*_ARRAY` const path token for an element type's array OID —
+/// projected from the single [`col_spec`] source (its `array_oid_path`).
 fn array_oid_path(ty: bsql_build::RustType) -> TokenStream2 {
-    use bsql_build::RustType;
-    match ty {
-        RustType::I16 => quote!(::bsql::__rt::oids::INT2_ARRAY),
-        RustType::I32 => quote!(::bsql::__rt::oids::INT4_ARRAY),
-        RustType::I64 => quote!(::bsql::__rt::oids::INT8_ARRAY),
-        RustType::U32 => quote!(::bsql::__rt::oids::OID_ARRAY),
-        RustType::Bool => quote!(::bsql::__rt::oids::BOOL_ARRAY),
-        RustType::Text => quote!(::bsql::__rt::oids::TEXT_ARRAY),
-        RustType::F32 => quote!(::bsql::__rt::oids::FLOAT4_ARRAY),
-        RustType::F64 => quote!(::bsql::__rt::oids::FLOAT8_ARRAY),
-        RustType::Bytea => quote!(::bsql::__rt::oids::BYTEA_ARRAY),
-        RustType::Uuid => quote!(::bsql::__rt::oids::UUID_ARRAY),
-        RustType::Timestamptz => quote!(::bsql::__rt::oids::TIMESTAMPTZ_ARRAY),
-        RustType::Timestamp => quote!(::bsql::__rt::oids::TIMESTAMP_ARRAY),
-        RustType::Json => quote!(::bsql::__rt::oids::JSON_ARRAY),
-        RustType::Jsonb => quote!(::bsql::__rt::oids::JSONB_ARRAY),
-        RustType::Numeric => quote!(::bsql::__rt::oids::NUMERIC_ARRAY),
-        RustType::Date => quote!(::bsql::__rt::oids::DATE_ARRAY),
-        RustType::Time => quote!(::bsql::__rt::oids::TIME_ARRAY),
-        RustType::Interval => quote!(::bsql::__rt::oids::INTERVAL_ARRAY),
-        // Structurally dead (see `array_oid`): a `0u32` fail-closed literal
-        // that would fail the validator's OID cross-check rather than bake a
-        // plausible-but-wrong array-OID const path.
-        RustType::Array(_) => quote!(0u32),
-    }
+    col_spec(ty).array_oid_path
 }
 
 /// The `'static`-lifetime type-level marker for one parameter tuple

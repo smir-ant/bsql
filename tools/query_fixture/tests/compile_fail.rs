@@ -56,6 +56,13 @@ fn unknown_reference_is_compile_error() {
     // `query!` const wire-artifact + fingerprint-seal surface.
     //   * The validating constructor rejects a param-OID drift
     //     (E0080) — there is no unchecked twin.
+    //   * It ALSO rejects a SAME-WIDTH ROW-OID drift (a `(u32,)` decoder with
+    //     an `int4` row OID — both 4 bytes, different type) at E0080. This is
+    //     the compile-side witness that the single-source unification closed
+    //     the silent mis-decode class: the record decode and the wire OID now
+    //     derive from the ONE row-tuple marker, so a same-width divergence
+    //     cannot be silent — it is a const-eval failure here or an E0308 at
+    //     the record. (Runtime half: `query_same_width_decode.rs`.)
     //   * The SCHEMA_PIN check rejects a baked Parse template whose OID
     //     section drifts from the declared param OIDs (E0080).
     //   * Layer 1 of the seal: a direct struct-literal fabrication is
@@ -63,6 +70,7 @@ fn unknown_reference_is_compile_error() {
     //   * Layer 2 of the seal: a hand-written fingerprint carrier that
     //     lies about its shape fails through the `run` boundary (E0080).
     t.compile_fail("tests/compile_fail/query_wire_oid_drift.rs");
+    t.compile_fail("tests/compile_fail/query_wire_row_oid_drift.rs");
     t.compile_fail("tests/compile_fail/query_wire_schema_pin_drift.rs");
     t.compile_fail("tests/compile_fail/query_hostile_construction.rs");
     t.compile_fail("tests/compile_fail/query_hostile_fingerprint.rs");

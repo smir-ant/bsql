@@ -212,7 +212,7 @@ pub use ident::{
 pub use startup::{StartupParam, StartupParamError, RESERVED_NAMES};
 pub use password::{Credentials, Password, PasswordError};
 pub use sensitive::Sensitive;
-pub use prepared::{PreparedQuery, QueryFingerprint, RowDecode};
+pub use prepared::{ColCellAt, PreparedQuery, QueryFingerprint, RowDecode};
 pub use typed_query::TypedQuery;
 // The connecting-phase engine state enum.
 pub use state::ConnectingState;

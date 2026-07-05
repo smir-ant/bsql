@@ -152,6 +152,17 @@ bsql::query!(TextArrayLit, "SELECT ARRAY['a', NULL, 'c']::text[] AS xs");
 bsql::query!(NullArrayLit, "SELECT NULL::int4[] AS xs");
 bsql::query!(EmptyArrayLit, "SELECT ARRAY[]::int4[] AS xs");
 
+// ── int2 (i16) + bool: the last two of the 18 scalar types without a
+//    decode-VALUE witness through the `ColCellAt::decode_at` seam. The scalar
+//    row is all-fixed-not-null (the const-offset FAST path decodes each column
+//    through `<marker as ColCellAt<'_>>::decode_at`); the arrays exercise
+//    `int2[]` / `bool[]` on the per-cell path (with a NULL element each).
+bsql::query!(SmallBool, "SELECT 1::int2 AS a, true AS b");
+bsql::query!(
+    SmallBoolArrays,
+    "SELECT ARRAY[1, NULL, 2]::int2[] AS c, ARRAY[true, NULL, false]::bool[] AS d"
+);
+
 // ── exact numeric / decimal: a FromStr-constructed `bsql::Numeric` binds as a
 //    param, and `$1::numeric::text` is PG's own text rendering (the oracle).
 bsql::query!(EchoNum, "SELECT $1::numeric AS n");
@@ -968,6 +979,30 @@ fn typed_array_columns_round_trip() {
     // An empty array (PG ndim = 0) -> an empty `Vec`.
     let empty = c.query_one::<EmptyArrayLitQuery>(()).expect("query_one EmptyArrayLit");
     assert_eq!(empty.xs, Some(Vec::<Option<i32>>::new()));
+
+    c.close().expect("close");
+}
+
+/// int2 (`i16`) + `bool` — the last two of the 18 scalar types, decoded through
+/// the unified `ColCellAt::decode_at` seam. The scalar pair is all-fixed-not-null
+/// (const-offset FAST path); the arrays cover `int2[]` / `bool[]` (per-cell path,
+/// each with a NULL element). Each column decodes to its DECLARED Rust type.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_int2_and_bool_round_trip() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    // FAST path: two fixed-width, NOT-NULL columns (`int2` = 2 B, `bool` = 1 B).
+    let sb = c.query_one::<SmallBoolQuery>(()).expect("query_one SmallBool");
+    assert_eq!(sb.a, 1_i16);
+    assert!(sb.b);
+
+    // Per-cell path: `int2[]` and `bool[]`, each with an honest `None` element.
+    let arr = c
+        .query_one::<SmallBoolArraysQuery>(())
+        .expect("query_one SmallBoolArrays");
+    assert_eq!(arr.c, Some(vec![Some(1_i16), None, Some(2_i16)]));
+    assert_eq!(arr.d, Some(vec![Some(true), None, Some(false)]));
 
     c.close().expect("close");
 }

@@ -217,7 +217,7 @@ pub use bsql_postgres_core::{Rows, RowsBuilder};
 pub mod __rt {
     pub use bsql_postgres_proto::wire_pin;
     pub use bsql_postgres_proto::{
-        BinaryFmt, Cell, DataRowRef, Date, DecodeError, Interval, Json, Jsonb, Numeric,
+        BinaryFmt, Cell, ColCellAt, DataRowRef, Date, DecodeError, Interval, Json, Jsonb, Numeric,
         PreparedQuery, QueryFingerprint, Time, Timestamp, Timestamptz, TypedQuery, Uuid, oids,
         prepared, query_budget,
     };
