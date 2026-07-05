@@ -584,3 +584,63 @@ fn oversize_control_frame_tears_down() {
     let events = drive(&mut engine, &oversize, 1000);
     assert_eq!(events.last(), Some(&Ev::Close), "oversize control frame tears down");
 }
+
+/// An OVERSIZE `CopyData` OUTSIDE the COPY-OUT phase is out of phase: it must
+/// tear down (`Close`), never surface a spurious truncated `CopyData` event.
+/// The in-buffer path already tears a stray `CopyData` down in `step_idle`; the
+/// oversize Sub-B path must mirror that phase gate — `CopyData` is
+/// streaming-eligible, so WITHOUT the gate it is absorbed into the prefix and
+/// surfaced out of phase. Reachable only from a hostile / non-compliant server;
+/// bounded, no crash (the body is absorbed into the bounded prefix, then torn
+/// down).
+#[test]
+fn oversize_copy_data_outside_copy_out_tears_down() {
+    let mut engine = active_engine();
+    // No COPY OUT was opened — the engine is idle. Forge an oversize CopyData
+    // (declared length far beyond READ_BUF_CAP, so it takes the Sub-B path).
+    let body_len = READ_BUF_CAP * 2 + 41;
+    let declared = u32::try_from(body_len + 4).expect("declared fits u32");
+    let oversize = frame_declared(TAG_COPY_DATA.byte(), declared, &vec![b'q'; body_len]);
+    let events = drive(&mut engine, &oversize, 1000);
+    assert_eq!(
+        events.last(),
+        Some(&Ev::Close),
+        "an oversize CopyData outside COPY OUT tears down, got {events:?}",
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, Ev::CopyData(_))),
+        "no spurious out-of-phase CopyData event is surfaced, got {events:?}",
+    );
+}
+
+/// The in-phase companion: an oversize `CopyData` DURING COPY OUT still surfaces
+/// its truncated Sub-B prefix, then the engine resumes — proving the phase gate
+/// preserves the legitimate path and rejects only the out-of-phase case.
+#[test]
+fn oversize_copy_data_in_copy_out_surfaces_truncated_prefix() {
+    /// Mirror of the engine-private Sub-B prefix cap.
+    const PREFIX_CAP: usize = 8192;
+    let mut engine = active_engine();
+    // Open COPY OUT so a CopyData is in phase.
+    feed(&mut engine, &copy_out_response(1));
+    assert!(matches!(engine.next_event(), Event::NeedMore));
+
+    let body_len = PREFIX_CAP * 2 + 7; // exceeds both READ_BUF_CAP and the prefix
+    let declared = u32::try_from(body_len + 4).expect("declared fits u32");
+    let oversize = frame_declared(TAG_COPY_DATA.byte(), declared, &vec![b'd'; body_len]);
+    let tail = concat(&[copy_done(), command_complete("COPY 1"), ready_for_query(b'I')]);
+    let wire = concat(&[oversize, tail]);
+
+    let events = drive(&mut engine, &wire, 1000);
+    match events.first() {
+        Some(Ev::CopyData(prefix)) => {
+            assert_eq!(prefix.len(), PREFIX_CAP, "Sub-B prefix truncated to the cap");
+        }
+        other => panic!("expected a truncated in-phase CopyData, got {other:?}"),
+    }
+    assert_eq!(
+        events.last(),
+        Some(&Ev::Idle),
+        "engine resumes after the oversize in-phase CopyData, got {events:?}",
+    );
+}

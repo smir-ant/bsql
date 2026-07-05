@@ -1436,9 +1436,12 @@ impl ActiveEngine {
 
     /// Surface a completed Sub-B oversize frame from its accumulated prefix.
     ///
-    /// The async / data frames (`Notice`, `Notify`, `ParameterStatus`,
-    /// `CopyData`) do not advance the command state machine — their truncated
-    /// prefix IS the observable. The state-advancing control frames
+    /// The phase-independent async frames (`Notice`, `Notify`, `ParameterStatus`)
+    /// do not advance the command state machine — their truncated prefix IS the
+    /// observable, legal in any phase. `CopyData` is a COPY-OUT data frame, so it
+    /// is phase-gated to the `CopyOut` state exactly as the in-buffer
+    /// `step_copy_out` gates it; out of phase it is a classified teardown, never a
+    /// spurious surfaced event. The state-advancing control frames
     /// (`ErrorResponse`, `CommandComplete`) must still run their command-state
     /// transition when oversize, exactly as the in-buffer path does; otherwise
     /// the trailing `ReadyForQuery` lands in the wrong phase and tears down.
@@ -1447,7 +1450,16 @@ impl ActiveEngine {
             T_NOTICE => ActiveOutcome::Notice(Lend::Prefix, 0, n),
             T_NOTIFY => ActiveOutcome::Notify(Lend::Prefix, 0, n),
             T_PARAM_STATUS => ActiveOutcome::ParamStatus(Lend::Prefix, 0, n),
-            T_COPY_DATA => ActiveOutcome::CopyData(Lend::Prefix, 0, n),
+            // Phase-gated: a CopyData is legal only during COPY OUT, mirroring the
+            // in-buffer `step_copy_out`. In phase, surface the truncated prefix.
+            T_COPY_DATA if matches!(self.state, ActiveState::CopyOut) => {
+                ActiveOutcome::CopyData(Lend::Prefix, 0, n)
+            }
+            // An oversize CopyData outside COPY OUT (reachable only from a
+            // hostile / non-compliant server) is out of phase: teardown, never a
+            // spurious out-of-phase CopyData event. The body was already
+            // bounded-absorbed into the prefix, so this is bounded and crash-free.
+            T_COPY_DATA => self.teardown(),
             T_ERROR => {
                 // Mirror `fail_recoverable`: park the drain so the trailing RFQ
                 // recovers the connection (a query-level error is recoverable).
