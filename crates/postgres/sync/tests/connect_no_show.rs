@@ -106,6 +106,11 @@ fn connect_captures_server_version_without_a_show_round_trip() {
     // Capture works: the value is exactly what a `SHOW server_version` returns.
     assert_eq!(conn.server_version(), Some(SERVER_VERSION));
 
+    // `SslMode::Disable` connected over plain TCP, so the encryption accessor —
+    // wired to the real `Wire` arm — reports `false`. (A live TLS connect reports
+    // `true`; that half needs a TLS-enabled server, exercised in the live suite.)
+    assert!(!conn.is_encrypted(), "a plaintext (SslMode::Disable) connection must report unencrypted");
+
     // The only post-handshake client frame: a graceful Terminate.
     conn.close().expect("close");
 

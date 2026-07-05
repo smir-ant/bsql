@@ -7,6 +7,22 @@ description = "Shared types and Session for bsql PostgreSQL drivers (async + syn
 license = "MIT OR Apache-2.0"
 
 [features]
+# DEFAULT-ON. The baked Mozilla roots are the out-of-the-box trust anchors; a
+# consumer that verifies only against a pinned/custom CA can drop them with
+# `default-features = false`.
+default = ["webpki-roots"]
+
+# `webpki-roots` — bake the Mozilla CA trust anchors (`TLS_SERVER_ROOTS`, ~55-65
+# KB of DER) into the default client TLS root store (`tls::shared_client_config`).
+# DEFAULT-ON so a public-CA PostgreSQL server verifies out of the box. A consumer
+# that verifies ONLY against a pinned/custom CA (`ConnectConfig::with_ca_roots` /
+# the `sslrootcert` DSN key) or the system store can drop the baked blob with
+# `default-features = false`; with no baked roots AND no custom CA, a TLS connect
+# then fails CLOSED at the handshake (an empty trust-anchor set trusts no server
+# cert), never a silent plaintext downgrade. Optional dep, so the golden lock is
+# unchanged (Cargo.lock unions all optional deps; `deps_pin` stays green).
+webpki-roots = ["dep:webpki-roots"]
+
 # `testkit` — the in-memory fake PostgreSQL backend (`testkit::FakeTransport`)
 # plus the `Wire::Fake` arm that plugs it behind the engine's transport seam.
 # OFF by default: a production consumer that never uses the fake pays nothing
@@ -27,11 +43,13 @@ n1-detect = []
 bsql-postgres-proto = { path = "../proto" }
 rustls = { workspace = true }
 # `webpki-roots` 1.0 ships the Mozilla CA root bundle as the
-# `TLS_SERVER_ROOTS` slice consumed in `src/ssl.rs`. The 0.26 line is a
+# `TLS_SERVER_ROOTS` slice consumed in `src/tls.rs`. The 0.26 line is a
 # thin re-export shim over 1.0.x, so depending on 0.26 dragged BOTH
 # 0.26.11 and 1.0.x into the lock; pinning 1.0 directly collapses the
-# graph to a single entry (same `TLS_SERVER_ROOTS` API).
-webpki-roots = { workspace = true }
+# graph to a single entry (same `TLS_SERVER_ROOTS` API). OPTIONAL and behind
+# the default-on `webpki-roots` feature so a custom/pinned-CA-only consumer can
+# drop the ~55-65 KB baked DER blob with `default-features = false`.
+webpki-roots = { workspace = true, optional = true }
 zeroize = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]

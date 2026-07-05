@@ -322,4 +322,19 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 - No `expect()` or `unwrap()` in production code
 - Error types: `DriverError::Db(DbError)` for server errors with SQLSTATE, `DriverError::Config` for pre-connect validation, `DriverError::NoRows` for empty results
 - `ConnectConfig` is `#[non_exhaustive]` — construct via `new()` + builder methods
-- `SslMode::Prefer` warns in debug builds about SSL downgrade risk
+- `SslMode::Prefer` warns on stderr (debug AND release) when the server refuses
+  SSL and it falls back to plain TCP — an SSL downgrade is a security event a
+  production build must not hide. A consumer can also assert
+  `Connection::is_encrypted()` (both drivers) to reject a plaintext/downgraded
+  connection. The default `SslMode` is still `Prefer` (ecosystem/libpq parity +
+  localhost/dev ergonomics); flipping it to `Require` is a breaking change left
+  for the owner / the 1.0 API freeze.
+- Custom CA roots: `ConnectConfig::with_ca_roots(pem)` (or the `sslrootcert=<path>`
+  DSN key / `PGSSLROOTCERT` env) verify against an internal/private CA, making
+  `SslMode::Require` usable there instead of forcing plaintext. Stored raw, parsed
+  into a rustls root store at connect; a bad/empty PEM is a fail-closed
+  `DriverError::Config`, never a fallback to the baked roots or plaintext.
+- The baked Mozilla CA bundle is behind the default-on `webpki-roots` feature
+  (core → drivers → umbrella): a custom/pinned-CA-only consumer drops the
+  ~55-65 KB blob with `default-features = false`; with no roots and no custom CA,
+  TLS fails CLOSED at the handshake.

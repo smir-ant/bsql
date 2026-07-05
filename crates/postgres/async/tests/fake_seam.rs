@@ -89,6 +89,12 @@ async fn connect_and_query_over_the_fake_with_no_socket() {
     // The server_version captured from the handshake ParameterStatus.
     assert_eq!(conn.server_version(), Some("17.0 (bsql-testkit)"));
 
+    // The in-memory fake is plaintext by construction, so the encryption
+    // accessor — wired to the real `Wire` arm — reports `false`. (A live TLS
+    // connect reports `true`; that half needs a TLS-enabled server, exercised in
+    // the ignored live suite.)
+    assert!(!conn.is_encrypted(), "the plaintext fake wire must report unencrypted");
+
     let result = conn
         .query_sql("SELECT id FROM users")
         .await

@@ -219,19 +219,26 @@ impl<E> From<TlsStepError> for TlsError<E> {
 // Configuration
 // ===========================================================================
 
-/// The process-wide client TLS configuration, built once and shared by every
-/// connection.
+/// The process-wide **default-roots** client TLS configuration, built once and
+/// shared by every connection that does NOT supply its own CA roots.
 ///
 /// Built with [`ClientConfig::builder_with_provider`] passing the ring
 /// provider **explicitly** — the workspace pins `rustls` to ring only, so the
 /// provider-less `ClientConfig::builder()` has no process-default provider to
-/// resolve and would fail the moment provider resolution matters. The Mozilla
-/// CA roots are loaded for real server-certificate verification; both TLS 1.2
-/// and 1.3 are offered (the workspace enables `tls12` for legacy-PG reach).
+/// resolve and would fail the moment provider resolution matters. The root
+/// store is the baked Mozilla CA bundle **when the `webpki-roots` feature is
+/// on** (the default); with that feature OFF the store is EMPTY, so a
+/// default-roots TLS connect then fails CLOSED at the handshake (every server
+/// cert is untrusted) rather than silently downgrading — a consumer that
+/// dropped the baked blob must supply its own roots via
+/// [`client_config_with_ca_roots`]. Both TLS 1.2 and 1.3 are offered (the
+/// workspace enables `tls12` for legacy-PG reach).
 ///
 /// Cached in a [`OnceLock`]: the first caller builds the config, every later
 /// caller shares the same `Arc`. A build error is not cached — a transient
-/// failure does not poison the slot.
+/// failure does not poison the slot. A connection with CUSTOM CA roots does not
+/// use this shared config — its roots differ per config, so it builds a
+/// dedicated [`ClientConfig`] via [`client_config_with_ca_roots`].
 ///
 /// # Errors
 ///
@@ -243,21 +250,155 @@ pub fn shared_client_config() -> Result<Arc<ClientConfig>, rustls::Error> {
     if let Some(cfg) = CONFIG.get() {
         return Ok(Arc::clone(cfg));
     }
-    let built = build_client_config()?;
+    let built = config_from_roots(default_roots())?;
     // A concurrent caller may win the race; `get_or_init` returns the single
     // installed value either way (the loser's `built` is dropped).
     Ok(Arc::clone(CONFIG.get_or_init(|| built)))
 }
 
-fn build_client_config() -> Result<Arc<ClientConfig>, rustls::Error> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+/// The default trust anchors: the baked Mozilla CA bundle when the
+/// `webpki-roots` feature is on.
+#[cfg(feature = "webpki-roots")]
+fn default_roots() -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+}
+
+/// The default trust anchors when the `webpki-roots` feature is OFF: EMPTY.
+///
+/// The consumer opted out of the ~55–65 KB baked DER bundle. A TLS connect with
+/// no custom CA then fails CLOSED at the handshake (an empty trust-anchor set
+/// trusts no server certificate) — never a silent plaintext fallback. Such a
+/// consumer must supply roots through [`client_config_with_ca_roots`].
+#[cfg(not(feature = "webpki-roots"))]
+fn default_roots() -> rustls::RootCertStore {
+    rustls::RootCertStore::empty()
+}
+
+/// Assemble the ring-explicit, TLS-1.2+1.3 client config over a given root
+/// store. The single config-assembly seam shared by the default-roots
+/// [`shared_client_config`] and the custom-CA [`client_config_with_ca_roots`],
+/// so the two paths cannot drift in provider, version policy, or client-auth
+/// posture.
+fn config_from_roots(
+    roots: rustls::RootCertStore,
+) -> Result<Arc<ClientConfig>, rustls::Error> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(Arc::new(config))
+}
+
+/// Why building a client TLS config from consumer-supplied CA roots failed.
+///
+/// Every variant is a FAIL-CLOSED outcome: an unusable custom-CA source is a
+/// classified error, never a silent fallback to the baked roots or to
+/// plaintext. A driver lifts this to
+/// [`DriverError::Config`](crate::DriverError).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CaRootsError {
+    /// The supplied bytes contained no PEM `CERTIFICATE` section — empty input,
+    /// a wrong-kind PEM (e.g. only a private key), or not PEM at all. An empty
+    /// trust-anchor set would trust nothing, so it is rejected rather than
+    /// silently producing an unusable config.
+    NoCertificates,
+    /// A PEM `CERTIFICATE` section was present but its base64/DER body did not
+    /// decode. Carries the pki-types PEM cause.
+    MalformedPem(rustls::pki_types::pem::Error),
+    /// A certificate decoded from PEM but `rustls` rejected it as a trust
+    /// anchor (a structurally-invalid X.509 body). Carries the `rustls` cause.
+    InvalidCertificate(rustls::Error),
+    /// `rustls` protocol-version selection failed while assembling the config.
+    /// Structurally should not happen with the pinned ring provider; surfaced
+    /// rather than `unwrap`ped.
+    ProtocolVersions(rustls::Error),
+}
+
+impl fmt::Display for CaRootsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoCertificates => {
+                f.write_str("custom CA roots contained no PEM certificate")
+            }
+            Self::MalformedPem(e) => write!(f, "custom CA roots PEM is malformed: {e}"),
+            Self::InvalidCertificate(e) => {
+                write!(f, "custom CA certificate is not a valid trust anchor: {e}")
+            }
+            Self::ProtocolVersions(e) => {
+                write!(f, "TLS provider advertised no usable protocol versions: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CaRootsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MalformedPem(e) => Some(e),
+            Self::InvalidCertificate(e) | Self::ProtocolVersions(e) => Some(e),
+            Self::NoCertificates => None,
+        }
+    }
+}
+
+/// Parse a PEM bundle of one or more CA certificates into a `rustls`
+/// [`RootCertStore`](rustls::RootCertStore).
+///
+/// Fail-CLOSED: a `CERTIFICATE` section whose body does not decode is a
+/// [`CaRootsError::MalformedPem`] (never silently skipped), and a bundle with
+/// ZERO certificate sections (empty, non-PEM, or key-only) is a
+/// [`CaRootsError::NoCertificates`]. Non-certificate PEM sections (e.g. a
+/// private key accidentally left in the file) are ignored by the
+/// certificate-kind iterator, but at least one certificate must be present.
+///
+/// PEM parsing is delegated to `rustls-pki-types` (already a `rustls`
+/// dependency) — no hand-rolled ASN.1/base64.
+///
+/// # Errors
+///
+/// [`CaRootsError::MalformedPem`] for an undecodable certificate body,
+/// [`CaRootsError::InvalidCertificate`] if `rustls` rejects a decoded cert as a
+/// trust anchor, and [`CaRootsError::NoCertificates`] if none is found.
+pub fn parse_ca_roots(pem: &[u8]) -> Result<rustls::RootCertStore, CaRootsError> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::CertificateDer;
+
+    let mut roots = rustls::RootCertStore::empty();
+    let mut added: usize = 0;
+    for item in CertificateDer::pem_slice_iter(pem) {
+        let cert = item.map_err(CaRootsError::MalformedPem)?;
+        roots.add(cert).map_err(CaRootsError::InvalidCertificate)?;
+        added = added.saturating_add(1);
+    }
+    if added == 0 {
+        return Err(CaRootsError::NoCertificates);
+    }
+    Ok(roots)
+}
+
+/// Build a client TLS config whose trust anchors are EXACTLY the CA
+/// certificate(s) in `pem` — the internal/private-CA path.
+///
+/// The supplied roots REPLACE (do not extend) the baked Mozilla bundle, matching
+/// libpq's `sslrootcert`: a fleet with an internal CA verifies against precisely
+/// that CA, not that CA plus every public root. This makes
+/// [`SslMode::Require`](crate::SslMode) usable against an internal-CA server
+/// without the plaintext fallback. Not cached in the shared [`OnceLock`] — roots
+/// differ per config, so each custom-CA connection assembles its own config
+/// (connect is not a hot path).
+///
+/// # Errors
+///
+/// Any [`CaRootsError`] from parsing/validating the PEM, or from config
+/// assembly. Fail-closed: a bad or empty PEM is an error, never a fallback to
+/// the baked roots.
+pub fn client_config_with_ca_roots(pem: &[u8]) -> Result<Arc<ClientConfig>, CaRootsError> {
+    let roots = parse_ca_roots(pem)?;
+    config_from_roots(roots).map_err(CaRootsError::ProtocolVersions)
 }
 
 // ===========================================================================
@@ -681,6 +822,27 @@ pub enum Wire<S: Transport> {
     Fake(Box<crate::testkit::FakeTransport>),
 }
 
+impl<S: Transport> Wire<S> {
+    /// Whether this wire encrypts its traffic: `true` ONLY for the TLS arm.
+    ///
+    /// A plaintext socket and the in-memory testkit fake are both unencrypted.
+    /// The value is a property of the wire's variant, decided once when the
+    /// wire is built (the PostgreSQL protocol negotiates TLS a single time,
+    /// before the startup packet, and never up- or down-grades mid-session), so
+    /// a snapshot a driver captures at connect stays accurate for the
+    /// connection's whole life.
+    #[must_use]
+    #[inline]
+    pub fn is_encrypted(&self) -> bool {
+        match self {
+            Wire::Tls(_) => true,
+            Wire::Plain(_) => false,
+            #[cfg(feature = "testkit")]
+            Wire::Fake(_) => false,
+        }
+    }
+}
+
 impl<S: Transport> Transport for Wire<S> {
     /// The arm-uniform error union: a plaintext socket error rides
     /// [`TlsError::Socket`]; the TLS arm's error already is this type.
@@ -931,5 +1093,116 @@ fn queue_close_notify(
             Ok(ConnectionState::TransmitTlsData(t)) => t.done(),
             Ok(_) => return Err(TlsStepError::UnexpectedState),
         }
+    }
+}
+
+#[cfg(test)]
+mod ca_roots_tests {
+    use super::{client_config_with_ca_roots, parse_ca_roots, CaRootsError};
+
+    /// A self-signed test CA (CN=bsql-test-ca), used only to prove the PEM →
+    /// `RootCertStore` parse populates the store. It is never used for a live
+    /// handshake, so its validity window is irrelevant — adding a cert to a
+    /// `RootCertStore` checks the DER structure, not expiry or trust.
+    const VALID_CA_PEM: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIDDzCCAfegAwIBAgIUORlDsy8oktmcPotcfLycNCO9gs4wDQYJKoZIhvcNAQEL
+BQAwFzEVMBMGA1UEAwwMYnNxbC10ZXN0LWNhMB4XDTI2MDcwNTEwNTEwN1oXDTM2
+MDcwMjEwNTEwN1owFzEVMBMGA1UEAwwMYnNxbC10ZXN0LWNhMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAti189MDzZ5D/rUiI5hY1PW04D0pm6P0KUZXJ
+WR/1Dj231r5shqDSJqyiAlUujr+IQcIH7UizqzyBJ4YRkZIVaa74I+uTW/7ALdOm
+Ks3k7ToG1L5U51ppm7uHsGZnV3B52llIM5XHt97DVylcNyDk0GNmMe9PapTrHqZL
+v+xMTW8TCWbnnCaTJ9KlFVo7HEVwaBoWJhbgdChV1pmIzTElfGBDb+HUKgvjGRRJ
+t91gf9+tcAsXWWnhW5i1Yv8Njmi8jkUajuu3Qmbk9YCQ+gnzQuk1VaZFeWlQddMo
+d+v02pAnaqE/rcJf6u+obLgFPu+RuMquw4pQofOGezdHjpCoiQIDAQABo1MwUTAd
+BgNVHQ4EFgQUJiKU0c5Tlo7Hk7jATcp+PkNFNMgwHwYDVR0jBBgwFoAUJiKU0c5T
+lo7Hk7jATcp+PkNFNMgwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOC
+AQEADCAJqKmMxaiJ8O0vbYo9YvLZNl+eaOUJVt6dz3H3KVGAZ8klblIU61r6wkUD
++sXp6Bf734Ox5RgoqUwjDneslIcVfGujB174m8I5Hj7lCCmK+MQODAc/nP39GSQu
+++eOoNKjET7FvRF7YgapcMmGvLkAXOTO8z3t7C1uxiKdG6mH+vxdzlyY4/KRFmAz
+gkHVFpdSptPfL/OQcaA8aXvP/nI2iNboNrtwLEsTdOUocz82/p5rLmhDTcRaKgFu
+PA9vJWoKSb1lZ7YpcVy1Dqb4L4QLk598XKP5BPEjV+du6kqqodW1Y9fX9ZtxEML1
+kZ8om3v1zy9LLKM1Yzpv7M2aeQ==
+-----END CERTIFICATE-----
+";
+
+    /// THE WITNESS: a valid CA PEM populates the `RootCertStore` — the store is
+    /// non-empty and holds exactly the one certificate supplied. This is the
+    /// tier-3 proof that `with_ca_roots` reaches a real, populated trust anchor
+    /// set (the driver's `build_wire` feeds the same PEM to this fn).
+    #[test]
+    fn valid_ca_pem_populates_the_root_store() {
+        let store = match parse_ca_roots(VALID_CA_PEM) {
+            Ok(s) => s,
+            Err(e) => panic!("a valid CA PEM must populate the store, got {e:?}"),
+        };
+        assert!(!store.is_empty(), "the store must be populated");
+        assert_eq!(store.len(), 1, "exactly the one supplied CA is trusted");
+    }
+
+    /// And it assembles a full `ClientConfig` (ring-explicit) — the end-to-end
+    /// custom-CA path a driver takes.
+    #[test]
+    fn valid_ca_pem_assembles_a_client_config() {
+        if let Err(e) = client_config_with_ca_roots(VALID_CA_PEM) {
+            panic!("a valid CA PEM must assemble a client config, got {e:?}");
+        }
+    }
+
+    /// FAIL-CLOSED: empty input has no certificate section.
+    #[test]
+    fn empty_input_is_no_certificates() {
+        assert!(
+            matches!(parse_ca_roots(b""), Err(CaRootsError::NoCertificates)),
+            "empty input must be NoCertificates, never a silent empty store",
+        );
+    }
+
+    /// FAIL-CLOSED: non-PEM garbage has no certificate section.
+    #[test]
+    fn non_pem_garbage_is_no_certificates() {
+        assert!(
+            matches!(
+                parse_ca_roots(b"this is not a PEM file at all\n"),
+                Err(CaRootsError::NoCertificates),
+            ),
+            "non-PEM input must be NoCertificates, never a silent empty store",
+        );
+    }
+
+    /// FAIL-CLOSED: a `CERTIFICATE` block whose body is not valid base64 is a
+    /// malformed-PEM error — the section is present but undecodable, never
+    /// silently skipped.
+    #[test]
+    fn certificate_block_with_bad_base64_is_malformed() {
+        const BAD: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+!!! this is not base64 !!!
+-----END CERTIFICATE-----
+";
+        assert!(
+            matches!(parse_ca_roots(BAD), Err(CaRootsError::MalformedPem(_))),
+            "a CERTIFICATE block with a non-base64 body must be MalformedPem",
+        );
+    }
+
+    /// FAIL-CLOSED: a `CERTIFICATE` block whose base64 decodes but is not a
+    /// valid X.509 body is rejected by rustls as a trust anchor — never trusted.
+    #[test]
+    fn certificate_block_with_non_der_body_is_invalid() {
+        // "aGVsbG8gd29ybGQ=" is valid base64 for "hello world" — decodes, but is
+        // not a DER certificate, so `RootCertStore::add` rejects it.
+        const NON_DER: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+aGVsbG8gd29ybGQ=
+-----END CERTIFICATE-----
+";
+        assert!(
+            matches!(
+                parse_ca_roots(NON_DER),
+                Err(CaRootsError::InvalidCertificate(_)),
+            ),
+            "a non-DER certificate body must be InvalidCertificate",
+        );
     }
 }

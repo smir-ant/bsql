@@ -7,10 +7,20 @@ description = "Multi-backend SQL toolkit — PostgreSQL and SQLite"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = ["postgres-async", "postgres-sync", "sqlite"]
+default = ["postgres-async", "postgres-sync", "sqlite", "webpki-roots"]
 postgres-async = ["dep:bsql-postgres-async"]
 postgres-sync = ["dep:bsql-postgres-sync"]
 sqlite = ["dep:bsql-sqlite"]
+
+# `webpki-roots` — the baked Mozilla CA trust anchors for TLS server verification,
+# DEFAULT-ON. Forwards to whichever PostgreSQL driver(s) are enabled (the `?`
+# activates it ONLY on an already-enabled driver, so it pulls no driver a consumer
+# did not ask for). A consumer that verifies only against a pinned/custom CA
+# (`ConnectConfig::with_ca_roots` / the `sslrootcert` DSN key) drops the ~55-65 KB
+# baked DER blob with `default-features = false` (and simply does not re-list
+# `webpki-roots`). With no baked roots and no custom CA, a TLS connect fails CLOSED
+# at the handshake, never a silent plaintext downgrade.
+webpki-roots = ["bsql-postgres-async?/webpki-roots", "bsql-postgres-sync?/webpki-roots"]
 
 # `n1-detect` — turn on the diagnostics-only N+1 query detector on whichever
 # PostgreSQL driver(s) are enabled (`conn.n1_report()`). OFF by default: a
@@ -67,8 +77,12 @@ test-harness = [
 ]
 
 [dependencies]
-bsql-postgres-async = { path = "../postgres/async", optional = true }
-bsql-postgres-sync = { path = "../postgres/sync", optional = true }
+# `default-features = false` on the two PostgreSQL drivers so this umbrella (and
+# any consumer through it) can drop core's default-on `webpki-roots` (the baked
+# Mozilla CA blob). The umbrella re-exposes it via its own default-on
+# `webpki-roots` feature above, which forwards to the enabled driver(s).
+bsql-postgres-async = { path = "../postgres/async", optional = true, default-features = false }
+bsql-postgres-sync = { path = "../postgres/sync", optional = true, default-features = false }
 bsql-sqlite = { path = "../sqlite/driver", optional = true }
 
 # Behind `testkit` only — the in-memory fake PostgreSQL. It re-enables the async
@@ -83,7 +97,12 @@ bsql-testkit = { path = "../testkit", optional = true }
 # package SET is unchanged; these are the umbrella re-export edges.
 bsql-query-macros = { path = "../query-macros", optional = true }
 bsql-postgres-proto = { path = "../postgres/proto", optional = true }
-bsql-postgres-core = { path = "../postgres/core", optional = true }
+# `default-features = false`: the `macros`/`test-harness` surface this pulls (the
+# `sql_ident` validator, `Rows`/`RowsBuilder`) needs no TLS roots, and forcing
+# core's default-on `webpki-roots` here would defeat the umbrella opt-out (Cargo
+# unifies features across edges, so a default-on core edge would re-enable the
+# baked blob even when the driver edges dropped it).
+bsql-postgres-core = { path = "../postgres/core", optional = true, default-features = false }
 
 # Behind `test-harness` only — the per-test runtime the `#[bsql::test]` harness
 # builds. `rt` runs the current-thread runtime; `net` + `time` enable the I/O and

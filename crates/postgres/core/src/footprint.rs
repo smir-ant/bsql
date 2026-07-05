@@ -45,7 +45,7 @@
 //!   ArenaSealError               1      1   2-variant seal-error enum
 //!   DriverError                 32      8   Db(Box<DbError>) — cold path boxes the 120 B DbError
 //!   DbError                    120      8   5 String/Option<String> fields
-//!   ConnectConfig              112      8   host/user/db/password Strings
+//!   ConnectConfig              152      8   host/user/db/password Strings + startup Vec + CA-roots Arc
 //!   SslMode                      1      1   3-variant enum
 //!   Notification                56      8   2 String + i32
 //!   QueryResult                 72      8   Vec<Row> + String + usize + Arc<[String]>

@@ -7,6 +7,17 @@ description = "Sync PostgreSQL driver built on bsql-pg-proto sans-IO state machi
 license = "MIT OR Apache-2.0"
 
 [features]
+# DEFAULT-ON. Forwards the core's baked-Mozilla-roots default; a custom-CA-only
+# consumer drops it with `default-features = false`.
+default = ["webpki-roots"]
+
+# `webpki-roots` — forward the core's default-on baked Mozilla CA trust anchors
+# (`ConnectConfig::with_ca_roots` supplies custom roots regardless of this flag).
+# DEFAULT-ON; `default-features = false` drops the ~55-65 KB baked DER blob for a
+# consumer that verifies only against a pinned/custom CA. See the core crate's
+# `webpki-roots` feature. Adds no external dependency of its own.
+webpki-roots = ["bsql-postgres-core/webpki-roots"]
+
 # `testkit` — expose `Connection::connect_fake`, which drives the full
 # startup/query engine path over the in-memory `core::testkit::FakeTransport`
 # instead of a socket. OFF by default: it only turns on the core `testkit`
@@ -23,7 +34,10 @@ testkit = ["bsql-postgres-core/testkit"]
 n1-detect = ["bsql-postgres-core/n1-detect"]
 
 [dependencies]
-bsql-postgres-core = { path = "../core" }
+# `default-features = false` so the umbrella (and any consumer) can drop core's
+# default-on `webpki-roots` (the baked Mozilla CA blob); the driver re-exposes it
+# through its own default-on `webpki-roots` feature above.
+bsql-postgres-core = { path = "../core", default-features = false }
 bsql-postgres-proto = { path = "../proto" }
 rustls = { workspace = true }
 

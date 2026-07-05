@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use bsql_postgres_core::materialize::{self, ResultCollector};
 use bsql_postgres_core::sql_ident;
-use bsql_postgres_core::tls::{self, TlsError, TlsTransport, Wire};
+use bsql_postgres_core::tls::{self, CaRootsError, TlsError, TlsTransport, Wire};
 use bsql_postgres_core::{
     capture_notify, validate_startup_params, ConnectConfig, DbError, DbErrorSink, DriverError,
     NotificationLedger, Notification, QueryResult, Row, Rows, RowsBuilder, SslMode,
@@ -162,6 +162,13 @@ pub struct Connection {
     engine: SyncEngine,
     /// The liveness token, or `None` when the connection is dead. The health bit.
     live: Option<Live<'static>>,
+    /// Whether the underlying wire is TLS-encrypted, captured at connect from the
+    /// built [`Wire`] arm. Immutable for the connection's life (PostgreSQL
+    /// negotiates TLS once, before startup, and never up/downgrades mid-session).
+    /// Read via [`is_encrypted`](Self::is_encrypted) so a consumer over an
+    /// untrusted network can ASSERT it — catching a silent `SslMode::Prefer`
+    /// downgrade that left the connection on plain TCP.
+    encrypted: bool,
     /// A `try_clone` of the underlying socket, used to arm socket read/write
     /// timeouts on a fd the engine otherwise owns: the engine owns the I/O
     /// socket, but a dup'd handle shares the same kernel socket, so a timeout set
@@ -228,6 +235,9 @@ impl Connection {
         let socket_ctl = tcp.try_clone()?;
 
         let wire = Self::build_wire(tcp, config)?;
+        // Snapshot the encryption state from the built wire BEFORE it is moved
+        // into the engine — `Wire::is_encrypted` is the single source of truth.
+        let encrypted = wire.is_encrypted();
 
         let user = Ident::try_from_str(&config.user)
             .map_err(|_| DriverError::Config("invalid user name"))?;
@@ -272,6 +282,7 @@ impl Connection {
         Ok(Self {
             engine,
             live: Some(live),
+            encrypted,
             socket_ctl: Some(socket_ctl),
             params: SessionParams {
                 server_version,
@@ -308,6 +319,8 @@ impl Connection {
         fake: bsql_postgres_core::testkit::FakeTransport,
     ) -> Result<Self, DriverError> {
         let wire: SyncWire = Wire::Fake(Box::new(fake));
+        // The in-memory fake is plaintext by construction — no socket, no TLS.
+        let encrypted = wire.is_encrypted();
         let user = Ident::try_from_str("bsql_testkit")
             .map_err(|_| DriverError::Config("invalid testkit user name"))?;
         let (mut engine, live) = engine::open_owned(wire, &user, None, &[], Credentials::Trust)
@@ -321,6 +334,7 @@ impl Connection {
         Ok(Self {
             engine,
             live: Some(live),
+            encrypted,
             socket_ctl: None,
             params: SessionParams {
                 server_version,
@@ -354,12 +368,20 @@ impl Connection {
         Read::read_exact(&mut tcp, &mut response).map_err(lift_probe_io)?;
         match bsql_postgres_core::ssl::classify_ssl_response(response[0], config)? {
             bsql_postgres_core::ssl::SslProbe::Accepted { server_name } => {
-                // Use the provider-explicit ring config from `shared_client_config`:
-                // under the ring-only crypto pin a bare `ClientConfig::builder()`
-                // installs no default provider and would fault at the handshake.
-                // The server name comes from the probe.
-                let cfg = tls::shared_client_config()
-                    .map_err(|e| DriverError::Io(io::Error::other(format!("TLS config: {e}"))))?;
+                // Use the provider-explicit ring config: under the ring-only
+                // crypto pin a bare `ClientConfig::builder()` installs no default
+                // provider and would fault at the handshake. Custom CA roots (an
+                // internal CA via `with_ca_roots` / `sslrootcert`) build a
+                // dedicated config verified against EXACTLY those roots; otherwise
+                // the shared default-roots config. A bad/empty custom PEM is a
+                // classified `Config` error — fail-closed, never a fallback to the
+                // default roots or to plaintext. The server name comes from the probe.
+                let cfg = match config.ca_roots_pem() {
+                    Some(pem) => tls::client_config_with_ca_roots(pem).map_err(lift_ca_roots_error)?,
+                    None => tls::shared_client_config().map_err(|e| {
+                        DriverError::Io(io::Error::other(format!("TLS config: {e}")))
+                    })?,
+                };
                 let socket = SyncSocket::new(tcp);
                 let tls = match engine::poll_once(TlsTransport::connect(socket, cfg, server_name)) {
                     Ok(Ok(transport)) => transport,
@@ -1483,6 +1505,31 @@ impl Connection {
         self.params.backend_pid
     }
 
+    /// Whether this connection's traffic is TLS-encrypted.
+    ///
+    /// `true` iff the TLS handshake completed — `SslMode::Require`, or
+    /// `SslMode::Prefer` where the server accepted SSL. `false` for a plaintext
+    /// connection, INCLUDING a `SslMode::Prefer` connection the server
+    /// downgraded to plain TCP (the downgrade also emits a stderr warning). A
+    /// consumer over an untrusted network can ASSERT this after connect to
+    /// reject a silent downgrade:
+    ///
+    /// ```no_run
+    /// # fn check(conn: &bsql_postgres_sync::Connection) -> Result<(), &'static str> {
+    /// if !conn.is_encrypted() {
+    ///     return Err("refusing to proceed on a plaintext connection");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Captured at connect and never changes: PostgreSQL negotiates TLS once,
+    /// before the startup packet, and never up- or down-grades mid-session.
+    #[must_use]
+    pub fn is_encrypted(&self) -> bool {
+        self.encrypted
+    }
+
     /// Gracefully close the connection (`Terminate` + shutdown). Idempotent.
     pub fn close(&mut self) -> Result<(), DriverError> {
         match self.live.take() {
@@ -1567,6 +1614,29 @@ fn lift_tls_error(e: WireError) -> DriverError {
         },
         // Preserve the TLS error verbatim as the source of a classified I/O error.
         other => DriverError::Io(io::Error::other(other)),
+    }
+}
+
+/// Lift a custom-CA-roots build failure to a classified [`DriverError::Config`]
+/// (the crate's pre-connect-validation class) — fail-closed: a bad or empty CA
+/// PEM aborts the connect, never a silent fallback to the default roots.
+fn lift_ca_roots_error(e: CaRootsError) -> DriverError {
+    match e {
+        CaRootsError::NoCertificates => {
+            DriverError::Config("custom CA roots (with_ca_roots/sslrootcert) contained no certificate")
+        }
+        CaRootsError::MalformedPem(_) => {
+            DriverError::Config("custom CA roots PEM is malformed")
+        }
+        CaRootsError::InvalidCertificate(_) => {
+            DriverError::Config("a custom CA certificate is not a valid trust anchor")
+        }
+        CaRootsError::ProtocolVersions(_) => {
+            DriverError::Config("TLS provider advertised no usable protocol versions")
+        }
+        // `CaRootsError` is `#[non_exhaustive]`; a future rejection class must
+        // still fail CLOSED (a classified Config error), never a silent fallback.
+        _ => DriverError::Config("custom CA roots could not be used"),
     }
 }
 

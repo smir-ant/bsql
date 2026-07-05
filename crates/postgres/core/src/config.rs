@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 /// SSL negotiation mode.
 ///
 /// # Security
@@ -55,17 +57,33 @@ pub struct ConnectConfig {
     /// [`with_application_name`]: ConnectConfig::with_application_name
     /// [`startup_params`]: ConnectConfig::startup_params
     startup_params: Vec<(String, String)>,
+    /// Consumer-supplied CA certificate roots (PEM), or `None` to verify the
+    /// server certificate against the DEFAULT trust anchors (the baked Mozilla
+    /// bundle, under the `webpki-roots` feature). Set via [`with_ca_roots`] or
+    /// the `sslrootcert=<path>` DSN key / `PGSSLROOTCERT` env var.
+    ///
+    /// Stored RAW (the PEM bytes) and parsed into a `rustls` root store at
+    /// connect — consistent with `startup_params`, which are also stored raw and
+    /// validated at connect. An invalid/empty PEM is a classified
+    /// [`DriverError::Config`](crate::DriverError) at connect, never a silent
+    /// fallback to the default roots or to plaintext. `Arc<[u8]>` so a
+    /// `ConnectConfig` clone (e.g. per pool checkout) is an O(1) refcount bump,
+    /// not a PEM deep-copy.
+    ///
+    /// [`with_ca_roots`]: ConnectConfig::with_ca_roots
+    ca_roots_pem: Option<Arc<[u8]>>,
 }
 
 // Footprint pin: four owned Strings/Option<String> (host, user, database,
-// password) plus a u16 port, a u64 timeout, the SslMode byte, and the
+// password) plus a u16 port, a u64 timeout, the SslMode byte, the
 // startup-params `Vec<(String, String)>` (one 3-word / 24-byte owned handle;
-// its heap buffer is empty until a startup parameter is added). Config is
-// built once per connection, so its size is not hot — but pinning it keeps a
-// silently-added field on the review surface, and the password is a
-// Zeroizing<String> whose 3-word shape must not regress. 112 + 24 (the Vec) =
-// 136.
-crate::footprint_pin!(ConnectConfig, size = 136, align = 8);
+// its heap buffer is empty until a startup parameter is added), and the
+// custom-CA `Option<Arc<[u8]>>` (a 16-byte fat pointer, niche-packed into 16 B;
+// `None` until a CA is supplied). Config is built once per connection, so its
+// size is not hot — but pinning it keeps a silently-added field on the review
+// surface, and the password is a Zeroizing<String> whose 3-word shape must not
+// regress. 112 + 24 (the Vec) + 16 (the Arc) = 152.
+crate::footprint_pin!(ConnectConfig, size = 152, align = 8);
 
 impl ConnectConfig {
     pub fn password_str(&self) -> Option<&str> {
@@ -142,6 +160,7 @@ impl ConnectConfig {
         // Parse query params
         let mut ssl_mode = SslMode::Prefer;
         let mut timeout = 10u64;
+        let mut ca_roots_pem: Option<Arc<[u8]>> = None;
         if let Some(q) = query {
             for param in q.split('&') {
                 // A parameter with no `=` carries no value. Silently skipping it
@@ -163,6 +182,19 @@ impl ConnectConfig {
                     "connect_timeout" => {
                         timeout = v.parse().map_err(|_| format!("invalid timeout: {v}"))?;
                     }
+                    "sslrootcert" => {
+                        // Read the CA bundle from the given path NOW. libpq reads
+                        // `sslrootcert` at connect; here, DSN parsing is the
+                        // connect-config assembly step. A missing/unreadable file
+                        // is a loud error carrying the path — never a silent
+                        // fallback to the default roots. The PEM contents are
+                        // parsed into the rustls root store at connect (fail-closed
+                        // on an invalid/empty bundle there), consistent with how
+                        // startup parameters are stored raw and validated at connect.
+                        let bytes = std::fs::read(v)
+                            .map_err(|e| format!("cannot read sslrootcert file {v}: {e}"))?;
+                        ca_roots_pem = Some(Arc::from(bytes));
+                    }
                     // An unrecognised key is a misconfiguration (e.g. a
                     // typo'd `sslmod=require` that would otherwise silently
                     // leave the default `prefer`, downgrading security).
@@ -182,12 +214,14 @@ impl ConnectConfig {
             connect_timeout_secs: timeout,
             ssl_mode,
             startup_params: Vec::new(),
+            ca_roots_pem,
         })
     }
 
     /// Construct from environment variables.
     ///
-    /// Reads: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE`.
+    /// Reads: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`,
+    /// `PGSSLMODE`, `PGSSLROOTCERT`.
     ///
     /// A variable that is **absent** falls back to a documented default
     /// (host=localhost, port=5432, user=`$USER` then `postgres`,
@@ -245,6 +279,21 @@ impl ConnectConfig {
             Err(VarError::NotUnicode(_)) => return Err("PGSSLMODE is not valid UTF-8".to_string()),
         };
 
+        // `PGSSLROOTCERT` names a CA-bundle file; read it now (a present-but-
+        // unreadable path is a loud error carrying the path, never a silent
+        // fallback to the default roots). Absent → the default trust anchors.
+        let ca_roots_pem = match std::env::var("PGSSLROOTCERT") {
+            Ok(path) => {
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| format!("cannot read PGSSLROOTCERT file {path}: {e}"))?;
+                Some(Arc::from(bytes))
+            }
+            Err(VarError::NotPresent) => None,
+            Err(VarError::NotUnicode(_)) => {
+                return Err("PGSSLROOTCERT is not valid UTF-8".to_string())
+            }
+        };
+
         Ok(Self {
             host,
             port,
@@ -254,6 +303,7 @@ impl ConnectConfig {
             connect_timeout_secs: 10,
             ssl_mode,
             startup_params: Vec::new(),
+            ca_roots_pem,
         })
     }
 
@@ -268,6 +318,7 @@ impl ConnectConfig {
             connect_timeout_secs: 10,
             ssl_mode: SslMode::default(),
             startup_params: Vec::new(),
+            ca_roots_pem: None,
         }
     }
 
@@ -348,6 +399,37 @@ impl ConnectConfig {
     #[must_use]
     pub fn startup_params(&self) -> &[(String, String)] {
         &self.startup_params
+    }
+
+    /// Verify the server certificate against a CUSTOM set of CA roots supplied
+    /// as PEM, instead of the default (baked Mozilla) trust anchors.
+    ///
+    /// This is the internal/private-CA path: a fleet whose PostgreSQL servers
+    /// present certificates signed by an in-house CA can now use
+    /// [`SslMode::Require`] (verified TLS) against them, instead of being forced
+    /// to [`SslMode::Disable`] (plaintext) because the baked public roots cannot
+    /// validate an internal CA. The supplied roots REPLACE the default anchors
+    /// (they do not extend them), matching libpq's `sslrootcert`: the server is
+    /// verified against precisely this CA, not this CA plus every public root.
+    ///
+    /// The PEM is stored raw and parsed into a `rustls` root store at connect. An
+    /// invalid or empty PEM is a classified
+    /// [`DriverError::Config`](crate::DriverError) at connect — fail-closed,
+    /// never a silent fallback to the default roots or to plaintext.
+    ///
+    /// Chainable; a later call replaces an earlier one (the last CA source wins).
+    #[must_use]
+    pub fn with_ca_roots(mut self, pem: &[u8]) -> Self {
+        self.ca_roots_pem = Some(Arc::from(pem));
+        self
+    }
+
+    /// Borrow the raw, not-yet-parsed custom CA-roots PEM, or `None` when the
+    /// default trust anchors are in force. The drivers parse it into a `rustls`
+    /// root store at connect (fail-closed on an invalid/empty bundle).
+    #[must_use]
+    pub fn ca_roots_pem(&self) -> Option<&[u8]> {
+        self.ca_roots_pem.as_deref()
     }
 }
 
@@ -448,6 +530,52 @@ mod tests {
     #[test]
     fn a_fresh_config_has_no_startup_params() {
         assert!(ConnectConfig::new("localhost", "u").startup_params().is_empty());
+    }
+
+    #[test]
+    fn a_fresh_config_has_no_ca_roots() {
+        assert!(ConnectConfig::new("localhost", "u").ca_roots_pem().is_none());
+    }
+
+    #[test]
+    fn with_ca_roots_stores_the_raw_pem() {
+        const PEM: &[u8] = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        let cfg = ConnectConfig::new("localhost", "u").with_ca_roots(PEM);
+        assert_eq!(cfg.ca_roots_pem(), Some(PEM), "the raw PEM must round-trip");
+    }
+
+    #[test]
+    fn dsn_sslrootcert_missing_file_is_a_loud_error() {
+        // A present-but-unreadable `sslrootcert` path is a loud error carrying
+        // the path — never a silent fallback to the default roots.
+        let err =
+            ConnectConfig::from_dsn("postgres://u@h?sslrootcert=/no/such/bsql/test/ca.pem");
+        match err {
+            Err(msg) => assert!(
+                msg.contains("sslrootcert"),
+                "the error must name the failing key, got {msg:?}",
+            ),
+            Ok(_) => panic!("an unreadable sslrootcert file must not parse silently"),
+        }
+    }
+
+    #[test]
+    fn dsn_sslrootcert_reads_the_file_into_ca_roots() {
+        // The DSN reads the file NOW; the PEM is validated later (at connect).
+        const PEM: &[u8] = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        let path =
+            std::env::temp_dir().join(format!("bsql_w2_ca_{}.pem", std::process::id()));
+        if std::fs::write(&path, PEM).is_err() {
+            panic!("temp-file write failed; cannot exercise sslrootcert read");
+        }
+        let dsn = format!("postgres://u@h?sslrootcert={}", path.display());
+        let cfg = match ConnectConfig::from_dsn(&dsn) {
+            Ok(c) => c,
+            Err(e) => panic!("a DSN with a readable sslrootcert must parse: {e}"),
+        };
+        // Best-effort cleanup before asserting (a leftover temp file is harmless).
+        drop(std::fs::remove_file(&path));
+        assert_eq!(cfg.ca_roots_pem(), Some(PEM), "the file bytes must be stored");
     }
 
     #[test]

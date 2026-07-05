@@ -34,8 +34,11 @@ pub fn ssl_request_bytes() -> &'static [u8; 8] {
 /// On acceptance, derives the verified `server_name` from `config.host` (the TLS
 /// config is built once per process by [`tls::shared_client_config`], not here).
 /// On refusal, honours `SslMode`: `Require` is a hard [`DriverError::SslRefused`];
-/// `Prefer` warns in debug builds and falls back to plain TCP. Any other byte
-/// (a server `ErrorResponse` start, or an out-of-protocol value) is a hard
+/// `Prefer` warns ON STDERR (in debug AND release — an SSL downgrade is a
+/// security event a production build must not hide) and falls back to plain TCP.
+/// A consumer that must not silently downgrade can additionally assert
+/// `Connection::is_encrypted()` after connect. Any other byte (a server
+/// `ErrorResponse` start, or an out-of-protocol value) is a hard
 /// [`DriverError::Io`] — never a silent fallback.
 ///
 /// [`tls::shared_client_config`]: crate::tls::shared_client_config
@@ -56,9 +59,13 @@ pub fn classify_ssl_response(
             if config.ssl_mode == SslMode::Require {
                 return Err(DriverError::SslRefused);
             }
-            #[cfg(debug_assertions)]
+            // Emit in debug AND release: a silent downgrade to plaintext on an
+            // untrusted network is exactly the event a production build must
+            // surface. stderr keeps it dependency-free (no logging crate). A
+            // consumer can also assert `Connection::is_encrypted()` to fail hard.
             eprintln!("[bsql] WARNING: SSL refused by server, falling back to plain TCP. \
-                Use SslMode::Require for production over untrusted networks.");
+                Use SslMode::Require for production over untrusted networks, or assert \
+                Connection::is_encrypted().");
             Ok(SslProbe::PlainTcp)
         }
         // `ErrorIncoming` (a server `ErrorResponse` start), `InvalidByte`, or any
