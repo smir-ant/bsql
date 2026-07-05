@@ -7,16 +7,27 @@ description = "Sync PostgreSQL driver built on bsql-pg-proto sans-IO state machi
 license = "MIT OR Apache-2.0"
 
 [features]
-# DEFAULT-ON. Forwards the core's baked-Mozilla-roots default; a custom-CA-only
-# consumer drops it with `default-features = false`.
-default = ["webpki-roots"]
+# DEFAULT-ON. Forwards the core's `tls` + baked-Mozilla-roots defaults; a
+# localhost / unix-socket / trust-auth deployment drops the ENTIRE ring/rustls
+# subtree with `default-features = false`.
+default = ["tls", "webpki-roots"]
+
+# `tls` — forward the core's default-on rustls-backed encrypted transport. With
+# it OFF (`default-features = false`) the whole ring/rustls subtree is dropped
+# and this driver's `build_tcp_wire` sends no SSLRequest probe: `SslMode::Prefer`
+# connects plaintext, while `SslMode::Require` or a custom CA is a fail-loud
+# `DriverError::Config` at connect (never a silent plaintext connect). This
+# driver names no `rustls` type of its own (it composes `core::tls`), so the
+# feature only forwards to core — it pulls no extra direct dependency.
+tls = ["bsql-postgres-core/tls"]
 
 # `webpki-roots` — forward the core's default-on baked Mozilla CA trust anchors
 # (`ConnectConfig::with_ca_roots` supplies custom roots regardless of this flag).
-# DEFAULT-ON; `default-features = false` drops the ~55-65 KB baked DER blob for a
-# consumer that verifies only against a pinned/custom CA. See the core crate's
-# `webpki-roots` feature. Adds no external dependency of its own.
-webpki-roots = ["bsql-postgres-core/webpki-roots"]
+# DEFAULT-ON; IMPLIES `tls` (baked roots without the rustls transport are
+# meaningless). `default-features = false, features = ["tls"]` keeps TLS but
+# drops the ~55-65 KB baked DER blob for a consumer that verifies only against a
+# pinned/custom CA. See the core crate's `webpki-roots` feature.
+webpki-roots = ["tls", "bsql-postgres-core/webpki-roots"]
 
 # `testkit` — expose `Connection::connect_fake`, which drives the full
 # startup/query engine path over the in-memory `core::testkit::FakeTransport`
@@ -39,7 +50,10 @@ n1-detect = ["bsql-postgres-core/n1-detect"]
 # through its own default-on `webpki-roots` feature above.
 bsql-postgres-core = { path = "../core", default-features = false }
 bsql-postgres-proto = { path = "../proto" }
-rustls = { workspace = true }
+# No direct `rustls`: this driver composes the engine's sans-IO
+# `core::tls::TlsTransport` (shared with the async driver) and names no `rustls`
+# type of its own, so TLS rides the core `tls` feature — the whole rustls subtree
+# drops with `default-features = false`.
 
 # Inherit the workspace FORBID floor (the two-tier lint wall). The pool's
 # mutex/condvar poison-recovery fallbacks carry scoped allows in

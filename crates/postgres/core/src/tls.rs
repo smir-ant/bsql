@@ -50,36 +50,47 @@
 //! (no aws-lc-rs, no auto-installed process-default provider), so the
 //! provider-less `ClientConfig::builder()` would have no provider to resolve.
 
-use std::boxed::Box;
 use std::fmt;
-use std::future::Future;
-use std::sync::{Arc, OnceLock};
-use std::vec::Vec;
-
-use rustls::client::{ClientConfig, UnbufferedClientConnection};
-use rustls::pki_types::ServerName;
-use rustls::unbuffered::{
-    ConnectionState, EncodeError, EncryptError, InsufficientSizeError,
-};
-use zeroize::Zeroize;
 
 use bsql_postgres_proto::engine::Transport;
+
+// Everything the rustls-backed TLS transport needs is compiled ONLY under the
+// `tls` feature. With it off, `Wire` degenerates to its plaintext arm, `TlsError`
+// to its `Socket` arm, and this crate names no `rustls` type — the whole
+// ring/rustls subtree drops from the build. `Box` / `Vec` ride the std prelude,
+// so the plaintext skeleton needs no extra import.
+#[cfg(feature = "tls")]
+use std::future::Future;
+#[cfg(feature = "tls")]
+use std::sync::{Arc, OnceLock};
+
+#[cfg(feature = "tls")]
+use rustls::client::{ClientConfig, UnbufferedClientConnection};
+#[cfg(feature = "tls")]
+use rustls::pki_types::ServerName;
+#[cfg(feature = "tls")]
+use rustls::unbuffered::{ConnectionState, EncodeError, EncryptError, InsufficientSizeError};
+#[cfg(feature = "tls")]
+use zeroize::Zeroize;
 
 /// Maximum plaintext bytes in a single TLS record (RFC 8446 / RFC 5246).
 /// `write` chunks its plaintext to this size so each `rustls` `encrypt`
 /// produces exactly one record that fits in the fixed [`TLS_RECORD_SCRATCH`].
+#[cfg(feature = "tls")]
 const MAX_PLAINTEXT_PER_RECORD: usize = 16384;
 
 /// Fixed scratch capacity: one max-size plaintext record plus TLS framing
 /// overhead (content-type byte, AEAD tag, record header, and headroom).
 /// A `<=16 KiB` plaintext chunk always encrypts within this bound, so the
 /// scratch never grows and `write` allocates nothing per call.
+#[cfg(feature = "tls")]
 const TLS_RECORD_SCRATCH: usize = 16384 + 256;
 
 /// Guaranteed minimum spare read window past the inbound watermark. The staging
 /// buffer is sized so every socket read gets at least this many initialized
 /// bytes to read into (one max record, so a whole record is typically pulled in
 /// a single `read`) without a per-read zero-fill.
+#[cfg(feature = "tls")]
 const RECV_CHUNK: usize = 16384;
 
 /// The largest TLS record that can appear on the wire: RFC 8446 §5.2 caps
@@ -87,6 +98,7 @@ const RECV_CHUNK: usize = 16384;
 /// `rustls` rejects any record whose header claims more, so the unconsumed
 /// partial-record residue left in staging after a pump is always strictly less
 /// than this — the bound that lets the staging buffer be a fixed size.
+#[cfg(feature = "tls")]
 const MAX_CIPHERTEXT_RECORD: usize = 5 + 16384 + 256;
 
 /// Fixed inbound staging capacity, allocated and zero-filled EXACTLY ONCE per
@@ -96,6 +108,7 @@ const MAX_CIPHERTEXT_RECORD: usize = 5 + 16384 + 256;
 /// already-initialized spare region past the `staging_filled` watermark, so no
 /// per-read memset is ever needed and the buffer never reallocates in steady
 /// state.
+#[cfg(feature = "tls")]
 const STAGING_CAP: usize = MAX_CIPHERTEXT_RECORD + RECV_CHUNK;
 
 // The read window past the watermark is `staging[staging_filled..]`, and
@@ -104,7 +117,9 @@ const STAGING_CAP: usize = MAX_CIPHERTEXT_RECORD + RECV_CHUNK;
 // the spare window is always `> STAGING_CAP - MAX_CIPHERTEXT_RECORD ==
 // RECV_CHUNK > 0`: a socket read never gets an empty window (which would read as
 // a false EOF).
+#[cfg(feature = "tls")]
 const _: () = assert!(STAGING_CAP > MAX_CIPHERTEXT_RECORD);
+#[cfg(feature = "tls")]
 const _: () = assert!(STAGING_CAP - MAX_CIPHERTEXT_RECORD == RECV_CHUNK);
 
 // ===========================================================================
@@ -121,16 +136,23 @@ const _: () = assert!(STAGING_CAP - MAX_CIPHERTEXT_RECORD == RECV_CHUNK);
 #[derive(Debug)]
 pub enum TlsError<E> {
     /// The inner socket transport failed (connection reset, broken pipe, …).
+    ///
+    /// The ONLY variant present with the `tls` feature OFF: a plaintext `Wire`
+    /// error rides here, so a no-TLS build still has a single classified wire
+    /// error. Every other variant is a TLS-protocol classification, produced
+    /// only by the `tls`-gated transport, so it exists only when `tls` is on.
     Socket(E),
     /// `rustls` reported a TLS-protocol error: a handshake failure, a decrypt
     /// failure, a fatal alert from the peer, or a malformed record. The cause
     /// is carried verbatim; nothing is reclassified or swallowed.
+    #[cfg(feature = "tls")]
     Tls(rustls::Error),
     /// A record's ciphertext did not fit the fixed encrypt scratch and
     /// `rustls` requested a larger buffer than the bound permits. Structurally
     /// unreachable for the `<=16 KiB` chunks `write` produces, but surfaced as
     /// a classified error rather than an `unwrap`: a future `rustls` overhead
     /// change is a loud failure, never silent corruption.
+    #[cfg(feature = "tls")]
     RecordOversize {
         /// The output size `rustls` asked for, in bytes.
         required: usize,
@@ -138,18 +160,22 @@ pub enum TlsError<E> {
     /// `rustls` reported the encrypter is exhausted: the connection's
     /// sequence-number space or key schedule can encrypt no further records.
     /// A terminal state, surfaced rather than dropping the write.
+    #[cfg(feature = "tls")]
     EncryptExhausted,
     /// The inner socket accepted zero bytes for a non-empty ciphertext queue —
     /// a stalled or broken write side. Classified rather than spun on (an
     /// `Ok(0)` loop would never make progress).
+    #[cfg(feature = "tls")]
     WriteZero,
     /// The peer closed the connection before the TLS handshake completed
     /// (socket EOF mid-handshake). Distinct from a clean post-handshake close,
     /// which `read` reports as `Ok(0)`.
+    #[cfg(feature = "tls")]
     ClosedDuringHandshake,
     /// `rustls` surfaced a `ConnectionState` this client does not model.
     /// `ConnectionState` is `#[non_exhaustive]`; rather than a silent wildcard
     /// that drops the state, an unmodelled state is a loud classified error.
+    #[cfg(feature = "tls")]
     UnexpectedState,
 }
 
@@ -157,20 +183,26 @@ impl<E: fmt::Display> fmt::Display for TlsError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Socket(e) => write!(f, "TLS transport socket error: {e}"),
+            #[cfg(feature = "tls")]
             Self::Tls(e) => write!(f, "TLS protocol error: {e}"),
+            #[cfg(feature = "tls")]
             Self::RecordOversize { required } => write!(
                 f,
                 "TLS record exceeds the fixed encrypt scratch (required {required} bytes)"
             ),
+            #[cfg(feature = "tls")]
             Self::EncryptExhausted => {
                 write!(f, "TLS encrypter exhausted; no further records can be sent")
             }
+            #[cfg(feature = "tls")]
             Self::WriteZero => {
                 write!(f, "TLS socket accepted zero bytes for a non-empty ciphertext queue")
             }
+            #[cfg(feature = "tls")]
             Self::ClosedDuringHandshake => {
                 write!(f, "TLS peer closed the connection before the handshake completed")
             }
+            #[cfg(feature = "tls")]
             Self::UnexpectedState => {
                 write!(f, "TLS connection reached a state this client does not model")
             }
@@ -182,7 +214,9 @@ impl<E: std::error::Error + 'static> std::error::Error for TlsError<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Socket(e) => Some(e),
+            #[cfg(feature = "tls")]
             Self::Tls(e) => Some(e),
+            #[cfg(feature = "tls")]
             Self::RecordOversize { .. }
             | Self::EncryptExhausted
             | Self::WriteZero
@@ -196,6 +230,7 @@ impl<E: std::error::Error + 'static> std::error::Error for TlsError<E> {
 /// state-machine steps can produce, before any socket error is possible. Kept
 /// separate from the I/O-bearing variants so the sync core need not be generic
 /// over the inner error type; the async layer lifts it via [`From`].
+#[cfg(feature = "tls")]
 #[derive(Debug)]
 enum TlsStepError {
     Tls(rustls::Error),
@@ -204,6 +239,7 @@ enum TlsStepError {
     UnexpectedState,
 }
 
+#[cfg(feature = "tls")]
 impl<E> From<TlsStepError> for TlsError<E> {
     fn from(e: TlsStepError) -> Self {
         match e {
@@ -245,6 +281,7 @@ impl<E> From<TlsStepError> for TlsError<E> {
 /// Returns the `rustls::Error` from protocol-version selection if the ring
 /// provider somehow advertises no usable versions (it always does, so this is
 /// surfaced rather than `unwrap`ped).
+#[cfg(feature = "tls")]
 pub fn shared_client_config() -> Result<Arc<ClientConfig>, rustls::Error> {
     static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     if let Some(cfg) = CONFIG.get() {
@@ -271,7 +308,7 @@ fn default_roots() -> rustls::RootCertStore {
 /// no custom CA then fails CLOSED at the handshake (an empty trust-anchor set
 /// trusts no server certificate) — never a silent plaintext fallback. Such a
 /// consumer must supply roots through [`client_config_with_ca_roots`].
-#[cfg(not(feature = "webpki-roots"))]
+#[cfg(all(feature = "tls", not(feature = "webpki-roots")))]
 fn default_roots() -> rustls::RootCertStore {
     rustls::RootCertStore::empty()
 }
@@ -281,6 +318,7 @@ fn default_roots() -> rustls::RootCertStore {
 /// [`shared_client_config`] and the custom-CA [`client_config_with_ca_roots`],
 /// so the two paths cannot drift in provider, version policy, or client-auth
 /// posture.
+#[cfg(feature = "tls")]
 fn config_from_roots(
     roots: rustls::RootCertStore,
 ) -> Result<Arc<ClientConfig>, rustls::Error> {
@@ -298,6 +336,7 @@ fn config_from_roots(
 /// classified error, never a silent fallback to the baked roots or to
 /// plaintext. A driver lifts this to
 /// [`DriverError::Config`](crate::DriverError).
+#[cfg(feature = "tls")]
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CaRootsError {
@@ -318,6 +357,7 @@ pub enum CaRootsError {
     ProtocolVersions(rustls::Error),
 }
 
+#[cfg(feature = "tls")]
 impl fmt::Display for CaRootsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -335,6 +375,7 @@ impl fmt::Display for CaRootsError {
     }
 }
 
+#[cfg(feature = "tls")]
 impl std::error::Error for CaRootsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -363,6 +404,7 @@ impl std::error::Error for CaRootsError {
 /// [`CaRootsError::MalformedPem`] for an undecodable certificate body,
 /// [`CaRootsError::InvalidCertificate`] if `rustls` rejects a decoded cert as a
 /// trust anchor, and [`CaRootsError::NoCertificates`] if none is found.
+#[cfg(feature = "tls")]
 pub fn parse_ca_roots(pem: &[u8]) -> Result<rustls::RootCertStore, CaRootsError> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::CertificateDer;
@@ -396,6 +438,7 @@ pub fn parse_ca_roots(pem: &[u8]) -> Result<rustls::RootCertStore, CaRootsError>
 /// Any [`CaRootsError`] from parsing/validating the PEM, or from config
 /// assembly. Fail-closed: a bad or empty PEM is an error, never a fallback to
 /// the baked roots.
+#[cfg(feature = "tls")]
 pub fn client_config_with_ca_roots(pem: &[u8]) -> Result<Arc<ClientConfig>, CaRootsError> {
     let roots = parse_ca_roots(pem)?;
     config_from_roots(roots).map_err(CaRootsError::ProtocolVersions)
@@ -408,6 +451,7 @@ pub fn client_config_with_ca_roots(pem: &[u8]) -> Result<Arc<ClientConfig>, CaRo
 /// What one synchronous inbound state-machine step needs the async layer to do
 /// next. The byte movement (encode handshake output, decrypt records) has
 /// already happened in the owned buffers; this only signals the next I/O.
+#[cfg(feature = "tls")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pumped {
     /// `WriteTraffic` reached: the handshake is complete and no inbound
@@ -426,6 +470,7 @@ enum Pumped {
 /// Construct with [`TlsTransport::connect`], which drives the handshake to
 /// completion before returning a ready transport. Then drive it through the
 /// [`Transport`] quartet exactly like a plaintext socket.
+#[cfg(feature = "tls")]
 pub struct TlsTransport<Inner: Transport> {
     conn: UnbufferedClientConnection,
     inner: Inner,
@@ -452,6 +497,7 @@ pub struct TlsTransport<Inner: Transport> {
     scratch: Box<[u8; TLS_RECORD_SCRATCH]>,
 }
 
+#[cfg(feature = "tls")]
 impl<Inner: Transport> fmt::Debug for TlsTransport<Inner> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Buffer *contents* (plaintext + ciphertext) are deliberately omitted.
@@ -463,6 +509,7 @@ impl<Inner: Transport> fmt::Debug for TlsTransport<Inner> {
     }
 }
 
+#[cfg(feature = "tls")]
 impl<Inner: Transport> TlsTransport<Inner> {
     /// Establish a TLS session over an already-connected `inner` transport.
     ///
@@ -734,12 +781,14 @@ impl<Inner: Transport> TlsTransport<Inner> {
     }
 }
 
+#[cfg(feature = "tls")]
 impl<Inner: Transport> Drop for TlsTransport<Inner> {
     fn drop(&mut self) {
         self.scrub();
     }
 }
 
+#[cfg(feature = "tls")]
 impl<Inner: Transport> Transport for TlsTransport<Inner> {
     type Error = TlsError<Inner::Error>;
 
@@ -808,7 +857,10 @@ pub enum Wire<S: Transport> {
     /// Boxed: the TLS state (rustls connection + record buffers) dwarfs a bare
     /// socket, so boxing the rare TLS arm keeps `Wire` — and the `Engine` that
     /// embeds it — small for the plaintext common case. The deref is per
-    /// syscall, never per row.
+    /// syscall, never per row. Present only under the `tls` feature; with it off
+    /// there is no TLS arm to build, so `Wire` is plaintext-only (plus the
+    /// testkit fake) and this crate names no `rustls` type.
+    #[cfg(feature = "tls")]
     Tls(Box<TlsTransport<S>>),
     /// An in-memory fake PostgreSQL backend ([`crate::testkit::FakeTransport`]),
     /// plugged in behind this same seam for tests — no socket, no network.
@@ -835,6 +887,7 @@ impl<S: Transport> Wire<S> {
     #[inline]
     pub fn is_encrypted(&self) -> bool {
         match self {
+            #[cfg(feature = "tls")]
             Wire::Tls(_) => true,
             Wire::Plain(_) => false,
             #[cfg(feature = "testkit")]
@@ -854,6 +907,7 @@ impl<S: Transport> Transport for Wire<S> {
             // A socket-level error (either arm) is classified by the inner
             // transport; a TLS-protocol error is never a recoverable deadline.
             TlsError::Socket(inner) => S::is_would_block(inner),
+            #[cfg(feature = "tls")]
             TlsError::Tls(_)
             | TlsError::RecordOversize { .. }
             | TlsError::EncryptExhausted
@@ -872,6 +926,7 @@ impl<S: Transport> Transport for Wire<S> {
     async fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Result<usize, Self::Error> {
         match self {
             Wire::Plain(s) => s.read(buf).await.map_err(TlsError::Socket),
+            #[cfg(feature = "tls")]
             Wire::Tls(t) => t.read(buf).await,
             // The fake is infallible (`Infallible` error): the empty match
             // coerces the never type onto the shared error union, no fabricated
@@ -885,6 +940,7 @@ impl<S: Transport> Transport for Wire<S> {
     async fn write<'a>(&'a mut self, buf: &'a [u8]) -> Result<usize, Self::Error> {
         match self {
             Wire::Plain(s) => s.write(buf).await.map_err(TlsError::Socket),
+            #[cfg(feature = "tls")]
             Wire::Tls(t) => t.write(buf).await,
             #[cfg(feature = "testkit")]
             Wire::Fake(f) => f.write(buf).await.map_err(|e| match e {}),
@@ -895,6 +951,7 @@ impl<S: Transport> Transport for Wire<S> {
     async fn flush(&mut self) -> Result<(), Self::Error> {
         match self {
             Wire::Plain(s) => s.flush().await.map_err(TlsError::Socket),
+            #[cfg(feature = "tls")]
             Wire::Tls(t) => t.flush().await,
             #[cfg(feature = "testkit")]
             Wire::Fake(f) => f.flush().await.map_err(|e| match e {}),
@@ -905,6 +962,7 @@ impl<S: Transport> Transport for Wire<S> {
     async fn shutdown(&mut self) -> Result<(), Self::Error> {
         match self {
             Wire::Plain(s) => s.shutdown().await.map_err(TlsError::Socket),
+            #[cfg(feature = "tls")]
             Wire::Tls(t) => t.shutdown().await,
             #[cfg(feature = "testkit")]
             Wire::Fake(f) => f.shutdown().await.map_err(|e| match e {}),
@@ -926,6 +984,7 @@ impl<S: Transport> Transport for Wire<S> {
 /// into `out_buf`, decrypt application records into `plaintext`, and advance
 /// the staging cursor by every discarded byte. Returns when the connection
 /// reaches a state needing external action.
+#[cfg(feature = "tls")]
 fn pump_inbound(
     conn: &mut UnbufferedClientConnection,
     staging: &mut [u8],
@@ -998,6 +1057,7 @@ fn pump_inbound(
 /// Encrypt `plaintext` into `<=`one-record chunks, appending each ciphertext
 /// record to `out_buf`. The fixed `scratch` holds exactly one record, so it
 /// never grows.
+#[cfg(feature = "tls")]
 fn encrypt_app_data(
     conn: &mut UnbufferedClientConnection,
     plaintext: &[u8],
@@ -1053,6 +1113,7 @@ fn encrypt_app_data(
 
 /// Queue a `close_notify` alert record into `out_buf`, driving past any
 /// residual handshake/key-update output first.
+#[cfg(feature = "tls")]
 fn queue_close_notify(
     conn: &mut UnbufferedClientConnection,
     out_buf: &mut Vec<u8>,
@@ -1096,7 +1157,7 @@ fn queue_close_notify(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tls"))]
 mod ca_roots_tests {
     use super::{client_config_with_ca_roots, parse_ca_roots, CaRootsError};
 

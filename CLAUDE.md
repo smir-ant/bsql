@@ -353,5 +353,23 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `DriverError::Config`, never a fallback to the baked roots or plaintext.
 - The baked Mozilla CA bundle is behind the default-on `webpki-roots` feature
   (core → drivers → umbrella): a custom/pinned-CA-only consumer drops the
-  ~55-65 KB blob with `default-features = false`; with no roots and no custom CA,
-  TLS fails CLOSED at the handshake.
+  ~55-65 KB blob with `default-features = false, features = ["tls"]`; with no
+  roots and no custom CA, TLS fails CLOSED at the handshake.
+- The whole rustls-backed encrypted transport is behind the default-on `tls`
+  feature (core → drivers → umbrella; `webpki-roots` implies `tls`). With `tls`
+  OFF (`default-features = false`) the ENTIRE ring/rustls subtree — ring (the
+  single largest/longest-compiling runtime node), rustls, rustls-webpki,
+  rustls-pki-types, webpki-roots, untrusted, once_cell (7 crates; measured async
+  runtime graph 41 → 34, and a clean release build of the async driver ~11.7 s →
+  ~6.8 s) — is dropped and NOT compiled, for the common localhost / unix-socket /
+  trust-auth deployment that never negotiates TLS. FAIL-LOUD when off: the
+  `SslMode` / `ca_roots_pem` are runtime data (DSN / env / builder), so the guard
+  is a uniform runtime check at connect (in the driver's `build_tcp_wire`), not a
+  compile gate (a compile gate on the builder would leave the `PGSSLMODE=require`
+  DSN/env path an unchecked bypass): `SslMode::Require`, or a custom CA
+  (`with_ca_roots` / `sslrootcert` / `PGSSLROOTCERT`), is a classified
+  `DriverError::Config` at connect — NEVER a silent plaintext connect the consumer
+  believes is encrypted. `SslMode::Prefer` connects plaintext with the SSLRequest
+  probe compiled out, and `is_encrypted()` is then always `false`. The `tls`-off
+  fail-loud is witnessed by `bsql-postgres-sync`'s `tls_off_fail_loud` test
+  (`cargo test -p bsql-postgres-sync --no-default-features --test tls_off_fail_loud`).

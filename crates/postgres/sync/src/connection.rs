@@ -26,15 +26,25 @@
 
 use core::ops::ControlFlow;
 use core::str::FromStr;
+// `std::io` and the blocking `Read`/`Write` traits are named only by the
+// `tls`-gated SSLRequest probe + TLS-config path in `build_wire` (and
+// `lift_probe_io`); with `tls` off no probe is sent and none is used.
+#[cfg(feature = "tls")]
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use bsql_postgres_core::driver::{
-    lift_ca_roots_error, lift_conn_fail, lift_engine_error, lift_tls_error, Core, WireError,
-};
-use bsql_postgres_core::tls::{self, TlsTransport, Wire};
+use bsql_postgres_core::driver::{lift_conn_fail, lift_engine_error, Core, WireError};
+// The TLS handshake lifters + the SSLRequest probe + the rustls transport are
+// reached only from the `tls`-gated arm of `build_wire`; with `tls` off the probe
+// is compiled out and none of these are named. `WireError` (`= TlsError<io>`)
+// stays: it is the plaintext-or-TLS wire error either way.
+#[cfg(feature = "tls")]
+use bsql_postgres_core::driver::{lift_ca_roots_error, lift_tls_error};
+use bsql_postgres_core::tls::Wire;
+#[cfg(feature = "tls")]
+use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
     resolve_endpoint, validate_startup_params, ConnectConfig, DriverError, Endpoint, Notification,
     QueryResult, Row, Rows, SslMode, TypedNotification,
@@ -306,40 +316,71 @@ impl Connection {
         if matches!(sock, SyncSock::Unix(_)) || config.ssl_mode == SslMode::Disable {
             return Ok(Wire::Plain(SyncSocket::new(sock)));
         }
-        let ssl_bytes = bsql_postgres_core::ssl::ssl_request_bytes();
-        let mut tcp = sock;
-        // The armed connect-phase `connect_timeout` firing on a server silent on
-        // the `SSLRequest` probe byte is a connect-phase TIMEOUT, classified as
-        // such via `lift_probe_io`: the SAME class the async driver and the
-        // post-probe TLS handshake surface, so the two drivers agree. A bare `?`
-        // would instead map it to the generic `DriverError::Io(TimedOut)`. Every
-        // other io error keeps its real class.
-        Write::write_all(&mut tcp, ssl_bytes).map_err(lift_probe_io)?;
-        let mut response = [0u8; 1];
-        Read::read_exact(&mut tcp, &mut response).map_err(lift_probe_io)?;
-        match bsql_postgres_core::ssl::classify_ssl_response(response[0], config)? {
-            bsql_postgres_core::ssl::SslProbe::Accepted { server_name } => {
-                // Use the provider-explicit ring config; custom CA roots build a
-                // config verified against EXACTLY those roots, otherwise the shared
-                // default-roots config. A bad/empty custom PEM is a classified
-                // `Config` error — fail-closed, never a fallback.
-                let cfg = match config.ca_roots_pem() {
-                    Some(pem) => {
-                        tls::client_config_with_ca_roots(pem).map_err(lift_ca_roots_error)?
-                    }
-                    None => tls::shared_client_config().map_err(|e| {
-                        DriverError::Io(io::Error::other(format!("TLS config: {e}")))
-                    })?,
-                };
-                let socket = SyncSocket::new(tcp);
-                let tls = match engine::poll_once(TlsTransport::connect(socket, cfg, server_name)) {
-                    Ok(Ok(transport)) => transport,
-                    Ok(Err(e)) => return Err(lift_tls_error(e)),
-                    Err(SpuriousPending) => return Err(DriverError::SpuriousPending),
-                };
-                Ok(Wire::Tls(Box::new(tls)))
+        // A TCP socket with `ssl_mode` == `Prefer` or `Require` here.
+        //
+        // With `tls` OFF the client cannot negotiate TLS at all: `Require` or a
+        // custom CA is a FAIL-LOUD `DriverError::Config` at connect (never a
+        // silent plaintext connect the consumer believes is encrypted), and
+        // `Prefer` connects plaintext with the SSLRequest probe compiled out —
+        // `is_encrypted()` is then always `false`.
+        #[cfg(not(feature = "tls"))]
+        {
+            if config.ssl_mode == SslMode::Require {
+                return Err(DriverError::Config(
+                    "TLS support is not compiled in (the `tls` feature is off); \
+                     SslMode::Require cannot be honored — enable the `tls` feature, \
+                     or use SslMode::Prefer/Disable for a plaintext connection",
+                ));
             }
-            bsql_postgres_core::ssl::SslProbe::PlainTcp => Ok(Wire::Plain(SyncSocket::new(tcp))),
+            if config.ca_roots_pem().is_some() {
+                return Err(DriverError::Config(
+                    "TLS support is not compiled in (the `tls` feature is off); \
+                     custom CA roots (with_ca_roots / sslrootcert / PGSSLROOTCERT) \
+                     cannot be used — enable the `tls` feature",
+                ));
+            }
+            Ok(Wire::Plain(SyncSocket::new(sock)))
+        }
+        #[cfg(feature = "tls")]
+        {
+            let ssl_bytes = bsql_postgres_core::ssl::ssl_request_bytes();
+            let mut tcp = sock;
+            // The armed connect-phase `connect_timeout` firing on a server silent on
+            // the `SSLRequest` probe byte is a connect-phase TIMEOUT, classified as
+            // such via `lift_probe_io`: the SAME class the async driver and the
+            // post-probe TLS handshake surface, so the two drivers agree. A bare `?`
+            // would instead map it to the generic `DriverError::Io(TimedOut)`. Every
+            // other io error keeps its real class.
+            Write::write_all(&mut tcp, ssl_bytes).map_err(lift_probe_io)?;
+            let mut response = [0u8; 1];
+            Read::read_exact(&mut tcp, &mut response).map_err(lift_probe_io)?;
+            match bsql_postgres_core::ssl::classify_ssl_response(response[0], config)? {
+                bsql_postgres_core::ssl::SslProbe::Accepted { server_name } => {
+                    // Use the provider-explicit ring config; custom CA roots build a
+                    // config verified against EXACTLY those roots, otherwise the shared
+                    // default-roots config. A bad/empty custom PEM is a classified
+                    // `Config` error — fail-closed, never a fallback.
+                    let cfg = match config.ca_roots_pem() {
+                        Some(pem) => {
+                            tls::client_config_with_ca_roots(pem).map_err(lift_ca_roots_error)?
+                        }
+                        None => tls::shared_client_config().map_err(|e| {
+                            DriverError::Io(io::Error::other(format!("TLS config: {e}")))
+                        })?,
+                    };
+                    let socket = SyncSocket::new(tcp);
+                    let tls =
+                        match engine::poll_once(TlsTransport::connect(socket, cfg, server_name)) {
+                            Ok(Ok(transport)) => transport,
+                            Ok(Err(e)) => return Err(lift_tls_error(e)),
+                            Err(SpuriousPending) => return Err(DriverError::SpuriousPending),
+                        };
+                    Ok(Wire::Tls(Box::new(tls)))
+                }
+                bsql_postgres_core::ssl::SslProbe::PlainTcp => {
+                    Ok(Wire::Plain(SyncSocket::new(tcp)))
+                }
+            }
         }
     }
 
@@ -924,6 +965,10 @@ impl Drop for Connection {
 ///
 /// [`WouldBlock`]: io::ErrorKind::WouldBlock
 /// [`TimedOut`]: io::ErrorKind::TimedOut
+///
+/// Reached only from the `tls`-gated SSLRequest probe in `build_wire`; with `tls`
+/// off no probe is sent, so this helper is not compiled.
+#[cfg(feature = "tls")]
 fn lift_probe_io(e: io::Error) -> DriverError {
     match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => DriverError::Timeout,

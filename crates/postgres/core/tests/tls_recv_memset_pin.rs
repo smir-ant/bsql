@@ -1,3 +1,6 @@
+// The guard targets the rustls-backed `TlsTransport` read path, which exists
+// only under the `tls` feature; with TLS off this test binary is empty.
+#![cfg(feature = "tls")]
 //! Static source-guard: the TLS inbound read path performs NO per-read memset.
 //!
 //! # The blind spot this gate closes

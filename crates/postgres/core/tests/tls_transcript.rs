@@ -1,3 +1,6 @@
+// The whole gate targets the rustls-backed `TlsTransport`, which exists only
+// under the `tls` feature; with TLS off this test binary is empty (no tests).
+#![cfg(feature = "tls")]
 //! Scripted-TLS transcript gate for [`bsql_postgres_core::tls::TlsTransport`].
 //!
 //! Drives the production `TlsTransport` (a real `rustls::unbuffered` client)

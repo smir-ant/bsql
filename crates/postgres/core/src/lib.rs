@@ -25,6 +25,11 @@ pub mod n1;
 // and the sink adapter that captures every surfaced notification into it.
 pub mod notify;
 pub mod sql_ident;
+// The PostgreSQL `SSLRequest` probe + response classifier. TLS-only: with the
+// `tls` feature OFF the probe is never sent (the driver connects plaintext
+// directly) and this module — which names `rustls` server-name types — is not
+// compiled.
+#[cfg(feature = "tls")]
 pub mod ssl;
 // The in-memory fake PostgreSQL backend behind the engine's transport seam.
 // Feature-gated OFF by default so the real transport path — and the shipped

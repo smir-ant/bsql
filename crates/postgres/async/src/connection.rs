@@ -23,19 +23,30 @@
 use core::future::Future;
 use core::ops::ControlFlow;
 use core::str::FromStr;
-use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+// `std::io` and the tokio read/write extension traits are named only by the
+// `tls`-gated SSLRequest probe + TLS-config path in `build_tcp_wire`; with `tls`
+// off no probe is sent and neither is used.
+#[cfg(feature = "tls")]
+use std::io;
+#[cfg(feature = "tls")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::Instant;
 
-use bsql_postgres_core::driver::{
-    lift_ca_roots_error, lift_conn_fail, lift_engine_error, lift_tls_error, Core,
-};
+use bsql_postgres_core::driver::{lift_conn_fail, lift_engine_error, Core};
+// The TLS handshake lifters + the SSLRequest probe + the rustls transport are
+// reached only from the `tls`-gated arm of `build_tcp_wire`; with `tls` off the
+// probe is compiled out and none of these are named.
+#[cfg(feature = "tls")]
+use bsql_postgres_core::driver::{lift_ca_roots_error, lift_tls_error};
+#[cfg(feature = "tls")]
 use bsql_postgres_core::ssl::SslProbe;
-use bsql_postgres_core::tls::{self, TlsTransport, Wire};
+use bsql_postgres_core::tls::Wire;
+#[cfg(feature = "tls")]
+use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
     resolve_endpoint, validate_startup_params, ConnectConfig, DriverError, Endpoint, Notification,
     QueryResult, Row, Rows, SslMode, TypedNotification,
@@ -278,35 +289,67 @@ impl Connection {
                 Arc::clone(deadline),
             )));
         }
-        let ssl_bytes = bsql_postgres_core::ssl::ssl_request_bytes();
-        let mut tcp = tcp;
-        tcp.write_all(ssl_bytes).await?;
-        let mut response = [0u8; 1];
-        tcp.read_exact(&mut response).await?;
-        match bsql_postgres_core::ssl::classify_ssl_response(response[0], config)? {
-            SslProbe::Accepted { server_name } => {
-                // Use the provider-explicit ring config (the workspace pins rustls
-                // to ring only). Custom CA roots build a config verified against
-                // EXACTLY those roots; otherwise the shared default-roots config. A
-                // bad/empty custom PEM is a classified `Config` error — fail-closed.
-                let cfg = match config.ca_roots_pem() {
-                    Some(pem) => {
-                        tls::client_config_with_ca_roots(pem).map_err(lift_ca_roots_error)?
-                    }
-                    None => tls::shared_client_config().map_err(|e| {
-                        DriverError::Io(io::Error::other(format!("TLS config: {e}")))
-                    })?,
-                };
-                let socket = TokioSocket::new(Sock::Tcp(tcp), Arc::clone(deadline));
-                let tls = TlsTransport::connect(socket, cfg, server_name)
-                    .await
-                    .map_err(lift_tls_error)?;
-                Ok(Wire::Tls(Box::new(tls)))
+        // `ssl_mode` is `Prefer` or `Require` here.
+        //
+        // With `tls` OFF the client cannot negotiate TLS at all: `Require` or a
+        // custom CA is a FAIL-LOUD `DriverError::Config` at connect (never a
+        // silent plaintext connect the consumer believes is encrypted), and
+        // `Prefer` connects plaintext with the SSLRequest probe compiled out
+        // (nothing to negotiate) — `is_encrypted()` is then always `false`.
+        #[cfg(not(feature = "tls"))]
+        {
+            if config.ssl_mode == SslMode::Require {
+                return Err(DriverError::Config(
+                    "TLS support is not compiled in (the `tls` feature is off); \
+                     SslMode::Require cannot be honored — enable the `tls` feature, \
+                     or use SslMode::Prefer/Disable for a plaintext connection",
+                ));
             }
-            SslProbe::PlainTcp => Ok(Wire::Plain(TokioSocket::new(
+            if config.ca_roots_pem().is_some() {
+                return Err(DriverError::Config(
+                    "TLS support is not compiled in (the `tls` feature is off); \
+                     custom CA roots (with_ca_roots / sslrootcert / PGSSLROOTCERT) \
+                     cannot be used — enable the `tls` feature",
+                ));
+            }
+            Ok(Wire::Plain(TokioSocket::new(
                 Sock::Tcp(tcp),
                 Arc::clone(deadline),
-            ))),
+            )))
+        }
+        #[cfg(feature = "tls")]
+        {
+            let ssl_bytes = bsql_postgres_core::ssl::ssl_request_bytes();
+            let mut tcp = tcp;
+            tcp.write_all(ssl_bytes).await?;
+            let mut response = [0u8; 1];
+            tcp.read_exact(&mut response).await?;
+            match bsql_postgres_core::ssl::classify_ssl_response(response[0], config)? {
+                SslProbe::Accepted { server_name } => {
+                    // Use the provider-explicit ring config (the workspace pins
+                    // rustls to ring only). Custom CA roots build a config verified
+                    // against EXACTLY those roots; otherwise the shared default-roots
+                    // config. A bad/empty custom PEM is a classified `Config` error —
+                    // fail-closed.
+                    let cfg = match config.ca_roots_pem() {
+                        Some(pem) => {
+                            tls::client_config_with_ca_roots(pem).map_err(lift_ca_roots_error)?
+                        }
+                        None => tls::shared_client_config().map_err(|e| {
+                            DriverError::Io(io::Error::other(format!("TLS config: {e}")))
+                        })?,
+                    };
+                    let socket = TokioSocket::new(Sock::Tcp(tcp), Arc::clone(deadline));
+                    let tls = TlsTransport::connect(socket, cfg, server_name)
+                        .await
+                        .map_err(lift_tls_error)?;
+                    Ok(Wire::Tls(Box::new(tls)))
+                }
+                SslProbe::PlainTcp => Ok(Wire::Plain(TokioSocket::new(
+                    Sock::Tcp(tcp),
+                    Arc::clone(deadline),
+                ))),
+            }
         }
     }
 

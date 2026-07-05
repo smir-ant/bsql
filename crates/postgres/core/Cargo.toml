@@ -7,21 +7,41 @@ description = "Shared types and Session for bsql PostgreSQL drivers (async + syn
 license = "MIT OR Apache-2.0"
 
 [features]
-# DEFAULT-ON. The baked Mozilla roots are the out-of-the-box trust anchors; a
-# consumer that verifies only against a pinned/custom CA can drop them with
-# `default-features = false`.
-default = ["webpki-roots"]
+# DEFAULT-ON. The `tls` subtree (rustls + ring + webpki-*) and the baked Mozilla
+# roots are the out-of-the-box encrypted transport; a localhost / unix-socket /
+# trust-auth deployment that never does TLS drops the ENTIRE ring/rustls subtree
+# with `default-features = false`.
+default = ["tls", "webpki-roots"]
+
+# `tls` — the rustls-backed encrypted transport: the whole `tls` module
+# (`TlsTransport`, `shared_client_config`, the custom-CA parsers), the `ssl`
+# SSLRequest-probe module, and the `Wire::Tls` arm. DEFAULT-ON. With it OFF
+# (`default-features = false`) the entire ring/rustls dependency subtree — ring
+# (the single largest/longest-compiling runtime node), rustls, rustls-webpki,
+# rustls-pki-types, webpki-roots, untrusted, once_cell — is dropped and NOT
+# compiled, for the common localhost / unix-socket / trust-auth deployment that
+# never negotiates TLS. Fail-loud when OFF: a connect that sets
+# `SslMode::Require` or supplies a custom CA (`with_ca_roots` / `sslrootcert` /
+# `PGSSLROOTCERT`) is a classified `DriverError::Config` at connect (the driver's
+# `build_tcp_wire`), NEVER a silent plaintext connect the consumer thinks is
+# encrypted; `SslMode::Prefer` connects plaintext with the SSLRequest probe
+# compiled out, and `is_encrypted()` is then always `false`. Optional dep, so the
+# golden lock is unchanged (Cargo.lock unions all optional deps; `deps_pin` stays
+# green).
+tls = ["dep:rustls"]
 
 # `webpki-roots` — bake the Mozilla CA trust anchors (`TLS_SERVER_ROOTS`, ~55-65
 # KB of DER) into the default client TLS root store (`tls::shared_client_config`).
-# DEFAULT-ON so a public-CA PostgreSQL server verifies out of the box. A consumer
-# that verifies ONLY against a pinned/custom CA (`ConnectConfig::with_ca_roots` /
-# the `sslrootcert` DSN key) or the system store can drop the baked blob with
-# `default-features = false`; with no baked roots AND no custom CA, a TLS connect
-# then fails CLOSED at the handshake (an empty trust-anchor set trusts no server
-# cert), never a silent plaintext downgrade. Optional dep, so the golden lock is
-# unchanged (Cargo.lock unions all optional deps; `deps_pin` stays green).
-webpki-roots = ["dep:webpki-roots"]
+# DEFAULT-ON so a public-CA PostgreSQL server verifies out of the box. IMPLIES
+# `tls` (baked roots without the rustls transport are meaningless — the store is
+# consumed only by `tls::shared_client_config`). A consumer that verifies ONLY
+# against a pinned/custom CA (`ConnectConfig::with_ca_roots` / the `sslrootcert`
+# DSN key) or the system store can drop the baked blob while keeping TLS with
+# `default-features = false, features = ["tls"]`; with no baked roots AND no
+# custom CA, a TLS connect then fails CLOSED at the handshake (an empty
+# trust-anchor set trusts no server cert), never a silent plaintext downgrade.
+# Optional dep, so the golden lock is unchanged (`deps_pin` stays green).
+webpki-roots = ["tls", "dep:webpki-roots"]
 
 # `testkit` — the in-memory fake PostgreSQL backend (`testkit::FakeTransport`)
 # plus the `Wire::Fake` arm that plugs it behind the engine's transport seam.
@@ -41,7 +61,13 @@ n1-detect = []
 
 [dependencies]
 bsql-postgres-proto = { path = "../proto" }
-rustls = { workspace = true }
+# `rustls` — OPTIONAL, behind the default-on `tls` feature. The pure-Rust TLS
+# stack (ring provider) the `tls` / `ssl` modules build on. With `tls` OFF the
+# whole rustls + ring subtree is neither resolved into a runtime graph nor
+# compiled. Optional dep → the golden lock is unchanged (Cargo.lock unions all
+# optional deps; `deps_pin` stays green — it pins the resolved SET, which the
+# all-features union already contains).
+rustls = { workspace = true, optional = true }
 # `webpki-roots` 1.0 ships the Mozilla CA root bundle as the
 # `TLS_SERVER_ROOTS` slice consumed in `src/tls.rs`. The 0.26 line is a
 # thin re-export shim over 1.0.x, so depending on 0.26 dragged BOTH

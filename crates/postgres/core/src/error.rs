@@ -125,6 +125,13 @@ pub enum DriverError {
     Db(Box<DbError>),
     Io(std::io::Error),
     NotReady,
+    /// The server refused SSL while the connection required it
+    /// (`SslMode::Require`). Produced only by the TLS SSLRequest probe, so it
+    /// exists only under the `tls` feature — with TLS compiled out the probe is
+    /// never sent (a `Require`/custom-CA connect is instead a fail-loud
+    /// [`DriverError::Config`] before any probe), so this classification can
+    /// never occur and is not present.
+    #[cfg(feature = "tls")]
     SslRefused,
     NoRows,
     Config(&'static str),
@@ -234,6 +241,7 @@ impl fmt::Display for DriverError {
             Self::Db(e) => write!(f, "{e}"),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::NotReady => write!(f, "connection not ready"),
+            #[cfg(feature = "tls")]
             Self::SslRefused => write!(f, "server refused SSL"),
             Self::NoRows => write!(f, "query returned no rows"),
             Self::Config(msg) => write!(f, "config error: {msg}"),
@@ -268,8 +276,12 @@ impl std::error::Error for DriverError {
             Self::Io(e) => Some(e),
             Self::Decode(e) => Some(e),
             Self::Column(e) => Some(e),
+            // TLS-only classification: a separate gated arm so the `|`-chain
+            // below is feature-independent (a single alternative cannot itself
+            // be `#[cfg]`-gated).
+            #[cfg(feature = "tls")]
+            Self::SslRefused => None,
             Self::NotReady
-            | Self::SslRefused
             | Self::NoRows
             | Self::Config(_)
             | Self::RowTooLarge

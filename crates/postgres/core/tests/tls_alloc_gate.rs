@@ -1,3 +1,6 @@
+// The whole gate targets the rustls-backed `TlsTransport`, which exists only
+// under the `tls` feature; with TLS off this test binary is empty (no tests).
+#![cfg(feature = "tls")]
 //! Allocation gate for [`bsql_postgres_core::tls::TlsTransport`].
 //!
 //! Installs the workspace counting allocator as this binary's

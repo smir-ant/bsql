@@ -63,7 +63,10 @@ use bsql_postgres_proto::{
 
 use crate::materialize::{self, ResultCollector};
 use crate::sql_ident::{self, SafeIdent, SafeTable};
-use crate::tls::{CaRootsError, TlsError, Wire};
+use crate::tls::{TlsError, Wire};
+// `CaRootsError` names a rustls parse failure, so it exists only under `tls`.
+#[cfg(feature = "tls")]
+use crate::tls::CaRootsError;
 use crate::{
     capture_notify, DbError, DbErrorSink, DriverError, Notification, NotificationLedger,
     QueryResult, Rows, RowsBuilder,
@@ -1344,13 +1347,19 @@ pub fn lift_tls_error(e: WireError) -> DriverError {
             _ => DriverError::Io(io),
         },
         // Preserve the TLS error verbatim as the source of a classified I/O error.
+        // Only the `Socket` arm exists with `tls` off (every TLS-protocol variant
+        // is `tls`-gated on `TlsError`), so this catch-all is reachable — and
+        // needed — only under `tls`.
+        #[cfg(feature = "tls")]
         other => DriverError::Io(io::Error::other(other)),
     }
 }
 
 /// Lift a custom-CA-roots build failure to a classified [`DriverError::Config`] —
 /// fail-closed: a bad or empty CA PEM aborts the connect, never a silent fallback
-/// to the default roots. `#[doc(hidden)]`: used by each driver's connect.
+/// to the default roots. `#[doc(hidden)]`: used by each driver's connect. Present
+/// only under `tls`: `CaRootsError` names a rustls parse failure.
+#[cfg(feature = "tls")]
 #[doc(hidden)]
 #[must_use]
 pub fn lift_ca_roots_error(e: CaRootsError) -> DriverError {
