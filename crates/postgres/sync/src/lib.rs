@@ -31,8 +31,8 @@ mod pool;
 mod transport;
 
 pub use bsql_postgres_core::{
-    ColumnError, ConnectConfig, DbError, DriverError, Notification, QueryResult, Row, Rows,
-    SafeIdent, SafeTable, SslMode, TypedNotification,
+    ColumnError, ConnectConfig, DbError, DriverError, Notification, ParamsWriter, QueryResult,
+    Row, Rows, SafeIdent, SafeTable, SslMode, TypedNotification,
 };
 
 pub use connection::{Connection, CopyInWriter, PreparedStatement, Transaction};

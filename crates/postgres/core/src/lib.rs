@@ -61,3 +61,8 @@ pub use notify::{capture_notify, NotificationLedger, TypedNotification};
 pub use sql_ident::{SafeIdent, SafeTable};
 pub use typed_rows::{Rows, RowsBuilder};
 pub use types::{ArenaBuilder, ArenaSealError, Notification, QueryResult, Row, RowSet};
+
+/// The sealed parameter-encoding contract every `*_params` / typed verb takes
+/// (`&(a, b)` tuples up to arity 16). Re-exported so a consumer can write a
+/// generic helper — `fn run<P: ParamsWriter>(…)` — without a direct proto dep.
+pub use bsql_postgres_proto::ParamsWriter;

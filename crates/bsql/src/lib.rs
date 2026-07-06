@@ -176,7 +176,9 @@ pub use bsql_query_macros::query;
 /// driver's typed-query entry points execute a `query!` carrier through
 /// these.
 #[cfg(feature = "macros")]
-pub use bsql_postgres_proto::{DecodeError, PreparedQuery, QueryFingerprint, TypedQuery};
+pub use bsql_postgres_proto::{
+    DecodeError, ParamsWriter, PreparedQuery, QueryFingerprint, TypedQuery,
+};
 
 /// Dependency-free bsql-native types a `query!` record field carries for a
 /// PostgreSQL `uuid` / `timestamptz` / `timestamp` / `date` / `time` /
