@@ -78,6 +78,13 @@ harness = false
 name = "dynamic_oneshot"
 harness = false
 
+# bsql-only round-trip delta: the deferred-BEGIN transaction fusion (D2) — a
+# one-statement transaction fused into 2 round trips vs the manual
+# BEGIN; stmt; COMMIT 3-flush sequence.
+[[bench]]
+name = "tx_fusion"
+harness = false
+
 # Peak-RSS harnesses — one binary per client so each measured process links and
 # faults in ONLY that client's code (a single arg-selected binary would leave
 # the other clients' code linked-but-cold, muddying the resident figure).
