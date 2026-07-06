@@ -1157,7 +1157,22 @@ impl<'b, T: Transport> Engine<'b, T> {
     ///
     /// As [`simple_query`](Self::simple_query) (`FrameTooLong` covers an oversize
     /// COPY command; a transport fault while flushing is fatal).
-    pub async fn copy_in_begin(&mut self, sql: &str) -> Result<(), EngineError<T::Error>> {
+    ///
+    /// `sink` is threaded ONLY to the fused-prelude drain (a deferred `BEGIN` when a
+    /// COPY is a transaction's FIRST statement): the COPY command's own reply is not
+    /// read here (see above), but the prelude's `CommandComplete` + `ReadyForQuery`
+    /// are — and a `NOTIFY` / `NOTICE` / `ParameterStatus` riding that reply must
+    /// reach the driver's capture ledger like every other first statement, so the
+    /// driver passes its real capture sink (never a silent drop). With no prelude
+    /// pending the sink is untouched.
+    pub async fn copy_in_begin<S>(
+        &mut self,
+        sql: &str,
+        mut sink: S,
+    ) -> Result<(), EngineError<T::Error>>
+    where
+        S: FnMut(Surface<'_>) -> ControlFlow<Never>,
+    {
         let Self {
             transport,
             phase,
@@ -1175,14 +1190,13 @@ impl<'b, T: Transport> Engine<'b, T> {
         super::flush::flush(send_buf, transport).await?;
         // Drain a fused prelude's response (e.g. a deferred BEGIN) NOW, so the COPY
         // stream that follows starts at the COPY command's own reply, not the
-        // prelude's `CommandComplete` + `ReadyForQuery`. Swallow-only: a
-        // COPY-first transaction body has no caller sink here, so a NOTIFY riding
-        // the prelude is dropped (a rare COPY-first-in-transaction edge; the COPY's
-        // own stream carries no notification path either).
+        // prelude's `CommandComplete` + `ReadyForQuery`. The caller's `sink` (the
+        // driver's capture adapter) surfaces a NOTIFY / NOTICE / ParameterStatus
+        // riding the prelude into the ledger — the no-drop guarantee every other
+        // first statement gets — while the prelude's own frames are swallowed.
         if active.draining_prelude() {
             core::hint::cold_path();
-            let mut swallow = noop_sink;
-            super::pump::drain_fused_prelude(active, transport, &mut swallow).await?;
+            super::pump::drain_fused_prelude(active, transport, &mut sink).await?;
         }
         Ok(())
     }

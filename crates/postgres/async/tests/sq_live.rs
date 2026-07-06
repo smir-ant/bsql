@@ -936,7 +936,7 @@ async fn transaction_commit_and_recoverable_rollback() {
     c.close().await.expect("close");
 }
 
-/// The deferred-BEGIN FUSION correctness path (D2), end-to-end over real PG on the
+/// The deferred-BEGIN FUSION correctness path, end-to-end over real PG on the
 /// async driver: an EMPTY transaction still opens+closes a real transaction, a
 /// transaction whose FIRST statement is the EXTENDED protocol (`query_params`,
 /// one-round-trip) fuses BEGIN into that statement and commits its effect, and a

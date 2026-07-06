@@ -197,7 +197,7 @@ fn copy_in_batches_writes_and_preserves_every_frame() {
     // exchange (a tagged-frame stream the parser can walk).
     recorded.lock().expect("recorder lock").clear();
 
-    poll_once(engine.copy_in_begin("COPY t FROM STDIN"))
+    poll_once(engine.copy_in_begin("COPY t FROM STDIN", |_s| ControlFlow::Continue(())))
         .expect("poll")
         .expect("begin");
 

@@ -44,7 +44,7 @@ use bsql_postgres_proto::action::TxStatus;
 use bsql_postgres_proto::engine::{poll_once, session, Surface, Transport};
 use bsql_postgres_proto::wire::{
     TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_COMMAND_COMPLETE, TAG_DATA_ROW,
-    TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
+    TAG_NOTIFICATION_RESPONSE, TAG_READY_FOR_QUERY, TAG_ROW_DESCRIPTION,
 };
 use bsql_postgres_proto::{Credentials, Ident};
 
@@ -105,6 +105,15 @@ fn row_description_one(name: &str, oid: i32) -> Vec<u8> {
     body.extend_from_slice(&(-1_i32).to_be_bytes());
     body.extend_from_slice(&0_i16.to_be_bytes()); // text format
     frame(TAG_ROW_DESCRIPTION.byte(), &body)
+}
+
+fn notification(pid: i32, channel: &str, payload: &str) -> Vec<u8> {
+    let mut body = pid.to_be_bytes().to_vec();
+    body.extend_from_slice(channel.as_bytes());
+    body.push(0);
+    body.extend_from_slice(payload.as_bytes());
+    body.push(0);
+    frame(TAG_NOTIFICATION_RESPONSE.byte(), &body)
 }
 
 fn data_row_one(cell: &[u8]) -> Vec<u8> {
@@ -398,6 +407,60 @@ fn clear_command_prelude_discards_a_stranded_prelude() {
         );
     })
     .expect("session");
+}
+
+/// COPY-first-in-transaction NO-DROP LEDGER guarantee: when a `COPY` is a
+/// transaction's FIRST statement, `copy_in_begin` drains the fused `BEGIN` reply
+/// directly (it flushes without a pump). A `NOTIFY` riding that reply must still be
+/// captured — threaded through the driver's capture sink — exactly like every
+/// non-COPY first statement, never silently consumed.
+#[test]
+fn copy_first_fused_begin_captures_a_notify_riding_the_prelude() {
+    // Handshake, then the fused BEGIN's reply with a NOTIFY riding it. The COPY's
+    // own CopyInResponse is NOT read by copy_in_begin (optimistic write-ahead), so
+    // the script ends at the BEGIN's ReadyForQuery.
+    let inbound = concat(&[
+        handshake(),
+        notification(4321, "chan", "payload-during-begin"),
+        command_complete("BEGIN"),
+        rfq(b'T'),
+    ]);
+
+    let (server, _writes) = counting_server(inbound);
+    let user = Ident::try_from_str("bsql_fusion").expect("user");
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap = Arc::clone(&captured);
+    session(server, &user, None, &[], Credentials::Trust, |mut engine, live| {
+        // copy_in_begin is token-less at the engine layer; the handshake token
+        // (the driver would hold it across the streaming writes) is unused here and
+        // falls out of scope as a statement value (a ZST, no must_use).
+        poll_once(engine.connect(live)).expect("single poll").expect("handshake");
+
+        // Arm the deferred BEGIN as a COPY-first transaction body would, then open
+        // the COPY — its fused-prelude drain must surface the riding NOTIFY.
+        engine.defer_command_prelude("BEGIN");
+        poll_once(engine.copy_in_begin("COPY t FROM STDIN", |s: Surface<'_>| {
+            if let Surface::Notify(body) = s {
+                cap.lock().expect("lock").push(String::from_utf8_lossy(body).into_owned());
+            }
+            ControlFlow::Continue(())
+        }))
+        .expect("single poll")
+        .expect("copy_in_begin");
+    })
+    .expect("session");
+
+    let got = captured.lock().expect("lock");
+    assert_eq!(
+        got.len(),
+        1,
+        "the NOTIFY riding the fused BEGIN reply was captured, not dropped"
+    );
+    assert!(
+        got[0].contains("payload-during-begin"),
+        "the captured notification carries its payload: {:?}",
+        got[0]
+    );
 }
 
 // ─────────────────────────── LIVE flush-count witness ───────────────────

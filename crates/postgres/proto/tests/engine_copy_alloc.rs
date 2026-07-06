@@ -185,7 +185,7 @@ fn copy_in_write_bounded_buffer_zero_alloc_and_passthrough() {
     // ---- Warm-up cycle (UNTIMED): grows the send buffer to its bounded
     // steady-state capacity (crosses the threshold, so the buffer reaches the
     // same peak the measured cycles will), then a full begin+write+finish. ----
-    poll_once(engine.copy_in_begin("COPY t FROM STDIN"))
+    poll_once(engine.copy_in_begin("COPY t FROM STDIN", |_s| ControlFlow::Continue(())))
         .expect("poll")
         .expect("warm begin");
     for _ in 0..WARM {
@@ -199,7 +199,7 @@ fn copy_in_write_bounded_buffer_zero_alloc_and_passthrough() {
     };
 
     // ---- Measured-SMALL: bracket ONLY the SMALL write loop. ----
-    poll_once(engine.copy_in_begin("COPY t FROM STDIN"))
+    poll_once(engine.copy_in_begin("COPY t FROM STDIN", |_s| ControlFlow::Continue(())))
         .expect("poll")
         .expect("small begin");
     let before_small = ALLOC.snapshot();
@@ -215,7 +215,7 @@ fn copy_in_write_bounded_buffer_zero_alloc_and_passthrough() {
     };
 
     // ---- Measured-LARGE: bracket ONLY the LARGE write loop. ----
-    poll_once(engine.copy_in_begin("COPY t FROM STDIN"))
+    poll_once(engine.copy_in_begin("COPY t FROM STDIN", |_s| ControlFlow::Continue(())))
         .expect("poll")
         .expect("large begin");
     let before_large = ALLOC.snapshot();
@@ -233,7 +233,7 @@ fn copy_in_write_bounded_buffer_zero_alloc_and_passthrough() {
     // ---- Measured BIG-CHUNK passthrough: bracket ONLY the single large-chunk
     // write. It must allocate NOTHING — the borrowed body is streamed directly,
     // never copied into the (far smaller) send buffer. ----
-    poll_once(engine.copy_in_begin("COPY t FROM STDIN"))
+    poll_once(engine.copy_in_begin("COPY t FROM STDIN", |_s| ControlFlow::Continue(())))
         .expect("poll")
         .expect("big begin");
     let before_big = ALLOC.snapshot();

@@ -1119,7 +1119,19 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     #[doc(hidden)]
     pub async fn copy_in_begin(&mut self, sql: &str) -> Result<Live<'static>, DriverError> {
         let live = self.take_live()?;
-        match self.engine.copy_in_begin(sql).await {
+        // Thread the capture adapter into the engine's fused-prelude drain (a
+        // deferred BEGIN when this COPY is a transaction's FIRST statement): a
+        // NOTIFY riding the prelude's reply is buffered into the ledger — the same
+        // no-drop guarantee `copy_in_finish` / `copy_in_abort` give — rather than
+        // silently consumed. With no prelude pending the sink is never called.
+        let outcome = self
+            .engine
+            .copy_in_begin(
+                sql,
+                capture_notify(&mut self.notifications, |_s: Surface<'_>| ControlFlow::Continue(())),
+            )
+            .await;
+        match outcome {
             Ok(()) => Ok(live),
             Err(e) => Err(lift_engine_error(e)),
         }

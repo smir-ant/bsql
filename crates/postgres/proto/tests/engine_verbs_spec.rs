@@ -1333,7 +1333,7 @@ fn copy_in_streams_data_and_completes() {
         let mut cap = Cap::default();
         // begin + per-chunk writes + finish — the streaming trio. `begin` and the
         // writes are token-less; `copy_in_finish` returns the token.
-        poll_once(e.copy_in_begin("COPY t FROM STDIN"))
+        poll_once(e.copy_in_begin("COPY t FROM STDIN", |_s| ControlFlow::Continue(())))
             .expect("poll")
             .expect("begin");
         poll_once(e.copy_in_write(b"row1\n"))
@@ -1362,7 +1362,7 @@ fn copy_in_abort_sends_copy_fail_and_recovers() {
     ]);
     let (status, fails) = run(script, |e, live| {
         let mut cap = Cap::default();
-        poll_once(e.copy_in_begin("COPY t FROM STDIN"))
+        poll_once(e.copy_in_begin("COPY t FROM STDIN", |_s| ControlFlow::Continue(())))
             .expect("poll")
             .expect("begin");
         poll_once(e.copy_in_write(b"partial"))

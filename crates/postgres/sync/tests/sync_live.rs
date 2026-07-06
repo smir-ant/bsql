@@ -698,7 +698,7 @@ fn transaction_closure() {
     c.close().expect("close");
 }
 
-/// The deferred-BEGIN FUSION correctness path (D2), end-to-end over real PG:
+/// The deferred-BEGIN FUSION correctness path, end-to-end over real PG:
 /// an EMPTY transaction still opens+closes a real transaction, a transaction whose
 /// FIRST statement is the EXTENDED protocol (`query_params`, one-round-trip) fuses
 /// BEGIN into that statement and commits its effect, and a rollback of such a body
