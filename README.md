@@ -266,7 +266,7 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 1939** — every `#[test]` / `#[tokio::test]` attribute:
+- **Test functions: 1950** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
   find . -path ./target -prune -o -path ./.claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
@@ -286,7 +286,7 @@ The numbers therefore cannot silently rot.
       "$(find "$d/src" -name '*.rs' -exec cat {} + | wc -l)"
   done
   # bsql 914 · proto 27886 · core 9236 · async 1743 · sync 1575
-  # sqlite/driver 995 · testkit 1005 · build 34719 · query-macros 1929
+  # sqlite/driver 1642 · testkit 1005 · build 34719 · query-macros 1929
   ```
 
 ## Sources of truth

@@ -32,13 +32,13 @@ fn query_rows() {
     conn.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')").expect("insert");
 
     let result = conn.query("SELECT id, name FROM t ORDER BY id").expect("select");
-    assert_eq!(result.column_count, 2);
-    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.column_count(), 2);
+    assert_eq!(result.len(), 2);
 
-    assert_eq!(result.rows[0].get::<i32>(0).expect("id0"), 1);
-    assert_eq!(result.rows[0].get::<&str>(1).expect("name0"), "alice");
-    assert_eq!(result.rows[1].get::<i32>(0).expect("id1"), 2);
-    assert_eq!(result.rows[1].get::<&str>(1).expect("name1"), "bob");
+    assert_eq!(result.get(0).expect("row 0").get::<i32>(0).expect("id0"), 1);
+    assert_eq!(result.get(0).expect("row 0").get::<&str>(1).expect("name0"), "alice");
+    assert_eq!(result.get(1).expect("row 1").get::<i32>(0).expect("id1"), 2);
+    assert_eq!(result.get(1).expect("row 1").get::<&str>(1).expect("name1"), "bob");
 }
 
 #[test]
@@ -47,10 +47,13 @@ fn query_with_params() {
     conn.execute("CREATE TABLE t(id INTEGER, v TEXT)").expect("create");
     conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").expect("insert");
 
-    let result = conn.query_params("SELECT v FROM t WHERE id > ?", &["1"]).expect("select");
-    assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.rows[0].get::<&str>(0).expect("b"), "b");
-    assert_eq!(result.rows[1].get::<&str>(0).expect("c"), "c");
+    // Bind a TRUE integer parameter (not the text "1" the old text-only path
+    // forced): `id INTEGER > ?` compares integer-to-integer with no affinity coercion.
+    let result =
+        conn.query_params("SELECT v FROM t WHERE id > ?", &[ValueRef::Integer(1)]).expect("select");
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.get(0).expect("row 0").get::<&str>(0).expect("b"), "b");
+    assert_eq!(result.get(1).expect("row 1").get::<&str>(0).expect("c"), "c");
 }
 
 #[test]
@@ -58,21 +61,25 @@ fn execute_with_params() {
     let conn = Connection::open_in_memory().expect("open");
     conn.execute("CREATE TABLE t(id INTEGER, v TEXT)").expect("create");
 
-    let changed = conn.execute_params("INSERT INTO t VALUES (?, ?)", &["42", "hello"]).expect("insert");
+    // A mixed param list: an integer bound as INTEGER, a string bound as TEXT —
+    // the `.into()` ergonomic keeps common binds terse.
+    let changed = conn
+        .execute_params("INSERT INTO t VALUES (?, ?)", &[42_i64.into(), "hello".into()])
+        .expect("insert");
     assert_eq!(changed, 1);
 
     let result = conn.query("SELECT id, v FROM t").expect("select");
-    assert_eq!(result.rows[0].get::<i32>(0).expect("id"), 42);
-    assert_eq!(result.rows[0].get::<&str>(1).expect("v"), "hello");
+    assert_eq!(result.get(0).expect("row 0").get::<i32>(0).expect("id"), 42);
+    assert_eq!(result.get(0).expect("row 0").get::<&str>(1).expect("v"), "hello");
 }
 
 #[test]
 fn null_handling() {
     let conn = Connection::open_in_memory().expect("open");
     let result = conn.query("SELECT 1, NULL, 'hello'").expect("select");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.len(), 1);
 
-    let row = &result.rows[0];
+    let row = &result.get(0).expect("row 0");
     assert_eq!(row.column_count(), 3);
     assert_eq!(row.get::<i32>(0).expect("i32"), 1);
     assert!(row.is_null(1).expect("is_null"));
@@ -86,7 +93,7 @@ fn null_handling() {
 fn typed_access() {
     let conn = Connection::open_in_memory().expect("open");
     let result = conn.query("SELECT 42, 2.5, 'text', 1, 0").expect("select");
-    let row = &result.rows[0];
+    let row = &result.get(0).expect("row 0");
 
     assert_eq!(row.get::<i32>(0).expect("i32"), 42);
     assert_eq!(row.get::<i64>(0).expect("i64"), 42);
@@ -101,8 +108,8 @@ fn empty_result() {
     let conn = Connection::open_in_memory().expect("open");
     conn.execute("CREATE TABLE t(id INTEGER)").expect("create");
     let result = conn.query("SELECT id FROM t").expect("select");
-    assert_eq!(result.rows.len(), 0);
-    assert_eq!(result.column_count, 1);
+    assert_eq!(result.len(), 0);
+    assert_eq!(result.column_count(), 1);
 }
 
 #[test]
@@ -113,9 +120,9 @@ fn many_rows() {
         conn.execute(&format!("INSERT INTO t VALUES ({i})")).expect("insert");
     }
     let result = conn.query("SELECT i FROM t ORDER BY i").expect("select");
-    assert_eq!(result.rows.len(), 1000);
-    assert_eq!(result.rows[0].get::<i32>(0).expect("first"), 0);
-    assert_eq!(result.rows[999].get::<i32>(0).expect("last"), 999);
+    assert_eq!(result.len(), 1000);
+    assert_eq!(result.get(0).expect("row 0").get::<i32>(0).expect("first"), 0);
+    assert_eq!(result.get(999).expect("row 999").get::<i32>(0).expect("last"), 999);
 }
 
 #[test]
@@ -144,7 +151,7 @@ fn transaction_commit() {
     conn.execute("COMMIT").expect("commit");
 
     let result = conn.query("SELECT v FROM t").expect("select");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.len(), 1);
 }
 
 #[test]
@@ -157,8 +164,8 @@ fn transaction_rollback() {
     conn.execute("ROLLBACK").expect("rollback");
 
     let result = conn.query("SELECT v FROM t").expect("select");
-    assert_eq!(result.rows.len(), 1);
-    assert_eq!(result.rows[0].get::<i32>(0).expect("v"), 1);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.get(0).expect("row 0").get::<i32>(0).expect("v"), 1);
 }
 
 #[test]
@@ -168,9 +175,9 @@ fn blob_roundtrip() {
     conn.execute("INSERT INTO t VALUES (X'DEADBEEF')").expect("insert");
 
     let result = conn.query("SELECT data FROM t").expect("select");
-    assert_eq!(result.rows[0].get::<&[u8]>(0).expect("blob"), [0xDE, 0xAD, 0xBE, 0xEF].as_slice());
+    assert_eq!(result.get(0).expect("row 0").get::<&[u8]>(0).expect("blob"), [0xDE, 0xAD, 0xBE, 0xEF].as_slice());
     // Owned copy variant.
-    assert_eq!(result.rows[0].get::<Vec<u8>>(0).expect("owned blob"), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    assert_eq!(result.get(0).expect("row 0").get::<Vec<u8>>(0).expect("owned blob"), vec![0xDE, 0xAD, 0xBE, 0xEF]);
 }
 
 #[test]
@@ -187,7 +194,7 @@ fn open_file_and_reopen() {
     {
         let conn = Connection::open(&dir).expect("reopen");
         let result = conn.query("SELECT v FROM t").expect("select");
-        assert_eq!(result.rows[0].get::<i32>(0).expect("v"), 42);
+        assert_eq!(result.get(0).expect("row 0").get::<i32>(0).expect("v"), 42);
         conn.close().expect("close");
     }
 
@@ -198,17 +205,18 @@ fn open_file_and_reopen() {
 fn column_names() {
     let conn = Connection::open_in_memory().expect("open");
     let result = conn.query("SELECT 1 AS id, 'hello' AS greeting").expect("query");
-    assert_eq!(result.column_names, vec!["id", "greeting"]);
-    assert_eq!(
-        result.rows[0].get_by_name::<&str>("greeting", &result.column_names).expect("greeting"),
-        "hello"
-    );
+    assert_eq!(result.column_names.len(), 2);
+    assert_eq!(result.column_names[0], "id");
+    assert_eq!(result.column_names[1], "greeting");
+    // The row carries its own names (via the shared arena) — no threaded slice.
+    let row = result.get(0).expect("row 0");
+    assert_eq!(row.get_by_name::<&str>("greeting").expect("greeting"), "hello");
     // A missing name is a classified error, not a silent None.
-    match result.rows[0].get_by_name::<&str>("missing", &result.column_names) {
+    match row.get_by_name::<&str>("missing") {
         Err(SqliteError::UnknownColumn { name }) => assert_eq!(name, "missing"),
         other => panic!("expected UnknownColumn, got {other:?}"),
     }
-    assert_eq!(result.rows[0].get::<i32>(0).expect("id"), 1);
+    assert_eq!(row.get::<i32>(0).expect("id"), 1);
 }
 
 #[test]
@@ -233,13 +241,13 @@ fn transaction_helpers() {
     conn.execute("INSERT INTO t VALUES (1)").expect("insert");
     conn.commit().expect("commit");
     let r = conn.query("SELECT count(*) FROM t").expect("count");
-    assert_eq!(r.rows[0].get::<i64>(0).expect("count"), 1);
+    assert_eq!(r.get(0).expect("row 0").get::<i64>(0).expect("count"), 1);
 
     conn.begin().expect("begin2");
     conn.execute("INSERT INTO t VALUES (2)").expect("insert2");
     conn.rollback().expect("rollback");
     let r = conn.query("SELECT count(*) FROM t").expect("count2");
-    assert_eq!(r.rows[0].get::<i64>(0).expect("count2"), 1);
+    assert_eq!(r.get(0).expect("row 0").get::<i64>(0).expect("count2"), 1);
 }
 
 #[test]
@@ -248,8 +256,8 @@ fn unicode_values() {
     conn.execute("CREATE TABLE t(v text)").expect("create");
     conn.execute("INSERT INTO t VALUES ('Привет мир')").expect("insert");
     let result = conn.query("SELECT v FROM t").expect("query");
-    assert_eq!(result.rows[0].get::<&str>(0).expect("v"), "Привет мир");
-    assert_eq!(result.rows[0].get::<String>(0).expect("owned"), "Привет мир".to_string());
+    assert_eq!(result.get(0).expect("row 0").get::<&str>(0).expect("v"), "Привет мир");
+    assert_eq!(result.get(0).expect("row 0").get::<String>(0).expect("owned"), "Привет мир".to_string());
 }
 
 #[test]
@@ -262,7 +270,7 @@ fn transaction_closure_commit() {
     })
     .expect("tx");
     let r = conn.query("SELECT count(*) FROM t").expect("count");
-    assert_eq!(r.rows[0].get::<i64>(0).expect("count"), 1);
+    assert_eq!(r.get(0).expect("row 0").get::<i64>(0).expect("count"), 1);
 }
 
 #[test]
@@ -276,7 +284,7 @@ fn transaction_closure_rollback_on_err() {
     });
     assert!(err.is_err());
     let r = conn.query("SELECT count(*) FROM t").expect("count");
-    assert_eq!(r.rows[0].get::<i64>(0).expect("count"), 1, "should have rolled back");
+    assert_eq!(r.get(0).expect("row 0").get::<i64>(0).expect("count"), 1, "should have rolled back");
 }
 
 #[test]
@@ -288,7 +296,7 @@ fn transaction_closure_return_value() {
             c.execute("INSERT INTO t VALUES (1)")?;
             c.execute("INSERT INTO t VALUES (2)")?;
             let r = c.query("SELECT count(*) FROM t")?;
-            r.rows[0].get::<i64>(0)
+            r.get(0).expect("row 0").get::<i64>(0)
         })
         .expect("tx");
     assert_eq!(count, 2);
@@ -298,7 +306,7 @@ fn transaction_closure_return_value() {
 fn typed_get_generic() {
     let conn = Connection::open_in_memory().expect("open");
     let r = conn.query("SELECT 42, 2.5, 'hello'").expect("query");
-    let row = &r.rows[0];
+    let row = &r.get(0).expect("row 0");
     assert_eq!(row.get::<i32>(0).expect("i32"), 42);
     assert!((row.get::<f64>(1).expect("f64") - 2.5).abs() < f64::EPSILON);
     assert_eq!(row.get::<String>(2).expect("string"), "hello".to_string());
@@ -318,15 +326,15 @@ fn execute_batch_multi_statement() {
     .expect("batch");
     let r1 = conn.query("SELECT v FROM a").expect("a");
     let r2 = conn.query("SELECT v FROM b").expect("b");
-    assert_eq!(r1.rows[0].get::<i64>(0).expect("a"), 1);
-    assert_eq!(r2.rows[0].get::<i64>(0).expect("b"), 2);
+    assert_eq!(r1.get(0).expect("row 0").get::<i64>(0).expect("a"), 1);
+    assert_eq!(r2.get(0).expect("row 0").get::<i64>(0).expect("b"), 2);
 }
 
 #[test]
 fn native_integer_access() {
     let conn = Connection::open_in_memory().expect("open");
     let r = conn.query("SELECT 42, 2.5, NULL").expect("query");
-    let row = &r.rows[0];
+    let row = &r.get(0).expect("row 0");
     assert_eq!(row.get::<i64>(0).expect("i64"), 42);
     assert!((row.get::<f64>(1).expect("f64") - 2.5).abs() < f64::EPSILON);
     // Integer -> f64 lossless coercion.
@@ -340,7 +348,7 @@ fn native_integer_access() {
 fn type_mismatch_is_classified_not_silent_none() {
     let conn = Connection::open_in_memory().expect("open");
     let r = conn.query("SELECT 42, 'text', X'BEEF'").expect("query");
-    let row = &r.rows[0];
+    let row = &r.get(0).expect("row 0");
 
     // Integer read as &str: a classified TypeMismatch, NOT a silent None.
     match row.get::<&str>(0) {
@@ -373,7 +381,7 @@ fn type_mismatch_is_classified_not_silent_none() {
 fn null_is_distinct_from_mismatch() {
     let conn = Connection::open_in_memory().expect("open");
     let r = conn.query("SELECT NULL, 'x'").expect("query");
-    let row = &r.rows[0];
+    let row = &r.get(0).expect("row 0");
 
     // A non-nullable get of a NULL column is UnexpectedNull, not TypeMismatch.
     match row.get::<i64>(0) {
@@ -393,7 +401,7 @@ fn null_is_distinct_from_mismatch() {
 fn integer_out_of_range_is_classified() {
     let conn = Connection::open_in_memory().expect("open");
     let r = conn.query("SELECT 5000000000").expect("query"); // > i32::MAX
-    let row = &r.rows[0];
+    let row = &r.get(0).expect("row 0");
     // Fits i64, overflows i32 — a classified error, not a truncated value.
     assert_eq!(row.get::<i64>(0).expect("i64"), 5_000_000_000);
     match row.get::<i32>(0) {
@@ -410,7 +418,7 @@ fn f64_rejects_inexact_integer() {
     let conn = Connection::open_in_memory().expect("open");
     // 2^53 + 1 is the first integer f64 cannot represent exactly.
     let r = conn.query("SELECT 9007199254740993").expect("query");
-    let row = &r.rows[0];
+    let row = &r.get(0).expect("row 0");
     assert_eq!(row.get::<i64>(0).expect("i64"), 9_007_199_254_740_993);
     match row.get::<f64>(0) {
         Err(SqliteError::InexactFloat { value, .. }) => assert_eq!(value, 9_007_199_254_740_993),
@@ -422,7 +430,7 @@ fn f64_rejects_inexact_integer() {
 fn f64_accepts_two_pow_53_exactly() {
     let conn = Connection::open_in_memory().expect("open");
     let r = conn.query("SELECT 9007199254740992").expect("query"); // exactly 2^53
-    let v = r.rows[0].get::<f64>(0).expect("2^53 must convert");
+    let v = r.get(0).expect("row 0").get::<f64>(0).expect("2^53 must convert");
     assert!((v - 9_007_199_254_740_992.0).abs() < f64::EPSILON);
 }
 
@@ -430,7 +438,7 @@ fn f64_accepts_two_pow_53_exactly() {
 fn non_boolean_integer_is_classified() {
     let conn = Connection::open_in_memory().expect("open");
     let r = conn.query("SELECT 5, 'true'").expect("query");
-    let row = &r.rows[0];
+    let row = &r.get(0).expect("row 0");
     // Integer 5 read as bool: SQLite bool is 0/1, so 5 is classified, not truthy.
     match row.get::<bool>(0) {
         Err(SqliteError::NotABoolean { value, .. }) => assert_eq!(value, 5),
@@ -441,13 +449,25 @@ fn non_boolean_integer_is_classified() {
 }
 
 #[test]
-fn invalid_utf8_text_is_classified_on_eager_materialize() {
+fn invalid_utf8_text_is_classified_lazily_at_get() {
     let conn = Connection::open_in_memory().expect("open");
-    // CAST a non-UTF-8 blob to TEXT: the eager path validates UTF-8 up front
-    // and fails the whole query with a classified error, never lossily.
-    match conn.query("SELECT CAST(X'FF' AS TEXT)") {
+    // CAST a non-UTF-8 blob to TEXT. The arena stores the raw bytes and validates
+    // UTF-8 LAZILY at `get::<&str>` — so the query SUCCEEDS (one bad byte in a big
+    // result no longer fails the whole materialization), and only the text read
+    // classifies. This is the semantic improvement over the old eager path.
+    let r = conn.query("SELECT CAST(X'FF' AS TEXT)").expect("query succeeds — no eager UTF-8 check");
+    let row = r.get(0).expect("row 0");
+    // The storage class is TEXT (not a lossy substitution).
+    assert!(matches!(row.value_ref(0).expect("vref"), ValueRef::Text(_)));
+    // Reading it as `&str` is the classified failure point.
+    match row.get::<&str>(0) {
         Err(SqliteError::InvalidUtf8 { column }) => assert_eq!(column, 0),
         other => panic!("expected InvalidUtf8, got {other:?}"),
+    }
+    // The raw bytes are always recoverable via `value_ref`.
+    match row.value_ref(0).expect("vref bytes") {
+        ValueRef::Text(bytes) => assert_eq!(bytes, [0xFF].as_slice()),
+        other => panic!("expected Text bytes, got {other:?}"),
     }
 }
 
@@ -455,7 +475,7 @@ fn invalid_utf8_text_is_classified_on_eager_materialize() {
 fn column_index_out_of_bounds_is_classified() {
     let conn = Connection::open_in_memory().expect("open");
     let r = conn.query("SELECT 1").expect("query");
-    let row = &r.rows[0];
+    let row = &r.get(0).expect("row 0");
     match row.get::<i64>(5) {
         Err(SqliteError::ColumnIndexOutOfBounds { index, count }) => {
             assert_eq!(index, 5);
@@ -540,7 +560,7 @@ fn query_each_params() {
 
     let mut collected: Vec<String> = Vec::new();
     let outcome = conn
-        .query_each_params("SELECT v FROM t WHERE id > ? ORDER BY id", &["1"], |row| {
+        .query_each_params("SELECT v FROM t WHERE id > ? ORDER BY id", &[ValueRef::Integer(1)], |row| {
             // Copy out explicitly when accumulation is wanted.
             collected.push(row.get::<String>(0).expect("owned"));
             ControlFlow::<()>::Continue(())
@@ -556,7 +576,7 @@ fn query_each_classified_error_mid_stream() {
     let r = conn.query("SELECT 'x'").expect("query");
     // Reading text as i64 inside the stream returns a classified Err from the
     // accessor — the driver never silently substitutes.
-    assert!(matches!(r.rows[0].get::<i64>(0), Err(SqliteError::TypeMismatch { .. })));
+    assert!(matches!(r.get(0).expect("row 0").get::<i64>(0), Err(SqliteError::TypeMismatch { .. })));
 }
 
 #[test]
@@ -574,15 +594,18 @@ fn full_lifecycle_integration() {
     .expect("tx");
 
     let result = conn.query("SELECT id, name, score FROM users ORDER BY id").expect("query");
-    assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.column_names, vec!["id", "name", "score"]);
-    assert_eq!(result.rows[0].get::<&str>(1).expect("name"), "alice");
-    assert!((result.rows[0].get::<f64>(2).expect("score") - 95.5).abs() < f64::EPSILON);
-    assert_eq!(result.rows[1].get::<i64>(0).expect("id"), 2);
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.column_names.len(), 3);
+    assert_eq!(result.column_names[0], "id");
+    assert_eq!(result.column_names[1], "name");
+    assert_eq!(result.column_names[2], "score");
+    assert_eq!(result.get(0).expect("row 0").get::<&str>(1).expect("name"), "alice");
+    assert!((result.get(0).expect("row 0").get::<f64>(2).expect("score") - 95.5).abs() < f64::EPSILON);
+    assert_eq!(result.get(1).expect("row 1").get::<i64>(0).expect("id"), 2);
 
     // Native type access — no double-conversion.
-    assert_eq!(result.rows[0].get::<i64>(0).expect("id int"), 1);
-    assert!((result.rows[0].get::<f64>(0).expect("id as f64") - 1.0).abs() < f64::EPSILON);
+    assert_eq!(result.get(0).expect("row 0").get::<i64>(0).expect("id int"), 1);
+    assert!((result.get(0).expect("row 0").get::<f64>(0).expect("id as f64") - 1.0).abs() < f64::EPSILON);
 
     // Error in transaction → rollback.
     let err: Result<(), _> = conn.transaction(|tx| {
@@ -591,7 +614,150 @@ fn full_lifecycle_integration() {
     });
     assert!(err.is_err());
     let count = conn.query("SELECT count(*) FROM users").expect("count");
-    assert_eq!(count.rows[0].get::<i64>(0).expect("count"), 2); // charlie rolled back
+    assert_eq!(count.get(0).expect("row 0").get::<i64>(0).expect("count"), 2); // charlie rolled back
 
     conn.close().expect("close");
+}
+
+// ─────────────────────── typed parameter binding ───────────────────────
+//
+// The param model is `&[ValueRef]`, binding each value in its TRUE SQLite
+// storage class. The text-only `&[&str]` model these tests replace could bind
+// neither `NULL` nor `BLOB`, and bound every integer/real as text (leaning on
+// column affinity, a silent-wrong-result trap against an affinity-less compare).
+
+#[test]
+fn null_parameter_round_trips() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute("CREATE TABLE t(id INTEGER, note TEXT)").expect("create");
+
+    // Bind a real SQL NULL — impossible under the old text-only model (no `&str`
+    // binds NULL; `""` binds an empty TEXT value, a different thing entirely).
+    let changed = conn
+        .execute_params("INSERT INTO t VALUES (?, ?)", &[ValueRef::Integer(1), ValueRef::Null])
+        .expect("insert null");
+    assert_eq!(changed, 1);
+
+    // The bound NULL is a genuine NULL: `note IS NULL` matches it.
+    let r = conn.query("SELECT id FROM t WHERE note IS NULL").expect("select");
+    assert_eq!(r.len(), 1);
+    assert_eq!(r.get(0).expect("row 0").get::<i64>(0).expect("id"), 1);
+
+    // And it reads back as a NULL, distinct from any present value.
+    let r2 = conn.query("SELECT note FROM t").expect("select note");
+    assert!(r2.get(0).expect("row 0").is_null(0).expect("is_null"));
+    assert_eq!(r2.get(0).expect("row 0").get_opt::<&str>(0).expect("opt"), None);
+
+    // The ergonomic `Option` bind produces the same NULL.
+    let none: Option<&str> = None;
+    let r3 = conn
+        .query_params("SELECT ? IS NULL", &[none.into()])
+        .expect("opt-none bind");
+    assert!(r3.get(0).expect("row 0").get::<bool>(0).expect("is null bool"));
+}
+
+#[test]
+fn blob_parameter_round_trips_byte_exact() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute("CREATE TABLE t(data BLOB)").expect("create");
+
+    // A blob with a non-UTF-8 byte (0xFF) and a NUL — bytes no text param could
+    // carry losslessly. Bound as a BLOB, read back byte-for-byte.
+    let bytes: &[u8] = &[0x00, 0xDE, 0xAD, 0xFF, 0xBE, 0xEF];
+    let changed = conn
+        .execute_params("INSERT INTO t VALUES (?)", &[ValueRef::Blob(bytes)])
+        .expect("insert blob");
+    assert_eq!(changed, 1);
+
+    let r = conn.query("SELECT data FROM t").expect("select");
+    assert_eq!(r.get(0).expect("row 0").get::<&[u8]>(0).expect("blob"), bytes, "blob round-trips byte-exact");
+    // Its storage class really is BLOB (not TEXT): a `&str` read is a mismatch.
+    assert!(matches!(r.get(0).expect("row 0").get::<&str>(0), Err(SqliteError::TypeMismatch { .. })));
+}
+
+#[test]
+fn integer_and_real_params_bind_as_their_storage_class() {
+    let conn = Connection::open_in_memory().expect("open");
+
+    // `typeof(?)` reports the parameter's ACTUAL storage class. An integer bound
+    // as INTEGER reports 'integer' (not 'text' — the affinity trap the old
+    // text-only path fell into, which silently broke affinity-less comparisons).
+    let ti = conn.query_params("SELECT typeof(?)", &[ValueRef::Integer(42)]).expect("int typeof");
+    assert_eq!(ti.get(0).expect("row 0").get::<&str>(0).expect("typeof int"), "integer");
+
+    let tr = conn.query_params("SELECT typeof(?)", &[ValueRef::Real(2.5)]).expect("real typeof");
+    assert_eq!(tr.get(0).expect("row 0").get::<&str>(0).expect("typeof real"), "real");
+
+    // The affinity trap made concrete: against an affinity-less comparison
+    // (`id + 0`), a text "42" would NOT equal the integer 42, silently returning
+    // no rows. A true integer bind matches.
+    conn.execute("CREATE TABLE t(id INTEGER)").expect("create");
+    conn.execute("INSERT INTO t VALUES (42)").expect("seed");
+    let matched = conn
+        .query_params("SELECT id FROM t WHERE id + 0 = ?", &[ValueRef::Integer(42)])
+        .expect("affinity-less compare");
+    assert_eq!(matched.len(), 1, "an integer param compares as an integer");
+}
+
+#[test]
+fn text_parameter_still_expressible() {
+    // The capability the old model had — binding text — is preserved, via
+    // `ValueRef::Text` or the `&str` `From` impl.
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute("CREATE TABLE t(v TEXT)").expect("create");
+    conn.execute_params("INSERT INTO t VALUES (?)", &[ValueRef::Text(b"explicit")]).expect("text");
+    conn.execute_params("INSERT INTO t VALUES (?)", &["ergonomic".into()]).expect("text into");
+
+    let r = conn.query("SELECT v FROM t ORDER BY v").expect("select");
+    assert_eq!(r.get(0).expect("row 0").get::<&str>(0).expect("v0"), "ergonomic");
+    assert_eq!(r.get(1).expect("row 1").get::<&str>(0).expect("v1"), "explicit");
+    // Both bound as TEXT.
+    let tt = conn.query_params("SELECT typeof(?)", &["x".into()]).expect("typeof text");
+    assert_eq!(tt.get(0).expect("row 0").get::<&str>(0).expect("typeof"), "text");
+}
+
+// ─────────────────────── unsigned reads + u64 affected count ───────────────────────
+
+#[test]
+fn unsigned_integer_reads_are_range_checked() {
+    let conn = Connection::open_in_memory().expect("open");
+    // Values within u32 and u64 read directly — a rowid/count/bitfield no longer
+    // needs a manual i64 round-trip + range check the driver already owns.
+    let r = conn.query("SELECT 4000000000, 9000000000000000000").expect("query");
+    let row = r.get(0).expect("row 0");
+    assert_eq!(row.get::<u32>(0).expect("u32"), 4_000_000_000);
+    assert_eq!(row.get::<u64>(1).expect("u64"), 9_000_000_000_000_000_000);
+
+    // A negative value is out of range for both unsigned types — classified,
+    // never wrapped to a huge positive.
+    let neg = conn.query("SELECT -1").expect("neg");
+    let row = neg.get(0).expect("row 0");
+    match row.get::<u32>(0) {
+        Err(SqliteError::IntegerOutOfRange { value, .. }) => assert_eq!(value, -1),
+        other => panic!("expected IntegerOutOfRange for u32, got {other:?}"),
+    }
+    match row.get::<u64>(0) {
+        Err(SqliteError::IntegerOutOfRange { value, .. }) => assert_eq!(value, -1),
+        other => panic!("expected IntegerOutOfRange for u64, got {other:?}"),
+    }
+
+    // A value beyond u32 but within u64: u32 is a classified overflow, u64 fits.
+    let big = conn.query("SELECT 5000000000").expect("big");
+    let row = big.get(0).expect("row 0");
+    assert!(matches!(row.get::<u32>(0), Err(SqliteError::IntegerOutOfRange { .. })));
+    assert_eq!(row.get::<u64>(0).expect("u64 fits"), 5_000_000_000);
+}
+
+#[test]
+fn affected_count_is_u64() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute("CREATE TABLE t(v int)").expect("create");
+    // The `u64` annotation pins the return type (cross-backend parity with the
+    // PostgreSQL drivers' affected-row `u64`).
+    let inserted: u64 = conn.execute("INSERT INTO t VALUES (1),(2),(3)").expect("insert");
+    assert_eq!(inserted, 3);
+    let deleted: u64 = conn
+        .execute_params("DELETE FROM t WHERE v > ?", &[ValueRef::Integer(1)])
+        .expect("delete");
+    assert_eq!(deleted, 2);
 }

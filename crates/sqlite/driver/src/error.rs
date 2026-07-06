@@ -100,6 +100,13 @@ pub enum SqliteError {
         /// The column name that did not resolve.
         name: String,
     },
+    /// An eager [`query`](crate::Connection::query) result's text/blob bytes (or
+    /// its column count) exceeded the 32-bit bounds of the shared arena's slot
+    /// fields — a `> 4 GiB` eager materialization. Rejected loudly rather than
+    /// returned with mis-addressed cells; stream the result with
+    /// [`query_each`](crate::Connection::query_each) (constant memory, no cap)
+    /// instead.
+    ResultTooLarge,
 }
 
 // Footprint pin: sized by the widest variant. The `String`-carrying variants
@@ -204,6 +211,10 @@ impl core::fmt::Display for SqliteError {
                 write!(f, "column index {index} out of bounds ({count} columns)")
             }
             Self::UnknownColumn { name } => write!(f, "unknown column {name:?}"),
+            Self::ResultTooLarge => write!(
+                f,
+                "eager result exceeds the 4 GiB arena bound — stream it with query_each instead",
+            ),
         }
     }
 }

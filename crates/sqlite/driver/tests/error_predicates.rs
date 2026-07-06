@@ -89,7 +89,7 @@ fn wal_write_conflict_is_busy() {
     // at the first read).
     reader.execute("BEGIN").expect("begin read txn");
     let seen = reader.query("SELECT x FROM t").expect("read snapshot");
-    assert_eq!(seen.rows.len(), 1);
+    assert_eq!(seen.len(), 1);
 
     // A concurrent autocommit write advances the WAL past `reader`'s snapshot.
     writer.execute("INSERT INTO t VALUES (1)").expect("concurrent commit");

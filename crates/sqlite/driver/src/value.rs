@@ -42,13 +42,22 @@ impl core::fmt::Display for Type {
     }
 }
 
-/// A zero-copy borrowed view of a single column's value.
+/// A zero-copy borrowed view of a single value — the ONE value vocabulary the
+/// driver uses on BOTH sides of the wire.
 ///
-/// `Text`/`Blob` borrow the underlying byte buffer directly (SQLite's own
-/// column memory on the streaming path, or the owned cell's buffer on the
-/// eager path) — no allocation, no copy. The borrow's lifetime `'a` is bounded
-/// by the row it came from, so a `ValueRef` cannot outlive the row step that
-/// produced it.
+/// * **Reading** a column: `Text`/`Blob` borrow the underlying byte buffer
+///   directly (the arena's cell bytes) — no allocation, no copy. The borrow's
+///   lifetime `'a` is bounded by the row it came from, so a `ValueRef` cannot
+///   outlive the row step that produced it.
+/// * **Binding** a parameter: the same enum is the parameter model for every
+///   `*_params` verb. Each variant binds in its TRUE SQLite storage class —
+///   `Null` binds SQL `NULL`, `Integer`/`Real` bind numerically (no affinity
+///   coercion), `Text`/`Blob` bind the borrowed bytes zero-copy. This is why
+///   `NULL` and `BLOB` parameters are expressible at all (a text-only param
+///   model can bind neither), and why an integer bound against an
+///   affinity-less comparison is compared as an integer, not silently as text.
+///   The `From` impls below keep common binds terse (`42_i64.into()`,
+///   `"name".into()`, `Some(x).into()` → the value or `Null`).
 ///
 /// `Text` is raw bytes, not `&str`: SQLite does not guarantee a `TEXT` value is
 /// valid UTF-8. Validation happens only when a `&str`/`String` is requested,
@@ -98,17 +107,100 @@ impl<'a> From<rusqlite::types::ValueRef<'a>> for ValueRef<'a> {
     }
 }
 
-/// An owned SQLite value — the materialized cell of an eager [`Row`].
+// ─── parameter binding ──────────────────────────────────────────────────────
+//
+// `ValueRef` is the parameter model for every `*_params` verb. Binding runs
+// through rusqlite's `ToSql` seam, but the driver's public surface stays
+// `ValueRef` (rusqlite's own `ToSql` never leaks into a signature), and each
+// bind is BORROWED — the `ToSqlOutput::Borrowed` path copies nothing on the
+// Rust side, so a `&[ValueRef]` param list allocates nothing per parameter.
+
+impl<'a> From<ValueRef<'a>> for rusqlite::types::ValueRef<'a> {
+    fn from(v: ValueRef<'a>) -> Self {
+        match v {
+            ValueRef::Null => Self::Null,
+            ValueRef::Integer(n) => Self::Integer(n),
+            ValueRef::Real(f) => Self::Real(f),
+            ValueRef::Text(b) => Self::Text(b),
+            ValueRef::Blob(b) => Self::Blob(b),
+        }
+    }
+}
+
+impl rusqlite::types::ToSql for ValueRef<'_> {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        // BORROWED: the parameter's storage class is carried through unchanged
+        // (no coercion) and its bytes (for Text/Blob) are lent, not copied. The
+        // returned view's lifetime is `&self`'s, which the value's own `'a`
+        // outlives (covariance narrows it), so this is a zero-copy bind.
+        Ok(rusqlite::types::ToSqlOutput::Borrowed((*self).into()))
+    }
+}
+
+// Terse constructors for the common bind cases. Non-borrowing scalars leave the
+// target lifetime free; `&str`/`&[u8]` borrow it; `Option<T>` collapses to the
+// inner value or `Null` — the ergonomic NULL bind.
+
+impl From<i64> for ValueRef<'_> {
+    fn from(n: i64) -> Self {
+        Self::Integer(n)
+    }
+}
+
+impl From<i32> for ValueRef<'_> {
+    fn from(n: i32) -> Self {
+        Self::Integer(i64::from(n))
+    }
+}
+
+impl From<f64> for ValueRef<'_> {
+    fn from(f: f64) -> Self {
+        Self::Real(f)
+    }
+}
+
+impl From<bool> for ValueRef<'_> {
+    fn from(b: bool) -> Self {
+        // SQLite has no boolean storage class; a boolean binds as the integers
+        // 0/1, mirroring the `get::<bool>` read side (which accepts 0/1 only).
+        Self::Integer(i64::from(b))
+    }
+}
+
+impl<'a> From<&'a str> for ValueRef<'a> {
+    fn from(s: &'a str) -> Self {
+        Self::Text(s.as_bytes())
+    }
+}
+
+impl<'a> From<&'a [u8]> for ValueRef<'a> {
+    fn from(b: &'a [u8]) -> Self {
+        Self::Blob(b)
+    }
+}
+
+impl<'a, T: Into<ValueRef<'a>>> From<Option<T>> for ValueRef<'a> {
+    fn from(o: Option<T>) -> Self {
+        // `Some(v)` binds `v`'s storage class; `None` binds SQL `NULL`. This is
+        // the ergonomic nullable bind: `Some("x").into()` / `None::<&str>.into()`.
+        match o {
+            Some(v) => v.into(),
+            None => Self::Null,
+        }
+    }
+}
+
+/// An OWNED SQLite value — the `'static` counterpart of the borrowed
+/// [`ValueRef`].
 ///
-/// `Text` is stored as a validated `String`: the eager materialization
-/// enforces UTF-8 once, up front, and a non-UTF-8 `TEXT` cell fails the whole
-/// query with a classified [`SqliteError::InvalidUtf8`] rather than being
-/// silently lossy. A caller that must handle non-UTF-8 text bytes uses the
-/// streaming [`Connection::query_each`] path with `value_ref` /
-/// `get::<&[u8]>` instead.
+/// Two roles: (1) an owned snapshot a caller can build and stash beyond a row's
+/// borrow, and (2) an owned parameter source — [`as_ref`](Self::as_ref) yields a
+/// [`ValueRef`] for binding, so a value that cannot be borrowed at the call site
+/// (a computed `String`/`Vec<u8>`) still binds in its true storage class.
 ///
-/// [`Row`]: crate::Row
-/// [`Connection::query_each`]: crate::Connection::query_each
+/// `Text` is a `String` (always valid UTF-8 by construction). A row's raw,
+/// possibly-non-UTF-8 `TEXT` bytes are read borrowed via [`ValueRef`] /
+/// `get::<&[u8]>`, never forced through this owned type.
 #[derive(Debug, Clone)]
 pub enum SqliteValue {
     /// `NULL`.
@@ -206,6 +298,41 @@ impl FromColumn<'_> for i64 {
 impl FromColumn<'_> for i32 {
     fn from_column(column: usize, value: ValueRef<'_>) -> Result<Self, SqliteError> {
         match value {
+            ValueRef::Integer(n) => {
+                Self::try_from(n).map_err(|_| SqliteError::IntegerOutOfRange { column, value: n })
+            }
+            other => Err(SqliteError::TypeMismatch {
+                column,
+                expected: Type::Integer,
+                found: other.data_type(),
+            }),
+        }
+    }
+}
+
+impl FromColumn<'_> for u32 {
+    fn from_column(column: usize, value: ValueRef<'_>) -> Result<Self, SqliteError> {
+        match value {
+            // SQLite integers are signed `i64`; a `u32` read range-checks (a
+            // rowid, count, or bitfield). A negative or out-of-range value is the
+            // classified `IntegerOutOfRange`, never a truncated/wrapped read.
+            ValueRef::Integer(n) => {
+                Self::try_from(n).map_err(|_| SqliteError::IntegerOutOfRange { column, value: n })
+            }
+            other => Err(SqliteError::TypeMismatch {
+                column,
+                expected: Type::Integer,
+                found: other.data_type(),
+            }),
+        }
+    }
+}
+
+impl FromColumn<'_> for u64 {
+    fn from_column(column: usize, value: ValueRef<'_>) -> Result<Self, SqliteError> {
+        match value {
+            // A `u64` read of an `i64` fails only on a NEGATIVE value (every
+            // non-negative `i64` fits `u64`) — again classified, never wrapped.
             ValueRef::Integer(n) => {
                 Self::try_from(n).map_err(|_| SqliteError::IntegerOutOfRange { column, value: n })
             }

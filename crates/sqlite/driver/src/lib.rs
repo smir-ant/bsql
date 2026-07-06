@@ -15,12 +15,13 @@
 //!
 //! ```text
 //!   TYPE           size  align
-//!   Row              24      8   one Vec<SqliteValue> (eager, owned)
+//!   Row              16      8   Arc<arena> + u32 row index (lazy handle)
+//!   RowSet           16      8   Option<Arc<arena>> + u32 row count (lazy)
 //!   BorrowedRow       8      8   one &rusqlite::Row (streaming, zero-copy)
 //!   SqliteValue      32      8   widest variant Text(String)/Blob(Vec<u8>)
 //!   ValueRef         24      8   widest variant Text/Blob (&[u8] fat pointer)
 //!   Type              1      1   five field-less storage-class variants
-//!   QueryResult      56      8   Vec<Row> + usize + Vec<String>
+//!   QueryResult      32      8   RowSet + Arc<[String]> (one shared arena)
 //!   SqliteError      32      8   String-carrying variants (niche-packed tag)
 //! ```
 
@@ -51,6 +52,6 @@ mod connection;
 mod error;
 mod value;
 
-pub use connection::{BorrowedRow, Connection, QueryResult, Row};
+pub use connection::{BorrowedRow, Connection, QueryResult, Row, RowSet, Transaction};
 pub use error::SqliteError;
 pub use value::{FromColumn, SqliteValue, Type, ValueRef};

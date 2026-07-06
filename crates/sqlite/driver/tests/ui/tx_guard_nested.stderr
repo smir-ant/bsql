@@ -1,0 +1,35 @@
+error[E0599]: no method named `transaction` found for reference `&Transaction<'_>` in the current scope
+  --> tests/ui/tx_guard_nested.rs:16:12
+   |
+16 |         tx.transaction(|_inner| Ok(()))?;
+   |            ^^^^^^^^^^^ method not found in `&Transaction<'_>`
+
+error[E0599]: no method named `begin` found for reference `&Transaction<'_>` in the current scope
+  --> tests/ui/tx_guard_nested.rs:18:12
+   |
+18 |         tx.begin()?;
+   |            ^^^^^ method not found in `&Transaction<'_>`
+
+error[E0599]: no method named `commit` found for reference `&Transaction<'_>` in the current scope
+  --> tests/ui/tx_guard_nested.rs:19:12
+   |
+19 |         tx.commit()?;
+   |            ^^^^^^ method not found in `&Transaction<'_>`
+
+error[E0599]: no method named `rollback` found for reference `&Transaction<'_>` in the current scope
+  --> tests/ui/tx_guard_nested.rs:20:12
+   |
+20 |         tx.rollback()?;
+   |            ^^^^^^^^ method not found in `&Transaction<'_>`
+
+error[E0599]: no method named `close` found for reference `&Transaction<'_>` in the current scope
+  --> tests/ui/tx_guard_nested.rs:21:12
+   |
+21 |         tx.close()?;
+   |            ^^^^^
+   |
+help: there is a method `clone` with a similar name
+   |
+21 -         tx.close()?;
+21 +         tx.clone()?;
+   |
