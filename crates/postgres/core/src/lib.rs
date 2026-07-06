@@ -7,6 +7,15 @@
 //! sans-IO engine surface), `ConnectConfig`, `DriverError`, `tls`/`ssl` modules.
 //! Both `bsql-postgres-async` and `bsql-postgres-sync` depend on this.
 
+// The shared live-PostgreSQL SQL-mechanism scenario library
+// (`define_sql_scenario_tests!`), run by BOTH drivers' `--ignored` live
+// suites. A test-only concern, so it lives behind the OFF-BY-DEFAULT
+// `test-scenarios` feature: a production `cargo build -p bsql-postgres-core`
+// compiles no `test_scenarios` module and the `#[macro_export]` macro never
+// enters core's public API. The drivers turn it on through a
+// `[dev-dependencies]` edge, so it is present only when their test targets
+// are built, never for a downstream consumer.
+#[cfg(feature = "test-scenarios")]
 pub mod test_scenarios;
 
 pub mod config;

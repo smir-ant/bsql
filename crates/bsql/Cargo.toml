@@ -7,7 +7,7 @@ description = "Multi-backend SQL toolkit — PostgreSQL and SQLite"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = ["postgres-async", "postgres-sync", "sqlite", "tls", "webpki-roots", "scram"]
+default = ["postgres-async", "postgres-sync", "sqlite", "tls", "webpki-roots", "scram", "md5-auth"]
 postgres-async = ["dep:bsql-postgres-async"]
 postgres-sync = ["dep:bsql-postgres-sync"]
 sqlite = ["dep:bsql-sqlite"]
@@ -43,6 +43,14 @@ webpki-roots = ["tls", "bsql-postgres-async?/webpki-roots", "bsql-postgres-sync?
 # `cpufeatures`) leave the runtime graph; a password-bearing connect then fails
 # LOUD (`DriverError::Config`), and Trust auth still works. SQLite is unaffected.
 scram = ["bsql-postgres-async?/scram", "bsql-postgres-sync?/scram"]
+
+# `md5-auth` — MD5-password authentication, DEFAULT-ON. Forwards to whichever
+# PostgreSQL driver(s) are enabled (the `?` activates it ONLY on an already-enabled
+# driver). With it OFF (`default-features = false` and not re-listed) `md-5` and
+# its private crypto stack (7 crates) leave the runtime graph; a server that
+# demands MD5 is answered with `ConnFail::UnsupportedAuthMethod` (fail-loud), and
+# Trust / SCRAM auth still work. SQLite is unaffected.
+md5-auth = ["bsql-postgres-async?/md5-auth", "bsql-postgres-sync?/md5-auth"]
 
 # `n1-detect` — turn on the diagnostics-only N+1 query detector on whichever
 # PostgreSQL driver(s) are enabled (`conn.n1_report()`). OFF by default: a

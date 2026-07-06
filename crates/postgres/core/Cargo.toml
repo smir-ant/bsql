@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 # roots are the out-of-the-box encrypted transport; a localhost / unix-socket /
 # trust-auth deployment that never does TLS drops the ENTIRE ring/rustls subtree
 # with `default-features = false`.
-default = ["tls", "webpki-roots", "scram"]
+default = ["tls", "webpki-roots", "scram", "md5-auth"]
 
 # `tls` — the rustls-backed encrypted transport: the whole `tls` module
 # (`TlsTransport`, `shared_client_config`, the custom-CA parsers), the `ssl`
@@ -52,6 +52,17 @@ webpki-roots = ["tls", "dep:webpki-roots"]
 # `bsql-testkit` crate turns this on.
 testkit = []
 
+# `test-scenarios` — the shared live-PostgreSQL SQL-mechanism scenario library
+# (the `define_sql_scenario_tests!` macro), run by BOTH drivers' `--ignored`
+# live suites. OFF by default: a test-only concern, so a production build
+# compiles no `test_scenarios` module and the `#[macro_export]` macro never
+# enters core's PUBLIC API. Additive and dependency-free (a `macro_rules!`
+# generating `#[test]` fns over the driver's inherent methods). Each driver
+# turns it on through a `[dev-dependencies]` edge, so it is present only when
+# that driver's test targets are built. Distinct from `testkit` (the no-network
+# fake): these scenarios need a LIVE PostgreSQL.
+test-scenarios = []
+
 # `n1-detect` — the diagnostics-only N+1 query detector (`n1::N1Tracker`,
 # `n1::N1Report`). OFF by default: a production build compiles no tracker type,
 # so the drivers' `Connection` gains no field and no query-path branch. Additive
@@ -65,6 +76,13 @@ n1-detect = []
 # connect then fails LOUD at the driver, and Trust auth still works. Forwards to
 # `bsql-postgres-proto` only — this crate pulls no extra dependency of its own.
 scram = ["bsql-postgres-proto/scram"]
+
+# `md5-auth` — forward the sans-IO kernel's default-on MD5-password authentication.
+# DEFAULT-ON. With it OFF, `md-5` and its private crypto stack (7 crates) leave a
+# `--no-default-features` runtime graph; a server that demands MD5 is answered with
+# `ConnFail::UnsupportedAuthMethod` (fail-loud). Forwards to `bsql-postgres-proto`
+# only — this crate pulls no extra dependency of its own.
+md5-auth = ["bsql-postgres-proto/md5-auth"]
 
 [dependencies]
 # `default-features = false` so this crate (and the drivers/umbrella above it) can

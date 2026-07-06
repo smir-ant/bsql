@@ -650,9 +650,9 @@ pub(crate) fn parse_server_first(
     if iterations < MIN_SCRAM_ITERATIONS {
         return Err(ScramError::IterationsTooLow { iterations });
     }
-    // Pass #6 BS8: bound the upper end. A malicious server sending
-    // `iterations = u32::MAX` stalls PBKDF2 for minutes per connection
-    // — client-side DoS. Reject anything above the 10M sanity cap.
+    // Bound the upper end. A malicious server sending `iterations = u32::MAX`
+    // stalls PBKDF2 for minutes per connection — client-side DoS. Reject
+    // anything above `MAX_SCRAM_ITERATIONS`.
     if iterations > MAX_SCRAM_ITERATIONS {
         return Err(ScramError::IterationsTooHigh { iterations });
     }

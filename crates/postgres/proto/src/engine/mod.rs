@@ -697,7 +697,11 @@ const _: fn() = || {
     ));
 };
 
-#[cfg(test)]
+// Gated on `md5-auth`: the fixture credential is MD5 (its reply does not depend
+// on the client nonce, so a static script suffices — a SCRAM reply would). The
+// `scrub_drained` call it exercises is credential-agnostic, so the SCRAM path's
+// own drop witnesses cover the same scrub when this is compiled out.
+#[cfg(all(test, feature = "md5-auth"))]
 mod connect_scrub_tests {
     //! Connect call-site teeth for the handshake-completion secret scrub.
     //!

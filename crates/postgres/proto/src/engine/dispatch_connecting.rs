@@ -60,6 +60,7 @@ use crate::ident::{DatabaseName, Ident};
 // `PodBytes` backs the SCRAM session's reused nonce/message leaves — SCRAM-only.
 #[cfg(feature = "scram")]
 use crate::ident::PodBytes;
+#[cfg(feature = "md5-auth")]
 use crate::md5::Md5HandshakeState;
 use crate::password::{Credentials, Password};
 use crate::startup::StartupParam;
@@ -187,7 +188,8 @@ enum ConnEvent {
     Silent,
     /// Server requested cleartext-password auth; the response is in the buffer.
     Cleartext,
-    /// Server requested MD5 auth; the response is in the buffer.
+    /// Server requested MD5 auth; the response is in the buffer. MD5-only.
+    #[cfg(feature = "md5-auth")]
     Md5 {
         /// The server-chosen 4-byte salt.
         salt: [u8; 4],
@@ -214,6 +216,7 @@ enum DriveOutcome {
     NeedMore,
     Ready,
     Cleartext,
+    #[cfg(feature = "md5-auth")]
     Md5 { salt: [u8; 4] },
     ProtoFail(ConnFail),
     #[cfg(feature = "scram")]
@@ -378,6 +381,7 @@ impl ConnectingEngine {
             Credentials::CleartextPassword(password) => ConnectingState::StartupCleartext {
                 password: Box::new(password),
             },
+            #[cfg(feature = "md5-auth")]
             Credentials::Md5Password(password) => ConnectingState::StartupMd5 {
                 handshake: Box::new(Md5HandshakeState {
                     password,
@@ -419,9 +423,9 @@ impl ConnectingEngine {
         match self.drive_to_event(send_buf) {
             DriveOutcome::NeedMore => HandshakeProgress::NeedMore,
             DriveOutcome::Ready => HandshakeProgress::Ready,
-            DriveOutcome::Cleartext | DriveOutcome::Md5 { .. } => {
-                HandshakeProgress::AuthResponse
-            }
+            DriveOutcome::Cleartext => HandshakeProgress::AuthResponse,
+            #[cfg(feature = "md5-auth")]
+            DriveOutcome::Md5 { .. } => HandshakeProgress::AuthResponse,
             #[cfg(feature = "scram")]
             DriveOutcome::SaslContinue { .. } => HandshakeProgress::AuthResponse,
             DriveOutcome::ParamStatus { .. } => HandshakeProgress::ParamStatus,
@@ -451,6 +455,7 @@ impl ConnectingEngine {
             DriveOutcome::NeedMore => AuthEvent::NeedMore,
             DriveOutcome::Ready => AuthEvent::Ready,
             DriveOutcome::Cleartext => AuthEvent::AuthCleartext,
+            #[cfg(feature = "md5-auth")]
             DriveOutcome::Md5 { salt } => AuthEvent::AuthMd5 { salt },
             DriveOutcome::ProtoFail(_) => AuthEvent::Fail(&[]),
             #[cfg(feature = "scram")]
@@ -531,6 +536,7 @@ impl ConnectingEngine {
             match dispatch.event {
                 ConnEvent::Silent => continue,
                 ConnEvent::Cleartext => return DriveOutcome::Cleartext,
+                #[cfg(feature = "md5-auth")]
                 ConnEvent::Md5 { salt } => return DriveOutcome::Md5 { salt },
                 #[cfg(feature = "scram")]
                 ConnEvent::SaslContinue => return DriveOutcome::SaslContinue { start, end },
@@ -659,6 +665,7 @@ fn build_cleartext_password_message(
 }
 
 /// Build the MD5 `PasswordMessage`, reusing [`crate::md5::compute_response_body`].
+#[cfg(feature = "md5-auth")]
 fn build_md5_password_message(
     write: &mut WriteBuf,
     handshake: &Md5HandshakeState,
@@ -779,7 +786,21 @@ fn build_sasl_response(
 /// Classification of a parsed `Authentication` frame sub-code field.
 enum AuthCode<'a> {
     /// A recognised PG auth sub-code plus the bytes after it.
-    Known(AuthSubCode, &'a [u8]),
+    Known(
+        AuthSubCode,
+        // The trailing payload (MD5 salt / SASL mechanism list / SCRAM
+        // server-first|final) is read only by the `md5-auth` and `scram`
+        // dispatch arms; with BOTH gated out it is bound to `_` everywhere, so
+        // the field is legitimately dead in that minimal build.
+        #[cfg_attr(
+            not(any(feature = "scram", feature = "md5-auth")),
+            expect(
+                dead_code,
+                reason = "trailing auth payload is consumed only by the md5-auth / scram dispatch arms; with both features off it is bound to `_` everywhere"
+            )
+        )]
+        &'a [u8],
+    ),
     /// A 4-byte-aligned sub-code outside the PG-defined set.
     Unknown,
     /// The payload was shorter than the 4-byte sub-code field.
@@ -852,9 +873,11 @@ fn dispatch_connecting(
             dispatch_startup_cleartext(password, tag, payload, write)
         }
         ConnectingState::CleartextAwaitingAuthOk => dispatch_await_auth_ok(tag, payload),
+        #[cfg(feature = "md5-auth")]
         ConnectingState::StartupMd5 { handshake } => {
             dispatch_startup_md5(handshake, tag, payload, write)
         }
+        #[cfg(feature = "md5-auth")]
         ConnectingState::Md5AwaitingAuthOk => dispatch_await_auth_ok(tag, payload),
         #[cfg(feature = "scram")]
         ConnectingState::StartupScram { scram } => {
@@ -945,6 +968,7 @@ fn dispatch_startup_cleartext(
     }
 }
 
+#[cfg(feature = "md5-auth")]
 fn dispatch_startup_md5(
     handshake: Box<Md5HandshakeState>,
     tag: InboundTag,

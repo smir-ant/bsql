@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 # DEFAULT-ON. Forwards the core's `tls` + baked-Mozilla-roots defaults; a
 # localhost / unix-socket / trust-auth deployment drops the ENTIRE ring/rustls
 # subtree with `default-features = false`.
-default = ["tls", "webpki-roots", "scram"]
+default = ["tls", "webpki-roots", "scram", "md5-auth"]
 
 # `tls` — forward the core's default-on rustls-backed encrypted transport. With
 # it OFF (`default-features = false`) the whole ring/rustls subtree is dropped
@@ -51,6 +51,13 @@ n1-detect = ["bsql-postgres-core/n1-detect"]
 # direct dependency.
 scram = ["bsql-postgres-core/scram"]
 
+# `md5-auth` — forward the default-on MD5-password authentication. DEFAULT-ON.
+# With it OFF, `md-5` and its private crypto stack (7 crates) leave a
+# `--no-default-features` runtime graph; a server that demands MD5 is answered
+# with `ConnFail::UnsupportedAuthMethod` (fail-loud). Forwards to core only — no
+# extra direct dependency.
+md5-auth = ["bsql-postgres-core/md5-auth"]
+
 [dependencies]
 # `default-features = false` so the umbrella (and any consumer) can drop core's
 # default-on `webpki-roots` (the baked Mozilla CA blob); the driver re-exposes it
@@ -70,3 +77,12 @@ bsql-postgres-proto = { path = "../proto", default-features = false }
 # `src/pool.rs`; the live integration test carries one in `tests/`.
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Turn ON core's OFF-BY-DEFAULT `test-scenarios` feature for this driver's TEST
+# build only — its `--ignored` live suite (`tests/sync_live.rs`) invokes
+# `bsql_postgres_core::define_sql_scenario_tests!`. `default-features = false`
+# adds ONLY `test-scenarios` (the driver's own feature forwarding governs core's
+# tls/scram), and being dev-only keeps the macro out of a downstream consumer's
+# core.
+bsql-postgres-core = { path = "../core", default-features = false, features = ["test-scenarios"] }

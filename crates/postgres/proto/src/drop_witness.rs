@@ -304,8 +304,12 @@ impl<const N: usize> CrateZeroizeSecret for crate::ident::SecretBoundedStr<N> {}
 
 // `bsql-pg-proto::md5::Md5HandshakeState` — `derive(ZeroizeOnDrop)`
 // at `md5.rs:94`. Carries `Sensitive<Password>` (zeroized) +
-// `Ident` (skip).
+// `Ident` (skip). Present only under the `md5-auth` feature — with MD5 auth
+// off the type does not exist. (The exhaustiveness gate's scan is cfg-blind
+// text, so both the manifest and the discovered set still count it.)
+#[cfg(feature = "md5-auth")]
 impl sealed::Sealed for crate::md5::Md5HandshakeState {}
+#[cfg(feature = "md5-auth")]
 impl CrateZeroizeSecret for crate::md5::Md5HandshakeState {}
 
 // `bsql-pg-proto::password::Password` — `derive(Zeroize, ZeroizeOnDrop)`

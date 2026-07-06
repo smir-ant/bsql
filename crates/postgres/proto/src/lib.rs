@@ -144,6 +144,12 @@ pub mod engine;
 pub mod error;
 pub mod frame;
 pub mod ident;
+// MD5-password authentication (`AuthenticationMD5Password`). Behind the
+// default-on `md5-auth` feature: with it OFF the `md-5` crate (and its private
+// crypto stack) leaves the runtime graph, `Credentials::Md5Password` cannot be
+// built, and an MD5-demanding server is answered with
+// `ConnFail::UnsupportedAuthMethod` (fail-loud) by the always-present dispatch.
+#[cfg(feature = "md5-auth")]
 pub(crate) mod md5;
 // Typed numeric narrowing/widening helpers with single-audit-point
 // encapsulation of the `try_from(...).unwrap_or(SATURATION)` pattern.

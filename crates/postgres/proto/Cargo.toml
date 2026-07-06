@@ -27,15 +27,15 @@ autobenches = false
 # consumer drops it through the driver chain (each shipped dependent takes proto
 # with `default-features = false` and forwards this feature), so a
 # `--no-default-features` build carries no SCRAM crypto.
-default = ["scram"]
+default = ["scram", "md5-auth"]
 
 # `scram` — SCRAM-SHA-256 authentication (RFC 5802 / 7677): the whole `scram`
 # module (the RustCrypto composition), the `Credentials::ScramPassword` variant,
 # the four connecting-state SCRAM variants + their dispatch, the `ConnFail::Scram`
 # leaf class, and the SCRAM secret-zeroization drop witnesses. DEFAULT-ON. With it
 # OFF the SCRAM-EXCLUSIVE crypto crates — `sha2`, `hmac`, `pbkdf2`, `base64ct`,
-# `cpufeatures` (a `sha2` edge) — drop from the runtime graph (`md-5`, kept
-# unconditional for MD5 auth, keeps the shared `digest`/`subtle`/`generic-array`
+# `cpufeatures` (a `sha2` edge) — drop from the runtime graph (`md-5`, on via the
+# default-on `md5-auth` feature, keeps the shared `digest`/`subtle`/`generic-array`
 # stack alive, so ONLY these SCRAM-only crates drop — not the audit's optimistic
 # ~12). `getrandom` drops only when `tls` is also off (rustls/ring keeps it).
 # Trust auth still works OFF; a driver given a password with SCRAM off fails LOUD
@@ -52,6 +52,22 @@ scram = [
     "dep:getrandom",
 ]
 
+# `md5-auth` — MD5-password authentication (PG `AuthenticationMD5Password`,
+# sub-code 5): the whole `md5` module (its `md-5`-crate digest), the
+# `Credentials::Md5Password` variant, the two connecting-state MD5 variants
+# (`StartupMd5` / `Md5AwaitingAuthOk`) + their dispatch, and the MD5
+# secret-zeroization drop witness. DEFAULT-ON. With it OFF, exactly SEVEN crates
+# leave a `--no-default-features` runtime graph — `md-5` and its private
+# `digest`/`block-buffer`/`generic-array`/`typenum`/`crypto-common`/`cfg-if`
+# stack (none shared with the rest once SCRAM is also off). Fail-loud when OFF:
+# `Credentials::Md5Password` cannot be built, and a server that demands MD5 auth
+# is answered by the always-present dispatch arms with
+# `ConnFail::UnsupportedAuthMethod` — never a panic or a silent auth failure. The
+# unconditional `AuthSubCode::Md5Password` wire classification stays (it is only a
+# decode of a server sub-code; the fail-loud rides the dispatch, not the wire
+# enum). Optional dep → the golden lock is unchanged (`deps_pin` stays green).
+md5-auth = ["dep:md-5"]
+
 # No `bench-hooks` feature. A naive shape would gate `#[doc(hidden)] pub fn`
 # test/bench hooks behind a cargo feature that downstream users could enable in
 # their Cargo.toml (tier-3 by-discipline; CREDO §1 absolute-safety violation
@@ -65,11 +81,18 @@ scram = [
 heapless = { workspace = true }
 # SCRAM-SHA-256 crypto — OPTIONAL, behind the default-on `scram` feature. Each is
 # named only by the `scram`-gated `scram` module, so with SCRAM off they leave the
-# runtime graph. `md-5` (below) is UNCONDITIONAL (MD5 auth) and keeps the shared
-# `digest`/`generic-array`/`subtle` stack resolved, so `subtle` stays in the lock
-# even when its only DIRECT edge (SCRAM's `ConstantTimeEq`) is gated out.
+# runtime graph. `md-5` (below) rides the default-on `md5-auth` feature and shares
+# the `digest`/`generic-array`/`subtle` stack, so `subtle` stays in the lock while
+# EITHER `scram` or `md5-auth` is on — even when SCRAM's `ConstantTimeEq` (subtle's
+# only DIRECT edge) is gated out.
 sha2 = { workspace = true, optional = true }
-md-5 = { workspace = true }
+# `md-5` — OPTIONAL, behind the default-on `md5-auth` feature. Named only by the
+# `md5-auth`-gated `md5` module, so with MD5 auth off it (and its private
+# `digest`/`block-buffer`/`generic-array`/`typenum`/`crypto-common`/`cfg-if`
+# stack) leaves the runtime graph. It shares the `digest`/`generic-array`/`subtle`
+# stack with SCRAM, so `subtle` stays resolved while EITHER `scram` or `md5-auth`
+# is on.
+md-5 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 pbkdf2 = { workspace = true, optional = true }
 base64ct = { workspace = true, optional = true }

@@ -49,9 +49,11 @@ pub enum ConnectingState {
         password: alloc::boxed::Box<crate::sensitive::Sensitive<crate::password::Password>>,
     },
     CleartextAwaitingAuthOk,
+    #[cfg(feature = "md5-auth")]
     StartupMd5 {
         handshake: alloc::boxed::Box<crate::md5::Md5HandshakeState>,
     },
+    #[cfg(feature = "md5-auth")]
     Md5AwaitingAuthOk,
     #[cfg(feature = "scram")]
     StartupScram {
@@ -105,9 +107,11 @@ impl core::fmt::Debug for ConnectingState {
             Self::CleartextAwaitingAuthOk => {
                 write!(f, "CleartextAwaitingAuthOk")
             }
+            #[cfg(feature = "md5-auth")]
             Self::StartupMd5 { .. } => f
                 .debug_struct("StartupMd5")
                 .finish_non_exhaustive(),
+            #[cfg(feature = "md5-auth")]
             Self::Md5AwaitingAuthOk => {
                 write!(f, "Md5AwaitingAuthOk")
             }

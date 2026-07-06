@@ -188,10 +188,22 @@ impl fmt::Debug for Password {
 /// `Credentials` is a cold-path enum constructed once per connection,
 /// `Password` is 512 B by design ([`MAX_PASSWORD_LEN`]), and boxing at
 /// the variant layer would require allocation in user code — breaking
-/// the no_alloc-from-outside contract. `clippy::large_enum_variant`
-/// would warn only if a single variant dominated the size; the three
-/// password-bearing variants are symmetric and the lint does not fire
-/// on the current shape.
+/// the no_alloc-from-outside contract. In the full build the
+/// password-bearing variants (SCRAM / cleartext / MD5) are symmetric, so
+/// `clippy::large_enum_variant` (which fires only when a single variant
+/// dominates) does not warn. In the MINIMAL build with BOTH `scram` and
+/// `md5-auth` gated out, only `CleartextPassword` and unit `Trust` remain,
+/// so the heuristic flags a size gap that reflects the gated-out variants,
+/// not a fixable layout — the scoped `expect` below documents that (boxing
+/// to silence it would add a heap indirection to every credential on the
+/// common path).
+#[cfg_attr(
+    not(any(feature = "scram", feature = "md5-auth")),
+    expect(
+        clippy::large_enum_variant,
+        reason = "minimal build only: with both password features gated out, the inline 512-byte `Sensitive<Password>` in `CleartextPassword` is the lone large variant beside unit `Trust`; the full build's symmetric password variants close the gap, and boxing to appease the heuristic would cost a heap indirection on the common path"
+    )
+)]
 #[non_exhaustive]
 pub enum Credentials {
     /// Trust authentication — no password required.
@@ -242,6 +254,11 @@ pub enum Credentials {
     /// debug redaction. The MD5 computation is performed inside
     /// `crate::md5` which uses `Zeroizing<>` for every password-
     /// derived intermediate buffer.
+    ///
+    /// Present only under the default-on `md5-auth` feature — with MD5 auth off
+    /// the `md-5` crate is not compiled, so this credential cannot be built (an
+    /// MD5-demanding server then fails LOUD with `UnsupportedAuthMethod`).
+    #[cfg(feature = "md5-auth")]
     Md5Password(Sensitive<Password>),
 }
 
@@ -272,6 +289,7 @@ impl fmt::Debug for Credentials {
             Self::CleartextPassword(_) => {
                 f.write_str("Credentials::CleartextPassword(<REDACTED>)")
             }
+            #[cfg(feature = "md5-auth")]
             Self::Md5Password(_) => f.write_str("Credentials::Md5Password(<REDACTED>)"),
         }
     }

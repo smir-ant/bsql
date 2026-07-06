@@ -37,17 +37,32 @@ use bsql_postgres_proto::{DecodeError, TypedQuery};
 use crate::error::DbError;
 use crate::materialize::{parse_error_response, DbErrorSink};
 
-/// A per-ROW span into the prebuffer's `wire` byte vector. Not per-column —
+/// The per-ROW record in the prebuffer's span vector: one row's `DataRow`
+/// payload LENGTH (from its 2-byte column-count header onward). Not per-column —
 /// [`TypedQuery::decode_borrowed`] parses the columns out of one contiguous
 /// `DataRow` payload itself.
-#[derive(Debug, Clone, Copy)]
-struct RowSlot {
-    /// Byte offset of the row's `DataRow` payload (its 2-byte column-count
-    /// header onward) within `wire`.
-    offset: usize,
-    /// Byte length of that payload.
-    len: usize,
-}
+///
+/// The row's byte OFFSET into `wire` is NOT stored — it is the running
+/// prefix-sum of every prior row's length, reconstructed by a `usize`
+/// accumulator as [`Rows::iter`] / [`Rows::into_owned`] walk the spans in order.
+/// Storing only the length is 4 B/row instead of the 16 B a
+/// `{ offset: usize, len: usize }` slot cost — a 4× cut on a million-row result
+/// (4 MB vs 16 MB) — and there is no random-access row getter (the only readers
+/// are the two sequential walks), so the offset never needs to materialise. A
+/// whole `DataRow` payload is bounded by the inline frame buffer
+/// (`READ_BUF_CAP` = 4096; an oversize row streams as chunks and is flagged
+/// instead), so a per-row length fits a `u32` with headroom while the cumulative
+/// offset stays a full `usize`.
+type RowLen = u32;
+
+// The per-row span footprint: one `u32` length (4 B), down from the 16 B a
+// `{ offset: usize, len: usize }` slot cost. Widening `RowLen` back to a `usize`
+// or a two-field struct fails this E0080 drift pin.
+const _: () = assert!(
+    core::mem::size_of::<RowLen>() == 4,
+    "per-row span must be a single 4-byte length; the byte offset is a derived \
+     prefix-sum of prior lengths, never stored",
+);
 
 /// Type-erased prebuffer collector fed by a driver's typed-query sink.
 ///
@@ -59,7 +74,7 @@ struct RowSlot {
 #[derive(Debug, Default)]
 pub struct RowsBuilder {
     wire: Vec<u8>,
-    slots: Vec<RowSlot>,
+    slots: Vec<RowLen>,
     affected: u64,
     db_error: Option<DbError>,
     saw_oversize: bool,
@@ -77,12 +92,22 @@ impl RowsBuilder {
     pub fn feed(&mut self, surface: Surface<'_>) {
         match surface {
             Surface::Row(body) => {
-                let offset = self.wire.len();
                 self.wire.extend_from_slice(body);
-                self.slots.push(RowSlot {
-                    offset,
-                    len: body.len(),
-                });
+                // Record the payload LENGTH only; the byte offset is the running
+                // prefix-sum of prior lengths, reconstructed on the walk. A
+                // `DataRow` payload is bounded by the inline frame buffer
+                // (`READ_BUF_CAP` = 4096; an oversize row streams as `RowChunk`
+                // instead), so the narrow to `u32` is structurally infallible.
+                // The sink cannot return a `Result`, so the dead arm saturates
+                // rather than storing a wrong length: an (impossible) over-long
+                // body then over-runs `wire` at decode → a classified
+                // `TruncatedRow`, never a silent corruption of this or a later
+                // row's offset.
+                let payload_len = match RowLen::try_from(body.len()) {
+                    Ok(len) => len,
+                    Err(_) => RowLen::MAX,
+                };
+                self.slots.push(payload_len);
             }
             Surface::Deliver { tag, .. } => {
                 // The affected-row count rides the command tag (`SELECT 3` →
@@ -151,8 +176,9 @@ pub struct Rows<Q: TypedQuery> {
     /// Every result `DataRow` payload, concatenated (each begins with its
     /// 2-byte column-count header).
     wire: Vec<u8>,
-    /// One `(offset, len)` span per row into `wire`.
-    slots: Vec<RowSlot>,
+    /// One payload LENGTH per row into `wire`; the byte offset is the running
+    /// prefix-sum of prior lengths, reconstructed on the sequential walk.
+    slots: Vec<RowLen>,
     /// Affected-row count from the command tag.
     affected: u64,
     /// Pins the row type without owning a `Q`. `fn() -> Q` is covariant in `Q`
@@ -179,14 +205,15 @@ impl<Q: TypedQuery> Rows<Q> {
         self.affected
     }
 
-    /// The contiguous `DataRow` payload for one row span.
+    /// The contiguous `DataRow` payload at `offset` for `len` bytes.
     ///
-    /// The spans are produced by [`RowsBuilder::feed`] from the very bytes in
-    /// `wire`, so the slice always resolves; the `None` arm is fail-closed
-    /// (classified, never an out-of-bounds index) against a future seam.
-    fn row_body<'a>(wire: &'a [u8], slot: &RowSlot) -> Result<&'a [u8], DecodeError> {
-        wire.get(slot.offset..)
-            .and_then(|tail| tail.get(..slot.len))
+    /// The `(offset, len)` pair is reconstructed by the caller's prefix-sum walk
+    /// from the very bytes [`RowsBuilder::feed`] wrote into `wire`, so the slice
+    /// always resolves; the `None` arm is fail-closed (classified, never an
+    /// out-of-bounds index) against a future seam.
+    fn row_body(wire: &[u8], offset: usize, len: usize) -> Result<&[u8], DecodeError> {
+        wire.get(offset..)
+            .and_then(|tail| tail.get(..len))
             .ok_or(DecodeError::TruncatedRow)
     }
 
@@ -200,9 +227,23 @@ impl<Q: TypedQuery> Rows<Q> {
     /// runs).
     pub fn iter(&self) -> impl Iterator<Item = Result<Q::Record<'_>, DecodeError>> + '_ {
         let wire = self.wire.as_slice();
-        self.slots
-            .iter()
-            .map(move |slot| Q::decode_borrowed(Self::row_body(wire, slot)?))
+        // The byte offset is not stored per row: it is the running prefix-sum of
+        // the prior rows' lengths, threaded through this `usize` accumulator as
+        // the walk advances (the spans are visited strictly in order).
+        // Cumulative, so it stays a full `usize` even when a per-row length is a
+        // `u32`. `saturating_add` (the arithmetic wall forbids a bare `+`) never
+        // saturates in practice — the sum equals `wire.len()` — and a dead
+        // saturation would fail-closed to a classified `TruncatedRow`.
+        let mut offset: usize = 0;
+        self.slots.iter().map(move |&len| {
+            // `usize >= u32` on every supported target, so the widen is
+            // infallible; a failure is classified (not swallowed) as a
+            // `TruncatedRow` rather than fed on as a wrong length.
+            let len = usize::try_from(len).map_err(|_| DecodeError::TruncatedRow)?;
+            let start = offset;
+            offset = offset.saturating_add(len);
+            Q::decode_borrowed(Self::row_body(wire, start, len)?)
+        })
     }
 
     /// Decode every row into the owned twin, allocating one `Vec` plus one
@@ -215,8 +256,16 @@ impl<Q: TypedQuery> Rows<Q> {
     /// a partial, silently-truncated vector.
     pub fn into_owned(self) -> Result<Vec<Q::Owned>, DecodeError> {
         let mut out = Vec::with_capacity(self.slots.len());
-        for slot in &self.slots {
-            out.push(Q::decode_owned(Self::row_body(&self.wire, slot)?)?);
+        // Same derived-offset walk as `iter`: the running prefix-sum reconstructs
+        // each row's byte offset without a stored field.
+        let mut offset: usize = 0;
+        for &len in &self.slots {
+            // Infallible widen (`usize >= u32`); a failure is a classified
+            // `TruncatedRow`, never a swallowed default.
+            let len = usize::try_from(len).map_err(|_| DecodeError::TruncatedRow)?;
+            let start = offset;
+            offset = offset.saturating_add(len);
+            out.push(Q::decode_owned(Self::row_body(&self.wire, start, len)?)?);
         }
         Ok(out)
     }

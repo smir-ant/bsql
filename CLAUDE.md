@@ -412,8 +412,9 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `tls` on, exactly FIVE SCRAM-exclusive crates leave the async runtime graph —
   `sha2`, `hmac`, `pbkdf2`, `base64ct`, `cpufeatures` (41 → 36). `subtle` and
   `getrandom` are NOT SCRAM-exclusive (rustls/ring keep them), so they drop only
-  when `tls` is ALSO off; `md-5` stays unconditional (MD5 auth). With BOTH `tls`
-  and `scram` off the minimal build is 27 runtime crates (vs 41 default). FAIL-LOUD
+  when `tls` is ALSO off; `md-5` rides its own default-on `md5-auth` feature
+  (below). With BOTH `tls` and `scram` off the minimal build is 27 runtime crates
+  (vs 41 default); dropping `md5-auth` too removes 7 more → 20. FAIL-LOUD
   when off: password auth is SCRAM-only, so a driver given a password with `scram`
   off is a classified `DriverError::Config` at connect naming the missing feature
   (Trust auth still works; a Trust client hitting a SCRAM-demanding server already
@@ -423,3 +424,21 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `wire_pin!` pairs; the engine census counts the cfg-blind source text). The
   `scram`-off fail-loud is witnessed by `bsql-postgres-sync`'s
   `scram_off_fail_loud` test.
+- The whole MD5-password authentication capability
+  (`AuthenticationMD5Password`, sub-code 5) is behind the default-on `md5-auth`
+  feature (proto → core → drivers → umbrella; each shipped dependent takes proto
+  with `default-features = false` so a consumer can drop it). With `md5-auth` OFF,
+  exactly SEVEN crates leave a `--no-default-features` runtime graph — `md-5` and
+  its private `digest` / `block-buffer` / `generic-array` / `typenum` /
+  `crypto-common` / `cfg-if` stack (none shared with the rest once SCRAM is also
+  off). FAIL-LOUD when off: `Credentials::Md5Password` is feature-gated (a client
+  cannot opt into MD5), and a server that DEMANDS MD5 is answered by the
+  always-present dispatch arms with `ConnFail::UnsupportedAuthMethod` — never a
+  panic or a silent auth failure. The unconditional `AuthSubCode::Md5Password`
+  wire classification stays (it is only a decode of a server sub-code; the
+  fail-loud rides the dispatch, not the wire enum). Witnessed by
+  `bsql-postgres-proto`'s `md5_off_fail_loud` test
+  (`cargo test -p bsql-postgres-proto --no-default-features --test md5_off_fail_loud`).
+  The drivers themselves only ever build `Credentials::ScramPassword` / `Trust`,
+  so `md5-auth` gating leaves their code path untouched — MD5 is a proto-engine
+  capability, exercised by proto's own connect specs.
