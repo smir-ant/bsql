@@ -239,12 +239,12 @@ where
     // Drain the enqueued request once, before the first read.
     flush(send_buf, transport).await?;
 
-    // Drain a fused simple-query PRELUDE (a pipelined BEGIN, or a pool-checkout
-    // RESET) FIRST: its frame was enqueued ahead of the command's, so the single
-    // flush above carried BOTH. Its own results are swallowed; a NOTIFY / NOTICE /
+    // Drain a fused simple-query PRELUDE (today a pipelined transaction BEGIN)
+    // FIRST: its frame was enqueued ahead of the command's, so the single flush
+    // above carried BOTH. Its own results are swallowed; a NOTIFY / NOTICE /
     // ParameterStatus riding its response still surfaces through `sink`. Cold: only
-    // a transaction's first statement / a checkout's first verb arms one, so the
-    // common path is one predict-not-taken branch.
+    // a transaction's first statement arms one, so the common path is one
+    // predict-not-taken branch.
     if active.draining_prelude() {
         core::hint::cold_path();
         drain_fused_prelude(active, transport, &mut sink).await?;

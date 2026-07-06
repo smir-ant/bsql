@@ -175,8 +175,8 @@ fn enqueue_frame<E>(
 }
 
 /// Stage a fused simple-query PRELUDE at the FRONT of the current command's
-/// batch, if one was armed — a deferred `BEGIN` (fused with a transaction's first
-/// statement) or a pool-checkout session RESET.
+/// batch, if one was armed — today ONLY a deferred transaction `BEGIN`, fused
+/// with the transaction's first statement.
 ///
 /// Called by each request verb right after [`SendBuf::reset`](super::SendBuf::reset)
 /// and BEFORE it enqueues its own frames: the prelude's `'Q'` frame is enqueued
@@ -186,9 +186,11 @@ fn enqueue_frame<E>(
 /// (empty) buffer, the prelude is a natural PREPEND with no memmove.
 ///
 /// A no-op — one predict-not-taken branch — when no prelude is pending, the steady
-/// state. The prelude SQL is a fixed `BEGIN` / `COMMIT` / `ROLLBACK` / session
-/// RESET, all of which fit the bounded [`WriteBuf`]; a builder overflow is the
-/// classified [`EngineError::FrameTooLong`], never a silent truncation.
+/// state. The prelude SQL is a fixed short `'static` simple query (the `BEGIN`
+/// armed today) that fits the bounded [`WriteBuf`]; a builder overflow is the
+/// classified [`EngineError::FrameTooLong`], never a silent truncation. The drain
+/// only understands `BEGIN`'s non-row-bearing reply, so a row-bearing prelude
+/// (a pool RESET returning rows) is a deferred capability, not armed here.
 #[inline]
 fn stage_prelude<E>(
     active: &mut ActiveEngine,

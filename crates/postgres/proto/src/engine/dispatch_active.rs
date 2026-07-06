@@ -388,10 +388,12 @@ pub struct ActiveEngine {
     /// `.rodata`, so the entries are bare fat pointers, not owned strings.
     parsed_statements: Vec<&'static str>,
     /// The simple-query SQL of a fused PRELUDE to prepend to the NEXT command's
-    /// flush — a deferred `BEGIN` (fused with a transaction's first statement) or
-    /// a pool-checkout session RESET. `None` in steady state. Taken by the first
-    /// request verb that runs, which enqueues the prelude's `'Q'` frame ahead of
-    /// its own and then [`arm_prelude`](Self::arm_prelude)s the drain. The
+    /// flush — today ONLY a deferred transaction `BEGIN`, fused with the
+    /// transaction's first statement (a row-bearing prelude such as a pool RESET
+    /// is a deferred capability the drain does not yet handle — see
+    /// [`step_prelude`](Self::step_prelude)). `None` in steady state. Taken by the
+    /// first request verb that runs, which enqueues the prelude's `'Q'` frame ahead
+    /// of its own and then [`arm_prelude`](Self::arm_prelude)s the drain. The
     /// `'static` SQL is a bare `&str` into `.rodata`, never an owned allocation.
     ///
     /// Off the hot path: read only at a verb's send-path entry (never inside
@@ -593,20 +595,25 @@ impl ActiveEngine {
 
     // ── Fused-prelude staging + drain ─────────────────────────────────────
     //
-    // A transaction's `BEGIN` (and a pool checkout's session RESET) is DEFERRED
-    // and fused into the first following command's flush: one flush carries the
-    // prelude simple-query AND the command, and the prelude's own response is
-    // drained (swallowed) AHEAD of the command's, removing the prelude's standalone
-    // round trip. The mechanism is confined to a SEPARATE drain path
+    // A transaction's `BEGIN` is DEFERRED and fused into the first following
+    // command's flush: one flush carries the prelude simple-query AND the command,
+    // and the prelude's own response is drained (swallowed) AHEAD of the command's,
+    // removing the prelude's standalone round trip. `BEGIN` is the ONLY prelude
+    // armed today — the drain (`step_prelude`) understands only its non-row-bearing
+    // reply shape; a row-bearing prelude (a pool RESET returning a row) is deferred
+    // (see `step_prelude`). The mechanism is confined to a SEPARATE drain path
     // ([`next_prelude_event`](Self::next_prelude_event) / `drive_prelude` /
     // `step_prelude`), so the inbound hot dispatch [`next_event`](Self::next_event)
     // is byte-identical whether or not a prelude is armed — read below only in the
     // cold verb send-path and the cold drain path, never in `next_event`.
 
     /// Arm a fused simple-query prelude to prepend to the NEXT command's flush.
-    /// The SQL is a `'static` simple query (`BEGIN`, `COMMIT`, `ROLLBACK`, or a
-    /// session RESET). Overwrites any previously-armed pending prelude — the caller
-    /// (a transaction / pool checkout) arms exactly one at a time.
+    /// The SQL parameter is a general `'static &str`, but the ONLY prelude armed
+    /// today is a transaction `BEGIN`, and the drain ([`step_prelude`](Self::step_prelude))
+    /// handles only its non-row-bearing reply shape (`CommandComplete` +
+    /// `ReadyForQuery`) — a ROW-bearing prelude would hit the fatal-teardown arm.
+    /// Overwrites any previously-armed pending prelude — the caller (a transaction)
+    /// arms exactly one at a time.
     #[inline]
     pub fn set_pending_prelude(&mut self, sql: &'static str) {
         self.pending_prelude = Some(sql);
