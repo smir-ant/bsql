@@ -589,9 +589,24 @@ impl ConnectConfig {
 /// a public name, a private-range address (still reached over a network path),
 /// or a string that does not parse as an IP — is NOT loopback, so it is treated
 /// as remote (and defaults to `Require`).
+///
+/// A DSN authority carries an IPv6 literal in BRACKETS (`[::1]`) so the colons
+/// do not collide with the `:port` delimiter; the brackets are stripped (only
+/// when BOTH are present) before parsing, so a genuinely-local `[::1]` is
+/// classified local rather than mis-parsed as a remote name. The host is not
+/// mutated — only the classification reads the unbracketed form (the bracketed
+/// form is what `ToSocketAddrs` dials). A non-loopback bracketed literal
+/// (`[2001:db8::1]`, or the IPv4-mapped `[::ffff:127.0.0.1]`, which is not `::1`)
+/// still classifies remote — fail-safe.
 fn host_is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let unbracketed = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(inner) => inner,
+        None => host,
+    };
+    unbracketed.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// A resolved connection target derived from a [`ConnectConfig`]'s `host` +
@@ -985,6 +1000,9 @@ mod tests {
         assert_eq!(resolve_default("127.0.0.1", 5432), SslMode::Prefer);
         assert_eq!(resolve_default("127.0.0.5", 5432), SslMode::Prefer); // 127.0.0.0/8
         assert_eq!(resolve_default("::1", 5432), SslMode::Prefer);
+        // A DSN authority brackets an IPv6 literal (`[::1]`); the brackets are
+        // stripped for classification, so a genuinely-local IPv6 loopback is local.
+        assert_eq!(resolve_default("[::1]", 5432), SslMode::Prefer);
         assert_eq!(resolve_default("localhost", 5432), SslMode::Prefer);
         // RFC 6761 names `localhost` case-insensitively.
         assert_eq!(resolve_default("LocalHost", 5432), SslMode::Prefer);
@@ -1001,9 +1019,13 @@ mod tests {
         assert_eq!(resolve_default("192.168.1.1", 5432), SslMode::Require);
         assert_eq!(resolve_default("172.16.0.9", 5432), SslMode::Require);
         assert_eq!(resolve_default("8.8.8.8", 5432), SslMode::Require);
-        // A bracketed / otherwise-unparseable host is not a recognized loopback
-        // literal → treated as remote (fail-safe toward TLS).
-        assert_eq!(resolve_default("[::1]", 5432), SslMode::Require);
+        // A bracketed IPv6 literal is unbracketed before parsing, but a NON-loopback
+        // one stays remote: a public address, and the IPv4-mapped `::ffff:127.0.0.1`
+        // (which is not `::1`, so `Ipv6Addr::is_loopback` is false) — fail-safe.
+        assert_eq!(resolve_default("[2001:db8::1]", 5432), SslMode::Require);
+        assert_eq!(resolve_default("[::ffff:127.0.0.1]", 5432), SslMode::Require);
+        // An otherwise-unparseable host is not a recognized loopback literal → remote.
+        assert_eq!(resolve_default("[not-an-ip]", 5432), SslMode::Require);
     }
 
     #[test]

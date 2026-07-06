@@ -99,3 +99,31 @@ fn custom_ca_roots_without_tls_is_a_loud_config_error() {
         ),
     }
 }
+
+/// The DEFAULTED-remote + `tls`-off path funnels through the SAME resolved
+/// `Require` that `ssl_mode_require_without_tls_is_a_loud_config_error` (above)
+/// proves becomes the loud `DriverError::Config`.
+///
+/// Asserted here via the RESOLUTION UNIT rather than a live connect, ON PURPOSE:
+/// the `tls`-off `Require` rejection fires INSIDE `build_wire`, AFTER a successful
+/// TCP dial (unlike the pre-dial unix-`Require` check), so a live defaulted-remote
+/// connect would have to dial a real remote host — a DNS/network dependency this
+/// suite forbids. Instead the two composable halves are proven offline: (1) a
+/// remote host with NO explicit `SslMode` resolves to `Require` (here), and (2)
+/// the explicit-`Require` test above shows a resolved `Require` with `tls` off is
+/// the loud Config error. (`resolve_ssl_mode` is feature-independent, so it holds
+/// identically in this `--no-default-features` build.)
+#[test]
+fn defaulted_remote_resolves_to_require_the_tls_off_loud_path() {
+    let config = ConnectConfig::new("db.example.com", "u");
+    assert!(
+        !config.ssl_mode_is_explicit(),
+        "the defaulted case must carry no explicit SslMode",
+    );
+    let endpoint = bsql_postgres_core::resolve_endpoint("db.example.com", 5432);
+    assert_eq!(
+        config.resolve_ssl_mode(&endpoint),
+        SslMode::Require,
+        "a remote host with no explicit mode defaults to Require — the loud path",
+    );
+}
