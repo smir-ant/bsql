@@ -204,9 +204,23 @@ fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     #[cfg(not(feature = "sqlite"))]
     let _ = scan_acknowledged;
 
+    // The SQLite typed-runtime bridge (`impl SqliteTypedQuery for {Name}Query`),
+    // emitted ONLY when the umbrella's `sqlite` runtime driver is present (the
+    // `sqlite-runtime` macro feature) AND the query is SQLite-decodable — every
+    // projected column a SQLite storage class, unbridged, and no PostgreSQL-only
+    // dynamic sugar. A non-decodable query emits nothing here, so calling it on
+    // the SQLite driver is a located compile error, never a silent mis-decode.
+    // Empty (`quote!()`) with the feature off, so the PostgreSQL-only expansion
+    // is byte-identical to before.
+    #[cfg(feature = "sqlite-runtime")]
+    let sqlite_typed = emit_sqlite_typed(&name, &shape, &bridges)?;
+    #[cfg(not(feature = "sqlite-runtime"))]
+    let sqlite_typed = TokenStream2::new();
+
     Ok(quote! {
         #records
         #wire
+        #sqlite_typed
     })
 }
 
@@ -1903,6 +1917,186 @@ fn build_bind_execute_prefix_bytes(stmt_name: &str) -> Vec<u8> {
 fn byte_array_literal(bytes: &[u8]) -> TokenStream2 {
     let lits = bytes.iter().map(|b| Literal::u8_unsuffixed(*b));
     quote! { &[ #( #lits ),* ] }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// query! — SQLite typed-runtime bridge (feature `sqlite-runtime`)
+// ════════════════════════════════════════════════════════════════════
+//
+// The PostgreSQL `TypedQuery` above decodes a `DataRow` byte payload at const
+// offsets validated against wire OIDs — a model SQLite does not share (rusqlite
+// hands back native storage-class values). So the carrier ALSO implements
+// `SqliteTypedQuery` over the SAME record twins: `const SQL` (the portable,
+// `$N`-positional form SQLite binds) plus per-field decoders that read each
+// column through the driver's `FromColumn`, VERIFYING the actual storage class
+// against the declared field type at runtime (SQLite is dynamically typed). This
+// half is emitted ONLY under the `sqlite-runtime` feature (the umbrella's
+// `sqlite` driver) AND only for a SQLite-decodable query; otherwise nothing is
+// emitted here and the PostgreSQL expansion is byte-identical.
+
+/// The Rust field target for a SQLite typed decode of column type `ty`, or
+/// `None` if the type is NOT a SQLite storage class (a PostgreSQL-only
+/// `uuid`/`timestamptz`/`numeric`/array/… — decoded only on the PostgreSQL
+/// path). Owned targets copy text/blob (`String` / `Vec<u8>`); borrowed targets
+/// alias the source (`&'q str` / `&'q [u8]`), matching the record twin the
+/// `emit_records` path built. Exhaustive over [`bsql_build::RustType`], so a new
+/// column type forces a storable/not decision here.
+#[cfg(feature = "sqlite-runtime")]
+fn sqlite_target(ty: bsql_build::RustType, is_owned: bool) -> Option<TokenStream2> {
+    use bsql_build::RustType;
+    Some(match ty {
+        // SQLite stores every integer as `i64`; a narrower Rust target range-checks
+        // (a classified `IntegerOutOfRange`, never a wrapped read).
+        RustType::I16 => quote!(i16),
+        RustType::I32 => quote!(i32),
+        RustType::I64 => quote!(i64),
+        RustType::U32 => quote!(u32),
+        RustType::Bool => quote!(bool),
+        // SQLite REAL is `f64`.
+        RustType::F64 => quote!(f64),
+        RustType::Text => {
+            if is_owned {
+                quote!(::std::string::String)
+            } else {
+                quote!(&'q str)
+            }
+        }
+        RustType::Bytea => {
+            if is_owned {
+                quote!(::std::vec::Vec<u8>)
+            } else {
+                quote!(&'q [u8])
+            }
+        }
+        // NOT a SQLite storage class: `f32` (SQLite has only `f64` REAL) and the
+        // PostgreSQL-only value types / arrays. A query projecting one is decoded
+        // on the PostgreSQL path only; the SQLite bridge is skipped for the whole
+        // query, so `sqlite_conn.query::<That>()` is a located compile error.
+        RustType::F32
+        | RustType::Uuid
+        | RustType::Timestamptz
+        | RustType::Timestamp
+        | RustType::Date
+        | RustType::Time
+        | RustType::Interval
+        | RustType::Json
+        | RustType::Jsonb
+        | RustType::Numeric
+        | RustType::Array(_) => return None,
+    })
+}
+
+/// One SQLite record-field decode expression: read column `idx` through the
+/// driver's `FromColumn`, verifying the storage class. A nullable column routes
+/// through `read_optional` (`NULL` → `None`); a NOT-NULL column through
+/// `read_required` (`NULL` → the classified `UnexpectedNull`). `None` if the
+/// column type is not a SQLite storage class.
+#[cfg(feature = "sqlite-runtime")]
+fn sqlite_field_decode(
+    ty: bsql_build::RustType,
+    nullable: bool,
+    is_owned: bool,
+    idx: usize,
+) -> Option<TokenStream2> {
+    let target = sqlite_target(ty, is_owned)?;
+    let idx_lit = Literal::usize_unsuffixed(idx);
+    let helper = if nullable {
+        quote!(read_optional)
+    } else {
+        quote!(read_required)
+    };
+    Some(quote! {
+        ::bsql::__rt_sqlite::#helper::<#target, __S>(__src, #idx_lit)?
+    })
+}
+
+/// Emit the SQLite typed-runtime bridge `impl SqliteTypedQuery for {Name}Query`,
+/// or NOTHING (`quote!()`) when the query is not SQLite-decodable — a
+/// PostgreSQL-only dynamic form (`OPTIONAL(...)`, `= ANY(...)`, a runtime
+/// `ORDER BY` allow-set), a bridged column, or a column type SQLite cannot
+/// store. Emitting nothing (rather than a fallible runtime impl) keeps the
+/// not-decodable case a LOCATED compile error at the `sqlite_conn.query::<Q>()`
+/// call site, never a silent mis-decode.
+#[cfg(feature = "sqlite-runtime")]
+fn emit_sqlite_typed(
+    name: &Ident,
+    shape: &bsql_build::DynamicShape,
+    bridges: &Bridges,
+) -> syn::Result<TokenStream2> {
+    // A runtime `ORDER BY` allow-set or an `OPTIONAL(...)` / `= ANY(...)` param
+    // is PostgreSQL-runtime sugar with no SQLite lowering — skip the bridge.
+    if shape.order_by.is_some()
+        || shape
+            .params
+            .iter()
+            .any(|p| !matches!(p, bsql_build::ParamShape::Scalar(_)))
+    {
+        return Ok(TokenStream2::new());
+    }
+
+    // Per-column decode expressions (borrowed + owned twins). Bail to "no
+    // bridge" the moment a column is bridged or not SQLite-storable.
+    let mut borrowed_inits = Vec::with_capacity(shape.columns.len());
+    let mut owned_inits = Vec::with_capacity(shape.columns.len());
+    for (idx, col) in shape.columns.iter().enumerate() {
+        if bridges.for_column(col.ty).is_some() {
+            return Ok(TokenStream2::new());
+        }
+        let (Some(borrowed), Some(owned)) = (
+            sqlite_field_decode(col.ty, col.nullable, false, idx),
+            sqlite_field_decode(col.ty, col.nullable, true, idx),
+        ) else {
+            return Ok(TokenStream2::new());
+        };
+        let id = make_field_ident(&col.name, name.span())?;
+        borrowed_inits.push(quote! { #id: #borrowed });
+        owned_inits.push(quote! { #id: #owned });
+    }
+
+    // The SQLite-preparable SQL: the portable `infer_sql` form the build-time
+    // conformance oracle prepares against real SQLite, with `$N` rewritten to
+    // SQLite's `?N` numbered form by the SAME `sqlite_placeholder_form`
+    // authority the oracle uses — so the baked runtime string is byte-identical
+    // to the one build-time validation proved SQLite prepares (no drift, not a
+    // "happens to accept `$N`" assumption).
+    let infer_sql = &shape
+        .variants
+        .first()
+        .ok_or_else(|| syn::Error::new(name.span(), "query!: internal error — no wire variant"))?
+        .infer_sql;
+    let sqlite_sql = bsql_build::sqlite_placeholder_form(infer_sql);
+
+    let carrier = format_ident!("{}Query", name);
+    let owned_name = format_ident!("{}Owned", name);
+    // Mirror `emit_records`: the borrowed record carries `<'q>` iff a column
+    // borrows the input (`text` / `bytea`, unbridged), so the GAT projection
+    // agrees with the emitted struct.
+    let has_borrowed = shape.columns.iter().any(|c| column_borrows(c.ty, bridges));
+    let record_ty = if has_borrowed {
+        quote!(#name<'q>)
+    } else {
+        quote!(#name)
+    };
+
+    Ok(quote! {
+        impl ::bsql::__rt_sqlite::SqliteTypedQuery for #carrier {
+            type Record<'q> = #record_ty;
+            type Owned = #owned_name;
+            const SQL: &'static str = #sqlite_sql;
+
+            fn decode_row<'q, __S: ::bsql::__rt_sqlite::ColumnSource<'q>>(
+                __src: &__S,
+            ) -> ::core::result::Result<Self::Record<'q>, ::bsql::__rt_sqlite::SqliteError> {
+                ::core::result::Result::Ok(#name { #(#borrowed_inits),* })
+            }
+
+            fn decode_row_owned<'__a, __S: ::bsql::__rt_sqlite::ColumnSource<'__a>>(
+                __src: &__S,
+            ) -> ::core::result::Result<Self::Owned, ::bsql::__rt_sqlite::SqliteError> {
+                ::core::result::Result::Ok(#owned_name { #(#owned_inits),* })
+            }
+        }
+    })
 }
 
 // ════════════════════════════════════════════════════════════════════

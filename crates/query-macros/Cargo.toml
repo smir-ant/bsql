@@ -66,6 +66,17 @@ sha2 = { workspace = true }
 # runtime graph.
 sqlite = ["bsql-build/sqlite"]
 
+# `sqlite-runtime` — emit the `SqliteTypedQuery` impl (the SQLite half of the
+# typed flagship) for a SQLite-decodable `query!`. Turned on by the umbrella's
+# `sqlite` runtime-driver feature (only when `macros` is also on), so the
+# emitted `::bsql::__rt_sqlite::...` paths resolve against the present driver. A
+# PostgreSQL-only consumer leaves it off and gets a byte-identical PostgreSQL-only
+# expansion. Pulls NO dependency (the runtime emission reuses the already-inferred
+# shape — it needs no SQLite validation toolchain, unlike `sqlite` above). Kept
+# ORTHOGONAL to `sqlite` (build-time conformance) so a consumer can enable either
+# independently.
+sqlite-runtime = []
+
 # Inherit the workspace FORBID floor (the lint wall). This crate carries
 # its own stricter crate-root forbid-bundle in `src/lib.rs`, which
 # coexists with the floor.

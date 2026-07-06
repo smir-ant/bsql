@@ -13,7 +13,7 @@ fn escape(conn: &Connection) {
     // `stash` outlives the callback. Pushing a borrow taken from the row into
     // it would let that borrow escape the `for<'r>` bound — the violation.
     let mut stash: Vec<&str> = Vec::new();
-    let _ = conn.query_each("SELECT 'x'", |row| {
+    let _ = conn.query_each_sql("SELECT 'x'", |row| {
         let s = row.get::<&str>(0).expect("str");
         stash.push(s);
         ControlFlow::<()>::Continue(())

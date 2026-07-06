@@ -64,7 +64,7 @@
 //! ## Quick start — SQLite
 //!
 //! ```rust,ignore
-//! use bsql::sqlite::Connection;
+//! use bsql::sqlite::{Connection, ValueRef};
 //!
 //! let conn = Connection::open_in_memory()?;
 //! conn.execute("CREATE TABLE t(v INTEGER)")?;
@@ -72,8 +72,15 @@
 //!     tx.execute("INSERT INTO t VALUES (42)")?;
 //!     Ok(())
 //! })?;
-//! let row = conn.query_one("SELECT v FROM t")?;
-//! assert_eq!(row.get_i64(0), Some(42));
+//! // Dynamic (raw-SQL) verbs carry the `_sql` suffix; reads are classified.
+//! let row = conn.query_one_sql("SELECT v FROM t")?;
+//! assert_eq!(row.get::<i64>(0)?, 42);
+//!
+//! // The compile-checked `query!` flagship runs against SQLite too (feature
+//! // `sqlite`): the bare `query::<Q>` / `query_one::<Q>` / … verbs decode into
+//! // typed records, verifying each value's storage class at runtime.
+//! // bsql::query!(Val, "SELECT v FROM t");
+//! // let vals = conn.query::<ValQuery>(&[])?;   // TypedRows<ValQuery>
 //! ```
 //!
 //! ## The compile-checked `query!` flagship (feature `macros`)
@@ -229,6 +236,23 @@ pub mod __rt {
         BinaryFmt, Cell, ColCellAt, DataRowRef, Date, DecodeError, Interval, Json, Jsonb, Numeric,
         PreparedQuery, QueryFingerprint, Time, Timestamp, Timestamptz, TypedQuery, Uuid, oids,
         prepared, query_budget,
+    };
+}
+
+/// SQLite typed-runtime support the `query!` expansion names.
+///
+/// NOT a stable API and NOT for direct use — the SQLite half of a `query!`
+/// expansion (`::bsql::__rt_sqlite::...`) resolves through the single `bsql`
+/// dependency. Present only when BOTH the `macros` and `sqlite` features are on
+/// (the macro emits a `SqliteTypedQuery` impl only then), so a PostgreSQL-only
+/// or a driverless-macros build compiles no reference to it. The set is exactly
+/// the SQLite typed-decode primitives the macro references: the carrier trait,
+/// the row-view seam, the classified error, and the per-field read helpers.
+#[cfg(all(feature = "macros", feature = "sqlite"))]
+#[doc(hidden)]
+pub mod __rt_sqlite {
+    pub use bsql_sqlite::{
+        read_optional, read_required, ColumnSource, SqliteError, SqliteTypedQuery,
     };
 }
 

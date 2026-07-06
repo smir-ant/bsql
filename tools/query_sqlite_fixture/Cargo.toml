@@ -13,16 +13,20 @@ description = "Fixture consumer exercising the bsql SQLite build-time validation
 publish = false
 
 [dependencies]
-# The umbrella crate, and the ONLY runtime dependency of this fixture's own
-# code. `macros` reaches the flagship `query!` (its expansion names only
+# The umbrella crate, and the ONLY dependency of this fixture's own code.
+# `macros` reaches the flagship `query!` (its PostgreSQL expansion names only
 # `::bsql::__rt::` paths); `macros-sqlite` turns ON the macro's build-time
-# SQLite conformance cross-check (pulling the build-time-only SQLite
-# validation toolchain, host/expansion only). This is the exact wiring a real
-# SQLite-targeting consumer uses: `bsql` with `["macros", "macros-sqlite"]`
-# plus the `[build-dependencies]` catalog+template generator below. The
-# build-time SQLite toolchain (rusqlite, bsql-build, sqlparser) never enters
-# this crate's runtime closure — `bsql-query-macros` is a host-only proc-macro.
-bsql = { path = "../../crates/bsql", default-features = false, features = ["macros", "macros-sqlite"] }
+# SQLite conformance cross-check (host/expansion only); `sqlite` pulls the
+# embedded SQLite RUNTIME driver AND turns on the macro's SQLite typed-runtime
+# emission (`::bsql::__rt_sqlite::...`), so a `query!` carrier gains its
+# `SqliteTypedQuery` impl and `bsql::sqlite::Connection::query::<Q>()` executes
+# it. This is the exact wiring a real SQLite-targeting consumer uses:
+# `["macros", "macros-sqlite", "sqlite"]` plus the `[build-dependencies]`
+# catalog+template generator below. The build-time SQLite VALIDATION toolchain
+# (bsql-build, sqlparser) stays host-only — `bsql-query-macros` is a proc-macro
+# — while the RUNTIME driver (rusqlite, via `sqlite`) is deliberately in the
+# runtime closure now, because this fixture EXECUTES typed queries.
+bsql = { path = "../../crates/bsql", default-features = false, features = ["macros", "macros-sqlite", "sqlite"] }
 
 [build-dependencies]
 # BUILD-DEPENDENCY ONLY, with the `sqlite` feature on: bsql-build both

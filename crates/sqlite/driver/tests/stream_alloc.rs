@@ -48,7 +48,7 @@ fn stream_rows(conn: &Connection, n: i64) -> (usize, usize) {
 
     let before = ALLOC.snapshot();
     let outcome = conn
-        .query_each(&sql, |row| {
+        .query_each_sql(&sql, |row| {
             // The exact per-row work: borrowed primitive reads (zero-copy, no
             // alloc), nothing accumulated.
             sum = sum.wrapping_add(row.get::<i64>(0).expect("x"));

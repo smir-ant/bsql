@@ -248,6 +248,21 @@ impl SqliteValue {
 /// on an `INTEGER` reads the integer directly, and `get::<i64>` on a `TEXT`
 /// value is a [`SqliteError::TypeMismatch`], not a hopeful `str::parse`.
 ///
+/// # Numeric coercion: lossless-or-loud (by design)
+///
+/// The one place a value is coerced ACROSS storage classes is
+/// `INTEGER → f64`, and it is deliberately ASYMMETRIC: `get::<f64>` accepts an
+/// `INTEGER` in `[-(2^53), 2^53]` (every such integer is exactly representable
+/// as `f64`, so the widening is LOSSLESS), and an integer OUTSIDE that range is
+/// the classified [`SqliteError::InexactFloat`] ("read it as `i64`") — never a
+/// silently-rounded approximation. The reverse — `get::<i64>` on a `REAL` — is
+/// NOT coerced at all: it is a [`SqliteError::TypeMismatch`], because a real is a
+/// LOSSY source for an integer (the fractional part, or a magnitude past
+/// `i64`). The rule is uniform: a cross-class read succeeds only when it is
+/// provably lossless, and is a loud classified error otherwise. The narrowing
+/// integer reads (`i16`/`i32`/`u32`/`u64` from an out-of-range `i64`) follow the
+/// same rule via [`SqliteError::IntegerOutOfRange`].
+///
 /// The lifetime `'a` is the borrow of the source value: an owned target
 /// (`String`, `Vec<u8>`, `i64`, …) ignores it; a borrowed target (`&'a str`,
 /// `&'a [u8]`) borrows the column buffer zero-copy.
@@ -286,6 +301,24 @@ impl FromColumn<'_> for i64 {
     fn from_column(column: usize, value: ValueRef<'_>) -> Result<Self, SqliteError> {
         match value {
             ValueRef::Integer(n) => Ok(n),
+            other => Err(SqliteError::TypeMismatch {
+                column,
+                expected: Type::Integer,
+                found: other.data_type(),
+            }),
+        }
+    }
+}
+
+impl FromColumn<'_> for i16 {
+    fn from_column(column: usize, value: ValueRef<'_>) -> Result<Self, SqliteError> {
+        match value {
+            // SQLite integers are `i64`; a narrower `i16` (a `smallint` column)
+            // range-checks. Out of range is the classified `IntegerOutOfRange`,
+            // never a truncated/wrapped read — mirroring `i32`/`u32`.
+            ValueRef::Integer(n) => {
+                Self::try_from(n).map_err(|_| SqliteError::IntegerOutOfRange { column, value: n })
+            }
             other => Err(SqliteError::TypeMismatch {
                 column,
                 expected: Type::Integer,

@@ -87,7 +87,8 @@ mod infer;
 mod sqlite;
 
 pub use dynamics::{
-    infer_dynamic_query, DynamicError, DynamicShape, OrderByVariant, ParamShape, WireVariant,
+    infer_dynamic_query, sqlite_placeholder_form, DynamicError, DynamicShape, OrderByVariant,
+    ParamShape, WireVariant,
 };
 pub use infer::{
     infer_query, scalar_rust_type_for_pg, ElemType, InferError, InferredColumn, QueryShape,

@@ -856,9 +856,89 @@ fn collect_placeholders(text: &str, out: &mut BTreeSet<usize>) -> Result<(), Dyn
     Ok(())
 }
 
+/// Rewrite PostgreSQL `$N` placeholders to SQLite `?N` numbered parameters,
+/// outside string literals. SQLite does not accept the `$N` numeric-after-dollar
+/// form; `?N` is its numbered-parameter spelling and preserves reuse (`?1` twice
+/// binds one slot, matching `$1` twice).
+///
+/// The SINGLE authority for the placeholder form: the build-time SQLite
+/// conformance oracle prepares this exact rewrite of a query's `infer_sql`, and
+/// the `query!` macro bakes the SAME rewrite as a SQLite carrier's `const SQL`,
+/// so the string executed at runtime is byte-identical to the one build-time
+/// validation proved SQLite prepares — no drift between the two.
+#[must_use]
+pub fn sqlite_placeholder_form(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_squote {
+            if c == b'\'' {
+                in_squote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dquote {
+            if c == b'"' {
+                in_dquote = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_squote = true;
+                i += 1;
+            }
+            b'"' => {
+                in_dquote = true;
+                i += 1;
+            }
+            b'$' => {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > i + 1 {
+                    // `i` (the `$`) and `j` (after the digits) are ASCII byte
+                    // positions, so these slices sit on char boundaries.
+                    out.push_str(&sql[copied..i]);
+                    out.push('?');
+                    out.push_str(&sql[i + 1..j]);
+                    i = j;
+                    copied = i;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    out.push_str(&sql[copied..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_placeholder_form_rewrites_outside_string_literals() {
+        assert_eq!(
+            sqlite_placeholder_form("WHERE id = $1 AND x = $12"),
+            "WHERE id = ?1 AND x = ?12"
+        );
+        // A `$1` inside a string literal is left untouched; the real placeholder
+        // outside it is rewritten.
+        assert_eq!(sqlite_placeholder_form("'$1' = $1"), "'$1' = ?1");
+    }
 
     fn cat() -> Catalog {
         // users(id int8 PK, email text NOT NULL); orders(id int8 PK,

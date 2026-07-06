@@ -3,8 +3,8 @@ error[E0521]: borrowed data escapes outside of closure
    |
 15 |     let mut stash: Vec<&str> = Vec::new();
    |         --------- `stash` declared here, outside of the closure body
-16 |     let _ = conn.query_each("SELECT 'x'", |row| {
-   |                                            --- `row` is a reference that is only valid in the closure body
+16 |     let _ = conn.query_each_sql("SELECT 'x'", |row| {
+   |                                                --- `row` is a reference that is only valid in the closure body
 17 |         let s = row.get::<&str>(0).expect("str");
 18 |         stash.push(s);
    |         ^^^^^^^^^^^^^ `row` escapes the closure body here

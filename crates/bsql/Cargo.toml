@@ -10,7 +10,14 @@ license = "MIT OR Apache-2.0"
 default = ["postgres-async", "postgres-sync", "sqlite", "tls", "webpki-roots", "scram", "md5-auth"]
 postgres-async = ["dep:bsql-postgres-async"]
 postgres-sync = ["dep:bsql-postgres-sync"]
-sqlite = ["dep:bsql-sqlite"]
+# `sqlite` — the embedded SQLite driver. When `macros` is ALSO on, it turns on
+# the `query!` macro's SQLite typed-runtime emission (`bsql-query-macros`'s
+# `sqlite-runtime` feature), so a `query!` carrier gains its `SqliteTypedQuery`
+# impl and `bsql::sqlite::Connection::query::<Q>()` executes it. The `?` keeps
+# the macro edge inert when `macros` is off (the proc-macro is absent). This is
+# ORTHOGONAL to `macros-sqlite` below: that is the build-time SQLite conformance
+# oracle; this is the runtime driver + its typed emission.
+sqlite = ["dep:bsql-sqlite", "bsql-query-macros?/sqlite-runtime"]
 
 # `tls` — the rustls-backed encrypted PostgreSQL transport, DEFAULT-ON. Forwards
 # to whichever PostgreSQL driver(s) are enabled (the `?` activates it ONLY on an

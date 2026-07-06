@@ -44,7 +44,7 @@ fn materialize_rows(conn: &Connection, n: i64) -> (usize, usize) {
     );
 
     let before = ALLOC.snapshot();
-    let result = conn.query(&sql).expect("query");
+    let result = conn.query_sql(&sql).expect("query");
     let after = ALLOC.snapshot();
 
     // Touch every row so the arena is fully addressed (mint each handle, read

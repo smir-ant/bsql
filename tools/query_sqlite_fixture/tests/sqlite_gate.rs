@@ -49,6 +49,13 @@ fn sqlite_conformance_gate() {
     t.compile_fail("tests/compile_fail/type_disagreement.rs");
     t.compile_fail("tests/compile_fail/scan_on_toggle.rs");
 
+    // Caught by the SQLite typed RUNTIME: a query that types on PostgreSQL and
+    // passes conformance but uses PostgreSQL-only dynamic sugar (`OPTIONAL(...)`)
+    // is not SQLite-decodable, so the macro emits no `SqliteTypedQuery` impl —
+    // executing it on `bsql::sqlite::Connection` is a LOCATED compile error at
+    // the call site (the trait bound is unsatisfied), never a silent mis-run.
+    t.compile_fail("tests/compile_fail/typed_pg_only_on_sqlite.rs");
+
     // RECORDED DECISION — there is deliberately NO nullability-disagreement
     // compile-fail fixture here (only the type-disagreement one above). A
     // TYPE fork arises organically: PostgreSQL `oid` types as `u32` in the

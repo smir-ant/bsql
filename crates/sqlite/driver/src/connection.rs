@@ -1,9 +1,11 @@
+use core::marker::PhantomData;
 use core::ops::ControlFlow;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::SqliteError;
+use crate::typed::{ColumnSource, SqliteTypedQuery};
 use crate::value::{typed_get, typed_get_opt, FromColumn, Type, ValueRef};
 
 /// Default busy timeout applied by [`Connection::open`] / [`open_in_memory`]: a
@@ -21,7 +23,7 @@ const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// by the discriminant with no sentinel. The `u32` offset/len keep the slot at
 /// 16 bytes; a whole result whose text/blob bytes exceed `u32::MAX` (a `> 4 GiB`
 /// eager materialization) is rejected loudly at seal rather than mis-addressed
-/// (stream it via [`Connection::query_each`] instead — that path has no cap).
+/// (stream it via [`Connection::query_each_sql`] instead — that path has no cap).
 #[derive(Debug, Clone, Copy)]
 enum CellSlot {
     Null,
@@ -352,31 +354,7 @@ impl Row {
     /// The text/blob byte slices borrow the shared arena for `&self`'s lifetime,
     /// so the view is honestly zero-copy.
     pub fn value_ref(&self, col: usize) -> Result<ValueRef<'_>, SqliteError> {
-        let inner = &*self.arena;
-        let n_cols = usize::from(inner.n_cols);
-        if col >= n_cols {
-            return Err(SqliteError::ColumnIndexOutOfBounds { index: col, count: n_cols });
-        }
-        // The arena is built by `ArenaBuilder` with `slots.len() == n_rows *
-        // n_cols` and every text/blob range in-bounds, and a `Row` is minted
-        // only for `row_idx < n_rows`, so for an in-range `col` the slot and
-        // byte lookups below are total BY CONSTRUCTION. The `?` / `.get()`
-        // fail-closed arms are the architecturally unreachable dead path — never
-        // a panic, never an out-of-bounds index, never a fabricated value —
-        // mirroring the PostgreSQL arena's fail-closed shape.
-        let corrupt = || SqliteError::Query("arena slot resolution failed (invariant violated)".to_owned());
-        let row_base = usize::try_from(self.row_idx).map_err(|_| corrupt())?;
-        let slot_idx = row_base
-            .checked_mul(n_cols)
-            .and_then(|b| b.checked_add(col))
-            .ok_or_else(corrupt)?;
-        match *inner.slots.get(slot_idx).ok_or_else(corrupt)? {
-            CellSlot::Null => Ok(ValueRef::Null),
-            CellSlot::Integer(n) => Ok(ValueRef::Integer(n)),
-            CellSlot::Real(f) => Ok(ValueRef::Real(f)),
-            CellSlot::Text { offset, len } => Ok(ValueRef::Text(slice_arena(&inner.data, offset, len)?)),
-            CellSlot::Blob { offset, len } => Ok(ValueRef::Blob(slice_arena(&inner.data, offset, len)?)),
-        }
+        resolve_cell(&self.arena, self.row_idx, col)
     }
 
     /// Read column `col` as `T`, classifying any failure. A real `NULL` is
@@ -433,6 +411,45 @@ impl Row {
     }
 }
 
+/// Resolve column `col` of row `row_idx` in `inner` to a borrowed [`ValueRef`],
+/// or a classified error. The single arena cell-resolution routine, called by
+/// BOTH the owned [`Row`] handle ([`Row::value_ref`]) and the borrowed
+/// [`ArenaRowRef`] view — so the two cannot drift, and the borrowed view's
+/// zero-copy cell reuses the exact slot/byte-range logic the handle proved.
+///
+/// The returned [`ValueRef`] borrows `inner` (the `&ArenaInner` argument), so
+/// its lifetime is the caller's arena borrow — NOT the receiver: an
+/// [`ArenaRowRef<'a>`] holding `&'a ArenaInner` yields a `ValueRef<'a>` (the
+/// container's lifetime), which is what makes a typed borrowed record outlive
+/// the per-row view.
+///
+/// The arena is built by `ArenaBuilder` with `slots.len() == n_rows * n_cols`
+/// and every text/blob range in-bounds, and a row index is used only when
+/// `< n_rows`, so for an in-range `col` the slot and byte lookups are total BY
+/// CONSTRUCTION. The `?` / `.get()` fail-closed arms are the architecturally
+/// unreachable dead path — never a panic, never an out-of-bounds index, never a
+/// fabricated value.
+fn resolve_cell(inner: &ArenaInner, row_idx: u32, col: usize) -> Result<ValueRef<'_>, SqliteError> {
+    let n_cols = usize::from(inner.n_cols);
+    if col >= n_cols {
+        return Err(SqliteError::ColumnIndexOutOfBounds { index: col, count: n_cols });
+    }
+    let corrupt =
+        || SqliteError::Query("arena slot resolution failed (invariant violated)".to_owned());
+    let row_base = usize::try_from(row_idx).map_err(|_| corrupt())?;
+    let slot_idx = row_base
+        .checked_mul(n_cols)
+        .and_then(|b| b.checked_add(col))
+        .ok_or_else(corrupt)?;
+    match *inner.slots.get(slot_idx).ok_or_else(corrupt)? {
+        CellSlot::Null => Ok(ValueRef::Null),
+        CellSlot::Integer(n) => Ok(ValueRef::Integer(n)),
+        CellSlot::Real(f) => Ok(ValueRef::Real(f)),
+        CellSlot::Text { offset, len } => Ok(ValueRef::Text(slice_arena(&inner.data, offset, len)?)),
+        CellSlot::Blob { offset, len } => Ok(ValueRef::Blob(slice_arena(&inner.data, offset, len)?)),
+    }
+}
+
 /// Borrow `data[offset .. offset+len]`, fail-closed to a classified error if the
 /// range is out of bounds. The range is in-bounds BY CONSTRUCTION (the builder
 /// only records a slot after copying its bytes and checking the 32-bit sum), so
@@ -445,7 +462,7 @@ fn slice_arena(data: &[u8], offset: u32, len: u32) -> Result<&[u8], SqliteError>
 }
 
 /// A borrowed view of a single row on the streaming path, valid only for the
-/// duration of the [`Connection::query_each`] callback that receives it.
+/// duration of the [`Connection::query_each_sql`] callback that receives it.
 ///
 /// `Text`/`Blob` reads (`get::<&str>` / `get::<&[u8]>` / [`BorrowedRow::value_ref`])
 /// borrow SQLite's own column buffer with zero copy. The view's lifetime `'r`
@@ -504,6 +521,19 @@ impl<'r> BorrowedRow<'r> {
     #[must_use]
     pub fn column_count(&self) -> usize {
         self.row.as_ref().column_count()
+    }
+}
+
+// A streaming row is a typed-decode column source: `cell` lends SQLite's own
+// column buffer for the row step (`'r`), so a borrowed typed record decoded
+// through it borrows that buffer zero-copy.
+impl<'r> ColumnSource<'r> for BorrowedRow<'r> {
+    fn cell(&self, col: usize) -> Result<ValueRef<'r>, SqliteError> {
+        self.value_ref(col)
+    }
+
+    fn column_count(&self) -> usize {
+        BorrowedRow::column_count(self)
     }
 }
 
@@ -577,7 +607,12 @@ impl Connection {
     }
 
     /// Run `sql` and eagerly materialize every row.
-    pub fn query(&self, sql: &str) -> Result<QueryResult, SqliteError> {
+    ///
+    /// The `_sql` suffix marks the DYNAMIC (raw-SQL-text) verb, distinct from the
+    /// compile-checked typed flagship [`query`](Self::query)`::<Q>` that runs a
+    /// `query!` carrier — the same naming split the PostgreSQL driver uses
+    /// (`query_sql` dynamic, `query` typed).
+    pub fn query_sql(&self, sql: &str) -> Result<QueryResult, SqliteError> {
         self.query_collect(sql, [])
     }
 
@@ -591,7 +626,7 @@ impl Connection {
         self.query_collect(sql, rusqlite::params_from_iter(params))
     }
 
-    /// Shared eager-collect core for [`Self::query`] / [`Self::query_params`].
+    /// Shared eager-collect core for [`Self::query_sql`] / [`Self::query_params`].
     ///
     /// Materializes every row into ONE shared arena (a single `data`/`slots`
     /// pair) and a lazy [`RowSet`] over it — no per-row `Vec`, no per-cell owned
@@ -634,14 +669,14 @@ impl Connection {
     /// call: a `&str`/`&[u8]` borrowed from a row cannot be stashed in anything
     /// that outlives the callback (a compile error), so a streamed borrow can
     /// never dangle.
-    pub fn query_each<F, E>(&self, sql: &str, on_row: F) -> Result<Option<E>, SqliteError>
+    pub fn query_each_sql<F, E>(&self, sql: &str, on_row: F) -> Result<Option<E>, SqliteError>
     where
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
     {
         self.query_each_collect(sql, [], on_row)
     }
 
-    /// Parameterized peer of [`Self::query_each`].
+    /// Parameterized peer of [`Self::query_each_sql`].
     pub fn query_each_params<F, E>(
         &self,
         sql: &str,
@@ -654,7 +689,7 @@ impl Connection {
         self.query_each_collect(sql, rusqlite::params_from_iter(params), on_row)
     }
 
-    /// Shared streaming core for [`Self::query_each`] / [`Self::query_each_params`].
+    /// Shared streaming core for [`Self::query_each_sql`] / [`Self::query_each_params`].
     fn query_each_collect<F, E>(
         &self,
         sql: &str,
@@ -697,15 +732,158 @@ impl Connection {
 
     /// Run a query and return exactly its first row, or [`SqliteError::Query`]
     /// if it produced none.
-    pub fn query_one(&self, sql: &str) -> Result<Row, SqliteError> {
-        self.query(sql)?
+    pub fn query_one_sql(&self, sql: &str) -> Result<Row, SqliteError> {
+        self.query_sql(sql)?
             .get(0)
             .ok_or_else(|| SqliteError::Query("query returned no rows".to_owned()))
     }
 
     /// Run a query and return its first row, if any.
-    pub fn query_opt(&self, sql: &str) -> Result<Option<Row>, SqliteError> {
-        Ok(self.query(sql)?.get(0))
+    pub fn query_opt_sql(&self, sql: &str) -> Result<Option<Row>, SqliteError> {
+        Ok(self.query_sql(sql)?.get(0))
+    }
+
+    /// Run a compile-checked `query!` and collect its TYPED rows — the flagship
+    /// query over SQLite.
+    ///
+    /// `Q` is a `query!` carrier (`FooQuery`); the projected column types and
+    /// nullability were fixed at build time against the migration-replayed
+    /// schema, so this returns typed records, not a dynamic row. Each `$N`
+    /// parameter binds through `params` in its TRUE SQLite storage class (see
+    /// [`ValueRef`]) — a `NULL` / `BLOB` parameter is expressible, an integer is
+    /// bound as an integer.
+    ///
+    /// Because SQLite is dynamically typed, decoding VERIFIES each value's actual
+    /// storage class against the record's declared field type: a mismatch (the
+    /// catalog declared `INTEGER`, a `TEXT` arrives) is a classified
+    /// [`SqliteError::TypeMismatch`], and a `NULL` in a non-`Option` field is
+    /// [`SqliteError::UnexpectedNull`] — surfaced lazily at
+    /// [`TypedRows::iter`] / [`TypedRows::into_owned`], never a silent coercion.
+    ///
+    /// # Errors
+    ///
+    /// A prepare / step failure is a classified [`SqliteError`]; per-row decode
+    /// failures surface from the returned [`TypedRows`].
+    pub fn query<Q: SqliteTypedQuery>(
+        &self,
+        params: &[ValueRef<'_>],
+    ) -> Result<TypedRows<Q>, SqliteError> {
+        let result = self.query_collect(Q::SQL, rusqlite::params_from_iter(params))?;
+        Ok(TypedRows { result, _q: PhantomData })
+    }
+
+    /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
+    /// owned typed record. Zero rows is [`SqliteError::Query`]; more than one is
+    /// [`SqliteError::TooManyRows`] — the same exactly-one contract the
+    /// PostgreSQL typed `query_one` enforces (the typed flagship reads the same
+    /// on both backends).
+    ///
+    /// Streams and decodes ONLY the first row (no whole-result arena), then steps
+    /// once more to reject a second — so a by-key lookup pays for one row plus one
+    /// step, never a materialization. The dynamic
+    /// [`query_one_sql`](Self::query_one_sql) is the first-row variant.
+    ///
+    /// # Errors
+    ///
+    /// [`SqliteError::Query`] on zero rows, [`SqliteError::TooManyRows`] on two or
+    /// more, or a classified [`SqliteError`] on a prepare / step / decode failure.
+    pub fn query_one<Q: SqliteTypedQuery>(
+        &self,
+        params: &[ValueRef<'_>],
+    ) -> Result<Q::Owned, SqliteError> {
+        self.query_first_owned::<Q>(params)?
+            .ok_or_else(|| SqliteError::Query("query returned no rows".to_owned()))
+    }
+
+    /// Run a compile-checked `query!` expecting AT MOST one row, returning the
+    /// owned typed record if present or `None` if absent — the by-key
+    /// maybe-absent shape. More than one row is [`SqliteError::TooManyRows`] (the
+    /// same at-most-one contract as the PostgreSQL typed `query_opt`).
+    ///
+    /// Streams and decodes ONLY the first row (no whole-result arena), then steps
+    /// once more to reject a second. The dynamic
+    /// [`query_opt_sql`](Self::query_opt_sql) is the first-row variant.
+    ///
+    /// # Errors
+    ///
+    /// [`SqliteError::TooManyRows`] on two or more rows, or a classified
+    /// [`SqliteError`] on a prepare / step / decode failure (zero rows is
+    /// `Ok(None)`).
+    pub fn query_opt<Q: SqliteTypedQuery>(
+        &self,
+        params: &[ValueRef<'_>],
+    ) -> Result<Option<Q::Owned>, SqliteError> {
+        self.query_first_owned::<Q>(params)
+    }
+
+    /// Shared at-most-one decode-direct body behind
+    /// [`query_one`](Self::query_one) / [`query_opt`](Self::query_opt): prepare,
+    /// step to the first row (if any), decode it into the owned twin without
+    /// materialising the whole-result arena, then step ONCE more to enforce the
+    /// at-most-one contract.
+    ///
+    /// A second row is the classified [`SqliteError::TooManyRows`] — matching the
+    /// PostgreSQL TYPED `query_one` / `query_opt` (exactly-one / at-most-one), so
+    /// the typed flagship reads the same on both backends and a query ported
+    /// PostgreSQL→SQLite keeps its multi-row semantics. The extra step is one
+    /// `sqlite3_step`, never a materialization (the same cost model as the
+    /// PostgreSQL break-on-second-row path). The DYNAMIC `query_one_sql` /
+    /// `query_opt_sql` deliberately stay first-row.
+    fn query_first_owned<Q: SqliteTypedQuery>(
+        &self,
+        params: &[ValueRef<'_>],
+    ) -> Result<Option<Q::Owned>, SqliteError> {
+        let mut stmt = self.inner.prepare(Q::SQL)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        // Decode the first row's OWNED twin (copies text/blob out, so it no
+        // longer borrows the row step) — or return `None` for zero rows. The
+        // borrowed view is dropped at the end of this `match`, releasing `rows`
+        // for the second step below.
+        let first = match rows.next()? {
+            Some(row) => Q::decode_row_owned(&BorrowedRow { row })?,
+            None => return Ok(None),
+        };
+        // A second row means the caller asked for at most one but got more.
+        if rows.next()?.is_some() {
+            return Err(SqliteError::TooManyRows);
+        }
+        Ok(Some(first))
+    }
+
+    /// Stream a compile-checked `query!`'s TYPED rows one at a time through
+    /// `on_row` in CONSTANT memory — the streaming peer of [`query`](Self::query).
+    ///
+    /// Each borrowed record is decoded directly off SQLite's row buffer (text/blob
+    /// columns alias it, zero-copy) and handed to `on_row`; the `for<'q>` bound
+    /// makes the record valid only inside the call, so nothing it lends can
+    /// escape (a compile error). `on_row` returns [`ControlFlow`]: `Continue(())`
+    /// keeps streaming, `Break(e)` stops early. The result is `Ok(None)` when
+    /// every row streamed, `Ok(Some(e))` on an early break, or `Err` on a
+    /// prepare / step / decode failure — a decode error is LOUD (it stops the
+    /// stream), never skipped.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`SqliteError`] on a prepare / step / decode failure.
+    pub fn query_each<Q, F, E>(
+        &self,
+        params: &[ValueRef<'_>],
+        mut on_row: F,
+    ) -> Result<Option<E>, SqliteError>
+    where
+        Q: SqliteTypedQuery,
+        F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E>,
+    {
+        let mut stmt = self.inner.prepare(Q::SQL)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        while let Some(row) = rows.next()? {
+            let view = BorrowedRow { row };
+            let record = Q::decode_row(&view)?;
+            if let ControlFlow::Break(e) = on_row(record) {
+                return Ok(Some(e));
+            }
+        }
+        Ok(None)
     }
 
     /// Begin a transaction.
@@ -845,8 +1023,8 @@ impl Transaction<'_> {
     }
 
     /// Run `sql` and eagerly materialize every row.
-    pub fn query(&self, sql: &str) -> Result<QueryResult, SqliteError> {
-        self.conn.query(sql)
+    pub fn query_sql(&self, sql: &str) -> Result<QueryResult, SqliteError> {
+        self.conn.query_sql(sql)
     }
 
     /// Run a parameterized `sql` and eagerly materialize every row.
@@ -860,13 +1038,13 @@ impl Transaction<'_> {
 
     /// Run a query and return exactly its first row, or
     /// [`SqliteError::Query`] if it produced none.
-    pub fn query_one(&self, sql: &str) -> Result<Row, SqliteError> {
-        self.conn.query_one(sql)
+    pub fn query_one_sql(&self, sql: &str) -> Result<Row, SqliteError> {
+        self.conn.query_one_sql(sql)
     }
 
     /// Run a query and return its first row, if any.
-    pub fn query_opt(&self, sql: &str) -> Result<Option<Row>, SqliteError> {
-        self.conn.query_opt(sql)
+    pub fn query_opt_sql(&self, sql: &str) -> Result<Option<Row>, SqliteError> {
+        self.conn.query_opt_sql(sql)
     }
 
     /// Run a parameterized query and return exactly its first row, or
@@ -889,14 +1067,14 @@ impl Transaction<'_> {
     }
 
     /// Stream a query's rows one at a time through `on_row`, zero-copy.
-    pub fn query_each<F, E>(&self, sql: &str, on_row: F) -> Result<Option<E>, SqliteError>
+    pub fn query_each_sql<F, E>(&self, sql: &str, on_row: F) -> Result<Option<E>, SqliteError>
     where
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
     {
-        self.conn.query_each(sql, on_row)
+        self.conn.query_each_sql(sql, on_row)
     }
 
-    /// Parameterized peer of [`Self::query_each`].
+    /// Parameterized peer of [`Self::query_each_sql`].
     pub fn query_each_params<F, E>(
         &self,
         sql: &str,
@@ -907,6 +1085,186 @@ impl Transaction<'_> {
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
     {
         self.conn.query_each_params(sql, params, on_row)
+    }
+
+    /// Run a compile-checked `query!` and collect its TYPED rows — inside the
+    /// transaction. See [`Connection::query`].
+    ///
+    /// # Errors
+    ///
+    /// A classified [`SqliteError`] on a prepare / step failure.
+    pub fn query<Q: SqliteTypedQuery>(
+        &self,
+        params: &[ValueRef<'_>],
+    ) -> Result<TypedRows<Q>, SqliteError> {
+        self.conn.query::<Q>(params)
+    }
+
+    /// Run a compile-checked `query!` expecting EXACTLY one row — inside the
+    /// transaction. See [`Connection::query_one`].
+    ///
+    /// # Errors
+    ///
+    /// [`SqliteError::Query`] on zero rows, [`SqliteError::TooManyRows`] on two or
+    /// more, or a classified [`SqliteError`] on a prepare / step / decode failure.
+    pub fn query_one<Q: SqliteTypedQuery>(
+        &self,
+        params: &[ValueRef<'_>],
+    ) -> Result<Q::Owned, SqliteError> {
+        self.conn.query_one::<Q>(params)
+    }
+
+    /// Run a compile-checked `query!` expecting AT MOST one row — inside the
+    /// transaction. See [`Connection::query_opt`].
+    ///
+    /// # Errors
+    ///
+    /// [`SqliteError::TooManyRows`] on two or more rows, or a classified
+    /// [`SqliteError`] on a prepare / step / decode failure (zero rows is
+    /// `Ok(None)`).
+    pub fn query_opt<Q: SqliteTypedQuery>(
+        &self,
+        params: &[ValueRef<'_>],
+    ) -> Result<Option<Q::Owned>, SqliteError> {
+        self.conn.query_opt::<Q>(params)
+    }
+
+    /// Stream a compile-checked `query!`'s TYPED rows through `on_row` — inside
+    /// the transaction. See [`Connection::query_each`].
+    ///
+    /// # Errors
+    ///
+    /// A classified [`SqliteError`] on a prepare / step / decode failure.
+    pub fn query_each<Q, F, E>(
+        &self,
+        params: &[ValueRef<'_>],
+        on_row: F,
+    ) -> Result<Option<E>, SqliteError>
+    where
+        Q: SqliteTypedQuery,
+        F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E>,
+    {
+        self.conn.query_each::<Q, F, E>(params, on_row)
+    }
+}
+
+// ─── Typed flagship (compile-checked query!) ─────────────────────────────────
+
+/// A borrowed VIEW of one eager-result row that reads columns straight from the
+/// shared arena — the eager-path [`ColumnSource`] the typed decode consumes.
+///
+/// Unlike the owned [`Row`] handle (an `Arc`-clone whose `value_ref` lends the
+/// arena for the RECEIVER'S borrow), this holds a `&'a ArenaInner` and lends
+/// each cell for `'a` — the CONTAINER'S lifetime. That is what lets a typed
+/// borrowed record ([`SqliteTypedQuery::Record`]) decoded through it outlive the
+/// per-row view and borrow the [`TypedRows`] buffer directly (a `&'a str` field
+/// aliases the arena, zero-copy), exactly like the PostgreSQL typed path's
+/// records aliasing their prebuffer.
+struct ArenaRowRef<'a> {
+    arena: &'a ArenaInner,
+    row_idx: u32,
+}
+
+impl<'a> ColumnSource<'a> for ArenaRowRef<'a> {
+    fn cell(&self, col: usize) -> Result<ValueRef<'a>, SqliteError> {
+        // `self.arena` is `&'a ArenaInner` (a `Copy` reference read through
+        // `&self`), so `resolve_cell` returns `ValueRef<'a>` — the arena's
+        // lifetime, not the receiver's.
+        resolve_cell(self.arena, self.row_idx, col)
+    }
+
+    fn column_count(&self) -> usize {
+        usize::from(self.arena.n_cols)
+    }
+}
+
+impl RowSet {
+    /// A lazy iterator over the rows as arena VIEWS (each borrows the shared
+    /// arena for `&self`), for the typed decode. No per-row allocation, no
+    /// pre-materialised `Vec`.
+    fn arena_rows(&self) -> impl Iterator<Item = ArenaRowRef<'_>> + '_ {
+        // `n_rows > 0` implies `arena.is_some()` (the `ArenaBuilder::finish`
+        // invariant), so this yields exactly `n_rows` views; a rowless set (no
+        // arena) yields none.
+        self.arena
+            .as_ref()
+            .into_iter()
+            .flat_map(|arena| (0..self.n_rows).map(move |row_idx| ArenaRowRef { arena, row_idx }))
+    }
+}
+
+/// The bounded, typed result of a compile-checked `query!` over SQLite.
+///
+/// Holds one eager [`QueryResult`] (a single shared arena — a `data` byte pool +
+/// a `CellSlot` table, `Arc`-shared) and decodes it lazily into the query's
+/// typed records: [`iter`](Self::iter) yields the borrowed record
+/// `Q::Record<'_>` (text/blob columns alias the arena — zero-copy), and
+/// [`into_owned`](Self::into_owned) yields the `'static` owned twin. This mirrors
+/// the PostgreSQL typed `Rows<Q>`: a constant number of allocations per result,
+/// ZERO per row (a decoded borrowed record is built by value from arena cells).
+///
+/// # Borrow discipline (compiler-enforced escape wall)
+///
+/// A borrowed record from [`iter`](Self::iter) borrows `self`, so it cannot
+/// outlive the `TypedRows`: holding one past a drop is an `E0505` borrow error. A
+/// row that must outlive the buffer goes through [`into_owned`](Self::into_owned).
+#[must_use = "a TypedRows holds the query's result; read it via iter() or into_owned()"]
+pub struct TypedRows<Q: SqliteTypedQuery> {
+    /// The eager result whose shared arena backs every decoded record. Private
+    /// so the lazy arena shape cannot be bypassed.
+    result: QueryResult,
+    /// Pins the row type without owning a `Q`. `fn() -> Q` is covariant in `Q`
+    /// and imposes no auto-trait bound on the uninhabited carrier.
+    _q: PhantomData<fn() -> Q>,
+}
+
+impl<Q: SqliteTypedQuery> TypedRows<Q> {
+    /// The number of result rows.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.result.len()
+    }
+
+    /// Whether the result produced no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.result.is_empty()
+    }
+
+    /// Decode the rows lazily into borrowed records.
+    ///
+    /// A plain iterator — records can coexist, be `collect`ed, or random-
+    /// accessed (each `next` re-decodes from the arena). Each item is the
+    /// borrowed record or a classified [`SqliteError`] for a row whose value
+    /// storage classes do not match the record's declared field types (a
+    /// mismatch or an unexpected `NULL`) — never a silent coercion.
+    pub fn iter(&self) -> impl Iterator<Item = Result<Q::Record<'_>, SqliteError>> + '_ {
+        self.result.rows.arena_rows().map(|src| Q::decode_row(&src))
+    }
+
+    /// Decode every row into the owned twin, allocating one owned buffer per
+    /// text/blob cell. The owned records outlive the arena.
+    ///
+    /// # Errors
+    ///
+    /// The first row whose value storage classes do not match the record's
+    /// declared field types is a classified [`SqliteError`] — the whole call
+    /// fails rather than returning a partial vector.
+    pub fn into_owned(self) -> Result<Vec<Q::Owned>, SqliteError> {
+        let mut out = Vec::with_capacity(self.result.len());
+        for src in self.result.rows.arena_rows() {
+            out.push(Q::decode_row_owned(&src)?);
+        }
+        Ok(out)
+    }
+}
+
+impl<Q: SqliteTypedQuery> core::fmt::Debug for TypedRows<Q> {
+    /// Hand-written (not derived): the derive would demand `Q: Debug`, but the
+    /// carrier `Q` is an uninhabited marker. `PhantomData<fn() -> Q>` needs no
+    /// `Q: Debug`, so the impl is bound-free.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TypedRows").field("rows", &self.result.len()).finish()
     }
 }
 

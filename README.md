@@ -26,7 +26,16 @@ so there is no per-call text/binary drift and no injection surface.
   / MD5 / SCRAM-SHA-256 auth, rustls TLS, connection pooling, closure-scoped
   transactions. Runtime parameterized queries run in a single round trip (a
   fused `Parse`+`Bind`+`Describe`+`Execute`+`Sync`).
-- **Embedded SQLite** (`bsql::sqlite`) over bundled `rusqlite`.
+- **Embedded SQLite** (`bsql::sqlite`) over bundled `rusqlite` — a full peer of
+  the PostgreSQL path, not a text-only wrapper. The compile-checked `query!`
+  flagship RUNS against it: the same `query::<Q>` / `query_one::<Q>` /
+  `query_opt::<Q>` / `query_each::<Q>` verbs decode into the same typed records,
+  verifying each value's storage class at runtime (a mismatch or an unexpected
+  `NULL` is a classified error, never a silent coercion). Typed `&[ValueRef]`
+  parameters bind in their true storage class (so `NULL` / `BLOB` are bindable
+  and integers escape the affinity trap), a closure-scoped transaction guard
+  makes a nested/manual-commit desync a compile error, and a default
+  `busy_timeout` turns WAL contention into a classified busy error, never a hang.
 - **Local unix-domain sockets.** An absolute-path host (`/tmp`,
   `PGHOST=/var/run/postgresql`, or a `host=` DSN parameter) connects over a
   local `AF_UNIX` socket instead of TCP — libpq's rule, centralized once —
@@ -162,10 +171,31 @@ one-line entry point; it also emits the SQLite conformance template when
 the build-dep's `sqlite` feature is on. A deliberately PostgreSQL-only
 build can call `bsql_build::emit_catalog("migrations")` instead.)*
 
-To target SQLite for compile-checked queries as well, enable the
-umbrella's `macros-sqlite` feature and `bsql-build`'s `sqlite` feature in
-`[build-dependencies]`; `emit` then cross-checks each `query!` against a
-real SQLite replay of the same migrations.
+The same `query!` runs against **SQLite** too. With the umbrella's `sqlite`
+feature on, a carrier for a SQLite-decodable query (every projected column a
+SQLite storage class, no PostgreSQL-only dynamic sugar) also implements
+`bsql::sqlite::SqliteTypedQuery`, and `bsql::sqlite::Connection` gains the
+same typed verbs — `query::<Q>` / `query_one::<Q>` / `query_opt::<Q>` /
+`query_each::<Q>` (on the connection and its transaction guard) — that return
+the SAME typed records. Because SQLite is dynamically typed, decoding
+VERIFIES each value's actual storage class against the record's declared
+field type: a mismatch (the catalog declared `INTEGER`, a `TEXT` arrives) is
+a classified `TypeMismatch`, a `NULL` in a non-`Option` field is
+`UnexpectedNull` — never a silent coercion. A carrier for a PostgreSQL-only
+query (a `uuid` column, an `OPTIONAL(...)` toggle) simply does not implement
+`SqliteTypedQuery`, so running it on the SQLite driver is a located compile
+error, not a runtime surprise.
+
+**Recommended: enable `macros-sqlite` alongside.** The runtime `sqlite`
+feature and the build-time `macros-sqlite` conformance oracle are
+orthogonal: with `sqlite` + `macros` but WITHOUT `macros-sqlite` you get the
+typed runtime (still fail-loud — a storage-class mismatch is a classified
+runtime error, never silent) but NO build-time proof that real SQLite
+resolves the same row shape the lattice inferred. Enabling `macros-sqlite`
+(and `bsql-build`'s `sqlite` feature in `[build-dependencies]`) closes that
+gap — `emit` then cross-checks each `query!` against a real SQLite replay of
+the migrations at build time. The only cost is a second bundled-`rusqlite`
+build-dependency compile; a SQLite-targeting consumer should enable both.
 
 ### Runtime queries
 
@@ -268,7 +298,7 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 1958** — every `#[test]` / `#[tokio::test]` attribute:
+- **Test functions: 1974** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
   find . -path ./target -prune -o -path ./.claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
@@ -287,8 +317,8 @@ The numbers therefore cannot silently rot.
     printf '%-28s %s\n' "$d" \
       "$(find "$d/src" -name '*.rs' -exec cat {} + | wc -l)"
   done
-  # bsql 914 · proto 27886 · core 9236 · async 1743 · sync 1575
-  # sqlite/driver 1642 · testkit 1005 · build 34719 · query-macros 1929
+  # bsql 947 · proto 27886 · core 9236 · async 1743 · sync 1575
+  # sqlite/driver 2179 · testkit 1005 · build 35036 · query-macros 2252
   ```
 
 ## Sources of truth

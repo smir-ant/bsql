@@ -50,8 +50,17 @@ pub(crate) use footprint_pin;
 
 mod connection;
 mod error;
+mod typed;
 mod value;
 
-pub use connection::{BorrowedRow, Connection, QueryResult, Row, RowSet, Transaction};
+pub use connection::{BorrowedRow, Connection, QueryResult, Row, RowSet, Transaction, TypedRows};
 pub use error::SqliteError;
+pub use typed::{ColumnSource, SqliteTypedQuery};
 pub use value::{FromColumn, SqliteValue, Type, ValueRef};
+
+// The typed-decode helper functions the `query!` expansion names. Reachable
+// (not `pub(crate)`) ONLY so the macro's emitted `SqliteTypedQuery` impl can
+// call them through the umbrella's hidden `__rt_sqlite` re-export; a consumer
+// never names them directly.
+#[doc(hidden)]
+pub use typed::{read_optional, read_required};

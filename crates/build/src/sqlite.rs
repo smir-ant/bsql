@@ -73,6 +73,10 @@ use std::fmt;
 use std::path::Path;
 
 use crate::{BuildError, DynamicShape, InferredColumn, ParamShape, RustType};
+// The `$N`→`?N` SQLite placeholder rewrite — one authority, defined in `dynamics`
+// and shared by this conformance oracle AND the `query!` macro's baked SQLite
+// `const SQL`, so the runtime string is byte-identical to the one validated here.
+use crate::dynamics::sqlite_placeholder_form as rewrite_placeholders;
 
 /// The basename of the SQLite template database written into `OUT_DIR`.
 pub const SQLITE_TEMPLATE_FILE_NAME: &str = "bsql_sqlite_template.db";
@@ -586,72 +590,14 @@ fn sqlite_rust_type(decltype: &str) -> Option<RustType> {
         // bytes into an `f32`.
         "real" | "float" | "double" | "float4" | "float8" => Some(RustType::F64),
         // `bytea`'s SQLite peer is BLOB — an opaque byte string, decoding to
-        // the same `Vec<u8>` / `&[u8]`.
-        "blob" => Some(RustType::Bytea),
+        // the same `Vec<u8>` / `&[u8]`. A column declared `BLOB` gets SQLite BLOB
+        // affinity; a column declared `BYTEA` (the PostgreSQL spelling, so the
+        // SAME migration DDL replays into both backends) gets NUMERIC affinity
+        // but still stores a bound BLOB value verbatim — both resolve to the
+        // lattice `bytea`, so either spelling AGREES.
+        "blob" | "bytea" => Some(RustType::Bytea),
         _ => None,
     }
-}
-
-/// Rewrite PostgreSQL `$N` placeholders to SQLite `?N` numbered
-/// parameters, outside string literals. SQLite does not accept the `$N`
-/// numeric-after-dollar form; `?N` is its numbered-parameter spelling and
-/// preserves reuse (`?1` twice binds one slot, matching `$1` twice).
-fn rewrite_placeholders(sql: &str) -> String {
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
-    let mut copied = 0usize;
-    let mut i = 0usize;
-    let mut in_squote = false;
-    let mut in_dquote = false;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_squote {
-            if c == b'\'' {
-                in_squote = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_dquote {
-            if c == b'"' {
-                in_dquote = false;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'\'' => {
-                in_squote = true;
-                i += 1;
-            }
-            b'"' => {
-                in_dquote = true;
-                i += 1;
-            }
-            b'$' => {
-                let mut j = i + 1;
-                while j < bytes.len() && bytes[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j > i + 1 {
-                    // `i` (the `$`) and `j` (after the digits) are ASCII byte
-                    // positions, so these slices sit on char boundaries.
-                    out.push_str(&sql[copied..i]);
-                    out.push('?');
-                    out.push_str(&sql[i + 1..j]);
-                    i = j;
-                    copied = i;
-                } else {
-                    i += 1;
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    out.push_str(&sql[copied..]);
-    out
 }
 
 #[cfg(test)]

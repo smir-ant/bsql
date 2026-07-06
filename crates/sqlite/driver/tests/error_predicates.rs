@@ -88,7 +88,7 @@ fn wal_write_conflict_is_busy() {
     // Establish a read snapshot on `reader` (a deferred BEGIN takes the snapshot
     // at the first read).
     reader.execute("BEGIN").expect("begin read txn");
-    let seen = reader.query("SELECT x FROM t").expect("read snapshot");
+    let seen = reader.query_sql("SELECT x FROM t").expect("read snapshot");
     assert_eq!(seen.len(), 1);
 
     // A concurrent autocommit write advances the WAL past `reader`'s snapshot.
