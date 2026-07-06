@@ -189,6 +189,16 @@ bsql::query!(
     "SELECT d FROM (VALUES ('2000-01-01'::date), ('2000-02-29'::date), ('9999-12-31'::date)) t(d) WHERE d = ANY($1)"
 );
 
+// See the async twin: a USING-merged column drawn from an outer-join-promoted
+// (nullable) side. `bk` is NOT NULL on every base table, yet the merged key CAN
+// be NULL, so the soundness fix types it `Option<i32>` (pre-fix: a non-Option
+// `i32` a real NULL would crash on decode).
+bsql::query!(
+    OuterUsingNull,
+    "SELECT bk FROM oj_a LEFT JOIN oj_b ON oj_a.j = oj_b.j \
+     LEFT JOIN oj_c USING (bk) ORDER BY oj_a.j"
+);
+
 fn sync_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
@@ -1142,5 +1152,36 @@ fn date_array_any_bind_round_trip() {
     let mut got: Vec<i32> = rows.iter().map(|r| r.expect("row decodes").d.to_days()).collect();
     got.sort_unstable();
     assert_eq!(got, vec![0, 2_921_939], "date[] ANY($1) returns the matching rows");
+    c.close().expect("close");
+}
+
+/// SOUNDNESS witness (sync twin of `merged_outer_join_null_round_trips_as_none`):
+/// a `USING`-merged column drawn from an outer-join-promoted side decodes a REAL
+/// NULL into `None` without a decode error, over the blocking driver. Pre-fix the
+/// field was typed `i32` and the first row's genuine NULL failed `Rows` decode.
+#[test]
+#[ignore = "requires local PG"]
+fn merged_outer_join_null_round_trips_as_none() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    // `execute_sql` returns an affected-row count (no `#[must_use]` row handle).
+    c.execute_sql("DROP TABLE IF EXISTS oj_c, oj_b, oj_a").expect("drop");
+    c.execute_sql("CREATE TABLE oj_a (j INTEGER NOT NULL, x INTEGER)").expect("a");
+    c.execute_sql("CREATE TABLE oj_b (j INTEGER NOT NULL, bk INTEGER NOT NULL, y INTEGER)")
+        .expect("b");
+    c.execute_sql("CREATE TABLE oj_c (bk INTEGER NOT NULL, z INTEGER)").expect("c");
+    c.execute_sql("INSERT INTO oj_a (j, x) VALUES (1, 100), (2, 200)").expect("ins a");
+    c.execute_sql("INSERT INTO oj_b (j, bk, y) VALUES (2, 42, 7)").expect("ins b");
+    c.execute_sql("INSERT INTO oj_c (bk, z) VALUES (42, 9)").expect("ins c");
+
+    let rows = c.query::<OuterUsingNullQuery>(()).expect("query OuterUsingNull");
+    let got: Vec<Option<i32>> = rows.iter().map(|r| r.expect("row decodes").bk).collect();
+    assert_eq!(
+        got,
+        vec![None, Some(42)],
+        "the outer-join×USING merged key round-trips its real NULL as None",
+    );
+
+    c.execute_sql("DROP TABLE oj_c, oj_b, oj_a").expect("cleanup");
     c.close().expect("close");
 }

@@ -126,6 +126,18 @@ bsql::query!(
     "SELECT d FROM (VALUES ('2000-01-01'::date), ('2000-02-29'::date), ('9999-12-31'::date)) t(d) WHERE d = ANY($1)"
 );
 
+// A USING-merged column drawn from an OUTER-JOIN-promoted (nullable) side. `bk`
+// is NOT NULL on every base table, yet the merged key CAN be NULL (an `oj_a`
+// row with no matching `oj_b` null-extends `oj_b.bk`, which the second LEFT JOIN
+// preserves). The soundness fix infers `bk` as `Option<i32>`; before it, this
+// field was a non-Option `i32` and a real NULL crashed the decode. `ORDER BY`
+// pins the row order so the (None, Some) pair is deterministic.
+bsql::query!(
+    OuterUsingNull,
+    "SELECT bk FROM oj_a LEFT JOIN oj_b ON oj_a.j = oj_b.j \
+     LEFT JOIN oj_c USING (bk) ORDER BY oj_a.j"
+);
+
 fn async_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
@@ -971,5 +983,41 @@ async fn date_array_any_bind_round_trip() {
     let mut got: Vec<i32> = rows.iter().map(|r| r.expect("row decodes").d.to_days()).collect();
     got.sort_unstable();
     assert_eq!(got, vec![0, 2_921_939], "date[] ANY($1) returns the matching rows");
+    c.close().await.expect("close");
+}
+
+/// SOUNDNESS witness (async): a `USING`-merged column drawn from an
+/// outer-join-promoted side decodes a REAL NULL into `None` without a decode
+/// error. The `query!` above types `bk` as `Option<i32>` only because the
+/// nullability fix propagates the LEFT JOIN's promotion through the merge; the
+/// pre-fix inference typed it `i32`, and the first row's genuine NULL would then
+/// fail `Rows` decode (`NullInNonNullColumn`) on a perfectly valid query.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn merged_outer_join_null_round_trips_as_none() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+
+    // Fresh tables (drop any residue from an aborted prior run, dependents last).
+    // `execute_sql` returns an affected-row count (no `#[must_use]` row handle).
+    c.execute_sql("DROP TABLE IF EXISTS oj_c, oj_b, oj_a").await.expect("drop");
+    c.execute_sql("CREATE TABLE oj_a (j INTEGER NOT NULL, x INTEGER)").await.expect("a");
+    c.execute_sql("CREATE TABLE oj_b (j INTEGER NOT NULL, bk INTEGER NOT NULL, y INTEGER)")
+        .await
+        .expect("b");
+    c.execute_sql("CREATE TABLE oj_c (bk INTEGER NOT NULL, z INTEGER)").await.expect("c");
+    // j=1: no matching oj_b -> merged bk is NULL. j=2: fully matched -> bk = 42.
+    c.execute_sql("INSERT INTO oj_a (j, x) VALUES (1, 100), (2, 200)").await.expect("ins a");
+    c.execute_sql("INSERT INTO oj_b (j, bk, y) VALUES (2, 42, 7)").await.expect("ins b");
+    c.execute_sql("INSERT INTO oj_c (bk, z) VALUES (42, 9)").await.expect("ins c");
+
+    let rows = c.query::<OuterUsingNullQuery>(()).await.expect("query OuterUsingNull");
+    let got: Vec<Option<i32>> = rows.iter().map(|r| r.expect("row decodes").bk).collect();
+    assert_eq!(
+        got,
+        vec![None, Some(42)],
+        "the outer-join×USING merged key round-trips its real NULL as None",
+    );
+
+    c.execute_sql("DROP TABLE oj_c, oj_b, oj_a").await.expect("cleanup");
     c.close().await.expect("close");
 }

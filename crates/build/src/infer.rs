@@ -2178,6 +2178,16 @@ impl ScopeRelation {
     /// rescued by `::text`) names a supported output type, so its result's
     /// nullability is the column's nullability even though the column's own
     /// type is unsupported.
+    ///
+    /// This is also the per-side input the `USING`/`NATURAL` merged-column rule
+    /// reads (see [`register_merged_columns`]): a merged key is
+    /// `COALESCE(left.k, right.k)`, and while THIS join's own null-extension of a
+    /// side is supplied by the OTHER side (so it must NOT be observed — the
+    /// caller passes the pre-this-join snapshot for the left and defers this
+    /// join's right-extension), an EARLIER-chain or nested-inner promotion the
+    /// side ALREADY carries flows straight into the preserved merged value and
+    /// MUST be observed. Hence the merge reads this promotion-aware nullability,
+    /// not the raw declared nullability.
     fn column_nullability(&self, catalog: &Catalog, column: &str) -> Option<bool> {
         match &self.columns {
             RelationColumns::Catalog => {
@@ -2190,34 +2200,6 @@ impl ScopeRelation {
             RelationColumns::Derived(cols) => {
                 let derived = cols.get(column)?;
                 Some(derived.base_nullable || self.outer_nullable)
-            }
-        }
-    }
-
-    /// The BASE nullability of a column on THIS relation — its own declared
-    /// nullability BEFORE any outer-join promotion this relation may carry. A
-    /// `NOT NULL` catalog column is non-null here regardless of whether this
-    /// relation sits on an outer join's null-extended side; a derived column
-    /// carries the nullability its inner query computed. `None` means the column
-    /// is not present on this relation. This is the per-side input the
-    /// `USING`/`NATURAL` merged-column rule needs: a merged column is
-    /// `COALESCE(left.k, right.k)`, and because NULL never satisfies an equi-join
-    /// key, an outer-join row that null-extends a side does so only for an
-    /// UNMATCHED row whose key the OTHER side supplies — so the merged key's
-    /// nullability follows the per-side BASE nullabilities and the join type, not
-    /// the outer-join-promoted per-side nullability.
-    fn base_column_nullability(&self, catalog: &Catalog, column: &str) -> Option<bool> {
-        match &self.columns {
-            RelationColumns::Catalog => {
-                let info = catalog
-                    .tables
-                    .get(&self.table_key)
-                    .and_then(|cols| cols.get(column))?;
-                Some(!info.not_null)
-            }
-            RelationColumns::Derived(cols) => {
-                let derived = cols.get(column)?;
-                Some(derived.base_nullable)
             }
         }
     }
@@ -9512,25 +9494,33 @@ fn apply_join(
     // A `JOIN LATERAL (...)` right side sees the relations already in scope plus
     // the enclosing `outer`; `add_table_factor` threads them when the factor is
     // lateral, excluding the leading `lateral_floor` (DML target) relations.
-    add_table_factor(
-        catalog,
-        scope,
-        ctes,
-        &join.relation,
-        right_nullable,
-        outer,
-        lateral_floor,
-    )?;
+    //
+    // The right side is added WITHOUT this join's own right-extension
+    // (`false`, not `right_nullable`), so the just-added relation(s) carry ONLY
+    // their base nullability plus any INTERNAL (nested) outer-join promotion — a
+    // `RIGHT`/`FULL` right side that is itself an outer join
+    // (`x RIGHT JOIN (a LEFT JOIN b) USING (k)`) keeps `b`'s inner promotion but
+    // not this join's. This join's own right-extension is applied AFTER the
+    // `USING`/`NATURAL` merge is registered (below), symmetric to how the
+    // `left_relations` snapshot excludes this join's left-extension: a merged key
+    // that THIS join null-extends on a side is supplied by the OTHER (preserved)
+    // side, so the merge's nullability must not observe this join's own
+    // extension — while an EARLIER/INNER promotion the side already carries does
+    // make the merged key nullable and must be observed.
+    let right_start = scope.relations.len();
+    add_table_factor(catalog, scope, ctes, &join.relation, false, outer, lateral_floor)?;
 
     // The newly-joined relation is the last one in scope. The left side of
     // THIS chain is everything from `chain_base` up to (but not including) it.
     // A USING / NATURAL join merges its common column(s) across the two sides
     // into a single reference. The merged column's TYPE is resolved against the
-    // current scope (the common type of the two sides); its NULLABILITY is
-    // computed from each side's BASE (own, pre-outer-join) nullability combined
-    // with THIS join's type — not from the outer-join-promoted per-side
-    // nullability — because a merged column is `COALESCE(left.k, right.k)` over
-    // an equi-join key NULL never satisfies (see `register_merged_columns`).
+    // current scope (the common type of the two sides); its NULLABILITY combines
+    // each side's nullability EXCLUDING this join's own outer-extension (the
+    // pre-this-join `left_relations` snapshot for the left, the not-yet-extended
+    // right added just above) with this join's type — this join's own extension
+    // of a side is supplied by the OTHER side, but any EARLIER-chain or nested-
+    // inner promotion a side already carries flows into the preserved merged
+    // value and IS observed (see `register_merged_columns`).
     let join_kind = JoinNullability {
         right_nullable,
         left_nullable,
@@ -9563,6 +9553,7 @@ fn apply_join(
             register_merged_columns(
                 catalog,
                 scope,
+                &left_relations,
                 chain_base,
                 right_index,
                 &merged_names,
@@ -9577,6 +9568,7 @@ fn apply_join(
             register_merged_columns(
                 catalog,
                 scope,
+                &left_relations,
                 chain_base,
                 right_index,
                 &merged_names,
@@ -9589,6 +9581,20 @@ fn apply_join(
         // [`JoinConstraint`](sqlparser::ast::JoinConstraint) variant is a
         // compile error forcing a decision rather than a silent skip.
         sqlparser::ast::JoinConstraint::On(_) | sqlparser::ast::JoinConstraint::None => {}
+    }
+    // Now that any `USING`/`NATURAL` merge has been registered against the right
+    // side's internal-only nullability, apply THIS join's own right-extension to
+    // the just-added relation(s): a `LEFT`/`FULL` join null-extends its right
+    // side, so every qualified reference to a right column AFTER this join (and
+    // any further outer join in the chain) must see it as nullable. This is the
+    // right-side twin of the left-extension applied above (`if left_nullable`),
+    // deferred to here so the merge nullability does not observe it — the whole
+    // group when the right side is itself a nested join, exactly as the enclosed
+    // `add_table_factor` promotion would have done inline.
+    if right_nullable {
+        for relation in scope.relations.iter_mut().skip(right_start) {
+            relation.outer_nullable = true;
+        }
     }
     Ok(())
 }
@@ -9630,21 +9636,27 @@ fn relation_column_names(catalog: &Catalog, relation: &ScopeRelation) -> Vec<Str
 ///
 /// The merged TYPE is the common type of the two sides (identical, or the wider
 /// integer; otherwise a loud error surfaced when typed). The merged NULLABILITY
-/// is NOT a `COALESCE`-collapses-when-either-is-non-null rule and is NOT the
-/// outer-join-promoted per-side nullability; it follows each side's BASE (own,
-/// pre-outer-join) nullability combined with THIS join's type. A merged column
-/// is `COALESCE(left.k, right.k)` over an equi-join key, and NULL never
-/// satisfies an equi-join key, so a key value is only ever NULL in an UNMATCHED
-/// outer-join row whose key the PRESERVED side supplies:
+/// is NOT a `COALESCE`-collapses-when-either-is-non-null rule. It combines each
+/// side's nullability EXCLUDING this join's OWN outer-extension — read from the
+/// pre-this-join `left_relations` snapshot for the left, and from the right
+/// relation added with this join's right-extension DEFERRED — with this join's
+/// type. This join's own extension of a side is excluded because a merged key is
+/// `COALESCE(left.k, right.k)` over an equi-join key NULL never satisfies, so a
+/// row THIS join null-extends on one side draws the key from the OTHER
+/// (preserved) side. But a promotion a side ALREADY carries — from an EARLIER
+/// chain join, or from a nested outer join it is built out of — flows straight
+/// into the preserved merged value and IS observed (dropping it would infer a
+/// NULLABLE merged key as NOT NULL, an unsound promise a real server NULL
+/// breaks):
 ///
 ///   * INNER — both rows matched, the equal key is present on both, so the
-///     merged key is NOT NULL regardless of either side's base nullability.
+///     merged key is NOT NULL regardless of either side's nullability.
 ///   * LEFT  — the left row is preserved (its key supplies the merged value, or
-///     is NULL itself), so the merged key is nullable iff the LEFT base column
-///     is nullable.
-///   * RIGHT — symmetric: nullable iff the RIGHT base column is nullable.
+///     is NULL itself), so the merged key is nullable iff the LEFT side is
+///     nullable (its base nullability, OR a promotion it already carried).
+///   * RIGHT — symmetric: nullable iff the RIGHT side is (base, or carried).
 ///   * FULL  — either side can appear unmatched, so the merged key is nullable
-///     iff EITHER base column is nullable.
+///     iff EITHER side is (base, or carried).
 ///
 /// The `consumed` set records which scope relations this merge coalesced: the
 /// left-chain relations (within `chain_base..right_index`) that have the column
@@ -9666,6 +9678,7 @@ fn relation_column_names(catalog: &Catalog, relation: &ScopeRelation) -> Vec<Str
 fn register_merged_columns(
     catalog: &Catalog,
     scope: &mut Scope,
+    left_relations: &[ScopeRelation],
     chain_base: usize,
     right_index: usize,
     merged_names: &[String],
@@ -9677,10 +9690,16 @@ fn register_merged_columns(
             &scope.relations[right_index].ref_name,
             name,
         );
-        // The right side's BASE (own, pre-outer-join) nullability — the input
-        // to the per-join-type merged-column rule, not the outer-join-promoted
-        // nullability `right_resolved` carries.
-        let right_base = scope.relations[right_index].base_column_nullability(catalog, name);
+        // The right side's nullability as this merge sees it: its base plus any
+        // INTERNAL (nested) outer-join promotion it already carries, but NOT this
+        // join's own right-extension — the caller adds the right side with that
+        // extension DEFERRED (`add_table_factor(.., false, ..)`), so the relation's
+        // `outer_nullable` here is exactly that internal-only promotion. A plain
+        // table right side has no inner join, so this equals its base; a
+        // `RIGHT`/`FULL` right side that is itself an outer join
+        // (`x RIGHT JOIN (a LEFT JOIN b) USING (k)`) correctly reports `b`'s inner
+        // promotion, which the preserved-right merge rule must observe.
+        let right_side = scope.relations[right_index].column_nullability(catalog, name);
         // The left-chain relation indices that actually contribute this column.
         let left_indices: Vec<usize> = (chain_base..right_index)
             .filter(|&i| scope.relations[i].has_column(catalog, name))
@@ -9692,12 +9711,12 @@ fn register_merged_columns(
             // merge. The existing merged type re-merges with the new side
             // (coalesce-of-coalesce); its nullability re-combines per THIS
             // step's join type, with the running merged column's current
-            // nullability as the left base. The right relation joins `consumed`.
+            // nullability as the left input. The right relation joins `consumed`.
             Some(existing) => {
                 let existing_resolved = scope.merged[existing].resolved.clone();
                 let running_nullable = existing_resolved.as_ref().ok().map(|(_, n)| *n);
                 let type_merged = fold_into_merged(name, existing_resolved, right_resolved);
-                let nullable = merged_join_nullability(join, running_nullable, right_base);
+                let nullable = merged_join_nullability(join, running_nullable, right_side);
                 scope.merged[existing].resolved = with_merged_nullability(type_merged, nullable);
                 // Fold the running merge's source set per THIS step's join type
                 // (mirroring how the value expands): an INNER / LEFT step keeps
@@ -9719,11 +9738,27 @@ fn register_merged_columns(
                 let left_resolved = left_indices
                     .first()
                     .and_then(|&i| scope.relations[i].resolve_column(catalog, name, name));
-                let left_base = left_indices
+                // The LEFT contributor's nullability, read from the
+                // PRE-(this-join)-promotion snapshot `left_relations` so it
+                // carries any EARLIER-chain outer-join promotion the preserved
+                // side already accumulated (a relation an earlier
+                // `LEFT`/`RIGHT`/`FULL` join null-extended, then merged here).
+                // A `LEFT`/`FULL` merge preserves this left value, so an earlier
+                // promotion of it makes the merged key nullable — a plain
+                // base-nullability lookup (which drops the promotion) would
+                // under-nullable it into a NOT-NULL field that a real server NULL
+                // then breaks. This join's OWN left-extension (applied to
+                // `scope.relations` just above, for a `RIGHT`/`FULL` merge) is
+                // deliberately EXCLUDED — the snapshot predates it — because when
+                // THIS join null-extends the left, the merged key is supplied by
+                // the OTHER (preserved) side, not this null-extended left.
+                let left_side = left_indices
                     .first()
-                    .and_then(|&i| scope.relations[i].base_column_nullability(catalog, name));
+                    .and_then(|&i| i.checked_sub(chain_base))
+                    .and_then(|j| left_relations.get(j))
+                    .and_then(|relation| relation.column_nullability(catalog, name));
                 let type_merged = merge_resolved_sides(name, left_resolved, right_resolved);
-                let nullable = merged_join_nullability(join, left_base, right_base);
+                let nullable = merged_join_nullability(join, left_side, right_side);
                 let resolved = with_merged_nullability(type_merged, nullable);
                 // The source set of a fresh merge, per the join type: the left
                 // contributing relation(s) for INNER / LEFT, the right relation
@@ -9748,31 +9783,32 @@ fn register_merged_columns(
     }
 }
 
-/// The nullability of a `USING`/`NATURAL` merged column from each side's BASE
-/// (own, pre-outer-join) nullability and the join type. A merged column is
-/// `COALESCE(left.k, right.k)` over an equi-join key NULL never satisfies, so:
-/// INNER is never NULL (the matched key is present on both sides); LEFT follows
-/// the LEFT base (the left row is preserved); RIGHT follows the RIGHT base; FULL
-/// is NULL when EITHER base is (either side can appear unmatched). A side whose
-/// base nullability the resolver could not pin (`None` — a side that does not
-/// carry the column, not expected for a validated merge, or a derived column the
-/// resolver could not resolve) is treated as POSSIBLY-NULL so the result is
-/// never under-nullable (an under-nullable merge would decode a NULL into `T`
-/// and panic; an over-nullable one only adds a harmless `Option`, and only on
-/// this unreachable internal-inconsistency path).
+/// The nullability of a `USING`/`NATURAL` merged column from each side's
+/// nullability (base, PLUS any promotion the side carries EXCLUDING this join's
+/// own extension — see [`register_merged_columns`]) and the join type. A merged
+/// column is `COALESCE(left.k, right.k)` over an equi-join key NULL never
+/// satisfies, so: INNER is never NULL (the matched key is present on both
+/// sides); LEFT follows the LEFT side (the left row is preserved); RIGHT follows
+/// the RIGHT side; FULL is NULL when EITHER side is (either can appear
+/// unmatched). A side whose nullability the resolver could not pin (`None` — a
+/// side that does not carry the column, not expected for a validated merge, or a
+/// derived column the resolver could not resolve) is treated as POSSIBLY-NULL so
+/// the result is never under-nullable (an under-nullable merge would decode a
+/// NULL into `T` and panic; an over-nullable one only adds a harmless `Option`,
+/// and only on this unreachable internal-inconsistency path).
 fn merged_join_nullability(
     join: JoinNullability,
-    left_base: Option<bool>,
-    right_base: Option<bool>,
+    left_side: Option<bool>,
+    right_side: Option<bool>,
 ) -> bool {
     // A side the resolver could not pin is taken as possibly-null (never
     // under-nullable). For a validated merge both sides resolve, so this is the
-    // exact base nullability; `!= Some(false)` reads as "nullable, unless the
+    // exact per-side nullability; `!= Some(false)` reads as "nullable, unless the
     // side is definitively NOT NULL" — so an unresolved `None` side errs toward
     // an extra `Option` (an unreachable internal-inconsistency guard), never a
     // panic.
-    let left = left_base != Some(false);
-    let right = right_base != Some(false);
+    let left = left_side != Some(false);
+    let right = right_side != Some(false);
     match (join.left_nullable, join.right_nullable) {
         // INNER / CROSS: neither side outer-extended; a matched equal key is
         // present on both, so the merged key is never NULL.
@@ -22072,17 +22108,22 @@ mod tests {
         assert_eq!(s.columns, vec![col("id", RustType::I32, false)]);
     }
 
-    // ── USING / NATURAL merged-column nullability: BASE + join type ─────────
+    // ── USING / NATURAL merged-column nullability: per-side + join type ─────
     //
     // A merged column is `COALESCE(left.k, right.k)` over an equi-join key NULL
-    // never satisfies, so the merged key's nullability follows each side's BASE
-    // (own, pre-outer-join) nullability and the join type — NOT the
-    // outer-join-promoted per-side nullability. The rule, verified live against
-    // PostgreSQL by EXECUTION across all 12 (join x base-nullability) combos:
+    // never satisfies, so the merged key's nullability follows each side's
+    // nullability and the join type. When neither side carries an outer-join
+    // promotion (the combos here), that per-side nullability IS the base
+    // nullability — the rule below, verified live against PostgreSQL by
+    // EXECUTION across all 12 (join x base-nullability) combos:
     //   INNER -> NOT NULL always;
     //   LEFT  -> nullable iff the LEFT base column is nullable;
     //   RIGHT -> nullable iff the RIGHT base column is nullable;
     //   FULL  -> nullable iff EITHER base column is nullable.
+    // (A side that ALREADY carries a promotion — from an earlier chain join or a
+    // nested inner outer join — flows that into the preserved merged value; see
+    // `merged_left_contributor_promoted_by_earlier_join_is_nullable` and
+    // `merged_right_contributor_with_inner_outer_join_is_nullable`.)
     // Both sides of each merge share a column NAME but neither is a primary key,
     // so the merge is a real USING/NATURAL coalesce (not a PK-determined column).
 
@@ -22287,6 +22328,129 @@ mod tests {
                 panic!("`{name}` was wrongly REJECTED (false reject): {err:?}\n  SQL: {sql}");
             }
         }
+    }
+
+    // ── USING/NATURAL merged column over an OUTER-JOIN-PROMOTED contributor ──
+    //
+    // A merged key is `COALESCE(left.k, right.k)` over an equi-join key. The
+    // BASE-nullability rule above is right ONLY when a side's promotion comes
+    // from THIS join (which null-extends the side the OTHER side then supplies).
+    // A side promoted by an EARLIER chain join, or by a nested outer join it is
+    // built from, is DIFFERENT: this join PRESERVES that side, so its already-
+    // accumulated NULLs flow straight into the merged key. Inferring such a
+    // merged key NOT NULL is UNSOUND — a real server NULL then hits
+    // `DecodeError::NullInNonNullColumn` on a valid query. Every case below was
+    // reproduced live against PostgreSQL (the merged key returns an actual NULL).
+    //
+    // Two tables sharing a NOT NULL non-PK column `bk`, plus a join-key table.
+    const OJ_A: &str = "CREATE TABLE oj_a (j INT NOT NULL, x INT)";
+    const OJ_B: &str = "CREATE TABLE oj_b (j INT NOT NULL, bk INT NOT NULL, y INT)";
+    const OJ_C: &str = "CREATE TABLE oj_c (bk INT NOT NULL, z INT)";
+    const OJ_X: &str = "CREATE TABLE oj_x (bk INT NOT NULL, w INT)";
+
+    #[test]
+    fn merged_left_contributor_promoted_by_earlier_join_is_nullable() {
+        // `oj_b` is null-extended by the first LEFT JOIN, then its NOT NULL `bk`
+        // is the PRESERVED-left side of a second LEFT JOIN merge — so the merged
+        // `bk` inherits `oj_b`'s promotion and CAN be NULL. Live PG: NULL. Before
+        // the fix this inferred NOT NULL (the base lookup dropped the promotion).
+        let s = shape(
+            &[OJ_A, OJ_B, OJ_C],
+            "SELECT bk FROM oj_a LEFT JOIN oj_b ON oj_a.j = oj_b.j LEFT JOIN oj_c USING (bk)",
+        )
+        .expect("valid query");
+        assert_eq!(s.columns, vec![col("bk", RustType::I32, true)]);
+
+        // NATURAL merges the same common column by the same rule.
+        let s = shape(
+            &[OJ_A, OJ_B, OJ_C],
+            "SELECT bk FROM oj_a LEFT JOIN oj_b ON oj_a.j = oj_b.j NATURAL LEFT JOIN oj_c",
+        )
+        .expect("valid query");
+        assert_eq!(s.columns, vec![col("bk", RustType::I32, true)]);
+
+        // A parenthesized left group whose inner LEFT JOIN promotes `oj_b`, then
+        // merged: the pre-promotion snapshot captures the inner promotion too.
+        let s = shape(
+            &[OJ_A, OJ_B, OJ_C],
+            "SELECT bk FROM (oj_a LEFT JOIN oj_b ON oj_a.j = oj_b.j) LEFT JOIN oj_c USING (bk)",
+        )
+        .expect("valid query");
+        assert_eq!(s.columns, vec![col("bk", RustType::I32, true)]);
+    }
+
+    #[test]
+    fn merged_right_contributor_with_inner_outer_join_is_nullable() {
+        // The preserved side of a RIGHT/FULL merge is the RIGHT relation; when it
+        // is itself an outer join (`(oj_a LEFT JOIN oj_b)`) its inner NULLs flow
+        // into the merged key. Live PG: NULL. The fix defers THIS join's own
+        // right-extension past the merge so the right side reports only its
+        // INTERNAL promotion — enough to flip these, without over-nullabling a
+        // plain right side (controls below).
+        let s = shape(
+            &[OJ_X, OJ_A, OJ_B],
+            "SELECT bk FROM oj_x RIGHT JOIN (oj_a LEFT JOIN oj_b ON oj_a.j = oj_b.j) USING (bk)",
+        )
+        .expect("valid query");
+        assert_eq!(s.columns, vec![col("bk", RustType::I32, true)]);
+
+        let s = shape(
+            &[OJ_X, OJ_A, OJ_B],
+            "SELECT bk FROM oj_x FULL JOIN (oj_a LEFT JOIN oj_b ON oj_a.j = oj_b.j) USING (bk)",
+        )
+        .expect("valid query");
+        assert_eq!(s.columns, vec![col("bk", RustType::I32, true)]);
+
+        // The chained (`Some`) fold path reaches the same right side.
+        let s = shape(
+            &[OJ_C, OJ_X, OJ_A, OJ_B],
+            "SELECT bk FROM oj_c JOIN oj_x USING (bk) \
+             RIGHT JOIN (oj_a LEFT JOIN oj_b ON oj_a.j = oj_b.j) USING (bk)",
+        )
+        .expect("valid query");
+        assert_eq!(s.columns, vec![col("bk", RustType::I32, true)]);
+    }
+
+    #[test]
+    fn merged_over_outer_join_promotion_does_not_over_nullable() {
+        // The regression guard: a merge whose contributors carry NO extra
+        // promotion must keep its exact base-rule nullability — the fix must not
+        // spuriously flip a provably-NOT-NULL merged key to Option.
+        // INNER over two NOT NULL sides: matched equal key, never NULL.
+        let s = shape(&[OJ_B, OJ_C], "SELECT bk FROM oj_b JOIN oj_c USING (bk)")
+            .expect("valid query");
+        assert_eq!(s.columns, vec![col("bk", RustType::I32, false)]);
+        // FULL over two NOT NULL sides: an unmatched row's key is its own present
+        // NOT NULL value — still never NULL.
+        let s = shape(&[OJ_B, OJ_C], "SELECT bk FROM oj_b FULL JOIN oj_c USING (bk)")
+            .expect("valid query");
+        assert_eq!(s.columns, vec![col("bk", RustType::I32, false)]);
+        // RIGHT over a NOT NULL preserved right side: never NULL.
+        let s = shape(&[OJ_B, OJ_C], "SELECT bk FROM oj_b RIGHT JOIN oj_c USING (bk)")
+            .expect("valid query");
+        assert_eq!(s.columns, vec![col("bk", RustType::I32, false)]);
+        // A LEFT merge whose PRESERVED left side is plainly NOT NULL (no earlier
+        // promotion) stays NOT NULL — the fix reads the snapshot, which has no
+        // promotion here.
+        let s = shape(&[OJ_B, OJ_C], "SELECT bk FROM oj_b LEFT JOIN oj_c USING (bk)")
+            .expect("valid query");
+        assert_eq!(s.columns, vec![col("bk", RustType::I32, false)]);
+    }
+
+    #[test]
+    fn merged_right_extension_still_promotes_later_references() {
+        // Deferring THIS join's right-extension past the merge must NOT lose it:
+        // a QUALIFIED reference to the right side's own column AFTER a LEFT/FULL
+        // join must still see it as nullable (the right side was null-extended).
+        // `oj_b.j` is NOT NULL at base; a LEFT JOIN null-extends `oj_b`, so a
+        // qualified `oj_b.j` is nullable in the projection (had the deferred
+        // extension been dropped, it would wrongly read NOT NULL).
+        let s = shape(
+            &[OJ_C, OJ_B],
+            "SELECT oj_b.j FROM oj_c LEFT JOIN oj_b USING (bk)",
+        )
+        .expect("valid query");
+        assert_eq!(s.columns, vec![col("j", RustType::I32, true)]);
     }
 
     #[test]
