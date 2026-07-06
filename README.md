@@ -190,6 +190,7 @@ cargo test   --workspace --doc                             # doctests
 cargo test -p bsql-devgates --test deps_pin                # pinned dependency frontier
 cargo test -p bsql-devgates --test runtime_graph_pin       # build-time-only boundary
 cargo test -p bsql-devgates --test doc_links               # intra-doc-link wall
+cargo test -p bsql-devgates --test test_count              # README test-count doc-vs-reality wall
 cargo bench  --workspace                                   # perf evidence (criterion)
 ```
 
@@ -203,18 +204,25 @@ cargo test -p bsql-query-fixture  --test query_live_async -- --ignored  # live q
 cargo test -p bsql-query-fixture  --test query_live_sync  -- --ignored  # live query! (sync)
 ```
 
-### Measured facts (reproduce them)
+### Measured facts
 
-All measured at commit `a6577cd0` in this worktree:
+The two test counts below are **gate-enforced**: the `test_count` devgate
+(`tools/devgates/tests/test_count.rs`) runs the exact commands shown and asserts
+the README numbers match the live workspace, so a test added or removed without
+updating this section fails `cargo test --workspace`. A deliberate change
+regenerates them in place with
+`BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
+The numbers therefore cannot silently rot.
 
-- **1734 test functions** — `1644` `#[test]` + `90` `#[tokio::test]`
-  (including `tokio::test(flavor = …)` variants). Of these, **152 are
-  `#[ignore]` live suites** that require a running database.
+- **Test functions: 1896** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
   find . -path ./target -prune -o -name '*.rs' -print0 \
-    | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l   # 1734
+    | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
+  ```
+- **`#[ignore]` live suites (need a running database): 196**:
+  ```bash
   find . -path ./target -prune -o -name '*.rs' -print0 \
-    | xargs -0 grep -hE '^[[:space:]]*#\[ignore'        | wc -l   # 152
+    | xargs -0 grep -hE '^[[:space:]]*#\[ignore' | wc -l
   ```
 - **Source LoC** (per shipped crate `src/`; the largest, `bsql-build`, is
   dominated by an inline `#[cfg(test)]` inference test module):
