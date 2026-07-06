@@ -1,13 +1,24 @@
-/// Shared SQL test scenarios for both async and sync drivers.
-/// Usage from driver test files:
+/// A shared library of SQL-mechanism scenarios, run by BOTH drivers.
+///
+/// Every scenario exercises one SQL mechanism — joins, CTEs, window functions,
+/// aggregates, string/type ops, the error zoo, extreme values, transactions,
+/// … — over a single connection, and the bodies are written in BLOCKING shape
+/// (no `.await`). The sync driver runs them directly; the async driver runs the
+/// IDENTICAL bodies through a thin blocking shim (a small adapter that drives
+/// each async verb to completion on a per-test runtime). One scenario set, both
+/// drivers: a fix to a scenario cannot silently cover only one of them.
+///
+/// The single argument is a zero-argument constructor returning a connection
+/// whose inherent methods the scenarios call (`query_sql`, `execute_sql`,
+/// `query_params`, `execute_params`, `simple_query`, `ping`, `transaction`,
+/// `close`). Every generated test is `#[ignore]` — it needs a live PostgreSQL.
 ///
 /// ```ignore
-/// bsql_postgres_core::define_sync_sql_tests!(ConnectConfig, Connection, SslMode);
+/// fn make_conn() -> bsql_postgres_sync::Connection { /* connect */ }
+/// bsql_postgres_core::define_sql_scenario_tests!(make_conn);
 /// ```
-///
-/// Each scenario tests one SQL mechanism. All use one connection.
 #[macro_export]
-macro_rules! define_sync_sql_tests {
+macro_rules! define_sql_scenario_tests {
     ($config_fn:expr) => {
 
 #[test]

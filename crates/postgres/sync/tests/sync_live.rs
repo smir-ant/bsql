@@ -729,14 +729,16 @@ fn full_lifecycle() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Shared SQL scenario tests (macro — covers ALL SQL mechanics)
+// Shared SQL scenario tests (one macro — covers every SQL mechanic,
+// run natively over the blocking driver; the async driver runs the
+// SAME scenarios through a blocking shim in `sq_live.rs`).
 // ═══════════════════════════════════════════════════════════
 
 fn make_sync_conn() -> Connection {
     Connection::connect(&sync_config()).expect("connect")
 }
 
-bsql_postgres_core::define_sync_sql_tests!(make_sync_conn);
+bsql_postgres_core::define_sql_scenario_tests!(make_sync_conn);
 
 #[test]
 #[ignore = "requires local PG"]

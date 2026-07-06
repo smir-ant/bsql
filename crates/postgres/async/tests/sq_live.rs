@@ -1206,3 +1206,125 @@ async fn copy_in_streaming_bulk_constant_memory() {
     );
     c.close().await.expect("close");
 }
+
+// ═══════════════════════════════════════════════════════════
+// Shared SQL scenario coverage over the ASYNC driver.
+//
+// The same `define_sql_scenario_tests!` library the blocking driver runs — the
+// full SQL-mechanism suite (joins, CTEs, window functions, aggregates, string /
+// type ops, the error zoo, extreme values, transactions, …). The scenario
+// bodies are written in blocking shape, so the async driver runs them through a
+// thin blocking shim: a per-connection current-thread runtime that drives each
+// async verb to completion. This exercises the REAL async driver code — its
+// `Transport` impl and its verbs — just synchronously, so one scenario set now
+// genuinely covers both drivers.
+// ═══════════════════════════════════════════════════════════
+mod sql_scenarios {
+    use bsql_postgres_async::{ConnectConfig, Connection, DriverError, QueryResult, SslMode};
+    use bsql_postgres_proto::params::ParamsWriter;
+    use tokio::runtime::Runtime;
+
+    /// Blocking adapter over the async [`Connection`]. Its inherent methods match
+    /// exactly the surface the scenario macro calls; each drives one async verb
+    /// on `rt` to completion. Sequential top-level `block_on`s never nest.
+    struct BlockingConn {
+        inner: Connection,
+        rt: Runtime,
+    }
+
+    /// The transaction body's view of the connection — the two verbs the scenarios
+    /// use inside `transaction(|tx| …)`.
+    struct BlockingTx<'a> {
+        conn: &'a mut BlockingConn,
+    }
+
+    impl BlockingConn {
+        fn execute_sql(&mut self, sql: &str) -> Result<u64, DriverError> {
+            self.rt.block_on(self.inner.execute_sql(sql))
+        }
+        fn query_sql(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
+            self.rt.block_on(self.inner.query_sql(sql))
+        }
+        fn query_params<P: ParamsWriter>(
+            &mut self,
+            sql: &str,
+            params: &P,
+        ) -> Result<QueryResult, DriverError> {
+            self.rt.block_on(self.inner.query_params(sql, params))
+        }
+        fn execute_params<P: ParamsWriter>(
+            &mut self,
+            sql: &str,
+            params: &P,
+        ) -> Result<u64, DriverError> {
+            self.rt.block_on(self.inner.execute_params(sql, params))
+        }
+        fn simple_query(&mut self, sql: &str) -> Result<String, DriverError> {
+            self.rt.block_on(self.inner.simple_query(sql))
+        }
+        fn ping(&mut self) -> Result<(), DriverError> {
+            self.rt.block_on(self.inner.ping())
+        }
+        fn close(&mut self) -> Result<(), DriverError> {
+            self.rt.block_on(self.inner.close())
+        }
+
+        /// The closure-scoped transaction, driven over the blocking shim: `BEGIN`,
+        /// run the (blocking) body, then `COMMIT` on `Ok` / `ROLLBACK` on `Err`,
+        /// always surfacing the body's original error. (The async `transaction`
+        /// combinator — which takes an async closure — is covered directly by the
+        /// `transaction_*` tests above; a blocking body cannot drive it without
+        /// nesting `block_on`, so this reissues the same SQL over the async verbs.)
+        fn transaction<T>(
+            &mut self,
+            f: impl FnOnce(&mut BlockingTx<'_>) -> Result<T, DriverError>,
+        ) -> Result<T, DriverError> {
+            self.simple_query("BEGIN")?;
+            let outcome = {
+                let mut tx = BlockingTx { conn: &mut *self };
+                f(&mut tx)
+            };
+            match outcome {
+                Ok(v) => {
+                    self.simple_query("COMMIT")?;
+                    Ok(v)
+                }
+                Err(e) => {
+                    let _ = self.simple_query("ROLLBACK");
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    impl BlockingTx<'_> {
+        fn execute_sql(&mut self, sql: &str) -> Result<u64, DriverError> {
+            self.conn.execute_sql(sql)
+        }
+        fn query_sql(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
+            self.conn.query_sql(sql)
+        }
+    }
+
+    // Not a `#[test]` fn, so the floor's `allow-expect-in-tests` carve-out
+    // (keyed on `#[test]` context) does not reach it; the `expect`s are the
+    // loud runtime-build / connect-failure signal a live test wants, never a
+    // silent production fallback (there is no production path here).
+    #[expect(
+        clippy::expect_used,
+        reason = "connection-fixture helper: panics loudly if the runtime cannot build or PG is unreachable — the intended live-test signal, and not a `#[test]` fn so the in-tests carve-out cannot reach it"
+    )]
+    fn make_async_blocking_conn() -> BlockingConn {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        let cfg = ConnectConfig::new("127.0.0.1", "smir-ant")
+            .database("postgres".to_string())
+            .ssl_mode(SslMode::Disable);
+        let inner = rt.block_on(Connection::connect(&cfg)).expect("connect");
+        BlockingConn { inner, rt }
+    }
+
+    bsql_postgres_core::define_sql_scenario_tests!(make_async_blocking_conn);
+}
