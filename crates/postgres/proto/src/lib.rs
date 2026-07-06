@@ -226,6 +226,14 @@ pub use password::{Credentials, Password, PasswordError};
 pub use sensitive::Sensitive;
 pub use prepared::{ColCellAt, PreparedQuery, QueryFingerprint, RowDecode};
 pub use typed_query::TypedQuery;
+// The sealed public bound on the runtime-parameterised verbs
+// (`query_params` / `execute_params` / `query_prepared` / …). Re-exported at
+// the crate root — alongside its sibling sealed traits `RowDecode` /
+// `TypedQuery` — so a downstream facade can surface it under one umbrella name
+// and a consumer can name the bound (`fn insert<P: ParamsWriter>(…)`) without a
+// direct dependency on this crate. Name-only: sealed via `ParamsWriterSealed`,
+// so re-export cannot widen the impl set.
+pub use params::ParamsWriter;
 // The connecting-phase engine state enum.
 pub use state::ConnectingState;
 // Top-level re-export of the user-facing `Terminate` wire literal.
