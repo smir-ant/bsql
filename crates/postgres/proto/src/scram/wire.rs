@@ -1118,3 +1118,541 @@ mod tests {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Crypto-free total-function + verifier fuzz for the SCRAM wire parsers.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod total_function_fuzz {
+    //! Universal-coverage, CRYPTO-FREE total-function proof for the two SCRAM
+    //! wire parsers ([`parse_server_first`](super::parse_server_first),
+    //! [`parse_server_final`](super::parse_server_final)) and the constant-time
+    //! signature verifier ([`SecretDigest::ct_eq`](super::SecretDigest::ct_eq)).
+    //!
+    //! # Why in-crate, and why crypto-free
+    //!
+    //! The parsers are `pub(crate)`, so a DIRECT fuzz can only live INSIDE the
+    //! crate (an integration-test crate cannot name them — which is exactly why
+    //! `tests/scram_fuzz_spec.rs` had to route random `server-final` bytes
+    //! through the connecting engine, paying one full PBKDF2 key derivation per
+    //! sample). Fuzzing the parsers here decouples the panic-safety proof from
+    //! SCRAM's crypto entirely: no `salted_password`, no HMAC, no PBKDF2 runs,
+    //! so 50k+ adversarial iterations sweep BOTH parsers in well under a second
+    //! instead of minutes. The genuinely engine-bound never-Ready invariant
+    //! (which does need one derivation apiece) keeps a small, crafted witness
+    //! table in `tests/scram_fuzz_spec.rs`.
+    //!
+    //! # Invariants proven
+    //!
+    //! 1. **Total function.** On ANY input — malformed, truncated, random, or
+    //!    hostile — each parser returns `Ok(_)` or a CLASSIFIED
+    //!    [`ScramError`](super::ScramError), and NEVER panics or aborts. Proven
+    //!    at the machine level under `catch_unwind`: strictly stronger than the
+    //!    source `forbid`-bundle, since it also catches a panic hiding in a
+    //!    dependency the parser calls (`base64ct`, `heapless`,
+    //!    `core::str::from_utf8`).
+    //! 2. **Never silent-pass (parser).** An `Ok` from `parse_server_final`
+    //!    implies a `v=`-prefixed input; an `Ok` from `parse_server_first`
+    //!    implies its documented guarantees (iterations in `[4096, 100000]`, a
+    //!    non-empty salt within the bounded buffer, a client-nonce-prefixed
+    //!    server nonce).
+    //! 3. **Never silent-pass (verifier).** [`SecretDigest::ct_eq`] returns
+    //!    `1` (equal) if and ONLY if the two 32-byte digests are byte-equal — a
+    //!    randomly-parsed verifier never spuriously matches the expected
+    //!    signature. This is the parser-level analog of the engine's "never
+    //!    reaches Ready" invariant (in the engine, this ct_eq is the sole gate
+    //!    between a parsed `server-final` and advancing the handshake).
+    //!
+    //! # Teeth
+    //!
+    //! - A deliberately-planted panic is routed through the SAME `catch_unwind`
+    //!   harness and MUST be caught + captured — this proves the net has teeth
+    //!   AND (since it would abort, not report, under a `panic="abort"` profile)
+    //!   confirms the test profile unwinds. Planted via
+    //!   `assert!(core::hint::black_box(false), …)` rather than `panic!`: the
+    //!   crate `forbid`-bundle bars `panic!` even in test code, and `assert!` is
+    //!   exempt (`black_box` hides the `false` from `assertions_on_constants`).
+    //! - A minimum-iteration floor (`>= 50_000`) refuses a vacuous pass.
+    //! - A per-parser accept/reject floor (both `> 0`) proves the sweep reached
+    //!   the real accept AND reject branches, not only an early length guard.
+    //! - A positive + negative verifier control proves `ct_eq` actually
+    //!   discriminates (a broken all-equal `ct_eq` would fail the negative
+    //!   control's `matched == false` expectation).
+
+    use super::{
+        MAX_SALT_LEN, MAX_SCRAM_ITERATIONS, MIN_SCRAM_ITERATIONS, SecretDigest,
+        base64_encode_to_buf, parse_server_final, parse_server_first,
+    };
+    use std::boxed::Box;
+    use std::cell::RefCell;
+    use std::panic::{self, AssertUnwindSafe};
+    use std::string::{String, ToString};
+    use std::vec::Vec;
+    use std::{eprintln, format, thread_local};
+
+    /// Fixed nonzero seed — every run is byte-identical, so any finding is
+    /// reproducible from the printed input. Xorshift64 fixes `0`, hence nonzero.
+    const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+    /// Main-sweep iterations; each probes BOTH parsers, so probes ≈ `2 × ITERS`
+    /// plus the structured controls. The floor asserts `ITERS` actually ran.
+    const ITERS: u32 = 50_000;
+    /// The expected-signature constant the verifier fuzz checks `ct_eq` against.
+    /// Arbitrary non-trivial pattern; a random parsed verifier equalling it is a
+    /// `2^-256` event, so `matched` is effectively always `false` in the sweep —
+    /// the positive control below forces the `true` branch deterministically.
+    const EXPECTED_SIG: [u8; 32] = [0xA5; 32];
+    /// A fixed client nonce for `parse_server_first` (a real base64 SCRAM nonce
+    /// shape). The parser validates the server nonce carries this as a prefix.
+    const CLIENT_NONCE: &[u8] = b"Fyko+d2lbbFgONRv9qkxdawL";
+
+    // ── deterministic xorshift64 PRNG (no dependency, no clock) ──
+    struct Rng(u64);
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(if seed == 0 { SEED } else { seed })
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn byte(&mut self) -> u8 {
+            self.next_u64().to_le_bytes()[0]
+        }
+        /// A value in `0..bound` (or `0` for an empty bound). `checked_rem`
+        /// (not the `%` operator) keeps `clippy::arithmetic_side_effects` quiet;
+        /// its `None` arm is dead (the bound is guarded nonzero above).
+        fn bounded(&mut self, bound: usize) -> usize {
+            if bound == 0 {
+                return 0;
+            }
+            let draw = usize::from(u16::from_le_bytes([self.byte(), self.byte()]));
+            draw.checked_rem(bound).unwrap_or(0)
+        }
+        /// Overwrite `out` with `len` pseudo-random bytes (8 per step).
+        fn fill(&mut self, out: &mut Vec<u8>, len: usize) {
+            out.clear();
+            while out.len() < len {
+                let word = self.next_u64().to_le_bytes();
+                for &b in word.iter() {
+                    if out.len() >= len {
+                        break;
+                    }
+                    out.push(b);
+                }
+            }
+        }
+    }
+
+    // ── recording panic hook + RAII restore (mirrors core/decoder_fuzz) ──
+    type PanicHook = Box<dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+    thread_local! {
+        static LAST_PANIC: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+    struct HookGuard {
+        prev: Option<PanicHook>,
+    }
+    impl HookGuard {
+        fn install() -> Self {
+            let prev = panic::take_hook();
+            panic::set_hook(Box::new(|info| {
+                let loc = match info.location() {
+                    Some(l) => format!("{}:{}:{}", l.file(), l.line(), l.column()),
+                    None => String::from("<unknown location>"),
+                };
+                let payload = info.payload();
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    String::from("<non-string panic payload>")
+                };
+                LAST_PANIC.with(|slot| {
+                    *slot.borrow_mut() = Some(format!("{msg} @ {loc}"));
+                });
+            }));
+            Self { prev: Some(prev) }
+        }
+    }
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = self.prev.take() {
+                panic::set_hook(prev);
+            }
+        }
+    }
+
+    /// The outcome of one parser probe under `catch_unwind`.
+    enum Probe {
+        /// The parser returned `Ok` — the input happened to be well-formed. The
+        /// structural + verifier cross-checks already ran and held.
+        Accepted,
+        /// The parser returned a classified `Err` — the honest total path.
+        Rejected,
+        /// The parser PANICKED — a real finding. Carries the captured message.
+        Panicked(String),
+    }
+
+    fn take_captured_panic() -> String {
+        match LAST_PANIC.with(|slot| slot.borrow_mut().take()) {
+            Some(m) => m,
+            None => String::from("<no panic message captured>"),
+        }
+    }
+
+    /// Base64-encode `bytes` to an owned ASCII `Vec` for building `v=`/`s=`
+    /// fields. Bounded 128-byte scratch covers every input this fuzz encodes
+    /// (`<= 48` bytes → `<= 64` chars); an `Err` yields an empty vec (still a
+    /// legal — rejectable — fuzz input, never a panic).
+    fn b64(bytes: &[u8]) -> Vec<u8> {
+        let mut out = [0u8; 128];
+        match base64_encode_to_buf(bytes, &mut out) {
+            Ok(n) => out.get(..n).unwrap_or(&[]).to_vec(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Fuzz [`parse_server_final`] under `catch_unwind`. On `Ok`, cross-check the
+    /// `v=` structural guarantee AND the constant-time verifier against
+    /// `EXPECTED_SIG` — `ct_eq` must agree with plain byte-equality (proving it
+    /// never silently matches a non-equal verifier).
+    fn probe_final(input: &[u8]) -> Probe {
+        LAST_PANIC.with(|slot| *slot.borrow_mut() = None);
+        match panic::catch_unwind(AssertUnwindSafe(|| parse_server_final(input))) {
+            Ok(Ok(received)) => {
+                assert!(
+                    input.starts_with(b"v="),
+                    "parse_server_final returned Ok on a non-`v=` input: {input:?}",
+                );
+                let expected = SecretDigest::new(EXPECTED_SIG);
+                let matched = bool::from(expected.ct_eq(&received));
+                let byte_equal = received.as_bytes() == &EXPECTED_SIG;
+                assert_eq!(
+                    matched, byte_equal,
+                    "SecretDigest::ct_eq disagreed with byte-equality on a parsed verifier \
+                     (silent-match hazard): matched={matched} byte_equal={byte_equal}",
+                );
+                Probe::Accepted
+            }
+            Ok(Err(_class)) => Probe::Rejected,
+            Err(_) => Probe::Panicked(take_captured_panic()),
+        }
+    }
+
+    /// Fuzz [`parse_server_first`] under `catch_unwind`. On `Ok`, cross-check the
+    /// parser's documented acceptance guarantees.
+    fn probe_first(msg: &[u8]) -> Probe {
+        LAST_PANIC.with(|slot| *slot.borrow_mut() = None);
+        match panic::catch_unwind(AssertUnwindSafe(|| parse_server_first(msg, CLIENT_NONCE))) {
+            Ok(Ok(sf)) => {
+                assert!(
+                    sf.iterations >= MIN_SCRAM_ITERATIONS && sf.iterations <= MAX_SCRAM_ITERATIONS,
+                    "parse_server_first accepted out-of-range iterations {}",
+                    sf.iterations,
+                );
+                assert!(
+                    !sf.salt.is_empty() && sf.salt.len() <= MAX_SALT_LEN,
+                    "parse_server_first accepted an out-of-bounds salt (len {})",
+                    sf.salt.len(),
+                );
+                assert!(
+                    sf.server_nonce.as_bytes().starts_with(CLIENT_NONCE),
+                    "parse_server_first accepted a server nonce not prefixed by the client nonce",
+                );
+                Probe::Accepted
+            }
+            Ok(Err(_class)) => Probe::Rejected,
+            Err(_) => Probe::Panicked(take_captured_panic()),
+        }
+    }
+
+    /// Build an adversarial `server-final` candidate under one of several shaping
+    /// modes (fully random, `v=`/`e=`/`x=`-prefixed, random-base64, valid-base64
+    /// of K bytes so K==32 occasionally accepts, valid-32 + trailing extension).
+    fn shape_final(rng: &mut Rng, buf: &mut Vec<u8>) {
+        let mode = rng.bounded(7);
+        buf.clear();
+        let mut rand = Vec::new();
+        match mode {
+            0 => {
+                let n = rng.bounded(257);
+                rng.fill(buf, n);
+            }
+            1 => {
+                buf.extend_from_slice(b"v=");
+                let n = rng.bounded(200);
+                rng.fill(&mut rand, n);
+                buf.extend_from_slice(&rand);
+            }
+            2 => {
+                buf.extend_from_slice(b"e=");
+                let n = rng.bounded(96);
+                rng.fill(&mut rand, n);
+                buf.extend_from_slice(&rand);
+            }
+            3 => {
+                // `v=` + random base64-alphabet chars → reaches the decoder.
+                buf.extend_from_slice(b"v=");
+                let n = rng.bounded(64);
+                for _ in 0..n {
+                    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+                    let idx = rng.bounded(alphabet.len());
+                    buf.push(*alphabet.get(idx).unwrap_or(&b'A'));
+                }
+            }
+            4 => {
+                // `v=` + valid base64 of K random bytes; K==32 → accept path.
+                let k = rng.bounded(49);
+                rng.fill(&mut rand, k);
+                buf.extend_from_slice(b"v=");
+                buf.extend_from_slice(&b64(&rand));
+            }
+            5 => {
+                // valid 32-byte verifier + a trailing RFC extension part.
+                rng.fill(&mut rand, 32);
+                buf.extend_from_slice(b"v=");
+                buf.extend_from_slice(&b64(&rand));
+                buf.extend_from_slice(b",ext=");
+                let mut ext = Vec::new();
+                let n = rng.bounded(16);
+                rng.fill(&mut ext, n);
+                buf.extend_from_slice(&ext);
+            }
+            _ => {
+                // no recognised prefix.
+                let n = rng.bounded(64);
+                rng.fill(&mut rand, n);
+                buf.extend_from_slice(b"x=");
+                buf.extend_from_slice(&rand);
+            }
+        }
+    }
+
+    /// Build an adversarial `server-first` candidate under one of several shaping
+    /// modes (random, partial, fully valid, wrong-nonce, out-of-range iterations,
+    /// reserved-mext, valid + trailing extension, non-utf8 injection).
+    fn shape_first(rng: &mut Rng, buf: &mut Vec<u8>) {
+        let mode = rng.bounded(8);
+        buf.clear();
+        let mut salt = Vec::new();
+        match mode {
+            0 => {
+                let n = rng.bounded(257);
+                rng.fill(buf, n);
+            }
+            1 => {
+                buf.extend_from_slice(b"r=");
+                buf.extend_from_slice(CLIENT_NONCE);
+                let mut tail = Vec::new();
+                let n = rng.bounded(48);
+                rng.fill(&mut tail, n);
+                buf.extend_from_slice(&tail);
+            }
+            2 => {
+                // fully valid: r=<client_nonce><srv>,s=<b64 1..16>,i=<4096..100000>.
+                buf.extend_from_slice(b"r=");
+                buf.extend_from_slice(CLIENT_NONCE);
+                buf.extend_from_slice(b"SRVNONCE,s=");
+                let salt_len = rng.bounded(15).saturating_add(1);
+                rng.fill(&mut salt, salt_len);
+                buf.extend_from_slice(&b64(&salt));
+                let iters =
+                    MIN_SCRAM_ITERATIONS.saturating_add(u32_of(rng.bounded(95905)));
+                extend_i(buf, iters);
+            }
+            3 => {
+                // wrong nonce prefix → NoncePrefixMismatch.
+                buf.extend_from_slice(b"r=WRONGNONCE,s=");
+                rng.fill(&mut salt, 8);
+                buf.extend_from_slice(&b64(&salt));
+                extend_i(buf, 4096);
+            }
+            4 => {
+                // valid shape, out-of-range iterations → TooLow / TooHigh.
+                buf.extend_from_slice(b"r=");
+                buf.extend_from_slice(CLIENT_NONCE);
+                buf.extend_from_slice(b",s=");
+                rng.fill(&mut salt, 8);
+                buf.extend_from_slice(&b64(&salt));
+                let iters = if rng.bounded(2) == 0 {
+                    u32_of(rng.bounded(4096)) // 0..4095 (below MIN)
+                } else {
+                    MAX_SCRAM_ITERATIONS.saturating_add(u32_of(rng.bounded(1000)).saturating_add(1))
+                };
+                extend_i(buf, iters);
+            }
+            5 => {
+                // reserved-mext mandatory extension → MalformedServerFirst.
+                buf.extend_from_slice(b"m=unsupported,r=");
+                buf.extend_from_slice(CLIENT_NONCE);
+                buf.extend_from_slice(b",s=Wg==,i=4096");
+            }
+            6 => {
+                // valid + trailing optional extension (silently ignored).
+                buf.extend_from_slice(b"r=");
+                buf.extend_from_slice(CLIENT_NONCE);
+                buf.extend_from_slice(b"SRV,s=");
+                rng.fill(&mut salt, 6);
+                buf.extend_from_slice(&b64(&salt));
+                extend_i(buf, 8192);
+                buf.extend_from_slice(b",ext=whatever");
+            }
+            _ => {
+                // non-utf8 injection into an otherwise-shaped message.
+                buf.extend_from_slice(b"r=");
+                buf.push(0xFF);
+                buf.push(0xFE);
+                buf.extend_from_slice(CLIENT_NONCE);
+                buf.extend_from_slice(b",s=Wg==,i=4096");
+            }
+        }
+    }
+
+    /// Lossless `usize → u32` for a small bounded draw (saturates on the
+    /// impossible-large branch; `as` is banned crate-wide).
+    fn u32_of(v: usize) -> u32 {
+        u32::try_from(v).unwrap_or(u32::MAX)
+    }
+
+    /// Append `i=<n>` to a candidate `server-first`.
+    fn extend_i(buf: &mut Vec<u8>, iters: u32) {
+        buf.extend_from_slice(format!(",i={iters}").as_bytes());
+    }
+
+    #[test]
+    fn scram_wire_parsers_are_total_functions_and_verifier_never_silent_matches() {
+        // Install the recording hook for the whole fuzz (restored on scope exit).
+        let guard = HookGuard::install();
+
+        // ── Teeth: a deliberately-planted panic MUST be caught + captured by the
+        // exact same harness (proves the net has teeth AND the profile unwinds).
+        // `assert!(black_box(false), …)` panics without tripping the crate
+        // `forbid(clippy::panic)` (assert! is exempt) or `assertions_on_constants`.
+        LAST_PANIC.with(|slot| *slot.borrow_mut() = None);
+        let planted = panic::catch_unwind(AssertUnwindSafe(|| {
+            assert!(
+                core::hint::black_box(false),
+                "planted teeth panic — intentional",
+            );
+        }));
+        let teeth_msg = take_captured_panic();
+        let teeth_ok = planted.is_err() && teeth_msg.contains("planted teeth panic");
+
+        // ── Deterministic verifier controls (guarantee both ct_eq branches run).
+        // Positive: `v=<b64 of EXPECTED_SIG>` accepts AND ct_eq matches.
+        let mut ctrl = Vec::new();
+        ctrl.extend_from_slice(b"v=");
+        ctrl.extend_from_slice(&b64(&EXPECTED_SIG));
+        let pos_ok = matches!(probe_final(&ctrl), Probe::Accepted)
+            && bool::from(
+                SecretDigest::new(EXPECTED_SIG)
+                    .ct_eq(&match parse_server_final(&ctrl) {
+                        Ok(sig) => sig,
+                        Err(_) => SecretDigest::new([0; 32]),
+                    }),
+            );
+        // Negative: `v=<b64 of a different 32-byte value>` accepts but ct_eq must
+        // NOT match (a broken all-equal ct_eq would fail here).
+        let mut neg = Vec::new();
+        neg.extend_from_slice(b"v=");
+        neg.extend_from_slice(&b64(&[0x00; 32]));
+        let neg_ok = matches!(probe_final(&neg), Probe::Accepted)
+            && !bool::from(
+                SecretDigest::new(EXPECTED_SIG)
+                    .ct_eq(&match parse_server_final(&neg) {
+                        Ok(sig) => sig,
+                        Err(_) => SecretDigest::new(EXPECTED_SIG),
+                    }),
+            );
+
+        // ── The main sweep.
+        let mut rng = Rng::new(SEED);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut findings: Vec<String> = Vec::new();
+        let mut iterations: u64 = 0;
+        let mut probes: u64 = 0;
+        let mut final_accept: u64 = 0;
+        let mut final_reject: u64 = 0;
+        let mut first_accept: u64 = 0;
+        let mut first_reject: u64 = 0;
+
+        for _ in 0..ITERS {
+            iterations = iterations.saturating_add(1);
+
+            shape_final(&mut rng, &mut buf);
+            match probe_final(&buf) {
+                Probe::Accepted => final_accept = final_accept.saturating_add(1),
+                Probe::Rejected => final_reject = final_reject.saturating_add(1),
+                Probe::Panicked(msg) => {
+                    findings.push(format!("parse_server_final panicked on {buf:?}: {msg}"))
+                }
+            }
+            probes = probes.saturating_add(1);
+
+            shape_first(&mut rng, &mut buf);
+            match probe_first(&buf) {
+                Probe::Accepted => first_accept = first_accept.saturating_add(1),
+                Probe::Rejected => first_reject = first_reject.saturating_add(1),
+                Probe::Panicked(msg) => {
+                    findings.push(format!("parse_server_first panicked on {buf:?}: {msg}"))
+                }
+            }
+            probes = probes.saturating_add(1);
+        }
+
+        // Restore the normal hook BEFORE the assertions, so any failure prints.
+        drop(guard);
+
+        // ── Teeth + control assertions.
+        assert!(
+            teeth_ok,
+            "harness has NO TEETH: a planted panic was not caught + captured \
+             (catch_unwind/hook capture broken) — a green run would prove nothing; got {teeth_msg:?}",
+        );
+        assert!(
+            pos_ok,
+            "verifier positive control failed: `v=<b64(EXPECTED_SIG)>` must parse AND ct_eq-match",
+        );
+        assert!(
+            neg_ok,
+            "verifier negative control failed: a different verifier must parse but NOT ct_eq-match \
+             (ct_eq is silently matching non-equal digests)",
+        );
+
+        // ── Vacuous-pass guards.
+        assert!(
+            iterations >= u64::from(ITERS),
+            "fuzz ran {iterations} iterations (< {ITERS}) — the sweep is not exercising the surface",
+        );
+        assert!(
+            probes >= 100_000,
+            "fuzz recorded only {probes} probes (< 100k)",
+        );
+        assert!(
+            final_accept > 0 && final_reject > 0,
+            "parse_server_final sweep did not reach BOTH accept ({final_accept}) and reject ({final_reject})",
+        );
+        assert!(
+            first_accept > 0 && first_reject > 0,
+            "parse_server_first sweep did not reach BOTH accept ({first_accept}) and reject ({first_reject})",
+        );
+
+        // ── The total-function claim: ZERO parser panicked on ANY input.
+        assert!(
+            findings.is_empty(),
+            "{} SCRAM PARSER PANIC(S) FOUND — a hostile server byte could crash the driver:\n{}",
+            findings.len(),
+            findings.join("\n"),
+        );
+
+        eprintln!(
+            "scram total_function_fuzz: {probes} probes ({final_accept}+{final_reject} final, \
+             {first_accept}+{first_reject} first), 0 panics (seed {SEED:#018x})",
+        );
+    }
+}

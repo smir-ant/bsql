@@ -1,29 +1,44 @@
-//! Deterministic fuzz tests for the SCRAM wire parsers, driven through the
-//! connecting-phase engine — the production SCRAM dispatch path.
+//! ENGINE-LEVEL SCRAM never-Ready witnesses — the production SCRAM dispatch
+//! path, driven through the connecting-phase engine.
 //!
-//! # Scope
+//! # Scope + division of labour
 //!
-//! ~5K random adversarial payloads per parser exercise
-//! [`scram::wire::parse_server_first`] / [`parse_server_final`] via
+//! This file proves ONE invariant end-to-end through
 //! [`ConnectingEngine::next_auth_event`] (the same code path the live driver
-//! drives). Covers the gap a happy-path + hand-crafted-negative-vectors suite
-//! alone cannot reach.
+//! drives): **adversarial server bytes never complete the handshake** — a
+//! garbage `server-first` / `server-final` can only reach
+//! [`AuthEvent::Fail`] (a classified terminal), never [`AuthEvent::Ready`].
+//!
+//! The complementary PANIC-SAFETY proof of the two `pub(crate)` wire parsers
+//! ([`parse_server_first`] / [`parse_server_final`]) and the constant-time
+//! verifier lives in an in-crate `#[cfg(test)]` module
+//! (`scram::wire::total_function_fuzz`): fuzzed CRYPTO-FREE over 50k+ inputs,
+//! it runs in well under a second because it does not route through the
+//! engine's PBKDF2 key derivation. This file therefore keeps ONLY the
+//! genuinely engine-bound work — a small, crafted witness table (not thousands
+//! of random samples). Reaching a `server-final` witness costs exactly one
+//! derivation apiece, so the table is deliberately curated, not random-swept.
 //!
 //! # Methodology
 //!
-//! Same xorshift PRNG pattern as `fuzz_stress_spec.rs` (stable-Rust, no
-//! nightly / cargo-fuzz requirement). Each iteration drives fresh bytes
-//! through a fresh [`ConnectingEngine`]; post-iteration assertions verify the
-//! crate invariants:
+//! - The two RANDOM cheap tests below (`server_first`, `arbitrary_bytes`) still
+//!   sweep random bytes through a fresh engine — those never advance to the
+//!   PBKDF2 path (a random `server-first` almost never parses), so they cost
+//!   almost nothing while proving the engine tolerates arbitrary junk.
+//! - The CRAFTED witness test drives a curated table of adversarial
+//!   `server-first` (parse-fail, 0 crypto) and `server-final` (post-derivation,
+//!   1 crypto apiece) messages; each is asserted to classify as
+//!   [`AuthEvent::Fail`] and never reach [`AuthEvent::Ready`]. The teeth: every
+//!   `server-final` witness must ACTUALLY reach the `server-final` parser
+//!   (`reached_final == count`), so a broken setup that never gets past
+//!   `server-first` fails loudly rather than passing vacuously.
 //!
-//! - **No panic reached.** The forbid-bundle bars unwrap/expect/panic in the
-//!   parsers, so any panic is a test failure with a backtrace.
-//! - **No silent pass.** Adversarial input never drives the handshake to
-//!   [`AuthEvent::Ready`] — a single garbage `server-first` / `server-final`
-//!   cannot complete the handshake. A parse failure surfaces as
-//!   [`AuthEvent::Fail`] (the terminal `ConnPhase::Failed`), classified.
+//! A full CORRECT SCRAM exchange reaching [`AuthEvent::Ready`] is proven
+//! separately by `engine_connect_spec.rs`'s `ScramServer`, so the never-Ready
+//! assertions here are non-vacuous (the engine CAN reach Ready — just not on
+//! adversarial input).
 //!
-//! [`scram::wire::parse_server_first`]: bsql_postgres_proto::scram
+//! [`parse_server_first`]: bsql_postgres_proto::scram
 //! [`parse_server_final`]: bsql_postgres_proto::scram
 //! [`ConnectingEngine::next_auth_event`]: bsql_postgres_proto::engine::ConnectingEngine
 #![allow(
@@ -252,57 +267,223 @@ fn scram_server_first_fuzz_never_panics_never_silent_pass() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// Invariant: arbitrary server-final body never panics, never silently passes
+// Crafted engine-level never-Ready witnesses (replacing the old 5000× random
+// server-final loop that recomputed a bit-identical PBKDF2 every iteration).
 // ───────────────────────────────────────────────────────────────────
 
+/// Base64-encode raw bytes to an owned ASCII `Vec` for building crafted
+/// verifier / salt fields (dev-dep `base64ct`, the same encoder the crate
+/// uses). Bounded 256-byte scratch covers every witness below.
+fn b64(bytes: &[u8]) -> Vec<u8> {
+    use base64ct::{Base64, Encoding};
+    let mut buf = [0u8; 256];
+    match Base64::encode(bytes, &mut buf) {
+        Ok(s) => s.as_bytes().to_vec(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// A `v=<base64(verifier)>` server-final body from raw verifier bytes.
+fn v_witness(verifier: &[u8]) -> Vec<u8> {
+    let mut out = b"v=".to_vec();
+    out.extend_from_slice(&b64(verifier));
+    out
+}
+
+/// A `server-first` witness builder: takes the engine's client nonce (base64)
+/// and returns the message body fed as `auth(11, …)`.
+type FirstWitness = (&'static str, fn(&str) -> Vec<u8>);
+
+/// Crafted adversarial `server-first` messages. Each fails to PARSE (nonce
+/// mismatch, bad/empty salt, out-of-range iterations, reserved mandatory
+/// extension, missing fields, wrong field order, non-UTF-8) BEFORE the engine
+/// reaches PBKDF2 — 0 crypto — and must classify as `Fail`, never advancing.
+fn first_witnesses() -> Vec<FirstWitness> {
+    vec![
+        ("empty", |_n| Vec::new()),
+        ("no_scram_shape", |_n| b"garbage-not-scram".to_vec()),
+        ("only_commas", |_n| b",,,".to_vec()),
+        ("r_field_only", |n| format!("r={n}").into_bytes()),
+        ("nonce_prefix_mismatch", |_n| {
+            b"r=WRONGNONCE,s=Wg==,i=4096".to_vec()
+        }),
+        ("empty_salt", |n| format!("r={n}Srv,s=,i=4096").into_bytes()),
+        ("bad_base64_salt", |n| {
+            format!("r={n}Srv,s=@@@@,i=4096").into_bytes()
+        }),
+        ("iterations_too_low", |n| {
+            format!("r={n}Srv,s=Wg==,i=1").into_bytes()
+        }),
+        ("iterations_zero", |n| {
+            format!("r={n}Srv,s=Wg==,i=0").into_bytes()
+        }),
+        ("iterations_too_high", |n| {
+            format!("r={n}Srv,s=Wg==,i=999999999").into_bytes()
+        }),
+        ("iterations_overflow", |n| {
+            format!("r={n}Srv,s=Wg==,i=99999999999999999999").into_bytes()
+        }),
+        ("non_numeric_iterations", |n| {
+            format!("r={n}Srv,s=Wg==,i=abc").into_bytes()
+        }),
+        ("missing_iterations", |n| {
+            format!("r={n}Srv,s=Wg==").into_bytes()
+        }),
+        ("missing_salt_and_iters", |n| format!("r={n}Srv").into_bytes()),
+        ("field_order_s_before_r", |n| {
+            format!("s=Wg==,r={n}Srv,i=4096").into_bytes()
+        }),
+        ("reserved_mext_mandatory", |n| {
+            format!("m=unsupported,r={n}Srv,s=Wg==,i=4096").into_bytes()
+        }),
+        ("no_r_prefix", |_n| b"x=y,s=Wg==,i=4096".to_vec()),
+        ("non_utf8_body", |_n| {
+            let mut v = b"r=".to_vec();
+            v.push(0xFF);
+            v.push(0xFE);
+            v.extend_from_slice(b"Srv,s=Wg==,i=4096");
+            v
+        }),
+        ("bare_equals", |_n| b"=".to_vec()),
+        ("huge_body", |n| {
+            let mut v = format!("r={n}").into_bytes();
+            v.extend(std::iter::repeat_n(b'A', 4096));
+            v
+        }),
+    ]
+}
+
+/// Crafted adversarial `server-final` messages driven AFTER a valid
+/// `server-first` (so each pays exactly one PBKDF2). Every one must classify as
+/// `Fail` — a wrong/short/long/absent verifier cannot match the expected
+/// signature, and an `e=` reply is a server-reported error — never `Ready`.
+fn final_witnesses() -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = vec![
+        ("empty".into(), Vec::new()),
+        ("no_prefix".into(), b"garbage".to_vec()),
+        ("only_v_prefix".into(), b"v=".to_vec()),
+        ("v_not_base64".into(), b"v=@@@@".to_vec()),
+        ("v_odd_len".into(), b"v=x".to_vec()),
+        (
+            "v_zero32_wrong_sig".into(),
+            b"v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_vec(),
+        ),
+        (
+            "v_valid32_wrong_sig_plus_ext".into(),
+            {
+                let mut v = v_witness(&[0x5A; 32]);
+                v.extend_from_slice(b",ext=trailing");
+                v
+            },
+        ),
+        ("server_error_invalid_proof".into(), b"e=invalid-proof".to_vec()),
+        ("server_error_empty".into(), b"e=".to_vec()),
+        (
+            "server_error_long".into(),
+            {
+                let mut v = b"e=".to_vec();
+                v.extend(std::iter::repeat_n(b'x', 200));
+                v
+            },
+        ),
+        ("no_v_no_e".into(), b"x=whatever".to_vec()),
+        ("only_comma".into(), b",".to_vec()),
+        ("non_utf8".into(), {
+            let mut v = b"v=".to_vec();
+            v.push(0xFF);
+            v.push(0xFE);
+            v.push(0xFD);
+            v
+        }),
+    ];
+    // Parametric wrong-length verifier family, densely bracketing the 32-byte
+    // boundary (every length 0..=33) plus over-length samples. Only length 32
+    // reaches the constant-time compare (and fails it, `0xA5` ≠ the real
+    // signature); every other length is a structural `MalformedServerFinal`.
+    // All → Fail. These lift the engine-level witness count into the dozens the
+    // never-Ready invariant needs, at one derivation apiece.
+    for len in (0usize..=33).chain([47, 48, 64]) {
+        out.push((format!("v_len_{len}"), v_witness(&vec![0xA5u8; len])));
+    }
+    out
+}
+
 #[test]
-fn scram_server_final_fuzz_never_panics() {
-    let mut rng = XorShift64::new(0xBEEF_0002);
-    let mut reached_final: u32 = 0;
-
-    for _ in 0..SCRAM_FUZZ_ITERS {
+fn scram_engine_never_reaches_ready_on_crafted_witnesses() {
+    // ── Stage 1: adversarial `server-first` → parse-fail before crypto.
+    let firsts = first_witnesses();
+    let mut first_classified: u32 = 0;
+    for (name, build) in &firsts {
         let Some((mut engine, mut sb)) = engine_awaiting_server_first() else {
-            continue;
+            panic!("offline SASL setup did not settle for first-witness `{name}`");
         };
-
-        // Build a VALID server-first (echo client nonce + a server nonce part +
-        // a base64 salt + an RFC-7677-legal iteration count) so the engine
-        // parses it and advances to await the server-final.
         let nonce = extract_client_nonce(sb.pending());
-        if nonce.is_empty() {
+        let nonce_str = core::str::from_utf8(&nonce).unwrap_or("");
+        let body = build(nonce_str);
+        if !feed(&mut engine, &auth(11, &body)) {
+            // Over-cap ingest (the `huge_body` witness may exceed the bounded
+            // buffer) — a rejected feed is itself never-Ready. Count it settled.
+            first_classified = first_classified.saturating_add(1);
             continue;
         }
-        let Ok(nonce_str) = core::str::from_utf8(&nonce) else {
-            continue;
-        };
-        let server_first = format!("r={nonce_str}SRVNONCE,s=QSXCR+Q6sek8bf92,i=4096");
-        if !feed(&mut engine, &auth(11, server_first.as_bytes())) {
-            continue;
-        }
-        // A valid server-first parses → AuthSaslContinue (client proof queued).
-        if !matches!(
-            engine.next_auth_event(&mut sb),
-            AuthEvent::AuthSaslContinue(_)
-        ) {
-            continue;
-        }
-        reached_final = reached_final.saturating_add(1);
-
-        // Random server-final body → exercises `parse_server_final`.
-        let final_len = rng.len_up_to(256);
-        let mut final_body = vec![0u8; final_len];
-        rng.fill(&mut final_body);
-        if !feed(&mut engine, &auth(12, &final_body)) {
-            continue;
-        }
-        // A random server-final cannot produce the expected server signature, so
-        // it must never reach Ready (the invariant) — it classifies as Fail.
-        drain_assert_never_ready(&mut engine, &mut sb);
+        assert!(
+            drain_assert_never_ready(&mut engine, &mut sb),
+            "adversarial server-first `{name}` must classify as Fail (never Ready, never advance)",
+        );
+        first_classified = first_classified.saturating_add(1);
     }
 
+    // ── Stage 2: adversarial `server-final` AFTER a valid `server-first`.
+    let finals = final_witnesses();
+    let mut reached_final: u32 = 0;
+    for (name, body) in &finals {
+        let Some((mut engine, mut sb)) = engine_awaiting_server_first() else {
+            panic!("offline SASL setup did not settle for final-witness `{name}`");
+        };
+        let nonce = extract_client_nonce(sb.pending());
+        assert!(!nonce.is_empty(), "client nonce must be extractable for `{name}`");
+        let nonce_str = core::str::from_utf8(&nonce).unwrap_or("");
+        // A VALID server-first → the engine derives the client proof (one PBKDF2)
+        // and advances to await the server-final.
+        let server_first = format!("r={nonce_str}SRVNONCE,s=QSXCR+Q6sek8bf92,i=4096");
+        assert!(
+            feed(&mut engine, &auth(11, server_first.as_bytes())),
+            "valid server-first must feed for `{name}`",
+        );
+        assert!(
+            matches!(engine.next_auth_event(&mut sb), AuthEvent::AuthSaslContinue(_)),
+            "valid server-first must reach AuthSaslContinue for `{name}`",
+        );
+        reached_final = reached_final.saturating_add(1);
+
+        assert!(
+            feed(&mut engine, &auth(12, body)),
+            "server-final witness `{name}` must feed",
+        );
+        assert!(
+            drain_assert_never_ready(&mut engine, &mut sb),
+            "adversarial server-final `{name}` must classify as Fail (never Ready)",
+        );
+    }
+
+    // ── Teeth: every crafted witness ran, and every final witness ACTUALLY
+    // reached the server-final parser (a broken setup that never advanced past
+    // server-first would fail here rather than pass vacuously).
+    assert_eq!(
+        first_classified,
+        u32::try_from(firsts.len()).unwrap_or(u32::MAX),
+        "every server-first witness must settle",
+    );
+    assert_eq!(
+        reached_final,
+        u32::try_from(finals.len()).unwrap_or(u32::MAX),
+        "every server-final witness must reach the server-final parser (non-vacuous)",
+    );
     assert!(
-        reached_final > 0,
-        "the valid-server-first setup must reach the server-final parser",
+        firsts.len() >= 16 && finals.len() >= 16,
+        "witness tables shrank below their floor ({} first, {} final)",
+        firsts.len(),
+        finals.len(),
     );
 }
 
