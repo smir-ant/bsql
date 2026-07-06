@@ -1,0 +1,5 @@
+error: query!: unknown table or alias `ledgar` in this query — did you mean `ledger`?
+ --> tests/compile_fail/query_unknown_table_suggestion.rs:5:23
+  |
+5 |     bsql::query!(Row, "SELECT id FROM ledgar");
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^

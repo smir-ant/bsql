@@ -1,0 +1,5 @@
+error: query!: relation `users` has no column `emial` — did you mean `email`?
+ --> tests/compile_fail/query_unknown_column_suggestion.rs:6:23
+  |
+6 |     bsql::query!(Row, "SELECT emial FROM users");
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^

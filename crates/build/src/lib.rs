@@ -528,6 +528,132 @@ impl Catalog {
             bridges: Vec::new(),
         })
     }
+
+    /// The nearest known name to an unresolved reference in a `query!` — the
+    /// data behind the "did you mean `X`?" hint the proc-macro appends to an
+    /// [`InferError::UnknownColumn`] / [`InferError::UnknownRelation`].
+    ///
+    /// The candidate set is exactly the names THIS catalog can vouch for:
+    ///
+    /// * [`InferError::UnknownRelation`] — every table name in the catalog.
+    /// * [`InferError::UnknownColumn`] — the columns of the named relation,
+    ///   WHEN it is a catalog base table (the common case: the error names the
+    ///   `FROM` table). A derived-table / CTE / subquery alias has no catalog
+    ///   columns, so no candidate is offered — a wrong guess is worse than
+    ///   none.
+    ///
+    /// Matching is a restricted Damerau-Levenshtein (optimal string alignment)
+    /// distance — an adjacent transposition (`emial` for `email`) counts as a
+    /// SINGLE edit, the canonical one-key slip — case-insensitive, bounded to
+    /// `max(len, 3) / 3` edits (the same threshold rustc's own
+    /// `find_best_match_for_name` uses). Only the single unambiguous closest
+    /// candidate is returned; nothing within the threshold, or a tie for
+    /// closest, yields `None` rather than a misleading guess. Any other error
+    /// (a different [`InferError`] variant, or a [`DynamicError::Sugar`])
+    /// carries no name to correct, so it is `None`.
+    #[must_use]
+    pub fn did_you_mean(&self, err: &DynamicError) -> Option<String> {
+        let DynamicError::Infer(inner) = err else {
+            return None;
+        };
+        match inner {
+            InferError::UnknownRelation(name) => {
+                nearest_name(name, self.tables.keys().map(String::as_str))
+            }
+            InferError::UnknownColumn { relation, column } => {
+                // Exact key first (PG folds unquoted identifiers, so the error
+                // usually names the catalog's stored form); fall back to a
+                // case-insensitive scan so a quoted / mixed-case relation name
+                // still finds its columns for the hint. The column match below
+                // is already case-insensitive, so this keeps the two sides
+                // consistent — a relation-casing mismatch no longer silently
+                // drops the suggestion.
+                let columns = self.tables.get(relation).or_else(|| {
+                    self.tables
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(relation))
+                        .map(|(_, cols)| cols)
+                })?;
+                nearest_name(column, columns.keys().map(String::as_str))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The single closest candidate to `target`, within the rustc "did you mean"
+/// threshold (`max(len, 3) / 3` edits), or `None` when nothing is close enough
+/// OR the closest is a tie (an ambiguous best is no suggestion at all).
+/// Case-insensitive over ASCII; returns the candidate's own spelling.
+fn nearest_name<'a>(target: &str, candidates: impl Iterator<Item = &'a str>) -> Option<String> {
+    let needle: Vec<char> = target.to_ascii_lowercase().chars().collect();
+    // rustc's `find_best_match_for_name` bound is `dist <= max(len, 3) / 3`.
+    // Kept as the equivalent `3 * dist <= max(len, 3)` to avoid the forbidden
+    // `integer_division` (both sides are the same integer relation).
+    let bound = std::cmp::max(needle.len(), 3);
+    let mut best: Option<(usize, &str)> = None;
+    let mut tie = false;
+    for cand in candidates {
+        let hay: Vec<char> = cand.to_ascii_lowercase().chars().collect();
+        let dist = osa_distance(&needle, &hay);
+        if dist * 3 > bound {
+            continue;
+        }
+        match best {
+            None => best = Some((dist, cand)),
+            Some((best_dist, _)) if dist < best_dist => {
+                best = Some((dist, cand));
+                tie = false;
+            }
+            Some((best_dist, _)) if dist == best_dist => tie = true,
+            Some(_) => {}
+        }
+    }
+    match best {
+        Some((_, name)) if !tie => Some(name.to_string()),
+        _ => None,
+    }
+}
+
+/// Restricted Damerau-Levenshtein (optimal string alignment) distance: the
+/// minimum single-character insertions, deletions, substitutions, and
+/// ADJACENT transpositions to turn `a` into `b`. Operates on pre-lowercased
+/// char slices. Every index is proved in range by the loop bounds (row `i` /
+/// col `j` of an `(n+1) × (m+1)` grid), and each `- 1` / `- 2` is guarded by
+/// its surrounding `i`/`j` bound, so it cannot panic on any input.
+fn osa_distance(a: &[char], b: &[char]) -> usize {
+    let n = a.len();
+    let m = b.len();
+    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    // Base row/column: transforming an i-char prefix to/from the empty string
+    // costs i edits. (`row.first_mut()` / `d.first_mut()` are always `Some` —
+    // every row has `m + 1 >= 1` cells and the grid has `n + 1 >= 1` rows —
+    // but the `if let` keeps it panic-free by construction.)
+    for (i, row) in d.iter_mut().enumerate() {
+        if let Some(first) = row.first_mut() {
+            *first = i;
+        }
+    }
+    if let Some(first_row) = d.first_mut() {
+        for (j, cell) in first_row.iter_mut().enumerate() {
+            *cell = j;
+        }
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            let deletion = d[i - 1][j] + 1;
+            let insertion = d[i][j - 1] + 1;
+            let substitution = d[i - 1][j - 1] + cost;
+            let mut best = deletion.min(insertion).min(substitution);
+            // Adjacent transposition (`ab` <-> `ba`): one edit, not two subs.
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[n][m]
 }
 
 impl CatalogBuilder {

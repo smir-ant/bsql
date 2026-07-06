@@ -44,6 +44,10 @@
 // `compile_error!`, and the only `Option`/`Result` handling here goes
 // through explicit `match` / `?`, never a default-substituting combinator.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::SystemTime;
+
 use proc_macro::TokenStream;
 use proc_macro2::{Literal, Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
@@ -161,8 +165,18 @@ fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     // There is no "assume a type" path. A query with NO dynamic sugar
     // lowers to itself byte-for-byte, so its wire artifact is identical to
     // the non-dynamic path.
-    let shape = bsql_build::infer_dynamic_query(&catalog, &sql_text)
-        .map_err(|err| syn::Error::new(sql_span, format!("query!: {err}")))?;
+    let shape = bsql_build::infer_dynamic_query(&catalog, &sql_text).map_err(|err| {
+        // An unknown column / table names the missing symbol; if a known name
+        // is within one typo (a restricted Damerau-Levenshtein match against
+        // the queried table's columns / the catalog's table names), append it
+        // so the fix is one glance away. No candidate within threshold leaves
+        // the message exactly as-is — never a misleading guess.
+        let message = match catalog.did_you_mean(&err) {
+            Some(name) => format!("query!: {err} — did you mean `{name}`?"),
+            None => format!("query!: {err}"),
+        };
+        syn::Error::new(sql_span, message)
+    })?;
 
     // The typed-record twins (borrowed + owned) and their decoders.
     let records = emit_records(&name, &shape.columns, &bridges)?;
@@ -295,12 +309,85 @@ fn verify_sqlite(
     })
 }
 
+/// The parsed schema catalog, cached per proc-macro process.
+///
+/// The catalog is a rustc-env path a consumer's `build.rs` emits ONCE before
+/// the crate is compiled, so within a single compilation it is immutable;
+/// every `query!` in the crate reads the SAME bytes. This caches the parsed
+/// [`bsql_build::Catalog`] keyed on `(path, mtime, len)` so an N-query crate
+/// parses it once, not N times. The `(mtime, len)` guard makes the cache
+/// self-invalidating: a changed path, a moved mtime, or a changed byte length
+/// is a miss and the fresh bytes are parsed. `cargo` always compiles in a
+/// FRESH process (so a rebuilt catalog is a new process with an empty cache),
+/// so the guard matters only for a PERSISTENT proc-macro host (e.g. an IDE's
+/// `proc-macro-srv`) that outlives a rebuild — there the `mtime` catches every
+/// normal rewrite, and `len` additionally catches a length-changing rewrite
+/// within a coarse-mtime filesystem tick (HFS+ 1 s, FAT 2 s). The only
+/// remaining theoretical stale window is an IDE-host, same-tick, SAME-length
+/// rewrite — self-heals on the next tick and never yields a wrong compiled
+/// ARTIFACT (cargo, which produces artifacts, is always a fresh process). The
+/// value is shared as an [`Rc`] so a hit costs one pointer clone, never an
+/// `O(catalog_bytes)` copy.
+///
+/// Only the catalog is cached — it is plain span-free data. The external-type
+/// bridge set is deliberately NOT cached: a bridge entry carries `syn` tokens
+/// whose spans are minted per invocation, and reusing them across a later
+/// expansion is unsound (see [`load_bridges`]).
+struct CachedFile<T> {
+    /// The rustc-env path the value was parsed from.
+    path: String,
+    /// The file's `(modification time, byte length)` when it was parsed, both
+    /// read from ONE `metadata()` stat. `None` if the stat failed — in which
+    /// case the cache is never consulted (a fresh read re-derives the
+    /// fail-closed error), so a missing stat can never serve a possibly-changed
+    /// file.
+    stamp: Option<(SystemTime, u64)>,
+    /// The parsed value, shared by pointer.
+    value: Rc<T>,
+}
+
+thread_local! {
+    /// Per-process cache of the parsed schema catalog (see [`CachedFile`]).
+    static CATALOG_CACHE: RefCell<Option<CachedFile<bsql_build::Catalog>>> =
+        const { RefCell::new(None) };
+}
+
+/// The file's `(modification time, byte length)` from ONE `metadata()` stat,
+/// or `None` if it cannot be stat'd (or the mtime is unavailable). `len` is a
+/// free extra key component — the same stat already carries it — that catches a
+/// same-mtime-tick length-changing rewrite on a coarse-mtime filesystem.
+fn file_stamp(path: &str) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    Some((mtime, meta.len()))
+}
+
+/// A shared clone of the cached value IFF the slot holds one for the SAME path
+/// and a DEFINITE, matching `(mtime, len)` stamp. A missing stat (`stamp ==
+/// None`) is always a miss, so the cache never serves a file it cannot prove is
+/// unchanged.
+fn cache_hit<T>(
+    slot: &Option<CachedFile<T>>,
+    path: &str,
+    stamp: Option<(SystemTime, u64)>,
+) -> Option<Rc<T>> {
+    let cached = slot.as_ref()?;
+    let s = stamp?;
+    if cached.path == path && cached.stamp == Some(s) {
+        Some(Rc::clone(&cached.value))
+    } else {
+        None
+    }
+}
+
 /// Read the catalog text via the rustc-env channel and rebuild the
-/// `bsql_build::Catalog`. Fail-closed: an absent env var, an unreadable
-/// file, or a corrupt catalog is a `compile_error!` — never a silent pass
-/// against a missing schema (which would be the stale-schema blind spot
-/// this design exists to remove).
-fn load_build_catalog(span: Span) -> syn::Result<bsql_build::Catalog> {
+/// `bsql_build::Catalog`, memoized per proc-macro process (see [`CachedFile`]).
+/// Fail-closed: an absent env var, an unreadable file, or a corrupt catalog is
+/// a `compile_error!` — never a silent pass against a missing schema (which
+/// would be the stale-schema blind spot this design exists to remove). Only a
+/// SUCCESSFUL parse is cached, so every error path still runs fresh with the
+/// calling query's own span.
+fn load_build_catalog(span: Span) -> syn::Result<Rc<bsql_build::Catalog>> {
     let path = std::env::var(CATALOG_ENV_VAR).map_err(|_| {
         syn::Error::new(
             span,
@@ -313,6 +400,10 @@ fn load_build_catalog(span: Span) -> syn::Result<bsql_build::Catalog> {
             ),
         )
     })?;
+    let stamp = file_stamp(&path);
+    if let Some(hit) = CATALOG_CACHE.with_borrow(|slot| cache_hit(slot, &path, stamp)) {
+        return Ok(hit);
+    }
     let text = std::fs::read_to_string(&path).map_err(|err| {
         syn::Error::new(
             span,
@@ -324,12 +415,21 @@ fn load_build_catalog(span: Span) -> syn::Result<bsql_build::Catalog> {
             ),
         )
     })?;
-    bsql_build::parse_catalog(&text).map_err(|err| {
+    let catalog = bsql_build::parse_catalog(&text).map_err(|err| {
         syn::Error::new(
             span,
             format!("query!: the schema catalog at `{path}` is malformed: {err}"),
         )
-    })
+    })?;
+    let value = Rc::new(catalog);
+    CATALOG_CACHE.with_borrow_mut(|slot| {
+        *slot = Some(CachedFile {
+            path,
+            stamp,
+            value: Rc::clone(&value),
+        });
+    });
+    Ok(value)
 }
 
 /// One resolved external-type bridge: the native pivot type it fires on, the
@@ -386,6 +486,13 @@ fn load_bridges(span: Span) -> syn::Result<Bridges> {
         // No channel: the consumer registered no bridges. Native types.
         Err(_) => return Ok(Bridges { entries: Vec::new() }),
     };
+    // The bridge set is NOT memoized: a `BridgeEntry` holds `syn::Type` /
+    // `syn::Path` tokens whose SPANS are minted in the invocation that parsed
+    // them, and reusing span-bearing tokens across a later `query!` expansion
+    // is unsound (the cached spans dangle relative to the new invocation). The
+    // catalog IS memoized because it is plain span-free data. The bridge file
+    // is tiny (a handful of lines) and most consumers register none, so the
+    // per-call reparse is negligible — the meaningful win is the catalog.
     let text = std::fs::read_to_string(&path).map_err(|err| {
         syn::Error::new(
             span,
@@ -908,10 +1015,6 @@ fn emit_records(
         let ty = field_type_bridged(col.ty, col.nullable, false, bridges);
         quote! { #id: #ty }
     });
-    let owned_fields = field_idents.iter().zip(columns).map(|(id, col)| {
-        let ty = field_type_bridged(col.ty, col.nullable, true, bridges);
-        quote! { #id: #ty }
-    });
 
     // The borrowed record carries `<'q>` ONLY when it has a borrowing
     // (text / bytea) field — otherwise the lifetime would be unused, which
@@ -932,15 +1035,6 @@ fn emit_records(
         false,
         bridges,
     );
-    let owned_body = decode_body(
-        &field_idents,
-        columns,
-        &col_idx_u8,
-        n_i16,
-        all_fixed_not_null,
-        true,
-        bridges,
-    );
 
     let allow_reason = "generated typed-record fields are the query's output row shape; a consumer may read any subset of the columns";
 
@@ -959,17 +1053,60 @@ fn emit_records(
         quote!(Debug, Clone, PartialEq)
     };
 
+    // The owned twin. When the query projects a borrowing (`text` / `bytea`)
+    // column, the owned record genuinely DIFFERS from the borrowed one
+    // (`String` / `Vec<u8>` vs `&'q str` / `&'q [u8]`), so it is a distinct
+    // struct with its own `decode`. When NO column borrows (the common
+    // all-scalar case — integers/float/bool/uuid/temporal/numeric/arrays, and
+    // BRIDGED columns, all self-owning), the owned fields, the owned decode
+    // body, AND the borrowed record's spelling (lifetime-free in this branch)
+    // are byte-identical, so the owned twin is a plain type ALIAS instead of a
+    // duplicate struct + four derives + a ~45-line `decode` monomorphization.
+    // `#name` is `'static + Send` here, satisfying `TypedQuery::Owned: Send +
+    // 'static`, and both `#owned_name::decode` and `type Owned = #owned_name`
+    // (in `emit_dynamic_wire`) resolve straight through the alias.
+    let owned_items = if has_borrowed {
+        let owned_fields = field_idents.iter().zip(columns).map(|(id, col)| {
+            let ty = field_type_bridged(col.ty, col.nullable, true, bridges);
+            quote! { #id: #ty }
+        });
+        let owned_body = decode_body(
+            &field_idents,
+            columns,
+            &col_idx_u8,
+            n_i16,
+            all_fixed_not_null,
+            true,
+            bridges,
+        );
+        quote! {
+            #[derive(#derives)]
+            #[allow(dead_code, reason = #allow_reason)]
+            pub struct #owned_name {
+                #(#owned_fields),*
+            }
+
+            impl #owned_name {
+                /// Decode one raw `DataRow` payload (the wire bytes after the
+                /// field-count header) into the owned record.
+                pub fn decode(body: &[u8])
+                    -> ::core::result::Result<Self, ::bsql::__rt::DecodeError>
+                {
+                    #owned_body
+                }
+            }
+        }
+    } else {
+        quote! {
+            pub type #owned_name = #name;
+        }
+    };
+
     Ok(quote! {
         #[derive(#derives)]
         #[allow(dead_code, reason = #allow_reason)]
         pub struct #name #borrowed_generics {
             #(#borrowed_fields),*
-        }
-
-        #[derive(#derives)]
-        #[allow(dead_code, reason = #allow_reason)]
-        pub struct #owned_name {
-            #(#owned_fields),*
         }
 
         impl #borrowed_generics #name #borrowed_generics {
@@ -983,15 +1120,7 @@ fn emit_records(
             }
         }
 
-        impl #owned_name {
-            /// Decode one raw `DataRow` payload (the wire bytes after the
-            /// field-count header) into the owned record.
-            pub fn decode(body: &[u8])
-                -> ::core::result::Result<Self, ::bsql::__rt::DecodeError>
-            {
-                #owned_body
-            }
-        }
+        #owned_items
     })
 }
 

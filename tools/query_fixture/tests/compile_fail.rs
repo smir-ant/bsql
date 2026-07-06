@@ -42,6 +42,14 @@ fn unknown_reference_is_compile_error() {
     t.compile_fail("tests/compile_fail/query_unknown_table.rs");
     t.compile_fail("tests/compile_fail/query_renamed_away_table.rs");
     t.compile_fail("tests/compile_fail/query_unknown_column.rs");
+    //   * An unknown name within one typo of a real one is enriched with a
+    //     "did you mean `X`?" suggestion (a bounded restricted
+    //     Damerau-Levenshtein match against the queried table's columns / the
+    //     catalog's table names) — a transposed column and a one-key table
+    //     typo. An unrelated name (the `nope` / `widgets` cases above) stays
+    //     bare: no candidate is within threshold, so no misleading guess.
+    t.compile_fail("tests/compile_fail/query_unknown_column_suggestion.rs");
+    t.compile_fail("tests/compile_fail/query_unknown_table_suggestion.rs");
     t.compile_fail("tests/compile_fail/query_uncast_param.rs");
     t.compile_fail("tests/compile_fail/query_wrong_field.rs");
     t.compile_fail("tests/compile_fail/query_type_mismatch.rs");
