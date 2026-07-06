@@ -936,6 +936,63 @@ async fn transaction_commit_and_recoverable_rollback() {
     c.close().await.expect("close");
 }
 
+/// The deferred-BEGIN FUSION correctness path (D2), end-to-end over real PG on the
+/// async driver: an EMPTY transaction still opens+closes a real transaction, a
+/// transaction whose FIRST statement is the EXTENDED protocol (`query_params`,
+/// one-round-trip) fuses BEGIN into that statement and commits its effect, and a
+/// rollback of such a body discards it — proving the prelude drain preserves the
+/// statement's result schema over the fused path.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn transaction_fusion_empty_and_extended() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+    c.execute_sql("CREATE TEMP TABLE txf_async(v int)").await.expect("create");
+
+    // (1) EMPTY body: BEGIN fuses into the terminating COMMIT (BEGIN;COMMIT).
+    c.transaction(async |_conn| Ok(())).await.expect("empty tx commits");
+    assert!(c.is_healthy(), "healthy after an empty fused transaction");
+    c.execute_sql("INSERT INTO txf_async VALUES (7)").await.expect("post-empty insert");
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM txf_async").await.expect("c").rows[0].get_i64(0),
+        Ok(Some(1))
+    );
+
+    // (2) FIRST statement is the EXTENDED protocol: BEGIN fuses ahead of the
+    // Parse+Bind+Describe+Execute batch and the statement's row decodes correctly.
+    let fused = c
+        .transaction(async |conn| {
+            let r = conn.query_params_one("SELECT $1::int + 1 AS n", &(41i32,)).await?;
+            let n = r.get_i32(0).expect("decode the fused statement's row");
+            conn.execute_sql("INSERT INTO txf_async VALUES (8)").await?;
+            Ok(n)
+        })
+        .await
+        .expect("extended-first tx commits");
+    assert_eq!(fused, Some(42), "the fused extended statement decoded correctly");
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM txf_async").await.expect("c").rows[0].get_i64(0),
+        Ok(Some(2)),
+        "the committed insert persisted"
+    );
+
+    // (3) ROLLBACK of an extended-first body discards its effect.
+    let result: Result<(), _> = c
+        .transaction(async |conn| {
+            drop(conn.query_params_one("SELECT $1::int", &(9i32,)).await?);
+            conn.execute_sql("INSERT INTO txf_async VALUES (9)").await?;
+            Err(bsql_postgres_async::DriverError::NoRows)
+        })
+        .await;
+    assert!(result.is_err(), "a body error aborts the transaction");
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM txf_async").await.expect("c").rows[0].get_i64(0),
+        Ok(Some(2)),
+        "the rolled-back insert did not persist"
+    );
+    c.close().await.expect("close");
+}
+
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn one_connection_everything() {

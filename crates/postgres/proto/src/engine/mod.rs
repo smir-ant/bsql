@@ -328,6 +328,40 @@ impl<'b, T> Engine<'b, T> {
             active.clear_statement_cache();
         }
     }
+
+    /// Arm a fused simple-query PRELUDE to prepend to the NEXT command's flush — a
+    /// deferred `BEGIN` (fused with a transaction's first statement) or a
+    /// pool-checkout session RESET.
+    ///
+    /// The first request verb that runs enqueues the prelude's `'Q'` frame ahead of
+    /// its own, so the single following flush carries BOTH — the prelude's
+    /// standalone round trip is removed — and the pump drains the prelude's response
+    /// (swallowed) before the command's. A no-op unless the engine is active (a
+    /// prelude only makes sense post-handshake). The SQL is a `'static` simple query
+    /// (`BEGIN` / `COMMIT` / `ROLLBACK` / a session RESET); see
+    /// [`ActiveEngine::set_pending_prelude`](crate::engine::ActiveEngine::set_pending_prelude).
+    #[inline]
+    pub fn defer_command_prelude(&mut self, sql: &'static str) {
+        if let Phase::Active(active) = &mut self.phase {
+            active.set_pending_prelude(sql);
+        }
+    }
+
+    /// Discard any armed-but-unconsumed fused prelude. A no-op unless the engine is
+    /// active with a pending prelude.
+    ///
+    /// A prelude is normally consumed by the next request verb; the ONE way to
+    /// strand it is a PANIC in a transaction body before it issued any statement
+    /// (the `COMMIT`/`ROLLBACK` that would consume it never runs). A connection
+    /// reused through the pool's `reset_session` clears it here so a stranded
+    /// `BEGIN` cannot fuse into — and corrupt — the reset (or the next user's first
+    /// statement).
+    #[inline]
+    pub fn clear_command_prelude(&mut self) {
+        if let Phase::Active(active) = &mut self.phase {
+            active.clear_pending_prelude();
+        }
+    }
 }
 
 impl<'b, T: Transport> Engine<'b, T> {

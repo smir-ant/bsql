@@ -698,6 +698,94 @@ fn transaction_closure() {
     c.close().expect("close");
 }
 
+/// The deferred-BEGIN FUSION correctness path (D2), end-to-end over real PG:
+/// an EMPTY transaction still opens+closes a real transaction, a transaction whose
+/// FIRST statement is the EXTENDED protocol (`query_params`, one-round-trip) fuses
+/// BEGIN into that statement and commits its effect, and a rollback of such a body
+/// discards it. Exercises the fused BEGIN over both the simple- and extended-query
+/// first-statement paths, proving the prelude drain does not corrupt the
+/// statement's result.
+#[test]
+#[ignore = "requires local PG"]
+fn transaction_fusion_empty_and_extended() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute_sql("CREATE TEMP TABLE txf(v int)").expect("create");
+
+    // (1) EMPTY body: BEGIN fuses into the terminating COMMIT (BEGIN;COMMIT). No
+    // statement, no error, and the connection stays healthy + at a clean idle.
+    c.transaction(|_tx| Ok(())).expect("empty tx commits");
+    assert!(c.is_healthy(), "connection healthy after an empty fused transaction");
+    // The connection is reusable and NOT stuck in a transaction (a subsequent
+    // stand-alone statement autocommits).
+    c.execute_sql("INSERT INTO txf VALUES (7)").expect("post-empty insert");
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM txf").expect("c").rows[0].get_i64(0),
+        Ok(Some(1))
+    );
+
+    // (2) FIRST statement is the EXTENDED protocol: BEGIN fuses ahead of the
+    // Parse+Bind+Describe+Execute batch, and the statement's own row decodes
+    // correctly (the prelude drain preserved the command's result schema).
+    let fused = c
+        .transaction(|tx| {
+            let r = tx.query_params_one("SELECT $1::int + 1 AS n", &(41i32,))?;
+            let n = r.get_i32(0).expect("decode the fused statement's row");
+            tx.execute_sql("INSERT INTO txf VALUES (8)")?;
+            Ok(n)
+        })
+        .expect("extended-first tx commits");
+    assert_eq!(fused, Some(42), "the fused extended statement decoded correctly");
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM txf").expect("c").rows[0].get_i64(0),
+        Ok(Some(2)),
+        "the committed insert persisted"
+    );
+
+    // (3) ROLLBACK of an extended-first body discards its effect.
+    let _: Result<(), _> = c.transaction(|tx| {
+        drop(tx.query_params_one("SELECT $1::int", &(9i32,))?);
+        tx.execute_sql("INSERT INTO txf VALUES (9)")?;
+        Err(bsql_postgres_sync::DriverError::NoRows)
+    });
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM txf").expect("c").rows[0].get_i64(0),
+        Ok(Some(2)),
+        "the rolled-back insert did not persist"
+    );
+    c.close().expect("close");
+}
+
+/// A transaction body that PANICS before issuing its first statement strands the
+/// DEFERRED `BEGIN` (its `COMMIT`/`ROLLBACK` never runs to consume it). The pool's
+/// reuse hook `reset_session` DISCARDS the stranded prelude, so the reset succeeds
+/// (a stranded `BEGIN` fusing into `DISCARD ALL` would be a "cannot run inside a
+/// transaction block" server error) and the connection is reusable — the fusion
+/// never leaves a latent corruption on the connection.
+#[test]
+#[ignore = "requires local PG"]
+fn transaction_panic_before_first_statement_is_cleared_by_reset() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    // Isolate the user-code panic so we can inspect + reuse the connection.
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<(), _> = c.transaction(|_tx| -> Result<(), bsql_postgres_sync::DriverError> {
+            panic!("user code panicked before the first statement");
+        });
+    }));
+    assert!(panicked.is_err(), "the panic propagated out of transaction");
+    // Healthy (no verb ran, so the liveness token is intact) but carrying a
+    // stranded BEGIN — exactly the connection a pool would take back.
+    assert!(c.is_healthy(), "connection healthy after a body panic");
+    // The reuse hook clears the stranded prelude, so the reset does NOT fuse it and
+    // succeeds.
+    c.reset_session().expect("reset clears the stranded prelude and succeeds");
+    // The next statement flushes only itself (no fused stale BEGIN) and works.
+    assert_eq!(
+        c.query_sql("SELECT 1::int").expect("q").rows[0].get_i32(0),
+        Ok(Some(1))
+    );
+    c.close().expect("close");
+}
+
 #[test]
 #[ignore = "requires local PG"]
 fn row_clone_across_threads() {

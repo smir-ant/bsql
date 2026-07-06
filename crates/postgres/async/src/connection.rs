@@ -691,11 +691,22 @@ impl Connection {
     /// async guard (`Drop` cannot `.await`): the async closure form is the
     /// cancellation-correct shape — if the returned future is dropped mid-body, no
     /// `COMMIT` runs and the server rolls back when the socket later closes.
+    ///
+    /// The `BEGIN` is DEFERRED and PIPELINED with the first statement the body
+    /// issues: it rides that statement's flush (one round trip carries both), so a
+    /// one-statement transaction costs the pipelined round trips, not a separate
+    /// `BEGIN` round trip plus the statement's. An EMPTY body (no statement) still
+    /// opens the transaction — the pending `BEGIN` fuses into the terminating
+    /// `COMMIT` / `ROLLBACK` flush. A fused `BEGIN` that errors surfaces as the
+    /// transaction's failure (it cannot be swallowed by the first statement).
     pub async fn transaction<R, F>(&mut self, f: F) -> Result<R, DriverError>
     where
         F: AsyncFnOnce(&mut Self) -> Result<R, DriverError>,
     {
-        self.core.simple_query("BEGIN").await?;
+        // Defer BEGIN: it fuses into the first statement's flush (or the terminating
+        // COMMIT/ROLLBACK for an empty body), so it is always consumed before this
+        // method returns — never left pending on the connection.
+        self.core.defer_begin();
         let result = match f(self).await {
             Ok(value) => {
                 self.core.simple_query("COMMIT").await?;
@@ -703,7 +714,10 @@ impl Connection {
             }
             Err(e) => {
                 // Best-effort rollback; the outcome rides the liveness token, so it
-                // is explicitly discarded. The caller's error `e` dominates.
+                // is explicitly discarded. The caller's error `e` dominates. If the
+                // body issued no statement, this ROLLBACK's flush also carries the
+                // still-pending BEGIN (an empty BEGIN;ROLLBACK — a harmless no-op
+                // transaction), so no stale prelude survives into the next verb.
                 drop(self.core.simple_query("ROLLBACK").await);
                 Err(e)
             }

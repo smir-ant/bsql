@@ -239,6 +239,17 @@ where
     // Drain the enqueued request once, before the first read.
     flush(send_buf, transport).await?;
 
+    // Drain a fused simple-query PRELUDE (a pipelined BEGIN, or a pool-checkout
+    // RESET) FIRST: its frame was enqueued ahead of the command's, so the single
+    // flush above carried BOTH. Its own results are swallowed; a NOTIFY / NOTICE /
+    // ParameterStatus riding its response still surfaces through `sink`. Cold: only
+    // a transaction's first statement / a checkout's first verb arms one, so the
+    // common path is one predict-not-taken branch.
+    if active.draining_prelude() {
+        core::hint::cold_path();
+        drain_fused_prelude(active, transport, &mut sink).await?;
+    }
+
     loop {
         // The borrowing `Event` is confined to this `match`: arms either diverge
         // (read / return a boundary) before binding any payload, or yield a
@@ -307,6 +318,101 @@ where
             core::hint::cold_path();
             return Ok(Boundary::Stopped(b));
         }
+    }
+}
+
+/// Drain a fused simple-query PRELUDE's response to its trailing
+/// `ReadyForQuery`, swallowing the prelude's own rows/completions while surfacing
+/// any `NOTIFY` / `NOTICE` / `ParameterStatus` through `sink`. On return the
+/// engine is handed back to its seated command state (the prelude cleared), so the
+/// caller's main pump loop reads the command's own response next.
+///
+/// The prelude and the command travel in ONE flush (the prelude's frame was
+/// enqueued ahead of the command's), so this removes the prelude's standalone
+/// round trip. The prelude drain uses a SEPARATE pull
+/// ([`ActiveEngine::next_prelude_event`]) that does not touch the command's seated
+/// result columns, so the command decodes against its own schema afterward.
+///
+/// # Errors
+///
+/// - The read/framing errors of [`pump_active_to_boundary`] (transport fault,
+///   `UnexpectedEof`, `IngestFull`, `IngestCommitOverflow`).
+/// - [`EngineError::ProtocolViolation`](super::EngineError::ProtocolViolation) —
+///   a prelude `ErrorResponse` or any unexpected frame. A fixed
+///   `BEGIN`/`COMMIT`/`RESET` at a clean boundary cannot error, so this is
+///   structurally unreachable; when reached (e.g. a future isolation variant with
+///   invalid syntax) the connection is killed rather than left with an undrained
+///   command reply — the transaction aborts and the pool evicts the connection.
+///
+/// [`ActiveEngine::next_prelude_event`]: super::ActiveEngine::next_prelude_event
+pub(crate) async fn drain_fused_prelude<T, S, B>(
+    active: &mut ActiveEngine,
+    transport: &mut T,
+    sink: &mut S,
+) -> Result<(), EngineError<T::Error>>
+where
+    T: Transport,
+    S: FnMut(Surface<'_>) -> ControlFlow<B>,
+{
+    while active.draining_prelude() {
+        // Each borrowing `Event` is confined to its match arm (consumed by the
+        // read or the sink call), so the next `read_slot` re-borrow is conflict-free
+        // — the same borrow discipline the main pump loop uses.
+        match active.next_prelude_event() {
+            Event::NeedMore => {
+                let slot = active.read_slot(READ_WANT).map_err(EngineError::IngestFull)?;
+                let n = transport
+                    .read(slot)
+                    .await
+                    .map_err(EngineError::Transport)?;
+                if n == 0 {
+                    core::hint::cold_path();
+                    return Err(EngineError::UnexpectedEof);
+                }
+                active.commit(n).map_err(EngineError::IngestCommitOverflow)?;
+            }
+            // The prelude's trailing `ReadyForQuery` cleared the drain; the loop
+            // guard exits and the command loop takes over.
+            Event::Idle => {}
+            // Asynchronous frames on the prelude's response must still surface
+            // (captured into the ledger by the driver's capture sink). The prelude
+            // drain is NOT caller-stoppable — a NOTIFY/NOTICE/ParamStatus rides a
+            // Continue-returning capture sink — so an (inapplicable) Break is
+            // ignored rather than stranding the connection mid-prelude.
+            Event::Notice(body) => surface_during_prelude(sink, Surface::Notice(body)),
+            Event::Notify(body) => surface_during_prelude(sink, Surface::Notify(body)),
+            Event::ParamStatus(body) => surface_during_prelude(sink, Surface::ParamStatus(body)),
+            // A prelude ErrorResponse / teardown / any frame the swallowing drain
+            // never emits: fatal. The connection is killed (its undrained command
+            // reply is abandoned with it).
+            Event::Fail(_)
+            | Event::Close
+            | Event::Deliver
+            | Event::Suspended
+            | Event::Row(_)
+            | Event::RowChunk(_)
+            | Event::RowChunkEnd
+            | Event::CopyData(_)
+            | Event::CopyDone => {
+                core::hint::cold_path();
+                return Err(EngineError::ProtocolViolation);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Surface an asynchronous frame observed during a prelude drain. The drain is not
+/// caller-stoppable, so a `Break` (never returned by a capture sink for an async
+/// frame) is ignored rather than acted on — the connection must not be left
+/// mid-prelude on a spurious stop.
+#[inline]
+fn surface_during_prelude<S, B>(sink: &mut S, s: Surface<'_>)
+where
+    S: FnMut(Surface<'_>) -> ControlFlow<B>,
+{
+    if let ControlFlow::Break(_) = sink(s) {
+        core::hint::cold_path();
     }
 }
 

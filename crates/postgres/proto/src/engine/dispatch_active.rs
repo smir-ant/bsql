@@ -257,6 +257,32 @@ enum ActiveState {
     Failed,
 }
 
+/// The drain sub-state for a fused simple-query PRELUDE — a pipelined `BEGIN`
+/// (fused with a transaction's first statement) or a pool-checkout session
+/// RESET — whose response is drained BEFORE the seated command's response, so a
+/// single flush carries the prelude AND the command and the prelude's standalone
+/// round trip is removed.
+///
+/// While a prelude is in flight ([`ActiveEngine::prelude`] is `Some`) the drive
+/// loop routes frames through [`ActiveEngine::step_prelude`] — a self-contained
+/// simple-query drain that SWALLOWS the prelude's own rows/completions and never
+/// touches the command's already-seated result columns — instead of the seated
+/// [`ActiveState`]; the seated state takes over the moment the prelude's trailing
+/// `ReadyForQuery` clears it. Two variants: they mirror just the frames a
+/// `BEGIN` / `COMMIT` / `ROLLBACK` / `RESET` simple query can produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreludePhase {
+    /// Awaiting the prelude's next statement boundary: a `CommandComplete`
+    /// (swallowed — another statement or the trailing RFQ follows), a
+    /// `RowDescription` (a RESET `SELECT` — advance to the swallowed row phase),
+    /// an `EmptyQueryResponse` (swallowed), or the trailing `ReadyForQuery`
+    /// (prelude done).
+    Awaiting,
+    /// The prelude opened a row stream (a RESET `SELECT pg_advisory_unlock_all()`);
+    /// swallowing `DataRow`s until the statement's `CommandComplete`.
+    StreamingRows,
+}
+
 /// Borrow source for a payload-lending [`ActiveOutcome`].
 #[derive(Debug, Clone, Copy)]
 enum Lend {
@@ -387,17 +413,36 @@ pub struct ActiveEngine {
     /// bound; the names are short `'static` references into the consumer's
     /// `.rodata`, so the entries are bare fat pointers, not owned strings.
     parsed_statements: Vec<&'static str>,
+    /// The simple-query SQL of a fused PRELUDE to prepend to the NEXT command's
+    /// flush — a deferred `BEGIN` (fused with a transaction's first statement) or
+    /// a pool-checkout session RESET. `None` in steady state. Taken by the first
+    /// request verb that runs, which enqueues the prelude's `'Q'` frame ahead of
+    /// its own and then [`arm_prelude`](Self::arm_prelude)s the drain. The
+    /// `'static` SQL is a bare `&str` into `.rodata`, never an owned allocation.
+    ///
+    /// Off the hot path: read only at a verb's send-path entry (never inside
+    /// `next_event`/`drive`), so its footprint cost is an offset shift with no
+    /// hot-loop codegen effect.
+    pending_prelude: Option<&'static str>,
+    /// The drain sub-state while a fused prelude's response is being consumed
+    /// AHEAD of the seated command's response. `None` in steady state — the drive
+    /// loop then dispatches on [`state`](Self::state) directly, byte-identically to
+    /// before this field existed. See [`PreludePhase`]; read only on the SEPARATE
+    /// [`next_prelude_event`](Self::next_prelude_event) drain path, so `next_event`
+    /// is untouched.
+    prelude: Option<PreludePhase>,
 }
 
 // Stack footprint of the active handle: the carried-forward `IngestBuf` (144)
 // dominates, plus the pid/secret/tx-status scalars, the `Option<Box<…>>` /
 // `Vec` handles (schema, oversize prefix, the Sub-C accumulator, the prepared-
-// statement-name cache), the `command_tag`, and the captured `server_version`
+// statement-name cache), the `command_tag`, the captured `server_version`
 // (`Option<String>`, 24 B — the version text itself is off-stack behind the
-// `String`). The result-schema, oversize, and cached-name bytes live off-stack
-// behind those handles. A field addition lands here as a reviewed footprint
-// drift.
-crate::wire_pin!(ActiveEngine, size = 352, align = 8);
+// `String`), and the fused-prelude pair (`Option<&'static str>` + a 1-byte
+// `Option<PreludePhase>`). The result-schema, oversize, and cached-name bytes
+// live off-stack behind those handles. A field addition lands here as a reviewed
+// footprint drift.
+crate::wire_pin!(ActiveEngine, size = 368, align = 8);
 
 impl ActiveEngine {
     /// Construct the active engine at handshake completion, carrying the
@@ -424,6 +469,8 @@ impl ActiveEngine {
             command_tag: None,
             server_version,
             parsed_statements: Vec::new(),
+            pending_prelude: None,
+            prelude: None,
         }
     }
 
@@ -563,6 +610,61 @@ impl ActiveEngine {
     #[inline]
     pub fn evict_statement(&mut self, stmt_name: &str) {
         self.parsed_statements.retain(|name| *name != stmt_name);
+    }
+
+    // ── Fused-prelude staging + drain ─────────────────────────────────────
+    //
+    // A transaction's `BEGIN` (and a pool checkout's session RESET) is DEFERRED
+    // and fused into the first following command's flush: one flush carries the
+    // prelude simple-query AND the command, and the prelude's own response is
+    // drained (swallowed) AHEAD of the command's, removing the prelude's standalone
+    // round trip. The mechanism is confined to a SEPARATE drain path
+    // ([`next_prelude_event`](Self::next_prelude_event) / `drive_prelude` /
+    // `step_prelude`), so the inbound hot dispatch [`next_event`](Self::next_event)
+    // is byte-identical whether or not a prelude is armed — read below only in the
+    // cold verb send-path and the cold drain path, never in `next_event`.
+
+    /// Arm a fused simple-query prelude to prepend to the NEXT command's flush.
+    /// The SQL is a `'static` simple query (`BEGIN`, `COMMIT`, `ROLLBACK`, or a
+    /// session RESET). Overwrites any previously-armed pending prelude — the caller
+    /// (a transaction / pool checkout) arms exactly one at a time.
+    #[inline]
+    pub fn set_pending_prelude(&mut self, sql: &'static str) {
+        self.pending_prelude = Some(sql);
+    }
+
+    /// Take the pending fused-prelude SQL, if any — the request verb enqueues its
+    /// `'Q'` frame ahead of its own command frames, then
+    /// [`arm_prelude`](Self::arm_prelude)s the drain.
+    #[inline]
+    #[must_use]
+    pub fn take_pending_prelude(&mut self) -> Option<&'static str> {
+        self.pending_prelude.take()
+    }
+
+    /// Discard any pending fused prelude without consuming it — the pool's
+    /// `reset_session` clears a prelude a panicked transaction body stranded.
+    #[inline]
+    pub fn clear_pending_prelude(&mut self) {
+        self.pending_prelude = None;
+    }
+
+    /// Arm the prelude DRAIN: the next inbound frames drain the prelude's
+    /// simple-query response (swallowed) before the seated command's, then the
+    /// seated [`ActiveState`] takes over. Paired with the verb enqueuing the
+    /// prelude's frame ahead of its own command frames.
+    #[inline]
+    pub fn arm_prelude(&mut self) {
+        self.prelude = Some(PreludePhase::Awaiting);
+    }
+
+    /// Whether a fused prelude is still being drained (its trailing
+    /// `ReadyForQuery` not yet seen). The pump drains it via
+    /// [`next_prelude_event`](Self::next_prelude_event) before the command loop.
+    #[inline]
+    #[must_use]
+    pub fn draining_prelude(&self) -> bool {
+        self.prelude.is_some()
     }
 
     // ── Extended-query-protocol state-entry seam ──────────────────────────
@@ -1484,6 +1586,157 @@ impl ActiveEngine {
     fn reset_columns(&mut self) {
         self.col_oids.clear();
         self.col_names.clear();
+    }
+
+    // ── Fused-prelude drain (the swallowing twin of the main dispatch) ──────
+    //
+    // Kept SEPARATE from `next_event`/`drive`/`step_frame` so the inbound hot
+    // dispatch is byte-identical whether or not a prelude is armed: the whole
+    // subtree below is reachable only from the pump's cold prelude pre-drain, never
+    // from `next_event`. `#[cold]` + `#[inline(never)]` so it cannot fold into any
+    // caller's hot frame (it runs at most once per transaction / pool checkout).
+
+    /// Pull the next event while DRAINING a fused prelude — the swallowing twin of
+    /// [`next_event`](Self::next_event), used only while
+    /// [`draining_prelude`](Self::draining_prelude).
+    ///
+    /// Routes frames through [`step_prelude`](Self::step_prelude) (which swallows
+    /// the prelude's own rows/completions and never touches the seated command's
+    /// columns) instead of the seated [`ActiveState`]. Only NeedMore / Idle (the
+    /// prelude's trailing RFQ) / the async frames / a fatal Close can surface; the
+    /// prelude's own row/deliver/copy frames are swallowed internally.
+    #[cold]
+    #[inline(never)]
+    pub fn next_prelude_event(&mut self) -> Event<'_> {
+        match self.drive_prelude() {
+            ActiveOutcome::Silent | ActiveOutcome::NeedMore => Event::NeedMore,
+            ActiveOutcome::Idle => Event::Idle,
+            ActiveOutcome::Close => Event::Close,
+            ActiveOutcome::Notice(l, s, e) => Event::Notice(self.lend(l, s, e)),
+            ActiveOutcome::Notify(l, s, e) => Event::Notify(self.lend(l, s, e)),
+            ActiveOutcome::ParamStatus(l, s, e) => Event::ParamStatus(self.lend(l, s, e)),
+            // The prelude drain swallows its OWN results (rows, deliveries,
+            // suspends, copies, oversize) — `drive_prelude` never returns any of
+            // these. Classify each as a fatal teardown rather than a silent misframe
+            // (Enumerated, no wildcard: a future outcome forces a decision here).
+            ActiveOutcome::Deliver
+            | ActiveOutcome::Suspended
+            | ActiveOutcome::RowChunkEnd
+            | ActiveOutcome::CopyDone
+            | ActiveOutcome::Fail(..)
+            | ActiveOutcome::Row(..)
+            | ActiveOutcome::RowChunk(..)
+            | ActiveOutcome::CopyData(..) => Event::Close,
+        }
+    }
+
+    /// Drive the framing + prelude dispatch loop to the next surfaceable outcome —
+    /// the prelude twin of [`drive`](Self::drive).
+    ///
+    /// A `BEGIN` / `COMMIT` / `RESET` reply is small and never oversize, so this
+    /// omits `drive`'s oversize + `Failed`-short-circuit machinery: a malformed or
+    /// oversize frame here is unexpected and a fatal teardown. Asynchronous frames
+    /// (`NOTICE` / `NOTIFY` / `ParameterStatus`) surface regardless of phase,
+    /// exactly as in `drive`, so a notification riding the prelude's response is
+    /// never dropped.
+    #[cold]
+    #[inline(never)]
+    fn drive_prelude(&mut self) -> ActiveOutcome {
+        loop {
+            match self.ingest.peek_header() {
+                HeaderParse::Empty | HeaderParse::Incomplete => return ActiveOutcome::NeedMore,
+                HeaderParse::MalformedLength { .. } | HeaderParse::FrameTooLarge { .. } => {
+                    return self.prelude_teardown();
+                }
+                HeaderParse::Ok { .. } => match self.ingest.take_frame() {
+                    None => return ActiveOutcome::NeedMore,
+                    Some((tag, start, end)) => match tag {
+                        T_NOTICE => return ActiveOutcome::Notice(Lend::Ingest, start, end),
+                        T_NOTIFY => return ActiveOutcome::Notify(Lend::Ingest, start, end),
+                        T_PARAM_STATUS => {
+                            return ActiveOutcome::ParamStatus(Lend::Ingest, start, end)
+                        }
+                        _ => {
+                            let outcome = self.step_prelude(tag, start, end);
+                            if matches!(outcome, ActiveOutcome::Silent) {
+                                continue;
+                            }
+                            return outcome;
+                        }
+                    },
+                },
+            }
+        }
+    }
+
+    /// Per-frame prelude transition. SWALLOWS the prelude's own rows/completions
+    /// (returning [`Silent`](ActiveOutcome::Silent)); the trailing `ReadyForQuery`
+    /// ends the drain via [`finish_prelude`](Self::finish_prelude). A
+    /// `BEGIN`/`COMMIT`/`RESET` simple query cannot error at a clean boundary, so a
+    /// `T_ERROR` (or any other unexpected frame) is a fatal teardown, never a
+    /// silently-recovered state — the connection is then killed rather than left
+    /// with an undrained command reply.
+    fn step_prelude(&mut self, tag: u8, start: usize, end: usize) -> ActiveOutcome {
+        match self.prelude {
+            Some(PreludePhase::Awaiting) => match tag {
+                // A statement completed / was empty — swallow; another statement or
+                // the trailing RFQ follows.
+                T_COMMAND_COMPLETE | T_EMPTY_QUERY => ActiveOutcome::Silent,
+                // A RESET `SELECT` opened a row stream — advance to the swallowed
+                // row phase (deliberately NOT parsed into `col_oids`: the command's
+                // seated columns must survive the prelude drain).
+                T_ROW_DESC => {
+                    self.prelude = Some(PreludePhase::StreamingRows);
+                    ActiveOutcome::Silent
+                }
+                T_READY_FOR_QUERY => self.finish_prelude(start, end),
+                _ => self.prelude_teardown(),
+            },
+            Some(PreludePhase::StreamingRows) => match tag {
+                T_DATA_ROW => ActiveOutcome::Silent,
+                T_COMMAND_COMPLETE => {
+                    self.prelude = Some(PreludePhase::Awaiting);
+                    ActiveOutcome::Silent
+                }
+                _ => self.prelude_teardown(),
+            },
+            // Unreachable: `drive_prelude` routes here only while `prelude` is
+            // `Some`. Classified (no wildcard) rather than a panic.
+            None => self.prelude_teardown(),
+        }
+    }
+
+    /// The prelude's trailing `ReadyForQuery`: record its transaction-status
+    /// indicator (a `BEGIN` moves the session to `InTransaction`) and clear the
+    /// drain so the seated [`ActiveState`] takes over on the next frame.
+    ///
+    /// Deliberately does NOT reset the per-statement columns: the seated command's
+    /// result OIDs — set by its `begin_*` seat BEFORE the prelude drain — must
+    /// survive into the command's own response (the extended Execute re-sends no
+    /// `RowDescription`). The RFQ's own frame body is re-borrowed off the ingest
+    /// cursor `take_frame` just advanced.
+    fn finish_prelude(&mut self, start: usize, end: usize) -> ActiveOutcome {
+        let body = self.ingest.frame_body(start, end);
+        match body {
+            [byte] => match TxStatus::try_from_byte(*byte) {
+                Ok(tx) => {
+                    self.tx_status = tx;
+                    self.prelude = None;
+                    ActiveOutcome::Idle
+                }
+                Err(_) => self.prelude_teardown(),
+            },
+            _ => self.prelude_teardown(),
+        }
+    }
+
+    /// A fatal prelude teardown: clear the drain and mark the command state
+    /// `Failed` so the connection is killed (the pump maps the surfaced `Close` to
+    /// [`EngineError::ProtocolViolation`](super::EngineError::ProtocolViolation)).
+    fn prelude_teardown(&mut self) -> ActiveOutcome {
+        self.prelude = None;
+        self.state = ActiveState::Failed;
+        ActiveOutcome::Close
     }
 
     // ── oversize streaming ──

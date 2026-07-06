@@ -174,6 +174,34 @@ fn enqueue_frame<E>(
     Ok(())
 }
 
+/// Stage a fused simple-query PRELUDE at the FRONT of the current command's
+/// batch, if one was armed — a deferred `BEGIN` (fused with a transaction's first
+/// statement) or a pool-checkout session RESET.
+///
+/// Called by each request verb right after [`SendBuf::reset`](super::SendBuf::reset)
+/// and BEFORE it enqueues its own frames: the prelude's `'Q'` frame is enqueued
+/// first (so the single following flush carries the prelude AND the command — one
+/// round trip, not two), then the prelude DRAIN is armed so the pump consumes the
+/// prelude's response before the command's. Because it runs on the freshly-reset
+/// (empty) buffer, the prelude is a natural PREPEND with no memmove.
+///
+/// A no-op — one predict-not-taken branch — when no prelude is pending, the steady
+/// state. The prelude SQL is a fixed `BEGIN` / `COMMIT` / `ROLLBACK` / session
+/// RESET, all of which fit the bounded [`WriteBuf`]; a builder overflow is the
+/// classified [`EngineError::FrameTooLong`], never a silent truncation.
+#[inline]
+fn stage_prelude<E>(
+    active: &mut ActiveEngine,
+    send_buf: &mut SendBuf,
+) -> Result<(), EngineError<E>> {
+    if let Some(sql) = active.take_pending_prelude() {
+        core::hint::cold_path();
+        enqueue_frame(send_buf, |wb| frames::build_simple_query(wb, sql.as_bytes()))?;
+        active.arm_prelude();
+    }
+    Ok(())
+}
+
 /// Classify a streamed-`Bind` builder overflow as [`EngineError::FrameTooLong`].
 ///
 /// The single cold-path landing for the STREAMING Bind assembly — the peer of
@@ -358,6 +386,9 @@ where
 {
     let reuse = active.is_statement_parsed(q.stmt_name);
     send_buf.reset();
+    // Prepend a fused prelude (a deferred BEGIN) ahead of this command's frames,
+    // if one was armed — one flush then carries both.
+    stage_prelude(active, send_buf)?;
     if !reuse {
         enqueue_frame(send_buf, |wb| {
             frames::build_close_statement(wb, q.stmt_name.as_bytes())
@@ -436,6 +467,7 @@ impl<'b, T: Transport> Engine<'b, T> {
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
+        stage_prelude(active, send_buf)?;
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
         let status = drive_to_outcome(active, transport, send_buf, sink).await?;
         Ok(Outcome { live, status })
@@ -606,6 +638,7 @@ impl<'b, T: Transport> Engine<'b, T> {
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
+        stage_prelude(active, send_buf)?;
         // Stream the SQL body directly onto the (growable) send buffer rather
         // than copying it into the bounded `WriteBuf`: only the 5-byte header is
         // built into the scratch buffer, so a multi-kilobyte query (a large
@@ -655,6 +688,7 @@ impl<'b, T: Transport> Engine<'b, T> {
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
+        stage_prelude(active, send_buf)?;
         // Stream the SQL body onto the (growable) send buffer rather than copying
         // it into the bounded `WriteBuf`: only the Parse header (tag + length +
         // statement name) is built into the scratch buffer, so a multi-kilobyte
@@ -746,6 +780,7 @@ impl<'b, T: Transport> Engine<'b, T> {
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
+        stage_prelude(active, send_buf)?;
         // Unnamed portal; the named statement was parsed by `prepare`. The Bind
         // streams onto the growable send buffer (unbounded params); Execute+Sync
         // below stay bounded.
@@ -809,6 +844,7 @@ impl<'b, T: Transport> Engine<'b, T> {
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
+        stage_prelude(active, send_buf)?;
         // Parse(unnamed ""): stream the SQL body onto the (growable) send buffer
         // rather than the bounded scratch, so a multi-kilobyte runtime query is
         // not capped at MAX_OWNED_SEND_LEN — byte-identical to the `prepare` path's
@@ -1084,6 +1120,7 @@ impl<'b, T: Transport> Engine<'b, T> {
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
+        stage_prelude(active, send_buf)?;
         enqueue_frame(send_buf, |wb| {
             frames::build_close_statement(wb, stmt.stmt_name().as_bytes())
         })?;
@@ -1127,11 +1164,27 @@ impl<'b, T: Transport> Engine<'b, T> {
             send_buf,
             ..
         } = self;
-        // Phase gate only — the flush needs no `active` handle (nothing is read).
-        phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        // A fused prelude (a deferred BEGIN when a COPY is a transaction's FIRST
+        // statement) needs the `active` handle both to stage its frame ahead of the
+        // COPY command and to drain its response BEFORE the client-streaming phase
+        // begins — so this verb keeps the handle rather than a bare phase gate.
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
+        stage_prelude(active, send_buf)?;
         enqueue_frame(send_buf, |wb| frames::build_simple_query(wb, sql.as_bytes()))?;
-        super::flush::flush(send_buf, transport).await
+        super::flush::flush(send_buf, transport).await?;
+        // Drain a fused prelude's response (e.g. a deferred BEGIN) NOW, so the COPY
+        // stream that follows starts at the COPY command's own reply, not the
+        // prelude's `CommandComplete` + `ReadyForQuery`. Swallow-only: a
+        // COPY-first transaction body has no caller sink here, so a NOTIFY riding
+        // the prelude is dropped (a rare COPY-first-in-transaction edge; the COPY's
+        // own stream carries no notification path either).
+        if active.draining_prelude() {
+            core::hint::cold_path();
+            let mut swallow = noop_sink;
+            super::pump::drain_fused_prelude(active, transport, &mut swallow).await?;
+        }
+        Ok(())
     }
 
     /// Stream one `CopyData` (`'d'`) frame for an open COPY-in, BATCHING the flush
@@ -1331,6 +1384,7 @@ impl<'b, T: Transport> Engine<'b, T> {
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
+        stage_prelude(active, send_buf)?;
         enqueue_frame(send_buf, |wb| frames::build_simple_query(wb, sql.as_bytes()))?;
         let boundary = pump_active_to_boundary(active, transport, send_buf, sink).await?;
         match boundary {

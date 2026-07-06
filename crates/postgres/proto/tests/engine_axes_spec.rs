@@ -430,10 +430,13 @@ const ENGINE_ERROR_VARIANTS: usize = 14;
 const ACTIVE_VERBS: usize = 20;
 /// `core::hint::cold_path()` classified-branch markers across `engine/`.
 /// Reproduce: `grep -rho 'core::hint::cold_path()' crates/postgres/proto/src/engine/*.rs | wc -l`
-/// (46 includes the COPY-in `write_all` `WriteZero`/`SendOverrun` branches,
-/// `query_params_fused`'s oversize-SQL `FrameTooLong` branch, and the streaming
-/// `Bind`'s `frame_too_long` overflow landing.)
-const COLD_CLASSIFIED_BRANCHES: usize = 46;
+/// (52 includes the COPY-in `write_all` `WriteZero`/`SendOverrun` branches,
+/// `query_params_fused`'s oversize-SQL `FrameTooLong` branch, the streaming
+/// `Bind`'s `frame_too_long` overflow landing, and the six fused-prelude markers:
+/// the `stage_prelude` prepend, the `pump_active_to_boundary` prelude-drain branch,
+/// the `drain_fused_prelude` EOF + fatal-frame arms, `surface_during_prelude`'s
+/// inapplicable-`Break` guard, and `copy_in_begin`'s prelude-drain branch.)
+const COLD_CLASSIFIED_BRANCHES: usize = 52;
 /// `#[non_exhaustive]` attribute lines across `engine/`.
 /// Reproduce: `grep -rcE '^#\[non_exhaustive\]' crates/postgres/proto/src/engine/*.rs` (summed)
 const NON_EXHAUSTIVE_ATTRS: usize = 4;
