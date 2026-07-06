@@ -44,20 +44,20 @@ Load-bearing decisions for any new session:
 
 ```
 crates/
-  bsql/              — umbrella facade + query! re-export + #[bsql::test] harness (bsql::pg, ::pg_sync, ::sqlite)  — 675 LoC
+  bsql/              — umbrella facade + query! re-export + #[bsql::test] harness (bsql::pg, ::pg_sync, ::sqlite)  — 914 LoC
   postgres/
-    proto/           — sans-IO wire protocol + session engine (no_std + alloc)  — 25765 LoC
-    core/            — shared engine materializer + types + config + TLS + Rows + notify ledger + N+1 detector  — 6861 LoC
-    async/           — tokio async driver (thin adapter over the engine)  — 2095 LoC
-    sync/            — std::net sync driver (thin adapter over the engine)  — 1910 LoC
+    proto/           — sans-IO wire protocol + session engine (no_std + alloc)  — 27886 LoC
+    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + N+1 detector + SafeIdent guard  — 9236 LoC
+    async/           — tokio async driver (plugs its socket into the shared Core<S>)  — 1743 LoC
+    sync/            — std::net blocking driver (plugs its socket into the shared Core<S>)  — 1575 LoC
   sqlite/
-    driver/          — embedded SQLite driver (bundled rusqlite)  — 1010 LoC
-  testkit/           — deterministic in-memory fake PostgreSQL for driver tests (no network)  — 560 LoC
-  build/             — BUILD-DEP: migration DDL → schema catalog (+ SQLite template)  — 34591 LoC
-  query-macros/      — PROC-MACRO: query! (types/validates against the catalog) + #[bsql::test] (schema-per-test wrapper)  — 1864 LoC
+    driver/          — embedded SQLite driver (bundled rusqlite)  — 995 LoC
+  testkit/           — deterministic in-memory fake PostgreSQL for driver tests (no network)  — 1005 LoC
+  build/             — BUILD-DEP: migration DDL → schema catalog (+ SQLite template)  — 34719 LoC
+  query-macros/      — PROC-MACRO: query! (types/validates against the catalog) + #[bsql::test] (schema-per-test wrapper)  — 1929 LoC
 ```
 
-(src LoC measured per crate via `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by ~13K lines of inference tests in `src/infer.rs`. Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync}`, `bsql-sqlite`, `bsql-testkit`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-bridge-fixture`, `bsql-query-sqlite-fixture`, `bsql-test-harness-fixture`, `bsql-corpus`.)
+(src LoC measured per crate via `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by `src/infer.rs` (29563 lines: the schema/type-inference engine plus a ~13K-line inline `#[cfg(test)]` test module). Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync}`, `bsql-sqlite`, `bsql-testkit`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-bridge-fixture`, `bsql-query-sqlite-fixture`, `bsql-test-harness-fixture`, `bsql-corpus`.)
 
 ## Build & test
 
@@ -306,8 +306,8 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 ## Architecture
 
 - **Sans-IO engine** (`bsql-postgres-proto`, `engine` module): the session engine with zero I/O dependencies (`no_std + alloc`). Its seams: `Transport` (the driver-facing I/O seam, RPITIT + `Send`), `Live` (a branded, non-`Clone`, linear liveness token minted by `engine::session`), and the `Never` carrier for phase-impossible frames. Protocol logic lives here; the driver only supplies bytes.
-- **Core** (`bsql-postgres-core`): the shared result materializer, the dynamic `Row` / `QueryResult` types, `ConnectConfig`, TLS config, and the typed `Rows` / `RowsBuilder` containers. Both drivers build on it.
-- **Drivers** are thin I/O adapters implementing the `Transport` seam over the one engine. Difference: `.await` on async, blocking on sync.
+- **Core** (`bsql-postgres-core`): the shared TRANSPORT-GENERIC driver engine `Core<S: Transport>` — it holds the sans-IO engine over a `Wire<S>` plus the linear liveness token and defines every non-I/O verb ONCE — alongside the result materializer, the dynamic `Row` / `QueryResult` types, `ConnectConfig`, TLS config, and the typed `Rows` / `RowsBuilder` containers. Both drivers build on it.
+- **Drivers** are thin I/O adapters that plug their socket into the ONE `Core<S>`: `Core<TokioSocket>` on async, `Core<SyncSocket>` on sync (each socket is a TCP-or-unix enum), MONOMORPHISED per driver — static dispatch, no `dyn`. The verbs live once in `Core<S>`; the drivers differ only in `.await` vs blocking, so async/sync parity is a COMPILER guarantee, not hand-maintained twins.
 - **Rows.** The dynamic `Row` (from `query_sql` etc.) is 16 bytes (`'static + Clone + Send + Sync`) over an `Arc`-shared arena: 4 heap allocations per whole `QueryResult`, regardless of row count. The typed `Rows<Q>` (from the `query!` flagship) is 2 allocations per result and 0 per row (borrowed, zero-copy decode).
 
 ## Safety invariants
@@ -328,12 +328,29 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 - `PreparedStatement` consumed by `close_statement(stmt)` — use-after-close is compile error
 - Transactions via closure scope — no forgotten commits
 - Passwords `Zeroizing<String>` — scrubbed on drop, redacted in Debug
+- SQL identifiers spliced into DDL / COPY (table + schema names) go through
+  `SafeIdent` / `SafeTable` — newtypes with a PRIVATE field and a validate-only
+  constructor (`validate`), so an un-validated identifier CANNOT be spliced (no
+  other way to build one exists). Identifier-injection safety is STRUCTURAL — a
+  construction guarantee, not a runtime escape pass a call site could forget.
 
 ## Conventions
 
 - No `expect()` or `unwrap()` in production code
 - Error types: `DriverError::Db(DbError)` for server errors with SQLSTATE, `DriverError::Config` for pre-connect validation, `DriverError::NoRows` for empty results
 - `ConnectConfig` is `#[non_exhaustive]` — construct via `new()` + builder methods
+  (`footprint_pin!`-ed at 152 bytes)
+- Runtime parameterized queries (`query_params` / `query_params_one` /
+  `execute_params`) execute in a SINGLE round trip: `Parse`(unnamed) + `Bind` +
+  `Describe`(portal) + `Execute` + `Sync` are fused into one flush, so a one-shot
+  dynamic query costs one network round trip, not three (a separate prepare +
+  bind + close).
+- `copy_in` batches streamed `CopyData` to a 64 KiB threshold before flushing (a
+  single chunk at or above the threshold streams DIRECTLY from the borrowed
+  slice, never copied into the buffer), so a megarow bulk load costs about
+  `total_bytes / 64 KiB` write syscalls instead of one per row, with the send
+  buffer bounded under `2 ×` the threshold — constant memory regardless of COPY
+  size.
 - Transport (both drivers) is chosen by libpq's rule, centralized once in
   `core::resolve_endpoint`: an ABSOLUTE-PATH host (begins with `/`, e.g.
   `ConnectConfig::new("/tmp", …)`, `PGHOST=/var/run/postgresql`, or the DSN

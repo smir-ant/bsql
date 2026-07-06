@@ -20,19 +20,38 @@ so there is no per-call text/binary drift and no injection surface.
 ## What is shipped today
 
 - **PostgreSQL — async and sync.** A tokio driver (`bsql::pg`) and a
-  blocking `std::net` driver (`bsql::pg_sync`), both thin I/O adapters over
-  one shared sans-IO protocol engine. Trust / MD5 / SCRAM-SHA-256 auth,
-  optional rustls TLS, connection pooling, closure-scoped transactions.
+  blocking `std::net` driver (`bsql::pg_sync`), both thin I/O adapters that
+  plug their socket into ONE transport-generic driver core (`Core<S>`), so
+  async/sync parity is a compiler guarantee, not hand-maintained twins. Trust
+  / MD5 / SCRAM-SHA-256 auth, rustls TLS, connection pooling, closure-scoped
+  transactions. Runtime parameterized queries run in a single round trip (a
+  fused `Parse`+`Bind`+`Describe`+`Execute`+`Sync`).
 - **Embedded SQLite** (`bsql::sqlite`) over bundled `rusqlite`.
+- **Local unix-domain sockets.** An absolute-path host (`/tmp`,
+  `PGHOST=/var/run/postgresql`, or a `host=` DSN parameter) connects over a
+  local `AF_UNIX` socket instead of TCP — libpq's rule, centralized once —
+  measured ~2.4–2.9× faster than loopback TCP on a single round trip. A unix
+  socket is always plaintext, so `SslMode::Require` over one is a loud
+  `DriverError::Config`, never a silent downgrade.
+- **TLS with custom or private CA roots.** `SslMode::Require` verifies against
+  the baked Mozilla root bundle by default; a private CA is supplied with
+  `ConnectConfig::with_ca_roots(pem)` (or the `sslrootcert=<path>` DSN key /
+  `PGSSLROOTCERT` env), and a bad or empty PEM fails CLOSED — never a fallback
+  to baked roots or plaintext. `SslMode::Prefer` warns on stderr (debug AND
+  release) when the server refuses SSL and it falls back to plain TCP, and
+  `Connection::is_encrypted()` (both drivers) lets a consumer reject a
+  plaintext / downgraded connection outright.
 - **The compile-checked `query!` macro** (feature `macros`), reachable
   through the single `bsql` crate. SQL is typed at build time against the
   schema your migration `*.sql` files describe.
 - **Binary-uniform wire.** `ParamsWriter` is the sole encoding authority;
   `query!` binds every parameter in binary.
 - **Streaming `COPY`.** `copy_in` / `copy_in_with` bulk-load a table in
-  constant memory (no per-row heap growth — one reused scratch buffer) and
-  `copy_out` streams a table back the same way. Both drivers, PostgreSQL
-  text copy format, the table name validated as a SQL identifier.
+  constant memory (the send buffer stays bounded under 2× a 64 KiB flush
+  threshold) and batch streamed rows into large flushes — a megarow load costs
+  roughly `total_bytes / 64 KiB` write syscalls instead of one per row.
+  `copy_out` streams a table back the same way. Both drivers, PostgreSQL text
+  copy format, the table name validated as a SQL identifier (`SafeTable`).
 - **Typed `LISTEN` / `NOTIFY`.** `listen` subscribes; `recv_notification`
   (or `recv_notification_as::<T>` for a `FromStr`-parsed payload) delivers
   the notifications. A `NOTIFY` that arrives *during* a query is captured in
@@ -44,6 +63,13 @@ so there is no per-call text/binary drift and no injection surface.
   `build.rs` registers `.bridge(pg_type, target_path, converter_fn_path)` and
   the consumer supplies one infallible free-function converter — the
   orphan-proof seam. (CLAUDE.md documents it under *External-type bridges*.)
+- **N+1 query detection** (feature `n1-detect`). Detects the classic
+  anti-pattern — the same `query!` executed once per row of a prior result,
+  from the same source line — and surfaces it through `conn.n1_report()` with
+  the offending SQL, file, line, and count. Diagnostics-only (it never
+  batches, blocks, errors, or alters a result) and zero-cost when off
+  (default): a production build compiles no detector field, no query-path
+  branch, and no `#[track_caller]` cost. Both drivers.
 - **Destructive-migration acknowledgement gate.** A migration that
   irreversibly destroys data — `DROP TABLE`, `ALTER TABLE … DROP COLUMN`,
   `DROP SCHEMA … CASCADE`, `TRUNCATE`, or `DROP DATABASE` — is a **build
@@ -53,12 +79,22 @@ so there is no per-call text/binary drift and no injection surface.
   tests real driver code — `query_sql` *and* the compile-checked `query!`
   flagship — against a deterministic in-memory fake, with no network and no
   server, over either the async or the sync driver.
+- **Cargo feature slimming.** TLS (`tls`, default-on) and SCRAM-SHA-256 auth
+  (`scram`, default-on) are droppable: a `default-features = false` build for a
+  common localhost / unix-socket / trust-auth deployment omits — and never
+  compiles — the whole ring/rustls subtree and the SCRAM crypto crates
+  (measured async runtime graph 41 → 27 crates with both off). Dropping a
+  capability FAILS LOUD at connect: `SslMode::Require` with `tls` off, or a
+  password with `scram` off, is a classified `DriverError::Config`, never a
+  silent plaintext connect or auth failure. The baked Mozilla CA bundle is
+  itself behind the default-on `webpki-roots` feature (drop it for a
+  pinned-/private-CA-only build).
 - **A safety floor enforced by the compiler**, not by convention (see
   [Safety floor](#safety-floor)).
 
-Not yet shipped (do not assume these exist): automatic N+1 detection, and a
-live migration **runner**. The build-time schema validation and the
-destructive-migration acknowledgement gate ship, but there is no
+Not yet shipped (do not assume it exists): a live migration **runner**. The
+build-time schema validation and the destructive-migration acknowledgement gate
+ship, but there is no
 `bsql migrate` command that applies migrations to a running database. The
 macro validates against your migration **files**, not a live database — a
 schema change applied by hand in `psql` without a migration file is
@@ -133,7 +169,7 @@ of row count). See the crate-root docs of `bsql` / `bsql-postgres-async` /
 
 ## Crate layout
 
-Nine publishable crates and five never-published (`publish = false`) dev
+Nine publishable crates and six never-published (`publish = false`) dev
 tools. *(members: root `Cargo.toml` `[workspace] members`; package names /
 publish flags: `grep -m1 '^name\|^publish' <member>/Cargo.toml`.)*
 
@@ -141,9 +177,9 @@ publish flags: `grep -m1 '^name\|^publish' <member>/Cargo.toml`.)*
 |-------|------|------|
 | `bsql` | [`crates/bsql/`](crates/bsql/) | Umbrella facade. Re-exports `bsql::pg` / `bsql::pg_sync` / `bsql::sqlite` per feature; behind `macros`, re-exports `query!` + the typed-query surface. The one crate a consumer needs. |
 | `bsql-postgres-proto` | [`crates/postgres/proto/`](crates/postgres/proto/) | Sans-IO PostgreSQL wire protocol + session engine (`no_std + alloc`). Holds the typed-query decode primitives the `query!` expansion names. |
-| `bsql-postgres-core` | [`crates/postgres/core/`](crates/postgres/core/) | Shared across both drivers: result materializer, dynamic `Row` / `QueryResult` types, `ConnectConfig`, TLS config, and `Rows` / `RowsBuilder`. |
-| `bsql-postgres-async` | [`crates/postgres/async/`](crates/postgres/async/) | tokio async driver — a thin I/O adapter over the engine. |
-| `bsql-postgres-sync` | [`crates/postgres/sync/`](crates/postgres/sync/) | `std::net` blocking driver — a thin I/O adapter over the engine. |
+| `bsql-postgres-core` | [`crates/postgres/core/`](crates/postgres/core/) | Shared across both drivers: the transport-generic driver engine `Core<S>` (verbs defined once), the result materializer, dynamic `Row` / `QueryResult` types, `ConnectConfig`, TLS config, `Rows` / `RowsBuilder`, and the `SafeIdent` guard. |
+| `bsql-postgres-async` | [`crates/postgres/async/`](crates/postgres/async/) | tokio async driver — plugs a `TokioSocket` into the shared `Core<S>`. |
+| `bsql-postgres-sync` | [`crates/postgres/sync/`](crates/postgres/sync/) | `std::net` blocking driver — plugs a `SyncSocket` into the shared `Core<S>`. |
 | `bsql-sqlite` | [`crates/sqlite/driver/`](crates/sqlite/driver/) | Embedded SQLite driver over bundled `rusqlite`. |
 | `bsql-testkit` | [`crates/testkit/`](crates/testkit/) | Deterministic in-memory fake PostgreSQL. Tests real driver code (`query_sql` and the compile-checked `query!` path) against scripted replies over both drivers — no network, no server. Enables the drivers' + core's off-by-default `testkit` feature (the `Wire::Fake` transport arm). |
 | `bsql-build` | [`crates/build/`](crates/build/) | **Build-time only.** Replays migration DDL into the schema catalog (and, under its `sqlite` feature, a SQLite conformance template). A `[build-dependencies]` helper — never a runtime dependency. |
@@ -154,18 +190,21 @@ Neither (nor `sqlparser`, which `bsql-build` reaches) enters any shipped
 crate's runtime graph — the `runtime_graph_pin` gate proves this.
 
 Dev-only tools (`publish = false`, not shipped): `bsql-devgates`
-(the local gates + counting allocator, the workspace's only `unsafe`),
-`bsql-query-fixture` and `bsql-query-sqlite-fixture` (real consumers that
-exercise the migrations → catalog → `query!` chain end-to-end),
-`bsql-query-bridge-fixture` (a real consumer proving the external-type
-bridge — `query!` decoding a column into a consumer-chosen type), and
-`bsql-corpus` (a replay corpus pinning engine behaviour against goldens).
+(the local gates + counting allocator), `bsql-query-fixture` and
+`bsql-query-sqlite-fixture` (real consumers that exercise the
+migrations → catalog → `query!` chain end-to-end), `bsql-query-bridge-fixture`
+(a real consumer proving the external-type bridge — `query!` decoding a column
+into a consumer-chosen type), `bsql-test-harness-fixture` (the live
+`#[bsql::test]` schema-isolation witness over both drivers), and `bsql-corpus`
+(a replay corpus pinning engine behaviour against goldens).
 
 ## Safety floor
 
 - `#![forbid(unsafe_code)]` at the root of every shipped crate — all
-  production code is unsafe-free and un-bypassable. The only `unsafe` in
-  the workspace lives in the never-published `bsql-devgates`.
+  production code is unsafe-free and un-bypassable. The only `unsafe` lives
+  in never-published (`publish = false`) places: the `bsql-devgates` building
+  blocks and one justified `std::env::set_var` in each of two consumer-fixture
+  trybuild tests — none ships.
 - A two-tier lint wall inherited by every shipped crate (root
   `Cargo.toml` `[workspace.lints]`): a `forbid` floor plus a `deny` band
   that bans `panic!` / `unwrap` / `expect` and a silent-fallback ledger in
@@ -176,6 +215,10 @@ bridge — `query!` decoding a column into a consumer-chosen type), and
   is a compile error.
 - Transactions are closure-scoped — no forgotten commits.
 - Passwords are zeroized on drop and redacted in `Debug`.
+- SQL identifiers spliced into DDL / COPY (table + schema names) pass through
+  `SafeIdent` / `SafeTable` — a private-field newtype with a validate-only
+  constructor, so an un-validated identifier cannot be spliced. Identifier
+  injection-safety is structural, not a runtime escape pass.
 
 ## Verification
 
@@ -225,15 +268,16 @@ The numbers therefore cannot silently rot.
     | xargs -0 grep -hE '^[[:space:]]*#\[ignore' | wc -l
   ```
 - **Source LoC** (per shipped crate `src/`; the largest, `bsql-build`, is
-  dominated by an inline `#[cfg(test)]` inference test module):
+  dominated by `src/infer.rs` — 29563 lines, the schema/type-inference engine
+  plus a ~13K-line inline `#[cfg(test)]` test module):
   ```bash
   for d in crates/bsql crates/postgres/{proto,core,async,sync} \
            crates/sqlite/driver crates/testkit crates/build crates/query-macros; do
     printf '%-28s %s\n' "$d" \
       "$(find "$d/src" -name '*.rs' -exec cat {} + | wc -l)"
   done
-  # bsql 217 · proto 25765 · core 5817 · async 2095 · sync 1910
-  # sqlite/driver 1010 · testkit 560 · build 34591 · query-macros 1697
+  # bsql 914 · proto 27886 · core 9236 · async 1743 · sync 1575
+  # sqlite/driver 995 · testkit 1005 · build 34719 · query-macros 1929
   ```
 
 ## Sources of truth
