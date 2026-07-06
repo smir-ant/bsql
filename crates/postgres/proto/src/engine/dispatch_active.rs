@@ -257,32 +257,6 @@ enum ActiveState {
     Failed,
 }
 
-/// The drain sub-state for a fused simple-query PRELUDE — a pipelined `BEGIN`
-/// (fused with a transaction's first statement) or a pool-checkout session
-/// RESET — whose response is drained BEFORE the seated command's response, so a
-/// single flush carries the prelude AND the command and the prelude's standalone
-/// round trip is removed.
-///
-/// While a prelude is in flight ([`ActiveEngine::prelude`] is `Some`) the drive
-/// loop routes frames through [`ActiveEngine::step_prelude`] — a self-contained
-/// simple-query drain that SWALLOWS the prelude's own rows/completions and never
-/// touches the command's already-seated result columns — instead of the seated
-/// [`ActiveState`]; the seated state takes over the moment the prelude's trailing
-/// `ReadyForQuery` clears it. Two variants: they mirror just the frames a
-/// `BEGIN` / `COMMIT` / `ROLLBACK` / `RESET` simple query can produce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreludePhase {
-    /// Awaiting the prelude's next statement boundary: a `CommandComplete`
-    /// (swallowed — another statement or the trailing RFQ follows), a
-    /// `RowDescription` (a RESET `SELECT` — advance to the swallowed row phase),
-    /// an `EmptyQueryResponse` (swallowed), or the trailing `ReadyForQuery`
-    /// (prelude done).
-    Awaiting,
-    /// The prelude opened a row stream (a RESET `SELECT pg_advisory_unlock_all()`);
-    /// swallowing `DataRow`s until the statement's `CommandComplete`.
-    StreamingRows,
-}
-
 /// Borrow source for a payload-lending [`ActiveOutcome`].
 #[derive(Debug, Clone, Copy)]
 enum Lend {
@@ -424,13 +398,18 @@ pub struct ActiveEngine {
     /// `next_event`/`drive`), so its footprint cost is an offset shift with no
     /// hot-loop codegen effect.
     pending_prelude: Option<&'static str>,
-    /// The drain sub-state while a fused prelude's response is being consumed
-    /// AHEAD of the seated command's response. `None` in steady state — the drive
-    /// loop then dispatches on [`state`](Self::state) directly, byte-identically to
-    /// before this field existed. See [`PreludePhase`]; read only on the SEPARATE
+    /// Whether a fused prelude's response is still being drained AHEAD of the
+    /// seated command's response. `false` in steady state — the drive loop then
+    /// dispatches on [`state`](Self::state) directly, byte-identically to before
+    /// this field existed.
+    ///
+    /// The ONLY deferred prelude is a transaction `BEGIN` (see
+    /// [`set_pending_prelude`](Self::set_pending_prelude)), whose reply is exactly
+    /// `CommandComplete` + `ReadyForQuery`, so a single drain shape suffices — no
+    /// per-phase state machine. Read only on the SEPARATE
     /// [`next_prelude_event`](Self::next_prelude_event) drain path, so `next_event`
     /// is untouched.
-    prelude: Option<PreludePhase>,
+    prelude_active: bool,
 }
 
 // Stack footprint of the active handle: the carried-forward `IngestBuf` (144)
@@ -439,7 +418,7 @@ pub struct ActiveEngine {
 // statement-name cache), the `command_tag`, the captured `server_version`
 // (`Option<String>`, 24 B — the version text itself is off-stack behind the
 // `String`), and the fused-prelude pair (`Option<&'static str>` + a 1-byte
-// `Option<PreludePhase>`). The result-schema, oversize, and cached-name bytes
+// `bool`). The result-schema, oversize, and cached-name bytes
 // live off-stack behind those handles. A field addition lands here as a reviewed
 // footprint drift.
 crate::wire_pin!(ActiveEngine, size = 368, align = 8);
@@ -470,7 +449,7 @@ impl ActiveEngine {
             server_version,
             parsed_statements: Vec::new(),
             pending_prelude: None,
-            prelude: None,
+            prelude_active: false,
         }
     }
 
@@ -655,7 +634,7 @@ impl ActiveEngine {
     /// prelude's frame ahead of its own command frames.
     #[inline]
     pub fn arm_prelude(&mut self) {
-        self.prelude = Some(PreludePhase::Awaiting);
+        self.prelude_active = true;
     }
 
     /// Whether a fused prelude is still being drained (its trailing
@@ -664,7 +643,7 @@ impl ActiveEngine {
     #[inline]
     #[must_use]
     pub fn draining_prelude(&self) -> bool {
-        self.prelude.is_some()
+        self.prelude_active
     }
 
     // ── Extended-query-protocol state-entry seam ──────────────────────────
@@ -1669,40 +1648,29 @@ impl ActiveEngine {
         }
     }
 
-    /// Per-frame prelude transition. SWALLOWS the prelude's own rows/completions
-    /// (returning [`Silent`](ActiveOutcome::Silent)); the trailing `ReadyForQuery`
-    /// ends the drain via [`finish_prelude`](Self::finish_prelude). A
-    /// `BEGIN`/`COMMIT`/`RESET` simple query cannot error at a clean boundary, so a
-    /// `T_ERROR` (or any other unexpected frame) is a fatal teardown, never a
-    /// silently-recovered state — the connection is then killed rather than left
-    /// with an undrained command reply.
+    /// Per-frame prelude transition. The ONLY deferred prelude is a transaction
+    /// `BEGIN`, whose reply is exactly `CommandComplete` + `ReadyForQuery`: swallow
+    /// the `CommandComplete` (returning [`Silent`](ActiveOutcome::Silent)) and end
+    /// the drain on the trailing `ReadyForQuery` via
+    /// [`finish_prelude`](Self::finish_prelude). `BEGIN` at a clean boundary cannot
+    /// error and returns NO rows, so EVERY other frame — an `ErrorResponse`, a
+    /// `RowDescription`/`DataRow` (a row-returning reply `BEGIN` never sends), or
+    /// any other tag — is a protocol-violating server and a fatal teardown, never a
+    /// silently-recovered state (the connection is killed rather than left with an
+    /// undrained command reply). An `EmptyQueryResponse` is likewise illegal for a
+    /// non-empty `BEGIN`.
+    ///
+    /// Deliberately NARROW: it is the BEGIN shape only. Draining a row-bearing
+    /// prelude (a pool-checkout `RESET`, whose `SELECT pg_advisory_unlock_all()`
+    /// returns a row) is a DEFERRED capability — if it is ever built, it re-adds a
+    /// swallowed-row phase here WITH its own tests, rather than carrying an
+    /// unreachable, untested path now.
     fn step_prelude(&mut self, tag: u8, start: usize, end: usize) -> ActiveOutcome {
-        match self.prelude {
-            Some(PreludePhase::Awaiting) => match tag {
-                // A statement completed / was empty — swallow; another statement or
-                // the trailing RFQ follows.
-                T_COMMAND_COMPLETE | T_EMPTY_QUERY => ActiveOutcome::Silent,
-                // A RESET `SELECT` opened a row stream — advance to the swallowed
-                // row phase (deliberately NOT parsed into `col_oids`: the command's
-                // seated columns must survive the prelude drain).
-                T_ROW_DESC => {
-                    self.prelude = Some(PreludePhase::StreamingRows);
-                    ActiveOutcome::Silent
-                }
-                T_READY_FOR_QUERY => self.finish_prelude(start, end),
-                _ => self.prelude_teardown(),
-            },
-            Some(PreludePhase::StreamingRows) => match tag {
-                T_DATA_ROW => ActiveOutcome::Silent,
-                T_COMMAND_COMPLETE => {
-                    self.prelude = Some(PreludePhase::Awaiting);
-                    ActiveOutcome::Silent
-                }
-                _ => self.prelude_teardown(),
-            },
-            // Unreachable: `drive_prelude` routes here only while `prelude` is
-            // `Some`. Classified (no wildcard) rather than a panic.
-            None => self.prelude_teardown(),
+        match tag {
+            // `BEGIN`'s `CommandComplete` — swallow; its `ReadyForQuery` follows.
+            T_COMMAND_COMPLETE => ActiveOutcome::Silent,
+            T_READY_FOR_QUERY => self.finish_prelude(start, end),
+            _ => self.prelude_teardown(),
         }
     }
 
@@ -1721,7 +1689,7 @@ impl ActiveEngine {
             [byte] => match TxStatus::try_from_byte(*byte) {
                 Ok(tx) => {
                     self.tx_status = tx;
-                    self.prelude = None;
+                    self.prelude_active = false;
                     ActiveOutcome::Idle
                 }
                 Err(_) => self.prelude_teardown(),
@@ -1734,7 +1702,7 @@ impl ActiveEngine {
     /// `Failed` so the connection is killed (the pump maps the surfaced `Close` to
     /// [`EngineError::ProtocolViolation`](super::EngineError::ProtocolViolation)).
     fn prelude_teardown(&mut self) -> ActiveOutcome {
-        self.prelude = None;
+        self.prelude_active = false;
         self.state = ActiveState::Failed;
         ActiveOutcome::Close
     }
