@@ -259,12 +259,12 @@ The numbers therefore cannot silently rot.
 
 - **Test functions: 1902** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
-  find . -path ./target -prune -o -name '*.rs' -print0 \
+  find . -path ./target -prune -o -path ./.claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
   ```
 - **`#[ignore]` live suites (need a running database): 198**:
   ```bash
-  find . -path ./target -prune -o -name '*.rs' -print0 \
+  find . -path ./target -prune -o -path ./.claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[ignore' | wc -l
   ```
 - **Source LoC** (per shipped crate `src/`; the largest, `bsql-build`, is
