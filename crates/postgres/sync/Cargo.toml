@@ -86,3 +86,14 @@ workspace = true
 # tls/scram), and being dev-only keeps the macro out of a downstream consumer's
 # core.
 bsql-postgres-core = { path = "../core", default-features = false, features = ["test-scenarios"] }
+
+# `trybuild` — golden compile-fail harness PINNING the transaction-guard tier-1
+# guarantee: it PROVES `tx.begin/commit/rollback/transaction/close/reset_session`
+# on the borrowing `Transaction` guard are each E0599 (a future refactor that
+# re-added a lifecycle verb, or reverted the closure arg to `&mut Connection`,
+# would silently downgrade tier-1 → tier-4 with every other test still green).
+# Already a resolved workspace dependency (used by core's / proto's compile-fail
+# goldens), so this dev edge adds NO package to the lockfile (`deps_pin`
+# unchanged) and is excluded from every shipped crate's runtime graph
+# (`runtime_graph_pin` unchanged — dev edges are not `-e normal`).
+trybuild = { workspace = true }

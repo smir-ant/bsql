@@ -90,6 +90,7 @@ dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
  "tokio",
+ "trybuild",
 ]
 
 [[package]]
@@ -129,6 +130,7 @@ version = "0.1.0-alpha.0"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
+ "trybuild",
 ]
 
 [[package]]

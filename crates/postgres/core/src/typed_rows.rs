@@ -89,6 +89,15 @@ const _: () = assert!(
 /// the `Q` is stamped on only at [`finish`](Self::finish), because decoding is
 /// deferred. [`feed`](Self::feed) is infallible (the engine sink cannot report a
 /// `Result`); any anomaly is parked and surfaced after the verb settles.
+///
+/// `#[doc(hidden)]`: an INTERNAL decode/collect seam, not a consumer API — the
+/// drivers build it inside `Core`'s typed verbs and hand back a finished
+/// [`Rows<Q>`], so a consumer never names it on the happy path. It stays `pub`
+/// (reachable, not `pub(crate)`) ONLY so the query fixture's offline decode +
+/// allocation tests can feed it synthetic `DataRow` bytes through the single
+/// `bsql` dependency; it is kept OUT of the rendered public docs so it does not
+/// masquerade as part of the consumer surface.
+#[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct RowsBuilder {
     wire: Vec<u8>,

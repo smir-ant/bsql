@@ -465,12 +465,13 @@ impl Connection {
         self.core.query_one_sql(sql)
     }
 
-    /// Run a runtime-SQL query returning the first row if any.
-    pub fn query_opt<'a>(
+    /// Run a runtime-SQL query returning the first row if any. The compile-checked
+    /// typed counterpart is [`query_opt`](Self::query_opt).
+    pub fn query_opt_sql<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
-        self.core.query_opt(sql)
+        self.core.query_opt_sql(sql)
     }
 
     /// Prepare a statement: `Parse` + `Describe` + `Sync`, recovering the result
@@ -625,6 +626,27 @@ impl Connection {
         )
     }
 
+    /// Run a compile-checked `query!` expecting AT MOST one row, returning the
+    /// owned record if present or `None` if absent — the by-key maybe-absent shape.
+    /// Zero rows is `Ok(None)`; more than one is [`DriverError::TooManyRows`]
+    /// (loud, never a silently-taken first row). The zero-or-one peer of
+    /// [`query_one`](Self::query_one); the runtime-SQL escape hatch is
+    /// [`query_opt_sql`](Self::query_opt_sql).
+    #[cfg_attr(feature = "n1-detect", track_caller)]
+    pub fn query_opt<'a, Q: TypedQuery + 'a>(
+        &'a mut self,
+        params: Q::Params,
+    ) -> impl core::future::Future<Output = Result<Option<Q::Owned>, DriverError>> + 'a
+    where
+        Q::Params: 'a,
+    {
+        self.core.query_opt::<Q>(
+            params,
+            #[cfg(feature = "n1-detect")]
+            core::panic::Location::caller(),
+        )
+    }
+
     /// Stream a compile-checked `query!`'s rows one at a time to `on_row` in
     /// CONSTANT memory — the streaming peer of [`query`](Self::query).
     ///
@@ -696,12 +718,21 @@ impl Connection {
     /// Run `f` inside a transaction: `COMMIT` on `Ok`, best-effort `ROLLBACK` on
     /// `Err`, KEEPING the connection on a recoverable error.
     ///
-    /// `f` is an async closure borrowing `&mut Self`, so the body can run any
-    /// sequence of the connection's async verbs and the transaction holds no
-    /// object to leak — the boundary is the call scope. There is no `Drop`-based
-    /// async guard (`Drop` cannot `.await`): the async closure form is the
-    /// cancellation-correct shape — if the returned future is dropped mid-body, no
-    /// `COMMIT` runs and the server rolls back when the socket later closes.
+    /// `f` is an async closure handed a borrowing [`Transaction`] guard — NOT the
+    /// whole `Connection`. The guard exposes ONLY the data verbs (query / execute /
+    /// the typed `query!` verbs), so `tx.begin()` / `tx.commit()` / `tx.rollback()`
+    /// / a nested `tx.transaction(..)` / `tx.close()` inside the body do not exist
+    /// (a method-not-found compile error, E0599). This makes transaction atomicity
+    /// a COMPILE-TIME guarantee: the classic footgun where a body hand-drives the
+    /// transaction lifecycle — or a composed helper opens its own inner
+    /// `transaction` (PostgreSQL has no nested transactions, so the inner `COMMIT`
+    /// would silently flatten the outer's atomic scope) — is now impossible by
+    /// construction, the same tier as [`copy_in_with`](Self::copy_in_with)'s
+    /// exclusive-borrow writer. The guard holds no object to leak — its boundary is
+    /// the call scope. There is no `Drop`-based async guard (`Drop` cannot
+    /// `.await`): the async closure form is the cancellation-correct shape — if the
+    /// returned future is dropped mid-body, no `COMMIT` runs and the server rolls
+    /// back when the socket later closes.
     ///
     /// The `BEGIN` is DEFERRED and PIPELINED with the first statement the body
     /// issues: it rides that statement's flush (one round trip carries both), so a
@@ -712,13 +743,20 @@ impl Connection {
     /// transaction's failure (it cannot be swallowed by the first statement).
     pub async fn transaction<R, F>(&mut self, f: F) -> Result<R, DriverError>
     where
-        F: AsyncFnOnce(&mut Self) -> Result<R, DriverError>,
+        F: AsyncFnOnce(&mut Transaction<'_>) -> Result<R, DriverError>,
     {
         // Defer BEGIN: it fuses into the first statement's flush (or the terminating
         // COMMIT/ROLLBACK for an empty body), so it is always consumed before this
         // method returns — never left pending on the connection.
         self.core.defer_begin();
-        let result = match f(self).await {
+        // The guard borrows `self.core` for the body's scope ONLY; it is dropped at
+        // the end of this block, releasing the borrow so the terminating
+        // COMMIT/ROLLBACK below can re-borrow `self.core`.
+        let outcome = {
+            let mut tx = Transaction { core: &mut self.core };
+            f(&mut tx).await
+        };
+        let result = match outcome {
             Ok(value) => {
                 self.core.simple_query("COMMIT").await?;
                 Ok(value)
@@ -1047,5 +1085,351 @@ impl Connection {
     /// Gracefully close the connection (`Terminate` + shutdown). Idempotent.
     pub fn close(&mut self) -> impl Future<Output = Result<(), DriverError>> + '_ {
         self.core.close()
+    }
+}
+
+/// A borrowing transaction guard, handed to the closure of
+/// [`transaction`](Connection::transaction).
+///
+/// The guard forbids EXACTLY the six transaction / connection LIFECYCLE verbs —
+/// `begin`, `commit`, `rollback`, a nested `transaction`, `close`,
+/// `reset_session` — so hand-driving the transaction boundary from inside the
+/// body (or nesting a helper that opens its own transaction, which PostgreSQL
+/// flattens with no diagnostic) is a compile error (E0599), not a silent runtime
+/// atomicity break. That is the WHOLE point: the atomicity invariant is enforced
+/// by the type, and the `transaction` wrapper alone owns the terminating `COMMIT`
+/// / `ROLLBACK`.
+///
+/// EVERY other verb the body legitimately uses remains available: the runtime-SQL
+/// family (`query_sql` / `execute_sql` / `query_params*` / prepared statements),
+/// the compile-checked typed `query!` family (`query` / `query_one` /
+/// `query_opt` / `query_each` / `execute`), bulk [`COPY`](Self::copy_in_with) in
+/// and out, and `LISTEN` / `UNLISTEN`. COPY in particular is legal (and atomic)
+/// inside a transaction — it completes its own COPY sub-protocol before returning
+/// and never touches the transaction boundary, so atomic bulk-load-with-rollback
+/// works exactly as it did when the closure received the whole `Connection`. The
+/// sole non-lifecycle verb NOT offered is [`recv_notification`](Connection::recv_notification):
+/// it needs the driver's connection-level read-deadline state the guard does not
+/// hold, and a backend cannot receive notifications mid-transaction anyway.
+///
+/// Borrows the connection's [`Core`] for the closure scope, so it holds no
+/// object past the call and adds no `Drop` terminator: cancellation correctness
+/// is exactly as [`transaction`](Connection::transaction) documents. Every verb
+/// forwards DIRECTLY to the same shared `Core` verb the [`Connection`] method
+/// calls — the guard adds no state-machine layer, and under `n1-detect` it
+/// records the USER's call site (not a guard-internal line) via `#[track_caller]`.
+///
+/// No `Debug`: it borrows the connection's engine (a live socket / TLS session),
+/// which is not `Debug` — the same reason [`CopyInWriter`] carries none.
+pub struct Transaction<'t> {
+    core: &'t mut Core<TokioSocket>,
+}
+
+impl Transaction<'_> {
+    // ── Delegated runtime-SQL verbs (data only) ─────────────────────────────
+    //
+    // Each RETURNS the shared `Core` verb's future directly (a `fn -> impl Future`
+    // forwarder), identical to the `Connection` methods — no extra state layer.
+
+    /// Round-trip a `Sync` to confirm the connection is live.
+    pub fn ping(&mut self) -> impl Future<Output = Result<(), DriverError>> + '_ {
+        self.core.ping()
+    }
+
+    /// Issue a simple query, returning the command tag string.
+    pub fn simple_query<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl Future<Output = Result<String, DriverError>> + 'a {
+        self.core.simple_query(sql)
+    }
+
+    /// Execute a non-row runtime-SQL command, returning the affected-row count.
+    pub fn execute_sql<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
+        self.core.execute_sql(sql)
+    }
+
+    /// Run a row-returning runtime-SQL query (text result columns).
+    pub fn query_sql<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
+        self.core.query_sql(sql)
+    }
+
+    /// Run a runtime-SQL query returning the first row, or [`DriverError::NoRows`].
+    pub fn query_one_sql<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl Future<Output = Result<Row, DriverError>> + 'a {
+        self.core.query_one_sql(sql)
+    }
+
+    /// Run a runtime-SQL query returning the first row if any (typed peer:
+    /// [`query_opt`](Self::query_opt)).
+    pub fn query_opt_sql<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
+        self.core.query_opt_sql(sql)
+    }
+
+    /// Prepare a statement: `Parse` + `Describe` + `Sync`.
+    pub fn prepare<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl Future<Output = Result<PreparedStatement, DriverError>> + 'a {
+        self.core.prepare(sql)
+    }
+
+    /// Execute a prepared statement returning rows.
+    pub fn query_prepared<'a, P: ParamsWriter>(
+        &'a mut self,
+        stmt: &'a PreparedStatement,
+        params: &'a P,
+    ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
+        self.core.query_prepared(stmt, params)
+    }
+
+    /// Execute a prepared statement for its side effect, returning the affected
+    /// count.
+    pub fn execute_prepared<'a, P: ParamsWriter>(
+        &'a mut self,
+        stmt: &'a PreparedStatement,
+        params: &'a P,
+    ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
+        self.core.execute_prepared(stmt, params)
+    }
+
+    /// Prepare, query, and close a runtime SQL statement with params.
+    pub fn query_params<'a, P: ParamsWriter>(
+        &'a mut self,
+        sql: &'a str,
+        params: &'a P,
+    ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
+        self.core.query_params(sql, params)
+    }
+
+    /// Like [`query_params`](Self::query_params), returning the first row.
+    pub fn query_params_one<'a, P: ParamsWriter>(
+        &'a mut self,
+        sql: &'a str,
+        params: &'a P,
+    ) -> impl Future<Output = Result<Row, DriverError>> + 'a {
+        self.core.query_params_one(sql, params)
+    }
+
+    /// Like [`query_params`](Self::query_params), returning the first row if any.
+    pub fn query_params_opt<'a, P: ParamsWriter>(
+        &'a mut self,
+        sql: &'a str,
+        params: &'a P,
+    ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
+        self.core.query_params_opt(sql, params)
+    }
+
+    /// Prepare, execute, and close a runtime SQL statement with params.
+    pub fn execute_params<'a, P: ParamsWriter>(
+        &'a mut self,
+        sql: &'a str,
+        params: &'a P,
+    ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
+        self.core.execute_params(sql, params)
+    }
+
+    /// Close a prepared statement, consuming it (use-after-close is a move error).
+    pub fn close_statement(
+        &mut self,
+        stmt: PreparedStatement,
+    ) -> impl Future<Output = Result<(), DriverError>> + '_ {
+        self.core.close_statement(stmt)
+    }
+
+    // ── Compile-checked typed verbs (the `query!` flagship) ─────────────────
+    //
+    // Same `fn -> impl Future` + `#[track_caller]` shape as the `Connection`
+    // methods, so under `n1-detect` the USER's call site is captured (not the
+    // guard's forwarder line) and threaded to the shared `Core` verb.
+
+    /// Execute a compile-checked `query!` for its side effect, returning the
+    /// affected-row count (binary-uniform params).
+    #[cfg_attr(feature = "n1-detect", track_caller)]
+    pub fn execute<'a, P, R>(
+        &'a mut self,
+        q: &'static PreparedQuery<P, R>,
+        params: P,
+    ) -> impl Future<Output = Result<u64, DriverError>> + 'a
+    where
+        P: ParamsWriter + 'static,
+        R: RowDecode + 'static,
+    {
+        self.core.execute(
+            q,
+            params,
+            #[cfg(feature = "n1-detect")]
+            core::panic::Location::caller(),
+        )
+    }
+
+    /// Run a compile-checked `query!` and collect its TYPED rows — the flagship
+    /// parameterised query.
+    #[cfg_attr(feature = "n1-detect", track_caller)]
+    pub fn query<'a, Q: TypedQuery + 'a>(
+        &'a mut self,
+        params: Q::Params,
+    ) -> impl Future<Output = Result<Rows<Q>, DriverError>> + 'a
+    where
+        Q::Params: 'a,
+    {
+        self.core.query::<Q>(
+            params,
+            #[cfg(feature = "n1-detect")]
+            core::panic::Location::caller(),
+        )
+    }
+
+    /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
+    /// owned record. Zero rows is [`DriverError::NoRows`]; more than one is
+    /// [`DriverError::TooManyRows`].
+    #[cfg_attr(feature = "n1-detect", track_caller)]
+    pub fn query_one<'a, Q: TypedQuery + 'a>(
+        &'a mut self,
+        params: Q::Params,
+    ) -> impl Future<Output = Result<Q::Owned, DriverError>> + 'a
+    where
+        Q::Params: 'a,
+    {
+        self.core.query_one::<Q>(
+            params,
+            #[cfg(feature = "n1-detect")]
+            core::panic::Location::caller(),
+        )
+    }
+
+    /// Run a compile-checked `query!` expecting AT MOST one row, returning the
+    /// owned record if present or `None` if absent. Zero rows is `Ok(None)`; more
+    /// than one is [`DriverError::TooManyRows`]. The zero-or-one peer of
+    /// [`query_one`](Self::query_one).
+    #[cfg_attr(feature = "n1-detect", track_caller)]
+    pub fn query_opt<'a, Q: TypedQuery + 'a>(
+        &'a mut self,
+        params: Q::Params,
+    ) -> impl Future<Output = Result<Option<Q::Owned>, DriverError>> + 'a
+    where
+        Q::Params: 'a,
+    {
+        self.core.query_opt::<Q>(
+            params,
+            #[cfg(feature = "n1-detect")]
+            core::panic::Location::caller(),
+        )
+    }
+
+    /// Stream a compile-checked `query!`'s rows one at a time to `on_row` in
+    /// CONSTANT memory — the streaming peer of [`query`](Self::query). See
+    /// [`Connection::query_each`] for the full contract.
+    #[cfg_attr(feature = "n1-detect", track_caller)]
+    pub fn query_each<'a, Q, F, E>(
+        &'a mut self,
+        params: Q::Params,
+        on_row: F,
+    ) -> impl Future<Output = Result<Option<E>, DriverError>> + 'a
+    where
+        Q: TypedQuery + 'a,
+        Q::Params: 'a,
+        E: 'a,
+        F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E> + 'a,
+    {
+        self.core.query_each::<Q, F, E>(
+            params,
+            on_row,
+            #[cfg(feature = "n1-detect")]
+            core::panic::Location::caller(),
+        )
+    }
+
+    // ── COPY (bulk load / unload — legal + atomic inside a transaction) ─────
+    //
+    // COPY completes its own COPY sub-protocol before returning and touches NO
+    // transaction boundary, so `COPY … FROM STDIN` inside a `transaction` body is
+    // an atomic bulk load that commits/rolls back with the surrounding scope. The
+    // deferred BEGIN even fuses into a COPY that is the transaction's first
+    // statement (`Core::copy_in_begin`). These mirror the `Connection` methods.
+
+    /// `COPY <table> FROM STDIN`, bulk-loading `rows_data` in CONSTANT memory —
+    /// the ergonomic batch form of [`copy_in_with`](Self::copy_in_with).
+    pub async fn copy_in(
+        &mut self,
+        table: &str,
+        rows_data: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<u64, DriverError> {
+        self.copy_in_with(table, async |w| {
+            for row in rows_data {
+                w.write_row(row.as_ref().as_bytes()).await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// `COPY <table> FROM STDIN` with a scoped streaming writer — the
+    /// CONSTANT-MEMORY, cancellation-safe bulk-load primitive. See
+    /// [`Connection::copy_in_with`] for the full cancellation / recovery contract;
+    /// the orchestration here is identical (the guard just borrows the same
+    /// [`Core`] the `Connection` method does).
+    pub async fn copy_in_with<F>(&mut self, table: &str, f: F) -> Result<u64, DriverError>
+    where
+        F: AsyncFnOnce(&mut CopyInWriter<'_>) -> Result<(), DriverError>,
+    {
+        let live = self.core.copy_in_begin_table(table).await?;
+        let body = {
+            let mut writer = CopyInWriter {
+                core: &mut *self.core,
+                scratch: Vec::new(),
+            };
+            f(&mut writer).await
+        };
+        match body {
+            Ok(()) => self.core.copy_in_finish(live).await,
+            Err(e) => {
+                self.core.copy_in_abort(live).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// `COPY <table> TO STDOUT`, streaming each row to `on_chunk` in CONSTANT
+    /// memory. See [`Connection::copy_out`] for the full contract.
+    pub fn copy_out<'a, F, E>(
+        &'a mut self,
+        table: &'a str,
+        on_chunk: F,
+    ) -> impl Future<Output = Result<Option<E>, DriverError>> + 'a
+    where
+        F: for<'q> FnMut(&'q [u8]) -> ControlFlow<E> + 'a,
+        E: 'a,
+    {
+        self.core.copy_out(table, on_chunk)
+    }
+
+    // ── Session subscription (LISTEN/UNLISTEN — atomicity-neutral) ──────────
+
+    /// Subscribe to a `LISTEN` channel (validated; see [`Connection::listen`]).
+    pub fn listen<'a>(
+        &'a mut self,
+        channel: &'a str,
+    ) -> impl Future<Output = Result<(), DriverError>> + 'a {
+        self.core.listen(channel)
+    }
+
+    /// Unsubscribe from a `LISTEN` channel (see [`Connection::unlisten`]).
+    pub fn unlisten<'a>(
+        &'a mut self,
+        channel: &'a str,
+    ) -> impl Future<Output = Result<(), DriverError>> + 'a {
+        self.core.unlisten(channel)
     }
 }

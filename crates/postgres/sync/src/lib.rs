@@ -35,7 +35,7 @@ pub use bsql_postgres_core::{
     SafeIdent, SafeTable, SslMode, TypedNotification,
 };
 
-pub use connection::{Connection, CopyInWriter, PreparedStatement};
+pub use connection::{Connection, CopyInWriter, PreparedStatement, Transaction};
 pub use pool::{Pool, PooledConnection};
 
 const _: () = {

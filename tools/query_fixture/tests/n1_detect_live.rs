@@ -127,3 +127,52 @@ async fn query_one_loop_is_flagged_once(conn: &mut Connection) {
     assert_eq!(report[0].line, call_line, "attributed to the user's call site");
     assert_eq!(report[0].count, u32::try_from(LOOP).unwrap());
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// 5. The detector works THROUGH the transaction guard: an N+1 loop run on
+//    the borrowing `Transaction` guard inside a `transaction` body is flagged
+//    and attributed to the CONSUMER's call line (via `#[track_caller]` on the
+//    guard forwarder), NOT a driver-internal line. The report survives the
+//    tx-boundary window reset (`reset()` clears the recency window but keeps the
+//    accumulated reports), so it is still visible after the transaction commits.
+// ─────────────────────────────────────────────────────────────────────
+#[bsql::test]
+#[ignore = "live: needs PostgreSQL at BSQL_TEST_DSN"]
+async fn n_plus_one_through_the_transaction_guard_is_flagged_at_the_consumer_line(
+    conn: &mut Connection,
+) {
+    let mut call_line = 0u32;
+    // The N+1 loop runs INSIDE a transaction, driving the guard `tx` (not `conn`).
+    conn.transaction(async |tx| {
+        for i in 0..LOOP {
+            call_line = line!() + 1;
+            let rows = tx.query::<EchoQuery>((i,)).await?;
+            // DIAGNOSTICS-ONLY through the guard too: each query is unaltered.
+            let owned = rows.into_owned()?;
+            assert_eq!(owned.len(), 1, "iteration {i}: one row");
+            assert_eq!(owned[0].n, i, "iteration {i}: echoed value unchanged");
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let report = conn.n1_report();
+    assert_eq!(
+        report.len(),
+        1,
+        "the guard-path N+1 site is flagged exactly once, got {report:?}"
+    );
+    let r = &report[0];
+    assert_eq!(r.sql, ECHO_SQL, "the flagged query's SQL");
+    assert!(
+        r.file.ends_with("n1_detect_live.rs"),
+        "flagged in this source file, got {:?}",
+        r.file
+    );
+    assert_eq!(
+        r.line, call_line,
+        "attributed to the guard-body call line, not a driver-internal line"
+    );
+    assert_eq!(r.count, u32::try_from(LOOP).unwrap(), "count reflects every guard execution");
+}

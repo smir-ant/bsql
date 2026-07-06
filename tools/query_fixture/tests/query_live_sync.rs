@@ -326,6 +326,33 @@ fn query_one_classifies_zero_and_many() {
     c.close().expect("close");
 }
 
+/// `query_opt` is AT-MOST-one: zero rows -> `Ok(None)`, exactly one ->
+/// `Ok(Some(record))`, more than one -> `TooManyRows` (same precedence as
+/// `query_one`, only the zero-row outcome differs).
+#[test]
+#[ignore = "requires local PG"]
+fn query_opt_classifies_zero_one_and_many() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    // Zero rows -> Ok(None) (NOT NoRows — the whole point of the opt shape).
+    let none = c.query_opt::<NoneRowQuery>(()).expect("query_opt runs");
+    assert!(none.is_none(), "zero rows must be Ok(None), got {none:?}");
+
+    // Exactly one row -> Ok(Some(owned record)).
+    let one = c.query_opt::<OneQuery>(()).expect("query_opt runs");
+    assert_eq!(one.expect("one row present").n, 1, "the single row decodes");
+
+    // Two rows -> TooManyRows (loud, same as query_one — never a silent first row).
+    let many = c.query_opt::<ManyQuery>(());
+    assert!(
+        matches!(many, Err(DriverError::TooManyRows)),
+        "two rows must be TooManyRows, got {many:?}"
+    );
+
+    assert!(c.is_healthy(), "connection stays healthy after classified errors");
+    c.close().expect("close");
+}
+
 /// A real parameter round-trips through the `(i32,)` / `(&str,)` binary-bind
 /// path: the value is encoded as a Bind param and echoed back as a typed record.
 #[test]

@@ -197,11 +197,18 @@ pub use bsql_postgres_proto::{
     Timestamp, Timestamptz, Uuid, UuidParseError,
 };
 
-/// Bounded / streaming typed result containers a driver's typed-query
-/// entry points return: [`Rows`] holds one query's decoded rows;
-/// [`RowsBuilder`] is its prebuffer.
+/// The bounded / streaming typed result container a driver's typed-query
+/// entry points return: [`Rows`] holds one query's decoded rows.
 #[cfg(feature = "macros")]
-pub use bsql_postgres_core::{Rows, RowsBuilder};
+pub use bsql_postgres_core::Rows;
+
+// `RowsBuilder` is the INTERNAL prebuffer `Rows` is built from — a decode/collect
+// seam, not a consumer API. Re-exported (doc-hidden, like its definition) ONLY so
+// the query fixture's offline decode + allocation tests can name it through the
+// single `bsql` dependency; a consumer never touches it on the happy path.
+#[cfg(feature = "macros")]
+#[doc(hidden)]
+pub use bsql_postgres_core::RowsBuilder;
 
 /// Runtime support the `query!` expansion names.
 ///

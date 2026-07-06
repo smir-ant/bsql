@@ -184,7 +184,12 @@ impl ConnectConfig {
         // Split userinfo@hostpath
         let (userinfo, hostpath) = match main.split_once('@') {
             Some((u, h)) => (u, h),
-            None => return Err("missing @ in DSN".to_string()),
+            None => {
+                return Err(
+                    "missing '@' in DSN (expected postgres://user[:password]@host[:port][/database])"
+                        .to_string(),
+                );
+            }
         };
 
         // Parse user:password
@@ -247,7 +252,11 @@ impl ConnectConfig {
                             "disable" => SslMode::Disable,
                             "prefer" => SslMode::Prefer,
                             "require" => SslMode::Require,
-                            other => return Err(format!("unknown sslmode: {other}")),
+                            other => {
+                                return Err(format!(
+                                    "unknown sslmode: {other} (valid: disable, prefer, require)"
+                                ));
+                            }
                         });
                     }
                     "connect_timeout" => {

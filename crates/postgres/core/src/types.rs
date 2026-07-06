@@ -528,7 +528,7 @@ impl RowSet {
     /// A 16-byte [`Row`] handle built on demand — O(1), exactly one `Arc`
     /// refcount bump, never a per-row allocation and never dependent on the row
     /// count. This is the single-row read the driver's `query_one_sql` /
-    /// `query_opt` route through, so a one-row fetch clones the `Arc` ONCE.
+    /// `query_opt_sql` route through, so a one-row fetch clones the `Arc` ONCE.
     #[must_use]
     pub fn get(&self, i: usize) -> Option<Row> {
         // A `usize` index past `u32::MAX` cannot address a `u32`-bounded arena,

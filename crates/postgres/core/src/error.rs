@@ -69,7 +69,14 @@ impl DbError {
 /// collapsed NULL, decode-failure, and out-of-range into a single `None` and
 /// silently swallowed the parse error. This type exists so that collapse cannot
 /// happen: every outcome is a distinct, inspectable value.
+///
+/// `#[non_exhaustive]`: a consumer matching a `Row::get` failure must carry a
+/// wildcard arm, so a future column-error class (added as the decode matrix
+/// grows) is an additive, non-breaking change rather than a breaking `match`
+/// churn — matching the forward-compat contract the rest of the tree already
+/// uses (`DecodeError`, `ProtocolError`, `SqliteError`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ColumnError {
     /// The requested column index is `>=` the row's column count.
     ///
@@ -119,7 +126,18 @@ impl std::error::Error for ColumnError {
 }
 
 /// Driver-level error.
+///
+/// `#[non_exhaustive]`: this is the error a consumer actually matches on (it
+/// reaches the consumer through every fallible driver return and the
+/// `bsql::pg::*` glob), and its variant set has GROWN across the project's life
+/// (`PoolTimeout`, `TooManyRows`, `Decode`, `Column`, `PayloadParse`, … were each
+/// added later — each a breaking `match` change under an exhaustive enum). The
+/// wildcard-arm requirement makes every future classification an additive,
+/// non-breaking change, matching the tree's own dominant convention (proto uses
+/// `#[non_exhaustive]` 44×; `SqliteError` carries it). Adding it does NOT change
+/// the layout, so the 24-byte footprint pin below is unaffected.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DriverError {
     /// A structured server error with SQLSTATE. BOXED: `DbError` is by far the
     /// widest payload (~120 B of owned diagnostic strings), so inlining it would
@@ -249,7 +267,10 @@ impl fmt::Display for DriverError {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::NotReady => write!(f, "connection not ready"),
             #[cfg(feature = "tls")]
-            Self::SslRefused => write!(f, "server refused SSL"),
+            Self::SslRefused => write!(
+                f,
+                "server refused SSL while SslMode::Require was set (use SslMode::Prefer to allow a plaintext fallback, or SslMode::Disable to skip SSL)"
+            ),
             Self::NoRows => write!(f, "query returned no rows"),
             Self::Config(msg) => write!(f, "config error: {msg}"),
             Self::RowTooLarge => write!(f, "result row too large to represent (exceeds 32-bit arena bounds)"),

@@ -150,8 +150,10 @@ migrations never created — e.g. `SELECT nope FROM users` — is a
 executing a carrier is a `bsql::Rows<NameQuery>` (2 allocations per result,
 0 per row); the user-facing query types (`bsql::TypedQuery`,
 `bsql::PreparedQuery`, `bsql::QueryFingerprint`, `bsql::DecodeError`,
-`bsql::Rows`, `bsql::RowsBuilder`) are all nameable with no dependency in
-scope but `bsql`.
+`bsql::Rows`) are all nameable with no dependency in scope but `bsql`. (The
+prebuffer `Rows` is built from, `RowsBuilder`, is a `#[doc(hidden)]` internal
+decode seam — reachable for the fixture's offline tests, but not a consumer
+API.)
 
 *(consumer shape verified by reading `crates/bsql/src/lib.rs`,
 `tools/query_fixture/{Cargo.toml,build.rs,src/lib.rs}`, and the `emit` /
@@ -186,7 +188,7 @@ publish flags: `grep -m1 '^name\|^publish' <member>/Cargo.toml`.)*
 |-------|------|------|
 | `bsql` | [`crates/bsql/`](crates/bsql/) | Umbrella facade. Re-exports `bsql::pg` / `bsql::pg_sync` / `bsql::sqlite` per feature; behind `macros`, re-exports `query!` + the typed-query surface. The one crate a consumer needs. |
 | `bsql-postgres-proto` | [`crates/postgres/proto/`](crates/postgres/proto/) | Sans-IO PostgreSQL wire protocol + session engine (`no_std + alloc`). Holds the typed-query decode primitives the `query!` expansion names. |
-| `bsql-postgres-core` | [`crates/postgres/core/`](crates/postgres/core/) | Shared across both drivers: the transport-generic driver engine `Core<S>` (verbs defined once), the result materializer, dynamic `Row` / `QueryResult` types, `ConnectConfig`, TLS config, `Rows` / `RowsBuilder`, and the `SafeIdent` guard. |
+| `bsql-postgres-core` | [`crates/postgres/core/`](crates/postgres/core/) | Shared across both drivers: the transport-generic driver engine `Core<S>` (verbs defined once), the result materializer, dynamic `Row` / `QueryResult` types, `ConnectConfig`, TLS config, the typed `Rows` container (built from an internal `RowsBuilder` prebuffer), and the `SafeIdent` guard. |
 | `bsql-postgres-async` | [`crates/postgres/async/`](crates/postgres/async/) | tokio async driver — plugs a `TokioSocket` into the shared `Core<S>`. |
 | `bsql-postgres-sync` | [`crates/postgres/sync/`](crates/postgres/sync/) | `std::net` blocking driver — plugs a `SyncSocket` into the shared `Core<S>`. |
 | `bsql-sqlite` | [`crates/sqlite/driver/`](crates/sqlite/driver/) | Embedded SQLite driver over bundled `rusqlite`. |
@@ -266,12 +268,12 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 1950** — every `#[test]` / `#[tokio::test]` attribute:
+- **Test functions: 1958** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
   find . -path ./target -prune -o -path ./.claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
   ```
-- **`#[ignore]` live suites (need a running database): 212**:
+- **`#[ignore]` live suites (need a running database): 218**:
   ```bash
   find . -path ./target -prune -o -path ./.claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[ignore' | wc -l

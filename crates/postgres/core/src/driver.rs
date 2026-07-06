@@ -379,7 +379,12 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     }
 
     /// Run a runtime-SQL query returning the first row if any.
-    pub async fn query_opt(&mut self, sql: &str) -> Result<Option<crate::Row>, DriverError> {
+    ///
+    /// The `_sql` suffix marks the runtime (unchecked-string) source, matching its
+    /// [`query_sql`](Self::query_sql) / [`query_one_sql`](Self::query_one_sql)
+    /// siblings; the bare [`query_opt`](Self::query_opt) is the compile-checked
+    /// typed peer.
+    pub async fn query_opt_sql(&mut self, sql: &str) -> Result<Option<crate::Row>, DriverError> {
         Ok(self.query_sql(sql).await?.get(0))
     }
 
@@ -654,6 +659,50 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// [`DriverError::TooManyRows`]. Under `n1-detect` records the USER call site
     /// exactly once.
     ///
+    /// Shares the decode-direct streaming path with [`query_opt`](Self::query_opt)
+    /// (see [`query_at_most_one`](Self::query_at_most_one)); the two differ ONLY in
+    /// the zero-row outcome — `query_one` rejects it as
+    /// [`NoRows`](DriverError::NoRows), `query_opt` returns `Ok(None)`.
+    pub async fn query_one<Q: TypedQuery>(
+        &mut self,
+        params: Q::Params,
+        #[cfg(feature = "n1-detect")] caller: &'static core::panic::Location<'static>,
+    ) -> Result<Q::Owned, DriverError> {
+        #[cfg(feature = "n1-detect")]
+        self.n1_record(Q::PREPARED.sql(), caller);
+        self.query_at_most_one::<Q>(params).await?.ok_or(DriverError::NoRows)
+    }
+
+    /// Run a compile-checked `query!` expecting AT MOST one row, returning the
+    /// owned record if present or `None` if absent — the by-key maybe-absent
+    /// shape, the flagship's most common cardinality. More than one row is
+    /// [`DriverError::TooManyRows`]. Under `n1-detect` records the USER call site
+    /// exactly once.
+    ///
+    /// The zero-or-one peer of [`query_one`](Self::query_one): it shares the exact
+    /// decode-direct streaming path (see
+    /// [`query_at_most_one`](Self::query_at_most_one)) and differs ONLY in that
+    /// zero rows is `Ok(None)` rather than [`NoRows`](DriverError::NoRows). All
+    /// other precedence is identical — a second row still dominates as
+    /// [`TooManyRows`](DriverError::TooManyRows), and a lone malformed row is
+    /// [`Decode`](DriverError::Decode).
+    pub async fn query_opt<Q: TypedQuery>(
+        &mut self,
+        params: Q::Params,
+        #[cfg(feature = "n1-detect")] caller: &'static core::panic::Location<'static>,
+    ) -> Result<Option<Q::Owned>, DriverError> {
+        #[cfg(feature = "n1-detect")]
+        self.n1_record(Q::PREPARED.sql(), caller);
+        self.query_at_most_one::<Q>(params).await
+    }
+
+    /// The shared zero-or-one decode-direct body behind
+    /// [`query_one`](Self::query_one) and [`query_opt`](Self::query_opt): stream a
+    /// compile-checked `query!` and return `Some(owned)` for exactly one row,
+    /// `Ok(None)` for zero rows, or [`TooManyRows`](DriverError::TooManyRows) for
+    /// two or more. Records NOTHING — the N+1 hook fires once in whichever public
+    /// verb called this.
+    ///
     /// Decodes the single expected row DIRECTLY into its owned twin off the wire,
     /// with NO intermediate prebuffer: the [`query`](Self::query) collect path
     /// would allocate a [`Rows<Q>`]'s `wire` + `slots` vectors (plus a memcpy of
@@ -675,15 +724,12 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// first row, since the old `_ => TooManyRows` arm never decoded a >1-row
     /// result (so a first-row decode failure is PARKED, not raised, while a
     /// second row is still awaited); a lone malformed row is
-    /// [`Decode`](DriverError::Decode); zero rows is
-    /// [`NoRows`](DriverError::NoRows).
-    pub async fn query_one<Q: TypedQuery>(
+    /// [`Decode`](DriverError::Decode); zero rows is `Ok(None)` (mapped to
+    /// [`NoRows`](DriverError::NoRows) only by [`query_one`](Self::query_one)).
+    async fn query_at_most_one<Q: TypedQuery>(
         &mut self,
         params: Q::Params,
-        #[cfg(feature = "n1-detect")] caller: &'static core::panic::Location<'static>,
-    ) -> Result<Q::Owned, DriverError> {
-        #[cfg(feature = "n1-detect")]
-        self.n1_record(Q::PREPARED.sql(), caller);
+    ) -> Result<Option<Q::Owned>, DriverError> {
         let live = self.take_live()?;
         // The single decoded row (owned, so it outlives the pump), plus the
         // read-after-settle flags the streaming sink parks.
@@ -764,9 +810,11 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 // Streamed to a clean idle — token restored, no drain needed.
                 self.live = Some(live);
                 match (row, decode_err) {
-                    (Some(owned), _) => Ok(owned),
+                    (Some(owned), _) => Ok(Some(owned)),
                     (None, Some(de)) => Err(DriverError::Decode(de)),
-                    (None, None) => Err(DriverError::NoRows),
+                    // Zero rows: `Ok(None)`. `query_one` maps this to `NoRows`;
+                    // `query_opt` returns it verbatim.
+                    (None, None) => Ok(None),
                 }
             }
             Boundary::Failed => {

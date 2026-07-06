@@ -27,6 +27,7 @@ bsql::query!(Seven, "SELECT 7::int4 AS n");
 bsql::query!(Hi, "SELECT 'hello'::text AS s");
 bsql::query!(Nums, "SELECT n FROM (VALUES (10::int4), (20), (30)) AS t(n)");
 bsql::query!(Many, "SELECT n FROM (VALUES (1::int4), (2)) AS t(n)");
+bsql::query!(NoneRow, "SELECT 1::int4 AS n WHERE false");
 bsql::query!(Echo, "SELECT $1::int4 AS n");
 bsql::query!(EchoS, "SELECT $1::text AS s");
 bsql::query!(WithNull, "SELECT NULL::int4 AS n");
@@ -243,6 +244,33 @@ async fn query_one_rejects_many_rows() {
     c.close().await.expect("close");
 }
 
+/// `query_opt` is AT-MOST-one: zero rows -> `Ok(None)`, exactly one ->
+/// `Ok(Some(record))`, more than one -> `TooManyRows` (same precedence as
+/// `query_one`, only the zero-row outcome differs).
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn query_opt_classifies_zero_one_and_many() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+
+    // Zero rows -> Ok(None) (NOT NoRows — the whole point of the opt shape).
+    let none = c.query_opt::<NoneRowQuery>(()).await.expect("query_opt runs");
+    assert!(none.is_none(), "zero rows must be Ok(None), got {none:?}");
+
+    // Exactly one row -> Ok(Some(owned record)).
+    let one = c.query_opt::<OneQuery>(()).await.expect("query_opt runs");
+    assert_eq!(one.expect("one row present").n, 1, "the single row decodes");
+
+    // Two rows -> TooManyRows (loud, same as query_one — never a silent first row).
+    let many = c.query_opt::<ManyQuery>(()).await;
+    assert!(
+        matches!(many, Err(DriverError::TooManyRows)),
+        "two rows must be TooManyRows, got {many:?}"
+    );
+
+    assert!(c.is_healthy(), "connection stays healthy after classified errors");
+    c.close().await.expect("close");
+}
+
 /// Int + text params round-trip through the binary-bind path.
 #[tokio::test]
 #[ignore = "requires local PG"]
@@ -335,7 +363,7 @@ async fn plan_is_parsed_once_and_persists() {
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn pooled_connection_reset_keeps_parsed_plan() {
-    let pool = Pool::new(async_config(), 1).await.expect("pool");
+    let pool = Pool::new(async_config(), 1);
     let mut pid: Option<i32> = None;
     for i in 0..20 {
         let mut c = pool.get().await.unwrap_or_else(|e| panic!("checkout {i}: {e:?}"));
@@ -380,7 +408,7 @@ async fn pooled_connection_reset_keeps_parsed_plan() {
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn pooled_reset_rolls_back_open_tx_and_keeps_plan() {
-    let pool = Pool::new(async_config(), 1).await.expect("pool");
+    let pool = Pool::new(async_config(), 1);
     let pid = {
         let mut c = pool.get().await.expect("get1");
         let conn = c.conn_mut().expect("live1");

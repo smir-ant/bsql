@@ -594,7 +594,7 @@ async fn reset_session_clears_the_notification_ledger() {
 async fn pool_basic() {
     use bsql_postgres_async::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
-    let pool = Pool::new(config, 3).await.expect("pool");
+    let pool = Pool::new(config, 3);
     let mut c = pool.get().await.expect("get");
     c.conn_mut().expect("live").ping().await.expect("ping");
     drop(c);
@@ -606,7 +606,7 @@ async fn pool_basic() {
 async fn pool_concurrent() {
     use bsql_postgres_async::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
-    let pool = Pool::new(config, 3).await.expect("pool");
+    let pool = Pool::new(config, 3);
     let handles: Vec<_> = (0..10u32).map(|i| {
         let p = pool.clone();
         tokio::spawn(async move {
@@ -632,7 +632,7 @@ async fn pool_reset_on_return_no_bleed() {
     // checkout of the SAME physical connection.
     use bsql_postgres_async::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
-    let pool = Pool::new(config, 1).await.expect("pool"); // max_size=1 forces reuse
+    let pool = Pool::new(config, 1); // max_size=1 forces reuse
     let pid1 = {
         let mut c = pool.get().await.expect("get1");
         let conn = c.conn_mut().expect("live1");
@@ -687,7 +687,7 @@ async fn cancelled_transaction_is_rolled_back_before_reuse() {
         setup.close().await.expect("close setup");
     }
 
-    let pool = Pool::new(mk_config(), 1).await.expect("pool"); // max_size=1 forces reuse
+    let pool = Pool::new(mk_config(), 1); // max_size=1 forces reuse
     let pid1;
     {
         let mut guard = pool.get().await.expect("acquire 1");
@@ -751,7 +751,7 @@ async fn pool_get_cancellation_returns_permit() {
     use bsql_postgres_async::Pool;
     use std::time::Duration;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
-    let pool = Pool::new(config, 1).await.expect("pool");
+    let pool = Pool::new(config, 1);
     // Warm one connection into the idle set so the next get() takes the RESET
     // path: its first poll acquires the (now-free) permit synchronously, then the
     // reset round-trip suspends — so the future is Pending after one poll.
@@ -786,7 +786,7 @@ async fn pool_acquire_timeout_not_hang() {
     use bsql_postgres_async::Pool;
     use std::time::{Duration, Instant};
     let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
-    let pool = Pool::new(config, 1).await.expect("pool");
+    let pool = Pool::new(config, 1);
     let _held = pool.get().await.expect("hold the one connection");
     let start = Instant::now();
     let err = pool.get_timeout(Duration::from_millis(200)).await;
@@ -807,7 +807,7 @@ async fn pool_evicts_dead_connection() {
     // fresh, healthy one instead.
     use bsql_postgres_async::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
-    let pool = Pool::new(config, 1).await.expect("pool");
+    let pool = Pool::new(config, 1);
     let dead_pid = {
         let mut c = pool.get().await.expect("get");
         let conn = c.conn_mut().expect("live");
@@ -883,7 +883,7 @@ async fn full_lifecycle() {
 async fn pool_stress_100_tasks() {
     use bsql_postgres_async::Pool;
     let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
-    let pool = Pool::new(config, 5).await.expect("pool");
+    let pool = Pool::new(config, 5);
     let handles: Vec<_> = (0..100u32).map(|i| {
         let p = pool.clone();
         tokio::spawn(async move {
@@ -989,6 +989,62 @@ async fn transaction_fusion_empty_and_extended() {
         c.query_sql("SELECT count(*) FROM txf_async").await.expect("c").get(0).expect("row 0").get_i64(0),
         Ok(Some(2)),
         "the rolled-back insert did not persist"
+    );
+    c.close().await.expect("close");
+}
+
+/// COPY inside a transaction (via the borrowing guard) is a legal, ATOMIC bulk
+/// load: the copied rows are visible to a query in the SAME transaction, persist
+/// on COMMIT, and are gone on ROLLBACK — atomic bulk-load-with-rollback. Also
+/// witnesses the deferred BEGIN fusing into a COPY that is the transaction's
+/// FIRST statement.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn copy_in_inside_transaction_commits_and_rolls_back() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cptx_async(v int)").await.expect("create");
+
+    // COMMIT path: `copy_in_with` (scoped writer) is the tx's FIRST statement, so
+    // the deferred BEGIN fuses into it; a query in the SAME tx sees the rows.
+    let count = c
+        .transaction(async |tx| {
+            let n = tx
+                .copy_in_with("cptx_async", async |w| {
+                    w.write_row(b"1").await?;
+                    w.write_row(b"2").await?;
+                    w.write_row(b"3").await?;
+                    Ok(())
+                })
+                .await?;
+            assert_eq!(
+                tx.query_sql("SELECT count(*) FROM cptx_async").await?.get(0).expect("row 0").get_i64(0),
+                Ok(Some(3)),
+                "the just-copied rows are visible inside the transaction"
+            );
+            Ok(n)
+        })
+        .await
+        .expect("copy-in transaction commits");
+    assert_eq!(count, 3, "COPY reported 3 loaded rows");
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cptx_async").await.expect("q").get(0).expect("row 0").get_i64(0),
+        Ok(Some(3)),
+        "the committed COPY rows persist"
+    );
+
+    // ROLLBACK path: `copy_in` more rows, then Err → the copied rows are discarded.
+    let result: Result<(), _> = c
+        .transaction(async |tx| {
+            tx.copy_in("cptx_async", vec!["4", "5"]).await?;
+            Err(DriverError::NoRows)
+        })
+        .await;
+    assert!(result.is_err(), "the body error rolls the transaction back");
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cptx_async").await.expect("q").get(0).expect("row 0").get_i64(0),
+        Ok(Some(3)),
+        "the rolled-back COPY rows are NOT visible (still 3, not 5)"
     );
     c.close().await.expect("close");
 }

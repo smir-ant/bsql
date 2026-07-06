@@ -102,8 +102,17 @@ impl ResultCollector {
             Surface::Row(body) => self.push_row_body(body),
             Surface::RowChunk(bytes) => self.chunk.extend_from_slice(bytes),
             Surface::RowChunkEnd => {
-                let body = core::mem::take(&mut self.chunk);
+                // Detach the reassembled body to parse it (`push_row_body` needs
+                // `&mut self`, so it cannot also borrow `self.chunk`), then RETAIN
+                // the buffer's capacity for the next oversize row rather than
+                // dropping it — matching the typed `query_each` path's `clear()`
+                // reuse. `mem::take` ALONE left `Vec::new()` behind, freeing +
+                // reallocating per oversize row; putting the cleared buffer back
+                // keeps streaming a run of oversize rows at constant allocation.
+                let mut body = core::mem::take(&mut self.chunk);
                 self.push_row_body(&body);
+                body.clear();
+                self.chunk = body;
             }
             Surface::Deliver { tag, oids, names } => {
                 match tag {

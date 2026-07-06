@@ -44,7 +44,7 @@ pub use bsql_postgres_core::{
     SafeIdent, SafeTable, SslMode, TypedNotification,
 };
 
-pub use connection::{Connection, CopyInWriter, PreparedStatement};
+pub use connection::{Connection, CopyInWriter, PreparedStatement, Transaction};
 pub use pool::{Pool, PooledConnection};
 
 // Tier-1 static assertions: Connection is Send (its futures cross .await points

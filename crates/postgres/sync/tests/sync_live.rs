@@ -786,6 +786,56 @@ fn transaction_panic_before_first_statement_is_cleared_by_reset() {
     c.close().expect("close");
 }
 
+/// COPY inside a transaction (via the borrowing guard) is a legal, ATOMIC bulk
+/// load: the copied rows are visible to a query in the SAME transaction, persist
+/// on COMMIT, and are gone on ROLLBACK — atomic bulk-load-with-rollback. Also
+/// witnesses the deferred BEGIN fusing into a COPY that is the transaction's
+/// FIRST statement.
+#[test]
+#[ignore = "requires local PG"]
+fn copy_in_inside_transaction_commits_and_rolls_back() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute_sql("CREATE TEMP TABLE cptx(v int)").expect("create");
+
+    // COMMIT path: `copy_in_with` (scoped writer) is the tx's FIRST statement, so
+    // the deferred BEGIN fuses into it; a query in the SAME tx sees the rows.
+    let count = c
+        .transaction(|tx| {
+            let n = tx.copy_in_with("cptx", |w| {
+                w.write_row(b"1")?;
+                w.write_row(b"2")?;
+                w.write_row(b"3")?;
+                Ok(())
+            })?;
+            assert_eq!(
+                tx.query_sql("SELECT count(*) FROM cptx")?.get(0).expect("row 0").get_i64(0),
+                Ok(Some(3)),
+                "the just-copied rows are visible inside the transaction"
+            );
+            Ok(n)
+        })
+        .expect("copy-in transaction commits");
+    assert_eq!(count, 3, "COPY reported 3 loaded rows");
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cptx").expect("q").get(0).expect("row 0").get_i64(0),
+        Ok(Some(3)),
+        "the committed COPY rows persist"
+    );
+
+    // ROLLBACK path: `copy_in` more rows, then Err → the copied rows are discarded.
+    let result: Result<(), _> = c.transaction(|tx| {
+        tx.copy_in("cptx", vec!["4", "5"])?;
+        Err(bsql_postgres_sync::DriverError::NoRows)
+    });
+    assert!(result.is_err(), "the body error rolls the transaction back");
+    assert_eq!(
+        c.query_sql("SELECT count(*) FROM cptx").expect("q").get(0).expect("row 0").get_i64(0),
+        Ok(Some(3)),
+        "the rolled-back COPY rows are NOT visible (still 3, not 5)"
+    );
+    c.close().expect("close");
+}
+
 #[test]
 #[ignore = "requires local PG"]
 fn row_clone_across_threads() {

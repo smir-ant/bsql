@@ -21,9 +21,26 @@
 //! slot; on exhaustion it returns [`DriverError::PoolTimeout`] rather than
 //! blocking forever. [`get_timeout`](Pool::get_timeout) overrides the deadline
 //! per call.
+//!
+//! # Fairness (FIFO hand-off)
+//!
+//! Checkouts are served in FIFO arrival order — the same fairness the async pool
+//! gets for free from `tokio::sync::Semaphore`. A plain `std::sync::Condvar` +
+//! `notify_one` does NOT give this: `notify_one` wakes a parked waiter, but a
+//! FRESH `get()` caller can win the mutex race before the woken waiter re-locks,
+//! steal the just-returned connection, and leave — the woken waiter re-locks,
+//! finds nothing, and re-waits, having burned its wakeup. Under sustained
+//! arrivals one waiter can lose that race many times in a row (unbounded tail;
+//! eventually a false `PoolTimeout` while connections are actively cycling). So
+//! each blocked waiter instead enqueues its OWN [`Condvar`] as a ticket in a
+//! `VecDeque` and is served ONLY when it reaches the FRONT — a fresh caller that
+//! finds a non-empty queue must enqueue BEHIND it (no barging by construction),
+//! and a freed slot wakes exactly the front waiter (an O(1) hand-off, not a
+//! thundering `notify_all`). The uncontended path allocates no ticket: an empty
+//! queue with a free slot is taken directly.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use bsql_postgres_core::{ConnectConfig, DriverError};
@@ -43,7 +60,6 @@ pub struct Pool {
 struct PoolInner {
     config: ConnectConfig,
     state: Mutex<PoolState>,
-    available: Condvar,
     max_size: usize,
     acquire_timeout: Duration,
 }
@@ -51,6 +67,10 @@ struct PoolInner {
 struct PoolState {
     connections: VecDeque<Connection>,
     checked_out: usize,
+    /// FIFO queue of blocked waiters, each parked on its OWN [`Condvar`]
+    /// (identified by `Arc` pointer). The FRONT is the next to serve; a freed
+    /// slot wakes exactly it. Empty on the uncontended path.
+    waiters: VecDeque<Arc<Condvar>>,
 }
 
 impl std::fmt::Debug for Pool {
@@ -63,16 +83,47 @@ impl std::fmt::Debug for Pool {
     }
 }
 
-/// Pop the first HEALTHY idle connection, evicting (dropping) any that died
-/// while idle. Returns `None` when the idle set holds no healthy connection.
-fn pop_healthy(state: &mut PoolState) -> Option<Connection> {
-    while let Some(conn) = state.connections.pop_front() {
-        if conn.is_healthy() {
-            return Some(conn);
-        }
-        // else: dead — drop it (evict) and keep looking.
+/// Reserve a slot for the caller if one is free, incrementing `checked_out`.
+///
+/// `Some(Some(conn))` — reuse the popped idle connection (reset before handing
+/// out); `Some(None)` — a fresh slot was reserved (create a new connection);
+/// `None` — the pool is at capacity with nothing idle (the caller must wait).
+/// The caller must already be entitled to the slot (queue empty, or at the
+/// FIFO front) — this does NOT check fairness.
+fn try_take(state: &mut PoolState, max_size: usize) -> Option<Option<Connection>> {
+    // A connection enters the idle deque ONLY when healthy (`Drop` guards on
+    // `is_healthy`; a fatal verb or an explicit `close` evicts at RETURN time,
+    // never adding it), and nothing runs on an idle pooled connection to flip its
+    // health, so the front is always reusable — pop it directly. Genuine
+    // idle-death (the server closed the socket while idle) is `is_healthy()==true`
+    // and is caught by the reset failing on acquire (evict + retry), not by a
+    // pop-time probe — a pop-time `is_healthy()` filter would be dead code.
+    if let Some(conn) = state.connections.pop_front() {
+        state.checked_out += 1;
+        return Some(Some(conn));
+    }
+    if state.connections.len() + state.checked_out < max_size {
+        state.checked_out += 1;
+        return Some(None);
     }
     None
+}
+
+/// Wake the FIFO front waiter, if any, so it re-checks and takes its turn. An
+/// O(1) hand-off (one `notify_one` on the front's own condvar), never a
+/// thundering `notify_all`.
+fn wake_front(state: &PoolState) {
+    if let Some(front) = state.waiters.front() {
+        front.notify_one();
+    }
+}
+
+/// Remove `ticket` from the waiter queue (on timeout) — it may be anywhere, not
+/// only the front, so it is located by `Arc` pointer identity.
+fn remove_ticket(state: &mut PoolState, ticket: &Arc<Condvar>) {
+    if let Some(pos) = state.waiters.iter().position(|w| Arc::ptr_eq(w, ticket)) {
+        state.waiters.remove(pos);
+    }
 }
 
 impl Pool {
@@ -105,8 +156,8 @@ impl Pool {
                 state: Mutex::new(PoolState {
                     connections: VecDeque::with_capacity(max_size),
                     checked_out: 0,
+                    waiters: VecDeque::new(),
                 }),
-                available: Condvar::new(),
                 max_size,
                 acquire_timeout,
             }),
@@ -136,43 +187,29 @@ impl Pool {
 
         // Outer loop: retry after evicting a connection whose reset failed.
         loop {
-            // ── Phase 1: under the lock, reserve a slot, or wait until the
-            // deadline. Reserving increments `checked_out`; the reservation is
-            // released on any Phase-2 failure below. `Some(conn)` = a popped idle
-            // connection to REUSE (reset before handing out); `None` = the slot is
-            // reserved for a FRESH connection (already clean).
+            // ── Phase 1: under the lock, reserve a slot FAIRLY (FIFO), or wait
+            // until the deadline. Reserving increments `checked_out`; the
+            // reservation is released on any Phase-2 failure below. `Some(conn)` =
+            // a popped idle connection to REUSE (reset before handing out); `None`
+            // = the slot is reserved for a FRESH connection (already clean).
             let reused: Option<Connection> = {
                 // Mutex poison recovery, not a data fallback: a poisoned lock means
                 // another thread panicked while holding it; `into_inner` recovers
                 // the guarded pool state so the pool keeps operating.
                 #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
                 let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                loop {
-                    if let Some(conn) = pop_healthy(&mut state) {
-                        state.checked_out += 1;
-                        break Some(conn);
+                // FAST PATH: no one is queued ahead of us AND a slot is free → take
+                // it directly, with NO ticket allocation (the uncontended common
+                // case). If someone is already waiting, we MUST queue behind them
+                // even if a slot is momentarily free — that is the anti-barging
+                // guarantee (FIFO).
+                if state.waiters.is_empty() {
+                    match try_take(&mut state, self.inner.max_size) {
+                        Some(taken) => taken,
+                        None => self.wait_in_line(state, deadline)?,
                     }
-                    if state.connections.len() + state.checked_out < self.inner.max_size {
-                        state.checked_out += 1;
-                        break None;
-                    }
-                    // At capacity, nothing idle: wait until the deadline.
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(DriverError::PoolTimeout);
-                    }
-                    let remaining = deadline.saturating_duration_since(now);
-                    // Condvar poison recovery, same reasoning as the lock above.
-                    #[allow(clippy::disallowed_methods, reason = "condvar poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
-                    let (recovered, _timed_out) = self
-                        .inner
-                        .available
-                        .wait_timeout(state, remaining)
-                        .unwrap_or_else(|e| e.into_inner());
-                    // Re-check the condition at the top of the loop (handles
-                    // spurious wakeups); the `now >= deadline` guard above bounds
-                    // the total wait.
-                    state = recovered;
+                } else {
+                    self.wait_in_line(state, deadline)?
                 }
             };
 
@@ -223,22 +260,75 @@ impl Pool {
         }
     }
 
-    /// Release a reserved slot (decrement `checked_out`) and wake one waiter.
-    /// Used when a reserved connection could not be delivered (reset / connect
-    /// failure).
-    fn release_slot(&self) {
-        {
-            // Mutex poison recovery (see `get_timeout`), not a data fallback.
-            #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
-            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            // `checked_out` was incremented once for this reservation; a checked
-            // decrement fails loud in debug rather than silently wrapping.
-            match state.checked_out.checked_sub(1) {
-                Some(n) => state.checked_out = n,
-                None => debug_assert!(false, "pool checked_out underflow on slot release"),
+    /// Join the FIFO waiter queue and block until we reach the FRONT and a slot
+    /// is free, or the deadline elapses.
+    ///
+    /// Consumes the lock guard (the wait must own it) and returns the reserved
+    /// outcome — `Some(conn)` to reuse (reset before handing out), `None` for a
+    /// fresh slot — or [`DriverError::PoolTimeout`]. Serving increments
+    /// `checked_out` and dequeues our ticket; a coalesced multi-return that freed
+    /// more than one slot is propagated by waking the NEW front on the way out.
+    fn wait_in_line(
+        &self,
+        mut state: MutexGuard<'_, PoolState>,
+        deadline: Instant,
+    ) -> Result<Option<Connection>, DriverError> {
+        // Our OWN condvar, enqueued as a ticket. Allocated only on the contended
+        // path (a fresh caller that found a slot free never reaches here).
+        let ticket = Arc::new(Condvar::new());
+        state.waiters.push_back(Arc::clone(&ticket));
+        loop {
+            // Serve ONLY when we are the front — never barge past an earlier
+            // waiter even if a slot is momentarily free.
+            if state.waiters.front().is_some_and(|w| Arc::ptr_eq(w, &ticket))
+                && let Some(taken) = try_take(&mut state, self.inner.max_size)
+            {
+                // Took our turn: leave the queue and hand off to the next waiter
+                // — a coalesced multi-return may have freed more than the one slot
+                // our single wakeup accounted for.
+                state.waiters.pop_front();
+                wake_front(&state);
+                return Ok(taken);
             }
+            let now = Instant::now();
+            if now >= deadline {
+                // Give up our place. If a slot was handed to us AS we timed out
+                // (a return raced our deadline), the next waiter must be woken to
+                // claim it — never a lost hand-off.
+                remove_ticket(&mut state, &ticket);
+                wake_front(&state);
+                return Err(DriverError::PoolTimeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            // Wait on OUR ticket, not a shared condvar: a freed slot wakes exactly
+            // the front, so a wakeup we consume is always ours to act on (no
+            // burned wakeup, the barging root cause). Condvar poison recovery, same
+            // reasoning as the lock in `get_timeout`.
+            #[allow(clippy::disallowed_methods, reason = "condvar poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+            let (recovered, _timed_out) = ticket
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            // Re-check at the loop top (handles spurious wakeups + our
+            // not-yet-at-front case); the deadline guard bounds the total wait.
+            state = recovered;
         }
-        self.inner.available.notify_one();
+    }
+
+    /// Release a reserved slot (decrement `checked_out`) and hand off to the FIFO
+    /// front waiter. Used when a reserved connection could not be delivered
+    /// (reset / connect failure).
+    fn release_slot(&self) {
+        // Mutex poison recovery (see `get_timeout`), not a data fallback.
+        #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        // `checked_out` was incremented once for this reservation; a checked
+        // decrement fails loud in debug rather than silently wrapping.
+        match state.checked_out.checked_sub(1) {
+            Some(n) => state.checked_out = n,
+            None => debug_assert!(false, "pool checked_out underflow on slot release"),
+        }
+        // Freeing this slot may let the front waiter proceed — wake exactly it.
+        wake_front(&state);
     }
 
     /// The number of idle (checked-in) connections currently held.
@@ -325,8 +415,90 @@ impl Drop for PooledConnection {
             if conn.is_healthy() {
                 state.connections.push_back(conn);
             }
-            drop(state);
-            self.pool.available.notify_one();
+            // Hand off to the FIFO front waiter (an added idle connection or a
+            // freed slot may let exactly it proceed). Woken while holding the lock:
+            // the waiter blocks on re-lock until this guard drops at scope end.
+            wake_front(&state);
         }
+    }
+}
+
+#[cfg(test)]
+mod fairness_tests {
+    //! FIFO fairness witness: under saturation, blocked checkouts are served in
+    //! strict ARRIVAL order (the same guarantee the async pool gets for free from
+    //! `tokio::sync::Semaphore`), never barged. A barging `notify_one` + shared
+    //! `Condvar` would serve them in an arbitrary scheduler-decided order.
+    //!
+    //! DETERMINISTIC, not timing-dependent: the queue is ordered by SPINNING on
+    //! the private waiter count until each worker has actually parked, so arrival
+    //! order does not depend on spawn/scheduler timing; and once the primed
+    //! connection is released, the hand-off is a causal chain (worker `i` records
+    //! its id and only THEN releases, which alone can wake worker `i+1`), so the
+    //! recorded service order is a total order fixed by construction. Needs a live
+    //! PG (a real `Connection`), so `#[ignore]`.
+
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    fn test_config() -> ConnectConfig {
+        ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string())
+    }
+
+    /// The private FIFO waiter count — the barrier the arrival ordering spins on.
+    fn waiter_count(pool: &Pool) -> usize {
+        #[allow(clippy::disallowed_methods, reason = "test-only mutex poison recovery")]
+        let state = pool.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.waiters.len()
+    }
+
+    #[test]
+    #[ignore = "requires local PG"]
+    fn saturated_checkouts_are_served_in_fifo_arrival_order() {
+        const N: usize = 8;
+        // Pool size 1: one connection, so every worker but the holder must queue.
+        let pool = Pool::new(test_config(), 1);
+        // Hold the only connection so all N workers block in the FIFO queue.
+        let held = pool.get().expect("prime the single connection");
+
+        let (order_tx, order_rx) = mpsc::channel::<usize>();
+        let mut handles = Vec::new();
+        for id in 0..N {
+            let p = pool.clone();
+            let tx = order_tx.clone();
+            handles.push(thread::spawn(move || {
+                // On acquire, record our id (the SERVICE order), then release —
+                // dropping the connection alone can wake the next front waiter, so
+                // this send strictly precedes the next worker's.
+                let conn = p.get().expect("worker acquires");
+                tx.send(id).expect("record service order");
+                drop(conn);
+            }));
+            // Enforce ARRIVAL order deterministically: block until THIS worker has
+            // actually enqueued its ticket before spawning the next.
+            while waiter_count(&pool) < id + 1 {
+                thread::yield_now();
+            }
+        }
+        assert_eq!(waiter_count(&pool), N, "all workers queued in arrival order");
+
+        // Release the primed connection: the FIFO hand-off now serves the queue
+        // strictly front-to-back.
+        drop(held);
+
+        let mut served = Vec::with_capacity(N);
+        for _ in 0..N {
+            served.push(order_rx.recv().expect("a worker was served"));
+        }
+        for h in handles {
+            h.join().expect("worker thread");
+        }
+        // FIFO: served in the EXACT arrival order. A barging pool scrambles this.
+        assert_eq!(
+            served,
+            (0..N).collect::<Vec<_>>(),
+            "saturated checkouts must be served in FIFO arrival order"
+        );
     }
 }

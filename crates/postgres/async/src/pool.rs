@@ -80,8 +80,9 @@ impl Pool {
     /// Connections are created lazily on demand. To set a non-default deadline at
     /// construction use [`with_acquire_timeout`](Self::with_acquire_timeout); to
     /// override it for a single checkout use [`get_timeout`](Self::get_timeout).
-    pub async fn new(config: ConnectConfig, max_size: usize) -> Result<Self, DriverError> {
-        Self::with_acquire_timeout(config, max_size, DEFAULT_ACQUIRE_TIMEOUT).await
+    #[must_use]
+    pub fn new(config: ConnectConfig, max_size: usize) -> Self {
+        Self::with_acquire_timeout(config, max_size, DEFAULT_ACQUIRE_TIMEOUT)
     }
 
     /// Create a pool with an explicit default acquire deadline, fixed for the
@@ -89,13 +90,17 @@ impl Pool {
     ///
     /// The deadline is set at construction (not mutated later), so a
     /// clone/checkout never races an accounting change and no connections are
-    /// ever discarded to reconfigure it.
-    pub async fn with_acquire_timeout(
+    /// ever discarded to reconfigure it. Construction is a pure, infallible field
+    /// set — connections are lazy (nothing is dialed here), so this is NOT `async`
+    /// and does NOT return a `Result` (that would be defensive error handling for
+    /// an impossible event); it mirrors the sync driver's `Pool::new` exactly.
+    #[must_use]
+    pub fn with_acquire_timeout(
         config: ConnectConfig,
         max_size: usize,
         acquire_timeout: Duration,
-    ) -> Result<Self, DriverError> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             inner: Arc::new(PoolInner {
                 config,
                 connections: Mutex::new(VecDeque::with_capacity(max_size)),
@@ -103,7 +108,7 @@ impl Pool {
                 max_size,
                 acquire_timeout,
             }),
-        })
+        }
     }
 
     /// Check out a connection, waiting up to the pool's configured acquire
@@ -151,14 +156,14 @@ impl Pool {
                 // panic. The connection set it guards is observed as normal.
                 #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
                 let mut conns = self.inner.connections.lock().unwrap_or_else(|e| e.into_inner());
-                // Skip connections that died while idle (evict, do not reset).
-                loop {
-                    match conns.pop_front() {
-                        Some(conn) if conn.is_healthy() => break Some(conn),
-                        Some(_dead) => continue,
-                        None => break None,
-                    }
-                }
+                // A connection enters the idle set ONLY when healthy (`Drop` guards
+                // on `is_healthy`; a fatal verb or an explicit `close` evicts at
+                // RETURN time), and nothing runs on an idle pooled connection to
+                // flip its health, so the front is always reusable — pop it
+                // directly. Genuine idle-death (the server closed the socket while
+                // idle) is `is_healthy()==true` and is caught by the reset failing
+                // on acquire below (evict + retry), not by a pop-time probe.
+                conns.pop_front()
             };
 
             match reused {

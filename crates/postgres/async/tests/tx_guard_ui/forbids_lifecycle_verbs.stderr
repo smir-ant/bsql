@@ -1,0 +1,35 @@
+error[E0599]: no method named `begin` found for mutable reference `&mut Transaction<'_>` in the current scope
+  --> tests/tx_guard_ui/forbids_lifecycle_verbs.rs:12:20
+   |
+12 |         let _ = tx.begin();
+   |                    ^^^^^ method not found in `&mut Transaction<'_>`
+
+error[E0599]: no method named `commit` found for mutable reference `&mut Transaction<'_>` in the current scope
+  --> tests/tx_guard_ui/forbids_lifecycle_verbs.rs:13:20
+   |
+13 |         let _ = tx.commit();
+   |                    ^^^^^^ method not found in `&mut Transaction<'_>`
+
+error[E0599]: no method named `rollback` found for mutable reference `&mut Transaction<'_>` in the current scope
+  --> tests/tx_guard_ui/forbids_lifecycle_verbs.rs:14:20
+   |
+14 |         let _ = tx.rollback();
+   |                    ^^^^^^^^ method not found in `&mut Transaction<'_>`
+
+error[E0599]: no method named `transaction` found for mutable reference `&mut Transaction<'_>` in the current scope
+  --> tests/tx_guard_ui/forbids_lifecycle_verbs.rs:18:20
+   |
+18 |         let _ = tx.transaction(async |_inner: ()| Ok::<(), DriverError>(()));
+   |                    ^^^^^^^^^^^ method not found in `&mut Transaction<'_>`
+
+error[E0599]: no method named `close` found for mutable reference `&mut Transaction<'_>` in the current scope
+  --> tests/tx_guard_ui/forbids_lifecycle_verbs.rs:19:20
+   |
+19 |         let _ = tx.close();
+   |                    ^^^^^ method not found in `&mut Transaction<'_>`
+
+error[E0599]: no method named `reset_session` found for mutable reference `&mut Transaction<'_>` in the current scope
+  --> tests/tx_guard_ui/forbids_lifecycle_verbs.rs:20:20
+   |
+20 |         let _ = tx.reset_session();
+   |                    ^^^^^^^^^^^^^ method not found in `&mut Transaction<'_>`
