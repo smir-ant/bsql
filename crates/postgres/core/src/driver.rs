@@ -629,7 +629,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     }
 
     /// The typed-collect body behind [`query`](Self::query): collects a typed
-    /// result into a [`Rows<Q>`] prebuffer and classifies an oversize row loudly.
+    /// result into a [`Rows<Q>`] prebuffer. An oversize row (wider than the
+    /// engine's inline read buffer) is REASSEMBLED into the prebuffer by
+    /// [`RowsBuilder::feed`] and decodes identically to an inline one — no cap.
     /// Records nothing — the N+1 hook fires exactly once in the public verb that
     /// called this. ([`query_one`](Self::query_one) does NOT route through here:
     /// it decodes its single row directly off the wire, with no prebuffer.)
@@ -652,11 +654,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             )
             .await;
         self.settle(outcome, &mut builder)?;
-        // The connection is now idle + pooled. An oversize row cannot be decoded
-        // contiguously by the bounded path; classify it loudly.
-        if builder.saw_oversize() {
-            return Err(DriverError::OversizeRow);
-        }
+        // The connection is now idle + pooled. An oversize row was reassembled
+        // into the prebuffer's `wire` by `RowsBuilder::feed` and is just another
+        // contiguous span, so it decodes exactly like an inline row — no cap.
         Ok(builder.finish::<Q>())
     }
 
@@ -674,8 +674,14 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// `Option<Q::Owned>` (the owned twin does not borrow the transient ingest
     /// buffer, so it safely outlives the pump), and BREAKS on a second row.
     ///
-    /// Error precedence is exactly the old collect-then-count path's: an oversize
-    /// row dominates (it was checked before the count); then a second row is
+    /// An oversize FIRST row (wider than the engine's inline read buffer, so
+    /// streamed as `RowChunk` pieces) is REASSEMBLED into a scratch `Vec` and
+    /// decoded from there — no cap, no prebuffer for the common small single-row
+    /// case (the scratch stays unallocated until the first chunk). A completed
+    /// oversize row counts as a row exactly like an inline one, so a SECOND row
+    /// (inline or oversize) is still the too-many condition.
+    ///
+    /// Error precedence: a second row is
     /// [`TooManyRows`](DriverError::TooManyRows) — dominating even a malformed
     /// first row, since the old `_ => TooManyRows` arm never decoded a >1-row
     /// result (so a first-row decode failure is PARKED, not raised, while a
@@ -696,7 +702,10 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         let mut seen_first = false;
         let mut decode_err: Option<DecodeError> = None;
         let mut db_error: Option<DbError> = None;
-        let mut oversize = false;
+        // Reassembly scratch for an oversize FIRST row (chunk-streamed). Stays
+        // UNALLOCATED for the common small single-row case (no chunk ever
+        // arrives), so the zero-prebuffer fast path is unchanged.
+        let mut oversize_scratch: Vec<u8> = Vec::new();
         let outcome = self
             .engine
             .query_params_break(
@@ -728,11 +737,28 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                         db_error = Some(materialize::parse_error_response(body));
                         ControlFlow::Continue(())
                     }
-                    // An oversize row streams as chunks the bounded typed decoder
-                    // cannot reassemble; flag it for a classified `OversizeRow`
-                    // after the stream ends — never reassemble, never truncate.
-                    Surface::RowChunk(_) | Surface::RowChunkEnd => {
-                        oversize = true;
+                    // An oversize row streams as `RowChunk` pieces. If a whole row
+                    // was already seen, this chunk begins a SECOND row → stop for
+                    // too-many (drained below), never accumulating it. Otherwise
+                    // reassemble the FIRST row's chunks into the scratch `Vec`.
+                    Surface::RowChunk(bytes) => {
+                        if seen_first {
+                            return ControlFlow::Break(());
+                        }
+                        oversize_scratch.extend_from_slice(bytes);
+                        ControlFlow::Continue(())
+                    }
+                    // The reassembled first oversize row is complete: decode it
+                    // from the contiguous scratch exactly as an inline first row,
+                    // and count it (so a following row is still too-many). Only
+                    // reachable with `seen_first` false — a second oversize row is
+                    // stopped at its first `RowChunk` above, never reaching here.
+                    Surface::RowChunkEnd => {
+                        seen_first = true;
+                        match Q::decode_owned(&oversize_scratch) {
+                            Ok(owned) => row = Some(owned),
+                            Err(de) => decode_err = Some(de),
+                        }
                         ControlFlow::Continue(())
                     }
                     _ => ControlFlow::Continue(()),
@@ -748,10 +774,6 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             Boundary::Idle => {
                 // Streamed to a clean idle — token restored, no drain needed.
                 self.live = Some(live);
-                // Oversize dominates (the collect path checked it before the count).
-                if oversize {
-                    return Err(DriverError::OversizeRow);
-                }
                 match (row, decode_err) {
                     (Some(owned), _) => Ok(owned),
                     (None, Some(de)) => Err(DriverError::Decode(de)),
@@ -768,12 +790,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 }
             }
             Boundary::Stopped(()) => {
-                // Broke on the second row: drain to reclaim, then classify.
-                // Oversize still dominates too-many (matching the collect path).
+                // Broke on the second row (inline or the first chunk of a second
+                // oversize row): drain to reclaim, then classify as too-many.
                 self.drain_to_idle(live).await?;
-                if oversize {
-                    return Err(DriverError::OversizeRow);
-                }
                 Err(DriverError::TooManyRows)
             }
             // `query_params_break` maps Closed/Suspended to a fatal `Err`, so they
@@ -807,7 +826,11 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         let live = self.take_live()?;
         // Captured across the streaming sink; read after the verb settles.
         let mut db_error: Option<DbError> = None;
-        let mut oversize = false;
+        // Reassembly scratch for an oversize row (chunk-streamed), REUSED across
+        // oversize rows (cleared after each), so streaming stays constant-memory
+        // — bounded by the widest oversize row, not the whole result. Stays
+        // unallocated while every row fits one buffer fill.
+        let mut oversize_scratch: Vec<u8> = Vec::new();
         let outcome = self
             .engine
             .query_params_break(
@@ -832,12 +855,28 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                         db_error = Some(materialize::parse_error_response(body));
                         ControlFlow::Continue(())
                     }
-                    // An oversize row streams as chunks the bounded typed decoder
-                    // cannot reassemble; flag it for a classified `OversizeRow`
-                    // after the stream ends — never reassemble, never truncate.
-                    Surface::RowChunk(_) | Surface::RowChunkEnd => {
-                        oversize = true;
+                    // An oversize row streams as `RowChunk` pieces: reassemble them
+                    // into the reused scratch buffer.
+                    Surface::RowChunk(bytes) => {
+                        oversize_scratch.extend_from_slice(bytes);
                         ControlFlow::Continue(())
+                    }
+                    // The reassembled oversize row is complete: decode the borrowed
+                    // record from the contiguous scratch and hand it to `on_row`
+                    // exactly as an inline row, then clear the scratch to reuse its
+                    // allocation for the next oversize row (the borrow via `rec`
+                    // ends when `on_row` returns, before the clear). A decode
+                    // failure is LOUD; an `on_row` break rides `Stop::User`.
+                    Surface::RowChunkEnd => {
+                        let flow = match Q::decode_borrowed(&oversize_scratch) {
+                            Ok(rec) => match on_row(rec) {
+                                ControlFlow::Continue(()) => ControlFlow::Continue(()),
+                                ControlFlow::Break(e) => ControlFlow::Break(Stop::User(e)),
+                            },
+                            Err(de) => ControlFlow::Break(Stop::Decode(de)),
+                        };
+                        oversize_scratch.clear();
+                        flow
                     }
                     // COPY / delivery / other async frames are not stream rows (a
                     // NOTIFY is captured into the ledger by the wrapper above this
@@ -856,9 +895,6 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             Boundary::Idle => {
                 // Streamed to completion at a clean idle — no drain needed.
                 self.live = Some(live);
-                if oversize {
-                    return Err(DriverError::OversizeRow);
-                }
                 Ok(None)
             }
             Boundary::Failed => {
@@ -873,9 +909,6 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             Boundary::Stopped(Stop::User(e)) => {
                 // Caller broke early: drain to reclaim, then report the stop value.
                 self.drain_to_idle(live).await?;
-                if oversize {
-                    return Err(DriverError::OversizeRow);
-                }
                 Ok(Some(e))
             }
             Boundary::Stopped(Stop::Decode(de)) => {

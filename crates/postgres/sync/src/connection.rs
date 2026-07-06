@@ -539,8 +539,9 @@ impl Connection {
     /// `Q` is a `query!`-generated carrier; the returned [`Rows<Q>`] decodes lazily
     /// into the macro's typed records — borrowed (zero-copy text) via
     /// [`Rows::iter`], or owned via [`Rows::into_owned`]. SQL is validated against
-    /// the schema at build time, params are bound in binary. An oversize row is a
-    /// classified [`DriverError::OversizeRow`], never a silent truncation. The
+    /// the schema at build time, params are bound in binary. An oversize row
+    /// (wider than the engine's inline read buffer) is reassembled into the
+    /// prebuffer and decodes identically to an inline one — no size cap. The
     /// statement is Parsed once per connection and the server-side plan reused
     /// thereafter. The runtime-SQL escape hatch is [`query_sql`](Self::query_sql).
     #[cfg_attr(feature = "n1-detect", track_caller)]
@@ -580,9 +581,11 @@ impl Connection {
     /// - `Err(DriverError::Decode(..))` — a row failed to decode into its
     ///   compile-time shape; drained, stays healthy — LOUD, never swallowed.
     /// - `Err(DriverError::Db(..))` — a server error mid-stream; drained, healthy.
-    /// - `Err(DriverError::OversizeRow)` — a row exceeded the inline buffer; rows
-    ///   before it were delivered, then the classified error (never a truncation).
     /// - other `Err` — a fatal transport/protocol fault; the connection is dead.
+    ///
+    /// An oversize row (wider than the inline read buffer) is reassembled into a
+    /// reused scratch buffer and streamed to `on_row` exactly like an inline one
+    /// — constant memory (bounded by the widest oversize row), no size cap.
     ///
     /// A [`Break`](ControlFlow::Break) of a colossal result still reads the
     /// remaining rows to reach the clean idle boundary — O(remaining rows).

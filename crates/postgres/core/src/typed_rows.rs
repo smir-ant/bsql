@@ -27,6 +27,23 @@
 //! (text columns are `&str` aliases — zero-copy). [`Rows::into_owned`] pays one
 //! `Vec` plus one `String` per text cell, and only when it is called.
 //!
+//! # Oversize rows (bounded reassembly, small rows untouched)
+//!
+//! A row that fits one engine buffer fill arrives whole as [`Surface::Row`] and
+//! is appended to `wire` with a single `extend` — zero extra work, zero extra
+//! allocation. A row WIDER than the engine's inline read buffer
+//! (`READ_BUF_CAP` = 4096) cannot reside whole in that buffer, so the engine
+//! streams it as [`Surface::RowChunk`] pieces terminated by
+//! [`Surface::RowChunkEnd`]. [`RowsBuilder::feed`] REASSEMBLES those chunks by
+//! appending each one contiguously into the SAME `wire` buffer (exactly where a
+//! whole `Surface::Row` body would land) and recording one span at the
+//! terminator, so a reassembled oversize row becomes an ordinary `(offset, len)`
+//! span in `wire` indistinguishable from an inline row — it decodes through the
+//! identical [`TypedQuery::decode_borrowed`] path. Only an oversize row (rare +
+//! large) pays the per-chunk copy; the common small-row path is byte-identical
+//! to before. This mirrors the dynamic [`Row`](crate::Row) materialiser, which
+//! reassembles the same chunk stream into one contiguous `DataRow` body.
+//!
 //! [`Row`]: crate::Row
 
 use std::marker::PhantomData;
@@ -49,10 +66,11 @@ use crate::materialize::{parse_error_response, DbErrorSink};
 /// `{ offset: usize, len: usize }` slot cost — a 4× cut on a million-row result
 /// (4 MB vs 16 MB) — and there is no random-access row getter (the only readers
 /// are the two sequential walks), so the offset never needs to materialise. A
-/// whole `DataRow` payload is bounded by the inline frame buffer
-/// (`READ_BUF_CAP` = 4096; an oversize row streams as chunks and is flagged
-/// instead), so a per-row length fits a `u32` with headroom while the cumulative
-/// offset stays a full `usize`.
+/// per-row payload length fits a `u32`: an inline row is bounded by the engine's
+/// inline frame buffer (`READ_BUF_CAP` = 4096), and a REASSEMBLED oversize row
+/// (the chunk-streamed wide-row case) is bounded by the PostgreSQL `DataRow`
+/// message length field — a 4-byte signed integer, so under 2 GiB — both well
+/// within a `u32`, while the cumulative offset stays a full `usize`.
 type RowLen = u32;
 
 // The per-row span footprint: one `u32` length (4 B), down from the 16 B a
@@ -77,7 +95,15 @@ pub struct RowsBuilder {
     slots: Vec<RowLen>,
     affected: u64,
     db_error: Option<DbError>,
-    saw_oversize: bool,
+    /// Bytes appended to `wire` so far for the IN-PROGRESS oversize (chunk-
+    /// streamed) row, reset to 0 at each [`Surface::RowChunkEnd`]. It is 0
+    /// whenever no oversize row is mid-reassembly — the common all-small-rows
+    /// result never leaves it non-zero and never touches it. This is the ONLY
+    /// new footprint: one `usize` in the TRANSIENT builder, NOT in the returned
+    /// [`Rows<Q>`] (which still moves out only `wire` + `slots` + `affected`),
+    /// so the documented "2 allocations per result, 0 per row" of a `Rows<Q>`
+    /// is preserved exactly.
+    oversize_len: usize,
 }
 
 impl RowsBuilder {
@@ -94,20 +120,51 @@ impl RowsBuilder {
             Surface::Row(body) => {
                 self.wire.extend_from_slice(body);
                 // Record the payload LENGTH only; the byte offset is the running
-                // prefix-sum of prior lengths, reconstructed on the walk. A
-                // `DataRow` payload is bounded by the inline frame buffer
-                // (`READ_BUF_CAP` = 4096; an oversize row streams as `RowChunk`
-                // instead), so the narrow to `u32` is structurally infallible.
-                // The sink cannot return a `Result`, so the dead arm saturates
-                // rather than storing a wrong length: an (impossible) over-long
-                // body then over-runs `wire` at decode → a classified
-                // `TruncatedRow`, never a silent corruption of this or a later
-                // row's offset.
+                // prefix-sum of prior lengths, reconstructed on the walk. An
+                // inline row is bounded by the inline frame buffer
+                // (`READ_BUF_CAP` = 4096; an oversize row instead arrives as the
+                // `RowChunk` / `RowChunkEnd` pair below), so the narrow to `u32`
+                // is structurally infallible here. The sink cannot return a
+                // `Result`, so the dead arm saturates rather than storing a wrong
+                // length: an (impossible) over-long body then over-runs `wire` at
+                // decode → a classified `TruncatedRow`, never a silent corruption
+                // of this or a later row's offset.
                 let payload_len = match RowLen::try_from(body.len()) {
                     Ok(len) => len,
                     Err(_) => RowLen::MAX,
                 };
                 self.slots.push(payload_len);
+            }
+            // An oversize row (wider than `READ_BUF_CAP` = 4096) is streamed by
+            // the engine as `RowChunk` pieces terminated by `RowChunkEnd`.
+            // REASSEMBLE it into `wire` exactly where a whole `Surface::Row` body
+            // would land: append each chunk contiguously and accumulate the
+            // running length, so at the terminator the row is ONE contiguous
+            // span in `wire` indistinguishable from an inline row — it decodes
+            // through the identical `Q::decode_borrowed(row_body(..))` path. The
+            // small-row path above is untouched (this arm never runs for a row
+            // that fit one buffer fill).
+            Surface::RowChunk(bytes) => {
+                self.wire.extend_from_slice(bytes);
+                // Cumulative across the row's chunks, so a full `usize`;
+                // `saturating_add` never saturates in practice (the sum is the
+                // row's body length, under 2 GiB) and a dead saturation only
+                // over-records, failing CLOSED to a `TruncatedRow` at decode.
+                self.oversize_len = self.oversize_len.saturating_add(bytes.len());
+            }
+            Surface::RowChunkEnd => {
+                // The reassembled row is complete: record its total length as ONE
+                // span, then reset the accumulator so the NEXT row (small or
+                // oversize) starts clean. The `u32` narrow saturates only on a
+                // PostgreSQL-impossible > 4 GiB row to `RowLen::MAX`, which
+                // fails CLOSED to a classified `TruncatedRow` at decode, never a
+                // silent wrong length.
+                let payload_len = match RowLen::try_from(self.oversize_len) {
+                    Ok(len) => len,
+                    Err(_) => RowLen::MAX,
+                };
+                self.slots.push(payload_len);
+                self.oversize_len = 0;
             }
             Surface::Deliver { tag, .. } => {
                 // The affected-row count rides the command tag (`SELECT 3` →
@@ -118,11 +175,6 @@ impl RowsBuilder {
                 };
             }
             Surface::Fail(body) => self.db_error = Some(parse_error_response(body)),
-            // An oversize row streams as chunks. The bounded typed decoder needs
-            // one contiguous payload per row, so flag it for a classified
-            // `OversizeRow` after settle rather than reassembling — and never a
-            // silent truncation.
-            Surface::RowChunk(_) | Surface::RowChunkEnd => self.saw_oversize = true,
             // Asynchronous / COPY frames are not part of a typed row result.
             Surface::Notice(_)
             | Surface::Notify(_)
@@ -130,13 +182,6 @@ impl RowsBuilder {
             | Surface::CopyData(_)
             | Surface::CopyDone => {}
         }
-    }
-
-    /// Whether an oversize (chunk-streamed) row was observed — the driver maps
-    /// this to a classified [`DriverError::OversizeRow`](crate::DriverError::OversizeRow).
-    #[must_use]
-    pub fn saw_oversize(&self) -> bool {
-        self.saw_oversize
     }
 
     /// Stamp the row type and produce the finished [`Rows<Q>`]. Moves the

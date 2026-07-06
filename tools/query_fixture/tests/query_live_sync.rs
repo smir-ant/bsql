@@ -204,6 +204,26 @@ bsql::query!(
      LEFT JOIN oj_c USING (bk) ORDER BY oj_a.j"
 );
 
+// ── INBOUND OVERSIZE-ROW witness (see the async twin for the full rationale): a
+//    RESULT row WIDER than the engine's inline read buffer (READ_BUF_CAP = 4096)
+//    streams from PG as `RowChunk` pieces the typed path now REASSEMBLES and
+//    decodes identically to an inline row — at base each was a hard
+//    `DriverError::OversizeRow`. Function-derived columns type nullable.
+bsql::query!(OvBigText, "SELECT repeat('x', 5000)::text AS s");
+bsql::query!(OvBigJsonb, r#"SELECT ('"' || repeat('z', 6000) || '"')::jsonb AS j"#);
+bsql::query!(OvBigBytea, "SELECT decode(repeat('cd', 5000), 'hex')::bytea AS b");
+bsql::query!(
+    OvWideCols,
+    "SELECT repeat('a', 450)::text AS c1, repeat('b', 450)::text AS c2, \
+     repeat('c', 450)::text AS c3, repeat('d', 450)::text AS c4, \
+     repeat('e', 450)::text AS c5, repeat('f', 450)::text AS c6, \
+     repeat('g', 450)::text AS c7, repeat('h', 450)::text AS c8, \
+     repeat('i', 450)::text AS c9, repeat('j', 450)::text AS c10, \
+     repeat('k', 450)::text AS c11, repeat('l', 450)::text AS c12"
+);
+// `body` is TEXT NOT NULL, so it decodes NON-nullable; `k` pins the order.
+bsql::query!(OvRows, "SELECT body FROM ov_rows ORDER BY k");
+
 fn sync_config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
         .database("postgres".to_string())
@@ -1242,5 +1262,126 @@ fn merged_outer_join_null_round_trips_as_none() {
     );
 
     c.execute_sql("DROP TABLE oj_c, oj_b, oj_a").expect("cleanup");
+    c.close().expect("close");
+}
+
+/// INBOUND OVERSIZE (sync): a > 4 KiB TEXT result row streams as `RowChunk`
+/// pieces the typed path now REASSEMBLES — `query` (`iter` + `into_owned`) and
+/// `query_one` decode the exact 5000-byte value. At base each was a hard
+/// `DriverError::OversizeRow`.
+#[test]
+#[ignore = "requires local PG"]
+fn oversize_typed_text_row_reassembles() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    // The borrowed record aliases `rows`, so it is scoped closed before
+    // `into_owned` (the documented E0505 escape wall).
+    let rows = c.query::<OvBigTextQuery>(()).expect("query OvBigText");
+    assert_eq!(rows.len(), 1, "the oversize result is one row");
+    {
+        let rec = rows.iter().next().expect("one row").expect("row decodes");
+        let borrowed = rec.s.expect("text present");
+        assert_eq!(borrowed.len(), 5000, "borrowed > 4 KiB text reassembled contiguous");
+        assert!(borrowed.bytes().all(|b| b == b'x'), "every byte survived reassembly");
+    }
+    let owned = rows.into_owned().expect("into_owned");
+    let s_owned = owned[0].s.as_deref().expect("owned text present");
+    assert_eq!(s_owned.len(), 5000, "owned reassembled text length");
+    assert!(s_owned.bytes().all(|b| b == b'x'), "owned bytes intact");
+
+    let one = c.query_one::<OvBigTextQuery>(()).expect("query_one OvBigText");
+    let s = one.s.expect("query_one text present");
+    assert_eq!(s.len(), 5000, "query_one reassembles the oversize row");
+    assert!(s.bytes().all(|b| b == b'x'));
+
+    c.close().expect("close");
+}
+
+/// INBOUND OVERSIZE (sync): a > 4 KiB JSONB and a > 4 KiB BYTEA column each
+/// reassemble and round-trip their exact value through `query_one`.
+#[test]
+#[ignore = "requires local PG"]
+fn oversize_typed_jsonb_and_bytea_reassemble() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    let jb = c.query_one::<OvBigJsonbQuery>(()).expect("query_one OvBigJsonb");
+    let j = jb.j.expect("jsonb present");
+    assert_eq!(j.as_str().len(), 6002, "> 4 KiB jsonb reassembled");
+    assert!(j.as_str().starts_with('"') && j.as_str().ends_with('"'));
+    assert!(j.as_str()[1..6001].bytes().all(|b| b == b'z'), "jsonb payload intact");
+
+    let bt = c.query_one::<OvBigByteaQuery>(()).expect("query_one OvBigBytea");
+    let bytes = bt.b.expect("bytea present");
+    assert_eq!(bytes.len(), 5000, "> 4 KiB bytea reassembled");
+    assert!(bytes.iter().all(|&x| x == 0xCD), "every bytea byte survived reassembly");
+
+    c.close().expect("close");
+}
+
+/// INBOUND OVERSIZE (sync): a row made oversize by MANY columns (none itself
+/// over 4 KiB) reassembles — the width comes from column count, not one fat cell.
+#[test]
+#[ignore = "requires local PG"]
+fn oversize_typed_wide_many_columns_reassembles() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let r = c.query_one::<OvWideColsQuery>(()).expect("query_one OvWideCols");
+    for (field, ch) in [
+        (r.c1, b'a'), (r.c2, b'b'), (r.c3, b'c'), (r.c4, b'd'),
+        (r.c5, b'e'), (r.c6, b'f'), (r.c7, b'g'), (r.c8, b'h'),
+        (r.c9, b'i'), (r.c10, b'j'), (r.c11, b'k'), (r.c12, b'l'),
+    ] {
+        let s = field.expect("wide column present");
+        assert_eq!(s.len(), 450, "each column intact after reassembly");
+        assert!(s.bytes().all(|b| b == ch), "each column's bytes unshuffled");
+    }
+    c.close().expect("close");
+}
+
+/// INBOUND OVERSIZE (sync): the MULTI-ROW reassembly cases over a real table —
+/// an oversize row FOLLOWED by a small one (buffer must RESET), MULTIPLE
+/// oversize rows, and `query_each` streaming a reassembled oversize row. Single
+/// test (serial) so the shared `ov_rows` table cannot race a parallel sibling.
+#[test]
+#[ignore = "requires local PG"]
+fn oversize_typed_multirow_reassembly_over_table() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute_sql("DROP TABLE IF EXISTS ov_rows").expect("drop residue");
+    c.execute_sql("CREATE TABLE ov_rows (k INTEGER NOT NULL, body TEXT NOT NULL)")
+        .expect("create ov_rows");
+
+    // Scenario A — oversize (k=1) THEN small (k=2): the accumulator must reset.
+    c.execute_sql("INSERT INTO ov_rows (k, body) VALUES (1, repeat('x', 5000)), (2, 'small')")
+        .expect("insert oversize-then-small");
+    let rows = c.query::<OvRowsQuery>(()).expect("query OvRows (A)");
+    let lens: Vec<usize> = rows.iter().map(|r| r.expect("decodes").body.len()).collect();
+    assert_eq!(lens, vec![5000, 5], "oversize row then small row; buffer reset");
+    let owned = rows.into_owned().expect("into_owned (A)");
+    assert!(owned[0].body.bytes().all(|b| b == b'x'), "oversize row bytes intact");
+    assert_eq!(owned[1].body, "small", "the small row after an oversize row is clean");
+
+    let mut streamed: Vec<usize> = Vec::new();
+    c.query_each::<OvRowsQuery, _, ()>((), |rec| {
+        streamed.push(rec.body.len());
+        ControlFlow::Continue(())
+    })
+    .expect("query_each OvRows (A)");
+    assert_eq!(streamed, vec![5000, 5], "query_each reassembles the oversize row and resets");
+
+    // Scenario B — MULTIPLE oversize rows; the accumulator resets between them.
+    c.execute_sql("TRUNCATE ov_rows").expect("truncate");
+    c.execute_sql("INSERT INTO ov_rows (k, body) VALUES (1, repeat('x', 5000)), (2, repeat('y', 6000))")
+        .expect("insert two oversize");
+    let owned = c
+        .query::<OvRowsQuery>(())
+        .expect("query OvRows (B)")
+        .into_owned()
+        .expect("into_owned (B)");
+    assert_eq!(owned.len(), 2, "two oversize rows");
+    assert_eq!(owned[0].body.len(), 5000);
+    assert!(owned[0].body.bytes().all(|b| b == b'x'), "first oversize row intact");
+    assert_eq!(owned[1].body.len(), 6000);
+    assert!(owned[1].body.bytes().all(|b| b == b'y'), "second oversize row intact");
+
+    c.execute_sql("DROP TABLE ov_rows").expect("cleanup");
     c.close().expect("close");
 }

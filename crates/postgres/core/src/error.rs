@@ -194,11 +194,6 @@ pub enum DriverError {
     /// connection — it is a value returned to the caller, never a silent
     /// default.
     Decode(DecodeError),
-    /// A typed `query!` result carried a row that exceeded the engine's inline
-    /// buffer and was streamed in chunks. The bounded typed decoder needs one
-    /// contiguous payload per row, so an oversize row is a classified error
-    /// rather than a silently truncated or reassembled record.
-    OversizeRow,
     /// A typed `query_one` matched MORE than one row. The exactly-one contract
     /// rejects a multi-row result loudly rather than silently returning the
     /// first row (which would mask a query that is not as selective as the
@@ -256,7 +251,6 @@ impl fmt::Display for DriverError {
             Self::SpuriousPending => write!(f, "single-poll executor: engine future returned Pending over a blocking transport"),
             Self::RowDecodeFailed => write!(f, "server DataRow did not match its declared column framing"),
             Self::Decode(e) => write!(f, "typed row decode failed: {e}"),
-            Self::OversizeRow => write!(f, "typed query result carried an oversize row that exceeds the bounded decoder's contiguous-payload requirement"),
             Self::TooManyRows => write!(f, "query_one matched more than one row"),
             Self::PoolTimeout => write!(f, "timed out acquiring a pooled connection; the pool is exhausted"),
             Self::Column(e) => write!(f, "{e}"),
@@ -294,7 +288,6 @@ impl std::error::Error for DriverError {
             | Self::Timeout
             | Self::SpuriousPending
             | Self::RowDecodeFailed
-            | Self::OversizeRow
             | Self::TooManyRows
             | Self::PoolTimeout
             | Self::PayloadParse(_) => None,
