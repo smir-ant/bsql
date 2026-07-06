@@ -24,7 +24,7 @@
 //! let mut conn = fake.connect().await?;
 //! let result = conn.query_sql("SELECT id FROM users").await?;
 //!
-//! assert_eq!(result.rows.len(), 2);
+//! assert_eq!(result.len(), 2);
 //! # Ok(())
 //! # }
 //! ```

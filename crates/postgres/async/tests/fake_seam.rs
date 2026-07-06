@@ -100,9 +100,9 @@ async fn connect_and_query_over_the_fake_with_no_socket() {
         .await
         .expect("query the fake");
 
-    assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.rows[0].get_i64(0), Ok(Some(1)));
-    assert_eq!(result.rows[1].get_i64(0), Ok(Some(2)));
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
+    assert_eq!(result.get(1).expect("row 1").get_i64(0), Ok(Some(2)));
     assert_eq!(result.command_tag, "SELECT 2");
 }
 
@@ -167,7 +167,7 @@ async fn a_query_after_a_failed_extended_op_returns_its_rows_on_the_same_connect
         .query_sql("SELECT id FROM users")
         .await
         .expect("the reused connection must return the scripted rows");
-    assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.rows[0].get_i64(0), Ok(Some(1)));
-    assert_eq!(result.rows[1].get_i64(0), Ok(Some(2)));
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
+    assert_eq!(result.get(1).expect("row 1").get_i64(0), Ok(Some(2)));
 }

@@ -290,11 +290,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             Some(names) => names,
             None => Arc::from(collected.column_names.into_boxed_slice()),
         };
-        Ok(QueryResult {
-            rows: collected.rows,
-            command_tag: collected.command_tag,
-            column_names,
-        })
+        Ok(QueryResult::new(collected.rows, collected.command_tag, column_names))
     }
 
     // ── Runtime-SQL verbs ───────────────────────────────────────────────────
@@ -375,18 +371,16 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     }
 
     /// Run a runtime-SQL query returning the first row, or [`DriverError::NoRows`].
+    ///
+    /// Mints EXACTLY one [`Row`](crate::Row) handle ([`QueryResult::get`]) — a
+    /// single `Arc` refcount bump — never the whole result's worth of handles.
     pub async fn query_one_sql(&mut self, sql: &str) -> Result<crate::Row, DriverError> {
-        self.query_sql(sql)
-            .await?
-            .rows
-            .into_iter()
-            .next()
-            .ok_or(DriverError::NoRows)
+        self.query_sql(sql).await?.get(0).ok_or(DriverError::NoRows)
     }
 
     /// Run a runtime-SQL query returning the first row if any.
     pub async fn query_opt(&mut self, sql: &str) -> Result<Option<crate::Row>, DriverError> {
-        Ok(self.query_sql(sql).await?.rows.into_iter().next())
+        Ok(self.query_sql(sql).await?.get(0))
     }
 
     /// Prepare a statement: `Parse` + `Describe` + `Sync`, recovering the result
@@ -513,12 +507,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         sql: &str,
         params: &P,
     ) -> Result<crate::Row, DriverError> {
-        self.query_params(sql, params)
-            .await?
-            .rows
-            .into_iter()
-            .next()
-            .ok_or(DriverError::NoRows)
+        self.query_params(sql, params).await?.get(0).ok_or(DriverError::NoRows)
     }
 
     /// Like [`query_params`](Self::query_params), returning the first row if any.
@@ -527,7 +516,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         sql: &str,
         params: &P,
     ) -> Result<Option<crate::Row>, DriverError> {
-        Ok(self.query_params(sql, params).await?.rows.into_iter().next())
+        Ok(self.query_params(sql, params).await?.get(0))
     }
 
     /// Run a one-shot runtime-SQL command with params in ONE round trip,

@@ -47,7 +47,7 @@ fn runtime() -> Runtime {
 /// Read every column of a bsql `(id int4, name text, val int4)` result.
 fn read_select_bsql(qr: &bsql::pg::QueryResult) -> i64 {
     let mut acc = 0_i64;
-    for row in &qr.rows {
+    for row in qr.iter() {
         let id = row.get_i32(0).expect("id decodes");
         let name = row.get_str(1).expect("name decodes");
         let val = row.get_i32(2).expect("val decodes");
@@ -62,7 +62,7 @@ fn read_select_bsql(qr: &bsql::pg::QueryResult) -> i64 {
 /// Read every column of a bsql `(label text, count int8, sum int8)` result.
 fn read_agg_bsql(qr: &bsql::pg::QueryResult) -> i64 {
     let mut acc = 0_i64;
-    for row in &qr.rows {
+    for row in qr.iter() {
         let label = row.get_str(0).expect("label decodes");
         let cnt = row.get_i64(1).expect("count decodes");
         let sm = row.get_i64(2).expect("sum decodes");

@@ -122,7 +122,7 @@ fn slow_query_beyond_connect_timeout_survives() {
     let slept = c
         .query_sql("SELECT pg_sleep(3)")
         .expect("a query slower than connect_timeout must succeed, not kill the connection");
-    assert_eq!(slept.rows.len(), 1, "pg_sleep returns exactly one (void) row");
+    assert_eq!(slept.len(), 1, "pg_sleep returns exactly one (void) row");
     assert!(c.is_healthy(), "connection stays healthy after a slow query");
 
     // And it stays usable: a second query round-trips on the same connection.
@@ -313,9 +313,9 @@ fn runtime_path_binds_non_copy_params() {
 fn streaming_1k_rows() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     let r = c.query_sql("SELECT generate_series(1, 1000)").expect("query");
-    assert_eq!(r.rows.len(), 1000);
-    assert_eq!(r.rows[0].get_i32(0), Ok(Some(1)));
-    assert_eq!(r.rows[999].get_i32(0), Ok(Some(1000)));
+    assert_eq!(r.len(), 1000);
+    assert_eq!(r.get(0).expect("row 0").get_i32(0), Ok(Some(1)));
+    assert_eq!(r.get(999).expect("row 999").get_i32(0), Ok(Some(1000)));
     c.close().expect("close");
 }
 
@@ -330,25 +330,25 @@ fn dynamic_getter_classifies_null_and_decode_error_over_the_wire() {
     // `is_null`. This proves the typed getter classifies NULL as a present-but-
     // absent value, never conflated with a decode failure or out-of-range.
     let r = c.query_sql("SELECT NULL::int4").expect("null query");
-    assert_eq!(r.rows[0].get_i32(0), Ok(None));
-    assert!(r.rows[0].is_null(0));
+    assert_eq!(r.get(0).expect("row 0").get_i32(0), Ok(None));
+    assert!(r.get(0).expect("row 0").is_null(0));
 
     // (2) An `i32` read of genuinely non-numeric text ('x') is a classified `Err`
     // over the real wire — exactly the failure the retired `.parse().ok()` hid as
     // a silent `None`. Assert the EXACT classified variant, not `.is_err()`.
     let r = c.query_sql("SELECT 'x'::text").expect("text query");
     assert_eq!(
-        r.rows[0].get_i32(0),
+        r.get(0).expect("row 0").get_i32(0),
         Err(ColumnError::Decode(DecodeError::IntParse)),
     );
     // A `bool` read of the same non-bool text classifies too (`BoolParse`),
     // proving the classification holds across decoders on the real wire.
     assert_eq!(
-        r.rows[0].get_bool(0),
+        r.get(0).expect("row 0").get_bool(0),
         Err(ColumnError::Decode(DecodeError::BoolParse)),
     );
     // Read as text the same column is a legitimate value — text is text.
-    assert_eq!(r.rows[0].get_str(0), Ok(Some("x")));
+    assert_eq!(r.get(0).expect("row 0").get_str(0), Ok(Some("x")));
 
     c.close().expect("close");
 }
@@ -358,8 +358,8 @@ fn dynamic_getter_classifies_null_and_decode_error_over_the_wire() {
 fn streaming_10k_rows() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     let r = c.query_sql("SELECT generate_series(1, 10000)").expect("query");
-    assert_eq!(r.rows.len(), 10000);
-    assert_eq!(r.rows[9999].get_i32(0), Ok(Some(10000)));
+    assert_eq!(r.len(), 10000);
+    assert_eq!(r.get(9999).expect("row 9999").get_i32(0), Ok(Some(10000)));
     c.close().expect("close");
 }
 
@@ -376,7 +376,7 @@ fn error_recovery_and_resilience() {
     // Full CRUD still works
     c.execute_sql("CREATE TEMP TABLE resilience(v int)").expect("create");
     c.execute_sql("INSERT INTO resilience VALUES (42)").expect("insert");
-    assert_eq!(c.query_sql("SELECT v FROM resilience").expect("select").rows[0].get_i32(0), Ok(Some(42)));
+    assert_eq!(c.query_sql("SELECT v FROM resilience").expect("select").get(0).expect("row 0").get_i32(0), Ok(Some(42)));
     c.close().expect("close");
 }
 
@@ -396,7 +396,7 @@ fn recv_notification_failed_read_timeout_does_not_strand_the_token() {
     );
     // Prove it is genuinely reusable after the rejected timeout.
     c.ping().expect("connection still usable");
-    assert_eq!(c.query_sql("SELECT 5::int4").expect("query").rows[0].get_i32(0), Ok(Some(5)));
+    assert_eq!(c.query_sql("SELECT 5::int4").expect("query").get(0).expect("row 0").get_i32(0), Ok(Some(5)));
     c.close().expect("close");
 }
 
@@ -407,7 +407,7 @@ fn client_encoding_pinned_to_utf8_and_roundtrips_non_ascii() {
     // TEXT decode is correct regardless of the server's default encoding.
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    let enc = c.query_sql("SHOW client_encoding").expect("show").rows[0]
+    let enc = c.query_sql("SHOW client_encoding").expect("show").get(0).expect("row 0")
         .get_str(0)
         .expect("client_encoding decodes")
         .map(String::from);
@@ -416,7 +416,7 @@ fn client_encoding_pinned_to_utf8_and_roundtrips_non_ascii() {
     // Non-ASCII (Cyrillic + emoji) round-trips byte-exact under the pinned UTF-8.
     let text = "Привет, мир 🌍";
     let r = c.query_sql(&format!("SELECT '{text}'::text")).expect("query");
-    assert_eq!(r.rows[0].get_str(0), Ok(Some(text)));
+    assert_eq!(r.get(0).expect("row 0").get_str(0), Ok(Some(text)));
     c.close().expect("close");
 }
 
@@ -437,15 +437,15 @@ fn mixed_width_multi_statement_is_rejected_not_misaddressed() {
     // client-side result shape is rejected, so the connection stays reusable.
     assert!(c.is_healthy(), "connection stays healthy after a rejected result shape");
     assert_eq!(
-        c.query_sql("SELECT 7::int4").expect("follow-up query works").rows[0].get_i32(0),
+        c.query_sql("SELECT 7::int4").expect("follow-up query works").get(0).expect("row 0").get_i32(0),
         Ok(Some(7)),
     );
 
     // A UNIFORM-width multi-statement batch is fine.
     let uniform = c.query_sql("SELECT 1::int4; SELECT 2::int4").expect("uniform batch");
-    assert_eq!(uniform.rows.len(), 2);
-    assert_eq!(uniform.rows[0].get_i32(0), Ok(Some(1)));
-    assert_eq!(uniform.rows[1].get_i32(0), Ok(Some(2)));
+    assert_eq!(uniform.len(), 2);
+    assert_eq!(uniform.get(0).expect("row 0").get_i32(0), Ok(Some(1)));
+    assert_eq!(uniform.get(1).expect("row 1").get_i32(0), Ok(Some(2)));
     c.close().expect("close");
 }
 
@@ -494,7 +494,7 @@ fn copy_in_rejects_injection_and_accepts_schema_qualified() {
     // A schema-qualified `schema.table` is accepted.
     assert_eq!(c.copy_in("pg_temp.cp_inj", vec!["3"]).expect("schema-qualified copy"), 1);
     assert_eq!(
-        c.query_sql("SELECT count(*) FROM cp_inj").expect("count").rows[0].get_i64(0),
+        c.query_sql("SELECT count(*) FROM cp_inj").expect("count").get(0).expect("row 0").get_i64(0),
         Ok(Some(3)),
     );
     c.close().expect("close");
@@ -509,7 +509,7 @@ fn prepared_reuse_after_constraint_violation() {
     c.execute_prepared(&stmt, &(1i32,)).expect("insert 1");
     assert!(c.execute_prepared(&stmt, &(1i32,)).is_err());
     c.execute_prepared(&stmt, &(2i32,)).expect("insert 2 after error");
-    assert_eq!(c.query_sql("SELECT count(*) FROM pr_err").expect("count").rows[0].get_i64(0), Ok(Some(2)));
+    assert_eq!(c.query_sql("SELECT count(*) FROM pr_err").expect("count").get(0).expect("row 0").get_i64(0), Ok(Some(2)));
     c.close_statement(stmt).expect("close stmt");
     c.close().expect("close");
 }
@@ -553,7 +553,7 @@ fn notify_interleaved_with_a_query_is_captured_not_dropped() {
     notifier.simple_query("NOTIFY bsql_sync_interleave_ch, 'mid-query'").expect("notify");
 
     let r = listener.query_sql("SELECT 1::int4").expect("query");
-    assert_eq!(r.rows[0].get_i32(0), Ok(Some(1)));
+    assert_eq!(r.get(0).expect("row 0").get_i32(0), Ok(Some(1)));
 
     assert!(
         listener.buffered_notifications() >= 1,
@@ -576,7 +576,7 @@ fn reset_session_clears_the_notification_ledger() {
     listener.listen("bsql_sync_reset_ch").expect("listen");
     notifier.simple_query("NOTIFY bsql_sync_reset_ch, 'prior-user'").expect("notify");
     let r = listener.query_sql("SELECT 1::int4").expect("query"); // captures the notify
-    assert_eq!(r.rows[0].get_i32(0), Ok(Some(1)));
+    assert_eq!(r.get(0).expect("row 0").get_i32(0), Ok(Some(1)));
     assert!(listener.buffered_notifications() >= 1, "captured before reset");
 
     listener.reset_session().expect("reset");
@@ -602,7 +602,7 @@ fn pool() {
         let p = pool.clone();
         std::thread::spawn(move || {
             let mut conn = p.get().expect("get");
-            assert_eq!(conn.conn_mut().expect("live").query_sql(&format!("SELECT {i}::int")).expect("q").rows[0].get_i32(0), Ok(Some(i as i32)));
+            assert_eq!(conn.conn_mut().expect("live").query_sql(&format!("SELECT {i}::int")).expect("q").get(0).expect("row 0").get_i32(0), Ok(Some(i as i32)));
         })
     }).collect();
     for h in handles { h.join().expect("thread"); }
@@ -629,16 +629,16 @@ fn pool_reset_on_return_no_bleed() {
     let mut c = pool.get().expect("get2");
     let conn = c.conn_mut().expect("live2");
     assert_eq!(conn.backend_pid(), pid1, "max_size=1 must reuse the SAME physical connection");
-    let sp = conn.query_sql("SHOW search_path").expect("show").rows[0]
+    let sp = conn.query_sql("SHOW search_path").expect("show").get(0).expect("row 0")
         .get_str(0).expect("search_path decodes").map(String::from);
     assert_ne!(sp.as_deref(), Some("pg_temp"), "search_path GUC bled across checkout");
     let n = conn.query_sql("SELECT count(*) FROM pg_tables WHERE tablename='bleed_probe'")
-        .expect("tmp").rows[0].get_i64(0).expect("count decodes");
+        .expect("tmp").get(0).expect("row 0").get_i64(0).expect("count decodes");
     assert_eq!(n, Some(0), "temp table bled across checkout");
     // LISTEN channel gone (UNLISTEN * ran in the reset).
     let listening = conn
         .query_sql("SELECT count(*)::int8 FROM pg_listening_channels() AS c(chan) WHERE chan='bleed_chan'")
-        .expect("listen check").rows[0].get_i64(0).expect("listen count decodes");
+        .expect("listen check").get(0).expect("row 0").get_i64(0).expect("listen count decodes");
     assert_eq!(listening, Some(0), "LISTEN channel bled across checkout");
 }
 
@@ -689,12 +689,12 @@ fn transaction_closure() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     c.execute_sql("CREATE TEMP TABLE tx(v int)").expect("create");
     c.transaction(|tx| { tx.execute_sql("INSERT INTO tx VALUES (1)")?; Ok(()) }).expect("commit");
-    assert_eq!(c.query_sql("SELECT count(*) FROM tx").expect("c").rows[0].get_i64(0), Ok(Some(1)));
+    assert_eq!(c.query_sql("SELECT count(*) FROM tx").expect("c").get(0).expect("row 0").get_i64(0), Ok(Some(1)));
     let _: Result<(), _> = c.transaction(|tx| {
         tx.execute_sql("INSERT INTO tx VALUES (2)")?;
         Err(bsql_postgres_sync::DriverError::NoRows)
     });
-    assert_eq!(c.query_sql("SELECT count(*) FROM tx").expect("c").rows[0].get_i64(0), Ok(Some(1)));
+    assert_eq!(c.query_sql("SELECT count(*) FROM tx").expect("c").get(0).expect("row 0").get_i64(0), Ok(Some(1)));
     c.close().expect("close");
 }
 
@@ -719,7 +719,7 @@ fn transaction_fusion_empty_and_extended() {
     // stand-alone statement autocommits).
     c.execute_sql("INSERT INTO txf VALUES (7)").expect("post-empty insert");
     assert_eq!(
-        c.query_sql("SELECT count(*) FROM txf").expect("c").rows[0].get_i64(0),
+        c.query_sql("SELECT count(*) FROM txf").expect("c").get(0).expect("row 0").get_i64(0),
         Ok(Some(1))
     );
 
@@ -736,7 +736,7 @@ fn transaction_fusion_empty_and_extended() {
         .expect("extended-first tx commits");
     assert_eq!(fused, Some(42), "the fused extended statement decoded correctly");
     assert_eq!(
-        c.query_sql("SELECT count(*) FROM txf").expect("c").rows[0].get_i64(0),
+        c.query_sql("SELECT count(*) FROM txf").expect("c").get(0).expect("row 0").get_i64(0),
         Ok(Some(2)),
         "the committed insert persisted"
     );
@@ -748,7 +748,7 @@ fn transaction_fusion_empty_and_extended() {
         Err(bsql_postgres_sync::DriverError::NoRows)
     });
     assert_eq!(
-        c.query_sql("SELECT count(*) FROM txf").expect("c").rows[0].get_i64(0),
+        c.query_sql("SELECT count(*) FROM txf").expect("c").get(0).expect("row 0").get_i64(0),
         Ok(Some(2)),
         "the rolled-back insert did not persist"
     );
@@ -780,7 +780,7 @@ fn transaction_panic_before_first_statement_is_cleared_by_reset() {
     c.reset_session().expect("reset clears the stranded prelude and succeeds");
     // The next statement flushes only itself (no fused stale BEGIN) and works.
     assert_eq!(
-        c.query_sql("SELECT 1::int").expect("q").rows[0].get_i32(0),
+        c.query_sql("SELECT 1::int").expect("q").get(0).expect("row 0").get_i32(0),
         Ok(Some(1))
     );
     c.close().expect("close");
@@ -790,7 +790,7 @@ fn transaction_panic_before_first_statement_is_cleared_by_reset() {
 #[ignore = "requires local PG"]
 fn row_clone_across_threads() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    let row = c.query_sql("SELECT 42::int, 'hello'::text").expect("q").rows[0].clone();
+    let row = c.query_sql("SELECT 42::int, 'hello'::text").expect("q").get(0).expect("row 0");
     let handle = std::thread::spawn(move || row.get_i32(0).expect("i32 decodes"));
     assert_eq!(handle.join().expect("thread"), Some(42));
     c.close().expect("close");
@@ -842,7 +842,7 @@ fn pool_stress_100_tasks() {
         std::thread::spawn(move || {
             let mut c = p.get().expect("get");
             let r = c.conn_mut().expect("live").query_sql(&format!("SELECT {i}::int, pg_backend_pid()")).expect("q");
-            assert_eq!(r.rows[0].get_i32(0), Ok(Some(i as i32)));
+            assert_eq!(r.get(0).expect("row 0").get_i32(0), Ok(Some(i as i32)));
         })
     }).collect();
     let mut ok = 0u32;
@@ -872,16 +872,16 @@ fn one_connection_everything() {
 
     // Query
     let r = c.query_sql("SELECT count(*) FROM omni").expect("count");
-    assert_eq!(r.rows[0].get_i64(0), Ok(Some(4)));
+    assert_eq!(r.get(0).expect("row 0").get_i64(0), Ok(Some(4)));
 
     // Query with params
     let r = c.query_params("SELECT name FROM omni WHERE val > $1 ORDER BY val", &(15i32,)).expect("qp");
-    assert_eq!(r.rows.len(), 3); // b, c, d
+    assert_eq!(r.len(), 3); // b, c, d
 
     // Prepared
     let stmt = c.prepare("SELECT name, val FROM omni WHERE active = $1 ORDER BY val").expect("prep");
     let r = c.query_prepared(&stmt, &(true,)).expect("qprep");
-    assert_eq!(r.rows.len(), 3); // a, c, d
+    assert_eq!(r.len(), 3); // a, c, d
     c.close_statement(stmt).expect("close stmt");
 
     // Transaction
@@ -891,7 +891,7 @@ fn one_connection_everything() {
     }).expect("tx");
     let r = c.query_sql("SELECT SUM(val) FROM omni").expect("sum");
     // a:20 + b:20(unchanged) + c:60 + d:80 = 180
-    assert_eq!(r.rows[0].get_i64(0), Ok(Some(180)));
+    assert_eq!(r.get(0).expect("row 0").get_i64(0), Ok(Some(180)));
 
     // Error + recovery
     assert!(c.query_sql("SELECT * FROM nonexistent").is_err());
@@ -906,7 +906,7 @@ fn one_connection_everything() {
     assert_eq!(&*r.column_names, &["id", "name", "val"]);
 
     // Row clone across thread
-    let row = c.query_sql("SELECT 'final'::text").expect("q").rows[0].clone();
+    let row = c.query_sql("SELECT 'final'::text").expect("q").get(0).expect("row 0");
     let v = std::thread::spawn(move || row.get_str(0).expect("final decodes").map(String::from)).join().expect("thread");
     assert_eq!(v, Some("final".to_string()));
 
@@ -921,11 +921,11 @@ fn wide_columns() {
         let cols: Vec<String> = (0..n).map(|i| format!("{i}::int AS col_{i}")).collect();
         let sql = format!("SELECT {}", cols.join(", "));
         let r = c.query_sql(&sql).unwrap_or_else(|e| panic!("{n} cols failed: {e}"));
-        assert_eq!(r.rows.len(), 1, "rows at {n} cols");
+        assert_eq!(r.len(), 1, "rows at {n} cols");
         assert_eq!(r.column_names.len(), usize::try_from(n).unwrap(), "col names at {n}");
-        assert_eq!(r.rows[0].get_i32(0), Ok(Some(0)), "first col at {n}");
+        assert_eq!(r.get(0).expect("row 0").get_i32(0), Ok(Some(0)), "first col at {n}");
         let last = usize::try_from(n.saturating_sub(1)).unwrap();
-        assert_eq!(r.rows[0].get_i32(last), Ok(Some(n.saturating_sub(1) as i32)), "last col at {n}");
+        assert_eq!(r.get(0).expect("row 0").get_i32(last), Ok(Some(n.saturating_sub(1) as i32)), "last col at {n}");
     }
     c.close().expect("close");
 }
@@ -945,14 +945,14 @@ fn prepared_statement_edge_cases() {
     for i in 0..50i32 {
         c.execute_prepared(&stmt, &(i, format!("v{i}").as_str())).expect("exec");
     }
-    assert_eq!(c.query_sql("SELECT count(*) FROM ps_edge").expect("c").rows[0].get_i64(0), Ok(Some(50)));
+    assert_eq!(c.query_sql("SELECT count(*) FROM ps_edge").expect("c").get(0).expect("row 0").get_i64(0), Ok(Some(50)));
     c.close_statement(stmt).expect("close");
 
     // Prepare SELECT, query many times
     let stmt = c.prepare("SELECT v FROM ps_edge WHERE id = $1").expect("prep select");
     for i in 0..50i32 {
         let r = c.query_prepared(&stmt, &(i,)).expect("qp");
-        assert_eq!(r.rows[0].get_str(0), Ok(Some(format!("v{i}").as_str())));
+        assert_eq!(r.get(0).expect("row 0").get_str(0), Ok(Some(format!("v{i}").as_str())));
     }
     c.close_statement(stmt).expect("close");
 
@@ -961,12 +961,12 @@ fn prepared_statement_edge_cases() {
     let s2 = c.prepare("SELECT v FROM ps_edge WHERE id = $1").expect("s2");
     let s3 = c.prepare("UPDATE ps_edge SET v = $1 WHERE id = $2").expect("s3");
     let r1 = c.query_prepared(&s1, &(5i32,)).expect("q1");
-    assert_eq!(r1.rows.len(), 5);
+    assert_eq!(r1.len(), 5);
     let r2 = c.query_prepared(&s2, &(0i32,)).expect("q2");
-    assert_eq!(r2.rows[0].get_str(0), Ok(Some("v0")));
+    assert_eq!(r2.get(0).expect("row 0").get_str(0), Ok(Some("v0")));
     c.execute_prepared(&s3, &("updated", 0i32)).expect("exec3");
     let r2b = c.query_prepared(&s2, &(0i32,)).expect("q2b");
-    assert_eq!(r2b.rows[0].get_str(0), Ok(Some("updated")));
+    assert_eq!(r2b.get(0).expect("row 0").get_str(0), Ok(Some("updated")));
     c.close_statement(s1).expect("close s1");
     c.close_statement(s2).expect("close s2");
     c.close_statement(s3).expect("close s3");
@@ -990,7 +990,7 @@ fn copy_in_edge_cases() {
     // COPY 0 rows
     c.execute_sql("CREATE TEMP TABLE cp_edge(id int, name text)").expect("create");
     assert_eq!(c.copy_in("cp_edge", Vec::<&str>::new()).expect("empty"), 0);
-    assert_eq!(c.query_sql("SELECT count(*) FROM cp_edge").expect("c").rows[0].get_i64(0), Ok(Some(0)));
+    assert_eq!(c.query_sql("SELECT count(*) FROM cp_edge").expect("c").get(0).expect("row 0").get_i64(0), Ok(Some(0)));
 
     // COPY 1 row
     assert_eq!(c.copy_in("cp_edge", vec!["1\tone"]).expect("one"), 1);
@@ -1001,7 +1001,7 @@ fn copy_in_edge_cases() {
     // COPY many rows
     let big: Vec<String> = (0..5000).map(|i| format!("{i}\tname_{i}")).collect();
     assert_eq!(c.copy_in("cp_edge", &big).expect("5k"), 5000);
-    assert_eq!(c.query_sql("SELECT count(*) FROM cp_edge").expect("c").rows[0].get_i64(0), Ok(Some(5002)));
+    assert_eq!(c.query_sql("SELECT count(*) FROM cp_edge").expect("c").get(0).expect("row 0").get_i64(0), Ok(Some(5002)));
 
     // COPY into a non-existent table on the SAME connection that just ran three
     // successful COPYs: the server never enters copy mode (it sends ErrorResponse
@@ -1021,7 +1021,7 @@ fn copy_in_edge_cases() {
     // The SAME connection is reusable: a follow-up query works and still sees the
     // rows the successful COPYs committed (the failed COPY committed nothing).
     assert_eq!(
-        c.query_sql("SELECT count(*) FROM cp_edge").expect("count").rows[0].get_i64(0),
+        c.query_sql("SELECT count(*) FROM cp_edge").expect("count").get(0).expect("row 0").get_i64(0),
         Ok(Some(5002)),
     );
     c.ping().expect("ping recovers on the same connection");
@@ -1037,35 +1037,35 @@ fn streaming_edge_cases() {
     // 0 rows streaming (query returns no DataRow)
     c.execute_sql("CREATE TEMP TABLE empty_stream(v int)").expect("create");
     let r = c.query_sql("SELECT * FROM empty_stream").expect("empty");
-    assert_eq!(r.rows.len(), 0);
+    assert_eq!(r.len(), 0);
 
     // 1 row streaming
     c.execute_sql("INSERT INTO empty_stream VALUES (42)").expect("ins");
     let r = c.query_sql("SELECT * FROM empty_stream").expect("one");
-    assert_eq!(r.rows.len(), 1);
-    assert_eq!(r.rows[0].get_i32(0), Ok(Some(42)));
+    assert_eq!(r.len(), 1);
+    assert_eq!(r.get(0).expect("row 0").get_i32(0), Ok(Some(42)));
 
     // Large value via SQL literal (params limited to 1024 bytes)
     let big_val = "X".repeat(50_000);
     c.execute_sql("CREATE TEMP TABLE big_val(v text)").expect("create");
     c.execute_sql(&format!("INSERT INTO big_val VALUES ('{big_val}')")).expect("ins");
     let r = c.query_sql("SELECT v FROM big_val").expect("q");
-    assert_eq!(r.rows[0].get_str(0).expect("big_val decodes").map(|s| s.len()), Some(50_000));
+    assert_eq!(r.get(0).expect("row 0").get_str(0).expect("big_val decodes").map(|s| s.len()), Some(50_000));
 
     // Many columns with NULLs
     let r = c.query_sql("SELECT NULL::int, 1::int, NULL::text, 'a'::text, NULL::bool, true").expect("mixed nulls");
-    assert!(r.rows[0].is_null(0));
-    assert_eq!(r.rows[0].get_i32(1), Ok(Some(1)));
-    assert!(r.rows[0].is_null(2));
-    assert_eq!(r.rows[0].get_str(3), Ok(Some("a")));
-    assert!(r.rows[0].is_null(4));
-    assert_eq!(r.rows[0].get_bool(5), Ok(Some(true)));
+    assert!(r.get(0).expect("row 0").is_null(0));
+    assert_eq!(r.get(0).expect("row 0").get_i32(1), Ok(Some(1)));
+    assert!(r.get(0).expect("row 0").is_null(2));
+    assert_eq!(r.get(0).expect("row 0").get_str(3), Ok(Some("a")));
+    assert!(r.get(0).expect("row 0").is_null(4));
+    assert_eq!(r.get(0).expect("row 0").get_bool(5), Ok(Some(true)));
 
     // Query after error mid-stream should recover
     assert!(c.query_sql("SELECT 1/0 FROM generate_series(1,10)").is_err());
     c.ping().expect("recover after mid-stream error");
     let r = c.query_sql("SELECT 1::int").expect("after recover");
-    assert_eq!(r.rows[0].get_i32(0), Ok(Some(1)));
+    assert_eq!(r.get(0).expect("row 0").get_i32(0), Ok(Some(1)));
 
     c.close().expect("close");
 }
@@ -1080,7 +1080,7 @@ fn connection_resilience_marathon() {
         if i % 2 == 0 {
             assert!(c.query_sql("SELECT * FROM nonexistent_marathon").is_err());
         } else {
-            assert_eq!(c.query_sql(&format!("SELECT {i}::int")).expect("q").rows[0].get_i32(0), Ok(Some(i as i32)));
+            assert_eq!(c.query_sql(&format!("SELECT {i}::int")).expect("q").get(0).expect("row 0").get_i32(0), Ok(Some(i as i32)));
         }
     }
     c.ping().expect("after marathon");
@@ -1099,16 +1099,16 @@ fn connection_resilience_marathon() {
         assert!(c.query_sql("SELECT 'bad'::int").is_err());
         c.ping().unwrap_or_else(|e| panic!("ping2 #{i}: {e}"));
         let r = c.query_sql("SELECT count(*) FROM marathon_t").unwrap_or_else(|e| panic!("count #{i}: {e}"));
-        assert!(r.rows[0].get_i64(0).expect("count decodes").unwrap_or(0) > 0);
+        assert!(r.get(0).expect("row 0").get_i64(0).expect("count decodes").unwrap_or(0) > 0);
     }
 
     // Verify connection is still fully functional
     c.execute_sql("CREATE TEMP TABLE final_check(a int, b text, c bool)").expect("create");
     c.execute_sql("INSERT INTO final_check VALUES (1, 'hello', true)").expect("ins");
     let r = c.query_sql("SELECT * FROM final_check").expect("final");
-    assert_eq!(r.rows[0].get_i32(0), Ok(Some(1)));
-    assert_eq!(r.rows[0].get_str(1), Ok(Some("hello")));
-    assert_eq!(r.rows[0].get_bool(2), Ok(Some(true)));
+    assert_eq!(r.get(0).expect("row 0").get_i32(0), Ok(Some(1)));
+    assert_eq!(r.get(0).expect("row 0").get_str(1), Ok(Some("hello")));
+    assert_eq!(r.get(0).expect("row 0").get_bool(2), Ok(Some(true)));
 
     c.close().expect("close");
 }
@@ -1264,10 +1264,10 @@ fn prepared_query_insert_binary_params_round_trip() {
     // Read the row back via the simple-query text path to confirm the
     // server actually stored the binary-encoded values correctly.
     let r = c.query_sql("SELECT n, big, flag FROM prep_target").expect("read-back query");
-    assert_eq!(r.rows.len(), 1, "exactly one row stored");
-    assert_eq!(r.rows[0].get_i32(0), Ok(Some(sent_n)), "i32 param stored correctly");
-    assert_eq!(r.rows[0].get_i64(1), Ok(Some(sent_big)), "i64 param stored correctly");
-    assert_eq!(r.rows[0].get_bool(2), Ok(Some(sent_flag)), "bool param stored correctly");
+    assert_eq!(r.len(), 1, "exactly one row stored");
+    assert_eq!(r.get(0).expect("row 0").get_i32(0), Ok(Some(sent_n)), "i32 param stored correctly");
+    assert_eq!(r.get(0).expect("row 0").get_i64(1), Ok(Some(sent_big)), "i64 param stored correctly");
+    assert_eq!(r.get(0).expect("row 0").get_bool(2), Ok(Some(sent_flag)), "bool param stored correctly");
 
     // Cleanup: DROP IF EXISTS at end (schema CASCADE removes the table).
     c.execute_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE")).expect("drop schema post");
@@ -1309,7 +1309,7 @@ fn copy_round_trip_in_then_out() {
     );
     assert!(c.is_healthy());
     assert_eq!(
-        c.query_sql("SELECT count(*) FROM cp_rt").expect("count").rows[0].get_i64(0),
+        c.query_sql("SELECT count(*) FROM cp_rt").expect("count").get(0).expect("row 0").get_i64(0),
         Ok(Some(3)),
     );
     c.close().expect("close");
@@ -1337,11 +1337,11 @@ fn copy_in_large_chunk_passthrough() {
     assert_eq!(n, u64::try_from(ROWS).expect("ROWS fits u64"), "all rows ingested");
 
     assert_eq!(
-        c.query_sql("SELECT count(*) FROM cp_big").expect("count").rows[0].get_i64(0),
+        c.query_sql("SELECT count(*) FROM cp_big").expect("count").get(0).expect("row 0").get_i64(0),
         Ok(Some(ROWS)),
     );
     assert_eq!(
-        c.query_sql("SELECT payload FROM cp_big WHERE id = 9999").expect("val").rows[0].get_str(0),
+        c.query_sql("SELECT payload FROM cp_big WHERE id = 9999").expect("val").get(0).expect("row 0").get_str(0),
         Ok(Some("payload-row-9999")),
     );
     c.close().expect("close");
@@ -1365,7 +1365,7 @@ fn copy_in_abort_mid_stream_recovers() {
     );
     assert!(c.is_healthy(), "connection recovered after the mid-stream abort");
     assert_eq!(
-        c.query_sql("SELECT count(*) FROM cp_ab").expect("count").rows[0].get_i64(0),
+        c.query_sql("SELECT count(*) FROM cp_ab").expect("count").get(0).expect("row 0").get_i64(0),
         Ok(Some(0)),
         "an aborted COPY commits no rows",
     );
@@ -1390,7 +1390,7 @@ fn copy_out_early_break_recovers() {
     assert_eq!(broke, Some(1));
     assert!(c.is_healthy());
     assert_eq!(
-        c.query_sql("SELECT count(*) FROM cp_brk").expect("count").rows[0].get_i64(0),
+        c.query_sql("SELECT count(*) FROM cp_brk").expect("count").get(0).expect("row 0").get_i64(0),
         Ok(Some(1000)),
     );
     c.close().expect("close");
@@ -1414,7 +1414,7 @@ fn copy_in_streaming_bulk_constant_memory() {
         .expect("bulk copy_in");
     assert_eq!(n, u64::try_from(N).expect("N fits u64"));
     assert_eq!(
-        c.query_sql("SELECT count(*) FROM cp_bulk").expect("count").rows[0].get_i64(0),
+        c.query_sql("SELECT count(*) FROM cp_bulk").expect("count").get(0).expect("row 0").get_i64(0),
         Ok(Some(N)),
     );
     c.close().expect("close");

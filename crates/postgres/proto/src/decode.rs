@@ -706,13 +706,19 @@ pub enum DecodeError {
     },
     /// A column's data region is shorter than the declared length
     /// prefix (partial row).
+    ///
+    /// Both counts are `u32`: a column's declared length comes from a
+    /// non-negative `i32` length prefix (so `<= i32::MAX`), and the bytes
+    /// remaining are a slice of the `<= 2 GB` (`i32`-framed) row body — both
+    /// fit `u32` with headroom, keeping this the widest `DecodeError` payload
+    /// at 12 bytes rather than 24.
     TruncatedColumnData {
         /// Zero-based column index.
         column_idx: u8,
         /// Length declared by the prefix.
-        declared_len: usize,
+        declared_len: u32,
         /// Bytes actually remaining in the row body.
-        remaining: usize,
+        remaining: u32,
     },
     /// Column bytes are not valid UTF-8. Applies to text-format
     /// columns (including `&str` and all integer decoders, which
@@ -824,6 +830,15 @@ pub enum DecodeError {
         dscale: u16,
     },
 }
+
+// Direct size pin. The widest variant is `TruncatedColumnData { column_idx: u8,
+// declared_len: u32, remaining: u32 }` = 12 B (the two `u32`s + the `u8`, the
+// enum discriminant packed into the trailing padding); every other variant is
+// narrower. Pinned HERE — not merely capped transitively by `DriverError`'s
+// 24 B pin, whose width is actually set by its 16-byte fat-pointer payloads —
+// so a silent regrowth of `DecodeError` (e.g. a field widened back to `usize`)
+// fails at THIS site with `E0080`, not unnoticed under `DriverError`'s slack.
+crate::wire_pin!(DecodeError, size = 12, align = 4);
 
 // Additive `core::error::Error` impl; matches the crate-wide
 // policy of implementing the canonical `core::error::Error` on
@@ -1102,10 +1117,16 @@ impl<'a> Iterator for ColumnsIter<'a> {
             }
             None => {
                 let remaining = after_len.len();
+                // `len_usize` came from a non-negative `i32` prefix and
+                // `remaining` is a slice of the `<= 2 GB` row body, so both are
+                // `<= i32::MAX < u32::MAX` — the narrow is structurally
+                // infallible. The dead arm saturates the pure DIAGNOSTIC field
+                // (the truncation is still classified `TruncatedColumnData`)
+                // rather than a forbidden unwrap.
                 self.fuse_and_error(DecodeError::TruncatedColumnData {
                     column_idx: idx,
-                    declared_len: len_usize,
-                    remaining,
+                    declared_len: u32::try_from(len_usize).unwrap_or(u32::MAX),
+                    remaining: u32::try_from(remaining).unwrap_or(u32::MAX),
                 })
             }
         }

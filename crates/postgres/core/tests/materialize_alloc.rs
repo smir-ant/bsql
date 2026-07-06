@@ -219,13 +219,18 @@ fn no_op_sink<'s>(
 
 /// PINNED baseline: allocations charged to the WHOLE warm eager `query_sql()`
 /// path — fresh `ResultCollector`, `feed` over a 3-row result, then the full
-/// `build_query_result` finalization (`finish` into owned rows PLUS the
+/// `build_query_result` finalization (`finish` into the lazy [`RowSet`] PLUS the
 /// `Arc::from(column_names.into_boxed_slice())` and `QueryResult` construction).
-/// Currently **21**: the collector's per-call vectors + a `String` per row cell
-/// and command tag + the arena `finish`, plus the column-names `Arc`
-/// allocation. The per-call prebuffer cost a later slice (a pooled/reused
-/// collector) would trim.
-const EAGER_QUERY_ALLOC_PIN: usize = 21;
+/// Currently **20**: the collector's per-call vectors + a `String` per row cell
+/// and command tag + the arena `finish` (the ONE shared `Arc`), plus the
+/// column-names `Arc` allocation.
+///
+/// History: **21 → 20** when `finish` stopped eagerly building a `Vec<Row>` of N
+/// handles and now seals into a [`RowSet`] (one `Arc`, handles minted lazily on
+/// access) — the `16·N`-byte handle `Vec` is no longer allocated at all, and a
+/// single-row read clones the `Arc` once instead of N times. The remaining
+/// per-call prebuffer cost a later slice (a pooled/reused collector) would trim.
+const EAGER_QUERY_ALLOC_PIN: usize = 20;
 
 /// PINNED baseline: allocations charged to the WHOLE warm `reset_session()`
 /// round-trip — a fresh `ResultCollector` over the LITERAL 7-statement idle
@@ -312,13 +317,12 @@ fn run_query<'b>(
     };
     // ── the literal body of Connection::build_query_result(collector, None) ──
     let collected = collector.finish().expect("materialise owned rows");
-    assert_eq!(collected.rows.len(), QUERY_ROWS, "all rows materialised");
+    assert_eq!(collected.rows.len(), QUERY_ROWS, "all rows sealed into the RowSet");
     let column_names: Arc<[String]> = Arc::from(collected.column_names.into_boxed_slice());
-    let result = QueryResult {
-        rows: collected.rows,
-        command_tag: collected.command_tag,
-        column_names,
-    };
+    let result = QueryResult::new(collected.rows, collected.command_tag, column_names);
+    // The result is lazy: no eager `Vec<Row>` was built, yet every row is still
+    // reachable (and identical) through the on-demand accessors.
+    assert_eq!(result.len(), QUERY_ROWS);
     core::hint::black_box(&result);
     live
 }

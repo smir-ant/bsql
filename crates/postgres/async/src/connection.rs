@@ -854,8 +854,9 @@ impl Connection {
                     payload,
                     pid: n.pid,
                 })),
-                // The payload string moves into the classified error.
-                Err(_) => Err(DriverError::PayloadParse(n.payload)),
+                // The payload string moves into the classified error as a
+                // read-only `Box<str>` (no spare capacity retained).
+                Err(_) => Err(DriverError::PayloadParse(n.payload.into_boxed_str())),
             },
             None => Ok(None),
         }

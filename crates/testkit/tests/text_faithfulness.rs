@@ -132,10 +132,10 @@ async fn query_sql_over_a_faithful_uuid_still_works() {
     fake.on("SELECT id FROM t").returns(rows![[Uuid::from_bytes(raw)]]);
     let mut conn = fake.connect().await.expect("connect");
     let result = conn.query_sql("SELECT id FROM t").await.expect("query_sql over a uuid works");
-    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.len(), 1);
     // The dynamic Row's text form is exactly PostgreSQL's `uuid ::text`.
     assert_eq!(
-        result.rows[0].get_str(0),
+        result.get(0).expect("row 0").get_str(0),
         Ok(Some("550e8400-e29b-41d4-a716-446655440000"))
     );
 }

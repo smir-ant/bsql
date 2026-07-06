@@ -37,7 +37,8 @@
 use core::mem::{align_of, size_of};
 
 use bsql_postgres_core::{
-    ArenaSealError, ConnectConfig, DbError, DriverError, Notification, QueryResult, Row, SslMode,
+    ArenaSealError, ConnectConfig, DbError, DriverError, Notification, QueryResult, Row, RowSet,
+    SslMode,
 };
 
 /// `(size, align)` baseline for every stable public type of `bsql-postgres-core`.
@@ -49,12 +50,13 @@ fn core_stable_public_types_match_baseline() {
     let rows: &[(usize, usize, usize, usize, &str)] = &[
         (size_of::<Row>(), align_of::<Row>(), 16, 8, "Row"),
         (size_of::<ArenaSealError>(), align_of::<ArenaSealError>(), 1, 1, "ArenaSealError"),
-        (size_of::<DriverError>(), align_of::<DriverError>(), 32, 8, "DriverError"),
+        (size_of::<DriverError>(), align_of::<DriverError>(), 24, 8, "DriverError"),
         (size_of::<DbError>(), align_of::<DbError>(), 120, 8, "DbError"),
         (size_of::<ConnectConfig>(), align_of::<ConnectConfig>(), 152, 8, "ConnectConfig"),
         (size_of::<SslMode>(), align_of::<SslMode>(), 1, 1, "SslMode"),
         (size_of::<Notification>(), align_of::<Notification>(), 56, 8, "Notification"),
-        (size_of::<QueryResult>(), align_of::<QueryResult>(), 64, 8, "QueryResult"),
+        (size_of::<RowSet>(), align_of::<RowSet>(), 16, 8, "RowSet"),
+        (size_of::<QueryResult>(), align_of::<QueryResult>(), 56, 8, "QueryResult"),
     ];
     for &(sz, al, exp_sz, exp_al, name) in rows {
         assert_eq!(sz, exp_sz, "footprint baseline drift (size) for {name}");

@@ -405,8 +405,7 @@ fn plan_is_parsed_once_and_persists() {
         .query_sql("SELECT count(*)::int4 FROM pg_prepared_statements")
         .expect("count prepared statements");
     let count = result
-        .rows
-        .first()
+        .get(0)
         .expect("count row")
         .get_i32(0).expect("count decodes").expect("count value");
     assert_eq!(
@@ -453,8 +452,7 @@ fn pooled_connection_reset_keeps_parsed_plan() {
             .expect("live")
             .query_sql("SELECT count(*)::int4 FROM pg_prepared_statements")
             .unwrap_or_else(|e| panic!("checkout {i} count: {e:?}"))
-            .rows
-            .first()
+            .get(0)
             .expect("count row")
             .get_i32(0).expect("count decodes").expect("count value");
         assert_eq!(count, 1, "checkout {i}: statement kept across reset (parsed once)");
@@ -497,8 +495,7 @@ fn pooled_reset_rolls_back_open_tx_and_keeps_plan() {
     let count = conn
         .query_sql("SELECT count(*)::int4 FROM pg_prepared_statements")
         .expect("count")
-        .rows
-        .first()
+        .get(0)
         .expect("count row")
         .get_i32(0).expect("count decodes").expect("count value");
     assert_eq!(count, 1, "the ROLLBACK-prefixed reset kept the cached plan (parsed once)");

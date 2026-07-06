@@ -17,9 +17,9 @@ async fn consumer_runs_query_against_the_fake_with_no_network(
     let mut conn = fake.connect().await?;
     let result = conn.query_sql("SELECT id FROM users").await?;
 
-    assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.rows[0].get_i64(0), Ok(Some(1)));
-    assert_eq!(result.rows[1].get_i64(0), Ok(Some(2)));
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
+    assert_eq!(result.get(1).expect("row 1").get_i64(0), Ok(Some(2)));
     Ok(())
 }
 
@@ -32,12 +32,12 @@ async fn multiple_columns_and_types_decode() -> Result<(), Box<dyn std::error::E
     let mut conn = fake.connect().await?;
     let result = conn.query_sql("SELECT id, name, active FROM users").await?;
 
-    assert_eq!(result.rows.len(), 2);
-    assert_eq!(result.rows[0].get_i64(0), Ok(Some(1)));
-    assert_eq!(result.rows[0].get_str(1), Ok(Some("alice")));
-    assert_eq!(result.rows[0].get_bool(2), Ok(Some(true)));
-    assert_eq!(result.rows[1].get_str(1), Ok(Some("bob")));
-    assert_eq!(result.rows[1].get_bool(2), Ok(Some(false)));
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
+    assert_eq!(result.get(0).expect("row 0").get_str(1), Ok(Some("alice")));
+    assert_eq!(result.get(0).expect("row 0").get_bool(2), Ok(Some(true)));
+    assert_eq!(result.get(1).expect("row 1").get_str(1), Ok(Some("bob")));
+    assert_eq!(result.get(1).expect("row 1").get_bool(2), Ok(Some(false)));
     Ok(())
 }
 
@@ -50,9 +50,9 @@ async fn null_cells_decode_as_none() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = fake.connect().await?;
     let result = conn.query_sql("SELECT nickname FROM users").await?;
 
-    assert_eq!(result.rows.len(), 2);
-    assert!(result.rows[0].is_null(0));
-    assert_eq!(result.rows[1].get_str(0), Ok(Some("yui")));
+    assert_eq!(result.len(), 2);
+    assert!(result.get(0).expect("row 0").is_null(0));
+    assert_eq!(result.get(1).expect("row 1").get_str(0), Ok(Some("yui")));
     Ok(())
 }
 

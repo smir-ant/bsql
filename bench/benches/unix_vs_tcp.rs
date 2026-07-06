@@ -35,7 +35,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 /// read is what forces the driver to actually decode, not just frame.
 fn read_select_bsql(qr: &bsql::pg::QueryResult) -> i64 {
     let mut acc = 0_i64;
-    for row in &qr.rows {
+    for row in qr.iter() {
         let id = row.get_i32(0).expect("id decodes");
         let name = row.get_str(1).expect("name decodes");
         let val = row.get_i32(2).expect("val decodes");

@@ -115,8 +115,8 @@ fn config() -> ConnectConfig {
 /// Join an `EXPLAIN` result's plan-text rows into one string.
 fn explain(conn: &mut Connection, sql: &str) -> String {
     let result = conn.query_sql(sql).expect("EXPLAIN runs");
-    let mut lines = Vec::with_capacity(result.rows.len());
-    for row in &result.rows {
+    let mut lines = Vec::with_capacity(result.len());
+    for row in result.iter() {
         if let Ok(Some(line)) = row.get_str(0) {
             lines.push(line.to_string());
         }
@@ -131,7 +131,7 @@ fn plan_counts(conn: &mut Connection, name: &str) -> (i64, i64) {
         "SELECT generic_plans, custom_plans FROM pg_prepared_statements WHERE name = '{name}'"
     );
     let result = conn.query_sql(&sql).expect("read plan counts");
-    let row = result.rows.first().expect("prepared statement is present");
+    let row = result.get(0).expect("prepared statement is present");
     (
         row.get_i64(0).expect("generic_plans decodes").expect("generic_plans present"),
         row.get_i64(1).expect("custom_plans decodes").expect("custom_plans present"),

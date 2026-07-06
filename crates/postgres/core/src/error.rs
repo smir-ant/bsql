@@ -72,11 +72,16 @@ impl DbError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnError {
     /// The requested column index is `>=` the row's column count.
+    ///
+    /// Both counts are `u32`: the column count is the arena's `u16` stride, and
+    /// the requested index is a diagnostic bounded here (a `usize` past `u32`
+    /// is capped — it is trivially out of range for a `u16`-strided row). This
+    /// keeps `OutOfRange` an 8-byte payload rather than 16.
     OutOfRange {
         /// The requested (zero-based) column index.
-        col: usize,
+        col: u32,
         /// The row's actual column count.
-        n_cols: usize,
+        n_cols: u32,
     },
     /// A by-name lookup found no column with the requested name in the result.
     UnknownColumn,
@@ -121,7 +126,9 @@ pub enum DriverError {
     /// make EVERY `Result<T, DriverError>` carry 120 B on its error half — paid
     /// on the cold half of every fallible driver return. Boxing moves that
     /// payload behind a pointer: the happy path never allocates, only the cold
-    /// error path does, and `DriverError` shrinks from 120 B to 32 B.
+    /// error path does, and `DriverError` shrinks from 120 B to 32 B (and to 24 B
+    /// once the remaining payload variants were narrowed to `<= 16` B — see the
+    /// footprint pin below).
     Db(Box<DbError>),
     Io(std::io::Error),
     NotReady,
@@ -218,17 +225,22 @@ pub enum DriverError {
     /// its [`FromStr`](core::str::FromStr) impl. Carries the raw payload string so
     /// the failure is inspectable, never a silently-dropped notification — the
     /// typed-subscription counterpart to a decode failure. The notification was
-    /// still removed from the ledger, so it cannot wedge the buffer.
-    PayloadParse(String),
+    /// still removed from the ledger, so it cannot wedge the buffer. A `Box<str>`
+    /// (16 B) rather than a `String` (24 B): the payload is read-only once
+    /// captured, so the spare `String` capacity word is dead weight on the error.
+    PayloadParse(Box<str>),
 }
 
-// Footprint pin: a sum type whose size is set by its widest variant. With the
-// dominant `DbError` boxed (`Db(Box<DbError>)` = one pointer), the width is now
-// set by the 24-byte payload variants (`Io`/`Decode`/`Column`/`PayloadParse`)
-// plus the discriminant: 32 B, down from 120 B. Every `Result<T, DriverError>`
-// error half shrinks accordingly. The pin catches a new wide variant that would
-// re-inflate the enum.
-crate::footprint_pin!(DriverError, size = 32, align = 8);
+// Footprint pin: a sum type whose size is set by its widest variant plus the
+// discriminant word. With the dominant `DbError` boxed (`Db(Box<DbError>)` = one
+// pointer), the widest payloads are the two 16-byte fat pointers `Config(&'static
+// str)` and `PayloadParse(Box<str>)`; `Decode(DecodeError)` (12 B, after its
+// `TruncatedColumnData` counts narrowed `usize -> u32`) and `Column(ColumnError)`
+// (also 12 B, after `OutOfRange` narrowed `usize -> u32`) no longer set the width.
+// So 16 B payload + 8 B discriminant = 24 B, down from 32 (and 120 before boxing).
+// Every `Result<T, DriverError>` error half shrinks accordingly. The pin catches a
+// new wide variant that would re-inflate the enum.
+crate::footprint_pin!(DriverError, size = 24, align = 8);
 
 impl fmt::Display for DriverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -362,6 +374,6 @@ mod tests {
         assert!(dberr.is_unique_violation());
 
         // And the layout win: the enum is the shrunk width, payload one pointer.
-        assert_eq!(core::mem::size_of::<DriverError>(), 32);
+        assert_eq!(core::mem::size_of::<DriverError>(), 24);
     }
 }

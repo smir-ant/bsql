@@ -34,7 +34,7 @@ async fn notify_during_query_is_captured_async() -> Result<(), Box<dyn std::erro
     let mut conn = fake.connect().await?;
     let result = conn.query_sql("SELECT id FROM users").await?;
     // The query itself still returns its rows, unaffected.
-    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.len(), 2);
 
     // The smoking gun: the interleaved notification was captured DURING the query
     // (this is the exact frame the old no-op arm dropped).
@@ -63,7 +63,7 @@ fn notify_during_query_is_captured_sync() -> Result<(), Box<dyn std::error::Erro
 
     let mut conn = fake.connect_sync()?;
     let result = conn.query_sql("SELECT id FROM users")?;
-    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.len(), 2);
 
     assert_eq!(conn.buffered_notifications(), 1, "the interleaved NOTIFY was captured, not dropped");
     assert_eq!(conn.notifications_received(), 1);
@@ -209,7 +209,7 @@ async fn recv_notification_as_classifies_a_parse_failure_not_a_silent_drop(
         .await
         .expect_err("a non-numeric payload must not parse into i64");
     match err {
-        DriverError::PayloadParse(raw) => assert_eq!(raw, "not-a-number"),
+        DriverError::PayloadParse(raw) => assert_eq!(&*raw, "not-a-number"),
         other => panic!("expected a classified PayloadParse, got {other:?}"),
     }
     // The notification was removed from the ledger (it cannot wedge the buffer).

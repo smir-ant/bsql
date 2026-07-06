@@ -44,14 +44,17 @@ const _: () = assert!(core::mem::size_of::<ColSlot>() == 8);
 
 // ─── Arena ──────────────────────────────────────────────────
 
-/// Shared backing store for all rows in a query result.
-/// 1 Arc + 3 Vecs = 4 heap allocations total, regardless of row count.
+/// Shared backing store for all rows in a query result: the concatenated cell
+/// bytes plus the per-cell slot table, addressed by the fixed `n_cols` stride.
+/// One `Arc<ArenaInner>` backs every [`Row`] handle of a result. The row COUNT
+/// is not stored here — it lives in the [`RowSet`] that owns the `Arc`, because
+/// the arena only needs the stride (`n_cols`) to resolve a `(row_idx, col)`
+/// cell; the count bounds the handle minting, which [`RowSet`] does.
 #[derive(Debug)]
 struct ArenaInner {
     data: Vec<u8>,
     slots: Vec<ColSlot>,
     n_cols: u16,
-    _n_rows: u32,
 }
 
 // ─── Row ────────────────────────────────────────────────────
@@ -86,7 +89,20 @@ impl Row {
         let inner = &*self.arena;
         let n_cols = usize::from(inner.n_cols);
         if col >= n_cols {
-            return Err(ColumnError::OutOfRange { col, n_cols });
+            // `n_cols` is the arena's `u16` stride (infallible `u16 -> u32`);
+            // `col` is a caller-supplied `usize` that CAN exceed `u32` on a
+            // 64-bit target, but such an index is trivially out of range, so
+            // the pure diagnostic is capped rather than a forbidden unwrap.
+            #[expect(
+                clippy::manual_unwrap_or,
+                reason = "unwrap_or is banned by the silent-fallback ledger; this explicit \
+                          match is the sanctioned dead arm for the structurally-out-of-range cap"
+            )]
+            let col = match u32::try_from(col) {
+                Ok(c) => c,
+                Err(_) => u32::MAX,
+            };
+            return Err(ColumnError::OutOfRange { col, n_cols: u32::from(inner.n_cols) });
         }
         // Uniform-width arena: slot `(row_idx, col)` lives at
         // `row_idx * n_cols + col`, which `ArenaBuilder::finish` guarantees is
@@ -421,7 +437,11 @@ impl ArenaBuilder {
         self.rows_finished = self.rows_finished.saturating_add(1);
     }
 
-    /// Seal the arena and produce Row handles.
+    /// Seal the arena into a [`RowSet`] — ONE shared `Arc` over the row bytes,
+    /// with per-row [`Row`] handles minted lazily on access. This does NOT
+    /// eagerly build a `Vec<Row>` of N handles: the whole result costs the
+    /// arena's allocations regardless of row count, and a single-row read
+    /// ([`RowSet::get`]) clones the `Arc` exactly once, not N times.
     ///
     /// # Errors
     ///
@@ -429,7 +449,7 @@ impl ArenaBuilder {
     /// overflowed the 32-bit fields; [`ArenaSealError::MixedRowWidth`] if the
     /// fed rows did not all have the same column count (which would mis-address
     /// cells against the arena's single stride).
-    pub fn finish(self) -> Result<Vec<Row>, ArenaSealError> {
+    pub fn finish(self) -> Result<RowSet, ArenaSealError> {
         if self.overflow {
             return Err(ArenaSealError::TooLarge);
         }
@@ -437,35 +457,191 @@ impl ArenaBuilder {
             return Err(ArenaSealError::MixedRowWidth);
         }
         let n_rows = self.rows_finished;
+        // A rowless seal allocates NO arena — the invariant `arena.is_some() ==
+        // (n_rows > 0)` keeps `get` / `iter` from minting a handle over an
+        // absent backing store.
+        if n_rows == 0 {
+            return Ok(RowSet { arena: None, n_rows: 0 });
+        }
         let arena = Arc::new(ArenaInner {
             data: self.data,
             slots: self.slots,
             n_cols: self.n_cols,
-            _n_rows: n_rows,
         });
-        Ok((0..n_rows)
-            .map(|i| Row { arena: arena.clone(), row_idx: i })
-            .collect())
+        Ok(RowSet { arena: Some(arena), n_rows })
+    }
+}
+
+// ─── RowSet ──────────────────────────────────────────────────
+
+/// The sealed rows of one dynamic result: ONE shared arena (or none, for a
+/// command that returned no rows) plus the row count. Every [`Row`] handle is
+/// minted ON DEMAND — a 16-byte `Arc`-clone — by [`get`](Self::get) /
+/// [`iter`](Self::iter), so the whole set costs the arena's allocations
+/// regardless of row count and NO eager `Vec<Row>` is ever built. A single-row
+/// read is one `Arc` refcount bump, independent of the row count.
+///
+/// This is the dynamic-path parallel of the typed [`Rows<Q>`](crate::Rows): one
+/// owned backing store, lazy per-row access, zero per-row allocation. It backs
+/// [`QueryResult`], whose accessors delegate here; a caller normally reaches it
+/// through the `QueryResult` facade rather than naming it directly.
+#[derive(Debug, Clone, Default)]
+pub struct RowSet {
+    /// `None` = a command that produced no result set (e.g. `INSERT`/`UPDATE`):
+    /// no arena is allocated. `Some` = the shared arena backing every row.
+    /// Invariant (held by [`ArenaBuilder::finish`]): `Some` iff `n_rows > 0`.
+    arena: Option<Arc<ArenaInner>>,
+    /// The number of rows the arena addresses. A `u32`, matching the arena's
+    /// 32-bit row-index field; the handle minters bound `row_idx` by it.
+    n_rows: u32,
+}
+
+// Footprint pin: `Option<Arc<_>>` niche-packs to one 8-byte pointer (a null
+// pointer encodes `None`), plus a `u32` row count = 12 B padded to 16. Widening
+// `n_rows`, or adding a field, shows up here.
+crate::footprint_pin!(RowSet, size = 16, align = 8);
+
+impl RowSet {
+    /// The number of result rows.
+    #[must_use]
+    #[expect(
+        clippy::manual_unwrap_or_default,
+        reason = "`unwrap_or_default()` is banned by the tier-4 silent-fallback ledger; \
+                  this explicit match is the sanctioned dead arm for an infallible narrow \
+                  (`usize >= 32` bits on every supported target, so `n_rows: u32` always fits)"
+    )]
+    pub fn len(&self) -> usize {
+        match usize::try_from(self.n_rows) {
+            Ok(n) => n,
+            Err(_) => 0,
+        }
+    }
+
+    /// Whether the result produced no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.n_rows == 0
+    }
+
+    /// The row at zero-based index `i`, or `None` if `i >= len()`.
+    ///
+    /// A 16-byte [`Row`] handle built on demand — O(1), exactly one `Arc`
+    /// refcount bump, never a per-row allocation and never dependent on the row
+    /// count. This is the single-row read the driver's `query_one_sql` /
+    /// `query_opt` route through, so a one-row fetch clones the `Arc` ONCE.
+    #[must_use]
+    pub fn get(&self, i: usize) -> Option<Row> {
+        // A `usize` index past `u32::MAX` cannot address a `u32`-bounded arena,
+        // so it is out of range — `None`, never a wrapped index.
+        let idx = u32::try_from(i).ok()?;
+        self.row_at(idx)
+    }
+
+    /// Mint the handle for `idx` if it is in range and an arena backs it. The
+    /// shared helper behind [`get`](Self::get) and [`iter`](Self::iter).
+    fn row_at(&self, idx: u32) -> Option<Row> {
+        if idx >= self.n_rows {
+            return None;
+        }
+        // `arena` is `Some` whenever `n_rows > 0` (the `finish` invariant), and
+        // `idx < n_rows` here, so this maps rather than fabricating a handle
+        // over an absent arena.
+        self.arena
+            .as_ref()
+            .map(|arena| Row { arena: Arc::clone(arena), row_idx: idx })
+    }
+
+    /// A lazy iterator over the rows. Each yielded [`Row`] is one `Arc`-clone
+    /// handle — no per-row allocation, no pre-materialised `Vec`. Mirrors
+    /// [`Rows::iter`](crate::Rows::iter)'s lazy shape on the dynamic path.
+    pub fn iter(&self) -> impl Iterator<Item = Row> + '_ {
+        (0..self.n_rows).filter_map(move |idx| self.row_at(idx))
+    }
+
+    /// Materialise every row into an owned `Vec<Row>` — the escape hatch for a
+    /// caller that truly needs a random-access owned collection.
+    ///
+    /// This pays the N `Arc`-clones plus the `16·N`-byte `Vec` the lazy
+    /// container otherwise avoids; prefer [`iter`](Self::iter) / [`get`](Self::get)
+    /// unless an owned `Vec` is genuinely required.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<Row> {
+        self.iter().collect()
     }
 }
 
 // ─── QueryResult ────────────────────────────────────────────
 
 /// Result of a query — rows + command tag + column names.
+///
+/// The rows are held LAZILY: `QueryResult` owns one [`RowSet`] (a single shared
+/// `Arc` over the row bytes), and its accessors mint [`Row`] handles on demand
+/// rather than eagerly building a `Vec<Row>`. Read the rows with
+/// [`iter`](Self::iter) (a lazy iterator), [`get`](Self::get) (O(1) random
+/// access), or [`len`](Self::len) — or [`into_vec`](Self::into_vec) for the rare
+/// owned-`Vec` case. This mirrors the typed [`Rows<Q>`](crate::Rows) container:
+/// one owned backing store, zero per-row allocation, decode/handle-mint on read.
 #[derive(Debug)]
 #[must_use]
 pub struct QueryResult {
-    pub rows: Vec<Row>,
+    /// The result rows, held as one shared arena (see [`RowSet`]). Private so
+    /// the eager-`Vec<Row>` shape cannot be reintroduced by a caller; the
+    /// row accessors below are the sole entry.
+    rows: RowSet,
+    /// The command tag (`"SELECT 5"`, `"INSERT 0 1"`, …); empty when none.
     pub command_tag: String,
+    /// The result-column names, in column order.
     pub column_names: Arc<[String]>,
 }
 
-// Footprint pin: a Vec (3 words) + a String (3 words) + an Arc<[_]> (2 words,
-// fat pointer) = 8 words = 64 B. A new field, or swapping a field to a wider
-// owned type, shows up here. (An earlier data-row-width `column_count: usize`
-// field was write-only — never read anywhere — and was removed; a caller that
-// needs the column count reads `column_names.len()`.)
-crate::footprint_pin!(QueryResult, size = 64, align = 8);
+// Footprint pin: a `RowSet` (16 B: a niche-packed `Option<Arc>` + a `u32`) + a
+// String (3 words) + an Arc<[_]> (2 words, fat pointer) = 56 B, down from the
+// 64 B the old eager `Vec<Row>` field cost (a `RowSet` is 16 B vs a `Vec`'s 24).
+// A new field, or swapping a field to a wider owned type, shows up here.
+crate::footprint_pin!(QueryResult, size = 56, align = 8);
+
+impl QueryResult {
+    /// Assemble a result from its sealed rows and metadata. The row-container
+    /// field is private, so this is the sole constructor — a caller cannot
+    /// splice in an eager `Vec<Row>`.
+    pub fn new(rows: RowSet, command_tag: String, column_names: Arc<[String]>) -> Self {
+        Self { rows, command_tag, column_names }
+    }
+
+    /// The number of result rows (no allocation — read from the arena's count).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the result produced no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The row at zero-based index `i`, or `None` if `i >= len()`. A 16-byte
+    /// `Arc`-clone [`Row`] handle built on demand — O(1), one refcount bump.
+    #[must_use]
+    pub fn get(&self, i: usize) -> Option<Row> {
+        self.rows.get(i)
+    }
+
+    /// A lazy iterator over the rows; each yielded [`Row`] is one `Arc`-clone
+    /// handle, minted on demand — no pre-materialised `Vec`.
+    pub fn iter(&self) -> impl Iterator<Item = Row> + '_ {
+        self.rows.iter()
+    }
+
+    /// Materialise every row into an owned `Vec<Row>` — the escape hatch for a
+    /// caller that truly needs a random-access owned collection (pays the N
+    /// `Arc`-clones + the `16·N`-byte `Vec`). Prefer [`iter`](Self::iter) /
+    /// [`get`](Self::get) unless an owned `Vec` is genuinely required.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<Row> {
+        self.rows.into_vec()
+    }
+}
 
 // ─── Notification ───────────────────────────────────────────
 
@@ -496,9 +672,11 @@ mod tests {
             Err(e) => panic!("unexpected overflow: {e}"),
         };
         assert_eq!(rows.len(), 1);
-        let row = &rows[0];
+        let row = rows.get(0).expect("row 0");
         assert_eq!(row.get_raw(0), Ok(Some(&b"hi"[..])));
         assert!(row.is_null(1));
+        // Out-of-range index is None, never a fabricated handle.
+        assert!(rows.get(1).is_none());
     }
 
     #[test]
@@ -511,7 +689,7 @@ mod tests {
             Ok(r) => r,
             Err(e) => panic!("unexpected overflow: {e}"),
         };
-        assert_eq!(rows[0].get_raw(0), Ok(Some(&b"foobar"[..])));
+        assert_eq!(rows.get(0).expect("row 0").get_raw(0), Ok(Some(&b"foobar"[..])));
     }
 
     #[test]
@@ -552,14 +730,23 @@ mod tests {
             Err(e) => panic!("unexpected seal error: {e}"),
         };
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].get_raw(0), Ok(Some(&b"a"[..])));
-        assert!(rows[0].is_null(1));
-        assert_eq!(rows[1].get_raw(0), Ok(Some(&b"b"[..])));
-        assert_eq!(rows[1].get_raw(1), Ok(Some(&b"c"[..])));
+        let r0 = rows.get(0).expect("row 0");
+        let r1 = rows.get(1).expect("row 1");
+        assert_eq!(r0.get_raw(0), Ok(Some(&b"a"[..])));
+        assert!(r0.is_null(1));
+        assert_eq!(r1.get_raw(0), Ok(Some(&b"b"[..])));
+        assert_eq!(r1.get_raw(1), Ok(Some(&b"c"[..])));
+        // The lazy `iter` walk yields the SAME values as random-access `get`.
+        // (A raw slice borrows the per-item handle, so copy it out to compare.)
+        let via_iter: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|r| r.get_raw(0).expect("in range").expect("non-null").to_vec())
+            .collect();
+        assert_eq!(via_iter, vec![b"a".to_vec(), b"b".to_vec()]);
     }
 
     /// Build a one-row arena whose single column holds `bytes` (non-NULL).
-    fn one_col_row(bytes: &[u8]) -> Vec<Row> {
+    fn one_col_row(bytes: &[u8]) -> RowSet {
         let mut ab = ArenaBuilder::new(1);
         ab.push_value(bytes);
         ab.end_row();
@@ -582,7 +769,7 @@ mod tests {
             Ok(r) => r,
             Err(e) => panic!("unexpected seal error: {e}"),
         };
-        let row = &rows[0];
+        let row = rows.get(0).expect("row 0");
         // Present value → Ok(Some).
         assert_eq!(row.get_i32(0), Ok(Some(42)));
         // SQL NULL → Ok(None) — a value that happens to be absent, NOT an error.
@@ -603,7 +790,7 @@ mod tests {
         // now different values a caller can branch on.
         let rows = one_col_row(b"hello");
         assert_eq!(
-            rows[0].get_i32(0),
+            rows.get(0).expect("row 0").get_i32(0),
             Err(ColumnError::Decode(DecodeError::IntParse)),
         );
     }
@@ -617,19 +804,21 @@ mod tests {
         // `&str` is a legitimate text read — verified below — which is why a
         // separate OID pre-check adds little on this path.)
         let int_row = one_col_row(b"42");
+        let int0 = int_row.get(0).expect("row 0");
         assert_eq!(
-            int_row[0].get_bool(0),
+            int0.get_bool(0),
             Err(ColumnError::Decode(DecodeError::BoolParse)),
         );
         // The same int column read as text is a valid read, not an error.
-        assert_eq!(int_row[0].get_str(0), Ok(Some("42")));
+        assert_eq!(int0.get_str(0), Ok(Some("42")));
 
         let bool_row = one_col_row(b"t");
+        let bool0 = bool_row.get(0).expect("row 0");
         assert_eq!(
-            bool_row[0].get_i32(0),
+            bool0.get_i32(0),
             Err(ColumnError::Decode(DecodeError::IntParse)),
         );
-        assert_eq!(bool_row[0].get_bool(0), Ok(Some(true)));
+        assert_eq!(bool0.get_bool(0), Ok(Some(true)));
     }
 
     #[test]
@@ -639,7 +828,7 @@ mod tests {
         // `from_utf8`).
         let rows = one_col_row(&[0xff]);
         assert_eq!(
-            rows[0].get_str(0),
+            rows.get(0).expect("row 0").get_str(0),
             Err(ColumnError::Decode(DecodeError::NonUtf8)),
         );
     }
@@ -657,13 +846,13 @@ mod tests {
             Ok(r) => r,
             Err(e) => panic!("unexpected seal error: {e}"),
         };
-        let row = &rows[0];
+        let row = rows.get(0).expect("row 0");
         assert_eq!(row.get_f64(0), Ok(Some(2.5)));
         assert_eq!(row.get_f64(1), Ok(None));
         assert_eq!(row.get_f64(2), Err(ColumnError::FloatParse));
         // PG float specials parse through the same path.
         let specials = one_col_row(b"NaN");
-        assert!(matches!(specials[0].get_f64(0), Ok(Some(v)) if v.is_nan()));
+        assert!(matches!(specials.get(0).expect("row 0").get_f64(0), Ok(Some(v)) if v.is_nan()));
     }
 
     #[test]
@@ -681,7 +870,7 @@ mod tests {
             Ok(r) => r,
             Err(e) => panic!("unexpected seal error: {e}"),
         };
-        let row = &rows[0];
+        let row = rows.get(0).expect("row 0");
         assert_eq!(row.get_f32(0), Ok(Some(2.5)));
         assert_eq!(row.get_f32(1), Ok(None));
         assert_eq!(row.get_f32(2), Err(ColumnError::FloatParse));
@@ -690,17 +879,63 @@ mod tests {
         assert_eq!(row.get_f32(4), Err(ColumnError::OutOfRange { col: 4, n_cols: 4 }));
         // PG float specials parse through the same path.
         let specials = one_col_row(b"-Infinity");
-        assert!(matches!(specials[0].get_f32(0), Ok(Some(v)) if v.is_infinite() && v < 0.0));
+        assert!(matches!(specials.get(0).expect("row 0").get_f32(0), Ok(Some(v)) if v.is_infinite() && v < 0.0));
     }
 
     #[test]
     fn get_by_name_resolves_or_classifies_unknown() {
         let rows = one_col_row(b"alice");
+        let row = rows.get(0).expect("row 0");
         let names = vec!["name".to_string()];
-        assert_eq!(rows[0].get_by_name::<&str>("name", &names), Ok(Some("alice")));
+        assert_eq!(row.get_by_name::<&str>("name", &names), Ok(Some("alice")));
         assert_eq!(
-            rows[0].get_by_name::<&str>("missing", &names),
+            row.get_by_name::<&str>("missing", &names),
             Err(ColumnError::UnknownColumn),
         );
+    }
+
+    /// N→1 clone witness: the single-row read (`query_one`'s path) mints EXACTLY
+    /// one `Row` handle — one `Arc` refcount bump — regardless of the row count,
+    /// where the retired eager `Vec<Row>` cloned the `Arc` once per row. Proven
+    /// by `Arc::strong_count`: `get` on a 1000-row set lifts the count by one,
+    /// not by a thousand.
+    #[test]
+    fn single_row_read_clones_the_arc_once_not_per_row() {
+        const N: u32 = 1000;
+        let mut ab = ArenaBuilder::new(1);
+        for i in 0..N {
+            ab.push_value(format!("row{i}").as_bytes());
+            ab.end_row();
+        }
+        let rows = match ab.finish() {
+            Ok(r) => r,
+            Err(e) => panic!("unexpected seal error: {e}"),
+        };
+        assert_eq!(rows.len(), 1000);
+        let arena = rows.arena.as_ref().expect("populated set has an arena");
+        // Sealed: only the `RowSet` holds the arena.
+        assert_eq!(Arc::strong_count(arena), 1);
+
+        // The single-row read clones the `Arc` EXACTLY once — independent of the
+        // 1000 rows behind it (the whole point of the lazy handle).
+        let row0 = rows.get(0).expect("row 0");
+        assert_eq!(Arc::strong_count(arena), 2, "get(0) is one clone, not N");
+        assert_eq!(row0.get_str(0), Ok(Some("row0")));
+        drop(row0);
+        assert_eq!(Arc::strong_count(arena), 1, "the handle released its clone");
+
+        // Value identity across the three read paths on the same backing store.
+        assert_eq!(rows.get(999).expect("last").get_str(0), Ok(Some("row999")));
+        let via_iter: Vec<Option<String>> = rows
+            .iter()
+            .map(|r| r.get_str(0).expect("decode").map(str::to_owned))
+            .collect();
+        assert_eq!(via_iter.len(), 1000);
+        assert_eq!(via_iter.first(), Some(&Some("row0".to_string())));
+        assert_eq!(via_iter.last(), Some(&Some("row999".to_string())));
+        // The eager escape hatch materialises the SAME values (opt-in N clones).
+        let owned = rows.into_vec();
+        assert_eq!(owned.len(), 1000);
+        assert_eq!(owned.first().expect("row 0").get_str(0), Ok(Some("row0")));
     }
 }

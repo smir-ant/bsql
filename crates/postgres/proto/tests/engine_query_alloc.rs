@@ -270,10 +270,11 @@ fn no_op_sink(surface: Surface<'_>) -> ControlFlow<Never> {
 /// 2. The captured `server_version` `String` — the value a `SHOW server_version`
 ///    would return, now carried from the handshake for free. This one owned
 ///    allocation replaces the old post-connect `SHOW` round-trip, which cost a
-///    full network round-trip PLUS a whole `QueryResult` (four allocations) to
-///    recover the same string. Trading one cold-path `String` for a round-trip
-///    is a large net win, so this pin rises by one rather than the round-trip
-///    being kept.
+///    full network round-trip PLUS a whole `QueryResult` (three allocations
+///    now the eager `Vec<Row>` is gone — see `materialize_alloc`'s pinned
+///    figure) to recover the same string. Trading one cold-path `String` for a
+///    round-trip is a large net win, so this pin rises by one rather than the
+///    round-trip being kept.
 ///
 /// An honest baseline, not an aspirational zero. A later slice that trims either
 /// cost must lower this pin — a visible, reviewed number.

@@ -1,11 +1,12 @@
 //! `Surface` → `Row` materialisation shared by the blocking and async drivers.
 //!
 //! The sans-I/O engine surfaces query results as RAW wire bytes through a
-//! [`Surface`] sink — it is `no_std` and cannot name a typed [`Row`]. This
-//! module turns that borrowed-bytes stream into the owned, Arc-arena [`Row`] the
-//! driver API returns: one [`ArenaBuilder`] per result set, so the whole result
-//! costs the arena's four allocations regardless of row count, never a per-row
-//! allocation.
+//! [`Surface`] sink — it is `no_std` and cannot name a typed [`Row`](crate::Row).
+//! This module turns that borrowed-bytes stream into the owned, Arc-arena
+//! [`RowSet`] the driver API returns: one [`ArenaBuilder`] per result set, so the
+//! whole result costs the arena's allocations regardless of row count, never a
+//! per-row allocation — and the [`RowSet`] mints each [`Row`](crate::Row) handle
+//! lazily on access, so no eager `Vec<Row>` is built either.
 //!
 //! A [`ResultCollector`] is fed every [`Surface`] event a verb's pump produces.
 //! The pump's sink can only ever `Continue` (its break payload is uninhabited),
@@ -24,7 +25,7 @@
 use bsql_postgres_proto::engine::Surface;
 
 use crate::error::{DbError, DriverError};
-use crate::types::{ArenaBuilder, Notification, Row};
+use crate::types::{ArenaBuilder, Notification, RowSet};
 
 /// A collector that parks a server `ErrorResponse` for a driver's settle step
 /// to classify.
@@ -51,8 +52,9 @@ impl DbErrorSink for ResultCollector {
 /// The fully materialised result of a row-collecting verb.
 #[derive(Debug)]
 pub struct CollectedResult {
-    /// The result rows (empty for a command that returns none).
-    pub rows: Vec<Row>,
+    /// The result rows as one lazily-addressed [`RowSet`] (empty for a command
+    /// that returns none) — one shared arena, `Row` handles minted on access.
+    pub rows: RowSet,
     /// The command tag (`"SELECT 5"`, `"INSERT 0 1"`, …); empty when none.
     pub command_tag: String,
     /// The affected-row count from the command tag (0 for a countless command).
@@ -196,8 +198,10 @@ impl ResultCollector {
             return Err(e);
         }
         let rows = match self.builder {
+            // A verb that produced no `DataRow` never created a builder; its
+            // result is the empty (arena-less) `RowSet`.
             Some(b) => b.finish()?,
-            None => Vec::new(),
+            None => RowSet::default(),
         };
         Ok(CollectedResult {
             rows,
@@ -449,10 +453,12 @@ mod result_collector_width_tests {
         c.feed(Surface::Row(&row_body(&[b"2", b"two"])));
         let result = c.finish().expect("uniform-width rows seal cleanly");
         assert_eq!(result.rows.len(), 2);
-        assert_eq!(result.rows[0].get_raw(0), Ok(Some(&b"1"[..])));
-        assert_eq!(result.rows[0].get_raw(1), Ok(Some(&b"one"[..])));
-        assert_eq!(result.rows[1].get_raw(0), Ok(Some(&b"2"[..])));
-        assert_eq!(result.rows[1].get_raw(1), Ok(Some(&b"two"[..])));
+        let r0 = result.rows.get(0).expect("row 0");
+        let r1 = result.rows.get(1).expect("row 1");
+        assert_eq!(r0.get_raw(0), Ok(Some(&b"1"[..])));
+        assert_eq!(r0.get_raw(1), Ok(Some(&b"one"[..])));
+        assert_eq!(r1.get_raw(0), Ok(Some(&b"2"[..])));
+        assert_eq!(r1.get_raw(1), Ok(Some(&b"two"[..])));
     }
 }
 

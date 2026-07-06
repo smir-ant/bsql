@@ -34,7 +34,7 @@ fn run() -> Result<(), bsql::pg_sync::DriverError> {
     for i in 0..h::RSS_SELECT_ITERS {
         let id = (i % h::SEED_ROWS) + 1;
         let qr = conn.query_prepared(&select, &(id,))?;
-        for row in &qr.rows {
+        for row in qr.iter() {
             // Read every column, exactly like the latency benches.
             if let Some(v) = row.get_i32(0)? {
                 acc = acc.wrapping_add(i64::from(v));
