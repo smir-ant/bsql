@@ -13,7 +13,9 @@
 //! The user supplies parameters as a tuple, e.g., `(42i32, "hi", true)`.
 //! `ParamsWriter` threads that tuple through the wire format WITHOUT
 //! any intermediate buffer — each element's [`crate::decode::EncodeBinary`]
-//! impl writes directly into the caller's [`crate::write_buf::WriteBuf`].
+//! impl writes directly into the caller's [`crate::write_buf::FrameSink`]
+//! (the GROWABLE send buffer in production, so the parameter block is
+//! unbounded; a bounded [`crate::write_buf::WriteBuf`] in the byte-twin tests).
 //!
 //! # Tier invariants
 //!
@@ -30,7 +32,9 @@
 //!   `Result<(), WriteBufFull>` — buffer overflow is classified,
 //!   not silent.
 //! - **Zero alloc**: no heap, no stack fixture buffer. Direct stream
-//!   into the output `WriteBuf`.
+//!   into the output [`crate::write_buf::FrameSink`] (which, for the growable
+//!   send-buffer target, reuses its warm capacity — a small-parameter Bind on a
+//!   warm connection allocates nothing).
 //!
 //! # Scope — why arity 16
 //!
@@ -67,7 +71,7 @@
 //! `maybe_email` as NULL-or-bytes with zero user intervention.
 
 use crate::decode::{EncodeBinary, FormatCode};
-use crate::write_buf::{WriteBuf, WriteBufFull};
+use crate::write_buf::{FrameSink, WriteBufFull};
 
 /// Module-private seal. Only the tuple impls inside this crate can
 /// opt a type into [`ParamsWriter`], and only `ParamEncoder` impls
@@ -96,7 +100,7 @@ mod sealed {
 /// two impls exist:
 /// - `impl<T: EncodeBinary> ParamEncoder for T` — the non-NULL
 ///   path, writes `len` + bytes via
-///   [`WriteBuf::with_i32_length_prefixed_body`].
+///   [`crate::write_buf::WriteBuf::with_i32_length_prefixed_body`].
 /// - `impl<T: EncodeBinary> ParamEncoder for Option<T>` — the
 ///   NULL-aware path.
 ///
@@ -123,8 +127,9 @@ pub trait ParamEncoder: sealed::ParamEncoderSealed {
     const OID: u32;
 
     /// Write exactly one param's `{len_i32, [u8; len]}` (non-NULL)
-    /// or `{-1}` (NULL) pair into `dst`.
-    fn write_param(&self, dst: &mut WriteBuf) -> Result<(), WriteBufFull>;
+    /// or `{-1}` (NULL) pair into `dst` — generic over the
+    /// [`FrameSink`] target (streaming send buffer or bounded [`crate::write_buf::WriteBuf`]).
+    fn write_param<S: FrameSink>(&self, dst: &mut S) -> Result<(), WriteBufFull>;
 }
 
 // Blanket impl for all non-Option EncodeBinary types.
@@ -132,7 +137,7 @@ impl<T: EncodeBinary> sealed::ParamEncoderSealed for T {}
 impl<T: EncodeBinary> ParamEncoder for T {
     const OID: u32 = <T as EncodeBinary>::OID;
     #[inline]
-    fn write_param(&self, dst: &mut WriteBuf) -> Result<(), WriteBufFull> {
+    fn write_param<S: FrameSink>(&self, dst: &mut S) -> Result<(), WriteBufFull> {
         dst.with_i32_length_prefixed_body(|w| self.encode_to(w))
     }
 }
@@ -145,7 +150,7 @@ impl<T: EncodeBinary> sealed::ParamEncoderSealed for Option<T> {}
 impl<T: EncodeBinary> ParamEncoder for Option<T> {
     const OID: u32 = <T as EncodeBinary>::OID;
     #[inline]
-    fn write_param(&self, dst: &mut WriteBuf) -> Result<(), WriteBufFull> {
+    fn write_param<S: FrameSink>(&self, dst: &mut S) -> Result<(), WriteBufFull> {
         match self {
             Some(value) => dst.with_i32_length_prefixed_body(|w| value.encode_to(w)),
             // SQL NULL wire form: length = -1, no body bytes follow.
@@ -155,24 +160,14 @@ impl<T: EncodeBinary> ParamEncoder for Option<T> {
 }
 
 /// Upper bound on tuple arity supported by [`ParamsWriter`] impls
-/// in this module. Referenced by [`crate::write_buf::max_bind_message_size`]
-/// for the worst-case Bind-frame size computation — changing this
-/// const without updating the tuple-impl invocation list would
-/// silently break the budget.
+/// in this module — a COMPILE-TIME monomorphisation choice (tuple impls cover
+/// arity `0..=16`), NOT a byte cap. The per-parameter data is UNBOUNDED: a Bind
+/// streams its parameter block onto the growable send buffer via
+/// [`FrameSink`], so a single multi-kilobyte `jsonb` / `bytea` / array
+/// parameter — or up to 16 of them — binds with no size ceiling. Changing this
+/// const without updating the tuple-impl invocation list would silently break
+/// the arity coverage.
 pub const MAX_PARAMS_ARITY: usize = 16;
-
-/// Upper bound on total parameter-data bytes across all 16 params
-/// in a single Bind frame. Per-param individual size isn't capped
-/// structurally — the caller can send one 1 KB text param OR 16 ×
-/// 64-byte params, provided the SUM stays under this limit.
-///
-/// Enforcement is runtime (via [`crate::write_buf::WriteBufFull`]
-/// when the encoded bytes exceed the buffer's remaining capacity),
-/// classified as tier-2 structural. The const is consulted by
-/// [`crate::write_buf::max_bind_message_size`] to size the worst
-/// case against [`crate::write_buf::MAX_OWNED_SEND_LEN`] at build
-/// time (tier-1 compile).
-pub const MAX_PARAMS_DATA_TOTAL: usize = 1024;
 
 /// Serialise a tuple of PG parameter values into a Bind frame.
 ///
@@ -212,16 +207,17 @@ pub trait ParamsWriter: sealed::ParamsWriterSealed {
     /// block — a sequence of `{len: i32, bytes: [u8; len]}` pairs.
     /// The caller has already emitted everything up to and including
     /// the `n_params` count; this method writes only the parameter
-    /// values themselves.
+    /// values themselves. Generic over the [`FrameSink`] target:
+    /// production streams the block onto the GROWABLE send buffer (so the
+    /// parameter block is UNBOUNDED — an arbitrarily large `jsonb` / `bytea` /
+    /// array binds), while tests build into a bounded [`crate::write_buf::WriteBuf`].
     ///
     /// # Errors
     ///
-    /// [`WriteBufFull`] if any element overflows the buffer. The
-    /// Bind-frame const-assert pins the worst-case size against
-    /// `MAX_OWNED_SEND_LEN`; in production the error branch is
-    /// architecturally dead but surfaces as a classified error
-    /// rather than a panic.
-    fn write_params(&self, dst: &mut WriteBuf) -> Result<(), WriteBufFull>;
+    /// [`WriteBufFull`] if a sink rejects a write. For the growable production
+    /// sink this is only the architecturally-dead case of a body exceeding the
+    /// `u32` / `i32` wire length field — a classified error, never a panic.
+    fn write_params<S: FrameSink>(&self, dst: &mut S) -> Result<(), WriteBufFull>;
 }
 
 // ─────────────────────── Tuple impls via macro ───────────────────
@@ -244,7 +240,7 @@ macro_rules! params_writer_impl {
             const FORMATS: &'static [FormatCode] = &[];
             const OIDS: &'static [u32] = &[];
             #[inline]
-            fn write_params(&self, _dst: &mut WriteBuf) -> Result<(), WriteBufFull> {
+            fn write_params<S: FrameSink>(&self, _dst: &mut S) -> Result<(), WriteBufFull> {
                 Ok(())
             }
         }
@@ -276,7 +272,7 @@ macro_rules! params_writer_impl {
             const OIDS: &'static [u32] = &[$(<$t as ParamEncoder>::OID),+];
 
             #[inline]
-            fn write_params(&self, dst: &mut WriteBuf) -> Result<(), WriteBufFull> {
+            fn write_params<S: FrameSink>(&self, dst: &mut S) -> Result<(), WriteBufFull> {
                 $(
                     // Each param goes through `ParamEncoder::write_param`
                     // which handles len-prefix + body (non-NULL) or
@@ -383,6 +379,7 @@ mod tests {
     //! emits. Catches any seam where `with_i32_length_prefixed_body`
     //! / `encode_to` pairing desyncs.
     use super::*;
+    use crate::write_buf::WriteBuf;
 
     #[test]
     fn arity_zero_writes_nothing() {

@@ -430,9 +430,10 @@ const ENGINE_ERROR_VARIANTS: usize = 14;
 const ACTIVE_VERBS: usize = 20;
 /// `core::hint::cold_path()` classified-branch markers across `engine/`.
 /// Reproduce: `grep -rho 'core::hint::cold_path()' crates/postgres/proto/src/engine/*.rs | wc -l`
-/// (45 includes the COPY-in `write_all` `WriteZero`/`SendOverrun` branches and
-/// `query_params_fused`'s oversize-SQL `FrameTooLong` branch.)
-const COLD_CLASSIFIED_BRANCHES: usize = 45;
+/// (46 includes the COPY-in `write_all` `WriteZero`/`SendOverrun` branches,
+/// `query_params_fused`'s oversize-SQL `FrameTooLong` branch, and the streaming
+/// `Bind`'s `frame_too_long` overflow landing.)
+const COLD_CLASSIFIED_BRANCHES: usize = 46;
 /// `#[non_exhaustive]` attribute lines across `engine/`.
 /// Reproduce: `grep -rcE '^#\[non_exhaustive\]' crates/postgres/proto/src/engine/*.rs` (summed)
 const NON_EXHAUSTIVE_ATTRS: usize = 4;

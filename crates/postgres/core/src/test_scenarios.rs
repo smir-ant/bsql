@@ -557,15 +557,17 @@ fn sql_extreme_values() {
     assert!(r.rows[0].is_null(1));
     assert_eq!(r.rows[0].get_str(2), Ok(Some(" ")));
 
-    // Long text via params (limited by MAX_PARAMS_DATA_TOTAL=1024)
+    // Long text via params — an 8 KiB value, FAR past the old ~2 KiB bounded-
+    // Bind cap. The Bind now streams its parameter block onto the growable send
+    // buffer, so there is no fixed cap on parameter size.
     c.execute_sql("CREATE TEMP TABLE longtext(v text)").expect("create");
-    let long = "x".repeat(900);
-    c.execute_params("INSERT INTO longtext VALUES ($1)", &(long.as_str(),)).expect("insert 900");
+    let long = "x".repeat(8000);
+    c.execute_params("INSERT INTO longtext VALUES ($1)", &(long.as_str(),)).expect("insert 8000");
     let r = c.query_sql("SELECT length(v), v FROM longtext").expect("select");
-    assert_eq!(r.rows[0].get_i32(0), Ok(Some(900)));
-    assert_eq!(r.rows[0].get_str(1).expect("v decodes").map(|s| s.len()), Some(900));
+    assert_eq!(r.rows[0].get_i32(0), Ok(Some(8000)));
+    assert_eq!(r.rows[0].get_str(1).expect("v decodes").map(|s| s.len()), Some(8000));
 
-    // Very long text via SQL literal (bypasses param limit)
+    // Very long text via SQL literal (an alternate large-value path)
     let big_literal = "y".repeat(50_000);
     c.execute_sql(&format!("INSERT INTO longtext VALUES ('{big_literal}')")).expect("insert 50K literal");
     let r = c.query_sql("SELECT length(v) FROM longtext WHERE v LIKE 'y%'").expect("select big");

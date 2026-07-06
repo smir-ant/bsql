@@ -2779,13 +2779,19 @@ pub trait EncodeBinary: sealed::EncodeBinarySealed {
     /// for the surrounding per-param length prefix (PG Bind frame
     /// layout); `encode_to` writes only the payload bytes.
     ///
+    /// Generic over the [`crate::write_buf::FrameSink`] target: production
+    /// binds stream onto the GROWABLE send buffer (so an arbitrarily large
+    /// `jsonb` / `bytea` / array parameter is not capped), while tests and the
+    /// byte-twin reference build into the bounded [`crate::write_buf::WriteBuf`]
+    /// — the same code over both sinks, so their output cannot drift.
+    ///
     /// # Errors
     ///
-    /// [`crate::write_buf::WriteBufFull`] if the buffer can't fit
-    /// the encoded output — architecturally-bounded at the call
-    /// site via the Bind-message size const-assert, but surfaced
-    /// as a classified error rather than a panic.
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    /// [`crate::write_buf::WriteBufFull`] if the sink rejects the write — for
+    /// the growable sink only the architecturally-dead case of a body exceeding
+    /// the `u32` / `i32` wire length field, surfaced as a classified error
+    /// rather than a panic.
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>;
 }
 
@@ -2796,7 +2802,7 @@ macro_rules! impl_encode_binary_int {
             impl EncodeBinary for $t {
                 const OID: u32 = $oid;
                 #[inline]
-                fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+                fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
                     -> Result<(), crate::write_buf::WriteBufFull>
                 {
                     dst.$push(*self)
@@ -2816,7 +2822,7 @@ impl sealed::EncodeBinarySealed for i64 {}
 impl EncodeBinary for i64 {
     const OID: u32 = oids::INT8;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_i64_be(*self)
@@ -2828,7 +2834,7 @@ impl sealed::EncodeBinarySealed for bool {}
 impl EncodeBinary for bool {
     const OID: u32 = oids::BOOL;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_u8(u8::from(*self))
@@ -2841,7 +2847,7 @@ impl sealed::EncodeBinarySealed for &str {}
 impl EncodeBinary for &str {
     const OID: u32 = oids::TEXT;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_bytes(self.as_bytes())
@@ -2859,7 +2865,7 @@ macro_rules! impl_encode_binary_float {
             impl EncodeBinary for $t {
                 const OID: u32 = $oid;
                 #[inline]
-                fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+                fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
                     -> Result<(), crate::write_buf::WriteBufFull>
                 {
                     dst.push_bytes(&self.to_be_bytes())
@@ -2878,7 +2884,7 @@ impl sealed::EncodeBinarySealed for &[u8] {}
 impl EncodeBinary for &[u8] {
     const OID: u32 = oids::BYTEA;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_bytes(self)
@@ -2894,7 +2900,7 @@ impl sealed::EncodeBinarySealed for Uuid {}
 impl EncodeBinary for Uuid {
     const OID: u32 = oids::UUID;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_bytes(self.as_bytes())
@@ -2906,7 +2912,7 @@ impl sealed::EncodeBinarySealed for Timestamptz {}
 impl EncodeBinary for Timestamptz {
     const OID: u32 = oids::TIMESTAMPTZ;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_i64_be(self.as_micros())
@@ -2918,7 +2924,7 @@ impl sealed::EncodeBinarySealed for Timestamp {}
 impl EncodeBinary for Timestamp {
     const OID: u32 = oids::TIMESTAMP;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_i64_be(self.as_micros())
@@ -2931,7 +2937,7 @@ impl sealed::EncodeBinarySealed for Date {}
 impl EncodeBinary for Date {
     const OID: u32 = oids::DATE;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_i32_be(self.to_days())
@@ -2943,7 +2949,7 @@ impl sealed::EncodeBinarySealed for Time {}
 impl EncodeBinary for Time {
     const OID: u32 = oids::TIME;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_i64_be(self.as_micros())
@@ -2957,7 +2963,7 @@ impl sealed::EncodeBinarySealed for Interval {}
 impl EncodeBinary for Interval {
     const OID: u32 = oids::INTERVAL;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_i64_be(self.micros())?;
@@ -2971,7 +2977,7 @@ impl sealed::EncodeBinarySealed for Json {}
 impl EncodeBinary for Json {
     const OID: u32 = oids::JSON;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_bytes(self.as_str().as_bytes())
@@ -2984,7 +2990,7 @@ impl sealed::EncodeBinarySealed for Jsonb {}
 impl EncodeBinary for Jsonb {
     const OID: u32 = oids::JSONB;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_u8(1)?;
@@ -3001,7 +3007,7 @@ impl sealed::EncodeBinarySealed for Numeric {}
 impl EncodeBinary for Numeric {
     const OID: u32 = oids::NUMERIC;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         let digits = self.base_10000_digits();
@@ -3065,9 +3071,9 @@ impl EncodeBinary for Numeric {
 /// type OID, so the header's `element_oid` can never disagree with the
 /// bytes that follow.
 #[inline]
-fn encode_array_1d<T: EncodeBinary>(
+fn encode_array_1d<T: EncodeBinary, S: crate::write_buf::FrameSink>(
     elems: &[T],
-    dst: &mut crate::write_buf::WriteBuf,
+    dst: &mut S,
 ) -> Result<(), crate::write_buf::WriteBufFull> {
     // An empty array is PG's canonical zero-dimension form: `array_send`
     // writes `ndim = 0` with NO dimension or lower-bound words (verified
@@ -3107,10 +3113,10 @@ macro_rules! impl_encode_binary_array {
             impl<'array> EncodeBinary for &'array [$elem] {
                 const OID: u32 = $array_oid;
                 #[inline]
-                fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+                fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
                     -> Result<(), crate::write_buf::WriteBufFull>
                 {
-                    encode_array_1d::<$elem>(self, dst)
+                    encode_array_1d::<$elem, S>(self, dst)
                 }
             }
         )+
@@ -3138,10 +3144,10 @@ impl sealed::EncodeBinarySealed for &[&str] {}
 impl EncodeBinary for &[&str] {
     const OID: u32 = oids::TEXT_ARRAY;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
-        encode_array_1d::<&str>(self, dst)
+        encode_array_1d::<&str, S>(self, dst)
     }
 }
 
@@ -3152,10 +3158,10 @@ impl sealed::EncodeBinarySealed for &[&[u8]] {}
 impl EncodeBinary for &[&[u8]] {
     const OID: u32 = oids::BYTEA_ARRAY;
     #[inline]
-    fn encode_to(&self, dst: &mut crate::write_buf::WriteBuf)
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
         -> Result<(), crate::write_buf::WriteBufFull>
     {
-        encode_array_1d::<&[u8]>(self, dst)
+        encode_array_1d::<&[u8], S>(self, dst)
     }
 }
 

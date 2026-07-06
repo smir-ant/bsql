@@ -174,6 +174,21 @@ fn enqueue_frame<E>(
     Ok(())
 }
 
+/// Classify a streamed-`Bind` builder overflow as [`EngineError::FrameTooLong`].
+///
+/// The single cold-path landing for the STREAMING Bind assembly — the peer of
+/// [`enqueue_frame`]'s bounded-builder overflow. A `Bind` streams its parameter
+/// block straight onto the growable send buffer via [`SendBuf::frame`], so it
+/// has NO fixed capacity cap; this maps the only remaining, architecturally-dead
+/// overflow (a frame body exceeding the `u32` / `i32` wire length field — beyond
+/// 2 GiB, an OOM long before then) to the same classified error a bounded
+/// frame's overflow raises, never a panic or truncation.
+#[inline]
+fn frame_too_long<E>(_: WriteBufFull) -> EngineError<E> {
+    core::hint::cold_path();
+    EngineError::FrameTooLong
+}
+
 /// The COPY-in batched-flush threshold, in bytes.
 ///
 /// Streamed `CopyData` accumulates in the send buffer and is flushed to the
@@ -349,9 +364,12 @@ where
         })?;
         send_buf.enqueue(q.parse_template);
     }
-    enqueue_frame(send_buf, |wb| {
-        frames::build_bind_prepared(wb, q.bind_execute_prefix, args)
-    })?;
+    // The Bind streams DIRECTLY onto the growable send buffer (unbounded params);
+    // the Close/Parse above and Execute/Sync below are fixed-size and stay
+    // bounded. `send_buf.frame()`'s borrow ends with this statement, freeing
+    // `send_buf` for the following enqueues.
+    frames::build_bind_prepared(&mut send_buf.frame(), q.bind_execute_prefix, args)
+        .map_err(frame_too_long)?;
     send_buf.enqueue(&crate::prepared::EXECUTE_EMPTY_PORTAL_NO_LIMIT);
     send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
     if reuse {
@@ -728,10 +746,11 @@ impl<'b, T: Transport> Engine<'b, T> {
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
-        // Unnamed portal; the named statement was parsed by `prepare`.
-        enqueue_frame(send_buf, |wb| {
-            frames::build_bind(wb, b"", stmt.stmt_name().as_bytes(), params)
-        })?;
+        // Unnamed portal; the named statement was parsed by `prepare`. The Bind
+        // streams onto the growable send buffer (unbounded params); Execute+Sync
+        // below stay bounded.
+        frames::build_bind(&mut send_buf.frame(), b"", stmt.stmt_name().as_bytes(), params)
+            .map_err(frame_too_long)?;
         enqueue_frame(send_buf, |wb| frames::build_execute(wb, b"", 0))?;
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
         active.begin_bind_execute(stmt.result_oids());
@@ -803,8 +822,10 @@ impl<'b, T: Transport> Engine<'b, T> {
         send_buf.enqueue(sql_bytes);
         send_buf.enqueue(&frames::PARSE_SQL_TRAILER);
         // Bind(portal "" from the unnamed statement ""); Describe(portal "");
-        // Execute(portal "", no row limit); Sync — one pipelined batch.
-        enqueue_frame(send_buf, |wb| frames::build_bind(wb, b"", b"", params))?;
+        // Execute(portal "", no row limit); Sync — one pipelined batch. The Bind
+        // streams onto the growable send buffer (unbounded params); the rest are
+        // fixed-size and stay bounded.
+        frames::build_bind(&mut send_buf.frame(), b"", b"", params).map_err(frame_too_long)?;
         enqueue_frame(send_buf, |wb| frames::build_describe_portal(wb, b""))?;
         enqueue_frame(send_buf, |wb| frames::build_execute(wb, b"", 0))?;
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);

@@ -186,32 +186,14 @@ const _: () = assert!(
      in lockstep. `5` here is `SYNC_WIRE_BYTES.len()`.",
 );
 
-/// Worst-case byte size of a PostgreSQL `Bind` (`'B'`) frame —
-/// tag + length prefix + portal name + stmt name + n_param_formats
-/// + format codes + n_params + per-param length+data + n_result_formats.
-///
-/// Per-param format codes: [`crate::params::MAX_PARAMS_ARITY`] × 2 bytes.
-/// Per-param length prefixes: [`crate::params::MAX_PARAMS_ARITY`] × 4 bytes.
-/// Per-param data bytes total: [`crate::params::MAX_PARAMS_DATA_TOTAL`].
-///
-/// Bumping either const without growing [`MAX_OWNED_SEND_LEN`]
-/// fails the `const _` assert on the Bind+Execute+Sync bundle below.
-pub const fn max_bind_message_size() -> usize {
-    1usize // tag 'B'
-        .saturating_add(4) // length prefix (includes itself)
-        .saturating_add(crate::ident::MAX_PG_NAME_LEN)
-        .saturating_add(1) // portal NUL
-        .saturating_add(crate::ident::MAX_PG_NAME_LEN)
-        .saturating_add(1) // stmt NUL
-        .saturating_add(2) // n_param_formats
-        .saturating_add(crate::params::MAX_PARAMS_ARITY.saturating_mul(2)) // format codes
-        .saturating_add(2) // n_params
-        .saturating_add(crate::params::MAX_PARAMS_ARITY.saturating_mul(4)) // per-param length prefixes
-        .saturating_add(crate::params::MAX_PARAMS_DATA_TOTAL) // param data
-        .saturating_add(4) // n_result_formats + 1 code: worst case is the
-        // prepared path's `1, [Binary]` (4 bytes); the non-macro path's
-        // `n_result_formats = 0` (2 bytes) fits within this.
-}
+// The `Bind` (`'B'`) frame is DELIBERATELY not sized against [`WriteBuf`]: its
+// parameter block is UNBOUNDED (a multi-kilobyte `jsonb`, a large `bytea`, a
+// several-hundred-element array), so a fixed-capacity bound would reject
+// legitimate parameters. The Bind therefore streams its body straight onto the
+// growable send buffer with a back-patched length via the [`FrameSink`]
+// abstraction — exactly as the simple-query / Parse / `CopyData` bodies already
+// do — so there is no worst-case-Bind const to pin here and no cap on the
+// parameter block. (Execute, below, is a fixed 5-field frame and stays bounded.)
 
 /// Worst-case byte size of a PostgreSQL `Execute` (`'E'`) frame —
 /// tag + length + portal name NUL-terminated + max_rows i32.
@@ -223,24 +205,16 @@ pub const fn max_execute_message_size() -> usize {
         .saturating_add(4) // max_rows i32
 }
 
-/// Drift-pin: the Bind + Execute + Sync bundle ships in a single
-/// `push_bind_execute` call, so the caller's WriteBuf must fit all
-/// three worst-case messages simultaneously. Bumping
-/// `MAX_PARAMS_DATA_TOTAL` / `MAX_PARAMS_ARITY` / `MAX_PG_NAME_LEN`
-/// without growing `MAX_OWNED_SEND_LEN` is a build failure.
-///
-/// `SYNC_WIRE_BYTES` is a 5-byte static const (tag 'S' + BE u32
-/// length=4); hard-coded as `5` here instead of referencing the
-/// const to avoid a module cycle (wire.rs imports nothing from
-/// write_buf, keeping that direction clean).
+/// Drift-pin: an `Execute` (`'E'`) frame is assembled into its own bounded
+/// [`WriteBuf`] before being queued, so the buffer must fit its worst case.
+/// Bumping `MAX_PG_NAME_LEN` without growing `MAX_OWNED_SEND_LEN` is a build
+/// failure. (The `Bind` that precedes it in the same batch no longer rides a
+/// `WriteBuf` — it streams onto the growable send buffer — so only `Execute`
+/// needs a bounded-frame pin here.)
 const _: () = assert!(
-    MAX_OWNED_SEND_LEN
-        >= max_bind_message_size()
-            .saturating_add(max_execute_message_size())
-            .saturating_add(5),
-    "MAX_OWNED_SEND_LEN below worst-case Bind+Execute+Sync bundle. \
-     Grow MAX_OWNED_SEND_LEN or shrink params::MAX_PARAMS_ARITY / \
-     MAX_PARAMS_DATA_TOTAL / MAX_PG_NAME_LEN.",
+    MAX_OWNED_SEND_LEN >= max_execute_message_size(),
+    "MAX_OWNED_SEND_LEN below worst-case Execute ('E') frame size. \
+     Grow MAX_OWNED_SEND_LEN or shrink MAX_PG_NAME_LEN.",
 );
 
 /// Worst-case byte size of a PostgreSQL `Describe` (`'D'`) frame —
@@ -397,6 +371,139 @@ impl core::error::Error for WriteBufFull {}
 impl fmt::Display for WriteBufFull {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("write buffer full")
+    }
+}
+
+/// Seal for [`FrameSink`] — `pub(crate)` so the growable send-buffer view in
+/// `engine::flush` can opt in, while downstream code cannot introduce a third
+/// sink (the bounded-frame discipline is un-bypassable from outside).
+pub(crate) mod frame_sink_sealed {
+    /// Supertrait seal for [`super::FrameSink`].
+    pub trait Sealed {}
+}
+
+/// The sealed PG-wire byte-sink shared by the two outbound frame assemblers:
+/// the BOUNDED [`WriteBuf`] and the GROWABLE send-buffer view
+/// (`engine::flush::SendFrame`).
+///
+/// # Why an abstraction over two buffers
+///
+/// Every fixed-size request frame (Sync, Execute, Describe, Close, the Parse /
+/// simple-query headers) assembles into the bounded [`WriteBuf`]: its worst
+/// case is const-asserted to fit, so a builder overflow is architecturally
+/// dead. The `Bind` frame is the one exception — its parameter block is
+/// UNBOUNDED (a multi-kilobyte `jsonb`, a large `bytea`, a several-hundred-
+/// element array), so capping it at [`MAX_OWNED_SEND_LEN`] would reject
+/// legitimate parameters. The Bind therefore streams its body straight onto the
+/// growable send buffer with a back-patched length, exactly as the
+/// simple-query / Parse / `CopyData` bodies already do.
+///
+/// Both targets expose the SAME push primitives through this trait, so the
+/// frame builders ([`crate::engine::frames`]) and the whole parameter-encode
+/// tree ([`crate::decode::EncodeBinary`] / [`crate::params::ParamsWriter`]) are
+/// written ONCE, generic over the sink — the bounded byte-twin reference and
+/// the streaming production assembly cannot drift byte-for-byte because they are
+/// literally the same code over two sinks.
+///
+/// # Error
+///
+/// Every method returns [`WriteBufFull`] on overflow — for [`WriteBuf`] a true
+/// capacity overflow, for the growable sink the (architecturally-dead) case of
+/// a frame body exceeding the `u32` / `i32` wire length field. Both are the
+/// crate's single "outbound frame too long" sentinel, classified never
+/// panicked — the same one the streamed simple-query / Parse / `CopyData`
+/// header builders already return on a `u32` length overflow.
+pub trait FrameSink: frame_sink_sealed::Sealed {
+    /// Push a single byte.
+    fn push_u8(&mut self, byte: u8) -> Result<(), WriteBufFull>;
+    /// Push raw bytes.
+    fn push_bytes(&mut self, data: &[u8]) -> Result<(), WriteBufFull>;
+    /// Push a big-endian `i16`.
+    fn push_i16_be(&mut self, val: i16) -> Result<(), WriteBufFull>;
+    /// Push a big-endian `u16`.
+    fn push_u16_be(&mut self, val: u16) -> Result<(), WriteBufFull>;
+    /// Push a big-endian `i32`.
+    fn push_i32_be(&mut self, val: i32) -> Result<(), WriteBufFull>;
+    /// Push a big-endian `u32`.
+    fn push_u32_be(&mut self, val: u32) -> Result<(), WriteBufFull>;
+    /// Push a big-endian `i64`.
+    fn push_i64_be(&mut self, val: i64) -> Result<(), WriteBufFull>;
+    /// Push a NUL-terminated string (bytes + `\0`). The input must not contain
+    /// NUL — the identifier newtypes guarantee this at construction.
+    fn push_nul_terminated(&mut self, data: &[u8]) -> Result<(), WriteBufFull>;
+    /// Write a top-level length-prefixed region (PG's "length includes itself
+    /// but excludes the tag" convention): reserve a 4-byte placeholder, run
+    /// `body`, then back-patch the placeholder with the total byte count.
+    fn with_length_prefix<F>(&mut self, body: F) -> Result<(), WriteBufFull>
+    where
+        F: FnOnce(&mut Self) -> Result<(), WriteBufFull>,
+        Self: Sized;
+    /// Write an `i32` length-prefixed body where the length counts ONLY the
+    /// body bytes (PG's Bind per-param `{len i32, bytes}` shape): reserve a
+    /// 4-byte placeholder, run `body`, then back-patch with the body-only count.
+    fn with_i32_length_prefixed_body<F>(&mut self, body: F) -> Result<(), WriteBufFull>
+    where
+        F: FnOnce(&mut Self) -> Result<(), WriteBufFull>,
+        Self: Sized;
+}
+
+impl frame_sink_sealed::Sealed for WriteBuf {}
+
+/// [`WriteBuf`] is the BOUNDED sink: every method forwards to the inherent
+/// bounded builder (an overflow is the classified [`WriteBufFull`]). This is
+/// the target for the fixed-size frames and the byte-twin reference build of
+/// the Bind; the production `Bind` assembly uses the growable send-buffer sink.
+///
+/// Each method calls the same-named INHERENT method by explicit `WriteBuf::`
+/// path — never `self.method(...)` — so a future rename of an inherent method
+/// is a compile error here rather than a silent self-recursion through the
+/// trait method.
+impl FrameSink for WriteBuf {
+    #[inline]
+    fn push_u8(&mut self, byte: u8) -> Result<(), WriteBufFull> {
+        WriteBuf::push_u8(self, byte)
+    }
+    #[inline]
+    fn push_bytes(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
+        WriteBuf::push_bytes(self, data)
+    }
+    #[inline]
+    fn push_i16_be(&mut self, val: i16) -> Result<(), WriteBufFull> {
+        WriteBuf::push_i16_be(self, val)
+    }
+    #[inline]
+    fn push_u16_be(&mut self, val: u16) -> Result<(), WriteBufFull> {
+        WriteBuf::push_u16_be(self, val)
+    }
+    #[inline]
+    fn push_i32_be(&mut self, val: i32) -> Result<(), WriteBufFull> {
+        WriteBuf::push_i32_be(self, val)
+    }
+    #[inline]
+    fn push_u32_be(&mut self, val: u32) -> Result<(), WriteBufFull> {
+        WriteBuf::push_u32_be(self, val)
+    }
+    #[inline]
+    fn push_i64_be(&mut self, val: i64) -> Result<(), WriteBufFull> {
+        WriteBuf::push_i64_be(self, val)
+    }
+    #[inline]
+    fn push_nul_terminated(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
+        WriteBuf::push_nul_terminated(self, data)
+    }
+    #[inline]
+    fn with_length_prefix<F>(&mut self, body: F) -> Result<(), WriteBufFull>
+    where
+        F: FnOnce(&mut Self) -> Result<(), WriteBufFull>,
+    {
+        WriteBuf::with_length_prefix(self, body)
+    }
+    #[inline]
+    fn with_i32_length_prefixed_body<F>(&mut self, body: F) -> Result<(), WriteBufFull>
+    where
+        F: FnOnce(&mut Self) -> Result<(), WriteBufFull>,
+    {
+        WriteBuf::with_i32_length_prefixed_body(self, body)
     }
 }
 

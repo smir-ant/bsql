@@ -98,6 +98,7 @@ use core::fmt;
 
 use super::error::EngineError;
 use super::seams::Transport;
+use crate::write_buf::WriteBufFull;
 
 /// Engine-owned outbound send buffer: already-encoded bytes plus a send
 /// cursor.
@@ -326,6 +327,141 @@ impl SendBuf {
     pub fn clear(&mut self) {
         self.buf.clear();
         self.sent = 0;
+    }
+
+    /// Borrow the backing store as a GROWABLE frame builder — the streaming
+    /// peer of the bounded [`WriteBuf`](crate::write_buf::WriteBuf).
+    ///
+    /// The returned [`SendFrame`] appends onto the same buffer
+    /// [`enqueue`](Self::enqueue) does (so the built frame joins the pending
+    /// tail in order), but exposes the PG-wire push primitives with BACK-PATCHED
+    /// length prefixes, so a frame whose total length is only known after its
+    /// body is encoded — the `Bind`, whose parameter block is unbounded — can be
+    /// assembled in place without an intermediate bounded buffer or a size
+    /// pre-pass. The view holds no cursor of its own; it only appends, exactly
+    /// like `enqueue`, so a mid-build drop leaves the buffer's send cursor
+    /// untouched (the partial frame is simply unsent bytes a later `reset`
+    /// reclaims). Growable on purpose: bounding a single pipelined frame is the
+    /// verb layer's concern, not this cursor's (see the module docs).
+    #[inline]
+    pub(crate) fn frame(&mut self) -> SendFrame<'_> {
+        SendFrame { buf: &mut self.buf }
+    }
+}
+
+/// A GROWABLE [`crate::write_buf::FrameSink`] over a [`SendBuf`]'s backing
+/// store — the streaming counterpart of the bounded
+/// [`WriteBuf`](crate::write_buf::WriteBuf).
+///
+/// Minted by [`SendBuf::frame`]. Every push appends to the borrowed buffer
+/// (reusing its warm capacity — a small-parameter Bind on a warm buffer
+/// allocates nothing), and the two length-prefix helpers reserve a 4-byte
+/// placeholder, run the body, then back-patch it with the final count. Because
+/// the placeholder is patched by ABSOLUTE index (not a raw pointer), a body
+/// that reallocates the buffer mid-build leaves the offset valid — the reason a
+/// growable back-patch is sound where a pointer-based one would dangle.
+///
+/// The only failure is a frame body exceeding the `u32` / `i32` wire length
+/// field (> 2 GiB — architecturally dead, a process would exhaust memory
+/// first), surfaced as the crate's [`WriteBufFull`](crate::write_buf::WriteBufFull)
+/// "outbound frame too long" sentinel, classified never panicked — the same one
+/// the streamed simple-query / Parse / `CopyData` headers already return.
+#[derive(Debug)]
+pub(crate) struct SendFrame<'a> {
+    /// The [`SendBuf`]'s backing store, borrowed for in-place frame assembly.
+    buf: &'a mut Vec<u8>,
+}
+
+impl crate::write_buf::frame_sink_sealed::Sealed for SendFrame<'_> {}
+
+impl crate::write_buf::FrameSink for SendFrame<'_> {
+    #[inline]
+    fn push_u8(&mut self, byte: u8) -> Result<(), WriteBufFull> {
+        self.buf.push(byte);
+        Ok(())
+    }
+    #[inline]
+    fn push_bytes(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
+        self.buf.extend_from_slice(data);
+        Ok(())
+    }
+    #[inline]
+    fn push_i16_be(&mut self, val: i16) -> Result<(), WriteBufFull> {
+        self.buf.extend_from_slice(&val.to_be_bytes());
+        Ok(())
+    }
+    #[inline]
+    fn push_u16_be(&mut self, val: u16) -> Result<(), WriteBufFull> {
+        self.buf.extend_from_slice(&val.to_be_bytes());
+        Ok(())
+    }
+    #[inline]
+    fn push_i32_be(&mut self, val: i32) -> Result<(), WriteBufFull> {
+        self.buf.extend_from_slice(&val.to_be_bytes());
+        Ok(())
+    }
+    #[inline]
+    fn push_u32_be(&mut self, val: u32) -> Result<(), WriteBufFull> {
+        self.buf.extend_from_slice(&val.to_be_bytes());
+        Ok(())
+    }
+    #[inline]
+    fn push_i64_be(&mut self, val: i64) -> Result<(), WriteBufFull> {
+        self.buf.extend_from_slice(&val.to_be_bytes());
+        Ok(())
+    }
+    #[inline]
+    fn push_nul_terminated(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
+        self.buf.extend_from_slice(data);
+        self.buf.push(0);
+        Ok(())
+    }
+    #[inline]
+    fn with_length_prefix<F>(&mut self, body: F) -> Result<(), WriteBufFull>
+    where
+        F: FnOnce(&mut Self) -> Result<(), WriteBufFull>,
+    {
+        // Self-inclusive length (PG convention: the 4-byte field counts itself).
+        let start = self.buf.len();
+        self.buf.extend_from_slice(&[0, 0, 0, 0]); // placeholder
+        body(self)?;
+        let body_len = self.buf.len().saturating_sub(start);
+        let len = u32::try_from(body_len).map_err(|_| WriteBufFull)?;
+        // Patch by ABSOLUTE index via `get_mut` + `first_chunk_mut` — no
+        // unchecked slice index (the forbid wall), and valid even if `body`
+        // reallocated the buffer. The `push_u32_be(0)` placeholder guarantees
+        // `buf.len() >= start + 4`, so the `None` arm is structurally dead;
+        // converting it to an explicit `Err` means a future refactor that
+        // dropped the placeholder fails loudly rather than emitting a zero
+        // length field.
+        let Some(slot) = self.buf.get_mut(start..).and_then(|s| s.first_chunk_mut::<4>()) else {
+            return Err(WriteBufFull);
+        };
+        *slot = len.to_be_bytes();
+        Ok(())
+    }
+    #[inline]
+    fn with_i32_length_prefixed_body<F>(&mut self, body: F) -> Result<(), WriteBufFull>
+    where
+        F: FnOnce(&mut Self) -> Result<(), WriteBufFull>,
+    {
+        // Body-only length (PG Bind per-param: the i32 counts only the value
+        // bytes, not the length field itself).
+        let len_offset = self.buf.len();
+        self.buf.extend_from_slice(&[0, 0, 0, 0]); // placeholder
+        let body_start = self.buf.len();
+        body(self)?;
+        let body_len = self.buf.len().saturating_sub(body_start);
+        let body_len_i32 = i32::try_from(body_len).map_err(|_| WriteBufFull)?;
+        let Some(slot) = self
+            .buf
+            .get_mut(len_offset..)
+            .and_then(|s| s.first_chunk_mut::<4>())
+        else {
+            return Err(WriteBufFull);
+        };
+        *slot = body_len_i32.to_be_bytes();
+        Ok(())
     }
 }
 

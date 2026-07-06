@@ -19,7 +19,7 @@
 use core::ops::ControlFlow;
 use core::str::FromStr as _;
 
-use bsql::{Date, Interval, Numeric, Time, Timestamptz, Uuid};
+use bsql::{Date, Interval, Jsonb, Numeric, Time, Timestamptz, Uuid};
 use bsql_postgres_async::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 bsql::query!(One, "SELECT 1::int4 AS n");
@@ -73,6 +73,12 @@ bsql::query!(
     ByteaAny,
     r"SELECT b FROM (VALUES ('\x01'::bytea), ('\x02'::bytea), ('\x03'::bytea)) t(b) WHERE b = ANY($1)"
 );
+
+// ── BIG-PARAMETER witness (flagship typed path): a big bind streams onto the
+//    growable send buffer instead of failing with `FrameTooLong`. The RESULT is
+//    a single int (not the echoed blob) so the reply row stays well under the
+//    inbound row buffer — the send-side cap (B1) is what this exercises.
+bsql::query!(BigByteaLen, "SELECT length($1::bytea)::int4 AS n");
 
 // ── widened bsql-native types: uuid / timestamptz / timestamp ─────────────
 bsql::query!(
@@ -672,6 +678,69 @@ async fn bytea_array_any_bind_round_trip() {
     let mut got: Vec<Vec<u8>> = rows.iter().map(|r| r.expect("row decodes").b.to_vec()).collect();
     got.sort_unstable();
     assert_eq!(got, vec![vec![0x01u8], vec![0x03u8]], "bytea[] ANY($1)");
+    c.close().await.expect("close");
+}
+
+/// BIG-PARAMETER STREAMING (async): a Bind whose encoded parameters far exceed
+/// the old ~2 KiB bounded-frame cap now round-trips over REAL PG — the fix for
+/// the B1 capability gap. Each of a ~4 KiB `bytea`, a ~5 KiB `jsonb`, and a
+/// 500-element `int4[]` was a `FrameTooLong` before the Bind streamed onto the
+/// growable send buffer (see `frames::bind_stream_twin` for the offline
+/// RED→GREEN unit proof: the SAME builder `Err`s on the bounded `WriteBuf`).
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn big_params_stream_past_the_old_bind_cap() {
+    // Each parameter below encodes to > 4 KiB, FAR past the old ~2 KiB
+    // bounded-`WriteBuf` Bind cap — before the streaming fix each was a
+    // `FrameTooLong` on the wire. The exact round-trip is proven SERVER-SIDE (a
+    // single-`bool` reply comparing the bound value against a server-constructed
+    // reference), so the reply row stays tiny and this isolates the SEND-side
+    // Bind (the reassembling dynamic path would also handle a big reply, but the
+    // send cap is what B1 lifts).
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+
+    // (a) ~4 KiB bytea (a small binary blob / image shape).
+    let big_bytea = vec![0xABu8; 4096];
+    let r = c
+        .query_params_one(
+            "SELECT ($1::bytea = decode(repeat('ab', 4096), 'hex')) AS eq",
+            &(big_bytea.as_slice(),),
+        )
+        .await
+        .expect("query_params_one 4 KiB bytea — was FrameTooLong before streaming");
+    assert_eq!(r.get_bool(0), Ok(Some(true)), "4 KiB bytea param arrived byte-for-byte");
+
+    // (b) ~5 KiB jsonb (a JSON string scalar, an owned param).
+    let big_json = format!("\"{}\"", "x".repeat(5000));
+    let r = c
+        .query_params_one(
+            "SELECT ($1::jsonb = ('\"' || repeat('x', 5000) || '\"')::jsonb) AS eq",
+            &(Jsonb::new(big_json),),
+        )
+        .await
+        .expect("query_params_one ~5 KiB jsonb — was FrameTooLong before streaming");
+    assert_eq!(r.get_bool(0), Ok(Some(true)), "~5 KiB jsonb param arrived");
+
+    // (c) 500-element int4[] — the array wire is ~4 KiB.
+    let big_arr = vec![7i32; 500];
+    let r = c
+        .query_params_one(
+            "SELECT ($1::int4[] = array_fill(7, ARRAY[500])) AS eq",
+            &(big_arr.as_slice(),),
+        )
+        .await
+        .expect("query_params_one 500-elem int4[] — was FrameTooLong before streaming");
+    assert_eq!(r.get_bool(0), Ok(Some(true)), "500-element int4[] param arrived");
+
+    // (d) FLAGSHIP typed `query!` path also streams a big Bind: a 4 KiB bytea
+    //     param, returning its length (a tiny reply row).
+    const BIG_BYTEA: &[u8] = &[0xCDu8; 4096];
+    let n = c
+        .query_one::<BigByteaLenQuery>((BIG_BYTEA,))
+        .await
+        .expect("query_one BigByteaLen(4 KiB) — was FrameTooLong before streaming");
+    assert_eq!(n.n, Some(4096), "typed query! binds a 4 KiB bytea param");
+
     c.close().await.expect("close");
 }
 

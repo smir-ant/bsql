@@ -11,7 +11,7 @@ extern crate bsql_postgres_proto;
 use bsql_postgres_proto::decode::FormatCode;
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::write_buf::WriteBufFull;
-use bsql_postgres_proto::WriteBuf;
+use bsql_postgres_proto::FrameSink;
 
 struct EvilParams;
 
@@ -20,7 +20,7 @@ impl ParamsWriter for EvilParams {
     const FORMATS: &'static [FormatCode] = &[FormatCode::Binary];
     const OIDS: &'static [u32] = &[23]; // INT4
 
-    fn write_params(&self, _dst: &mut WriteBuf) -> Result<(), WriteBufFull> {
+    fn write_params<S: FrameSink>(&self, _dst: &mut S) -> Result<(), WriteBufFull> {
         // A real attack would write hostile injection bytes here.
         Ok(())
     }

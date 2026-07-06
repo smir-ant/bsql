@@ -26,7 +26,7 @@
 use core::ops::ControlFlow;
 use core::str::FromStr as _;
 
-use bsql::{Date, Interval, Numeric, Time, Timestamptz, Uuid};
+use bsql::{Date, Interval, Jsonb, Numeric, Time, Timestamptz, Uuid};
 use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 // One column, fixed-width, NOT NULL -> the borrowed record carries no lifetime
@@ -122,6 +122,11 @@ bsql::query!(
     ByteaAny,
     r"SELECT b FROM (VALUES ('\x01'::bytea), ('\x02'::bytea), ('\x03'::bytea)) t(b) WHERE b = ANY($1)"
 );
+
+// ── BIG-PARAMETER witness (flagship typed path; see the async twin). The reply
+//    is a single int, so the reply row stays small — this isolates the SEND-side
+//    Bind cap (B1).
+bsql::query!(BigByteaLen, "SELECT length($1::bytea)::int4 AS n");
 
 // ── widened bsql-native types: uuid / timestamptz / timestamp ─────────────
 // Literal casts (no schema): each proves PG's binary wire for that type
@@ -756,6 +761,60 @@ fn bytea_array_any_bind_round_trip() {
         vec![vec![0x01u8], vec![0x03u8]],
         "bytea[] ANY($1) returns the matching rows"
     );
+    c.close().expect("close");
+}
+
+/// BIG-PARAMETER STREAMING (sync twin): a Bind whose encoded parameters far
+/// exceed the old ~2 KiB bounded-frame cap now round-trips over REAL PG (the B1
+/// fix). A ~4 KiB `bytea`, a ~5 KiB `jsonb`, and a 500-element `int4[]` — each a
+/// `FrameTooLong` before the Bind streamed onto the growable send buffer.
+#[test]
+#[ignore = "requires local PG"]
+fn big_params_stream_past_the_old_bind_cap() {
+    // Each parameter encodes to > 4 KiB, far past the old ~2 KiB bounded-`WriteBuf`
+    // Bind cap (a `FrameTooLong` before streaming). Round-trip proven SERVER-SIDE
+    // (a single-`bool` reply comparing the bound value to a server reference), so
+    // the reply row stays tiny and this isolates the SEND-side Bind (B1).
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    // (a) ~4 KiB bytea.
+    let big_bytea = vec![0xABu8; 4096];
+    let r = c
+        .query_params_one(
+            "SELECT ($1::bytea = decode(repeat('ab', 4096), 'hex')) AS eq",
+            &(big_bytea.as_slice(),),
+        )
+        .expect("query_params_one 4 KiB bytea — was FrameTooLong before streaming");
+    assert_eq!(r.get_bool(0), Ok(Some(true)), "4 KiB bytea param arrived byte-for-byte");
+
+    // (b) ~5 KiB jsonb (a JSON string scalar).
+    let big_json = format!("\"{}\"", "x".repeat(5000));
+    let r = c
+        .query_params_one(
+            "SELECT ($1::jsonb = ('\"' || repeat('x', 5000) || '\"')::jsonb) AS eq",
+            &(Jsonb::new(big_json),),
+        )
+        .expect("query_params_one ~5 KiB jsonb — was FrameTooLong before streaming");
+    assert_eq!(r.get_bool(0), Ok(Some(true)), "~5 KiB jsonb param arrived");
+
+    // (c) 500-element int4[] — the array wire is ~4 KiB.
+    let big_arr = vec![7i32; 500];
+    let r = c
+        .query_params_one(
+            "SELECT ($1::int4[] = array_fill(7, ARRAY[500])) AS eq",
+            &(big_arr.as_slice(),),
+        )
+        .expect("query_params_one 500-elem int4[] — was FrameTooLong before streaming");
+    assert_eq!(r.get_bool(0), Ok(Some(true)), "500-element int4[] param arrived");
+
+    // (d) FLAGSHIP typed `query!` path also streams a big Bind: a 4 KiB bytea
+    //     param, returning its length (a tiny reply row).
+    const BIG_BYTEA: &[u8] = &[0xCDu8; 4096];
+    let n = c
+        .query_one::<BigByteaLenQuery>((BIG_BYTEA,))
+        .expect("query_one BigByteaLen(4 KiB) — was FrameTooLong before streaming");
+    assert_eq!(n.n, Some(4096), "typed query! binds a 4 KiB bytea param");
+
     c.close().expect("close");
 }
 

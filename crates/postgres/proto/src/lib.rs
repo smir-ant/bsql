@@ -245,7 +245,7 @@ pub use wire::{SslNegotiationOutcome, classify_ssl_response_byte};
 // Drivers call `cancel_request_bytes(pid, secret_key)` to materialise the
 // 16-byte cancel packet, open a parallel TCP connection, write it, close.
 pub use wire::cancel_request_bytes;
-pub use write_buf::{MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
+pub use write_buf::{FrameSink, MAX_OWNED_SEND_LEN, WriteBuf, WriteBufFull};
 
 // ---------------------------------------------------------------------
 // Tier-1 compile gates on Send — every type that crosses a task
