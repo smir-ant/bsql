@@ -163,6 +163,20 @@ impl Pool {
 
             match reused {
                 Some(mut conn) => {
+                    // EXACTLY-ONCE LIVENESS GATE — do NOT fuse this reset into the
+                    // user's first verb to save its round trip. The pre-verb reset
+                    // is the proof the connection is still alive BEFORE the user's
+                    // verb is sent: if it fails, recovery is transparent (evict +
+                    // reconnect + retry) precisely because the verb has NOT run yet,
+                    // so a non-idempotent verb (INSERT, …) is never at risk of double
+                    // execution. Fusing the reset into the first verb would widen the
+                    // ambiguous-failure window to idle-deaths — a fused failure
+                    // cannot distinguish "the verb ran" from "it never arrived" (the
+                    // two-generals problem, irreducible), forcing either a
+                    // double-execution risk or a user-visible error where recovery is
+                    // invisible today. The ~10–25µs local RTT is the minimum price of
+                    // exactly-once, not an optimization gap.
+                    //
                     // Reset a REUSED connection before handing it out. A reset
                     // failure evicts it (drop) and tries the next idle one — never
                     // hand out an un-reset (dirty) connection. The owned permit is
