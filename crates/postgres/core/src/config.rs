@@ -2,21 +2,39 @@ use std::sync::Arc;
 
 /// SSL negotiation mode.
 ///
-/// # Security
+/// # The default is threat-scoped, not a fixed value
 ///
-/// `Prefer` silently falls back to plain TCP if the server refuses SSL.
-/// An active network attacker can forge the single-byte 'N' refusal
-/// (sent before TLS protects the stream), stripping SSL entirely.
-/// Use `Require` for production deployments over untrusted networks.
+/// A [`ConnectConfig`] does NOT store a fixed default `SslMode`. When the
+/// consumer sets none, the effective mode is resolved at connect against the
+/// endpoint by [`ConnectConfig::resolve_ssl_mode`], scoped to where the
+/// interception threat actually exists — a network path:
+///
+/// - a LOCAL endpoint (a unix-domain socket, or a loopback TCP host —
+///   `localhost`, `127.0.0.0/8`, `::1`) resolves to [`Prefer`](Self::Prefer):
+///   there is no network to intercept, and PostgreSQL offers no TLS on a unix
+///   socket.
+/// - a REMOTE endpoint (any other host) resolves to [`Require`](Self::Require):
+///   a remote server that refuses TLS is a loud error, never a silent plaintext
+///   connect an on-path attacker could have forced.
+///
+/// An explicitly-set mode (builder [`ssl_mode`](ConnectConfig::ssl_mode), DSN
+/// `sslmode=`, `PGSSLMODE`) always wins, unchanged.
+///
+/// `Prefer` falls back to plain TCP if the server refuses SSL (with a stderr
+/// warning). An active network attacker can forge the single-byte 'N' refusal
+/// (sent before TLS protects the stream), stripping SSL — which is exactly why
+/// the default resolves to `Require` on a remote path. `Require` is safe against
+/// that downgrade; `Disable` never attempts TLS.
+///
+/// Deliberately NOT `Default`: there is no single default SSL mode to return,
+/// and a `Default` claiming one would contradict the threat-scoped model above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
 pub enum SslMode {
     /// No SSL. Plain TCP. Use only for localhost/unix socket.
     Disable,
     /// Try SSL; fall back to plain TCP if server refuses.
     /// **WARNING**: vulnerable to active SSL-stripping attacks.
     /// Use `Require` for production over untrusted networks.
-    #[default]
     Prefer,
     /// Require SSL. Fail if server refuses. Safe against downgrade.
     Require,
@@ -40,7 +58,21 @@ pub struct ConnectConfig {
     pub database: Option<String>,
     password_inner: Option<zeroize::Zeroizing<String>>,
     pub connect_timeout_secs: u64,
-    pub ssl_mode: SslMode,
+    /// The consumer's EXPLICIT SSL negotiation mode, or `None` when it was left
+    /// to the threat-scoped default resolved at connect by [`resolve_ssl_mode`]
+    /// (LOCAL endpoint → `Prefer`, REMOTE endpoint → `Require`; see [`SslMode`]).
+    ///
+    /// PRIVATE so the builder [`ssl_mode`], the DSN `sslmode=` key, and the
+    /// `PGSSLMODE` env are the only way to set it (each stores `Some`), and so
+    /// the `None`-means-defaulted encoding cannot leak or be bypassed with a
+    /// direct field write — the resolution is centralized in one place, exactly
+    /// like `resolve_endpoint` centralizes the unix-vs-TCP rule. `Option<SslMode>`
+    /// niche-packs into the same 1 byte as a bare `SslMode` (a 3-variant enum has
+    /// spare discriminants for `None`), so the footprint is unchanged.
+    ///
+    /// [`ssl_mode`]: ConnectConfig::ssl_mode
+    /// [`resolve_ssl_mode`]: ConnectConfig::resolve_ssl_mode
+    ssl_mode: Option<SslMode>,
     /// Consumer-supplied PostgreSQL startup parameters (GUCs) sent in the
     /// `StartupMessage` — `search_path`, `application_name`,
     /// `statement_timeout`, or any GUC. Set via [`with_startup_param`],
@@ -75,7 +107,9 @@ pub struct ConnectConfig {
 }
 
 // Footprint pin: four owned Strings/Option<String> (host, user, database,
-// password) plus a u16 port, a u64 timeout, the SslMode byte, the
+// password) plus a u16 port, a u64 timeout, the `Option<SslMode>` byte (niche-
+// packed to 1 B — `SslMode` is a 3-variant enum, so `None` rides a spare
+// discriminant; the same width as the bare `SslMode` it replaced), the
 // startup-params `Vec<(String, String)>` (one 3-word / 24-byte owned handle;
 // its heap buffer is empty until a startup parameter is added), and the
 // custom-CA `Option<Arc<[u8]>>` (a 16-byte fat pointer, niche-packed into 16 B;
@@ -177,8 +211,9 @@ impl ConnectConfig {
             None => (hostport.to_string(), 5432),
         };
 
-        // Parse query params
-        let mut ssl_mode = SslMode::Prefer;
+        // Parse query params. `ssl_mode` stays `None` (defaulted — resolved
+        // per-endpoint at connect) unless an explicit `sslmode=` sets it.
+        let mut ssl_mode: Option<SslMode> = None;
         let mut timeout = 10u64;
         let mut ca_roots_pem: Option<Arc<[u8]>> = None;
         // `host=` OVERRIDES the authority host (libpq: the query parameter wins).
@@ -206,12 +241,14 @@ impl ConnectConfig {
                         host_override = Some(v.to_string());
                     }
                     "sslmode" => {
-                        ssl_mode = match v {
+                        // An explicit `sslmode=` — stored as `Some`, so it wins
+                        // over the threat-scoped default at connect.
+                        ssl_mode = Some(match v {
                             "disable" => SslMode::Disable,
                             "prefer" => SslMode::Prefer,
                             "require" => SslMode::Require,
                             other => return Err(format!("unknown sslmode: {other}")),
-                        };
+                        });
                     }
                     "connect_timeout" => {
                         timeout = v.parse().map_err(|_| format!("invalid timeout: {v}"))?;
@@ -319,15 +356,20 @@ impl ConnectConfig {
         };
 
         let ssl_mode = match std::env::var("PGSSLMODE") {
-            Ok(v) => match v.as_str() {
+            // An explicit `PGSSLMODE` — stored as `Some`, so it wins over the
+            // threat-scoped default at connect.
+            Ok(v) => Some(match v.as_str() {
                 "disable" => SslMode::Disable,
                 "prefer" => SslMode::Prefer,
                 "require" => SslMode::Require,
-                // A typo here would otherwise silently fall to `prefer`, which
-                // permits an SSL-stripping downgrade. Reject it loudly.
+                // A typo here would otherwise silently fall to the default,
+                // which on a local endpoint permits a downgrade. Reject it loudly.
                 other => return Err(format!("unknown PGSSLMODE: {other}")),
-            },
-            Err(VarError::NotPresent) => SslMode::Prefer,
+            }),
+            // Absent → defaulted (resolved per-endpoint at connect), NOT a fixed
+            // `Prefer`: a remote host now defaults to `Require`, closing the
+            // silent-plaintext-to-remote hole.
+            Err(VarError::NotPresent) => None,
             Err(VarError::NotUnicode(_)) => return Err("PGSSLMODE is not valid UTF-8".to_string()),
         };
 
@@ -368,7 +410,10 @@ impl ConnectConfig {
             database: None,
             password_inner: None,
             connect_timeout_secs: 10,
-            ssl_mode: SslMode::default(),
+            // Unset: the effective mode is resolved per-endpoint at connect
+            // (LOCAL → Prefer, REMOTE → Require). An explicit `ssl_mode(..)`
+            // overrides it.
+            ssl_mode: None,
             startup_params: Vec::new(),
             ca_roots_pem: None,
         }
@@ -386,9 +431,15 @@ impl ConnectConfig {
         self
     }
 
-    /// Set SSL mode.
+    /// Set the SSL mode EXPLICITLY, overriding the threat-scoped default.
+    ///
+    /// Without this (and without a DSN `sslmode=` / `PGSSLMODE`), the mode is
+    /// resolved per-endpoint at connect: a LOCAL endpoint → [`SslMode::Prefer`],
+    /// a REMOTE endpoint → [`SslMode::Require`] (see
+    /// [`resolve_ssl_mode`](Self::resolve_ssl_mode)). An explicit setting here
+    /// always wins.
     pub fn ssl_mode(mut self, mode: SslMode) -> Self {
-        self.ssl_mode = mode;
+        self.ssl_mode = Some(mode);
         self
     }
 
@@ -483,6 +534,64 @@ impl ConnectConfig {
     pub fn ca_roots_pem(&self) -> Option<&[u8]> {
         self.ca_roots_pem.as_deref()
     }
+
+    /// Whether the [`SslMode`] was set EXPLICITLY (builder
+    /// [`ssl_mode`](Self::ssl_mode) / DSN `sslmode=` / `PGSSLMODE`), as opposed
+    /// to left to the threat-scoped default resolved by
+    /// [`resolve_ssl_mode`](Self::resolve_ssl_mode). A driver uses this to tell
+    /// an explicitly-required TLS refusal (a violated caller contract) apart from
+    /// a defaulted-remote one (which names the plaintext opt-out in its error).
+    #[must_use]
+    pub fn ssl_mode_is_explicit(&self) -> bool {
+        self.ssl_mode.is_some()
+    }
+
+    /// Resolve the [`SslMode`] in force for a connection to `endpoint` — the
+    /// threat-scoped default when the consumer did not set one explicitly.
+    ///
+    /// An EXPLICIT mode (builder [`ssl_mode`](Self::ssl_mode), DSN `sslmode=`,
+    /// `PGSSLMODE`) always wins, unchanged. When none was set, the default is
+    /// scoped to where an interception threat can actually exist — a network
+    /// path:
+    ///
+    /// - a LOCAL endpoint — a unix-domain socket, or a loopback TCP host
+    ///   (`localhost`, `127.0.0.0/8`, `::1`) — resolves to [`SslMode::Prefer`]:
+    ///   there is no network to intercept, and PostgreSQL offers no TLS on a
+    ///   unix socket.
+    /// - a REMOTE endpoint (any other host, INCLUDING private ranges such as
+    ///   `10.0.0.0/8` or `192.168.0.0/16` — still reached over a network path)
+    ///   resolves to [`SslMode::Require`]: a remote server that refuses TLS is a
+    ///   loud error, never a silent plaintext connect an on-path attacker could
+    ///   have forced.
+    ///
+    /// The local/remote classification is SYNTACTIC — on the CONFIGURED host,
+    /// with no DNS resolution (a resolver round trip would be both slow and a
+    /// TOCTOU hole; the rule reads the host string the consumer supplied). Both
+    /// drivers resolve through this one method, so the rule cannot drift between
+    /// them — exactly as [`resolve_endpoint`] centralizes the unix-vs-TCP rule.
+    #[must_use]
+    pub fn resolve_ssl_mode(&self, endpoint: &Endpoint) -> SslMode {
+        match self.ssl_mode {
+            Some(explicit) => explicit,
+            None if endpoint.is_unix() || host_is_loopback(&self.host) => SslMode::Prefer,
+            None => SslMode::Require,
+        }
+    }
+}
+
+/// Whether `host` names a LOOPBACK network target — the syntactic classification
+/// (no DNS) the threat-scoped SSL default uses to treat an endpoint as local.
+///
+/// True for the hostname `localhost` (case-insensitive — RFC 6761 mandates it
+/// resolve to loopback) and for any IP literal in the loopback ranges
+/// (`127.0.0.0/8` for IPv4, `::1` for IPv6, via
+/// [`IpAddr::is_loopback`](std::net::IpAddr::is_loopback)). Every other host —
+/// a public name, a private-range address (still reached over a network path),
+/// or a string that does not parse as an IP — is NOT loopback, so it is treated
+/// as remote (and defaults to `Require`).
+fn host_is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// A resolved connection target derived from a [`ConnectConfig`]'s `host` +
@@ -603,7 +712,10 @@ mod tests {
             Err(e) => panic!("valid DSN must parse: {e}"),
         };
         assert_eq!(cfg.port, 5433);
-        assert_eq!(cfg.ssl_mode, SslMode::Require);
+        // An explicit `sslmode=require` is stored as `Some` (it wins over the
+        // threat-scoped default at connect).
+        assert_eq!(cfg.ssl_mode, Some(SslMode::Require));
+        assert!(cfg.ssl_mode_is_explicit());
         assert_eq!(cfg.connect_timeout_secs, 3);
     }
 
@@ -853,6 +965,100 @@ mod tests {
             dsn_endpoint("postgres://u@localhost/app"),
             Ok(Endpoint::Tcp("localhost:5432".to_string())),
         );
+    }
+
+    /// Resolve the effective SslMode for an unset config against `host`/`port`
+    /// the way a driver does at connect — the offline proof of the threat-scoped
+    /// default without a live PG.
+    fn resolve_default(host: &str, port: u16) -> SslMode {
+        let cfg = ConnectConfig::new(host, "u").port(port);
+        assert!(!cfg.ssl_mode_is_explicit(), "a fresh config must be defaulted");
+        cfg.resolve_ssl_mode(&resolve_endpoint(&cfg.host, cfg.port))
+    }
+
+    #[test]
+    fn threat_scoped_default_local_endpoints_resolve_to_prefer() {
+        // WITNESS: an UNSET SslMode over a LOCAL endpoint stays `Prefer` — no
+        // network path to intercept. A unix socket, and every loopback TCP host.
+        assert_eq!(resolve_default("/var/run/postgresql", 5432), SslMode::Prefer);
+        assert_eq!(resolve_default("/tmp", 5432), SslMode::Prefer);
+        assert_eq!(resolve_default("127.0.0.1", 5432), SslMode::Prefer);
+        assert_eq!(resolve_default("127.0.0.5", 5432), SslMode::Prefer); // 127.0.0.0/8
+        assert_eq!(resolve_default("::1", 5432), SslMode::Prefer);
+        assert_eq!(resolve_default("localhost", 5432), SslMode::Prefer);
+        // RFC 6761 names `localhost` case-insensitively.
+        assert_eq!(resolve_default("LocalHost", 5432), SslMode::Prefer);
+        assert_eq!(resolve_default("LOCALHOST", 5432), SslMode::Prefer);
+    }
+
+    #[test]
+    fn threat_scoped_default_remote_endpoints_resolve_to_require() {
+        // WITNESS: an UNSET SslMode over a REMOTE endpoint resolves to `Require`
+        // — a remote TLS refusal becomes a loud error, never a silent plaintext
+        // connect. Private-range addresses are STILL a network path → remote.
+        assert_eq!(resolve_default("db.example.com", 5432), SslMode::Require);
+        assert_eq!(resolve_default("10.0.0.5", 5432), SslMode::Require);
+        assert_eq!(resolve_default("192.168.1.1", 5432), SslMode::Require);
+        assert_eq!(resolve_default("172.16.0.9", 5432), SslMode::Require);
+        assert_eq!(resolve_default("8.8.8.8", 5432), SslMode::Require);
+        // A bracketed / otherwise-unparseable host is not a recognized loopback
+        // literal → treated as remote (fail-safe toward TLS).
+        assert_eq!(resolve_default("[::1]", 5432), SslMode::Require);
+    }
+
+    #[test]
+    fn explicit_ssl_mode_always_wins_over_the_threat_scoped_default() {
+        // WITNESS: an EXPLICIT setting overrides the endpoint-scoped default in
+        // BOTH directions.
+        // Explicit Prefer to a REMOTE host → Prefer (the consumer opted out).
+        let remote_prefer = ConnectConfig::new("db.example.com", "u").ssl_mode(SslMode::Prefer);
+        assert!(remote_prefer.ssl_mode_is_explicit());
+        assert_eq!(
+            remote_prefer.resolve_ssl_mode(&resolve_endpoint(&remote_prefer.host, 5432)),
+            SslMode::Prefer,
+        );
+        // Explicit Require to a LOCAL (loopback) host → Require.
+        let local_require = ConnectConfig::new("localhost", "u").ssl_mode(SslMode::Require);
+        assert_eq!(
+            local_require.resolve_ssl_mode(&resolve_endpoint(&local_require.host, 5432)),
+            SslMode::Require,
+        );
+        // Explicit Require to a UNIX host → Require (the unix-socket fail-loud is
+        // a SEPARATE later check; resolution just honors the explicit choice).
+        let unix_require = ConnectConfig::new("/tmp", "u").ssl_mode(SslMode::Require);
+        assert_eq!(
+            unix_require.resolve_ssl_mode(&resolve_endpoint(&unix_require.host, 5432)),
+            SslMode::Require,
+        );
+        // Explicit Disable to a loopback host → Disable.
+        let local_disable = ConnectConfig::new("127.0.0.1", "u").ssl_mode(SslMode::Disable);
+        assert_eq!(
+            local_disable.resolve_ssl_mode(&resolve_endpoint(&local_disable.host, 5432)),
+            SslMode::Disable,
+        );
+    }
+
+    #[test]
+    fn explicit_dsn_sslmode_wins_over_the_threat_scoped_default() {
+        // WITNESS: the explicit path also flows through the DSN — `sslmode=` (and
+        // by the same mechanism `PGSSLMODE`, which stores `Some` identically)
+        // always wins. `sslmode=require` to a LOCAL host stays Require; a REMOTE
+        // host with no `sslmode=` defaults to Require anyway (the loud-remote rule).
+        let cfg = match ConnectConfig::from_dsn("postgres://u@localhost?sslmode=require") {
+            Ok(c) => c,
+            Err(e) => panic!("valid DSN must parse: {e}"),
+        };
+        assert!(cfg.ssl_mode_is_explicit());
+        assert_eq!(
+            cfg.resolve_ssl_mode(&resolve_endpoint(&cfg.host, cfg.port)),
+            SslMode::Require,
+        );
+    }
+
+    #[test]
+    fn a_fresh_config_leaves_ssl_mode_defaulted() {
+        // The constructor stores no explicit mode — the resolution decides.
+        assert!(!ConnectConfig::new("localhost", "u").ssl_mode_is_explicit());
     }
 
     #[test]

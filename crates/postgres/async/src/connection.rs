@@ -261,20 +261,28 @@ impl Connection {
         config: &ConnectConfig,
         deadline: &Arc<ReadDeadline>,
     ) -> Result<AsyncWire, DriverError> {
-        match resolve_endpoint(&config.host, config.port) {
+        let endpoint = resolve_endpoint(&config.host, config.port);
+        // Resolve the effective SSL mode ONCE against the endpoint (the
+        // threat-scoped default: LOCAL → Prefer, REMOTE → Require; an explicit
+        // mode wins). Thread it down so nothing below re-reads the raw config —
+        // one resolution point, no drift.
+        let ssl_mode = config.resolve_ssl_mode(&endpoint);
+        match endpoint {
             Endpoint::Tcp(addr) => {
                 let tcp = TcpStream::connect(&addr).await?;
                 // Disable Nagle on the data socket for the connection's whole life
                 // — Nagle + delayed-ACK can add ~40ms stalls to small writes and
                 // COPY-in streaming; one setsockopt with zero per-op cost.
                 tcp.set_nodelay(true)?;
-                Self::build_tcp_wire(tcp, config, deadline).await
+                Self::build_tcp_wire(tcp, config, ssl_mode, deadline).await
             }
             Endpoint::Unix(path) => {
                 // Fail LOUD: TLS cannot be required over a socket that will never
                 // do it. A local kernel socket is trusted by filesystem
                 // permissions, not TLS, and PostgreSQL does not offer TLS there.
-                if config.ssl_mode == SslMode::Require {
+                // (A defaulted unix endpoint resolves to Prefer, so this fires
+                // only for an EXPLICIT `SslMode::Require`.)
+                if ssl_mode == SslMode::Require {
                     return Err(DriverError::Config(
                         "SslMode::Require cannot be honored over a unix-domain socket \
                          (TLS is not available on a local socket)",
@@ -297,9 +305,10 @@ impl Connection {
     async fn build_tcp_wire(
         tcp: TcpStream,
         config: &ConnectConfig,
+        ssl_mode: SslMode,
         deadline: &Arc<ReadDeadline>,
     ) -> Result<AsyncWire, DriverError> {
-        if config.ssl_mode == SslMode::Disable {
+        if ssl_mode == SslMode::Disable {
             return Ok(Wire::Plain(TokioSocket::new(
                 Sock::Tcp(tcp),
                 Arc::clone(deadline),
@@ -314,7 +323,7 @@ impl Connection {
         // (nothing to negotiate) — `is_encrypted()` is then always `false`.
         #[cfg(not(feature = "tls"))]
         {
-            if config.ssl_mode == SslMode::Require {
+            if ssl_mode == SslMode::Require {
                 return Err(DriverError::Config(
                     "TLS support is not compiled in (the `tls` feature is off); \
                      SslMode::Require cannot be honored — enable the `tls` feature, \
@@ -340,7 +349,7 @@ impl Connection {
             tcp.write_all(ssl_bytes).await?;
             let mut response = [0u8; 1];
             tcp.read_exact(&mut response).await?;
-            match bsql_postgres_core::ssl::classify_ssl_response(response[0], config)? {
+            match bsql_postgres_core::ssl::classify_ssl_response(response[0], config, ssl_mode)? {
                 SslProbe::Accepted { server_name } => {
                     // Use the provider-explicit ring config (the workspace pins
                     // rustls to ring only). Custom CA roots build a config verified

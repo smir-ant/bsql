@@ -75,9 +75,10 @@ fn ssl_mode_require_without_tls_is_a_loud_config_error() {
 #[test]
 fn custom_ca_roots_without_tls_is_a_loud_config_error() {
     let port = spawn_accept_and_hold();
-    // `SslMode::Prefer` (the default) + a custom CA: with TLS the CA would be
-    // used; without TLS supplying one is contradictory, so it fails loud rather
-    // than being silently ignored on a plaintext connection.
+    // Unset SslMode over a loopback host resolves to `Prefer` (the threat-scoped
+    // LOCAL default), plus a custom CA: with TLS the CA would be used; without
+    // TLS supplying one is contradictory, so it fails loud rather than being
+    // silently ignored on a plaintext connection.
     let config = ConnectConfig::new("127.0.0.1", "postgres")
         .port(port)
         .with_ca_roots(b"-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n-----END CERTIFICATE-----\n");

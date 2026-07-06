@@ -33,6 +33,13 @@ so there is no per-call text/binary drift and no injection surface.
   measured ~2.4–2.9× faster than loopback TCP on a single round trip. A unix
   socket is always plaintext, so `SslMode::Require` over one is a loud
   `DriverError::Config`, never a silent downgrade.
+- **Threat-scoped TLS default.** When you set no `SslMode`, the effective mode
+  is resolved at connect against the endpoint: a LOCAL endpoint (unix socket, or
+  a loopback host — `localhost`, `127.0.0.0/8`, `::1`) defaults to `Prefer`, and
+  a REMOTE endpoint (any other host, private ranges included) defaults to
+  `Require` — so a remote server that refuses TLS is a loud error naming the
+  fix, never a silent plaintext connect an on-path attacker could have forced.
+  An explicit `SslMode` (builder / DSN `sslmode=` / `PGSSLMODE`) always wins.
 - **TLS with custom or private CA roots.** `SslMode::Require` verifies against
   the baked Mozilla root bundle by default; a private CA is supplied with
   `ConnectConfig::with_ca_roots(pem)` (or the `sslrootcert=<path>` DSN key /
@@ -259,7 +266,7 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 1929** — every `#[test]` / `#[tokio::test]` attribute:
+- **Test functions: 1937** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
   find . -path ./target -prune -o -path ./.claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l

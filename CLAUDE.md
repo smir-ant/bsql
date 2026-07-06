@@ -374,9 +374,28 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   SSL and it falls back to plain TCP — an SSL downgrade is a security event a
   production build must not hide. A consumer can also assert
   `Connection::is_encrypted()` (both drivers) to reject a plaintext/downgraded
-  connection. The default `SslMode` is still `Prefer` (ecosystem/libpq parity +
-  localhost/dev ergonomics); flipping it to `Require` is a breaking change left
-  for the owner / the 1.0 API freeze.
+  connection.
+- The default `SslMode` is THREAT-SCOPED, not a fixed value: when the consumer
+  sets none (no builder `ssl_mode` / DSN `sslmode=` / `PGSSLMODE`), the effective
+  mode is resolved at connect against the endpoint by
+  `ConnectConfig::resolve_ssl_mode`, scoped to where an interception threat can
+  actually exist — a network path. A LOCAL endpoint (a unix socket, or a loopback
+  TCP host — `localhost` case-insensitive, `127.0.0.0/8`, `::1`) resolves to
+  `Prefer`: no network to intercept, and PG offers no TLS on a unix socket. A
+  REMOTE endpoint (any other host, INCLUDING private ranges like `10.0.0.0/8` /
+  `192.168.0.0/16` — still a network path) resolves to `Require`: a remote server
+  that refuses TLS is a LOUD classified error (`DriverError::SslRefused` for an
+  explicit require, or a `DriverError::Config` naming the `Prefer`/`Disable`
+  opt-out for the defaulted-remote case), never a silent plaintext connect an
+  on-path attacker could have forced. This closes the last silent-downgrade class
+  (the former blanket-`Prefer` default). An EXPLICIT `SslMode` always wins,
+  unchanged; the classification is SYNTACTIC on the configured host (no DNS — a
+  resolver round trip would be slow and a TOCTOU hole). The rule lives in one
+  method both drivers resolve through, exactly as `resolve_endpoint` centralizes
+  the unix-vs-TCP rule, so it cannot drift between them. `SslMode` is
+  deliberately NOT `Default` (there is no single default to return), and the
+  config stores the mode as a private `Option<SslMode>` (`None` = defaulted),
+  niche-packed to the same 1 byte — the `ConnectConfig` footprint is unchanged.
 - Custom CA roots: `ConnectConfig::with_ca_roots(pem)` (or the `sslrootcert=<path>`
   DSN key / `PGSSLROOTCERT` env) verify against an internal/private CA, making
   `SslMode::Require` usable there instead of forcing plaintext. Stored raw, parsed

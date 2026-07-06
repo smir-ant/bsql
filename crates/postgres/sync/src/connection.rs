@@ -186,10 +186,17 @@ impl Connection {
     /// TLS, or handshake failure — never a panic.
     pub fn connect(config: &ConnectConfig) -> Result<Self, DriverError> {
         let endpoint = resolve_endpoint(&config.host, config.port);
+        // Resolve the effective SSL mode ONCE against the endpoint (the
+        // threat-scoped default: LOCAL → Prefer, REMOTE → Require; an explicit
+        // mode wins). Thread it down so nothing below re-reads the raw config —
+        // one resolution point, no drift between the two drivers.
+        let ssl_mode = config.resolve_ssl_mode(&endpoint);
         // Fail LOUD: TLS cannot be required over a socket that will never do it.
         // Rejected before the connect syscall — a wasted dial would tell us
-        // nothing, and this is a pre-connect configuration fault.
-        if endpoint.is_unix() && config.ssl_mode == SslMode::Require {
+        // nothing, and this is a pre-connect configuration fault. (A defaulted
+        // unix endpoint resolves to Prefer, so this fires only for an EXPLICIT
+        // `SslMode::Require`.)
+        if endpoint.is_unix() && ssl_mode == SslMode::Require {
             return Err(DriverError::Config(
                 "SslMode::Require cannot be honored over a unix-domain socket \
                  (TLS is not available on a local socket)",
@@ -221,7 +228,7 @@ impl Connection {
         // socket is moved into the wire / TLS layer.
         let socket_ctl = sock.try_clone()?;
 
-        let wire = Self::build_wire(sock, config)?;
+        let wire = Self::build_wire(sock, config, ssl_mode)?;
         // Snapshot the encryption state from the built wire BEFORE it is moved
         // into the engine.
         let encrypted = wire.is_encrypted();
@@ -328,8 +335,12 @@ impl Connection {
     /// `SSLRequest` probe runs only for a TCP socket with SSL wanted; `Prefer`
     /// over unix is plaintext with no probe and no downgrade warning (nothing was
     /// downgraded — TLS was never applicable to a local socket).
-    fn build_wire(sock: SyncSock, config: &ConnectConfig) -> Result<SyncWire, DriverError> {
-        if matches!(sock, SyncSock::Unix(_)) || config.ssl_mode == SslMode::Disable {
+    fn build_wire(
+        sock: SyncSock,
+        config: &ConnectConfig,
+        ssl_mode: SslMode,
+    ) -> Result<SyncWire, DriverError> {
+        if matches!(sock, SyncSock::Unix(_)) || ssl_mode == SslMode::Disable {
             return Ok(Wire::Plain(SyncSocket::new(sock)));
         }
         // A TCP socket with `ssl_mode` == `Prefer` or `Require` here.
@@ -341,7 +352,7 @@ impl Connection {
         // `is_encrypted()` is then always `false`.
         #[cfg(not(feature = "tls"))]
         {
-            if config.ssl_mode == SslMode::Require {
+            if ssl_mode == SslMode::Require {
                 return Err(DriverError::Config(
                     "TLS support is not compiled in (the `tls` feature is off); \
                      SslMode::Require cannot be honored — enable the `tls` feature, \
@@ -370,7 +381,7 @@ impl Connection {
             Write::write_all(&mut tcp, ssl_bytes).map_err(lift_probe_io)?;
             let mut response = [0u8; 1];
             Read::read_exact(&mut tcp, &mut response).map_err(lift_probe_io)?;
-            match bsql_postgres_core::ssl::classify_ssl_response(response[0], config)? {
+            match bsql_postgres_core::ssl::classify_ssl_response(response[0], config, ssl_mode)? {
                 bsql_postgres_core::ssl::SslProbe::Accepted { server_name } => {
                     // Use the provider-explicit ring config; custom CA roots build a
                     // config verified against EXACTLY those roots, otherwise the shared
