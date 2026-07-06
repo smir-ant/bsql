@@ -1190,11 +1190,14 @@ async fn oversize_typed_wide_many_columns_reassembles() {
     c.close().await.expect("close");
 }
 
-/// INBOUND OVERSIZE (async): the MULTI-ROW reassembly cases over a real table —
-/// an oversize row FOLLOWED by a small one (the reassembly buffer must RESET),
-/// MULTIPLE oversize rows in one result, and `query_each` streaming a
-/// reassembled oversize row. Single test (serial) so the shared `ov_rows` table
-/// cannot race a parallel sibling.
+/// INBOUND OVERSIZE (async): the MULTI-ROW cases over a real table — an oversize
+/// row FOLLOWED by a small one (the reassembly buffer must RESET), MULTIPLE
+/// oversize rows in one result, `query_each` streaming a reassembled oversize
+/// row, and `query_one` TOO-MANY over both orders (an oversize FIRST row + a
+/// small second → the Row-arm break; a small FIRST row + an oversize second →
+/// the RowChunk-arm break MID-oversize-frame), each proving the connection
+/// drains to a clean idle and stays healthy. Single test (serial) so the shared
+/// `ov_rows` table cannot race a parallel sibling.
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn oversize_typed_multirow_reassembly_over_table() {
@@ -1244,6 +1247,44 @@ async fn oversize_typed_multirow_reassembly_over_table() {
     assert!(owned[0].body.bytes().all(|b| b == b'x'), "first oversize row intact");
     assert_eq!(owned[1].body.len(), 6000);
     assert!(owned[1].body.bytes().all(|b| b == b'y'), "second oversize row intact");
+
+    // Scenario C — query_one TOO-MANY, oversize FIRST then small: the oversize
+    // row reassembles + counts (seen_first set at RowChunkEnd), then the small
+    // second row trips the Row-arm break. TooManyRows must dominate, and the
+    // connection must drain from that whole-row boundary to a clean idle.
+    c.execute_sql("TRUNCATE ov_rows").await.expect("truncate C");
+    c.execute_sql("INSERT INTO ov_rows (k, body) VALUES (1, repeat('x', 5000)), (2, 'small')")
+        .await
+        .expect("insert oversize-then-small (C)");
+    let too_many = c.query_one::<OvRowsQuery>(()).await;
+    assert!(
+        matches!(too_many, Err(DriverError::TooManyRows)),
+        "oversize first + small second must be TooManyRows, got {too_many:?}",
+    );
+    assert_eq!(
+        c.query_one::<OneQuery>(()).await.expect("probe after C drain").n,
+        1,
+        "connection drained healthy after the oversize-first too-many break",
+    );
+
+    // Scenario D — query_one TOO-MANY, small FIRST then oversize: the small row
+    // sets seen_first (Row arm), then the second row's FIRST RowChunk trips the
+    // RowChunk-arm break MID-oversize-frame (the otherwise-unwitnessed branch).
+    // The mid-frame drain must still reach a clean idle.
+    c.execute_sql("TRUNCATE ov_rows").await.expect("truncate D");
+    c.execute_sql("INSERT INTO ov_rows (k, body) VALUES (1, 'small'), (2, repeat('x', 5000))")
+        .await
+        .expect("insert small-then-oversize (D)");
+    let too_many = c.query_one::<OvRowsQuery>(()).await;
+    assert!(
+        matches!(too_many, Err(DriverError::TooManyRows)),
+        "small first + oversize second must be TooManyRows, got {too_many:?}",
+    );
+    assert_eq!(
+        c.query_one::<OneQuery>(()).await.expect("probe after D drain").n,
+        1,
+        "connection drained healthy after the mid-oversize-frame too-many break",
+    );
 
     c.execute_sql("DROP TABLE ov_rows").await.expect("cleanup");
     c.close().await.expect("close");

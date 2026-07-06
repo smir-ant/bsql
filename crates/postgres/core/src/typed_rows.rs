@@ -328,3 +328,73 @@ impl<Q: TypedQuery> std::fmt::Debug for Rows<Q> {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod reassembly_tests {
+    //! Deterministic OFFLINE proof of the oversize-row REASSEMBLY bookkeeping in
+    //! [`RowsBuilder::feed`]: that `RowChunk` pieces append into `wire`
+    //! contiguously, that `RowChunkEnd` records ONE span equal to the chunk
+    //! SUM, and that the running accumulator RESETS so a following row (small or
+    //! oversize) is not corrupted. A dropped reset or a double span-push would
+    //! otherwise pass the whole offline suite silently — the live PG witness
+    //! needs a running server, and the testkit frames only whole rows (it cannot
+    //! emit `RowChunk`). These feed synthetic [`Surface`] sequences straight into
+    //! the builder and assert the raw prebuffer bytes + spans (no decode): the
+    //! bytes are arbitrary since `feed` copies + measures, never parses.
+    //!
+    //! This module is a descendant of the one defining `RowsBuilder`, so it reads
+    //! the private `wire` / `slots` / `oversize_len` fields directly — the exact
+    //! state the reassembly maintains.
+
+    use bsql_postgres_proto::engine::Surface;
+
+    use super::RowsBuilder;
+
+    #[test]
+    fn oversize_row_between_small_rows_reassembles_and_resets() {
+        // Row(3) → [RowChunk(2), RowChunk(2), RowChunkEnd] → Row(4). The middle
+        // row is oversize (two chunks); its span must be the SUM (4), the wire
+        // the exact concatenation, and the accumulator 0 after the terminator so
+        // the trailing small row is clean.
+        let mut b = RowsBuilder::new();
+        b.feed(Surface::Row(b"AAA"));
+        b.feed(Surface::RowChunk(b"BB"));
+        b.feed(Surface::RowChunk(b"CC"));
+        b.feed(Surface::RowChunkEnd);
+        b.feed(Surface::Row(b"DDDD"));
+
+        assert_eq!(b.slots, vec![3u32, 4u32, 4u32], "spans: small, chunk-sum, small");
+        assert_eq!(b.wire, b"AAABBCCDDDD".to_vec(), "wire is the exact byte concatenation");
+        assert_eq!(b.oversize_len, 0, "accumulator reset after RowChunkEnd");
+    }
+
+    #[test]
+    fn two_chunked_rows_back_to_back_each_reset() {
+        // Two oversize rows back-to-back: [RowChunk(2), RowChunk(1), End] then
+        // [RowChunk(3), End]. The accumulator must reset between them, so the
+        // second span is 3 (NOT 3+3), proving no cross-row leakage.
+        let mut b = RowsBuilder::new();
+        b.feed(Surface::RowChunk(b"AA"));
+        b.feed(Surface::RowChunk(b"B"));
+        b.feed(Surface::RowChunkEnd);
+        b.feed(Surface::RowChunk(b"CCC"));
+        b.feed(Surface::RowChunkEnd);
+
+        assert_eq!(b.slots, vec![3u32, 3u32], "each chunked row's span is its own chunk sum");
+        assert_eq!(b.wire, b"AABCCC".to_vec(), "wire is the two rows concatenated");
+        assert_eq!(b.oversize_len, 0, "accumulator reset after the last RowChunkEnd");
+    }
+
+    #[test]
+    fn chunked_row_as_the_only_row() {
+        // A single oversize row (two chunks) with nothing before or after.
+        let mut b = RowsBuilder::new();
+        b.feed(Surface::RowChunk(b"XXXX"));
+        b.feed(Surface::RowChunk(b"YY"));
+        b.feed(Surface::RowChunkEnd);
+
+        assert_eq!(b.slots, vec![6u32], "one span equal to the chunk sum");
+        assert_eq!(b.wire, b"XXXXYY".to_vec(), "wire is the reassembled row");
+        assert_eq!(b.oversize_len, 0, "accumulator reset");
+    }
+}
