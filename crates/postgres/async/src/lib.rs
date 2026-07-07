@@ -1,5 +1,18 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+// Mechanical-cast wall (tier-1) completing the workspace floor's
+// `cast_sign_loss` + `integer_division` forbid: an `as` conversion, a truncating
+// or sign-flipping `as` cast, and `unreachable!` are all rejected at compile
+// time — a future `len as u32` on an untrusted-byte path is a build error, not a
+// hand scan. `deny` (not `forbid`) preserves a greppable, reasoned
+// `#[expect(..., reason = "...")]` escape for a provably-lossless widening (the
+// workspace keystone `allow_attributes_without_reason` forces the reason).
+#![deny(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::unreachable
+)]
 
 //! Async (tokio) PostgreSQL driver built on the `bsql-postgres-proto` sans-IO
 //! engine.

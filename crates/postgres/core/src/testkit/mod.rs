@@ -228,7 +228,9 @@ impl FakeTransport {
         };
         let mut a = [0u8; 4];
         a.copy_from_slice(len_bytes);
-        let total = u32::from_be_bytes(a) as usize;
+        let Ok(total) = usize::try_from(u32::from_be_bytes(a)) else {
+            return Framed::Incomplete;
+        };
         if total < 4 || inbox.len() < total {
             return Framed::Incomplete;
         }
@@ -266,7 +268,9 @@ impl FakeTransport {
         };
         let mut a = [0u8; 4];
         a.copy_from_slice(len_bytes);
-        let len = u32::from_be_bytes(a) as usize;
+        let Ok(len) = usize::try_from(u32::from_be_bytes(a)) else {
+            return Framed::Incomplete;
+        };
         let total = len.saturating_add(1); // tag byte is not counted in len
         if len < 4 || inbox.len() < total {
             return Framed::Incomplete;
