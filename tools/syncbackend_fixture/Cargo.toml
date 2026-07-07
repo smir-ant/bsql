@@ -1,0 +1,47 @@
+[package]
+name = "bsql-syncbackend-fixture"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Fixture consumer proving the write-once cross-backend `SyncBackend` surface end-to-end: ONE generic data layer (`load_users<B>`, the parameterized `user_by_id<B>`, a generic-transaction helper) written against `bsql::SyncBackend` compiles AND executes unchanged on the blocking PostgreSQL driver (live) and the embedded SQLite driver (in-process), plus the verbatim E0221 disproof that fixes `RunsOn`'s backend key. Never published."
+
+# Not a shipped crate. It is the end-to-end PROOF of the `SyncBackend`
+# write-once surface: the SAME generic functions type-check for both concrete
+# backends AND run (SQLite in-process here; live PostgreSQL under `--ignored`),
+# and the recorded disproof pins WHY `RunsOn` keys on the backend.
+publish = false
+
+[features]
+# `n1-detect` (non-default) — turns on the cross-backend N+1 detector via `bsql`.
+# The `tests/n1_generic.rs` witness `#![cfg]`s itself out when off, so a default
+# `--workspace` build never forces it. It proves the detector's `Location::caller()`
+# propagates THROUGH the generic `SyncQueries::fetch_*` layer to the CONSUMER's
+# call site (not the `backend.rs` forwarder). Enable with `--features n1-detect`.
+n1-detect = ["bsql/n1-detect"]
+
+[dependencies]
+# The umbrella crate. `postgres-sync` gives the blocking PG driver + its typed
+# `query::<Q: TypedQuery>` verbs; `sqlite` gives the embedded driver + turns on
+# the macro's `SqliteTypedQuery` emission, so ONE `query!` carrier gains BOTH
+# typed-execution impls over the SAME record twins — the premise `SyncBackend`
+# rests on. `macros-sqlite` adds the build-time SQLite conformance cross-check.
+# This is the exact feature set a real "write once, run on Postgres or SQLite"
+# consumer enables. `default-features = false` drops TLS/SCRAM/MD5 (the live PG
+# test connects to a local trust-auth server, which needs none of them).
+bsql = { path = "../../crates/bsql", default-features = false, features = [
+    "macros",
+    "macros-sqlite",
+    "sqlite",
+    "postgres-sync",
+] }
+
+[build-dependencies]
+# BUILD-DEPENDENCY ONLY, `sqlite` feature on: replays migrations/ into BOTH the
+# PostgreSQL catalog AND the SQLite template DB in one `emit` call, so a carrier
+# is typed against the lattice AND conformance-checked against real SQLite.
+bsql-build = { path = "../../crates/build", features = ["sqlite"] }
+
+# Inherit the workspace FORBID floor / lint wall.
+[lints]
+workspace = true

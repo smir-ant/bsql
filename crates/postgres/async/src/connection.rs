@@ -628,10 +628,10 @@ impl Connection {
     #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query<'a, Q: TypedQuery + 'a>(
         &'a mut self,
-        params: Q::Params,
+        params: Q::Params<'a>,
     ) -> impl core::future::Future<Output = Result<Rows<Q>, DriverError>> + 'a
     where
-        Q::Params: 'a,
+        Q::Params<'a>: 'a,
     {
         self.core.query::<Q>(
             params,
@@ -646,10 +646,10 @@ impl Connection {
     #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_one<'a, Q: TypedQuery + 'a>(
         &'a mut self,
-        params: Q::Params,
+        params: Q::Params<'a>,
     ) -> impl core::future::Future<Output = Result<Q::Owned, DriverError>> + 'a
     where
-        Q::Params: 'a,
+        Q::Params<'a>: 'a,
     {
         self.core.query_one::<Q>(
             params,
@@ -667,10 +667,10 @@ impl Connection {
     #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_opt<'a, Q: TypedQuery + 'a>(
         &'a mut self,
-        params: Q::Params,
+        params: Q::Params<'a>,
     ) -> impl core::future::Future<Output = Result<Option<Q::Owned>, DriverError>> + 'a
     where
-        Q::Params: 'a,
+        Q::Params<'a>: 'a,
     {
         self.core.query_opt::<Q>(
             params,
@@ -713,12 +713,12 @@ impl Connection {
     #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_each<'a, Q, F, E>(
         &'a mut self,
-        params: Q::Params,
+        params: Q::Params<'a>,
         on_row: F,
     ) -> impl core::future::Future<Output = Result<Option<E>, DriverError>> + 'a
     where
         Q: TypedQuery + 'a,
-        Q::Params: 'a,
+        Q::Params<'a>: 'a,
         E: 'a,
         F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E> + 'a,
     {
@@ -1389,10 +1389,10 @@ impl Transaction<'_> {
     #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query<'a, Q: TypedQuery + 'a>(
         &'a mut self,
-        params: Q::Params,
+        params: Q::Params<'a>,
     ) -> impl Future<Output = Result<Rows<Q>, DriverError>> + 'a
     where
-        Q::Params: 'a,
+        Q::Params<'a>: 'a,
     {
         #[cfg(feature = "n1-detect")]
         let loc = core::panic::Location::caller();
@@ -1411,10 +1411,10 @@ impl Transaction<'_> {
     #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_one<'a, Q: TypedQuery + 'a>(
         &'a mut self,
-        params: Q::Params,
+        params: Q::Params<'a>,
     ) -> impl Future<Output = Result<Q::Owned, DriverError>> + 'a
     where
-        Q::Params: 'a,
+        Q::Params<'a>: 'a,
     {
         #[cfg(feature = "n1-detect")]
         let loc = core::panic::Location::caller();
@@ -1434,10 +1434,10 @@ impl Transaction<'_> {
     #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_opt<'a, Q: TypedQuery + 'a>(
         &'a mut self,
-        params: Q::Params,
+        params: Q::Params<'a>,
     ) -> impl Future<Output = Result<Option<Q::Owned>, DriverError>> + 'a
     where
-        Q::Params: 'a,
+        Q::Params<'a>: 'a,
     {
         #[cfg(feature = "n1-detect")]
         let loc = core::panic::Location::caller();
@@ -1456,12 +1456,12 @@ impl Transaction<'_> {
     #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_each<'a, Q, F, E>(
         &'a mut self,
-        params: Q::Params,
+        params: Q::Params<'a>,
         on_row: F,
     ) -> impl Future<Output = Result<Option<E>, DriverError>> + 'a
     where
         Q: TypedQuery + 'a,
-        Q::Params: 'a,
+        Q::Params<'a>: 'a,
         E: 'a,
         F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E> + 'a,
     {

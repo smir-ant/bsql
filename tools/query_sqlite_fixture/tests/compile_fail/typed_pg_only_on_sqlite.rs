@@ -17,5 +17,5 @@ bsql::query!(
 fn main() {
     let conn = bsql::sqlite::Connection::open_in_memory().expect("open");
     // `OptUserQuery` does not implement `SqliteTypedQuery` — this does not compile.
-    let _ = conn.query::<OptUserQuery>(&[]);
+    let _ = conn.query::<OptUserQuery>(());
 }

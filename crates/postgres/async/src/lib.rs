@@ -128,50 +128,97 @@ const _: () = assert!(core::mem::size_of::<CancelToken>() == 56);
 const _: () = {
     fn _is_send<T: Send>(_: &T) {}
 
-    // The five leaf typed verbs on the bare `Connection`. Each future borrows
-    // `conn` only for its own statement, then drops at the `;`, so the sequential
-    // `&mut` borrows never overlap. Distinct `p_*` params because each verb takes
-    // `Q::Params` / `P` by value.
-    fn _conn_verbs<Q, P, R>(
+    // The five leaf typed verbs on the bare `Connection`, each pinned in its OWN
+    // helper. Because the parameter is now a lifetime GAT (`Q::Params<'p>`) and a
+    // GAT is INVARIANT in a generic context, the verb's own `'a` cannot narrow
+    // below the param `'p`; tying the `&'p mut Connection` borrow to that same
+    // `'p` keeps the single borrow well-formed (a shared helper calling all five
+    // would need five simultaneous `&mut` borrows). The `execute` verb takes a
+    // plain `P: ParamsWriter` (no GAT), so it keeps the multi-borrow-free shape.
+    fn _conn_query<'p, Q>(conn: &'p mut Connection, p: Q::Params<'p>)
+    where
+        Q: bsql_postgres_proto::TypedQuery + 'p,
+        Q::Params<'p>: 'p,
+        for<'x> Q::Params<'x>: Send,
+    {
+        _is_send(&conn.query::<Q>(p));
+    }
+    fn _conn_query_one<'p, Q>(conn: &'p mut Connection, p: Q::Params<'p>)
+    where
+        Q: bsql_postgres_proto::TypedQuery + 'p,
+        Q::Params<'p>: 'p,
+        for<'x> Q::Params<'x>: Send,
+    {
+        _is_send(&conn.query_one::<Q>(p));
+    }
+    fn _conn_query_opt<'p, Q>(conn: &'p mut Connection, p: Q::Params<'p>)
+    where
+        Q: bsql_postgres_proto::TypedQuery + 'p,
+        Q::Params<'p>: 'p,
+        for<'x> Q::Params<'x>: Send,
+    {
+        _is_send(&conn.query_opt::<Q>(p));
+    }
+    fn _conn_query_each<'p, Q>(conn: &'p mut Connection, p: Q::Params<'p>)
+    where
+        Q: bsql_postgres_proto::TypedQuery + 'p,
+        Q::Params<'p>: 'p,
+        for<'x> Q::Params<'x>: Send,
+    {
+        _is_send(&conn.query_each::<Q, _, ()>(p, |_row| core::ops::ControlFlow::Continue(())));
+    }
+    fn _conn_execute<P, R>(
         conn: &mut Connection,
         q: &'static bsql_postgres_proto::PreparedQuery<P, R>,
-        p_query: Q::Params,
-        p_one: Q::Params,
-        p_opt: Q::Params,
-        p_each: Q::Params,
         p_exec: P,
     ) where
-        Q: bsql_postgres_proto::TypedQuery,
-        Q::Params: Send,
         P: ParamsWriter + Send + 'static,
         R: bsql_postgres_proto::RowDecode + 'static,
     {
-        _is_send(&conn.query::<Q>(p_query));
-        _is_send(&conn.query_one::<Q>(p_one));
-        _is_send(&conn.query_opt::<Q>(p_opt));
-        _is_send(&conn.query_each::<Q, _, ()>(p_each, |_row| core::ops::ControlFlow::Continue(())));
         _is_send(&conn.execute::<P, R>(q, p_exec));
     }
 
-    // The same five typed verbs on the transaction guard.
-    fn _tx_verbs<Q, P, R>(
+    // The same typed verbs on the transaction guard.
+    fn _tx_query<'p, Q>(tx: &'p mut Transaction<'_>, p: Q::Params<'p>)
+    where
+        Q: bsql_postgres_proto::TypedQuery + 'p,
+        Q::Params<'p>: 'p,
+        for<'x> Q::Params<'x>: Send,
+    {
+        _is_send(&tx.query::<Q>(p));
+    }
+    fn _tx_query_one<'p, Q>(tx: &'p mut Transaction<'_>, p: Q::Params<'p>)
+    where
+        Q: bsql_postgres_proto::TypedQuery + 'p,
+        Q::Params<'p>: 'p,
+        for<'x> Q::Params<'x>: Send,
+    {
+        _is_send(&tx.query_one::<Q>(p));
+    }
+    fn _tx_query_opt<'p, Q>(tx: &'p mut Transaction<'_>, p: Q::Params<'p>)
+    where
+        Q: bsql_postgres_proto::TypedQuery + 'p,
+        Q::Params<'p>: 'p,
+        for<'x> Q::Params<'x>: Send,
+    {
+        _is_send(&tx.query_opt::<Q>(p));
+    }
+    fn _tx_query_each<'p, Q>(tx: &'p mut Transaction<'_>, p: Q::Params<'p>)
+    where
+        Q: bsql_postgres_proto::TypedQuery + 'p,
+        Q::Params<'p>: 'p,
+        for<'x> Q::Params<'x>: Send,
+    {
+        _is_send(&tx.query_each::<Q, _, ()>(p, |_row| core::ops::ControlFlow::Continue(())));
+    }
+    fn _tx_execute<P, R>(
         tx: &mut Transaction<'_>,
         q: &'static bsql_postgres_proto::PreparedQuery<P, R>,
-        p_query: Q::Params,
-        p_one: Q::Params,
-        p_opt: Q::Params,
-        p_each: Q::Params,
         p_exec: P,
     ) where
-        Q: bsql_postgres_proto::TypedQuery,
-        Q::Params: Send,
         P: ParamsWriter + Send + 'static,
         R: bsql_postgres_proto::RowDecode + 'static,
     {
-        _is_send(&tx.query::<Q>(p_query));
-        _is_send(&tx.query_one::<Q>(p_one));
-        _is_send(&tx.query_opt::<Q>(p_opt));
-        _is_send(&tx.query_each::<Q, _, ()>(p_each, |_row| core::ops::ControlFlow::Continue(())));
         _is_send(&tx.execute::<P, R>(q, p_exec));
     }
 

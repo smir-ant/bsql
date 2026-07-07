@@ -256,7 +256,7 @@ fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     // Empty (`quote!()`) with the feature off, so the PostgreSQL-only expansion
     // is byte-identical to before.
     #[cfg(feature = "sqlite-runtime")]
-    let sqlite_typed = emit_sqlite_typed(&name, &shape, &bridges)?;
+    let sqlite_typed = emit_sqlite_typed(&name, &shape, &bridges, &enums)?;
     #[cfg(not(feature = "sqlite-runtime"))]
     let sqlite_typed = TokenStream2::new();
 
@@ -1671,7 +1671,12 @@ fn emit_records(
         .zip(columns)
         .map(|(id, col)| {
             let ty = field_type_bridged(col.ty, col.nullable, false, bridges, enums)?;
-            Ok(quote! { #id: #ty })
+            // `pub`: a record is DATA (the query's output row), not an invariant —
+            // no encapsulation is load-bearing. Public fields let a generic /
+            // cross-module data layer (e.g. `SyncBackend`) READ a `Vec<Q::Owned>`
+            // returned across the module boundary; module-private fields made an
+            // owned record opaque outside its defining module.
+            Ok(quote! { pub #id: #ty })
         })
         .collect::<syn::Result<Vec<_>>>()?;
 
@@ -1731,7 +1736,9 @@ fn emit_records(
             .zip(columns)
             .map(|(id, col)| {
                 let ty = field_type_bridged(col.ty, col.nullable, true, bridges, enums)?;
-                Ok(quote! { #id: #ty })
+                // `pub` — see the borrowed-twin note above (a record is data, not
+                // an invariant; a returned `Vec<Q::Owned>` must be readable).
+                Ok(quote! { pub #id: #ty })
             })
             .collect::<syn::Result<Vec<_>>>()?;
         let owned_body = decode_body(
@@ -2176,21 +2183,33 @@ fn array_oid_path(ty: bsql_build::RustType) -> TokenStream2 {
 fn param_tuple_marker(
     shape: bsql_build::ParamShape,
     enums: &EnumTypes,
+    lt: &TokenStream2,
 ) -> syn::Result<TokenStream2> {
     use bsql_build::{ParamShape, RustType};
-    // The scalar element marker for a parameter. A user-enum parameter is NOT
+    // The scalar element marker for a parameter, at the lifetime `lt`. A `text` /
+    // `bytea` parameter BORROWS the caller's bytes (`&'lt str` / `&'lt [u8]`),
+    // so `lt` threads the verb's parameter lifetime through — letting a RUNTIME
+    // `&str` bind, not only a `&'static` literal. A user-enum parameter is NOT
     // the `&str` wire pivot (which the OUTPUT row-tuple uses): it is
     // `EnumLabel<TheEnum>`, an `unspecified`-typed (OID 0) label the server
     // infers to the enum from context — a `text` (25) parameter has no cast to
     // an enum and is rejected. The phantom enum type keeps it enum-specific, so
-    // a query expecting one enum rejects another's label at compile time.
+    // a query expecting one enum rejects another's label at compile time. A
+    // by-value scalar (`i64`, `Numeric`, …) ignores `lt` — it owns its data.
     let scalar = |ty: RustType| -> syn::Result<TokenStream2> {
         match ty {
             RustType::UserEnum(id) => {
                 let enum_ident = enums.ident(id)?;
                 Ok(quote!(::bsql::__rt::EnumLabel<#enum_ident>))
             }
-            _ => Ok(tuple_marker(ty)),
+            _ => {
+                let spec = col_spec(ty);
+                Ok(match spec.borrow {
+                    BorrowKind::Str => quote!(& #lt str),
+                    BorrowKind::Bytes => quote!(& #lt [u8]),
+                    BorrowKind::ByValue => spec.marker,
+                })
+            }
         }
     };
     match shape {
@@ -2211,7 +2230,7 @@ fn param_tuple_marker(
         )),
         ParamShape::Array(ty) => {
             let elem = tuple_marker(ty);
-            Ok(quote!(&'static [#elem]))
+            Ok(quote!(& #lt [#elem]))
         }
     }
 }
@@ -2251,8 +2270,14 @@ fn param_oid_path(shape: bsql_build::ParamShape) -> TokenStream2 {
 /// variant of one query (only the runtime `ORDER BY` SQL differs between
 /// variants). Bundled so the per-carrier emit takes one argument for both.
 struct TypeTuples {
-    /// The `Params` tuple type (from the lowered `$N` shapes).
+    /// The `Params` tuple type at `'static` (from the lowered `$N` shapes) — the
+    /// OID/const-validator marker (`QueryFingerprint::Params`, `PREPARED`).
     params: TokenStream2,
+    /// The SAME `Params` tuple at the GAT lifetime `'p` (`text`/`bytea`/array
+    /// params borrow `&'p …`) — the verb-argument marker (`TypedQuery::Params<'p>`),
+    /// so a RUNTIME `&str` binds. Scalar/param-free queries make it identical to
+    /// [`params`](Self::params).
+    params_p: TokenStream2,
     /// The `Row` tuple type (from the projected columns' native markers).
     row: TokenStream2,
 }
@@ -2301,12 +2326,20 @@ fn emit_dynamic_wire(
     let param_markers: Vec<TokenStream2> = shape
         .params
         .iter()
-        .map(|p| param_tuple_marker(*p, enums))
+        .map(|p| param_tuple_marker(*p, enums, &quote!('static)))
+        .collect::<syn::Result<Vec<_>>>()?;
+    // The SAME markers at the verb-argument GAT lifetime `'p` (borrowing params
+    // become `&'p …`), for `TypedQuery::Params<'p>`.
+    let param_markers_p: Vec<TokenStream2> = shape
+        .params
+        .iter()
+        .map(|p| param_tuple_marker(*p, enums, &quote!('p)))
         .collect::<syn::Result<Vec<_>>>()?;
     let row_markers: Vec<TokenStream2> =
         shape.columns.iter().map(|c| tuple_marker(c.ty)).collect();
     let tuples = TypeTuples {
         params: tuple_type(&param_markers),
+        params_p: tuple_type(&param_markers_p),
         row: tuple_type(&row_markers),
     };
 
@@ -2437,6 +2470,7 @@ fn emit_carrier(
     bridges: &Bridges,
 ) -> syn::Result<TokenStream2> {
     let params_tuple = &tuples.params;
+    let params_tuple_p = &tuples.params_p;
     let row_tuple = &tuples.row;
     // Content-addressed statement name: SHA-256 of the (lowered) SQL text,
     // truncated to 96 bits, hex-encoded, prefixed. Two distinct queries
@@ -2518,7 +2552,7 @@ fn emit_carrier(
         // const above — referencing `#carrier::PREPARED` here would be
         // ambiguous between the inherent and this trait const.
         impl ::bsql::__rt::TypedQuery for #carrier {
-            type Params = #params_tuple;
+            type Params<'p> = #params_tuple_p;
             type Row = #row_tuple;
             type Record<'q> = #record_ty;
             type Owned = #owned_name;
@@ -2753,6 +2787,7 @@ fn emit_sqlite_typed(
     name: &Ident,
     shape: &bsql_build::DynamicShape,
     bridges: &Bridges,
+    enums: &EnumTypes,
 ) -> syn::Result<TokenStream2> {
     // A runtime `ORDER BY` allow-set or an `OPTIONAL(...)` / `= ANY(...)` param
     // is PostgreSQL-runtime sugar with no SQLite lowering — skip the bridge.
@@ -2764,6 +2799,23 @@ fn emit_sqlite_typed(
     {
         return Ok(TokenStream2::new());
     }
+
+    // The typed `$N` parameter tuple — the SAME markers the PostgreSQL
+    // `TypedQuery::Params` uses (built through the one `param_tuple_marker` /
+    // `tuple_type` authority), so a `query!` binds the SAME typed parameters on
+    // both backends. `SqliteTypedQuery::Params` is UNBOUNDED, so a scalar type
+    // SQLite cannot bind (a `u64`, a `Uuid`, an `EnumLabel`) still emits a valid
+    // impl; the `SqliteBindParams` requirement on the driver's `query::<Q>` verb
+    // makes running such a carrier a LOCATED call-site error, never a mis-decode.
+    // At the verb-argument GAT lifetime `'p` (`text`/`bytea` params borrow
+    // `&'p …`), matching `TypedQuery::Params<'p>` — so a RUNTIME `&str` binds the
+    // SAME typed parameter on both backends.
+    let param_markers_p: Vec<TokenStream2> = shape
+        .params
+        .iter()
+        .map(|p| param_tuple_marker(*p, enums, &quote!('p)))
+        .collect::<syn::Result<Vec<_>>>()?;
+    let params_tuple_p = tuple_type(&param_markers_p);
 
     // Per-column decode expressions (borrowed + owned twins). Bail to "no
     // bridge" the moment a column is bridged or not SQLite-storable.
@@ -2811,6 +2863,7 @@ fn emit_sqlite_typed(
 
     Ok(quote! {
         impl ::bsql::__rt_sqlite::SqliteTypedQuery for #carrier {
+            type Params<'p> = #params_tuple_p;
             type Record<'q> = #record_ty;
             type Owned = #owned_name;
             const SQL: &'static str = #sqlite_sql;

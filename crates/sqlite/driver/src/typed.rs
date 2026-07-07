@@ -69,6 +69,23 @@ pub trait ColumnSource<'a> {
     note = "the SQLite typed runtime decodes only a query whose every projected column is a SQLite storage class (INTEGER/REAL/TEXT/BLOB), is unbridged, and which uses no PostgreSQL-only dynamic sugar (OPTIONAL, = ANY, runtime ORDER BY allow-sets); such a query is PostgreSQL-only"
 )]
 pub trait SqliteTypedQuery {
+    /// The `$N` parameter tuple — the SAME tuple type the PostgreSQL
+    /// [`TypedQuery::Params`](https://docs.rs/bsql) uses for this carrier (the
+    /// macro emits both from one source), so a `query!` runs on either backend
+    /// with the SAME typed parameters.
+    ///
+    /// Deliberately UNBOUNDED here: a carrier whose parameters are not all
+    /// SQLite-bindable (a `u64`, or a PostgreSQL-only type) still implements this
+    /// trait — the [`SqliteBindParams`](crate::SqliteBindParams) requirement lives
+    /// on the driver's `query::<Q>` verb, so such a carrier is a LOCATED compile
+    /// error at the call site, never an impl-site break that would fail a
+    /// PostgreSQL-only build.
+    ///
+    /// A lifetime GAT (matching `TypedQuery::Params<'p>`): a `text` / `bytea`
+    /// parameter is a borrow (`&'p str` / `&'p [u8]`), so a typed verb accepts
+    /// `Params<'p>` for the caller's `'p` — a RUNTIME `&str` binds, not only a
+    /// `&'static` literal. A scalar / param-free query is `'p`-invariant.
+    type Params<'p>;
     /// The borrowed record at lifetime `'q` — the macro's `Foo<'q>` (text
     /// columns are `&'q str`, aliasing the source) or `Foo` for an all-scalar
     /// row (the `'q` is then unused).

@@ -65,7 +65,7 @@ fn n_plus_one_is_flagged_with_source_and_count() {
     let mut call_line = 0u32;
     for _ in 0..LOOP {
         call_line = line!() + 1;
-        let rows = conn.query::<MeasByIdQuery>(&[ValueRef::Integer(1)]).unwrap();
+        let rows = conn.query::<MeasByIdQuery>((1i64,)).unwrap();
         // DIAGNOSTICS-ONLY: the detector altered nothing — the row is returned.
         let owned = rows.into_owned().unwrap();
         assert_eq!(owned.len(), 1, "the seeded row is returned every iteration");
@@ -90,9 +90,9 @@ fn n_plus_one_is_flagged_with_source_and_count() {
 #[test]
 fn a_single_query_is_not_flagged() {
     let conn = seed();
-    let a = conn.query::<MeasByIdQuery>(&[ValueRef::Integer(1)]).unwrap();
+    let a = conn.query::<MeasByIdQuery>((1i64,)).unwrap();
     assert_eq!(a.into_owned().unwrap().len(), 1);
-    let b = conn.query::<AllIdsQuery>(&[]).unwrap();
+    let b = conn.query::<AllIdsQuery>(()).unwrap();
     assert_eq!(b.into_owned().unwrap().len(), 1);
 
     assert!(
@@ -111,11 +111,11 @@ fn distinct_call_sites_are_not_conflated() {
     let conn = seed();
     // 20 + 20 = 40 (> 25 threshold) but split across two lines: 20 each.
     for _ in 0..20 {
-        let a = conn.query::<MeasByIdQuery>(&[ValueRef::Integer(1)]).unwrap(); // site A
+        let a = conn.query::<MeasByIdQuery>((1i64,)).unwrap(); // site A
         assert_eq!(a.into_owned().unwrap().len(), 1);
     }
     for _ in 0..20 {
-        let b = conn.query::<MeasByIdQuery>(&[ValueRef::Integer(1)]).unwrap(); // site B (distinct line)
+        let b = conn.query::<MeasByIdQuery>((1i64,)).unwrap(); // site B (distinct line)
         assert_eq!(b.into_owned().unwrap().len(), 1);
     }
     assert!(
@@ -133,7 +133,7 @@ fn query_one_loop_is_flagged_once() {
     let mut call_line = 0u32;
     for _ in 0..LOOP {
         call_line = line!() + 1;
-        let one = conn.query_one::<MeasByIdQuery>(&[ValueRef::Integer(1)]).unwrap();
+        let one = conn.query_one::<MeasByIdQuery>((1i64,)).unwrap();
         assert_eq!(one.id, 1);
     }
     let report = conn.n1_report();
@@ -158,7 +158,7 @@ fn manual_commit_resets_the_window_like_pg() {
     for _ in 0..2 {
         conn.begin().unwrap();
         for _ in 0..20 {
-            let rows = conn.query::<MeasByIdQuery>(&[ValueRef::Integer(1)]).unwrap();
+            let rows = conn.query::<MeasByIdQuery>((1i64,)).unwrap();
             assert_eq!(rows.into_owned().unwrap().len(), 1);
         }
         conn.commit().unwrap();
@@ -181,7 +181,7 @@ fn manual_rollback_resets_the_window_like_pg() {
     for tx_idx in 0..2 {
         conn.begin().unwrap();
         for _ in 0..20 {
-            let rows = conn.query::<MeasByIdQuery>(&[ValueRef::Integer(1)]).unwrap(); // ONE site
+            let rows = conn.query::<MeasByIdQuery>((1i64,)).unwrap(); // ONE site
             assert_eq!(rows.into_owned().unwrap().len(), 1);
         }
         // First transaction rolls back, second commits — both are boundaries that
@@ -211,7 +211,7 @@ fn n_plus_one_through_the_transaction_guard_is_flagged_at_the_consumer_line() {
     conn.transaction(|tx| {
         for _ in 0..LOOP {
             call_line = line!() + 1;
-            let rows = tx.query::<MeasByIdQuery>(&[ValueRef::Integer(1)])?;
+            let rows = tx.query::<MeasByIdQuery>((1i64,))?;
             let owned = rows.into_owned()?;
             assert_eq!(owned.len(), 1);
             assert_eq!(owned[0].id, 1);

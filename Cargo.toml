@@ -64,6 +64,14 @@ members = [
     # loud unset-DSN error. `publish = false`; not a shipped crate; adds no
     # external package (only `bsql`, already a resolved member).
     "tools/test_harness_fixture",
+    # Fixture consumer proving the write-once cross-backend `SyncBackend`
+    # surface end-to-end: ONE generic data layer written against
+    # `bsql::SyncBackend` compiles AND executes unchanged on the blocking
+    # PostgreSQL driver (live, `--ignored`) and the embedded SQLite driver
+    # (in-process), plus the recorded E0221 disproof that keys `RunsOn` on the
+    # backend. `publish = false`; adds no external package (only `bsql`, a
+    # resolved member).
+    "tools/syncbackend_fixture",
 ]
 
 [workspace.package]

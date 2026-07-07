@@ -1,10 +1,8 @@
 error[E0277]: `OptUserQuery` is not a SQLite-runnable `query!` carrier
-  --> tests/compile_fail/typed_pg_only_on_sqlite.rs:20:26
+  --> tests/compile_fail/typed_pg_only_on_sqlite.rs:20:18
    |
-20 |     let _ = conn.query::<OptUserQuery>(&[]);
-   |                  -----   ^^^^^^^^^^^^ unsatisfied trait bound
-   |                  |
-   |                  required by a bound introduced by this call
+20 |     let _ = conn.query::<OptUserQuery>(());
+   |                  ^^^^^ unsatisfied trait bound
    |
 help: the trait `SqliteTypedQuery` is not implemented for `OptUserQuery`
   --> tests/compile_fail/typed_pg_only_on_sqlite.rs:11:1
@@ -13,9 +11,4 @@ help: the trait `SqliteTypedQuery` is not implemented for `OptUserQuery`
 12 | |     OptUser,
    | |___________^
    = note: the SQLite typed runtime decodes only a query whose every projected column is a SQLite storage class (INTEGER/REAL/TEXT/BLOB), is unbridged, and which uses no PostgreSQL-only dynamic sugar (OPTIONAL, = ANY, runtime ORDER BY allow-sets); such a query is PostgreSQL-only
-note: required by a bound in `Connection::query`
-  --> $WORKSPACE/crates/sqlite/driver/src/connection.rs
-   |
-   |     pub fn query<Q: SqliteTypedQuery>(
-   |                     ^^^^^^^^^^^^^^^^ required by this bound in `Connection::query`
    = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

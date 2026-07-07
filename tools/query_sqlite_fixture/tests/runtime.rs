@@ -32,7 +32,9 @@ bsql::query!(
     "SELECT id, label, weight, payload, count, note FROM measurements ORDER BY id"
 );
 
-// A `$1` positional parameter, bound by the runtime `&[ValueRef]` slice.
+// A `$1` positional parameter, bound by the TYPED `Q::Params` tuple — the SAME
+// typed parameter the PostgreSQL path takes (here `(i64,)`), not a dynamic
+// `&[ValueRef]` slice.
 bsql::query!(
     MeasurementById,
     "SELECT id, label, weight, payload, count, note FROM measurements WHERE id = $1"
@@ -40,6 +42,14 @@ bsql::query!(
 
 // An all-scalar row (no borrowing column): the borrowed record is lifetime-free.
 bsql::query!(WeightById, "SELECT weight FROM measurements WHERE id = $1");
+
+// TWO positional parameters — proves the macro emits a MULTI-arity `Params`
+// tuple `(i64, i64)` (identical to the PostgreSQL side) and the bridge binds
+// both positionally (`$1` → `?1`, `$2` → `?2`).
+bsql::query!(
+    MeasurementBetween,
+    "SELECT id FROM measurements WHERE id >= $1 AND id <= $2 ORDER BY id"
+);
 
 const SCHEMA: &str = "CREATE TABLE measurements ( \
      id BIGINT PRIMARY KEY, label TEXT NOT NULL, weight DOUBLE PRECISION NOT NULL, \
@@ -80,7 +90,7 @@ fn seed() -> Connection {
 #[test]
 fn typed_query_round_trips_every_storage_class_borrowed() {
     let conn = seed();
-    let rows = conn.query::<MeasurementQuery>(&[]).expect("typed query");
+    let rows = conn.query::<MeasurementQuery>(()).expect("typed query");
     assert_eq!(rows.len(), 2);
 
     let decoded: Vec<_> = rows.iter().map(|r| r.expect("decode")).collect();
@@ -104,7 +114,7 @@ fn typed_query_round_trips_every_storage_class_borrowed() {
 #[test]
 fn typed_query_into_owned_copies_text_and_blob() {
     let conn = seed();
-    let owned = conn.query::<MeasurementQuery>(&[]).expect("query").into_owned().expect("owned");
+    let owned = conn.query::<MeasurementQuery>(()).expect("query").into_owned().expect("owned");
     assert_eq!(owned[0].label, "alpha".to_owned());
     assert_eq!(owned[0].payload, Some(vec![0xAA, 0xBB]));
     assert_eq!(owned[0].note, Some("first".to_owned()));
@@ -115,22 +125,34 @@ fn typed_query_into_owned_copies_text_and_blob() {
 fn typed_query_one_and_opt_with_param() {
     let conn = seed();
     // `query_one` with a bound `$1` returns the owned record for that key.
-    let one = conn.query_one::<MeasurementByIdQuery>(&[ValueRef::Integer(2)]).expect("one");
+    let one = conn.query_one::<MeasurementByIdQuery>((2i64,)).expect("one");
     assert_eq!(one.id, 2);
     assert_eq!(one.count, None);
 
     // `query_opt` is `None` for an absent key, `Some` for a present one.
     assert!(conn
-        .query_opt::<MeasurementByIdQuery>(&[ValueRef::Integer(99)])
+        .query_opt::<MeasurementByIdQuery>((99i64,))
         .expect("opt")
         .is_none());
     assert!(conn
-        .query_opt::<MeasurementByIdQuery>(&[ValueRef::Integer(1)])
+        .query_opt::<MeasurementByIdQuery>((1i64,))
         .expect("opt")
         .is_some());
 
     // An all-scalar (lifetime-free) typed record over a param query.
-    let w = conn.query_one::<WeightByIdQuery>(&[ValueRef::Integer(1)]).expect("weight");
+    // Two typed params bind positionally (arity > 1) through the macro-emitted
+    // `Params = (i64, i64)`.
+    let span: Vec<i64> = conn
+        .query::<MeasurementBetweenQuery>((1i64, 2i64))
+        .expect("two-param query")
+        .into_owned()
+        .expect("owned")
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(span, vec![1, 2]);
+
+    let w = conn.query_one::<WeightByIdQuery>((1i64,)).expect("weight");
     assert!((w.weight - 1.5).abs() < f64::EPSILON);
 }
 
@@ -141,11 +163,11 @@ fn typed_query_one_and_opt_enforce_at_most_one() {
     // with the classified TooManyRows — the SAME contract the PostgreSQL typed
     // `query_one` / `query_opt` enforce, so a query ported PostgreSQL→SQLite keeps
     // its multi-row semantics (the dynamic `*_sql` verbs stay first-row).
-    match conn.query_one::<MeasurementQuery>(&[]) {
+    match conn.query_one::<MeasurementQuery>(()) {
         Err(bsql::sqlite::SqliteError::TooManyRows) => {}
         other => panic!("expected TooManyRows from query_one, got {other:?}"),
     }
-    match conn.query_opt::<MeasurementQuery>(&[]) {
+    match conn.query_opt::<MeasurementQuery>(()) {
         Err(bsql::sqlite::SqliteError::TooManyRows) => {}
         other => panic!("expected TooManyRows from query_opt, got {other:?}"),
     }
@@ -156,7 +178,7 @@ fn typed_query_each_streams() {
     let conn = seed();
     let mut ids = Vec::new();
     let out = conn
-        .query_each::<MeasurementQuery, _, ()>(&[], |rec| {
+        .query_each::<MeasurementQuery, _, ()>((), |rec| {
             ids.push(rec.id);
             ControlFlow::Continue(())
         })
@@ -170,7 +192,7 @@ fn typed_verbs_on_the_transaction_guard() {
     let conn = seed();
     let ids: Vec<i64> = conn
         .transaction(|tx| {
-            let rows = tx.query::<MeasurementQuery>(&[]).expect("typed in tx");
+            let rows = tx.query::<MeasurementQuery>(()).expect("typed in tx");
             Ok(rows.iter().map(|r| r.expect("decode").id).collect())
         })
         .expect("transaction");
@@ -197,7 +219,7 @@ fn storage_class_mismatch_is_a_classified_error() {
     )
     .expect("insert hostile");
 
-    let rows = conn.query::<MeasurementQuery>(&[]).expect("query");
+    let rows = conn.query::<MeasurementQuery>(()).expect("query");
     // Rows 0 and 1 decode fine; row 2's `weight` is the classified mismatch.
     let third = rows.iter().nth(2).expect("third row item");
     match third {

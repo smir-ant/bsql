@@ -45,6 +45,7 @@ struct CellOwned {
 enum CellQuery {}
 
 impl SqliteTypedQuery for CellQuery {
+    type Params<'p> = ();
     type Record<'q> = Cell<'q>;
     type Owned = CellOwned;
     const SQL: &'static str = "SELECT i, r, t, b, n FROM cells ORDER BY i";
@@ -102,7 +103,7 @@ fn query_iter_decodes_all_storage_classes_borrowed() {
     let conn = Connection::open_in_memory().expect("open");
     seed_cells(&conn);
 
-    let rows = conn.query::<CellQuery>(&[]).expect("typed query");
+    let rows = conn.query::<CellQuery>(()).expect("typed query");
     assert_eq!(rows.len(), 2);
     assert!(!rows.is_empty());
 
@@ -121,7 +122,7 @@ fn query_into_owned_decodes_owned_twin() {
     let conn = Connection::open_in_memory().expect("open");
     seed_cells(&conn);
 
-    let owned = conn.query::<CellQuery>(&[]).expect("typed query").into_owned().expect("owned");
+    let owned = conn.query::<CellQuery>(()).expect("typed query").into_owned().expect("owned");
     assert_eq!(
         owned,
         vec![
@@ -137,6 +138,7 @@ fn query_into_owned_decodes_owned_twin() {
 enum OneCellQuery {}
 
 impl SqliteTypedQuery for OneCellQuery {
+    type Params<'p> = (i64,);
     type Record<'q> = Cell<'q>;
     type Owned = CellOwned;
     const SQL: &'static str = "SELECT i, r, t, b, n FROM cells WHERE i = $1";
@@ -156,25 +158,26 @@ fn query_one_and_query_opt_enforce_at_most_one() {
     seed_cells(&conn); // two rows (i = 1, 2)
 
     // A single-row query: `query_one` returns it, `query_opt` is `Some`.
-    let one = conn.query_one::<OneCellQuery>(&[ValueRef::Integer(1)]).expect("one");
+    let one = conn.query_one::<OneCellQuery>((1i64,)).expect("one");
     assert_eq!(one.i, 1);
-    assert!(conn.query_opt::<OneCellQuery>(&[ValueRef::Integer(1)]).expect("opt").is_some());
+    assert!(conn.query_opt::<OneCellQuery>((1i64,)).expect("opt").is_some());
 
-    // Zero rows: `query_opt` is `Ok(None)`, `query_one` is the no-rows error.
-    assert!(conn.query_opt::<OneCellQuery>(&[ValueRef::Integer(999)]).expect("opt").is_none());
-    match conn.query_one::<OneCellQuery>(&[ValueRef::Integer(999)]) {
-        Err(SqliteError::Query(_)) => {}
-        other => panic!("expected Query(no rows), got {other:?}"),
+    // Zero rows: `query_opt` is `Ok(None)`, `query_one` is the classified no-rows
+    // error (the peer of PostgreSQL's `DriverError::NoRows`).
+    assert!(conn.query_opt::<OneCellQuery>((999i64,)).expect("opt").is_none());
+    match conn.query_one::<OneCellQuery>((999i64,)) {
+        Err(SqliteError::NoRows) => {}
+        other => panic!("expected NoRows, got {other:?}"),
     }
 
     // TWO rows (`CellQuery` selects all): BOTH typed verbs reject with the
     // classified TooManyRows — the exactly-one / at-most-one contract, matching
     // the PostgreSQL typed verbs (not first-row like the dynamic *_sql peers).
-    match conn.query_one::<CellQuery>(&[]) {
+    match conn.query_one::<CellQuery>(()) {
         Err(SqliteError::TooManyRows) => {}
         other => panic!("expected TooManyRows, got {other:?}"),
     }
-    match conn.query_opt::<CellQuery>(&[]) {
+    match conn.query_opt::<CellQuery>(()) {
         Err(SqliteError::TooManyRows) => {}
         other => panic!("expected TooManyRows, got {other:?}"),
     }
@@ -187,7 +190,7 @@ fn query_each_streams_borrowed_records() {
 
     let mut seen: Vec<i64> = Vec::new();
     let out = conn
-        .query_each::<CellQuery, _, ()>(&[], |rec| {
+        .query_each::<CellQuery, _, ()>((), |rec| {
             seen.push(rec.i);
             ControlFlow::Continue(())
         })
@@ -197,7 +200,7 @@ fn query_each_streams_borrowed_records() {
 
     // Early break carries the payload.
     let stop = conn
-        .query_each::<CellQuery, _, &str>(&[], |rec| {
+        .query_each::<CellQuery, _, &str>((), |rec| {
             if rec.i == 1 {
                 ControlFlow::Break("stopped at one")
             } else {
@@ -218,6 +221,7 @@ struct IntRow {
 enum IntRowQuery {}
 
 impl SqliteTypedQuery for IntRowQuery {
+    type Params<'p> = ();
     type Record<'q> = IntRow;
     type Owned = IntRow;
     const SQL: &'static str = "SELECT v FROM t";
@@ -240,7 +244,7 @@ fn storage_class_mismatch_is_classified() {
 
     // The record declares `v: i64`, but a TEXT value arrives — a classified
     // TypeMismatch (INTEGER expected, TEXT found), never a coercion.
-    match conn.query::<IntRowQuery>(&[]).expect("query").iter().next().expect("one row") {
+    match conn.query::<IntRowQuery>(()).expect("query").iter().next().expect("one row") {
         Err(SqliteError::TypeMismatch { column, expected, found }) => {
             assert_eq!(column, 0);
             assert_eq!(expected.to_string(), "INTEGER");
@@ -249,7 +253,7 @@ fn storage_class_mismatch_is_classified() {
         other => panic!("expected TypeMismatch, got {other:?}"),
     }
     // The same mismatch on the direct-decode path (`query_one`).
-    match conn.query_one::<IntRowQuery>(&[]) {
+    match conn.query_one::<IntRowQuery>(()) {
         Err(SqliteError::TypeMismatch { .. }) => {}
         other => panic!("expected TypeMismatch, got {other:?}"),
     }
@@ -263,7 +267,7 @@ fn null_in_non_null_field_is_classified() {
 
     // The record declares `v: i64` (non-Option), but the value is NULL — a
     // classified UnexpectedNull, distinct from a type mismatch.
-    match conn.query::<IntRowQuery>(&[]).expect("query").iter().next().expect("one row") {
+    match conn.query::<IntRowQuery>(()).expect("query").iter().next().expect("one row") {
         Err(SqliteError::UnexpectedNull { column }) => assert_eq!(column, 0),
         other => panic!("expected UnexpectedNull, got {other:?}"),
     }
@@ -279,6 +283,7 @@ fn typed_query_binds_params_and_runs_in_a_transaction() {
     // A `$1` parameter binds by position; a positive filter selects one row.
     enum ByIQuery {}
     impl SqliteTypedQuery for ByIQuery {
+        type Params<'p> = (i64,);
         type Record<'q> = IntRow;
         type Owned = IntRow;
         const SQL: &'static str = "SELECT i FROM cells WHERE i = $1";
@@ -292,15 +297,89 @@ fn typed_query_binds_params_and_runs_in_a_transaction() {
         }
     }
 
-    let hit = conn.query_one::<ByIQuery>(&[ValueRef::Integer(2)]).expect("param query");
+    let hit = conn.query_one::<ByIQuery>((2i64,)).expect("param query");
     assert_eq!(hit.v, 2);
 
     // The same typed verbs are exposed on the transaction guard.
     let inside: Vec<i64> = conn
         .transaction(|tx| {
-            let rows = tx.query::<CellQuery>(&[]).expect("typed in tx");
+            let rows = tx.query::<CellQuery>(()).expect("typed in tx");
             Ok(rows.into_owned().expect("owned in tx").into_iter().map(|c| c.i).collect())
         })
         .expect("transaction");
     assert_eq!(inside, vec![1, 2]);
+}
+
+// A MULTI-parameter INSERT ... RETURNING. The typed param tuple `(i64, &str)`
+// binds each value in its true storage class onto the write (arity > 1), and
+// RETURNING decodes the result straight back into the typed record — the
+// write-path peer of the by-key read, with the SAME typed `Q::Params` the
+// PostgreSQL path takes (no `&[ValueRef]`).
+enum InsertRetQuery {}
+impl SqliteTypedQuery for InsertRetQuery {
+    type Params<'p> = (i64, &'static str);
+    type Record<'q> = IntRow;
+    type Owned = IntRow;
+    const SQL: &'static str =
+        "INSERT INTO cells (i, r, t, b, n) VALUES (?1, 9.0, ?2, x'AB', NULL) RETURNING i";
+    fn decode_row<'q, S: ColumnSource<'q>>(src: &S) -> Result<Self::Record<'q>, SqliteError> {
+        Ok(IntRow { v: read_required::<i64, S>(src, 0)? })
+    }
+    fn decode_row_owned<'a, S: ColumnSource<'a>>(src: &S) -> Result<Self::Owned, SqliteError> {
+        Ok(IntRow { v: read_required::<i64, S>(src, 0)? })
+    }
+}
+
+#[test]
+fn typed_multi_param_insert_returning_binds_and_decodes() {
+    let conn = Connection::open_in_memory().expect("open");
+    conn.execute_sql("CREATE TABLE cells (i INTEGER, r REAL, t TEXT, b BLOB, n INTEGER)")
+        .expect("create");
+
+    // Two typed params bind positionally; RETURNING decodes the new key.
+    let ret = conn.query_one::<InsertRetQuery>((42i64, "gamma")).expect("insert returning");
+    assert_eq!(ret.v, 42);
+
+    // The `&str` param really persisted in its TEXT storage class (read it back).
+    let back = conn.query_one_sql("SELECT t FROM cells WHERE i = 42").expect("read back");
+    assert_eq!(back.get::<&str>(0).expect("text"), "gamma");
+}
+
+// A NULLABLE parameter (`Option<i64>`): `None` binds SQL `NULL` (disabling the
+// `?1 IS NULL OR …` filter — every row), `Some(v)` binds the value (filters).
+// Proves the NULL-parameter path end-to-end through the typed verb — the bind
+// twin of a nullable RECORD field.
+enum NullFilterQuery {}
+impl SqliteTypedQuery for NullFilterQuery {
+    type Params<'p> = (Option<i64>,);
+    type Record<'q> = IntRow;
+    type Owned = IntRow;
+    const SQL: &'static str = "SELECT i FROM cells WHERE (?1 IS NULL OR i = ?1) ORDER BY i";
+    fn decode_row<'q, S: ColumnSource<'q>>(src: &S) -> Result<Self::Record<'q>, SqliteError> {
+        Ok(IntRow { v: read_required::<i64, S>(src, 0)? })
+    }
+    fn decode_row_owned<'a, S: ColumnSource<'a>>(src: &S) -> Result<Self::Owned, SqliteError> {
+        Ok(IntRow { v: read_required::<i64, S>(src, 0)? })
+    }
+}
+
+#[test]
+fn typed_nullable_param_binds_null_and_value() {
+    let conn = Connection::open_in_memory().expect("open");
+    seed_cells(&conn); // i = 1, 2
+
+    // `None` → the parameter is SQL NULL → the filter is disabled → both rows.
+    let all: Vec<i64> = conn
+        .query::<NullFilterQuery>((None,))
+        .expect("none param")
+        .into_owned()
+        .expect("owned")
+        .into_iter()
+        .map(|r| r.v)
+        .collect();
+    assert_eq!(all, vec![1, 2]);
+
+    // `Some(2)` → the filter is active → exactly one row.
+    let one = conn.query_one::<NullFilterQuery>((Some(2i64),)).expect("some param");
+    assert_eq!(one.v, 2);
 }

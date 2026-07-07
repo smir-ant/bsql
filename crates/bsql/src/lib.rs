@@ -204,6 +204,10 @@ pub trait BackendError {
     /// A typed `query_one` that matched MORE than one row (both backends'
     /// `TooManyRows`).
     fn is_too_many_rows(&self) -> bool;
+    /// A one-row read that expected a row but got NONE (PostgreSQL
+    /// `DriverError::NoRows`; SQLite `SqliteError::NoRows`) — lets a generic
+    /// consumer treat an empty `fetch_one` identically on both backends.
+    fn is_no_rows(&self) -> bool;
 }
 
 // Name `DriverError` from whichever PostgreSQL driver is enabled. Both drivers
@@ -238,6 +242,9 @@ impl BackendError for PgDriverError {
     fn is_too_many_rows(&self) -> bool {
         matches!(self, PgDriverError::TooManyRows)
     }
+    fn is_no_rows(&self) -> bool {
+        matches!(self, PgDriverError::NoRows)
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -264,7 +271,39 @@ impl BackendError for bsql_sqlite::SqliteError {
     fn is_too_many_rows(&self) -> bool {
         matches!(self, bsql_sqlite::SqliteError::TooManyRows)
     }
+    fn is_no_rows(&self) -> bool {
+        matches!(self, bsql_sqlite::SqliteError::NoRows)
+    }
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Write-once cross-backend data access (the two BLOCKING drivers)
+// ════════════════════════════════════════════════════════════════════
+//
+// One generic surface over `pg_sync` + `sqlite`, so a data layer written ONCE
+// runs on either. Present whenever a BLOCKING backend is enabled; an
+// async-only build has no `SyncBackend` (the async driver is unified
+// separately). See the module for the shape and the consumer-signature
+// contract.
+
+#[cfg(any(feature = "postgres-sync", feature = "sqlite"))]
+mod backend;
+
+/// Write-once cross-backend data access over the two BLOCKING drivers.
+///
+/// [`SyncBackend`] / [`SyncQueries`] are the generic surface a data layer is
+/// written against; [`RunsOn`] bridges a `query!` carrier to a concrete backend.
+/// Write the flagship consumer shape as `fn f<B>(conn: &mut B) where B:
+/// SyncBackend, SomeQuery: RunsOn<B, Params = .., Owned = ..>` — one `RunsOn<B>`
+/// bound per distinct `query!` the function runs, no `dyn`, no HRTB.
+#[cfg(any(feature = "postgres-sync", feature = "sqlite"))]
+pub use backend::{RunsOn, SyncBackend, SyncQueries};
+
+/// The SQLite transaction-guard adapter handed to a generic
+/// [`SyncBackend::transaction`] body. Named only in the public associated type
+/// `<sqlite::Connection as SyncBackend>::Tx`; a consumer rarely writes it.
+#[cfg(feature = "sqlite")]
+pub use backend::SqliteTx;
 
 // ════════════════════════════════════════════════════════════════════
 // Compile-checked query API (feature `macros`)

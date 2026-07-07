@@ -193,6 +193,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsql-syncbackend-fixture"
+version = "0.0.0"
+dependencies = [
+ "bsql",
+ "bsql-build",
+]
+
+[[package]]
 name = "bsql-test-harness-fixture"
 version = "0.0.0"
 dependencies = [

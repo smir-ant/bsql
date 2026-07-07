@@ -112,7 +112,10 @@ pub type _RowsReachableThroughBsql = bsql::Rows<UsersIdQuery>;
 /// umbrella crate's `bsql::PreparedQuery` re-export.
 #[doc(hidden)]
 pub type _PreparedReachableThroughBsql = bsql::PreparedQuery<
-    <UsersIdQuery as bsql::TypedQuery>::Params,
+    // `PREPARED` is `PreparedQuery<Self::Params<'static>, _>` (the const validator
+    // rides the `'static` param marker), so this alias names the `'static`
+    // instantiation of the parameter GAT.
+    <UsersIdQuery as bsql::TypedQuery>::Params<'static>,
     <UsersIdQuery as bsql::TypedQuery>::Row,
 >;
 

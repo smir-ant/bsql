@@ -65,6 +65,13 @@ pub use bsql_postgres_core::{
     Row, RowRef, Rows, SafeIdent, SafeTable, SslMode, TypedNotification,
 };
 
+// Re-export the compile-checked-query bound so a consumer can NAME the `query::<Q>`
+// verb's `Q: TypedQuery` constraint (e.g. in a generic-over-backend data layer)
+// through the driver alone, without reaching for the umbrella's `macros`
+// re-export. Symmetric with the SQLite driver, which already exposes
+// `SqliteTypedQuery`.
+pub use bsql_postgres_proto::TypedQuery;
+
 pub use cancel::CancelToken;
 pub use connection::{Connection, CopyInWriter, PreparedStatement, Transaction};
 pub use pool::{Pool, PooledConnection};

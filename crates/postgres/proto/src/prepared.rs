@@ -790,6 +790,40 @@ where
     )
 }
 
+/// Re-type [`Q::PREPARED`](crate::TypedQuery::PREPARED) to the verb-argument
+/// lifetime instantiation of its parameter GAT.
+///
+/// `Q::PREPARED` is `PreparedQuery<Q::Params<'static>, Q::Row>` — the const
+/// validator rides the `'static` parameter marker. A typed verb binds a BORROWED
+/// parameter (`Q::Params<'p>`, e.g. a runtime `&str`), whose tuple type differs
+/// from the `'static` one only in lifetime (SAME OID shape). Because
+/// [`PreparedQuery`] is INVARIANT in `Params`, the `'static`-typed const cannot
+/// be passed to the engine alongside a `'p` argument; this copies the prepared's
+/// byte fields (all `&'static`, unchanged — the OIDs / templates are
+/// lifetime-invariant) into the `'p` instantiation. The engine's
+/// `query_params(q: &PreparedQuery<P, R>, args: P)` then still ties the argument
+/// tuple to the prepared's `P` (`= Q::Params<'p>`), so the arg-SHAPE type pin is
+/// PRESERVED — only the lifetime moves. No `unsafe`: a field copy + a fresh
+/// zero-size `PhantomData`.
+#[doc(hidden)]
+#[inline]
+#[must_use]
+pub fn prepared_at<'p, Q>() -> PreparedQuery<Q::Params<'p>, Q::Row>
+where
+    Q: crate::TypedQuery,
+{
+    let s = <Q as crate::TypedQuery>::PREPARED;
+    PreparedQuery {
+        sql: s.sql,
+        stmt_name: s.stmt_name,
+        param_oids: s.param_oids,
+        row_oids: s.row_oids,
+        parse_template: s.parse_template,
+        bind_execute_prefix: s.bind_execute_prefix,
+        _phantom: PhantomData,
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // Static trailer bytes for the Bind frame.
 //

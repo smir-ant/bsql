@@ -141,7 +141,51 @@ pub enum SqliteError {
     /// the cancel it requested; the connection is REUSABLE afterward (the
     /// interrupt aborts the statement, not the connection).
     Interrupted,
+    /// A `NaN` floating-point value was bound as a parameter. SQLite's
+    /// `sqlite3_bind_double` silently coerces `NaN` to SQL `NULL` (only `NaN` —
+    /// `±INF` binds as a normal `REAL`), so a bound `NaN` would vanish and a
+    /// `WHERE x = ?` would match nothing. PostgreSQL round-trips `NaN`
+    /// bit-identically; that parity is unreachable on SQLite, so a `NaN` bind is
+    /// a LOUD classified error rather than a silent divergence. Rejected at the
+    /// one `ValueRef` bind seam, so BOTH the typed and dynamic paths see it.
+    NanBind,
+    /// A one-row verb ([`query_one`](crate::Connection::query_one) /
+    /// `query_one_sql` / `query_params_one`) received ZERO rows. The classified
+    /// peer of PostgreSQL's `DriverError::NoRows`, so a generic cross-backend
+    /// consumer classifies an empty one-row read identically on both backends
+    /// (via `BackendError::is_no_rows` at the umbrella). Replaces the former
+    /// stringly `Query("query returned no rows")`.
+    NoRows,
+    /// A TYPED query's bound parameter tuple had a DIFFERENT count than the SQL's
+    /// `?N` placeholders — a hand-written [`SqliteTypedQuery`](crate::SqliteTypedQuery)
+    /// carrier whose `Params` arity disagrees with its `SQL`. Under-binding would
+    /// otherwise run with SILENT `NULL`s for the unbound placeholders (SQLite
+    /// leaves an unbound parameter `NULL`); this makes the mismatch loud. The
+    /// dynamic `*_params` path already errors on a bind-count mismatch — this
+    /// closes the typed-path asymmetry. (The macro-generated carriers always
+    /// agree by construction; this guards a HAND-WRITTEN carrier.)
+    ParameterCountMismatch {
+        /// The number of `?N` placeholders the prepared statement expects.
+        expected: usize,
+        /// The number of parameters the tuple bound (`SqliteBindParams::COUNT`).
+        bound: usize,
+    },
 }
+
+/// Zero-size marker threaded through [`rusqlite::Error::ToSqlConversionFailure`]
+/// so the [`From<rusqlite::Error>`] seam can classify a `NaN` parameter bind
+/// (rejected in [`ValueRef`](crate::ValueRef)'s `ToSql`) into
+/// [`SqliteError::NanBind`], never an opaque conversion failure.
+#[derive(Debug)]
+pub(crate) struct NanBindError;
+
+impl core::fmt::Display for NanBindError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "a NaN floating-point value cannot be bound as a SQLite parameter")
+    }
+}
+
+impl std::error::Error for NanBindError {}
 
 // Footprint pin: sized by the widest variant. The `String`-carrying variants
 // (`Sqlite { code: Option<i32>, message: String }`, `UnknownColumn { name }`)
@@ -323,6 +367,17 @@ impl core::fmt::Display for SqliteError {
                  than one",
             ),
             Self::Interrupted => write!(f, "sqlite: query interrupted (canceled)"),
+            Self::NanBind => write!(
+                f,
+                "a NaN parameter cannot be bound on SQLite (it would silently coerce to NULL) — \
+                 bind a sentinel value or use a nullable column",
+            ),
+            Self::NoRows => write!(f, "query returned no rows"),
+            Self::ParameterCountMismatch { expected, bound } => write!(
+                f,
+                "typed query expects {expected} bound parameter(s) but the tuple bound {bound} — \
+                 the carrier's Params arity disagrees with its SQL",
+            ),
         }
     }
 }
@@ -331,6 +386,15 @@ impl std::error::Error for SqliteError {}
 
 impl From<rusqlite::Error> for SqliteError {
     fn from(e: rusqlite::Error) -> Self {
+        // A NaN parameter bind, rejected at the single `ValueRef` ToSql seam, is
+        // carried as a typed marker inside `ToSqlConversionFailure` — recover it
+        // into the classified `NanBind` variant rather than an opaque conversion
+        // failure.
+        if let rusqlite::Error::ToSqlConversionFailure(inner) = &e
+            && inner.downcast_ref::<NanBindError>().is_some()
+        {
+            return Self::NanBind;
+        }
         // A `sqlite3_interrupt`-aborted statement is classified into its OWN
         // variant so a caller can match the cancel it requested — never folded
         // into an opaque `Sqlite { code: 9 }`. Every other engine failure keeps

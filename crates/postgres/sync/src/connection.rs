@@ -636,7 +636,7 @@ impl Connection {
     /// statement is Parsed once per connection and the server-side plan reused
     /// thereafter. The runtime-SQL escape hatch is [`query_sql`](Self::query_sql).
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query<Q: TypedQuery>(&mut self, params: Q::Params) -> Result<Rows<Q>, DriverError> {
+    pub fn query<'p, Q: TypedQuery>(&mut self, params: Q::Params<'p>) -> Result<Rows<Q>, DriverError> {
         drive_sync(engine::poll_once(self.core.query::<Q>(
             params,
             #[cfg(feature = "n1-detect")]
@@ -648,7 +648,7 @@ impl Connection {
     /// owned record. Zero rows is [`DriverError::NoRows`]; more than one is
     /// [`DriverError::TooManyRows`] (loud, never a silently-taken first row).
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query_one<Q: TypedQuery>(&mut self, params: Q::Params) -> Result<Q::Owned, DriverError> {
+    pub fn query_one<'p, Q: TypedQuery>(&mut self, params: Q::Params<'p>) -> Result<Q::Owned, DriverError> {
         drive_sync(engine::poll_once(self.core.query_one::<Q>(
             params,
             #[cfg(feature = "n1-detect")]
@@ -663,9 +663,9 @@ impl Connection {
     /// [`query_one`](Self::query_one); the runtime-SQL escape hatch is
     /// [`query_opt_sql`](Self::query_opt_sql).
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query_opt<Q: TypedQuery>(
+    pub fn query_opt<'p, Q: TypedQuery>(
         &mut self,
-        params: Q::Params,
+        params: Q::Params<'p>,
     ) -> Result<Option<Q::Owned>, DriverError> {
         drive_sync(engine::poll_once(self.core.query_opt::<Q>(
             params,
@@ -699,9 +699,9 @@ impl Connection {
     /// A [`Break`](ControlFlow::Break) of a colossal result still reads the
     /// remaining rows to reach the clean idle boundary — O(remaining rows).
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query_each<Q, F, E>(
+    pub fn query_each<'p, Q, F, E>(
         &mut self,
-        params: Q::Params,
+        params: Q::Params<'p>,
         on_row: F,
     ) -> Result<Option<E>, DriverError>
     where
@@ -1337,7 +1337,7 @@ impl Transaction<'_> {
     /// Run a compile-checked `query!` and collect its TYPED rows — the flagship
     /// parameterised query.
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query<Q: TypedQuery>(&mut self, params: Q::Params) -> Result<Rows<Q>, DriverError> {
+    pub fn query<'p, Q: TypedQuery>(&mut self, params: Q::Params<'p>) -> Result<Rows<Q>, DriverError> {
         self.arm_begin();
         drive_sync(engine::poll_once(self.core.query::<Q>(
             params,
@@ -1350,7 +1350,7 @@ impl Transaction<'_> {
     /// owned record. Zero rows is [`DriverError::NoRows`]; more than one is
     /// [`DriverError::TooManyRows`].
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query_one<Q: TypedQuery>(&mut self, params: Q::Params) -> Result<Q::Owned, DriverError> {
+    pub fn query_one<'p, Q: TypedQuery>(&mut self, params: Q::Params<'p>) -> Result<Q::Owned, DriverError> {
         self.arm_begin();
         drive_sync(engine::poll_once(self.core.query_one::<Q>(
             params,
@@ -1364,9 +1364,9 @@ impl Transaction<'_> {
     /// than one is [`DriverError::TooManyRows`]. The zero-or-one peer of
     /// [`query_one`](Self::query_one).
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query_opt<Q: TypedQuery>(
+    pub fn query_opt<'p, Q: TypedQuery>(
         &mut self,
-        params: Q::Params,
+        params: Q::Params<'p>,
     ) -> Result<Option<Q::Owned>, DriverError> {
         self.arm_begin();
         drive_sync(engine::poll_once(self.core.query_opt::<Q>(
@@ -1380,9 +1380,9 @@ impl Transaction<'_> {
     /// CONSTANT memory — the streaming peer of [`query`](Self::query). See
     /// [`Connection::query_each`] for the full contract.
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query_each<Q, F, E>(
+    pub fn query_each<'p, Q, F, E>(
         &mut self,
-        params: Q::Params,
+        params: Q::Params<'p>,
         on_row: F,
     ) -> Result<Option<E>, DriverError>
     where

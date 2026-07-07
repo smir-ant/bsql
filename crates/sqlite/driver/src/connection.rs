@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::bind::SqliteBindParams;
 use crate::error::SqliteError;
 use crate::typed::{ColumnSource, SqliteTypedQuery};
 use crate::value::{typed_get, typed_get_opt, FromColumn, Type, ValueRef};
@@ -713,16 +714,48 @@ impl Connection {
         let col_count = stmt.column_count();
         let column_names: Arc<[String]> =
             stmt.column_names().iter().map(|s| (*s).to_owned()).collect();
-
-        let mut builder = ArenaBuilder::new(col_count);
         let mut rows = stmt.query(params)?;
+        Self::drain_into_result(col_count, column_names, &mut rows)
+    }
+
+    /// Typed-flagship eager-collect: bind the compile-checked `$N` parameter
+    /// tuple positionally onto the prepared statement (zero-alloc, via rusqlite's
+    /// `raw_bind_parameter`), then materialize the same shared arena as the
+    /// dynamic [`Self::query_collect`]. The parameter model is the typed tuple
+    /// (`P: SqliteBindParams`), not the dynamic `&[ValueRef]`, so a `query!`
+    /// binds the SAME typed parameters on SQLite as on PostgreSQL.
+    fn query_collect_typed<P: SqliteBindParams>(
+        &self,
+        sql: &str,
+        params: &P,
+    ) -> Result<QueryResult, SqliteError> {
+        let mut stmt = self.inner.prepare(sql)?;
+        let col_count = stmt.column_count();
+        let column_names: Arc<[String]> =
+            stmt.column_names().iter().map(|s| (*s).to_owned()).collect();
+        ensure_param_count(&stmt, P::COUNT)?;
+        params.bind_positional(&mut stmt)?;
+        let mut rows = stmt.raw_query();
+        Self::drain_into_result(col_count, column_names, &mut rows)
+    }
+
+    /// Drain every row of a prepared query into ONE shared arena + lazy
+    /// [`RowSet`] — the collect loop shared by the dynamic
+    /// [`Self::query_collect`] and the typed [`Self::query_collect_typed`], so
+    /// the two bind paths (dynamic `&[ValueRef]` vs typed tuple) converge on one
+    /// arena-materialize with no drift.
+    fn drain_into_result(
+        col_count: usize,
+        column_names: Arc<[String]>,
+        rows: &mut rusqlite::Rows<'_>,
+    ) -> Result<QueryResult, SqliteError> {
+        let mut builder = ArenaBuilder::new(col_count);
         while let Some(row) = rows.next()? {
             for col in 0..col_count {
                 builder.push_ref(row.get_ref(col)?);
             }
             builder.end_row();
         }
-
         let rows = builder.finish(Arc::clone(&column_names))?;
         Ok(QueryResult { rows, column_names })
     }
@@ -789,7 +822,7 @@ impl Connection {
     ) -> Result<Row, SqliteError> {
         self.query_params(sql, params)?
             .get(0)
-            .ok_or_else(|| SqliteError::Query("query returned no rows".to_owned()))
+            .ok_or(SqliteError::NoRows)
     }
 
     /// Run a parameterized query and return its first row, if any.
@@ -806,7 +839,7 @@ impl Connection {
     pub fn query_one_sql(&self, sql: &str) -> Result<Row, SqliteError> {
         self.query_sql(sql)?
             .get(0)
-            .ok_or_else(|| SqliteError::Query("query returned no rows".to_owned()))
+            .ok_or(SqliteError::NoRows)
     }
 
     /// Run a query and return its first row, if any.
@@ -819,10 +852,16 @@ impl Connection {
     ///
     /// `Q` is a `query!` carrier (`FooQuery`); the projected column types and
     /// nullability were fixed at build time against the migration-replayed
-    /// schema, so this returns typed records, not a dynamic row. Each `$N`
-    /// parameter binds through `params` in its TRUE SQLite storage class (see
-    /// [`ValueRef`]) — a `NULL` / `BLOB` parameter is expressible, an integer is
-    /// bound as an integer.
+    /// schema, so this returns typed records, not a dynamic row. `params` is the
+    /// TYPED `Q::Params` tuple — the SAME tuple the PostgreSQL `query::<Q>` takes
+    /// (the SQLite param-bridge, [`SqliteBindParams`](crate::SqliteBindParams)) —
+    /// so a `query!` runs with the SAME typed parameters on both backends: each
+    /// element binds in its true storage class (`&str` → `TEXT`, `&[u8]` → `BLOB`,
+    /// `None` → SQL `NULL`), compile-checked against the query's `$N` types. A
+    /// parameter type SQLite cannot bind (a `u64`, a PostgreSQL-only type) is a
+    /// located compile error here, never a silent mis-bind. The dynamic
+    /// [`query_params`](Self::query_params) verb keeps the untyped `&[ValueRef]`
+    /// as the escape hatch.
     ///
     /// Because SQLite is dynamically typed, decoding VERIFIES each value's actual
     /// storage class against the record's declared field type: a mismatch (the
@@ -836,13 +875,16 @@ impl Connection {
     /// A prepare / step failure is a classified [`SqliteError`]; per-row decode
     /// failures surface from the returned [`TypedRows`].
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query<Q: SqliteTypedQuery>(
+    pub fn query<'p, Q: SqliteTypedQuery>(
         &self,
-        params: &[ValueRef<'_>],
-    ) -> Result<TypedRows<Q>, SqliteError> {
+        params: Q::Params<'p>,
+    ) -> Result<TypedRows<Q>, SqliteError>
+    where
+        Q::Params<'p>: SqliteBindParams,
+    {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::SQL, core::panic::Location::caller());
-        let result = self.query_collect(Q::SQL, rusqlite::params_from_iter(params))?;
+        let result = self.query_collect_typed::<Q::Params<'p>>(Q::SQL, &params)?;
         Ok(TypedRows { result, _q: PhantomData })
     }
 
@@ -862,14 +904,17 @@ impl Connection {
     /// [`SqliteError::Query`] on zero rows, [`SqliteError::TooManyRows`] on two or
     /// more, or a classified [`SqliteError`] on a prepare / step / decode failure.
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query_one<Q: SqliteTypedQuery>(
+    pub fn query_one<'p, Q: SqliteTypedQuery>(
         &self,
-        params: &[ValueRef<'_>],
-    ) -> Result<Q::Owned, SqliteError> {
+        params: Q::Params<'p>,
+    ) -> Result<Q::Owned, SqliteError>
+    where
+        Q::Params<'p>: SqliteBindParams,
+    {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::SQL, core::panic::Location::caller());
-        self.query_first_owned::<Q>(params)?
-            .ok_or_else(|| SqliteError::Query("query returned no rows".to_owned()))
+        self.query_first_owned::<Q>(&params)?
+            .ok_or(SqliteError::NoRows)
     }
 
     /// Run a compile-checked `query!` expecting AT MOST one row, returning the
@@ -887,13 +932,16 @@ impl Connection {
     /// [`SqliteError`] on a prepare / step / decode failure (zero rows is
     /// `Ok(None)`).
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query_opt<Q: SqliteTypedQuery>(
+    pub fn query_opt<'p, Q: SqliteTypedQuery>(
         &self,
-        params: &[ValueRef<'_>],
-    ) -> Result<Option<Q::Owned>, SqliteError> {
+        params: Q::Params<'p>,
+    ) -> Result<Option<Q::Owned>, SqliteError>
+    where
+        Q::Params<'p>: SqliteBindParams,
+    {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::SQL, core::panic::Location::caller());
-        self.query_first_owned::<Q>(params)
+        self.query_first_owned::<Q>(&params)
     }
 
     /// Shared at-most-one decode-direct body behind
@@ -909,12 +957,17 @@ impl Connection {
     /// `sqlite3_step`, never a materialization (the same cost model as the
     /// PostgreSQL break-on-second-row path). The DYNAMIC `query_one_sql` /
     /// `query_opt_sql` deliberately stay first-row.
-    fn query_first_owned<Q: SqliteTypedQuery>(
+    fn query_first_owned<'p, Q: SqliteTypedQuery>(
         &self,
-        params: &[ValueRef<'_>],
-    ) -> Result<Option<Q::Owned>, SqliteError> {
+        params: &Q::Params<'p>,
+    ) -> Result<Option<Q::Owned>, SqliteError>
+    where
+        Q::Params<'p>: SqliteBindParams,
+    {
         let mut stmt = self.inner.prepare(Q::SQL)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        ensure_param_count(&stmt, <Q::Params<'p> as SqliteBindParams>::COUNT)?;
+        params.bind_positional(&mut stmt)?;
+        let mut rows = stmt.raw_query();
         // Decode the first row's OWNED twin (copies text/blob out, so it no
         // longer borrows the row step) — or return `None` for zero rows. The
         // borrowed view is dropped at the end of this `match`, releasing `rows`
@@ -946,19 +999,22 @@ impl Connection {
     ///
     /// A classified [`SqliteError`] on a prepare / step / decode failure.
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query_each<Q, F, E>(
+    pub fn query_each<'p, Q, F, E>(
         &self,
-        params: &[ValueRef<'_>],
+        params: Q::Params<'p>,
         mut on_row: F,
     ) -> Result<Option<E>, SqliteError>
     where
         Q: SqliteTypedQuery,
+        Q::Params<'p>: SqliteBindParams,
         F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E>,
     {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::SQL, core::panic::Location::caller());
         let mut stmt = self.inner.prepare(Q::SQL)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
+        ensure_param_count(&stmt, <Q::Params<'p> as SqliteBindParams>::COUNT)?;
+        params.bind_positional(&mut stmt)?;
+        let mut rows = stmt.raw_query();
         while let Some(row) = rows.next()? {
             let view = BorrowedRow { row };
             let record = Q::decode_row(&view)?;
@@ -1071,6 +1127,23 @@ fn changes_to_u64(n: usize) -> u64 {
     match u64::try_from(n) {
         Ok(v) => v,
         Err(_) => 0,
+    }
+}
+
+/// Guard a TYPED bind against an arity mismatch between the carrier's `Params`
+/// tuple (`bound` = `SqliteBindParams::COUNT`) and the SQL's `?N` placeholders
+/// (`stmt.parameter_count()`). A hand-written [`SqliteTypedQuery`](crate::SqliteTypedQuery)
+/// carrier whose tuple is SHORTER would otherwise bind SILENT `NULL`s for the
+/// unbound placeholders (SQLite leaves an unbound parameter `NULL`) — this makes
+/// the mismatch a classified [`SqliteError::ParameterCountMismatch`], closing the
+/// asymmetry with the dynamic path (which already errors on a bind-count
+/// mismatch). Macro-generated carriers always agree by construction.
+fn ensure_param_count(stmt: &rusqlite::Statement<'_>, bound: usize) -> Result<(), SqliteError> {
+    let expected = stmt.parameter_count();
+    if expected == bound {
+        Ok(())
+    } else {
+        Err(SqliteError::ParameterCountMismatch { expected, bound })
     }
 }
 
@@ -1194,10 +1267,13 @@ impl Transaction<'_> {
     ///
     /// A classified [`SqliteError`] on a prepare / step failure.
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query<Q: SqliteTypedQuery>(
+    pub fn query<'p, Q: SqliteTypedQuery>(
         &self,
-        params: &[ValueRef<'_>],
-    ) -> Result<TypedRows<Q>, SqliteError> {
+        params: Q::Params<'p>,
+    ) -> Result<TypedRows<Q>, SqliteError>
+    where
+        Q::Params<'p>: SqliteBindParams,
+    {
         self.conn.query::<Q>(params)
     }
 
@@ -1209,10 +1285,13 @@ impl Transaction<'_> {
     /// [`SqliteError::Query`] on zero rows, [`SqliteError::TooManyRows`] on two or
     /// more, or a classified [`SqliteError`] on a prepare / step / decode failure.
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query_one<Q: SqliteTypedQuery>(
+    pub fn query_one<'p, Q: SqliteTypedQuery>(
         &self,
-        params: &[ValueRef<'_>],
-    ) -> Result<Q::Owned, SqliteError> {
+        params: Q::Params<'p>,
+    ) -> Result<Q::Owned, SqliteError>
+    where
+        Q::Params<'p>: SqliteBindParams,
+    {
         self.conn.query_one::<Q>(params)
     }
 
@@ -1225,10 +1304,13 @@ impl Transaction<'_> {
     /// [`SqliteError`] on a prepare / step / decode failure (zero rows is
     /// `Ok(None)`).
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query_opt<Q: SqliteTypedQuery>(
+    pub fn query_opt<'p, Q: SqliteTypedQuery>(
         &self,
-        params: &[ValueRef<'_>],
-    ) -> Result<Option<Q::Owned>, SqliteError> {
+        params: Q::Params<'p>,
+    ) -> Result<Option<Q::Owned>, SqliteError>
+    where
+        Q::Params<'p>: SqliteBindParams,
+    {
         self.conn.query_opt::<Q>(params)
     }
 
@@ -1239,13 +1321,14 @@ impl Transaction<'_> {
     ///
     /// A classified [`SqliteError`] on a prepare / step / decode failure.
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn query_each<Q, F, E>(
+    pub fn query_each<'p, Q, F, E>(
         &self,
-        params: &[ValueRef<'_>],
+        params: Q::Params<'p>,
         on_row: F,
     ) -> Result<Option<E>, SqliteError>
     where
         Q: SqliteTypedQuery,
+        Q::Params<'p>: SqliteBindParams,
         F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E>,
     {
         self.conn.query_each::<Q, F, E>(params, on_row)

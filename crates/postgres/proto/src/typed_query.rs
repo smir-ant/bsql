@@ -73,7 +73,18 @@ pub trait TypedQuery {
     /// hatch mirrors this: it borrows the param tuple all the way to the engine
     /// (`&P`), so it too binds a non-`Copy` owned param — the two paths are
     /// symmetric, with no `Copy`-only asymmetry between them.
-    type Params: ParamsWriter;
+    ///
+    /// # Why this is a lifetime GAT
+    ///
+    /// A `text` / `bytea` parameter is a BORROW (`&'p str` / `&'p [u8]`), so the
+    /// parameter tuple is lifetime-POLYMORPHIC: a typed verb accepts `Params<'p>`
+    /// for the caller's `'p`, letting a RUNTIME `&str` bind (not only a `&'static`
+    /// literal). The lifetime never reaches the wire — the OIDs / formats are
+    /// lifetime-invariant, and the const validator uses the `'static`
+    /// instantiation ([`PREPARED`](Self::PREPARED) is `PreparedQuery<Self::Params<'static>,
+    /// _>`), so the compile-time OID pin is unchanged. A scalar / param-free query
+    /// makes `Params<'p>` `'p`-invariant (`(i64,)` / `()`).
+    type Params<'p>: ParamsWriter;
     /// The row tuple marker — the projected column Rust types, supplying the
     /// wire row OIDs.
     type Row: RowDecode;
@@ -90,7 +101,11 @@ pub trait TypedQuery {
     /// `FooQuery::PREPARED`, minted at compile time through the proto-owned
     /// `run` boundary. Its wire bytes are const-checked against
     /// [`Params`](Self::Params) / [`Row`](Self::Row); a drift is a build error.
-    const PREPARED: PreparedQuery<Self::Params, Self::Row>;
+    ///
+    /// Uses the `'static` instantiation of the parameter GAT — the OIDs the
+    /// validator pins are lifetime-invariant, so this is byte-identical to the
+    /// pre-GAT `PreparedQuery<Self::Params, Self::Row>`.
+    const PREPARED: PreparedQuery<Self::Params<'static>, Self::Row>;
 
     /// Decode one raw `DataRow` payload (the wire bytes beginning with the
     /// 2-byte column-count header) into the borrowed record. Text columns alias

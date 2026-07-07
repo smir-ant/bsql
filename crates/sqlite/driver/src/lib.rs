@@ -77,6 +77,7 @@ macro_rules! footprint_pin {
 }
 pub(crate) use footprint_pin;
 
+mod bind;
 mod cancel;
 mod connection;
 mod error;
@@ -88,6 +89,7 @@ mod n1;
 mod typed;
 mod value;
 
+pub use bind::{SqliteBindParams, SqliteBindValue};
 pub use cancel::SqliteCancelToken;
 pub use connection::{BorrowedRow, Connection, QueryResult, Row, RowSet, Transaction, TypedRows};
 pub use error::SqliteError;

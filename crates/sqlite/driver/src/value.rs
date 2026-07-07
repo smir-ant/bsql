@@ -129,6 +129,21 @@ impl<'a> From<ValueRef<'a>> for rusqlite::types::ValueRef<'a> {
 
 impl rusqlite::types::ToSql for ValueRef<'_> {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        // A NaN cannot bind: `sqlite3_bind_double` silently coerces NaN to SQL
+        // NULL (only NaN — `±INF` binds as a normal REAL), so a bound NaN would
+        // vanish and `WHERE x = ?` match nothing. PostgreSQL round-trips NaN
+        // bit-identically; that parity is unreachable here, so a NaN bind is a
+        // LOUD classified error (`SqliteError::NanBind`, recovered from this
+        // marker in `From<rusqlite::Error>`) rather than a silent divergence.
+        // This is the ONE bind seam both the typed (`raw_bind_parameter`) and
+        // dynamic (`params_from_iter`) paths pass through.
+        if let ValueRef::Real(f) = self
+            && f.is_nan()
+        {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                crate::error::NanBindError,
+            )));
+        }
         // BORROWED: the parameter's storage class is carried through unchanged
         // (no coercion) and its bytes (for Text/Blob) are lent, not copied. The
         // returned view's lifetime is `&self`'s, which the value's own `'a`

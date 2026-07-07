@@ -646,9 +646,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
 
     /// Run a compile-checked `query!` and collect its TYPED rows — the flagship
     /// parameterised query. Under `n1-detect` records the USER call site.
-    pub async fn query<Q: TypedQuery>(
+    pub async fn query<'p, Q: TypedQuery>(
         &mut self,
-        params: Q::Params,
+        params: Q::Params<'p>,
         #[cfg(feature = "n1-detect")] caller: &'static core::panic::Location<'static>,
     ) -> Result<Rows<Q>, DriverError> {
         #[cfg(feature = "n1-detect")]
@@ -663,9 +663,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// Records nothing — the N+1 hook fires exactly once in the public verb that
     /// called this. ([`query_one`](Self::query_one) does NOT route through here:
     /// it decodes its single row directly off the wire, with no prebuffer.)
-    async fn query_collect<Q: TypedQuery>(
+    async fn query_collect<'p, Q: TypedQuery>(
         &mut self,
-        params: Q::Params,
+        params: Q::Params<'p>,
     ) -> Result<Rows<Q>, DriverError> {
         let live = self.take_live()?;
         let mut builder = RowsBuilder::new();
@@ -673,7 +673,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .engine
             .query_params(
                 live,
-                &Q::PREPARED,
+                &bsql_postgres_proto::prepared::prepared_at::<Q>(),
                 params,
                 capture_notify(&mut self.notifications, |s| {
                     builder.feed(s);
@@ -697,9 +697,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// (see [`query_at_most_one`](Self::query_at_most_one)); the two differ ONLY in
     /// the zero-row outcome — `query_one` rejects it as
     /// [`NoRows`](DriverError::NoRows), `query_opt` returns `Ok(None)`.
-    pub async fn query_one<Q: TypedQuery>(
+    pub async fn query_one<'p, Q: TypedQuery>(
         &mut self,
-        params: Q::Params,
+        params: Q::Params<'p>,
         #[cfg(feature = "n1-detect")] caller: &'static core::panic::Location<'static>,
     ) -> Result<Q::Owned, DriverError> {
         #[cfg(feature = "n1-detect")]
@@ -720,9 +720,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// other precedence is identical — a second row still dominates as
     /// [`TooManyRows`](DriverError::TooManyRows), and a lone malformed row is
     /// [`Decode`](DriverError::Decode).
-    pub async fn query_opt<Q: TypedQuery>(
+    pub async fn query_opt<'p, Q: TypedQuery>(
         &mut self,
-        params: Q::Params,
+        params: Q::Params<'p>,
         #[cfg(feature = "n1-detect")] caller: &'static core::panic::Location<'static>,
     ) -> Result<Option<Q::Owned>, DriverError> {
         #[cfg(feature = "n1-detect")]
@@ -760,9 +760,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// second row is still awaited); a lone malformed row is
     /// [`Decode`](DriverError::Decode); zero rows is `Ok(None)` (mapped to
     /// [`NoRows`](DriverError::NoRows) only by [`query_one`](Self::query_one)).
-    async fn query_at_most_one<Q: TypedQuery>(
+    async fn query_at_most_one<'p, Q: TypedQuery>(
         &mut self,
-        params: Q::Params,
+        params: Q::Params<'p>,
     ) -> Result<Option<Q::Owned>, DriverError> {
         let live = self.take_live()?;
         // The single decoded row (owned, so it outlives the pump), plus the
@@ -779,7 +779,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .engine
             .query_params_break(
                 live,
-                &Q::PREPARED,
+                &bsql_postgres_proto::prepared::prepared_at::<Q>(),
                 params,
                 capture_notify(&mut self.notifications, |surface| match surface {
                     Surface::Row(body) => {
@@ -882,9 +882,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ///
     /// See each driver's `query_each` for the full contract (return values,
     /// early-abort cost, decode/oversize/server-error handling).
-    pub async fn query_each<Q, F, E>(
+    pub async fn query_each<'p, Q, F, E>(
         &mut self,
-        params: Q::Params,
+        params: Q::Params<'p>,
         mut on_row: F,
         #[cfg(feature = "n1-detect")] caller: &'static core::panic::Location<'static>,
     ) -> Result<Option<E>, DriverError>
@@ -906,7 +906,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .engine
             .query_params_break(
                 live,
-                &Q::PREPARED,
+                &bsql_postgres_proto::prepared::prepared_at::<Q>(),
                 params,
                 capture_notify(&mut self.notifications, |surface| match surface {
                     Surface::Row(body) => match Q::decode_borrowed(body) {
