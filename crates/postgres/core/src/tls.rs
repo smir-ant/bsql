@@ -172,9 +172,13 @@ pub enum TlsError<E> {
     /// which `read` reports as `Ok(0)`.
     #[cfg(feature = "tls")]
     ClosedDuringHandshake,
-    /// `rustls` surfaced a `ConnectionState` this client does not model.
-    /// `ConnectionState` is `#[non_exhaustive]`; rather than a silent wildcard
-    /// that drops the state, an unmodelled state is a loud classified error.
+    /// The TLS transport reached a state this client does not model: either
+    /// `rustls` surfaced a `#[non_exhaustive]` `ConnectionState` bsql does not
+    /// handle, or an internal buffer cursor would have to violate its
+    /// `start <= filled <= len` invariant to proceed (a bound-check or
+    /// checked-arithmetic dead arm). Both are structurally unreachable under an
+    /// intact build; surfaced as a loud classified error rather than a silent
+    /// wildcard or a panicking `arr[i]` / `+`.
     #[cfg(feature = "tls")]
     UnexpectedState,
 }
@@ -502,9 +506,15 @@ impl<Inner: Transport> fmt::Debug for TlsTransport<Inner> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Buffer *contents* (plaintext + ciphertext) are deliberately omitted.
         f.debug_struct("TlsTransport")
-            .field("out_pending", &(self.out_buf.len() - self.out_sent))
-            .field("staging_pending", &(self.staging_filled - self.staging_start))
-            .field("plaintext_pending", &(self.plaintext.len() - self.plaintext_start))
+            .field("out_pending", &self.out_buf.len().saturating_sub(self.out_sent))
+            .field(
+                "staging_pending",
+                &self.staging_filled.saturating_sub(self.staging_start),
+            )
+            .field(
+                "plaintext_pending",
+                &self.plaintext.len().saturating_sub(self.plaintext_start),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -576,7 +586,8 @@ impl<Inner: Transport> TlsTransport<Inner> {
             self.out_buf.clear();
         } else {
             self.out_buf.copy_within(self.out_sent.., 0);
-            self.out_buf.truncate(self.out_buf.len() - self.out_sent);
+            self.out_buf
+                .truncate(self.out_buf.len().saturating_sub(self.out_sent));
         }
         self.out_sent = 0;
     }
@@ -595,7 +606,7 @@ impl<Inner: Transport> TlsTransport<Inner> {
         }
         self.staging
             .copy_within(self.staging_start..self.staging_filled, 0);
-        self.staging_filled -= self.staging_start;
+        self.staging_filled = self.staging_filled.saturating_sub(self.staging_start);
         self.staging_start = 0;
     }
 
@@ -620,13 +631,17 @@ impl<Inner: Transport> TlsTransport<Inner> {
         while self.out_sent < self.out_buf.len() {
             let n = self
                 .inner
-                .write(&self.out_buf[self.out_sent..])
+                .write(
+                    self.out_buf
+                        .get(self.out_sent..)
+                        .ok_or(TlsError::UnexpectedState)?,
+                )
                 .await
                 .map_err(TlsError::Socket)?;
             if n == 0 {
                 return Err(TlsError::WriteZero);
             }
-            self.out_sent += n;
+            self.out_sent = self.out_sent.checked_add(n).ok_or(TlsError::UnexpectedState)?;
         }
         self.reclaim_out();
         Ok(())
@@ -659,10 +674,14 @@ impl<Inner: Transport> TlsTransport<Inner> {
         self.compact_staging();
         let n = self
             .inner
-            .read(&mut self.staging[self.staging_filled..])
+            .read(
+                self.staging
+                    .get_mut(self.staging_filled..)
+                    .ok_or(TlsError::UnexpectedState)?,
+            )
             .await
             .map_err(TlsError::Socket)?;
-        self.staging_filled += n;
+        self.staging_filled = self.staging_filled.checked_add(n).ok_or(TlsError::UnexpectedState)?;
         Ok(n)
     }
 
@@ -670,7 +689,9 @@ impl<Inner: Transport> TlsTransport<Inner> {
         loop {
             let signal = pump_inbound(
                 &mut self.conn,
-                &mut self.staging[..self.staging_filled],
+                self.staging
+                    .get_mut(..self.staging_filled)
+                    .ok_or(TlsError::UnexpectedState)?,
                 &mut self.staging_start,
                 &mut self.out_buf,
                 &mut self.plaintext,
@@ -699,10 +720,18 @@ impl<Inner: Transport> TlsTransport<Inner> {
             // 1. Serve buffered plaintext first (a record may span several
             //    reads when the caller buffer is smaller than the record).
             if self.plaintext_start < self.plaintext.len() {
-                let avail = &self.plaintext[self.plaintext_start..];
+                let avail = self
+                    .plaintext
+                    .get(self.plaintext_start..)
+                    .ok_or(TlsError::UnexpectedState)?;
                 let n = avail.len().min(buf.len());
-                buf[..n].copy_from_slice(&avail[..n]);
-                self.plaintext_start += n;
+                buf.get_mut(..n)
+                    .ok_or(TlsError::UnexpectedState)?
+                    .copy_from_slice(avail.get(..n).ok_or(TlsError::UnexpectedState)?);
+                self.plaintext_start = self
+                    .plaintext_start
+                    .checked_add(n)
+                    .ok_or(TlsError::UnexpectedState)?;
                 if self.plaintext_start >= self.plaintext.len() {
                     self.plaintext.clear();
                     self.plaintext_start = 0;
@@ -722,7 +751,9 @@ impl<Inner: Transport> TlsTransport<Inner> {
             //    record and does not grow; only the extra residence remains.
             let signal = pump_inbound(
                 &mut self.conn,
-                &mut self.staging[..self.staging_filled],
+                self.staging
+                    .get_mut(..self.staging_filled)
+                    .ok_or(TlsError::UnexpectedState)?,
                 &mut self.staging_start,
                 &mut self.out_buf,
                 &mut self.plaintext,
@@ -994,13 +1025,18 @@ fn pump_inbound(
     scratch: &mut [u8],
 ) -> Result<Pumped, TlsStepError> {
     loop {
-        let status = conn.process_tls_records(&mut staging[*staging_start..]);
+        let status = conn.process_tls_records(
+            staging
+                .get_mut(*staging_start..)
+                .ok_or(TlsStepError::UnexpectedState)?,
+        );
         let mut discard = status.discard;
         let signal: Option<Pumped> = match status.state {
             Err(e) => return Err(TlsStepError::Tls(e)),
             Ok(ConnectionState::EncodeTlsData(mut enc)) => {
                 match enc.encode(scratch) {
-                    Ok(n) => out_buf.extend_from_slice(&scratch[..n]),
+                    Ok(n) => out_buf
+                        .extend_from_slice(scratch.get(..n).ok_or(TlsStepError::UnexpectedState)?),
                     Err(EncodeError::InsufficientSize(InsufficientSizeError {
                         required_size,
                     })) => {
@@ -1022,7 +1058,9 @@ fn pump_inbound(
                     match rt.next_record() {
                         Some(Ok(rec)) => {
                             plaintext.extend_from_slice(rec.payload);
-                            discard += rec.discard;
+                            discard = discard
+                                .checked_add(rec.discard)
+                                .ok_or(TlsStepError::UnexpectedState)?;
                             got = true;
                         }
                         Some(Err(e)) => return Err(TlsStepError::Tls(e)),
@@ -1046,7 +1084,9 @@ fn pump_inbound(
             Ok(_) => return Err(TlsStepError::UnexpectedState),
         };
         if discard > 0 {
-            *staging_start += discard;
+            *staging_start = (*staging_start)
+                .checked_add(discard)
+                .ok_or(TlsStepError::UnexpectedState)?;
         }
         if let Some(sig) = signal {
             return Ok(sig);
@@ -1066,8 +1106,13 @@ fn encrypt_app_data(
 ) -> Result<(), TlsStepError> {
     let mut off = 0;
     while off < plaintext.len() {
-        let end = (off + MAX_PLAINTEXT_PER_RECORD).min(plaintext.len());
-        let chunk = &plaintext[off..end];
+        let end = off
+            .checked_add(MAX_PLAINTEXT_PER_RECORD)
+            .ok_or(TlsStepError::UnexpectedState)?
+            .min(plaintext.len());
+        let chunk = plaintext
+            .get(off..end)
+            .ok_or(TlsStepError::UnexpectedState)?;
         let mut empty: [u8; 0] = [];
         loop {
             let status = conn.process_tls_records(&mut empty);
@@ -1075,7 +1120,9 @@ fn encrypt_app_data(
                 Err(e) => return Err(TlsStepError::Tls(e)),
                 Ok(ConnectionState::WriteTraffic(mut wt)) => match wt.encrypt(chunk, scratch) {
                     Ok(n) => {
-                        out_buf.extend_from_slice(&scratch[..n]);
+                        out_buf.extend_from_slice(
+                            scratch.get(..n).ok_or(TlsStepError::UnexpectedState)?,
+                        );
                         break;
                     }
                     Err(EncryptError::InsufficientSize(InsufficientSizeError {
@@ -1090,7 +1137,8 @@ fn encrypt_app_data(
                     }
                 },
                 Ok(ConnectionState::EncodeTlsData(mut enc)) => match enc.encode(scratch) {
-                    Ok(n) => out_buf.extend_from_slice(&scratch[..n]),
+                    Ok(n) => out_buf
+                        .extend_from_slice(scratch.get(..n).ok_or(TlsStepError::UnexpectedState)?),
                     Err(EncodeError::InsufficientSize(InsufficientSizeError {
                         required_size,
                     })) => {
@@ -1127,7 +1175,9 @@ fn queue_close_notify(
             Ok(ConnectionState::WriteTraffic(mut wt)) => {
                 match wt.queue_close_notify(scratch) {
                     Ok(n) => {
-                        out_buf.extend_from_slice(&scratch[..n]);
+                        out_buf.extend_from_slice(
+                            scratch.get(..n).ok_or(TlsStepError::UnexpectedState)?,
+                        );
                         return Ok(());
                     }
                     Err(EncryptError::InsufficientSize(InsufficientSizeError {
@@ -1143,7 +1193,8 @@ fn queue_close_notify(
                 }
             }
             Ok(ConnectionState::EncodeTlsData(mut enc)) => match enc.encode(scratch) {
-                Ok(n) => out_buf.extend_from_slice(&scratch[..n]),
+                Ok(n) => out_buf
+                    .extend_from_slice(scratch.get(..n).ok_or(TlsStepError::UnexpectedState)?),
                 Err(EncodeError::InsufficientSize(InsufficientSizeError { required_size })) => {
                     return Err(TlsStepError::RecordOversize {
                         required: required_size,

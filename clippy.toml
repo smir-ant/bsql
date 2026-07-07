@@ -19,11 +19,13 @@
 # not a silent data fallback, so a per-site ledger would be noise rather
 # than signal.
 
-# Test carve-outs for the production FORBID floor's panic-class lints.
-# `clippy::{panic,unwrap_used,expect_used}` and `indexing_slicing` are in
-# the workspace floor (production-only). Test / bench code legitimately
-# panics / unwraps / indexes — a failed `unwrap()` in a test IS the loud
-# failure signal, the opposite of a silent production fallback. These
+# Test carve-outs for the production panic-class lints.
+# `clippy::{panic,unwrap_used,expect_used}` are in the workspace floor
+# (production-only). `indexing_slicing` is NOT a workspace-floor lint — it is
+# enforced at the crate root (a forbid on `proto` / `query-macros`, a deny on the
+# `core` / `async` / `sync` / `sqlite` driver crates). Test / bench code
+# legitimately panics / unwraps / indexes — a failed `unwrap()` in a test IS the
+# loud failure signal, the opposite of a silent production fallback. These
 # switches scope the panic-class lints to non-test code only, so the
 # floor stays a true production fortress without forbidding the panic that
 # makes a test assert. Clippy treats `#[test]` fns, `#[cfg(test)]`

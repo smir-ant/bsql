@@ -13,6 +13,20 @@
     clippy::cast_possible_wrap,
     clippy::unreachable
 )]
+// Panic-class mechanical wall (tier-1): an unbounded `arr[i]` and an overflowing
+// `+`/`-`/`*` on a cursor are now rejected by rustc, not review. `deny` (not
+// `forbid`) keeps a reasoned `#[expect]` escape. Indexing in test code is
+// exempted by clippy.toml `allow-indexing-slicing-in-tests`;
+// `arithmetic_side_effects` has NO such key, so the `cfg_attr(test, allow)`
+// below scopes it to production.
+#![deny(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::arithmetic_side_effects,
+        reason = "test assertions/fixtures use bare arithmetic; the production deny above is the tier-1 wall"
+    )
+)]
 
 //! Embedded SQLite driver.
 //!

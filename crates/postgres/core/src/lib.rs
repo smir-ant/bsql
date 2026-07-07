@@ -13,6 +13,24 @@
     clippy::cast_possible_wrap,
     clippy::unreachable
 )]
+// Panic-class mechanical wall (tier-1): the last two mechanical classes — an
+// unbounded `arr[i]` and an overflowing `+`/`-`/`*` on a cursor — are now
+// rejected by rustc, not review, so a hostile server byte cannot drive a
+// bounds-panic or a wrapping overflow on the decode / TLS path. Every existing
+// production site was first converted to `.get(..).ok_or(<classified>)?` /
+// `checked_*`; `deny` (not `forbid`) keeps a reasoned `#[expect]` escape.
+// Indexing in test code is exempted by the clippy.toml
+// `allow-indexing-slicing-in-tests` key; `arithmetic_side_effects` has NO such
+// key, so the `cfg_attr(test, allow)` below scopes it to production (a test
+// `assert_eq!(x, a + b)` on small constants is legitimate).
+#![deny(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::arithmetic_side_effects,
+        reason = "test assertions and fixtures use bare arithmetic on small constants; the production deny above is the tier-1 wall, mirroring clippy.toml's allow-*-in-tests carve-outs for the panic class"
+    )
+)]
 
 //! Shared core for bsql PostgreSQL drivers (async + sync).
 //!

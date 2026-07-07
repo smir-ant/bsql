@@ -99,11 +99,16 @@ fn try_take(state: &mut PoolState, max_size: usize) -> Option<Option<Connection>
     // and is caught by the reset failing on acquire (evict + retry), not by a
     // pop-time probe — a pop-time `is_healthy()` filter would be dead code.
     if let Some(conn) = state.connections.pop_front() {
-        state.checked_out += 1;
+        // `checked_out` counts handed-out slots; it is bounded by `max_size`
+        // (a `usize`) so this cannot overflow. `saturating_add` is the
+        // forbid-bundle-compliant total form (this fn returns `Option`, not
+        // `Result`, so there is no channel to carry an overflow error) and is
+        // behavior-identical in the reachable domain.
+        state.checked_out = state.checked_out.saturating_add(1);
         return Some(Some(conn));
     }
-    if state.connections.len() + state.checked_out < max_size {
-        state.checked_out += 1;
+    if state.connections.len().saturating_add(state.checked_out) < max_size {
+        state.checked_out = state.checked_out.saturating_add(1);
         return Some(None);
     }
     None
