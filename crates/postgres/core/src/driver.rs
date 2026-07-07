@@ -58,9 +58,10 @@ use bsql_postgres_proto::engine::{
 };
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
-    DecodeError, PreparedQuery, RowDecode, StmtName, TxStatus, TypedQuery,
+    DecodeError, PreparedQuery, RowDecode, Sensitive, StmtName, TxStatus, TypedQuery,
 };
 
+use crate::cancel::CancelKey;
 use crate::materialize::{self, ResultCollector};
 use crate::sql_ident::{self, SafeIdent, SafeTable};
 use crate::tls::{TlsError, Wire};
@@ -180,8 +181,15 @@ pub struct Core<S: Transport<Error = io::Error>> {
     /// The server version reported at connect, if the startup `ParameterStatus`
     /// stream carried one (honest absence otherwise).
     server_version: Option<String>,
-    /// The backend process id from `BackendKeyData`.
+    /// The backend process id from `BackendKeyData` — the non-secret half of the
+    /// cancel key.
     backend_pid: i32,
+    /// The `BackendKeyData` secret — the SECRET half of the cancel key, captured
+    /// at connect and kept in a `Sensitive` (redacted in `Debug`, zeroed on drop)
+    /// so [`cancel_key`](Self::cancel_key) can mint an unforgeable [`CancelKey`]
+    /// for an out-of-band `CancelRequest`. `Sensitive<i32>` is `#[repr(transparent)]`
+    /// over the `i32`, so the field costs 4 bytes and no hot path reads it.
+    secret_key: Sensitive<i32>,
     /// Monotonic counter for generating fresh prepared-statement names.
     stmt_counter: u32,
     /// The bounded, counted no-drop buffer of asynchronous notifications. Every
@@ -200,9 +208,14 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ///
     /// Called by each driver's per-driver `connect` after it has built the wire,
     /// opened the engine, driven the startup/auth handshake, and read the
-    /// connect-time session facts (`encrypted`, `server_version`, `backend_pid`)
-    /// off the engine. `#[doc(hidden)]`: the driver-facing construction seam, not
-    /// a public API.
+    /// connect-time session facts (`encrypted`, `server_version`, `backend_pid`,
+    /// `secret_key`) off the engine. `#[doc(hidden)]`: the driver-facing
+    /// construction seam, not a public API.
+    ///
+    /// `secret_key` is the raw `BackendKeyData` secret (read once via
+    /// [`Engine::with_secret_key`](bsql_postgres_proto::engine::Engine::with_secret_key));
+    /// it is wrapped back into a `Sensitive` here immediately, so its only
+    /// in-the-clear residence is the argument register on this call.
     #[doc(hidden)]
     #[must_use]
     pub fn new(
@@ -211,6 +224,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         encrypted: bool,
         server_version: Option<String>,
         backend_pid: i32,
+        secret_key: i32,
     ) -> Self {
         Self {
             engine,
@@ -218,11 +232,30 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             encrypted,
             server_version,
             backend_pid,
+            secret_key: Sensitive::new(secret_key),
             stmt_counter: 0,
             notifications: NotificationLedger::new(),
             #[cfg(feature = "n1-detect")]
             n1_tracker: crate::N1Tracker::new(),
         }
+    }
+
+    /// Mint the unforgeable [`CancelKey`] for this connection's backend — the
+    /// `(backend_pid, secret_key)` authenticator a driver's `CancelToken` needs
+    /// to build an out-of-band `CancelRequest`.
+    ///
+    /// Reads the pid and CLONES the secret out of the connection's `Sensitive`
+    /// store into the returned key's own `Sensitive`, so the key is a detached,
+    /// `Send + Sync + 'static` capability that does not borrow the live
+    /// connection — mintable at any point (before starting a query) and movable
+    /// to another task. Captured at connect, so it stays valid even after the
+    /// owning connection goes dead.
+    #[must_use]
+    pub fn cancel_key(&self) -> CancelKey {
+        CancelKey::new(
+            self.backend_pid,
+            self.secret_key.with_inner(|secret| Sensitive::new(*secret)),
+        )
     }
 
     // ── Token + result plumbing (shared internals) ──────────────────────────

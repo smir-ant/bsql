@@ -287,6 +287,28 @@ impl<'b, T> Engine<'b, T> {
         Ok(self.phase.as_active()?.backend_pid())
     }
 
+    /// Closure-scope access to the backend cancel-key authenticator (the SECRET
+    /// half of the cancel key, captured from `BackendKeyData` at handshake
+    /// completion).
+    ///
+    /// The secret is handed to `f` as an `i32` and never escapes the call — the
+    /// HRTB `FnOnce(i32) -> R` closure mirrors [`Sensitive::with_inner`], so a
+    /// caller can copy it out (to re-wrap it in its own [`Sensitive`]) but cannot
+    /// retain a borrow into the engine's zeroize-on-drop store. The sole intended
+    /// consumer is a driver capturing the cancel key for an out-of-band
+    /// `CancelRequest` (see [`cancel_request_bytes`](crate::cancel_request_bytes)).
+    ///
+    /// Returns [`WrongPhase`] before [`connect`](Self::connect) has driven the
+    /// engine active — the key does not exist until `BackendKeyData` arrives, so
+    /// the absence is a classified error, not a sentinel.
+    ///
+    /// [`Sensitive`]: crate::Sensitive
+    /// [`Sensitive::with_inner`]: crate::Sensitive::with_inner
+    #[inline]
+    pub fn with_secret_key<R>(&self, f: impl FnOnce(i32) -> R) -> Result<R, WrongPhase> {
+        Ok(self.phase.as_active()?.with_secret_key(f))
+    }
+
     /// The `server_version` GUC captured from the startup `ParameterStatus`
     /// reports during the handshake — the version string a `SHOW server_version`
     /// would return, recovered for free without the round-trip.

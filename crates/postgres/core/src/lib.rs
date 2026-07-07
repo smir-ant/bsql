@@ -53,6 +53,11 @@
 #[cfg(feature = "test-scenarios")]
 pub mod test_scenarios;
 
+// The transport-agnostic building blocks of driver-level query cancellation:
+// the unforgeable `CancelKey` authenticator and the credential-free `Redial`
+// endpoint snapshot. The I/O half (dial + write the CancelRequest) lives in each
+// driver's `CancelToken`.
+pub mod cancel;
 pub mod config;
 // The transport-generic driver engine (`Core<S>`): every non-I/O verb written
 // ONCE, shared by the async and sync drivers, monomorphised per transport.
@@ -86,6 +91,7 @@ pub mod tls;
 pub mod typed_rows;
 pub mod types;
 
+pub use cancel::{CancelKey, Redial};
 pub use config::{resolve_endpoint, validate_startup_params, ConnectConfig, Endpoint, SslMode};
 pub use driver::{Core, PreparedStatement};
 pub use error::{ColumnError, DbError, DriverError};

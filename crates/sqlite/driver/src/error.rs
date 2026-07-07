@@ -115,6 +115,13 @@ pub enum SqliteError {
     /// [`query_one_sql`](crate::Connection::query_one_sql) /
     /// [`query_opt_sql`](crate::Connection::query_opt_sql) stay first-row.)
     TooManyRows,
+    /// An in-flight query was INTERRUPTED by a
+    /// [`SqliteCancelToken`](crate::SqliteCancelToken) (`sqlite3_interrupt`) from
+    /// another thread — the SQLite cross-backend twin of the PostgreSQL cancel.
+    /// A classified variant (not a bare `Sqlite { code }`), so a caller can match
+    /// the cancel it requested; the connection is REUSABLE afterward (the
+    /// interrupt aborts the statement, not the connection).
+    Interrupted,
 }
 
 // Footprint pin: sized by the widest variant. The `String`-carrying variants
@@ -228,6 +235,7 @@ impl core::fmt::Display for SqliteError {
                 "typed query_one/query_opt expected at most one row, but the query returned more \
                  than one",
             ),
+            Self::Interrupted => write!(f, "sqlite: query interrupted (canceled)"),
         }
     }
 }
@@ -236,6 +244,15 @@ impl std::error::Error for SqliteError {}
 
 impl From<rusqlite::Error> for SqliteError {
     fn from(e: rusqlite::Error) -> Self {
+        // A `sqlite3_interrupt`-aborted statement is classified into its OWN
+        // variant so a caller can match the cancel it requested — never folded
+        // into an opaque `Sqlite { code: 9 }`. Every other engine failure keeps
+        // its preserved extended code.
+        if let rusqlite::Error::SqliteFailure(err, _) = &e
+            && err.code == rusqlite::ErrorCode::OperationInterrupted
+        {
+            return Self::Interrupted;
+        }
         let code = match &e {
             rusqlite::Error::SqliteFailure(err, _) => Some(err.extended_code),
             _ => None,

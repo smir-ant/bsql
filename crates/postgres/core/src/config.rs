@@ -137,6 +137,23 @@ impl ConnectConfig {
     pub fn password_str(&self) -> Option<&str> {
         self.password_inner.as_deref().map(|s| s.as_str())
     }
+
+    /// The RAW configured SSL mode (`None` = defaulted). Crate-internal: the
+    /// [`Redial`](crate::cancel::Redial) snapshot preserves the exact
+    /// explicit/defaulted state so a cancel dial reproduces the original SSL
+    /// decision (the public surface stays [`resolve_ssl_mode`](Self::resolve_ssl_mode)
+    /// / [`ssl_mode_is_explicit`](Self::ssl_mode_is_explicit)).
+    pub(crate) fn ssl_mode_raw(&self) -> Option<SslMode> {
+        self.ssl_mode
+    }
+
+    /// The custom CA-roots PEM as a cheap-to-clone `Arc` handle (`None` = default
+    /// trust anchors). Crate-internal: the [`Redial`](crate::cancel::Redial)
+    /// snapshot carries the same `Arc` so a cancel dial verifies against the same
+    /// roots without deep-copying the PEM.
+    pub(crate) fn ca_roots_arc(&self) -> Option<Arc<[u8]>> {
+        self.ca_roots_pem.clone()
+    }
 }
 
 impl core::fmt::Debug for ConnectConfig {

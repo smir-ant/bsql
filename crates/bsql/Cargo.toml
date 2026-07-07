@@ -60,12 +60,17 @@ scram = ["bsql-postgres-async?/scram", "bsql-postgres-sync?/scram"]
 md5-auth = ["bsql-postgres-async?/md5-auth", "bsql-postgres-sync?/md5-auth"]
 
 # `n1-detect` — turn on the diagnostics-only N+1 query detector on whichever
-# PostgreSQL driver(s) are enabled (`conn.n1_report()`). OFF by default: a
+# backend(s) are enabled (`conn.n1_report()`), across BOTH the PostgreSQL drivers
+# and the SQLite driver (one cross-backend detector). OFF by default: a
 # production build compiles no tracker field and no query-path branch. The `?`
-# activates the feature ONLY on an already-enabled driver, so it composes with
-# any backend selection and pulls no driver a consumer did not already ask for.
+# activates the feature ONLY on an already-enabled backend, so it composes with
+# any backend selection and pulls no backend a consumer did not already ask for.
 # Adds no external dependency (a cargo feature only).
-n1-detect = ["bsql-postgres-async?/n1-detect", "bsql-postgres-sync?/n1-detect"]
+n1-detect = [
+    "bsql-postgres-async?/n1-detect",
+    "bsql-postgres-sync?/n1-detect",
+    "bsql-sqlite?/n1-detect",
+]
 
 # `testkit` — the deterministic in-memory fake PostgreSQL (`bsql::testkit`), for
 # testing driver code with no network. NON-default: a production build never

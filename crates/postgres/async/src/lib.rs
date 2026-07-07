@@ -63,6 +63,7 @@
 //! the working set is the engine's already-pinned buffers, not driver-owned
 //! state.
 
+mod cancel;
 mod connection;
 mod pool;
 mod transport;
@@ -73,6 +74,7 @@ pub use bsql_postgres_core::{
     Row, Rows, SafeIdent, SafeTable, SslMode, TypedNotification,
 };
 
+pub use cancel::CancelToken;
 pub use connection::{Connection, CopyInWriter, PreparedStatement, Transaction};
 pub use pool::{Pool, PooledConnection};
 
@@ -95,8 +97,20 @@ const _: () = {
         _assert_sync::<Pool>();
         _assert_send::<PooledConnection>();
         _assert_static::<PooledConnection>();
+        // The CancelToken is a DETACHED capability: Send + Sync + 'static so it
+        // can be moved into another task and shared while the owning connection's
+        // query future is in flight (the whole out-of-band design). Borrowing the
+        // connection would alias its in-flight `&mut` — this pins that it does not.
+        _assert_send::<CancelToken>();
+        _assert_sync::<CancelToken>();
+        _assert_static::<CancelToken>();
     }
 };
+
+// Footprint pin: the cancel key (8) + the redial snapshot (48) = 56 bytes. The
+// key and redial are pinned individually in `bsql-postgres-core`; this pins that
+// composing them adds no padding. A widened token trips it.
+const _: () = assert!(core::mem::size_of::<CancelToken>() == 56);
 
 // Tier-1 static assertions: EVERY typed verb future — on the bare connection AND
 // on the transaction guard — plus the `transaction` combinator stay `Send`, so

@@ -77,13 +77,22 @@ macro_rules! footprint_pin {
 }
 pub(crate) use footprint_pin;
 
+mod cancel;
 mod connection;
 mod error;
+// The per-connection N+1 query detector — a diagnostics-only, zero-cost-off
+// tracker (a self-contained twin of the PostgreSQL detector). Compiled only under
+// the `n1-detect` feature; a default build has no tracker type and no field.
+#[cfg(feature = "n1-detect")]
+mod n1;
 mod typed;
 mod value;
 
+pub use cancel::SqliteCancelToken;
 pub use connection::{BorrowedRow, Connection, QueryResult, Row, RowSet, Transaction, TypedRows};
 pub use error::SqliteError;
+#[cfg(feature = "n1-detect")]
+pub use n1::{N1Report, N1Tracker};
 pub use typed::{ColumnSource, SqliteTypedQuery};
 pub use value::{FromColumn, SqliteValue, Type, ValueRef};
 

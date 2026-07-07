@@ -55,6 +55,7 @@
 //! a thin handle (engine + token + control socket + cached params) and is not
 //! separately pinned.
 
+mod cancel;
 mod connection;
 mod pool;
 mod transport;
@@ -64,6 +65,7 @@ pub use bsql_postgres_core::{
     Row, Rows, SafeIdent, SafeTable, SslMode, TypedNotification,
 };
 
+pub use cancel::CancelToken;
 pub use connection::{Connection, CopyInWriter, PreparedStatement, Transaction};
 pub use pool::{Pool, PooledConnection};
 
@@ -82,5 +84,15 @@ const _: () = {
         // Send + 'static (movable across threads), not a borrow-based guard.
         _assert_send::<PooledConnection>();
         _assert_static::<PooledConnection>();
+        // The CancelToken is a DETACHED capability: Send + Sync + 'static so it
+        // can move to another thread and be shared while the owning connection's
+        // blocking query is in flight (the whole out-of-band design).
+        _assert_send::<CancelToken>();
+        _assert_sync::<CancelToken>();
+        _assert_static::<CancelToken>();
     }
 };
+
+// Footprint pin: the cancel key (8) + the redial snapshot (48) = 56 bytes,
+// matching the async driver's token (both compose the same core building blocks).
+const _: () = assert!(core::mem::size_of::<CancelToken>() == 56);

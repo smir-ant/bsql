@@ -12,6 +12,15 @@ description = "Fixture consumer exercising the bsql SQLite build-time validation
 # SQLite. Mirrors `tools/query_fixture` (the PostgreSQL-only twin).
 publish = false
 
+[features]
+# `n1-detect` (non-default) — turns on the N+1 detector on the SQLite driver for
+# the SQLite N+1 witness (`tests/n1_detect_sqlite.rs`). Kept OFF by default so a
+# plain `cargo {clippy,test} --workspace` builds the driver feature-OFF (feature
+# unification would otherwise force the detector on for the whole workspace); the
+# witness file `#![cfg]`s itself out when off. Enable with `--features n1-detect`.
+# Adds no external package (a cargo feature only).
+n1-detect = ["bsql/n1-detect"]
+
 [dependencies]
 # The umbrella crate, and the ONLY dependency of this fixture's own code.
 # `macros` reaches the flagship `query!` (its PostgreSQL expansion names only

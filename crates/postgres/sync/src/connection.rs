@@ -31,7 +31,7 @@ use core::str::FromStr;
 // `lift_probe_io`); with `tls` off no probe is sent and none is used.
 #[cfg(feature = "tls")]
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -47,7 +47,7 @@ use bsql_postgres_core::tls::Wire;
 use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
     resolve_endpoint, validate_startup_params, ConnectConfig, DriverError, Endpoint, Notification,
-    QueryResult, Row, Rows, SslMode, TypedNotification,
+    QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
 };
 use bsql_postgres_proto::engine::{self, EngineError, SpuriousPending};
 use bsql_postgres_proto::params::ParamsWriter;
@@ -93,6 +93,34 @@ fn flatten_poll<T>(polled: Polled<T>) -> Result<T, DriverError> {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => Err(lift_engine_error(e)),
         Err(SpuriousPending) => Err(DriverError::SpuriousPending),
+    }
+}
+
+/// Open a TCP connection to `addr` ("host:port") with the SYN bounded by
+/// `timeout`.
+///
+/// [`std::net::TcpStream::connect`] has NO connect timeout — a black-holed host
+/// stalls the calling thread until the OS SYN timeout (~1-2 min). This resolves
+/// the address and tries each candidate with
+/// [`TcpStream::connect_timeout`](std::net::TcpStream::connect_timeout), so the
+/// connect fails within the caller's connect-timeout budget, while preserving
+/// `TcpStream::connect`'s try-each-resolved-address behaviour (important for a
+/// dual-stack host). DNS resolution itself is the OS's and unbounded — as with
+/// the async driver's `tokio::net::TcpStream::connect`, only the SYN is budgeted.
+fn connect_tcp_within(addr: &str, timeout: Duration) -> std::io::Result<TcpStream> {
+    let mut last_err: Option<std::io::Error> = None;
+    for socket_addr in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&socket_addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    match last_err {
+        Some(e) => Err(e),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no socket addresses resolved for the host",
+        )),
     }
 }
 
@@ -156,6 +184,12 @@ pub struct Connection {
     /// facts + notification ledger (+ the N+1 tracker under `n1-detect`). Every
     /// non-I/O verb is defined on it once and shared with the async driver.
     core: Core<SyncSocket>,
+    /// The credential-free endpoint snapshot for a cancel dial, captured from the
+    /// [`ConnectConfig`] at connect. A [`cancel_token`](Self::cancel_token)
+    /// combines it with the [`Core`]'s cancel key into a detached
+    /// [`CancelToken`](crate::CancelToken); it carries no password, so it grants
+    /// only the redial endpoint + TLS posture, never login.
+    redial: Redial,
     /// A `try_clone` of the underlying socket (TCP or unix), used to arm socket
     /// read/write timeouts on a fd the engine otherwise owns: a dup'd handle
     /// shares the same kernel socket, so a timeout set here applies to the
@@ -185,36 +219,7 @@ impl Connection {
     /// A classified [`DriverError`] for any pre-connect validation, transport,
     /// TLS, or handshake failure — never a panic.
     pub fn connect(config: &ConnectConfig) -> Result<Self, DriverError> {
-        let endpoint = resolve_endpoint(&config.host, config.port);
-        // Resolve the effective SSL mode ONCE against the endpoint (the
-        // threat-scoped default: LOCAL → Prefer, REMOTE → Require; an explicit
-        // mode wins). Thread it down so nothing below re-reads the raw config —
-        // one resolution point, no drift between the two drivers.
-        let ssl_mode = config.resolve_ssl_mode(&endpoint);
-        // Fail LOUD: TLS cannot be required over a socket that will never do it.
-        // Rejected before the connect syscall — a wasted dial would tell us
-        // nothing, and this is a pre-connect configuration fault. (A defaulted
-        // unix endpoint resolves to Prefer, so this fires only for an EXPLICIT
-        // `SslMode::Require`.)
-        if endpoint.is_unix() && ssl_mode == SslMode::Require {
-            return Err(DriverError::Config(
-                "SslMode::Require cannot be honored over a unix-domain socket \
-                 (TLS is not available on a local socket)",
-            ));
-        }
-        let sock = match endpoint {
-            Endpoint::Tcp(addr) => {
-                let tcp = TcpStream::connect(&addr)?;
-                // Disable Nagle on the data socket for the connection's whole life
-                // — Nagle + delayed-ACK can add ~40ms stalls to small writes and
-                // COPY-in streaming; one setsockopt with zero per-op cost. Nagle
-                // is a TCP concept — `AF_UNIX` has no such buffering, so the unix
-                // arm skips it (it is meaningless, not an error).
-                tcp.set_nodelay(true)?;
-                SyncSock::Tcp(tcp)
-            }
-            Endpoint::Unix(path) => SyncSock::Unix(UnixStream::connect(&path)?),
-        };
+        let (sock, ssl_mode) = Self::dial_socket(config)?;
         // `connect_timeout` bounds ONLY the connect phase — the SSL `SSLRequest`
         // probe (TCP only) and the startup/auth handshake — armed as the socket
         // read+write timeout here and DISARMED once the handshake completes
@@ -275,6 +280,10 @@ impl Connection {
         socket_ctl.set_read_timeout(None)?;
         socket_ctl.set_write_timeout(None)?;
         let backend_pid = engine.backend_pid().map_err(|_| DriverError::NotReady)?;
+        // Capture the SECRET half of the cancel key alongside the pid, so a later
+        // `cancel_token()` can build an out-of-band `CancelRequest`. Read out of
+        // the engine's `Sensitive` here and re-wrapped inside `Core::new`.
+        let secret_key = engine.with_secret_key(|s| s).map_err(|_| DriverError::NotReady)?;
         // The engine captured `server_version` from the startup `ParameterStatus`
         // reports during the handshake, so it is read here for free. `None` if the
         // server sent no such report (honest absence, not a fabricated value).
@@ -284,7 +293,8 @@ impl Connection {
             .map(str::to_owned);
 
         Ok(Self {
-            core: Core::new(engine, live, encrypted, server_version, backend_pid),
+            core: Core::new(engine, live, encrypted, server_version, backend_pid, secret_key),
+            redial: Redial::from_config(config),
             socket_ctl: Some(socket_ctl),
         })
     }
@@ -316,14 +326,66 @@ impl Connection {
             .map_err(lift_conn_fail)?;
         let live = flatten_poll(engine::poll_once(engine.connect(live)))?;
         let backend_pid = engine.backend_pid().map_err(|_| DriverError::NotReady)?;
+        let secret_key = engine.with_secret_key(|s| s).map_err(|_| DriverError::NotReady)?;
         let server_version = engine
             .server_version()
             .map_err(|_| DriverError::NotReady)?
             .map(str::to_owned);
         Ok(Self {
-            core: Core::new(engine, live, encrypted, server_version, backend_pid),
+            core: Core::new(engine, live, encrypted, server_version, backend_pid, secret_key),
+            // The in-memory fake has no network endpoint; a nominal loopback
+            // redial satisfies the field (a testkit connection is never canceled).
+            redial: Redial::from_config(&ConnectConfig::new("localhost", "")),
             socket_ctl: None,
         })
+    }
+
+    /// Resolve the endpoint, reject the fail-loud unix + `SslMode::Require`
+    /// combination, and DIAL the chosen socket (TCP with Nagle disabled, or unix)
+    /// — returning the connected socket plus the resolved SSL mode. The single
+    /// dial authority shared by [`connect`](Self::connect) and the cancel dial, so
+    /// the two cannot drift on endpoint resolution or the unix-TLS rule.
+    ///
+    /// Timeout arming and the `try_clone` control handle are the CALLER's job (the
+    /// two callers want different follow-ups), so this returns the bare socket.
+    pub(crate) fn dial_socket(config: &ConnectConfig) -> Result<(SyncSock, SslMode), DriverError> {
+        let endpoint = resolve_endpoint(&config.host, config.port);
+        // Resolve the effective SSL mode ONCE against the endpoint (the
+        // threat-scoped default: LOCAL → Prefer, REMOTE → Require; an explicit
+        // mode wins). Thread it down so nothing below re-reads the raw config —
+        // one resolution point, no drift between the two drivers.
+        let ssl_mode = config.resolve_ssl_mode(&endpoint);
+        // Fail LOUD: TLS cannot be required over a socket that will never do it.
+        // Rejected before the connect syscall — a wasted dial would tell us
+        // nothing, and this is a pre-connect configuration fault. (A defaulted
+        // unix endpoint resolves to Prefer, so this fires only for an EXPLICIT
+        // `SslMode::Require`.)
+        if endpoint.is_unix() && ssl_mode == SslMode::Require {
+            return Err(DriverError::Config(
+                "SslMode::Require cannot be honored over a unix-domain socket \
+                 (TLS is not available on a local socket)",
+            ));
+        }
+        let sock = match endpoint {
+            Endpoint::Tcp(addr) => {
+                // Bound the TCP connect (the SYN) by the connect-timeout budget so
+                // a black-holed host fails within the budget instead of the OS SYN
+                // timeout (~1-2 min) — the sync twin of the async driver wrapping
+                // the whole connect in `tokio::time::timeout`. Applies to BOTH the
+                // main connect and the cancel dial, since both route through here.
+                let budget = Duration::from_secs(config.connect_timeout_secs);
+                let tcp = connect_tcp_within(&addr, budget)?;
+                // Disable Nagle on the data socket for the connection's whole life
+                // — Nagle + delayed-ACK can add ~40ms stalls to small writes and
+                // COPY-in streaming; one setsockopt with zero per-op cost. Nagle
+                // is a TCP concept — `AF_UNIX` has no such buffering, so the unix
+                // arm skips it (it is meaningless, not an error).
+                tcp.set_nodelay(true)?;
+                SyncSock::Tcp(tcp)
+            }
+            Endpoint::Unix(path) => SyncSock::Unix(UnixStream::connect(&path)?),
+        };
+        Ok((sock, ssl_mode))
     }
 
     /// Build the plaintext or TLS wire, performing the PG `SSLRequest` negotiation
@@ -331,11 +393,11 @@ impl Connection {
     ///
     /// A unix-domain socket is ALWAYS plaintext: TLS over a local kernel socket is
     /// pointless, PostgreSQL does not offer it there, and `SslMode::Require` +
-    /// unix was already rejected by [`connect`](Self::connect). So the
+    /// unix was already rejected by [`dial_socket`](Self::dial_socket). So the
     /// `SSLRequest` probe runs only for a TCP socket with SSL wanted; `Prefer`
     /// over unix is plaintext with no probe and no downgrade warning (nothing was
     /// downgraded — TLS was never applicable to a local socket).
-    fn build_wire(
+    pub(crate) fn build_wire(
         sock: SyncSock,
         config: &ConnectConfig,
         ssl_mode: SslMode,
@@ -409,6 +471,23 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Mint a detached [`CancelToken`](crate::CancelToken) for this connection's
+    /// in-flight (or next) query.
+    ///
+    /// The token is `Send + Sync + 'static` and borrows NOTHING from this
+    /// connection, so it can be obtained BEFORE a long blocking query and moved to
+    /// another THREAD that calls [`cancel`](crate::CancelToken::cancel) while the
+    /// query is still running. It is unforgeable (the cancel key's secret is
+    /// minted only at connect).
+    ///
+    /// PostgreSQL cancellation is OUT-OF-BAND (a second connection) and
+    /// BEST-EFFORT by spec (§55.4): `cancel()` REQUESTS cancellation; it does not
+    /// guarantee the query stops. See [`CancelToken`](crate::CancelToken).
+    #[must_use]
+    pub fn cancel_token(&self) -> crate::CancelToken {
+        crate::CancelToken::new(self.core.cancel_key(), self.redial.clone())
     }
 
     // ── Delegated runtime-SQL verbs (one `poll_once` drive each) ────────────

@@ -49,7 +49,7 @@ use bsql_postgres_core::tls::Wire;
 use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
     resolve_endpoint, validate_startup_params, ConnectConfig, DriverError, Endpoint, Notification,
-    QueryResult, Row, Rows, SslMode, TypedNotification,
+    QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
 };
 use bsql_postgres_proto::engine;
 use bsql_postgres_proto::params::ParamsWriter;
@@ -142,6 +142,12 @@ pub struct Connection {
     /// facts + notification ledger (+ the N+1 tracker under `n1-detect`). Every
     /// non-I/O verb is defined on it once and shared with the blocking driver.
     core: Core<TokioSocket>,
+    /// The credential-free endpoint snapshot for a cancel dial, captured from the
+    /// [`ConnectConfig`] at connect. A [`cancel_token`](Self::cancel_token)
+    /// combines it with the [`Core`]'s cancel key into a detached
+    /// [`CancelToken`](crate::CancelToken); it carries no password, so it grants
+    /// only the redial endpoint + TLS posture, never login.
+    redial: Redial,
     /// Shared with the [`TokioSocket`] the engine owns: the driver arms an
     /// absolute read deadline here before [`recv_notification`](Self::recv_notification)
     /// and disarms it after, so a notification wait times out from inside the read
@@ -233,6 +239,10 @@ impl Connection {
                 .map_err(lift_conn_fail)?;
         let live = engine.connect(live).await.map_err(lift_engine_error)?;
         let backend_pid = engine.backend_pid().map_err(|_| DriverError::NotReady)?;
+        // Capture the SECRET half of the cancel key alongside the pid, so a later
+        // `cancel_token()` can build an out-of-band `CancelRequest`. Read out of
+        // the engine's `Sensitive` here and re-wrapped inside `Core::new`.
+        let secret_key = engine.with_secret_key(|s| s).map_err(|_| DriverError::NotReady)?;
         // The engine captured `server_version` from the startup `ParameterStatus`
         // reports during the handshake, so it is read here for free — no
         // `SHOW server_version` round-trip. `None` if the server sent no such
@@ -243,7 +253,8 @@ impl Connection {
             .map(str::to_owned);
 
         Ok(Self {
-            core: Core::new(engine, live, encrypted, server_version, backend_pid),
+            core: Core::new(engine, live, encrypted, server_version, backend_pid, secret_key),
+            redial: Redial::from_config(config),
             read_deadline,
         })
     }
@@ -257,7 +268,7 @@ impl Connection {
     /// probe — TLS is not applicable to a local socket). `SslMode::Require` over a
     /// unix host is a fail-loud [`DriverError::Config`], never a silent plaintext
     /// downgrade.
-    async fn connect_wire(
+    pub(crate) async fn connect_wire(
         config: &ConnectConfig,
         deadline: &Arc<ReadDeadline>,
     ) -> Result<AsyncWire, DriverError> {
@@ -406,14 +417,35 @@ impl Connection {
             .map_err(lift_conn_fail)?;
         let live = engine.connect(live).await.map_err(lift_engine_error)?;
         let backend_pid = engine.backend_pid().map_err(|_| DriverError::NotReady)?;
+        let secret_key = engine.with_secret_key(|s| s).map_err(|_| DriverError::NotReady)?;
         let server_version = engine
             .server_version()
             .map_err(|_| DriverError::NotReady)?
             .map(str::to_owned);
         Ok(Self {
-            core: Core::new(engine, live, encrypted, server_version, backend_pid),
+            core: Core::new(engine, live, encrypted, server_version, backend_pid, secret_key),
+            // The in-memory fake has no network endpoint; a nominal loopback
+            // redial satisfies the field (a testkit connection is never canceled).
+            redial: Redial::from_config(&ConnectConfig::new("localhost", "")),
             read_deadline,
         })
+    }
+
+    /// Mint a detached [`CancelToken`](crate::CancelToken) for this connection's
+    /// in-flight (or next) query.
+    ///
+    /// The token is `Send + Sync + 'static` and borrows NOTHING from this
+    /// connection, so it can be obtained BEFORE a long query and moved to another
+    /// task that calls [`cancel`](crate::CancelToken::cancel) while the query is
+    /// still running — with no `&mut` aliasing against the in-flight verb future.
+    /// It is unforgeable (the cancel key's secret is minted only at connect).
+    ///
+    /// PostgreSQL cancellation is OUT-OF-BAND (a second connection) and
+    /// BEST-EFFORT by spec (§55.4): `cancel()` REQUESTS cancellation; it does not
+    /// guarantee the query stops. See [`CancelToken`](crate::CancelToken).
+    #[must_use]
+    pub fn cancel_token(&self) -> crate::CancelToken {
+        crate::CancelToken::new(self.core.cancel_key(), self.redial.clone())
     }
 
     // ── Delegated runtime-SQL verbs ─────────────────────────────────────────

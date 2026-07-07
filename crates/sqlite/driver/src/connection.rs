@@ -540,6 +540,14 @@ impl<'r> ColumnSource<'r> for BorrowedRow<'r> {
 /// An embedded SQLite connection.
 pub struct Connection {
     inner: rusqlite::Connection,
+    /// The diagnostics-only N+1 query detector. Present ONLY under the
+    /// `n1-detect` feature — a default build has no such field, so the typed
+    /// verbs stay byte-identical blocking `fn`s and the footprint is unchanged.
+    /// `RefCell` because the typed verbs record through `&self` (SQLite's engine
+    /// is already `!Sync` via rusqlite's interior mutability, so this adds no new
+    /// thread-safety constraint).
+    #[cfg(feature = "n1-detect")]
+    n1: core::cell::RefCell<crate::n1::N1Tracker>,
 }
 
 impl core::fmt::Debug for Connection {
@@ -549,6 +557,18 @@ impl core::fmt::Debug for Connection {
 }
 
 impl Connection {
+    /// Wrap an already-configured rusqlite connection into a driver `Connection`,
+    /// initialising the (feature-gated) N+1 tracker. The single construction seam
+    /// both `open` constructors funnel through, so the `n1-detect` field is
+    /// initialised in exactly one place.
+    fn wrap(inner: rusqlite::Connection) -> Self {
+        Self {
+            inner,
+            #[cfg(feature = "n1-detect")]
+            n1: core::cell::RefCell::new(crate::n1::N1Tracker::new()),
+        }
+    }
+
     /// Open (or create) a database at `path`, enabling WAL journaling and
     /// foreign-key enforcement, and a [`DEFAULT_BUSY_TIMEOUT`] so a briefly-locked
     /// database waits (bounded) rather than failing instantly under WAL contention.
@@ -560,7 +580,7 @@ impl Connection {
         inner
             .busy_timeout(DEFAULT_BUSY_TIMEOUT)
             .map_err(|e| SqliteError::Open(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self::wrap(inner))
     }
 
     /// Open a private in-memory database with foreign-key enforcement and the
@@ -574,7 +594,7 @@ impl Connection {
         inner
             .busy_timeout(DEFAULT_BUSY_TIMEOUT)
             .map_err(|e| SqliteError::Open(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self::wrap(inner))
     }
 
     /// Set how long a locked-database operation waits for the lock before
@@ -584,6 +604,52 @@ impl Connection {
     /// IMMEDIATELY, the honest fail-loud with no hidden blocking).
     pub fn set_busy_timeout(&self, timeout: Duration) -> Result<(), SqliteError> {
         self.inner.busy_timeout(timeout).map_err(SqliteError::from)
+    }
+
+    /// Mint a detached [`SqliteCancelToken`](crate::SqliteCancelToken) for this
+    /// connection's in-flight (or next) query — the cross-backend twin of the
+    /// PostgreSQL `conn.cancel_token()`.
+    ///
+    /// The token is `Send + Sync + 'static` and borrows nothing from the
+    /// connection, so it can be obtained BEFORE a long / compute-bound query and
+    /// handed to another thread that calls
+    /// [`cancel`](crate::SqliteCancelToken::cancel) mid-query. The interrupted
+    /// step surfaces as [`SqliteError::Interrupted`](crate::SqliteError::Interrupted)
+    /// and the connection stays reusable.
+    #[must_use]
+    pub fn cancel_token(&self) -> crate::SqliteCancelToken {
+        crate::SqliteCancelToken::new(self.inner.get_interrupt_handle())
+    }
+
+    /// The detected N+1 anti-patterns on this connection so far — one entry per
+    /// `(query, source line)` site that ran the SAME `query!` past the detector's
+    /// threshold (25) within a single logical operation. Present ONLY under the
+    /// `n1-detect` feature; purely diagnostic — enabling detection cannot change
+    /// what any query returns. The SQLite twin of the PostgreSQL driver's
+    /// `n1_report()`, returning the SAME [`N1Report`](crate::N1Report) shape.
+    ///
+    /// Returns an owned snapshot (the tracker lives behind interior mutability),
+    /// so a caller iterating it holds no borrow of the connection.
+    #[cfg(feature = "n1-detect")]
+    #[must_use]
+    pub fn n1_report(&self) -> Vec<crate::N1Report> {
+        self.n1.borrow().report().to_vec()
+    }
+
+    /// Record one execution of a typed `query!` from source location `caller`.
+    /// Diagnostics-only (see [`N1Tracker`](crate::N1Tracker)); the typed verbs
+    /// funnel their `#[track_caller]` site here.
+    #[cfg(feature = "n1-detect")]
+    fn n1_record(&self, sql: &'static str, caller: &'static core::panic::Location<'static>) {
+        self.n1.borrow_mut().record(sql, caller);
+    }
+
+    /// Forget the N+1 recency window at a logical-operation boundary (a
+    /// transaction commit/rollback), so repetition of a query ACROSS separate
+    /// operations is forgiven while a per-row loop WITHIN one is caught.
+    #[cfg(feature = "n1-detect")]
+    fn n1_reset(&self) {
+        self.n1.borrow_mut().reset();
     }
 
     /// Execute a statement, returning the number of rows changed.
@@ -764,10 +830,13 @@ impl Connection {
     ///
     /// A prepare / step failure is a classified [`SqliteError`]; per-row decode
     /// failures surface from the returned [`TypedRows`].
+    #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query<Q: SqliteTypedQuery>(
         &self,
         params: &[ValueRef<'_>],
     ) -> Result<TypedRows<Q>, SqliteError> {
+        #[cfg(feature = "n1-detect")]
+        self.n1_record(Q::SQL, core::panic::Location::caller());
         let result = self.query_collect(Q::SQL, rusqlite::params_from_iter(params))?;
         Ok(TypedRows { result, _q: PhantomData })
     }
@@ -787,10 +856,13 @@ impl Connection {
     ///
     /// [`SqliteError::Query`] on zero rows, [`SqliteError::TooManyRows`] on two or
     /// more, or a classified [`SqliteError`] on a prepare / step / decode failure.
+    #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_one<Q: SqliteTypedQuery>(
         &self,
         params: &[ValueRef<'_>],
     ) -> Result<Q::Owned, SqliteError> {
+        #[cfg(feature = "n1-detect")]
+        self.n1_record(Q::SQL, core::panic::Location::caller());
         self.query_first_owned::<Q>(params)?
             .ok_or_else(|| SqliteError::Query("query returned no rows".to_owned()))
     }
@@ -809,10 +881,13 @@ impl Connection {
     /// [`SqliteError::TooManyRows`] on two or more rows, or a classified
     /// [`SqliteError`] on a prepare / step / decode failure (zero rows is
     /// `Ok(None)`).
+    #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_opt<Q: SqliteTypedQuery>(
         &self,
         params: &[ValueRef<'_>],
     ) -> Result<Option<Q::Owned>, SqliteError> {
+        #[cfg(feature = "n1-detect")]
+        self.n1_record(Q::SQL, core::panic::Location::caller());
         self.query_first_owned::<Q>(params)
     }
 
@@ -865,6 +940,7 @@ impl Connection {
     /// # Errors
     ///
     /// A classified [`SqliteError`] on a prepare / step / decode failure.
+    #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_each<Q, F, E>(
         &self,
         params: &[ValueRef<'_>],
@@ -874,6 +950,8 @@ impl Connection {
         Q: SqliteTypedQuery,
         F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E>,
     {
+        #[cfg(feature = "n1-detect")]
+        self.n1_record(Q::SQL, core::panic::Location::caller());
         let mut stmt = self.inner.prepare(Q::SQL)?;
         let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
         while let Some(row) = rows.next()? {
@@ -892,15 +970,24 @@ impl Connection {
         Ok(())
     }
 
-    /// Commit the current transaction.
+    /// Commit the current transaction (a logical-operation boundary: the N+1
+    /// recency window is forgotten under `n1-detect`, matching the PostgreSQL
+    /// `commit()` so the manual `begin`/`commit` path resets identically to the
+    /// closure `transaction` path and to both PostgreSQL drivers).
     pub fn commit(&self) -> Result<(), SqliteError> {
         self.inner.execute_batch("COMMIT")?;
+        #[cfg(feature = "n1-detect")]
+        self.n1_reset();
         Ok(())
     }
 
-    /// Roll back the current transaction.
+    /// Roll back the current transaction (a logical-operation boundary: the N+1
+    /// recency window is forgotten under `n1-detect`, matching PostgreSQL's
+    /// `rollback()`).
     pub fn rollback(&self) -> Result<(), SqliteError> {
         self.inner.execute_batch("ROLLBACK")?;
+        #[cfg(feature = "n1-detect")]
+        self.n1_reset();
         Ok(())
     }
 
@@ -924,11 +1011,12 @@ impl Connection {
     ) -> Result<R, SqliteError> {
         self.inner.execute_batch("BEGIN")?;
         let tx = Transaction { conn: self };
-        match f(&tx) {
-            Ok(val) => {
-                self.inner.execute_batch("COMMIT")?;
-                Ok(val)
-            }
+        let result = match f(&tx) {
+            Ok(val) => self
+                .inner
+                .execute_batch("COMMIT")
+                .map(|()| val)
+                .map_err(SqliteError::from),
             Err(e) => match self.inner.execute_batch("ROLLBACK") {
                 // ROLLBACK undid the transaction: return the closure's error.
                 Ok(()) => Err(e),
@@ -940,7 +1028,13 @@ impl Connection {
                     rollback: Box::new(SqliteError::from(rb)),
                 }),
             },
-        }
+        };
+        // Either terminator closes a logical operation: forget the N+1 recency
+        // window so repetition ACROSS transactions is forgiven (a no-op with the
+        // feature off).
+        #[cfg(feature = "n1-detect")]
+        self.n1_reset();
+        result
     }
 
     /// Execute multiple SQL statements separated by semicolons.
@@ -1093,6 +1187,7 @@ impl Transaction<'_> {
     /// # Errors
     ///
     /// A classified [`SqliteError`] on a prepare / step failure.
+    #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query<Q: SqliteTypedQuery>(
         &self,
         params: &[ValueRef<'_>],
@@ -1107,6 +1202,7 @@ impl Transaction<'_> {
     ///
     /// [`SqliteError::Query`] on zero rows, [`SqliteError::TooManyRows`] on two or
     /// more, or a classified [`SqliteError`] on a prepare / step / decode failure.
+    #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_one<Q: SqliteTypedQuery>(
         &self,
         params: &[ValueRef<'_>],
@@ -1122,6 +1218,7 @@ impl Transaction<'_> {
     /// [`SqliteError::TooManyRows`] on two or more rows, or a classified
     /// [`SqliteError`] on a prepare / step / decode failure (zero rows is
     /// `Ok(None)`).
+    #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_opt<Q: SqliteTypedQuery>(
         &self,
         params: &[ValueRef<'_>],
@@ -1135,6 +1232,7 @@ impl Transaction<'_> {
     /// # Errors
     ///
     /// A classified [`SqliteError`] on a prepare / step / decode failure.
+    #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_each<Q, F, E>(
         &self,
         params: &[ValueRef<'_>],

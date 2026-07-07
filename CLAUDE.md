@@ -47,11 +47,11 @@ crates/
   bsql/              — umbrella facade + query! re-export + #[bsql::test] harness (bsql::pg, ::pg_sync, ::sqlite)  — 947 LoC
   postgres/
     proto/           — sans-IO wire protocol + session engine (no_std + alloc)  — 27886 LoC
-    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + N+1 detector + SafeIdent guard  — 9236 LoC
-    async/           — tokio async driver (plugs its socket into the shared Core<S>)  — 1743 LoC
-    sync/            — std::net blocking driver (plugs its socket into the shared Core<S>)  — 1575 LoC
+    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + N+1 detector + SafeIdent guard + cancel key/redial  — 10586 LoC
+    async/           — tokio async driver (plugs its socket into the shared Core<S>) + CancelToken  — 2433 LoC
+    sync/            — std::net blocking driver (plugs its socket into the shared Core<S>) + CancelToken  — 2342 LoC
   sqlite/
-    driver/          — embedded SQLite driver (bundled rusqlite) + typed query! runtime  — 2179 LoC
+    driver/          — embedded SQLite driver (bundled rusqlite) + typed query! runtime + interrupt CancelToken + N+1 detector  — 2788 LoC
   testkit/           — deterministic in-memory fake PostgreSQL for driver tests (no network)  — 1005 LoC
   build/             — BUILD-DEP: migration DDL → schema catalog (+ SQLite template) + shared $N→?N placeholder authority  — 35036 LoC
   query-macros/      — PROC-MACRO: query! (types/validates against the catalog; emits the PostgreSQL + SQLite typed bridges) + #[bsql::test] (schema-per-test wrapper)  — 2252 LoC
@@ -75,6 +75,10 @@ cargo test -p bsql-postgres-core --test decoder_fuzz   # decoder total-function 
 cargo test -p bsql-sqlite            # SQLite (no PG needed)
 cargo test -p bsql-postgres-async --test sq_live -- --ignored    # async PG (needs local PG)
 cargo test -p bsql-postgres-sync --test sync_live -- --ignored   # sync PG (needs local PG)
+cargo test -p bsql-postgres-async --test sq_live cancel_token_stops -- --ignored   # async cancel witness (needs PG)
+cargo test -p bsql-postgres-sync  --test sync_live cancel_token_stops -- --ignored # sync cancel witness (needs PG)
+cargo test -p bsql-sqlite --test cancel              # SQLite interrupt witness (in-process, no PG)
+cargo test -p bsql-query-sqlite-fixture --features n1-detect --test n1_detect_sqlite  # SQLite N+1 witness (in-process)
 cargo test -p bsql-query-fixture --test query_live_async -- --ignored  # live query! (async, needs PG)
 cargo test -p bsql-query-fixture --test query_live_sync  -- --ignored  # live query! (sync, needs PG)
 cargo clippy -p bsql --features test-harness --all-targets              # lint the (non-default) #[bsql::test] harness
@@ -198,7 +202,16 @@ call sites of the same query are never conflated. No external dependency (a carg
 feature only). The `tools/query_fixture` `n1-detect` feature + its
 `tests/n1_detect_live.rs` are the end-to-end proof (N+1 flagged with source +
 count, no false positive on a one-shot or across distinct lines, all results
-still correct).
+still correct). The SAME detector is a CROSS-BACKEND feature: the SQLite driver
+carries its own `n1-detect` feature over the SAME `N1Report` shape / threshold /
+window-reset-at-transaction semantics, so `conn.n1_report()` reads identically on
+both backends and a consumer relying on the net in tests does not lose it when the
+backend is SQLite. SQLite's is SIMPLER than the async PG driver's RPIT reshape —
+its verbs are plain blocking `fn`, so `#[track_caller]` works directly (no future
+reshape); the tracker is a self-contained COPY (a `bsql-postgres-core` dependency
+would drag the whole PG + rustls tree into the embedded crate), so it adds no
+external dependency. Witnessed by `tools/query_sqlite_fixture`'s `n1-detect`
+feature + `tests/n1_detect_sqlite.rs`.
 
 The `deps_pin` gate (`tools/devgates/tests/deps_pin.rs`) pins the resolved
 dependency set (parsed from `Cargo.lock`) to a committed golden, and bans any
@@ -309,7 +322,7 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 - **Core** (`bsql-postgres-core`): the shared TRANSPORT-GENERIC driver engine `Core<S: Transport>` — it holds the sans-IO engine over a `Wire<S>` plus the linear liveness token and defines every non-I/O verb ONCE — alongside the result materializer, the dynamic `Row` / `QueryResult` types, `ConnectConfig`, TLS config, and the typed `Rows` container (built from an internal `#[doc(hidden)]` `RowsBuilder` prebuffer). Both drivers build on it.
 - **Drivers** are thin I/O adapters that plug their socket into the ONE `Core<S>`: `Core<TokioSocket>` on async, `Core<SyncSocket>` on sync (each socket is a TCP-or-unix enum), MONOMORPHISED per driver — static dispatch, no `dyn`. The verbs live once in `Core<S>`; the drivers differ only in `.await` vs blocking, so async/sync parity is a COMPILER guarantee, not hand-maintained twins.
 - **Rows.** The dynamic `Row` (from `query_sql` etc.) is 16 bytes (`'static + Clone + Send + Sync`) over an `Arc`-shared arena: 3 heap allocations per whole `QueryResult` (the arena's `data` + `slots` vectors + the shared `Arc`), regardless of row count, and 0 per row — a `QueryResult` holds ONE lazy `RowSet` and mints each `Row` handle on demand (`.get(i)` / `.iter()`), never eagerly building a `Vec<Row>`, so a single-row read (`query_one_sql`) clones the `Arc` once, not N times. This mirrors the typed `Rows<Q>` (from the `query!` flagship), which is 2 allocations per result and 0 per row (borrowed, zero-copy decode). The **SQLite** backend runs the SAME lazy model: its `QueryResult` is one lazy `RowSet` over a shared arena (a `data` byte pool + a `CellSlot` table carrying integer/real inline and text/blob as `(offset, len)`, with the column names shared by `Arc`), so an eager `query_sql()` costs a constant number of allocations, 0 per row (a minted 16-byte `Row` handle carries its own names, so `get_by_name` threads no slice), and text UTF-8 is validated lazily at `get::<&str>` (never eagerly failing the whole result on one bad byte). A `> 4 GiB` eager result is the loud `SqliteError::ResultTooLarge` (stream it via `query_each_sql`, which is capless/constant-memory). The SQLite **typed** flagship result `TypedRows<Q>` wraps that same lazy arena: a constant number of allocations, 0 per row, borrowed records aliasing the arena zero-copy via an `ArenaRowRef` per-get view.
-- **SQLite parity.** The SQLite driver is a full peer of the PG path, not a text-only wrapper. **Verb naming matches PG:** `query` / `query_one` / `query_opt` / `query_each` are the compile-checked TYPED flagship (over a `query!` carrier); the dynamic raw-SQL verbs carry the `_sql` suffix (`query_sql` / `query_one_sql` / `query_opt_sql` / `query_each_sql`), and the parameterized dynamic verbs keep their names (`query_params`, `query_params_one/opt`, `query_each_params`). **Typed flagship:** a `query!` carrier for a SQLite-decodable query (every column a SQLite storage class, unbridged, no PG-only dynamic sugar) implements `SqliteTypedQuery` (emitted by the macro under the umbrella `sqlite` feature), so `Connection::query::<Q>()` and its peers (+ the transaction guard) execute it and decode into the SAME typed records the PG path produces. SQLite is dynamically typed, so decoding VERIFIES each value's actual storage class against the record's declared field type via `FromColumn` — a mismatch is a classified `TypeMismatch`, a `NULL` in a non-`Option` field is `UnexpectedNull`, never a silent coercion (the runtime peer of the PG wire-OID pinning). The borrowed record `Q::Record<'q>` aliases the shared arena zero-copy through an `ArenaRowRef` per-get VIEW that lends cells for the CONTAINER lifetime (the memory-proven per-get view, scoped to SQLite); one macro-emitted `decode_row` serves BOTH the eager (`TypedRows<Q>`) and the streaming (`query_each`) paths via the `ColumnSource` seam that `ArenaRowRef` and `BorrowedRow` both implement. A carrier for a PG-only query does NOT implement `SqliteTypedQuery`, so `sqlite_conn.query::<That>()` is a LOCATED E0277 (`#[diagnostic::on_unimplemented]`), never a silent mis-run. The macro emits the SQLite bridge ONLY under `sqlite-runtime` (the umbrella `sqlite` feature), so a PG-only build's expansion is byte-identical and the PG codegen/alloc gates and trybuild goldens are untouched. Runtime emission (`sqlite`) and build-time conformance (`macros-sqlite`) are ORTHOGONAL — a SQLite-targeting consumer should enable BOTH: runtime-only is still fail-loud (a storage-class mismatch is a classified runtime error) but lacks the build-time proof that real SQLite resolves the inferred row shape. Typed `query_one`/`query_opt` are exactly-one/at-most-one (`SqliteError::TooManyRows` on 2+, one extra `sqlite3_step`, no materialization) — the SAME contract as the PG typed verbs, so the flagship reads identically on both backends; the dynamic `*_sql` verbs stay first-row. **Parameters** bind as a typed `&[ValueRef]` (the ONE value vocabulary for read AND bind, for both dynamic and typed verbs) — every value in its TRUE storage class, so `NULL`/`BLOB` are bindable and integers escape the affinity trap; `ParamsWriter` has no SQLite twin because rusqlite's typed bind IS the authority. `Connection::transaction` hands the closure a borrowing `Transaction` guard exposing only the data verbs, so a nested/manual-`commit` desync is E0599 (same design as the PG transaction guard). `open` sets a 5 s default `busy_timeout` (a contended write waits, bounded, then classifies as busy — never a hang; `set_busy_timeout(Duration::ZERO)` restores immediate fail-loud). Affected counts are `u64` (PG parity). The `$N`→`?N` SQLite placeholder rewrite has ONE authority (`bsql_build::sqlite_placeholder_form`), shared by the build-time conformance oracle AND the macro's baked SQLite `const SQL`, so the runtime string is byte-identical to the one build-time validation proved SQLite prepares.
+- **SQLite parity.** The SQLite driver is a full peer of the PG path, not a text-only wrapper. **Verb naming matches PG:** `query` / `query_one` / `query_opt` / `query_each` are the compile-checked TYPED flagship (over a `query!` carrier); the dynamic raw-SQL verbs carry the `_sql` suffix (`query_sql` / `query_one_sql` / `query_opt_sql` / `query_each_sql`), and the parameterized dynamic verbs keep their names (`query_params`, `query_params_one/opt`, `query_each_params`). **Typed flagship:** a `query!` carrier for a SQLite-decodable query (every column a SQLite storage class, unbridged, no PG-only dynamic sugar) implements `SqliteTypedQuery` (emitted by the macro under the umbrella `sqlite` feature), so `Connection::query::<Q>()` and its peers (+ the transaction guard) execute it and decode into the SAME typed records the PG path produces. SQLite is dynamically typed, so decoding VERIFIES each value's actual storage class against the record's declared field type via `FromColumn` — a mismatch is a classified `TypeMismatch`, a `NULL` in a non-`Option` field is `UnexpectedNull`, never a silent coercion (the runtime peer of the PG wire-OID pinning). The borrowed record `Q::Record<'q>` aliases the shared arena zero-copy through an `ArenaRowRef` per-get VIEW that lends cells for the CONTAINER lifetime (the memory-proven per-get view, scoped to SQLite); one macro-emitted `decode_row` serves BOTH the eager (`TypedRows<Q>`) and the streaming (`query_each`) paths via the `ColumnSource` seam that `ArenaRowRef` and `BorrowedRow` both implement. A carrier for a PG-only query does NOT implement `SqliteTypedQuery`, so `sqlite_conn.query::<That>()` is a LOCATED E0277 (`#[diagnostic::on_unimplemented]`), never a silent mis-run. The macro emits the SQLite bridge ONLY under `sqlite-runtime` (the umbrella `sqlite` feature), so a PG-only build's expansion is byte-identical and the PG codegen/alloc gates and trybuild goldens are untouched. Runtime emission (`sqlite`) and build-time conformance (`macros-sqlite`) are ORTHOGONAL — a SQLite-targeting consumer should enable BOTH: runtime-only is still fail-loud (a storage-class mismatch is a classified runtime error) but lacks the build-time proof that real SQLite resolves the inferred row shape. Typed `query_one`/`query_opt` are exactly-one/at-most-one (`SqliteError::TooManyRows` on 2+, one extra `sqlite3_step`, no materialization) — the SAME contract as the PG typed verbs, so the flagship reads identically on both backends; the dynamic `*_sql` verbs stay first-row. **Parameters** bind as a typed `&[ValueRef]` (the ONE value vocabulary for read AND bind, for both dynamic and typed verbs) — every value in its TRUE storage class, so `NULL`/`BLOB` are bindable and integers escape the affinity trap; `ParamsWriter` has no SQLite twin because rusqlite's typed bind IS the authority. `Connection::transaction` hands the closure a borrowing `Transaction` guard exposing only the data verbs, so a nested/manual-`commit` desync is E0599 (same design as the PG transaction guard). `open` sets a 5 s default `busy_timeout` (a contended write waits, bounded, then classifies as busy — never a hang; `set_busy_timeout(Duration::ZERO)` restores immediate fail-loud). Affected counts are `u64` (PG parity). The `$N`→`?N` SQLite placeholder rewrite has ONE authority (`bsql_build::sqlite_placeholder_form`), shared by the build-time conformance oracle AND the macro's baked SQLite `const SQL`, so the runtime string is byte-identical to the one build-time validation proved SQLite prepares. **Cross-backend capabilities:** `conn.cancel_token()` (interrupt-based `SqliteCancelToken`) and `conn.n1_report()` (feature `n1-detect`) read the SAME as the PostgreSQL drivers, so cancellation and N+1 detection are one mental model across backends (see the Conventions cancellation bullet and the N+1 paragraph).
 
 ## Safety invariants
 
@@ -352,6 +365,31 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `total_bytes / 64 KiB` write syscalls instead of one per row, with the send
   buffer bounded under `2 ×` the threshold — constant memory regardless of COPY
   size.
+- **Query cancellation** — `conn.cancel_token()` mints a DETACHED
+  `CancelToken` (`Send + Sync + 'static`, borrowing NOTHING from the connection)
+  that can be obtained BEFORE a long query and moved to another task/thread that
+  calls `token.cancel()` while the query is in flight — no `&mut` aliasing with
+  the in-flight future. The token is UNFORGEABLE (the `BackendKeyData` secret is
+  captured only at connect, kept in a `Sensitive<i32>` end-to-end; `Core::cancel_key()`
+  clones it into the detached `CancelKey`) and pinned tier-1 (footprint 56 B).
+  Because a PostgreSQL cancel MUST travel on a SECOND socket (the owning
+  connection is blocked server-side), `cancel()` opens a THROWAWAY socket to the
+  same endpoint by driving each driver's OWN wire-builder over a rebuilt
+  credential-free `ConnectConfig` (the `Redial` snapshot — host/port/raw-ssl-mode/
+  ca-roots, NO password), so it re-runs the `SSLRequest` probe and honors the
+  original `SslMode` / custom CA roots — a cancel to a TLS-required server
+  negotiates TLS — with ONE wire authority and no drift. **HONEST FRAMING:** PG
+  cancel is BEST-EFFORT by spec (§55.4) — a CAPABILITY, not a guarantee: `cancel()`
+  REQUESTS cancellation (the canceled query returns SQLSTATE `57014`
+  `query_canceled` and the connection is left drained + reusable), it does not
+  promise the query stops (a late cancel is a server no-op; a double cancel is two
+  harmless packets). The SQLite twin `SqliteCancelToken` (over rusqlite's
+  `InterruptHandle`) reads the SAME — `conn.cancel_token()` / `token.cancel()` —
+  for one cross-backend mental model, but cancels IN-PROCESS via
+  `sqlite3_interrupt` (so `cancel()` is infallible → `()`, and an interrupted step
+  is the classified `SqliteError::Interrupted`; the connection stays reusable).
+  Both PG drivers' cancel is witnessed by the `--ignored` `cancel_token_stops_an_inflight_query`
+  live tests; SQLite's by `crates/sqlite/driver/tests/cancel.rs`.
 - Transport (both drivers) is chosen by libpq's rule, centralized once in
   `core::resolve_endpoint`: an ABSOLUTE-PATH host (begins with `/`, e.g.
   `ConnectConfig::new("/tmp", …)`, `PGHOST=/var/run/postgresql`, or the DSN

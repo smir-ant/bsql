@@ -6,6 +6,16 @@ rust-version = "1.95"
 description = "Lightweight SQLite driver with API-compatible Row type"
 license = "MIT OR Apache-2.0"
 
+[features]
+# `n1-detect` — the diagnostics-only N+1 query detector (`conn.n1_report()`),
+# the SQLite twin of the PostgreSQL driver's detector. OFF by default: a
+# production build compiles no tracker field, no query-path branch, and no
+# `#[track_caller]` ABI cost — the typed verbs stay byte-identical blocking
+# `fn`s. It is a SELF-CONTAINED copy of the tracker (a `bsql-postgres-core`
+# dependency would drag the whole PostgreSQL + rustls tree into this embedded
+# crate), so it adds NO external dependency — a cargo feature only.
+n1-detect = []
+
 [dependencies]
 # `rusqlite` — Safe Rust bindings for SQLite. `bundled` feature compiles
 # SQLite from source via `libsqlite3-sys`, removing system-library

@@ -55,6 +55,62 @@ async fn unix_socket_ssl_require_is_a_loud_config_error() {
     }
 }
 
+/// WITNESS (query cancellation): start a long `SELECT pg_sleep(5)` on one
+/// connection, then from ANOTHER task send an out-of-band cancel via a
+/// `CancelToken` obtained BEFORE the query. The query must return a classified
+/// SQLSTATE `57014` (`query_canceled`) WELL under the 5-second sleep, and the
+/// connection must be left drained + reusable (a canceled query is a recoverable
+/// server error). This proves the whole out-of-band path end-to-end: the token is
+/// detached (moved into the cancel task while the query future is in flight), the
+/// throwaway socket redials the same endpoint, and the server honors the cancel.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn cancel_token_stops_an_inflight_query() {
+    let cfg = ConnectConfig::new("localhost", "smir-ant").database("postgres".to_string());
+    let mut conn = Connection::connect(&cfg).await.expect("connect");
+    // The token is obtained BEFORE the long query and borrows nothing from `conn`.
+    let token = conn.cancel_token();
+    assert!(token.backend_pid() > 0, "the token names the backend to cancel");
+    // From another task, cancel ~300 ms in — long after pg_sleep(5) has started
+    // server-side, long before it would finish.
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        token.cancel().await
+    });
+    let start = std::time::Instant::now();
+    let outcome = conn.query_sql("SELECT pg_sleep(5)").await;
+    let elapsed = start.elapsed();
+    canceller
+        .await
+        .expect("cancel task join")
+        .expect("cancel packet delivered");
+    match outcome {
+        Err(DriverError::Db(db)) => assert!(
+            db.is_code("57014"),
+            "a canceled query must be SQLSTATE 57014 query_canceled, got {}",
+            db.code
+        ),
+        Ok(_) => panic!("pg_sleep(5) must be canceled, not run to completion"),
+        Err(other) => panic!("cancel must surface as DriverError::Db(57014), got {other:?}"),
+    }
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "cancel must return well under the 5s sleep, took {elapsed:?}"
+    );
+    // A canceled query is a RECOVERABLE server error: the verb drained the
+    // ErrorResponse + ReadyForQuery, so the connection stays healthy and reusable.
+    assert!(
+        conn.is_healthy(),
+        "the connection must be drained + reusable after a cancel"
+    );
+    let row = conn
+        .query_one_sql("SELECT 1")
+        .await
+        .expect("connection reusable after cancel");
+    assert_eq!(row.get_str(0), Ok(Some("1")));
+    conn.close().await.expect("close");
+}
+
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn connect_and_ping() {
