@@ -1,3 +1,6 @@
+//! The PostgreSQL `SSLRequest` probe and its `'S'` / `'N'` response classifier
+//! (TLS-only — compiled out with the `tls` feature off).
+
 use crate::config::{ConnectConfig, SslMode};
 use crate::error::DriverError;
 

@@ -1,3 +1,6 @@
+//! Connection configuration: [`ConnectConfig`], [`SslMode`], endpoint
+//! resolution ([`resolve_endpoint`]), and startup-parameter validation.
+
 use std::sync::Arc;
 
 /// SSL negotiation mode.
@@ -52,11 +55,19 @@ crate::footprint_pin!(SslMode, size = 1, align = 1);
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ConnectConfig {
+    /// The server host: a TCP hostname / IP, or an absolute path (leading `/`)
+    /// selecting a unix-domain socket directory (see [`resolve_endpoint`]).
     pub host: String,
+    /// The TCP port, or the `.s.PGSQL.<port>` file suffix for a unix socket.
     pub port: u16,
+    /// The PostgreSQL role to authenticate as.
     pub user: String,
+    /// The database to open; `None` defaults to the [`user`](Self::user) name
+    /// (libpq parity).
     pub database: Option<String>,
     password_inner: Option<zeroize::Zeroizing<String>>,
+    /// The connect-timeout budget in seconds — the wall-clock deadline covering
+    /// TCP connect, the TLS handshake, and the startup / auth handshake.
     pub connect_timeout_secs: u64,
     /// The consumer's EXPLICIT SSL negotiation mode, or `None` when it was left
     /// to the threat-scoped default resolved at connect by [`resolve_ssl_mode`]
@@ -120,6 +131,9 @@ pub struct ConnectConfig {
 crate::footprint_pin!(ConnectConfig, size = 152, align = 8);
 
 impl ConnectConfig {
+    /// Borrow the configured password as `&str`, or `None` if none was set. The
+    /// stored password is a `Zeroizing<String>` — scrubbed on drop, redacted in
+    /// `Debug`.
     pub fn password_str(&self) -> Option<&str> {
         self.password_inner.as_deref().map(|s| s.as_str())
     }

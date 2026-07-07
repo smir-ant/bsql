@@ -1,3 +1,7 @@
+//! Dynamic result types: the `Arc`-arena-backed [`Row`] / [`QueryResult`] /
+//! [`RowSet`] and its [`ArenaBuilder`], plus the LISTEN/NOTIFY [`Notification`]
+//! payload.
+
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -243,7 +247,9 @@ impl Row {
         matches!(self.get_raw(col), Ok(None))
     }
 
+    /// The number of columns in this row.
     pub fn len(&self) -> usize { usize::from(self.arena.n_cols) }
+    /// `true` if this row has zero columns.
     pub fn is_empty(&self) -> bool { self.arena.n_cols == 0 }
 
     /// Decode the column named `name` (resolved against `column_names`) into any
@@ -370,6 +376,10 @@ impl ArenaBuilder {
         }
     }
 
+    /// Append a non-NULL column holding `bytes` to the row under construction.
+    /// An offset or length that would overflow the 32-bit arena bounds marks
+    /// the builder so [`finish`](Self::finish) fails loudly — never a saturated
+    /// offset that would mis-address bytes.
     pub fn push_value(&mut self, bytes: &[u8]) {
         // Count this column toward the current row's width (checked at end_row).
         self.cols_in_row = self.cols_in_row.saturating_add(1);
@@ -398,6 +408,7 @@ impl ArenaBuilder {
         }
     }
 
+    /// Append a SQL `NULL` column to the row under construction.
     pub fn push_null(&mut self) {
         // Count this column toward the current row's width (checked at end_row).
         self.cols_in_row = self.cols_in_row.saturating_add(1);
@@ -427,6 +438,10 @@ impl ArenaBuilder {
         }
     }
 
+    /// Finish the current row, enforcing the uniform column-width invariant: a
+    /// completed row whose width differs from the declared `n_cols` marks the
+    /// builder so [`finish`](Self::finish) fails loudly rather than mis-addressing
+    /// cells against the fixed stride.
     pub fn end_row(&mut self) {
         // Enforce the uniform-width invariant: a completed row must contribute
         // exactly `n_cols` slots, or the fixed stride would mis-address it.
@@ -645,10 +660,14 @@ impl QueryResult {
 
 // ─── Notification ───────────────────────────────────────────
 
+/// An asynchronous `NOTIFY` payload delivered on a subscribed `LISTEN` channel.
 #[derive(Debug, Clone)]
 pub struct Notification {
+    /// The channel the `NOTIFY` was sent on.
     pub channel: String,
+    /// The payload string (empty if the `NOTIFY` carried none).
     pub payload: String,
+    /// The PID of the backend that issued the `NOTIFY`.
     pub pid: i32,
 }
 

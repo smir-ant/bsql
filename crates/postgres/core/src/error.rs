@@ -1,3 +1,6 @@
+//! Error types: the SQLSTATE-classified server error [`DbError`], the
+//! driver-level [`DriverError`], and the dynamic-column [`ColumnError`].
+
 use std::fmt;
 
 use bsql_postgres_proto::DecodeError;
@@ -5,13 +8,18 @@ use bsql_postgres_proto::DecodeError;
 /// Structured PostgreSQL error with SQLSTATE code.
 #[derive(Debug, Clone)]
 pub struct DbError {
+    /// The 5-character SQLSTATE code (e.g. `"23505"`); test it with
+    /// [`is_code`](Self::is_code).
     pub code: String,
     /// Server-reported severity. `None` when the server omitted it or it was
     /// unrecognized — never fabricated. (Display falls back to "ERROR" for
     /// presentation only; the stored value stays honest.)
     pub severity: Option<String>,
+    /// The primary human-readable error message.
     pub message: String,
+    /// An optional secondary DETAIL line elaborating the error.
     pub detail: Option<String>,
+    /// An optional HINT suggesting how to resolve the error.
     pub hint: Option<String>,
 }
 
@@ -42,8 +50,11 @@ impl std::error::Error for DbError {}
 crate::footprint_pin!(DbError, size = 120, align = 8);
 
 impl DbError {
+    /// `true` if the SQLSTATE [`code`](Self::code) equals `code`.
     pub fn is_code(&self, code: &str) -> bool { self.code == code }
+    /// `true` if the SQLSTATE is `23505` (`unique_violation`).
     pub fn is_unique_violation(&self) -> bool { self.code == "23505" }
+    /// `true` if the SQLSTATE is `23503` (`foreign_key_violation`).
     pub fn is_foreign_key_violation(&self) -> bool { self.code == "23503" }
 }
 
@@ -148,7 +159,10 @@ pub enum DriverError {
     /// once the remaining payload variants were narrowed to `<= 16` B — see the
     /// footprint pin below).
     Db(Box<DbError>),
+    /// A transport-level socket / I/O failure; the connection is dead.
     Io(std::io::Error),
+    /// The connection is not in a state to accept a verb — dead, or its linear
+    /// liveness token was already taken by a prior fatal error.
     NotReady,
     /// The server refused SSL while the connection required it
     /// (`SslMode::Require`). Produced only by the TLS SSLRequest probe, so it
@@ -158,7 +172,10 @@ pub enum DriverError {
     /// never occur and is not present.
     #[cfg(feature = "tls")]
     SslRefused,
+    /// A query that required at least one row (e.g. `query_one_sql`) matched none.
     NoRows,
+    /// A pre-connect configuration / validation error; the `&'static str` names
+    /// the specific problem and the fix.
     Config(&'static str),
     /// A result row exceeded the 32-bit on-arena bounds (more columns,
     /// offset, or cell length than `u32`/`u16` can address). Never silently

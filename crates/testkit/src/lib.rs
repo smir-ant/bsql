@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// A future undocumented `pub` item is a build error, not silent doc rot.
+#![deny(missing_docs)]
 
 //! Deterministic in-memory fake PostgreSQL for testing bsql driver code.
 //!

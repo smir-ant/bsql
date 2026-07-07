@@ -1,3 +1,7 @@
+//! Shared live-PostgreSQL SQL-mechanism scenario library
+//! (`define_sql_scenario_tests!`), run by both drivers' `--ignored` live suites
+//! under the `test-scenarios` feature.
+
 /// A shared library of SQL-mechanism scenarios, run by BOTH drivers.
 ///
 /// Every scenario exercises one SQL mechanism — joins, CTEs, window functions,

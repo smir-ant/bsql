@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+// A future undocumented `pub` item is a build error, not silent doc rot.
+#![deny(missing_docs)]
 // Mechanical-cast wall (tier-1) completing the workspace floor's
 // `cast_sign_loss` + `integer_division` forbid: an `as` conversion, a truncating
 // or sign-flipping `as` cast, and `unreachable!` are all rejected at compile
