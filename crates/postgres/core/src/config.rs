@@ -222,12 +222,40 @@ impl ConnectConfig {
             None => (hostpath, None),
         };
 
-        let (host, port) = match hostport.rsplit_once(':') {
-            Some((h, p)) => {
-                let port = p.parse::<u16>().map_err(|_| format!("invalid port: {p}"))?;
-                (h.to_string(), port)
-            }
-            None => (hostport.to_string(), 5432),
+        // Split host from port. A bracketed IPv6 literal (`[::1]`, `[2001:db8::1]`)
+        // carries the address's OWN colons INSIDE the brackets, so the port
+        // separator is only the `:` that FOLLOWS the closing `]`. `rsplit_once(':')`
+        // alone would split at the address's last internal colon when no port is
+        // present (`[::1]` → port `"1]"`), so the bracket form is handled FIRST; a
+        // bare host / `host:port` falls through to the unchanged rsplit path.
+        let (host, port) = match hostport.strip_prefix('[') {
+            Some(rest) => match rest.split_once(']') {
+                Some((addr, after)) => {
+                    let port = match after.strip_prefix(':') {
+                        Some(p) => p.parse::<u16>().map_err(|_| format!("invalid port: {p}"))?,
+                        None if after.is_empty() => 5432,
+                        None => {
+                            return Err(format!(
+                                "invalid characters after IPv6 literal in DSN host: {after:?}"
+                            ));
+                        }
+                    };
+                    // Keep the brackets: they are what `ToSocketAddrs` dials, and
+                    // `host_is_loopback` / `resolve_endpoint` both expect the
+                    // bracketed form (matching the already-correct with-port path).
+                    (format!("[{addr}]"), port)
+                }
+                None => {
+                    return Err(format!("unterminated IPv6 literal in DSN host: {hostport:?}"));
+                }
+            },
+            None => match hostport.rsplit_once(':') {
+                Some((h, p)) => {
+                    let port = p.parse::<u16>().map_err(|_| format!("invalid port: {p}"))?;
+                    (h.to_string(), port)
+                }
+                None => (hostport.to_string(), 5432),
+            },
         };
 
         // Parse query params. `ssl_mode` stays `None` (defaulted — resolved
@@ -1002,6 +1030,73 @@ mod tests {
         assert_eq!(
             dsn_endpoint("postgres://u@localhost/app"),
             Ok(Endpoint::Tcp("localhost:5432".to_string())),
+        );
+    }
+
+    #[test]
+    fn dsn_bracketed_ipv6_without_port_uses_the_default_port() {
+        // WITNESS: a bracketed IPv6 literal with NO explicit port. The port split
+        // must key on the `]`, never on the address's internal colons — so
+        // `[::1]/db` is the loopback host at the default 5432, not `Err(port "1]")`.
+        let cfg = match ConnectConfig::from_dsn("postgres://u@[::1]/db") {
+            Ok(c) => c,
+            Err(e) => panic!("a bracketed IPv6 loopback with no port must parse: {e}"),
+        };
+        assert_eq!(cfg.host, "[::1]", "the brackets are kept for dialing");
+        assert_eq!(cfg.port, 5432, "no explicit port ⇒ the default");
+        assert!(host_is_loopback(&cfg.host), "[::1] is loopback");
+        assert_eq!(
+            resolve_endpoint(&cfg.host, cfg.port),
+            Endpoint::Tcp("[::1]:5432".to_string()),
+        );
+    }
+
+    #[test]
+    fn dsn_bracketed_ipv6_remote_without_port_uses_the_default_port() {
+        // A non-loopback bracketed IPv6 literal with no port: the full address
+        // survives (internal colons intact) and the default port applies.
+        let cfg = match ConnectConfig::from_dsn("postgres://u@[2001:db8::1]/db") {
+            Ok(c) => c,
+            Err(e) => panic!("a bracketed IPv6 remote with no port must parse: {e}"),
+        };
+        assert_eq!(cfg.host, "[2001:db8::1]");
+        assert_eq!(cfg.port, 5432);
+        assert!(!host_is_loopback(&cfg.host), "2001:db8::1 is not loopback");
+        assert_eq!(
+            resolve_endpoint(&cfg.host, cfg.port),
+            Endpoint::Tcp("[2001:db8::1]:5432".to_string()),
+        );
+    }
+
+    #[test]
+    fn dsn_bracketed_ipv6_with_explicit_port_is_unchanged() {
+        // The already-correct with-port form must keep parsing: the `]:port`
+        // suffix splits the port, the internal colons stay in the host.
+        let cfg = match ConnectConfig::from_dsn("postgres://u@[::1]:5432/db") {
+            Ok(c) => c,
+            Err(e) => panic!("a bracketed IPv6 with an explicit port must parse: {e}"),
+        };
+        assert_eq!(cfg.host, "[::1]");
+        assert_eq!(cfg.port, 5432);
+        let cfg2 = match ConnectConfig::from_dsn("postgres://u@[2001:db8::1]:6000/db") {
+            Ok(c) => c,
+            Err(e) => panic!("a bracketed IPv6 remote with a port must parse: {e}"),
+        };
+        assert_eq!(cfg2.host, "[2001:db8::1]");
+        assert_eq!(cfg2.port, 6000);
+    }
+
+    #[test]
+    fn dsn_malformed_bracketed_ipv6_is_a_loud_error() {
+        // An unterminated literal or a bad port after `]` is a classified Err,
+        // never a silent mis-parse.
+        assert!(
+            ConnectConfig::from_dsn("postgres://u@[::1/db").is_err(),
+            "an unterminated IPv6 literal must be a loud error",
+        );
+        assert!(
+            ConnectConfig::from_dsn("postgres://u@[::1]:notaport/db").is_err(),
+            "a non-numeric port after ] must be a loud error",
         );
     }
 

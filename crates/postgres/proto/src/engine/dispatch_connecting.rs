@@ -74,7 +74,8 @@ use crate::sensitive::Sensitive;
 use crate::state::ConnectingState;
 use crate::wire::{
     AuthSubCode, InboundTag, PROTOCOL_VERSION_3_0, TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA,
-    TAG_ERROR_RESPONSE, TAG_PARAMETER_STATUS, TAG_READY_FOR_QUERY, TAG_SASL_RESPONSE,
+    TAG_ERROR_RESPONSE, TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_NOTICE_RESPONSE, TAG_PARAMETER_STATUS,
+    TAG_READY_FOR_QUERY, TAG_SASL_RESPONSE,
 };
 // The advertised SASL mechanism name — matched only by the SCRAM dispatch.
 #[cfg(feature = "scram")]
@@ -121,6 +122,14 @@ pub enum ConnFail {
     Scram(ScramFailureClass),
     /// The outbound auth response did not fit the bounded write buffer.
     BufferOverflow,
+    /// The server answered the startup request with a `NegotiateProtocolVersion`
+    /// frame. bsql requests exactly protocol 3.0 with NO `_pq_.` protocol
+    /// options, so a spec-compliant server never sends this — a `'v'` frame means
+    /// the peer rejected the requested protocol. Classified LOUD rather than
+    /// swallowed: swallowing would mask a genuine negotiation failure if bsql ever
+    /// grows protocol options. A unit variant — no payload, so it rides the
+    /// discriminant and does not widen the footprint.
+    ProtocolNegotiationRejected,
 }
 
 #[cfg(feature = "scram")]
@@ -500,6 +509,30 @@ impl ConnectingEngine {
                 Some(frame) => frame,
                 None => return DriveOutcome::NeedMore,
             };
+
+            // Phase-independent frames, lifted BEFORE the per-state dispatch — the
+            // same pattern the active loop applies (see `dispatch_active`), so the
+            // connecting phase honours PostgreSQL protocol §55.2.7 ("a frontend
+            // must be prepared to accept NoticeResponse messages whenever it is
+            // expecting any other type of message").
+            let async_tag = InboundTag::from_byte(tag);
+            // A NoticeResponse may arrive in ANY handshaking state — e.g. a PG17
+            // `login` event trigger that RAISE NOTICEs fires on EVERY connection,
+            // interleaved with the post-auth ParameterStatus/BackendKeyData batch.
+            // Absorb it WITHOUT advancing the connecting state machine (`phase`
+            // untouched) and keep pulling; a handshake notice can never tear the
+            // connection down.
+            if async_tag == TAG_NOTICE_RESPONSE {
+                continue;
+            }
+            // A NegotiateProtocolVersion is a CLASSIFIED loud failure. bsql requests
+            // exactly protocol 3.0 with no `_pq_.` options, so a compliant server
+            // never sends `'v'`; classifying it (rather than letting it fall to a
+            // generic UnexpectedFrame, or — worse — swallowing it) keeps a real
+            // negotiation rejection visible if bsql ever grows protocol options.
+            if async_tag == TAG_NEGOTIATE_PROTOCOL_VERSION {
+                return DriveOutcome::ProtoFail(ConnFail::ProtocolNegotiationRejected);
+            }
 
             // Move the in-flight state out for the consuming dispatch. The
             // terminal arms are unreachable (the short-circuit above returned)

@@ -81,6 +81,29 @@ fn parameter_status(key: &str, value: &str) -> Vec<u8> {
     frame(TAG_PARAMETER_STATUS.byte(), &body)
 }
 
+/// A `NoticeResponse` ('N') — the field-list form a PG `RAISE NOTICE` sends
+/// (`S`everity, `C`ode, `M`essage), a `\0`-terminated field list. The engine
+/// absorbs it without parsing, so only the tag + framing are load-bearing here.
+fn notice(message: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(b'S');
+    body.extend_from_slice(b"NOTICE\0");
+    body.push(b'C');
+    body.extend_from_slice(b"00000\0");
+    body.push(b'M');
+    body.extend_from_slice(message.as_bytes());
+    body.push(0);
+    body.push(0); // field-list terminator
+    frame(b'N', &body)
+}
+
+/// A `NegotiateProtocolVersion` ('v'): Int32(newest supported minor) +
+/// Int32(count of unrecognised options). bsql requests exactly 3.0 with no
+/// options, so a compliant server never sends this.
+fn negotiate_protocol_version() -> Vec<u8> {
+    frame(b'v', &[0, 0, 0, 0, 0, 0, 0, 0])
+}
+
 // ─────────────────────────── engine drivers ───────────────────────────
 
 fn user() -> Ident {
@@ -378,4 +401,72 @@ fn need_more_when_buffer_drained() {
         ConnectingEngine::start(&mut sb, &user(), None, &[], Credentials::Trust).unwrap();
     // Nothing fed yet.
     assert!(matches!(engine.next_auth_event(&mut sb), AuthEvent::NeedMore));
+}
+
+#[test]
+fn handshake_absorbs_notices_in_every_state_and_reaches_ready() {
+    // WITNESS (RED before / GREEN after): a NoticeResponse arriving in ANY
+    // handshaking state — mid-auth (before AuthenticationOk), and interleaved
+    // through the post-auth ParameterStatus/BackendKeyData batch — is ABSORBED
+    // without advancing the state machine, so the handshake still reaches Ready.
+    // Before the fix each 'N' fell to `fail(UnexpectedFrame)` (PG protocol
+    // §55.2.7 violation): a PG17 `login` event trigger's RAISE NOTICE would make
+    // bsql 100% unable to connect. Trust path (no password exchange to intrude on).
+    let mut sb = SendBuf::new();
+    let mut engine =
+        ConnectingEngine::start(&mut sb, &user(), None, &[], Credentials::Trust).unwrap();
+
+    feed(&mut engine, &notice("login trigger fired (before auth)"));
+    feed(&mut engine, &auth_ok());
+    feed(&mut engine, &notice("login trigger fired (post-auth)"));
+    feed(&mut engine, &parameter_status("server_version", "17.0"));
+    feed(&mut engine, &notice("interleaved with the param batch"));
+    feed(&mut engine, &backend_key(4321, 8765));
+    feed(&mut engine, &notice("just before ReadyForQuery"));
+    feed(&mut engine, &ready_for_query(b'I'));
+
+    // Drive to completion, absorbing the surfaced ParameterStatus; the handshake
+    // must COMPLETE (Ready), never Fail.
+    loop {
+        match engine.next_auth_event(&mut sb) {
+            AuthEvent::Ready => break,
+            AuthEvent::ParamStatus(_) => {}
+            AuthEvent::NeedMore => panic!("ran out of bytes before Ready"),
+            AuthEvent::Fail(_) => panic!("a handshake NoticeResponse must NOT tear down"),
+            AuthEvent::AuthCleartext
+            | AuthEvent::AuthMd5 { .. }
+            | AuthEvent::AuthSaslContinue(_) => {}
+        }
+    }
+
+    let active = match engine.into_active() {
+        Ok(active) => active,
+        Err(_) => panic!("into_active must succeed after Ready"),
+    };
+    assert_eq!(active.backend_pid(), 4321);
+    assert!(matches!(active.tx_status(), TxStatus::Idle));
+}
+
+#[test]
+fn negotiate_protocol_version_is_a_classified_loud_fail() {
+    // WITNESS: a NegotiateProtocolVersion before Authentication is a CLASSIFIED
+    // loud failure (ConnFail::ProtocolNegotiationRejected → AuthEvent::Fail),
+    // NEVER swallowed-and-continued. bsql requests exactly 3.0 with no `_pq_.`
+    // options, so a compliant server never sends 'v'; swallowing it would mask a
+    // real negotiation failure if bsql ever grows protocol options. Feeding a
+    // full valid handshake tail AFTER 'v' proves the frame is not swallowed: the
+    // engine fails immediately rather than reaching Ready.
+    let mut sb = SendBuf::new();
+    let mut engine =
+        ConnectingEngine::start(&mut sb, &user(), None, &[], Credentials::Trust).unwrap();
+
+    feed(&mut engine, &negotiate_protocol_version());
+    feed(&mut engine, &auth_ok());
+    feed(&mut engine, &backend_key(1, 2));
+    feed(&mut engine, &ready_for_query(b'I'));
+
+    assert!(
+        matches!(engine.next_auth_event(&mut sb), AuthEvent::Fail(_)),
+        "a NegotiateProtocolVersion must fail loud, not be swallowed into Ready",
+    );
 }

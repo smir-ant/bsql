@@ -737,41 +737,51 @@ impl Connection {
     /// The `BEGIN` is DEFERRED and PIPELINED with the first statement the body
     /// issues: it rides that statement's flush (one round trip carries both), so a
     /// one-statement transaction costs the pipelined round trips, not a separate
-    /// `BEGIN` round trip plus the statement's. An EMPTY body (no statement) still
-    /// opens the transaction — the pending `BEGIN` fuses into the terminating
-    /// `COMMIT` / `ROLLBACK` flush. A fused `BEGIN` that errors surfaces as the
-    /// transaction's failure (it cannot be swallowed by the first statement).
+    /// `BEGIN` round trip plus the statement's. The `BEGIN` is armed INSIDE that
+    /// first verb (within the `take_live` window it opens), never out-of-band at
+    /// entry — so if the returned future is dropped BEFORE any verb runs (its
+    /// first suspending await is non-bsql — a `sleep`, a lock, an external fetch),
+    /// NOTHING is staged: the connection is left clean, never carrying a stranded
+    /// `BEGIN` a later verb on a reused (bare) connection would silently fuse. An
+    /// EMPTY body (no statement) is therefore a true no-op: it opens nothing and
+    /// costs zero round trips — no `COMMIT` / `ROLLBACK` is issued. A fused `BEGIN`
+    /// that errors surfaces as the transaction's failure (it cannot be swallowed by
+    /// the first statement).
     pub async fn transaction<R, F>(&mut self, f: F) -> Result<R, DriverError>
     where
         F: AsyncFnOnce(&mut Transaction<'_>) -> Result<R, DriverError>,
     {
-        // Defer BEGIN: it fuses into the first statement's flush (or the terminating
-        // COMMIT/ROLLBACK for an empty body), so it is always consumed before this
-        // method returns — never left pending on the connection.
-        self.core.defer_begin();
-        // The guard borrows `self.core` for the body's scope ONLY; it is dropped at
-        // the end of this block, releasing the borrow so the terminating
-        // COMMIT/ROLLBACK below can re-borrow `self.core`.
-        let outcome = {
-            let mut tx = Transaction { core: &mut self.core };
-            f(&mut tx).await
+        // The BEGIN is NOT armed out-of-band here. The guard arms it inside the
+        // first verb (poll-time, within that verb's take_live window), so a
+        // transaction future dropped before any verb runs leaves nothing staged.
+        // The guard borrows `self.core` for the body's scope ONLY; the block ends
+        // that borrow (and reads back whether a verb opened the transaction) so the
+        // terminating COMMIT/ROLLBACK below can re-borrow `self.core`.
+        let (outcome, opened) = {
+            let mut tx = Transaction { core: &mut self.core, begin_armed: false };
+            let outcome = f(&mut tx).await;
+            (outcome, tx.begin_armed)
         };
+        // Terminate ONLY if a verb actually opened the transaction. An empty body
+        // armed no BEGIN, so there is nothing to commit or roll back — and the
+        // terminator can never carry a fused BEGIN into the next verb.
         let result = match outcome {
             Ok(value) => {
-                self.core.simple_query("COMMIT").await?;
+                if opened {
+                    self.core.simple_query("COMMIT").await?;
+                }
                 Ok(value)
             }
             Err(e) => {
                 // Best-effort rollback; the outcome rides the liveness token, so it
-                // is explicitly discarded. The caller's error `e` dominates. If the
-                // body issued no statement, this ROLLBACK's flush also carries the
-                // still-pending BEGIN (an empty BEGIN;ROLLBACK — a harmless no-op
-                // transaction), so no stale prelude survives into the next verb.
-                drop(self.core.simple_query("ROLLBACK").await);
+                // is explicitly discarded. The caller's error `e` dominates.
+                if opened {
+                    drop(self.core.simple_query("ROLLBACK").await);
+                }
                 Err(e)
             }
         };
-        // Either terminator closes a logical operation: forget the N+1 recency
+        // The transaction scope closes a logical operation: forget the N+1 recency
         // window (a no-op with the feature off).
         self.core.n1_reset();
         result
@@ -1123,17 +1133,52 @@ impl Connection {
 /// which is not `Debug` — the same reason [`CopyInWriter`] carries none.
 pub struct Transaction<'t> {
     core: &'t mut Core<TokioSocket>,
+    /// `true` once the deferred `BEGIN` has been armed by the first verb. Armed
+    /// exactly once, and ONLY from within a verb's poll (never out-of-band at
+    /// `transaction()` entry) — which is what makes a transaction future dropped
+    /// before any verb runs leave nothing staged. Read by the combinator after
+    /// the body to decide whether a terminating `COMMIT` / `ROLLBACK` is owed.
+    begin_armed: bool,
 }
 
 impl Transaction<'_> {
+    /// Poll-time arm-once wrapper: arm the deferred `BEGIN` INSIDE the returned
+    /// future, at the SAME poll the built verb takes the liveness token.
+    ///
+    /// The first verb the body issues opens the transaction — its flush fuses
+    /// the `BEGIN` (the 1-RTT win). Because the arming (`defer_begin`) and the
+    /// core verb's `take_live` share ONE synchronous critical section with no
+    /// `.await` between them, a transaction future dropped before any verb is
+    /// polled arms NOTHING: the strand hazard is unreachable by construction, not
+    /// merely unlikely. Every data verb routes through here, so whichever verb
+    /// runs first opens the transaction — exactly as the (deleted) out-of-band
+    /// arming did, minus the blind zone between `transaction()` entry and the
+    /// first verb.
+    fn armed<'a, F, Fut>(&'a mut self, make: F) -> impl Future<Output = Fut::Output> + 'a
+    where
+        F: FnOnce(&'a mut Core<TokioSocket>) -> Fut + 'a,
+        Fut: Future + 'a,
+    {
+        let core = &mut *self.core;
+        let armed = &mut self.begin_armed;
+        async move {
+            if !*armed {
+                core.defer_begin();
+                *armed = true;
+            }
+            make(core).await
+        }
+    }
+
     // ── Delegated runtime-SQL verbs (data only) ─────────────────────────────
     //
-    // Each RETURNS the shared `Core` verb's future directly (a `fn -> impl Future`
-    // forwarder), identical to the `Connection` methods — no extra state layer.
+    // Each routes through `armed` (poll-time arm-once), so the first verb the
+    // body issues opens the transaction and every verb otherwise drives the same
+    // shared `Core` verb the `Connection` method drives — no extra state layer.
 
     /// Round-trip a `Sync` to confirm the connection is live.
     pub fn ping(&mut self) -> impl Future<Output = Result<(), DriverError>> + '_ {
-        self.core.ping()
+        self.armed(|c| c.ping())
     }
 
     /// Issue a simple query, returning the command tag string.
@@ -1141,7 +1186,7 @@ impl Transaction<'_> {
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<String, DriverError>> + 'a {
-        self.core.simple_query(sql)
+        self.armed(move |c| c.simple_query(sql))
     }
 
     /// Execute a non-row runtime-SQL command, returning the affected-row count.
@@ -1149,7 +1194,7 @@ impl Transaction<'_> {
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
-        self.core.execute_sql(sql)
+        self.armed(move |c| c.execute_sql(sql))
     }
 
     /// Run a row-returning runtime-SQL query (text result columns).
@@ -1157,7 +1202,7 @@ impl Transaction<'_> {
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
-        self.core.query_sql(sql)
+        self.armed(move |c| c.query_sql(sql))
     }
 
     /// Run a runtime-SQL query returning the first row, or [`DriverError::NoRows`].
@@ -1165,7 +1210,7 @@ impl Transaction<'_> {
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<Row, DriverError>> + 'a {
-        self.core.query_one_sql(sql)
+        self.armed(move |c| c.query_one_sql(sql))
     }
 
     /// Run a runtime-SQL query returning the first row if any (typed peer:
@@ -1174,7 +1219,7 @@ impl Transaction<'_> {
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
-        self.core.query_opt_sql(sql)
+        self.armed(move |c| c.query_opt_sql(sql))
     }
 
     /// Prepare a statement: `Parse` + `Describe` + `Sync`.
@@ -1182,7 +1227,7 @@ impl Transaction<'_> {
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<PreparedStatement, DriverError>> + 'a {
-        self.core.prepare(sql)
+        self.armed(move |c| c.prepare(sql))
     }
 
     /// Execute a prepared statement returning rows.
@@ -1191,7 +1236,7 @@ impl Transaction<'_> {
         stmt: &'a PreparedStatement,
         params: &'a P,
     ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
-        self.core.query_prepared(stmt, params)
+        self.armed(move |c| c.query_prepared(stmt, params))
     }
 
     /// Execute a prepared statement for its side effect, returning the affected
@@ -1201,7 +1246,7 @@ impl Transaction<'_> {
         stmt: &'a PreparedStatement,
         params: &'a P,
     ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
-        self.core.execute_prepared(stmt, params)
+        self.armed(move |c| c.execute_prepared(stmt, params))
     }
 
     /// Prepare, query, and close a runtime SQL statement with params.
@@ -1210,7 +1255,7 @@ impl Transaction<'_> {
         sql: &'a str,
         params: &'a P,
     ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
-        self.core.query_params(sql, params)
+        self.armed(move |c| c.query_params(sql, params))
     }
 
     /// Like [`query_params`](Self::query_params), returning the first row.
@@ -1219,7 +1264,7 @@ impl Transaction<'_> {
         sql: &'a str,
         params: &'a P,
     ) -> impl Future<Output = Result<Row, DriverError>> + 'a {
-        self.core.query_params_one(sql, params)
+        self.armed(move |c| c.query_params_one(sql, params))
     }
 
     /// Like [`query_params`](Self::query_params), returning the first row if any.
@@ -1228,7 +1273,7 @@ impl Transaction<'_> {
         sql: &'a str,
         params: &'a P,
     ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
-        self.core.query_params_opt(sql, params)
+        self.armed(move |c| c.query_params_opt(sql, params))
     }
 
     /// Prepare, execute, and close a runtime SQL statement with params.
@@ -1237,7 +1282,7 @@ impl Transaction<'_> {
         sql: &'a str,
         params: &'a P,
     ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
-        self.core.execute_params(sql, params)
+        self.armed(move |c| c.execute_params(sql, params))
     }
 
     /// Close a prepared statement, consuming it (use-after-close is a move error).
@@ -1245,7 +1290,7 @@ impl Transaction<'_> {
         &mut self,
         stmt: PreparedStatement,
     ) -> impl Future<Output = Result<(), DriverError>> + '_ {
-        self.core.close_statement(stmt)
+        self.armed(move |c| c.close_statement(stmt))
     }
 
     // ── Compile-checked typed verbs (the `query!` flagship) ─────────────────
@@ -1266,12 +1311,16 @@ impl Transaction<'_> {
         P: ParamsWriter + 'static,
         R: RowDecode + 'static,
     {
-        self.core.execute(
-            q,
-            params,
-            #[cfg(feature = "n1-detect")]
-            core::panic::Location::caller(),
-        )
+        #[cfg(feature = "n1-detect")]
+        let loc = core::panic::Location::caller();
+        self.armed(move |c| {
+            c.execute(
+                q,
+                params,
+                #[cfg(feature = "n1-detect")]
+                loc,
+            )
+        })
     }
 
     /// Run a compile-checked `query!` and collect its TYPED rows — the flagship
@@ -1284,11 +1333,15 @@ impl Transaction<'_> {
     where
         Q::Params: 'a,
     {
-        self.core.query::<Q>(
-            params,
-            #[cfg(feature = "n1-detect")]
-            core::panic::Location::caller(),
-        )
+        #[cfg(feature = "n1-detect")]
+        let loc = core::panic::Location::caller();
+        self.armed(move |c| {
+            c.query::<Q>(
+                params,
+                #[cfg(feature = "n1-detect")]
+                loc,
+            )
+        })
     }
 
     /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
@@ -1302,11 +1355,15 @@ impl Transaction<'_> {
     where
         Q::Params: 'a,
     {
-        self.core.query_one::<Q>(
-            params,
-            #[cfg(feature = "n1-detect")]
-            core::panic::Location::caller(),
-        )
+        #[cfg(feature = "n1-detect")]
+        let loc = core::panic::Location::caller();
+        self.armed(move |c| {
+            c.query_one::<Q>(
+                params,
+                #[cfg(feature = "n1-detect")]
+                loc,
+            )
+        })
     }
 
     /// Run a compile-checked `query!` expecting AT MOST one row, returning the
@@ -1321,11 +1378,15 @@ impl Transaction<'_> {
     where
         Q::Params: 'a,
     {
-        self.core.query_opt::<Q>(
-            params,
-            #[cfg(feature = "n1-detect")]
-            core::panic::Location::caller(),
-        )
+        #[cfg(feature = "n1-detect")]
+        let loc = core::panic::Location::caller();
+        self.armed(move |c| {
+            c.query_opt::<Q>(
+                params,
+                #[cfg(feature = "n1-detect")]
+                loc,
+            )
+        })
     }
 
     /// Stream a compile-checked `query!`'s rows one at a time to `on_row` in
@@ -1343,12 +1404,16 @@ impl Transaction<'_> {
         E: 'a,
         F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E> + 'a,
     {
-        self.core.query_each::<Q, F, E>(
-            params,
-            on_row,
-            #[cfg(feature = "n1-detect")]
-            core::panic::Location::caller(),
-        )
+        #[cfg(feature = "n1-detect")]
+        let loc = core::panic::Location::caller();
+        self.armed(move |c| {
+            c.query_each::<Q, F, E>(
+                params,
+                on_row,
+                #[cfg(feature = "n1-detect")]
+                loc,
+            )
+        })
     }
 
     // ── COPY (bulk load / unload — legal + atomic inside a transaction) ─────
@@ -1384,7 +1449,10 @@ impl Transaction<'_> {
     where
         F: AsyncFnOnce(&mut CopyInWriter<'_>) -> Result<(), DriverError>,
     {
-        let live = self.core.copy_in_begin_table(table).await?;
+        // Arm the deferred BEGIN at the poll of this first COPY step, so a COPY
+        // that is the transaction's first statement still fuses the BEGIN — and a
+        // transaction future dropped before this point armed nothing.
+        let live = self.armed(|c| c.copy_in_begin_table(table)).await?;
         let body = {
             let mut writer = CopyInWriter {
                 core: &mut *self.core,
@@ -1412,7 +1480,7 @@ impl Transaction<'_> {
         F: for<'q> FnMut(&'q [u8]) -> ControlFlow<E> + 'a,
         E: 'a,
     {
-        self.core.copy_out(table, on_chunk)
+        self.armed(move |c| c.copy_out(table, on_chunk))
     }
 
     // ── Session subscription (LISTEN/UNLISTEN — atomicity-neutral) ──────────
@@ -1422,7 +1490,7 @@ impl Transaction<'_> {
         &'a mut self,
         channel: &'a str,
     ) -> impl Future<Output = Result<(), DriverError>> + 'a {
-        self.core.listen(channel)
+        self.armed(move |c| c.listen(channel))
     }
 
     /// Unsubscribe from a `LISTEN` channel (see [`Connection::unlisten`]).
@@ -1430,6 +1498,6 @@ impl Transaction<'_> {
         &'a mut self,
         channel: &'a str,
     ) -> impl Future<Output = Result<(), DriverError>> + 'a {
-        self.core.unlisten(channel)
+        self.armed(move |c| c.unlisten(channel))
     }
 }

@@ -353,22 +353,6 @@ impl<'b, T> Engine<'b, T> {
             active.set_pending_prelude(sql);
         }
     }
-
-    /// Discard any armed-but-unconsumed fused prelude. A no-op unless the engine is
-    /// active with a pending prelude.
-    ///
-    /// A prelude is normally consumed by the next request verb; the ONE way to
-    /// strand it is a PANIC in a transaction body before it issued any statement
-    /// (the `COMMIT`/`ROLLBACK` that would consume it never runs). A connection
-    /// reused through the pool's `reset_session` clears it here so a stranded
-    /// `BEGIN` cannot fuse into — and corrupt — the reset (or the next user's first
-    /// statement).
-    #[inline]
-    pub fn clear_command_prelude(&mut self) {
-        if let Phase::Active(active) = &mut self.phase {
-            active.clear_pending_prelude();
-        }
-    }
 }
 
 impl<'b, T: Transport> Engine<'b, T> {

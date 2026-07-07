@@ -699,22 +699,22 @@ fn transaction_closure() {
 }
 
 /// The deferred-BEGIN FUSION correctness path, end-to-end over real PG:
-/// an EMPTY transaction still opens+closes a real transaction, a transaction whose
-/// FIRST statement is the EXTENDED protocol (`query_params`, one-round-trip) fuses
-/// BEGIN into that statement and commits its effect, and a rollback of such a body
-/// discards it. Exercises the fused BEGIN over both the simple- and extended-query
-/// first-statement paths, proving the prelude drain does not corrupt the
-/// statement's result.
+/// an EMPTY transaction is a true no-op (it arms no BEGIN and issues no COMMIT), a
+/// transaction whose FIRST statement is the EXTENDED protocol (`query_params`,
+/// one-round-trip) fuses BEGIN into that statement and commits its effect, and a
+/// rollback of such a body discards it. Exercises the fused BEGIN over both the
+/// simple- and extended-query first-statement paths, proving the prelude drain does
+/// not corrupt the statement's result.
 #[test]
 #[ignore = "requires local PG"]
 fn transaction_fusion_empty_and_extended() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     c.execute_sql("CREATE TEMP TABLE txf(v int)").expect("create");
 
-    // (1) EMPTY body: BEGIN fuses into the terminating COMMIT (BEGIN;COMMIT). No
-    // statement, no error, and the connection stays healthy + at a clean idle.
-    c.transaction(|_tx| Ok(())).expect("empty tx commits");
-    assert!(c.is_healthy(), "connection healthy after an empty fused transaction");
+    // (1) EMPTY body: a true no-op — no verb ran, so no BEGIN is armed and no
+    // COMMIT/ROLLBACK is issued, and the connection stays healthy + at a clean idle.
+    c.transaction(|_tx| Ok(())).expect("empty tx is a clean no-op");
+    assert!(c.is_healthy(), "connection healthy after an empty (no-op) transaction");
     // The connection is reusable and NOT stuck in a transaction (a subsequent
     // stand-alone statement autocommits).
     c.execute_sql("INSERT INTO txf VALUES (7)").expect("post-empty insert");
@@ -755,15 +755,16 @@ fn transaction_fusion_empty_and_extended() {
     c.close().expect("close");
 }
 
-/// A transaction body that PANICS before issuing its first statement strands the
-/// DEFERRED `BEGIN` (its `COMMIT`/`ROLLBACK` never runs to consume it). The pool's
-/// reuse hook `reset_session` DISCARDS the stranded prelude, so the reset succeeds
-/// (a stranded `BEGIN` fusing into `DISCARD ALL` would be a "cannot run inside a
-/// transaction block" server error) and the connection is reusable — the fusion
-/// never leaves a latent corruption on the connection.
+/// A transaction body that PANICS before issuing its first statement arms
+/// NOTHING: the deferred `BEGIN` is armed INSIDE the first verb (never
+/// out-of-band at `transaction()` entry), so a panic before any verb ran never
+/// staged it. The connection is therefore already clean — `reset_session` has no
+/// prelude to discard, and a subsequent statement flushes only itself. This is
+/// the live regression guard for the arm-in-first-verb invariant: reset + reuse
+/// after a mid-body panic must just work, with no latent stranded `BEGIN`.
 #[test]
 #[ignore = "requires local PG"]
-fn transaction_panic_before_first_statement_is_cleared_by_reset() {
+fn transaction_panic_before_first_statement_arms_nothing() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     // Isolate the user-code panic so we can inspect + reuse the connection.
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -772,12 +773,11 @@ fn transaction_panic_before_first_statement_is_cleared_by_reset() {
         });
     }));
     assert!(panicked.is_err(), "the panic propagated out of transaction");
-    // Healthy (no verb ran, so the liveness token is intact) but carrying a
-    // stranded BEGIN — exactly the connection a pool would take back.
+    // Healthy (no verb ran, so the liveness token is intact) AND carrying no
+    // armed BEGIN — exactly the clean connection a pool would take back.
     assert!(c.is_healthy(), "connection healthy after a body panic");
-    // The reuse hook clears the stranded prelude, so the reset does NOT fuse it and
-    // succeeds.
-    c.reset_session().expect("reset clears the stranded prelude and succeeds");
+    // Nothing was armed, so the reset finds no prelude to fuse and just succeeds.
+    c.reset_session().expect("reset succeeds — no stranded prelude exists to clear");
     // The next statement flushes only itself (no fused stale BEGIN) and works.
     assert_eq!(
         c.query_sql("SELECT 1::int").expect("q").get(0).expect("row 0").get_i32(0),

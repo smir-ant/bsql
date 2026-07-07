@@ -996,10 +996,12 @@ impl<S: Transport<Error = io::Error>> Core<S> {
 
     /// Arm a DEFERRED `BEGIN`: it is not sent now, but fused into the flush of the
     /// first command the transaction body issues (so `BEGIN` + that statement ride
-    /// ONE round trip instead of two). Used by each driver's `transaction`; the
-    /// engine drains the fused `BEGIN`'s reply before the statement's, and if the
-    /// body issues no command the following `COMMIT` / `ROLLBACK` flushes the still
-    /// -pending `BEGIN`. A field-set only, no I/O and no token.
+    /// ONE round trip instead of two). Called by each driver's transaction GUARD
+    /// from WITHIN its first verb — never out-of-band at `transaction()` entry — so
+    /// the `BEGIN` is armed and consumed inside that one verb's flush and a
+    /// transaction cancelled/panicked before any verb ran arms nothing. The engine
+    /// drains the fused `BEGIN`'s reply before the statement's. A field-set only, no
+    /// I/O and no token.
     #[inline]
     pub fn defer_begin(&mut self) {
         self.engine.defer_command_prelude("BEGIN");
@@ -1075,15 +1077,11 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         const RESET_WITH_ROLLBACK: &str =
             "ROLLBACK; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; \
              CLOSE ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
-        // Discard any fused prelude stranded by a transaction body that PANICKED
-        // before issuing a statement (its COMMIT/ROLLBACK never ran to consume the
-        // deferred BEGIN). Cleared BEFORE the reset's own simple query so the
-        // stranded BEGIN cannot fuse into — and error out — the RESET (a `DISCARD`
-        // inside a transaction block is a server error). Without this a stranded
-        // BEGIN would make the reset fail; the pool would still self-heal (evict +
-        // reconnect), but at the cost of a wasted connection and a failed round
-        // trip. A no-op in the normal path (no prelude is pending at checkout).
-        self.engine.clear_command_prelude();
+        // No stranded-prelude clear is needed here: the transaction guards arm the
+        // deferred BEGIN INSIDE the first verb (async: at that verb's poll; sync: at
+        // its call), so it is armed and consumed within one verb's flush and can
+        // never persist to a pool checkout. A cancelled or panicked transaction that
+        // ran no verb armed nothing, so there is no prelude to discard.
         let sql = if matches!(self.engine.tx_status(), Ok(TxStatus::Idle)) {
             RESET
         } else {

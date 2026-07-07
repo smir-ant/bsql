@@ -937,11 +937,11 @@ async fn transaction_commit_and_recoverable_rollback() {
 }
 
 /// The deferred-BEGIN FUSION correctness path, end-to-end over real PG on the
-/// async driver: an EMPTY transaction still opens+closes a real transaction, a
-/// transaction whose FIRST statement is the EXTENDED protocol (`query_params`,
-/// one-round-trip) fuses BEGIN into that statement and commits its effect, and a
-/// rollback of such a body discards it — proving the prelude drain preserves the
-/// statement's result schema over the fused path.
+/// async driver: an EMPTY transaction is a true no-op (it arms no BEGIN and issues
+/// no COMMIT), a transaction whose FIRST statement is the EXTENDED protocol
+/// (`query_params`, one-round-trip) fuses BEGIN into that statement and commits its
+/// effect, and a rollback of such a body discards it — proving the prelude drain
+/// preserves the statement's result schema over the fused path.
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn transaction_fusion_empty_and_extended() {
@@ -949,9 +949,10 @@ async fn transaction_fusion_empty_and_extended() {
     let mut c = Connection::connect(&config).await.expect("connect");
     c.execute_sql("CREATE TEMP TABLE txf_async(v int)").await.expect("create");
 
-    // (1) EMPTY body: BEGIN fuses into the terminating COMMIT (BEGIN;COMMIT).
-    c.transaction(async |_conn| Ok(())).await.expect("empty tx commits");
-    assert!(c.is_healthy(), "healthy after an empty fused transaction");
+    // (1) EMPTY body: a true no-op — no verb ran, so no BEGIN is armed and no
+    // COMMIT/ROLLBACK is issued (zero round trips), leaving the connection clean.
+    c.transaction(async |_conn| Ok(())).await.expect("empty tx is a clean no-op");
+    assert!(c.is_healthy(), "healthy after an empty (no-op) transaction");
     c.execute_sql("INSERT INTO txf_async VALUES (7)").await.expect("post-empty insert");
     assert_eq!(
         c.query_sql("SELECT count(*) FROM txf_async").await.expect("c").get(0).expect("row 0").get_i64(0),

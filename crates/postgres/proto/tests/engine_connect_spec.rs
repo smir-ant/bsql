@@ -34,8 +34,8 @@ use base64ct::{Base64, Encoding};
 use bsql_postgres_proto::engine::{poll_once, session, ConnFail, EngineError, Transport};
 use bsql_postgres_proto::scram::crypto::compute_client_proof;
 use bsql_postgres_proto::wire::{
-    TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_ERROR_RESPONSE, TAG_PARAMETER_STATUS,
-    TAG_READY_FOR_QUERY,
+    TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_ERROR_RESPONSE, TAG_NOTICE_RESPONSE,
+    TAG_PARAMETER_STATUS, TAG_READY_FOR_QUERY,
 };
 use bsql_postgres_proto::{Credentials, Ident, Password, Sensitive, TxStatus};
 
@@ -94,6 +94,20 @@ fn error_response(severity: &str, sqlstate: &str, message: &str) -> Vec<u8> {
     }
     body.push(0);
     frame(TAG_ERROR_RESPONSE.byte(), &body)
+}
+
+/// A `NoticeResponse` — a `\0`-terminated field list, byte-identical framing to
+/// [`error_response`] but with the `'N'` tag. The engine absorbs it without
+/// parsing the body, so only the tag + framing are load-bearing here.
+fn notice_response(severity: &str, sqlstate: &str, message: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (tag, text) in [(b'S', severity), (b'C', sqlstate), (b'M', message)] {
+        body.push(tag);
+        body.extend_from_slice(text.as_bytes());
+        body.push(0);
+    }
+    body.push(0);
+    frame(TAG_NOTICE_RESPONSE.byte(), &body)
 }
 
 // ─────────────────────────── static scripted server ───────────────────────────
@@ -167,6 +181,11 @@ struct ScramServer {
     client_first_bare: Vec<u8>,
     server_first: String,
     server_nonce: String,
+    /// When set, interleave a `NoticeResponse` into the SCRAM exchange — after
+    /// the `AuthenticationSASLContinue` (before the client's SASLResponse) and
+    /// between the server-final and `AuthenticationOk` — to prove the engine
+    /// absorbs a mid-SCRAM notice without corrupting its crypto state.
+    inject_notices: bool,
 }
 
 /// The server salt + iteration count (RFC-7677-legal).
@@ -187,7 +206,15 @@ impl ScramServer {
             client_first_bare: Vec::new(),
             server_first: String::new(),
             server_nonce: String::new(),
+            inject_notices: false,
         }
+    }
+
+    /// Interleave a `NoticeResponse` into the SCRAM exchange (see
+    /// [`inject_notices`](Self::inject_notices)).
+    fn with_interleaved_notices(mut self) -> Self {
+        self.inject_notices = true;
+        self
     }
 
     /// Compute the next server message once the current one is fully read.
@@ -208,7 +235,17 @@ impl ScramServer {
                 let salt_b64 = encode_b64(&SCRAM_SALT);
                 let server_first =
                     format!("r={server_nonce},s={salt_b64},i={SCRAM_ITERATIONS}");
-                self.out = auth(11, server_first.as_bytes());
+                // A NoticeResponse riding the AuthenticationSASLContinue, BEFORE
+                // the client's SASLResponse — the engine must absorb it without
+                // disturbing the ScramAwaiting* crypto state it just entered.
+                self.out = if self.inject_notices {
+                    concat(&[
+                        auth(11, server_first.as_bytes()),
+                        notice_response("NOTICE", "01000", "mid-SCRAM notice (continue)"),
+                    ])
+                } else {
+                    auth(11, server_first.as_bytes())
+                };
                 self.client_first_bare = bare.into_bytes();
                 self.server_first = server_first;
                 self.server_nonce = server_nonce;
@@ -228,12 +265,24 @@ impl ScramServer {
                 .expect("compute_client_proof on well-formed inputs");
                 let sig_b64 = encode_b64(proof.1.as_bytes());
                 let server_final = format!("v={sig_b64}");
-                self.out = concat(&[
-                    auth(12, server_final.as_bytes()),
-                    auth_ok(),
-                    backend_key(SCRAM_BACKEND_PID, 4242),
-                    ready_for_query(b'I'),
-                ]);
+                // A NoticeResponse BETWEEN the server-final and AuthenticationOk —
+                // absorbed while the engine awaits the final auth verdict.
+                self.out = if self.inject_notices {
+                    concat(&[
+                        auth(12, server_final.as_bytes()),
+                        notice_response("NOTICE", "01000", "mid-SCRAM notice (final)"),
+                        auth_ok(),
+                        backend_key(SCRAM_BACKEND_PID, 4242),
+                        ready_for_query(b'I'),
+                    ])
+                } else {
+                    concat(&[
+                        auth(12, server_final.as_bytes()),
+                        auth_ok(),
+                        backend_key(SCRAM_BACKEND_PID, 4242),
+                        ready_for_query(b'I'),
+                    ])
+                };
             }
             // The handshake is complete; nothing more to send.
             _ => self.out = Vec::new(),
@@ -463,6 +512,21 @@ fn md5_connect_reaches_active() {
 fn scram_connect_reaches_active() {
     let creds = Credentials::ScramPassword(scram_password("pencil"));
     let server = ScramServer::new("pencil");
+    assert_eq!(connect_active(server, creds), (SCRAM_BACKEND_PID, TxStatus::Idle));
+}
+
+/// A `NoticeResponse` interleaved into the SCRAM exchange — riding the
+/// `AuthenticationSASLContinue` (before the client SASLResponse) AND between the
+/// server-final and `AuthenticationOk` — is ABSORBED (PG protocol §55.2.7)
+/// WITHOUT corrupting the crypto state: the engine absorbs the notice ahead of
+/// the per-state dispatch (before it moves the `ScramAwaiting*` phase out), so
+/// the correct-password exchange still verifies the server signature and reaches
+/// active. A regression that let a mid-SCRAM notice touch the SASL state machine
+/// would fail the handshake here, not reach active.
+#[test]
+fn scram_connect_absorbs_interleaved_notices_and_reaches_active() {
+    let creds = Credentials::ScramPassword(scram_password("pencil"));
+    let server = ScramServer::new("pencil").with_interleaved_notices();
     assert_eq!(connect_active(server, creds), (SCRAM_BACKEND_PID, TxStatus::Idle));
 }
 

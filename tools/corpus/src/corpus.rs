@@ -644,6 +644,45 @@ pub fn seed() -> Vec<Transcript> {
         },
     });
 
+    // ── 15b. trust handshake ABSORBING NoticeResponses (login-trigger case) ──
+    // A NoticeResponse may arrive in ANY handshaking state (PG protocol §55.2.7);
+    // a PG17 `login` event trigger's RAISE NOTICE fires on every connection,
+    // interleaved through the post-auth batch AND (here) before AuthenticationOk.
+    // The engine ABSORBS each notice without advancing the state machine, so the
+    // handshake still reaches Ready — and, since the connect phase surfaces no
+    // notice sink, the notices are NOT observed (byte-for-byte the same startup
+    // wire + captured ParameterStatus as `startup_with_params`).
+    out.push(Transcript {
+        name: "startup_absorbs_notice",
+        setup: Setup::StartupScript {
+            server_bytes: frames::concat(&[
+                frames::notice_response("NOTICE", "00000", "notice before auth"),
+                frames::auth_ok(),
+                frames::notice_response("NOTICE", "01000", "login event trigger fired"),
+                frames::parameter_status("server_version", "17.2"),
+                frames::backend_key_data(1, 2),
+                frames::notice_response("NOTICE", "00000", "notice just before ready"),
+                frames::ready_for_query(frames::TX_IDLE),
+            ]),
+        },
+        steps: Vec::new(),
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ObservedRun {
+            client_bytes: vec![
+                0, 0, 0, 42, 0, 3, 0, 0, 117, 115, 101, 114, 0, 99, 111, 114, 112, 117, 115, 0,
+                99, 108, 105, 101, 110, 116, 95, 101, 110, 99, 111, 100, 105, 110, 103, 0, 85, 84,
+                70, 56, 0, 0,
+            ],
+            outcome: Ok(ObservedOk::default()),
+            notices: Vec::new(),
+            parameter_statuses: vec![("server_version".to_string(), "17.2".to_string())],
+            notifications: Vec::new(),
+            backend_pid: Some(1),
+            tx_status: ObservedTxStatus::Idle,
+            terminal: ObservedStatus::Ready,
+        },
+    });
+
     // ── 16. partial-frame assembly: chunked SELECT under OneBytePerRead ──
     out.push(Transcript {
         name: "partial_one_byte_per_read",
@@ -1394,8 +1433,10 @@ pub fn adversarial() -> Vec<Transcript> {
     });
 
     // (3) NoticeResponse during the authentication/connecting phase. PINNED:
-    // the connecting state rejects an unsolicited notice (it is NOT surfaced),
-    // so the handshake fails — the connection never becomes active.
+    // per PG protocol §55.2.7 an unsolicited notice may arrive in ANY handshaking
+    // state; the connecting engine ABSORBS it without advancing the state machine
+    // (never surfaced during connect), so the handshake still reaches Ready and
+    // the connection becomes active — a mid-handshake notice cannot tear it down.
     out.push(Transcript {
         name: "adversarial_notice_during_auth",
         setup: Setup::StartupScript {
@@ -1405,6 +1446,36 @@ pub fn adversarial() -> Vec<Transcript> {
                 frames::backend_key_data(1, 2),
                 frames::ready_for_query(frames::TX_IDLE),
             ]),
+        },
+        steps: Vec::new(),
+        chunk_schedule: ChunkSchedule::AllAtOnce,
+        expect: ObservedRun {
+            client_bytes: vec![
+                0, 0, 0, 42, 0, 3, 0, 0, 117, 115, 101, 114, 0, 99, 111, 114, 112, 117, 115, 0,
+                99, 108, 105, 101, 110, 116, 95, 101, 110, 99, 111, 100, 105, 110, 103, 0, 85, 84,
+                70, 56, 0, 0,
+            ],
+            outcome: Ok(ObservedOk::default()),
+            notices: Vec::new(),
+            parameter_statuses: Vec::new(),            notifications: Vec::new(),
+            backend_pid: Some(1),
+            tx_status: ObservedTxStatus::Idle,
+            terminal: ObservedStatus::Ready,
+        },
+    });
+
+    // (3b) NegotiateProtocolVersion before Authentication. PINNED: bsql requests
+    // exactly protocol 3.0 with NO `_pq_.` options, so a compliant server never
+    // sends 'v'; the engine classifies it (ConnFail::ProtocolNegotiationRejected)
+    // as a LOUD handshake failure rather than swallowing it — swallowing would
+    // mask a real negotiation rejection if bsql ever grows protocol options. This
+    // is the genuine HandshakeFailed observable (the corrected notice fixture
+    // above now reaches Ready, so a real connect failure is witnessed here).
+    out.push(Transcript {
+        name: "adversarial_negotiate_protocol_version",
+        setup: Setup::StartupScript {
+            // 'v' body: Int32(newest supported minor) + Int32(count of options).
+            server_bytes: frames::frame(b'v', &[0, 0, 0, 0, 0, 0, 0, 0]),
         },
         steps: Vec::new(),
         chunk_schedule: ChunkSchedule::AllAtOnce,

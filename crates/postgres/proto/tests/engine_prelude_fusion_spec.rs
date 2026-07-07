@@ -18,8 +18,8 @@
 //! 3. **The transaction is really open** — `tx_status` after the fused verb is
 //!    `InTransaction` (the `BEGIN`'s `ReadyForQuery` was consumed and recorded),
 //!    not `Idle`.
-//! 4. **An empty body still opens the transaction** — arming the prelude and then
-//!    running the terminating `COMMIT` fuses `BEGIN`+`COMMIT` into one flush.
+//! 4. **Fusion is opt-in** — without an armed prelude a statement flushes only
+//!    itself (the control), so a normal verb's single-flush wire is unchanged.
 //!
 //! The deterministic tests run always (a scripted `CountingServer`, no network);
 //! the `#[ignore]` `live_*` test proves the SAME single-write fusion against a real
@@ -283,49 +283,6 @@ fn deferred_begin_fuses_into_first_statement_one_flush() {
     .expect("session");
 }
 
-/// An EMPTY transaction body still opens the transaction: arming BEGIN and then
-/// running the terminating `COMMIT` fuses `BEGIN`+`COMMIT` into ONE flush (so no
-/// stale prelude survives, and the empty transaction is a real BEGIN;COMMIT).
-#[test]
-fn empty_body_fuses_begin_into_the_commit() {
-    let inbound = concat(&[
-        handshake(),
-        // BEGIN reply.
-        command_complete("BEGIN"),
-        rfq(b'T'),
-        // COMMIT reply (back to Idle).
-        command_complete("COMMIT"),
-        rfq(b'I'),
-    ]);
-
-    let (server, writes) = counting_server(inbound);
-    let user = Ident::try_from_str("bsql_fusion").expect("user");
-    session(server, &user, None, &[], Credentials::Trust, |mut engine, live| {
-        let live = poll_once(engine.connect(live))
-            .expect("single poll")
-            .expect("handshake");
-        writes.lock().expect("writes lock").clear();
-
-        engine.defer_command_prelude("BEGIN");
-        // No statement issued — the terminating COMMIT flushes the pending BEGIN.
-        drop(poll_once(engine.query(live, "COMMIT", |_s: Surface<'_>| ControlFlow::Continue(())))
-            .expect("single poll")
-            .expect("fused commit"));
-
-        let log = writes.lock().expect("writes lock");
-        assert_eq!(log.len(), 1, "BEGIN+COMMIT ride ONE flush");
-        assert_eq!(
-            &log[0],
-            &concat(&[simple_query_frame("BEGIN"), simple_query_frame("COMMIT")]),
-            "the empty-transaction flush is BEGIN then COMMIT"
-        );
-        drop(log);
-        // COMMIT's RFQ returned the session to Idle.
-        assert_eq!(engine.tx_status().expect("active"), TxStatus::Idle);
-    })
-    .expect("session");
-}
-
 /// Without arming a prelude, a statement flushes ONLY itself (the control: the
 /// fusion is opt-in, and a normal verb's single-flush wire is unchanged).
 #[test]
@@ -354,57 +311,6 @@ fn without_a_prelude_a_statement_flushes_only_itself() {
         assert_eq!(&log[0], &simple_query_frame("SELECT 1"), "just the statement");
         drop(log);
         assert_eq!(engine.tx_status().expect("active"), TxStatus::Idle);
-    })
-    .expect("session");
-}
-
-/// A stranded prelude (armed but never consumed — the fingerprint of a
-/// transaction body that PANICKED before its first statement) is DISCARDED by
-/// `clear_command_prelude`, so it cannot fuse into the next verb. Guards the pool
-/// checkout path: `reset_session` clears it, so a stranded `BEGIN` never corrupts
-/// the reset or the next user's first statement.
-#[test]
-fn clear_command_prelude_discards_a_stranded_prelude() {
-    let inbound = concat(&[
-        handshake(),
-        // Only the statement's own reply — NO BEGIN reply, because after the clear
-        // the statement flushes ONLY itself.
-        row_description_one("?column?", 23),
-        data_row_one(b"1"),
-        command_complete("SELECT 1"),
-        rfq(b'I'),
-    ]);
-
-    let (server, writes) = counting_server(inbound);
-    let user = Ident::try_from_str("bsql_fusion").expect("user");
-    session(server, &user, None, &[], Credentials::Trust, |mut engine, live| {
-        let live = poll_once(engine.connect(live))
-            .expect("single poll")
-            .expect("handshake");
-        writes.lock().expect("writes lock").clear();
-
-        // Arm a prelude (as a transaction would), then DISCARD it (as the pool's
-        // reset_session does when a panicked body stranded it).
-        engine.defer_command_prelude("BEGIN");
-        engine.clear_command_prelude();
-
-        // The next verb flushes ONLY itself — the stranded BEGIN did not fuse.
-        drop(poll_once(engine.query(live, "SELECT 1", |_s: Surface<'_>| ControlFlow::Continue(())))
-            .expect("single poll")
-            .expect("query"));
-        let log = writes.lock().expect("writes lock");
-        assert_eq!(log.len(), 1, "one flush");
-        assert_eq!(
-            &log[0],
-            &simple_query_frame("SELECT 1"),
-            "the stranded BEGIN was discarded — only the statement flushed"
-        );
-        drop(log);
-        assert_eq!(
-            engine.tx_status().expect("active"),
-            TxStatus::Idle,
-            "no transaction was opened (the stranded BEGIN never ran)"
-        );
     })
     .expect("session");
 }

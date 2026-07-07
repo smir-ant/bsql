@@ -628,13 +628,6 @@ impl ActiveEngine {
         self.pending_prelude.take()
     }
 
-    /// Discard any pending fused prelude without consuming it — the pool's
-    /// `reset_session` clears a prelude a panicked transaction body stranded.
-    #[inline]
-    pub fn clear_pending_prelude(&mut self) {
-        self.pending_prelude = None;
-    }
-
     /// Arm the prelude DRAIN: the next inbound frames drain the prelude's
     /// simple-query response (swallowed) before the seated command's, then the
     /// seated [`ActiveState`] takes over. Paired with the verb enqueuing the
