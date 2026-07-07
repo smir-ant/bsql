@@ -96,22 +96,73 @@ const _: () = {
     }
 };
 
-// Tier-1 static assertion: the flagship typed query future stays `Send` so it
-// remains spawnable — the property the pool relies on. This holds in BOTH
-// builds: as a plain `async fn` (default), and as the `n1-detect` reshape
-// `fn -> impl Future + '_`, whose bare RPIT return type LEAKS the concrete
-// future's auto-traits (a boxed `dyn Future` would not). The reshape thus adds
-// no explicit `Send` bound and constrains no caller; `Send` is preserved exactly
-// as the `async fn` had it (given `Send` params). Type-checked, never run.
+// Tier-1 static assertions: EVERY typed verb future — on the bare connection AND
+// on the transaction guard — plus the `transaction` combinator stay `Send`, so
+// each remains spawnable (the property the pool relies on). Previously only
+// `query` was pinned; the `Send`-ness of `query_one` / `query_opt` /
+// `query_each` / `execute` (and every guard verb) was an incidental property
+// leaked from `Core` — a tier-4 "happens to be Send". Pinning all of them
+// converts a silent, downstream-only `tokio::spawn` break into a compile error
+// in bsql's OWN build.
+//
+// Each holds in BOTH builds: the plain `async fn` (default), and the `n1-detect`
+// reshape `fn -> impl Future + '_`, whose bare RPIT return type LEAKS the
+// concrete future's auto-traits (a boxed `dyn Future` would not) — so the reshape
+// adds no `Send` bound and constrains no caller. Type-checked, never run.
 const _: () = {
-    fn _assert_query_future_send<Q: bsql_postgres_proto::TypedQuery>(
+    fn _is_send<T: Send>(_: &T) {}
+
+    // The five leaf typed verbs on the bare `Connection`. Each future borrows
+    // `conn` only for its own statement, then drops at the `;`, so the sequential
+    // `&mut` borrows never overlap. Distinct `p_*` params because each verb takes
+    // `Q::Params` / `P` by value.
+    fn _conn_verbs<Q, P, R>(
         conn: &mut Connection,
-        params: Q::Params,
+        q: &'static bsql_postgres_proto::PreparedQuery<P, R>,
+        p_query: Q::Params,
+        p_one: Q::Params,
+        p_opt: Q::Params,
+        p_each: Q::Params,
+        p_exec: P,
     ) where
+        Q: bsql_postgres_proto::TypedQuery,
         Q::Params: Send,
+        P: ParamsWriter + Send + 'static,
+        R: bsql_postgres_proto::RowDecode + 'static,
     {
-        fn _is_send<T: Send>(_: &T) {}
-        let fut = conn.query::<Q>(params);
-        _is_send(&fut);
+        _is_send(&conn.query::<Q>(p_query));
+        _is_send(&conn.query_one::<Q>(p_one));
+        _is_send(&conn.query_opt::<Q>(p_opt));
+        _is_send(&conn.query_each::<Q, _, ()>(p_each, |_row| core::ops::ControlFlow::Continue(())));
+        _is_send(&conn.execute::<P, R>(q, p_exec));
+    }
+
+    // The same five typed verbs on the transaction guard.
+    fn _tx_verbs<Q, P, R>(
+        tx: &mut Transaction<'_>,
+        q: &'static bsql_postgres_proto::PreparedQuery<P, R>,
+        p_query: Q::Params,
+        p_one: Q::Params,
+        p_opt: Q::Params,
+        p_each: Q::Params,
+        p_exec: P,
+    ) where
+        Q: bsql_postgres_proto::TypedQuery,
+        Q::Params: Send,
+        P: ParamsWriter + Send + 'static,
+        R: bsql_postgres_proto::RowDecode + 'static,
+    {
+        _is_send(&tx.query::<Q>(p_query));
+        _is_send(&tx.query_one::<Q>(p_one));
+        _is_send(&tx.query_opt::<Q>(p_opt));
+        _is_send(&tx.query_each::<Q, _, ()>(p_each, |_row| core::ops::ControlFlow::Continue(())));
+        _is_send(&tx.execute::<P, R>(q, p_exec));
+    }
+
+    // The `transaction` combinator itself, given a trivial `Send` body: proves
+    // its deferred-BEGIN + guard + terminating COMMIT/ROLLBACK hold nothing
+    // `!Send` across an await.
+    fn _transaction_combinator(conn: &mut Connection) {
+        _is_send(&conn.transaction(async |_tx: &mut Transaction<'_>| Ok::<(), DriverError>(())));
     }
 };
