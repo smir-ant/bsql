@@ -92,7 +92,7 @@ pub use dynamics::{
 };
 pub use infer::{
     infer_query, scalar_rust_type_for_pg, ElemType, InferError, InferredColumn, QueryShape,
-    RustType,
+    RustType, UserEnumId,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
@@ -105,8 +105,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use sqlparser::ast::{
-    AlterColumnOperation, AlterTableOperation, ColumnDef, ColumnOption, Expr, Ident, IndexColumn,
-    ObjectName, ObjectType, RenameTableNameKind, Statement, TableConstraint,
+    AlterColumnOperation, AlterTableOperation, AlterType, AlterTypeAddValue,
+    AlterTypeAddValuePosition, AlterTypeOperation, AlterTypeRename, AlterTypeRenameValue, ColumnDef,
+    ColumnOption, CreateDomain, DropDomain, Expr, Ident, IndexColumn, ObjectName, ObjectType,
+    RenameTableNameKind, Statement, TableConstraint, UserDefinedTypeRepresentation,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -130,6 +132,19 @@ pub const BRIDGES_FILE_NAME: &str = "bsql_type_bridges.txt";
 /// which case `query!` decodes into the dep-free native types.
 pub const BRIDGES_ENV_VAR: &str = "BSQL_TYPE_BRIDGES";
 
+/// The basename of the user-defined-types file written into `OUT_DIR` alongside
+/// the catalog. Carries every `CREATE TYPE ... AS ENUM` (and, later, `DOMAIN` /
+/// composite) declared in the migrations, so the query proc-macro can generate
+/// a Rust type per user type and decode the columns that use them.
+pub const USER_TYPES_FILE_NAME: &str = "bsql_user_types.txt";
+
+/// The environment variable, set via `cargo:rustc-env`, that carries the
+/// absolute path of the generated user-defined-types file to the query
+/// proc-macro. Always emitted by every catalog-writing path (its file is empty
+/// when the migrations declare no user types), so the macro reads a definite
+/// channel rather than inferring absence from a missing variable.
+pub const USER_TYPES_ENV_VAR: &str = "BSQL_USER_TYPES";
+
 /// A column's replayed shape: its canonical PostgreSQL type name and
 /// whether the schema marks it `NOT NULL`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +154,41 @@ pub struct ColumnInfo {
     /// `true` when the column is `NOT NULL` (explicitly, or via a
     /// `PRIMARY KEY` constraint, which implies `NOT NULL` in PostgreSQL).
     pub not_null: bool,
+}
+
+/// A user-defined PostgreSQL type declared by a migration `CREATE TYPE` /
+/// `CREATE DOMAIN`. The query proc-macro turns each into a generated Rust type
+/// (an `enum` for [`UserType::Enum`]) and decodes the columns that use it.
+///
+/// The type's OID is DELIBERATELY absent: a user type's OID is server-assigned
+/// and dynamic (not in the fixed catalog set), so it cannot be pinned at build
+/// time. The build-time guarantee is over the type's NAME and its variant/base
+/// SET (exactly what the migration declares) — the wire form of every modeled
+/// user type is self-describing enough to decode without the OID (a PG enum is
+/// sent as its label text; a domain is transparent over its base), so no
+/// dynamic OID is needed on the decode path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserType {
+    /// `CREATE TYPE name AS ENUM ('a', 'b', ...)` — an ordered set of string
+    /// labels. Order is the declaration order (PostgreSQL's enum sort order);
+    /// the generated Rust `enum` mirrors it. On the wire a PG enum value is its
+    /// label text, so decode is a label-string match and encode is the label
+    /// text as an `unknown`-typed (OID 0) bind parameter the server coerces.
+    Enum {
+        /// The labels in declaration order (PostgreSQL enum ordinal order).
+        labels: Vec<String>,
+    },
+    /// `CREATE DOMAIN name AS base [CHECK (...)]` — a constrained alias for a
+    /// base type. A domain is TRANSPARENT on the wire: it sends and receives
+    /// exactly its base type's bytes (the `CHECK` is SERVER-enforced, never a
+    /// client concern), so a `query!` column typed as a domain decodes as its
+    /// base's Rust type (`age AS int` -> `i32`). `base` is the canonical base
+    /// type name; it may itself name another domain (a domain over a domain, or
+    /// a domain over a user enum), resolved transitively at the query site.
+    Domain {
+        /// The canonical base type name the domain aliases.
+        base: String,
+    },
 }
 
 /// The replayed schema: tables in insertion-stable order, each mapping
@@ -159,6 +209,13 @@ pub struct Catalog {
     /// (membership is all the coverage check needs) and keeps the serialized
     /// form byte-deterministic.
     pub primary_keys: BTreeMap<String, BTreeSet<String>>,
+    /// User-defined types declared by `CREATE TYPE` / `CREATE DOMAIN`
+    /// migrations, keyed by the canonical (case-folded) type name — the same
+    /// spelling a column's `pg_type` carries when it references the type. The
+    /// query proc-macro reads this to generate a Rust type per entry and to
+    /// resolve a column typed as one. `BTreeMap` keeps the serialized form
+    /// byte-deterministic.
+    pub user_types: BTreeMap<String, UserType>,
 }
 
 /// A build-time failure. Every variant is fatal: the consumer's
@@ -417,6 +474,14 @@ fn write_catalog(catalog: &Catalog) -> Result<(), BuildError> {
         "cargo:rustc-env={CATALOG_ENV_VAR}={}",
         catalog_path.display()
     );
+
+    // The user-defined types ride their OWN channel alongside the catalog
+    // (the catalog line format is pinned at five fields; the user-types file
+    // is a distinct file + rustc-env var, exactly like the bridge channel).
+    // Emitting it from THIS single catalog-writing path means every emit entry
+    // point — the free functions and the builder — always emits it, so the
+    // macro's two channels can never fall out of sync.
+    write_user_types(catalog)?;
     Ok(())
 }
 
@@ -501,6 +566,35 @@ pub struct CatalogBuilder {
 }
 
 impl Catalog {
+    /// The [`UserEnumId`] handle for the user enum named `name`, or `None` when
+    /// no user type of that name is an enum. `name` is the canonical
+    /// (case-folded) type name a column's `pg_type` carries. The id is the
+    /// type's index in the sorted `user_types` map; it round-trips through
+    /// [`Catalog::user_enum`] against this same catalog.
+    #[must_use]
+    pub fn user_enum_id(&self, name: &str) -> Option<UserEnumId> {
+        let position = self
+            .user_types
+            .iter()
+            .position(|(key, ty)| key == name && matches!(ty, UserType::Enum { .. }))?;
+        u32::try_from(position).ok().map(UserEnumId)
+    }
+
+    /// Resolve a [`UserEnumId`] back to the enum's canonical name and ordered
+    /// label set, or `None` when the id does not name an enum in this catalog
+    /// (an out-of-range index, or a non-enum entry at that position). The
+    /// inverse of [`Catalog::user_enum_id`] over this same catalog.
+    #[must_use]
+    pub fn user_enum(&self, id: UserEnumId) -> Option<(&str, &[String])> {
+        let index = usize::try_from(id.0).ok()?;
+        let (name, ty) = self.user_types.iter().nth(index)?;
+        match ty {
+            UserType::Enum { labels } => Some((name.as_str(), labels.as_slice())),
+            // A domain is not an enum — a `UserEnumId` never names one.
+            UserType::Domain { .. } => None,
+        }
+    }
+
     /// Begin a [`CatalogBuilder`] by replaying a consumer's `migrations/`
     /// directory into a [`Catalog`], the same way [`emit_catalog`] does.
     ///
@@ -931,6 +1025,259 @@ pub fn parse_bridges(text: &str) -> Result<Vec<BridgeSpec>, BridgeParseError> {
         });
     }
     Ok(specs)
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// User-defined types channel (`CREATE TYPE ... AS ENUM`): the migration-
+// declared enum set, serialized to `OUT_DIR/bsql_user_types.txt` and read
+// back by the query proc-macro so it can generate one Rust type per user
+// type. A SEPARATE channel from the schema catalog (whose line format is
+// pinned at exactly five fields) — mirroring the external-type bridge
+// channel — so the catalog format and its goldens stay byte-identical.
+// ════════════════════════════════════════════════════════════════════════
+
+/// Escape one user-type field (a type name or an enum label) for the
+/// tab-delimited, line-oriented user-types channel. An enum label is a
+/// PostgreSQL string literal and may contain ANY byte except NUL — INCLUDING a
+/// tab or newline, which are the channel's field and record delimiters — so the
+/// four bytes that would otherwise be ambiguous (`\`, tab, newline, carriage
+/// return) are backslash-escaped. Every label round-trips exactly through
+/// [`unescape_user_field`], so no label is ever rejected or silently corrupted
+/// (universal, not a fail-loud rejection of an unusual-but-legal label).
+fn escape_user_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Inverse of [`escape_user_field`]: decode one escaped field back to its
+/// literal bytes. Total — an unrecognized or dangling escape is a loud
+/// [`UserTypesParseError::BadEscape`] (the channel is machine-generated, so a
+/// bad escape means the build-script channel is corrupt), never a silent drop.
+fn unescape_user_field(s: &str, line: usize) -> Result<String, UserTypesParseError> {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            other => {
+                return Err(UserTypesParseError::BadEscape {
+                    line,
+                    sequence: match other {
+                        Some(c) => format!("\\{c}"),
+                        None => "\\".to_string(),
+                    },
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Serialize the user-defined types to the line-oriented text the query
+/// proc-macro reads back via [`parse_user_types`]. One line per type; the
+/// leading field is a one-letter kind tag. For an enum:
+///
+/// ```text
+/// E<TAB><name>[<TAB><label>]...
+/// ```
+///
+/// Name and labels are [`escape_user_field`]-escaped so a tab/newline in a
+/// label cannot break the framing. `BTreeMap` iteration keeps the output
+/// byte-deterministic across builds. An enum with zero labels (PostgreSQL
+/// permits `AS ENUM ()`) serializes as just `E<TAB><name>`.
+fn serialize_user_types(user_types: &BTreeMap<String, UserType>) -> String {
+    let mut out = String::new();
+    for (name, ty) in user_types {
+        match ty {
+            UserType::Enum { labels } => {
+                out.push('E');
+                out.push('\t');
+                out.push_str(&escape_user_field(name));
+                for label in labels {
+                    out.push('\t');
+                    out.push_str(&escape_user_field(label));
+                }
+                out.push('\n');
+            }
+            UserType::Domain { base } => {
+                // `D<TAB><name><TAB><base>` — a domain aliases exactly one base.
+                out.push('D');
+                out.push('\t');
+                out.push_str(&escape_user_field(name));
+                out.push('\t');
+                out.push_str(&escape_user_field(base));
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// A failure parsing the line-oriented user-types file back into the
+/// [`UserType`] map. The file is machine-generated by the emit path, so any
+/// malformed line means the build-script channel is corrupt — a loud error,
+/// never a silently dropped type (which would reopen a user-typed column as an
+/// unsupported/undecodable type the consumer chose to model).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserTypesParseError {
+    /// A line's leading kind tag is not a known kind (`E` for enum).
+    UnknownKind {
+        /// The 1-based line number.
+        line: usize,
+        /// The offending kind tag.
+        kind: String,
+    },
+    /// A line carried a kind tag but no type-name field.
+    MissingName {
+        /// The 1-based line number.
+        line: usize,
+    },
+    /// A `D` (domain) line did not have exactly a name and a base field.
+    MalformedDomain {
+        /// The 1-based line number.
+        line: usize,
+        /// How many fields followed the kind tag (expected exactly 2).
+        fields: usize,
+    },
+    /// A field held an unrecognized or dangling backslash escape.
+    BadEscape {
+        /// The 1-based line number.
+        line: usize,
+        /// The offending escape sequence (e.g. `\x` or a trailing `\`).
+        sequence: String,
+    },
+}
+
+impl fmt::Display for UserTypesParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UserTypesParseError::UnknownKind { line, kind } => write!(
+                f,
+                "user-types file line {line} has an unknown kind tag `{kind}` \
+                 (expected `E` for an enum). The file is machine-generated; a \
+                 malformed line means the build-script channel is corrupt."
+            ),
+            UserTypesParseError::MissingName { line } => write!(
+                f,
+                "user-types file line {line} has a kind tag but no type-name \
+                 field. The file is machine-generated; a malformed line means \
+                 the build-script channel is corrupt."
+            ),
+            UserTypesParseError::MalformedDomain { line, fields } => write!(
+                f,
+                "user-types file line {line} is a domain (`D`) with {fields} \
+                 field(s) after the kind, expected exactly 2 (name, base). The \
+                 file is machine-generated; a malformed line means the \
+                 build-script channel is corrupt."
+            ),
+            UserTypesParseError::BadEscape { line, sequence } => write!(
+                f,
+                "user-types file line {line} has an invalid escape sequence \
+                 `{sequence}`. The file is machine-generated; a malformed field \
+                 means the build-script channel is corrupt."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UserTypesParseError {}
+
+/// Parse the line-oriented user-types text [`serialize_user_types`] produced
+/// back into the [`UserType`] map (the inverse of the emit path). Each
+/// non-empty line is a kind tag then tab-separated escaped fields; a blank
+/// final line (from a trailing newline) is skipped. Every other line MUST be
+/// well-formed, or a loud [`UserTypesParseError`].
+///
+/// # Errors
+///
+/// [`UserTypesParseError`] for an unknown kind tag, a kind tag without a name,
+/// or a field with an invalid backslash escape.
+pub fn parse_user_types(text: &str) -> Result<BTreeMap<String, UserType>, UserTypesParseError> {
+    let mut types = BTreeMap::new();
+    for (idx, line) in text.lines().enumerate() {
+        // A trailing newline yields one empty final line; it is the only
+        // skippable form. Line numbers are 1-based in diagnostics.
+        if line.is_empty() {
+            continue;
+        }
+        let number = idx.saturating_add(1);
+        let fields: Vec<&str> = line.split('\t').collect();
+        // `split` always yields at least one field; `split_first` binds the
+        // kind tag without an indexing operation.
+        let (kind, rest) = match fields.split_first() {
+            Some((k, r)) => (*k, r),
+            None => continue,
+        };
+        match kind {
+            "E" => {
+                let (name_field, label_fields) = match rest.split_first() {
+                    Some((n, l)) => (*n, l),
+                    None => return Err(UserTypesParseError::MissingName { line: number }),
+                };
+                let name = unescape_user_field(name_field, number)?;
+                let mut labels = Vec::with_capacity(label_fields.len());
+                for label in label_fields {
+                    labels.push(unescape_user_field(label, number)?);
+                }
+                types.insert(name, UserType::Enum { labels });
+            }
+            "D" => {
+                let [name_field, base_field] = match rest {
+                    [name_field, base_field] => [*name_field, *base_field],
+                    other => {
+                        return Err(UserTypesParseError::MalformedDomain {
+                            line: number,
+                            fields: other.len(),
+                        });
+                    }
+                };
+                let name = unescape_user_field(name_field, number)?;
+                let base = unescape_user_field(base_field, number)?;
+                types.insert(name, UserType::Domain { base });
+            }
+            other => {
+                return Err(UserTypesParseError::UnknownKind {
+                    line: number,
+                    kind: other.to_string(),
+                });
+            }
+        }
+    }
+    Ok(types)
+}
+
+/// Serialize the catalog's user types to `OUT_DIR/bsql_user_types.txt` and set
+/// the `BSQL_USER_TYPES` rustc-env channel. Called from the one catalog-writing
+/// path ([`write_catalog`]) so every emit path (the free functions AND the
+/// builder) always emits it — the file is empty when the migrations declare no
+/// user types, so the channel is always definite (the macro never has to infer
+/// absence from a missing variable).
+fn write_user_types(catalog: &Catalog) -> Result<(), BuildError> {
+    let out_dir = env_path("OUT_DIR")?;
+    let path = out_dir.join(USER_TYPES_FILE_NAME);
+    let serialized = serialize_user_types(&catalog.user_types);
+    std::fs::write(&path, serialized).map_err(|source| BuildError::WriteCatalog {
+        path: path.clone(),
+        source,
+    })?;
+    println!("cargo:rustc-env={USER_TYPES_ENV_VAR}={}", path.display());
+    Ok(())
 }
 
 /// Build the [`Catalog`] from a directory of migration `*.sql` files,
@@ -1455,13 +1802,259 @@ fn replay_statement(
             }
             Ok(())
         }
+        // `CREATE TYPE name AS ENUM ('a', 'b', ...)` — a user-defined enum.
+        // Record its ordered label set so the query proc-macro can generate a
+        // Rust `enum` and decode the columns that reference it. The name is
+        // folded with the SAME rule a column's type name is (`object_name_leaf`
+        // -> `fold_ident`), so a column typed `m mood` (canonicalised to
+        // `mood`) resolves to this entry. The labels are string literals and
+        // are CASE-SENSITIVE in PostgreSQL (unlike identifiers), so their exact
+        // `value` is kept verbatim — never case-folded. A `CREATE TYPE` with a
+        // non-enum representation (a composite `AS (...)`, a `RANGE`, or an SQL
+        // definition) is not yet modeled; it passes through here unrecorded, so
+        // a column using it stays a loud `UnsupportedPgType` at the query site
+        // (fail-closed, never a silently-wrong catalog).
+        Statement::CreateType {
+            name,
+            representation: Some(UserDefinedTypeRepresentation::Enum { labels }),
+        } => {
+            let type_name = object_name_leaf(&name);
+            let labels: Vec<String> = labels.into_iter().map(|label| label.value).collect();
+            catalog
+                .user_types
+                .insert(type_name, UserType::Enum { labels });
+            Ok(())
+        }
+        // `ALTER TYPE name {ADD VALUE | RENAME VALUE | RENAME TO}` — evolve a
+        // user enum. This MUST reach the catalog: a silent skip would leave the
+        // label set out of sync with the migration FILES, defeating the
+        // compile-time-drift guarantee (a later `ADD VALUE` the generated enum
+        // silently lacked; a `RENAME VALUE` the generated variant mapped to a
+        // label the live server rejects). `DROP TYPE` already mutates the
+        // catalog; `ALTER TYPE` is its evolving peer.
+        Statement::AlterType(AlterType { name, operation }) => {
+            replay_alter_type(catalog, path, &name, operation)
+        }
+        // `CREATE DOMAIN name AS base [CHECK (...)]` — a constrained alias for a
+        // base type. Record its canonical base so a column typed as the domain
+        // resolves TRANSPARENTLY to the base's Rust type. The `CHECK` is
+        // server-enforced and carries no client-side shape, so it is not
+        // modeled (a domain's wire form IS its base's). The base is
+        // canonicalised with the SAME rule a column type is, so `age AS INTEGER`
+        // records base `int4`; a base that is itself a user type (another domain
+        // or an enum) is followed transitively at the query site.
+        Statement::CreateDomain(CreateDomain {
+            name, data_type, ..
+        }) => {
+            let type_name = object_name_leaf(&name);
+            let base = canonical_type(&data_type);
+            catalog
+                .user_types
+                .insert(type_name, UserType::Domain { base });
+            Ok(())
+        }
+        // `DROP TYPE name [, ...]` removes a user-defined type from the catalog
+        // so a later same-named `CREATE TYPE` does not inherit stale labels and
+        // a column referencing the dropped type resolves as unsupported (loud),
+        // exactly as `DROP TABLE` re-keys tables. A `DROP TYPE` is not
+        // data-destructive in the base-table sense (it removes a type
+        // definition, and the server refuses it while any column still uses the
+        // type), so it needs no destructive acknowledgement.
+        Statement::Drop {
+            object_type: ObjectType::Type,
+            names,
+            ..
+        } => {
+            for name in &names {
+                catalog.user_types.remove(&object_name_leaf(name));
+            }
+            Ok(())
+        }
+        // `DROP DOMAIN name` is a DISTINCT statement in the grammar (not a
+        // `DROP ... object_type = Domain`), so it removes the domain the same
+        // way `DROP TYPE` removes an enum — keeping a later same-named type from
+        // inheriting a stale base, and a column of the dropped domain resolving
+        // as unsupported (loud).
+        Statement::DropDomain(DropDomain { name, .. }) => {
+            catalog.user_types.remove(&object_name_leaf(&name));
+            Ok(())
+        }
         // Statements without base-table column-shape meaning (CREATE
         // INDEX, seed INSERTs, CREATE/ALTER VIEW, COMMENT, GRANT, CREATE
-        // SCHEMA/SEQUENCE/TYPE, SET, etc.) carry no change to a tracked
+        // SCHEMA/SEQUENCE, SET, etc.) carry no change to a tracked
         // table's columns, so passing them through is correct — not a
         // silent skip of schema information this catalog models.
         _ => Ok(()),
     }
+}
+
+/// Replay an `ALTER TYPE name ...` into the catalog. A `RENAME TO` re-keys ANY
+/// modeled user type; `ADD VALUE` / `RENAME VALUE` mutate a modeled ENUM's label
+/// set in place (preserving DECLARED ORDER, which the generated enum's derived
+/// `Ord` mirrors). An `ALTER TYPE` on a name the catalog does not model is a
+/// no-op (it is not one of our enums/domains); `ADD VALUE` / `RENAME VALUE` on a
+/// modeled DOMAIN is a loud error (PostgreSQL rejects it — those ops are
+/// enum-only), never a silent skip.
+fn replay_alter_type(
+    catalog: &mut Catalog,
+    path: &Path,
+    name: &ObjectName,
+    operation: AlterTypeOperation,
+) -> Result<(), BuildError> {
+    let type_name = object_name_leaf(name);
+    match operation {
+        // `ALTER TYPE old RENAME TO new` — re-key the modeled type under its new
+        // name (an enum OR a domain). A column referencing the OLD name stops
+        // resolving; the NEW name resolves. A name we do not model is a no-op.
+        AlterTypeOperation::Rename(AlterTypeRename { new_name }) => {
+            if let Some(ty) = catalog.user_types.remove(&type_name) {
+                catalog.user_types.insert(fold_ident(&new_name), ty);
+            }
+            Ok(())
+        }
+        // `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'v' [BEFORE|AFTER 'n']`.
+        AlterTypeOperation::AddValue(add) => {
+            alter_type_add_value(catalog, path, &type_name, add)
+        }
+        // `ALTER TYPE name RENAME VALUE 'from' TO 'to'`.
+        AlterTypeOperation::RenameValue(AlterTypeRenameValue { from, to }) => {
+            alter_type_rename_value(catalog, path, &type_name, &from.value, to.value)
+        }
+    }
+}
+
+/// Apply `ALTER TYPE name ADD VALUE` to a modeled enum's label set, honoring the
+/// optional `BEFORE`/`AFTER` position so DECLARED ORDER (PostgreSQL's enum sort
+/// order, which the generated enum's derived `Ord` mirrors) stays correct.
+fn alter_type_add_value(
+    catalog: &mut Catalog,
+    path: &Path,
+    type_name: &str,
+    add: AlterTypeAddValue,
+) -> Result<(), BuildError> {
+    let AlterTypeAddValue {
+        if_not_exists,
+        value,
+        position,
+    } = add;
+    let labels = match catalog.user_types.get_mut(type_name) {
+        Some(UserType::Enum { labels }) => labels,
+        // `ADD VALUE` on a domain is invalid in PostgreSQL — a loud error, never
+        // a silent skip of a migration the live server would reject.
+        Some(UserType::Domain { .. }) => {
+            return Err(BuildError::Replay {
+                path: path.to_path_buf(),
+                message: format!(
+                    "`ALTER TYPE {type_name} ADD VALUE` targets a DOMAIN; ADD VALUE \
+                     is only valid on an enum type."
+                ),
+            });
+        }
+        // Not a modeled type — nothing to evolve (a native/unmodeled type).
+        None => return Ok(()),
+    };
+    let new_label = value.value;
+    if labels.iter().any(|existing| existing == &new_label) {
+        // Duplicate. `IF NOT EXISTS` makes it a no-op; otherwise PostgreSQL
+        // errors, so the migration is loud here too (never a silent skip).
+        return if if_not_exists {
+            Ok(())
+        } else {
+            Err(BuildError::Replay {
+                path: path.to_path_buf(),
+                message: format!(
+                    "`ALTER TYPE {type_name} ADD VALUE '{new_label}'`: the label \
+                     already exists (use `IF NOT EXISTS` for an idempotent add)."
+                ),
+            })
+        };
+    }
+    // The insertion index, honoring BEFORE/AFTER. A neighbor that does not exist
+    // is a loud error (PostgreSQL rejects it), never a silent append.
+    let insert_at = match position {
+        None => labels.len(),
+        Some(AlterTypeAddValuePosition::Before(neighbor)) => {
+            alter_type_neighbor_index(labels, &neighbor.value, path, type_name, "BEFORE")?
+        }
+        Some(AlterTypeAddValuePosition::After(neighbor)) => {
+            alter_type_neighbor_index(labels, &neighbor.value, path, type_name, "AFTER")?
+                .saturating_add(1)
+        }
+    };
+    labels.insert(insert_at, new_label);
+    Ok(())
+}
+
+/// The index of a `BEFORE`/`AFTER` neighbor label in an enum's label set, or a
+/// loud [`BuildError::Replay`] when the neighbor does not exist (PostgreSQL
+/// rejects an `ADD VALUE ... BEFORE/AFTER` naming an absent value).
+fn alter_type_neighbor_index(
+    labels: &[String],
+    neighbor: &str,
+    path: &Path,
+    type_name: &str,
+    keyword: &str,
+) -> Result<usize, BuildError> {
+    labels
+        .iter()
+        .position(|existing| existing == neighbor)
+        .ok_or_else(|| BuildError::Replay {
+            path: path.to_path_buf(),
+            message: format!(
+                "`ALTER TYPE {type_name} ADD VALUE ... {keyword} '{neighbor}'`: the \
+                 neighbor label `{neighbor}` does not exist in the enum."
+            ),
+        })
+}
+
+/// Apply `ALTER TYPE name RENAME VALUE 'from' TO 'to'` to a modeled enum:
+/// relabel IN PLACE at the same index (so declared order is preserved). A
+/// missing `from`, a colliding `to`, or a non-enum target is a loud error.
+fn alter_type_rename_value(
+    catalog: &mut Catalog,
+    path: &Path,
+    type_name: &str,
+    from: &str,
+    to: String,
+) -> Result<(), BuildError> {
+    let labels = match catalog.user_types.get_mut(type_name) {
+        Some(UserType::Enum { labels }) => labels,
+        Some(UserType::Domain { .. }) => {
+            return Err(BuildError::Replay {
+                path: path.to_path_buf(),
+                message: format!(
+                    "`ALTER TYPE {type_name} RENAME VALUE` targets a DOMAIN; RENAME \
+                     VALUE is only valid on an enum type."
+                ),
+            });
+        }
+        None => return Ok(()),
+    };
+    // The target must not collide with a DIFFERENT existing label (a no-op
+    // rename to itself is allowed). PostgreSQL rejects a colliding rename.
+    if to != from && labels.iter().any(|existing| existing == &to) {
+        return Err(BuildError::Replay {
+            path: path.to_path_buf(),
+            message: format!(
+                "`ALTER TYPE {type_name} RENAME VALUE '{from}' TO '{to}'`: the \
+                 target label `{to}` already exists."
+            ),
+        });
+    }
+    let index = labels
+        .iter()
+        .position(|existing| existing == from)
+        .ok_or_else(|| BuildError::Replay {
+            path: path.to_path_buf(),
+            message: format!(
+                "`ALTER TYPE {type_name} RENAME VALUE '{from}' TO ...`: the source \
+                 label `{from}` does not exist in the enum."
+            ),
+        })?;
+    if let Some(slot) = labels.get_mut(index) {
+        *slot = to;
+    }
+    Ok(())
 }
 
 /// Replay a `CREATE TABLE`. Only the explicit-column-list form is
@@ -2386,6 +2979,248 @@ mod tests {
     fn drop_table_removes_it() {
         let cat = catalog_from(&["CREATE TABLE t (a INT)", acked("DROP TABLE t").as_str()]);
         assert!(!cat.tables.contains_key("t"));
+    }
+
+    // ── User-defined ENUM types ────────────────────────────────────────
+
+    #[test]
+    fn create_type_enum_records_ordered_labels() {
+        let cat = catalog_from(&["CREATE TYPE mood AS ENUM ('happy', 'sad', 'ok')"]);
+        match cat.user_types.get("mood") {
+            Some(UserType::Enum { labels }) => {
+                assert_eq!(labels, &["happy", "sad", "ok"], "labels in declared order");
+            }
+            other => panic!("expected a mood enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enum_labels_are_case_sensitive() {
+        // Enum LABELS are string literals — case-sensitive, unlike identifiers.
+        let cat = catalog_from(&["CREATE TYPE status AS ENUM ('Active', 'INACTIVE')"]);
+        match cat.user_types.get("status") {
+            Some(UserType::Enum { labels }) => {
+                assert_eq!(labels, &["Active", "INACTIVE"], "exact label case kept");
+            }
+            other => panic!("expected a status enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_type_removes_it() {
+        let cat = catalog_from(&[
+            "CREATE TYPE mood AS ENUM ('happy')",
+            "DROP TYPE mood",
+        ]);
+        assert!(!cat.user_types.contains_key("mood"), "dropped type is gone");
+    }
+
+    // ── ALTER TYPE (enum evolution must reach the catalog) ─────────────
+
+    fn enum_labels<'a>(cat: &'a Catalog, name: &str) -> &'a [String] {
+        match cat.user_types.get(name) {
+            Some(UserType::Enum { labels }) => labels.as_slice(),
+            other => panic!("expected an enum `{name}`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alter_type_add_value_appends_and_positions_preserve_declared_order() {
+        // Declared order is PostgreSQL's enum sort order (the generated `Ord`
+        // mirrors it), so ADD VALUE must honor BEFORE/AFTER and append.
+        let cat = catalog_from(&[
+            "CREATE TYPE priority AS ENUM ('low', 'high')",
+            "ALTER TYPE priority ADD VALUE 'medium' AFTER 'low'", // [low, medium, high]
+            "ALTER TYPE priority ADD VALUE 'urgent'",             // append -> [.., urgent]
+            "ALTER TYPE priority ADD VALUE 'lowest' BEFORE 'low'", // [lowest, low, ..]
+        ]);
+        assert_eq!(
+            enum_labels(&cat, "priority"),
+            &["lowest", "low", "medium", "high", "urgent"]
+        );
+    }
+
+    #[test]
+    fn alter_type_rename_value_relabels_in_place() {
+        let cat = catalog_from(&[
+            "CREATE TYPE mood AS ENUM ('happy', 'sad', 'ok')",
+            "ALTER TYPE mood RENAME VALUE 'sad' TO 'unhappy'", // same index
+        ]);
+        assert_eq!(enum_labels(&cat, "mood"), &["happy", "unhappy", "ok"]);
+    }
+
+    #[test]
+    fn alter_type_rename_to_rekeys_the_type() {
+        let cat = catalog_from(&[
+            "CREATE TYPE tshirt AS ENUM ('s', 'm', 'l')",
+            "ALTER TYPE tshirt RENAME TO garment_size",
+        ]);
+        assert!(!cat.user_types.contains_key("tshirt"), "old name gone");
+        assert_eq!(enum_labels(&cat, "garment_size"), &["s", "m", "l"]);
+    }
+
+    #[test]
+    fn alter_type_add_value_if_not_exists_is_idempotent() {
+        let cat = catalog_from(&[
+            "CREATE TYPE t AS ENUM ('a', 'b')",
+            "ALTER TYPE t ADD VALUE IF NOT EXISTS 'a'",
+        ]);
+        assert_eq!(enum_labels(&cat, "t"), &["a", "b"]);
+    }
+
+    #[test]
+    fn alter_type_add_duplicate_without_if_not_exists_is_loud() {
+        let msg = replay_err(&[
+            "CREATE TYPE t AS ENUM ('a', 'b')",
+            "ALTER TYPE t ADD VALUE 'a'",
+        ]);
+        assert!(msg.contains("already exists"), "got: {msg}");
+    }
+
+    #[test]
+    fn alter_type_add_value_unknown_neighbor_is_loud() {
+        let msg = replay_err(&[
+            "CREATE TYPE t AS ENUM ('a')",
+            "ALTER TYPE t ADD VALUE 'b' AFTER 'nonexistent'",
+        ]);
+        assert!(msg.contains("neighbor"), "got: {msg}");
+    }
+
+    #[test]
+    fn alter_type_rename_value_unknown_source_is_loud() {
+        let msg = replay_err(&[
+            "CREATE TYPE t AS ENUM ('a')",
+            "ALTER TYPE t RENAME VALUE 'nope' TO 'b'",
+        ]);
+        assert!(msg.contains("does not exist"), "got: {msg}");
+    }
+
+    #[test]
+    fn alter_type_add_value_on_a_domain_is_loud() {
+        let msg = replay_err(&[
+            "CREATE DOMAIN d AS int",
+            "ALTER TYPE d ADD VALUE 'x'",
+        ]);
+        assert!(msg.contains("DOMAIN"), "got: {msg}");
+    }
+
+    #[test]
+    fn alter_type_on_an_unmodeled_name_is_a_noop() {
+        // An ALTER TYPE naming a type the catalog does not model (e.g. a
+        // composite, unrecorded) is a no-op, not a crash or a loud error.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int)",
+            "ALTER TYPE nonexistent ADD VALUE 'x'",
+        ]);
+        assert!(!cat.user_types.contains_key("nonexistent"));
+    }
+
+    #[test]
+    fn column_of_enum_type_resolves_to_a_user_enum_id() {
+        // A column declared with the enum's name resolves through the same
+        // canonical folding, so its `pg_type` matches the `user_types` key.
+        let cat = catalog_from(&[
+            "CREATE TYPE mood AS ENUM ('happy', 'sad')",
+            "CREATE TABLE feelings (id INT, m mood)",
+        ]);
+        assert_eq!(cat.tables["feelings"]["m"].pg_type, "mood");
+        let id = cat.user_enum_id("mood").expect("mood resolves to an id");
+        let (name, labels) = cat.user_enum(id).expect("id round-trips");
+        assert_eq!(name, "mood");
+        assert_eq!(labels, &["happy", "sad"]);
+    }
+
+    #[test]
+    fn user_enum_id_is_none_for_a_non_enum_name() {
+        let cat = catalog_from(&["CREATE TYPE mood AS ENUM ('happy')"]);
+        assert!(cat.user_enum_id("nonexistent").is_none());
+        assert!(cat.user_enum_id("int4").is_none(), "a native type is not a user enum");
+    }
+
+    #[test]
+    fn user_types_channel_round_trips() {
+        let cat = catalog_from(&[
+            "CREATE TYPE mood AS ENUM ('happy', 'sad')",
+            "CREATE TYPE priority AS ENUM ('lo', 'hi')",
+        ]);
+        let text = serialize_user_types(&cat.user_types);
+        let parsed = parse_user_types(&text).expect("round-trip parses");
+        assert_eq!(parsed, cat.user_types);
+    }
+
+    #[test]
+    fn user_types_channel_escapes_tabs_and_newlines_in_labels() {
+        // An enum label is a string literal and may contain the channel's own
+        // delimiters; escaping keeps them round-tripping (universal, not a
+        // fail-loud rejection). A label built directly (sqlparser would accept
+        // the equivalent quoted literal).
+        let mut user_types = BTreeMap::new();
+        user_types.insert(
+            "weird".to_string(),
+            UserType::Enum {
+                labels: vec!["a\tb".to_string(), "c\nd".to_string(), "e\\f".to_string()],
+            },
+        );
+        let text = serialize_user_types(&user_types);
+        let parsed = parse_user_types(&text).expect("escaped labels round-trip");
+        assert_eq!(parsed, user_types);
+    }
+
+    #[test]
+    fn empty_user_types_serialize_to_empty_and_parse_back() {
+        let empty: BTreeMap<String, UserType> = BTreeMap::new();
+        assert_eq!(serialize_user_types(&empty), "");
+        assert_eq!(parse_user_types("").expect("empty parses"), empty);
+    }
+
+    #[test]
+    fn user_types_parse_rejects_unknown_kind() {
+        let err = parse_user_types("X\tmood\thappy").expect_err("unknown kind is loud");
+        assert!(matches!(err, UserTypesParseError::UnknownKind { .. }));
+    }
+
+    // ── User-defined DOMAIN types ──────────────────────────────────────
+
+    #[test]
+    fn create_domain_records_canonical_base() {
+        // The base canonicalises with the same rule a column type does:
+        // `INTEGER` -> `int4`, `VARCHAR(50)` -> `varchar`.
+        let cat = catalog_from(&[
+            "CREATE DOMAIN age AS INTEGER CHECK (VALUE >= 0)",
+            "CREATE DOMAIN username AS VARCHAR(50)",
+        ]);
+        match cat.user_types.get("age") {
+            Some(UserType::Domain { base }) => assert_eq!(base, "int4"),
+            other => panic!("expected an age domain, got {other:?}"),
+        }
+        match cat.user_types.get("username") {
+            Some(UserType::Domain { base }) => assert_eq!(base, "varchar"),
+            other => panic!("expected a username domain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_type_removes_a_domain() {
+        let cat = catalog_from(&["CREATE DOMAIN age AS int", "DROP DOMAIN age"]);
+        assert!(!cat.user_types.contains_key("age"));
+    }
+
+    #[test]
+    fn domain_and_enum_channel_round_trip_together() {
+        let cat = catalog_from(&[
+            "CREATE TYPE mood AS ENUM ('happy', 'sad')",
+            "CREATE DOMAIN age AS int",
+            "CREATE DOMAIN email AS text",
+        ]);
+        let text = serialize_user_types(&cat.user_types);
+        let parsed = parse_user_types(&text).expect("round-trip");
+        assert_eq!(parsed, cat.user_types);
+    }
+
+    #[test]
+    fn domain_parse_rejects_wrong_field_count() {
+        let err = parse_user_types("D\tage").expect_err("a domain needs name + base");
+        assert!(matches!(err, UserTypesParseError::MalformedDomain { fields: 1, .. }));
     }
 
     // ── PRIMARY KEY tracking ───────────────────────────────────────────

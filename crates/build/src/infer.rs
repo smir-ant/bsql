@@ -94,7 +94,9 @@ use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
-use crate::{canonical_type, fold_ident, object_name_leaf, schema_part_folds_to_public, Catalog};
+use crate::{
+    canonical_type, fold_ident, object_name_leaf, schema_part_folds_to_public, Catalog, UserType,
+};
 
 /// The element type of a one-dimensional array column (`T[]`) — exactly the
 /// scalar [`RustType`] set. A `RustType` cannot nest (it is a flat `Copy`
@@ -196,12 +198,36 @@ impl ElemType {
     }
 }
 
+/// A `Copy` handle to a user-defined enum in the [`Catalog`] — the 0-based
+/// index of the type in the catalog's sorted `user_types` map.
+///
+/// A user enum's Rust identity is its NAME (a dynamic `String`), which cannot
+/// ride inside a `Copy` [`RustType`]. Carrying the index instead keeps
+/// `RustType` `Copy` (the type flows by value through every inference step) at
+/// the cost of one resolution step at codegen: [`Catalog::user_enum`] maps the
+/// id back to the enum's name + labels. The mapping cannot drift — the same
+/// `Catalog` value is used to type the query AND to resolve the id (the macro
+/// builds one catalog and passes it to `infer_dynamic_query` in the same call),
+/// so the index is as stable as a pointer into that one map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserEnumId(pub u32);
+
 /// A Rust type the runtime can decode. This is the **v1 supported set** —
 /// every catalog `pg_type` an inferred column may carry maps to exactly
 /// one of these, and any catalog type outside the set is a loud
 /// [`InferError::UnsupportedPgType`] (fail-closed: never silently mapped).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RustType {
+    /// A user-defined PostgreSQL `enum` declared by a `CREATE TYPE ... AS ENUM`
+    /// migration, carried as a [`UserEnumId`] handle into the catalog's
+    /// `user_types`. The query proc-macro turns it into a generated Rust `enum`
+    /// (decoding the enum's label text on the wire), resolving the id to the
+    /// enum's name and labels via [`Catalog::user_enum`]. Unlike the native
+    /// variants, its wire OID is server-assigned/dynamic — so it is NOT pinned
+    /// by the compile-time OID validator; the decode is label-text based (a PG
+    /// enum is sent as its label), and an unknown label is a classified runtime
+    /// error.
+    UserEnum(UserEnumId),
     /// PostgreSQL `int2` / `smallint`.
     I16,
     /// PostgreSQL `int4` / `integer`.
@@ -259,6 +285,13 @@ impl RustType {
     #[must_use]
     pub fn rust_name(self) -> &'static str {
         match self {
+            // A user enum's Rust spelling is its generated PascalCase name,
+            // which is dynamic and cannot be a `&'static str`. `rust_name` is a
+            // DIAGNOSTICS helper (codegen resolves the real name via
+            // `Catalog::user_enum`), so a placeholder is returned here; a
+            // diagnostic that must name the concrete enum resolves it through
+            // the catalog instead.
+            RustType::UserEnum(_) => "user-defined enum",
             RustType::I16 => "i16",
             RustType::I32 => "i32",
             RustType::I64 => "i64",
@@ -309,6 +342,45 @@ fn rust_type_for_pg(pg_type: &str) -> Option<RustType> {
         return scalar_elem_for_pg(element).map(RustType::Array);
     }
     scalar_elem_for_pg(pg_type).map(ElemType::as_scalar)
+}
+
+/// The bound on a domain-alias chain a `pg_type` may traverse before resolving
+/// to a native type or an enum. PostgreSQL forbids cyclic domains, but the
+/// build catalog is fail-open on type NAMES (an unknown base passes through), so
+/// it cannot prove acyclicity; the bound makes a pathological / cyclic chain a
+/// loud [`InferError::UnsupportedPgType`] rather than an unbounded loop. Well
+/// above any realistic domain nesting.
+const MAX_USER_TYPE_DEPTH: usize = 32;
+
+/// Resolve a catalog column's canonical `pg_type` to a [`RustType`], consulting
+/// BOTH the fixed native set ([`rust_type_for_pg`]) AND the catalog's
+/// user-defined types. A native type maps as before; a `CREATE TYPE ... AS
+/// ENUM` resolves to `RustType::UserEnum(id)`; a `CREATE DOMAIN` resolves
+/// TRANSPARENTLY to its base's `RustType` (following a domain-over-domain /
+/// domain-over-enum chain up to [`MAX_USER_TYPE_DEPTH`]); anything else is
+/// `None`, which every caller turns into a loud [`InferError::UnsupportedPgType`]
+/// (fail-closed — a name that is neither native nor a modeled user type is never
+/// silently mapped). This is the single choke point that teaches every
+/// column/param resolver about user types, so the rule lives once.
+fn resolve_pg_type(catalog: &Catalog, pg_type: &str) -> Option<RustType> {
+    let mut name = pg_type;
+    for _ in 0..MAX_USER_TYPE_DEPTH {
+        if let Some(ty) = rust_type_for_pg(name) {
+            return Some(ty);
+        }
+        match catalog.user_types.get(name) {
+            // An enum resolves to its generated Rust type.
+            Some(UserType::Enum { .. }) => {
+                return catalog.user_enum_id(name).map(RustType::UserEnum);
+            }
+            // A domain is transparent: follow its base (which may itself be a
+            // domain, a native type, or an enum).
+            Some(UserType::Domain { base }) => name = base,
+            None => return None,
+        }
+    }
+    // Depth exceeded — a cyclic / pathologically deep domain chain. Fail-closed.
+    None
 }
 
 /// The scalar [`RustType`] a canonical PostgreSQL type name resolves to, or
@@ -2152,7 +2224,7 @@ impl ScopeRelation {
                     .tables
                     .get(&self.table_key)
                     .and_then(|cols| cols.get(column))?;
-                let resolved = match rust_type_for_pg(&info.pg_type) {
+                let resolved = match resolve_pg_type(catalog, &info.pg_type) {
                     Some(ty) => Ok((ty, !info.not_null || self.outer_nullable)),
                     None => Err(InferError::UnsupportedPgType {
                         pg_type: info.pg_type.clone(),
@@ -10021,7 +10093,12 @@ fn common_type(a: RustType, b: RustType) -> Option<RustType> {
         // array-vs-scalar or two distinct-element arrays are a loud
         // cast-required — matching PostgreSQL, which has no implicit array
         // element-type widening on a set-op / join merge.
-        | RustType::Array(_) => None,
+        | RustType::Array(_)
+        // A user enum has no widening ladder: two sides merge ONLY when they
+        // are the SAME enum (the `a == b` early return above handles that,
+        // yielding that enum); two DISTINCT enums, or an enum with any other
+        // type, have no common type and are a loud cast-required error.
+        | RustType::UserEnum(_) => None,
     };
     match (rank(a), rank(b)) {
         (Some(ra), Some(rb)) => {
@@ -14673,9 +14750,11 @@ fn insert_column_type(
             })
         }
     };
-    let ty = rust_type_for_pg(&info.pg_type).ok_or_else(|| InferError::UnsupportedPgType {
-        pg_type: info.pg_type.clone(),
-        context: format!("INSERT column `{table_key}.{column_name}`"),
+    let ty = resolve_pg_type(catalog, &info.pg_type).ok_or_else(|| {
+        InferError::UnsupportedPgType {
+            pg_type: info.pg_type.clone(),
+            context: format!("INSERT column `{table_key}.{column_name}`"),
+        }
     })?;
     Ok(Some(ty))
 }
@@ -16326,6 +16405,172 @@ mod tests {
             ty,
             nullable,
         }
+    }
+
+    // ── User-defined ENUM inference ────────────────────────────────────
+
+    const ENUM_DDL: &[&str] = &[
+        "CREATE TYPE mood AS ENUM ('happy', 'sad')",
+        "CREATE TABLE feelings (id INT PRIMARY KEY, m mood NOT NULL, note mood)",
+    ];
+
+    #[test]
+    fn select_enum_column_projects_as_user_enum() {
+        let shape = shape(ENUM_DDL, "SELECT m, note FROM feelings").expect("infer ok");
+        // The single enum sits at index 0 of the sorted user_types map.
+        let id = UserEnumId(0);
+        assert_eq!(shape.columns[0], col("m", RustType::UserEnum(id), false));
+        assert_eq!(shape.columns[1], col("note", RustType::UserEnum(id), true));
+    }
+
+    #[test]
+    fn where_eq_enum_column_types_the_param_as_the_enum() {
+        let shape = shape(ENUM_DDL, "SELECT id FROM feelings WHERE m = $1").expect("infer ok");
+        assert_eq!(shape.params, vec![RustType::UserEnum(UserEnumId(0))]);
+    }
+
+    #[test]
+    fn insert_into_enum_column_types_the_param_as_the_enum() {
+        let shape = shape(
+            ENUM_DDL,
+            "INSERT INTO feelings (id, m) VALUES ($1, $2) RETURNING id",
+        )
+        .expect("infer ok");
+        assert_eq!(
+            shape.params,
+            vec![RustType::I32, RustType::UserEnum(UserEnumId(0))]
+        );
+    }
+
+    #[test]
+    fn returning_enum_column_projects_as_user_enum() {
+        let shape = shape(
+            ENUM_DDL,
+            "INSERT INTO feelings (id, m) VALUES ($1, $2) RETURNING m",
+        )
+        .expect("infer ok");
+        assert_eq!(
+            shape.columns,
+            vec![col("m", RustType::UserEnum(UserEnumId(0)), false)]
+        );
+    }
+
+    #[test]
+    fn column_of_unknown_type_name_stays_loud() {
+        // A type name that is neither native nor a modeled user type stays a
+        // loud UnsupportedPgType — the user-type path is fail-closed.
+        let err = shape(
+            &["CREATE TABLE t (c notatype)"],
+            "SELECT c FROM t",
+        )
+        .expect_err("unknown type is loud");
+        assert!(matches!(err, InferError::UnsupportedPgType { .. }));
+    }
+
+    // ── User-defined DOMAIN inference (transparent over the base) ───────
+
+    #[test]
+    fn domain_column_resolves_to_its_base_type() {
+        // A `CREATE DOMAIN age AS int` column types EXACTLY as its base (`i32`)
+        // — the CHECK is server-enforced, invisible to the Rust type.
+        let shape = shape(
+            &[
+                "CREATE DOMAIN age AS int CHECK (VALUE >= 0)",
+                "CREATE DOMAIN handle AS text",
+                "CREATE TABLE people (id int PRIMARY KEY, a age NOT NULL, h handle)",
+            ],
+            "SELECT a, h FROM people",
+        )
+        .expect("infer ok");
+        assert_eq!(shape.columns[0], col("a", RustType::I32, false));
+        assert_eq!(shape.columns[1], col("h", RustType::Text, true));
+    }
+
+    #[test]
+    fn domain_param_types_as_the_base() {
+        // A param compared to a domain column types as the base's Rust type.
+        let shape = shape(
+            &[
+                "CREATE DOMAIN age AS int",
+                "CREATE TABLE people (id int PRIMARY KEY, a age NOT NULL)",
+            ],
+            "SELECT id FROM people WHERE a = $1",
+        )
+        .expect("infer ok");
+        assert_eq!(shape.params, vec![RustType::I32]);
+    }
+
+    #[test]
+    fn domain_over_domain_follows_the_chain() {
+        let shape = shape(
+            &[
+                "CREATE DOMAIN age AS int",
+                "CREATE DOMAIN adult_age AS age CHECK (VALUE >= 18)",
+                "CREATE TABLE t (a adult_age NOT NULL)",
+            ],
+            "SELECT a FROM t",
+        )
+        .expect("infer ok");
+        assert_eq!(shape.columns[0], col("a", RustType::I32, false));
+    }
+
+    #[test]
+    fn alter_type_rename_to_makes_the_new_name_resolve() {
+        // A type RENAMEd by a later migration resolves under its NEW name; the
+        // OLD name no longer resolves (loud) — the catalog matches the FILES.
+        let ddl = &[
+            "CREATE TYPE tshirt AS ENUM ('s', 'm', 'l')",
+            "ALTER TYPE tshirt RENAME TO garment_size",
+            "CREATE TABLE t (size garment_size NOT NULL)",
+        ];
+        let shape = shape(ddl, "SELECT size FROM t").expect("infer ok");
+        assert!(
+            matches!(shape.columns[0].ty, RustType::UserEnum(_)),
+            "the renamed enum resolves under its new name, got {:?}",
+            shape.columns[0].ty
+        );
+    }
+
+    #[test]
+    fn composite_type_column_is_fail_closed_loud() {
+        // A `CREATE TYPE addr AS (...)` composite is not yet modeled (it needs a
+        // new row-type binary decode path). Until then it is FAIL-CLOSED: the
+        // composite is passed through unrecorded, so a column typed as it is a
+        // LOUD `UnsupportedPgType` at the query site — never a silently-wrong
+        // decode or a panic. This test LOCKS that boundary (a future composite
+        // slice must keep decode correct, never silent).
+        let err = shape(
+            &[
+                "CREATE TYPE addr AS (street text, zip int4)",
+                "CREATE TABLE places (id int PRIMARY KEY, a addr)",
+            ],
+            "SELECT a FROM places",
+        )
+        .expect_err("a composite column is loud until modeled");
+        assert!(
+            matches!(err, InferError::UnsupportedPgType { ref pg_type, .. } if pg_type == "addr"),
+            "expected a loud UnsupportedPgType for the composite, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn domain_over_enum_resolves_to_the_enum() {
+        // A domain whose base is a user enum resolves transitively to the enum
+        // — the column decodes into the generated Rust enum.
+        let shape = shape(
+            &[
+                "CREATE TYPE mood AS ENUM ('happy', 'sad')",
+                "CREATE DOMAIN feeling AS mood",
+                "CREATE TABLE t (f feeling NOT NULL)",
+            ],
+            "SELECT f FROM t",
+        )
+        .expect("infer ok");
+        assert!(
+            matches!(shape.columns[0].ty, RustType::UserEnum(_)),
+            "a domain over an enum resolves to the enum, got {:?}",
+            shape.columns[0].ty
+        );
     }
 
     const USERS: &str =

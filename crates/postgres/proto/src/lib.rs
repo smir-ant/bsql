@@ -207,7 +207,7 @@ pub use action::TxStatus;
 pub use bounded::{BoundedLen, BoundedU8, BoundedU16};
 pub use decode::{
     BinaryFmt, Cell, ColumnDesc, ColumnsIter, CopyFormat, CopyHeader, DataRowRef, DecodeError,
-    Fmt, FormatCode, MAX_ROW_COLUMNS,
+    EnumLabel, Fmt, FormatCode, MAX_ROW_COLUMNS, PgEnum,
     RowDesc, RowDescColumnsIter, TextFmt, decode_with_format, oids,
     parse_long_uint_swar, parse_pg_bool_swar, parse_short_uint_swar, validate_utf8_swar,
 };

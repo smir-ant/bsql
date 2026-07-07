@@ -452,4 +452,60 @@ mod tests {
             16,
         );
     }
+
+    /// A minimal `PgEnum` for testing the `EnumLabel` bind path in isolation
+    /// (the generated impls are exercised by the fixture; this pins the proto
+    /// contract: OID 0 + raw label bytes + NULL sentinel for a `None`).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum TestMood {
+        Happy,
+        Sad,
+    }
+
+    impl crate::decode::PgEnum for TestMood {
+        fn wire_label(self) -> &'static str {
+            match self {
+                TestMood::Happy => "happy",
+                TestMood::Sad => "sad",
+            }
+        }
+        fn from_wire_label(label: &str) -> Result<Self, crate::decode::DecodeError> {
+            match label {
+                "happy" => Ok(TestMood::Happy),
+                "sad" => Ok(TestMood::Sad),
+                _ => Err(crate::decode::DecodeError::UnknownEnumLabel),
+            }
+        }
+    }
+
+    #[test]
+    fn enum_label_param_is_unspecified_oid_and_raw_label_bytes() {
+        use crate::decode::{EnumLabel, PgEnum as _};
+        // A user enum binds as OID 0 (UNSPECIFIED): the server infers the enum
+        // type from context — a `text` (25) OID would be rejected.
+        assert_eq!(<EnumLabel<TestMood> as ParamEncoder>::OID, 0);
+        assert_eq!(<(EnumLabel<TestMood>,) as ParamsWriter>::OIDS, &[0]);
+        assert!(
+            <(EnumLabel<TestMood>,) as ParamsWriter>::FORMATS
+                .iter()
+                .all(|f| matches!(f, FormatCode::Binary)),
+        );
+
+        // The wire form is the i32 length prefix + the raw label bytes.
+        let mut buf = WriteBuf::new();
+        assert!((TestMood::Sad.as_label(),).write_params(&mut buf).is_ok());
+        assert_eq!(buf.as_bytes(), &[0, 0, 0, 3, b's', b'a', b'd']);
+    }
+
+    #[test]
+    fn nullable_enum_label_param_writes_sql_null_for_none() {
+        use crate::decode::EnumLabel;
+        // A `None` nullable enum param is the SQL NULL sentinel (length -1),
+        // keeping the inner enum's OID.
+        assert_eq!(<Option<EnumLabel<TestMood>> as ParamEncoder>::OID, 0);
+        let mut buf = WriteBuf::new();
+        let none: Option<EnumLabel<TestMood>> = None;
+        assert!((none,).write_params(&mut buf).is_ok());
+        assert_eq!(buf.as_bytes(), &[255, 255, 255, 255]);
+    }
 }

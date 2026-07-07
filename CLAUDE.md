@@ -130,6 +130,59 @@ value; the row OID list and the const validator ride the native pivot, so the
 compile-time OID-drift guarantee (E0080) is untouched.
 `tools/query_bridge_fixture` is the end-to-end proof.
 
+**User-defined types generated from the migration DDL — `bsql::user_types!()`
+(feature `macros`).** A consumer who declares a PostgreSQL type in a migration
+gets a generated Rust type for it with ZERO derives and no hand-maintained type
+name — a capability no other library offers, because only bsql parses the
+migration set at build time. A `CREATE TYPE mood AS ENUM ('happy', 'sad')`
+migration, plus `bsql::user_types!()` invoked ONCE (in a module in scope at the
+`query!` call sites), generates `pub enum Mood { Happy, Sad }` (variants in
+declared order — PostgreSQL's enum sort order, so the derived `Ord` matches the
+server). A `query!` selecting a `mood` column decodes into `Mood`; a variant
+renamed or deleted in a later migration regenerates the type and any code that
+named the old variant stops compiling — DRIFT IS A BUILD ERROR. Enum EVOLUTION
+reaches the catalog too: `ALTER TYPE … ADD VALUE [BEFORE|AFTER]` /
+`RENAME VALUE … TO …` / `RENAME TO …` are FULLY replayed (label-set mutation in
+place, preserving declared order — which the derived `Ord` mirrors — and a type
+re-key), so the generated enum always matches the migration FILES; a silent skip
+of an `ALTER TYPE` would leave the enum missing an added label (a runtime
+`UnknownEnumLabel`) or mapping a variant to a label the live server rejects, so
+it is never a no-op. On the wire a PG
+enum is its LABEL TEXT (`enum_send`/`recv`), so decode rides the `text` pivot
+(positional, no runtime OID check — as for every column) plus a label→variant
+reshape (`PgEnum::from_wire_label`); an unknown label (a value ALTERed into the
+live enum out-of-band, absent from the migration) is a classified
+`DecodeError::UnknownEnumLabel`, never a panic. An enum PARAMETER binds through
+`EnumLabel<E>` (from `Mood::Happy.as_label()`) as an `unspecified`-typed (OID 0)
+label the server infers from context — a PG enum has NO implicit `text` cast, so
+a `text` (25) parameter is rejected; the phantom `E` makes `EnumLabel<Mood>` ≠
+`EnumLabel<Status>`, so a query expecting one enum rejects another's label at
+compile time. A `CREATE DOMAIN age AS int CHECK (VALUE >= 0)` is TRANSPARENT: a
+domain column types EXACTLY as its base (`age` -> `i32`, following a
+domain-over-domain / domain-over-enum chain), and the `CHECK` is SERVER-enforced
+(a violation is a classified server error, never a client check) — so a domain
+emits no generated type. **Guarantee boundary (honest):** the compile-time layer
+pins the type NAME + variant SET from the migration catalog; there is NO
+compile-time OID pin (a user type's OID is server-assigned/dynamic) and —
+deliberately — NO connect-time OID resolution (PG's unknown-parameter inference
++ positional label decode make it unnecessary), so a live-DB label the migration
+did not declare surfaces as a LOUD classified error, never silent corruption.
+This is exactly the existing "catalog matches migration FILES" boundary, and the
+runtime label check is strictly STRONGER than a native column's (which has no
+runtime OID check at all). The user types ride their own build channel
+(`BSQL_USER_TYPES`), so the schema catalog format and its goldens are untouched;
+`RustType::UserEnum(UserEnumId)` carries a `Copy` index into the catalog. Composite
+types (`CREATE TYPE addr AS (...)`) are a STAGED follow-up (their wire form is the
+PG row-type binary format, a new decode path with no native pivot); a composite
+column is a loud `UnsupportedPgType` until then, never silently wrong. The
+`0014_moods.sql` / `0015_domains.sql` / `0016_alter_type_evolve.sql` migrations in
+`tools/query_fixture` and its `query_enum_live` / `query_domain_live` /
+`query_alter_type_live` / `query_enum_offline` tests are the end-to-end proof
+(decode both twins + nullable + actual NULL; a param round-trip; an unknown label
+classified; a renamed-variant compile-error golden; the domain base decode +
+server-enforced CHECK; and ADD VALUE / RENAME VALUE / RENAME TO evolution
+round-tripping the added / renamed labels).
+
 **Schema-per-test isolation — `#[bsql::test]` (feature `test-harness`).** A
 consumer adds `bsql` with `features = ["test-harness"]` and writes a test taking
 a single connection — `async` over the async driver, or a plain `fn` over the

@@ -1,0 +1,8 @@
+error[E0599]: no variant, associated function, or constant named `Ecstatic` found for enum `Mood` in the current scope
+  --> tests/compile_fail/query_enum_unknown_variant.rs:12:19
+   |
+ 9 | bsql::user_types!();
+   | ------------------- variant, associated function, or constant `Ecstatic` not found for this enum
+...
+12 |     let _ = Mood::Ecstatic;
+   |                   ^^^^^^^^ variant, associated function, or constant not found in `Mood`

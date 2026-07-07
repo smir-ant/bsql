@@ -177,6 +177,14 @@ pub mod testkit {
 #[cfg(feature = "macros")]
 pub use bsql_query_macros::query;
 
+/// Generate a Rust type for every user-defined PostgreSQL type in the
+/// consumer's migrations — `enum Mood { Happy, Sad }` from
+/// `CREATE TYPE mood AS ENUM ('happy', 'sad')`, with zero derives and no
+/// hand-maintained type name. Invoke once, in a module in scope at your
+/// `query!` call sites. See [`macro@user_types`] for the full contract.
+#[cfg(feature = "macros")]
+pub use bsql_query_macros::user_types;
+
 /// The typed-query execution bridge, the const-checked prepared-query
 /// artifact, its build-time fingerprint, and the classified decode error —
 /// the user-facing types a `query!`-generated carrier is built from. A
@@ -186,6 +194,17 @@ pub use bsql_query_macros::query;
 pub use bsql_postgres_proto::{
     DecodeError, ParamsWriter, PreparedQuery, QueryFingerprint, TypedQuery,
 };
+
+/// The runtime contract of a Rust `enum` generated from a `CREATE TYPE ... AS
+/// ENUM` migration by [`user_types!`], and the enum bind-parameter wrapper.
+///
+/// A consumer rarely names these directly — [`user_types!`] emits the
+/// `impl PgEnum` and inherent `as_label` / `label` methods, and `query!`
+/// decodes/binds enum columns through them — but [`PgEnum`] is a real public
+/// contract (be generic over generated enums), and [`EnumLabel`] is the type an
+/// enum's `as_label()` returns to bind it as a `query!` parameter.
+#[cfg(feature = "macros")]
+pub use bsql_postgres_proto::{EnumLabel, PgEnum};
 
 /// Dependency-free bsql-native types a `query!` record field carries for a
 /// PostgreSQL `uuid` / `timestamptz` / `timestamp` / `date` / `time` /
@@ -233,9 +252,9 @@ pub use bsql_postgres_core::RowsBuilder;
 pub mod __rt {
     pub use bsql_postgres_proto::wire_pin;
     pub use bsql_postgres_proto::{
-        BinaryFmt, Cell, ColCellAt, DataRowRef, Date, DecodeError, Interval, Json, Jsonb, Numeric,
-        PreparedQuery, QueryFingerprint, Time, Timestamp, Timestamptz, TypedQuery, Uuid, oids,
-        prepared, query_budget,
+        BinaryFmt, Cell, ColCellAt, DataRowRef, Date, DecodeError, EnumLabel, Interval, Json, Jsonb,
+        Numeric, PgEnum, PreparedQuery, QueryFingerprint, Time, Timestamp, Timestamptz, TypedQuery,
+        Uuid, oids, prepared, query_budget,
     };
 }
 

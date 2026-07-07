@@ -829,6 +829,16 @@ pub enum DecodeError {
         /// The offending display-scale word from the wire header.
         dscale: u16,
     },
+    /// A user-defined `enum` column carried a label the generated Rust enum does
+    /// not know — a value present in the LIVE database's enum but absent from
+    /// the migration that the build catalog typed the query against (the enum
+    /// gained a label out-of-band, without a corresponding migration file). A PG
+    /// enum is sent as its label text; a label matching no generated variant is
+    /// classified here rather than mapped to a plausible-but-wrong variant or
+    /// panicking. Payload-free (the decoder has no context to carry the label
+    /// bytes here without breaking the size pin); the classification is the
+    /// signal — the fix is to add the migration that declares the new label.
+    UnknownEnumLabel,
 }
 
 // Direct size pin. The widest variant is `TruncatedColumnData { column_idx: u8,
@@ -912,6 +922,10 @@ impl fmt::Display for DecodeError {
             Self::NumericInvalidScale { dscale } => write!(
                 f,
                 "numeric column display scale {dscale} exceeds the wire format's 14-bit range (0..=16383)",
+            ),
+            Self::UnknownEnumLabel => f.write_str(
+                "enum column carried a label not declared by the migration the query was typed \
+                 against (the live database's enum has a value the build catalog does not know)",
             ),
         }
     }
@@ -2875,6 +2889,114 @@ impl EncodeBinary for &str {
     }
 }
 
+/// The runtime contract of a Rust type generated from a PostgreSQL
+/// `CREATE TYPE ... AS ENUM` migration — the `bsql::user_types!()` macro emits
+/// one `impl PgEnum` per migration enum, and the compile-checked `query!` path
+/// decodes an enum column through [`from_wire_label`](PgEnum::from_wire_label)
+/// and binds an enum parameter through [`as_label`](PgEnum::as_label).
+///
+/// A PostgreSQL enum value travels on the wire as its LABEL TEXT (in both the
+/// text and binary formats — `enum_send`/`enum_recv` are the label bytes), so a
+/// generated enum is decoded exactly like a `text` column plus a label→variant
+/// match, and encoded as its label text. The label⟷variant mapping lives once,
+/// in the generated `impl` — `query!` only names the type and calls these
+/// methods, so the mapping cannot drift between decode and encode.
+///
+/// This trait is deliberately NOT sealed: the impl is emitted in the CONSUMER
+/// crate (by `user_types!()`), so a seal would be unsatisfiable there. It grants
+/// no wire capability a hand impl could abuse — a `PgEnum` value only ever binds
+/// as an `unspecified`-typed (OID 0) label parameter the SERVER validates
+/// against the real enum (an invalid label is a server error), and only ever
+/// decodes a label the generated `from_wire_label` recognises (an unknown label
+/// is a classified [`DecodeError::UnknownEnumLabel`]).
+pub trait PgEnum: Copy + 'static {
+    /// This value's PostgreSQL enum LABEL — the exact declared label text,
+    /// case-sensitive. The inverse of [`from_wire_label`](Self::from_wire_label)
+    /// over the recognised labels.
+    fn wire_label(self) -> &'static str;
+
+    /// Decode a wire enum LABEL into this Rust enum, or a classified error when
+    /// the label matches no generated variant.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::UnknownEnumLabel`] when `label` is not one of the enum's
+    /// declared labels — a value in the live database's enum that the migration
+    /// the query was typed against did not declare. Never a panic or a
+    /// plausible-but-wrong variant.
+    fn from_wire_label(label: &str) -> Result<Self, DecodeError>;
+
+    /// Wrap this value as a bind parameter for the compile-checked `query!`
+    /// path. The returned [`EnumLabel`] carries the value's label and binds it
+    /// as an `unspecified`-typed (OID 0) parameter the server coerces to the
+    /// enum from context. Type-parameterised by the enum, so a `query!`
+    /// expecting one enum rejects another enum's label at compile time.
+    #[inline]
+    #[must_use]
+    fn as_label(self) -> EnumLabel<Self> {
+        EnumLabel::new(self)
+    }
+}
+
+/// A user-enum bind parameter: a [`PgEnum`] value's label text, bound as an
+/// `unspecified`-typed (OID 0) binary parameter the server infers from context.
+///
+/// A PostgreSQL enum has NO implicit `text` cast, so a `text` (OID 25)
+/// parameter against an enum column is a server error; declaring the parameter
+/// UNSPECIFIED (0) instead lets the server resolve the enum type from the SQL
+/// context and apply `enum_recv` to the label bytes. The phantom `E` makes the
+/// parameter enum-SPECIFIC: `EnumLabel<Mood>` and `EnumLabel<Status>` are
+/// distinct types, so a `query!` whose parameter is one enum rejects the other
+/// enum's label with a compile error — the wrong-enum footgun is structural.
+pub struct EnumLabel<E: PgEnum> {
+    /// The value's declared label text (always `'static` — an enum's labels are
+    /// generated string literals).
+    label: &'static str,
+    /// Phantom tie to the source enum, so `EnumLabel<A>` ≠ `EnumLabel<B>`.
+    _enum: core::marker::PhantomData<E>,
+}
+
+impl<E: PgEnum> EnumLabel<E> {
+    /// Wrap a [`PgEnum`] value's label as an `unspecified`-typed bind parameter.
+    #[inline]
+    #[must_use]
+    pub fn new(value: E) -> Self {
+        EnumLabel {
+            label: value.wire_label(),
+            _enum: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<E: PgEnum> Clone for EnumLabel<E> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<E: PgEnum> Copy for EnumLabel<E> {}
+
+impl<E: PgEnum> core::fmt::Debug for EnumLabel<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("EnumLabel").field(&self.label).finish()
+    }
+}
+
+impl<E: PgEnum> sealed::EncodeBinarySealed for EnumLabel<E> {}
+impl<E: PgEnum> EncodeBinary for EnumLabel<E> {
+    // OID 0 (unspecified): the server infers the enum type from the parameter's
+    // SQL context, then applies `enum_recv` to the label bytes below. A `text`
+    // (25) OID would be rejected — PG has no implicit text→enum cast.
+    const OID: u32 = oids::UNSPECIFIED;
+    #[inline]
+    fn encode_to<S: crate::write_buf::FrameSink>(&self, dst: &mut S)
+        -> Result<(), crate::write_buf::WriteBufFull>
+    {
+        dst.push_bytes(self.label.as_bytes())
+    }
+}
+
 // IEEE-754 float encoders: the big-endian bit pattern PG expects
 // (`float4` = 4 bytes, `float8` = 8), written verbatim. `to_be_bytes`
 // is the exact inverse of the `from_be_bytes` decoders above, so a
@@ -3266,6 +3388,15 @@ const _: () = {
 /// (`INT4 = 32` instead of `23`) fails the build. No runtime test
 /// required — the drift guard is the type system itself.
 pub mod oids {
+    /// PostgreSQL's `InvalidOid` (0) — an "unspecified type" marker, NOT a
+    /// concrete type. Used as a Parse-frame parameter type OID to ask the server
+    /// to INFER the parameter's type from its context in the SQL (exactly as an
+    /// unquoted string literal is `unknown`-typed and coerced). This is how a
+    /// user-defined `enum` parameter binds: a PG enum has no implicit `text`
+    /// (OID 25) cast, so declaring the parameter `text` is rejected, but an
+    /// unspecified (0) parameter is resolved to the enum type from context and
+    /// its binary label bytes are accepted by `enum_recv`.
+    pub const UNSPECIFIED: u32 = 0;
     /// `bool` (1-byte typtype `b`).
     pub const BOOL: u32 = 16;
     /// `bytea`.

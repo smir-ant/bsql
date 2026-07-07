@@ -23,6 +23,10 @@ fn unknown_reference_is_compile_error() {
     // our `build.rs` and captured at compile time via `env!`.
     unsafe {
         std::env::set_var("BSQL_SCHEMA_CATALOG", env!("BSQL_SCHEMA_CATALOG"));
+        // The user-defined-types channel, forwarded the same way so a
+        // `bsql::user_types!()` in a child compile reaches the real enum set
+        // (the generated-enum variant-set guarantee golden below).
+        std::env::set_var("BSQL_USER_TYPES", env!("BSQL_USER_TYPES"));
     }
     let t = trybuild::TestCases::new();
 
@@ -133,6 +137,13 @@ fn unknown_reference_is_compile_error() {
     //     (borrowed data escapes) — the streaming escape wall.
     t.compile_fail("tests/compile_fail/query_rows_escape.rs");
     t.compile_fail("tests/compile_fail/query_each_escape.rs");
+
+    // `bsql::user_types!()` generated-enum surface: the generated `Mood` has
+    // EXACTLY the migration's variant set, so naming a variant the migration did
+    // not declare — the same situation as a variant renamed / deleted by a later
+    // migration — is a compile error at the use site (E0599). Drift is a BUILD
+    // error, exactly as a dropped column is on the `query!` path.
+    t.compile_fail("tests/compile_fail/query_enum_unknown_variant.rs");
 
     // Every valid dynamic form type-checks at macro expansion.
     t.pass("tests/compile_pass/query_dynamics_ok.rs");

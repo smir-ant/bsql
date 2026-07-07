@@ -37,6 +37,55 @@ bsql::query!(AuditEvent, "SELECT event FROM audit");
 
 // ONE-CRATE REACHABILITY PROOF.
 //
+// USER-DEFINED TYPES from the build catalog (the audit-4 flagship).
+//
+// `0014_moods.sql` declares `CREATE TYPE mood AS ENUM ('happy', 'sad', 'ok',
+// 'in_progress')`. `bsql::user_types!()` generates `enum Mood { Happy, Sad, Ok,
+// InProgress }` from that DDL — zero derives, zero manual type name — and
+// `query!` below decodes a `mood` column straight into it. NO library in any
+// other language does this, because none parses the migration set at build
+// time. The generated `Mood` is in scope for the `query!` calls that name it.
+bsql::user_types!();
+
+// Decode a `mood` column into `Mood` (NOT NULL -> `Mood`) and a nullable
+// `mood` into `Option<Mood>` — proving the enum decode + nullability. `$1` is
+// the `int` primary key.
+bsql::query!(FeelingById, "SELECT id, m, note FROM feelings WHERE id = $1");
+// Round-trip an enum PARAMETER: `$1` types as `Mood` (bind it with
+// `Mood::Happy.as_label()`), the server coerces the label to the enum.
+bsql::query!(FeelingsByMood, "SELECT id FROM feelings WHERE m = $1");
+// Insert with an enum parameter and RETURN the decoded enum back.
+bsql::query!(
+    InsertFeeling,
+    "INSERT INTO feelings (id, m) VALUES ($1, $2) RETURNING id, m"
+);
+
+// The generated `Mood` is a real, ergonomic Rust enum: constructible, matchable,
+// ordered (declared order = PG sort order), and reachable through `bsql` alone.
+const _: () = {
+    // A wrong variant would be a compile error here; the variant SET is the
+    // migration's, enforced by the compiler.
+    const fn assert_pg_enum<E: bsql::PgEnum>() {}
+    assert_pg_enum::<Mood>();
+};
+
+// A DOMAIN column types TRANSPARENTLY as its base — `a age NOT NULL` is `i32`
+// (`age AS int`, resolved through the `adult_age`-style chain when nested), and
+// `h handle` is `Option<&str>` (`handle AS text`, nullable). No generated type:
+// a domain is its base on the wire, with the server enforcing the CHECK. That
+// this `query!` types at all proves `CREATE DOMAIN` reached the catalog and its
+// column resolved to the base's Rust type.
+bsql::query!(MemberById, "SELECT id, a, h FROM members WHERE id = $1");
+
+// ALTER TYPE evolution reaches the generated enum: `priority` was built by
+// `CREATE TYPE ... AS ENUM ('low','high')` then ADD VALUE + RENAME VALUE (0016),
+// and `garment_size` is `tshirt` after a RENAME TO. That this `query!` types at
+// all — `p` decodes into a `Priority` carrying the added/renamed variants,
+// `size` into a `GarmentSize` under the renamed type — proves ALTER TYPE reached
+// the catalog (a silent drop would leave the enum missing the added variant or
+// the table's type name unresolved).
+bsql::query!(TaskById, "SELECT id, p, size FROM tasks WHERE id = $1");
+
 // This crate's ONLY `[dependency]` is `bsql`. That every `query!` above
 // expands here — its emitted `::bsql::__rt::` paths resolving — already
 // proves the flagship macro is reachable through `bsql` alone. This block

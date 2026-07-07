@@ -115,6 +115,40 @@ pub fn query(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Generate a Rust type for every user-defined PostgreSQL type declared in the
+/// consumer's migrations — with ZERO derives, ZERO OID annotations, and no
+/// hand-maintained `type_name`.
+///
+/// `bsql::user_types!()` reads the SAME build catalog `query!` types against and
+/// emits, for each `CREATE TYPE name AS ENUM ('a', 'b', ...)` migration, a
+/// public Rust `enum` (`enum Name { A, B }`, variants in the declared order —
+/// which is PostgreSQL's enum sort order, so the derived `Ord` matches the
+/// server's) plus its wire decode/encode. A `query!` selecting an enum column
+/// decodes into that generated type; a variant renamed or deleted in a later
+/// migration regenerates the type, and any code that named the old variant
+/// stops compiling — drift is a BUILD error, not a runtime surprise.
+///
+/// Invoke it ONCE, in a module whose names are in scope at your `query!` call
+/// sites (a `query!` names the generated type by its bare PascalCase name):
+///
+/// ```rust,ignore
+/// bsql::user_types!();   // generates `enum Mood { Happy, Sad }`, etc.
+///
+/// bsql::query!(GetMood, "SELECT m FROM feelings WHERE id = $1");
+/// // GetMood's `m` field is `Mood`; bind a `Mood` param with `mood.as_label()`.
+/// ```
+///
+/// Takes no arguments. A migration whose type or a label cannot form a valid
+/// Rust identifier, or two labels that PascalCase to the same variant, is a
+/// loud `compile_error!` — never a silent mangle or collision.
+#[proc_macro]
+pub fn user_types(input: TokenStream) -> TokenStream {
+    match user_types_impl(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
 /// `query!(Name, "SQL")` input: a record base name and a SQL string.
 struct QueryInput {
     name: Ident,
@@ -178,15 +212,24 @@ fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
         syn::Error::new(sql_span, message)
     })?;
 
+    // Resolve every user-defined enum the query references into its generated
+    // Rust type identifier, ONCE (a migration enum whose name cannot form a
+    // valid Rust identifier is a loud error here, not at each use site). The
+    // generated enum TYPES themselves are emitted by the separate
+    // `bsql::user_types!()` macro; `query!` only NAMES them (they must be in
+    // scope at the call site, exactly as a hand-written record field type would
+    // be).
+    let enums = resolve_enum_types(&catalog, &shape, name.span())?;
+
     // The typed-record twins (borrowed + owned) and their decoders.
-    let records = emit_records(&name, &shape.columns, &bridges)?;
+    let records = emit_records(&name, &shape.columns, &bridges, &enums)?;
     // The const wire artifact(s): the uninhabited fingerprint carrier(s),
     // their `QueryFingerprint` impl(s) (baked Parse / Bind-prefix templates
     // + OID lists, all derived from the lowered shape), the validated
     // `PreparedQuery` const(s) minted through the proto-owned `run`
     // boundary, the dynamic-form budget assertions, and — for a runtime
     // `ORDER BY` allow-set — the closed selector enum.
-    let wire = emit_dynamic_wire(&name, &shape, &bridges)?;
+    let wire = emit_dynamic_wire(&name, &shape, &bridges, &enums)?;
 
     // SQLite conformance cross-check (only when this crate's `sqlite` feature
     // is on AND the consumer's build.rs emitted a template). It opens the
@@ -221,6 +264,132 @@ fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
         #records
         #wire
         #sqlite_typed
+    })
+}
+
+/// Generate the Rust types for every user-defined type in the build catalog.
+/// Empty input; a stray token is a loud error. Currently emits one `enum` per
+/// `CREATE TYPE ... AS ENUM` migration (composites/domains are additive).
+fn user_types_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
+    if !input.is_empty() {
+        return Err(syn::Error::new_spanned(
+            input,
+            "bsql::user_types!() takes no arguments",
+        ));
+    }
+    let span = Span::call_site();
+    let catalog = load_build_catalog(span)?;
+
+    let mut items = Vec::new();
+    for (type_name, ty) in &catalog.user_types {
+        match ty {
+            bsql_build::UserType::Enum { labels } => {
+                items.push(emit_user_enum(type_name, labels, span)?);
+            }
+            // A domain is TRANSPARENT — it decodes/encodes as its base type, so
+            // there is no generated Rust type: a `query!` column typed as the
+            // domain resolves directly to the base's Rust type. Nothing to emit.
+            bsql_build::UserType::Domain { .. } => {}
+        }
+    }
+    Ok(quote! { #(#items)* })
+}
+
+/// Emit one generated Rust `enum` for a `CREATE TYPE name AS ENUM (...)`: the
+/// type, its inherent `label` / `as_label` methods, and its
+/// [`::bsql::__rt::PgEnum`] impl (the wire label⟷variant mapping, defined ONCE
+/// here so `query!`'s decode and a bound parameter cannot disagree). The
+/// variant order is the declared label order — PostgreSQL's enum sort order —
+/// so the derived `Ord`/`PartialOrd` matches the server's ordering.
+fn emit_user_enum(enum_name: &str, labels: &[String], span: Span) -> syn::Result<TokenStream2> {
+    let type_ident = pascal_ident(enum_name, "enum type", span)?;
+
+    // One validated variant identifier per label, with a loud collision guard:
+    // two labels that PascalCase to the SAME variant (e.g. `a_b` and `a-b`) are
+    // an ambiguous mapping, never a silent last-wins.
+    let mut variant_idents: Vec<Ident> = Vec::with_capacity(labels.len());
+    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for label in labels {
+        let variant = pascal_ident(label, "enum variant", span)?;
+        let key = variant.to_string();
+        if let Some(first) = seen.get(&key) {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "bsql::user_types!(): enum `{enum_name}` labels `{first}` and \
+                     `{label}` both map to the Rust variant `{key}`. Rename one \
+                     label in the migration so each maps to a distinct variant."
+                ),
+            ));
+        }
+        seen.insert(key, label.clone());
+        variant_idents.push(variant);
+    }
+
+    // Parallel (variant, label) slices for the two match bodies. The labels are
+    // interpolated as string literals (exact bytes, case-sensitive).
+    let variants_for_encode = &variant_idents;
+    let labels_for_encode = labels;
+    let variants_for_decode = &variant_idents;
+    let labels_for_decode = labels;
+
+    let type_doc = format!(
+        "The `{enum_name}` PostgreSQL enum, generated from the migration \
+         `CREATE TYPE {enum_name} AS ENUM (...)`. Variants are in the declared \
+         (PostgreSQL sort) order. Decode an `{enum_name}` column with `query!`; \
+         bind one as a parameter with [`Self::as_label`]."
+    );
+    let dead_reason =
+        "a generated user type may be referenced by any, all, or none of the crate's queries";
+
+    Ok(quote! {
+        #[doc = #type_doc]
+        #[derive(
+            ::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy,
+            ::core::cmp::PartialEq, ::core::cmp::Eq,
+            ::core::cmp::PartialOrd, ::core::cmp::Ord, ::core::hash::Hash,
+        )]
+        #[allow(dead_code, reason = #dead_reason)]
+        pub enum #type_ident {
+            #( #variant_idents ),*
+        }
+
+        impl #type_ident {
+            /// This value's PostgreSQL enum label (the exact declared text).
+            #[allow(dead_code, reason = #dead_reason)]
+            #[must_use]
+            pub fn label(self) -> &'static str {
+                <Self as ::bsql::__rt::PgEnum>::wire_label(self)
+            }
+
+            /// Bind this value as a `query!` parameter (an enum-typed label the
+            /// server coerces from context — a PG enum has no `text` cast).
+            #[allow(dead_code, reason = #dead_reason)]
+            #[must_use]
+            pub fn as_label(self) -> ::bsql::__rt::EnumLabel<Self> {
+                ::bsql::__rt::EnumLabel::new(self)
+            }
+        }
+
+        impl ::bsql::__rt::PgEnum for #type_ident {
+            fn wire_label(self) -> &'static str {
+                match self {
+                    #( #type_ident::#variants_for_encode => #labels_for_encode, )*
+                }
+            }
+
+            fn from_wire_label(
+                __label: &str,
+            ) -> ::core::result::Result<Self, ::bsql::__rt::DecodeError> {
+                match __label {
+                    #( #labels_for_decode =>
+                        ::core::result::Result::Ok(#type_ident::#variants_for_decode), )*
+                    _ => ::core::result::Result::Err(
+                        ::bsql::__rt::DecodeError::UnknownEnumLabel,
+                    ),
+                }
+            }
+        }
     })
 }
 
@@ -429,12 +598,21 @@ fn load_build_catalog(span: Span) -> syn::Result<Rc<bsql_build::Catalog>> {
             ),
         )
     })?;
-    let catalog = bsql_build::parse_catalog(&text).map_err(|err| {
+    let mut catalog = bsql_build::parse_catalog(&text).map_err(|err| {
         syn::Error::new(
             span,
             format!("query!: the schema catalog at `{path}` is malformed: {err}"),
         )
     })?;
+    // Attach the user-defined types (`CREATE TYPE ... AS ENUM`) from their own
+    // channel. Both files are written together by the same build.rs run and the
+    // catalog file is rewritten every build, so caching the merged value under
+    // the catalog file's stamp is sound (they change atomically). The data is
+    // span-free (plain strings), so — unlike the bridge tokens — it is safe to
+    // memoize. An absent channel means an older/mismatched build-dep with no
+    // user types: treated as none (a user-typed column then stays a loud
+    // `UnsupportedPgType`, never a silent miss).
+    catalog.user_types = load_user_types(span)?;
     let value = Rc::new(catalog);
     CATALOG_CACHE.with_borrow_mut(|slot| {
         *slot = Some(CachedFile {
@@ -444,6 +622,39 @@ fn load_build_catalog(span: Span) -> syn::Result<Rc<bsql_build::Catalog>> {
         });
     });
     Ok(value)
+}
+
+/// Read the user-defined types (`CREATE TYPE ... AS ENUM`) from the
+/// `BSQL_USER_TYPES` rustc-env channel and parse them into the catalog's map.
+/// An absent channel (an older build-dep, or a build predating this feature) is
+/// an EMPTY map — a user-typed column then stays a loud `UnsupportedPgType`,
+/// never a silent miss. An unreadable or malformed present file fails closed
+/// (the file is machine-generated; a bad line means the build-script channel is
+/// corrupt), never a silent decode of an enum column back to an unknown type.
+fn load_user_types(
+    span: Span,
+) -> syn::Result<std::collections::BTreeMap<String, bsql_build::UserType>> {
+    let path = match std::env::var(bsql_build::USER_TYPES_ENV_VAR) {
+        Ok(path) => path,
+        // No channel: no user types (native-only build).
+        Err(_) => return Ok(std::collections::BTreeMap::new()),
+    };
+    let text = std::fs::read_to_string(&path).map_err(|err| {
+        syn::Error::new(
+            span,
+            format!(
+                "query!: cannot read the user-types file at `{path}`: {err}. It is \
+                 generated by `bsql-build` into OUT_DIR; an unreadable file fails \
+                 closed rather than silently dropping a user-defined type."
+            ),
+        )
+    })?;
+    bsql_build::parse_user_types(&text).map_err(|err| {
+        syn::Error::new(
+            span,
+            format!("query!: the user-types file at `{path}` is malformed: {err}"),
+        )
+    })
 }
 
 /// One resolved external-type bridge: the native pivot type it fires on, the
@@ -857,6 +1068,32 @@ fn col_spec(ty: bsql_build::RustType) -> ColSpec {
                 impls_eq: e.impls_eq,
             }
         }
+        // A user-defined enum decodes on the WIRE exactly like `text` — a PG
+        // enum value is its label bytes — so its row-tuple marker + OID ride the
+        // TEXT pivot (`&'static str`, OID 25), keeping the const OID validator
+        // untouched. The RECORD FIELD is the generated Rust enum, and the decode
+        // reshapes the `&str` label into it via `PgEnum::from_wire_label`; those
+        // are applied at the per-column codegen layer (which has the catalog to
+        // resolve the enum's name), so `field_owned` here is a never-read
+        // placeholder. `borrow: ByValue` because the field is an OWNED enum (no
+        // `<'q>`); `fixed_width: None` so an enum column takes the per-cell
+        // decode path (where the reshape lives), never the const-offset fast
+        // path. `impls_eq: true` — a generated enum derives `Eq`.
+        RustType::UserEnum(_) => ColSpec {
+            marker: quote!(&'static str),
+            // Placeholder — `field_type_bridged`/decode intercept `UserEnum`
+            // before reading this, substituting the generated enum path.
+            field_owned: quote!(&'static str),
+            borrow: BorrowKind::ByValue,
+            oid_path: quote!(::bsql::__rt::oids::TEXT),
+            oid_value: 25,
+            // Enum arrays are not modeled (a `mood[]` column stays a loud
+            // `UnsupportedPgType` at inference), so the array OID is never baked.
+            array_oid_path: quote!(::bsql::__rt::oids::TEXT_ARRAY),
+            array_oid_value: 1009,
+            fixed_width: None,
+            impls_eq: true,
+        },
     }
 }
 
@@ -932,26 +1169,38 @@ fn field_type_bridged(
     nullable: bool,
     is_owned: bool,
     bridges: &Bridges,
-) -> TokenStream2 {
-    let base = match bridges.for_column(ty) {
-        // Bridged: the target field type is the SAME for both twins (the
-        // target owns its value; the converter takes the owned native value).
-        Some((entry, is_array)) => {
-            let target = &entry.target;
-            if is_array {
-                quote!(::std::vec::Vec<::core::option::Option<#target>>)
-            } else {
-                quote!(#target)
-            }
+    enums: &EnumTypes,
+) -> syn::Result<TokenStream2> {
+    let base = match ty {
+        // A user-defined enum decodes into its generated Rust enum — the SAME
+        // owned type in both twins (a fieldless enum is self-owning, so there is
+        // no borrowed spelling and no `<'q>` contribution). This takes priority
+        // over the bridge/native paths: an enum is never a bridge target and its
+        // native `col_spec.field_owned` is a placeholder.
+        bsql_build::RustType::UserEnum(id) => {
+            let enum_ident = enums.ident(id)?;
+            quote!(#enum_ident)
         }
-        // Unbridged: the native base type (non-null; the Option wrap is below).
-        None => field_type(ty, false, is_owned),
+        _ => match bridges.for_column(ty) {
+            // Bridged: the target field type is the SAME for both twins (the
+            // target owns its value; the converter takes the owned native value).
+            Some((entry, is_array)) => {
+                let target = &entry.target;
+                if is_array {
+                    quote!(::std::vec::Vec<::core::option::Option<#target>>)
+                } else {
+                    quote!(#target)
+                }
+            }
+            // Unbridged: the native base type (non-null; the Option wrap is below).
+            None => field_type(ty, false, is_owned),
+        },
     };
-    if nullable {
+    Ok(if nullable {
         quote!(::core::option::Option<#base>)
     } else {
         base
-    }
+    })
 }
 
 /// Build a field identifier from an output column name, using a raw
@@ -973,11 +1222,118 @@ fn make_field_ident(name: &str, span: Span) -> syn::Result<Ident> {
     ))
 }
 
+/// Convert a PostgreSQL identifier or enum label to a candidate PascalCase Rust
+/// identifier body: split on any run of non-alphanumeric characters (`_`, `-`,
+/// spaces, punctuation), uppercase each segment's first character, and
+/// concatenate (digits kept in place). The result may still be an invalid Rust
+/// identifier (empty, or leading digit) — the caller validates via
+/// [`syn::parse_str`] and reports a loud error, never a silent mangle.
+fn pascal_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut at_boundary = true;
+    for ch in s.chars() {
+        if ch.is_alphanumeric() {
+            if at_boundary {
+                out.extend(ch.to_uppercase());
+                at_boundary = false;
+            } else {
+                out.push(ch);
+            }
+        } else {
+            at_boundary = true;
+        }
+    }
+    out
+}
+
+/// PascalCase `raw` into a validated Rust identifier (a raw identifier for a
+/// keyword where legal), or a loud error naming the offending source. `kind`
+/// names the role (`enum type` / `enum variant`) for the message; `span`
+/// locates it. Never a silent mangle — a name that cannot form a valid
+/// identifier is a build error the migration author fixes.
+fn pascal_ident(raw: &str, kind: &str, span: Span) -> syn::Result<Ident> {
+    let candidate = pascal_case(raw);
+    if let Ok(id) = syn::parse_str::<Ident>(&candidate) {
+        return Ok(id);
+    }
+    if let Ok(id) = syn::parse_str::<Ident>(&format!("r#{candidate}")) {
+        return Ok(id);
+    }
+    Err(syn::Error::new(
+        span,
+        format!(
+            "query!: {kind} `{raw}` cannot be mapped to a valid Rust identifier \
+             (PascalCased to `{candidate}`). Rename it in the migration to a name \
+             that forms a valid Rust identifier."
+        ),
+    ))
+}
+
+/// Resolves a `RustType::UserEnum(id)` to the generated Rust enum TYPE
+/// identifier (the `user_types!()`-emitted `enum` a `mood` column decodes into).
+///
+/// Built once per `query!` over exactly the enums the query references, so a
+/// migration enum whose name cannot form a valid Rust identifier fails ONCE,
+/// loudly, and the per-column / per-param codegen looks the ident up against a
+/// pre-validated map (the lookup carries the query span for the — structurally
+/// unreachable — "id not pre-resolved" internal guard, keeping the codegen
+/// panic-free without an `unwrap`).
+struct EnumTypes {
+    /// `UserEnumId.0` -> the generated enum's PascalCase type identifier.
+    by_id: std::collections::BTreeMap<u32, Ident>,
+    /// The query name's span, for the internal-guard diagnostic.
+    span: Span,
+}
+
+impl EnumTypes {
+    /// The generated type identifier for a user-enum id. Every enum the query's
+    /// columns / params carry was resolved at construction, so this is total for
+    /// them; a miss is an internal logic error surfaced loudly (never a panic).
+    fn ident(&self, id: bsql_build::UserEnumId) -> syn::Result<&Ident> {
+        self.by_id.get(&id.0).ok_or_else(|| {
+            syn::Error::new(self.span, "query!: internal error — unresolved user-enum id")
+        })
+    }
+}
+
+/// Resolve every user enum the query's columns and parameters reference into a
+/// [`EnumTypes`] map, against the SAME catalog the query was typed with. A bad
+/// enum name is a loud error here, once, rather than at each use site.
+fn resolve_enum_types(
+    catalog: &bsql_build::Catalog,
+    shape: &bsql_build::DynamicShape,
+    span: Span,
+) -> syn::Result<EnumTypes> {
+    let mut by_id = std::collections::BTreeMap::new();
+    let mut resolve = |id: bsql_build::UserEnumId| -> syn::Result<()> {
+        if by_id.contains_key(&id.0) {
+            return Ok(());
+        }
+        let (enum_name, _labels) = catalog.user_enum(id).ok_or_else(|| {
+            syn::Error::new(span, "query!: internal error — unresolved user-enum id")
+        })?;
+        by_id.insert(id.0, pascal_ident(enum_name, "enum type", span)?);
+        Ok(())
+    };
+    for col in &shape.columns {
+        if let bsql_build::RustType::UserEnum(id) = col.ty {
+            resolve(id)?;
+        }
+    }
+    for param in &shape.params {
+        if let bsql_build::RustType::UserEnum(id) = param.element() {
+            resolve(id)?;
+        }
+    }
+    Ok(EnumTypes { by_id, span })
+}
+
 /// Emit the borrowed + owned record twins and their `decode` fns.
 fn emit_records(
     name: &Ident,
     columns: &[bsql_build::InferredColumn],
     bridges: &Bridges,
+    enums: &EnumTypes,
 ) -> syn::Result<TokenStream2> {
     let owned_name = format_ident!("{}Owned", name);
 
@@ -1025,10 +1381,14 @@ fn emit_records(
         .iter()
         .all(|c| !c.nullable && fixed_width(c.ty).is_some());
 
-    let borrowed_fields = field_idents.iter().zip(columns).map(|(id, col)| {
-        let ty = field_type_bridged(col.ty, col.nullable, false, bridges);
-        quote! { #id: #ty }
-    });
+    let borrowed_fields = field_idents
+        .iter()
+        .zip(columns)
+        .map(|(id, col)| {
+            let ty = field_type_bridged(col.ty, col.nullable, false, bridges, enums)?;
+            Ok(quote! { #id: #ty })
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
 
     // The borrowed record carries `<'q>` ONLY when it has a borrowing
     // (text / bytea) field — otherwise the lifetime would be unused, which
@@ -1040,6 +1400,7 @@ fn emit_records(
         quote!(body: &[u8])
     };
 
+    let cx = Codegen { bridges, enums };
     let borrowed_body = decode_body(
         &field_idents,
         columns,
@@ -1047,8 +1408,8 @@ fn emit_records(
         n_i16,
         all_fixed_not_null,
         false,
-        bridges,
-    );
+        &cx,
+    )?;
 
     let allow_reason = "generated typed-record fields are the query's output row shape; a consumer may read any subset of the columns";
 
@@ -1080,10 +1441,14 @@ fn emit_records(
     // 'static`, and both `#owned_name::decode` and `type Owned = #owned_name`
     // (in `emit_dynamic_wire`) resolve straight through the alias.
     let owned_items = if has_borrowed {
-        let owned_fields = field_idents.iter().zip(columns).map(|(id, col)| {
-            let ty = field_type_bridged(col.ty, col.nullable, true, bridges);
-            quote! { #id: #ty }
-        });
+        let owned_fields = field_idents
+            .iter()
+            .zip(columns)
+            .map(|(id, col)| {
+                let ty = field_type_bridged(col.ty, col.nullable, true, bridges, enums)?;
+                Ok(quote! { #id: #ty })
+            })
+            .collect::<syn::Result<Vec<_>>>()?;
         let owned_body = decode_body(
             &field_idents,
             columns,
@@ -1091,8 +1456,8 @@ fn emit_records(
             n_i16,
             all_fixed_not_null,
             true,
-            bridges,
-        );
+            &cx,
+        )?;
         quote! {
             #[derive(#derives)]
             #[allow(dead_code, reason = #allow_reason)]
@@ -1143,6 +1508,16 @@ fn emit_records(
 /// per-cell path (which classifies NULL / variable-width / oversized
 /// rows). When the fast path is not eligible, only the per-cell path is
 /// emitted.
+/// The per-column codegen resolution context: the external-type bridges and the
+/// resolved user enums, bundled so the record-decode coordinator threads one
+/// reference instead of two (and stays within the argument-count wall).
+struct Codegen<'a> {
+    /// The external-type bridge overrides (possibly empty).
+    bridges: &'a Bridges,
+    /// The resolved user-enum type identifiers for this query.
+    enums: &'a EnumTypes,
+}
+
 fn decode_body(
     field_idents: &[Ident],
     columns: &[bsql_build::InferredColumn],
@@ -1150,17 +1525,21 @@ fn decode_body(
     n_i16: i16,
     all_fixed_not_null: bool,
     is_owned: bool,
-    bridges: &Bridges,
-) -> TokenStream2 {
-    let per_cell = per_cell_path(field_idents, columns, col_idx_u8, is_owned, bridges);
+    cx: &Codegen<'_>,
+) -> syn::Result<TokenStream2> {
+    let per_cell = per_cell_path(field_idents, columns, col_idx_u8, is_owned, cx.bridges, cx.enums)?;
+    // The fast path only fires when every column is fixed-width; a user-enum
+    // column is variable-width (`fixed_width` is `None`), so a query with an
+    // enum column never takes the fast path — `fast_path` never sees an enum and
+    // stays enum-agnostic.
     if all_fixed_not_null {
-        let fast = fast_path(field_idents, columns, n_i16, bridges);
-        quote! {
+        let fast = fast_path(field_idents, columns, n_i16, cx.bridges);
+        Ok(quote! {
             #fast
             #per_cell
-        }
+        })
     } else {
-        per_cell
+        Ok(per_cell)
     }
 }
 
@@ -1263,14 +1642,15 @@ fn per_cell_path(
     col_idx_u8: &[u8],
     is_owned: bool,
     bridges: &Bridges,
-) -> TokenStream2 {
+    enums: &EnumTypes,
+) -> syn::Result<TokenStream2> {
     if columns.is_empty() {
         // No projected columns: validate the row body and build the empty
         // record. `parse` still fails closed on a malformed count header.
-        return quote! {
+        return Ok(quote! {
             ::bsql::__rt::DataRowRef::parse(body)?;
             ::core::result::Result::Ok(Self {})
-        };
+        });
     }
 
     let stmts = field_idents
@@ -1279,8 +1659,8 @@ fn per_cell_path(
         .zip(col_idx_u8)
         .map(|((id, col), idx)| {
             let idx_lit = Literal::u8_suffixed(*idx);
-            let value = per_cell_value_expr(col.ty, col.nullable, is_owned, bridges);
-            quote! {
+            let value = per_cell_value_expr(col.ty, col.nullable, is_owned, bridges, enums)?;
+            Ok(quote! {
                 let __cell = match ::core::iter::Iterator::next(&mut __cols) {
                     ::core::option::Option::Some(__result) => __result?,
                     // The row declared fewer columns than the query
@@ -1293,15 +1673,16 @@ fn per_cell_path(
                     ),
                 };
                 let #id = #value;
-            }
-        });
+            })
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
 
-    quote! {
+    Ok(quote! {
         let __row = ::bsql::__rt::DataRowRef::parse(body)?;
         let mut __cols = ::bsql::__rt::DataRowRef::columns(&__row);
         #(#stmts)*
         ::core::result::Result::Ok(Self { #(#field_idents),* })
-    }
+    })
 }
 
 /// One per-cell column value expression. A NOT-NULL column returns the
@@ -1312,9 +1693,10 @@ fn per_cell_value_expr(
     nullable: bool,
     is_owned: bool,
     bridges: &Bridges,
-) -> TokenStream2 {
-    let decode_expr = decode_value_expr_bridged(ty, is_owned, bridges);
-    if nullable {
+    enums: &EnumTypes,
+) -> syn::Result<TokenStream2> {
+    let decode_expr = decode_value_expr_bridged(ty, is_owned, bridges, enums)?;
+    Ok(if nullable {
         quote! {
             match __cell {
                 ::core::option::Option::Some(__bytes) =>
@@ -1333,7 +1715,7 @@ fn per_cell_value_expr(
                 ),
             }
         }
-    }
+    })
 }
 
 /// The decode call for one non-NULL cell body (`__bytes`).
@@ -1384,8 +1766,24 @@ fn decode_value_expr_bridged(
     ty: bsql_build::RustType,
     is_owned: bool,
     bridges: &Bridges,
-) -> TokenStream2 {
-    match bridges.for_column(ty) {
+    enums: &EnumTypes,
+) -> syn::Result<TokenStream2> {
+    // A user-defined enum decodes its LABEL TEXT (the `&str` wire pivot, via the
+    // SAME `ColCellAt` decode the const validator pins the OID to) and reshapes
+    // it into the generated Rust enum through `PgEnum::from_wire_label`. That
+    // reshape is FALLIBLE — a label the migration did not declare is a
+    // classified `DecodeError::UnknownEnumLabel` (never a panic or a
+    // plausible-but-wrong variant). The `&str` borrows `__bytes` only for the
+    // duration of `from_wire_label`, which returns an OWNED enum, so an enum
+    // field never carries `<'q>` (its `col_spec.borrow` is `ByValue`).
+    if let bsql_build::RustType::UserEnum(id) = ty {
+        let enum_ident = enums.ident(id)?;
+        let label = decode_call_expr(ty, is_owned);
+        return Ok(quote! {
+            <#enum_ident as ::bsql::__rt::PgEnum>::from_wire_label(#label)?
+        });
+    }
+    Ok(match bridges.for_column(ty) {
         None => decode_call_expr(ty, is_owned),
         Some((entry, false)) => {
             // Scalar bridge: reshape the OWNED native value (same for both
@@ -1411,7 +1809,7 @@ fn decode_value_expr_bridged(
                 ))
             }
         }
-    }
+    })
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1490,27 +1888,60 @@ fn array_oid_path(ty: bsql_build::RustType) -> TokenStream2 {
 /// element. A toggled optional filter is `Option<T>` (passing `None`
 /// disables it); a `= ANY($N)` in-list is the array slice `&'static [T]`;
 /// a plain scalar is `T`.
-fn param_tuple_marker(shape: bsql_build::ParamShape) -> TokenStream2 {
-    use bsql_build::ParamShape;
-    match shape {
-        ParamShape::Scalar(ty) => tuple_marker(ty),
-        ParamShape::Optional(ty) => {
-            let inner = tuple_marker(ty);
-            quote!(::core::option::Option<#inner>)
+fn param_tuple_marker(
+    shape: bsql_build::ParamShape,
+    enums: &EnumTypes,
+) -> syn::Result<TokenStream2> {
+    use bsql_build::{ParamShape, RustType};
+    // The scalar element marker for a parameter. A user-enum parameter is NOT
+    // the `&str` wire pivot (which the OUTPUT row-tuple uses): it is
+    // `EnumLabel<TheEnum>`, an `unspecified`-typed (OID 0) label the server
+    // infers to the enum from context — a `text` (25) parameter has no cast to
+    // an enum and is rejected. The phantom enum type keeps it enum-specific, so
+    // a query expecting one enum rejects another's label at compile time.
+    let scalar = |ty: RustType| -> syn::Result<TokenStream2> {
+        match ty {
+            RustType::UserEnum(id) => {
+                let enum_ident = enums.ident(id)?;
+                Ok(quote!(::bsql::__rt::EnumLabel<#enum_ident>))
+            }
+            _ => Ok(tuple_marker(ty)),
         }
+    };
+    match shape {
+        ParamShape::Scalar(ty) => scalar(ty),
+        ParamShape::Optional(ty) => {
+            let inner = scalar(ty)?;
+            Ok(quote!(::core::option::Option<#inner>))
+        }
+        // A `col = ANY($N)` in-list over a user enum would bind an ARRAY of the
+        // enum, whose element OID is server-dynamic and whose array wire framing
+        // is out of scope for v1 — a loud rejection, never a silently-wrong
+        // encoding. Native-element arrays are unchanged.
+        ParamShape::Array(RustType::UserEnum(_)) => Err(syn::Error::new(
+            enums.span,
+            "query!: a `= ANY($N)` in-list over a user-defined enum column is not \
+             yet supported; compare the enum column with a scalar `$N` instead \
+             (`WHERE col = $1`).",
+        )),
         ParamShape::Array(ty) => {
             let elem = tuple_marker(ty);
-            quote!(&'static [#elem])
+            Ok(quote!(&'static [#elem]))
         }
     }
 }
 
 /// The numeric OID baked into the Parse template for one parameter. A
 /// toggled `Option<T>` keeps the scalar OID (a SQL NULL is typed by its
-/// column); a `= ANY($N)` array uses the element type's array OID.
+/// column); a `= ANY($N)` array uses the element type's array OID; a
+/// user-enum parameter is UNSPECIFIED (0) — the server infers the enum type
+/// from context (a PG enum has no implicit `text` cast).
 fn param_oid_value(shape: bsql_build::ParamShape) -> u32 {
-    use bsql_build::ParamShape;
+    use bsql_build::{ParamShape, RustType};
     match shape {
+        ParamShape::Scalar(RustType::UserEnum(_)) | ParamShape::Optional(RustType::UserEnum(_)) => {
+            0
+        }
         ParamShape::Scalar(ty) | ParamShape::Optional(ty) => rust_type_oid(ty),
         ParamShape::Array(ty) => array_oid(ty),
     }
@@ -1518,10 +1949,14 @@ fn param_oid_value(shape: bsql_build::ParamShape) -> u32 {
 
 /// The `oids::*` const path token emitted into `PARAM_OIDS` for one
 /// parameter — the runtime const validator cross-checks it against the
-/// `ParamsWriter` tuple's declared OIDs.
+/// `ParamsWriter` tuple's declared OIDs. A user-enum parameter is the
+/// `UNSPECIFIED` (0) path, matching `EnumLabel::OID`.
 fn param_oid_path(shape: bsql_build::ParamShape) -> TokenStream2 {
-    use bsql_build::ParamShape;
+    use bsql_build::{ParamShape, RustType};
     match shape {
+        ParamShape::Scalar(RustType::UserEnum(_)) | ParamShape::Optional(RustType::UserEnum(_)) => {
+            quote!(::bsql::__rt::oids::UNSPECIFIED)
+        }
         ParamShape::Scalar(ty) | ParamShape::Optional(ty) => oid_path(ty),
         ParamShape::Array(ty) => array_oid_path(ty),
     }
@@ -1545,6 +1980,7 @@ fn emit_dynamic_wire(
     name: &Ident,
     shape: &bsql_build::DynamicShape,
     bridges: &Bridges,
+    enums: &EnumTypes,
 ) -> syn::Result<TokenStream2> {
     // The runtime `ParamsWriter` / `RowDecode` impls (and the whole
     // prepared-statement wire path) cover tuple arity 0..=16. A query
@@ -1576,8 +2012,11 @@ fn emit_dynamic_wire(
     // from the lowered `$N` shapes (scalar / Option / array); Row from the
     // projected columns (base marker — nullability is the records' concern,
     // not the wire OID's).
-    let param_markers: Vec<TokenStream2> =
-        shape.params.iter().map(|p| param_tuple_marker(*p)).collect();
+    let param_markers: Vec<TokenStream2> = shape
+        .params
+        .iter()
+        .map(|p| param_tuple_marker(*p, enums))
+        .collect::<syn::Result<Vec<_>>>()?;
     let row_markers: Vec<TokenStream2> =
         shape.columns.iter().map(|c| tuple_marker(c.ty)).collect();
     let tuples = TypeTuples {
@@ -1982,6 +2421,12 @@ fn sqlite_target(ty: bsql_build::RustType, is_owned: bool) -> Option<TokenStream
         | RustType::Json
         | RustType::Jsonb
         | RustType::Numeric
+        // A user-defined PostgreSQL enum is not a SQLite concept (`CREATE TYPE
+        // ... AS ENUM` is PG-only; the SQLite conformance template cannot even
+        // replay it), so a query projecting one is PostgreSQL-only — the SQLite
+        // bridge is skipped and `sqlite_conn.query::<That>()` is a located
+        // compile error.
+        | RustType::UserEnum(_)
         | RustType::Array(_) => return None,
     })
 }
