@@ -62,7 +62,7 @@ mod transport;
 
 pub use bsql_postgres_core::{
     ColumnError, ConnectConfig, DbError, DriverError, Notification, ParamsWriter, QueryResult,
-    Row, Rows, SafeIdent, SafeTable, SslMode, TypedNotification,
+    Row, RowRef, Rows, SafeIdent, SafeTable, SslMode, TypedNotification,
 };
 
 pub use cancel::CancelToken;

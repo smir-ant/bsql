@@ -7,12 +7,13 @@
 //!
 //! ## Quick start — PostgreSQL (async)
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # async fn example() -> Result<(), bsql::pg::DriverError> {
 //! use bsql::pg::{ConnectConfig, Connection};
 //!
 //! let config = ConnectConfig::new("127.0.0.1", "myuser")
-//!     .database("mydb".into())
-//!     .password("secret".into());
+//!     .database("mydb")
+//!     .password("secret");
 //!
 //! let mut conn = Connection::connect(&config).await?;
 //!
@@ -39,48 +40,56 @@
 //! conn.close_statement(stmt).await?;
 //!
 //! // Transactions (tier-1 safety: closure scope = transaction boundary)
-//! conn.transaction(|tx| async {
+//! conn.transaction(async |tx| {
 //!     tx.execute_sql("INSERT INTO log VALUES ('start')").await?;
 //!     tx.execute_sql("UPDATE counter SET n = n + 1").await?;
 //!     Ok(()) // → COMMIT. Err → ROLLBACK.
 //! }).await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Quick start — PostgreSQL (sync)
 //!
-//! ```rust,ignore
+//! ```no_run
+//! # fn main() -> Result<(), bsql::pg_sync::DriverError> {
 //! use bsql::pg_sync::{ConnectConfig, Connection, SslMode};
 //!
 //! let config = ConnectConfig::new("127.0.0.1", "myuser")
-//!     .database("mydb".into())
+//!     .database("mydb")
 //!     .ssl_mode(SslMode::Disable);
 //!
 //! let mut conn = Connection::connect(&config)?;
 //! let result = conn.query_sql("SELECT 1 + 1 AS answer")?;
 //! assert_eq!(result.get(0).expect("one row").get_i32(0), Ok(Some(2)));
 //! conn.close()?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Quick start — SQLite
 //!
-//! ```rust,ignore
-//! use bsql::sqlite::{Connection, ValueRef};
+//! ```
+//! # fn main() -> Result<(), bsql::sqlite::SqliteError> {
+//! use bsql::sqlite::Connection;
 //!
 //! let conn = Connection::open_in_memory()?;
-//! conn.execute("CREATE TABLE t(v INTEGER)")?;
+//! conn.execute_sql("CREATE TABLE t(v INTEGER)")?;
 //! conn.transaction(|tx| {
-//!     tx.execute("INSERT INTO t VALUES (42)")?;
+//!     tx.execute_sql("INSERT INTO t VALUES (42)")?;
 //!     Ok(())
 //! })?;
 //! // Dynamic (raw-SQL) verbs carry the `_sql` suffix; reads are classified.
 //! let row = conn.query_one_sql("SELECT v FROM t")?;
 //! assert_eq!(row.get::<i64>(0)?, 42);
+//! # Ok(())
+//! # }
 //!
 //! // The compile-checked `query!` flagship runs against SQLite too (feature
 //! // `sqlite`): the bare `query::<Q>` / `query_one::<Q>` / … verbs decode into
 //! // typed records, verifying each value's storage class at runtime.
-//! // bsql::query!(Val, "SELECT v FROM t");
-//! // let vals = conn.query::<ValQuery>(&[])?;   // TypedRows<ValQuery>
+//! //   bsql::query!(Val, "SELECT v FROM t");
+//! //   let vals = conn.query::<ValQuery>(&[])?;   // TypedRows<ValQuery>
 //! ```
 //!
 //! ## The compile-checked `query!` flagship (feature `macros`)
@@ -148,6 +157,113 @@ pub mod testkit {
     //! Deterministic in-memory fake PostgreSQL for testing driver code with no
     //! network. Gated OFF by default so a production build never pulls it.
     pub use bsql_testkit::*;
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Cross-backend error classification (any backend feature)
+// ════════════════════════════════════════════════════════════════════
+
+/// A backend-agnostic classification VIEW over a driver error, so a
+/// cross-backend consumer can branch on `err.is_unique_violation()` identically
+/// whether the error came from PostgreSQL or SQLite.
+///
+/// Implemented for `bsql::pg::DriverError` (the same type as
+/// `bsql::pg_sync::DriverError`) and `bsql::sqlite::SqliteError`. It is
+/// ZERO-COST: every accessor is a cheap match layered over each backend's own
+/// inherent predicates — no new error variant, no allocation, no conversion. The
+/// two backends encode a constraint class very differently — PostgreSQL as a
+/// 5-character SQLSTATE, SQLite as a numeric extended result code — and this
+/// trait maps the COMMON classes onto one vocabulary. For example
+/// `is_unique_violation()` is SQLSTATE `23505` on PostgreSQL and
+/// `SQLITE_CONSTRAINT_UNIQUE` **or** `SQLITE_CONSTRAINT_PRIMARYKEY` on SQLite —
+/// both, because PostgreSQL's `23505` spans a duplicate UNIQUE index and a
+/// duplicate PRIMARY KEY, which SQLite splits into two codes. A class the backend
+/// did not report maps to `false` / `None`, never to a wrong classification.
+///
+/// This is a VIEW, not a replacement: each backend keeps its own richer error
+/// (`DriverError` carries the full SQLSTATE + message; `SqliteError` carries the
+/// extended code), and this trait exposes only the portable common denominator.
+#[cfg(any(feature = "postgres-async", feature = "postgres-sync", feature = "sqlite"))]
+pub trait BackendError {
+    /// The 5-character PostgreSQL SQLSTATE, if this backend carries one.
+    /// `Some` for a PostgreSQL server error; always `None` for SQLite (which
+    /// classifies by numeric result code, not SQLSTATE — use the boolean
+    /// predicates for a portable class check).
+    fn sqlstate(&self) -> Option<&str>;
+    /// A UNIQUE / PRIMARY KEY duplicate (PostgreSQL `23505`; SQLite
+    /// `SQLITE_CONSTRAINT_UNIQUE` or `SQLITE_CONSTRAINT_PRIMARYKEY`).
+    fn is_unique_violation(&self) -> bool;
+    /// A NOT NULL violation (PostgreSQL `23502`; SQLite
+    /// `SQLITE_CONSTRAINT_NOTNULL`).
+    fn is_not_null_violation(&self) -> bool;
+    /// A FOREIGN KEY violation (PostgreSQL `23503`; SQLite
+    /// `SQLITE_CONSTRAINT_FOREIGNKEY`).
+    fn is_foreign_key_violation(&self) -> bool;
+    /// A CHECK violation (PostgreSQL `23514`; SQLite `SQLITE_CONSTRAINT_CHECK`).
+    fn is_check_violation(&self) -> bool;
+    /// A typed `query_one` that matched MORE than one row (both backends'
+    /// `TooManyRows`).
+    fn is_too_many_rows(&self) -> bool;
+}
+
+// Name `DriverError` from whichever PostgreSQL driver is enabled. Both drivers
+// re-export the SAME `bsql_postgres_core::DriverError`, so binding one path (async
+// preferred, else sync) gives ONE canonical type and ONE impl — matching on both
+// paths would be a duplicate-impl error when both drivers are on.
+#[cfg(feature = "postgres-async")]
+use bsql_postgres_async::DriverError as PgDriverError;
+#[cfg(all(feature = "postgres-sync", not(feature = "postgres-async")))]
+use bsql_postgres_sync::DriverError as PgDriverError;
+
+#[cfg(any(feature = "postgres-async", feature = "postgres-sync"))]
+impl BackendError for PgDriverError {
+    fn sqlstate(&self) -> Option<&str> {
+        match self {
+            PgDriverError::Db(e) => Some(e.code.as_str()),
+            _ => None,
+        }
+    }
+    fn is_unique_violation(&self) -> bool {
+        matches!(self, PgDriverError::Db(e) if e.is_unique_violation())
+    }
+    fn is_not_null_violation(&self) -> bool {
+        matches!(self, PgDriverError::Db(e) if e.is_not_null_violation())
+    }
+    fn is_foreign_key_violation(&self) -> bool {
+        matches!(self, PgDriverError::Db(e) if e.is_foreign_key_violation())
+    }
+    fn is_check_violation(&self) -> bool {
+        matches!(self, PgDriverError::Db(e) if e.is_check_violation())
+    }
+    fn is_too_many_rows(&self) -> bool {
+        matches!(self, PgDriverError::TooManyRows)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl BackendError for bsql_sqlite::SqliteError {
+    fn sqlstate(&self) -> Option<&str> {
+        // SQLite classifies by numeric extended result code, not SQLSTATE. The
+        // boolean predicates below carry the portable class check.
+        None
+    }
+    fn is_unique_violation(&self) -> bool {
+        // Inherent method (preferred over this trait method in path resolution),
+        // so this forwards rather than recursing.
+        bsql_sqlite::SqliteError::is_unique_violation(self)
+    }
+    fn is_not_null_violation(&self) -> bool {
+        bsql_sqlite::SqliteError::is_not_null_violation(self)
+    }
+    fn is_foreign_key_violation(&self) -> bool {
+        bsql_sqlite::SqliteError::is_foreign_key_violation(self)
+    }
+    fn is_check_violation(&self) -> bool {
+        bsql_sqlite::SqliteError::is_check_violation(self)
+    }
+    fn is_too_many_rows(&self) -> bool {
+        matches!(self, bsql_sqlite::SqliteError::TooManyRows)
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════

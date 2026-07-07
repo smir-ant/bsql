@@ -72,12 +72,31 @@ pub enum SqliteError {
     /// An `Integer` value was read as `f64` but lies outside the `[-(2^53),
     /// 2^53]` range in which every integer round-trips through `f64`'s 53-bit
     /// mantissa exactly. Returning a rounded approximation would be a silent
-    /// loss; this classified error says "read it as `i64`".
+    /// loss; this classified error says "read it as `i64`". (The `f32` peer for
+    /// an out-of-range integer read reuses this variant; a `REAL` that does not
+    /// narrow to `f32` exactly is the distinct [`InexactFloatNarrowing`] below,
+    /// which carries the source `f64`.)
+    ///
+    /// [`InexactFloatNarrowing`]: SqliteError::InexactFloatNarrowing
     InexactFloat {
         /// The zero-based column index that was read.
         column: usize,
-        /// The integer value that is not exactly representable as `f64`.
+        /// The integer value that is not exactly representable as the float.
         value: i64,
+    },
+    /// A `REAL` (stored as `f64`) was read as `f32` but does not narrow to `f32`
+    /// exactly — either its magnitude exceeds `f32::MAX` (narrowing would
+    /// overflow to `±inf`) or it needs more than `f32`'s 24-bit mantissa.
+    /// Returning the rounded/overflowed `f32` would be a silent loss; this
+    /// classified error says "read it as `f64`". Distinct from [`InexactFloat`],
+    /// whose source is an out-of-range `Integer` (carrying an `i64`).
+    ///
+    /// [`InexactFloat`]: SqliteError::InexactFloat
+    InexactFloatNarrowing {
+        /// The zero-based column index that was read.
+        column: usize,
+        /// The `f64` value that is not exactly representable as `f32`.
+        value: f64,
     },
     /// An `Integer` value other than `0` or `1` was read as `bool`. SQLite has
     /// no boolean storage class; a boolean is stored as the integers `0`/`1`,
@@ -146,6 +165,33 @@ const PRIMARY_BUSY: i32 = 5;
 /// Primary `SQLITE_CONSTRAINT`.
 const PRIMARY_CONSTRAINT: i32 = 19;
 
+// SQLite EXTENDED constraint codes (`SQLITE_CONSTRAINT | (subtype << 8)`), used
+// by the specific per-class predicates below. These values are FROZEN by
+// SQLite's result-code compatibility guarantee (a code is never renumbered), so
+// they are pinned here as named constants next to the primary codes above; each
+// equals its `rusqlite::ffi::SQLITE_CONSTRAINT_*` counterpart.
+/// Extended `SQLITE_CONSTRAINT_UNIQUE` (`19 | (8 << 8)`).
+const SQLITE_CONSTRAINT_UNIQUE: i32 = 2067;
+/// Extended `SQLITE_CONSTRAINT_PRIMARYKEY` (`19 | (6 << 8)`).
+const SQLITE_CONSTRAINT_PRIMARYKEY: i32 = 1555;
+/// Extended `SQLITE_CONSTRAINT_NOTNULL` (`19 | (5 << 8)`).
+const SQLITE_CONSTRAINT_NOTNULL: i32 = 1299;
+/// Extended `SQLITE_CONSTRAINT_FOREIGNKEY` (`19 | (3 << 8)`).
+const SQLITE_CONSTRAINT_FOREIGNKEY: i32 = 787;
+/// Extended `SQLITE_CONSTRAINT_CHECK` (`19 | (1 << 8)`).
+const SQLITE_CONSTRAINT_CHECK: i32 = 275;
+
+// Drift-pin: assert each pinned constant equals the SQLite header value it
+// documents (which is `PRIMARY_CONSTRAINT | (subtype << 8)`), so a typo in a
+// literal above is a build error, not a mis-classification.
+const _: () = {
+    assert!(SQLITE_CONSTRAINT_UNIQUE == PRIMARY_CONSTRAINT | (8 << 8));
+    assert!(SQLITE_CONSTRAINT_PRIMARYKEY == PRIMARY_CONSTRAINT | (6 << 8));
+    assert!(SQLITE_CONSTRAINT_NOTNULL == PRIMARY_CONSTRAINT | (5 << 8));
+    assert!(SQLITE_CONSTRAINT_FOREIGNKEY == PRIMARY_CONSTRAINT | (3 << 8));
+    assert!(SQLITE_CONSTRAINT_CHECK == PRIMARY_CONSTRAINT | (1 << 8));
+};
+
 impl SqliteError {
     /// The PRIMARY SQLite result code carried by a [`SqliteError::Sqlite`], if
     /// any. [`From<rusqlite::Error>`] stores the full EXTENDED code; this masks
@@ -188,6 +234,43 @@ impl SqliteError {
             _ => None,
         }
     }
+
+    /// Check if this is a UNIQUE / PRIMARY KEY constraint violation
+    /// (`SQLITE_CONSTRAINT_UNIQUE` or `SQLITE_CONSTRAINT_PRIMARYKEY`).
+    ///
+    /// Both extended subtypes count, because a duplicate PRIMARY KEY and a
+    /// duplicate UNIQUE index are ONE class on the PostgreSQL side (both are
+    /// SQLSTATE `23505`), so this predicate reads identically across backends —
+    /// see the cross-backend `BackendError::is_unique_violation`.
+    #[must_use]
+    pub fn is_unique_violation(&self) -> bool {
+        matches!(
+            self.code(),
+            Some(SQLITE_CONSTRAINT_UNIQUE | SQLITE_CONSTRAINT_PRIMARYKEY)
+        )
+    }
+
+    /// Check if this is a NOT NULL constraint violation
+    /// (`SQLITE_CONSTRAINT_NOTNULL`) — the peer of PostgreSQL SQLSTATE `23502`.
+    #[must_use]
+    pub fn is_not_null_violation(&self) -> bool {
+        self.code() == Some(SQLITE_CONSTRAINT_NOTNULL)
+    }
+
+    /// Check if this is a FOREIGN KEY constraint violation
+    /// (`SQLITE_CONSTRAINT_FOREIGNKEY`) — the peer of PostgreSQL SQLSTATE
+    /// `23503`.
+    #[must_use]
+    pub fn is_foreign_key_violation(&self) -> bool {
+        self.code() == Some(SQLITE_CONSTRAINT_FOREIGNKEY)
+    }
+
+    /// Check if this is a CHECK constraint violation
+    /// (`SQLITE_CONSTRAINT_CHECK`) — the peer of PostgreSQL SQLSTATE `23514`.
+    #[must_use]
+    pub fn is_check_violation(&self) -> bool {
+        self.code() == Some(SQLITE_CONSTRAINT_CHECK)
+    }
 }
 
 impl core::fmt::Display for SqliteError {
@@ -217,7 +300,11 @@ impl core::fmt::Display for SqliteError {
             }
             Self::InexactFloat { column, value } => write!(
                 f,
-                "column {column}: integer {value} is not exactly representable as f64",
+                "column {column}: integer {value} is not exactly representable as the requested float",
+            ),
+            Self::InexactFloatNarrowing { column, value } => write!(
+                f,
+                "column {column}: real {value} does not narrow to f32 exactly (read it as f64)",
             ),
             Self::NotABoolean { column, value } => {
                 write!(f, "column {column}: integer {value} is not a boolean (0 or 1)")

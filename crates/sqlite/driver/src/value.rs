@@ -400,6 +400,47 @@ impl FromColumn<'_> for f64 {
     }
 }
 
+impl FromColumn<'_> for f32 {
+    fn from_column(column: usize, value: ValueRef<'_>) -> Result<Self, SqliteError> {
+        // The narrowing float read — the checked peer of the `i16`/`i32`
+        // narrowings and of `f64`'s integer coercion. SQLite has no `f32`
+        // storage class (a REAL is always an 8-byte `f64`), so a read succeeds
+        // only when the conversion is provably lossless, and is a loud classified
+        // error otherwise — never a silently rounded/overflowed approximation.
+        match value {
+            // A REAL narrows to `f32` only when it round-trips exactly
+            // (`f64 -> f32 -> f64` is the identity). A magnitude past `f32::MAX`
+            // (which would narrow to `±inf`) or a value needing more than `f32`'s
+            // 24-bit mantissa fails the round-trip and is the classified
+            // `InexactFloatNarrowing`. NaN is a valid `f32` value (representable),
+            // so it is accepted directly — but a `!=`-based round-trip check would
+            // reject it (`NaN != NaN`), so it is special-cased first.
+            ValueRef::Real(v) if v.is_nan() => Ok(Self::NAN),
+            ValueRef::Real(v) => {
+                let narrowed = narrow_f64_to_f32(v);
+                if f64::from(narrowed) == v {
+                    Ok(narrowed)
+                } else {
+                    Err(SqliteError::InexactFloatNarrowing { column, value: v })
+                }
+            }
+            // An INTEGER read as `f32` is lossless only within `f32`'s exact
+            // integer range `[-(2^24), 2^24]` (its 24-bit mantissa) — the tighter
+            // peer of `f64`'s `[-(2^53), 2^53]`. Outside it, the classified
+            // `InexactFloat` ("read it as i64"), never a rounded value.
+            ValueRef::Integer(n) if (-(1i64 << 24)..=(1i64 << 24)).contains(&n) => {
+                Ok(exact_i64_as_f32(n))
+            }
+            ValueRef::Integer(n) => Err(SqliteError::InexactFloat { column, value: n }),
+            other => Err(SqliteError::TypeMismatch {
+                column,
+                expected: Type::Real,
+                found: other.data_type(),
+            }),
+        }
+    }
+}
+
 impl FromColumn<'_> for bool {
     fn from_column(column: usize, value: ValueRef<'_>) -> Result<Self, SqliteError> {
         match value {
@@ -466,4 +507,31 @@ impl FromColumn<'_> for Vec<u8> {
 )]
 fn exact_i64_as_f64(n: i64) -> f64 {
     n as f64
+}
+
+/// Convert an integer already proven to lie within `[-(2^24), 2^24]` to `f32`.
+/// Every such integer is exactly representable in `f32`'s 24-bit mantissa, so
+/// this is lossless (not a silent truncation) — the `f32` peer of
+/// [`exact_i64_as_f64`], isolated behind the same checked-then-widen boundary.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "caller proves n is within [-(2^24), 2^24]; every such integer is exactly representable as f32, so the widening is lossless"
+)]
+fn exact_i64_as_f32(n: i64) -> f32 {
+    n as f32
+}
+
+/// Narrow a `f64` to `f32` (round-to-nearest). LOSSY in general, so the sole
+/// caller ([`f32::from_column`](FromColumn::from_column)) checks the round-trip
+/// (`f64::from(narrowed) == source`) and classifies a non-round-tripping value
+/// rather than returning it — this helper only isolates the one narrowing cast in
+/// the crate so it is auditable in a single place.
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "the sole caller checks the round-trip and rejects a lossy narrow as InexactFloatNarrowing; this isolates the one f64->f32 cast for audit"
+)]
+fn narrow_f64_to_f32(v: f64) -> f32 {
+    v as f32
 }

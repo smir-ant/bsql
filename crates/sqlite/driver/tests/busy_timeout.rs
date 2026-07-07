@@ -49,10 +49,10 @@ impl Drop for TempDb {
 fn busy_timeout_waits_then_classifies_and_zero_fails_immediately() {
     let db = TempDb::new("wait");
     let a = Connection::open(&db.path).expect("open A (WAL)");
-    a.execute("CREATE TABLE t(x INTEGER)").expect("create");
+    a.execute_sql("CREATE TABLE t(x INTEGER)").expect("create");
 
     // A takes the write lock and holds it for the rest of the test.
-    a.execute("BEGIN IMMEDIATE").expect("A acquires the write lock");
+    a.execute_sql("BEGIN IMMEDIATE").expect("A acquires the write lock");
 
     let b = Connection::open(&db.path).expect("open B (WAL)");
 
@@ -60,7 +60,7 @@ fn busy_timeout_waits_then_classifies_and_zero_fails_immediately() {
     // busy error — proof it waited (elapsed well above zero) but did NOT hang.
     b.set_busy_timeout(Duration::from_millis(150)).expect("set 150ms");
     let start = Instant::now();
-    let waited = b.execute("INSERT INTO t VALUES (1)").expect_err("contended write must fail");
+    let waited = b.execute_sql("INSERT INTO t VALUES (1)").expect_err("contended write must fail");
     let waited_elapsed = start.elapsed();
     assert!(waited.is_busy(), "a contended write is a classified busy error, got {waited:?}");
     assert!(
@@ -71,7 +71,7 @@ fn busy_timeout_waits_then_classifies_and_zero_fails_immediately() {
     // (2) ZERO timeout: B fails IMMEDIATELY — the honest fail-loud, no blocking.
     b.set_busy_timeout(Duration::ZERO).expect("set zero");
     let start = Instant::now();
-    let immediate = b.execute("INSERT INTO t VALUES (2)").expect_err("contended write must fail");
+    let immediate = b.execute_sql("INSERT INTO t VALUES (2)").expect_err("contended write must fail");
     let immediate_elapsed = start.elapsed();
     assert!(immediate.is_busy(), "still a classified busy error, got {immediate:?}");
     assert!(
@@ -80,5 +80,5 @@ fn busy_timeout_waits_then_classifies_and_zero_fails_immediately() {
     );
 
     // Release A's lock before the sidecar files are removed on drop.
-    a.execute("ROLLBACK").expect("release lock");
+    a.execute_sql("ROLLBACK").expect("release lock");
 }

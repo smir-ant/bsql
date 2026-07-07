@@ -252,24 +252,15 @@ impl Row {
     /// `true` if this row has zero columns.
     pub fn is_empty(&self) -> bool { self.arena.n_cols == 0 }
 
-    /// Decode the column named `name` (resolved against `column_names`) into any
-    /// type proto's classified text-decode matrix covers.
-    ///
-    /// - `Err(ColumnError::UnknownColumn)` — no column with that name.
-    /// - otherwise identical to [`get`](Self::get) for the resolved index.
-    pub fn get_by_name<'a, T>(
-        &'a self,
-        name: &str,
-        column_names: &[String],
-    ) -> Result<Option<T>, ColumnError>
-    where
-        T: Cell<'a, TextFmt>,
-    {
-        match column_names.iter().position(|n| n == name) {
-            Some(idx) => self.get::<T>(idx),
-            None => Err(ColumnError::UnknownColumn),
-        }
-    }
+    // By-NAME access is deliberately NOT on `Row`: a bare `Row` carries no column
+    // names (16 bytes: an `Arc<ArenaInner>` + a row index — the names live on the
+    // owning `QueryResult`), so a name→index resolution needs the names from THAT
+    // result. Threading them as a caller-supplied `&[String]` was a silent-mis-
+    // decode footgun (the WRONG result's same-width names array resolves `name` to
+    // a different index and decodes the wrong column's bytes as `T`). By-name reads
+    // go through [`RowRef`], minted by [`QueryResult::row`] / [`QueryResult::rows`],
+    // which pairs each row with its OWN result's names — so a mismatch is
+    // structurally impossible, not merely discouraged.
 }
 
 // ─── ArenaSealError ─────────────────────────────────────────
@@ -656,6 +647,85 @@ impl QueryResult {
     pub fn into_vec(self) -> Vec<Row> {
         self.rows.into_vec()
     }
+
+    /// The row at zero-based index `i` as a [`RowRef`] — a positional [`Row`]
+    /// paired with THIS result's column names, enabling by-name reads
+    /// ([`RowRef::get_by_name`]) WITHOUT the caller threading a names slice.
+    ///
+    /// Because the names come from the same `QueryResult` the row was minted
+    /// from, a name can never resolve against a foreign result's array — the
+    /// wrong-column silent-mis-decode that a caller-threaded `&[String]` allowed
+    /// is structurally impossible here. `None` if `i >= len()`. Mints one 16-byte
+    /// `Arc`-clone `Row` handle (O(1)); the names are borrowed, not cloned.
+    #[must_use]
+    pub fn row(&self, i: usize) -> Option<RowRef<'_>> {
+        self.rows.get(i).map(|row| RowRef { row, names: &self.column_names })
+    }
+
+    /// A lazy iterator over the rows as [`RowRef`]s — each a positional [`Row`]
+    /// paired with this result's names, so a by-name read needs no threaded
+    /// slice. The by-name peer of [`iter`](Self::iter) (which yields bare
+    /// positional [`Row`]s); no per-row allocation.
+    pub fn rows(&self) -> impl Iterator<Item = RowRef<'_>> + '_ {
+        self.rows.iter().map(move |row| RowRef { row, names: &self.column_names })
+    }
+}
+
+// ─── RowRef ─────────────────────────────────────────────────
+
+/// A row paired with its result's column names — the by-NAME read view.
+///
+/// Minted by [`QueryResult::row`] / [`QueryResult::rows`], it borrows the owning
+/// result's names (`&'q [String]`) alongside one positional [`Row`] handle, so
+/// [`get_by_name`](Self::get_by_name) resolves a name against the SAME result the
+/// row came from. This is what makes a by-name read injection-safe by
+/// CONSTRUCTION: there is no way to pair a `Row` with a foreign result's names,
+/// so the wrong-column mis-decode a caller-threaded `&[String]` permitted cannot
+/// be expressed. Positional access is still available through [`row`](Self::row)
+/// (the underlying `Row`, with its zero-copy positional getters).
+///
+/// A borrow view, distinct from the pinned 16-byte [`Row`] (which stays a
+/// detachable `'static` handle): `RowRef` is 32 bytes (a `Row` + a names fat
+/// pointer) and lives only as long as its `QueryResult`.
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct RowRef<'q> {
+    row: Row,
+    names: &'q [String],
+}
+
+// Footprint pin: a 16-byte `Row` + a 16-byte `&[String]` fat pointer. The view
+// deliberately does NOT grow `Row` (whose 16-byte pin makes it a cheap 'static
+// handle); it pairs an unchanged `Row` with a borrowed names slice. Pinned at a
+// `'static` instantiation — `size_of`/`align_of` need a concrete lifetime.
+crate::footprint_pin!(RowRef<'static>, size = 32, align = 8);
+
+impl<'q> RowRef<'q> {
+    /// The underlying positional [`Row`] — for index-based reads
+    /// (`get`/`get_i32`/`get_str`/…) and to detach a `'static` handle.
+    pub fn row(&self) -> &Row {
+        &self.row
+    }
+
+    /// Decode the column named `name` (resolved against this result's own names)
+    /// into any type proto's classified text-decode matrix covers.
+    ///
+    /// - `Err(ColumnError::UnknownColumn)` — no column with that name in THIS
+    ///   result.
+    /// - otherwise identical to [`Row::get`] for the resolved index.
+    ///
+    /// The name resolves against the names of the `QueryResult` this view was
+    /// minted from, so it always decodes the intended column — a caller cannot
+    /// supply a mismatched names array.
+    pub fn get_by_name<'a, T>(&'a self, name: &str) -> Result<Option<T>, ColumnError>
+    where
+        T: Cell<'a, TextFmt>,
+    {
+        match self.names.iter().position(|n| n == name) {
+            Some(idx) => self.row.get::<T>(idx),
+            None => Err(ColumnError::UnknownColumn),
+        }
+    }
 }
 
 // ─── Notification ───────────────────────────────────────────
@@ -902,15 +972,38 @@ mod tests {
     }
 
     #[test]
-    fn get_by_name_resolves_or_classifies_unknown() {
-        let rows = one_col_row(b"alice");
-        let row = rows.get(0).expect("row 0");
-        let names = vec!["name".to_string()];
-        assert_eq!(row.get_by_name::<&str>("name", &names), Ok(Some("alice")));
+    fn row_ref_resolves_by_name_against_its_own_result() {
+        // Two DISTINCT columns, so a WRONG name→index resolution would read a
+        // different column's bytes. The retired `Row::get_by_name(name, &names)`
+        // let a caller thread ANY same-width names array (the footgun: the wrong
+        // result's names decode the wrong column as `T`). `RowRef`, minted by
+        // `QueryResult::row`, resolves against the SAME result's own names, so it
+        // always reads the intended column — a mismatch is not expressible.
+        let mut ab = ArenaBuilder::new(2);
+        ab.push_value(b"alice"); // col 0 = "name"
+        ab.push_value(b"30"); // col 1 = "age"
+        ab.end_row();
+        let rows = match ab.finish() {
+            Ok(r) => r,
+            Err(e) => panic!("unexpected seal error: {e}"),
+        };
+        let names: Arc<[String]> = vec!["name".to_string(), "age".to_string()].into();
+        let result = QueryResult::new(rows, "SELECT 1".to_string(), names);
+
+        let row_ref = result.row(0).expect("row 0");
+        // Each name resolves to its OWN column — "age" is col 1 (=30), not col 0.
+        assert_eq!(row_ref.get_by_name::<i32>("age"), Ok(Some(30)));
+        assert_eq!(row_ref.get_by_name::<&str>("name"), Ok(Some("alice")));
+        // Unknown name is classified, never a silent wrong-column read.
         assert_eq!(
-            row.get_by_name::<&str>("missing", &names),
+            row_ref.get_by_name::<&str>("missing"),
             Err(ColumnError::UnknownColumn),
         );
+        // The underlying positional `Row` is still reachable and unchanged.
+        assert_eq!(row_ref.row().get_i32(1), Ok(Some(30)));
+        // The by-name iterator yields the same view over each row.
+        let first = result.rows().next().expect("one row");
+        assert_eq!(first.get_by_name::<&str>("name"), Ok(Some("alice")));
     }
 
     /// N→1 clone witness: the single-row read (`query_one`'s path) mints EXACTLY

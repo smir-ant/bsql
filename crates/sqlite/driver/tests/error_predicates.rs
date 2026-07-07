@@ -46,10 +46,10 @@ fn unique_violation_is_a_constraint_violation() {
     // A duplicate PRIMARY KEY yields an EXTENDED constraint code
     // (SQLITE_CONSTRAINT_PRIMARYKEY = 1555 / _UNIQUE = 2067), never bare 19.
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT UNIQUE)").expect("create");
-    conn.execute("INSERT INTO t VALUES (1, 'alice')").expect("first insert");
+    conn.execute_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT UNIQUE)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES (1, 'alice')").expect("first insert");
 
-    let err = conn.execute("INSERT INTO t VALUES (1, 'bob')").expect_err("duplicate PK must fail");
+    let err = conn.execute_sql("INSERT INTO t VALUES (1, 'bob')").expect_err("duplicate PK must fail");
     let code = err.code().expect("a SQLite error carries a code");
     assert_ne!(
         code, 19,
@@ -65,7 +65,7 @@ fn unique_violation_is_a_constraint_violation() {
 
     // A distinct constraint subtype (the second, UNIQUE, column) also classifies.
     let dup_name = conn
-        .execute("INSERT INTO t VALUES (2, 'alice')")
+        .execute_sql("INSERT INTO t VALUES (2, 'alice')")
         .expect_err("duplicate name must violate the UNIQUE constraint");
     assert!(
         dup_name.is_constraint_violation(),
@@ -82,20 +82,20 @@ fn wal_write_conflict_is_busy() {
     let reader = Connection::open(&db.path).expect("open reader (WAL)");
     let writer = Connection::open(&db.path).expect("open writer (WAL)");
 
-    reader.execute("CREATE TABLE t(x INTEGER)").expect("create");
-    reader.execute("INSERT INTO t VALUES (0)").expect("seed");
+    reader.execute_sql("CREATE TABLE t(x INTEGER)").expect("create");
+    reader.execute_sql("INSERT INTO t VALUES (0)").expect("seed");
 
     // Establish a read snapshot on `reader` (a deferred BEGIN takes the snapshot
     // at the first read).
-    reader.execute("BEGIN").expect("begin read txn");
+    reader.execute_sql("BEGIN").expect("begin read txn");
     let seen = reader.query_sql("SELECT x FROM t").expect("read snapshot");
     assert_eq!(seen.len(), 1);
 
     // A concurrent autocommit write advances the WAL past `reader`'s snapshot.
-    writer.execute("INSERT INTO t VALUES (1)").expect("concurrent commit");
+    writer.execute_sql("INSERT INTO t VALUES (1)").expect("concurrent commit");
 
     // `reader` now tries to upgrade its stale snapshot to a write → BUSY_SNAPSHOT.
-    let err = reader.execute("INSERT INTO t VALUES (2)").expect_err("stale-snapshot write must fail");
+    let err = reader.execute_sql("INSERT INTO t VALUES (2)").expect_err("stale-snapshot write must fail");
     let code = err.code().expect("a SQLite busy error carries a code");
     assert_ne!(
         code, 5,
@@ -108,5 +108,5 @@ fn wal_write_conflict_is_busy() {
 
     // Roll the reader back so its WAL read lock is released before the sidecar
     // files are removed on drop.
-    reader.execute("ROLLBACK").expect("rollback");
+    reader.execute_sql("ROLLBACK").expect("rollback");
 }

@@ -101,7 +101,7 @@ pub use n1::{N1Report, N1Tracker};
 pub use notify::{capture_notify, NotificationLedger, TypedNotification};
 pub use sql_ident::{SafeIdent, SafeTable};
 pub use typed_rows::{Rows, RowsBuilder};
-pub use types::{ArenaBuilder, ArenaSealError, Notification, QueryResult, Row, RowSet};
+pub use types::{ArenaBuilder, ArenaSealError, Notification, QueryResult, Row, RowRef, RowSet};
 
 /// The sealed parameter-encoding contract every `*_params` / typed verb takes
 /// (`&(a, b)` tuples up to arity 16). Re-exported so a consumer can write a

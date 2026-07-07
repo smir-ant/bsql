@@ -54,8 +54,12 @@ impl DbError {
     pub fn is_code(&self, code: &str) -> bool { self.code == code }
     /// `true` if the SQLSTATE is `23505` (`unique_violation`).
     pub fn is_unique_violation(&self) -> bool { self.code == "23505" }
+    /// `true` if the SQLSTATE is `23502` (`not_null_violation`).
+    pub fn is_not_null_violation(&self) -> bool { self.code == "23502" }
     /// `true` if the SQLSTATE is `23503` (`foreign_key_violation`).
     pub fn is_foreign_key_violation(&self) -> bool { self.code == "23503" }
+    /// `true` if the SQLSTATE is `23514` (`check_violation`).
+    pub fn is_check_violation(&self) -> bool { self.code == "23514" }
 }
 
 /// Why reading a typed value from a dynamic [`Row`](crate::Row) column failed.

@@ -19,8 +19,8 @@ fn open_in_memory() {
 #[test]
 fn create_table_and_insert() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)").expect("create");
-    let changed = conn.execute("INSERT INTO t VALUES (1, 'alice')").expect("insert");
+    conn.execute_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)").expect("create");
+    let changed = conn.execute_sql("INSERT INTO t VALUES (1, 'alice')").expect("insert");
     assert_eq!(changed, 1);
     conn.close().expect("close");
 }
@@ -28,8 +28,8 @@ fn create_table_and_insert() {
 #[test]
 fn query_rows() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(id INTEGER, name TEXT)").expect("create");
-    conn.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')").expect("insert");
+    conn.execute_sql("CREATE TABLE t(id INTEGER, name TEXT)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')").expect("insert");
 
     let result = conn.query_sql("SELECT id, name FROM t ORDER BY id").expect("select");
     assert_eq!(result.column_count(), 2);
@@ -44,8 +44,8 @@ fn query_rows() {
 #[test]
 fn query_with_params() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(id INTEGER, v TEXT)").expect("create");
-    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").expect("insert");
+    conn.execute_sql("CREATE TABLE t(id INTEGER, v TEXT)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").expect("insert");
 
     // Bind a TRUE integer parameter (not the text "1" the old text-only path
     // forced): `id INTEGER > ?` compares integer-to-integer with no affinity coercion.
@@ -59,7 +59,7 @@ fn query_with_params() {
 #[test]
 fn execute_with_params() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(id INTEGER, v TEXT)").expect("create");
+    conn.execute_sql("CREATE TABLE t(id INTEGER, v TEXT)").expect("create");
 
     // A mixed param list: an integer bound as INTEGER, a string bound as TEXT —
     // the `.into()` ergonomic keeps common binds terse.
@@ -106,7 +106,7 @@ fn typed_access() {
 #[test]
 fn empty_result() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(id INTEGER)").expect("create");
+    conn.execute_sql("CREATE TABLE t(id INTEGER)").expect("create");
     let result = conn.query_sql("SELECT id FROM t").expect("select");
     assert_eq!(result.len(), 0);
     assert_eq!(result.column_count(), 1);
@@ -115,9 +115,9 @@ fn empty_result() {
 #[test]
 fn many_rows() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(i INTEGER)").expect("create");
+    conn.execute_sql("CREATE TABLE t(i INTEGER)").expect("create");
     for i in 0..1000 {
-        conn.execute(&format!("INSERT INTO t VALUES ({i})")).expect("insert");
+        conn.execute_sql(&format!("INSERT INTO t VALUES ({i})")).expect("insert");
     }
     let result = conn.query_sql("SELECT i FROM t ORDER BY i").expect("select");
     assert_eq!(result.len(), 1000);
@@ -135,20 +135,20 @@ fn bad_sql_returns_error() {
 #[test]
 fn foreign_keys_enforced() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)").expect("create parent");
-    conn.execute("CREATE TABLE child(id INTEGER, pid INTEGER REFERENCES parent(id))")
+    conn.execute_sql("CREATE TABLE parent(id INTEGER PRIMARY KEY)").expect("create parent");
+    conn.execute_sql("CREATE TABLE child(id INTEGER, pid INTEGER REFERENCES parent(id))")
         .expect("create child");
-    let result = conn.execute("INSERT INTO child VALUES (1, 999)");
+    let result = conn.execute_sql("INSERT INTO child VALUES (1, 999)");
     assert!(result.is_err(), "FK violation should fail");
 }
 
 #[test]
 fn transaction_commit() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(v INTEGER)").expect("create");
-    conn.execute("BEGIN").expect("begin");
-    conn.execute("INSERT INTO t VALUES (1)").expect("insert");
-    conn.execute("COMMIT").expect("commit");
+    conn.execute_sql("CREATE TABLE t(v INTEGER)").expect("create");
+    conn.execute_sql("BEGIN").expect("begin");
+    conn.execute_sql("INSERT INTO t VALUES (1)").expect("insert");
+    conn.execute_sql("COMMIT").expect("commit");
 
     let result = conn.query_sql("SELECT v FROM t").expect("select");
     assert_eq!(result.len(), 1);
@@ -157,11 +157,11 @@ fn transaction_commit() {
 #[test]
 fn transaction_rollback() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(v INTEGER)").expect("create");
-    conn.execute("INSERT INTO t VALUES (1)").expect("seed");
-    conn.execute("BEGIN").expect("begin");
-    conn.execute("INSERT INTO t VALUES (2)").expect("insert");
-    conn.execute("ROLLBACK").expect("rollback");
+    conn.execute_sql("CREATE TABLE t(v INTEGER)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES (1)").expect("seed");
+    conn.execute_sql("BEGIN").expect("begin");
+    conn.execute_sql("INSERT INTO t VALUES (2)").expect("insert");
+    conn.execute_sql("ROLLBACK").expect("rollback");
 
     let result = conn.query_sql("SELECT v FROM t").expect("select");
     assert_eq!(result.len(), 1);
@@ -171,8 +171,8 @@ fn transaction_rollback() {
 #[test]
 fn blob_roundtrip() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(data BLOB)").expect("create");
-    conn.execute("INSERT INTO t VALUES (X'DEADBEEF')").expect("insert");
+    conn.execute_sql("CREATE TABLE t(data BLOB)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES (X'DEADBEEF')").expect("insert");
 
     let result = conn.query_sql("SELECT data FROM t").expect("select");
     assert_eq!(result.get(0).expect("row 0").get::<&[u8]>(0).expect("blob"), [0xDE, 0xAD, 0xBE, 0xEF].as_slice());
@@ -187,8 +187,8 @@ fn open_file_and_reopen() {
 
     {
         let conn = Connection::open(&dir).expect("open");
-        conn.execute("CREATE TABLE t(v INTEGER)").expect("create");
-        conn.execute("INSERT INTO t VALUES (42)").expect("insert");
+        conn.execute_sql("CREATE TABLE t(v INTEGER)").expect("create");
+        conn.execute_sql("INSERT INTO t VALUES (42)").expect("insert");
         conn.close().expect("close");
     }
     {
@@ -222,8 +222,8 @@ fn column_names() {
 #[test]
 fn query_one_and_opt() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(v int)").expect("create");
-    conn.execute("INSERT INTO t VALUES (42)").expect("insert");
+    conn.execute_sql("CREATE TABLE t(v int)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES (42)").expect("insert");
 
     let row = conn.query_one_sql("SELECT v FROM t").expect("query_one");
     assert_eq!(row.get::<i32>(0).expect("v"), 42);
@@ -233,18 +233,56 @@ fn query_one_and_opt() {
 }
 
 #[test]
+fn f32_reads_lossless_or_classifies() {
+    // The checked f32 narrow: a REAL/INTEGER read as f32 succeeds only when the
+    // conversion is provably lossless, and is a classified error otherwise —
+    // never a silently rounded/overflowed value.
+    let conn = Connection::open_in_memory().expect("open");
+
+    // In-range REAL, exactly representable in f32 -> Ok.
+    let row = conn.query_one_sql("SELECT 2.5").expect("query 2.5");
+    assert_eq!(row.get::<f32>(0).expect("2.5 narrows exactly"), 2.5_f32);
+
+    // In-range INTEGER within f32's 24-bit mantissa -> Ok (lossless widen).
+    let row = conn.query_one_sql("SELECT 100").expect("query 100");
+    assert_eq!(row.get::<f32>(0).expect("100 as f32"), 100.0_f32);
+
+    // A REAL needing more than f32's mantissa (the f64 nearest 0.1) -> classified.
+    let row = conn.query_one_sql("SELECT 0.1").expect("query 0.1");
+    match row.get::<f32>(0) {
+        Err(SqliteError::InexactFloatNarrowing { column, .. }) => assert_eq!(column, 0),
+        other => panic!("0.1 must not narrow to f32 exactly: {other:?}"),
+    }
+
+    // A REAL past f32::MAX (would overflow to +inf) -> classified.
+    let row = conn.query_one_sql("SELECT 1e40").expect("query 1e40");
+    assert!(matches!(row.get::<f32>(0), Err(SqliteError::InexactFloatNarrowing { .. })));
+
+    // An INTEGER beyond f32's exact range (2^24 + 1) -> classified InexactFloat.
+    let row = conn.query_one_sql("SELECT 16777217").expect("query 2^24+1");
+    match row.get::<f32>(0) {
+        Err(SqliteError::InexactFloat { value, .. }) => assert_eq!(value, 16_777_217),
+        other => panic!("2^24+1 is not exact as f32: {other:?}"),
+    }
+
+    // A non-numeric column read as f32 -> TypeMismatch.
+    let row = conn.query_one_sql("SELECT 'hi'").expect("query text");
+    assert!(matches!(row.get::<f32>(0), Err(SqliteError::TypeMismatch { .. })));
+}
+
+#[test]
 fn transaction_helpers() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(v int)").expect("create");
+    conn.execute_sql("CREATE TABLE t(v int)").expect("create");
 
     conn.begin().expect("begin");
-    conn.execute("INSERT INTO t VALUES (1)").expect("insert");
+    conn.execute_sql("INSERT INTO t VALUES (1)").expect("insert");
     conn.commit().expect("commit");
     let r = conn.query_sql("SELECT count(*) FROM t").expect("count");
     assert_eq!(r.get(0).expect("row 0").get::<i64>(0).expect("count"), 1);
 
     conn.begin().expect("begin2");
-    conn.execute("INSERT INTO t VALUES (2)").expect("insert2");
+    conn.execute_sql("INSERT INTO t VALUES (2)").expect("insert2");
     conn.rollback().expect("rollback");
     let r = conn.query_sql("SELECT count(*) FROM t").expect("count2");
     assert_eq!(r.get(0).expect("row 0").get::<i64>(0).expect("count2"), 1);
@@ -253,8 +291,8 @@ fn transaction_helpers() {
 #[test]
 fn unicode_values() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(v text)").expect("create");
-    conn.execute("INSERT INTO t VALUES ('Привет мир')").expect("insert");
+    conn.execute_sql("CREATE TABLE t(v text)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES ('Привет мир')").expect("insert");
     let result = conn.query_sql("SELECT v FROM t").expect("query");
     assert_eq!(result.get(0).expect("row 0").get::<&str>(0).expect("v"), "Привет мир");
     assert_eq!(result.get(0).expect("row 0").get::<String>(0).expect("owned"), "Привет мир".to_string());
@@ -263,9 +301,9 @@ fn unicode_values() {
 #[test]
 fn transaction_closure_commit() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(v int)").expect("create");
+    conn.execute_sql("CREATE TABLE t(v int)").expect("create");
     conn.transaction(|c| {
-        c.execute("INSERT INTO t VALUES (1)")?;
+        c.execute_sql("INSERT INTO t VALUES (1)")?;
         Ok(())
     })
     .expect("tx");
@@ -276,10 +314,10 @@ fn transaction_closure_commit() {
 #[test]
 fn transaction_closure_rollback_on_err() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(v int)").expect("create");
-    conn.execute("INSERT INTO t VALUES (1)").expect("seed");
+    conn.execute_sql("CREATE TABLE t(v int)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES (1)").expect("seed");
     let err: Result<(), _> = conn.transaction(|c| {
-        c.execute("INSERT INTO t VALUES (2)")?;
+        c.execute_sql("INSERT INTO t VALUES (2)")?;
         Err(SqliteError::Query("forced".to_string()))
     });
     assert!(err.is_err());
@@ -290,11 +328,11 @@ fn transaction_closure_rollback_on_err() {
 #[test]
 fn transaction_closure_return_value() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(v int)").expect("create");
+    conn.execute_sql("CREATE TABLE t(v int)").expect("create");
     let count = conn
         .transaction(|c| {
-            c.execute("INSERT INTO t VALUES (1)")?;
-            c.execute("INSERT INTO t VALUES (2)")?;
+            c.execute_sql("INSERT INTO t VALUES (1)")?;
+            c.execute_sql("INSERT INTO t VALUES (2)")?;
             let r = c.query_sql("SELECT count(*) FROM t")?;
             r.get(0).expect("row 0").get::<i64>(0)
         })
@@ -507,8 +545,8 @@ fn column_index_out_of_bounds_is_classified() {
 #[test]
 fn query_each_streams_all_rows() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(i INTEGER)").expect("create");
-    conn.execute("INSERT INTO t VALUES (0),(1),(2),(3),(4)").expect("insert");
+    conn.execute_sql("CREATE TABLE t(i INTEGER)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES (0),(1),(2),(3),(4)").expect("insert");
 
     let mut sum = 0i64;
     let mut n = 0usize;
@@ -527,8 +565,8 @@ fn query_each_streams_all_rows() {
 #[test]
 fn query_each_breaks_early() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(i INTEGER)").expect("create");
-    conn.execute("INSERT INTO t VALUES (0),(1),(2),(3),(4)").expect("insert");
+    conn.execute_sql("CREATE TABLE t(i INTEGER)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES (0),(1),(2),(3),(4)").expect("insert");
 
     let mut seen = 0usize;
     let outcome = conn
@@ -549,8 +587,8 @@ fn query_each_breaks_early() {
 #[test]
 fn query_each_zero_copy_text_and_blob_borrow() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(s TEXT, b BLOB)").expect("create");
-    conn.execute("INSERT INTO t VALUES ('hello', X'DEADBEEF')").expect("insert");
+    conn.execute_sql("CREATE TABLE t(s TEXT, b BLOB)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES ('hello', X'DEADBEEF')").expect("insert");
 
     let outcome = conn
         .query_each_sql("SELECT s, b FROM t", |row| {
@@ -572,8 +610,8 @@ fn query_each_zero_copy_text_and_blob_borrow() {
 #[test]
 fn query_each_params() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(id INTEGER, v TEXT)").expect("create");
-    conn.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").expect("insert");
+    conn.execute_sql("CREATE TABLE t(id INTEGER, v TEXT)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").expect("insert");
 
     let mut collected: Vec<String> = Vec::new();
     let outcome = conn
@@ -604,8 +642,8 @@ fn full_lifecycle_integration() {
         .expect("create");
 
     conn.transaction(|tx| {
-        tx.execute("INSERT INTO users(name, score) VALUES ('alice', 95.5)")?;
-        tx.execute("INSERT INTO users(name, score) VALUES ('bob', 88.0)")?;
+        tx.execute_sql("INSERT INTO users(name, score) VALUES ('alice', 95.5)")?;
+        tx.execute_sql("INSERT INTO users(name, score) VALUES ('bob', 88.0)")?;
         Ok(())
     })
     .expect("tx");
@@ -626,7 +664,7 @@ fn full_lifecycle_integration() {
 
     // Error in transaction → rollback.
     let err: Result<(), _> = conn.transaction(|tx| {
-        tx.execute("INSERT INTO users(name) VALUES ('charlie')")?;
+        tx.execute_sql("INSERT INTO users(name) VALUES ('charlie')")?;
         Err(SqliteError::Query("abort".to_string()))
     });
     assert!(err.is_err());
@@ -646,7 +684,7 @@ fn full_lifecycle_integration() {
 #[test]
 fn null_parameter_round_trips() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(id INTEGER, note TEXT)").expect("create");
+    conn.execute_sql("CREATE TABLE t(id INTEGER, note TEXT)").expect("create");
 
     // Bind a real SQL NULL — impossible under the old text-only model (no `&str`
     // binds NULL; `""` binds an empty TEXT value, a different thing entirely).
@@ -676,7 +714,7 @@ fn null_parameter_round_trips() {
 #[test]
 fn blob_parameter_round_trips_byte_exact() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(data BLOB)").expect("create");
+    conn.execute_sql("CREATE TABLE t(data BLOB)").expect("create");
 
     // A blob with a non-UTF-8 byte (0xFF) and a NUL — bytes no text param could
     // carry losslessly. Bound as a BLOB, read back byte-for-byte.
@@ -708,8 +746,8 @@ fn integer_and_real_params_bind_as_their_storage_class() {
     // The affinity trap made concrete: against an affinity-less comparison
     // (`id + 0`), a text "42" would NOT equal the integer 42, silently returning
     // no rows. A true integer bind matches.
-    conn.execute("CREATE TABLE t(id INTEGER)").expect("create");
-    conn.execute("INSERT INTO t VALUES (42)").expect("seed");
+    conn.execute_sql("CREATE TABLE t(id INTEGER)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES (42)").expect("seed");
     let matched = conn
         .query_params("SELECT id FROM t WHERE id + 0 = ?", &[ValueRef::Integer(42)])
         .expect("affinity-less compare");
@@ -721,7 +759,7 @@ fn text_parameter_still_expressible() {
     // The capability the old model had — binding text — is preserved, via
     // `ValueRef::Text` or the `&str` `From` impl.
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(v TEXT)").expect("create");
+    conn.execute_sql("CREATE TABLE t(v TEXT)").expect("create");
     conn.execute_params("INSERT INTO t VALUES (?)", &[ValueRef::Text(b"explicit")]).expect("text");
     conn.execute_params("INSERT INTO t VALUES (?)", &["ergonomic".into()]).expect("text into");
 
@@ -768,10 +806,10 @@ fn unsigned_integer_reads_are_range_checked() {
 #[test]
 fn affected_count_is_u64() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t(v int)").expect("create");
+    conn.execute_sql("CREATE TABLE t(v int)").expect("create");
     // The `u64` annotation pins the return type (cross-backend parity with the
     // PostgreSQL drivers' affected-row `u64`).
-    let inserted: u64 = conn.execute("INSERT INTO t VALUES (1),(2),(3)").expect("insert");
+    let inserted: u64 = conn.execute_sql("INSERT INTO t VALUES (1),(2),(3)").expect("insert");
     assert_eq!(inserted, 3);
     let deleted: u64 = conn
         .execute_params("DELETE FROM t WHERE v > ?", &[ValueRef::Integer(1)])

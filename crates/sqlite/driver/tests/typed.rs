@@ -71,7 +71,7 @@ impl SqliteTypedQuery for CellQuery {
 }
 
 fn seed_cells(conn: &Connection) {
-    conn.execute("CREATE TABLE cells (i INTEGER, r REAL, t TEXT, b BLOB, n INTEGER)")
+    conn.execute_sql("CREATE TABLE cells (i INTEGER, r REAL, t TEXT, b BLOB, n INTEGER)")
         .expect("create");
     conn.execute_params(
         "INSERT INTO cells VALUES ($1, $2, $3, $4, $5)",
@@ -234,7 +234,7 @@ impl SqliteTypedQuery for IntRowQuery {
 #[test]
 fn storage_class_mismatch_is_classified() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t (v)").expect("create"); // no affinity — stores what it gets
+    conn.execute_sql("CREATE TABLE t (v)").expect("create"); // no affinity — stores what it gets
     conn.execute_params("INSERT INTO t VALUES ($1)", &[ValueRef::Text(b"not an int")])
         .expect("insert text");
 
@@ -258,8 +258,8 @@ fn storage_class_mismatch_is_classified() {
 #[test]
 fn null_in_non_null_field_is_classified() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute("CREATE TABLE t (v)").expect("create");
-    conn.execute("INSERT INTO t VALUES (NULL)").expect("insert null");
+    conn.execute_sql("CREATE TABLE t (v)").expect("create");
+    conn.execute_sql("INSERT INTO t VALUES (NULL)").expect("insert null");
 
     // The record declares `v: i64` (non-Option), but the value is NULL — a
     // classified UnexpectedNull, distinct from a type mismatch.

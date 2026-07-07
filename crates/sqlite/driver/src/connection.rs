@@ -653,7 +653,12 @@ impl Connection {
     }
 
     /// Execute a statement, returning the number of rows changed.
-    pub fn execute(&self, sql: &str) -> Result<u64, SqliteError> {
+    ///
+    /// The `_sql` suffix marks the DYNAMIC (raw-SQL-text) verb — the same naming
+    /// split the PostgreSQL driver uses (`execute_sql` dynamic), and the same the
+    /// other dynamic verbs here follow (`query_sql`, `query_one_sql`, …). It frees
+    /// the bare `execute` name for a future symmetric typed `execute::<Q>`.
+    pub fn execute_sql(&self, sql: &str) -> Result<u64, SqliteError> {
         Ok(changes_to_u64(self.inner.execute(sql, [])?))
     }
 
@@ -1087,7 +1092,7 @@ fn changes_to_u64(n: usize) -> u64 {
 ///
 /// Residual (inherent, shared with the PostgreSQL guard): the guard closes the
 /// METHOD-level misuse, but raw SQL text cannot be typed away on any
-/// `execute(&str)` surface — a body that runs `tx.execute("COMMIT")` (or
+/// `execute_sql(&str)` surface — a body that runs `tx.execute_sql("COMMIT")` (or
 /// `"BEGIN"` / `"SAVEPOINT s"`) as a string still reaches the engine. That is a
 /// property of accepting arbitrary SQL text, not a gap in this guard; the
 /// compile-checked boundary is the set of METHODS the closure is handed.
@@ -1097,9 +1102,10 @@ pub struct Transaction<'c> {
 }
 
 impl Transaction<'_> {
-    /// Execute a statement, returning the number of rows changed.
-    pub fn execute(&self, sql: &str) -> Result<u64, SqliteError> {
-        self.conn.execute(sql)
+    /// Execute a statement, returning the number of rows changed. See
+    /// [`Connection::execute_sql`].
+    pub fn execute_sql(&self, sql: &str) -> Result<u64, SqliteError> {
+        self.conn.execute_sql(sql)
     }
 
     /// Execute a parameterized statement, returning the number of rows changed.
