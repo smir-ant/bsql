@@ -54,7 +54,7 @@ use bsql_postgres_core::{
 use bsql_postgres_proto::engine;
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
-    Credentials, DatabaseName, Ident, PreparedQuery, RowDecode, TypedQuery,
+    Credentials, DatabaseName, Ident, PreparedQuery, RowDecode, TypedCopyIn, TypedQuery,
 };
 // `Password` / `Sensitive` build a `Credentials::ScramPassword` — SCRAM-only.
 #[cfg(feature = "scram")]
@@ -1042,6 +1042,35 @@ impl Connection {
         }
     }
 
+    /// `COPY … FROM STDIN` in PGCOPY BINARY, bulk-loading `rows` into the
+    /// compile-checked target of a [`copy!`](bsql_postgres_core::TypedCopyIn)
+    /// carrier `Q`, in CONSTANT memory — the TYPED, injection-safe-by-construction
+    /// peer of [`copy_in`](Self::copy_in).
+    ///
+    /// Each item is a typed row tuple `Q::Row<'q>`: a `NOT NULL` column is `T`, a
+    /// nullable column `Option<T>` (pass `None` for a SQL NULL), a `text` /
+    /// `bytea` column borrows the caller's data (`&'q str` / `&'q [u8]`). The
+    /// target table, column list, and per-column types were pinned at COMPILE
+    /// time by `copy!` against the migration catalog, so a wrong-typed or
+    /// wrong-arity row is a compile error — and there is no COPY text to
+    /// mis-escape (an embedded tab / newline / quote rides the binary field
+    /// verbatim), the footgun the raw [`copy_in`](Self::copy_in) leaves the
+    /// caller. Rows are NOT pre-collected; a megarow load streams in bounded
+    /// memory through the 64 KiB batcher.
+    ///
+    /// # Errors
+    ///
+    /// A row the server rejects at `CopyDone` (a constraint / type violation) is a
+    /// classified [`DriverError::Db`], and the connection RECOVERS to a clean idle
+    /// (it stays pooled). A transport fault is fatal.
+    pub async fn copy_in_typed<'q, Q, I>(&mut self, rows: I) -> Result<u64, DriverError>
+    where
+        Q: TypedCopyIn,
+        I: IntoIterator<Item = Q::Row<'q>>,
+    {
+        self.core.copy_in_typed::<Q, I>(rows).await
+    }
+
     /// `COPY <table> TO STDOUT`, streaming each row to `on_chunk` in CONSTANT
     /// memory — the bulk-unload peer of [`copy_in`](Self::copy_in).
     ///
@@ -1499,6 +1528,25 @@ impl Transaction<'_> {
                 Err(e)
             }
         }
+    }
+
+    /// `COPY … FROM STDIN` in PGCOPY BINARY into a [`copy!`](bsql_postgres_core::TypedCopyIn)
+    /// carrier `Q`'s target, in CONSTANT memory. See
+    /// [`Connection::copy_in_typed`] for the full typed contract; the
+    /// orchestration here is identical (the guard borrows the same [`Core`]), and
+    /// the deferred `BEGIN` even fuses into this COPY when it is the transaction's
+    /// FIRST statement.
+    pub async fn copy_in_typed<'q, Q, I>(&mut self, rows: I) -> Result<u64, DriverError>
+    where
+        Q: TypedCopyIn,
+        I: IntoIterator<Item = Q::Row<'q>>,
+    {
+        // Arm the deferred BEGIN at the poll of this first COPY step (the whole
+        // typed-COPY future is one Core verb, and its `copy_in_begin` stages the
+        // armed prelude), so a COPY that is the transaction's first statement
+        // still fuses the BEGIN — and a transaction future dropped before this
+        // point armed nothing.
+        self.armed(|c| c.copy_in_typed::<Q, I>(rows)).await
     }
 
     /// `COPY <table> TO STDOUT`, streaming each row to `on_chunk` in CONSTANT

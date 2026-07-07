@@ -288,6 +288,39 @@ pub(crate) fn build_copy_data_header(
     wb.push_u32_be(len)
 }
 
+/// `'d'` CopyData frame carrying one PGCOPY BINARY row: `tag | len | int16
+/// field-count | per-field {len i32, bytes}` (a field `len` of `-1` is a SQL
+/// NULL, no body). `len` is self-inclusive (PG convention). The per-field block
+/// is byte-identical to a Bind parameter block — it reuses the SAME
+/// [`ParamsWriter::write_params`] leaves — so the binary-COPY field encoding
+/// cannot drift from the `query!` parameter encoding. Streams DIRECTLY onto the
+/// growable send buffer (no per-row scratch), so a bulk load copies each field
+/// once.
+///
+/// `Err` only if the encoded row body exceeds the `u32` / `i32` wire length field
+/// (> 2 GiB — architecturally dead) — the crate's classified
+/// [`WriteBufFull`](crate::write_buf::WriteBufFull), never a panic or a silent
+/// truncation.
+#[inline]
+pub(crate) fn build_copy_binary_row<P: ParamsWriter, S: FrameSink>(
+    wb: &mut S,
+    row: &P,
+) -> Result<(), WriteBufFull> {
+    // The PGCOPY row field-count is a signed int16; `ParamsWriter` arity is
+    // 0..=16, so this conversion never truncates. The classified `WriteBufFull`
+    // covers the architecturally-dead overflow rather than an `as` cast (the
+    // crate forbids `as_conversions`).
+    let field_count = i16::try_from(P::COUNT).map_err(|_| WriteBufFull)?;
+    wb.push_u8(crate::wire::TAG_COPY_DATA.byte())?;
+    // Self-inclusive length over the row body: int16 field-count + the parameter
+    // block. The closure's tail IS `write_params`, so its `Result` propagates
+    // directly (no error-capture dance).
+    wb.with_length_prefix(|w| {
+        w.push_i16_be(field_count)?;
+        row.write_params(w)
+    })
+}
+
 /// `'f'` CopyFail frame: `tag | len | reason | NUL`. Aborts an in-progress
 /// COPY IN from the client; the server echoes the reason in its `ErrorResponse`
 /// and then returns to idle (PG §55.7). The length prefix (self-inclusive) is
@@ -465,5 +498,92 @@ mod bind_stream_twin {
         };
         assert_eq!(s.first().copied(), Some(b'B'), "non-vacuous: 'B' frame");
         assert_eq!(s, w, "streamed prepared Bind must equal the reference");
+    }
+}
+
+#[cfg(test)]
+mod copy_binary_row_twin {
+    //! Byte-twin for the PGCOPY binary ROW frame builder. Pins the EXACT wire
+    //! layout — `'d' | self-inclusive len | int16 field-count | per-field
+    //! {len i32, bytes}` with `-1` for a SQL NULL — against a hand-built
+    //! reference, and proves the streamed (growable [`SendFrame`]) and bounded
+    //! ([`WriteBuf`]) sinks are byte-identical (the field block IS a Bind
+    //! parameter block, so a drift here would be a drift in the whole shared
+    //! encoder).
+
+    use super::build_copy_binary_row;
+    use crate::engine::SendBuf;
+    use crate::write_buf::WriteBuf;
+    use alloc::vec::Vec;
+
+    fn streamed<P: crate::params::ParamsWriter>(row: &P) -> Vec<u8> {
+        let mut sb = SendBuf::new();
+        build_copy_binary_row(&mut sb.frame(), row).expect("streamed row fits");
+        sb.queued().to_vec()
+    }
+
+    fn whole<P: crate::params::ParamsWriter>(row: &P) -> Vec<u8> {
+        let mut wb = WriteBuf::new();
+        build_copy_binary_row(&mut wb, row).expect("whole row fits scratch");
+        wb.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn row_bytes_are_exact_pgcopy_layout() {
+        // (42i32, "hi"): 'd' | len | 0x0002 (2 fields)
+        //   | 00 00 00 04 00 00 00 2A (i32 = 42)
+        //   | 00 00 00 02 'h' 'i'     (text = "hi").
+        let got = whole(&(42i32, "hi"));
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            b'd',                                   // CopyData tag
+            0x00, 0x00, 0x00, 0x14,                 // self-inclusive len = 4 + 16 = 20
+            0x00, 0x02,                             // int16 field-count = 2
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2A, // field 0: len 4, i32 42
+            0x00, 0x00, 0x00, 0x02, b'h', b'i',     // field 1: len 2, "hi"
+        ];
+        assert_eq!(got, expected, "the row bytes must be the exact PGCOPY layout");
+        assert_eq!(streamed(&(42i32, "hi")), got, "streamed row must equal the bounded reference");
+    }
+
+    #[test]
+    fn null_field_is_minus_one_no_body() {
+        // (Some(1i32), Option::<&str>::None): the second field is a SQL NULL,
+        // encoded as an int32 length of -1 (0xFFFFFFFF) with NO body bytes.
+        let got = whole(&(Some(1i32), Option::<&str>::None));
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            b'd',
+            0x00, 0x00, 0x00, 0x12,                 // len = 4 + 14 = 18
+            0x00, 0x02,                             // 2 fields
+            0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, // field 0: len 4, i32 1
+            0xFF, 0xFF, 0xFF, 0xFF,                 // field 1: len -1 (NULL), no body
+        ];
+        assert_eq!(got, expected, "a NULL field is int32 -1 with no body");
+        assert_eq!(
+            streamed(&(Some(1i32), Option::<&str>::None)),
+            got,
+            "streamed NULL row must equal the bounded reference",
+        );
+    }
+
+    #[test]
+    fn zero_field_row_is_count_zero() {
+        // The unit tuple: a zero-column row is a valid (degenerate) PGCOPY row —
+        // int16 field-count = 0, no fields.
+        let got = whole(&());
+        assert_eq!(got, &[b'd', 0x00, 0x00, 0x00, 0x06, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn embedded_delimiters_are_verbatim_not_escaped() {
+        // A tab / newline / quote inside a text field — the bytes that CORRUPT a
+        // text COPY — ride the binary row verbatim (length-prefixed, no escaping).
+        let hostile = "a\tb\nc\"d";
+        let got = whole(&(hostile,));
+        // 'd' | len | 0x0001 | len=7 | the 7 raw bytes.
+        assert_eq!(got.first().copied(), Some(b'd'));
+        let field_bytes = got.get(11..).expect("field body present");
+        assert_eq!(field_bytes, hostile.as_bytes(), "field bytes are verbatim, unescaped");
     }
 }

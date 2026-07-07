@@ -175,6 +175,12 @@ pub mod prepared;
 // frame the active engine reads.
 pub mod command_tag;
 
+// Typed binary `COPY … FROM STDIN`: the PGCOPY binary file header/trailer
+// constants + the `TypedCopyIn` carrier trait. The `copy!` macro emits a
+// `TypedCopyIn` impl in the consumer crate; the drivers' `copy_in_typed` verb
+// streams each typed row through the shared `ParamsWriter` encoders.
+pub mod copy_binary;
+
 // SCRAM-SHA-256 authentication (RFC 5802 / 7677), composed over RustCrypto.
 // Behind the default-on `scram` feature: with it off the SCRAM-exclusive crypto
 // crates leave the build, `Credentials::ScramPassword` and the connecting-state
@@ -224,8 +230,11 @@ pub use ident::{
 pub use startup::{StartupParam, StartupParamError, RESERVED_NAMES};
 pub use password::{Credentials, Password, PasswordError};
 pub use sensitive::Sensitive;
-pub use prepared::{ColCellAt, PreparedQuery, QueryFingerprint, RowDecode};
+pub use prepared::{ColCellAt, PreparedQuery, QueryFingerprint, RowDecode, oids_equal};
 pub use typed_query::TypedQuery;
+// Typed binary COPY: the carrier trait + the PGCOPY binary header/trailer the
+// drivers' `copy_in_typed` streams around the per-row frames.
+pub use copy_binary::{PGCOPY_BINARY_HEADER, PGCOPY_BINARY_TRAILER, TypedCopyIn};
 // The sealed public bound on the runtime-parameterised verbs
 // (`query_params` / `execute_params` / `query_prepared` / …). Re-exported at
 // the crate root — alongside its sibling sealed traits `RowDecode` /

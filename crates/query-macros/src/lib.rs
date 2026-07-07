@@ -393,6 +393,291 @@ fn emit_user_enum(enum_name: &str, labels: &[String], span: Span) -> syn::Result
     })
 }
 
+// ════════════════════════════════════════════════════════════════════
+// copy! — compile-checked binary COPY-in carrier
+// ════════════════════════════════════════════════════════════════════
+//
+// `copy!(Name, "table", (col, ...))` validates the target table + columns +
+// their types against the same build catalog `query!` reads, and emits an
+// uninhabited `Name` carrier implementing `TypedCopyIn`: a GAT `Row<'q>` tuple
+// pinning the column encode types (a NOT NULL column is `T`, a nullable column
+// `Option<T>`; a `text` / `bytea` column borrows as `&'q str` / `&'q [u8]`), and
+// a const `SQL` = `COPY <table> (<cols>) FROM STDIN WITH (FORMAT binary)` baked
+// from the catalog identifiers. A driver's `copy_in_typed::<Name>(rows)` streams
+// each row through the SHARED `ParamsWriter` binary leaves — the same encoders
+// the `query!` param path uses — so binary-COPY is faster (no text
+// parse/format) AND injection-safe by construction (no text to mis-escape, and
+// the identifiers are a compile-time constant, never a runtime splice). A
+// wrong-typed or wrong-arity row is a compile error at the `copy_in_typed` call.
+
+/// Compile-checked binary COPY-in carrier generator.
+///
+/// `copy!(Name, "table", (col1, col2, …))` validates the target `table` and its
+/// `col`s against the schema replayed from the consumer's migration DDL (the
+/// build-generated catalog `query!` reads), and emits an uninhabited `Name`
+/// carrier implementing `bsql::TypedCopyIn`. A driver's
+/// `copy_in_typed::<Name>(rows)` bulk-loads `rows` — each a typed tuple matching
+/// the columns' Rust types — via the fastest, injection-safe-by-construction
+/// PGCOPY *binary* path.
+///
+/// A `NOT NULL` column maps to `T`; a nullable column to `Option<T>` (pass
+/// `None` for a SQL NULL). A `text` / `bytea` column borrows the caller's data
+/// (`&'q str` / `&'q [u8]`), so a streamed bulk load copies each field once with
+/// no owned-`String` per field.
+///
+/// At most [`MAX_COPY_COLUMNS`] (32) columns per carrier — the row tuple is a
+/// `ParamsWriter`, whose tuple impls cover arity `0..=32`. A wider table is a
+/// tailored `compile_error!` (split the load, or use the raw `copy_in`), never
+/// an untailored trait-bound error.
+///
+/// An unknown table / column, a duplicate column, an empty or over-32 column
+/// list, or a column whose type binary COPY does not yet support (an array /
+/// unsupported type — use the raw `copy_in` for those) is a `compile_error!`,
+/// never a silent pass.
+#[proc_macro]
+pub fn copy(input: TokenStream) -> TokenStream {
+    match copy_impl(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// The maximum number of columns a `copy!` carrier may name — the arity ceiling
+/// of the `ParamsWriter` tuple impls (`0..=32`) the row tuple is built from.
+/// Kept in lockstep with `bsql_postgres_proto::MAX_PARAMS_ARITY`; a wider column
+/// list is a tailored `copy!` compile error rather than a raw trait-bound
+/// failure on the `Row<'q>: ParamsWriter` bound.
+const MAX_COPY_COLUMNS: usize = 32;
+
+/// `copy!(Name, "table", (cols))` input: a carrier name, a table string literal,
+/// and a parenthesized column-identifier list.
+struct CopyInput {
+    name: Ident,
+    table: syn::LitStr,
+    columns: Vec<Ident>,
+}
+
+impl Parse for CopyInput {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let name: Ident = input.parse()?;
+        let _comma1: Token![,] = input.parse()?;
+        let table: syn::LitStr = input.parse()?;
+        let _comma2: Token![,] = input.parse()?;
+        let content;
+        syn::parenthesized!(content in input);
+        let cols = content.parse_terminated(Ident::parse, Token![,])?;
+        if !input.is_empty() {
+            return Err(input.error(
+                "copy!: expected exactly `Name, \"table\", (col, …)` — a carrier \
+                 name, a comma, a table string, a comma, and a parenthesized \
+                 column list",
+            ));
+        }
+        let columns: Vec<Ident> = cols.into_iter().collect();
+        if columns.is_empty() {
+            return Err(syn::Error::new(
+                table.span(),
+                "copy!: the column list must name at least one column",
+            ));
+        }
+        Ok(CopyInput { name, table, columns })
+    }
+}
+
+/// Validate a caller-supplied identifier for splicing into the COPY command:
+/// a plain unquoted PostgreSQL identifier (a leading ASCII letter or `_`, then
+/// letters / digits / `_` / `$`, at most 63 bytes). Rejects a
+/// schema-qualified / dotted name (copy! targets a catalog table by its bare
+/// name) and anything else injection-shaped — rejection is injection-proof by
+/// construction, exactly as `SafeIdent` / `SafeTable` do on the raw path.
+/// Returns the case-folded (lowercase) form PostgreSQL resolves an unquoted
+/// identifier to — the key the catalog stores and the text spliced into the SQL.
+fn validate_copy_table(raw: &str, span: Span) -> syn::Result<String> {
+    if raw.contains('.') {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "copy!: the table `{raw}` must be a bare unquoted identifier — a \
+                 schema-qualified name is not supported; name the catalog table \
+                 directly."
+            ),
+        ));
+    }
+    let ok = match raw.as_bytes().split_first() {
+        Some((&first, rest)) => {
+            raw.len() <= 63
+                && (first.is_ascii_alphabetic() || first == b'_')
+                && rest
+                    .iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+        }
+        None => false,
+    };
+    if ok {
+        Ok(raw.to_ascii_lowercase())
+    } else {
+        Err(syn::Error::new(
+            span,
+            format!(
+                "copy!: the table `{raw}` is not a plain unquoted SQL identifier \
+                 (a letter or '_' then letters / digits / '_' / '$', at most 63 \
+                 bytes)"
+            ),
+        ))
+    }
+}
+
+/// Case-fold a column identifier the way PostgreSQL folds an unquoted name (to
+/// lowercase), stripping a Rust raw-identifier prefix (`r#type` → `type`) so a
+/// column that collides with a Rust keyword can still be named.
+fn fold_column_ident(col: &Ident) -> String {
+    let raw = col.to_string();
+    let bare = match raw.strip_prefix("r#") {
+        Some(stripped) => stripped,
+        None => raw.as_str(),
+    };
+    bare.to_ascii_lowercase()
+}
+
+fn copy_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
+    let CopyInput {
+        name,
+        table,
+        columns,
+    } = syn::parse2(input)?;
+    let table_span = table.span();
+
+    // The catalog-folded table name (lowercase, the catalog key + the spliced
+    // SQL text). Injection-safe by validation, exactly like the raw path's
+    // `SafeTable`.
+    let table_folded = validate_copy_table(&table.value(), table_span)?;
+
+    // Rebuild the catalog the consumer's build.rs wrote (fail-closed on a
+    // missing / unreadable / corrupt catalog), then resolve the target table.
+    let catalog = load_build_catalog(name.span())?;
+    let table_cols = catalog.tables.get(&table_folded).ok_or_else(|| {
+        syn::Error::new(
+            table_span,
+            format!(
+                "copy!: unknown table `{table_folded}` — no such table in the \
+                 schema replayed from the migrations. copy! validates the target \
+                 against the SAME build catalog as query!."
+            ),
+        )
+    })?;
+
+    // Arity ceiling: the row tuple is a `ParamsWriter`, whose tuple impls cover
+    // 0..=32. A wider column list would otherwise hit an untailored E0277 on the
+    // `Row<'q>: ParamsWriter` bound — bulk-load targets commonly exceed 16
+    // columns, so this loud, tailored rejection names the cap and the escape
+    // hatch instead of a raw trait-bound error.
+    if columns.len() > MAX_COPY_COLUMNS {
+        return Err(syn::Error::new(
+            table_span,
+            format!(
+                "copy!: {} columns — typed binary COPY supports at most \
+                 {MAX_COPY_COLUMNS} columns per carrier. Split the load across \
+                 narrower `copy!` carriers, or use the raw `copy_in` for a wider \
+                 table.",
+                columns.len()
+            ),
+        ));
+    }
+
+    // Per column: fold + look up + map the catalog `pg_type` to its Rust encode
+    // type (scalar types only — an array / unsupported column is a loud
+    // rejection, never a silent skip). Reject a duplicate column (PostgreSQL
+    // itself rejects `COPY t (a, a)`), so the failure is at build time.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut field_markers: Vec<TokenStream2> = Vec::with_capacity(columns.len());
+    let mut oid_paths: Vec<TokenStream2> = Vec::with_capacity(columns.len());
+    let mut col_names: Vec<String> = Vec::with_capacity(columns.len());
+    for col in &columns {
+        let folded = fold_column_ident(col);
+        if !seen.insert(folded.clone()) {
+            return Err(syn::Error::new(
+                col.span(),
+                format!("copy!: column `{folded}` is listed more than once"),
+            ));
+        }
+        let info = table_cols.get(&folded).ok_or_else(|| {
+            syn::Error::new(
+                col.span(),
+                format!(
+                    "copy!: unknown column `{folded}` in table `{table_folded}`"
+                ),
+            )
+        })?;
+        let ty = bsql_build::scalar_rust_type_for_pg(&info.pg_type).ok_or_else(|| {
+            syn::Error::new(
+                col.span(),
+                format!(
+                    "copy!: column `{folded}` has type `{}`, which typed binary \
+                     COPY does not support — scalar columns only (an array or an \
+                     otherwise-unsupported type cannot be bulk-loaded via copy! \
+                     yet; use the raw `copy_in` for pre-formatted COPY data of \
+                     those columns).",
+                    info.pg_type
+                ),
+            )
+        })?;
+        // Borrowed row-field type (`&'q str` for text) — one copy per field, no
+        // owned String; nullable columns wrap in `Option<..>`. Projected from
+        // the SAME `col_spec` source query! uses, so a row marker and its OID
+        // path cannot disagree.
+        field_markers.push(field_type(ty, !info.not_null, false));
+        oid_paths.push(oid_path(ty));
+        col_names.push(folded);
+    }
+
+    let row_tuple = tuple_type(&field_markers);
+    let sql = format!(
+        "COPY {table_folded} ({}) FROM STDIN WITH (FORMAT binary)",
+        col_names.join(", ")
+    );
+
+    let carrier_doc = format!(
+        "Compile-checked binary COPY-in carrier for `{table_folded}`. Its \
+         [`TypedCopyIn`](::bsql::TypedCopyIn) impl pins the target columns' Rust \
+         types ([`Row`](::bsql::TypedCopyIn::Row)) and the catalog-baked COPY \
+         command ([`SQL`](::bsql::TypedCopyIn::SQL)); a driver's \
+         `copy_in_typed::<{name}>(rows)` bulk-loads typed rows through the fastest \
+         PGCOPY binary path."
+    );
+    let allow_reason = "the generated COPY carrier is part of the public surface; a consumer may use any subset of it";
+
+    Ok(quote! {
+        #[doc = #carrier_doc]
+        #[allow(dead_code, reason = #allow_reason)]
+        pub enum #name {}
+
+        impl ::bsql::__rt::TypedCopyIn for #name {
+            type Row<'q> = #row_tuple;
+            const SQL: &'static str = #sql;
+        }
+
+        // Build-time OID drift guard: the generated row-tuple's declared OIDs
+        // must equal the catalog column OIDs this carrier was baked from. Both
+        // derive from the same `col_spec` source, so this fails ONLY on a
+        // `col_spec` inconsistency (a row marker whose `EncodeBinary::OID` does
+        // not match its OID path) — the tier-1 drift guard, exactly like the
+        // query! `PreparedQuery` validator. `Row<'static>` fixes the GAT to a
+        // concrete lifetime (the OIDs do not depend on it).
+        const _: () = {
+            const __CATALOG_OIDS: &[u32] = &[ #( #oid_paths ),* ];
+            assert!(
+                ::bsql::__rt::oids_equal(
+                    <<#name as ::bsql::__rt::TypedCopyIn>::Row<'static>
+                        as ::bsql::__rt::ParamsWriter>::OIDS,
+                    __CATALOG_OIDS,
+                ),
+                "copy!: internal drift — the generated row-tuple OIDs must equal \
+                 the catalog column OIDs",
+            );
+        };
+    })
+}
+
 /// Strip the recognized `/* bsql:allow-scan[: reason] */` acknowledgment
 /// directive from a query string. Returns the cleaned SQL and whether the
 /// directive was present. Only the FIRST block comment that contains the
@@ -1982,16 +2267,17 @@ fn emit_dynamic_wire(
     bridges: &Bridges,
     enums: &EnumTypes,
 ) -> syn::Result<TokenStream2> {
-    // The runtime `ParamsWriter` / `RowDecode` impls (and the whole
-    // prepared-statement wire path) cover tuple arity 0..=16. A query
-    // outside that envelope is a loud rejection, not a silent truncation
-    // or an opaque trait-bound error.
-    if shape.params.len() > 16 {
+    // The runtime `ParamsWriter` impls cover tuple arity 0..=32 (raised from 16
+    // so a wide parameterised query is not capped); the `RowDecode` result
+    // decoders remain 0..=16 (a SEPARATE wire mechanism). A query outside either
+    // envelope is a loud rejection, not a silent truncation or an opaque
+    // trait-bound error.
+    if shape.params.len() > 32 {
         return Err(syn::Error::new(
             name.span(),
             format!(
                 "query!: {} parameters — the prepared-query wire path \
-                 supports at most 16 `$N` parameters",
+                 supports at most 32 `$N` parameters",
                 shape.params.len()
             ),
         ));

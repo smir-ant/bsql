@@ -52,7 +52,7 @@ use bsql_postgres_core::{
 use bsql_postgres_proto::engine::{self, EngineError, SpuriousPending};
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
-    Credentials, DatabaseName, Ident, PreparedQuery, RowDecode, TypedQuery,
+    Credentials, DatabaseName, Ident, PreparedQuery, RowDecode, TypedCopyIn, TypedQuery,
 };
 // `Password` / `Sensitive` build a `Credentials::ScramPassword` — SCRAM-only.
 #[cfg(feature = "scram")]
@@ -1025,6 +1025,35 @@ impl Connection {
         }
     }
 
+    /// `COPY … FROM STDIN` in PGCOPY BINARY, bulk-loading `rows` into the
+    /// compile-checked target of a [`copy!`](bsql_postgres_core::TypedCopyIn)
+    /// carrier `Q`, in CONSTANT memory — the TYPED, injection-safe-by-construction
+    /// peer of [`copy_in`](Self::copy_in).
+    ///
+    /// Each item is a typed row tuple `Q::Row<'q>`: a `NOT NULL` column is `T`, a
+    /// nullable column `Option<T>` (pass `None` for a SQL NULL), a `text` /
+    /// `bytea` column borrows the caller's data. The target table, column list,
+    /// and per-column types were pinned at COMPILE time by `copy!` against the
+    /// migration catalog, so a wrong-typed or wrong-arity row is a compile error —
+    /// and there is no COPY text to mis-escape (an embedded tab / newline / quote
+    /// rides the binary field verbatim). Rows are NOT pre-collected; a megarow
+    /// load streams in bounded memory. The blocking peer of the async
+    /// [`Connection::copy_in_typed`](crate::Connection::copy_in_typed) (they share
+    /// the one `Core::copy_in_typed`, driven to completion in a single poll here).
+    ///
+    /// # Errors
+    ///
+    /// A row the server rejects at `CopyDone` is a classified [`DriverError::Db`],
+    /// and the connection RECOVERS to a clean idle (it stays pooled). A transport
+    /// fault is fatal.
+    pub fn copy_in_typed<'q, Q, I>(&mut self, rows: I) -> Result<u64, DriverError>
+    where
+        Q: TypedCopyIn,
+        I: IntoIterator<Item = Q::Row<'q>>,
+    {
+        drive_sync(engine::poll_once(self.core.copy_in_typed::<Q, I>(rows)))
+    }
+
     /// `COPY <table> TO STDOUT`, streaming each row to `on_chunk` in CONSTANT
     /// memory — the bulk-unload peer of [`copy_in`](Self::copy_in).
     ///
@@ -1424,6 +1453,23 @@ impl Transaction<'_> {
                 Err(e)
             }
         }
+    }
+
+    /// `COPY … FROM STDIN` in PGCOPY BINARY into a [`copy!`](bsql_postgres_core::TypedCopyIn)
+    /// carrier `Q`'s target, in CONSTANT memory. See
+    /// [`Connection::copy_in_typed`](crate::Connection::copy_in_typed) for the full
+    /// typed contract; the deferred `BEGIN` fuses into this COPY when it is the
+    /// transaction's FIRST statement.
+    pub fn copy_in_typed<'q, Q, I>(&mut self, rows: I) -> Result<u64, DriverError>
+    where
+        Q: TypedCopyIn,
+        I: IntoIterator<Item = Q::Row<'q>>,
+    {
+        // Arm the deferred BEGIN before the first COPY step, so a COPY that is the
+        // transaction's first statement still fuses the BEGIN. The whole typed
+        // COPY is one Core verb, driven to completion in a single poll.
+        self.arm_begin();
+        drive_sync(engine::poll_once(self.core.copy_in_typed::<Q, I>(rows)))
     }
 
     /// `COPY <table> TO STDOUT`, streaming each row to `on_chunk` in CONSTANT

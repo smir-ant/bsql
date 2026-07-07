@@ -107,3 +107,9 @@ pub use types::{ArenaBuilder, ArenaSealError, Notification, QueryResult, Row, Ro
 /// (`&(a, b)` tuples up to arity 16). Re-exported so a consumer can write a
 /// generic helper — `fn run<P: ParamsWriter>(…)` — without a direct proto dep.
 pub use bsql_postgres_proto::ParamsWriter;
+
+/// The compile-checked binary-COPY carrier trait a `copy!` invocation implements
+/// (its target `Q::SQL` + typed `Q::Row<'q>`). Re-exported so a driver's
+/// `copy_in_typed::<Q>` verb — and a consumer naming the bound — reach it without
+/// a direct proto dep.
+pub use bsql_postgres_proto::TypedCopyIn;

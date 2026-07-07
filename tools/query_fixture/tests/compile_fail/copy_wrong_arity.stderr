@@ -1,0 +1,18 @@
+error[E0271]: type mismatch resolving `<[(i64, &str); 1] as IntoIterator>::Item == (i64, &str, Option<&str>, Option<i32>)`
+  --> tests/compile_fail/copy_wrong_arity.rs:12:46
+   |
+12 |     let _ = conn.copy_in_typed::<BulkRow, _>([(1i64, "x")]);
+   |                  -------------               ^^^^^^^^^^^^^ expected a tuple with 4 elements, found one with 2 elements
+   |                  |
+   |                  required by a bound introduced by this call
+   |
+   = note: expected tuple `(i64, &str, Option<&str>, Option<i32>)`
+              found tuple `(i64, &str)`
+note: required by a bound in `Connection::copy_in_typed`
+  --> $WORKSPACE/crates/postgres/sync/src/connection.rs
+   |
+   |     pub fn copy_in_typed<'q, Q, I>(&mut self, rows: I) -> Result<u64, DriverError>
+   |            ------------- required by a bound in this associated function
+...
+   |         I: IntoIterator<Item = Q::Row<'q>>,
+   |                         ^^^^^^^^^^^^^^^^^ required by this bound in `Connection::copy_in_typed`

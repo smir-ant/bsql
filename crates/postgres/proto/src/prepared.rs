@@ -609,7 +609,12 @@ where
 /// Const element-wise equality of two `u32` (OID) slices — no
 /// indexing (the crate forbids `clippy::indexing_slicing`), walked in
 /// lockstep via `split_first`.
-const fn oids_equal(left: &[u32], right: &[u32]) -> bool {
+///
+/// Re-exported at the crate root so the `copy!` macro can pin, at build time,
+/// that a [`TypedCopyIn`](crate::TypedCopyIn) carrier's row-tuple OIDs equal the
+/// catalog column OIDs it was generated from — the same drift guard the
+/// [`PreparedQuery`] validator uses for `query!`.
+pub const fn oids_equal(left: &[u32], right: &[u32]) -> bool {
     if left.len() != right.len() {
         return false;
     }

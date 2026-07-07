@@ -1271,6 +1271,54 @@ impl<'b, T: Transport> Engine<'b, T> {
         }
     }
 
+    /// Stream one PGCOPY BINARY row as a `CopyData` frame, BATCHING the flush
+    /// exactly like [`copy_in_write`](Self::copy_in_write). The row body — an
+    /// `int16` field-count followed by each field's `{len i32, bytes}` (or `-1`
+    /// for a SQL NULL) — is encoded DIRECTLY onto the growable send buffer
+    /// through the SAME [`ParamsWriter`] leaves the `query!` parameter path uses,
+    /// with NO intermediate per-row scratch buffer (one copy per field). Frame
+    /// boundaries are irrelevant to the PGCOPY stream, so each row rides its own
+    /// `CopyData` and the whole stream stays byte-correct.
+    ///
+    /// Token-less: the caller holds the [`Live`] token across the streaming
+    /// writes (issued between [`copy_in_begin`](Self::copy_in_begin) and
+    /// [`copy_in_finish`](Self::copy_in_finish) / [`copy_in_abort`](Self::copy_in_abort)).
+    /// The batching is identical to [`copy_in_write`](Self::copy_in_write): the
+    /// framed row accumulates in the send buffer and flushes only when the
+    /// pending bytes cross [`COPY_IN_FLUSH_THRESHOLD`] — a megarow load costs far
+    /// fewer socket writes than rows while the buffer stays bounded (CONSTANT
+    /// memory, never O(rows)).
+    ///
+    /// # Errors
+    ///
+    /// [`FrameTooLong`](EngineError::FrameTooLong) if the encoded row body exceeds
+    /// a `u32` wire length; a transport fault while flushing is fatal (as
+    /// [`copy_in_write`](Self::copy_in_write)).
+    pub async fn copy_in_write_binary_row<P: ParamsWriter>(
+        &mut self,
+        row: &P,
+    ) -> Result<(), EngineError<T::Error>> {
+        let Self {
+            transport,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        // Reclaim a DRAINED prefix while PRESERVING any accumulated-but-unflushed
+        // frames — the constant-memory invariant, exactly as `copy_in_write`.
+        send_buf.reset();
+        // Encode the whole `CopyData` frame in place onto the growable send
+        // buffer (the length prefix is back-patched after the body), reusing the
+        // shared `ParamsWriter` field encoders.
+        frames::build_copy_binary_row(&mut send_buf.frame(), row).map_err(frame_too_long)?;
+        // Flush only when the batch crosses the threshold.
+        if send_buf.pending_len() >= COPY_IN_FLUSH_THRESHOLD {
+            super::flush::flush(send_buf, transport).await?;
+        }
+        Ok(())
+    }
+
     /// Close an open COPY-in cleanly: send `CopyDone` (`'c'`) and pump for the
     /// server's `CommandComplete` + `ReadyForQuery`, returning the [`Live`] token
     /// with the [`CommandStatus`] the command reached. `B = Never`.

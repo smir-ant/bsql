@@ -1,0 +1,5 @@
+error: copy!: 33 columns — typed binary COPY supports at most 32 columns per carrier. Split the load across narrower `copy!` carriers, or use the raw `copy_in` for a wider table.
+ --> tests/compile_fail/copy_over_column_cap.rs:9:9
+  |
+9 |         "copy_bulk",
+  |         ^^^^^^^^^^^

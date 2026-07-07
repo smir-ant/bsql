@@ -36,25 +36,31 @@
 //!   send-buffer target, reuses its warm capacity — a small-parameter Bind on a
 //!   warm connection allocates nothing).
 //!
-//! # Scope — why arity 16
+//! # Scope — why arity 32
 //!
-//! Tuple arity 0..=16 covered. Each arity monomorphises into a
-//! distinct machine-code body (~30 LOC post-codegen); 16 arities
-//! × ~30 LOC ≈ 480 LOC of generated code per target build.
-//! `[ParamEncoder; 16]` inline array fits a single AVX2 register
-//! for the `FORMATS_WIRE` const — breaking the ≤64-byte bound
-//! would force a branch-on-length eq path and lose branch-free
-//! compare. The 16-cap also matches `ParamOids`'s MAX_PARAMS_ARITY
-//! (action.rs) so the describe-reply shape mirrors the bind-send
-//! shape.
+//! Tuple arity 0..=32 covered. Each arity is a distinct GENERIC
+//! impl (~30 LOC post-codegen when actually instantiated); 32
+//! arities ≈ 960 LOC of generated impl bodies, compiled ONCE per
+//! build and monomorphised only per tuple a consumer actually uses.
+//! Nothing here is sized by the cap: `FORMATS` / `OIDS` are
+//! `&'static [_]` slices (no inline array), and the parameter block
+//! streams directly onto the GROWABLE send buffer — there is NO
+//! fixed per-arity buffer to overflow (the compile-checked `query!`
+//! path bakes its param OIDs into the Parse template at build time
+//! and reads no `ParameterDescription` at runtime), so raising the
+//! cap trips no footprint pin and grows no runtime struct.
 //!
-//! Tradeoff: callers wanting > 16 parameters must refactor into
-//! smaller statements. The "few placeholders per query" norm in
-//! idiomatic usage covers the typical case.
+//! The cap was 16; it is 32 because a bulk-load target (`copy!`,
+//! whose row tuple is a `ParamsWriter`) and a wide parameterised
+//! `query!` commonly exceed 16 columns/params — the exact use case
+//! typed COPY exists for. Result-column decode ([`crate::RowDecode`])
+//! is a SEPARATE wire mechanism and stays 0..=16.
 //!
-//! If I-cache measurement shows per-arity monomorphisation
-//! bloating hot paths, the HList-recursion path is the drop-in
-//! replacement.
+//! Tradeoff: callers wanting > 32 parameters must refactor into
+//! smaller statements. If arity ever needs to be truly unbounded
+//! (approaching PostgreSQL's 65535 param ceiling), the
+//! HList-recursion path is the drop-in replacement — the tuple
+//! generation is bounded O(N) generated code by construction.
 //!
 //! Every element type must implement [`ParamEncoder`] — a sealed
 //! intermediate trait that adds SQL-NULL handling on top of
@@ -161,28 +167,28 @@ impl<T: EncodeBinary> ParamEncoder for Option<T> {
 
 /// Upper bound on tuple arity supported by [`ParamsWriter`] impls
 /// in this module — a COMPILE-TIME monomorphisation choice (tuple impls cover
-/// arity `0..=16`), NOT a byte cap. The per-parameter data is UNBOUNDED: a Bind
+/// arity `0..=32`), NOT a byte cap. The per-parameter data is UNBOUNDED: a Bind
 /// streams its parameter block onto the growable send buffer via
 /// [`FrameSink`], so a single multi-kilobyte `jsonb` / `bytea` / array
-/// parameter — or up to 16 of them — binds with no size ceiling. Changing this
+/// parameter — or up to 32 of them — binds with no size ceiling. Changing this
 /// const without updating the tuple-impl invocation list would silently break
 /// the arity coverage.
-pub const MAX_PARAMS_ARITY: usize = 16;
+pub const MAX_PARAMS_ARITY: usize = 32;
 
 /// Serialise a tuple of PG parameter values into a Bind frame.
 ///
 /// See module-level docs for the full wire-format contract and tier
 /// analysis. `ParamsWriter` is sealed; the impls in this module
-/// cover tuple arity `0..=16`.
+/// cover tuple arity `0..=32`.
 //
 // Structural diagnostic for sealed-trait E0277. A parameter value that
 // is not a supported tuple (e.g. a bare struct) or a tuple of arity >
-// 16 hits `T: ParamsWriterSealed` failure with the bare bound message.
+// 32 hits `T: ParamsWriterSealed` failure with the bare bound message.
 // The attribute below routes them to the tuple-shape contract.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a valid parameter tuple for a prepared query",
-    label = "expected a tuple `()` through `(T1, T2, ..., T16)` where each Ti implements `ParamEncoder`",
-    note = "`ParamsWriter` is sealed — only the crate-internal tuple impls (arity 0..=16) qualify; downstream `impl ParamsWriter for ...` is forbidden by construction"
+    label = "expected a tuple `()` through `(T1, T2, ..., T32)` where each Ti implements `ParamEncoder`",
+    note = "`ParamsWriter` is sealed — only the crate-internal tuple impls (arity 0..=32) qualify; downstream `impl ParamsWriter for ...` is forbidden by construction"
 )]
 pub trait ParamsWriter: sealed::ParamsWriterSealed {
     /// Number of parameters this tuple encodes. Compile-time
@@ -272,7 +278,10 @@ macro_rules! params_writer_impl {
             const OIDS: &'static [u32] = &[$(<$t as ParamEncoder>::OID),+];
 
             #[inline]
-            fn write_params<S: FrameSink>(&self, dst: &mut S) -> Result<(), WriteBufFull> {
+            // The sink generic is named `Sink` (not `S`) so it cannot collide
+            // with a single-uppercase-letter tuple type-param at arity >= 19
+            // (element 18 is `S`) — an E0403 duplicate-generic otherwise.
+            fn write_params<Sink: FrameSink>(&self, dst: &mut Sink) -> Result<(), WriteBufFull> {
                 $(
                     // Each param goes through `ParamEncoder::write_param`
                     // which handles len-prefix + body (non-NULL) or
@@ -316,7 +325,7 @@ macro_rules! emit_binary_per_token {
     ($tok:ident) => { FormatCode::Binary };
 }
 
-// ───────────────── Arity 0..=16 impls ─────────────────
+// ───────────────── Arity 0..=32 impls ─────────────────
 //
 // Handwriting 16 impls is tedious but generating them individually
 // via nested macros tends to obscure the structure more than it
@@ -338,6 +347,25 @@ params_writer_impl!(13, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J
 params_writer_impl!(14, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13]);
 params_writer_impl!(15, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14]);
 params_writer_impl!(16, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15]);
+// Arity 17..=32 — raised from the former 16-cap so a bulk-load target (`copy!`,
+// whose row tuple is a `ParamsWriter`) and a wide parameterised `query!` are not
+// capped at 16. Type-param idents run A..Z then AA..AF for the 27..=32 slots.
+params_writer_impl!(17, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16]);
+params_writer_impl!(18, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17]);
+params_writer_impl!(19, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18]);
+params_writer_impl!(20, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19]);
+params_writer_impl!(21, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19, U: 20]);
+params_writer_impl!(22, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19, U: 20, V: 21]);
+params_writer_impl!(23, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19, U: 20, V: 21, W: 22]);
+params_writer_impl!(24, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19, U: 20, V: 21, W: 22, X: 23]);
+params_writer_impl!(25, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19, U: 20, V: 21, W: 22, X: 23, Y: 24]);
+params_writer_impl!(26, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19, U: 20, V: 21, W: 22, X: 23, Y: 24, Z: 25]);
+params_writer_impl!(27, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19, U: 20, V: 21, W: 22, X: 23, Y: 24, Z: 25, AA: 26]);
+params_writer_impl!(28, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19, U: 20, V: 21, W: 22, X: 23, Y: 24, Z: 25, AA: 26, AB: 27]);
+params_writer_impl!(29, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19, U: 20, V: 21, W: 22, X: 23, Y: 24, Z: 25, AA: 26, AB: 27, AC: 28]);
+params_writer_impl!(30, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19, U: 20, V: 21, W: 22, X: 23, Y: 24, Z: 25, AA: 26, AB: 27, AC: 28, AD: 29]);
+params_writer_impl!(31, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19, U: 20, V: 21, W: 22, X: 23, Y: 24, Z: 25, AA: 26, AB: 27, AC: 28, AD: 29, AE: 30]);
+params_writer_impl!(32, [A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11, M: 12, N: 13, O: 14, P: 15, Q: 16, R: 17, S: 18, T: 19, U: 20, V: 21, W: 22, X: 23, Y: 24, Z: 25, AA: 26, AB: 27, AC: 28, AD: 29, AE: 30, AF: 31]);
 
 // Compile-time smoke-test of the canonical shapes: a 0-tuple, a
 // singleton, and a mixed-type triplet — pin the anchor invariants
@@ -349,6 +377,14 @@ const _: () = {
     assert!(<(i32, i32) as ParamsWriter>::COUNT == 2);
     assert!(<(i32, i32, i32) as ParamsWriter>::COUNT == 3);
     assert!(<(i32, i32, i32, i32, i32, i32, i32, i32) as ParamsWriter>::COUNT == 8);
+    // Pin the raised cap: the top arity (32) instantiates and reports its COUNT.
+    assert!(
+        <(
+            i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32,
+            i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32,
+        ) as ParamsWriter>::COUNT
+            == 32
+    );
     // OIDS shape: every slot == EncodeBinary::OID of its element.
     // Use slice pattern-match so `clippy::indexing_slicing` doesn't
     // fire — also more structurally explicit than `oids[0] == X`.

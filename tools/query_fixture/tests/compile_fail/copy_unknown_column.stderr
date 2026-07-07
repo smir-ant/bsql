@@ -1,0 +1,5 @@
+error: copy!: unknown column `nonexistent` in table `copy_bulk`
+ --> tests/compile_fail/copy_unknown_column.rs:6:40
+  |
+6 |     bsql::copy!(Bad, "copy_bulk", (id, nonexistent));
+  |                                        ^^^^^^^^^^^

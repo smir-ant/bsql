@@ -58,7 +58,8 @@ use bsql_postgres_proto::engine::{
 };
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
-    DecodeError, PreparedQuery, RowDecode, Sensitive, StmtName, TxStatus, TypedQuery,
+    DecodeError, PreparedQuery, RowDecode, Sensitive, StmtName, TxStatus, TypedCopyIn, TypedQuery,
+    PGCOPY_BINARY_HEADER, PGCOPY_BINARY_TRAILER,
 };
 
 use crate::cancel::CancelKey;
@@ -1288,6 +1289,86 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         {
             self.live = Some(live);
         }
+    }
+
+    /// Stream one PGCOPY BINARY row for an open COPY-in and batch its flush.
+    /// Token-less (the caller holds the token across writes). `#[doc(hidden)]`:
+    /// the per-driver typed COPY orchestration drives this, framed between the
+    /// PGCOPY header and trailer.
+    #[doc(hidden)]
+    pub async fn copy_in_write_binary_row<P: ParamsWriter>(
+        &mut self,
+        row: &P,
+    ) -> Result<(), DriverError> {
+        self.engine
+            .copy_in_write_binary_row(row)
+            .await
+            .map_err(lift_engine_error)
+    }
+
+    /// Bulk-load `rows` into the compile-checked target of a [`copy!`](TypedCopyIn)
+    /// carrier `Q` via PGCOPY BINARY `COPY … FROM STDIN`, in CONSTANT memory,
+    /// returning the server's affected-row count.
+    ///
+    /// The whole orchestration lives ONCE here in the transport-generic
+    /// [`Core`](Self): issue the catalog-baked `Q::SQL` COPY command, stream the
+    /// PGCOPY binary [header](PGCOPY_BINARY_HEADER), then each `rows` item as one
+    /// typed binary row (through the SAME [`ParamsWriter`] encoders the `query!`
+    /// param path uses), then the [trailer](PGCOPY_BINARY_TRAILER), then
+    /// `CopyDone`. Both drivers forward here (async `.await`, sync single-poll),
+    /// so their typed-COPY behaviour is a COMPILER guarantee, not hand-maintained
+    /// twins. The rows are NOT pre-collected — a megarow load streams in bounded
+    /// memory.
+    ///
+    /// # Errors and recovery
+    ///
+    /// A server rejection at `CopyDone` (a constraint / type violation on an
+    /// ingested row) is a classified [`DriverError::Db`], and the connection
+    /// RECOVERS to a clean idle (it stays pooled). A frame-encode overflow (a
+    /// row body past the `u32` wire length) aborts the COPY recoverably. A
+    /// transport fault is fatal.
+    pub async fn copy_in_typed<'q, Q, I>(&mut self, rows: I) -> Result<u64, DriverError>
+    where
+        Q: TypedCopyIn,
+        I: IntoIterator<Item = Q::Row<'q>>,
+    {
+        // The COPY command is a compile-time constant baked from validated
+        // catalog identifiers, so there is no runtime identifier to splice —
+        // injection-safety is stronger here than the raw path's `SafeTable`
+        // (there is no untrusted string at all). On a fault the token is dropped
+        // by the begin (dead connection).
+        let live = self.copy_in_begin(Q::SQL).await?;
+        let streamed = self.copy_in_typed_stream::<Q, I>(rows).await;
+        match streamed {
+            // `copy_in_finish` restores the token on either status and maps a
+            // server rejection to `DriverError::Db` with the connection pooled.
+            Ok(()) => self.copy_in_finish(live).await,
+            Err(e) => {
+                // A mid-stream error (a frame-encode overflow) aborts the COPY:
+                // `CopyFail` reclaims the connection recoverably; a transport
+                // fault leaves it dead. The caller's `e` dominates.
+                self.copy_in_abort(live).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Stream the PGCOPY binary body — header, then each typed row, then trailer
+    /// — for [`copy_in_typed`](Self::copy_in_typed). Factored out so the token is
+    /// held by the caller across the whole stream and handed to the terminal
+    /// `copy_in_finish` / `copy_in_abort` step. Each piece rides its own batched
+    /// `CopyData`; frame boundaries are irrelevant to the PGCOPY stream.
+    async fn copy_in_typed_stream<'q, Q, I>(&mut self, rows: I) -> Result<(), DriverError>
+    where
+        Q: TypedCopyIn,
+        I: IntoIterator<Item = Q::Row<'q>>,
+    {
+        self.copy_in_write(&PGCOPY_BINARY_HEADER).await?;
+        for row in rows {
+            self.copy_in_write_binary_row(&row).await?;
+        }
+        self.copy_in_write(&PGCOPY_BINARY_TRAILER).await?;
+        Ok(())
     }
 
     // ── Notification seam (the per-driver `recv_notification` orchestrates) ──

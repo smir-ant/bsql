@@ -145,6 +145,25 @@ fn unknown_reference_is_compile_error() {
     // error, exactly as a dropped column is on the `query!` path.
     t.compile_fail("tests/compile_fail/query_enum_unknown_variant.rs");
 
+    // `copy!` + `copy_in_typed` compile-checked binary bulk-insert surface.
+    //   * A row whose column TYPE does not match the catalog is a type mismatch
+    //     at the `copy_in_typed` call (the row tuple does not match `Row<'q>`).
+    //   * A row with the wrong ARITY (field count) is the same — the column list
+    //     pins the tuple shape.
+    //   * A `copy!` naming a column the catalog does not have is a
+    //     `compile_error!` at the macro, never a silent pass that would only fail
+    //     at COPY time.
+    t.compile_fail("tests/compile_fail/copy_wrong_column_type.rs");
+    t.compile_fail("tests/compile_fail/copy_wrong_arity.rs");
+    t.compile_fail("tests/compile_fail/copy_unknown_column.rs");
+    //   * A carrier naming MORE than 32 columns is a TAILORED compile error
+    //     naming the cap + the escape hatch, not a raw ParamsWriter trait-bound
+    //     failure (the row tuple's arity ceiling).
+    t.compile_fail("tests/compile_fail/copy_over_column_cap.rs");
+
     // Every valid dynamic form type-checks at macro expansion.
     t.pass("tests/compile_pass/query_dynamics_ok.rs");
+    // The valid `copy!` + `copy_in_typed` happy path type-checks (GREEN peer of
+    // the `copy_wrong_*` goldens).
+    t.pass("tests/compile_pass/copy_typed_ok.rs");
 }

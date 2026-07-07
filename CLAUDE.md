@@ -46,15 +46,15 @@ Load-bearing decisions for any new session:
 crates/
   bsql/              — umbrella facade + query! re-export + #[bsql::test] harness (bsql::pg, ::pg_sync, ::sqlite)  — 947 LoC
   postgres/
-    proto/           — sans-IO wire protocol + session engine (no_std + alloc)  — 27886 LoC
-    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + N+1 detector + SafeIdent guard + cancel key/redial  — 10586 LoC
-    async/           — tokio async driver (plugs its socket into the shared Core<S>) + CancelToken  — 2433 LoC
-    sync/            — std::net blocking driver (plugs its socket into the shared Core<S>) + CancelToken  — 2342 LoC
+    proto/           — sans-IO wire protocol + session engine (no_std + alloc) + PGCOPY binary framing + TypedCopyIn  — 29678 LoC
+    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + N+1 detector + SafeIdent guard + cancel key/redial + copy_in_typed  — 10766 LoC
+    async/           — tokio async driver (plugs its socket into the shared Core<S>) + CancelToken  — 2549 LoC
+    sync/            — std::net blocking driver (plugs its socket into the shared Core<S>) + CancelToken  — 2480 LoC
   sqlite/
     driver/          — embedded SQLite driver (bundled rusqlite) + typed query! runtime + interrupt CancelToken + N+1 detector  — 2788 LoC
   testkit/           — deterministic in-memory fake PostgreSQL for driver tests (no network)  — 1005 LoC
   build/             — BUILD-DEP: migration DDL → schema catalog (+ SQLite template) + shared $N→?N placeholder authority  — 35036 LoC
-  query-macros/      — PROC-MACRO: query! (types/validates against the catalog; emits the PostgreSQL + SQLite typed bridges) + #[bsql::test] (schema-per-test wrapper)  — 2252 LoC
+  query-macros/      — PROC-MACRO: query! + copy! (types/validates against the catalog; emits the PostgreSQL + SQLite typed bridges) + #[bsql::test] (schema-per-test wrapper)  — 2507 LoC
 ```
 
 (src LoC measured per crate via `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by `src/infer.rs` (29563 lines: the schema/type-inference engine plus a ~13K-line inline `#[cfg(test)]` test module). Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync}`, `bsql-sqlite`, `bsql-testkit`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-bridge-fixture`, `bsql-query-sqlite-fixture`, `bsql-test-harness-fixture`, `bsql-corpus`.)
@@ -81,6 +81,10 @@ cargo test -p bsql-sqlite --test cancel              # SQLite interrupt witness 
 cargo test -p bsql-query-sqlite-fixture --features n1-detect --test n1_detect_sqlite  # SQLite N+1 witness (in-process)
 cargo test -p bsql-query-fixture --test query_live_async -- --ignored  # live query! (async, needs PG)
 cargo test -p bsql-query-fixture --test query_live_sync  -- --ignored  # live query! (sync, needs PG)
+cargo test -p bsql-query-fixture --test copy_typed_offline             # copy! macro expansion + row shape (offline)
+cargo test -p bsql-query-fixture --test copy_typed_live_async -- --ignored  # live copy_in_typed (async, needs PG)
+cargo test -p bsql-query-fixture --test copy_typed_live_sync  -- --ignored  # live copy_in_typed (sync, needs PG)
+cargo test -p bsql-postgres-proto --test engine_copy_typed_alloc       # typed binary-COPY constant-memory gate
 cargo clippy -p bsql --features test-harness --all-targets              # lint the (non-default) #[bsql::test] harness
 cargo test  -p bsql --features test-harness --lib                       # harness unit tests (offline)
 BSQL_TEST_DSN=postgres://USER@localhost/postgres \
@@ -418,6 +422,44 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `total_bytes / 64 KiB` write syscalls instead of one per row, with the send
   buffer bounded under `2 ×` the threshold — constant memory regardless of COPY
   size.
+- **Typed binary COPY — `conn.copy_in_typed::<Q>(rows)` + the `copy!` macro.**
+  The SAFE-BY-CONSTRUCTION bulk-insert flagship, both drivers (+ their transaction
+  guards). The raw `copy_in` / `copy_in_with` takes `&[u8]`: the caller
+  hand-formats COPY *text* with correct escaping / NULL sentinels, and a
+  mis-escaped tab or newline SILENTLY corrupts a row (the classic COPY footgun).
+  `copy!(Name, "table", (cols))` validates the target table + columns + their
+  types against the SAME build catalog `query!` reads and emits an uninhabited
+  `Name` carrier implementing `TypedCopyIn` — a GAT `Row<'q>` tuple pinning the
+  column encode types (a `NOT NULL` column is `T`, a nullable column `Option<T>`;
+  `text` / `bytea` borrow `&'q str` / `&'q [u8]`) and a const `SQL` =
+  `COPY <table> (<cols>) FROM STDIN WITH (FORMAT binary)`. `copy_in_typed::<Name>`
+  streams each `rows` item (an `IntoIterator<Item = Q::Row<'q>>`) as one PGCOPY
+  *binary* row — an `int16` field-count + each field's `{len, bytes}` / `-1`,
+  which is byte-identical to a Bind parameter block, so it REUSES the same
+  `ParamsWriter` binary leaves the `query!` param path uses (no format drift) and
+  streams through the EXISTING 64 KiB batcher in constant memory (no per-row
+  scratch; one copy per field). This is a genuine tier-elevation over the raw
+  path: FASTER (no text parse/format on either side) AND injection-safe by
+  CONSTRUCTION — a typed value cannot carry an escaping bug (there is no text to
+  mis-escape; an embedded tab / newline / quote rides the binary field verbatim),
+  and the target identifiers are a compile-time constant baked from validated
+  catalog names (stronger than the raw path's runtime `SafeTable`). A wrong-typed
+  or wrong-arity row is a compile error at the `copy_in_typed` call (the tuple
+  does not match `Row<'q>`); an unknown / duplicate / over-32 / unsupported
+  (array — use raw `copy_in`) column is a `copy!` `compile_error!`. A carrier
+  names at most 32 columns — the row tuple is a `ParamsWriter`, whose tuple impls
+  cover arity `0..=32` (raised from 16 so a wide bulk-load target is not capped;
+  a `query!`'s `$N` params ride the same raised cap, while its result-column
+  decode stays 16). The whole orchestration
+  (begin + header + rows + trailer + `CopyDone`) lives ONCE in `Core::copy_in_typed`;
+  a mid-stream server rejection is a classified `DriverError::Db` and the
+  connection RECOVERS (pooled). The raw `copy_in` / `copy_in_with` STAYS as the
+  advanced escape hatch for pre-formatted / text COPY data. Witnessed by
+  `tools/query_fixture`'s `copy_typed_offline` (macro expansion + row shape) +
+  `--ignored` `copy_typed_live_{sync,async}` (hostile-string / NULL / large
+  multi-flush round-trip + rejected-row recovery, both drivers) + the
+  `copy_wrong_*` / `copy_unknown_column` trybuild goldens, and the
+  `engine_copy_typed_alloc` constant-memory gate.
 - **Query cancellation** — `conn.cancel_token()` mints a DETACHED
   `CancelToken` (`Send + Sync + 'static`, borrowing NOTHING from the connection)
   that can be obtained BEFORE a long query and moved to another task/thread that

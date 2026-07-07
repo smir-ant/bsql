@@ -185,6 +185,20 @@ pub use bsql_query_macros::query;
 #[cfg(feature = "macros")]
 pub use bsql_query_macros::user_types;
 
+/// The compile-checked binary COPY-in carrier macro.
+///
+/// `copy!(Name, "table", (col1, col2, …))` validates the target table, its
+/// columns, and their types against the SAME build catalog `query!` reads, and
+/// emits an uninhabited `Name` carrier implementing [`TypedCopyIn`]. A driver's
+/// `copy_in_typed::<Name>(rows)` then bulk-loads `rows` — each a typed tuple
+/// matching the columns' Rust types (a `NOT NULL` column is `T`, a nullable
+/// column `Option<T>`) — through the fastest, injection-safe-by-construction
+/// PGCOPY *binary* path: no text to mis-escape, and the target identifiers are a
+/// compile-time constant. An unknown / duplicate / unsupported column is a
+/// `compile_error!`.
+#[cfg(feature = "macros")]
+pub use bsql_query_macros::copy;
+
 /// The typed-query execution bridge, the const-checked prepared-query
 /// artifact, its build-time fingerprint, and the classified decode error —
 /// the user-facing types a `query!`-generated carrier is built from. A
@@ -192,7 +206,7 @@ pub use bsql_query_macros::user_types;
 /// these.
 #[cfg(feature = "macros")]
 pub use bsql_postgres_proto::{
-    DecodeError, ParamsWriter, PreparedQuery, QueryFingerprint, TypedQuery,
+    DecodeError, ParamsWriter, PreparedQuery, QueryFingerprint, TypedCopyIn, TypedQuery,
 };
 
 /// The runtime contract of a Rust `enum` generated from a `CREATE TYPE ... AS
@@ -253,8 +267,8 @@ pub mod __rt {
     pub use bsql_postgres_proto::wire_pin;
     pub use bsql_postgres_proto::{
         BinaryFmt, Cell, ColCellAt, DataRowRef, Date, DecodeError, EnumLabel, Interval, Json, Jsonb,
-        Numeric, PgEnum, PreparedQuery, QueryFingerprint, Time, Timestamp, Timestamptz, TypedQuery,
-        Uuid, oids, prepared, query_budget,
+        Numeric, ParamsWriter, PgEnum, PreparedQuery, QueryFingerprint, Time, Timestamp, Timestamptz,
+        TypedCopyIn, TypedQuery, Uuid, oids, oids_equal, prepared, query_budget,
     };
 }
 
