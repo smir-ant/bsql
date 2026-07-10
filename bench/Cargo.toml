@@ -55,6 +55,17 @@ sqlx = { version = "0.8", default-features = false, features = [
 # FFI here never reaches any shipped artifact.
 libc = "0.2"
 
+# PILOT own-FFI probe (bin `ffi_probe`) — a thin unsafe layer over the SAME
+# bundled SQLite the rebuild's `rusqlite` links (`libsqlite3-sys` 0.35 bundled =
+# SQLite 3.50.2). Measures whether removing the rusqlite wrapper recovers the
+# original bsql's small-read numbers. `bundled` UNIFIES with rusqlite's own
+# `libsqlite3-sys` (one `sqlite3` in the binary), so the own-FFI-vs-rebuild delta
+# is pure wrapper overhead on an identical engine. Already resolved in this lock
+# via `bsql-sqlite -> rusqlite`, so this direct edge adds NO package; and this is
+# the STANDALONE `bench` workspace, so it never reaches the shipped `deps_pin` /
+# `runtime_graph_pin` gates. `publish = false`; a never-shipped measurement probe.
+libsqlite3-sys = { version = "0.35", features = ["bundled"] }
+
 [build-dependencies]
 # BUILD-DEP ONLY — replays `migrations/` into the `query!` catalog (exactly the
 # placement a real consumer uses). `publish = false` standalone workspace, so
@@ -110,6 +121,11 @@ path = "src/bin/parity_pg.rs"
 [[bin]]
 name = "parity_sqlite"
 path = "src/bin/parity_sqlite.rs"
+
+# PILOT: own-FFI vs rebuild small-read comparison, same process / same engine.
+[[bin]]
+name = "ffi_probe"
+path = "src/bin/ffi_probe.rs"
 
 [[bin]]
 name = "rss_bsql_sync"

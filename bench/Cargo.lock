@@ -112,6 +112,7 @@ dependencies = [
  "criterion",
  "futures",
  "libc",
+ "libsqlite3-sys",
  "sqlx",
  "tokio",
  "tokio-postgres",
