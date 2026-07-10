@@ -62,9 +62,14 @@ pub enum ProtocolError {
     },
 
     /// Server's `RowDescription` declares more columns than
-    /// [`crate::MAX_ROW_COLUMNS`] — this crate's bounded inline storage cannot
-    /// accommodate the result-set. The query is failed and the connection is
-    /// torn down; the user retries with a narrower projection.
+    /// [`crate::MAX_ROW_COLUMNS`] (1664 — PostgreSQL's own
+    /// `MaxTupleAttributeNumber`). Unlike the malformed-frame variants above, the
+    /// frame is WELL-FORMED — only too wide — so the stream position is known and
+    /// this is RECOVERABLE: the driver drains the in-flight result to the trailing
+    /// `ReadyForQuery` and leaves the connection alive + pooled, then the caller
+    /// retries with a narrower projection. A conforming server never exceeds 1664
+    /// (it errors at 1665 first, a server error), so this classifies a
+    /// nonconforming peer.
     TooManyColumns {
         /// Column count declared by the server.
         count: usize,

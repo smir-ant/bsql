@@ -131,6 +131,48 @@ async fn connect_and_ping() {
     c.close().await.expect("close");
 }
 
+/// The async peer of the sync `wide_columns` witness: a 1664-column result — the
+/// widest PostgreSQL produces (`MaxTupleAttributeNumber`), now the driver's cap —
+/// decodes correctly over the shared `Core<S>`.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn wide_columns_1664_decode() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+    for n in [1000u32, 1664] {
+        let cols: Vec<String> = (0..n).map(|i| format!("{i}::int AS c{i}")).collect();
+        let sql = format!("SELECT {}", cols.join(", "));
+        let r = match c.query_sql(&sql).await {
+            Ok(r) => r,
+            Err(e) => panic!("{n} cols failed: {e}"),
+        };
+        assert_eq!(r.len(), 1, "rows at {n}");
+        assert_eq!(r.column_names.len(), usize::try_from(n).unwrap(), "col names at {n}");
+        let last = usize::try_from(n.saturating_sub(1)).unwrap();
+        assert_eq!(
+            r.get(0).expect("row 0").get_i32(last),
+            Ok(Some(n.saturating_sub(1) as i32)),
+            "last col at {n}"
+        );
+    }
+    // Beyond PG's own 1664 limit is a recoverable SERVER error; the connection
+    // survives to serve a follow-up query (the client-side over-cap is witnessed
+    // deterministically in `bsql-testkit`'s `overcap_recovery`).
+    let over: Vec<String> = (0..1665u32).map(|i| format!("{i}::int AS c{i}")).collect();
+    let over_sql = format!("SELECT {}", over.join(", "));
+    let err = c.query_sql(&over_sql).await.expect_err("1665 exceeds PG's 1664 limit");
+    match err {
+        DriverError::Db(db) => assert!(
+            format!("{db}").contains("target lists can have at most 1664"),
+            "expected PG's target-list-limit error, got: {db}"
+        ),
+        other => panic!("expected a server Db error, got {other:?}"),
+    }
+    let r = c.query_sql("SELECT 7").await.expect("connection recovered after the server error");
+    assert_eq!(r.get(0).expect("row 0").get_i32(0), Ok(Some(7)));
+    c.close().await.expect("close");
+}
+
 /// WITNESS (steady-state timeout parity): the async driver has NO steady-state
 /// read deadline — a query the server delays LONGER than `connect_timeout` must
 /// SUCCEED and leave the connection usable. This is the behaviour the blocking

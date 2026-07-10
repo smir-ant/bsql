@@ -164,6 +164,20 @@ pub enum Event<'e> {
     CopyData(&'e [u8]),
     /// The `COPY` stream is complete.
     CopyDone,
+    /// A well-formed but too-wide `RowDescription` — its column count exceeds
+    /// [`MAX_ROW_COLUMNS`](crate::MAX_ROW_COLUMNS) — classified as a RECOVERABLE
+    /// `TooManyColumns`. Carries the offending `count` and the supported `max` so
+    /// the driver names the exact limit; the engine has parked a drain that
+    /// swallows the in-flight result to the trailing `ReadyForQuery`, so the
+    /// connection recovers to idle (distinct from [`Close`](Self::Close), which
+    /// tears it down). Payload-free of any buffer borrow — the two counts are
+    /// owned, so it does not widen the event past its fat-slice variants.
+    Overcap {
+        /// Column count the server's `RowDescription` declared.
+        count: usize,
+        /// Maximum supported — [`MAX_ROW_COLUMNS`](crate::MAX_ROW_COLUMNS).
+        max: usize,
+    },
 }
 
 crate::wire_pin!(Event<'static>, size = 24, align = 8);

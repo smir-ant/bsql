@@ -42,11 +42,30 @@ pub trait DbErrorSink {
     /// Take the parsed server error parked from a [`Surface::Fail`], if one was
     /// observed during the pump. Consumes it (a second call returns `None`).
     fn take_db_error(&mut self) -> Option<DbError>;
+
+    /// Take the too-wide classification parked from a [`Surface::Overcap`] — the
+    /// `(count, max)` of a result whose column count exceeded the driver's cap —
+    /// if one was observed during the pump. Consumes it (a second call returns
+    /// `None`). The client-side peer of [`take_db_error`](Self::take_db_error):
+    /// checked FIRST by the driver's settle step so a too-wide result surfaces its
+    /// specific classification, not the generic recovered-failure fallback.
+    ///
+    /// Defaults to `None`: only the dynamic [`ResultCollector`] can observe an
+    /// over-cap (the typed-row [`RowsBuilder`](crate::RowsBuilder) decodes a
+    /// compile-capped column count that cannot exceed the cap), so it alone
+    /// overrides this.
+    fn take_overcap(&mut self) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 impl DbErrorSink for ResultCollector {
     fn take_db_error(&mut self) -> Option<DbError> {
         self.db_error.take()
+    }
+
+    fn take_overcap(&mut self) -> Option<(usize, usize)> {
+        self.overcap.take()
     }
 }
 
@@ -72,6 +91,11 @@ pub struct ResultCollector {
     column_names: Vec<String>,
     db_error: Option<DbError>,
     decode_error: Option<DriverError>,
+    /// The `(count, max)` of a too-wide `RowDescription` parked from a
+    /// [`Surface::Overcap`]. Read through [`DbErrorSink::take_overcap`] by the
+    /// driver's settle step, which maps it to the recoverable
+    /// `DriverError::TooManyColumns` — the client-side peer of `db_error`.
+    overcap: Option<(usize, usize)>,
 }
 
 impl ResultCollector {
@@ -135,6 +159,10 @@ impl ResultCollector {
                 self.column_names = names.to_vec();
             }
             Surface::Fail(body) => self.db_error = Some(parse_error_response(body)),
+            // A too-wide result classified as recoverable `TooManyColumns`: park
+            // the counts for the settle step, exactly as `Fail` parks a server
+            // error. The pump then reaches its `Failed` boundary and drains.
+            Surface::Overcap { count, max } => self.overcap = Some((count, max)),
             // Asynchronous / COPY frames are not part of a row result set; the
             // copy affected-count rides the trailing `Deliver` like any command.
             Surface::Notice(_)

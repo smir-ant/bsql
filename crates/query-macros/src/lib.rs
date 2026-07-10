@@ -1860,17 +1860,19 @@ fn emit_records(
     // inference engine; the Rust "two fields, one name" rule (E0124) is
     // the structural backstop.
     let mut field_idents = Vec::with_capacity(columns.len());
-    // Per-column 0-based index, as a `u8` for the `TruncatedColumnLen`
-    // diagnostic on a short row. Bounded loudly so the cast is never lossy.
-    let mut col_idx_u8 = Vec::with_capacity(columns.len());
+    // Per-column 0-based index, as a `u16` for the `TruncatedColumnLen`
+    // diagnostic on a short row — the width of `DecodeError::column_idx` (the wire
+    // column count is a non-negative `i16`, so `u16` holds every index). Bounded
+    // loudly so the cast is never lossy.
+    let mut col_idx_u16 = Vec::with_capacity(columns.len());
     for (idx, col) in columns.iter().enumerate() {
         field_idents.push(make_field_ident(&col.name, name.span())?);
-        match u8::try_from(idx) {
-            Ok(value) => col_idx_u8.push(value),
+        match u16::try_from(idx) {
+            Ok(value) => col_idx_u16.push(value),
             Err(_) => {
                 return Err(syn::Error::new(
                     name.span(),
-                    "query!: more than 256 output columns are not supported",
+                    "query!: too many output columns (a column index exceeds the u16 index space)",
                 ))
             }
         }
@@ -1927,7 +1929,7 @@ fn emit_records(
     let borrowed_body = decode_body(
         &field_idents,
         columns,
-        &col_idx_u8,
+        &col_idx_u16,
         n_i16,
         all_fixed_not_null,
         false,
@@ -1977,7 +1979,7 @@ fn emit_records(
         let owned_body = decode_body(
             &field_idents,
             columns,
-            &col_idx_u8,
+            &col_idx_u16,
             n_i16,
             all_fixed_not_null,
             true,
@@ -2046,13 +2048,13 @@ struct Codegen<'a> {
 fn decode_body(
     field_idents: &[Ident],
     columns: &[bsql_build::InferredColumn],
-    col_idx_u8: &[u8],
+    col_idx_u16: &[u16],
     n_i16: i16,
     all_fixed_not_null: bool,
     is_owned: bool,
     cx: &Codegen<'_>,
 ) -> syn::Result<TokenStream2> {
-    let per_cell = per_cell_path(field_idents, columns, col_idx_u8, is_owned, cx.bridges, cx.enums)?;
+    let per_cell = per_cell_path(field_idents, columns, col_idx_u16, is_owned, cx.bridges, cx.enums)?;
     // The fast path only fires when every column is fixed-width; a user-enum
     // column is variable-width (`fixed_width` is `None`), so a query with an
     // enum column never takes the fast path — `fast_path` never sees an enum and
@@ -2164,7 +2166,7 @@ fn fast_path(
 fn per_cell_path(
     field_idents: &[Ident],
     columns: &[bsql_build::InferredColumn],
-    col_idx_u8: &[u8],
+    col_idx_u16: &[u16],
     is_owned: bool,
     bridges: &Bridges,
     enums: &EnumTypes,
@@ -2181,9 +2183,9 @@ fn per_cell_path(
     let stmts = field_idents
         .iter()
         .zip(columns)
-        .zip(col_idx_u8)
+        .zip(col_idx_u16)
         .map(|((id, col), idx)| {
-            let idx_lit = Literal::u8_suffixed(*idx);
+            let idx_lit = Literal::u16_suffixed(*idx);
             let value = per_cell_value_expr(col.ty, col.nullable, is_owned, bridges, enums)?;
             Ok(quote! {
                 let __cell = match ::core::iter::Iterator::next(&mut __cols) {

@@ -177,6 +177,15 @@ enum ActiveState {
     CopyInActive,
     /// A recoverable server error parked a drain; awaiting `ReadyForQuery`.
     DrainAfterError,
+    /// A too-wide `RowDescription` (column count over
+    /// [`MAX_ROW_COLUMNS`](crate::decode::MAX_ROW_COLUMNS)) was classified as a
+    /// recoverable `TooManyColumns`; the in-flight result the client rejected is
+    /// being SWALLOWED to the trailing `ReadyForQuery`. Distinct from
+    /// [`DrainAfterError`](Self::DrainAfterError): a server error aborts the query
+    /// (only the RFQ follows), whereas here the server streams a full result, so
+    /// every frame until the RFQ — `DataRow`s, `CommandComplete`, a second
+    /// statement's `RowDescription` — is discarded.
+    DrainOvercapToRfq,
 
     // ── Extended query protocol (Parse / Describe / Bind+Execute / Close) ──
     //
@@ -281,6 +290,11 @@ enum ActiveOutcome {
     Close,
     RowChunkEnd,
     CopyDone,
+    /// A too-wide `RowDescription` classified as a recoverable `TooManyColumns`.
+    /// The `count`/`max` ride the outcome (no buffer borrow) so the driver names
+    /// the exact limit; the drain state was already parked by
+    /// [`enter_overcap_recovery`](ActiveEngine::enter_overcap_recovery).
+    Overcap { count: usize, max: usize },
     Fail(Lend, usize, usize),
     Notice(Lend, usize, usize),
     Notify(Lend, usize, usize),
@@ -303,6 +317,13 @@ enum OversizeMode {
     /// wide `RowDescription`: every column's OID and name is load-bearing, so it
     /// can be neither truncated like Sub-B nor streamed piecewise like Sub-A).
     Accumulate,
+    /// Consume and DISCARD the whole body, surfacing nothing. Entered only while
+    /// [`DrainOvercapToRfq`](ActiveState::DrainOvercapToRfq): recovering from a
+    /// too-wide result means every following frame (including a wide `DataRow`
+    /// that itself overflows the buffer) is swallowed to reach the trailing RFQ,
+    /// so an oversize one is skipped rather than streamed (Sub-A), accumulated
+    /// (Sub-C), or truncated-and-surfaced (Sub-B).
+    Skip,
 }
 
 /// State of an in-progress oversize frame. `Copy` so the drive loop can lift it
@@ -833,6 +854,7 @@ impl ActiveEngine {
             ActiveOutcome::Close => Event::Close,
             ActiveOutcome::RowChunkEnd => Event::RowChunkEnd,
             ActiveOutcome::CopyDone => Event::CopyDone,
+            ActiveOutcome::Overcap { count, max } => Event::Overcap { count, max },
             ActiveOutcome::Fail(l, s, e) => Event::Fail(self.lend(l, s, e)),
             ActiveOutcome::Notice(l, s, e) => Event::Notice(self.lend(l, s, e)),
             ActiveOutcome::Notify(l, s, e) => Event::Notify(self.lend(l, s, e)),
@@ -871,6 +893,7 @@ impl ActiveEngine {
                 | ActiveState::CopyOutAwaitingCc
                 | ActiveState::CopyInActive
                 | ActiveState::DrainAfterError
+                | ActiveState::DrainOvercapToRfq
                 | ActiveState::ParseAwaitingParseComplete
                 | ActiveState::ParseDescribeStmtAwaitingParseComplete
                 | ActiveState::ParseBindExecuteAwaitingParseComplete
@@ -950,6 +973,7 @@ impl ActiveEngine {
             ActiveState::CopyOutAwaitingCc => self.step_copy_out_awaiting_cc(tag, start, end),
             ActiveState::CopyInActive => self.step_copy_in_active(tag, start, end),
             ActiveState::DrainAfterError => self.step_drain_after_error(tag, start, end),
+            ActiveState::DrainOvercapToRfq => self.step_drain_overcap(tag, start, end),
             ActiveState::ParseAwaitingParseComplete => {
                 self.step_parse_awaiting_parse_complete(tag, start, end)
             }
@@ -1070,6 +1094,35 @@ impl ActiveEngine {
         match tag {
             T_READY_FOR_QUERY => self.parse_rfq(start, end),
             _ => self.teardown(),
+        }
+    }
+
+    /// `DrainOvercapToRfq` — recovering from a too-wide result the client
+    /// rejected: SWALLOW every frame until the trailing `ReadyForQuery`, which
+    /// recovers to idle. Unlike [`step_drain_after_error`](Self::step_drain_after_error)
+    /// (a server error aborts the query, so the next frame IS the RFQ and anything
+    /// else is a teardown), the server here is actively streaming a full result
+    /// the client cannot represent — its `DataRow`s, `CommandComplete`, and even a
+    /// second statement's `RowDescription` in a simple-query batch must all be
+    /// discarded, so every non-RFQ frame is a silent swallow, not a teardown. An
+    /// oversize frame during the drain is skipped by
+    /// [`begin_oversize`](Self::begin_oversize)'s
+    /// [`Skip`](OversizeMode::Skip) mode; the asynchronous `Notice`/`Notify`/
+    /// `ParameterStatus` frames still surface (handled above the per-state dispatch
+    /// in [`drive`](Self::drive)), so a notification in the recovery window is
+    /// captured, never dropped.
+    ///
+    /// `#[cold]` + `#[inline(never)]`: the over-cap drain is a rare recovery path
+    /// (reached only from a nonconforming server), so its body is kept OUT of
+    /// [`next_event`](Self::next_event)'s hot frame — the state dispatch reaches it
+    /// through a call, never an inlined arm, so the per-`DataRow` hot path does not
+    /// carry the drain's instructions.
+    #[cold]
+    #[inline(never)]
+    fn step_drain_overcap(&mut self, tag: u8, start: usize, end: usize) -> ActiveOutcome {
+        match tag {
+            T_READY_FOR_QUERY => self.parse_rfq(start, end),
+            _ => ActiveOutcome::Silent,
         }
     }
 
@@ -1324,6 +1377,7 @@ impl ActiveEngine {
             | ActiveState::CopyOutAwaitingCc
             | ActiveState::CopyInActive
             | ActiveState::DrainAfterError
+            | ActiveState::DrainOvercapToRfq
             | ActiveState::ParseAwaitingParseComplete
             | ActiveState::ParseDescribeStmtAwaitingParseComplete
             | ActiveState::ParseBindExecuteAwaitingParseComplete
@@ -1346,17 +1400,24 @@ impl ActiveEngine {
         self.apply_open_row_stream(parsed)
     }
 
-    /// Open the row stream from a parsed schema (or tear down on a parse fail).
-    /// Shared by the in-buffer and Sub-C-accumulated `RowDescription` paths.
-    fn apply_open_row_stream(&mut self, parsed: Option<(Vec<u32>, Vec<String>)>) -> ActiveOutcome {
+    /// Open the row stream from a parsed schema, RECOVER from a too-wide one, or
+    /// tear down on a malformed frame. Shared by the in-buffer and
+    /// Sub-C-accumulated `RowDescription` paths.
+    fn apply_open_row_stream(
+        &mut self,
+        parsed: Result<(Vec<u32>, Vec<String>), crate::error::ProtocolError>,
+    ) -> ActiveOutcome {
         match parsed {
-            Some((oids, names)) => {
+            Ok((oids, names)) => {
                 self.col_oids = oids;
                 self.col_names = names;
                 self.state = ActiveState::StreamingRows;
                 ActiveOutcome::Silent
             }
-            None => self.teardown(),
+            Err(crate::error::ProtocolError::TooManyColumns { count, max }) => {
+                self.enter_overcap_recovery(count, max)
+            }
+            Err(_) => self.teardown(),
         }
     }
 
@@ -1370,15 +1431,21 @@ impl ActiveEngine {
     /// only at the trailing `ReadyForQuery`), so the runtime consumer reads the
     /// recovered OIDs + names at the delivery exactly as the separate-`prepare`
     /// path surfaced them. Shared by the in-buffer and Sub-C-accumulated paths.
-    fn apply_fused_row_stream(&mut self, parsed: Option<(Vec<u32>, Vec<String>)>) -> ActiveOutcome {
+    fn apply_fused_row_stream(
+        &mut self,
+        parsed: Result<(Vec<u32>, Vec<String>), crate::error::ProtocolError>,
+    ) -> ActiveOutcome {
         match parsed {
-            Some((oids, names)) => {
+            Ok((oids, names)) => {
                 self.col_oids = oids;
                 self.col_names = names;
                 self.state = ActiveState::BindAwaitingData;
                 ActiveOutcome::Silent
             }
-            None => self.teardown(),
+            Err(crate::error::ProtocolError::TooManyColumns { count, max }) => {
+                self.enter_overcap_recovery(count, max)
+            }
+            Err(_) => self.teardown(),
         }
     }
 
@@ -1445,15 +1512,18 @@ impl ActiveEngine {
     /// Shared by the in-buffer and Sub-C-accumulated `RowDescription` paths.
     fn apply_record_described_rows(
         &mut self,
-        parsed: Option<(Vec<u32>, Vec<String>)>,
+        parsed: Result<(Vec<u32>, Vec<String>), crate::error::ProtocolError>,
     ) -> ActiveOutcome {
         match parsed {
-            Some((oids, names)) => {
+            Ok((oids, names)) => {
                 self.col_oids = oids;
                 self.col_names = names;
                 self.deliver_empty(ActiveState::ExtendedAwaitingRfq)
             }
-            None => self.teardown(),
+            Err(crate::error::ProtocolError::TooManyColumns { count, max }) => {
+                self.enter_overcap_recovery(count, max)
+            }
+            Err(_) => self.teardown(),
         }
     }
 
@@ -1504,6 +1574,7 @@ impl ActiveEngine {
             | ActiveState::CopyOutAwaitingCc
             | ActiveState::CopyInActive
             | ActiveState::DrainAfterError
+            | ActiveState::DrainOvercapToRfq
             | ActiveState::ParseAwaitingParseComplete
             | ActiveState::ParseDescribeStmtAwaitingParseComplete
             | ActiveState::ParseBindExecuteAwaitingParseComplete
@@ -1551,6 +1622,34 @@ impl ActiveEngine {
     fn fail_recoverable(&mut self, start: usize, end: usize) -> ActiveOutcome {
         self.state = ActiveState::DrainAfterError;
         ActiveOutcome::Fail(Lend::Ingest, start, end)
+    }
+
+    /// A well-formed but too-wide `RowDescription` (its column count exceeds
+    /// [`MAX_ROW_COLUMNS`](crate::decode::MAX_ROW_COLUMNS)) → surface the
+    /// classified `TooManyColumns` and park a drain that SWALLOWS the in-flight
+    /// result to the trailing `ReadyForQuery`. This is the documented recoverable
+    /// path (the connection survives; the caller retries with a narrower
+    /// projection), distinct from a MALFORMED frame (a framing desync that
+    /// tears the connection down via [`teardown`](Self::teardown)): the frame
+    /// parsed cleanly, so the stream position is known and every following frame
+    /// can be discarded to the recovering RFQ.
+    ///
+    /// Unlike [`fail_recoverable`](Self::fail_recoverable) (a server error aborts
+    /// the query, so only the RFQ follows and the drain is
+    /// [`DrainAfterError`](ActiveState::DrainAfterError)), the server here streams
+    /// a FULL result the client rejected, so the drain
+    /// ([`DrainOvercapToRfq`](ActiveState::DrainOvercapToRfq)) swallows every
+    /// frame — including a wide `DataRow` that itself exceeds the ingest buffer —
+    /// until the RFQ. `count`/`max` ride the outcome so the driver names the exact
+    /// limit.
+    ///
+    /// `#[cold]` + `#[inline(never)]`: reached only from the (cold) RowDescription
+    /// arms, never the hot `DataRow` frame, so it is kept out of line.
+    #[cold]
+    #[inline(never)]
+    fn enter_overcap_recovery(&mut self, count: usize, max: usize) -> ActiveOutcome {
+        self.state = ActiveState::DrainOvercapToRfq;
+        ActiveOutcome::Overcap { count, max }
     }
 
     /// `ReadyForQuery` → validate the 1-byte transaction status, record it,
@@ -1621,6 +1720,9 @@ impl ActiveEngine {
             | ActiveOutcome::RowChunkEnd
             | ActiveOutcome::CopyDone
             | ActiveOutcome::Fail(..)
+            // A fixed prelude returns no rows, so it cannot over-cap — an
+            // `Overcap` here is as impossible as a `Row` and shares the teardown.
+            | ActiveOutcome::Overcap { .. }
             | ActiveOutcome::Row(..)
             | ActiveOutcome::RowChunk(..)
             | ActiveOutcome::CopyData(..) => Event::Close,
@@ -1747,6 +1849,22 @@ impl ActiveEngine {
         // Body length = declared (length-inclusive) minus the 4 length bytes.
         let body_len = usize_from_u32(declared).saturating_sub(HEADER_LEN.saturating_sub(1));
 
+        // Recovering from a too-wide result: SWALLOW every oversize frame
+        // regardless of tag (a wide `DataRow`, or a second statement's wide
+        // `RowDescription` in a simple-query batch), consuming its body without
+        // surfacing, until the drain reaches the trailing `ReadyForQuery` (which
+        // is tiny and never oversize). Checked BEFORE the tag classification so it
+        // takes precedence over Sub-A/Sub-C for a `DataRow`/`RowDescription` here.
+        if matches!(self.state, ActiveState::DrainOvercapToRfq) {
+            self.oversize = Some(OversizeStream {
+                mode: OversizeMode::Skip,
+                body_remaining: body_len,
+                surfaced_tag: tag,
+                prefix_len: 0,
+            });
+            return ActiveOutcome::Silent;
+        }
+
         if tag == T_DATA_ROW
             && matches!(
                 self.state,
@@ -1826,6 +1944,24 @@ impl ActiveEngine {
                         os.body_remaining = os.body_remaining.saturating_sub(took);
                         self.oversize = Some(os);
                         ActiveOutcome::RowChunk(Lend::Ingest, start, end)
+                    }
+                }
+            }
+            OversizeMode::Skip => {
+                if os.body_remaining == 0 {
+                    self.oversize = None;
+                    // Body fully discarded; resume the drain, which reads the next
+                    // frame (another swallowed body, or the recovering RFQ).
+                    return ActiveOutcome::Silent;
+                }
+                match self.ingest.take_chunk(os.body_remaining) {
+                    None => ActiveOutcome::NeedMore,
+                    Some((start, end)) => {
+                        let took = end.saturating_sub(start);
+                        os.body_remaining = os.body_remaining.saturating_sub(took);
+                        self.oversize = Some(os);
+                        // Consumed + discarded — surface nothing.
+                        ActiveOutcome::Silent
                     }
                 }
             }
@@ -1922,6 +2058,11 @@ impl ActiveEngine {
             ActiveState::BindAwaitingData => Some(ActiveState::ExtendedAwaitingRfq),
             ActiveState::CopyOut
             | ActiveState::DrainAfterError
+            // In the overcap drain an in-buffer `CommandComplete` is swallowed by
+            // `step_drain_overcap` and an oversize one by `Skip` mode — neither
+            // reaches this Sub-B completion path — so a `CommandComplete` arriving
+            // here in that state is as wire-illegal as in `DrainAfterError`.
+            | ActiveState::DrainOvercapToRfq
             | ActiveState::ParseAwaitingParseComplete
             | ActiveState::ParseDescribeStmtAwaitingParseComplete
             | ActiveState::ParseBindExecuteAwaitingParseComplete
@@ -1985,21 +2126,26 @@ impl ActiveEngine {
     }
 }
 
-/// Parse a `RowDescription` body into owned column type OIDs + names, or `None`
-/// when the body is wire-malformed. Owned (not borrowed), so the caller can
-/// mutate `self` after the parse — and so the same parse serves both the
-/// in-buffer body (`IngestBuf::frame_body`) and the Sub-C accumulator (a `Vec`).
+/// Parse a `RowDescription` body into owned column type OIDs + names, or the
+/// classified [`ProtocolError`](crate::error::ProtocolError) the wire decode
+/// rejected it with. Owned (not borrowed), so the caller can mutate `self` after
+/// the parse — and so the same parse serves both the in-buffer body
+/// (`IngestBuf::frame_body`) and the Sub-C accumulator (a `Vec`).
+///
+/// The classification is THREADED, not flattened to `Option`: a well-formed but
+/// too-wide frame is `Err(ProtocolError::TooManyColumns { .. })` — a RECOVERABLE
+/// class the caller drains from, distinct from a malformed frame (a framing
+/// desync that tears the connection down). Collapsing both to `None` would have
+/// forced every caller to teardown, which is exactly the bug this preserves the
+/// distinction to fix.
 #[inline]
-fn parse_row_desc_owned(body: &[u8]) -> Option<(Vec<u32>, Vec<String>)> {
-    let oids = match parse_row_description(body) {
-        Ok(rd) => rd.columns_iter().map(|c| c.type_oid).collect::<Vec<u32>>(),
-        Err(_) => return None,
-    };
-    let names = match parse_column_names(body) {
-        Ok(names) => names,
-        Err(_) => return None,
-    };
-    Some((oids, names))
+fn parse_row_desc_owned(
+    body: &[u8],
+) -> Result<(Vec<u32>, Vec<String>), crate::error::ProtocolError> {
+    let rd = parse_row_description(body)?;
+    let oids = rd.columns_iter().map(|c| c.type_oid).collect::<Vec<u32>>();
+    let names = parse_column_names(body)?;
+    Ok((oids, names))
 }
 
 /// Is `tag` a payload-bearing non-`DataRow` frame whose oversize is absorbed

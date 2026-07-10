@@ -476,9 +476,18 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 self.live = Some(live);
                 match status {
                     CommandStatus::Completed => Ok(()),
-                    CommandStatus::ServerErrored => match collector.take_db_error() {
-                        Some(db) => Err(DriverError::Db(Box::new(db))),
-                        None => Err(DriverError::UnclassifiedFailure),
+                    // A recoverable failure the verb already drained to a clean
+                    // idle. TWO client-visible classes ride this status: a too-wide
+                    // result (checked FIRST — its own classification, never masked
+                    // by the generic fallback) and a server `ErrorResponse`. The
+                    // engine parks at most one, so the order only fixes precedence
+                    // for the impossible both-set case.
+                    CommandStatus::ServerErrored => match collector.take_overcap() {
+                        Some((count, max)) => Err(DriverError::TooManyColumns { count, max }),
+                        None => match collector.take_db_error() {
+                            Some(db) => Err(DriverError::Db(Box::new(db))),
+                            None => Err(DriverError::UnclassifiedFailure),
+                        },
                     },
                 }
             }

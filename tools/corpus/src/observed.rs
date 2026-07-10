@@ -189,6 +189,10 @@ pub enum ProtocolFailureKind {
     /// A push (request build) was rejected because the connection was not
     /// ready to accept a command.
     NotReady,
+    /// A well-formed `RowDescription` declared more columns than the driver's
+    /// supported maximum — a RECOVERABLE classification (the engine drains the
+    /// in-flight result to a clean idle), the client-side peer of a server error.
+    TooManyColumns,
 }
 
 /// The `ReadyForQuery` transaction-status indicator (PG §55.7).

@@ -309,6 +309,22 @@ pub enum DriverError {
     /// first row (which would mask a query that is not as selective as the
     /// caller assumed).
     TooManyRows,
+    /// A dynamic (`query_sql` / `query_params`) result declared more columns than
+    /// the driver's supported maximum ([`bsql_postgres_proto::MAX_ROW_COLUMNS`] =
+    /// 1664, PostgreSQL's own `MaxTupleAttributeNumber` target-list limit). Unlike
+    /// a torn-down connection, this is RECOVERABLE: the verb drained the in-flight
+    /// result to a clean idle before returning, so the connection stays pooled and
+    /// the caller retries with a narrower projection. Names both the offending
+    /// `count` and the `max` so the fix is obvious. A conforming server never
+    /// exceeds `max` (it errors at 1665 first, surfaced as a server
+    /// [`Db`](Self::Db) error), so this classifies a NONCONFORMING peer; the typed
+    /// `query!` path cannot reach it (its result columns are compile-capped).
+    TooManyColumns {
+        /// Column count the server's `RowDescription` declared.
+        count: usize,
+        /// Maximum supported by the driver.
+        max: usize,
+    },
     /// A pooled connection could not be acquired within the pool's configured
     /// acquire deadline: every connection was checked out and the pool was at
     /// its `max_size`, so no permit became free in time. Surfaced as a distinct
@@ -395,6 +411,10 @@ impl fmt::Display for DriverError {
             Self::RowDecodeFailed => write!(f, "server DataRow did not match its declared column framing"),
             Self::Decode(e) => write!(f, "typed row decode failed: {e}"),
             Self::TooManyRows => write!(f, "query_one matched more than one row"),
+            Self::TooManyColumns { count, max } => write!(
+                f,
+                "result-set too wide: {count} columns (max supported {max}); narrow the projection"
+            ),
             Self::PoolTimeout => write!(f, "timed out acquiring a pooled connection; the pool is exhausted"),
             Self::Column(e) => write!(f, "{e}"),
             Self::PayloadParse(payload) => {
@@ -431,6 +451,7 @@ impl std::error::Error for DriverError {
             | Self::SpuriousPending
             | Self::RowDecodeFailed
             | Self::TooManyRows
+            | Self::TooManyColumns { .. }
             | Self::PoolTimeout
             | Self::PayloadParse(_) => None,
         }

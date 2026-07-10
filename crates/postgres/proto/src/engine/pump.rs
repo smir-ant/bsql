@@ -191,6 +191,17 @@ pub enum Surface<'e> {
     CopyData(&'e [u8]),
     /// The `COPY` stream is complete.
     CopyDone,
+    /// A too-wide `RowDescription` classified as a recoverable `TooManyColumns`,
+    /// surfaced before a [`Boundary::Failed`]. The `count`/`max` name the exact
+    /// limit; a driver's collector parks them so its settle step maps the
+    /// recovered failure to its "too many columns" error (the client-side peer of
+    /// the [`Fail`](Self::Fail) server-error carry).
+    Overcap {
+        /// Column count the server's `RowDescription` declared.
+        count: usize,
+        /// Maximum supported.
+        max: usize,
+    },
 }
 
 // The widest variant is `Deliver { tag, oids, names }` — an `Option<&CommandTag>`
@@ -280,6 +291,22 @@ where
             Event::Idle => return Ok(Boundary::Idle),
             Event::Suspended => return Ok(Boundary::Suspended),
             Event::Close => return Ok(Boundary::Closed),
+            Event::Overcap { count, max } => {
+                // A too-wide result classified as recoverable `TooManyColumns`:
+                // surface the classified counts, then report the `Failed` boundary
+                // the verb drains (the engine has parked the swallow-to-RFQ drain).
+                // The client-side twin of the `Fail` server-error carry — it rides
+                // the SAME recovery path (drain to idle, token restored), so a
+                // driver treats "too wide" and "server error" as one recoverable
+                // family, distinguished by which surface its collector parked.
+                return match sink(Surface::Overcap { count, max }) {
+                    ControlFlow::Break(b) => {
+                        core::hint::cold_path();
+                        Ok(Boundary::Stopped(b))
+                    }
+                    ControlFlow::Continue(()) => Ok(Boundary::Failed),
+                };
+            }
             Event::Fail(body) => {
                 // Surface the raw error bytes, then report the failure boundary
                 // the verb maps to its error. A sink break still wins as an
@@ -393,7 +420,11 @@ where
             | Event::RowChunk(_)
             | Event::RowChunkEnd
             | Event::CopyData(_)
-            | Event::CopyDone => {
+            | Event::CopyDone
+            // A fixed `BEGIN`/`COMMIT`/`RESET` prelude returns no rows, so it
+            // cannot over-cap; an `Overcap` here is as impossible as a row and is
+            // the same fatal classification.
+            | Event::Overcap { .. } => {
                 core::hint::cold_path();
                 return Err(EngineError::ProtocolViolation);
             }

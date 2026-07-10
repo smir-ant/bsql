@@ -387,6 +387,13 @@ fn pull_one(active: &mut ActiveEngine) -> PullEvent {
         Event::CopyData(body) => PullEvent::CopyData(body.to_vec()),
         Event::CopyDone => PullEvent::CopyDone,
         Event::Fail(body) => PullEvent::Fail(parse_server_error(body)),
+        // A too-wide result classified as a recoverable `TooManyColumns` — a
+        // client-side protocol failure (no server SQLSTATE), observed as its
+        // stable CLASS; the drain to the recovering RFQ follows exactly as a
+        // server error's does.
+        Event::Overcap { .. } => {
+            PullEvent::Fail(ObservedErr::Protocol(ProtocolFailureKind::TooManyColumns))
+        }
         Event::Deliver => {
             let (command_tag, affected_rows) = match active.last_command_tag() {
                 Some(tag) => (tag.to_string(), tag.rows()),
@@ -1211,6 +1218,13 @@ fn fold_surface(
         Surface::Fail(body) => {
             if cap.fail.is_none() {
                 cap.fail = Some(parse_server_error(body));
+            }
+        }
+        // A too-wide result classified as a recoverable `TooManyColumns` — the
+        // client-side peer of `Fail`, observed as its stable protocol CLASS.
+        Surface::Overcap { .. } => {
+            if cap.fail.is_none() {
+                cap.fail = Some(ObservedErr::Protocol(ProtocolFailureKind::TooManyColumns));
             }
         }
         Surface::RowChunk(_) | Surface::RowChunkEnd | Surface::CopyDone => {}

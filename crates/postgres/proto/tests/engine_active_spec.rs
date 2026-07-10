@@ -178,6 +178,7 @@ enum Ev {
     Row(Vec<u8>),
     RowChunk(Vec<u8>),
     CopyData(Vec<u8>),
+    Overcap { count: usize, max: usize },
 }
 
 fn feed(engine: &mut ActiveEngine, bytes: &[u8]) {
@@ -229,6 +230,7 @@ fn pull(engine: &mut ActiveEngine) -> Ev {
         Event::Row(b) => Ev::Row(b.to_vec()),
         Event::RowChunk(b) => Ev::RowChunk(b.to_vec()),
         Event::CopyData(b) => Ev::CopyData(b.to_vec()),
+        Event::Overcap { count, max } => Ev::Overcap { count, max },
     }
 }
 

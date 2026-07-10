@@ -1042,7 +1042,9 @@ fn one_connection_everything() {
 #[ignore = "requires local PG"]
 fn wide_columns() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    for n in [250u32, 500, 600, 800, 1000, 1600] {
+    // 1664 is PostgreSQL's MaxTupleAttributeNumber — the widest result it
+    // produces, and now the driver's cap. A conforming server never exceeds it.
+    for n in [250u32, 500, 1000, 1600, 1664] {
         let cols: Vec<String> = (0..n).map(|i| format!("{i}::int AS col_{i}")).collect();
         let sql = format!("SELECT {}", cols.join(", "));
         let r = c.query_sql(&sql).unwrap_or_else(|e| panic!("{n} cols failed: {e}"));
@@ -1052,6 +1054,34 @@ fn wide_columns() {
         let last = usize::try_from(n.saturating_sub(1)).unwrap();
         assert_eq!(r.get(0).expect("row 0").get_i32(last), Ok(Some(n.saturating_sub(1) as i32)), "last col at {n}");
     }
+    c.close().expect("close");
+}
+
+/// The wide-column BOUNDARY, live: 1665 columns is beyond PostgreSQL's own
+/// `MaxTupleAttributeNumber` (1664), so the SERVER rejects the query before any
+/// result — a recoverable `DriverError::Db` — and the connection survives to
+/// serve a follow-up query (the wide-column corner is recoverable end-to-end, not
+/// a teardown). A CLIENT-side over-cap (a nonconforming server wider than 1664)
+/// is witnessed deterministically in `bsql-testkit`'s `overcap_recovery`.
+#[test]
+#[ignore = "requires local PG"]
+fn wide_columns_beyond_pg_limit_is_a_recoverable_server_error() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let cols: Vec<String> = (0..1665u32).map(|i| format!("{i}::int AS col_{i}")).collect();
+    let sql = format!("SELECT {}", cols.join(", "));
+    let err = c.query_sql(&sql).expect_err("1665 columns exceeds PG's own 1664 limit");
+    match err {
+        bsql_postgres_sync::DriverError::Db(db) => {
+            assert!(
+                format!("{db}").contains("target lists can have at most 1664"),
+                "expected PG's target-list-limit error, got: {db}"
+            );
+        }
+        other => panic!("expected a server Db error, got {other:?}"),
+    }
+    // Recovered: a follow-up query on the SAME connection succeeds.
+    let r = c.query_sql("SELECT 7").expect("connection recovered after the server error");
+    assert_eq!(r.get(0).expect("row 0").get_i32(0), Ok(Some(7)));
     c.close().expect("close");
 }
 

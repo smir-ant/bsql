@@ -184,8 +184,13 @@ impl RowsBuilder {
                 };
             }
             Surface::Fail(body) => self.db_error = Some(parse_error_response(body)),
+            // A too-wide result cannot arise on the TYPED path — a `query!`'s
+            // result columns are compile-capped well below `MAX_ROW_COLUMNS`, so
+            // the engine never classifies one here — but the surface is
+            // enumerated, so it is ignored like the other non-row frames.
+            Surface::Overcap { .. }
             // Asynchronous / COPY frames are not part of a typed row result.
-            Surface::Notice(_)
+            | Surface::Notice(_)
             | Surface::Notify(_)
             | Surface::ParamStatus(_)
             | Surface::CopyData(_)

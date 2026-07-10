@@ -253,6 +253,11 @@ impl Captured {
             Surface::RowChunkEnd => self.row_chunk_ends += 1,
             Surface::CopyData(b) => self.copy_data.push(b.to_vec()),
             Surface::CopyDone => self.copy_dones += 1,
+            // A too-wide result is a recoverable failure surface, recorded like a
+            // `Fail` (this spec does not exercise the over-cap path).
+            Surface::Overcap { count, max } => {
+                self.fails.push(format!("overcap:{count}/{max}").into_bytes())
+            }
         }
     }
 }

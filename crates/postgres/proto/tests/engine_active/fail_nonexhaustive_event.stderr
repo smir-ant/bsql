@@ -1,8 +1,8 @@
-error[E0004]: non-exhaustive patterns: `Event::Notify(_)`, `Event::Suspended`, `Event::RowChunk(_)` and 3 more not covered
+error[E0004]: non-exhaustive patterns: `Event::Notify(_)`, `Event::Suspended`, `Event::RowChunk(_)` and 4 more not covered
   --> tests/engine_active/fail_nonexhaustive_event.rs:9:11
    |
  9 |     match ev {
-   |           ^^ patterns `Event::Notify(_)`, `Event::Suspended`, `Event::RowChunk(_)` and 3 more not covered
+   |           ^^ patterns `Event::Notify(_)`, `Event::Suspended`, `Event::RowChunk(_)` and 4 more not covered
    |
 note: `Event<'_>` defined here
   --> src/engine/mod.rs

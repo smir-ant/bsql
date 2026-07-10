@@ -83,16 +83,15 @@ fn trust_without_scram_is_not_rejected_at_the_credential_step() {
         .port(port)
         .ssl_mode(SslMode::Disable);
 
-    match Connection::connect(&config) {
-        // The loopback server speaks no protocol, so the handshake fails — but NOT
-        // with the missing-feature config error: Trust needs no SCRAM.
-        Err(DriverError::Config(msg)) => assert!(
+    // The loopback server speaks no protocol, so the handshake fails — but NOT
+    // with the missing-feature config error: Trust needs no SCRAM. Any other
+    // outcome (a transport/handshake error against the dummy server, or —
+    // implausibly — success) is fine: the point is only that Trust is not blocked
+    // at the credential step.
+    if let Err(DriverError::Config(msg)) = Connection::connect(&config) {
+        assert!(
             !msg.contains("scram"),
             "a Trust connection must not be rejected for a missing `scram` feature, got: {msg}"
-        ),
-        // Any other outcome (a transport/handshake error against the dummy server,
-        // or — implausibly — success) is fine: the point is only that Trust is not
-        // blocked at the credential step.
-        _ => {}
+        );
     }
 }

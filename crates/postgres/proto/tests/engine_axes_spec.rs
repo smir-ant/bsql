@@ -436,8 +436,10 @@ const ACTIVE_VERBS: usize = 21;
 /// `Bind`'s `frame_too_long` overflow landing, and the six fused-prelude markers:
 /// the `stage_prelude` prepend, the `pump_active_to_boundary` prelude-drain branch,
 /// the `drain_fused_prelude` EOF + fatal-frame arms, `surface_during_prelude`'s
-/// inapplicable-`Break` guard, and `copy_in_begin`'s prelude-drain branch.)
-const COLD_CLASSIFIED_BRANCHES: usize = 52;
+/// inapplicable-`Break` guard, and `copy_in_begin`'s prelude-drain branch.
+/// 53 adds the `pump_active_to_boundary` `Event::Overcap` sink-`Break` marker —
+/// the too-wide-result recovery's early-stop landing, the twin of the `Fail` arm's.)
+const COLD_CLASSIFIED_BRANCHES: usize = 53;
 /// `#[non_exhaustive]` attribute lines across `engine/`.
 /// Reproduce: `grep -rcE '^#\[non_exhaustive\]' crates/postgres/proto/src/engine/*.rs` (summed)
 const NON_EXHAUSTIVE_ATTRS: usize = 4;

@@ -320,6 +320,9 @@ impl Cap {
                 Surface::ParamStatus(_) => self.param_statuses += 1,
                 Surface::CopyData(body) => self.copy_data.push(body.to_vec()),
                 Surface::Fail(_) => self.fails += 1,
+                // A too-wide result is a recoverable failure surface, counted like
+                // a `Fail` (this spec does not exercise the over-cap path).
+                Surface::Overcap { .. } => self.fails += 1,
                 Surface::RowChunk(_) | Surface::RowChunkEnd | Surface::CopyDone => {}
             }
             ControlFlow::Continue(())

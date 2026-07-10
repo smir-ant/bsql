@@ -3,34 +3,34 @@
 //! `bsql-pg-proto` owns the raw wire encoding of a result-set: the
 //! `RowDescription` frame tells us column count, type OIDs, and
 //! per-column format codes; each `DataRow` frame carries the column
-//! values. This module parses `RowDescription` into [`RowDesc`]
-//! (shared between the row-streaming `ColEvent` API and
-//! `crate::Reply::QueryComplete`) and hosts the typed-decoder
+//! values. This module parses `RowDescription` into [`RowDesc`] (the
+//! per-statement schema the active engine holds and surfaces to the
+//! driver at each command boundary) and hosts the typed-decoder
 //! primitives that materialise column bytes into Rust types.
 //!
-//! # Why POD + bounded capacity
+//! # Storage
 //!
-//! The crate is `no_alloc`. `RowDesc` is a flat inline struct
-//! holding a `[ColumnDesc; MAX_ROW_COLUMNS]` array alongside a
-//! `u16` populated count — `Copy`, no `Drop`. Result-sets with
-//! more than [`MAX_ROW_COLUMNS`] columns land in
-//! [`crate::ProtocolError::TooManyColumns`] at parse time (tier-2
-//! structural — the bound is enforced at construction, no silent
-//! truncation).
+//! The crate is `no_std + alloc`. [`RowDesc`] is a SINGLE exact-size heap
+//! allocation — a `Box<[u32]>` packing the column count, per-column type OIDs,
+//! and a format-code bitset (not a fixed inline `[ColumnDesc; N]` array), so its
+//! handle is a fat pointer regardless of column count. Result-sets with more than
+//! [`MAX_ROW_COLUMNS`] columns are classified
+//! [`crate::ProtocolError::TooManyColumns`] at parse time (no silent truncation);
+//! see that variant for how the driver RECOVERS from an over-cap result rather
+//! than tearing the connection down.
 //!
 //! # Tier notes
 //!
-//! Schema ingest is **tier-2 structural**. The parser produces
-//! `RowDesc` only on well-formed payloads
-//! (`MalformedRowDescription` on framing errors,
-//! `UnexpectedFormatCode` on values outside `{0, 1}`). A malformed
-//! response tears the connection down via the usual `Errored`
-//! outcome.
+//! Schema ingest is **tier-2 structural**. The parser produces `RowDesc` only on
+//! well-formed payloads: a MALFORMED frame is `MalformedRowDescription` (framing
+//! errors) or `UnexpectedFormatCode` (a value outside `{0, 1}`) and tears the
+//! connection down (framing desync), while a well-formed but too-wide frame is
+//! the RECOVERABLE `TooManyColumns` the driver drains from.
 //!
-//! Schema access is **tier-1 compile** on pairing:
-//! `Action::StreamRow` carries `&'r RowDesc` — the `'r` lifetime
-//! prevents the user from using a stale schema after the protocol
-//! advances to a new query.
+//! Schema access is lifetime-scoped: the active engine hands the driver a
+//! `RowDesc` / column view borrowed from its per-statement state, consumed at the
+//! command boundary before the next pull resets it — a stale schema cannot be
+//! read after the protocol advances to a new query.
 
 use core::fmt;
 
@@ -41,20 +41,25 @@ use crate::pgtypes::{Date, Interval, Json, Jsonb, Numeric, Time, Timestamp, Time
 /// connection stays alive (recoverable), the user retries with a
 /// narrower projection.
 ///
-/// 1600 matches PG's `MaxTupleAttributeNumber`. Since RowDesc is
-/// now heap-allocated (`Box<[u32]>`, exact-size), this constant
-/// only affects the parse-time rejection threshold — not storage.
+/// `1664` is PostgreSQL's `MaxTupleAttributeNumber` — the hard limit on the
+/// number of entries in a target list (a query RESULT), which is exactly what a
+/// `RowDescription` describes. PG accepts a 1664-column result and errors only at
+/// 1665 (`target lists can have at most 1664 entries`), so this is the true
+/// projection ceiling. It is NOT `MaxHeapAttributeNumber` (`1600`) — that is a
+/// *table*'s column cap, a lower and different limit; a result set (joins,
+/// computed columns, multiple tables) can legitimately be wider than any single
+/// table. Since `RowDesc` is heap-allocated (`Box<[u32]>`, exact-size), this
+/// constant only sets the parse-time rejection threshold — not storage.
 ///
 /// # Effective wire limit
 ///
-/// The RowDescription frame for >~140 typical columns exceeds
-/// `READ_BUF_CAP` (4096 B) and enters partial-assembly mode
-/// (`PREFIX_CAP` = 8 KB prefix + skip tail). Queries with
-/// ~300-400 columns parse from the prefix; beyond ~400 the
-/// prefix truncation causes `MalformedRowDescription`. The
-/// RowDesc TYPE has no cap — only the wire infrastructure
-/// constrains the effective maximum.
-pub const MAX_ROW_COLUMNS: usize = 1600;
+/// A `RowDescription` for more than ~140 typical columns exceeds `READ_BUF_CAP`
+/// (4096 B) and enters the Sub-C oversize path, which ACCUMULATES the whole body
+/// into a growable buffer (bounded by `MAX_ROW_DESC_ACCUM` = 1 MiB) and parses it
+/// in full — so the effective wire maximum is `MAX_ROW_COLUMNS`, not a smaller
+/// prefix-truncation limit. A worst-case 1664-column frame (~136 KiB) clears the
+/// 1 MiB ceiling with wide margin.
+pub const MAX_ROW_COLUMNS: usize = 1664;
 
 /// PostgreSQL wire format for one column's bytes.
 ///
@@ -507,7 +512,7 @@ pub struct CopyHeader {
     /// frame MUST equal this byte per PG spec.
     pub format: CopyFormat,
     /// Number of columns in the transfer. Bounded by
-    /// [`MAX_ROW_COLUMNS`] = 32.
+    /// [`MAX_ROW_COLUMNS`] (1664).
     pub n_cols: u16,
 }
 
@@ -690,31 +695,33 @@ pub enum DecodeError {
     },
     /// A column's 4-byte length prefix is missing (fewer bytes
     /// remain than expected). `column_idx` is 0-based, bounded by
-    /// [`MAX_ROW_COLUMNS`] = 32 — fits `u8` with headroom.
+    /// [`MAX_ROW_COLUMNS`] (1664) — a `u16` (the wire column count is a
+    /// non-negative `i16`, so the widest index fits `u16` with headroom; a `u8`
+    /// would silently saturate a real index past column 255).
     TruncatedColumnLen {
         /// Zero-based column index where the truncation was detected.
-        column_idx: u8,
+        column_idx: u16,
     },
     /// A column's declared length prefix is negative and is not the
     /// sentinel `-1` (which encodes SQL `NULL`). Other negative
     /// values are wire-level invalid.
     NegativeColumnLength {
         /// Zero-based column index.
-        column_idx: u8,
+        column_idx: u16,
         /// The offending length value.
         length: i32,
     },
     /// A column's data region is shorter than the declared length
     /// prefix (partial row).
     ///
-    /// Both counts are `u32`: a column's declared length comes from a
+    /// The two length counts are `u32`: a column's declared length comes from a
     /// non-negative `i32` length prefix (so `<= i32::MAX`), and the bytes
     /// remaining are a slice of the `<= 2 GB` (`i32`-framed) row body — both
-    /// fit `u32` with headroom, keeping this the widest `DecodeError` payload
-    /// at 12 bytes rather than 24.
+    /// fit `u32` with headroom; with the `u16` column index that keeps this the
+    /// widest `DecodeError` payload at 12 bytes rather than 24.
     TruncatedColumnData {
         /// Zero-based column index.
-        column_idx: u8,
+        column_idx: u16,
         /// Length declared by the prefix.
         declared_len: u32,
         /// Bytes actually remaining in the row body.
@@ -869,8 +876,8 @@ pub enum DecodeError {
     CompositeTruncated,
 }
 
-// Direct size pin. The widest variant is `TruncatedColumnData { column_idx: u8,
-// declared_len: u32, remaining: u32 }` = 12 B (the two `u32`s + the `u8`, the
+// Direct size pin. The widest variant is `TruncatedColumnData { column_idx: u16,
+// declared_len: u32, remaining: u32 }` = 12 B (the two `u32`s + the `u16`, the
 // enum discriminant packed into the trailing padding); every other variant is
 // narrower. Pinned HERE — not merely capped transitively by `DriverError`'s
 // 24 B pin, whose width is actually set by its 16-byte fat-pointer payloads —
@@ -1064,7 +1071,7 @@ impl<'a> DataRowRef<'a> {
         ColumnsIter {
             remaining: self.body_after_count,
             columns_left: self.n_columns,
-            column_idx: 0u8,
+            column_idx: 0u16,
         }
     }
 }
@@ -1086,9 +1093,11 @@ impl<'a> DataRowRef<'a> {
 pub struct ColumnsIter<'a> {
     remaining: &'a [u8],
     columns_left: u16,
-    /// Zero-based column index, bounded by [`MAX_ROW_COLUMNS`] = 32 —
-    /// `u8` with headroom. Propagated into `DecodeError::TruncatedColumn*`.
-    column_idx: u8,
+    /// Zero-based column index, bounded by [`MAX_ROW_COLUMNS`] (1664) — a `u16`,
+    /// the same width as the wire column count. Propagated into
+    /// `DecodeError::TruncatedColumn*`; a `u8` would saturate a real index past
+    /// column 255 and mis-report the failing column on a wide row.
+    column_idx: u16,
 }
 
 impl<'a> ColumnsIter<'a> {
@@ -1132,8 +1141,8 @@ impl<'a> Iterator for ColumnsIter<'a> {
         //   if len == -1 { NULL }
         //   if len < 0 { NegativeColumnLength }
         //   usize::try_from(len) { ... Err → NegativeColumnLength }
-        // Three comparisons per column × 32 max cols × 1M rows =
-        // ~96M redundant compares on row-heavy workloads.
+        // Three comparisons per column × up-to-MAX_ROW_COLUMNS cols × 1M rows =
+        // tens of millions of redundant compares on row-heavy workloads.
         //
         // The collapsed form: single NULL shortcut + fold the
         // `< -1` case into the `usize::try_from` Err branch (which
@@ -3751,7 +3760,7 @@ mod parse_tests {
     }
 
     /// Build a full RowDescription body. `columns.len() ≤ i16::MAX`
-    /// is guaranteed by `MAX_ROW_COLUMNS = 32 ≪ i16::MAX`. The
+    /// is guaranteed by `MAX_ROW_COLUMNS = 1664 ≪ i16::MAX`. The
     /// `fixture_i16` helper asserts the bound and narrows;
     /// invariant breach is `#[track_caller]`-attributed loud-fail,
     /// not silent `unwrap_or(0)` fixture corruption.
@@ -4390,10 +4399,10 @@ mod format_code_set_tests {
     ///   `mask_for_const(31) = 0x80000000` against future changes
     ///   that might accidentally use sign-flagged shift.
     #[test]
-    fn wide_row_description_32_alternating_formats() {
+    fn wide_row_description_max_cols_alternating_formats() {
         use alloc::vec::Vec;
         let mut frame: Vec<u8> = Vec::new();
-        // MAX_ROW_COLUMNS = 32 fits i16 trivially; const-asserts in
+        // MAX_ROW_COLUMNS = 1664 fits i16 trivially; const-asserts in
         // this module pin the value. `fixture_i16` loud-fails on
         // overflow via `#[track_caller]` assert — replaces the prior
         // silent `return` (which would have masked a future widening
