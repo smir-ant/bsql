@@ -229,3 +229,162 @@ const _: () = {
         _is_send(&conn.transaction(async |_tx: &mut Transaction<'_>| Ok::<(), DriverError>(())));
     }
 };
+
+// Tier-1 static assertions completing the wall over the DYNAMIC (runtime-SQL)
+// surface — the same doctrine as the typed-verb wall above, applied to every
+// remaining spawnable public future. Each of these forwards `Core`'s future
+// directly (a `fn -> impl Future`, or on the guard a thin `armed` wrapper), so
+// its `Send`-ness was an incidental property LEAKED from `Core` — a tier-4
+// "happens to be Send". These convert a silent, downstream-only `tokio::spawn`
+// break (a future refactor threading an `Rc`-shared plan into `DynStmtCache` or
+// a `Cell` counter into the notification ledger) into a compile error in bsql's
+// OWN build, and REPLACE the class of spawn-integration test that would
+// otherwise be needed to prove each future spawnable. Both surfaces are pinned
+// (the bare `Connection` AND the `Transaction` guard) because the guard wraps
+// each verb in a distinct `armed` future — a genuinely separate type. Every
+// bound is the MINIMAL one the future truly requires; over-constraining would
+// weaken the guarantee. Type-checked, never run.
+const _: () = {
+    fn _is_send<T: Send>(_: &T) {}
+
+    // ── Bare `Connection` ────────────────────────────────────────────────────
+
+    // The no-generic verbs: each is a separate statement, so the `&mut conn`
+    // reborrow the future holds is released at the `;` before the next call (no
+    // GAT invariance to pin the borrow open, unlike the typed verbs above), so
+    // one helper covers them all. Includes the lifecycle + session futures
+    // (`begin`/`commit`/`rollback`/`reset_session`/`listen`/`unlisten`/`close`)
+    // and BOTH notification futures — the complete no-generic async surface.
+    fn _conn_dyn(conn: &mut Connection, sql: &str) {
+        _is_send(&conn.ping());
+        _is_send(&conn.simple_query(sql));
+        _is_send(&conn.execute_sql(sql));
+        _is_send(&conn.query_sql(sql));
+        _is_send(&conn.query_one_sql(sql));
+        _is_send(&conn.query_opt_sql(sql));
+        _is_send(&conn.prepare(sql));
+        _is_send(&conn.begin());
+        _is_send(&conn.commit());
+        _is_send(&conn.rollback());
+        _is_send(&conn.reset_session());
+        _is_send(&conn.listen(sql));
+        _is_send(&conn.unlisten(sql));
+        _is_send(&conn.close());
+        _is_send(&conn.recv_notification(core::time::Duration::from_secs(1)));
+        _is_send(&conn.recv_notification_as::<String>(core::time::Duration::from_secs(1)));
+    }
+
+    // The parameterised verbs. CRUCIAL bound: the params are held by REFERENCE
+    // (`&'a P`) across the await, so the future is `Send` iff `&P: Send` iff
+    // `P: Sync` — NOT `P: Send` (the future never owns a `P`). A `P: Send` bound
+    // here would fail to compile against a `Sync`-only param and mis-state the
+    // real contract. One representative `P` covers `query_prepared` /
+    // `execute_prepared` / `query_params{,_one,_opt}` / `execute_params`.
+    fn _conn_params<P: ParamsWriter + Sync>(
+        conn: &mut Connection,
+        sql: &str,
+        stmt: &PreparedStatement,
+        p: &P,
+    ) {
+        _is_send(&conn.query_prepared::<P>(stmt, p));
+        _is_send(&conn.execute_prepared::<P>(stmt, p));
+        _is_send(&conn.query_params::<P>(sql, p));
+        _is_send(&conn.query_params_one::<P>(sql, p));
+        _is_send(&conn.query_params_opt::<P>(sql, p));
+        _is_send(&conn.execute_params::<P>(sql, p));
+    }
+
+    // `close_statement` CONSUMES the statement by value, so it takes its own
+    // helper (the moved `stmt` cannot be reused for another call).
+    fn _conn_close_statement(conn: &mut Connection, stmt: PreparedStatement) {
+        _is_send(&conn.close_statement(stmt));
+    }
+
+    // The COPY-in / COPY-out futures, each with a representative `Send` argument
+    // (an owned `Vec<String>` row source, and trivial nothing-captured
+    // closures): proves the bulk-load / bulk-unload orchestration holds nothing
+    // `!Send` across an await. The typed binary `copy_in_typed` is pinned
+    // separately (its bound is a non-obvious GAT interaction).
+    fn _conn_copy(conn: &mut Connection) {
+        _is_send(&conn.copy_in("t", Vec::<String>::new()));
+        _is_send(
+            &conn.copy_in_with("t", async |_w: &mut CopyInWriter<'_>| Ok::<(), DriverError>(())),
+        );
+        _is_send(&conn.copy_out("t", |_c: &[u8]| core::ops::ControlFlow::<()>::Continue(())));
+    }
+
+    // The typed binary `copy_in_typed` future is the single most fragile
+    // un-pinned spot: its `Send`-ness rides on a GENERIC-GAT interaction, so
+    // the naive `I: IntoIterator` bound is not enough. The future holds `rows: I`
+    // across the header round trip (`copy_in_begin`) BEFORE the iterator is
+    // consumed, then holds `I::IntoIter` across each per-row write, and borrows
+    // each `Q::Row<'q>` (`&row`) across that write — so the MINIMAL, honest
+    // contract is all three: `I: Send`, `I::IntoIter: Send`, and the
+    // `for<'x>`-quantified `Q::Row<'x>: Send + Sync` (the GAT is invariant, so
+    // the quantified form is the one that holds). Each of the three is
+    // load-bearing (dropping any one fails to compile), so this both PINS the
+    // future spawnable and DOCUMENTS the exact bound a consumer spawning a typed
+    // COPY must satisfy — otherwise discoverable only by trial compile.
+    fn _conn_copy_in_typed<'q, Q, I>(conn: &mut Connection, rows: I)
+    where
+        Q: bsql_postgres_proto::TypedCopyIn,
+        I: IntoIterator<Item = Q::Row<'q>> + Send,
+        I::IntoIter: Send,
+        for<'x> Q::Row<'x>: Send + Sync,
+    {
+        _is_send(&conn.copy_in_typed::<Q, I>(rows));
+    }
+
+    // ── `Transaction` guard (each verb is a distinct `armed`-wrapped future) ──
+
+    fn _tx_dyn(tx: &mut Transaction<'_>, sql: &str) {
+        _is_send(&tx.ping());
+        _is_send(&tx.simple_query(sql));
+        _is_send(&tx.execute_sql(sql));
+        _is_send(&tx.query_sql(sql));
+        _is_send(&tx.query_one_sql(sql));
+        _is_send(&tx.query_opt_sql(sql));
+        _is_send(&tx.prepare(sql));
+        _is_send(&tx.listen(sql));
+        _is_send(&tx.unlisten(sql));
+    }
+
+    fn _tx_params<P: ParamsWriter + Sync>(
+        tx: &mut Transaction<'_>,
+        sql: &str,
+        stmt: &PreparedStatement,
+        p: &P,
+    ) {
+        _is_send(&tx.query_prepared::<P>(stmt, p));
+        _is_send(&tx.execute_prepared::<P>(stmt, p));
+        _is_send(&tx.query_params::<P>(sql, p));
+        _is_send(&tx.query_params_one::<P>(sql, p));
+        _is_send(&tx.query_params_opt::<P>(sql, p));
+        _is_send(&tx.execute_params::<P>(sql, p));
+    }
+
+    fn _tx_close_statement(tx: &mut Transaction<'_>, stmt: PreparedStatement) {
+        _is_send(&tx.close_statement(stmt));
+    }
+
+    fn _tx_copy(tx: &mut Transaction<'_>) {
+        _is_send(&tx.copy_in("t", Vec::<String>::new()));
+        _is_send(
+            &tx.copy_in_with("t", async |_w: &mut CopyInWriter<'_>| Ok::<(), DriverError>(())),
+        );
+        _is_send(&tx.copy_out("t", |_c: &[u8]| core::ops::ControlFlow::<()>::Continue(())));
+    }
+
+    // The guard's typed COPY carries the SAME three-part bound as the connection
+    // method (`armed` adds only `Send` captures — the `&mut Core` / `&mut bool`
+    // it threads — so the contract is unchanged).
+    fn _tx_copy_in_typed<'q, Q, I>(tx: &mut Transaction<'_>, rows: I)
+    where
+        Q: bsql_postgres_proto::TypedCopyIn,
+        I: IntoIterator<Item = Q::Row<'q>> + Send,
+        I::IntoIter: Send,
+        for<'x> Q::Row<'x>: Send + Sync,
+    {
+        _is_send(&tx.copy_in_typed::<Q, I>(rows));
+    }
+};

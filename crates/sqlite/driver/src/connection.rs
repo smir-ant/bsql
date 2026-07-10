@@ -332,11 +332,25 @@ pub struct Row {
 // handle is what makes `Clone` a refcount bump and lets a row cross threads.
 crate::footprint_pin!(Row, size = 16, align = 8);
 
-// Tier-1 static assertion (matching the PostgreSQL driver's discipline): `Row`
+// Tier-1 static assertions (matching the PostgreSQL driver's discipline). `Row`
 // is `Send + Sync + 'static`, as its doc claims — a 16-byte handle can cross
 // threads and outlive any borrow. `footprint_pin!` covers only size/align, so a
 // future non-`Send`/non-`Sync` field in `ArenaInner` would silently falsify the
-// doc; this pins it. Type-checked, never run.
+// doc; this pins it.
+//
+// `Connection` is `Send` (a blocking handle routinely moved into a
+// `spawn_blocking` / worker thread — its cross-thread mobility is load-bearing),
+// exactly as the PostgreSQL drivers pin `Connection: Send`. It is deliberately
+// NOT asserted `Sync`, because it is NOT `Sync`: it wraps `rusqlite::Connection`
+// (interior mutability over a `RefCell` around the raw sqlite handle) and, under
+// `n1-detect`, a `RefCell<N1Tracker>` — both `!Sync`. Send WITHOUT Sync is the
+// true auto-trait set, and asserting only what holds is the discipline; a future
+// change that added a `!Send` field (a raw pointer cached for a fast path, an
+// `Rc`-shared arena) would silently make `Connection` `!Send`, compile clean
+// here, and break only a downstream `spawn_blocking(move || conn.query_sql(..))`
+// — the tier-4 gap this closes. Holds in both feature states (`RefCell<T>` is
+// `Send` when `T: Send`, so the `n1-detect` field preserves Send). Type-checked,
+// never run.
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _assert_sync<T: Sync>() {}
@@ -345,6 +359,7 @@ const _: () = {
         _assert_send::<Row>();
         _assert_sync::<Row>();
         _assert_static::<Row>();
+        _assert_send::<Connection>();
     }
 };
 
