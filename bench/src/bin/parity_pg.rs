@@ -46,6 +46,15 @@ bsql::query!(
     FetchMany,
     "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1"
 );
+// The INSERT-RETURNING carrier for the TYPED insert cell — the path the ORIGINAL
+// bsql runner used (`query!(...).fetch_one()`): binary params + binary result +
+// a decode-DIRECT single row (no dynamic `QueryResult` arena). This is the
+// apples-to-apples comparison with the recorded original insert number.
+bsql::query!(
+    InsertReturning,
+    "INSERT INTO bench_users (name, email, active, score) \
+     VALUES ($1, $2, true, 0.0) RETURNING id"
+);
 
 const ITERS_DEFAULT: u64 = 10_000;
 const ITERS_BIG: u64 = 1_000; // 10k-row fetch, batch insert (matches pg_bench.c)
@@ -159,6 +168,28 @@ fn bench_insert_single(conn: &mut Connection) -> Result<(), DriverError> {
     }
     report("pg_insert_single", start.elapsed(), ITERS_DEFAULT);
     conn.close_statement(stmt)
+}
+
+/// INSERT RETURNING via the TYPED `query!` path (`query_one::<InsertReturningQuery>`)
+/// — the path the ORIGINAL bsql runner used, and the rebuild's fastest INSERT
+/// RETURNING shape. Binary params + binary result, the engine's own statement
+/// cache (HIT after warm-up = Bind+Execute+Sync, no re-parse), and a
+/// decode-DIRECT single owned record (`{ id: i32 }`) — NO dynamic `QueryResult`
+/// arena, so ~0 client allocations per call (vs the dynamic
+/// `query_prepared` path's ~15-20). Reads the RETURNING id.
+fn bench_insert_single_typed(conn: &mut Connection) -> Result<(), DriverError> {
+    let name = "bench_insert";
+    let email = "bench@example.com";
+    // Warm up: primes the engine's statement cache so the timed loop is all HIT.
+    let rec = conn.query_one::<InsertReturningQuery>((name, email))?;
+    black_box(rec.id);
+    let start = Instant::now();
+    for _ in 0..ITERS_DEFAULT {
+        let rec = conn.query_one::<InsertReturningQuery>((black_box(name), black_box(email)))?;
+        black_box(rec.id);
+    }
+    report("pg_insert_single_typed", start.elapsed(), ITERS_DEFAULT);
+    Ok(())
 }
 
 /// The honest comparable to C's `bench_insert_batch`: 100 DISCRETE prepared
@@ -300,6 +331,7 @@ fn run() -> Result<(), DriverError> {
     bench_subquery(&mut conn)?;
     bench_dynamic(&mut conn)?;
     bench_insert_single(&mut conn)?;
+    bench_insert_single_typed(&mut conn)?;
     bench_insert_batch(&mut conn)?;
     bench_insert_batch_copy(&mut conn)?;
     // pipelined: the rebuild has NO general pipeline API — an honest N/A.
