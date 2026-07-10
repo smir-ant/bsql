@@ -3,9 +3,9 @@
 //! This module handles the four SCRAM messages exchanged during
 //! authentication (RFC 5802 §7):
 //!
-//! 1. **client-first-message** — `n,,n=<user>,r=<nonce>` (we build it)
+//! 1. **client-first-message** — `<gs2-header>n=<user>,r=<nonce>` (we build it)
 //! 2. **server-first-message** — `r=<nonce>,s=<salt>,i=<iters>` (we parse it)
-//! 3. **client-final-message** — `c=biws,r=<nonce>,p=<proof>` (we build it)
+//! 3. **client-final-message** — `c=<cbind_b64>,r=<nonce>,p=<proof>` (we build it)
 //! 4. **server-final-message** — `v=<verifier>` or `e=<error>` (we parse it)
 //!
 //! This is protocol text, not crypto — it is allowed to be hand-written.
@@ -13,8 +13,12 @@
 //!
 //! # Channel binding
 //!
-//! Channel binding is not supported. The GS2 header is always `n,,`
-//! and the channel binding data is always `biws` (base64 of `n,,`).
+//! The gs2 header and the client-final `c=` value are parametrized by the
+//! resolved [`SaslChoice`](crate::scram::channel_binding::SaslChoice): `n,,`
+//! (no binding), `y,,` (capable-but-unused), or `p=tls-server-end-point,,`
+//! for SCRAM-SHA-256-PLUS — in which case `c=` carries the base64 of that
+//! header plus the server certificate hash. See
+//! [`super::channel_binding`].
 
 use crate::scram::types::{CappedServerNonce, SecretDigest};
 use core::fmt;
@@ -31,14 +35,25 @@ pub const MAX_CLIENT_FIRST_BARE_LEN: usize = 128;
 /// configurability in tests.
 pub const MAX_CLIENT_NONCE_B64_LEN: usize = 48;
 
-/// Maximum byte length for the full client-first-message (with GS2 header).
-pub const MAX_CLIENT_FIRST_MSG_LEN: usize = 136;
+/// Maximum byte length for the full client-first-message (gs2 header + bare).
+///
+/// The gs2 header is up to
+/// [`MAX_GS2_HEADER_LEN`](crate::scram::channel_binding::MAX_GS2_HEADER_LEN)
+/// bytes (`p=tls-server-end-point,,`), so this is that plus
+/// [`MAX_CLIENT_FIRST_BARE_LEN`].
+pub const MAX_CLIENT_FIRST_MSG_LEN: usize =
+    crate::scram::channel_binding::MAX_GS2_HEADER_LEN + MAX_CLIENT_FIRST_BARE_LEN;
 
 /// Maximum byte length for the client-final-message.
 ///
-/// `c=biws,r=<server_nonce>,p=<proof_b64>` where server nonce can be
-/// up to MAX_SERVER_NONCE_LEN and proof_b64 is 44 chars.
-pub const MAX_CLIENT_FINAL_MSG_LEN: usize = 384;
+/// `c=<cbind_b64>,r=<server_nonce>,p=<proof_b64>` where `cbind_b64` is the
+/// base64 cbind-input (up to
+/// [`MAX_CBIND_B64_LEN`](crate::scram::channel_binding::MAX_CBIND_B64_LEN) —
+/// widest for the `-PLUS` `p=tls-server-end-point,,` header plus a SHA-512 cert
+/// hash), the server nonce is up to
+/// [`MAX_SERVER_NONCE_LEN`](crate::scram::types::MAX_SERVER_NONCE_LEN), and
+/// `proof_b64` is 44 chars.
+pub const MAX_CLIENT_FINAL_MSG_LEN: usize = 448;
 
 /// Minimum SCRAM iteration count per RFC 7677 section 4.2.
 pub const MIN_SCRAM_ITERATIONS: u32 = 4096;
@@ -117,7 +132,8 @@ const _: () = assert!(
 pub(crate) const fn sasl_initial_response_frame_size() -> usize {
     1usize // tag 'p'
         .saturating_add(4) // length field
-        .saturating_add(crate::wire::SCRAM_SHA_256_MECHANISM.len())
+        // Widest mechanism name: `SCRAM-SHA-256-PLUS` (the -PLUS variant).
+        .saturating_add(crate::wire::SCRAM_SHA_256_PLUS_MECHANISM.len())
         .saturating_add(1) // mechanism NUL terminator
         .saturating_add(4) // body-length field
         .saturating_add(MAX_CLIENT_FIRST_MSG_LEN)
@@ -156,9 +172,10 @@ const _: () = assert!(
     "MAX_CLIENT_FIRST_BARE_LEN below worst-case n=<user>,r=<nonce>",
 );
 
-/// Worst-case full `client-first-message`: GS2 header + bare.
+/// Worst-case full `client-first-message`: the widest gs2 header
+/// (`p=tls-server-end-point,,`) plus the bare message.
 const fn expected_client_first_msg_size() -> usize {
-    3usize // GS2 header "n,,"
+    crate::scram::channel_binding::MAX_GS2_HEADER_LEN
         .saturating_add(MAX_CLIENT_FIRST_BARE_LEN)
 }
 const _: () = assert!(
@@ -166,10 +183,12 @@ const _: () = assert!(
     "MAX_CLIENT_FIRST_MSG_LEN below GS2 header + client-first-bare",
 );
 
-/// Worst-case `client-final-message`: `c=biws,r=<server_nonce>,p=<proof_b64>`.
+/// Worst-case `client-final-message`: `c=<cbind_b64>,r=<server_nonce>,p=<proof_b64>`
+/// where `cbind_b64` is the widest base64 cbind-input (the `-PLUS` header plus a
+/// SHA-512 cert hash).
 const fn expected_client_final_msg_size() -> usize {
     2usize // "c="
-        .saturating_add(4) // "biws" (base64 of GS2 "n,,")
+        .saturating_add(crate::scram::channel_binding::MAX_CBIND_B64_LEN)
         .saturating_add(3) // ",r="
         .saturating_add(crate::scram::types::MAX_SERVER_NONCE_LEN)
         .saturating_add(3) // ",p="
@@ -177,7 +196,7 @@ const fn expected_client_final_msg_size() -> usize {
 }
 const _: () = assert!(
     MAX_CLIENT_FINAL_MSG_LEN >= expected_client_final_msg_size(),
-    "MAX_CLIENT_FINAL_MSG_LEN below worst-case c=biws,r=<nonce>,p=<proof>",
+    "MAX_CLIENT_FINAL_MSG_LEN below worst-case c=<cbind_b64>,r=<nonce>,p=<proof>",
 );
 
 // SASL frames must fit inside the shared outbound buffer.
@@ -284,6 +303,13 @@ pub enum ScramError {
     /// actual cause was `/dev/urandom` EAGAIN. Now the diagnostic
     /// names the real root cause.
     RandomnessUnavailable,
+    /// The consumer required channel binding (`channel_binding=require`) but the
+    /// server offered no `SCRAM-SHA-256-PLUS` mechanism, so the exchange is
+    /// refused fail-closed rather than falling back to plain SCRAM. Over TLS to a
+    /// server that genuinely supports channel binding this cannot happen (it
+    /// always advertises `-PLUS`); the refusal fires against a legacy/non-binding
+    /// server, or when a downgrade attacker stripped `-PLUS` from the offer.
+    ChannelBindingRequired,
 }
 
 /// Discriminant-flattened mirror of [`ScramError`] for protocol-error
@@ -359,6 +385,8 @@ pub enum ScramFailureClass {
     NoSupportedMechanism,
     /// Mirror of [`ScramError::RandomnessUnavailable`].
     RandomnessUnavailable,
+    /// Mirror of [`ScramError::ChannelBindingRequired`].
+    ChannelBindingRequired,
 }
 
 impl ScramError {
@@ -406,6 +434,7 @@ impl ScramError {
             Self::BufferOverflow => (ScramFailureClass::BufferOverflow, None),
             Self::NoSupportedMechanism => (ScramFailureClass::NoSupportedMechanism, None),
             Self::RandomnessUnavailable => (ScramFailureClass::RandomnessUnavailable, None),
+            Self::ChannelBindingRequired => (ScramFailureClass::ChannelBindingRequired, None),
         }
     }
 }
@@ -438,6 +467,9 @@ impl core::fmt::Display for ScramFailureClass {
             Self::BufferOverflow => f.write_str("SCRAM: message buffer overflow"),
             Self::NoSupportedMechanism => f.write_str("SCRAM: no supported mechanism offered"),
             Self::RandomnessUnavailable => f.write_str("SCRAM: OS randomness source unavailable"),
+            Self::ChannelBindingRequired => {
+                f.write_str("SCRAM: channel binding required but server offered no -PLUS mechanism")
+            }
         }
     }
 }
@@ -479,21 +511,20 @@ impl fmt::Display for ScramError {
             Self::NoSupportedMechanism => {
                 f.write_str("SCRAM: server offered no supported authentication mechanism")
             }
+            Self::ChannelBindingRequired => f.write_str(
+                "SCRAM: channel binding required (channel_binding=require) but the server offered no SCRAM-SHA-256-PLUS mechanism",
+            ),
         }
     }
 }
 
-/// GS2 header for no channel binding: `n,,`
-const GS2_HEADER: &[u8] = b"n,,";
-
-/// Base64 of `n,,` — the channel binding data echoed in client-final.
-/// `biws` is the standard encoding of the GS2 header without channel binding.
-const CBIND_DATA: &[u8] = b"biws";
-
 /// Build the client-first-message-bare: `n=<user>,r=<nonce_b64>`.
 ///
-/// Returns the bare message (without GS2 header) in a bounded buffer.
-/// The caller prepends the GS2 header (`n,,`) for the full client-first.
+/// Returns the bare message (without the gs2 header) in a bounded buffer.
+/// The caller prepends the gs2 channel-binding header for the full
+/// client-first. The bare message is IDENTICAL for every channel-binding
+/// choice — the gs2 flag lives only in the full message and the client-final
+/// `c=` value, never in the bare form that anchors the SCRAM `AuthMessage`.
 pub(crate) fn build_client_first_bare(
     user: &[u8],
     client_nonce_b64: &[u8],
@@ -511,15 +542,19 @@ pub(crate) fn build_client_first_bare(
     Ok(buf)
 }
 
-/// Build the full client-first-message: GS2 header + bare.
+/// Build the full client-first-message: gs2 header + bare.
 ///
-/// `n,,n=<user>,r=<nonce_b64>`
+/// `<gs2_header>n=<user>,r=<nonce_b64>` — e.g. `n,,n=user,r=nonce` (no channel
+/// binding) or `p=tls-server-end-point,,n=user,r=nonce` (SCRAM-SHA-256-PLUS).
+/// The gs2 header is chosen by the caller from the resolved
+/// [`SaslChoice`](crate::scram::channel_binding::SaslChoice).
 pub(crate) fn build_client_first_message(
+    gs2_header: &[u8],
     user: &[u8],
     client_nonce_b64: &[u8],
 ) -> Result<heapless::Vec<u8, MAX_CLIENT_FIRST_MSG_LEN>, ScramError> {
     let mut msg = heapless::Vec::new();
-    msg.extend_from_slice(GS2_HEADER)
+    msg.extend_from_slice(gs2_header)
         .map_err(|_| ScramError::BufferOverflow)?;
     msg.extend_from_slice(b"n=")
         .map_err(|_| ScramError::BufferOverflow)?;
@@ -664,17 +699,22 @@ pub(crate) fn parse_server_first(
     })
 }
 
-/// Build the client-final-message-without-proof: `c=biws,r=<server_nonce>`.
+/// Build the client-final-message-without-proof: `c=<cbind_b64>,r=<server_nonce>`.
 ///
-/// This is used as part of the AuthMessage and to construct the full
-/// client-final-message (by appending `,p=<proof_b64>`).
+/// `cbind_b64` is the base64-encoded cbind-input (`gs2-header || cbind-data`) —
+/// `biws` for no channel binding (`n,,`), `eSws` for `y,,`, or the base64 of
+/// `p=tls-server-end-point,,` plus the cert hash for SCRAM-SHA-256-PLUS. This is
+/// used as part of the SCRAM `AuthMessage` and to construct the full
+/// client-final-message (by appending `,p=<proof_b64>`), so the channel binding
+/// is cryptographically anchored into the proof.
 pub(crate) fn build_client_final_without_proof(
+    cbind_b64: &[u8],
     server_nonce: &[u8],
 ) -> Result<heapless::Vec<u8, MAX_CLIENT_FINAL_MSG_LEN>, ScramError> {
     let mut buf = heapless::Vec::new();
     buf.extend_from_slice(b"c=")
         .map_err(|_| ScramError::BufferOverflow)?;
-    buf.extend_from_slice(CBIND_DATA)
+    buf.extend_from_slice(cbind_b64)
         .map_err(|_| ScramError::BufferOverflow)?;
     buf.extend_from_slice(b",r=")
         .map_err(|_| ScramError::BufferOverflow)?;
@@ -683,12 +723,13 @@ pub(crate) fn build_client_final_without_proof(
     Ok(buf)
 }
 
-/// Build the complete client-final-message: `c=biws,r=<nonce>,p=<proof_b64>`.
+/// Build the complete client-final-message: `c=<cbind_b64>,r=<nonce>,p=<proof_b64>`.
 pub(crate) fn build_client_final_message(
+    cbind_b64: &[u8],
     server_nonce: &[u8],
     proof_b64: &[u8],
 ) -> Result<heapless::Vec<u8, MAX_CLIENT_FINAL_MSG_LEN>, ScramError> {
-    let mut buf = build_client_final_without_proof(server_nonce)?;
+    let mut buf = build_client_final_without_proof(cbind_b64, server_nonce)?;
     buf.extend_from_slice(b",p=")
         .map_err(|_| ScramError::BufferOverflow)?;
     buf.extend_from_slice(proof_b64)

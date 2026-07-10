@@ -131,7 +131,10 @@ fn user() -> Ident {
 }
 
 fn scram_creds() -> Credentials {
-    Credentials::ScramPassword(Sensitive::new(Password::try_from_str("pencil").unwrap()))
+    Credentials::ScramPassword(
+        Sensitive::new(Password::try_from_str("pencil").unwrap()),
+        bsql_postgres_proto::scram::channel_binding::ChannelBinding::Unbound,
+    )
 }
 
 /// Feed scripted server bytes through the ingest slot. Returns `false` if the
@@ -509,5 +512,62 @@ fn scram_arbitrary_bytes_never_panic() {
         // Random bytes at the await-server-first state must never drive the
         // handshake to Ready (no valid AuthOk + BackendKey + RFQ sequence).
         drain_assert_never_ready(&mut engine, &mut sb);
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Invariant: the SCRAM-SHA-256-PLUS channel-binding parse paths are TOTAL
+//
+// The `-PLUS` path introduces two new byte-consuming decoders that run on
+// server-controlled input during connect: the SASL mechanism-list parse
+// (`MechanismOffer::parse`, over the `AuthenticationSASL` body) and the
+// `tls-server-end-point` certificate hash (`tls_server_end_point`, over the DER
+// the TLS peer presents). A hostile server byte reaching either must yield a
+// value, never a panic — the same total-function contract the wire parsers hold.
+// ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn channel_binding_parse_paths_are_total() {
+    use bsql_postgres_proto::scram::channel_binding::{
+        tls_server_end_point, ChannelBinding, MechanismOffer,
+    };
+
+    let mut rng = XorShift64::new(0xFEED_0005);
+    // Enough length spread to exercise the DER length forms (short, long-form
+    // 0x81/0x82), the indefinite-length reject, and multi-name NUL-split lists.
+    let lengths = [
+        0usize, 1, 2, 3, 4, 5, 8, 16, 32, 64, 127, 128, 129, 255, 256, 257, 512, 1024, 4096,
+    ];
+
+    for _ in 0..SCRAM_FUZZ_ITERS {
+        for &len in &lengths {
+            let mut bytes = vec![0u8; len];
+            rng.fill(&mut bytes);
+
+            // Mechanism-list parse: never panics, and the two flags are pure
+            // membership over NUL-split names.
+            let offer = MechanismOffer::parse(&bytes);
+
+            // The certificate hash: never panics on arbitrary/malformed DER, and
+            // always yields a 32/48/64-byte digest (the three SHA-2 widths).
+            let cbind = tls_server_end_point(&bytes);
+            assert!(
+                matches!(cbind.as_slice().len(), 32 | 48 | 64),
+                "tls-server-end-point must yield a SHA-2 digest width, got {} for {len} bytes",
+                cbind.as_slice().len(),
+            );
+
+            // The decision function is total for every offer × binding pairing —
+            // it returns Ok(choice) or a classified Err, never a panic. Reaching
+            // the arm proves totality; the match consumes the `#[must_use]`.
+            use bsql_postgres_proto::scram::channel_binding::decide_sasl_choice;
+            let binding = ChannelBinding::Available { data: cbind, require: len & 1 == 0 };
+            match decide_sasl_choice(offer, &binding) {
+                Ok(_) | Err(_) => {}
+            }
+            match decide_sasl_choice(offer, &ChannelBinding::Unbound) {
+                Ok(_) | Err(_) => {}
+            }
+        }
     }
 }

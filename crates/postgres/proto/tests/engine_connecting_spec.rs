@@ -36,6 +36,7 @@ use bsql_postgres_proto::wire::{
     TAG_SASL_RESPONSE,
 };
 use bsql_postgres_proto::{Credentials, Ident, Password, Sensitive, TxStatus};
+use bsql_postgres_proto::scram::channel_binding::ChannelBinding;
 
 /// The exact byte length of the `user=corpus` startup packet — the offset at
 /// which any outbound auth response begins in the client wire. Includes the
@@ -252,7 +253,7 @@ fn md5_wrong_length_salt_is_classified_fail() {
 
 #[test]
 fn scram_initial_response_built() {
-    let creds = Credentials::ScramPassword(password("hunter2"));
+    let creds = Credentials::ScramPassword(password("hunter2"), ChannelBinding::Unbound);
     let mut sb = SendBuf::new();
     let mut engine = ConnectingEngine::start(&mut sb, &user(), None, &[], creds).unwrap();
 
@@ -267,7 +268,7 @@ fn scram_initial_response_built() {
 
 #[test]
 fn scram_continue_builds_sasl_response() {
-    let creds = Credentials::ScramPassword(password("pencil"));
+    let creds = Credentials::ScramPassword(password("pencil"), ChannelBinding::Unbound);
     let mut sb = SendBuf::new();
     let mut engine = ConnectingEngine::start(&mut sb, &user(), None, &[], creds).unwrap();
     feed(&mut engine, &auth(10, b"SCRAM-SHA-256\0\0"));
@@ -298,7 +299,7 @@ fn scram_continue_builds_sasl_response() {
 
 #[test]
 fn scram_final_signature_mismatch_fails() {
-    let creds = Credentials::ScramPassword(password("pencil"));
+    let creds = Credentials::ScramPassword(password("pencil"), ChannelBinding::Unbound);
     let mut sb = SendBuf::new();
     let mut engine = ConnectingEngine::start(&mut sb, &user(), None, &[], creds).unwrap();
     feed(&mut engine, &auth(10, b"SCRAM-SHA-256\0\0"));
@@ -323,7 +324,7 @@ fn scram_final_signature_mismatch_fails() {
 
 #[test]
 fn scram_offered_without_supported_mechanism_fails() {
-    let creds = Credentials::ScramPassword(password("hunter2"));
+    let creds = Credentials::ScramPassword(password("hunter2"), ChannelBinding::Unbound);
     let mut sb = SendBuf::new();
     let mut engine = ConnectingEngine::start(&mut sb, &user(), None, &[], creds).unwrap();
     // Server offers only a mechanism the client does not implement.

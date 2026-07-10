@@ -557,6 +557,20 @@ impl<Inner: Transport> TlsTransport<Inner> {
         Ok(transport)
     }
 
+    /// The server's end-entity (leaf) certificate DER, for `tls-server-end-point`
+    /// SCRAM channel binding. `rustls` yields the peer's presented chain via
+    /// `peer_certificates`; the first entry is the leaf. `None` before the
+    /// handshake completes, or if the peer presented no certificate — structurally
+    /// unreachable here, since `connect` drives a verify-full handshake to
+    /// completion before returning and server auth always presents a leaf.
+    #[must_use]
+    pub fn peer_end_entity_cert(&self) -> Option<&[u8]> {
+        self.conn
+            .peer_certificates()
+            .and_then(<[_]>::first)
+            .map(|cert| cert.as_ref())
+    }
+
     fn with_conn(conn: UnbufferedClientConnection, inner: Inner) -> Self {
         Self {
             conn,
@@ -923,6 +937,22 @@ impl<S: Transport> Wire<S> {
             Wire::Plain(_) => false,
             #[cfg(feature = "testkit")]
             Wire::Fake(_) => false,
+        }
+    }
+
+    /// The server's end-entity certificate DER for SCRAM `tls-server-end-point`
+    /// channel binding — `Some` ONLY for the TLS arm (a plaintext socket and the
+    /// in-memory fake present no certificate). Read at connect (before the wire
+    /// is moved into the engine) and hashed into the channel-binding data.
+    #[must_use]
+    #[inline]
+    pub fn peer_end_entity_cert(&self) -> Option<&[u8]> {
+        match self {
+            #[cfg(feature = "tls")]
+            Wire::Tls(t) => t.peer_end_entity_cert(),
+            Wire::Plain(_) => None,
+            #[cfg(feature = "testkit")]
+            Wire::Fake(_) => None,
         }
     }
 }

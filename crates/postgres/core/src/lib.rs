@@ -97,7 +97,12 @@ pub mod typed_rows;
 pub mod types;
 
 pub use cancel::{CancelKey, Redial};
-pub use config::{resolve_endpoint, validate_startup_params, ConnectConfig, Endpoint, SslMode};
+pub use config::{
+    resolve_endpoint, validate_startup_params, ChannelBindingMode, ConnectConfig, Endpoint,
+    SslMode,
+};
+#[cfg(feature = "scram")]
+pub use config::resolve_channel_binding;
 pub use driver::{Core, PreparedStatement};
 pub use error::{ColumnError, DbError, DriverError};
 pub use materialize::{DbErrorSink, ResultCollector};

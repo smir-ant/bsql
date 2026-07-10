@@ -214,8 +214,16 @@ pub enum Credentials {
     /// debug redaction. Present only under the default-on `scram` feature — with
     /// SCRAM off the crypto is not compiled, so this credential cannot be built
     /// (a driver given a password then fails LOUD at connect).
+    ///
+    /// The second field is the resolved
+    /// [`ChannelBinding`](crate::scram::channel_binding::ChannelBinding): the
+    /// driver computes it from the TLS transport + the consumer's
+    /// `channel_binding` policy, so the SCRAM credential carries everything the
+    /// exchange needs — the password AND whether/how to bind to the channel. It
+    /// is [`ChannelBinding::Unbound`](crate::scram::channel_binding::ChannelBinding::Unbound)
+    /// on a plaintext connection.
     #[cfg(feature = "scram")]
-    ScramPassword(Sensitive<Password>),
+    ScramPassword(Sensitive<Password>, crate::scram::channel_binding::ChannelBinding),
     /// Cleartext password authentication (PG `AuthenticationCleartextPassword`,
     /// sub-code 3).
     ///
@@ -285,7 +293,7 @@ impl fmt::Debug for Credentials {
         match self {
             Self::Trust => f.write_str("Credentials::Trust"),
             #[cfg(feature = "scram")]
-            Self::ScramPassword(_) => f.write_str("Credentials::ScramPassword(<REDACTED>)"),
+            Self::ScramPassword(_, _) => f.write_str("Credentials::ScramPassword(<REDACTED>)"),
             Self::CleartextPassword(_) => {
                 f.write_str("Credentials::CleartextPassword(<REDACTED>)")
             }

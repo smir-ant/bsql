@@ -38,6 +38,8 @@ use bsql_postgres_proto::wire::{
     TAG_PARAMETER_STATUS, TAG_READY_FOR_QUERY,
 };
 use bsql_postgres_proto::{Credentials, Ident, Password, Sensitive, TxStatus};
+use bsql_postgres_proto::scram::channel_binding::{tls_server_end_point, ChannelBinding};
+use bsql_postgres_proto::scram::wire::ScramFailureClass;
 
 // ─────────────────────────── frame builders ───────────────────────────
 
@@ -186,6 +188,21 @@ struct ScramServer {
     /// between the server-final and `AuthenticationOk` — to prove the engine
     /// absorbs a mid-SCRAM notice without corrupting its crypto state.
     inject_notices: bool,
+    /// When set, offer `SCRAM-SHA-256-PLUS` (channel binding) alongside plain
+    /// `SCRAM-SHA-256` in the mechanism list — simulating a TLS server.
+    offer_plus: bool,
+    /// The `tls-server-end-point` binding data this server verifies against when
+    /// the client selects `-PLUS`: it reconstructs the client-final `c=` value as
+    /// `base64(gs2-header || server_cbind_data)`. When this equals the data the
+    /// client bound to, the server signature verifies; a DIFFERENT value models a
+    /// relay/MITM channel and makes the exchange fail on a binding mismatch.
+    server_cbind_data: Vec<u8>,
+    /// The gs2 channel-binding header the client sent (recorded from
+    /// client-first), used to reconstruct the `c=` value at server-final.
+    gs2_header: Vec<u8>,
+    /// When set, assert the client's gs2 header equals this exactly — proves the
+    /// client chose the expected flag (e.g. `y,,` anti-downgrade, not `n,,`).
+    expect_gs2_header: Option<Vec<u8>>,
 }
 
 /// The server salt + iteration count (RFC-7677-legal).
@@ -207,7 +224,17 @@ impl ScramServer {
             server_first: String::new(),
             server_nonce: String::new(),
             inject_notices: false,
+            offer_plus: false,
+            server_cbind_data: Vec::new(),
+            gs2_header: Vec::new(),
+            expect_gs2_header: None,
         }
+    }
+
+    /// Assert the client's gs2 header equals `header` exactly (e.g. `b"y,,"`).
+    fn expect_gs2(mut self, header: &[u8]) -> Self {
+        self.expect_gs2_header = Some(header.to_vec());
+        self
     }
 
     /// Interleave a `NoticeResponse` into the SCRAM exchange (see
@@ -217,18 +244,52 @@ impl ScramServer {
         self
     }
 
+    /// Offer `SCRAM-SHA-256-PLUS` and verify the client's channel binding
+    /// against `cbind_data` (the server's view of its own `tls-server-end-point`
+    /// hash). Pass the SAME bytes the client binds to for a successful exchange,
+    /// or DIFFERENT bytes to model a MITM/relay channel (binding mismatch).
+    fn with_plus(mut self, cbind_data: Vec<u8>) -> Self {
+        self.offer_plus = true;
+        self.server_cbind_data = cbind_data;
+        self
+    }
+
     /// Compute the next server message once the current one is fully read.
     fn advance(&mut self) {
         match self.served {
-            // Phase 0: respond to the startup with the SASL mechanism offer.
+            // Phase 0: respond to the startup with the SASL mechanism offer. A
+            // TLS server offers -PLUS first (client preference order), then plain.
             0 => {
-                self.out = auth(10, b"SCRAM-SHA-256\0\0");
+                self.out = if self.offer_plus {
+                    auth(10, b"SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0")
+                } else {
+                    auth(10, b"SCRAM-SHA-256\0\0")
+                };
             }
             // Phase 1: the client has sent its SASL initial response; build the
             // server-first echoing the client nonce.
             1 => {
                 let sasl_initial = &self.client_frames[1];
-                let bare = extract_client_first_bare(sasl_initial);
+                let mechanism = extract_mechanism(sasl_initial);
+                let (gs2_header, bare) = extract_gs2_and_bare(sasl_initial);
+                // Teeth: a `-PLUS`-offering server proves the client actually
+                // selected channel binding — the SASL mechanism is
+                // `SCRAM-SHA-256-PLUS` and the gs2 flag is `p=`, never plain
+                // SCRAM with `n`/`y`.
+                if self.offer_plus {
+                    assert_eq!(
+                        mechanism, b"SCRAM-SHA-256-PLUS",
+                        "a channel-binding-capable client MUST select -PLUS when offered",
+                    );
+                    assert!(
+                        gs2_header.starts_with(b"p=tls-server-end-point,,"),
+                        "the -PLUS client-first gs2 header must be p=tls-server-end-point,,",
+                    );
+                }
+                if let Some(expected) = &self.expect_gs2_header {
+                    assert_eq!(&gs2_header, expected, "unexpected gs2 channel-binding header");
+                }
+                self.gs2_header = gs2_header;
                 let client_nonce = extract_nonce(&bare);
                 let mut server_nonce = client_nonce;
                 server_nonce.push_str("ScramServerSuffix");
@@ -251,9 +312,19 @@ impl ScramServer {
                 self.server_nonce = server_nonce;
             }
             // Phase 2: the client has sent its proof; verify by computing the
-            // expected server signature, then complete the handshake.
+            // expected server signature, then complete the handshake. The `c=`
+            // value is `base64(gs2-header || cbind-data)` — the server appends
+            // its OWN `server_cbind_data` for a `p=` (channel-binding) header, so
+            // a client bound to different data produces a different AuthMessage
+            // and the server signature the client verifies will not match.
             2 => {
-                let client_final_without_proof = format!("c=biws,r={}", self.server_nonce);
+                let mut cbind_input = self.gs2_header.clone();
+                if self.gs2_header.starts_with(b"p=") {
+                    cbind_input.extend_from_slice(&self.server_cbind_data);
+                }
+                let cbind_b64 = encode_b64(&cbind_input);
+                let client_final_without_proof =
+                    format!("c={cbind_b64},r={}", self.server_nonce);
                 let proof = compute_client_proof(
                     &self.password,
                     &SCRAM_SALT,
@@ -329,18 +400,34 @@ impl Transport for ScramServer {
     }
 }
 
-/// Extract the client-first-message-bare (`n=...,r=<nonce>`) from a
-/// `SASLInitialResponse` frame (`'p'`, len, mechanism NUL, i32 body_len, body).
-fn extract_client_first_bare(frame_bytes: &[u8]) -> String {
+/// Extract the SASL mechanism name from a `SASLInitialResponse` frame (the
+/// NUL-terminated string after the 5-byte tag+length header).
+fn extract_mechanism(frame_bytes: &[u8]) -> Vec<u8> {
+    let body = &frame_bytes[5..];
+    let mech_end = body.iter().position(|b| *b == 0).expect("mechanism NUL");
+    body[..mech_end].to_vec()
+}
+
+/// Extract the gs2 channel-binding header and the client-first-message-bare
+/// (`n=...,r=<nonce>`) from a `SASLInitialResponse` frame (`'p'`, len, mechanism
+/// NUL, i32 body_len, body). The gs2 header is everything up to and including
+/// the first `,,` (empty authzid) — `n,,`, `y,,`, or `p=tls-server-end-point,,`.
+fn extract_gs2_and_bare(frame_bytes: &[u8]) -> (Vec<u8>, String) {
     let body = &frame_bytes[5..];
     let mech_end = body.iter().position(|b| *b == 0).expect("mechanism NUL");
     let msg_start = mech_end + 1 + 4;
     let client_first = &body[msg_start..];
-    let bare = match client_first.strip_prefix(b"n,,") {
-        Some(bare) => bare,
-        None => panic!("client-first-message must begin with the gs2 header `n,,`"),
-    };
-    std::str::from_utf8(bare).expect("client-first-bare is UTF-8").to_string()
+    // Locate the first `,,` (channel-binding flag `,` authzid `,`); the header is
+    // the prefix through it, the bare is the rest.
+    let double_comma = client_first
+        .windows(2)
+        .position(|w| w == b",,")
+        .expect("gs2 header must contain the `,,` authzid separator");
+    let header_end = double_comma + 2;
+    let gs2_header = client_first[..header_end].to_vec();
+    let bare = &client_first[header_end..];
+    let bare = std::str::from_utf8(bare).expect("client-first-bare is UTF-8").to_string();
+    (gs2_header, bare)
 }
 
 /// Extract the nonce (`r=<nonce>`) from a client-first-message-bare.
@@ -510,8 +597,100 @@ fn md5_connect_reaches_active() {
 /// active.
 #[test]
 fn scram_connect_reaches_active() {
-    let creds = Credentials::ScramPassword(scram_password("pencil"));
+    let creds = Credentials::ScramPassword(scram_password("pencil"), ChannelBinding::Unbound);
     let server = ScramServer::new("pencil");
+    assert_eq!(connect_active(server, creds), (SCRAM_BACKEND_PID, TxStatus::Idle));
+}
+
+// ─────────────────────── SCRAM-SHA-256-PLUS (channel binding) ───────────────────────
+//
+// Stand-in server-certificate DER bytes. There is no real TLS here — the SCRAM
+// engine consumes the ALREADY-COMPUTED `tls-server-end-point` binding data, so a
+// fixed byte string plus its hash is a faithful driver for the -PLUS path.
+
+const FAKE_SERVER_CERT: &[u8] = b"bsql-fake-server-certificate-der-bytes";
+const RELAY_SERVER_CERT: &[u8] = b"bsql-relay-mitm-different-certificate";
+
+/// A SCRAM credential carrying the `tls-server-end-point` binding for `cert`.
+fn scram_plus_creds(secret: &str, cert: &[u8], require: bool) -> Credentials {
+    Credentials::ScramPassword(
+        scram_password(secret),
+        ChannelBinding::Available { data: tls_server_end_point(cert), require },
+    )
+}
+
+/// SCRAM-SHA-256-PLUS: over a (simulated) TLS channel that offers `-PLUS`, the
+/// client SELECTS it and binds to the server certificate hash, and the exchange
+/// completes. The fake asserts the SASL mechanism was `SCRAM-SHA-256-PLUS` and
+/// the gs2 flag `p=tls-server-end-point,,` (not plain SCRAM), so reaching active
+/// proves channel binding was actually used, not merely that auth succeeded.
+#[test]
+fn scram_plus_connect_binds_to_the_server_certificate() {
+    let server_cbind = tls_server_end_point(FAKE_SERVER_CERT).as_slice().to_vec();
+    let creds = scram_plus_creds("pencil", FAKE_SERVER_CERT, false);
+    let server = ScramServer::new("pencil").with_plus(server_cbind);
+    assert_eq!(connect_active(server, creds), (SCRAM_BACKEND_PID, TxStatus::Idle));
+}
+
+/// `channel_binding=require` completes over `-PLUS` exactly like `prefer` — the
+/// strict mode does not change a successful bound exchange.
+#[test]
+fn scram_plus_require_connects_when_offered() {
+    let server_cbind = tls_server_end_point(FAKE_SERVER_CERT).as_slice().to_vec();
+    let creds = scram_plus_creds("pencil", FAKE_SERVER_CERT, true);
+    let server = ScramServer::new("pencil").with_plus(server_cbind);
+    assert_eq!(connect_active(server, creds), (SCRAM_BACKEND_PID, TxStatus::Idle));
+}
+
+/// A channel-binding MISMATCH — the client bound to the real server certificate,
+/// but the channel presents a DIFFERENT one (a relay/MITM terminating TLS with
+/// its own valid cert) — makes the SCRAM exchange FAIL: the binding is anchored
+/// into the `AuthMessage`, so the server signature the client verifies does not
+/// match. Classified `SignatureMismatch`, never a silent success. This is the
+/// residual MITM class `-PLUS` closes.
+#[test]
+fn scram_plus_binding_mismatch_fails_classified() {
+    // Client binds to FAKE_SERVER_CERT; the server verifies against a DIFFERENT
+    // cert hash — the relay-channel scenario.
+    let relay_cbind = tls_server_end_point(RELAY_SERVER_CERT).as_slice().to_vec();
+    let creds = scram_plus_creds("pencil", FAKE_SERVER_CERT, false);
+    let server = ScramServer::new("pencil").with_plus(relay_cbind);
+    let err = connect_error(server, creds);
+    assert!(
+        matches!(
+            err,
+            EngineError::Handshake(ConnFail::Scram(ScramFailureClass::SignatureMismatch)),
+        ),
+        "a channel-binding mismatch must be a classified SignatureMismatch, got {err:?}",
+    );
+}
+
+/// `channel_binding=require` over a channel whose server offers ONLY plain SCRAM
+/// (no `-PLUS` — a legacy server, or a downgrade attacker who stripped `-PLUS`
+/// from the offer) is REFUSED fail-closed, never a silent fallback to an unbound
+/// exchange. Classified `ChannelBindingRequired`.
+#[test]
+fn scram_require_refuses_when_server_omits_plus() {
+    let creds = scram_plus_creds("pencil", FAKE_SERVER_CERT, true);
+    let server = ScramServer::new("pencil"); // offers plain SCRAM-SHA-256 only
+    let err = connect_error(server, creds);
+    assert!(
+        matches!(
+            err,
+            EngineError::Handshake(ConnFail::Scram(ScramFailureClass::ChannelBindingRequired)),
+        ),
+        "require + a server without -PLUS must refuse, got {err:?}",
+    );
+}
+
+/// A channel-binding-capable client (TLS, `prefer`) whose server offers ONLY
+/// plain SCRAM sends the `y,,` anti-downgrade gs2 flag (NOT `n,,`) and completes.
+/// A server that genuinely supported binding would reject `y`; a genuine plain
+/// server accepts it. The fake asserts the flag is exactly `y,,`.
+#[test]
+fn scram_prefer_sends_y_flag_without_plus() {
+    let creds = scram_plus_creds("pencil", FAKE_SERVER_CERT, false);
+    let server = ScramServer::new("pencil").expect_gs2(b"y,,");
     assert_eq!(connect_active(server, creds), (SCRAM_BACKEND_PID, TxStatus::Idle));
 }
 
@@ -525,7 +704,7 @@ fn scram_connect_reaches_active() {
 /// would fail the handshake here, not reach active.
 #[test]
 fn scram_connect_absorbs_interleaved_notices_and_reaches_active() {
-    let creds = Credentials::ScramPassword(scram_password("pencil"));
+    let creds = Credentials::ScramPassword(scram_password("pencil"), ChannelBinding::Unbound);
     let server = ScramServer::new("pencil").with_interleaved_notices();
     assert_eq!(connect_active(server, creds), (SCRAM_BACKEND_PID, TxStatus::Idle));
 }

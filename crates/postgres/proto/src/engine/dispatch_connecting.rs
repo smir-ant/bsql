@@ -65,6 +65,8 @@ use crate::md5::Md5HandshakeState;
 use crate::password::{Credentials, Password};
 use crate::startup::StartupParam;
 #[cfg(feature = "scram")]
+use crate::scram::channel_binding;
+#[cfg(feature = "scram")]
 use crate::scram::session::ScramSession;
 #[cfg(feature = "scram")]
 use crate::scram::types::SecretDigest;
@@ -77,9 +79,6 @@ use crate::wire::{
     TAG_ERROR_RESPONSE, TAG_NEGOTIATE_PROTOCOL_VERSION, TAG_NOTICE_RESPONSE, TAG_PARAMETER_STATUS,
     TAG_READY_FOR_QUERY, TAG_SASL_RESPONSE,
 };
-// The advertised SASL mechanism name — matched only by the SCRAM dispatch.
-#[cfg(feature = "scram")]
-use crate::wire::SCRAM_SHA_256_MECHANISM;
 use crate::write_buf::{WriteBuf, WriteBufFull};
 
 // ===========================================================================
@@ -384,9 +383,11 @@ impl ConnectingEngine {
         let state = match credentials {
             Credentials::Trust => ConnectingState::StartupTrust,
             #[cfg(feature = "scram")]
-            Credentials::ScramPassword(password) => ConnectingState::StartupScram {
-                scram: Box::new(ScramSession::from_password(password)),
-            },
+            Credentials::ScramPassword(password, channel_binding) => {
+                ConnectingState::StartupScram {
+                    scram: Box::new(ScramSession::from_password(password, channel_binding)),
+                }
+            }
             Credentials::CleartextPassword(password) => ConnectingState::StartupCleartext {
                 password: Box::new(password),
             },
@@ -728,21 +729,27 @@ fn build_sasl_initial_response(
     scram: &mut ScramSession,
 ) -> Result<(), ConnFail> {
     use crate::scram::wire;
+    // The gs2 header + mechanism name come from the resolved choice: plain
+    // `SCRAM-SHA-256` with `n,,` / `y,,`, or `SCRAM-SHA-256-PLUS` with
+    // `p=tls-server-end-point,,`. Set by the caller from the server's offer.
+    let choice = scram.sasl_choice;
+    let gs2_header = choice.gs2_header();
+    let mechanism = choice.mechanism();
     // PG binds the SCRAM identity to the StartupMessage `user`; the SASL-level
     // name is empty (mirrors the live builder).
     let user_bytes: &[u8] = b"";
     let client_nonce = wire::generate_client_nonce().map_err(ConnFail::scram)?;
     let client_first_bare =
         wire::build_client_first_bare(user_bytes, &client_nonce).map_err(ConnFail::scram)?;
-    let client_first_msg =
-        wire::build_client_first_message(user_bytes, &client_nonce).map_err(ConnFail::scram)?;
+    let client_first_msg = wire::build_client_first_message(gs2_header, user_bytes, &client_nonce)
+        .map_err(ConnFail::scram)?;
 
     write
         .push_u8(TAG_SASL_RESPONSE.byte())
         .map_err(|_| ConnFail::BufferOverflow)?;
     write
         .with_length_prefix(|w| {
-            w.push_bytes(SCRAM_SHA_256_MECHANISM)?;
+            w.push_bytes(mechanism)?;
             w.push_u8(0)?;
             let body_len = i32::try_from(client_first_msg.len()).map_err(|_| WriteBufFull)?;
             w.push_i32_be(body_len)?;
@@ -767,11 +774,30 @@ fn build_sasl_response(
     scram: &ScramSession,
     server_first: &[u8],
 ) -> Result<SecretDigest, ConnFail> {
-    use crate::scram::{crypto, wire};
+    use crate::scram::{channel_binding, crypto, wire};
     let parsed = wire::parse_server_first(server_first, scram.client_nonce_b64.as_slice())
         .map_err(ConnFail::scram)?;
+    // Reconstruct the cbind-input (`gs2-header || cbind-data`) chosen at the
+    // SASL-initial step and base64-encode it into the client-final `c=` value.
+    // For `n`/`y` this is `biws`/`eSws`; for `-PLUS` it is the base64 of
+    // `p=tls-server-end-point,,` + the server cert hash — cryptographically
+    // anchored into the proof via the `AuthMessage` below.
+    let mut cbind_input = [0u8; channel_binding::MAX_CBIND_INPUT_LEN];
+    let cbind_input_len = scram
+        .sasl_choice
+        .write_cbind_input(scram.channel_binding.data(), &mut cbind_input)
+        .ok_or(ConnFail::BufferOverflow)?;
+    let cbind_input_slice = cbind_input
+        .get(..cbind_input_len)
+        .ok_or(ConnFail::BufferOverflow)?;
+    let mut cbind_b64 = [0u8; channel_binding::MAX_CBIND_B64_LEN];
+    let cbind_b64_len =
+        wire::base64_encode_to_buf(cbind_input_slice, &mut cbind_b64).map_err(ConnFail::scram)?;
+    let cbind_b64_slice = cbind_b64
+        .get(..cbind_b64_len)
+        .ok_or(ConnFail::BufferOverflow)?;
     let client_final_without_proof =
-        wire::build_client_final_without_proof(parsed.server_nonce.as_bytes())
+        wire::build_client_final_without_proof(cbind_b64_slice, parsed.server_nonce.as_bytes())
             .map_err(ConnFail::scram)?;
     let client_first_bare = scram.client_first_bare.as_slice();
     // Closure-scoped password access: the borrow dies at the call boundary;
@@ -796,9 +822,12 @@ fn build_sasl_response(
         Some(slice) => slice,
         None => return Err(ConnFail::BufferOverflow),
     };
-    let mut client_final_msg =
-        wire::build_client_final_message(parsed.server_nonce.as_bytes(), proof_b64_slice)
-            .map_err(ConnFail::scram)?;
+    let mut client_final_msg = wire::build_client_final_message(
+        cbind_b64_slice,
+        parsed.server_nonce.as_bytes(),
+        proof_b64_slice,
+    )
+    .map_err(ConnFail::scram)?;
 
     write
         .push_u8(TAG_SASL_RESPONSE.byte())
@@ -871,23 +900,6 @@ fn parse_rfq_tx_status(payload: &[u8]) -> Option<TxStatus> {
         [byte] => TxStatus::try_from_byte(*byte).ok(),
         _ => None,
     }
-}
-
-/// Does the SASL mechanism list advertise `SCRAM-SHA-256`? Mirror of the live
-/// dispatcher's fast-path + NUL-split fallback.
-#[cfg(feature = "scram")]
-fn mechanism_list_contains_scram(data: &[u8]) -> bool {
-    if let Some(rest) = data.strip_prefix(SCRAM_SHA_256_MECHANISM)
-        && let Some(&0) = rest.first()
-    {
-        return true;
-    }
-    for name in data.split(|byte| *byte == 0) {
-        if name == SCRAM_SHA_256_MECHANISM {
-            return true;
-        }
-    }
-    false
 }
 
 /// The connecting-phase dispatch: consume one [`ConnectingState`] and one
@@ -1051,9 +1063,17 @@ fn dispatch_startup_scram(
     if tag == TAG_AUTHENTICATION {
         match parse_auth_sub_code(payload) {
             AuthCode::Known(AuthSubCode::Sasl, rest) => {
-                if !mechanism_list_contains_scram(rest) {
-                    return fail(ConnFail::Scram(ScramFailureClass::NoSupportedMechanism));
-                }
+                // Resolve the SASL mechanism + gs2 flag from the server's offer
+                // and the transport-resolved channel binding: SCRAM-SHA-256-PLUS
+                // when the server offers it over a bound channel, plain
+                // SCRAM-SHA-256 (`y,,` anti-downgrade over TLS, `n,,` otherwise)
+                // when it does not, or a classified refusal.
+                let offer = channel_binding::MechanismOffer::parse(rest);
+                let choice = match channel_binding::decide_sasl_choice(offer, &scram.channel_binding) {
+                    Ok(choice) => choice,
+                    Err(error) => return fail(ConnFail::scram(error)),
+                };
+                scram.sasl_choice = choice;
                 match build_sasl_initial_response(write, &mut scram) {
                     // Client-initiated SASL: the response is in the buffer;
                     // the surfaceable challenge is the server-first that

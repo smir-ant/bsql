@@ -57,7 +57,10 @@ use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
     Credentials, DatabaseName, Ident, PreparedQuery, RowDecode, TypedCopyIn, TypedQuery,
 };
-// `Password` / `Sensitive` build a `Credentials::ScramPassword` — SCRAM-only.
+// `Password` / `Sensitive` build a `Credentials::ScramPassword` — SCRAM-only;
+// `resolve_channel_binding` computes its channel binding from the built wire.
+#[cfg(feature = "scram")]
+use bsql_postgres_core::resolve_channel_binding;
 #[cfg(feature = "scram")]
 use bsql_postgres_proto::{Password, Sensitive};
 
@@ -221,7 +224,17 @@ impl Connection {
             Some(pw) => {
                 let password = Password::try_from_str(pw)
                     .map_err(|_| DriverError::Config("invalid password"))?;
-                Credentials::ScramPassword(Sensitive::new(password))
+                // Resolve SCRAM channel binding from the negotiated transport +
+                // the consumer's policy: over TLS this hashes the server's
+                // certificate into the `tls-server-end-point` binding data, so the
+                // engine can select SCRAM-SHA-256-PLUS. `channel_binding=require`
+                // over a plaintext channel fails closed here.
+                let channel_binding = resolve_channel_binding(
+                    encrypted,
+                    wire.peer_end_entity_cert(),
+                    config.channel_binding_mode(),
+                )?;
+                Credentials::ScramPassword(Sensitive::new(password), channel_binding)
             }
             #[cfg(not(feature = "scram"))]
             Some(_) => {

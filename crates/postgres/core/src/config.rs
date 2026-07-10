@@ -47,6 +47,42 @@ pub enum SslMode {
 // variant accidentally carrying data would widen it; the pin catches that.
 crate::footprint_pin!(SslMode, size = 1, align = 1);
 
+/// The SCRAM-SHA-256-PLUS channel-binding policy, mirroring libpq's
+/// `channel_binding` connection parameter.
+///
+/// Channel binding ties the SCRAM exchange to the specific TLS channel (via the
+/// server's `tls-server-end-point` certificate hash), closing the valid-cert
+/// relay/MITM residual that full cert+hostname verification alone leaves open.
+/// It applies only over TLS — a plaintext channel cannot be bound.
+///
+/// The default is [`Prefer`](Self::Prefer), matching libpq: channel binding is
+/// used whenever the server offers `SCRAM-SHA-256-PLUS`, but a server that does
+/// not (a legacy PostgreSQL, or a SCRAM-speaking pooler) still connects. The
+/// threat-scoped [`SslMode`] default already ensures a REMOTE endpoint is
+/// encrypted (defeating passive interception); channel binding is
+/// defense-in-depth against the narrower active-relay threat, so — like libpq —
+/// it is opt-in-strict rather than default-strict, to avoid breaking
+/// connectivity to servers that do not implement it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelBindingMode {
+    /// Never use channel binding — plain SCRAM-SHA-256 even over TLS (gs2 `n,,`).
+    /// The escape hatch for a server whose `-PLUS` support is broken.
+    Disable,
+    /// Use `SCRAM-SHA-256-PLUS` when the server offers it (over TLS); otherwise
+    /// fall back to plain SCRAM (the `y,,` anti-downgrade flag over TLS). The
+    /// default.
+    Prefer,
+    /// REQUIRE channel binding: refuse to authenticate unless the server offers
+    /// `SCRAM-SHA-256-PLUS` over TLS. A plaintext connection, or a server without
+    /// `-PLUS` (including a downgrade attacker who stripped it), is a fail-closed
+    /// [`DriverError::Config`](crate::DriverError) /
+    /// `ChannelBindingRequired` refusal, never a fallback.
+    Require,
+}
+
+// Footprint pin: a 3-variant fieldless enum is a single discriminant byte.
+crate::footprint_pin!(ChannelBindingMode, size = 1, align = 1);
+
 
 /// Connection configuration.
 ///
@@ -115,6 +151,18 @@ pub struct ConnectConfig {
     ///
     /// [`with_ca_roots`]: ConnectConfig::with_ca_roots
     ca_roots_pem: Option<Arc<[u8]>>,
+    /// The SCRAM-SHA-256-PLUS channel-binding policy (default
+    /// [`ChannelBindingMode::Prefer`]). Set via the builder
+    /// [`channel_binding`](Self::channel_binding), the DSN `channel_binding=`
+    /// key, or `PGCHANNELBINDING`. Only meaningful for a password (SCRAM)
+    /// connection over TLS; ignored for Trust auth or plaintext (where binding
+    /// is impossible — `Require` then fails closed at connect).
+    ///
+    /// Stored directly (not `Option`) — unlike [`SslMode`] the default is a
+    /// FIXED `Prefer` (not endpoint-dependent), so there is no defaulted-vs-set
+    /// distinction to preserve. Niche-packs beside `ssl_mode` into the config's
+    /// existing padding, so the footprint is unchanged.
+    channel_binding: ChannelBindingMode,
 }
 
 // Footprint pin: four owned Strings/Option<String> (host, user, database,
@@ -280,6 +328,9 @@ impl ConnectConfig {
         let mut ssl_mode: Option<SslMode> = None;
         let mut timeout = 10u64;
         let mut ca_roots_pem: Option<Arc<[u8]>> = None;
+        // `channel_binding` defaults to `Prefer` unless a `channel_binding=` key
+        // sets it (libpq parity).
+        let mut channel_binding = ChannelBindingMode::Prefer;
         // `host=` OVERRIDES the authority host (libpq: the query parameter wins).
         // The canonical way to name a unix-socket directory in a PG URL, whose
         // leading `/` cannot ride the authority slot.
@@ -317,6 +368,19 @@ impl ConnectConfig {
                                 ));
                             }
                         });
+                    }
+                    "channel_binding" => {
+                        // libpq parity: `disable` / `prefer` / `require`.
+                        channel_binding = match v {
+                            "disable" => ChannelBindingMode::Disable,
+                            "prefer" => ChannelBindingMode::Prefer,
+                            "require" => ChannelBindingMode::Require,
+                            other => {
+                                return Err(format!(
+                                    "unknown channel_binding: {other} (valid: disable, prefer, require)"
+                                ));
+                            }
+                        };
                     }
                     "connect_timeout" => {
                         timeout = v.parse().map_err(|_| format!("invalid timeout: {v}"))?;
@@ -372,6 +436,7 @@ impl ConnectConfig {
             ssl_mode,
             startup_params: Vec::new(),
             ca_roots_pem,
+            channel_binding,
         })
     }
 
@@ -456,6 +521,26 @@ impl ConnectConfig {
             }
         };
 
+        // `PGCHANNELBINDING` — present-but-malformed is a loud error (never a
+        // silent default that could weaken a `require` intent), mirroring how
+        // `PGSSLMODE` is handled.
+        let channel_binding = match std::env::var("PGCHANNELBINDING") {
+            Ok(v) => match v.as_str() {
+                "disable" => ChannelBindingMode::Disable,
+                "prefer" => ChannelBindingMode::Prefer,
+                "require" => ChannelBindingMode::Require,
+                other => {
+                    return Err(format!(
+                        "unknown PGCHANNELBINDING: {other} (valid: disable, prefer, require)"
+                    ));
+                }
+            },
+            Err(VarError::NotPresent) => ChannelBindingMode::Prefer,
+            Err(VarError::NotUnicode(_)) => {
+                return Err("PGCHANNELBINDING is not valid UTF-8".to_string())
+            }
+        };
+
         Ok(Self {
             host,
             port,
@@ -466,6 +551,7 @@ impl ConnectConfig {
             ssl_mode,
             startup_params: Vec::new(),
             ca_roots_pem,
+            channel_binding,
         })
     }
 
@@ -484,6 +570,7 @@ impl ConnectConfig {
             ssl_mode: None,
             startup_params: Vec::new(),
             ca_roots_pem: None,
+            channel_binding: ChannelBindingMode::Prefer,
         }
     }
 
@@ -509,6 +596,25 @@ impl ConnectConfig {
     pub fn ssl_mode(mut self, mode: SslMode) -> Self {
         self.ssl_mode = Some(mode);
         self
+    }
+
+    /// Set the SCRAM-SHA-256-PLUS channel-binding policy (default
+    /// [`ChannelBindingMode::Prefer`]).
+    ///
+    /// [`Require`](ChannelBindingMode::Require) is the strict mode — it refuses
+    /// to authenticate unless channel binding is in use (a TLS server offering
+    /// `SCRAM-SHA-256-PLUS`), closing the valid-cert relay/MITM residual. Also
+    /// settable via the DSN `channel_binding=` key or `PGCHANNELBINDING`.
+    pub fn channel_binding(mut self, mode: ChannelBindingMode) -> Self {
+        self.channel_binding = mode;
+        self
+    }
+
+    /// The effective channel-binding policy (default
+    /// [`ChannelBindingMode::Prefer`]).
+    #[must_use]
+    pub fn channel_binding_mode(&self) -> ChannelBindingMode {
+        self.channel_binding
     }
 
     /// Set connection timeout in seconds.
@@ -733,6 +839,68 @@ pub fn resolve_endpoint(host: &str, port: u16) -> Endpoint {
     }
 }
 
+/// Resolve the SCRAM channel binding for a built connection, centralizing the
+/// rule ONE place both drivers thread through — exactly as [`resolve_endpoint`]
+/// centralizes the unix-vs-TCP rule and
+/// [`resolve_ssl_mode`](ConnectConfig::resolve_ssl_mode) the SSL-mode rule.
+///
+/// Given the negotiated transport's encryption state and, when encrypted, the
+/// server's end-entity certificate DER (from `rustls::peer_certificates`), it
+/// produces the [`ChannelBinding`](bsql_postgres_proto::scram::channel_binding::ChannelBinding)
+/// the SCRAM credential carries into the engine:
+///
+/// - [`ChannelBindingMode::Disable`] → `Unbound` (plain SCRAM even over TLS).
+/// - [`ChannelBindingMode::Prefer`] / [`Require`](ChannelBindingMode::Require)
+///   over TLS → `Available` with the `tls-server-end-point` hash of the peer
+///   cert (the engine then selects `-PLUS` iff the server offers it).
+/// - `Prefer` on a plaintext channel → `Unbound` (binding is impossible).
+/// - `Require` on a plaintext channel → a fail-closed
+///   [`DriverError::Config`](crate::DriverError): channel binding needs TLS.
+///
+/// # Errors
+///
+/// [`DriverError::Config`](crate::DriverError) when `Require` is set over a
+/// plaintext channel, or when an encrypted channel presents no peer certificate
+/// (structurally unreachable after a verify-full handshake, surfaced fail-closed
+/// rather than silently unbound).
+#[cfg(feature = "scram")]
+pub fn resolve_channel_binding(
+    encrypted: bool,
+    peer_cert_der: Option<&[u8]>,
+    mode: ChannelBindingMode,
+) -> Result<bsql_postgres_proto::scram::channel_binding::ChannelBinding, crate::DriverError> {
+    use bsql_postgres_proto::scram::channel_binding::{tls_server_end_point, ChannelBinding};
+    match mode {
+        ChannelBindingMode::Disable => Ok(ChannelBinding::Unbound),
+        ChannelBindingMode::Prefer | ChannelBindingMode::Require => {
+            let require = mode == ChannelBindingMode::Require;
+            if encrypted {
+                match peer_cert_der {
+                    Some(der) => Ok(ChannelBinding::Available {
+                        data: tls_server_end_point(der),
+                        require,
+                    }),
+                    // A completed verify-full TLS handshake always presents a
+                    // peer certificate; its absence is a broken invariant, not a
+                    // "server doesn't support binding" case — fail closed.
+                    None => Err(crate::DriverError::Config(
+                        "TLS channel binding could not read the server certificate",
+                    )),
+                }
+            } else if require {
+                Err(crate::DriverError::Config(
+                    "channel_binding=require needs a TLS connection — the channel is \
+                     plaintext (a unix socket, or an SSL-disabled/refused TCP connection), \
+                     so no server certificate exists to bind to; use \
+                     channel_binding=prefer/disable, or connect over TLS",
+                ))
+            } else {
+                Ok(ChannelBinding::Unbound)
+            }
+        }
+    }
+}
+
 /// Validate a config's raw startup parameters into wire
 /// [`StartupParam`](bsql_postgres_proto::StartupParam)s.
 ///
@@ -812,6 +980,102 @@ mod tests {
         // `?sslmode` with no value would silently keep the default `prefer`,
         // downgrading SSL. A parameter missing `=` must be rejected loudly.
         assert!(ConnectConfig::from_dsn("postgres://u@h?sslmode").is_err());
+    }
+
+    #[test]
+    fn channel_binding_defaults_to_prefer() {
+        assert_eq!(
+            ConnectConfig::new("h", "u").channel_binding_mode(),
+            ChannelBindingMode::Prefer,
+        );
+    }
+
+    #[test]
+    fn builder_sets_channel_binding() {
+        assert_eq!(
+            ConnectConfig::new("h", "u")
+                .channel_binding(ChannelBindingMode::Require)
+                .channel_binding_mode(),
+            ChannelBindingMode::Require,
+        );
+    }
+
+    #[test]
+    fn dsn_parses_channel_binding() {
+        for (dsn, expected) in [
+            ("postgres://u@h?channel_binding=require", ChannelBindingMode::Require),
+            ("postgres://u@h?channel_binding=prefer", ChannelBindingMode::Prefer),
+            ("postgres://u@h?channel_binding=disable", ChannelBindingMode::Disable),
+        ] {
+            let cfg = match ConnectConfig::from_dsn(dsn) {
+                Ok(c) => c,
+                Err(e) => panic!("valid DSN {dsn} must parse: {e}"),
+            };
+            assert_eq!(cfg.channel_binding_mode(), expected, "for {dsn}");
+        }
+        // Absent → the Prefer default.
+        let cfg = match ConnectConfig::from_dsn("postgres://u@h") {
+            Ok(c) => c,
+            Err(e) => panic!("DSN must parse: {e}"),
+        };
+        assert_eq!(cfg.channel_binding_mode(), ChannelBindingMode::Prefer);
+    }
+
+    #[test]
+    fn dsn_rejects_unknown_channel_binding_value() {
+        // A malformed value must be loud, never a silent default that could
+        // weaken a `require` intent.
+        assert!(ConnectConfig::from_dsn("postgres://u@h?channel_binding=verify").is_err());
+    }
+
+    #[cfg(feature = "scram")]
+    #[test]
+    fn resolve_channel_binding_covers_every_policy_and_transport() {
+        use bsql_postgres_proto::scram::channel_binding::{tls_server_end_point, ChannelBinding};
+        const CERT: &[u8] = b"fake-server-cert-der";
+
+        // Disable → Unbound regardless of transport.
+        assert!(matches!(
+            resolve_channel_binding(true, Some(CERT), ChannelBindingMode::Disable),
+            Ok(ChannelBinding::Unbound),
+        ));
+
+        // Prefer over TLS → Available (require = false) with the cert hash.
+        let cb = match resolve_channel_binding(true, Some(CERT), ChannelBindingMode::Prefer) {
+            Ok(cb) => cb,
+            Err(e) => panic!("prefer over TLS must resolve, got {e:?}"),
+        };
+        match cb {
+            ChannelBinding::Available { data, require } => {
+                assert!(!require);
+                assert_eq!(data.as_slice(), tls_server_end_point(CERT).as_slice());
+            }
+            _ => panic!("prefer over TLS must be Available, got {cb:?}"),
+        }
+
+        // Require over TLS → Available (require = true).
+        assert!(matches!(
+            resolve_channel_binding(true, Some(CERT), ChannelBindingMode::Require),
+            Ok(ChannelBinding::Available { require: true, .. }),
+        ));
+
+        // Prefer over plaintext → Unbound (binding impossible).
+        assert!(matches!(
+            resolve_channel_binding(false, None, ChannelBindingMode::Prefer),
+            Ok(ChannelBinding::Unbound),
+        ));
+
+        // Require over plaintext → fail closed.
+        assert!(matches!(
+            resolve_channel_binding(false, None, ChannelBindingMode::Require),
+            Err(crate::DriverError::Config(_)),
+        ));
+
+        // Encrypted but no peer cert (broken invariant) → fail closed.
+        assert!(matches!(
+            resolve_channel_binding(true, None, ChannelBindingMode::Prefer),
+            Err(crate::DriverError::Config(_)),
+        ));
     }
 
     #[test]

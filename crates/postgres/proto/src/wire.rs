@@ -855,6 +855,11 @@ const _: () = {
 /// The SCRAM-SHA-256 mechanism name as bytes.
 pub const SCRAM_SHA_256_MECHANISM: &[u8] = b"SCRAM-SHA-256";
 
+/// The SCRAM-SHA-256-PLUS mechanism name as bytes — SCRAM with channel binding
+/// (RFC 5802 §6). A server advertises this in its `AuthenticationSASL` mechanism
+/// list only when it can bind (it is on a TLS connection).
+pub const SCRAM_SHA_256_PLUS_MECHANISM: &[u8] = b"SCRAM-SHA-256-PLUS";
+
 /// PG protocol version 3.0 = 196608 (0x00030000).
 pub const PROTOCOL_VERSION_3_0: u32 = 196608;
 

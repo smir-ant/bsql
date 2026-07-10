@@ -22,6 +22,7 @@
 //! reaches this module.
 
 use crate::password::Password;
+use crate::scram::channel_binding::{ChannelBinding, SaslChoice};
 use crate::sensitive::Sensitive;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -96,6 +97,27 @@ pub struct ScramSession {
     #[zeroize(skip)]
     pub(crate) client_nonce_b64:
         crate::ident::PodBytes<{ crate::scram::wire::MAX_CLIENT_NONCE_B64_LEN }>,
+    /// The resolved channel-binding context (transport-derived): `Unbound` on a
+    /// plaintext connection or under `channel_binding=disable`, or `Available`
+    /// with the `tls-server-end-point` cert hash over TLS. Set at
+    /// `from_password` from the credential and read at the
+    /// `AuthenticationSASL` dispatch to decide the mechanism.
+    ///
+    /// `#[zeroize(skip)]` — the binding data is the server's PUBLIC certificate
+    /// hash (sent base64 in the client-final `c=` value), not a secret.
+    #[zeroize(skip)]
+    pub(crate) channel_binding: ChannelBinding,
+    /// The SCRAM mechanism + gs2 flag actually selected for this exchange.
+    /// Initialised to [`SaslChoice::NoBinding`] and authoritatively set by
+    /// `dispatch_startup_scram` from the server's mechanism offer + the
+    /// `channel_binding` above, BEFORE the StartupScram → ServerFirst
+    /// transition — exactly as `client_first_bare` / `client_nonce_b64` are
+    /// populated there. Read at the client-final build to reconstruct the `c=`
+    /// cbind-input.
+    ///
+    /// `#[zeroize(skip)]` — a Copy enum discriminant, no secret material.
+    #[zeroize(skip)]
+    pub(crate) sasl_choice: SaslChoice,
 }
 
 impl ScramSession {
@@ -109,12 +131,21 @@ impl ScramSession {
     /// Response build, BEFORE the StartupScram → ServerFirst
     /// transition. The single `Box<ScramSession>` allocation is
     /// reused across both states.
+    ///
+    /// `channel_binding` is the transport-resolved binding (carried in from the
+    /// SCRAM credential); `sasl_choice` starts at [`SaslChoice::NoBinding`] and
+    /// is set from the server's mechanism offer at the same StartupScram step.
     #[inline]
-    pub(crate) const fn from_password(password: Sensitive<Password>) -> Self {
+    pub(crate) const fn from_password(
+        password: Sensitive<Password>,
+        channel_binding: ChannelBinding,
+    ) -> Self {
         Self {
             password,
             client_first_bare: crate::ident::PodBytes::new(),
             client_nonce_b64: crate::ident::PodBytes::new(),
+            channel_binding,
+            sasl_choice: SaslChoice::NoBinding,
         }
     }
 
@@ -162,7 +193,7 @@ mod drop_witness_tests {
             Ok(p) => p,
             Err(_) => return,
         };
-        let session = ScramSession::from_password(Sensitive::new(pw));
+        let session = ScramSession::from_password(Sensitive::new(pw), crate::scram::channel_binding::ChannelBinding::Unbound);
         DropCounter::scoped(session, probe.clone(), || {
             assert_eq!(probe.fired(), 0, "session alive — counter is 0");
         });
@@ -184,7 +215,7 @@ mod drop_witness_tests {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            let session = ScramSession::from_password(Sensitive::new(pw));
+            let session = ScramSession::from_password(Sensitive::new(pw), crate::scram::channel_binding::ChannelBinding::Unbound);
             DropCounter::scoped(session, probe.clone(), || {});
         }
         assert_eq!(probe.fired(), 3);

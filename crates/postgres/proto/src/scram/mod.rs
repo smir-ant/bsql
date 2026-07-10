@@ -7,6 +7,9 @@
 //!   only) and `CappedServerNonce`.
 //! - [`session`] — [`ScramSession`] typestate eliminating the
 //!   `Trust`-vs-`ScramPassword` double-match seam.
+//! - [`channel_binding`] — SCRAM-SHA-256-PLUS channel binding: the
+//!   `tls-server-end-point` certificate-hash computation and the
+//!   mechanism/gs2-flag decision.
 //!
 //! # Exchange flow (RFC 5802 mapped to our state machine)
 //!
@@ -82,12 +85,18 @@
 //!   immediately so password material doesn't linger in memory on
 //!   terminal connections.
 //!
-//! Channel binding (SCRAM-SHA-256-PLUS) is not supported in this
-//! crate yet. The GS2 header is always `n,,` and the channel binding
-//! data is always `biws`.
+//! Channel binding (SCRAM-SHA-256-PLUS) IS supported (see
+//! [`channel_binding`]): over TLS, when the driver supplies the
+//! `tls-server-end-point` binding data and the server offers `-PLUS`,
+//! the exchange selects it — the gs2 header becomes
+//! `p=tls-server-end-point,,` and the client-final `c=` carries the
+//! base64 of that header plus the server certificate hash. The
+//! `n,,` (no binding) and `y,,` (capable-but-unused, anti-downgrade)
+//! headers are the other two [`channel_binding::SaslChoice`] outcomes.
 //!
 //! [`ScramSession`]: session::ScramSession
 
+pub mod channel_binding;
 pub mod crypto;
 pub mod session;
 pub mod types;

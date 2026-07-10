@@ -735,6 +735,48 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `wire_pin!` pairs; the engine census counts the cfg-blind source text). The
   `scram`-off fail-loud is witnessed by `bsql-postgres-sync`'s
   `scram_off_fail_loud` test.
+- **SCRAM-SHA-256-PLUS channel binding** closes the valid-cert relay/MITM
+  residual that full cert+hostname verification alone leaves (a compromised proxy
+  or a mis-issued cert for a DIFFERENT name relaying the exchange). Over TLS the
+  driver hashes the server's END-ENTITY certificate into the RFC 5929
+  `tls-server-end-point` binding data — `resolve_channel_binding` in
+  `bsql-postgres-core` centralizes the rule ONE place both drivers thread
+  through, exactly like `resolve_endpoint` / `resolve_ssl_mode`. The cert hash is
+  chosen from the certificate's OWN `signatureAlgorithm` (a bounded, TOTAL
+  ASN.1 walk reading only that OID): SHA-384/512 for the ECDSA/RSA variants
+  naming them, and SHA-256 for everything else — the SHA-256 variants, the
+  MD5/SHA-1 upgrade RFC 5929 §4.1 mandates, and any unrecognised/unreadable OID
+  (which fails SAFE — a loud SCRAM signature mismatch, never a silent downgrade).
+  The hash is a direct `sha2` call (no hand-rolled crypto, no X.509 trust
+  parsing). The sans-IO engine then combines the binding with the server's
+  `AuthenticationSASL` mechanism offer (`channel_binding::decide_sasl_choice`)
+  to pick the mechanism + gs2 flag: `SCRAM-SHA-256-PLUS` (`p=tls-server-end-point,,`)
+  when the server offers it over a bound channel; plain SCRAM-SHA-256 with `y,,`
+  (the RFC 5802 §6 anti-downgrade flag) over TLS WITHOUT `-PLUS`; `n,,` when
+  unbound (plaintext / disabled); or a fail-closed `ChannelBindingRequired`
+  refusal under `channel_binding=require`. The chosen cbind-input is base64'd
+  into the client-final `c=` value, so the binding is cryptographically anchored
+  into the SCRAM proof (a MITM's different cert breaks the proof — a classified
+  `SignatureMismatch`). The policy is a `ChannelBindingMode` on `ConnectConfig`
+  (`Disable`/`Prefer`/`Require`, default `Prefer` — libpq parity; the
+  threat-scoped `SslMode` default already encrypts remote endpoints, so channel
+  binding is opt-in-strict to avoid breaking legacy PG / poolers without `-PLUS`),
+  settable via the builder `channel_binding(..)`, the DSN `channel_binding=` key,
+  or `PGCHANNELBINDING`. `Require` is the strict opt-in — a plaintext channel, or
+  a server without `-PLUS` (including a downgrade attacker who stripped it), is a
+  fail-closed `DriverError::Config` / `ChannelBindingRequired`, never a fallback.
+  Both the cert hash and the mechanism/cbind parse are TOTAL-function fuzzed
+  (`channel_binding_parse_paths_are_total`). Witnessed OFFLINE by the
+  `ScramServer` fake extended to offer `-PLUS` + verify the cbind data
+  (`bsql-postgres-proto`'s `engine_connect_spec` `scram_plus_*` /
+  `scram_require_*` / `scram_prefer_sends_y_flag_without_plus` — `-PLUS` actually
+  SELECTED not plain SCRAM, a binding MISMATCH fails, `require` refuses, `y,,`
+  anti-downgrade). The `-PLUS` LIVE witness needs a TLS-enabled SCRAM server (the
+  standard local PG has `ssl=off`, so it is not in the offline suite); it was
+  verified against an ephemeral SSL+SCRAM PostgreSQL (`require` over TLS AUTHs =
+  `-PLUS` used and the `tls-server-end-point` hash accepted by real PG; `require`
+  over a non-TLS server fails closed). Channel binding is entirely `scram`-gated;
+  the `next_event` hotpath is unaffected (SCRAM is the connecting phase).
 - The whole MD5-password authentication capability
   (`AuthenticationMD5Password`, sub-code 5) is behind the default-on `md5-auth`
   feature (proto → core → drivers → umbrella; each shipped dependent takes proto
