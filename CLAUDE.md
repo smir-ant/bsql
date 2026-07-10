@@ -47,13 +47,13 @@ crates/
   bsql/              — umbrella facade + query! re-export + #[bsql::test] harness (bsql::pg, ::pg_sync, ::sqlite)  — 947 LoC
   postgres/
     proto/           — sans-IO wire protocol + session engine (no_std + alloc) + PGCOPY binary framing + TypedCopyIn  — 29678 LoC
-    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + N+1 detector + SafeIdent guard + cancel key/redial + copy_in_typed + dynamic prepared-statement cache  — 11256 LoC
-    async/           — tokio async driver (plugs its socket into the shared Core<S>) + CancelToken  — 2549 LoC
-    sync/            — std::net blocking driver (plugs its socket into the shared Core<S>) + CancelToken  — 2480 LoC
+    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + N+1 detector + SafeIdent guard + cancel key/redial + copy_in_typed + dynamic prepared-statement cache + migration runner  — 12281 LoC
+    async/           — tokio async driver (plugs its socket into the shared Core<S>) + CancelToken + migration-runner try-lock poll  — 2651 LoC
+    sync/            — std::net blocking driver (plugs its socket into the shared Core<S>) + CancelToken + migration-runner try-lock poll  — 2558 LoC
   sqlite/
-    driver/          — embedded SQLite driver (bundled rusqlite) + typed query! runtime + explicit prepared-statement handles + interrupt CancelToken + N+1 detector  — 3914 LoC
+    driver/          — embedded SQLite driver (bundled rusqlite) + typed query! runtime + explicit prepared-statement handles + interrupt CancelToken + N+1 detector + migration runner  — 4656 LoC
   testkit/           — deterministic in-memory fake PostgreSQL for driver tests (no network)  — 1005 LoC
-  build/             — BUILD-DEP: migration DDL → schema catalog (+ SQLite template) + shared $N→?N placeholder authority  — 35036 LoC
+  build/             — BUILD-DEP: migration DDL → schema catalog (+ SQLite template) + shared $N→?N placeholder authority + migration embed (emit_migrations)  — 36279 LoC
   query-macros/      — PROC-MACRO: query! + copy! (types/validates against the catalog; emits the PostgreSQL + SQLite typed bridges) + #[bsql::test] (schema-per-test wrapper)  — 2507 LoC
 ```
 
@@ -81,6 +81,11 @@ cargo test -p bsql-sqlite --test cancel              # SQLite interrupt witness 
 cargo test -p bsql-query-sqlite-fixture --features n1-detect --test n1_detect_sqlite  # SQLite N+1 witness (in-process)
 cargo test -p bsql-query-fixture --test query_live_async -- --ignored  # live query! (async, needs PG)
 cargo test -p bsql-query-fixture --test query_live_sync  -- --ignored  # live query! (sync, needs PG)
+cargo test -p bsql-sqlite --test migrate                # migration runner (in-process, no PG)
+cargo test -p bsql-postgres-sync  --test migrate_live -- --ignored  # migration runner (sync PG, incl. concurrency + CONCURRENTLY)
+cargo test -p bsql-postgres-async --test migrate_live -- --ignored  # migration runner (async PG try-lock poll)
+cargo test -p bsql-query-fixture  --test embed_migrations_live      # embed baked-set shape (offline)
+cargo test -p bsql-query-fixture  --test embed_migrations_live -- --ignored  # embedded set applies live (needs PG)
 cargo test -p bsql-query-fixture --test copy_typed_offline             # copy! macro expansion + row shape (offline)
 cargo test -p bsql-query-fixture --test copy_typed_live_async -- --ignored  # live copy_in_typed (async, needs PG)
 cargo test -p bsql-query-fixture --test copy_typed_live_sync  -- --ignored  # live copy_in_typed (sync, needs PG)
@@ -309,6 +314,86 @@ reshape); the tracker is a self-contained COPY (a `bsql-postgres-core` dependenc
 would drag the whole PG + rustls tree into the embedded crate), so it adds no
 external dependency. Witnessed by `tools/query_sqlite_fixture`'s `n1-detect`
 feature + `tests/n1_detect_sqlite.rs`.
+
+**Migration runner — `conn.run_migrations(source)`.** The one product gap
+between build-time schema validation and a live database: a runtime capability
+on all three drivers (async PG, sync PG, SQLite) that APPLIES a consumer's
+migration set. Always available (adds NO dependency — the checksum is dep-free
+FNV-1a-64, not `scram`-gated `sha2`). The PostgreSQL logic lives ONCE over the
+transport-generic `Core<S>` (so async/sync are a compiler guarantee); the SQLite
+runner is a self-contained twin over the SAME `MigrationSource` shape, ledger,
+checksum, drift classification, embed slice, and `run_migrations` /
+`migration_status` / `dry_run_migrations` verbs (its pure logic a COPY, like the
+N+1 detector — the embedded crate depends on no `bsql-postgres-core`; the offline
+tests pin both copies to the SAME known-answer checksum vector). **Correctness:**
+(a) EXACTLY ONCE, in the SAME lexicographic-by-name order the build-time catalog
+replay uses — ONE genuine ordering authority: the build's `scan_sql_tree` sorts
+by the SAME `/`-normalized relative-name STRING key the runner sorts by (NOT the
+raw `PathBuf`, whose component-wise `Ord` disagrees with a byte-wise name compare
+at the `.`/`/` boundary for nested prefix collisions — `[a/b.sql, a.sql]` vs
+`[a.sql, a/b.sql]`), so build-validated order == apply order in every layout. A
+duplicate migration name (only reachable from a hand-built embedded slice — a
+directory walk yields unique paths) is a loud pre-flight
+`MigrationError::Source(DuplicateName)` on BOTH backends BEFORE any apply, never a
+silent skip of the second (SQLite would otherwise skip it via its ledger
+re-check; PG would fail on the ledger PK — now both fail loud identically);
+(b) each migration's DDL + its `_bsql_migrations` ledger row are ONE transaction
+(PostgreSQL DDL is transactional; SQLite too) — a migration that fails ROLLS BACK
+and the runner STOPS with a classified `MigrationError::MigrationFailed` naming
+it, later migrations untouched; (c) checksum DRIFT (an edited applied migration),
+a reorder / insert-before, and a deleted-from-source applied migration are each a
+classified `MigrationError::Drift` — never silently re-run or ignored. The
+checksum is EXACT-BYTES, so a git `autocrlf` checkout (CRLF line endings)
+re-checked against a ledger recorded from an LF apply spuriously drifts (the SAFE
+direction — a false drift error, never a silent mis-apply — but pin line endings
+in `.gitattributes` to avoid the surprise); (d)
+CONCURRENCY: two instances booting together SERIALIZE. PostgreSQL uses a
+NON-BLOCKING `pg_try_advisory_lock` POLL with client-side backoff (the sleep is
+the one inherently per-driver piece — `tokio::time::sleep` async, `thread::sleep`
+sync — sharing one `next_backoff` policy); this is DELIBERATE over a blocking
+`pg_advisory_lock`, which deadlocks against a `CREATE INDEX CONCURRENTLY`
+migration in the lock-holder (the blocked waiter's implicit-transaction vxid is
+exactly what the concurrent index build waits on — a real 40P01 the parallel live
+witness surfaced). SQLite serializes via `BEGIN IMMEDIATE` (write lock up front,
+so a concurrent runner's `BEGIN IMMEDIATE` waits on `busy_timeout`) plus an
+in-transaction ledger RE-CHECK that skips a migration a concurrent runner already
+applied. A stuck holder past `LOCK_ACQUIRE_TIMEOUT` (60 s) is the classified
+`MigrationError::LockTimeout`. The advisory lock is DB-GLOBAL (keyed on the
+ledger name), NOT schema-scoped — so parallel `#[bsql::test]` schemas each
+running migrations serialize on the one lock (correctness-preserving, just
+serialized; migrations are a rare boot-time op). **Non-transactional
+migrations:** a `-- bsql:no-transaction` comment line makes the runner apply a
+migration OUTSIDE a transaction (for `CREATE INDEX CONCURRENTLY` etc.), with a
+documented WEAKER guarantee (a crash between the DDL commit and the ledger insert
+leaves it applied-but-unrecorded → a re-run RE-APPLIES it, so write such a
+migration idempotently: `CREATE INDEX CONCURRENTLY IF NOT EXISTS`); the SAME
+statement WITHOUT the marker is wrapped in `BEGIN`, so PostgreSQL rejects it
+LOUDLY — the runner never silently breaks atomicity. **Embed vs directory:** the
+set is either baked into the binary (`bsql::embed_migrations!()`, generated by
+`bsql_build::emit_migrations(dir)` via `include_str!` + the
+`BSQL_EMBEDDED_MIGRATIONS` rustc-env channel — no filesystem at run time) or read
+from a runtime `MigrationSource::directory(path)` (the ops-friendly case). The
+EMBED path re-runs, per file in the SAME sqlparser AST pass, the S42
+destructive-acknowledgement gate (an unacknowledged `DROP TABLE` cannot ship
+baked into a binary — it fails the build there too, `reuse, never bypass`) AND a
+transaction-control reject (a top-level `BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`
+is a loud `BuildError::TransactionControlInMigration` — the runner owns the
+transaction boundary, so an embedded `COMMIT` that would break atomicity is a
+BUILD error; a `-- bsql:no-transaction` migration is NOT exempt, it runs as
+autocommit statements). The runtime directory source parses nothing, so both
+build-time gates are authorship guarantees honestly scoped to the embed. The
+`_bsql_migrations` identifier is a fixed compile-time literal (no injection
+surface); the migration NAME + checksum ride Bind PARAMETERS, never spliced. Runtime emission and the runner are ORTHOGONAL to `query!` — a
+runner-only consumer needs no catalog. Witnessed by
+`crates/sqlite/driver/tests/migrate.rs` (in-process: order, idempotent re-run,
+drift, fail-stop, status/dry-run, directory source, no-transaction, two
+concurrent runners over one FILE), `crates/postgres/{sync,async}/tests/migrate_live.rs`
+(`--ignored`, per-test isolated schemas: the same set PLUS `CREATE INDEX
+CONCURRENTLY` via the marker AND its fail-loud counterpart AND the advisory-lock
+concurrency, all green in PARALLEL — the deadlock repro), and
+`tools/query_fixture`'s `runner_migrations/` + `tests/embed_migrations_live.rs`
+(the build.rs `emit_migrations` embed chain, including an acked-destructive
+migration that applies live).
 
 The `deps_pin` gate (`tools/devgates/tests/deps_pin.rs`) pins the resolved
 dependency set (parsed from `Cargo.lock`) to a committed golden, and bans any

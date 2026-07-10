@@ -11,5 +11,11 @@
 //! Any error is propagated (fail the build) — never swallowed.
 
 fn main() -> Result<(), bsql_build::BuildError> {
-    bsql_build::emit_catalog("migrations")
+    bsql_build::emit_catalog("migrations")?;
+    // Bake the (separate, self-contained) runner migration set for the embedded
+    // migration-runner witness. This re-runs the SAME destructive-ack gate on
+    // `runner_migrations/` (its `0003_drop_scratch.sql` is acked — drop the
+    // marker and this build fails), and sets the `BSQL_EMBEDDED_MIGRATIONS`
+    // channel the `bsql::embed_migrations!()` macro reads.
+    bsql_build::emit_migrations("runner_migrations")
 }

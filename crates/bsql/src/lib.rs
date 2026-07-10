@@ -306,6 +306,44 @@ pub use backend::{RunsOn, SyncBackend, SyncQueries};
 pub use backend::SqliteTx;
 
 // ════════════════════════════════════════════════════════════════════
+// Migration runner — embed macro (any backend)
+// ════════════════════════════════════════════════════════════════════
+//
+// The migration RUNNER (`conn.run_migrations(..)`) is an always-available
+// capability on every driver (it adds NO dependency). It applies a consumer's
+// migration set to a live database, exactly once, in deterministic order, with
+// a ledger + checksum-drift detection + a concurrency lock. See each backend's
+// `run_migrations` / `migration_status` / `dry_run_migrations` verbs and the
+// `MigrationSource` type (`bsql::pg::MigrationSource`, `bsql::sqlite::MigrationSource`).
+
+/// Expand to the `&'static [(&'static str, &'static str)]` of `(name, sql)`
+/// pairs the consumer's `build.rs` baked with `bsql_build::emit_migrations(..)`.
+///
+/// Hand the result to `conn.run_migrations(..)` for the EMBEDDED source (no
+/// filesystem at run time):
+///
+/// ```rust,ignore
+/// // build.rs:  bsql_build::emit_migrations("migrations")?;
+/// const MIGRATIONS: &[(&str, &str)] = bsql::embed_migrations!();
+/// let report = conn.run_migrations(MIGRATIONS)?;
+/// ```
+///
+/// It `include!`s the file the `emit_migrations` build step generated (via the
+/// `BSQL_EMBEDDED_MIGRATIONS` rustc-env channel). Invoking it WITHOUT that
+/// build step is a loud compile error naming the missing `build.rs` call —
+/// never a silent empty set.
+#[macro_export]
+macro_rules! embed_migrations {
+    () => {
+        include!(env!(
+            "BSQL_EMBEDDED_MIGRATIONS",
+            "bsql::embed_migrations!() requires a build.rs that calls \
+             bsql_build::emit_migrations(\"migrations\")"
+        ))
+    };
+}
+
+// ════════════════════════════════════════════════════════════════════
 // Compile-checked query API (feature `macros`)
 // ════════════════════════════════════════════════════════════════════
 //

@@ -91,6 +91,27 @@ so there is no per-call text/binary drift and no injection surface.
   `DROP SCHEMA … CASCADE`, `TRUNCATE`, or `DROP DATABASE` — is a **build
   error** unless a co-located `-- bsql:ack-destructive` comment
   acknowledges it, so accidental data loss is caught at compile time.
+- **Migration runner** — `conn.run_migrations(source)` applies your migration
+  set to a LIVE database, on all three drivers (async PG, sync PG, SQLite).
+  **Exactly once, in order** (the same lexicographic-by-name order the build-time
+  catalog replay uses), tracked in a `_bsql_migrations` ledger; a re-run is a
+  no-op. **Atomic per migration** (the DDL and its ledger row are one
+  transaction), and a migration that fails **rolls back and STOPS** the run with
+  a classified error naming it. An already-applied migration whose file **changed**
+  (checksum drift — exact-bytes, so pin line endings in `.gitattributes` to avoid a
+  spurious CRLF-vs-LF drift), or a migration inserted before / deleted from the
+  applied set, or a duplicate name, is a **classified error**, never silently
+  re-run or skipped. Concurrent runners **serialize** — PostgreSQL via a
+  non-blocking `pg_try_advisory_lock` poll (deadlock-free even with `CREATE INDEX
+  CONCURRENTLY` migrations), SQLite via `BEGIN IMMEDIATE` + an in-transaction
+  ledger re-check — so two instances booting together never double-apply. A
+  `-- bsql:no-transaction` migration runs outside a transaction (for `CREATE INDEX
+  CONCURRENTLY IF NOT EXISTS` etc.). The migration set is either EMBEDDED in the
+  binary (`bsql::embed_migrations!()`, baked by `bsql_build::emit_migrations` — the
+  destructive-ack gate above runs on it too, and a migration that manages its own
+  transaction (`BEGIN`/`COMMIT`) is a build error) or read from a runtime
+  DIRECTORY. `conn.migration_status(source)` and `conn.dry_run_migrations(source)`
+  report applied-vs-pending without applying anything.
 - **An in-memory fake PostgreSQL test kit** (`bsql-testkit`). A consumer
   tests real driver code — `query_sql` *and* the compile-checked `query!`
   flagship — against a deterministic in-memory fake, with no network and no
@@ -108,13 +129,12 @@ so there is no per-call text/binary drift and no injection surface.
 - **A safety floor enforced by the compiler**, not by convention (see
   [Safety floor](#safety-floor)).
 
-Not yet shipped (do not assume it exists): a live migration **runner**. The
-build-time schema validation and the destructive-migration acknowledgement gate
-ship, but there is no
-`bsql migrate` command that applies migrations to a running database. The
-macro validates against your migration **files**, not a live database — a
-schema change applied by hand in `psql` without a migration file is
-invisible by design (the committed migration set is the source of truth).
+A note on the guarantee boundary: the compile-checked `query!` macro validates
+against your migration **files**, not a live database — a schema change applied
+by hand in `psql` without a migration file is invisible to the macro by design
+(the committed migration set is the source of truth). The migration **runner**
+above applies that SAME committed set to the live database, so the files stay the
+one source of truth for both the compile-time types AND the applied schema.
 
 ## The one-crate consumer story
 
@@ -196,6 +216,41 @@ resolves the same row shape the lattice inferred. Enabling `macros-sqlite`
 gap — `emit` then cross-checks each `query!` against a real SQLite replay of
 the migrations at build time. The only cost is a second bundled-`rusqlite`
 build-dependency compile; a SQLite-targeting consumer should enable both.
+
+### Applying migrations
+
+Add `bsql_build::emit_migrations("migrations")` to your `build.rs` to bake the
+set into the binary, then apply it at startup:
+
+```rust
+// build.rs
+fn main() -> Result<(), bsql_build::BuildError> {
+    bsql_build::emit("migrations")?;             // query! catalog (if you use it)
+    bsql_build::emit_migrations("migrations")     // the embedded runner set
+}
+```
+
+```rust
+// startup — no filesystem access at run time
+const MIGRATIONS: &[(&str, &str)] = bsql::embed_migrations!();
+
+let report = conn.run_migrations(MIGRATIONS)?;    // exactly-once, in order
+println!("applied {} new migration(s)", report.applied.len());
+```
+
+Or read them from a runtime directory (the ops-friendly path):
+
+```rust
+use bsql::pg_sync::MigrationSource;
+conn.run_migrations(MigrationSource::directory("migrations"))?;
+// Inspect first, without applying:
+let status = conn.migration_status(MigrationSource::directory("migrations"))?;
+let pending = conn.dry_run_migrations(MigrationSource::directory("migrations"))?;
+```
+
+The runner reads identically on all three drivers (`bsql::pg`, `bsql::pg_sync`,
+`bsql::sqlite`). See the *Migration runner* bullet above for the full ledger /
+atomicity / drift / concurrency guarantees.
 
 ### Runtime queries
 
@@ -298,12 +353,12 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 2136** — every `#[test]` / `#[tokio::test]` attribute:
+- **Test functions: 2185** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
   ```
-- **`#[ignore]` live suites (need a running database): 241**:
+- **`#[ignore]` live suites (need a running database): 252**:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[ignore' | wc -l

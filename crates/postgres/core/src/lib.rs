@@ -65,6 +65,11 @@ pub mod driver;
 pub mod error;
 pub mod footprint;
 pub mod materialize;
+// The migration RUNNER: applies a consumer's migration set to a live database,
+// exactly once, in deterministic order, atomically per migration, with a ledger
+// + checksum-drift detection + a concurrency advisory lock. Defined once over
+// `Core<S>`, so both PostgreSQL drivers share it.
+pub mod migrate;
 // The per-connection N+1 query detector — a diagnostics-only, zero-cost-off
 // tracker. Compiled only under the `n1-detect` feature; a default build has no
 // tracker type, no field, and no query-path branch.
@@ -96,6 +101,10 @@ pub use config::{resolve_endpoint, validate_startup_params, ConnectConfig, Endpo
 pub use driver::{Core, PreparedStatement};
 pub use error::{ColumnError, DbError, DriverError};
 pub use materialize::{DbErrorSink, ResultCollector};
+pub use migrate::{
+    AppliedMigration, DriftKind, MigrationError, MigrationReport, MigrationSource,
+    MigrationSourceError, MigrationStatus, LEDGER_TABLE,
+};
 #[cfg(feature = "n1-detect")]
 pub use n1::{N1Report, N1Tracker};
 pub use notify::{capture_notify, NotificationLedger, TypedNotification};

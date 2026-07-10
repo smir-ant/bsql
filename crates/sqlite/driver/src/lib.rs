@@ -86,6 +86,11 @@ mod error;
 // the `n1-detect` feature; a default build has no tracker type and no field.
 #[cfg(feature = "n1-detect")]
 mod n1;
+// The migration RUNNER — the cross-backend twin of the PostgreSQL runner over
+// the SAME `MigrationSource` / ledger / checksum / drift contract. A
+// self-contained copy of the pure logic (the embedded crate depends on no
+// `bsql-postgres-core`), pinned to the SAME known-answer vector.
+mod migrate;
 mod typed;
 mod value;
 
@@ -96,6 +101,10 @@ pub use connection::{
     Transaction, TypedRows,
 };
 pub use error::SqliteError;
+pub use migrate::{
+    AppliedMigration, DriftKind, MigrationError, MigrationReport, MigrationSource,
+    MigrationSourceError, MigrationStatus, LEDGER_TABLE,
+};
 #[cfg(feature = "n1-detect")]
 pub use n1::{N1Report, N1Tracker};
 pub use typed::{ColumnSource, SqliteTypedQuery};

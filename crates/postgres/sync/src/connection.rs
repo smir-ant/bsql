@@ -46,8 +46,9 @@ use bsql_postgres_core::tls::Wire;
 #[cfg(feature = "tls")]
 use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
-    resolve_endpoint, validate_startup_params, ConnectConfig, DriverError, Endpoint, Notification,
-    QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
+    resolve_endpoint, validate_startup_params, ConnectConfig, DriverError, Endpoint,
+    MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification, QueryResult,
+    Redial, Row, Rows, SslMode, TypedNotification,
 };
 use bsql_postgres_proto::engine::{self, EngineError, SpuriousPending};
 use bsql_postgres_proto::params::ParamsWriter;
@@ -82,6 +83,19 @@ fn drive_sync<T>(driven: Driven<T>) -> Result<T, DriverError> {
     match driven {
         Ok(result) => result,
         Err(SpuriousPending) => Err(DriverError::SpuriousPending),
+    }
+}
+
+/// Collapse a single-poll drive of a migration-runner verb, whose error surface
+/// is [`MigrationError`] (not `DriverError`). A spurious `Pending` over the
+/// blocking socket is classified, never spun on.
+#[inline]
+fn drive_migration<T>(
+    driven: Result<Result<T, MigrationError>, SpuriousPending>,
+) -> Result<T, MigrationError> {
+    match driven {
+        Ok(result) => result,
+        Err(SpuriousPending) => Err(DriverError::SpuriousPending.into()),
     }
 }
 
@@ -714,6 +728,61 @@ impl Connection {
             #[cfg(feature = "n1-detect")]
             core::panic::Location::caller(),
         )))
+    }
+
+    // ── Migration runner ─────────────────────────────────────────────────────
+
+    /// Apply every pending migration from `source` to the database, exactly
+    /// once, in deterministic order — the runtime migration RUNNER. See
+    /// [`bsql_postgres_core::migrate`] for the ledger / atomicity /
+    /// checksum-drift / advisory-lock guarantees.
+    pub fn run_migrations<'a>(
+        &'a mut self,
+        source: impl Into<MigrationSource<'a>>,
+    ) -> Result<MigrationReport, MigrationError> {
+        use bsql_postgres_core::migrate;
+        let source = source.into();
+        // Acquire the migration lock by NON-BLOCKING poll with backoff (see the
+        // async driver): a waiter holds no long-lived transaction, so a
+        // `CREATE INDEX CONCURRENTLY` migration cannot deadlock against it.
+        let start = std::time::Instant::now();
+        let mut backoff = migrate::LOCK_POLL_INITIAL;
+        loop {
+            let got = drive_sync(engine::poll_once(self.core.try_acquire_migration_lock()))
+                .map_err(MigrationError::from)?;
+            if got {
+                break;
+            }
+            if start.elapsed() >= migrate::LOCK_ACQUIRE_TIMEOUT {
+                return Err(MigrationError::LockTimeout);
+            }
+            std::thread::sleep(backoff);
+            backoff = migrate::next_backoff(backoff);
+        }
+        // Lock held — apply, then ALWAYS release (best effort).
+        let result = drive_migration(engine::poll_once(self.core.apply_pending_locked(source)));
+        match drive_sync(engine::poll_once(self.core.release_migration_lock())) {
+            Ok(()) | Err(_) => {}
+        }
+        result
+    }
+
+    /// A read-only snapshot of applied vs pending migrations (no lock, no
+    /// apply).
+    pub fn migration_status<'a>(
+        &'a mut self,
+        source: impl Into<MigrationSource<'a>>,
+    ) -> Result<MigrationStatus, MigrationError> {
+        drive_migration(engine::poll_once(self.core.migration_status(source.into())))
+    }
+
+    /// Report which migrations WOULD be applied (running the same drift checks
+    /// as [`run_migrations`](Self::run_migrations)) without applying anything.
+    pub fn dry_run_migrations<'a>(
+        &'a mut self,
+        source: impl Into<MigrationSource<'a>>,
+    ) -> Result<Vec<String>, MigrationError> {
+        drive_migration(engine::poll_once(self.core.dry_run_migrations(source.into())))
     }
 
     // ── Transaction / session boundary primitives ───────────────────────────

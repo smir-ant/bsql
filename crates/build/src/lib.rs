@@ -132,6 +132,17 @@ pub const BRIDGES_FILE_NAME: &str = "bsql_type_bridges.txt";
 /// which case `query!` decodes into the dep-free native types.
 pub const BRIDGES_ENV_VAR: &str = "BSQL_TYPE_BRIDGES";
 
+/// The basename of the embedded-migrations source file written into `OUT_DIR`
+/// by [`emit_migrations`].
+pub const EMBEDDED_MIGRATIONS_FILE_NAME: &str = "bsql_embedded_migrations.rs";
+
+/// The environment variable, set via `cargo:rustc-env` by [`emit_migrations`],
+/// that carries the absolute path of the generated embedded-migrations source
+/// file. The `bsql::embed_migrations!()` macro `include!`s the path this
+/// variable names, so the migration name + SQL set is baked into the runtime
+/// binary with no filesystem dependency at run time.
+pub const EMBEDDED_MIGRATIONS_ENV_VAR: &str = "BSQL_EMBEDDED_MIGRATIONS";
+
 /// The basename of the user-defined-types file written into `OUT_DIR` alongside
 /// the catalog. Carries every `CREATE TYPE ... AS ENUM` (and, later, `DOMAIN` /
 /// composite) declared in the migrations, so the query proc-macro can generate
@@ -317,6 +328,22 @@ pub enum BuildError {
         /// The 1-based source line of the statement's first token.
         line: u64,
     },
+    /// A migration file (baked by [`emit_migrations`]) contains a top-level
+    /// transaction-control statement (`BEGIN` / `START TRANSACTION` / `COMMIT` /
+    /// `ROLLBACK` / `SAVEPOINT` / `RELEASE SAVEPOINT`). The RUNNER owns the
+    /// transaction boundary — it wraps each migration in its own transaction — so
+    /// a migration must not manage its own: an embedded `COMMIT` would leak the
+    /// preceding DDL before a later statement in the same file fails, breaking
+    /// atomicity and wedging a re-run. This is a BUILD error, never a runtime
+    /// atomicity break. (A `-- bsql:no-transaction` migration is NOT exempt: it
+    /// runs as one or more AUTOCOMMIT statements, so a `COMMIT`/`BEGIN` in it is
+    /// equally meaningless and rejected.)
+    TransactionControlInMigration {
+        /// The migration file containing the transaction-control statement.
+        file: PathBuf,
+        /// The offending statement keyword (`BEGIN`, `COMMIT`, …).
+        statement: &'static str,
+    },
 }
 
 impl fmt::Debug for BuildError {
@@ -406,6 +433,19 @@ impl fmt::Display for BuildError {
                  The acknowledgement must directly precede THIS statement: one \
                  before another statement, or the marker text inside a string \
                  literal, does not count.",
+                file.display()
+            ),
+            BuildError::TransactionControlInMigration { file, statement } => write!(
+                f,
+                "bsql-build: migration {} contains a top-level `{statement}` \
+                 statement. The migration runner OWNS the transaction boundary \
+                 (it wraps each migration in its own transaction), so a migration \
+                 must not manage its own — an embedded `{statement}` would break \
+                 atomicity. Remove the transaction-control statement; if the \
+                 migration must run outside a transaction (e.g. `CREATE INDEX \
+                 CONCURRENTLY`), mark it with a `-- bsql:no-transaction` comment \
+                 line instead (it then runs as autocommit statements, still \
+                 without any `BEGIN`/`COMMIT`).",
                 file.display()
             ),
         }
@@ -543,6 +583,154 @@ pub fn emit(migrations_dir: impl AsRef<Path>) -> Result<(), BuildError> {
     #[cfg(feature = "sqlite")]
     emit_sqlite_template(&migrations_dir)?;
     Ok(())
+}
+
+/// Bake the consumer's migration set (each migration's stable NAME + its SQL)
+/// into the runtime binary, for the runtime migration RUNNER
+/// (`conn.run_migrations(..)`).
+///
+/// Call this from a consumer's `build.rs` (in addition to, or instead of,
+/// [`emit`] — it is independent of the `query!` catalog):
+///
+/// ```no_run
+/// fn main() -> Result<(), bsql_build::BuildError> {
+///     bsql_build::emit("migrations")?;             // query! catalog (optional)
+///     bsql_build::emit_migrations("migrations")     // the embedded runner set
+/// }
+/// ```
+///
+/// The consumer then reaches the baked set with the `bsql::embed_migrations!()`
+/// macro, which expands to a `&'static [(&'static str, &'static str)]` of
+/// `(name, sql)` pairs and hands it to `conn.run_migrations(..)` — no
+/// filesystem access at run time.
+///
+/// It:
+///
+/// * walks the migrations tree ONCE using the SAME ordering authority as the
+///   catalog replay ([`scan_sql_tree`]), so the embedded set replays in the
+///   identical deterministic order (lexicographic by path);
+/// * emits `cargo:rerun-if-changed` for the directory (membership) and each
+///   file (content), so ADD / DELETE / EDIT of any migration re-bakes the set;
+/// * parses each migration and re-runs the destructive-migration
+///   acknowledgement gate ([`BuildError::UnackedDestructiveMigration`]) — the
+///   SAME gate the catalog replay enforces — so an unacknowledged `DROP TABLE`
+///   fails the build here too, never silently ships baked into a binary. (The
+///   embed gate does NOT require the DDL to be catalog-*modelable* — the runner
+///   applies raw SQL to a real database — only that it PARSES so the ack gate
+///   can classify it. A migration form `sqlparser` cannot parse is a loud
+///   [`BuildError::Parse`]; apply it via the runtime *directory* source, which
+///   parses nothing, instead.)
+/// * writes the generated source to `OUT_DIR` and sets the
+///   [`EMBEDDED_MIGRATIONS_ENV_VAR`] rustc-env channel the macro `include!`s.
+///
+/// The SQL bytes ride `include_str!` of each migration's absolute path (not an
+/// inlined string literal), so there is no escaping hazard and an EDIT to a
+/// migration is picked up on recompile.
+///
+/// Returns `Err` (failing the build) on any I/O, parse, or unacknowledged
+/// destructive-migration error.
+pub fn emit_migrations(migrations_dir: impl AsRef<Path>) -> Result<(), BuildError> {
+    let manifest = env_path("CARGO_MANIFEST_DIR")?;
+    let dir = manifest.join(migrations_dir.as_ref());
+
+    // ONE walk — the SAME ordering authority the catalog replay uses, so the
+    // embedded set's order is identical to the build-validated catalog order.
+    let walk = scan_sql_tree(&dir)?;
+
+    // Membership + content tracking: ADD / DELETE (directory mtime) and EDIT
+    // (per-file content) both re-bake the embedded set.
+    emit_rerun_directives(&walk);
+
+    let mut generated = String::from("&[\n");
+    for file in &walk.files {
+        let sql = std::fs::read_to_string(file).map_err(|source| BuildError::ReadFile {
+            path: file.clone(),
+            source,
+        })?;
+
+        // Re-run the destructive-acknowledgement gate on the SAME parsed
+        // statements the catalog replay checks — the embed cannot bypass S42.
+        parse_and_enforce_acks(file, &sql)?;
+
+        let name = migration_name(&dir, file)?;
+        let abs = file.to_str().ok_or_else(|| BuildError::Parse {
+            path: file.clone(),
+            message: "migration path is not valid UTF-8".to_owned(),
+        })?;
+        // `{:?}` renders a VALID Rust string literal (escapes quotes /
+        // backslashes / control bytes) — no hand-rolled escaping.
+        generated.push_str(&format!("    ({name:?}, include_str!({abs:?})),\n"));
+    }
+    generated.push_str("]\n");
+
+    let out_dir = env_path("OUT_DIR")?;
+    let path = out_dir.join(EMBEDDED_MIGRATIONS_FILE_NAME);
+    std::fs::write(&path, generated).map_err(|source| BuildError::WriteCatalog {
+        path: path.clone(),
+        source,
+    })?;
+    println!("cargo:rustc-env={EMBEDDED_MIGRATIONS_ENV_VAR}={}", path.display());
+    Ok(())
+}
+
+/// Parse one migration file and run the destructive-acknowledgement gate on it
+/// — the embed-time reuse of the SAME S42 gate the catalog replay enforces, so
+/// an unacknowledged destructive migration cannot ship baked into a binary.
+/// (Modelability is NOT required — the runner applies raw SQL — only that the
+/// file PARSES so the gate can classify it.)
+fn parse_and_enforce_acks(file: &Path, sql: &str) -> Result<(), BuildError> {
+    let dialect = PostgreSqlDialect {};
+    let statements = Parser::parse_sql(&dialect, sql).map_err(|err| BuildError::Parse {
+        path: file.to_path_buf(),
+        message: err.to_string(),
+    })?;
+    enforce_destructive_acks(file, sql, &statements)?;
+    // The runner owns the transaction boundary; a migration must not contain its
+    // own BEGIN/COMMIT/ROLLBACK/SAVEPOINT (which would break per-migration
+    // atomicity). Reject in the SAME AST pass as the ack gate.
+    for statement in &statements {
+        if let Some(keyword) = transaction_control_statement(statement) {
+            return Err(BuildError::TransactionControlInMigration {
+                file: file.to_path_buf(),
+                statement: keyword,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Classify a top-level transaction-control statement, returning its keyword, or
+/// `None` for any other statement. The runner manages transactions itself, so a
+/// migration containing one of these is a build error (see
+/// [`BuildError::TransactionControlInMigration`]).
+fn transaction_control_statement(statement: &Statement) -> Option<&'static str> {
+    match statement {
+        Statement::StartTransaction { .. } => Some("BEGIN"),
+        Statement::Commit { .. } => Some("COMMIT"),
+        Statement::Rollback { .. } => Some("ROLLBACK"),
+        Statement::Savepoint { .. } => Some("SAVEPOINT"),
+        Statement::ReleaseSavepoint { .. } => Some("RELEASE SAVEPOINT"),
+        _ => None,
+    }
+}
+
+/// The stable migration NAME for a walked file: its path relative to the
+/// migrations directory, with `/` separators regardless of host OS, so the
+/// baked name matches the runtime directory walk's name for the SAME file on
+/// every platform. This name is the ledger's primary key.
+fn migration_name(dir: &Path, file: &Path) -> Result<String, BuildError> {
+    // Every walked file is under `dir` (the walk builds paths by joining `dir`),
+    // so `strip_prefix` succeeds; the `Err` arm degrades to the full path rather
+    // than fabricating, keeping the function total.
+    let rel = match file.strip_prefix(dir) {
+        Ok(r) => r,
+        Err(_) => file,
+    };
+    let text = rel.to_str().ok_or_else(|| BuildError::Parse {
+        path: file.to_path_buf(),
+        message: "migration path is not valid UTF-8".to_owned(),
+    })?;
+    Ok(text.replace(std::path::MAIN_SEPARATOR, "/"))
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1474,20 +1662,43 @@ struct Walk {
 }
 
 /// Walk the migrations tree rooted at `dir`, returning every `*.sql` file
-/// (at any depth, sorted by full path) and every directory visited.
+/// (at any depth, in the runner's replay order) and every directory visited.
 ///
 /// Recursion (rather than rejecting subdirectories) is deliberate:
 /// partitioned migration layouts (e.g. `migrations/2026/0001.sql`) are a
-/// legitimate convention, so they must be picked up, not refused. Files
-/// are sorted by full path AFTER the walk so the replay sequence is
-/// deterministic regardless of the order the filesystem yields entries.
+/// legitimate convention, so they must be picked up, not refused. Files are
+/// sorted AFTER the walk so the replay sequence is deterministic regardless of
+/// the order the filesystem yields entries.
+///
+/// The sort key is the RELATIVE-NAME string ([`migration_sort_key`]) — the SAME
+/// string the runtime runner sorts by (`migration_name`), NOT the raw `PathBuf`.
+/// A `PathBuf`'s component-wise `Ord` disagrees with a byte-wise name compare at
+/// the `.` (0x2E) / `/` (0x2F) boundary for nested prefix collisions (e.g. build
+/// would order `[a/b.sql, a.sql]`, the runner `[a.sql, a/b.sql]`), so a naive
+/// `PathBuf` sort would make the build-validated catalog order DIVERGE from the
+/// runtime apply order in nested layouts. Sorting by the runner's key here makes
+/// them ONE authority: what the catalog type-checks in order is what the runner
+/// applies in order.
 fn scan_sql_tree(dir: &Path) -> Result<Walk, BuildError> {
     let mut walk = Walk::default();
     descend(dir, &mut walk)?;
-    // Sort the accumulated files once, by full path, so the whole tree
-    // replays in a single global lexicographic order across all depths.
-    walk.files.sort();
+    walk.files
+        .sort_by_cached_key(|file| migration_sort_key(dir, file));
     Ok(walk)
+}
+
+/// The runner's replay-ordering key for a walked file: its `/`-normalized path
+/// relative to the migrations root — the string form [`migration_name`]
+/// produces, so the build sort agrees byte-for-byte with the runtime apply
+/// order. Total (lossy on the pathological non-UTF-8 path, which
+/// [`migration_name`] rejects at emit time anyway; for every UTF-8 path — the
+/// only kind that reaches the runner — it is identical to `migration_name`).
+fn migration_sort_key(root: &Path, file: &Path) -> String {
+    let rel = match file.strip_prefix(root) {
+        Ok(r) => r,
+        Err(_) => file,
+    };
+    rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 /// Recursive worker for [`scan_sql_tree`]: records `dir`, then visits its
@@ -4269,6 +4480,102 @@ mod tests {
         // the `.txt` is not.
         assert_eq!(walk.files.len(), 3, "three sql files, the txt ignored");
         assert!(walk.files.windows(2).all(|w| w[0] <= w[1]), "sorted");
+    }
+
+    #[test]
+    fn build_sort_agrees_with_the_runner_at_the_dot_slash_boundary() {
+        // A nested prefix collision: `a.sql` and `a/b.sql`. A raw `PathBuf` sort
+        // orders these `[a/b.sql, a.sql]` (component-wise: "a" < "a.sql"), but the
+        // runtime runner sorts by the relative-name STRING — where `.` (0x2E)
+        // < `/` (0x2F) — giving `[a.sql, a/b.sql]`. The build must match the
+        // runner (ONE ordering authority), so `scan_sql_tree` yields the STRING
+        // order, and the build-validated catalog order == the apply order.
+        let tmp = TempDir::new("dotslash");
+        let root = &tmp.path;
+        std::fs::create_dir_all(root.join("a")).expect("subdir");
+        std::fs::write(root.join("a.sql"), "CREATE TABLE a_top (x int);").expect("w");
+        std::fs::write(root.join("a").join("b.sql"), "CREATE TABLE a_b (x int);").expect("w");
+
+        let walk = scan_sql_tree(root).expect("scan");
+        let build_order: Vec<String> = walk
+            .files
+            .iter()
+            .map(|f| migration_sort_key(root, f))
+            .collect();
+
+        // The runner's order: the relative names sorted as strings (byte-wise).
+        let mut runner_order = build_order.clone();
+        runner_order.sort();
+
+        assert_eq!(build_order, vec!["a.sql".to_owned(), "a/b.sql".to_owned()]);
+        assert_eq!(
+            build_order, runner_order,
+            "the build walk order must equal the runner's string-sorted order"
+        );
+    }
+
+    // ── embed migrations: the S42 ack gate rides emit_migrations ───────
+
+    #[test]
+    fn embed_ack_gate_rejects_an_unacknowledged_destructive_migration() {
+        // emit_migrations runs the SAME destructive-acknowledgement gate per
+        // file, so an unacknowledged DROP TABLE fails the build here too — it
+        // can never ship baked into a binary.
+        let err = parse_and_enforce_acks(Path::new("0009_drop.sql"), "DROP TABLE users;")
+            .expect_err("an unacked DROP TABLE must fail the embed");
+        assert!(
+            matches!(err, BuildError::UnackedDestructiveMigration { .. }),
+            "expected UnackedDestructiveMigration, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn embed_ack_gate_accepts_an_acknowledged_destructive_migration() {
+        parse_and_enforce_acks(
+            Path::new("0009_drop.sql"),
+            "-- bsql:ack-destructive\nDROP TABLE users;",
+        )
+        .expect("an acked DROP TABLE passes the embed gate");
+    }
+
+    #[test]
+    fn embed_rejects_a_top_level_transaction_control_statement() {
+        // The runner owns the transaction boundary; an embedded COMMIT would leak
+        // the CREATE before a later failure. It is a BUILD error.
+        for (sql, kw) in [
+            ("CREATE TABLE t (a int);\nCOMMIT;", "COMMIT"),
+            ("BEGIN;\nCREATE TABLE t (a int);", "BEGIN"),
+            ("CREATE TABLE t (a int);\nROLLBACK;", "ROLLBACK"),
+            ("SAVEPOINT s;\nCREATE TABLE t (a int);", "SAVEPOINT"),
+        ] {
+            let err = parse_and_enforce_acks(Path::new("m.sql"), sql)
+                .expect_err("transaction control must fail the embed");
+            assert!(
+                matches!(err, BuildError::TransactionControlInMigration { statement, .. } if statement == kw),
+                "expected TransactionControlInMigration({kw}), got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn embed_accepts_a_normal_migration_and_a_no_transaction_concurrently() {
+        // A normal migration and a `-- bsql:no-transaction` CREATE INDEX
+        // CONCURRENTLY (which the runner applies outside a transaction, WITHOUT a
+        // BEGIN/COMMIT) both pass the embed gate.
+        parse_and_enforce_acks(Path::new("0001.sql"), "CREATE TABLE t (a int)")
+            .expect("a normal migration passes");
+        parse_and_enforce_acks(
+            Path::new("0002.sql"),
+            "-- bsql:no-transaction\nCREATE INDEX CONCURRENTLY i ON t (a)",
+        )
+        .expect("a no-transaction CONCURRENTLY migration passes");
+    }
+
+    #[test]
+    fn embed_name_normalizes_separators_relative_to_the_dir() {
+        let dir = Path::new("/project/migrations");
+        let file = Path::new("/project/migrations/2026/0001_init.sql");
+        assert_eq!(migration_name(dir, file).expect("name"), "2026/0001_init.sql");
     }
 
     // ── catalog text round-trip (serialize -> parse_catalog) ───────────

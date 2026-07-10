@@ -588,7 +588,9 @@ impl<'r> ColumnSource<'r> for BorrowedRow<'r> {
 /// anyway. This mirrors the PostgreSQL drivers' prepared-statement reuse for the
 /// bounded verbs while keeping streaming on its fastest primitive.
 pub struct Connection {
-    inner: rusqlite::Connection,
+    // `pub(crate)` so the sibling `migrate` module can drive the ledger /
+    // `BEGIN IMMEDIATE` transactions directly over the raw handle.
+    pub(crate) inner: rusqlite::Connection,
     /// The diagnostics-only N+1 query detector. Present ONLY under the
     /// `n1-detect` feature — a default build has no such field, so the typed
     /// verbs stay byte-identical blocking `fn`s and the footprint is unchanged.

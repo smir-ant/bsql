@@ -48,8 +48,9 @@ use bsql_postgres_core::tls::Wire;
 #[cfg(feature = "tls")]
 use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
-    resolve_endpoint, validate_startup_params, ConnectConfig, DriverError, Endpoint, Notification,
-    QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
+    resolve_endpoint, validate_startup_params, ConnectConfig, DriverError, Endpoint,
+    MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification, QueryResult,
+    Redial, Row, Rows, SslMode, TypedNotification,
 };
 use bsql_postgres_proto::engine;
 use bsql_postgres_proto::params::ParamsWriter;
@@ -731,6 +732,58 @@ impl Connection {
     }
 
     // ── Transaction / session boundary primitives ───────────────────────────
+
+    /// Apply every pending migration from `source` to the database, exactly
+    /// once, in deterministic order — the runtime migration RUNNER. See
+    /// [`bsql_postgres_core::migrate`] for the ledger / atomicity /
+    /// checksum-drift / advisory-lock guarantees.
+    pub async fn run_migrations<'a>(
+        &'a mut self,
+        source: impl Into<MigrationSource<'a>>,
+    ) -> Result<MigrationReport, MigrationError> {
+        use bsql_postgres_core::migrate;
+        let source = source.into();
+        // Acquire the migration lock by NON-BLOCKING poll with backoff: a waiter
+        // holds no long-lived transaction, so a `CREATE INDEX CONCURRENTLY`
+        // migration in the lock-holder cannot deadlock against a waiter's vxid.
+        let start = std::time::Instant::now();
+        let mut backoff = migrate::LOCK_POLL_INITIAL;
+        loop {
+            if self.core.try_acquire_migration_lock().await.map_err(MigrationError::from)? {
+                break;
+            }
+            if start.elapsed() >= migrate::LOCK_ACQUIRE_TIMEOUT {
+                return Err(MigrationError::LockTimeout);
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = migrate::next_backoff(backoff);
+        }
+        // Lock held — apply, then ALWAYS release (best effort: on a healthy
+        // connection this succeeds; a dead one auto-releases at session end).
+        let result = self.core.apply_pending_locked(source).await;
+        match self.core.release_migration_lock().await {
+            Ok(()) | Err(_) => {}
+        }
+        result
+    }
+
+    /// A read-only snapshot of applied vs pending migrations (no lock, no
+    /// apply).
+    pub fn migration_status<'a>(
+        &'a mut self,
+        source: impl Into<MigrationSource<'a>>,
+    ) -> impl Future<Output = Result<MigrationStatus, MigrationError>> + 'a {
+        self.core.migration_status(source.into())
+    }
+
+    /// Report which migrations WOULD be applied (running the same drift checks
+    /// as [`run_migrations`](Self::run_migrations)) without applying anything.
+    pub fn dry_run_migrations<'a>(
+        &'a mut self,
+        source: impl Into<MigrationSource<'a>>,
+    ) -> impl Future<Output = Result<Vec<String>, MigrationError>> + 'a {
+        self.core.dry_run_migrations(source.into())
+    }
 
     /// `BEGIN` a transaction.
     pub fn begin(&mut self) -> impl Future<Output = Result<(), DriverError>> + '_ {
