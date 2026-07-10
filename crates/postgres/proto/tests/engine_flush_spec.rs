@@ -308,14 +308,6 @@ fn flush_classifies_an_over_accepting_transport_as_send_overrun() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn sendbuf_holds_its_pinned_footprint() {
-    // Mirrors the build-time `wire_pin!(SendBuf, size = 32, align = 8)` anchor
-    // in the engine source: a `Vec<u8>` (3 words) plus a `usize` cursor.
-    assert_eq!(core::mem::size_of::<SendBuf>(), 32);
-    assert_eq!(core::mem::align_of::<SendBuf>(), 8);
-}
-
-#[test]
 fn flush_future_is_send() {
     fn assert_send<T: Send>(_: &T) {}
     let mut sb = SendBuf::new();

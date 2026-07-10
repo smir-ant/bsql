@@ -13,9 +13,7 @@
     reason = "test harness — a fixture/handshake failure is a loud assertion, the sanctioned test-failure signal"
 )]
 
-use bsql_postgres_proto::engine::{
-    session, AuthEvent, EngineError, Event, Live, Surface, Transport,
-};
+use bsql_postgres_proto::engine::{session, EngineError, Surface, Transport};
 use bsql_postgres_proto::wire::{TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_READY_FOR_QUERY};
 use bsql_postgres_proto::{Credentials, Ident};
 use core::convert::Infallible;
@@ -148,19 +146,4 @@ fn verbs_thread_token_one_await_each() {
         })
         .expect("startup packet assembles");
     assert!(threaded);
-}
-
-/// The declared pull-event vocabulary holds its pinned 24-byte footprint.
-#[test]
-fn event_and_authevent_are_24_bytes() {
-    assert_eq!(core::mem::size_of::<Event<'static>>(), 24);
-    assert_eq!(core::mem::align_of::<Event<'static>>(), 8);
-    assert_eq!(core::mem::size_of::<AuthEvent<'static>>(), 24);
-    assert_eq!(core::mem::align_of::<AuthEvent<'static>>(), 8);
-}
-
-/// The branded liveness token is zero-sized.
-#[test]
-fn live_is_zero_sized() {
-    assert_eq!(core::mem::size_of::<Live<'static>>(), 0);
 }

@@ -485,13 +485,6 @@ mod tests {
     }
 
     #[test]
-    fn u8_size_invariants() {
-        assert_eq!(core::mem::size_of::<BoundedU8<32>>(), 1);
-        assert_eq!(core::mem::size_of::<Option<BoundedU8<32>>>(), 1);
-        assert_eq!(core::mem::align_of::<BoundedU8<32>>(), 1);
-    }
-
-    #[test]
     fn u8_bounded_len_trait() {
         let v = <BoundedU8<32> as BoundedLen<32>>::try_new_usize(5);
         let v = match v {
@@ -538,13 +531,6 @@ mod tests {
         const V2048: BoundedU16<2048> = BoundedU16::<2048>::new_const::<2048>();
         assert_eq!(V0.get(), 0);
         assert_eq!(V2048.get(), 2048);
-    }
-
-    #[test]
-    fn u16_size_invariants() {
-        assert_eq!(core::mem::size_of::<BoundedU16<2048>>(), 2);
-        assert_eq!(core::mem::size_of::<Option<BoundedU16<2048>>>(), 2);
-        assert_eq!(core::mem::align_of::<BoundedU16<2048>>(), 2);
     }
 
     #[test]

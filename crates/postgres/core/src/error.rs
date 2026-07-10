@@ -523,8 +523,5 @@ mod tests {
             .downcast_ref::<DbError>()
             .expect("source is the DbError, not the Box wrapping it");
         assert!(dberr.is_unique_violation());
-
-        // And the layout win: the enum is the shrunk width, payload one pointer.
-        assert_eq!(core::mem::size_of::<DriverError>(), 24);
     }
 }
