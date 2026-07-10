@@ -44,12 +44,12 @@
 //!   Row                         16      8   Arc pointer + u32 row index
 //!   ArenaSealError               1      1   2-variant seal-error enum
 //!   DriverError                 24      8   Db(Box<DbError>) boxed + payloads narrowed to <=16 B fat pointers
-//!   DbError                    120      8   5 String/Option<String> fields
+//!   DbError                    104      8   [u8;5] SQLSTATE + 4 String/Option<String> fields
 //!   ConnectConfig              152      8   host/user/db/password Strings + startup Vec + CA-roots Arc
 //!   SslMode                      1      1   3-variant enum
 //!   Notification                56      8   2 String + i32
 //!   RowSet                      16      8   Option<Arc<arena>> (niche) + u32 row count
-//!   QueryResult                 56      8   RowSet + String + Arc<[String]>
+//!   QueryResult                 72      8   RowSet + CommandTag (Copy) + Arc<[String]>
 //! ```
 //!
 //! Stable wire/error/state types — `bsql-postgres-proto` — carry their own

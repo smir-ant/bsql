@@ -5,6 +5,7 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use bsql_postgres_proto::command_tag::CommandTag;
 use bsql_postgres_proto::{Cell, DecodeError, TextFmt};
 
 use crate::error::ColumnError;
@@ -440,7 +441,18 @@ impl ArenaBuilder {
             self.width_mismatch = true;
         }
         self.cols_in_row = 0;
-        self.rows_finished = self.rows_finished.saturating_add(1);
+        // Guard the row COUNTER exactly like the byte/offset dimensions: a result
+        // past `u32::MAX` finished rows sets the sticky `overflow` flag so
+        // `finish()` fails loud with `TooLarge`, never a silent saturation that
+        // would freeze the count while `push_*` keeps appending slots — leaving
+        // `len()` under-reporting and the tail rows materialized-but-unaddressable.
+        // A NULL-heavy (zero-byte) row writes NO `data` bytes, so the offset guard
+        // alone would miss this — the counter needs its own loud guard, matching
+        // the SQLite arena's `end_row`.
+        match self.rows_finished.checked_add(1) {
+            Some(n) => self.rows_finished = n,
+            None => self.overflow = true,
+        }
     }
 
     /// Seal the arena into a [`RowSet`] — ONE shared `Arc` over the row bytes,
@@ -594,24 +606,53 @@ pub struct QueryResult {
     /// the eager-`Vec<Row>` shape cannot be reintroduced by a caller; the
     /// row accessors below are the sole entry.
     rows: RowSet,
-    /// The command tag (`"SELECT 5"`, `"INSERT 0 1"`, …); empty when none.
-    pub command_tag: String,
+    /// The typed command tag. Stored as the `Copy` [`CommandTag`] the engine
+    /// already parsed (`INSERT`/`UPDATE`/…/`SELECT` + a `u64` count, or a
+    /// freeform `Other`), NOT a heap `String` — so a dynamic result no longer
+    /// allocates a tag string it usually never reads, and the affected-row count
+    /// is a typed projection ([`affected`](Self::affected)) rather than a
+    /// re-parse of a string this driver just formatted. Private: read it through
+    /// [`command_tag`](Self::command_tag) / [`affected`](Self::affected).
+    command_tag: CommandTag,
     /// The result-column names, in column order.
     pub column_names: Arc<[String]>,
 }
 
 // Footprint pin: a `RowSet` (16 B: a niche-packed `Option<Arc>` + a `u32`) + a
-// String (3 words) + an Arc<[_]> (2 words, fat pointer) = 56 B, down from the
-// 64 B the old eager `Vec<Row>` field cost (a `RowSet` is 16 B vs a `Vec`'s 24).
-// A new field, or swapping a field to a wider owned type, shows up here.
-crate::footprint_pin!(QueryResult, size = 56, align = 8);
+// `CommandTag` (40 B: its widest `Other(BoundedStr<32>)` variant + disc/pad) + an
+// `Arc<[_]>` (2 words, fat pointer) = 72 B. Up 16 B from the former `String`-tag
+// 56 B — the deliberate trade for DELETING one heap allocation per dynamic result
+// (the `.to_string()` that formatted the tag whether or not the caller read it)
+// AND closing the `affected()` capability gap. The tag is `Copy` and never
+// per-row, so this is +16 B once per whole result, never per row. A new field, or
+// a wider owned type, shows up here.
+crate::footprint_pin!(QueryResult, size = 72, align = 8);
 
 impl QueryResult {
     /// Assemble a result from its sealed rows and metadata. The row-container
     /// field is private, so this is the sole constructor — a caller cannot
     /// splice in an eager `Vec<Row>`.
-    pub fn new(rows: RowSet, command_tag: String, column_names: Arc<[String]>) -> Self {
+    pub fn new(rows: RowSet, command_tag: CommandTag, column_names: Arc<[String]>) -> Self {
         Self { rows, command_tag, column_names }
+    }
+
+    /// The typed command tag for this result (`CommandTag::Select { rows }`,
+    /// `CommandTag::Insert { rows }`, …, or `CommandTag::Other` for a tagless /
+    /// freeform command). A `Copy` value — match on it, or render its wire text
+    /// with `to_string()`. No allocation.
+    #[must_use]
+    pub fn command_tag(&self) -> CommandTag {
+        self.command_tag
+    }
+
+    /// The affected-row count this command reported: the row count of an
+    /// `INSERT`/`UPDATE`/`DELETE`/`SELECT`/… tag, or `0` for a countless command
+    /// (DDL, transaction control). The dynamic-path peer of `Rows<Q>::affected`
+    /// — a typed projection of the command tag, never a string re-parse. No
+    /// allocation.
+    #[must_use]
+    pub fn affected(&self) -> u64 {
+        self.command_tag.rows_or_zero()
     }
 
     /// The number of result rows (no allocation — read from the arena's count).
@@ -988,7 +1029,7 @@ mod tests {
             Err(e) => panic!("unexpected seal error: {e}"),
         };
         let names: Arc<[String]> = vec!["name".to_string(), "age".to_string()].into();
-        let result = QueryResult::new(rows, "SELECT 1".to_string(), names);
+        let result = QueryResult::new(rows, CommandTag::Select { rows: 1 }, names);
 
         let row_ref = result.row(0).expect("row 0");
         // Each name resolves to its OWN column — "age" is col 1 (=30), not col 0.

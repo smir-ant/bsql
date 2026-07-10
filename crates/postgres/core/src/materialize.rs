@@ -22,6 +22,7 @@
 //! formats, and the cell bytes are copied verbatim into the arena — the typed
 //! `Row` accessors above interpret them.
 
+use bsql_postgres_proto::command_tag::CommandTag;
 use bsql_postgres_proto::engine::Surface;
 
 use crate::error::{DbError, DriverError};
@@ -49,20 +50,6 @@ impl DbErrorSink for ResultCollector {
     }
 }
 
-/// The fully materialised result of a row-collecting verb.
-#[derive(Debug)]
-pub struct CollectedResult {
-    /// The result rows as one lazily-addressed [`RowSet`] (empty for a command
-    /// that returns none) — one shared arena, `Row` handles minted on access.
-    pub rows: RowSet,
-    /// The command tag (`"SELECT 5"`, `"INSERT 0 1"`, …); empty when none.
-    pub command_tag: String,
-    /// The affected-row count from the command tag (0 for a countless command).
-    pub affected: u64,
-    /// The result-column names recovered from the `RowDescription`.
-    pub column_names: Vec<String>,
-}
-
 /// Accumulates a [`Surface`] stream into owned rows plus result metadata.
 ///
 /// Construct with [`new`](Self::new), feed every surface event with
@@ -76,8 +63,11 @@ pub struct ResultCollector {
     builder: Option<ArenaBuilder>,
     /// Reassembly buffer for an oversize row delivered as `RowChunk` pieces.
     chunk: Vec<u8>,
-    command_tag: String,
-    affected: u64,
+    /// The typed command tag captured at the delivery. Stored as the `Copy`
+    /// [`CommandTag`] the engine parsed — NOT a heap `String`, so a delivery
+    /// costs no tag allocation; the affected-row count is a typed projection of
+    /// it ([`affected`](Self::affected)), so no separate `affected` field.
+    command_tag: CommandTag,
     oids: Vec<u32>,
     column_names: Vec<String>,
     db_error: Option<DbError>,
@@ -115,18 +105,15 @@ impl ResultCollector {
                 self.chunk = body;
             }
             Surface::Deliver { tag, oids, names } => {
-                match tag {
-                    Some(t) => {
-                        self.command_tag = t.to_string();
-                        self.affected = t.rows_or_zero();
-                    }
+                // Store the `Copy` tag verbatim — no `to_string()` allocation.
+                // The affected-row count is a typed projection of it, read on
+                // demand via `affected()`.
+                self.command_tag = match tag {
+                    Some(t) => *t,
                     // A tagless boundary (the extended-protocol acks / a
-                    // `Describe` completion): no command tag, no row count.
-                    None => {
-                        self.command_tag = String::new();
-                        self.affected = 0;
-                    }
-                }
+                    // `Describe` completion): the empty tag, no row count.
+                    None => CommandTag::EMPTY,
+                };
                 // Reuse the `oids` Vec SPINE across a multi-statement batch's
                 // successive `Deliver`s: `clear` + `extend_from_slice` keeps the
                 // backing allocation instead of dropping it and allocating a
@@ -158,27 +145,25 @@ impl ResultCollector {
         }
     }
 
-    /// The command tag captured at the delivery (empty when none).
-    #[must_use]
-    pub fn command_tag(&self) -> &str {
-        &self.command_tag
-    }
-
-    /// Consume the collector, MOVING out the owned command-tag `String`.
+    /// Render the captured command tag into an owned `String` (its wire text,
+    /// `"SELECT 3"` / `"INSERT 0 1"` / …; empty when none).
     ///
-    /// For a caller that only needs the tag and drops the rest (the drivers'
-    /// `simple_query` returns it and discards the collector), this hands back the
-    /// already-owned `String` with no clone — one fewer allocation than
-    /// [`command_tag`](Self::command_tag)`().to_string()`.
+    /// The drivers' `simple_query` returns this and drops the rest. The tag is
+    /// stored as a `Copy` [`CommandTag`], so this allocates the string EXACTLY
+    /// ONCE — at the point a caller actually wants text — rather than on every
+    /// delivery; a row-returning verb that never asks for the text (it goes
+    /// through `finish` into a `QueryResult` that stores the `Copy` tag) pays no
+    /// tag allocation at all.
     #[must_use]
     pub fn into_command_tag(self) -> String {
-        self.command_tag
+        self.command_tag.to_string()
     }
 
-    /// The affected-row count captured at the delivery.
+    /// The affected-row count captured at the delivery — a typed projection of
+    /// the command tag (`0` for a countless command).
     #[must_use]
     pub fn affected(&self) -> u64 {
-        self.affected
+        self.command_tag.rows_or_zero()
     }
 
     /// The result-column type OIDs recovered at the delivery (empty when none).
@@ -193,7 +178,12 @@ impl ResultCollector {
         &self.column_names
     }
 
-    /// Seal the arena and produce the [`CollectedResult`].
+    /// Seal the arena and yield the row-collecting verb's result pieces: the
+    /// sealed [`RowSet`], the typed [`CommandTag`], and the result-column names —
+    /// exactly what [`QueryResult`](crate::QueryResult) is assembled from.
+    /// Consumes the collector; the affected-row count, when a caller needs it
+    /// instead of the rows, is read from [`affected`](Self::affected) BEFORE this
+    /// call.
     ///
     /// # Errors
     ///
@@ -202,7 +192,7 @@ impl ResultCollector {
     /// [`DriverError::MixedResultWidth`] if a multi-statement batch delivered
     /// rows of differing column counts (which the single arena's fixed stride
     /// cannot represent without mis-addressing cells).
-    pub fn finish(self) -> Result<CollectedResult, DriverError> {
+    pub fn finish(self) -> Result<(RowSet, CommandTag, Vec<String>), DriverError> {
         if let Some(e) = self.decode_error {
             return Err(e);
         }
@@ -212,12 +202,7 @@ impl ResultCollector {
             Some(b) => b.finish()?,
             None => RowSet::default(),
         };
-        Ok(CollectedResult {
-            rows,
-            command_tag: self.command_tag,
-            affected: self.affected,
-            column_names: self.column_names,
-        })
+        Ok((rows, self.command_tag, self.column_names))
     }
 
     /// Parse one whole `DataRow` body (`[i16 n_cols] [per col: i32 len] [bytes]`)
@@ -304,7 +289,11 @@ fn read_be_i32(buf: &[u8], cursor: &mut usize) -> Option<i32> {
 /// engine's lossy bounded-string handling), so a malformed field never aborts
 /// the whole error.
 pub fn parse_error_response(body: &[u8]) -> DbError {
-    let mut code = String::new();
+    // The SQLSTATE (`C`) is the ONLY field with a fixed shape (5 ASCII chars), so
+    // it lands in an inline `[u8; 5]` with no allocation; the human-readable
+    // fields stay owned `String`s. `[b' '; 5]` (space-padded) is the empty/absent
+    // code until a `C` field is seen.
+    let mut code = [b' '; 5];
     let mut severity: Option<String> = None;
     let mut message = String::new();
     let mut detail: Option<String> = None;
@@ -324,15 +313,17 @@ pub fn parse_error_response(body: &[u8]) -> DbError {
             Some(v) => v,
             None => break,
         };
-        let value = String::from_utf8_lossy(value_bytes).into_owned();
         match type_byte {
-            b'C' => code = value,
+            // The SQLSTATE narrows to 5 ASCII bytes with no allocation; a
+            // malformed (non-5-char / non-ASCII) wire code is padded/truncated,
+            // never a panic (the `decoder_fuzz` gate proves totality).
+            b'C' => code = crate::error::sqlstate_bytes(value_bytes),
             // PG sends `S` (localized) then `V` (non-localized, 9.6+); the later
             // `V` wins, keeping the stable non-localized severity.
-            b'S' | b'V' => severity = Some(value),
-            b'M' => message = value,
-            b'D' => detail = Some(value),
-            b'H' => hint = Some(value),
+            b'S' | b'V' => severity = Some(String::from_utf8_lossy(value_bytes).into_owned()),
+            b'M' => message = String::from_utf8_lossy(value_bytes).into_owned(),
+            b'D' => detail = Some(String::from_utf8_lossy(value_bytes).into_owned()),
+            b'H' => hint = Some(String::from_utf8_lossy(value_bytes).into_owned()),
             _ => {}
         }
         let next = match nul.checked_add(1) {
@@ -460,10 +451,10 @@ mod result_collector_width_tests {
         let mut c = ResultCollector::new();
         c.feed(Surface::Row(&row_body(&[b"1", b"one"])));
         c.feed(Surface::Row(&row_body(&[b"2", b"two"])));
-        let result = c.finish().expect("uniform-width rows seal cleanly");
-        assert_eq!(result.rows.len(), 2);
-        let r0 = result.rows.get(0).expect("row 0");
-        let r1 = result.rows.get(1).expect("row 1");
+        let (rows, _tag, _names) = c.finish().expect("uniform-width rows seal cleanly");
+        assert_eq!(rows.len(), 2);
+        let r0 = rows.get(0).expect("row 0");
+        let r1 = rows.get(1).expect("row 1");
         assert_eq!(r0.get_raw(0), Ok(Some(&b"1"[..])));
         assert_eq!(r0.get_raw(1), Ok(Some(&b"one"[..])));
         assert_eq!(r1.get_raw(0), Ok(Some(&b"2"[..])));

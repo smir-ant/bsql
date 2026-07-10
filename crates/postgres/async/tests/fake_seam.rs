@@ -103,7 +103,8 @@ async fn connect_and_query_over_the_fake_with_no_socket() {
     assert_eq!(result.len(), 2);
     assert_eq!(result.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
     assert_eq!(result.get(1).expect("row 1").get_i64(0), Ok(Some(2)));
-    assert_eq!(result.command_tag, "SELECT 2");
+    assert_eq!(result.command_tag().to_string(), "SELECT 2");
+    assert_eq!(result.affected(), 2);
 }
 
 #[tokio::test]

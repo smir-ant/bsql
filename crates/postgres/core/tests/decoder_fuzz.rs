@@ -46,7 +46,7 @@
 use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
 
-use bsql_postgres_core::materialize::parse_notification;
+use bsql_postgres_core::materialize::{parse_error_response, parse_notification};
 use bsql_postgres_proto::{
     BinaryFmt, Cell, Date, Interval, Json, Jsonb, Numeric, Time, Timestamp, Timestamptz, Uuid,
     parse_long_uint_swar, parse_pg_bool_swar, parse_short_uint_swar, validate_utf8_swar,
@@ -416,6 +416,17 @@ fn text_and_misc_decoders() -> Vec<NamedDecoder> {
         ("parse_pg_bool_swar", |b| parse_pg_bool_swar(b).is_some()),
         ("validate_utf8_swar", |b| validate_utf8_swar(b).is_some()),
         ("parse_notification", |b| parse_notification(b).is_ok()),
+        // `parse_error_response` turns UNTRUSTED server `ErrorResponse` bytes into
+        // a `DbError` INFALLIBLY — including the fixed 5-byte SQLSTATE narrow
+        // (`sqlstate_bytes`), which must stay total on a malformed (non-5-char /
+        // non-ASCII) wire code. Total-by-construction today (space-pad/truncate,
+        // no indexing/unwrap); fuzzing it pins that a future regression can never
+        // panic on a hostile server error frame. Always "succeeds" (no Result), so
+        // the tally records an `Ok` — the real assertion is that it never panics.
+        ("parse_error_response", |b| {
+            core::hint::black_box(&parse_error_response(b));
+            true
+        }),
         // The two `RowDescription` (`'T'`) parsers: both turn UNTRUSTED server
         // bytes into a Rust value (the OID/format schema, and the column names) —
         // reached in production by the active dispatch and the fused runtime-param

@@ -507,12 +507,12 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         collector: ResultCollector,
         names_override: Option<Arc<[String]>>,
     ) -> Result<QueryResult, DriverError> {
-        let collected = collector.finish()?;
+        let (rows, command_tag, names) = collector.finish()?;
         let column_names = match names_override {
             Some(names) => names,
-            None => Arc::from(collected.column_names.into_boxed_slice()),
+            None => Arc::from(names.into_boxed_slice()),
         };
-        Ok(QueryResult::new(collected.rows, collected.command_tag, column_names))
+        Ok(QueryResult::new(rows, command_tag, column_names))
     }
 
     // ── Runtime-SQL verbs ───────────────────────────────────────────────────

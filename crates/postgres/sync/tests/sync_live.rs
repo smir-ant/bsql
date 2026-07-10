@@ -112,7 +112,7 @@ fn cancel_token_stops_an_inflight_query_sync() {
         Err(bsql_postgres_sync::DriverError::Db(db)) => assert!(
             db.is_code("57014"),
             "a canceled query must be SQLSTATE 57014 query_canceled, got {}",
-            db.code
+            db.code()
         ),
         Ok(_) => panic!("pg_sleep(5) must be canceled, not run to completion"),
         Err(other) => panic!("cancel must surface as DriverError::Db(57014), got {other:?}"),
@@ -360,6 +360,25 @@ fn runtime_path_binds_non_copy_params() {
         .execute_params("SELECT $1::numeric", &(n2,))
         .expect("numeric param binds via execute_params");
     let _ = affected;
+
+    // WITNESS: `QueryResult::affected()` surfaces the affected-row count on the
+    // dynamic `query_params` result — the capability the `Copy` `CommandTag`
+    // closed. A non-RETURNING UPDATE yields zero rows but a non-zero count.
+    c.execute_sql("CREATE TEMP TABLE m1_aff (id int)").expect("temp table");
+    let inserted = c
+        .execute_sql("INSERT INTO m1_aff VALUES (1), (2), (3)")
+        .expect("seed rows");
+    assert_eq!(inserted, 3, "execute_sql reports the INSERT count");
+    let upd = c
+        .query_params("UPDATE m1_aff SET id = id + 10 WHERE id >= $1", &(2_i32,))
+        .expect("parameterized UPDATE");
+    assert_eq!(upd.affected(), 2, "query_params result exposes the UPDATE affected count");
+    assert_eq!(upd.len(), 0, "a non-RETURNING UPDATE yields no rows");
+    let sel = c
+        .query_params("SELECT id FROM m1_aff WHERE id >= $1", &(1_i32,))
+        .expect("parameterized SELECT");
+    assert_eq!(sel.affected(), 3, "a SELECT's affected() is its returned row count");
+    assert_eq!(sel.len(), 3);
 
     c.close().expect("close");
 }

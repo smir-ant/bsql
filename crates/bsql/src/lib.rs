@@ -223,7 +223,7 @@ use bsql_postgres_sync::DriverError as PgDriverError;
 impl BackendError for PgDriverError {
     fn sqlstate(&self) -> Option<&str> {
         match self {
-            PgDriverError::Db(e) => Some(e.code.as_str()),
+            PgDriverError::Db(e) => Some(e.code()),
             _ => None,
         }
     }

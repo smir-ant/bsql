@@ -74,7 +74,7 @@ mod sync_driver {
         // The client never checks — it is a classified server error (23514).
         match c.simple_query("INSERT INTO members (id, a) VALUES (3, 10)") {
             Err(DriverError::Db(e)) => assert_eq!(
-                e.code, "23514",
+                e.code(), "23514",
                 "an under-18 value is a server-side check_violation"
             ),
             other => panic!("expected a server check_violation, got: {other:?}"),
@@ -114,7 +114,7 @@ mod async_driver {
             .simple_query("INSERT INTO members (id, a) VALUES (2, 5)")
             .await
         {
-            Err(DriverError::Db(e)) => assert_eq!(e.code, "23514"),
+            Err(DriverError::Db(e)) => assert_eq!(e.code(), "23514"),
             other => panic!("expected a server check_violation (async), got: {other:?}"),
         }
 

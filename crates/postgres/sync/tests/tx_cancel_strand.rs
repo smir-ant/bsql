@@ -95,5 +95,5 @@ fn a_transaction_panicking_before_its_first_verb_leaves_no_armed_begin() {
         .expect("the reused connection must run a BARE verb, not a fused BEGIN");
     assert_eq!(result.len(), 1, "the bare SELECT returns its one row");
     assert_eq!(result.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
-    assert_eq!(result.command_tag, "SELECT 1");
+    assert_eq!(result.command_tag().to_string(), "SELECT 1");
 }

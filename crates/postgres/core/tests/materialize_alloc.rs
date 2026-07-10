@@ -14,8 +14,9 @@
 //! - **`reset_session`** — the driver runs the exact 7-statement idle `RESET`
 //!   batch (`SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; UNLISTEN
 //!   *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES`) via
-//!   `simple_query`, then returns `into_command_tag()` (moving the owned tag
-//!   out, no clone). The gate scripts the real reply — six tag-only completions
+//!   `simple_query`, then returns `into_command_tag()` (rendering the `Copy`
+//!   command tag to a `String` ONCE, at the return — the collector stores no tag
+//!   `String` per statement). The gate scripts the real reply — six tag-only completions
 //!   PLUS the row-returning `pg_advisory_unlock_all` (a `RowDescription` +
 //!   `DataRow`, surfacing as a `Deliver` with non-empty oids/names AND a
 //!   `Surface::Row`) — and ends with the same trailing `into_command_tag()`.
@@ -221,22 +222,28 @@ fn no_op_sink<'s>(
 /// path — fresh `ResultCollector`, `feed` over a 3-row result, then the full
 /// `build_query_result` finalization (`finish` into the lazy [`RowSet`] PLUS the
 /// `Arc::from(column_names.into_boxed_slice())` and `QueryResult` construction).
-/// Currently **20**: the collector's per-call vectors + a `String` per row cell
-/// and command tag + the arena `finish` (the ONE shared `Arc`), plus the
-/// column-names `Arc` allocation.
+/// Currently **19**: the collector's per-call vectors + the arena `finish` (the
+/// ONE shared `Arc`) + the column-names `Arc` allocation. The command tag now
+/// rides the result as a `Copy` `CommandTag` (no `String`), so this path no
+/// longer allocates a tag string a dynamic caller usually never reads.
 ///
 /// History: **21 → 20** when `finish` stopped eagerly building a `Vec<Row>` of N
 /// handles and now seals into a [`RowSet`] (one `Arc`, handles minted lazily on
 /// access) — the `16·N`-byte handle `Vec` is no longer allocated at all, and a
-/// single-row read clones the `Arc` once instead of N times. The remaining
-/// per-call prebuffer cost a later slice (a pooled/reused collector) would trim.
-const EAGER_QUERY_ALLOC_PIN: usize = 20;
+/// single-row read clones the `Arc` once instead of N times. **20 → 19** when
+/// `QueryResult.command_tag` became the `Copy` `CommandTag` instead of a heap
+/// `String`, deleting the per-result `t.to_string()` (and adding an `affected()`
+/// accessor). The remaining per-call prebuffer cost a later slice (a
+/// pooled/reused collector) would trim.
+const EAGER_QUERY_ALLOC_PIN: usize = 19;
 
 /// PINNED baseline: allocations charged to the WHOLE warm `reset_session()`
 /// round-trip — a fresh `ResultCollector` over the LITERAL 7-statement idle
 /// `RESET` reply, ending with the trailing `into_command_tag()` `simple_query`
-/// returns. Currently **21**: one command-tag `String` per statement (7 — the
-/// last MOVED out, not cloned), plus the row-returning `SELECT
+/// returns. Currently **15**: the collector now stores the `Copy` `CommandTag`
+/// (no per-statement tag `String`), so the ONLY tag allocation is the SINGLE
+/// `into_command_tag()` at the end that renders the last tag to a `String` for
+/// `simple_query`'s return — plus the row-returning `SELECT
 /// pg_advisory_unlock_all()`'s `Surface::Row` `ArenaBuilder`/value push and the
 /// ONE `oids`/`names` allocation its delivery needs. The pool pays this per
 /// re-acquire. History: 24 -> 23 when `simple_query` moved the tag out instead
@@ -244,9 +251,12 @@ const EAGER_QUERY_ALLOC_PIN: usize = 20;
 /// (`clear` + `extend_from_slice`) instead of a fresh `to_vec()` per `Deliver` —
 /// the `pg_advisory_unlock_all` OIDs stay cached and ride three `Deliver`s in
 /// this batch, so the old code allocated three OID Vecs where one reused buffer
-/// now suffices (-2). (The in-transaction `ROLLBACK`-prefixed variant is one
-/// statement longer — the idle path modelled here is the pooled steady state.)
-const RESET_ALLOC_PIN: usize = 21;
+/// now suffices (-2). **21 -> 15** when the command tag became a `Copy`
+/// `CommandTag`: the 7 per-statement `t.to_string()` allocations vanish from the
+/// feed, leaving one lazy render at the return (-7 feed, +1 render = -6). (The
+/// in-transaction `ROLLBACK`-prefixed variant is one statement longer — the idle
+/// path modelled here is the pooled steady state.)
+const RESET_ALLOC_PIN: usize = 15;
 
 #[test]
 fn eager_query_and_reset_prebuffer_allocs_are_pinned() {
@@ -316,10 +326,10 @@ fn run_query<'b>(
         other => panic!("query must complete, got {other:?}"),
     };
     // ── the literal body of Connection::build_query_result(collector, None) ──
-    let collected = collector.finish().expect("materialise owned rows");
-    assert_eq!(collected.rows.len(), QUERY_ROWS, "all rows sealed into the RowSet");
-    let column_names: Arc<[String]> = Arc::from(collected.column_names.into_boxed_slice());
-    let result = QueryResult::new(collected.rows, collected.command_tag, column_names);
+    let (rows, command_tag, names) = collector.finish().expect("materialise owned rows");
+    assert_eq!(rows.len(), QUERY_ROWS, "all rows sealed into the RowSet");
+    let column_names: Arc<[String]> = Arc::from(names.into_boxed_slice());
+    let result = QueryResult::new(rows, command_tag, column_names);
     // The result is lazy: no eager `Vec<Row>` was built, yet every row is still
     // reachable (and identical) through the on-demand accessors.
     assert_eq!(result.len(), QUERY_ROWS);
@@ -342,8 +352,9 @@ fn run_reset<'b>(
         Ok(Ok(Outcome { live, .. })) => live,
         other => panic!("reset must complete, got {other:?}"),
     };
-    // simple_query returns `Ok(collector.into_command_tag())` — it MOVES the
-    // already-owned tag out (no clone). reset_session discards it via `?`.
+    // simple_query returns `Ok(collector.into_command_tag())` — it renders the
+    // `Copy` command tag to a `String` here (the collector stored no tag
+    // `String`). reset_session discards it via `?`.
     core::hint::black_box(collector.into_command_tag());
     live
 }

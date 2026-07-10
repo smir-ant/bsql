@@ -19,13 +19,13 @@ use bsql::BackendError;
 /// classification mapping without a live server. Not a `#[test]` fn, but it only
 /// constructs values (no `unwrap`/`expect`/`panic`), so the floor is satisfied.
 fn pg_db_error(code: &str) -> bsql::pg::DriverError {
-    bsql::pg::DriverError::from(bsql::pg::DbError {
-        code: code.to_string(),
-        severity: Some("ERROR".to_string()),
-        message: "synthetic classification fixture".to_string(),
-        detail: None,
-        hint: None,
-    })
+    bsql::pg::DriverError::from(bsql::pg::DbError::new(
+        code,
+        Some("ERROR".to_string()),
+        "synthetic classification fixture".to_string(),
+        None,
+        None,
+    ))
 }
 
 #[test]

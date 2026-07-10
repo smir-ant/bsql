@@ -95,13 +95,19 @@ pub use cancel::{CancelKey, Redial};
 pub use config::{resolve_endpoint, validate_startup_params, ConnectConfig, Endpoint, SslMode};
 pub use driver::{Core, PreparedStatement};
 pub use error::{ColumnError, DbError, DriverError};
-pub use materialize::{CollectedResult, DbErrorSink, ResultCollector};
+pub use materialize::{DbErrorSink, ResultCollector};
 #[cfg(feature = "n1-detect")]
 pub use n1::{N1Report, N1Tracker};
 pub use notify::{capture_notify, NotificationLedger, TypedNotification};
 pub use sql_ident::{SafeIdent, SafeTable};
 pub use typed_rows::{Rows, RowsBuilder};
 pub use types::{ArenaBuilder, ArenaSealError, Notification, QueryResult, Row, RowRef, RowSet};
+
+/// The typed `CommandComplete` tag ([`QueryResult::command_tag`]'s type — a
+/// `Copy` enum a consumer matches on, e.g. `CommandTag::Insert { rows }`, rather
+/// than substring-parsing a string). Re-exported so a consumer can name the tag
+/// type without a direct proto dep.
+pub use bsql_postgres_proto::command_tag::CommandTag;
 
 /// The sealed parameter-encoding contract every `*_params` / typed verb takes
 /// (`&(a, b)` tuples up to arity 16). Re-exported so a consumer can write a

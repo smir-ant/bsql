@@ -61,8 +61,8 @@ mod pool;
 mod transport;
 
 pub use bsql_postgres_core::{
-    ColumnError, ConnectConfig, DbError, DriverError, Notification, ParamsWriter, QueryResult,
-    Row, RowRef, Rows, SafeIdent, SafeTable, SslMode, TypedNotification,
+    ColumnError, CommandTag, ConnectConfig, DbError, DriverError, Notification, ParamsWriter,
+    QueryResult, Row, RowRef, Rows, SafeIdent, SafeTable, SslMode, TypedNotification,
 };
 
 // Re-export the compile-checked-query bound so a consumer can NAME the `query::<Q>`

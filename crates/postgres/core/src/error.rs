@@ -5,12 +5,34 @@ use std::fmt;
 
 use bsql_postgres_proto::DecodeError;
 
+/// Build the fixed 5-byte SQLSTATE from wire bytes. A SQLSTATE is invariantly 5
+/// ASCII chars (`[0-9A-Z]`); a well-formed server sends exactly that. This
+/// narrows any UNTRUSTED input TOTALLY: the first 5 bytes are taken, a short code
+/// is space-padded, a longer one truncated, and any non-ASCII byte replaced with
+/// `?`, so the result is ALWAYS valid ASCII (hence valid UTF-8) — [`DbError::code`]
+/// views it as `&str` infallibly. Never panics (the `decoder_fuzz` gate proves it
+/// across arbitrary bytes).
+pub(crate) fn sqlstate_bytes(value: &[u8]) -> [u8; 5] {
+    let mut code = [b' '; 5];
+    for (dst, &src) in code.iter_mut().zip(value.iter()) {
+        *dst = if src.is_ascii() { src } else { b'?' };
+    }
+    code
+}
+
 /// Structured PostgreSQL error with SQLSTATE code.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DbError {
-    /// The 5-character SQLSTATE code (e.g. `"23505"`); test it with
-    /// [`is_code`](Self::is_code).
-    pub code: String,
+    /// The 5-byte SQLSTATE (e.g. `b"23505"`), read as `&str` via
+    /// [`code`](Self::code) / tested with [`is_code`](Self::is_code). Stored
+    /// INLINE as `[u8; 5]` rather than a heap `String`: a SQLSTATE is invariantly
+    /// 5 ASCII chars, so the "exactly 5 bytes" invariant is lifted into the type
+    /// and a server error no longer heap-allocates for its code. Private so the
+    /// 5-byte / ASCII invariant cannot be violated by a caller (construct via
+    /// [`new`](Self::new)). `pub(crate)` so the in-crate materializer sets it
+    /// through the same [`sqlstate_bytes`] narrow — never reachable from outside
+    /// the crate.
+    pub(crate) code: [u8; 5],
     /// Server-reported severity. `None` when the server omitted it or it was
     /// unrecognized — never fabricated. (Display falls back to "ERROR" for
     /// presentation only; the stored value stays honest.)
@@ -23,6 +45,20 @@ pub struct DbError {
     pub hint: Option<String>,
 }
 
+impl fmt::Debug for DbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Render `code` as its `&str` view (not the raw `[u8; 5]`), so Debug
+        // reads `code: "23505"` exactly as the former `String` field did.
+        f.debug_struct("DbError")
+            .field("code", &self.code())
+            .field("severity", &self.severity)
+            .field("message", &self.message)
+            .field("detail", &self.detail)
+            .field("hint", &self.hint)
+            .finish()
+    }
+}
+
 impl fmt::Display for DbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The fallback is a presentation default for the optional `severity`
@@ -32,7 +68,7 @@ impl fmt::Display for DbError {
         // hidden — the literal labels a severity-less error as "ERROR".
         #[allow(clippy::disallowed_methods, reason = "presentation default for an absent severity header; the message and SQLSTATE are still printed in full, so no data is dropped")]
         let severity = self.severity.as_deref().unwrap_or("ERROR");
-        write!(f, "{}: {} ({})", severity, self.message, self.code)?;
+        write!(f, "{}: {} ({})", severity, self.message, self.code())?;
         if let Some(ref d) = self.detail
             && !d.is_empty() { write!(f, "\nDETAIL: {d}")?; }
         if let Some(ref h) = self.hint
@@ -43,23 +79,56 @@ impl fmt::Display for DbError {
 
 impl std::error::Error for DbError {}
 
-// Footprint pin: five owned String / Option<String> fields (code, severity,
-// message, detail, hint). DbError is the structured server-error payload; its
-// size is the dominant variant of DriverError, so pinning it documents the
-// error path's footprint and catches a field addition.
-crate::footprint_pin!(DbError, size = 120, align = 8);
+// Footprint pin: the inline `[u8; 5]` SQLSTATE + four owned String / Option<String>
+// fields (severity, message, detail, hint) = 5 + 4·24 = 101, padded to 104 (align
+// 8). Down from 120 (the former `code: String` was 24 B); the shrink does NOT reach
+// `DriverError` (which boxes `DbError` behind `Db(Box<DbError>)`, so its 24-byte pin
+// is untouched). Pinning `DbError` documents the server-error payload footprint and
+// catches a field addition.
+crate::footprint_pin!(DbError, size = 104, align = 8);
 
 impl DbError {
+    /// Assemble a server error from its SQLSTATE and human-readable fields. The
+    /// `code` is narrowed to the fixed 5-byte form ([`sqlstate_bytes`]); the sole
+    /// constructor, since the `code` field is private.
+    #[must_use]
+    pub fn new(
+        code: &str,
+        severity: Option<String>,
+        message: String,
+        detail: Option<String>,
+        hint: Option<String>,
+    ) -> Self {
+        Self { code: sqlstate_bytes(code.as_bytes()), severity, message, detail, hint }
+    }
+
+    /// The 5-character SQLSTATE as `&str` (e.g. `"23505"`). No allocation — a
+    /// view of the inline `[u8; 5]`.
+    #[must_use]
+    #[expect(
+        clippy::manual_unwrap_or_default,
+        reason = "unwrap_or_default is banned by the silent-fallback ledger; this explicit \
+                  match is the sanctioned dead arm for an infallible narrow — `code` is \
+                  ASCII-only by construction (`sqlstate_bytes`), so the `Err` view is \
+                  unreachable, never a masked failure"
+    )]
+    pub fn code(&self) -> &str {
+        match core::str::from_utf8(&self.code) {
+            Ok(s) => s,
+            Err(_) => "",
+        }
+    }
+
     /// `true` if the SQLSTATE [`code`](Self::code) equals `code`.
-    pub fn is_code(&self, code: &str) -> bool { self.code == code }
+    pub fn is_code(&self, code: &str) -> bool { self.code() == code }
     /// `true` if the SQLSTATE is `23505` (`unique_violation`).
-    pub fn is_unique_violation(&self) -> bool { self.code == "23505" }
+    pub fn is_unique_violation(&self) -> bool { self.is_code("23505") }
     /// `true` if the SQLSTATE is `23502` (`not_null_violation`).
-    pub fn is_not_null_violation(&self) -> bool { self.code == "23502" }
+    pub fn is_not_null_violation(&self) -> bool { self.is_code("23502") }
     /// `true` if the SQLSTATE is `23503` (`foreign_key_violation`).
-    pub fn is_foreign_key_violation(&self) -> bool { self.code == "23503" }
+    pub fn is_foreign_key_violation(&self) -> bool { self.is_code("23503") }
     /// `true` if the SQLSTATE is `23514` (`check_violation`).
-    pub fn is_check_violation(&self) -> bool { self.code == "23514" }
+    pub fn is_check_violation(&self) -> bool { self.is_code("23514") }
 }
 
 /// Why reading a typed value from a dynamic [`Row`](crate::Row) column failed.
@@ -205,11 +274,6 @@ pub enum DriverError {
     /// The requested timeout is so large that adding it to the current clock
     /// instant would overflow. Surfaced instead of panicking.
     TimeoutOverflow,
-    /// A row stream produced row data but the column schema needed to size and
-    /// interpret each row was absent. Without it every cell would silently read
-    /// as 0-column / `None`; the row count and contents cannot be trusted, so
-    /// the result is rejected rather than returned hollow.
-    RowDescriptionMissing,
     /// A NOTIFY frame was observed but its payload could not be resolved from
     /// the protocol's notification arena. The notification definitely arrived;
     /// dropping it silently would lose an event the caller is waiting on.
@@ -325,7 +389,6 @@ impl fmt::Display for DriverError {
             Self::UnclassifiedFailure => write!(f, "server reported a failure with no classified cause"),
             Self::NonUtf8Payload => write!(f, "server payload was not valid UTF-8"),
             Self::TimeoutOverflow => write!(f, "requested timeout overflows the monotonic clock"),
-            Self::RowDescriptionMissing => write!(f, "row stream produced rows with no column description; result cannot be decoded"),
             Self::NotificationUnavailable => write!(f, "NOTIFY frame observed but its payload could not be resolved"),
             Self::Timeout => write!(f, "read timed out while awaiting a server reply mid-command"),
             Self::SpuriousPending => write!(f, "single-poll executor: engine future returned Pending over a blocking transport"),
@@ -363,7 +426,6 @@ impl std::error::Error for DriverError {
             | Self::UnclassifiedFailure
             | Self::NonUtf8Payload
             | Self::TimeoutOverflow
-            | Self::RowDescriptionMissing
             | Self::NotificationUnavailable
             | Self::Timeout
             | Self::SpuriousPending
@@ -408,13 +470,13 @@ mod tests {
     use super::*;
 
     fn sample_db_error() -> DbError {
-        DbError {
-            code: "23505".to_string(),
-            severity: Some("ERROR".to_string()),
-            message: "duplicate key value violates unique constraint".to_string(),
-            detail: Some("Key (id)=(1) already exists.".to_string()),
-            hint: None,
-        }
+        DbError::new(
+            "23505",
+            Some("ERROR".to_string()),
+            "duplicate key value violates unique constraint".to_string(),
+            Some("Key (id)=(1) already exists.".to_string()),
+            None,
+        )
     }
 
     /// Boxing `Db` is a LAYOUT change only — the Display / Debug / Error impls
