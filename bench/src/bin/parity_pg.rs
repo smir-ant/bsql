@@ -148,6 +148,18 @@ fn bench_fetch_many(conn: &mut Connection, limit: i64) -> Result<(), DriverError
     Ok(())
 }
 
+/// Clean up accumulated `bench_insert` rows and force a WAL checkpoint BEFORE an
+/// insert cell — matching the original runner's pre-bench hygiene. Without it,
+/// the prior insert cell's rows bloat the table + its email index, inflating the
+/// next cell's per-insert cost (index maintenance grows with table size), and a
+/// pending checkpoint could fire mid-measurement. Each insert cell thus measures
+/// on a comparably-clean table.
+fn reset_insert_rows(conn: &mut Connection) -> Result<(), DriverError> {
+    conn.execute_sql("DELETE FROM bench_users WHERE name = 'bench_insert'")?;
+    conn.execute_sql("CHECKPOINT")?;
+    Ok(())
+}
+
 fn bench_insert_single(conn: &mut Connection) -> Result<(), DriverError> {
     let stmt = conn.prepare(
         "INSERT INTO bench_users (name, email, active, score) \
@@ -330,7 +342,9 @@ fn run() -> Result<(), DriverError> {
     bench_join_aggregate(&mut conn)?;
     bench_subquery(&mut conn)?;
     bench_dynamic(&mut conn)?;
+    reset_insert_rows(&mut conn)?;
     bench_insert_single(&mut conn)?;
+    reset_insert_rows(&mut conn)?;
     bench_insert_single_typed(&mut conn)?;
     bench_insert_batch(&mut conn)?;
     bench_insert_batch_copy(&mut conn)?;

@@ -768,6 +768,17 @@ impl ActiveEngine {
         self.state = ActiveState::CloseAwaitingComplete;
     }
 
+    /// Seat the engine to drain a BATCHED `Close`+…+`Close`+`Sync` — any number
+    /// of `CloseComplete` acks then the Sync's `ReadyForQuery`. REUSES the
+    /// extended-tail RFQ waiter [`ExtendedAwaitingRfq`](ActiveState::ExtendedAwaitingRfq)
+    /// (which now drains a `CloseComplete` silently), so NO new dispatch state is
+    /// added — the inbound-hot `next_event` frame is byte-unchanged. No count is
+    /// kept (the state drains until the RFQ), so it handles any number of closes.
+    #[inline]
+    pub fn begin_close_many(&mut self) {
+        self.state = ActiveState::ExtendedAwaitingRfq;
+    }
+
     /// Seat the engine to await the fused one-round-trip runtime-param batch's
     /// reply: `Parse`(unnamed) + `Bind` + `Describe`(portal) + `Execute` + `Sync`
     /// → `ParseComplete`, `BindComplete`, then the `Describe`(portal) answer
@@ -1222,6 +1233,13 @@ impl ActiveEngine {
     fn step_extended_awaiting_rfq(&mut self, tag: u8, start: usize, end: usize) -> ActiveOutcome {
         match tag {
             T_READY_FOR_QUERY => self.parse_rfq(start, end),
+            // A batched `Close`+…+`Close`+`Sync` (the pool-reset cache clear,
+            // seated here by `begin_close_many`) drains each `CloseComplete` ack
+            // SILENTLY until the Sync's RFQ. On a NORMAL extended-query tail the
+            // server never sends a `CloseComplete` here (the setup states consumed
+            // the one for a single `Close`), so this arm fires ONLY on the batched
+            // path — it does not loosen the single-statement tail's strictness.
+            T_CLOSE_COMPLETE => ActiveOutcome::Silent,
             T_ERROR => self.fail_recoverable(start, end),
             _ => self.teardown(),
         }

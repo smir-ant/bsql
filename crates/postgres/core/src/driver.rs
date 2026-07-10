@@ -210,21 +210,27 @@ struct DynSlot {
 ///
 /// # Cleared on a pool checkout
 ///
-/// The cache is CLEARED by [`reset_session`](Core::reset_session), for pool
-/// hygiene: a pooled connection handed to a different logical user must not
-/// reuse the prior user's cached plans. Unlike the engine's compile-checked
-/// (typed) cache — keyed on a content-addressed COMPILE-TIME query, identical
-/// across all logical users, so safe to keep — this cache is keyed on RUNTIME
-/// SQL text, whose plan can depend on the preparing user's session state (a
-/// `SET search_path`, a temp table). Clearing on checkout closes that
-/// cross-user class of hazard at the pool boundary. The clear `Close`s each
-/// READY server-side statement (a protocol `Close` of an already-dropped
-/// statement is a wire no-op, so the clear is robust even if the user ran
-/// `DISCARD` / `DEALLOCATE` mid-session), so nothing is orphaned. The cost is
-/// that a pooled connection re-warms its dynamic cache each checkout (the
-/// within-checkout reuse — a query looped in one request — is unaffected, which
-/// is where the win is); a DIRECT (non-pooled) connection never calls
-/// `reset_session`, so its cache persists for the connection's life.
+/// The cache is CLEARED by [`reset_session`](Core::reset_session). This is
+/// primarily HYGIENE, not a strict-correctness necessity: PostgreSQL revalidates
+/// a cached plan and re-resolves its objects when session state that affects
+/// resolution changes (a `SET search_path`), so a `search_path`-shifted reuse
+/// re-plans rather than returning the wrong table. The distinguishing reason the
+/// DYNAMIC cache clears while the engine's compile-checked (TYPED) cache is KEPT
+/// is object LIFETIME: a TYPED `query!` is build-validated against PERMANENT
+/// migration objects that outlive every session, so its cached plan cannot
+/// dangle; a DYNAMIC runtime-SQL plan can reference a SESSION-scoped object (a
+/// `CREATE TEMP TABLE`, a session `CREATE FUNCTION`) that `reset_session`'s
+/// `DISCARD TEMP` / `RESET ALL` tears down — so keeping such a plan across a
+/// checkout would leave it referencing a dropped object. Clearing at the pool
+/// boundary removes that class cleanly, and denies a new logical user the prior
+/// user's plans as a defensive bonus. The clear `Close`s each READY server-side
+/// statement (a protocol `Close` of an already-dropped statement is a wire
+/// no-op, so it is robust even after a mid-session `DISCARD` / `DEALLOCATE`) and
+/// BATCHES all of them into ONE round trip. The cost is that a pooled connection
+/// re-warms its dynamic cache each checkout (the within-checkout reuse — a query
+/// looped in one request — is unaffected, which is where the win is); a DIRECT
+/// (non-pooled) connection never calls `reset_session`, so its cache persists for
+/// the connection's life.
 #[derive(Debug)]
 struct DynStmtCache {
     /// Insertion-ordered slots (linear scan; `DYN_STMT_CACHE_CAP` is small, so a
@@ -707,33 +713,38 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ) -> Result<QueryResult, DriverError> {
         if let Some(idx) = self.dyn_cache.ready_index(sql) {
             // REUSE: Bind+Execute+Sync on the cached named statement (no re-parse).
-            let Some(stmt) = self.dyn_cache.take(idx) else {
-                return self.query_params_uncached(sql, params).await;
-            };
-            return match self.query_prepared(&stmt, params).await {
-                Ok(qr) => {
-                    self.dyn_cache.restore(idx, stmt);
-                    Ok(qr)
+            if let Some(stmt) = self.dyn_cache.take(idx) {
+                match self.query_prepared(&stmt, params).await {
+                    Ok(qr) => {
+                        self.dyn_cache.restore(idx, stmt);
+                        return Ok(qr);
+                    }
+                    Err(e) if e.is_stale_prepared_plan() => {
+                        // The cached plan went stale (schema change / out-of-band
+                        // DEALLOCATE). Reclaim the server-side statement, evict,
+                        // then TRANSPARENTLY re-run THIS query on the fused path so
+                        // the caller never sees the driver-internal staleness — a
+                        // schema change costs one fused re-parse, never a spurious
+                        // error. This is NOT fallback error-masking: it fires only
+                        // on the two SQLSTATEs that can ONLY arise from a stale
+                        // CACHED plan (a genuine 0A000 would have failed this
+                        // query's first, uncached sighting and so never cached),
+                        // and any OTHER error surfaces unchanged (below). Fall
+                        // through to the fused re-run + re-warm.
+                        self.dyn_cache.remove(idx);
+                        self.close_statement(stmt).await?;
+                    }
+                    Err(e) => {
+                        // A data error (a constraint violation, a bad cast) does
+                        // NOT invalidate the plan — keep it cached, surface the error.
+                        self.dyn_cache.restore(idx, stmt);
+                        return Err(e);
+                    }
                 }
-                Err(e) if e.is_stale_prepared_plan() => {
-                    // The cached plan went stale (schema change / out-of-band
-                    // DEALLOCATE): reclaim the server-side statement and evict, so
-                    // the next sighting re-warms via the fused→pending→promote flow
-                    // (the fused re-run observes the current schema). Surface the
-                    // error once — a schema change is a loud, self-healing event.
-                    self.dyn_cache.remove(idx);
-                    self.close_statement(stmt).await?;
-                    Err(e)
-                }
-                Err(e) => {
-                    // A data error (a constraint violation, a bad cast) does NOT
-                    // invalidate the plan — keep it cached and surface the error.
-                    self.dyn_cache.restore(idx, stmt);
-                    Err(e)
-                }
-            };
-        }
-        if self.dyn_cache.is_pending(sql) {
+            }
+            // Only reached on the stale-self-heal fall-through (the slot was
+            // evicted above); re-run on the fused path and re-note PENDING.
+        } else if self.dyn_cache.is_pending(sql) {
             // PROMOTE (second sighting): prepare a named statement, run it, and
             // cache the (valid) statement regardless of the execute OUTCOME — a
             // data error does not invalidate a freshly-prepared plan.
@@ -742,7 +753,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             self.dyn_cache.promote(sql, stmt);
             return out;
         }
-        // FIRST sighting: the fused one-round-trip path; note it PENDING on success.
+        // FIRST sighting — OR a stale-evicted re-warm (the transparent self-heal):
+        // the fused one-round-trip path; note it PENDING on success so the next
+        // sighting re-promotes.
         let qr = self.query_params_uncached(sql, params).await?;
         self.dyn_cache.note_pending(sql);
         Ok(qr)
@@ -820,33 +833,34 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ) -> Result<u64, DriverError> {
         if let Some(idx) = self.dyn_cache.ready_index(sql) {
             // REUSE: Bind+Execute+Sync on the cached named statement.
-            let Some(stmt) = self.dyn_cache.take(idx) else {
-                return self.execute_params_uncached(sql, params).await;
-            };
-            return match self.execute_prepared(&stmt, params).await {
-                Ok(n) => {
-                    self.dyn_cache.restore(idx, stmt);
-                    Ok(n)
+            if let Some(stmt) = self.dyn_cache.take(idx) {
+                match self.execute_prepared(&stmt, params).await {
+                    Ok(n) => {
+                        self.dyn_cache.restore(idx, stmt);
+                        return Ok(n);
+                    }
+                    // Stale cached plan → reclaim, evict, and TRANSPARENTLY re-run
+                    // on the fused path (see `query_params` for the full rationale
+                    // — this is a retry of a driver-internal optimization artifact,
+                    // not error-masking; any non-stale error surfaces unchanged).
+                    Err(e) if e.is_stale_prepared_plan() => {
+                        self.dyn_cache.remove(idx);
+                        self.close_statement(stmt).await?;
+                    }
+                    Err(e) => {
+                        self.dyn_cache.restore(idx, stmt);
+                        return Err(e);
+                    }
                 }
-                Err(e) if e.is_stale_prepared_plan() => {
-                    self.dyn_cache.remove(idx);
-                    self.close_statement(stmt).await?;
-                    Err(e)
-                }
-                Err(e) => {
-                    self.dyn_cache.restore(idx, stmt);
-                    Err(e)
-                }
-            };
-        }
-        if self.dyn_cache.is_pending(sql) {
+            }
+        } else if self.dyn_cache.is_pending(sql) {
             // PROMOTE (second sighting).
             let stmt = self.prepare(sql).await?;
             let out = self.execute_prepared(&stmt, params).await;
             self.dyn_cache.promote(sql, stmt);
             return out;
         }
-        // FIRST sighting: fused; note PENDING on success.
+        // FIRST sighting — OR a stale-evicted re-warm: fused; note PENDING on success.
         let n = self.execute_params_uncached(sql, params).await?;
         self.dyn_cache.note_pending(sql);
         Ok(n)
@@ -877,6 +891,31 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .await;
         self.settle(outcome, &mut collector)?;
         Ok(collector.affected())
+    }
+
+    /// Close MANY dynamic-cache statements by NAME in ONE round trip — the
+    /// batched peer of [`close_statement`](Self::close_statement) that
+    /// [`reset_session`](Self::reset_session) uses to clear the cache without
+    /// paying a round trip per statement. Takes the names (not the owned handles),
+    /// so the caller keeps the [`PreparedStatement`]s and drops them after; a
+    /// `Close` of an already-dropped statement is a wire no-op. `#[doc(hidden)]`:
+    /// the pool-reset seam, not a public verb.
+    #[doc(hidden)]
+    pub async fn close_dyn_statements(&mut self, names: &[&StmtName]) -> Result<(), DriverError> {
+        let live = self.take_live()?;
+        let mut collector = ResultCollector::new();
+        let outcome = self
+            .engine
+            .close_statements(
+                live,
+                names,
+                capture_notify(&mut self.notifications, |s| {
+                    collector.feed(s);
+                    ControlFlow::Continue(())
+                }),
+            )
+            .await;
+        self.settle(outcome, &mut collector)
     }
 
     /// Close a prepared statement, consuming it (use-after-close is a move error).
@@ -1392,12 +1431,12 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// simple-query round trip (prefixed with `ROLLBACK` only when inside a
     /// transaction, decided from the cached `ReadyForQuery` tx status so the
     /// common idle path costs no extra round trip), then CLEARS the DYNAMIC
-    /// prepared-statement cache (`Close`ing each cached server-side statement for
-    /// pool hygiene — a runtime-SQL plan can depend on the preparing user's
-    /// session state, so a new user must not reuse it; see [`DynStmtCache`]), and
-    /// clears the notification ledger and the N+1 recency window. The engine's
+    /// prepared-statement cache in ONE batched round trip (`Close`ing every cached
+    /// server-side statement — see [`DynStmtCache`] for why a dynamic runtime-SQL
+    /// plan, unlike a typed one, can dangle over a `DISCARD TEMP`), and clears the
+    /// notification ledger and the N+1 recency window. The engine's
     /// compile-checked (TYPED) statement cache — content-addressed COMPILE-TIME
-    /// plans, identical across users and thus safe to share — is deliberately
+    /// plans over PERMANENT migration objects that cannot dangle — is deliberately
     /// KEPT (`DISCARD` excludes `DEALLOCATE ALL` / `DISCARD PLANS`), so the typed
     /// flagship's server-side plan reuse survives the checkout. See each driver's
     /// `reset_session` for the full rationale.
@@ -1420,12 +1459,17 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         self.simple_query(sql).await?;
         // CLEAR the dynamic prepared-statement cache: a pooled connection handed
         // to a different logical user must not reuse the prior user's cached
-        // runtime-SQL plans. Close each READY server-side statement so nothing is
+        // runtime-SQL plans. Close every READY server-side statement so nothing is
         // orphaned (a protocol `Close` of an already-dropped statement is a wire
         // no-op, so this is robust even after a mid-session `DISCARD`/`DEALLOCATE`).
-        // Done AFTER the reset round trip — the connection is idle and drained.
-        for stmt in self.dyn_cache.drain() {
-            self.close_statement(stmt).await?;
+        // BATCHED into ONE round trip (N `Close` + one `Sync`), so even a full
+        // cache costs a single flush on checkout, not one per statement.
+        let stmts = self.dyn_cache.drain();
+        if !stmts.is_empty() {
+            let names: Vec<&StmtName> = stmts.iter().map(|s| s.inner.stmt_name()).collect();
+            self.close_dyn_statements(&names).await?;
+            // `stmts` drop here: the WireStatement name buffers free, and the
+            // server-side statements were already closed by the batch above.
         }
         // Clear the ledger AFTER the reset round trip: `UNLISTEN *` stops new
         // notifications, and this discards every notification captured before or

@@ -431,20 +431,24 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   READY statement is never evicted, so nothing leaks), SELF-HEALING (a schema
   change or out-of-band `DEALLOCATE` surfaces the classified `0A000` / `26000`
   once while the cache reclaims the stale statement and re-warms against the
-  current schema — never a silently-stale result), and CLEARED by `reset_session`
-  for pool hygiene (a pooled connection handed to a different logical user must
-  not reuse the prior user's runtime-SQL plans, whose resolution can depend on
-  the preparing user's session state — a `SET search_path`, a temp table; the
-  clear `Close`s each cached server-side statement, a wire no-op if already
-  dropped, so nothing is orphaned). This CONTRASTS with the engine's
-  compile-checked (TYPED) statement cache, which `reset_session` deliberately
-  KEEPS: a content-addressed COMPILE-TIME plan is identical across all logical
-  users and thus safe to share (`DISCARD` excludes `DEALLOCATE ALL` / `DISCARD
-  PLANS`). A DIRECT (non-pooled) connection never calls `reset_session`, so its
-  dynamic cache persists for the connection's life. The typed `query!` path
-  caches in the ENGINE (a content-addressed named statement with a
-  Close-before-Parse idempotent MISS path); this is its driver-level DYNAMIC
-  peer.
+  current schema — never a silently-stale result; the reuse path re-runs the
+  fused query TRANSPARENTLY on stale detection, so a schema change costs one
+  re-parse, never a user-visible spurious error), and CLEARED by `reset_session`
+  in ONE batched round trip (all cached statements `Close`d + a single `Sync`).
+  The clear is primarily HYGIENE, not strict correctness: PostgreSQL re-resolves
+  a cached plan's objects when `search_path` changes, so a `search_path`-shifted
+  reuse re-plans rather than returning the wrong table. The distinguishing reason
+  the DYNAMIC cache clears while the engine's compile-checked (TYPED) cache is
+  KEPT is object LIFETIME — a TYPED `query!` is build-validated against PERMANENT
+  migration objects that cannot dangle, whereas a DYNAMIC runtime-SQL plan can
+  reference a SESSION-scoped object (a `CREATE TEMP TABLE`) that `reset_session`'s
+  `DISCARD TEMP` tears down, so keeping it across a checkout would leave the plan
+  referencing a dropped object (`DISCARD` excludes `DEALLOCATE ALL` / `DISCARD
+  PLANS`, so the typed statements survive). A DIRECT (non-pooled) connection never
+  calls `reset_session`, so its dynamic cache persists for the connection's life.
+  The typed `query!` path caches in the ENGINE (a content-addressed named
+  statement with a Close-before-Parse idempotent MISS path); this is its
+  driver-level DYNAMIC peer.
 - `copy_in` batches streamed `CopyData` to a 64 KiB threshold before flushing (a
   single chunk at or above the threshold streams DIRECTLY from the borrowed
   slice, never copied into the buffer), so a megarow bulk load costs about

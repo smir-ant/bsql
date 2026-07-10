@@ -1134,6 +1134,51 @@ impl<'b, T: Transport> Engine<'b, T> {
         Ok(Outcome { live, status })
     }
 
+    /// Close MANY prepared statements in ONE round trip: `Close`+…+`Close` +
+    /// a single `Sync`, then drain every `CloseComplete` ack (see
+    /// [`begin_close_many`](ActiveEngine::begin_close_many)). This is the batched
+    /// peer of [`close_statement`](Self::close_statement) — the pool reset's
+    /// dynamic-cache clear closes up to a cacheful of statements without paying
+    /// one round trip each. Takes the statement NAMES (not the owned
+    /// [`PreparedStatement`]s), so the caller keeps ownership and drops them after
+    /// (their server-side statements are already closed by the batch). A `Close`
+    /// of an already-dropped statement is a wire no-op, so the batch is robust.
+    /// `B = Never`.
+    ///
+    /// A zero-length `names` still sends a bare `Sync` (a liveness round trip);
+    /// the caller should skip the verb when there is nothing to close.
+    ///
+    /// # Errors
+    ///
+    /// As [`simple_query`](Self::simple_query) (`FrameTooLong` covers an oversize
+    /// statement name).
+    pub async fn close_statements<S>(
+        &mut self,
+        live: Live<'b>,
+        names: &[&StmtName],
+        sink: S,
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
+    where
+        S: FnMut(Surface<'_>) -> ControlFlow<Never>,
+    {
+        let Self {
+            transport,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        send_buf.reset();
+        stage_prelude(active, send_buf)?;
+        for name in names {
+            enqueue_frame(send_buf, |wb| frames::build_close_statement(wb, name.as_bytes()))?;
+        }
+        send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
+        active.begin_close_many();
+        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
+        Ok(Outcome { live, status })
+    }
+
     /// Open a `COPY … FROM STDIN`: issue the COPY command and flush it, entering
     /// the client-streaming phase. The token-less half of the streaming COPY-in
     /// trio ([`copy_in_write`](Self::copy_in_write) then

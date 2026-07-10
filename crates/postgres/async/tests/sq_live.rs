@@ -406,11 +406,14 @@ async fn dynamic_cache_reuse_returns_correct_rows() {
     c.close().await.expect("close");
 }
 
-/// WITNESS: the cache SELF-HEALS a stale plan after a schema change, never
-/// returning a silently-stale result. A cached `SELECT *` whose result type
-/// changes (an `ALTER TABLE ... ADD COLUMN`) surfaces the classified `0A000`
-/// server error ONCE while the cache reclaims the stale statement; the NEXT
-/// call re-prepares against the current schema and returns the new column set.
+/// WITNESS: the cache SELF-HEALS a stale plan TRANSPARENTLY after a schema
+/// change — the caller never sees a spurious error. A cached `SELECT *` whose
+/// result type changes (an `ALTER TABLE ... ADD COLUMN`) would bind a stale plan
+/// (PG's `0A000` "cached plan must not change result type"); the reuse path
+/// detects that classified SQLSTATE, reclaims the stale statement, and RE-RUNS
+/// the query on the fused path IN THE SAME CALL, so the very next query SUCCEEDS
+/// with the new column set — a schema change costs one re-parse, never a
+/// user-visible error and never a silently-stale result.
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn dynamic_cache_self_heals_after_schema_change() {
@@ -439,22 +442,17 @@ async fn dynamic_cache_self_heals_after_schema_change() {
         .await
         .expect("alter");
 
-    // The next reuse binds the STALE cached plan: PG rejects it with `0A000`
-    // ("cached plan must not change result type"). The cache surfaces it ONCE and
-    // evicts + reclaims the server-side statement.
-    match c.query_params(sql, &(0_i32,)).await {
-        Err(DriverError::Db(db)) => {
-            assert!(db.is_code("0A000"), "expected the stale-cached-plan SQLSTATE 0A000, got {}", db.code);
-        }
-        other => panic!("expected a 0A000 stale-plan error, got {other:?}"),
-    }
-
-    // Self-healed: the next call re-prepares against the CURRENT schema (three
-    // columns now) and returns correct rows — never a silently-stale 2-column
-    // result. Run it TWICE to prove the re-warmed cache is correct on reuse too.
-    for _ in 0..2 {
-        let r = c.query_params(sql, &(0_i32,)).await.expect("post-heal");
-        assert_eq!(r.column_names.len(), 3, "three columns after ALTER + self-heal");
+    // The next reuse binds the STALE cached plan (a `0A000` on the wire), but the
+    // driver's transparent self-heal re-runs the query on the fused path in the
+    // SAME call — so the caller sees SUCCESS with the CURRENT 3-column schema, NOT
+    // a spurious error, and NEVER the silently-stale 2-column result. Run several
+    // more to prove the re-warmed cache is correct on reuse too.
+    for i in 0..4 {
+        let r = match c.query_params(sql, &(0_i32,)).await {
+            Ok(r) => r,
+            Err(e) => panic!("post-alter query must self-heal, not error (iter {i}): {e:?}"),
+        };
+        assert_eq!(r.column_names.len(), 3, "three columns after ALTER + transparent self-heal");
         assert_eq!(r.len(), 2);
     }
 
