@@ -115,7 +115,9 @@ pub use n1::{N1Report, N1Tracker};
 pub use notify::{capture_notify, NotificationLedger, TypedNotification};
 pub use sql_ident::{SafeIdent, SafeTable};
 pub use typed_rows::{Rows, RowsBuilder};
-pub use types::{ArenaBuilder, ArenaSealError, Notification, QueryResult, Row, RowRef, RowSet};
+pub use types::{
+    ArenaBuilder, ArenaSealError, BorrowedRow, Notification, QueryResult, Row, RowRef, RowSet,
+};
 
 /// The typed `CommandComplete` tag ([`QueryResult::command_tag`]'s type — a
 /// `Copy` enum a consumer matches on, e.g. `CommandTag::Insert { rows }`, rather

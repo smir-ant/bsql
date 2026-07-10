@@ -428,7 +428,11 @@ const ENGINE_ERROR_VARIANTS: usize = 14;
 /// to Close N statements in one round trip. `LISTEN` has NO dedicated verb: the
 /// driver validates the channel into a `SafeIdent` and issues `LISTEN <channel>`
 /// through `simple_query`, so the injection-safe type is the sole splice currency.)
-const ACTIVE_VERBS: usize = 21;
+/// 23 adds the two BREAKABLE dynamic streaming verbs — `query_break` (the
+/// simple-query peer of `query`) and `query_params_fused_break` (the fused peer
+/// of `query_params_fused`) — behind the driver's `query_each_sql` /
+/// `query_each_params` constant-memory streaming.
+const ACTIVE_VERBS: usize = 23;
 /// `core::hint::cold_path()` classified-branch markers across `engine/`.
 /// Reproduce: `grep -rho 'core::hint::cold_path()' crates/postgres/proto/src/engine/*.rs | wc -l`
 /// (52 includes the COPY-in `write_all` `WriteZero`/`SendOverrun` branches,
@@ -438,8 +442,13 @@ const ACTIVE_VERBS: usize = 21;
 /// the `drain_fused_prelude` EOF + fatal-frame arms, `surface_during_prelude`'s
 /// inapplicable-`Break` guard, and `copy_in_begin`'s prelude-drain branch.
 /// 53 adds the `pump_active_to_boundary` `Event::Overcap` sink-`Break` marker —
-/// the too-wide-result recovery's early-stop landing, the twin of the `Fail` arm's.)
-const COLD_CLASSIFIED_BRANCHES: usize = 53;
+/// the too-wide-result recovery's early-stop landing, the twin of the `Fail` arm's.
+/// 56 adds the three `classify_break_boundary` markers (the shared post-pump
+/// classifier for the breakable dynamic streaming verbs: the `Failed` recover,
+/// the `Closed` protocol-violation, and the `Suspended` fatal arm — the `FrameTooLong`
+/// cold markers of `stage_simple_query` / `stage_fused_params` were MOVED out of
+/// `run_simple` / `query_params_fused`, so those are net-zero.)
+const COLD_CLASSIFIED_BRANCHES: usize = 56;
 /// `#[non_exhaustive]` attribute lines across `engine/`.
 /// Reproduce: `grep -rcE '^#\[non_exhaustive\]' crates/postgres/proto/src/engine/*.rs` (summed)
 const NON_EXHAUSTIVE_ATTRS: usize = 4;

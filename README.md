@@ -263,6 +263,14 @@ lazily, never an eager `Vec<Row>` — regardless of row count). See the
 crate-root docs of `bsql` / `bsql-postgres-async` /
 `bsql-postgres-sync` / `bsql-sqlite` for runnable examples.
 
+For a colossal runtime result, `query_each_sql(sql, on_row)` /
+`query_each_params(sql, params, on_row)` stream the dynamic row to a callback
+ONE AT A TIME in constant memory (the escape from eager `query_sql`), lending
+each row as a zero-copy `BorrowedRow` with zero per-row allocation and a
+`ControlFlow` early break that drains the remainder so the connection stays
+reusable. Available on both PostgreSQL and SQLite with the SAME signature — a
+dynamic stream reads identically across backends.
+
 ## Crate layout
 
 Nine publishable crates and six never-published (`publish = false`) dev
@@ -353,12 +361,12 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 2209** — every `#[test]` / `#[tokio::test]` attribute:
+- **Test functions: 2224** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
   ```
-- **`#[ignore]` live suites (need a running database): 254**:
+- **`#[ignore]` live suites (need a running database): 264**:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[ignore' | wc -l

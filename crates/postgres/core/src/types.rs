@@ -6,7 +6,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use bsql_postgres_proto::command_tag::CommandTag;
-use bsql_postgres_proto::{Cell, DecodeError, TextFmt};
+use bsql_postgres_proto::{Cell, DataRowRef, DecodeError, TextFmt};
 
 use crate::error::ColumnError;
 
@@ -14,8 +14,13 @@ use crate::error::ColumnError;
 
 /// Per-column metadata. 8 bytes, niche-packed.
 /// NULL = `len_plus_one: None` (compiler-enforced handling).
+///
+/// `pub(crate)` (opaque — fields stay private) so the constant-memory streaming
+/// path can hold a reused `Vec<ColSlot>` scratch across rows without exposing the
+/// slot layout; it is filled only through [`fill_row_slots`] and read only through
+/// [`BorrowedRow`].
 #[derive(Debug, Clone, Copy)]
-struct ColSlot {
+pub(crate) struct ColSlot {
     offset: u32,
     /// `None` = SQL NULL. `Some(n)` where `n.get() - 1` = byte length.
     /// Empty string '' = Some(1). This encoding fits NULL into the
@@ -165,10 +170,7 @@ impl Row {
     where
         T: Cell<'a, TextFmt>,
     {
-        match self.get_raw(col)? {
-            None => Ok(None),
-            Some(bytes) => T::decode(bytes).map(Some).map_err(ColumnError::Decode),
-        }
+        decode_text_cell(self.get_raw(col)?)
     }
 
     /// Decode column `col` as UTF-8 text (`&str`), zero-copy.
@@ -205,15 +207,7 @@ impl Row {
     /// Accepts PG's `NaN` / `Infinity` / `-Infinity` spellings (Rust's `f32`
     /// parser is case-insensitive on those).
     pub fn get_f32(&self, col: usize) -> Result<Option<f32>, ColumnError> {
-        match self.get_raw(col)? {
-            None => Ok(None),
-            Some(bytes) => {
-                let text = core::str::from_utf8(bytes)
-                    .map_err(|_| ColumnError::Decode(DecodeError::NonUtf8))?;
-                let value: f32 = text.parse().map_err(|_| ColumnError::FloatParse)?;
-                Ok(Some(value))
-            }
-        }
+        decode_text_f32(self.get_raw(col)?)
     }
 
     /// Decode column `col` as `f64` (PG `float8` text format).
@@ -227,15 +221,7 @@ impl Row {
     /// Accepts PG's `NaN` / `Infinity` / `-Infinity` spellings (Rust's `f64`
     /// parser is case-insensitive on those).
     pub fn get_f64(&self, col: usize) -> Result<Option<f64>, ColumnError> {
-        match self.get_raw(col)? {
-            None => Ok(None),
-            Some(bytes) => {
-                let text = core::str::from_utf8(bytes)
-                    .map_err(|_| ColumnError::Decode(DecodeError::NonUtf8))?;
-                let value: f64 = text.parse().map_err(|_| ColumnError::FloatParse)?;
-                Ok(Some(value))
-            }
-        }
+        decode_text_f64(self.get_raw(col)?)
     }
 
     /// Whether column `col` exists AND is SQL `NULL`.
@@ -769,6 +755,276 @@ impl<'q> RowRef<'q> {
     }
 }
 
+// ─── Shared text-cell decode ────────────────────────────────
+//
+// The single decode routing both the arena-backed [`Row`] and the zero-copy
+// streaming [`BorrowedRow`] funnel through, so the two row views cannot drift in
+// how they classify a NULL / decode failure. Each takes the already-resolved raw
+// cell bytes (the only novel logic per view is `get_raw`) and applies the
+// identical proto `Cell<TextFmt>` (or float) decode.
+
+/// Decode already-resolved raw text-format cell bytes into `T`, propagating SQL
+/// NULL as `Ok(None)` and a parse failure as a classified `Err`.
+fn decode_text_cell<'a, T>(raw: Option<&'a [u8]>) -> Result<Option<T>, ColumnError>
+where
+    T: Cell<'a, TextFmt>,
+{
+    match raw {
+        None => Ok(None),
+        Some(bytes) => T::decode(bytes).map(Some).map_err(ColumnError::Decode),
+    }
+}
+
+/// Decode already-resolved raw cell bytes as `f32` (PG `float4` text format),
+/// validating UTF-8 and classifying a non-float parse — never a swallowed `None`.
+fn decode_text_f32(raw: Option<&[u8]>) -> Result<Option<f32>, ColumnError> {
+    match raw {
+        None => Ok(None),
+        Some(bytes) => {
+            let text = core::str::from_utf8(bytes)
+                .map_err(|_| ColumnError::Decode(DecodeError::NonUtf8))?;
+            let value: f32 = text.parse().map_err(|_| ColumnError::FloatParse)?;
+            Ok(Some(value))
+        }
+    }
+}
+
+/// The `float8` peer of [`decode_text_f32`].
+fn decode_text_f64(raw: Option<&[u8]>) -> Result<Option<f64>, ColumnError> {
+    match raw {
+        None => Ok(None),
+        Some(bytes) => {
+            let text = core::str::from_utf8(bytes)
+                .map_err(|_| ColumnError::Decode(DecodeError::NonUtf8))?;
+            let value: f64 = text.parse().map_err(|_| ColumnError::FloatParse)?;
+            Ok(Some(value))
+        }
+    }
+}
+
+// ─── BorrowedRow (streaming) ─────────────────────────────────
+
+/// Parse one whole `DataRow` body into `slots` as `(offset-into-body, len)`
+/// pairs — the zero-COPY peer of the arena builder's [`ArenaBuilder::push_value`]
+/// used by the constant-memory streaming path.
+///
+/// REUSES proto's fuzz-covered [`DataRowRef`] for the byte walk (the count-header
+/// parse + the per-column length framing + its classified errors); this only
+/// records where each column's data STARTS in `body` (never copying the bytes),
+/// tracking the offset alongside the iterator (the `DataRow` layout is a fixed
+/// 4-byte length prefix + data per column, so the cursor mirrors the iterator's
+/// advance exactly). `slots` is CLEARED and refilled per row, so a caller that
+/// reuses one buffer across a whole stream allocates nothing per row.
+///
+/// # Errors
+///
+/// [`DecodeError`] — a malformed / truncated row body (propagated from
+/// [`DataRowRef`]), or an offset/length that overflows the 32-bit slot fields.
+pub(crate) fn fill_row_slots(body: &[u8], slots: &mut Vec<ColSlot>) -> Result<(), DecodeError> {
+    slots.clear();
+    let row = DataRowRef::parse(body)?;
+    // Body offset AFTER the 2-byte column-count header — where the first column's
+    // 4-byte length prefix begins.
+    let mut off = 2usize;
+    for cell in row.columns() {
+        let cell = cell?;
+        // The cell's data (if any) begins AFTER this column's 4-byte length prefix.
+        let data_off = off.checked_add(4).ok_or(DecodeError::TruncatedRow)?;
+        match cell {
+            None => {
+                // SQL NULL: a `-1` length prefix, no data body. Advance past the
+                // prefix only.
+                slots.push(ColSlot::null());
+                off = data_off;
+            }
+            Some(bytes) => {
+                let offset = u32::try_from(data_off).map_err(|_| DecodeError::TruncatedRow)?;
+                // `len + 1` (the niche NULL encoding) must fit `u32`.
+                let len_plus_one = u32::try_from(bytes.len())
+                    .ok()
+                    .and_then(|len| len.checked_add(1))
+                    .and_then(NonZeroU32::new)
+                    .ok_or(DecodeError::TruncatedRow)?;
+                slots.push(ColSlot::value(offset, len_plus_one));
+                off = data_off
+                    .checked_add(bytes.len())
+                    .ok_or(DecodeError::TruncatedRow)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A zero-copy borrowed view of ONE streamed result row — the row type the
+/// constant-memory dynamic streaming verbs (`query_each_sql` / `query_each_params`)
+/// lend to their callback.
+///
+/// It borrows the transient wire buffer (`'r`) directly and holds NO `Arc` — so a
+/// colossal result streams row-by-row with ZERO per-row allocation, the dynamic
+/// peer of the typed `query_each`'s borrowed record and the cross-backend peer of
+/// the SQLite driver's `BorrowedRow`. The `'r` lifetime is bounded by the callback
+/// invocation (a `for<'r>` bound on the streaming verb is the escape wall), so
+/// nothing it lends can outlive the row — a value that must survive is decoded to
+/// an owned type (`get::<i32>` / a `String` via `get::<&str>().map(str::to_owned)`)
+/// inside the callback.
+///
+/// Reads are POSITIONAL only (`get(col)` etc.) — deliberately, and matching the
+/// SQLite streaming view: the result's column NAMES arrive on the wire only at the
+/// command's completion (AFTER every row), so a per-row by-name resolution is
+/// impossible on the streaming path. By-name reads live on the eager
+/// [`QueryResult::row`] → [`RowRef`] path, which has the whole result's names.
+/// Column access is O(1): the row's cell offsets are parsed once (into a reused
+/// buffer, no per-row allocation) before the view is lent.
+#[derive(Debug, Clone, Copy)]
+#[must_use]
+pub struct BorrowedRow<'r> {
+    /// The whole `DataRow` body — cell data is resolved from here by `slots`.
+    body: &'r [u8],
+    /// One slot per column, holding the cell's `(offset-into-body, len)` or the
+    /// NULL niche. `slots.len()` is the row's column count.
+    slots: &'r [ColSlot],
+}
+
+// Footprint pin: two fat slice pointers (16 B each) = 32 B. The view borrows the
+// wire buffer + a reused slot table; it holds no owned data and no `Arc`. Pinned
+// at a `'static` instantiation (size/align need a concrete lifetime).
+crate::footprint_pin!(BorrowedRow<'static>, size = 32, align = 8);
+
+impl<'r> BorrowedRow<'r> {
+    /// Parse `body` into `scratch` (offsets into `body`, no copy) and lend a view
+    /// over it. `scratch` is cleared and refilled, so reusing one buffer across a
+    /// stream allocates nothing per row.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] — a malformed / truncated row body.
+    pub(crate) fn parse(
+        body: &'r [u8],
+        scratch: &'r mut Vec<ColSlot>,
+    ) -> Result<Self, DecodeError> {
+        fill_row_slots(body, scratch)?;
+        Ok(Self { body, slots: scratch })
+    }
+
+    /// The number of columns in this row.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// `true` if this row has zero columns.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Raw bytes of column `col` (borrowed from the wire buffer, zero-copy).
+    ///
+    /// - `Ok(Some(bytes))` — a non-NULL column's raw payload.
+    /// - `Ok(None)` — the column is SQL `NULL`.
+    /// - `Err(ColumnError::OutOfRange { .. })` — `col >= len()`.
+    ///
+    /// SQL NULL and out-of-range are DISTINCT outcomes, exactly as
+    /// [`Row::get_raw`].
+    pub fn get_raw(&self, col: usize) -> Result<Option<&'r [u8]>, ColumnError> {
+        let n_cols = self.slots.len();
+        let slot = self.slots.get(col).ok_or_else(|| {
+            // `col >= n_cols`; report both, capping a `> u32::MAX` index (trivially
+            // out of range) rather than a forbidden cast/unwrap.
+            #[expect(
+                clippy::manual_unwrap_or,
+                reason = "unwrap_or is banned by the silent-fallback ledger; this explicit \
+                          match is the sanctioned dead arm for the structurally-out-of-range cap"
+            )]
+            let col_u32 = match u32::try_from(col) {
+                Ok(c) => c,
+                Err(_) => u32::MAX,
+            };
+            #[expect(
+                clippy::manual_unwrap_or,
+                reason = "same sanctioned out-of-range cap for the column count (a >u32 \
+                          column count is structurally impossible on the wire)"
+            )]
+            let n_cols_u32 = match u32::try_from(n_cols) {
+                Ok(c) => c,
+                Err(_) => u32::MAX,
+            };
+            ColumnError::OutOfRange { col: col_u32, n_cols: n_cols_u32 }
+        })?;
+        let byte_len = match slot.byte_len() {
+            // NULL is the slot's niche — a real absence, distinct from any error.
+            None => return Ok(None),
+            Some(l) => l,
+        };
+        // `fill_row_slots` proved every offset/length in-bounds of `body`; a `None`
+        // here would mean that invariant was violated (architecturally unreachable),
+        // so it is fail-closed to a classified decode error — never a fabricated
+        // NULL or an out-of-bounds index, mirroring `Row::get_raw`.
+        let corrupt = || ColumnError::Decode(DecodeError::TruncatedRow);
+        let len = usize::try_from(byte_len).map_err(|_| corrupt())?;
+        let start = usize::try_from(slot.offset).map_err(|_| corrupt())?;
+        let end = start.checked_add(len).ok_or_else(corrupt)?;
+        let bytes = self.body.get(start..end).ok_or_else(corrupt)?;
+        Ok(Some(bytes))
+    }
+
+    /// Decode column `col` into any type proto's classified text-decode matrix
+    /// covers (`i16`, `i32`, `i64`, `u32`, `bool`, `&str`) — the streaming peer of
+    /// [`Row::get`], sharing its exact decode.
+    ///
+    /// - `Ok(Some(v))` — decoded value.
+    /// - `Ok(None)` — SQL `NULL` (a dynamic read is nullable-by-default).
+    /// - `Err(ColumnError::OutOfRange { .. })` — index past the row's width.
+    /// - `Err(ColumnError::Decode(..))` — the bytes did not decode as `T`.
+    ///
+    /// Float columns read through [`get_f32`](Self::get_f32) / [`get_f64`](Self::get_f64).
+    pub fn get<'a, T>(&'a self, col: usize) -> Result<Option<T>, ColumnError>
+    where
+        T: Cell<'a, TextFmt>,
+    {
+        decode_text_cell(self.get_raw(col)?)
+    }
+
+    /// Decode column `col` as UTF-8 text (`&str`), zero-copy (borrowed for `'r`).
+    pub fn get_str(&self, col: usize) -> Result<Option<&'r str>, ColumnError> {
+        // Borrow for the buffer lifetime `'r`, not the shorter `&self` — a streamed
+        // `&str` is valid for as long as the row body is (the callback scope).
+        decode_text_cell::<&'r str>(self.get_raw(col)?)
+    }
+
+    /// Decode column `col` as `i32` (PG `int4` text format).
+    pub fn get_i32(&self, col: usize) -> Result<Option<i32>, ColumnError> {
+        self.get::<i32>(col)
+    }
+
+    /// Decode column `col` as `i64` (PG `int8` text format).
+    pub fn get_i64(&self, col: usize) -> Result<Option<i64>, ColumnError> {
+        self.get::<i64>(col)
+    }
+
+    /// Decode column `col` as `bool` (PG boolean text format: `"t"` / `"f"`).
+    pub fn get_bool(&self, col: usize) -> Result<Option<bool>, ColumnError> {
+        self.get::<bool>(col)
+    }
+
+    /// Decode column `col` as `f32` (PG `float4` text format) — the streaming peer
+    /// of [`Row::get_f32`], sharing its exact classified hand-path.
+    pub fn get_f32(&self, col: usize) -> Result<Option<f32>, ColumnError> {
+        decode_text_f32(self.get_raw(col)?)
+    }
+
+    /// Decode column `col` as `f64` (PG `float8` text format).
+    pub fn get_f64(&self, col: usize) -> Result<Option<f64>, ColumnError> {
+        decode_text_f64(self.get_raw(col)?)
+    }
+
+    /// Whether column `col` exists AND is SQL `NULL` (out-of-range is `false` — an
+    /// absent column is not a NULL value, exactly as [`Row::is_null`]).
+    pub fn is_null(&self, col: usize) -> bool {
+        matches!(self.get_raw(col), Ok(None))
+    }
+}
+
 // ─── Notification ───────────────────────────────────────────
 
 /// An asynchronous `NOTIFY` payload delivered on a subscribed `LISTEN` channel.
@@ -820,6 +1076,78 @@ mod tests {
             Err(e) => panic!("unexpected overflow: {e}"),
         };
         assert_eq!(rows.get(0).expect("row 0").get_raw(0), Ok(Some(&b"foobar"[..])));
+    }
+
+    /// Build a `DataRow` frame BODY: `[i16 n_cols]` then per column `[i32 len]`
+    /// (`-1` = NULL, no data) `[bytes]`.
+    fn data_row_body(cols: &[Option<&[u8]>]) -> Vec<u8> {
+        let n = i16::try_from(cols.len()).expect("column count fits i16");
+        let mut body = n.to_be_bytes().to_vec();
+        for cell in cols {
+            match cell {
+                None => body.extend_from_slice(&(-1_i32).to_be_bytes()),
+                Some(bytes) => {
+                    let len = i32::try_from(bytes.len()).expect("cell len fits i32");
+                    body.extend_from_slice(&len.to_be_bytes());
+                    body.extend_from_slice(bytes);
+                }
+            }
+        }
+        body
+    }
+
+    #[test]
+    fn borrowed_row_positional_decode_null_and_out_of_range() {
+        // Three columns: a text-int `"42"`, a SQL NULL, and an empty string.
+        let body = data_row_body(&[Some(b"42"), None, Some(b"")]);
+        let mut slots: Vec<ColSlot> = Vec::new();
+        let row = BorrowedRow::parse(&body, &mut slots).expect("well-formed row parses");
+
+        assert_eq!(row.len(), 3);
+        assert!(!row.is_empty());
+        // Positional raw + typed decode share `Row`'s exact classification.
+        assert_eq!(row.get_raw(0), Ok(Some(&b"42"[..])));
+        assert_eq!(row.get::<i32>(0), Ok(Some(42)));
+        assert_eq!(row.get_str(0), Ok(Some("42")));
+        // SQL NULL is `Ok(None)`, distinct from out-of-range, and `is_null` true.
+        assert_eq!(row.get_raw(1), Ok(None));
+        assert_eq!(row.get::<i32>(1), Ok(None));
+        assert!(row.is_null(1));
+        // Empty string is a present zero-length value, NOT a NULL.
+        assert_eq!(row.get_raw(2), Ok(Some(&b""[..])));
+        assert_eq!(row.get_str(2), Ok(Some("")));
+        assert!(!row.is_null(2));
+        // Out-of-range is a classified error, never a fabricated NULL.
+        assert_eq!(row.get_raw(3), Err(ColumnError::OutOfRange { col: 3, n_cols: 3 }));
+        assert!(!row.is_null(3));
+    }
+
+    #[test]
+    fn borrowed_row_reuses_scratch_across_rows() {
+        // The scratch slot table is CLEARED and refilled per row — a second row of
+        // a different width decodes correctly over the reused buffer.
+        let mut slots: Vec<ColSlot> = Vec::new();
+        let first = data_row_body(&[Some(b"a"), Some(b"bb")]);
+        {
+            let row = BorrowedRow::parse(&first, &mut slots).expect("row 1 parses");
+            assert_eq!(row.len(), 2);
+            assert_eq!(row.get_str(1), Ok(Some("bb")));
+        }
+        let second = data_row_body(&[Some(b"only-one")]);
+        let row = BorrowedRow::parse(&second, &mut slots).expect("row 2 parses");
+        assert_eq!(row.len(), 1);
+        assert_eq!(row.get_str(0), Ok(Some("only-one")));
+    }
+
+    #[test]
+    fn borrowed_row_rejects_a_truncated_body() {
+        // A length prefix claiming more bytes than remain is a classified decode
+        // error (propagated from the reused `DataRowRef` walker), never a panic.
+        let mut slots: Vec<ColSlot> = Vec::new();
+        let mut body = 1_i16.to_be_bytes().to_vec();
+        body.extend_from_slice(&10_i32.to_be_bytes()); // claims 10 bytes …
+        body.extend_from_slice(b"xy"); // … but only 2 remain
+        assert!(BorrowedRow::parse(&body, &mut slots).is_err());
     }
 
     #[test]

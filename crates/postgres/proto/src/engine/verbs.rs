@@ -204,6 +204,116 @@ fn stage_prelude<E>(
     Ok(())
 }
 
+/// Stage a simple-query (`'Q'`) request onto the send buffer: reset, prelude,
+/// then the header + streamed SQL body + NUL terminator.
+///
+/// SHARED by [`run_simple`](Engine::run_simple) (collect-all) and
+/// [`query_break`](Engine::query_break) (breakable), exactly as
+/// [`stage_compiled_query`] is shared by the two compiled verbs — so a collect
+/// verb and its streaming peer cannot drift in their wire framing (a drift would
+/// put different bytes on the wire for the same SQL).
+///
+/// The SQL body streams directly onto the (growable) send buffer rather than
+/// being copied into the bounded [`WriteBuf`]: only the 5-byte header is built
+/// into the scratch buffer, so a multi-kilobyte query is not capped at
+/// `MAX_OWNED_SEND_LEN`. The flushed bytes — header, SQL, NUL — are contiguous
+/// and byte-identical to the whole-frame builder's output.
+#[inline]
+fn stage_simple_query<E>(
+    active: &mut ActiveEngine,
+    send_buf: &mut SendBuf,
+    sql: &str,
+) -> Result<(), EngineError<E>> {
+    send_buf.reset();
+    stage_prelude(active, send_buf)?;
+    let sql_bytes = sql.as_bytes();
+    let sql_len = u32::try_from(sql_bytes.len()).map_err(|_| {
+        core::hint::cold_path();
+        EngineError::FrameTooLong
+    })?;
+    enqueue_frame(send_buf, |wb| frames::build_simple_query_header(wb, sql_len))?;
+    send_buf.enqueue(sql_bytes);
+    send_buf.enqueue(&[0]);
+    Ok(())
+}
+
+/// Stage a fused unnamed extended-protocol request onto the send buffer:
+/// `Parse`(unnamed) + `Bind` + `Describe`(portal) + `Execute` + `Sync`, and seat
+/// the fused awaiting state.
+///
+/// SHARED by [`query_params_fused`](Engine::query_params_fused) (collect-all) and
+/// [`query_params_fused_break`](Engine::query_params_fused_break) (breakable) so
+/// the runtime one-round-trip framing cannot drift between the eager and the
+/// streaming dynamic verb. See [`query_params_fused`](Engine::query_params_fused)
+/// for the fusion rationale (one round trip, inline `Describe`, no `Close`).
+#[inline]
+fn stage_fused_params<P, E>(
+    active: &mut ActiveEngine,
+    send_buf: &mut SendBuf,
+    sql: &str,
+    params: &P,
+) -> Result<(), EngineError<E>>
+where
+    P: ParamsWriter,
+{
+    send_buf.reset();
+    stage_prelude(active, send_buf)?;
+    // Parse(unnamed ""): stream the SQL body onto the growable send buffer, so a
+    // multi-kilobyte runtime query is not capped at MAX_OWNED_SEND_LEN.
+    let sql_bytes = sql.as_bytes();
+    let sql_len = u32::try_from(sql_bytes.len()).map_err(|_| {
+        core::hint::cold_path();
+        EngineError::FrameTooLong
+    })?;
+    enqueue_frame(send_buf, |wb| frames::build_parse_header(wb, b"", sql_len))?;
+    send_buf.enqueue(sql_bytes);
+    send_buf.enqueue(&frames::PARSE_SQL_TRAILER);
+    // Bind(portal "" from the unnamed statement ""); Describe(portal "");
+    // Execute(portal "", no row limit); Sync — one pipelined batch.
+    frames::build_bind(&mut send_buf.frame(), b"", b"", params).map_err(frame_too_long)?;
+    enqueue_frame(send_buf, |wb| frames::build_describe_portal(wb, b""))?;
+    enqueue_frame(send_buf, |wb| frames::build_execute(wb, b"", 0))?;
+    send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
+    active.begin_fused_parse_bind_describe_execute();
+    Ok(())
+}
+
+/// Classify the RAW [`Boundary`] a dynamic BREAKABLE verb's pump reached: an
+/// ALIVE boundary (`Idle` / `Failed` / `Stopped`) passes through so the verb can
+/// wrap it with its token into an `Ok` [`Outcome`]; a fatal boundary
+/// (`Closed` / `Suspended`) is an `Err` and the token is consumed.
+///
+/// The dynamic (unnamed / simple-query) peer of
+/// [`query_params_break`](Engine::query_params_break)'s post-pump match, WITHOUT
+/// its statement-cache settle: the fused and simple-query dynamic paths hold no
+/// engine-side statement cache, so there is nothing to record. A dirty
+/// [`Stopped`](Boundary::Stopped) (caller break) or [`Failed`](Boundary::Failed)
+/// (server error) still rides an alive boundary — the connection owes frames the
+/// caller reclaims with [`drain`](Engine::drain). The token stays with the verb
+/// (never threaded through this helper), matching the [`drive_to_outcome`] /
+/// [`classify_drained`] helper shape.
+#[inline]
+fn classify_break_boundary<E, B>(boundary: Boundary<B>) -> Result<Boundary<B>, EngineError<E>> {
+    match boundary {
+        Boundary::Idle => Ok(Boundary::Idle),
+        Boundary::Failed => {
+            core::hint::cold_path();
+            Ok(Boundary::Failed)
+        }
+        // The caller broke early: the connection is alive but DIRTY. The caller
+        // drains to reclaim it.
+        Boundary::Stopped(b) => Ok(Boundary::Stopped(b)),
+        Boundary::Closed => {
+            core::hint::cold_path();
+            Err(EngineError::ProtocolViolation)
+        }
+        Boundary::Suspended => {
+            core::hint::cold_path();
+            Err(EngineError::UnexpectedSuspend)
+        }
+    }
+}
+
 /// Classify a streamed-`Bind` builder overflow as [`EngineError::FrameTooLong`].
 ///
 /// The single cold-path landing for the STREAMING Bind assembly — the peer of
@@ -639,23 +749,7 @@ impl<'b, T: Transport> Engine<'b, T> {
             ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        send_buf.reset();
-        stage_prelude(active, send_buf)?;
-        // Stream the SQL body directly onto the (growable) send buffer rather
-        // than copying it into the bounded `WriteBuf`: only the 5-byte header is
-        // built into the scratch buffer, so a multi-kilobyte query (a large
-        // literal INSERT, a wide column projection) is not capped at
-        // `MAX_OWNED_SEND_LEN`. The flushed bytes — header, SQL, NUL — are
-        // contiguous on the send buffer, byte-identical to the whole-frame
-        // builder's output.
-        let sql_bytes = sql.as_bytes();
-        let sql_len = u32::try_from(sql_bytes.len()).map_err(|_| {
-            core::hint::cold_path();
-            EngineError::FrameTooLong
-        })?;
-        enqueue_frame(send_buf, |wb| frames::build_simple_query_header(wb, sql_len))?;
-        send_buf.enqueue(sql_bytes);
-        send_buf.enqueue(&[0]);
+        stage_simple_query(active, send_buf, sql)?;
         drive_to_outcome(active, transport, send_buf, sink).await
     }
 
@@ -845,30 +939,96 @@ impl<'b, T: Transport> Engine<'b, T> {
             ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        send_buf.reset();
-        stage_prelude(active, send_buf)?;
-        // Parse(unnamed ""): stream the SQL body onto the (growable) send buffer
-        // rather than the bounded scratch, so a multi-kilobyte runtime query is
-        // not capped at MAX_OWNED_SEND_LEN — byte-identical to the `prepare` path's
-        // streaming Parse assembly (proven by the parse-stream byte-twin).
-        let sql_bytes = sql.as_bytes();
-        let sql_len = u32::try_from(sql_bytes.len()).map_err(|_| {
-            core::hint::cold_path();
-            EngineError::FrameTooLong
-        })?;
-        enqueue_frame(send_buf, |wb| frames::build_parse_header(wb, b"", sql_len))?;
-        send_buf.enqueue(sql_bytes);
-        send_buf.enqueue(&frames::PARSE_SQL_TRAILER);
-        // Bind(portal "" from the unnamed statement ""); Describe(portal "");
-        // Execute(portal "", no row limit); Sync — one pipelined batch. The Bind
-        // streams onto the growable send buffer (unbounded params); the rest are
-        // fixed-size and stay bounded.
-        frames::build_bind(&mut send_buf.frame(), b"", b"", params).map_err(frame_too_long)?;
-        enqueue_frame(send_buf, |wb| frames::build_describe_portal(wb, b""))?;
-        enqueue_frame(send_buf, |wb| frames::build_execute(wb, b"", 0))?;
-        send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
-        active.begin_fused_parse_bind_describe_execute();
+        stage_fused_params(active, send_buf, sql, params)?;
         let status = drive_to_outcome(active, transport, send_buf, sink).await?;
+        Ok(Outcome { live, status })
+    }
+
+    /// Issue a simple-query (`'Q'`) with a BREAKABLE sink — the CONSTANT-MEMORY
+    /// STREAMING peer of [`query`](Self::query).
+    ///
+    /// Identical wire to [`query`](Self::query) (both share
+    /// [`stage_simple_query`], so the eager and the streaming raw-SQL verb cannot
+    /// drift), but the sink may [`Break`](ControlFlow::Break) — carrying a user
+    /// payload `B` — to stop the pump early. Rows surface as [`Surface::Row`] one
+    /// at a time; nothing is accumulated, so a colossal result streams in bounded
+    /// memory.
+    ///
+    /// Returns the RAW [`Boundary`] the pump reached, inside the [`Outcome`] whose
+    /// token rides `Ok` because the connection is ALIVE (see
+    /// [`query_params_break`](Self::query_params_break) for the full
+    /// Idle/Failed/Stopped contract — this is its collect-all-free dynamic peer,
+    /// with NO statement cache to settle). A dirty [`Stopped`](Boundary::Stopped)
+    /// (caller break) or [`Failed`](Boundary::Failed) (server error) must be
+    /// reclaimed with [`drain`](Self::drain) before reuse.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::ProtocolViolation`] / [`EngineError::UnexpectedSuspend`] —
+    ///   a teardown or unexpected suspend; the connection is dead, token consumed.
+    /// - As [`query`](Self::query) for the wire-building / transport faults.
+    pub async fn query_break<S, B>(
+        &mut self,
+        live: Live<'b>,
+        sql: &str,
+        sink: S,
+    ) -> Result<Outcome<'b, Boundary<B>>, EngineError<T::Error>>
+    where
+        S: FnMut(Surface<'_>) -> ControlFlow<B>,
+    {
+        let Self {
+            transport,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        stage_simple_query(active, send_buf, sql)?;
+        let boundary = pump_active_to_boundary(active, transport, send_buf, sink).await?;
+        let status = classify_break_boundary(boundary)?;
+        Ok(Outcome { live, status })
+    }
+
+    /// Issue a one-shot runtime-SQL query with params and a BREAKABLE sink — the
+    /// CONSTANT-MEMORY STREAMING peer of
+    /// [`query_params_fused`](Self::query_params_fused).
+    ///
+    /// Identical wire to [`query_params_fused`](Self::query_params_fused) (both
+    /// share [`stage_fused_params`], so the eager and the streaming dynamic-param
+    /// verb cannot drift), fused into ONE round trip, but the sink may
+    /// [`Break`](ControlFlow::Break) — carrying a user payload `B`. Rows surface as
+    /// [`Surface::Row`] one at a time against the recovered schema; nothing is
+    /// accumulated. Like the fused collect verb it touches NO statement cache (the
+    /// unnamed statement/portal are implicitly discarded at the next `Parse`).
+    ///
+    /// Returns the RAW [`Boundary`] in the [`Outcome`] exactly as
+    /// [`query_break`](Self::query_break) does.
+    ///
+    /// # Errors
+    ///
+    /// As [`query_break`](Self::query_break) (`FrameTooLong` covers oversize SQL or
+    /// encoded parameters).
+    pub async fn query_params_fused_break<P, S, B>(
+        &mut self,
+        live: Live<'b>,
+        sql: &str,
+        params: &P,
+        sink: S,
+    ) -> Result<Outcome<'b, Boundary<B>>, EngineError<T::Error>>
+    where
+        P: ParamsWriter,
+        S: FnMut(Surface<'_>) -> ControlFlow<B>,
+    {
+        let Self {
+            transport,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        stage_fused_params(active, send_buf, sql, params)?;
+        let boundary = pump_active_to_boundary(active, transport, send_buf, sink).await?;
+        let status = classify_break_boundary(boundary)?;
         Ok(Outcome { live, status })
     }
 

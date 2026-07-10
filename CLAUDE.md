@@ -90,6 +90,9 @@ cargo test -p bsql-query-fixture --test copy_typed_offline             # copy! m
 cargo test -p bsql-query-fixture --test copy_typed_live_async -- --ignored  # live copy_in_typed (async, needs PG)
 cargo test -p bsql-query-fixture --test copy_typed_live_sync  -- --ignored  # live copy_in_typed (sync, needs PG)
 cargo test -p bsql-postgres-proto --test engine_copy_typed_alloc       # typed binary-COPY constant-memory gate
+cargo test -p bsql-postgres-proto --test engine_query_break_alloc      # dynamic streaming constant-memory gate (alloc count row-count-independent)
+cargo test -p bsql-postgres-async --test sq_live query_each -- --ignored    # dynamic streaming witnesses (async, needs PG)
+cargo test -p bsql-postgres-sync  --test sync_live query_each -- --ignored  # dynamic streaming witnesses (sync, needs PG)
 cargo clippy -p bsql --features test-harness --all-targets              # lint the (non-default) #[bsql::test] harness
 cargo test  -p bsql --features test-harness --lib                       # harness unit tests (offline)
 BSQL_TEST_DSN=postgres://USER@localhost/postgres \
@@ -574,6 +577,43 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   The typed `query!` path caches in the ENGINE (a content-addressed named
   statement with a Close-before-Parse idempotent MISS path); this is its
   driver-level DYNAMIC peer.
+- **Dynamic streaming — `conn.query_each_sql(sql, on_row)` /
+  `conn.query_each_params(sql, params, on_row)`** (both drivers + their
+  transaction guards). The DYNAMIC (runtime-untyped) constant-memory streaming
+  peer of the eager `query_sql` / `query_params`, and the PostgreSQL peer of the
+  SQLite driver's identically-named verbs — so a dynamic stream over millions of
+  runtime-assembled rows now reads the SAME on both backends (the last
+  cross-backend asymmetry: SQLite had dynamic streaming, PG had only the TYPED
+  `query_each`). Each row is lent to `on_row` as a zero-copy `BorrowedRow<'r>` as
+  it arrives, accumulating NOTHING — a colossal runtime SELECT streams without
+  growing memory (the escape from `query_sql`, which materialises the whole
+  result). `BorrowedRow` borrows the transient wire buffer directly (no `Arc`,
+  ZERO per-row allocation — the dynamic peer of the typed `query_each`'s borrowed
+  record); its cell offsets are parsed ONCE per row into a REUSED slot table (via
+  proto's `DataRowRef` walker, no copy), so column access is O(1) and the whole
+  stream allocates nothing per row. Reads are POSITIONAL only (matching the
+  SQLite streaming view): the result's column NAMES arrive on the wire only after
+  every row, so per-row by-name resolution is impossible on the streaming path
+  (by-name lives on the eager `QueryResult::row` → `RowRef`). `on_row` returns
+  `ControlFlow`: `Continue` keeps streaming, `Break(e)` stops early — the payload
+  rides `Ok(Some(e))` and the remaining rows are drained back to a clean idle so
+  the (pooled) connection stays reusable (O(remaining rows), like the typed
+  `query_each`); a per-row decode failure or a mid-stream server error is LOUD +
+  drained, never swallowed. `query_each_sql` rides the SIMPLE-query wire (like
+  `query_sql`); `query_each_params` rides the FUSED one-round-trip dynamic path
+  (like the one-shot `query_params`) and deliberately does NOT touch the dynamic
+  prepared-statement cache (a streaming bulk read is one-shot by nature). The
+  three streaming verbs (typed + these two dynamic) share ONE post-pump settle
+  (`Core::finish_stream`) so they cannot drift in how they reclaim the
+  connection; the engine's two breakable dynamic verbs (`query_break` /
+  `query_params_fused_break`) reuse the existing `pump_active_to_boundary`, so
+  `next_event` is byte-identical (the codegen gate is green). Constant memory is
+  gated by `engine_query_break_alloc` (a warm stream's allocation count is
+  INDEPENDENT of the row count — an 8-row and a 512-row stream allocate the same
+  fixed handful, proving zero per-row alloc). Witnessed live on both drivers by
+  the `--ignored` `query_each_sql_*` / `query_each_params_*` tests (a 20 000-row
+  in-order stream with a correctness check, a runtime `$1` filter, an early break
+  leaving the connection reusable, and streaming inside a transaction).
 - `copy_in` batches streamed `CopyData` to a 64 KiB threshold before flushing (a
   single chunk at or above the threshold streams DIRECTLY from the borrowed
   slice, never copied into the buffer), so a megarow bulk load costs about

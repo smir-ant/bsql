@@ -628,6 +628,191 @@ async fn streaming_10k_rows() {
     c.close().await.expect("close");
 }
 
+/// WITNESS (dynamic streaming): `query_each_sql` streams a 20 000-row runtime
+/// query ONE ROW AT A TIME — every row is seen, in order, with correct values —
+/// WITHOUT eager-collecting the result (the escape from `query_sql` for a colossal
+/// runtime SELECT). The alloc gate proves the constant memory; this proves the
+/// correctness end-to-end against a live server.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn query_each_sql_streams_a_large_result_correctly() {
+    use core::ops::ControlFlow;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    let mut count = 0i64;
+    let mut sum = 0i64;
+    let mut expected_next = 1i64;
+    let mut in_order = true;
+    let out = c
+        .query_each_sql::<_, ()>("SELECT generate_series(1, 20000) AS n", |row| {
+            let n = row.get_i64(0).expect("decode n").expect("n is not NULL");
+            if n != expected_next {
+                in_order = false;
+            }
+            expected_next += 1;
+            count += 1;
+            sum += n;
+            ControlFlow::Continue(())
+        })
+        .await
+        .expect("stream completes");
+
+    assert_eq!(out, None, "a full stream returns Ok(None)");
+    assert_eq!(count, 20_000, "every row was streamed");
+    assert!(in_order, "rows streamed in order");
+    // 1 + 2 + … + 20000 = 20000·20001/2 = 200_010_000.
+    assert_eq!(sum, 200_010_000, "every value was correct");
+    // The connection is clean + reusable after a full stream.
+    let after = c.query_one_sql("SELECT 'reusable'").await.expect("reuse");
+    assert_eq!(after.get_str(0), Ok(Some("reusable")));
+    c.close().await.expect("close");
+}
+
+/// WITNESS (dynamic streaming with a runtime param): `query_each_params` streams a
+/// parameterised runtime query — the `$1` bound at run time filters the series, and
+/// only the matching rows stream.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn query_each_params_streams_with_a_runtime_param() {
+    use core::ops::ControlFlow;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    let mut seen: Vec<i32> = Vec::new();
+    let out = c
+        .query_each_params::<_, _, ()>(
+            "SELECT n FROM generate_series(1, 1000) AS n WHERE n <= $1 ORDER BY n",
+            &(5_i32,),
+            |row| {
+                seen.push(row.get_i32(0).expect("decode").expect("not NULL"));
+                ControlFlow::Continue(())
+            },
+        )
+        .await
+        .expect("stream completes");
+    assert_eq!(out, None);
+    assert_eq!(seen, vec![1, 2, 3, 4, 5], "the runtime $1 bound the filter");
+    c.close().await.expect("close");
+}
+
+/// WITNESS (early break + reuse): a closure `Break` STOPS the stream early; the
+/// break payload rides `Ok(Some(_))`, the remaining rows are drained to a clean
+/// idle, and the connection is REUSABLE for a follow-up query — the drain keeps a
+/// pooled connection healthy after an early abort of a colossal result.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn query_each_sql_break_stops_early_and_connection_is_reusable() {
+    use core::ops::ControlFlow;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    let mut seen = 0i64;
+    // Break after 100 of a would-be 1,000,000-row stream.
+    let stopped_at = c
+        .query_each_sql::<_, i64>("SELECT generate_series(1, 1000000) AS n", |row| {
+            let _n = row.get_i64(0).expect("decode").expect("not NULL");
+            seen += 1;
+            if seen >= 100 {
+                ControlFlow::Break(seen)
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .await
+        .expect("stream drains after the early break");
+
+    assert_eq!(stopped_at, Some(100), "the break payload rides Ok(Some(_))");
+    assert_eq!(seen, 100, "the closure saw exactly the rows before its break");
+    // The connection was drained back to idle — a follow-up query works.
+    assert!(c.is_healthy());
+    let after = c.query_one_sql("SELECT 7").await.expect("reuse after early break");
+    assert_eq!(after.get_i32(0), Ok(Some(7)));
+    c.close().await.expect("close");
+}
+
+/// WITNESS (oversize-row reassembly): `query_each_sql` streams multiple rows each
+/// FAR larger than the 4 KiB read buffer — so each arrives split into `RowChunk`
+/// pieces and is REASSEMBLED into the reused scratch before decode. Proves the
+/// dynamic streaming path reconstructs a chunk-split row BYTE-EXACT (no truncation
+/// at a chunk seam, no cross-row bleed), with an interleaved NULL cell and a
+/// trailing small column both correctly positioned AFTER the big value, and the
+/// connection reusable after. The dynamic peer of the typed oversize-row coverage.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn query_each_sql_reassembles_oversize_rows() {
+    use core::ops::ControlFlow;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    // Three rows, each a big text (hundreds of KiB — >> the 4 KiB read buffer, so
+    // each spans ~100 `RowChunk`s), a distinct fill char per row (to catch any
+    // cross-row bleed), an interleaved SQL NULL, and a small trailing column.
+    const SPEC: [(char, usize, &str); 3] = [('a', 400_000, "end-1"), ('b', 300_000, "end-2"), ('c', 500_000, "end-3")];
+    let sql = "SELECT repeat('a', 400000) AS big, NULL::text AS mid, 'end-1' AS tail \
+               UNION ALL SELECT repeat('b', 300000), NULL, 'end-2' \
+               UNION ALL SELECT repeat('c', 500000), NULL, 'end-3'";
+
+    // Collect owned facts per row inside the callback (the borrowed row cannot
+    // escape); each row's big value is verified byte-exact (length + every byte the
+    // expected fill char — a chunk-seam truncation would change the length).
+    let mut rows: Vec<(usize, bool, bool, String)> = Vec::new();
+    let out = c
+        .query_each_sql::<_, ()>(sql, |row| {
+            assert_eq!(row.len(), 3, "each streamed row has three columns");
+            let big = row.get_str(0).expect("big decodes").expect("big is not NULL");
+            let idx = rows.len();
+            let (fill, _len, _tail) = SPEC[idx];
+            let all_fill = big.bytes().all(|b| b == fill as u8);
+            let mid_is_null = matches!(row.get_raw(1), Ok(None)) && row.is_null(1);
+            let tail = row.get_str(2).expect("tail decodes").expect("tail not NULL").to_owned();
+            rows.push((big.len(), all_fill, mid_is_null, tail));
+            ControlFlow::Continue(())
+        })
+        .await
+        .expect("oversize stream completes");
+
+    assert_eq!(out, None);
+    assert_eq!(rows.len(), 3, "every oversize row streamed");
+    for (i, (len, all_fill, mid_is_null, tail)) in rows.iter().enumerate() {
+        let (_fill, expected_len, expected_tail) = SPEC[i];
+        assert_eq!(*len, expected_len, "row {i}: big value reassembled to its FULL length (no chunk-seam truncation)");
+        assert!(*all_fill, "row {i}: every byte is this row's fill char (no cross-row chunk bleed)");
+        assert!(*mid_is_null, "row {i}: the interleaved NULL cell reads as None after the big value");
+        assert_eq!(tail, expected_tail, "row {i}: the trailing small column is correctly positioned after the reassembled big value");
+    }
+    // The reused oversize scratch is cleared between rows — the connection is clean.
+    let after = c.query_one_sql("SELECT 'reusable-after-oversize'").await.expect("reuse");
+    assert_eq!(after.get_str(0), Ok(Some("reusable-after-oversize")));
+    c.close().await.expect("close");
+}
+
+/// WITNESS (streaming inside a transaction): the streaming verb works through the
+/// transaction GUARD — a stream inside a `transaction` body sees every row and the
+/// transaction commits normally.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn query_each_sql_streams_inside_a_transaction() {
+    use core::ops::ControlFlow;
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    let count = c
+        .transaction(async |tx| {
+            let mut n = 0i64;
+            tx.query_each_sql::<_, ()>("SELECT generate_series(1, 500)", |_row| {
+                n += 1;
+                ControlFlow::Continue(())
+            })
+            .await?;
+            Ok(n)
+        })
+        .await
+        .expect("transaction with a stream commits");
+    assert_eq!(count, 500);
+    c.close().await.expect("close");
+}
+
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn error_recovery_and_resilience() {

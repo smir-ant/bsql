@@ -48,7 +48,7 @@ use bsql_postgres_core::tls::Wire;
 #[cfg(feature = "tls")]
 use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
-    resolve_endpoint, validate_startup_params, ConnectConfig, DriverError, Endpoint,
+    resolve_endpoint, validate_startup_params, BorrowedRow, ConnectConfig, DriverError, Endpoint,
     MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification, QueryResult,
     Redial, Row, Rows, SslMode, TypedNotification,
 };
@@ -518,6 +518,72 @@ impl Connection {
         sql: &'a str,
     ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
         self.core.query_opt_sql(sql)
+    }
+
+    /// Stream a runtime raw-SQL query's rows one at a time to `on_row` in CONSTANT
+    /// memory — the dynamic (untyped) streaming peer of [`query_sql`](Self::query_sql),
+    /// and the PostgreSQL peer of the SQLite driver's `query_each_sql` (so a
+    /// dynamic stream reads the SAME on both backends).
+    ///
+    /// Each row is handed to `on_row` as a zero-copy [`BorrowedRow`] as it arrives,
+    /// accumulating NOTHING — a colossal runtime SELECT streams without growing
+    /// memory (the escape from eager `query_sql`, which materialises the whole
+    /// result). `on_row` returns [`ControlFlow`]: [`Continue`](ControlFlow::Continue)
+    /// to keep streaming, or [`Break(e)`](ControlFlow::Break) to stop early. The
+    /// borrowed row CANNOT escape the closure (the `for<'r>` bound is the escape
+    /// wall) — a value that must outlive it is decoded to an owned type inside.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(None)` — streamed to completion.
+    /// - `Ok(Some(e))` — `on_row` broke early; the connection was drained back to a
+    ///   clean idle and stays healthy + pooled.
+    /// - `Err(DriverError::Decode(..))` — a row body was malformed; the connection
+    ///   was drained and stays healthy — LOUD, never swallowed.
+    /// - `Err(DriverError::Db(..))` — the server reported an error mid-stream; the
+    ///   connection was drained and stays healthy.
+    /// - other `Err` — a fatal transport/protocol fault; the connection is dead.
+    ///
+    /// Reads are POSITIONAL (`row.get::<i32>(0)` / `row.get_str(1)` / …); the
+    /// result's column names arrive on the wire only after every row, so by-name
+    /// reads live on the eager [`QueryResult::row`] path, not the streaming one.
+    /// An oversize row (wider than the inline read buffer) is reassembled into a
+    /// reused scratch buffer and streamed exactly like an inline one — constant
+    /// memory, no size cap.
+    ///
+    /// # Early-abort cost
+    ///
+    /// A [`Break`](ControlFlow::Break) of a colossal result still READS (and
+    /// discards) the remaining rows to reach the clean idle boundary that makes the
+    /// connection reusable — O(remaining rows).
+    pub fn query_each_sql<'a, F, E>(
+        &'a mut self,
+        sql: &'a str,
+        on_row: F,
+    ) -> impl Future<Output = Result<Option<E>, DriverError>> + 'a
+    where
+        F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E> + 'a,
+        E: 'a,
+    {
+        self.core.query_each_sql(sql, on_row)
+    }
+
+    /// Stream a runtime parameterised query's rows one at a time to `on_row` in
+    /// CONSTANT memory — the dynamic streaming peer of
+    /// [`query_params`](Self::query_params), and the PostgreSQL peer of the SQLite
+    /// driver's `query_each_params`. See [`query_each_sql`](Self::query_each_sql)
+    /// for the full contract; the params are borrowed all the way to the engine.
+    pub fn query_each_params<'a, P: ParamsWriter, F, E>(
+        &'a mut self,
+        sql: &'a str,
+        params: &'a P,
+        on_row: F,
+    ) -> impl Future<Output = Result<Option<E>, DriverError>> + 'a
+    where
+        F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E> + 'a,
+        E: 'a,
+    {
+        self.core.query_each_params(sql, params, on_row)
     }
 
     /// Prepare a statement: `Parse` + `Describe` + `Sync`, recovering the result
@@ -1347,6 +1413,35 @@ impl Transaction<'_> {
         sql: &'a str,
     ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
         self.armed(move |c| c.query_opt_sql(sql))
+    }
+
+    /// Stream a runtime raw-SQL query's rows in CONSTANT memory, inside the
+    /// transaction. See [`Connection::query_each_sql`] for the full contract.
+    pub fn query_each_sql<'a, F, E>(
+        &'a mut self,
+        sql: &'a str,
+        on_row: F,
+    ) -> impl Future<Output = Result<Option<E>, DriverError>> + 'a
+    where
+        F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E> + 'a,
+        E: 'a,
+    {
+        self.armed(move |c| c.query_each_sql(sql, on_row))
+    }
+
+    /// Stream a runtime parameterised query's rows in CONSTANT memory, inside the
+    /// transaction. See [`Connection::query_each_params`] for the full contract.
+    pub fn query_each_params<'a, P: ParamsWriter, F, E>(
+        &'a mut self,
+        sql: &'a str,
+        params: &'a P,
+        on_row: F,
+    ) -> impl Future<Output = Result<Option<E>, DriverError>> + 'a
+    where
+        F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E> + 'a,
+        E: 'a,
+    {
+        self.armed(move |c| c.query_each_params(sql, params, on_row))
     }
 
     /// Prepare a statement: `Parse` + `Describe` + `Sync`.

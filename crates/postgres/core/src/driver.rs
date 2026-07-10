@@ -65,6 +65,8 @@ use bsql_postgres_proto::{
 use crate::cancel::CancelKey;
 use crate::materialize::{self, ResultCollector};
 use crate::sql_ident::{self, SafeIdent, SafeTable};
+use crate::types::ColSlot;
+use crate::BorrowedRow;
 use crate::tls::{TlsError, Wire};
 // `CaRootsError` names a rustls parse failure, so it exists only under `tls`.
 #[cfg(feature = "tls")]
@@ -95,6 +97,80 @@ enum Stop<E> {
     Decode(DecodeError),
     /// The caller's `on_row` returned [`ControlFlow::Break`], carrying its payload.
     User(E),
+}
+
+/// Parse one whole `DataRow` `body` into a zero-copy [`BorrowedRow`] over the
+/// REUSED `slots` table and hand it to `on_row`, translating the outcome into the
+/// engine's [`Stop`] break payload.
+///
+/// A per-row decode failure is LOUD ([`Stop::Decode`] stops the pump), never a
+/// Continue past it or a substituted default; a caller [`Break`](ControlFlow::Break)
+/// rides [`Stop::User`]. Shared by the inline and the reassembled-oversize arms of
+/// [`stream_dynamic_row`], so the two decode a row identically.
+fn decode_and_hand<F, E>(
+    body: &[u8],
+    on_row: &mut F,
+    slots: &mut Vec<ColSlot>,
+) -> ControlFlow<Stop<E>>
+where
+    F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
+{
+    match BorrowedRow::parse(body, slots) {
+        Ok(view) => match on_row(view) {
+            ControlFlow::Continue(()) => ControlFlow::Continue(()),
+            ControlFlow::Break(e) => ControlFlow::Break(Stop::User(e)),
+        },
+        Err(de) => ControlFlow::Break(Stop::Decode(de)),
+    }
+}
+
+/// The shared per-surface sink body for BOTH dynamic streaming verbs
+/// ([`Core::query_each_sql`] / [`Core::query_each_params`]): lend each
+/// `Surface::Row` (or a reassembled oversize row) to `on_row` as a zero-copy
+/// [`BorrowedRow`], capturing a mid-stream server error and swallowing async /
+/// COPY frames.
+///
+/// Defined ONCE so the two verbs cannot drift in their per-row decode. The scratch
+/// buffers (`slots`, `oversize`) are owned by the verb and reused per row, so this
+/// accumulates NOTHING — the constant-memory invariant.
+fn stream_dynamic_row<F, E>(
+    surface: Surface<'_>,
+    on_row: &mut F,
+    slots: &mut Vec<ColSlot>,
+    oversize: &mut Vec<u8>,
+    db_error: &mut Option<DbError>,
+) -> ControlFlow<Stop<E>>
+where
+    F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
+{
+    match surface {
+        // A whole inline row: parse its cell offsets into the reused slot table
+        // and lend a zero-copy view.
+        Surface::Row(body) => decode_and_hand(body, on_row, slots),
+        // Capture the server error's cause, then let the pump reach its `Failed`
+        // boundary so the connection can be drained to idle.
+        Surface::Fail(body) => {
+            *db_error = Some(materialize::parse_error_response(body));
+            ControlFlow::Continue(())
+        }
+        // An oversize row streams as `RowChunk` pieces: reassemble into the reused
+        // buffer (bounded by the widest oversize row, not the whole result).
+        Surface::RowChunk(bytes) => {
+            oversize.extend_from_slice(bytes);
+            ControlFlow::Continue(())
+        }
+        // The reassembled oversize row is complete: decode it exactly as an inline
+        // row, then clear the buffer to reuse its allocation for the next one (the
+        // view's borrow ends when `decode_and_hand` returns, before the clear).
+        Surface::RowChunkEnd => {
+            let flow = decode_and_hand(oversize, on_row, slots);
+            oversize.clear();
+            flow
+        }
+        // COPY / delivery / other async frames are not stream rows (a NOTIFY is
+        // captured into the ledger by the `capture_notify` wrapper above this).
+        _ => ControlFlow::Continue(()),
+    }
 }
 
 /// A fixed-capacity ASCII sink so a generated prepared-statement name renders
@@ -1295,7 +1371,33 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 }),
             )
             .await;
+        self.finish_stream(outcome, db_error).await
+    }
 
+    /// The shared post-pump settle for EVERY streaming verb (typed
+    /// [`query_each`](Self::query_each) and the dynamic
+    /// [`query_each_sql`](Self::query_each_sql) / [`query_each_params`](Self::query_each_params)):
+    /// classify the RAW [`Boundary`] the pump reached, draining a dirty
+    /// connection back to a clean idle so it stays pooled, and map the outcome.
+    ///
+    /// Defined ONCE so the three streaming verbs cannot drift in how they reclaim
+    /// the connection or classify the stop — they differ only in the engine verb
+    /// that produced the boundary and the per-row decode, never in the settle.
+    ///
+    /// - [`Boundary::Idle`] → `Ok(None)` (streamed to completion; token restored).
+    /// - [`Boundary::Failed`] → drain, then the parsed server error.
+    /// - [`Boundary::Stopped(Stop::User(e))`] → drain, then `Ok(Some(e))` (the
+    ///   caller's early-break payload).
+    /// - [`Boundary::Stopped(Stop::Decode(de))`] → drain, then the loud classified
+    ///   decode error.
+    /// - a fatal boundary (the breakable engine verbs map Closed/Suspended to
+    ///   `Err`, so they never ride an `Ok` outcome) → a classified I/O error; the
+    ///   token is dropped, leaving the connection dead + evictable.
+    async fn finish_stream<E>(
+        &mut self,
+        outcome: Result<Outcome<'static, Boundary<Stop<E>>>, EngineError<WireError>>,
+        db_error: Option<DbError>,
+    ) -> Result<Option<E>, DriverError> {
         // The token rides `Ok` on any ALIVE boundary; a fatal is `Err`.
         let (live, boundary) = match outcome {
             Ok(Outcome { live, status }) => (live, status),
@@ -1327,14 +1429,89 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 self.drain_to_idle(live).await?;
                 Err(DriverError::Decode(de))
             }
-            // `query_params_break` maps Closed/Suspended to a fatal `Err`, so they
-            // never ride an `Ok` outcome; `Boundary` is `#[non_exhaustive]`, so
+            // The breakable engine verbs map Closed/Suspended to a fatal `Err`, so
+            // they never ride an `Ok` outcome; `Boundary` is `#[non_exhaustive]`, so
             // this classified arm also covers any future boundary. The token is
             // dropped (not restored), so the connection is left dead + evictable.
             _ => Err(DriverError::Io(io::Error::other(
                 "unexpected protocol boundary from a streaming query",
             ))),
         }
+    }
+
+    /// Stream a runtime raw-SQL query's rows one at a time to `on_row` in CONSTANT
+    /// memory — the dynamic (untyped) streaming peer of
+    /// [`query_sql`](Self::query_sql), and the PostgreSQL peer of the SQLite
+    /// driver's `query_each_sql`.
+    ///
+    /// See each driver's `query_each_sql` for the full contract; the mechanism is
+    /// the typed [`query_each`](Self::query_each)'s breakable cursor over the
+    /// dynamic simple-query engine verb, lending a zero-copy [`BorrowedRow`] per
+    /// row (nothing accumulated).
+    pub async fn query_each_sql<F, E>(
+        &mut self,
+        sql: &str,
+        mut on_row: F,
+    ) -> Result<Option<E>, DriverError>
+    where
+        F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
+    {
+        let live = self.take_live()?;
+        let mut db_error: Option<DbError> = None;
+        // Reused per-row scratch: the slot table (offsets into the row body) and
+        // the oversize-row reassembly buffer. Both retain their capacity across
+        // rows (cleared, never reallocated), so streaming a colossal result
+        // allocates NOTHING per row — the constant-memory invariant.
+        let mut slots: Vec<ColSlot> = Vec::new();
+        let mut oversize: Vec<u8> = Vec::new();
+        let outcome = self
+            .engine
+            .query_break(
+                live,
+                sql,
+                capture_notify(&mut self.notifications, |surface| {
+                    stream_dynamic_row(surface, &mut on_row, &mut slots, &mut oversize, &mut db_error)
+                }),
+            )
+            .await;
+        self.finish_stream(outcome, db_error).await
+    }
+
+    /// Stream a runtime parameterised query's rows one at a time to `on_row` in
+    /// CONSTANT memory — the dynamic streaming peer of
+    /// [`query_params`](Self::query_params), and the PostgreSQL peer of the SQLite
+    /// driver's `query_each_params`.
+    ///
+    /// Rides the FUSED one-round-trip dynamic path (the same wire the one-shot
+    /// [`query_params`](Self::query_params) first-sighting uses); a streaming bulk
+    /// read is one-shot by nature, so it deliberately does NOT touch the dynamic
+    /// prepared-statement cache. Params are borrowed all the way to the engine.
+    pub async fn query_each_params<P, F, E>(
+        &mut self,
+        sql: &str,
+        params: &P,
+        mut on_row: F,
+    ) -> Result<Option<E>, DriverError>
+    where
+        P: ParamsWriter,
+        F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
+    {
+        let live = self.take_live()?;
+        let mut db_error: Option<DbError> = None;
+        let mut slots: Vec<ColSlot> = Vec::new();
+        let mut oversize: Vec<u8> = Vec::new();
+        let outcome = self
+            .engine
+            .query_params_fused_break(
+                live,
+                sql,
+                params,
+                capture_notify(&mut self.notifications, |surface| {
+                    stream_dynamic_row(surface, &mut on_row, &mut slots, &mut oversize, &mut db_error)
+                }),
+            )
+            .await;
+        self.finish_stream(outcome, db_error).await
     }
 
     /// Drain a connection left DIRTY by an early stop of a streaming query/unload
