@@ -158,6 +158,182 @@ pub struct PreparedStatement {
     column_names: Arc<[String]>,
 }
 
+/// Capacity of the per-connection dynamic prepared-statement cache — the most
+/// distinct hot dynamic SQL strings whose server-side plan is retained for
+/// reuse. Bounded so a churn of one-shot SQL cannot grow the cache without
+/// limit; a workload with MORE than this many hot dynamic queries leaves the
+/// overflow on the (still 1-round-trip) fused path — no regression, just no
+/// plan-reuse for the overflow. 32 covers the common handful of hot dynamic
+/// queries with headroom.
+const DYN_STMT_CACHE_CAP: usize = 32;
+
+/// One entry in the [`DynStmtCache`]: the SQL text plus, once the query has been
+/// prepared, its server-side prepared statement.
+#[derive(Debug)]
+struct DynSlot {
+    /// The runtime SQL text this slot caches (the cache key).
+    sql: Box<str>,
+    /// `None` = PENDING: the SQL has been seen ONCE (run through the fused,
+    /// unnamed 1-round-trip path) and is queued to prepare on its NEXT sighting.
+    /// `Some` = READY: a named server-side statement to `Bind`+`Execute` (plan
+    /// reuse, no re-parse).
+    prepared: Option<PreparedStatement>,
+}
+
+/// A bounded per-connection cache of DYNAMIC prepared statements, keyed on SQL
+/// text — driver-level plan reuse for the runtime `query_params` /
+/// `execute_params` family, the dynamic peer of the engine's compile-checked
+/// (typed) statement cache.
+///
+/// # Why prepare on the SECOND sighting, not the first
+///
+/// The fused unnamed path already runs a one-shot dynamic query in ONE round
+/// trip (`Parse`+`Bind`+`Describe`+`Execute`+`Sync`), so preparing a NAMED
+/// statement on the FIRST sighting — which needs a separate `prepare` round trip
+/// before the first `Bind`+`Execute` — would REGRESS a genuinely one-shot query
+/// from one round trip to two. So a first sighting stays on the fused path and
+/// is only NOTED (`prepared = None`); the SECOND sighting prepares the named
+/// statement (a one-time extra round trip) and every LATER sighting reuses the
+/// server-side plan in one round trip (`Bind`+`Execute`+`Sync`, no re-parse) —
+/// strictly better than fused for a repeated query (same round trip, no
+/// server-side re-parse / re-plan). A query run exactly once therefore pays
+/// nothing; a query run in a loop amortizes the single prepare to zero.
+///
+/// # Bounded, leak-free
+///
+/// At most [`DYN_STMT_CACHE_CAP`] slots. A first sighting evicts the OLDEST
+/// PENDING slot if the cache is full — a pending slot holds NO server-side
+/// statement, so eviction is free (never a leaked prepared statement). A READY
+/// slot is NEVER evicted (only reclaimed by the reuse path's self-heal, which
+/// `Close`s it), so the server-side statement count is bounded by the cache and
+/// nothing leaks; on connection close PostgreSQL drops them all.
+///
+/// # Cleared on a pool checkout
+///
+/// The cache is CLEARED by [`reset_session`](Core::reset_session), for pool
+/// hygiene: a pooled connection handed to a different logical user must not
+/// reuse the prior user's cached plans. Unlike the engine's compile-checked
+/// (typed) cache — keyed on a content-addressed COMPILE-TIME query, identical
+/// across all logical users, so safe to keep — this cache is keyed on RUNTIME
+/// SQL text, whose plan can depend on the preparing user's session state (a
+/// `SET search_path`, a temp table). Clearing on checkout closes that
+/// cross-user class of hazard at the pool boundary. The clear `Close`s each
+/// READY server-side statement (a protocol `Close` of an already-dropped
+/// statement is a wire no-op, so the clear is robust even if the user ran
+/// `DISCARD` / `DEALLOCATE` mid-session), so nothing is orphaned. The cost is
+/// that a pooled connection re-warms its dynamic cache each checkout (the
+/// within-checkout reuse — a query looped in one request — is unaffected, which
+/// is where the win is); a DIRECT (non-pooled) connection never calls
+/// `reset_session`, so its cache persists for the connection's life.
+#[derive(Debug)]
+struct DynStmtCache {
+    /// Insertion-ordered slots (linear scan; `DYN_STMT_CACHE_CAP` is small, so a
+    /// scan is far cheaper than the network round trip it saves). Insertion order
+    /// makes "oldest pending" the first `prepared == None` slot.
+    slots: Vec<DynSlot>,
+}
+
+impl DynStmtCache {
+    /// An empty cache.
+    const fn new() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    /// The index of a READY slot for `sql`, if the query has a cached plan.
+    fn ready_index(&self, sql: &str) -> Option<usize> {
+        self.slots.iter().position(|s| s.prepared.is_some() && &*s.sql == sql)
+    }
+
+    /// Whether `sql` is a PENDING slot (seen once, awaiting its second sighting).
+    fn is_pending(&self, sql: &str) -> bool {
+        self.slots.iter().any(|s| s.prepared.is_none() && &*s.sql == sql)
+    }
+
+    /// Take the prepared statement out of READY slot `idx` (leaving it PENDING)
+    /// so it can be executed while `&mut Core` is borrowed, then
+    /// [`restore`](Self::restore)d (or the slot [`remove`](Self::remove)d on a
+    /// self-heal). `None` only if `idx` is stale or already empty — an
+    /// architecturally-dead arm the caller treats as a cache miss.
+    fn take(&mut self, idx: usize) -> Option<PreparedStatement> {
+        self.slots.get_mut(idx).and_then(|s| s.prepared.take())
+    }
+
+    /// Restore a prepared statement into slot `idx` after a successful (or a
+    /// non-stale-error) reuse.
+    fn restore(&mut self, idx: usize, stmt: PreparedStatement) {
+        if let Some(s) = self.slots.get_mut(idx) {
+            s.prepared = Some(stmt);
+        }
+    }
+
+    /// Drop slot `idx` entirely (the reuse path evicts a stale cached plan here
+    /// after `Close`ing its server-side statement).
+    fn remove(&mut self, idx: usize) {
+        if idx < self.slots.len() {
+            self.slots.remove(idx);
+        }
+    }
+
+    /// Promote the PENDING slot for `sql` to READY with its now-prepared
+    /// statement. The pending slot exists by construction (the caller checked
+    /// [`is_pending`](Self::is_pending) and nothing mutated the cache since), so
+    /// this is an in-place `None -> Some` that never needs to evict; the fallback
+    /// installs a fresh READY slot only for the architecturally-dead case where
+    /// the pending slot vanished.
+    fn promote(&mut self, sql: &str, stmt: PreparedStatement) {
+        match self.slots.iter_mut().find(|s| s.prepared.is_none() && &*s.sql == sql) {
+            Some(s) => s.prepared = Some(stmt),
+            None => {
+                self.make_room();
+                if self.slots.len() < DYN_STMT_CACHE_CAP {
+                    self.slots.push(DynSlot { sql: Box::from(sql), prepared: Some(stmt) });
+                }
+            }
+        }
+    }
+
+    /// Note a FIRST sighting of `sql` as PENDING (its fused run just succeeded),
+    /// evicting the oldest PENDING slot if the cache is full. A no-op if `sql` is
+    /// already tracked.
+    fn note_pending(&mut self, sql: &str) {
+        if self.slots.iter().any(|s| &*s.sql == sql) {
+            return;
+        }
+        self.make_room();
+        if self.slots.len() < DYN_STMT_CACHE_CAP {
+            self.slots.push(DynSlot { sql: Box::from(sql), prepared: None });
+        }
+    }
+
+    /// Evict the oldest PENDING slot if the cache is at capacity, freeing a slot
+    /// WITHOUT touching any server-side statement. If every slot is READY (all
+    /// promoted), nothing is evicted — a new query then stays on the fused path
+    /// rather than a READY statement being dropped (which would leak it).
+    fn make_room(&mut self) {
+        if self.slots.len() < DYN_STMT_CACHE_CAP {
+            return;
+        }
+        if let Some(i) = self.slots.iter().position(|s| s.prepared.is_none()) {
+            self.slots.remove(i);
+        }
+    }
+
+    /// Empty the cache, returning every READY prepared statement so the caller
+    /// can `Close` its server-side statement (a PENDING slot holds none). Used by
+    /// [`reset_session`](Core::reset_session) to CLEAR the cache on a pool
+    /// checkout — after this the cache is empty and no server-side statement is
+    /// orphaned.
+    fn drain(&mut self) -> Vec<PreparedStatement> {
+        let mut out = Vec::new();
+        for slot in self.slots.drain(..) {
+            if let Some(stmt) = slot.prepared {
+                out.push(stmt);
+            }
+        }
+        out
+    }
+}
+
 /// The transport-generic driver engine: the shared owner of the sans-IO
 /// [`Engine`] + liveness token, defining every non-I/O verb once.
 ///
@@ -193,6 +369,11 @@ pub struct Core<S: Transport<Error = io::Error>> {
     secret_key: Sensitive<i32>,
     /// Monotonic counter for generating fresh prepared-statement names.
     stmt_counter: u32,
+    /// The bounded per-connection cache of DYNAMIC prepared statements, keyed on
+    /// SQL text (see [`DynStmtCache`]) — plan reuse for the runtime
+    /// `query_params` / `execute_params` family. Off the compile-checked typed
+    /// path (which caches in the engine); this is the driver-level dynamic peer.
+    dyn_cache: DynStmtCache,
     /// The bounded, counted no-drop buffer of asynchronous notifications. Every
     /// verb's sink is wrapped with [`capture_notify`] so a `NOTIFY` arriving on
     /// any command's response stream is buffered here rather than dropped.
@@ -235,6 +416,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             backend_pid,
             secret_key: Sensitive::new(secret_key),
             stmt_counter: 0,
+            dyn_cache: DynStmtCache::new(),
             notifications: NotificationLedger::new(),
             #[cfg(feature = "n1-detect")]
             n1_tracker: crate::N1Tracker::new(),
@@ -500,22 +682,88 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         Ok(collector.affected())
     }
 
-    /// Run a one-shot runtime-SQL query with params in ONE round trip.
+    /// Run a runtime-SQL query with params, transparently reusing a cached
+    /// server-side plan for a REPEATED query.
+    ///
+    /// A one-shot query still costs ONE round trip: the FIRST sighting of a SQL
+    /// runs the fused unnamed path (a single
+    /// `Parse`(unnamed)/`Bind`/`Describe`(portal)/`Execute`/`Sync` flush, see
+    /// [`query_params_uncached`](Self::query_params_uncached)), so a query run
+    /// once pays nothing extra. A query run AGAIN is prepared to a named
+    /// server-side statement (one one-time extra round trip on its second
+    /// sighting) and every LATER call reuses that plan in ONE round trip
+    /// (`Bind`/`Execute`/`Sync`, no server-side re-parse or re-plan) — strictly
+    /// better than re-parsing the SQL on every call. The cache is INVISIBLE (the
+    /// verb still takes SQL text), bounded, and self-healing: see [`DynStmtCache`].
+    ///
+    /// A schema change that invalidates a cached plan surfaces the classified
+    /// server error ONCE (`0A000` / `26000`) while the cache reclaims the stale
+    /// statement; the next sighting re-prepares against the current schema, so a
+    /// stale result is never returned silently.
+    pub async fn query_params<P: ParamsWriter>(
+        &mut self,
+        sql: &str,
+        params: &P,
+    ) -> Result<QueryResult, DriverError> {
+        if let Some(idx) = self.dyn_cache.ready_index(sql) {
+            // REUSE: Bind+Execute+Sync on the cached named statement (no re-parse).
+            let Some(stmt) = self.dyn_cache.take(idx) else {
+                return self.query_params_uncached(sql, params).await;
+            };
+            return match self.query_prepared(&stmt, params).await {
+                Ok(qr) => {
+                    self.dyn_cache.restore(idx, stmt);
+                    Ok(qr)
+                }
+                Err(e) if e.is_stale_prepared_plan() => {
+                    // The cached plan went stale (schema change / out-of-band
+                    // DEALLOCATE): reclaim the server-side statement and evict, so
+                    // the next sighting re-warms via the fused→pending→promote flow
+                    // (the fused re-run observes the current schema). Surface the
+                    // error once — a schema change is a loud, self-healing event.
+                    self.dyn_cache.remove(idx);
+                    self.close_statement(stmt).await?;
+                    Err(e)
+                }
+                Err(e) => {
+                    // A data error (a constraint violation, a bad cast) does NOT
+                    // invalidate the plan — keep it cached and surface the error.
+                    self.dyn_cache.restore(idx, stmt);
+                    Err(e)
+                }
+            };
+        }
+        if self.dyn_cache.is_pending(sql) {
+            // PROMOTE (second sighting): prepare a named statement, run it, and
+            // cache the (valid) statement regardless of the execute OUTCOME — a
+            // data error does not invalidate a freshly-prepared plan.
+            let stmt = self.prepare(sql).await?;
+            let out = self.query_prepared(&stmt, params).await;
+            self.dyn_cache.promote(sql, stmt);
+            return out;
+        }
+        // FIRST sighting: the fused one-round-trip path; note it PENDING on success.
+        let qr = self.query_params_uncached(sql, params).await?;
+        self.dyn_cache.note_pending(sql);
+        Ok(qr)
+    }
+
+    /// Run a one-shot runtime-SQL query with params in ONE round trip, WITHOUT
+    /// the plan cache — the fused primitive behind [`query_params`](Self::query_params).
     ///
     /// Fuses `Parse`(unnamed) + `Bind` + `Describe`(portal) + `Execute` + `Sync`
     /// into a single flush (see [`Engine::query_params_fused`]), so a one-shot
-    /// parameterised query costs ONE round trip instead of the three the old
-    /// prepare / bind+execute / close sequence took. The result schema (OIDs +
-    /// names) is recovered from the inline `Describe`(portal) `RowDescription`, so
-    /// the [`QueryResult`]'s column names come straight from the collector — no
+    /// parameterised query costs ONE round trip. The result schema (OIDs + names)
+    /// is recovered from the inline `Describe`(portal) `RowDescription`, so the
+    /// [`QueryResult`]'s column names come straight from the collector — no
     /// separate `prepare` round trip. The unnamed statement is implicitly
     /// discarded at the next `Parse`, so no `Close` is needed and the
-    /// prepared-statement cache is untouched. For a query executed REPEATEDLY,
-    /// prefer an explicit [`prepare`](Self::prepare) +
-    /// [`query_prepared`](Self::query_prepared) to amortize the parse.
+    /// prepared-statement cache is untouched. This is the FIRST-sighting path;
+    /// [`query_params`](Self::query_params) promotes a repeated query to a cached
+    /// named statement.
     ///
     /// [`Engine::query_params_fused`]: bsql_postgres_proto::engine::Engine::query_params_fused
-    pub async fn query_params<P: ParamsWriter>(
+    async fn query_params_uncached<P: ParamsWriter>(
         &mut self,
         sql: &str,
         params: &P,
@@ -558,14 +806,57 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         Ok(self.query_params(sql, params).await?.get(0))
     }
 
-    /// Run a one-shot runtime-SQL command with params in ONE round trip,
-    /// returning the affected-row count.
-    ///
-    /// The side-effect twin of [`query_params`](Self::query_params): the same
-    /// fused `Parse`+`Bind`+`Describe`+`Execute`+`Sync` single round trip. A
-    /// no-RETURNING command answers the `Describe`(portal) with `NoData`; the
-    /// affected count rides the `CommandComplete` tag exactly as before.
+    /// Run a runtime-SQL command with params, returning the affected-row count —
+    /// the side-effect twin of [`query_params`](Self::query_params), with the
+    /// SAME transparent dynamic plan cache (first sighting fused, repeats reuse a
+    /// cached named statement in one round trip). A no-RETURNING command answers
+    /// the `Describe`(portal) with `NoData`; the affected count rides the
+    /// `CommandComplete` tag. Self-heals a stale cached plan exactly as
+    /// [`query_params`](Self::query_params) does.
     pub async fn execute_params<P: ParamsWriter>(
+        &mut self,
+        sql: &str,
+        params: &P,
+    ) -> Result<u64, DriverError> {
+        if let Some(idx) = self.dyn_cache.ready_index(sql) {
+            // REUSE: Bind+Execute+Sync on the cached named statement.
+            let Some(stmt) = self.dyn_cache.take(idx) else {
+                return self.execute_params_uncached(sql, params).await;
+            };
+            return match self.execute_prepared(&stmt, params).await {
+                Ok(n) => {
+                    self.dyn_cache.restore(idx, stmt);
+                    Ok(n)
+                }
+                Err(e) if e.is_stale_prepared_plan() => {
+                    self.dyn_cache.remove(idx);
+                    self.close_statement(stmt).await?;
+                    Err(e)
+                }
+                Err(e) => {
+                    self.dyn_cache.restore(idx, stmt);
+                    Err(e)
+                }
+            };
+        }
+        if self.dyn_cache.is_pending(sql) {
+            // PROMOTE (second sighting).
+            let stmt = self.prepare(sql).await?;
+            let out = self.execute_prepared(&stmt, params).await;
+            self.dyn_cache.promote(sql, stmt);
+            return out;
+        }
+        // FIRST sighting: fused; note PENDING on success.
+        let n = self.execute_params_uncached(sql, params).await?;
+        self.dyn_cache.note_pending(sql);
+        Ok(n)
+    }
+
+    /// Run a one-shot runtime-SQL command with params in ONE round trip, WITHOUT
+    /// the plan cache — the fused primitive behind [`execute_params`](Self::execute_params).
+    /// Shares the fused wire with [`query_params_uncached`](Self::query_params_uncached);
+    /// the affected count rides the `CommandComplete` tag.
+    async fn execute_params_uncached<P: ParamsWriter>(
         &mut self,
         sql: &str,
         params: &P,
@@ -1095,16 +1386,21 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     }
 
     /// Reset all BLEEDABLE session state so this connection can be safely reused
-    /// by a different logical user, WITHOUT dropping prepared statements.
+    /// by a different logical user.
     ///
     /// Runs `DISCARD ALL` MINUS `DEALLOCATE ALL` / `DISCARD PLANS` in one
     /// simple-query round trip (prefixed with `ROLLBACK` only when inside a
     /// transaction, decided from the cached `ReadyForQuery` tx status so the
-    /// common idle path costs no extra round trip), then clears the notification
-    /// ledger and the N+1 recency window. Prepared statements — content-addressed
-    /// plans safe to share across logical users — are deliberately KEPT so the
-    /// server-side plan reuse survives a pool checkout with NO cache
-    /// invalidation. See each driver's `reset_session` for the full rationale.
+    /// common idle path costs no extra round trip), then CLEARS the DYNAMIC
+    /// prepared-statement cache (`Close`ing each cached server-side statement for
+    /// pool hygiene — a runtime-SQL plan can depend on the preparing user's
+    /// session state, so a new user must not reuse it; see [`DynStmtCache`]), and
+    /// clears the notification ledger and the N+1 recency window. The engine's
+    /// compile-checked (TYPED) statement cache — content-addressed COMPILE-TIME
+    /// plans, identical across users and thus safe to share — is deliberately
+    /// KEPT (`DISCARD` excludes `DEALLOCATE ALL` / `DISCARD PLANS`), so the typed
+    /// flagship's server-side plan reuse survives the checkout. See each driver's
+    /// `reset_session` for the full rationale.
     pub async fn reset_session(&mut self) -> Result<(), DriverError> {
         const RESET: &str = "SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; \
              UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
@@ -1122,6 +1418,15 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             RESET_WITH_ROLLBACK
         };
         self.simple_query(sql).await?;
+        // CLEAR the dynamic prepared-statement cache: a pooled connection handed
+        // to a different logical user must not reuse the prior user's cached
+        // runtime-SQL plans. Close each READY server-side statement so nothing is
+        // orphaned (a protocol `Close` of an already-dropped statement is a wire
+        // no-op, so this is robust even after a mid-session `DISCARD`/`DEALLOCATE`).
+        // Done AFTER the reset round trip — the connection is idle and drained.
+        for stmt in self.dyn_cache.drain() {
+            self.close_statement(stmt).await?;
+        }
         // Clear the ledger AFTER the reset round trip: `UNLISTEN *` stops new
         // notifications, and this discards every notification captured before or
         // during the reset — so a pooled connection never delivers a prior user's
@@ -1638,5 +1943,121 @@ mod stmt_name_render_tests {
         assert_eq!(render(42), "_bsql_42");
         // u32::MAX is 10 digits — the widest name (6 + 10 = 16 = capacity).
         assert_eq!(render(u32::MAX), "_bsql_4294967295");
+    }
+}
+
+#[cfg(test)]
+mod dyn_cache_tests {
+    //! Offline invariants of the dynamic prepared-statement cache — the pure
+    //! data-structure logic (promotion, bounded eviction, take/restore/remove)
+    //! driven directly, no wire. The end-to-end reuse + self-heal is witnessed
+    //! by the `--ignored` live tests (they need a real server to Parse against).
+
+    use super::{DynStmtCache, PreparedStatement, StmtName, WireStatement, DYN_STMT_CACHE_CAP};
+    use std::sync::Arc;
+
+    /// A fabricated cached statement — the cache never inspects its contents (it
+    /// only owns/moves it), so an empty OID/name payload is enough.
+    fn fake_prepared(name: &str) -> PreparedStatement {
+        let stmt_name = StmtName::try_from_str(name).expect("valid _bsql name");
+        PreparedStatement {
+            inner: WireStatement::new(stmt_name, Vec::new()),
+            column_names: Arc::from(Vec::<String>::new().into_boxed_slice()),
+        }
+    }
+
+    #[test]
+    fn promotion_flips_pending_to_ready() {
+        let mut cache = DynStmtCache::new();
+        cache.note_pending("SELECT 1");
+        assert!(cache.is_pending("SELECT 1"));
+        assert!(cache.ready_index("SELECT 1").is_none());
+
+        cache.promote("SELECT 1", fake_prepared("_bsql_0"));
+        assert!(!cache.is_pending("SELECT 1"));
+        assert!(cache.ready_index("SELECT 1").is_some());
+        // Promotion is in place — no extra slot grew.
+        assert_eq!(cache.slots.len(), 1);
+    }
+
+    #[test]
+    fn take_restore_remove_round_trip() {
+        let mut cache = DynStmtCache::new();
+        cache.note_pending("Q");
+        cache.promote("Q", fake_prepared("_bsql_1"));
+        let idx = cache.ready_index("Q").expect("ready");
+
+        let stmt = cache.take(idx).expect("some");
+        // Taken out → the slot reads as pending until restored.
+        assert!(cache.is_pending("Q"));
+        cache.restore(idx, stmt);
+        assert!(cache.ready_index("Q").is_some());
+
+        cache.remove(idx);
+        assert!(cache.ready_index("Q").is_none());
+        assert!(!cache.is_pending("Q"));
+        assert_eq!(cache.slots.len(), 0);
+    }
+
+    #[test]
+    fn bounded_at_capacity_evicting_oldest_pending() {
+        let mut cache = DynStmtCache::new();
+        for i in 0..DYN_STMT_CACHE_CAP {
+            cache.note_pending(&format!("sql-{i}"));
+        }
+        assert_eq!(cache.slots.len(), DYN_STMT_CACHE_CAP);
+        // One more first-sighting evicts the OLDEST pending (sql-0), never grows.
+        cache.note_pending("sql-new");
+        assert_eq!(cache.slots.len(), DYN_STMT_CACHE_CAP);
+        assert!(!cache.is_pending("sql-0"), "oldest pending evicted");
+        assert!(cache.is_pending("sql-new"));
+        assert!(cache.is_pending("sql-1"), "younger pending retained");
+    }
+
+    #[test]
+    fn ready_slots_are_never_evicted() {
+        // Fill the cache with READY statements (promote every slot).
+        let mut cache = DynStmtCache::new();
+        for i in 0..DYN_STMT_CACHE_CAP {
+            let sql = format!("ready-{i}");
+            cache.note_pending(&sql);
+            cache.promote(&sql, fake_prepared(&format!("_bsql_{i}")));
+        }
+        assert_eq!(cache.slots.len(), DYN_STMT_CACHE_CAP);
+        // A NEW first sighting cannot evict a READY slot (which would leak its
+        // server-side statement) — so it is simply NOT cached (stays fused).
+        cache.note_pending("overflow");
+        assert_eq!(cache.slots.len(), DYN_STMT_CACHE_CAP);
+        assert!(!cache.is_pending("overflow"), "overflow not tracked");
+        // Every READY statement survived.
+        for i in 0..DYN_STMT_CACHE_CAP {
+            assert!(cache.ready_index(&format!("ready-{i}")).is_some());
+        }
+    }
+
+    #[test]
+    fn note_pending_is_idempotent() {
+        let mut cache = DynStmtCache::new();
+        cache.note_pending("dup");
+        cache.note_pending("dup");
+        assert_eq!(cache.slots.len(), 1);
+    }
+
+    #[test]
+    fn drain_returns_ready_statements_and_empties() {
+        // Two READY + one PENDING: drain returns the two prepared statements (for
+        // the caller to Close) and leaves the cache empty (the pool-checkout clear).
+        let mut cache = DynStmtCache::new();
+        cache.note_pending("r1");
+        cache.promote("r1", fake_prepared("_bsql_1"));
+        cache.note_pending("r2");
+        cache.promote("r2", fake_prepared("_bsql_2"));
+        cache.note_pending("p1"); // stays pending — no server-side statement
+
+        let ready = cache.drain();
+        assert_eq!(ready.len(), 2, "only the READY statements are returned to Close");
+        assert_eq!(cache.slots.len(), 0, "the cache is empty after a drain");
+        assert!(cache.ready_index("r1").is_none());
+        assert!(!cache.is_pending("p1"));
     }
 }

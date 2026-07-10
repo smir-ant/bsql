@@ -368,6 +368,147 @@ async fn runtime_path_binds_non_copy_params() {
     c.close().await.expect("close");
 }
 
+/// WITNESS: the DYNAMIC prepared-statement cache is transparent and correct —
+/// the SAME parameterized SQL run many times with DIFFERENT params returns each
+/// call's OWN row. The first sighting runs the fused unnamed path, the second
+/// prepares a named statement, and every later call reuses the server-side plan
+/// (`Bind`+`Execute`, no re-parse); a leaked binding or a mis-reused plan would
+/// return a stale row. Also asserts a genuinely one-shot query (a distinct SQL
+/// run once) still works — it never leaves the fused path.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn dynamic_cache_reuse_returns_correct_rows() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    // The SAME SQL text, executed across the loop with different params — the
+    // fused→promote→reuse progression happens inside `query_params`. Each result
+    // must be the call's own value (text-format dynamic Row).
+    let sql = "SELECT ($1::int * 10) AS v";
+    for round in 0..3 {
+        for i in 0..20_i32 {
+            let row = c.query_params_one(sql, &(i,)).await.expect("cached reuse");
+            assert_eq!(
+                row.get_i32(0),
+                Ok(Some(i * 10)),
+                "round {round}, i {i}: cached plan returned the wrong row"
+            );
+        }
+    }
+
+    // A one-shot distinct SQL (run once) still works via the fused path.
+    let one = c
+        .query_params_one("SELECT $1::int + 7 AS w", &(35_i32,))
+        .await
+        .expect("one-shot fused");
+    assert_eq!(one.get_i32(0), Ok(Some(42)));
+
+    c.close().await.expect("close");
+}
+
+/// WITNESS: the cache SELF-HEALS a stale plan after a schema change, never
+/// returning a silently-stale result. A cached `SELECT *` whose result type
+/// changes (an `ALTER TABLE ... ADD COLUMN`) surfaces the classified `0A000`
+/// server error ONCE while the cache reclaims the stale statement; the NEXT
+/// call re-prepares against the current schema and returns the new column set.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn dynamic_cache_self_heals_after_schema_change() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    c.execute_sql("DROP TABLE IF EXISTS bsql_cache_heal").await.expect("drop");
+    c.execute_sql("CREATE TABLE bsql_cache_heal (id int, name text)")
+        .await
+        .expect("create");
+    c.execute_sql("INSERT INTO bsql_cache_heal VALUES (1, 'a'), (2, 'b')")
+        .await
+        .expect("seed");
+
+    let sql = "SELECT * FROM bsql_cache_heal WHERE id >= $1 ORDER BY id";
+    // Three runs: first sighting (fused) → second (promote to a named statement)
+    // → third (reuse the cached plan). All see the 2-column schema.
+    for _ in 0..3 {
+        let r = c.query_params(sql, &(0_i32,)).await.expect("pre-alter");
+        assert_eq!(r.column_names.len(), 2, "two columns before ALTER");
+        assert_eq!(r.len(), 2);
+    }
+
+    // Change the result type — the cached plan is now stale.
+    c.execute_sql("ALTER TABLE bsql_cache_heal ADD COLUMN extra int DEFAULT 0")
+        .await
+        .expect("alter");
+
+    // The next reuse binds the STALE cached plan: PG rejects it with `0A000`
+    // ("cached plan must not change result type"). The cache surfaces it ONCE and
+    // evicts + reclaims the server-side statement.
+    match c.query_params(sql, &(0_i32,)).await {
+        Err(DriverError::Db(db)) => {
+            assert!(db.is_code("0A000"), "expected the stale-cached-plan SQLSTATE 0A000, got {}", db.code);
+        }
+        other => panic!("expected a 0A000 stale-plan error, got {other:?}"),
+    }
+
+    // Self-healed: the next call re-prepares against the CURRENT schema (three
+    // columns now) and returns correct rows — never a silently-stale 2-column
+    // result. Run it TWICE to prove the re-warmed cache is correct on reuse too.
+    for _ in 0..2 {
+        let r = c.query_params(sql, &(0_i32,)).await.expect("post-heal");
+        assert_eq!(r.column_names.len(), 3, "three columns after ALTER + self-heal");
+        assert_eq!(r.len(), 2);
+    }
+
+    c.execute_sql("DROP TABLE bsql_cache_heal").await.expect("cleanup");
+    c.close().await.expect("close");
+}
+
+/// WITNESS: `reset_session` CLEARS the dynamic prepared-statement cache for pool
+/// hygiene, `Close`ing the cached server-side statements. Observed directly via
+/// `pg_prepared_statements`: a query cached to a named statement is PRESENT
+/// before the reset and ABSENT after, and the query still returns correct
+/// results afterward (the re-warm). A DIFFERENT logical user checked out of the
+/// pool therefore never inherits the prior user's runtime-SQL plans.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn reset_session_clears_the_dynamic_prepared_cache() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+
+    // Count bsql-named prepared statements the server currently holds.
+    async fn bsql_stmt_count(c: &mut Connection) -> i64 {
+        let row = c
+            .query_one_sql("SELECT count(*) FROM pg_prepared_statements WHERE name ~ '^_bsql_'")
+            .await
+            .expect("count query");
+        match row.get_i64(0) {
+            Ok(Some(n)) => n,
+            other => panic!("count was not an i64: {other:?}"),
+        }
+    }
+
+    // Run the SAME dynamic query TWICE so it is promoted to a cached NAMED
+    // server-side statement (first sighting fused, second prepares + caches).
+    let sql = "SELECT ($1::int + 1) AS v";
+    for _ in 0..2 {
+        let row = c.query_params_one(sql, &(41_i32,)).await.expect("cache warm");
+        assert_eq!(row.get_i32(0), Ok(Some(42)));
+    }
+    assert!(bsql_stmt_count(&mut c).await >= 1, "a named statement is cached before reset");
+
+    // The pool-hygiene clear: close + forget the cached statements.
+    c.reset_session().await.expect("reset_session");
+    assert_eq!(
+        bsql_stmt_count(&mut c).await,
+        0,
+        "reset_session must Close every cached dynamic statement"
+    );
+
+    // Re-warm: the same query still returns correct results (a fresh first sighting).
+    let r = c.query_params_one(sql, &(41_i32,)).await.expect("re-warm");
+    assert_eq!(r.get_i32(0), Ok(Some(42)));
+    c.close().await.expect("close");
+}
+
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn streaming_1k_rows() {

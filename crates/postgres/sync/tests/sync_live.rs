@@ -1525,3 +1525,21 @@ fn copy_in_streaming_bulk_constant_memory() {
     );
     c.close().expect("close");
 }
+
+/// WITNESS (blocking driver): the DYNAMIC prepared-statement cache is
+/// transparent and correct on the SYNC driver too — the same Core cache logic,
+/// driven single-poll. The SAME parameterized SQL run many times with different
+/// params returns each call's own row (no leaked binding, no mis-reused plan).
+#[test]
+#[ignore = "requires local PG"]
+fn dynamic_cache_reuse_returns_correct_rows_sync() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    let sql = "SELECT ($1::int * 10) AS v";
+    for round in 0..3 {
+        for i in 0..20_i32 {
+            let row = c.query_params_one(sql, &(i,)).expect("cached reuse");
+            assert_eq!(row.get_i32(0), Ok(Some(i * 10)), "round {round}, i {i}");
+        }
+    }
+    c.close().expect("close");
+}

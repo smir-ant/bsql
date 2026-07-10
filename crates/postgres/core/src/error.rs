@@ -281,6 +281,32 @@ pub enum DriverError {
 // new wide variant that would re-inflate the enum.
 crate::footprint_pin!(DriverError, size = 24, align = 8);
 
+impl DriverError {
+    /// `true` if this is a server error whose SQLSTATE says a CACHED prepared
+    /// plan is no longer valid on this connection — the signal the dynamic
+    /// prepared-statement cache uses to evict and re-warm.
+    ///
+    /// Two codes qualify:
+    /// - `0A000` (`feature_not_supported`) carries PostgreSQL's "cached plan must
+    ///   not change result type" — a schema change altered a cached statement's
+    ///   result columns, so the stored plan can no longer be executed. In the
+    ///   cache's REUSE path this code can arise ONLY from a stale cached plan: a
+    ///   genuine unsupported-feature `0A000` would already have failed the query's
+    ///   FIRST (fused, unnamed) sighting, so it would never have been cached.
+    /// - `26000` (`invalid_sql_statement_name`) — the cached server-side statement
+    ///   was dropped out of band (`DEALLOCATE ALL` / `DISCARD ALL` run as SQL),
+    ///   so a `Bind` to it now fails.
+    ///
+    /// On either, the cache reclaims the stale statement and surfaces the error
+    /// once; the next sighting re-prepares against the current schema (the
+    /// fused→pending→promote re-warm), so a schema change is a loud, self-healing
+    /// event, never a silently-stale result.
+    #[must_use]
+    pub(crate) fn is_stale_prepared_plan(&self) -> bool {
+        matches!(self, Self::Db(db) if db.is_code("0A000") || db.is_code("26000"))
+    }
+}
+
 impl fmt::Display for DriverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

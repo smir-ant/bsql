@@ -47,7 +47,7 @@ crates/
   bsql/              — umbrella facade + query! re-export + #[bsql::test] harness (bsql::pg, ::pg_sync, ::sqlite)  — 947 LoC
   postgres/
     proto/           — sans-IO wire protocol + session engine (no_std + alloc) + PGCOPY binary framing + TypedCopyIn  — 29678 LoC
-    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + N+1 detector + SafeIdent guard + cancel key/redial + copy_in_typed  — 10766 LoC
+    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + N+1 detector + SafeIdent guard + cancel key/redial + copy_in_typed + dynamic prepared-statement cache  — 11256 LoC
     async/           — tokio async driver (plugs its socket into the shared Core<S>) + CancelToken  — 2549 LoC
     sync/            — std::net blocking driver (plugs its socket into the shared Core<S>) + CancelToken  — 2480 LoC
   sqlite/
@@ -412,10 +412,39 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 - `ConnectConfig` is `#[non_exhaustive]` — construct via `new()` + builder methods
   (`footprint_pin!`-ed at 152 bytes)
 - Runtime parameterized queries (`query_params` / `query_params_one` /
-  `execute_params`) execute in a SINGLE round trip: `Parse`(unnamed) + `Bind` +
-  `Describe`(portal) + `Execute` + `Sync` are fused into one flush, so a one-shot
-  dynamic query costs one network round trip, not three (a separate prepare +
-  bind + close).
+  `execute_params`) cost a SINGLE round trip whether run once or repeatedly, via a
+  transparent per-connection dynamic prepared-statement cache keyed on SQL TEXT
+  (`DynStmtCache` in `bsql-postgres-core`). The FIRST sighting of a SQL runs the
+  fused unnamed path (`Parse`(unnamed) + `Bind` + `Describe`(portal) + `Execute` +
+  `Sync` in one flush — a one-shot query costs one round trip, not three), so a
+  query run once pays nothing. A query run AGAIN is prepared to a named
+  server-side statement (one one-time extra round trip on its SECOND sighting) and
+  every later call reuses that plan in ONE round trip (`Bind`+`Execute`+`Sync`, NO
+  server-side re-parse / re-plan) — strictly better than re-parsing on every call
+  (the original bsql's behavior, and the ~14% the fused-only path lost on a
+  repeated dynamic query; measured `pg_dynamic_4clauses` ~165 µs fused-only →
+  ~153 µs cached, matching the original and the C libpq reference). The cache is
+  INVISIBLE (the verb still takes SQL text), preparing on the SECOND sighting
+  specifically so a genuinely one-shot query is never regressed from one round
+  trip to two. It is BOUNDED (32 hot SQLs; a first sighting evicts the oldest
+  PENDING slot — which holds no server-side statement, so eviction is free — and a
+  READY statement is never evicted, so nothing leaks), SELF-HEALING (a schema
+  change or out-of-band `DEALLOCATE` surfaces the classified `0A000` / `26000`
+  once while the cache reclaims the stale statement and re-warms against the
+  current schema — never a silently-stale result), and CLEARED by `reset_session`
+  for pool hygiene (a pooled connection handed to a different logical user must
+  not reuse the prior user's runtime-SQL plans, whose resolution can depend on
+  the preparing user's session state — a `SET search_path`, a temp table; the
+  clear `Close`s each cached server-side statement, a wire no-op if already
+  dropped, so nothing is orphaned). This CONTRASTS with the engine's
+  compile-checked (TYPED) statement cache, which `reset_session` deliberately
+  KEEPS: a content-addressed COMPILE-TIME plan is identical across all logical
+  users and thus safe to share (`DISCARD` excludes `DEALLOCATE ALL` / `DISCARD
+  PLANS`). A DIRECT (non-pooled) connection never calls `reset_session`, so its
+  dynamic cache persists for the connection's life. The typed `query!` path
+  caches in the ENGINE (a content-addressed named statement with a
+  Close-before-Parse idempotent MISS path); this is its driver-level DYNAMIC
+  peer.
 - `copy_in` batches streamed `CopyData` to a 64 KiB threshold before flushing (a
   single chunk at or above the threshold streams DIRECTLY from the borrowed
   slice, never copied into the buffer), so a megarow bulk load costs about
