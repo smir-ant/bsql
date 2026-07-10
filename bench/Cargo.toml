@@ -23,10 +23,16 @@ edition = "2024"
 publish = false
 
 [dependencies]
-# The rebuild under test — by path. Both PG drivers, no SQLite (unused here).
+# The rebuild under test — by path. Both PG drivers + the embedded SQLite driver
+# (the parity runners exercise the full original matrix, which spans both
+# backends). This is a `publish = false` STANDALONE workspace, so the added
+# `sqlite`/rusqlite subtree lands ONLY in this crate's own lock — never in the
+# shipped `deps_pin` / `runtime_graph_pin` gates.
 bsql = { path = "../crates/bsql", default-features = false, features = [
     "postgres-async",
     "postgres-sync",
+    "sqlite",
+    "macros",
 ] }
 
 # Async runtime. current-thread flavour is what the single-connection benches
@@ -48,6 +54,12 @@ sqlx = { version = "0.8", default-features = false, features = [
 # a `publish = false` project outside the shipped graph, so the small justified
 # FFI here never reaches any shipped artifact.
 libc = "0.2"
+
+[build-dependencies]
+# BUILD-DEP ONLY — replays `migrations/` into the `query!` catalog (exactly the
+# placement a real consumer uses). `publish = false` standalone workspace, so
+# this build edge never enters the shipped `deps_pin` / `runtime_graph_pin`.
+bsql-build = { path = "../crates/build" }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
@@ -88,6 +100,17 @@ harness = false
 # Peak-RSS harnesses — one binary per client so each measured process links and
 # faults in ONLY that client's code (a single arg-selected binary would leave
 # the other clients' code linked-but-cold, muddying the resident figure).
+# Full-matrix PARITY runners — reproduce the ORIGINAL bsql bench matrix
+# (bench_users/bench_orders schema, original SQL + iteration counts) on the
+# rebuild API, printing `ns/op` in the C runner's shape for a direct diff.
+[[bin]]
+name = "parity_pg"
+path = "src/bin/parity_pg.rs"
+
+[[bin]]
+name = "parity_sqlite"
+path = "src/bin/parity_sqlite.rs"
+
 [[bin]]
 name = "rss_bsql_sync"
 path = "src/bin/rss_bsql_sync.rs"

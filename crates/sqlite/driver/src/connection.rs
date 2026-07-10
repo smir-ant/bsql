@@ -539,6 +539,39 @@ impl<'r> ColumnSource<'r> for BorrowedRow<'r> {
 }
 
 /// An embedded SQLite connection.
+///
+/// # Prepared-statement caching
+///
+/// The EAGER, EXECUTE and typed-single-row verbs prepare their SQL through a
+/// per-connection LRU cache (rusqlite's `prepare_cached`), keyed on the SQL
+/// TEXT: the first call with a given SQL compiles it and every subsequent call
+/// with the SAME text reuses the compiled bytecode instead of recompiling. For
+/// a small query re-run in a loop (a by-key lookup, an insert) the recompile is
+/// the dominant cost, so caching it is a large win. The cache is invisible to
+/// the caller — the verbs still take SQL text — and correct by construction: a
+/// returned statement is RESET and its bindings CLEARED before it re-enters the
+/// cache (no value leaks between calls), and a schema change (an `ALTER TABLE`
+/// after a statement was cached) is handled by SQLite's `prepare_v3`
+/// auto-reprepare — the next step transparently recompiles, or, if the change
+/// made the SQL invalid, surfaces a CLASSIFIED [`SqliteError`], never a
+/// silently-stale result. The cache holds at most a bounded number of idle
+/// statements (default 16, see
+/// [`Self::set_prepared_statement_cache_capacity`]); both the typed flagship's
+/// `&'static` const SQL and the dynamic verbs' arbitrary `&str` are valid keys
+/// (the dynamic path's LRU eviction bounds the retained set).
+///
+/// The STREAMING verbs ([`query_each_sql`](Self::query_each_sql) /
+/// [`query_each_params`](Self::query_each_params) / the typed
+/// [`query_each`](Self::query_each)) deliberately do NOT cache — they prepare
+/// with a plain (non-persistent) statement. rusqlite's cache forces the
+/// `SQLITE_PREPARE_PERSISTENT` flag, which bypasses SQLite's lookaside memory
+/// pool and measurably slows multi-row stepping; on the zero-copy streaming
+/// path there is no per-row materialization to hide that cost, so caching would
+/// REGRESS large-N streaming — the one case streaming exists to serve. On the
+/// eager path the per-cell arena copy fully masks the flag's cost (so caching is
+/// free there), and a streamed scan amortizes its single prepare over every row
+/// anyway. This mirrors the PostgreSQL drivers' prepared-statement reuse for the
+/// bounded verbs while keeping streaming on its fastest primitive.
 pub struct Connection {
     inner: rusqlite::Connection,
     /// The diagnostics-only N+1 query detector. Present ONLY under the
@@ -607,6 +640,27 @@ impl Connection {
         self.inner.busy_timeout(timeout).map_err(SqliteError::from)
     }
 
+    /// Set how many distinct compiled statements this connection retains in its
+    /// prepared-statement cache (default 16).
+    ///
+    /// Every read/execute verb prepares through a per-connection LRU cache
+    /// keyed on the SQL text (see the [`Connection`] type-level caching note),
+    /// so a query re-run in a loop compiles its bytecode ONCE and reuses the
+    /// compiled statement on every subsequent call — the reuse the raw
+    /// `sqlite3_prepare_v2` recompile-per-call would otherwise pay for a small
+    /// query dominantly. The cache holds at most `capacity` idle statements; a
+    /// workload cycling through MORE than `capacity` distinct hot SQL strings
+    /// would evict one about to be reused (a recompile — cache thrash). Raise
+    /// the capacity for such a workload; the default suits the common case of a
+    /// handful of hot queries. `0` disables caching entirely (every call
+    /// recompiles — the honest opt-out).
+    ///
+    /// Bounded by construction: at most `capacity` compiled statements are
+    /// retained, so the cache cannot grow without limit.
+    pub fn set_prepared_statement_cache_capacity(&self, capacity: usize) {
+        self.inner.set_prepared_statement_cache_capacity(capacity);
+    }
+
     /// Mint a detached [`SqliteCancelToken`](crate::SqliteCancelToken) for this
     /// connection's in-flight (or next) query — the cross-backend twin of the
     /// PostgreSQL `conn.cancel_token()`.
@@ -660,7 +714,8 @@ impl Connection {
     /// other dynamic verbs here follow (`query_sql`, `query_one_sql`, …). It frees
     /// the bare `execute` name for a future symmetric typed `execute::<Q>`.
     pub fn execute_sql(&self, sql: &str) -> Result<u64, SqliteError> {
-        Ok(changes_to_u64(self.inner.execute(sql, [])?))
+        let mut stmt = self.inner.prepare_cached(sql)?;
+        Ok(changes_to_u64(stmt.execute([])?))
     }
 
     /// Execute a parameterized statement, returning the number of rows changed.
@@ -675,7 +730,8 @@ impl Connection {
         sql: &str,
         params: &[ValueRef<'_>],
     ) -> Result<u64, SqliteError> {
-        Ok(changes_to_u64(self.inner.execute(sql, rusqlite::params_from_iter(params))?))
+        let mut stmt = self.inner.prepare_cached(sql)?;
+        Ok(changes_to_u64(stmt.execute(rusqlite::params_from_iter(params))?))
     }
 
     /// Run `sql` and eagerly materialize every row.
@@ -710,12 +766,19 @@ impl Connection {
         sql: &str,
         params: impl rusqlite::Params,
     ) -> Result<QueryResult, SqliteError> {
-        let mut stmt = self.inner.prepare(sql)?;
-        let col_count = stmt.column_count();
-        let column_names: Arc<[String]> =
-            stmt.column_names().iter().map(|s| (*s).to_owned()).collect();
-        let mut rows = stmt.query(params)?;
-        Self::drain_into_result(col_count, column_names, &mut rows)
+        let mut stmt = self.inner.prepare_cached(sql)?;
+        // Drain the rows FIRST (in an inner scope that releases the `rows`
+        // borrow), then read the column shape from the STATEMENT. A cached
+        // statement can be schema-stale (its compiled column shape predates an
+        // `ALTER TABLE`); SQLite's `prepare_v3` reprepares it on the first
+        // `sqlite3_step`, so the arena stride and the column names are both read
+        // AFTER that step — never the stale cached width, which would silently
+        // truncate cells or mis-report the columns.
+        let builder = {
+            let mut rows = stmt.query(params)?;
+            Self::drain_cells(&mut rows)?
+        };
+        Self::seal_result(&stmt, builder)
     }
 
     /// Typed-flagship eager-collect: bind the compile-checked `$N` parameter
@@ -729,33 +792,63 @@ impl Connection {
         sql: &str,
         params: &P,
     ) -> Result<QueryResult, SqliteError> {
-        let mut stmt = self.inner.prepare(sql)?;
-        let col_count = stmt.column_count();
-        let column_names: Arc<[String]> =
-            stmt.column_names().iter().map(|s| (*s).to_owned()).collect();
+        let mut stmt = self.inner.prepare_cached(sql)?;
         ensure_param_count(&stmt, P::COUNT)?;
         params.bind_positional(&mut stmt)?;
-        let mut rows = stmt.raw_query();
-        Self::drain_into_result(col_count, column_names, &mut rows)
+        // Same schema-safe order as [`Self::query_collect`]: drain (which steps,
+        // triggering any reprepare) in an inner scope, then read the current
+        // column shape from the reprepared statement.
+        let builder = {
+            let mut rows = stmt.raw_query();
+            Self::drain_cells(&mut rows)?
+        };
+        Self::seal_result(&stmt, builder)
     }
 
-    /// Drain every row of a prepared query into ONE shared arena + lazy
-    /// [`RowSet`] — the collect loop shared by the dynamic
-    /// [`Self::query_collect`] and the typed [`Self::query_collect_typed`], so
-    /// the two bind paths (dynamic `&[ValueRef]` vs typed tuple) converge on one
-    /// arena-materialize with no drift.
-    fn drain_into_result(
-        col_count: usize,
-        column_names: Arc<[String]>,
-        rows: &mut rusqlite::Rows<'_>,
-    ) -> Result<QueryResult, SqliteError> {
-        let mut builder = ArenaBuilder::new(col_count);
+    /// Drain every row of a started query into ONE shared arena builder — the
+    /// collect loop shared by the dynamic [`Self::query_collect`] and the typed
+    /// [`Self::query_collect_typed`], so the two bind paths (dynamic
+    /// `&[ValueRef]` vs typed tuple) converge on one arena-materialize with no
+    /// drift.
+    ///
+    /// The column stride is taken from the FIRST row's own column count — read
+    /// AFTER its `sqlite3_step`, so it reflects any schema-cookie reprepare the
+    /// (possibly cached) statement underwent, never the stale compiled width. A
+    /// zero-row result yields an empty builder; [`Self::seal_result`] reports the
+    /// columns from the reprepared statement.
+    fn drain_cells(rows: &mut rusqlite::Rows<'_>) -> Result<ArenaBuilder, SqliteError> {
+        let mut builder: Option<ArenaBuilder> = None;
         while let Some(row) = rows.next()? {
-            for col in 0..col_count {
-                builder.push_ref(row.get_ref(col)?);
+            let b =
+                builder.get_or_insert_with(|| ArenaBuilder::new(row.as_ref().column_count()));
+            // `b.n_cols` is the first row's post-reprepare width (real SQLite
+            // caps column counts well under `u16::MAX`, so the narrow is exact);
+            // every row of one result set has that same width.
+            for col in 0..usize::from(b.n_cols) {
+                b.push_ref(row.get_ref(col)?);
             }
-            builder.end_row();
+            b.end_row();
         }
+        // `Some` = at least one row set the width; `None` = a zero-row result,
+        // whose empty builder needs no width (`seal_result` reports the columns
+        // from the reprepared statement). An explicit match, not `unwrap_or_*`
+        // (a real empty-result arm, not a silent fallback).
+        match builder {
+            Some(b) => Ok(b),
+            None => Ok(ArenaBuilder::new(0)),
+        }
+    }
+
+    /// Seal a drained builder into a [`QueryResult`], reading the column names
+    /// from the (post-drain, post-reprepare) statement so a cached statement that
+    /// was schema-reprepared mid-query reports the CURRENT columns, never the
+    /// stale cached shape.
+    fn seal_result(
+        stmt: &rusqlite::Statement<'_>,
+        builder: ArenaBuilder,
+    ) -> Result<QueryResult, SqliteError> {
+        let column_names: Arc<[String]> =
+            stmt.column_names().iter().map(|s| (*s).to_owned()).collect();
         let rows = builder.finish(Arc::clone(&column_names))?;
         Ok(QueryResult { rows, column_names })
     }
@@ -803,6 +896,15 @@ impl Connection {
     where
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
     {
+        // Plain `prepare` (NOT `prepare_cached`) on the STREAMING path: the
+        // zero-copy row read has no per-row materialization to mask the cost of
+        // the `SQLITE_PREPARE_PERSISTENT` flag that `prepare_cached` forces —
+        // that flag bypasses SQLite's lookaside pool, measurably slowing
+        // multi-row stepping (a per-row penalty visible ONLY where no copy hides
+        // it, i.e. exactly here). Caching here would regress large-N streaming,
+        // the one thing streaming exists to do well; the eager/execute/typed
+        // verbs (where materialization masks the penalty, or the result is at
+        // most one row) do cache. See the [`Connection`] type-level caching note.
         let mut stmt = self.inner.prepare(sql)?;
         let mut rows = stmt.query(params)?;
         while let Some(row) = rows.next()? {
@@ -964,7 +1066,7 @@ impl Connection {
     where
         Q::Params<'p>: SqliteBindParams,
     {
-        let mut stmt = self.inner.prepare(Q::SQL)?;
+        let mut stmt = self.inner.prepare_cached(Q::SQL)?;
         ensure_param_count(&stmt, <Q::Params<'p> as SqliteBindParams>::COUNT)?;
         params.bind_positional(&mut stmt)?;
         let mut rows = stmt.raw_query();
@@ -1011,6 +1113,11 @@ impl Connection {
     {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::SQL, core::panic::Location::caller());
+        // Plain `prepare` on the typed STREAMING path, for the same reason as
+        // the dynamic `query_each_collect`: a cached (PERSISTENT) statement
+        // bypasses lookaside and regresses multi-row stepping, and this zero-copy
+        // path has no per-row materialization to hide it. See the [`Connection`]
+        // type-level caching note.
         let mut stmt = self.inner.prepare(Q::SQL)?;
         ensure_param_count(&stmt, <Q::Params<'p> as SqliteBindParams>::COUNT)?;
         params.bind_positional(&mut stmt)?;
