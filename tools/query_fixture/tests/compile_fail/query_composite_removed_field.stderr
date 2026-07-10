@@ -1,0 +1,7 @@
+error[E0609]: no field `county` on type `Addr`
+  --> tests/compile_fail/query_composite_removed_field.rs:13:25
+   |
+13 |     let _ = |a: Addr| a.county;
+   |                         ^^^^^^ unknown field
+   |
+   = note: available fields are: `street`, `zip`

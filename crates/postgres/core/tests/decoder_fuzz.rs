@@ -365,6 +365,37 @@ fn array_decoders() -> Vec<NamedDecoder> {
     ]
 }
 
+/// Fully drive a [`CompositeReader`] over `bytes` for a fixed declared arity:
+/// `new` (checks the field-count header), then one `next_field` per declared
+/// field, then `finish` (rejects surplus). Returns whether the whole walk was
+/// `Ok` — the point is that on ANY input it must return, never panic (the probe
+/// harness catches a panic and fails the gate).
+fn drive_composite_reader(bytes: &[u8], arity: u32) -> bool {
+    use bsql_postgres_proto::CompositeReader;
+    let mut r = match CompositeReader::new(bytes, arity) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    for _ in 0..arity {
+        if r.next_field().is_err() {
+            return false;
+        }
+    }
+    r.finish().is_ok()
+}
+
+/// The composite (row-type) frame reader, driven at several declared arities so
+/// the fuzz exercises the count header, the per-field `{oid, len, body}` walk,
+/// the NULL sentinel, and the surplus / truncation classifications.
+fn composite_reader_decoders() -> Vec<NamedDecoder> {
+    vec![
+        ("CompositeReader:arity0", |b| drive_composite_reader(b, 0)),
+        ("CompositeReader:arity1", |b| drive_composite_reader(b, 1)),
+        ("CompositeReader:arity2", |b| drive_composite_reader(b, 2)),
+        ("CompositeReader:arity3", |b| drive_composite_reader(b, 3)),
+    ]
+}
+
 /// The text-format scalar `Cell` decoders, the `FromStr` parsers, the SWAR
 /// fast-paths, and `parse_notification` — everything that parses text or scans
 /// framed bytes. These also receive the ASCII-biased corpus.
@@ -572,6 +603,41 @@ fn craft_array(rng: &mut Rng, out: &mut Vec<u8>, oid_pool: &[u32]) {
     }
 }
 
+/// Craft a semi-structured composite (row-type) binary frame so the fuzz
+/// reaches the `CompositeReader` field walk: a leading `int32` field count from
+/// a pool biased toward the driven arities (0..=3) plus hostile / negative
+/// values, then a bounded number of `{oid i32, len i32, body}` field groups with
+/// the length from a pool including the `-1` NULL sentinel, zero, small widths,
+/// and hostile negative / huge values (the body random and sometimes truncated).
+fn craft_composite(rng: &mut Rng, out: &mut Vec<u8>) {
+    out.clear();
+    let count_pool: [i32; 8] = [0, 1, 2, 3, 4, -1, rng_i32(rng), 0x7FFF_FFFF];
+    let nfields = match rng.pick(&count_pool) {
+        Some(&v) => v,
+        None => 0,
+    };
+    out.extend_from_slice(&nfields.to_be_bytes());
+    // Append a bounded number of field groups regardless of the declared count,
+    // so both the "too few" and "surplus" tails are exercised.
+    let field_groups = rng.bounded(6);
+    for _ in 0..field_groups {
+        let oid = rng.u32();
+        out.extend_from_slice(&oid.to_be_bytes());
+        let len_pool: [i32; 9] = [-1, 0, 1, 2, 4, 8, 16, -5, 0x7FFF_FFFF];
+        let field_len = match rng.pick(&len_pool) {
+            Some(&v) => v,
+            None => 0,
+        };
+        out.extend_from_slice(&field_len.to_be_bytes());
+        if field_len > 0 {
+            let body_len = usize::from(rng.u16() & 0x3f);
+            let mut body = Vec::new();
+            rng.fill(&mut body, body_len);
+            out.extend_from_slice(&body);
+        }
+    }
+}
+
 /// A random `i32` (four fresh bytes, reinterpreted — covers the full signed
 /// range including the negatives the array/`numeric` headers must survive).
 fn rng_i32(rng: &mut Rng) -> i32 {
@@ -602,6 +668,7 @@ fn no_wire_decoder_panics_on_any_input() {
     // ── Assemble the decoder tables.
     let binary_scalars = binary_scalar_decoders();
     let arrays = array_decoders();
+    let composites = composite_reader_decoders();
     let text_misc = text_and_misc_decoders();
     let oid_pool = real_element_oids();
 
@@ -609,6 +676,7 @@ fn no_wire_decoder_panics_on_any_input() {
     let mut all_random: Vec<NamedDecoder> = Vec::new();
     all_random.extend_from_slice(&binary_scalars);
     all_random.extend_from_slice(&arrays);
+    all_random.extend_from_slice(&composites);
     all_random.extend_from_slice(&text_misc);
 
     let mut rng = Rng::new(SEED);
@@ -655,6 +723,16 @@ fn no_wire_decoder_panics_on_any_input() {
     for _ in 0..2500 {
         craft_array(&mut rng, &mut buf, &oid_pool);
         for &(name, dec) in &arrays {
+            tally.record(name, &buf, probe(dec, &buf));
+        }
+    }
+
+    // ── Sweep 5: semi-structured composite frames → the composite reader at
+    // every driven arity (reaches the field-count check, the per-field
+    // `{oid, len, body}` walk, the NULL sentinel, and the surplus classification).
+    for _ in 0..2500 {
+        craft_composite(&mut rng, &mut buf);
+        for &(name, dec) in &composites {
             tally.record(name, &buf, probe(dec, &buf));
         }
     }

@@ -175,17 +175,57 @@ This is exactly the existing "catalog matches migration FILES" boundary, and the
 runtime label check is strictly STRONGER than a native column's (which has no
 runtime OID check at all). The user types ride their own build channel
 (`BSQL_USER_TYPES`), so the schema catalog format and its goldens are untouched;
-`RustType::UserEnum(UserEnumId)` carries a `Copy` index into the catalog. Composite
-types (`CREATE TYPE addr AS (...)`) are a STAGED follow-up (their wire form is the
-PG row-type binary format, a new decode path with no native pivot); a composite
-column is a loud `UnsupportedPgType` until then, never silently wrong. The
-`0014_moods.sql` / `0015_domains.sql` / `0016_alter_type_evolve.sql` migrations in
-`tools/query_fixture` and its `query_enum_live` / `query_domain_live` /
-`query_alter_type_live` / `query_enum_offline` tests are the end-to-end proof
-(decode both twins + nullable + actual NULL; a param round-trip; an unknown label
-classified; a renamed-variant compile-error golden; the domain base decode +
-server-enforced CHECK; and ADD VALUE / RENAME VALUE / RENAME TO evolution
-round-tripping the added / renamed labels).
+`RustType::UserEnum(UserEnumId)` carries a `Copy` index into the catalog. A
+`CREATE TYPE addr AS (street text, zip int4)` COMPOSITE generates a Rust `struct
+Addr { street: Option<String>, zip: Option<i32> }` — one `Option<T>` field per
+attribute, because a composite attribute is ALWAYS nullable on the wire
+(PostgreSQL forbids `NOT NULL` on a `CREATE TYPE ... AS` attribute, and the
+row-type binary frame carries a per-field length that may be `-1`). A `query!`
+selecting an `addr` column DECODES it by walking the row-type binary frame — an
+`int32` field count, then per field a `{uint32 type_oid, int32 len (-1 = NULL),
+byte[len] value}` triple (the exact `record_send` form) — via the
+`CompositeReader` cursor, RECURSING into each field's own existing decoder (a
+native `Cell<BinaryFmt>` scalar/array, a NESTED composite `PgComposite::decode_row`,
+or an ENUM label reshape), never a second copy of the scalar decoders. The
+generated struct is OWNED and `'static` (its `text`/`bytea` fields copy), so it is
+a valid record field in both record twins; it derives `Debug`/`Clone`/`PartialEq`
+(deliberately not `Eq`/`Ord`/`Hash` — a composite may carry a float field, so a
+record with a composite column is `PartialEq` but not `Eq`). **Guarantee boundary
+(same as the enum's).** The composite's OID — and every field's wire OID — is
+server-assigned/DYNAMIC (a domain or enum field carries its own dynamic OID), so
+there is NO static field-OID pin: the wire field OID is READ and IGNORED, and the
+decode is validated by field POSITION + ARITY (a field count differing from the
+migration's is a classified `DecodeError::CompositeArityMismatch`, e.g. a field
+ADDed/DROPped on the LIVE type out-of-band) + each field's own decode succeeding
+(a malformed frame is `DecodeError::CompositeTruncated`). A composite `struct`'s
+field SET is the migration's, so a renamed/dropped/retyped attribute (an
+`ALTER TYPE ... {DROP|RENAME|ALTER} ATTRIBUTE`) breaks the build at the field use
+site — the exact peer of the enum variant-set drift guarantee. Composite decode
+resolves a field of another user type (an enum, a domain, a NESTED composite)
+through the SAME `resolve_field_type` chain a column uses; a composite `$N`
+PARAMETER (the row-type binary ENCODE) is a follow-up (decode is the high-value
+half) — a loud, located rejection today, not a half-correct encode. It stages as
+a WHOLE (not the encodable subset) precisely because an all-native composite's
+field OIDs are stable but a composite with an enum / domain / nested-composite
+field needs server-dynamic OIDs — the composite's own type OID (the `$N` param
+OID) AND each field's OID inside the `record_recv` frame — and bsql does NO
+connect-time OID resolution, so shipping only the all-native subset would be a
+non-universal partial. Composite
+ATTRIBUTE-level `ALTER TYPE` (`ADD`/`DROP`/`ALTER`/`RENAME ATTRIBUTE`) is a LOUD
+`sqlparser` parse error (the pinned `sqlparser` grammar models only enum
+`ALTER TYPE` ops), i.e. drift is a build error, never a silently-stale struct;
+`ALTER TYPE ... RENAME TO` re-keys the composite via the generic path. A
+composite column is PostgreSQL-only (its row-type frame has no SQLite storage
+class), so `sqlite_conn.query::<Q>()` over it is a located compile error. The
+`0014_moods.sql` / `0015_domains.sql` / `0016_alter_type_evolve.sql` /
+`0017_composites.sql` migrations in `tools/query_fixture` and its
+`query_enum_live` / `query_domain_live` / `query_alter_type_live` /
+`query_composite_live` / `query_enum_offline` / `query_composite_offline` tests
+are the end-to-end proof (decode both twins + nullable + actual NULL; a param
+round-trip; an unknown label classified; a renamed-variant / removed-composite-field
+compile-error golden; the domain base decode + server-enforced CHECK; ADD VALUE /
+RENAME VALUE / RENAME TO evolution; and the composite decode of a plain / NESTED /
+enum-bearing composite over both drivers + the classified arity drift).
 
 **Schema-per-test isolation — `#[bsql::test]` (feature `test-harness`).** A
 consumer adds `bsql` with `features = ["test-harness"]` and writes a test taking

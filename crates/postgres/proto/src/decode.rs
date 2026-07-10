@@ -839,6 +839,34 @@ pub enum DecodeError {
     /// bytes here without breaking the size pin); the classification is the
     /// signal — the fix is to add the migration that declares the new label.
     UnknownEnumLabel,
+    /// A user-defined COMPOSITE (row-type) column's binary frame declared a
+    /// field count that does not match the field count the migration's
+    /// `CREATE TYPE name AS (...)` declared. The composite wire form leads with an
+    /// `int32` field count; a mismatch means the LIVE database's composite has a
+    /// different attribute set than the build catalog was typed against (an
+    /// attribute added / dropped out-of-band, without a corresponding migration
+    /// file), so the positional field decode would read the wrong bytes. A
+    /// negative count (a malformed / hostile header) also lands here — it can
+    /// never equal the declared count. Classified rather than mapped to a
+    /// plausible-but-wrong record; the fix is to add the migration that evolves
+    /// the composite. Payload carries both counts for the operator diagnostic.
+    CompositeArityMismatch {
+        /// The field count the migration `CREATE TYPE` declared.
+        expected: u32,
+        /// The field count the wire frame's leading `int32` declared (may be
+        /// negative for a malformed header).
+        found: i32,
+    },
+    /// A user-defined COMPOSITE (row-type) column's binary frame does not frame
+    /// EXACTLY. The wire form is an `int32` field count then, per field, a
+    /// `{uint32 type_oid, int32 len, byte[len]}` triple (`len = -1` = NULL);
+    /// this covers a body too SHORT for the count header, a field's 8-byte
+    /// `{oid, len}` header, or a field body of the declared length, a negative
+    /// field length other than the `-1` NULL sentinel, AND a length SURPLUS
+    /// (trailing bytes past the last declared field). Classified rather than
+    /// yielding a partial / defaulted record or silently ignoring the surplus —
+    /// mirroring the array and fixed-width scalar decoders.
+    CompositeTruncated,
 }
 
 // Direct size pin. The widest variant is `TruncatedColumnData { column_idx: u8,
@@ -927,6 +955,15 @@ impl fmt::Display for DecodeError {
                 "enum column carried a label not declared by the migration the query was typed \
                  against (the live database's enum has a value the build catalog does not know)",
             ),
+            Self::CompositeArityMismatch { expected, found } => write!(
+                f,
+                "composite column field count mismatch: the migration `CREATE TYPE` declared \
+                 {expected} fields, the wire frame declares {found} (the live composite's \
+                 attribute set differs from the build catalog)",
+            ),
+            Self::CompositeTruncated => {
+                f.write_str("composite column payload is truncated or malformed")
+            }
         }
     }
 }
@@ -2994,6 +3031,152 @@ impl<E: PgEnum> EncodeBinary for EnumLabel<E> {
         -> Result<(), crate::write_buf::WriteBufFull>
     {
         dst.push_bytes(self.label.as_bytes())
+    }
+}
+
+/// A user-defined PostgreSQL COMPOSITE (row) type generated from a
+/// `CREATE TYPE name AS (...)` migration. `query!` decodes a composite column
+/// through [`decode_row`](PgComposite::decode_row).
+///
+/// A PostgreSQL composite value travels on the wire in BINARY as its row-type
+/// frame — an `int32` field count, then per field a `{uint32 type_oid, int32 len
+/// (-1 = NULL), byte[len] value}` triple, the value bytes being each field
+/// type's OWN binary encoding. So a generated composite is decoded by walking
+/// the frame ([`CompositeReader`]) and RECURSING into each field's own decoder
+/// (a native `Cell<BinaryFmt>` scalar/array, a nested [`PgComposite`], or a
+/// [`PgEnum`] label) — never a second copy of the scalar decoders. The
+/// field⟷attribute mapping lives once, in the generated `impl`, so `query!` only
+/// names the type and calls this method.
+///
+/// **Guarantee boundary (the runtime peer of the column-OID pin, matching the
+/// enum's).** The composite's OID — and every field's wire OID — is
+/// server-assigned / DYNAMIC (a domain or enum field carries its own dynamic OID,
+/// not its base's), so there is NO static OID to pin: the wire field OID is READ
+/// and IGNORED. The decode is validated instead by field POSITION + ARITY (the
+/// frame's declared field count must equal the migration's — else
+/// [`DecodeError::CompositeArityMismatch`]) + each field's OWN decode succeeding
+/// (a fixed-width field rejects a wrong byte length; a nested composite re-checks
+/// its own arity; an enum field rejects an unknown label). A same-width native
+/// confusion (a field the migration declares `int4` that the LIVE composite was
+/// ALTERed to `float4`) is NOT caught by length alone — but that requires an
+/// out-of-band schema divergence from the migration FILES, exactly the documented
+/// catalog boundary, and an attribute add/drop shifts the arity, which IS caught.
+///
+/// This trait is deliberately NOT sealed: the impl is emitted in the CONSUMER
+/// crate (by `user_types!()`), so a seal would be unsatisfiable there. It grants
+/// no wire capability a hand impl could abuse — a `PgComposite` only ever DECODES
+/// a frame the generated `decode_row` walks, classifying any malformed / drifted
+/// frame rather than panicking.
+pub trait PgComposite: Sized {
+    /// Decode a composite (row-type) binary frame into this Rust struct, or a
+    /// classified error for a malformed / arity-drifted frame.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::CompositeArityMismatch`] when the frame's declared field
+    /// count differs from the migration's; [`DecodeError::CompositeTruncated`]
+    /// when the frame does not frame exactly; or the field's own decode error
+    /// (e.g. [`DecodeError::UnknownEnumLabel`] for an enum field, a
+    /// [`DecodeError::BinaryLengthMismatch`] for a wrong-width scalar field).
+    fn decode_row(frame: &[u8]) -> Result<Self, DecodeError>;
+}
+
+/// A cursor over a PostgreSQL composite (row-type) BINARY frame, walking it
+/// field-by-field so a generated [`PgComposite::decode_row`] never re-implements
+/// the frame framing. TOTAL and panic-free: every read is a bounds-checked
+/// `split_first_chunk` / `split_at_checked`, and any shortfall / surplus / bad
+/// length is a classified [`DecodeError`] (`CompositeArityMismatch` /
+/// `CompositeTruncated`), never a panic or a partial value.
+///
+/// Usage (as the generated code drives it): [`new`](CompositeReader::new) reads +
+/// checks the field-count header, then exactly one [`next_field`](
+/// CompositeReader::next_field) per declared field (in declared order), then
+/// [`finish`](CompositeReader::finish) to reject any trailing surplus.
+#[derive(Debug)]
+pub struct CompositeReader<'a> {
+    /// The unconsumed remainder of the frame (after the count header and every
+    /// field read so far).
+    rest: &'a [u8],
+}
+
+impl<'a> CompositeReader<'a> {
+    /// Begin reading a composite frame, consuming and checking the leading
+    /// `int32` field count against the migration's declared field count.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::CompositeTruncated`] when the frame is too short for the
+    /// 4-byte count header; [`DecodeError::CompositeArityMismatch`] when the
+    /// declared count differs from `expected_nfields` (including a negative
+    /// count, which never equals a real field count).
+    #[inline]
+    pub fn new(frame: &'a [u8], expected_nfields: u32) -> Result<Self, DecodeError> {
+        let (count_bytes, rest) = frame
+            .split_first_chunk::<4>()
+            .ok_or(DecodeError::CompositeTruncated)?;
+        let nfields = i32::from_be_bytes(*count_bytes);
+        // Compare via i64 so a negative wire count and a large declared count
+        // both compare losslessly (no `as`, no fallible narrowing).
+        if i64::from(nfields) != i64::from(expected_nfields) {
+            return Err(DecodeError::CompositeArityMismatch {
+                expected: expected_nfields,
+                found: nfields,
+            });
+        }
+        Ok(CompositeReader { rest })
+    }
+
+    /// Read the next field: its 4-byte type OID (read and IGNORED — dynamic,
+    /// per the guarantee boundary) and 4-byte length, then its body. Returns
+    /// `Ok(None)` for a NULL field (`len == -1`), `Ok(Some(body))` for a present
+    /// field's binary value bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::CompositeTruncated`] when the remainder is too short for
+    /// the `{oid, len}` header or the declared body, or the length is negative
+    /// and not the `-1` NULL sentinel.
+    #[inline]
+    pub fn next_field(&mut self) -> Result<Option<&'a [u8]>, DecodeError> {
+        let (_oid_bytes, after_oid) = self
+            .rest
+            .split_first_chunk::<4>()
+            .ok_or(DecodeError::CompositeTruncated)?;
+        // The field's wire type OID is server-assigned / dynamic (a domain or
+        // enum field carries its own OID), so it is READ past and NOT validated;
+        // the decode is checked by position + arity + each field's own decode.
+        let (len_bytes, after_len) = after_oid
+            .split_first_chunk::<4>()
+            .ok_or(DecodeError::CompositeTruncated)?;
+        let len = i32::from_be_bytes(*len_bytes);
+        // -1 is the wire NULL sentinel — an honest absent field.
+        if len == -1 {
+            self.rest = after_len;
+            return Ok(None);
+        }
+        // Any other negative length is a malformed frame (classified, never a
+        // wrapped / saturated count).
+        let len_usize = usize::try_from(len).map_err(|_| DecodeError::CompositeTruncated)?;
+        let (body, after_body) = after_len
+            .split_at_checked(len_usize)
+            .ok_or(DecodeError::CompositeTruncated)?;
+        self.rest = after_body;
+        Ok(Some(body))
+    }
+
+    /// Assert the frame is fully consumed. A trailing surplus past the last
+    /// declared field is a malformed / hostile frame, not silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::CompositeTruncated`] when unconsumed bytes remain.
+    #[inline]
+    pub fn finish(self) -> Result<(), DecodeError> {
+        if self.rest.is_empty() {
+            Ok(())
+        } else {
+            Err(DecodeError::CompositeTruncated)
+        }
     }
 }
 
@@ -5823,5 +6006,135 @@ mod array_decode_tests {
             ),
             "an empty text[] header decoded as int4[] must be classified, got {got:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod composite_reader_tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// Build a composite (row-type) binary frame from `(oid, Option<body>)`
+    /// fields — the exact `record_send` wire form: `int32 nfields`, then per
+    /// field `{uint32 oid, int32 len (-1 = NULL), byte[len]}`.
+    fn build_composite(fields: &[(u32, Option<&[u8]>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let nfields = i32::try_from(fields.len()).expect("test arity");
+        out.extend_from_slice(&nfields.to_be_bytes());
+        for (oid, body) in fields {
+            out.extend_from_slice(&oid.to_be_bytes());
+            match body {
+                None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(bytes) => {
+                    let len = i32::try_from(bytes.len()).expect("test len");
+                    out.extend_from_slice(&len.to_be_bytes());
+                    out.extend_from_slice(bytes);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn reads_present_and_null_fields_then_finishes() {
+        // The empirically-captured `ROW('main st', 5)::addr` shape: a text field
+        // then an int4 field.
+        let five = 5i32.to_be_bytes();
+        let frame = build_composite(&[(oids::TEXT, Some(b"main st")), (oids::INT4, Some(&five))]);
+        let mut r = CompositeReader::new(&frame, 2).expect("arity 2");
+        assert_eq!(r.next_field(), Ok(Some(&b"main st"[..])));
+        assert_eq!(r.next_field(), Ok(Some(&five[..])));
+        assert_eq!(r.finish(), Ok(()));
+    }
+
+    #[test]
+    fn null_field_reads_as_none() {
+        // `ROW(NULL, 5)::addr` — the first field carries len = -1.
+        let five = 5i32.to_be_bytes();
+        let frame = build_composite(&[(oids::TEXT, None), (oids::INT4, Some(&five))]);
+        let mut r = CompositeReader::new(&frame, 2).expect("arity 2");
+        assert_eq!(r.next_field(), Ok(None));
+        assert_eq!(r.next_field(), Ok(Some(&five[..])));
+        assert_eq!(r.finish(), Ok(()));
+    }
+
+    #[test]
+    fn wrong_arity_is_classified() {
+        let five = 5i32.to_be_bytes();
+        let frame = build_composite(&[(oids::INT4, Some(&five))]); // 1 field
+        let got = CompositeReader::new(&frame, 2); // expected 2
+        assert!(
+            matches!(
+                got,
+                Err(DecodeError::CompositeArityMismatch { expected: 2, found: 1 })
+            ),
+            "a 1-field frame decoded as arity 2 must be classified, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn negative_field_count_is_classified_as_arity() {
+        // A malformed / hostile negative field count can never equal a real
+        // arity, so it classifies as a mismatch (found carries the negative).
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(-3i32).to_be_bytes());
+        let got = CompositeReader::new(&frame, 2);
+        assert!(
+            matches!(
+                got,
+                Err(DecodeError::CompositeArityMismatch { expected: 2, found: -3 })
+            ),
+            "a negative field count must be classified, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn truncated_count_header_is_classified() {
+        // Fewer than the 4 header bytes.
+        let got = CompositeReader::new(&[0x00, 0x00], 1);
+        assert!(matches!(got, Err(DecodeError::CompositeTruncated)), "got {got:?}");
+    }
+
+    #[test]
+    fn truncated_field_header_is_classified() {
+        // Declares 1 field but the {oid,len} header is short.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1i32.to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x00, 0x00]); // 3 of 8 header bytes
+        let mut r = CompositeReader::new(&frame, 1).expect("arity 1");
+        assert!(matches!(r.next_field(), Err(DecodeError::CompositeTruncated)));
+    }
+
+    #[test]
+    fn field_body_shorter_than_declared_is_classified() {
+        // A field whose declared len exceeds the remaining bytes.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1i32.to_be_bytes());
+        frame.extend_from_slice(&oids::INT4.to_be_bytes());
+        frame.extend_from_slice(&4i32.to_be_bytes()); // len 4
+        frame.extend_from_slice(&[0x00, 0x00]); // only 2 body bytes
+        let mut r = CompositeReader::new(&frame, 1).expect("arity 1");
+        assert!(matches!(r.next_field(), Err(DecodeError::CompositeTruncated)));
+    }
+
+    #[test]
+    fn negative_field_length_other_than_null_is_classified() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1i32.to_be_bytes());
+        frame.extend_from_slice(&oids::INT4.to_be_bytes());
+        frame.extend_from_slice(&(-2i32).to_be_bytes()); // -2 is not the -1 NULL sentinel
+        let mut r = CompositeReader::new(&frame, 1).expect("arity 1");
+        assert!(matches!(r.next_field(), Err(DecodeError::CompositeTruncated)));
+    }
+
+    #[test]
+    fn trailing_surplus_is_classified_by_finish() {
+        // A fully-valid single field with extra trailing bytes: finish() rejects.
+        let five = 5i32.to_be_bytes();
+        let mut frame = build_composite(&[(oids::INT4, Some(&five))]);
+        frame.extend_from_slice(&[0xDE, 0xAD]);
+        let mut r = CompositeReader::new(&frame, 1).expect("arity 1");
+        assert_eq!(r.next_field(), Ok(Some(&five[..])));
+        assert!(matches!(r.finish(), Err(DecodeError::CompositeTruncated)));
     }
 }

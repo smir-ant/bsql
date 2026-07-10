@@ -1,0 +1,5 @@
+error: query!: binding a user-defined COMPOSITE value as a `$N` parameter is not yet supported (decode of a composite column works); pass the composite's fields as separate scalar parameters, or construct the composite in SQL with `ROW($1, $2, ...)::your_type`.
+  --> tests/compile_fail/query_composite_param_unsupported.rs:16:14
+   |
+16 | bsql::query!(BadParam, "SELECT id FROM places WHERE a = $1");
+   |              ^^^^^^^^

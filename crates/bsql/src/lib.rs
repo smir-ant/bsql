@@ -375,6 +375,17 @@ pub use bsql_postgres_proto::{
 #[cfg(feature = "macros")]
 pub use bsql_postgres_proto::{EnumLabel, PgEnum};
 
+/// The runtime contract of a Rust `struct` generated from a
+/// `CREATE TYPE ... AS (...)` COMPOSITE migration by [`user_types!`].
+///
+/// A consumer rarely names this directly — [`user_types!`] emits the
+/// `impl PgComposite` (the row-type binary frame decoder) and `query!` decodes
+/// composite columns through it — but [`PgComposite`] is a real public contract
+/// (be generic over generated composites, or decode a frame directly with
+/// [`PgComposite::decode_row`]).
+#[cfg(feature = "macros")]
+pub use bsql_postgres_proto::PgComposite;
+
 /// Dependency-free bsql-native types a `query!` record field carries for a
 /// PostgreSQL `uuid` / `timestamptz` / `timestamp` / `date` / `time` /
 /// `interval` / `json` / `jsonb` / `numeric` column — the always-available core
@@ -421,9 +432,10 @@ pub use bsql_postgres_core::RowsBuilder;
 pub mod __rt {
     pub use bsql_postgres_proto::wire_pin;
     pub use bsql_postgres_proto::{
-        BinaryFmt, Cell, ColCellAt, DataRowRef, Date, DecodeError, EnumLabel, Interval, Json, Jsonb,
-        Numeric, ParamsWriter, PgEnum, PreparedQuery, QueryFingerprint, Time, Timestamp, Timestamptz,
-        TypedCopyIn, TypedQuery, Uuid, oids, oids_equal, prepared, query_budget,
+        BinaryFmt, Cell, ColCellAt, CompositeReader, DataRowRef, Date, DecodeError, EnumLabel,
+        Interval, Json, Jsonb, Numeric, ParamsWriter, PgComposite, PgEnum, PreparedQuery,
+        QueryFingerprint, Time, Timestamp, Timestamptz, TypedCopyIn, TypedQuery, Uuid, oids,
+        oids_equal, prepared, query_budget,
     };
 }
 

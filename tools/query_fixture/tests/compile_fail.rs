@@ -145,6 +145,22 @@ fn unknown_reference_is_compile_error() {
     // error, exactly as a dropped column is on the `query!` path.
     t.compile_fail("tests/compile_fail/query_enum_unknown_variant.rs");
 
+    // `bsql::user_types!()` generated-COMPOSITE surface: the generated `Addr`
+    // struct has EXACTLY the migration's attribute set, so naming a field the
+    // migration did not declare — the same situation as a field renamed /
+    // dropped / retyped by a later `ALTER TYPE ... {DROP|RENAME|ALTER}
+    // ATTRIBUTE` migration — is a compile error at the use site (E0609). Drift is
+    // a BUILD error, the exact peer of the enum's variant-set guarantee.
+    t.compile_fail("tests/compile_fail/query_composite_removed_field.rs");
+
+    // A composite `$N` PARAMETER (the row-type binary ENCODE) is a STAGED
+    // follow-up — decode is the high-value half and ships now. The blocker is
+    // architectural: `record_recv` needs the composite's own + each field's
+    // concrete type OID, which are server-dynamic, and bsql does no connect-time
+    // OID resolution. So a composite parameter is a LOUD, located compile error,
+    // never a half-correct encoder.
+    t.compile_fail("tests/compile_fail/query_composite_param_unsupported.rs");
+
     // `copy!` + `copy_in_typed` compile-checked binary bulk-insert surface.
     //   * A row whose column TYPE does not match the catalog is a type mismatch
     //     at the `copy_in_typed` call (the row tuple does not match `Row<'q>`).

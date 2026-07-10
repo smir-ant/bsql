@@ -212,6 +212,18 @@ impl ElemType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserEnumId(pub u32);
 
+/// A `Copy` handle to a user-defined COMPOSITE (row) type in the [`Catalog`] —
+/// the 0-based index of the type in the catalog's sorted `user_types` map.
+///
+/// The peer of [`UserEnumId`] for composites: a composite's Rust identity is its
+/// NAME plus its ordered FIELD list (both dynamic), which cannot ride inside a
+/// `Copy` [`RustType`]. Carrying the index keeps `RustType` `Copy`; codegen
+/// resolves the id back to the composite's name + fields via
+/// [`Catalog::user_composite`]. The mapping cannot drift — the same `Catalog`
+/// value types the query AND resolves the id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserCompositeId(pub u32);
+
 /// A Rust type the runtime can decode. This is the **v1 supported set** —
 /// every catalog `pg_type` an inferred column may carry maps to exactly
 /// one of these, and any catalog type outside the set is a loud
@@ -228,6 +240,18 @@ pub enum RustType {
     /// enum is sent as its label), and an unknown label is a classified runtime
     /// error.
     UserEnum(UserEnumId),
+    /// A user-defined PostgreSQL COMPOSITE (row) type declared by a
+    /// `CREATE TYPE name AS (fields)` migration, carried as a [`UserCompositeId`]
+    /// handle into the catalog's `user_types`. The query proc-macro turns it into
+    /// a generated Rust `struct` (one `Option<T>` field per attribute — a
+    /// composite attribute is always nullable on the wire), decoding the
+    /// row-type binary frame by recursing into each field's own decoder, and
+    /// resolving the id to the composite's name and fields via
+    /// [`Catalog::user_composite`]. Like an enum, its wire OID is
+    /// server-assigned / dynamic — so it is NOT pinned by the compile-time OID
+    /// validator; the decode is validated by field position + arity + each
+    /// field's own decode.
+    UserComposite(UserCompositeId),
     /// PostgreSQL `int2` / `smallint`.
     I16,
     /// PostgreSQL `int4` / `integer`.
@@ -292,6 +316,10 @@ impl RustType {
             // diagnostic that must name the concrete enum resolves it through
             // the catalog instead.
             RustType::UserEnum(_) => "user-defined enum",
+            // A composite's Rust spelling is its generated PascalCase struct
+            // name, dynamic like an enum's — codegen resolves the real name via
+            // `Catalog::user_composite`, so this diagnostics placeholder stands in.
+            RustType::UserComposite(_) => "user-defined composite",
             RustType::I16 => "i16",
             RustType::I32 => "i32",
             RustType::I64 => "i64",
@@ -362,7 +390,7 @@ const MAX_USER_TYPE_DEPTH: usize = 32;
 /// (fail-closed — a name that is neither native nor a modeled user type is never
 /// silently mapped). This is the single choke point that teaches every
 /// column/param resolver about user types, so the rule lives once.
-fn resolve_pg_type(catalog: &Catalog, pg_type: &str) -> Option<RustType> {
+pub(crate) fn resolve_pg_type(catalog: &Catalog, pg_type: &str) -> Option<RustType> {
     let mut name = pg_type;
     for _ in 0..MAX_USER_TYPE_DEPTH {
         if let Some(ty) = rust_type_for_pg(name) {
@@ -373,8 +401,12 @@ fn resolve_pg_type(catalog: &Catalog, pg_type: &str) -> Option<RustType> {
             Some(UserType::Enum { .. }) => {
                 return catalog.user_enum_id(name).map(RustType::UserEnum);
             }
+            // A composite resolves to its generated Rust struct.
+            Some(UserType::Composite { .. }) => {
+                return catalog.user_composite_id(name).map(RustType::UserComposite);
+            }
             // A domain is transparent: follow its base (which may itself be a
-            // domain, a native type, or an enum).
+            // domain, a native type, an enum, or a composite).
             Some(UserType::Domain { base }) => name = base,
             None => return None,
         }
@@ -10098,7 +10130,11 @@ fn common_type(a: RustType, b: RustType) -> Option<RustType> {
         // are the SAME enum (the `a == b` early return above handles that,
         // yielding that enum); two DISTINCT enums, or an enum with any other
         // type, have no common type and are a loud cast-required error.
-        | RustType::UserEnum(_) => None,
+        | RustType::UserEnum(_)
+        // A composite has no widening ladder either: two sides merge ONLY when
+        // they are the SAME composite (`a == b` early return); any other pairing
+        // is a loud cast-required error.
+        | RustType::UserComposite(_) => None,
     };
     match (rank(a), rank(b)) {
         (Some(ra), Some(rb)) => {
@@ -11367,7 +11403,11 @@ fn infer_cast(
     data_type: &sqlparser::ast::DataType,
 ) -> Result<(RustType, bool), InferError> {
     let pg_type = canonical_type(data_type);
-    let ty = rust_type_for_pg(&pg_type).ok_or_else(|| InferError::UnsupportedPgType {
+    // Resolve the cast target the SAME way a column type is (native OR a modeled
+    // user type — an enum, a composite, or a domain chain), so the idiomatic
+    // composite / enum construction casts (`ROW($1, $2)::addr`, `'happy'::mood`)
+    // type as the generated struct / enum rather than a loud unsupported error.
+    let ty = resolve_pg_type(catalog, &pg_type).ok_or_else(|| InferError::UnsupportedPgType {
         pg_type,
         context: "cast target".to_string(),
     })?;
@@ -16532,25 +16572,66 @@ mod tests {
     }
 
     #[test]
-    fn composite_type_column_is_fail_closed_loud() {
-        // A `CREATE TYPE addr AS (...)` composite is not yet modeled (it needs a
-        // new row-type binary decode path). Until then it is FAIL-CLOSED: the
-        // composite is passed through unrecorded, so a column typed as it is a
-        // LOUD `UnsupportedPgType` at the query site — never a silently-wrong
-        // decode or a panic. This test LOCKS that boundary (a future composite
-        // slice must keep decode correct, never silent).
-        let err = shape(
+    fn select_composite_column_projects_as_user_composite() {
+        // A `CREATE TYPE addr AS (...)` composite column projects as a
+        // `RustType::UserComposite` (the query proc-macro generates a struct for
+        // it and decodes the row-type binary frame). The column's OWN nullability
+        // rides the table DDL: `a addr` (no NOT NULL) is a nullable column.
+        let shape = shape(
             &[
                 "CREATE TYPE addr AS (street text, zip int4)",
                 "CREATE TABLE places (id int PRIMARY KEY, a addr)",
             ],
             "SELECT a FROM places",
         )
-        .expect_err("a composite column is loud until modeled");
+        .expect("infer ok");
         assert!(
-            matches!(err, InferError::UnsupportedPgType { ref pg_type, .. } if pg_type == "addr"),
-            "expected a loud UnsupportedPgType for the composite, got {err:?}"
+            matches!(shape.columns[0].ty, RustType::UserComposite(_)),
+            "a composite column projects as UserComposite, got {:?}",
+            shape.columns[0].ty
         );
+        assert!(shape.columns[0].nullable, "the `a addr` column is nullable");
+    }
+
+    #[test]
+    fn domain_over_composite_resolves_to_the_composite() {
+        // A domain whose base is a composite resolves transitively to the
+        // composite — the column decodes into the generated struct.
+        let shape = shape(
+            &[
+                "CREATE TYPE addr AS (street text, zip int4)",
+                "CREATE DOMAIN home AS addr",
+                "CREATE TABLE t (h home NOT NULL)",
+            ],
+            "SELECT h FROM t",
+        )
+        .expect("infer ok");
+        assert!(
+            matches!(shape.columns[0].ty, RustType::UserComposite(_)),
+            "a domain over a composite resolves to the composite, got {:?}",
+            shape.columns[0].ty
+        );
+    }
+
+    #[test]
+    fn composite_id_round_trips_to_name_and_fields() {
+        // The `UserCompositeId` a column projects with resolves back to the
+        // composite's name and ordered field list through the SAME catalog.
+        let mut catalog = Catalog::default();
+        replay_file_for_test(
+            &mut catalog,
+            &PathBuf::from("ddl.sql"),
+            "CREATE TYPE addr AS (street text, zip int4)",
+        )
+        .expect("replay ok");
+        let id = catalog.user_composite_id("addr").expect("composite id");
+        let (name, fields) = catalog.user_composite(id).expect("resolve id");
+        assert_eq!(name, "addr");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "street");
+        assert_eq!(fields[0].pg_type, "text");
+        assert_eq!(fields[1].name, "zip");
+        assert_eq!(fields[1].pg_type, "int4");
     }
 
     #[test]

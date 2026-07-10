@@ -290,6 +290,12 @@ fn user_types_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
             // there is no generated Rust type: a `query!` column typed as the
             // domain resolves directly to the base's Rust type. Nothing to emit.
             bsql_build::UserType::Domain { .. } => {}
+            // A composite generates a Rust `struct` with a row-type binary frame
+            // decoder (`PgComposite`). It resolves its FIELD types against the
+            // whole catalog, so it takes the catalog.
+            bsql_build::UserType::Composite { fields } => {
+                items.push(emit_user_composite(&catalog, type_name, fields, span)?);
+            }
         }
     }
     Ok(quote! { #(#items)* })
@@ -388,6 +394,149 @@ fn emit_user_enum(enum_name: &str, labels: &[String], span: Span) -> syn::Result
                         ::bsql::__rt::DecodeError::UnknownEnumLabel,
                     ),
                 }
+            }
+        }
+    })
+}
+
+/// Emit one generated Rust `struct` for a `CREATE TYPE name AS (fields)`
+/// composite: the struct (one `Option<T>` field per attribute — a composite
+/// attribute is always nullable on the wire) and its
+/// [`::bsql::__rt::PgComposite`] impl (the row-type binary frame decoder,
+/// defined ONCE here so `query!`'s decode of a composite column cannot disagree
+/// with it). Field order is the declared order (the wire frame's field order).
+///
+/// The decoder walks the frame with [`::bsql::__rt::CompositeReader`] and decodes
+/// each field into its OWNED value by RECURSING into that field's own existing
+/// decoder — a native `Cell<BinaryFmt>` scalar/array (via `ColCellAt`), a nested
+/// composite (`PgComposite::decode_row`), or an enum label
+/// (`PgEnum::from_wire_label`) — never a second copy of the scalar decoders. The
+/// struct is OWNED and `'static` (its `text`/`bytea` fields copy), so it is a
+/// valid record field in both the borrowed and owned `query!` record twins.
+///
+/// A field whose type the catalog cannot resolve (neither native nor a modeled
+/// user type) is a loud error; a field name that cannot form a Rust identifier is
+/// a loud error. The struct derives only `Debug`, `Clone`, `PartialEq` — a
+/// composite may carry a float field, so it is deliberately not `Eq`/`Ord`/`Hash`.
+fn emit_user_composite(
+    catalog: &bsql_build::Catalog,
+    composite_name: &str,
+    fields: &[bsql_build::CompositeField],
+    span: Span,
+) -> syn::Result<TokenStream2> {
+    let struct_ident = pascal_ident(composite_name, "composite type", span)?;
+
+    // Resolve every field's canonical PG type to a `RustType`, up front, so a
+    // field of an unsupported type is a loud error naming the field.
+    let mut field_types = Vec::with_capacity(fields.len());
+    for field in fields {
+        let ty = catalog.resolve_field_type(&field.pg_type).ok_or_else(|| {
+            syn::Error::new(
+                span,
+                format!(
+                    "bsql::user_types!(): composite `{composite_name}` field \
+                     `{}` has type `{}`, which is not a supported column type \
+                     (neither a native type nor a modeled enum / domain / \
+                     composite). A composite with an unsupported field cannot be \
+                     generated.",
+                    field.name, field.pg_type
+                ),
+            )
+        })?;
+        field_types.push(ty);
+    }
+
+    // Resolve the enum / composite idents the FIELDS reference (a nested
+    // composite field, or an enum field), against the same catalog — so a bad
+    // nested-type name fails once, here.
+    let field_idents_resolver = resolve_user_type_idents(catalog, field_types.iter().copied(), span)?;
+    // Composite fields decode into the NATIVE bsql types — external-type bridges
+    // fire on top-level columns, not composite fields (a documented boundary).
+    let no_bridges = Bridges { entries: Vec::new() };
+
+    let mut field_idents = Vec::with_capacity(fields.len());
+    let mut field_type_tokens = Vec::with_capacity(fields.len());
+    let mut field_docs = Vec::with_capacity(fields.len());
+    let mut decode_exprs = Vec::with_capacity(fields.len());
+    for (field, &ty) in fields.iter().zip(field_types.iter()) {
+        field_idents.push(make_field_ident(&field.name, span)?);
+        // Every composite field is nullable on the wire, so the Rust field is
+        // `Option<T>` (owned twin — the struct is `'static`).
+        field_type_tokens.push(field_type_bridged(
+            ty,
+            true,
+            true,
+            &no_bridges,
+            &field_idents_resolver,
+        )?);
+        decode_exprs.push(decode_value_expr_bridged(
+            ty,
+            true,
+            &no_bridges,
+            &field_idents_resolver,
+        )?);
+        field_docs.push(format!(
+            "The `{}` attribute of the `{composite_name}` composite (always \
+             `Option` — a composite attribute is nullable on the wire).",
+            field.name
+        ));
+    }
+
+    let nfields = u32::try_from(fields.len()).map_err(|_| {
+        syn::Error::new(
+            span,
+            format!("bsql::user_types!(): composite `{composite_name}` has too many fields"),
+        )
+    })?;
+
+    let type_doc = format!(
+        "The `{composite_name}` PostgreSQL composite type, generated from the \
+         migration `CREATE TYPE {composite_name} AS (...)`. One `Option<T>` field \
+         per attribute (a composite attribute is always nullable on the wire). \
+         Decode a `{composite_name}` column with `query!`."
+    );
+    let dead_reason =
+        "a generated user type may be referenced by any, all, or none of the crate's queries";
+
+    // The generated `decode_row` locals whose lifetime SPANS the per-field
+    // `let #field_ident = …` bindings (the frame param and the reader) are given
+    // MIXED-SITE hygiene, so a composite attribute literally named `__frame` /
+    // `__reader` — a `let __reader = …` from `#field_idents` (call-site hygiene) —
+    // cannot shadow them: the compiler treats a mixed-site local and a same-text
+    // call-site local as DISTINCT bindings, so `next_field(&mut #reader)` and
+    // `finish(#reader)` always resolve to the reader, never to a field local of
+    // the same name. (The `__bytes` match binding does NOT need this: it lives in
+    // the inner match-arm scope, fully consumed before the outer field `let`, so a
+    // field named `__bytes` is already benign — and it must share the plain
+    // hygiene of the `decode_value_expr_bridged`-emitted `__bytes` it feeds.) This
+    // is the composite peer of the enum's keyword-label raw-ident handling.
+    let frame = Ident::new("__frame", Span::mixed_site());
+    let reader = Ident::new("__reader", Span::mixed_site());
+
+    Ok(quote! {
+        #[doc = #type_doc]
+        #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq)]
+        #[allow(dead_code, reason = #dead_reason)]
+        pub struct #struct_ident {
+            #( #[doc = #field_docs] pub #field_idents: #field_type_tokens, )*
+        }
+
+        impl ::bsql::__rt::PgComposite for #struct_ident {
+            fn decode_row(
+                #frame: &[u8],
+            ) -> ::core::result::Result<Self, ::bsql::__rt::DecodeError> {
+                let mut #reader = ::bsql::__rt::CompositeReader::new(#frame, #nfields)?;
+                #(
+                    let #field_idents = match ::bsql::__rt::CompositeReader::next_field(
+                        &mut #reader,
+                    )? {
+                        ::core::option::Option::Some(__bytes) =>
+                            ::core::option::Option::Some(#decode_exprs),
+                        ::core::option::Option::None => ::core::option::Option::None,
+                    };
+                )*
+                ::bsql::__rt::CompositeReader::finish(#reader)?;
+                ::core::result::Result::Ok(#struct_ident { #( #field_idents ),* })
             }
         }
     })
@@ -1379,6 +1528,34 @@ fn col_spec(ty: bsql_build::RustType) -> ColSpec {
             fixed_width: None,
             impls_eq: true,
         },
+        // A user-defined COMPOSITE decodes on the wire as its row-type BINARY
+        // frame (walked by `CompositeReader` into the generated struct), NOT as
+        // any native marker. Like the enum, `field_type_bridged`/decode intercept
+        // `UserComposite` before reading the placeholders here, substituting the
+        // generated struct path + `PgComposite::decode_row`. The row-tuple marker
+        // is a never-decoded `&'static str` placeholder (the row tuple feeds only
+        // the build-time const validator — the runtime decode routes through the
+        // record's own `decode`, never `Q::Row`), and the OID rides the same TEXT
+        // placeholder the const validator pins against it (a composite's real OID
+        // is server-dynamic, so it is not pinned — exactly the enum's boundary).
+        // `borrow: ByValue` because the struct is OWNED and `'static` (no `<'q>`);
+        // `fixed_width: None` so a composite column takes the per-cell decode path
+        // (where the reshape lives). `impls_eq: false` — a composite may carry a
+        // float field, so the generated struct derives only `PartialEq`, and a
+        // record with a composite column is `PartialEq` but not `Eq`.
+        RustType::UserComposite(_) => ColSpec {
+            marker: quote!(&'static str),
+            field_owned: quote!(&'static str),
+            borrow: BorrowKind::ByValue,
+            oid_path: quote!(::bsql::__rt::oids::TEXT),
+            oid_value: 25,
+            // Composite arrays are not modeled (an `addr[]` column stays a loud
+            // `UnsupportedPgType` at inference), so the array OID is never baked.
+            array_oid_path: quote!(::bsql::__rt::oids::TEXT_ARRAY),
+            array_oid_value: 1009,
+            fixed_width: None,
+            impls_eq: false,
+        },
     }
 }
 
@@ -1465,6 +1642,15 @@ fn field_type_bridged(
         bsql_build::RustType::UserEnum(id) => {
             let enum_ident = enums.ident(id)?;
             quote!(#enum_ident)
+        }
+        // A user-defined composite decodes into its generated Rust struct — the
+        // SAME owned, `'static` type in both record twins (the struct owns its
+        // fields, so there is no borrowed spelling and no `<'q>` contribution). A
+        // composite is never a bridge target and its native `col_spec.field_owned`
+        // is a placeholder, so this takes priority over the bridge/native paths.
+        bsql_build::RustType::UserComposite(id) => {
+            let struct_ident = enums.composite_ident(id)?;
+            quote!(#struct_ident)
         }
         _ => match bridges.for_column(ty) {
             // Bridged: the target field type is the SAME for both twins (the
@@ -1554,18 +1740,26 @@ fn pascal_ident(raw: &str, kind: &str, span: Span) -> syn::Result<Ident> {
     ))
 }
 
-/// Resolves a `RustType::UserEnum(id)` to the generated Rust enum TYPE
-/// identifier (the `user_types!()`-emitted `enum` a `mood` column decodes into).
+/// Resolves a user-defined-type id to its generated Rust TYPE identifier — a
+/// `RustType::UserEnum(id)` to the `user_types!()`-emitted `enum`, and a
+/// `RustType::UserComposite(id)` to the emitted `struct` — that a column or
+/// composite field of that type decodes into.
 ///
-/// Built once per `query!` over exactly the enums the query references, so a
-/// migration enum whose name cannot form a valid Rust identifier fails ONCE,
-/// loudly, and the per-column / per-param codegen looks the ident up against a
+/// (Named `EnumTypes` historically; it now resolves BOTH user enums and
+/// composites — a private macro-internal helper with no external surface.)
+///
+/// Built once per `query!` over exactly the user types the query references
+/// (and, for a composite's own decoder, over its field types), so a migration
+/// type whose name cannot form a valid Rust identifier fails ONCE, loudly, and
+/// the per-column / per-param / per-field codegen looks the ident up against a
 /// pre-validated map (the lookup carries the query span for the — structurally
 /// unreachable — "id not pre-resolved" internal guard, keeping the codegen
 /// panic-free without an `unwrap`).
 struct EnumTypes {
     /// `UserEnumId.0` -> the generated enum's PascalCase type identifier.
     by_id: std::collections::BTreeMap<u32, Ident>,
+    /// `UserCompositeId.0` -> the generated struct's PascalCase type identifier.
+    composites_by_id: std::collections::BTreeMap<u32, Ident>,
     /// The query name's span, for the internal-guard diagnostic.
     span: Span,
 }
@@ -1579,38 +1773,77 @@ impl EnumTypes {
             syn::Error::new(self.span, "query!: internal error — unresolved user-enum id")
         })
     }
+
+    /// The generated struct identifier for a user-composite id. Total for every
+    /// composite the query's columns / a composite's fields carry (resolved at
+    /// construction); a miss is an internal logic error surfaced loudly.
+    fn composite_ident(&self, id: bsql_build::UserCompositeId) -> syn::Result<&Ident> {
+        self.composites_by_id.get(&id.0).ok_or_else(|| {
+            syn::Error::new(
+                self.span,
+                "query!: internal error — unresolved user-composite id",
+            )
+        })
+    }
 }
 
-/// Resolve every user enum the query's columns and parameters reference into a
-/// [`EnumTypes`] map, against the SAME catalog the query was typed with. A bad
-/// enum name is a loud error here, once, rather than at each use site.
+/// Resolve every user enum / composite the query's columns and parameters
+/// reference into an [`EnumTypes`] map, against the SAME catalog the query was
+/// typed with. A bad type name is a loud error here, once, rather than at each
+/// use site.
 fn resolve_enum_types(
     catalog: &bsql_build::Catalog,
     shape: &bsql_build::DynamicShape,
     span: Span,
 ) -> syn::Result<EnumTypes> {
+    let types = shape
+        .columns
+        .iter()
+        .map(|col| col.ty)
+        .chain(shape.params.iter().map(|p| p.element()));
+    resolve_user_type_idents(catalog, types, span)
+}
+
+/// Resolve the user enums / composites among an iterator of [`RustType`]s into
+/// an [`EnumTypes`] map (against `catalog`), validating each type's name into a
+/// Rust identifier ONCE. Shared by the query-shape resolver above and the
+/// composite emitter (which resolves its own FIELD types). Native types are
+/// skipped; a duplicate id is resolved once.
+fn resolve_user_type_idents(
+    catalog: &bsql_build::Catalog,
+    types: impl Iterator<Item = bsql_build::RustType>,
+    span: Span,
+) -> syn::Result<EnumTypes> {
     let mut by_id = std::collections::BTreeMap::new();
-    let mut resolve = |id: bsql_build::UserEnumId| -> syn::Result<()> {
-        if by_id.contains_key(&id.0) {
-            return Ok(());
-        }
-        let (enum_name, _labels) = catalog.user_enum(id).ok_or_else(|| {
-            syn::Error::new(span, "query!: internal error — unresolved user-enum id")
-        })?;
-        by_id.insert(id.0, pascal_ident(enum_name, "enum type", span)?);
-        Ok(())
-    };
-    for col in &shape.columns {
-        if let bsql_build::RustType::UserEnum(id) = col.ty {
-            resolve(id)?;
+    let mut composites_by_id = std::collections::BTreeMap::new();
+    for ty in types {
+        match ty {
+            bsql_build::RustType::UserEnum(id) => {
+                if by_id.contains_key(&id.0) {
+                    continue;
+                }
+                let (enum_name, _labels) = catalog.user_enum(id).ok_or_else(|| {
+                    syn::Error::new(span, "query!: internal error — unresolved user-enum id")
+                })?;
+                by_id.insert(id.0, pascal_ident(enum_name, "enum type", span)?);
+            }
+            bsql_build::RustType::UserComposite(id) => {
+                if composites_by_id.contains_key(&id.0) {
+                    continue;
+                }
+                let (comp_name, _fields) = catalog.user_composite(id).ok_or_else(|| {
+                    syn::Error::new(span, "query!: internal error — unresolved user-composite id")
+                })?;
+                composites_by_id.insert(id.0, pascal_ident(comp_name, "composite type", span)?);
+            }
+            _ => {}
         }
     }
-    for param in &shape.params {
-        if let bsql_build::RustType::UserEnum(id) = param.element() {
-            resolve(id)?;
-        }
-    }
-    Ok(EnumTypes { by_id, span })
+    Ok(EnumTypes {
+        by_id,
+        composites_by_id,
+        span,
+    })
 }
 
 /// Emit the borrowed + owned record twins and their `decode` fns.
@@ -2075,6 +2308,18 @@ fn decode_value_expr_bridged(
             <#enum_ident as ::bsql::__rt::PgEnum>::from_wire_label(#label)?
         });
     }
+    // A user-defined composite decodes its ROW-TYPE BINARY FRAME (`__bytes`) into
+    // the generated struct by walking the frame — `PgComposite::decode_row`
+    // recurses into each field's own decoder. FALLIBLE: a malformed / arity-
+    // drifted frame is a classified `DecodeError` (never a panic or a partial
+    // record). The struct is OWNED and `'static`, so a composite field never
+    // carries `<'q>` (its `col_spec.borrow` is `ByValue`).
+    if let bsql_build::RustType::UserComposite(id) = ty {
+        let struct_ident = enums.composite_ident(id)?;
+        return Ok(quote! {
+            <#struct_ident as ::bsql::__rt::PgComposite>::decode_row(__bytes)?
+        });
+    }
     Ok(match bridges.for_column(ty) {
         None => decode_call_expr(ty, is_owned),
         Some((entry, false)) => {
@@ -2202,6 +2447,27 @@ fn param_tuple_marker(
                 let enum_ident = enums.ident(id)?;
                 Ok(quote!(::bsql::__rt::EnumLabel<#enum_ident>))
             }
+            // A composite PARAMETER (binding a whole composite value as `$N`, the
+            // row-type binary ENCODE) is a follow-up — decode is the high-value
+            // half and lands first. The precise reason it is staged as a WHOLE
+            // (rather than shipping the subset that IS encodable): an ALL-NATIVE
+            // composite's field type OIDs are STABLE, so its `record` frame could
+            // be encoded — BUT a composite with an enum / domain / nested-composite
+            // field needs SERVER-DYNAMIC OIDs both for the composite's own type
+            // (the `$N` param OID, to select the binary recv function) and for that
+            // field inside the frame (`record_recv` validates each field OID
+            // concretely), and bsql does NO connect-time OID resolution (the same
+            // boundary the enum decode rides). Shipping only the all-native subset
+            // would be a NON-UNIVERSAL partial, so the whole feature stages behind
+            // a loud, located rejection — never a silently-wrong or half-correct
+            // encode.
+            RustType::UserComposite(_) => Err(syn::Error::new(
+                enums.span,
+                "query!: binding a user-defined COMPOSITE value as a `$N` parameter \
+                 is not yet supported (decode of a composite column works); pass the \
+                 composite's fields as separate scalar parameters, or construct the \
+                 composite in SQL with `ROW($1, $2, ...)::your_type`.",
+            )),
             _ => {
                 let spec = col_spec(ty);
                 Ok(match spec.borrow {
@@ -2745,8 +3011,10 @@ fn sqlite_target(ty: bsql_build::RustType, is_owned: bool) -> Option<TokenStream
         // ... AS ENUM` is PG-only; the SQLite conformance template cannot even
         // replay it), so a query projecting one is PostgreSQL-only — the SQLite
         // bridge is skipped and `sqlite_conn.query::<That>()` is a located
-        // compile error.
+        // compile error. A user-defined COMPOSITE is likewise PG-only (its
+        // row-type binary frame has no SQLite storage class).
         | RustType::UserEnum(_)
+        | RustType::UserComposite(_)
         | RustType::Array(_) => return None,
     })
 }

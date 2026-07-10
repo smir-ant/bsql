@@ -92,7 +92,7 @@ pub use dynamics::{
 };
 pub use infer::{
     infer_query, scalar_rust_type_for_pg, ElemType, InferError, InferredColumn, QueryShape,
-    RustType, UserEnumId,
+    RustType, UserCompositeId, UserEnumId,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
@@ -167,6 +167,26 @@ pub struct ColumnInfo {
 /// user type is self-describing enough to decode without the OID (a PG enum is
 /// sent as its label text; a domain is transparent over its base), so no
 /// dynamic OID is needed on the decode path.
+/// One attribute of a user-defined COMPOSITE (row) type: its name and the
+/// canonical PostgreSQL type it carries.
+///
+/// A composite attribute is ALWAYS nullable on the wire — PostgreSQL forbids a
+/// `NOT NULL` constraint on a `CREATE TYPE name AS (...)` attribute (it is a
+/// syntax error), and the row-type binary frame carries a per-field length that
+/// may be `-1` (NULL) for any field. So the generated Rust struct wraps every
+/// field in `Option<T>`; there is no per-field nullability to store here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeField {
+    /// The attribute name, case-folded the same way a column name is (so a
+    /// `query!` and the generated struct agree on the field's spelling).
+    pub name: String,
+    /// The canonical PostgreSQL type name the attribute carries (already
+    /// alias-collapsed by `canonical_type`, e.g. `bigint` -> `int8`). It may name
+    /// another user type (an enum, a domain, or a nested composite), resolved
+    /// through the same chain a column type is at the query site.
+    pub pg_type: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserType {
     /// `CREATE TYPE name AS ENUM ('a', 'b', ...)` — an ordered set of string
@@ -188,6 +208,17 @@ pub enum UserType {
     Domain {
         /// The canonical base type name the domain aliases.
         base: String,
+    },
+    /// `CREATE TYPE name AS (field type, ...)` — a COMPOSITE (row) type: an
+    /// ordered list of named, typed attributes. On the wire a composite value is
+    /// its row-type binary frame (an `int32` field count, then per field a
+    /// `{uint32 type_oid, int32 len (-1 = NULL), byte[len] value}` triple), so the
+    /// generated Rust `struct` decodes it by recursing into each field's own
+    /// decoder. Field order is the declared order (the wire frame's field order);
+    /// every field is nullable (see [`CompositeField`]).
+    Composite {
+        /// The attributes in declared (wire) order.
+        fields: Vec<CompositeField>,
     },
 }
 
@@ -590,9 +621,55 @@ impl Catalog {
         let (name, ty) = self.user_types.iter().nth(index)?;
         match ty {
             UserType::Enum { labels } => Some((name.as_str(), labels.as_slice())),
-            // A domain is not an enum — a `UserEnumId` never names one.
-            UserType::Domain { .. } => None,
+            // Neither a domain nor a composite is an enum — a `UserEnumId` never
+            // names one.
+            UserType::Domain { .. } | UserType::Composite { .. } => None,
         }
+    }
+
+    /// The [`UserCompositeId`] handle for the user COMPOSITE named `name`, or
+    /// `None` when no user type of that name is a composite. `name` is the
+    /// canonical (case-folded) type name a column's `pg_type` carries. The id is
+    /// the type's index in the sorted `user_types` map; it round-trips through
+    /// [`Catalog::user_composite`] against this same catalog — the peer of
+    /// [`Catalog::user_enum_id`].
+    #[must_use]
+    pub fn user_composite_id(&self, name: &str) -> Option<UserCompositeId> {
+        let position = self
+            .user_types
+            .iter()
+            .position(|(key, ty)| key == name && matches!(ty, UserType::Composite { .. }))?;
+        u32::try_from(position).ok().map(UserCompositeId)
+    }
+
+    /// Resolve a [`UserCompositeId`] back to the composite's canonical name and
+    /// ordered field list, or `None` when the id does not name a composite in
+    /// this catalog. The inverse of [`Catalog::user_composite_id`] over this same
+    /// catalog — the peer of [`Catalog::user_enum`].
+    #[must_use]
+    pub fn user_composite(&self, id: UserCompositeId) -> Option<(&str, &[CompositeField])> {
+        let index = usize::try_from(id.0).ok()?;
+        let (name, ty) = self.user_types.iter().nth(index)?;
+        match ty {
+            UserType::Composite { fields } => Some((name.as_str(), fields.as_slice())),
+            // An enum / domain is not a composite — a `UserCompositeId` never
+            // names one.
+            UserType::Enum { .. } | UserType::Domain { .. } => None,
+        }
+    }
+
+    /// Resolve one canonical PostgreSQL type name to the [`RustType`] a column of
+    /// that type decodes as, consulting BOTH the native set AND this catalog's
+    /// user-defined types (an enum -> `UserEnum`, a composite -> `UserComposite`,
+    /// a domain -> its base transitively). `None` for a name that is neither
+    /// native nor a modeled user type (the fail-closed contract).
+    ///
+    /// This is the single choke point the query proc-macro resolves a COMPOSITE
+    /// FIELD's type through — the same resolution a top-level column uses — so a
+    /// composite field and a column of the same type agree on their Rust type.
+    #[must_use]
+    pub fn resolve_field_type(&self, pg_type: &str) -> Option<RustType> {
+        infer::resolve_pg_type(self, pg_type)
     }
 
     /// Begin a [`CatalogBuilder`] by replaying a consumer's `migrations/`
@@ -1124,6 +1201,21 @@ fn serialize_user_types(user_types: &BTreeMap<String, UserType>) -> String {
                 out.push_str(&escape_user_field(base));
                 out.push('\n');
             }
+            UserType::Composite { fields } => {
+                // `C<TAB><name>[<TAB><field_name><TAB><field_type>]...` — the
+                // field name and type alternate, so the fields following the name
+                // are an EVEN count of (name, type) pairs in declared order.
+                out.push('C');
+                out.push('\t');
+                out.push_str(&escape_user_field(name));
+                for field in fields {
+                    out.push('\t');
+                    out.push_str(&escape_user_field(&field.name));
+                    out.push('\t');
+                    out.push_str(&escape_user_field(&field.pg_type));
+                }
+                out.push('\n');
+            }
         }
     }
     out
@@ -1153,6 +1245,14 @@ pub enum UserTypesParseError {
         /// The 1-based line number.
         line: usize,
         /// How many fields followed the kind tag (expected exactly 2).
+        fields: usize,
+    },
+    /// A `C` (composite) line's attribute fields did not form (name, type)
+    /// PAIRS — the fields after the type name must be an even count.
+    MalformedComposite {
+        /// The 1-based line number.
+        line: usize,
+        /// How many attribute fields followed the type name (expected even).
         fields: usize,
     },
     /// A field held an unrecognized or dangling backslash escape.
@@ -1185,6 +1285,13 @@ impl fmt::Display for UserTypesParseError {
                  field(s) after the kind, expected exactly 2 (name, base). The \
                  file is machine-generated; a malformed line means the \
                  build-script channel is corrupt."
+            ),
+            UserTypesParseError::MalformedComposite { line, fields } => write!(
+                f,
+                "user-types file line {line} is a composite (`C`) with {fields} \
+                 attribute field(s) after the name, expected an even count of \
+                 (name, type) pairs. The file is machine-generated; a malformed \
+                 line means the build-script channel is corrupt."
             ),
             UserTypesParseError::BadEscape { line, sequence } => write!(
                 f,
@@ -1250,6 +1357,44 @@ pub fn parse_user_types(text: &str) -> Result<BTreeMap<String, UserType>, UserTy
                 let name = unescape_user_field(name_field, number)?;
                 let base = unescape_user_field(base_field, number)?;
                 types.insert(name, UserType::Domain { base });
+            }
+            "C" => {
+                let (name_field, attr_fields) = match rest.split_first() {
+                    Some((n, l)) => (*n, l),
+                    None => return Err(UserTypesParseError::MissingName { line: number }),
+                };
+                // The attribute fields alternate (name, type), so their count
+                // must be even. An odd count is a corrupt channel.
+                if !attr_fields.len().is_multiple_of(2) {
+                    return Err(UserTypesParseError::MalformedComposite {
+                        line: number,
+                        fields: attr_fields.len(),
+                    });
+                }
+                let name = unescape_user_field(name_field, number)?;
+                // One `CompositeField` per (name, type) PAIR. `chunks_exact(2)`
+                // over the even-length slice yields exactly that many chunks; the
+                // capacity is a hint (`attr_fields.len()` is a safe upper bound,
+                // avoiding a division the crate lint forbids).
+                let mut fields = Vec::with_capacity(attr_fields.len());
+                for pair in attr_fields.chunks_exact(2) {
+                    // `chunks_exact(2)` over an even-length slice yields exactly
+                    // (name, type) pairs; `split_first` binds each without
+                    // indexing.
+                    let (field_name, type_rest) = match pair.split_first() {
+                        Some((n, r)) => (*n, r),
+                        None => continue,
+                    };
+                    let field_type = match type_rest.first() {
+                        Some(t) => *t,
+                        None => continue,
+                    };
+                    fields.push(CompositeField {
+                        name: unescape_user_field(field_name, number)?,
+                        pg_type: unescape_user_field(field_type, number)?,
+                    });
+                }
+                types.insert(name, UserType::Composite { fields });
             }
             other => {
                 return Err(UserTypesParseError::UnknownKind {
@@ -1825,6 +1970,32 @@ fn replay_statement(
                 .insert(type_name, UserType::Enum { labels });
             Ok(())
         }
+        // `CREATE TYPE name AS (field type, ...)` — a user-defined COMPOSITE (row)
+        // type. Record its ordered field list (each attribute's case-folded name
+        // and canonical type) so the query proc-macro can generate a Rust `struct`
+        // and decode the columns that reference it. The field name is folded with
+        // the SAME rule a column name is (`fold_ident`), and the field type is
+        // canonicalised with the SAME rule a column type is (`canonical_type`), so
+        // a field typed as another user type (an enum, a domain, or a nested
+        // composite) is followed transitively at the query site. Field order is
+        // preserved — it is the wire frame's field order.
+        Statement::CreateType {
+            name,
+            representation: Some(UserDefinedTypeRepresentation::Composite { attributes }),
+        } => {
+            let type_name = object_name_leaf(&name);
+            let fields: Vec<CompositeField> = attributes
+                .into_iter()
+                .map(|attr| CompositeField {
+                    name: fold_ident(&attr.name),
+                    pg_type: canonical_type(&attr.data_type),
+                })
+                .collect();
+            catalog
+                .user_types
+                .insert(type_name, UserType::Composite { fields });
+            Ok(())
+        }
         // `ALTER TYPE name {ADD VALUE | RENAME VALUE | RENAME TO}` — evolve a
         // user enum. This MUST reach the catalog: a silent skip would leave the
         // label set out of sync with the migration FILES, defeating the
@@ -1939,13 +2110,23 @@ fn alter_type_add_value(
     } = add;
     let labels = match catalog.user_types.get_mut(type_name) {
         Some(UserType::Enum { labels }) => labels,
-        // `ADD VALUE` on a domain is invalid in PostgreSQL — a loud error, never
-        // a silent skip of a migration the live server would reject.
+        // `ADD VALUE` on a domain or a composite is invalid in PostgreSQL — a
+        // loud error, never a silent skip of a migration the live server would
+        // reject (ADD VALUE is enum-only).
         Some(UserType::Domain { .. }) => {
             return Err(BuildError::Replay {
                 path: path.to_path_buf(),
                 message: format!(
                     "`ALTER TYPE {type_name} ADD VALUE` targets a DOMAIN; ADD VALUE \
+                     is only valid on an enum type."
+                ),
+            });
+        }
+        Some(UserType::Composite { .. }) => {
+            return Err(BuildError::Replay {
+                path: path.to_path_buf(),
+                message: format!(
+                    "`ALTER TYPE {type_name} ADD VALUE` targets a COMPOSITE; ADD VALUE \
                      is only valid on an enum type."
                 ),
             });
@@ -2024,6 +2205,15 @@ fn alter_type_rename_value(
                 path: path.to_path_buf(),
                 message: format!(
                     "`ALTER TYPE {type_name} RENAME VALUE` targets a DOMAIN; RENAME \
+                     VALUE is only valid on an enum type."
+                ),
+            });
+        }
+        Some(UserType::Composite { .. }) => {
+            return Err(BuildError::Replay {
+                path: path.to_path_buf(),
+                message: format!(
+                    "`ALTER TYPE {type_name} RENAME VALUE` targets a COMPOSITE; RENAME \
                      VALUE is only valid on an enum type."
                 ),
             });
@@ -3221,6 +3411,121 @@ mod tests {
     fn domain_parse_rejects_wrong_field_count() {
         let err = parse_user_types("D\tage").expect_err("a domain needs name + base");
         assert!(matches!(err, UserTypesParseError::MalformedDomain { fields: 1, .. }));
+    }
+
+    // ── User-defined COMPOSITE types ───────────────────────────────────
+
+    #[test]
+    fn create_composite_records_ordered_canonical_fields() {
+        // Field names fold and field types canonicalise with the SAME rules a
+        // column does (`STREET` -> `street`, `INTEGER` -> `int4`), and declared
+        // ORDER is preserved (it is the wire frame's field order).
+        let cat = catalog_from(&["CREATE TYPE addr AS (STREET text, Zip INTEGER, tag VARCHAR(8))"]);
+        match cat.user_types.get("addr") {
+            Some(UserType::Composite { fields }) => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[0], CompositeField { name: "street".into(), pg_type: "text".into() });
+                assert_eq!(fields[1], CompositeField { name: "zip".into(), pg_type: "int4".into() });
+                assert_eq!(fields[2], CompositeField { name: "tag".into(), pg_type: "varchar".into() });
+            }
+            other => panic!("expected an addr composite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_type_removes_a_composite() {
+        let cat = catalog_from(&["CREATE TYPE addr AS (street text)", "DROP TYPE addr"]);
+        assert!(!cat.user_types.contains_key("addr"));
+    }
+
+    #[test]
+    fn alter_type_rename_to_rekeys_a_composite() {
+        // `RENAME TO` re-keys ANY modeled user type — a composite included, via
+        // the generic re-key. (Composite ATTRIBUTE-level ALTERs are not modelled
+        // by sqlparser, so they are a loud parse error, never a silent skip.)
+        let cat = catalog_from(&[
+            "CREATE TYPE addr AS (street text, zip int4)",
+            "ALTER TYPE addr RENAME TO postal",
+        ]);
+        assert!(!cat.user_types.contains_key("addr"));
+        assert!(matches!(
+            cat.user_types.get("postal"),
+            Some(UserType::Composite { .. })
+        ));
+    }
+
+    #[test]
+    fn composite_add_attribute_is_a_loud_parse_error_fail_closed() {
+        // `ALTER TYPE addr ADD ATTRIBUTE country text` (and DROP / ALTER / RENAME
+        // ATTRIBUTE) is a composite ATTRIBUTE-level evolution the pinned
+        // `sqlparser` grammar does NOT model (it parses only enum `ALTER TYPE`
+        // ops: RENAME TO / ADD VALUE / RENAME VALUE). A form the replay cannot
+        // model faithfully is a LOUD build error, never a silently-stale struct —
+        // exactly the catalog boundary. This LOCKS that fail-closed behavior.
+        let mut cat = Catalog::default();
+        replay_file(
+            &mut cat,
+            &PathBuf::from("t0.sql"),
+            "CREATE TYPE addr AS (street text, zip int4)",
+        )
+        .expect("create composite");
+        let err = replay_file(
+            &mut cat,
+            &PathBuf::from("t1.sql"),
+            "ALTER TYPE addr ADD ATTRIBUTE country text",
+        )
+        .expect_err("ADD ATTRIBUTE is not modeled by sqlparser — a loud parse error");
+        assert!(
+            matches!(err, BuildError::Parse { .. }),
+            "expected a loud BuildError::Parse for ADD ATTRIBUTE, got {err:?}"
+        );
+        // The catalog is UNCHANGED — the build fails, so no silently-stale struct
+        // is emitted (the composite keeps its declared 2-field set).
+        match cat.user_types.get("addr") {
+            Some(UserType::Composite { fields }) => assert_eq!(fields.len(), 2),
+            other => panic!("expected the addr composite intact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_and_enum_and_composite_channel_round_trip_together() {
+        let cat = catalog_from(&[
+            "CREATE TYPE mood AS ENUM ('happy', 'sad')",
+            "CREATE TYPE addr AS (street text, zip int4)",
+            "CREATE TYPE person AS (name text, home addr, feeling mood)",
+            "CREATE DOMAIN email AS text",
+        ]);
+        let text = serialize_user_types(&cat.user_types);
+        let parsed = parse_user_types(&text).expect("round-trip");
+        assert_eq!(parsed, cat.user_types);
+    }
+
+    #[test]
+    fn composite_channel_escapes_delimiters_in_field_names() {
+        // A quoted attribute name may carry the channel's own delimiters;
+        // escaping keeps them round-tripping (universal, not a fail-loud reject).
+        let mut user_types = BTreeMap::new();
+        user_types.insert(
+            "weird".to_string(),
+            UserType::Composite {
+                fields: vec![
+                    CompositeField { name: "a\tb".into(), pg_type: "text".into() },
+                    CompositeField { name: "c\nd".into(), pg_type: "int4".into() },
+                ],
+            },
+        );
+        let text = serialize_user_types(&user_types);
+        let parsed = parse_user_types(&text).expect("escaped composite fields round-trip");
+        assert_eq!(parsed, user_types);
+    }
+
+    #[test]
+    fn composite_parse_rejects_odd_field_count() {
+        // The attribute fields must be (name, type) PAIRS — an odd count is a
+        // corrupt channel, loud not silent.
+        let err = parse_user_types("C\taddr\tstreet\ttext\tzip")
+            .expect_err("a composite needs even attribute fields");
+        assert!(matches!(err, UserTypesParseError::MalformedComposite { fields: 3, .. }));
     }
 
     // ── PRIMARY KEY tracking ───────────────────────────────────────────
