@@ -43,11 +43,11 @@ const README: &str = "README.md";
 /// The count command the README cites for total test functions. Kept BYTE-FOR-
 /// BYTE identical to the fenced command in the doc, so the gate measures exactly
 /// what a reader reproduces.
-const TOTAL_CMD: &str = "find . -path ./target -prune -o -path ./.claude -prune -o -name '*.rs' -print0 \
+const TOTAL_CMD: &str = "find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
      | xargs -0 grep -hE '^[[:space:]]*#\\[(tokio::)?test' | wc -l";
 
 /// The count command the README cites for `#[ignore]` live suites.
-const IGNORE_CMD: &str = "find . -path ./target -prune -o -path ./.claude -prune -o -name '*.rs' -print0 \
+const IGNORE_CMD: &str = "find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
      | xargs -0 grep -hE '^[[:space:]]*#\\[ignore' | wc -l";
 
 /// Unique prose anchor preceding the total in the README; the integer that
