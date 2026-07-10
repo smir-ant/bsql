@@ -41,6 +41,10 @@
 //! [`parse_server_first`]: bsql_postgres_proto::scram
 //! [`parse_server_final`]: bsql_postgres_proto::scram
 //! [`ConnectingEngine::next_auth_event`]: bsql_postgres_proto::engine::ConnectingEngine
+// End-to-end SCRAM dispatch witnesses: with SCRAM compiled out there is no
+// handshake path to exercise, so the whole suite is skipped rather than
+// referencing the gated `Credentials::ScramPassword` / `scram` module.
+#![cfg(feature = "scram")]
 #![allow(
     clippy::unwrap_used,
     clippy::panic,

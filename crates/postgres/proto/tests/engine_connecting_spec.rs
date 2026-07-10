@@ -24,6 +24,11 @@
 //! [`SendBuf`]: bsql_postgres_proto::engine::SendBuf
 //! [`pending`]: bsql_postgres_proto::engine::SendBuf::pending
 
+// Exercises the SCRAM *and* MD5 password-response dispatch (plus trust) through
+// the connecting-phase engine. Both `Credentials::ScramPassword` / `scram` and
+// `Credentials::Md5Password` are feature-gated, so with either compiled out the
+// suite has nothing to build or run — the whole gate is skipped.
+#![cfg(all(feature = "scram", feature = "md5-auth"))]
 #![forbid(unsafe_code)]
 #![allow(
     clippy::unwrap_used,

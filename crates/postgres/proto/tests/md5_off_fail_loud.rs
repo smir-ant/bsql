@@ -6,7 +6,8 @@
 #![forbid(unsafe_code)]
 #![allow(
     clippy::panic,
-    reason = "offline scripted-transport witness — panic is the loud test-failure signal, not a production fallback"
+    clippy::expect_used,
+    reason = "offline scripted-transport witness — panic/expect are the loud test-failure signals, not production fallbacks"
 )]
 
 //! Fail-loud witness for a build WITHOUT the `md5-auth` feature.
@@ -32,11 +33,12 @@ use bsql_postgres_proto::{Credentials, Ident};
 
 /// Build a tagged, length-prefixed wire frame (`tag`, 4-byte BE length that
 /// counts itself + body, then body). The `try_from` is infallible for these tiny
-/// fixtures; the saturating dead arm keeps the helper free of an unwrap.
+/// fixtures; a fixture that somehow overflowed a `u32` length is a loud test
+/// failure, never a silently-substituted value.
 fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len().saturating_add(5));
+    let mut out = Vec::with_capacity(body.len() + 5);
     out.push(tag);
-    let len = u32::try_from(body.len().saturating_add(4)).unwrap_or(0);
+    let len = u32::try_from(body.len() + 4).expect("frame body fits a u32 length");
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(body);
     out

@@ -19,6 +19,11 @@
 //! [`Transport`]: bsql_postgres_proto::engine::Transport
 //! [`poll_once`]: bsql_postgres_proto::engine::poll_once
 
+// Exercises the SCRAM *and* MD5 auth paths (plus trust) end-to-end. Both the
+// `Credentials::ScramPassword` / `scram` module and `Credentials::Md5Password`
+// are feature-gated, so with either capability compiled out there is nothing
+// here to build or run — the whole gate is skipped.
+#![cfg(all(feature = "scram", feature = "md5-auth"))]
 #![forbid(unsafe_code)]
 #![allow(
     clippy::unwrap_used,
