@@ -91,7 +91,10 @@ mod value;
 
 pub use bind::{SqliteBindParams, SqliteBindValue};
 pub use cancel::SqliteCancelToken;
-pub use connection::{BorrowedRow, Connection, QueryResult, Row, RowSet, Transaction, TypedRows};
+pub use connection::{
+    BorrowedRow, Connection, QueryResult, Row, RowSet, SqliteStatement, SqliteTypedStatement,
+    Transaction, TypedRows,
+};
 pub use error::SqliteError;
 #[cfg(feature = "n1-detect")]
 pub use n1::{N1Report, N1Tracker};

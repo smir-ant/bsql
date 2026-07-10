@@ -108,6 +108,49 @@ fn bench_fetch_many(conn: &Connection, limit: i64) -> Result<(), SqliteError> {
     Ok(())
 }
 
+/// By-PK through an EXPLICIT reusable prepared handle (`conn.prepare_sql` +
+/// `stmt.query_each`), the third path that closes the parity gap: the compiled
+/// statement is reused across the loop (a PLAIN, non-persistent prepare that
+/// keeps SQLite's lookaside pool live), so NO per-call `sqlite3_prepare_v2`
+/// recompile is paid. Reads every column zero-copy, byte-for-byte the same work
+/// `bench_fetch_one` does through the connection's per-call-prepare streaming
+/// verb — so the delta between `sqlite_fetch_one` and `by_pk_prepared` is PURELY
+/// the eliminated recompile.
+fn bench_fetch_one_prepared(conn: &Connection) -> Result<(), SqliteError> {
+    let sql = "SELECT id, name, email FROM bench_users WHERE id = ?1";
+    let p = [ValueRef::Integer(42)];
+    let mut stmt = conn.prepare_sql(sql)?;
+    stmt.query_each(&p, |r| touch_all(&r))?; // warm up
+    let start = Instant::now();
+    for _ in 0..ITERS_DEFAULT {
+        if let Some(e) = stmt.query_each(&p, |r| touch_all(&r))? {
+            return Err(e);
+        }
+    }
+    report("by_pk_prepared", start.elapsed(), ITERS_DEFAULT);
+    Ok(())
+}
+
+/// 10-row scan through the reusable prepared handle — where eliminating the
+/// per-call recompile matters most (the recompile is a fixed cost amortized over
+/// only ten rows, so it dominates the streaming per-call-prepare cell). Same
+/// per-column touch as `bench_fetch_many(conn, 10)`, so `10row_prepared`
+/// isolates the recompile against `sqlite_fetch_many/10`.
+fn bench_fetch_many_prepared(conn: &Connection, limit: i64) -> Result<(), SqliteError> {
+    let sql = "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT ?1";
+    let p = [ValueRef::Integer(limit)];
+    let mut stmt = conn.prepare_sql(sql)?;
+    stmt.query_each(&p, |r| touch_all(&r))?; // warm up
+    let start = Instant::now();
+    for _ in 0..ITERS_DEFAULT {
+        if let Some(e) = stmt.query_each(&p, |r| touch_all(&r))? {
+            return Err(e);
+        }
+    }
+    report("10row_prepared", start.elapsed(), ITERS_DEFAULT);
+    Ok(())
+}
+
 fn bench_insert_single(conn: &Connection) -> Result<(), SqliteError> {
     let sql = "INSERT INTO bench_users (name, email, active, score) \
                VALUES (?1, ?2, 1, 0.0) RETURNING id";
@@ -200,7 +243,9 @@ fn run() -> Result<(), SqliteError> {
     // table removes the bloat confound — same rationale as the PG runner).
     bench_fetch_one(&conn)?;
     bench_fetch_one_eager(&conn)?;
+    bench_fetch_one_prepared(&conn)?;
     bench_fetch_many(&conn, 10)?;
+    bench_fetch_many_prepared(&conn, 10)?;
     bench_fetch_many(&conn, 100)?;
     bench_fetch_many(&conn, 1_000)?;
     bench_fetch_many(&conn, 10_000)?;

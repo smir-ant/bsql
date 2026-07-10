@@ -1132,6 +1132,97 @@ impl Connection {
         Ok(None)
     }
 
+    /// Prepare a raw-SQL statement into an explicit, reusable
+    /// [`SqliteStatement`] handle bound to this connection — the DYNAMIC peer of
+    /// the compile-checked typed [`prepare`](Self::prepare)`::<Q>`.
+    ///
+    /// The verbs on the connection (`query_sql` / `query_params` / … ) prepare a
+    /// fresh statement PER CALL; a query re-run in a loop through them pays a
+    /// `sqlite3_prepare_v2` recompile every iteration (the eager/execute/typed
+    /// verbs hide it behind a per-connection cache, but the zero-copy STREAMING
+    /// verbs deliberately do NOT — see the [`Connection`] type-level caching
+    /// note). This handle is the third path: the CONSUMER holds it on the stack
+    /// beside the connection and executes it repeatedly, so a hot loop compiles
+    /// the SQL ONCE and reuses the compiled bytecode — the shape a hand-rolled
+    /// `sqlite3_prepare_v2` + reuse achieves, with NO `unsafe` and NO self-
+    /// referential hidden cache.
+    ///
+    /// The statement is prepared with a PLAIN (non-persistent) statement — it
+    /// keeps SQLite's lookaside memory pool live for its stepping (unlike the
+    /// `SQLITE_PREPARE_PERSISTENT` a hidden statement cache forces), so a reused
+    /// multi-row read runs at the fast lookaside speed, closing the gap the
+    /// per-call-prepare streaming verbs leave open.
+    ///
+    /// The returned handle BORROWS this connection (it is
+    /// `SqliteStatement<'conn>` over `rusqlite::Statement<'conn>`), so the
+    /// borrow checker keeps the connection alive for the handle's whole life —
+    /// no dangling, no `unsafe`, and no way to outlive the connection (tier-1).
+    /// A statement prepared here can be executed INSIDE a
+    /// [`transaction`](Self::transaction) closure (it runs on the same db handle,
+    /// within the current transaction) and honors a
+    /// [`cancel_token`](Self::cancel_token) interrupt exactly as the connection
+    /// verbs do (an interrupted step is [`SqliteError::Interrupted`]).
+    ///
+    /// # Errors
+    ///
+    /// A classified [`SqliteError`] if the SQL fails to compile.
+    pub fn prepare_sql(&self, sql: &str) -> Result<SqliteStatement<'_>, SqliteError> {
+        Ok(SqliteStatement { stmt: self.inner.prepare(sql)? })
+    }
+
+    /// Prepare a compile-checked `query!` carrier into an explicit, reusable
+    /// [`SqliteTypedStatement`] handle — the TYPED flagship peer of the dynamic
+    /// [`prepare_sql`](Self::prepare_sql).
+    ///
+    /// `Q` is a `query!` carrier (`FooQuery`); the handle's verbs
+    /// ([`query`](SqliteTypedStatement::query) /
+    /// [`query_one`](SqliteTypedStatement::query_one) /
+    /// [`query_opt`](SqliteTypedStatement::query_opt) /
+    /// [`query_each`](SqliteTypedStatement::query_each)) take the SAME typed
+    /// `Q::Params` tuple and decode into the SAME typed records the connection's
+    /// [`query`](Self::query) family produces (storage-class-verified per value —
+    /// a mismatch is a classified [`SqliteError`], never a silent coercion). Like
+    /// [`prepare_sql`](Self::prepare_sql) it compiles the SQL ONCE (a plain,
+    /// non-persistent statement) and reuses it on every call, so a typed by-key
+    /// lookup re-run in a loop pays no per-call recompile.
+    ///
+    /// The `?N`↔tuple arity is checked ONCE here at prepare (not per call), so a
+    /// miswired hand-written carrier is a classified
+    /// [`SqliteError::ParameterCountMismatch`] at prepare rather than a silent
+    /// under-bind at each execution; a macro-generated carrier always agrees by
+    /// construction.
+    ///
+    /// A carrier `Q` whose parameters are not all SQLite-bindable (a `u64`, a
+    /// PostgreSQL-only type) makes this a LOCATED compile error at the call site
+    /// (the `SqliteBindParams` bound), never a silent mis-bind — the same wall
+    /// the connection's typed verbs raise.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`SqliteError`] if the SQL fails to compile, or
+    /// [`SqliteError::ParameterCountMismatch`] if the carrier's parameter arity
+    /// disagrees with the prepared statement's placeholder count.
+    pub fn prepare<Q: SqliteTypedQuery>(
+        &self,
+    ) -> Result<SqliteTypedStatement<'_, Q>, SqliteError>
+    where
+        Q::Params<'static>: SqliteBindParams,
+    {
+        let stmt = self.inner.prepare(Q::SQL)?;
+        // The placeholder↔tuple-arity guard is a property of the SQL text + the
+        // carrier, both fixed at prepare — so it is checked ONCE here, keeping the
+        // per-execution hot path free of the `sqlite3_bind_parameter_count` call.
+        // `Q::Params<'static>::COUNT` is the tuple arity (invariant in the
+        // lifetime), so `'static` names it without a live `'p`.
+        ensure_param_count(&stmt, <Q::Params<'static> as SqliteBindParams>::COUNT)?;
+        Ok(SqliteTypedStatement {
+            stmt,
+            _q: PhantomData,
+            #[cfg(feature = "n1-detect")]
+            conn: self,
+        })
+    }
+
     /// Begin a transaction.
     pub fn begin(&self) -> Result<(), SqliteError> {
         self.inner.execute_batch("BEGIN")?;
@@ -1559,6 +1650,330 @@ impl<Q: SqliteTypedQuery> core::fmt::Debug for TypedRows<Q> {
     /// `Q: Debug`, so the impl is bound-free.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TypedRows").field("rows", &self.result.len()).finish()
+    }
+}
+
+// ─── Explicit prepared-statement handles ─────────────────────────────────────
+
+/// An explicit, reusable DYNAMIC (raw-SQL) prepared statement — the handle
+/// [`Connection::prepare_sql`] returns.
+///
+/// Holds one `rusqlite::Statement<'conn>` (a PLAIN, non-persistent prepare, so
+/// its stepping keeps SQLite's lookaside pool live) borrowing the connection.
+/// The consumer keeps it on the stack beside the connection and calls its verbs
+/// repeatedly; the SQL is compiled ONCE at [`prepare_sql`](Connection::prepare_sql)
+/// and every execution reuses the compiled bytecode, so a hot loop pays no
+/// per-call `sqlite3_prepare_v2` recompile — the fast reuse shape a hand-rolled
+/// FFI layer achieves, with no `unsafe` and no self-referential hidden cache.
+///
+/// The verbs MIRROR the connection's dynamic parameterized verbs (a `&[ValueRef]`
+/// param slice, each value bound in its true storage class):
+/// [`execute`](Self::execute), [`query`](Self::query),
+/// [`query_one`](Self::query_one) / [`query_opt`](Self::query_opt) (first row),
+/// and the zero-copy streaming [`query_each`](Self::query_each). They take
+/// `&mut self` because reusing a `rusqlite::Statement` mutates its bound
+/// parameters and step cursor; the previous execution's rows are fully drained
+/// (and the statement reset) before the next call, so a reuse never observes a
+/// stale binding.
+///
+/// Because the handle BORROWS the connection, it can be used inside a
+/// [`Connection::transaction`] closure (same db handle, within the current
+/// transaction) and it cannot outlive the connection (tier-1, borrow-checked).
+/// It carries no N+1 detection: an explicit prepared handle is DELIBERATE reuse
+/// (the same rationale the connection's dynamic verbs and the PostgreSQL
+/// `query_prepared` follow — the N+1 net targets the transparent typed `query!`
+/// verbs, where accidental per-row repetition is the anti-pattern).
+pub struct SqliteStatement<'conn> {
+    /// The compiled statement borrowing the connection. Plain (non-persistent).
+    stmt: rusqlite::Statement<'conn>,
+}
+
+impl core::fmt::Debug for SqliteStatement<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SqliteStatement")
+            .field("columns", &self.stmt.column_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SqliteStatement<'_> {
+    /// The number of result columns the statement produces.
+    #[must_use]
+    pub fn column_count(&self) -> usize {
+        self.stmt.column_count()
+    }
+
+    /// The number of bind parameters (`?N` placeholders) the statement expects.
+    #[must_use]
+    pub fn parameter_count(&self) -> usize {
+        self.stmt.parameter_count()
+    }
+
+    /// Execute the statement for its side effect, returning the number of rows
+    /// changed. Peer of [`Connection::execute_params`], reusing the compiled
+    /// statement.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`SqliteError`] on a bind (including an arity mismatch
+    /// against the statement's `?N` count) or step failure.
+    pub fn execute(&mut self, params: &[ValueRef<'_>]) -> Result<u64, SqliteError> {
+        Ok(changes_to_u64(self.stmt.execute(rusqlite::params_from_iter(params))?))
+    }
+
+    /// Run the statement and eagerly materialize every row into one shared arena
+    /// [`QueryResult`]. Peer of [`Connection::query_params`], reusing the
+    /// compiled statement.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`SqliteError`] on a bind / step / seal failure (a `> 4 GiB`
+    /// eager result is [`SqliteError::ResultTooLarge`] — stream it via
+    /// [`query_each`](Self::query_each) instead).
+    pub fn query(&mut self, params: &[ValueRef<'_>]) -> Result<QueryResult, SqliteError> {
+        // Drain the rows in an inner scope (releasing the `&mut self.stmt` the
+        // `Rows` holds, and resetting the statement on their drop), then read the
+        // post-reprepare column shape from the statement — the same schema-safe
+        // order as `Connection::query_collect`.
+        let builder = {
+            let mut rows = self.stmt.query(rusqlite::params_from_iter(params))?;
+            Connection::drain_cells(&mut rows)?
+        };
+        Connection::seal_result(&self.stmt, builder)
+    }
+
+    /// Run the statement and return exactly its FIRST row, or
+    /// [`SqliteError::NoRows`] if it produced none. Peer of
+    /// [`Connection::query_params_one`] (first-row, the dynamic contract).
+    ///
+    /// # Errors
+    ///
+    /// [`SqliteError::NoRows`] on zero rows, or a classified [`SqliteError`] on a
+    /// bind / step failure.
+    pub fn query_one(&mut self, params: &[ValueRef<'_>]) -> Result<Row, SqliteError> {
+        self.query(params)?.get(0).ok_or(SqliteError::NoRows)
+    }
+
+    /// Run the statement and return its FIRST row if any. Peer of
+    /// [`Connection::query_params_opt`] (first-row, the dynamic contract).
+    ///
+    /// # Errors
+    ///
+    /// A classified [`SqliteError`] on a bind / step failure.
+    pub fn query_opt(&mut self, params: &[ValueRef<'_>]) -> Result<Option<Row>, SqliteError> {
+        Ok(self.query(params)?.get(0))
+    }
+
+    /// Stream the statement's rows one at a time through `on_row` in CONSTANT
+    /// memory (nothing accumulated), each row a zero-copy [`BorrowedRow`]. Peer
+    /// of [`Connection::query_each_params`], reusing the compiled statement — so
+    /// a large streamed scan re-run in a loop pays no per-call recompile, the
+    /// gap the connection's (deliberately uncached) streaming verb leaves.
+    ///
+    /// The callback returns [`ControlFlow`]: `Continue(())` keeps streaming,
+    /// `Break(e)` stops early. `Ok(None)` = every row streamed, `Ok(Some(e))` =
+    /// an early break. The `for<'r>` bound makes each `BorrowedRow` valid only
+    /// inside the call, so nothing it lends can escape.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`SqliteError`] on a bind / step failure.
+    pub fn query_each<F, E>(
+        &mut self,
+        params: &[ValueRef<'_>],
+        mut on_row: F,
+    ) -> Result<Option<E>, SqliteError>
+    where
+        F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
+    {
+        let mut rows = self.stmt.query(rusqlite::params_from_iter(params))?;
+        while let Some(row) = rows.next()? {
+            if let ControlFlow::Break(e) = on_row(BorrowedRow { row }) {
+                return Ok(Some(e));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// An explicit, reusable TYPED (compile-checked `query!`) prepared statement —
+/// the handle [`Connection::prepare`]`::<Q>` returns, the flagship peer of the
+/// dynamic [`SqliteStatement`].
+///
+/// Holds one plain (non-persistent) `rusqlite::Statement<'conn>` borrowing the
+/// connection, compiled ONCE from the carrier's `Q::SQL` and reused on every
+/// call. Its verbs take the SAME typed `Q::Params` tuple and produce the SAME
+/// typed records as the connection's [`query`](Connection::query) family —
+/// storage-class-verified per value, exactly-one / at-most-one contracts
+/// preserved — so a typed by-key lookup re-run in a loop skips the per-call
+/// recompile while keeping every compile-time and runtime guarantee.
+///
+/// Under the `n1-detect` feature the read verbs record their `(SQL, call-site)`
+/// pair exactly as the connection's typed verbs do (a typed read repeated 25+
+/// times from one call site within a logical operation is the N+1 anti-pattern
+/// regardless of whether the statement was pre-prepared), so the net is not
+/// lost by reaching for the handle; the field the recording needs exists only
+/// under that feature, leaving the default footprint unchanged.
+pub struct SqliteTypedStatement<'conn, Q: SqliteTypedQuery> {
+    /// The compiled statement borrowing the connection. Plain (non-persistent).
+    stmt: rusqlite::Statement<'conn>,
+    /// Pins the carrier type without owning a `Q`. `fn() -> Q` is covariant and
+    /// imposes no auto-trait bound on the uninhabited marker.
+    _q: PhantomData<fn() -> Q>,
+    /// The connection, held ONLY to record N+1 detections through it. Present
+    /// solely under `n1-detect`; a shared reborrow of the same `&self` the
+    /// `stmt` field already borrows (both are `&'conn Connection`), so it adds no
+    /// aliasing constraint and no default-build footprint.
+    #[cfg(feature = "n1-detect")]
+    conn: &'conn Connection,
+}
+
+impl<Q: SqliteTypedQuery> core::fmt::Debug for SqliteTypedStatement<'_, Q> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SqliteTypedStatement")
+            .field("columns", &self.stmt.column_count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'conn, Q: SqliteTypedQuery> SqliteTypedStatement<'conn, Q> {
+    /// The number of result columns the statement produces.
+    #[must_use]
+    pub fn column_count(&self) -> usize {
+        self.stmt.column_count()
+    }
+
+    /// Record one execution against the N+1 detector (a no-op with the feature
+    /// off — the whole body compiles out). The read verbs funnel their
+    /// `#[track_caller]` site here, matching [`Connection::query`] and friends.
+    #[cfg(feature = "n1-detect")]
+    #[inline]
+    fn n1_record(&self) {
+        self.conn.n1_record(Q::SQL, core::panic::Location::caller());
+    }
+
+    /// Run the typed statement and collect its rows into a [`TypedRows`] (one
+    /// shared arena). Peer of [`Connection::query`], reusing the compiled
+    /// statement.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`SqliteError`] on a bind / step / seal failure; per-row
+    /// decode failures surface from the returned [`TypedRows`].
+    #[cfg_attr(feature = "n1-detect", track_caller)]
+    pub fn query<'p>(&mut self, params: Q::Params<'p>) -> Result<TypedRows<Q>, SqliteError>
+    where
+        Q::Params<'p>: SqliteBindParams,
+    {
+        #[cfg(feature = "n1-detect")]
+        self.n1_record();
+        params.bind_positional(&mut self.stmt)?;
+        let builder = {
+            let mut rows = self.stmt.raw_query();
+            Connection::drain_cells(&mut rows)?
+        };
+        let result = Connection::seal_result(&self.stmt, builder)?;
+        Ok(TypedRows { result, _q: PhantomData })
+    }
+
+    /// Run the typed statement expecting EXACTLY one row, returning the owned
+    /// record. Zero rows is [`SqliteError::NoRows`]; more than one is
+    /// [`SqliteError::TooManyRows`] — the SAME exactly-one contract as
+    /// [`Connection::query_one`], reusing the compiled statement.
+    ///
+    /// # Errors
+    ///
+    /// [`SqliteError::NoRows`] on zero rows, [`SqliteError::TooManyRows`] on two
+    /// or more, or a classified [`SqliteError`] on a bind / step / decode
+    /// failure.
+    #[cfg_attr(feature = "n1-detect", track_caller)]
+    pub fn query_one<'p>(&mut self, params: Q::Params<'p>) -> Result<Q::Owned, SqliteError>
+    where
+        Q::Params<'p>: SqliteBindParams,
+    {
+        #[cfg(feature = "n1-detect")]
+        self.n1_record();
+        self.first_owned(&params)?.ok_or(SqliteError::NoRows)
+    }
+
+    /// Run the typed statement expecting AT MOST one row, returning the owned
+    /// record if present or `None` if absent. More than one row is
+    /// [`SqliteError::TooManyRows`] — the SAME at-most-one contract as
+    /// [`Connection::query_opt`], reusing the compiled statement.
+    ///
+    /// # Errors
+    ///
+    /// [`SqliteError::TooManyRows`] on two or more rows, or a classified
+    /// [`SqliteError`] on a bind / step / decode failure (zero rows is
+    /// `Ok(None)`).
+    #[cfg_attr(feature = "n1-detect", track_caller)]
+    pub fn query_opt<'p>(
+        &mut self,
+        params: Q::Params<'p>,
+    ) -> Result<Option<Q::Owned>, SqliteError>
+    where
+        Q::Params<'p>: SqliteBindParams,
+    {
+        #[cfg(feature = "n1-detect")]
+        self.n1_record();
+        self.first_owned(&params)
+    }
+
+    /// Bind, step to the first row (decode its owned twin), then step ONCE more
+    /// to enforce the at-most-one contract — the shared body behind
+    /// [`query_one`](Self::query_one) / [`query_opt`](Self::query_opt), the same
+    /// decode-direct shape as [`Connection::query_first_owned`] but over the
+    /// REUSED statement.
+    fn first_owned<'p>(
+        &mut self,
+        params: &Q::Params<'p>,
+    ) -> Result<Option<Q::Owned>, SqliteError>
+    where
+        Q::Params<'p>: SqliteBindParams,
+    {
+        params.bind_positional(&mut self.stmt)?;
+        let mut rows = self.stmt.raw_query();
+        let first = match rows.next()? {
+            Some(row) => Q::decode_row_owned(&BorrowedRow { row })?,
+            None => return Ok(None),
+        };
+        if rows.next()?.is_some() {
+            return Err(SqliteError::TooManyRows);
+        }
+        Ok(Some(first))
+    }
+
+    /// Stream the typed statement's rows one at a time through `on_row` in
+    /// CONSTANT memory, each a borrowed record aliasing SQLite's row buffer
+    /// zero-copy. Peer of [`Connection::query_each`], reusing the compiled
+    /// statement.
+    ///
+    /// # Errors
+    ///
+    /// A classified [`SqliteError`] on a bind / step / decode failure — a decode
+    /// error is LOUD (it stops the stream), never skipped.
+    #[cfg_attr(feature = "n1-detect", track_caller)]
+    pub fn query_each<'p, F, E>(
+        &mut self,
+        params: Q::Params<'p>,
+        mut on_row: F,
+    ) -> Result<Option<E>, SqliteError>
+    where
+        Q::Params<'p>: SqliteBindParams,
+        F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E>,
+    {
+        #[cfg(feature = "n1-detect")]
+        self.n1_record();
+        params.bind_positional(&mut self.stmt)?;
+        let mut rows = self.stmt.raw_query();
+        while let Some(row) = rows.next()? {
+            let view = BorrowedRow { row };
+            let record = Q::decode_row(&view)?;
+            if let ControlFlow::Break(e) = on_row(record) {
+                return Ok(Some(e));
+            }
+        }
+        Ok(None)
     }
 }
 
