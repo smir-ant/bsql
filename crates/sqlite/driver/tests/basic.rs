@@ -182,7 +182,10 @@ fn blob_roundtrip() {
 
 #[test]
 fn open_file_and_reopen() {
-    let dir = std::env::temp_dir().join("bsql_sqlite_test.db");
+    // Unique per process so a concurrent `cargo test` run (e.g. a background
+    // build) cannot race this fixed path — matching the pid-scoped convention
+    // in the sibling file-backed tests (`busy_timeout.rs`, `error_predicates.rs`).
+    let dir = std::env::temp_dir().join(format!("bsql_sqlite_reopen_{}.db", std::process::id()));
     let _ = std::fs::remove_file(&dir);
 
     {
