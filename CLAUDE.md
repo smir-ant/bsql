@@ -1038,6 +1038,17 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   probe compiled out, and `is_encrypted()` is then always `false`. The `tls`-off
   fail-loud is witnessed by `bsql-postgres-sync`'s `tls_off_fail_loud` test
   (`cargo test -p bsql-postgres-sync --no-default-features --test tls_off_fail_loud`).
+  PER-CONNECTION MEMORY (pool sizing): a plaintext connection holds a fixed 4 KiB
+  engine read buffer (`bsql_postgres_proto::READ_BUF_CAP`); a TLS connection adds
+  the rustls record buffers boxed in `Wire::Tls` — a fixed ~32 KiB inbound
+  ciphertext staging buffer (`STAGING_CAP = MAX_CIPHERTEXT_RECORD + RECV_CHUNK` in
+  `core::tls`) plus a fixed ~16 KiB encrypt scratch (`TLS_RECORD_SCRATCH`), both
+  allocated ONCE per connection, plus rustls's own connection state and two
+  transient plaintext/ciphertext vecs each bounded near one 16 KiB TLS record. So
+  a TLS connection costs on the order of ~64 KiB of driver-owned buffers vs ~4 KiB
+  plaintext — a 100-connection TLS pool ≈ ~6 MiB. Dropping `tls` removes it
+  entirely. (The plaintext 4 KiB is pinned by `footprint_baseline`'s
+  `per_connection_resident_estimate`.)
 - The whole SCRAM-SHA-256 authentication capability is behind the default-on
   `scram` feature (proto → core → drivers → umbrella; proto keeps
   `default = ["scram"]` so the standard `cargo test` runs keep the full SCRAM

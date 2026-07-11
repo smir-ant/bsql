@@ -269,14 +269,23 @@ atomicity / drift / concurrency guarantees.
 
 ### Runtime queries
 
-The typed `query!` path is the flagship, but every driver also exposes a
-runtime-SQL surface (`query_sql`, `query_params_one`, `prepare` /
-`execute_prepared`, `transaction`, …) and a dynamic 16-byte `Row` backed
-by an `Arc`-shared arena (3 heap allocations per whole result — the arena's
-data + slots vectors + the shared `Arc`; the result mints `Row` handles
-lazily, never an eager `Vec<Row>` — regardless of row count). See the
-crate-root docs of `bsql` / `bsql-postgres-async` /
-`bsql-postgres-sync` / `bsql-sqlite` for runnable examples.
+**Reach for the typed `query!` verbs first.** The compile-checked verbs
+(`query` / `query_one` / `query_opt` / `query_each` / typed `execute`) are the
+DEFAULT: they are typed at build time, so a wrong column or type is a compile
+error and every parameter binds in one uniform binary format. The dynamic
+runtime-SQL verbs are the ESCAPE HATCH — they carry a `_sql` suffix precisely to
+mark the untyped path (`query_sql`, `query_one_sql`, `query_opt_sql`,
+`execute_sql`, `query_each_sql`; plus the parameterized `query_params` /
+`query_params_one` / `execute_params`) — and are for the case a typed query
+cannot cover: SQL assembled at runtime that the migration catalog cannot
+validate. Prefer the typed path; drop to `_sql` only when you must.
+
+The dynamic verbs return a dynamic 16-byte `Row` backed by an `Arc`-shared arena
+(3 heap allocations per whole result — the arena's data + slots vectors + the
+shared `Arc`; the result mints `Row` handles lazily, never an eager `Vec<Row>` —
+regardless of row count). See the crate-root docs of `bsql` /
+`bsql-postgres-async` / `bsql-postgres-sync` / `bsql-sqlite` for runnable
+examples.
 
 For a colossal runtime result, `query_each_sql(sql, on_row)` /
 `query_each_params(sql, params, on_row)` stream the dynamic row to a callback
@@ -429,6 +438,17 @@ hardens the connection LIFECYCLE:
   the return-time restamp reads the clock only when `idle_timeout` is set). A reap
   emits `DiagEvent::PoolConnectionEvicted` and increments the `Pool::stats()`
   eviction counter.
+- **Per-connection memory (sizing a large pool).** A PLAINTEXT connection holds a
+  fixed 4 KiB engine read buffer (the dominant driver-owned heap, apart from the
+  kernel's own socket buffers). A **TLS** connection additionally holds the rustls
+  record buffers: a ~32 KiB inbound ciphertext staging buffer (`STAGING_CAP`) plus
+  a ~16 KiB encrypt scratch (`TLS_RECORD_SCRATCH`), both fixed and allocated ONCE
+  per connection, plus rustls's own connection state and two transient
+  plaintext/ciphertext vecs each bounded near one 16 KiB TLS record. So budget on
+  the order of **~64 KiB per TLS connection** — a 100-connection TLS pool holds
+  roughly ~6 MiB of driver-owned buffers, versus ~0.4 MiB plaintext. Drop the
+  whole cost with `default-features = false` (TLS off) for a localhost /
+  unix-socket / trust-auth deployment.
 
 ## Crate layout
 
