@@ -98,6 +98,7 @@ version = "0.1.0-alpha.0"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
+ "socket2",
  "tokio",
  "trybuild",
 ]
@@ -139,6 +140,7 @@ version = "0.1.0-alpha.0"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
+ "socket2",
  "trybuild",
 ]
 

@@ -61,6 +61,44 @@ use std::time::{Duration, Instant};
 use bsql_postgres_core::{ConnectConfig, DiagEvent, Diagnostics, DriverError, PoolStats};
 use crate::connection::Connection;
 
+/// An idle pooled connection plus its lifecycle stamps, so a checkout can REAP a
+/// connection that outlived `max_lifetime` (age since it was established) or
+/// `idle_timeout` (since it last returned) BEFORE handing it out — minting a
+/// fresh one instead of reusing a stale one. The blocking twin of the async
+/// pool's `Idle`.
+struct Idle {
+    conn: Connection,
+    /// When the underlying connection was first established (for `max_lifetime`).
+    created: Instant,
+    /// When it last returned to the idle set (for `idle_timeout`).
+    returned: Instant,
+}
+
+/// Whether an idle connection must be REAPED at checkout: it has outlived
+/// `max_lifetime` (age since `created`) or `idle_timeout` (idle since
+/// `returned`). Both bounds are opt-in (`None` = disabled), so the default pool
+/// reaps nothing and reuses every healthy connection — no behaviour change for an
+/// existing consumer.
+fn is_stale(
+    created: Instant,
+    returned: Instant,
+    now: Instant,
+    max_lifetime: Option<Duration>,
+    idle_timeout: Option<Duration>,
+) -> bool {
+    if let Some(max) = max_lifetime
+        && now.saturating_duration_since(created) > max
+    {
+        return true;
+    }
+    if let Some(idle) = idle_timeout
+        && now.saturating_duration_since(returned) > idle
+    {
+        return true;
+    }
+    false
+}
+
 /// The default acquire deadline when a caller does not specify one via
 /// [`Pool::get_timeout`] or [`Pool::acquire_timeout`]. Finite by construction:
 /// the pool never blocks forever.
@@ -90,10 +128,18 @@ struct PoolInner {
     /// High-water mark of the FIFO waiter queue depth (updated under the state
     /// lock as a waiter enqueues).
     waiters_high_water: AtomicU64,
+    /// Maximum lifetime of a pooled connection (since it was established), or
+    /// `None` (disabled). At checkout, a connection older than this is reaped and
+    /// replaced. Fixed for the pool's life.
+    max_lifetime: Option<Duration>,
+    /// Maximum idle time of a pooled connection (since it last returned), or
+    /// `None` (disabled). At checkout, a connection idle longer than this is
+    /// reaped and replaced. Fixed for the pool's life.
+    idle_timeout: Option<Duration>,
 }
 
 struct PoolState {
-    connections: VecDeque<Connection>,
+    connections: VecDeque<Idle>,
     checked_out: usize,
     /// FIFO queue of blocked waiters, each parked on its OWN [`Condvar`]
     /// (identified by `Arc` pointer). The FRONT is the next to serve; a freed
@@ -113,12 +159,12 @@ impl std::fmt::Debug for Pool {
 
 /// Reserve a slot for the caller if one is free, incrementing `checked_out`.
 ///
-/// `Some(Some(conn))` — reuse the popped idle connection (reset before handing
-/// out); `Some(None)` — a fresh slot was reserved (create a new connection);
-/// `None` — the pool is at capacity with nothing idle (the caller must wait).
-/// The caller must already be entitled to the slot (queue empty, or at the
-/// FIFO front) — this does NOT check fairness.
-fn try_take(state: &mut PoolState, max_size: usize) -> Option<Option<Connection>> {
+/// `Some(Some(idle))` — reuse the popped idle connection (check staleness + reset
+/// before handing out); `Some(None)` — a fresh slot was reserved (create a new
+/// connection); `None` — the pool is at capacity with nothing idle (the caller
+/// must wait). The caller must already be entitled to the slot (queue empty, or at
+/// the FIFO front) — this does NOT check fairness.
+fn try_take(state: &mut PoolState, max_size: usize) -> Option<Option<Idle>> {
     // A connection enters the idle deque ONLY when healthy (`Drop` guards on
     // `is_healthy`; a fatal verb or an explicit `close` evicts at RETURN time,
     // never adding it), and nothing runs on an idle pooled connection to flip its
@@ -126,14 +172,14 @@ fn try_take(state: &mut PoolState, max_size: usize) -> Option<Option<Connection>
     // idle-death (the server closed the socket while idle) is `is_healthy()==true`
     // and is caught by the reset failing on acquire (evict + retry), not by a
     // pop-time probe — a pop-time `is_healthy()` filter would be dead code.
-    if let Some(conn) = state.connections.pop_front() {
+    if let Some(idle) = state.connections.pop_front() {
         // `checked_out` counts handed-out slots; it is bounded by `max_size`
         // (a `usize`) so this cannot overflow. `saturating_add` is the
         // forbid-bundle-compliant total form (this fn returns `Option`, not
         // `Result`, so there is no channel to carry an overflow error) and is
         // behavior-identical in the reachable domain.
         state.checked_out = state.checked_out.saturating_add(1);
-        return Some(Some(conn));
+        return Some(Some(idle));
     }
     if state.connections.len().saturating_add(state.checked_out) < max_size {
         state.checked_out = state.checked_out.saturating_add(1);
@@ -183,7 +229,8 @@ impl Pool {
         max_size: usize,
         acquire_timeout: Duration,
     ) -> Self {
-        Self::from_parts(config, max_size, acquire_timeout, Diagnostics::default())
+        // `None`/`None`: no lifetime/idle reaping by default (existing behaviour).
+        Self::from_parts(config, max_size, acquire_timeout, Diagnostics::default(), None, None)
     }
 
     /// Start building a pool with structured diagnostics (a
@@ -200,6 +247,8 @@ impl Pool {
             max_size,
             acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
             diagnostics: Diagnostics::default(),
+            max_lifetime: None,
+            idle_timeout: None,
         }
     }
 
@@ -210,6 +259,8 @@ impl Pool {
         max_size: usize,
         acquire_timeout: Duration,
         diagnostics: Diagnostics,
+        max_lifetime: Option<Duration>,
+        idle_timeout: Option<Duration>,
     ) -> Self {
         Self {
             inner: Arc::new(PoolInner {
@@ -225,6 +276,8 @@ impl Pool {
                 acquire_timeouts: AtomicU64::new(0),
                 connections_evicted: AtomicU64::new(0),
                 waiters_high_water: AtomicU64::new(0),
+                max_lifetime,
+                idle_timeout,
             }),
         }
     }
@@ -254,10 +307,10 @@ impl Pool {
         loop {
             // ── Phase 1: under the lock, reserve a slot FAIRLY (FIFO), or wait
             // until the deadline. Reserving increments `checked_out`; the
-            // reservation is released on any Phase-2 failure below. `Some(conn)` =
-            // a popped idle connection to REUSE (reset before handing out); `None`
-            // = the slot is reserved for a FRESH connection (already clean).
-            let reused: Option<Connection> = {
+            // reservation is released on any Phase-2 failure below. `Some(idle)` =
+            // a popped idle connection to REUSE (reap-check + reset before handing
+            // out); `None` = the slot is reserved for a FRESH connection.
+            let reused: Option<Idle> = {
                 // Mutex poison recovery, not a data fallback: a poisoned lock means
                 // another thread panicked while holding it; `into_inner` recovers
                 // the guarded pool state so the pool keeps operating.
@@ -293,24 +346,66 @@ impl Pool {
             // ~10–25µs local RTT is the minimum price of exactly-once, not an
             // optimization gap.
             match reused {
-                Some(mut conn) => match conn.reset_session() {
-                    Ok(()) => {
-                        return Ok(PooledConnection {
-                            conn: Some(conn),
-                            pool: self.inner.clone(),
-                        });
-                    }
-                    // Reset failed: evict this connection, release its slot, and
-                    // retry — never hand out an un-reset (dirty) connection.
-                    Err(_evict) => {
-                        // Count + surface the eviction (a steady stream is a
-                        // reconnect storm — server-side churn made visible).
+                Some(idle) => {
+                    let Idle { mut conn, created, returned } = idle;
+                    // LAZY REAPER — before the liveness reset, drop a connection
+                    // that outlived `max_lifetime` (age) or `idle_timeout` (idle):
+                    // gracefully close it (bounded Terminate), release its slot, and
+                    // loop to mint a FRESH one instead of reusing a stale
+                    // plan/socket. Reaping-at-checkout is chosen over a background
+                    // timer thread (extra lifecycle + a per-pool thread) and over
+                    // reap-on-return (which cannot catch a connection that ages past
+                    // a bound WHILE idle). Disabled by default (`None`/`None`).
+                    //
+                    // ZERO-COST WHEN OFF: read the clock (and run the staleness
+                    // check) ONLY if a bound is set. Rust's `&&` short-circuits, so
+                    // a default pool (both `None`) never evaluates `Instant::now()`
+                    // here — no per-checkout timing work.
+                    if (self.inner.max_lifetime.is_some() || self.inner.idle_timeout.is_some())
+                        && is_stale(
+                            created,
+                            returned,
+                            Instant::now(),
+                            self.inner.max_lifetime,
+                            self.inner.idle_timeout,
+                        )
+                    {
                         self.inner.connections_evicted.fetch_add(1, Ordering::Relaxed);
                         self.inner.diagnostics.emit(&DiagEvent::PoolConnectionEvicted);
+                        conn.close_graceful();
+                        // Fairness nuance (intentional, benign): on reaping under
+                        // contention the sync pool RELEASES its slot and re-queues
+                        // (the fresh connect re-competes at the FIFO back), whereas
+                        // the async pool RETAINS its permit and `continue`s. Both
+                        // correctly hand the caller a FRESH connection; the
+                        // difference is internal machinery only, not observable
+                        // behaviour.
                         self.release_slot();
                         drop(conn);
+                    } else {
+                        match conn.reset_session() {
+                            Ok(()) => {
+                                return Ok(PooledConnection {
+                                    conn: Some(conn),
+                                    pool: self.inner.clone(),
+                                    // Preserve the ORIGINAL birth time so
+                                    // `max_lifetime` measures true age.
+                                    created,
+                                });
+                            }
+                            // Reset failed: evict this connection, release its slot,
+                            // and retry — never hand out an un-reset connection.
+                            Err(_evict) => {
+                                // Count + surface the eviction (a steady stream is a
+                                // reconnect storm — server-side churn made visible).
+                                self.inner.connections_evicted.fetch_add(1, Ordering::Relaxed);
+                                self.inner.diagnostics.emit(&DiagEvent::PoolConnectionEvicted);
+                                self.release_slot();
+                                drop(conn);
+                            }
+                        }
                     }
-                },
+                }
                 // No reusable idle connection: create a FRESH one (already clean,
                 // no reset needed) carrying the pool's diagnostics, into the
                 // reserved slot.
@@ -319,6 +414,8 @@ impl Pool {
                         return Ok(PooledConnection {
                             conn: Some(conn),
                             pool: self.inner.clone(),
+                            // Birth time of a freshly-established connection.
+                            created: Instant::now(),
                         });
                     }
                     Err(e) => {
@@ -334,8 +431,8 @@ impl Pool {
     /// is free, or the deadline elapses.
     ///
     /// Consumes the lock guard (the wait must own it) and returns the reserved
-    /// outcome — `Some(conn)` to reuse (reset before handing out), `None` for a
-    /// fresh slot — or [`DriverError::PoolTimeout`]. Serving increments
+    /// outcome — `Some(idle)` to reuse (reap-check + reset before handing out),
+    /// `None` for a fresh slot — or [`DriverError::PoolTimeout`]. Serving increments
     /// `checked_out` and dequeues our ticket; a coalesced multi-return that freed
     /// more than one slot is propagated by waking the NEW front on the way out.
     fn wait_in_line(
@@ -343,7 +440,7 @@ impl Pool {
         mut state: MutexGuard<'_, PoolState>,
         deadline: Instant,
         timeout: Duration,
-    ) -> Result<Option<Connection>, DriverError> {
+    ) -> Result<Option<Idle>, DriverError> {
         // Our OWN condvar, enqueued as a ticket. Allocated only on the contended
         // path (a fresh caller that found a slot free never reaches here).
         let ticket = Arc::new(Condvar::new());
@@ -450,6 +547,54 @@ impl Pool {
             self.inner.waiters_high_water.load(Ordering::Relaxed),
         )
     }
+
+    /// GRACEFULLY DRAIN the pool: send a protocol `Terminate` to every
+    /// currently-IDLE pooled connection so the server sees a CLEAN disconnect,
+    /// then close each socket. The blocking twin of the async `Pool::close`.
+    ///
+    /// Without this, dropping the pool drops each pooled connection's socket
+    /// bare — an RST/FIN with no `Terminate` — and PostgreSQL logs an "unexpected
+    /// EOF on client connection" per connection (an error-log flood at shutdown
+    /// for a large pool). `close` replaces that with the graceful `Terminate` the
+    /// protocol defines for a clean disconnect.
+    ///
+    /// # Consumes the pool (use-after-close is a COMPILE error)
+    ///
+    /// `close` takes `self` by value, so this handle cannot be used afterward:
+    ///
+    /// ```compile_fail
+    /// # fn demo(pool: bsql_postgres_sync::Pool) {
+    /// pool.close();
+    /// pool.get().unwrap();   // ERROR[E0382]: `pool` was moved into `close`
+    /// # }
+    /// ```
+    ///
+    /// # Bounded on a dead peer
+    ///
+    /// Each `Terminate` rides [`Connection::close_graceful`], whose write is
+    /// bounded by the connection's `connect_timeout` (an armed `SO_SNDTIMEO`), so
+    /// a black-hole peer cannot hang the drain for the kernel's `tcp_retries2`
+    /// budget (~15 min). Best-effort: a per-connection failure is swallowed and
+    /// the drain continues.
+    ///
+    /// # Scope
+    ///
+    /// Drains only connections IDLE at the moment of the call — see the async
+    /// `Pool::close` for the checked-out / surviving-clone semantics.
+    pub fn close(self) {
+        // Move the idle connections OUT from under the state lock BEFORE any
+        // blocking `Terminate` I/O, so the drain never serializes other threads
+        // behind the pool state lock (mirrors the reset running outside the lock).
+        let idle: VecDeque<Idle> = {
+            #[allow(clippy::disallowed_methods, reason = "mutex poison recovery — reclaims the guard after another thread panicked; not a silent data fallback")]
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut state.connections)
+        };
+        for entry in idle {
+            let mut conn = entry.conn;
+            conn.close_graceful();
+        }
+    }
 }
 
 /// A builder for a [`Pool`] with an acquire deadline and structured diagnostics.
@@ -464,6 +609,8 @@ pub struct PoolBuilder {
     max_size: usize,
     acquire_timeout: Duration,
     diagnostics: Diagnostics,
+    max_lifetime: Option<Duration>,
+    idle_timeout: Option<Duration>,
 }
 
 impl PoolBuilder {
@@ -471,6 +618,28 @@ impl PoolBuilder {
     /// [`Pool::get_timeout`]). Defaults to 30s.
     pub fn acquire_timeout(mut self, acquire_timeout: Duration) -> Self {
         self.acquire_timeout = acquire_timeout;
+        self
+    }
+
+    /// Set the maximum LIFETIME of a pooled connection (age since it was
+    /// established). At checkout, a connection older than this is gracefully
+    /// closed (a bounded `Terminate`) and replaced with a fresh one, so a
+    /// long-lived pool rotates its connections — bounding server-side per-backend
+    /// memory growth and letting a rolling credential / DNS change take effect.
+    /// `None` (the default) disables the bound. Reaping is LAZY (at checkout), so
+    /// it adds no background thread — see [`Pool::get`] for the rationale.
+    pub fn max_lifetime(mut self, max_lifetime: Option<Duration>) -> Self {
+        self.max_lifetime = max_lifetime;
+        self
+    }
+
+    /// Set the IDLE timeout of a pooled connection (time since it last returned to
+    /// the pool). At checkout, a connection idle longer than this is gracefully
+    /// closed and replaced, so a pool that went quiet sheds connections the server
+    /// may itself time out rather than handing out a likely-dead one. `None` (the
+    /// default) disables the bound.
+    pub fn idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
         self
     }
 
@@ -502,7 +671,14 @@ impl PoolBuilder {
     /// [`Pool::get`].
     #[must_use]
     pub fn build(self) -> Pool {
-        Pool::from_parts(self.config, self.max_size, self.acquire_timeout, self.diagnostics)
+        Pool::from_parts(
+            self.config,
+            self.max_size,
+            self.acquire_timeout,
+            self.diagnostics,
+            self.max_lifetime,
+            self.idle_timeout,
+        )
     }
 }
 
@@ -522,6 +698,10 @@ impl PoolBuilder {
 pub struct PooledConnection {
     conn: Option<Connection>,
     pool: Arc<PoolInner>,
+    /// The underlying connection's birth time, preserved across the checkout so
+    /// its `Drop` restamps the returned [`Idle`] with the ORIGINAL `created` — so
+    /// `max_lifetime` measures true age, not age since the last checkout.
+    created: Instant,
 }
 
 impl std::fmt::Debug for PooledConnection {
@@ -572,7 +752,22 @@ impl Drop for PooledConnection {
                 None => debug_assert!(false, "pool checked_out underflow on connection return"),
             }
             if conn.is_healthy() {
-                state.connections.push_back(conn);
+                // Restamp `returned` for `idle_timeout` — but read the clock ONLY
+                // when idle reaping is enabled (ZERO-COST WHEN OFF). When
+                // `idle_timeout` is `None`, `returned` is never consumed by the
+                // checkout `is_stale` gate, so reuse the clock-free `created` stamp
+                // instead of an `Instant::now()`. `created` is always preserved (for
+                // `max_lifetime`), so age is measured from birth.
+                let returned = if self.pool.idle_timeout.is_some() {
+                    Instant::now()
+                } else {
+                    self.created
+                };
+                state.connections.push_back(Idle {
+                    conn,
+                    created: self.created,
+                    returned,
+                });
             }
             // Hand off to the FIFO front waiter (an added idle connection or a
             // freed slot may let exactly it proceed). Woken while holding the lock:
@@ -659,5 +854,35 @@ mod fairness_tests {
             (0..N).collect::<Vec<_>>(),
             "saturated checkouts must be served in FIFO arrival order"
         );
+    }
+}
+
+#[cfg(test)]
+mod reaper_tests {
+    //! Offline witness for the lazy reaper's staleness gate (twin of the async
+    //! pool's). Documents the invariant the zero-cost-off short-circuit relies
+    //! on: with BOTH bounds `None`, `is_stale` is unconditionally `false`, so the
+    //! checkout gate can skip the `Instant::now()` read entirely.
+
+    use super::is_stale;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn disabled_bounds_are_never_stale() {
+        let birth = Instant::now();
+        let much_later = birth + Duration::from_secs(1_000_000);
+        assert!(!is_stale(birth, birth, much_later, None, None));
+    }
+
+    #[test]
+    fn each_bound_triggers_independently() {
+        let birth = Instant::now();
+        let now = birth + Duration::from_secs(10);
+        // max_lifetime = age since `created`.
+        assert!(is_stale(birth, now, now, Some(Duration::from_secs(5)), None));
+        assert!(!is_stale(birth, now, now, Some(Duration::from_secs(50)), None));
+        // idle_timeout = time since `returned`.
+        assert!(is_stale(now, birth, now, None, Some(Duration::from_secs(5))));
+        assert!(!is_stale(now, birth, now, None, Some(Duration::from_secs(50))));
     }
 }

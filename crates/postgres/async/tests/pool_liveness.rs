@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use bsql_postgres_async::{ConnectConfig, DriverError, Pool, SslMode};
+use bsql_postgres_async::{ConnectConfig, Connection, DriverError, Pool, PooledConnection, SslMode};
 
 /// Real local PostgreSQL the relay forwards to (trust auth, plaintext).
 const UPSTREAM: &str = "127.0.0.1:5432";
@@ -302,4 +302,225 @@ async fn pool_get_is_bounded_when_no_fresh_connection_can_open() {
     );
 
     drop(proxy);
+}
+
+/// A direct-to-PG config (no relay) for the graceful-close witness.
+fn direct_config() -> ConnectConfig {
+    ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(SslMode::Disable)
+}
+
+/// Count how many of `pids` are still present as live backends, via a monitor
+/// connection independent of the pool.
+#[expect(
+    clippy::expect_used,
+    reason = "test probe: a failed monitor query is the loud harness-failure signal, and this is not a `#[test]` fn so the in-tests carve-out cannot reach it"
+)]
+async fn live_backends(mon: &mut Connection, pids: &[i32]) -> usize {
+    let mut alive = 0;
+    for &pid in pids {
+        // `pid` is a trusted i32 straight from `pg_backend_pid()`, so splicing it
+        // into the probe is injection-safe (no user text).
+        let sql = format!("SELECT count(*)::int4 FROM pg_stat_activity WHERE pid = {pid}");
+        let row = mon.query_one_sql(&sql).await.expect("stat_activity probe");
+        if row.get_i32(0).ok().flatten() != Some(0) {
+            alive += 1;
+        }
+    }
+    alive
+}
+
+/// C2 WITNESS: `Pool::close` sends a protocol `Terminate` to every idle pooled
+/// connection, so the server sees a CLEAN disconnect and the backends EXIT —
+/// rather than a bare socket drop that leaves an "unexpected EOF on client
+/// connection" in PG's log. Observed via `pg_stat_activity`: the idle backends
+/// are gone after `close`, bounded in time.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pool_close_gracefully_terminates_idle_backends() {
+    let pool = Pool::new(direct_config(), 4);
+
+    // Warm THREE distinct backends (held concurrently so each gets its own), then
+    // return them all idle.
+    let mut pids: Vec<i32> = Vec::new();
+    let mut guards = Vec::new();
+    for _ in 0..3 {
+        let mut c = pool.get().await.expect("warm a pooled connection");
+        let pid = c
+            .conn_mut()
+            .expect("borrow")
+            .query_one_sql("SELECT pg_backend_pid()")
+            .await
+            .expect("read backend pid")
+            .get_i32(0)
+            .expect("pid decode")
+            .expect("pid present");
+        pids.push(pid);
+        guards.push(c);
+    }
+    drop(guards); // all three return to the idle set
+
+    // A monitor connection that OUTLIVES the pool (its own backend, not in `pids`).
+    let mut mon = Connection::connect(&direct_config())
+        .await
+        .expect("monitor connection");
+    assert_eq!(
+        live_backends(&mut mon, &pids).await,
+        3,
+        "the three idle backends must be alive before close",
+    );
+
+    // Graceful drain: Terminate every idle connection.
+    pool.close().await;
+
+    // The three backends must EXIT promptly (a clean Terminate leaves the server
+    // straight away). Poll bounded — never a hang.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let alive = live_backends(&mut mon, &pids).await;
+        if alive == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pool.close() must terminate the idle backends; {alive} still alive",
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    drop(mon);
+}
+
+/// C2 WITNESS (bounded): `Pool::close` cannot hang on a black-hole peer. A pooled
+/// connection is frozen (half-open, silent), then `close` drains — its bounded
+/// `Terminate` returns within the connect budget, never the `tcp_retries2` hang.
+#[tokio::test]
+#[ignore = "requires local PG (black-hole relay in front of 127.0.0.1:5432)"]
+async fn pool_close_is_bounded_when_a_pooled_peer_is_black_holed() {
+    let proxy = BlackHoleProxy::start();
+    let pool = Pool::new(proxy_config(proxy.port()), 4);
+
+    // Warm ONE connection through the relay (generation 0), return it idle.
+    {
+        let mut c = pool.get().await.expect("warm through the relay");
+        let one = c
+            .conn_mut()
+            .expect("borrow")
+            .query_one_sql("SELECT 'warm'")
+            .await
+            .expect("warm connection works");
+        assert_eq!(one.get_str(0), Ok(Some("warm")));
+    }
+
+    // The peer VANISHES (frozen, ESTABLISHED-but-silent), then close the pool.
+    proxy.freeze_existing();
+    let start = Instant::now();
+    pool.close().await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "pool.close() must be BOUNDED on a black-hole peer, took {elapsed:?}",
+    );
+
+    drop(proxy);
+}
+
+/// Read the server-side backend pid of a checked-out connection — the identity
+/// that CHANGES when the pool reaps + replaces, and STAYS when it reuses.
+#[expect(
+    clippy::expect_used,
+    reason = "test probe: a failed pid query is the loud harness-failure signal, and this is not a `#[test]` fn so the in-tests carve-out cannot reach it"
+)]
+async fn pid_of(c: &mut PooledConnection) -> i32 {
+    c.conn_mut()
+        .expect("borrow")
+        .query_one_sql("SELECT pg_backend_pid()")
+        .await
+        .expect("read backend pid")
+        .get_i32(0)
+        .expect("pid decode")
+        .expect("pid present")
+}
+
+/// C4 WITNESS: a pooled connection older than `max_lifetime` is REAPED at
+/// checkout and REPLACED with a fresh one (a new backend pid), and the eviction
+/// counter records it.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pool_reaps_a_connection_past_max_lifetime() {
+    let pool = Pool::builder(direct_config(), 4)
+        .max_lifetime(Some(Duration::from_millis(1)))
+        .build();
+
+    // Warm ONE connection, record its backend pid, return it idle.
+    let pid1 = {
+        let mut c = pool.get().await.expect("warm");
+        pid_of(&mut c).await
+    };
+    let evicted_before = pool.stats().connections_evicted;
+
+    // Age past the 1 ms max_lifetime.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Checkout REAPS the aged connection and mints a fresh one — a NEW pid.
+    let pid2 = {
+        let mut c = pool.get().await.expect("get after aging");
+        pid_of(&mut c).await
+    };
+    assert_ne!(pid1, pid2, "a connection past max_lifetime must be reaped + replaced");
+    assert!(
+        pool.stats().connections_evicted > evicted_before,
+        "the reap must be counted as an eviction",
+    );
+}
+
+/// C4 WITNESS: a pooled connection idle past `idle_timeout` is REAPED + replaced.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pool_reaps_a_connection_past_idle_timeout() {
+    let pool = Pool::builder(direct_config(), 4)
+        .idle_timeout(Some(Duration::from_millis(1)))
+        .build();
+
+    let pid1 = {
+        let mut c = pool.get().await.expect("warm");
+        pid_of(&mut c).await
+    };
+    // Idle past the 1 ms idle_timeout.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let pid2 = {
+        let mut c = pool.get().await.expect("get after idling");
+        pid_of(&mut c).await
+    };
+    assert_ne!(pid1, pid2, "a connection idle past idle_timeout must be reaped + replaced");
+}
+
+/// C4 WITNESS (the negative): a connection WITHIN both bounds is REUSED at
+/// checkout — same backend pid, nothing reaped.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pool_reuses_a_connection_within_limits() {
+    let pool = Pool::builder(direct_config(), 4)
+        .max_lifetime(Some(Duration::from_secs(3600)))
+        .idle_timeout(Some(Duration::from_secs(3600)))
+        .build();
+
+    let pid1 = {
+        let mut c = pool.get().await.expect("warm");
+        pid_of(&mut c).await
+    };
+    let evicted_before = pool.stats().connections_evicted;
+    // Immediately re-check out: well within both hour-long bounds.
+    let pid2 = {
+        let mut c = pool.get().await.expect("get within limits");
+        pid_of(&mut c).await
+    };
+    assert_eq!(pid1, pid2, "a connection within both bounds must be REUSED, not reaped");
+    assert_eq!(
+        pool.stats().connections_evicted,
+        evicted_before,
+        "nothing must be reaped within the limits",
+    );
 }

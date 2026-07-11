@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use bsql_postgres_sync::{ConnectConfig, DriverError, Pool, SslMode};
+use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, Pool, PooledConnection, SslMode};
 
 /// Real local PostgreSQL the relay forwards to (trust auth, plaintext).
 const UPSTREAM: &str = "127.0.0.1:5432";
@@ -298,4 +298,200 @@ fn pool_get_is_bounded_when_no_fresh_connection_can_open() {
     );
 
     drop(proxy);
+}
+
+/// A direct-to-PG config (no relay) for the graceful-close witness.
+fn direct_config() -> ConnectConfig {
+    ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(SslMode::Disable)
+}
+
+/// Count how many of `pids` are still present as live backends, via a monitor
+/// connection independent of the pool.
+#[expect(
+    clippy::expect_used,
+    reason = "test probe: a failed monitor query is the loud harness-failure signal, and this is not a `#[test]` fn so the in-tests carve-out cannot reach it"
+)]
+fn live_backends(mon: &mut Connection, pids: &[i32]) -> usize {
+    let mut alive = 0;
+    for &pid in pids {
+        // `pid` is a trusted i32 from `pg_backend_pid()`, so splicing it is safe.
+        let sql = format!("SELECT count(*)::int4 FROM pg_stat_activity WHERE pid = {pid}");
+        let row = mon.query_one_sql(&sql).expect("stat_activity probe");
+        if row.get_i32(0).ok().flatten() != Some(0) {
+            alive += 1;
+        }
+    }
+    alive
+}
+
+/// C2 WITNESS: `Pool::close` sends a protocol `Terminate` to every idle pooled
+/// connection, so the server sees a CLEAN disconnect and the backends EXIT —
+/// rather than a bare socket drop that leaves an "unexpected EOF on client
+/// connection" in PG's log. Observed via `pg_stat_activity`.
+#[test]
+#[ignore = "requires local PG"]
+fn pool_close_gracefully_terminates_idle_backends() {
+    let pool = Pool::new(direct_config(), 4);
+
+    let mut pids: Vec<i32> = Vec::new();
+    let mut guards = Vec::new();
+    for _ in 0..3 {
+        let mut c = pool.get().expect("warm a pooled connection");
+        let pid = c
+            .conn_mut()
+            .expect("borrow")
+            .query_one_sql("SELECT pg_backend_pid()")
+            .expect("read backend pid")
+            .get_i32(0)
+            .expect("pid decode")
+            .expect("pid present");
+        pids.push(pid);
+        guards.push(c);
+    }
+    drop(guards); // all three return to the idle set
+
+    let mut mon = Connection::connect(&direct_config()).expect("monitor connection");
+    assert_eq!(
+        live_backends(&mut mon, &pids),
+        3,
+        "the three idle backends must be alive before close",
+    );
+
+    pool.close();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let alive = live_backends(&mut mon, &pids);
+        if alive == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pool.close() must terminate the idle backends; {alive} still alive",
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    drop(mon);
+}
+
+/// C2 WITNESS (bounded): `Pool::close` cannot hang on a black-hole peer.
+#[test]
+#[ignore = "requires local PG (black-hole relay in front of 127.0.0.1:5432)"]
+fn pool_close_is_bounded_when_a_pooled_peer_is_black_holed() {
+    let proxy = BlackHoleProxy::start();
+    let pool = Pool::new(proxy_config(proxy.port()), 4);
+
+    {
+        let mut c = pool.get().expect("warm through the relay");
+        let one = c
+            .conn_mut()
+            .expect("borrow")
+            .query_one_sql("SELECT 'warm'")
+            .expect("warm connection works");
+        assert_eq!(one.get_str(0), Ok(Some("warm")));
+    }
+
+    proxy.freeze_existing();
+    let start = Instant::now();
+    pool.close();
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "pool.close() must be BOUNDED on a black-hole peer, took {elapsed:?}",
+    );
+
+    drop(proxy);
+}
+
+/// Read the server-side backend pid of a checked-out connection — the identity
+/// that CHANGES when the pool reaps + replaces, and STAYS when it reuses.
+#[expect(
+    clippy::expect_used,
+    reason = "test probe: a failed pid query is the loud harness-failure signal, and this is not a `#[test]` fn so the in-tests carve-out cannot reach it"
+)]
+fn pid_of(c: &mut PooledConnection) -> i32 {
+    c.conn_mut()
+        .expect("borrow")
+        .query_one_sql("SELECT pg_backend_pid()")
+        .expect("read backend pid")
+        .get_i32(0)
+        .expect("pid decode")
+        .expect("pid present")
+}
+
+/// C4 WITNESS: a pooled connection older than `max_lifetime` is REAPED at
+/// checkout and REPLACED with a fresh one (a new backend pid).
+#[test]
+#[ignore = "requires local PG"]
+fn pool_reaps_a_connection_past_max_lifetime() {
+    let pool = Pool::builder(direct_config(), 4)
+        .max_lifetime(Some(Duration::from_millis(1)))
+        .build();
+
+    let pid1 = {
+        let mut c = pool.get().expect("warm");
+        pid_of(&mut c)
+    };
+    let evicted_before = pool.stats().connections_evicted;
+    std::thread::sleep(Duration::from_millis(20));
+    let pid2 = {
+        let mut c = pool.get().expect("get after aging");
+        pid_of(&mut c)
+    };
+    assert_ne!(pid1, pid2, "a connection past max_lifetime must be reaped + replaced");
+    assert!(
+        pool.stats().connections_evicted > evicted_before,
+        "the reap must be counted as an eviction",
+    );
+}
+
+/// C4 WITNESS: a pooled connection idle past `idle_timeout` is REAPED + replaced.
+#[test]
+#[ignore = "requires local PG"]
+fn pool_reaps_a_connection_past_idle_timeout() {
+    let pool = Pool::builder(direct_config(), 4)
+        .idle_timeout(Some(Duration::from_millis(1)))
+        .build();
+
+    let pid1 = {
+        let mut c = pool.get().expect("warm");
+        pid_of(&mut c)
+    };
+    std::thread::sleep(Duration::from_millis(20));
+    let pid2 = {
+        let mut c = pool.get().expect("get after idling");
+        pid_of(&mut c)
+    };
+    assert_ne!(pid1, pid2, "a connection idle past idle_timeout must be reaped + replaced");
+}
+
+/// C4 WITNESS (the negative): a connection WITHIN both bounds is REUSED at
+/// checkout — same backend pid, nothing reaped.
+#[test]
+#[ignore = "requires local PG"]
+fn pool_reuses_a_connection_within_limits() {
+    let pool = Pool::builder(direct_config(), 4)
+        .max_lifetime(Some(Duration::from_secs(3600)))
+        .idle_timeout(Some(Duration::from_secs(3600)))
+        .build();
+
+    let pid1 = {
+        let mut c = pool.get().expect("warm");
+        pid_of(&mut c)
+    };
+    let evicted_before = pool.stats().connections_evicted;
+    let pid2 = {
+        let mut c = pool.get().expect("get within limits");
+        pid_of(&mut c)
+    };
+    assert_eq!(pid1, pid2, "a connection within both bounds must be REUSED, not reaped");
+    assert_eq!(
+        pool.stats().connections_evicted,
+        evicted_before,
+        "nothing must be reaped within the limits",
+    );
 }

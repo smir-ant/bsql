@@ -358,6 +358,21 @@ webpki-roots = { version = "1.0", default-features = false }
 # the async crate's own `[dev-dependencies]`, NOT forced on consumers.
 tokio = { version = "1", default-features = false }
 
+# `socket2` — the ecosystem's safe wrapper over raw-socket options. Both
+# drivers use it for exactly ONE thing: enabling TCP keepalive on a
+# connected TCP stream (`SockRef::from(&stream).set_tcp_keepalive(..)`),
+# so a silently-vanished peer on an IDLE pooled connection is detected by
+# the kernel (libpq enables keepalives by default; we match it). It is
+# consumed through its SAFE borrowed-fd API — the `unsafe` fd handling
+# lives INSIDE socket2, never in our `#![forbid(unsafe_code)]` crates.
+# It is ALREADY in the resolved graph (tokio's `net` feature pulls the
+# same 0.6 line), so naming it directly here adds NO new package to the
+# lockfile — `deps_pin` is unchanged. Pinned to the 0.6 line tokio
+# resolves; default features suffice (`SockRef` + `TcpKeepalive` need no
+# extra feature). A hand-rolled `setsockopt` would need FFI + `unsafe` in a
+# shipped crate (DEF-META policy: OS primitives via a dedicated crate).
+socket2 = { version = "0.6", default-features = false }
+
 # NOTE: `tokio-rustls` was removed when the async driver cut over to the
 # engine's sans-IO `core::tls::TlsTransport` (rustls::unbuffered, ring-explicit,
 # shared with the blocking driver). Both drivers now wrap their socket in that

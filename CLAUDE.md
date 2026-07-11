@@ -595,6 +595,82 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `pool_liveness` suites (both drivers: a black-hole TCP relay freezes a pooled
   connection mid-stream, then `get()` recovers a fresh connection / returns a
   classified error, both bounded — never the `tcp_retries2` hang).
+- **Pool graceful shutdown — `Pool::close(self)`** (both drivers). Dropping a pool
+  drops each pooled connection's socket BARE — an RST/FIN with no protocol
+  `Terminate` — and PostgreSQL logs an "unexpected EOF on client connection" per
+  connection (an error-log flood at shutdown for a large pool). `close` instead
+  sends a protocol `Terminate` (`Connection::close_graceful`, a `pub(crate)` verb)
+  to every currently-IDLE connection so the server sees a CLEAN disconnect, then
+  closes each socket. It CONSUMES `self` (use-after-close is a compile error) and
+  is BEST-EFFORT: a per-connection failure is swallowed and the drain continues.
+  BOUNDED on a dead peer — the `Terminate` write is bounded by the connection's
+  own `connect_timeout` (no new `ConnectConfig` knob): the async driver wraps the
+  whole close in a `tokio::time::timeout` (SAFE here — unlike `reset_session` /
+  `recv_notification`, there is no live token to strand, since `close` consumes it
+  and the connection is discarded next), the sync driver arms the same
+  `SO_RCVTIMEO`/`SO_SNDTIMEO` ceiling `reset_session` arms (no restore — the
+  connection is dropped). This is the INTENTIONAL, opt-in, batched home for a
+  `Terminate` (a prior slice deliberately deleted the unbounded blocking
+  `Terminate` from the hot `Drop` path — `close` is the correct place for it).
+  Drains only connections idle at the call; a checked-out connection returns to the
+  detached idle set on its own `Drop`. Witnessed by the `--ignored` `pool_liveness`
+  suites (`pool_close_gracefully_terminates_idle_backends` — the backends EXIT,
+  seen via `pg_stat_activity`; `pool_close_is_bounded_when_a_pooled_peer_is_black_holed`
+  — bounded against the black-hole relay) plus a `compile_fail` doctest on
+  `Pool::close` pinning use-after-close.
+- **TCP keepalive is ON by default** (both drivers, TCP-only). Every TCP
+  connection enables `SO_KEEPALIVE` (idle 60 s, interval 10 s) right after connect
+  via `socket2`'s SAFE borrowed-fd API (`SockRef::from(&stream).set_tcp_keepalive`
+  — the `unsafe` fd handling lives inside `socket2`, so the driver crates stay
+  `#![forbid(unsafe_code)]`), so a silently-vanished peer on an IDLE connection is
+  eventually detected by the kernel. This matches libpq (keepalives on by default)
+  and complements the checkout-time reset bound above: the reset catches a dead
+  peer at checkout, keepalive lets the kernel notice one while the connection just
+  sits idle. NO config knob — a dead-peer probe is near-free on a healthy
+  connection and near-universally wanted, so it is not a `ConnectConfig` field
+  (the 152 B footprint is untouched). A unix socket has no keepalive concept, so
+  it is gated on the transport enum (TCP arm only). `socket2` is ALREADY in the
+  resolved graph (via tokio's `net` feature), so `deps_pin` is unchanged.
+  Constants: `KEEPALIVE_IDLE` / `KEEPALIVE_INTERVAL` in each driver's
+  `connection.rs`. Witnessed offline by each driver's `keepalive_tests`
+  (`set_tcp_keepalive_enables_so_keepalive`: a fresh socket has it off, the helper
+  turns it on — read back via `socket2`, no PG).
+- **Pool `max_lifetime` + `idle_timeout` — a LAZY reaper** (both drivers, on the
+  same `PoolBuilder`: `.max_lifetime(Option<Duration>)` / `.idle_timeout(Option<Duration>)`,
+  default `None` = disabled, no behaviour change). Each idle slot is stamped with
+  its connection's `created` (established) and `returned` (last check-in) `Instant`
+  (a private `Idle { conn, created, returned }` in each pool; `PooledConnection`
+  carries `created` so its `Drop` preserves the ORIGINAL birth time — `max_lifetime`
+  measures TRUE age, not age-since-last-checkout). At CHECKOUT, BEFORE the liveness
+  reset, a shared `is_stale(created, returned, now, max_lifetime, idle_timeout)`
+  gate reaps a connection that outlived `max_lifetime` (age) or `idle_timeout`
+  (idle): it is gracefully closed via C2's bounded `close_graceful`, emits
+  `DiagEvent::PoolConnectionEvicted` (+ the `connections_evicted` counter), and the
+  loop mints a FRESH one instead (async retains the permit + `continue`s; sync
+  `release_slot()`s then loops — routing through the EXISTING eviction machinery so
+  the stale + failed-reset paths cannot drift). **Reaping is LAZY (at checkout),
+  chosen over ≥2 alternatives:** a background timer thread/task (rejected — adds a
+  runtime dependency + lifecycle, and cannot spawn from a pool built outside a
+  runtime; sqlx's simplest mode is lazy too) and reap-on-return (rejected — Drop
+  cannot `.await` a graceful close, and it cannot catch a connection that ages past
+  a bound WHILE idle). Pool-builder-side config, NOT `ConnectConfig` (the 152 B pin
+  is fixed). **ZERO-COST WHEN OFF:** the checkout `is_stale` call is gated behind
+  `max_lifetime.is_some() || idle_timeout.is_some()` (Rust `&&` short-circuit → a
+  default pool never evaluates `Instant::now()` on the reuse path), and the `Drop`
+  `returned` restamp reads the clock ONLY when `idle_timeout.is_some()` (else it
+  reuses the clock-free `created` stamp, which the disabled `is_stale` never reads)
+  — matching the `slow_query_armed` / `n1-detect` zero-cost-off discipline. The one
+  remaining `Instant::now()` in a disabled pool is the birth stamp at fresh-connect
+  MINT (per-connection, syscall-dominated — NOT the per-checkout reaper overhead;
+  gating it out would need a non-const `Instant` sentinel or a stored base
+  `Instant`, a restructure). NO background task exists (grep the diff: no
+  `thread::spawn` / `tokio::spawn`). Witnessed by the offline `reaper_tests`
+  (`disabled_bounds_are_never_stale` pins the invariant the short-circuit relies on)
+  and the `--ignored` `pool_liveness` suites (both
+  drivers): `pool_reaps_a_connection_past_max_lifetime` /
+  `pool_reaps_a_connection_past_idle_timeout` (a NEW backend pid + eviction count)
+  and the negative `pool_reuses_a_connection_within_limits` (SAME pid, nothing
+  reaped).
 - Runtime parameterized queries (`query_params` / `query_params_one` /
   `execute_params`) cost a SINGLE round trip whether run once or repeatedly, via a
   transparent per-connection dynamic prepared-statement cache keyed on SQL TEXT

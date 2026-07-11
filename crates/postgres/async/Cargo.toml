@@ -82,6 +82,11 @@ bsql-postgres-proto = { path = "../proto", default-features = false }
 # tokio-rustls glue. `rustls` itself is not a direct dependency: the driver
 # composes `core::tls` / `core::ssl` and names no rustls type.
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
+# `socket2` — SAFE borrowed-fd access to enable TCP keepalive on the connected
+# TCP stream (dead-peer detection for IDLE pooled connections). Already in the
+# graph via tokio's `net` feature, so this adds no new crate (deps_pin unchanged).
+# Used through `SockRef` + `TcpKeepalive` only — no `unsafe` reaches this crate.
+socket2 = { workspace = true }
 
 # Inherit the workspace FORBID floor (the two-tier lint wall). The pool's
 # mutex poison-recovery fallbacks carry scoped allows in `src/pool.rs`.

@@ -150,6 +150,31 @@ fn connect_tcp_within(addr: &str, timeout: Duration) -> std::io::Result<TcpStrea
     }
 }
 
+/// TCP keepalive idle time — the kernel starts sending keepalive probes after
+/// this long with no traffic on an IDLE connection.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+/// TCP keepalive probe interval — the gap between successive keepalive probes.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Enable TCP keepalive on a connected TCP stream (idle [`KEEPALIVE_IDLE`],
+/// interval [`KEEPALIVE_INTERVAL`]) so a silently-vanished peer on an IDLE
+/// connection is eventually detected by the kernel — libpq enables keepalives by
+/// default, and this matches it. TCP-only (a unix socket has no keepalive), so
+/// the caller invokes this only on the TCP dial arm. The blocking twin of the
+/// async driver's `set_tcp_keepalive`.
+///
+/// Uses `socket2`'s SAFE borrowed-fd API ([`socket2::SockRef::from`] +
+/// `set_tcp_keepalive`), so this crate stays `#![forbid(unsafe_code)]` — the
+/// `unsafe` fd handling lives inside `socket2`, never here. `socket2` is already
+/// in the workspace graph (via the async driver's tokio), so this adds no new
+/// crate.
+fn set_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let params = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&params)
+}
+
 /// A lending `COPY … FROM STDIN` writer, handed to the closure of
 /// [`copy_in_with`](Connection::copy_in_with).
 ///
@@ -456,6 +481,11 @@ impl Connection {
                 // is a TCP concept — `AF_UNIX` has no such buffering, so the unix
                 // arm skips it (it is meaningless, not an error).
                 tcp.set_nodelay(true)?;
+                // Enable TCP keepalive so a silently-vanished peer on an IDLE
+                // connection is detected by the kernel (libpq enables keepalives
+                // by default; this matches it). TCP-only — a unix socket has no
+                // keepalive concept, so the unix arm skips it.
+                set_tcp_keepalive(&tcp)?;
                 SyncSock::Tcp(tcp)
             }
             #[cfg(unix)]
@@ -1394,6 +1424,35 @@ impl Connection {
     pub fn close(&mut self) -> Result<(), DriverError> {
         drive_sync(engine::poll_once(self.core.close()))
     }
+
+    /// BEST-EFFORT graceful close for a pooled connection the pool is DISCARDING
+    /// (a [`Pool::close`](crate::Pool::close) drain, or a `max_lifetime` /
+    /// `idle_timeout` reap): send a protocol `Terminate` so the server sees a
+    /// CLEAN disconnect — not the "unexpected EOF on client connection" its log
+    /// records for a bare socket drop — then let the socket close when `self`
+    /// drops. The blocking twin of the async `close_graceful`.
+    ///
+    /// BOUNDED by the connection's own `connect_timeout`: it arms the SAME
+    /// `SO_RCVTIMEO`/`SO_SNDTIMEO` control-handle ceiling [`reset_session`](Self::reset_session)
+    /// arms, so a `Terminate` write into a full send buffer on a black-hole peer
+    /// ELAPSES instead of hanging for the kernel's `tcp_retries2` budget (~15 min).
+    /// The timeout is NOT restored — the connection is dropped next — so no restore
+    /// error can surface. No `ConnectConfig` knob is added.
+    ///
+    /// Best-effort: any outcome is DISCARDED (the socket closes on drop
+    /// regardless), so the pool's drain continues past a single dead peer.
+    pub(crate) fn close_graceful(&mut self) {
+        let budget = Duration::from_secs(self.redial.connect_timeout_secs());
+        if let Some(ctl) = &self.socket_ctl {
+            // Best-effort arm: a `setsockopt` on a live fd does not fail in
+            // practice, and this connection is being discarded — a failed arm at
+            // worst leaves the (rare) full-buffer write unbounded, so it is
+            // discarded rather than propagated (there is no `Result` channel here).
+            drop(ctl.set_read_timeout(Some(budget)));
+            drop(ctl.set_write_timeout(Some(budget)));
+        }
+        drop(self.close());
+    }
 }
 
 /// A borrowing transaction guard, handed to the closure of
@@ -1814,5 +1873,38 @@ fn lift_probe_io(e: io::Error) -> DriverError {
     match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => DriverError::Timeout,
         _ => DriverError::Io(e),
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    //! C3 WITNESS (offline): [`set_tcp_keepalive`] turns `SO_KEEPALIVE` ON for a
+    //! connected TCP stream — the blocking twin of the async driver's witness. A
+    //! real loopback socket pair (no PG); the getter reads the option back off the
+    //! fd via `socket2`.
+
+    use super::set_tcp_keepalive;
+    use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn set_tcp_keepalive_enables_so_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (_server, _peer) = listener.accept().expect("accept");
+
+        assert!(
+            !socket2::SockRef::from(&client)
+                .keepalive()
+                .expect("read keepalive before"),
+            "a fresh TCP socket must have SO_KEEPALIVE off",
+        );
+        set_tcp_keepalive(&client).expect("enable keepalive");
+        assert!(
+            socket2::SockRef::from(&client)
+                .keepalive()
+                .expect("read keepalive after"),
+            "set_tcp_keepalive must turn SO_KEEPALIVE on",
+        );
     }
 }

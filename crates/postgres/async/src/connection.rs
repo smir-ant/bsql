@@ -81,6 +81,30 @@ pub use bsql_postgres_core::PreparedStatement;
 /// The plaintext-or-TLS transport the engine is monomorphic over.
 type AsyncWire = Wire<TokioSocket>;
 
+/// TCP keepalive idle time — the kernel starts sending keepalive probes after
+/// this long with no traffic on an IDLE connection.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+/// TCP keepalive probe interval — the gap between successive keepalive probes
+/// once probing has begun.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Enable TCP keepalive on a connected TCP stream (idle [`KEEPALIVE_IDLE`],
+/// interval [`KEEPALIVE_INTERVAL`]) so a silently-vanished peer on an IDLE
+/// connection is eventually detected by the kernel — libpq enables keepalives by
+/// default, and this matches it. TCP-only (a unix socket has no keepalive), so
+/// the caller invokes this only on the TCP dial arm.
+///
+/// Uses `socket2`'s SAFE borrowed-fd API (`socket2::SockRef::from` +
+/// `set_tcp_keepalive`), so this crate stays `#![forbid(unsafe_code)]` — the
+/// `unsafe` fd handling lives inside `socket2`, never here. `socket2` is already
+/// in the dependency graph (via tokio), so this adds no new crate.
+fn set_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let params = socket2::TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&params)
+}
+
 /// A lending `COPY … FROM STDIN` writer, handed to the closure of
 /// [`copy_in_with`](Connection::copy_in_with).
 ///
@@ -353,6 +377,11 @@ impl Connection {
                 // — Nagle + delayed-ACK can add ~40ms stalls to small writes and
                 // COPY-in streaming; one setsockopt with zero per-op cost.
                 tcp.set_nodelay(true)?;
+                // Enable TCP keepalive so a silently-vanished peer on an IDLE
+                // connection is detected by the kernel (libpq enables keepalives by
+                // default; this matches it). TCP-only — a unix socket has no
+                // keepalive concept.
+                set_tcp_keepalive(&tcp)?;
                 Self::build_tcp_wire(tcp, config, ssl_mode, deadline, diagnostics).await
             }
             #[cfg(unix)]
@@ -1416,6 +1445,34 @@ impl Connection {
     pub fn close(&mut self) -> impl Future<Output = Result<(), DriverError>> + '_ {
         self.core.close()
     }
+
+    /// BEST-EFFORT graceful close for a pooled connection the pool is DISCARDING
+    /// (a [`Pool::close`](crate::Pool::close) drain, or a `max_lifetime` /
+    /// `idle_timeout` reap): send a protocol `Terminate` so the server sees a
+    /// CLEAN disconnect — not the "unexpected EOF on client connection" its log
+    /// records for a bare socket drop (an RST/FIN with no `Terminate`) — then let
+    /// the socket close when `self` drops.
+    ///
+    /// BOUNDED by the connection's own `connect_timeout`: the `Terminate` write
+    /// into a full send buffer on a black-hole peer (a half-open socket) would
+    /// otherwise block for the kernel's `tcp_retries2` budget (~15 min). Wrapping
+    /// the whole close in an outer [`tokio::time::timeout`] is SAFE here — unlike
+    /// [`reset_session`](Self::reset_session) / [`recv_notification`](Self::recv_notification),
+    /// where dropping the verb future would strand the linear liveness token —
+    /// precisely BECAUSE the connection is being discarded: `close` consumes the
+    /// token (`live.take()`) and `self` is dropped next, so a dropped-mid-flight
+    /// close future strands nothing. No `ConnectConfig` knob is added — the budget
+    /// is the existing `connect_timeout`.
+    ///
+    /// Best-effort: any outcome — a completed `Terminate`, a server/transport
+    /// error, or an elapsed budget — is DISCARDED (the socket closes on drop
+    /// regardless), so the pool's drain continues past a single dead peer.
+    pub(crate) async fn close_graceful(&mut self) {
+        let budget = Duration::from_secs(self.redial.connect_timeout_secs());
+        // Discard the nested outcome (timeout OR verb error): the graceful close
+        // is fire-and-forget and there is no token to strand.
+        drop(tokio::time::timeout(budget, self.close()).await);
+    }
 }
 
 /// A borrowing transaction guard, handed to the closure of
@@ -1867,5 +1924,40 @@ impl Transaction<'_> {
         channel: &'a str,
     ) -> impl Future<Output = Result<(), DriverError>> + 'a {
         self.armed(move |c| c.unlisten(channel))
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    //! C3 WITNESS (offline): [`set_tcp_keepalive`] turns `SO_KEEPALIVE` ON for a
+    //! connected TCP stream — the dead-peer-detection posture every TCP connection
+    //! gets by default. A real loopback socket pair (no PG), so the getter reads
+    //! the option straight back off the fd via `socket2`.
+
+    use super::set_tcp_keepalive;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn set_tcp_keepalive_enables_so_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let (_server, _peer) = listener.accept().await.expect("accept");
+
+        // A fresh TCP socket has keepalive OFF by default.
+        assert!(
+            !socket2::SockRef::from(&client)
+                .keepalive()
+                .expect("read keepalive before"),
+            "a fresh TCP socket must have SO_KEEPALIVE off",
+        );
+        // After our helper it is ON — the connect path applies exactly this.
+        set_tcp_keepalive(&client).expect("enable keepalive");
+        assert!(
+            socket2::SockRef::from(&client)
+                .keepalive()
+                .expect("read keepalive after"),
+            "set_tcp_keepalive must turn SO_KEEPALIVE on",
+        );
     }
 }

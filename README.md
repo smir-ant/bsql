@@ -373,6 +373,48 @@ connection it mints. Diagnostics is **NOT** a `ConnectConfig` field — the
   `Pool::stats()`), `ParameterStatus`, `MigrationLockWaiting` /
   `MigrationApplying` / `MigrationApplied`, and `PreparedCacheSelfHeal`.
 
+### Connection-pool robustness
+
+The pool (both drivers) is bounded, self-resetting, and FIFO-fair; beyond that it
+hardens the connection LIFECYCLE:
+
+- **Graceful shutdown — `Pool::close(self)`.** Dropping a pool drops each pooled
+  connection's socket bare (an RST/FIN with no protocol `Terminate`), and
+  PostgreSQL logs an "unexpected EOF on client connection" per connection — an
+  error-log flood at shutdown for a large pool. `pool.close()` instead sends a
+  protocol `Terminate` to every currently-IDLE connection so the server sees a
+  CLEAN disconnect, then closes each socket. It CONSUMES the pool, so
+  use-after-close is a compile error, and each `Terminate` is BOUNDED by the
+  connection's `connect_timeout` (a black-hole peer cannot hang the drain for the
+  kernel's `tcp_retries2` budget, ~15 min) — best-effort, so a single dead peer
+  never stalls the rest of the drain.
+- **TCP keepalive by default.** Every TCP connection enables `SO_KEEPALIVE` (idle
+  ~60 s, interval ~10 s) right after connect, so a silently-vanished peer on an
+  IDLE connection is eventually detected by the kernel — matching libpq, which
+  enables keepalives by default. No config knob (a dead-peer probe is near-free on
+  a healthy connection and near-universally wanted); TCP-only (a unix socket has
+  no keepalive). Set through `socket2`'s SAFE borrowed-fd API, so the driver crates
+  stay `#![forbid(unsafe_code)]`.
+- **`max_lifetime` + `idle_timeout` (a LAZY reaper).**
+  `Pool::builder(config, max).max_lifetime(Some(dur)).idle_timeout(Some(dur))`
+  bounds how long a pooled connection lives (age since it was established) and how
+  long it may sit idle (since it last returned). At CHECKOUT, before a reused
+  connection is handed out, one that exceeds either bound is gracefully closed
+  (the bounded `Terminate` above) and REPLACED with a fresh connection — so a
+  long-lived pool rotates connections (bounding per-backend memory growth, letting
+  a rolling credential/DNS change take effect) and a quiet pool sheds connections
+  the server may have already timed out. The reaper is LAZY (checked at checkout),
+  so it adds NO background timer thread/task — chosen over a background reaper
+  (extra runtime dependency + lifecycle, and it cannot even spawn from a pool
+  built outside a runtime) and over reap-on-return (which cannot catch a
+  connection that ages past a bound while sitting idle). Both bounds default to
+  `None` (disabled) — no behaviour change for an existing pool, and ZERO timing
+  work per checkout when disabled (the clock read is gated behind
+  `max_lifetime.is_some() || idle_timeout.is_some()` via `&&` short-circuit, and
+  the return-time restamp reads the clock only when `idle_timeout` is set). A reap
+  emits `DiagEvent::PoolConnectionEvicted` and increments the `Pool::stats()`
+  eviction counter.
+
 ## Crate layout
 
 Nine publishable crates and six never-published (`publish = false`) dev
@@ -463,12 +505,12 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 2280** — every `#[test]` / `#[tokio::test]` attribute:
+- **Test functions: 2296** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
   ```
-- **`#[ignore]` live suites (need a running database): 293**:
+- **`#[ignore]` live suites (need a running database): 303**:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[ignore' | wc -l

@@ -165,10 +165,13 @@ pub enum DiagEvent<'a> {
         /// The deadline the checkout waited (its configured acquire timeout).
         waited: Duration,
     },
-    /// A pooled connection was EVICTED on checkout because its health-gate reset
-    /// failed (a silently-vanished peer, a server that closed the idle socket).
-    /// A steady stream of these is a reconnect storm — server-side churn made
-    /// visible instead of hiding behind latency.
+    /// A pooled connection was REMOVED on checkout rather than handed out —
+    /// either because its health-gate reset FAILED (a silently-vanished peer, a
+    /// server that closed the idle socket) or because it was REAPED for outliving
+    /// the pool's configured `max_lifetime` (age) / `idle_timeout` (idle). A steady
+    /// stream from failed resets is a reconnect storm (server-side churn made
+    /// visible); a steady stream from reaping is just the pool rotating aged
+    /// connections as configured.
     PoolConnectionEvicted,
     /// A query's server round trip met or exceeded the configured slow-query
     /// threshold. Carries the SQL TEXT — never the bound parameter VALUES (no
@@ -237,9 +240,11 @@ pub struct PoolStats {
     /// Checkouts that waited out their acquire deadline (classified
     /// `PoolTimeout`) — monotonic. A rising value means sustained saturation.
     pub acquire_timeouts: u64,
-    /// Pooled connections evicted on checkout because their health-gate reset
-    /// failed — monotonic. A rising value means server-side idle-connection
-    /// churn (a reconnect storm).
+    /// Pooled connections removed on checkout — either their health-gate reset
+    /// failed, or they were reaped for outliving `max_lifetime` / `idle_timeout` —
+    /// monotonic. A rising value from failed resets means server-side
+    /// idle-connection churn (a reconnect storm); from reaping it is the pool
+    /// rotating aged connections as configured.
     pub connections_evicted: u64,
     /// The high-water mark of concurrent checkouts blocked waiting for a
     /// permit/slot — the deepest the acquire queue ever got. `0` if a checkout
