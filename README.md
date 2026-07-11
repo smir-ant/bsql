@@ -217,6 +217,21 @@ gap — `emit` then cross-checks each `query!` against a real SQLite replay of
 the migrations at build time. The only cost is a second bundled-`rusqlite`
 build-dependency compile; a SQLite-targeting consumer should enable both.
 
+### A worked example
+
+[`tools/query_fixture/examples/web_service.rs`](tools/query_fixture/examples/web_service.rs)
+is a realistic small web-service data layer end-to-end: a connection pool with
+the structured diagnostics sink wired to stderr, a couple of `query!` typed
+queries against a small migration, an atomic transaction, and
+reconnect-on-disconnect error handling with `DriverError::is_disconnect()`. It is
+compiled offline by `cargo build --examples` (the `query!` macros are typed at
+build time; `main` is compiled, never run) and runs against a live PostgreSQL:
+
+```bash
+DATABASE_URL=postgres://user@localhost/db \
+  cargo run -p bsql-query-fixture --example web_service
+```
+
 ### Applying migrations
 
 Add `bsql_build::emit_migrations("migrations")` to your `build.rs` to bake the
