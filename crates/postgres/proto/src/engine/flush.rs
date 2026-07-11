@@ -100,6 +100,35 @@ use super::error::EngineError;
 use super::seams::Transport;
 use crate::write_buf::WriteBufFull;
 
+/// High-water capacity, in bytes, above which
+/// [`SendBuf::reclaim_if_oversized`] releases the outbound backing allocation
+/// at a cold pool-checkout settle point.
+///
+/// A single large `Bind` parameter block (a multi-megabyte `bytea` / `jsonb` /
+/// `text` parameter) streams UNCAPPED onto [`SendBuf`] (see the module docs),
+/// and that grown capacity is otherwise retained for the whole life of the
+/// connection — a steady-state memory bloat for a long-lived pooled connection
+/// that once sent a big payload. `reclaim_if_oversized` reclaims it.
+///
+/// The mark is `64 KiB`, matching the COPY-in flush threshold
+/// (`COPY_IN_FLUSH_THRESHOLD` in `engine::verbs`): a NORMAL query's outbound
+/// batch — a `≤ MAX_SQL_LEN` (2 KiB) simple query, or a `Parse`+`Bind`+…+`Sync`
+/// pipeline with modest scalar params — never crosses it, so a steady
+/// small-query workload NEVER triggers a shrink (no thrash, zero realloc on the
+/// common path). Only a genuinely oversized buffer is reclaimed. The two
+/// constants are independent policies that happen to share `64 KiB`; a drift
+/// between them is not a correctness issue.
+pub(crate) const SEND_BUF_HIGH_WATER: usize = 64 * 1024;
+
+/// The baseline capacity, in bytes, [`SendBuf::reclaim_if_oversized`] shrinks an
+/// oversized backing down to.
+///
+/// Large enough that a following normal query — and the reset round trip's own
+/// `RESET ALL` simple query — reuses the retained allocation without a realloc
+/// (so a shrink is never immediately undone by the next small batch); small
+/// enough that reclaiming a multi-megabyte buffer returns almost all of it.
+pub(crate) const SEND_BUF_BASELINE: usize = 8 * 1024;
+
 /// Engine-owned outbound send buffer: already-encoded bytes plus a send
 /// cursor.
 ///
@@ -327,6 +356,68 @@ impl SendBuf {
     pub fn clear(&mut self) {
         self.buf.clear();
         self.sent = 0;
+    }
+
+    /// Release an OVERSIZED backing allocation down to a small baseline,
+    /// scrubbing the freed bytes first — the bounded-pool-memory reclaim.
+    ///
+    /// A large `Bind` parameter block grows [`SendBuf`] uncapped and that
+    /// capacity is otherwise retained for the connection's whole life (see the
+    /// module docs). This reclaims it: when the backing capacity exceeds
+    /// [`SEND_BUF_HIGH_WATER`] it is dropped to [`SEND_BUF_BASELINE`].
+    ///
+    /// # Thrash-free by construction
+    ///
+    /// The reclaim is a COLD, once-per-checkout op (its sole caller is the
+    /// driver's `reset_session`, run when a pooled connection is handed back
+    /// out) — NEVER the hot per-query / per-flush path, so a per-query
+    /// shrink-then-regrow cannot happen. And a normal small-query workload never
+    /// crosses [`SEND_BUF_HIGH_WATER`], so the gate below returns after a single
+    /// capacity compare — no scrub, no realloc, no shrink at all. Only a
+    /// connection that actually sent an oversized payload pays the reclaim, once,
+    /// at a boundary that already costs a reset round trip.
+    ///
+    /// # Scrub before shrink
+    ///
+    /// [`Vec::shrink_to`] reallocates to a smaller block and FREES the old,
+    /// oversized one, which held prior outbound wire bytes (the SQL text, and
+    /// after the handshake the SCRAM client proof / password message). The
+    /// teardown [`Drop`] only scrubs whatever backing is live AT drop, so this
+    /// mid-life shrink must zeroize its OWN freed block — a shrink without the
+    /// prior scrub would leak those bytes into freed heap. The full capacity is
+    /// zeroized before the realloc.
+    ///
+    /// # Precondition
+    ///
+    /// Only valid when the buffer is [`is_drained`](Self::is_drained): it scrubs
+    /// and reallocates the whole backing, so any UNSENT tail would be lost. The
+    /// sole caller invokes it after its reset round trip has fully drained the
+    /// buffer; a `debug_assert` pins the invariant (a programming-error check, no
+    /// runtime recovery branch).
+    #[inline]
+    pub(crate) fn reclaim_if_oversized(&mut self) {
+        // Fast gate: a buffer that never grew past the high-water mark is not
+        // worth reclaiming. This is the ONLY work a normal small-query workload
+        // ever does here — one capacity compare, then return — so the reclaim is
+        // zero-realloc / zero-thrash on the common path.
+        if self.buf.capacity() <= SEND_BUF_HIGH_WATER {
+            return;
+        }
+        debug_assert!(
+            self.is_drained(),
+            "reclaim_if_oversized called with an unsent tail; it scrubs and \
+             reallocates the whole backing and would lose those bytes",
+        );
+        use zeroize::Zeroize;
+        // Scrub the FULL capacity (queued bytes + spare) BEFORE `shrink_to`
+        // frees the oversized allocation — see "Scrub before shrink" above.
+        self.buf.zeroize();
+        self.buf.clear();
+        self.sent = 0;
+        // Drop the oversized allocation to the baseline the next batch reuses
+        // without a realloc. `shrink_to` never grows and never panics; with the
+        // length now `0`, the new capacity settles at `>= SEND_BUF_BASELINE`.
+        self.buf.shrink_to(SEND_BUF_BASELINE);
     }
 
     /// Borrow the backing store as a GROWABLE frame builder — the streaming
@@ -694,6 +785,108 @@ mod scrub_drained_tests {
         // The retained allocation accepts a follow-on batch.
         sb.enqueue(b"next-phase-frame");
         assert_eq!(sb.queued(), b"next-phase-frame");
+    }
+}
+
+#[cfg(test)]
+mod reclaim_tests {
+    //! Bounded-pool-memory witness for [`SendBuf::reclaim_if_oversized`]: a
+    //! backing that grew past [`SEND_BUF_HIGH_WATER`] is dropped to
+    //! [`SEND_BUF_BASELINE`] (memory reclaimed), while a normal small-query
+    //! buffer is left UNTOUCHED across any number of reclaims (no thrash). This
+    //! is the deterministic, in-process witness for the P2 shrink-on-checkin
+    //! reclaim — the buffer capacity is directly observable via the `cfg(test)`
+    //! [`SendBuf::capacity`] probe, so no live server is needed. The wiring —
+    //! that `reset_session` calls the reclaim — is witnessed at the engine level
+    //! by `super::super::reclaim_send_buffer_engine_tests`.
+
+    use super::{SendBuf, SEND_BUF_BASELINE, SEND_BUF_HIGH_WATER};
+
+    /// An oversized buffer (a big `Bind` param block) is reclaimed to the
+    /// baseline on a drained settle point — the memory returns to the allocator.
+    /// A 4 MiB stand-in for a large `Bind` parameter payload.
+    const BIG_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
+
+    #[test]
+    fn oversized_buffer_is_reclaimed_to_baseline() {
+        let mut sb = SendBuf::new();
+        // Simulate a multi-megabyte parameter payload growing the backing.
+        let mut big = alloc::vec::Vec::new();
+        big.resize(BIG_PAYLOAD_LEN, 0xABu8);
+        sb.enqueue(&big);
+        // Fully "send" it so the drained precondition holds (a completed verb
+        // leaves `sent == len`).
+        let pending = sb.pending_len();
+        assert!(sb.advance(pending).is_ok());
+        assert!(sb.is_drained());
+        let grown = sb.capacity();
+        assert!(
+            grown > SEND_BUF_HIGH_WATER,
+            "precondition: the 4 MiB payload must have grown the backing past the high-water mark (was {grown})",
+        );
+
+        sb.reclaim_if_oversized();
+
+        let reclaimed = sb.capacity();
+        assert!(
+            reclaimed < grown,
+            "reclaim must shrink the oversized backing ({grown} -> {reclaimed})",
+        );
+        assert!(
+            reclaimed <= SEND_BUF_HIGH_WATER,
+            "reclaimed capacity {reclaimed} must be back under the high-water mark",
+        );
+        // The buffer is empty + drained + reusable after the reclaim.
+        assert!(sb.is_drained());
+        assert!(sb.pending().is_empty());
+        // A normal follow-on batch reuses the baseline allocation without a
+        // realloc (the baseline is sized to hold it).
+        let after = sb.capacity();
+        sb.enqueue(b"SELECT 1");
+        assert_eq!(sb.capacity(), after, "a small batch must reuse the baseline, not realloc");
+    }
+
+    /// A normal small-query buffer never crosses the high-water mark, so the
+    /// reclaim leaves it UNTOUCHED — the no-thrash guarantee — even when called
+    /// repeatedly (a small-query loop returning to the pool each cycle).
+    #[test]
+    fn small_query_buffer_never_shrinks_no_thrash() {
+        let mut sb = SendBuf::new();
+        // A representative small request (a typical parameterized query batch).
+        sb.enqueue(b"SELECT id, name FROM users WHERE id = $1");
+        let pending = sb.pending_len();
+        assert!(sb.advance(pending).is_ok());
+        assert!(sb.is_drained());
+        let cap = sb.capacity();
+        assert!(
+            cap <= SEND_BUF_HIGH_WATER,
+            "a normal small-query buffer must stay under the high-water mark (was {cap})",
+        );
+
+        // Repeated reclaims (each pool checkout) must be a no-op on capacity —
+        // never a shrink-then-regrow cycle.
+        for _ in 0..16 {
+            sb.reclaim_if_oversized();
+            assert_eq!(
+                sb.capacity(),
+                cap,
+                "reclaim shrank a small buffer — a thrash the gate must prevent",
+            );
+        }
+    }
+
+    /// The reclaim baseline is at least large enough for the reset round trip's
+    /// own `RESET ALL` simple query, so the reclaim never forces the very next
+    /// (reset-internal) frame to realloc.
+    #[test]
+    fn baseline_holds_a_reset_all_simple_query() {
+        const RESET: &[u8] = b"ROLLBACK; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; \
+             CLOSE ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
+        assert!(
+            RESET.len() < SEND_BUF_BASELINE,
+            "the reclaim baseline ({SEND_BUF_BASELINE}) must comfortably hold the RESET simple query ({} bytes)",
+            RESET.len(),
+        );
     }
 }
 

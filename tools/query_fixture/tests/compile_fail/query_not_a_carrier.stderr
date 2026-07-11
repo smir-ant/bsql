@@ -1,0 +1,18 @@
+error[E0277]: `User` is not a runnable `query!` carrier
+  --> tests/compile_fail/query_not_a_carrier.rs:14:18
+   |
+14 |     let _ = conn.query::<User>(());
+   |                  ^^^^^ not a `query!` carrier
+   |
+help: the trait `TypedQuery` is not implemented for `User`
+  --> tests/compile_fail/query_not_a_carrier.rs:10:1
+   |
+10 | bsql::query!(User, "SELECT id FROM users");
+   | ^^^^^^^^^^^^^^^^^
+   = note: run a compile-checked query through the CARRIER the `query!` macro emits: for `query!(Foo, "…")` that is `FooQuery` — pass it to `query` / `query_one` / `query_opt`. The bare `Foo` is the decoded-row RECORD type (it holds a row's values), not a runnable query.
+help: the trait `TypedQuery` is implemented for `UserQuery`
+  --> tests/compile_fail/query_not_a_carrier.rs:10:1
+   |
+10 | bsql::query!(User, "SELECT id FROM users");
+   | ^^^^^^^^^^^^^^^^^
+   = note: this error originates in the macro `bsql::query` (in Nightly builds, run with -Z macro-backtrace for more info)

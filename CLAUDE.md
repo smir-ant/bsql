@@ -121,7 +121,12 @@ fn main() -> Result<(), bsql_build::BuildError> {
 Then `bsql::query!(Name, "<SQL>")` types the SQL at build time against that
 catalog and emits the `Name` record + the `NameQuery` carrier (which
 implements the umbrella's re-exported `bsql::TypedQuery`); an unknown
-column is a `compile_error!`. The macro's expansion names only
+column is a `compile_error!`. Passing the RECORD type (`conn.query::<Name>()`)
+where the runnable CARRIER (`NameQuery`) is required — the single most common
+`query!` mistake — is a `TypedQuery` `#[diagnostic::on_unimplemented]`: the error
+reads `` `Name` is not a runnable `query!` carrier `` and names the fix (use the
+`…Query` carrier; the bare record holds a decoded row and is not runnable),
+the PostgreSQL peer of the SQLite driver's `SqliteTypedQuery` diagnostic. The macro's expansion names only
 `::bsql::__rt::…` paths (a `#[doc(hidden)]` internal module), so no other
 dependency is needed at compile time — `bsql-query-macros` is a host-only
 proc-macro and never enters the runtime binary. `emit` also emits the

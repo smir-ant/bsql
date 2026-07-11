@@ -365,6 +365,28 @@ impl<'b, T> Engine<'b, T> {
         }
     }
 
+    /// Release the outbound send buffer's backing allocation if it grew past the
+    /// high-water mark — the bounded-pool-memory reclaim.
+    ///
+    /// A large `Bind` parameter block (a multi-megabyte `bytea` / `jsonb` /
+    /// `text` parameter) streams UNCAPPED onto the engine's send buffer, and that
+    /// grown capacity is otherwise retained for the connection's whole life — a
+    /// steady-state memory bloat for a long-lived pooled connection. This drops it
+    /// back to a small baseline, scrubbing the freed bytes first (a mid-life
+    /// shrink frees the oversized block, which held prior outbound wire bytes).
+    ///
+    /// It is a pure memory-hygiene op INDEPENDENT of protocol phase (it touches
+    /// only the outbound byte buffer, never the phase), so it takes `&mut self`
+    /// and is infallible — no `WrongPhase`. The sole caller is a driver's
+    /// `reset_session`, which runs it at a COLD pool-checkout settle point AFTER
+    /// its reset round trip has drained the buffer. It is NEVER on the hot
+    /// per-query / per-row path, and a normal small-query buffer (which never
+    /// crosses the high-water mark) is left untouched — no thrash.
+    #[inline]
+    pub fn reclaim_send_buffer(&mut self) {
+        self.send_buf.reclaim_if_oversized();
+    }
+
     /// Arm a fused simple-query PRELUDE to prepend to the NEXT command's flush.
     /// Today the ONE armed prelude is a deferred transaction `BEGIN`, fused with
     /// the transaction's first statement so it costs no standalone round trip.
@@ -896,6 +918,65 @@ mod connect_scrub_tests {
             scrubbed,
             Ok(true),
             "connect must reach active and scrub the secret-bearing handshake wire from send_buf",
+        );
+    }
+}
+
+#[cfg(test)]
+mod reclaim_send_buffer_engine_tests {
+    //! Wiring witness for [`Engine::reclaim_send_buffer`]: the engine hop that a
+    //! driver's `reset_session` calls actually reaches the send buffer's
+    //! oversized-reclaim, and is phase-independent (a pure memory-hygiene op).
+    //! The reclaim POLICY itself — the high-water threshold, scrub-before-shrink,
+    //! and the no-thrash small-buffer no-op — is proven at the buffer level by
+    //! `flush::reclaim_tests`.
+
+    use super::flush::SEND_BUF_HIGH_WATER;
+    use super::{Engine, Phase, SendBuf, WitnessTransport};
+
+    /// A 2 MiB stand-in for a large `Bind` parameter payload grown onto the
+    /// engine's outbound buffer.
+    const BIG_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
+
+    #[test]
+    fn reclaim_send_buffer_releases_an_oversized_backing() {
+        let mut engine: Engine<'static, WitnessTransport> =
+            Engine::new_in_scope(WitnessTransport, SendBuf::new(), Phase::Transitioning);
+        // Grow the engine's outbound buffer past the high-water mark, then mark
+        // it drained (a completed verb leaves `sent == len`).
+        let mut big = alloc::vec::Vec::new();
+        big.resize(BIG_PAYLOAD_LEN, 0x5Au8);
+        engine.send_buf.enqueue(&big);
+        let pending = engine.send_buf.pending_len();
+        assert!(engine.send_buf.advance(pending).is_ok());
+        let grown = engine.send_buf.capacity();
+        assert!(grown > SEND_BUF_HIGH_WATER, "precondition: the payload must have grown the backing (was {grown})");
+
+        engine.reclaim_send_buffer();
+
+        assert!(
+            engine.send_buf.capacity() < grown,
+            "the engine hop must reach the reclaim and shrink the oversized backing",
+        );
+        assert!(engine.send_buf.capacity() <= SEND_BUF_HIGH_WATER);
+    }
+
+    #[test]
+    fn reclaim_send_buffer_leaves_a_small_buffer_untouched() {
+        let mut engine: Engine<'static, WitnessTransport> =
+            Engine::new_in_scope(WitnessTransport, SendBuf::new(), Phase::Transitioning);
+        engine.send_buf.enqueue(b"SELECT id, name FROM users WHERE id = $1");
+        let pending = engine.send_buf.pending_len();
+        assert!(engine.send_buf.advance(pending).is_ok());
+        let cap = engine.send_buf.capacity();
+        assert!(cap <= SEND_BUF_HIGH_WATER);
+
+        engine.reclaim_send_buffer();
+
+        assert_eq!(
+            engine.send_buf.capacity(),
+            cap,
+            "a small buffer must not shrink — no thrash on the normal path",
         );
     }
 }

@@ -1883,6 +1883,16 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         self.notifications.clear();
         // A pool session reset is the strongest logical-operation boundary.
         self.n1_reset();
+        // Reclaim an OVERSIZED outbound send buffer before the connection is
+        // handed back out. A prior large `Bind` parameter block (a multi-MB
+        // `bytea` / `jsonb` / `text`) grew the buffer uncapped, and that capacity
+        // is otherwise retained for the connection's whole life — a steady-state
+        // memory bloat for a long-lived pooled connection. This is the cold,
+        // once-per-checkout settle point (the reset round trip above already
+        // DRAINED the buffer), so the reclaim never touches the hot per-query
+        // path, and a normal small-query workload — whose buffer never crosses
+        // the high-water mark — is left untouched (no shrink-then-regrow thrash).
+        self.engine.reclaim_send_buffer();
         Ok(())
     }
 

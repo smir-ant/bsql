@@ -57,6 +57,12 @@ fn unknown_reference_is_compile_error() {
     t.compile_fail("tests/compile_fail/query_uncast_param.rs");
     t.compile_fail("tests/compile_fail/query_wrong_field.rs");
     t.compile_fail("tests/compile_fail/query_type_mismatch.rs");
+    // Passing the generated RECORD type (`User`) where a runnable CARRIER
+    // (`UserQuery`) is required — the single most common `query!` misuse. The
+    // `#[diagnostic::on_unimplemented]` on `TypedQuery` names the exact fix
+    // (use the `…Query` carrier; the record is not runnable) rather than a raw
+    // unsatisfied-trait-bound wall.
+    t.compile_fail("tests/compile_fail/query_not_a_carrier.rs");
     // The widened `{f32, f64, bytea}` types keep the wrong-type wall: a
     // `float4` column's record field is `f32`, and using it where an `f64`
     // is expected is E0308 — widening did not weaken the type safety.

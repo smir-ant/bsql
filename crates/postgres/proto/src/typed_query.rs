@@ -59,6 +59,21 @@ use crate::prepared::{PreparedQuery, RowDecode};
 ///   with no text column it is `Foo` (the `'q` is harmlessly unused).
 /// - [`Owned`](Self::Owned) — the owned twin `FooOwned`, `Send + 'static` so a
 ///   row can outlive the prebuffer.
+///
+/// # Misuse diagnostic
+///
+/// The single most common `query!` mistake is passing the generated RECORD type
+/// (`Foo`) where a runnable CARRIER (`FooQuery`) is required — `conn.query::<Foo>()`
+/// instead of `conn.query::<FooQuery>()`. The `#[diagnostic::on_unimplemented]`
+/// below names that fix in the query author's own vocabulary (use the `…Query`
+/// carrier; the bare record holds a decoded row and is not runnable) rather than a
+/// raw "`Foo: TypedQuery` is not satisfied" wall — the PostgreSQL peer of the
+/// SQLite driver's `SqliteTypedQuery` on-unimplemented message.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a runnable `query!` carrier",
+    label = "not a `query!` carrier",
+    note = "run a compile-checked query through the CARRIER the `query!` macro emits: for `query!(Foo, \"…\")` that is `FooQuery` — pass it to `query` / `query_one` / `query_opt`. The bare `Foo` is the decoded-row RECORD type (it holds a row's values), not a runnable query."
+)]
 pub trait TypedQuery {
     /// The parameter tuple marker — the `$N` Rust types, supplying the wire
     /// param OIDs / formats.
