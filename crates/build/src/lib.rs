@@ -1731,35 +1731,36 @@ struct Walk {
 /// sorted AFTER the walk so the replay sequence is deterministic regardless of
 /// the order the filesystem yields entries.
 ///
-/// The sort key is the RELATIVE-NAME string ([`migration_sort_key`]) — the SAME
-/// string the runtime runner sorts by (`migration_name`), NOT the raw `PathBuf`.
-/// A `PathBuf`'s component-wise `Ord` disagrees with a byte-wise name compare at
-/// the `.` (0x2E) / `/` (0x2F) boundary for nested prefix collisions (e.g. build
-/// would order `[a/b.sql, a.sql]`, the runner `[a.sql, a/b.sql]`), so a naive
-/// `PathBuf` sort would make the build-validated catalog order DIVERGE from the
-/// runtime apply order in nested layouts. Sorting by the runner's key here makes
-/// them ONE authority: what the catalog type-checks in order is what the runner
-/// applies in order.
+/// The sort key is the canonical migration NAME ([`migration_name`]) — the SAME
+/// `/`-normalized relative-name string the runtime runner sorts by, NOT the raw
+/// `PathBuf`. A `PathBuf`'s component-wise `Ord` disagrees with a byte-wise name
+/// compare at the `.` (0x2E) / `/` (0x2F) boundary for nested prefix collisions
+/// (e.g. a `PathBuf` sort would order `[a/b.sql, a.sql]`, the runner
+/// `[a.sql, a/b.sql]`), so a naive `PathBuf` sort would make the build-validated
+/// catalog order DIVERGE from the runtime apply order in nested layouts. Sorting
+/// by [`migration_name`] — the ONE name-normalization authority in this crate,
+/// the exact string the runner keys on — makes them structurally ONE order: what
+/// the catalog type-checks in order is what the runner applies in order.
+///
+/// [`migration_name`] is fallible on a non-UTF-8 path, so precomputing it here
+/// (rather than a separate lossy sort key) surfaces that error at SCAN — earlier
+/// and louder than the emit-time name resolution that would otherwise catch it,
+/// and against the SAME rejection.
 fn scan_sql_tree(dir: &Path) -> Result<Walk, BuildError> {
     let mut walk = Walk::default();
     descend(dir, &mut walk)?;
-    walk.files
-        .sort_by_cached_key(|file| migration_sort_key(dir, file));
-    Ok(walk)
-}
 
-/// The runner's replay-ordering key for a walked file: its `/`-normalized path
-/// relative to the migrations root — the string form [`migration_name`]
-/// produces, so the build sort agrees byte-for-byte with the runtime apply
-/// order. Total (lossy on the pathological non-UTF-8 path, which
-/// [`migration_name`] rejects at emit time anyway; for every UTF-8 path — the
-/// only kind that reaches the runner — it is identical to `migration_name`).
-fn migration_sort_key(root: &Path, file: &Path) -> String {
-    let rel = match file.strip_prefix(root) {
-        Ok(r) => r,
-        Err(_) => file,
-    };
-    rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
+    // Pair each walked file with its canonical migration name (fallible on a
+    // non-UTF-8 path), sort by that name string, then restore the ordered paths.
+    let files = core::mem::take(&mut walk.files);
+    let mut named = files
+        .into_iter()
+        .map(|file| Ok((migration_name(dir, &file)?, file)))
+        .collect::<Result<Vec<(String, PathBuf)>, BuildError>>()?;
+    named.sort_by(|(a, _), (b, _)| a.cmp(b));
+    walk.files = named.into_iter().map(|(_, file)| file).collect();
+
+    Ok(walk)
 }
 
 /// Recursive worker for [`scan_sql_tree`]: records `dir`, then visits its
@@ -4578,7 +4579,7 @@ mod tests {
         let build_order: Vec<String> = walk
             .files
             .iter()
-            .map(|f| migration_sort_key(root, f))
+            .map(|f| migration_name(root, f).expect("utf-8 migration name"))
             .collect();
 
         // The runner's order: the relative names sorted as strings (byte-wise).
