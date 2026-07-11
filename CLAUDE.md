@@ -70,6 +70,7 @@ cargo test -p bsql-devgates --test deps_pin            # dependency-frontier gat
 cargo test -p bsql-devgates --test runtime_graph_pin   # build-time-only boundary gate
 cargo test -p bsql-devgates --test doc_links           # intra-doc-link wall (broken-link deny)
 cargo test -p bsql-devgates --test test_count          # README test-count doc-vs-reality gate
+cargo test -p bsql-devgates --test cross_platform      # Windows/Linux cross-target regression gate (cargo check --no-default-features; NO-OP-PASS when the target isn't `rustup target add`-ed)
 cargo test -p bsql-postgres-proto --test engine_hotpath_codegen  # next_event codegen-stability gate (panic-free + instruction ceiling)
 cargo test -p bsql-postgres-core --test decoder_fuzz   # decoder total-function gate (dep-free fuzz: no decoder panics on any input)
 cargo test -p bsql-sqlite            # SQLite (no PG needed)
@@ -449,6 +450,35 @@ test -p bsql-devgates --test test_count` (mirroring `TRYBUILD=overwrite`). It is
 `publish = false` (a devgate) with no dependencies, so `deps_pin` and
 `runtime_graph_pin` are untouched.
 
+The `cross_platform` gate (`tools/devgates/tests/cross_platform.rs`) is the
+NO-CI regression wall for the Windows/Linux cross-target fix (the `#[cfg(unix)]`
+gating of the unix-domain-socket transport arm in each driver's `transport.rs`
+plus the 64-bit `compile_error!`). Without CI, an unconditional
+`use std::os::unix::…` would silently re-break Windows and no routine check on
+the dev's macOS/Linux host would notice. This gate runs `cargo check -p
+<driver> --target <triple> --no-default-features` for the two shipped drivers
+(`bsql-postgres-async`, `bsql-postgres-sync`) against `x86_64-pc-windows-msvc`
+and `x86_64-unknown-linux-gnu`, in a dedicated `CARGO_TARGET_DIR`
+(`target/devgate-cross`, no-contention like `doc_links`). An ungated
+`use std::os::unix::…` fails the Windows check with `E0433` (the module does not
+exist there) — the exact regression the gate catches (proven RED->GREEN by
+temporarily adding `use std::os::unix::net::UnixListener;` to a driver's
+`transport.rs`). Two deliberate scoping choices: (1) `cargo check`, not `build`
+— `check` emits only metadata and NEVER LINKS, so it needs no target linker (no
+MSVC `link.exe` on macOS), only the target's prebuilt `std` from `rustup target
+add`; (2) `--no-default-features` — the default `tls` feature pulls `ring`,
+whose C compile needs a C CROSS-toolchain a bare target add does not provide, so
+the gate scopes to the pure-Rust surface (the transport gating is on the TARGET,
+not a feature, so `--no-default-features` still compiles `transport.rs`); TLS-on
+cross-compilation needs the target's C toolchain and is documented, not gated.
+NO-OP-PASS when absent: it probes `rustup target list --installed` and SKIPS
+(passes, with an `eprintln!` note) any target not installed — or the whole gate
+if `rustup` is unavailable — so a developer without the Windows target added
+never gets a false red, mirroring how the `--ignored` live suites skip without a
+database. It FAILS only when a target IS installed and its check fails (a real,
+reproducible regression). It is `publish = false` with no dependencies, so
+`deps_pin` and `runtime_graph_pin` are untouched.
+
 The `engine_hotpath_codegen` gate
 (`crates/postgres/proto/tests/engine_hotpath_codegen.rs`) pins the *compiled
 shape* of the inbound hot dispatch `ActiveEngine::next_event` (the pull-cursor
@@ -510,6 +540,28 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 - **Drivers** are thin I/O adapters that plug their socket into the ONE `Core<S>`: `Core<TokioSocket>` on async, `Core<SyncSocket>` on sync (each socket is a TCP-or-unix enum), MONOMORPHISED per driver — static dispatch, no `dyn`. The verbs live once in `Core<S>`; the drivers differ only in `.await` vs blocking, so async/sync parity is a COMPILER guarantee, not hand-maintained twins.
 - **Rows.** The dynamic `Row` (from `query_sql` etc.) is 16 bytes (`'static + Clone + Send + Sync`) over an `Arc`-shared arena: 3 heap allocations per whole `QueryResult` (the arena's `data` + `slots` vectors + the shared `Arc`), regardless of row count, and 0 per row — a `QueryResult` holds ONE lazy `RowSet` and mints each `Row` handle on demand (`.get(i)` / `.iter()`), never eagerly building a `Vec<Row>`, so a single-row read (`query_one_sql`) clones the `Arc` once, not N times. This mirrors the typed `Rows<Q>` (from the `query!` flagship), which is 2 allocations per result and 0 per row (borrowed, zero-copy decode). The **SQLite** backend runs the SAME lazy model: its `QueryResult` is one lazy `RowSet` over a shared arena (a `data` byte pool + a `CellSlot` table carrying integer/real inline and text/blob as `(offset, len)`, with the column names shared by `Arc`), so an eager `query_sql()` costs a constant number of allocations, 0 per row (a minted 16-byte `Row` handle carries its own names, so `get_by_name` threads no slice), and text UTF-8 is validated lazily at `get::<&str>` (never eagerly failing the whole result on one bad byte). A `> 4 GiB` eager result is the loud `SqliteError::ResultTooLarge` (stream it via `query_each_sql`, which is capless/constant-memory). The SQLite **typed** flagship result `TypedRows<Q>` wraps that same lazy arena: a constant number of allocations, 0 per row, borrowed records aliasing the arena zero-copy via an `ArenaRowRef` per-get view.
 - **SQLite parity.** The SQLite driver is a full peer of the PG path, not a text-only wrapper. **Verb naming matches PG:** `query` / `query_one` / `query_opt` / `query_each` are the compile-checked TYPED flagship (over a `query!` carrier); the dynamic raw-SQL verbs carry the `_sql` suffix (`query_sql` / `query_one_sql` / `query_opt_sql` / `query_each_sql`), and the parameterized dynamic verbs keep their names (`query_params`, `query_params_one/opt`, `query_each_params`). **Typed flagship:** a `query!` carrier for a SQLite-decodable query (every column a SQLite storage class, unbridged, no PG-only dynamic sugar) implements `SqliteTypedQuery` (emitted by the macro under the umbrella `sqlite` feature), so `Connection::query::<Q>()` and its peers (+ the transaction guard) execute it and decode into the SAME typed records the PG path produces. SQLite is dynamically typed, so decoding VERIFIES each value's actual storage class against the record's declared field type via `FromColumn` — a mismatch is a classified `TypeMismatch`, a `NULL` in a non-`Option` field is `UnexpectedNull`, never a silent coercion (the runtime peer of the PG wire-OID pinning). The borrowed record `Q::Record<'q>` aliases the shared arena zero-copy through an `ArenaRowRef` per-get VIEW that lends cells for the CONTAINER lifetime (the memory-proven per-get view, scoped to SQLite); one macro-emitted `decode_row` serves BOTH the eager (`TypedRows<Q>`) and the streaming (`query_each`) paths via the `ColumnSource` seam that `ArenaRowRef` and `BorrowedRow` both implement. A carrier for a PG-only query does NOT implement `SqliteTypedQuery`, so `sqlite_conn.query::<That>()` is a LOCATED E0277 (`#[diagnostic::on_unimplemented]`), never a silent mis-run. The macro emits the SQLite bridge ONLY under `sqlite-runtime` (the umbrella `sqlite` feature), so a PG-only build's expansion is byte-identical and the PG codegen/alloc gates and trybuild goldens are untouched. Runtime emission (`sqlite`) and build-time conformance (`macros-sqlite`) are ORTHOGONAL — a SQLite-targeting consumer should enable BOTH: runtime-only is still fail-loud (a storage-class mismatch is a classified runtime error) but lacks the build-time proof that real SQLite resolves the inferred row shape. Typed `query_one`/`query_opt` are exactly-one/at-most-one (`SqliteError::TooManyRows` on 2+, one extra `sqlite3_step`, no materialization) — the SAME contract as the PG typed verbs, so the flagship reads identically on both backends; the dynamic `*_sql` verbs stay first-row. **Parameters** come in two vocabularies, matching PG. The TYPED flagship verbs take the compile-checked `Q::Params<'p>` tuple — a LIFETIME-GAT (a `text`/`bytea` param is `&'p str`/`&'p [u8]`), so a RUNTIME `String`/buffer binds on the typed path (no `'static` wall; the `'static` instantiation feeds only the const validator/OID pins) — the SAME tuple type the PG `TypedQuery::Params<'p>` uses (the macro emits both from one source), bound onto the statement by the SQLite twin of `ParamsWriter`: the sealed `SqliteBindParams` (tuple) over `SqliteBindValue` (per-leaf → `ValueRef`), which binds each element positionally via rusqlite's zero-alloc `raw_bind_parameter` in its true storage class (`&str`→`TEXT`, `&[u8]`→`BLOB`, `None`→`NULL`). So a `query!` binds the SAME typed parameters on both backends, and a parameter type SQLite cannot bind (a `u64`, or a PG-only `Uuid`/`Numeric`/temporal/`EnumLabel`) is a LOCATED compile error at the `query::<Q>` call (the `SqliteBindParams` bound lives on the verb, not the associated type, so a PG-only-param carrier still gets its `SqliteTypedQuery` impl — only running it on SQLite is refused). The DYNAMIC verbs keep the untyped `&[ValueRef]` slice (the ONE value vocabulary for read AND dynamic bind) as the escape hatch — every value in its TRUE storage class, so `NULL`/`BLOB` are bindable and integers escape the affinity trap. The PG `ParamsWriter` binary-encode path is byte-untouched (the SQLite twin is a SEPARATE trait). **Explicit prepared-statement handles** close the last SQLite parity cell (a real surface gap — the PG driver has `prepare`/`query_prepared`, SQLite had none). `conn.prepare_sql(sql)` returns a DYNAMIC `SqliteStatement<'conn>`, `conn.prepare::<Q>()` a TYPED `SqliteTypedStatement<'conn, Q>` — each holds one PLAIN (non-persistent) `rusqlite::Statement<'conn>` borrowing the connection, so the CONSUMER holds it on the stack beside the connection and calls its verbs (`query`/`query_one`/`query_opt`/`query_each`/`execute` dynamic; `query`/`query_one`/`query_opt`/`query_each` typed) repeatedly. The SQL is compiled ONCE and reused every call, so a hot loop pays NO per-call `sqlite3_prepare_v2` recompile — the fast reuse shape a hand-rolled FFI layer achieves, with NO `unsafe` and NO self-referential hidden cache (the borrow checker keeps the connection alive for the handle, tier-1). This is the THIRD path the transparent verb-level cache cannot take: rusqlite's `prepare_cached` forces `SQLITE_PREPARE_PERSISTENT` (which bypasses lookaside and slows multi-row stepping), and a hidden cache of plain `Statement`s would be self-referential — an explicit handle is neither. The typed handle keeps every guarantee (storage-class verification, exactly-one/at-most-one, the `?N`↔tuple arity guard checked ONCE at prepare); a statement prepared on the connection runs correctly INSIDE a `transaction` closure (same db handle) and honors a `cancel_token` interrupt. Under `n1-detect` the TYPED handle's read verbs record (a typed read repeated 25+ times from one call site is the anti-pattern regardless of pre-preparation); the DYNAMIC handle does not (deliberate reuse, matching the dynamic connection verbs and the PG `query_prepared`). Measured: the reused handle hits the plain-prepare pilot ideal — `by_pk_prepared` ~1.7 µs, `10row_prepared` ~5.2 µs, both BELOW the C reference (2.28 / 5.66 µs), where the per-call-prepare streaming verbs sit at ~4.7 / ~7.4 µs. `Connection::transaction` hands the closure a borrowing `Transaction` guard exposing only the data verbs, so a nested/manual-`commit` desync is E0599 (same design as the PG transaction guard). `open` sets a 5 s default `busy_timeout` (a contended write waits, bounded, then classifies as busy — never a hang; `set_busy_timeout(Duration::ZERO)` restores immediate fail-loud). Affected counts are `u64` (PG parity). The `$N`→`?N` SQLite placeholder rewrite has ONE authority (`bsql_build::sqlite_placeholder_form`), shared by the build-time conformance oracle AND the macro's baked SQLite `const SQL`, so the runtime string is byte-identical to the one build-time validation proved SQLite prepares. **Cross-backend capabilities:** `conn.cancel_token()` (interrupt-based `SqliteCancelToken`) and `conn.n1_report()` (feature `n1-detect`) read the SAME as the PostgreSQL drivers, so cancellation and N+1 detection are one mental model across backends (see the Conventions cancellation bullet and the N+1 paragraph).
+
+## Platform support
+
+- **64-bit Linux, macOS, and Windows** (`x86_64` + `aarch64`). A 64-bit target
+  is REQUIRED: the footprint pins assert exact `size_of`/`align_of` for 64-bit
+  pointers, so `#[cfg(not(target_pointer_width = "64"))] compile_error!` fails a
+  non-64-bit build (i686 / wasm32 / 32-bit ARM) loudly in `bsql`, core, and both
+  drivers — never a silently-wrong layout.
+- **TCP everywhere; unix-domain-socket transport is unix-only.** The unix-socket
+  arm (`std::os::unix::net::UnixStream`) is gated behind `#[cfg(unix)]` in each
+  driver's `transport.rs` (`std::os::unix` does not exist on Windows). A
+  unix-socket host requested on a non-unix target is the classified
+  `DriverError::Config` message `UNIX_SOCKET_UNSUPPORTED` (defined once in
+  `core::config`), never a silent TCP fallback or a panic. So Windows uses TCP; a
+  unix-socket deployment is Linux / macOS.
+- **TLS (`ring`) on Windows / cross needs a C toolchain.** The default-on `tls`
+  feature pulls `ring`, which compiles C. A NATIVE build on each platform (with
+  its own C compiler) builds it normally; CROSS-compiling it (e.g. a Windows
+  target from a macOS host) needs the TARGET's C cross-toolchain, which a bare
+  `rustup target add <triple>` does NOT install. A `default-features = false`
+  (TLS-off) build is pure Rust and cross-compiles with only the target's prebuilt
+  `std`. This is why the `cross_platform` gate scopes to `--no-default-features`.
 
 ## Safety invariants
 

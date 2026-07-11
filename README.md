@@ -446,6 +446,33 @@ into a consumer-chosen type), `bsql-test-harness-fixture` (the live
 `#[bsql::test]` schema-isolation witness over both drivers), and `bsql-corpus`
 (a replay corpus pinning engine behaviour against goldens).
 
+## Platform support
+
+- **64-bit Linux, macOS, and Windows** (`x86_64` and `aarch64`). The footprint
+  pins assert exact `size_of` / `align_of` for 64-bit pointers, so a 64-bit
+  target is required — a non-64-bit build (i686 / wasm32 / 32-bit ARM) is a loud
+  `compile_error!`, never a silently-wrong layout.
+- **TCP transport works on every platform.** The **unix-domain-socket** transport
+  (an absolute-path host) is **unix-only** — it is gated behind `#[cfg(unix)]`,
+  because `std::os::unix::net::UnixStream` does not exist on Windows. A
+  unix-socket host requested on a non-unix target is a classified
+  `DriverError::Config` at connect (`use a TCP host`), never a silent fallback or
+  a panic. So a Windows deployment uses TCP; a unix-socket deployment is Linux /
+  macOS.
+- **TLS on Windows / when cross-compiling needs a C toolchain.** The default-on
+  `tls` feature pulls `ring`, which compiles C — cross-compiling it (e.g. a
+  Windows target built on a macOS/Linux host) needs the *target's* C toolchain,
+  which `rustup target add <triple>` does NOT install. A `default-features =
+  false` (TLS-off) build is pure Rust and cross-compiles with only the target's
+  prebuilt `std`; add TLS back with the target's C cross-toolchain in place. A
+  native build on each platform (with its own C compiler) builds `ring` normally.
+- **Local regression guard.** With no CI, the `cross_platform` devgate
+  (`tools/devgates/tests/cross_platform.rs`) runs `cargo check` for the Windows
+  and Linux targets (pure-Rust, `--no-default-features`) whenever those targets
+  are installed, so an accidental unconditional `use std::os::unix::…` is caught
+  on the dev's own machine. It skips (passes) any target not installed, so a
+  developer who has not run `rustup target add …` never gets a false red.
+
 ## Safety floor
 
 - `#![forbid(unsafe_code)]` at the root of every shipped crate — all
@@ -482,6 +509,7 @@ cargo test -p bsql-devgates --test deps_pin                # pinned dependency f
 cargo test -p bsql-devgates --test runtime_graph_pin       # build-time-only boundary
 cargo test -p bsql-devgates --test doc_links               # intra-doc-link wall
 cargo test -p bsql-devgates --test test_count              # README test-count doc-vs-reality wall
+cargo test -p bsql-devgates --test cross_platform          # Windows/Linux cross-target regression wall (skips absent targets)
 cargo bench  --workspace                                   # perf evidence (criterion)
 ```
 
@@ -505,7 +533,7 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 2296** — every `#[test]` / `#[tokio::test]` attribute:
+- **Test functions: 2297** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
