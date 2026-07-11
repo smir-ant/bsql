@@ -271,6 +271,54 @@ each row as a zero-copy `BorrowedRow` with zero per-row allocation and a
 reusable. Available on both PostgreSQL and SQLite with the SAME signature — a
 dynamic stream reads identically across backends.
 
+### Error handling — reconnect vs. retry
+
+A resilient consumer needs to tell two failures apart: "the server REJECTED my
+query but the connection is FINE" (fix the query, retry on the same connection)
+vs. "the connection DIED mid-operation" (reconnect / get a fresh pooled
+connection). `DriverError::is_disconnect()` (both PostgreSQL drivers) draws that
+line EXACTLY — by construction, never a string-match heuristic:
+
+```rust
+match conn.query_sql(sql).await {
+    Ok(rows) => rows,
+    Err(e) if e.is_disconnect() => reconnect_and_retry().await?, // socket died / backend terminated
+    Err(e) => return Err(e),                                     // a query error — fix the query
+}
+```
+
+It is `true` for a dropped socket / EOF / reset (`Io`), a not-ready connection
+whose token a prior fatal error took (`NotReady`), a fatal liveness-deadline
+(`Timeout` — a silently vanished peer), and a connection-broken server error
+(the `08` class, or the whole `57P` termination subclass — `57P01`/`57P02`
+admin/crash shutdown, `57P03` cannot-connect, `57P04` database-dropped, `57P05`
+idle-session-timeout). It is `false`
+for every per-query server error the connection survives — INCLUDING `57014`
+`query_canceled` (a `statement_timeout` or `CancelToken` cancel leaves the
+connection reusable), a syntax error, and a constraint violation.
+
+The same decision is CROSS-BACKEND via `BackendError::is_disconnect()`: SQLite
+runs in-process, so it never network-disconnects, but the analogue — a broken
+handle/file (`SQLITE_IOERR` / `SQLITE_CORRUPT` / `SQLITE_CANTOPEN` /
+`SQLITE_NOTADB`, whose recovery is a fresh handle) — reads identically, so a
+generic consumer's reconnect/reopen logic is one decision on both backends.
+
+The SERVER-side guardrail against a runaway query is
+`ConnectConfig::with_statement_timeout(Duration)` — the complement to the client
+`CancelToken`. PostgreSQL aborts any statement exceeding the budget with `57014`
+`query_canceled`, and the connection is left reusable (so the abort is NOT a
+disconnect — it sheds a slow query without killing the pooled connection). It
+rides the existing startup-parameter map (footprint-neutral — no new
+`ConnectConfig` field), applies from before the first query, and survives a
+pooled connection's `RESET ALL`. `Duration::ZERO` maps to PG's `statement_timeout
+= 0` (disabled); a sub-millisecond request rounds up to 1 ms (never down to
+0/disabled).
+
+```rust
+let config = ConnectConfig::new("db.example.com", "app")
+    .with_statement_timeout(Duration::from_secs(5)); // abort any query over 5s
+```
+
 ### Observability — the `DiagEvent` sink
 
 bsql emits structured operational events through ONE **dep-free** seam: a
@@ -415,12 +463,12 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 2267** — every `#[test]` / `#[tokio::test]` attribute:
+- **Test functions: 2280** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
   ```
-- **`#[ignore]` live suites (need a running database): 289**:
+- **`#[ignore]` live suites (need a running database): 293**:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[ignore' | wc -l

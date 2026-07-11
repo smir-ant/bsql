@@ -139,6 +139,45 @@ impl DbError {
     /// database does not exist. A connect-time diagnostic formerly collapsed to an
     /// opaque I/O string; now matchable exactly like an active-phase server error.
     pub fn is_invalid_catalog_name(&self) -> bool { self.is_code("3D000") }
+
+    /// `true` if this SQLSTATE says the SERVER connection is broken / being torn
+    /// down — so the connection is no longer usable and the fix is to reconnect,
+    /// not to change the query. This is the server-error input to
+    /// [`DriverError::is_disconnect`].
+    ///
+    /// Two whole classes qualify, matched by CLASS PREFIX (never an enumeration
+    /// that could omit a member):
+    /// - the entire **`08`** class (`connection_exception` — `08000`, `08003`
+    ///   `connection_does_not_exist`, `08006` `connection_failure`, `08001`,
+    ///   `08004`, `08007`, `08P01` `protocol_violation`): every member means the
+    ///   connection itself failed.
+    /// - the entire **`57P`** operator-intervention TERMINATION/REFUSAL subclass —
+    ///   `57P01` `admin_shutdown` (the `pg_terminate_backend` signal), `57P02`
+    ///   `crash_shutdown`, `57P03` `cannot_connect_now`, `57P04` `database_dropped`
+    ///   (`DROP DATABASE … FORCE` killed the backend), and `57P05`
+    ///   `idle_session_timeout` (the server terminated an idle session): every
+    ///   member is the server terminating or refusing the backend, and a future
+    ///   `57Pxx` termination code is covered too.
+    ///
+    /// Deliberately EXCLUDES `57014` (`query_canceled`) — it is the `57` class but
+    /// NOT the `57P` subclass (a different subcode), so the prefix match does not
+    /// sweep it in: a `statement_timeout` abort or a client `CancelToken` leaves
+    /// the connection fully usable (it is drained + reusable), so a cancelled query
+    /// is NEVER a disconnect. `57000` (`operator_intervention`, the bare class
+    /// code) is likewise not `57P` and stays excluded. Every ordinary server error
+    /// (a syntax error `42601`, a constraint violation `23505`, an undefined table
+    /// `42P01`) also does not close the connection, so it is not a connection error
+    /// here.
+    #[must_use]
+    pub fn is_connection_error(&self) -> bool {
+        let code = self.code();
+        // The whole `08` (connection exception) class, plus the whole `57P`
+        // operator-intervention termination/refusal subclass. BOTH matched by
+        // class prefix (consistent — no enumerate-vs-prefix split that could drop a
+        // member): `57014` (query_canceled) is the `57` class but not `57P`, so it
+        // is NOT swept in.
+        code.starts_with("08") || code.starts_with("57P")
+    }
 }
 
 /// Why reading a typed value from a dynamic [`Row`](crate::Row) column failed.
@@ -372,6 +411,98 @@ pub enum DriverError {
 crate::footprint_pin!(DriverError, size = 24, align = 8);
 
 impl DriverError {
+    /// `true` if this error means the CONNECTION is no longer usable — the signal
+    /// to RECONNECT (drop this connection / get a fresh pooled one), as opposed to
+    /// a per-query error the connection survives (fix the query and retry on the
+    /// SAME connection).
+    ///
+    /// # Intended use
+    ///
+    /// Branch your reconnect logic on the result of a VERB (a `query_*` / `execute`
+    /// on an established connection):
+    ///
+    /// ```ignore
+    /// match conn.query_sql(sql).await {
+    ///     Ok(rows) => rows,
+    ///     Err(e) if e.is_disconnect() => reconnect_and_retry().await?, // connection dead
+    ///     Err(e) => return Err(e),                                     // query at fault
+    /// }
+    /// ```
+    ///
+    /// This is the distinction a resilient consumer needs: "the server REJECTED my
+    /// query but the connection is fine" (a syntax error, a constraint violation,
+    /// a `statement_timeout` cancel — [`is_disconnect`](Self::is_disconnect) is
+    /// `false`) vs "the connection DIED mid-operation" (a dropped socket, a
+    /// terminated backend — `true`). It is EXACT, not a string-match heuristic:
+    /// each classified variant is decided by construction.
+    ///
+    /// The predicate answers exactly "is this connection UNUSABLE — get a fresh
+    /// one?". A CONNECT-phase policy refusal is deliberately NOT a disconnect under
+    /// that framing: [`SslRefused`](Self::SslRefused) is a violated TLS-policy
+    /// contract, not a broken connection — an identical fresh connect would refuse
+    /// the same way, so retrying is pointless (it is `false`). By contrast an
+    /// [`Io`](Self::Io) during connect IS unusable and a fresh attempt may succeed,
+    /// so it is `true` — consistent with the "unusable → reconnect" reading.
+    ///
+    /// `true` for:
+    /// - [`Io`](Self::Io) — a transport socket failure (an unexpected EOF, a
+    ///   connection reset, a broken pipe): the connection is dead.
+    /// - [`NotReady`](Self::NotReady) — the connection's linear liveness token was
+    ///   already taken by a PRIOR fatal error (a verb after a disconnect), so the
+    ///   connection is dead.
+    /// - [`Timeout`](Self::Timeout) — a FATAL mid-command read deadline elapsed
+    ///   (the pool's dead-peer liveness bound, where a half-open socket's peer
+    ///   vanished silently); the connection is torn down. (A notification wait's
+    ///   quiet deadline is not this — it never surfaces as an error.)
+    /// - [`Db`](Self::Db) whose SQLSTATE is a connection-broken code (the `08`
+    ///   class, or `57P01`/`57P02`/`57P03` admin/crash shutdown — see
+    ///   [`DbError::is_connection_error`]).
+    ///
+    /// `false` for every other classified error — a per-query server error
+    /// ([`Db`](Self::Db) with an ordinary SQLSTATE, INCLUDING `57014`
+    /// `query_canceled` from a `statement_timeout` or a `CancelToken`, which
+    /// leaves the connection drained + reusable), [`NoRows`](Self::NoRows),
+    /// [`Config`](Self::Config), [`PoolTimeout`](Self::PoolTimeout), a decode /
+    /// column error, and the rest — none of which closes the connection.
+    #[must_use]
+    pub fn is_disconnect(&self) -> bool {
+        match self {
+            // The transport itself failed, the token was already taken by a prior
+            // fatal error, or a fatal mid-command read deadline elapsed — in every
+            // case the connection is dead and a verb on it cannot proceed.
+            Self::Io(_) | Self::NotReady | Self::Timeout => true,
+            // A server error is a disconnect ONLY when its SQLSTATE says the
+            // connection is broken (the `08` class / `57P0x` shutdown); a syntax
+            // error, a constraint violation, or a `57014` cancel is NOT.
+            Self::Db(db) => db.is_connection_error(),
+            // A required-SSL refusal aborts the CONNECT (the connection was never
+            // established); it is a configuration/handshake fault, not a live
+            // connection dying, so reconnecting unchanged would refuse again.
+            #[cfg(feature = "tls")]
+            Self::SslRefused => false,
+            // Every remaining class leaves the connection usable (or never had
+            // one): the query is at fault, not the transport. Listed exhaustively
+            // (no wildcard) so a new variant forces a classification decision here
+            // rather than silently defaulting.
+            Self::NoRows
+            | Self::Config(_)
+            | Self::RowTooLarge
+            | Self::MixedResultWidth
+            | Self::UnclassifiedFailure
+            | Self::NonUtf8Payload
+            | Self::TimeoutOverflow
+            | Self::NotificationUnavailable
+            | Self::SpuriousPending
+            | Self::RowDecodeFailed
+            | Self::Decode(_)
+            | Self::TooManyRows
+            | Self::TooManyColumns { .. }
+            | Self::PoolTimeout
+            | Self::Column(_)
+            | Self::PayloadParse(_) => false,
+        }
+    }
+
     /// `true` if this is a server error whose SQLSTATE says a CACHED prepared
     /// plan is no longer valid on this connection — the signal the dynamic
     /// prepared-statement cache uses to evict and re-warm.
@@ -533,5 +664,84 @@ mod tests {
             .downcast_ref::<DbError>()
             .expect("source is the DbError, not the Box wrapping it");
         assert!(dberr.is_unique_violation());
+    }
+
+    fn db(code: &str) -> DriverError {
+        DriverError::from(DbError::new(code, None, "x".to_string(), None, None))
+    }
+
+    /// The transport-fatal driver classes mean "the connection is dead —
+    /// reconnect": a socket I/O failure, a not-ready connection whose token was
+    /// taken by a prior fatal error, and a fatal mid-command read deadline.
+    #[test]
+    fn is_disconnect_true_for_transport_fatal_classes() {
+        assert!(DriverError::Io(std::io::Error::other("server closed the connection")).is_disconnect());
+        assert!(DriverError::NotReady.is_disconnect());
+        assert!(DriverError::Timeout.is_disconnect());
+    }
+
+    /// A server error is a disconnect for a connection-broken SQLSTATE: the whole
+    /// `08` (connection exception) class and the whole `57P` operator-intervention
+    /// termination/refusal subclass — INCLUDING `57P04` (database_dropped) and
+    /// `57P05` (idle_session_timeout), covered by the `57P` class-prefix match.
+    #[test]
+    fn is_disconnect_true_for_connection_broken_sqlstates() {
+        for code in ["08000", "08003", "08006", "08001", "08004", "08007", "08P01",
+                     "57P01", "57P02", "57P03", "57P04", "57P05"] {
+            assert!(db(code).is_disconnect(), "SQLSTATE {code} must classify as a disconnect");
+            // The DbError predicate agrees standalone.
+            assert!(
+                DbError::new(code, None, String::new(), None, None).is_connection_error(),
+                "DbError::is_connection_error must be true for {code}",
+            );
+        }
+    }
+
+    /// A `statement_timeout` / `CancelToken` cancel returns `57014`
+    /// (`query_canceled`) but leaves the connection DRAINED + REUSABLE — it is
+    /// NEVER a disconnect. This is the load-bearing distinction for the
+    /// server-side `statement_timeout` guardrail. The `57P` termination subclass is
+    /// matched by prefix, so the `57` class's non-`57P` members must stay excluded.
+    #[test]
+    fn is_disconnect_false_for_query_canceled() {
+        assert!(!db("57014").is_disconnect(), "57014 query_canceled is not a disconnect");
+        assert!(!DbError::new("57014", None, String::new(), None, None).is_connection_error());
+        // `57000` operator_intervention shares the `57` class but is NOT the `57P`
+        // termination subclass — must not be swept in by the prefix match.
+        assert!(!db("57000").is_disconnect(), "57000 is not a disconnect");
+    }
+
+    /// An ordinary per-query server error (a syntax error, a constraint
+    /// violation, an undefined table) is NOT a disconnect: the connection is fine
+    /// and the fix is the query, not a reconnect.
+    #[test]
+    fn is_disconnect_false_for_ordinary_server_errors() {
+        for code in ["42601", "23505", "23502", "23503", "23514", "42P01", "53300", "3D000"] {
+            assert!(!db(code).is_disconnect(), "SQLSTATE {code} must NOT classify as a disconnect");
+        }
+    }
+
+    /// Every non-transport, non-server-error driver class leaves the connection
+    /// usable (or never had one), so none is a disconnect.
+    #[test]
+    fn is_disconnect_false_for_non_transport_classes() {
+        let usable = [
+            DriverError::NoRows,
+            DriverError::Config("x"),
+            DriverError::RowTooLarge,
+            DriverError::MixedResultWidth,
+            DriverError::UnclassifiedFailure,
+            DriverError::NonUtf8Payload,
+            DriverError::TimeoutOverflow,
+            DriverError::NotificationUnavailable,
+            DriverError::SpuriousPending,
+            DriverError::RowDecodeFailed,
+            DriverError::TooManyRows,
+            DriverError::TooManyColumns { count: 2000, max: 1664 },
+            DriverError::PoolTimeout,
+        ];
+        for e in &usable {
+            assert!(!e.is_disconnect(), "{e:?} must NOT classify as a disconnect");
+        }
     }
 }

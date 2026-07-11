@@ -2,6 +2,7 @@
 //! resolution ([`resolve_endpoint`]), and startup-parameter validation.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 /// SSL negotiation mode.
 ///
@@ -671,6 +672,64 @@ impl ConnectConfig {
         self.with_startup_param("application_name", application_name)
     }
 
+    /// Set the server-side `statement_timeout` on connect — the SERVER-side
+    /// complement to the client `CancelToken`, and the standard production
+    /// guardrail against a runaway query.
+    ///
+    /// PostgreSQL aborts any statement running LONGER than this, returning SQLSTATE
+    /// `57014` `query_canceled`; the connection is left drained + REUSABLE (a
+    /// `statement_timeout` abort is NOT a disconnect — see
+    /// [`DriverError::is_disconnect`](crate::DriverError::is_disconnect)). Unlike a
+    /// per-query `SET statement_timeout` round trip, this rides the EXISTING
+    /// startup-parameter map (a convenience over
+    /// [`with_startup_param`](Self::with_startup_param)`("statement_timeout", …)`),
+    /// so it is footprint-neutral (no new [`ConnectConfig`] field), applies from
+    /// before the FIRST query, and — as a startup-packet GUC — becomes the
+    /// session's reset value, so it SURVIVES a pooled connection's `RESET ALL` on
+    /// checkout (the guardrail persists across checkouts).
+    ///
+    /// # Duration mapping
+    ///
+    /// PostgreSQL's `statement_timeout` is an integer-millisecond GUC:
+    ///
+    /// - [`Duration::ZERO`] maps to `"0"`, which — by PostgreSQL's own convention —
+    ///   DISABLES the timeout. To leave the timeout UNSET, do not call this method;
+    ///   pass `Duration::ZERO` only to EXPLICITLY opt out. **Watch a dynamically
+    ///   computed budget**: an already-expired deadline yields
+    ///   `deadline.saturating_duration_since(now) == Duration::ZERO`, so passing
+    ///   that here DISABLES the guardrail rather than bounding the query to zero —
+    ///   guard the exact-zero case yourself if "already expired" should mean "abort
+    ///   immediately". (A non-zero sub-ms budget is safe — it rounds up to 1 ms,
+    ///   below.)
+    /// - a non-zero SUB-millisecond duration is rounded UP to `1` ms (the finest
+    ///   granularity PostgreSQL offers), NEVER down to `0` — a requested timeout is
+    ///   never silently weakened into "disabled".
+    /// - a duration whose whole milliseconds exceed PostgreSQL's 32-bit GUC ceiling
+    ///   (`i32::MAX` ms ≈ 24.8 days) is capped there, so an enormous `Duration`
+    ///   never produces a value the server rejects.
+    ///
+    /// The value is stored raw and (like every startup parameter) validated at
+    /// connect. This convenience writes the SAME `statement_timeout` startup-GUC
+    /// key as [`with_startup_param`](Self::with_startup_param)`("statement_timeout",
+    /// …)` / a DSN `options`, and the startup map APPENDS (no dedup), so setting it
+    /// twice — or mixing this with a raw `statement_timeout` param — sends two
+    /// entries and PostgreSQL applies the LAST (last-wins, the existing startup-map
+    /// semantics), never an error.
+    #[must_use]
+    pub fn with_statement_timeout(self, timeout: Duration) -> Self {
+        // PostgreSQL's statement_timeout is a millisecond GUC with a 32-bit
+        // (`i32::MAX`) ceiling; `0` means DISABLED.
+        const MAX_MS: u128 = 2_147_483_647; // i32::MAX ms ≈ 24.8 days
+        let ms: u128 = if timeout.is_zero() {
+            0
+        } else {
+            // Floor to whole ms but never below 1 (a sub-ms request must not
+            // collapse to `0` = disabled), and never above the GUC ceiling.
+            timeout.as_millis().clamp(1, MAX_MS)
+        };
+        self.with_startup_param("statement_timeout", ms.to_string())
+    }
+
     /// Borrow the raw, not-yet-validated startup parameters, in insertion
     /// order. The drivers validate each into a wire `StartupParam` at connect.
     #[must_use]
@@ -1109,6 +1168,63 @@ mod tests {
     #[test]
     fn a_fresh_config_has_no_startup_params() {
         assert!(ConnectConfig::new("localhost", "u").startup_params().is_empty());
+    }
+
+    /// `statement_timeout(Duration)` writes a millisecond value into the EXISTING
+    /// startup-parameter map — footprint-neutral (no new field), and formatted the
+    /// way PostgreSQL's integer-ms GUC expects.
+    #[test]
+    fn statement_timeout_formats_as_milliseconds() {
+        fn param(cfg: &ConnectConfig) -> Option<&str> {
+            cfg.startup_params()
+                .iter()
+                .find(|(k, _)| k == "statement_timeout")
+                .map(|(_, v)| v.as_str())
+        }
+
+        // A whole-second / millisecond duration → its millisecond count.
+        let cfg = ConnectConfig::new("h", "u").with_statement_timeout(Duration::from_millis(5000));
+        assert_eq!(param(&cfg), Some("5000"));
+        assert_eq!(
+            ConnectConfig::new("h", "u")
+                .with_statement_timeout(Duration::from_secs(2))
+                .startup_params()
+                .iter()
+                .find(|(k, _)| k == "statement_timeout")
+                .map(|(_, v)| v.as_str()),
+            Some("2000"),
+        );
+
+        // Duration::ZERO → "0" (PG convention: DISABLED), explicit opt-out.
+        let zero = ConnectConfig::new("h", "u").with_statement_timeout(Duration::ZERO);
+        assert_eq!(param(&zero), Some("0"), "Duration::ZERO disables the timeout (PG convention)");
+
+        // A non-zero SUB-millisecond duration rounds UP to 1 ms — never down to 0
+        // (which would silently DISABLE the guardrail).
+        let sub_ms = ConnectConfig::new("h", "u").with_statement_timeout(Duration::from_micros(500));
+        assert_eq!(param(&sub_ms), Some("1"), "a sub-ms request must not collapse to 0/disabled");
+        let one_ns = ConnectConfig::new("h", "u").with_statement_timeout(Duration::from_nanos(1));
+        assert_eq!(param(&one_ns), Some("1"));
+
+        // An enormous duration is capped at PG's 32-bit GUC ceiling (i32::MAX ms).
+        let huge = ConnectConfig::new("h", "u").with_statement_timeout(Duration::from_secs(60 * 60 * 24 * 365));
+        assert_eq!(param(&huge), Some("2147483647"), "capped at i32::MAX ms");
+    }
+
+    /// It rides the SAME map as the other startup builders (footprint-neutral),
+    /// composes with them, and preserves insertion order.
+    #[test]
+    fn statement_timeout_composes_with_other_startup_params() {
+        let cfg = ConnectConfig::new("h", "u")
+            .with_search_path("myschema")
+            .with_statement_timeout(Duration::from_millis(200));
+        assert_eq!(
+            cfg.startup_params(),
+            &[
+                ("search_path".to_string(), "myschema".to_string()),
+                ("statement_timeout".to_string(), "200".to_string()),
+            ],
+        );
     }
 
     #[test]

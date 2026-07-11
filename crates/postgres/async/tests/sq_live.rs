@@ -272,6 +272,102 @@ async fn cancel_token_stops_an_inflight_query() {
     conn.close().await.expect("close");
 }
 
+/// WITNESS (C5 — `is_disconnect`): a connection whose backend is TERMINATED
+/// mid-flight (`pg_terminate_backend` from a second connection) fails its
+/// in-flight query with an error that `DriverError::is_disconnect()` classifies
+/// TRUE — the "reconnect" signal — whether the failure surfaces as a FATAL
+/// `57P01` server error or as a torn socket. A plain SYNTAX error on a healthy
+/// connection classifies FALSE (fix the query, the connection is fine).
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn is_disconnect_true_on_terminated_backend_false_on_syntax_error() {
+    use std::time::Duration;
+
+    let cfg = ConnectConfig::new("/tmp", "smir-ant").database("postgres".to_string());
+    let mut victim = Connection::connect(&cfg).await.expect("connect victim");
+    let mut killer = Connection::connect(&cfg).await.expect("connect killer");
+    let pid = victim.backend_pid();
+    assert!(pid > 0, "backend pid must be captured from the handshake");
+
+    // Kill the victim MID-FLIGHT: it starts a 3s sleep; ~200ms in the killer
+    // terminates its backend, so the in-flight query dies on the wire.
+    let sleeping = victim.query_one_sql("SELECT pg_sleep(3)");
+    let terminating = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let terminated = killer
+            .query_one_sql(&format!("SELECT pg_terminate_backend({pid})"))
+            .await
+            .expect("terminate the victim backend");
+        assert_eq!(terminated.get_str(0), Ok(Some("t")), "pg_terminate_backend returned true");
+    };
+    let (victim_res, ()) = tokio::join!(sleeping, terminating);
+
+    let disconnect_err = match victim_res {
+        Err(e) => e,
+        Ok(_) => panic!("a terminated backend must fail the in-flight query"),
+    };
+    assert!(
+        disconnect_err.is_disconnect(),
+        "a terminated connection must classify as a disconnect, got {disconnect_err:?}",
+    );
+
+    // A syntax error on the STILL-HEALTHY killer connection is NOT a disconnect.
+    let syntax_err = match killer.query_one_sql("SELECT bogus not valid sql !!").await {
+        Err(e) => e,
+        Ok(_) => panic!("a syntax error must fail"),
+    };
+    assert!(
+        !syntax_err.is_disconnect(),
+        "a syntax error is not a disconnect (the connection is fine), got {syntax_err:?}",
+    );
+    // Proof the killer connection survived its own syntax error.
+    let row = killer.query_one_sql("SELECT 1").await.expect("healthy after a syntax error");
+    assert_eq!(row.get_str(0), Ok(Some("1")));
+    killer.close().await.expect("close killer");
+}
+
+/// WITNESS (C6 — `statement_timeout`): a connection built with
+/// `with_statement_timeout(200ms)` has the SERVER abort a runaway query
+/// (`pg_sleep(2)`) with SQLSTATE `57014` `query_canceled`; the cancel is NOT a
+/// disconnect (`is_disconnect()` is false), so the connection RECOVERS and is
+/// reusable. A connection WITHOUT the timeout runs the same-shape sleep to
+/// completion.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn statement_timeout_aborts_a_runaway_query_and_the_connection_recovers() {
+    use std::time::Duration;
+
+    let cfg = ConnectConfig::new("/tmp", "smir-ant")
+        .database("postgres".to_string())
+        .with_statement_timeout(Duration::from_millis(200));
+    let mut c = Connection::connect(&cfg).await.expect("connect with statement_timeout");
+
+    let err = match c.query_one_sql("SELECT pg_sleep(2)").await {
+        Err(e) => e,
+        Ok(_) => panic!("pg_sleep(2) must be aborted by statement_timeout=200ms"),
+    };
+    match &err {
+        DriverError::Db(db) => assert!(
+            db.is_code("57014"),
+            "statement_timeout must abort with 57014 query_canceled, got {}",
+            db.code(),
+        ),
+        other => panic!("statement_timeout must surface as DriverError::Db(57014), got {other:?}"),
+    }
+    // A statement_timeout abort is a RECOVERABLE server error, never a disconnect.
+    assert!(!err.is_disconnect(), "a statement_timeout cancel is not a disconnect");
+    let row = c.query_one_sql("SELECT 1").await.expect("connection reusable after statement_timeout");
+    assert_eq!(row.get_str(0), Ok(Some("1")));
+    c.close().await.expect("close");
+
+    // WITHOUT the timeout, the same-shape sleep runs to completion.
+    let plain = ConnectConfig::new("/tmp", "smir-ant").database("postgres".to_string());
+    let mut c2 = Connection::connect(&plain).await.expect("connect without statement_timeout");
+    let done = c2.query_one_sql("SELECT pg_sleep(0.3)").await.expect("no timeout — sleep completes");
+    assert!(done.get_str(0).is_ok(), "the completed pg_sleep row is readable (void)");
+    c2.close().await.expect("close");
+}
+
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn connect_and_ping() {

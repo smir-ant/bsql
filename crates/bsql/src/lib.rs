@@ -217,6 +217,27 @@ pub trait BackendError {
     /// `DriverError::NoRows`; SQLite `SqliteError::NoRows`) — lets a generic
     /// consumer treat an empty `fetch_one` identically on both backends.
     fn is_no_rows(&self) -> bool;
+    /// The connection / database handle is no longer usable — RECONNECT (or, on
+    /// SQLite, reopen) rather than retrying on the same handle. Distinct from a
+    /// per-query error the connection survives.
+    ///
+    /// The concept is honestly DIFFERENT across backends but reads the SAME:
+    /// - **PostgreSQL** — a networked connection that DIED mid-operation: a
+    ///   dropped socket / EOF / reset, a fatal liveness-deadline (a silently
+    ///   vanished peer), or a connection-broken server error (the `08` class,
+    ///   `57P01`/`57P02`/`57P03` admin/crash shutdown). Deliberately FALSE for a
+    ///   `57014` `query_canceled` (a `statement_timeout` or `CancelToken` cancel
+    ///   leaves the connection reusable) and for every ordinary server error.
+    ///   Forwards to `DriverError::is_disconnect`.
+    /// - **SQLite** — IN-PROCESS, so it never network-disconnects; the analogue is
+    ///   a BROKEN HANDLE/FILE (`SQLITE_IOERR` / `SQLITE_CORRUPT` /
+    ///   `SQLITE_CANTOPEN` / `SQLITE_NOTADB`), whose recovery is a fresh handle.
+    ///   FALSE for a `SQLITE_BUSY` retry, an interrupt, and every constraint /
+    ///   type error. Forwards to `SqliteError::is_disconnect`.
+    ///
+    /// So a cross-backend consumer's reconnect/reopen logic is ONE decision on
+    /// both backends.
+    fn is_disconnect(&self) -> bool;
 }
 
 // Name `DriverError` from whichever PostgreSQL driver is enabled. Both drivers
@@ -254,6 +275,11 @@ impl BackendError for PgDriverError {
     fn is_no_rows(&self) -> bool {
         matches!(self, PgDriverError::NoRows)
     }
+    fn is_disconnect(&self) -> bool {
+        // Fully-qualified to the inherent method (which classifies the full
+        // variant set), so this forwards rather than recursing into the trait.
+        PgDriverError::is_disconnect(self)
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -282,6 +308,11 @@ impl BackendError for bsql_sqlite::SqliteError {
     }
     fn is_no_rows(&self) -> bool {
         matches!(self, bsql_sqlite::SqliteError::NoRows)
+    }
+    fn is_disconnect(&self) -> bool {
+        // Inherent method (broken-handle codes: IOERR / CORRUPT / CANTOPEN /
+        // NOTADB); fully-qualified so it forwards rather than recursing.
+        bsql_sqlite::SqliteError::is_disconnect(self)
     }
 }
 

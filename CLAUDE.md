@@ -539,6 +539,37 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 
 - No `expect()` or `unwrap()` in production code
 - Error types: `DriverError::Db(DbError)` for server errors with SQLSTATE, `DriverError::Config` for pre-connect validation, `DriverError::NoRows` for empty results
+- **Reconnect vs. retry — `DriverError::is_disconnect()`** (both PG drivers; a
+  cross-backend peer `SqliteError::is_disconnect()` / `BackendError::is_disconnect()`).
+  Draws the EXACT line a resilient consumer needs — "the connection DIED
+  mid-operation, RECONNECT" vs. "the server rejected my query but the connection
+  is fine, fix the query" — by construction, never a string-match heuristic. It is
+  a PREDICATE over the existing classified variant set (no new variant): `true`
+  for `Io` (a dropped socket / EOF / reset — the transport is dead), `NotReady`
+  (the linear liveness token was already taken by a prior fatal error), `Timeout`
+  (a FATAL mid-command read deadline — the pool's dead-peer liveness bound, a
+  silently vanished peer), and `Db` whose SQLSTATE is connection-broken (the whole
+  `08` connection-exception class, or the whole `57P` operator-intervention
+  termination/refusal subclass — `57P01`/`57P02` admin/crash shutdown, `57P03`
+  cannot-connect, `57P04` database-dropped, `57P05` idle-session-timeout, matched
+  by class prefix like `08`, via the new `DbError::is_connection_error()`
+  predicate). It is `false`
+  for every per-query error the connection survives — CRUCIALLY `57014`
+  `query_canceled` (a `statement_timeout` abort or a `CancelToken` cancel leaves
+  the connection drained + reusable, so a cancel is never a disconnect), a syntax
+  error, a constraint violation, `NoRows`, `Config`, `PoolTimeout`, a decode /
+  column error. The `DriverError` match is EXHAUSTIVE (no wildcard), so a future
+  variant forces a classification decision. Cross-backend honesty: SQLite is
+  IN-PROCESS (never network-disconnects), so its `is_disconnect()` maps to the
+  broken-HANDLE/FILE codes (`SQLITE_IOERR` / `SQLITE_CORRUPT` / `SQLITE_CANTOPEN`
+  / `SQLITE_NOTADB`, whose recovery is a fresh handle), and is `false` for a
+  `SQLITE_BUSY` retry, an interrupt, and every constraint/type error — so a
+  generic consumer's reconnect/reopen logic is ONE decision on both backends.
+  Witnessed live on both PG drivers (`is_disconnect_true_on_terminated_backend...`:
+  a `pg_terminate_backend` mid-flight classifies `true`, a syntax error `false`,
+  the connection surviving its own syntax error) + offline unit tests for every
+  variant's classification (PG core + SQLite) + the cross-backend
+  `BackendError::is_disconnect` witness.
 - `ConnectConfig` is `#[non_exhaustive]` — construct via `new()` + builder methods
   (`footprint_pin!`-ed at 152 bytes)
 - **Pool liveness — `get()` is BOUNDED even on a dead peer.** The pool
@@ -708,6 +739,33 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   is the classified `SqliteError::Interrupted`; the connection stays reusable).
   Both PG drivers' cancel is witnessed by the `--ignored` `cancel_token_stops_an_inflight_query`
   live tests; SQLite's by `crates/sqlite/driver/tests/cancel.rs`.
+- **Server-side `statement_timeout` — `ConnectConfig::with_statement_timeout(Duration)`.**
+  The SERVER-side complement to the client `CancelToken`, and the standard
+  production guardrail against a runaway query: PostgreSQL aborts any statement
+  running longer than the budget with SQLSTATE `57014` `query_canceled`, and the
+  connection is left drained + REUSABLE (a `statement_timeout` abort is NOT a
+  disconnect — `is_disconnect()` is false, so the guardrail sheds a slow query
+  without killing the pooled connection). Implemented as a footprint-neutral
+  convenience over the EXISTING startup-parameter map (it inserts
+  `("statement_timeout", <ms>)` via `with_startup_param`, adding NO `ConnectConfig`
+  field — the 152 B pin is untouched), CHOSEN over a per-query `SET
+  statement_timeout` round trip (which costs an extra RTT and is not session-wide)
+  and over a new typed field (which would break the footprint pin and format into
+  the same map anyway). As a startup-packet GUC it applies from before the first
+  query and becomes the session's reset value, so it SURVIVES a pooled
+  connection's `RESET ALL` on checkout — the guardrail persists across checkouts.
+  The `Duration` maps to PostgreSQL's integer-millisecond GUC: `Duration::ZERO` →
+  `"0"` (PG's own convention: DISABLED — the explicit opt-out); a non-zero
+  sub-millisecond duration rounds UP to `1` ms (never DOWN to `0`, which would
+  silently weaken the guardrail into "disabled"); and a duration whose whole
+  milliseconds exceed PG's 32-bit GUC ceiling (`i32::MAX` ms ≈ 24.8 days) is
+  capped there so an enormous `Duration` never produces a value the server
+  rejects. Witnessed live on both drivers
+  (`statement_timeout_aborts_a_runaway_query_and_the_connection_recovers`: a
+  `with_statement_timeout(200ms)` connection aborts `SELECT pg_sleep(2)` with a
+  classified `57014` and then reuses the connection, while a connection WITHOUT
+  the timeout runs the same sleep to completion) plus offline unit tests for the
+  ms formatting / zero / sub-ms / cap.
 - Transport (both drivers) is chosen by libpq's rule, centralized once in
   `core::resolve_endpoint`: an ABSOLUTE-PATH host (begins with `/`, e.g.
   `ConnectConfig::new("/tmp", …)`, `PGHOST=/var/run/postgresql`, or the DSN

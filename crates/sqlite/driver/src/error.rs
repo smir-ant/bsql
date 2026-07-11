@@ -209,6 +209,18 @@ const PRIMARY_BUSY: i32 = 5;
 /// Primary `SQLITE_CONSTRAINT`.
 const PRIMARY_CONSTRAINT: i32 = 19;
 
+// Primary result codes for a BROKEN database handle/file — the in-process
+// analogue of a lost network connection, used by [`SqliteError::is_disconnect`].
+// FROZEN by SQLite's result-code compatibility guarantee (never renumbered).
+/// Primary `SQLITE_IOERR` — a disk I/O error.
+const PRIMARY_IOERR: i32 = 10;
+/// Primary `SQLITE_CORRUPT` — the database disk image is malformed.
+const PRIMARY_CORRUPT: i32 = 11;
+/// Primary `SQLITE_CANTOPEN` — unable to open the database file.
+const PRIMARY_CANTOPEN: i32 = 14;
+/// Primary `SQLITE_NOTADB` — the file is not a database.
+const PRIMARY_NOTADB: i32 = 26;
+
 // SQLite EXTENDED constraint codes (`SQLITE_CONSTRAINT | (subtype << 8)`), used
 // by the specific per-class predicates below. These values are FROZEN by
 // SQLite's result-code compatibility guarantee (a code is never renumbered), so
@@ -315,6 +327,31 @@ impl SqliteError {
     pub fn is_check_violation(&self) -> bool {
         self.code() == Some(SQLITE_CONSTRAINT_CHECK)
     }
+
+    /// Check if the database HANDLE/FILE is broken — a disk I/O error
+    /// (`SQLITE_IOERR`), a corrupt/malformed image (`SQLITE_CORRUPT`), an
+    /// unopenable file (`SQLITE_CANTOPEN`), or a not-a-database file
+    /// (`SQLITE_NOTADB`).
+    ///
+    /// This is the SQLite peer of PostgreSQL's `DriverError::is_disconnect` — but
+    /// the concept is HONESTLY DIFFERENT: SQLite runs IN-PROCESS, so it never
+    /// network-disconnects. What it CAN hit is a broken handle/file, and a fresh
+    /// handle (reopen) is the analogous recovery. A generic cross-backend consumer
+    /// reads this identically to the PostgreSQL disconnect via
+    /// `BackendError::is_disconnect`, so its reconnect/reopen logic is one mental
+    /// model on both backends.
+    ///
+    /// Deliberately EXCLUDES `SQLITE_BUSY` (a lock contention that RETRIES — see
+    /// [`is_busy`](Self::is_busy)), an [`Interrupted`](SqliteError::Interrupted)
+    /// cancel (the connection stays usable), and every constraint / type error
+    /// (the statement is at fault, not the database).
+    #[must_use]
+    pub fn is_disconnect(&self) -> bool {
+        matches!(
+            self.primary_code(),
+            Some(PRIMARY_IOERR | PRIMARY_CORRUPT | PRIMARY_CANTOPEN | PRIMARY_NOTADB)
+        )
+    }
 }
 
 impl core::fmt::Display for SqliteError {
@@ -412,5 +449,43 @@ impl From<rusqlite::Error> for SqliteError {
             code,
             message: e.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite(code: i32) -> SqliteError {
+        SqliteError::Sqlite { code: Some(code), message: "x".to_string() }
+    }
+
+    /// A broken-handle/file code (I/O error, corruption, unopenable, not-a-DB)
+    /// classifies as a disconnect — including an EXTENDED subtype, which masks to
+    /// the same primary code.
+    #[test]
+    fn is_disconnect_true_for_broken_handle_codes() {
+        // Primary codes.
+        assert!(sqlite(PRIMARY_IOERR).is_disconnect());
+        assert!(sqlite(PRIMARY_CORRUPT).is_disconnect());
+        assert!(sqlite(PRIMARY_CANTOPEN).is_disconnect());
+        assert!(sqlite(PRIMARY_NOTADB).is_disconnect());
+        // Extended subtypes mask to the primary: SQLITE_IOERR_READ = 10 | (1<<8),
+        // SQLITE_CORRUPT_VTAB = 11 | (1<<8).
+        assert!(sqlite(PRIMARY_IOERR | (1 << 8)).is_disconnect());
+        assert!(sqlite(PRIMARY_CORRUPT | (1 << 8)).is_disconnect());
+    }
+
+    /// A busy/locked contention (retryable), an interrupt (connection usable), a
+    /// constraint violation, and a code-less error are NOT disconnects.
+    #[test]
+    fn is_disconnect_false_for_recoverable_and_statement_errors() {
+        assert!(!sqlite(PRIMARY_BUSY).is_disconnect(), "busy is a retry, not a disconnect");
+        assert!(!sqlite(SQLITE_CONSTRAINT_UNIQUE).is_disconnect());
+        assert!(!SqliteError::Interrupted.is_disconnect(), "an interrupt leaves the connection usable");
+        assert!(!SqliteError::NoRows.is_disconnect());
+        assert!(!SqliteError::TooManyRows.is_disconnect());
+        // A `Sqlite` without a preserved code cannot be classified as broken.
+        assert!(!SqliteError::Sqlite { code: None, message: "x".to_string() }.is_disconnect());
     }
 }

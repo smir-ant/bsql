@@ -274,6 +274,93 @@ fn cancel_token_stops_an_inflight_query_sync() {
     conn.close().expect("close");
 }
 
+/// WITNESS (C5 — `is_disconnect`): a connection whose backend is TERMINATED
+/// mid-flight fails its in-flight query with an error that
+/// `DriverError::is_disconnect()` classifies TRUE (the "reconnect" signal),
+/// while a plain SYNTAX error on a healthy connection classifies FALSE.
+#[test]
+#[ignore = "requires local PG"]
+fn is_disconnect_true_on_terminated_backend_false_on_syntax_error_sync() {
+    use std::time::Duration;
+
+    let mut victim = Connection::connect(&unix_config()).expect("connect victim");
+    let killer = Connection::connect(&unix_config()).expect("connect killer");
+    let pid = victim.backend_pid();
+    assert!(pid > 0, "backend pid must be captured from the handshake");
+
+    // Terminate the victim MID-FLIGHT from a background thread while the main
+    // thread blocks in a 3s sleep. The killer connection is returned so the
+    // syntax-error half can reuse it.
+    let terminator = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let mut killer = killer;
+        let terminated = killer
+            .query_one_sql(&format!("SELECT pg_terminate_backend({pid})"))
+            .expect("terminate the victim backend");
+        assert_eq!(terminated.get_str(0), Ok(Some("t")), "pg_terminate_backend returned true");
+        killer
+    });
+    let victim_res = victim.query_one_sql("SELECT pg_sleep(3)");
+    let mut killer = terminator.join().expect("terminator thread joins");
+
+    let disconnect_err = match victim_res {
+        Err(e) => e,
+        Ok(_) => panic!("a terminated backend must fail the in-flight query"),
+    };
+    assert!(
+        disconnect_err.is_disconnect(),
+        "a terminated connection must classify as a disconnect, got {disconnect_err:?}",
+    );
+
+    let syntax_err = match killer.query_one_sql("SELECT bogus not valid sql !!") {
+        Err(e) => e,
+        Ok(_) => panic!("a syntax error must fail"),
+    };
+    assert!(
+        !syntax_err.is_disconnect(),
+        "a syntax error is not a disconnect (the connection is fine), got {syntax_err:?}",
+    );
+    let row = killer.query_one_sql("SELECT 1").expect("healthy after a syntax error");
+    assert_eq!(row.get_str(0), Ok(Some("1")));
+    killer.close().expect("close killer");
+}
+
+/// WITNESS (C6 — `statement_timeout`): a connection built with
+/// `with_statement_timeout(200ms)` has the SERVER abort a runaway query with
+/// SQLSTATE `57014`; the cancel is NOT a disconnect, so the connection RECOVERS.
+/// A connection WITHOUT the timeout runs the same sleep to completion.
+#[test]
+#[ignore = "requires local PG"]
+fn statement_timeout_aborts_a_runaway_query_and_the_connection_recovers_sync() {
+    use std::time::Duration;
+
+    let cfg = unix_config().with_statement_timeout(Duration::from_millis(200));
+    let mut c = Connection::connect(&cfg).expect("connect with statement_timeout");
+
+    let err = match c.query_one_sql("SELECT pg_sleep(2)") {
+        Err(e) => e,
+        Ok(_) => panic!("pg_sleep(2) must be aborted by statement_timeout=200ms"),
+    };
+    match &err {
+        bsql_postgres_sync::DriverError::Db(db) => assert!(
+            db.is_code("57014"),
+            "statement_timeout must abort with 57014 query_canceled, got {}",
+            db.code(),
+        ),
+        other => panic!("statement_timeout must surface as DriverError::Db(57014), got {other:?}"),
+    }
+    assert!(!err.is_disconnect(), "a statement_timeout cancel is not a disconnect");
+    let row = c.query_one_sql("SELECT 1").expect("connection reusable after statement_timeout");
+    assert_eq!(row.get_str(0), Ok(Some("1")));
+    c.close().expect("close");
+
+    // WITHOUT the timeout, the same-shape sleep runs to completion.
+    let mut c2 = Connection::connect(&unix_config()).expect("connect without statement_timeout");
+    let done = c2.query_one_sql("SELECT pg_sleep(0.3)").expect("no timeout — sleep completes");
+    assert!(done.get_str(0).is_ok(), "the completed pg_sleep row is readable (void)");
+    c2.close().expect("close");
+}
+
 #[test]
 #[ignore = "requires local PG"]
 fn connect_and_ping() {

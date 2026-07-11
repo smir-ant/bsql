@@ -48,6 +48,15 @@ fn pg_driver_error_classifies_offline() {
     assert!(!BackendError::is_foreign_key_violation(&other));
     assert!(!BackendError::is_check_violation(&other));
     assert_eq!(BackendError::sqlstate(&other), Some("42P01"));
+
+    // Cross-backend disconnect classification: a connection-broken SQLSTATE (the
+    // `08` class, `57P01` admin shutdown) is a disconnect; a `57014` cancel and an
+    // ordinary server error are not.
+    assert!(BackendError::is_disconnect(&pg_db_error("08006")));
+    assert!(BackendError::is_disconnect(&pg_db_error("57P01")));
+    assert!(!BackendError::is_disconnect(&pg_db_error("57014")));
+    assert!(!BackendError::is_disconnect(&unique));
+    assert!(!BackendError::is_disconnect(&other));
 }
 
 // ─── SQLite (in-process: real engine errors) ─────────────────────────────────
@@ -106,6 +115,19 @@ fn sqlite_error_classifies_in_process() {
     assert!(!BackendError::is_foreign_key_violation(&syntax));
     assert!(!BackendError::is_check_violation(&syntax));
     assert!(!BackendError::is_too_many_rows(&syntax));
+
+    // A constraint / syntax error is NOT a disconnect on SQLite either — the
+    // handle stays usable (the in-process analogue of "the connection is fine").
+    // (The broken-handle codes IOERR/CORRUPT are unit-tested in the sqlite crate;
+    // they cannot be provoked against a healthy in-memory database here.)
+    assert!(!BackendError::is_disconnect(&uniq));
+    assert!(!BackendError::is_disconnect(&syntax));
+    // The handle still answers a query — proving the errors above were not
+    // connection-fatal.
+    assert_eq!(
+        conn.query_one_sql("SELECT 1").and_then(|r| r.get::<i64>(0)).ok(),
+        Some(1_i64),
+    );
 }
 
 // ─── PostgreSQL (live: real server error) ────────────────────────────────────
