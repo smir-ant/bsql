@@ -299,6 +299,21 @@ pub enum DriverError {
     /// A pre-connect configuration / validation error; the `&'static str` names
     /// the specific problem and the fix.
     Config(&'static str),
+    /// A pre-connect configuration error whose message is computed at runtime and
+    /// so cannot be a `&'static str` — a DSN / environment parse failure naming the
+    /// offending value (e.g. `invalid port: 99999`, `unknown DSN parameter: sslmod`).
+    ///
+    /// The dynamic sibling of [`Config`](Self::Config): a `Box<str>` (16 B, the
+    /// same width as the existing widest payloads) rather than a `String` (24 B),
+    /// since the message is read-only once built, so the spare capacity word is
+    /// dead weight — and so this variant does NOT widen [`DriverError`] past its
+    /// pinned 16-byte payload. Kept a SEPARATE variant rather than changing
+    /// `Config` to `Cow<'static, str>` (which would be 24 B and re-inflate the
+    /// enum, and churn every static `Config("…")` construction site) or to
+    /// `Box<str>` (which would force every static message to allocate). Both
+    /// classify as configuration errors — [`is_config`](Self::is_config) is `true`
+    /// for either, and neither is a disconnect.
+    ConfigDynamic(Box<str>),
     /// A result row exceeded the 32-bit on-arena bounds (more columns,
     /// offset, or cell length than `u32`/`u16` can address). Never silently
     /// truncated — the row is rejected so no corrupted bytes are surfaced.
@@ -401,8 +416,10 @@ pub enum DriverError {
 
 // Footprint pin: a sum type whose size is set by its widest variant plus the
 // discriminant word. With the dominant `DbError` boxed (`Db(Box<DbError>)` = one
-// pointer), the widest payloads are the two 16-byte fat pointers `Config(&'static
-// str)` and `PayloadParse(Box<str>)`; `Decode(DecodeError)` (12 B, after its
+// pointer), the widest payloads are the 16-byte fat pointers `Config(&'static
+// str)`, `ConfigDynamic(Box<str>)`, and `PayloadParse(Box<str>)` (all 16 B, so
+// the dynamic-config carrier does NOT re-inflate the enum);
+// `Decode(DecodeError)` (12 B, after its
 // `TruncatedColumnData` counts narrowed `usize -> u32`) and `Column(ColumnError)`
 // (also 12 B, after `OutOfRange` narrowed `usize -> u32`) no longer set the width.
 // So 16 B payload + 8 B discriminant = 24 B, down from 32 (and 120 before boxing).
@@ -486,6 +503,7 @@ impl DriverError {
             // rather than silently defaulting.
             Self::NoRows
             | Self::Config(_)
+            | Self::ConfigDynamic(_)
             | Self::RowTooLarge
             | Self::MixedResultWidth
             | Self::UnclassifiedFailure
@@ -501,6 +519,16 @@ impl DriverError {
             | Self::Column(_)
             | Self::PayloadParse(_) => false,
         }
+    }
+
+    /// `true` if this is a pre-connect configuration / validation error —
+    /// EITHER the `&'static str` [`Config`](Self::Config) or the runtime-message
+    /// [`ConfigDynamic`](Self::ConfigDynamic). One check for "the connection was
+    /// misconfigured" so a consumer need not know the two carriers exist (a
+    /// static message vs a DSN/env parse failure that names its offending value).
+    #[must_use]
+    pub fn is_config(&self) -> bool {
+        matches!(self, Self::Config(_) | Self::ConfigDynamic(_))
     }
 
     /// `true` if this is a server error whose SQLSTATE says a CACHED prepared
@@ -541,6 +569,7 @@ impl fmt::Display for DriverError {
             ),
             Self::NoRows => write!(f, "query returned no rows"),
             Self::Config(msg) => write!(f, "config error: {msg}"),
+            Self::ConfigDynamic(msg) => write!(f, "config error: {msg}"),
             Self::RowTooLarge => write!(f, "result row too large to represent (exceeds 32-bit arena bounds)"),
             Self::MixedResultWidth => write!(f, "multi-statement batch mixed result-row widths; a single result set cannot represent statements returning different column counts — run them separately"),
             Self::UnclassifiedFailure => write!(f, "server reported a failure with no classified cause"),
@@ -582,6 +611,7 @@ impl std::error::Error for DriverError {
             Self::NotReady
             | Self::NoRows
             | Self::Config(_)
+            | Self::ConfigDynamic(_)
             | Self::RowTooLarge
             | Self::MixedResultWidth
             | Self::UnclassifiedFailure
@@ -728,6 +758,7 @@ mod tests {
         let usable = [
             DriverError::NoRows,
             DriverError::Config("x"),
+            DriverError::ConfigDynamic("invalid port: 99999".into()),
             DriverError::RowTooLarge,
             DriverError::MixedResultWidth,
             DriverError::UnclassifiedFailure,
@@ -743,5 +774,25 @@ mod tests {
         for e in &usable {
             assert!(!e.is_disconnect(), "{e:?} must NOT classify as a disconnect");
         }
+    }
+
+    /// A runtime-message config error (a DSN / env parse failure) is a classified
+    /// `ConfigDynamic`, matchable by a consumer, `is_config()`-true, never a
+    /// disconnect, and displays with the same `config error:` prefix as the static
+    /// `Config` — so the two carriers read identically.
+    #[test]
+    fn config_dynamic_is_a_classified_matchable_config_error() {
+        let err = DriverError::ConfigDynamic("invalid port: 99999".into());
+        assert!(matches!(err, DriverError::ConfigDynamic(_)));
+        assert!(err.is_config(), "ConfigDynamic must classify as a config error");
+        assert!(DriverError::Config("x").is_config(), "static Config is a config error too");
+        assert!(!err.is_disconnect(), "a config error is never a disconnect");
+        assert_eq!(err.to_string(), "config error: invalid port: 99999");
+        // The static and dynamic carriers share the Display prefix — a consumer
+        // reading the message cannot tell (nor should care) which carrier it is.
+        assert_eq!(
+            DriverError::Config("invalid port: 99999").to_string(),
+            err.to_string(),
+        );
     }
 }

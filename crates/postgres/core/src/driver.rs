@@ -936,6 +936,21 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// server error ONCE (`0A000` / `26000`) while the cache reclaims the stale
     /// statement; the next sighting re-prepares against the current schema, so a
     /// stale result is never returned silently.
+    ///
+    /// # Parameters are borrowed (`&P`), the typed flagship's are by value
+    ///
+    /// The DYNAMIC parameterized verbs take `params: &P` where `P: ParamsWriter`,
+    /// whereas the compile-checked flagship [`query`](Self::query) takes its
+    /// concrete `Q::Params<'p>` tuple BY VALUE. This is a DELIBERATE reflection of
+    /// two different roles, not an accidental inconsistency: `P: ParamsWriter` is
+    /// an UNBOUNDED generic the verb only READS (it needs `&self` to write the
+    /// Bind block), so a borrow is the idiomatic read-only-generic signature —
+    /// exactly like `fn f<T: Display>(x: &T)`. The flagship's `Q::Params<'p>` is a
+    /// CONCRETE macro-emitted associated type, constructed inline at the call site,
+    /// for which by-value gives the cleanest flagship call. Aligning the two would
+    /// only drop one `&` at the call site — a purely cosmetic change with no
+    /// correctness, safety, or performance payoff — while de-idiomatizing the
+    /// read-only generic; so the shapes are kept as-is by design.
     pub async fn query_params<P: ParamsWriter>(
         &mut self,
         sql: &str,

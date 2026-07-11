@@ -4,6 +4,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Build the classified [`DriverError::ConfigDynamic`](crate::DriverError) that
+/// carries a runtime-computed DSN / environment parse message (one that names its
+/// offending value, so it cannot be a `&'static str`). Centralized so every
+/// pre-connect parse failure routes through the SAME classified carrier — a
+/// consumer matches [`DriverError`](crate::DriverError) (or
+/// [`is_config`](crate::DriverError::is_config)) uniformly, never a bare `String`.
+fn config_error(msg: impl Into<Box<str>>) -> crate::DriverError {
+    crate::DriverError::ConfigDynamic(msg.into())
+}
+
 /// SSL negotiation mode.
 ///
 /// # The default is threat-scoped, not a fixed value
@@ -250,10 +260,10 @@ impl ConnectConfig {
     /// An EMPTY authority host with no `host=` parameter (`postgres://u@/db`) is a
     /// loud error naming the `host=` form — never a silent connect to a
     /// port-only TCP address.
-    pub fn from_dsn(dsn: &str) -> Result<Self, String> {
+    pub fn from_dsn(dsn: &str) -> Result<Self, crate::DriverError> {
         let s = dsn.strip_prefix("postgres://")
             .or_else(|| dsn.strip_prefix("postgresql://"))
-            .ok_or_else(|| "DSN must start with postgres:// or postgresql://".to_string())?;
+            .ok_or_else(|| config_error("DSN must start with postgres:// or postgresql://"))?;
 
         // Split query string
         let (main, query) = match s.split_once('?') {
@@ -265,10 +275,9 @@ impl ConnectConfig {
         let (userinfo, hostpath) = match main.split_once('@') {
             Some((u, h)) => (u, h),
             None => {
-                return Err(
-                    "missing '@' in DSN (expected postgres://user[:password]@host[:port][/database])"
-                        .to_string(),
-                );
+                return Err(config_error(
+                    "missing '@' in DSN (expected postgres://user[:password]@host[:port][/database])",
+                ));
             }
         };
 
@@ -279,7 +288,7 @@ impl ConnectConfig {
         };
 
         if user.is_empty() {
-            return Err("empty user in DSN".to_string());
+            return Err(config_error("empty user in DSN"));
         }
 
         // Parse host:port/database
@@ -298,12 +307,12 @@ impl ConnectConfig {
             Some(rest) => match rest.split_once(']') {
                 Some((addr, after)) => {
                     let port = match after.strip_prefix(':') {
-                        Some(p) => p.parse::<u16>().map_err(|_| format!("invalid port: {p}"))?,
+                        Some(p) => p.parse::<u16>().map_err(|_| config_error(format!("invalid port: {p}")))?,
                         None if after.is_empty() => 5432,
                         None => {
-                            return Err(format!(
+                            return Err(config_error(format!(
                                 "invalid characters after IPv6 literal in DSN host: {after:?}"
-                            ));
+                            )));
                         }
                     };
                     // Keep the brackets: they are what `ToSocketAddrs` dials, and
@@ -312,12 +321,14 @@ impl ConnectConfig {
                     (format!("[{addr}]"), port)
                 }
                 None => {
-                    return Err(format!("unterminated IPv6 literal in DSN host: {hostport:?}"));
+                    return Err(config_error(format!(
+                        "unterminated IPv6 literal in DSN host: {hostport:?}"
+                    )));
                 }
             },
             None => match hostport.rsplit_once(':') {
                 Some((h, p)) => {
-                    let port = p.parse::<u16>().map_err(|_| format!("invalid port: {p}"))?;
+                    let port = p.parse::<u16>().map_err(|_| config_error(format!("invalid port: {p}")))?;
                     (h.to_string(), port)
                 }
                 None => (hostport.to_string(), 5432),
@@ -343,7 +354,11 @@ impl ConnectConfig {
                 // SSL without the caller knowing. Reject it loudly instead.
                 let (k, v) = match param.split_once('=') {
                     Some(kv) => kv,
-                    None => return Err(format!("malformed DSN parameter (missing '='): {param}")),
+                    None => {
+                        return Err(config_error(format!(
+                            "malformed DSN parameter (missing '='): {param}"
+                        )));
+                    }
                 };
                 match k {
                     "host" => {
@@ -364,9 +379,9 @@ impl ConnectConfig {
                             "prefer" => SslMode::Prefer,
                             "require" => SslMode::Require,
                             other => {
-                                return Err(format!(
+                                return Err(config_error(format!(
                                     "unknown sslmode: {other} (valid: disable, prefer, require)"
-                                ));
+                                )));
                             }
                         });
                     }
@@ -377,14 +392,14 @@ impl ConnectConfig {
                             "prefer" => ChannelBindingMode::Prefer,
                             "require" => ChannelBindingMode::Require,
                             other => {
-                                return Err(format!(
+                                return Err(config_error(format!(
                                     "unknown channel_binding: {other} (valid: disable, prefer, require)"
-                                ));
+                                )));
                             }
                         };
                     }
                     "connect_timeout" => {
-                        timeout = v.parse().map_err(|_| format!("invalid timeout: {v}"))?;
+                        timeout = v.parse().map_err(|_| config_error(format!("invalid timeout: {v}")))?;
                     }
                     "sslrootcert" => {
                         // Read the CA bundle from the given path NOW. libpq reads
@@ -396,7 +411,7 @@ impl ConnectConfig {
                         // on an invalid/empty bundle there), consistent with how
                         // startup parameters are stored raw and validated at connect.
                         let bytes = std::fs::read(v)
-                            .map_err(|e| format!("cannot read sslrootcert file {v}: {e}"))?;
+                            .map_err(|e| config_error(format!("cannot read sslrootcert file {v}: {e}")))?;
                         ca_roots_pem = Some(Arc::from(bytes));
                     }
                     // An unrecognised key is a misconfiguration (e.g. a
@@ -404,7 +419,7 @@ impl ConnectConfig {
                     // leave the default `prefer`, downgrading security).
                     // Reject it loudly, consistent with how an unknown
                     // sslmode VALUE is already rejected above.
-                    other => return Err(format!("unknown DSN parameter: {other}")),
+                    other => return Err(config_error(format!("unknown DSN parameter: {other}"))),
                 }
             }
         }
@@ -419,12 +434,11 @@ impl ConnectConfig {
         // it at parse time with the fix — the `host=` form (the only way to name a
         // unix-socket directory, whose leading `/` cannot ride the URL authority).
         if host.is_empty() {
-            return Err(
+            return Err(config_error(
                 "empty host in DSN authority; give the host via the \"host\" query \
                  parameter — e.g. \"?host=/var/run/postgresql\" for a unix-domain \
-                 socket, or \"?host=db.example.com\" for TCP"
-                    .to_string(),
-            );
+                 socket, or \"?host=db.example.com\" for TCP",
+            ));
         }
 
         Ok(Self {
@@ -452,19 +466,19 @@ impl ConnectConfig {
     /// misconfiguration and is rejected with `Err` — a typo'd `PGPORT=abc` or
     /// `PGSSLMODE=requ1re` never silently degrades to a default that could send
     /// the connection to the wrong port or strip SSL.
-    pub fn from_env() -> Result<Self, String> {
+    pub fn from_env() -> Result<Self, crate::DriverError> {
         use std::env::VarError;
 
         let host = match std::env::var("PGHOST") {
             Ok(h) => h,
             Err(VarError::NotPresent) => "localhost".to_string(),
-            Err(VarError::NotUnicode(_)) => return Err("PGHOST is not valid UTF-8".to_string()),
+            Err(VarError::NotUnicode(_)) => return Err(config_error("PGHOST is not valid UTF-8")),
         };
 
         let port = match std::env::var("PGPORT") {
-            Ok(p) => p.parse::<u16>().map_err(|_| format!("invalid PGPORT: {p}"))?,
+            Ok(p) => p.parse::<u16>().map_err(|_| config_error(format!("invalid PGPORT: {p}")))?,
             Err(VarError::NotPresent) => 5432,
-            Err(VarError::NotUnicode(_)) => return Err("PGPORT is not valid UTF-8".to_string()),
+            Err(VarError::NotUnicode(_)) => return Err(config_error("PGPORT is not valid UTF-8")),
         };
 
         let user = match std::env::var("PGUSER") {
@@ -472,21 +486,21 @@ impl ConnectConfig {
             Err(VarError::NotPresent) => match std::env::var("USER") {
                 Ok(u) => u,
                 Err(VarError::NotPresent) => "postgres".to_string(),
-                Err(VarError::NotUnicode(_)) => return Err("USER is not valid UTF-8".to_string()),
+                Err(VarError::NotUnicode(_)) => return Err(config_error("USER is not valid UTF-8")),
             },
-            Err(VarError::NotUnicode(_)) => return Err("PGUSER is not valid UTF-8".to_string()),
+            Err(VarError::NotUnicode(_)) => return Err(config_error("PGUSER is not valid UTF-8")),
         };
 
         let database = match std::env::var("PGDATABASE") {
             Ok(d) => Some(d),
             Err(VarError::NotPresent) => None,
-            Err(VarError::NotUnicode(_)) => return Err("PGDATABASE is not valid UTF-8".to_string()),
+            Err(VarError::NotUnicode(_)) => return Err(config_error("PGDATABASE is not valid UTF-8")),
         };
 
         let password = match std::env::var("PGPASSWORD") {
             Ok(p) => Some(p),
             Err(VarError::NotPresent) => None,
-            Err(VarError::NotUnicode(_)) => return Err("PGPASSWORD is not valid UTF-8".to_string()),
+            Err(VarError::NotUnicode(_)) => return Err(config_error("PGPASSWORD is not valid UTF-8")),
         };
 
         let ssl_mode = match std::env::var("PGSSLMODE") {
@@ -498,13 +512,13 @@ impl ConnectConfig {
                 "require" => SslMode::Require,
                 // A typo here would otherwise silently fall to the default,
                 // which on a local endpoint permits a downgrade. Reject it loudly.
-                other => return Err(format!("unknown PGSSLMODE: {other}")),
+                other => return Err(config_error(format!("unknown PGSSLMODE: {other}"))),
             }),
             // Absent → defaulted (resolved per-endpoint at connect), NOT a fixed
             // `Prefer`: a remote host now defaults to `Require`, closing the
             // silent-plaintext-to-remote hole.
             Err(VarError::NotPresent) => None,
-            Err(VarError::NotUnicode(_)) => return Err("PGSSLMODE is not valid UTF-8".to_string()),
+            Err(VarError::NotUnicode(_)) => return Err(config_error("PGSSLMODE is not valid UTF-8")),
         };
 
         // `PGSSLROOTCERT` names a CA-bundle file; read it now (a present-but-
@@ -513,12 +527,12 @@ impl ConnectConfig {
         let ca_roots_pem = match std::env::var("PGSSLROOTCERT") {
             Ok(path) => {
                 let bytes = std::fs::read(&path)
-                    .map_err(|e| format!("cannot read PGSSLROOTCERT file {path}: {e}"))?;
+                    .map_err(|e| config_error(format!("cannot read PGSSLROOTCERT file {path}: {e}")))?;
                 Some(Arc::from(bytes))
             }
             Err(VarError::NotPresent) => None,
             Err(VarError::NotUnicode(_)) => {
-                return Err("PGSSLROOTCERT is not valid UTF-8".to_string())
+                return Err(config_error("PGSSLROOTCERT is not valid UTF-8"))
             }
         };
 
@@ -531,14 +545,14 @@ impl ConnectConfig {
                 "prefer" => ChannelBindingMode::Prefer,
                 "require" => ChannelBindingMode::Require,
                 other => {
-                    return Err(format!(
+                    return Err(config_error(format!(
                         "unknown PGCHANNELBINDING: {other} (valid: disable, prefer, require)"
-                    ));
+                    )));
                 }
             },
             Err(VarError::NotPresent) => ChannelBindingMode::Prefer,
             Err(VarError::NotUnicode(_)) => {
-                return Err("PGCHANNELBINDING is not valid UTF-8".to_string())
+                return Err(config_error("PGCHANNELBINDING is not valid UTF-8"))
             }
         };
 
@@ -1246,10 +1260,20 @@ mod tests {
         let err =
             ConnectConfig::from_dsn("postgres://u@h?sslrootcert=/no/such/bsql/test/ca.pem");
         match err {
-            Err(msg) => assert!(
-                msg.contains("sslrootcert"),
-                "the error must name the failing key, got {msg:?}",
-            ),
+            // A parse failure is now a CLASSIFIED `DriverError` a consumer can
+            // match (not a bare `String`); the informative message is preserved
+            // and reachable via Display.
+            Err(e) => {
+                assert!(
+                    matches!(e, crate::DriverError::ConfigDynamic(_)),
+                    "a DSN parse failure must be a classified config error, got {e:?}",
+                );
+                assert!(e.is_config(), "and it must classify as a config error");
+                assert!(
+                    e.to_string().contains("sslrootcert"),
+                    "the error must name the failing key, got {e}",
+                );
+            }
             Ok(_) => panic!("an unreadable sslrootcert file must not parse silently"),
         }
     }
@@ -1382,7 +1406,11 @@ mod tests {
     /// the offline proof that a DSN reaches the intended [`Endpoint`] without a
     /// live PG.
     fn dsn_endpoint(dsn: &str) -> Result<Endpoint, String> {
-        let cfg = ConnectConfig::from_dsn(dsn)?;
+        // `from_dsn` now returns a classified `DriverError`; this offline helper
+        // only asserts on the resolved endpoint (Ok cases) or that parsing failed
+        // (Err cases), so it flattens the error to its Display string — keeping the
+        // helper's `Result<_, String>` shape and every existing assertion intact.
+        let cfg = ConnectConfig::from_dsn(dsn).map_err(|e| e.to_string())?;
         Ok(resolve_endpoint(&cfg.host, cfg.port))
     }
 
@@ -1610,6 +1638,45 @@ mod tests {
         assert!(!ConnectConfig::new("localhost", "u").ssl_mode_is_explicit());
     }
 
+    /// WITNESS (D1): every `from_dsn` parse failure is a CLASSIFIED
+    /// [`DriverError`](crate::DriverError) a consumer can `match` on — not a bare
+    /// `String` — and the informative message (naming the offending value) is
+    /// preserved and reachable via Display. Covers a bad scheme, a bad port, an
+    /// empty user/host, and an unknown parameter.
+    #[test]
+    fn from_dsn_parse_failures_are_classified_matchable_driver_errors() {
+        // (dsn, a substring the preserved message must still contain)
+        let cases: &[(&str, &str)] = &[
+            ("mysql://u@h/db", "postgres://"),
+            ("postgres://u@h:99999/db", "invalid port: 99999"),
+            ("postgres://u@h:notaport/db", "invalid port: notaport"),
+            ("postgres://@h/db", "empty user"),
+            ("postgres://u@/db", "host"),
+            ("postgres://u@h?sslmode=verify-full", "unknown sslmode: verify-full"),
+            ("postgres://u@h?bogus=1", "unknown DSN parameter: bogus"),
+            ("postgres://u@h?sslmode", "missing '='"),
+        ];
+        for (dsn, needle) in cases {
+            match ConnectConfig::from_dsn(dsn) {
+                // A consumer matches the classified variant (or `is_config()`),
+                // never a stringly-typed error.
+                Err(e) => {
+                    assert!(
+                        matches!(e, crate::DriverError::ConfigDynamic(_)),
+                        "DSN {dsn:?} must fail as a classified ConfigDynamic, got {e:?}",
+                    );
+                    assert!(e.is_config(), "DSN {dsn:?} must classify as a config error");
+                    assert!(!e.is_disconnect(), "a parse error is never a disconnect");
+                    assert!(
+                        e.to_string().contains(needle),
+                        "DSN {dsn:?} error must preserve {needle:?}, got {e}",
+                    );
+                }
+                Ok(_) => panic!("DSN {dsn:?} must be a loud parse error, not a silent parse"),
+            }
+        }
+    }
+
     #[test]
     fn dsn_empty_authority_host_without_host_param_is_a_loud_error() {
         // `postgres://u@/tmp/db` parses `/tmp/db` as the DATABASE on an EMPTY host
@@ -1617,10 +1684,19 @@ mod tests {
         // Reject it at parse time, naming the `host=` fix — never a silent
         // port-only TCP connect.
         match ConnectConfig::from_dsn("postgres://u@/tmp/db") {
-            Err(msg) => assert!(
-                msg.contains("host") && msg.contains("query parameter"),
-                "the empty-host error must point at the host= form, got {msg:?}"
-            ),
+            // A classified `DriverError` a consumer can match, with the
+            // host=-form guidance preserved in the Display message.
+            Err(e) => {
+                assert!(
+                    matches!(e, crate::DriverError::ConfigDynamic(_)) && e.is_config(),
+                    "the empty-host error must be a classified config error, got {e:?}",
+                );
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("host") && msg.contains("query parameter"),
+                    "the empty-host error must point at the host= form, got {msg}"
+                );
+            }
             Ok(_) => panic!("an empty authority host must be a loud parse error"),
         }
     }

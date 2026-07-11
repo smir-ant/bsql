@@ -590,7 +590,7 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 ## Conventions
 
 - No `expect()` or `unwrap()` in production code
-- Error types: `DriverError::Db(DbError)` for server errors with SQLSTATE, `DriverError::Config` for pre-connect validation, `DriverError::NoRows` for empty results
+- Error types: `DriverError::Db(DbError)` for server errors with SQLSTATE, `DriverError::Config`/`DriverError::ConfigDynamic` for pre-connect validation, `DriverError::NoRows` for empty results. Pre-connect config validation is ONE classified family: `Config(&'static str)` carries a fixed message; `ConfigDynamic(Box<str>)` carries a runtime-computed one that names its offending value (an `invalid port: 99999` DSN/env parse failure). `ConnectConfig::from_dsn` / `from_env` therefore return `Result<Self, DriverError>` (NOT a bare `String` — a consumer can `match` the classified error, or use `DriverError::is_config()` which is `true` for either carrier). `ConfigDynamic`'s `Box<str>` is 16 B, the same width as the enum's existing widest payload, so `DriverError` stays pinned at 24 B.
 - **Reconnect vs. retry — `DriverError::is_disconnect()`** (both PG drivers; a
   cross-backend peer `SqliteError::is_disconnect()` / `BackendError::is_disconnect()`).
   Draws the EXACT line a resilient consumer needs — "the connection DIED

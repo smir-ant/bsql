@@ -128,7 +128,10 @@ impl From<DriverError> for HarnessError {
 /// malformed DSN identically.
 fn resolve_dsn(var: Result<String, VarError>) -> Result<ConnectConfig, HarnessError> {
     match var {
-        Ok(dsn) => ConnectConfig::from_dsn(&dsn).map_err(HarnessError::DsnParse),
+        // `from_dsn` now returns a classified `DriverError`; the harness surfaces
+        // the DSN problem as a loud panic, so it flattens the classified error to
+        // its Display message for `DsnParse` (the message text is preserved).
+        Ok(dsn) => ConnectConfig::from_dsn(&dsn).map_err(|e| HarnessError::DsnParse(e.to_string())),
         Err(VarError::NotPresent) => Err(HarnessError::DsnMissing),
         Err(VarError::NotUnicode(_)) => Err(HarnessError::DsnNotUnicode),
     }
