@@ -51,9 +51,9 @@
 //! the driver composes (`Engine`, `Live`, `Surface`, …) carry their pins in
 //! `bsql-postgres-proto`. The sync driver has no futures of its own — its
 //! operations are blocking method calls whose working set lives on the caller's
-//! stack — so there is no `future_pin!` surface here; the `Connection` shell is
-//! a thin handle (engine + token + control socket + cached params) and is not
-//! separately pinned.
+//! stack — so there is no unnameable-future footprint surface here; the
+//! `Connection` shell is a thin handle (engine + token + control socket + cached
+//! params) and is not separately pinned.
 
 // bsql's footprint pins (defined in `bsql-postgres-core` / `-proto`) assert exact
 // `size_of` / `align_of` values computed for 64-bit pointers; on a non-64-bit

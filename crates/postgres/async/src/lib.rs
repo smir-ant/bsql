@@ -55,13 +55,13 @@
 //!
 //! The driver's own footprint surface is its hot-path futures — the state machine
 //! each `async fn` (`query`, `execute`, `query_prepared`, …) lowers to. A
-//! future's type is unnameable and its size is not const-evaluable, and applying
-//! `bsql_postgres_core::future_pin!` to one requires a constructed connection
-//! (the future captures `&mut Connection`, which owns a live socket), so those
-//! pins would live with whatever owns the futures. They are not pinned today: the
-//! futures are thin (a `&mut Engine` borrow plus a local `ResultCollector`), and
-//! the working set is the engine's already-pinned buffers, not driver-owned
-//! state.
+//! future's type is unnameable and its size is not const-evaluable, so it carries
+//! no `footprint_pin!`; the hot inbound dispatch it drives (`next_event`) is
+//! instead gated at the machine level by the `engine_hotpath_codegen` gate
+//! (`bsql-postgres-proto`), which pins that body panic-free and under a committed
+//! instruction ceiling. The futures themselves are thin (a `&mut Engine` borrow
+//! plus a local `ResultCollector`), and their working set is the engine's
+//! already-pinned buffers, not driver-owned state.
 
 // bsql's footprint pins (defined in `bsql-postgres-core` / `-proto`) assert exact
 // `size_of` / `align_of` values computed for 64-bit pointers; on a non-64-bit

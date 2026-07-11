@@ -2,7 +2,7 @@
 //!
 //! Footprint is a **measured, build-gated dimension** of this codebase: the
 //! byte size and alignment of every stable public type is pinned to its
-//! measured value, and any drift fails the build. Two macros carry the regime:
+//! measured value, and any drift fails the build. The regime is one macro:
 //!
 //! - [`crate::footprint_pin`] pins a **nameable** type's `size_of` *and* `align_of`
 //!   with a free-standing `const _: () = { … }` item. A drift turns one of the
@@ -11,12 +11,12 @@
 //!   This is the strongest possible gate: it needs neither a test run nor a
 //!   construction site.
 //!
-//! - [`crate::future_pin`] pins the `size_of_val` of a **concrete future** produced
-//!   by an `async fn` or async block. A future's type is *unnameable* and its
-//!   size is *not* const-evaluable (you cannot call the `async fn` in a `const`
-//!   context — `E0015`), so there is no `E0080` path here. The strongest
-//!   available gate is a `#[test]` that constructs the future (never polling it,
-//!   so zero I/O) and asserts its measured size. Drift fails `cargo test`.
+//! An `async fn`'s concrete future is *unnameable* and its `size_of_val` is not
+//! const-evaluable (the fn cannot be called in a `const` context — `E0015`), so
+//! it has no `footprint_pin!` path. The hot-path future's compiled shape is
+//! instead gated far more strongly at the machine level by the
+//! `engine_hotpath_codegen` gate (`bsql-postgres-proto`), which pins
+//! `next_event`'s instruction body panic-free and under a committed ceiling.
 //!
 //! # Why both `size_of` and `align_of`
 //!
@@ -28,8 +28,7 @@
 //! # Runtime cost
 //!
 //! Zero. [`crate::footprint_pin`] emits a `const _: ()` item that is fully erased by
-//! codegen. [`crate::future_pin`] emits a `#[cfg(test)]`-gated `#[test]` that exists
-//! only in the test binary.
+//! codegen.
 //!
 //! # Baseline footprint (measured @ aarch64-apple-darwin, rustc 1.96.0)
 //!
@@ -139,66 +138,8 @@ macro_rules! footprint_pin {
     };
 }
 
-/// Pin the `size_of_val` of a **concrete future** produced by an `async fn` or
-/// async block, by emitting a `#[test]` that constructs the future (without
-/// polling it — zero I/O) and asserts its measured size.
-///
-/// A future's type is unnameable and its size is **not** const-evaluable (the
-/// producing `async fn` cannot be called in a `const` context — `E0015`), so
-/// there is no `E0080` compile-time path for it the way [`crate::footprint_pin`] has
-/// for a nameable type. A `cargo test` assertion is the strongest gate
-/// available: it fires whenever the test binary runs, catching any growth of
-/// the state-machine the `async fn` lowers to (an added `.await`, a wider
-/// captured local, an inlined sub-future).
-///
-/// The future expression is evaluated but the future is **never polled**, so a
-/// future that performs I/O when driven performs none here — only its stack
-/// layout is measured.
-///
-/// ```
-/// # use bsql_postgres_core::future_pin;
-/// async fn sample(x: u64) -> u64 { x + 1 }
-/// future_pin!(sample_future_size, sample(7), size = 16);
-/// ```
-#[macro_export]
-macro_rules! future_pin {
-    ($test_name:ident, $fut_expr:expr, size = $n:expr $(,)?) => {
-        #[cfg(test)]
-        #[test]
-        fn $test_name() {
-            let fut = $fut_expr;
-            let measured = core::mem::size_of_val(&fut);
-            // Never poll — measuring layout only, no I/O.
-            drop(fut);
-            assert_eq!(
-                measured, $n,
-                "FUTURE FOOTPRINT DRIFT for {}: measured {} B, pinned {} B",
-                stringify!($test_name), measured, $n
-            );
-        }
-    };
-}
-
 #[cfg(test)]
 mod tests {
-    // Self-test of the `future_pin!` mechanism on a local async fn (not a
-    // driver future): proves the macro measures a real future's size and that
-    // the emitted assertion fires on drift. A driver hot-path future is pinned
-    // with this same macro once the engine that owns it is in place; that
-    // future's type is constructed only behind a live connection, so it is
-    // measured against a live driver, not here.
-    async fn sample(a: u64, b: u64) -> u64 {
-        let s = a.wrapping_add(b);
-        // A trailing await widens the state machine; this exercises that the
-        // macro measures the lowered future, not just the argument tuple.
-        core::future::ready(s).await
-    }
-
-    // The measured size of this concrete future on the reference target. If
-    // the macro under-measured (e.g. sized the fn pointer instead of the
-    // future), or the lowering changed, this pin would fail.
-    crate::future_pin!(sample_future_is_pinned, sample(3, 4), size = 40);
-
     #[test]
     fn footprint_pin_macro_measures_a_real_type() {
         // The `footprint_pin!` doctests prove the E0080 drift path across the

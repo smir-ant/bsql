@@ -25,7 +25,7 @@
 //! The stable public *types* this driver re-exports carry their `size_of` pins in
 //! `bsql-postgres-core`. The sync driver has no futures of its own — its verbs are
 //! blocking calls whose working set lives on the caller's stack — so there is no
-//! `future_pin!` surface here.
+//! unnameable-future footprint surface here.
 
 use core::ops::ControlFlow;
 use core::str::FromStr;
