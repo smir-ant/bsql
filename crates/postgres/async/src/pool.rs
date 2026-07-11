@@ -22,6 +22,21 @@
 //! blocking forever. [`get_timeout`](Pool::get_timeout) overrides the deadline
 //! per call.
 //!
+//! # Liveness (a dead peer can never hang a checkout)
+//!
+//! The acquire deadline above bounds only the semaphore WAIT. The post-acquire
+//! health-gate reset is bounded SEPARATELY, by its own liveness deadline: on a
+//! silently-vanished peer (a half-open socket — a NAT idle-drop, a cable pull, an
+//! AZ partition — where no FIN/RST ever arrives) [`Connection::reset_session`]
+//! arms an absolute read deadline (the connection's `connect_timeout`), so a
+//! reset that would otherwise block for the kernel's `tcp_retries2` budget
+//! (~15 min) ELAPSES into a classified error within a bounded wall-clock. That
+//! routes into the eviction arm below (`Err(_evict) => drop; continue`), so a
+//! dead pooled connection is evicted and the caller gets a FRESH connection — or,
+//! if the whole budget is spent, a classified acquire-timeout — never a
+//! multi-minute hang. So `get()` as a WHOLE is bounded, not merely its permit
+//! wait.
+//!
 //! # Cancellation safety
 //!
 //! The capacity permit is an owned [`OwnedSemaphorePermit`] moved into the

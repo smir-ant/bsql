@@ -992,12 +992,53 @@ impl Connection {
     /// statements (content-addressed plans safe to share) are KEPT so the
     /// server-side plan reuse survives a pool checkout with no cache invalidation.
     ///
+    /// # Liveness bound (why a pool checkout can never hang on a dead peer)
+    ///
+    /// The reset is a round-trip liveness probe run on every pool checkout, so a
+    /// pooled connection whose peer VANISHED silently (a NAT idle-drop, a cable
+    /// pull, an AZ partition — a half-open socket where no FIN/RST ever arrives)
+    /// must not block the checkout for the kernel's `tcp_retries2` budget
+    /// (~15 min). This reset therefore arms an absolute read deadline — the SAME
+    /// [`ReadDeadline`](crate::transport) primitive
+    /// [`recv_notification`](Self::recv_notification) uses, proven token-safe —
+    /// bounded by the connection's own `connect_timeout` (a reset is a mini
+    /// handshake, so it earns the handshake's wall-clock budget; no separate knob,
+    /// so the [`ConnectConfig`](bsql_postgres_core::ConnectConfig) footprint is
+    /// untouched). On a vanished peer the read ELAPSES into a fatal transport
+    /// error — the reset's pump has no would-block quiet arm (that arm is unique to
+    /// the notification wait), so an elapsed deadline is NOT a quiet alive outcome
+    /// here but a dead-connection one — so the token is dropped, this returns
+    /// classified, and a pool EVICTS the connection and hands out a fresh one (or a
+    /// classified acquire-timeout if the whole budget is spent) instead of hanging.
+    /// A healthy reset completes in microseconds, far inside the budget, so the
+    /// deadline never fires on the happy path (no added round trip, only an
+    /// arm/disarm atomic store bracketing the existing round trip).
+    ///
     /// # Errors
     ///
     /// Any transport / server error is returned classified; a pool evicts a
     /// connection whose reset failed rather than handing out a still-dirty one.
-    pub fn reset_session(&mut self) -> impl Future<Output = Result<(), DriverError>> + '_ {
-        self.core.reset_session()
+    /// [`DriverError::TimeoutOverflow`] if `connect_timeout` is so large that the
+    /// absolute deadline overflows the clock (the token is untaken, connection
+    /// still alive).
+    pub async fn reset_session(&mut self) -> Result<(), DriverError> {
+        // Bound the WHOLE reset sequence (the RESET simple-query plus the batched
+        // dynamic-statement Close) under ONE absolute deadline = the connection's
+        // connect budget. Compute it with `checked_add` BEFORE arming / taking the
+        // token, so an overflow returns Err with the connection untouched.
+        let budget = Duration::from_secs(self.redial.connect_timeout_secs());
+        let deadline = Instant::now()
+            .checked_add(budget)
+            .ok_or(DriverError::TimeoutOverflow)?;
+        // The RAII guard disarms on drop, so the deadline cannot survive this
+        // future being dropped mid-`.await` (an outer timeout / cancelled task) —
+        // a structural guarantee, not caller discipline. On the normal path the
+        // explicit `drop(guard)` performs the same single atomic-store disarm a
+        // manual one would, before the caller's real verbs read deadline-free.
+        let guard = self.read_deadline.arm_scoped(deadline);
+        let result = self.core.reset_session().await;
+        drop(guard);
+        result
     }
 
     // ── Notifications (deadline arming is async-specific; stays here) ────────
@@ -1033,12 +1074,17 @@ impl Connection {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(DriverError::TimeoutOverflow)?;
-        self.read_deadline.arm(deadline);
+        // The RAII guard disarms on drop, so a stale deadline cannot survive this
+        // future being dropped mid-`.await` (an outer `tokio::time::timeout` /
+        // `select!` losing the race) and fire a spurious `TimedOut` on the reused
+        // connection's next verb — a structural guarantee, not caller discipline.
+        let guard = self.read_deadline.arm_scoped(deadline);
         let received = self.core.recv_notification_inner().await;
         // Disarm before draining, so a later verb's reads are deadline-free. The
-        // disarm is infallible (an atomic store), so — unlike the blocking driver's
-        // socket-timeout restore — there is no restore error to thread.
-        self.read_deadline.disarm();
+        // explicit `drop(guard)` is the same single infallible atomic store the
+        // manual `disarm` was (no restore error to thread, unlike the blocking
+        // driver's socket-timeout restore).
+        drop(guard);
         if received? {
             self.core.take_expected_notification()
         } else {

@@ -77,6 +77,8 @@ cargo test -p bsql-postgres-async --test sq_live -- --ignored    # async PG (nee
 cargo test -p bsql-postgres-sync --test sync_live -- --ignored   # sync PG (needs local PG)
 cargo test -p bsql-postgres-async --test sq_live cancel_token_stops -- --ignored   # async cancel witness (needs PG)
 cargo test -p bsql-postgres-sync  --test sync_live cancel_token_stops -- --ignored # sync cancel witness (needs PG)
+cargo test -p bsql-postgres-async --test pool_liveness -- --ignored   # async pool dead-peer liveness (get() bounded, not a hang; PG behind a black-hole relay)
+cargo test -p bsql-postgres-sync  --test pool_liveness -- --ignored   # sync  pool dead-peer liveness (get() bounded, not a hang; PG behind a black-hole relay)
 cargo test -p bsql-sqlite --test cancel              # SQLite interrupt witness (in-process, no PG)
 cargo test -p bsql-query-sqlite-fixture --features n1-detect --test n1_detect_sqlite  # SQLite N+1 witness (in-process)
 cargo test -p bsql-query-fixture --test query_live_async -- --ignored  # live query! (async, needs PG)
@@ -539,6 +541,29 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
 - Error types: `DriverError::Db(DbError)` for server errors with SQLSTATE, `DriverError::Config` for pre-connect validation, `DriverError::NoRows` for empty results
 - `ConnectConfig` is `#[non_exhaustive]` — construct via `new()` + builder methods
   (`footprint_pin!`-ed at 152 bytes)
+- **Pool liveness — `get()` is BOUNDED even on a dead peer.** The pool
+  health-gates every REUSED connection with a `reset_session` on checkout (the
+  exactly-once liveness proof before the user's verb runs). That reset is a
+  round-trip, so a pooled connection whose peer VANISHED SILENTLY (a half-open
+  socket — a NAT idle-drop, a cable pull, an AZ partition — where no FIN/RST
+  arrives) must not block the checkout for the kernel's `tcp_retries2` budget
+  (~15 min). The reset therefore arms a liveness deadline = the connection's own
+  `connect_timeout` (a reset is a mini handshake, so it earns the handshake's
+  budget — no separate knob, so the `ConnectConfig` 152-byte footprint is
+  untouched): the async driver arms the same `ReadDeadline` `recv_notification`
+  uses (proven token-safe), the sync driver arms the socket read+write timeout
+  `connect` uses. UNLIKE the notification wait, the reset's pump has no
+  would-block QUIET arm, so an elapsed deadline is a FATAL transport error, not a
+  quiet-alive one — the token drops, the reset returns classified, and the pool's
+  existing eviction arm drops the dead connection and hands out a FRESH one (or a
+  classified acquire-timeout if the whole budget is spent). So `get()` as a WHOLE
+  is bounded (its permit/slot wait AND its post-acquire reset), not merely its
+  permit wait. The happy path is UNCHANGED: a healthy reset completes in
+  microseconds far inside the budget, so the deadline never fires — only an
+  arm/disarm bracket is added, never a round trip. Witnessed by the `--ignored`
+  `pool_liveness` suites (both drivers: a black-hole TCP relay freezes a pooled
+  connection mid-stream, then `get()` recovers a fresh connection / returns a
+  classified error, both bounded — never the `tcp_retries2` hang).
 - Runtime parameterized queries (`query_params` / `query_params_one` /
   `execute_params`) cost a SINGLE round trip whether run once or repeatedly, via a
   transparent per-connection dynamic prepared-statement cache keyed on SQL TEXT

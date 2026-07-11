@@ -973,12 +973,63 @@ impl Connection {
     /// statements (content-addressed plans safe to share) are KEPT so the
     /// server-side plan reuse survives a pool checkout with no cache invalidation.
     ///
+    /// # Liveness bound (why a pool checkout can never hang on a dead peer)
+    ///
+    /// The reset is a round-trip liveness probe run on every pool checkout, so a
+    /// pooled connection whose peer VANISHED silently (a NAT idle-drop, a cable
+    /// pull, an AZ partition — a half-open socket where no FIN/RST ever arrives)
+    /// must not block the checkout for the kernel's `tcp_retries2` budget
+    /// (~15 min). This reset therefore arms a bounded socket read+write timeout —
+    /// the SAME control handle [`recv_notification`](Self::recv_notification) and
+    /// [`connect`](Self::connect) arm — bounded by the connection's own
+    /// `connect_timeout` (a reset is a mini handshake, so it earns the handshake's
+    /// budget; no separate knob, so the
+    /// [`ConnectConfig`](bsql_postgres_core::ConnectConfig) footprint is untouched).
+    /// On a vanished peer the read (or a write into a full send buffer) ELAPSES
+    /// into a fatal transport error — the reset's pump has no would-block quiet arm
+    /// (that arm is unique to the notification wait) — so the token is dropped,
+    /// this returns classified, and a pool EVICTS the connection and hands out a
+    /// fresh one (or a classified acquire-timeout if the whole budget is spent)
+    /// instead of hanging. A healthy reset completes in microseconds, far inside
+    /// the budget, so the deadline never fires on the happy path (no added round
+    /// trip, only a pair of `setsockopt`s bracketing the existing round trip).
+    ///
     /// # Errors
     ///
     /// Any transport / server error is returned classified; a pool evicts a
     /// connection whose reset failed rather than handing out a still-dirty one.
     pub fn reset_session(&mut self) -> Result<(), DriverError> {
-        drive_sync(engine::poll_once(self.core.reset_session()))
+        // Arm the bounded read+write timeout BEFORE the inner verb takes the token,
+        // so a failed `set_*_timeout` syscall returns Err with the token still live
+        // — never stranding it and bricking a connection nothing touched on the
+        // wire. No socket (testkit) → nothing to arm; the wait is vacuous. The
+        // WHOLE reset sequence (the RESET simple-query plus the batched
+        // dynamic-statement Close) runs under this per-read/write ceiling.
+        let budget = Duration::from_secs(self.redial.connect_timeout_secs());
+        if let Some(ctl) = &self.socket_ctl {
+            ctl.set_read_timeout(Some(budget)).map_err(DriverError::Io)?;
+            ctl.set_write_timeout(Some(budget)).map_err(DriverError::Io)?;
+        }
+        let result = drive_sync(engine::poll_once(self.core.reset_session()));
+        // Restore the disarmed (block-forever) steady state in EVERY arm BEFORE
+        // returning, so the caller's real verbs block indefinitely again (the
+        // steady-state I/O contract), exactly as `recv_notification` restores.
+        let restore = match &self.socket_ctl {
+            Some(ctl) => ctl
+                .set_read_timeout(None)
+                .and_then(|()| ctl.set_write_timeout(None)),
+            None => Ok(()),
+        };
+        match result {
+            Ok(()) => {
+                restore.map_err(DriverError::Io)?;
+                Ok(())
+            }
+            Err(e) => {
+                restore.map_err(DriverError::Io)?;
+                Err(e)
+            }
+        }
     }
 
     // ── Notifications (read-timeout arming is blocking-specific; stays here) ─

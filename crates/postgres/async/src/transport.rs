@@ -160,6 +160,23 @@ impl ReadDeadline {
         self.armed.store(true, Ordering::Release);
     }
 
+    /// Arm an absolute read deadline and return an RAII guard that DISARMS on
+    /// drop — whether the guarded scope ends by a normal return OR by the future
+    /// being dropped (an outer `tokio::time::timeout` / `select!` losing the race,
+    /// a cancelled task). This makes "no stale deadline survives a dropped verb
+    /// future" a STRUCTURAL guarantee (the compiler's `Drop`), not caller
+    /// discipline: a direct caller who wraps a deadline-armed verb in an outer
+    /// timeout and loses the race can no longer strand an armed deadline that
+    /// would fire a spurious `TimedOut` on the reused connection's NEXT verb.
+    ///
+    /// The happy path is byte-identical to a manual `arm` then `disarm`: on a
+    /// normal return the guard's `Drop` does exactly the one atomic store the
+    /// manual `disarm` did (drop the guard explicitly to place that store).
+    pub(crate) fn arm_scoped(&self, at: Instant) -> DisarmOnDrop<'_> {
+        self.arm(at);
+        DisarmOnDrop { deadline: self }
+    }
+
     /// Disarm: subsequent reads take the deadline-free fast path. The stored
     /// instant is irrelevant once the gate is down, so it is left as-is.
     pub(crate) fn disarm(&self) {
@@ -186,6 +203,23 @@ impl ReadDeadline {
     )]
     fn lock(&self) -> MutexGuard<'_, Option<Instant>> {
         self.at.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// An RAII guard, minted by [`ReadDeadline::arm_scoped`], that DISARMS its
+/// [`ReadDeadline`] when it drops — on a normal return, an unwind, OR a
+/// dropped/cancelled future. It carries only a borrow (no owned state), so it is
+/// zero happy-path cost: its `Drop` performs the same single atomic store a
+/// manual `disarm` would. Its whole purpose is that `Drop`, so it is `#[must_use]`
+/// (dropping it immediately would disarm before the guarded read even runs).
+#[must_use = "the guard disarms the read deadline on drop; binding it to `_` would disarm immediately"]
+pub(crate) struct DisarmOnDrop<'a> {
+    deadline: &'a ReadDeadline,
+}
+
+impl Drop for DisarmOnDrop<'_> {
+    fn drop(&mut self) {
+        self.deadline.disarm();
     }
 }
 
