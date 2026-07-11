@@ -129,6 +129,16 @@ impl DbError {
     pub fn is_foreign_key_violation(&self) -> bool { self.is_code("23503") }
     /// `true` if the SQLSTATE is `23514` (`check_violation`).
     pub fn is_check_violation(&self) -> bool { self.is_code("23514") }
+    /// `true` if the SQLSTATE is `53300` (`too_many_connections`) — the server is
+    /// at its connection limit. The signal a connection-pool storm needs to shed
+    /// load or back off. Classified from a CONNECT-time `ErrorResponse` exactly as
+    /// from an active-phase one (the wire frame is identical), so a pool exhausting
+    /// the server's limit no longer collapses to an unclassifiable I/O string.
+    pub fn is_too_many_connections(&self) -> bool { self.is_code("53300") }
+    /// `true` if the SQLSTATE is `3D000` (`invalid_catalog_name`) — the requested
+    /// database does not exist. A connect-time diagnostic formerly collapsed to an
+    /// opaque I/O string; now matchable exactly like an active-phase server error.
+    pub fn is_invalid_catalog_name(&self) -> bool { self.is_code("3D000") }
 }
 
 /// Why reading a typed value from a dynamic [`Row`](crate::Row) column failed.

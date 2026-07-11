@@ -131,6 +131,54 @@ async fn connect_and_ping() {
     c.close().await.expect("close");
 }
 
+/// WITNESS (R5 — a connect-time server error is CLASSIFIED): a connect to a
+/// NON-EXISTENT database surfaces the server's `ErrorResponse` as a fully
+/// classified `DriverError::Db` — SQLSTATE `3D000` (`invalid_catalog_name`) plus
+/// the server's message — NOT a single opaque I/O string. A consumer can match
+/// `err.code()` / `is_invalid_catalog_name()` on a CONNECT error exactly as on an
+/// active-phase error. Formerly collapsed to
+/// `Io("server returned an error during startup")`.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn connect_to_missing_database_classifies_3d000() {
+    let cfg = ConnectConfig::new("127.0.0.1", "smir-ant").database("bsql_r5_no_such_db".to_string());
+    match Connection::connect(&cfg).await {
+        Err(DriverError::Db(db)) => {
+            assert_eq!(db.code(), "3D000", "a wrong-DB connect must classify as 3D000");
+            assert!(db.is_invalid_catalog_name(), "the 3D000 predicate must hold");
+            assert!(
+                db.message.contains("bsql_r5_no_such_db"),
+                "the server message must name the missing database, got {:?}",
+                db.message,
+            );
+        }
+        Ok(_) => panic!("a connect to a non-existent database must fail"),
+        Err(other) => panic!("expected DriverError::Db(3D000), got {other:?}"),
+    }
+}
+
+/// WITNESS (R5 — bad authorization is CLASSIFIED): a connect as a NON-EXISTENT
+/// role surfaces the server's `ErrorResponse` as a classified `DriverError::Db`
+/// with an auth SQLSTATE in the `28xxx` class (`28000`
+/// invalid_authorization_specification), NOT an opaque string — the same
+/// classified `DbError` the active path produces, decoded through the same
+/// `parse_error_response`.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn connect_as_missing_role_classifies_auth_error() {
+    let cfg =
+        ConnectConfig::new("127.0.0.1", "bsql_r5_no_such_role").database("postgres".to_string());
+    match Connection::connect(&cfg).await {
+        Err(DriverError::Db(db)) => assert!(
+            db.code().starts_with("28"),
+            "a bad-authorization connect must classify in the 28xxx class, got {}",
+            db.code(),
+        ),
+        Ok(_) => panic!("a connect as a non-existent role must fail"),
+        Err(other) => panic!("expected DriverError::Db(28xxx), got {other:?}"),
+    }
+}
+
 /// The async peer of the sync `wide_columns` witness: a 1664-column result — the
 /// widest PostgreSQL produces (`MaxTupleAttributeNumber`), now the driver's cap —
 /// decodes correctly over the shared `Core<S>`.

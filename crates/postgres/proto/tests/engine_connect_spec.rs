@@ -208,6 +208,14 @@ struct ScramServer {
     /// When set, assert the client's gs2 header equals this exactly — proves the
     /// client chose the expected flag (e.g. `y,,` anti-downgrade, not `n,,`).
     expect_gs2_header: Option<Vec<u8>>,
+    /// When set, the server REJECTS the exchange at the server-final step (after it
+    /// has sent `AuthenticationSASLContinue` and the client has sent its proof) by
+    /// emitting this raw `ErrorResponse` frame instead of
+    /// `AuthenticationSASLFinal` + AuthOk + key + RFQ. Models a server that accepts
+    /// the SASL exchange up to the proof, then fails auth (e.g. `28P01
+    /// invalid_password`) — exercising the connect-time raw-error-body carry on the
+    /// LATE SCRAM arm (`ScramAwaitingServerFinal`), not just the early Trust arm.
+    reject_at_final: Option<Vec<u8>>,
 }
 
 /// The server salt + iteration count (RFC-7677-legal).
@@ -233,7 +241,15 @@ impl ScramServer {
             server_cbind_data: Vec::new(),
             gs2_header: Vec::new(),
             expect_gs2_header: None,
+            reject_at_final: None,
         }
+    }
+
+    /// Reject the exchange at the server-final step with `error` (a full
+    /// `ErrorResponse` frame). See [`reject_at_final`](Self::reject_at_final).
+    fn reject_at_server_final(mut self, error: Vec<u8>) -> Self {
+        self.reject_at_final = Some(error);
+        self
     }
 
     /// Assert the client's gs2 header equals `header` exactly (e.g. `b"y,,"`).
@@ -322,6 +338,17 @@ impl ScramServer {
             // its OWN `server_cbind_data` for a `p=` (channel-binding) header, so
             // a client bound to different data produces a different AuthMessage
             // and the server signature the client verifies will not match.
+            2 if self.reject_at_final.is_some() => {
+                // Reject at server-final: the client sent a well-formed proof, and
+                // the server answers with an `ErrorResponse` (e.g. `28P01`) instead
+                // of `AuthenticationSASLFinal`. The engine is in
+                // `ScramAwaitingServerFinal`, so the `ErrorResponse` routes through
+                // that arm's `server_fail` → the raw-body carry. (Disjoint-field
+                // borrow: `reject_at_final` read, `out` written.)
+                if let Some(error) = &self.reject_at_final {
+                    self.out = error.clone();
+                }
+            }
             2 => {
                 let mut cbind_input = self.gs2_header.clone();
                 if self.gs2_header.starts_with(b"p=") {
@@ -715,16 +742,63 @@ fn scram_connect_absorbs_interleaved_notices_and_reaches_active() {
 }
 
 /// A server `ErrorResponse` during connect is a classified
-/// [`EngineError::Handshake`] carrying [`ConnFail::ServerError`] — never a
-/// panic, never a silent active transition.
+/// [`EngineError::HandshakeServerError`] carrying the RAW error-response body up
+/// VERBATIM — never a panic, never a silent active transition, and never the
+/// former opaque `ConnFail::ServerError` that discarded the SQLSTATE. The raw
+/// body must carry the SQLSTATE + message bytes intact, so the driver's
+/// `parse_error_response` (the active path's decoder) can classify the connect
+/// failure exactly as an active-phase server error. Proving those bytes survive
+/// the sans-IO layer boundary is the whole point of the fix.
 #[test]
-fn server_error_during_connect_is_classified_handshake() {
+fn server_error_during_connect_carries_the_raw_error_body() {
     let server = StaticServer::new(error_response("FATAL", "28000", "role does not exist"));
     let err = connect_error(server, Credentials::Trust);
-    assert!(
-        matches!(err, EngineError::Handshake(ConnFail::ServerError)),
-        "expected Handshake(ServerError), got {err:?}",
-    );
+    match err {
+        EngineError::HandshakeServerError(body) => {
+            assert!(
+                body.windows(5).any(|w| w == b"28000"),
+                "the raw error body must carry SQLSTATE 28000; got {body:?}",
+            );
+            assert!(
+                body.windows(b"role does not exist".len())
+                    .any(|w| w == b"role does not exist"),
+                "the raw error body must carry the server message verbatim; got {body:?}",
+            );
+        }
+        other => panic!("expected HandshakeServerError with the raw body, got {other:?}"),
+    }
+}
+
+/// A server `ErrorResponse` that arrives MID-SCRAM — after the
+/// `AuthenticationSASLContinue`, at the server-final step (the LATE
+/// `ScramAwaitingServerFinal` arm) — is carried up as a classified
+/// [`EngineError::HandshakeServerError`] with the RAW body VERBATIM, exactly like
+/// the early Trust arm. This proves the connect-time raw-body carry is UNIFORM
+/// across every connecting arm that can see an `ErrorResponse`, not just the
+/// first. A real server does this on `28P01` (`invalid_password`): it runs the
+/// SASL exchange up to the client proof, then rejects the password — so the
+/// SQLSTATE + message must survive on this late arm too, not collapse to an
+/// opaque string.
+#[test]
+fn server_error_after_scram_continue_carries_the_raw_error_body() {
+    let creds = Credentials::ScramPassword(scram_password("pencil"), ChannelBinding::Unbound);
+    let server = ScramServer::new("pencil")
+        .reject_at_server_final(error_response("FATAL", "28P01", "password authentication failed"));
+    let err = connect_error(server, creds);
+    match err {
+        EngineError::HandshakeServerError(body) => {
+            assert!(
+                body.windows(5).any(|w| w == b"28P01"),
+                "the mid-SCRAM raw error body must carry SQLSTATE 28P01; got {body:?}",
+            );
+            assert!(
+                body.windows(b"password authentication failed".len())
+                    .any(|w| w == b"password authentication failed"),
+                "the mid-SCRAM raw error body must carry the server message verbatim; got {body:?}",
+            );
+        }
+        other => panic!("expected HandshakeServerError from the server-final arm, got {other:?}"),
+    }
 }
 
 /// Calling `connect` after the engine is already active is a classified

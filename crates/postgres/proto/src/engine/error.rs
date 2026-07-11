@@ -6,6 +6,8 @@
 //! error enum serves a `std`-backed socket driver, a TLS driver, or a
 //! scripted in-memory transport without the core ever naming `std`.
 
+use alloc::boxed::Box;
+
 use super::flush::SendOverrun;
 use super::ingest::{IngestCommitOverflow, IngestFull};
 use super::ConnFail;
@@ -63,8 +65,24 @@ pub enum EngineError<E> {
     /// during connect, an auth method the configured credentials cannot
     /// satisfy, a SCRAM/MD5 failure, or a wire-illegal connecting frame.
     /// Carries the classified [`ConnFail`] cause. Classified rather than
-    /// retried (the handshake cannot recover) or swallowed.
+    /// retried (the handshake cannot recover) or swallowed. A server
+    /// `ErrorResponse` during connect does NOT ride this variant — it carries
+    /// server bytes, so it has its own [`HandshakeServerError`](Self::HandshakeServerError).
     Handshake(ConnFail),
+    /// The handshake terminated because the server answered with an
+    /// `ErrorResponse`. Carries the raw error-response body bytes VERBATIM (one
+    /// owned `Box<[u8]>`, allocated only on this cold connect-FAILURE path). The
+    /// driver decodes them with the SAME `parse_error_response` the active-phase
+    /// server-error path uses, so a connect-time server error surfaces its full
+    /// SQLSTATE + message + fields — `DriverError::Db` with the complete
+    /// classification — never a single opaque string collapsing wrong-DB
+    /// (`3D000`), too-many-connections (`53300`), and bad-auth (`28000`) into one
+    /// unusable value. Distinct from [`Handshake`](Self::Handshake) (a client-side
+    /// classified [`ConnFail`] with no server payload). The sans-IO engine carries
+    /// only bytes here; the decode into a `DbError` happens in the driver,
+    /// respecting the `#![no_std]` layer boundary (`parse_error_response` /
+    /// `DbError` live above the engine).
+    HandshakeServerError(Box<[u8]>),
     /// A verb was invoked in a protocol phase that does not support it — e.g.
     /// [`connect`](super::Engine::connect) after the engine is already active,
     /// or an active-phase accessor before the handshake completed. A classified
@@ -112,7 +130,9 @@ pub enum EngineError<E> {
 // envelope: the widest variant is `IngestFull(IngestFull)` (a 24 B body —
 // IngestFull's three usize fields dominate IngestCommitOverflow/SendOverrun/
 // RowCount's 16 B) plus the discriminant → 32. Generic over `E`, so there is no
-// single canonical size; a driver's real `E` adds at most `size_of::<E>()`.
+// single canonical size; a driver's real `E` adds at most `size_of::<E>()`. The
+// `HandshakeServerError(Box<[u8]>)` raw-body carrier is a 16 B fat pointer —
+// UNDER the 24 B `IngestFull` width — so the pin is unchanged.
 crate::wire_pin!(EngineError<core::convert::Infallible>, size = 32, align = 8);
 
 /// The row-count contract a guard verb enforces — the expectation half of a

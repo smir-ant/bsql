@@ -45,6 +45,7 @@
 //! prove; it is surfaced as the classified [`SpuriousPending`] error, never a
 //! spin and never a deadlock.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use core::future::Future;
 use core::ops::ControlFlow;
@@ -135,23 +136,36 @@ crate::wire_pin!(Boundary<()>, size = 1, align = 1);
 /// [`connect`](super::Engine::connect) verb that receives it can re-borrow the
 /// engine freely for the synchronous Connecting→Active swap. `#[non_exhaustive]`
 /// so a future outcome can be added without breaking a downstream `match`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum HandshakeOutcome {
     /// `AuthenticationOk` + `BackendKeyData` + a clean `ReadyForQuery` were
     /// observed: the connection is ready to transition to the active phase.
     Ready,
-    /// The handshake failed, carrying the classified [`ConnFail`] cause.
+    /// The handshake failed on a CLIENT-side protocol classification (an
+    /// unsupported auth method, a malformed/illegal connecting frame, a SCRAM/MD5
+    /// failure). Carries the classified [`ConnFail`] cause, which has no server
+    /// payload.
     Failed(ConnFail),
+    /// The server answered the handshake with an `ErrorResponse`. Carries the raw
+    /// error-response body VERBATIM (one owned `Box<[u8]>`, allocated only on this
+    /// cold connect-FAILURE path). The driver decodes it with the SAME
+    /// `parse_error_response` the active-phase server-error path uses, so a
+    /// connect-time server error surfaces its full SQLSTATE + message + fields —
+    /// `DriverError::Db` with the complete classification — never a single opaque
+    /// string. Distinct from [`Failed`](Self::Failed) precisely because it carries
+    /// server bytes to decode upstream rather than a client-side classification.
+    ServerError(Box<[u8]>),
 }
 
-// One fat-niche enum over `ConnFail` (its footprint dominates); the unit
-// outcomes ride the discriminant. `ConnFail` is 8 B/4 with SCRAM on and 2 B/1
-// with SCRAM off, so this shrinks in lock-step.
-#[cfg(feature = "scram")]
-crate::wire_pin!(HandshakeOutcome, size = 8, align = 4);
-#[cfg(not(feature = "scram"))]
-crate::wire_pin!(HandshakeOutcome, size = 2, align = 1);
+// The widest variant is now `ServerError(Box<[u8]>)` — a 16 B fat pointer — so the
+// enum is a 16 B payload + an 8 B discriminant word (the boxed slice's single
+// null-pointer niche cannot also encode `Ready` AND `Failed`, so the tag is
+// explicit) = 24 B, align 8. NO LONGER feature-split: the `Box` dominates
+// `ConnFail` regardless of whether SCRAM is compiled, so both feature states are
+// 24/8 — a deliberate re-baseline (the raw-body carrier subsumes the former
+// ConnFail-sized width).
+crate::wire_pin!(HandshakeOutcome, size = 24, align = 8);
 
 /// One surfaceable active-phase event, lent to the pump's sink and consumed
 /// within that call — the borrow never escapes the sink invocation, which is
@@ -457,8 +471,10 @@ where
 /// pulling; on [`NeedMore`](HandshakeProgress::NeedMore) flush any still-queued
 /// response (the SASL initial response is queued without surfacing an auth
 /// event) before reading one chunk into the connecting ingest buffer; on
-/// [`Ready`](HandshakeProgress::Ready) / [`Failed`](HandshakeProgress::Failed)
-/// return the [`HandshakeOutcome`]. The handshake carries no rows or
+/// [`Ready`](HandshakeProgress::Ready) / [`Failed`](HandshakeProgress::Failed) /
+/// [`ServerError`](HandshakeProgress::ServerError) return the
+/// [`HandshakeOutcome`] (the server-error step carrying the raw error-response
+/// body up for the driver to classify). The handshake carries no rows or
 /// completions.
 ///
 /// [`HandshakeProgress`] is non-borrowing, so each step's classification (and
@@ -496,6 +512,10 @@ where
             HandshakeProgress::Failed(reason) => {
                 core::hint::cold_path();
                 return Ok(HandshakeOutcome::Failed(reason));
+            }
+            HandshakeProgress::ServerError(body) => {
+                core::hint::cold_path();
+                return Ok(HandshakeOutcome::ServerError(body));
             }
             HandshakeProgress::AuthResponse => flush(send_buf, transport).await?,
             // The startup `ParameterStatus` reports keep the pump pulling. The

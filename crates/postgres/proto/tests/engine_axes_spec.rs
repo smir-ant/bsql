@@ -411,15 +411,21 @@ const SECTION7: &[Row] = &[
 const SECTION7_AXES: usize = 12;
 /// `crate::wire_pin!(` footprint-pin invocations across `engine/`.
 /// Reproduce: `grep -rho 'crate::wire_pin!(' crates/postgres/proto/src/engine/*.rs | wc -l`
-/// Text-level count (this scan is cfg-blind): `ConnFail`, `HandshakeProgress`, and
-/// `HandshakeOutcome` each carry a `#[cfg(feature = "scram")]` / `#[cfg(not(...))]`
-/// pin PAIR (their footprint shrinks when the SCRAM leaf class is compiled out),
-/// so each contributes two invocations to the source text.
-const WIRE_PINS: usize = 30;
+/// Text-level count (this scan is cfg-blind): only `ConnFail` still carries a
+/// `#[cfg(feature = "scram")]` / `#[cfg(not(...))]` pin PAIR (its footprint shrinks
+/// when the SCRAM leaf class is compiled out), contributing two invocations.
+/// `HandshakeProgress` and `HandshakeOutcome` are now SINGLE pins: their widest
+/// variant is the `ServerError(Box<[u8]>)` raw-body carrier (24/8), which dominates
+/// `ConnFail` regardless of the SCRAM feature, so their footprint is
+/// feature-INDEPENDENT (down from a pair each — the 30→28 re-baseline).
+const WIRE_PINS: usize = 28;
 /// Variants of `EngineError<E>` (the classified error taxonomy).
 /// Reproduce: count the upper-case-leading lines inside the `pub enum
 /// EngineError<E> { .. }` block in `engine/error.rs`.
-const ENGINE_ERROR_VARIANTS: usize = 14;
+/// 15 adds `HandshakeServerError(Box<[u8]>)` — a connect-time server `ErrorResponse`
+/// carried up as raw bytes for the driver to classify into `DriverError::Db`,
+/// distinct from the client-side classified `Handshake(ConnFail)`.
+const ENGINE_ERROR_VARIANTS: usize = 15;
 /// Active-phase verbs (each takes the linear `Live` token; all return it save the
 /// session-ending `terminate`, which consumes it into the closed phase).
 /// Reproduce: `grep -c "live: Live<'b>" crates/postgres/proto/src/engine/verbs.rs`
@@ -448,7 +454,11 @@ const ACTIVE_VERBS: usize = 23;
 /// the `Closed` protocol-violation, and the `Suspended` fatal arm — the `FrameTooLong`
 /// cold markers of `stage_simple_query` / `stage_fused_params` were MOVED out of
 /// `run_simple` / `query_params_fused`, so those are net-zero.)
-const COLD_CLASSIFIED_BRANCHES: usize = 56;
+/// 58 adds the two connect-time server-error markers: the pump's
+/// `HandshakeProgress::ServerError` arm (raw body → `HandshakeOutcome::ServerError`)
+/// and the connect verb's `HandshakeOutcome::ServerError` arm
+/// (→ `EngineError::HandshakeServerError`) — both cold connect-failure landings.
+const COLD_CLASSIFIED_BRANCHES: usize = 58;
 /// `#[non_exhaustive]` attribute lines across `engine/`.
 /// Reproduce: `grep -rcE '^#\[non_exhaustive\]' crates/postgres/proto/src/engine/*.rs` (summed)
 const NON_EXHAUSTIVE_ATTRS: usize = 4;

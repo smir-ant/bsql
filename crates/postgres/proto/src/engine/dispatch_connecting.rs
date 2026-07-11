@@ -96,7 +96,16 @@ use crate::write_buf::{WriteBuf, WriteBufFull};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnFail {
-    /// The server sent an `ErrorResponse` during the handshake.
+    /// The server sent an `ErrorResponse` during the handshake — the internal
+    /// terminal MARKER set by [`server_fail`], recorded in the failed
+    /// [`ConnPhase`]. The raw error-response body does NOT ride this `Copy`
+    /// classification: it is carried up VERBATIM by
+    /// [`HandshakeProgress::ServerError`] / `HandshakeOutcome::ServerError` so the
+    /// driver decodes the full SQLSTATE + message with the SAME
+    /// `parse_error_response` the active path uses — a connect-time server error
+    /// classifies exactly like an active one, never an opaque string. This unit
+    /// variant remains the phase marker (and the defensive classification of a
+    /// re-drive of an already-failed engine, a path the connect flow never takes).
     ServerError,
     /// A frame whose tag is not legal for the current connecting phase.
     UnexpectedFrame {
@@ -240,7 +249,7 @@ enum DriveOutcome {
 /// response, read more, keep pulling, or stop. This drops every borrow, so the
 /// pump can act across an `.await` with no borrow to end first, and carries the
 /// classified [`ConnFail`] directly on failure (no unreachable `Option`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum HandshakeProgress {
     /// The framing buffer is drained — read one chunk.
     NeedMore,
@@ -250,17 +259,30 @@ pub(crate) enum HandshakeProgress {
     ParamStatus,
     /// Handshake complete — ready to transition to the active phase.
     Ready,
-    /// The handshake failed, carrying the classified cause.
+    /// The handshake failed on a CLIENT-side protocol classification (an
+    /// unsupported auth method, a malformed/illegal connecting frame, a SCRAM/MD5
+    /// failure) — carrying the classified [`ConnFail`], which has no server
+    /// payload.
     Failed(ConnFail),
+    /// The server answered the handshake with an `ErrorResponse` — carrying the
+    /// raw error-response body VERBATIM (one owned `Box<[u8]>`, allocated only on
+    /// this cold connect-FAILURE path; the happy connect path never allocates
+    /// here). Kept distinct from [`Failed`](Self::Failed) precisely because it
+    /// carries server bytes to decode UPSTREAM (in the driver, with the active
+    /// path's `parse_error_response`) rather than a client-side classification, so
+    /// a connect-time server error surfaces its full SQLSTATE + message.
+    ServerError(Box<[u8]>),
 }
 
-// `pub(crate)` pump-facing surface. Widest variant is `Failed(ConnFail)`; the
-// four unit steps ride the discriminant. `ConnFail` is 8 B/4 with SCRAM on and
-// 2 B/1 with SCRAM off, so this shrinks in lock-step.
-#[cfg(feature = "scram")]
-crate::wire_pin!(HandshakeProgress, size = 8, align = 4);
-#[cfg(not(feature = "scram"))]
-crate::wire_pin!(HandshakeProgress, size = 2, align = 1);
+// `pub(crate)` pump-facing surface. The widest variant is now
+// `ServerError(Box<[u8]>)` — a 16 B fat pointer — so the enum is a 16 B payload +
+// an 8 B discriminant word (the boxed slice's single null-pointer niche cannot
+// also encode the four unit steps AND `Failed`, so the tag is explicit) = 24 B,
+// align 8. NO LONGER feature-split: the `Box` dominates `ConnFail` regardless of
+// whether SCRAM is compiled, so both feature states are 24/8 — a deliberate
+// re-baseline (the raw-body carrier for a classified connect-time server error
+// subsumes the former ConnFail-sized width).
+crate::wire_pin!(HandshakeProgress, size = 24, align = 8);
 
 #[inline]
 fn advance(state: ConnectingState) -> ConnDispatch {
@@ -440,8 +462,16 @@ impl ConnectingEngine {
             DriveOutcome::SaslContinue { .. } => HandshakeProgress::AuthResponse,
             DriveOutcome::ParamStatus { .. } => HandshakeProgress::ParamStatus,
             DriveOutcome::ProtoFail(reason) => HandshakeProgress::Failed(reason),
-            // A server `ErrorResponse` during connect — the cause is fixed.
-            DriveOutcome::ServerFail { .. } => HandshakeProgress::Failed(ConnFail::ServerError),
+            // A server `ErrorResponse` during connect — carry the raw body bytes UP
+            // verbatim (one COLD owned alloc, on this connect-failure path only) so
+            // the driver decodes the full SQLSTATE + message with the SAME
+            // `parse_error_response` the active path uses, never an opaque string.
+            // The offsets are still valid here (the frame was just located); the
+            // sans-IO engine carries only BYTES — the decode into a `DbError`
+            // happens in core, respecting the `#![no_std]` layer boundary.
+            DriveOutcome::ServerFail { start, end } => {
+                HandshakeProgress::ServerError(Box::from(self.ingest.frame_body(start, end)))
+            }
         }
     }
 

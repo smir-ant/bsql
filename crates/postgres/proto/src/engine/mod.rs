@@ -410,9 +410,12 @@ impl<'b, T: Transport> Engine<'b, T> {
     ///
     /// # Errors
     ///
-    /// - [`EngineError::Handshake`] — the handshake failed (server error,
-    ///   unsupported auth method, SCRAM/MD5 failure, wire-illegal frame),
-    ///   carrying the classified cause.
+    /// - [`EngineError::Handshake`] — the handshake failed on a client-side
+    ///   classification (unsupported auth method, SCRAM/MD5 failure, wire-illegal
+    ///   frame), carrying the classified cause.
+    /// - [`EngineError::HandshakeServerError`] — the server answered the handshake
+    ///   with an `ErrorResponse`, carrying its raw body up so the driver decodes
+    ///   the full SQLSTATE + message.
     /// - [`EngineError::WrongPhase`] — `connect` was called when the engine was
     ///   not in its connecting phase (e.g. already active).
     /// - [`EngineError::Transport`] / [`EngineError::UnexpectedEof`] /
@@ -446,6 +449,13 @@ impl<'b, T: Transport> Engine<'b, T> {
             HandshakeOutcome::Failed(cause) => {
                 core::hint::cold_path();
                 Err(EngineError::Handshake(cause))
+            }
+            HandshakeOutcome::ServerError(body) => {
+                // A server `ErrorResponse` during connect: carry the raw body up so
+                // the driver decodes its full SQLSTATE + message with the active
+                // path's `parse_error_response` — never an opaque string.
+                core::hint::cold_path();
+                Err(EngineError::HandshakeServerError(body))
             }
             HandshakeOutcome::Ready => {
                 // Erase the handshake's secret-bearing outbound wire (the SCRAM

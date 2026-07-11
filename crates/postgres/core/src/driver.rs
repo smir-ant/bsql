@@ -2070,6 +2070,16 @@ pub fn lift_engine_error(e: EngineError<WireError>) -> DriverError {
     match e {
         EngineError::Transport(t) => lift_tls_error(t),
         EngineError::Handshake(cf) => lift_conn_fail(cf),
+        EngineError::HandshakeServerError(body) => {
+            // A server `ErrorResponse` during connect: decode the raw body with the
+            // SAME authority the active path uses (`parse_error_response`), so a
+            // connect-time failure carries its FULL SQLSTATE + message and a
+            // consumer can `err.code()` / `is_too_many_connections()` /
+            // `is_invalid_catalog_name()` on it EXACTLY as on an active-phase server
+            // error — no longer collapsed to one opaque I/O string. One cold alloc
+            // on the failure path only; the happy connect path is untouched.
+            DriverError::from(materialize::parse_error_response(&body))
+        }
         EngineError::WrongPhase(_) => DriverError::NotReady,
         EngineError::UnexpectedEof => {
             DriverError::Io(io::Error::other("server closed the connection"))
@@ -2140,6 +2150,11 @@ pub fn lift_conn_fail(cf: ConnFail) -> DriverError {
             DriverError::Config("server requested an unsupported authentication method")
         }
         ConnFail::ServerError => {
+            // Defensive: the connect flow routes a server `ErrorResponse` through
+            // `EngineError::HandshakeServerError` (raw body → classified
+            // `DriverError::Db` with the full SQLSTATE), so this `Copy` unit reaches
+            // here ONLY via a non-connect re-drive of an already-failed engine. Kept
+            // honest rather than removed.
             DriverError::Io(io::Error::other("server returned an error during startup"))
         }
         // `ConnFail` is `#[non_exhaustive]`; the malformed-frame / SCRAM / overflow
@@ -2289,5 +2304,69 @@ mod dyn_cache_tests {
         assert_eq!(cache.slots.len(), 0, "the cache is empty after a drain");
         assert!(cache.ready_index("r1").is_none());
         assert!(!cache.is_pending("p1"));
+    }
+}
+
+#[cfg(test)]
+mod connect_error_lift_tests {
+    //! The connect-time server-error lift: a raw `ErrorResponse` body carried up
+    //! by `EngineError::HandshakeServerError` (the connect flow's own error, from
+    //! both drivers' `engine.connect().map_err(lift_engine_error)`) must classify
+    //! to `DriverError::Db` with the FULL SQLSTATE — the SAME `parse_error_response`
+    //! decode the ACTIVE path produces — so a consumer can `code()` / `is_*()` on a
+    //! connect failure exactly as on a query failure. Offline + deterministic: the
+    //! lift is `parse_error_response` + the `From<DbError>` box, both pure.
+    use super::{lift_engine_error, DriverError, EngineError};
+
+    /// Build a raw `ErrorResponse` BODY — the field list AFTER the tag+length
+    /// header, i.e. the exact slice the engine's `frame_body` lends up: each field
+    /// is `<type byte><value>\0`, terminated by a `\0` type byte (PG §55.7).
+    fn error_body(severity: &str, sqlstate: &str, message: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (tag, text) in [(b'S', severity), (b'C', sqlstate), (b'M', message)] {
+            body.push(tag);
+            body.extend_from_slice(text.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        body
+    }
+
+    /// The owner's named scenario: a connection-pool storm hitting the server's
+    /// connection limit. `53300 too_many_connections` during connect must lift to a
+    /// classified `DriverError::Db` a consumer can shed load on — `is_too_many_connections()`
+    /// / `code() == "53300"` — never the former opaque
+    /// `Io("server returned an error during startup")`.
+    #[test]
+    fn too_many_connections_connect_error_classifies_53300() {
+        let body = error_body("FATAL", "53300", "sorry, too many clients already");
+        let err = lift_engine_error(EngineError::HandshakeServerError(body.into_boxed_slice()));
+        match err {
+            DriverError::Db(db) => {
+                assert_eq!(db.code(), "53300");
+                assert!(
+                    db.is_too_many_connections(),
+                    "the 53300 predicate must hold on a CONNECT error, not only an active one",
+                );
+                assert!(db.message.contains("too many clients"));
+            }
+            other => panic!("a 53300 connect error must lift to DriverError::Db, got {other:?}"),
+        }
+    }
+
+    /// The driver-level peer of the proto mid-SCRAM body-carry witness: the SAME
+    /// lift path classifies the late-arm `28P01 invalid_password` body into a
+    /// `DriverError::Db` carrying the full SQLSTATE + message.
+    #[test]
+    fn mid_scram_auth_connect_error_classifies_28p01() {
+        let body = error_body("FATAL", "28P01", "password authentication failed");
+        let err = lift_engine_error(EngineError::HandshakeServerError(body.into_boxed_slice()));
+        match err {
+            DriverError::Db(db) => {
+                assert_eq!(db.code(), "28P01");
+                assert!(db.message.contains("password authentication failed"));
+            }
+            other => panic!("a 28P01 connect error must lift to DriverError::Db, got {other:?}"),
+        }
     }
 }

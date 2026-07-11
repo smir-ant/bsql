@@ -153,6 +153,51 @@ fn connect_and_ping() {
     c.close().expect("close");
 }
 
+/// WITNESS (R5 — a connect-time server error is CLASSIFIED): a connect to a
+/// NON-EXISTENT database surfaces the server's `ErrorResponse` as a fully
+/// classified `DriverError::Db` — SQLSTATE `3D000` (`invalid_catalog_name`) plus
+/// the server's message — NOT a single opaque I/O string. `err.code()` /
+/// `is_invalid_catalog_name()` match a CONNECT error exactly as an active one.
+#[test]
+#[ignore = "requires local PG"]
+fn connect_to_missing_database_classifies_3d000() {
+    let cfg =
+        ConnectConfig::new("127.0.0.1", "smir-ant").database("bsql_r5_no_such_db".to_string());
+    match Connection::connect(&cfg) {
+        Err(bsql_postgres_sync::DriverError::Db(db)) => {
+            assert_eq!(db.code(), "3D000", "a wrong-DB connect must classify as 3D000");
+            assert!(db.is_invalid_catalog_name(), "the 3D000 predicate must hold");
+            assert!(
+                db.message.contains("bsql_r5_no_such_db"),
+                "the server message must name the missing database, got {:?}",
+                db.message,
+            );
+        }
+        Ok(_) => panic!("a connect to a non-existent database must fail"),
+        Err(other) => panic!("expected DriverError::Db(3D000), got {other:?}"),
+    }
+}
+
+/// WITNESS (R5 — bad authorization is CLASSIFIED): a connect as a NON-EXISTENT
+/// role surfaces the server's `ErrorResponse` as a classified `DriverError::Db`
+/// with an auth SQLSTATE in the `28xxx` class — the same classified `DbError` the
+/// active path produces, decoded through the same `parse_error_response`.
+#[test]
+#[ignore = "requires local PG"]
+fn connect_as_missing_role_classifies_auth_error() {
+    let cfg =
+        ConnectConfig::new("127.0.0.1", "bsql_r5_no_such_role").database("postgres".to_string());
+    match Connection::connect(&cfg) {
+        Err(bsql_postgres_sync::DriverError::Db(db)) => assert!(
+            db.code().starts_with("28"),
+            "a bad-authorization connect must classify in the 28xxx class, got {}",
+            db.code(),
+        ),
+        Ok(_) => panic!("a connect as a non-existent role must fail"),
+        Err(other) => panic!("expected DriverError::Db(28xxx), got {other:?}"),
+    }
+}
+
 /// WITNESS (steady-state timeout): `connect_timeout` gates ONLY the
 /// TCP-connect + startup/auth handshake, NOT steady-state I/O. A query the
 /// server delays LONGER than `connect_timeout` must SUCCEED (not trip a socket
