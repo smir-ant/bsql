@@ -807,6 +807,18 @@ pub enum Endpoint {
     Unix(std::path::PathBuf),
 }
 
+/// The classified `DriverError::Config` message for a unix-domain-socket host
+/// requested on a target without unix-domain sockets (e.g. Windows).
+///
+/// [`resolve_endpoint`] classifies an absolute-path host as [`Endpoint::Unix`]
+/// from purely portable data (a leading `/`), so the classification is the same on
+/// every platform. The *dial*, however, is platform-specific: a non-unix target has
+/// no `UnixStream` to open, so both drivers reject an [`Endpoint::Unix`] there with
+/// this message — a loud, classified fault, never a silent fall-through to TCP or a
+/// panic. Defined once so the two drivers cannot drift in what they report.
+pub const UNIX_SOCKET_UNSUPPORTED: &str =
+    "unix-domain sockets are not available on this platform; use a TCP host (host:port)";
+
 impl Endpoint {
     /// Whether this endpoint is a unix-domain socket.
     ///

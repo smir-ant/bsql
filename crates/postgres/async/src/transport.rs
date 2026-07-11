@@ -35,7 +35,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
+// `tokio::net::UnixStream` exists only on unix targets. A unix-socket host on a
+// non-unix target is rejected at connect (see the driver's `Endpoint::Unix` arm),
+// so no non-unix `Unix` arm is needed here.
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::time::Instant;
 
 use bsql_postgres_proto::engine::Transport;
@@ -63,7 +68,8 @@ use bsql_postgres_proto::engine::Transport;
 pub enum Sock {
     /// A TCP socket (the default, non-path host).
     Tcp(TcpStream),
-    /// A unix-domain socket (an absolute-path host).
+    /// A unix-domain socket (an absolute-path host). Unix targets only.
+    #[cfg(unix)]
     Unix(UnixStream),
 }
 
@@ -77,6 +83,7 @@ impl AsyncRead for Sock {
         // `get_mut` needs `Self: Unpin` (both arms are), so no unsafe projection.
         match self.get_mut() {
             Sock::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(unix)]
             Sock::Unix(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -91,6 +98,7 @@ impl AsyncWrite for Sock {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Sock::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(unix)]
             Sock::Unix(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
@@ -99,6 +107,7 @@ impl AsyncWrite for Sock {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Sock::Tcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(unix)]
             Sock::Unix(s) => Pin::new(s).poll_flush(cx),
         }
     }
@@ -107,6 +116,7 @@ impl AsyncWrite for Sock {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Sock::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(unix)]
             Sock::Unix(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
@@ -211,6 +221,11 @@ pub(crate) struct TokioSocket {
 // pins its ABSOLUTE 8/4 footprint; the asymmetry is deliberate.)
 const _: () = {
     use core::mem::size_of;
+    // Property 1 compares the two arms and so is unix-only (no `UnixStream` type
+    // exists elsewhere). Properties 2 and 3 hold regardless: on a non-unix target
+    // `Sock` is the single-variant `Tcp` (size == `TcpStream`, still within the
+    // bound), and `TokioSocket` still adds only the deadline `Arc`.
+    #[cfg(unix)]
     assert!(size_of::<TcpStream>() == size_of::<UnixStream>());
     assert!(size_of::<Sock>() <= size_of::<TcpStream>() + size_of::<usize>());
     assert!(size_of::<TokioSocket>() == size_of::<Sock>() + size_of::<Arc<ReadDeadline>>());

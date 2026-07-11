@@ -55,6 +55,15 @@
 //! a thin handle (engine + token + control socket + cached params) and is not
 //! separately pinned.
 
+// bsql's footprint pins (defined in `bsql-postgres-core` / `-proto`) assert exact
+// `size_of` / `align_of` values computed for 64-bit pointers; on a non-64-bit
+// target they fail as a wall of confusing `E0080` "FOOTPRINT DRIFT" panics. This
+// one honest line replaces that wall. 64-bit is the only supported width
+// (i686 / wasm32 / 32-bit ARM are unrequested and unsupported); 64-bit builds are
+// unaffected.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("bsql requires a 64-bit target; the footprint pins assume 64-bit pointers");
+
 mod cancel;
 mod connection;
 mod pool;

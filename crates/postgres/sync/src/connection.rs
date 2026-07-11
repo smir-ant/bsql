@@ -14,8 +14,11 @@
 //! The liveness token, health-bit semantics, and recoverable-error model all live
 //! in `Core` (see its docs); this module supplies only the blocking-specific
 //! connect (socket read/write timeouts + a `try_clone`d control handle), the
-//! notification read-timeout arming, the `FnOnce` `transaction` / `copy_in_with`,
-//! and the best-effort `Drop`-time `Terminate`.
+//! notification read-timeout arming, and the `FnOnce` `transaction` /
+//! `copy_in_with`. Dropping a [`Connection`] closes the socket fd (an abrupt FIN
+//! PostgreSQL treats like a `Terminate`); a graceful protocol-level `Terminate` is
+//! sent only by an explicit [`Connection::close`], never on `Drop` — an implicit
+//! drop must never risk a blocking write (see the `Connection` `Drop` note below).
 //!
 //! # Footprint regime
 //!
@@ -32,6 +35,9 @@ use core::str::FromStr;
 #[cfg(feature = "tls")]
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+// Unix targets only — `std::os::unix` is absent elsewhere; a unix-socket host on a
+// non-unix target is rejected at connect (see the `Endpoint::Unix` dial arm below).
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -50,6 +56,9 @@ use bsql_postgres_core::{
     MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification, QueryResult,
     Redial, Row, Rows, SslMode, TypedNotification,
 };
+// Referenced only by the non-unix `Endpoint::Unix` reject arm in `dial_socket`.
+#[cfg(not(unix))]
+use bsql_postgres_core::UNIX_SOCKET_UNSUPPORTED;
 use bsql_postgres_proto::engine::{self, EngineError, SpuriousPending};
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
@@ -386,7 +395,10 @@ impl Connection {
         // Rejected before the connect syscall — a wasted dial would tell us
         // nothing, and this is a pre-connect configuration fault. (A defaulted
         // unix endpoint resolves to Prefer, so this fires only for an EXPLICIT
-        // `SslMode::Require`.)
+        // `SslMode::Require`.) Unix-only: on a non-unix target a unix endpoint can
+        // never be dialed at all, so the platform rejection below subsumes this
+        // (and takes precedence — the more fundamental fault wins).
+        #[cfg(unix)]
         if endpoint.is_unix() && ssl_mode == SslMode::Require {
             return Err(DriverError::Config(
                 "SslMode::Require cannot be honored over a unix-domain socket \
@@ -410,7 +422,13 @@ impl Connection {
                 tcp.set_nodelay(true)?;
                 SyncSock::Tcp(tcp)
             }
+            #[cfg(unix)]
             Endpoint::Unix(path) => SyncSock::Unix(UnixStream::connect(&path)?),
+            // No unix-domain socket on a non-unix target: fail loud + classified,
+            // never a silent TCP fallback or a panic. The classification lives in
+            // `resolve_endpoint` (portable); only the dial is platform-specific.
+            #[cfg(not(unix))]
+            Endpoint::Unix(_path) => return Err(DriverError::Config(UNIX_SOCKET_UNSUPPORTED)),
         };
         Ok((sock, ssl_mode))
     }
@@ -429,7 +447,7 @@ impl Connection {
         config: &ConnectConfig,
         ssl_mode: SslMode,
     ) -> Result<SyncWire, DriverError> {
-        if matches!(sock, SyncSock::Unix(_)) || ssl_mode == SslMode::Disable {
+        if sock.is_unix() || ssl_mode == SslMode::Disable {
             return Ok(Wire::Plain(SyncSocket::new(sock)));
         }
         // A TCP socket with `ssl_mode` == `Prefer` or `Require` here.
@@ -1655,15 +1673,18 @@ impl Transaction<'_> {
     }
 }
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        // Best-effort graceful terminate over the blocking socket (resolves in one
-        // poll). Drop cannot propagate the outcome and a closed socket is fine, so
-        // it is explicitly discarded. `close` is idempotent — a no-op if the token
-        // was already taken (a graceful `close` call, or a fatal verb).
-        drop(engine::poll_once(self.core.close()));
-    }
-}
+// `Connection` deliberately has NO `Drop`: dropping it simply closes the socket
+// fd, and PostgreSQL treats the resulting abrupt FIN identically to a graceful
+// `Terminate` ('X') for a connection at idle — either way the backend tears down
+// its session. A `Drop` that wrote `Terminate` would be a BLOCKING write on a
+// socket whose write deadline is `None`; if the local send buffer were full and
+// the peer had stopped ACKing (a half-open socket), that write could block
+// unboundedly inside `drop` — a hazard Rust's `Drop` cannot signal or bound. A
+// caller who wants the graceful protocol-level goodbye calls
+// [`Connection::close`] explicitly (where blocking is the caller's choice); an
+// implicit drop must never block. This matches the async driver, whose
+// `Connection` likewise has no `Drop` — so the two drivers close a connection
+// identically.
 
 /// Classify an [`io::Error`] from the connect-phase `SSLRequest` probe — the raw
 /// `write_all` / `read_exact` on the bare socket BEFORE the wire is built.

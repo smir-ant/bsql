@@ -27,9 +27,17 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
+// The unix-domain-socket arm exists only on unix targets — `std::os::unix` is not
+// present elsewhere. A unix-socket host on a non-unix target is rejected at connect
+// with a classified `DriverError::Config` (never a silent TCP fallback), so nothing
+// below needs a non-unix `Unix` arm.
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
+// Used only by the two `#[cfg(unix)]` footprint pins below (they capture the unix
+// fd layout); on a non-unix target there is no socket duality to pin.
+#[cfg(unix)]
 use bsql_postgres_core::footprint_pin;
 use bsql_postgres_proto::engine::Transport;
 
@@ -49,13 +57,18 @@ use bsql_postgres_proto::engine::Transport;
 pub enum SyncSock {
     /// A TCP socket (the default, non-path host).
     Tcp(TcpStream),
-    /// A unix-domain socket (an absolute-path host).
+    /// A unix-domain socket (an absolute-path host). Unix targets only.
+    #[cfg(unix)]
     Unix(UnixStream),
 }
 
 // A `TcpStream`/`UnixStream` is a 4-byte fd handle; the two-arm enum is that plus
 // a discriminant, rounded to 8. The pin makes the +4 B (over a bare `TcpStream`)
 // the socket duality costs a visible, reviewed number rather than a silent drift.
+// Unix-only: it captures the unix fd layout (a 4-byte `RawFd`, align 4); a non-unix
+// `TcpStream` wraps a platform handle of a different size/align, so the pin does not
+// apply there (and there is no unix arm to cost).
+#[cfg(unix)]
 footprint_pin!(SyncSock, size = 8, align = 4);
 
 impl SyncSock {
@@ -66,6 +79,7 @@ impl SyncSock {
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match self {
             SyncSock::Tcp(s) => s.set_read_timeout(dur),
+            #[cfg(unix)]
             SyncSock::Unix(s) => s.set_read_timeout(dur),
         }
     }
@@ -76,6 +90,7 @@ impl SyncSock {
     pub fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match self {
             SyncSock::Tcp(s) => s.set_write_timeout(dur),
+            #[cfg(unix)]
             SyncSock::Unix(s) => s.set_write_timeout(dur),
         }
     }
@@ -86,7 +101,25 @@ impl SyncSock {
     pub fn try_clone(&self) -> io::Result<SyncSock> {
         match self {
             SyncSock::Tcp(s) => s.try_clone().map(SyncSock::Tcp),
+            #[cfg(unix)]
             SyncSock::Unix(s) => s.try_clone().map(SyncSock::Unix),
+        }
+    }
+
+    /// Whether this is a unix-domain socket.
+    ///
+    /// Always `false` on a non-unix target — no `Unix` arm exists there and a
+    /// unix-socket host is rejected before a socket is ever built — so a caller
+    /// gating the TLS-only steps on socket kind stays portable.
+    #[inline]
+    pub fn is_unix(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, SyncSock::Unix(_))
+        }
+        #[cfg(not(unix))]
+        {
+            false
         }
     }
 
@@ -95,6 +128,7 @@ impl SyncSock {
     fn shutdown_write(&self) -> io::Result<()> {
         match self {
             SyncSock::Tcp(s) => s.shutdown(Shutdown::Write),
+            #[cfg(unix)]
             SyncSock::Unix(s) => s.shutdown(Shutdown::Write),
         }
     }
@@ -105,6 +139,7 @@ impl Read for SyncSock {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             SyncSock::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
             SyncSock::Unix(s) => s.read(buf),
         }
     }
@@ -115,6 +150,7 @@ impl Write for SyncSock {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             SyncSock::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
             SyncSock::Unix(s) => s.write(buf),
         }
     }
@@ -123,6 +159,7 @@ impl Write for SyncSock {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             SyncSock::Tcp(s) => s.flush(),
+            #[cfg(unix)]
             SyncSock::Unix(s) => s.flush(),
         }
     }
@@ -143,6 +180,9 @@ pub struct SyncSocket {
 
 // The wrapper is exactly its inner `SyncSock` — the same 8 B — with no added
 // state. Pinned so the wrapper cannot silently grow past the socket it carries.
+// Unix-only, for the same reason as the `SyncSock` pin above (the std socket
+// layout it captures is the unix fd's).
+#[cfg(unix)]
 footprint_pin!(SyncSocket, size = 8, align = 4);
 
 impl SyncSocket {

@@ -152,6 +152,9 @@ impl core::fmt::Debug for ConnectingState {
 // the dominant payload is one 8 B pointer (the boxed-secret arms) or the 8 B
 // `pid: i32` + `secret_key: Sensitive<i32>` pair; the enum adds an 8 B-aligned
 // discriminant, settling at 16 B. A layout drift is an E0080 build failure.
+// 64-bit-scoped (the pinned 16 B is a 64-bit-pointer figure) — on any other width
+// the crate-root `compile_error!` is the single honest diagnostic.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(
     core::mem::size_of::<ConnectingState>() == 16,
     "ConnectingState 16 B — one 8 B boxed-secret pointer (or pid+secret pair) \

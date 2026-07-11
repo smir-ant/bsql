@@ -33,7 +33,11 @@ use std::time::Duration;
 use std::io;
 #[cfg(feature = "tls")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
+// Unix targets only — `tokio::net::UnixStream` is absent elsewhere; a unix-socket
+// host on a non-unix target is rejected at connect (see the `Endpoint::Unix` arm).
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::time::Instant;
 
 use bsql_postgres_core::driver::{lift_conn_fail, lift_engine_error, Core};
@@ -52,6 +56,9 @@ use bsql_postgres_core::{
     MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification, QueryResult,
     Redial, Row, Rows, SslMode, TypedNotification,
 };
+// Referenced only by the non-unix `Endpoint::Unix` reject arm in `build_wire`.
+#[cfg(not(unix))]
+use bsql_postgres_core::UNIX_SOCKET_UNSUPPORTED;
 use bsql_postgres_proto::engine;
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
@@ -301,6 +308,7 @@ impl Connection {
                 tcp.set_nodelay(true)?;
                 Self::build_tcp_wire(tcp, config, ssl_mode, deadline).await
             }
+            #[cfg(unix)]
             Endpoint::Unix(path) => {
                 // Fail LOUD: TLS cannot be required over a socket that will never
                 // do it. A local kernel socket is trusted by filesystem
@@ -321,6 +329,11 @@ impl Connection {
                     Arc::clone(deadline),
                 )))
             }
+            // No unix-domain socket on a non-unix target: fail loud + classified,
+            // never a silent TCP fallback or a panic. The classification lives in
+            // `resolve_endpoint` (portable); only the dial is platform-specific.
+            #[cfg(not(unix))]
+            Endpoint::Unix(_path) => Err(DriverError::Config(UNIX_SOCKET_UNSUPPORTED)),
         }
     }
 

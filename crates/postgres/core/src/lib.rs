@@ -42,6 +42,14 @@
 //! sans-IO engine surface), `ConnectConfig`, `DriverError`, `tls`/`ssl` modules.
 //! Both `bsql-postgres-async` and `bsql-postgres-sync` depend on this.
 
+// bsql's `footprint_pin!` guards assert exact `size_of` / `align_of` values
+// computed for 64-bit pointers; on a non-64-bit target they fail as a wall of
+// confusing `E0080` "FOOTPRINT DRIFT" panics. This one honest line replaces that
+// wall. 64-bit is the only supported width (i686 / wasm32 / 32-bit ARM are
+// unrequested and unsupported); 64-bit builds are unaffected.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("bsql requires a 64-bit target; the footprint pins assume 64-bit pointers");
+
 // The shared live-PostgreSQL SQL-mechanism scenario library
 // (`define_sql_scenario_tests!`), run by BOTH drivers' `--ignored` live
 // suites. A test-only concern, so it lives behind the OFF-BY-DEFAULT
@@ -99,7 +107,7 @@ pub mod types;
 pub use cancel::{CancelKey, Redial};
 pub use config::{
     resolve_endpoint, validate_startup_params, ChannelBindingMode, ConnectConfig, Endpoint,
-    SslMode,
+    SslMode, UNIX_SOCKET_UNSUPPORTED,
 };
 #[cfg(feature = "scram")]
 pub use config::resolve_channel_binding;

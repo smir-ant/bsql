@@ -54,6 +54,14 @@
 //!   SqliteError      32      8   String-carrying variants (niche-packed tag)
 //! ```
 
+// bsql's `footprint_pin!` guards assert exact `size_of` / `align_of` values
+// computed for 64-bit pointers; on a non-64-bit target they fail as a wall of
+// confusing `E0080` "FOOTPRINT DRIFT" panics. This one honest line replaces that
+// wall. 64-bit is the only supported width (i686 / wasm32 / 32-bit ARM are
+// unrequested and unsupported); 64-bit builds are unaffected.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("bsql requires a 64-bit target; the footprint pins assume 64-bit pointers");
+
 /// Pin the `size_of` AND `align_of` of a nameable type at build time — a
 /// layout drift becomes an `E0080` const-eval failure. The emitted
 /// `const _: ()` item is evaluated at `cargo check`, including for a type
@@ -63,6 +71,11 @@
 /// crate has no dependency on those crates, so it carries its own copy.
 macro_rules! footprint_pin {
     ($t:ty, size = $n:expr, align = $a:expr $(,)?) => {
+        // The pinned `size`/`align` are computed for 64-bit pointers, so the assert
+        // is scoped to 64-bit targets — the only width bsql supports. On any other
+        // width the crate-root `compile_error!` (which forbids non-64-bit) is the
+        // single honest diagnostic, not a wall of misleading per-pin drift panics.
+        #[cfg(target_pointer_width = "64")]
         const _: () = {
             assert!(
                 core::mem::size_of::<$t>() == $n,
