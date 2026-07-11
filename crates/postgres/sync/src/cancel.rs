@@ -92,7 +92,10 @@ impl CancelToken {
         let budget = Duration::from_secs(self.redial.connect_timeout_secs());
         sock.set_read_timeout(Some(budget))?;
         sock.set_write_timeout(Some(budget))?;
-        let mut wire = Connection::build_wire(sock, &config, ssl_mode)?;
+        // A detached, throwaway cancel dial carries no diagnostics sink — an SSL
+        // downgrade here keeps the historical stderr warning, never a wired event.
+        let diagnostics = bsql_postgres_core::Diagnostics::default();
+        let mut wire = Connection::build_wire(sock, &config, ssl_mode, &diagnostics)?;
         send_cancel_packet(&mut wire, &self.key.request_bytes())
     }
 }

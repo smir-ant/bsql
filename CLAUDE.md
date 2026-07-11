@@ -727,11 +727,83 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `Prefer` over unix is plaintext with NO downgrade warning (nothing was
   downgraded). Measured local win: the unix socket is ~2.4–2.9× faster than
   loopback TCP on the by-PK single-round-trip (`bench/benches/unix_vs_tcp.rs`).
-- `SslMode::Prefer` warns on stderr (debug AND release) when the server refuses
-  SSL and it falls back to plain TCP — an SSL downgrade is a security event a
-  production build must not hide. A consumer can also assert
-  `Connection::is_encrypted()` (both drivers) to reject a plaintext/downgraded
-  connection.
+- `SslMode::Prefer` surfaces an SSL downgrade (the server refused TLS and it fell
+  back to plain TCP — a security event a production build must not hide): it
+  routes through the structured-diagnostics sink as `DiagEvent::SslDowngrade`
+  when one is installed (see the diagnostics bullet below), and keeps the
+  historical stderr warning (debug AND release) when no sink is set, so a
+  consumer who installs no sink sees no behaviour change. A consumer can also
+  assert `Connection::is_encrypted()` (both drivers) to reject a
+  plaintext/downgraded connection.
+- **Structured diagnostics — `DiagEvent` + the `Diagnostics` sink.** The dep-free
+  observability seam (no `tracing`/`log`/`metrics` in the runtime graph — a
+  consumer picks their own stack; an optional `tracing` adapter can wrap the
+  callback later). A `Diagnostics` handle carries an
+  `Option<Arc<dyn Fn(&DiagEvent<'_>) + Send + Sync>>` sink plus a slow-query
+  threshold; a consumer installs it on a standalone connection
+  (`Connection::connect_with(config, &diag)` / `set_diagnostics`) or on a pool
+  (`Pool::builder(config, max).on_diagnostic(..).slow_query_threshold(..).build()`,
+  which rides every minted connection). It is NOT a `ConnectConfig` field — the
+  152-byte config footprint is untouched. **Zero-cost when off:** an unset sink
+  is a single never-taken `if let Some` branch at each COLD lifecycle boundary —
+  no event built, no wire parsed, no `Instant::now`, no alloc; the per-row hot
+  path is untouched (the `next_event` codegen ceiling is byte-identical — this is
+  the deliberate distinction from the deleted per-row `Observer`, which fired per
+  row on the hot path). **No PII:** a `DiagEvent` never carries a bound parameter
+  VALUE — a slow-query event carries the SQL TEXT (or a digest a consumer
+  computes), never the values. **A panicking sink cannot hurt the driver:** the
+  sink is arbitrary consumer code, so EVERY invocation routes through ONE
+  `diag::dispatch` that wraps it in `catch_unwind(AssertUnwindSafe(..))` (SAFE — no
+  `unsafe`) and DROPS a caught panic (noted once to stderr); diagnostics are
+  strictly non-correctness, so a buggy callback can never poison a connection
+  (unwind a verb before it restores its `Live` token → `NotReady`) or abort the
+  process (a double-panic from a `Drop` mid-unwind). **A sink can do ANYTHING —
+  the driver absorbs it structurally:** a pool event's sink runs OUTSIDE the
+  pool's state lock (the sync pool `drop`s the guard before the emit), so a sink
+  that inspects the pool (`pool.stats()`) cannot deadlock; and a per-thread
+  `IN_DISPATCH` flag in the single `dispatch` chokepoint SUPPRESSES any diagnostic
+  emitted from WITHIN a sink (a self-slow query, a `pool.get()` that times out, a
+  direct `emit`), so a self-emitting sink fires exactly once and can never recurse
+  into a stack-overflow abort (the flag resets via an RAII guard, so it clears
+  even if the sink panics). So the sink contract is the strongest form — a sink
+  may do anything, and the only consequence a consumer owns is that a diagnostic
+  emitted from inside a sink does not itself reach a sink. The events (all
+  `#[non_exhaustive]`): `ServerNotice
+  { severity, code, message }` (a `RAISE NOTICE`/`WARNING` — the primary PL/pgSQL
+  log channel, formerly dropped `=> {}` by both materializers; surfaced by the
+  shared `capture_notify` adapter, borrowed `Cow` fields, total parse via the
+  fuzz-proven `error_response_fields` walk; SCOPE: STEADY-STATE query streams — a
+  pre-auth NoticeResponse during the connect HANDSHAKE rides the connecting-phase
+  dispatch and is not surfaced); `SslDowngrade { host }`; `SlowQuery { sql, elapsed
+  }` (gated behind `Diagnostics::slow_query_armed()` = a threshold AND a sink, so
+  the off path reads no clock — reported by a `SlowQueryGuard` that fires on drop,
+  ONLY for a verb that COMPLETED successfully — `commit_slow` marks the `Ok` path;
+  an errored/cancelled/panicked verb reports nothing — and covers the compile-
+  checked FLAGSHIP (`query`/`query_one`/`query_opt`/typed `execute`) AND the
+  dynamic verbs (`query_sql`/`execute_sql`/`query_params`/`execute_params`, timing
+  the whole cache-promotion), DELIBERATELY excluding the streaming verbs
+  (`query_each*` — a stream's duration is consumer iteration time, not query
+  latency) and the low-level `query_prepared`/`execute_prepared` primitive
+  (already timed via `query_params`); `PoolAcquireTimeout { waited }` /
+  `PoolConnectionEvicted` (plus monotonic relaxed-atomic counters —
+  acquire-timeouts, evictions, and waiter high-water which counts only truly
+  BLOCKED waiters via the async `try_acquire_owned` fast-path, `0` when
+  uncontended — via `Pool::stats() -> PoolStats`); `ParameterStatus { name, value }`
+  (a GUC change); `MigrationLockWaiting { elapsed }` / `MigrationApplying { name }`
+  / `MigrationApplied { name }` (a serialized deploy is no longer a silent
+  freeze); and `PreparedCacheSelfHeal { sql }` (the transparent stale-plan
+  re-prepare, an otherwise-invisible fallback). All fire ONLY at cold boundaries,
+  never from the DataRow hot arm. Witnessed live on both drivers
+  (`raise_notice_surfaces...`, `ssl_prefer_downgrade_routes...`,
+  `pool_acquire_timeout_emits_and_counts`, `slow_query_emits_with_the_threshold_set`,
+  the typed `typed_slow_query_emits_slow_query`, the panic-safety
+  `panicking_sink_neither_aborts_nor_poisons_the_connection`, the no-deadlock
+  `sync_pool_stats_sink_on_acquire_timeout_does_not_deadlock`, the
+  `uncontended_checkout_leaves_waiters_high_water_zero`,
+  `{async,sync}_runner_emits_progress_events`, all `--ignored`) + offline (the seam
+  plumbing, the notice/param-status/arm-gate parses). Follow-ups: a
+  `Connected`/`CancelRedial` lifecycle event, cancel issue/no-op events, and the
+  optional default-off `tracing` adapter.
 - The default `SslMode` is THREAT-SCOPED, not a fixed value: when the consumer
   sets none (no builder `ssl_mode` / DSN `sslmode=` / `PGSSLMODE`), the effective
   mode is resolved at connect against the endpoint by

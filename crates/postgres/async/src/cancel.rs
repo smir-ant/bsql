@@ -103,7 +103,11 @@ impl CancelToken {
         let config = self.redial.rebuild_config();
         // The cancel never reads a reply, so a fresh disarmed deadline suffices.
         let deadline = Arc::new(ReadDeadline::new());
-        let mut wire = Connection::connect_wire(&config, &deadline).await?;
+        // A detached, throwaway cancel dial carries no diagnostics sink — an SSL
+        // downgrade here (should the cancel endpoint's TLS posture differ) keeps
+        // the historical stderr warning, never a wired event.
+        let diagnostics = bsql_postgres_core::Diagnostics::default();
+        let mut wire = Connection::connect_wire(&config, &deadline, &diagnostics).await?;
         send_cancel_packet(&mut wire, &self.key.request_bytes()).await
     }
 }

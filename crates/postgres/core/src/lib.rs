@@ -67,6 +67,11 @@ pub mod test_scenarios;
 // driver's `CancelToken`.
 pub mod cancel;
 pub mod config;
+// The dep-free structured-diagnostics seam: the `DiagEvent` vocabulary, the
+// `DiagSink` callback type, and the `Diagnostics` config handle. Zero-cost when
+// no sink is installed (see the module docs); fires only at cold lifecycle
+// boundaries, never on the per-row hot path.
+pub mod diag;
 // The transport-generic driver engine (`Core<S>`): every non-I/O verb written
 // ONCE, shared by the async and sync drivers, monomorphised per transport.
 pub mod driver;
@@ -109,6 +114,7 @@ pub use config::{
     resolve_endpoint, validate_startup_params, ChannelBindingMode, ConnectConfig, Endpoint,
     SslMode, UNIX_SOCKET_UNSUPPORTED,
 };
+pub use diag::{DiagEvent, DiagSink, Diagnostics, PoolStats};
 #[cfg(feature = "scram")]
 pub use config::resolve_channel_binding;
 pub use driver::{Core, PreparedStatement};

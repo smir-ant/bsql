@@ -35,6 +35,167 @@ async fn connect_over_unix_socket_and_query() {
     c.close().await.expect("close");
 }
 
+/// WITNESS (C1a — server NOTICE surfacing): a query that `RAISE NOTICE`s
+/// surfaces the notice through the installed diagnostics sink with its severity
+/// + SQLSTATE + message, instead of the driver silently dropping it (a `NOTICE`
+/// is the primary PL/pgSQL logging channel). Proves `Connection::connect_with`
+/// installs the sink and the `capture_notify` adapter routes a `NoticeResponse`
+/// to `DiagEvent::ServerNotice` end-to-end.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn raise_notice_surfaces_through_the_diagnostics_sink() {
+    use std::sync::{Arc, Mutex};
+
+    use bsql_postgres_async::{DiagEvent, Diagnostics};
+
+    let captured: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_in = Arc::clone(&captured);
+    let diag = Diagnostics::new().on_event(move |ev: &DiagEvent<'_>| {
+        if let DiagEvent::ServerNotice { severity, code, message } = ev {
+            captured_in.lock().expect("diag lock").push((
+                severity.to_string(),
+                code.to_string(),
+                message.to_string(),
+            ));
+        }
+    });
+
+    let cfg = ConnectConfig::new("/tmp", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect_with(&cfg, &diag).await.expect("connect_with");
+    // A `DO` block that raises a NOTICE — the PL/pgSQL log channel. Runs as a
+    // plain command (no rows), so the notice rides its response stream.
+    c.execute_sql("DO $$ BEGIN RAISE NOTICE 'hello from bsql notice'; END $$")
+        .await
+        .expect("DO with RAISE NOTICE");
+
+    let got = captured.lock().expect("diag lock").clone();
+    assert!(
+        got.iter()
+            .any(|(sev, _code, msg)| sev == "NOTICE" && msg == "hello from bsql notice"),
+        "the RAISE NOTICE must surface through the sink with its severity + message, got {got:?}",
+    );
+    // The connection stays fully usable after surfacing the notice.
+    let row = c.query_one_sql("SELECT 42").await.expect("query after notice");
+    assert_eq!(row.get_i32(0), Ok(Some(42)));
+    drop(c); // cleanup only; the witness assertions ran above
+}
+
+/// WITNESS (C1b — SSL downgrade routing): a TCP connect with `SslMode::Prefer`
+/// to a server that refuses TLS (the local PG has `ssl=off`) falls back to
+/// plaintext AND routes the downgrade through the installed sink as
+/// `DiagEvent::SslDowngrade` (naming the host) — instead of the bare stderr
+/// warning a headless service cannot capture. Proves the sink is threaded into
+/// the connect sequence, so a CONNECT-time event surfaces.
+#[tokio::test]
+#[ignore = "requires local PG with ssl=off on TCP"]
+async fn ssl_prefer_downgrade_routes_through_the_diagnostics_sink() {
+    use std::sync::{Arc, Mutex};
+
+    use bsql_postgres_async::{DiagEvent, Diagnostics};
+
+    let downgrades: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let downgrades_in = Arc::clone(&downgrades);
+    let diag = Diagnostics::new().on_event(move |ev: &DiagEvent<'_>| {
+        if let DiagEvent::SslDowngrade { host } = ev {
+            downgrades_in.lock().expect("diag lock").push((*host).to_string());
+        }
+    });
+
+    // TCP (not unix — the SSLRequest probe is TCP-only) with an EXPLICIT Prefer,
+    // so a refusal is a downgrade rather than a loud Require error.
+    let cfg = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(SslMode::Prefer);
+    let c = Connection::connect_with(&cfg, &diag).await.expect("connect_with over TCP");
+    assert!(!c.is_encrypted(), "the server refused TLS — the connection is plaintext");
+
+    let got = downgrades.lock().expect("diag lock").clone();
+    assert_eq!(
+        got.as_slice(),
+        &["127.0.0.1".to_string()],
+        "the SSL downgrade must route through the sink with the host, got {got:?}",
+    );
+    drop(c); // cleanup only; the witness assertions ran above
+}
+
+/// WITNESS (C1c — pool saturation): a max-size-1 pool with one connection held
+/// times out the second checkout AND surfaces a `DiagEvent::PoolAcquireTimeout`
+/// through the sink, with the acquire-timeout counter + waiter high-water mark
+/// recorded in `Pool::stats()`. The named "reconnect storm / thousands of
+/// connections" blind zone made observable.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pool_acquire_timeout_emits_and_counts() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use bsql_postgres_async::{DiagEvent, Pool};
+
+    let timeouts: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let timeouts_in = Arc::clone(&timeouts);
+    let cfg = ConnectConfig::new("/tmp", "smir-ant").database("postgres".to_string());
+    let pool = Pool::builder(cfg, 1)
+        .acquire_timeout(Duration::from_millis(150))
+        .on_diagnostic(move |ev: &DiagEvent<'_>| {
+            if let DiagEvent::PoolAcquireTimeout { .. } = ev {
+                *timeouts_in.lock().expect("diag lock") += 1;
+            }
+        })
+        .build();
+
+    // Hold the ONLY slot, then a second checkout must time out (no slot free).
+    let held = pool.get().await.expect("first checkout");
+    match pool.get().await {
+        Err(DriverError::PoolTimeout) => {}
+        Err(other) => panic!("expected PoolTimeout, got {other:?}"),
+        Ok(_) => panic!("a max-size-1 pool must not hand out a second connection"),
+    }
+
+    assert_eq!(*timeouts.lock().expect("diag lock"), 1, "the acquire timeout emitted once");
+    let stats = pool.stats();
+    assert_eq!(stats.acquire_timeouts, 1, "the counter recorded the timeout");
+    assert!(stats.waiters_high_water >= 1, "a waiter was queued: {stats:?}");
+    drop(held);
+}
+
+/// WITNESS (C1d — slow-query detection): with a slow-query threshold set, a
+/// query whose round trip exceeds it emits `DiagEvent::SlowQuery` carrying the
+/// SQL TEXT (never the param values — no PII), while a fast query below the
+/// threshold emits nothing. The zero-cost-off half (no clock read when the
+/// threshold is unset) is proven offline by `Diagnostics::slow_query_armed`.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn slow_query_emits_with_the_threshold_set() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use bsql_postgres_async::{DiagEvent, Diagnostics};
+
+    let slow: Arc<Mutex<Vec<(String, Duration)>>> = Arc::new(Mutex::new(Vec::new()));
+    let slow_in = Arc::clone(&slow);
+    let diag = Diagnostics::new()
+        .slow_query_threshold(Duration::from_millis(50))
+        .on_event(move |ev: &DiagEvent<'_>| {
+            if let DiagEvent::SlowQuery { sql, elapsed } = ev {
+                slow_in.lock().expect("diag lock").push(((*sql).to_string(), *elapsed));
+            }
+        });
+    let cfg = ConnectConfig::new("/tmp", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect_with(&cfg, &diag).await.expect("connect_with");
+
+    // A fast query is BELOW the 50ms threshold → no event.
+    let _row = c.query_one_sql("SELECT 1").await.expect("fast query");
+    assert!(slow.lock().expect("diag lock").is_empty(), "a fast query is not reported slow");
+
+    // A slow query (the server sleeps 200ms) is ABOVE it → exactly one event.
+    let _qr = c.query_sql("SELECT pg_sleep(0.2)").await.expect("slow query");
+    let got = slow.lock().expect("diag lock").clone();
+    assert_eq!(got.len(), 1, "the slow query emitted once, got {got:?}");
+    assert!(got[0].0.contains("pg_sleep"), "the event carries the SQL text, got {:?}", got[0].0);
+    assert!(got[0].1 >= Duration::from_millis(50), "elapsed >= threshold, got {:?}", got[0].1);
+    drop(c); // cleanup only; the witness assertions ran above
+}
+
 /// FAIL LOUD: `SslMode::Require` over a unix-domain socket is a classified
 /// `DriverError::Config` — never a silent plaintext downgrade. Needs NO live PG:
 /// the rejection precedes the connect syscall (it still completes within the
@@ -1934,4 +2095,49 @@ mod sql_scenarios {
     }
 
     bsql_postgres_core::define_sql_scenario_tests!(make_async_blocking_conn);
+}
+
+/// WITNESS (review BLOCKER 2, async — a panicking sink neither aborts nor
+/// poisons): a sink that PANICS on every event, threshold ZERO so `SlowQuery`
+/// fires, over a `DO … RAISE NOTICE`. Both panics are contained by `catch_unwind`;
+/// the test completing proves no abort, and `SELECT 42` proves no poisoning.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn panicking_sink_neither_aborts_nor_poisons_the_connection() {
+    use std::time::Duration;
+
+    use bsql_postgres_async::{DiagEvent, Diagnostics};
+
+    let diag = Diagnostics::new()
+        .slow_query_threshold(Duration::ZERO)
+        .on_event(|_ev: &DiagEvent<'_>| panic!("boom — a deliberately buggy sink"));
+    let cfg = ConnectConfig::new("/tmp", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect_with(&cfg, &diag).await.expect("connect_with");
+
+    c.execute_sql("DO $$ BEGIN RAISE NOTICE 'x'; END $$")
+        .await
+        .expect("the DO completes despite the panicking sink");
+
+    let row = c.query_one_sql("SELECT 42").await.expect("connection still usable, not NotReady");
+    assert_eq!(row.get_i32(0), Ok(Some(42)));
+    drop(c);
+}
+
+/// WITNESS (review MAJOR 4, async — uncontended checkout leaves
+/// waiters_high_water at 0): a single checkout on a pool with a free slot never
+/// blocks (the acquire fast-paths `try_acquire_owned`), so the gauge stays 0.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn uncontended_checkout_leaves_waiters_high_water_zero() {
+    use bsql_postgres_async::Pool;
+
+    let cfg = ConnectConfig::new("/tmp", "smir-ant").database("postgres".to_string());
+    let pool = Pool::builder(cfg, 4).build();
+    let c = pool.get().await.expect("uncontended checkout");
+    assert_eq!(
+        pool.stats().waiters_high_water,
+        0,
+        "an uncontended checkout must not register a blocked waiter",
+    );
+    drop(c);
 }

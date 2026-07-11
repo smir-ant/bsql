@@ -70,7 +70,7 @@ mod pool;
 mod transport;
 
 pub use bsql_postgres_core::{
-    AppliedMigration, BorrowedRow, ChannelBindingMode, ColumnError, CommandTag, ConnectConfig, DbError, DriftKind, DriverError,
+    AppliedMigration, BorrowedRow, ChannelBindingMode, ColumnError, CommandTag, ConnectConfig, DbError, DiagEvent, DiagSink, Diagnostics, PoolStats, DriftKind, DriverError,
     MigrationError, MigrationReport, MigrationSource, MigrationSourceError, MigrationStatus,
     Notification, ParamsWriter, QueryResult, Row, RowRef, Rows, SafeIdent, SafeTable, SslMode,
     TypedNotification, LEDGER_TABLE,
@@ -85,7 +85,7 @@ pub use bsql_postgres_proto::TypedQuery;
 
 pub use cancel::CancelToken;
 pub use connection::{Connection, CopyInWriter, PreparedStatement, Transaction};
-pub use pool::{Pool, PooledConnection};
+pub use pool::{Pool, PoolBuilder, PooledConnection};
 
 const _: () = {
     fn _assert_send<T: Send>() {}

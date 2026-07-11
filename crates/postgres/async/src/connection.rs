@@ -52,9 +52,9 @@ use bsql_postgres_core::tls::Wire;
 #[cfg(feature = "tls")]
 use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
-    resolve_endpoint, validate_startup_params, BorrowedRow, ConnectConfig, DriverError, Endpoint,
-    MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification, QueryResult,
-    Redial, Row, Rows, SslMode, TypedNotification,
+    resolve_endpoint, validate_startup_params, BorrowedRow, ConnectConfig, Diagnostics, DriverError,
+    Endpoint, MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification,
+    QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
 };
 // Referenced only by the non-unix `Endpoint::Unix` reject arm in `build_wire`.
 #[cfg(not(unix))]
@@ -186,29 +186,75 @@ impl Connection {
     /// accepts the connection but never answers the startup packet fails fast
     /// rather than hanging forever.
     pub async fn connect(config: &ConnectConfig) -> Result<Self, DriverError> {
+        // Diagnostics off: no sink, so an SSL downgrade keeps the historical
+        // stderr warning and nothing is installed on the connection.
+        Self::connect_with(config, &Diagnostics::default()).await
+    }
+
+    /// Open a connection and install the structured-diagnostics configuration on
+    /// it, so operational events (a server `NOTICE`, a slow query, an SSL
+    /// downgrade at connect, …) surface through `diagnostics`' sink.
+    ///
+    /// This is how a standalone connection (outside a pool) opts into
+    /// diagnostics; a pool installs the same configuration on every connection it
+    /// mints via [`Pool::builder`](crate::Pool::builder). Diagnostics is NOT a
+    /// [`ConnectConfig`] field (the config footprint is untouched) — it rides the
+    /// connection, so different connections over the same config can carry
+    /// different sinks. The sink is threaded into the connect sequence itself, so
+    /// a connect-time event (an SSL `Prefer`→plaintext downgrade) routes through
+    /// it — not only steady-state events after connect.
+    ///
+    /// # Errors
+    ///
+    /// The same classified [`DriverError`] set as [`connect`](Self::connect).
+    pub async fn connect_with(
+        config: &ConnectConfig,
+        diagnostics: &Diagnostics,
+    ) -> Result<Self, DriverError> {
         // Bound the ENTIRE connect sequence under ONE `connect_timeout` budget,
         // measured from the start. On elapse tokio drops the in-flight future;
         // nothing is stranded, since no `Connection` (and no reusable liveness
         // token) exists yet.
         let budget = Duration::from_secs(config.connect_timeout_secs);
-        match tokio::time::timeout(budget, Self::connect_inner(config)).await {
-            Ok(result) => result,
+        let mut conn = match tokio::time::timeout(
+            budget,
+            Self::connect_inner(config, diagnostics),
+        )
+        .await
+        {
+            Ok(result) => result?,
             // The same class the blocking driver surfaces for a connect-phase
             // (handshake) timeout, so the two drivers agree.
-            Err(_elapsed) => Err(DriverError::Timeout),
-        }
+            Err(_elapsed) => return Err(DriverError::Timeout),
+        };
+        // Install the full configuration (sink + slow-query threshold) for
+        // steady-state events. The connect-time SSL-downgrade event already
+        // routed through the sink threaded into `connect_inner` above.
+        conn.set_diagnostics(diagnostics.clone());
+        Ok(conn)
+    }
+
+    /// Install (or replace) the structured-diagnostics configuration on this
+    /// connection: the [`DiagSink`](bsql_postgres_core::DiagSink) callback plus the
+    /// slow-query threshold. Passing [`Diagnostics::default`] turns diagnostics off.
+    pub fn set_diagnostics(&mut self, diagnostics: Diagnostics) {
+        self.core.set_diagnostics(diagnostics);
     }
 
     /// The connect sequence proper — run UNDER the `connect_timeout` budget by
-    /// [`connect`](Self::connect).
-    async fn connect_inner(config: &ConnectConfig) -> Result<Self, DriverError> {
+    /// [`connect_with`](Self::connect_with). `diagnostics` is threaded to the wire
+    /// build so a connect-time SSL downgrade routes through its sink.
+    async fn connect_inner(
+        config: &ConnectConfig,
+        diagnostics: &Diagnostics,
+    ) -> Result<Self, DriverError> {
         // The read-deadline cell shared with the socket the engine will own.
         let read_deadline = Arc::new(ReadDeadline::new());
         // Dial the chosen transport (TCP or unix) and build the wire. No
         // dial-only timeout: the caller's single outer budget bounds the whole
         // sequence, so a black-hole dial elapses into `DriverError::Timeout`
         // exactly like a silent handshake.
-        let wire = Self::connect_wire(config, &read_deadline).await?;
+        let wire = Self::connect_wire(config, &read_deadline, diagnostics).await?;
         // Snapshot the encryption state from the built wire BEFORE it is moved
         // into the engine.
         let encrypted = wire.is_encrypted();
@@ -292,6 +338,7 @@ impl Connection {
     pub(crate) async fn connect_wire(
         config: &ConnectConfig,
         deadline: &Arc<ReadDeadline>,
+        diagnostics: &Diagnostics,
     ) -> Result<AsyncWire, DriverError> {
         let endpoint = resolve_endpoint(&config.host, config.port);
         // Resolve the effective SSL mode ONCE against the endpoint (the
@@ -306,7 +353,7 @@ impl Connection {
                 // — Nagle + delayed-ACK can add ~40ms stalls to small writes and
                 // COPY-in streaming; one setsockopt with zero per-op cost.
                 tcp.set_nodelay(true)?;
-                Self::build_tcp_wire(tcp, config, ssl_mode, deadline).await
+                Self::build_tcp_wire(tcp, config, ssl_mode, deadline, diagnostics).await
             }
             #[cfg(unix)]
             Endpoint::Unix(path) => {
@@ -345,6 +392,17 @@ impl Connection {
         config: &ConnectConfig,
         ssl_mode: SslMode,
         deadline: &Arc<ReadDeadline>,
+        // Threaded to `classify_ssl_response` so a `Prefer`→plaintext downgrade
+        // routes through the diagnostics sink. TLS-only: with `tls` off there is
+        // no probe and no downgrade to report, so the parameter is unused there.
+        #[cfg_attr(
+            not(feature = "tls"),
+            expect(
+                unused_variables,
+                reason = "the SSL-downgrade signal is TLS-only; with tls off there is no SSLRequest probe and no downgrade to surface"
+            )
+        )]
+        diagnostics: &Diagnostics,
     ) -> Result<AsyncWire, DriverError> {
         if ssl_mode == SslMode::Disable {
             return Ok(Wire::Plain(TokioSocket::new(
@@ -387,7 +445,12 @@ impl Connection {
             tcp.write_all(ssl_bytes).await?;
             let mut response = [0u8; 1];
             tcp.read_exact(&mut response).await?;
-            match bsql_postgres_core::ssl::classify_ssl_response(response[0], config, ssl_mode)? {
+            match bsql_postgres_core::ssl::classify_ssl_response(
+                response[0],
+                config,
+                ssl_mode,
+                diagnostics,
+            )? {
                 SslProbe::Accepted { server_name } => {
                     // Use the provider-explicit ring config (the workspace pins
                     // rustls to ring only). Custom CA roots build a config verified
@@ -844,9 +907,14 @@ impl Connection {
             if self.core.try_acquire_migration_lock().await.map_err(MigrationError::from)? {
                 break;
             }
-            if start.elapsed() >= migrate::LOCK_ACQUIRE_TIMEOUT {
+            let elapsed = start.elapsed();
+            if elapsed >= migrate::LOCK_ACQUIRE_TIMEOUT {
                 return Err(MigrationError::LockTimeout);
             }
+            // Surface the wait so a serialized deploy is not mistaken for a hang.
+            self.core
+                .diagnostics()
+                .emit(&bsql_postgres_core::DiagEvent::MigrationLockWaiting { elapsed });
             tokio::time::sleep(backoff).await;
             backoff = migrate::next_backoff(backoff);
         }

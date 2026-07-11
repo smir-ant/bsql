@@ -48,12 +48,13 @@
 //! can be permanently lost.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use bsql_postgres_core::{ConnectConfig, DriverError};
+use bsql_postgres_core::{ConnectConfig, DiagEvent, Diagnostics, DriverError, PoolStats};
 use crate::connection::Connection;
 
 /// The default acquire deadline when a caller constructs the pool with
@@ -76,6 +77,46 @@ struct PoolInner {
     semaphore: Arc<Semaphore>,
     max_size: usize,
     acquire_timeout: Duration,
+    /// The structured-diagnostics configuration installed on every connection the
+    /// pool mints (via [`Connection::connect_with`]), and the sink the pool's own
+    /// saturation events emit through. `Default` (off) unless the pool was built
+    /// through [`Pool::builder`]. Fixed for the pool's life, so a clone/checkout
+    /// never races a reconfiguration.
+    diagnostics: Diagnostics,
+    /// Monotonic count of checkouts that waited out their acquire deadline.
+    acquire_timeouts: AtomicU64,
+    /// Monotonic count of pooled connections evicted on checkout (a failed
+    /// health-gate reset).
+    connections_evicted: AtomicU64,
+    /// Concurrent checkouts currently blocked waiting for a permit (bracketed by
+    /// [`WaiterGuard`], cancellation-safe), used only to feed `waiters_high_water`.
+    current_waiters: AtomicU64,
+    /// High-water mark of [`current_waiters`](Self::current_waiters).
+    waiters_high_water: AtomicU64,
+}
+
+/// A cancellation-safe bracket around the semaphore acquire: it bumps the pool's
+/// concurrent-waiter gauge (and its high-water mark) on creation and decrements
+/// on drop — so even a `get` future dropped mid-`.await` (an outer timeout, a
+/// `select!` loser) restores the gauge, never leaking a phantom waiter.
+struct WaiterGuard<'a> {
+    current: &'a AtomicU64,
+}
+
+impl<'a> WaiterGuard<'a> {
+    fn new(current: &'a AtomicU64, high_water: &'a AtomicU64) -> Self {
+        // `fetch_add` returns the PRIOR value; the count including self is +1.
+        let now = current.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        // Raise the high-water mark to at least `now` (a no-op if already higher).
+        high_water.fetch_max(now, Ordering::Relaxed);
+        Self { current }
+    }
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.current.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for Pool {
@@ -115,6 +156,46 @@ impl Pool {
         max_size: usize,
         acquire_timeout: Duration,
     ) -> Self {
+        Self::from_parts(config, max_size, acquire_timeout, Diagnostics::default())
+    }
+
+    /// Start building a pool with structured diagnostics (a
+    /// [`DiagSink`](bsql_postgres_core::DiagSink) + a slow-query threshold): the
+    /// installed configuration rides every connection the pool mints, and the
+    /// pool's own saturation events (acquire timeout, connection eviction) emit
+    /// through the same sink.
+    ///
+    /// Diagnostics is NOT a [`ConnectConfig`] field, so the config footprint is
+    /// untouched; it is a pool-level (not per-connection) setting installed here.
+    ///
+    /// ```no_run
+    /// # use bsql_postgres_async::Pool;
+    /// # use bsql_postgres_core::{ConnectConfig, DiagEvent};
+    /// # use std::time::Duration;
+    /// let pool = Pool::builder(ConnectConfig::new("localhost", "u"), 16)
+    ///     .acquire_timeout(Duration::from_secs(5))
+    ///     .on_diagnostic(|ev: &DiagEvent<'_>| eprintln!("{ev:?}"))
+    ///     .slow_query_threshold(Duration::from_millis(200))
+    ///     .build();
+    /// # let _ = pool;
+    /// ```
+    pub fn builder(config: ConnectConfig, max_size: usize) -> PoolBuilder {
+        PoolBuilder {
+            config,
+            max_size,
+            acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
+            diagnostics: Diagnostics::default(),
+        }
+    }
+
+    /// The one construction point every constructor + the builder route through,
+    /// so the field set cannot drift between them.
+    fn from_parts(
+        config: ConnectConfig,
+        max_size: usize,
+        acquire_timeout: Duration,
+        diagnostics: Diagnostics,
+    ) -> Self {
         Self {
             inner: Arc::new(PoolInner {
                 config,
@@ -122,6 +203,11 @@ impl Pool {
                 semaphore: Arc::new(Semaphore::new(max_size)),
                 max_size,
                 acquire_timeout,
+                diagnostics,
+                acquire_timeouts: AtomicU64::new(0),
+                connections_evicted: AtomicU64::new(0),
+                current_waiters: AtomicU64::new(0),
+                waiters_high_water: AtomicU64::new(0),
             }),
         }
     }
@@ -147,18 +233,47 @@ impl Pool {
         // is dropped at any `.await` below (acquire, reset, or connect), the
         // permit's own `Drop` returns the capacity — no manual accounting, no
         // leak window.
-        let permit = match tokio::time::timeout(
-            timeout,
-            Arc::clone(&self.inner.semaphore).acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => permit,
-            // The semaphore is never closed by this pool; classify defensively.
-            Ok(Err(_closed)) => {
-                return Err(DriverError::Io(std::io::Error::other("pool closed")));
+        //
+        let permit = {
+            // FAST PATH: a permit is immediately available → the checkout never
+            // BLOCKS, so no waiter is counted (parity with the sync pool, which
+            // counts only queued waiters; `waiters_high_water` stays `0` when
+            // nobody had to wait — as its doc promises).
+            match Arc::clone(&self.inner.semaphore).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_would_block) => {
+                    // CONTENDED: no permit is free, so this checkout WILL block on
+                    // the semaphore — NOW count it as a waiter. The `WaiterGuard`
+                    // feeds the concurrent-waiter gauge + high-water mark and drops
+                    // (restoring the gauge) when this scope ends OR the future is
+                    // cancelled — cancellation-safe like the permit.
+                    let _waiter = WaiterGuard::new(
+                        &self.inner.current_waiters,
+                        &self.inner.waiters_high_water,
+                    );
+                    match tokio::time::timeout(
+                        timeout,
+                        Arc::clone(&self.inner.semaphore).acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => permit,
+                        // The semaphore is never closed by this pool; classify defensively.
+                        Ok(Err(_closed)) => {
+                            return Err(DriverError::Io(std::io::Error::other("pool closed")));
+                        }
+                        Err(_elapsed) => {
+                            // Saturation: count it and surface a structured event
+                            // before returning the classified backpressure error.
+                            self.inner.acquire_timeouts.fetch_add(1, Ordering::Relaxed);
+                            self.inner
+                                .diagnostics
+                                .emit(&DiagEvent::PoolAcquireTimeout { waited: timeout });
+                            return Err(DriverError::PoolTimeout);
+                        }
+                    }
+                }
             }
-            Err(_elapsed) => return Err(DriverError::PoolTimeout),
         };
 
         // Drain stale/broken idle connections and, on failure, create a fresh
@@ -210,15 +325,27 @@ impl Pool {
                             });
                         }
                         Err(_evict) => {
+                            // A dead pooled connection: count the eviction and
+                            // surface it (a steady stream is a reconnect storm),
+                            // then drop it and retry with the next idle one / a
+                            // fresh connect.
+                            self.inner.connections_evicted.fetch_add(1, Ordering::Relaxed);
+                            self.inner.diagnostics.emit(&DiagEvent::PoolConnectionEvicted);
                             drop(conn);
                             continue;
                         }
                     }
                 }
                 // No reusable idle connection: create a FRESH one (already clean,
-                // no reset needed). It rides the permit already held; a connect
-                // failure drops the permit (returning capacity) on the way out.
-                None => match Connection::connect(&self.inner.config).await {
+                // no reset needed) carrying the pool's diagnostics. It rides the
+                // permit already held; a connect failure drops the permit
+                // (returning capacity) on the way out.
+                None => match Connection::connect_with(
+                    &self.inner.config,
+                    &self.inner.diagnostics,
+                )
+                .await
+                {
                     Ok(conn) => {
                         return Ok(PooledConnection {
                             conn: Some(conn),
@@ -245,6 +372,75 @@ impl Pool {
     #[must_use]
     pub fn max_size(&self) -> usize {
         self.inner.max_size
+    }
+
+    /// A snapshot of the pool's operational counters (idle/max plus the monotonic
+    /// acquire-timeout, eviction, and waiter high-water gauges) — the pull-style
+    /// complement to the push-style [`DiagEvent`] pool events. Cheap: a few
+    /// relaxed atomic loads plus the idle count under the lock.
+    #[must_use]
+    pub fn stats(&self) -> PoolStats {
+        PoolStats::new(
+            self.idle_count(),
+            self.inner.max_size,
+            self.inner.acquire_timeouts.load(Ordering::Relaxed),
+            self.inner.connections_evicted.load(Ordering::Relaxed),
+            self.inner.waiters_high_water.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// A builder for a [`Pool`] with an acquire deadline and structured diagnostics.
+///
+/// Obtained from [`Pool::builder`]. All settings beyond `config` + `max_size`
+/// are optional; [`build`](Self::build) is infallible (connections are lazy, so
+/// nothing is dialed here).
+#[derive(Debug)]
+#[must_use = "a PoolBuilder does nothing until `.build()` is called"]
+pub struct PoolBuilder {
+    config: ConnectConfig,
+    max_size: usize,
+    acquire_timeout: Duration,
+    diagnostics: Diagnostics,
+}
+
+impl PoolBuilder {
+    /// Set the default acquire deadline (overridable per checkout via
+    /// [`Pool::get_timeout`]). Defaults to 30s.
+    pub fn acquire_timeout(mut self, acquire_timeout: Duration) -> Self {
+        self.acquire_timeout = acquire_timeout;
+        self
+    }
+
+    /// Install a diagnostics callback closure — the sink every minted connection
+    /// carries and the pool's saturation events emit through.
+    pub fn on_diagnostic(
+        mut self,
+        sink: impl Fn(&bsql_postgres_core::DiagEvent<'_>) + Send + Sync + 'static,
+    ) -> Self {
+        self.diagnostics = self.diagnostics.on_event(sink);
+        self
+    }
+
+    /// Install a complete [`Diagnostics`] configuration (a pre-built sink +
+    /// slow-query threshold), replacing whatever this builder held.
+    pub fn diagnostics(mut self, diagnostics: Diagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    /// Set the slow-query threshold: a query whose server round trip meets or
+    /// exceeds it emits a slow-query event (off by default — no timing cost).
+    pub fn slow_query_threshold(mut self, threshold: Duration) -> Self {
+        self.diagnostics = self.diagnostics.slow_query_threshold(threshold);
+        self
+    }
+
+    /// Build the pool. Infallible — connections are created lazily on first
+    /// [`Pool::get`].
+    #[must_use]
+    pub fn build(self) -> Pool {
+        Pool::from_parts(self.config, self.max_size, self.acquire_timeout, self.diagnostics)
     }
 }
 

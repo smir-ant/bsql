@@ -79,7 +79,7 @@ mod transport;
 
 // Re-export shared types from core.
 pub use bsql_postgres_core::{
-    AppliedMigration, BorrowedRow, ChannelBindingMode, ColumnError, CommandTag, ConnectConfig, DbError, DriftKind, DriverError,
+    AppliedMigration, BorrowedRow, ChannelBindingMode, ColumnError, CommandTag, ConnectConfig, DbError, DiagEvent, DiagSink, Diagnostics, PoolStats, DriftKind, DriverError,
     MigrationError, MigrationReport, MigrationSource, MigrationSourceError, MigrationStatus,
     Notification, ParamsWriter, QueryResult, Row, RowRef, Rows, SafeIdent, SafeTable, SslMode,
     TypedNotification, LEDGER_TABLE,
@@ -87,7 +87,7 @@ pub use bsql_postgres_core::{
 
 pub use cancel::CancelToken;
 pub use connection::{Connection, CopyInWriter, PreparedStatement, Transaction};
-pub use pool::{Pool, PooledConnection};
+pub use pool::{Pool, PoolBuilder, PooledConnection};
 
 // Tier-1 static assertions: Connection is Send (its futures cross .await points
 // and are spawned by the pool's concurrent tasks). Row is Send + Sync + 'static

@@ -56,6 +56,146 @@ fn connect_over_unix_socket_and_query() {
     c.close().expect("close");
 }
 
+/// WITNESS (C1a — server NOTICE surfacing, blocking twin): a `RAISE NOTICE`
+/// surfaces through the installed diagnostics sink with its severity + message,
+/// instead of being silently dropped. The blocking mirror of the async witness.
+#[test]
+#[ignore = "requires local PG"]
+fn raise_notice_surfaces_through_the_diagnostics_sink() {
+    use std::sync::{Arc, Mutex};
+
+    use bsql_postgres_sync::{DiagEvent, Diagnostics};
+
+    let captured: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_in = Arc::clone(&captured);
+    let diag = Diagnostics::new().on_event(move |ev: &DiagEvent<'_>| {
+        if let DiagEvent::ServerNotice { severity, message, .. } = ev {
+            captured_in
+                .lock()
+                .expect("diag lock")
+                .push((severity.to_string(), message.to_string()));
+        }
+    });
+
+    let mut c = Connection::connect_with(&unix_config(), &diag).expect("connect_with");
+    c.execute_sql("DO $$ BEGIN RAISE NOTICE 'hello from bsql notice'; END $$")
+        .expect("DO with RAISE NOTICE");
+
+    let got = captured.lock().expect("diag lock").clone();
+    assert!(
+        got.iter()
+            .any(|(sev, msg)| sev == "NOTICE" && msg == "hello from bsql notice"),
+        "the RAISE NOTICE must surface through the sink, got {got:?}",
+    );
+    // The connection stays fully usable after surfacing the notice.
+    let row = c.query_one_sql("SELECT 42").expect("query after notice");
+    assert_eq!(row.get_i32(0), Ok(Some(42)));
+    drop(c); // cleanup only; the witness assertions ran above
+}
+
+/// WITNESS (C1b — SSL downgrade routing, blocking twin): a TCP connect with
+/// `SslMode::Prefer` to a server that refuses TLS falls back to plaintext AND
+/// routes the downgrade through the installed sink as `DiagEvent::SslDowngrade`.
+#[test]
+#[ignore = "requires local PG with ssl=off on TCP"]
+fn ssl_prefer_downgrade_routes_through_the_diagnostics_sink() {
+    use std::sync::{Arc, Mutex};
+
+    use bsql_postgres_sync::{DiagEvent, Diagnostics, SslMode};
+
+    let downgrades: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let downgrades_in = Arc::clone(&downgrades);
+    let diag = Diagnostics::new().on_event(move |ev: &DiagEvent<'_>| {
+        if let DiagEvent::SslDowngrade { host } = ev {
+            downgrades_in.lock().expect("diag lock").push((*host).to_string());
+        }
+    });
+
+    let cfg = ConnectConfig::new("127.0.0.1", "smir-ant")
+        .database("postgres".to_string())
+        .ssl_mode(SslMode::Prefer);
+    let c = Connection::connect_with(&cfg, &diag).expect("connect_with over TCP");
+    assert!(!c.is_encrypted(), "the server refused TLS — the connection is plaintext");
+
+    let got = downgrades.lock().expect("diag lock").clone();
+    assert_eq!(
+        got.as_slice(),
+        &["127.0.0.1".to_string()],
+        "the SSL downgrade must route through the sink with the host, got {got:?}",
+    );
+    drop(c); // cleanup only; the witness assertions ran above
+}
+
+/// WITNESS (C1c — pool saturation, blocking twin): a max-size-1 pool with one
+/// connection held times out the second checkout AND surfaces a
+/// `DiagEvent::PoolAcquireTimeout`, with the counter + waiter high-water recorded
+/// in `Pool::stats()`.
+#[test]
+#[ignore = "requires local PG"]
+fn pool_acquire_timeout_emits_and_counts() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use bsql_postgres_sync::{DiagEvent, DriverError, Pool};
+
+    let timeouts: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let timeouts_in = Arc::clone(&timeouts);
+    let pool = Pool::builder(unix_config(), 1)
+        .acquire_timeout(Duration::from_millis(150))
+        .on_diagnostic(move |ev: &DiagEvent<'_>| {
+            if let DiagEvent::PoolAcquireTimeout { .. } = ev {
+                *timeouts_in.lock().expect("diag lock") += 1;
+            }
+        })
+        .build();
+
+    let held = pool.get().expect("first checkout");
+    match pool.get() {
+        Err(DriverError::PoolTimeout) => {}
+        Err(other) => panic!("expected PoolTimeout, got {other:?}"),
+        Ok(_) => panic!("a max-size-1 pool must not hand out a second connection"),
+    }
+
+    assert_eq!(*timeouts.lock().expect("diag lock"), 1, "the acquire timeout emitted once");
+    let stats = pool.stats();
+    assert_eq!(stats.acquire_timeouts, 1, "the counter recorded the timeout");
+    assert!(stats.waiters_high_water >= 1, "a waiter was queued: {stats:?}");
+    drop(held);
+}
+
+/// WITNESS (C1d — slow-query detection, blocking twin): with a threshold set, a
+/// slow query emits `DiagEvent::SlowQuery` with the SQL text; a fast one emits
+/// nothing.
+#[test]
+#[ignore = "requires local PG"]
+fn slow_query_emits_with_the_threshold_set() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use bsql_postgres_sync::{DiagEvent, Diagnostics};
+
+    let slow: Arc<Mutex<Vec<(String, Duration)>>> = Arc::new(Mutex::new(Vec::new()));
+    let slow_in = Arc::clone(&slow);
+    let diag = Diagnostics::new()
+        .slow_query_threshold(Duration::from_millis(50))
+        .on_event(move |ev: &DiagEvent<'_>| {
+            if let DiagEvent::SlowQuery { sql, elapsed } = ev {
+                slow_in.lock().expect("diag lock").push(((*sql).to_string(), *elapsed));
+            }
+        });
+    let mut c = Connection::connect_with(&unix_config(), &diag).expect("connect_with");
+
+    let _row = c.query_one_sql("SELECT 1").expect("fast query");
+    assert!(slow.lock().expect("diag lock").is_empty(), "a fast query is not reported slow");
+
+    let _qr = c.query_sql("SELECT pg_sleep(0.2)").expect("slow query");
+    let got = slow.lock().expect("diag lock").clone();
+    assert_eq!(got.len(), 1, "the slow query emitted once, got {got:?}");
+    assert!(got[0].0.contains("pg_sleep"), "the event carries the SQL text, got {:?}", got[0].0);
+    assert!(got[0].1 >= Duration::from_millis(50), "elapsed >= threshold, got {:?}", got[0].1);
+    drop(c); // cleanup only; the witness assertions ran above
+}
+
 /// FAIL LOUD: `SslMode::Require` over a unix-domain socket is a classified
 /// `DriverError::Config` — never a silent plaintext downgrade (TLS is not
 /// available on a local socket, so an unsatisfiable requirement is rejected up
@@ -1794,4 +1934,95 @@ fn query_each_sql_streams_inside_a_transaction_sync() {
     .expect("transaction with a stream commits");
     assert_eq!(n, 500);
     c.close().expect("close");
+}
+
+/// WITNESS (review BLOCKER 1 — no re-entrancy deadlock): a diagnostics sink that
+/// calls `pool.stats()` from inside the `PoolAcquireTimeout` event must NOT
+/// deadlock the sync pool (the state lock is released before the sink runs).
+/// Before the fix this hung; the test PASSING (get() returns within the deadline)
+/// proves no deadlock.
+#[test]
+#[ignore = "requires local PG"]
+fn sync_pool_stats_sink_on_acquire_timeout_does_not_deadlock() {
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
+
+    use bsql_postgres_sync::{DiagEvent, DriverError, Pool};
+
+    // The sink re-enters the pool via a handle shared through a OnceLock set after
+    // build (the pool cannot be captured before it exists).
+    let pool_cell: Arc<OnceLock<Pool>> = Arc::new(OnceLock::new());
+    let cell_in = Arc::clone(&pool_cell);
+    let reentered: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    let reentered_in = Arc::clone(&reentered);
+    let pool = Pool::builder(unix_config(), 1)
+        .acquire_timeout(Duration::from_millis(150))
+        .on_diagnostic(move |ev: &DiagEvent<'_>| {
+            if let DiagEvent::PoolAcquireTimeout { .. } = ev {
+                // Re-enter: lock the SAME pool state the emit path just released.
+                if let Some(p) = cell_in.get() {
+                    *reentered_in.lock().expect("lock") = Some(p.stats().acquire_timeouts);
+                }
+            }
+        })
+        .build();
+    pool_cell.set(pool.clone()).ok();
+
+    let held = pool.get().expect("first checkout");
+    match pool.get() {
+        Err(DriverError::PoolTimeout) => {}
+        Err(other) => panic!("expected PoolTimeout, got {other:?}"),
+        Ok(_) => panic!("a max-size-1 pool must not hand out a second connection"),
+    }
+    assert!(
+        reentered.lock().expect("lock").is_some(),
+        "the sink re-entered pool.stats() from PoolAcquireTimeout without deadlocking",
+    );
+    drop(held);
+}
+
+/// WITNESS (review BLOCKER 2 — a panicking sink neither aborts nor poisons): a
+/// sink that PANICS on every event, with `slow_query_threshold(ZERO)` so
+/// `SlowQuery` also fires, over a `DO … RAISE NOTICE` (which fires `ServerNotice`
+/// DURING the pump). Both panics are contained by `catch_unwind`; the test
+/// completing proves no process abort, and the follow-up `SELECT 42` returning
+/// proves the connection was not poisoned to `NotReady`.
+#[test]
+#[ignore = "requires local PG"]
+fn panicking_sink_neither_aborts_nor_poisons_the_connection() {
+    use std::time::Duration;
+
+    use bsql_postgres_sync::{DiagEvent, Diagnostics};
+
+    let diag = Diagnostics::new()
+        .slow_query_threshold(Duration::ZERO)
+        .on_event(|_ev: &DiagEvent<'_>| panic!("boom — a deliberately buggy sink"));
+    let mut c = Connection::connect_with(&unix_config(), &diag).expect("connect_with");
+
+    // Fires ServerNotice (pump) AND SlowQuery (drop) — the sink panics on both,
+    // both must be contained.
+    c.execute_sql("DO $$ BEGIN RAISE NOTICE 'x'; END $$")
+        .expect("the DO completes despite the panicking sink");
+
+    // Not poisoned: the connection is still usable and the result is correct.
+    let row = c.query_one_sql("SELECT 42").expect("connection still usable, not NotReady");
+    assert_eq!(row.get_i32(0), Ok(Some(42)));
+    drop(c);
+}
+
+/// WITNESS (review MAJOR 4 — uncontended checkout leaves waiters_high_water at 0):
+/// a single checkout on a pool with a free slot never blocks, so the gauge stays 0.
+#[test]
+#[ignore = "requires local PG"]
+fn uncontended_checkout_leaves_waiters_high_water_zero() {
+    use bsql_postgres_sync::Pool;
+
+    let pool = Pool::builder(unix_config(), 4).build();
+    let c = pool.get().expect("uncontended checkout");
+    assert_eq!(
+        pool.stats().waiters_high_water,
+        0,
+        "an uncontended checkout must not register a blocked waiter",
+    );
+    drop(c);
 }

@@ -40,6 +40,7 @@ use std::ops::ControlFlow;
 
 use bsql_postgres_proto::engine::Surface;
 
+use crate::diag::DiagSink;
 use crate::error::DriverError;
 use crate::materialize::parse_notification;
 use crate::types::Notification;
@@ -195,32 +196,65 @@ pub struct TypedNotification<T> {
     pub pid: i32,
 }
 
-/// Wrap a verb's surface sink so every [`Surface::Notify`] is captured into
-/// `ledger` and every other surface flows to `inner` unchanged.
+/// Wrap a verb's surface sink so every asynchronous side-channel frame is handled
+/// in ONE place: a [`Surface::Notify`] is captured into `ledger`, and — when a
+/// diagnostics sink is installed — a [`Surface::Notice`] (a server
+/// `RAISE NOTICE` / `WARNING` / …) is surfaced as a
+/// [`DiagEvent::ServerNotice`](crate::diag::DiagEvent::ServerNotice) on `diag`.
+/// Every other surface flows to `inner` unchanged.
 ///
-/// This is the ONE place the notification-capture rule lives; every driver verb
-/// wraps its own sink with it, so a notification arriving on any command's
-/// response stream is buffered rather than dropped. A captured notification does
-/// NOT stop the pump — the wrapper returns [`ControlFlow::Continue`] for it, so a
-/// query runs to completion and merely deposits any interleaved notification in
-/// the ledger as a side effect.
+/// This is the ONE place the async-frame-capture rule lives; every driver verb
+/// wraps its own sink with it, so a notification OR a server notice arriving on
+/// any command's response stream is captured rather than dropped, with no
+/// per-verb drift. Neither stops the pump — the wrapper returns
+/// [`ControlFlow::Continue`] for a notify and forwards a notice to `inner` (whose
+/// collector ignores it), so a query runs to completion and merely surfaces the
+/// side-channel frame as it passes.
+///
+/// # Zero-cost when diagnostics are off
+///
+/// `diag` is `None` on a connection with no sink installed (the common case): a
+/// `Notice` then takes a single never-taken `if let Some` branch and forwards to
+/// `inner` exactly as before — no notice body is parsed, no event is built, no
+/// allocation happens. The per-row [`Surface::Row`] path is untouched in BOTH
+/// states (it hits the `_ =>` forward arm), so this adds nothing to the hot path.
 ///
 /// The returned closure is higher-ranked over the surface lifetime (`inner` sees
 /// `Surface<'e>` for any `'e`) and generic over the sink's break payload `B`, so
 /// it fits both the command verbs (break payload `Never`) and the notification
-/// wait (break payload `()`). The captured body is copied into the ledger inside
-/// the call, so it never outlives the borrow.
+/// wait (break payload `()`). A captured notification body is copied into the
+/// ledger, and a surfaced notice is emitted, inside the call, so neither
+/// outlives the borrow.
 pub fn capture_notify<'l, B>(
     ledger: &'l mut NotificationLedger,
+    diag: Option<&'l DiagSink>,
     mut inner: impl FnMut(Surface<'_>) -> ControlFlow<B> + 'l,
 ) -> impl FnMut(Surface<'_>) -> ControlFlow<B> + 'l {
-    move |surface: Surface<'_>| {
-        if let Surface::Notify(body) = surface {
+    move |surface: Surface<'_>| match surface {
+        Surface::Notify(body) => {
             ledger.capture(body);
             ControlFlow::Continue(())
-        } else {
+        }
+        Surface::Notice(body) => {
+            // Surface a server NOTICE/WARNING through the diagnostics sink when one
+            // is installed; otherwise this is a never-taken branch (zero cost).
+            if let Some(sink) = diag {
+                crate::diag::emit_server_notice(sink, body);
+            }
+            // Forward to `inner` so the pump control flow is unchanged (the result
+            // collector ignores a notice — it is not part of a row result set).
             inner(surface)
         }
+        Surface::ParamStatus(body) => {
+            // Surface a GUC change (SET timezone/search_path/…) when a sink is
+            // installed; a never-taken branch otherwise. Forwarded to `inner`,
+            // which ignores it.
+            if let Some(sink) = diag {
+                crate::diag::emit_parameter_status(sink, body);
+            }
+            inner(surface)
+        }
+        _ => inner(surface),
     }
 }
 
@@ -338,7 +372,7 @@ mod tests {
         let mut led = NotificationLedger::new();
         let mut rows: Vec<Vec<u8>> = Vec::new();
         {
-            let mut sink = capture_notify::<()>(&mut led, |s| {
+            let mut sink = capture_notify::<()>(&mut led, None, |s| {
                 if let Surface::Row(r) = s {
                     rows.push(r.to_vec());
                 }

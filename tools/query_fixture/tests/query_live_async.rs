@@ -23,6 +23,12 @@ use bsql::{Date, Interval, Jsonb, Numeric, Time, Timestamptz, Uuid};
 use bsql_postgres_async::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 bsql::query!(One, "SELECT 1::int4 AS n");
+// A genuinely SLOW typed query (the server sleeps 0.2s) — the witness that
+// slow-query detection covers the compile-checked FLAGSHIP, not only dynamic SQL.
+bsql::query!(
+    SlowSleep,
+    "SELECT n FROM (VALUES (1::int4)) AS t(n) WHERE pg_sleep(0.2) IS NOT NULL"
+);
 bsql::query!(Seven, "SELECT 7::int4 AS n");
 bsql::query!(Hi, "SELECT 'hello'::text AS s");
 bsql::query!(Nums, "SELECT n FROM (VALUES (10::int4), (20), (30)) AS t(n)");
@@ -1313,4 +1319,38 @@ async fn oversize_typed_multirow_reassembly_over_table() {
 
     c.execute_sql("DROP TABLE ov_rows").await.expect("cleanup");
     c.close().await.expect("close");
+}
+
+/// WITNESS (review MAJOR 3 — the compile-checked FLAGSHIP is covered by
+/// slow-query detection): a slow typed `query!(…)` emits `DiagEvent::SlowQuery`
+/// carrying the typed query's SQL text (never the params — no PII). The gap the
+/// review flagged: the guard was installed only on the dynamic verbs.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_slow_query_emits_slow_query() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use bsql_postgres_async::{DiagEvent, Diagnostics};
+
+    let slow: Arc<Mutex<Vec<(String, Duration)>>> = Arc::new(Mutex::new(Vec::new()));
+    let slow_in = Arc::clone(&slow);
+    let diag = Diagnostics::new()
+        .slow_query_threshold(Duration::from_millis(50))
+        .on_event(move |ev: &DiagEvent<'_>| {
+            if let DiagEvent::SlowQuery { sql, elapsed } = ev {
+                slow_in.lock().expect("lock").push(((*sql).to_string(), *elapsed));
+            }
+        });
+    let mut c = Connection::connect_with(&async_config(), &diag)
+        .await
+        .expect("connect_with");
+
+    let rows = c.query::<SlowSleepQuery>(()).await.expect("slow typed query");
+    assert_eq!(rows.len(), 1);
+
+    let got = slow.lock().expect("lock").clone();
+    assert_eq!(got.len(), 1, "the slow typed query! emitted SlowQuery once, got {got:?}");
+    assert!(got[0].0.contains("pg_sleep"), "the event carries the typed SQL, got {:?}", got[0].0);
+    assert!(got[0].1 >= Duration::from_millis(50), "elapsed >= threshold, got {:?}", got[0].1);
 }

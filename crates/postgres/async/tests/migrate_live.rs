@@ -57,3 +57,51 @@ async fn async_runner_applies_then_is_idempotent() {
 
     conn.simple_query(&format!("DROP SCHEMA {schema} CASCADE")).await.expect("drop schema");
 }
+
+/// WITNESS (C1f — migration progress): running a set emits a
+/// `MigrationApplying` then `MigrationApplied` for each migration, in order —
+/// so a long deploy is visible, not silent between start and the final report.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn async_runner_emits_progress_events() {
+    use std::sync::{Arc, Mutex};
+
+    use bsql_postgres_async::{DiagEvent, Diagnostics};
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_in = Arc::clone(&events);
+    let diag = Diagnostics::new().on_event(move |ev: &DiagEvent<'_>| match ev {
+        DiagEvent::MigrationApplying { name } => {
+            events_in.lock().expect("lock").push(format!("applying:{name}"));
+        }
+        DiagEvent::MigrationApplied { name } => {
+            events_in.lock().expect("lock").push(format!("applied:{name}"));
+        }
+        _ => {}
+    });
+
+    let mut conn = Connection::connect_with(&config(), &diag).await.expect("connect_with");
+    let schema = format!("bsql_migdiag_async_{}", std::process::id());
+    conn.simple_query(&format!("CREATE SCHEMA {schema}")).await.expect("create schema");
+    conn.simple_query(&format!("SET search_path TO {schema}")).await.expect("search_path");
+
+    let set = [
+        ("0001_a.sql", "CREATE TABLE t (id int)"),
+        ("0002_b.sql", "ALTER TABLE t ADD COLUMN v int"),
+    ];
+    conn.run_migrations(MigrationSource::embedded(&set)).await.expect("run");
+
+    let got = events.lock().expect("lock").clone();
+    assert_eq!(
+        got,
+        vec![
+            "applying:0001_a.sql",
+            "applied:0001_a.sql",
+            "applying:0002_b.sql",
+            "applied:0002_b.sql",
+        ],
+        "each migration emits applying then applied, in order",
+    );
+
+    conn.simple_query(&format!("DROP SCHEMA {schema} CASCADE")).await.expect("drop schema");
+}

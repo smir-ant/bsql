@@ -51,6 +51,7 @@ use core::fmt::Write as _;
 use core::ops::ControlFlow;
 use std::io;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bsql_postgres_proto::engine::{
     Boundary, CommandStatus, ConnFail, Engine, EngineError, Live, NotifyStatus, Outcome,
@@ -416,6 +417,76 @@ impl DynStmtCache {
     }
 }
 
+/// A scope guard that times a query verb and, on drop, emits a
+/// [`DiagEvent::SlowQuery`](crate::diag::DiagEvent::SlowQuery) if the verb
+/// COMPLETED and its elapsed time met the threshold.
+///
+/// Reporting on DROP covers every exit path of a multi-return verb (the cached /
+/// promoted / fused / error branches of `query_params`) with ONE construction
+/// site, and measures the WHOLE operation (including any plan-promotion round
+/// trips). It owns a CLONED [`Diagnostics`](crate::diag::Diagnostics) rather than
+/// borrowing `self`, so it does not alias the `&mut self` the verb body needs.
+/// It is built ONLY when slow-query timing is armed (a threshold AND a sink), so
+/// an off connection never clones or reads a clock.
+///
+/// # Success-gated + unwind-safe (never a rogue callback from a destructor)
+///
+/// The guard reports ONLY when [`commit`](Self::commit) marked the verb's
+/// SUCCESSFUL (`Ok`) completion — a verb that errored or whose future was
+/// cancelled mid-`.await` never committed, so it emits no "slow query" for a
+/// query that did not complete. The drop ALSO short-circuits if the thread is
+/// [`panicking`](std::thread::panicking): a verb unwinding on a panic must never
+/// fire a consumer callback from a destructor (the double-panic → `SIGABRT`
+/// hazard), and a panicked verb "failed", it was not "slow". The emit itself
+/// routes through [`Diagnostics::emit`](crate::diag::Diagnostics::emit), whose
+/// `catch_unwind` contains a panicking sink regardless.
+struct SlowQueryGuard<'a> {
+    /// A clone of the connection's diagnostics (sink + threshold). Cheap: an
+    /// `Option<Arc>` bump plus an `Option<Duration>` copy.
+    diag: crate::diag::Diagnostics,
+    /// The SQL text to report (borrowed from the verb's `sql` argument, which
+    /// outlives the guard). Never the parameter VALUES (no PII).
+    sql: &'a str,
+    /// When the verb started (read once, at guard construction).
+    started: Instant,
+    /// Set by [`commit`](Self::commit) once the verb completed SUCCESSFULLY; the
+    /// drop emits only when this is `true`.
+    committed: bool,
+}
+
+impl SlowQueryGuard<'_> {
+    /// Mark the verb's successful completion, so the drop will report if slow.
+    /// Called on the `Ok` path only; an errored/cancelled verb leaves this
+    /// `false` and emits nothing.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SlowQueryGuard<'_> {
+    fn drop(&mut self) {
+        // Never fire a consumer callback from a destructor during an unwind (the
+        // double-panic → SIGABRT hazard); a panicked verb failed, it was not slow.
+        if std::thread::panicking() {
+            return;
+        }
+        // Report only a verb that COMPLETED (Ok) — not an errored/cancelled one.
+        if !self.committed {
+            return;
+        }
+        // `threshold` is `Some` by construction (armed guard); route the emit
+        // through `Diagnostics::emit`, whose `catch_unwind` contains a panicking
+        // sink so it can never poison the driver.
+        if let Some(threshold) = self.diag.slow_threshold() {
+            let elapsed = self.started.elapsed();
+            if elapsed >= threshold {
+                self.diag
+                    .emit(&crate::diag::DiagEvent::SlowQuery { sql: self.sql, elapsed });
+            }
+        }
+    }
+}
+
 /// The transport-generic driver engine: the shared owner of the sans-IO
 /// [`Engine`] + liveness token, defining every non-I/O verb once.
 ///
@@ -460,6 +531,15 @@ pub struct Core<S: Transport<Error = io::Error>> {
     /// verb's sink is wrapped with [`capture_notify`] so a `NOTIFY` arriving on
     /// any command's response stream is buffered here rather than dropped.
     notifications: NotificationLedger,
+    /// The structured-diagnostics configuration (the [`DiagSink`] callback + the
+    /// slow-query threshold). `Default` (no sink) unless a
+    /// [`set_diagnostics`](Self::set_diagnostics) call installs one, so an off
+    /// connection pays only a never-taken branch at each cold boundary — the
+    /// per-row hot path is untouched. Threaded from the pool to every minted
+    /// connection, or set on a standalone connection.
+    ///
+    /// [`DiagSink`]: crate::diag::DiagSink
+    diag: crate::diag::Diagnostics,
     /// The diagnostics-only N+1 query detector. Present ONLY under the
     /// `n1-detect` feature — a default build has no such field, so the flagship
     /// typed verbs stay byte-identical and the footprint is unchanged.
@@ -500,8 +580,64 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             stmt_counter: 0,
             dyn_cache: DynStmtCache::new(),
             notifications: NotificationLedger::new(),
+            diag: crate::diag::Diagnostics::default(),
             #[cfg(feature = "n1-detect")]
             n1_tracker: crate::N1Tracker::new(),
+        }
+    }
+
+    /// Install the structured-diagnostics configuration on this connection.
+    ///
+    /// Called by a driver's `connect_with` after the handshake (so a connect-time
+    /// event like an SSL downgrade routes through the SAME sink) and by a pool for
+    /// every connection it mints, or directly by a consumer on a standalone
+    /// connection. Replaces any prior configuration; passing
+    /// [`Diagnostics::default`](crate::diag::Diagnostics::default) turns diagnostics
+    /// off again.
+    pub fn set_diagnostics(&mut self, diag: crate::diag::Diagnostics) {
+        self.diag = diag;
+    }
+
+    /// The installed diagnostics configuration (its sink + slow-query threshold).
+    #[must_use]
+    pub fn diagnostics(&self) -> &crate::diag::Diagnostics {
+        &self.diag
+    }
+
+    /// Arm a slow-query timer for `sql`, or `None` when slow-query diagnostics are
+    /// off — the ZERO-COST-OFF gate.
+    ///
+    /// Returns `Some(guard)` ONLY when BOTH a slow-query threshold AND a sink are
+    /// installed; otherwise `None`, so an off connection reads no clock
+    /// (`Instant::now` is inside the `Some` arm) and clones no `Diagnostics`. The
+    /// returned guard owns a clone (not a borrow of `self`), so it does not alias
+    /// the `&mut self` the verb body then uses; it reports on drop, covering every
+    /// exit path of the verb.
+    fn armed_slow_guard<'a>(&self, sql: &'a str) -> Option<SlowQueryGuard<'a>> {
+        // Zero-cost-off gate: `Instant::now` and the `Diagnostics` clone live
+        // INSIDE this `if`, so an unarmed connection reads no clock and clones
+        // nothing (proven offline by `Diagnostics::slow_query_armed` unit tests).
+        if self.diag.slow_query_armed() {
+            Some(SlowQueryGuard {
+                diag: self.diag.clone(),
+                sql,
+                started: Instant::now(),
+                committed: false,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Commit the slow-query guard iff `result` is `Ok`, so a slow query is
+    /// reported ONLY for a verb that COMPLETED successfully (an errored/cancelled
+    /// verb leaves the guard uncommitted and emits nothing). A no-op when the
+    /// guard is `None` (slow-query timing off).
+    fn commit_slow<T, E>(guard: &mut Option<SlowQueryGuard<'_>>, result: &Result<T, E>) {
+        if result.is_ok()
+            && let Some(g) = guard
+        {
+            g.commit();
         }
     }
 
@@ -610,7 +746,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .engine
             .ping(
                 live,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
@@ -621,6 +757,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
 
     /// Issue a simple query, returning the command tag string.
     pub async fn simple_query(&mut self, sql: &str) -> Result<String, DriverError> {
+        let mut slow = self.armed_slow_guard(sql);
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let outcome = self
@@ -628,7 +765,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .simple_query(
                 live,
                 sql,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
@@ -636,11 +773,14 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .await;
         self.settle(outcome, &mut collector)?;
         // Move the already-owned tag out — no clone (the collector is dropped).
-        Ok(collector.into_command_tag())
+        let result = Ok(collector.into_command_tag());
+        Self::commit_slow(&mut slow, &result);
+        result
     }
 
     /// Execute a non-row runtime-SQL command, returning the affected-row count.
     pub async fn execute_sql(&mut self, sql: &str) -> Result<u64, DriverError> {
+        let mut slow = self.armed_slow_guard(sql);
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let outcome = self
@@ -648,18 +788,21 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .execute(
                 live,
                 sql,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
             )
             .await;
         self.settle(outcome, &mut collector)?;
-        Ok(collector.affected())
+        let result = Ok(collector.affected());
+        Self::commit_slow(&mut slow, &result);
+        result
     }
 
     /// Run a row-returning runtime-SQL query (text result columns).
     pub async fn query_sql(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
+        let mut slow = self.armed_slow_guard(sql);
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let outcome = self
@@ -667,14 +810,16 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .query(
                 live,
                 sql,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
             )
             .await;
         self.settle(outcome, &mut collector)?;
-        Self::build_query_result(collector, None)
+        let result = Self::build_query_result(collector, None);
+        Self::commit_slow(&mut slow, &result);
+        result
     }
 
     /// Run a runtime-SQL query returning the first row, or [`DriverError::NoRows`].
@@ -707,7 +852,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 live,
                 &stmt_name,
                 sql,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
@@ -738,7 +883,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 live,
                 &stmt.inner,
                 params,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
@@ -763,7 +908,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 live,
                 &stmt.inner,
                 params,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
@@ -796,6 +941,23 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         sql: &str,
         params: &P,
     ) -> Result<QueryResult, DriverError> {
+        // Time the WHOLE operation (fused/promoted/cached paths) via a thin
+        // wrapper over the inner body, committing only on Ok — a multi-return verb
+        // funnels through one point, so a slow repeated query (cache reuse) is
+        // caught and an errored one is not reported.
+        let mut slow = self.armed_slow_guard(sql);
+        let result = self.query_params_inner(sql, params).await;
+        Self::commit_slow(&mut slow, &result);
+        result
+    }
+
+    /// The body of [`query_params`](Self::query_params) — the dynamic plan-cache
+    /// orchestration, wrapped by `query_params` for slow-query timing.
+    async fn query_params_inner<P: ParamsWriter>(
+        &mut self,
+        sql: &str,
+        params: &P,
+    ) -> Result<QueryResult, DriverError> {
         if let Some(idx) = self.dyn_cache.ready_index(sql) {
             // REUSE: Bind+Execute+Sync on the cached named statement (no re-parse).
             if let Some(stmt) = self.dyn_cache.take(idx) {
@@ -816,6 +978,12 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                         // query's first, uncached sighting and so never cached),
                         // and any OTHER error surfaces unchanged (below). Fall
                         // through to the fused re-run + re-warm.
+                        //
+                        // Surface the self-heal: a silent re-prepare on a stale
+                        // plan is exactly the fallback path an operator must be
+                        // able to see (only latency shows otherwise).
+                        self.diag
+                            .emit(&crate::diag::DiagEvent::PreparedCacheSelfHeal { sql });
                         self.dyn_cache.remove(idx);
                         self.close_statement(stmt).await?;
                     }
@@ -874,7 +1042,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 live,
                 sql,
                 params,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
@@ -916,6 +1084,20 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         sql: &str,
         params: &P,
     ) -> Result<u64, DriverError> {
+        // Thin timing wrapper over the inner body (see `query_params`).
+        let mut slow = self.armed_slow_guard(sql);
+        let result = self.execute_params_inner(sql, params).await;
+        Self::commit_slow(&mut slow, &result);
+        result
+    }
+
+    /// The body of [`execute_params`](Self::execute_params), wrapped by
+    /// `execute_params` for slow-query timing.
+    async fn execute_params_inner<P: ParamsWriter>(
+        &mut self,
+        sql: &str,
+        params: &P,
+    ) -> Result<u64, DriverError> {
         if let Some(idx) = self.dyn_cache.ready_index(sql) {
             // REUSE: Bind+Execute+Sync on the cached named statement.
             if let Some(stmt) = self.dyn_cache.take(idx) {
@@ -929,6 +1111,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                     // — this is a retry of a driver-internal optimization artifact,
                     // not error-masking; any non-stale error surfaces unchanged).
                     Err(e) if e.is_stale_prepared_plan() => {
+                        // Surface the self-heal (see `query_params`).
+                        self.diag
+                            .emit(&crate::diag::DiagEvent::PreparedCacheSelfHeal { sql });
                         self.dyn_cache.remove(idx);
                         self.close_statement(stmt).await?;
                     }
@@ -968,7 +1153,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 live,
                 sql,
                 params,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
@@ -994,7 +1179,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .close_statements(
                 live,
                 names,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
@@ -1012,7 +1197,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .close_statement(
                 live,
                 stmt.inner,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
@@ -1041,6 +1226,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     {
         #[cfg(feature = "n1-detect")]
         self.n1_record(q.sql(), caller);
+        let mut slow = self.armed_slow_guard(q.sql());
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let outcome = self
@@ -1049,14 +1235,16 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 live,
                 q,
                 params,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
             )
             .await;
         self.settle(outcome, &mut collector)?;
-        Ok(collector.affected())
+        let result = Ok(collector.affected());
+        Self::commit_slow(&mut slow, &result);
+        result
     }
 
     /// Run a compile-checked `query!` and collect its TYPED rows — the flagship
@@ -1068,7 +1256,13 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ) -> Result<Rows<Q>, DriverError> {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::PREPARED.sql(), caller);
-        self.query_collect::<Q>(params).await
+        // Slow-query timing for the compile-checked FLAGSHIP (parity with the
+        // dynamic verbs): time the whole op, commit only on Ok, report the const
+        // SQL (never the params — no PII).
+        let mut slow = self.armed_slow_guard(Q::PREPARED.sql());
+        let result = self.query_collect::<Q>(params).await;
+        Self::commit_slow(&mut slow, &result);
+        result
     }
 
     /// The typed-collect body behind [`query`](Self::query): collects a typed
@@ -1090,7 +1284,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 live,
                 &bsql_postgres_proto::prepared::prepared_at::<Q>(),
                 params,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     builder.feed(s);
                     ControlFlow::Continue(())
                 }),
@@ -1119,7 +1313,13 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ) -> Result<Q::Owned, DriverError> {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::PREPARED.sql(), caller);
-        self.query_at_most_one::<Q>(params).await?.ok_or(DriverError::NoRows)
+        let mut slow = self.armed_slow_guard(Q::PREPARED.sql());
+        let result = self
+            .query_at_most_one::<Q>(params)
+            .await
+            .and_then(|opt| opt.ok_or(DriverError::NoRows));
+        Self::commit_slow(&mut slow, &result);
+        result
     }
 
     /// Run a compile-checked `query!` expecting AT MOST one row, returning the
@@ -1142,7 +1342,10 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ) -> Result<Option<Q::Owned>, DriverError> {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::PREPARED.sql(), caller);
-        self.query_at_most_one::<Q>(params).await
+        let mut slow = self.armed_slow_guard(Q::PREPARED.sql());
+        let result = self.query_at_most_one::<Q>(params).await;
+        Self::commit_slow(&mut slow, &result);
+        result
     }
 
     /// The shared zero-or-one decode-direct body behind
@@ -1196,7 +1399,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 live,
                 &bsql_postgres_proto::prepared::prepared_at::<Q>(),
                 params,
-                capture_notify(&mut self.notifications, |surface| match surface {
+                capture_notify(&mut self.notifications, self.diag.sink(), |surface| match surface {
                     Surface::Row(body) => {
                         if seen_first {
                             // A SECOND row: the caller asked for exactly one, so
@@ -1323,7 +1526,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 live,
                 &bsql_postgres_proto::prepared::prepared_at::<Q>(),
                 params,
-                capture_notify(&mut self.notifications, |surface| match surface {
+                capture_notify(&mut self.notifications, self.diag.sink(), |surface| match surface {
                     Surface::Row(body) => match Q::decode_borrowed(body) {
                         // The record borrows the transient ingest buffer; `on_row`
                         // consumes it in-scope (the `for<'q>` wall forbids escape).
@@ -1469,7 +1672,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .query_break(
                 live,
                 sql,
-                capture_notify(&mut self.notifications, |surface| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
                     stream_dynamic_row(surface, &mut on_row, &mut slots, &mut oversize, &mut db_error)
                 }),
             )
@@ -1506,7 +1709,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 live,
                 sql,
                 params,
-                capture_notify(&mut self.notifications, |surface| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
                     stream_dynamic_row(surface, &mut on_row, &mut slots, &mut oversize, &mut db_error)
                 }),
             )
@@ -1526,7 +1729,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .engine
             .drain(
                 live,
-                capture_notify(&mut self.notifications, |_s: Surface<'_>| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |_s: Surface<'_>| {
                     ControlFlow::Continue(())
                 }),
             )
@@ -1593,7 +1796,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .simple_query(
                 live,
                 &sql,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
@@ -1689,7 +1892,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .copy_out(
                 live,
                 &sql,
-                capture_notify(&mut self.notifications, |surface| match surface {
+                capture_notify(&mut self.notifications, self.diag.sink(), |surface| match surface {
                     // The chunk borrows the transient ingest buffer; `on_chunk`
                     // consumes it in-scope (the `for<'q>` wall forbids escape).
                     Surface::CopyData(body) => on_chunk(body),
@@ -1765,7 +1968,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .engine
             .copy_in_begin(
                 sql,
-                capture_notify(&mut self.notifications, |_s: Surface<'_>| ControlFlow::Continue(())),
+                capture_notify(&mut self.notifications, self.diag.sink(), |_s: Surface<'_>| ControlFlow::Continue(())),
             )
             .await;
         match outcome {
@@ -1795,7 +1998,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .engine
             .copy_in_finish(
                 live,
-                capture_notify(&mut self.notifications, |s| {
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
@@ -1818,7 +2021,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             .copy_in_abort(
                 live,
                 b"client aborted COPY",
-                capture_notify(&mut self.notifications, |_s: Surface<'_>| ControlFlow::Continue(())),
+                capture_notify(&mut self.notifications, self.diag.sink(), |_s: Surface<'_>| ControlFlow::Continue(())),
             )
             .await
         {

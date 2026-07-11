@@ -2,6 +2,7 @@
 //! (TLS-only — compiled out with the `tls` feature off).
 
 use crate::config::{ConnectConfig, SslMode};
+use crate::diag::{DiagEvent, Diagnostics};
 use crate::error::DriverError;
 
 /// SSL probe result after sending the SSL request bytes and reading the
@@ -50,9 +51,12 @@ pub fn ssl_request_bytes() -> &'static [u8; 8] {
 ///   host is intentional. This is the loud replacement for the former silent
 ///   plaintext fallback to a remote server.
 ///
-/// `Prefer` warns ON STDERR (in debug AND release — an SSL downgrade is a
-/// security event a production build must not hide) and falls back to plain TCP.
-/// A consumer that must not silently downgrade can additionally assert
+/// `Prefer` falls back to plain TCP on a refusal and SURFACES the downgrade — a
+/// security event a production build must not hide. When a diagnostics sink is
+/// installed it routes through it as [`DiagEvent::SslDowngrade`] (so a headless /
+/// journald service can capture it); with NO sink it keeps the historical stderr
+/// warning (in debug AND release), so existing behaviour is preserved. A consumer
+/// that must not silently downgrade can additionally assert
 /// `Connection::is_encrypted()` after connect. Any other byte (a server
 /// `ErrorResponse` start, or an out-of-protocol value) is a hard
 /// [`DriverError::Io`] — never a silent fallback.
@@ -62,6 +66,7 @@ pub fn classify_ssl_response(
     response_byte: u8,
     config: &ConnectConfig,
     ssl_mode: SslMode,
+    diagnostics: &Diagnostics,
 ) -> Result<SslProbe, DriverError> {
     use bsql_postgres_proto::wire::SslNegotiationOutcome;
     match bsql_postgres_proto::wire::classify_ssl_response_byte(response_byte) {
@@ -88,13 +93,24 @@ pub fn classify_ssl_response(
                     )
                 });
             }
-            // Emit in debug AND release: a silent downgrade to plaintext on an
-            // untrusted network is exactly the event a production build must
-            // surface. stderr keeps it dependency-free (no logging crate). A
-            // consumer can also assert `Connection::is_encrypted()` to fail hard.
-            eprintln!("[bsql] WARNING: SSL refused by server, falling back to plain TCP. \
-                Use SslMode::Require for production over untrusted networks, or assert \
-                Connection::is_encrypted().");
+            // Surface the downgrade — a silent fallback to plaintext on an
+            // untrusted network is exactly the event a production build must not
+            // hide. Route through the diagnostics sink when one is installed (so a
+            // headless service captures a structured `SslDowngrade`); otherwise
+            // keep the historical stderr warning (debug AND release), so a consumer
+            // that installs no sink sees no behaviour change. A consumer can also
+            // assert `Connection::is_encrypted()` to fail hard.
+            if diagnostics.is_enabled() {
+                // Route through `Diagnostics::emit`, whose `catch_unwind` contains
+                // a panicking sink — a buggy callback can never fault the connect.
+                diagnostics.emit(&DiagEvent::SslDowngrade { host: config.host.as_str() });
+            } else {
+                eprintln!(
+                    "[bsql] WARNING: SSL refused by server, falling back to plain TCP. \
+                     Use SslMode::Require for production over untrusted networks, or assert \
+                     Connection::is_encrypted()."
+                );
+            }
             Ok(SslProbe::PlainTcp)
         }
         // `ErrorIncoming` (a server `ErrorResponse` start), `InvalidByte`, or any
@@ -116,7 +132,7 @@ mod tests {
         // An EXPLICITLY-required TLS that the server refuses is the caller's own
         // contract being violated → the honest `SslRefused` class (unchanged).
         let config = ConnectConfig::new("db.example.com", "u").ssl_mode(SslMode::Require);
-        match classify_ssl_response(REFUSED, &config, SslMode::Require) {
+        match classify_ssl_response(REFUSED, &config, SslMode::Require, &Diagnostics::new()) {
             Err(DriverError::SslRefused) => {}
             Err(other) => panic!("explicit Require refused must be SslRefused, got {other:?}"),
             Ok(_) => panic!("explicit Require refused must NOT fall back to plain TCP"),
@@ -133,7 +149,7 @@ mod tests {
         let resolved =
             config.resolve_ssl_mode(&crate::resolve_endpoint(&config.host, config.port));
         assert_eq!(resolved, SslMode::Require, "a remote host defaults to Require");
-        match classify_ssl_response(REFUSED, &config, resolved) {
+        match classify_ssl_response(REFUSED, &config, resolved, &Diagnostics::new()) {
             Err(DriverError::Config(msg)) => {
                 assert!(
                     msg.contains("refused TLS")
@@ -152,12 +168,40 @@ mod tests {
         // `Prefer` (explicit or the local default) tolerates a refusal — plain TCP
         // with a stderr warning, never an error.
         let config = ConnectConfig::new("localhost", "u");
-        match classify_ssl_response(REFUSED, &config, SslMode::Prefer) {
+        match classify_ssl_response(REFUSED, &config, SslMode::Prefer, &Diagnostics::new()) {
             Ok(SslProbe::PlainTcp) => {}
             Ok(SslProbe::Accepted { .. }) => {
                 panic!("a refusal must never be classified as Accepted")
             }
             Err(e) => panic!("Prefer refused must fall back to PlainTcp, got Err: {e:?}"),
         }
+    }
+
+    #[test]
+    fn refused_prefer_with_a_sink_routes_the_downgrade_through_it() {
+        // WITNESS (C1b): with a diagnostics sink installed, a Prefer downgrade is
+        // surfaced as `DiagEvent::SslDowngrade` through the sink (naming the host),
+        // NOT printed to stderr — a headless service can capture the security
+        // event. No live server: the classifier is driven directly.
+        use std::sync::{Arc, Mutex};
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_in = Arc::clone(&captured);
+        let diag = Diagnostics::new().on_event(move |ev: &DiagEvent<'_>| {
+            if let DiagEvent::SslDowngrade { host } = ev {
+                captured_in.lock().expect("lock").push((*host).to_string());
+            }
+        });
+        let config = ConnectConfig::new("db.internal.example", "u");
+        match classify_ssl_response(REFUSED, &config, SslMode::Prefer, &diag) {
+            Ok(SslProbe::PlainTcp) => {}
+            Ok(SslProbe::Accepted { .. }) => panic!("a refusal must never be Accepted"),
+            Err(e) => panic!("Prefer refused must fall back to PlainTcp, got Err: {e:?}"),
+        }
+        assert_eq!(
+            captured.lock().expect("lock").as_slice(),
+            &["db.internal.example".to_string()],
+            "the downgrade must route through the sink with the host",
+        );
     }
 }

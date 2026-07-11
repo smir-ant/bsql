@@ -271,6 +271,60 @@ each row as a zero-copy `BorrowedRow` with zero per-row allocation and a
 reusable. Available on both PostgreSQL and SQLite with the SAME signature — a
 dynamic stream reads identically across backends.
 
+### Observability — the `DiagEvent` sink
+
+bsql emits structured operational events through ONE **dep-free** seam: a
+consumer-installed callback that receives a borrowed `DiagEvent`. No
+`tracing` / `log` / `metrics` in the runtime graph — a consumer chooses their
+own logging stack and bsql forces none (an optional `tracing` adapter can wrap
+the callback later).
+
+```rust
+use bsql::pg::{DiagEvent, Diagnostics, Pool};
+use std::time::Duration;
+
+let pool = Pool::builder(config, 16)
+    .on_diagnostic(|ev: &DiagEvent<'_>| match ev {
+        DiagEvent::SlowQuery { sql, elapsed } => eprintln!("SLOW {elapsed:?}: {sql}"),
+        DiagEvent::ServerNotice { severity, message, .. } => eprintln!("{severity}: {message}"),
+        other => eprintln!("{other:?}"),
+    })
+    .slow_query_threshold(Duration::from_millis(100))
+    .build();
+```
+
+A standalone connection opts in with `Connection::connect_with(config, &diag)`
+(or `set_diagnostics`); a pool installs the same configuration on every
+connection it mints. Diagnostics is **NOT** a `ConnectConfig` field — the
+152-byte config footprint is untouched.
+
+- **Zero-cost when off.** An unset sink is a single never-taken `if let Some`
+  branch at each COLD lifecycle boundary — no event built, no wire parsed, no
+  `Instant::now`, no allocation. The events fire only at cold boundaries (a
+  completed query's timing, a received `NOTICE`, a pool checkout, a connect), so
+  the per-row hot path is untouched — the `next_event` codegen ceiling is
+  byte-identical, the deliberate distinction from a per-row observation seam.
+- **No PII by default.** A `DiagEvent` never carries a bound parameter VALUE — a
+  slow-query event carries the SQL TEXT (or a digest a consumer computes from
+  it), never the values a placeholder stood for.
+- **A sink can do anything — the driver absorbs it.** Every sink call is wrapped
+  in `catch_unwind`, so a panicking callback is contained (never poisons a
+  connection or aborts the process); pool events run outside the pool lock, so a
+  sink may safely call `pool.stats()`; and a diagnostic emitted from WITHIN a sink
+  (a self-slow query, a re-entrant `pool.get()`) is silently suppressed, so a
+  self-emitting sink can never recurse into a stack overflow.
+- **Slow-query covers the flagship.** `SlowQuery` fires for the compile-checked
+  `query!` verbs (`query`/`query_one`/`query_opt`/typed `execute`) AND the dynamic
+  SQL verbs, only for a query that COMPLETED (an errored/cancelled one is not
+  reported); streaming verbs are excluded by design (a stream's duration is
+  consumer iteration time).
+- **Events** (`#[non_exhaustive]`): `ServerNotice` (a `RAISE NOTICE`/`WARNING` —
+  the primary PL/pgSQL log channel, formerly silently dropped), `SslDowngrade`,
+  `SlowQuery` (timing gated behind a threshold so the off path reads no clock),
+  `PoolAcquireTimeout` / `PoolConnectionEvicted` (plus counters via
+  `Pool::stats()`), `ParameterStatus`, `MigrationLockWaiting` /
+  `MigrationApplying` / `MigrationApplied`, and `PreparedCacheSelfHeal`.
+
 ## Crate layout
 
 Nine publishable crates and six never-published (`publish = false`) dev
@@ -361,12 +415,12 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 2242** — every `#[test]` / `#[tokio::test]` attribute:
+- **Test functions: 2267** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
   ```
-- **`#[ignore]` live suites (need a running database): 272**:
+- **`#[ignore]` live suites (need a running database): 289**:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[ignore' | wc -l

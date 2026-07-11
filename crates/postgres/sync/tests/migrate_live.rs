@@ -267,3 +267,46 @@ fn two_concurrent_runners_apply_exactly_once_via_advisory_lock() {
 
     drop_schema(&mut setup, &schema);
 }
+
+/// WITNESS (C1f — migration progress, blocking twin): running a set emits a
+/// `MigrationApplying` then `MigrationApplied` for each migration, in order.
+#[test]
+#[ignore = "requires local PG"]
+fn sync_runner_emits_progress_events() {
+    use std::sync::{Arc, Mutex};
+
+    use bsql_postgres_sync::{DiagEvent, Diagnostics};
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_in = Arc::clone(&events);
+    let diag = Diagnostics::new().on_event(move |ev: &DiagEvent<'_>| match ev {
+        DiagEvent::MigrationApplying { name } => {
+            events_in.lock().expect("lock").push(format!("applying:{name}"));
+        }
+        DiagEvent::MigrationApplied { name } => {
+            events_in.lock().expect("lock").push(format!("applied:{name}"));
+        }
+        _ => {}
+    });
+
+    let mut conn = Connection::connect_with(&config(), &diag).expect("connect_with");
+    let schema = unique_schema();
+    conn.simple_query(&format!("CREATE SCHEMA {schema}")).expect("create schema");
+    conn.simple_query(&format!("SET search_path TO {schema}")).expect("set search_path");
+
+    conn.run_migrations(MigrationSource::embedded(&[M1, M2])).expect("run");
+
+    let got = events.lock().expect("lock").clone();
+    assert_eq!(
+        got,
+        vec![
+            "applying:0001_users.sql",
+            "applied:0001_users.sql",
+            "applying:0002_email.sql",
+            "applied:0002_email.sql",
+        ],
+        "each migration emits applying then applied, in order",
+    );
+
+    drop_schema(&mut conn, &schema);
+}

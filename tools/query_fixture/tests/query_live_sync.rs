@@ -32,6 +32,10 @@ use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 // One column, fixed-width, NOT NULL -> the borrowed record carries no lifetime
 // (`One { n: i32 }`) and decodes through the vectorized fast path.
 bsql::query!(One, "SELECT 1::int4 AS n");
+bsql::query!(
+    SlowSleep,
+    "SELECT n FROM (VALUES (1::int4)) AS t(n) WHERE pg_sleep(0.2) IS NOT NULL"
+);
 // A distinct literal (distinct SQL -> distinct content address) — a second shape
 // for `query_one`.
 bsql::query!(Seven, "SELECT 7::int4 AS n");
@@ -1445,4 +1449,34 @@ fn oversize_typed_multirow_reassembly_over_table() {
 
     c.execute_sql("DROP TABLE ov_rows").expect("cleanup");
     c.close().expect("close");
+}
+
+/// WITNESS (review MAJOR 3, blocking twin): a slow typed `query!(…)` emits
+/// `DiagEvent::SlowQuery` with the typed query's SQL text.
+#[test]
+#[ignore = "requires local PG"]
+fn typed_slow_query_emits_slow_query() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use bsql_postgres_sync::{DiagEvent, Diagnostics};
+
+    let slow: Arc<Mutex<Vec<(String, Duration)>>> = Arc::new(Mutex::new(Vec::new()));
+    let slow_in = Arc::clone(&slow);
+    let diag = Diagnostics::new()
+        .slow_query_threshold(Duration::from_millis(50))
+        .on_event(move |ev: &DiagEvent<'_>| {
+            if let DiagEvent::SlowQuery { sql, elapsed } = ev {
+                slow_in.lock().expect("lock").push(((*sql).to_string(), *elapsed));
+            }
+        });
+    let mut c = Connection::connect_with(&sync_config(), &diag).expect("connect_with");
+
+    let rows = c.query::<SlowSleepQuery>(()).expect("slow typed query");
+    assert_eq!(rows.len(), 1);
+
+    let got = slow.lock().expect("lock").clone();
+    assert_eq!(got.len(), 1, "the slow typed query! emitted SlowQuery once, got {got:?}");
+    assert!(got[0].0.contains("pg_sleep"), "the event carries the typed SQL, got {:?}", got[0].0);
+    assert!(got[0].1 >= Duration::from_millis(50), "elapsed >= threshold, got {:?}", got[0].1);
 }

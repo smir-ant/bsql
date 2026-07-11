@@ -327,20 +327,7 @@ pub fn parse_error_response(body: &[u8]) -> DbError {
     let mut detail: Option<String> = None;
     let mut hint: Option<String> = None;
 
-    let mut rest = body;
-    while let Some((type_byte, after_type)) = rest.split_first() {
-        let type_byte = *type_byte;
-        if type_byte == 0 {
-            break;
-        }
-        let nul = match after_type.iter().position(|&b| b == 0) {
-            Some(p) => p,
-            None => break,
-        };
-        let value_bytes = match after_type.get(..nul) {
-            Some(v) => v,
-            None => break,
-        };
+    for (type_byte, value_bytes) in error_response_fields(body) {
         match type_byte {
             // The SQLSTATE narrows to 5 ASCII bytes with no allocation; a
             // malformed (non-5-char / non-ASCII) wire code is padded/truncated,
@@ -354,14 +341,6 @@ pub fn parse_error_response(body: &[u8]) -> DbError {
             b'H' => hint = Some(String::from_utf8_lossy(value_bytes).into_owned()),
             _ => {}
         }
-        let next = match nul.checked_add(1) {
-            Some(n) => n,
-            None => break,
-        };
-        rest = match after_type.get(next..) {
-            Some(r) => r,
-            None => break,
-        };
     }
 
     DbError {
@@ -371,6 +350,36 @@ pub fn parse_error_response(body: &[u8]) -> DbError {
         detail,
         hint,
     }
+}
+
+/// Iterate the `[type:u8] [value:CString]` fields of a server `ErrorResponse` /
+/// `NoticeResponse` body (identical shape, PG §55.7), ending at the `0` type
+/// byte (or the first structural malformation — a missing NUL terminator, which
+/// stops iteration rather than mis-reading). Yields each field as
+/// `(type_byte, value_bytes)` where `value_bytes` borrows the body.
+///
+/// The SINGLE field-walk authority: [`parse_error_response`] (the owned
+/// [`DbError`]) and the diagnostics `ServerNotice` emitter (borrowed
+/// [`Cow`](std::borrow::Cow) fields) both drive it, so the two cannot drift, and
+/// the walk's totality is proven once by the `decoder_fuzz` gate exercising
+/// `parse_error_response` on arbitrary bytes.
+pub(crate) fn error_response_fields(body: &[u8]) -> impl Iterator<Item = (u8, &[u8])> + '_ {
+    let mut rest = body;
+    std::iter::from_fn(move || {
+        let (type_byte, after_type) = rest.split_first()?;
+        let type_byte = *type_byte;
+        if type_byte == 0 {
+            return None;
+        }
+        let nul = after_type.iter().position(|&b| b == 0)?;
+        let value_bytes = after_type.get(..nul)?;
+        // `nul + 1` cannot overflow a `usize` for a real body (a position inside a
+        // slice), but the arithmetic wall forbids a bare `+`; a dead saturation
+        // just ends iteration one field early (fail-closed, never a mis-read).
+        let next = nul.checked_add(1)?;
+        rest = after_type.get(next..)?;
+        Some((type_byte, value_bytes))
+    })
 }
 
 /// Parse a `NotificationResponse` body (`[i32 pid] [channel CString] [payload

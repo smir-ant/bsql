@@ -654,7 +654,13 @@ impl<S: Transport<Error = std::io::Error>> Core<S> {
                     "too many migrations to record (ordinal exceeds i32)",
                 )))
             })?;
+            // Progress events (cold, per-migration): a long migration run is now
+            // visible instead of silent between the start and the final report.
+            self.diagnostics()
+                .emit(&crate::diag::DiagEvent::MigrationApplying { name: &migration.name });
             self.apply_one(migration, ordinal).await?;
+            self.diagnostics()
+                .emit(&crate::diag::DiagEvent::MigrationApplied { name: &migration.name });
             newly_applied.push(migration.name.clone());
         }
 
