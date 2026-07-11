@@ -217,6 +217,21 @@ gap — `emit` then cross-checks each `query!` against a real SQLite replay of
 the migrations at build time. The only cost is a second bundled-`rusqlite`
 build-dependency compile; a SQLite-targeting consumer should enable both.
 
+### A worked example
+
+[`tools/query_fixture/examples/web_service.rs`](tools/query_fixture/examples/web_service.rs)
+is a realistic small web-service data layer end-to-end: a connection pool with
+the structured diagnostics sink wired to stderr, a couple of `query!` typed
+queries against a small migration, an atomic transaction, and
+reconnect-on-disconnect error handling with `DriverError::is_disconnect()`. It is
+compiled offline by `cargo build --examples` (the `query!` macros are typed at
+build time; `main` is compiled, never run) and runs against a live PostgreSQL:
+
+```bash
+DATABASE_URL=postgres://user@localhost/db \
+  cargo run -p bsql-query-fixture --example web_service
+```
+
 ### Applying migrations
 
 Add `bsql_build::emit_migrations("migrations")` to your `build.rs` to bake the
@@ -254,14 +269,23 @@ atomicity / drift / concurrency guarantees.
 
 ### Runtime queries
 
-The typed `query!` path is the flagship, but every driver also exposes a
-runtime-SQL surface (`query_sql`, `query_params_one`, `prepare` /
-`execute_prepared`, `transaction`, …) and a dynamic 16-byte `Row` backed
-by an `Arc`-shared arena (3 heap allocations per whole result — the arena's
-data + slots vectors + the shared `Arc`; the result mints `Row` handles
-lazily, never an eager `Vec<Row>` — regardless of row count). See the
-crate-root docs of `bsql` / `bsql-postgres-async` /
-`bsql-postgres-sync` / `bsql-sqlite` for runnable examples.
+**Reach for the typed `query!` verbs first.** The compile-checked verbs
+(`query` / `query_one` / `query_opt` / `query_each` / typed `execute`) are the
+DEFAULT: they are typed at build time, so a wrong column or type is a compile
+error and every parameter binds in one uniform binary format. The dynamic
+runtime-SQL verbs are the ESCAPE HATCH — they carry a `_sql` suffix precisely to
+mark the untyped path (`query_sql`, `query_one_sql`, `query_opt_sql`,
+`execute_sql`, `query_each_sql`; plus the parameterized `query_params` /
+`query_params_one` / `execute_params`) — and are for the case a typed query
+cannot cover: SQL assembled at runtime that the migration catalog cannot
+validate. Prefer the typed path; drop to `_sql` only when you must.
+
+The dynamic verbs return a dynamic 16-byte `Row` backed by an `Arc`-shared arena
+(3 heap allocations per whole result — the arena's data + slots vectors + the
+shared `Arc`; the result mints `Row` handles lazily, never an eager `Vec<Row>` —
+regardless of row count). See the crate-root docs of `bsql` /
+`bsql-postgres-async` / `bsql-postgres-sync` / `bsql-sqlite` for runnable
+examples.
 
 For a colossal runtime result, `query_each_sql(sql, on_row)` /
 `query_each_params(sql, params, on_row)` stream the dynamic row to a callback
@@ -414,6 +438,17 @@ hardens the connection LIFECYCLE:
   the return-time restamp reads the clock only when `idle_timeout` is set). A reap
   emits `DiagEvent::PoolConnectionEvicted` and increments the `Pool::stats()`
   eviction counter.
+- **Per-connection memory (sizing a large pool).** A PLAINTEXT connection holds a
+  fixed 4 KiB engine read buffer (the dominant driver-owned heap, apart from the
+  kernel's own socket buffers). A **TLS** connection additionally holds the rustls
+  record buffers: a ~32 KiB inbound ciphertext staging buffer (`STAGING_CAP`) plus
+  a ~16 KiB encrypt scratch (`TLS_RECORD_SCRATCH`), both fixed and allocated ONCE
+  per connection, plus rustls's own connection state and two transient
+  plaintext/ciphertext vecs each bounded near one 16 KiB TLS record. So budget on
+  the order of **~64 KiB per TLS connection** — a 100-connection TLS pool holds
+  roughly ~6 MiB of driver-owned buffers, versus ~0.4 MiB plaintext. Drop the
+  whole cost with `default-features = false` (TLS off) for a localhost /
+  unix-socket / trust-auth deployment.
 
 ## Crate layout
 
@@ -445,6 +480,33 @@ migrations → catalog → `query!` chain end-to-end), `bsql-query-bridge-fixtur
 into a consumer-chosen type), `bsql-test-harness-fixture` (the live
 `#[bsql::test]` schema-isolation witness over both drivers), and `bsql-corpus`
 (a replay corpus pinning engine behaviour against goldens).
+
+## Platform support
+
+- **64-bit Linux, macOS, and Windows** (`x86_64` and `aarch64`). The footprint
+  pins assert exact `size_of` / `align_of` for 64-bit pointers, so a 64-bit
+  target is required — a non-64-bit build (i686 / wasm32 / 32-bit ARM) is a loud
+  `compile_error!`, never a silently-wrong layout.
+- **TCP transport works on every platform.** The **unix-domain-socket** transport
+  (an absolute-path host) is **unix-only** — it is gated behind `#[cfg(unix)]`,
+  because `std::os::unix::net::UnixStream` does not exist on Windows. A
+  unix-socket host requested on a non-unix target is a classified
+  `DriverError::Config` at connect (`use a TCP host`), never a silent fallback or
+  a panic. So a Windows deployment uses TCP; a unix-socket deployment is Linux /
+  macOS.
+- **TLS on Windows / when cross-compiling needs a C toolchain.** The default-on
+  `tls` feature pulls `ring`, which compiles C — cross-compiling it (e.g. a
+  Windows target built on a macOS/Linux host) needs the *target's* C toolchain,
+  which `rustup target add <triple>` does NOT install. A `default-features =
+  false` (TLS-off) build is pure Rust and cross-compiles with only the target's
+  prebuilt `std`; add TLS back with the target's C cross-toolchain in place. A
+  native build on each platform (with its own C compiler) builds `ring` normally.
+- **Local regression guard.** With no CI, the `cross_platform` devgate
+  (`tools/devgates/tests/cross_platform.rs`) runs `cargo check` for the Windows
+  and Linux targets (pure-Rust, `--no-default-features`) whenever those targets
+  are installed, so an accidental unconditional `use std::os::unix::…` is caught
+  on the dev's own machine. It skips (passes) any target not installed, so a
+  developer who has not run `rustup target add …` never gets a false red.
 
 ## Safety floor
 
@@ -482,6 +544,7 @@ cargo test -p bsql-devgates --test deps_pin                # pinned dependency f
 cargo test -p bsql-devgates --test runtime_graph_pin       # build-time-only boundary
 cargo test -p bsql-devgates --test doc_links               # intra-doc-link wall
 cargo test -p bsql-devgates --test test_count              # README test-count doc-vs-reality wall
+cargo test -p bsql-devgates --test cross_platform          # Windows/Linux cross-target regression wall (skips absent targets)
 cargo bench  --workspace                                   # perf evidence (criterion)
 ```
 
