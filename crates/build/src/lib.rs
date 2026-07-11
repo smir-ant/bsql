@@ -275,6 +275,14 @@ pub enum BuildError {
     MigrationsDir { path: PathBuf, source: std::io::Error },
     /// A migration file could not be read.
     ReadFile { path: PathBuf, source: std::io::Error },
+    /// A directory entry named `*.sql` is NOT a regular file (nor a symlink to
+    /// one) — it is a FIFO / socket / block or character device / named pipe.
+    /// Reading such an entry as a migration would block the build forever (a
+    /// writer-less FIFO) or read without bound (a `/dev/zero`-class device), so
+    /// it is rejected LOUDLY, naming the path, rather than admitted as a leaf. A
+    /// legitimate symlink to a real `.sql` file IS followed and admitted; only a
+    /// non-regular target is an error.
+    NonRegularFile { path: PathBuf },
     /// `sqlparser` rejected a file's SQL.
     Parse { path: PathBuf, message: String },
     /// A parsed statement could not be replayed against the catalog
@@ -367,6 +375,16 @@ impl fmt::Display for BuildError {
             BuildError::ReadFile { path, source } => write!(
                 f,
                 "bsql-build: cannot read migration file {}: {source}",
+                path.display()
+            ),
+            BuildError::NonRegularFile { path } => write!(
+                f,
+                "bsql-build: migration entry {} is not a regular file (it is a \
+                 FIFO, socket, or device). Reading it as a migration would hang \
+                 the build (a writer-less FIFO) or read without bound (a device), \
+                 so it is rejected. A migration must be a regular `.sql` file (a \
+                 symlink to one is followed); remove the special file or point it \
+                 at real SQL.",
                 path.display()
             ),
             BuildError::Parse { path, message } => write!(
@@ -673,17 +691,60 @@ pub fn emit_migrations(migrations_dir: impl AsRef<Path>) -> Result<(), BuildErro
     Ok(())
 }
 
+/// The maximum SQL nesting depth `bsql-build` parses before rejecting a
+/// migration with a classified [`BuildError::Parse`].
+///
+/// `sqlparser`'s `recursive-protection` feature (enabled in `Cargo.toml`) makes
+/// a deep parse STRUCTURALLY unable to overflow the stack — its stacker grows
+/// the native stack on demand across the parser's deep-recursion productions —
+/// so this bound is not a "fire before the stack overflows" safety margin but a
+/// POLICY cap on absurd nesting: past it the parser's `RecursionCounter` returns
+/// a classified `RecursionLimitExceeded` (mapped to [`BuildError::Parse`]) rather
+/// than parse a pathological migration into a giant AST.
+///
+/// It sits far ABOVE any legitimate migration — real DDL nests a handful deep; a
+/// `CHECK` constraint or sub-query hundreds of parens deep is machine-generated
+/// or hostile, not authored — so it never false-rejects a real schema, while
+/// still keeping the accepted AST shallow enough that the downstream replay walk
+/// and the AST's own recursive `Drop` (which the parser's stacker does NOT cover)
+/// stay comfortably within the stack.
+const MAX_MIGRATION_PARSE_DEPTH: usize = 512;
+
+/// Parse one migration file's SQL into statements with a bounded recursion
+/// depth, mapping ANY parse failure — including the recursion-limit rejection
+/// of pathologically deep nesting — to a classified [`BuildError::Parse`]
+/// naming the file.
+///
+/// The SINGLE parse authority: every migration the build reads (the catalog
+/// replay in [`replay_file`] AND the embed gate in [`parse_and_enforce_acks`])
+/// goes through here, so the recursion bound — and the SIGABRT-to-classified
+/// conversion it buys — cannot drift between the two paths. Uses the builder
+/// (`with_recursion_limit`) rather than the `Parser::parse_sql` free function,
+/// which is fixed at sqlparser's default depth of 50; [`MAX_MIGRATION_PARSE_DEPTH`]
+/// raises that to a bound generous for real migrations while still bounding the
+/// pathological case.
+fn parse_migration_sql(path: &Path, sql: &str) -> Result<Vec<Statement>, BuildError> {
+    let dialect = PostgreSqlDialect {};
+    let mut parser = Parser::new(&dialect)
+        .with_recursion_limit(MAX_MIGRATION_PARSE_DEPTH)
+        .try_with_sql(sql)
+        .map_err(|err| BuildError::Parse {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?;
+    parser.parse_statements().map_err(|err| BuildError::Parse {
+        path: path.to_path_buf(),
+        message: err.to_string(),
+    })
+}
+
 /// Parse one migration file and run the destructive-acknowledgement gate on it
 /// — the embed-time reuse of the SAME S42 gate the catalog replay enforces, so
 /// an unacknowledged destructive migration cannot ship baked into a binary.
 /// (Modelability is NOT required — the runner applies raw SQL — only that the
 /// file PARSES so the gate can classify it.)
 fn parse_and_enforce_acks(file: &Path, sql: &str) -> Result<(), BuildError> {
-    let dialect = PostgreSqlDialect {};
-    let statements = Parser::parse_sql(&dialect, sql).map_err(|err| BuildError::Parse {
-        path: file.to_path_buf(),
-        message: err.to_string(),
-    })?;
+    let statements = parse_migration_sql(file, sql)?;
     enforce_destructive_acks(file, sql, &statements)?;
     // The runner owns the transaction boundary; a migration must not contain its
     // own BEGIN/COMMIT/ROLLBACK/SAVEPOINT (which would break per-migration
@@ -1723,7 +1784,29 @@ fn descend(dir: &Path, walk: &mut Walk) -> Result<(), BuildError> {
         if file_type.is_dir() {
             descend(&path, walk)?;
         } else if path.extension().is_some_and(|ext| ext == "sql") {
-            walk.files.push(path);
+            // Admit only a REGULAR file (or a symlink resolving to one).
+            // `entry.file_type()` above does NOT traverse symlinks and reports
+            // only dir-vs-not, so a FIFO / socket / device / named pipe named
+            // `*.sql` would otherwise be pushed as a leaf and then BLOCK the
+            // build forever at `read_to_string` (a writer-less FIFO's `open`
+            // never returns; a `/dev/zero`-class device would grow the read
+            // buffer without bound → OOM). `fs::metadata` FOLLOWS symlinks and
+            // does NOT open the file (a `stat`, so it never blocks on a FIFO),
+            // so a legitimate symlink to a real `.sql` resolves to a regular
+            // file and is admitted, while a non-regular `.sql` is a LOUD
+            // classified error naming the path — never a silent skip (a
+            // migration that is a device is an authorship error, not an absent
+            // migration). A broken/dangling symlink fails the `stat` and is the
+            // classified [`BuildError::ReadFile`] naming it.
+            let metadata = std::fs::metadata(&path).map_err(|source| BuildError::ReadFile {
+                path: path.clone(),
+                source,
+            })?;
+            if metadata.is_file() {
+                walk.files.push(path);
+            } else {
+                return Err(BuildError::NonRegularFile { path });
+            }
         }
     }
     Ok(())
@@ -1743,12 +1826,7 @@ pub(crate) fn replay_file_for_test(
 
 /// Parse and replay every statement in one migration file.
 fn replay_file(catalog: &mut Catalog, path: &Path, sql: &str) -> Result<(), BuildError> {
-    let dialect = PostgreSqlDialect {};
-    let statements =
-        Parser::parse_sql(&dialect, sql).map_err(|err| BuildError::Parse {
-            path: path.to_path_buf(),
-            message: err.to_string(),
-        })?;
+    let statements = parse_migration_sql(path, sql)?;
     // Gate irreversible data destruction BEFORE any statement mutates the
     // catalog: a `DROP TABLE` / `DROP COLUMN` without a co-located
     // acknowledgement fails the build rather than silently discarding data.

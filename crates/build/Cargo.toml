@@ -22,7 +22,37 @@ categories = ["database", "development-tools::build-utils"]
 # Apache-2.0, zero `unsafe` in its parser core. `default-features =
 # false` drops the optional `serde`/`visitor` derives we do not use,
 # keeping the build-time surface minimal.
-sqlparser = { workspace = true }
+#
+# `features = ["recursive-protection"]` re-enables sqlparser's OWN recursion
+# guard so a pathologically deep migration (thousands of nested parens /
+# prefix operators / sub-queries) can NO LONGER overflow the build-script
+# stack and ABORT the process (SIGABRT — uncatchable by `catch_unwind`, no
+# file name, no diagnostic). It is the parser crate's expert-domain solution
+# to deep recursion, which we consume rather than reinvent, and it layers
+# TWO protections that together make the abort structurally impossible:
+#   * `recursive`/`stacker` (the crate this feature pulls) GROWS the native
+#     stack on demand across the parser's deep-recursion productions, so the
+#     parse cannot overflow regardless of the build-script's initial stack
+#     size — which is smaller and shallower than one might assume: Cargo
+#     compiles build scripts UNOPTIMIZED (`build-override` defaults to
+#     opt-level 0 → large per-frame stack use), and a Windows build script
+#     runs on a 1 MiB main-thread stack. A counter alone would have to fire
+#     BEFORE recursing `limit` frames deep, so a limit generous enough for
+#     real migrations would overflow those stacks first; stacker decouples
+#     the limit from the platform stack size.
+#   * the `std` counter (`recursive-protection` implies `std`) then bounds
+#     the depth at [`MAX_MIGRATION_PARSE_DEPTH`], returning a classified
+#     `ParserError::RecursionLimitExceeded` (mapped to `BuildError::Parse`
+#     naming the file) so an absurd nesting is rejected CLEANLY rather than
+#     parsed into a giant AST.
+# BUILD-TIME COST ONLY: this adds `recursive` + `stacker` (+ their build-deps
+# `cc` / `psm`) to the lockfile — a reviewed `deps_pin` golden diff, justified
+# in the root Cargo.toml `[workspace.dependencies]` policy block. NONE of them
+# reach a shipped crate's RUNTIME closure: `bsql-build` is a build-dependency
+# helper, and `runtime_graph_pin` proves `bsql-build` (and everything it pulls,
+# including these) is absent from every shipped crate's `cargo tree -e normal`
+# graph. So the shipped, runtime-linked artifact is byte-for-byte unchanged.
+sqlparser = { workspace = true, features = ["recursive-protection"] }
 
 # `rusqlite` — safe Rust bindings to SQLite, BUILD-TIME ONLY and OPTIONAL
 # (behind the `sqlite` feature). When a consumer also targets SQLite, this

@@ -481,9 +481,29 @@ proc-macro2 = { version = "1", default-features = false, features = ["proc-macro
 # hand-roll a SQL parser: faithful DDL grammar coverage (quoting, type
 # aliases, CREATE/ALTER column ops) is expert-domain work that drifts
 # from the spec the instant we own it. Apache-2.0, no `unsafe` in the
-# parser core. `default-features = false` drops the optional
-# `serde`/`visitor`/`recursive-protection` features we do not use,
-# keeping the build-time surface (and its transitive closure) minimal.
+# parser core. `default-features = false` at the workspace level drops the
+# optional `serde`/`visitor` derives we do not use; `bsql-build` re-adds
+# ONLY `recursive-protection` on top (see its Cargo.toml) — the parser
+# crate's own guard against a pathologically deep migration overflowing the
+# build-script stack and ABORTING the consumer's build (SIGABRT, uncatchable
+# by `catch_unwind`). That feature pulls SIX build-only transitive crates,
+# recorded in the `deps_pin` golden and justified here:
+#   * `recursive` + `recursive-proc-macro-impl` — the attribute that marks
+#     the parser's deep-recursion productions.
+#   * `stacker` + `psm` — grow the native stack on demand so the parse
+#     cannot overflow regardless of the (unoptimized, possibly 1 MiB on
+#     Windows) build-script stack; without this a recursion-limit generous
+#     enough for real migrations overflows before the counter can fire
+#     (empirically, a ~512-deep expression aborts even an 8 MiB main thread).
+#   * `object` + `ar_archive_writer` — pulled by `cc` (already in the tree
+#     for ring/rusqlite) when it builds `psm`'s tiny stack-switch assembly.
+# ALL SIX are BUILD-TIME ONLY: they are reached exclusively through
+# `bsql-build` (a `[build-dependencies]` helper), so the `runtime_graph_pin`
+# gate — which proves `bsql-build` and everything under it is absent from
+# every shipped crate's `cargo tree -e normal` runtime graph — stays green,
+# and the shipped, runtime-linked artifact is byte-for-byte unchanged. We do
+# NOT hand-roll stack-safe recursion: it is exactly the expert-domain work
+# the parser crate already solves.
 sqlparser = { version = "0.62", default-features = false }
 
 # --- Build profiles ---
