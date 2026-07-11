@@ -1,6 +1,6 @@
 //! Active-phase dispatch + the borrowing [`Event`] pull surface.
 //!
-//! This is the strangler engine's query brain — the post-handshake counterpart
+//! This is the engine's query brain — the post-handshake counterpart
 //! to the connecting dispatch. It dispatches **directly** on the engine's own
 //! per-phase [`ActiveState`]: there is no wide `ProtoState` mirror and no
 //! `From`/`TryFrom` lift. A `(phase, frame)` pair the protocol cannot reach has

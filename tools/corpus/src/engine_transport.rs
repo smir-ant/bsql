@@ -1,6 +1,6 @@
 //! A scripted [`Transport`] for driving the new engine's real verbs.
 //!
-//! Implements the strangler engine's `Transport` seam over a pre-fragmented
+//! Implements the engine's `Transport` seam over a pre-fragmented
 //! reply script: `read` delivers the next scripted chunk (honouring the
 //! transcript's [`ChunkSchedule`] for partial-frame resumption), and `write`
 //! captures every client byte into a shared buffer the adapter reads back after

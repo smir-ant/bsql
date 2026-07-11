@@ -1,15 +1,12 @@
-//! AXIS-5 HOSTILE RE-PROOF — fault injection against the REWRITTEN engine.
+//! AXIS-5 HOSTILE PROOF — fault injection against the session engine.
 //!
-//! The old wire state machine has its own hostility proofs
-//! (`partial_assembly_spec` / `fuzz_stress_spec` / `bounded_buffers_spec`). The
-//! strangler engine must NOT inherit that proof by faith: this spec feeds the NEW
-//! `ActiveEngine` / `ConnectingEngine` malformed and adversarial byte streams
-//! directly (via `read_slot`/`commit`/`next_event` and via the public pumps) and
-//! asserts a CLASSIFIED outcome for each — a teardown (`Event::Close` /
-//! `Boundary::Closed`) or a classified handshake `ConnFail` — with no panic, no
-//! infinite loop / hang, no unbounded memory, no wrong classification. The crate
-//! is `#![forbid(unsafe_code)]`, so UB is structurally absent; these tests assert
-//! the *classified* handling on top of that.
+//! This spec feeds the engine's `ActiveEngine` / `ConnectingEngine` malformed and
+//! adversarial byte streams directly (via `read_slot`/`commit`/`next_event` and
+//! via the public pumps) and asserts a CLASSIFIED outcome for each — a teardown
+//! (`Event::Close` / `Boundary::Closed`) or a classified handshake `ConnFail` —
+//! with no panic, no infinite loop / hang, no unbounded memory, no wrong
+//! classification. The crate is `#![forbid(unsafe_code)]`, so UB is structurally
+//! absent; these tests assert the *classified* handling on top of that.
 //!
 //! Each test asserts the SPECIFIC classified outcome (the exact `Event` sequence,
 //! `Boundary`, or `ConnFail` variant), never merely "did not panic" — a hostile

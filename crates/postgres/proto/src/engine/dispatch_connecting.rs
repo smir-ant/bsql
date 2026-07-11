@@ -1,6 +1,6 @@
 //! Connecting-phase dispatch for the session engine.
 //!
-//! This is the strangler engine's handshake brain. It dispatches **directly**
+//! This is the engine's handshake brain. It dispatches **directly**
 //! on the existing per-phase [`ConnectingState`] enum — there is no wide
 //! `ProtoState` mirror and no `From`/`TryFrom` lift/lower: a `(phase, frame)`
 //! pair that the protocol cannot reach has no arm by *omission* (so it is a

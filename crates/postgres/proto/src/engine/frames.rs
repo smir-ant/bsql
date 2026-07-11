@@ -19,26 +19,16 @@
 //! a bounded [`WriteBuf`] (the byte-twin reference), so the streaming production
 //! bytes and the bounded reference cannot drift.
 //!
-//! # Why engine-local builders, not the crate's existing frame encoders
+//! # Engine-local builders
 //!
-//! Three shapes were weighed for the active frames:
-//!
-//! 1. **Reuse the crate's `protocol.rs` builders directly** — rejected: they take
-//!    a `BrandedWriteReserved` (a brand-locked `WriteBuf` view minted by the
-//!    staging apparatus) and return a `WriteRange` (offsets a `StagedAction`
-//!    consumes), threading the old push-engine's `WriteRange`/`ProtocolError`/
-//!    staging types into the new sans-I/O engine — the exact coupling the
-//!    strangler separation exists to avoid.
-//! 2. **Widen those builders to also accept a plain `&mut WriteBuf`** — rejected:
-//!    it edits the old engine's surface (which must stay byte-identical), and the
-//!    `WriteRange` return is intrinsic to the staging path, not removable.
-//! 3. **Engine-local builders into a `WriteBuf` via the public push API** —
-//!    chosen: zero coupling to the old engine, and byte-identical by construction
-//!    because they drive the same `with_length_prefix` / `push_*` primitives and,
-//!    for the prepared-macro Bind, the same [`ParamsWriter`] format/encode source
-//!    and the same `BIND_RESULT_FORMATS_ALL_BINARY` trailer the macro path uses.
-//!    This mirrors the connecting engine, whose `build_startup_message` is itself
-//!    an engine-local `WriteBuf` builder rather than a `protocol.rs` reuse.
+//! These active frames are assembled by engine-local builders into a bounded
+//! `WriteBuf` through the public push API, not by any shared/external frame
+//! encoder. They are byte-identical by construction because they drive the same
+//! `with_length_prefix` / `push_*` primitives and — for the prepared-macro Bind —
+//! the same [`ParamsWriter`] format/encode source and the same
+//! `BIND_RESULT_FORMATS_ALL_BINARY` trailer the macro path uses. This mirrors the
+//! connecting engine, whose `build_startup_message` is itself an engine-local
+//! `WriteBuf` builder.
 
 use crate::params::ParamsWriter;
 use crate::prepared::BIND_RESULT_FORMATS_ALL_BINARY;

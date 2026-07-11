@@ -1,4 +1,4 @@
-//! The strangler engine's §7 twelve-axis edge-case pass — the durable,
+//! The engine's §7 twelve-axis edge-case pass — the durable,
 //! self-verifying coverage artifact.
 //!
 //! # What this file is
