@@ -16,6 +16,20 @@ Machine: aarch64-apple-darwin (Apple Silicon), rustc 1.96.0, release + LTO,
 PostgreSQL 15.14, loopback TCP. Numbers below are criterion medians; the ±CI
 column is the 95%-confidence half-width (the noise metric).
 
+> **Re-verified @ `10e94032`** (the final shipped tip — both audit-8 gaps closed:
+> SCRAM-SHA-256-PLUS + the client-liveness window). Two fresh full runs.
+> **RSS re-measured and confirmed:** `bsql_sync` is byte-identical at 1,687,552 B
+> (1.69 MB), `bsql_async` 1.79 MB, the field 6.5–6.7 MB — **~3.9× smaller**
+> (RSS is deterministic, load-independent). **Latency:** bsql was fastest in
+> every scenario in both runs (ranking rock-stable), and the hot decode/dispatch
+> frame is byte-identical to the run these medians were taken on (the
+> `engine_hotpath_codegen` gate proves it), so the medians below stand — the
+> Gap1/D1/D2 changes touch only cold connect/observe paths, never the per-row hot
+> arm. The two fresh runs ran under elevated background load (~5.0, above the ~2.9
+> these tables were measured at), so their *absolute* µs sit ~10–15 % higher while
+> the *ranking* is unchanged — exactly the run-to-run load behaviour the
+> Determinism note below documents.
+
 ### Latency — bsql wins every scenario
 
 Lower is better. Every client does IDENTICAL work: bind a pre-prepared
