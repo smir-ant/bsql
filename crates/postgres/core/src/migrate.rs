@@ -65,7 +65,14 @@ pub use bsql_common::migrate::{
     AppliedMigration, DriftKind, MigrationReport, MigrationSource, MigrationSourceError,
     MigrationStatus, LEDGER_TABLE,
 };
-use bsql_common::migrate::{checksum_hex, is_non_transactional, migration_checksum, plan, Drift, LoadedMigration};
+// `plan` / `Drift` / `LoadedMigration` were PRIVATE here before the pure logic
+// moved — keep them a private import (no over-exposure).
+use bsql_common::migrate::{plan, Drift, LoadedMigration};
+// `migration_checksum` / `checksum_hex` / `is_non_transactional` were `pub fn`s on
+// THIS module (nameable as `bsql_postgres_core::migrate::…`, since `migrate` is
+// `pub mod`) before the pure logic moved to `bsql-common`. Re-export them at their
+// OLD public paths so the move is genuinely non-breaking.
+pub use bsql_common::migrate::{checksum_hex, is_non_transactional, migration_checksum};
 
 /// `CREATE TABLE IF NOT EXISTS` for the ledger. Idempotent and
 /// concurrency-safe under the advisory lock. `applied_at` defaults to the

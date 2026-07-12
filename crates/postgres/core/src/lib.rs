@@ -83,6 +83,17 @@ pub mod materialize;
 // + checksum-drift detection + a concurrency advisory lock. Defined once over
 // `Core<S>`, so both PostgreSQL drivers share it.
 pub mod migrate;
+// Restore the pre-split module path `bsql_postgres_core::n1::{N1Report, N1Tracker}`
+// (this was `pub mod n1` before the tracker moved to the shared `bsql-common` leaf
+// crate). The types ARE the `bsql_common` ones — also re-exported at the crate
+// root below — so this keeps the old qualified path resolving without a second
+// definition.
+#[cfg(feature = "n1-detect")]
+pub mod n1 {
+    //! The diagnostics-only N+1 detector types, re-exported from the shared
+    //! dependency-free `bsql-common` leaf crate.
+    pub use bsql_common::{N1Report, N1Tracker};
+}
 // The per-connection notification ledger (a bounded, counted no-drop buffer)
 // and the sink adapter that captures every surfaced notification into it.
 pub mod notify;
