@@ -33,30 +33,35 @@ cargo bench -p bsql-query-fixture  --bench typed_decode
 EMITTED by the `query!` macro against the crate's build catalog, which
 the proto crate has no access to.
 
-## End-to-end / competitor / peak-RSS harness (`bench/`)
+## End-to-end / competitor / peak-RSS harness (the `bench` branch)
 
 The `hot_paths` / `typed_decode` benches above measure the engine with
-the socket REMOVED (in-process scripted transport). The **`bench/`**
-project measures the whole driver against a real PostgreSQL over
-loopback TCP, side by side with the Rust competitors — the only place
-the "beat the original bsql (and the field)" question is answered end
-to end. It is a STANDALONE cargo workspace (its competitor deps never
-enter the shipped `deps_pin` / `runtime_graph_pin` graph).
+the socket REMOVED (in-process scripted transport). The whole-driver
+comparison against a real PostgreSQL over loopback TCP — side by side
+with the Rust competitors (`tokio-postgres`, `sqlx`), the only place the
+"beat the original bsql (and the field)" question is answered end to end
+— lives on a **dedicated `bench` branch**, NOT on the code branch. It is a
+STANDALONE cargo workspace whose competitor deps never enter the shipped
+`deps_pin` / `runtime_graph_pin` graph; keeping it off the code branch also
+keeps a normal clone lean and out of the repo's language statistics.
 
-| Target | What |
+```bash
+git switch bench          # the reproducibility home: harness + methodology + results
+cd bench
+psql -h 127.0.0.1 -U smir-ant -d postgres -f setup/pg_setup.sql   # seed once
+cargo bench                                            # criterion latency sweep
+cargo test --release --test rss_ceiling -- --ignored   # the peak-RSS gate
+```
+
+| Target (on the `bench` branch) | What |
 |---|---|
 | `benches/e2e.rs` | criterion latency: bsql async + sync vs `tokio-postgres` vs `sqlx`, SELECT by-PK / 10 / 100 / 1000 rows, single INSERT, JOIN+agg |
 | `src/bin/rss_*.rs` | peak-RSS harness (getrusage), one binary per client, 10k SELECT + 1k INSERT |
 | `tests/rss_ceiling.rs` | RSS regression gate — blocking driver < 2 MiB, async < 2.25 MiB |
 
-```bash
-scripts/bench-e2e.sh all         # quiet-system gate + PG seed + RSS + latency
-scripts/bench-e2e.sh rss         # peak-RSS comparison only
-cd bench && cargo test --release --test rss_ceiling -- --ignored   # the gate
-```
-
-The current measured standing (bsql wins every latency scenario; 1.69 MB
-peak RSS, 3.7× smaller than the field) lives in `bench/README.md`.
+The measured standing (bsql wins every latency scenario; 1.69 MB peak RSS,
+~3.9× smaller than the field), the full methodology, and the reproducible
+results all live in the `bench` branch's `bench/README.md`.
 
 ## Deterministic gates (`cargo test`)
 

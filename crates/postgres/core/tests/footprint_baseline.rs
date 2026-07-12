@@ -19,7 +19,7 @@
 //! # Runtime footprint has teeth elsewhere; binary size is a documented anchor
 //!
 //! The MEANINGFUL footprint regression gate is now **runtime peak RSS**, not a
-//! static binary-size number: the `bench/` project's `rss_ceiling` test runs a
+//! static binary-size number: the `bench` branch's `rss_ceiling` test runs a
 //! real 10k-SELECT + 1k-INSERT workload over one connection and fails if the
 //! blocking driver's peak resident set exceeds 2 MiB (measured ≈ 1.7 MiB) — a
 //! number bsql actually controls.
@@ -84,5 +84,5 @@ fn per_connection_resident_estimate() {
 // The minimum-consumer binary size (≈ 2.03 MB, SQLite-dominated) is recorded in
 // the module doc above as a documentation anchor, NOT as a test: a test that
 // asserts nothing defends no invariant. The footprint number that bsql controls
-// and that regresses meaningfully is runtime peak RSS, gated by the `bench/`
-// project's `rss_ceiling` test.
+// and that regresses meaningfully is runtime peak RSS, gated by the `bench`
+// branch's `rss_ceiling` test.

@@ -559,6 +559,19 @@ cargo test -p bsql-query-fixture  --test query_live_async -- --ignored  # live q
 cargo test -p bsql-query-fixture  --test query_live_sync  -- --ignored  # live query! (sync)
 ```
 
+The end-to-end comparison against the field (`tokio-postgres`, `sqlx`) and the
+peak-RSS harness live on a dedicated **`bench` branch**, kept off the code branch
+so a normal clone stays lean and the competitor dev-deps never touch the shipped
+dependency graph:
+
+```bash
+git switch bench && cd bench && cargo bench    # latency vs competitors + peak RSS
+```
+
+The measured standing — bsql fastest in every latency scenario, ~1.7 MB peak RSS
+(**~3.9× smaller than the field**) — with the full methodology and reproducible
+results lives in that branch's `bench/README.md`.
+
 ### Measured facts
 
 The two test counts below are **gate-enforced**: the `test_count` devgate
@@ -569,14 +582,14 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 2356** — every `#[test]` / `#[tokio::test]` attribute in the
+- **Test functions: 2354** — every `#[test]` / `#[tokio::test]` attribute in the
   TRACKED sources (`git ls-files`, so an untracked scratch test or a sibling git
   worktree cannot inflate the count):
   ```bash
   git ls-files -z -- '*.rs' \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
   ```
-- **`#[ignore]` live suites (need a running database): 341**:
+- **`#[ignore]` live suites (need a running database): 339**:
   ```bash
   git ls-files -z -- '*.rs' \
     | xargs -0 grep -hE '^[[:space:]]*#\[ignore' | wc -l

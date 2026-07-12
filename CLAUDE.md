@@ -1109,7 +1109,8 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `SslMode::Require` over a unix host is a fail-loud `DriverError::Config`, and
   `Prefer` over unix is plaintext with NO downgrade warning (nothing was
   downgraded). Measured local win: the unix socket is ~2.4–2.9× faster than
-  loopback TCP on the by-PK single-round-trip (`bench/benches/unix_vs_tcp.rs`).
+  loopback TCP on the by-PK single-round-trip (`benches/unix_vs_tcp.rs` on the
+  `bench` branch — the competitor/RSS harness lives there, off the code branch).
 - `SslMode::Prefer` surfaces an SSL downgrade (the server refused TLS and it fell
   back to plain TCP — a security event a production build must not hide): it
   routes through the structured-diagnostics sink as `DiagEvent::SslDowngrade`
