@@ -169,6 +169,57 @@ pub mod testkit {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// N+1 detection — ONE cross-backend report type (feature `n1-detect`)
+// ════════════════════════════════════════════════════════════════════
+
+// The N+1 query report is now a SINGLE nominal type — `bsql_common::N1Report` —
+// that every backend's `conn.n1_report()` returns. Re-exported here as the
+// canonical `bsql::N1Report` / `bsql::N1Tracker`, sourced from whichever backend
+// is enabled (all are the same type, so the cascade's choice is immaterial). A
+// consumer can write ONE `fn handle(r: &bsql::N1Report)` over reports from the
+// async PostgreSQL driver, the sync PostgreSQL driver, AND the SQLite driver —
+// the "backend-agnostic N+1 handling" the docs promise, now a compiler fact
+// rather than two field-identical-but-distinct types.
+#[cfg(all(feature = "n1-detect", feature = "postgres-async"))]
+pub use bsql_postgres_async::{N1Report, N1Tracker};
+#[cfg(all(feature = "n1-detect", feature = "postgres-sync", not(feature = "postgres-async")))]
+pub use bsql_postgres_sync::{N1Report, N1Tracker};
+#[cfg(all(
+    feature = "n1-detect",
+    feature = "sqlite",
+    not(feature = "postgres-async"),
+    not(feature = "postgres-sync")
+))]
+pub use bsql_sqlite::{N1Report, N1Tracker};
+
+// COMPILE-TIME proof that `N1Report` is now ONE nominal type across every
+// backend. Fn-pointer coercions type-check ONLY if all four paths resolve to the
+// SAME `bsql_common::N1Report` (fn-pointer argument types are INVARIANT, so the
+// signatures must match exactly — not merely field-identical). Before the shared
+// leaf crate, `bsql::pg::N1Report` and `bsql::sqlite::N1Report` were two DISTINCT
+// nominal types and the coercions below would be `E0308`. Checked on every build
+// with every backend AND the detector enabled (`--features n1-detect`), so a
+// regression that re-forks the type turns the umbrella's own build red. (A
+// `#[test]` here would resolve to the crate's own `#[bsql::test]` attribute, so
+// the proof is a `const _` — which is also stronger: it is a compile-time fact,
+// not a runtime assertion.)
+#[cfg(all(
+    feature = "n1-detect",
+    feature = "postgres-async",
+    feature = "postgres-sync",
+    feature = "sqlite"
+))]
+const _: () = {
+    fn the_one_type(_: &sqlite::N1Report) {}
+    // Each coercion binds `the_one_type` (typed for the SQLite report) to a
+    // fn-pointer typed for another backend's report; it compiles only if the two
+    // report types are identical. `the_one_type` is thus USED (no dead code).
+    let _async_pg: fn(&pg::N1Report) = the_one_type;
+    let _sync_pg: fn(&pg_sync::N1Report) = the_one_type;
+    let _umbrella: fn(&N1Report) = the_one_type;
+};
+
+// ════════════════════════════════════════════════════════════════════
 // Cross-backend error classification (any backend feature)
 // ════════════════════════════════════════════════════════════════════
 

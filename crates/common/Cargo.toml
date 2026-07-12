@@ -9,6 +9,15 @@ description = "Dependency-free shared logic for bsql backends: the migration pur
 keywords = ["postgres", "sqlite", "sql", "migrations", "database"]
 categories = ["database"]
 
+[features]
+# `n1` — the diagnostics-only N+1 query detector (`N1Tracker` / `N1Report`). OFF
+# by default: a backend that does not enable its own `n1-detect` compiles none of
+# the tracker (no type, no window array). Each driver's `n1-detect` forwards to
+# `bsql-common/n1`, so `conn.n1_report()` returns the SAME `bsql_common::N1Report`
+# on every backend. Adds NO dependency (a fixed inline window + a `Vec` of
+# reports).
+n1 = []
+
 [dependencies]
 # NONE — this is a ZERO-DEPENDENCY leaf crate BY DESIGN. It hosts only pure
 # (no-I/O) logic reachable from BOTH the PostgreSQL core and the embedded SQLite

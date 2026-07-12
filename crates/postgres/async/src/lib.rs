@@ -85,6 +85,13 @@ pub use bsql_postgres_core::{
     TypedNotification, LEDGER_TABLE,
 };
 
+// The diagnostics-only N+1 detector (feature `n1-detect`). Re-exported so
+// `bsql::pg::N1Report` resolves at the path a consumer uses — the SAME
+// `bsql_common::N1Report` the sync driver and the SQLite driver re-export, so a
+// consumer can write ONE function over both backends' reports.
+#[cfg(feature = "n1-detect")]
+pub use bsql_postgres_core::{N1Report, N1Tracker};
+
 pub use cancel::CancelToken;
 pub use connection::{Connection, CopyInWriter, PreparedStatement, Transaction};
 pub use pool::{Pool, PoolBuilder, PooledConnection};

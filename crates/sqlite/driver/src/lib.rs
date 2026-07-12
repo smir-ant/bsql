@@ -94,15 +94,10 @@ mod bind;
 mod cancel;
 mod connection;
 mod error;
-// The per-connection N+1 query detector — a diagnostics-only, zero-cost-off
-// tracker (a self-contained twin of the PostgreSQL detector). Compiled only under
-// the `n1-detect` feature; a default build has no tracker type and no field.
-#[cfg(feature = "n1-detect")]
-mod n1;
 // The migration RUNNER — the cross-backend twin of the PostgreSQL runner over
-// the SAME `MigrationSource` / ledger / checksum / drift contract. A
-// self-contained copy of the pure logic (the embedded crate depends on no
-// `bsql-postgres-core`), pinned to the SAME known-answer vector.
+// the SAME `MigrationSource` / ledger / checksum / drift contract. The pure
+// logic lives ONCE in the dependency-free `bsql-common` leaf crate (this module
+// holds only the SQLite-specific I/O).
 mod migrate;
 mod typed;
 mod value;
@@ -118,8 +113,14 @@ pub use migrate::{
     AppliedMigration, DriftKind, MigrationError, MigrationReport, MigrationSource,
     MigrationSourceError, MigrationStatus, LEDGER_TABLE,
 };
+// The diagnostics-only N+1 detector lives ONCE in the dependency-free
+// `bsql-common` leaf crate (behind its `n1` feature, forwarded from this crate's
+// `n1-detect`), so `N1Report` is the SAME type on every backend — the embedded
+// crate keeps its zero-`bsql-postgres-core` boundary because `bsql-common` has
+// no dependencies at all. Re-exported here so `crate::{N1Report, N1Tracker}`
+// resolves.
 #[cfg(feature = "n1-detect")]
-pub use n1::{N1Report, N1Tracker};
+pub use bsql_common::{N1Report, N1Tracker};
 pub use typed::{ColumnSource, SqliteTypedQuery};
 pub use value::{FromColumn, SqliteValue, Type, ValueRef};
 

@@ -49,5 +49,18 @@
 //!   types. The per-backend RUNNER (the advisory-lock poll on PostgreSQL, the
 //!   `BEGIN IMMEDIATE` re-check on SQLite) stays in each driver, bridged through
 //!   [`migrate::plan`] and each driver's own `From<`[`migrate::Drift`]`>`.
+//! - `N1Report` / `N1Tracker` (feature `n1`) — the diagnostics-only N+1
+//!   query detector, so `conn.n1_report()` returns the SAME type on every
+//!   backend (the promise the docs made becomes a compiler fact — a consumer can
+//!   write ONE function over both backends' reports). (Plain code spans, not
+//!   intra-doc links, because the types compile only under the `n1` feature.)
 
 pub mod migrate;
+
+// The diagnostics-only N+1 detector. Behind the `n1` feature (each driver's
+// `n1-detect` turns it on) so a default build compiles no tracker type at all.
+#[cfg(feature = "n1")]
+mod n1;
+
+#[cfg(feature = "n1")]
+pub use n1::{N1Report, N1Tracker};

@@ -1,18 +1,25 @@
-//! N+1 query detection — a **diagnostics-only** tracker (feature `n1-detect`).
+//! N+1 query detection — a **diagnostics-only** tracker (feature `n1`).
 //!
 //! The classic N+1 anti-pattern runs the SAME query repeatedly from the SAME
 //! source line (typically once per row of a prior result). This module records
 //! that pattern — WITH the source location — so a driver can surface it at
-//! runtime through [`Connection::n1_report`], entirely off the hot path and
+//! runtime through its `n1_report()` verb, entirely off the hot path and
 //! WITHOUT ever altering execution.
+//!
+//! It is ONE compiled source shared by every backend (the PostgreSQL drivers and
+//! the embedded SQLite driver), so `conn.n1_report()` returns the SAME
+//! [`N1Report`] type everywhere — a consumer can write one function over both
+//! backends. (Before this crate existed the tracker was a hand-maintained COPY
+//! in each driver, and the copies had already drifted.)
 //!
 //! # Zero behavioural effect
 //!
 //! [`N1Tracker::record`] returns nothing and reads nothing that steers control
 //! flow. A miscount (a false positive under an unlucky window eviction) is at
 //! most a spurious [`N1Report`], never a change in what a query returns. The
-//! whole tracker is compiled out unless the `n1-detect` feature is on, so a
-//! default build has no field, no branch, and no allocation on the query path.
+//! whole tracker is compiled out unless a driver enables its `n1-detect`
+//! feature (which turns on this crate's `n1`), so a default build has no field,
+//! no branch, and no allocation on the query path.
 //!
 //! # Cost regime
 //!
@@ -21,16 +28,16 @@
 //! allocation, no growth. The only heap use is the [`N1Report`] vector, which
 //! stays empty (`Vec::new` does not allocate) until an actual N+1 is detected,
 //! so the common no-N+1 path never allocates.
-//!
-//! [`Connection::n1_report`]: the driver method that returns [`N1Tracker::report`].
 
 use core::panic::Location;
 
 /// A detected N+1 anti-pattern: one query executed `count` times from a single
 /// source location.
 ///
-/// Returned (as a slice) by a driver's `n1_report()`. Purely diagnostic — the
-/// driver builds it as a side effect of running queries and never acts on it.
+/// Returned (as a slice / owned snapshot) by a driver's `n1_report()`. Purely
+/// diagnostic — the driver builds it as a side effect of running queries and
+/// never acts on it. Because it is ONE type across every backend, a consumer's
+/// N+1 handling is genuinely backend-agnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct N1Report {
     /// The query's SQL text (the `query!` carrier's `&'static str`).
@@ -102,7 +109,7 @@ impl WindowSlot {
     }
 }
 
-// Footprint pin (compiled ONLY under `n1-detect`): the recency window must stay
+// Footprint pin (compiled ONLY under `n1`): the recency window must stay
 // 384 B — 16 slots of 24 B each (two `usize` pointers + two `u32`s), with NO
 // `Option` discriminant and a `u32` (not `u64`) tick. A drift (a re-added
 // `Option`, a widened field) is an `E0080` const-eval failure at `cargo check`.

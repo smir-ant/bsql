@@ -83,11 +83,6 @@ pub mod materialize;
 // + checksum-drift detection + a concurrency advisory lock. Defined once over
 // `Core<S>`, so both PostgreSQL drivers share it.
 pub mod migrate;
-// The per-connection N+1 query detector — a diagnostics-only, zero-cost-off
-// tracker. Compiled only under the `n1-detect` feature; a default build has no
-// tracker type, no field, and no query-path branch.
-#[cfg(feature = "n1-detect")]
-pub mod n1;
 // The per-connection notification ledger (a bounded, counted no-drop buffer)
 // and the sink adapter that captures every surfaced notification into it.
 pub mod notify;
@@ -124,8 +119,12 @@ pub use migrate::{
     AppliedMigration, DriftKind, MigrationError, MigrationReport, MigrationSource,
     MigrationSourceError, MigrationStatus, LEDGER_TABLE,
 };
+// The diagnostics-only N+1 detector lives ONCE in the dependency-free
+// `bsql-common` leaf crate (behind its `n1` feature, forwarded from this crate's
+// `n1-detect`), so `N1Report` is the SAME type on every backend. Re-exported
+// here so the existing `crate::{N1Report, N1Tracker}` paths stay stable.
 #[cfg(feature = "n1-detect")]
-pub use n1::{N1Report, N1Tracker};
+pub use bsql_common::{N1Report, N1Tracker};
 pub use notify::{capture_notify, NotificationLedger, TypedNotification};
 pub use sql_ident::{SafeIdent, SafeTable};
 pub use typed_rows::{Rows, RowsBuilder};

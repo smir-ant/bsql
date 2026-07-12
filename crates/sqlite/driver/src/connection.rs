@@ -598,7 +598,7 @@ pub struct Connection {
     /// is already `!Sync` via rusqlite's interior mutability, so this adds no new
     /// thread-safety constraint).
     #[cfg(feature = "n1-detect")]
-    n1: core::cell::RefCell<crate::n1::N1Tracker>,
+    n1: core::cell::RefCell<crate::N1Tracker>,
 }
 
 impl core::fmt::Debug for Connection {
@@ -616,7 +616,7 @@ impl Connection {
         Self {
             inner,
             #[cfg(feature = "n1-detect")]
-            n1: core::cell::RefCell::new(crate::n1::N1Tracker::new()),
+            n1: core::cell::RefCell::new(crate::N1Tracker::new()),
         }
     }
 
