@@ -7,6 +7,17 @@ members = [
     "crates/postgres/async",
     "crates/postgres/sync",
     "crates/sqlite/driver",
+    # Dependency-free leaf crate hosting the PURE, transport-agnostic logic
+    # BOTH the PostgreSQL core and the embedded SQLite driver need: the
+    # migration checksum / ordering / drift authority + source loader, and the
+    # diagnostics-only N+1 detector (behind an `n1` feature). ONE compiled
+    # source instead of two hand-maintained copies, so the cross-backend
+    # behaviour cannot silently diverge. ZERO external dependencies, so it drags
+    # neither backend's heavy tree into the other and reaches no `sqlparser` /
+    # `bsql-build` (`runtime_graph_pin` green by construction; `deps_pin` gains
+    # exactly one golden line). Publishable; the per-backend I/O runner stays in
+    # each driver, bridged through its `plan()` seam.
+    "crates/common",
     # Consumer-facing testkit: a deterministic in-memory fake PostgreSQL a
     # consumer runs its driver-using tests against with no network. Publishable;
     # turns on the `testkit` feature of the async driver + core (the `Wire::Fake`
@@ -255,11 +266,22 @@ wildcard_dependencies = "forbid"
 disallowed_methods = "deny"
 
 [workspace.dependencies]
-# Every addition is justified inline:
+# Every EXTERNAL addition is justified inline:
 #   - Why we can't write it ourselves in < 200 LoC.
 #   - `default-features = false` to minimise surface.
 #   - Pinned version, never `*`.
 # See reforge.md §4.4 / Part XI for the policy.
+#
+# INTERNAL path members are declared directly on each consumer's `[dependencies]`
+# (not here), and each carries its own inline justification. The `deps_pin`
+# golden's ONE new line — `bsql-common 1.0.0-alpha.0` — is the zero-dependency
+# leaf member added in the `members` list above: it hosts the migration
+# pure-logic (checksum / ordering / drift authority) and the N+1 detector as ONE
+# compiled source both the PostgreSQL core and the embedded SQLite driver depend
+# on, replacing two hand-maintained copies that had already drifted. It pulls NO
+# external crate (so this block gains no entry and `runtime_graph_pin` stays
+# green), and it merges the two formerly-distinct `N1Report` types into one, so a
+# consumer's cross-backend N+1 handling is genuinely backend-agnostic.
 
 # `heapless` — bounded, stack-allocated `Vec<T, N>` / `String<N>` /
 # `FnvIndexMap<K, V, N>`. `bsql-pg-proto` is `no_std` and forbids

@@ -90,6 +90,17 @@ md5-auth = ["bsql-postgres-proto/md5-auth"]
 # the `scram` feature above. Without this, proto's default would force SCRAM on
 # for the whole graph, defeating the drop.
 bsql-postgres-proto = { path = "../proto", default-features = false }
+# `bsql-common` — the ZERO-DEPENDENCY leaf crate hosting the migration PURE
+# logic (checksum / ordering / drift authority + source loader) and — behind its
+# `n1` feature, forwarded from this crate's `n1-detect` — the N+1 detector. ONE
+# compiled source shared with the embedded SQLite driver, so the cross-backend
+# checksum / order / drift behaviour cannot silently diverge. It reaches no
+# `sqlparser` / `bsql-build`, so `runtime_graph_pin` stays green; it adds exactly
+# one lockfile package, so `deps_pin` gains one golden line. The advisory-lock
+# poll + backoff (PostgreSQL-only I/O) and this crate's own `MigrationError`
+# (with its PG-only `LockTimeout`) stay here, bridged through the shared
+# `migrate::plan()` seam + a local `From<migrate::Drift>`.
+bsql-common = { path = "../../common" }
 # `rustls` — OPTIONAL, behind the default-on `tls` feature. The pure-Rust TLS
 # stack (ring provider) the `tls` / `ssl` modules build on. With `tls` OFF the
 # whole rustls + ring subtree is neither resolved into a runtime graph nor

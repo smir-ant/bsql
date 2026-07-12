@@ -82,6 +82,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsql-common"
+version = "1.0.0-alpha.0"
+
+[[package]]
 name = "bsql-corpus"
 version = "0.0.0"
 dependencies = [
@@ -107,6 +111,7 @@ dependencies = [
 name = "bsql-postgres-core"
 version = "0.1.0-alpha.0"
 dependencies = [
+ "bsql-common",
  "bsql-devgates",
  "bsql-postgres-proto",
  "rustls",
@@ -198,6 +203,7 @@ dependencies = [
 name = "bsql-sqlite"
 version = "0.1.0-alpha.0"
 dependencies = [
+ "bsql-common",
  "bsql-devgates",
  "rusqlite",
  "trybuild",

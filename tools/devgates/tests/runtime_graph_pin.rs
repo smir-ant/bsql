@@ -58,6 +58,11 @@ const SHIPPED_CRATES: &[&str] = &[
     "bsql-postgres-async",
     "bsql-postgres-sync",
     "bsql-sqlite",
+    // The dependency-free shared leaf crate. It has ZERO external deps, so its
+    // runtime closure is itself alone — trivially free of the build-time-only
+    // query toolchain (checked here so a future dependency addition that broke
+    // that invariant would turn this gate red).
+    "bsql-common",
 ];
 
 /// Runtime libraries that must be absent from every shipped crate's runtime

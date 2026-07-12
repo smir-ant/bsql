@@ -24,6 +24,15 @@ n1-detect = []
 # by the rusqlite working group. Version pinned in the root
 # `[workspace.dependencies]` policy block (single source of truth).
 rusqlite = { workspace = true }
+# `bsql-common` — the ZERO-DEPENDENCY leaf crate hosting the migration PURE
+# logic (checksum / ordering / drift authority + source loader), shared with the
+# PostgreSQL core so the cross-backend behaviour is ONE compiled source, not a
+# hand-maintained COPY. It reaches no `sqlparser` / `bsql-build` and drags no
+# PostgreSQL / rustls tree (it has NO dependencies), so the embedded crate stays
+# lean and `runtime_graph_pin` stays green. The `BEGIN IMMEDIATE` apply loop
+# (SQLite-only I/O) and this crate's own `MigrationError` stay here, bridged
+# through the shared `migrate::plan()` seam + a local `From<migrate::Drift>`.
+bsql-common = { path = "../../common" }
 
 [dev-dependencies]
 # `trybuild` — pins the EXACT compiler diagnostic for the streaming

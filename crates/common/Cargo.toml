@@ -1,0 +1,25 @@
+[package]
+name = "bsql-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dependency-free shared logic for bsql backends: the migration pure-logic (checksum / ordering / drift authority + source loading) and the diagnostics-only N+1 detector. One compiled source both the PostgreSQL core and the embedded SQLite driver depend on, so the cross-backend behaviour cannot silently diverge."
+keywords = ["postgres", "sqlite", "sql", "migrations", "database"]
+categories = ["database"]
+
+[dependencies]
+# NONE — this is a ZERO-DEPENDENCY leaf crate BY DESIGN. It hosts only pure
+# (no-I/O) logic reachable from BOTH the PostgreSQL core and the embedded SQLite
+# driver WITHOUT dragging either backend's heavy runtime tree into the other
+# (the exact reason the logic was a hand-maintained COPY before). Keeping it
+# dependency-free means `runtime_graph_pin` stays green by construction (it
+# reaches neither `sqlparser` nor `bsql-build`), and `deps_pin` gains exactly one
+# golden line (this crate itself, no transitive edge). Do NOT add an external
+# dependency here — a would-be dependency belongs in whichever backend needs it,
+# not in this leaf.
+
+# Inherit the workspace FORBID floor (the two-tier lint wall).
+[lints]
+workspace = true

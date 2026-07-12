@@ -8,6 +8,7 @@ bitflags 2.11.1
 block-buffer 0.10.4
 bsql 0.1.0-alpha.0
 bsql-build 1.0.0-alpha.0
+bsql-common 1.0.0-alpha.0
 bsql-corpus 0.0.0
 bsql-devgates 0.0.0
 bsql-postgres-async 0.1.0-alpha.0
