@@ -1,19 +1,25 @@
-//! WITNESS: a parameter OID that disagrees with the declared type is now
-//! UNREPRESENTABLE, strictly stronger than the former const cross-check.
+//! WITNESS (type-distinctness): the PG types `oid` and `int4` — the SAME 4-byte
+//! wire width — map to DISTINCT Rust types (`u32` vs `i32`), so a `PreparedQuery`
+//! over one is not substitutable for the other (`error[E0308]`).
 //!
-//! `new_prepared_query` no longer accepts a `param_oids` slice: the param OID
-//! list is SOURCED from `<Params as ParamsWriter>::OIDS`, so there is no
-//! separate array to lie in. A "wrong param OID" is therefore a WRONG PARAM
-//! TYPE — and `PreparedQuery` is INVARIANT in `Params`, so a same-width type
-//! confusion is a hard `error[E0308]`, not a value the validator has to catch.
+//! HONEST SCOPE — what this does and does NOT prove. Since the OID lists are now
+//! SOURCED from the parameter tuple type (`<Params as ParamsWriter>::OIDS`, in
+//! `new_prepared_query`), there is no separate `param_oids` array a caller can
+//! lie in. This fixture therefore witnesses the type-level FOUNDATION that makes
+//! that sourcing safe: two same-width PG types are DISTINCT Rust types, so the
+//! type is a faithful OID discriminator and a `(u32,)`-param query cannot be
+//! passed where an `(i32,)`-param one is required. The `error[E0308]` below fires
+//! from CONCRETE-TYPE DISTINCTNESS (`(u32,)` and `(i32,)` are different
+//! instantiations), NOT from variance and NOT from the OID machinery — this
+//! fixture never calls `new_prepared_query`, so it would stay green even if the
+//! OID-sourcing itself regressed.
 //!
-//! Here `(u32,)` is the `oid` type (OID 26) and `(i32,)` is `int4` (OID 23):
-//! the SAME 4-byte wire width, DIFFERENT types. Before the OID lists were
-//! sourced from the tuple, this pair was distinguished only by the
-//! `oids_equal(param_oids, P::OIDS)` const assert; now it is distinguished by
-//! the TYPE itself — a `(u32,)`-param prepared query cannot stand in for an
-//! `(i32,)`-param one. (The runtime half — that two same-width params encode
-//! to their DECLARED type — rides the same single-source `ParamsWriter::OIDS`.)
+//! The actual "a wrong OID is CAUGHT" property lives in the E0080 wire-template
+//! goldens: `query_wire_schema_pin_drift` (the direct constructor cross-checks
+//! the pre-baked `Parse` bytes against `<P as ParamsWriter>::OIDS`) and
+//! `query_hostile_fingerprint` (the same check through the `run` boundary). The
+//! runtime half — that two same-width params encode to their DECLARED OID — is
+//! asserted in `tests/query_wire.rs` (`q.param_oids()`).
 
 extern crate bsql_postgres_proto;
 
@@ -22,8 +28,9 @@ use bsql_postgres_proto::PreparedQuery;
 fn takes_int4_param(_q: PreparedQuery<(i32,), ()>) {}
 
 fn hand_off(q: PreparedQuery<(u32,), ()>) {
-    // `(u32,)` (`oid` = 26) is not `(i32,)` (`int4` = 23) even at the same
-    // 4-byte width: a same-width param-OID confusion is a TYPE error.
+    // `(u32,)` (`oid` = 26) is a different type from `(i32,)` (`int4` = 23) even
+    // at the same 4-byte width: the two prepared-query instantiations are not
+    // interchangeable.
     takes_int4_param(q);
 }
 
