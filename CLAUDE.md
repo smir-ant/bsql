@@ -83,6 +83,8 @@ cargo test -p bsql-postgres-sync  --test sync_live cancel_token_stops -- --ignor
 cargo test -p bsql-postgres-async --test pool_liveness -- --ignored   # async pool dead-peer liveness (get() bounded, not a hang; PG behind a black-hole relay)
 cargo test -p bsql-postgres-sync  --test pool_liveness -- --ignored   # sync  pool dead-peer liveness (get() bounded, not a hang; PG behind a black-hole relay)
 cargo test -p bsql-postgres-async --test tls_fragmentation -- --ignored  # TLS byte-fragmentation reassembly gate (the owner's-burn regression net): a self-contained ephemeral SSL PG behind a 1/3-byte fragmenting relay; handshake + multi-record result + 300 KB record-spanning value + stream reassemble byte-exact, is_encrypted, zero panics/hangs. Skips cleanly if no initdb/openssl or run as root
+cargo test -p bsql-postgres-async --test midstream_faults -- --ignored  # async mid-stream fault matrix (server error / cancel-57014 / transport-death FIN mid-result / pg_terminate_backend / dropped future): each is a classified Err in bounded time, connection recovers OR evicts as NotReady, never a torn "success" and never a hang; no leak over a repeat loop
+cargo test -p bsql-postgres-sync  --test midstream_faults -- --ignored  # sync mid-stream fault matrix (same, minus the dropped-future class the blocking driver has no peer for)
 cargo test -p bsql-sqlite --test cancel              # SQLite interrupt witness (in-process, no PG)
 cargo test -p bsql-query-sqlite-fixture --features n1-detect --test n1_detect_sqlite  # SQLite N+1 witness (in-process)
 cargo test -p bsql-query-fixture --test query_live_async -- --ignored  # live query! (async, needs PG)
