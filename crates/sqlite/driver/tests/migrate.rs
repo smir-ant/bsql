@@ -294,15 +294,28 @@ fn duplicate_named_migration_is_loud_not_a_silent_skip() {
 // ── minimal temp-dir helper (no external crate) ───────────────────────────────
 
 /// Create a unique temp directory under the OS temp dir, removed on drop.
+///
+/// The name's COLLISION-PROOF component is a process-global monotonic counter:
+/// `pid` + a nanosecond clock are not enough, because two parallel test threads
+/// (same pid) can call `tempdir` within one clock tick on a coarse-resolution
+/// platform (macOS), collide on the same directory, and cross-contaminate — the
+/// source of the flaky `a_failing_migration_rolls_back_and_stops` failure under
+/// `cargo test`'s default thread parallelism. The `AtomicU64` guarantees a
+/// distinct name per call regardless of clock resolution or same-tick races; the
+/// pid + nanos stay for human-readable disambiguation across runs.
 fn tempdir(tag: &str) -> TempPath {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let mut base = std::env::temp_dir();
     let unique = format!(
-        "bsql_{tag}_{}_{}",
+        "bsql_{tag}_{}_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
-            .as_nanos()
+            .as_nanos(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
     );
     base.push(unique);
     std::fs::create_dir_all(&base).expect("mkdir temp");
