@@ -101,11 +101,14 @@ socket2 0.6.3
 sqlparser 0.62.0
 stable_deref_trait 1.2.1
 stacker 0.1.24
+stringprep 0.1.5
 subtle 2.6.1
 syn 2.0.117
 target-triple 1.0.0
 termcolor 1.4.1
 tinytemplate 1.2.1
+tinyvec 1.12.0
+tinyvec_macros 0.1.1
 tokio 1.52.3
 tokio-macros 2.7.0
 toml 1.1.2+spec-1.1.0
@@ -114,7 +117,10 @@ toml_parser 1.1.2+spec-1.1.0
 toml_writer 1.1.1+spec-1.1.0
 trybuild 1.0.116
 typenum 1.19.0
+unicode-bidi 0.3.18
 unicode-ident 1.0.24
+unicode-normalization 0.1.25
+unicode-properties 0.1.4
 untrusted 0.9.0
 uuid 1.23.4
 vcpkg 0.2.15

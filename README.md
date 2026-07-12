@@ -569,12 +569,12 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 2291** — every `#[test]` / `#[tokio::test]` attribute:
+- **Test functions: 2299** — every `#[test]` / `#[tokio::test]` attribute:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[(tokio::)?test' | wc -l
   ```
-- **`#[ignore]` live suites (need a running database): 303**:
+- **`#[ignore]` live suites (need a running database): 304**:
   ```bash
   find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
     | xargs -0 grep -hE '^[[:space:]]*#\[ignore' | wc -l

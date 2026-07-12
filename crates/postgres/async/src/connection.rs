@@ -64,12 +64,14 @@ use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
     Credentials, DatabaseName, Ident, PreparedQuery, RowDecode, TypedCopyIn, TypedQuery,
 };
-// `Password` / `Sensitive` build a `Credentials::ScramPassword` — SCRAM-only;
-// `resolve_channel_binding` computes its channel binding from the built wire.
+// `saslprep_password` SASLpreps (RFC 4013) the config password and builds the
+// zeroize-on-drop `Password`; `Sensitive` wraps it into a
+// `Credentials::ScramPassword`; `resolve_channel_binding` computes its channel
+// binding from the built wire. All SCRAM-only.
 #[cfg(feature = "scram")]
-use bsql_postgres_core::resolve_channel_binding;
+use bsql_postgres_core::{resolve_channel_binding, saslprep_password};
 #[cfg(feature = "scram")]
-use bsql_postgres_proto::{Password, Sensitive};
+use bsql_postgres_proto::Sensitive;
 
 use crate::transport::{ReadDeadline, Sock, TokioSocket};
 
@@ -299,8 +301,13 @@ impl Connection {
             // attempt (which the server would reject anyway) or a panic.
             #[cfg(feature = "scram")]
             Some(pw) => {
-                let password = Password::try_from_str(pw)
-                    .map_err(|_| DriverError::Config("invalid password"))?;
+                // RFC 5802 SCRAM mandates RFC 4013 SASLprep of the password
+                // before PBKDF2 — a non-breaking space / soft hyphen /
+                // NFKC-normalisable codepoint set through psql/libpq is stored
+                // by the server in its SASLprep form, so the raw bytes would
+                // never match. Normalise here (a prohibited codepoint is a
+                // classified `DriverError::Config`) so proto sees the RFC form.
+                let password = saslprep_password(pw)?;
                 // Resolve SCRAM channel binding from the negotiated transport +
                 // the consumer's policy: over TLS this hashes the server's
                 // certificate into the `tls-server-end-point` binding data, so the

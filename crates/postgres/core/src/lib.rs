@@ -97,6 +97,11 @@ pub mod n1 {
 // The per-connection notification ledger (a bounded, counted no-drop buffer)
 // and the sink adapter that captures every surfaced notification into it.
 pub mod notify;
+// RFC 4013 SASLprep normalisation of the SCRAM password (RFC 5802 mandate).
+// SCRAM-only: with `scram` OFF there is no password auth, so the `stringprep`
+// Unicode subtree this module names is neither compiled nor resolved.
+#[cfg(feature = "scram")]
+pub mod scram_prep;
 pub mod sql_ident;
 // The PostgreSQL `SSLRequest` probe + response classifier. TLS-only: with the
 // `tls` feature OFF the probe is never sent (the driver connects plaintext
@@ -123,6 +128,8 @@ pub use config::{
 pub use diag::{DiagEvent, DiagSink, Diagnostics, PoolStats};
 #[cfg(feature = "scram")]
 pub use config::resolve_channel_binding;
+#[cfg(feature = "scram")]
+pub use scram_prep::saslprep_password;
 pub use driver::{Core, PreparedStatement};
 pub use error::{ColumnError, DbError, DriverError};
 pub use materialize::{DbErrorSink, ResultCollector};

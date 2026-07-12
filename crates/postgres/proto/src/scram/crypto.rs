@@ -6,8 +6,16 @@
 //!
 //! # Operations (RFC 5802 §2.2)
 //!
+//! The `password` fed to `PBKDF2` below is expected to ALREADY be its RFC 4013
+//! SASLprep form. RFC 5802 mandates that normalisation, but SASLprep needs
+//! std-only Unicode tables and this is a `no_std` crate, so the driver's
+//! credential builder (`bsql_postgres_core::saslprep_password`) applies it
+//! before the bytes reach here — this module operates on the prepared bytes
+//! verbatim. (The RFC 7677 test vectors below use an ASCII password, which is
+//! SASLprep-invariant, so they exercise this composition unchanged.)
+//!
 //! ```text
-//! SaltedPassword := PBKDF2(password, salt, iters)
+//! SaltedPassword := PBKDF2(SASLprep(password), salt, iters)
 //! ClientKey      := HMAC(SaltedPassword, "Client Key")
 //! StoredKey      := SHA-256(ClientKey)
 //! ServerKey      := HMAC(SaltedPassword, "Server Key")
@@ -192,7 +200,9 @@ fn hmac_auth_message(
 ///
 /// # Arguments
 ///
-/// - `password` — the user's password bytes.
+/// - `password` — the user's password bytes, ALREADY RFC 4013 SASLprep-
+///   normalised by the caller (see the module header); this function does not
+///   normalise (it is `no_std`).
 /// - `salt` — base64-decoded salt from the server.
 /// - `iterations` — iteration count from the server (>= 4096).
 /// - `client_first_bare` — the `n=<user>,r=<nonce>` string.

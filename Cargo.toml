@@ -352,6 +352,22 @@ zeroize = { version = "1", default-features = false, features = ["zeroize_derive
 # SystemTime-seeded (expert-domain cryptography).
 getrandom = { version = "0.2", default-features = false }
 
+# `stringprep` — RFC 4013 SASLprep normalisation of the SCRAM password
+# (RFC 5802 §5.1 MANDATES it: the client feeds `SASLprep(password)` to
+# PBKDF2, exactly as PostgreSQL/libpq/JDBC do when building the stored
+# verifier). SASLprep is expert-domain Unicode (RFC 3454 mapping +
+# NFKC + bidi + prohibited-codepoint tables) — DEF-META-01 / Policy 9
+# forbids hand-rolling it; `stringprep` is the vetted implementation
+# (RustCrypto/PyCA-adjacent, by the `rust-native-tls`/`postgres`
+# author, and the same crate `sqlx` / `tokio-postgres` use for SCRAM).
+# Gated behind `bsql-postgres-core`'s default-on `scram` feature so a
+# `scram`-off build pulls neither it nor its Unicode subtree. It is a
+# std crate (Unicode tables), which is exactly why it lives in the std
+# `core` driver-support crate and NOT in the no_std `proto` kernel —
+# proto stays no_std-buildable with `scram` on. Runtime library (not a
+# build-time SQL parser), so `runtime_graph_pin` is unaffected.
+stringprep = { version = "0.1", default-features = false }
+
 # --- TLS / driver runtime deps (single source of version truth) ---
 # Hoisted here so every consuming crate inherits one pinned version via
 # `dep = { workspace = true }`. A version bump happens in exactly one

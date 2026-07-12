@@ -77,7 +77,7 @@ n1-detect = ["bsql-common/n1"]
 # `pbkdf2`, `base64ct`, `cpufeatures`) leave the runtime graph; a password-bearing
 # connect then fails LOUD at the driver, and Trust auth still works. Forwards to
 # `bsql-postgres-proto` only — this crate pulls no extra dependency of its own.
-scram = ["bsql-postgres-proto/scram"]
+scram = ["bsql-postgres-proto/scram", "dep:stringprep"]
 
 # `md5-auth` — forward the sans-IO kernel's default-on MD5-password authentication.
 # DEFAULT-ON. With it OFF, `md-5` and its private crypto stack (7 crates) leave a
@@ -103,6 +103,17 @@ bsql-postgres-proto = { path = "../proto", default-features = false }
 # (with its PG-only `LockTimeout`) stay here, bridged through the shared
 # `migrate::plan()` seam + a local `From<migrate::Drift>`.
 bsql-common = { path = "../../common" }
+# `stringprep` — OPTIONAL, behind the default-on `scram` feature. RFC 4013
+# SASLprep of the SCRAM password (RFC 5802 mandates it); applied in
+# `scram_prep::saslprep_password` at credential construction so the no_std
+# `proto` kernel receives already-normalised bytes and stays no_std-buildable
+# with `scram` on. Named only by the `scram`-gated `scram_prep` module, so with
+# SCRAM off it (and its Unicode subtree) leaves the runtime graph. A std crate
+# (Unicode tables) — a runtime library, not a build-time SQL parser, so
+# `runtime_graph_pin` stays green. See the workspace `[workspace.dependencies]`
+# policy note. Optional dep → the golden lock unions it in; `deps_pin` gains the
+# new lines and is regenerated with justification.
+stringprep = { workspace = true, optional = true }
 # `rustls` — OPTIONAL, behind the default-on `tls` feature. The pure-Rust TLS
 # stack (ring provider) the `tls` / `ssl` modules build on. With `tls` OFF the
 # whole rustls + ring subtree is neither resolved into a runtime graph nor

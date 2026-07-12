@@ -27,7 +27,13 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// (industry practice: argon2 accepts arbitrary input but real
 /// deployments cap at ~128; bcrypt truncates at 72). This is a no_std
 /// crate: it stores the password bytes VERBATIM and performs no
-/// Unicode transformation of its own.
+/// Unicode transformation of its own. RFC 5802 SCRAM mandates RFC 4013
+/// SASLprep of the password before PBKDF2; SASLprep needs the Unicode
+/// tables of a std-only crate, so it is applied by the driver's
+/// credential builder (`bsql_postgres_core::saslprep_password`) BEFORE
+/// the bytes reach this type — on the SCRAM path the bytes stored here
+/// are already the SASLprep form. (NFKC can expand the input; 512 B
+/// still comfortably covers ~128 normalized UTF-8 chars.)
 ///
 /// Halves of this cap propagate through `Password` size →
 /// `Sensitive<Password>` → `Credentials::ScramPassword` →

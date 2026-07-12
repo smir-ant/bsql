@@ -1596,6 +1596,61 @@ async fn scram_auth() {
     c.close().await.expect("close");
 }
 
+/// LIVE interop witness for RFC 4013 SASLprep (RFC 5802 SCRAM).
+///
+/// The `bsql_test_scram` role's password is set to `pa\u{00A0}ss` — a
+/// NO-BREAK SPACE `U+00A0` that SASLprep MAPS to a plain space — via
+/// `ALTER ROLE`. PostgreSQL SASLpreps the plaintext when it builds the stored
+/// verifier, so the server holds the verifier for `pa ss`. Connecting through
+/// bsql with the RAW unicode password `pa\u{00A0}ss` must SUCCEED: the driver's
+/// credential builder SASLpreps client-side to `pa ss`, so the proof matches.
+///
+/// This is the reported defect inverted into a green gate: WITHOUT the SASLprep
+/// fix bsql fed the raw bytes (`61 62 c2 a0 63 64`) to PBKDF2 and the server
+/// rejected the proof with `28P01`. It is the exact peer of libpq, which has
+/// always authenticated this password.
+///
+/// The password is mutated and RESTORED over a `smir-ant` trust connection; the
+/// connect Result is captured BEFORE the restore, so even a failed connect
+/// leaves the role back on its original password and the `scram_auth` test above
+/// stays green. The password constant contains no `'`, so the fixed-literal
+/// `ALTER ROLE` splice has no injection surface.
+#[tokio::test]
+#[ignore = "requires local PG with scram-sha-256 auth (mutates+restores bsql_test_scram password)"]
+async fn scram_saslprep_normalizes_a_unicode_password() {
+    const UNICODE_PW: &str = "pa\u{00A0}ss"; // NO-BREAK SPACE -> SASLprep maps to ' '
+    const ORIGINAL_PW: &str = "test_password_123";
+
+    // DDL over a trust connection as smir-ant (a superuser on the dev box).
+    let admin_cfg = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut admin = Connection::connect(&admin_cfg).await.expect("admin trust connect");
+    admin
+        .execute_sql(&format!("ALTER ROLE bsql_test_scram PASSWORD '{UNICODE_PW}'"))
+        .await
+        .expect("set the SASLprep-sensitive password");
+
+    // Connect as bsql_test_scram with the RAW unicode password — bsql SASLpreps.
+    let scram_cfg = ConnectConfig::new("127.0.0.1", "bsql_test_scram")
+        .database("postgres".to_string())
+        .password(UNICODE_PW.to_string());
+    let connect_result = Connection::connect(&scram_cfg).await;
+
+    // Restore BEFORE asserting, so a failed connect still leaves the role usable.
+    admin
+        .execute_sql(&format!("ALTER ROLE bsql_test_scram PASSWORD '{ORIGINAL_PW}'"))
+        .await
+        .expect("restore the original password");
+    admin.close().await.expect("admin close");
+
+    let mut c = connect_result
+        .expect("SCRAM auth with a raw unicode (SASLprep-mapped) password must succeed with the fix");
+    assert_eq!(
+        c.query_sql("SELECT current_user").await.expect("q").get(0).expect("row 0").get_raw(0),
+        Ok(Some(b"bsql_test_scram".as_slice())),
+    );
+    c.close().await.expect("close");
+}
+
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn ssl_modes() {
