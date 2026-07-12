@@ -751,6 +751,67 @@ impl ConnectConfig {
         &self.startup_params
     }
 
+    /// The client-side read-liveness window derived from the configured
+    /// server-side `statement_timeout`, or `None` when no such budget is set.
+    ///
+    /// # Why this is the ONE safe client-side bound
+    ///
+    /// A silently-vanished *live* peer — a black-hole proxy whose kernel still
+    /// ACKs but whose application forwards NOTHING, an unrecoverable app hang
+    /// behind a healthy NAT — cannot be detected by TCP keepalive (the peer
+    /// kernel answers the probes) and is INDISTINGUISHABLE at the socket layer
+    /// from a server legitimately taking a long time to produce the first result
+    /// byte. So no *fixed* client read deadline can catch it without also cutting
+    /// a legitimate slow query — the classic tension that leaves every driver's
+    /// in-flight read unbounded by default.
+    ///
+    /// The one budget that makes them distinguishable is the server's own
+    /// `statement_timeout`: the server aborts any query exceeding it with
+    /// `57014`, so a client that has waited `statement_timeout` PLUS one
+    /// round-trip ([`connect_timeout`](Self::connect_timeout), the driver's
+    /// existing network-handshake budget) for ANY byte — a result OR the `57014`
+    /// abort — is looking at a peer whose response was dropped, NEVER a query the
+    /// server would still allow (it would have aborted it first). Arming a
+    /// per-read inactivity deadline of this window therefore bounds a black-holed
+    /// in-flight query WITHOUT ever cutting a query the server itself would not
+    /// have aborted — the closure the raw `statement_timeout` cannot make alone
+    /// (its `57014` is black-holed too, so it bounds the SERVER, not the client's
+    /// read).
+    ///
+    /// # When it is `None` (the current unbounded steady-state read)
+    ///
+    /// - `statement_timeout` unset — no query budget, so no safe client window
+    ///   exists (any finite deadline could cut a legitimate long query).
+    /// - `statement_timeout` `0` (explicitly disabled, PostgreSQL's convention).
+    /// - `statement_timeout` in a form [`parse_statement_timeout_ms`] cannot model
+    ///   (`DEFAULT`, garbage) — a fail-SAFE absence, never a spurious bound. Unit
+    ///   suffixes PostgreSQL accepts (`us`/`ms`/`s`/`min`/`h`/`d`) DO parse, so a
+    ///   raw `("statement_timeout", "30s")` startup param derives its window too.
+    ///
+    /// Last-wins over the startup map (its last-applied + PostgreSQL's
+    /// case-insensitive GUC-name-folding semantics), so it reads the SAME value
+    /// the server will.
+    ///
+    /// # Runtime drift (the window is re-derived, never left stale)
+    ///
+    /// This is the CONNECT-TIME window. A runtime `SET statement_timeout` changes
+    /// the server budget out from under it; a window left stale BELOW a raised
+    /// budget would cut a query the server now allows. The drivers therefore
+    /// re-derive the window when they OBSERVE an explicit top-level `SET`/`RESET`
+    /// of `statement_timeout` (via [`statement_timeout_effect`]) and SUPPRESS it
+    /// for bsql's own trusted long operations (the migration runner) — so the
+    /// window is never shorter than the budget the server is actually enforcing.
+    #[must_use]
+    pub fn client_liveness_window(&self) -> Option<Duration> {
+        let ms: u64 = self
+            .startup_params
+            .iter()
+            .rev()
+            .find(|(name, _)| name.eq_ignore_ascii_case("statement_timeout"))
+            .and_then(|(_, value)| parse_statement_timeout_ms(value))?;
+        window_from_statement_timeout_ms(ms, self.connect_timeout_secs)
+    }
+
     /// Verify the server certificate against a CUSTOM set of CA roots supplied
     /// as PEM, instead of the default (baked Mozilla) trust anchors.
     ///
@@ -996,6 +1057,188 @@ pub fn resolve_channel_binding(
 /// parameter can never reach the wire, and the `StartupMessage` can never carry
 /// a NUL or override a reserved parameter.
 ///
+/// Parse a PostgreSQL `statement_timeout` GUC value to whole milliseconds.
+///
+/// Accepts a bare integer (milliseconds — the unit
+/// [`with_statement_timeout`](ConnectConfig::with_statement_timeout) emits) and
+/// the unit-suffixed forms PostgreSQL accepts (`us`/`ms`/`s`/`min`/`h`/`d`),
+/// optionally single-quoted. `0` → `Some(0)` (disabled). Returns `None` for
+/// `DEFAULT`, an empty/negative/garbage value, or a unit this does not model — a
+/// fail-SAFE signal the caller treats as "no bound / disarm the window", never a
+/// spurious bound derived from a value it could not read. The result is clamped
+/// to PostgreSQL's 32-bit millisecond GUC ceiling (`i32::MAX`), so an enormous
+/// value never overflows the downstream clock arithmetic.
+#[must_use]
+pub fn parse_statement_timeout_ms(value: &str) -> Option<u64> {
+    const MAX_MS: u64 = 2_147_483_647; // i32::MAX ms ≈ 24.8 days (PG's GUC ceiling)
+    let v = value.trim().trim_matches('\'').trim();
+    if v.is_empty() {
+        return None;
+    }
+    // Split the leading digit run from an optional unit suffix.
+    let digits_end = v.bytes().take_while(|b| b.is_ascii_digit()).count();
+    let (num_str, unit) = (v.get(..digits_end)?, v.get(digits_end..)?);
+    let num: u64 = num_str.parse().ok()?;
+    let ms = match unit.trim() {
+        "" | "ms" => num,
+        // Integer floor via `checked_div` (the `/` operator is crate-forbidden);
+        // a sub-millisecond `us` budget floors toward `0`, which the caller reads
+        // as "disabled" — the SAFE direction (no client bound).
+        "us" => num.checked_div(1000)?,
+        "s" => num.checked_mul(1000)?,
+        "min" => num.checked_mul(60_000)?,
+        "h" => num.checked_mul(3_600_000)?,
+        "d" => num.checked_mul(86_400_000)?,
+        _ => return None, // an unmodeled unit (or trailing garbage) → fail-safe
+    };
+    Some(ms.min(MAX_MS))
+}
+
+/// Derive the client-liveness WINDOW from a `statement_timeout` budget (ms) and
+/// the connection's `connect_timeout`: `budget + connect_timeout` (saturating), or
+/// `None` when `budget_ms == 0` (disabled → no client bound). One authority for
+/// the connect-time derivation AND the runtime re-derivation after an observed
+/// `SET`, so the two cannot drift.
+#[must_use]
+pub fn window_from_statement_timeout_ms(budget_ms: u64, connect_timeout_secs: u64) -> Option<Duration> {
+    if budget_ms == 0 {
+        // Disabled: no server budget, so no finite client window can be safe.
+        return None;
+    }
+    Some(Duration::from_millis(budget_ms).saturating_add(Duration::from_secs(connect_timeout_secs)))
+}
+
+/// The effect an EXECUTED SQL statement has on the session `statement_timeout`,
+/// classified conservatively from its text so the client-liveness window can be
+/// re-derived (never left STALE below a raised server budget, which would cut a
+/// query the server now allows). Only a TOP-LEVEL `SET`/`RESET` is recognized;
+/// every ambiguous form fails SAFE to [`Disarm`](Self::Disarm) (drop the window,
+/// never a false cut), and every non-`SET`/`RESET` statement is
+/// [`Unchanged`](Self::Unchanged).
+// Deliberately NOT `#[non_exhaustive]`: the drivers match it EXHAUSTIVELY (per the
+// crate convention), so a future effect variant forces a classification decision
+// at every application site rather than a silent wildcard fall-through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementTimeoutEffect {
+    /// The statement does not observably change `statement_timeout`.
+    Unchanged,
+    /// `SET [SESSION] statement_timeout = <v>` to a parseable budget (ms; `0` =
+    /// disabled). Re-derive the window to this budget.
+    SetTo(u64),
+    /// `RESET statement_timeout` / `RESET ALL`: back to the connect-time budget.
+    ResetToConnect,
+    /// A `statement_timeout` change this cannot pin to an exact value (`SET LOCAL`
+    /// — transaction-scoped; an unparseable value; `= DEFAULT`): DISARM the window
+    /// (drop the client bound rather than risk cutting a legit query).
+    Disarm,
+}
+
+/// Classify an executed SQL statement's effect on `statement_timeout` — see
+/// [`StatementTimeoutEffect`].
+///
+/// Cheap on the common path: a statement whose first token is not (case-
+/// insensitively) `SET` or `RESET` is `Unchanged` after a few-byte check, with no
+/// full-text scan. A multi-statement batch is split on `;` and the LAST
+/// SET/RESET wins (PostgreSQL applies them in order), with ANY ambiguous piece
+/// forcing `Disarm`.
+///
+/// LIMITS (honest, and all fail SAFE — never a false cut, only lost black-hole
+/// protection or a harmlessly-loose window): a `statement_timeout` set via
+/// `SELECT set_config(...)`, dynamic `EXECUTE`, a `DO`/function body, or a
+/// non-leading statement in a batch is NOT observed (window stays as-is — loose
+/// if the hidden change RAISED the budget); a `SET LOCAL` is `Disarm`ed
+/// (transaction scope is untrackable here). A `SET` reached only through the
+/// transaction-guard verbs (which run on `Core`, below the driver that owns the
+/// window) is likewise not observed.
+#[must_use]
+pub fn statement_timeout_effect(sql: &str) -> StatementTimeoutEffect {
+    let mut effect = StatementTimeoutEffect::Unchanged;
+    for piece in sql.split(';') {
+        match classify_one_statement(piece.trim()) {
+            StatementTimeoutEffect::Unchanged => {}
+            // Any ambiguous piece taints the whole batch — fail safe.
+            StatementTimeoutEffect::Disarm => return StatementTimeoutEffect::Disarm,
+            // A recognized SET/RESET: last one in the batch wins.
+            other => effect = other,
+        }
+    }
+    effect
+}
+
+/// Classify a SINGLE trimmed statement (no `;`). See [`statement_timeout_effect`].
+fn classify_one_statement(p: &str) -> StatementTimeoutEffect {
+    // `RESET statement_timeout` / `RESET ALL` → back to the connect-time budget.
+    if let Some(rest) = strip_leading_keyword(p, "reset") {
+        let target = rest.trim_start();
+        if starts_with_keyword(target, "statement_timeout") || starts_with_keyword(target, "all") {
+            return StatementTimeoutEffect::ResetToConnect;
+        }
+        return StatementTimeoutEffect::Unchanged;
+    }
+    // Only a `SET` can raise/lower the budget going forward.
+    let Some(after_set) = strip_leading_keyword(p, "set") else {
+        return StatementTimeoutEffect::Unchanged;
+    };
+    let after_set = after_set.trim_start();
+    // Peel an optional SESSION / LOCAL qualifier.
+    let (after_qual, is_local) = if let Some(r) = strip_leading_keyword(after_set, "local") {
+        (r.trim_start(), true)
+    } else if let Some(r) = strip_leading_keyword(after_set, "session") {
+        (r.trim_start(), false)
+    } else {
+        (after_set, false)
+    };
+    // The GUC name runs up to whitespace or `=`. `find` yields a valid char
+    // boundary (or the length), so `split_at` never panics — no indexing/unwrap.
+    let name_end = match after_qual.find(|c: char| c.is_ascii_whitespace() || c == '=') {
+        Some(i) => i,
+        None => after_qual.len(),
+    };
+    let (name, tail_raw) = after_qual.split_at(name_end);
+    let tail = tail_raw.trim_start();
+    if !name.eq_ignore_ascii_case("statement_timeout") {
+        // SET of a DIFFERENT GUC (its value merely mentioning the word is fine).
+        return StatementTimeoutEffect::Unchanged;
+    }
+    // Expect `= <v>` or `TO <v>`.
+    let value = if let Some(v) = tail.strip_prefix('=') {
+        v.trim()
+    } else if let Some(v) = strip_leading_keyword(tail, "to") {
+        v.trim()
+    } else {
+        // `SET statement_timeout` in a form we don't understand → fail-safe.
+        return StatementTimeoutEffect::Disarm;
+    };
+    if is_local {
+        // Transaction-scoped: its revert is untrackable here → drop the bound.
+        return StatementTimeoutEffect::Disarm;
+    }
+    match parse_statement_timeout_ms(value) {
+        Some(ms) => StatementTimeoutEffect::SetTo(ms),
+        None => StatementTimeoutEffect::Disarm, // DEFAULT / unparseable
+    }
+}
+
+/// If `s` begins (case-insensitively) with `kw` at a word boundary (followed by
+/// whitespace, `=`, or end), return the remainder after `kw`; else `None`.
+fn strip_leading_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    let head = s.get(..kw.len())?;
+    if !head.eq_ignore_ascii_case(kw) {
+        return None;
+    }
+    let rest = s.get(kw.len()..)?;
+    if rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '=') {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+/// Whether `s` begins (case-insensitively) with `kw` at a word boundary.
+fn starts_with_keyword(s: &str, kw: &str) -> bool {
+    strip_leading_keyword(s, kw).is_some()
+}
+
 /// The wire `StartupParam` carries the precise cause internally
 /// (`StartupParamError`); it is collapsed to a `&'static str` here because
 /// [`DriverError::Config`](crate::DriverError) is the crate's established
@@ -1239,6 +1482,126 @@ mod tests {
                 ("statement_timeout".to_string(), "200".to_string()),
             ],
         );
+    }
+
+    /// The client-liveness window derives from a configured `statement_timeout`:
+    /// `None` when unset / disabled / non-integer, and `statement_timeout +
+    /// connect_timeout` (last-wins, case-insensitive) otherwise.
+    #[test]
+    fn client_liveness_window_is_derived_from_statement_timeout() {
+        // Unset → no window (the historical unbounded steady read).
+        assert_eq!(
+            ConnectConfig::new("h", "u").client_liveness_window(),
+            None,
+            "no statement_timeout → no client window",
+        );
+
+        // Set via the blessed builder → statement_timeout + connect_timeout
+        // (5000 ms + 7 s = 12000 ms).
+        let cfg = ConnectConfig::new("h", "u")
+            .connect_timeout(7)
+            .with_statement_timeout(Duration::from_millis(5000));
+        assert_eq!(cfg.client_liveness_window(), Some(Duration::from_millis(12_000)));
+
+        // `0` (explicitly disabled) → no window: no query budget, so no safe bound.
+        assert_eq!(
+            ConnectConfig::new("h", "u")
+                .with_statement_timeout(Duration::ZERO)
+                .client_liveness_window(),
+            None,
+        );
+
+        // A sub-ms budget rounds up to 1 ms in the GUC, so the window is 1 ms +
+        // connect_timeout (2 s) = 2001 ms (never collapses to "disabled").
+        assert_eq!(
+            ConnectConfig::new("h", "u")
+                .connect_timeout(2)
+                .with_statement_timeout(Duration::from_micros(500))
+                .client_liveness_window(),
+            Some(Duration::from_millis(2001)),
+        );
+
+        // A form the parser still cannot pin (`DEFAULT`) → fail-SAFE None (no
+        // spurious bound), NOT a parse panic. (A unit-suffixed `"30s"` DOES parse
+        // now — covered in the last-wins block above.)
+        assert_eq!(
+            ConnectConfig::new("h", "u")
+                .with_startup_param("statement_timeout", "DEFAULT")
+                .client_liveness_window(),
+            None,
+        );
+
+        // Last-wins + case-insensitive GUC-name folding: the SECOND value applies,
+        // matching how PostgreSQL resolves a repeated startup param.
+        // 2000 ms + connect_timeout 1 s = 3000 ms.
+        let last_wins = ConnectConfig::new("h", "u")
+            .connect_timeout(1)
+            .with_startup_param("Statement_Timeout", "1000")
+            .with_startup_param("statement_timeout", "2000");
+        assert_eq!(
+            last_wins.client_liveness_window(),
+            Some(Duration::from_millis(3000)),
+        );
+
+        // A raw unit-suffixed startup param NOW derives a window (minor-fix: parse
+        // PostgreSQL's duration forms, not just bare ms).
+        assert_eq!(
+            ConnectConfig::new("h", "u")
+                .connect_timeout(0)
+                .with_startup_param("statement_timeout", "30s")
+                .client_liveness_window(),
+            Some(Duration::from_millis(30_000)),
+        );
+    }
+
+    /// The `statement_timeout` value parser accepts PostgreSQL's duration forms
+    /// and fail-SAFEs (`None`) on anything it cannot pin to whole milliseconds.
+    #[test]
+    fn statement_timeout_value_parsing() {
+        use super::parse_statement_timeout_ms as p;
+        assert_eq!(p("5000"), Some(5000)); // bare ms
+        assert_eq!(p("'5000'"), Some(5000)); // quoted
+        assert_eq!(p("0"), Some(0)); // disabled
+        assert_eq!(p("30s"), Some(30_000));
+        assert_eq!(p("'1min'"), Some(60_000));
+        assert_eq!(p("2h"), Some(7_200_000));
+        assert_eq!(p("1d"), Some(86_400_000));
+        assert_eq!(p("500ms"), Some(500));
+        assert_eq!(p("500us"), Some(0)); // sub-ms floors to 0 = disabled (SAFE)
+        assert_eq!(p("default"), None); // can't pin → fail-safe
+        assert_eq!(p("garbage"), None);
+        assert_eq!(p(""), None);
+        assert_eq!(p("60zz"), None); // unmodeled unit → fail-safe
+        // Clamped to PG's i32::MAX ms ceiling.
+        assert_eq!(p("999999999999"), Some(2_147_483_647));
+    }
+
+    /// The SET/RESET classifier: the common explicit forms are recognized, and
+    /// every ambiguous form fails SAFE (`Disarm`) or is `Unchanged` — NEVER a
+    /// mis-read that leaves a window stale below a raised budget.
+    #[test]
+    fn statement_timeout_effect_classification() {
+        use super::{statement_timeout_effect as e, StatementTimeoutEffect as E};
+        // The common explicit SET a consumer types → re-derive to the new budget.
+        assert_eq!(e("SET statement_timeout = '30s'"), E::SetTo(30_000));
+        assert_eq!(e("set statement_timeout to 60000"), E::SetTo(60_000));
+        assert_eq!(e("SET SESSION statement_timeout = 0"), E::SetTo(0)); // disable
+        assert_eq!(e("SET statement_timeout='5s'"), E::SetTo(5000)); // no spaces
+        // RESET → back to the connect-time budget.
+        assert_eq!(e("RESET statement_timeout"), E::ResetToConnect);
+        assert_eq!(e("reset all"), E::ResetToConnect);
+        // Ambiguous → Disarm (fail-safe, never a false cut).
+        assert_eq!(e("SET LOCAL statement_timeout = '60s'"), E::Disarm);
+        assert_eq!(e("SET statement_timeout = DEFAULT"), E::Disarm);
+        // A leading SET in a batch is seen; the trailing query rides the new budget.
+        assert_eq!(e("SET statement_timeout='60s'; SELECT 1"), E::SetTo(60_000));
+        // Unrelated statements never touch the window.
+        assert_eq!(e("SELECT 1"), E::Unchanged);
+        assert_eq!(e("SET search_path = myschema"), E::Unchanged);
+        assert_eq!(e("RESET search_path"), E::Unchanged);
+        assert_eq!(e("SELECT set_config('statement_timeout','0',false)"), E::Unchanged); // residual (loose = safe)
+        // A value that merely mentions the word is not a false match.
+        assert_eq!(e("SET application_name = 'statement_timeout'"), E::Unchanged);
     }
 
     #[test]

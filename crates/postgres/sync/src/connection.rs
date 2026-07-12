@@ -54,7 +54,7 @@ use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
     resolve_endpoint, validate_startup_params, BorrowedRow, ConnectConfig, Diagnostics, DriverError,
     Endpoint, MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification,
-    QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
+    QueryResult, Redial, Row, Rows, SslMode, StatementTimeoutEffect, TypedNotification,
 };
 // Referenced only by the non-unix `Endpoint::Unix` reject arm in `dial_socket`.
 #[cfg(not(unix))]
@@ -247,13 +247,29 @@ pub struct Connection {
     /// read/write timeouts on a fd the engine otherwise owns: a dup'd handle
     /// shares the same kernel socket, so a timeout set here applies to the
     /// engine's own reads and writes. [`connect`](Self::connect) bounds the
-    /// connect + handshake with `connect_timeout` then disarms it (steady-state
-    /// I/O blocks indefinitely, matching the async driver);
+    /// connect + handshake with `connect_timeout` then restores the STEADY read
+    /// timeout (`steady_read_timeout` below);
     /// [`recv_notification`](Self::recv_notification) arms a bounded read deadline
-    /// for its own poll and restores the disarmed state on exit. `None` for an
+    /// for its own poll and restores the steady state on exit. `None` for an
     /// in-memory testkit connection, which never blocks — the arming is then a
     /// no-op.
     socket_ctl: Option<SyncSock>,
+    /// The steady-state read timeout (`SO_RCVTIMEO`) the socket rests at between
+    /// verbs: the client-liveness window derived from a configured
+    /// `statement_timeout` (`Some(w)`), or `None` = block indefinitely (the
+    /// historical steady read, async-parity). Set once at connect and restored
+    /// after every bounded [`reset_session`](Self::reset_session) /
+    /// [`recv_notification`](Self::recv_notification) arming — so a black-holed
+    /// in-flight query read elapses into a classified `Timeout` at `w` instead of
+    /// hanging, without cutting a query the server itself would not have aborted.
+    /// A per-read (`SO_RCVTIMEO`) inactivity window, so a legitimately slow stream
+    /// whose bytes keep arriving never trips it. MUTATED when a runtime
+    /// `SET statement_timeout` is observed (so the window is never stale below a
+    /// raised budget) and restored to `connect_read_timeout` by `reset_session`.
+    steady_read_timeout: Option<Duration>,
+    /// The IMMUTABLE connect-time baseline window — what a `RESET statement_timeout`
+    /// / `RESET ALL` / pool `reset_session` restores `steady_read_timeout` to.
+    connect_read_timeout: Option<Duration>,
 }
 
 impl Connection {
@@ -366,10 +382,15 @@ impl Connection {
             engine::open_owned(wire, &user, database.as_ref(), &startup_params, credentials)
                 .map_err(lift_conn_fail)?;
         let live = flatten_poll(engine::poll_once(engine.connect(live)))?;
-        // Handshake complete: disarm the connect-phase deadline so steady-state
-        // reads and writes block indefinitely (async-parity). The only remaining
-        // deadline is the bounded one `recv_notification` arms for its own wait.
-        socket_ctl.set_read_timeout(None)?;
+        // Handshake complete: leave the connect-phase deadline and rest the socket
+        // at its STEADY state. Writes block indefinitely (async-parity); reads rest
+        // at the client-liveness window derived from a configured
+        // `statement_timeout` (`None` = block indefinitely, the historical read),
+        // so a black-holed in-flight query read elapses into a classified `Timeout`
+        // at the window instead of hanging — without cutting a query the server
+        // allows. `SO_RCVTIMEO` is per-read, so a live stream re-arms it each read.
+        let steady_read_timeout = config.client_liveness_window();
+        socket_ctl.set_read_timeout(steady_read_timeout)?;
         socket_ctl.set_write_timeout(None)?;
         let backend_pid = engine.backend_pid().map_err(|_| DriverError::NotReady)?;
         // Capture the SECRET half of the cancel key alongside the pid, so a later
@@ -388,6 +409,8 @@ impl Connection {
             core: Core::new(engine, live, encrypted, server_version, backend_pid, secret_key),
             redial: Redial::from_config(config),
             socket_ctl: Some(socket_ctl),
+            steady_read_timeout,
+            connect_read_timeout: steady_read_timeout,
         };
         // Install the full configuration (sink + slow-query threshold) for
         // steady-state events; the connect-time SSL-downgrade event already
@@ -441,6 +464,10 @@ impl Connection {
             // redial satisfies the field (a testkit connection is never canceled).
             redial: Redial::from_config(&ConnectConfig::new("localhost", "")),
             socket_ctl: None,
+            // No socket to bound and the fake never blocks — the steady read
+            // timeout is a no-op here.
+            steady_read_timeout: None,
+            connect_read_timeout: None,
         })
     }
 
@@ -632,20 +659,75 @@ impl Connection {
     }
 
     /// Issue a simple query, returning the command tag string.
+    ///
+    /// A successful top-level `SET`/`RESET statement_timeout` here RE-DERIVES the
+    /// client-liveness window (see [`note_statement_timeout`](Self::note_statement_timeout)).
     pub fn simple_query(&mut self, sql: &str) -> Result<String, DriverError> {
-        drive_sync(engine::poll_once(self.core.simple_query(sql)))
+        let result = drive_sync(engine::poll_once(self.core.simple_query(sql)));
+        self.note_statement_timeout(sql, result.is_ok());
+        result
     }
 
     /// Execute a non-row runtime-SQL command, returning the affected-row count.
     /// The compile-checked counterpart is [`execute`](Self::execute).
+    ///
+    /// A successful top-level `SET`/`RESET statement_timeout` here RE-DERIVES the
+    /// client-liveness window (see [`note_statement_timeout`](Self::note_statement_timeout)).
     pub fn execute_sql(&mut self, sql: &str) -> Result<u64, DriverError> {
-        drive_sync(engine::poll_once(self.core.execute_sql(sql)))
+        let result = drive_sync(engine::poll_once(self.core.execute_sql(sql)));
+        self.note_statement_timeout(sql, result.is_ok());
+        result
     }
 
     /// Run a row-returning runtime-SQL query (text result columns). The
     /// compile-checked, typed counterpart is [`query`](Self::query).
+    ///
+    /// A successful top-level `SET`/`RESET statement_timeout` here RE-DERIVES the
+    /// client-liveness window (see [`note_statement_timeout`](Self::note_statement_timeout)).
     pub fn query_sql(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
-        drive_sync(engine::poll_once(self.core.query_sql(sql)))
+        let result = drive_sync(engine::poll_once(self.core.query_sql(sql)));
+        self.note_statement_timeout(sql, result.is_ok());
+        result
+    }
+
+    /// Re-derive the client-liveness window from an EXECUTED runtime SQL
+    /// statement's effect on `statement_timeout`, so the window is never left STALE
+    /// below a budget a runtime `SET` raised — which would cut a query the server
+    /// now allows (the ABSOLUTE mandate: never falsely cut a legit query). The
+    /// blocking twin of the async driver's method; see
+    /// [`bsql_postgres_core::statement_timeout_effect`] for the observed set and
+    /// the honest residual. Only fires after a SUCCESSFUL verb.
+    fn note_statement_timeout(&mut self, sql: &str, ok: bool) {
+        if !ok {
+            return;
+        }
+        let window = match bsql_postgres_core::statement_timeout_effect(sql) {
+            StatementTimeoutEffect::Unchanged => return,
+            StatementTimeoutEffect::SetTo(budget_ms) => {
+                bsql_postgres_core::window_from_statement_timeout_ms(
+                    budget_ms,
+                    self.redial.connect_timeout_secs(),
+                )
+            }
+            StatementTimeoutEffect::ResetToConnect => self.connect_read_timeout,
+            StatementTimeoutEffect::Disarm => None,
+        };
+        self.set_steady_read_timeout(window);
+    }
+
+    /// Apply a new steady read-timeout (`SO_RCVTIMEO`) window to the fd AND the
+    /// field. A setsockopt failure falls back to UNBOUNDED (the SAFE direction —
+    /// never a falsely-TIGHT ceiling that could cut a legit query); the next
+    /// `reset_session` re-syncs from the connect baseline.
+    fn set_steady_read_timeout(&mut self, window: Option<Duration>) {
+        if let Some(ctl) = &self.socket_ctl
+            && ctl.set_read_timeout(window).is_err()
+        {
+            drop(ctl.set_read_timeout(None));
+            self.steady_read_timeout = None;
+            return;
+        }
+        self.steady_read_timeout = window;
     }
 
     /// Run a runtime-SQL query returning the first row, or [`DriverError::NoRows`].
@@ -907,12 +989,43 @@ impl Connection {
     /// once, in deterministic order — the runtime migration RUNNER. See
     /// [`bsql_postgres_core::migrate`] for the ledger / atomicity /
     /// checksum-drift / advisory-lock guarantees.
+    ///
+    /// The client-liveness window is SUPPRESSED for the whole run (the socket
+    /// blocks indefinitely): a migration is a TRUSTED bsql-controlled long op (a
+    /// `CREATE INDEX CONCURRENTLY` behind a `SET statement_timeout = 0`), governed
+    /// by its own server-side budget, so bsql must never client-cut its own
+    /// migration. The steady window is restored on EVERY exit path (the inner call
+    /// returns its `Result` and the restore runs unconditionally after).
     pub fn run_migrations<'a>(
         &'a mut self,
         source: impl Into<MigrationSource<'a>>,
     ) -> Result<MigrationReport, MigrationError> {
+        let restore_to = self.steady_read_timeout;
+        if let Some(ctl) = &self.socket_ctl {
+            // Block indefinitely for the trusted long op. Best-effort: a failed
+            // setsockopt on a live dup'd fd is essentially impossible, and would
+            // signal a broken connection the apply below surfaces classified.
+            drop(ctl.set_read_timeout(None));
+        }
+        let result = self.run_migrations_apply(source.into());
+        // Restore the pre-run steady window on EVERY exit (a `LockTimeout` early
+        // return, an apply error, or success). A migration that PERSISTENTLY
+        // changed `statement_timeout` (a non-LOCAL `SET` without a `RESET`) leaves
+        // this loose, not tight — the SAFE direction; a pooled connection's
+        // `reset_session` re-derives to the connect baseline on the next checkout.
+        if let Some(ctl) = &self.socket_ctl {
+            drop(ctl.set_read_timeout(restore_to));
+        }
+        result
+    }
+
+    /// The migration apply proper, run with the client-liveness window suppressed
+    /// by [`run_migrations`](Self::run_migrations).
+    fn run_migrations_apply(
+        &mut self,
+        source: MigrationSource<'_>,
+    ) -> Result<MigrationReport, MigrationError> {
         use bsql_postgres_core::migrate;
-        let source = source.into();
         // Acquire the migration lock by NON-BLOCKING poll with backoff (see the
         // async driver): a waiter holds no long-lived transaction, so a
         // `CREATE INDEX CONCURRENTLY` migration cannot deadlock against it.
@@ -1105,12 +1218,19 @@ impl Connection {
             ctl.set_write_timeout(Some(budget)).map_err(DriverError::Io)?;
         }
         let result = drive_sync(engine::poll_once(self.core.reset_session()));
-        // Restore the disarmed (block-forever) steady state in EVERY arm BEFORE
-        // returning, so the caller's real verbs block indefinitely again (the
-        // steady-state I/O contract), exactly as `recv_notification` restores.
+        // `RESET ALL` restored `statement_timeout` to its connect-time value, so
+        // the client-liveness window returns to the connect BASELINE — a runtime
+        // `SET` made on this checkout does not leak its (possibly larger/disarmed)
+        // window to the next checkout of a pooled connection.
+        self.steady_read_timeout = self.connect_read_timeout;
+        // Restore the STEADY state in EVERY arm BEFORE returning: the read timeout
+        // to its (now connect-baseline) client-liveness window (or `None` =
+        // block-forever) and the write timeout to block-forever, so the caller's
+        // real verbs rest at the steady-state I/O contract again, exactly as
+        // `recv_notification` restores.
         let restore = match &self.socket_ctl {
             Some(ctl) => ctl
-                .set_read_timeout(None)
+                .set_read_timeout(self.steady_read_timeout)
                 .and_then(|()| ctl.set_write_timeout(None)),
             None => Ok(()),
         };
@@ -1157,12 +1277,13 @@ impl Connection {
             ctl.set_read_timeout(Some(timeout)).map_err(DriverError::Io)?;
         }
         let received = drive_sync(engine::poll_once(self.core.recv_notification_inner()));
-        // Disarm the bounded read deadline so subsequent verbs block indefinitely
-        // again (the steady-state I/O contract). Restored in EVERY arm BEFORE the
-        // buffered notification is drained, so a disarm failure leaves the
-        // notification buffered (recoverable next call), never lost.
+        // Restore the STEADY read timeout (the client-liveness window, or `None` =
+        // block indefinitely) so subsequent verbs rest at the steady-state I/O
+        // contract again. Restored in EVERY arm BEFORE the buffered notification is
+        // drained, so a restore failure leaves the notification buffered
+        // (recoverable next call), never lost.
         let restore = match &self.socket_ctl {
-            Some(ctl) => ctl.set_read_timeout(None),
+            Some(ctl) => ctl.set_read_timeout(self.steady_read_timeout),
             None => Ok(()),
         };
         match received {

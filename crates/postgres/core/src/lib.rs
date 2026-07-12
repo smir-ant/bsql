@@ -122,8 +122,9 @@ pub mod types;
 
 pub use cancel::{CancelKey, Redial};
 pub use config::{
-    resolve_endpoint, validate_startup_params, ChannelBindingMode, ConnectConfig, Endpoint,
-    SslMode, UNIX_SOCKET_UNSUPPORTED,
+    resolve_endpoint, statement_timeout_effect, validate_startup_params,
+    window_from_statement_timeout_ms, ChannelBindingMode, ConnectConfig, Endpoint, SslMode,
+    StatementTimeoutEffect, UNIX_SOCKET_UNSUPPORTED,
 };
 pub use diag::{DiagEvent, DiagSink, Diagnostics, PoolStats};
 #[cfg(feature = "scram")]

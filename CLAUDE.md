@@ -82,6 +82,8 @@ cargo test -p bsql-postgres-async --test sq_live cancel_token_stops -- --ignored
 cargo test -p bsql-postgres-sync  --test sync_live cancel_token_stops -- --ignored # sync cancel witness (needs PG)
 cargo test -p bsql-postgres-async --test pool_liveness -- --ignored   # async pool dead-peer liveness (get() bounded, not a hang; PG behind a black-hole relay)
 cargo test -p bsql-postgres-sync  --test pool_liveness -- --ignored   # sync  pool dead-peer liveness (get() bounded, not a hang; PG behind a black-hole relay)
+cargo test -p bsql-postgres-async --test direct_liveness -- --ignored   # async DIRECT/in-flight query liveness (a black-holed query with a statement_timeout is a bounded classified Timeout, not a hang; mid-query FIN classified in ms; PG behind a black-hole relay)
+cargo test -p bsql-postgres-sync  --test direct_liveness -- --ignored   # sync  DIRECT/in-flight query liveness (same bound over the blocking driver; PG behind a black-hole relay)
 cargo test -p bsql-postgres-async --test tls_fragmentation -- --ignored  # TLS byte-fragmentation reassembly gate (the owner's-burn regression net): a self-contained ephemeral SSL PG behind a 1/3-byte fragmenting relay; handshake + multi-record result + 300 KB record-spanning value + stream reassemble byte-exact, is_encrypted, zero panics/hangs. Skips cleanly if no initdb/openssl or run as root
 cargo test -p bsql-postgres-async --test channel_binding_plus -- --ignored  # live SCRAM-SHA-256-PLUS witness: a self-contained ephemeral SSL + SCRAM PG (initdb + openssl self-signed cert + password_encryption=scram-sha-256 + a hostssl scram login role) it starts itself; channel_binding=Require/Prefer over TLS AUTHENTICATE (real PG only accepts the tls-server-end-point cert hash a correct -PLUS proof carries), and channel_binding=Require over plaintext FAILS CLOSED (DriverError::Config). Skips cleanly if no initdb/openssl/psql or run as root
 cargo test -p bsql-postgres-async --test midstream_faults -- --ignored  # async mid-stream fault matrix (server error / cancel-57014 / transport-death FIN mid-result / pg_terminate_backend / dropped future): each is a classified Err in bounded time, connection recovers OR evicts as NotReady, never a torn "success" and never a hang; no leak over a repeat loop
@@ -998,6 +1000,81 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   classified `57014` and then reuses the connection, while a connection WITHOUT
   the timeout runs the same sleep to completion) plus offline unit tests for the
   ms formatting / zero / sub-ms / cap.
+- **Client-side read-liveness window (a black-holed in-flight query cannot hang) —
+  derived from `statement_timeout`.** A DIRECT (non-pooled) in-flight query's
+  socket read has no client deadline by default, so a peer that VANISHED while
+  still ALIVE (a black-hole proxy whose kernel keeps ACKing — TCP keepalive is
+  answered, so keepalive canNOT detect it — but whose app forwards nothing) leaves
+  the read blocked indefinitely, and the server's `statement_timeout` `57014` abort
+  is ITSELF black-holed, so `statement_timeout` alone bounds the SERVER, not the
+  client (measured: a black-holed query hangs past a generous outer timeout even
+  with `statement_timeout` set). The catch: a silent black-hole is
+  INDISTINGUISHABLE at the socket layer from a server legitimately taking a long
+  time to produce the first byte, so NO fixed client deadline can catch it without
+  cutting a legitimate slow query — EXCEPT one derived from the server's own query
+  budget. When a `statement_timeout` is configured, both drivers therefore arm a
+  per-read INACTIVITY window = `statement_timeout` + `connect_timeout`
+  (`ConnectConfig::client_liveness_window`, the ONE authority both drivers resolve
+  through, like `resolve_endpoint`): the async driver as a third `ReadDeadline`
+  mode (`ReadBound::Within` — a relative `timeout` re-armed per read, the absolute
+  reset/notification deadline still taking priority), the sync driver as the steady
+  `SO_RCVTIMEO` the socket rests at between verbs (per-read by nature). A
+  black-holed read then ELAPSES at the window into a classified `DriverError::Timeout`
+  (`is_disconnect()` true → a resilient consumer reconnects) instead of the kernel's
+  `tcp_retries2` hang — and it NEVER cuts a query the server allows, because the
+  server would already have aborted any query past `statement_timeout` (the `+
+  connect_timeout` margin covers the abort's network round-trip), and the per-read
+  inactivity semantics never trip a legitimately slow STREAM whose bytes keep the
+  window fresh. This bounds BOTH a DIRECT query and a POOLED connection's IN-FLIGHT
+  query (the pool bounds a CHECKOUT via `reset_session`; this bounds the query
+  running ON the checked-out connection — the two together leave no unbounded
+  window), and it makes the dead-KERNEL case snappier than keepalive's ~2.5 min
+  too. **NEVER falsely cuts a query the server ALLOWS (runtime-drift tracked):** the
+  connect-time window would go STALE if a runtime `SET statement_timeout` RAISED the
+  server budget (a query the server now permits would be client-cut — a real bug).
+  So the window is RE-DERIVED, never left stale: (1) the migration runner SUPPRESSES
+  the window for its whole run (a trusted bsql-controlled long op — a `CREATE INDEX
+  CONCURRENTLY` behind a `SET statement_timeout = 0` — is governed by its own
+  server-side budget, so bsql never client-cuts its own migration; async via
+  `ReadDeadline::suppress_scoped` RAII, sync via a socket read-timeout save/restore);
+  (2) the connection-level `simple_query` / `execute_sql` / `query_sql` OBSERVE an
+  executed top-level `SET`/`RESET statement_timeout` (the shared, pure
+  `statement_timeout_effect` classifier — cheap: `Unchanged` after a few-byte check
+  for any statement not starting with `SET`/`RESET`; the value parser handles PG's
+  duration forms `us`/`ms`/`s`/`min`/`h`/`d`) and re-derive the window (a raised
+  budget widens it, `RESET`/`RESET ALL` restores the connect baseline, and every
+  AMBIGUOUS form — `SET LOCAL`, `= DEFAULT`, an unparseable value — DISARMS the
+  window, the SAFE direction, never a false cut); (3) the pool `reset_session`
+  restores the window to the connect baseline (a runtime `SET` on one checkout never
+  leaks its window to the next). The window is a mutable atomic (async
+  `AtomicU64` ms + sentinel, one relaxed load per read) / a re-`setsockopt`'d
+  `SO_RCVTIMEO` (sync). The remaining false-cut residual is FUNDAMENTAL + narrow +
+  reported: a budget change bsql cannot OBSERVE — via `SELECT set_config(...)`,
+  dynamic `EXECUTE`, a `DO`/function body, a non-leading batch statement, or a `SET`
+  through a transaction-GUARD verb (which runs on `Core`, below the driver that owns
+  the window) — leaves the window LOOSE if it raised the budget (no false cut) but
+  STALE if a later hidden change lowered/disabled it (the only residual false-cut,
+  the same class every driver leaves to the app). **ZERO-COST + honest residual:** no `statement_timeout` → `client_liveness_window`
+  is `None` → the steady read is byte-identical to the historical unbounded one (a
+  fresh `None`-window `ReadDeadline` / a `None` `SO_RCVTIMEO`), because without a
+  declared query budget NO finite client deadline is safe (it would cut legitimate
+  long queries) — so that residual is fundamental, not a gap (a dead KERNEL is
+  still caught by keepalive; a live black-hole on a budget-less connection is the
+  same case libpq leaves to `statement_timeout` + cancel). Footprint-neutral: no
+  new `ConnectConfig` field (derived from the existing startup map + `connect_timeout`;
+  the 152 B pin is untouched); the async `Arc<ReadDeadline>` and the DataRow hot
+  path (`next_event`) are byte-identical (the window lives in the driver's socket
+  read, below the engine). Witnessed by the `--ignored` `direct_liveness` suites
+  (both drivers: a black-holed direct AND pooled-in-flight query is a bounded
+  classified `Timeout`; a mid-query FIN is a classified disconnect in ms; AND the
+  never-false-cut half — an under-budget query returns, an over-budget query on a
+  HEALTHY peer gets the SERVER's recoverable `57014` not the client `Timeout`, a
+  runtime `SET` RAISING the budget is not falsely cut, and a migration long op is
+  not client-cut) plus the offline
+  `client_liveness_window_is_derived_from_statement_timeout` /
+  `steady_window_bounds_a_read_without_an_armed_deadline` /
+  `statement_timeout_value_parsing` / `statement_timeout_effect_classification`
+  unit tests.
 - Transport (both drivers) is chosen by libpq's rule, centralized once in
   `core::resolve_endpoint`: an ABSOLUTE-PATH host (begins with `/`, e.g.
   `ConnectConfig::new("/tmp", …)`, `PGHOST=/var/run/postgresql`, or the DSN

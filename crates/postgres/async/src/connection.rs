@@ -54,7 +54,7 @@ use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
     resolve_endpoint, validate_startup_params, BorrowedRow, ConnectConfig, Diagnostics, DriverError,
     Endpoint, MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification,
-    QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
+    QueryResult, Redial, Row, Rows, SslMode, StatementTimeoutEffect, TypedNotification,
 };
 // Referenced only by the non-unix `Endpoint::Unix` reject arm in `build_wire`.
 #[cfg(not(unix))]
@@ -274,8 +274,11 @@ impl Connection {
         config: &ConnectConfig,
         diagnostics: &Diagnostics,
     ) -> Result<Self, DriverError> {
-        // The read-deadline cell shared with the socket the engine will own.
-        let read_deadline = Arc::new(ReadDeadline::new());
+        // The read-deadline cell shared with the socket the engine will own. It
+        // carries the steady-state client-liveness window derived from the
+        // configured `statement_timeout` (`None` when unset), so a black-holed
+        // in-flight query is bounded WITHOUT cutting a query the server allows.
+        let read_deadline = Arc::new(ReadDeadline::new(config.client_liveness_window()));
         // Dial the chosen transport (TCP or unix) and build the wire. No
         // dial-only timeout: the caller's single outer budget bounds the whole
         // sequence, so a black-hole dial elapses into `DriverError::Timeout`
@@ -535,8 +538,8 @@ impl Connection {
         // The in-memory fake is plaintext by construction — no socket, no TLS.
         let encrypted = wire.is_encrypted();
         // The fake never blocks, so it ignores the read deadline; a fresh disarmed
-        // cell satisfies the struct invariant.
-        let read_deadline = Arc::new(ReadDeadline::new());
+        // cell with no steady window satisfies the struct invariant.
+        let read_deadline = Arc::new(ReadDeadline::new(None));
         let user = Ident::try_from_str("bsql_testkit")
             .map_err(|_| DriverError::Config("invalid testkit user name"))?;
         let (mut engine, live) = engine::open_owned(wire, &user, None, &[], Credentials::Trust)
@@ -589,29 +592,38 @@ impl Connection {
     }
 
     /// Issue a simple query, returning the command tag string.
-    pub fn simple_query<'a>(
-        &'a mut self,
-        sql: &'a str,
-    ) -> impl Future<Output = Result<String, DriverError>> + 'a {
-        self.core.simple_query(sql)
+    ///
+    /// A successful top-level `SET`/`RESET statement_timeout` here RE-DERIVES the
+    /// client-liveness window (see [`note_statement_timeout`](Self::note_statement_timeout))
+    /// so the window is never left stale below a runtime-raised server budget. The
+    /// returned future is `Send` (the anonymous `async fn` future leaks it, like
+    /// the delegating verbs), so the pool is unaffected.
+    pub async fn simple_query(&mut self, sql: &str) -> Result<String, DriverError> {
+        let result = self.core.simple_query(sql).await;
+        self.note_statement_timeout(sql, result.is_ok());
+        result
     }
 
     /// Execute a non-row runtime-SQL command, returning the affected-row count.
     /// The compile-checked counterpart is [`execute`](Self::execute).
-    pub fn execute_sql<'a>(
-        &'a mut self,
-        sql: &'a str,
-    ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
-        self.core.execute_sql(sql)
+    ///
+    /// A successful top-level `SET`/`RESET statement_timeout` here RE-DERIVES the
+    /// client-liveness window (see [`note_statement_timeout`](Self::note_statement_timeout)).
+    pub async fn execute_sql(&mut self, sql: &str) -> Result<u64, DriverError> {
+        let result = self.core.execute_sql(sql).await;
+        self.note_statement_timeout(sql, result.is_ok());
+        result
     }
 
     /// Run a row-returning runtime-SQL query (text result columns). The
     /// compile-checked, typed counterpart is [`query`](Self::query).
-    pub fn query_sql<'a>(
-        &'a mut self,
-        sql: &'a str,
-    ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
-        self.core.query_sql(sql)
+    ///
+    /// A successful top-level `SET`/`RESET statement_timeout` here RE-DERIVES the
+    /// client-liveness window (see [`note_statement_timeout`](Self::note_statement_timeout)).
+    pub async fn query_sql(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
+        let result = self.core.query_sql(sql).await;
+        self.note_statement_timeout(sql, result.is_ok());
+        result
     }
 
     /// Run a runtime-SQL query returning the first row, or [`DriverError::NoRows`].
@@ -922,17 +934,64 @@ impl Connection {
         )
     }
 
+    /// Re-derive the client-liveness window from an EXECUTED runtime SQL
+    /// statement's effect on `statement_timeout`, so the window is never left
+    /// STALE below a budget a runtime `SET` raised — which would cut a query the
+    /// server now allows (the ABSOLUTE mandate: never falsely cut a legit query).
+    ///
+    /// Only fires after a SUCCESSFUL verb (a failed `SET` changed nothing on the
+    /// server). Cheap on the common path: [`statement_timeout_effect`] is
+    /// `Unchanged` after a few-byte check for any statement not beginning with
+    /// `SET`/`RESET`. An ambiguous form (`SET LOCAL`, `= DEFAULT`, an unparseable
+    /// value) DISARMS the window (drops the client bound — the SAFE direction,
+    /// never a false cut). See [`statement_timeout_effect`] for the observed set
+    /// and the honest residual (a change made via `set_config` / dynamic SQL / a
+    /// transaction-guard verb is not observed and leaves the window loose, never
+    /// falsely tight).
+    ///
+    /// [`statement_timeout_effect`]: bsql_postgres_core::statement_timeout_effect
+    fn note_statement_timeout(&mut self, sql: &str, ok: bool) {
+        if !ok {
+            return;
+        }
+        match bsql_postgres_core::statement_timeout_effect(sql) {
+            StatementTimeoutEffect::Unchanged => {}
+            StatementTimeoutEffect::SetTo(budget_ms) => {
+                let window = bsql_postgres_core::window_from_statement_timeout_ms(
+                    budget_ms,
+                    self.redial.connect_timeout_secs(),
+                );
+                self.read_deadline.set_steady_window(window);
+            }
+            StatementTimeoutEffect::ResetToConnect => {
+                self.read_deadline
+                    .set_steady_window(self.read_deadline.connect_window());
+            }
+            StatementTimeoutEffect::Disarm => self.read_deadline.set_steady_window(None),
+        }
+    }
+
     // ── Transaction / session boundary primitives ───────────────────────────
 
     /// Apply every pending migration from `source` to the database, exactly
     /// once, in deterministic order — the runtime migration RUNNER. See
     /// [`bsql_postgres_core::migrate`] for the ledger / atomicity /
     /// checksum-drift / advisory-lock guarantees.
+    ///
+    /// The client-liveness window is SUPPRESSED for the whole run: a migration is
+    /// a TRUSTED bsql-controlled long operation (a `CREATE INDEX CONCURRENTLY`
+    /// behind a `SET statement_timeout = 0`), governed by its own server-side
+    /// budget, so bsql must never client-cut its own migration. The suppression is
+    /// restored on return OR a dropped future (RAII).
     pub async fn run_migrations<'a>(
         &'a mut self,
         source: impl Into<MigrationSource<'a>>,
     ) -> Result<MigrationReport, MigrationError> {
         use bsql_postgres_core::migrate;
+        // Suppress the client-liveness window for the trusted long op. A cloned
+        // `Arc` so the guard borrows a local, leaving `self.core` free below.
+        let deadline = std::sync::Arc::clone(&self.read_deadline);
+        let _window_suppressed = deadline.suppress_scoped();
         let source = source.into();
         // Acquire the migration lock by NON-BLOCKING poll with backoff: a waiter
         // holds no long-lived transaction, so a `CREATE INDEX CONCURRENTLY`
@@ -1142,6 +1201,13 @@ impl Connection {
         let guard = self.read_deadline.arm_scoped(deadline);
         let result = self.core.reset_session().await;
         drop(guard);
+        // `reset_session` ran `RESET ALL`, restoring `statement_timeout` to its
+        // connect-time value — so the client-liveness window returns to the
+        // connect baseline. A runtime `SET` made on THIS checkout cannot leak its
+        // (possibly larger/disarmed) window to the next checkout of a pooled
+        // connection.
+        self.read_deadline
+            .set_steady_window(self.read_deadline.connect_window());
         result
     }
 

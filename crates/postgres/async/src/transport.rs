@@ -30,9 +30,10 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -130,26 +131,119 @@ impl AsyncWrite for Sock {
 /// the driver and the socket hold an `Arc` to the SAME `ReadDeadline`, so the
 /// driver can arm a per-read deadline on a socket it cannot otherwise reach.
 ///
-/// `armed` is the hot-path gate: a relaxed-acquire bool load is effectively free,
-/// so a read on the steady-state query path (no deadline) pays only that load and
-/// never locks the mutex. Only [`recv_notification`] arms a deadline, and only
-/// then is the `at` mutex consulted.
+/// `armed` is the hot-path gate for the absolute deadline: a relaxed-acquire bool
+/// load is effectively free, so a read that arms no absolute deadline pays only
+/// that load and never locks the mutex. Only [`recv_notification`] /
+/// [`reset_session`](crate::Connection::reset_session) arm the absolute deadline,
+/// and only then is the `at` mutex consulted.
+///
+/// `steady_window_ms` is the always-on, MUTABLE per-read inactivity bound for the
+/// steady-state query path (the client-liveness window): the milliseconds a plain
+/// query read may sit silent before it elapses, or the sentinel [`NO_WINDOW`]
+/// (`u64::MAX`) for the historical UNBOUNDED read. It starts at the connect-time
+/// window (`Some` when the consumer configured a server-side `statement_timeout`,
+/// see [`ConnectConfig::client_liveness_window`]) and is RE-DERIVED when the driver
+/// observes a runtime `SET statement_timeout` and SUPPRESSED for the migration
+/// runner (a relaxed `AtomicU64` — one store between verbs, one relaxed load per
+/// read). A read consults it only after finding no absolute deadline armed; the
+/// absolute deadline (a bounded reset/notification round-trip) always takes
+/// PRIORITY, so those verbs keep their exact semantics.
+///
+/// `connect_window_ms` is the IMMUTABLE connect-time baseline (same encoding), the
+/// value a `RESET statement_timeout` / `RESET ALL` / pool `reset_session` restores.
 ///
 /// [`recv_notification`]: crate::Connection::recv_notification
+/// [`ConnectConfig::client_liveness_window`]: bsql_postgres_core::ConnectConfig::client_liveness_window
 pub(crate) struct ReadDeadline {
-    /// Hot-path gate: when `false`, reads take the deadline-free fast path.
+    /// Hot-path gate: when `false`, reads arm no ABSOLUTE deadline (they may
+    /// still take the steady-window path — see `steady_window_ms`).
     armed: AtomicBool,
     /// The armed absolute deadline. Read only when `armed` is observed `true`.
     at: Mutex<Option<Instant>>,
+    /// The mutable steady-state window in ms ([`NO_WINDOW`] = unbounded).
+    steady_window_ms: AtomicU64,
+    /// The immutable connect-time baseline in ms ([`NO_WINDOW`] = unbounded).
+    connect_window_ms: u64,
+}
+
+/// The `steady_window_ms` / `connect_window_ms` sentinel for "no client window"
+/// (the historical unbounded steady read). `u64::MAX` ms is ~5.8×10^8 years, far
+/// beyond any real budget (PG's ceiling is `i32::MAX` ms), so it can never be a
+/// real window value.
+const NO_WINDOW: u64 = u64::MAX;
+
+/// Encode an optional window `Duration` as its `steady_window_ms` value. A real
+/// window is always whole ms well below the sentinel (PG's ceiling + connect
+/// budget), so `min(NO_WINDOW - 1)` only guards against an absurd input, never a
+/// real one.
+fn window_to_ms(window: Option<Duration>) -> u64 {
+    match window {
+        None => NO_WINDOW,
+        Some(d) => match u64::try_from(d.as_millis()) {
+            Ok(ms) => ms.min(NO_WINDOW.saturating_sub(1)),
+            Err(_) => NO_WINDOW,
+        },
+    }
+}
+
+/// Decode a `steady_window_ms` / `connect_window_ms` value back to an optional
+/// window `Duration` ([`NO_WINDOW`] → `None`).
+fn ms_to_window(ms: u64) -> Option<Duration> {
+    if ms == NO_WINDOW {
+        None
+    } else {
+        Some(Duration::from_millis(ms))
+    }
+}
+
+/// The effective bound for one socket read, resolved by [`ReadDeadline::read_bound`].
+enum ReadBound {
+    /// No bound: the deadline-free fast path (an unbounded async read).
+    None,
+    /// An ABSOLUTE deadline (a bounded reset / notification round-trip).
+    At(Instant),
+    /// A per-read inactivity WINDOW (the steady-state liveness bound).
+    Within(Duration),
 }
 
 impl ReadDeadline {
-    /// A disarmed deadline.
-    pub(crate) fn new() -> Self {
+    /// A deadline with no absolute arming and the given connect-time steady
+    /// window (`None` for the historical unbounded steady read). The connect
+    /// window is BOTH the current window and the immutable baseline a later
+    /// `RESET` / pool reset restores.
+    pub(crate) fn new(steady_window: Option<Duration>) -> Self {
+        let ms = window_to_ms(steady_window);
         Self {
             armed: AtomicBool::new(false),
             at: Mutex::new(None),
+            steady_window_ms: AtomicU64::new(ms),
+            connect_window_ms: ms,
         }
+    }
+
+    /// The connect-time baseline window (what a `RESET` / pool reset restores).
+    pub(crate) fn connect_window(&self) -> Option<Duration> {
+        ms_to_window(self.connect_window_ms)
+    }
+
+    /// Re-derive the steady window to `window` (a runtime `SET statement_timeout`
+    /// observed, or a `RESET` back to the connect baseline). One relaxed store,
+    /// read by the socket on its next read — no lock (the window is advisory, and
+    /// a verb and its own socket read never run concurrently on one connection).
+    pub(crate) fn set_steady_window(&self, window: Option<Duration>) {
+        self.steady_window_ms
+            .store(window_to_ms(window), Ordering::Relaxed);
+    }
+
+    /// SUPPRESS the steady window for a trusted long operation (the migration
+    /// runner), returning an RAII guard that RESTORES the pre-suppression value on
+    /// drop (normal return OR a dropped future). While suppressed, a steady read is
+    /// UNBOUNDED — a migration's own server-side `statement_timeout` governs it, so
+    /// bsql never client-cuts its own trusted long op (a `CREATE INDEX
+    /// CONCURRENTLY` behind a `SET statement_timeout = 0`).
+    pub(crate) fn suppress_scoped(&self) -> RestoreWindowOnDrop<'_> {
+        let saved = self.steady_window_ms.swap(NO_WINDOW, Ordering::Relaxed);
+        RestoreWindowOnDrop { deadline: self, saved }
     }
 
     /// Arm an absolute read deadline. Sets the instant BEFORE flipping the gate
@@ -183,12 +277,20 @@ impl ReadDeadline {
         self.armed.store(false, Ordering::Release);
     }
 
-    /// The armed deadline, or `None` if disarmed (the hot path).
-    fn current(&self) -> Option<Instant> {
-        if !self.armed.load(Ordering::Acquire) {
-            return None;
+    /// The effective bound for the next read: the armed ABSOLUTE deadline if one
+    /// is armed (a bounded reset / notification round-trip — highest priority),
+    /// otherwise the steady-state inactivity WINDOW, otherwise none (the hot
+    /// path). A read consults the `at` mutex only when the `armed` gate is `true`.
+    fn read_bound(&self) -> ReadBound {
+        if self.armed.load(Ordering::Acquire)
+            && let Some(at) = *self.lock()
+        {
+            return ReadBound::At(at);
         }
-        *self.lock()
+        match ms_to_window(self.steady_window_ms.load(Ordering::Relaxed)) {
+            Some(w) => ReadBound::Within(w),
+            None => ReadBound::None,
+        }
     }
 
     /// Lock the instant cell, recovering a poisoned guard.
@@ -220,6 +322,25 @@ pub(crate) struct DisarmOnDrop<'a> {
 impl Drop for DisarmOnDrop<'_> {
     fn drop(&mut self) {
         self.deadline.disarm();
+    }
+}
+
+/// An RAII guard, minted by [`ReadDeadline::suppress_scoped`], that RESTORES the
+/// steady window it swapped out when it drops (a normal return, an unwind, OR a
+/// dropped future). It carries the saved encoded window, so a suppressed
+/// migration run always re-arms whatever window was in effect before it — the
+/// window can never be left suppressed by an early return or a cancelled future.
+#[must_use = "the guard restores the steady window on drop; binding it to `_` would restore immediately"]
+pub(crate) struct RestoreWindowOnDrop<'a> {
+    deadline: &'a ReadDeadline,
+    saved: u64,
+}
+
+impl Drop for RestoreWindowOnDrop<'_> {
+    fn drop(&mut self) {
+        self.deadline
+            .steady_window_ms
+            .store(self.saved, Ordering::Relaxed);
     }
 }
 
@@ -290,22 +411,40 @@ impl Transport for TokioSocket {
 
     #[inline]
     async fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> Result<usize, io::Error> {
-        match self.deadline.current() {
-            // Hot path: no deadline armed — a plain async read that yields real
-            // `Pending` until the socket is readable.
-            None => self.stream.read(buf).await,
-            // A deadline is armed (a notification wait): bound this read by the
-            // absolute deadline. The deadline lives IN the read, not in a timeout
+        match self.deadline.read_bound() {
+            // Hot path: no bound — a plain async read that yields real `Pending`
+            // until the socket is readable.
+            ReadBound::None => self.stream.read(buf).await,
+            // An ABSOLUTE deadline is armed (a notification wait / reset): bound
+            // this read by it. The deadline lives IN the read, not in a timeout
             // wrapping the verb future, so a fired deadline returns a `TimedOut`
-            // error the engine classifies as a quiet outcome (the linear token
-            // rides back) — it never drops the verb future and strands the token.
-            Some(at) => match tokio::time::timeout_at(at, self.stream.read(buf)).await {
+            // error the engine classifies (a quiet outcome for `recv_notification`,
+            // a fatal one for `reset_session` / a query) — it never drops the verb
+            // future and strands the linear token.
+            ReadBound::At(at) => match tokio::time::timeout_at(at, self.stream.read(buf)).await {
                 Ok(result) => result,
                 Err(_elapsed) => Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "read deadline elapsed",
                 )),
             },
+            // A steady-state inactivity WINDOW (a configured `statement_timeout`
+            // derived the client-liveness bound): bound THIS read by the relative
+            // window, re-armed per read — so it fires only on total silence longer
+            // than the window (a black-holed peer), never on a legitimately slow
+            // stream whose bytes keep the window fresh. A fired window is `TimedOut`,
+            // which the query pump treats as a FATAL transport error (no quiet arm
+            // there) → a classified `DriverError::Timeout`, and the connection is
+            // dropped — never the `tcp_retries2` / never-detected-black-hole hang.
+            ReadBound::Within(window) => {
+                match tokio::time::timeout(window, self.stream.read(buf)).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "read liveness window elapsed",
+                    )),
+                }
+            }
         }
     }
 
@@ -361,7 +500,7 @@ mod tests {
         let client = TcpStream::connect(addr).await.expect("connect");
         let (mut server, _peer) = listener.accept().await.expect("accept");
 
-        let deadline = Arc::new(ReadDeadline::new());
+        let deadline = Arc::new(ReadDeadline::new(None));
         let mut socket = TokioSocket::new(Sock::Tcp(client), Arc::clone(&deadline));
 
         // Arm a short deadline; the silent peer never sends, so the read must time
@@ -384,5 +523,40 @@ mod tests {
         let n = socket.read(&mut buf).await.expect("read after disarm");
         assert_eq!(n, 1);
         assert_eq!(buf.first().copied(), Some(b'x'));
+    }
+
+    #[tokio::test]
+    async fn steady_window_bounds_a_read_without_an_armed_deadline() {
+        // A steady-state inactivity window is armed via the immutable field (no
+        // `arm`), so a read over a silent peer with NO absolute deadline still
+        // times out — the black-hole bound. A read that receives data returns it
+        // (the window is a ceiling, not a delay).
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let (mut server, _peer) = listener.accept().await.expect("accept");
+
+        let deadline = Arc::new(ReadDeadline::new(Some(Duration::from_millis(120))));
+        let mut socket = TokioSocket::new(Sock::Tcp(client), Arc::clone(&deadline));
+
+        // No `arm`: only the immutable steady window is in effect. A silent peer
+        // must make the read elapse into a `TimedOut` (a fatal transport error on
+        // the query path — never the historical unbounded hang).
+        let mut buf = [0u8; 16];
+        match socket.read(&mut buf).await {
+            Err(e) => assert!(
+                TokioSocket::is_would_block(&e),
+                "an elapsed steady window must surface as a timed-out read, got {e:?}",
+            ),
+            Ok(n) => panic!("expected a timed-out read, got Ok({n})"),
+        }
+
+        // A peer that speaks inside the window returns its bytes — the window
+        // never breaks a live connection.
+        server.write_all(b"y").await.expect("server write");
+        server.flush().await.expect("server flush");
+        let n = socket.read(&mut buf).await.expect("read within window");
+        assert_eq!(n, 1);
+        assert_eq!(buf.first().copied(), Some(b'y'));
     }
 }
