@@ -102,8 +102,9 @@ impl CancelToken {
         // TLS handshake the connection did — one authority, no drift.
         let config = self.redial.rebuild_config();
         // The cancel never reads a reply and runs no steady-state queries, so a
-        // fresh disarmed deadline with no steady window suffices.
-        let deadline = Arc::new(ReadDeadline::new(None));
+        // fresh disarmed deadline with no steady window suffices (it never observes
+        // a runtime `SET`, so its `connect_timeout` margin is immaterial).
+        let deadline = Arc::new(ReadDeadline::new(None, config.connect_timeout_secs));
         // A detached, throwaway cancel dial carries no diagnostics sink — an SSL
         // downgrade here (should the cancel endpoint's TLS posture differ) keeps
         // the historical stderr warning, never a wired event.

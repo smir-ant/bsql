@@ -1037,24 +1037,35 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   CONCURRENTLY` behind a `SET statement_timeout = 0` — is governed by its own
   server-side budget, so bsql never client-cuts its own migration; async via
   `ReadDeadline::suppress_scoped` RAII, sync via a socket read-timeout save/restore);
-  (2) the connection-level `simple_query` / `execute_sql` / `query_sql` OBSERVE an
-  executed top-level `SET`/`RESET statement_timeout` (the shared, pure
-  `statement_timeout_effect` classifier — cheap: `Unchanged` after a few-byte check
-  for any statement not starting with `SET`/`RESET`; the value parser handles PG's
-  duration forms `us`/`ms`/`s`/`min`/`h`/`d`) and re-derive the window (a raised
-  budget widens it, `RESET`/`RESET ALL` restores the connect baseline, and every
-  AMBIGUOUS form — `SET LOCAL`, `= DEFAULT`, an unparseable value — DISARMS the
-  window, the SAFE direction, never a false cut); (3) the pool `reset_session`
-  restores the window to the connect baseline (a runtime `SET` on one checkout never
-  leaks its window to the next). The window is a mutable atomic (async
-  `AtomicU64` ms + sentinel, one relaxed load per read) / a re-`setsockopt`'d
-  `SO_RCVTIMEO` (sync). The remaining false-cut residual is FUNDAMENTAL + narrow +
-  reported: a budget change bsql cannot OBSERVE — via `SELECT set_config(...)`,
-  dynamic `EXECUTE`, a `DO`/function body, a non-leading batch statement, or a `SET`
-  through a transaction-GUARD verb (which runs on `Core`, below the driver that owns
-  the window) — leaves the window LOOSE if it raised the budget (no false cut) but
-  STALE if a later hidden change lowered/disabled it (the only residual false-cut,
-  the same class every driver leaves to the app). **ZERO-COST + honest residual:** no `statement_timeout` → `client_liveness_window`
+  (2) EVERY dynamic runtime-SQL verb — the raw-text (`simple_query`/`execute_sql`/
+  `query_sql`/`query_one_sql`/`query_opt_sql`), param (`query_params*`/
+  `execute_params`) and streaming (`query_each*`) families, on the CONNECTION AND
+  inside a `transaction` GUARD (the guard borrows the connection's window cell and
+  re-derives through the SAME `window_after_statement` authority — closing the
+  former tx-guard observation gap) — OBSERVES its executed SQL's effect on
+  `statement_timeout` (the shared, pure `statement_timeout_effect` classifier: a
+  precise top-level `SET`/`RESET` re-derives to the new budget — `Unchanged` after a
+  few-byte check for a non-`SET`/`RESET` statement, the value parser handles PG's
+  duration forms `us`/`ms`/`s`/`min`/`h`/`d`; an AMBIGUOUS `SET` — `SET LOCAL`,
+  `= DEFAULT`, an unparseable value — DISARMS; and DISARM-ON-SUSPICION drops the
+  window whenever the text mentions BOTH `set_config` AND `statement_timeout`, since
+  a `set_config('statement_timeout', …)` — the only in-session GUC-setter function,
+  reachable from a `SELECT`/`DO` block — cannot be pinned to a value, so dropping the
+  client bound is the only fail-safe choice; requiring `set_config` too keeps a query
+  that merely MENTIONS the GUC name as data from disarming); (3) the pool
+  `reset_session` restores the window to the connect baseline (a runtime change on
+  one checkout never leaks its window to the next). The window is a mutable atomic
+  (async `AtomicU64` ms + sentinel, one relaxed load per read) / a re-`setsockopt`'d
+  `SO_RCVTIMEO` (sync). The remaining false-cut residual is the THEORETICAL FLOOR:
+  ONLY a `statement_timeout` change whose executed SQL has NO contiguous textual
+  mention of the GUC name — a `SELECT my_func()` whose body calls `set_config`, an
+  `EXECUTE prepared_stmt` whose prepared body does, an adversarial
+  `set_config('statement' || '_timeout', …)` — can still leave the window stale-low.
+  PostgreSQL does NOT report `statement_timeout` via `ParameterStatus` (it is absent
+  from the hard-wired GUC_REPORT set), so a client CANNOT observe such a change
+  without a forbidden per-query round trip — this is a genuine limit, not a
+  discipline gap, and every OBSERVABLE form fails safe (disarm or re-derive-up).
+  **ZERO-COST + honest residual:** no `statement_timeout` → `client_liveness_window`
   is `None` → the steady read is byte-identical to the historical unbounded one (a
   fresh `None`-window `ReadDeadline` / a `None` `SO_RCVTIMEO`), because without a
   declared query budget NO finite client deadline is safe (it would cut legitimate
@@ -1069,10 +1080,15 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   classified `Timeout`; a mid-query FIN is a classified disconnect in ms; AND the
   never-false-cut half — an under-budget query returns, an over-budget query on a
   HEALTHY peer gets the SERVER's recoverable `57014` not the client `Timeout`, a
-  runtime `SET` RAISING the budget is not falsely cut, and a migration long op is
+  runtime `SET` RAISING the budget is not falsely cut, a `SET` inside a `transaction`
+  guard is not falsely cut (`tx_guard_set_raising_the_budget_is_not_falsely_cut`), a
+  `set_config`-raised budget is not falsely cut
+  (`set_config_raising_the_budget_is_not_falsely_cut`), and a migration long op is
   not client-cut) plus the offline
   `client_liveness_window_is_derived_from_statement_timeout` /
   `steady_window_bounds_a_read_without_an_armed_deadline` /
+  `observe_statement_timeout_re_derives_the_steady_window` /
+  `window_after_statement_maps_every_effect` /
   `statement_timeout_value_parsing` / `statement_timeout_effect_classification`
   unit tests.
 - Transport (both drivers) is chosen by libpq's rule, centralized once in

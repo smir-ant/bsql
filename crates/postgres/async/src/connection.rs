@@ -54,7 +54,7 @@ use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
     resolve_endpoint, validate_startup_params, BorrowedRow, ConnectConfig, Diagnostics, DriverError,
     Endpoint, MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification,
-    QueryResult, Redial, Row, Rows, SslMode, StatementTimeoutEffect, TypedNotification,
+    QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
 };
 // Referenced only by the non-unix `Endpoint::Unix` reject arm in `build_wire`.
 #[cfg(not(unix))]
@@ -278,7 +278,10 @@ impl Connection {
         // carries the steady-state client-liveness window derived from the
         // configured `statement_timeout` (`None` when unset), so a black-holed
         // in-flight query is bounded WITHOUT cutting a query the server allows.
-        let read_deadline = Arc::new(ReadDeadline::new(config.client_liveness_window()));
+        let read_deadline = Arc::new(ReadDeadline::new(
+            config.client_liveness_window(),
+            config.connect_timeout_secs,
+        ));
         // Dial the chosen transport (TCP or unix) and build the wire. No
         // dial-only timeout: the caller's single outer budget bounds the whole
         // sequence, so a black-hole dial elapses into `DriverError::Timeout`
@@ -538,8 +541,9 @@ impl Connection {
         // The in-memory fake is plaintext by construction — no socket, no TLS.
         let encrypted = wire.is_encrypted();
         // The fake never blocks, so it ignores the read deadline; a fresh disarmed
-        // cell with no steady window satisfies the struct invariant.
-        let read_deadline = Arc::new(ReadDeadline::new(None));
+        // cell with no steady window (and a nominal connect_timeout) satisfies the
+        // struct invariant.
+        let read_deadline = Arc::new(ReadDeadline::new(None, 0));
         let user = Ident::try_from_str("bsql_testkit")
             .map_err(|_| DriverError::Config("invalid testkit user name"))?;
         let (mut engine, live) = engine::open_owned(wire, &user, None, &[], Credentials::Trust)
@@ -579,12 +583,55 @@ impl Connection {
 
     // ── Delegated runtime-SQL verbs ─────────────────────────────────────────
     //
-    // Each RETURNS the shared `Core` verb's future directly (a `fn -> impl Future`
+    // The non-SQL verbs (`ping`) and the prepared-EXECUTE / typed `query!` verbs
+    // RETURN the shared `Core` verb's future directly (a `fn -> impl Future`
     // forwarder, no wrapping `async` block) so there is no extra forwarder
-    // state-machine layer — the awaited future is `Core`'s own, monomorphised over
-    // `TokioSocket`, byte-for-byte the work the driver did inline before. The bare
-    // RPIT leaks the future's `Send` (which the pool relies on), so no `+ Send` is
-    // added. `.await` call sites are unaffected.
+    // state-machine layer. The DYNAMIC runtime-SQL verbs (raw text + params +
+    // streaming + `prepare`) instead route through [`observed`](Self::observed),
+    // which awaits the `Core` verb and then RE-DERIVES the client-liveness window
+    // from the executed SQL's effect on `statement_timeout` — so a runtime
+    // `SET`/`RESET`/`set_config` can never leave the window stale below a raised
+    // budget (a false cut). The bare RPIT leaks the future's `Send` (which the pool
+    // relies on) in both shapes, so no `+ Send` is added and `.await` call sites are
+    // unaffected. Observation is NOT on the per-row hot path — it fires once per
+    // verb, after the round trip completes.
+
+    /// Run a DYNAMIC runtime-SQL verb, then OBSERVE its effect on the server's
+    /// `statement_timeout` so the client-liveness window is re-derived — never left
+    /// stale below a runtime-raised budget (which would falsely cut a query the
+    /// server now allows, the ABSOLUTE mandate). The ONE chokepoint EVERY dynamic
+    /// runtime-SQL verb routes through, so none can silently skip observation; the
+    /// build-time-constant typed `query!` verbs and the prepared-EXECUTE verbs (a
+    /// fixed plan; the SQL was already seen at [`prepare`](Self::prepare)) carry no
+    /// runtime GUC change and are deliberately NOT routed here.
+    ///
+    /// Observes only on SUCCESS (a failed `SET` changed nothing on the server) and
+    /// via the shared [`ReadDeadline::observe_statement_timeout`](crate::transport)
+    /// primitive — the same one the transaction guard uses, so a `SET` inside a
+    /// `transaction` closure re-derives identically.
+    fn observed<'a, T, F, Fut>(
+        &'a mut self,
+        sql: &'a str,
+        run: F,
+    ) -> impl Future<Output = Result<T, DriverError>> + 'a
+    where
+        F: FnOnce(&'a mut Core<TokioSocket>) -> Fut + 'a,
+        Fut: Future<Output = Result<T, DriverError>> + 'a,
+        T: 'a,
+    {
+        // Disjoint field borrows: the verb runs on `core`, the observation applies
+        // to the shared `read_deadline` cell — never the same field, so the split
+        // is a compiler fact.
+        let core = &mut self.core;
+        let read_deadline = &self.read_deadline;
+        async move {
+            let result = run(core).await;
+            if result.is_ok() {
+                read_deadline.observe_statement_timeout(sql);
+            }
+            result
+        }
+    }
 
     /// Round-trip a `Sync` to confirm the connection is live.
     pub fn ping(&mut self) -> impl Future<Output = Result<(), DriverError>> + '_ {
@@ -593,55 +640,61 @@ impl Connection {
 
     /// Issue a simple query, returning the command tag string.
     ///
-    /// A successful top-level `SET`/`RESET statement_timeout` here RE-DERIVES the
-    /// client-liveness window (see [`note_statement_timeout`](Self::note_statement_timeout))
-    /// so the window is never left stale below a runtime-raised server budget. The
-    /// returned future is `Send` (the anonymous `async fn` future leaks it, like
-    /// the delegating verbs), so the pool is unaffected.
-    pub async fn simple_query(&mut self, sql: &str) -> Result<String, DriverError> {
-        let result = self.core.simple_query(sql).await;
-        self.note_statement_timeout(sql, result.is_ok());
-        result
+    /// A successful top-level `SET`/`RESET`/`set_config` of `statement_timeout` here
+    /// RE-DERIVES the client-liveness window (see [`observed`](Self::observed)) so it
+    /// is never left stale below a runtime-raised server budget. The returned future
+    /// is `Send` (the RPIT leaks it), so the pool is unaffected.
+    pub fn simple_query<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl Future<Output = Result<String, DriverError>> + 'a {
+        self.observed(sql, move |c| c.simple_query(sql))
     }
 
     /// Execute a non-row runtime-SQL command, returning the affected-row count.
     /// The compile-checked counterpart is [`execute`](Self::execute).
     ///
-    /// A successful top-level `SET`/`RESET statement_timeout` here RE-DERIVES the
-    /// client-liveness window (see [`note_statement_timeout`](Self::note_statement_timeout)).
-    pub async fn execute_sql(&mut self, sql: &str) -> Result<u64, DriverError> {
-        let result = self.core.execute_sql(sql).await;
-        self.note_statement_timeout(sql, result.is_ok());
-        result
+    /// A successful top-level `SET`/`RESET`/`set_config` of `statement_timeout` here
+    /// RE-DERIVES the client-liveness window (see [`observed`](Self::observed)).
+    pub fn execute_sql<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
+        self.observed(sql, move |c| c.execute_sql(sql))
     }
 
     /// Run a row-returning runtime-SQL query (text result columns). The
     /// compile-checked, typed counterpart is [`query`](Self::query).
     ///
-    /// A successful top-level `SET`/`RESET statement_timeout` here RE-DERIVES the
-    /// client-liveness window (see [`note_statement_timeout`](Self::note_statement_timeout)).
-    pub async fn query_sql(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
-        let result = self.core.query_sql(sql).await;
-        self.note_statement_timeout(sql, result.is_ok());
-        result
+    /// A successful top-level `SET`/`RESET`/`set_config` of `statement_timeout` here
+    /// RE-DERIVES the client-liveness window (see [`observed`](Self::observed)).
+    pub fn query_sql<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
+        self.observed(sql, move |c| c.query_sql(sql))
     }
 
     /// Run a runtime-SQL query returning the first row, or [`DriverError::NoRows`].
-    /// The compile-checked counterpart is [`query_one`](Self::query_one).
+    /// The compile-checked counterpart is [`query_one`](Self::query_one). A
+    /// `set_config('statement_timeout', …)` here RE-DERIVES the client-liveness
+    /// window (see [`observed`](Self::observed)).
     pub fn query_one_sql<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<Row, DriverError>> + 'a {
-        self.core.query_one_sql(sql)
+        self.observed(sql, move |c| c.query_one_sql(sql))
     }
 
     /// Run a runtime-SQL query returning the first row if any. The compile-checked
-    /// typed counterpart is [`query_opt`](Self::query_opt).
+    /// typed counterpart is [`query_opt`](Self::query_opt). A
+    /// `set_config('statement_timeout', …)` here RE-DERIVES the client-liveness
+    /// window (see [`observed`](Self::observed)).
     pub fn query_opt_sql<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
-        self.core.query_opt_sql(sql)
+        self.observed(sql, move |c| c.query_opt_sql(sql))
     }
 
     /// Stream a runtime raw-SQL query's rows one at a time to `on_row` in CONSTANT
@@ -689,7 +742,7 @@ impl Connection {
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E> + 'a,
         E: 'a,
     {
-        self.core.query_each_sql(sql, on_row)
+        self.observed(sql, move |c| c.query_each_sql(sql, on_row))
     }
 
     /// Stream a runtime parameterised query's rows one at a time to `on_row` in
@@ -707,11 +760,20 @@ impl Connection {
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E> + 'a,
         E: 'a,
     {
-        self.core.query_each_params(sql, params, on_row)
+        self.observed(sql, move |c| c.query_each_params(sql, params, on_row))
     }
 
     /// Prepare a statement: `Parse` + `Describe` + `Sync`, recovering the result
     /// schema for later `Bind`+`Execute`.
+    ///
+    /// Deliberately NOT routed through [`observed`](Self::observed): `Parse` does not
+    /// EXECUTE the statement, so a prepared `SET statement_timeout = …` changes the
+    /// server budget by NOTHING — re-deriving the window from it would tighten the
+    /// window below the actual budget (a false cut). A `set_config` smuggled into a
+    /// prepared plan and run via [`query_prepared`](Self::query_prepared) is the
+    /// documented theoretical floor; the SQL-level `PREPARE … AS … set_config` +
+    /// `EXECUTE` path stays fail-safe because both ride the observed
+    /// [`execute_sql`](Self::execute_sql).
     pub fn prepare<'a>(
         &'a mut self,
         sql: &'a str,
@@ -739,13 +801,15 @@ impl Connection {
         self.core.execute_prepared(stmt, params)
     }
 
-    /// Prepare, query, and close a runtime SQL statement with params.
+    /// Prepare, query, and close a runtime SQL statement with params. A
+    /// `set_config('statement_timeout', …)` in the SQL text RE-DERIVES the
+    /// client-liveness window (see [`observed`](Self::observed)).
     pub fn query_params<'a, P: ParamsWriter>(
         &'a mut self,
         sql: &'a str,
         params: &'a P,
     ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
-        self.core.query_params(sql, params)
+        self.observed(sql, move |c| c.query_params(sql, params))
     }
 
     /// Like [`query_params`](Self::query_params), returning the first row.
@@ -754,7 +818,7 @@ impl Connection {
         sql: &'a str,
         params: &'a P,
     ) -> impl Future<Output = Result<Row, DriverError>> + 'a {
-        self.core.query_params_one(sql, params)
+        self.observed(sql, move |c| c.query_params_one(sql, params))
     }
 
     /// Like [`query_params`](Self::query_params), returning the first row if any.
@@ -763,16 +827,18 @@ impl Connection {
         sql: &'a str,
         params: &'a P,
     ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
-        self.core.query_params_opt(sql, params)
+        self.observed(sql, move |c| c.query_params_opt(sql, params))
     }
 
-    /// Prepare, execute, and close a runtime SQL statement with params.
+    /// Prepare, execute, and close a runtime SQL statement with params. A
+    /// `set_config('statement_timeout', …)` in the SQL text RE-DERIVES the
+    /// client-liveness window (see [`observed`](Self::observed)).
     pub fn execute_params<'a, P: ParamsWriter>(
         &'a mut self,
         sql: &'a str,
         params: &'a P,
     ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
-        self.core.execute_params(sql, params)
+        self.observed(sql, move |c| c.execute_params(sql, params))
     }
 
     /// Close a prepared statement, consuming it (use-after-close is a move error).
@@ -934,43 +1000,6 @@ impl Connection {
         )
     }
 
-    /// Re-derive the client-liveness window from an EXECUTED runtime SQL
-    /// statement's effect on `statement_timeout`, so the window is never left
-    /// STALE below a budget a runtime `SET` raised — which would cut a query the
-    /// server now allows (the ABSOLUTE mandate: never falsely cut a legit query).
-    ///
-    /// Only fires after a SUCCESSFUL verb (a failed `SET` changed nothing on the
-    /// server). Cheap on the common path: [`statement_timeout_effect`] is
-    /// `Unchanged` after a few-byte check for any statement not beginning with
-    /// `SET`/`RESET`. An ambiguous form (`SET LOCAL`, `= DEFAULT`, an unparseable
-    /// value) DISARMS the window (drops the client bound — the SAFE direction,
-    /// never a false cut). See [`statement_timeout_effect`] for the observed set
-    /// and the honest residual (a change made via `set_config` / dynamic SQL / a
-    /// transaction-guard verb is not observed and leaves the window loose, never
-    /// falsely tight).
-    ///
-    /// [`statement_timeout_effect`]: bsql_postgres_core::statement_timeout_effect
-    fn note_statement_timeout(&mut self, sql: &str, ok: bool) {
-        if !ok {
-            return;
-        }
-        match bsql_postgres_core::statement_timeout_effect(sql) {
-            StatementTimeoutEffect::Unchanged => {}
-            StatementTimeoutEffect::SetTo(budget_ms) => {
-                let window = bsql_postgres_core::window_from_statement_timeout_ms(
-                    budget_ms,
-                    self.redial.connect_timeout_secs(),
-                );
-                self.read_deadline.set_steady_window(window);
-            }
-            StatementTimeoutEffect::ResetToConnect => {
-                self.read_deadline
-                    .set_steady_window(self.read_deadline.connect_window());
-            }
-            StatementTimeoutEffect::Disarm => self.read_deadline.set_steady_window(None),
-        }
-    }
-
     // ── Transaction / session boundary primitives ───────────────────────────
 
     /// Apply every pending migration from `source` to the database, exactly
@@ -1098,7 +1127,11 @@ impl Connection {
         // that borrow (and reads back whether a verb opened the transaction) so the
         // terminating COMMIT/ROLLBACK below can re-borrow `self.core`.
         let (outcome, opened) = {
-            let mut tx = Transaction { core: &mut self.core, begin_armed: false };
+            let mut tx = Transaction {
+                core: &mut self.core,
+                read_deadline: &self.read_deadline,
+                begin_armed: false,
+            };
             let outcome = f(&mut tx).await;
             (outcome, tx.begin_armed)
         };
@@ -1583,6 +1616,13 @@ impl Connection {
 /// which is not `Debug` — the same reason [`CopyInWriter`] carries none.
 pub struct Transaction<'t> {
     core: &'t mut Core<TokioSocket>,
+    /// The connection's shared client-liveness window cell, so a `SET`/`RESET`/
+    /// `set_config` of `statement_timeout` issued INSIDE the transaction re-derives
+    /// the window through the SAME authority the connection-level verbs use (closes
+    /// the tx-guard observation gap — a transaction is a common place to bound a
+    /// long operation via `SET statement_timeout`). Borrowed for the body's scope;
+    /// the guard adds no owned state and no `Drop`.
+    read_deadline: &'t Arc<ReadDeadline>,
     /// `true` once the deferred `BEGIN` has been armed by the first verb. Armed
     /// exactly once, and ONLY from within a verb's poll (never out-of-band at
     /// `transaction()` entry) — which is what makes a transaction future dropped
@@ -1620,39 +1660,82 @@ impl Transaction<'_> {
         }
     }
 
+    /// [`armed`](Self::armed) PLUS the client-liveness-window observation the
+    /// connection-level [`Connection::observed`] applies — the SQL-carrying verbs
+    /// route through here so a `SET`/`RESET`/`set_config` of `statement_timeout`
+    /// issued INSIDE the transaction re-derives the window (never left stale below a
+    /// budget the transaction raised: the tx-guard observation gap, closed). Uses
+    /// the connection's shared [`ReadDeadline`] cell (the guard holds only a borrow
+    /// of it) via the SAME [`ReadDeadline::observe_statement_timeout`](crate::transport)
+    /// authority, so a `SET` inside vs outside a transaction re-derives identically.
+    /// Observes only on SUCCESS.
+    fn observed<'a, T, F, Fut>(
+        &'a mut self,
+        sql: &'a str,
+        make: F,
+    ) -> impl Future<Output = Result<T, DriverError>> + 'a
+    where
+        F: FnOnce(&'a mut Core<TokioSocket>) -> Fut + 'a,
+        Fut: Future<Output = Result<T, DriverError>> + 'a,
+        T: 'a,
+    {
+        let core = &mut *self.core;
+        let armed = &mut self.begin_armed;
+        let read_deadline = self.read_deadline;
+        async move {
+            if !*armed {
+                core.defer_begin();
+                *armed = true;
+            }
+            let result = make(core).await;
+            if result.is_ok() {
+                read_deadline.observe_statement_timeout(sql);
+            }
+            result
+        }
+    }
+
     // ── Delegated runtime-SQL verbs (data only) ─────────────────────────────
     //
-    // Each routes through `armed` (poll-time arm-once), so the first verb the
-    // body issues opens the transaction and every verb otherwise drives the same
-    // shared `Core` verb the `Connection` method drives — no extra state layer.
+    // The non-SQL `ping` routes through `armed` (poll-time arm-once); the DYNAMIC
+    // runtime-SQL verbs route through `observed` (arm-once PLUS window observation),
+    // so the first verb the body issues opens the transaction and a `SET
+    // statement_timeout` inside the transaction re-derives the window. Every verb
+    // otherwise drives the same shared `Core` verb the `Connection` method drives —
+    // no extra state layer beyond the window observation.
 
     /// Round-trip a `Sync` to confirm the connection is live.
     pub fn ping(&mut self) -> impl Future<Output = Result<(), DriverError>> + '_ {
         self.armed(|c| c.ping())
     }
 
-    /// Issue a simple query, returning the command tag string.
+    /// Issue a simple query, returning the command tag string. A `SET`/`RESET`/
+    /// `set_config` of `statement_timeout` here re-derives the client-liveness
+    /// window (the tx-guard peer of [`Connection::simple_query`]).
     pub fn simple_query<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<String, DriverError>> + 'a {
-        self.armed(move |c| c.simple_query(sql))
+        self.observed(sql, move |c| c.simple_query(sql))
     }
 
-    /// Execute a non-row runtime-SQL command, returning the affected-row count.
+    /// Execute a non-row runtime-SQL command, returning the affected-row count. A
+    /// `SET`/`RESET`/`set_config` of `statement_timeout` here re-derives the
+    /// client-liveness window.
     pub fn execute_sql<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
-        self.armed(move |c| c.execute_sql(sql))
+        self.observed(sql, move |c| c.execute_sql(sql))
     }
 
-    /// Run a row-returning runtime-SQL query (text result columns).
+    /// Run a row-returning runtime-SQL query (text result columns). A `set_config`
+    /// of `statement_timeout` here re-derives the client-liveness window.
     pub fn query_sql<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
-        self.armed(move |c| c.query_sql(sql))
+        self.observed(sql, move |c| c.query_sql(sql))
     }
 
     /// Run a runtime-SQL query returning the first row, or [`DriverError::NoRows`].
@@ -1660,7 +1743,7 @@ impl Transaction<'_> {
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<Row, DriverError>> + 'a {
-        self.armed(move |c| c.query_one_sql(sql))
+        self.observed(sql, move |c| c.query_one_sql(sql))
     }
 
     /// Run a runtime-SQL query returning the first row if any (typed peer:
@@ -1669,7 +1752,7 @@ impl Transaction<'_> {
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
-        self.armed(move |c| c.query_opt_sql(sql))
+        self.observed(sql, move |c| c.query_opt_sql(sql))
     }
 
     /// Stream a runtime raw-SQL query's rows in CONSTANT memory, inside the
@@ -1683,7 +1766,7 @@ impl Transaction<'_> {
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E> + 'a,
         E: 'a,
     {
-        self.armed(move |c| c.query_each_sql(sql, on_row))
+        self.observed(sql, move |c| c.query_each_sql(sql, on_row))
     }
 
     /// Stream a runtime parameterised query's rows in CONSTANT memory, inside the
@@ -1698,7 +1781,7 @@ impl Transaction<'_> {
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E> + 'a,
         E: 'a,
     {
-        self.armed(move |c| c.query_each_params(sql, params, on_row))
+        self.observed(sql, move |c| c.query_each_params(sql, params, on_row))
     }
 
     /// Prepare a statement: `Parse` + `Describe` + `Sync`.
@@ -1734,7 +1817,7 @@ impl Transaction<'_> {
         sql: &'a str,
         params: &'a P,
     ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
-        self.armed(move |c| c.query_params(sql, params))
+        self.observed(sql, move |c| c.query_params(sql, params))
     }
 
     /// Like [`query_params`](Self::query_params), returning the first row.
@@ -1743,7 +1826,7 @@ impl Transaction<'_> {
         sql: &'a str,
         params: &'a P,
     ) -> impl Future<Output = Result<Row, DriverError>> + 'a {
-        self.armed(move |c| c.query_params_one(sql, params))
+        self.observed(sql, move |c| c.query_params_one(sql, params))
     }
 
     /// Like [`query_params`](Self::query_params), returning the first row if any.
@@ -1752,7 +1835,7 @@ impl Transaction<'_> {
         sql: &'a str,
         params: &'a P,
     ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
-        self.armed(move |c| c.query_params_opt(sql, params))
+        self.observed(sql, move |c| c.query_params_opt(sql, params))
     }
 
     /// Prepare, execute, and close a runtime SQL statement with params.
@@ -1761,7 +1844,7 @@ impl Transaction<'_> {
         sql: &'a str,
         params: &'a P,
     ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
-        self.armed(move |c| c.execute_params(sql, params))
+        self.observed(sql, move |c| c.execute_params(sql, params))
     }
 
     /// Close a prepared statement, consuming it (use-after-close is a move error).

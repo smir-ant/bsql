@@ -401,6 +401,59 @@ fn runtime_set_raising_the_budget_is_not_falsely_cut() {
     );
 }
 
+/// The TX-GUARD peer of the headline witness: a `SET statement_timeout` issued
+/// INSIDE a `transaction` closure is OBSERVED (the guard re-derives the window
+/// through the SAME authority the connection-level verbs use), so a long query
+/// WITHIN the same transaction is NOT client-cut. Before the tx-guard observation
+/// gap was closed, the stale 2.3 s window would have falsely cut this 3 s query.
+#[test]
+#[ignore = "requires local PG"]
+fn tx_guard_set_raising_the_budget_is_not_falsely_cut() {
+    let mut conn =
+        Connection::connect(&healthy_config(Duration::from_millis(300), 2)).expect("connect");
+    let elapsed = conn
+        .transaction(|tx| {
+            // Raise the server budget to 30 s INSIDE the transaction.
+            tx.execute_sql("SET statement_timeout = '30s'")?;
+            // A 3 s query the server now allows; the stale 2.3 s connect-time window
+            // WOULD have client-cut it if the tx-guard did not observe the SET.
+            let start = Instant::now();
+            let row = tx.query_one_sql("SELECT pg_sleep(3), 9::int4")?;
+            assert_eq!(row.get_i32(1), Ok(Some(9)));
+            Ok(start.elapsed())
+        })
+        .expect("a tx-guard-raised budget must NOT be falsely client-cut");
+    assert!(
+        elapsed >= Duration::from_secs(3),
+        "the query must have run its full 3 s inside the transaction, took {elapsed:?}",
+    );
+}
+
+/// A `set_config` of `statement_timeout` that RAISES the budget is caught by
+/// disarm-on-suspicion: the window is dropped (fail-safe), so a following long
+/// query the raised budget allows is NOT falsely client-cut. Before the fix,
+/// `set_config` classified as `Unchanged` and left the stale 2.3 s window armed.
+#[test]
+#[ignore = "requires local PG"]
+fn set_config_raising_the_budget_is_not_falsely_cut() {
+    let mut conn =
+        Connection::connect(&healthy_config(Duration::from_millis(300), 2)).expect("connect");
+    let raised = conn
+        .query_one_sql("SELECT set_config('statement_timeout', '30s', false)")
+        .expect("set_config raises the budget");
+    assert_eq!(raised.get_str(0), Ok(Some("30s")));
+    let start = Instant::now();
+    let row = conn
+        .query_one_sql("SELECT pg_sleep(3), 9::int4")
+        .expect("a set_config-raised budget must NOT be falsely client-cut");
+    let elapsed = start.elapsed();
+    assert_eq!(row.get_i32(1), Ok(Some(9)));
+    assert!(
+        elapsed >= Duration::from_secs(3),
+        "the query must have run its full 3 s, took {elapsed:?}",
+    );
+}
+
 /// A migration that disables the timeout for a long operation is NOT client-cut.
 #[test]
 #[ignore = "requires local PG"]

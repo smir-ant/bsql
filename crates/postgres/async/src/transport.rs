@@ -164,6 +164,14 @@ pub(crate) struct ReadDeadline {
     steady_window_ms: AtomicU64,
     /// The immutable connect-time baseline in ms ([`NO_WINDOW`] = unbounded).
     connect_window_ms: u64,
+    /// The immutable `connect_timeout` (seconds) — the network-round-trip margin a
+    /// runtime `SET statement_timeout` re-derivation adds to the raised budget
+    /// ([`window_after_statement`](bsql_postgres_core::window_after_statement)).
+    /// Stored here so [`observe_statement_timeout`](Self::observe_statement_timeout)
+    /// is self-contained: BOTH the connection verbs and the transaction-guard verbs
+    /// (which hold only this shared cell, not the driver's config) re-derive the
+    /// window through the ONE shared authority with no extra plumbing.
+    connect_timeout_secs: u64,
 }
 
 /// The `steady_window_ms` / `connect_window_ms` sentinel for "no client window"
@@ -208,22 +216,44 @@ enum ReadBound {
 
 impl ReadDeadline {
     /// A deadline with no absolute arming and the given connect-time steady
-    /// window (`None` for the historical unbounded steady read). The connect
-    /// window is BOTH the current window and the immutable baseline a later
-    /// `RESET` / pool reset restores.
-    pub(crate) fn new(steady_window: Option<Duration>) -> Self {
+    /// window (`None` for the historical unbounded steady read) plus the
+    /// `connect_timeout` (seconds) a runtime re-derivation adds as its
+    /// network-round-trip margin. The connect window is BOTH the current window and
+    /// the immutable baseline a later `RESET` / pool reset restores.
+    pub(crate) fn new(steady_window: Option<Duration>, connect_timeout_secs: u64) -> Self {
         let ms = window_to_ms(steady_window);
         Self {
             armed: AtomicBool::new(false),
             at: Mutex::new(None),
             steady_window_ms: AtomicU64::new(ms),
             connect_window_ms: ms,
+            connect_timeout_secs,
         }
     }
 
     /// The connect-time baseline window (what a `RESET` / pool reset restores).
     pub(crate) fn connect_window(&self) -> Option<Duration> {
         ms_to_window(self.connect_window_ms)
+    }
+
+    /// Re-derive the steady window from an EXECUTED statement's observed effect on
+    /// the server's `statement_timeout` — so the window is never left STALE below a
+    /// budget a runtime `SET`/`set_config` raised (which would falsely cut a query
+    /// the server now allows). Routes through the ONE shared authority
+    /// [`window_after_statement`](bsql_postgres_core::window_after_statement), so
+    /// every observing verb — a connection verb OR a transaction-guard verb, which
+    /// holds only this shared cell — re-derives identically. Only the caller's
+    /// success gates it (a failed `SET` changed nothing on the server); a
+    /// `WindowAction::Unchanged` leaves the window untouched (the common path).
+    pub(crate) fn observe_statement_timeout(&self, sql: &str) {
+        match bsql_postgres_core::window_after_statement(
+            sql,
+            self.connect_timeout_secs,
+            self.connect_window(),
+        ) {
+            bsql_postgres_core::WindowAction::Unchanged => {}
+            bsql_postgres_core::WindowAction::Set(window) => self.set_steady_window(window),
+        }
     }
 
     /// Re-derive the steady window to `window` (a runtime `SET statement_timeout`
@@ -480,6 +510,7 @@ mod tests {
     //! notification wait times out from inside the read without breaking the
     //! connection.
 
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -500,7 +531,7 @@ mod tests {
         let client = TcpStream::connect(addr).await.expect("connect");
         let (mut server, _peer) = listener.accept().await.expect("accept");
 
-        let deadline = Arc::new(ReadDeadline::new(None));
+        let deadline = Arc::new(ReadDeadline::new(None, 0));
         let mut socket = TokioSocket::new(Sock::Tcp(client), Arc::clone(&deadline));
 
         // Arm a short deadline; the silent peer never sends, so the read must time
@@ -536,7 +567,7 @@ mod tests {
         let client = TcpStream::connect(addr).await.expect("connect");
         let (mut server, _peer) = listener.accept().await.expect("accept");
 
-        let deadline = Arc::new(ReadDeadline::new(Some(Duration::from_millis(120))));
+        let deadline = Arc::new(ReadDeadline::new(Some(Duration::from_millis(120)), 0));
         let mut socket = TokioSocket::new(Sock::Tcp(client), Arc::clone(&deadline));
 
         // No `arm`: only the immutable steady window is in effect. A silent peer
@@ -558,5 +589,32 @@ mod tests {
         let n = socket.read(&mut buf).await.expect("read within window");
         assert_eq!(n, 1);
         assert_eq!(buf.first().copied(), Some(b'y'));
+    }
+
+    #[test]
+    fn observe_statement_timeout_re_derives_the_steady_window() {
+        // The shared observation primitive BOTH the connection verbs and the
+        // transaction-guard verbs route through: a runtime `SET`/`RESET`/`set_config`
+        // re-derives the steady window; an unrelated statement leaves it untouched.
+        // Connect-time budget 300 ms + connect_timeout 2 s = 2300 ms baseline.
+        let d = ReadDeadline::new(Some(Duration::from_millis(2300)), 2);
+        let steady = || super::ms_to_window(d.steady_window_ms.load(Ordering::Relaxed));
+        assert_eq!(steady(), Some(Duration::from_millis(2300)), "connect baseline");
+
+        // A runtime SET RAISES the budget to 30 s → window = 30 s + 2 s = 32 s.
+        d.observe_statement_timeout("SET statement_timeout = '30s'");
+        assert_eq!(steady(), Some(Duration::from_millis(32_000)));
+
+        // An unrelated statement leaves the (raised) window exactly as it is.
+        d.observe_statement_timeout("SELECT 1");
+        assert_eq!(steady(), Some(Duration::from_millis(32_000)));
+
+        // A `set_config` of statement_timeout cannot be pinned → DISARM (unbounded).
+        d.observe_statement_timeout("SELECT set_config('statement_timeout','5min',false)");
+        assert_eq!(steady(), None, "set_config disarms the window (fail-safe)");
+
+        // A RESET restores the connect-time baseline (not the disarmed None).
+        d.observe_statement_timeout("RESET statement_timeout");
+        assert_eq!(steady(), Some(Duration::from_millis(2300)));
     }
 }

@@ -794,13 +794,19 @@ impl ConnectConfig {
     ///
     /// # Runtime drift (the window is re-derived, never left stale)
     ///
-    /// This is the CONNECT-TIME window. A runtime `SET statement_timeout` changes
-    /// the server budget out from under it; a window left stale BELOW a raised
-    /// budget would cut a query the server now allows. The drivers therefore
-    /// re-derive the window when they OBSERVE an explicit top-level `SET`/`RESET`
-    /// of `statement_timeout` (via [`statement_timeout_effect`]) and SUPPRESS it
-    /// for bsql's own trusted long operations (the migration runner) — so the
-    /// window is never shorter than the budget the server is actually enforcing.
+    /// This is the CONNECT-TIME window. A runtime change to `statement_timeout`
+    /// moves the server budget out from under it; a window left stale BELOW a
+    /// raised budget would cut a query the server now allows. The drivers therefore
+    /// re-derive the window from EVERY executed dynamic runtime-SQL statement (via
+    /// [`window_after_statement`] / [`statement_timeout_effect`]), on the connection
+    /// AND inside a `transaction` guard: an explicit top-level `SET`/`RESET`
+    /// re-derives to the new budget, and a `set_config('statement_timeout', …)` —
+    /// which cannot be pinned to a value — DISARMS the window (fail-safe). The
+    /// window is SUPPRESSED for bsql's own trusted long operations (the migration
+    /// runner). The only residual is a change with NO textual mention of the GUC
+    /// name in the executed SQL (a function body, an `EXECUTE` of a prepared plan) —
+    /// the theoretical floor, since PostgreSQL does not report `statement_timeout`
+    /// via `ParameterStatus`; see [`statement_timeout_effect`].
     #[must_use]
     pub fn client_liveness_window(&self) -> Option<Duration> {
         let ms: u64 = self
@@ -1142,16 +1148,45 @@ pub enum StatementTimeoutEffect {
 /// SET/RESET wins (PostgreSQL applies them in order), with ANY ambiguous piece
 /// forcing `Disarm`.
 ///
-/// LIMITS (honest, and all fail SAFE — never a false cut, only lost black-hole
-/// protection or a harmlessly-loose window): a `statement_timeout` set via
-/// `SELECT set_config(...)`, dynamic `EXECUTE`, a `DO`/function body, or a
-/// non-leading statement in a batch is NOT observed (window stays as-is — loose
-/// if the hidden change RAISED the budget); a `SET LOCAL` is `Disarm`ed
-/// (transaction scope is untrackable here). A `SET` reached only through the
-/// transaction-guard verbs (which run on `Core`, below the driver that owns the
-/// window) is likewise not observed.
+/// # Disarm-on-suspicion (the `set_config` catch)
+///
+/// A `statement_timeout` change made through `set_config('statement_timeout', …)`
+/// — the ONLY in-session GUC-setter FUNCTION, reachable from a `SELECT`, a `DO`
+/// block, or any statement — is not a `SET`, so the per-piece pass classifies it
+/// `Unchanged`. Trusting the window then would leave it STALE-LOW under a
+/// `set_config` RAISE — a false cut. So BEFORE the precise pass, if the whole text
+/// contains BOTH `set_config` AND `statement_timeout` (ASCII-case-insensitive),
+/// this DISARMS the window unconditionally: the `set_config` value cannot be
+/// pinned from the text (it may be computed, quoted oddly, or transaction-local
+/// via the third arg), so dropping the client bound is the only fail-SAFE choice —
+/// keepalive still bounds a dead kernel, and a false cut is impossible with no
+/// window. Requiring `set_config` too (not merely the GUC name) keeps a query that
+/// only MENTIONS `statement_timeout` as data (a `WHERE name = 'statement_timeout'`,
+/// a log row) from disarming — that stays `Unchanged`.
+///
+/// # The residual is the theoretical floor, not a discipline gap
+///
+/// What remains unobservable is a `statement_timeout` change whose executed SQL
+/// text contains NO contiguous mention of the GUC name: a `SELECT my_func()` whose
+/// body calls `set_config`, an `EXECUTE prepared_stmt` whose prepared body does, or
+/// an adversarial `set_config('statement' || '_timeout', …)`. PostgreSQL does NOT
+/// report `statement_timeout` via `ParameterStatus` (it is absent from the
+/// hard-wired GUC_REPORT set), so a client CANNOT learn of such a change without a
+/// per-query round trip. This is the theoretical limit — not closeable without
+/// server cooperation or a forbidden extra round trip — and it is the ONLY residual
+/// that can still leave the window stale-low; every observable form fails safe.
+/// A `SET LOCAL` is `Disarm`ed (transaction scope is untrackable here).
 #[must_use]
 pub fn statement_timeout_effect(sql: &str) -> StatementTimeoutEffect {
+    // Disarm-on-suspicion: a `set_config` of `statement_timeout` can move the
+    // budget to a value the text cannot pin, so drop the window (fail-SAFE) rather
+    // than trust one a raise would leave stale-low. `set_config` scanned first (the
+    // rarer token → the common query without it fails this fast and never scans for
+    // the GUC name). This overrides a same-batch precise `SetTo`, since a
+    // `set_config` later in the batch could be the effective value.
+    if contains_ascii_ci(sql, b"set_config") && contains_ascii_ci(sql, b"statement_timeout") {
+        return StatementTimeoutEffect::Disarm;
+    }
     let mut effect = StatementTimeoutEffect::Unchanged;
     for piece in sql.split(';') {
         match classify_one_statement(piece.trim()) {
@@ -1163,6 +1198,55 @@ pub fn statement_timeout_effect(sql: &str) -> StatementTimeoutEffect {
         }
     }
     effect
+}
+
+/// Whether `haystack` contains `needle` as an ASCII-case-insensitive substring,
+/// allocation-free (`to_ascii_lowercase` would allocate a `String` per query).
+///
+/// `needle` must be non-empty ASCII lowercase (`windows(0)` would panic, so the
+/// callers pass fixed non-empty literals). A haystack shorter than `needle` yields
+/// no windows → `false`. No indexing, no arithmetic — [`<[u8]>::windows`] and
+/// [`<[u8]>::eq_ignore_ascii_case`] are total.
+fn contains_ascii_ci(haystack: &str, needle: &[u8]) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+/// The window update an executed statement's [`StatementTimeoutEffect`] implies,
+/// resolved against the connect-time budget context — the ONE mapping authority
+/// both drivers (and both the connection-level verbs and the transaction-guard
+/// verbs) apply, so the effect→window derivation cannot drift between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowAction {
+    /// The statement did not observably touch `statement_timeout`: leave the
+    /// steady client-liveness window exactly as it is.
+    Unchanged,
+    /// Re-derive the steady window to this value (`None` = disarm / unbounded —
+    /// the historical steady read; a `Some` window is the black-hole bound).
+    Set(Option<Duration>),
+}
+
+/// Resolve the [`WindowAction`] an executed statement implies for the client-
+/// liveness window, given the connection's `connect_timeout` (for a runtime `SET`)
+/// and the connect-time baseline window (for a `RESET`). One authority for both
+/// drivers, so a `SET`/`RESET`/`set_config`/disarm never re-derives differently on
+/// async vs sync, nor between a connection verb and a transaction-guard verb.
+#[must_use]
+pub fn window_after_statement(
+    sql: &str,
+    connect_timeout_secs: u64,
+    connect_baseline: Option<Duration>,
+) -> WindowAction {
+    match statement_timeout_effect(sql) {
+        StatementTimeoutEffect::Unchanged => WindowAction::Unchanged,
+        StatementTimeoutEffect::SetTo(budget_ms) => {
+            WindowAction::Set(window_from_statement_timeout_ms(budget_ms, connect_timeout_secs))
+        }
+        StatementTimeoutEffect::ResetToConnect => WindowAction::Set(connect_baseline),
+        StatementTimeoutEffect::Disarm => WindowAction::Set(None),
+    }
 }
 
 /// Classify a SINGLE trimmed statement (no `;`). See [`statement_timeout_effect`].
@@ -1599,9 +1683,48 @@ mod tests {
         assert_eq!(e("SELECT 1"), E::Unchanged);
         assert_eq!(e("SET search_path = myschema"), E::Unchanged);
         assert_eq!(e("RESET search_path"), E::Unchanged);
-        assert_eq!(e("SELECT set_config('statement_timeout','0',false)"), E::Unchanged); // residual (loose = safe)
+        // Disarm-on-suspicion: a `set_config` of `statement_timeout` cannot be
+        // pinned from the text → DISARM (fail-safe), never a stale-low window.
+        assert_eq!(e("SELECT set_config('statement_timeout','300s',false)"), E::Disarm);
+        assert_eq!(e("select SET_CONFIG('statement_timeout', $1, false)"), E::Disarm); // case-insensitive
+        assert_eq!(
+            e("DO $$ BEGIN PERFORM set_config('statement_timeout','5min',false); END $$"),
+            E::Disarm, // `;` inside the block does not hide the suspicion (whole-text scan)
+        );
+        // A same-batch `set_config` overrides a precise `SET` (it could win) → Disarm.
+        assert_eq!(
+            e("SET statement_timeout='5s'; SELECT set_config('statement_timeout','300s',false)"),
+            E::Disarm,
+        );
+        // `set_config` of a DIFFERENT GUC does not disarm (no statement_timeout token).
+        assert_eq!(e("SELECT set_config('search_path','x',false)"), E::Unchanged);
+        // A query that MENTIONS statement_timeout as data (no set_config) keeps its
+        // window — the `set_config` requirement stops a data mention from disarming.
+        assert_eq!(e("SELECT * FROM audit WHERE guc = 'statement_timeout'"), E::Unchanged);
         // A value that merely mentions the word is not a false match.
         assert_eq!(e("SET application_name = 'statement_timeout'"), E::Unchanged);
+    }
+
+    #[test]
+    fn window_after_statement_maps_every_effect() {
+        use super::{window_after_statement as w, WindowAction as A};
+        let baseline = Some(Duration::from_millis(7_000));
+        // A precise runtime SET → new budget + connect_timeout (2 s here).
+        assert_eq!(
+            w("SET statement_timeout = '5s'", 2, baseline),
+            A::Set(Some(Duration::from_millis(7_000))), // 5s + 2s
+        );
+        // RESET → back to the connect-time baseline (not a fresh derivation).
+        assert_eq!(w("RESET statement_timeout", 2, baseline), A::Set(baseline));
+        // A `SET statement_timeout = 0` disables the budget → no client window.
+        assert_eq!(w("SET statement_timeout = 0", 2, baseline), A::Set(None));
+        // Disarm-on-suspicion (set_config) → drop the window (fail-safe).
+        assert_eq!(
+            w("SELECT set_config('statement_timeout','300s',false)", 2, baseline),
+            A::Set(None),
+        );
+        // An unrelated statement leaves the window exactly as it is.
+        assert_eq!(w("SELECT 1", 2, baseline), A::Unchanged);
     }
 
     #[test]
