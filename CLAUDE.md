@@ -82,6 +82,7 @@ cargo test -p bsql-postgres-async --test sq_live cancel_token_stops -- --ignored
 cargo test -p bsql-postgres-sync  --test sync_live cancel_token_stops -- --ignored # sync cancel witness (needs PG)
 cargo test -p bsql-postgres-async --test pool_liveness -- --ignored   # async pool dead-peer liveness (get() bounded, not a hang; PG behind a black-hole relay)
 cargo test -p bsql-postgres-sync  --test pool_liveness -- --ignored   # sync  pool dead-peer liveness (get() bounded, not a hang; PG behind a black-hole relay)
+cargo test -p bsql-postgres-async --test tls_fragmentation -- --ignored  # TLS byte-fragmentation reassembly gate (the owner's-burn regression net): a self-contained ephemeral SSL PG behind a 1/3-byte fragmenting relay; handshake + multi-record result + 300 KB record-spanning value + stream reassemble byte-exact, is_encrypted, zero panics/hangs. Skips cleanly if no initdb/openssl or run as root
 cargo test -p bsql-sqlite --test cancel              # SQLite interrupt witness (in-process, no PG)
 cargo test -p bsql-query-sqlite-fixture --features n1-detect --test n1_detect_sqlite  # SQLite N+1 witness (in-process)
 cargo test -p bsql-query-fixture --test query_live_async -- --ignored  # live query! (async, needs PG)
