@@ -15,8 +15,8 @@
 //! - `per_cell_owned` — `UserNamesOwned::decode` over the same row. Copies the
 //!   `text` cell into a `String`; the deliberate allocating contrast.
 //!
-//! Post-LTO codegen is inspected with `PKG=bsql-query-fixture
-//! scripts/asm-linked-diff.sh typed_decode`; see `BENCHMARKING.md`.
+//! Post-LTO codegen is inspected with the `asm-linked-diff` tooling on the
+//! `bench` branch (`PKG=bsql-query-fixture … typed_decode`).
 
 #![allow(
     missing_docs,

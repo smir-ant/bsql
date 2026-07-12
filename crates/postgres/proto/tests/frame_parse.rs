@@ -1,6 +1,6 @@
 //! Frame-header parser spec-conformance.
 //!
-//! Per reforge.md §4.11, a test exists only if it pins:
+//! A test exists only if it pins:
 //!
 //! - **(1) Functional spec-conformance** — externally observable API
 //!   behaviour on valid or invalid input matches the contract.
@@ -146,7 +146,7 @@ fn length_below_minimum_is_malformed() {
 /// Invariant (spec): `declared > MAX_FRAME_LEN_FIELD` → `FrameTooLarge`,
 /// with the attacker-chosen value round-tripped unchanged in the error.
 ///
-/// This is the structural DoS defence from reforge.md §53 (length-
+/// This is the structural DoS defence (length-
 /// amplification rejected before the buffer grows). The cap value is
 /// a wire-level commitment; a regression that clamped `declared` to
 /// the cap inside the error would hide attacker values from the

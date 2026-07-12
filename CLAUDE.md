@@ -5,8 +5,8 @@
 The theoretical-limit rebuild's core has landed: the compile-checked
 `query!` flagship, the PostgreSQL async + sync drivers, and the embedded
 SQLite backend all ship today, reachable through the single `bsql` umbrella
-crate. `reforge.md` (the original blueprint) and `CREDO.md` (its principles)
-are now **historical** — this file and the code are the source of truth.
+crate. This file and the code are the source of truth (the original design
+blueprint and principles are historical and no longer tracked in-repo).
 Load-bearing decisions for any new session:
 
 - **Query API = PURE SQL TEXT.** SQL lives as text in the compile-checked
@@ -19,7 +19,7 @@ Load-bearing decisions for any new session:
   text/binary drift).
 - **NO CI.** There are no GitHub Actions and the owner mandates none. Gates run
   locally via `cargo` + the `tools/devgates` crate (`deps_pin`,
-  `runtime_graph_pin`). Treat any `reforge.md` CI prescription (nightly CI,
+  `runtime_graph_pin`). Treat any historical CI prescription (nightly CI,
   cargo-deny CI) as superseded by local devgates.
 - **Compile-checked query API.** SQL references are validated at build time
   against the schema replayed from the consumer's migration `*.sql` by

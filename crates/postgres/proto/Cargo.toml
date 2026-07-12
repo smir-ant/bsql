@@ -18,7 +18,7 @@ autobenches = false
 # machine, zero I/O, zero allocator, zero async runtime. It runs
 # inside an async wrapper (`bsql-driver-postgres`, ships in 1e),
 # inside the proc-macro online client (Phase 2), or inside a
-# blocking ad-hoc test — identically. See reforge.md §7.1, §13.
+# blocking ad-hoc test — identically.
 
 [features]
 # DEFAULT-ON `scram`. The standard `cargo build/test -p bsql-postgres-proto`

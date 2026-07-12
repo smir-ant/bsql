@@ -270,7 +270,7 @@ disallowed_methods = "deny"
 #   - Why we can't write it ourselves in < 200 LoC.
 #   - `default-features = false` to minimise surface.
 #   - Pinned version, never `*`.
-# See reforge.md §4.4 / Part XI for the policy.
+# The rules above are the workspace dependency policy.
 #
 # INTERNAL path members are declared directly on each consumer's `[dependencies]`
 # (not here), and each carries its own inline justification. The `deps_pin`

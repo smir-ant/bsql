@@ -42,7 +42,7 @@ pub const READ_BUF_CAP: usize = 4096;
 /// is `READ_BUF_CAP - 1`. Anything larger is rejected at the
 /// header-parse step — the buffer is never asked to hold the body.
 /// This is the structural cap that turns "frame length amplification
-/// DoS" into reforge.md §53's STRUCTURALLY UNREACHABLE.
+/// DoS" into a STRUCTURALLY UNREACHABLE case.
 ///
 /// Hard-coded as a `u32` literal because the forbid-bundle refuses
 /// `as` conversions (including inside const blocks — `forbid` cannot

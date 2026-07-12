@@ -26,9 +26,9 @@
 //! into no-ops. The engine is no_std; this bench target compiles with std (the
 //! `[[bench]]` target's own std), exactly as the lib's dev/test targets do.
 //!
-//! Post-LTO codegen for these paths is inspected with `scripts/asm-linked-diff.sh`
-//! (it dumps this bench's fully-optimized binary); ns/op regressions are tracked
-//! with `scripts/bench-stable.sh`. See `BENCHMARKING.md`.
+//! Post-LTO codegen for these paths is inspected with the asm/ns measurement
+//! tooling (`asm-linked-diff.sh` dumps this bench's fully-optimized binary;
+//! `bench-stable.sh` tracks ns/op regressions) + methodology on the `bench` branch.
 
 #![allow(
     missing_docs,

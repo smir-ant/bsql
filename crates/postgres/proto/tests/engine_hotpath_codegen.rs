@@ -79,7 +79,8 @@
 //!
 //! # Machinery
 //!
-//! Reuses the project asm foundation (`scripts/asm-dump.sh`): emit release
+//! Reuses the project asm foundation (the `asm-dump` approach, on the `bench`
+//! branch): emit release
 //! assembly for the proto lib with
 //! `cargo rustc --release --lib -- --emit=asm`, find the newest emitted `.s`,
 //! and extract `next_event`'s instruction body between its definition label and

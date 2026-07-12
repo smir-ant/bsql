@@ -3775,7 +3775,7 @@ pub mod oids {
 #[cfg(test)]
 mod parse_tests {
     //! `parse_row_description` conformance per PG §55.7 + bad-path
-    //! classification. Category (1)/(B) per reforge.md §4.11 —
+    //! classification. Category (1)/(B) —
     //! spec-conformance table + tier-3 framing-error shield.
     //!
     //! Assertion style: every test uses `assert!(matches!(...))` +

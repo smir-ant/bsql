@@ -624,13 +624,8 @@ The numbers therefore cannot silently rot.
 - **[`CLAUDE.md`](CLAUDE.md)** — the live conventions, workspace layout,
   build/test commands, and safety invariants. Read this first.
 - **The code** — the authoritative behaviour.
-- **[`reforge.md`](reforge.md)** and **[`CREDO.md`](CREDO.md)** are
-  **historical** design records (the original v1.0 blueprint and its
-  principles). They are superseded by `CLAUDE.md` + the code; consult them
-  only for design rationale, never as current instructions.
-- **[`BENCHMARKING.md`](BENCHMARKING.md)** — the perf/codegen measurement
-  playbook. **[`deferred.md`](deferred.md)** is a frozen pre-rebuild
-  registry.
+- **The `bench` branch** — the benchmark harness, the perf/codegen measurement
+  methodology, and the reproducible results (kept off the code branch).
 
 ## License
 
