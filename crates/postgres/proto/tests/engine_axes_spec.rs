@@ -458,7 +458,13 @@ const ACTIVE_VERBS: usize = 23;
 /// `HandshakeProgress::ServerError` arm (raw body → `HandshakeOutcome::ServerError`)
 /// and the connect verb's `HandshakeOutcome::ServerError` arm
 /// (→ `EngineError::HandshakeServerError`) — both cold connect-failure landings.
-const COLD_CLASSIFIED_BRANCHES: usize = 58;
+/// 56 removes the two oversize-SQL `FrameTooLong` cold markers of
+/// `stage_fused_params` and the `prepare` verb: both now stream the whole `Parse`
+/// (SQL + parameter-type OID list) onto the send buffer via `build_parse` over a
+/// `SendFrame` with a back-patched length, so the explicit `u32::try_from(sql_len)`
+/// pre-check is subsumed by the streamed builder's own overflow landing
+/// (`frame_too_long`, already counted once at its definition).
+const COLD_CLASSIFIED_BRANCHES: usize = 56;
 /// `#[non_exhaustive]` attribute lines across `engine/`.
 /// Reproduce: `grep -rcE '^#\[non_exhaustive\]' crates/postgres/proto/src/engine/*.rs` (summed)
 const NON_EXHAUSTIVE_ATTRS: usize = 4;

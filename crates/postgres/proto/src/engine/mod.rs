@@ -223,6 +223,16 @@ pub struct Engine<'b, T> {
 /// phases, so a verb or accessor after a graceful close is a classified
 /// [`WrongPhase`], never a silent no-op.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Active(ActiveEngine) is DELIBERATELY inline — it is the connection's \
+              hot per-verb state (144 B IngestBuf + the schema/param/cache handles). \
+              Boxing it, as the lint suggests, would put the whole hot state behind a \
+              pointer and add an indirection to EVERY verb — a real hot-path regression \
+              to silence a cosmetic size-difference threshold. The two live phases \
+              overlay one connection, so the enum is sized by its larger phase by \
+              design; the Active/Connecting size gap is intrinsic, not accidental."
+)]
 enum Phase {
     /// Driving the startup/auth handshake.
     Connecting(ConnectingEngine),
@@ -343,6 +353,23 @@ impl<'b, T> Engine<'b, T> {
     #[inline]
     pub fn tx_status(&self) -> Result<TxStatus, WrongPhase> {
         Ok(self.phase.as_active()?.tx_status())
+    }
+
+    /// The parameter-type OIDs captured from the most recent statement
+    /// `Describe`'s `ParameterDescription` (the `prepare` path), in `$1..$n`
+    /// order — the types the server INFERRED (or the client DECLARED) for the
+    /// prepared statement's placeholders. Read at a `prepare`'s settle so the
+    /// driver retains them on the `PreparedStatement` and VERIFIES a later
+    /// `Bind`'s encoded parameter types against them (a fixed-plan statement
+    /// cannot coerce a differently-typed binary bind, so a wrong-typed `Bind`
+    /// would otherwise be silently reinterpreted). Empty when no statement
+    /// describe has run on this connection.
+    ///
+    /// Returns [`WrongPhase`] before the engine is active (see
+    /// [`backend_pid`](Self::backend_pid)).
+    #[inline]
+    pub fn current_param_oids(&self) -> Result<&[u32], WrongPhase> {
+        Ok(self.phase.as_active()?.current_param_oids())
     }
 
     /// Forget the per-connection prepared-statement cache (a no-op unless the

@@ -578,8 +578,14 @@ fn prepare_surfaces_recovered_schema() {
     let cap = run(script, |e, live| {
         let name = StmtName::try_from_str("s1").expect("stmt name");
         let mut cap = Cap::default();
-        let live = flatten(poll_once(e.prepare(live, &name, "SELECT id, name FROM t", cap.sink())))
-            .expect("prepare");
+        let live = flatten(poll_once(e.prepare(
+            live,
+            &name,
+            "SELECT id, name FROM t",
+            &[],
+            cap.sink(),
+        )))
+        .expect("prepare");
         let _ = live;
         cap
     });
@@ -602,7 +608,7 @@ fn prepare_nodata_surfaces_empty_row_schema() {
     let cap = run(script, |e, live| {
         let name = StmtName::try_from_str("s2").expect("stmt name");
         let mut cap = Cap::default();
-        let live = flatten(poll_once(e.prepare(live, &name, "UPDATE t SET x=$1", cap.sink())))
+        let live = flatten(poll_once(e.prepare(live, &name, "UPDATE t SET x=$1", &[], cap.sink())))
             .expect("prepare");
         let _ = live;
         cap
@@ -613,10 +619,10 @@ fn prepare_nodata_surfaces_empty_row_schema() {
 
 #[test]
 fn prepare_large_sql_does_not_overflow() {
-    // A >2 KiB prepared SQL: the Parse path streams the SQL onto the send buffer
-    // (build_parse_header + body), so it must NOT fail with FrameTooLong the way
-    // the old whole-frame build_parse would. The reply is a normal prepare
-    // completion; the verb reaches a clean Completed outcome.
+    // A >2 KiB prepared SQL: the Parse path streams the whole frame onto the send
+    // buffer via `build_parse` over a `SendFrame` (back-patched length), so it must
+    // NOT fail with FrameTooLong the way a bounded `WriteBuf` build would. The reply
+    // is a normal prepare completion; the verb reaches a clean Completed outcome.
     let big_sql = "SELECT id, name FROM t WHERE id = $1 -- ".to_string() + &"x".repeat(3000);
     let script = concat(&[
         handshake(),
@@ -628,7 +634,7 @@ fn prepare_large_sql_does_not_overflow() {
     let (completed, oids) = run(script, |e, live| {
         let name = StmtName::try_from_str("big").expect("stmt name");
         let mut cap = Cap::default();
-        let outcome = poll_once(e.prepare(live, &name, &big_sql, cap.sink()));
+        let outcome = poll_once(e.prepare(live, &name, &big_sql, &[], cap.sink()));
         let completed = matches!(
             outcome,
             Ok(Ok(Outcome {

@@ -33,9 +33,14 @@ use core::fmt;
 /// - StartupMessage worst case: ~305 bytes.
 /// - SASLInitialResponse worst case: ~147 bytes.
 /// - SASLResponse worst case: ~389 bytes.
-/// - SimpleQuery (`Q`) worst case: 2054 bytes.
-/// - **Parse (`P`) worst case: 2120 bytes** (tag + length + stmt_name
-///   + NUL + SQL + NUL + i16 param-type count). Dominates.
+/// - **SimpleQuery (`Q`) worst case: 2054 bytes.** Dominates.
+///
+/// `Parse` (`P`) and `Bind` (`B`) are NOT bounded here: both stream their
+/// UNBOUNDED bodies (SQL + parameter-type OID list; the parameter value block)
+/// straight onto the growable send buffer via a [`FrameSink`] with a back-patched
+/// length, so neither ever builds into this bounded buffer in production. The
+/// byte-twins build them into a `WriteBuf` only with SMALL inputs (well under the
+/// cap), so no `Parse`/`Bind` worst-case assert is needed — the same treatment.
 pub const MAX_OWNED_SEND_LEN: usize = 2176;
 
 /// Worst-case byte size of the **fixed prefix** of a PostgreSQL
@@ -127,72 +132,14 @@ const _: () = assert!(
      MAX_OWNED_SEND_LEN or shrink MAX_SQL_LEN in lockstep.",
 );
 
-/// Worst-case byte size of a PostgreSQL `Parse` (`'P'`) frame —
-/// Extended Query protocol.
-///
-/// Layout (PG §55.7 Parse):
-/// - Tag: `'P'` (1 byte)
-/// - Length: `u32` BE including itself
-/// - Statement name: up to [`crate::ident::MAX_PG_NAME_LEN`] bytes + NUL
-/// - SQL text: up to [`crate::ident::MAX_SQL_LEN`] bytes + NUL
-/// - Parameter type-count: `i16` (currently always 0 — no hints)
-/// - Parameter type OIDs: `i32` × count (currently 0)
-///
-/// # Drift guard
-///
-/// Bumping [`crate::ident::MAX_PG_NAME_LEN`] or
-/// [`crate::ident::MAX_SQL_LEN`] without growing
-/// [`MAX_OWNED_SEND_LEN`] fails the `const _` assert below.
-/// Parameter type hints are not yet supported; when they are, this
-/// size formula widens (+4 × MAX_PARAM_COUNT).
-pub const fn max_parse_message_size() -> usize {
-    1usize // tag 'P'
-        .saturating_add(4) // length prefix (includes itself)
-        .saturating_add(crate::ident::MAX_PG_NAME_LEN)
-        .saturating_add(1) // stmt_name NUL
-        .saturating_add(crate::ident::MAX_SQL_LEN)
-        .saturating_add(1) // sql NUL
-        .saturating_add(2) // i16 param-type count
-    // No per-param-type OIDs (count is zero — param hints not yet
-    // supported).
-}
-
-// Drift-pin: same pattern as SimpleQuery above. Parse without
-// param-type hints fits comfortably under MAX_OWNED_SEND_LEN; param
-// hints would require a corresponding cap bump.
-const _: () = assert!(
-    MAX_OWNED_SEND_LEN >= max_parse_message_size(),
-    "MAX_OWNED_SEND_LEN below worst-case Parse ('P') frame size — \
-     full-size stmt_name + SQL would overflow the caller's WriteBuf. \
-     Grow MAX_OWNED_SEND_LEN or shrink MAX_PG_NAME_LEN / MAX_SQL_LEN \
-     in lockstep.",
-);
-
-/// Drift-pin for `push_parse` Parse+Sync bundle. `push_parse`
-/// appends `SYNC_WIRE_BYTES` inline to `WriteBuf` after the Parse
-/// frame (bytes-only push), so the caller's buffer must fit both
-/// simultaneously. Without this assert, bumping `MAX_PG_NAME_LEN` /
-/// `MAX_SQL_LEN` could allow a Parse frame that fills the buffer,
-/// leaving no room for the trailing 5-byte Sync — a tier-4 "happens
-/// to fit" gap. With this assert: tier-1 build failure on drift.
-///
-/// Sibling to the Bind+Execute+Sync and Describe+Sync drift pins
-/// below.
-const _: () = assert!(
-    MAX_OWNED_SEND_LEN >= max_parse_message_size().saturating_add(5),
-    "MAX_OWNED_SEND_LEN below worst-case Parse+Sync bundle. \
-     push_parse appends Sync inline (bytes-only push). \
-     Grow MAX_OWNED_SEND_LEN or shrink MAX_PG_NAME_LEN / MAX_SQL_LEN \
-     in lockstep. `5` here is `SYNC_WIRE_BYTES.len()`.",
-);
-
-// The `Bind` (`'B'`) frame is DELIBERATELY not sized against [`WriteBuf`]: its
-// parameter block is UNBOUNDED (a multi-kilobyte `jsonb`, a large `bytea`, a
-// several-hundred-element array), so a fixed-capacity bound would reject
-// legitimate parameters. The Bind therefore streams its body straight onto the
-// growable send buffer with a back-patched length via the [`FrameSink`]
-// abstraction — exactly as the simple-query / Parse / `CopyData` bodies already
-// do — so there is no worst-case-Bind const to pin here and no cap on the
+// The `Parse` (`'P'`) and `Bind` (`'B'`) frames are DELIBERATELY not sized
+// against [`WriteBuf`]: their bodies are UNBOUNDED (Parse's SQL text + its
+// parameter-type OID list; Bind's parameter value block — a multi-kilobyte
+// `jsonb`, a large `bytea`, a several-hundred-element array), so a fixed-capacity
+// bound would reject legitimate frames. Both stream their whole frame straight
+// onto the growable send buffer with a back-patched length via the [`FrameSink`]
+// abstraction — exactly as the simple-query / `CopyData` bodies already do — so
+// there is no worst-case-Parse/Bind const to pin here and no cap on the SQL /
 // parameter block. (Execute, below, is a fixed 5-field frame and stays bounded.)
 
 /// Worst-case byte size of a PostgreSQL `Execute` (`'E'`) frame —

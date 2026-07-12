@@ -412,6 +412,44 @@ pub enum DriverError {
     /// (16 B) rather than a `String` (24 B): the payload is read-only once
     /// captured, so the spare `String` capacity word is dead weight on the error.
     PayloadParse(Box<str>),
+    /// An explicit `prepare`d statement was executed (`query_prepared` /
+    /// `execute_prepared`) with a parameter whose ENCODED type OID disagrees with
+    /// the type the SERVER inferred for that `$N` placeholder at prepare time.
+    ///
+    /// A prepared statement has a FIXED plan: its parameter types are pinned at
+    /// `Parse`, so the server CANNOT coerce a differently-typed binary bind
+    /// against it — it would read the bytes AS the pinned type (a silent
+    /// reinterpretation for two types of the same wire width). The driver
+    /// therefore VERIFIES the caller's `<P as ParamsWriter>::OIDS` against the
+    /// statement's server-inferred parameter types BEFORE sending the `Bind`, and
+    /// rejects a mismatch loudly here — no wire round trip, and the connection is
+    /// untouched (fix the parameter type and retry on the SAME connection). This
+    /// is STRICTER than the dynamic `query_params` path (whose per-call `Parse`
+    /// re-declares the types, so the server applies normal coercion): a fixed plan
+    /// admits no coercion, so a strict-equality check is the only sound verification.
+    /// An `unspecified` (OID `0`) type on EITHER side — an `EnumLabel` the client
+    /// left to inference, or a parameter the server could not infer — is not
+    /// verifiable and is passed through (best-effort), never falsely rejected.
+    ParamTypeMismatch {
+        /// Zero-based index of the offending `$N` parameter (`$1` is index `0`).
+        index: usize,
+        /// The type OID the server inferred for this parameter at prepare time —
+        /// what the fixed plan requires.
+        expected: u32,
+        /// The type OID the caller's parameter encoded — what was bound.
+        found: u32,
+    },
+    /// An explicit `prepare`d statement was executed with a parameter tuple whose
+    /// arity disagrees with the number of `$N` placeholders the prepared statement
+    /// declares. Caught client-side before the `Bind` (the server would otherwise
+    /// reject the mismatched Bind), so no round trip is wasted and the connection
+    /// is untouched — fix the tuple arity and retry.
+    ParamCountMismatch {
+        /// Number of parameters the prepared statement declares.
+        expected: usize,
+        /// Number of parameters the caller's tuple supplied.
+        found: usize,
+    },
 }
 
 // Footprint pin: a sum type whose size is set by its widest variant plus the
@@ -517,7 +555,11 @@ impl DriverError {
             | Self::TooManyColumns { .. }
             | Self::PoolTimeout
             | Self::Column(_)
-            | Self::PayloadParse(_) => false,
+            | Self::PayloadParse(_)
+            // A client-side parameter-type / arity rejection: caught BEFORE any
+            // Bind, so the connection is untouched — fix the parameter and retry.
+            | Self::ParamTypeMismatch { .. }
+            | Self::ParamCountMismatch { .. } => false,
         }
     }
 
@@ -590,6 +632,15 @@ impl fmt::Display for DriverError {
             Self::PayloadParse(payload) => {
                 write!(f, "notification payload did not parse into the requested type: {payload:?}")
             }
+            Self::ParamTypeMismatch { index, expected, found } => write!(
+                f,
+                "prepared-statement parameter ${} has type OID {expected} but a value of type OID {found} was bound; a prepared statement's parameter types are fixed at prepare time and cannot coerce a differently-typed value",
+                index.saturating_add(1)
+            ),
+            Self::ParamCountMismatch { expected, found } => write!(
+                f,
+                "prepared statement declares {expected} parameter(s) but {found} were bound"
+            ),
         }
     }
 }
@@ -624,7 +675,9 @@ impl std::error::Error for DriverError {
             | Self::TooManyRows
             | Self::TooManyColumns { .. }
             | Self::PoolTimeout
-            | Self::PayloadParse(_) => None,
+            | Self::PayloadParse(_)
+            | Self::ParamTypeMismatch { .. }
+            | Self::ParamCountMismatch { .. } => None,
         }
     }
 }

@@ -95,7 +95,9 @@ use alloc::vec::Vec;
 use super::{Event, IngestBuf, IngestCommitOverflow, IngestFull};
 use crate::action::TxStatus;
 use crate::command_tag::{parse_command_tag_bytes, CommandTag};
-use crate::decode::{parse_column_names, parse_copy_response_header, parse_row_description};
+use crate::decode::{
+    parse_column_names, parse_copy_response_header, parse_param_description, parse_row_description,
+};
 use crate::frame::{HeaderParse, HEADER_LEN};
 use crate::narrow::usize_from_u32;
 use crate::sensitive::Sensitive;
@@ -374,6 +376,15 @@ pub struct ActiveEngine {
     col_oids: Vec<u32>,
     /// Per-column names of the current statement's `RowDescription`.
     col_names: Vec<String>,
+    /// Parameter-type OIDs from the current statement `Describe`'s
+    /// `ParameterDescription` (`$1..$n` order) — the types the server INFERRED
+    /// (or the client DECLARED) for a prepared statement's `$N` placeholders.
+    /// Populated only during a statement `Describe` (the `prepare` path); empty
+    /// otherwise. Read via [`current_param_oids`](Self::current_param_oids) at the
+    /// prepare's settle so the driver can retain them on the
+    /// `PreparedStatement` and VERIFY a later `Bind`'s encoded parameter types
+    /// against them. Cold — never touched by the `DataRow` hot arm.
+    param_oids: Vec<u32>,
     /// The most recent statement's `CommandComplete` tag.
     command_tag: Option<CommandTag>,
     /// The `server_version` GUC captured from the startup `ParameterStatus`
@@ -437,14 +448,17 @@ pub struct ActiveEngine {
 
 // Stack footprint of the active handle: the carried-forward `IngestBuf` (144)
 // dominates, plus the pid/secret/tx-status scalars, the `Option<Box<…>>` /
-// `Vec` handles (schema, oversize prefix, the Sub-C accumulator, the prepared-
-// statement-name cache), the `command_tag`, the captured `server_version`
+// `Vec` handles (result-schema OIDs + names, the prepared-statement parameter
+// OIDs, oversize prefix, the Sub-C accumulator, the prepared-statement-name
+// cache), the `command_tag`, the captured `server_version`
 // (`Option<String>`, 24 B — the version text itself is off-stack behind the
 // `String`), and the fused-prelude pair (`Option<&'static str>` + a 1-byte
-// `bool`). The result-schema, oversize, and cached-name bytes
+// `bool`). The result-schema, parameter-OID, oversize, and cached-name bytes
 // live off-stack behind those handles. A field addition lands here as a reviewed
-// footprint drift.
-crate::wire_pin!(ActiveEngine, size = 368, align = 8);
+// footprint drift — the `param_oids: Vec<u32>` capture (a prepared statement's
+// server-inferred parameter types, retained for the `Bind` type check) is the
+// +24 B from 368.
+crate::wire_pin!(ActiveEngine, size = 392, align = 8);
 
 impl ActiveEngine {
     /// Construct the active engine at handshake completion, carrying the
@@ -468,6 +482,7 @@ impl ActiveEngine {
             oversize_accum: Vec::new(),
             col_oids: Vec::new(),
             col_names: Vec::new(),
+            param_oids: Vec::new(),
             command_tag: None,
             server_version,
             parsed_statements: Vec::new(),
@@ -542,6 +557,16 @@ impl ActiveEngine {
     #[must_use]
     pub fn current_column_names(&self) -> &[String] {
         &self.col_names
+    }
+
+    /// Parameter-type OIDs from the current statement `Describe`'s
+    /// `ParameterDescription` (`$1..$n` order), or empty when none was observed
+    /// for the in-flight statement. Read at a `prepare`'s settle so the driver
+    /// retains the server-inferred parameter types on the `PreparedStatement`.
+    #[inline]
+    #[must_use]
+    pub fn current_param_oids(&self) -> &[u32] {
+        &self.param_oids
     }
 
     /// The most recent statement's typed `CommandComplete` tag, set just before
@@ -691,10 +716,18 @@ impl ActiveEngine {
     /// [`current_type_oids`](Self::current_type_oids) /
     /// [`current_column_names`](Self::current_column_names) at the describe's
     /// delivery, so a later `Bind`+`Execute` can thread the OIDs back in. Clears
-    /// the per-statement columns so a prior statement's schema cannot leak.
+    /// the per-statement columns AND parameter OIDs so a prior statement's schema
+    /// cannot leak — `param_oids` feeds a security check (a wrong-typed `Bind` is
+    /// rejected), so a stale value surviving into a later prepare's verify would
+    /// be a false pass; clearing here (NOT in
+    /// [`reset_columns`](Self::reset_columns), which a params-carrying `NoData`
+    /// prepare re-runs AFTER its `ParameterDescription`) makes
+    /// [`current_param_oids`](Self::current_param_oids) reflect ONLY this
+    /// statement.
     #[inline]
     pub fn begin_prepare(&mut self) {
         self.reset_columns();
+        self.param_oids.clear();
         self.state = ActiveState::ParseDescribeStmtAwaitingParseComplete;
     }
 
@@ -703,9 +736,12 @@ impl ActiveEngine {
     /// recovered result schema is surfaced via
     /// [`current_type_oids`](Self::current_type_oids) /
     /// [`current_column_names`](Self::current_column_names) at the describe's
-    /// delivery, before the trailing `ReadyForQuery` resets it.
+    /// delivery, before the trailing `ReadyForQuery` resets it. Clears
+    /// `param_oids` (see [`begin_prepare`](Self::begin_prepare)) so a prior
+    /// statement's parameter types cannot leak into this describe's capture.
     #[inline]
     pub fn begin_describe_statement(&mut self) {
+        self.param_oids.clear();
         self.state = ActiveState::DescribeStmtAwaitingParamDesc;
     }
 
@@ -1205,8 +1241,23 @@ impl ActiveEngine {
     }
 
     /// `DescribeStmtAwaitingParamDesc` — a statement `Describe` answers with
-    /// `ParameterDescription` first. Its parameter OIDs are not part of the
-    /// row-result observable, so the frame advances the phase silently.
+    /// `ParameterDescription` first. Its parameter-type OIDs are captured into
+    /// [`param_oids`](Self::param_oids) (surfaced via
+    /// [`current_param_oids`](Self::current_param_oids) at the prepare's settle)
+    /// so the driver retains them on the `PreparedStatement` for a later `Bind`'s
+    /// type verification, then the frame advances the phase silently. A malformed
+    /// `ParameterDescription` (short / negative count / trailing bytes) is a
+    /// framing desync — the same classified teardown as a malformed
+    /// `RowDescription`.
+    ///
+    /// `#[cold]` + `#[inline(never)]`: a statement `Describe`'s
+    /// `ParameterDescription` arrives ONLY on the prepare path, never during row
+    /// streaming, so the `parse_param_description` walk is kept OUT of
+    /// [`next_event`](Self::next_event)'s hot frame (the dispatch tree otherwise
+    /// inlines every `step_*` arm) — the same discipline as `begin_oversize` /
+    /// `step_drain_overcap`. Proven by the `engine_hotpath_codegen` ceiling.
+    #[cold]
+    #[inline(never)]
     fn step_describe_awaiting_param_desc(
         &mut self,
         tag: u8,
@@ -1214,10 +1265,14 @@ impl ActiveEngine {
         end: usize,
     ) -> ActiveOutcome {
         match tag {
-            T_PARAM_DESC => {
-                self.state = ActiveState::DescribeAwaitingRowDescOrNoData;
-                ActiveOutcome::Silent
-            }
+            T_PARAM_DESC => match parse_param_description(self.ingest.frame_body(start, end)) {
+                Some(oids) => {
+                    self.param_oids = oids;
+                    self.state = ActiveState::DescribeAwaitingRowDescOrNoData;
+                    ActiveOutcome::Silent
+                }
+                None => self.teardown(),
+            },
             T_ERROR => self.fail_recoverable(start, end),
             _ => self.teardown(),
         }
@@ -2168,6 +2223,7 @@ impl core::fmt::Debug for ActiveEngine {
             .field("tx_status", &self.tx_status)
             .field("state", &self.state)
             .field("n_columns", &self.col_oids.len())
+            .field("n_params", &self.param_oids.len())
             .finish_non_exhaustive()
     }
 }

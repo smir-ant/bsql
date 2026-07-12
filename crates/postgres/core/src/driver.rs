@@ -228,11 +228,57 @@ impl StmtNameBuf {
 /// consumes it by value, so a use after close is a compile error (E0382), not a
 /// runtime use-after-close. Each driver re-exports this type.
 ///
+/// It also retains `param_oids` — the parameter-type OIDs the SERVER inferred for
+/// the statement's `$N` placeholders (from the prepare's `ParameterDescription`).
+/// A prepared statement has a FIXED plan, so the server cannot coerce a
+/// differently-typed binary `Bind` against it; [`query_prepared`](Core::query_prepared)
+/// / [`execute_prepared`](Core::execute_prepared) therefore VERIFY the caller's
+/// encoded parameter types against these BEFORE binding, rejecting a mismatch
+/// with a classified [`DriverError::ParamTypeMismatch`] rather than letting the
+/// server silently reinterpret the bytes.
+///
 /// [`close_statement`]: Core::close_statement
 #[derive(Debug)]
 pub struct PreparedStatement {
     inner: WireStatement,
     column_names: Arc<[String]>,
+    /// Server-inferred parameter-type OIDs (`$1..$n` order), retained for the
+    /// pre-`Bind` type verification. Empty when the server reported none.
+    param_oids: Box<[u32]>,
+}
+
+impl PreparedStatement {
+    /// Verify the caller's encoded parameter types (`<P as ParamsWriter>::OIDS`)
+    /// against the server-inferred types this statement was prepared with.
+    ///
+    /// A prepared statement's parameter types are FIXED at `Parse`; the server
+    /// reads each `Bind` value AS the inferred type with no coercion, so a
+    /// wrong-typed binary bind of the same wire width is silently reinterpreted.
+    /// This closes that hole client-side: an arity or a per-parameter type
+    /// disagreement is a classified error returned BEFORE the `Bind`, so no wire
+    /// round trip is spent and the connection is untouched.
+    ///
+    /// STRICT EQUALITY (not the dynamic path's server-side coercion): a fixed plan
+    /// cannot coerce, so anything but an exact OID match (or an `unspecified` `0`
+    /// on either side — unverifiable, passed through) is a real mismatch.
+    fn verify_params<P: ParamsWriter>(&self) -> Result<(), DriverError> {
+        let declared = P::OIDS;
+        if declared.len() != self.param_oids.len() {
+            return Err(DriverError::ParamCountMismatch {
+                expected: self.param_oids.len(),
+                found: declared.len(),
+            });
+        }
+        for (index, (&expected, &found)) in self.param_oids.iter().zip(declared.iter()).enumerate() {
+            // `0` = `unspecified` on either side (an `EnumLabel` param the client
+            // leaves to inference, or a param the server could not infer): not a
+            // type, so not verifiable — pass through rather than falsely reject.
+            if expected != 0 && found != 0 && expected != found {
+                return Err(DriverError::ParamTypeMismatch { index, expected, found });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Capacity of the per-connection dynamic prepared-statement cache — the most
@@ -244,12 +290,22 @@ pub struct PreparedStatement {
 /// queries with headroom.
 const DYN_STMT_CACHE_CAP: usize = 32;
 
-/// One entry in the [`DynStmtCache`]: the SQL text plus, once the query has been
-/// prepared, its server-side prepared statement.
+/// One entry in the [`DynStmtCache`]: the (SQL text, parameter-type OIDs) key
+/// plus, once the query has been prepared, its server-side prepared statement.
 #[derive(Debug)]
 struct DynSlot {
-    /// The runtime SQL text this slot caches (the cache key).
+    /// The runtime SQL text this slot caches (half the cache key).
     sql: Box<str>,
+    /// The parameter-type OIDs (`<P as ParamsWriter>::OIDS`) the cached plan was
+    /// PREPARED with — the OTHER half of the key. A REUSE requires BOTH the SQL
+    /// text AND these OIDs to match, so a plan prepared for one parameter-type
+    /// tuple is NEVER reused for a different-typed bind of the same SQL text. That
+    /// would bind the new value's binary bytes to be decoded AS the prepared
+    /// type — a SILENT reinterpretation for two types of the same wire width
+    /// (int4/float4/date; int8/float8/timestamp), the exact hole the declared-OID
+    /// `Parse` closes on the FIRST sighting and this key closes on REUSE. Stored
+    /// as `&'static` (it points at the baked `const OIDS` array — no allocation).
+    param_oids: &'static [u32],
     /// `None` = PENDING: the SQL has been seen ONCE (run through the fused,
     /// unnamed 1-round-trip path) and is queued to prepare on its NEXT sighting.
     /// `Some` = READY: a named server-side statement to `Bind`+`Execute` (plan
@@ -257,10 +313,25 @@ struct DynSlot {
     prepared: Option<PreparedStatement>,
 }
 
-/// A bounded per-connection cache of DYNAMIC prepared statements, keyed on SQL
-/// text — driver-level plan reuse for the runtime `query_params` /
-/// `execute_params` family, the dynamic peer of the engine's compile-checked
-/// (typed) statement cache.
+/// A bounded per-connection cache of DYNAMIC prepared statements, keyed on the
+/// (SQL text, parameter-type OIDs) pair — driver-level plan reuse for the runtime
+/// `query_params` / `execute_params` family, the dynamic peer of the engine's
+/// compile-checked (typed) statement cache.
+///
+/// # Why the key includes the parameter-type OIDs, not just the SQL text
+///
+/// A cached plan is prepared with a specific parameter-type tuple (its `Parse`
+/// declares `<P as ParamsWriter>::OIDS`), and a `Bind` sends each value's binary
+/// bytes to be decoded AS that prepared type. Keying on SQL text ALONE would let
+/// the same SQL string bound with a DIFFERENT Rust parameter type reuse the plan,
+/// binding the new value's bytes to be reinterpreted as the prepared type — a
+/// SILENT wrong value for two types of the same wire width (`int4`/`float4`/`date`;
+/// `int8`/`float8`/`timestamp`). Including `P::OIDS` in the key makes such a call a
+/// DISTINCT cache entry (its own plan, prepared for its own types), so a reuse
+/// never crosses parameter types — the reuse-path peer of the first-sighting
+/// declared-OID `Parse`. (An `EnumLabel`'s `unspecified` OID `0` is shared across
+/// enum types, but the same SQL resolves the same enum from context, so a `0`-OID
+/// reuse is type-consistent by construction.)
 ///
 /// # Why prepare on the SECOND sighting, not the first
 ///
@@ -322,14 +393,21 @@ impl DynStmtCache {
         Self { slots: Vec::new() }
     }
 
-    /// The index of a READY slot for `sql`, if the query has a cached plan.
-    fn ready_index(&self, sql: &str) -> Option<usize> {
-        self.slots.iter().position(|s| s.prepared.is_some() && &*s.sql == sql)
+    /// The index of a READY slot for the (`sql`, `oids`) key, if the query has a
+    /// cached plan prepared for THIS parameter-type tuple. A slot with the same
+    /// SQL but different `param_oids` is NOT a hit (it would reinterpret the bind).
+    fn ready_index(&self, sql: &str, oids: &[u32]) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|s| s.prepared.is_some() && &*s.sql == sql && s.param_oids == oids)
     }
 
-    /// Whether `sql` is a PENDING slot (seen once, awaiting its second sighting).
-    fn is_pending(&self, sql: &str) -> bool {
-        self.slots.iter().any(|s| s.prepared.is_none() && &*s.sql == sql)
+    /// Whether the (`sql`, `oids`) key is a PENDING slot (seen once, awaiting its
+    /// second sighting for THIS parameter-type tuple).
+    fn is_pending(&self, sql: &str, oids: &[u32]) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.prepared.is_none() && &*s.sql == sql && s.param_oids == oids)
     }
 
     /// Take the prepared statement out of READY slot `idx` (leaving it PENDING)
@@ -363,28 +441,37 @@ impl DynStmtCache {
     /// this is an in-place `None -> Some` that never needs to evict; the fallback
     /// installs a fresh READY slot only for the architecturally-dead case where
     /// the pending slot vanished.
-    fn promote(&mut self, sql: &str, stmt: PreparedStatement) {
-        match self.slots.iter_mut().find(|s| s.prepared.is_none() && &*s.sql == sql) {
+    fn promote(&mut self, sql: &str, oids: &'static [u32], stmt: PreparedStatement) {
+        match self
+            .slots
+            .iter_mut()
+            .find(|s| s.prepared.is_none() && &*s.sql == sql && s.param_oids == oids)
+        {
             Some(s) => s.prepared = Some(stmt),
             None => {
                 self.make_room();
                 if self.slots.len() < DYN_STMT_CACHE_CAP {
-                    self.slots.push(DynSlot { sql: Box::from(sql), prepared: Some(stmt) });
+                    self.slots.push(DynSlot {
+                        sql: Box::from(sql),
+                        param_oids: oids,
+                        prepared: Some(stmt),
+                    });
                 }
             }
         }
     }
 
-    /// Note a FIRST sighting of `sql` as PENDING (its fused run just succeeded),
-    /// evicting the oldest PENDING slot if the cache is full. A no-op if `sql` is
-    /// already tracked.
-    fn note_pending(&mut self, sql: &str) {
-        if self.slots.iter().any(|s| &*s.sql == sql) {
+    /// Note a FIRST sighting of the (`sql`, `oids`) key as PENDING (its fused run
+    /// just succeeded), evicting the oldest PENDING slot if the cache is full. A
+    /// no-op if the key is already tracked (the same SQL with DIFFERENT param OIDs
+    /// is a DISTINCT key, so it gets its own slot — never a cross-type reuse).
+    fn note_pending(&mut self, sql: &str, oids: &'static [u32]) {
+        if self.slots.iter().any(|s| &*s.sql == sql && s.param_oids == oids) {
             return;
         }
         self.make_room();
         if self.slots.len() < DYN_STMT_CACHE_CAP {
-            self.slots.push(DynSlot { sql: Box::from(sql), prepared: None });
+            self.slots.push(DynSlot { sql: Box::from(sql), param_oids: oids, prepared: None });
         }
     }
 
@@ -842,7 +929,39 @@ impl<S: Transport<Error = io::Error>> Core<S> {
 
     /// Prepare a statement: `Parse` + `Describe` + `Sync`, recovering the result
     /// schema for later `Bind`+`Execute`.
+    ///
+    /// The explicit-handle path declares NO parameter-type OIDs (the server infers
+    /// each `$N` from the SQL context), because the parameter types are only known
+    /// at a later `Bind`. The DYNAMIC plan-cache PROMOTE uses
+    /// [`prepare_with_oids`](Self::prepare_with_oids) instead, which pins the
+    /// caller's encoded parameter types into the `Parse`.
+    ///
+    /// The server-inferred parameter types are RETAINED on the returned
+    /// [`PreparedStatement`] (from the prepare's `ParameterDescription`), so a
+    /// later [`query_prepared`](Self::query_prepared) /
+    /// [`execute_prepared`](Self::execute_prepared) VERIFIES the caller's encoded
+    /// parameter types against them and rejects a mismatch loudly — a fixed plan
+    /// cannot coerce a differently-typed binary bind, so this closes the silent
+    /// reinterpretation a bare same-width bind would otherwise cause.
     pub async fn prepare(&mut self, sql: &str) -> Result<PreparedStatement, DriverError> {
+        self.prepare_with_oids(sql, &[]).await
+    }
+
+    /// Prepare a statement declaring `param_oids` as the parameter-type OIDs in the
+    /// `Parse` — the DYNAMIC plan-cache PROMOTE's named-statement prepare.
+    ///
+    /// Threads the caller's `<P as ParamsWriter>::OIDS` into the `Parse` so a
+    /// repeated dynamic query's cached plan decodes each binary parameter AS the
+    /// client's encoded type (a type disagreement is a LOUD classified server
+    /// error, never a silent reinterpretation) — the named-statement peer of the
+    /// fused first-sighting path's declared OIDs, and of the compile-checked
+    /// `query!` path's baked template. `&[]` is the server-infers form the public
+    /// [`prepare`](Self::prepare) uses.
+    async fn prepare_with_oids(
+        &mut self,
+        sql: &str,
+        param_oids: &[u32],
+    ) -> Result<PreparedStatement, DriverError> {
         let stmt_name = self.next_stmt_name()?;
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
@@ -852,6 +971,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 live,
                 &stmt_name,
                 sql,
+                param_oids,
                 capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
                     ControlFlow::Continue(())
@@ -862,9 +982,23 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         let result_oids = collector.oids().to_vec();
         let column_names: Arc<[String]> =
             Arc::from(collector.column_names().to_vec().into_boxed_slice());
+        // The server-inferred parameter-type OIDs from the prepare's
+        // `ParameterDescription`, retained for the pre-`Bind` type check in
+        // `query_prepared` / `execute_prepared`. Read from the engine directly
+        // (stable post-settle state, like `tx_status`): a successful prepare left
+        // the engine active, so `current_param_oids` resolves; a `WrongPhase`
+        // (unreachable on this success path) degrades to empty = best-effort skip,
+        // never a panic.
+        let param_oids: Box<[u32]> = match self.engine.current_param_oids() {
+            Ok(oids) => Box::from(oids),
+            // Unreachable on this success path (a settled prepare left the engine
+            // active); empty = best-effort skip, never a panic.
+            Err(_) => Box::from([]),
+        };
         Ok(PreparedStatement {
             inner: WireStatement::new(stmt_name, result_oids),
             column_names,
+            param_oids,
         })
     }
 
@@ -875,6 +1009,11 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         stmt: &PreparedStatement,
         params: &P,
     ) -> Result<QueryResult, DriverError> {
+        // Verify the caller's encoded parameter types against the statement's
+        // fixed (server-inferred) parameter types BEFORE binding — a mismatch is
+        // rejected here with no wire round trip, closing the silent-reinterpret
+        // hole a same-width wrong-typed bind would open against the fixed plan.
+        stmt.verify_params::<P>()?;
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let outcome = self
@@ -900,6 +1039,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         stmt: &PreparedStatement,
         params: &P,
     ) -> Result<u64, DriverError> {
+        // Verify parameter types against the fixed plan before binding (see
+        // [`query_prepared`](Self::query_prepared)).
+        stmt.verify_params::<P>()?;
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let outcome = self
@@ -973,8 +1115,10 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         sql: &str,
         params: &P,
     ) -> Result<QueryResult, DriverError> {
-        if let Some(idx) = self.dyn_cache.ready_index(sql) {
+        if let Some(idx) = self.dyn_cache.ready_index(sql, P::OIDS) {
             // REUSE: Bind+Execute+Sync on the cached named statement (no re-parse).
+            // The slot is keyed on (SQL, P::OIDS), so the cached plan was prepared
+            // for EXACTLY this parameter-type tuple — no cross-type reinterpret.
             if let Some(stmt) = self.dyn_cache.take(idx) {
                 match self.query_prepared(&stmt, params).await {
                     Ok(qr) => {
@@ -1012,20 +1156,22 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             }
             // Only reached on the stale-self-heal fall-through (the slot was
             // evicted above); re-run on the fused path and re-note PENDING.
-        } else if self.dyn_cache.is_pending(sql) {
-            // PROMOTE (second sighting): prepare a named statement, run it, and
-            // cache the (valid) statement regardless of the execute OUTCOME — a
-            // data error does not invalidate a freshly-prepared plan.
-            let stmt = self.prepare(sql).await?;
+        } else if self.dyn_cache.is_pending(sql, P::OIDS) {
+            // PROMOTE (second sighting): prepare a named statement declaring the
+            // caller's encoded parameter types (`P::OIDS`, so the cached plan
+            // type-checks each binary parameter exactly as the fused first sighting
+            // did), run it, and cache the (valid) statement regardless of the
+            // execute OUTCOME — a data error does not invalidate a fresh plan.
+            let stmt = self.prepare_with_oids(sql, P::OIDS).await?;
             let out = self.query_prepared(&stmt, params).await;
-            self.dyn_cache.promote(sql, stmt);
+            self.dyn_cache.promote(sql, P::OIDS, stmt);
             return out;
         }
         // FIRST sighting — OR a stale-evicted re-warm (the transparent self-heal):
         // the fused one-round-trip path; note it PENDING on success so the next
         // sighting re-promotes.
         let qr = self.query_params_uncached(sql, params).await?;
-        self.dyn_cache.note_pending(sql);
+        self.dyn_cache.note_pending(sql, P::OIDS);
         Ok(qr)
     }
 
@@ -1113,8 +1259,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         sql: &str,
         params: &P,
     ) -> Result<u64, DriverError> {
-        if let Some(idx) = self.dyn_cache.ready_index(sql) {
-            // REUSE: Bind+Execute+Sync on the cached named statement.
+        if let Some(idx) = self.dyn_cache.ready_index(sql, P::OIDS) {
+            // REUSE: Bind+Execute+Sync on the cached named statement (keyed on
+            // (SQL, P::OIDS), so no cross-type reinterpret on reuse).
             if let Some(stmt) = self.dyn_cache.take(idx) {
                 match self.execute_prepared(&stmt, params).await {
                     Ok(n) => {
@@ -1138,16 +1285,18 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                     }
                 }
             }
-        } else if self.dyn_cache.is_pending(sql) {
-            // PROMOTE (second sighting).
-            let stmt = self.prepare(sql).await?;
+        } else if self.dyn_cache.is_pending(sql, P::OIDS) {
+            // PROMOTE (second sighting): declare the caller's encoded parameter
+            // types (`P::OIDS`) in the named-statement prepare, matching the fused
+            // first sighting (see `query_params_inner`).
+            let stmt = self.prepare_with_oids(sql, P::OIDS).await?;
             let out = self.execute_prepared(&stmt, params).await;
-            self.dyn_cache.promote(sql, stmt);
+            self.dyn_cache.promote(sql, P::OIDS, stmt);
             return out;
         }
         // FIRST sighting — OR a stale-evicted re-warm: fused; note PENDING on success.
         let n = self.execute_params_uncached(sql, params).await?;
-        self.dyn_cache.note_pending(sql);
+        self.dyn_cache.note_pending(sql, P::OIDS);
         Ok(n)
     }
 
@@ -2429,6 +2578,14 @@ mod dyn_cache_tests {
     use super::{DynStmtCache, PreparedStatement, StmtName, WireStatement, DYN_STMT_CACHE_CAP};
     use std::sync::Arc;
 
+    /// The parameter-type OID key most tests use (a single `int4` parameter). The
+    /// cache is keyed on (SQL, OIDs), so a fixed key isolates the SQL-axis tests
+    /// from the type-axis; `OIDS_B` exercises the type axis.
+    const OIDS_A: &[u32] = &[23];
+    /// A DIFFERENT parameter-type OID key (`float4`) — same wire width as `int4`,
+    /// the exact silent-reinterpret pair the (SQL, OIDs) key defends against.
+    const OIDS_B: &[u32] = &[700];
+
     /// A fabricated cached statement — the cache never inspects its contents (it
     /// only owns/moves it), so an empty OID/name payload is enough.
     fn fake_prepared(name: &str) -> PreparedStatement {
@@ -2436,19 +2593,20 @@ mod dyn_cache_tests {
         PreparedStatement {
             inner: WireStatement::new(stmt_name, Vec::new()),
             column_names: Arc::from(Vec::<String>::new().into_boxed_slice()),
+            param_oids: Box::from([]),
         }
     }
 
     #[test]
     fn promotion_flips_pending_to_ready() {
         let mut cache = DynStmtCache::new();
-        cache.note_pending("SELECT 1");
-        assert!(cache.is_pending("SELECT 1"));
-        assert!(cache.ready_index("SELECT 1").is_none());
+        cache.note_pending("SELECT 1", OIDS_A);
+        assert!(cache.is_pending("SELECT 1", OIDS_A));
+        assert!(cache.ready_index("SELECT 1", OIDS_A).is_none());
 
-        cache.promote("SELECT 1", fake_prepared("_bsql_0"));
-        assert!(!cache.is_pending("SELECT 1"));
-        assert!(cache.ready_index("SELECT 1").is_some());
+        cache.promote("SELECT 1", OIDS_A, fake_prepared("_bsql_0"));
+        assert!(!cache.is_pending("SELECT 1", OIDS_A));
+        assert!(cache.ready_index("SELECT 1", OIDS_A).is_some());
         // Promotion is in place — no extra slot grew.
         assert_eq!(cache.slots.len(), 1);
     }
@@ -2456,19 +2614,19 @@ mod dyn_cache_tests {
     #[test]
     fn take_restore_remove_round_trip() {
         let mut cache = DynStmtCache::new();
-        cache.note_pending("Q");
-        cache.promote("Q", fake_prepared("_bsql_1"));
-        let idx = cache.ready_index("Q").expect("ready");
+        cache.note_pending("Q", OIDS_A);
+        cache.promote("Q", OIDS_A, fake_prepared("_bsql_1"));
+        let idx = cache.ready_index("Q", OIDS_A).expect("ready");
 
         let stmt = cache.take(idx).expect("some");
         // Taken out → the slot reads as pending until restored.
-        assert!(cache.is_pending("Q"));
+        assert!(cache.is_pending("Q", OIDS_A));
         cache.restore(idx, stmt);
-        assert!(cache.ready_index("Q").is_some());
+        assert!(cache.ready_index("Q", OIDS_A).is_some());
 
         cache.remove(idx);
-        assert!(cache.ready_index("Q").is_none());
-        assert!(!cache.is_pending("Q"));
+        assert!(cache.ready_index("Q", OIDS_A).is_none());
+        assert!(!cache.is_pending("Q", OIDS_A));
         assert_eq!(cache.slots.len(), 0);
     }
 
@@ -2476,15 +2634,15 @@ mod dyn_cache_tests {
     fn bounded_at_capacity_evicting_oldest_pending() {
         let mut cache = DynStmtCache::new();
         for i in 0..DYN_STMT_CACHE_CAP {
-            cache.note_pending(&format!("sql-{i}"));
+            cache.note_pending(&format!("sql-{i}"), OIDS_A);
         }
         assert_eq!(cache.slots.len(), DYN_STMT_CACHE_CAP);
         // One more first-sighting evicts the OLDEST pending (sql-0), never grows.
-        cache.note_pending("sql-new");
+        cache.note_pending("sql-new", OIDS_A);
         assert_eq!(cache.slots.len(), DYN_STMT_CACHE_CAP);
-        assert!(!cache.is_pending("sql-0"), "oldest pending evicted");
-        assert!(cache.is_pending("sql-new"));
-        assert!(cache.is_pending("sql-1"), "younger pending retained");
+        assert!(!cache.is_pending("sql-0", OIDS_A), "oldest pending evicted");
+        assert!(cache.is_pending("sql-new", OIDS_A));
+        assert!(cache.is_pending("sql-1", OIDS_A), "younger pending retained");
     }
 
     #[test]
@@ -2493,27 +2651,54 @@ mod dyn_cache_tests {
         let mut cache = DynStmtCache::new();
         for i in 0..DYN_STMT_CACHE_CAP {
             let sql = format!("ready-{i}");
-            cache.note_pending(&sql);
-            cache.promote(&sql, fake_prepared(&format!("_bsql_{i}")));
+            cache.note_pending(&sql, OIDS_A);
+            cache.promote(&sql, OIDS_A, fake_prepared(&format!("_bsql_{i}")));
         }
         assert_eq!(cache.slots.len(), DYN_STMT_CACHE_CAP);
         // A NEW first sighting cannot evict a READY slot (which would leak its
         // server-side statement) — so it is simply NOT cached (stays fused).
-        cache.note_pending("overflow");
+        cache.note_pending("overflow", OIDS_A);
         assert_eq!(cache.slots.len(), DYN_STMT_CACHE_CAP);
-        assert!(!cache.is_pending("overflow"), "overflow not tracked");
+        assert!(!cache.is_pending("overflow", OIDS_A), "overflow not tracked");
         // Every READY statement survived.
         for i in 0..DYN_STMT_CACHE_CAP {
-            assert!(cache.ready_index(&format!("ready-{i}")).is_some());
+            assert!(cache.ready_index(&format!("ready-{i}"), OIDS_A).is_some());
         }
     }
 
     #[test]
     fn note_pending_is_idempotent() {
         let mut cache = DynStmtCache::new();
-        cache.note_pending("dup");
-        cache.note_pending("dup");
+        cache.note_pending("dup", OIDS_A);
+        cache.note_pending("dup", OIDS_A);
         assert_eq!(cache.slots.len(), 1);
+    }
+
+    #[test]
+    fn same_sql_distinct_param_oids_are_distinct_keys() {
+        // The type-fidelity defense: the SAME SQL text bound with DIFFERENT
+        // parameter types (`int4` vs `float4`, same 4-byte wire width) occupies
+        // TWO independent slots — a REUSE never crosses them, so a plan prepared
+        // for `int4` is never reused for a `float4` bind (which would reinterpret
+        // the 4 bytes). Before the (SQL, OIDs) key, this was ONE slot.
+        let mut cache = DynStmtCache::new();
+        cache.note_pending("SELECT $1", OIDS_A);
+        cache.promote("SELECT $1", OIDS_A, fake_prepared("_bsql_a"));
+        // The float4-typed sighting of the SAME SQL is NOT a ready hit, NOT pending
+        // under its own key — it is a fresh first sighting.
+        assert!(cache.ready_index("SELECT $1", OIDS_B).is_none(), "no cross-type reuse");
+        assert!(!cache.is_pending("SELECT $1", OIDS_B));
+        cache.note_pending("SELECT $1", OIDS_B);
+        cache.promote("SELECT $1", OIDS_B, fake_prepared("_bsql_b"));
+        // Two independent slots — each keyed hit lands on its own plan.
+        assert_eq!(cache.slots.len(), 2, "same SQL, two param-type keys → two slots");
+        assert!(cache.ready_index("SELECT $1", OIDS_A).is_some());
+        assert!(cache.ready_index("SELECT $1", OIDS_B).is_some());
+        assert_ne!(
+            cache.ready_index("SELECT $1", OIDS_A),
+            cache.ready_index("SELECT $1", OIDS_B),
+            "the two keys resolve to different slots",
+        );
     }
 
     #[test]
@@ -2521,17 +2706,17 @@ mod dyn_cache_tests {
         // Two READY + one PENDING: drain returns the two prepared statements (for
         // the caller to Close) and leaves the cache empty (the pool-checkout clear).
         let mut cache = DynStmtCache::new();
-        cache.note_pending("r1");
-        cache.promote("r1", fake_prepared("_bsql_1"));
-        cache.note_pending("r2");
-        cache.promote("r2", fake_prepared("_bsql_2"));
-        cache.note_pending("p1"); // stays pending — no server-side statement
+        cache.note_pending("r1", OIDS_A);
+        cache.promote("r1", OIDS_A, fake_prepared("_bsql_1"));
+        cache.note_pending("r2", OIDS_A);
+        cache.promote("r2", OIDS_A, fake_prepared("_bsql_2"));
+        cache.note_pending("p1", OIDS_A); // stays pending — no server-side statement
 
         let ready = cache.drain();
         assert_eq!(ready.len(), 2, "only the READY statements are returned to Close");
         assert_eq!(cache.slots.len(), 0, "the cache is empty after a drain");
-        assert!(cache.ready_index("r1").is_none());
-        assert!(!cache.is_pending("p1"));
+        assert!(cache.ready_index("r1", OIDS_A).is_none());
+        assert!(!cache.is_pending("p1", OIDS_A));
     }
 }
 

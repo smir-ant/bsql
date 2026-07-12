@@ -4,18 +4,19 @@
 //! [`FrameSink`] push surface (length prefixes patched by
 //! [`FrameSink::with_length_prefix`], exactly the PG §55.7 "length includes
 //! itself" convention). The FIXED-size frames (Sync, Execute, Describe, Close,
-//! the Parse / simple-query headers) build into a transient bounded
+//! the simple-query header) build into a transient bounded
 //! [`WriteBuf`] and are copied onto the engine's persistent
 //! [`SendBuf`](super::SendBuf) — the transient-scratch / persistent-queue split
 //! the connecting handshake uses. [`WriteBuf`] is `heapless` and scrub-on-drop,
 //! so a parameter-bearing assembly never outlives the build, and its capacity is
 //! const-asserted to fit every bounded frame's worst case.
 //!
-//! The `Bind` frame is the ONE exception: its parameter block is UNBOUNDED (a
-//! multi-kilobyte `jsonb`, a large `bytea`, a several-hundred-element array), so
-//! [`build_bind`] / [`build_bind_prepared`] are generic over [`FrameSink`] and
+//! The `Parse` and `Bind` frames are the exceptions: their bodies are UNBOUNDED
+//! (a multi-kilobyte SQL / `jsonb`, a large `bytea`, a several-hundred-element
+//! array, plus Parse's own parameter-type OID list), so [`build_parse`],
+//! [`build_bind`], and [`build_bind_prepared`] are generic over [`FrameSink`] and
 //! the verb layer streams them straight onto the growable send buffer with a
-//! back-patched length — never a fixed cap. The same generic builder can target
+//! back-patched length — never a fixed cap. The same generic builders can target
 //! a bounded [`WriteBuf`] (the byte-twin reference), so the streaming production
 //! bytes and the bounded reference cannot drift.
 //!
@@ -71,66 +72,55 @@ pub(crate) fn build_simple_query_header(wb: &mut WriteBuf, sql_len: u32) -> Resu
     wb.push_u32_be(len)
 }
 
-/// `'P'` Parse frame: `tag | len | stmt_name NUL | sql NUL | n_param_types=0`.
+/// `'P'` Parse frame: `tag | len | stmt_name NUL | sql NUL | n_param_types |
+/// param_oid[..]`.
 ///
-/// `#[cfg(test)]` — the byte-twin REFERENCE only. The production prepare path
-/// streams the SQL via [`build_parse_header`] + the send buffer (so a large SQL
-/// never has to fit the bounded [`WriteBuf`]); this whole-frame builder produces
-/// byte-identical output for SQL that fits, so it is kept as the reference the
-/// `protocol.rs` byte-twin pins against (and the in-module twin chains the
-/// streaming assembly to it). No parameter-type OIDs are declared
-/// (`n_param_types = 0`): the server infers them.
-#[cfg(test)]
+/// Generic over [`FrameSink`], exactly like [`build_bind`]: both the SQL body and
+/// the parameter-type OID list are UNBOUNDED in principle (a multi-kilobyte SQL,
+/// up to [`MAX_PARAMS_ARITY`](crate::params::MAX_PARAMS_ARITY) OIDs), so the verb
+/// layer streams the whole frame straight onto the growable send buffer with a
+/// back-patched length — never a fixed cap. The same generic builder targets a
+/// bounded [`WriteBuf`] (the byte-twin reference in [`parse_frame_twin`]), so the
+/// streaming production bytes and the bounded reference cannot drift.
+///
+/// `param_oids` is the parameter tuple's own `<P as ParamsWriter>::OIDS` for the
+/// DYNAMIC `query_params` family — declaring each parameter's ENCODED type OID —
+/// or `&[]` for the server-infers path (the explicit `prepare` handle, whose
+/// parameter types are not known until a later `Bind`). Declaring the OIDs is what
+/// makes the server DECODE each binary parameter AS the client's declared type and
+/// apply normal SQL coercion, so a type disagreement (a `&str` where an `int4` is
+/// required, no implicit cast) is a LOUD classified server error rather than a
+/// silent byte-for-byte reinterpretation. This aligns the dynamic path with the
+/// compile-checked `query!` path — which bakes the same OIDs into its Parse
+/// template — and with libpq's `PQexecParams` `paramTypes`. An OID of `0`
+/// (`unspecified` — an `EnumLabel`, whose type the server infers from context)
+/// leaves THAT parameter to inference, per-parameter.
+///
+/// `Err` only if the encoded frame body exceeds the `u32` wire length field
+/// (> 4 GiB — architecturally dead, an OOM first) — the classified
+/// [`WriteBufFull`], never a panic or a silent truncation.
 #[inline]
-pub(crate) fn build_parse(
-    wb: &mut WriteBuf,
+pub(crate) fn build_parse<S: FrameSink>(
+    wb: &mut S,
     stmt_name: &[u8],
     sql: &[u8],
+    param_oids: &[u32],
 ) -> Result<(), WriteBufFull> {
     wb.push_u8(TAG_PARSE.byte())?;
     wb.with_length_prefix(|w| {
         w.push_nul_terminated(stmt_name)?;
         w.push_nul_terminated(sql)?;
-        w.push_i16_be(0)
+        // n_param_types (i16 on the wire; arity is 0..=MAX_PARAMS_ARITY, so the
+        // conversion never truncates — the classified WriteBufFull covers the
+        // architecturally-dead overflow rather than an `as` cast).
+        let count = u16::try_from(param_oids.len()).map_err(|_| WriteBufFull)?;
+        w.push_u16_be(count)?;
+        for &oid in param_oids {
+            w.push_u32_be(oid)?;
+        }
+        Ok(())
     })
 }
-
-/// `'P'` Parse frame HEADER only: `tag | len | stmt_name NUL`, where `len` is the
-/// self-inclusive `4 + (stmt_name_len + 1) + (sql_len + 1) + 2` (the length
-/// field, the NUL-terminated statement name, the NUL-terminated SQL, and the
-/// `n_param_types = 0` trailer). The SQL body, its NUL, and the 2-byte
-/// zero-param-types trailer ([`PARSE_SQL_TRAILER`]) are queued directly onto the
-/// send buffer by the caller, so a multi-kilobyte prepared SQL never has to fit
-/// the bounded [`WriteBuf`] — the same header-in-scratch / body-on-send-buffer
-/// split the simple-query and `CopyData` paths use. No parameter-type OIDs are
-/// declared (the server infers them); the compile-checked `query!` macro bakes
-/// its own Parse template (with OIDs) enqueued verbatim elsewhere. `Err` only if
-/// the computed length overflows `u32`.
-#[inline]
-pub(crate) fn build_parse_header(
-    wb: &mut WriteBuf,
-    stmt_name: &[u8],
-    sql_len: u32,
-) -> Result<(), WriteBufFull> {
-    wb.push_u8(TAG_PARSE.byte())?;
-    let stmt_len = u32::try_from(stmt_name.len()).map_err(|_| WriteBufFull)?;
-    // Self-inclusive length: 4 (len field) + stmt_name + NUL + sql + NUL +
-    // n_param_types(2). Checked throughout (the forbid wall bars wrapping add).
-    let len = 4u32
-        .checked_add(stmt_len)
-        .and_then(|v| v.checked_add(1))
-        .and_then(|v| v.checked_add(sql_len))
-        .and_then(|v| v.checked_add(1))
-        .and_then(|v| v.checked_add(2))
-        .ok_or(WriteBufFull)?;
-    wb.push_u32_be(len)?;
-    wb.push_nul_terminated(stmt_name)
-}
-
-/// The trailing bytes the streaming Parse path queues after the SQL body: the
-/// SQL's NUL terminator + `n_param_types = 0` (i16 BE) — completing the frame the
-/// [`build_parse_header`] header opened.
-pub(super) const PARSE_SQL_TRAILER: [u8; 3] = [0, 0, 0];
 
 /// `'D'` Describe-statement frame: `tag | len | 'S' | stmt_name NUL`.
 #[inline]
@@ -326,59 +316,91 @@ pub(crate) fn build_copy_fail(wb: &mut WriteBuf, reason: &[u8]) -> Result<(), Wr
 }
 
 #[cfg(test)]
-mod parse_stream_twin {
-    //! Byte-twin for the streaming Parse assembly: the production prepare path
-    //! emits `build_parse_header(stmt, sql_len)` (into scratch) ++ `sql` ++
-    //! [`PARSE_SQL_TRAILER`] onto the send buffer. This proves that assembly is
-    //! byte-identical to the whole-frame [`build_parse`] (which the `protocol.rs`
-    //! byte-twin in turn pins to the proven `build_parse_message_cfgtest`), so the
-    //! streaming path is transitively byte-correct — AND that a multi-kilobyte SQL
-    //! that would overflow the bounded `WriteBuf` builds without `WriteBufFull`.
+mod parse_frame_twin {
+    //! Byte-twin for the streaming `Parse` assembly, mirroring [`bind_stream_twin`].
+    //! Production streams the whole Parse — statement name, SQL, `n_param_types`,
+    //! and the parameter-type OID list — straight onto the growable send buffer via
+    //! [`build_parse`] over a [`SendFrame`](super::super::flush::SendFrame) with a
+    //! back-patched length. This proves three things:
+    //!
+    //! 1. **Byte-identity across sinks.** The SAME generic [`build_parse`] over the
+    //!    growable [`SendFrame`] emits bytes identical to the bounded [`WriteBuf`]
+    //!    reference — so the streaming production path cannot drift from the twin.
+    //! 2. **The Parse carries the parameter-type OIDs.** An explicit hand-built
+    //!    expected-bytes pin asserts the exact `n_param_types` + OID-list wire
+    //!    layout — so a regression to the old zero-param-types trailer (a silent
+    //!    reinterpret hole) turns this red OFFLINE, with no server.
+    //! 3. **The SQL body is uncapped.** A multi-kilobyte SQL that OVERFLOWS the
+    //!    bounded `WriteBuf` streams onto `SendFrame` with correct framing.
 
-    use super::{build_parse, build_parse_header, PARSE_SQL_TRAILER};
+    use super::build_parse;
+    use crate::decode::oids::{INT4, TEXT};
+    use crate::engine::SendBuf;
     use crate::write_buf::WriteBuf;
     use alloc::string::ToString;
     use alloc::vec::Vec;
 
-    /// Assemble the streaming Parse path into a flat byte vector.
-    fn streamed(stmt: &[u8], sql: &[u8]) -> Vec<u8> {
-        let sql_len = u32::try_from(sql.len()).expect("sql fits u32");
-        let mut header = WriteBuf::new();
-        build_parse_header(&mut header, stmt, sql_len).expect("header fits scratch");
-        let mut out = Vec::new();
-        out.extend_from_slice(header.as_bytes());
-        out.extend_from_slice(sql);
-        out.extend_from_slice(&PARSE_SQL_TRAILER);
-        out
+    /// Assemble a `Parse` via the streaming `SendFrame` path into a flat vector.
+    fn streamed(stmt: &[u8], sql: &[u8], oids: &[u32]) -> Vec<u8> {
+        let mut sb = SendBuf::new();
+        build_parse(&mut sb.frame(), stmt, sql, oids).expect("streamed Parse fits");
+        sb.queued().to_vec()
     }
 
-    /// Assemble the whole-frame reference into a flat byte vector.
-    fn whole(stmt: &[u8], sql: &[u8]) -> Vec<u8> {
+    /// Assemble a `Parse` via the bounded `WriteBuf` reference into a flat vector.
+    fn whole(stmt: &[u8], sql: &[u8], oids: &[u32]) -> Vec<u8> {
         let mut wb = WriteBuf::new();
-        build_parse(&mut wb, stmt, sql).expect("whole frame fits scratch");
+        build_parse(&mut wb, stmt, sql, oids).expect("whole Parse fits scratch");
         wb.as_bytes().to_vec()
     }
 
     #[test]
-    fn streamed_parse_matches_whole_frame_for_small_sql() {
+    fn streamed_parse_matches_whole_frame() {
         let stmt = b"_bsql_0";
         let sql = b"SELECT id, name FROM demo WHERE id = $1";
-        let s = streamed(stmt, sql);
-        let w = whole(stmt, sql);
-        assert_eq!(s.first().copied(), Some(b'P'), "non-vacuous: 'P' frame");
-        assert_eq!(s, w, "streamed Parse must equal the whole-frame reference");
+        // No OIDs (server-infers path), then a two-OID declared-types path.
+        for oids in [&[][..], &[INT4, TEXT][..]] {
+            let s = streamed(stmt, sql, oids);
+            let w = whole(stmt, sql, oids);
+            assert_eq!(s.first().copied(), Some(b'P'), "non-vacuous: 'P' frame");
+            assert_eq!(s, w, "streamed Parse must equal the whole-frame reference");
+        }
     }
 
     #[test]
-    fn streamed_parse_builds_large_sql_without_overflow() {
-        // A multi-kilobyte SQL: the whole-frame builder would overflow the bounded
-        // WriteBuf, but the streaming header is tiny (tag + len + stmt NUL) and
-        // the SQL rides the send buffer, so the header builds with no WriteBufFull.
+    fn parse_declares_the_parameter_type_oids() {
+        // The wire-shape pin: `'P' | len | "" NUL | sql NUL | n_param_types=2 |
+        // INT4(u32 BE) | TEXT(u32 BE)`. A drop back to `n_param_types=0` (the
+        // silent-reinterpret hole) fails this exact-bytes assertion — the OFFLINE
+        // regression wall for D1, no server needed.
+        let sql = b"SELECT $1::int4, $2::text";
+        let got = whole(b"", sql, &[INT4, TEXT]);
+        let mut expected: Vec<u8> = Vec::new();
+        expected.push(b'P');
+        // Self-inclusive length: 4 + (0+1) + (sql+1) + 2 + 4 + 4.
+        let body_len = 4 + 1 + sql.len() + 1 + 2 + 4 + 4;
+        expected.extend_from_slice(&(u32::try_from(body_len).expect("fits")).to_be_bytes());
+        expected.push(0); // empty statement name NUL
+        expected.extend_from_slice(sql);
+        expected.push(0); // SQL NUL
+        expected.extend_from_slice(&2u16.to_be_bytes()); // n_param_types = 2
+        expected.extend_from_slice(&INT4.to_be_bytes()); // $1 = int4
+        expected.extend_from_slice(&TEXT.to_be_bytes()); // $2 = text
+        assert_eq!(got, expected, "Parse must carry n_param_types + the exact OID list");
+    }
+
+    #[test]
+    fn streamed_parse_lifts_the_bounded_cap() {
+        // A multi-kilobyte SQL: it OVERFLOWS the bounded `WriteBuf`, but streams
+        // onto `SendFrame` with correct self-inclusive framing.
         let stmt = b"_bsql_big";
         let sql = "SELECT 1 -- ".to_string() + &"x".repeat(3000);
-        let s = streamed(stmt, sql.as_bytes());
-        // Framing is correct: 'P' tag, and the self-inclusive length matches the
-        // emitted byte count (len field counts itself + everything after the tag).
+        let mut wb = WriteBuf::new();
+        assert!(
+            build_parse(&mut wb, stmt, sql.as_bytes(), &[]).is_err(),
+            "a >2 KiB SQL must overflow the bounded WriteBuf (the lifted cap)",
+        );
+        let s = streamed(stmt, sql.as_bytes(), &[]);
         assert_eq!(s.first().copied(), Some(b'P'));
         let len_bytes: [u8; 4] = s.get(1..5).expect("len field").try_into().expect("4 bytes");
         let declared = u32::from_be_bytes(len_bytes);

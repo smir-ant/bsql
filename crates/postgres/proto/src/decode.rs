@@ -481,6 +481,52 @@ pub fn parse_column_names(
     Ok(names)
 }
 
+/// Extract the parameter-type OIDs from a `ParameterDescription` (`'t'`) payload.
+///
+/// Wire body shape (PG §55.7): `n_params: int16` followed by `n_params × int32`
+/// parameter-type OIDs, in `$1..$n` order. A statement `Describe` answers with
+/// this frame BEFORE its `RowDescription`/`NoData`, naming the type the server
+/// inferred (or the client declared) for each `$N` placeholder. The driver
+/// retains these on the driver's `PreparedStatement` so a
+/// later `Bind` can VERIFY the caller's encoded parameter types against them —
+/// the fixed-plan peer of the compile-checked path's OID pin.
+///
+/// TOTAL FUNCTION: on ANY input — truncated, over-count, hostile — it returns
+/// `Some(oids)` (well-formed) or `None` (malformed → the caller tears the
+/// connection down), NEVER a panic (fuzzed by `decoder_fuzz`). `None` is used
+/// rather than a classified [`ProtocolError`](crate::error::ProtocolError)
+/// because the sole caller DISCARDS the error and tears down — a distinct
+/// variant would be dead classification. An OID `0` (`unspecified` — a param the
+/// server could not infer, or one the client left to inference) is preserved
+/// verbatim; the verify step treats `0` as unverifiable, not a type.
+///
+/// A count beyond [`MAX_ROW_COLUMNS`] is rejected (`None`) as a nonconforming /
+/// hostile peer before allocating — the same reject-before-allocate ceiling
+/// [`parse_row_description`] applies. A realistic prepared statement names far
+/// fewer parameters (the typed tuple path caps at 32), so this ceiling is only a
+/// hostile-input bound, never a real limit.
+#[must_use]
+pub fn parse_param_description(payload: &[u8]) -> Option<alloc::vec::Vec<u32>> {
+    let (count_bytes, mut rest) = payload.split_first_chunk::<2>()?;
+    let n_i16 = i16::from_be_bytes(*count_bytes);
+    // A negative count is a framing violation (`try_from` rejects it).
+    let n = usize::try_from(n_i16).ok()?;
+    if n > MAX_ROW_COLUMNS {
+        return None;
+    }
+    let mut oids = alloc::vec::Vec::with_capacity(n);
+    for _ in 0..n {
+        let (oid_bytes, next) = rest.split_first_chunk::<4>()?;
+        oids.push(u32::from_be_bytes(*oid_bytes));
+        rest = next;
+    }
+    // Trailing bytes after the declared OIDs signal a framing desync.
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(oids)
+}
+
 // ════════════════════════════════════════════════════════════════════
 // COPY response header (, PG §55.2.6)
 // ════════════════════════════════════════════════════════════════════
@@ -5471,6 +5517,55 @@ mod parse_edge_case_tests {
         assert!(parse_row_description(payload).is_err());
     }
 
+    #[test]
+    fn parse_param_description_zero_params() {
+        // A no-param prepared statement: count 0, no OIDs.
+        assert_eq!(parse_param_description(&[0, 0]), Some(alloc::vec::Vec::new()));
+    }
+
+    #[test]
+    fn parse_param_description_three_params() {
+        let mut payload = alloc::vec::Vec::new();
+        payload.extend_from_slice(&3i16.to_be_bytes());
+        payload.extend_from_slice(&23u32.to_be_bytes()); // int4
+        payload.extend_from_slice(&25u32.to_be_bytes()); // text
+        payload.extend_from_slice(&0u32.to_be_bytes()); // unspecified (server could not infer)
+        assert_eq!(parse_param_description(&payload), Some(alloc::vec![23, 25, 0]));
+    }
+
+    #[test]
+    fn parse_param_description_negative_count_rejected() {
+        assert_eq!(parse_param_description(&[0xFF, 0xFF]), None); // i16 = -1
+    }
+
+    #[test]
+    fn parse_param_description_truncated_oid_rejected() {
+        // Declares 1 param but only 3 of the 4 OID bytes present.
+        let mut payload = alloc::vec::Vec::new();
+        payload.extend_from_slice(&1i16.to_be_bytes());
+        payload.extend_from_slice(&[0, 0, 23]);
+        assert_eq!(parse_param_description(&payload), None);
+    }
+
+    #[test]
+    fn parse_param_description_trailing_bytes_rejected() {
+        // Declares 0 params but carries a trailing byte — framing desync.
+        assert_eq!(parse_param_description(&[0, 0, 0xAB]), None);
+    }
+
+    #[test]
+    fn parse_param_description_short_header_rejected() {
+        assert_eq!(parse_param_description(&[0]), None);
+        assert_eq!(parse_param_description(&[]), None);
+    }
+
+    #[test]
+    fn parse_param_description_over_cap_rejected() {
+        // A count beyond MAX_ROW_COLUMNS is rejected before allocating.
+        let over = i16::try_from(MAX_ROW_COLUMNS + 1).unwrap_or(i16::MAX);
+        let payload = over.to_be_bytes();
+        assert_eq!(parse_param_description(&payload), None);
+    }
 }
 
 #[cfg(test)]

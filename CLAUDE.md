@@ -754,10 +754,77 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `pool_reaps_a_connection_past_idle_timeout` (a NEW backend pid + eviction count)
   and the negative `pool_reuses_a_connection_within_limits` (SAME pid, nothing
   reaped).
+- **Dynamic-param TYPE FIDELITY (no silent coercion).** The dynamic
+  `query_params` / `query_params_one` / `query_params_opt` / `execute_params` /
+  `query_each_params` path declares each parameter's ENCODED type OID
+  (`<P as ParamsWriter>::OIDS`) in its `Parse` frame — the SAME OIDs the
+  compile-checked `query!` path bakes into its `Parse` template. So PostgreSQL
+  decodes each binary parameter AS the client's declared type and applies normal
+  SQL coercion: a correctly-typed param round-trips, a coercible one (an `int8`
+  value into an `int4` comparison) is coerced by PG's own rules, and a genuinely
+  incompatible one (a `&str` where an `int4` is required, no implicit cast) is a
+  LOUD classified server error (`42883` / `22P02`), NEVER a silent byte-for-byte
+  reinterpretation (the old `n_param_types = 0` hole silently matched `WHERE id =
+  $1` bound with `&str "AAAA"` against `id = 1094795585` — the four ASCII bytes
+  read as `int4`). This is the runtime peer of the wire-OID pinning the typed path
+  and the SQLite twin already enforce — the "never a silent coercion" invariant now
+  holds on ALL of bsql's parameter-binding surfaces (witnessed by the
+  `dynamic_param_type_fidelity_{sync,async}` live tests, the
+  `param_type_fidelity_three_path_parity` oracle, and the offline
+  `dynamic_parse_param_oids` wire-shape gate). An `EnumLabel`'s `unspecified` OID
+  `0` still leaves that one parameter to server inference, per-parameter. The
+  `Parse` frame is streamed onto the growable send buffer via one generic
+  `build_parse` (like `Bind`), so its SQL + OID list are uncapped.
+
+  The EXPLICIT prepared-statement handle (`conn.prepare(sql)` →
+  `query_prepared::<P>` / `execute_prepared::<P>`) closes the SAME hole from the
+  OTHER direction, and is STRICTER. A prepared statement's plan is FIXED at
+  `Parse` (the explicit handle declares NO OIDs — the server infers each `$N`),
+  so the server CANNOT coerce a differently-typed binary `Bind` against it: a
+  same-width wrong-typed value is read AS the pinned type, a silent reinterpret.
+  `prepare` therefore RETAINS the server-inferred parameter types (from the
+  prepare's `ParameterDescription`, parsed by `parse_param_description` and
+  surfaced via `Engine::current_param_oids`) on the `PreparedStatement`, and
+  `query_prepared` / `execute_prepared` (generic over `P`) VERIFY the caller's
+  `<P as ParamsWriter>::OIDS` against them BEFORE the `Bind` — a per-parameter
+  STRICT-EQUALITY check (a fixed plan admits no coercion, so int8-into-int4 is
+  rejected here, UNLIKE the dynamic path where PG coerces) plus an arity check.
+  A mismatch is a classified `DriverError::ParamTypeMismatch { index, expected,
+  found }` / `ParamCountMismatch { expected, found }` returned with NO wire round
+  trip, so the connection is untouched (neither is a disconnect — fix the
+  parameter and retry on the SAME connection). An `unspecified` OID `0` on EITHER
+  side (an `EnumLabel` param, or a `$N` the server could not infer — e.g. a bare
+  `SELECT $1`) is not verifiable and passed through (best-effort), never falsely
+  rejected. This makes the "never a silent coercion" invariant TRUE on every
+  parameter-binding surface — typed (compile), dynamic (server), prepared
+  (client), and SQLite (storage class) — witnessed by
+  `prepared_param_type_fidelity_{sync,async}`, the extended
+  `param_type_fidelity_three_path_parity` oracle, the offline
+  `parse_param_description` unit + `decoder_fuzz` total-function gate, and the
+  `Describe`-parse `#[cold]`-kept `next_event` codegen gate (byte-stable hot arm).
+
+  INTENDED STRICTNESS (behaviour note): because a parameter's ENCODED type is now
+  declared, binding a bare `&str` (OID `text` 25) where the server expects a
+  PostgreSQL type with NO implicit `text` cast — an `enum`, `uuid`, `date`,
+  `timestamptz`, etc. — is now a LOUD classified error (dynamic: server `42883`;
+  prepared: client `ParamTypeMismatch`), where the OLD `n_param_types = 0` path
+  silently reinterpreted the text bytes. This is strictly BETTER (loud, not
+  silent-garbage): bind the proper typed value instead (the blessed
+  `EnumLabel<E>` for an enum, `bsql::Uuid` / a temporal type for the rest — all
+  unaffected), or add an explicit `$1::type` cast in the SQL where a text→type
+  cast is valid. `char(n)`/`bpchar` note: a `bpchar` column right-pads to `n`, so a
+  bound `&str` shorter than `n` compares/stores blank-padded per SQL semantics —
+  unchanged by type fidelity (the OID is still `text`-compatible via the implicit
+  cast), just the usual fixed-width-CHAR trailing-space behaviour.
 - Runtime parameterized queries (`query_params` / `query_params_one` /
   `execute_params`) cost a SINGLE round trip whether run once or repeatedly, via a
-  transparent per-connection dynamic prepared-statement cache keyed on SQL TEXT
-  (`DynStmtCache` in `bsql-postgres-core`). The FIRST sighting of a SQL runs the
+  transparent per-connection dynamic prepared-statement cache keyed on the (SQL
+  TEXT, parameter-type OIDs) pair (`DynStmtCache` in `bsql-postgres-core`). The key
+  includes `P::OIDS`, not just the SQL text, so the SAME SQL string bound with a
+  DIFFERENT parameter-type tuple is a DISTINCT cache entry with its own plan — a
+  reuse NEVER crosses parameter types (which would reinterpret the new value's
+  binary bytes as the cached plan's type — the reuse-path peer of the declared-OID
+  `Parse`). The FIRST sighting of a SQL runs the
   fused unnamed path (`Parse`(unnamed) + `Bind` + `Describe`(portal) + `Execute` +
   `Sync` in one flush — a one-shot query costs one round trip, not three), so a
   query run once pays nothing. A query run AGAIN is prepared to a named

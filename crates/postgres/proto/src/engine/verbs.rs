@@ -258,16 +258,14 @@ where
 {
     send_buf.reset();
     stage_prelude(active, send_buf)?;
-    // Parse(unnamed ""): stream the SQL body onto the growable send buffer, so a
-    // multi-kilobyte runtime query is not capped at MAX_OWNED_SEND_LEN.
-    let sql_bytes = sql.as_bytes();
-    let sql_len = u32::try_from(sql_bytes.len()).map_err(|_| {
-        core::hint::cold_path();
-        EngineError::FrameTooLong
-    })?;
-    enqueue_frame(send_buf, |wb| frames::build_parse_header(wb, b"", sql_len))?;
-    send_buf.enqueue(sql_bytes);
-    send_buf.enqueue(&frames::PARSE_SQL_TRAILER);
+    // Parse(unnamed ""): stream the whole frame — SQL body AND the parameter-type
+    // OID list from `P::OIDS` — onto the growable send buffer, so a multi-kilobyte
+    // runtime query is not capped at MAX_OWNED_SEND_LEN. Declaring `P::OIDS` makes
+    // the server decode each binary parameter AS the client's encoded type (a type
+    // disagreement is then a LOUD server error, never a silent reinterpretation),
+    // exactly as the compile-checked `query!` path bakes its OIDs into its Parse.
+    frames::build_parse(&mut send_buf.frame(), b"", sql.as_bytes(), P::OIDS)
+        .map_err(frame_too_long)?;
     // Bind(portal "" from the unnamed statement ""); Describe(portal "");
     // Execute(portal "", no row limit); Sync — one pipelined batch.
     frames::build_bind(&mut send_buf.frame(), b"", b"", params).map_err(frame_too_long)?;
@@ -771,6 +769,7 @@ impl<'b, T: Transport> Engine<'b, T> {
         live: Live<'b>,
         stmt_name: &StmtName,
         sql: &str,
+        param_oids: &[u32],
         sink: S,
     ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
     where
@@ -785,23 +784,15 @@ impl<'b, T: Transport> Engine<'b, T> {
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         send_buf.reset();
         stage_prelude(active, send_buf)?;
-        // Stream the SQL body onto the (growable) send buffer rather than copying
-        // it into the bounded `WriteBuf`: only the Parse header (tag + length +
-        // statement name) is built into the scratch buffer, so a multi-kilobyte
-        // prepared SQL is not capped at `MAX_OWNED_SEND_LEN`. The flushed bytes —
-        // header, SQL, NUL + zero-param-types trailer — are contiguous and
-        // byte-identical to the whole-frame builder (proven by the parse-stream
-        // byte-twin).
-        let sql_bytes = sql.as_bytes();
-        let sql_len = u32::try_from(sql_bytes.len()).map_err(|_| {
-            core::hint::cold_path();
-            EngineError::FrameTooLong
-        })?;
-        enqueue_frame(send_buf, |wb| {
-            frames::build_parse_header(wb, stmt_name.as_bytes(), sql_len)
-        })?;
-        send_buf.enqueue(sql_bytes);
-        send_buf.enqueue(&frames::PARSE_SQL_TRAILER);
+        // Stream the whole Parse frame — statement name, SQL, and the parameter-type
+        // OID list — onto the (growable) send buffer with a back-patched length, so
+        // a multi-kilobyte prepared SQL is not capped at `MAX_OWNED_SEND_LEN` (the
+        // same streaming shape as `Bind`). `param_oids` is `P::OIDS` for the DYNAMIC
+        // plan-cache PROMOTE (so a repeated `query_params` prepares its named plan
+        // with the caller's encoded types) or `&[]` for the explicit `prepare`
+        // handle (whose parameter types are only known at a later `Bind`).
+        frames::build_parse(&mut send_buf.frame(), stmt_name.as_bytes(), sql.as_bytes(), param_oids)
+            .map_err(frame_too_long)?;
         enqueue_frame(send_buf, |wb| {
             frames::build_describe_statement(wb, stmt_name.as_bytes())
         })?;

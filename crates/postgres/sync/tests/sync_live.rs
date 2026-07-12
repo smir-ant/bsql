@@ -655,6 +655,201 @@ fn runtime_path_binds_non_copy_params() {
     c.close().expect("close");
 }
 
+/// WITNESS (D1 — dynamic-param TYPE FIDELITY, blocking twin): the dynamic
+/// `query_params` family declares each parameter's ENCODED type OID in its
+/// `Parse`, so a Rust value whose type disagrees with the SQL-inferred type is a
+/// LOUD classified server error — never a silent binary reinterpretation.
+///
+/// The exact repro: a table with a row at `id = 1094795585` (`0x41414141`, the
+/// int4 the four ASCII bytes of `"AAAA"` reinterpret to). Before the fix, binding
+/// the `&str "AAAA"` against the `int4` column `id = $1` SILENTLY matched that
+/// row (server inferred `$1 = int4`, read the text bytes as int4). After the fix,
+/// `$1` is declared `text`, so `int4 = text` has no operator — a classified `Db`
+/// error, and the connection RECOVERS. A correctly-typed and a coercible param
+/// still round-trip; the cached (promoted) plan preserves the fidelity.
+#[test]
+#[ignore = "requires local PG"]
+fn dynamic_param_type_fidelity_sync() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute_sql("CREATE TEMP TABLE d1_tf (id int4 PRIMARY KEY, big int8, name text)")
+        .expect("temp table");
+    c.execute_sql("INSERT INTO d1_tf VALUES (1094795585, 999, 'target'), (1, 100, 'one')")
+        .expect("seed rows");
+
+    // Correctly-typed param round-trips (the happy path is unregressed).
+    let row = c
+        .query_params_one("SELECT name FROM d1_tf WHERE id = $1", &(1_i32,))
+        .expect("correctly-typed int4 param round-trips");
+    assert_eq!(row.get_str(0), Ok(Some("one")));
+
+    // THE REPRO (distinct SQL so no cache interaction): a `&str` bound against the
+    // int4 `id = $1`. This MUST be a classified server error, NOT the silent match
+    // of the `id = 1094795585` row (the four ASCII bytes reinterpreted as int4).
+    let err = c
+        .query_params_one("SELECT id FROM d1_tf WHERE id = $1", &("AAAA",))
+        .expect_err("a &str bound against an int4 column must be a LOUD type error");
+    match err {
+        bsql_postgres_sync::DriverError::Db(db) => assert_eq!(
+            db.code(),
+            "42883",
+            "int4 = text has no operator — expected 42883, got {}",
+            db.code()
+        ),
+        other => panic!("wrong-typed dynamic param must be DriverError::Db(42883), got {other:?}"),
+    }
+    // The connection RECOVERS from the classified error (drained to idle).
+    let recovered = c
+        .query_params_one("SELECT id FROM d1_tf WHERE id = $1 AND true", &(1_i32,))
+        .expect("connection recovers after the classified type error");
+    assert_eq!(recovered.get_i32(0), Ok(Some(1)));
+
+    // The explicit-cast form: `$1::int4` with `"AAAA"` → the text VALUE is cast,
+    // so it is `invalid input syntax for integer` (22P02), not the byte reinterpret.
+    let cast_err = c
+        .query_params_one("SELECT $1::int4 AS v", &("AAAA",))
+        .expect_err("casting the text 'AAAA' to int4 must be a loud parse error");
+    match cast_err {
+        bsql_postgres_sync::DriverError::Db(db) => assert_eq!(
+            db.code(),
+            "22P02",
+            "text 'AAAA'::int4 is invalid_text_representation — expected 22P02, got {}",
+            db.code()
+        ),
+        other => panic!("text::int4 must be DriverError::Db(22P02), got {other:?}"),
+    }
+
+    // A COERCIBLE param is NOT over-rejected: an int8 value against an int4 `id`
+    // comparison is coerced by PG's cross-type operator (distinct SQL, first
+    // sighting), returning that row's `big`.
+    let coerced = c
+        .query_params_one("SELECT big FROM d1_tf WHERE id = $1", &(1_i64,))
+        .expect("int8 param coerces into the int4 comparison");
+    assert_eq!(coerced.get_i64(0), Ok(Some(100)));
+
+    // The CACHED (promoted) plan preserves fidelity: run a correct query 3× so it
+    // promotes to a named statement (second sighting) whose Parse also declares
+    // `P::OIDS`, then reuses it — all correct.
+    for _ in 0..3 {
+        let r = c
+            .query_params_one("SELECT id FROM d1_tf WHERE name = $1", &("one",))
+            .expect("cached-plan query round-trips");
+        assert_eq!(r.get_i32(0), Ok(Some(1)));
+    }
+
+    // CACHE TYPE-FIDELITY: the SAME SQL text bound with a DIFFERENT param type is a
+    // DISTINCT cache key, so a `float4` sighting of the just-cached `text` query is
+    // NOT reused against the text plan (which would reinterpret the 4 bytes). It is
+    // its own fresh plan — `text = float4` has no operator, a LOUD error, never a
+    // silent match. (The cache is keyed on (SQL, P::OIDS).)
+    let cross_type = c.query_params_one("SELECT id FROM d1_tf WHERE name = $1", &(1.0_f32,));
+    match cross_type {
+        Err(bsql_postgres_sync::DriverError::Db(_)) => {}
+        other => panic!("a float4 reuse of a text-cached SQL must be a loud Db error, got {other:?}"),
+    }
+    // …and the original text-typed cached plan still works (its slot is intact).
+    let still_cached = c
+        .query_params_one("SELECT id FROM d1_tf WHERE name = $1", &("one",))
+        .expect("the text-typed cached plan survives the distinct-key float4 sighting");
+    assert_eq!(still_cached.get_i32(0), Ok(Some(1)));
+
+    // `execute_params` shares the fused Parse: a wrong-typed bind is loud there too.
+    let exec_err = c
+        .execute_params("UPDATE d1_tf SET name = 'x' WHERE id = $1", &("AAAA",))
+        .expect_err("execute_params must reject a &str bound against int4");
+    assert!(matches!(exec_err, bsql_postgres_sync::DriverError::Db(_)));
+    let _ = c
+        .query_params_one("SELECT id FROM d1_tf WHERE id = $1 AND 1=1", &(1_i32,))
+        .expect("recovers");
+
+    c.close().expect("close");
+}
+
+/// MAJOR-1: the EXPLICIT prepared-statement path is type-faithful. A prepared
+/// statement has a FIXED plan (its `$N` types are pinned at Parse), so the server
+/// cannot coerce a differently-typed binary bind against it — a same-width
+/// wrong-typed bind would be silently reinterpreted. The driver retains the
+/// server-inferred parameter types and VERIFIES the caller's encoded types before
+/// the Bind, so a mismatch is a LOUD client-side `ParamTypeMismatch`, never the
+/// silent `id = 1094795585` match.
+#[test]
+#[ignore = "requires local PG"]
+fn prepared_param_type_fidelity_sync() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute_sql("CREATE TEMP TABLE pf_tf (id int4 PRIMARY KEY, name text)")
+        .expect("temp table");
+    c.execute_sql("INSERT INTO pf_tf VALUES (1094795585, 'target'), (1, 'one')")
+        .expect("seed rows");
+
+    let stmt = c
+        .prepare("SELECT name FROM pf_tf WHERE id = $1")
+        .expect("prepare");
+
+    // Correctly-typed param round-trips (happy path unregressed).
+    let ok = c.query_prepared(&stmt, &(1_i32,)).expect("correct int4 binds");
+    let ok_row = ok.get(0).expect("one row");
+    assert_eq!(ok_row.get_str(0), Ok(Some("one")));
+
+    // THE REPRO: a `&str` bound against the int4 `$1`. Was `id = 1094795585`
+    // (the four ASCII bytes reinterpreted as int4); now a client-side reject
+    // BEFORE the Bind — no server round trip, connection untouched.
+    let err = c
+        .query_prepared(&stmt, &("AAAA",))
+        .expect_err("a &str bound to an int4 prepared param must be a LOUD reject");
+    match err {
+        bsql_postgres_sync::DriverError::ParamTypeMismatch { index, expected, found } => {
+            assert_eq!(index, 0, "the first ($1) parameter");
+            assert_eq!(expected, 23, "server inferred int4 (OID 23)");
+            assert_eq!(found, 25, "the client bound text (OID 25)");
+        }
+        other => panic!("expected ParamTypeMismatch, got {other:?}"),
+    }
+
+    // The connection is UNTOUCHED by the client-side reject (no Bind was sent):
+    // the SAME statement runs correctly immediately after.
+    let after = c.query_prepared(&stmt, &(1_i32,)).expect("stmt still usable");
+    let after_row = after.get(0).expect("one row");
+    assert_eq!(after_row.get_str(0), Ok(Some("one")));
+
+    // Arity mismatch is caught client-side too (the tuple supplies the wrong
+    // number of params for the statement's one placeholder).
+    let arity = c
+        .query_prepared(&stmt, &(1_i32, 2_i32))
+        .expect_err("2 params for a 1-param statement must be a LOUD reject");
+    assert!(
+        matches!(
+            arity,
+            bsql_postgres_sync::DriverError::ParamCountMismatch { expected: 1, found: 2 }
+        ),
+        "expected ParamCountMismatch {{1,2}}, got {arity:?}"
+    );
+
+    // `execute_prepared` verifies identically.
+    let dml = c
+        .prepare("UPDATE pf_tf SET name = 'x' WHERE id = $1")
+        .expect("prepare dml");
+    let dml_err = c
+        .execute_prepared(&dml, &("AAAA",))
+        .expect_err("execute_prepared rejects a &str bound to int4");
+    assert!(matches!(
+        dml_err,
+        bsql_postgres_sync::DriverError::ParamTypeMismatch { .. }
+    ));
+
+    // A COERCIBLE type is STRICT-rejected on the fixed-plan path (unlike the
+    // dynamic path where PG coerces): the plan pinned int4, an int8 bind cannot
+    // reinterpret against it, so the client rejects it with a clear message
+    // rather than letting the server misread the 8 bytes.
+    let coerce = c
+        .query_prepared(&stmt, &(1_i64,))
+        .expect_err("int8 against a fixed int4 plan is strict-rejected client-side");
+    assert!(matches!(
+        coerce,
+        bsql_postgres_sync::DriverError::ParamTypeMismatch { expected: 23, found: 20, .. }
+    ));
+
+    c.close().expect("close");
+}
+
 #[test]
 #[ignore = "requires local PG"]
 fn streaming_1k_rows() {

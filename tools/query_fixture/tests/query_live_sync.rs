@@ -378,6 +378,77 @@ fn typed_params_int_and_text_round_trip() {
     c.close().expect("close");
 }
 
+/// THREE-PATH PARITY ORACLE (D1): a parameter's declared type is honored on ALL
+/// of bsql's type-checked binding surfaces — none silently coerces a wrong-typed
+/// value into a wrong result. For the SAME `SELECT $1::int4` shape:
+///
+/// 1. **PG TYPED (`query!`)** — a CORRECT int4 binds and round-trips; a WRONG
+///    `&str` is a COMPILE error (the `Q::Params` tuple rejects it), witnessed by
+///    the sibling `compile_fail/query_arg_type_mismatch.rs` trybuild golden. This
+///    same shared macro/tuple rejects the wrong type on the SQLITE typed path too
+///    (one mechanism, both backends).
+/// 2. **PG DYNAMIC (`query_params`)** — the CORRECT int4 gives the SAME result as
+///    the typed path (they agree), and the WRONG `&str` is now a LOUD classified
+///    runtime error (declared `P::OIDS` in the `Parse`), NOT a silent reinterpret.
+/// 3. **SQLite** — the typed `query!` bind rejects the wrong type at COMPILE (the
+///    same shared tuple), and a storage-class mismatch on decode is the classified
+///    `SqliteError::TypeMismatch` (witnessed in the SQLite driver's `basic.rs`).
+///
+/// Before D1, path 2 was the lone hole (a silent binary reinterpretation); this
+/// asserts it now AGREES with paths 1 and 3 — a wrong-typed bind is refused
+/// everywhere, and a correct bind gives the one identical result on both PG paths.
+#[test]
+#[ignore = "requires local PG"]
+fn param_type_fidelity_three_path_parity() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+
+    // Path 1 (TYPED) and path 2 (DYNAMIC) AGREE on the correct int4 → 42.
+    let typed = c.query_one::<EchoQuery>((42,)).expect("typed int4 round-trips");
+    assert_eq!(typed.n, 42);
+    let dynamic = c
+        .query_params_one("SELECT $1::int4 AS n", &(42_i32,))
+        .expect("dynamic int4 round-trips");
+    assert_eq!(dynamic.get_i32(0), Ok(Some(42)), "the dynamic path agrees with the typed path");
+
+    // Path 2 (DYNAMIC): the WRONG `&str` is now a LOUD runtime error (was the
+    // silent-reinterpret hole). `text 'AAAA'::int4` is invalid_text_representation.
+    let wrong = c
+        .query_params_one("SELECT $1::int4 AS n", &("AAAA",))
+        .expect_err("a &str bound where int4 is required must be a LOUD classified error");
+    match wrong {
+        DriverError::Db(db) => assert_eq!(
+            db.code(),
+            "22P02",
+            "text 'AAAA'::int4 must be a classified 22P02, got {}",
+            db.code()
+        ),
+        other => panic!("the dynamic wrong-typed bind must be DriverError::Db, got {other:?}"),
+    }
+    // Path 1 (TYPED) rejects the SAME wrong bind at COMPILE — `c.query_one::<EchoQuery>(("AAAA",))`
+    // does not compile (the `EchoQuery::Params<'p>` is `(i32,)`), pinned by the
+    // `compile_fail/query_arg_type_mismatch.rs` trybuild golden. The connection is
+    // still usable after the dynamic error (drained to idle):
+    let recovered = c.query_one::<EchoQuery>((7,)).expect("typed path recovers");
+    assert_eq!(recovered.n, 7);
+
+    // Path 3 (EXPLICIT PREPARED) agrees, and is STRICTER than the dynamic path: a
+    // prepared statement's plan is FIXED, so the driver rejects the wrong-typed
+    // bind CLIENT-side (before any Bind), whereas the dynamic path relies on the
+    // server. Same SQL as the other paths ($1 inferred int4).
+    let pstmt = c.prepare("SELECT $1::int4 AS n").expect("prepare");
+    let pok = c.query_prepared(&pstmt, &(42_i32,)).expect("prepared int4 round-trips");
+    assert_eq!(pok.get(0).and_then(|r| r.get_i32(0).ok().flatten()), Some(42));
+    let pwrong = c
+        .query_prepared(&pstmt, &("AAAA",))
+        .expect_err("the prepared path rejects the wrong bind CLIENT-side");
+    assert!(
+        matches!(pwrong, DriverError::ParamTypeMismatch { expected: 23, found: 25, .. }),
+        "the prepared path is a client-side ParamTypeMismatch (int4 vs text), got {pwrong:?}"
+    );
+
+    c.close().expect("close");
+}
+
 /// A nullable column decodes `NULL -> None` and a present value -> `Some` on the
 /// SAME `Option<T>` record field — proving nullable decode end-to-end.
 #[test]

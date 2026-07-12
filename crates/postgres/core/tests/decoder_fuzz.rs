@@ -439,6 +439,13 @@ fn text_and_misc_decoders() -> Vec<NamedDecoder> {
         ("parse_column_names", |b| {
             bsql_postgres_proto::decode::parse_column_names(b).is_ok()
         }),
+        // A statement `Describe`'s `ParameterDescription` — untrusted server bytes
+        // turned into the prepared statement's parameter-type OIDs (the fixed-plan
+        // type check reads these). Must be total: a hostile / truncated frame is
+        // `None`, never a panic.
+        ("parse_param_description", |b| {
+            bsql_postgres_proto::decode::parse_param_description(b).is_some()
+        }),
     ]
 }
 
