@@ -607,6 +607,50 @@ impl core::fmt::Debug for Connection {
     }
 }
 
+/// Enable WAL journaling, retrying on `SQLITE_BUSY` / `SQLITE_LOCKED` up to
+/// [`DEFAULT_BUSY_TIMEOUT`].
+///
+/// `PRAGMA journal_mode=WAL` needs a momentary EXCLUSIVE lock. When two
+/// connections open the SAME fresh file at once (the documented "two instances
+/// booting together SERIALIZE" migration path) and BOTH attempt the switch,
+/// SQLite returns `SQLITE_BUSY` WITHOUT invoking the busy handler — it
+/// deliberately bypasses the handler to break the shared-lock-upgrade deadlock
+/// (both connections hold a SHARED lock and each waits for the other to release
+/// it), so [`DEFAULT_BUSY_TIMEOUT`] alone does NOT cover this race. The fix is an
+/// application-level back-off: retry the switch until it takes. Once EITHER
+/// connection wins, WAL is a PERSISTENT database-file property, so the loser's
+/// retry finds it already WAL and succeeds. Bounded by the same
+/// [`DEFAULT_BUSY_TIMEOUT`] budget so a genuinely stuck file still fails LOUD
+/// (`SqliteError::Open`), never a hang. A non-busy error is returned immediately.
+fn enable_wal_with_retry(inner: &rusqlite::Connection) -> Result<(), SqliteError> {
+    const RETRY_SLEEP: Duration = Duration::from_millis(5);
+    let start = std::time::Instant::now();
+    loop {
+        match inner.execute_batch("PRAGMA journal_mode=WAL;") {
+            Ok(()) => return Ok(()),
+            Err(e) if is_busy_or_locked(&e) && start.elapsed() < DEFAULT_BUSY_TIMEOUT => {
+                std::thread::sleep(RETRY_SLEEP);
+            }
+            Err(e) => return Err(SqliteError::Open(e.to_string())),
+        }
+    }
+}
+
+/// Whether a raw rusqlite error is a `SQLITE_BUSY` / `SQLITE_LOCKED` lock
+/// contention (the retryable class for the WAL-switch back-off). Classified on
+/// the raw error because the `open` path maps every failure to the string
+/// `SqliteError::Open`, which drops the primary code `is_busy` reads.
+fn is_busy_or_locked(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(
+                f.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 impl Connection {
     /// Wrap an already-configured rusqlite connection into a driver `Connection`,
     /// initialising the (feature-gated) N+1 tracker. The single construction seam
@@ -622,14 +666,27 @@ impl Connection {
 
     /// Open (or create) a database at `path`, enabling WAL journaling and
     /// foreign-key enforcement, and a [`DEFAULT_BUSY_TIMEOUT`] so a briefly-locked
-    /// database waits (bounded) rather than failing instantly under WAL contention.
+    /// database waits (bounded) rather than failing instantly. Two processes
+    /// opening the SAME fresh file at once race on the one-time WAL-mode switch;
+    /// that switch is made robust by a bounded retry (see `enable_wal_with_retry`)
+    /// because SQLite bypasses the busy handler for exactly that contention.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
         let inner = rusqlite::Connection::open(path).map_err(|e| SqliteError::Open(e.to_string()))?;
-        inner
-            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| SqliteError::Open(e.to_string()))?;
+        // Arm the busy handler FIRST, before touching any db lock — a
+        // `set_busy_timeout(Duration::ZERO)` after open still restores immediate
+        // fail-loud for subsequent contended writes (it overrides this default).
         inner
             .busy_timeout(DEFAULT_BUSY_TIMEOUT)
+            .map_err(|e| SqliteError::Open(e.to_string()))?;
+        // Enable WAL with a bounded retry (see `enable_wal_with_retry`): the
+        // switch races on a fresh file two processes open at once, and SQLite
+        // BYPASSES the busy handler for that particular contention, so the timeout
+        // alone does not cover it.
+        enable_wal_with_retry(&inner)?;
+        // `foreign_keys` is a connection-local setting (no db lock), so it never
+        // contends and needs no retry.
+        inner
+            .execute_batch("PRAGMA foreign_keys=ON;")
             .map_err(|e| SqliteError::Open(e.to_string()))?;
         Ok(Self::wrap(inner))
     }

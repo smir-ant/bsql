@@ -225,7 +225,12 @@ fn non_transactional_migration_applies_and_records() {
 
 /// WITNESS (concurrency): two runners over the SAME database FILE apply the set
 /// exactly once between them — no double-apply. `BEGIN IMMEDIATE` + the in-txn
-/// ledger re-check serialize them.
+/// ledger re-check serialize them. Also exercises the fresh-file concurrent-OPEN
+/// path: both `Connection::open` calls race on the one-time `journal_mode=WAL`
+/// switch, and SQLite bypasses the busy handler for that shared-lock-upgrade
+/// contention, so `open` retries the switch (see `connection.rs::open` /
+/// `enable_wal_with_retry`) — otherwise the losing open fails with
+/// `database is locked` before either runner even begins.
 #[test]
 fn two_concurrent_runners_apply_exactly_once() {
     let dir = tempdir("mig-concurrent");
