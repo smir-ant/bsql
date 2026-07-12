@@ -23,12 +23,11 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 ///
 /// PostgreSQL does not impose a hard limit on password length, but
 /// SCRAM-SHA-256 with PBKDF2 processes the full password on every
-/// authentication. SCRAM uses SASLprep normalisation on the password
-/// bytes; UTF-8 NFKC expansion is bounded at ~4× the input-char count
-/// in the pathological case (combining marks). 512 B accommodates 128
-/// normalized UTF-8 chars — a huge password for any realistic
-/// workflow (industry practice: argon2 accepts arbitrary input but
-/// real deployments cap at ~128; bcrypt truncates at 72).
+/// authentication. 512 B is a generous cap for any realistic workflow
+/// (industry practice: argon2 accepts arbitrary input but real
+/// deployments cap at ~128; bcrypt truncates at 72). This is a no_std
+/// crate: it stores the password bytes VERBATIM and performs no
+/// Unicode transformation of its own.
 ///
 /// Halves of this cap propagate through `Password` size →
 /// `Sensitive<Password>` → `Credentials::ScramPassword` →
