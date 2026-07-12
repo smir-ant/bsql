@@ -44,20 +44,21 @@ Load-bearing decisions for any new session:
 
 ```
 crates/
-  bsql/              — umbrella facade + query! re-export + #[bsql::test] harness (bsql::pg, ::pg_sync, ::sqlite)  — 947 LoC
+  bsql/              — umbrella facade + query! re-export + #[bsql::test] harness (bsql::pg, ::pg_sync, ::sqlite) + the ONE cross-backend bsql::N1Report  — 1650 LoC
   postgres/
     proto/           — sans-IO wire protocol + session engine (no_std + alloc) + PGCOPY binary framing + TypedCopyIn  — 29678 LoC
-    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + N+1 detector + SafeIdent guard + cancel key/redial + copy_in_typed + dynamic prepared-statement cache + migration runner  — 12281 LoC
+    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + SafeIdent guard + cancel key/redial + copy_in_typed + dynamic prepared-statement cache + migration RUNNER (PG I/O; pure logic in bsql-common) + N+1 re-export  — 13928 LoC
     async/           — tokio async driver (plugs its socket into the shared Core<S>) + CancelToken + migration-runner try-lock poll  — 2651 LoC
     sync/            — std::net blocking driver (plugs its socket into the shared Core<S>) + CancelToken + migration-runner try-lock poll  — 2558 LoC
   sqlite/
-    driver/          — embedded SQLite driver (bundled rusqlite) + typed query! runtime + explicit prepared-statement handles + interrupt CancelToken + N+1 detector + migration runner  — 4656 LoC
+    driver/          — embedded SQLite driver (bundled rusqlite) + typed query! runtime + explicit prepared-statement handles + interrupt CancelToken + migration RUNNER (SQLite I/O; pure logic in bsql-common) + N+1 re-export  — 4059 LoC
+  common/            — ZERO-DEP leaf: migration PURE logic (checksum/ordering/drift authority + source loader) + N+1 detector (feature `n1`) — ONE compiled source both PG core + SQLite depend on (was two hand-maintained copies)  — 1065 LoC
   testkit/           — deterministic in-memory fake PostgreSQL for driver tests (no network)  — 1005 LoC
   build/             — BUILD-DEP: migration DDL → schema catalog (+ SQLite template) + shared $N→?N placeholder authority + migration embed (emit_migrations)  — 36279 LoC
   query-macros/      — PROC-MACRO: query! + copy! (types/validates against the catalog; emits the PostgreSQL + SQLite typed bridges) + #[bsql::test] (schema-per-test wrapper)  — 2507 LoC
 ```
 
-(src LoC measured per crate via `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by `src/infer.rs` (29563 lines: the schema/type-inference engine plus a ~13K-line inline `#[cfg(test)]` test module). Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync}`, `bsql-sqlite`, `bsql-testkit`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-bridge-fixture`, `bsql-query-sqlite-fixture`, `bsql-test-harness-fixture`, `bsql-corpus`.)
+(src LoC measured per crate via `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by `src/infer.rs` (29563 lines: the schema/type-inference engine plus a ~13K-line inline `#[cfg(test)]` test module). Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync}`, `bsql-sqlite`, `bsql-common`, `bsql-testkit`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-bridge-fixture`, `bsql-query-sqlite-fixture`, `bsql-test-harness-fixture`, `bsql-corpus`.)
 
 ## Build & test
 
@@ -101,7 +102,8 @@ cargo test  -p bsql --features test-harness --lib                       # harnes
 BSQL_TEST_DSN=postgres://USER@localhost/postgres \
   cargo test -p bsql-test-harness-fixture -- --ignored                  # live #[bsql::test] isolation witness (needs PG)
 cargo clippy --workspace --features n1-detect --all-targets             # lint the (non-default) N+1 detector reshape
-cargo test  -p bsql-postgres-core --features n1-detect --lib n1::       # N1Tracker offline unit tests
+cargo test  -p bsql-common                                             # migration pure-logic offline unit tests (checksum / order / drift)
+cargo test  -p bsql-common --features n1                                # + N1Tracker offline unit tests (the ONE shared source)
 BSQL_TEST_DSN=postgres://USER@localhost/postgres \
   cargo test -p bsql-query-fixture --features n1-detect -- --ignored    # live N+1-detection witness (needs PG)
 ```
@@ -315,28 +317,50 @@ call sites of the same query are never conflated. No external dependency (a carg
 feature only). The `tools/query_fixture` `n1-detect` feature + its
 `tests/n1_detect_live.rs` are the end-to-end proof (N+1 flagged with source +
 count, no false positive on a one-shot or across distinct lines, all results
-still correct). The SAME detector is a CROSS-BACKEND feature: the SQLite driver
-carries its own `n1-detect` feature over the SAME `N1Report` shape / threshold /
-window-reset-at-transaction semantics, so `conn.n1_report()` reads identically on
-both backends and a consumer relying on the net in tests does not lose it when the
-backend is SQLite. SQLite's is SIMPLER than the async PG driver's RPIT reshape —
-its verbs are plain blocking `fn`, so `#[track_caller]` works directly (no future
-reshape); the tracker is a self-contained COPY (a `bsql-postgres-core` dependency
-would drag the whole PG + rustls tree into the embedded crate), so it adds no
-external dependency. Witnessed by `tools/query_sqlite_fixture`'s `n1-detect`
-feature + `tests/n1_detect_sqlite.rs`.
+still correct). The SAME detector is a CROSS-BACKEND feature: the tracker
+(`N1Tracker` / `N1Report` / the recency window + its 384-byte footprint pin)
+lives ONCE in the dependency-free `bsql-common` leaf crate, behind its default-off
+`n1` feature. Each driver's `n1-detect` forwards to `bsql-common/n1` and
+RE-EXPORTS the type, so `conn.n1_report()` returns the SAME
+`bsql_common::N1Report` on EVERY backend — the async PG driver, the sync PG
+driver, AND SQLite — and `bsql::N1Report` is that ONE canonical type (a consumer
+can write a single `fn(&bsql::N1Report)` over both backends; the umbrella carries
+a compile-time `const _` fn-pointer-coercion proof that the type is single, so a
+regression re-forking it turns the build red). This REPLACES the former
+hand-maintained COPY in each driver — the copies had already drifted (the SQLite
+copy dropped `window_evicts_lru_beyond_capacity` and abbreviated two tests); the
+single source heals that. The embedded SQLite crate keeps its
+zero-`bsql-postgres-core` boundary precisely because `bsql-common` has NO
+dependencies at all (it drags in no PG / rustls tree). SQLite's `n1-detect` path
+is SIMPLER than the async PG driver's RPIT reshape — its verbs are plain blocking
+`fn`, so `#[track_caller]` works directly (no future reshape) — but both now share
+the ONE `bsql-common` tracker. Witnessed by `tools/query_sqlite_fixture`'s
+`n1-detect` feature + `tests/n1_detect_sqlite.rs`, the `bsql-common` offline unit
+tests, and the umbrella's single-type proof.
 
 **Migration runner — `conn.run_migrations(source)`.** The one product gap
 between build-time schema validation and a live database: a runtime capability
 on all three drivers (async PG, sync PG, SQLite) that APPLIES a consumer's
 migration set. Always available (adds NO dependency — the checksum is dep-free
-FNV-1a-64, not `scram`-gated `sha2`). The PostgreSQL logic lives ONCE over the
-transport-generic `Core<S>` (so async/sync are a compiler guarantee); the SQLite
-runner is a self-contained twin over the SAME `MigrationSource` shape, ledger,
-checksum, drift classification, embed slice, and `run_migrations` /
-`migration_status` / `dry_run_migrations` verbs (its pure logic a COPY, like the
-N+1 detector — the embedded crate depends on no `bsql-postgres-core`; the offline
-tests pin both copies to the SAME known-answer checksum vector). **Correctness:**
+FNV-1a-64, not `scram`-gated `sha2`). The runner's transport-agnostic PURE logic
+— the FNV-1a-64 checksum, the `/`-normalized name ORDERING authority + source
+loader + duplicate-name pre-flight, the drift classification (`plan()`), and the
+plain data / error types (`MigrationSource` / `AppliedMigration` /
+`MigrationReport` / `MigrationStatus` / `MigrationSourceError` / `DriftKind`) —
+lives ONCE in the dependency-free `bsql-common` leaf crate, so the checksum,
+apply order, and drift semantics are a COMPILER FACT identical on both backends,
+not a test-pinned convention (this REPLACES the former hand-maintained COPY in
+each driver + its known-answer cross-pin vector). The per-backend I/O RUNNER
+stays in each driver: the PostgreSQL half lives ONCE over the transport-generic
+`Core<S>` (so async/sync are a compiler guarantee) with its non-blocking
+advisory-lock poll and its own `MigrationError` (carrying a `LockTimeout` variant
+SQLite has no peer for); the SQLite half is the `BEGIN IMMEDIATE` +
+in-transaction re-check twin, over the SAME shared `MigrationSource` / ledger /
+`run_migrations` / `migration_status` / `dry_run_migrations` verbs. Both bridge to
+the shared classifier through `bsql_common::migrate::plan() -> Result<usize,
+Drift>` plus a per-backend `From<Drift>` / `From<MigrationSourceError>`; the ledger
+SQL text (`timestamptz`/`now()`/`$N` vs `TEXT`/`datetime('now')`/`?`) legitimately
+differs and stays per-driver. **Correctness:**
 (a) EXACTLY ONCE, in the SAME lexicographic-by-name order the build-time catalog
 replay uses — ONE genuine ordering authority: the build's `scan_sql_tree` sorts
 by the SAME `/`-normalized relative-name STRING key the runner sorts by (NOT the
