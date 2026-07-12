@@ -83,6 +83,7 @@ cargo test -p bsql-postgres-sync  --test sync_live cancel_token_stops -- --ignor
 cargo test -p bsql-postgres-async --test pool_liveness -- --ignored   # async pool dead-peer liveness (get() bounded, not a hang; PG behind a black-hole relay)
 cargo test -p bsql-postgres-sync  --test pool_liveness -- --ignored   # sync  pool dead-peer liveness (get() bounded, not a hang; PG behind a black-hole relay)
 cargo test -p bsql-postgres-async --test tls_fragmentation -- --ignored  # TLS byte-fragmentation reassembly gate (the owner's-burn regression net): a self-contained ephemeral SSL PG behind a 1/3-byte fragmenting relay; handshake + multi-record result + 300 KB record-spanning value + stream reassemble byte-exact, is_encrypted, zero panics/hangs. Skips cleanly if no initdb/openssl or run as root
+cargo test -p bsql-postgres-async --test channel_binding_plus -- --ignored  # live SCRAM-SHA-256-PLUS witness: a self-contained ephemeral SSL + SCRAM PG (initdb + openssl self-signed cert + password_encryption=scram-sha-256 + a hostssl scram login role) it starts itself; channel_binding=Require/Prefer over TLS AUTHENTICATE (real PG only accepts the tls-server-end-point cert hash a correct -PLUS proof carries), and channel_binding=Require over plaintext FAILS CLOSED (DriverError::Config). Skips cleanly if no initdb/openssl/psql or run as root
 cargo test -p bsql-postgres-async --test midstream_faults -- --ignored  # async mid-stream fault matrix (server error / cancel-57014 / transport-death FIN mid-result / pg_terminate_backend / dropped future): each is a classified Err in bounded time, connection recovers OR evicts as NotReady, never a torn "success" and never a hang; no leak over a repeat loop
 cargo test -p bsql-postgres-sync  --test midstream_faults -- --ignored  # sync mid-stream fault matrix (same, minus the dropped-future class the blocking driver has no peer for)
 cargo test -p bsql-postgres-async --test streaming_scale -- --ignored  # live constant-memory scale gate: query_each_sql streams 5M rows with RSS O(1) in row count (coarse ps -o rss= delta vs a 10k stream, generous 48 MiB margin) + exact count/Gauss-sum/order — the live peer of the offline engine_query_break_alloc gate
@@ -1209,11 +1210,22 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `scram_require_*` / `scram_prefer_sends_y_flag_without_plus` — `-PLUS` actually
   SELECTED not plain SCRAM, a binding MISMATCH fails, `require` refuses, `y,,`
   anti-downgrade). The `-PLUS` LIVE witness needs a TLS-enabled SCRAM server (the
-  standard local PG has `ssl=off`, so it is not in the offline suite); it was
-  verified against an ephemeral SSL+SCRAM PostgreSQL (`require` over TLS AUTHs =
-  `-PLUS` used and the `tls-server-end-point` hash accepted by real PG; `require`
-  over a non-TLS server fails closed). Channel binding is entirely `scram`-gated;
-  the `next_event` hotpath is unaffected (SCRAM is the connecting phase).
+  standard local PG has `ssl=off`, so it is not in the DEFAULT offline suite); it
+  now lives IN-REPO as the `--ignored` `channel_binding_plus` test
+  (`crates/postgres/async/tests/channel_binding_plus.rs`), which stands up its OWN
+  ephemeral SSL + SCRAM PostgreSQL (a temp `initdb` cluster + a self-signed
+  CA -> leaf chain + `ssl=on` + `password_encryption=scram-sha-256` + a
+  `hostssl ... scram-sha-256` login role, torn down on drop like
+  `tls_fragmentation`; it SKIPS cleanly if `initdb`/`openssl`/`psql` are absent or
+  it runs as root) and asserts, against real PG: `channel_binding=Require`/`Prefer`
+  over TLS AUTHENTICATE (`-PLUS` used and the `tls-server-end-point` hash accepted
+  by real PostgreSQL — a `Require` client can send only `p=tls-server-end-point,,`,
+  and a `-PLUS`-offering server rejects a `y,,` downgrade, so a green auth is a
+  proof the `-PLUS` proof carried the right cert hash), and `channel_binding=Require`
+  over a plaintext channel fails closed (`DriverError::Config`). This CLOSES the
+  gap the note formerly flagged (a prior OUT-OF-BAND ephemeral verification is now
+  a committed in-repo witness). Channel binding is entirely `scram`-gated; the
+  `next_event` hotpath is unaffected (SCRAM is the connecting phase).
 - The whole MD5-password authentication capability
   (`AuthenticationMD5Password`, sub-code 5) is behind the default-on `md5-auth`
   feature (proto → core → drivers → umbrella; each shipped dependent takes proto
