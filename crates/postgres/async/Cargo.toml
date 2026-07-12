@@ -1,6 +1,6 @@
 [package]
 name = "bsql-postgres-async"
-version = "0.1.0-alpha.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.95"
 description = "Async PostgreSQL driver built on bsql-pg-proto sans-IO state machine"

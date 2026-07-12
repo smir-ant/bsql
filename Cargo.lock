@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "bsql"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.0"
 dependencies = [
  "bsql-postgres-async",
  "bsql-postgres-core",
@@ -98,7 +98,7 @@ version = "0.0.0"
 
 [[package]]
 name = "bsql-postgres-async"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.0"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-core"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.0"
 dependencies = [
  "bsql-common",
  "bsql-devgates",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-sync"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.0"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-sqlite"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.0"
 dependencies = [
  "bsql-common",
  "bsql-devgates",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-testkit"
-version = "0.1.0-alpha.0"
+version = "1.0.0-alpha.0"
 dependencies = [
  "bsql-postgres-async",
  "bsql-postgres-core",

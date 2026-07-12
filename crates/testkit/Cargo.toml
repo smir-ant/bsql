@@ -1,6 +1,6 @@
 [package]
 name = "bsql-testkit"
-version = "0.1.0-alpha.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.95"
 description = "Deterministic in-memory fake PostgreSQL for testing bsql driver code with no network"

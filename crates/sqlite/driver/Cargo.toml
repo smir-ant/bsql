@@ -1,6 +1,6 @@
 [package]
 name = "bsql-sqlite"
-version = "0.1.0-alpha.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.95"
 description = "Lightweight SQLite driver with API-compatible Row type"
