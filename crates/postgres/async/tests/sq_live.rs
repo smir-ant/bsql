@@ -1610,10 +1610,14 @@ async fn scram_auth() {
 /// rejected the proof with `28P01`. It is the exact peer of libpq, which has
 /// always authenticated this password.
 ///
-/// The password is mutated and RESTORED over a `smir-ant` trust connection; the
-/// connect Result is captured BEFORE the restore, so even a failed connect
-/// leaves the role back on its original password and the `scram_auth` test above
-/// stays green. The password constant contains no `'`, so the fixed-literal
+/// The password is mutated and RESTORED over a `smir-ant` trust connection. The
+/// assert-bearing body runs inside a `tokio::spawn`, so a panic ANYWHERE in it
+/// (a failed connect, a wrong `current_user`) is CONTAINED in the `JoinHandle`
+/// rather than propagated — the restore below then ALWAYS runs, and the original
+/// panic is re-raised AFTER the role is back on its password so the
+/// `scram_auth` test above stays green. This is the async-native equivalent of
+/// an RAII/`catch_unwind` restore guard (a `Drop` guard cannot `.await` the
+/// restore). The password constant contains no `'`, so the fixed-literal
 /// `ALTER ROLE` splice has no injection surface.
 #[tokio::test]
 #[ignore = "requires local PG with scram-sha-256 auth (mutates+restores bsql_test_scram password)"]
@@ -1629,26 +1633,36 @@ async fn scram_saslprep_normalizes_a_unicode_password() {
         .await
         .expect("set the SASLprep-sensitive password");
 
-    // Connect as bsql_test_scram with the RAW unicode password — bsql SASLpreps.
-    let scram_cfg = ConnectConfig::new("127.0.0.1", "bsql_test_scram")
-        .database("postgres".to_string())
-        .password(UNICODE_PW.to_string());
-    let connect_result = Connection::connect(&scram_cfg).await;
+    // Run the panic-prone body as a spawned task so its panic is caught in the
+    // JoinHandle; the restore below is thereby guaranteed to run.
+    let outcome = tokio::spawn(async {
+        // Connect as bsql_test_scram with the RAW unicode password — bsql SASLpreps.
+        let scram_cfg = ConnectConfig::new("127.0.0.1", "bsql_test_scram")
+            .database("postgres".to_string())
+            .password(UNICODE_PW.to_string());
+        let mut c = Connection::connect(&scram_cfg)
+            .await
+            .expect("SCRAM auth with a raw unicode (SASLprep-mapped) password must succeed");
+        assert_eq!(
+            c.query_sql("SELECT current_user").await.expect("q").get(0).expect("row 0").get_raw(0),
+            Ok(Some(b"bsql_test_scram".as_slice())),
+        );
+        c.close().await.expect("close");
+    })
+    .await;
 
-    // Restore BEFORE asserting, so a failed connect still leaves the role usable.
+    // Restore ALWAYS, even if the body above panicked.
     admin
         .execute_sql(&format!("ALTER ROLE bsql_test_scram PASSWORD '{ORIGINAL_PW}'"))
         .await
         .expect("restore the original password");
     admin.close().await.expect("admin close");
 
-    let mut c = connect_result
-        .expect("SCRAM auth with a raw unicode (SASLprep-mapped) password must succeed with the fix");
-    assert_eq!(
-        c.query_sql("SELECT current_user").await.expect("q").get(0).expect("row 0").get_raw(0),
-        Ok(Some(b"bsql_test_scram".as_slice())),
-    );
-    c.close().await.expect("close");
+    // Re-raise a body panic now that the role is restored, so the test still fails
+    // loudly if the SASLprep fix regresses.
+    if let Err(join_err) = outcome {
+        std::panic::resume_unwind(join_err.into_panic());
+    }
 }
 
 #[tokio::test]

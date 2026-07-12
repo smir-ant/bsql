@@ -32,6 +32,19 @@
 //! SASLprep actually rewrites (non-ASCII → mapping / NFKC) yields a `Cow::Owned`
 //! heap `String`, wrapped in `Zeroizing` so the normalised plaintext is scrubbed
 //! after it is copied into the zeroize-on-drop [`Password`].
+//!
+//! # Honest zeroize limitation
+//!
+//! On the non-ASCII path, `stringprep`'s internal NFKC normalisation allocates
+//! its own transient `String` / iterator buffers that briefly hold the password
+//! plaintext, and those are NOT zeroized — this is inherent to the vetted crate
+//! (the same holds for `sqlx` / `tokio-postgres`, which use it identically), and
+//! bsql does not fork it to add scrubbing. Only bsql's OWN output copy is
+//! scrubbed: the `Cow::Owned` `String` (via `Zeroizing`) and the `Password`
+//! buffer (`ZeroizeOnDrop`). So a reader should not over-trust the zeroize
+//! coverage here as end-to-end — the guarantee is "bsql's retained copies are
+//! scrubbed", not "no plaintext ever touches un-scrubbed heap". The ASCII
+//! fast-path allocates nothing and so has no such transient.
 
 use crate::error::DriverError;
 use bsql_postgres_proto::Password;

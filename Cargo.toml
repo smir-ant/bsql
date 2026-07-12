@@ -357,9 +357,10 @@ getrandom = { version = "0.2", default-features = false }
 # PBKDF2, exactly as PostgreSQL/libpq/JDBC do when building the stored
 # verifier). SASLprep is expert-domain Unicode (RFC 3454 mapping +
 # NFKC + bidi + prohibited-codepoint tables) — DEF-META-01 / Policy 9
-# forbids hand-rolling it; `stringprep` is the vetted implementation
-# (RustCrypto/PyCA-adjacent, by the `rust-native-tls`/`postgres`
-# author, and the same crate `sqlx` / `tokio-postgres` use for SCRAM).
+# forbids hand-rolling it; `stringprep` is the vetted implementation by
+# Steven Fackler (sfackler — author of `rust-postgres` / `rust-native-tls`
+# / `rust-openssl`), and the same crate `sqlx` / `tokio-postgres` use for
+# SCRAM.
 # Gated behind `bsql-postgres-core`'s default-on `scram` feature so a
 # `scram`-off build pulls neither it nor its Unicode subtree. It is a
 # std crate (Unicode tables), which is exactly why it lives in the std
