@@ -74,6 +74,7 @@ cargo test -p bsql-devgates --test test_count          # README test-count doc-v
 cargo test -p bsql-devgates --test cross_platform      # Windows/Linux cross-target regression gate (cargo check --no-default-features; NO-OP-PASS when the target isn't `rustup target add`-ed)
 cargo test -p bsql-postgres-proto --test engine_hotpath_codegen  # next_event codegen-stability gate (panic-free + instruction ceiling)
 cargo test -p bsql-postgres-core --test decoder_fuzz   # decoder total-function gate (dep-free fuzz: no decoder panics on any input)
+cargo test -p bsql-testkit --test wide_overcap_stress  # wide over-cap teardown-under-load gate (offline testkit: a too-wide RowDescription up to i16::MAX drains + recovers the connection every iteration of a 40× loop, both drivers)
 cargo test -p bsql-sqlite            # SQLite (no PG needed)
 cargo test -p bsql-postgres-async --test sq_live -- --ignored    # async PG (needs local PG)
 cargo test -p bsql-postgres-sync --test sync_live -- --ignored   # sync PG (needs local PG)

@@ -569,7 +569,7 @@ regenerates them in place with
 `BSQL_TEST_COUNT_PIN=overwrite cargo test -p bsql-devgates --test test_count`.
 The numbers therefore cannot silently rot.
 
-- **Test functions: 2314** — every `#[test]` / `#[tokio::test]` attribute in the
+- **Test functions: 2318** — every `#[test]` / `#[tokio::test]` attribute in the
   TRACKED sources (`git ls-files`, so an untracked scratch test or a sibling git
   worktree cannot inflate the count):
   ```bash
