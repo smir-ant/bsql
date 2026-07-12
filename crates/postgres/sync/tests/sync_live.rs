@@ -1659,7 +1659,6 @@ fn prepared_query_insert_binary_params_round_trip() {
     const INSERT_STMT: &str = "bsql_p_df4cc122f1840fe04c5a6ed3";
     // int4 = 23, int8 = 20, bool = 16.
     const INSERT_PARAM_OIDS: &[u32] = &[23, 20, 16];
-    const INSERT_ROW_OIDS: &[u32] = &[];
     const INSERT_PARSE_LEN: usize =
         1 + 4 + INSERT_STMT.len() + 1 + INSERT_SQL.len() + 1 + 2 + 4 * INSERT_PARAM_OIDS.len();
     const INSERT_PARSE: [u8; INSERT_PARSE_LEN] =
@@ -1670,8 +1669,6 @@ fn prepared_query_insert_binary_params_round_trip() {
         bsql_postgres_proto::prepared::new_prepared_query::<(i32, i64, bool), ()>(
             INSERT_SQL,
             INSERT_STMT,
-            INSERT_PARAM_OIDS,
-            INSERT_ROW_OIDS,
             &INSERT_PARSE,
             &INSERT_BIND,
         );

@@ -169,7 +169,6 @@ fn hit_reply() -> Vec<u8> {
 const DEMO_SQL: &str = "SELECT id::int4, name::text FROM demo WHERE id = $1::int4";
 const DEMO_STMT: &str = "bsql_gate_demo";
 const DEMO_PARAM_OIDS: &[u32] = &[23];
-const DEMO_RESULT_OIDS: &[u32] = &[23, 25];
 
 const DEMO_PARSE_LEN: usize =
     1 + 4 + DEMO_STMT.len() + 1 + DEMO_SQL.len() + 1 + 2 + 4 * DEMO_PARAM_OIDS.len();
@@ -182,8 +181,6 @@ static DEMO_QUERY: PreparedQuery<(i32,), (i32, &'static str)> =
     new_prepared_query::<(i32,), (i32, &'static str)>(
         DEMO_SQL,
         DEMO_STMT,
-        DEMO_PARAM_OIDS,
-        DEMO_RESULT_OIDS,
         &DEMO_PARSE,
         &DEMO_BIND,
     );

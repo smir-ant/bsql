@@ -1,39 +1,15 @@
-error[E0080]: evaluation panicked: PreparedQuery row OID list does not match the row tuple's declared OIDs
-  --> tests/compile_fail/query_wire_row_oid_drift.rs:20:38
+error[E0308]: mismatched types
+  --> tests/compile_fail/query_wire_row_oid_drift.rs:30:20
    |
-20 |   const Q: PreparedQuery<(), (u32,)> = new_prepared_query::<(), (u32,)>(
-   |  ______________________________________^
-21 | |     "SELECT 1::oid",
-22 | |     "bsql_q_row_drift",
-23 | |     &[],
-...  |
-28 | |     &[0, 0],
-29 | | );
-   | |_^ evaluation of `Q` failed inside this call
+30 |     takes_int4_row(q);
+   |     -------------- ^ expected `PreparedQuery<(), (i32,)>`, found `PreparedQuery<(), (u32,)>`
+   |     |
+   |     arguments to this function are incorrect
    |
-note: inside `bsql_postgres_proto::prepared::new_prepared_query::<(), (u32,)>`
-  --> $RUST/core/src/panic.rs
+   = note: expected struct `PreparedQuery<(), (i32,)>`
+              found struct `PreparedQuery<(), (u32,)>`
+note: function defined here
+  --> tests/compile_fail/query_wire_row_oid_drift.rs:25:4
    |
-   |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
-   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
-   |
-  ::: $WORKSPACE/crates/postgres/proto/src/prepared.rs
-   |
-   | /     assert!(
-   | |         oids_equal(row_oids, <R as RowDecode>::OIDS),
-   | |         "PreparedQuery row OID list does not match the row tuple's \
-   | |          declared OIDs",
-   | |     );
-   | |_____- in this macro invocation
-
-note: erroneous constant encountered
-  --> tests/compile_fail/query_wire_row_oid_drift.rs:32:14
-   |
-32 |     let _ = &Q;
-   |              ^
-
-note: erroneous constant encountered
-  --> tests/compile_fail/query_wire_row_oid_drift.rs:32:13
-   |
-32 |     let _ = &Q;
-   |             ^^
+25 | fn takes_int4_row(_q: PreparedQuery<(), (i32,)>) {}
+   |    ^^^^^^^^^^^^^^ -----------------------------

@@ -1,10 +1,14 @@
-//! SCHEMA_PIN drift: the parameter OID list agrees with the declared
-//! tuple, but the pre-baked `Parse`-frame template embeds a DIFFERENT
-//! OID in its trailing parameter-type section. The validating
-//! constructor cross-checks the wire bytes against the declared OIDs, so
-//! a template that lies about the parameter types it announces to the
-//! server is `error[E0080]` — the baked wire cannot drift from the
-//! schema-pinned shape.
+//! SCHEMA_PIN drift: the param OID list is now SOURCED from the declared
+//! tuple (`(i32,)` → `int4` = 23), but the pre-baked `Parse`-frame
+//! template embeds a DIFFERENT OID (`99`) in its trailing parameter-type
+//! section. The validating constructor cross-checks the independently-baked
+//! wire bytes against `<Params as ParamsWriter>::OIDS`, so a template that
+//! lies about the parameter types it announces to the server is
+//! `error[E0080]` — the baked wire cannot drift from the type it declares.
+//! This is the one genuinely-distinct OID cross-check that survives sourcing
+//! the OID lists from the tuple types: the `Parse` template is a SEPARATE
+//! representation (raw big-endian bytes for the zero-cost wire), not a
+//! restatement of the OID list, so it is a real check, not a tautology.
 //!
 //! The template below is a structurally valid `Parse` frame for one
 //! `int4` parameter EXCEPT that its OID word is `99` instead of `23`.
@@ -28,8 +32,6 @@ const PARSE_TEMPLATE: &[u8] = &[
 const Q: PreparedQuery<(i32,), ()> = new_prepared_query::<(i32,), ()>(
     "q",
     "s",
-    &[bsql_postgres_proto::oids::INT4],
-    &[],
     PARSE_TEMPLATE,
     &[0, 0],
 );

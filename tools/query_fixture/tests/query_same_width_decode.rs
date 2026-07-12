@@ -7,17 +7,18 @@
 //! the `i32` column to `-1` — each honors its DECLARED type, never a
 //! width-based conflation.
 //!
-//! This is the proof the unification closed the drift: after it, the record
-//! decode routes through the SAME marker (`u32` / `i32`) whose
-//! `ColCellAt::OID` the const validator pins into `ROW_OIDS`. Before it,
-//! `cell_marker` (the decode map) was a THIRD parallel map, unchecked against
-//! the OID-validated `tuple_marker`; a same-width divergence there would have
+//! This is the proof the unification closed the drift: the record decode
+//! routes through the SAME marker (`u32` / `i32`) whose `ColCellAt::OID` the
+//! runtime now SOURCES the row OID FROM (`<Row as RowDecode>::OIDS`). Before
+//! the unification, `cell_marker` (the decode map) was a THIRD parallel map,
+//! unchecked against the OID map; a same-width divergence there would have
 //! silently turned this wire `-1` into `4294967295` (or vice versa). Because
-//! decoder and wire OID are now one source, a same-width mismatch is either an
-//! `error[E0080]` at the validator or an `error[E0308]` at the record — never
-//! a silent mis-decode. The compile-side half of the witness is the
-//! `query_wire_row_oid_drift` trybuild golden (a same-width `u32`-vs-`int4`
-//! ROW-OID drift is `error[E0080]`).
+//! decoder and row OID are now ONE source, a same-width mismatch is
+//! structurally impossible in the OID list (it IS the marker's OID) — the
+//! former runtime cross-check is now unrepresentable. The compile-side half of
+//! the witness is the `query_wire_row_oid_drift` trybuild golden (a same-width
+//! `u32`-vs-`int4` ROW type is `error[E0308]`, `PreparedQuery` being invariant
+//! in `Row`).
 //!
 //! Structurally offline — the `DataRow` body is hand-built (no live server).
 

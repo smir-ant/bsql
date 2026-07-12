@@ -881,8 +881,6 @@ static Q_DEMO_VERB: PreparedQuery<(i32,), (i32, &'static str)> =
     new_prepared_query::<(i32,), (i32, &'static str)>(
         DEMO_SQL,
         DEMO_STMT,
-        DEMO_PARAM_OIDS,
-        &DEMO_RESULT_OIDS,
         &DEMO_PARSE,
         &DEMO_BIND,
     );

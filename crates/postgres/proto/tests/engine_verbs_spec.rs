@@ -870,7 +870,6 @@ fn query_params_fused_bind_error_drains_and_recovers() {
 const DEMO_SQL: &str = "SELECT id::int4, name::text FROM demo WHERE id = $1::int4";
 const DEMO_STMT: &str = "bsql_p_a6ff70d2d94bc34772d4a4ba";
 const DEMO_PARAM_OIDS: &[u32] = &[23];
-const DEMO_ROW_OIDS: &[u32] = &[23, 25];
 const DEMO_PARSE_LEN: usize =
     1 + 4 + DEMO_STMT.len() + 1 + DEMO_SQL.len() + 1 + 2 + 4 * DEMO_PARAM_OIDS.len();
 const DEMO_PARSE: [u8; DEMO_PARSE_LEN] =
@@ -882,8 +881,6 @@ static Q_DEMO: PreparedQuery<(i32,), (i32, &'static str)> =
     new_prepared_query::<(i32,), (i32, &'static str)>(
         DEMO_SQL,
         DEMO_STMT,
-        DEMO_PARAM_OIDS,
-        DEMO_ROW_OIDS,
         &DEMO_PARSE,
         &DEMO_BIND,
     );

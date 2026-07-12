@@ -1,14 +1,13 @@
 error[E0080]: evaluation panicked: PreparedQuery Parse-frame template OID section does not match the declared param OIDs
-  --> tests/compile_fail/query_wire_schema_pin_drift.rs:28:38
+  --> tests/compile_fail/query_wire_schema_pin_drift.rs:32:38
    |
-28 |   const Q: PreparedQuery<(i32,), ()> = new_prepared_query::<(i32,), ()>(
+32 |   const Q: PreparedQuery<(i32,), ()> = new_prepared_query::<(i32,), ()>(
    |  ______________________________________^
-29 | |     "q",
-30 | |     "s",
-31 | |     &[bsql_postgres_proto::oids::INT4],
-...  |
-34 | |     &[0, 0],
-35 | | );
+33 | |     "q",
+34 | |     "s",
+35 | |     PARSE_TEMPLATE,
+36 | |     &[0, 0],
+37 | | );
    | |_^ evaluation of `Q` failed inside this call
    |
 note: inside `bsql_postgres_proto::prepared::new_prepared_query::<(i32,), ()>`
@@ -20,20 +19,22 @@ note: inside `bsql_postgres_proto::prepared::new_prepared_query::<(i32,), ()>`
   ::: $WORKSPACE/crates/postgres/proto/src/prepared.rs
    |
    | /     assert!(
-   | |         parse_template_oid_section_matches(parse_template, param_oids, stmt_name, sql),
-   | |         "PreparedQuery Parse-frame template OID section does not match \
+   | |         parse_template_oid_section_matches(
+   | |             parse_template,
+   | |             <P as ParamsWriter>::OIDS,
+...  |
    | |          the declared param OIDs",
    | |     );
    | |_____- in this macro invocation
 
 note: erroneous constant encountered
-  --> tests/compile_fail/query_wire_schema_pin_drift.rs:38:14
+  --> tests/compile_fail/query_wire_schema_pin_drift.rs:40:14
    |
-38 |     let _ = &Q;
+40 |     let _ = &Q;
    |              ^
 
 note: erroneous constant encountered
-  --> tests/compile_fail/query_wire_schema_pin_drift.rs:38:13
+  --> tests/compile_fail/query_wire_schema_pin_drift.rs:40:13
    |
-38 |     let _ = &Q;
+40 |     let _ = &Q;
    |             ^^

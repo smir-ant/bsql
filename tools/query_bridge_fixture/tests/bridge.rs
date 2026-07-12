@@ -190,10 +190,13 @@ fn null_in_not_null_bridged_column_is_still_classified() {
 
 // ── the OID-drift guarantee still holds WITH bridges present ──────────────
 // Monomorphizing each carrier's `PREPARED` runs the proto-owned const
-// validator: `ROW_OIDS == <Row as RowDecode>::OIDS`. Both ride the NATIVE
-// pivot (uuid OID 2950, timestamptz OID 1184), UNCHANGED by the bridge — a
-// wrong OID would be `error[E0080]`. That this compiles proves the validator
-// runs and passes with a bridge in effect.
+// validator (formats-binary + the `Parse`-template OID pin against the param
+// tuple's `ParamsWriter::OIDS`). The ROW OID list is SOURCED from
+// `<Row as RowDecode>::OIDS`, which rides the NATIVE pivot (uuid OID 2950,
+// timestamptz OID 1184), UNCHANGED by the bridge — the bridge reshapes only
+// the record FIELD, not the row-tuple marker, so a wrong row type would be
+// `error[E0308]` at the record. That this compiles proves the native pivot
+// (and the surviving wire pin) hold with a bridge in effect.
 
 #[test]
 fn oid_validator_runs_with_bridges_present() {

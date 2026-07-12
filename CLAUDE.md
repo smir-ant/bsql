@@ -148,9 +148,11 @@ converter travel as STRINGS, so `bsql-build` / `bsql-query-macros` gain no
 external dependency. The free function is the orphan-proof seam: a consumer
 cannot `impl bsql::Cell for chrono::DateTime` (E0117 — both foreign), but a free
 fn compiles for any foreign target. The bridge reshapes ONLY the record field
-value; the row OID list and the const validator ride the native pivot, so the
-compile-time OID-drift guarantee (E0080) is untouched.
-`tools/query_bridge_fixture` is the end-to-end proof.
+value; the row-tuple marker (whose type SOURCES the row OID list) rides the
+native pivot, so the compile-time OID guarantee is untouched — a wrong row type
+is still a compile error, and the surviving param-wire OID pin (the pre-baked
+`Parse` template cross-checked against the parameter tuple's `ParamsWriter::OIDS`)
+stays `E0080`. `tools/query_bridge_fixture` is the end-to-end proof.
 
 **User-defined types generated from the migration DDL — `bsql::user_types!()`
 (feature `macros`).** A consumer who declares a PostgreSQL type in a migration

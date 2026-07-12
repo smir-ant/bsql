@@ -1,7 +1,7 @@
-error[E0080]: evaluation panicked: PreparedQuery param OID list does not match the parameter tuple's declared OIDs
-  --> tests/compile_fail/query_hostile_fingerprint.rs:29:38
+error[E0080]: evaluation panicked: PreparedQuery Parse-frame template OID section does not match the declared param OIDs
+  --> tests/compile_fail/query_hostile_fingerprint.rs:40:38
    |
-29 | const Q: PreparedQuery<(i32,), ()> = run::<Hostile>();
+40 | const Q: PreparedQuery<(i32,), ()> = run::<Hostile>();
    |                                      ^^^^^^^^^^^^^^^^ evaluation of `Q` failed inside this call
    |
 note: inside `bsql_postgres_proto::prepared::run::<Hostile>`
@@ -10,8 +10,7 @@ note: inside `bsql_postgres_proto::prepared::run::<Hostile>`
    | /     new_prepared_query::<Q::Params, Q::Row>(
    | |         <Q as QueryFingerprint>::SQL,
    | |         <Q as QueryFingerprint>::STMT_NAME,
-   | |         <Q as QueryFingerprint>::PARAM_OIDS,
-...  |
+   | |         <Q as QueryFingerprint>::PARSE_TEMPLATE,
    | |         <Q as QueryFingerprint>::BIND_EXECUTE_PREFIX,
    | |     )
    | |_____^
@@ -24,20 +23,22 @@ note: inside `bsql_postgres_proto::prepared::new_prepared_query::<(i32,), ()>`
   ::: $WORKSPACE/crates/postgres/proto/src/prepared.rs
    |
    | /     assert!(
-   | |         oids_equal(param_oids, <P as ParamsWriter>::OIDS),
-   | |         "PreparedQuery param OID list does not match the parameter \
-   | |          tuple's declared OIDs",
+   | |         parse_template_oid_section_matches(
+   | |             parse_template,
+   | |             <P as ParamsWriter>::OIDS,
+...  |
+   | |          the declared param OIDs",
    | |     );
    | |_____- in this macro invocation
 
 note: erroneous constant encountered
-  --> tests/compile_fail/query_hostile_fingerprint.rs:32:14
+  --> tests/compile_fail/query_hostile_fingerprint.rs:43:14
    |
-32 |     let _ = &Q;
+43 |     let _ = &Q;
    |              ^
 
 note: erroneous constant encountered
-  --> tests/compile_fail/query_hostile_fingerprint.rs:32:13
+  --> tests/compile_fail/query_hostile_fingerprint.rs:43:13
    |
-32 |     let _ = &Q;
+43 |     let _ = &Q;
    |             ^^

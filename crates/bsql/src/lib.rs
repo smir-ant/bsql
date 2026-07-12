@@ -564,7 +564,7 @@ pub mod __rt {
         BinaryFmt, Cell, ColCellAt, CompositeReader, DataRowRef, Date, DecodeError, EnumLabel,
         Interval, Json, Jsonb, Numeric, ParamsWriter, PgComposite, PgEnum, PreparedQuery,
         QueryFingerprint, Time, Timestamp, Timestamptz, TypedCopyIn, TypedQuery, Uuid, oids,
-        oids_equal, prepared, query_budget,
+        prepared, query_budget,
     };
 }
 

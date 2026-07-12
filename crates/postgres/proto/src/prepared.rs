@@ -404,13 +404,15 @@ where
     /// the full SQL text, so two distinct queries cannot share a
     /// stmt-name without colliding their content addresses.
     pub(crate) stmt_name: &'static str,
-    /// Parameter OID list — exactly `Params::COUNT` entries.
-    /// Drift-pinned via const-assert (per macro expansion) against
-    /// `<Params as ParamsWriter>::OIDS`.
+    /// Parameter OID list — exactly `Params::COUNT` entries. SOURCED
+    /// from `<Params as ParamsWriter>::OIDS` by [`new_prepared_query`]
+    /// (not an independent field the caller supplies), so it cannot
+    /// disagree with the parameter tuple.
     pub(crate) param_oids: &'static [u32],
     /// Row column OID list — exactly `<Row as RowDecode>::ARITY`
-    /// entries. The runtime builds a synthetic `RowDesc` from this
-    /// list for the SELECT/RETURNING path.
+    /// entries. SOURCED from `<Row as RowDecode>::OIDS` by
+    /// [`new_prepared_query`]; the runtime builds a synthetic `RowDesc`
+    /// from it for the SELECT/RETURNING path.
     pub(crate) row_oids: &'static [u32],
     /// Pre-built Parse-frame bytes. PG §55.2.2 layout, fully
     /// computable at macro-expansion (sql + stmt_name + n_params +
@@ -528,33 +530,44 @@ where
 /// visibility is required because the macro's expansion lands in the
 /// consumer crate, not this one.
 ///
-/// # Validating: malformed construction is a build error
+/// # The OID lists are SOURCED from the types — a mismatch is unrepresentable
 ///
-/// Every argument is cross-checked against the type-level shape the
-/// caller declared (`P` / `R`). A drift is a const-evaluation failure
+/// The param / row OID lists are NOT arguments: they are read here from
+/// the type-level shape the caller declared —
+/// `param_oids = <P as ParamsWriter>::OIDS`,
+/// `row_oids = <R as RowDecode>::OIDS`. A `PreparedQuery` whose stored
+/// OID lists disagree with its `P` / `R` therefore cannot be built: there
+/// is no separate OID slice to pass, so no lie to catch. This is strictly
+/// STRONGER than a const cross-check of two independent OID arrays — the
+/// drift is not *rejected at const-evaluation*, it is *structurally
+/// impossible to express*. (Both `ParamsWriter::OIDS` and
+/// `RowDecode::OIDS` derive each entry from the tuple element's own
+/// `EncodeBinary::OID` / `ColCellAt::OID`, which is the single source of
+/// truth for that type's OID, so the stored lists ARE the type's OIDs by
+/// construction.)
+///
+/// # Validating: a lying WIRE template is still a build error
+///
+/// Two genuinely-distinct wire properties remain cross-checked against
+/// the sourced shape. A drift is a const-evaluation failure
 /// (`error[E0080]`) when the result binds to a `const` — never a
 /// silently-wrong artifact:
 ///
-/// - the param OID list must equal the parameter tuple's declared
-///   OIDs (`<P as ParamsWriter>::OIDS`) — element for element;
-/// - the row OID list must equal the row tuple's declared OIDs
-///   (`<R as RowDecode>::OIDS`);
 /// - the parameter formats are uniformly binary
 ///   (`<P as ParamsWriter>::FORMATS`) — the binary-uniform wire
 ///   contract, where `ParamsWriter` is the sole format authority;
 /// - the pre-baked `Parse`-frame template's trailing parameter-OID
 ///   section (its `n_param_types` count and per-param OID words) must
-///   match the param OID list — so the wire bytes cannot lie about
-///   the parameter types they declare to the server.
-///
-/// Because the OID-list lengths are themselves pinned to the tuple
-/// arity inside [`ParamsWriter`] / [`RowDecode`], an arity mismatch is
-/// caught transitively by the element-wise OID comparison.
+///   match `<P as ParamsWriter>::OIDS` — so the independently-baked wire
+///   bytes cannot lie about the parameter types they declare to the
+///   server. This is a SEPARATE representation (raw big-endian bytes for
+///   the zero-cost wire path), not a restatement of the OID list, so it
+///   is a real check, not a tautology.
 ///
 /// # What this closes, and the honest boundary
 ///
 /// Direct construction of a *lying* artifact — one whose wire bytes
-/// disagree with its declared `P` / `R` — is now a compile error. The
+/// disagree with its declared `P` / `R` — is a compile error. The
 /// remaining surface is a caller who hand-builds a *self-consistent*
 /// artifact with their own literal SQL: that is identical to writing
 /// the SQL literal in the macro, i.e. the caller authoring their own
@@ -567,8 +580,6 @@ where
 pub const fn new_prepared_query<P, R>(
     sql: &'static str,
     stmt_name: &'static str,
-    param_oids: &'static [u32],
-    row_oids: &'static [u32],
     parse_template: &'static [u8],
     bind_execute_prefix: &'static [u8],
 ) -> PreparedQuery<P, R>
@@ -577,63 +588,27 @@ where
     R: RowDecode,
 {
     assert!(
-        oids_equal(param_oids, <P as ParamsWriter>::OIDS),
-        "PreparedQuery param OID list does not match the parameter \
-         tuple's declared OIDs",
-    );
-    assert!(
-        oids_equal(row_oids, <R as RowDecode>::OIDS),
-        "PreparedQuery row OID list does not match the row tuple's \
-         declared OIDs",
-    );
-    assert!(
         all_formats_binary(<P as ParamsWriter>::FORMATS),
         "PreparedQuery parameter formats must be uniformly binary",
     );
     assert!(
-        parse_template_oid_section_matches(parse_template, param_oids, stmt_name, sql),
+        parse_template_oid_section_matches(
+            parse_template,
+            <P as ParamsWriter>::OIDS,
+            stmt_name,
+            sql,
+        ),
         "PreparedQuery Parse-frame template OID section does not match \
          the declared param OIDs",
     );
     PreparedQuery {
         sql,
         stmt_name,
-        param_oids,
-        row_oids,
+        param_oids: <P as ParamsWriter>::OIDS,
+        row_oids: <R as RowDecode>::OIDS,
         parse_template,
         bind_execute_prefix,
         _phantom: PhantomData,
-    }
-}
-
-/// Const element-wise equality of two `u32` (OID) slices — no
-/// indexing (the crate forbids `clippy::indexing_slicing`), walked in
-/// lockstep via `split_first`.
-///
-/// Re-exported at the crate root so the `copy!` macro can pin, at build time,
-/// that a [`TypedCopyIn`](crate::TypedCopyIn) carrier's row-tuple OIDs equal the
-/// catalog column OIDs it was generated from — the same drift guard the
-/// [`PreparedQuery`] validator uses for `query!`.
-pub const fn oids_equal(left: &[u32], right: &[u32]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let (mut a, mut b) = (left, right);
-    loop {
-        match (a.split_first(), b.split_first()) {
-            (Some((x, a_rest)), Some((y, b_rest))) => {
-                if *x != *y {
-                    return false;
-                }
-                a = a_rest;
-                b = b_rest;
-            }
-            (None, None) => return true,
-            // Lengths were equality-checked above; this arm is
-            // structurally unreachable but returns the fail-closed
-            // answer rather than asserting.
-            _ => return false,
-        }
     }
 }
 
@@ -726,11 +701,13 @@ const fn parse_template_oid_section_matches(
 ///
 /// A query-generating macro emits ONE uninhabited carrier type per
 /// query (a zero-size, value-less marker) together with one
-/// `impl QueryFingerprint` for it. The impl carries the whole `const`
-/// wire artifact — the SQL text, its content-addressed statement name,
-/// the parameter / row OID lists, and the pre-baked `Parse` /
-/// `Bind`-prefix byte templates — plus the parameter and row tuple
-/// types at the type level.
+/// `impl QueryFingerprint` for it. The impl carries the `const` wire
+/// artifact — the SQL text, its content-addressed statement name, and
+/// the pre-baked `Parse` / `Bind`-prefix byte templates — plus the
+/// parameter and row tuple types at the type level. The parameter / row
+/// OID lists are NOT carried: they are SOURCED from the `Params` / `Row`
+/// tuple types by [`new_prepared_query`], so a carrier cannot declare an
+/// OID that disagrees with its own tuple.
 ///
 /// [`run`] is the only way to turn a carrier into a
 /// [`PreparedQuery`], and it forces the validating constructor
@@ -754,10 +731,6 @@ pub trait QueryFingerprint {
     const SQL: &'static str;
     /// Content-addressed statement name (a hash of [`Self::SQL`]).
     const STMT_NAME: &'static str;
-    /// Parameter OID list, one entry per `$N`.
-    const PARAM_OIDS: &'static [u32];
-    /// Projected-column OID list.
-    const ROW_OIDS: &'static [u32];
     /// Pre-baked `Parse`-frame template bytes.
     const PARSE_TEMPLATE: &'static [u8];
     /// Pre-baked `Bind`-frame prefix bytes (portal NUL + stmt-name
@@ -783,8 +756,6 @@ where
     new_prepared_query::<Q::Params, Q::Row>(
         <Q as QueryFingerprint>::SQL,
         <Q as QueryFingerprint>::STMT_NAME,
-        <Q as QueryFingerprint>::PARAM_OIDS,
-        <Q as QueryFingerprint>::ROW_OIDS,
         <Q as QueryFingerprint>::PARSE_TEMPLATE,
         <Q as QueryFingerprint>::BIND_EXECUTE_PREFIX,
     )
