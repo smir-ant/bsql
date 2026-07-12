@@ -338,6 +338,18 @@ pooled connection's `RESET ALL`. `Duration::ZERO` maps to PG's `statement_timeou
 = 0` (disabled); a sub-millisecond request rounds up to 1 ms (never down to
 0/disabled).
 
+Setting it also arms a **client-side liveness window** (`statement_timeout +
+connect_timeout`) on every in-flight read: a peer that vanishes mid-query while a
+middlebox keeps ACKing — the one failure TCP keepalive cannot see, and which the
+server's own `57014` abort cannot rescue because that abort is black-holed too —
+elapses into a classified `DriverError::Timeout` (a disconnect → reconnect)
+instead of the kernel's ~15-minute `tcp_retries2` hang. It never cuts a query the
+server would still run (the server would have aborted anything past
+`statement_timeout` first), and it re-derives itself whenever a runtime
+`SET`/`set_config` moves the budget, so it is never stale-low. With no
+`statement_timeout` set there is no client window (no safe finite bound exists),
+and a genuinely-dead peer is still caught by TCP keepalive.
+
 ```rust
 let config = ConnectConfig::new("db.example.com", "app")
     .with_statement_timeout(Duration::from_secs(5)); // abort any query over 5s
