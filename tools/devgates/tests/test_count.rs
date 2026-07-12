@@ -31,8 +31,11 @@
 //! - total test functions: `#[test]` + `#[tokio::test]` attribute lines;
 //! - `#[ignore]` attribute lines (the live suites).
 //!
-//! Both run from the workspace root with `./target` pruned, exactly as a reader
-//! would reproduce them.
+//! Both enumerate the `.rs` sources with `git ls-files` (the TRACKED set only,
+//! run from the workspace root), so the count reflects the COMMITTED suite and
+//! is immune to an untracked scratch test file or a sibling git worktree — the
+//! former `find` walk counted every `*.rs` on disk and could be inflated by
+//! either.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,11 +46,22 @@ const README: &str = "README.md";
 /// The count command the README cites for total test functions. Kept BYTE-FOR-
 /// BYTE identical to the fenced command in the doc, so the gate measures exactly
 /// what a reader reproduces.
-const TOTAL_CMD: &str = "find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
+///
+/// It enumerates the `.rs` sources with `git ls-files` — the COMMITTED set only.
+/// The former `find` walk counted EVERY `*.rs` on disk, so a stray untracked
+/// scratch test left in a `tests/` dir (or a sibling git worktree under
+/// `.claude/worktrees/`) inflated the count and turned this gate red for a file
+/// that is not part of the suite (exactly what happened during audit-8, when
+/// untracked `audit8_*.rs` harnesses drifted it). `git ls-files` lists only
+/// TRACKED files, so the count reflects the committed suite and nothing else —
+/// immune to untracked scratch AND to sibling worktrees (whose files are not in
+/// this checkout's index), with no `-prune` list to keep in sync.
+const TOTAL_CMD: &str = "git ls-files -z -- '*.rs' \
      | xargs -0 grep -hE '^[[:space:]]*#\\[(tokio::)?test' | wc -l";
 
-/// The count command the README cites for `#[ignore]` live suites.
-const IGNORE_CMD: &str = "find . -path ./target -prune -o -name .claude -prune -o -name '*.rs' -print0 \
+/// The count command the README cites for `#[ignore]` live suites (same
+/// tracked-only `git ls-files` enumeration as [`TOTAL_CMD`]).
+const IGNORE_CMD: &str = "git ls-files -z -- '*.rs' \
      | xargs -0 grep -hE '^[[:space:]]*#\\[ignore' | wc -l";
 
 /// Unique prose anchor preceding the total in the README; the integer that
