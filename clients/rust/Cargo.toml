@@ -1,0 +1,25 @@
+[package]
+name = "pg_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "pg_bench"
+path = "src/main.rs"
+
+[dependencies]
+bsql = { git = "https://github.com/smir-ant/bsql", branch = "main", default-features = false, features = ["postgres-async", "postgres-sync", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
+tokio-postgres = "0.7"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres"] }
+futures-util = "0.3"
+libc = "0.2"
+
+[build-dependencies]
+bsql-build = { git = "https://github.com/smir-ant/bsql", branch = "main" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

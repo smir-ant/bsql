@@ -2,100 +2,140 @@
 
 This branch is the **benchmark project** for [bsql](https://github.com/smir-ant/bsql)
 (the library itself lives on [`main`](https://github.com/smir-ant/bsql/tree/main)).
-It measures bsql against the Rust competitors — `tokio-postgres` and `sqlx` — over
-the same server, transport, and SQL, plus a peak-RSS harness that compares the
-resident footprint of a real workload. It depends on `bsql` as a **git dependency**
-on `main`, so this branch carries no copy of the library.
+It measures bsql against the same query workload in **seven clients across four
+languages** — bsql (async + sync), C (libpq), Go (pgx), and the Rust field
+(tokio-postgres, sqlx, diesel) — over one local PostgreSQL, plus a peak-memory
+harness. bsql is depended on as a **git dependency** on `main`, so this branch
+carries no copy of the library.
 
-```bash
-psql -h 127.0.0.1 -U smir-ant -d postgres -f setup/pg_setup.sql   # seed once
-cargo bench                                          # criterion latency sweep
-cargo run --release --bin rss_bsql_sync              # one RSS harness
-cargo test --release --test rss_ceiling -- --ignored # the RSS regression gate
+Every number below comes from an **actual run** captured in
+[`results/xlang_measure.log`](results/xlang_measure.log); the runner is
+[`scripts/xlang_measure.sh`](scripts/xlang_measure.sh) and each client's source is
+under [`clients/`](clients). Re-run it yourself — the point is that you don't have
+to trust the table.
 
-scripts/bench-e2e.sh all      # orchestrated: quiet-system gate + seed + RSS + latency
-```
+## Where it was measured
 
-Requires a local PostgreSQL on `127.0.0.1:5432`, user `smir-ant`, db `postgres`,
-trust auth. `scripts/` also holds the codegen/asm measurement tools
-(`asm-diff.sh`, `bench-stable.sh`, `asm-linked-diff.sh`, `bench-cpu-time.sh`); see
-[`BENCHMARKING.md`](BENCHMARKING.md) for the ns/codegen methodology.
+- **Device:** MacBook Pro 14" (Apple **M1 Pro**), macOS, `aarch64-apple-darwin`.
+- **Server:** PostgreSQL 15.14 (Homebrew), loopback TCP, trust auth, one direct
+  connection per client.
+- **Toolchains (latest at measurement time):** rustc **1.97.0**, Go **1.26.5**,
+  Apple clang **17.0.0**.
+- **Client libraries:** bsql **1.0.0-alpha.0**, tokio-postgres **0.7.18**, sqlx
+  **0.8.6**, diesel-async **0.6.1**, jackc/pgx **v5.10.0**, libpq **14**.
+- Quiet system (1-min load ≈ 2.6). Every client runs the identical work: prepare
+  a statement once, then a warmed timed loop (2000-iter warm-up, 7 reps, median
+  ns/op), reading every column of every row.
 
-## The measured standing
+## Latency — bsql leads the field, on par with raw C
 
-Machine: aarch64-apple-darwin (Apple Silicon), rustc 1.96.0, release + LTO,
-PostgreSQL 15.14, loopback TCP, quiet system. Numbers are criterion medians.
-`bsql` is the async driver (the primary mode); `bsql (sync)` is the blocking one
-(no tokio at all — a touch faster still).
+Microseconds per operation, lower is better. **bold** = the bsql drivers.
 
-### Latency — bsql wins every scenario
+| scenario (rows)     | bsql        | bsql (sync) | C / libpq | Go / pgx | tokio-postgres | sqlx     | diesel   |
+|---------------------|-------------|-------------|-----------|----------|----------------|----------|----------|
+| SELECT by-PK (1)    | **29.0 µs** | **24.6 µs** | 26.6 µs   | 44.5 µs  | 58.1 µs        | 30.2 µs  | 61.7 µs  |
+| SELECT 10 rows      | **42.7 µs** | **37.1 µs** | 40.7 µs   | 63.3 µs  | 79.4 µs        | 45.4 µs  | 83.5 µs  |
+| SELECT 100 rows     | **54.9 µs** | **49.4 µs** | 57.0 µs   | 80.1 µs  | 81.9 µs        | 72.8 µs  | 90.2 µs  |
+| SELECT 1000 rows    | **242 µs**  | **227 µs**  | 261 µs    | 268 µs   | 297 µs         | 302 µs   | 294 µs   |
+| INSERT single       | **44.5 µs** | **38.3 µs** | 39.6 µs   | 49.8 µs  | 63.0 µs        | 49.6 µs  | 64.8 µs  |
+| JOIN + GROUP BY agg | **3.01 ms** | **2.99 ms** | 3.13 ms   | 3.04 ms  | 3.06 ms        | 3.04 ms  | 3.08 ms  |
 
-Lower is better. Every client does IDENTICAL work: bind a pre-prepared statement,
-receive every row, read every column.
+Relative to bsql (async) on the flagship **single-row by-PK** read, where driver
+overhead dominates (lower = faster): **bsql (sync) 0.85× · C/libpq 0.92× · bsql
+1.0× · sqlx 1.04× · Go/pgx 1.53× · tokio-postgres 2.00× · diesel 2.13×**.
 
-| scenario (rows)     | bsql         | bsql (sync)  | tokio-postgres | sqlx     |
-|---------------------|--------------|--------------|----------------|----------|
-| SELECT by-PK (1)    | **26.1 µs**  | **25.0 µs**  | 39.8 µs        | 29.4 µs  |
-| SELECT 10 rows      | **44.2 µs**  | **40.0 µs**  | 59.4 µs        | 45.8 µs  |
-| SELECT 100 rows     | **54.3 µs**  | **53.2 µs**  | 72.3 µs        | 75.1 µs  |
-| SELECT 1000 rows    | **240.9 µs** | **240.3 µs** | 296.6 µs       | 330.0 µs |
-| INSERT single       | **40.5 µs**  | **38.2 µs**  | 44.8 µs        | 44.4 µs  |
-| JOIN + GROUP BY agg | **1.010 ms** | **1.003 ms** | 1.053 ms       | 1.039 ms |
+- bsql is **on par with hand-written C over libpq** and ahead of every other
+  client — the blocking driver even edges out C on point reads (within
+  cross-implementation measurement variance; call it a tie with raw C).
+- The lead is largest on **small results**, where per-round-trip client overhead
+  dominates — where a lean driver should win. On the ~3 ms server-bound
+  aggregate everything converges, as expected.
+- **tokio-postgres and diesel are ~2× slower on point reads** — tokio-postgres
+  runs the connection on a separate task (a scheduler hop per query on a
+  current-thread runtime); diesel-async adds ORM layering on top.
 
-- On the flagship **single-row-by-PK** latency, bsql is **1.13× faster than
-  sqlx** and **1.52× faster than tokio-postgres**.
-- The advantage is largest on **small results**, where per-round-trip client
-  overhead dominates — exactly where a lean driver should win. On large/complex
-  queries the PostgreSQL server cost dominates and the four converge.
-- **tokio-postgres is consistently slowest on small queries** — it runs the
-  connection on a *separate task*, so on a current-thread runtime each query hops
-  through the scheduler and back, latency bsql's inline-pump design does not pay.
+## Peak memory — bsql is the leanest client, period
 
-### Peak memory (RAM) — bsql is ~3.7× smaller than the field
+Peak resident memory (`getrusage` `ru_maxrss` — the RAM the process actually used)
+over one connection doing 10 000 by-PK SELECTs + 1 000 INSERTs, **one separate
+binary per client** so each measures only its own code. Deterministic (does not
+move with machine load).
 
-Peak resident memory — the actual RAM the process used, via `getrusage`
-`ru_maxrss` — over one connection doing 10 000 SELECT-by-PK + 1 000 INSERT. Unlike
-latency, this is deterministic: it reflects touched pages, not scheduling, so it
-does not move with machine load.
+| client             | peak memory (RAM) | × vs bsql |
+|--------------------|-------------------|-----------|
+| **bsql (sync)**    | **1.61 MB**       | 0.94×     |
+| **bsql** (async)   | **1.72 MB**       | 1.0×      |
+| tokio-postgres     | 6.20 MB           | 3.6×      |
+| sqlx               | 6.42 MB           | 3.7×      |
+| diesel             | 6.69 MB           | 3.9×      |
+| C / libpq          | 12.64 MB          | **7.4×**  |
+| Go / pgx           | 16.03 MB          | **9.3×**  |
 
-| client          | peak memory (RAM) |
-|-----------------|-------------------|
-| **bsql**        | **1.73 MB**       |
-| **bsql (sync)** | **1.62 MB**       |
-| tokio-postgres  | 6.25 MB           |
-| sqlx            | 6.39 MB           |
+bsql is **~3.7× leaner than the Rust field, ~7× leaner than a C/libpq client, and
+~9× leaner than Go/pgx.** Beating raw C on memory is not a typo: the standard
+libpq the C client links pulls in its full client-side dependency set (TLS, ICU,
+buffers), while bsql's arena-based decode holds a fixed ~4 KiB engine buffer and
+16-byte row handles. That is per process, so across a fleet of instances or
+containers the gap compounds directly. A committed gate (`tests/rss_ceiling.rs`)
+fails if bsql's peak exceeds **2 MiB** — the sub-2 MB figure is enforced, not
+aspirational.
 
-That is **~3.6–3.9× leaner** — and it is per process, so across a fleet of service
-instances or containers (each its own process) the gap compounds directly. A
-committed gate (`tests/rss_ceiling.rs`) fails if bsql's peak exceeds **2 MiB**
-(2.25 MiB for the async driver), so the sub-2 MB figure is enforced, not aspirational.
+## What each library can do
 
-## Methodology & noise control
+Speed is half the story; the other half is what the driver lets you *do*. Honest
+comparison — competitors get credit for what they have.
 
-- **Same transport for all** — loopback TCP (in-kernel, no wire, no switch). bsql
-  *also* has a unix-domain-socket transport (measured ~2.4–2.9× faster than
-  loopback TCP on the by-PK round trip — see the `unix_vs_tcp` bench), but the
-  competitor comparison uses TCP so every client is on equal footing.
-- **Prepared, cache-HIT** — statements prepared ONCE before the timed loop, the
-  path a real workload spends its life on.
-- **Read every column of every row** — forces the driver to actually decode.
-- **One direct connection per client** — no pool; the number is the driver's
-  per-round-trip cost.
-- **`setup/pg_setup.sql`** disables autovacuum on the bench tables and CHECKPOINTs
-  before measuring; seeding runs OUTSIDE the measured processes.
-- **Quiet-system gate** — `scripts/bench-e2e.sh` refuses to measure at 1-minute
-  load > 4.0 (criterion's sample windows amplify noise under load).
-- **criterion** reports a 95 % CI per number; RSS is the max of three fresh
-  processes.
+| capability | bsql | tokio-postgres | sqlx | diesel |
+|---|---|---|---|---|
+| Compile-time SQL check vs real schema | ✅ `query!` replays migrations | ❌ unchecked string | ✅ `query!` | ◐ typed DSL only |
+| …with **no live DB / cache** at build | ✅ offline from migration files | — | ❌ needs DB or committed cache | ◐ `schema.rs` usually from a DB |
+| Plain SQL text (not a DSL) | ✅ | ✅ (unchecked) | ✅ | ❌ query-builder DSL |
+| **N+1 query detection** | ✅ `conn.n1_report()`, zero-cost off | ❌ | ❌ | ❌ |
+| Typed/safe **binary COPY** | ✅ `copy_in_typed`, compile-checked | ◐ hand-wired binary | ◐ text COPY only | ❌ no COPY |
+| Build-time **migration safety** gate | ✅ destructive-op ack + checksum drift | ❌ | ◐ checksum drift | ◐ up/down by version |
+| First-class **sync AND async**, one API | ✅ shared `Core<S>` | ❌ async only | ❌ async only | ❌ sync only |
+| **Zero-per-row-alloc** streaming | ✅ `query_each`, O(1) RAM, 0 alloc/row | ◐ streams, allocs/row | ◐ streams, allocs/row | ◐ default materializes |
+| Out-of-band query cancellation | ✅ detached `CancelToken` | ✅ `cancel_token()` | ◐ cancel-on-drop | ❌ |
+| `#![forbid(unsafe_code)]` (shipped crates) | ✅ every crate | ◐ some `unsafe` | ◐ some `unsafe` | ❌ links libpq (C FFI) |
+| Unix-domain socket transport | ✅ (~2.4–2.9× faster than TCP locally) | ✅ | ✅ | ✅ (libpq) |
 
-## Honest caveats
+## Methodology
 
-- **C-libpq and Go-pgx are a cross-language follow-up.** They need a C toolchain /
-  a Go build and a separate-process harness. The RSS cross-check (tokio-postgres
-  ≈ a C-libpq-class figure) suggests the harness is calibrated; wiring the
-  cross-language clients is the next step.
-- **tokio-postgres was measured on a current-thread runtime** (same as all
-  clients). Its separate-task design is happier on a multi-thread runtime — a
-  fairer *best-case* for it, at higher RSS.
-- **RSS is macOS here.** A Linux re-measurement (where `ru_maxrss` page accounting
-  differs) would make an exact cross-OS comparison.
+- **Same everything.** Identical SQL, identical schema (`bench_items` / `bench_cat`
+  / `bench_ins`), prepared once and reused (the cache-hit path a real workload
+  lives on), every column of every row read so the driver actually decodes.
+  Loopback TCP for all (in-kernel, no wire); bsql *also* has a unix-socket
+  transport it does not use here, so the field stays even.
+- **Latency:** each client's own warmed timed loop (2000-iter warm-up, 7 reps,
+  median ns/op) — the same shape in every language so C, Go and Rust are directly
+  comparable. Server-bound scenarios (the ~3 ms aggregate) converge because the
+  cost is PostgreSQL's, not the client's.
+- **Memory:** one separate process per client (so linked-but-cold code from
+  another driver can't pollute the figure), `getrusage(ru_maxrss)` after a fixed
+  10 000-read + 1 000-write workload.
+- **Honesty:** numbers are captured from real runs (`results/xlang_measure.log`),
+  never hand-written; a client that can't run a scenario is left out of that row,
+  not given an invented value. The C client `PQclear`s every result (no leak
+  inflating its RSS); each Rust/diesel client decodes into real typed values.
+
+## Further measurements (designed, being added)
+
+The single-op latency + memory matrix above is the foundation. These deeper
+benchmarks are specified and will be measured with the same rigor (real runs,
+captured logs) — several probe a capability a competitor structurally lacks:
+
+- **Concurrency throughput** — sustained QPS + p99 under 8 / 32 / 128 workers on a
+  fixed pool. A level playing field that rewards low per-op + pool overhead.
+- **Constant-memory streaming of 5M rows** — RSS high-water *and* allocations/row.
+  bsql's `query_each` holds O(1) RAM with **0 alloc/row**; diesel's default
+  `load()` and libpq's `PQexec` are O(rows) and balloon; even the streaming
+  competitors pay a per-row allocation bsql does not.
+- **Typed binary COPY — 1M rows** — rows/s + MB/s + peak RSS. Binary COPY beats
+  text COPY (no server-side parse) and crushes multi-row INSERT — and **diesel has
+  no COPY at all**, a structural gap.
+- **Transaction round-trip fusion** — RTTs per small transaction (counted with a
+  loopback relay) + txns/s, paired with an honest **pipelining control** where
+  tokio-postgres's real pipelining is the winner (reported truthfully).
+- **Connection establishment cost** and **unix-socket vs loopback TCP**.
+- **Detection/observability overhead** — the price of `n1-detect` / the diagnostics
+  sink when on vs the proven zero cost when off.

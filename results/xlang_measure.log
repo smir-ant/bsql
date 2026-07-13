@@ -1,0 +1,82 @@
+### machine: load averages: 2.60 2.15 1.92
+### rustc 1.97.0  go go1.26.5  clang 17.0.0
+===== LATENCY (ns/op, self-timed 7-rep median) =====
+--- C/libpq ---
+VERSION libpq 140019
+LAT by_pk 26569
+LAT rows_10 40665
+LAT rows_100 57044
+LAT rows_1000 261106
+LAT insert 39637
+LAT join_agg 3125324
+--- Go/pgx ---
+VERSION jackc/pgx v5.10.0
+LAT by_pk 44470
+LAT rows_10 63292
+LAT rows_100 80113
+LAT rows_1000 268157
+LAT insert 49800
+LAT join_agg 3043028
+--- diesel ---
+VERSION diesel-async 0.6.1
+LAT by_pk 61664
+LAT rows_10 83476
+LAT rows_100 90224
+LAT rows_1000 293669
+LAT insert 64812
+LAT join_agg 3084706
+--- rust:bsql ---
+VERSION bsql-postgres-async 1.0.0-alpha.0
+LAT by_pk 28976
+LAT rows_10 42712
+LAT rows_100 54858
+LAT rows_1000 242261
+LAT insert 44494
+LAT join_agg 3007303
+--- rust:bsql_sync ---
+VERSION bsql-postgres-sync 1.0.0-alpha.0
+LAT by_pk 24567
+LAT rows_10 37062
+LAT rows_100 49396
+LAT rows_1000 226539
+LAT insert 38339
+LAT join_agg 2988620
+--- rust:tokio_postgres ---
+VERSION tokio-postgres 0.7.18
+LAT by_pk 58108
+LAT rows_10 79351
+LAT rows_100 81906
+LAT rows_1000 296513
+LAT insert 63038
+LAT join_agg 3061828
+--- rust:sqlx ---
+VERSION sqlx 0.8.6
+LAT by_pk 30202
+LAT rows_10 45398
+LAT rows_100 72798
+LAT rows_1000 302295
+LAT insert 49587
+LAT join_agg 3043204
+===== PEAK RSS (separate binary per client) =====
+--- C/libpq ---
+VERSION libpq 140019
+RSS 13254656
+--- Go/pgx ---
+VERSION jackc/pgx v5.10.0
+RSS 16809984
+--- diesel ---
+VERSION diesel-async 0.6.1
+RSS 7012352
+--- bsql (async) ---
+PEAK_RSS_BYTES 1802240
+PEAK_RSS 1.72 MB
+--- bsql (sync) ---
+PEAK_RSS_BYTES 1687552
+PEAK_RSS 1.61 MB
+--- tokio-postgres ---
+PEAK_RSS_BYTES 6504448
+PEAK_RSS 6.20 MB
+--- sqlx ---
+PEAK_RSS_BYTES 6733824
+PEAK_RSS 6.42 MB
+===== MEASURE_DONE =====
