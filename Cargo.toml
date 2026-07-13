@@ -1,0 +1,143 @@
+# bsql end-to-end / competitor / peak-RSS benchmark harness.
+#
+# This is a STANDALONE cargo project — it declares its own `[workspace]` table
+# so it is NEVER a member of the repo-root workspace. Its competitor dev-deps
+# (tokio-postgres, sqlx) and its `libc` FFI therefore do NOT enter the shipped
+# workspace's `deps_pin` / `runtime_graph_pin` gates or the shipped dependency
+# graph. It depends on `bsql` as a git dependency on `main`.
+#
+# Build/run from this branch root:
+#   cargo bench                       # criterion e2e latency, all clients
+#   cargo run --release --bin rss_bsql_sync   # peak-RSS harness (one client)
+#   cargo test --release -- --ignored         # the RSS regression gate (needs PG)
+#
+# rustc 1.96.0 is pinned via the co-located `rust-toolchain.toml`.
+
+[workspace]
+
+[package]
+name = "bsql-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The rebuild under test — by path. Both PG drivers + the embedded SQLite driver
+# (the parity runners exercise the full original matrix, which spans both
+# backends). This is a `publish = false` STANDALONE workspace, so the added
+# `sqlite`/rusqlite subtree lands ONLY in this crate's own lock — never in the
+# shipped `deps_pin` / `runtime_graph_pin` gates.
+bsql = { git = "https://github.com/smir-ant/bsql", branch = "main", default-features = false, features = [
+    "postgres-async",
+    "postgres-sync",
+    "sqlite",
+    "macros",
+] }
+
+# Async runtime. current-thread flavour is what the single-connection benches
+# use (a multi-thread pool would only add scheduler noise + RSS to a one-socket
+# workload).
+tokio = { version = "1", features = ["rt", "net", "macros", "time"] }
+futures = "0.3"
+
+# The Rust competitors the owner cares about most. C-libpq and Go-pgx are a
+# cross-language follow-up (they need a C toolchain / a Go build and a separate
+# process harness); noted in README, not wired here.
+tokio-postgres = "0.7"
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+] }
+
+# Peak-RSS measurement via getrusage(RUSAGE_SELF).ru_maxrss. Bench-only; this is
+# a `publish = false` project outside the shipped graph, so the small justified
+# FFI here never reaches any shipped artifact.
+libc = "0.2"
+
+# PILOT own-FFI probe (bin `ffi_probe`) — a thin unsafe layer over the SAME
+# bundled SQLite the rebuild's `rusqlite` links (`libsqlite3-sys` 0.35 bundled =
+# SQLite 3.50.2). Measures whether removing the rusqlite wrapper recovers the
+# original bsql's small-read numbers. `bundled` UNIFIES with rusqlite's own
+# `libsqlite3-sys` (one `sqlite3` in the binary), so the own-FFI-vs-rebuild delta
+# is pure wrapper overhead on an identical engine. Already resolved in this lock
+# via `bsql-sqlite -> rusqlite`, so this direct edge adds NO package; and this is
+# the STANDALONE `bench` workspace, so it never reaches the shipped `deps_pin` /
+# `runtime_graph_pin` gates. `publish = false`; a never-shipped measurement probe.
+libsqlite3-sys = { version = "0.35", features = ["bundled"] }
+
+[build-dependencies]
+# BUILD-DEP ONLY — replays `migrations/` into the `query!` catalog (exactly the
+# placement a real consumer uses). `publish = false` standalone workspace, so
+# this build edge never enters the shipped `deps_pin` / `runtime_graph_pin`.
+bsql-build = { git = "https://github.com/smir-ant/bsql", branch = "main" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[profile.release]
+# Match a realistic optimized consumer build. LTO + one codegen unit gives the
+# tightest code (and the smallest touched-code RSS) so the comparison reflects
+# each client's true steady-state footprint, not codegen-unit boundaries.
+# `panic` is left at the default `unwind` deliberately: the criterion custom-main
+# bench harness and the RSS regression gate both run under this profile, and
+# unwind tables are cold pages that do not move the resident figure.
+lto = true
+codegen-units = 1
+
+[[bench]]
+name = "e2e"
+harness = false
+
+# bsql-only transport delta: loopback TCP vs the local unix-domain socket.
+[[bench]]
+name = "unix_vs_tcp"
+harness = false
+
+# bsql-only round-trip delta: the fused one-round-trip `query_params` vs the
+# explicit three-round-trip prepare/query/close it replaced, on the dynamic
+# (runtime-untyped) one-shot path.
+[[bench]]
+name = "dynamic_oneshot"
+harness = false
+
+# bsql-only round-trip delta: the deferred-BEGIN transaction fusion (D2) — a
+# one-statement transaction fused into 2 round trips vs the manual
+# BEGIN; stmt; COMMIT 3-flush sequence.
+[[bench]]
+name = "tx_fusion"
+harness = false
+
+# Peak-RSS harnesses — one binary per client so each measured process links and
+# faults in ONLY that client's code (a single arg-selected binary would leave
+# the other clients' code linked-but-cold, muddying the resident figure).
+# Full-matrix PARITY runners — reproduce the ORIGINAL bsql bench matrix
+# (bench_users/bench_orders schema, original SQL + iteration counts) on the
+# rebuild API, printing `ns/op` in the C runner's shape for a direct diff.
+[[bin]]
+name = "parity_pg"
+path = "src/bin/parity_pg.rs"
+
+[[bin]]
+name = "parity_sqlite"
+path = "src/bin/parity_sqlite.rs"
+
+# PILOT: own-FFI vs rebuild small-read comparison, same process / same engine.
+[[bin]]
+name = "ffi_probe"
+path = "src/bin/ffi_probe.rs"
+
+[[bin]]
+name = "rss_bsql_sync"
+path = "src/bin/rss_bsql_sync.rs"
+
+[[bin]]
+name = "rss_bsql_async"
+path = "src/bin/rss_bsql_async.rs"
+
+[[bin]]
+name = "rss_tokio_postgres"
+path = "src/bin/rss_tokio_postgres.rs"
+
+[[bin]]
+name = "rss_sqlx"
+path = "src/bin/rss_sqlx.rs"
