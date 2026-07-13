@@ -41,8 +41,8 @@ let user = conn.query_one::<UserByIdQuery>((42_i32,)).await?;
   wrapper: the same `query!` carrier runs on both, decoding into the same typed
   records — and SQLite verifies each value's storage class at runtime (a mismatch
   is a classified error, never a silent coercion).
-- **Tiny footprint.** ~1.7 MB peak RSS for a real workload — about **3.9× smaller
-  than the field** — and the whole TLS/SCRAM stack is feature-gated, so a
+- **Tiny footprint.** ~1.7 MB peak memory (RSS) for a real workload — about
+  **3.7× smaller than the field** — and the whole TLS/SCRAM stack is feature-gated, so a
   localhost / trust-auth build is a handful of crates.
 - **`#![forbid(unsafe_code)]` on every shipped crate.** No `unwrap`/`expect` in
   production code. NULL is `Option<NonZeroU32>`, not a sentinel. The hot decode
@@ -60,8 +60,7 @@ methodology and how to reproduce it yourself.
 
 The short version: **bsql was fastest in every latency scenario measured**
 (single-row by-PK, 10 / 100 / 1000-row fetch, INSERT, JOIN+aggregate), and its
-**peak RSS is ~1.7 MB vs ~6.5 MB for the field**. Numbers wobble with machine
-load; the *ranking* held across independent runs. Don't take our word for it —
+**peak memory is ~1.7 MB vs ~6.3 MB for the field**. Don't take our word for it —
 `git switch bench && cargo bench`.
 
 ## Quick start
