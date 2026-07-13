@@ -41,8 +41,9 @@ let user = conn.query_one::<UserByIdQuery>((42_i32,)).await?;
   wrapper: the same `query!` carrier runs on both, decoding into the same typed
   records — and SQLite verifies each value's storage class at runtime (a mismatch
   is a classified error, never a silent coercion).
-- **Tiny footprint.** ~1.7 MB peak memory (RSS) for a real workload — about
-  **3.7× smaller than the field** — and the whole TLS/SCRAM stack is feature-gated, so a
+- **Tiny footprint.** ~1.7 MB peak memory for a real workload — **the leanest
+  client measured**, leaner than a C/libpq client (~7×) and Go/pgx (~9×), and
+  ~3.7× under the Rust field — and the whole TLS/SCRAM stack is feature-gated, so a
   localhost / trust-auth build is a handful of crates.
 - **`#![forbid(unsafe_code)]` on every shipped crate.** No `unwrap`/`expect` in
   production code. NULL is `Option<NonZeroU32>`, not a sentinel. The hot decode
@@ -55,13 +56,14 @@ let user = conn.query_one::<UserByIdQuery>((42_i32,)).await?;
 ## Performance
 
 [**You need to see this** 🫢](https://github.com/smir-ant/bsql/blob/bench/README.md)
-— bsql vs `tokio-postgres` vs `sqlx`, PostgreSQL over loopback TCP, full
-methodology and how to reproduce it yourself.
+— **seven clients across four languages** (bsql, C/libpq, Go/pgx, tokio-postgres,
+sqlx, diesel), PostgreSQL over loopback TCP, full methodology and captured logs so
+you don't have to trust the table.
 
-The short version: **bsql was fastest in every latency scenario measured**
-(single-row by-PK, 10 / 100 / 1000-row fetch, INSERT, JOIN+aggregate), and its
-**peak memory is ~1.7 MB vs ~6.3 MB for the field**. Don't take our word for it —
-`git switch bench && cargo bench`.
+The short version, measured on a MacBook Pro 14" (M1 Pro): bsql is **on par with
+hand-written C over libpq** on latency and ahead of every other client, and it is
+the **leanest of all** — ~1.7 MB peak memory, ~7× under a C/libpq client and ~9×
+under Go/pgx. Don't take our word for it — `git switch bench && cargo bench`.
 
 ## Quick start
 
