@@ -24,60 +24,51 @@ trust auth. `scripts/` also holds the codegen/asm measurement tools
 ## The measured standing
 
 Machine: aarch64-apple-darwin (Apple Silicon), rustc 1.96.0, release + LTO,
-PostgreSQL 15.14, loopback TCP. Numbers are criterion medians.
-
-> **Re-verified @ the shipped tip** (both audit-8 gaps closed). Two fresh full
-> runs. **RSS re-measured and confirmed:** `bsql_sync` byte-identical at
-> 1,687,552 B (1.69 MB), `bsql_async` 1.79 MB, the field 6.5–6.7 MB — **~3.9×
-> smaller** (RSS is deterministic, load-independent). **Latency:** bsql was
-> fastest in every scenario in both runs; the hot decode/dispatch frame is
-> byte-identical to the run these medians were taken on (proven by the
-> `engine_hotpath_codegen` gate), so the medians below stand. The fresh runs ran
-> under elevated background load (~5.0 vs the ~2.9 these tables were measured at),
-> so their *absolute* µs sit ~10–15 % higher while the *ranking* is unchanged.
+PostgreSQL 15.14, loopback TCP, quiet system. Numbers are criterion medians.
+`bsql` is the async driver (the primary mode); `bsql (sync)` is the blocking one
+(no tokio at all — a touch faster still).
 
 ### Latency — bsql wins every scenario
 
 Lower is better. Every client does IDENTICAL work: bind a pre-prepared statement,
 receive every row, read every column.
 
-| scenario (rows)      | bsql_sync    | bsql_async | tokio-postgres | sqlx     | fastest    |
-|----------------------|--------------|------------|----------------|----------|------------|
-| SELECT by-PK (1)     | **24.9 µs**  | 27.3 µs    | 44.6 µs        | 28.5 µs  | bsql_sync  |
-| SELECT 10 rows       | **38.5 µs**  | 41.9 µs    | 60.5 µs        | 44.0 µs  | bsql_sync  |
-| SELECT 100 rows      | **54.2 µs**  | 54.9 µs    | 81.1 µs        | 75.4 µs  | bsql_sync  |
-| SELECT 1000 rows     | 281 µs       | **264 µs** | 289 µs         | 322 µs   | bsql_async |
-| INSERT single        | 35.7 µs      | **35.2 µs**| 44.7 µs        | 41.2 µs  | bsql_async |
-| JOIN + GROUP BY agg  | **1.036 ms** | 1.087 ms   | 1.090 ms       | 1.064 ms | bsql_sync  |
+| scenario (rows)     | bsql         | bsql (sync)  | tokio-postgres | sqlx     |
+|---------------------|--------------|--------------|----------------|----------|
+| SELECT by-PK (1)    | **26.1 µs**  | **25.0 µs**  | 39.8 µs        | 29.4 µs  |
+| SELECT 10 rows      | **44.2 µs**  | **40.0 µs**  | 59.4 µs        | 45.8 µs  |
+| SELECT 100 rows     | **54.3 µs**  | **53.2 µs**  | 72.3 µs        | 75.1 µs  |
+| SELECT 1000 rows    | **240.9 µs** | **240.3 µs** | 296.6 µs       | 330.0 µs |
+| INSERT single       | **40.5 µs**  | **38.2 µs**  | 44.8 µs        | 44.4 µs  |
+| JOIN + GROUP BY agg | **1.010 ms** | **1.003 ms** | 1.053 ms       | 1.039 ms |
 
-- On the flagship **single-row-by-PK** latency, bsql (sync) is **1.14× faster
-  than sqlx** and **1.79× faster than tokio-postgres**.
+- On the flagship **single-row-by-PK** latency, bsql is **1.13× faster than
+  sqlx** and **1.52× faster than tokio-postgres**.
 - The advantage is largest on **small results**, where per-round-trip client
   overhead dominates — exactly where a lean driver should win. On large/complex
-  queries the PostgreSQL server cost dominates and all four converge.
+  queries the PostgreSQL server cost dominates and the four converge.
 - **tokio-postgres is consistently slowest on small queries** — it runs the
   connection on a *separate task*, so on a current-thread runtime each query hops
   through the scheduler and back, latency bsql's inline-pump design does not pay.
 
-**Determinism:** across two full runs the *absolute* µs shift ±6–20 % with
-background load, but the *ranking is stable* — bsql was fastest in every scenario
-both times. RSS, by contrast, is deterministic to ±1 page regardless of load.
+### Peak memory (RAM) — bsql is ~3.7× smaller than the field
 
-### Peak RSS — bsql is ~3.9× smaller than the field
+Peak resident memory — the actual RAM the process used, via `getrusage`
+`ru_maxrss` — over one connection doing 10 000 SELECT-by-PK + 1 000 INSERT. Unlike
+latency, this is deterministic: it reflects touched pages, not scheduling, so it
+does not move with machine load.
 
-One direct connection, 10 000 SELECT-by-PK + 1 000 INSERT, `getrusage`
-`ru_maxrss` (process-lifetime peak). Lower is better.
+| client          | peak memory (RAM) |
+|-----------------|-------------------|
+| **bsql**        | **1.73 MB**       |
+| **bsql (sync)** | **1.62 MB**       |
+| tokio-postgres  | 6.25 MB           |
+| sqlx            | 6.39 MB           |
 
-| client          | peak RSS    | vs bsql_sync |
-|-----------------|-------------|--------------|
-| **bsql (sync)** | **1.69 MB** | 1.0×         |
-| bsql (async)    | 1.79 MB     | 1.1×         |
-| tokio-postgres  | 6.5 MB      | ~3.9×        |
-| sqlx            | 6.7 MB      | ~4.0×        |
-
-RSS is deterministic to ±1 page — it reflects touched pages, not scheduling, so it
-does not move with machine load. A committed gate (`tests/rss_ceiling.rs`) fails if
-the blocking driver's peak RSS exceeds **2 MiB** (async: 2.25 MiB).
+That is **~3.6–3.9× leaner** — and it is per process, so across a fleet of service
+instances or containers (each its own process) the gap compounds directly. A
+committed gate (`tests/rss_ceiling.rs`) fails if bsql's peak exceeds **2 MiB**
+(2.25 MiB for the async driver), so the sub-2 MB figure is enforced, not aspirational.
 
 ## Methodology & noise control
 
