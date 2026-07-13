@@ -54,7 +54,7 @@ let user = conn.query_one::<UserByIdQuery>((42_i32,)).await?;
 
 ## Performance
 
-[**You need to see this** 🫢](https://github.com/smir-ant/bsql/blob/bench/bench/README.md)
+[**You need to see this** 🫢](https://github.com/smir-ant/bsql/blob/bench/README.md)
 — bsql vs `tokio-postgres` vs `sqlx`, PostgreSQL over loopback TCP, full
 methodology and how to reproduce it yourself.
 
@@ -62,7 +62,7 @@ The short version: **bsql was fastest in every latency scenario measured**
 (single-row by-PK, 10 / 100 / 1000-row fetch, INSERT, JOIN+aggregate), and its
 **peak RSS is ~1.7 MB vs ~6.5 MB for the field**. Numbers wobble with machine
 load; the *ranking* held across independent runs. Don't take our word for it —
-`git switch bench && cd bench && cargo bench`.
+`git switch bench && cargo bench`.
 
 ## Quick start
 
@@ -238,7 +238,7 @@ cargo test -p bsql-postgres-async --test sq_live -- --ignored
 ```
 
 Benchmarks + their methodology live on the **`bench` branch**
-(`git switch bench && cd bench && cargo bench`), kept off the code branch so a
+(`git switch bench && cargo bench`), kept off the code branch so a
 normal clone stays lean.
 
 ## About
