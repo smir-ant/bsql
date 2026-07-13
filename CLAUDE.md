@@ -70,7 +70,6 @@ cargo test --workspace --doc         # doctests
 cargo test -p bsql-devgates --test deps_pin            # dependency-frontier gate
 cargo test -p bsql-devgates --test runtime_graph_pin   # build-time-only boundary gate
 cargo test -p bsql-devgates --test doc_links           # intra-doc-link wall (broken-link deny)
-cargo test -p bsql-devgates --test test_count          # README test-count doc-vs-reality gate
 cargo test -p bsql-devgates --test cross_platform      # Windows/Linux cross-target regression gate (cargo check --no-default-features; NO-OP-PASS when the target isn't `rustup target add`-ed)
 cargo test -p bsql-postgres-proto --test engine_hotpath_codegen  # next_event codegen-stability gate (panic-free + instruction ceiling)
 cargo test -p bsql-postgres-core --test decoder_fuzz   # decoder total-function gate (dep-free fuzz: no decoder panics on any input)
@@ -475,19 +474,6 @@ gate the moment it lands. Scope: the PUBLIC documented surface of every member
 (a `--document-private-items` tightening is a follow-up — it currently surfaces
 unrelated pre-existing private-doc rot in the build-time inference crate + an
 engine `super::flush` ambiguity).
-
-The `test_count` gate (`tools/devgates/tests/test_count.rs`) is the
-doc-vs-reality wall for the README's advertised test counts. A hard-coded count
-in prose ROTS — every test added or removed drifts the doc, and no compile step
-reads the README. This gate runs the EXACT two count commands the README cites
-(the `#[test]` / `#[tokio::test]` total, and the `#[ignore]` live-suite count),
-greps the two numbers back OUT of the README, and asserts they match the live
-workspace — so a test added or removed without updating the doc turns it red
-inside the standard `cargo test --workspace` flow. A deliberate change
-regenerates the two numbers in place with `BSQL_TEST_COUNT_PIN=overwrite cargo
-test -p bsql-devgates --test test_count` (mirroring `TRYBUILD=overwrite`). It is
-`publish = false` (a devgate) with no dependencies, so `deps_pin` and
-`runtime_graph_pin` are untouched.
 
 The `cross_platform` gate (`tools/devgates/tests/cross_platform.rs`) is the
 NO-CI regression wall for the Windows/Linux cross-target fix (the `#[cfg(unix)]`
