@@ -405,7 +405,7 @@ impl Pool {
                     // retained across the retry. `created` rides into the guard so a
                     // reused connection keeps its ORIGINAL birth time (max_lifetime
                     // measures true age, not age-since-last-checkout).
-                    match conn.reset_session().await {
+                    match conn.pool_reset_session().await {
                         Ok(()) => {
                             return Ok(PooledConnection {
                                 conn: Some(conn),

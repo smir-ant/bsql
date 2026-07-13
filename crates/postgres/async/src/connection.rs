@@ -1218,10 +1218,29 @@ impl Connection {
     /// absolute deadline overflows the clock (the token is untaken, connection
     /// still alive).
     pub async fn reset_session(&mut self) -> Result<(), DriverError> {
-        // Bound the WHOLE reset sequence (the RESET simple-query plus the batched
-        // dynamic-statement Close) under ONE absolute deadline = the connection's
-        // connect budget. Compute it with `checked_add` BEFORE arming / taking the
-        // token, so an overflow returns Err with the connection untouched.
+        // The manual reset CLEARS the dynamic prepared-statement cache (clean slate).
+        self.reset_session_bounded(true).await
+    }
+
+    /// The POOL-checkout reset: KEEPS the dynamic prepared-statement cache warm
+    /// across the checkout (a measured pooled-throughput win — see
+    /// [`Core::pool_reset_session`](bsql_postgres_core)). Bounded identically to
+    /// [`reset_session`](Self::reset_session).
+    pub(crate) async fn pool_reset_session(&mut self) -> Result<(), DriverError> {
+        self.reset_session_bounded(false).await
+    }
+
+    /// The shared, bounded reset wrapper: arms the connect-budget liveness deadline
+    /// around the reset (so a vanished pooled peer ELAPSES into a classified error,
+    /// never a `tcp_retries2` hang) and restores the client-liveness window to the
+    /// connect baseline afterward. `clear_dyn_cache` selects the manual clean-slate
+    /// reset (`true`) or the cache-warm pool reset (`false`).
+    async fn reset_session_bounded(&mut self, clear_dyn_cache: bool) -> Result<(), DriverError> {
+        // Bound the WHOLE reset sequence (the RESET simple-query plus, on the manual
+        // path, the batched dynamic-statement Close) under ONE absolute deadline =
+        // the connection's connect budget. Compute it with `checked_add` BEFORE
+        // arming / taking the token, so an overflow returns Err with the connection
+        // untouched.
         let budget = Duration::from_secs(self.redial.connect_timeout_secs());
         let deadline = Instant::now()
             .checked_add(budget)
@@ -1232,9 +1251,13 @@ impl Connection {
         // explicit `drop(guard)` performs the same single atomic-store disarm a
         // manual one would, before the caller's real verbs read deadline-free.
         let guard = self.read_deadline.arm_scoped(deadline);
-        let result = self.core.reset_session().await;
+        let result = if clear_dyn_cache {
+            self.core.reset_session().await
+        } else {
+            self.core.pool_reset_session().await
+        };
         drop(guard);
-        // `reset_session` ran `RESET ALL`, restoring `statement_timeout` to its
+        // The reset ran `RESET ALL`, restoring `statement_timeout` to its
         // connect-time value — so the client-liveness window returns to the
         // connect baseline. A runtime `SET` made on THIS checkout cannot leak its
         // (possibly larger/disarmed) window to the next checkout of a pooled

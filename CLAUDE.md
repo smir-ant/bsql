@@ -837,22 +837,44 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   once while the cache reclaims the stale statement and re-warms against the
   current schema — never a silently-stale result; the reuse path re-runs the
   fused query TRANSPARENTLY on stale detection, so a schema change costs one
-  re-parse, never a user-visible spurious error), and CLEARED by `reset_session`
-  in ONE batched round trip (all cached statements `Close`d + a single `Sync`).
-  The clear is primarily HYGIENE, not strict correctness: PostgreSQL re-resolves
-  a cached plan's objects when `search_path` changes, so a `search_path`-shifted
-  reuse re-plans rather than returning the wrong table. The distinguishing reason
-  the DYNAMIC cache clears while the engine's compile-checked (TYPED) cache is
-  KEPT is object LIFETIME — a TYPED `query!` is build-validated against PERMANENT
-  migration objects that cannot dangle, whereas a DYNAMIC runtime-SQL plan can
-  reference a SESSION-scoped object (a `CREATE TEMP TABLE`) that `reset_session`'s
-  `DISCARD TEMP` tears down, so keeping it across a checkout would leave the plan
-  referencing a dropped object (`DISCARD` excludes `DEALLOCATE ALL` / `DISCARD
-  PLANS`, so the typed statements survive). A DIRECT (non-pooled) connection never
-  calls `reset_session`, so its dynamic cache persists for the connection's life.
-  The typed `query!` path caches in the ENGINE (a content-addressed named
-  statement with a Close-before-Parse idempotent MISS path); this is its
-  driver-level DYNAMIC peer.
+  re-parse, never a user-visible spurious error). **Kept warm across a pool
+  checkout (a measured ~+10% pooled throughput on a dynamic-param workload).** The
+  POOL checkout reset (`Core::pool_reset_session`) KEEPS the dynamic cache — the
+  server-side statements SURVIVE the `RESET ALL; … DISCARD TEMP` (`DISCARD` excludes
+  `DEALLOCATE ALL` / `DISCARD PLANS`), so keeping the client cache in step lets the
+  next checkout reach cached-plan reuse (`Bind`+`Execute`) instead of re-`Parse`ing
+  every op — the SAME treatment the engine's compile-checked (TYPED) cache already
+  gets. Measured on the concurrency by-PK dynamic bench: pooled qps +9 % (N=8) /
+  +12 % (N=32) / +10 % (N=128), p50 −8 %, all interleaved/reproducible. SAFE across
+  the two logical users: keeping is HYGIENE, not correctness (a prepared statement
+  carries a PLAN, never data) — PostgreSQL re-resolves a cached plan's objects when
+  `search_path` changes (a `search_path`-shifted reuse re-plans rather than
+  returning the wrong table), and a kept plan that referenced a SESSION object the
+  reset's `DISCARD TEMP` dropped re-plans SERVER-SIDE on next use and, if the object
+  is gone, returns a CLASSIFIED error (the existing self-heal), NEVER a silent wrong
+  result (witnessed by the `--ignored`
+  `pooled_dynamic_plan_stays_warm_and_a_dropped_temp_is_safe` test). The MANUAL
+  `reset_session` (a DIRECT consumer's explicit clean slate) still CLEARS the cache
+  in ONE batched round trip (all cached statements `Close`d + a single `Sync`) — the
+  two entry points share ONE `reset_session_impl(clear_dyn_cache)` body so the only
+  difference is that one `Close` batch. A DIRECT (non-pooled) connection never resets
+  on its own, so its dynamic cache persists for the connection's life. The typed
+  `query!` path caches in the ENGINE (a content-addressed named statement with a
+  Close-before-Parse idempotent MISS path); this is its driver-level DYNAMIC peer.
+
+  **Airtight pooled liveness is a fundamental 1-RTT-at-checkout tax (NOT removable).**
+  A pooled checkout MUST confirm the peer is still alive BEFORE the user's
+  (possibly non-idempotent) verb runs, so a peer that DIED WHILE IDLE is
+  transparently swapped at checkout, never surfacing as an error on the verb. That
+  confirmation is a fresh round trip completing AT CHECKOUT (the `pool_reset_session`
+  reset serves as both the isolation reset AND the liveness probe): it CANNOT be
+  overlapped with idle time (a probe sent at check-in confirms liveness only when it
+  REPLIES — early idle — so a black-hole death LATER in idle escapes and hits the
+  user's verb; empirically demonstrated) and CANNOT be fused into the verb (that
+  sends the verb to an unconfirmed connection — the two-generals ambiguity). So a
+  pooled op is ~2 RTT (reset + verb) vs a direct op's 1 RTT — measured pooled ≈
+  2.3–2.4× the direct control's qps. This tax is the price of exactly-once liveness
+  and is deliberately NOT traded away for throughput.
 - **Dynamic streaming — `conn.query_each_sql(sql, on_row)` /
   `conn.query_each_params(sql, params, on_row)`** (both drivers + their
   transaction guards). The DYNAMIC (runtime-untyped) constant-memory streaming

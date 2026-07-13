@@ -383,7 +383,7 @@ impl Pool {
                         self.release_slot();
                         drop(conn);
                     } else {
-                        match conn.reset_session() {
+                        match conn.pool_reset_session() {
                             Ok(()) => {
                                 return Ok(PooledConnection {
                                     conn: Some(conn),

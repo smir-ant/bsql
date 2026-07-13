@@ -1578,6 +1578,59 @@ async fn pool_reset_on_return_no_bleed() {
 
 #[tokio::test]
 #[ignore = "requires local PG"]
+async fn pooled_dynamic_plan_stays_warm_and_a_dropped_temp_is_safe() {
+    // Lever 2: the pool checkout reset KEEPS the dynamic prepared-statement cache
+    // warm (a measured pooled-throughput win), unlike the manual `reset_session`
+    // clean slate. This proves the KEPT cache is SAFE even for the adversarial edge
+    // — a cached plan that referenced a SESSION temp object the reset's
+    // `DISCARD TEMP` drops. Reusing the kept plan on the next checkout re-plans
+    // SERVER-SIDE against the now-dropped object and gives a CORRECT classified
+    // error (the object is gone for the next logical user, exactly as a fresh parse
+    // would report), NEVER a silent wrong result, a panic, or a poisoned connection.
+    use bsql_postgres_async::{DriverError, Pool};
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let pool = Pool::new(config, 1); // max_size=1 forces reuse of the SAME connection
+    const SQL: &str = "SELECT id FROM lever2_probe WHERE id = $1";
+    let pid1 = {
+        let mut c = pool.get().await.expect("get1");
+        let conn = c.conn_mut().expect("live1");
+        let pid = conn.backend_pid();
+        conn.execute_sql("CREATE TEMP TABLE lever2_probe(id int4)").await.expect("temp");
+        conn.execute_sql("INSERT INTO lever2_probe VALUES (1)").await.expect("insert");
+        // Run the DYNAMIC parameterized query TWICE so the dyn cache PROMOTES it to
+        // a cached (READY) server-side plan (promotion is on the 2nd sighting).
+        let one = conn.query_params_one(SQL, &(1i32,)).await.expect("first sighting (fused)");
+        assert_eq!(one.get_i32(0), Ok(Some(1)));
+        let two = conn.query_params(SQL, &(1i32,)).await.expect("second sighting promotes to cached");
+        assert_eq!(two.get(0).and_then(|r| r.get_i32(0).ok().flatten()), Some(1));
+        pid
+    }; // returned dirty; the POOL reset KEEPS the cached plan across the checkout
+
+    // Next checkout of the SAME connection: the pool reset dropped `lever2_probe`
+    // (DISCARD TEMP) but KEPT the dynamic plan cache — so the query REUSES the
+    // cached plan, PG re-plans against the dropped table, and the result is a
+    // CLASSIFIED error, not a wrong row.
+    let mut c = pool.get().await.expect("get2");
+    let conn = c.conn_mut().expect("live2");
+    assert_eq!(conn.backend_pid(), pid1, "max_size=1 must reuse the SAME physical connection");
+    let err = conn
+        .query_params_one(SQL, &(1i32,))
+        .await
+        .expect_err("a dropped temp object must be a classified error, never a silent wrong result");
+    match &err {
+        // A server error the connection recovered from (the exact SQLSTATE is PG's
+        // to choose — undefined_table / cached-plan invalidation), NOT a disconnect.
+        DriverError::Db(_) => {}
+        other => panic!("expected a classified SERVER error, got {other:?}"),
+    }
+    assert!(!err.is_disconnect(), "the connection must SURVIVE the error (stay reusable)");
+    // Proof of reusability: a fresh query on a non-session object works.
+    let row = conn.query_one_sql("SELECT 42::int4").await.expect("connection is still reusable");
+    assert_eq!(row.get_i32(0), Ok(Some(42)));
+}
+
+#[tokio::test]
+#[ignore = "requires local PG"]
 async fn cancelled_transaction_is_rolled_back_before_reuse() {
     // A `transaction()` future dropped mid-body (after BEGIN + a write, before
     // COMMIT/ROLLBACK) returns its connection to the pool still inside the

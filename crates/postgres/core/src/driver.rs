@@ -1978,22 +1978,61 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     }
 
     /// Reset all BLEEDABLE session state so this connection can be safely reused
-    /// by a different logical user.
+    /// by a different logical user, CLEARING the dynamic prepared-statement cache
+    /// (the manual clean-slate reset).
     ///
     /// Runs `DISCARD ALL` MINUS `DEALLOCATE ALL` / `DISCARD PLANS` in one
     /// simple-query round trip (prefixed with `ROLLBACK` only when inside a
     /// transaction, decided from the cached `ReadyForQuery` tx status so the
     /// common idle path costs no extra round trip), then CLEARS the DYNAMIC
     /// prepared-statement cache in ONE batched round trip (`Close`ing every cached
-    /// server-side statement — see [`DynStmtCache`] for why a dynamic runtime-SQL
-    /// plan, unlike a typed one, can dangle over a `DISCARD TEMP`), and clears the
-    /// notification ledger and the N+1 recency window. The engine's
-    /// compile-checked (TYPED) statement cache — content-addressed COMPILE-TIME
-    /// plans over PERMANENT migration objects that cannot dangle — is deliberately
-    /// KEPT (`DISCARD` excludes `DEALLOCATE ALL` / `DISCARD PLANS`), so the typed
-    /// flagship's server-side plan reuse survives the checkout. See each driver's
-    /// `reset_session` for the full rationale.
+    /// server-side statement), and clears the notification ledger and the N+1
+    /// recency window. The engine's compile-checked (TYPED) statement cache —
+    /// content-addressed COMPILE-TIME plans over PERMANENT migration objects that
+    /// cannot dangle — is deliberately KEPT (`DISCARD` excludes `DEALLOCATE ALL` /
+    /// `DISCARD PLANS`), so the typed flagship's server-side plan reuse survives.
+    ///
+    /// The POOL does NOT call this; it calls
+    /// [`pool_reset_session`](Self::pool_reset_session), which KEEPS the dynamic
+    /// cache warm (a measured pooled-throughput win — see there). This is the
+    /// explicit manual-reset primitive a DIRECT (non-pooled) consumer calls for a
+    /// full clean slate, dropping every cached dynamic plan.
     pub async fn reset_session(&mut self) -> Result<(), DriverError> {
+        self.reset_session_impl(true).await
+    }
+
+    /// The POOL-checkout session reset: identical to
+    /// [`reset_session`](Self::reset_session) EXCEPT it KEEPS the dynamic
+    /// prepared-statement cache warm across the checkout.
+    ///
+    /// The `RESET ALL; … DISCARD TEMP; …` clears every BLEEDABLE item (GUCs, temp
+    /// objects, cursors, `LISTEN`s, advisory locks) exactly as the manual reset
+    /// does — but it does NOT `Close` the cached dynamic server-side statements,
+    /// which SURVIVE the reset (`RESET` runs no `DEALLOCATE`). Keeping the client
+    /// `DynStmtCache` in step with them lets a pooled connection reach cached-plan
+    /// reuse (`Bind`+`Execute`) instead of re-`Parse`ing every checkout — the SAME
+    /// treatment the engine's TYPED cache already gets, and a measured ~10% pooled
+    /// throughput gain on a dynamic-param workload (a checked-out connection whose
+    /// query is a cache HIT does no server-side re-parse/re-plan per op).
+    ///
+    /// SAFE across users (verified): a kept plan that referenced a session object
+    /// the reset's `DISCARD TEMP` dropped re-plans SERVER-SIDE on next use and, if
+    /// the object is gone, returns a CLASSIFIED error (never a wrong result — the
+    /// dynamic cache's existing self-heal), and a `search_path`-shifted reuse
+    /// re-resolves rather than hitting the wrong table (PostgreSQL invalidates a
+    /// plan on `search_path` change). A prepared statement carries a PLAN, never
+    /// data, so nothing bleeds across the two logical users.
+    pub async fn pool_reset_session(&mut self) -> Result<(), DriverError> {
+        self.reset_session_impl(false).await
+    }
+
+    /// The shared reset body: `clear_dyn_cache` selects whether the dynamic
+    /// prepared-statement cache is DROPPED (`true`, the manual clean-slate reset)
+    /// or KEPT warm (`false`, the pool checkout — see
+    /// [`pool_reset_session`](Self::pool_reset_session)). Everything else — the
+    /// reset SQL, the notification-ledger + N+1-window clear, and the oversize
+    /// send-buffer reclaim — is identical, so the two entry points cannot drift.
+    async fn reset_session_impl(&mut self, clear_dyn_cache: bool) -> Result<(), DriverError> {
         const RESET: &str = "SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; \
              UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
         const RESET_WITH_ROLLBACK: &str =
@@ -2010,19 +2049,21 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             RESET_WITH_ROLLBACK
         };
         self.simple_query(sql).await?;
-        // CLEAR the dynamic prepared-statement cache: a pooled connection handed
-        // to a different logical user must not reuse the prior user's cached
-        // runtime-SQL plans. Close every READY server-side statement so nothing is
-        // orphaned (a protocol `Close` of an already-dropped statement is a wire
-        // no-op, so this is robust even after a mid-session `DISCARD`/`DEALLOCATE`).
-        // BATCHED into ONE round trip (N `Close` + one `Sync`), so even a full
-        // cache costs a single flush on checkout, not one per statement.
-        let stmts = self.dyn_cache.drain();
-        if !stmts.is_empty() {
-            let names: Vec<&StmtName> = stmts.iter().map(|s| s.inner.stmt_name()).collect();
-            self.close_dyn_statements(&names).await?;
-            // `stmts` drop here: the WireStatement name buffers free, and the
-            // server-side statements were already closed by the batch above.
+        // CLEAR the dynamic prepared-statement cache ONLY on the manual reset: a
+        // consumer asking for a clean slate must not reuse the prior plans. Close
+        // every READY server-side statement so nothing is orphaned (a protocol
+        // `Close` of an already-dropped statement is a wire no-op, so this is robust
+        // even after a mid-session `DISCARD`/`DEALLOCATE`). BATCHED into ONE round
+        // trip (N `Close` + one `Sync`). The POOL path skips this (keeps the cache
+        // warm — see `pool_reset_session`), which is where the pooled win comes from.
+        if clear_dyn_cache {
+            let stmts = self.dyn_cache.drain();
+            if !stmts.is_empty() {
+                let names: Vec<&StmtName> = stmts.iter().map(|s| s.inner.stmt_name()).collect();
+                self.close_dyn_statements(&names).await?;
+                // `stmts` drop here: the WireStatement name buffers free, and the
+                // server-side statements were already closed by the batch above.
+            }
         }
         // Clear the ledger AFTER the reset round trip: `UNLISTEN *` stops new
         // notifications, and this discards every notification captured before or
