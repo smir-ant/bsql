@@ -598,12 +598,28 @@ fn settle_statement_cache<P, R>(
 ///   through `PipelineAwaitingNextOrRfq`.
 /// - SUBSEQUENT command: append only its frames; the receive FSM seats it as its
 ///   acks arrive (never a separate seat).
+///
+/// `guard` arms the TYPED RESULT-SCHEMA guard per MISS command — TRUE for a
+/// heterogeneous `pipeline((...))` (each element decodes into its `Rows<Qi>`, so a
+/// drifted runtime column would silently mis-decode), FALSE for a homogeneous
+/// `execute_batch` (which reads affected COUNTS from the command tag and DISCARDS
+/// its RETURNING rows, so it never decodes into `Q` and cannot mis-decode — leaving
+/// its wire byte-identical, no `Describe`). When `guard`, a MISS command appends a
+/// `Describe`(portal) so the server returns a `RowDescription`, and its expected
+/// schema is armed: command 0 directly ([`arm_result_guard`](ActiveEngine::arm_result_guard),
+/// its `row_oids` already seated by the leading-state seat), a SUBSEQUENT MISS
+/// command via the per-command FIFO
+/// ([`push_pipeline_guard_oids`](ActiveEngine::push_pipeline_guard_oids)) the receive
+/// FSM pops at its `CloseComplete`. A HIT command sends no `Describe` and does not
+/// arm (byte-identical; a reused server-side plan cannot silently change result type
+/// — PostgreSQL refuses it as `0A000`).
 fn stage_pipeline_frames<P, R, E>(
     active: &mut ActiveEngine,
     send_buf: &mut SendBuf,
     q: &PreparedQuery<P, R>,
     args: &P,
     first: bool,
+    guard: bool,
 ) -> Result<(), EngineError<E>>
 where
     P: ParamsWriter,
@@ -626,14 +642,34 @@ where
     // transaction under ONE trailing Sync.
     frames::build_bind_prepared(&mut send_buf.frame(), q.bind_execute_prefix, args)
         .map_err(frame_too_long)?;
+    // On a GUARDED cache MISS (a FRESH Parse — where the resolved column types can
+    // diverge from the migration schema the carrier was typed against), append a
+    // `Describe`(portal) after the `Bind` so the server returns a `RowDescription`
+    // before the row stream; the guard verifies each runtime column OID against
+    // `q.row_oids`. `execute_batch` (guard = false) and a HIT never add this.
+    if guard && !reuse {
+        enqueue_frame(send_buf, |wb| frames::build_describe_portal(wb, b""))?;
+    }
     send_buf.enqueue(&crate::prepared::EXECUTE_EMPTY_PORTAL_NO_LIMIT);
     if first {
         if reuse {
             active.begin_bind_execute(q.row_oids);
         } else {
             active.begin_close_parse_bind_execute(q.row_oids);
+            // Command 0's expected schema is already seated by the leading-state seat
+            // above; arm the guard directly so its `Describe` answer is checked.
+            if guard {
+                active.arm_result_guard();
+            }
         }
+        // `begin_pipeline` CLEARS the per-command guard FIFO, so it starts fresh for
+        // this batch — before any subsequent MISS command pushes below.
         active.begin_pipeline();
+    } else if guard && !reuse {
+        // A SUBSEQUENT MISS command: the receive FSM seats it from its own
+        // `CloseComplete`, and it holds no carrier, so queue this command's expected
+        // OIDs (IN ORDER) for the FSM to pop then.
+        active.push_pipeline_guard_oids(q.row_oids);
     }
     Ok(())
 }
@@ -648,13 +684,16 @@ where
 /// would be correct (the leading `Close` makes it idempotent) but would defeat the
 /// whole point.
 ///
-/// - `first = true` (command 0): IDENTICAL to a pipeline's first command — reset the
+/// - `first = true` (command 0): like a pipeline's first command — reset the
 ///   buffer, stage any fused prelude (a deferred transaction `BEGIN`), take the
 ///   MISS/HIT cache decision (`Close`+`Parse` on a MISS), stream `Bind`+`Execute`,
 ///   seat the leading state, and arm [`begin_pipeline`](ActiveEngine::begin_pipeline)
 ///   so the command boundary routes through `PipelineAwaitingNextOrRfq`. Delegates
-///   to [`stage_pipeline_frames`] verbatim, so the two batch verbs cannot drift in
-///   their first-command framing or cache decision.
+///   to [`stage_pipeline_frames`] with `guard = false`, so the two batch verbs cannot
+///   drift in their first-command framing or cache decision — EXCEPT the result-OID
+///   guard, which `execute_batch` deliberately omits (no `Describe`, byte-identical
+///   wire): it reads affected COUNTS and DISCARDS its RETURNING rows, so it never
+///   decodes into `Q` and cannot mis-decode.
 /// - `first = false` (a subsequent command): a BARE `Bind`+`Execute` — NO
 ///   `Close`+`Parse` (command 0 already created / reused the server-side statement,
 ///   and the commands are pipelined in ORDER so command 0's `Parse` is processed
@@ -674,7 +713,10 @@ where
     R: RowDecode,
 {
     if first {
-        return stage_pipeline_frames(active, send_buf, q, args, true);
+        // `guard = false`: `execute_batch` reads affected COUNTS and DISCARDS its
+        // RETURNING rows (never decodes into `Q`), so it cannot mis-decode and needs
+        // no `Describe` / OID guard — its wire stays byte-identical.
+        return stage_pipeline_frames(active, send_buf, q, args, true, false);
     }
     // Parse-once: a subsequent command reuses the statement command 0 created. The
     // `Bind` streams its parameter block DIRECTLY onto the growable send buffer
@@ -1408,7 +1450,10 @@ impl<'b, T: Transport> Engine<'b, T> {
             phase, send_buf, ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        stage_pipeline_frames(active, send_buf, q, args, first)
+        // `guard = true`: the heterogeneous pipeline decodes each command into its
+        // own `Rows<Qi>`, so a MISS command's runtime result schema is guarded against
+        // its carrier's compile-time OIDs — the last silent-mis-decode surface, closed.
+        stage_pipeline_frames(active, send_buf, q, args, first, true)
     }
 
     /// Append the batch's SINGLE trailing `Sync` after every command is staged —

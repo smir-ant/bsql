@@ -94,6 +94,7 @@ cargo test -p bsql-query-sqlite-fixture --features n1-detect --test n1_detect_sq
 cargo test -p bsql-query-fixture --test query_live_async -- --ignored  # live query! (async, needs PG)
 cargo test -p bsql-query-fixture --test query_live_sync  -- --ignored  # live query! (sync, needs PG)
 cargo test -p bsql-query-fixture --test query_oid_guard_live -- --ignored  # live typed RESULT-schema OID guard (both drivers): a TEMP shadow of a DIFFERENT type is a classified ColumnOidMismatch on every typed verb (never a silent "AAAA"); a matching-typed shadow + varchar/bpchar columns decode correctly (no false positive). Per-connection TEMP shadows over the 0020_oidguard.sql table, so parallel-safe (run WITHOUT --test-threads=1)
+cargo test -p bsql-query-fixture --test pipeline_oid_guard_live -- --ignored  # live PER-COMMAND result-schema OID guard on the PIPELINE (both drivers): a drifted pipeline command is a classified DriverError::BatchColumnOidMismatch naming the command (batch_failed_index()), never a silent value, connection recovers; a matching shadow + varchar/bpchar + a user-type (domain) column decode correctly (no false positive). Per-connection TEMP shadows / per-test schema, so parallel-safe (run WITHOUT --test-threads=1)
 cargo test -p bsql-sqlite --test migrate                # migration runner (in-process, no PG)
 cargo test -p bsql-postgres-sync  --test migrate_live -- --ignored  # migration runner (sync PG, incl. concurrency + CONCURRENTLY)
 cargo test -p bsql-postgres-async --test migrate_live -- --ignored  # migration runner (async PG try-lock poll)
@@ -917,17 +918,34 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   user-defined type), and within the deliberate "bsql does no connect-time OID
   resolution" boundary; a wire-COMPATIBLE swap (`varchar`↔`text`) is ACCEPTED, being an
   identical decode. Footprint: `DecodeError` stays 12 B (the new variant is the same
-  shape as `TruncatedColumnData`); `ActiveEngine` 392 → 400 B (a compact 8-B
-  niche-packed `Option<ResultOidMismatch>` recording only `index` + `found`, the driver
-  recovering `expected` from the carrier). PIPELINE / `execute_batch` are NOT yet
-  guarded (they would need per-command arm state) and stay on the pre-existing
-  boundary — their HITs are `0A000`-safe. Witnessed by the `--ignored`
+  shape as `TruncatedColumnData`); `ActiveEngine` 400 → 432 B — the guard's mismatch
+  slot `Option<ResultOidMismatch>` grew 8 → 12 B (it now carries the checked
+  `index` + `found` + `expected` triple, so the engine is the SINGLE source of the
+  pair — the driver no longer recovers `expected` from the carrier, and the
+  batch-generic PIPELINE settle reads the same triple) plus the pipeline guard's
+  per-command expected-OID FIFO `pipeline_guard_oids: Vec<&'static [u32]>` (24 B, a
+  bare Vec of `'static` fat pointers, empty in steady state). Both are COLD, appended
+  AFTER the hot fields, so every hot-field offset is unchanged and `next_event` is
+  byte-identical. **The guard now covers EVERY typed-decode surface** — the
+  single-statement verbs AND the heterogeneous `pipeline((...))` (each command decodes
+  into its own `Rows<Qi>`, so a MISS command whose runtime result columns diverged
+  would silently mis-decode; see the pipeline bullet below). `execute_batch` is
+  deliberately NOT guarded and NOT vulnerable: it reads affected COUNTS from the
+  command tag and DISCARDS its RETURNING rows (it never decodes into `Q`), so it adds
+  no `Describe` and stays byte-identical. HITs on every path are `0A000`-safe.
+  Witnessed by the `--ignored`
   `query_oid_guard_live.rs` (both drivers: the mismatch caught on every typed verb
   `query`/`query_one`/`query_each` with the connection recovering, a matching-typed
   shadow decoding correctly, and `varchar`/`bpchar` columns NOT falsely rejected) over
   the dedicated `0020_oidguard.sql` migration table (per-connection TEMP shadows, so
-  parallel-safe), plus the offline `engine_verbs_spec` / `engine_query_alloc` / corpus
-  MISS-Describe wire updates and the byte-identical `engine_hotpath_codegen`.
+  parallel-safe), the `--ignored` `pipeline_oid_guard_live.rs` (both drivers: a
+  drifted pipeline command is a classified `BatchColumnOidMismatch` naming the command
+  via `batch_failed_index()`, the connection recovering; a matching shadow, a
+  `varchar`/`bpchar` column, and a user-type (domain) column NOT falsely rejected),
+  plus the offline `engine_pipeline_spec` guard tests (command 0 + FIFO-seated
+  subsequent command, match + drift + no-false-positive) and `engine_verbs_spec` /
+  `engine_query_alloc` / corpus MISS-Describe wire updates and the byte-identical
+  `engine_hotpath_codegen`.
 
   **Airtight pooled liveness is a fundamental 1-RTT-at-checkout tax (NOT removable).**
   A pooled checkout MUST confirm the peer is still alive BEFORE the user's
@@ -1027,7 +1045,8 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   (both PG drivers + the `Transaction` guard; a SQLite sequential twin). Sends N
   compile-checked `query!` commands in ONE round trip instead of N, and returns
   the typed tuple `(Rows<Q0>, Rows<Q1>, …)` — each command decoded against ITS OWN
-  carrier's compile-time OIDs (no erasure). Pure `query!` carriers, NO builder —
+  carrier's compile-time OIDs (no erasure), each guarded against RESULT-schema drift
+  (below). Pure `query!` carriers, NO builder —
   `Bound<Q>` (`Q::bind(params)`) is a bound carrier, not a runtime SQL fragment;
   the `Pipeline` sealed trait has hand-written tuple impls arity `1..=16`. **The
   contract is ATOMIC all-or-nothing** — this is the ONLY airtight semantic, forced
@@ -1061,7 +1080,33 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `#[cold]`/out-of-line like `step_fused`; the DataRow hot arm is untouched — the
   codegen gate is green). `DriverError::BatchFailed`'s payload is 16 B
   (`usize` + `Box<DbError>`), so the 24 B `DriverError` pin holds; `deps_pin` is
-  unchanged (no new dependency). Cancellation (`57014`, connection recovers) and a
+  unchanged (no new dependency). **RESULT-schema OID guard (the last silent-mis-decode
+  surface, closed on the pipeline too).** Because each command decodes into its own
+  `Rows<Qi>` POSITIONALLY, a cache-MISS command whose runtime result columns diverged
+  from its carrier's migration schema (an out-of-band `ALTER COLUMN TYPE`, a `TEMP`
+  shadow) would silently mis-decode — the SAME class the single-statement verbs close.
+  It is now closed on the pipeline WITHOUT touching the hot path: per MISS command a
+  `Describe`(portal) is appended (a HIT sends none — byte-identical, `0A000`-safe), and
+  the `PipelineAwaitingNextOrRfq` multiplexer runs the SAME
+  `apply_fused_row_stream` / `result_oid_compatible` / 16384-user-type-skip check the
+  single-query MISS uses, against that command's expected `Qi::row_oids` (command 0's
+  seated at staging; a subsequent command's popped off a per-command FIFO
+  `pipeline_guard_oids: Vec<&'static [u32]>` at its `CloseComplete`). A divergence is a
+  classified `DriverError::BatchColumnOidMismatch { command, source: DecodeError::ColumnOidMismatch }`
+  — the reused decode error plus the failing COMMAND index (read via the same
+  `batch_failed_index()` as `BatchFailed`); its 16 B payload holds the 24 B `DriverError`
+  pin. The client drains to a clean idle (reusable) and returns ZERO results, so no
+  garbage row ever decodes. HONEST NOTE: unlike a mid-batch SERVER error (rollback), a
+  mismatch is a CLIENT decode rejection AFTER the server processed — and, for the
+  implicit-tx batch, COMMITTED — the transaction; the client returns the drift instead of
+  decoding (fail-loud beats silent-wrong: the caller learns the SCHEMA drifted, not a
+  transient error to blind-retry — the SAME already-broken-schema situation the
+  single-query guard has). `ActiveEngine` grows 400 → 432 B (the guard's mismatch slot 8
+  → 12 B carrying the checked `index`/`found`/`expected` triple from ONE source, plus the
+  24 B FIFO), both COLD and appended after the hot fields, so `next_event` is
+  byte-identical. `execute_batch` is NOT guarded and NOT vulnerable (it discards its
+  RETURNING rows — no decode into `Q` — so it adds no `Describe` and stays byte-identical).
+  Cancellation (`57014`, connection recovers) and a
   mid-batch transport death (classified disconnect, bounded, never a torn success)
   are honored. **SQLite twin:** `sqlite_conn.pipeline((…))` runs the commands
   SEQUENTIALLY inside the standard `transaction` guard's plain `BEGIN … COMMIT`
@@ -1075,9 +1120,14 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   1×; a single-statement batch (N=1) equals today's fused query (no regression, the
   path is opt-in). Witnessed by `tools/query_fixture`'s `pipeline_live_{async,sync}`
   (all-or-nothing rollback proof, the ignored-in-guard blind-zone regression, the
-  index accessor, cancel, transport death, in-guard commit), the offline
-  `engine_pipeline_spec` (the multiplexer + mid-batch drain), the SQLite
-  `pipeline_sqlite`, and the `pipeline_wrong_param` trybuild golden.
+  index accessor, cancel, transport death, in-guard commit), the `--ignored`
+  `pipeline_oid_guard_live` (both drivers: a drifted command → classified
+  `BatchColumnOidMismatch` naming the command + connection recovering; a matching
+  shadow, `varchar`/`bpchar`, and a user-type (domain) column NOT falsely rejected),
+  the offline `engine_pipeline_spec` (the multiplexer + mid-batch drain, PLUS the
+  per-command guard: command 0 + FIFO-seated subsequent command, match + drift + the
+  varchar/bpchar/user-type no-false-positive), the SQLite `pipeline_sqlite`, and the
+  `pipeline_wrong_param` trybuild golden.
 - **Homogeneous atomic bulk write — `conn.execute_batch::<Q>(params_iter)`**
   (both PG drivers + the `Transaction` guard; a SQLite sequential twin). Runs ONE
   compile-checked `query!` write carrier `Q` (an `UPDATE`/`DELETE`/`INSERT ...

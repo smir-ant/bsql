@@ -492,24 +492,47 @@ pub struct ActiveEngine {
     /// `#[cold]` helper — so `next_event`'s hot frame is unperturbed. `false` in
     /// steady state.
     pipelining: bool,
-    /// TYPED-result-schema guard arm. Set by a compile-checked cache-MISS staging
-    /// (`stage_compiled_query` / `stage_pipeline_frames`), which appends a
-    /// `Describe(portal)` so the server returns a `RowDescription`; the shared
-    /// `BindComplete` handler then routes to the RowDescription wait
-    /// (`FusedAwaitingRowDescOrNoData`) instead of straight to the row stream, and
-    /// `apply_fused_row_stream` runs the OID guard. `false` on a cache HIT (no
-    /// Describe — the reused server-side plan cannot silently change result type,
-    /// PostgreSQL refuses it as `0A000`), on the dynamic path, and in steady state,
-    /// so the HIT hot path is byte-identical. Fits a padding byte of the trailing
+    /// TYPED-result-schema guard arm. Set by a compile-checked cache-MISS whose
+    /// staging appends a `Describe(portal)` so the server returns a `RowDescription`:
+    /// the single-query path (`stage_compiled_query`) and the heterogeneous
+    /// pipeline's FIRST command (`stage_pipeline_frames`) arm it directly at staging;
+    /// a pipeline's SUBSEQUENT MISS command arms it in
+    /// [`enter_pipeline_miss`](Self::enter_pipeline_miss) at its `CloseComplete` (the
+    /// receive FSM seats each subsequent command). The shared `BindComplete` handler
+    /// then routes to the RowDescription wait (`FusedAwaitingRowDescOrNoData`) instead
+    /// of straight to the row stream, and `apply_fused_row_stream` runs the OID guard.
+    /// `false` on a cache HIT (no Describe — the reused server-side plan cannot
+    /// silently change result type, PostgreSQL refuses it as `0A000`), on the dynamic
+    /// path, on `execute_batch` (which discards its rows), and in steady state, so the
+    /// HIT hot path is byte-identical. Fits a padding byte of the trailing
     /// `Option<&'static str>` (16) tail slot alongside `prelude_active` /
     /// `pipelining`, so it is FREE.
     result_guard_armed: bool,
     /// A recorded typed-result-OID mismatch (from the armed MISS's RowDescription
     /// check), read post-pump by the driver. `None` in steady state and on a clean
-    /// match. Niche-packed via `found: NonZeroU32` (`ResultOidMismatch` stores only
-    /// `index` + `found`, dropping `expected` — the driver recovers it from the
-    /// carrier), so the slot is 8 B — the sole footprint growth (392 → 400).
+    /// match. Niche-packed via `found: NonZeroU32` (`ResultOidMismatch` stores
+    /// `index` + `found` + `expected`), so the slot is 12 B.
     result_mismatch: Option<ResultOidMismatch>,
+    /// PER-COMMAND typed-result-schema guard queue for a HETEROGENEOUS pipeline.
+    ///
+    /// In a `pipeline((...))` batch, command 0's expected result OIDs are seated at
+    /// STAGING (via `begin_close_parse_bind_execute` → [`seat_schema`](Self::seat_schema)),
+    /// but commands `1..N` are seated by the RECEIVE FSM as their acks arrive — and
+    /// the FSM holds no carrier, so it cannot reach `Qi::row_oids`. This FIFO carries
+    /// each cache-MISS command `>= 1`'s compile-time `row_oids` (`&'static` into the
+    /// consumer's `.rodata`, so a bare fat pointer — no OID copy), pushed IN ORDER at
+    /// staging by [`push_pipeline_guard_oids`](Self::push_pipeline_guard_oids), and
+    /// popped-front by [`step_pipeline_next_or_rfq`](Self::step_pipeline_next_or_rfq)
+    /// at each MISS command's leading `CloseComplete` (`'3'`) to seat + arm that
+    /// command's guard before its `RowDescription`. A cache-HIT command leads with
+    /// `BindComplete` (`'2'`), sends no `Describe`, and never pushes — so the pop
+    /// count equals the MISS-command count and the order matches. CLEARED at each
+    /// batch's start ([`begin_pipeline`](Self::begin_pipeline)) — a completed batch
+    /// drains empty, and a mismatch/error-drained batch leaves the un-popped tail as
+    /// harmless retained `'static` pointers (no owned data) until the next batch's
+    /// clear, so no per-batch teardown touches the hot `parse_rfq`. Empty in steady
+    /// state (a single non-pipeline query never fills it).
+    pipeline_guard_oids: Vec<&'static [u32]>,
 }
 
 // Stack footprint of the active handle: the carried-forward `IngestBuf` (144)
@@ -526,12 +549,20 @@ pub struct ActiveEngine {
 // +24 B from 368. The `pipelining: bool` pipeline flag is FREE: it occupies a
 // padding byte in the trailing `Option<&'static str>` (16) + `bool` (1) tail slot
 // alongside `prelude_active`, and the typed-result-guard's `result_guard_armed:
-// bool` joins them for FREE too. The +8 B from 392 → 400 is the SOLE growth: the
+// bool` joins them for FREE too. The last two growths — the single-query guard's
 // typed-result-schema mismatch slot `result_mismatch: Option<ResultOidMismatch>`
-// (8 B, niche-packed via `found: NonZeroU32`, `expected` dropped and recovered by
-// the driver) — the compact minimum for the last silent-wrong-result guard (the
-// typed cache-MISS RowDescription OID check).
-crate::wire_pin!(ActiveEngine, size = 400, align = 8);
+// (now 12 B, niche-packed via `found: NonZeroU32`, carrying `index` + `found` +
+// `expected` so the guard's checked pair has ONE source both the single-query and
+// the heterogeneous-pipeline settles read) and the PIPELINE guard's per-command
+// expected-OID FIFO `pipeline_guard_oids: Vec<&'static [u32]>` (24 B, a bare Vec of
+// `'static` fat pointers — no OID copy, empty in steady state) — take the struct to
+// 432 B. Both are COLD, off the `DataRow` hot arm, and appended AFTER the hot
+// fields, so every hot-field offset is unchanged and `next_event` is byte-identical
+// (the codegen gate is green). The pipeline FIFO closes the last silent-mis-decode
+// surface (a pipeline command whose runtime result columns diverged from its
+// carrier's migration schema), the extension of the single-query cache-MISS
+// RowDescription OID check to every typed-decode command.
+crate::wire_pin!(ActiveEngine, size = 432, align = 8);
 
 /// A recorded typed-result-schema mismatch — one result column whose RUNTIME
 /// `RowDescription` OID diverged from the carrier's compile-time expected OID.
@@ -539,18 +570,27 @@ crate::wire_pin!(ActiveEngine, size = 400, align = 8);
 /// and read post-pump by the driver, which turns it into a classified
 /// [`DecodeError::ColumnOidMismatch`](crate::decode::DecodeError::ColumnOidMismatch).
 ///
-/// Carries only `index` + `found` (8 B, niche-packed): `found` is a
+/// Carries `index` + `found` + `expected` (12 B, niche-packed): `found` is a
 /// [`NonZeroU32`](core::num::NonZeroU32) — a valid result-column OID is never
 /// `InvalidOid` (0) — so `Option<ResultOidMismatch>` niche-packs into it with no
-/// discriminant. The `expected` OID is deliberately NOT stored here: the driver
-/// recovers it from the carrier's own `Q::PREPARED.row_oids()[index]` (the single
-/// source of the expected schema), so the engine footprint stays compact.
+/// discriminant. `expected` is the compile-time OID the guard checked against
+/// (the value SEATED into `col_oids` from the carrier's `row_oids`, held here so
+/// the driver need not recover it from the carrier): this is what lets the
+/// HETEROGENEOUS pipeline surface the drift with `expected` too, since its
+/// post-pump settle is GENERIC over the whole batch tuple and has no single
+/// carrier `Q` to recover from — the engine is the single source of the checked
+/// pair. The `col_oids` buffer holding it is cleared at the batch's trailing
+/// `ReadyForQuery` before the driver reads the mismatch, so the value is captured
+/// HERE at the point of divergence, not read back later.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ResultOidMismatch {
     /// The zero-based projected result-column index.
     index: u16,
     /// The OID the server's `RowDescription` reported at runtime.
     found: core::num::NonZeroU32,
+    /// The compile-time OID the carrier expected at this column (the seated
+    /// `col_oids[index]` the guard checked against).
+    expected: u32,
 }
 
 /// The TYPED result-schema guard: compare each RUNTIME `RowDescription` column
@@ -579,7 +619,11 @@ fn check_result_oids(expected: &[u32], runtime: &[u32]) -> Option<ResultOidMisma
                 Some(nz) => nz,
                 None => core::num::NonZeroU32::MAX,
             };
-            return Some(ResultOidMismatch { index, found });
+            return Some(ResultOidMismatch {
+                index,
+                found,
+                expected: *exp,
+            });
         }
         index = index.saturating_add(1);
     }
@@ -617,6 +661,7 @@ impl ActiveEngine {
             pipelining: false,
             result_guard_armed: false,
             result_mismatch: None,
+            pipeline_guard_oids: Vec::new(),
         }
     }
 
@@ -687,12 +732,17 @@ impl ActiveEngine {
     /// already drained to a clean idle by the over-cap drain the guard reused) and,
     /// when `Some`, surfaces a classified
     /// [`DecodeError::ColumnOidMismatch`](crate::decode::DecodeError::ColumnOidMismatch)
-    /// instead of the (row-less, drained) result. Returns `(index, found)`; the
-    /// driver recovers the `expected` OID from the carrier's
-    /// `Q::PREPARED.row_oids()[index]`.
+    /// instead of the (row-less, drained) result. Returns `(index, found, expected)`:
+    /// the engine is the SINGLE source of the checked pair — `expected` is the
+    /// compile-time OID seated from the carrier's `row_oids`, held on the mismatch
+    /// so both the single-query settle (which has a `Q`) AND the heterogeneous
+    /// pipeline settle (generic over the whole batch tuple, with no single `Q` to
+    /// recover from) surface the same triple.
     #[inline]
-    pub fn take_result_oid_mismatch(&mut self) -> Option<(u16, u32)> {
-        self.result_mismatch.take().map(|m| (m.index, m.found.get()))
+    pub fn take_result_oid_mismatch(&mut self) -> Option<(u16, u32, u32)> {
+        self.result_mismatch
+            .take()
+            .map(|m| (m.index, m.found.get(), m.expected))
     }
 
     /// Whether a typed result-OID mismatch was recorded on the in-flight command
@@ -1038,6 +1088,25 @@ impl ActiveEngine {
     #[inline]
     pub fn begin_pipeline(&mut self) {
         self.pipelining = true;
+        // Start each batch with an EMPTY per-command guard FIFO. A completed batch
+        // drains it empty; a mismatch/error-drained batch leaves an un-popped tail
+        // (harmless `'static` pointers, no owned data), so clearing HERE — at the
+        // batch's start, cold, never in `parse_rfq` — is the single reset point that
+        // keeps the hot return-to-idle byte-identical. Called on command 0's staging,
+        // BEFORE any command `>= 1` pushes, so the FIFO fills fresh for this batch.
+        self.pipeline_guard_oids.clear();
+    }
+
+    /// Push ONE cache-MISS pipeline command's compile-time expected result OIDs onto
+    /// the per-command guard FIFO — called at STAGING for each MISS command `>= 1`
+    /// (command 0 is seated directly at staging, so it never queues). The `'static`
+    /// slice (the carrier's `row_oids` into `.rodata`) is stored by reference — no
+    /// copy. Popped-front by [`step_pipeline_next_or_rfq`](Self::step_pipeline_next_or_rfq)
+    /// at that command's leading `CloseComplete`, IN THE SAME ORDER pushed, so the
+    /// guard seats the right command's schema before its `RowDescription`.
+    #[inline]
+    pub fn push_pipeline_guard_oids(&mut self, oids: &'static [u32]) {
+        self.pipeline_guard_oids.push(oids);
     }
 
     /// Reset the engine to a clean idle after a pipeline STAGING error (a
@@ -1062,6 +1131,11 @@ impl ActiveEngine {
     #[inline]
     pub fn abort_pipeline_staging(&mut self) {
         self.pipelining = false;
+        // Discard any per-command guard OIDs pushed for the commands staged before
+        // the overflow: nothing was flushed, so no reply will pop them, and the next
+        // batch's `begin_pipeline` would clear them anyway — clearing HERE keeps the
+        // aborted batch from carrying a stale tail into a non-pipeline verb.
+        self.pipeline_guard_oids.clear();
         self.reset_columns();
         self.prelude_active = false;
         self.state = ActiveState::Idle;
@@ -1620,9 +1694,17 @@ impl ActiveEngine {
     ///   its `BindComplete` is consumed HERE, so advance directly into
     ///   [`BindAwaitingData`](ActiveState::BindAwaitingData).
     /// - `'3'` `CloseComplete` → the next command is a cache-MISS whose leading
-    ///   `Close` makes its following `Parse` idempotent; advance into the existing
+    ///   `Close` makes its following `Parse` idempotent; SEAT + ARM that command's
+    ///   typed result-schema guard (pop its `Qi::row_oids` off the per-command FIFO —
+    ///   [`enter_pipeline_miss`](Self::enter_pipeline_miss)) and advance into the
+    ///   existing
     ///   [`ParseBindExecuteAwaitingParseComplete`](ActiveState::ParseBindExecuteAwaitingParseComplete)
-    ///   chain (`ParseComplete` → `BindComplete` → the row stream).
+    ///   chain (`ParseComplete` → `BindComplete` → the guarded `RowDescription` →
+    ///   the row stream). The guard runs in the SAME
+    ///   [`apply_fused_row_stream`](Self::apply_fused_row_stream) the single-query
+    ///   MISS uses, so a pipeline command whose runtime result columns diverged from
+    ///   its carrier's migration schema is a classified mismatch, never a silent
+    ///   mis-decode.
     /// - `'E'` `ErrorResponse` → the next command errored at its FIRST step (e.g. a
     ///   `Bind` type error, sent with no preceding `BindComplete`); recover via
     ///   [`fail_recoverable`](Self::fail_recoverable) (drain to the batch RFQ). The
@@ -1644,12 +1726,45 @@ impl ActiveEngine {
                 ActiveOutcome::Silent
             }
             T_CLOSE_COMPLETE => {
+                self.enter_pipeline_miss();
                 self.state = ActiveState::ParseBindExecuteAwaitingParseComplete;
                 ActiveOutcome::Silent
             }
             T_ERROR => self.fail_recoverable(start, end),
             _ => self.teardown(),
         }
+    }
+
+    /// Seat + arm the typed result-schema guard for the NEXT pipeline cache-MISS
+    /// command, at its leading `CloseComplete` (`'3'`) in
+    /// [`PipelineAwaitingNextOrRfq`](ActiveState::PipelineAwaitingNextOrRfq).
+    ///
+    /// Pops that command's compile-time `Qi::row_oids` off the FIFO
+    /// ([`push_pipeline_guard_oids`](Self::push_pipeline_guard_oids) filled it at
+    /// staging, IN ORDER), seats it as the expected schema, and arms the guard — so
+    /// when its `Describe`(portal) `RowDescription` arrives (after `ParseComplete` +
+    /// `BindComplete`), the shared [`apply_fused_row_stream`](Self::apply_fused_row_stream)
+    /// verifies each runtime column OID against it, exactly as the single-query MISS.
+    /// The pop is front-order because commands are staged and replied IN ORDER and a
+    /// HIT command never queues (it leads with `'2'`, not `'3'`), so the FIFO front is
+    /// always THIS MISS command's schema.
+    ///
+    /// FAIL-SAFE if the FIFO is empty (a `'3'` with no queued OIDs — only reachable
+    /// from a hand-seated offline spec that armed pipeline mode without staging, never
+    /// the real driver): leave the guard disarmed and take the byte-identical
+    /// pre-guard route, so the command still decodes (unchecked), never a panic.
+    ///
+    /// `#[cold]` + `#[inline(never)]`: a once-per-MISS-command transition off the hot
+    /// `DataRow` frame, kept out of line exactly like its caller.
+    #[cold]
+    #[inline(never)]
+    fn enter_pipeline_miss(&mut self) {
+        if self.pipeline_guard_oids.is_empty() {
+            return;
+        }
+        let expected = self.pipeline_guard_oids.remove(0);
+        self.seat_schema(expected);
+        self.arm_result_guard();
     }
 
     /// `ExtendedAwaitingRfq` — every extended-protocol command ends at the

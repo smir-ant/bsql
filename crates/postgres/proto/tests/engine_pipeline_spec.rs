@@ -176,6 +176,39 @@ fn miss_command(val: &[u8], tag: &str) -> Vec<u8> {
     out
 }
 
+/// A `RowDescription` carrying one column per `oids` entry (binary format). The
+/// per-field 18-byte meta is `table_oid(4) col_attr(2) type_oid(4) typlen(2)
+/// typmod(4) format_code(2)` — only the `type_oid` is load-bearing for the guard.
+fn row_description(oids: &[u32]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&i16::try_from(oids.len()).unwrap_or(0).to_be_bytes());
+    for (i, &oid) in oids.iter().enumerate() {
+        body.extend_from_slice(format!("c{i}").as_bytes());
+        body.push(0); // NUL-terminated column name
+        body.extend_from_slice(&0u32.to_be_bytes()); // table oid
+        body.extend_from_slice(&0u16.to_be_bytes()); // column attr number
+        body.extend_from_slice(&oid.to_be_bytes()); // TYPE OID (the guarded field)
+        body.extend_from_slice(&0u16.to_be_bytes()); // typlen
+        body.extend_from_slice(&0u32.to_be_bytes()); // typmod
+        body.extend_from_slice(&1u16.to_be_bytes()); // format code = binary
+    }
+    frame(b'T', &body)
+}
+
+/// One GUARDED MISS command's reply: like [`miss_command`] but with the
+/// `Describe`(portal) answer — a `RowDescription` (of `oids`) BEFORE the row — that
+/// the per-command result-schema guard checks. This is the wire a MISS pipeline
+/// command produces once it appends its `Describe`.
+fn miss_command_guarded(oids: &[u32], val: &[u8], tag: &str) -> Vec<u8> {
+    let mut out = close_complete();
+    out.extend_from_slice(&parse_complete());
+    out.extend_from_slice(&bind_complete());
+    out.extend_from_slice(&row_description(oids));
+    out.extend_from_slice(&data_row(val));
+    out.extend_from_slice(&command_complete(tag));
+    out
+}
+
 /// Drive one pump pass, tallying `Row` / `Deliver` / `Fail` surfaces.
 fn drive(engine: &mut ActiveEngine, transport: &mut ScriptReader) -> (Boundary, usize, usize, usize) {
     let mut send_buf = SendBuf::new();
@@ -374,4 +407,138 @@ fn error_at_the_next_commands_first_ack_is_classified_and_drains() {
     let (boundary2, _r, d2, _f) = drive(&mut engine, &mut transport);
     assert_eq!(boundary2, Boundary::Idle, "drains to a clean idle");
     assert_eq!(d2, 0);
+}
+
+// ── Per-command TYPED RESULT-SCHEMA guard ────────────────────────────────────
+//
+// A pipeline command decodes into its OWN `Rows<Qi>`, so a cache-MISS command whose
+// runtime result columns diverged from its carrier's migration schema would silently
+// mis-decode. The guard closes it: a MISS command appends a `Describe`(portal), and
+// the receive multiplexer verifies each runtime column OID against the seated
+// compile-time schema (command 0's seated at staging; a subsequent command's popped
+// off the FIFO at its `CloseComplete`) in the SAME `apply_fused_row_stream` the
+// single-query MISS uses. A mismatch records a classified mismatch and drains to a
+// clean idle (no garbage row surfaces); a match, a `varchar`/`bpchar` (one text
+// class), and a user type (dynamic OID >= 16384, skipped) all decode unrejected.
+
+#[test]
+fn pipeline_command0_miss_matching_rowdesc_decodes_no_mismatch() {
+    // Command 0 is a MISS seated + ARMED at staging (col_oids = [text 25]); its
+    // Describe answer reports the SAME text (25), so the guard passes and the row
+    // decodes — the transparent match path (a warm connection is all matches).
+    let mut engine = active();
+    engine.begin_close_parse_bind_execute(&[25]);
+    engine.arm_result_guard();
+    engine.begin_pipeline();
+    let mut inbound = miss_command_guarded(&[25], b"hi", "SELECT 1");
+    inbound.extend_from_slice(&ready_idle());
+    let mut transport = ScriptReader { inbound };
+    let (boundary, rows, delivers, fails) = drive(&mut engine, &mut transport);
+    assert_eq!(boundary, Boundary::Idle);
+    assert_eq!((rows, delivers, fails), (1, 1, 0), "matching schema decodes");
+    assert_eq!(
+        engine.take_result_oid_mismatch(),
+        None,
+        "a matching runtime schema records no mismatch",
+    );
+}
+
+#[test]
+fn pipeline_command0_miss_drifted_rowdesc_records_mismatch_and_drains() {
+    // Command 0's Describe answer reports int4 (23) where the carrier expected text
+    // (25) — a schema drift (a TEMP shadow / ALTER COLUMN TYPE). The guard fires:
+    // the in-flight result is SWALLOWED to the batch RFQ (no garbage row reaches a
+    // builder) and the classified mismatch (column 0, found 23, expected 25) is
+    // recorded for the driver to surface as a `BatchColumnOidMismatch`.
+    let mut engine = active();
+    engine.begin_close_parse_bind_execute(&[25]);
+    engine.arm_result_guard();
+    engine.begin_pipeline();
+    let mut inbound = miss_command_guarded(&[23], b"AAAA", "SELECT 1");
+    inbound.extend_from_slice(&ready_idle());
+    let mut transport = ScriptReader { inbound };
+    let (boundary, rows, delivers, fails) = drive(&mut engine, &mut transport);
+    assert_eq!(boundary, Boundary::Idle, "the drain reaches the clean batch RFQ");
+    assert_eq!(
+        (rows, delivers, fails),
+        (0, 0, 0),
+        "the drifted result is swallowed — no row ever reaches a builder",
+    );
+    assert_eq!(
+        engine.take_result_oid_mismatch(),
+        Some((0u16, 23u32, 25u32)),
+        "column 0: found int4=23, expected text=25",
+    );
+}
+
+#[test]
+fn pipeline_subsequent_miss_via_queue_matching_decodes() {
+    // Command 0 is a HIT; command 1 is a MISS seated by the RECEIVE FSM off the
+    // per-command FIFO (pushed at staging). Its Describe answer matches text (25),
+    // so both commands decode.
+    let mut engine = active();
+    engine.begin_bind_execute(&[25]);
+    engine.begin_pipeline(); // clears the FIFO
+    engine.push_pipeline_guard_oids(&[25]); // command 1's expected schema
+    let mut inbound = hit_command(b"c0", "SELECT 1");
+    inbound.extend_from_slice(&miss_command_guarded(&[25], b"c1", "SELECT 1"));
+    inbound.extend_from_slice(&ready_idle());
+    let mut transport = ScriptReader { inbound };
+    let (boundary, rows, delivers, fails) = drive(&mut engine, &mut transport);
+    assert_eq!(boundary, Boundary::Idle);
+    assert_eq!((rows, delivers, fails), (2, 2, 0));
+    assert_eq!(engine.take_result_oid_mismatch(), None);
+}
+
+#[test]
+fn pipeline_subsequent_miss_via_queue_drifted_records_mismatch() {
+    // Command 0 (HIT) delivers; command 1 (MISS, seated off the FIFO) drifts (int4
+    // where text expected). Only command 0's row surfaces; command 1's result is
+    // swallowed and the mismatch is recorded — the FIFO-seated peer of the
+    // command-0 drift.
+    let mut engine = active();
+    engine.begin_bind_execute(&[25]);
+    engine.begin_pipeline();
+    engine.push_pipeline_guard_oids(&[25]);
+    let mut inbound = hit_command(b"c0", "SELECT 1");
+    inbound.extend_from_slice(&miss_command_guarded(&[23], b"AAAA", "SELECT 1"));
+    inbound.extend_from_slice(&ready_idle());
+    let mut transport = ScriptReader { inbound };
+    let (boundary, rows, delivers, fails) = drive(&mut engine, &mut transport);
+    assert_eq!(boundary, Boundary::Idle);
+    assert_eq!(
+        (rows, delivers, fails),
+        (1, 1, 0),
+        "command 0 delivered; command 1's drifted result was swallowed",
+    );
+    assert_eq!(engine.take_result_oid_mismatch(), Some((0u16, 23u32, 25u32)));
+}
+
+#[test]
+fn pipeline_guard_no_false_positive_on_varchar_bpchar_or_user_type() {
+    // NONE of these is a mismatch against a text (25) marker: varchar (1043) and
+    // bpchar (1042) share ONE wire decode class with text, and a user type
+    // (dynamic OID >= 16384) is SKIPPED (its runtime safety is the label/arity
+    // check). Each decodes unrejected — the guard never falsely rejects.
+    for runtime in [1043u32, 1042u32, 16_385u32] {
+        let mut engine = active();
+        engine.begin_close_parse_bind_execute(&[25]);
+        engine.arm_result_guard();
+        engine.begin_pipeline();
+        let mut inbound = miss_command_guarded(&[runtime], b"x", "SELECT 1");
+        inbound.extend_from_slice(&ready_idle());
+        let mut transport = ScriptReader { inbound };
+        let (boundary, rows, delivers, fails) = drive(&mut engine, &mut transport);
+        assert_eq!(boundary, Boundary::Idle, "runtime={runtime}");
+        assert_eq!(
+            (rows, delivers, fails),
+            (1, 1, 0),
+            "runtime={runtime}: compatible/skipped column decodes, not falsely rejected",
+        );
+        assert_eq!(
+            engine.take_result_oid_mismatch(),
+            None,
+            "runtime={runtime}: no false mismatch",
+        );
+    }
 }

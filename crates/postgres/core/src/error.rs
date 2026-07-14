@@ -481,6 +481,45 @@ pub enum DriverError {
         /// The classified server error the failing command reported.
         source: Box<DbError>,
     },
+    /// A HETEROGENEOUS pipeline command's RESULT-schema OID guard caught a runtime
+    /// result column whose type DIVERGED from the migration schema the command's
+    /// carrier `Qi` was typed against (an out-of-band `ALTER COLUMN TYPE`, or a
+    /// `CREATE TEMP TABLE` shadowing a migration table with a different column type).
+    ///
+    /// This is a CLIENT-side decode guard, detected at command `command`'s
+    /// `RowDescription` (on a cache MISS) BEFORE its rows decode — so NO garbage row
+    /// is ever produced (the whole batch returns ZERO results, all-or-nothing). It
+    /// is the PIPELINE peer of the single-query [`Decode`](Self::Decode)`(`
+    /// [`DecodeError::ColumnOidMismatch`](bsql_postgres_proto::DecodeError::ColumnOidMismatch)`)`
+    /// guard, reusing the SAME `DecodeError::ColumnOidMismatch` (`source`) plus the
+    /// zero-based `command` index within the batch tuple (read via
+    /// [`batch_failed_index`](Self::batch_failed_index), like [`BatchFailed`](Self::BatchFailed)).
+    ///
+    /// # Honest post-detection state
+    ///
+    /// UNLIKE a mid-batch SERVER error (which ROLLS BACK the implicit transaction),
+    /// this is a client decode rejection AFTER the server has processed — and, for a
+    /// no-explicit-`BEGIN` batch, COMMITTED — the implicit transaction: the batch's
+    /// writes may have PERSISTED server-side. The client returns this instead of
+    /// decoding the drifted result. This is the SAME already-broken-schema situation
+    /// the single-query guard has, and fail-loud is strictly better than a silent
+    /// wrong value: a `ColumnOidMismatch` tells the caller the SCHEMA drifted (fix
+    /// the migration / drop the shadow), NOT a transient error to blind-retry. It is
+    /// NOT a disconnect ([`is_disconnect`](Self::is_disconnect) is `false`) — the
+    /// connection was drained to a clean idle and is reusable.
+    ///
+    /// A `u16` `command` (arity `<= 16`) + a 12 B `DecodeError` = 16 B, the SAME
+    /// width as the enum's existing widest payloads, so the 24 B footprint pin is
+    /// UNTOUCHED.
+    BatchColumnOidMismatch {
+        /// Zero-based index of the command whose result column drifted, within the
+        /// batch tuple (`0 <= command < arity`).
+        command: u16,
+        /// The reused classified decode error — always a
+        /// [`DecodeError::ColumnOidMismatch`](bsql_postgres_proto::DecodeError::ColumnOidMismatch)
+        /// naming the column index, the expected (migration) OID, and the runtime OID.
+        source: DecodeError,
+    },
 }
 
 // Footprint pin: a sum type whose size is set by its widest variant plus the
@@ -491,6 +530,9 @@ pub enum DriverError {
 // `Decode(DecodeError)` (12 B, after its
 // `TruncatedColumnData` counts narrowed `usize -> u32`) and `Column(ColumnError)`
 // (also 12 B, after `OutOfRange` narrowed `usize -> u32`) no longer set the width.
+// `BatchColumnOidMismatch { command: u16, source: DecodeError }` is 16 B too (the
+// 12 B `DecodeError` + a 2 B command index, padded to 16), so the pipeline
+// result-schema guard does NOT re-inflate the enum either.
 // So 16 B payload + 8 B discriminant = 24 B, down from 32 (and 120 before boxing).
 // Every `Result<T, DriverError>` error half shrinks accordingly. The pin catches a
 // new wide variant that would re-inflate the enum.
@@ -595,7 +637,11 @@ impl DriverError {
             // A client-side parameter-type / arity rejection: caught BEFORE any
             // Bind, so the connection is untouched — fix the parameter and retry.
             | Self::ParamTypeMismatch { .. }
-            | Self::ParamCountMismatch { .. } => false,
+            | Self::ParamCountMismatch { .. }
+            // A pipeline command's result-schema drift is a client-side decode guard;
+            // the connection was drained to a clean idle and is reusable (fix the
+            // schema drift, not the connection).
+            | Self::BatchColumnOidMismatch { .. } => false,
         }
     }
 
@@ -622,6 +668,10 @@ impl DriverError {
     pub fn batch_failed_index(&self) -> Option<usize> {
         match self {
             Self::BatchFailed { index, .. } => Some(*index),
+            // The result-OID guard's client-side rejection names its command too, so
+            // a consumer reads the failing index the SAME way for either pipeline
+            // failure kind (a server error or a schema-drift decode guard).
+            Self::BatchColumnOidMismatch { command, .. } => Some(usize::from(*command)),
             _ => None,
         }
     }
@@ -708,6 +758,10 @@ impl fmt::Display for DriverError {
                 f,
                 "pipeline command #{index} failed (the whole batch rolled back — all-or-nothing): {source}"
             ),
+            Self::BatchColumnOidMismatch { command, source } => write!(
+                f,
+                "pipeline command #{command} result-schema drift ({source}); the migration schema this command was typed against no longer matches the live result — fix the schema drift (the whole batch returned no results; the connection is reusable)"
+            ),
         }
     }
 }
@@ -720,6 +774,8 @@ impl std::error::Error for DriverError {
             Self::Db(e) => Some(e.as_ref()),
             // A pipeline failure's underlying cause is its command's server error.
             Self::BatchFailed { source, .. } => Some(source.as_ref()),
+            // A pipeline result-schema drift's cause is its reused decode error.
+            Self::BatchColumnOidMismatch { source, .. } => Some(source),
             Self::Io(e) => Some(e),
             Self::Decode(e) => Some(e),
             Self::Column(e) => Some(e),

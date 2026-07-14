@@ -837,20 +837,15 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// refuses to change a reused plan's result type (`0A000`) — so on a HIT there
     /// is nothing recorded and this is a cheap `None` check.
     ///
-    /// The engine records only `(index, found)`; the `expected` OID is recovered
-    /// HERE from the carrier's own `Q::PREPARED.row_oids()[index]` (the single
-    /// source of the compile-time expected schema), keeping the engine footprint
-    /// compact.
-    fn take_typed_schema_error<Q: TypedQuery>(&mut self) -> Result<(), DriverError> {
+    /// The engine records the checked `(index, found, expected)` triple directly
+    /// (the `expected` OID is the value it SEATED from the carrier's `row_oids` and
+    /// checked against), so the driver surfaces the classified error verbatim — the
+    /// engine is the single source of the pair. This is what lets the heterogeneous
+    /// [`pipeline`](Self::pipeline) surface the SAME triple from its batch-generic
+    /// settle, which has no single carrier `Q` to recover an `expected` from.
+    fn take_typed_schema_error(&mut self) -> Result<(), DriverError> {
         match self.engine.take_result_oid_mismatch() {
-            Some((index, found)) => {
-                // The guard's index is always within the carrier's row-OID list
-                // (it enumerated that very list); `0` (InvalidOid) is a defensive
-                // floor surfaced in the error, never a real expected OID.
-                let expected = match Q::PREPARED.row_oids().get(usize::from(index)) {
-                    Some(&oid) => oid,
-                    None => 0,
-                };
+            Some((index, found, expected)) => {
                 Err(DriverError::Decode(DecodeError::ColumnOidMismatch {
                     index,
                     expected,
@@ -1524,7 +1519,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         // The connection is now idle + pooled. Fail loud if the fresh Parse's
         // RowDescription revealed a runtime column type diverging from the
         // migration schema (the guard drained the result, so `builder` is empty).
-        self.take_typed_schema_error::<Q>()?;
+        self.take_typed_schema_error()?;
         // An oversize row was reassembled into the prebuffer's `wire` by
         // `RowsBuilder::feed` and is just another contiguous span, so it decodes
         // exactly like an inline row — no cap.
@@ -1699,7 +1694,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 // RowDescription) drained the rows before any reached the sink, so
                 // it dominates the (empty) row/decode outcome — fail loud rather
                 // than return `Ok(None)`.
-                self.take_typed_schema_error::<Q>()?;
+                self.take_typed_schema_error()?;
                 match (row, decode_err) {
                     (Some(owned), _) => Ok(Some(owned)),
                     (None, Some(de)) => Err(DriverError::Decode(de)),
@@ -1819,7 +1814,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         // before any reached `on_row`, so `out` is `None` (no garbage row was
         // yielded) and the mismatch dominates. Checked HERE (not in the shared
         // `finish_stream`) because the carrier `Q` recovers the expected OID.
-        self.take_typed_schema_error::<Q>()?;
+        self.take_typed_schema_error()?;
         Ok(out)
     }
 
@@ -2157,6 +2152,47 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             // connection at `Idle` tx status (mirrors the serial cache rule; inside
             // an explicit transaction it defers, since a rollback could drop it).
             CommandStatus::Completed => {
+                // TYPED RESULT-SCHEMA guard: a cache-MISS command whose runtime
+                // result columns diverged from its carrier `Qi`'s migration schema
+                // was caught at ITS `RowDescription` and the batch drained to a clean
+                // idle (the same over-cap drain the single-query guard reuses), so no
+                // garbage row ever reached a builder. Surface it BEFORE recording the
+                // cache or building the `Ok` tuple: the drifted command's rows never
+                // decode. `current` is the failing command's zero-based index —
+                // frozen at the mismatch, since the drain surfaces no further
+                // `Deliver`. HONEST NOTE: unlike a server error (rollback), the server
+                // may have COMMITTED this batch's implicit transaction (the mismatch
+                // is a client decode rejection AFTER the server processed); the client
+                // returns the classified drift instead of decoding — the schema
+                // drifted, fail-loud beats silent-wrong. A MISS whose guard fired is
+                // NOT recorded in the cache (a repeat re-`Describe`s + re-guards),
+                // which the settle below skips by returning here first.
+                if let Some((column, found, expected)) = self.engine.take_result_oid_mismatch() {
+                    core::hint::cold_path();
+                    // `current < arity <= 16`, so the `u16` never saturates; the
+                    // `Err` arm is a total-conversion floor, never reached (no `as`,
+                    // no `unwrap`). `unwrap_or` is banned by the silent-fallback
+                    // ledger, so this explicit match is the sanctioned dead arm (the
+                    // same shape `DbError::code`'s narrow uses).
+                    #[expect(
+                        clippy::manual_unwrap_or,
+                        reason = "unwrap_or is a disallowed method; this explicit match is the \
+                                  sanctioned dead-arm narrow — `current < arity <= 16`, so the \
+                                  `Err` view is unreachable, never a masked failure"
+                    )]
+                    let command = match u16::try_from(current) {
+                        Ok(c) => c,
+                        Err(_) => u16::MAX,
+                    };
+                    return Err(DriverError::BatchColumnOidMismatch {
+                        command,
+                        source: DecodeError::ColumnOidMismatch {
+                            index: column,
+                            expected,
+                            found,
+                        },
+                    });
+                }
                 if matches!(self.engine.tx_status(), Ok(TxStatus::Idle)) {
                     for &name in &plan {
                         self.engine.record_pipeline_statement(name);
