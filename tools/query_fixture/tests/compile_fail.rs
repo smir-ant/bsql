@@ -189,6 +189,10 @@ fn unknown_reference_is_compile_error() {
     // element guarantee holds at the batch boundary, same as a single `query`).
     t.compile_fail("tests/compile_fail/pipeline_wrong_param.rs");
 
+    // A homogeneous `execute_batch` whose parameter tuples do not match the carrier's
+    // `Params` is a type error at the call — a bulk write cannot carry a mistyped set.
+    t.compile_fail("tests/compile_fail/execute_batch_wrong_param.rs");
+
     // Every valid dynamic form type-checks at macro expansion.
     t.pass("tests/compile_pass/query_dynamics_ok.rs");
     // The valid `copy!` + `copy_in_typed` happy path type-checks (GREEN peer of

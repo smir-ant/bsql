@@ -618,6 +618,54 @@ where
     Ok(())
 }
 
+/// Stage ONE command of a HOMOGENEOUS `execute_batch` — the PARSE-ONCE peer of
+/// [`stage_pipeline_frames`]. The heterogeneous pipeline stages each element with
+/// its OWN cache decision (a MISS re-`Parse`s every element), but an `execute_batch`
+/// runs the SAME carrier `Q` against N parameter sets, so `Q` is `Parse`d at most
+/// ONCE (command 0's MISS `Close`+`Parse`, or a prior-cached HIT) and every
+/// SUBSEQUENT command is a BARE `Bind`+`Execute` referencing that one server-side
+/// statement — the bulk win. Re-`Parse`ing the same content-addressed name N times
+/// would be correct (the leading `Close` makes it idempotent) but would defeat the
+/// whole point.
+///
+/// - `first = true` (command 0): IDENTICAL to a pipeline's first command — reset the
+///   buffer, stage any fused prelude (a deferred transaction `BEGIN`), take the
+///   MISS/HIT cache decision (`Close`+`Parse` on a MISS), stream `Bind`+`Execute`,
+///   seat the leading state, and arm [`begin_pipeline`](ActiveEngine::begin_pipeline)
+///   so the command boundary routes through `PipelineAwaitingNextOrRfq`. Delegates
+///   to [`stage_pipeline_frames`] verbatim, so the two batch verbs cannot drift in
+///   their first-command framing or cache decision.
+/// - `first = false` (a subsequent command): a BARE `Bind`+`Execute` — NO
+///   `Close`+`Parse` (command 0 already created / reused the server-side statement,
+///   and the commands are pipelined in ORDER so command 0's `Parse` is processed
+///   before this command's `Bind`), and NO seat (the receive FSM seats each
+///   subsequent command from its own `BindComplete` at `PipelineAwaitingNextOrRfq`).
+///   NO `Sync` — the single trailing `Sync` is hoisted to the batch end, so the
+///   whole batch is ONE implicit transaction.
+fn stage_batch_frames<P, R, E>(
+    active: &mut ActiveEngine,
+    send_buf: &mut SendBuf,
+    q: &PreparedQuery<P, R>,
+    args: &P,
+    first: bool,
+) -> Result<(), EngineError<E>>
+where
+    P: ParamsWriter,
+    R: RowDecode,
+{
+    if first {
+        return stage_pipeline_frames(active, send_buf, q, args, true);
+    }
+    // Parse-once: a subsequent command reuses the statement command 0 created. The
+    // `Bind` streams its parameter block DIRECTLY onto the growable send buffer
+    // (unbounded params), exactly as the serial / pipeline paths; `Execute` is
+    // fixed-size. NO `Close`/`Parse`, NO seat, NO `Sync`.
+    frames::build_bind_prepared(&mut send_buf.frame(), q.bind_execute_prefix, args)
+        .map_err(frame_too_long)?;
+    send_buf.enqueue(&crate::prepared::EXECUTE_EMPTY_PORTAL_NO_LIMIT);
+    Ok(())
+}
+
 impl<'b, T: Transport> Engine<'b, T> {
     /// Drain a `Sync` and await the connection's `ReadyForQuery` — a liveness
     /// round trip. Surfaces nothing on a quiet connection; any asynchronous
@@ -1396,6 +1444,109 @@ impl<'b, T: Transport> Engine<'b, T> {
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         let status = drive_to_outcome(active, transport, send_buf, sink).await?;
+        Ok(Outcome { live, status })
+    }
+
+    // ── Homogeneous execute_batch staging + windowed drive ──────────────────
+
+    /// Stage ONE command of a homogeneous `execute_batch` — the PARSE-ONCE peer of
+    /// [`stage_pipeline_command`](Self::stage_pipeline_command). `first = true`
+    /// stages command 0 exactly as a pipeline's first command (reset + prelude +
+    /// MISS/HIT cache decision + `Bind`+`Execute` + seat + `begin_pipeline`);
+    /// `first = false` appends a BARE `Bind`+`Execute` reusing the statement command
+    /// 0 created — NO re-`Parse`, NO seat (see [`stage_batch_frames`]). No token, no
+    /// I/O — a pure send-buffer build the driver's `execute_batch` verb calls once
+    /// per parameter set.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::WrongPhase`] — the engine is not in its active phase.
+    /// - [`EngineError::FrameTooLong`] — a command's params exceeded the wire length
+    ///   field. If NOTHING has been flushed yet the caller
+    ///   [`abort_pipeline_staging`](Self::abort_pipeline_staging) (the connection is
+    ///   healthy, a consumed deferred `BEGIN` preserved); after a window was already
+    ///   flushed it is FATAL (the caller drops the connection, rolling back the
+    ///   open implicit transaction — all-or-nothing preserved).
+    pub fn stage_execute_batch_command<P, R>(
+        &mut self,
+        q: &PreparedQuery<P, R>,
+        args: &P,
+        first: bool,
+    ) -> Result<(), EngineError<T::Error>>
+    where
+        P: ParamsWriter,
+        R: RowDecode,
+    {
+        let Self {
+            phase, send_buf, ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        stage_batch_frames(active, send_buf, q, args, first)
+    }
+
+    /// Append a `Flush` (`'H'`) after a WINDOW of staged `execute_batch` commands —
+    /// forces the server to emit the window's buffered responses WITHOUT ending the
+    /// implicit transaction (only [`stage_pipeline_seal`](Self::stage_pipeline_seal)'s
+    /// `Sync` does that). The deadlock-free peer of the COPY batcher's threshold
+    /// flush: unlike COPY (the server is silent while the client streams), an
+    /// extended-protocol command emits a per-command response, so a large batch must
+    /// DRAIN each window's responses before staging the next — the `Flush` makes the
+    /// window's responses available to drain. No token, no I/O (the driver flushes +
+    /// drains next).
+    #[inline]
+    pub fn stage_flush(&mut self) {
+        self.send_buf.enqueue(&crate::wire::FLUSH_WIRE_BYTES);
+    }
+
+    /// Pending (staged-but-unflushed) send-buffer bytes — the driver's
+    /// `execute_batch` reads this after each staged command to decide a WINDOW
+    /// boundary (flush + drain when it crosses the batcher threshold), keeping the
+    /// send buffer bounded regardless of N (constant memory). No token, no I/O.
+    #[inline]
+    #[must_use]
+    pub fn pending_send_len(&self) -> usize {
+        self.send_buf.pending_len()
+    }
+
+    /// Drive a staged `execute_batch` WINDOW to its boundary — the BREAKABLE peer of
+    /// [`run_pipeline`](Self::run_pipeline). `sink` returns [`ControlFlow::Break`]
+    /// once it has counted the window's expected deliveries, so the pump stops at
+    /// the inter-command `PipelineAwaitingNextOrRfq` boundary
+    /// ([`Boundary::Stopped`]) — the connection is left at a clean resumable point
+    /// (the window ended with a `Flush`, so no frames remain buffered) and the
+    /// driver stages the next window. A mid-window server error surfaces its raw
+    /// bytes through `sink` and returns [`Boundary::Failed`] (no `Sync` was sent, so
+    /// the RFQ is NOT drained here — the driver stages the trailing `Sync` and drains
+    /// via [`run_pipeline`](Self::run_pipeline)). Mirrors
+    /// [`query_params_break`](Self::query_params_break) WITHOUT the staging/settle
+    /// (already staged by [`stage_execute_batch_command`](Self::stage_execute_batch_command)).
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::WrongPhase`] — not in the active phase.
+    /// - [`EngineError::ProtocolViolation`] / [`EngineError::UnexpectedSuspend`] — a
+    ///   teardown / unexpected suspend; the connection is dead, the token consumed.
+    /// - As [`run_pipeline`](Self::run_pipeline) for transport faults.
+    pub async fn run_pipeline_break<S, B>(
+        &mut self,
+        live: Live<'b>,
+        sink: S,
+    ) -> Result<Outcome<'b, Boundary<B>>, EngineError<T::Error>>
+    where
+        S: FnMut(Surface<'_>) -> ControlFlow<B>,
+    {
+        let Self {
+            transport,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        let boundary = pump_active_to_boundary(active, transport, send_buf, sink).await?;
+        // Alive boundaries (`Idle` / `Failed` / `Stopped`) ride `Ok` with the token;
+        // fatal ones (`Closed` / `Suspended`) consume it — the `classify_break_boundary`
+        // rule the breakable dynamic verbs use.
+        let status = classify_break_boundary(boundary)?;
         Ok(Outcome { live, status })
     }
 

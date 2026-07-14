@@ -103,6 +103,10 @@ cargo test -p bsql-query-fixture --test copy_typed_live_async -- --ignored  # li
 cargo test -p bsql-query-fixture --test copy_typed_live_sync  -- --ignored  # live copy_in_typed (sync, needs PG)
 cargo test -p bsql-postgres-proto --test engine_copy_typed_alloc       # typed binary-COPY constant-memory gate
 cargo test -p bsql-postgres-proto --test engine_query_break_alloc      # dynamic streaming constant-memory gate (alloc count row-count-independent)
+cargo test -p bsql-postgres-proto --test engine_execute_batch_alloc    # execute_batch constant-SEND-memory gate (staged-bytes high-water independent of N: identical for a small-N and a 100×-larger windowed batch)
+cargo test -p bsql-query-sqlite-fixture --test execute_batch_sqlite    # SQLite execute_batch_typed twin (in-process, read-only-scoped)
+cargo test -p bsql-query-fixture --test execute_batch_live_async -- --ignored  # live execute_batch (async: N counts + all-or-nothing bulk-write rollback + commit-time-None + no-auto-rollback + 20k-command windowed deadlock-free run; needs PG)
+cargo test -p bsql-query-fixture --test execute_batch_live_sync  -- --ignored  # live execute_batch (sync twin; needs PG)
 cargo test -p bsql-postgres-async --test sq_live query_each -- --ignored    # dynamic streaming witnesses (async, needs PG)
 cargo test -p bsql-postgres-sync  --test sync_live query_each -- --ignored  # dynamic streaming witnesses (sync, needs PG)
 cargo clippy -p bsql --features test-harness --all-targets              # lint the (non-default) #[bsql::test] harness
@@ -1014,6 +1018,74 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   index accessor, cancel, transport death, in-guard commit), the offline
   `engine_pipeline_spec` (the multiplexer + mid-batch drain), the SQLite
   `pipeline_sqlite`, and the `pipeline_wrong_param` trybuild golden.
+- **Homogeneous atomic bulk write — `conn.execute_batch::<Q>(params_iter)`**
+  (both PG drivers + the `Transaction` guard; a SQLite sequential twin). Runs ONE
+  compile-checked `query!` write carrier `Q` (an `UPDATE`/`DELETE`/`INSERT ...
+  RETURNING`) against N runtime parameter sets — `Parse`d ONCE and re-bound for every
+  set (the bulk win) — returning a `Vec<u64>` of per-command affected counts. The
+  batch peer of the typed `execute::<Q>(params)` and the homogeneous sibling of
+  `pipeline((…))`: it closes the gap those two leave (N varying-parameter writes fit
+  neither `copy_in_typed` [INSERT-only] nor `pipeline` [fixed-arity tuple]). NO new
+  vocabulary — one method symmetric with `copy_in_typed::<Q>(rows)` / `execute::<Q>(params)`,
+  its params the SAME lifetime-GAT tuple (`Q::Params<'p>`) the typed path uses (a
+  runtime `String`/buffer binds). Like `execute::<Q>`, `Q` is a row-shaped carrier
+  (SELECT or `… RETURNING` — the macro rejects a bare non-returning write); the
+  affected count rides the `CommandComplete` tag and any RETURNING rows are
+  read-and-ignored (symmetric with `execute::<Q>`). **The contract is ATOMIC
+  all-or-nothing, INHERITED from the pipeline core** — the N commands ride ONE trailing
+  `Sync` (a single implicit transaction), so the whole batch commits and returns every
+  count or it errors and returns ZERO. It reuses `pipeline`'s staging (`stage_pipeline_frames`
+  for command 0, then a Parse-once bare `Bind`+`Execute` per set — `stage_batch_frames`),
+  its receive multiplexer (`PipelineAwaitingNextOrRfq`, VERBATIM — a subsequent bare
+  `Bind` leads with the `BindComplete` the FSM already handles), and its SETTLE (the
+  same `failed_index`/`arity` classifier): a mid-batch failure is `DriverError::BatchFailed
+  { index }` (`batch_failed_index()`), a COMMIT-TIME failure (a `DEFERRABLE INITIALLY
+  DEFERRED` constraint) is `DriverError::Db` with `batch_failed_index()` `None` (the
+  inherited commit-time-`None` fix — a failure at the implicit COMMIT belongs to no
+  single command, never an out-of-range `index == arity`). NO auto-rollback (a mid-batch
+  failure inside an explicit transaction leaves it aborted `'E'` for its owner; a next
+  in-guard verb is a loud `25P02`, never a silent autocommit) and the abort-preserves-BEGIN
+  fix (a FIRST-window `FrameTooLong` reuses `abort_pipeline_staging`'s peek path — the
+  consumed deferred `BEGIN` survives). `N == 0` does NO wire I/O (`Ok(vec![])`); `N == 1`
+  equals a single `execute` (no regression). **Constant SEND memory, deadlock-free (the
+  windowed batcher).** A large N must NOT buffer all N `Bind`s: the commands stream and
+  flush at a 64 KiB threshold (`BATCH_WINDOW_THRESHOLD`, like `copy_in`), so the
+  staged-bytes high-water is bounded regardless of N. UNLIKE COPY — where the server is
+  silent while the client streams, so a write-ahead cannot deadlock — an extended-protocol
+  command emits a per-command response, so streaming N `Bind`s without reading would fill
+  BOTH the server's output buffer AND the client's send buffer and DEADLOCK. So each
+  window ends with a `Flush` (which forces the window's responses out WITHOUT ending the
+  implicit transaction — only the single trailing `Sync` does that, so all N stay ONE
+  atomic transaction) and the window's responses are DRAINED before the next window is
+  staged (a breakable `run_pipeline_break` sink breaks at the window's delivery count →
+  `Boundary::Stopped`, then resumes). A batch whose commands fit one window (the common
+  case) is exactly ~1 round trip with ONE `Sync` and no intermediate `Flush`; only a
+  genuinely huge N pays ~`N / window` round trips — the honest floor for a deadlock-free
+  constant-memory bulk over a bidirectional protocol (a single unbounded flush is either
+  O(N) send memory or a hang). Cancellation (`57014`, connection recovers) and a mid-batch
+  transport death (classified disconnect, bounded) are honored. `next_event` stays
+  BYTE-IDENTICAL (the receive FSM is reused — no new dispatch state); `DriverError` (24 B)
+  / `ConnectConfig` (152 B) / `ActiveEngine` (392 B) footprints are unchanged (no new
+  variant or field — the `pipelining` flag and `BatchFailed` variant are the pipeline's);
+  `deps_pin` is unchanged. **SQLite twin:** `sqlite_conn.execute_batch_typed::<Q>(…)` runs
+  the commands SEQUENTIALLY inside the standard `transaction` guard's `BEGIN … COMMIT`,
+  returning the SAME `Vec<u64>` + the IDENTICAL all-or-nothing contract (no RTT win,
+  in-process). It is `execute_batch_TYPED` (not `execute_batch`) because SQLite already
+  has a dynamic `execute_batch(sql)` — rusqlite's multi-statement executor, a semantically
+  DISTINCT operation — so the name is disambiguated exactly as `copy_in` / `copy_in_typed`
+  are; a consumer doing cross-backend bulk writes uses the PG `execute_batch` and the
+  SQLite `execute_batch_typed`. READ-ONLY under a conformance build (with `macros-sqlite`
+  a typed WRITE `query!` is rejected at its definition site, so every SQLite carrier is a
+  SELECT — the atomicity is read-consistency and the counts are 0; a typed WRITE batch is
+  a PostgreSQL-only capability, NOT advertised on SQLite). Witnessed by `tools/query_fixture`'s
+  `execute_batch_live_{async,sync}` (N correct counts + all applied; the all-or-nothing
+  bulk-write rollback — a mid-batch failure applies NOTHING, zero rows persisted, at both
+  small and LARGE N; the commit-time-`None` inheritance; the no-auto-rollback `25P02`; N=0
+  no-I/O + N=1; the LARGE-N 20 000-command windowed run — deadlock-free where a single
+  flush would hang), the offline `engine_execute_batch_alloc` constant-send-memory gate
+  (the staged-bytes high-water is IDENTICAL for a small-N and a 100×-larger batch, and
+  bounded under 2× the threshold — driving 400 000 windowed commands), the SQLite
+  `execute_batch_sqlite`, and the `execute_batch_wrong_param` trybuild golden.
 - **Query cancellation** — `conn.cancel_token()` mints a DETACHED
   `CancelToken` (`Send + Sync + 'static`, borrowing NOTHING from the connection)
   that can be obtained BEFORE a long query and moved to another task/thread that

@@ -442,7 +442,11 @@ const ENGINE_ERROR_VARIANTS: usize = 15;
 /// compile-checked commands under ONE trailing Sync — one implicit transaction).
 /// Its two staging helpers (`stage_pipeline_command` / `stage_pipeline_seal`) take
 /// NO `Live` token (pure send-buffer builds), so they do not count.
-const ACTIVE_VERBS: usize = 24;
+/// 25 adds `run_pipeline_break`, the BREAKABLE window-drive verb for a homogeneous
+/// `execute_batch` (drives one Flush-terminated window, breaking at its delivery
+/// count). Its staging helpers (`stage_execute_batch_command` / `stage_flush` /
+/// `pending_send_len`) take NO `Live` token, so they do not count.
+const ACTIVE_VERBS: usize = 25;
 /// `core::hint::cold_path()` classified-branch markers across `engine/`.
 /// Reproduce: `grep -rho 'core::hint::cold_path()' crates/postgres/proto/src/engine/*.rs | wc -l`
 /// (52 includes the COPY-in `write_all` `WriteZero`/`SendOverrun` branches,

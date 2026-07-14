@@ -1038,6 +1038,37 @@ impl Connection {
         self.core.pipeline(batch)
     }
 
+    /// Run a HOMOGENEOUS ATOMIC bulk write — ONE compile-checked `query!` write
+    /// carrier `Q` (an `UPDATE`/`DELETE`/`INSERT`) against N runtime parameter sets,
+    /// `Parse`d ONCE and re-bound per set, in ~ONE round trip, returning each
+    /// command's affected-row count. The batch peer of [`execute`](Self::execute) and
+    /// the homogeneous sibling of [`pipeline`](Self::pipeline).
+    ///
+    /// # Airtight all-or-nothing
+    ///
+    /// The N commands ride ONE trailing `Sync` (a single implicit transaction): the
+    /// whole batch commits and returns every count, or it errors and returns ZERO. A
+    /// mid-batch failure is [`DriverError::BatchFailed`] naming the failing command's
+    /// zero-based index; a COMMIT-TIME failure (a deferred constraint) is
+    /// [`DriverError::Db`] with [`batch_failed_index`](DriverError::batch_failed_index)
+    /// `None`. Like every verb it does NOT auto-rollback — a failure inside an
+    /// explicit transaction leaves it aborted (`'E'`) for its owner, so a next
+    /// in-guard verb fails loudly (`25P02`), never a silent autocommit. Constant send
+    /// memory regardless of N (the windowed batcher). `N == 0` does no wire I/O; `N ==
+    /// 1` equals a single [`execute`](Self::execute). See
+    /// [`Core::execute_batch`](bsql_postgres_core::Core::execute_batch) for the full
+    /// contract.
+    pub fn execute_batch<'a, Q, I>(
+        &'a mut self,
+        params: I,
+    ) -> impl core::future::Future<Output = Result<Vec<u64>, DriverError>> + 'a
+    where
+        Q: TypedQuery + 'a,
+        I: IntoIterator<Item = Q::Params<'a>> + 'a,
+    {
+        self.core.execute_batch::<Q, I>(params)
+    }
+
     // ── Transaction / session boundary primitives ───────────────────────────
 
     /// Apply every pending migration from `source` to the database, exactly
@@ -2050,6 +2081,26 @@ impl Transaction<'_> {
         B: Pipeline<'a> + 'a,
     {
         self.armed(move |c| c.pipeline(batch))
+    }
+
+    /// Run a HOMOGENEOUS ATOMIC bulk write inside this transaction — the guard peer
+    /// of [`Connection::execute_batch`].
+    ///
+    /// The batch's OWN `Sync` does NOT close this explicit transaction (the guard
+    /// owns commit/rollback), so it composes with the surrounding scope: a mid-batch
+    /// failure rolls back the batch's commands AND leaves the transaction aborted, so
+    /// the closure returns the classified [`DriverError::BatchFailed`] and the guard
+    /// rolls the whole transaction back. When the batch is the FIRST statement in the
+    /// body it fuses the deferred `BEGIN` (one round trip).
+    pub fn execute_batch<'a, Q, I>(
+        &'a mut self,
+        params: I,
+    ) -> impl Future<Output = Result<Vec<u64>, DriverError>> + 'a
+    where
+        Q: TypedQuery + 'a,
+        I: IntoIterator<Item = Q::Params<'a>> + 'a,
+    {
+        self.armed(move |c| c.execute_batch::<Q, I>(params))
     }
 
     // ── COPY (bulk load / unload — legal + atomic inside a transaction) ─────

@@ -913,6 +913,29 @@ impl Connection {
         }
     }
 
+    /// Run a typed `query!` carrier's SQL bound with `params` for its SIDE EFFECT
+    /// (draining and DISCARDING any rows) and return the number of rows it changed —
+    /// the per-command step of [`execute_batch`](Self::execute_batch). The count is
+    /// the `total_changes` DELTA across the statement (0 for a SELECT, the real
+    /// change count for a write), so it is accurate on both a read-only conformance
+    /// carrier and a hand-written writing [`SqliteTypedQuery`], never a stale
+    /// last-DML `changes()`.
+    fn exec_typed_for_changes<P: SqliteBindParams>(
+        &self,
+        sql: &str,
+        params: &P,
+    ) -> Result<u64, SqliteError> {
+        let before = self.inner.total_changes();
+        {
+            let mut stmt = self.inner.prepare_cached(sql)?;
+            ensure_param_count(&stmt, P::COUNT)?;
+            params.bind_positional(&mut stmt)?;
+            let mut rows = stmt.raw_query();
+            while rows.next()?.is_some() {}
+        }
+        Ok(self.inner.total_changes().saturating_sub(before))
+    }
+
     /// Seal a drained builder into a [`QueryResult`], reading the column names
     /// from the (post-drain, post-reprepare) statement so a cached statement that
     /// was schema-reprepared mid-query reports the CURRENT columns, never the
@@ -1094,6 +1117,41 @@ impl Connection {
         batch: B,
     ) -> Result<B::Output, SqliteError> {
         self.transaction(|tx| batch.run(tx))
+    }
+
+    /// Run ONE compile-checked `query!` carrier `Q` against N parameter sets
+    /// SEQUENTIALLY inside ONE transaction, returning each command's affected-row
+    /// count — the SQLite twin of the PostgreSQL `execute_batch`.
+    ///
+    /// SQLite is IN-PROCESS, so there is no round-trip win (the value is one mental
+    /// model + transaction atomicity across the batch). All-or-nothing holds
+    /// STRUCTURALLY: the batch runs inside [`transaction`](Self::transaction), so a
+    /// mid-batch failure short-circuits into the guard's ROLLBACK — the WHOLE
+    /// transaction is undone and the `Vec<u64>` is built only when every command
+    /// succeeded and the transaction COMMITTED. `N == 0` returns `Ok(vec![])` (an
+    /// empty transaction).
+    ///
+    /// READ-ONLY under a conformance build: with `macros-sqlite` on, a typed WRITE
+    /// `query!` is rejected at its definition site (the SQLite conformance oracle's
+    /// readonly authorizer), so under conformance every carrier is a SELECT — the
+    /// atomicity is read-consistency across the batch and the counts are 0. A typed
+    /// WRITE batch is a PostgreSQL-only capability (PG types write `query!`s); this
+    /// method exists for cross-backend API symmetry, not to advertise a SQLite write
+    /// batch. (A hand-written writing [`SqliteTypedQuery`] returns its real change
+    /// counts.)
+    ///
+    /// # Errors
+    ///
+    /// The first failing command's classified [`SqliteError`] (the transaction is
+    /// rolled back); or [`SqliteError::TransactionRollbackFailed`] if the rollback
+    /// itself fails.
+    pub fn execute_batch_typed<'p, Q, I>(&self, params: I) -> Result<Vec<u64>, SqliteError>
+    where
+        Q: SqliteTypedQuery,
+        I: IntoIterator<Item = Q::Params<'p>>,
+        Q::Params<'p>: SqliteBindParams,
+    {
+        self.transaction(|tx| tx.execute_batch_typed::<Q, I>(params))
     }
 
     /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
@@ -1579,6 +1637,27 @@ impl Transaction<'_> {
         Q::Params<'p>: SqliteBindParams,
     {
         self.conn.query::<Q>(params)
+    }
+
+    /// Run ONE `query!` carrier against N parameter sets SEQUENTIALLY — inside the
+    /// EXISTING transaction (no nested transaction; a mid-batch failure short-circuits
+    /// so the guard rolls the whole scope back). The guard peer of
+    /// [`Connection::execute_batch_typed`]; READ-ONLY under a conformance build (see it).
+    ///
+    /// # Errors
+    ///
+    /// The first failing command's classified [`SqliteError`].
+    pub fn execute_batch_typed<'p, Q, I>(&self, params: I) -> Result<Vec<u64>, SqliteError>
+    where
+        Q: SqliteTypedQuery,
+        I: IntoIterator<Item = Q::Params<'p>>,
+        Q::Params<'p>: SqliteBindParams,
+    {
+        let mut affected = Vec::new();
+        for p in params {
+            affected.push(self.conn.exec_typed_for_changes::<Q::Params<'p>>(Q::SQL, &p)?);
+        }
+        Ok(affected)
     }
 
     /// Run a compile-checked `query!` expecting EXACTLY one row — inside the

@@ -291,6 +291,18 @@ impl PreparedStatement {
 /// queries with headroom.
 const DYN_STMT_CACHE_CAP: usize = 32;
 
+/// The `execute_batch` send-window batcher threshold, in bytes.
+///
+/// A homogeneous batch streams its `Bind`+`Execute` frames onto the send buffer and
+/// flushes (with a `Flush`, then drains the window's responses) once the pending
+/// bytes cross this, so the staged-bytes high-water is bounded regardless of N —
+/// constant send memory. 64 KiB matches `copy_in`'s
+/// `COPY_IN_FLUSH_THRESHOLD` (a typical socket send buffer): a batch whose commands
+/// fit one window is exactly one round trip; a huge N pays ~`N / window` windows,
+/// each a request→`Flush`→drain that cannot deadlock (unlike a single unbounded
+/// flush against a server that answers per command).
+const BATCH_WINDOW_THRESHOLD: usize = 64 * 1024;
+
 /// One entry in the [`DynStmtCache`]: the (SQL text, parameter-type OIDs) key
 /// plus, once the query has been prepared, its server-side prepared statement.
 #[derive(Debug)]
@@ -2132,6 +2144,314 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                     }),
                     _ => Err(DriverError::UnclassifiedFailure),
                 }
+            }
+        }
+    }
+
+    /// Run a HOMOGENEOUS ATOMIC bulk write — ONE compile-checked `query!` write
+    /// carrier `Q` (an `UPDATE` / `DELETE` / `INSERT`) against N runtime parameter
+    /// sets, `Parse`d ONCE and re-bound for every set, in ~ONE round trip, returning
+    /// each command's affected-row count. The batch peer of the typed
+    /// [`execute`](Self::execute) and the homogeneous sibling of
+    /// [`pipeline`](Self::pipeline) — it closes the gap those two leave (running N
+    /// varying-parameter writes fits neither [`copy_in_typed`](Self::copy_in_typed),
+    /// which is INSERT-only, nor `pipeline`, whose arity is a fixed compile-time
+    /// tuple).
+    ///
+    /// # Airtight all-or-nothing (INHERITED from the pipeline core)
+    ///
+    /// The N commands ride ONE trailing `Sync`, forming a SINGLE implicit
+    /// transaction (PG §55.2.3): the whole batch commits and returns every count, or
+    /// it errors and returns ZERO (`Vec<u64>` is built ONLY after the batch reaches
+    /// its clean trailing `ReadyForQuery` — the server emits that only if the whole
+    /// implicit transaction COMMITTED). A mid-batch failure is
+    /// [`DriverError::BatchFailed`] naming the zero-based failing command
+    /// ([`batch_failed_index`](DriverError::batch_failed_index)); a COMMIT-TIME
+    /// failure (a `DEFERRABLE INITIALLY DEFERRED` constraint, a serialization
+    /// failure — every command succeeded at `Execute`, the implicit COMMIT at the
+    /// trailing `Sync` failed) is [`DriverError::Db`] whose `batch_failed_index` is
+    /// `None` (the failure belongs to no single command, never an out-of-range
+    /// index). Like every other verb, `execute_batch` does NOT auto-rollback — a
+    /// mid-batch failure inside an EXPLICIT transaction leaves it aborted (`'E'`) for
+    /// its owner to roll back, so a subsequent in-guard verb is a loud `25P02`, never
+    /// a silent autocommit. All three properties are inherited by driving the SAME
+    /// staging / settle machinery as [`pipeline`](Self::pipeline).
+    ///
+    /// # Constant send memory, deadlock-free (the windowed batcher)
+    ///
+    /// A large N must NOT buffer all N `Bind` frames. The commands stream onto the
+    /// send buffer and flush at the [`BATCH_WINDOW_THRESHOLD`] batcher threshold
+    /// (like `copy_in`), so the staged-bytes high-water is bounded
+    /// regardless of N (constant memory). UNLIKE COPY — where the server is silent
+    /// while the client streams, so a write-ahead cannot deadlock — an
+    /// extended-protocol command emits a per-command response, so streaming N `Bind`s
+    /// without reading would fill the server's output buffer AND the client's send
+    /// buffer and DEADLOCK. So each window ends with a `Flush` (not a `Sync` — a
+    /// `Flush` forces the window's responses out WITHOUT ending the implicit
+    /// transaction, so all N stay ONE atomic transaction under the single trailing
+    /// `Sync`) and the window's responses are DRAINED before the next window is
+    /// staged. A batch whose commands fit one window (the common case) is exactly ~1
+    /// round trip with ONE `Sync` and no intermediate `Flush`; only a genuinely huge
+    /// N pays ~`N / window` round trips — the honest floor for a deadlock-free,
+    /// constant-memory bulk over a bidirectional protocol.
+    ///
+    /// # Boundary cases
+    ///
+    /// - `N == 0` → `Ok(vec![])` with NO wire I/O.
+    /// - `N == 1` → one window, `Parse`+`Bind`+`Execute`+`Sync` — identical to a
+    ///   single [`execute`](Self::execute) (no regression).
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::BatchFailed`] / [`DriverError::Db`] as above; a FATAL
+    /// transport/protocol/EOF fault (the connection is dead,
+    /// [`is_disconnect`](DriverError::is_disconnect) is `true`). A single
+    /// parameter set whose `Bind` frame exceeds the wire length field
+    /// ([`DriverError::Io`] via `FrameTooLong`) is a clean, connection-preserving
+    /// error if it is the FIRST window (nothing flushed — a consumed deferred `BEGIN`
+    /// is preserved) and a FATAL connection-kill (rolling back the open implicit
+    /// transaction — all-or-nothing preserved) if a window was already flushed.
+    pub async fn execute_batch<'p, Q, I>(&mut self, params: I) -> Result<Vec<u64>, DriverError>
+    where
+        Q: TypedQuery,
+        I: IntoIterator<Item = Q::Params<'p>>,
+    {
+        let mut slow = self.armed_slow_guard(Q::PREPARED.sql());
+        let result = self.execute_batch_inner::<Q, I>(params).await;
+        Self::commit_slow(&mut slow, &result);
+        result
+    }
+
+    /// The windowed drive behind [`execute_batch`](Self::execute_batch).
+    async fn execute_batch_inner<'p, Q, I>(
+        &mut self,
+        params: I,
+    ) -> Result<Vec<u64>, DriverError>
+    where
+        Q: TypedQuery,
+        I: IntoIterator<Item = Q::Params<'p>>,
+    {
+        let prepared = bsql_postgres_proto::prepared::prepared_at::<Q>();
+        let stmt_name = prepared.stmt_name();
+        let mut it = params.into_iter();
+
+        // Stage command 0 (Parse-once). An EMPTY batch does NO wire I/O.
+        let first = match it.next() {
+            None => return Ok(Vec::new()),
+            Some(p) => p,
+        };
+        if let Err(e) = self
+            .engine
+            .stage_execute_batch_command(&prepared, &first, true)
+        {
+            core::hint::cold_path();
+            // Nothing flushed yet — discard the partial staging (preserving a
+            // consumed deferred `BEGIN` for the next verb) and stay healthy.
+            self.engine.abort_pipeline_staging();
+            return Err(lift_engine_error(e));
+        }
+
+        // Shared collector across every window drive (used sequentially).
+        let (lower, _) = it.size_hint();
+        let mut affected: Vec<u64> = Vec::with_capacity(lower.saturating_add(1));
+        let mut current: usize = 0; // delivered commands (global, 0-based)
+        let mut db_error: Option<DbError> = None;
+        let mut failed_index: Option<usize> = None;
+        let mut total: usize = 1; // staged commands (command 0 staged above)
+        let mut flushed_any = false;
+
+        let mut live = self.take_live()?;
+
+        'windows: loop {
+            // Fill the current window: stage subsequent commands until the send
+            // buffer crosses the batcher threshold or the iterator is exhausted.
+            let mut window_full = false;
+            loop {
+                match it.next() {
+                    None => break,
+                    Some(p) => {
+                        if let Err(e) =
+                            self.engine.stage_execute_batch_command(&prepared, &p, false)
+                        {
+                            core::hint::cold_path();
+                            // A single `Bind` frame exceeded the wire length field.
+                            if flushed_any {
+                                // A window was already flushed: the implicit
+                                // transaction is OPEN with committed-nothing partial
+                                // commands. Sending a `Sync` would COMMIT the partial
+                                // (breaking all-or-nothing), so the connection MUST
+                                // die — returning WITHOUT restoring `self.live` leaves
+                                // it NotReady (the token `live` falls out of scope),
+                                // and its socket close rolls the open implicit
+                                // transaction back. All-or-nothing is preserved at the
+                                // cost of the connection.
+                                return Err(lift_engine_error(e));
+                            }
+                            // First window, nothing flushed: clean abort (deferred
+                            // `BEGIN` preserved), restore the token, stay healthy.
+                            self.engine.abort_pipeline_staging();
+                            self.live = Some(live);
+                            return Err(lift_engine_error(e));
+                        }
+                        total = total.saturating_add(1);
+                        if self.engine.pending_send_len() >= BATCH_WINDOW_THRESHOLD {
+                            window_full = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !window_full {
+                // The iterator is exhausted — this is the FINAL window; it is sent
+                // with the trailing `Sync` below, not a `Flush`.
+                break 'windows;
+            }
+
+            // INTERMEDIATE window: `Flush` forces its responses out (without ending
+            // the implicit transaction), then DRAIN them so the next window cannot
+            // deadlock. The sink breaks once every command of this window has
+            // delivered, leaving the engine at a clean inter-command boundary.
+            self.engine.stage_flush();
+            flushed_any = true;
+            let window_target = total;
+            let outcome = self
+                .engine
+                .run_pipeline_break::<_, ()>(
+                    live,
+                    capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
+                        match surface {
+                            Surface::Deliver { tag, .. } => {
+                                // A tagless extended-protocol boundary has no row
+                                // count (0); a `CommandComplete` tag projects its own.
+                                let n = match tag {
+                                    Some(t) => t.rows_or_zero(),
+                                    None => 0,
+                                };
+                                affected.push(n);
+                                current = current.saturating_add(1);
+                                if current >= window_target {
+                                    return ControlFlow::Break(());
+                                }
+                                ControlFlow::Continue(())
+                            }
+                            Surface::Fail(body) if failed_index.is_none() => {
+                                failed_index = Some(current);
+                                db_error = Some(materialize::parse_error_response(body));
+                                ControlFlow::Continue(())
+                            }
+                            _ => ControlFlow::Continue(()),
+                        }
+                    }),
+                )
+                .await;
+            let (l, status) = match outcome {
+                Ok(Outcome { live, status }) => (live, status),
+                Err(other) => {
+                    core::hint::cold_path();
+                    return Err(lift_engine_error(other));
+                }
+            };
+            live = l;
+            match status {
+                // The window drained cleanly; stage the next window.
+                Boundary::Stopped(()) => {}
+                // A command in this window server-errored: the parked cause + index
+                // drive the settle. Stop staging; the trailing `Sync` + drain below
+                // recovers the connection.
+                Boundary::Failed => {
+                    core::hint::cold_path();
+                    break 'windows;
+                }
+                // A `Flush`-terminated window cannot reach a clean `Idle` (that needs
+                // the trailing `Sync`); a fatal boundary was already mapped to `Err`
+                // by `run_pipeline_break`. `Boundary` is `#[non_exhaustive]`, so this
+                // arm is fail-closed against a future boundary — never a torn success.
+                _ => {
+                    core::hint::cold_path();
+                    break 'windows;
+                }
+            }
+        }
+
+        // FINAL DRIVE: the ONE trailing `Sync` closes the batch. It is sent whether
+        // the loop ended cleanly (drive the final window's remaining commands + the
+        // batch RFQ) or aborted mid-batch (the server is skipping-to-`Sync` after the
+        // error, so the `Sync` produces the recovering RFQ the engine's parked drain
+        // reads). `drive_to_outcome` handles a COMMIT-TIME failure (a `Fail` at the
+        // Sync) by draining the owed RFQ — so a deferred-constraint failure surfaces
+        // exactly as the pipeline's, `batch_failed_index` `None`.
+        self.engine.stage_pipeline_seal();
+        let outcome = self
+            .engine
+            .run_pipeline(
+                live,
+                capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
+                    match surface {
+                        Surface::Deliver { tag, .. } => {
+                            let n = match tag {
+                                Some(t) => t.rows_or_zero(),
+                                None => 0,
+                            };
+                            affected.push(n);
+                            current = current.saturating_add(1);
+                        }
+                        Surface::Fail(body) if failed_index.is_none() => {
+                            failed_index = Some(current);
+                            db_error = Some(materialize::parse_error_response(body));
+                        }
+                        _ => {}
+                    }
+                    ControlFlow::Continue(())
+                }),
+            )
+            .await;
+        let (live, _status) = match outcome {
+            Ok(Outcome { live, status }) => (live, status),
+            Err(other) => {
+                core::hint::cold_path();
+                return Err(lift_engine_error(other));
+            }
+        };
+        self.live = Some(live);
+
+        // SETTLE — identical semantics to `pipeline`, driven by the PARKED failure
+        // (not the final boundary, which is `Idle` even after a mid-batch failure's
+        // recovery drain). One statement is shared by all N commands, so record /
+        // evict it ONCE.
+        match (failed_index, db_error) {
+            // No failure: the whole implicit transaction committed. Record the
+            // statement for future HITs IF the batch left the connection at `Idle`
+            // (mirrors the serial cache rule; inside an explicit transaction it
+            // defers, since a rollback could drop it).
+            (None, _) => {
+                if matches!(self.engine.tx_status(), Ok(TxStatus::Idle)) {
+                    self.engine.record_pipeline_statement(stmt_name);
+                }
+                Ok(affected)
+            }
+            // A failure: the whole batch rolled back; the collected counts are
+            // DISCARDED (never an `Ok`). Evict the statement so a next attempt
+            // re-`Parse`s (self-healing against an out-of-band plan drop).
+            (Some(index), Some(db)) => {
+                core::hint::cold_path();
+                self.engine.evict_pipeline_statement(stmt_name);
+                if index >= total {
+                    // COMMIT-TIME failure: every command Executed, the implicit
+                    // COMMIT failed — belongs to no single command.
+                    Err(DriverError::Db(Box::new(db)))
+                } else {
+                    Err(DriverError::BatchFailed {
+                        index,
+                        source: Box::new(db),
+                    })
+                }
+            }
+            // A `ServerErrored`-shaped state with no parsed cause is unreachable (a
+            // failure is reached ONLY via a surfaced `Fail`); fail-closed classified.
+            (Some(_), None) => {
+                core::hint::cold_path();
+                self.engine.evict_pipeline_statement(stmt_name);
+                Err(DriverError::UnclassifiedFailure)
             }
         }
     }
