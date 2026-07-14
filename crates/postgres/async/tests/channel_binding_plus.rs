@@ -484,3 +484,148 @@ async fn scram_sha_256_plus_authenticates_over_tls_and_fails_closed_on_plaintext
 
     drop(pg);
 }
+
+/// THE RESUMPTION + CHANNEL-BINDING CRUX, live against real PG: sharing the
+/// custom-CA TLS config across reconnects (which lets a reconnect RESUME an
+/// abbreviated handshake) must NEVER weaken SCRAM-SHA-256-PLUS channel binding.
+///
+/// On a RESUMED TLS session the server sends NO Certificate message, yet RFC 5929
+/// §4 requires the `tls-server-end-point` binding to use the ORIGINAL
+/// full-handshake certificate. rustls restores that certificate on resumption, so
+/// bsql's `-PLUS` proof still binds to the right cert. This test proves it
+/// end-to-end: after warming the shared config (a full handshake), a RECONNECT
+/// through the SAME shared config (which resumes) with `channel_binding=Require`
+/// STILL authenticates as the SCRAM role — and because a `Require` client can send
+/// ONLY `p=tls-server-end-point,,` and real PG rejects a wrong/absent hash, a green
+/// auth on the resumed session is a machine proof that the binding used the correct
+/// certificate on resume (case 1: rustls exposes the original cert). It also
+/// measures full-handshake vs resumed-handshake connect latency, same process.
+#[tokio::test]
+#[ignore = "spins up an ephemeral SSL + SCRAM PostgreSQL (initdb + openssl + psql); skips cleanly if it can't start (incl. running as root)"]
+async fn scram_sha_256_plus_survives_tls_session_resumption() {
+    let Some(pg) = EphemeralSslScramPg::start() else {
+        eprintln!(
+            "SKIP scram_sha_256_plus_survives_tls_session_resumption: could not start an ephemeral \
+             SSL + SCRAM PostgreSQL (initdb/openssl/pg_ctl/psql unavailable, running as root, or \
+             port taken)"
+        );
+        return;
+    };
+
+    // (1) HEADLINE SAFETY: warm the SHARED custom-CA config (a full handshake; the
+    // query guarantees the NewSessionTicket is received + stored in the shared
+    // config's resumption store), then RECONNECT through that same shared config —
+    // which now RESUMES — with channel_binding=Require. Real PG only lets a Require
+    // client in if it sent a correct SCRAM-SHA-256-PLUS proof with the right
+    // tls-server-end-point hash. So a green auth on the RESUMED session proves the
+    // binding still anchored to the ORIGINAL certificate rustls restored on resume.
+    let cfg = cb_config(pg.port(), pg.ca_pem())
+        .ssl_mode(SslMode::Require)
+        .channel_binding(ChannelBindingMode::Require);
+    {
+        // Warm-up: a FULL handshake. The query round-trips server bytes, so the
+        // post-handshake NewSessionTicket is received and stored in the config's
+        // (process-wide, per-CA-PEM shared) resumption store.
+        let mut warm = match Connection::connect(&cfg).await {
+            Ok(c) => c,
+            Err(e) => panic!("warm-up channel_binding=Require -PLUS connect (full handshake): {e:?}"),
+        };
+        assert!(warm.is_encrypted(), "the warm-up -PLUS connection MUST be real TLS");
+        let r = warm
+            .query_one_sql("SELECT 1::int4")
+            .await
+            .expect("warm-up query must succeed (and pull the session ticket)");
+        assert_eq!(r.get_i32(0), Ok(Some(1)));
+    } // dropped — its ticket now lives in the SHARED config's store
+
+    // The RECONNECT resumes the session (shared config → warm store). If resumption
+    // had broken channel binding (no cert / wrong cert), this Require -PLUS auth —
+    // which CANNOT fall back — would FAIL. A green auth proves the binding survived.
+    let mut resumed = match Connection::connect(&cfg).await {
+        Ok(c) => c,
+        Err(e) => panic!(
+            "RESUMED channel_binding=Require -PLUS reconnect must STILL authenticate with the \
+             correct tls-server-end-point hash (a broken binding on resume would fail here): {e:?}"
+        ),
+    };
+    assert!(resumed.is_encrypted(), "the resumed -PLUS connection MUST be real TLS");
+    let who = resumed
+        .query_one_sql("SELECT current_user::text")
+        .await
+        .expect("current_user on the resumed -PLUS connection must succeed");
+    assert_eq!(
+        who.get_str(0),
+        Ok(Some(CB_ROLE)),
+        "the RESUMED session authenticated as the SCRAM login role via -PLUS with the correct \
+         cert hash — channel binding survived TLS session resumption",
+    );
+    drop(resumed);
+
+    // (2) MEASUREMENT: median full-handshake vs median resumed-handshake connect
+    // latency, same process. FULL samples force a fresh (empty-store) config by
+    // giving a BYTE-DISTINCT CA PEM (extra trailing newlines — parsed to the SAME
+    // single trust anchor, but a distinct process-wide-cache key, so no shared
+    // store ⇒ a full handshake); RESUMED samples reuse the warm unpadded PEM.
+    const N: usize = 9;
+
+    // Warm the unpadded config's store once more (the drops above may have consumed
+    // tickets); a couple of connects keep it topped up.
+    for _ in 0..2 {
+        drop(Connection::connect(&cfg).await.expect("re-warm the resumption store"));
+    }
+
+    let mut full_samples: Vec<Duration> = Vec::with_capacity(N);
+    for i in 0..N {
+        // A byte-distinct PEM ⇒ a distinct cache key ⇒ a fresh, empty-store config
+        // ⇒ a FULL handshake (the trailing newlines are ignored by PEM parsing, so
+        // the SAME certificate is trusted and the -PLUS auth still succeeds).
+        let mut padded = pg.ca_pem().to_vec();
+        padded.extend(std::iter::repeat_n(b'\n', i + 1));
+        let cfg_full = cb_config(pg.port(), &padded)
+            .ssl_mode(SslMode::Require)
+            .channel_binding(ChannelBindingMode::Require);
+        let t0 = Instant::now();
+        let c = Connection::connect(&cfg_full)
+            .await
+            .expect("full-handshake -PLUS connect");
+        full_samples.push(t0.elapsed());
+        drop(c);
+    }
+
+    let mut resumed_samples: Vec<Duration> = Vec::with_capacity(N);
+    for _ in 0..N {
+        let t0 = Instant::now();
+        let c = Connection::connect(&cfg) // the warm shared config → RESUMES
+            .await
+            .expect("resumed -PLUS connect");
+        resumed_samples.push(t0.elapsed());
+        drop(c);
+    }
+
+    // `>> 1` is a floor-halving that avoids `clippy::integer_division` (the `/`
+    // operator is workspace-forbidden even in tests).
+    let median = |v: &mut Vec<Duration>| {
+        v.sort_unstable();
+        v[v.len() >> 1]
+    };
+    let full_med = median(&mut full_samples);
+    let resumed_med = median(&mut resumed_samples);
+    eprintln!(
+        "[tls-resumption] full-handshake connect median = {full_med:?}, resumed connect median = \
+         {resumed_med:?}, delta (full - resumed) = {:?}  (N = {N}, whole-connect incl. TCP + PG \
+         startup + SCRAM PBKDF2, which are constant across both; the delta isolates the TLS \
+         handshake savings)",
+        full_med.saturating_sub(resumed_med),
+    );
+    // Sanity (generous, noise-tolerant): a resumed handshake does strictly LESS
+    // work than a full one, so it must not be materially SLOWER. This only trips on
+    // a real regression (e.g. resumption silently disabled and paying extra), never
+    // on scheduling noise.
+    assert!(
+        resumed_med <= full_med.saturating_add(Duration::from_millis(50)),
+        "a resumed connect must not be materially slower than a full handshake \
+         (full median {full_med:?}, resumed median {resumed_med:?})",
+    );
+
+    drop(pg);
+}

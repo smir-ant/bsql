@@ -62,7 +62,7 @@ use bsql_postgres_proto::engine::Transport;
 #[cfg(feature = "tls")]
 use std::future::Future;
 #[cfg(feature = "tls")]
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(feature = "tls")]
 use rustls::client::{ClientConfig, UnbufferedClientConnection};
@@ -433,9 +433,14 @@ pub fn parse_ca_roots(pem: &[u8]) -> Result<rustls::RootCertStore, CaRootsError>
 /// libpq's `sslrootcert`: a fleet with an internal CA verifies against precisely
 /// that CA, not that CA plus every public root. This makes
 /// [`SslMode::Require`](crate::SslMode) usable against an internal-CA server
-/// without the plaintext fallback. Not cached in the shared [`OnceLock`] — roots
-/// differ per config, so each custom-CA connection assembles its own config
-/// (connect is not a hot path).
+/// without the plaintext fallback.
+///
+/// This is the config-ASSEMBLY primitive: it builds a FRESH config every call
+/// (with a FRESH, empty session-resumption store), so a driver that wants TLS
+/// session resumption across reconnections must instead go through
+/// [`shared_client_config_with_ca_roots`], which caches and SHARES one config
+/// (hence one resumption store) per distinct root set. This fn stays public for
+/// the one-off/testing case and as the wrapper's miss path.
 ///
 /// # Errors
 ///
@@ -446,6 +451,92 @@ pub fn parse_ca_roots(pem: &[u8]) -> Result<rustls::RootCertStore, CaRootsError>
 pub fn client_config_with_ca_roots(pem: &[u8]) -> Result<Arc<ClientConfig>, CaRootsError> {
     let roots = parse_ca_roots(pem)?;
     config_from_roots(roots).map_err(CaRootsError::ProtocolVersions)
+}
+
+/// A custom-CA client TLS config that is SHARED across every connection built
+/// from the SAME CA-roots PEM — the custom-CA peer of [`shared_client_config`],
+/// so a fleet reconnecting to an internal-CA server benefits from TLS session
+/// RESUMPTION (rustls's resumption store lives INSIDE the `ClientConfig`, so
+/// sharing the `Arc<ClientConfig>` accumulates session tickets and a reconnect
+/// resumes an abbreviated handshake instead of paying a full one).
+///
+/// # Why a keyed cache (not the single [`OnceLock`])
+///
+/// The default-roots config has ONE trust set, so [`shared_client_config`]
+/// caches it in a `OnceLock`. A custom-CA config's trust set is the supplied
+/// roots, which vary, so this caches per DISTINCT root set — keyed on the EXACT
+/// PEM bytes. This keying is both necessary AND sufficient for soundness:
+///
+/// - **Necessary.** rustls only permits sharing a resumption store between two
+///   configs if their certificate `verifier` is the same (`Arc::ptr_eq`) — a
+///   ticket originated under one trust set must never be resumed under another
+///   (it would resume a connection the second config never validated). Different
+///   PEM bytes ⇒ a different cache key ⇒ a different config ⇒ a different,
+///   isolated store. So a ticket from server A's CA can never be offered under
+///   server B's CA.
+/// - **Sufficient.** The config is a pure function of its ROOTS here (provider,
+///   version policy, and no-client-auth posture are constant); `SslMode` and the
+///   `webpki-roots` feature do not enter a CUSTOM-CA config (the supplied roots
+///   REPLACE the baked bundle), so identical PEM bytes yield an identical config
+///   and its store is safe to share. rustls additionally keys its own store by
+///   server name internally, so one shared config never offers server A's ticket
+///   to server B even within the same trust set.
+///
+/// Channel binding stays correct on a resumed session: rustls restores the
+/// ORIGINAL full-handshake peer certificate on resumption (RFC 5929 §4), so
+/// `peer_end_entity_cert` — and hence the `tls-server-end-point` binding hash —
+/// resolves to the same certificate a full handshake would.
+///
+/// # Bounded, thread-safe, non-poisoning
+///
+/// The cache is a process-wide `Mutex`-guarded table, BOUNDED to a small number
+/// of distinct root sets (a realistic fleet has one internal CA). Beyond the
+/// bound, a new root set gets a fresh UNSHARED config (today's behaviour — no
+/// resumption, but never an eviction of a live store). rustls's own resumption
+/// store is itself `Mutex`-guarded and bounded (256 server names, ≤8 TLS1.3
+/// tickets each), so nothing grows without bound. A poisoned lock is RECOVERED
+/// (the cache holds only immutable configs; a panic cannot break its invariant),
+/// so a poisoned mutex never fails a connect.
+///
+/// # Errors
+///
+/// On a cache MISS, any [`CaRootsError`] from [`client_config_with_ca_roots`]
+/// (a bad/empty PEM). A hit cannot error.
+#[cfg(feature = "tls")]
+pub fn shared_client_config_with_ca_roots(pem: &[u8]) -> Result<Arc<ClientConfig>, CaRootsError> {
+    /// One cached custom-CA config: its exact PEM key and the shared config
+    /// (whose resumption store is the value being kept warm across reconnects).
+    type CaConfigEntry = (Box<[u8]>, Arc<ClientConfig>);
+
+    /// Distinct custom-CA root sets whose configs are cached + shared. A fleet
+    /// realistically has ONE internal CA; beyond this a fresh unshared config is
+    /// handed out (no resumption, never an eviction of a live store).
+    const MAX_CACHED_CA_CONFIGS: usize = 8;
+
+    // Keyed on the EXACT PEM bytes (the trust set). The container is const-init
+    // (`Mutex::new` + `Vec::new` are const), so no `OnceLock` wrapping is needed.
+    static CACHE: Mutex<Vec<CaConfigEntry>> = Mutex::new(Vec::new());
+
+    // Recover a poisoned lock rather than fail the connect: the cache holds only
+    // immutable `Arc<ClientConfig>`s, so a panic mid-op cannot leave it in an
+    // invalid state (no `unwrap`/`unwrap_or_else` — a plain match on the guard).
+    let mut cache = match CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Hit: an identical trust set already has a shared config (and its warm
+    // resumption store) — clone the `Arc`, so the reconnect resumes.
+    if let Some((_, cfg)) = cache.iter().find(|(key, _)| key.as_ref() == pem) {
+        return Ok(Arc::clone(cfg));
+    }
+    // Miss: build the config once (fail-closed on a bad PEM). Held under the lock
+    // so a concurrent first connect with the same PEM cannot build a duplicate
+    // store — connect is not a hot path, and the build is bounded microseconds.
+    let cfg = client_config_with_ca_roots(pem)?;
+    if cache.len() < MAX_CACHED_CA_CONFIGS {
+        cache.push((Box::from(pem), Arc::clone(&cfg)));
+    }
+    Ok(cfg)
 }
 
 // ===========================================================================

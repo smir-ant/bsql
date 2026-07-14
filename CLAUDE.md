@@ -73,6 +73,7 @@ cargo test -p bsql-devgates --test doc_links           # intra-doc-link wall (br
 cargo test -p bsql-devgates --test cross_platform      # Windows/Linux cross-target regression gate (cargo check --no-default-features; NO-OP-PASS when the target isn't `rustup target add`-ed)
 cargo test -p bsql-postgres-proto --test engine_hotpath_codegen  # next_event codegen-stability gate (panic-free + instruction ceiling)
 cargo test -p bsql-postgres-core --test decoder_fuzz   # decoder total-function gate (dep-free fuzz: no decoder panics on any input)
+cargo test -p bsql-postgres-core --test tls_resumption # TLS session-resumption gate (hermetic, no PG): a SHARED ClientConfig resumes an abbreviated handshake AND the resumed session exposes the ORIGINAL peer cert (so the SCRAM tls-server-end-point channel-binding hash is unchanged); + a negative control that SEPARATE configs never resume
 cargo test -p bsql-testkit --test wide_overcap_stress  # wide over-cap teardown-under-load gate (offline testkit: a too-wide RowDescription up to i16::MAX drains + recovers the connection every iteration of a 40× loop, both drivers)
 cargo test -p bsql-sqlite            # SQLite (no PG needed)
 cargo test -p bsql-postgres-async --test sq_live -- --ignored    # async PG (needs local PG)
@@ -1274,6 +1275,47 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `SslMode::Require` usable there instead of forcing plaintext. Stored raw, parsed
   into a rustls root store at connect; a bad/empty PEM is a fail-closed
   `DriverError::Config`, never a fallback to the baked roots or plaintext.
+- **TLS session resumption is TRANSPARENT and ON — a faster reconnect handshake
+  at ZERO API cost, ZERO channel-binding compromise.** rustls's session-resumption
+  store lives INSIDE the `ClientConfig`, so sharing the `Arc<ClientConfig>` across
+  connections accumulates session tickets and a RECONNECT resumes an abbreviated
+  handshake (a pool warmup / reaped-connection replacement / connection-churn win).
+  The DEFAULT-roots config was ALREADY shared (the `tls::shared_client_config`
+  `OnceLock`), so it already resumed; the CUSTOM-CA path used to build a FRESH
+  config per connection (empty store ⇒ never resumed). It now shares too:
+  `tls::shared_client_config_with_ca_roots(pem)` caches one `Arc<ClientConfig>` per
+  DISTINCT CA-roots PEM in a bounded (≤8), `Mutex`-guarded, poison-recovering
+  process-wide table both drivers' `build_tcp_wire` resolve through (the custom-CA
+  peer of the default-roots `OnceLock`). Keyed on the EXACT PEM bytes, which is
+  both NECESSARY and SUFFICIENT: rustls permits sharing a resumption store only
+  between configs with the SAME certificate verifier (a ticket from server A's CA
+  must never resume under server B's), and a custom-CA config is a pure function of
+  its roots (provider / versions / no-client-auth constant; `SslMode` and
+  `webpki-roots` do not enter it), so different PEM ⇒ different key ⇒ different,
+  isolated store, and rustls additionally keys its own store by server name.
+  **Channel binding is UNTOUCHED on a resumed session** (the load-bearing safety
+  property): on an abbreviated handshake the server sends NO Certificate message,
+  but RFC 5929 §4 requires the `tls-server-end-point` binding to use the ORIGINAL
+  full-handshake cert — and rustls RESTORES that certificate on resumption (both
+  TLS 1.2 session-id and TLS 1.3 PSK paths set `peer_certificates` from the stored
+  session's `server_cert_chain`), so `Wire::peer_end_entity_cert` — and hence the
+  SCRAM `-PLUS` binding hash — resolves to the SAME cert a full handshake would.
+  So a resumed `channel_binding=Require` `-PLUS` auth still binds to the right
+  certificate (case 1: rustls exposes the original cert; there is NO fail-safe
+  disable-on-resume because none is needed). No new `ConnectConfig` field (the 152 B
+  pin is untouched — the cache is internal, not config); no new public API (the
+  cache is transparent); `deps_pin` unchanged (rustls already resolved); the
+  `next_event` hot path is byte-identical (TLS is the connect phase). Sharing the
+  config REDUCES per-connection memory (the config is shared, not rebuilt).
+  Witnessed hermetically by `bsql-postgres-core`'s `tls_resumption` test (a shared
+  config RESUMES — read off the loopback server's `handshake_kind` — and the resumed
+  session exposes the ORIGINAL cert so the `tls-server-end-point` hash is identical;
+  plus a negative control proving SEPARATE configs do NOT resume) and live against
+  real PG by the `--ignored` `channel_binding_plus`
+  `scram_sha_256_plus_survives_tls_session_resumption` (a resumed
+  `channel_binding=Require` `-PLUS` reconnect STILL authenticates as the SCRAM role
+  with the correct cert hash — a broken binding on resume would fail closed — plus
+  a full-vs-resumed connect-latency measurement).
 - The baked Mozilla CA bundle is behind the default-on `webpki-roots` feature
   (core → drivers → umbrella): a custom/pinned-CA-only consumer drops the
   ~55-65 KB blob with `default-features = false, features = ["tls"]`; with no

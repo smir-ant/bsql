@@ -649,13 +649,15 @@ impl Connection {
                 diagnostics,
             )? {
                 bsql_postgres_core::ssl::SslProbe::Accepted { server_name } => {
-                    // Use the provider-explicit ring config; custom CA roots build a
-                    // config verified against EXACTLY those roots, otherwise the shared
-                    // default-roots config. A bad/empty custom PEM is a classified
-                    // `Config` error — fail-closed, never a fallback.
+                    // Use the provider-explicit ring config; custom CA roots use a
+                    // SHARED config verified against EXACTLY those roots — shared per
+                    // root set so reconnections resume the TLS session, otherwise the
+                    // shared default-roots config. A bad/empty custom PEM is a
+                    // classified `Config` error — fail-closed, never a fallback.
                     let cfg = match config.ca_roots_pem() {
                         Some(pem) => {
-                            tls::client_config_with_ca_roots(pem).map_err(lift_ca_roots_error)?
+                            tls::shared_client_config_with_ca_roots(pem)
+                                .map_err(lift_ca_roots_error)?
                         }
                         None => tls::shared_client_config().map_err(|e| {
                             DriverError::Io(io::Error::other(format!("TLS config: {e}")))

@@ -8,6 +8,15 @@
 //! embedded in the mock socket and produces its flights on demand, so every
 //! transport future resolves in a single poll.
 
+// A shared test harness included by SEVERAL integration-test binaries
+// (`tls_transcript`, `tls_alloc_gate`, `tls_resumption`), each of which exercises
+// a DIFFERENT subset of the helpers; an item unused by one binary is dead-code
+// only from that binary's view. The standard `tests/common/mod.rs` idiom.
+#![allow(
+    dead_code,
+    reason = "shared TLS test harness — each including test binary uses a different subset of the helpers, so an item unused by one is not dead overall"
+)]
+
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -107,6 +116,29 @@ pub fn test_server_config() -> Arc<ServerConfig> {
     Arc::new(config)
 }
 
+/// A server config that ISSUES TLS 1.3 session tickets — the only addition over
+/// [`test_server_config`] is a real ring [`Ticketer`](rustls::crypto::ring::Ticketer),
+/// so a client with a shared resumption store can resume an abbreviated
+/// handshake on a later connection. ONE such config must be shared across the
+/// server instances (they must share the ticketer key, or the second server
+/// cannot decrypt the ticket the first issued).
+pub fn resumable_server_config() -> Arc<ServerConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cert = CertificateDer::from(CERT_DER);
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KEY_DER));
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("server protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("server single cert");
+    // The ticketer is what makes the server emit NewSessionTicket messages; the
+    // default `send_tls13_tickets` (2) is enough. A shared config ⇒ a shared
+    // ticketer key ⇒ the second server can decrypt the first's ticket.
+    config.ticketer = rustls::crypto::ring::Ticketer::new().expect("ring ticketer");
+    Arc::new(config)
+}
+
 /// The server name the client connects to (matches the cert's CN/SAN).
 pub fn test_server_name() -> ServerName<'static> {
     ServerName::try_from("localhost")
@@ -142,7 +174,27 @@ pub struct LoopbackInner {
 
 impl LoopbackInner {
     fn new() -> Self {
-        let server = UnbufferedServerConnection::new(test_server_config())
+        Self::with_server_config(test_server_config())
+    }
+
+    /// The server side's negotiated handshake kind (`Full` / `Resumed` / …),
+    /// once known — the resumption witness reads the SERVER's own view (rustls's
+    /// public API) so no bsql accessor is needed to observe resumption.
+    pub fn server_did_resume(&self) -> bool {
+        self.server.handshake_kind() == Some(rustls::HandshakeKind::Resumed)
+    }
+
+    /// The server negotiated a FULL handshake — the control the resumption
+    /// witness pins on the FIRST connection.
+    pub fn server_did_full(&self) -> bool {
+        self.server.handshake_kind() == Some(rustls::HandshakeKind::Full)
+    }
+
+    /// Build a loopback whose embedded server uses `server_config`. Passing ONE
+    /// shared, ticket-issuing config to several loopbacks lets a later
+    /// connection resume the session an earlier one established.
+    fn with_server_config(server_config: Arc<ServerConfig>) -> Self {
+        let server = UnbufferedServerConnection::new(server_config)
             .expect("server connection");
         Self {
             server,
@@ -337,6 +389,21 @@ impl MockInner {
     /// the server-side state.
     pub fn new() -> (Self, Arc<Mutex<LoopbackInner>>) {
         let state = Arc::new(Mutex::new(LoopbackInner::new()));
+        (
+            Self {
+                state: Arc::clone(&state),
+            },
+            state,
+        )
+    }
+
+    /// Construct a loopback pair whose embedded server uses `server_config` —
+    /// pass ONE shared, ticket-issuing config to two pairs to let the second
+    /// connection resume the first's session.
+    pub fn new_with_server_config(
+        server_config: Arc<ServerConfig>,
+    ) -> (Self, Arc<Mutex<LoopbackInner>>) {
+        let state = Arc::new(Mutex::new(LoopbackInner::with_server_config(server_config)));
         (
             Self {
                 state: Arc::clone(&state),

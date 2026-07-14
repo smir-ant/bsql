@@ -495,13 +495,15 @@ impl Connection {
             )? {
                 SslProbe::Accepted { server_name } => {
                     // Use the provider-explicit ring config (the workspace pins
-                    // rustls to ring only). Custom CA roots build a config verified
-                    // against EXACTLY those roots; otherwise the shared default-roots
-                    // config. A bad/empty custom PEM is a classified `Config` error —
-                    // fail-closed.
+                    // rustls to ring only). Custom CA roots use a SHARED config
+                    // verified against EXACTLY those roots — shared per root set so
+                    // reconnections resume the TLS session; otherwise the shared
+                    // default-roots config. A bad/empty custom PEM is a classified
+                    // `Config` error — fail-closed.
                     let cfg = match config.ca_roots_pem() {
                         Some(pem) => {
-                            tls::client_config_with_ca_roots(pem).map_err(lift_ca_roots_error)?
+                            tls::shared_client_config_with_ca_roots(pem)
+                                .map_err(lift_ca_roots_error)?
                         }
                         None => tls::shared_client_config().map_err(|e| {
                             DriverError::Io(io::Error::other(format!("TLS config: {e}")))
