@@ -146,11 +146,32 @@ fn command_tail(rows: usize) -> Vec<u8> {
     out
 }
 
-/// CloseComplete, ParseComplete, BindComplete, one DataRow, then the tail.
+/// A `RowDescription` ('T') for the demo query's `(int4, text)` row shape — the
+/// reply to the `Describe`(portal) a cache MISS now appends, which the typed
+/// result-schema guard verifies (OIDs [23, 25] == the seated compile-time schema)
+/// then discards. 18-byte fixed field trailer per PG §55.7.
+fn demo_row_desc() -> Vec<u8> {
+    let mut body = 2_i16.to_be_bytes().to_vec(); // 2 fields
+    for (name, oid) in [("id", 23_i32), ("name", 25_i32)] {
+        body.extend_from_slice(name.as_bytes());
+        body.push(0); // name NUL
+        body.extend_from_slice(&0_i32.to_be_bytes()); // table OID
+        body.extend_from_slice(&0_i16.to_be_bytes()); // column attr number
+        body.extend_from_slice(&oid.to_be_bytes()); // type OID
+        body.extend_from_slice(&(-1_i16).to_be_bytes()); // typlen (variable)
+        body.extend_from_slice(&(-1_i32).to_be_bytes()); // typmod
+        body.extend_from_slice(&0_i16.to_be_bytes()); // format code
+    }
+    frame(b'T', &body)
+}
+
+/// CloseComplete, ParseComplete, BindComplete, RowDescription (for the MISS's
+/// appended Describe), one DataRow, then the tail.
 fn miss_reply() -> Vec<u8> {
     let mut out = frame(b'3', &[]);
     out.extend_from_slice(&frame(b'1', &[]));
     out.extend_from_slice(&frame(b'2', &[]));
+    out.extend_from_slice(&demo_row_desc());
     out.extend_from_slice(&demo_row(0, "hit"));
     out.extend_from_slice(&command_tail(1));
     out

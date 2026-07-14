@@ -49,7 +49,10 @@ fn users_reply() -> QueryReply {
         wire::data_row(&[Some(wire::binary_int8(2))]).expect("data row 2"),
         wire::command_complete("SELECT 2").expect("command complete"),
     ]);
-    QueryReply { simple, extended }
+    // The Describe(portal) reply for the typed cache-MISS path (int8 column).
+    let row_description =
+        wire::row_description(&[("id".to_owned(), OID_INT8)]).expect("row description");
+    QueryReply { simple, extended, row_description }
 }
 
 fn error_reply(sqlstate: &str, message: &str) -> QueryReply {
@@ -58,7 +61,9 @@ fn error_reply(sqlstate: &str, message: &str) -> QueryReply {
         wire::ready_for_query(TX_IDLE).expect("ready for query"),
     ]);
     let extended = wire::error_response("ERROR", sqlstate, message).expect("error response");
-    QueryReply { simple, extended }
+    // An error query describes no result columns (the loud error rides the Execute).
+    let row_description = wire::no_data();
+    QueryReply { simple, extended, row_description }
 }
 
 fn script() -> FakeScript {

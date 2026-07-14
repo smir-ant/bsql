@@ -77,6 +77,24 @@ fn rfq() -> Vec<u8> {
     frame(b'Z', b"I")
 }
 
+/// A `RowDescription` for the `(int8 id, int8 user_id)` row shape — the reply to
+/// the `Describe(portal)` a cache MISS appends, which the typed result-schema
+/// guard verifies (OIDs [20, 20]) then discards.
+fn row_desc() -> Vec<u8> {
+    let mut body = 2_i16.to_be_bytes().to_vec();
+    for name in ["id", "user_id"] {
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0_i32.to_be_bytes()); // table OID
+        body.extend_from_slice(&0_i16.to_be_bytes()); // column attr
+        body.extend_from_slice(&20_i32.to_be_bytes()); // type OID (int8)
+        body.extend_from_slice(&8_i16.to_be_bytes()); // typlen
+        body.extend_from_slice(&(-1_i32).to_be_bytes()); // typmod
+        body.extend_from_slice(&0_i16.to_be_bytes()); // format
+    }
+    frame(b'T', &body)
+}
+
 /// A well-formed `[int8=id][int8=user_id]` `DataRow`.
 fn int8_row(id: i64, user_id: i64) -> Vec<u8> {
     let mut body = 2_i16.to_be_bytes().to_vec();
@@ -111,6 +129,7 @@ fn server_script() -> Vec<u8> {
     out.extend_from_slice(&frame(b'3', &[])); // CloseComplete
     out.extend_from_slice(&frame(b'1', &[])); // ParseComplete
     out.extend_from_slice(&frame(b'2', &[])); // BindComplete
+    out.extend_from_slice(&row_desc()); // RowDescription (Describe portal)
     out.extend_from_slice(&int8_row(100, 7)); // GOOD row -> delivered to on_row
     out.extend_from_slice(&malformed_int8_row()); // MALFORMED -> Err(Decode)
     out.extend_from_slice(&command_complete("SELECT 2")); // drain reads this ...

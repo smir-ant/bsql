@@ -516,12 +516,23 @@ where
     // `send_buf` for the following enqueues.
     frames::build_bind_prepared(&mut send_buf.frame(), q.bind_execute_prefix, args)
         .map_err(frame_too_long)?;
+    // On a cache MISS (a FRESH Parse — where the resolved column types can diverge
+    // from the migration schema the carrier was typed against), append a
+    // `Describe`(portal) so the server returns a `RowDescription`; the result-schema
+    // guard then verifies each runtime column OID against `q.row_oids`. A HIT reuses
+    // an existing server-side plan whose result type PostgreSQL itself refuses to
+    // change silently (`0A000`), so it needs no Describe — its wire + hot path stay
+    // byte-identical.
+    if !reuse {
+        enqueue_frame(send_buf, |wb| frames::build_describe_portal(wb, b""))?;
+    }
     send_buf.enqueue(&crate::prepared::EXECUTE_EMPTY_PORTAL_NO_LIMIT);
     send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
     if reuse {
         active.begin_bind_execute(q.row_oids);
     } else {
         active.begin_close_parse_bind_execute(q.row_oids);
+        active.arm_result_guard();
     }
     Ok(reuse)
 }
@@ -553,7 +564,16 @@ fn settle_statement_cache<P, R>(
         if server_errored {
             active.evict_statement(q.stmt_name);
         }
-    } else if completed_at_idle && matches!(active.tx_status(), TxStatus::Idle) {
+    } else if completed_at_idle
+        && matches!(active.tx_status(), TxStatus::Idle)
+        && !active.has_result_oid_mismatch()
+    {
+        // A MISS whose result-schema guard caught a mismatch is NOT recorded: the
+        // query FAILED (its runtime column types diverged from the migration), so
+        // recording it would make a REPEAT a cache HIT that skips the `Describe` +
+        // guard and silently mis-decodes. Leaving it unrecorded makes the repeat a
+        // fresh MISS that re-`Describe`s + re-guards (the leading idempotent `Close`
+        // re-Parses cleanly).
         active.record_statement_parsed(q.stmt_name);
     }
 }

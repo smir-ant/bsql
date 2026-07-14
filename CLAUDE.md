@@ -93,6 +93,7 @@ cargo test -p bsql-sqlite --test cancel              # SQLite interrupt witness 
 cargo test -p bsql-query-sqlite-fixture --features n1-detect --test n1_detect_sqlite  # SQLite N+1 witness (in-process)
 cargo test -p bsql-query-fixture --test query_live_async -- --ignored  # live query! (async, needs PG)
 cargo test -p bsql-query-fixture --test query_live_sync  -- --ignored  # live query! (sync, needs PG)
+cargo test -p bsql-query-fixture --test query_oid_guard_live -- --ignored  # live typed RESULT-schema OID guard (both drivers): a TEMP shadow of a DIFFERENT type is a classified ColumnOidMismatch on every typed verb (never a silent "AAAA"); a matching-typed shadow + varchar/bpchar columns decode correctly (no false positive). Per-connection TEMP shadows over the 0020_oidguard.sql table, so parallel-safe (run WITHOUT --test-threads=1)
 cargo test -p bsql-sqlite --test migrate                # migration runner (in-process, no PG)
 cargo test -p bsql-postgres-sync  --test migrate_live -- --ignored  # migration runner (sync PG, incl. concurrency + CONCURRENTLY)
 cargo test -p bsql-postgres-async --test migrate_live -- --ignored  # migration runner (async PG try-lock poll)
@@ -862,12 +863,71 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   live), and a shadow created afterward is not seen — so DROPPING the statements
   (a fresh `Parse` on next use, resolving against the current user's schema) is the
   only airtight fix, at the cost of the pooled-reuse micro-optimization. The engine's
-  compile-checked (TYPED) cache is KEPT (its plans reference only PERMANENT migration
-  objects, so they cannot resolve to a session object — the typed flagship's
-  server-side plan reuse is preserved). A DIRECT (non-pooled) connection never resets
-  on its own, so its dynamic cache persists for the connection's life. Witnessed by
-  the `--ignored` `pooled_dynamic_plan_re_resolves_a_temp_shadow_across_users` live
-  test (both drivers).
+  compile-checked (TYPED) cache is KEPT (the typed flagship's server-side plan reuse
+  is preserved) — safe NOT because a typed plan cannot bind a session object (it CAN:
+  a fresh typed `Parse` under a `CREATE TEMP TABLE` shadow DOES resolve to the temp),
+  but because a silent mis-decode is closed independently by the TYPED RESULT-SCHEMA
+  OID GUARD (see the typed-path guarantee-boundary bullet below) plus PostgreSQL's own
+  `0A000` refusal to change a reused plan's result type. A DIRECT (non-pooled)
+  connection never resets on its own, so its dynamic cache persists for the
+  connection's life. Witnessed by the `--ignored`
+  `pooled_dynamic_plan_re_resolves_a_temp_shadow_across_users` live test (both drivers).
+
+- **Typed `query!` RESULT-schema OID guard — the last silent-wrong-result surface,
+  closed.** The typed decode is POSITIONAL / const-offset, so a runtime result column
+  whose type DIVERGED from the migration schema the carrier was typed against — an
+  out-of-band `ALTER TABLE ... ALTER COLUMN ... TYPE`, or a `CREATE TEMP TABLE`
+  shadowing a migration table with a different column type — would silently mis-decode
+  (a `text` decoder reading 4 `int4` bytes yields a plausible-but-wrong `"AAAA"`, not
+  an error). This was the ONE bsql surface without runtime type verification (the
+  dynamic path declares `P::OIDS` so PG rejects a mismatch `42883`; SQLite verifies
+  each storage class; the typed ARRAY decoder already checks the element OID). It is
+  now closed WITHOUT touching the flagship hot path: a typed cache MISS (a FRESH
+  `Parse` — exactly where the resolved type can diverge) appends a `Describe`(portal)
+  so the server returns a `RowDescription`, and the engine's guard (in the cold
+  `apply_fused_row_stream`, off the `DataRow` hot arm — `next_event` is byte-identical)
+  verifies each runtime column OID against the seated compile-time schema
+  (`q.row_oids`). A divergence is a classified `DecodeError::ColumnOidMismatch { index,
+  expected, found }` (surfaced as `DriverError::Decode`, NOT a disconnect — the guard
+  drains the result to a clean idle so the connection is reusable), never a silent
+  value; the drain reuses the over-cap `DrainOvercapToRfq` path so NO row reaches a
+  streaming verb's `on_row`. A MISS that mismatched is NOT recorded in the statement
+  cache, so a REPEAT re-`Describe`s + re-guards (never a cache HIT that skips the
+  guard). A cache HIT sends no `Describe` (hot path unchanged, perf-neutral in steady
+  state — a warm connection is all HITs): a HIT cannot silently mis-decode because
+  PostgreSQL itself refuses to change a reused plan's result type
+  (`ERROR: cached plan must not change result type`, SQLSTATE `0A000` — verified
+  live), so a result-type-changing DDL is fail-loud, and a temp shadow created after
+  the plan was recorded leaves it OID-pinned to the original table (correct rows) or
+  forces the `0A000`. **The dynamic-OID skip needs NO build/macro change:** `q.row_oids`
+  (already on `PreparedQuery`) equals the per-column marker OID (25/`text` for
+  enum+composite, the base OID for a domain, the real native/bridged/array OID
+  otherwise), and the guard SKIPS any column whose RUNTIME OID `>= FIRST_NORMAL_OID`
+  (16384) — the PostgreSQL boundary above which every user-defined type (enum, domain,
+  composite) is assigned, so a domain column (which reports its OWN dynamic OID, not
+  its base's) / enum / composite is skipped exactly as the existing "no compile-time
+  OID pin for user types" boundary requires (their runtime safety is
+  `UnknownEnumLabel` / `CompositeArityMismatch`). The `text` family
+  (`text`/`varchar`/`bpchar`, and their arrays) is one compatibility class (they share
+  ONE wire decode — raw UTF-8 — so a `varchar` column reported as OID 1043 is NOT
+  falsely rejected against the `text` marker 25), else EXACT equality. **Honest
+  residual** (same dynamic-OID boundary as enum/domain/composite): a native migration
+  column shadowed AT A MISS by a USER-DEFINED type with a DIFFERENT base (runtime OID
+  `>= 16384` → skipped) is not caught — extremely exotic (a temp/DDL swap to a
+  user-defined type), and within the deliberate "bsql does no connect-time OID
+  resolution" boundary; a wire-COMPATIBLE swap (`varchar`↔`text`) is ACCEPTED, being an
+  identical decode. Footprint: `DecodeError` stays 12 B (the new variant is the same
+  shape as `TruncatedColumnData`); `ActiveEngine` 392 → 400 B (a compact 8-B
+  niche-packed `Option<ResultOidMismatch>` recording only `index` + `found`, the driver
+  recovering `expected` from the carrier). PIPELINE / `execute_batch` are NOT yet
+  guarded (they would need per-command arm state) and stay on the pre-existing
+  boundary — their HITs are `0A000`-safe. Witnessed by the `--ignored`
+  `query_oid_guard_live.rs` (both drivers: the mismatch caught on every typed verb
+  `query`/`query_one`/`query_each` with the connection recovering, a matching-typed
+  shadow decoding correctly, and `varchar`/`bpchar` columns NOT falsely rejected) over
+  the dedicated `0020_oidguard.sql` migration table (per-connection TEMP shadows, so
+  parallel-safe), plus the offline `engine_verbs_spec` / `engine_query_alloc` / corpus
+  MISS-Describe wire updates and the byte-identical `engine_hotpath_codegen`.
 
   **Airtight pooled liveness is a fundamental 1-RTT-at-checkout tax (NOT removable).**
   A pooled checkout MUST confirm the peer is still alive BEFORE the user's

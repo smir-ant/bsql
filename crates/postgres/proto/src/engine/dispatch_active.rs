@@ -492,6 +492,24 @@ pub struct ActiveEngine {
     /// `#[cold]` helper — so `next_event`'s hot frame is unperturbed. `false` in
     /// steady state.
     pipelining: bool,
+    /// TYPED-result-schema guard arm. Set by a compile-checked cache-MISS staging
+    /// (`stage_compiled_query` / `stage_pipeline_frames`), which appends a
+    /// `Describe(portal)` so the server returns a `RowDescription`; the shared
+    /// `BindComplete` handler then routes to the RowDescription wait
+    /// (`FusedAwaitingRowDescOrNoData`) instead of straight to the row stream, and
+    /// `apply_fused_row_stream` runs the OID guard. `false` on a cache HIT (no
+    /// Describe — the reused server-side plan cannot silently change result type,
+    /// PostgreSQL refuses it as `0A000`), on the dynamic path, and in steady state,
+    /// so the HIT hot path is byte-identical. Fits a padding byte of the trailing
+    /// `Option<&'static str>` (16) tail slot alongside `prelude_active` /
+    /// `pipelining`, so it is FREE.
+    result_guard_armed: bool,
+    /// A recorded typed-result-OID mismatch (from the armed MISS's RowDescription
+    /// check), read post-pump by the driver. `None` in steady state and on a clean
+    /// match. Niche-packed via `found: NonZeroU32` (`ResultOidMismatch` stores only
+    /// `index` + `found`, dropping `expected` — the driver recovers it from the
+    /// carrier), so the slot is 8 B — the sole footprint growth (392 → 400).
+    result_mismatch: Option<ResultOidMismatch>,
 }
 
 // Stack footprint of the active handle: the carried-forward `IngestBuf` (144)
@@ -507,8 +525,66 @@ pub struct ActiveEngine {
 // server-inferred parameter types, retained for the `Bind` type check) is the
 // +24 B from 368. The `pipelining: bool` pipeline flag is FREE: it occupies a
 // padding byte in the trailing `Option<&'static str>` (16) + `bool` (1) tail slot
-// alongside `prelude_active`, so the size is UNCHANGED at 392.
-crate::wire_pin!(ActiveEngine, size = 392, align = 8);
+// alongside `prelude_active`, and the typed-result-guard's `result_guard_armed:
+// bool` joins them for FREE too. The +8 B from 392 → 400 is the SOLE growth: the
+// typed-result-schema mismatch slot `result_mismatch: Option<ResultOidMismatch>`
+// (8 B, niche-packed via `found: NonZeroU32`, `expected` dropped and recovered by
+// the driver) — the compact minimum for the last silent-wrong-result guard (the
+// typed cache-MISS RowDescription OID check).
+crate::wire_pin!(ActiveEngine, size = 400, align = 8);
+
+/// A recorded typed-result-schema mismatch — one result column whose RUNTIME
+/// `RowDescription` OID diverged from the carrier's compile-time expected OID.
+/// Recorded by [`ActiveEngine::apply_fused_row_stream`] on a checked cache-MISS
+/// and read post-pump by the driver, which turns it into a classified
+/// [`DecodeError::ColumnOidMismatch`](crate::decode::DecodeError::ColumnOidMismatch).
+///
+/// Carries only `index` + `found` (8 B, niche-packed): `found` is a
+/// [`NonZeroU32`](core::num::NonZeroU32) — a valid result-column OID is never
+/// `InvalidOid` (0) — so `Option<ResultOidMismatch>` niche-packs into it with no
+/// discriminant. The `expected` OID is deliberately NOT stored here: the driver
+/// recovers it from the carrier's own `Q::PREPARED.row_oids()[index]` (the single
+/// source of the expected schema), so the engine footprint stays compact.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ResultOidMismatch {
+    /// The zero-based projected result-column index.
+    index: u16,
+    /// The OID the server's `RowDescription` reported at runtime.
+    found: core::num::NonZeroU32,
+}
+
+/// The TYPED result-schema guard: compare each RUNTIME `RowDescription` column
+/// OID against the carrier's COMPILE-TIME expected OID, POSITIONALLY. Returns the
+/// FIRST mismatch, or `None` when every checked column is compatible.
+///
+/// Compatibility is [`crate::decode::result_oid_compatible`]: a user-defined
+/// runtime type (`found >= FIRST_NORMAL_OID`) is SKIPPED (its OID is dynamic — the
+/// enum/domain/composite boundary), the `text` family is one class, else EXACT
+/// equality. Extra runtime columns (or extra expected ones) beyond the shorter
+/// list are not this guard's concern — an arity divergence is caught by the
+/// positional row decode itself; the guard checks the overlap.
+fn check_result_oids(expected: &[u32], runtime: &[u32]) -> Option<ResultOidMismatch> {
+    // The index is tracked as a `u16` from the start (saturating past a
+    // hostile-wide RowDescription, which the over-cap gate caps anyway) rather
+    // than `enumerate` + `try_from`, so there is no fallible-cast fallback.
+    let mut index: u16 = 0;
+    for (exp, found) in expected.iter().zip(runtime.iter()) {
+        if !crate::decode::result_oid_compatible(*exp, *found) {
+            // A conformant server never reports OID 0 for a result column, so a
+            // recorded `found` is non-zero; a malformed 0 (only from a hostile /
+            // broken `RowDescription`) is still recorded FAIL-LOUD via the
+            // `NonZeroU32::MAX` sentinel rather than dropped, keeping the guard
+            // total and the `Option<ResultOidMismatch>` niche-packed.
+            let found = match core::num::NonZeroU32::new(*found) {
+                Some(nz) => nz,
+                None => core::num::NonZeroU32::MAX,
+            };
+            return Some(ResultOidMismatch { index, found });
+        }
+        index = index.saturating_add(1);
+    }
+    None
+}
 
 impl ActiveEngine {
     /// Construct the active engine at handshake completion, carrying the
@@ -539,6 +615,8 @@ impl ActiveEngine {
             pending_prelude: None,
             prelude_active: false,
             pipelining: false,
+            result_guard_armed: false,
+            result_mismatch: None,
         }
     }
 
@@ -600,6 +678,35 @@ impl ActiveEngine {
     #[must_use]
     pub fn current_type_oids(&self) -> &[u32] {
         &self.col_oids
+    }
+
+    /// TAKE the typed result-schema mismatch recorded during a compile-checked
+    /// cache-MISS's `RowDescription` check, if any, clearing it.
+    ///
+    /// The driver reads this AFTER a typed verb's pump returns (the connection is
+    /// already drained to a clean idle by the over-cap drain the guard reused) and,
+    /// when `Some`, surfaces a classified
+    /// [`DecodeError::ColumnOidMismatch`](crate::decode::DecodeError::ColumnOidMismatch)
+    /// instead of the (row-less, drained) result. Returns `(index, found)`; the
+    /// driver recovers the `expected` OID from the carrier's
+    /// `Q::PREPARED.row_oids()[index]`.
+    #[inline]
+    pub fn take_result_oid_mismatch(&mut self) -> Option<(u16, u32)> {
+        self.result_mismatch.take().map(|m| (m.index, m.found.get()))
+    }
+
+    /// Whether a typed result-OID mismatch was recorded on the in-flight command
+    /// (PEEK — does not clear it, unlike [`take_result_oid_mismatch`](Self::take_result_oid_mismatch)).
+    ///
+    /// Read at the statement-cache settle: a mismatch means the query FAILED (its
+    /// runtime schema diverged from the migration), so the content-addressed
+    /// statement must NOT be recorded as durable — otherwise a REPEAT would be a
+    /// cache HIT (no `Describe`, no guard) and silently mis-decode. Leaving it
+    /// unrecorded makes the repeat a fresh MISS that re-`Describe`s and re-guards.
+    #[inline]
+    #[must_use]
+    pub fn has_result_oid_mismatch(&self) -> bool {
+        self.result_mismatch.is_some()
     }
 
     /// Per-column names from the current statement's `RowDescription`, or empty
@@ -864,6 +971,24 @@ impl ActiveEngine {
     pub fn begin_close_parse_bind_execute(&mut self, result_oids: &[u32]) {
         self.seat_schema(result_oids);
         self.state = ActiveState::CloseParseBindExecuteAwaitingCloseComplete;
+    }
+
+    /// ARM the typed result-schema guard for a compile-checked cache-MISS.
+    ///
+    /// A MISS's staging appends a `Describe(portal)` to its
+    /// `[Close]+Parse+Bind+Describe+Execute+Sync` batch (so the server returns a
+    /// `RowDescription`), then calls this: the shared `BindComplete` handler routes
+    /// to the `RowDescription` wait, where
+    /// [`apply_fused_row_stream`](Self::apply_fused_row_stream) verifies each
+    /// runtime column OID against the compile-time schema seated by
+    /// [`seat_schema`](Self::seat_schema). Clears any stale recorded mismatch so a
+    /// prior command's classification cannot leak. A cache HIT does NOT arm (no
+    /// Describe — a reused server-side plan cannot silently change result type;
+    /// PostgreSQL refuses it as `0A000`), so the HIT hot path is byte-identical.
+    #[inline]
+    pub fn arm_result_guard(&mut self) {
+        self.result_guard_armed = true;
+        self.result_mismatch = None;
     }
 
     /// Seat the engine to await a bare `Execute`'s reply — a resume of an open
@@ -1411,6 +1536,17 @@ impl ActiveEngine {
 
     /// `BindAwaitingBindComplete` — a `Bind`+`Execute` bundle awaits the
     /// server's `BindComplete` before any result data.
+    ///
+    /// A compile-checked cache-MISS (`result_guard_armed`) appended a
+    /// `Describe(portal)` after its `Bind`, so its `BindComplete` is followed by a
+    /// `RowDescription`, not the row stream: route to
+    /// [`FusedAwaitingRowDescOrNoData`](ActiveState::FusedAwaitingRowDescOrNoData)
+    /// (where [`apply_fused_row_stream`](Self::apply_fused_row_stream) runs the
+    /// result-OID guard against the seated compile-time schema) instead of straight
+    /// to [`BindAwaitingData`](ActiveState::BindAwaitingData). A cache HIT (no
+    /// Describe) and the non-guarded path keep the byte-identical direct route, so
+    /// the flagship hot path is unperturbed. This branch is off the `DataRow` hot
+    /// arm (once per query, at `BindComplete`).
     fn step_bind_awaiting_bind_complete(
         &mut self,
         tag: u8,
@@ -1419,7 +1555,11 @@ impl ActiveEngine {
     ) -> ActiveOutcome {
         match tag {
             T_BIND_COMPLETE => {
-                self.state = ActiveState::BindAwaitingData;
+                self.state = if self.result_guard_armed {
+                    ActiveState::FusedAwaitingRowDescOrNoData
+                } else {
+                    ActiveState::BindAwaitingData
+                };
                 ActiveOutcome::Silent
             }
             T_ERROR => self.fail_recoverable(start, end),
@@ -1671,6 +1811,32 @@ impl ActiveEngine {
     ) -> ActiveOutcome {
         match parsed {
             Ok((oids, names)) => {
+                // TYPED result-schema guard (armed ONLY by a compile-checked
+                // cache-MISS staging; the dynamic fused path leaves it off and
+                // takes the adopt-and-stream path below). VERIFY each runtime column
+                // OID against the compile-time expected schema still seated in
+                // `self.col_oids` (from `seat_schema(q.row_oids)`), then KEEP the
+                // seated schema and DROP the runtime `oids`/`names`: the typed decode
+                // is positional and surfaces no runtime names, so the observable
+                // (`current_type_oids` / `current_column_names`) stays byte-identical
+                // to the pre-guard typed path — only the verification is added. On a
+                // mismatch a silent mis-decode would follow, so record it and SWALLOW
+                // the in-flight result to the trailing `ReadyForQuery` (reusing the
+                // over-cap drain — no row reaches the driver's sink, so a streaming
+                // verb never yields a garbage row); the driver surfaces the
+                // classified `ColumnOidMismatch` post-pump.
+                if self.result_guard_armed {
+                    self.result_guard_armed = false;
+                    match check_result_oids(&self.col_oids, &oids) {
+                        Some(mismatch) => {
+                            core::hint::cold_path();
+                            self.result_mismatch = Some(mismatch);
+                            self.state = ActiveState::DrainOvercapToRfq;
+                        }
+                        None => self.state = ActiveState::BindAwaitingData,
+                    }
+                    return ActiveOutcome::Silent;
+                }
                 self.col_oids = oids;
                 self.col_names = names;
                 self.state = ActiveState::BindAwaitingData;
@@ -1921,10 +2087,21 @@ impl ActiveEngine {
     }
 
     /// Clear the per-statement column metadata at a command boundary.
+    ///
+    /// Also DISARMS the typed result-schema guard (a defensive clear for a
+    /// command that never reached its `RowDescription` — a `NoData` reply, or a
+    /// staging abort — so a stale arm cannot leak into the next command; the guard
+    /// itself already disarms in [`apply_fused_row_stream`](Self::apply_fused_row_stream)
+    /// once it runs). The RECORDED mismatch is deliberately NOT cleared here: on the
+    /// mismatch path this runs at the drain's trailing `ReadyForQuery`, BEFORE the
+    /// driver reads the mismatch post-pump, so clearing it would drop the
+    /// classification. The mismatch is cleared instead at the next arm
+    /// ([`arm_result_guard`](Self::arm_result_guard)) and taken by the driver.
     #[inline]
     fn reset_columns(&mut self) {
         self.col_oids.clear();
         self.col_names.clear();
+        self.result_guard_armed = false;
     }
 
     // ── Fused-prelude drain (the swallowing twin of the main dispatch) ──────

@@ -371,6 +371,11 @@ pub fn seed() -> Vec<Transcript> {
                 frames::close_complete(),
                 frames::parse_complete(),
                 frames::bind_complete(),
+                // A MISS now appends a Describe(portal), so the server returns a
+                // RowDescription; the typed result-schema guard VERIFIES its OIDs
+                // ([23, 25] == the seated compile-time schema) then DISCARDS it (the
+                // typed path keeps its seated schema + surfaces no runtime names).
+                frames::row_description(&[("id", frames::OID_INT4), ("name", frames::OID_TEXT)]),
                 frames::data_row(&[Some(b"42"), Some(b"neo")]),
                 frames::command_complete("SELECT 1"),
                 frames::ready_for_query(frames::TX_IDLE),
@@ -379,7 +384,8 @@ pub fn seed() -> Vec<Transcript> {
         chunk_schedule: ChunkSchedule::AllAtOnce,
         expect: ready_ok(
             // MISS wire: Close(statement) frame (tag 'C'=67, name `bsql_p_…`)
-            // FIRST, then the baked Parse (tag 'P'=80), Bind, Execute, Sync.
+            // FIRST, then the baked Parse (tag 'P'=80), Bind, Describe(portal)
+            // (tag 'D'=68, `[68,0,0,0,6,80,0]`), Execute, Sync.
             vec![
                 67, 0, 0, 0, 37, 83, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48, 100,
                 50, 100, 57, 52, 98, 99, 51, 52, 55, 55, 50, 100, 52, 97, 52, 98, 97, 0, 80, 0, 0,
@@ -390,8 +396,8 @@ pub fn seed() -> Vec<Transcript> {
                 32, 105, 100, 32, 61, 32, 36, 49, 58, 58, 105, 110, 116, 52, 0, 0, 1, 0, 0, 0, 23,
                 66, 0, 0, 0, 55, 0, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48, 100,
                 50, 100, 57, 52, 98, 99, 51, 52, 55, 55, 50, 100, 52, 97, 52, 98, 97, 0, 0, 1, 0, 1,
-                0, 1, 0, 0, 0, 4, 0, 0, 0, 42, 0, 1, 0, 1, 69, 0, 0, 0, 9, 0, 0, 0, 0, 0, 83, 0, 0,
-                0, 4,
+                0, 1, 0, 0, 0, 4, 0, 0, 0, 42, 0, 1, 0, 1, 68, 0, 0, 0, 6, 80, 0, 69, 0, 0, 0, 9, 0,
+                0, 0, 0, 0, 83, 0, 0, 0, 4,
             ],
             ok_one(rs("SELECT 1", &[], &[23, 25], vec![vec![cell(b"42"), cell(b"neo")]], Some(1))),
         ),
@@ -410,19 +416,23 @@ pub fn seed() -> Vec<Transcript> {
         name: "prepared_macro_reuse",
         setup: Setup::ActiveViaTrustHandshake,
         steps: vec![
-            // Step 1 (MISS): CloseComplete, ParseComplete, BindComplete, row, CC, RFQ.
+            // Step 1 (MISS): CloseComplete, ParseComplete, BindComplete,
+            // RowDescription (for the appended Describe(portal) the guard verifies +
+            // discards), row, CC, RFQ.
             Step::new(
                 ClientRequest::ExecutePreparedDemo(42),
                 frames::concat(&[
                     frames::close_complete(),
                     frames::parse_complete(),
                     frames::bind_complete(),
+                    frames::row_description(&[("id", frames::OID_INT4), ("name", frames::OID_TEXT)]),
                     frames::data_row(&[Some(b"42"), Some(b"neo")]),
                     frames::command_complete("SELECT 1"),
                     frames::ready_for_query(frames::TX_IDLE),
                 ]),
             ),
-            // Step 2 (HIT): BindComplete, row, CC, RFQ (no CloseComplete/ParseComplete).
+            // Step 2 (HIT): BindComplete, row, CC, RFQ (no CloseComplete/ParseComplete,
+            // and NO Describe/RowDescription — a HIT reuses the plan without a guard).
             Step::new(
                 ClientRequest::ExecutePreparedDemo(42),
                 frames::concat(&[
@@ -448,7 +458,8 @@ pub fn seed() -> Vec<Transcript> {
                 32, 105, 100, 32, 61, 32, 36, 49, 58, 58, 105, 110, 116, 52, 0, 0, 1, 0, 0, 0, 23,
                 66, 0, 0, 0, 55, 0, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48, 100,
                 50, 100, 57, 52, 98, 99, 51, 52, 55, 55, 50, 100, 52, 97, 52, 98, 97, 0, 0, 1, 0, 1,
-                0, 1, 0, 0, 0, 4, 0, 0, 0, 42, 0, 1, 0, 1, 69, 0, 0, 0, 9, 0, 0, 0, 0, 0, 83, 0, 0,
+                0, 1, 0, 0, 0, 4, 0, 0, 0, 42, 0, 1, 0, 1, 68, 0, 0, 0, 6, 80, 0, 69, 0, 0, 0, 9,
+                0, 0, 0, 0, 0, 83, 0, 0,
                 0, 4, 66, 0, 0, 0, 55, 0, 98, 115, 113, 108, 95, 112, 95, 97, 54, 102, 102, 55, 48,
                 100, 50, 100, 57, 52, 98, 99, 51, 52, 55, 55, 50, 100, 52, 97, 52, 98, 97, 0, 0, 1,
                 0, 1, 0, 1, 0, 0, 0, 4, 0, 0, 0, 42, 0, 1, 0, 1, 69, 0, 0, 0, 9, 0, 0, 0, 0, 0, 83,

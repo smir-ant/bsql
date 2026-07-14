@@ -600,6 +600,15 @@ pub fn close_complete() -> Result<Vec<u8>, FakeEncodeError> {
     frame(b'3', &[])
 }
 
+/// `NoData`: tag `n`, empty body — the extended-protocol `Describe(portal)`
+/// answer for a portal that returns no rows (a scripted error / no-column query).
+/// A fixed 5-byte frame (`b'n'`, length 4, no body), so it is built directly
+/// rather than through the fallible [`frame`] path.
+#[must_use]
+pub fn no_data() -> Vec<u8> {
+    vec![b'n', 0, 0, 0, 4]
+}
+
 #[cfg(test)]
 mod tests {
     //! The fake's binary cell bytes MUST be exactly what the flagship

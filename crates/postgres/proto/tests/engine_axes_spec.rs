@@ -472,7 +472,11 @@ const ACTIVE_VERBS: usize = 25;
 /// `SendFrame` with a back-patched length, so the explicit `u32::try_from(sql_len)`
 /// pre-check is subsumed by the streamed builder's own overflow landing
 /// (`frame_too_long`, already counted once at its definition).
-const COLD_CLASSIFIED_BRANCHES: usize = 56;
+///
+/// 56 → 57: the typed result-schema guard's mismatch branch in
+/// `apply_fused_row_stream` marks its (rare — a live/build schema divergence)
+/// drain-and-record path `#[cold]` via `core::hint::cold_path()`.
+const COLD_CLASSIFIED_BRANCHES: usize = 57;
 /// `#[non_exhaustive]` attribute lines across `engine/`.
 /// Reproduce: `grep -rcE '^#\[non_exhaustive\]' crates/postgres/proto/src/engine/*.rs` (summed)
 const NON_EXHAUSTIVE_ATTRS: usize = 4;

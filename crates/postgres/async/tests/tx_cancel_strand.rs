@@ -51,7 +51,10 @@ fn select_one_reply() -> QueryReply {
         wire::data_row(&[Some(wire::binary_int8(1))]).expect("data row"),
         wire::command_complete("SELECT 1").expect("command complete"),
     ]);
-    QueryReply { simple, extended }
+    // The Describe(portal) reply for the typed cache-MISS path (int8 column).
+    let row_description =
+        wire::row_description(&[("one".to_owned(), OID_INT8)]).expect("row description");
+    QueryReply { simple, extended, row_description }
 }
 
 /// Scripts `SELECT 1` but deliberately NOT `BEGIN`: a stranded fused `BEGIN`

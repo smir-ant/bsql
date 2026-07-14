@@ -83,14 +83,33 @@ fn int8_row(a: i64, b: i64) -> Vec<u8> {
     frame(b'D', &body)
 }
 
+/// A `RowDescription` for the `(int8 a, int8 b)` row shape — the reply to the
+/// `Describe(portal)` a cache MISS appends, which the typed result-schema guard
+/// verifies (OIDs [20, 20]) then discards. 18-byte fixed field trailer per §55.7.
+fn row_desc() -> Vec<u8> {
+    let mut body = 2_i16.to_be_bytes().to_vec();
+    for name in ["a", "b"] {
+        body.extend_from_slice(name.as_bytes());
+        body.push(0); // name NUL
+        body.extend_from_slice(&0_i32.to_be_bytes()); // table OID
+        body.extend_from_slice(&0_i16.to_be_bytes()); // column attr
+        body.extend_from_slice(&20_i32.to_be_bytes()); // type OID (int8)
+        body.extend_from_slice(&8_i16.to_be_bytes()); // typlen
+        body.extend_from_slice(&(-1_i32).to_be_bytes()); // typmod
+        body.extend_from_slice(&0_i16.to_be_bytes()); // format
+    }
+    frame(b'T', &body)
+}
+
 /// The full cache-MISS reply for `query_params_break` delivering exactly `n`
-/// rows: CloseComplete, ParseComplete, BindComplete, `n` DataRows,
-/// CommandComplete, ReadyForQuery.
+/// rows: CloseComplete, ParseComplete, BindComplete, RowDescription (for the
+/// MISS's Describe), `n` DataRows, CommandComplete, ReadyForQuery.
 fn miss_reply(n: usize) -> Vec<u8> {
     let mut out = handshake();
     out.extend_from_slice(&frame(b'3', &[])); // CloseComplete
     out.extend_from_slice(&frame(b'1', &[])); // ParseComplete
     out.extend_from_slice(&frame(b'2', &[])); // BindComplete
+    out.extend_from_slice(&row_desc()); // RowDescription (Describe portal)
     for i in 0..n {
         let v = i64::try_from(i).expect("row index fits i64");
         out.extend_from_slice(&int8_row(v.wrapping_add(1), v.wrapping_add(2)));

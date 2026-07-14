@@ -389,9 +389,20 @@ struct DynSlot {
 /// re-validates it against the pre-shadow schema before the user's shadow exists —
 /// verified live), so the airtight fix is to DROP the statements: the next user's
 /// query re-`Parse`s fresh against their own schema, exactly as on a fresh
-/// connection. The engine's compile-checked (TYPED) cache is KEPT (its plans
-/// reference only PERMANENT migration objects, so they cannot resolve to a session
-/// object), preserving the typed flagship's server-side plan reuse. A DIRECT
+/// connection. The engine's compile-checked (TYPED) cache is KEPT, preserving the
+/// typed flagship's server-side plan reuse — safe NOT because a typed plan cannot
+/// resolve to a session object (it CAN: a fresh typed `Parse` under a `CREATE TEMP
+/// TABLE` shadow DOES bind to the temp), but because every silent mis-decode is
+/// closed on TWO fronts: (a) `DISCARD TEMP` on checkout drops any prior user's temp
+/// so a kept plan that resolved to one fails LOUD on reuse (relation-not-exist /
+/// re-plan → `0A000`), never a silent cross-user leak; and (b) a fresh typed
+/// `Parse` (a cache MISS) appends a `Describe`(portal) and the driver's
+/// result-schema guard verifies each runtime column OID against the carrier's
+/// compile-time schema — a divergent runtime type (a temp shadow, or an out-of-band
+/// `ALTER COLUMN TYPE`) is a classified `DecodeError::ColumnOidMismatch`, and a HIT
+/// whose result type would change is refused by PostgreSQL itself as `0A000`
+/// ("cached plan must not change result type"). So a residual runtime/build-time
+/// result-type mismatch is FAIL-LOUD, never a silent mis-decode. A DIRECT
 /// (non-pooled) connection never resets on its own, so its dynamic cache persists
 /// for the connection's life.
 #[derive(Debug)]
@@ -807,6 +818,46 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             }
             // Fatal: the verb consumed the token and the connection is dead.
             Err(other) => Err(lift_engine_error(other)),
+        }
+    }
+
+    /// Surface a typed result-schema OID mismatch the engine recorded during a
+    /// compile-checked cache-MISS's `RowDescription` check, if any.
+    ///
+    /// The typed decode is positional / const-offset, so a runtime column whose
+    /// type diverged from the migration schema (an out-of-band `ALTER COLUMN TYPE`,
+    /// or a `TEMP TABLE` shadowing the migration table) would silently mis-decode.
+    /// The engine's guard catches this at the fresh Parse's `RowDescription` (a
+    /// cache MISS) and drains the result to a clean idle; every typed verb calls
+    /// this AFTER its pump settles — the connection is already reusable — to turn
+    /// the recorded mismatch into a classified
+    /// [`DecodeError::ColumnOidMismatch`](bsql_postgres_proto::DecodeError::ColumnOidMismatch)
+    /// (a `DriverError::Decode`, NOT a disconnect: fix the schema drift and retry on
+    /// the same connection). A cache HIT cannot silently mis-decode — PostgreSQL
+    /// refuses to change a reused plan's result type (`0A000`) — so on a HIT there
+    /// is nothing recorded and this is a cheap `None` check.
+    ///
+    /// The engine records only `(index, found)`; the `expected` OID is recovered
+    /// HERE from the carrier's own `Q::PREPARED.row_oids()[index]` (the single
+    /// source of the compile-time expected schema), keeping the engine footprint
+    /// compact.
+    fn take_typed_schema_error<Q: TypedQuery>(&mut self) -> Result<(), DriverError> {
+        match self.engine.take_result_oid_mismatch() {
+            Some((index, found)) => {
+                // The guard's index is always within the carrier's row-OID list
+                // (it enumerated that very list); `0` (InvalidOid) is a defensive
+                // floor surfaced in the error, never a real expected OID.
+                let expected = match Q::PREPARED.row_oids().get(usize::from(index)) {
+                    Some(&oid) => oid,
+                    None => 0,
+                };
+                Err(DriverError::Decode(DecodeError::ColumnOidMismatch {
+                    index,
+                    expected,
+                    found,
+                }))
+            }
+            None => Ok(()),
         }
     }
 
@@ -1470,9 +1521,13 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             )
             .await;
         self.settle(outcome, &mut builder)?;
-        // The connection is now idle + pooled. An oversize row was reassembled
-        // into the prebuffer's `wire` by `RowsBuilder::feed` and is just another
-        // contiguous span, so it decodes exactly like an inline row — no cap.
+        // The connection is now idle + pooled. Fail loud if the fresh Parse's
+        // RowDescription revealed a runtime column type diverging from the
+        // migration schema (the guard drained the result, so `builder` is empty).
+        self.take_typed_schema_error::<Q>()?;
+        // An oversize row was reassembled into the prebuffer's `wire` by
+        // `RowsBuilder::feed` and is just another contiguous span, so it decodes
+        // exactly like an inline row — no cap.
         Ok(builder.finish::<Q>())
     }
 
@@ -1640,6 +1695,11 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             Boundary::Idle => {
                 // Streamed to a clean idle — token restored, no drain needed.
                 self.live = Some(live);
+                // A typed result-schema mismatch (caught at the fresh Parse's
+                // RowDescription) drained the rows before any reached the sink, so
+                // it dominates the (empty) row/decode outcome — fail loud rather
+                // than return `Ok(None)`.
+                self.take_typed_schema_error::<Q>()?;
                 match (row, decode_err) {
                     (Some(owned), _) => Ok(Some(owned)),
                     (None, Some(de)) => Err(DriverError::Decode(de)),
@@ -1753,7 +1813,14 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 }),
             )
             .await;
-        self.finish_stream(outcome, db_error).await
+        let out = self.finish_stream(outcome, db_error).await?;
+        // Fail loud if the fresh Parse's RowDescription revealed a runtime column
+        // type diverging from the migration schema: the guard drained the rows
+        // before any reached `on_row`, so `out` is `None` (no garbage row was
+        // yielded) and the mismatch dominates. Checked HERE (not in the shared
+        // `finish_stream`) because the carrier `Q` recovers the expected OID.
+        self.take_typed_schema_error::<Q>()?;
+        Ok(out)
     }
 
     /// The shared post-pump settle for EVERY streaming verb (typed
@@ -1787,7 +1854,10 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         };
         match boundary {
             Boundary::Idle => {
-                // Streamed to completion at a clean idle — no drain needed.
+                // Streamed to completion at a clean idle — no drain needed. (A typed
+                // `query_each` checks its result-schema guard in the verb itself,
+                // where the carrier `Q` is in scope — `finish_stream` is shared with
+                // the dynamic streaming verbs, which never arm the guard.)
                 self.live = Some(live);
                 Ok(None)
             }
@@ -2534,9 +2604,15 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// trip (`Close`ing every cached server-side statement — `DISCARD` runs no
     /// `DEALLOCATE`, so they otherwise survive), and clears the notification ledger
     /// and the N+1 recency window. The engine's compile-checked (TYPED) statement
-    /// cache — content-addressed COMPILE-TIME plans over PERMANENT migration objects
-    /// that cannot dangle — is deliberately KEPT, so the typed flagship's
-    /// server-side plan reuse survives.
+    /// cache is deliberately KEPT, so the typed flagship's server-side plan reuse
+    /// survives — safe because a silent mis-decode is closed independently: a fresh
+    /// typed `Parse` (a cache MISS — which a temp shadow / out-of-band
+    /// `ALTER COLUMN TYPE` forces) appends a `Describe`(portal) and the driver's
+    /// result-schema guard classifies any runtime column-OID divergence as
+    /// `DecodeError::ColumnOidMismatch`, while a reused plan whose result type would
+    /// change is refused by PostgreSQL itself as `0A000` ("cached plan must not
+    /// change result type"). So keeping the typed cache never risks a silently-wrong
+    /// result — see the [`DynStmtCache`] doc for the full two-front argument.
     ///
     /// This is the SINGLE reset used both by a DIRECT consumer (an explicit clean
     /// slate) and by the POOL at checkout, so a pooled connection behaves EXACTLY
@@ -2565,13 +2641,21 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ///   resolves against the current user's schema, exactly as on a fresh
     ///   connection) is airtight.
     ///
-    /// The TYPED cache is KEPT because its plans reference only PERMANENT migration
-    /// objects (they cannot resolve to a session object), so the typed flagship's
-    /// server-side plan reuse is preserved. Witnessed by the `--ignored`
+    /// The TYPED cache is KEPT (its server-side plan reuse is the typed flagship's
+    /// speed) — NOT because a typed plan cannot bind a session object (it can: a
+    /// fresh typed `Parse` under a temp shadow resolves to the temp), but because a
+    /// silent mis-decode is closed by the result-schema guard (a typed cache MISS
+    /// appends a `Describe`(portal) and verifies each runtime column OID → a
+    /// classified `DecodeError::ColumnOidMismatch` on any divergence) plus
+    /// PostgreSQL's own `0A000` refusal to change a reused plan's result type. So a
+    /// kept typed plan is either correct or fail-loud, never silently wrong.
+    /// Witnessed by the `--ignored`
     /// `pooled_dynamic_plan_re_resolves_a_temp_shadow_across_users` live test (both
-    /// drivers): a pooled plan a prior user promoted against a PERMANENT table
-    /// returns the next user's `TEMP TABLE` data after checkout, never the permanent
-    /// rows — because the dynamic cache is dropped and the query re-`Parse`s fresh.
+    /// drivers) for the DYNAMIC cache's drop, and by
+    /// `query_oid_guard_live.rs` for the TYPED cache's guard: a pooled plan a prior
+    /// user promoted against a PERMANENT table returns the next user's `TEMP TABLE`
+    /// data after checkout, never the permanent rows — because the dynamic cache is
+    /// dropped and the query re-`Parse`s fresh.
     pub async fn reset_session(&mut self) -> Result<(), DriverError> {
         self.reset_session_impl().await
     }

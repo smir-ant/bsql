@@ -59,6 +59,13 @@ pub struct QueryReply {
     /// `Sync`'s `ReadyForQuery` after it, so this is exactly the bytes that ride
     /// the `Execute`.
     pub extended: Vec<u8>,
+    /// The `Describe(portal)` reply for the compile-checked `query!` cache-MISS
+    /// path (which appends a `Describe`): a `RowDescription` carrying this query's
+    /// column OIDs (a rows reply), so the driver's typed result-schema guard can
+    /// verify the runtime OIDs, or a bodyless `NoData` (a scripted error / no-row
+    /// reply). Emitted between `BindComplete` and the `Execute` payload. A cache
+    /// HIT sends no `Describe`, so this is unused on the reuse path.
+    pub row_description: Vec<u8>,
 }
 
 /// The pre-built reply bytes a [`FakeTransport`] serves.
@@ -147,6 +154,11 @@ pub struct FakeTransport {
     /// `None` outside an extended batch; cleared at `Sync` so it never leaks
     /// into the next batch.
     staged: Option<Vec<u8>>,
+    /// The `Describe(portal)` reply (a `RowDescription` or `NoData`) staged by the
+    /// batch's `Parse`, emitted by the following `Describe(portal)` the
+    /// compile-checked `query!` cache-MISS path appends. `None` outside an extended
+    /// batch; cleared at `Sync` alongside [`staged`](Self::staged).
+    staged_describe: Option<Vec<u8>>,
     /// Prepared statements seen on this connection: content-addressed statement
     /// name → its extended Execute payload, recorded at `Parse`. A cache-hit
     /// re-execute (bare `Bind` + `Execute`, no `Parse`) resolves its payload
@@ -185,6 +197,12 @@ enum FrontKind {
     Execute,
     /// An extended-protocol `Close` `'C'` — emits `CloseComplete`.
     Close,
+    /// An extended-protocol `Describe(portal)` `'D'` with target byte `'P'` — the
+    /// compile-checked `query!` cache-MISS path appends one so the server returns a
+    /// `RowDescription` the driver's typed result-schema guard verifies. Emits the
+    /// staged query's `RowDescription` (or `NoData`). A `Describe(statement)` `'S'`
+    /// (the runtime `prepare` path) stays [`Unsupported`](Self::Unsupported).
+    DescribePortal,
     /// A `Terminate` `'X'`.
     Terminate,
     /// A `Sync` `'S'` — the terminator of an extended-protocol batch (and a
@@ -217,6 +235,7 @@ impl FakeTransport {
             closed: false,
             awaiting_sync: false,
             staged: None,
+            staged_describe: None,
             prepared: Vec::new(),
         }
     }
@@ -312,8 +331,12 @@ impl FakeTransport {
             b'C' => FrontKind::Close,
             b'X' => FrontKind::Terminate,
             b'S' => FrontKind::Sync,
-            // `Describe`/`Flush`/anything else — the runtime `prepare` path and
-            // other unmodelled extended ops.
+            // `Describe`: the target byte at offset 5 is `'P'` (portal — the
+            // compile-checked `query!` MISS path, which the fake models) or `'S'`
+            // (statement — the runtime `prepare` path, unsupported).
+            b'D' if inbox.get(5) == Some(&b'P') => FrontKind::DescribePortal,
+            // `Describe(statement)` / `Flush` / anything else — the runtime
+            // `prepare` path and other unmodelled extended ops.
             _ => FrontKind::Unsupported,
         };
         Framed::Message { consumed: total, kind }
@@ -334,6 +357,17 @@ impl FakeTransport {
         match self.script.queries.iter().find(|(k, _)| k.as_str() == sql) {
             Some((_, reply)) => reply.extended.clone(),
             None => self.script.unmatched_extended.clone(),
+        }
+    }
+
+    /// Look up the `Describe(portal)` reply (a `RowDescription` or `NoData`) for a
+    /// trimmed SQL string. For an unmatched query there is no column shape to
+    /// describe, so a bodyless `NoData` is served (the loud unmatched error still
+    /// rides the following `Execute`); the driver's guard skips a `NoData` schema.
+    fn describe_for_sql(&self, sql: &str) -> Vec<u8> {
+        match self.script.queries.iter().find(|(k, _)| k.as_str() == sql) {
+            Some((_, reply)) => reply.row_description.clone(),
+            None => wire::no_data(),
         }
     }
 
@@ -372,6 +406,7 @@ impl FakeTransport {
                 FrontKind::Sync => {
                     self.awaiting_sync = false;
                     self.staged = None;
+                    self.staged_describe = None;
                     let reply = self.script.ready_for_query.clone();
                     self.outbox.extend_from_slice(&reply);
                 }
@@ -391,6 +426,18 @@ impl FakeTransport {
                 // its acknowledgement in order.
                 FrontKind::Close => {
                     let reply = self.script.close_complete.clone();
+                    self.outbox.extend_from_slice(&reply);
+                }
+                // A `Describe(portal)` (the compile-checked `query!` MISS path
+                // appends one): emit the staged `RowDescription` (or `NoData`) so
+                // the driver's typed result-schema guard can verify the runtime
+                // OIDs. Staged by the batch's `Parse`; a bare Describe with no prior
+                // Parse (malformed) falls back to `NoData`.
+                FrontKind::DescribePortal => {
+                    let reply = match &self.staged_describe {
+                        Some(bytes) => bytes.clone(),
+                        None => wire::no_data(),
+                    };
                     self.outbox.extend_from_slice(&reply);
                 }
                 // A `Parse`: match its SQL, stage the Execute payload for the
@@ -421,10 +468,18 @@ impl FakeTransport {
                         // payload so the Execute is a classified error.
                         None => self.script.unmatched_extended.clone(),
                     };
+                    // Stage the Describe(portal) reply too — the MISS path appends a
+                    // Describe, so this RowDescription (or NoData) rides before the
+                    // Execute payload.
+                    let describe = match &sql {
+                        Some(sql) => self.describe_for_sql(sql),
+                        None => wire::no_data(),
+                    };
                     if let Some(name) = name {
                         self.prepared.push((name, payload.clone()));
                     }
                     self.staged = Some(payload);
+                    self.staged_describe = Some(describe);
                     let ack = self.script.parse_complete.clone();
                     self.outbox.extend_from_slice(&ack);
                 }
@@ -641,7 +696,10 @@ mod tests {
             wire::data_row(&[Some(wire::binary_int8(1))]).expect("dr binary"),
             wire::command_complete("SELECT 1").expect("cc"),
         ]);
-        QueryReply { simple, extended }
+        // The Describe(portal) reply for the typed cache-MISS path (int8 column).
+        let row_description =
+            wire::row_description(&[("col0".to_owned(), wire::OID_INT8)]).expect("rd");
+        QueryReply { simple, extended, row_description }
     }
 
     fn sample_script() -> FakeScript {

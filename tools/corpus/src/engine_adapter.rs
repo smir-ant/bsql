@@ -496,6 +496,11 @@ fn run_pull(transcript: &Transcript) -> ObservedRun {
                     active.begin_bind_execute(&DEMO_RESULT_OIDS);
                 } else {
                     active.begin_close_parse_bind_execute(&DEMO_RESULT_OIDS);
+                    // A MISS appends a Describe(portal), so its reply carries a
+                    // RowDescription the typed result-schema guard verifies — arm it
+                    // (mirroring `stage_compiled_query`) so BindComplete routes to the
+                    // RowDescription wait, not straight to the row stream.
+                    active.arm_result_guard();
                     demo_parsed = true;
                 }
             }

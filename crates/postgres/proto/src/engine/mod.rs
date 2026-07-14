@@ -372,6 +372,24 @@ impl<'b, T> Engine<'b, T> {
         Ok(self.phase.as_active()?.current_param_oids())
     }
 
+    /// TAKE the typed result-schema OID mismatch recorded during a compile-checked
+    /// cache-MISS's `RowDescription` check (`Some((index, found))`), or `None`. The
+    /// driver reads this after a typed verb's pump returns — the over-cap drain the
+    /// guard reused has already reclaimed the connection to a clean idle — recovers
+    /// the `expected` OID from the carrier's `Q::PREPARED.row_oids()[index]`, and
+    /// surfaces a classified
+    /// [`DecodeError::ColumnOidMismatch`](crate::decode::DecodeError::ColumnOidMismatch).
+    ///
+    /// Returns `None` when the engine is not active (there is no mismatch to report
+    /// off the active path), so a caller never has to special-case the phase.
+    #[inline]
+    pub fn take_result_oid_mismatch(&mut self) -> Option<(u16, u32)> {
+        self.phase
+            .as_active_mut()
+            .ok()
+            .and_then(|active| active.take_result_oid_mismatch())
+    }
+
     /// Forget the per-connection prepared-statement cache (a no-op unless the
     /// engine is active).
     ///

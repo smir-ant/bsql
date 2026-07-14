@@ -966,6 +966,10 @@ fn query_params_runs_the_macro_path() {
         close_complete(),
         parse_complete(),
         bind_complete(),
+        // A typed cache-MISS appends a Describe(portal); the server returns this
+        // RowDescription, which the result-schema guard verifies ([23, 25] == the
+        // seated compile-time schema) then discards.
+        row_description(&[("id", 23), ("name", 25)]),
         data_row(&[Some(b"42"), Some(b"alice")]),
         command_complete("SELECT 1"),
         rfq(b'I'),
@@ -992,6 +996,10 @@ fn query_params_break_streams_all_reaches_idle() {
         close_complete(),
         parse_complete(),
         bind_complete(),
+        // A typed cache-MISS appends a Describe(portal); the server returns this
+        // RowDescription, which the result-schema guard verifies ([23, 25] == the
+        // seated compile-time schema) then discards.
+        row_description(&[("id", 23), ("name", 25)]),
         data_row(&[Some(b"1"), Some(b"a")]),
         data_row(&[Some(b"2"), Some(b"b")]),
         data_row(&[Some(b"3"), Some(b"c")]),
@@ -1030,6 +1038,10 @@ fn query_params_break_stops_early_then_drain_reclaims_and_reuses() {
         close_complete(),
         parse_complete(),
         bind_complete(),
+        // A typed cache-MISS appends a Describe(portal); the server returns this
+        // RowDescription, which the result-schema guard verifies ([23, 25] == the
+        // seated compile-time schema) then discards.
+        row_description(&[("id", 23), ("name", 25)]),
         data_row(&[Some(b"1"), Some(b"a")]),
         data_row(&[Some(b"2"), Some(b"b")]),
         data_row(&[Some(b"3"), Some(b"c")]),
@@ -1155,6 +1167,10 @@ fn query_params_miss_close_parses_hit_reuses_and_reparses_after_clear() {
         close_complete(),
         parse_complete(),
         bind_complete(),
+        // A typed cache-MISS appends a Describe(portal); the server returns this
+        // RowDescription, which the result-schema guard verifies ([23, 25] == the
+        // seated compile-time schema) then discards.
+        row_description(&[("id", 23), ("name", 25)]),
         data_row(&[Some(b"42"), Some(b"alice")]),
         command_complete("SELECT 1"),
         rfq(b'I'),
@@ -1167,6 +1183,10 @@ fn query_params_miss_close_parses_hit_reuses_and_reparses_after_clear() {
         close_complete(),
         parse_complete(),
         bind_complete(),
+        // A typed cache-MISS appends a Describe(portal); the server returns this
+        // RowDescription, which the result-schema guard verifies ([23, 25] == the
+        // seated compile-time schema) then discards.
+        row_description(&[("id", 23), ("name", 25)]),
         data_row(&[Some(b"42"), Some(b"alice")]),
         command_complete("SELECT 1"),
         rfq(b'I'),
@@ -1217,25 +1237,44 @@ fn query_params_miss_close_parses_hit_reuses_and_reparses_after_clear() {
 
     let parse_template = Q_DEMO.parse_template_for_test();
     let close_frame = close_statement_frame(Q_DEMO.stmt_name());
-    // MISS wire == Close ++ Parse ++ (the HIT's Bind+Execute+Sync tail).
+    // The Describe(portal) frame the MISS appends (and the HIT does NOT): `'D'`,
+    // len 6, `'P'` (describe portal), empty-portal NUL.
+    let describe_portal: [u8; 7] = [b'D', 0, 0, 0, 6, b'P', 0];
+    // MISS wire == Close ++ Parse ++ Bind ++ Describe(portal) ++ Execute ++ Sync.
+    // The HIT (w2) is a bare Bind ++ Execute ++ Sync, so the MISS's tail is the HIT
+    // wire with the Describe inserted before the trailing Execute+Sync (15 bytes:
+    // Execute 10 + Sync 5). Reconstructing w1 from w2 pins BOTH the miss prefix AND
+    // the appended Describe exactly.
+    let exec_sync_len = 15;
+    let hit_split = w2.len() - exec_sync_len;
+    let miss_tail =
+        [&w2[..hit_split], describe_portal.as_slice(), &w2[hit_split..]].concat();
     assert_eq!(
         w1,
-        [close_frame.as_slice(), parse_template, w2.as_slice()].concat(),
-        "call 1 (miss) == Close ++ Parse template ++ (Bind+Execute+Sync)"
+        [close_frame.as_slice(), parse_template, miss_tail.as_slice()].concat(),
+        "call 1 (miss) == Close ++ Parse template ++ Bind ++ Describe(portal) ++ Execute ++ Sync"
     );
     assert!(w1.starts_with(close_frame.as_slice()), "miss leads with the Close frame");
     assert!(
         w1.windows(parse_template.len()).any(|w| w == parse_template),
         "miss carries the Parse template"
     );
-    // HIT wire carries NEITHER a Close nor a Parse — a bare Bind+Execute+Sync.
+    assert!(
+        w1.windows(describe_portal.len()).any(|w| w == describe_portal),
+        "miss appends a Describe(portal) so the guard can verify the result schema"
+    );
+    // HIT wire carries NEITHER a Close, a Parse, NOR a Describe — a bare Bind+Execute+Sync.
     assert!(!w2.starts_with(close_frame.as_slice()), "hit must NOT send a Close");
     assert!(
         !w2.windows(parse_template.len()).any(|w| w == parse_template),
         "hit must NOT re-send the Parse (server plan reused)"
     );
+    assert!(
+        !w2.windows(describe_portal.len()).any(|w| w == describe_portal),
+        "hit must NOT send a Describe (a reused plan cannot silently change result type — 0A000)"
+    );
     // After clear_statement_cache the next call is a MISS again: call 3 == call 1.
-    assert_eq!(w3, w1, "after clear, the wire returns to the miss (Close+Parse+Bind+Execute)");
+    assert_eq!(w3, w1, "after clear, the wire returns to the miss (Close+Parse+Bind+Describe+Execute)");
 }
 
 #[test]
@@ -1254,6 +1293,10 @@ fn query_params_reuse_error_evicts_so_next_use_reparses() {
         close_complete(),
         parse_complete(),
         bind_complete(),
+        // A typed cache-MISS appends a Describe(portal); the server returns this
+        // RowDescription, which the result-schema guard verifies ([23, 25] == the
+        // seated compile-time schema) then discards.
+        row_description(&[("id", 23), ("name", 25)]),
         data_row(&[Some(b"42"), Some(b"alice")]),
         command_complete("SELECT 1"),
         rfq(b'I'),
@@ -1264,6 +1307,10 @@ fn query_params_reuse_error_evicts_so_next_use_reparses() {
         close_complete(),
         parse_complete(),
         bind_complete(),
+        // A typed cache-MISS appends a Describe(portal); the server returns this
+        // RowDescription, which the result-schema guard verifies ([23, 25] == the
+        // seated compile-time schema) then discards.
+        row_description(&[("id", 23), ("name", 25)]),
         data_row(&[Some(b"42"), Some(b"alice")]),
         command_complete("SELECT 1"),
         rfq(b'I'),

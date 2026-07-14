@@ -743,10 +743,14 @@ impl FakePostgres {
                 ScriptedReply::Rows { rows, notifications } => QueryReply {
                     simple: encode_rows_simple_faithful(rows, notifications)?,
                     extended: encode_rows_extended(rows, notifications)?,
+                    row_description: encode_row_description_extended(rows)?,
                 },
                 ScriptedReply::Error { sqlstate, message } => QueryReply {
                     simple: encode_error_simple(sqlstate, message)?,
                     extended: encode_error_extended(sqlstate, message)?,
+                    // An error query describes no result columns; the loud error
+                    // still rides the following Execute.
+                    row_description: wire::no_data(),
                 },
             };
             queries.push((sql.trim().to_owned(), query_reply));
@@ -976,6 +980,17 @@ fn encode_rows_extended(
     frames.extend(notification_frames(notifications)?);
     frames.push(wire::command_complete(&format!("SELECT {}", rows.rows.len()))?);
     Ok(wire::concat(&frames))
+}
+
+/// Encode the `Describe(portal)` reply for the EXTENDED (`query!`) path: a
+/// standalone `RowDescription` frame carrying the scripted result's column OIDs.
+/// A compile-checked cache MISS appends a `Describe(portal)`, and the driver's
+/// typed result-schema guard verifies these OIDs against the carrier's
+/// compile-time schema. It rides between `BindComplete` and the `Execute` payload
+/// (no acknowledgement / trailing frames).
+fn encode_row_description_extended(rows: &ScriptedRows) -> Result<Vec<u8>, TestkitError> {
+    let cols = checked_columns(rows)?;
+    Ok(wire::row_description(&cols)?)
 }
 
 /// Encode a scripted `ErrorResponse` + `ReadyForQuery` for the SIMPLE protocol.

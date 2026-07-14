@@ -920,11 +920,38 @@ pub enum DecodeError {
     /// yielding a partial / defaulted record or silently ignoring the surplus —
     /// mirroring the array and fixed-width scalar decoders.
     CompositeTruncated,
+    /// A compile-checked `query!` RESULT column's RUNTIME type OID (from the
+    /// server's `RowDescription`) does not match the carrier's COMPILE-TIME
+    /// expected OID (the migration schema the query was typed against). This is
+    /// the top-level peer of [`ArrayElemOidMismatch`](Self::ArrayElemOidMismatch):
+    /// the typed decode is positional / const-offset, so a runtime column whose
+    /// type DIFFERS from the baked schema — an out-of-band
+    /// `ALTER TABLE ... ALTER COLUMN ... TYPE`, or a `CREATE TEMP TABLE` shadowing
+    /// a migration table with a different column type — would silently mis-decode
+    /// (a `text` decoder reading 4 `int4` bytes yields a plausible-but-wrong
+    /// string). The guard verifies each column's runtime OID at the query's
+    /// `RowDescription` (a fresh Parse — a cache MISS — where the resolved type
+    /// can diverge; a plan REUSE that would change result type is refused by
+    /// PostgreSQL itself as `0A000` "cached plan must not change result type"), so
+    /// the mismatch is a classified error rather than a silent wrong value.
+    /// SKIPPED for a user-defined type (a domain/enum/composite, whose runtime OID
+    /// is server-assigned/dynamic — `found >= FIRST_NORMAL_OID`), matching the
+    /// existing "no compile-time OID pin for user types" boundary; the text family
+    /// (`text`/`varchar`/`bpchar`) is treated as one class (identical wire decode).
+    ColumnOidMismatch {
+        /// The zero-based projected result-column index.
+        index: u16,
+        /// The OID the carrier's compile-time row shape expects.
+        expected: u32,
+        /// The OID the server's `RowDescription` reported at runtime.
+        found: u32,
+    },
 }
 
-// Direct size pin. The widest variant is `TruncatedColumnData { column_idx: u16,
-// declared_len: u32, remaining: u32 }` = 12 B (the two `u32`s + the `u16`, the
-// enum discriminant packed into the trailing padding); every other variant is
+// Direct size pin. The two widest variants are `TruncatedColumnData { column_idx:
+// u16, declared_len: u32, remaining: u32 }` and `ColumnOidMismatch { index: u16,
+// expected: u32, found: u32 }` — both 12 B (two `u32`s + one `u16`, the enum
+// discriminant packed into the trailing padding); every other variant is
 // narrower. Pinned HERE — not merely capped transitively by `DriverError`'s
 // 24 B pin, whose width is actually set by its 16-byte fat-pointer payloads —
 // so a silent regrowth of `DecodeError` (e.g. a field widened back to `usize`)
@@ -1017,6 +1044,13 @@ impl fmt::Display for DecodeError {
             Self::CompositeTruncated => {
                 f.write_str("composite column payload is truncated or malformed")
             }
+            Self::ColumnOidMismatch { index, expected, found } => write!(
+                f,
+                "result column {index} type OID mismatch: the query was typed against OID {expected} \
+                 (the migration schema), but the server reported OID {found} at runtime — the live \
+                 column type differs from the migration (an out-of-band ALTER COLUMN TYPE, or a \
+                 TEMP TABLE shadowing the migration table)",
+            ),
         }
     }
 }
@@ -3722,6 +3756,20 @@ pub mod oids {
     pub const TIME_ARRAY: u32 = 1183;
     /// `interval[]` (`_interval`).
     pub const INTERVAL_ARRAY: u32 = 1187;
+    /// `bpchar[]` (`_bpchar`) — the array of `char(n)`.
+    pub const BPCHAR_ARRAY: u32 = 1014;
+    /// `varchar[]` (`_varchar`) — the array of `varchar(n)`.
+    pub const VARCHAR_ARRAY: u32 = 1015;
+
+    /// PostgreSQL's `FirstNormalObjectId` — the boundary between BUILT-IN type
+    /// OIDs (all `< 16384`, assigned in the bootstrap catalog) and USER-DEFINED
+    /// type OIDs (all `>= 16384`, assigned by `CREATE TYPE`/`DOMAIN`). The
+    /// result-column OID guard uses this to SKIP a user-defined type (an
+    /// enum/domain/composite, whose OID is server-assigned/dynamic and carries no
+    /// compile-time pin — the existing user-type boundary) while checking every
+    /// built-in column against its baked expected OID. Stable across PostgreSQL
+    /// versions.
+    pub const FIRST_NORMAL_OID: u32 = 16384;
 
     // Tier-1 compile drift-pin against the canonical PG catalog
     // (src/include/catalog/pg_type.dat). A typo in any constant
@@ -3769,7 +3817,51 @@ pub mod oids {
         assert!(DATE_ARRAY == 1182, "oids::DATE_ARRAY drift from pg_type.dat");
         assert!(TIME_ARRAY == 1183, "oids::TIME_ARRAY drift from pg_type.dat");
         assert!(INTERVAL_ARRAY == 1187, "oids::INTERVAL_ARRAY drift from pg_type.dat");
+        assert!(BPCHAR_ARRAY == 1014, "oids::BPCHAR_ARRAY drift from pg_type.dat");
+        assert!(VARCHAR_ARRAY == 1015, "oids::VARCHAR_ARRAY drift from pg_type.dat");
+        assert!(FIRST_NORMAL_OID == 16384, "oids::FIRST_NORMAL_OID drift from PG FirstNormalObjectId");
     };
+}
+
+/// Classify a result column's RUNTIME type OID against the carrier's COMPILE-TIME
+/// expected OID for the typed `query!` result-schema guard.
+///
+/// Returns `true` when the runtime column is safe to decode with the expected
+/// type's decoder — i.e. NOT a silent mis-decode:
+///
+/// - `found >= FIRST_NORMAL_OID` — a user-defined type (enum/domain/composite).
+///   Its OID is server-assigned/dynamic and carries no compile-time pin (a domain
+///   column reports its OWN OID, not its base's), so it is SKIPPED, exactly the
+///   existing user-type boundary (the runtime already validates an enum label /
+///   composite arity). A native column shadowed at a MISS by a user-defined type
+///   of a different base is the sole residual of this skip — extremely exotic.
+/// - the `text` family (`text` / `varchar` / `bpchar`, and their arrays) shares
+///   ONE wire decode (raw UTF-8 bytes), so a `varchar`/`bpchar` column decoded by
+///   the `text` marker is CORRECT, not a mismatch — they canonicalize to one class.
+/// - otherwise EXACT equality — any other runtime OID differing from the expected
+///   is a real type divergence (the reproduced `text`↔`int4` shadow).
+#[must_use]
+pub(crate) fn result_oid_compatible(expected: u32, found: u32) -> bool {
+    // A user-defined runtime type is dynamic-OID: skip (honest boundary).
+    if found >= oids::FIRST_NORMAL_OID {
+        return true;
+    }
+    result_oid_class(expected) == result_oid_class(found)
+}
+
+/// Canonicalize a built-in OID into its wire-decode equivalence class: the
+/// blank-padded / varying CHAR family (`varchar` 1043, `bpchar` 1042) collapses
+/// to `text` (25), and their arrays (`varchar[]` 1015, `bpchar[]` 1014) collapse
+/// to `text[]` (1009), since all decode identically (raw UTF-8). Every other OID
+/// is its own class (identity), so the guard is EXACT equality outside the CHAR
+/// family.
+#[must_use]
+fn result_oid_class(oid: u32) -> u32 {
+    match oid {
+        oids::VARCHAR | oids::BPCHAR => oids::TEXT,
+        oids::VARCHAR_ARRAY | oids::BPCHAR_ARRAY => oids::TEXT_ARRAY,
+        other => other,
+    }
 }
 
 #[cfg(test)]
