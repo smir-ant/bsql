@@ -357,29 +357,31 @@ struct DynSlot {
 /// `Close`s it), so the server-side statement count is bounded by the cache and
 /// nothing leaks; on connection close PostgreSQL drops them all.
 ///
-/// # Cleared on a pool checkout
+/// # Cleared on a session reset
 ///
-/// The cache is CLEARED by [`reset_session`](Core::reset_session). This is
-/// primarily HYGIENE, not a strict-correctness necessity: PostgreSQL revalidates
-/// a cached plan and re-resolves its objects when session state that affects
-/// resolution changes (a `SET search_path`), so a `search_path`-shifted reuse
-/// re-plans rather than returning the wrong table. The distinguishing reason the
-/// DYNAMIC cache clears while the engine's compile-checked (TYPED) cache is KEPT
-/// is object LIFETIME: a TYPED `query!` is build-validated against PERMANENT
-/// migration objects that outlive every session, so its cached plan cannot
-/// dangle; a DYNAMIC runtime-SQL plan can reference a SESSION-scoped object (a
-/// `CREATE TEMP TABLE`, a session `CREATE FUNCTION`) that `reset_session`'s
-/// `DISCARD TEMP` / `RESET ALL` tears down — so keeping such a plan across a
-/// checkout would leave it referencing a dropped object. Clearing at the pool
-/// boundary removes that class cleanly, and denies a new logical user the prior
-/// user's plans as a defensive bonus. The clear `Close`s each READY server-side
-/// statement (a protocol `Close` of an already-dropped statement is a wire
-/// no-op, so it is robust even after a mid-session `DISCARD` / `DEALLOCATE`) and
-/// BATCHES all of them into ONE round trip. The cost is that a pooled connection
-/// re-warms its dynamic cache each checkout (the within-checkout reuse — a query
-/// looped in one request — is unaffected, which is where the win is); a DIRECT
-/// (non-pooled) connection never calls `reset_session`, so its cache persists for
-/// the connection's life.
+/// The cache is CLEARED by [`reset_session`](Core::reset_session) — the SINGLE
+/// reset used both by a direct consumer and by the pool at checkout — which
+/// `Close`s each READY server-side statement (a protocol `Close` of an
+/// already-dropped statement is a wire no-op, so it is robust even after a
+/// mid-session `DISCARD` / `DEALLOCATE`) batched into ONE round trip.
+///
+/// Clearing the DYNAMIC cache at the pool boundary is a CORRECTNESS requirement,
+/// not a hygiene nicety. A dynamic runtime-SQL plan can resolve an UNQUALIFIED name
+/// (against the search path) or reference a SESSION object, so a plan a prior
+/// logical user promoted (e.g. `SELECT … FROM orders …` bound to `public.orders`)
+/// must NOT survive into the next user's checkout: keeping it warm would let a next
+/// user who creates a shadowing `CREATE TEMP TABLE orders` (with `pg_temp` already
+/// active, so the search-path OID list is unchanged) receive the PRIOR user's
+/// `public.orders` rows — a silent cross-user wrong result. `DISCARD PLANS` cannot
+/// fix this robustly (it invalidates a kept plan only ONCE, and PostgreSQL
+/// re-validates it against the pre-shadow schema before the user's shadow exists —
+/// verified live), so the airtight fix is to DROP the statements: the next user's
+/// query re-`Parse`s fresh against their own schema, exactly as on a fresh
+/// connection. The engine's compile-checked (TYPED) cache is KEPT (its plans
+/// reference only PERMANENT migration objects, so they cannot resolve to a session
+/// object), preserving the typed flagship's server-side plan reuse. A DIRECT
+/// (non-pooled) connection never resets on its own, so its dynamic cache persists
+/// for the connection's life.
 #[derive(Debug)]
 struct DynStmtCache {
     /// Insertion-ordered slots (linear scan; `DYN_STMT_CACHE_CAP` is small, so a
@@ -1971,8 +1973,15 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ///
     /// # Errors
     ///
-    /// - [`DriverError::BatchFailed`] — a command failed; the whole batch rolled
-    ///   back (all-or-nothing). Names the failing index + the server cause.
+    /// - [`DriverError::BatchFailed`] — a specific command failed (a `Bind`/`Execute`
+    ///   error); the whole batch rolled back (all-or-nothing). Names the failing
+    ///   command's index (always `< arity`) + the server cause.
+    /// - [`DriverError::Db`] — a COMMIT-TIME failure: every command succeeded at
+    ///   Execute and the implicit COMMIT at the trailing `Sync` failed (a
+    ///   `DEFERRABLE INITIALLY DEFERRED` constraint, a serialization failure). The
+    ///   whole batch rolled back (zero results); the failure belongs to no single
+    ///   command, so [`batch_failed_index`](DriverError::batch_failed_index) is
+    ///   `None`.
     /// - a FATAL transport/protocol/EOF error — the connection is dead
     ///   ([`is_disconnect`](DriverError::is_disconnect) is `true`).
     pub async fn pipeline<'p, B: Pipeline<'p>>(
@@ -2022,9 +2031,16 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                             }
                             current = current.saturating_add(1);
                         }
-                        // A mid-batch server error: `current` is the count of
-                        // COMPLETED commands = the failing command's index. Park it +
-                        // the cause once — the FIRST Fail wins (the guard makes a
+                        // A server error: `current` is the count of COMPLETED
+                        // commands. For a MID-BATCH command failure `current` is the
+                        // failing command's zero-based index (`< arity`). For a
+                        // COMMIT-TIME failure — every command SUCCEEDED at Execute
+                        // (`current == arity`), then the trailing `Sync`'s implicit
+                        // COMMIT failed (a `DEFERRABLE INITIALLY DEFERRED` constraint,
+                        // a SERIALIZABLE serialization failure) — `current` is `arity`,
+                        // which names NO command; the settle below maps that to a
+                        // batch-level `Db` error, never an out-of-range index. Park it
+                        // + the cause once — the FIRST Fail wins (the guard makes a
                         // later frame in the recovery window fall through), and the
                         // pump drains to the batch RFQ afterward.
                         Surface::Fail(body) if failed_index.is_none() => {
@@ -2098,6 +2114,18 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 // both are `Some` by construction; the `_` arm is fail-closed
                 // (classified, never a fabricated index) against the impossible case.
                 match (failed_index, db_error) {
+                    // COMMIT-TIME failure: every command completed at Execute
+                    // (`index == arity`), then the trailing `Sync`'s implicit COMMIT
+                    // failed — the error belongs to the whole batch, not any single
+                    // command. Return it as a batch-level `Db` (so `batch_failed_index`
+                    // is `None`), never `BatchFailed { index: arity }` (an out-of-range
+                    // index a consumer would index an N-element array by), and never a
+                    // silent clamp to `arity - 1` (which would misattribute the failure
+                    // to a command that actually SUCCEEDED). All-or-nothing still holds:
+                    // the implicit transaction rolled back, so zero rows persisted.
+                    (Some(index), Some(db)) if index >= arity => Err(DriverError::Db(Box::new(db))),
+                    // A command-attributable failure: `index < arity` names the
+                    // zero-based failing command.
                     (Some(index), Some(db)) => Err(DriverError::BatchFailed {
                         index,
                         source: Box::new(db),
@@ -2177,61 +2205,59 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     }
 
     /// Reset all BLEEDABLE session state so this connection can be safely reused
-    /// by a different logical user, CLEARING the dynamic prepared-statement cache
-    /// (the manual clean-slate reset).
+    /// by a different logical user, CLEARING the dynamic prepared-statement cache.
     ///
-    /// Runs `DISCARD ALL` MINUS `DEALLOCATE ALL` / `DISCARD PLANS` in one
-    /// simple-query round trip (prefixed with `ROLLBACK` only when inside a
-    /// transaction, decided from the cached `ReadyForQuery` tx status so the
-    /// common idle path costs no extra round trip), then CLEARS the DYNAMIC
-    /// prepared-statement cache in ONE batched round trip (`Close`ing every cached
-    /// server-side statement), and clears the notification ledger and the N+1
-    /// recency window. The engine's compile-checked (TYPED) statement cache —
-    /// content-addressed COMPILE-TIME plans over PERMANENT migration objects that
-    /// cannot dangle — is deliberately KEPT (`DISCARD` excludes `DEALLOCATE ALL` /
-    /// `DISCARD PLANS`), so the typed flagship's server-side plan reuse survives.
+    /// Runs `DISCARD ALL` MINUS `DEALLOCATE ALL` in one simple-query round trip
+    /// (prefixed with `ROLLBACK` only when inside a transaction, decided from the
+    /// cached `ReadyForQuery` tx status so the common idle path costs no extra round
+    /// trip), then CLEARS the DYNAMIC prepared-statement cache in ONE batched round
+    /// trip (`Close`ing every cached server-side statement — `DISCARD` runs no
+    /// `DEALLOCATE`, so they otherwise survive), and clears the notification ledger
+    /// and the N+1 recency window. The engine's compile-checked (TYPED) statement
+    /// cache — content-addressed COMPILE-TIME plans over PERMANENT migration objects
+    /// that cannot dangle — is deliberately KEPT, so the typed flagship's
+    /// server-side plan reuse survives.
     ///
-    /// The POOL does NOT call this; it calls
-    /// [`pool_reset_session`](Self::pool_reset_session), which KEEPS the dynamic
-    /// cache warm (a measured pooled-throughput win — see there). This is the
-    /// explicit manual-reset primitive a DIRECT (non-pooled) consumer calls for a
-    /// full clean slate, dropping every cached dynamic plan.
+    /// This is the SINGLE reset used both by a DIRECT consumer (an explicit clean
+    /// slate) and by the POOL at checkout, so a pooled connection behaves EXACTLY
+    /// like a fresh one for the next logical user.
+    ///
+    /// # Why the DYNAMIC cache is DROPPED, not kept warm
+    ///
+    /// Dropping the dynamic cache on every reset is a CORRECTNESS requirement, not a
+    /// hygiene nicety. A dynamic `query_params` plan can resolve an UNQUALIFIED name
+    /// (against the search path) or reference a SESSION object, so a plan a prior
+    /// user PROMOTED (e.g. `SELECT … FROM orders …` bound to `public.orders`, driven
+    /// to a GENERIC plan) must NOT survive into the next user's checkout:
+    ///
+    /// - Keeping it warm lets a NEXT user who creates a shadowing `CREATE TEMP TABLE
+    ///   orders` (with `pg_temp` already active, so the search-path OID list is
+    ///   unchanged) receive the PRIOR user's `public.orders` rows — a silent
+    ///   cross-user wrong result (a tenant-boundary leak, verified live).
+    /// - `DISCARD PLANS` cannot fix this robustly: it INVALIDATES a kept plan ONCE at
+    ///   checkout, but PostgreSQL RE-VALIDATES an invalidated plan at its next use,
+    ///   resolving against whatever schema exists AT THAT MOMENT. Any reset or user
+    ///   statement that touches the catalog before the user's shadow exists
+    ///   re-validates the plan back to `public` (VERIFIED live: `DISCARD PLANS` placed
+    ///   before `DISCARD TEMP` is re-validated by the trailing reset statements and
+    ///   the wrong rows still come back), and a shadow created AFTER a re-validation
+    ///   is not seen. Only DROPPING the statement (a fresh `Parse` on next use, which
+    ///   resolves against the current user's schema, exactly as on a fresh
+    ///   connection) is airtight.
+    ///
+    /// The TYPED cache is KEPT because its plans reference only PERMANENT migration
+    /// objects (they cannot resolve to a session object), so the typed flagship's
+    /// server-side plan reuse is preserved. Witnessed by the `--ignored`
+    /// `pooled_dynamic_plan_re_resolves_a_temp_shadow_across_users` live test (both
+    /// drivers): a pooled plan a prior user promoted against a PERMANENT table
+    /// returns the next user's `TEMP TABLE` data after checkout, never the permanent
+    /// rows — because the dynamic cache is dropped and the query re-`Parse`s fresh.
     pub async fn reset_session(&mut self) -> Result<(), DriverError> {
-        self.reset_session_impl(true).await
+        self.reset_session_impl().await
     }
 
-    /// The POOL-checkout session reset: identical to
-    /// [`reset_session`](Self::reset_session) EXCEPT it KEEPS the dynamic
-    /// prepared-statement cache warm across the checkout.
-    ///
-    /// The `RESET ALL; … DISCARD TEMP; …` clears every BLEEDABLE item (GUCs, temp
-    /// objects, cursors, `LISTEN`s, advisory locks) exactly as the manual reset
-    /// does — but it does NOT `Close` the cached dynamic server-side statements,
-    /// which SURVIVE the reset (`RESET` runs no `DEALLOCATE`). Keeping the client
-    /// `DynStmtCache` in step with them lets a pooled connection reach cached-plan
-    /// reuse (`Bind`+`Execute`) instead of re-`Parse`ing every checkout — the SAME
-    /// treatment the engine's TYPED cache already gets, and a measured ~10% pooled
-    /// throughput gain on a dynamic-param workload (a checked-out connection whose
-    /// query is a cache HIT does no server-side re-parse/re-plan per op).
-    ///
-    /// SAFE across users (verified): a kept plan that referenced a session object
-    /// the reset's `DISCARD TEMP` dropped re-plans SERVER-SIDE on next use and, if
-    /// the object is gone, returns a CLASSIFIED error (never a wrong result — the
-    /// dynamic cache's existing self-heal), and a `search_path`-shifted reuse
-    /// re-resolves rather than hitting the wrong table (PostgreSQL invalidates a
-    /// plan on `search_path` change). A prepared statement carries a PLAN, never
-    /// data, so nothing bleeds across the two logical users.
-    pub async fn pool_reset_session(&mut self) -> Result<(), DriverError> {
-        self.reset_session_impl(false).await
-    }
-
-    /// The shared reset body: `clear_dyn_cache` selects whether the dynamic
-    /// prepared-statement cache is DROPPED (`true`, the manual clean-slate reset)
-    /// or KEPT warm (`false`, the pool checkout — see
-    /// [`pool_reset_session`](Self::pool_reset_session)). Everything else — the
-    /// reset SQL, the notification-ledger + N+1-window clear, and the oversize
-    /// send-buffer reclaim — is identical, so the two entry points cannot drift.
-    async fn reset_session_impl(&mut self, clear_dyn_cache: bool) -> Result<(), DriverError> {
+    /// The shared reset body (defined once so the reset semantics cannot drift).
+    async fn reset_session_impl(&mut self) -> Result<(), DriverError> {
         const RESET: &str = "SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; \
              UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
         const RESET_WITH_ROLLBACK: &str =
@@ -2248,14 +2274,19 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             RESET_WITH_ROLLBACK
         };
         self.simple_query(sql).await?;
-        // CLEAR the dynamic prepared-statement cache ONLY on the manual reset: a
-        // consumer asking for a clean slate must not reuse the prior plans. Close
-        // every READY server-side statement so nothing is orphaned (a protocol
-        // `Close` of an already-dropped statement is a wire no-op, so this is robust
-        // even after a mid-session `DISCARD`/`DEALLOCATE`). BATCHED into ONE round
-        // trip (N `Close` + one `Sync`). The POOL path skips this (keeps the cache
-        // warm — see `pool_reset_session`), which is where the pooled win comes from.
-        if clear_dyn_cache {
+        // CLEAR the dynamic prepared-statement cache: neither a manual clean slate nor
+        // a pool checkout may reuse the prior plans. `RESET`/`DISCARD` run no
+        // `DEALLOCATE`, so the server-side statements SURVIVE the reset SQL above —
+        // Close them explicitly here so nothing is orphaned (a protocol `Close` of an
+        // already-dropped statement is a wire no-op, so this is robust even after a
+        // mid-session `DISCARD`/`DEALLOCATE`), BATCHED into ONE round trip (N `Close`
+        // + one `Sync`). Dropping the cache — rather than keeping it warm across a
+        // pool checkout — is what makes a pooled connection re-`Parse` a runtime SQL
+        // fresh against the CURRENT user's schema, so a kept plan can never return a
+        // prior user's name resolution (see `pool_reset_session` for the temp-shadow
+        // reasoning). The engine's TYPED cache is KEPT (its plans reference only
+        // permanent migration objects).
+        {
             let stmts = self.dyn_cache.drain();
             if !stmts.is_empty() {
                 let names: Vec<&StmtName> = stmts.iter().map(|s| s.inner.stmt_name()).collect();

@@ -158,6 +158,112 @@ async fn pool_acquire_timeout_emits_and_counts() {
     drop(held);
 }
 
+/// THE CROSS-USER WRONG-RESULT REGRESSION (BLOCKER): the pool must DROP a
+/// connection's dynamic prepared-statement cache on checkout, so a pooled connection
+/// behaves exactly like a fresh one. User 1 PROMOTES a cached plan for an UNQUALIFIED
+/// name to a GENERIC plan bound to the PERMANENT `public.pl_shadow` (pg_temp
+/// pre-active, so a later shadow does not auto-invalidate it; looped past the
+/// custom→generic threshold). After returning to the pool, User 2 checks out the
+/// SAME connection (pool size 1) and creates a `TEMP TABLE pl_shadow` shadowing the
+/// name. The identical query MUST return User 2's TEMP data — NEVER the permanent
+/// table's rows. Because the pool DROPS the dynamic cache, User 2's query re-`Parse`s
+/// fresh against its own schema and resolves to the temp table. If the cache were
+/// kept warm (the reverted Lever-2 behavior), the kept generic plan would return the
+/// PERMANENT row — a tenant-boundary leak. (`DISCARD PLANS` was verified NOT to fix
+/// this robustly — it only invalidates once and PG re-validates the plan back to
+/// `public` before the shadow exists — so dropping the statement is the fix.)
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn pooled_dynamic_plan_re_resolves_a_temp_shadow_across_users() {
+    use bsql_postgres_async::Pool;
+
+    let cfg = ConnectConfig::new("/tmp", "smir-ant").database("postgres".to_string());
+
+    // A PERMANENT `public.pl_shadow` with a distinguishable row (User 1's expected).
+    {
+        let mut setup = Connection::connect(&cfg).await.expect("setup connect");
+        setup.execute_sql("DROP TABLE IF EXISTS public.pl_shadow").await.expect("drop");
+        setup
+            .execute_sql("CREATE TABLE public.pl_shadow (id int4 PRIMARY KEY, val text NOT NULL)")
+            .await
+            .expect("create permanent");
+        setup
+            .execute_sql("INSERT INTO public.pl_shadow (id, val) VALUES (1, 'PERMANENT')")
+            .await
+            .expect("seed permanent");
+        setup.close().await.expect("setup close");
+    }
+
+    // Pool size 1 → User 2 reuses the EXACT connection User 1 warmed.
+    let pool = Pool::new(cfg.clone(), 1);
+    const SQL: &str = "SELECT val FROM pl_shadow WHERE id = $1";
+
+    // User 1: promote the cached plan to a KEPT NAMED statement and drive PG to a
+    // GENERIC plan bound to `public.pl_shadow`. TWO reproduction conditions:
+    //   (1) pg_temp must be ALREADY active when the plan is built, so a later
+    //       shadowing temp table does NOT change the search-path OID list (which is
+    //       what would otherwise auto-invalidate the plan) — activate it up front;
+    //   (2) the named statement must execute enough times (PG uses custom plans for
+    //       the first 5 executions, then a cached GENERIC plan) so the KEPT plan is
+    //       the generic one that does NOT re-resolve — loop well past the threshold.
+    {
+        let mut g = pool.get().await.expect("user1 checkout");
+        let c = g.conn_mut().expect("user1 conn");
+        c.execute_sql("CREATE TEMP TABLE _pgtemp_activate (x int4)")
+            .await
+            .expect("activate pg_temp for the connection's lifetime");
+        for _ in 0..12 {
+            let row = c
+                .query_params_opt(SQL, &(1i32,))
+                .await
+                .expect("user1 query")
+                .expect("user1 row");
+            assert_eq!(
+                row.get_str(0).expect("decode"),
+                Some("PERMANENT"),
+                "user 1 reads the permanent table",
+            );
+        }
+        // Back to the pool. pg_temp stays registered for the connection's lifetime
+        // (DISCARD TEMP drops the objects, not the namespace). On checkout the pool
+        // DROPS the dynamic cache (Close every statement), so the kept generic plan
+        // does NOT survive into user 2.
+    }
+
+    // User 2: the SAME connection. Shadow the name with a TEMP table carrying
+    // DISTINCT data, then run the IDENTICAL query — a cache MISS (the pool dropped
+    // the cache), so it re-`Parse`s fresh against user 2's schema.
+    {
+        let mut g = pool.get().await.expect("user2 checkout");
+        let c = g.conn_mut().expect("user2 conn");
+        c.execute_sql("CREATE TEMP TABLE pl_shadow (id int4 PRIMARY KEY, val text NOT NULL)")
+            .await
+            .expect("user2 temp table");
+        c.execute_sql("INSERT INTO pl_shadow (id, val) VALUES (1, 'TEMP-USER-2')")
+            .await
+            .expect("user2 temp seed");
+
+        let row = c
+            .query_params_opt(SQL, &(1i32,))
+            .await
+            .expect("user2 query")
+            .expect("user2 row");
+        assert_eq!(
+            row.get_str(0).expect("decode"),
+            Some("TEMP-USER-2"),
+            "user 2 MUST read their OWN temp table's row — the pool dropped the dynamic cache so \
+             the query re-parsed fresh; reading 'PERMANENT' here is the silent cross-user wrong result",
+        );
+    }
+
+    // Cleanup the permanent table.
+    {
+        let mut cleanup = Connection::connect(&cfg).await.expect("cleanup connect");
+        cleanup.execute_sql("DROP TABLE IF EXISTS public.pl_shadow").await.expect("cleanup drop");
+        cleanup.close().await.expect("cleanup close");
+    }
+}
+
 /// WITNESS (C1d — slow-query detection): with a slow-query threshold set, a
 /// query whose round trip exceeds it emits `DiagEvent::SlowQuery` carrying the
 /// SQL TEXT (never the param values — no PII), while a fast query below the

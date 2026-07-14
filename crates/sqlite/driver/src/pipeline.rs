@@ -1,13 +1,25 @@
 //! Heterogeneous atomic pipelining — the SQLite SEQUENTIAL twin of the PostgreSQL
 //! `pipeline`.
 //!
-//! `conn.pipeline((UserById::bind((7,)), InsertLog::bind((msg,)), …))` runs N
+//! `conn.pipeline((UserById::bind((7,)), OrderById::bind((9,)), …))` runs N
 //! compile-checked `query!` commands SEQUENTIALLY inside ONE transaction, yielding
-//! the IDENTICAL typed tuple `(TypedRows<Q0>, TypedRows<Q1>, …)` and the IDENTICAL
-//! all-or-nothing contract as the PostgreSQL driver: a mid-batch failure rolls back
-//! the WHOLE transaction and returns ZERO results. SQLite is IN-PROCESS, so there
-//! is no round-trip win — the value is ONE mental model + atomicity on both
-//! backends (the `SyncBackend` write-once philosophy).
+//! the typed tuple `(TypedRows<Q0>, TypedRows<Q1>, …)` and the all-or-nothing
+//! contract: a mid-batch failure rolls back the WHOLE transaction and returns ZERO
+//! results. SQLite is IN-PROCESS, so there is no round-trip win — the value is ONE
+//! mental model + transaction atomicity across the batch.
+//!
+//! # SQLite typed pipelines are READ-ONLY under a conformance build
+//!
+//! The atomicity here is READ-consistency across the batch's SELECTs, NOT a
+//! write-batch guarantee. Under the blessed dual-target build (`sqlite` +
+//! `macros-sqlite`), the SQLite conformance oracle validates every typed `query!`
+//! under a READONLY authorizer, so a typed WRITE (`INSERT`/`UPDATE`/`DELETE`)
+//! carrier is REJECTED at its `query!` definition site — and SQLite exposes no
+//! typed `execute::<Q>` verb — so a SQLite pipeline element is always a SELECT.
+//! (The PostgreSQL `pipeline` DOES type writes, so its batch is genuinely a write
+//! batch; that is the one place the two backends' pipelines differ. A write-bearing
+//! example like `InsertLog::bind(..)` therefore belongs on the PostgreSQL side,
+//! not here.)
 //!
 //! # Why a parallel trait, not the PostgreSQL one
 //!
@@ -92,6 +104,12 @@ mod sealed {
 /// `(Bound<Q0>, Bound<Q1>, …)` of arity `1..=16`, mapping to
 /// [`Output`](Self::Output) `= (TypedRows<Q0>, TypedRows<Q1>, …)`. Run it via
 /// [`Connection::pipeline`](crate::Connection::pipeline). Sealed.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a SQLite `pipeline` batch",
+    label = "expected a tuple of `1..=16` bound `query!` commands, e.g. `(UserById::bind((7,)), OrderById::bind((9,)))`",
+    note = "each element must be a `Bound<Q>` — build one with `Q::bind(params)` (the `BindExt` ext trait over every SQLite `query!` carrier); a SINGLE command needs a trailing comma: `(cmd,)`, not `(cmd)`",
+    note = "`SqlitePipeline` is sealed — only the crate-internal tuple impls (arity 1..=16) of `Bound`s qualify; a downstream `impl SqlitePipeline for ...` is forbidden by construction"
+)]
 pub trait SqlitePipeline<'p>: sealed::Sealed {
     /// The result tuple — one [`TypedRows<Qi>`](crate::TypedRows) per command.
     type Output;

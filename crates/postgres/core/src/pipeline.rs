@@ -112,6 +112,12 @@ mod sealed {
 /// Sealed (see [`Core::pipeline`](crate::Core::pipeline) for the airtight
 /// all-or-nothing contract). The two `#[doc(hidden)]` methods are the driver-facing
 /// staging + finishing seam a consumer never names.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a `pipeline` batch",
+    label = "expected a tuple of `1..=16` bound `query!` commands, e.g. `(UserById::bind((7,)), InsertLog::bind((msg,)))`",
+    note = "each element must be a `Bound<Q>` — build one with `Q::bind(params)` (the `BindExt` ext trait over every `query!` carrier); a SINGLE command needs a trailing comma: `(cmd,)`, not `(cmd)`",
+    note = "`Pipeline` is sealed — only the crate-internal tuple impls (arity 1..=16) of `Bound`s qualify; a downstream `impl Pipeline for ...` is forbidden by construction"
+)]
 pub trait Pipeline<'p>: sealed::Sealed {
     /// The result tuple — one [`Rows<Qi>`](crate::Rows) per command, in order.
     type Output;

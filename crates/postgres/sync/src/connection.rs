@@ -1278,39 +1278,33 @@ impl Connection {
     /// Any transport / server error is returned classified; a pool evicts a
     /// connection whose reset failed rather than handing out a still-dirty one.
     pub fn reset_session(&mut self) -> Result<(), DriverError> {
-        // The manual reset CLEARS the dynamic prepared-statement cache (clean slate).
-        self.reset_session_bounded(true)
+        self.reset_session_bounded()
     }
 
-    /// The POOL-checkout reset: KEEPS the dynamic prepared-statement cache warm
-    /// across the checkout (a measured pooled-throughput win — see
-    /// [`Core::pool_reset_session`](bsql_postgres_core)). Bounded identically to
-    /// [`reset_session`](Self::reset_session).
+    /// The POOL-checkout reset: behaviourally IDENTICAL to
+    /// [`reset_session`](Self::reset_session) (both drop the dynamic
+    /// prepared-statement cache, so a pooled connection behaves exactly like a fresh
+    /// one for the next logical user). A distinct `pub(crate)` entry so the pool has
+    /// a named checkout hook; bounded identically.
     pub(crate) fn pool_reset_session(&mut self) -> Result<(), DriverError> {
-        self.reset_session_bounded(false)
+        self.reset_session_bounded()
     }
 
     /// The shared, bounded reset wrapper: arms the connect-budget read+write ceiling
     /// around the reset and restores the steady I/O contract afterward.
-    /// `clear_dyn_cache` selects the manual clean-slate reset (`true`) or the
-    /// cache-warm pool reset (`false`).
-    fn reset_session_bounded(&mut self, clear_dyn_cache: bool) -> Result<(), DriverError> {
+    fn reset_session_bounded(&mut self) -> Result<(), DriverError> {
         // Arm the bounded read+write timeout BEFORE the inner verb takes the token,
         // so a failed `set_*_timeout` syscall returns Err with the token still live
         // — never stranding it and bricking a connection nothing touched on the
         // wire. No socket (testkit) → nothing to arm; the wait is vacuous. The
-        // WHOLE reset sequence (the RESET simple-query plus, on the manual path, the
-        // batched dynamic-statement Close) runs under this per-read/write ceiling.
+        // WHOLE reset sequence (the RESET simple-query plus the batched
+        // dynamic-statement Close) runs under this per-read/write ceiling.
         let budget = Duration::from_secs(self.redial.connect_timeout_secs());
         if let Some(ctl) = &self.socket_ctl {
             ctl.set_read_timeout(Some(budget)).map_err(DriverError::Io)?;
             ctl.set_write_timeout(Some(budget)).map_err(DriverError::Io)?;
         }
-        let result = if clear_dyn_cache {
-            drive_sync(engine::poll_once(self.core.reset_session()))
-        } else {
-            drive_sync(engine::poll_once(self.core.pool_reset_session()))
-        };
+        let result = drive_sync(engine::poll_once(self.core.reset_session()));
         // `RESET ALL` restored `statement_timeout` to its connect-time value, so
         // the client-liveness window returns to the connect BASELINE — a runtime
         // `SET` made on this checkout does not leak its (possibly larger/disarmed)

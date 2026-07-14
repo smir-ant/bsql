@@ -196,7 +196,12 @@ fn stage_prelude<E>(
     active: &mut ActiveEngine,
     send_buf: &mut SendBuf,
 ) -> Result<(), EngineError<E>> {
-    if let Some(sql) = active.take_pending_prelude() {
+    // PEEK, don't consume: the prelude stays armed until its reply is DRAINED. If a
+    // LATER command's staging overflows (`FrameTooLong`) after this frame is
+    // enqueued, `abort_pipeline_staging` discards the buffer but leaves
+    // `pending_prelude` set, so the next verb re-fuses the deferred `BEGIN` — never
+    // a lost transaction. A successful drain clears it (`finish_prelude`).
+    if let Some(sql) = active.pending_prelude() {
         core::hint::cold_path();
         enqueue_frame(send_buf, |wb| frames::build_simple_query(wb, sql.as_bytes()))?;
         active.arm_prelude();

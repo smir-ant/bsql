@@ -44,6 +44,10 @@ bsql::query!(
 );
 bsql::query!(PlSelAccount, "SELECT id FROM accounts WHERE id = $1");
 bsql::query!(PlSleep, "SELECT 1::int4 AS n WHERE pg_sleep(3) IS NOT NULL");
+bsql::query!(
+    PlDeferIns,
+    "INSERT INTO pl_deferred (id, tag) VALUES ($1, $2) RETURNING id"
+);
 
 fn cfg() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -168,6 +172,70 @@ async fn batch_failed_index_accessor_names_the_command() {
         .expect_err("batch fails");
     assert_eq!(err.batch_failed_index(), Some(2), "the third command failed");
     assert!(!account_exists(&mut c, id).await, "all rolled back");
+    c.close().await.expect("close");
+}
+
+/// COMMIT-TIME failure (regression for the out-of-range `failed_index == arity`
+/// bug): both commands SUCCEED at Execute, then the implicit COMMIT at the trailing
+/// `Sync` fails a `DEFERRABLE INITIALLY DEFERRED UNIQUE` constraint. The failure is
+/// attributable to NO single command, so `batch_failed_index()` is `None` and the
+/// error is a batch-level `Db` (SQLSTATE `23505`), NEVER a `BatchFailed { index: 2 }`
+/// that would name a nonexistent command (a consumer indexing an N-array by it would
+/// panic). All-or-nothing still holds: zero rows persisted.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn commit_time_deferred_constraint_failure_is_honest_not_out_of_range_index() {
+    let mut c = Connection::connect(&cfg()).await.expect("connect");
+    // Recreate the deferred-constraint table fresh (the deferrable UNIQUE is a
+    // runtime property; the migration only feeds the carrier's catalog columns).
+    c.execute_sql("DROP TABLE IF EXISTS pl_deferred").await.expect("drop");
+    c.execute_sql(
+        "CREATE TABLE pl_deferred (id INTEGER PRIMARY KEY, tag INTEGER NOT NULL, \
+         CONSTRAINT pl_deferred_tag_uniq UNIQUE (tag) DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .await
+    .expect("create pl_deferred");
+
+    // Two commands, DISTINCT ids (no PK clash at Execute) but the SAME tag: both
+    // Execute succeed (the UNIQUE check is deferred), then the implicit COMMIT at
+    // the batch's single trailing Sync fires the deferred check → 23505 at commit.
+    let result = c
+        .pipeline((PlDeferInsQuery::bind((1, 77)), PlDeferInsQuery::bind((2, 77))))
+        .await;
+
+    match result {
+        // Commit-time: a batch-level `Db`, NOT `BatchFailed`.
+        Err(DriverError::Db(ref e)) => {
+            assert_eq!(e.code(), "23505", "the deferred UNIQUE fired at commit: {e:?}");
+        }
+        Err(DriverError::BatchFailed { index, .. }) => panic!(
+            "a commit-time failure must NOT be BatchFailed (it named a nonexistent command #{index})",
+        ),
+        other => panic!("expected a commit-time Db(23505), got {other:?}"),
+    }
+    let err = result.expect_err("the batch failed at commit");
+    assert_eq!(
+        err.batch_failed_index(),
+        None,
+        "a commit-time failure is attributable to no command → batch_failed_index() is None",
+    );
+    // A commit failure leaves the connection drained + reusable (not a disconnect).
+    assert!(!err.is_disconnect(), "a 23505 is a per-query error, not a disconnect");
+
+    // ALL-OR-NOTHING: the whole implicit transaction rolled back — zero rows.
+    let count = c
+        .query_one_sql("SELECT count(*)::int8 AS n FROM pl_deferred")
+        .await
+        .expect("count");
+    assert_eq!(
+        count.get_i64(0).expect("decode").unwrap_or(-1),
+        0,
+        "the commit-time failure rolled the whole batch back — zero rows persisted",
+    );
+
+    // The connection survived the recoverable failure.
+    let seven = c.query_one::<PlSevenQuery>(()).await.expect("reuse after commit failure");
+    assert_eq!(seven.n, 7);
     c.close().await.expect("close");
 }
 

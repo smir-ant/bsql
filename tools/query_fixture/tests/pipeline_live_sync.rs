@@ -29,6 +29,10 @@ bsql::query!(
 );
 bsql::query!(PlSelAccountS, "SELECT id FROM accounts WHERE id = $1");
 bsql::query!(PlSleepS, "SELECT 1::int4 AS n WHERE pg_sleep(3) IS NOT NULL");
+bsql::query!(
+    PlDeferInsS,
+    "INSERT INTO pl_deferred (id, tag) VALUES ($1, $2) RETURNING id"
+);
 
 fn cfg() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -114,6 +118,52 @@ fn batch_failed_index_accessor_names_the_command() {
         .expect_err("batch fails");
     assert_eq!(err.batch_failed_index(), Some(2), "the third command failed");
     assert!(!account_exists(&mut c, id), "all rolled back");
+    c.close().expect("close");
+}
+
+/// COMMIT-TIME failure (regression for `failed_index == arity`): both commands
+/// succeed at Execute, then the implicit COMMIT fails a `DEFERRABLE INITIALLY
+/// DEFERRED UNIQUE` — a batch-level `Db(23505)`, `batch_failed_index()` is `None`,
+/// NEVER `BatchFailed { index: 2 }`; zero rows persisted (all-or-nothing).
+#[test]
+#[ignore = "requires local PG"]
+fn commit_time_deferred_constraint_failure_is_honest_not_out_of_range_index() {
+    let mut c = Connection::connect(&cfg()).expect("connect");
+    c.execute_sql("DROP TABLE IF EXISTS pl_deferred").expect("drop");
+    c.execute_sql(
+        "CREATE TABLE pl_deferred (id INTEGER PRIMARY KEY, tag INTEGER NOT NULL, \
+         CONSTRAINT pl_deferred_tag_uniq UNIQUE (tag) DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .expect("create pl_deferred");
+
+    let result = c.pipeline((PlDeferInsSQuery::bind((1, 77)), PlDeferInsSQuery::bind((2, 77))));
+
+    match result {
+        Err(DriverError::Db(ref e)) => {
+            assert_eq!(e.code(), "23505", "the deferred UNIQUE fired at commit: {e:?}");
+        }
+        Err(DriverError::BatchFailed { index, .. }) => panic!(
+            "a commit-time failure must NOT be BatchFailed (it named a nonexistent command #{index})",
+        ),
+        other => panic!("expected a commit-time Db(23505), got {other:?}"),
+    }
+    let err = result.expect_err("the batch failed at commit");
+    assert_eq!(
+        err.batch_failed_index(),
+        None,
+        "a commit-time failure is attributable to no command → batch_failed_index() is None",
+    );
+    assert!(!err.is_disconnect(), "a 23505 is a per-query error, not a disconnect");
+
+    let count = c
+        .query_one_sql("SELECT count(*)::int8 AS n FROM pl_deferred")
+        .expect("count");
+    assert_eq!(
+        count.get_i64(0).expect("decode").unwrap_or(-1),
+        0,
+        "the commit-time failure rolled the whole batch back — zero rows persisted",
+    );
+    assert_eq!(c.query_one::<PlSevenSQuery>(()).expect("reuse after commit failure").n, 7);
     c.close().expect("close");
 }
 

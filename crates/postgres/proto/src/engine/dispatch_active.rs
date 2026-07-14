@@ -451,10 +451,15 @@ pub struct ActiveEngine {
     /// flush — today ONLY a deferred transaction `BEGIN`, fused with the
     /// transaction's first statement (a row-bearing prelude such as a pool RESET
     /// is a deferred capability the drain does not yet handle — see
-    /// [`step_prelude`](Self::step_prelude)). `None` in steady state. Taken by the
-    /// first request verb that runs, which enqueues the prelude's `'Q'` frame ahead
-    /// of its own and then [`arm_prelude`](Self::arm_prelude)s the drain. The
-    /// `'static` SQL is a bare `&str` into `.rodata`, never an owned allocation.
+    /// [`step_prelude`](Self::step_prelude)). `None` in steady state. PEEKED (not
+    /// consumed) by the first request verb that runs, which enqueues the prelude's
+    /// `'Q'` frame ahead of its own and then [`arm_prelude`](Self::arm_prelude)s the
+    /// drain; it stays armed until the prelude's reply is DRAINED (cleared in
+    /// [`finish_prelude`](Self::finish_prelude) / [`prelude_teardown`](Self::prelude_teardown)),
+    /// so an [`abort_pipeline_staging`](Self::abort_pipeline_staging) that discards
+    /// an already-enqueued prelude frame (a later command overflowed pre-flush)
+    /// leaves it still pending for the next verb to re-fuse — never a lost `BEGIN`.
+    /// The `'static` SQL is a bare `&str` into `.rodata`, never an owned allocation.
     ///
     /// Off the hot path: read only at a verb's send-path entry (never inside
     /// `next_event`/`drive`), so its footprint cost is an offset shift with no
@@ -711,13 +716,24 @@ impl ActiveEngine {
         self.pending_prelude = Some(sql);
     }
 
-    /// Take the pending fused-prelude SQL, if any — the request verb enqueues its
+    /// PEEK the pending fused-prelude SQL, if any — the request verb enqueues its
     /// `'Q'` frame ahead of its own command frames, then
     /// [`arm_prelude`](Self::arm_prelude)s the drain.
+    ///
+    /// This does NOT consume `pending_prelude`: the SQL stays armed until the
+    /// prelude's reply is actually DRAINED (cleared by [`finish_prelude`](Self::finish_prelude)
+    /// / [`prelude_teardown`](Self::prelude_teardown)). Keeping it armed across the
+    /// send is what lets [`abort_pipeline_staging`](Self::abort_pipeline_staging)
+    /// PRESERVE a deferred `BEGIN` when a later command's staging overflows
+    /// (`FrameTooLong`) after this prelude was already enqueued: the discarded frame
+    /// leaves the prelude still pending, so the next verb re-fuses it — never a
+    /// silent transaction escape into autocommit. A consumed-then-lost prelude,
+    /// with the guard's `begin_armed` still `true`, would run the next in-guard
+    /// statement WITHOUT the `BEGIN`.
     #[inline]
     #[must_use]
-    pub fn take_pending_prelude(&mut self) -> Option<&'static str> {
-        self.pending_prelude.take()
+    pub fn pending_prelude(&self) -> Option<&'static str> {
+        self.pending_prelude
     }
 
     /// Arm the prelude DRAIN: the next inbound frames drain the prelude's
@@ -906,11 +922,22 @@ impl ActiveEngine {
     /// connection is healthy — this discards that half-seated state so the NEXT verb
     /// starts from `Idle`. No I/O and no token (staging never took one). The send
     /// buffer is reset by the caller ([`Engine`](super::Engine)) alongside this.
+    ///
+    /// PRESERVES a deferred prelude. If this batch was a transaction guard's FIRST
+    /// statement, staging PEEKED (did not consume) the deferred `BEGIN` and enqueued
+    /// its frame into the (now-discarded) send buffer — leaving `pending_prelude`
+    /// still `Some` and `prelude_active` `true`. Clearing `prelude_active` is
+    /// correct (the enqueued frame is gone, so there is no reply to drain), but
+    /// `pending_prelude` MUST survive: the guard's `begin_armed` stays `true`, so no
+    /// later verb re-defers the `BEGIN`, and the next in-guard statement's
+    /// `stage_prelude` re-fuses THIS still-pending `BEGIN`. Nulling it here would
+    /// run that statement in AUTOCOMMIT — a silent transaction escape (the write
+    /// could not be rolled back; guard-exit `COMMIT`/`ROLLBACK` would hit a
+    /// nonexistent transaction). So `pending_prelude` is left untouched.
     #[inline]
     pub fn abort_pipeline_staging(&mut self) {
         self.pipelining = false;
         self.reset_columns();
-        self.pending_prelude = None;
         self.prelude_active = false;
         self.state = ActiveState::Idle;
     }
@@ -2026,6 +2053,10 @@ impl ActiveEngine {
                 Ok(tx) => {
                     self.tx_status = tx;
                     self.prelude_active = false;
+                    // The prelude was SENT and its reply is now fully drained, so it
+                    // is genuinely consumed — clear it so the NEXT verb does not
+                    // re-enqueue it (a `pending_prelude` PEEKED, not taken, at stage).
+                    self.pending_prelude = None;
                     ActiveOutcome::Idle
                 }
                 Err(_) => self.prelude_teardown(),
@@ -2039,6 +2070,9 @@ impl ActiveEngine {
     /// [`EngineError::ProtocolViolation`](super::EngineError::ProtocolViolation)).
     fn prelude_teardown(&mut self) -> ActiveOutcome {
         self.prelude_active = false;
+        // The prelude was sent; on this fatal teardown the connection dies (the
+        // token drops), so clearing is for consistency, not reuse.
+        self.pending_prelude = None;
         self.state = ActiveState::Failed;
         ActiveOutcome::Close
     }
@@ -2271,7 +2305,18 @@ impl ActiveEngine {
             | ActiveState::AwaitingRfq
             | ActiveState::CopyOutAwaitingCc
             | ActiveState::CopyInActive => Some(ActiveState::AwaitingRfq),
-            ActiveState::BindAwaitingData => Some(ActiveState::ExtendedAwaitingRfq),
+            // Mirror the in-buffer `complete_bind_command`: a PIPELINED command's
+            // `CommandComplete` routes to `PipelineAwaitingNextOrRfq` (await the next
+            // command's leading ack or the batch RFQ), a SERIAL one to
+            // `ExtendedAwaitingRfq` (one Sync closes one command). Structurally
+            // unreachable today (a `CommandComplete` tag is far below `READ_BUF_CAP`,
+            // so it never takes the oversize path), but kept consistent so the
+            // oversize completion can never diverge from the in-buffer transition.
+            ActiveState::BindAwaitingData => Some(if self.pipelining {
+                ActiveState::PipelineAwaitingNextOrRfq
+            } else {
+                ActiveState::ExtendedAwaitingRfq
+            }),
             ActiveState::CopyOut
             | ActiveState::DrainAfterError
             // In the overcap drain an in-buffer `CommandComplete` is swallowed by

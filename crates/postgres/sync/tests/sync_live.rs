@@ -163,6 +163,77 @@ fn pool_acquire_timeout_emits_and_counts() {
     drop(held);
 }
 
+/// THE CROSS-USER WRONG-RESULT REGRESSION (BLOCKER, sync twin): a pooled connection
+/// keeps its dynamic prepared-statement cache warm across a checkout. User 1
+/// PROMOTES a cached plan for an UNQUALIFIED name against PERMANENT
+/// `public.pl_shadow`; User 2 reuses the SAME connection (pool size 1) and creates a
+/// `TEMP TABLE pl_shadow` shadowing it. The identical query MUST return User 2's
+/// TEMP data — never the permanent row. The reset's `DISCARD PLANS` forces the kept
+/// plan to re-resolve. See the async twin for the full narrative.
+#[test]
+#[ignore = "requires local PG"]
+fn pooled_dynamic_plan_re_resolves_a_temp_shadow_across_users() {
+    use bsql_postgres_sync::Pool;
+
+    let cfg = sync_config();
+
+    {
+        let mut setup = Connection::connect(&cfg).expect("setup connect");
+        setup.execute_sql("DROP TABLE IF EXISTS public.pl_shadow").expect("drop");
+        setup
+            .execute_sql("CREATE TABLE public.pl_shadow (id int4 PRIMARY KEY, val text NOT NULL)")
+            .expect("create permanent");
+        setup
+            .execute_sql("INSERT INTO public.pl_shadow (id, val) VALUES (1, 'PERMANENT')")
+            .expect("seed permanent");
+        setup.close().expect("setup close");
+    }
+
+    let pool = Pool::new(cfg.clone(), 1);
+    const SQL: &str = "SELECT val FROM pl_shadow WHERE id = $1";
+
+    // User 1: pre-activate pg_temp, then drive PG to a GENERIC plan bound to public
+    // (see the async twin for the two reproduction conditions).
+    {
+        let mut g = pool.get().expect("user1 checkout");
+        let c = g.conn_mut().expect("user1 conn");
+        c.execute_sql("CREATE TEMP TABLE _pgtemp_activate (x int4)")
+            .expect("activate pg_temp for the connection's lifetime");
+        for _ in 0..12 {
+            let row = c
+                .query_params_opt(SQL, &(1i32,))
+                .expect("user1 query")
+                .expect("user1 row");
+            assert_eq!(row.get_str(0).expect("decode").unwrap_or(""), "PERMANENT");
+        }
+    }
+
+    // User 2: the SAME connection — shadow the name and re-run the cached query.
+    {
+        let mut g = pool.get().expect("user2 checkout");
+        let c = g.conn_mut().expect("user2 conn");
+        c.execute_sql("CREATE TEMP TABLE pl_shadow (id int4 PRIMARY KEY, val text NOT NULL)")
+            .expect("user2 temp table");
+        c.execute_sql("INSERT INTO pl_shadow (id, val) VALUES (1, 'TEMP-USER-2')")
+            .expect("user2 temp seed");
+        let row = c
+            .query_params_opt(SQL, &(1i32,))
+            .expect("user2 query")
+            .expect("user2 row");
+        assert_eq!(
+            row.get_str(0).expect("decode").unwrap_or(""),
+            "TEMP-USER-2",
+            "user 2 MUST read their OWN temp table — reading 'PERMANENT' is the cross-user leak",
+        );
+    }
+
+    {
+        let mut cleanup = Connection::connect(&cfg).expect("cleanup connect");
+        cleanup.execute_sql("DROP TABLE IF EXISTS public.pl_shadow").expect("cleanup drop");
+        cleanup.close().expect("cleanup close");
+    }
+}
+
 /// WITNESS (C1d — slow-query detection, blocking twin): with a threshold set, a
 /// slow query emits `DiagEvent::SlowQuery` with the SQL text; a fast one emits
 /// nothing.

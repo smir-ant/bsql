@@ -204,6 +204,58 @@ fn drive(engine: &mut ActiveEngine, transport: &mut ScriptReader) -> (Boundary, 
 }
 
 #[test]
+fn abort_pipeline_staging_preserves_a_consumed_deferred_prelude() {
+    // A pipeline that is a transaction guard's FIRST statement: the guard armed a
+    // deferred `BEGIN` prelude, then staging the first command PEEKED it into the
+    // (bounded, growable) send buffer and armed its drain, then a LATER command's
+    // `Bind` overflowed the u32 frame length (`FrameTooLong`) BEFORE any flush.
+    //
+    // Reproduce that exact state through the SAME public seam the staging path uses:
+    // `set_pending_prelude` (the guard's `defer_begin`), then the staging effects
+    // `arm_prelude` (the drain armed after the `BEGIN` frame was enqueued) +
+    // `begin_pipeline` (the first command seated). The prelude is PEEKED, so it is
+    // still armed after staging.
+    let mut engine = active();
+    engine.set_pending_prelude("BEGIN");
+    assert_eq!(
+        engine.pending_prelude(),
+        Some("BEGIN"),
+        "staging PEEKS the prelude — it stays armed while its frame is enqueued",
+    );
+    engine.arm_prelude();
+    engine.begin_pipeline();
+    assert!(engine.draining_prelude(), "the enqueued prelude's drain is armed");
+
+    // The later command overflowed → the driver aborts the partial staging.
+    engine.abort_pipeline_staging();
+
+    // THE FIX: the deferred `BEGIN` SURVIVES the abort. The discarded send buffer
+    // dropped its enqueued frame, but the prelude is still PENDING, so the guard's
+    // next in-guard statement re-fuses it — never a silent autocommit. WITHOUT this
+    // (the pre-fix `abort` nulled `pending_prelude`), `begin_armed` on the guard
+    // would stay `true` with NO prelude pending → the next write runs in autocommit.
+    assert_eq!(
+        engine.pending_prelude(),
+        Some("BEGIN"),
+        "abort MUST preserve a consumed-but-unflushed deferred BEGIN",
+    );
+    // The discarded frame has no reply owed, so its drain is cleared, and pipeline
+    // mode is off — the next verb starts clean.
+    assert!(!engine.draining_prelude(), "the discarded frame's drain is cleared");
+
+    // Control: a pipeline abort with NO armed prelude leaves nothing pending (the
+    // preserve is gated on a prelude actually having been consumed).
+    let mut plain = active();
+    plain.begin_pipeline();
+    plain.abort_pipeline_staging();
+    assert_eq!(
+        plain.pending_prelude(),
+        None,
+        "no prelude armed → abort leaves nothing pending",
+    );
+}
+
+#[test]
 fn n_hit_commands_under_one_sync_surface_n_rows_n_delivers_then_idle() {
     for n in 1..=6usize {
         let mut engine = active();

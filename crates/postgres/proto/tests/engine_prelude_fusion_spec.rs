@@ -283,6 +283,66 @@ fn deferred_begin_fuses_into_first_statement_one_flush() {
     .expect("session");
 }
 
+/// A deferred `BEGIN` armed ONCE is consumed EXACTLY once: it fuses into the FIRST
+/// verb, and the SECOND verb flushes only ITSELF (no re-sent `BEGIN`). This pins
+/// the "peek, then clear at drain" contract — staging PEEKS `pending_prelude` (so
+/// an abort can restore it), and the prelude's own `ReadyForQuery` drain clears it,
+/// so a healthy first verb does not leave a stale `BEGIN` that the next verb would
+/// wrongly re-prepend (a double `BEGIN`).
+#[test]
+fn a_deferred_begin_armed_once_fuses_only_into_the_first_verb() {
+    let inbound = concat(&[
+        handshake(),
+        // Verb 1: fused BEGIN + SELECT 1.
+        command_complete("BEGIN"),
+        rfq(b'T'),
+        row_description_one("?column?", 23),
+        data_row_one(b"1"),
+        command_complete("SELECT 1"),
+        rfq(b'T'),
+        // Verb 2: SELECT 2 ONLY — no BEGIN reply, because no BEGIN should be re-sent.
+        row_description_one("?column?", 23),
+        data_row_one(b"2"),
+        command_complete("SELECT 1"),
+        rfq(b'T'),
+    ]);
+
+    let (server, writes) = counting_server(inbound);
+    let user = Ident::try_from_str("bsql_fusion").expect("user");
+    session(server, &user, None, &[], Credentials::Trust, |mut engine, live| {
+        let live = poll_once(engine.connect(live))
+            .expect("single poll")
+            .expect("handshake");
+        writes.lock().expect("writes lock").clear();
+
+        // Arm the deferred BEGIN, then run the FIRST verb (fuses BEGIN + SELECT 1).
+        engine.defer_command_prelude("BEGIN");
+        let first = poll_once(engine.query(live, "SELECT 1", |_s: Surface<'_>| ControlFlow::Continue(())))
+            .expect("single poll")
+            .expect("first fused query");
+        let live = first.live;
+        // The transaction is open; the prelude was consumed.
+        assert_eq!(engine.tx_status().expect("active"), TxStatus::InTransaction);
+
+        // Only the SECOND verb's flush is the subject now.
+        writes.lock().expect("writes lock").clear();
+        drop(poll_once(engine.query(live, "SELECT 2", |_s: Surface<'_>| ControlFlow::Continue(())))
+            .expect("single poll")
+            .expect("second query"));
+
+        // The SECOND verb flushes ONLY itself — the BEGIN was consumed exactly once,
+        // never re-prepended (a stale peeked prelude would double the BEGIN).
+        let log = writes.lock().expect("writes lock");
+        assert_eq!(log.len(), 1, "second verb: one flush");
+        assert_eq!(
+            &log[0],
+            &simple_query_frame("SELECT 2"),
+            "the second verb flushes ONLY its own frame — the armed BEGIN was cleared at the first verb's drain, never re-sent",
+        );
+    })
+    .expect("session");
+}
+
 /// Without arming a prelude, a statement flushes ONLY itself (the control: the
 /// fusion is opt-in, and a normal verb's single-flush wire is unchanged).
 #[test]

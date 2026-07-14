@@ -450,17 +450,25 @@ pub enum DriverError {
         /// Number of parameters the caller's tuple supplied.
         found: usize,
     },
-    /// A HETEROGENEOUS pipeline (`pipeline((...))`) failed at a specific command.
+    /// A HETEROGENEOUS pipeline (`pipeline((...))`) failed at a SPECIFIC command.
     ///
     /// The N commands of a pipeline are sent with ONE trailing `Sync`, so they form
     /// a SINGLE implicit transaction: on a mid-batch error the commands BEFORE the
     /// failure are ROLLED BACK, the failing one errors, and the ones AFTER are
     /// SKIPPED — the whole batch produces ZERO results (all-or-nothing). This is the
-    /// classified failure a `pipeline` returns: it names the ZERO-BASED [`index`]
-    /// of the failing command within the batch tuple, plus the boxed server
-    /// [`DbError`] cause (the SAME classified SQLSTATE + message a [`Db`](Self::Db)
-    /// error carries, so `is_disconnect` / SQLSTATE inspection work identically).
-    /// Read the index via [`batch_failed_index`](Self::batch_failed_index).
+    /// classified failure a `pipeline` returns for a COMMAND-ATTRIBUTABLE error: it
+    /// names the ZERO-BASED [`index`] of the failing command within the batch tuple,
+    /// plus the boxed server [`DbError`] cause (the SAME classified SQLSTATE +
+    /// message a [`Db`](Self::Db) error carries, so `is_disconnect` / SQLSTATE
+    /// inspection work identically). Read the index via
+    /// [`batch_failed_index`](Self::batch_failed_index).
+    ///
+    /// The [`index`] is ALWAYS a valid tuple position (`0 <= index < arity`). A
+    /// COMMIT-TIME failure — every command succeeded at Execute and the implicit
+    /// COMMIT at the trailing `Sync` failed (a `DEFERRABLE INITIALLY DEFERRED`
+    /// constraint, a serialization failure) — is NOT attributable to one command,
+    /// so it is returned as [`Db`](Self::Db) (and `batch_failed_index` is `None`),
+    /// never a `BatchFailed` with an out-of-range `index == arity`.
     ///
     /// A `usize` index (8 B) + a `Box<DbError>` (8 B — the 104 B `DbError` lives
     /// off-heap) = 16 B, the SAME width as the enum's existing widest payloads, so
@@ -592,12 +600,24 @@ impl DriverError {
     }
 
     /// The ZERO-BASED index of the command that failed within a
-    /// [`pipeline`](crate::Core::pipeline) batch, or `None` for any other error.
+    /// [`pipeline`](crate::Core::pipeline) batch, or `None` when the error is not
+    /// attributable to one command.
     ///
-    /// A pipeline's N commands form one implicit transaction, so on a mid-batch
-    /// error the WHOLE batch produced zero results (all-or-nothing); this names
-    /// WHICH command errored so a consumer can report / handle it without matching
-    /// the [`BatchFailed`](Self::BatchFailed) variant directly.
+    /// A pipeline's N commands form one implicit transaction, so ANY failure means
+    /// the WHOLE batch produced zero results (all-or-nothing). The failure is one
+    /// of two kinds:
+    ///
+    /// - a COMMAND-ATTRIBUTABLE failure (a `Bind`/`Execute` error on command `i`) →
+    ///   `Some(i)` with `i < arity` (`i` is always a valid index into the batch
+    ///   tuple), carried as [`BatchFailed`](Self::BatchFailed);
+    /// - a COMMIT-TIME failure (every command succeeded at Execute, then the
+    ///   trailing `Sync`'s implicit COMMIT failed — a `DEFERRABLE INITIALLY
+    ///   DEFERRED` constraint, a SERIALIZABLE serialization failure) → `None`,
+    ///   because no single command is at fault; it is carried as [`Db`](Self::Db)
+    ///   (the classified server cause is the `DbError` payload). This is never a
+    ///   fabricated out-of-range `Some(arity)`.
+    ///
+    /// `None` for every other error, too (a `Db`, a transport error, etc.).
     #[must_use]
     pub fn batch_failed_index(&self) -> Option<usize> {
         match self {

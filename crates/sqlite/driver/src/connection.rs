@@ -1070,12 +1070,19 @@ impl Connection {
     /// command. The SQLite twin of the PostgreSQL `pipeline`.
     ///
     /// SQLite is IN-PROCESS, so there is no round-trip win (the value is one mental
-    /// model + atomicity on both backends). The all-or-nothing contract holds
-    /// STRUCTURALLY: the batch runs inside
+    /// model + transaction atomicity across the batch). The all-or-nothing contract
+    /// holds STRUCTURALLY: the batch runs inside
     /// [`transaction`](Self::transaction), so a mid-batch failure short-circuits into
     /// the guard's ROLLBACK — the WHOLE transaction is undone and the `Ok` tuple is
     /// built only when every command succeeded and the transaction COMMITTED. A
     /// failure is the FIRST command's classified [`SqliteError`].
+    ///
+    /// READ-ONLY under a conformance build: with `macros-sqlite` on, a typed WRITE
+    /// `query!` is rejected at its definition site (the SQLite conformance oracle's
+    /// readonly authorizer), and SQLite has no typed `execute::<Q>`, so every
+    /// element is a SELECT — the atomicity is read-consistency across the batch, not
+    /// a write-batch guarantee. (A write batch is a PostgreSQL-only capability; PG
+    /// types write `query!`s.)
     ///
     /// # Errors
     ///
