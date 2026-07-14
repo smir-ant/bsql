@@ -54,7 +54,7 @@ use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
     resolve_endpoint, validate_startup_params, BorrowedRow, ConnectConfig, Diagnostics, DriverError,
     Endpoint, MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification,
-    QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
+    Pipeline, QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
 };
 // Referenced only by the non-unix `Endpoint::Unix` reject arm in `build_wire`.
 #[cfg(not(unix))]
@@ -998,6 +998,42 @@ impl Connection {
             #[cfg(feature = "n1-detect")]
             core::panic::Location::caller(),
         )
+    }
+
+    /// Run a HETEROGENEOUS ATOMIC pipeline — N compile-checked `query!` commands
+    /// (each a [`Bound`](bsql_postgres_core::Bound) carrier +
+    /// params) sent in ONE round trip as ONE implicit transaction, returning a
+    /// tuple of one [`Rows<Qi>`] per command.
+    ///
+    /// ```ignore
+    /// let (users, logs, count) = conn.pipeline((
+    ///     UserById::bind((7,)),
+    ///     RecentLogs::bind((&since,)),
+    ///     CountAll::bind(()),
+    /// )).await?;
+    /// ```
+    ///
+    /// # Airtight all-or-nothing
+    ///
+    /// The whole batch commits and returns every result, or it errors and returns
+    /// ZERO — a mid-batch failure ROLLS BACK the commands before it (they form one
+    /// implicit transaction), so the results before a failure are NEVER returned. A
+    /// failure is [`DriverError::BatchFailed`] naming the failing command's
+    /// zero-based index ([`DriverError::batch_failed_index`]). The connection is left
+    /// EXACTLY as any failed verb leaves it — a common implicit-tx batch is
+    /// immediately clean; a batch inside an explicit transaction leaves it aborted
+    /// (`'E'`) for its owner (a guard, a pooled reset, or the caller) to roll back,
+    /// so the next in-transaction verb fails loudly (`25P02`), never a silent
+    /// autocommit. Saves `N - 1` round trips versus `N` sequential `query` calls. See
+    /// [`Core::pipeline`](bsql_postgres_core::Core::pipeline) for the full contract.
+    pub fn pipeline<'a, B>(
+        &'a mut self,
+        batch: B,
+    ) -> impl core::future::Future<Output = Result<B::Output, DriverError>> + 'a
+    where
+        B: Pipeline<'a> + 'a,
+    {
+        self.core.pipeline(batch)
     }
 
     // ── Transaction / session boundary primitives ───────────────────────────
@@ -1999,6 +2035,25 @@ impl Transaction<'_> {
                 loc,
             )
         })
+    }
+
+    /// Run a HETEROGENEOUS ATOMIC pipeline inside this transaction — the guard peer
+    /// of [`Connection::pipeline`].
+    ///
+    /// The pipeline's OWN `Sync` does NOT close this explicit transaction (the guard
+    /// owns commit/rollback), so a batch here composes with the surrounding scope: a
+    /// mid-batch failure rolls back the batch's commands AND leaves the transaction
+    /// aborted, so the closure returns the classified [`DriverError::BatchFailed`]
+    /// and the guard rolls the whole transaction back. When the pipeline is the
+    /// FIRST statement in the body it fuses the deferred `BEGIN` (one round trip).
+    pub fn pipeline<'a, B>(
+        &'a mut self,
+        batch: B,
+    ) -> impl Future<Output = Result<B::Output, DriverError>> + 'a
+    where
+        B: Pipeline<'a> + 'a,
+    {
+        self.armed(move |c| c.pipeline(batch))
     }
 
     // ── COPY (bulk load / unload — legal + atomic inside a transaction) ─────

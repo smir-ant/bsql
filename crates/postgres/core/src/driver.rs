@@ -65,6 +65,7 @@ use bsql_postgres_proto::{
 
 use crate::cancel::CancelKey;
 use crate::materialize::{self, ResultCollector};
+use crate::pipeline::{Bound, Pipeline};
 use crate::sql_ident::{self, SafeIdent, SafeTable};
 use crate::types::ColSlot;
 use crate::BorrowedRow;
@@ -1906,6 +1907,204 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 Ok(())
             }
             Err(other) => Err(lift_engine_error(other)),
+        }
+    }
+
+    // ── Heterogeneous atomic pipelining ─────────────────────────────────────
+
+    /// Stage ONE pipelined command's frames onto the engine — the per-command seam
+    /// the [`Pipeline`] tuple impls call (element `0` with `first = true`). Records
+    /// the command's content-addressed statement name into `plan` for the batch
+    /// cache settle. `#[doc(hidden)]`: a driver-facing staging seam, not a consumer
+    /// API (a consumer builds a batch tuple of [`Bound`]s and calls
+    /// [`pipeline`](Self::pipeline)).
+    #[doc(hidden)]
+    pub fn stage_pipeline_cmd<Q: TypedQuery>(
+        &mut self,
+        bound: &Bound<'_, Q>,
+        first: bool,
+        plan: &mut Vec<&'static str>,
+    ) -> Result<(), DriverError> {
+        // Re-type the const `PREPARED` to the caller's param lifetime (byte-identical
+        // wire fields — the OIDs / templates are `'static`), exactly as the serial
+        // typed verbs do via `prepared_at`.
+        let prepared = bsql_postgres_proto::prepared::prepared_at::<Q>();
+        plan.push(prepared.stmt_name());
+        self.engine
+            .stage_pipeline_command(&prepared, bound.params(), first)
+            .map_err(lift_engine_error)
+    }
+
+    /// Run a HETEROGENEOUS ATOMIC pipeline — the N compile-checked `query!` commands
+    /// of `batch` sent with ONE trailing `Sync`, forming a SINGLE implicit
+    /// transaction, returning one [`Rows<Qi>`](crate::Rows) per command.
+    ///
+    /// # Airtight all-or-nothing (STRUCTURAL, not by discipline)
+    ///
+    /// The whole batch commits and returns every result, or it errors and returns
+    /// ZERO — because on a mid-batch error the server ROLLS BACK the commands before
+    /// the failure, errors the failing one, and SKIPS the rest (PG §55.2.3). The
+    /// ONLY code path that builds the `Ok((Rows<Q0>, …))` tuple is reached AFTER the
+    /// pump returns the batch-final clean `ReadyForQuery`
+    /// ([`CommandStatus::Completed`]), which the server emits only if the whole
+    /// implicit transaction COMMITTED. So a rolled-back / failing / skipped command
+    /// can NEVER be materialised into an `Ok` — the provisional per-command row
+    /// prebuffers are DISCARDED on any failure. A mid-batch failure is
+    /// [`DriverError::BatchFailed`] naming the ZERO-BASED index of the failing
+    /// command (read via [`DriverError::batch_failed_index`]).
+    ///
+    /// # Transaction state on error — CONSISTENT with a normal failed verb
+    ///
+    /// `pipeline` does NOT special-case the transaction: it leaves the connection
+    /// EXACTLY as any other verb leaves it. A COMMON implicit-tx batch (no explicit
+    /// `BEGIN`) has its single trailing `Sync` close the implicit transaction, so
+    /// `tx_status` is `Idle` and the connection is immediately clean + reusable. A
+    /// batch inside an EXPLICIT transaction (a `transaction` guard, or a manual
+    /// `BEGIN` in the batch) leaves that transaction ABORTED (`'E'`), UNTOUCHED —
+    /// the OWNER of the transaction rolls it back (the guard at closure exit, a
+    /// pooled `reset_session` on checkin, or a direct caller's `rollback`). Auto-
+    /// rolling-back here would make `pipeline` the ONLY verb that clears a caller's
+    /// aborted transaction, so a caller who ignored the error and issued another
+    /// verb inside a guard would silently run it in AUTOCOMMIT instead of getting a
+    /// loud `25P02` — a silent transaction escape. Leaving it `'E'` keeps the next
+    /// in-guard verb failing loudly, exactly as a normal failed verb does.
+    ///
+    /// # Errors
+    ///
+    /// - [`DriverError::BatchFailed`] — a command failed; the whole batch rolled
+    ///   back (all-or-nothing). Names the failing index + the server cause.
+    /// - a FATAL transport/protocol/EOF error — the connection is dead
+    ///   ([`is_disconnect`](DriverError::is_disconnect) is `true`).
+    pub async fn pipeline<'p, B: Pipeline<'p>>(
+        &mut self,
+        batch: B,
+    ) -> Result<B::Output, DriverError> {
+        let arity = B::ARITY;
+        // 1. STAGE every command's frames (pure send-buffer build, no token). A build
+        //    overflow (a > 2 GiB frame) leaves NOTHING flushed, so the connection is
+        //    healthy — discard the partial staging and restore a clean idle.
+        let mut plan: Vec<&'static str> = Vec::with_capacity(arity);
+        if let Err(e) = batch.stage(self, &mut plan) {
+            core::hint::cold_path();
+            self.engine.abort_pipeline_staging();
+            return Err(e);
+        }
+        self.engine.stage_pipeline_seal();
+
+        // 2. DRIVE. One flush carries the whole batch; the pump surfaces each
+        //    command's rows into ITS OWN prebuffer, advancing at each `Deliver`. On a
+        //    mid-batch `Fail` the failing index (the delivery count so far) + the
+        //    parsed cause are parked; nothing is returned as a row until the settle
+        //    confirms the clean batch RFQ.
+        let live = self.take_live()?;
+        let mut builders: Vec<RowsBuilder> = (0..arity).map(|_| RowsBuilder::new()).collect();
+        let mut current: usize = 0;
+        let mut db_error: Option<DbError> = None;
+        let mut failed_index: Option<usize> = None;
+        let outcome = self
+            .engine
+            .run_pipeline(
+                live,
+                capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
+                    match surface {
+                        // Rows (whole or reassembled-oversize chunks) belong to the
+                        // CURRENT command; route them to its builder.
+                        Surface::Row(_) | Surface::RowChunk(_) | Surface::RowChunkEnd => {
+                            if let Some(b) = builders.get_mut(current) {
+                                b.feed(surface);
+                            }
+                        }
+                        // A command completed: finalize its builder (the tag) and
+                        // advance to the next command.
+                        Surface::Deliver { .. } => {
+                            if let Some(b) = builders.get_mut(current) {
+                                b.feed(surface);
+                            }
+                            current = current.saturating_add(1);
+                        }
+                        // A mid-batch server error: `current` is the count of
+                        // COMPLETED commands = the failing command's index. Park it +
+                        // the cause once — the FIRST Fail wins (the guard makes a
+                        // later frame in the recovery window fall through), and the
+                        // pump drains to the batch RFQ afterward.
+                        Surface::Fail(body) if failed_index.is_none() => {
+                            failed_index = Some(current);
+                            db_error = Some(materialize::parse_error_response(body));
+                        }
+                        // A typed pipeline cannot over-cap (its result columns are
+                        // compile-capped); async / COPY frames are not batch rows
+                        // (a NOTIFY is captured by the `capture_notify` wrapper); a
+                        // second Fail after the first is ignored (guard above).
+                        _ => {}
+                    }
+                    ControlFlow::Continue(())
+                }),
+            )
+            .await;
+
+        // 3. SETTLE.
+        let (live, status) = match outcome {
+            Ok(Outcome { live, status }) => (live, status),
+            // FATAL: the verb consumed the token and the connection is dead.
+            Err(other) => {
+                core::hint::cold_path();
+                return Err(lift_engine_error(other));
+            }
+        };
+        self.live = Some(live);
+        match status {
+            // The batch reached its clean trailing `ReadyForQuery` with NO failure —
+            // every command committed under the implicit transaction. THE ONLY `Ok`
+            // path. Record each MISS statement (deduped) IF the batch left the
+            // connection at `Idle` tx status (mirrors the serial cache rule; inside
+            // an explicit transaction it defers, since a rollback could drop it).
+            CommandStatus::Completed => {
+                if matches!(self.engine.tx_status(), Ok(TxStatus::Idle)) {
+                    for &name in &plan {
+                        self.engine.record_pipeline_statement(name);
+                    }
+                }
+                B::finish(builders)
+            }
+            // A mid-batch failure. The N commands are ONE implicit transaction, so
+            // the server ROLLED BACK every command; the provisional builders are
+            // DISCARDED (never an `Ok`).
+            //
+            // The connection is left EXACTLY as a normal failed verb leaves it —
+            // `pipeline` does NOT special-case the transaction state. A COMMON
+            // implicit-tx batch (no explicit `BEGIN`) has its single trailing `Sync`
+            // close the implicit transaction, so `tx_status` is already `Idle` and
+            // the connection is clean. A batch inside an EXPLICIT transaction (a
+            // `conn.transaction` guard, or a manual `BEGIN` in the batch) leaves that
+            // transaction ABORTED (`'E'`), UNTOUCHED — the OWNER of the transaction
+            // rolls it back (the guard at closure exit, a pooled `reset_session` on
+            // checkin, or the direct caller's `rollback`). This is the tier-1 choice:
+            // auto-rolling-back here would make `pipeline` the ONLY verb that clears
+            // a caller's aborted transaction, so a caller who IGNORED the error and
+            // issued another verb inside the guard would run it in AUTOCOMMIT (a
+            // silent transaction escape) instead of getting a loud `25P02`. Leaving
+            // it `'E'` makes the next in-guard verb fail loudly with `25P02`, exactly
+            // as a normal failed verb does.
+            CommandStatus::ServerErrored => {
+                core::hint::cold_path();
+                // Self-heal (ORTHOGONAL to the transaction state): evict every
+                // referenced statement so a next attempt re-Parses
+                // (Close-before-Parse), recovering a plan dropped out of band. A
+                // no-op for MISS names (not cached).
+                for &name in &plan {
+                    self.engine.evict_pipeline_statement(name);
+                }
+                // A `ServerErrored` status is reached ONLY via a surfaced `Fail`, so
+                // both are `Some` by construction; the `_` arm is fail-closed
+                // (classified, never a fabricated index) against the impossible case.
+                match (failed_index, db_error) {
+                    (Some(index), Some(db)) => Err(DriverError::BatchFailed {
+                        index,
+                        source: Box::new(db),
+                    }),
+                    _ => Err(DriverError::UnclassifiedFailure),
+                }
+            }
         }
     }
 

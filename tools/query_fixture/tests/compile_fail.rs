@@ -183,6 +183,12 @@ fn unknown_reference_is_compile_error() {
     //     failure (the row tuple's arity ceiling).
     t.compile_fail("tests/compile_fail/copy_over_column_cap.rs");
 
+    // A heterogeneous `pipeline((...))` batch element is a `Bound<Q>` bound with
+    // `Q::Params`; binding the WRONG parameter tuple to a carrier is `error[E0308]`
+    // at the `bind`, so a mistyped command cannot ride a batch (the typed-per-
+    // element guarantee holds at the batch boundary, same as a single `query`).
+    t.compile_fail("tests/compile_fail/pipeline_wrong_param.rs");
+
     // Every valid dynamic form type-checks at macro expansion.
     t.pass("tests/compile_pass/query_dynamics_ok.rs");
     // The valid `copy!` + `copy_in_typed` happy path type-checks (GREEN peer of

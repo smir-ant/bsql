@@ -553,6 +553,66 @@ fn settle_statement_cache<P, R>(
     }
 }
 
+/// Stage ONE pipelined command's request bytes onto the send buffer WITHOUT the
+/// trailing `Sync` — the per-command half of a heterogeneous
+/// `pipeline((...))` batch, hoisting the single `Sync` to the batch end
+/// ([`stage_pipeline_seal`](Engine::stage_pipeline_seal)).
+///
+/// This is [`stage_compiled_query`] unrolled for the batch: the SAME cache decision
+/// (`is_statement_parsed` → a MISS leads with `Close`+`Parse`, a HIT reuses the
+/// server-side plan) and the SAME wire framing (`Close`/`Parse`/`Bind`/`Execute`),
+/// so a pipelined command puts IDENTICAL bytes on the wire as its serial peer for
+/// the same query — only the `Sync` moves. The leading `Close` on a MISS makes the
+/// `Parse` idempotent, so two IDENTICAL queries in one batch (both MISS, both
+/// `Close`+`Parse` the same content-addressed name) are safe in order.
+///
+/// - FIRST command: reset the buffer, stage any fused prelude (a deferred
+///   transaction `BEGIN`), seat the leading [`ActiveState`](super::ActiveEngine)
+///   (a MISS's `CloseParseBindExecute…` chain or a HIT's bind wait), and arm
+///   [`begin_pipeline`](ActiveEngine::begin_pipeline) so the command boundary routes
+///   through `PipelineAwaitingNextOrRfq`.
+/// - SUBSEQUENT command: append only its frames; the receive FSM seats it as its
+///   acks arrive (never a separate seat).
+fn stage_pipeline_frames<P, R, E>(
+    active: &mut ActiveEngine,
+    send_buf: &mut SendBuf,
+    q: &PreparedQuery<P, R>,
+    args: &P,
+    first: bool,
+) -> Result<(), EngineError<E>>
+where
+    P: ParamsWriter,
+    R: RowDecode,
+{
+    let reuse = active.is_statement_parsed(q.stmt_name);
+    if first {
+        send_buf.reset();
+        stage_prelude(active, send_buf)?;
+    }
+    if !reuse {
+        enqueue_frame(send_buf, |wb| {
+            frames::build_close_statement(wb, q.stmt_name.as_bytes())
+        })?;
+        send_buf.enqueue(q.parse_template);
+    }
+    // The `Bind` streams its parameter block DIRECTLY onto the growable send buffer
+    // (unbounded params), exactly as the serial path; `Execute` is fixed-size. NO
+    // `Sync` — it is hoisted to the batch end so the whole batch is ONE implicit
+    // transaction under ONE trailing Sync.
+    frames::build_bind_prepared(&mut send_buf.frame(), q.bind_execute_prefix, args)
+        .map_err(frame_too_long)?;
+    send_buf.enqueue(&crate::prepared::EXECUTE_EMPTY_PORTAL_NO_LIMIT);
+    if first {
+        if reuse {
+            active.begin_bind_execute(q.row_oids);
+        } else {
+            active.begin_close_parse_bind_execute(q.row_oids);
+        }
+        active.begin_pipeline();
+    }
+    Ok(())
+}
+
 impl<'b, T: Transport> Engine<'b, T> {
     /// Drain a `Sync` and await the connection's `ReadyForQuery` — a liveness
     /// round trip. Surfaces nothing on a quiet connection; any asynchronous
@@ -1245,6 +1305,91 @@ impl<'b, T: Transport> Engine<'b, T> {
         // (already-empty) send buffer as a no-op, then reads the owed reply frames
         // to a clean idle — threading the caller's sink so an async frame in the
         // drained remainder still surfaces, never a silent drop.
+        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
+        Ok(Outcome { live, status })
+    }
+
+    /// Stage ONE pipelined command's frames onto the send buffer (see
+    /// [`stage_pipeline_frames`]). No token, no I/O — a pure send-buffer build the
+    /// driver's generic `pipeline` verb calls once per batch element (the FIRST with
+    /// `first = true`). Pair with [`stage_pipeline_seal`](Self::stage_pipeline_seal)
+    /// after the last command, then [`run_pipeline`](Self::run_pipeline) to drive.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::WrongPhase`] — the engine is not in its active phase.
+    /// - [`EngineError::FrameTooLong`] — a command's params/SQL exceeded the wire
+    ///   length field. The caller must [`abort_pipeline_staging`](Self::abort_pipeline_staging)
+    ///   (nothing was flushed, so the connection stays healthy).
+    pub fn stage_pipeline_command<P, R>(
+        &mut self,
+        q: &PreparedQuery<P, R>,
+        args: &P,
+        first: bool,
+    ) -> Result<(), EngineError<T::Error>>
+    where
+        P: ParamsWriter,
+        R: RowDecode,
+    {
+        let Self {
+            phase, send_buf, ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
+        stage_pipeline_frames(active, send_buf, q, args, first)
+    }
+
+    /// Append the batch's SINGLE trailing `Sync` after every command is staged —
+    /// the one Sync that makes the whole batch ONE implicit transaction. No token,
+    /// no I/O.
+    #[inline]
+    pub fn stage_pipeline_seal(&mut self) {
+        self.send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
+    }
+
+    /// Discard a partially-staged pipeline after a staging build error
+    /// ([`EngineError::FrameTooLong`] from [`stage_pipeline_command`](Self::stage_pipeline_command)):
+    /// reset the send buffer and the engine to a clean `Idle`. Nothing was flushed,
+    /// so the connection is healthy; this drops the half-seated state so the next
+    /// verb starts fresh. No token (staging never took one).
+    #[inline]
+    pub fn abort_pipeline_staging(&mut self) {
+        if let Phase::Active(active) = &mut self.phase {
+            active.abort_pipeline_staging();
+        }
+        self.send_buf.reset();
+    }
+
+    /// Drive a staged pipeline batch to its boundary — the batch analog of
+    /// [`run_simple`](Self::run_simple)'s drive.
+    ///
+    /// Reuses [`drive_to_outcome`], so a mid-batch server error surfaces its raw
+    /// bytes through `sink` and then DRAINS the batch's single trailing
+    /// `ReadyForQuery` to a clean idle, reported as the recoverable
+    /// [`ServerErrored`](CommandStatus::ServerErrored) — the token rides `Ok` and
+    /// the connection survives. The ONLY `Ok(Completed)` path is a clean
+    /// `ReadyForQuery` after every command committed (the implicit transaction), so
+    /// a rolled-back / failing / skipped command can never be reported as completed.
+    /// `B = Never`.
+    ///
+    /// # Errors
+    ///
+    /// As [`simple_query`](Self::simple_query): a FATAL transport/protocol/EOF fault
+    /// consumes the token (the connection is dead).
+    pub async fn run_pipeline<S>(
+        &mut self,
+        live: Live<'b>,
+        sink: S,
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
+    where
+        S: FnMut(Surface<'_>) -> ControlFlow<Never>,
+    {
+        let Self {
+            transport,
+            phase,
+            send_buf,
+            ..
+        } = self;
+        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
         let status = drive_to_outcome(active, transport, send_buf, sink).await?;
         Ok(Outcome { live, status })
     }

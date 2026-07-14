@@ -54,7 +54,7 @@ use bsql_postgres_core::tls::{self, TlsTransport};
 use bsql_postgres_core::{
     resolve_endpoint, validate_startup_params, BorrowedRow, ConnectConfig, Diagnostics, DriverError,
     Endpoint, MigrationError, MigrationReport, MigrationSource, MigrationStatus, Notification,
-    window_after_statement, QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
+    window_after_statement, Pipeline, QueryResult, Redial, Row, Rows, SslMode, TypedNotification,
     WindowAction,
 };
 // Referenced only by the non-unix `Endpoint::Unix` reject arm in `dial_socket`.
@@ -951,6 +951,25 @@ impl Connection {
             #[cfg(feature = "n1-detect")]
             core::panic::Location::caller(),
         )))
+    }
+
+    /// Run a HETEROGENEOUS ATOMIC pipeline — N compile-checked `query!` commands
+    /// (each a [`Bound`](bsql_postgres_core::Bound) carrier + params) sent in ONE
+    /// round trip as ONE implicit transaction, returning a tuple of one
+    /// [`Rows<Qi>`] per command.
+    ///
+    /// The whole batch commits and returns every result, or it errors and returns
+    /// ZERO — a mid-batch failure ROLLS BACK the commands before it, so the results
+    /// before a failure are NEVER returned. A failure is
+    /// [`DriverError::BatchFailed`] naming the failing command's zero-based index
+    /// ([`DriverError::batch_failed_index`]). The connection is left EXACTLY as any
+    /// failed verb leaves it — a common implicit-tx batch is immediately clean; a
+    /// batch inside an explicit transaction leaves it aborted (`'E'`) for its owner
+    /// to roll back, so the next in-transaction verb fails loudly (`25P02`), never a
+    /// silent autocommit. See
+    /// [`Core::pipeline`](bsql_postgres_core::Core::pipeline) for the full contract.
+    pub fn pipeline<'p, B: Pipeline<'p>>(&mut self, batch: B) -> Result<B::Output, DriverError> {
+        drive_sync(engine::poll_once(self.core.pipeline(batch)))
     }
 
     /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
@@ -1940,6 +1959,16 @@ impl Transaction<'_> {
             #[cfg(feature = "n1-detect")]
             core::panic::Location::caller(),
         )))
+    }
+
+    /// Run a HETEROGENEOUS ATOMIC pipeline inside this transaction — the guard peer
+    /// of [`Connection::pipeline`]. The batch's own `Sync` does NOT close this
+    /// explicit transaction (the guard owns commit/rollback), so a mid-batch failure
+    /// leaves the transaction aborted and the guard rolls the whole scope back. When
+    /// the pipeline is the FIRST statement in the body it fuses the deferred `BEGIN`.
+    pub fn pipeline<'p, B: Pipeline<'p>>(&mut self, batch: B) -> Result<B::Output, DriverError> {
+        self.arm_begin();
+        drive_sync(engine::poll_once(self.core.pipeline(batch)))
     }
 
     /// Run a compile-checked `query!` expecting EXACTLY one row, returning the

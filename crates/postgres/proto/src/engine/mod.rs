@@ -392,6 +392,37 @@ impl<'b, T> Engine<'b, T> {
         }
     }
 
+    /// Record a pipelined command's content-addressed statement as durable on this
+    /// connection — the batch analog of the serial
+    /// [`query_params`](Self::query_params) cache settle. De-duplicates against the
+    /// current set (a HIT command's name is already present; two identical queries
+    /// in one batch record once), so it is safe to call for EVERY referenced name.
+    /// A no-op unless the engine is active.
+    ///
+    /// The driver calls this ONLY on a batch that completed at a clean idle with
+    /// `TxStatus::Idle` (the implicit transaction committed), so a recorded name can
+    /// never point at a statement a rollback removed.
+    #[inline]
+    pub fn record_pipeline_statement(&mut self, stmt_name: &'static str) {
+        if let Phase::Active(active) = &mut self.phase
+            && !active.is_statement_parsed(stmt_name)
+        {
+            active.record_statement_parsed(stmt_name);
+        }
+    }
+
+    /// Evict a pipelined command's statement name after a FAILED batch — the
+    /// self-heal for a plan dropped out of band (`DISCARD ALL` / `DEALLOCATE`): the
+    /// next use of the name is a cache MISS that Close-before-Parse re-creates. A
+    /// no-op for a name that was not cached (a MISS this batch), and a no-op unless
+    /// the engine is active.
+    #[inline]
+    pub fn evict_pipeline_statement(&mut self, stmt_name: &str) {
+        if let Phase::Active(active) = &mut self.phase {
+            active.evict_statement(stmt_name);
+        }
+    }
+
     /// Release the outbound send buffer's backing allocation if it grew past the
     /// high-water mark — the bounded-pool-memory reclaim.
     ///

@@ -97,6 +97,9 @@ pub mod n1 {
 // The per-connection notification ledger (a bounded, counted no-drop buffer)
 // and the sink adapter that captures every surfaced notification into it.
 pub mod notify;
+// Heterogeneous atomic pipelining — `Bound<Q>` + the sealed `Pipeline` trait a
+// batch tuple satisfies; `Core::pipeline` is the driver verb.
+pub mod pipeline;
 // RFC 4013 SASLprep normalisation of the SCRAM password (RFC 5802 mandate).
 // SCRAM-only: with `scram` OFF there is no password auth, so the `stringprep`
 // Unicode subtree this module names is neither compiled nor resolved.
@@ -145,6 +148,7 @@ pub use migrate::{
 #[cfg(feature = "n1-detect")]
 pub use bsql_common::{N1Report, N1Tracker};
 pub use notify::{capture_notify, NotificationLedger, TypedNotification};
+pub use pipeline::{BindExt, Bound, Pipeline};
 pub use sql_ident::{SafeIdent, SafeTable};
 pub use typed_rows::{Rows, RowsBuilder};
 pub use types::{

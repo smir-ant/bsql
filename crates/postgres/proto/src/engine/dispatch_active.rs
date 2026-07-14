@@ -264,6 +264,34 @@ enum ActiveState {
     /// the executed rows decode against the INLINE-recovered OIDs.
     FusedAwaitingRowDescOrNoData,
 
+    // ── Pipelined batch (N extended commands, ONE trailing Sync) ──
+    //
+    // A HETEROGENEOUS pipeline (`pipeline((...))`) flushes N compile-checked
+    // commands — each a `[Close+Parse if cache-miss] + Bind + Execute` block — with
+    // ONE trailing `Sync`. The N commands form a SINGLE implicit transaction: on a
+    // mid-batch error the server rolls back the commands before the failure, errors
+    // the failing one, and SKIPS the rest to the trailing `ReadyForQuery`. The
+    // receive side reuses every existing per-command sub-chain state; only the
+    // BOUNDARY between two commands is new. When [`pipelining`](ActiveEngine::pipelining)
+    // is set, a command's `CommandComplete` in [`BindAwaitingData`](Self::BindAwaitingData)
+    // routes HERE instead of to [`ExtendedAwaitingRfq`](Self::ExtendedAwaitingRfq)
+    // (which drains one command to one Sync).
+    /// A pipelined command completed (its `CommandComplete` was surfaced); awaiting
+    /// EITHER the NEXT command's leading ack — `BindComplete` (`'2'`, a cache-HIT
+    /// command's `Bind`+`Execute`) or `CloseComplete` (`'3'`, a cache-MISS command's
+    /// leading `Close`) — OR the batch-final `ReadyForQuery` (`'Z'`) of the single
+    /// trailing Sync, OR an `ErrorResponse` (`'E'`, the next command errored at its
+    /// first step, e.g. a `Bind` type error with no preceding `BindComplete`). A
+    /// `'2'` advances directly into [`BindAwaitingData`](Self::BindAwaitingData) (the
+    /// `BindComplete` is consumed here); a `'3'` advances into the existing
+    /// [`ParseBindExecuteAwaitingParseComplete`](Self::ParseBindExecuteAwaitingParseComplete)
+    /// chain (the leading `Close` makes the following `Parse` idempotent). A bare
+    /// `ParseComplete` (`'1'`) never LEADS a compile-checked command (a cache-miss
+    /// always leads with `Close`), so it is out-of-phase here and a classified
+    /// teardown — the honest tier-1 choice over a manufactured arm for a frame the
+    /// typed pipeline cannot emit.
+    PipelineAwaitingNextOrRfq,
+
     /// A protocol violation tore the connection down — terminal.
     Failed,
 }
@@ -444,6 +472,21 @@ pub struct ActiveEngine {
     /// [`next_prelude_event`](Self::next_prelude_event) drain path, so `next_event`
     /// is untouched.
     prelude_active: bool,
+    /// Whether a PIPELINED batch is in flight — set by
+    /// [`begin_pipeline`](Self::begin_pipeline) at staging, cleared at the batch's
+    /// trailing `ReadyForQuery` (in [`parse_rfq`](Self::parse_rfq), the universal
+    /// return-to-idle that every exit path — clean, drain-after-error,
+    /// overcap-drain — funnels through, so a failed batch clears the flag too).
+    ///
+    /// Read on the command boundary ONLY: when set, a command's `CommandComplete`
+    /// in [`BindAwaitingData`](ActiveState::BindAwaitingData) routes to
+    /// [`PipelineAwaitingNextOrRfq`](ActiveState::PipelineAwaitingNextOrRfq) (await
+    /// the next command's leading ack or the batch RFQ) instead of
+    /// [`ExtendedAwaitingRfq`](ActiveState::ExtendedAwaitingRfq) (one Sync closes
+    /// one command). The `DataRow` hot arm never reads it — the routing lives in a
+    /// `#[cold]` helper — so `next_event`'s hot frame is unperturbed. `false` in
+    /// steady state.
+    pipelining: bool,
 }
 
 // Stack footprint of the active handle: the carried-forward `IngestBuf` (144)
@@ -457,7 +500,9 @@ pub struct ActiveEngine {
 // live off-stack behind those handles. A field addition lands here as a reviewed
 // footprint drift — the `param_oids: Vec<u32>` capture (a prepared statement's
 // server-inferred parameter types, retained for the `Bind` type check) is the
-// +24 B from 368.
+// +24 B from 368. The `pipelining: bool` pipeline flag is FREE: it occupies a
+// padding byte in the trailing `Option<&'static str>` (16) + `bool` (1) tail slot
+// alongside `prelude_active`, so the size is UNCHANGED at 392.
 crate::wire_pin!(ActiveEngine, size = 392, align = 8);
 
 impl ActiveEngine {
@@ -488,6 +533,7 @@ impl ActiveEngine {
             parsed_statements: Vec::new(),
             pending_prelude: None,
             prelude_active: false,
+            pipelining: false,
         }
     }
 
@@ -836,6 +882,39 @@ impl ActiveEngine {
         self.state = ActiveState::ExtendedAwaitingRfq;
     }
 
+    /// Arm PIPELINE mode for the batch being staged: a command's `CommandComplete`
+    /// then routes to [`PipelineAwaitingNextOrRfq`](ActiveState::PipelineAwaitingNextOrRfq)
+    /// (await the next command's leading ack or the batch RFQ) instead of the
+    /// single-command [`ExtendedAwaitingRfq`](ActiveState::ExtendedAwaitingRfq).
+    ///
+    /// Called during staging, AFTER the FIRST command's leading state is seated
+    /// (via [`begin_bind_execute`](Self::begin_bind_execute) /
+    /// [`begin_close_parse_bind_execute`](Self::begin_close_parse_bind_execute) —
+    /// a pipeline's first command's reply chain is byte-identical to a serial
+    /// extended query up to its `CommandComplete`). The subsequent commands are
+    /// seated by the receive FSM as their acks arrive. Cleared at the batch's
+    /// trailing `ReadyForQuery` by [`parse_rfq`](Self::parse_rfq).
+    #[inline]
+    pub fn begin_pipeline(&mut self) {
+        self.pipelining = true;
+    }
+
+    /// Reset the engine to a clean idle after a pipeline STAGING error (a
+    /// `FrameTooLong` while building a command's frames) that happened BEFORE any
+    /// flush. The first command's leading state was already seated and
+    /// [`pipelining`](Self::pipelining) armed, but no bytes reached the wire, so the
+    /// connection is healthy — this discards that half-seated state so the NEXT verb
+    /// starts from `Idle`. No I/O and no token (staging never took one). The send
+    /// buffer is reset by the caller ([`Engine`](super::Engine)) alongside this.
+    #[inline]
+    pub fn abort_pipeline_staging(&mut self) {
+        self.pipelining = false;
+        self.reset_columns();
+        self.pending_prelude = None;
+        self.prelude_active = false;
+        self.state = ActiveState::Idle;
+    }
+
     /// Seat the engine to await the fused one-round-trip runtime-param batch's
     /// reply: `Parse`(unnamed) + `Bind` + `Describe`(portal) + `Execute` + `Sync`
     /// → `ParseComplete`, `BindComplete`, then the `Describe`(portal) answer
@@ -942,7 +1021,8 @@ impl ActiveEngine {
                 | ActiveState::CloseAwaitingComplete
                 | ActiveState::FusedAwaitingParseComplete
                 | ActiveState::FusedAwaitingBindComplete
-                | ActiveState::FusedAwaitingRowDescOrNoData => {}
+                | ActiveState::FusedAwaitingRowDescOrNoData
+                | ActiveState::PipelineAwaitingNextOrRfq => {}
             }
 
             // Continue an in-progress oversize stream before any new framing.
@@ -1045,6 +1125,9 @@ impl ActiveEngine {
             ActiveState::FusedAwaitingParseComplete
             | ActiveState::FusedAwaitingBindComplete
             | ActiveState::FusedAwaitingRowDescOrNoData => self.step_fused(tag, start, end),
+            ActiveState::PipelineAwaitingNextOrRfq => {
+                self.step_pipeline_next_or_rfq(tag, start, end)
+            }
             // Unreachable: the drive loop short-circuits `Failed` before
             // calling `step_frame`. Classified, never wildcarded.
             ActiveState::Failed => ActiveOutcome::Close,
@@ -1327,8 +1410,76 @@ impl ActiveEngine {
     fn step_bind_awaiting_data(&mut self, tag: u8, start: usize, end: usize) -> ActiveOutcome {
         match tag {
             T_DATA_ROW => self.emit_row(start, end),
-            T_COMMAND_COMPLETE => self.complete_command(start, end, ActiveState::ExtendedAwaitingRfq),
+            T_COMMAND_COMPLETE => self.complete_bind_command(start, end),
             T_PORTAL_SUSPENDED => self.deliver_suspended(ActiveState::ExtendedAwaitingRfq),
+            T_ERROR => self.fail_recoverable(start, end),
+            _ => self.teardown(),
+        }
+    }
+
+    /// `BindAwaitingData` → `CommandComplete`: complete the command and pick the
+    /// next state. A SERIAL extended query moves to
+    /// [`ExtendedAwaitingRfq`](ActiveState::ExtendedAwaitingRfq) (one Sync closes
+    /// one command); a PIPELINED command moves to
+    /// [`PipelineAwaitingNextOrRfq`](ActiveState::PipelineAwaitingNextOrRfq) (await
+    /// the next command's leading ack or the batch's single trailing RFQ).
+    ///
+    /// `#[cold]` + `#[inline(never)]`: a `CommandComplete` is once-per-command, off
+    /// the per-`DataRow` hot arm. Outlining it (like `step_fused` /
+    /// `step_drain_overcap`) keeps the `pipelining` read AND the `complete_command`
+    /// tag-parse out of [`next_event`](Self::next_event)'s hot frame — the
+    /// `T_DATA_ROW => emit_row` arm stays byte-identical, proven by the codegen gate.
+    #[cold]
+    #[inline(never)]
+    fn complete_bind_command(&mut self, start: usize, end: usize) -> ActiveOutcome {
+        let next = if self.pipelining {
+            ActiveState::PipelineAwaitingNextOrRfq
+        } else {
+            ActiveState::ExtendedAwaitingRfq
+        };
+        self.complete_command(start, end, next)
+    }
+
+    /// `PipelineAwaitingNextOrRfq` — the boundary BETWEEN two pipelined commands,
+    /// or the batch's single trailing `ReadyForQuery`.
+    ///
+    /// The prior command's `CommandComplete` was surfaced; the next frame is the
+    /// NEXT command's leading ack, the batch RFQ, or an error:
+    ///
+    /// - `'Z'` `ReadyForQuery` → the batch's ONE trailing Sync completed; back to
+    ///   `Idle` via [`parse_rfq`](Self::parse_rfq) (which clears
+    ///   [`pipelining`](Self::pipelining)).
+    /// - `'2'` `BindComplete` → the next command is a cache-HIT (`Bind`+`Execute`);
+    ///   its `BindComplete` is consumed HERE, so advance directly into
+    ///   [`BindAwaitingData`](ActiveState::BindAwaitingData).
+    /// - `'3'` `CloseComplete` → the next command is a cache-MISS whose leading
+    ///   `Close` makes its following `Parse` idempotent; advance into the existing
+    ///   [`ParseBindExecuteAwaitingParseComplete`](ActiveState::ParseBindExecuteAwaitingParseComplete)
+    ///   chain (`ParseComplete` → `BindComplete` → the row stream).
+    /// - `'E'` `ErrorResponse` → the next command errored at its FIRST step (e.g. a
+    ///   `Bind` type error, sent with no preceding `BindComplete`); recover via
+    ///   [`fail_recoverable`](Self::fail_recoverable) (drain to the batch RFQ). The
+    ///   implicit transaction rolls back the commands before it; the driver's
+    ///   collector reports the failing index and discards ALL results.
+    /// - anything else (including a bare `'1'` `ParseComplete`, which never LEADS a
+    ///   compile-checked command — a cache-miss always leads with `Close`) is
+    ///   out-of-phase: a classified [`teardown`](Self::teardown).
+    ///
+    /// `#[cold]` + `#[inline(never)]`: a once-per-command transition, kept off the
+    /// hot `DataRow` frame exactly like `step_fused`.
+    #[cold]
+    #[inline(never)]
+    fn step_pipeline_next_or_rfq(&mut self, tag: u8, start: usize, end: usize) -> ActiveOutcome {
+        match tag {
+            T_READY_FOR_QUERY => self.parse_rfq(start, end),
+            T_BIND_COMPLETE => {
+                self.state = ActiveState::BindAwaitingData;
+                ActiveOutcome::Silent
+            }
+            T_CLOSE_COMPLETE => {
+                self.state = ActiveState::ParseBindExecuteAwaitingParseComplete;
+                ActiveOutcome::Silent
+            }
             T_ERROR => self.fail_recoverable(start, end),
             _ => self.teardown(),
         }
@@ -1443,6 +1594,7 @@ impl ActiveEngine {
             | ActiveState::BindAwaitingData
             | ActiveState::ExtendedAwaitingRfq
             | ActiveState::CloseAwaitingComplete
+            | ActiveState::PipelineAwaitingNextOrRfq
             | ActiveState::Failed => self.teardown(),
         }
     }
@@ -1642,6 +1794,9 @@ impl ActiveEngine {
             // A `RowDescription` is never legal while awaiting `'1'` / `'2'`.
             | ActiveState::FusedAwaitingParseComplete
             | ActiveState::FusedAwaitingBindComplete
+            // A typed pipeline sends no `Describe`, so no `RowDescription` ever
+            // arrives at a pipeline boundary — a wide one here is out-of-phase.
+            | ActiveState::PipelineAwaitingNextOrRfq
             | ActiveState::Failed => self.teardown(),
         }
     }
@@ -1716,6 +1871,12 @@ impl ActiveEngine {
                 Ok(tx) => {
                     self.tx_status = tx;
                     self.reset_columns();
+                    // Clear the pipeline flag at the UNIVERSAL return-to-idle: every
+                    // batch exit — clean, drain-after-error, overcap-drain — reaches
+                    // its trailing `ReadyForQuery` here, so a batch (success OR
+                    // failure) can never leak `pipelining` into the next command. A
+                    // no-op single store in steady state (the flag is already false).
+                    self.pipelining = false;
                     self.state = ActiveState::Idle;
                     ActiveOutcome::Idle
                 }
@@ -2132,6 +2293,10 @@ impl ActiveEngine {
             | ActiveState::FusedAwaitingParseComplete
             | ActiveState::FusedAwaitingBindComplete
             | ActiveState::FusedAwaitingRowDescOrNoData
+            // A `CommandComplete` never arrives while awaiting the NEXT command's
+            // leading ack: a pipelined command's `CommandComplete` is seen in
+            // `BindAwaitingData`, which routes HERE afterward — never the reverse.
+            | ActiveState::PipelineAwaitingNextOrRfq
             | ActiveState::Failed => None,
         }
     }

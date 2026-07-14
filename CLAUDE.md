@@ -956,6 +956,58 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   multi-flush round-trip + rejected-row recovery, both drivers) + the
   `copy_wrong_*` / `copy_unknown_column` trybuild goldens, and the
   `engine_copy_typed_alloc` constant-memory gate.
+- **Atomic query pipelining — `conn.pipeline((Q0::bind(p), Q1::bind(p), …))`**
+  (both PG drivers + the `Transaction` guard; a SQLite sequential twin). Sends N
+  compile-checked `query!` commands in ONE round trip instead of N, and returns
+  the typed tuple `(Rows<Q0>, Rows<Q1>, …)` — each command decoded against ITS OWN
+  carrier's compile-time OIDs (no erasure). Pure `query!` carriers, NO builder —
+  `Bound<Q>` (`Q::bind(params)`) is a bound carrier, not a runtime SQL fragment;
+  the `Pipeline` sealed trait has hand-written tuple impls arity `1..=16`. **The
+  contract is ATOMIC all-or-nothing** — this is the ONLY airtight semantic, forced
+  by the verified PostgreSQL fact that N extended-query commands with ONE trailing
+  `Sync` form a SINGLE implicit transaction (a mid-batch error ROLLS BACK the
+  commands before it, errors the failing one, and SKIPS the rest). So the whole
+  batch commits and returns every result, or it returns `Err(DriverError::BatchFailed
+  { index, source })` (naming the zero-based failing command; `batch_failed_index()`
+  accessor) and **ZERO** results. Returning "the results before the failure as `Ok`"
+  is FORBIDDEN — those writes were rolled back. Airtight BY CONSTRUCTION, not
+  discipline: the ONLY code path that builds the `Ok((Rows<Q0>, …))` tuple is the
+  `CommandStatus::Completed` arm, reached ONLY after the pump's clean trailing
+  `ReadyForQuery` (`Boundary::Idle`), which the server emits ONLY if the whole
+  implicit transaction COMMITTED; a rolled-back / failing / skipped command has no
+  `Ok` value to read. **Consistent with every other verb on error:** `pipeline`
+  does NOT auto-rollback — a mid-batch failure inside an explicit transaction
+  (a `Transaction` guard, or a caller `BEGIN` in the batch) leaves it ABORTED
+  (`'E'`), untouched, exactly as a normal failed verb does; the transaction's OWNER
+  rolls it back (the guard at closure exit, a pooled `reset_session` on checkin, or
+  the direct caller). This closes a silent-autocommit-escape: a caller who IGNORES
+  a pipeline error inside a guard and issues another verb gets a LOUD `25P02`
+  (aborted transaction), never a silent autocommit (witnessed by
+  `ignored_in_guard_pipeline_error_does_not_autocommit_later_verbs`). The COMMON
+  implicit-tx batch (no explicit `BEGIN`) needs no rollback — the single `Sync`
+  closes it server-side → `Idle`, connection clean. **Engine:** the receive side is
+  the extended-protocol twin of the existing simple-query `AwaitingRfq` multiplexer
+  — ONE new dispatch state `PipelineAwaitingNextOrRfq` reusing every existing
+  sub-chain, staged by `stage_pipeline` (per command `[Close+Parse if MISS] + Bind +
+  Execute`, the `Sync` hoisted to the batch end) with a 1-byte `pipelining` flag on
+  `ActiveEngine`. `next_event` stays BYTE-IDENTICAL (the continuation is
+  `#[cold]`/out-of-line like `step_fused`; the DataRow hot arm is untouched — the
+  codegen gate is green). `DriverError::BatchFailed`'s payload is 16 B
+  (`usize` + `Box<DbError>`), so the 24 B `DriverError` pin holds; `deps_pin` is
+  unchanged (no new dependency). Cancellation (`57014`, connection recovers) and a
+  mid-batch transport death (classified disconnect, bounded, never a torn success)
+  are honored. **SQLite twin:** `sqlite_conn.pipeline((…))` runs the commands
+  SEQUENTIALLY inside `BEGIN IMMEDIATE … COMMIT` — the IDENTICAL typed tuple + the
+  IDENTICAL all-or-nothing contract (no RTT win, in-process; read-only in a
+  conformance build since the SQLite authorizer permits only SELECTs for typed
+  writes). Measured PG (loopback, K heterogeneous SELECTs, `pipeline` vs K serial
+  `query_one`): K=2 ~3.5×, K=8 ~5×, K=16 ~7.3× — the RTT term collapses from K× to
+  1×; a single-statement batch (N=1) equals today's fused query (no regression, the
+  path is opt-in). Witnessed by `tools/query_fixture`'s `pipeline_live_{async,sync}`
+  (all-or-nothing rollback proof, the ignored-in-guard blind-zone regression, the
+  index accessor, cancel, transport death, in-guard commit), the offline
+  `engine_pipeline_spec` (the multiplexer + mid-batch drain), the SQLite
+  `pipeline_sqlite`, and the `pipeline_wrong_param` trybuild golden.
 - **Query cancellation** — `conn.cancel_token()` mints a DETACHED
   `CancelToken` (`Send + Sync + 'static`, borrowing NOTHING from the connection)
   that can be obtained BEFORE a long query and moved to another task/thread that

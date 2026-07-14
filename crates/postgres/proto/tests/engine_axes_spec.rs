@@ -438,7 +438,11 @@ const ENGINE_ERROR_VARIANTS: usize = 15;
 /// simple-query peer of `query`) and `query_params_fused_break` (the fused peer
 /// of `query_params_fused`) — behind the driver's `query_each_sql` /
 /// `query_each_params` constant-memory streaming.
-const ACTIVE_VERBS: usize = 23;
+/// 24 adds `run_pipeline`, the drive verb for a HETEROGENEOUS pipelined batch (N
+/// compile-checked commands under ONE trailing Sync — one implicit transaction).
+/// Its two staging helpers (`stage_pipeline_command` / `stage_pipeline_seal`) take
+/// NO `Live` token (pure send-buffer builds), so they do not count.
+const ACTIVE_VERBS: usize = 24;
 /// `core::hint::cold_path()` classified-branch markers across `engine/`.
 /// Reproduce: `grep -rho 'core::hint::cold_path()' crates/postgres/proto/src/engine/*.rs | wc -l`
 /// (52 includes the COPY-in `write_all` `WriteZero`/`SendOverrun` branches,

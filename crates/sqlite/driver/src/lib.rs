@@ -99,6 +99,9 @@ mod error;
 // logic lives ONCE in the dependency-free `bsql-common` leaf crate (this module
 // holds only the SQLite-specific I/O).
 mod migrate;
+// Heterogeneous atomic pipelining — the SQLite SEQUENTIAL twin of the PostgreSQL
+// `pipeline` (`Bound` / `SqlitePipeline` over `SqliteTypedQuery`).
+mod pipeline;
 mod typed;
 mod value;
 
@@ -109,6 +112,7 @@ pub use connection::{
     Transaction, TypedRows,
 };
 pub use error::SqliteError;
+pub use pipeline::{BindExt, Bound, SqlitePipeline};
 pub use migrate::{
     AppliedMigration, DriftKind, MigrationError, MigrationReport, MigrationSource,
     MigrationSourceError, MigrationStatus, LEDGER_TABLE,

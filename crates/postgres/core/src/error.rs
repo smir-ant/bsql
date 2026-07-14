@@ -450,6 +450,29 @@ pub enum DriverError {
         /// Number of parameters the caller's tuple supplied.
         found: usize,
     },
+    /// A HETEROGENEOUS pipeline (`pipeline((...))`) failed at a specific command.
+    ///
+    /// The N commands of a pipeline are sent with ONE trailing `Sync`, so they form
+    /// a SINGLE implicit transaction: on a mid-batch error the commands BEFORE the
+    /// failure are ROLLED BACK, the failing one errors, and the ones AFTER are
+    /// SKIPPED — the whole batch produces ZERO results (all-or-nothing). This is the
+    /// classified failure a `pipeline` returns: it names the ZERO-BASED [`index`]
+    /// of the failing command within the batch tuple, plus the boxed server
+    /// [`DbError`] cause (the SAME classified SQLSTATE + message a [`Db`](Self::Db)
+    /// error carries, so `is_disconnect` / SQLSTATE inspection work identically).
+    /// Read the index via [`batch_failed_index`](Self::batch_failed_index).
+    ///
+    /// A `usize` index (8 B) + a `Box<DbError>` (8 B — the 104 B `DbError` lives
+    /// off-heap) = 16 B, the SAME width as the enum's existing widest payloads, so
+    /// the 24 B footprint pin is UNTOUCHED.
+    ///
+    /// [`index`]: Self::BatchFailed
+    BatchFailed {
+        /// Zero-based index of the command that failed within the batch tuple.
+        index: usize,
+        /// The classified server error the failing command reported.
+        source: Box<DbError>,
+    },
 }
 
 // Footprint pin: a sum type whose size is set by its widest variant plus the
@@ -530,6 +553,11 @@ impl DriverError {
             // connection is broken (the `08` class / `57P0x` shutdown); a syntax
             // error, a constraint violation, or a `57014` cancel is NOT.
             Self::Db(db) => db.is_connection_error(),
+            // A pipeline failure is classified by its command's server error,
+            // exactly like a `Db` — a mid-batch constraint violation leaves the
+            // connection drained + reusable (not a disconnect), while a mid-batch
+            // connection-broken code (the `08` class) IS a disconnect.
+            Self::BatchFailed { source, .. } => source.is_connection_error(),
             // A required-SSL refusal aborts the CONNECT (the connection was never
             // established); it is a configuration/handshake fault, not a live
             // connection dying, so reconnecting unchanged would refuse again.
@@ -560,6 +588,21 @@ impl DriverError {
             // Bind, so the connection is untouched — fix the parameter and retry.
             | Self::ParamTypeMismatch { .. }
             | Self::ParamCountMismatch { .. } => false,
+        }
+    }
+
+    /// The ZERO-BASED index of the command that failed within a
+    /// [`pipeline`](crate::Core::pipeline) batch, or `None` for any other error.
+    ///
+    /// A pipeline's N commands form one implicit transaction, so on a mid-batch
+    /// error the WHOLE batch produced zero results (all-or-nothing); this names
+    /// WHICH command errored so a consumer can report / handle it without matching
+    /// the [`BatchFailed`](Self::BatchFailed) variant directly.
+    #[must_use]
+    pub fn batch_failed_index(&self) -> Option<usize> {
+        match self {
+            Self::BatchFailed { index, .. } => Some(*index),
+            _ => None,
         }
     }
 
@@ -641,6 +684,10 @@ impl fmt::Display for DriverError {
                 f,
                 "prepared statement declares {expected} parameter(s) but {found} were bound"
             ),
+            Self::BatchFailed { index, source } => write!(
+                f,
+                "pipeline command #{index} failed (the whole batch rolled back — all-or-nothing): {source}"
+            ),
         }
     }
 }
@@ -651,6 +698,8 @@ impl std::error::Error for DriverError {
             // Deref past the Box so the source is the `DbError`, not the Box —
             // identical to the pre-boxing behaviour.
             Self::Db(e) => Some(e.as_ref()),
+            // A pipeline failure's underlying cause is its command's server error.
+            Self::BatchFailed { source, .. } => Some(source.as_ref()),
             Self::Io(e) => Some(e),
             Self::Decode(e) => Some(e),
             Self::Column(e) => Some(e),

@@ -1064,6 +1064,31 @@ impl Connection {
         Ok(TypedRows { result, _q: PhantomData })
     }
 
+    /// Run a HETEROGENEOUS ATOMIC pipeline — N compile-checked `query!` commands
+    /// (each a [`Bound`](crate::Bound) carrier + params) run SEQUENTIALLY inside ONE
+    /// transaction, returning a tuple of one [`TypedRows<Qi>`](crate::TypedRows) per
+    /// command. The SQLite twin of the PostgreSQL `pipeline`.
+    ///
+    /// SQLite is IN-PROCESS, so there is no round-trip win (the value is one mental
+    /// model + atomicity on both backends). The all-or-nothing contract holds
+    /// STRUCTURALLY: the batch runs inside
+    /// [`transaction`](Self::transaction), so a mid-batch failure short-circuits into
+    /// the guard's ROLLBACK — the WHOLE transaction is undone and the `Ok` tuple is
+    /// built only when every command succeeded and the transaction COMMITTED. A
+    /// failure is the FIRST command's classified [`SqliteError`].
+    ///
+    /// # Errors
+    ///
+    /// The first failing command's classified [`SqliteError`] (the transaction is
+    /// rolled back); or [`SqliteError::TransactionRollbackFailed`] if the rollback
+    /// itself fails.
+    pub fn pipeline<'p, B: crate::pipeline::SqlitePipeline<'p>>(
+        &self,
+        batch: B,
+    ) -> Result<B::Output, SqliteError> {
+        self.transaction(|tx| batch.run(tx))
+    }
+
     /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
     /// owned typed record. Zero rows is [`SqliteError::Query`]; more than one is
     /// [`SqliteError::TooManyRows`] — the same exactly-one contract the

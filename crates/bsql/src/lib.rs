@@ -539,6 +539,16 @@ pub use bsql_postgres_proto::{
 #[cfg(feature = "macros")]
 pub use bsql_postgres_core::Rows;
 
+/// Heterogeneous atomic pipelining (PostgreSQL) — [`Bound`] wraps a `query!`
+/// carrier with its params (build one with [`BindExt::bind`],
+/// `UserById::bind((7,))`), and a tuple of `Bound`s (arity `1..=16`) satisfies
+/// [`Pipeline`], the batch a driver's `pipeline((...))` verb runs in ONE round trip
+/// as ONE implicit transaction (all-or-nothing — see `pg::Connection::pipeline`).
+/// Gated on `macros` (like [`Rows`]): the types are usable wherever the `query!`
+/// flagship is; a driver feature provides the `Connection` to run a batch on.
+#[cfg(feature = "macros")]
+pub use bsql_postgres_core::{BindExt, Bound, Pipeline};
+
 // `RowsBuilder` is the INTERNAL prebuffer `Rows` is built from — a decode/collect
 // seam, not a consumer API. Re-exported (doc-hidden, like its definition) ONLY so
 // the query fixture's offline decode + allocation tests can name it through the
