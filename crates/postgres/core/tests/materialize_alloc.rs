@@ -233,30 +233,36 @@ fn no_op_sink<'s>(
 /// single-row read clones the `Arc` once instead of N times. **20 → 19** when
 /// `QueryResult.command_tag` became the `Copy` `CommandTag` instead of a heap
 /// `String`, deleting the per-result `t.to_string()` (and adding an `affected()`
-/// accessor). The remaining per-call prebuffer cost a later slice (a
-/// pooled/reused collector) would trim.
-const EAGER_QUERY_ALLOC_PIN: usize = 19;
+/// accessor). **19 → 18** when the `ResultCollector` stopped storing the
+/// result-column OID `Vec<u32>`: those OIDs are read at EXACTLY ONE cold site
+/// (`prepare_with_oids`, which now captures them into its own Vec in its pump
+/// closure), so every dynamic row-returning verb no longer pays a heap
+/// `Vec<u32>` per `Deliver` for a value it never read — the last per-`Deliver`
+/// metadata allocation the hot dynamic SELECT path charged. The remaining
+/// per-call prebuffer cost a later slice (a pooled/reused collector) would trim.
+const EAGER_QUERY_ALLOC_PIN: usize = 18;
 
 /// PINNED baseline: allocations charged to the WHOLE warm `reset_session()`
 /// round-trip — a fresh `ResultCollector` over the LITERAL 7-statement idle
 /// `RESET` reply, ending with the trailing `into_command_tag()` `simple_query`
-/// returns. Currently **15**: the collector now stores the `Copy` `CommandTag`
-/// (no per-statement tag `String`), so the ONLY tag allocation is the SINGLE
-/// `into_command_tag()` at the end that renders the last tag to a `String` for
-/// `simple_query`'s return — plus the row-returning `SELECT
-/// pg_advisory_unlock_all()`'s `Surface::Row` `ArenaBuilder`/value push and the
-/// ONE `oids`/`names` allocation its delivery needs. The pool pays this per
-/// re-acquire. History: 24 -> 23 when `simple_query` moved the tag out instead
-/// of cloning it; 23 -> 21 when the collector began REUSING the `oids` Vec spine
-/// (`clear` + `extend_from_slice`) instead of a fresh `to_vec()` per `Deliver` —
-/// the `pg_advisory_unlock_all` OIDs stay cached and ride three `Deliver`s in
-/// this batch, so the old code allocated three OID Vecs where one reused buffer
-/// now suffices (-2). **21 -> 15** when the command tag became a `Copy`
-/// `CommandTag`: the 7 per-statement `t.to_string()` allocations vanish from the
-/// feed, leaving one lazy render at the return (-7 feed, +1 render = -6). (The
-/// in-transaction `ROLLBACK`-prefixed variant is one statement longer — the idle
-/// path modelled here is the pooled steady state.)
-const RESET_ALLOC_PIN: usize = 15;
+/// returns. Currently **14**: the collector stores the `Copy` `CommandTag`
+/// (no per-statement tag `String`) and no longer stores the result-column OIDs
+/// at all, so the ONLY tag allocation is the SINGLE `into_command_tag()` at the
+/// end that renders the last tag to a `String` for `simple_query`'s return —
+/// plus the row-returning `SELECT pg_advisory_unlock_all()`'s `Surface::Row`
+/// `ArenaBuilder`/value push and the ONE `names` allocation its delivery needs.
+/// The pool pays this per re-acquire. History: 24 -> 23 when `simple_query`
+/// moved the tag out instead of cloning it; 23 -> 21 when the collector began
+/// REUSING the `oids` Vec spine (`clear` + `extend_from_slice`) instead of a
+/// fresh `to_vec()` per `Deliver` (-2). **21 -> 15** when the command tag became
+/// a `Copy` `CommandTag`: the 7 per-statement `t.to_string()` allocations vanish
+/// from the feed, leaving one lazy render at the return (-7 feed, +1 render =
+/// -6). **15 -> 14** when the collector stopped storing the result-column OIDs
+/// entirely (read at ONE cold site — `prepare_with_oids` — not this path): the
+/// single `pg_advisory_unlock_all` OID allocation this reset used to charge is
+/// gone. (The in-transaction `ROLLBACK`-prefixed variant is one statement longer
+/// — the idle path modelled here is the pooled steady state.)
+const RESET_ALLOC_PIN: usize = 14;
 
 #[test]
 fn eager_query_and_reset_prebuffer_allocs_are_pinned() {

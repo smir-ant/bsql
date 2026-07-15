@@ -1151,7 +1151,7 @@ impl<'a> DataRowRef<'a> {
         ColumnsIter {
             remaining: self.body_after_count,
             columns_left: self.n_columns,
-            column_idx: 0u16,
+            n_columns: self.n_columns,
         }
     }
 }
@@ -1173,11 +1173,15 @@ impl<'a> DataRowRef<'a> {
 pub struct ColumnsIter<'a> {
     remaining: &'a [u8],
     columns_left: u16,
-    /// Zero-based column index, bounded by [`MAX_ROW_COLUMNS`] (1664) — a `u16`,
-    /// the same width as the wire column count. Propagated into
-    /// `DecodeError::TruncatedColumn*`; a `u8` would saturate a real index past
-    /// column 255 and mis-report the failing column on a wide row.
-    column_idx: u16,
+    /// The row's ORIGINAL column count, captured once at construction and never
+    /// mutated. The failing column's 0-based index is recovered LAZILY in the
+    /// cold error arms as `n_columns - columns_left - 1` (see
+    /// [`failing_column_idx`](Self::failing_column_idx)), so the happy path pays
+    /// NO per-column index bookkeeping — no load / saturating-increment / store
+    /// of a running index. A `u16`, the same width as the wire column count and
+    /// bounded by [`MAX_ROW_COLUMNS`] (1664), so a real index past column 255 is
+    /// never truncated in a `DecodeError::TruncatedColumn*`.
+    n_columns: u16,
 }
 
 impl<'a> ColumnsIter<'a> {
@@ -1196,6 +1200,28 @@ impl<'a> ColumnsIter<'a> {
         self.columns_left = 0;
         Some(Err(e))
     }
+
+    /// The 0-based index of the column CURRENTLY being decoded, recovered for a
+    /// cold error arm.
+    ///
+    /// `next` decrements `columns_left` for the current column BEFORE any error
+    /// arm can fire, so at an error site `columns_left` already excludes the
+    /// current column; `n_columns - columns_left - 1` is therefore that column's
+    /// index. Must be read BEFORE [`fuse_and_error`](Self::fuse_and_error), which
+    /// zeroes `columns_left`.
+    ///
+    /// Called ONLY from the (cold) error arms — never the happy path, which is
+    /// exactly why the running index is not tracked per-column. Saturating
+    /// throughout: the loop invariant guarantees `columns_left <= n_columns - 1`
+    /// here, so neither subtraction underflows; the saturating form only
+    /// satisfies the crate's `arithmetic_side_effects` forbid and can never
+    /// yield a wrong-but-larger index.
+    #[inline]
+    fn failing_column_idx(&self) -> u16 {
+        self.n_columns
+            .saturating_sub(self.columns_left)
+            .saturating_sub(1)
+    }
 }
 
 impl<'a> Iterator for ColumnsIter<'a> {
@@ -1205,14 +1231,20 @@ impl<'a> Iterator for ColumnsIter<'a> {
         if self.columns_left == 0 {
             return None;
         }
-        let idx = self.column_idx;
-        self.column_idx = idx.saturating_add(1);
+        // Advance the loop counter ONLY — no running column index is kept. The
+        // current column's 0-based index is recovered on demand in the cold
+        // error arms via `failing_column_idx` (`n_columns - columns_left - 1`),
+        // so the happy path writes no per-column index field (the removed
+        // load / saturating-increment / store).
         self.columns_left = self.columns_left.saturating_sub(1);
 
         // 4-byte length prefix.
         let (len_bytes, after_len) = match self.remaining.split_first_chunk::<4>() {
             Some(pair) => pair,
-            None => return self.fuse_and_error(DecodeError::TruncatedColumnLen { column_idx: idx }),
+            None => {
+                let column_idx = self.failing_column_idx();
+                return self.fuse_and_error(DecodeError::TruncatedColumnLen { column_idx });
+            }
         };
         let len = i32::from_be_bytes(*len_bytes);
 
@@ -1244,8 +1276,9 @@ impl<'a> Iterator for ColumnsIter<'a> {
             // by crate-wide `as_conversions` forbid — try_from is
             // the accepted substitute with LLVM fusing the
             // non-negative fast path.
+            let column_idx = self.failing_column_idx();
             return self.fuse_and_error(DecodeError::NegativeColumnLength {
-                column_idx: idx,
+                column_idx,
                 length: len,
             });
         };
@@ -1257,6 +1290,7 @@ impl<'a> Iterator for ColumnsIter<'a> {
             }
             None => {
                 let remaining = after_len.len();
+                let column_idx = self.failing_column_idx();
                 // `len_usize` came from a non-negative `i32` prefix and
                 // `remaining` is a slice of the `<= 2 GB` row body, so both are
                 // `<= i32::MAX < u32::MAX` — the narrow is structurally
@@ -1264,7 +1298,7 @@ impl<'a> Iterator for ColumnsIter<'a> {
                 // (the truncation is still classified `TruncatedColumnData`)
                 // rather than a forbidden unwrap.
                 self.fuse_and_error(DecodeError::TruncatedColumnData {
-                    column_idx: idx,
+                    column_idx,
                     declared_len: u32::try_from(len_usize).unwrap_or(u32::MAX),
                     remaining: u32::try_from(remaining).unwrap_or(u32::MAX),
                 })
@@ -1929,8 +1963,9 @@ pub fn parse_long_uint_swar(bytes: &[u8]) -> Option<u64> {
 ///
 /// # Tier
 ///
-/// Tier-1 safe by construction (slice patterns, no indexing-slicing,
-/// no unsafe). Tier-3 false-negative classification (returns `None`
+/// Tier-1 safe by construction (`as_chunks` yields infallible fixed-size
+/// arrays, no indexing-slicing, no unsafe). Tier-3 false-negative
+/// classification (returns `None`
 /// on legal multi-byte UTF-8 — caller MUST follow up with full
 /// validator; documented contract). Closure: byte-position sweep
 /// over boundary values `0x7F` (highest ASCII, accepted) and `0x80`
@@ -1939,15 +1974,17 @@ pub fn parse_long_uint_swar(bytes: &[u8]) -> Option<u64> {
 #[must_use]
 pub fn validate_utf8_swar(bytes: &[u8]) -> Option<()> {
     const HIBIT: u64 = 0x8080_8080_8080_8080;
-    let mut tail: &[u8] = bytes;
-    while tail.len() >= 8 {
-        let (chunk, rest) = tail.split_at(8);
-        let arr: [u8; 8] = chunk.try_into().ok()?;
-        let packed = u64::from_le_bytes(arr);
+    // `as_chunks::<8>()` (stable 1.88) splits into infallible `&[u8; 8]` chunks
+    // plus a `< 8`-byte tail in one shot — no per-chunk `try_into().ok()?`
+    // fallible convert (that edge was architecturally dead: a `>= 8`-byte
+    // `split_at(8)` always yields exactly 8 bytes). Same SWAR, one fewer dead
+    // branch.
+    let (chunks, tail) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        let packed = u64::from_le_bytes(*chunk);
         if packed & HIBIT != 0 {
             return None;
         }
-        tail = rest;
     }
     for &b in tail {
         if b >= 0x80 {

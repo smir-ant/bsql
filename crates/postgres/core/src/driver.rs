@@ -1026,6 +1026,14 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         let stmt_name = self.next_stmt_name()?;
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
+        // `prepare` is the ONLY reader of the result-column OIDs, so it captures
+        // them directly into this owned Vec in its pump closure — the shared
+        // `ResultCollector` no longer stores an `oids` Vec (which charged every
+        // dynamic row-returning verb one heap `Vec<u32>` per `Deliver` for a
+        // value only this cold path reads). `Surface` is `Copy`, so the peeked
+        // `s` still feeds the collector; `clear` + `extend` keeps the LAST
+        // delivery (a prepare emits one result `Deliver`).
+        let mut result_oids: Vec<u32> = Vec::new();
         let outcome = self
             .engine
             .prepare(
@@ -1034,13 +1042,16 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 sql,
                 param_oids,
                 capture_notify(&mut self.notifications, self.diag.sink(), |s| {
+                    if let Surface::Deliver { oids, .. } = s {
+                        result_oids.clear();
+                        result_oids.extend_from_slice(oids);
+                    }
                     collector.feed(s);
                     ControlFlow::Continue(())
                 }),
             )
             .await;
         self.settle(outcome, &mut collector)?;
-        let result_oids = collector.oids().to_vec();
         let column_names: Arc<[String]> =
             Arc::from(collector.column_names().to_vec().into_boxed_slice());
         // The server-inferred parameter-type OIDs from the prepare's

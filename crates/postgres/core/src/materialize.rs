@@ -87,7 +87,6 @@ pub struct ResultCollector {
     /// costs no tag allocation; the affected-row count is a typed projection of
     /// it ([`affected`](Self::affected)), so no separate `affected` field.
     command_tag: CommandTag,
-    oids: Vec<u32>,
     column_names: Vec<String>,
     db_error: Option<DbError>,
     decode_error: Option<DriverError>,
@@ -128,7 +127,7 @@ impl ResultCollector {
                 body.clear();
                 self.chunk = body;
             }
-            Surface::Deliver { tag, oids, names } => {
+            Surface::Deliver { tag, names, .. } => {
                 // Store the `Copy` tag verbatim — no `to_string()` allocation.
                 // The affected-row count is a typed projection of it, read on
                 // demand via `affected()`.
@@ -138,24 +137,20 @@ impl ResultCollector {
                     // `Describe` completion): the empty tag, no row count.
                     None => CommandTag::EMPTY,
                 };
-                // Reuse the `oids` Vec SPINE across a multi-statement batch's
-                // successive `Deliver`s: `clear` + `extend_from_slice` keeps the
-                // backing allocation instead of dropping it and allocating a
-                // fresh one per statement, as `= to_vec()` did. This matters
-                // because a delivered statement's OIDs stay cached and ride EVERY
-                // subsequent completion in the batch (e.g. the pooled
-                // `reset_session` round-trip surfaces the `pg_advisory_unlock_all`
-                // OIDs on three `Deliver`s), so the old fresh-Vec-per-`Deliver`
-                // allocated once per repeat where one reused buffer suffices.
+                // The delivered `oids` slice is DELIBERATELY dropped here: the
+                // result-column type OIDs are read at EXACTLY ONE site — the cold
+                // `prepare_with_oids`, which captures them into its own owned Vec
+                // in its pump closure. Every dynamic ROW-RETURNING verb
+                // (`query_sql` / `query_params` / `simple_query`) fed this
+                // collector but never reads its OIDs, so storing them charged
+                // that hot path one heap `Vec<u32>` per `Deliver` for a value
+                // nobody read. Not capturing them here is that allocation gone.
                 //
-                // `column_names` deliberately stays `= to_vec()`: it flows into
+                // `column_names` stays `= to_vec()`: it flows into
                 // `build_query_result`'s `Arc::from(_.into_boxed_slice())` on the
                 // HOT `query_sql` path, and `into_boxed_slice()` is free only when
-                // cap == len — which `to_vec` guarantees but `extend`'s amortized
-                // growth (cap 4 for 2 names) does not, so reusing that spine would
-                // trade this cold-path win for a shrink-realloc on the hot path.
-                self.oids.clear();
-                self.oids.extend_from_slice(oids);
+                // cap == len — which `to_vec` guarantees but an `extend`'s
+                // amortized growth (cap 4 for 2 names) does not.
                 self.column_names = names.to_vec();
             }
             Surface::Fail(body) => self.db_error = Some(parse_error_response(body)),
@@ -192,12 +187,6 @@ impl ResultCollector {
     #[must_use]
     pub fn affected(&self) -> u64 {
         self.command_tag.rows_or_zero()
-    }
-
-    /// The result-column type OIDs recovered at the delivery (empty when none).
-    #[must_use]
-    pub fn oids(&self) -> &[u32] {
-        &self.oids
     }
 
     /// The result-column names recovered at the delivery (empty when none).
@@ -294,17 +283,24 @@ impl ResultCollector {
 /// Read a big-endian `i16` at `*cursor`, advancing it on success.
 fn read_be_i16(buf: &[u8], cursor: &mut usize) -> Option<i16> {
     let end = cursor.checked_add(2)?;
-    let bytes: [u8; 2] = buf.get(*cursor..end)?.try_into().ok()?;
+    // `first_chunk::<2>()` (stable 1.77) is one infallible-shape convert of the
+    // slice's leading 2 bytes to `&[u8; 2]` — no `try_into().ok()?` fallible
+    // edge (that arm was architecturally dead: an exactly-2-byte slice always
+    // converts). `first_chunk` returning `Some` proves `*cursor + 2 <= len`, so
+    // `end` is in range.
+    let bytes = buf.get(*cursor..)?.first_chunk::<2>()?;
     *cursor = end;
-    Some(i16::from_be_bytes(bytes))
+    Some(i16::from_be_bytes(*bytes))
 }
 
 /// Read a big-endian `i32` at `*cursor`, advancing it on success.
 fn read_be_i32(buf: &[u8], cursor: &mut usize) -> Option<i32> {
     let end = cursor.checked_add(4)?;
-    let bytes: [u8; 4] = buf.get(*cursor..end)?.try_into().ok()?;
+    // `first_chunk::<4>()` (stable 1.77) — same infallible convert, no dead
+    // `try_into().ok()?` edge.
+    let bytes = buf.get(*cursor..)?.first_chunk::<4>()?;
     *cursor = end;
-    Some(i32::from_be_bytes(bytes))
+    Some(i32::from_be_bytes(*bytes))
 }
 
 /// Parse a server `ErrorResponse` / `NoticeResponse` body into a [`DbError`].
