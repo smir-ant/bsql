@@ -1219,7 +1219,7 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   O(N) send memory or a hang). Cancellation (`57014`, connection recovers) and a mid-batch
   transport death (classified disconnect, bounded) are honored. `next_event` stays
   BYTE-IDENTICAL (the receive FSM is reused — no new dispatch state); `DriverError` (24 B)
-  / `ConnectConfig` (152 B) / `ActiveEngine` (392 B) footprints are unchanged (no new
+  / `ConnectConfig` (152 B) / `ActiveEngine` (432 B) footprints are unchanged (no new
   variant or field — the `pipelining` flag and `BatchFailed` variant are the pipeline's);
   `deps_pin` is unchanged. **SQLite twin:** `sqlite_conn.execute_batch_typed::<Q>(…)` runs
   the commands SEQUENTIALLY inside the standard `transaction` guard's `BEGIN … COMMIT`,
