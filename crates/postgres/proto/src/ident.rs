@@ -58,7 +58,7 @@
 //!
 //! A naive shape would define three near-identical newtypes
 //! (`Ident`, `DatabaseName`, `ApplicationName`) each wrapping a
-//! `heapless::Vec<u8, N>`, plus [`crate::ident::BoundedStr<N>`] —
+//! `arrayvec::ArrayVec<u8, N>`, plus [`crate::ident::BoundedStr<N>`] —
 //! a fourth, slightly different wrapper carrying a `[u8; N] + u16`
 //! form. The four would share ~300 LoC of validation, accessors,
 //! and `Debug`/`Display` impls.
@@ -74,8 +74,8 @@
 //!
 //! # POD — Copy, no Drop
 //!
-//! A `heapless::Vec<u8, N>`-backed form would carry a blanket `Drop`
-//! impl inherited from `heapless::Vec`. Even though the `u8` element
+//! A `arrayvec::ArrayVec<u8, N>`-backed form would carry a blanket `Drop`
+//! impl inherited from `arrayvec::ArrayVec`. Even though the `u8` element
 //! type has an empty `Drop` body, `needs_drop::<Vec<u8, _>>()`
 //! returns `true`, which would trip Drop propagation all the way up
 //! into `ProtoState`. POD form (`[u8; N] + u16`) makes
@@ -1065,8 +1065,8 @@ impl DescribeName for PortalName {
 ///
 /// Identical to `FixedStr` minus the phantom tag: `{ buf: [u8; N],
 /// len: u16 }`. `Copy`, `Clone`, `PartialEq`, `Eq`, no `Drop`,
-/// `Default`. Used in state fields instead of `heapless::Vec<u8, N>`
-/// to avoid propagating the blanket `Vec::drop` (empty body for
+/// `Default`. Used in state fields instead of `arrayvec::ArrayVec<u8, N>`
+/// to avoid propagating the blanket `ArrayVec::drop` (empty body for
 /// `u8`, but `needs_drop = true`) up into
 /// `crate::state::ProtoState`.
 // Clone/Copy/PartialEq/Eq are impl'd manually for the LenT-generic

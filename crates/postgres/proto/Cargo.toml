@@ -78,7 +78,7 @@ md5-auth = ["dep:md-5"]
 # feature is physically absent, so there is no leak surface to enable.
 
 [dependencies]
-heapless = { workspace = true }
+arrayvec = { workspace = true }
 # SCRAM-SHA-256 crypto — OPTIONAL, behind the default-on `scram` feature. Each is
 # named only by the `scram`-gated `scram` module, so with SCRAM off they leave the
 # runtime graph. `md-5` (below) rides the default-on `md5-auth` feature and shares

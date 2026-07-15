@@ -86,7 +86,7 @@ pub const MAX_SERVER_NONCE_LEN: usize = 256;
 #[derive(Clone)]
 #[repr(transparent)]
 pub struct CappedServerNonce {
-    buf: heapless::Vec<u8, MAX_SERVER_NONCE_LEN>,
+    buf: arrayvec::ArrayVec<u8, MAX_SERVER_NONCE_LEN>,
 }
 
 /// Error when a server nonce exceeds the capacity bound.
@@ -113,8 +113,8 @@ impl CappedServerNonce {
     ///
     /// Returns `Err` if the nonce exceeds [`MAX_SERVER_NONCE_LEN`].
     pub(crate) fn try_from_bytes(input: &[u8]) -> Result<Self, ServerNonceTooLong> {
-        let mut buf = heapless::Vec::new();
-        buf.extend_from_slice(input)
+        let mut buf = arrayvec::ArrayVec::new_const();
+        buf.try_extend_from_slice(input)
             .map_err(|_| ServerNonceTooLong { len: input.len() })?;
         Ok(Self { buf })
     }

@@ -1,6 +1,6 @@
 //! Bounded outbound frame builder.
 //!
-//! [`WriteBuf`] wraps `heapless::Vec<u8, MAX_OWNED_SEND_LEN>` with
+//! [`WriteBuf`] wraps `arrayvec::ArrayVec<u8, MAX_OWNED_SEND_LEN>` with
 //! PG-wire-aware helpers: [`WriteBuf::push_u8`], [`WriteBuf::push_u32_be`],
 //! [`WriteBuf::push_nul_terminated`], and [`WriteBuf::with_length_prefix`] for the PG
 //! "length includes itself but excludes tag" convention. Every mutator
@@ -305,7 +305,7 @@ const _: () = assert!(
 ///
 /// See [module-level docs](self) for sizing rationale.
 pub struct WriteBuf {
-    inner: heapless::Vec<u8, MAX_OWNED_SEND_LEN>,
+    inner: arrayvec::ArrayVec<u8, MAX_OWNED_SEND_LEN>,
 }
 
 /// Returned when a write operation would exceed the buffer capacity.
@@ -460,14 +460,14 @@ impl WriteBuf {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            inner: heapless::Vec::new(),
+            inner: arrayvec::ArrayVec::new_const(),
         }
     }
 
     /// Push a single byte.
     #[inline]
     pub fn push_u8(&mut self, byte: u8) -> Result<(), WriteBufFull> {
-        self.inner.push(byte).map_err(|_| WriteBufFull)
+        self.inner.try_push(byte).map_err(|_| WriteBufFull)
     }
 
     /// Push a big-endian `u32`.
@@ -475,7 +475,7 @@ impl WriteBuf {
     pub fn push_u32_be(&mut self, val: u32) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
-            .extend_from_slice(&bytes)
+            .try_extend_from_slice(&bytes)
             .map_err(|_| WriteBufFull)
     }
 
@@ -484,7 +484,7 @@ impl WriteBuf {
     pub fn push_i32_be(&mut self, val: i32) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
-            .extend_from_slice(&bytes)
+            .try_extend_from_slice(&bytes)
             .map_err(|_| WriteBufFull)
     }
 
@@ -499,7 +499,7 @@ impl WriteBuf {
     pub fn push_i16_be(&mut self, val: i16) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
-            .extend_from_slice(&bytes)
+            .try_extend_from_slice(&bytes)
             .map_err(|_| WriteBufFull)
     }
 
@@ -511,7 +511,7 @@ impl WriteBuf {
     pub fn push_u16_be(&mut self, val: u16) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
-            .extend_from_slice(&bytes)
+            .try_extend_from_slice(&bytes)
             .map_err(|_| WriteBufFull)
     }
 
@@ -521,7 +521,7 @@ impl WriteBuf {
     pub fn push_i64_be(&mut self, val: i64) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
-            .extend_from_slice(&bytes)
+            .try_extend_from_slice(&bytes)
             .map_err(|_| WriteBufFull)
     }
 
@@ -532,7 +532,7 @@ impl WriteBuf {
     pub fn push_u64_be(&mut self, val: u64) -> Result<(), WriteBufFull> {
         let bytes = val.to_be_bytes();
         self.inner
-            .extend_from_slice(&bytes)
+            .try_extend_from_slice(&bytes)
             .map_err(|_| WriteBufFull)
     }
 
@@ -540,7 +540,7 @@ impl WriteBuf {
     #[inline]
     pub fn push_bytes(&mut self, data: &[u8]) -> Result<(), WriteBufFull> {
         self.inner
-            .extend_from_slice(data)
+            .try_extend_from_slice(data)
             .map_err(|_| WriteBufFull)
     }
 
@@ -681,7 +681,7 @@ impl WriteBuf {
     ///
     /// # Zero-on-clear discipline
     ///
-    /// `heapless::Vec::clear()` by itself only resets the length to 0
+    /// `ArrayVec::clear()` by itself only resets the length to 0
     /// — the backing bytes persist in the 2176-byte array until a
     /// later `push_*` call overwrites them. Without zeroize, the
     /// buffer would retain **password-correlated SCRAM SASLResponse
@@ -725,9 +725,8 @@ impl Default for WriteBuf {
 
 /// Manual Drop impl zeroizes the occupied prefix on scope teardown.
 ///
-/// Rationale: `heapless::Vec` does NOT implement `zeroize::Zeroize`
-/// (the upstream crate bounds `Zeroize` on `Default + Copy`, which
-/// Vec does not satisfy). Scrub manually via `Zeroize` on the mut
+/// Rationale: `arrayvec::ArrayVec` does NOT implement `zeroize::Zeroize`
+/// (it is a foreign type with no `Zeroize` impl). Scrub manually via `Zeroize` on the mut
 /// slice (impl'd for `[u8]`). Ensures that on normal Drop — e.g.
 /// when a wrapper's connection handle goes out of scope — any
 /// residual password-correlated bytes (SASLResponse ClientProof) are
@@ -764,7 +763,7 @@ mod drop_witness_tests {
     //!
     //! `WriteBuf::drop` is a manual `impl Drop` that calls
     //! `inner.as_mut_slice().zeroize()` (no `ZeroizeOnDrop` derive
-    //! because `heapless::Vec` doesn't implement `Zeroize` upstream).
+    //! because `arrayvec::ArrayVec` doesn't implement `Zeroize`).
     //! Every `cargo test` increments the counter when
     //! `WriteBuf::drop` reaches its zeroize body. Catches regressions
     //! that remove the manual Drop impl (which would silently retain

@@ -118,7 +118,7 @@ classified `Cell<TextFmt>` decoder; `get_f64` adds the text-float path.
 ```
 bsql-postgres (this crate)
   └─ bsql-pg-proto (sans-IO state machine, #![forbid(unsafe_code)])
-       └─ heapless, simdutf8, sha2, hmac, pbkdf2, md-5, zeroize, getrandom
+       └─ arrayvec, simdutf8, sha2, hmac, pbkdf2, md-5, zeroize, getrandom
 ```
 
 The sans-IO protocol handles all wire-format parsing, state transitions,

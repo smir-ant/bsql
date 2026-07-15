@@ -39,14 +39,14 @@
 //! source-scan in the `engine_ingest_memset_guard` integration test, which
 //! fails if any memset-family call reappears in `read_slot` / `commit` /
 //! `next_event`.
-//! 2. **Per-call `heapless::Vec::resize_default`** — `heapless::Vec`
-//!    cannot lend its uninitialised spare capacity as `&mut [u8]` without
-//!    `unsafe` (`spare_capacity_mut` yields `&mut [MaybeUninit<u8>]`, and
-//!    committing it needs the `unsafe` `set_len`). The safe escape is to
-//!    `resize_default` to grow by `want` zero-filled bytes and lend the
-//!    now-initialised tail — but that is an O(`want`) **memset on every
-//!    read**, a recurring per-read zero-fill. Rejected: it reintroduces
-//!    exactly the recurring cost the watermark exists to remove.
+//! 2. **Per-call bounded-`Vec` grow-and-zero-fill** — a fixed-capacity inline
+//!    `arrayvec::ArrayVec` cannot lend its uninitialised spare capacity as
+//!    `&mut [u8]` without `unsafe` (its spare capacity is `MaybeUninit<u8>`,
+//!    and committing it needs an `unsafe` length set). The safe escape is to
+//!    zero-fill the grown tail and lend the now-initialised bytes — but that
+//!    is an O(`want`) **memset on every read**, a recurring per-read
+//!    zero-fill. Rejected: it reintroduces exactly the recurring cost the
+//!    watermark exists to remove.
 //! 3. **Audited `unsafe` `set_len`** — lend `spare_capacity_mut()` and
 //!    `set_len` after the socket writes. Zero memset, zero copy, but it
 //!    requires `unsafe`. This crate is `#![forbid(unsafe_code)]` and is a

@@ -283,14 +283,24 @@ disallowed_methods = "deny"
 # green), and it merges the two formerly-distinct `N1Report` types into one, so a
 # consumer's cross-backend N+1 handling is genuinely backend-agnostic.
 
-# `heapless` — bounded, stack-allocated `Vec<T, N>` / `String<N>` /
-# `FnvIndexMap<K, V, N>`. `bsql-pg-proto` is `no_std` and forbids
-# `alloc`; the only way to build a runtime-sized buffer (the read
-# buffer that absorbs incoming wire bytes) is `heapless::Vec`.
-# Writing a 250-LoC bounded ringbuffer ourselves duplicates a
-# 6-year-stable upstream that ships zero transitive deps with
-# `default-features = false`.
-heapless = { version = "0.9.2", default-features = false }
+# `arrayvec` — bounded, stack-allocated `ArrayVec<T, N>` (fixed-capacity
+# inline vector, no heap). `bsql-postgres-proto` is `no_std`: its outbound
+# `WriteBuf` frame buffer and the SCRAM nonce / salt / message builders are
+# fixed-capacity inline `ArrayVec<u8, N>`s with capacity-checked `try_push` /
+# `try_extend_from_slice` (a builder overflow is a classified error, never a
+# panic). Chosen over `heapless`: `heapless` 0.9 declares `hash32` (→
+# `byteorder`) as a NON-optional dependency (it backs `heapless::IndexMap`,
+# which bsql never uses — bsql only ever used `heapless::Vec<u8, N>`), so those
+# two crates sat DEAD in the resolved dependency frontier even under
+# `default-features = false` — LTO strips them from the shipped binary, but they
+# are a real compile-time + supply-chain + `deps_pin`-golden cost. `arrayvec`
+# provides the identical fixed-capacity inline buffer with ZERO transitive deps
+# under `default-features = false`, so the swap nets −2 crates (−heapless,
+# −hash32, −byteorder, +arrayvec). Not a trivial <200-LoC utility to hand-roll:
+# a bounded inline `Vec<u8, N>` over uninitialised tail storage is a
+# `MaybeUninit` / drop-safety minefield (uninitialised-read UB), so it is the
+# audited-standard case (policy 9-adjacent), not a hand-roll one.
+arrayvec = { version = "0.7", default-features = false }
 
 # `sha2` — SHA-256 hash used by SCRAM-SHA-256 authentication (RFC 5802).
 # Expert-domain cryptography: DEF-META-01 mandates we never hand-roll
@@ -608,8 +618,9 @@ opt-level = 3
 #         unwrap/expect/panic/indexing/arithmetic in crate code).
 #       * Third-party crypto deps (sha2, hmac, pbkdf2, base64ct) are
 #         documented infallible or return Result — no panics.
-#     But theoretically: an OOM in heapless Vec extend could panic,
-#     the abort would freeze that stack frame with secret bytes.
+#     But theoretically: a capacity overflow in an `arrayvec::ArrayVec`
+#     `try_extend_from_slice` is a returned `Err` (never a panic), so even
+#     that path does not abort with secret bytes on the frame.
 #
 # ALTERNATIVE (future design discussion):
 #   Option 1: switch to `panic = "unwind"` in release (accept size/FFI

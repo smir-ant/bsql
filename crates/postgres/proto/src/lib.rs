@@ -116,11 +116,13 @@ extern crate alloc;
 //    (1M+ downloads/month). Failure mode: misclassified text →
 //    `DecodeError::NonUtf8` (classified), never UB on attacker bytes.
 //
-// 2. `heapless` — bounded-capacity inline `Vec`/`String`. Used by the
-//    engine send/ingest buffers, the SCRAM wire builders, the `ident`
-//    `FixedStr`, and `write_buf`. Audit-trust class: **ecosystem-tested**
-//    (embedded-Rust standard). Scope of trust: a bounded-cap `Vec` never
-//    writes past its declared `N`; we never construct one from raw pointers.
+// 2. `arrayvec` — bounded, fixed-capacity inline `ArrayVec<u8, N>` (no heap).
+//    Used by the engine outbound send-frame buffer (`write_buf`'s `WriteBuf`)
+//    and the SCRAM wire builders (nonce / salt / client-first / client-final).
+//    Audit-trust class: **ecosystem-tested** (the fixed-capacity-vec standard).
+//    Scope of trust: a bounded-cap `ArrayVec` never writes past its declared
+//    `N` (`try_push` / `try_extend_from_slice` return `Err` at the bound); we
+//    never construct one from raw pointers.
 //
 // 3. RustCrypto: `sha2` + `md-5` + `hmac` + `pbkdf2` — SCRAM-SHA-256 / MD5
 //    primitives. Audit-trust class: **expert-domain crypto** (CREDO §11 —

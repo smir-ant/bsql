@@ -160,7 +160,7 @@ crate::wire_pin!(PreparedStatement, size = 96, align = 8);
 
 /// Build one frame into a transient scrub-on-drop scratch buffer and queue it.
 ///
-/// `WriteBuf` is `heapless` (a stack array), so this allocates nothing on the
+/// `WriteBuf` is `arrayvec`-backed (a stack array), so this allocates nothing on the
 /// heap. A builder overflow (the SQL/params exceeded the bounded capacity) is the
 /// classified [`EngineError::FrameTooLong`], never a silent truncation.
 #[inline]

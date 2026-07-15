@@ -34,7 +34,7 @@ bsql::query!(UserNames, "SELECT id, email FROM users");
 
 // Dynamic forms: a toggled optional filter, a `= ANY($1)` array in-list,
 // and a runtime ORDER BY allow-set. Their wire artifacts are const, so
-// reading them — and encoding the array param into the heapless send
+// reading them — and encoding the array param into the arrayvec send
 // buffer — must allocate nothing.
 bsql::query!(OptUser, "SELECT id FROM users WHERE OPTIONAL(id = $1)");
 bsql::query!(AnyOrders, "SELECT id FROM orders WHERE id = ANY($1)");
@@ -106,7 +106,7 @@ fn borrowed_decode_is_zero_alloc_owned_text_allocates() {
     black_box(dyn_len);
     let dyn_wire_allocs = after.delta(before).allocs;
 
-    // (6) Encoding a `= ANY($1)` array parameter writes into the heapless
+    // (6) Encoding a `= ANY($1)` array parameter writes into the arrayvec
     // send buffer — zero allocations.
     let before = ALLOC.snapshot();
     let mut buf = WriteBuf::new();
@@ -138,7 +138,7 @@ fn borrowed_decode_is_zero_alloc_owned_text_allocates() {
     );
     assert!(
         encode_result.is_ok(),
-        "array param must fit the heapless send buffer"
+        "array param must fit the arrayvec send buffer"
     );
     assert_eq!(
         array_encode_allocs, 0,

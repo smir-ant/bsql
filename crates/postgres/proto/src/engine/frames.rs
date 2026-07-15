@@ -7,7 +7,7 @@
 //! the simple-query header) build into a transient bounded
 //! [`WriteBuf`] and are copied onto the engine's persistent
 //! [`SendBuf`](super::SendBuf) — the transient-scratch / persistent-queue split
-//! the connecting handshake uses. [`WriteBuf`] is `heapless` and scrub-on-drop,
+//! the connecting handshake uses. [`WriteBuf`] is `arrayvec`-backed and scrub-on-drop,
 //! so a parameter-bearing assembly never outlives the build, and its capacity is
 //! const-asserted to fit every bounded frame's worst case.
 //!

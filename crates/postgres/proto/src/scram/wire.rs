@@ -528,16 +528,16 @@ impl fmt::Display for ScramError {
 pub(crate) fn build_client_first_bare(
     user: &[u8],
     client_nonce_b64: &[u8],
-) -> Result<heapless::Vec<u8, MAX_CLIENT_FIRST_BARE_LEN>, ScramError> {
-    let mut buf = heapless::Vec::new();
+) -> Result<arrayvec::ArrayVec<u8, MAX_CLIENT_FIRST_BARE_LEN>, ScramError> {
+    let mut buf = arrayvec::ArrayVec::new_const();
     // "n=" + user + ",r=" + nonce
-    buf.extend_from_slice(b"n=")
+    buf.try_extend_from_slice(b"n=")
         .map_err(|_| ScramError::BufferOverflow)?;
-    buf.extend_from_slice(user)
+    buf.try_extend_from_slice(user)
         .map_err(|_| ScramError::BufferOverflow)?;
-    buf.extend_from_slice(b",r=")
+    buf.try_extend_from_slice(b",r=")
         .map_err(|_| ScramError::BufferOverflow)?;
-    buf.extend_from_slice(client_nonce_b64)
+    buf.try_extend_from_slice(client_nonce_b64)
         .map_err(|_| ScramError::BufferOverflow)?;
     Ok(buf)
 }
@@ -552,17 +552,17 @@ pub(crate) fn build_client_first_message(
     gs2_header: &[u8],
     user: &[u8],
     client_nonce_b64: &[u8],
-) -> Result<heapless::Vec<u8, MAX_CLIENT_FIRST_MSG_LEN>, ScramError> {
-    let mut msg = heapless::Vec::new();
-    msg.extend_from_slice(gs2_header)
+) -> Result<arrayvec::ArrayVec<u8, MAX_CLIENT_FIRST_MSG_LEN>, ScramError> {
+    let mut msg = arrayvec::ArrayVec::new_const();
+    msg.try_extend_from_slice(gs2_header)
         .map_err(|_| ScramError::BufferOverflow)?;
-    msg.extend_from_slice(b"n=")
+    msg.try_extend_from_slice(b"n=")
         .map_err(|_| ScramError::BufferOverflow)?;
-    msg.extend_from_slice(user)
+    msg.try_extend_from_slice(user)
         .map_err(|_| ScramError::BufferOverflow)?;
-    msg.extend_from_slice(b",r=")
+    msg.try_extend_from_slice(b",r=")
         .map_err(|_| ScramError::BufferOverflow)?;
-    msg.extend_from_slice(client_nonce_b64)
+    msg.try_extend_from_slice(client_nonce_b64)
         .map_err(|_| ScramError::BufferOverflow)?;
     Ok(msg)
 }
@@ -578,19 +578,19 @@ pub(crate) fn build_client_first_message(
 /// return. It never crosses a `feed_bytes` / `push_command` boundary.
 /// The state that DOES persist to the next call
 /// (`crate::ProtoState::ConnectingScramAwaitingServerFinal`) carries
-/// only the POD `SecretDigest` — the `heapless::Vec` fields here
+/// only the POD `SecretDigest` — the `arrayvec::ArrayVec` fields here
 /// never propagate Drop into the state enum.
 ///
-/// Consequence for audits: a "replace `heapless::Vec` with `PodBytes`
+/// Consequence for audits: a "replace `arrayvec::ArrayVec` with `PodBytes`
 /// for state-Drop-cleanliness" suggestion does NOT apply here. The
-/// fields are fine as `heapless::Vec` — the Drop surface is bounded
+/// fields are fine as `arrayvec::ArrayVec` — the Drop surface is bounded
 /// to the parse frame's stack scope.
 #[derive(Debug)]
 pub(crate) struct ServerFirst {
     /// The full server nonce (`r=<value>`) — must start with client nonce.
     pub(crate) server_nonce: CappedServerNonce,
     /// Base64-decoded salt.
-    pub(crate) salt: heapless::Vec<u8, MAX_SALT_LEN>,
+    pub(crate) salt: arrayvec::ArrayVec<u8, MAX_SALT_LEN>,
     /// Iteration count.
     pub(crate) iterations: u32,
 }
@@ -710,15 +710,15 @@ pub(crate) fn parse_server_first(
 pub(crate) fn build_client_final_without_proof(
     cbind_b64: &[u8],
     server_nonce: &[u8],
-) -> Result<heapless::Vec<u8, MAX_CLIENT_FINAL_MSG_LEN>, ScramError> {
-    let mut buf = heapless::Vec::new();
-    buf.extend_from_slice(b"c=")
+) -> Result<arrayvec::ArrayVec<u8, MAX_CLIENT_FINAL_MSG_LEN>, ScramError> {
+    let mut buf = arrayvec::ArrayVec::new_const();
+    buf.try_extend_from_slice(b"c=")
         .map_err(|_| ScramError::BufferOverflow)?;
-    buf.extend_from_slice(cbind_b64)
+    buf.try_extend_from_slice(cbind_b64)
         .map_err(|_| ScramError::BufferOverflow)?;
-    buf.extend_from_slice(b",r=")
+    buf.try_extend_from_slice(b",r=")
         .map_err(|_| ScramError::BufferOverflow)?;
-    buf.extend_from_slice(server_nonce)
+    buf.try_extend_from_slice(server_nonce)
         .map_err(|_| ScramError::BufferOverflow)?;
     Ok(buf)
 }
@@ -728,11 +728,11 @@ pub(crate) fn build_client_final_message(
     cbind_b64: &[u8],
     server_nonce: &[u8],
     proof_b64: &[u8],
-) -> Result<heapless::Vec<u8, MAX_CLIENT_FINAL_MSG_LEN>, ScramError> {
+) -> Result<arrayvec::ArrayVec<u8, MAX_CLIENT_FINAL_MSG_LEN>, ScramError> {
     let mut buf = build_client_final_without_proof(cbind_b64, server_nonce)?;
-    buf.extend_from_slice(b",p=")
+    buf.try_extend_from_slice(b",p=")
         .map_err(|_| ScramError::BufferOverflow)?;
-    buf.extend_from_slice(proof_b64)
+    buf.try_extend_from_slice(proof_b64)
         .map_err(|_| ScramError::BufferOverflow)?;
     Ok(buf)
 }
@@ -813,7 +813,7 @@ pub(crate) fn base64_encode_to_buf(
     Ok(encoded_len)
 }
 
-/// Base64-decode into a bounded heapless::Vec.
+/// Base64-decode into a bounded `arrayvec::ArrayVec`.
 ///
 /// Same constant-time guarantees as the encoder, applied to the
 /// salt. (The salt is not secret per se — the server sends it
@@ -821,7 +821,7 @@ pub(crate) fn base64_encode_to_buf(
 /// side-channel posture uniform across SCRAM wire parsing.)
 fn base64_decode_bounded(
     input: &[u8],
-) -> Result<heapless::Vec<u8, MAX_SALT_LEN>, ScramError> {
+) -> Result<arrayvec::ArrayVec<u8, MAX_SALT_LEN>, ScramError> {
     use base64ct::{Base64, Encoding};
 
     // Strict RFC 4648 decode.
@@ -852,9 +852,9 @@ fn base64_decode_bounded(
     let mut decode_buf = [0u8; MAX_SALT_LEN];
     let decoded: &[u8] = Base64::decode(input, &mut decode_buf)
         .map_err(|_| ScramError::Base64DecodeError)?;
-    let mut result = heapless::Vec::new();
+    let mut result = arrayvec::ArrayVec::new_const();
     result
-        .extend_from_slice(decoded)
+        .try_extend_from_slice(decoded)
         .map_err(|_| ScramError::InvalidSalt)?;
     Ok(result)
 }
@@ -871,7 +871,7 @@ fn base64_decode_bounded(
 /// This injection point is physically absent from non-test builds
 /// (tier-1 by build configuration).
 #[cfg(not(test))]
-pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NONCE_B64_LEN>, ScramError> {
+pub(crate) fn generate_client_nonce() -> Result<arrayvec::ArrayVec<u8, MAX_CLIENT_NONCE_B64_LEN>, ScramError> {
     let mut raw = zeroize::Zeroizing::new([0u8; 18]);
     // Classify randomness failure separately from buffer overflow.
     // A naive `map_err(|_| BufferOverflow)` would produce
@@ -880,10 +880,10 @@ pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NON
     getrandom::getrandom(raw.as_mut()).map_err(|_| ScramError::RandomnessUnavailable)?;
     let mut b64_buf = [0u8; MAX_CLIENT_NONCE_B64_LEN];
     let written = base64_encode_to_buf(&*raw, &mut b64_buf)?;
-    let mut result = heapless::Vec::new();
+    let mut result = arrayvec::ArrayVec::new_const();
     let src = b64_buf.get(..written).ok_or(ScramError::BufferOverflow)?;
     result
-        .extend_from_slice(src)
+        .try_extend_from_slice(src)
         .map_err(|_| ScramError::BufferOverflow)?;
     Ok(result)
 }
@@ -896,7 +896,7 @@ pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NON
 /// RNG-failure classification path that is otherwise unreachable
 /// (getrandom rarely fails on test hosts).
 #[cfg(test)]
-pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NONCE_B64_LEN>, ScramError> {
+pub(crate) fn generate_client_nonce() -> Result<arrayvec::ArrayVec<u8, MAX_CLIENT_NONCE_B64_LEN>, ScramError> {
     // Check forced-failure flag first.
     let forced = FORCE_RNG_FAILURE.with(|cell| *cell.borrow());
     if forced {
@@ -904,9 +904,9 @@ pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NON
     }
     FIXED_TEST_NONCE.with(|cell| {
         if let Some(fixed) = cell.borrow().as_ref() {
-            let mut result = heapless::Vec::new();
+            let mut result = arrayvec::ArrayVec::new_const();
             result
-                .extend_from_slice(fixed.as_bytes())
+                .try_extend_from_slice(fixed.as_bytes())
                 .map_err(|_| ScramError::BufferOverflow)?;
             Ok(result)
         } else {
@@ -918,10 +918,10 @@ pub(crate) fn generate_client_nonce() -> Result<heapless::Vec<u8, MAX_CLIENT_NON
                 .map_err(|_| ScramError::RandomnessUnavailable)?;
             let mut b64_buf = [0u8; MAX_CLIENT_NONCE_B64_LEN];
             let written = base64_encode_to_buf(&*raw, &mut b64_buf)?;
-            let mut result = heapless::Vec::new();
+            let mut result = arrayvec::ArrayVec::new_const();
             let src = b64_buf.get(..written).ok_or(ScramError::BufferOverflow)?;
             result
-                .extend_from_slice(src)
+                .try_extend_from_slice(src)
                 .map_err(|_| ScramError::BufferOverflow)?;
             Ok(result)
         }
@@ -1191,7 +1191,7 @@ mod total_function_fuzz {
     //!    [`ScramError`](super::ScramError), and NEVER panics or aborts. Proven
     //!    at the machine level under `catch_unwind`: strictly stronger than the
     //!    source `forbid`-bundle, since it also catches a panic hiding in a
-    //!    dependency the parser calls (`base64ct`, `heapless`,
+    //!    dependency the parser calls (`base64ct`, `arrayvec`,
     //!    `core::str::from_utf8`).
     //! 2. **Never silent-pass (parser).** An `Ok` from `parse_server_final`
     //!    implies a `v=`-prefixed input; an `Ok` from `parse_server_first`

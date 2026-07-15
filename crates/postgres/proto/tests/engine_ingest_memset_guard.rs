@@ -81,7 +81,7 @@ const FORBIDDEN: &[&str] = &[
     ".fill(",            // slice/array constant-fill memset
     ".fill_with(",       // slice/array fill via a per-element closure
     ".resize(",          // Vec grow-with-value (zero-fills the new tail)
-    ".resize_default(",  // heapless/Vec grow-with-Default (the rejected alt 2)
+    ".resize_default(",  // bounded-Vec grow-with-Default memset (the rejected alt 2)
     ".resize_with(",     // Vec grow via a per-element closure
     ".zeroize(",         // explicit scrub — legitimate ONCE in Drop, never per-read
 ];

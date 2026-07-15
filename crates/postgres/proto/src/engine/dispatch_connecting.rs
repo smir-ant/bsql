@@ -864,7 +864,7 @@ fn build_sasl_response(
         .map_err(|_| ConnFail::BufferOverflow)?;
     let push_result = write.with_length_prefix(|w| w.push_bytes(&client_final_msg));
     // Scrub the password-correlated client-final bytes now they are copied
-    // into the write buffer (the heapless::Vec has no ZeroizeOnDrop).
+    // into the write buffer (the arrayvec::ArrayVec has no ZeroizeOnDrop).
     use zeroize::Zeroize;
     client_final_msg.as_mut_slice().zeroize();
     push_result.map_err(|_| ConnFail::BufferOverflow)?;
