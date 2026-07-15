@@ -125,13 +125,23 @@ pub trait Pipeline<'p>: sealed::Sealed {
     /// Number of commands in the batch (`1..=16`).
     const ARITY: usize;
 
-    /// Stage every command's request frames onto the engine (the FIRST with
-    /// `first = true` resets the buffer + seats pipeline mode), pushing each
-    /// command's content-addressed statement name onto `plan` for the cache settle.
+    /// Stage the `i`-th command's request frames onto the engine — the PER-COMMAND
+    /// staging cursor the windowed drive calls to interleave staging with window
+    /// drains (command `0` with `first = true` resets the buffer + seats pipeline
+    /// mode), pushing the command's content-addressed statement name onto `plan`
+    /// for the cache settle. The driver invokes it for `i` in `0..ARITY`; an
+    /// out-of-range `i` is a fail-closed classified [`DriverError`], never reached.
+    ///
+    /// A monolithic "stage all" would preclude the windowed batcher (constant send
+    /// memory, deadlock-free), so staging is a cursor: [`Core::pipeline`](crate::Core::pipeline)
+    /// stages one command, checks the send-buffer high-water, and flushes+drains a
+    /// window before staging the next — exactly as `execute_batch` streams its
+    /// parameter sets.
     #[doc(hidden)]
-    fn stage<S: Transport<Error = io::Error>>(
+    fn stage_nth<S: Transport<Error = io::Error>>(
         &self,
         core: &mut Core<S>,
+        i: usize,
         plan: &mut Vec<&'static str>,
     ) -> Result<(), DriverError>;
 
@@ -159,15 +169,21 @@ macro_rules! pipeline_impl {
             const ARITY: usize = $count;
 
             #[inline]
-            fn stage<S: Transport<Error = io::Error>>(
+            fn stage_nth<S: Transport<Error = io::Error>>(
                 &self,
                 core: &mut Core<S>,
+                i: usize,
                 plan: &mut Vec<&'static str>,
             ) -> Result<(), DriverError> {
-                $(
-                    core.stage_pipeline_cmd::<$q>(&self.$idx, $first, plan)?;
-                )+
-                Ok(())
+                match i {
+                    $(
+                        $idx => core.stage_pipeline_cmd::<$q>(&self.$idx, $first, plan),
+                    )+
+                    // The driver stages `i` in `0..ARITY`, so this arm is
+                    // unreachable; classified fail-closed (never an index panic),
+                    // the sanctioned dead-arm shape the `finish` `ok_or` uses.
+                    _ => Err(DriverError::UnclassifiedFailure),
+                }
             }
 
             #[inline]

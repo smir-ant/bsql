@@ -446,7 +446,14 @@ const ENGINE_ERROR_VARIANTS: usize = 15;
 /// `execute_batch` (drives one Flush-terminated window, breaking at its delivery
 /// count). Its staging helpers (`stage_execute_batch_command` / `stage_flush` /
 /// `pending_send_len`) take NO `Live` token, so they do not count.
-const ACTIVE_VERBS: usize = 25;
+/// 27 adds the two verbs the windowed HETEROGENEOUS `pipeline` needs:
+/// `run_pipeline_break_guarded` (the GUARDED intermediate-window drive — a
+/// pipeline decodes each command, so it also BAILS if a MISS command's
+/// result-schema guard parks a mismatch mid-window, which a `Flush`-terminated
+/// window has no `Sync` to drain) and the shared `run_pipeline_break_impl`
+/// (`run_pipeline_break` + `run_pipeline_break_guarded` differ only in the
+/// `const BAIL_ON_GUARD_MISMATCH` they thread into the pump; both delegate here).
+const ACTIVE_VERBS: usize = 27;
 /// `core::hint::cold_path()` classified-branch markers across `engine/`.
 /// Reproduce: `grep -rho 'core::hint::cold_path()' crates/postgres/proto/src/engine/*.rs | wc -l`
 /// (52 includes the COPY-in `write_all` `WriteZero`/`SendOverrun` branches,
@@ -476,7 +483,11 @@ const ACTIVE_VERBS: usize = 25;
 /// 56 → 57: the typed result-schema guard's mismatch branch in
 /// `apply_fused_row_stream` marks its (rare — a live/build schema divergence)
 /// drain-and-record path `#[cold]` via `core::hint::cold_path()`.
-const COLD_CLASSIFIED_BRANCHES: usize = 57;
+/// 57 → 58: the `pump_active_to_boundary_impl` GUARDED-window bail marker — when
+/// a pipeline intermediate window (a `Flush`, no `Sync`) parks a result-OID
+/// mismatch, the drain cannot reach an RFQ, so the pump returns `Failed` on the
+/// rare parked-mismatch branch (const-folded away for every non-guarded caller).
+const COLD_CLASSIFIED_BRANCHES: usize = 58;
 /// `#[non_exhaustive]` attribute lines across `engine/`.
 /// Reproduce: `grep -rcE '^#\[non_exhaustive\]' crates/postgres/proto/src/engine/*.rs` (summed)
 const NON_EXHAUSTIVE_ATTRS: usize = 4;

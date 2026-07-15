@@ -94,7 +94,10 @@ use core::ops::ControlFlow;
 
 use super::error::{EngineError, ExpectedRowCount, RowCountViolation};
 use super::frames;
-use super::pump::{poll_once, pump_active_to_boundary, Boundary, SpuriousPending, Surface};
+use super::pump::{
+    poll_once, pump_active_to_boundary, pump_active_to_boundary_impl, Boundary, SpuriousPending,
+    Surface,
+};
 use super::seams::{absurd, CommandStatus, Live, Never, NotifyStatus, Outcome, Transport};
 use super::{ActiveEngine, Engine, Phase, SendBuf};
 use crate::action::TxStatus;
@@ -1600,6 +1603,55 @@ impl<'b, T: Transport> Engine<'b, T> {
     where
         S: FnMut(Surface<'_>) -> ControlFlow<B>,
     {
+        // `BAIL = false`: `execute_batch` is UNGUARDED (it reads affected counts,
+        // never decodes into `Q`, so it can never park a result-OID mismatch), so
+        // the bail is inert — byte-identical to the historical drive.
+        self.run_pipeline_break_impl::<false, S, B>(live, sink).await
+    }
+
+    /// The GUARDED-window peer of [`run_pipeline_break`](Self::run_pipeline_break),
+    /// used by a heterogeneous `pipeline((...))`'s INTERMEDIATE window.
+    ///
+    /// A pipeline decodes each command into its own `Rows<Qi>`, so a cache-MISS
+    /// command's runtime result schema is guarded (a `Describe`(portal) is
+    /// appended and its runtime column OIDs are checked against the carrier). If
+    /// that guard parks a mismatch WHILE draining an intermediate window — which
+    /// ends with a `Flush`, NOT a `Sync` — the silent swallow-to-`ReadyForQuery`
+    /// drain would BLOCK forever (no RFQ is coming until the batch's single
+    /// trailing `Sync`). This drive therefore BAILS on a parked mismatch (via
+    /// [`pump_active_to_boundary_impl`]`::<true>`), returning [`Boundary::Failed`]
+    /// so the driver stops this window, stages the trailing `Sync`, and drains the
+    /// mismatch to the recovering RFQ (the classified `BatchColumnOidMismatch` is
+    /// read post-drive from the parked triple, exactly as the non-windowed
+    /// pipeline). A clean window (no mismatch) is byte-identical to
+    /// `run_pipeline_break` — the bail never fires.
+    ///
+    /// # Errors
+    ///
+    /// As [`run_pipeline_break`](Self::run_pipeline_break).
+    pub async fn run_pipeline_break_guarded<S, B>(
+        &mut self,
+        live: Live<'b>,
+        sink: S,
+    ) -> Result<Outcome<'b, Boundary<B>>, EngineError<T::Error>>
+    where
+        S: FnMut(Surface<'_>) -> ControlFlow<B>,
+    {
+        self.run_pipeline_break_impl::<true, S, B>(live, sink).await
+    }
+
+    /// The shared drive behind [`run_pipeline_break`](Self::run_pipeline_break)
+    /// and [`run_pipeline_break_guarded`](Self::run_pipeline_break_guarded),
+    /// parameterised by whether it bails on a parked result-OID guard mismatch
+    /// (see [`pump_active_to_boundary_impl`]).
+    async fn run_pipeline_break_impl<const BAIL_ON_GUARD_MISMATCH: bool, S, B>(
+        &mut self,
+        live: Live<'b>,
+        sink: S,
+    ) -> Result<Outcome<'b, Boundary<B>>, EngineError<T::Error>>
+    where
+        S: FnMut(Surface<'_>) -> ControlFlow<B>,
+    {
         let Self {
             transport,
             phase,
@@ -1607,7 +1659,11 @@ impl<'b, T: Transport> Engine<'b, T> {
             ..
         } = self;
         let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        let boundary = pump_active_to_boundary(active, transport, send_buf, sink).await?;
+        let boundary =
+            pump_active_to_boundary_impl::<BAIL_ON_GUARD_MISMATCH, _, _, _>(
+                active, transport, send_buf, sink,
+            )
+            .await?;
         // Alive boundaries (`Idle` / `Failed` / `Stopped`) ride `Ok` with the token;
         // fatal ones (`Closed` / `Suspended`) consume it — the `classify_break_boundary`
         // rule the breakable dynamic verbs use.

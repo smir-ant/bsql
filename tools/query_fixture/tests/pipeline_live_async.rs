@@ -48,6 +48,16 @@ bsql::query!(
     PlDeferIns,
     "INSERT INTO pl_deferred (id, tag) VALUES ($1, $2) RETURNING id"
 );
+// Carriers for the WINDOWED deadlock-free witnesses (0021_pl_bulk.sql): an EARLY
+// command that returns a LARGE (~4 MiB) result, paired with LATER commands that
+// carry LARGE `text` params — the batch spans MANY 64 KiB send windows, the exact
+// shape that DEADLOCKS a stage-all-then-flush pipeline and STREAMS through the
+// windowed drive.
+bsql::query!(PlBigResult, "SELECT repeat('x', 4000000)::text AS s");
+bsql::query!(
+    PlBulkIns,
+    "INSERT INTO pl_bulk (id, payload) VALUES ($1, $2) RETURNING id"
+);
 
 fn cfg() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -430,5 +440,165 @@ async fn ignored_in_guard_pipeline_error_does_not_autocommit_later_verbs() {
     assert!(!account_exists(&mut c, a_id).await, "A's write rolled back with the whole tx");
     assert!(!account_exists(&mut c, p_id).await, "B's write rolled back");
     assert!(!account_exists(&mut c, d_id).await, "D never committed (25P02) and did not autocommit");
+    c.close().await.expect("close");
+}
+
+/// Ensure `pl_bulk` exists and this test's id range is clear.
+async fn prepare_bulk(c: &mut Connection, lo: i64, hi: i64) {
+    // `CREATE TABLE IF NOT EXISTS` has a known concurrent-creation RACE (two callers
+    // both find the table absent, both try to insert its `pg_type` row → one wins,
+    // the other gets a `23505` on the `pg_type` unique index, or a `42P07`). Both
+    // windowed tests may create the brand-new `pl_bulk` on the first parallel run, so
+    // tolerate that race — on a duplicate error the table now exists (a failed
+    // autocommit `CREATE` leaves the connection idle + reusable for the `DELETE`).
+    if let Err(e) = c
+        .execute_sql("CREATE TABLE IF NOT EXISTS pl_bulk (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)")
+        .await
+    {
+        let raced = matches!(&e, DriverError::Db(db) if db.code() == "23505" || db.code() == "42P07");
+        assert!(raced, "create pl_bulk failed for a non-race reason: {e:?}");
+    }
+    c.execute_sql(&format!("DELETE FROM pl_bulk WHERE id BETWEEN {lo} AND {hi}"))
+        .await
+        .expect("clear id range");
+}
+
+async fn bulk_count(c: &mut Connection, lo: i64, hi: i64) -> i64 {
+    c.query_one_sql(&format!(
+        "SELECT count(*)::int8 AS n FROM pl_bulk WHERE id BETWEEN {lo} AND {hi}"
+    ))
+    .await
+    .expect("count")
+    .get_i64(0)
+    .expect("decode")
+    .unwrap_or(-1)
+}
+
+/// THE WINDOWED DEADLOCK-FREE WITNESS. A heterogeneous batch pairs an EARLY command
+/// that returns a ~4 MiB result with SIX later commands each carrying a 512 KiB
+/// `text` param — the whole batch stages ~3 MiB of tail while the server produces a
+/// ~4 MiB early result. A stage-all-then-flush `pipeline` DEADLOCKS here (the client
+/// blocks writing the tail while the server blocks writing the early result); the
+/// windowed drive STREAMS it (each window drains before the next stages, so the
+/// client always reads before it write-blocks). The `timeout` is the regression net:
+/// a revert to the old drive would HANG this and elapse the timeout instead of
+/// hanging forever. The completion — with EVERY result correct and all six writes
+/// committed — is also the BOUNDED-MEMORY proof: an unwindowed drive would need to
+/// buffer the whole ~3 MiB tail (or deadlock), the windowed drive never buffers past
+/// ~2× the 64 KiB window.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn windowed_large_result_plus_large_params_does_not_deadlock() {
+    let mut c = Connection::connect(&cfg()).await.expect("connect");
+    let base = 8_800_000i64;
+    prepare_bulk(&mut c, base, base + 999).await;
+    let payload = "a".repeat(512 * 1024); // 512 KiB per command → ~3 MiB tail
+
+    // arity 7: [ big-result, ins+1, ins+2, ins+3, ins+4, ins+5, ins+6 ].
+    let out = tokio::time::timeout(
+        Duration::from_secs(60),
+        c.pipeline((
+            PlBigResultQuery::bind(()),
+            PlBulkInsQuery::bind((base + 1, payload.as_str())),
+            PlBulkInsQuery::bind((base + 2, payload.as_str())),
+            PlBulkInsQuery::bind((base + 3, payload.as_str())),
+            PlBulkInsQuery::bind((base + 4, payload.as_str())),
+            PlBulkInsQuery::bind((base + 5, payload.as_str())),
+            PlBulkInsQuery::bind((base + 6, payload.as_str())),
+        )),
+    )
+    .await
+    .expect("pipeline completed within 60s — a stage-all-then-flush regression would DEADLOCK here")
+    .expect("pipeline runs");
+
+    let (big, r1, r2, r3, r4, r5, r6) = out;
+    // The early LARGE result decoded correctly (drained in the FIRST window, which
+    // unblocked the server — the deadlock-free proof).
+    assert_eq!(
+        big.iter()
+            .next()
+            .expect("row")
+            .expect("decode")
+            .s
+            .expect("non-null result")
+            .len(),
+        4_000_000,
+        "the ~4 MiB early result decoded whole",
+    );
+    // Every LARGE-param write returned its id, in order.
+    for (r, id) in [
+        (r1, base + 1),
+        (r2, base + 2),
+        (r3, base + 3),
+        (r4, base + 4),
+        (r5, base + 5),
+        (r6, base + 6),
+    ] {
+        assert_eq!(r.iter().next().expect("row").expect("decode").id, id);
+    }
+    // All six writes committed atomically with the batch.
+    assert_eq!(bulk_count(&mut c, base + 1, base + 6).await, 6, "all six writes committed");
+    // The payloads round-tripped byte-exact (no window boundary corrupted a param).
+    let got = c
+        .query_one_sql(&format!("SELECT length(payload)::int8 AS n FROM pl_bulk WHERE id = {}", base + 3))
+        .await
+        .expect("length")
+        .get_i64(0)
+        .expect("decode")
+        .unwrap_or(-1);
+    assert_eq!(got, 512 * 1024, "the 512 KiB payload round-tripped whole");
+    c.close().await.expect("close");
+}
+
+/// ALL-OR-NOTHING at LARGE payload across MANY windows. Eight commands each carry a
+/// 256 KiB `text` param (~2 MiB tail → multi-window); the LAST duplicates command
+/// #0's id → `23505` at its Execute. The batch is ONE implicit transaction under the
+/// single trailing `Sync`, so the whole thing ROLLS BACK: `BatchFailed { index: 8 }`
+/// and ZERO rows persisted — the windowed drive's all-or-nothing is airtight even
+/// when the failure lands after several flushed windows already streamed to the
+/// server.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn windowed_all_or_nothing_rollback_at_large_payload() {
+    let mut c = Connection::connect(&cfg()).await.expect("connect");
+    let base = 8_900_000i64;
+    prepare_bulk(&mut c, base, base + 999).await;
+    let payload = "b".repeat(256 * 1024); // 256 KiB per command → ~2 MiB tail
+
+    // arity 9: eight distinct-id inserts, then a NINTH that duplicates id (base+1).
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        c.pipeline((
+            PlBulkInsQuery::bind((base + 1, payload.as_str())),
+            PlBulkInsQuery::bind((base + 2, payload.as_str())),
+            PlBulkInsQuery::bind((base + 3, payload.as_str())),
+            PlBulkInsQuery::bind((base + 4, payload.as_str())),
+            PlBulkInsQuery::bind((base + 5, payload.as_str())),
+            PlBulkInsQuery::bind((base + 6, payload.as_str())),
+            PlBulkInsQuery::bind((base + 7, payload.as_str())),
+            PlBulkInsQuery::bind((base + 8, payload.as_str())),
+            PlBulkInsQuery::bind((base + 1, payload.as_str())), // DUPLICATE id → 23505
+        )),
+    )
+    .await
+    .expect("pipeline completed within 60s (no deadlock)");
+
+    match result {
+        Err(DriverError::BatchFailed { index, source }) => {
+            assert_eq!(index, 8, "the NINTH command (index 8) hit the duplicate key");
+            assert!(source.code().starts_with("23"), "a constraint violation, got {source:?}");
+        }
+        other => panic!("expected BatchFailed at index 8, got {other:?}"),
+    }
+    // THE PROOF: the whole implicit transaction rolled back — the eight LARGE-payload
+    // writes that streamed across several flushed windows persisted NOTHING.
+    assert_eq!(
+        bulk_count(&mut c, base + 1, base + 8).await,
+        0,
+        "a mid-batch failure rolled back every windowed write — zero rows persisted",
+    );
+    // The connection survived the recoverable failure and is reusable.
+    assert!(c.is_healthy(), "connection stays healthy after a windowed batch failure");
+    assert_eq!(c.query_one::<PlSevenQuery>(()).await.expect("reuse").n, 7);
     c.close().await.expect("close");
 }

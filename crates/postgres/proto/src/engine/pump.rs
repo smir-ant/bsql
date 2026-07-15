@@ -255,6 +255,40 @@ pub async fn pump_active_to_boundary<T, S, B>(
     active: &mut ActiveEngine,
     transport: &mut T,
     send_buf: &mut SendBuf,
+    sink: S,
+) -> Result<Boundary<B>, EngineError<T::Error>>
+where
+    T: Transport,
+    S: FnMut(Surface<'_>) -> ControlFlow<B>,
+{
+    // `BAIL = false`: every Sync-terminated command (single query, non-windowed
+    // pipeline, a batch's final drive) drains a parked result-OID guard mismatch
+    // SILENTLY to the trailing `Sync`'s `ReadyForQuery` — the RFQ always arrives,
+    // the drain completes cleanly, and the driver reads the parked mismatch
+    // post-pump. The const-folds the bail out, so this is byte-identical to the
+    // un-parameterised pump for every existing caller.
+    pump_active_to_boundary_impl::<false, T, S, B>(active, transport, send_buf, sink).await
+}
+
+/// [`pump_active_to_boundary`] parameterised by whether it BAILS on a parked
+/// typed result-OID guard mismatch.
+///
+/// `BAIL_ON_GUARD_MISMATCH` matters ONLY for a GUARDED pipeline's INTERMEDIATE
+/// window, which ends with a `Flush` (not a `Sync`). A cache-MISS command whose
+/// runtime result schema diverged from its carrier's migration OIDs parks the
+/// mismatch and enters the silent swallow-to-`ReadyForQuery` drain — but an
+/// intermediate window has NO trailing `Sync`, so no RFQ is coming and the
+/// swallow would BLOCK forever waiting for bytes the server will not send until
+/// the batch's single trailing `Sync`. When `BAIL`, the pump returns
+/// [`Boundary::Failed`] the moment such a mismatch is parked and the drain would
+/// otherwise block on a read, so the driver can stop this window, stage the
+/// trailing `Sync`, and drain the mismatch to the recovering RFQ. At
+/// `BAIL = false` the added check is `const`-folded away, so every Sync-terminated
+/// caller is byte-identical to the un-parameterised pump.
+pub(crate) async fn pump_active_to_boundary_impl<const BAIL_ON_GUARD_MISMATCH: bool, T, S, B>(
+    active: &mut ActiveEngine,
+    transport: &mut T,
+    send_buf: &mut SendBuf,
     mut sink: S,
 ) -> Result<Boundary<B>, EngineError<T::Error>>
 where
@@ -283,6 +317,18 @@ where
         // free of an E0499 conflict.
         let surface = match active.next_event() {
             Event::NeedMore => {
+                // A GUARDED pipeline INTERMEDIATE window (`BAIL`): if the typed
+                // result-OID guard parked a mismatch while draining this window,
+                // NO trailing `Sync` is coming (the window ends with a `Flush`),
+                // so the silent swallow-to-`ReadyForQuery` would block forever on
+                // this read. Return `Failed` so the driver stages the batch's
+                // single trailing `Sync` and drains the mismatch to the recovering
+                // RFQ. `const`-folded away for every Sync-terminated caller
+                // (`BAIL = false`) — those DO reach an RFQ, so they drain normally.
+                if BAIL_ON_GUARD_MISMATCH && active.has_result_oid_mismatch() {
+                    core::hint::cold_path();
+                    return Ok(Boundary::Failed);
+                }
                 // `read_slot` lends the active tier's whole remaining spare, so
                 // this one read fills as much as the socket has in a single
                 // syscall — no doubling ramp. `READ_WANT` only drives the

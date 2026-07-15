@@ -106,6 +106,7 @@ cargo test -p bsql-query-fixture --test copy_typed_live_sync  -- --ignored  # li
 cargo test -p bsql-postgres-proto --test engine_copy_typed_alloc       # typed binary-COPY constant-memory gate
 cargo test -p bsql-postgres-proto --test engine_query_break_alloc      # dynamic streaming constant-memory gate (alloc count row-count-independent)
 cargo test -p bsql-postgres-proto --test engine_execute_batch_alloc    # execute_batch constant-SEND-memory gate (staged-bytes high-water independent of N: identical for a small-N and a 100×-larger windowed batch)
+cargo test -p bsql-postgres-proto --test engine_pipeline_windowed_guard # windowed-pipeline result-OID guard BAIL gate (offline): a MISS command drifting in an INTERMEDIATE window (a Flush, no Sync) → run_pipeline_break_guarded returns Boundary::Failed (the bail) with the mismatch triple retrievable, never a hang; the unguarded run_pipeline_break reads past the truncated window into EOF; a matching window never over-fires the bail
 cargo test -p bsql-query-sqlite-fixture --test execute_batch_sqlite    # SQLite execute_batch_typed twin (in-process, read-only-scoped)
 cargo test -p bsql-query-fixture --test execute_batch_live_async -- --ignored  # live execute_batch (async: N counts + all-or-nothing bulk-write rollback + commit-time-None + no-auto-rollback + 20k-command windowed deadlock-free run; needs PG)
 cargo test -p bsql-query-fixture --test execute_batch_live_sync  -- --ignored  # live execute_batch (sync twin; needs PG)
@@ -1043,7 +1044,9 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `engine_copy_typed_alloc` constant-memory gate.
 - **Atomic query pipelining — `conn.pipeline((Q0::bind(p), Q1::bind(p), …))`**
   (both PG drivers + the `Transaction` guard; a SQLite sequential twin). Sends N
-  compile-checked `query!` commands in ONE round trip instead of N, and returns
+  compile-checked `query!` commands in ~ONE round trip instead of N (a common batch
+  fitting one 64 KiB send window; a huge-param batch spanning many windows pays
+  ~`N/window`, deadlock-free — see the windowed drive below), and returns
   the typed tuple `(Rows<Q0>, Rows<Q1>, …)` — each command decoded against ITS OWN
   carrier's compile-time OIDs (no erasure), each guarded against RESULT-schema drift
   (below). Pure `query!` carriers, NO builder —
@@ -1058,10 +1061,13 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   accessor) and **ZERO** results. Returning "the results before the failure as `Ok`"
   is FORBIDDEN — those writes were rolled back. Airtight BY CONSTRUCTION, not
   discipline: the ONLY code path that builds the `Ok((Rows<Q0>, …))` tuple is the
-  `CommandStatus::Completed` arm, reached ONLY after the pump's clean trailing
-  `ReadyForQuery` (`Boundary::Idle`), which the server emits ONLY if the whole
-  implicit transaction COMMITTED; a rolled-back / failing / skipped command has no
-  `Ok` value to read. **Consistent with every other verb on error:** `pipeline`
+  settle's NO-failure arm, reached ONLY after every command delivered and the
+  batch's single trailing `Sync` closed the implicit transaction with NO parked
+  failure and NO parked result-OID mismatch (the settle is driven by the PARKED
+  failure state, exactly as `execute_batch`, NOT by the final boundary — which is
+  `Idle` even after a mid-batch failure's recovery drain); the server emits that
+  clean trailing `ReadyForQuery` ONLY if the whole implicit transaction COMMITTED, so
+  a rolled-back / failing / skipped command has no `Ok` value to read. **Consistent with every other verb on error:** `pipeline`
   does NOT auto-rollback — a mid-batch failure inside an explicit transaction
   (a `Transaction` guard, or a caller `BEGIN` in the batch) leaves it ABORTED
   (`'E'`), untouched, exactly as a normal failed verb does; the transaction's OWNER
@@ -1074,9 +1080,38 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   closes it server-side → `Idle`, connection clean. **Engine:** the receive side is
   the extended-protocol twin of the existing simple-query `AwaitingRfq` multiplexer
   — ONE new dispatch state `PipelineAwaitingNextOrRfq` reusing every existing
-  sub-chain, staged by `stage_pipeline` (per command `[Close+Parse if MISS] + Bind +
-  Execute`, the `Sync` hoisted to the batch end) with a 1-byte `pipelining` flag on
-  `ActiveEngine`. `next_event` stays BYTE-IDENTICAL (the continuation is
+  sub-chain, staged per command (`[Close+Parse if MISS] + Bind + [Describe if guarded
+  MISS] + Execute`, the `Sync` hoisted to the batch end) via the per-command
+  `Pipeline::stage_nth` cursor with a 1-byte `pipelining` flag on `ActiveEngine`.
+  **Constant SEND memory, deadlock-free (the SAME windowed batcher as
+  `execute_batch`).** A heterogeneous batch that pairs an EARLY command returning a
+  LARGE result with LATER commands carrying LARGE params would DEADLOCK if the whole
+  batch were staged and flushed before a single read (the client blocks writing the
+  tail while the server blocks writing the early result — both send buffers full). So
+  `Core::pipeline` STREAMS: the `stage_nth` cursor stages one command, and when the
+  send buffer crosses the 64 KiB `BATCH_WINDOW_THRESHOLD` it `Flush`es (which forces
+  the window's responses out WITHOUT ending the implicit transaction — only the single
+  trailing `Sync` does) and DRAINS that window's responses (routing each command's rows
+  to ITS `Rows<Qi>` builder) via `run_pipeline_break_guarded` before staging the next —
+  so the client always reads before it write-blocks. A batch fitting one window (the
+  common case) stages every command, sends NO intermediate `Flush`, and rides the single
+  trailing `Sync` — exactly ~1 round trip, byte-identical to today's single-Sync
+  pipeline; only a genuinely huge-param batch pays ~`N/window` round trips (the honest
+  floor for a deadlock-free constant-memory bulk over a bidirectional protocol). The
+  **RESULT-OID guard survives the windowed drive:** a MISS command that drifts in an
+  INTERMEDIATE window (a `Flush`, no `Sync`) would park a mismatch whose silent
+  swallow-to-`ReadyForQuery` drain has no RFQ to reach, so `run_pipeline_break_guarded`
+  BAILS (returns `Boundary::Failed`) the moment such a mismatch parks — the driver then
+  stages the trailing `Sync` and drains the mismatch to the recovering RFQ, returning
+  the classified `BatchColumnOidMismatch` (the unguarded `execute_batch`, which can
+  never park a mismatch, keeps the inert `run_pipeline_break`; the bail is a
+  const-generic `pump_active_to_boundary` parameter, `const`-folded away for every
+  Sync-terminated caller). HONEST NOTE on a windowed mismatch: it stops staging later
+  windows, so the server commits only the windows flushed so far (vs the whole batch
+  when it fits one window) — but BOTH return ZERO results + the classified drift, the
+  honest client-side rejection of an already-drifted schema (a caller cannot trust ANY
+  DB state under a schema drift; a SERVER error rolls back everything regardless).
+  `next_event` stays BYTE-IDENTICAL (the continuation is
   `#[cold]`/out-of-line like `step_fused`; the DataRow hot arm is untouched — the
   codegen gate is green). `DriverError::BatchFailed`'s payload is 16 B
   (`usize` + `Box<DbError>`), so the 24 B `DriverError` pin holds; `deps_pin` is
@@ -1115,18 +1150,27 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   is the MIGRATION runner's, not the pipeline's) — the IDENTICAL typed tuple + the
   IDENTICAL all-or-nothing contract (no RTT win, in-process; read-only in a
   conformance build since the SQLite authorizer permits only SELECTs for typed
-  writes, so the atomicity is read-consistency across the batch). Measured PG (loopback, K heterogeneous SELECTs, `pipeline` vs K serial
-  `query_one`): K=2 ~3.5×, K=8 ~5×, K=16 ~7.3× — the RTT term collapses from K× to
-  1×; a single-statement batch (N=1) equals today's fused query (no regression, the
+  writes, so the atomicity is read-consistency across the batch). Measured PG (loopback, K heterogeneous SELECTs whose results fit ONE
+  window, `pipeline` vs K serial `query_one`): K=2 ~3.5×, K=8 ~5×, K=16 ~7.3× — the RTT
+  term collapses from K× to 1× (a single-window batch is exactly ~1 round trip; only a
+  huge-param batch spanning multiple windows pays the ~`N/window` deadlock-free floor);
+  a single-statement batch (N=1) equals today's fused query (no regression, the
   path is opt-in). Witnessed by `tools/query_fixture`'s `pipeline_live_{async,sync}`
   (all-or-nothing rollback proof, the ignored-in-guard blind-zone regression, the
-  index accessor, cancel, transport death, in-guard commit), the `--ignored`
+  index accessor, cancel, transport death, in-guard commit, PLUS the windowed
+  deadlock-free witnesses: a heterogeneous batch pairing an EARLY ~4 MiB result with
+  SIX 512 KiB `text` params COMPLETES with every result correct — a stage-all-then-flush
+  drive would DEADLOCK there — and the all-or-nothing rollback of eight 256 KiB-param
+  writes across many windows persists ZERO rows), the `--ignored`
   `pipeline_oid_guard_live` (both drivers: a drifted command → classified
   `BatchColumnOidMismatch` naming the command + connection recovering; a matching
   shadow, `varchar`/`bpchar`, and a user-type (domain) column NOT falsely rejected),
   the offline `engine_pipeline_spec` (the multiplexer + mid-batch drain, PLUS the
   per-command guard: command 0 + FIFO-seated subsequent command, match + drift + the
-  varchar/bpchar/user-type no-false-positive), the SQLite `pipeline_sqlite`, and the
+  varchar/bpchar/user-type no-false-positive), the offline `engine_pipeline_windowed_guard`
+  (the INTERMEDIATE-window mismatch BAIL: the guarded drive returns `Boundary::Failed`
+  on a parked mismatch without reading past the window, the unguarded drive reads into
+  EOF, and a matching window never over-fires the bail), the SQLite `pipeline_sqlite`, and the
   `pipeline_wrong_param` trybuild golden.
 - **Homogeneous atomic bulk write — `conn.execute_batch::<Q>(params_iter)`**
   (both PG drivers + the `Transaction` guard; a SQLite sequential twin). Runs ONE

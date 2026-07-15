@@ -33,6 +33,14 @@ bsql::query!(
     PlDeferInsS,
     "INSERT INTO pl_deferred (id, tag) VALUES ($1, $2) RETURNING id"
 );
+// Carriers for the WINDOWED deadlock-free witnesses (0021_pl_bulk.sql) — the sync
+// twins of `pipeline_live_async`'s: an EARLY command returning a LARGE (~4 MiB)
+// result, paired with LATER commands carrying LARGE `text` params.
+bsql::query!(PlBigResultS, "SELECT repeat('x', 4000000)::text AS s");
+bsql::query!(
+    PlBulkInsS,
+    "INSERT INTO pl_bulk (id, payload) VALUES ($1, $2) RETURNING id"
+);
 
 fn cfg() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -310,5 +318,140 @@ fn ignored_in_guard_pipeline_error_does_not_autocommit_later_verbs() {
     assert!(!account_exists(&mut c, a_id), "A's write rolled back with the whole tx");
     assert!(!account_exists(&mut c, p_id), "B's write rolled back");
     assert!(!account_exists(&mut c, d_id), "D never committed (25P02) and did not autocommit");
+    c.close().expect("close");
+}
+
+/// Ensure `pl_bulk` exists and this test's id range is clear.
+fn prepare_bulk(c: &mut Connection, lo: i64, hi: i64) {
+    // Tolerate the `CREATE TABLE IF NOT EXISTS` concurrent-creation race (a `23505` on
+    // the `pg_type` unique index / `42P07`) between the parallel windowed tests — see
+    // the async twin for the full note.
+    if let Err(e) =
+        c.execute_sql("CREATE TABLE IF NOT EXISTS pl_bulk (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)")
+    {
+        let raced = matches!(&e, DriverError::Db(db) if db.code() == "23505" || db.code() == "42P07");
+        assert!(raced, "create pl_bulk failed for a non-race reason: {e:?}");
+    }
+    c.execute_sql(&format!("DELETE FROM pl_bulk WHERE id BETWEEN {lo} AND {hi}"))
+        .expect("clear id range");
+}
+
+fn bulk_count(c: &mut Connection, lo: i64, hi: i64) -> i64 {
+    c.query_one_sql(&format!(
+        "SELECT count(*)::int8 AS n FROM pl_bulk WHERE id BETWEEN {lo} AND {hi}"
+    ))
+    .expect("count")
+    .get_i64(0)
+    .expect("decode")
+    .unwrap_or(-1)
+}
+
+/// THE WINDOWED DEADLOCK-FREE WITNESS (sync twin). Same batch shape as the async
+/// witness — an EARLY ~4 MiB result + SIX 512 KiB `text` params. The blocking
+/// `pipeline` runs in a WORKER thread joined with `recv_timeout`, so a
+/// stage-all-then-flush regression (which DEADLOCKS this shape) fails LOUDLY at the
+/// timeout instead of hanging the test forever. Completion with correct results is
+/// the deadlock-free + bounded-memory proof.
+#[test]
+#[ignore = "requires local PG"]
+fn windowed_large_result_plus_large_params_does_not_deadlock() {
+    let mut c = Connection::connect(&cfg()).expect("connect");
+    let base = 9_800_000i64;
+    prepare_bulk(&mut c, base, base + 999);
+    let payload = "a".repeat(512 * 1024); // 512 KiB per command → ~3 MiB tail
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let out = c.pipeline((
+            PlBigResultSQuery::bind(()),
+            PlBulkInsSQuery::bind((base + 1, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 2, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 3, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 4, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 5, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 6, payload.as_str())),
+        ));
+        // Extract owned primitives INSIDE the worker (the borrowed records alias the
+        // per-command `Rows`), then hand the connection + data back to the test.
+        let extracted = out.map(|(big, r1, r2, r3, r4, r5, r6)| {
+            let big_len = big
+                .iter()
+                .next()
+                .expect("row")
+                .expect("decode")
+                .s
+                .expect("non-null result")
+                .len();
+            let ids: Vec<i64> = [r1, r2, r3, r4, r5, r6]
+                .iter()
+                .map(|r| r.iter().next().expect("row").expect("decode").id)
+                .collect();
+            (big_len, ids)
+        });
+        let _ = tx.send((c, extracted));
+    });
+
+    let (mut c, extracted) = rx.recv_timeout(Duration::from_secs(60)).expect(
+        "pipeline completed within 60s — a stage-all-then-flush regression would DEADLOCK here",
+    );
+    worker.join().expect("worker thread");
+    let (big_len, ids) = extracted.expect("pipeline runs");
+    assert_eq!(big_len, 4_000_000, "the ~4 MiB early result decoded whole");
+    assert_eq!(
+        ids,
+        vec![base + 1, base + 2, base + 3, base + 4, base + 5, base + 6],
+        "every windowed write returned its id, in order",
+    );
+    assert_eq!(bulk_count(&mut c, base + 1, base + 6), 6, "all six writes committed");
+    c.close().expect("close");
+}
+
+/// ALL-OR-NOTHING at LARGE payload across MANY windows (sync twin). Eight 256 KiB
+/// `text` params then a NINTH duplicating id #0 → `23505`; the whole windowed batch
+/// ROLLS BACK: `BatchFailed { index: 8 }` and ZERO rows persisted.
+#[test]
+#[ignore = "requires local PG"]
+fn windowed_all_or_nothing_rollback_at_large_payload() {
+    let mut c = Connection::connect(&cfg()).expect("connect");
+    let base = 9_900_000i64;
+    prepare_bulk(&mut c, base, base + 999);
+    let payload = "b".repeat(256 * 1024); // 256 KiB per command → ~2 MiB tail
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let out = c.pipeline((
+            PlBulkInsSQuery::bind((base + 1, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 2, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 3, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 4, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 5, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 6, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 7, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 8, payload.as_str())),
+            PlBulkInsSQuery::bind((base + 1, payload.as_str())), // DUPLICATE id → 23505
+        ));
+        let classified: Result<(usize, String), String> = match out {
+            Err(DriverError::BatchFailed { index, source }) => Ok((index, source.code().to_string())),
+            Ok(_) => Err("expected BatchFailed, got Ok".to_string()),
+            Err(other) => Err(format!("expected BatchFailed, got {other:?}")),
+        };
+        let _ = tx.send((c, classified));
+    });
+
+    let (mut c, classified) = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("pipeline completed within 60s (no deadlock)");
+    worker.join().expect("worker thread");
+    let (index, code) = classified.expect("batch failed as a BatchFailed");
+    assert_eq!(index, 8, "the NINTH command (index 8) hit the duplicate key");
+    assert!(code.starts_with("23"), "a constraint violation, got {code}");
+    // THE PROOF: the whole implicit transaction rolled back — zero rows persisted.
+    assert_eq!(
+        bulk_count(&mut c, base + 1, base + 8),
+        0,
+        "a mid-batch failure rolled back every windowed write — zero rows persisted",
+    );
+    assert!(c.is_healthy(), "connection stays healthy after a windowed batch failure");
+    assert_eq!(c.query_one::<PlSevenSQuery>(()).expect("reuse").n, 7);
     c.close().expect("close");
 }

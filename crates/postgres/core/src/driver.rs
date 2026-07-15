@@ -2066,78 +2066,198 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         batch: B,
     ) -> Result<B::Output, DriverError> {
         let arity = B::ARITY;
-        // 1. STAGE every command's frames (pure send-buffer build, no token). A build
-        //    overflow (a > 2 GiB frame) leaves NOTHING flushed, so the connection is
-        //    healthy — discard the partial staging and restore a clean idle.
         let mut plan: Vec<&'static str> = Vec::with_capacity(arity);
-        if let Err(e) = batch.stage(self, &mut plan) {
+        let mut builders: Vec<RowsBuilder> = (0..arity).map(|_| RowsBuilder::new()).collect();
+        let mut current: usize = 0; // delivered commands (global, 0-based)
+        let mut db_error: Option<DbError> = None;
+        let mut failed_index: Option<usize> = None;
+
+        // 1. STAGE command 0 (`first = true`: reset the buffer + seat pipeline mode).
+        //    A build overflow (a > 2 GiB frame) leaves NOTHING flushed, so the
+        //    connection is healthy — discard the partial staging and restore a clean
+        //    idle. `ARITY >= 1`, so command 0 always exists.
+        if let Err(e) = batch.stage_nth(self, 0, &mut plan) {
             core::hint::cold_path();
             self.engine.abort_pipeline_staging();
             return Err(e);
         }
-        self.engine.stage_pipeline_seal();
+        let mut staged: usize = 1; // staged commands (command 0 above)
+        let mut flushed_any = false;
+        let mut live = self.take_live()?;
 
-        // 2. DRIVE. One flush carries the whole batch; the pump surfaces each
-        //    command's rows into ITS OWN prebuffer, advancing at each `Deliver`. On a
-        //    mid-batch `Fail` the failing index (the delivery count so far) + the
-        //    parsed cause are parked; nothing is returned as a row until the settle
-        //    confirms the clean batch RFQ.
-        let live = self.take_live()?;
-        let mut builders: Vec<RowsBuilder> = (0..arity).map(|_| RowsBuilder::new()).collect();
-        let mut current: usize = 0;
-        let mut db_error: Option<DbError> = None;
-        let mut failed_index: Option<usize> = None;
+        // 2. WINDOWED DRIVE — the deadlock-free peer of `execute_batch`'s. A
+        //    heterogeneous batch (an early LARGE result + later LARGE params) would
+        //    DEADLOCK if the whole batch were staged and flushed before a single read
+        //    (the client blocks writing the tail while the server blocks writing the
+        //    early result). So the commands STREAM: stage until the send buffer
+        //    crosses the batcher threshold, then `Flush` (which forces the window's
+        //    responses out WITHOUT ending the implicit transaction — only the single
+        //    trailing `Sync` does) and DRAIN that window's responses (routing each
+        //    command's rows to ITS builder) before staging the next, so the client
+        //    always drains before it write-blocks. Constant send memory. The COMMON
+        //    batch (fits one window) stages every command, never flushes an
+        //    intermediate `Flush`, and rides the single trailing `Sync` below — ~1
+        //    round trip, byte-identical to a single fused query.
+        'windows: loop {
+            // Fill the current window: stage subsequent commands until the send
+            // buffer crosses the batcher threshold or every command is staged.
+            let mut window_full = false;
+            while staged < arity {
+                if let Err(e) = batch.stage_nth(self, staged, &mut plan) {
+                    core::hint::cold_path();
+                    // A single command's `Bind` frame exceeded the wire length field.
+                    if flushed_any {
+                        // A window was already flushed: the implicit transaction is
+                        // OPEN with committed-nothing partial commands. Sending a
+                        // `Sync` would COMMIT the partial (breaking all-or-nothing),
+                        // so the connection MUST die — returning WITHOUT restoring
+                        // `self.live` leaves it NotReady (the token `live` drops), and
+                        // its socket close rolls the open implicit transaction back.
+                        // All-or-nothing preserved at the cost of the connection.
+                        return Err(e);
+                    }
+                    // First window, nothing flushed: clean abort (a deferred `BEGIN`
+                    // preserved), restore the token, stay healthy.
+                    self.engine.abort_pipeline_staging();
+                    self.live = Some(live);
+                    return Err(e);
+                }
+                staged = staged.saturating_add(1);
+                if self.engine.pending_send_len() >= BATCH_WINDOW_THRESHOLD {
+                    window_full = true;
+                    break;
+                }
+            }
+            if !window_full {
+                // Every command staged — this is the FINAL window; it rides the
+                // trailing `Sync` below, not a `Flush`.
+                break 'windows;
+            }
+
+            // INTERMEDIATE window: `Flush` + drain (routing rows to builders). The
+            // sink breaks once every command staged so far has delivered, leaving the
+            // engine at a clean inter-command boundary. The GUARDED drive also BAILS
+            // (returns `Failed`) if a MISS command's result-schema guard parks a
+            // mismatch — an intermediate window has no `Sync`, so the silent drain
+            // would otherwise block forever waiting for an RFQ that only the trailing
+            // `Sync` produces.
+            self.engine.stage_flush();
+            flushed_any = true;
+            let window_target = staged;
+            let outcome = self
+                .engine
+                .run_pipeline_break_guarded::<_, ()>(
+                    live,
+                    capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
+                        match surface {
+                            // Rows (whole or reassembled-oversize chunks) belong to
+                            // the CURRENT command; route them to its builder.
+                            Surface::Row(_) | Surface::RowChunk(_) | Surface::RowChunkEnd => {
+                                if let Some(b) = builders.get_mut(current) {
+                                    b.feed(surface);
+                                }
+                                ControlFlow::Continue(())
+                            }
+                            // A command completed: finalize its builder, advance, and
+                            // BREAK once the whole window has delivered.
+                            Surface::Deliver { .. } => {
+                                if let Some(b) = builders.get_mut(current) {
+                                    b.feed(surface);
+                                }
+                                current = current.saturating_add(1);
+                                if current >= window_target {
+                                    ControlFlow::Break(())
+                                } else {
+                                    ControlFlow::Continue(())
+                                }
+                            }
+                            // A server error: `current` is the failing command's
+                            // zero-based index. Park it + the cause once (FIRST Fail
+                            // wins); the trailing `Sync` + drain below recovers.
+                            Surface::Fail(body) if failed_index.is_none() => {
+                                failed_index = Some(current);
+                                db_error = Some(materialize::parse_error_response(body));
+                                ControlFlow::Continue(())
+                            }
+                            _ => ControlFlow::Continue(()),
+                        }
+                    }),
+                )
+                .await;
+            let (l, status) = match outcome {
+                Ok(Outcome { live, status }) => (live, status),
+                Err(other) => {
+                    core::hint::cold_path();
+                    return Err(lift_engine_error(other));
+                }
+            };
+            live = l;
+            match status {
+                // The window drained cleanly; stage the next window.
+                Boundary::Stopped(()) => {}
+                // A command in this window FAILED — a server `ErrorResponse` (parked
+                // in the sink) OR the result-schema guard parked a mismatch (the
+                // guarded drive bailed, since an intermediate window has no `Sync`).
+                // Stop staging; the trailing `Sync` + final drain recovers the
+                // connection and the settle classifies which. HONEST NOTE: on a
+                // mismatch this stops staging later windows, so the server commits
+                // only the windows flushed so far (vs the whole batch when it fits one
+                // window) — but BOTH return ZERO results + the classified drift, which
+                // is the honest client-side rejection of an already-drifted schema (a
+                // caller cannot trust ANY DB state under a schema drift). On a SERVER
+                // error the implicit transaction rolls back everything regardless.
+                Boundary::Failed => {
+                    core::hint::cold_path();
+                    break 'windows;
+                }
+                // A `Flush`-terminated window cannot reach a clean `Idle` (that needs
+                // the trailing `Sync`); a fatal boundary was already mapped to `Err`
+                // by `run_pipeline_break_guarded`. `Boundary` is `#[non_exhaustive]`,
+                // so this arm is fail-closed against a future boundary — never a torn
+                // success.
+                _ => {
+                    core::hint::cold_path();
+                    break 'windows;
+                }
+            }
+        }
+
+        // 3. FINAL DRIVE: the ONE trailing `Sync` closes the batch. Sent whether the
+        //    loop ended cleanly (drive the final window's remaining commands + the
+        //    batch RFQ) or aborted mid-batch (the server is skipping-to-`Sync` after
+        //    an error, or draining a parked mismatch — the `Sync` produces the
+        //    recovering RFQ the parked drain reads). Routes rows to builders (none
+        //    arrive after a mismatch/error — all swallowed by the drain).
+        self.engine.stage_pipeline_seal();
         let outcome = self
             .engine
             .run_pipeline(
                 live,
                 capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
                     match surface {
-                        // Rows (whole or reassembled-oversize chunks) belong to the
-                        // CURRENT command; route them to its builder.
                         Surface::Row(_) | Surface::RowChunk(_) | Surface::RowChunkEnd => {
                             if let Some(b) = builders.get_mut(current) {
                                 b.feed(surface);
                             }
                         }
-                        // A command completed: finalize its builder (the tag) and
-                        // advance to the next command.
                         Surface::Deliver { .. } => {
                             if let Some(b) = builders.get_mut(current) {
                                 b.feed(surface);
                             }
                             current = current.saturating_add(1);
                         }
-                        // A server error: `current` is the count of COMPLETED
-                        // commands. For a MID-BATCH command failure `current` is the
-                        // failing command's zero-based index (`< arity`). For a
-                        // COMMIT-TIME failure — every command SUCCEEDED at Execute
-                        // (`current == arity`), then the trailing `Sync`'s implicit
-                        // COMMIT failed (a `DEFERRABLE INITIALLY DEFERRED` constraint,
-                        // a SERIALIZABLE serialization failure) — `current` is `arity`,
-                        // which names NO command; the settle below maps that to a
-                        // batch-level `Db` error, never an out-of-range index. Park it
-                        // + the cause once — the FIRST Fail wins (the guard makes a
-                        // later frame in the recovery window fall through), and the
-                        // pump drains to the batch RFQ afterward.
                         Surface::Fail(body) if failed_index.is_none() => {
                             failed_index = Some(current);
                             db_error = Some(materialize::parse_error_response(body));
                         }
-                        // A typed pipeline cannot over-cap (its result columns are
-                        // compile-capped); async / COPY frames are not batch rows
-                        // (a NOTIFY is captured by the `capture_notify` wrapper); a
-                        // second Fail after the first is ignored (guard above).
                         _ => {}
                     }
                     ControlFlow::Continue(())
                 }),
             )
             .await;
-
-        // 3. SETTLE.
-        let (live, status) = match outcome {
-            Ok(Outcome { live, status }) => (live, status),
+        let live = match outcome {
+            Ok(Outcome { live, .. }) => live,
             // FATAL: the verb consumed the token and the connection is dead.
             Err(other) => {
                 core::hint::cold_path();
@@ -2145,54 +2265,51 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             }
         };
         self.live = Some(live);
-        match status {
-            // The batch reached its clean trailing `ReadyForQuery` with NO failure —
-            // every command committed under the implicit transaction. THE ONLY `Ok`
+
+        // 4. SETTLE — driven by the PARKED failure + the guard mismatch, NOT the final
+        //    boundary (which is `Idle` even after a mid-batch failure's recovery
+        //    drain, exactly as `execute_batch`). Priority: a result-schema mismatch (a
+        //    CLIENT-side rejection that may have committed server-side) first, then a
+        //    server / commit-time failure, then the clean `Ok`.
+        //
+        // TYPED RESULT-SCHEMA guard: a cache-MISS command whose runtime result columns
+        // diverged from its carrier `Qi`'s migration schema was caught at ITS
+        // `RowDescription` and the batch drained to a clean idle (the same over-cap
+        // drain the single-query guard reuses), so no garbage row ever reached a
+        // builder. `current` is the failing command's zero-based index — frozen at the
+        // mismatch, since the drain surfaces no further `Deliver`. A MISS whose guard
+        // fired is NOT recorded in the cache (a repeat re-`Describe`s + re-guards).
+        if let Some((column, found, expected)) = self.engine.take_result_oid_mismatch() {
+            core::hint::cold_path();
+            // `current < arity <= 16`, so the `u16` never saturates; the `Err` arm is
+            // a total-conversion floor, never reached (no `as`, no `unwrap`).
+            // `unwrap_or` is banned by the silent-fallback ledger, so this explicit
+            // match is the sanctioned dead arm (the same shape `DbError::code` uses).
+            #[expect(
+                clippy::manual_unwrap_or,
+                reason = "unwrap_or is a disallowed method; this explicit match is the \
+                          sanctioned dead-arm narrow — `current < arity <= 16`, so the \
+                          `Err` view is unreachable, never a masked failure"
+            )]
+            let command = match u16::try_from(current) {
+                Ok(c) => c,
+                Err(_) => u16::MAX,
+            };
+            return Err(DriverError::BatchColumnOidMismatch {
+                command,
+                source: DecodeError::ColumnOidMismatch {
+                    index: column,
+                    expected,
+                    found,
+                },
+            });
+        }
+        match (failed_index, db_error) {
+            // No failure: the whole implicit transaction committed. THE ONLY `Ok`
             // path. Record each MISS statement (deduped) IF the batch left the
-            // connection at `Idle` tx status (mirrors the serial cache rule; inside
-            // an explicit transaction it defers, since a rollback could drop it).
-            CommandStatus::Completed => {
-                // TYPED RESULT-SCHEMA guard: a cache-MISS command whose runtime
-                // result columns diverged from its carrier `Qi`'s migration schema
-                // was caught at ITS `RowDescription` and the batch drained to a clean
-                // idle (the same over-cap drain the single-query guard reuses), so no
-                // garbage row ever reached a builder. Surface it BEFORE recording the
-                // cache or building the `Ok` tuple: the drifted command's rows never
-                // decode. `current` is the failing command's zero-based index —
-                // frozen at the mismatch, since the drain surfaces no further
-                // `Deliver`. HONEST NOTE: unlike a server error (rollback), the server
-                // may have COMMITTED this batch's implicit transaction (the mismatch
-                // is a client decode rejection AFTER the server processed); the client
-                // returns the classified drift instead of decoding — the schema
-                // drifted, fail-loud beats silent-wrong. A MISS whose guard fired is
-                // NOT recorded in the cache (a repeat re-`Describe`s + re-guards),
-                // which the settle below skips by returning here first.
-                if let Some((column, found, expected)) = self.engine.take_result_oid_mismatch() {
-                    core::hint::cold_path();
-                    // `current < arity <= 16`, so the `u16` never saturates; the
-                    // `Err` arm is a total-conversion floor, never reached (no `as`,
-                    // no `unwrap`). `unwrap_or` is banned by the silent-fallback
-                    // ledger, so this explicit match is the sanctioned dead arm (the
-                    // same shape `DbError::code`'s narrow uses).
-                    #[expect(
-                        clippy::manual_unwrap_or,
-                        reason = "unwrap_or is a disallowed method; this explicit match is the \
-                                  sanctioned dead-arm narrow — `current < arity <= 16`, so the \
-                                  `Err` view is unreachable, never a masked failure"
-                    )]
-                    let command = match u16::try_from(current) {
-                        Ok(c) => c,
-                        Err(_) => u16::MAX,
-                    };
-                    return Err(DriverError::BatchColumnOidMismatch {
-                        command,
-                        source: DecodeError::ColumnOidMismatch {
-                            index: column,
-                            expected,
-                            found,
-                        },
-                    });
-                }
+            // connection at `Idle` tx status (mirrors the serial cache rule; inside an
+            // explicit transaction it defers, since a rollback could drop it).
+            (None, _) => {
                 if matches!(self.engine.tx_status(), Ok(TxStatus::Idle)) {
                     for &name in &plan {
                         self.engine.record_pipeline_statement(name);
@@ -2200,56 +2317,45 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 }
                 B::finish(builders)
             }
-            // A mid-batch failure. The N commands are ONE implicit transaction, so
-            // the server ROLLED BACK every command; the provisional builders are
-            // DISCARDED (never an `Ok`).
-            //
-            // The connection is left EXACTLY as a normal failed verb leaves it —
-            // `pipeline` does NOT special-case the transaction state. A COMMON
-            // implicit-tx batch (no explicit `BEGIN`) has its single trailing `Sync`
-            // close the implicit transaction, so `tx_status` is already `Idle` and
-            // the connection is clean. A batch inside an EXPLICIT transaction (a
-            // `conn.transaction` guard, or a manual `BEGIN` in the batch) leaves that
-            // transaction ABORTED (`'E'`), UNTOUCHED — the OWNER of the transaction
-            // rolls it back (the guard at closure exit, a pooled `reset_session` on
-            // checkin, or the direct caller's `rollback`). This is the tier-1 choice:
-            // auto-rolling-back here would make `pipeline` the ONLY verb that clears
-            // a caller's aborted transaction, so a caller who IGNORED the error and
-            // issued another verb inside the guard would run it in AUTOCOMMIT (a
-            // silent transaction escape) instead of getting a loud `25P02`. Leaving
-            // it `'E'` makes the next in-guard verb fail loudly with `25P02`, exactly
-            // as a normal failed verb does.
-            CommandStatus::ServerErrored => {
+            // A mid-batch / commit-time server failure. The N commands are ONE
+            // implicit transaction, so the server ROLLED BACK every command; the
+            // provisional builders are DISCARDED (never an `Ok`). The connection is
+            // left EXACTLY as a normal failed verb leaves it — `pipeline` does NOT
+            // special-case the transaction state (auto-rolling-back here would make
+            // `pipeline` the ONLY verb that clears a caller's aborted transaction, so
+            // a caller who IGNORED the error inside a guard would run the next verb in
+            // AUTOCOMMIT instead of getting a loud `25P02`). Self-heal: evict every
+            // referenced statement so a next attempt re-Parses (a no-op for MISS
+            // names, not cached).
+            (Some(index), Some(db)) => {
                 core::hint::cold_path();
-                // Self-heal (ORTHOGONAL to the transaction state): evict every
-                // referenced statement so a next attempt re-Parses
-                // (Close-before-Parse), recovering a plan dropped out of band. A
-                // no-op for MISS names (not cached).
                 for &name in &plan {
                     self.engine.evict_pipeline_statement(name);
                 }
-                // A `ServerErrored` status is reached ONLY via a surfaced `Fail`, so
-                // both are `Some` by construction; the `_` arm is fail-closed
-                // (classified, never a fabricated index) against the impossible case.
-                match (failed_index, db_error) {
+                if index >= arity {
                     // COMMIT-TIME failure: every command completed at Execute
                     // (`index == arity`), then the trailing `Sync`'s implicit COMMIT
                     // failed — the error belongs to the whole batch, not any single
-                    // command. Return it as a batch-level `Db` (so `batch_failed_index`
-                    // is `None`), never `BatchFailed { index: arity }` (an out-of-range
-                    // index a consumer would index an N-element array by), and never a
-                    // silent clamp to `arity - 1` (which would misattribute the failure
-                    // to a command that actually SUCCEEDED). All-or-nothing still holds:
-                    // the implicit transaction rolled back, so zero rows persisted.
-                    (Some(index), Some(db)) if index >= arity => Err(DriverError::Db(Box::new(db))),
+                    // command. Return a batch-level `Db` (so `batch_failed_index` is
+                    // `None`), never an out-of-range `BatchFailed { index: arity }`.
+                    Err(DriverError::Db(Box::new(db)))
+                } else {
                     // A command-attributable failure: `index < arity` names the
                     // zero-based failing command.
-                    (Some(index), Some(db)) => Err(DriverError::BatchFailed {
+                    Err(DriverError::BatchFailed {
                         index,
                         source: Box::new(db),
-                    }),
-                    _ => Err(DriverError::UnclassifiedFailure),
+                    })
                 }
+            }
+            // A parked failure with no parsed cause is unreachable (a failure is
+            // reached ONLY via a surfaced `Fail`); fail-closed classified.
+            (Some(_), None) => {
+                core::hint::cold_path();
+                for &name in &plan {
+                    self.engine.evict_pipeline_statement(name);
+                }
+                Err(DriverError::UnclassifiedFailure)
             }
         }
     }
