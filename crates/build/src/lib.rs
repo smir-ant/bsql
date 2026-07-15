@@ -1691,12 +1691,17 @@ pub fn catalog_from_dir(migrations_dir: impl AsRef<Path>) -> Result<Catalog, Bui
 /// Replay every walked file into a fresh catalog.
 fn catalog_from_walk(walk: &Walk) -> Result<Catalog, BuildError> {
     let mut catalog = Catalog::default();
+    // The constraint tracker is TRANSIENT replay scaffolding that spans EVERY
+    // migration file (a constraint declared in one file may be dropped in a
+    // later one), so it lives for the whole walk and is discarded here — it is
+    // never part of the returned `Catalog`.
+    let mut tracker = ConstraintTracker::default();
     for file in &walk.files {
         let sql = std::fs::read_to_string(file).map_err(|source| BuildError::ReadFile {
             path: file.clone(),
             source,
         })?;
-        replay_file(&mut catalog, file, &sql)?;
+        replay_file(&mut catalog, &mut tracker, file, &sql)?;
     }
     Ok(catalog)
 }
@@ -1819,21 +1824,27 @@ fn descend(dir: &Path, walk: &mut Walk) -> Result<(), BuildError> {
 #[cfg(test)]
 pub(crate) fn replay_file_for_test(
     catalog: &mut Catalog,
+    tracker: &mut ConstraintTracker,
     path: &Path,
     sql: &str,
 ) -> Result<(), BuildError> {
-    replay_file(catalog, path, sql)
+    replay_file(catalog, tracker, path, sql)
 }
 
 /// Parse and replay every statement in one migration file.
-fn replay_file(catalog: &mut Catalog, path: &Path, sql: &str) -> Result<(), BuildError> {
+fn replay_file(
+    catalog: &mut Catalog,
+    tracker: &mut ConstraintTracker,
+    path: &Path,
+    sql: &str,
+) -> Result<(), BuildError> {
     let statements = parse_migration_sql(path, sql)?;
     // Gate irreversible data destruction BEFORE any statement mutates the
     // catalog: a `DROP TABLE` / `DROP COLUMN` without a co-located
     // acknowledgement fails the build rather than silently discarding data.
     enforce_destructive_acks(path, sql, &statements)?;
     for statement in statements {
-        replay_statement(catalog, path, statement)?;
+        replay_statement(catalog, tracker, path, statement)?;
     }
     Ok(())
 }
@@ -2156,15 +2167,16 @@ fn comment_is_ack(content: &str) -> bool {
 /// silent skip (a silent skip would let a wrong catalog pass).
 fn replay_statement(
     catalog: &mut Catalog,
+    tracker: &mut ConstraintTracker,
     path: &Path,
     statement: Statement,
 ) -> Result<(), BuildError> {
     match statement {
-        Statement::CreateTable(create) => replay_create_table(catalog, path, create),
+        Statement::CreateTable(create) => replay_create_table(catalog, tracker, path, create),
         Statement::AlterTable(alter) => {
             let table = replay_relation_key(&alter.name, path)?;
             for op in alter.operations {
-                replay_alter_op(catalog, path, &table, op)?;
+                replay_alter_op(catalog, tracker, path, &table, op)?;
             }
             Ok(())
         }
@@ -2180,6 +2192,9 @@ fn replay_statement(
                 // it is removed alongside the columns; leaving it would let a
                 // later same-named table inherit a stale key.
                 catalog.primary_keys.remove(&table);
+                // The dropped table's tracked constraints go with it, so a later
+                // same-named table starts with a clean constraint registry.
+                tracker.forget_table(&table);
             }
             Ok(())
         }
@@ -2206,6 +2221,7 @@ fn replay_statement(
                     if drop_schema_targets_public(name) {
                         catalog.tables.clear();
                         catalog.primary_keys.clear();
+                        tracker.clear();
                     }
                 }
             }
@@ -2233,7 +2249,7 @@ fn replay_statement(
             for rename in renames {
                 let from = replay_relation_key(&rename.old_name, path)?;
                 let to = replay_relation_key(&rename.new_name, path)?;
-                rekey_table(catalog, path, &from, to)?;
+                rekey_table(catalog, tracker, path, &from, to)?;
             }
             Ok(())
         }
@@ -2537,11 +2553,353 @@ fn alter_type_rename_value(
     Ok(())
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Constraint tracking by NAME — so `DROP CONSTRAINT <name>` UNDOES the exact
+// constraint, never a name-blind no-op that keeps a dropped `NOT NULL` /
+// `PRIMARY KEY` stale (a silently-wrong catalog).
+// ════════════════════════════════════════════════════════════════════════
+//
+// The `AlterTableOperation::DropConstraint` AST carries only the constraint
+// NAME, not its kind, so the replay cannot tell from the drop alone whether it
+// removed a `NOT NULL` (a column becomes nullable), a `PRIMARY KEY` (the
+// functional-dependency key is gone), or something shape-irrelevant. The fix is
+// to REGISTER every constraint a `CREATE TABLE` / `ALTER TABLE ADD CONSTRAINT`
+// establishes under its PostgreSQL name — the EXPLICIT `CONSTRAINT <name> ...`
+// name when given, else the server's SYNTHESIZED default (`<table>_pkey`,
+// `<table>_<col>_not_null`, ...) — then RESOLVE a `DROP CONSTRAINT <name>`
+// against that registry and undo exactly what it constrained.
+//
+// A drop whose name does NOT resolve is a LOUD fail-closed error (never a
+// silent keep): dropping a nonexistent constraint is itself a PostgreSQL error,
+// so no VALID migration regresses — and this converts the former silent-wrong
+// (a kept-stale `NOT NULL` → an under-nullable `T` decode of a real server
+// `NULL`) into a fail-loud, per "a DDL form the replay cannot model is a loud
+// build error, never a silently-wrong catalog". A `DROP CONSTRAINT IF EXISTS`
+// of an unresolved name is the ONE sanctioned silent no-op (matching the
+// server's "does not exist, skipping").
+//
+// GUARANTEE BOUNDARY (documented residual, all fail-SAFE, none silently-wrong):
+//   * The SHAPE-relevant auto-names — `<table>_pkey` (one PK per table) and
+//     `<table>_<col>_not_null` (one per column) — are collision-FREE, so the
+//     shape-carrying drops resolve reliably.
+//   * The shape-IRRELEVANT auto-names (`UNIQUE`/`CHECK`/`FOREIGN KEY`) are
+//     synthesized best-effort; PostgreSQL's collision de-dup suffix (`_key1`,
+//     `_check1`), its single-column-attribution of a TABLE-level `CHECK`
+//     (`<table>_<col>_check`), and its 63-byte NAMEDATALEN truncation are NOT
+//     modeled, so an exotic auto-named shape-irrelevant drop may fail closed
+//     (a false-loud on a valid drop — safe, never a wrong catalog).
+//   * A `PRIMARY KEY`'s implicit `NOT NULL` (PostgreSQL 17 records a separate
+//     `<table>_<col>_not_null` for a bare `a int PRIMARY KEY`) is NOT
+//     registered as a droppable `NOT NULL`: registering it would UNDER-nullify
+//     on PostgreSQL < 17 (where the PK creates NO such constraint and its
+//     `DROP CONSTRAINT` is a server error, so the column stays `NOT NULL`).
+//     Dropping such a name on PostgreSQL 17 is therefore a false-loud — safe.
+//   * Dropping a `PRIMARY KEY` removes the key but leaves the columns
+//     `NOT NULL`: PostgreSQL keeps a column's `attnotnull` when its primary key
+//     is dropped (verified against a live server), so clearing it would
+//     OVER-nullify.
+
+/// What a tracked table constraint contributes to the catalog, so a later
+/// `ALTER TABLE ... DROP CONSTRAINT <name>` can UNDO exactly it.
+///
+/// Only two constraint kinds carry catalog SHAPE — a `NOT NULL` (a column's
+/// nullability) and a `PRIMARY KEY` (the `primary_keys` set). Every other kind
+/// (`UNIQUE` / `CHECK` / `FOREIGN KEY`) is shape-IRRELEVANT and tracked ONLY so
+/// its `DROP CONSTRAINT` RESOLVES (never a loud unresolved error on a valid
+/// drop).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrackedConstraint {
+    /// An explicit column `NOT NULL` (a named `CONSTRAINT c NOT NULL`, an
+    /// unnamed inline `NOT NULL` → auto-name `<table>_<col>_not_null`, or an
+    /// `ALTER COLUMN ... SET NOT NULL`). Its drop makes the column NULLABLE
+    /// unless another `NOT NULL` source (a second explicit constraint on the
+    /// same column, or that column's `PRIMARY KEY` membership) keeps it
+    /// non-null.
+    NotNull { column: String },
+    /// The table's `PRIMARY KEY` (a named constraint, or auto-name
+    /// `<table>_pkey`). Its drop removes `primary_keys[table]`; the columns'
+    /// `not_null` is UNCHANGED, because PostgreSQL keeps a column's `attnotnull`
+    /// when its primary key is dropped.
+    PrimaryKey,
+    /// A `UNIQUE` / `CHECK` / `FOREIGN KEY` constraint — shape-IRRELEVANT to
+    /// this catalog (it tracks column type/nullability + the primary key only),
+    /// so its drop changes NOTHING. Registered ONLY so its `DROP CONSTRAINT`
+    /// resolves, never a loud unresolved error.
+    Shapeless,
+}
+
+/// Every table's constraints tracked BY NAME across the WHOLE migration replay
+/// (a constraint declared in one migration file and dropped in a later one), so
+/// a `DROP CONSTRAINT <name>` RESOLVES the name and undoes exactly what it
+/// constrained.
+///
+/// TRANSIENT replay scaffolding, threaded ALONGSIDE the [`Catalog`] (never a
+/// `Catalog` field): the catalog serializes to a byte-deterministic on-disk
+/// form the query proc-macro reads, this tracker is meaningless post-replay,
+/// and embedding it would both pollute that form and break the catalog's
+/// serialize→parse round-trip equality (a parsed catalog would carry no
+/// tracker).
+#[derive(Debug, Default)]
+struct ConstraintTracker {
+    /// table (relation key) → (constraint name → what it constrains). Both keys
+    /// are already case-folded by the caller ([`fold_ident`]), matching how
+    /// PostgreSQL stores and resolves an identifier.
+    by_table: BTreeMap<String, BTreeMap<String, TrackedConstraint>>,
+}
+
+impl ConstraintTracker {
+    /// Register constraint `name` on `table`. A duplicate name on one table is a
+    /// migration the server itself rejects, so a re-register (overwrite) only
+    /// occurs on already-invalid input and is benign.
+    fn register(&mut self, table: &str, name: String, kind: TrackedConstraint) {
+        self.by_table
+            .entry(table.to_string())
+            .or_default()
+            .insert(name, kind);
+    }
+
+    /// Resolve and REMOVE a `DROP CONSTRAINT <name>` on `table`, returning what
+    /// it constrained, or `None` when no constraint of that name is tracked.
+    fn resolve_drop(&mut self, table: &str, name: &str) -> Option<TrackedConstraint> {
+        self.by_table.get_mut(table)?.remove(name)
+    }
+
+    /// Whether `column` still has ANY tracked `NOT NULL` constraint on `table` —
+    /// the recompute input that keeps a column non-null while a SECOND explicit
+    /// `NOT NULL` remains after one is dropped.
+    fn column_has_not_null(&self, table: &str, column: &str) -> bool {
+        self.by_table.get(table).is_some_and(|entries| {
+            entries.values().any(
+                |kind| matches!(kind, TrackedConstraint::NotNull { column: c } if c == column),
+            )
+        })
+    }
+
+    /// Re-key a table's tracked constraints on a `RENAME TABLE`. PostgreSQL
+    /// keeps constraint NAMES across a table rename, so only the table key
+    /// moves.
+    fn rekey_table(&mut self, from: &str, to: &str) {
+        if let Some(entries) = self.by_table.remove(from) {
+            self.by_table.insert(to.to_string(), entries);
+        }
+    }
+
+    /// Forget a dropped table's constraints, so a later same-named table starts
+    /// clean (the peer of the catalog's own `tables` / `primary_keys` removal).
+    fn forget_table(&mut self, table: &str) {
+        self.by_table.remove(table);
+    }
+
+    /// Forget EVERY table's constraints (a `DROP SCHEMA public CASCADE`).
+    fn clear(&mut self) {
+        self.by_table.clear();
+    }
+
+    /// Forget a column's `NOT NULL` entries on `table` — used by both a
+    /// `DROP COLUMN` (the column and its constraints go together) and an
+    /// `ALTER COLUMN ... DROP NOT NULL` (the constraint is removed, the column
+    /// stays). Shape-irrelevant entries that reference the column are LEFT
+    /// (their later drop then resolves to a harmless no-op — safe, since they
+    /// carry no shape).
+    fn forget_column_not_null(&mut self, table: &str, column: &str) {
+        if let Some(entries) = self.by_table.get_mut(table) {
+            entries.retain(
+                |_, kind| !matches!(kind, TrackedConstraint::NotNull { column: c } if c == column),
+            );
+        }
+    }
+
+    /// Follow a `RENAME COLUMN old TO new`: a `NOT NULL` on the OLD column now
+    /// targets the NEW column. PostgreSQL keeps the constraint NAME across a
+    /// column rename, so only the target column moves.
+    fn rename_column(&mut self, table: &str, old: &str, new: &str) {
+        if let Some(entries) = self.by_table.get_mut(table) {
+            for kind in entries.values_mut() {
+                if let TrackedConstraint::NotNull { column } = kind
+                    && column == old
+                {
+                    *column = new.to_string();
+                }
+            }
+        }
+    }
+
+    /// Follow a `RENAME CONSTRAINT old TO new` (the effect is unchanged, only
+    /// the name changes), so a later `DROP CONSTRAINT new` still resolves.
+    fn rename_constraint(&mut self, table: &str, old: &str, new: String) {
+        if let Some(entries) = self.by_table.get_mut(table)
+            && let Some(kind) = entries.remove(old)
+        {
+            entries.insert(new, kind);
+        }
+    }
+}
+
+/// The constraint's tracked name: the migration's EXPLICIT `CONSTRAINT <name>`
+/// when given, else the lazily-synthesized PostgreSQL default. An explicit
+/// branch (not `Option::unwrap_or_else`, which this crate bans as a
+/// silent-fallback shape) — "no explicit name" is a real named-vs-auto branch,
+/// not a swallowed failure.
+fn or_auto_name(explicit: Option<String>, auto: impl FnOnce() -> String) -> String {
+    match explicit {
+        Some(name) => name,
+        None => auto(),
+    }
+}
+
+/// PostgreSQL's default name for an UNNAMED `PRIMARY KEY` — `<table>_pkey`
+/// (collision-free: at most one primary key per table).
+fn auto_pk_name(table: &str) -> String {
+    format!("{table}_pkey")
+}
+
+/// PostgreSQL's default name for an UNNAMED column `NOT NULL` —
+/// `<table>_<col>_not_null` (PostgreSQL 17+ records NOT NULL as a droppable
+/// named constraint; collision-free: at most one per column).
+fn auto_not_null_name(table: &str, column: &str) -> String {
+    format!("{table}_{column}_not_null")
+}
+
+/// PostgreSQL's default name for an UNNAMED `UNIQUE` over `columns` —
+/// `<table>_<col>[_<col>...]_key`.
+fn auto_unique_name(table: &str, columns: &[String]) -> String {
+    let mut name = table.to_string();
+    for column in columns {
+        name.push('_');
+        name.push_str(column);
+    }
+    name.push_str("_key");
+    name
+}
+
+/// PostgreSQL's default name for an UNNAMED `FOREIGN KEY` —
+/// `<table>_<firstcol>_fkey` (PostgreSQL derives it from the FIRST constrained
+/// column).
+fn auto_fk_name(table: &str, columns: &[String]) -> String {
+    match columns.first() {
+        Some(first) => format!("{table}_{first}_fkey"),
+        None => format!("{table}_fkey"),
+    }
+}
+
+/// PostgreSQL's default name for an UNNAMED `CHECK` — `<table>_<col>_check` when
+/// exactly one column is attributed (a column-level check), else `<table>_check`
+/// (a table-level check; PostgreSQL's single-column attribution of a table-level
+/// check by expression analysis is NOT modeled — the documented residual above).
+fn auto_check_name(table: &str, columns: &[String]) -> String {
+    match columns {
+        [only] => format!("{table}_{only}_check"),
+        _ => format!("{table}_check"),
+    }
+}
+
+/// The explicit NAME of a column-level `PRIMARY KEY`, if the migration gave one
+/// (`a int CONSTRAINT pk PRIMARY KEY`). Checked at BOTH the option-def name
+/// (where `sqlparser` records a column-level `CONSTRAINT c ...`) and the inner
+/// primary-key constraint's own name.
+fn column_pk_name(column: &ColumnDef) -> Option<String> {
+    column.options.iter().find_map(|opt| match &opt.option {
+        ColumnOption::PrimaryKey(pk) => opt.name.as_ref().or(pk.name.as_ref()).map(fold_ident),
+        _ => None,
+    })
+}
+
+/// Register a column's column-LEVEL constraints — `NOT NULL` (shape) and
+/// `UNIQUE` / `CHECK` / `FOREIGN KEY` (shape-irrelevant) — into the tracker
+/// under their PostgreSQL names, so a later `DROP CONSTRAINT` resolves. The
+/// column-level `PRIMARY KEY` is registered by the caller's unified
+/// primary-key path (so the one `<table>_pkey` name is shared with a table-level
+/// declaration), and `Null` / `Default` / the rest carry no droppable-by-name
+/// constraint.
+fn register_column_constraints(tracker: &mut ConstraintTracker, table: &str, column: &ColumnDef) {
+    let col = fold_ident(&column.name);
+    for opt in &column.options {
+        // A column-level `CONSTRAINT c ...` name is recorded on the option-def.
+        let explicit = opt.name.as_ref().map(fold_ident);
+        match &opt.option {
+            ColumnOption::NotNull => {
+                let name = or_auto_name(explicit, || auto_not_null_name(table, &col));
+                tracker.register(
+                    table,
+                    name,
+                    TrackedConstraint::NotNull {
+                        column: col.clone(),
+                    },
+                );
+            }
+            ColumnOption::Unique(uq) => {
+                let name = or_auto_name(explicit.or_else(|| uq.name.as_ref().map(fold_ident)), || {
+                    auto_unique_name(table, std::slice::from_ref(&col))
+                });
+                tracker.register(table, name, TrackedConstraint::Shapeless);
+            }
+            ColumnOption::Check(ck) => {
+                let name = or_auto_name(explicit.or_else(|| ck.name.as_ref().map(fold_ident)), || {
+                    auto_check_name(table, std::slice::from_ref(&col))
+                });
+                tracker.register(table, name, TrackedConstraint::Shapeless);
+            }
+            ColumnOption::ForeignKey(fk) => {
+                let name = or_auto_name(explicit.or_else(|| fk.name.as_ref().map(fold_ident)), || {
+                    auto_fk_name(table, std::slice::from_ref(&col))
+                });
+                tracker.register(table, name, TrackedConstraint::Shapeless);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Register a table-LEVEL constraint that is shape-IRRELEVANT (`UNIQUE` /
+/// `CHECK` / `FOREIGN KEY`) into the tracker under its PostgreSQL name, so a
+/// later `DROP CONSTRAINT` resolves. The table-level `PRIMARY KEY` is registered
+/// by the caller's unified primary-key path; the MySQL `INDEX` / fulltext /
+/// PostgreSQL promote-index forms are not `DROP CONSTRAINT` targets this catalog
+/// models.
+fn register_table_constraint(
+    tracker: &mut ConstraintTracker,
+    table: &str,
+    constraint: &TableConstraint,
+) {
+    match constraint {
+        TableConstraint::Unique(uq) => {
+            let cols = index_column_names(&uq.columns);
+            let name = or_auto_name(uq.name.as_ref().map(fold_ident), || {
+                auto_unique_name(table, &cols)
+            });
+            tracker.register(table, name, TrackedConstraint::Shapeless);
+        }
+        TableConstraint::ForeignKey(fk) => {
+            let cols: Vec<String> = fk.columns.iter().map(fold_ident).collect();
+            let name = or_auto_name(fk.name.as_ref().map(fold_ident), || {
+                auto_fk_name(table, &cols)
+            });
+            tracker.register(table, name, TrackedConstraint::Shapeless);
+        }
+        TableConstraint::Check(ck) => {
+            let name = or_auto_name(ck.name.as_ref().map(fold_ident), || {
+                auto_check_name(table, &[])
+            });
+            tracker.register(table, name, TrackedConstraint::Shapeless);
+        }
+        // A `PRIMARY KEY` is registered by the unified primary-key path; the
+        // remaining forms (MySQL `INDEX` / fulltext / PostgreSQL
+        // `PRIMARY KEY|UNIQUE USING INDEX`) are not modeled as `DROP CONSTRAINT`
+        // targets — a drop of one is the documented fail-loud residual.
+        TableConstraint::PrimaryKey(_)
+        | TableConstraint::Index(_)
+        | TableConstraint::FulltextOrSpatial(_)
+        | TableConstraint::PrimaryKeyUsingIndex(_)
+        | TableConstraint::UniqueUsingIndex(_) => {}
+    }
+}
+
 /// Replay a `CREATE TABLE`. Only the explicit-column-list form is
 /// modeled; any form whose final column set this replay cannot derive
 /// faithfully is a loud error rather than a silently empty/merged table.
 fn replay_create_table(
     catalog: &mut Catalog,
+    tracker: &mut ConstraintTracker,
     path: &Path,
     create: sqlparser::ast::CreateTable,
 ) -> Result<(), BuildError> {
@@ -2632,10 +2990,12 @@ fn replay_create_table(
     // the other (which would record a wrong key set). Whichever form declares
     // it, those columns are NOT NULL in PostgreSQL.
     //
-    // `pk_columns` is `Some(set)` once the single primary key has been seen.
-    let mut pk_columns: Option<BTreeSet<String>> = None;
-    let mut set_pk = |names: Vec<String>| -> Result<(), BuildError> {
-        if pk_columns.is_some() {
+    // `pk` is `Some((columns, explicit_name))` once the single primary key has
+    // been seen; `explicit_name` is the migration's `CONSTRAINT <name>` if it
+    // gave one (else the tracker synthesizes `<table>_pkey`).
+    let mut pk: Option<(BTreeSet<String>, Option<String>)> = None;
+    let mut set_pk = |names: Vec<String>, name: Option<String>| -> Result<(), BuildError> {
+        if pk.is_some() {
             return Err(BuildError::Replay {
                 path: path.to_path_buf(),
                 message: format!(
@@ -2644,25 +3004,34 @@ fn replay_create_table(
                 ),
             });
         }
-        pk_columns = Some(names.into_iter().collect());
+        pk = Some((names.into_iter().collect(), name));
         Ok(())
     };
     for constraint in &create.constraints {
-        if let TableConstraint::PrimaryKey(pk) = constraint {
-            set_pk(index_column_names(&pk.columns))?;
+        if let TableConstraint::PrimaryKey(pkc) = constraint {
+            set_pk(
+                index_column_names(&pkc.columns),
+                pkc.name.as_ref().map(fold_ident),
+            )?;
         }
+        // Register the shape-irrelevant table-level constraints (UNIQUE / CHECK
+        // / FOREIGN KEY) so a later `DROP CONSTRAINT` resolves; the PRIMARY KEY
+        // is registered below via the unified path (one `<table>_pkey` name).
+        register_table_constraint(tracker, &table, constraint);
     }
     for column in &create.columns {
         if column_is_primary_key(column) {
-            set_pk(vec![fold_ident(&column.name)])?;
+            set_pk(vec![fold_ident(&column.name)], column_pk_name(column))?;
         }
     }
     for column in &create.columns {
         let info = column_info(column);
         columns.insert(fold_ident(&column.name), info);
+        // Register the column's column-level NOT NULL / UNIQUE / CHECK / FK.
+        register_column_constraints(tracker, &table, column);
     }
-    if let Some(pk) = pk_columns {
-        for name in &pk {
+    if let Some((pk_columns, pk_name)) = pk {
+        for name in &pk_columns {
             if let Some(info) = columns.get_mut(name) {
                 info.not_null = true;
             }
@@ -2672,8 +3041,10 @@ fn replay_create_table(
         // (which carry no plain column name) yields an empty set; an empty PK
         // set would spuriously "cover" every column under the functional-
         // dependency rule, so it is omitted rather than stored.
-        if !pk.is_empty() {
-            catalog.primary_keys.insert(table.clone(), pk);
+        if !pk_columns.is_empty() {
+            let name = or_auto_name(pk_name, || auto_pk_name(&table));
+            tracker.register(&table, name, TrackedConstraint::PrimaryKey);
+            catalog.primary_keys.insert(table.clone(), pk_columns);
         }
     }
     catalog.tables.insert(table, columns);
@@ -2686,6 +3057,7 @@ fn replay_create_table(
 /// that does not exist is a loud error, never a silent skip.
 fn rekey_table(
     catalog: &mut Catalog,
+    tracker: &mut ConstraintTracker,
     path: &Path,
     from: &str,
     to: String,
@@ -2700,6 +3072,9 @@ fn rekey_table(
     if let Some(pk) = catalog.primary_keys.remove(from) {
         catalog.primary_keys.insert(to.clone(), pk);
     }
+    // Re-key the tracked constraints too (their NAMES are unchanged by a table
+    // rename), so a later `DROP CONSTRAINT` under the new table name resolves.
+    tracker.rekey_table(from, &to);
     catalog.tables.insert(to, columns);
     Ok(())
 }
@@ -2713,6 +3088,7 @@ fn rekey_table(
 /// guarantee enforced by the compiler, not by a comment.
 fn replay_alter_op(
     catalog: &mut Catalog,
+    tracker: &mut ConstraintTracker,
     path: &Path,
     table: &str,
     op: AlterTableOperation,
@@ -2725,7 +3101,7 @@ fn replay_alter_op(
                 replay_relation_key(&name, path)?
             }
         };
-        return rekey_table(catalog, path, table, to);
+        return rekey_table(catalog, tracker, path, table, to);
     }
 
     let columns = catalog.tables.get_mut(table).ok_or_else(|| BuildError::Replay {
@@ -2736,6 +3112,9 @@ fn replay_alter_op(
         AlterTableOperation::AddColumn { column_def, .. } => {
             let info = column_info(&column_def);
             columns.insert(fold_ident(&column_def.name), info);
+            // Register the added column's column-level constraints (NOT NULL /
+            // UNIQUE / CHECK / FK) so a later `DROP CONSTRAINT` resolves.
+            register_column_constraints(tracker, table, &column_def);
             Ok(())
         }
         AlterTableOperation::DropColumn {
@@ -2764,6 +3143,10 @@ fn replay_alter_op(
                 {
                     catalog.primary_keys.remove(table);
                 }
+                // The dropped column's constraints go with it (PostgreSQL drops
+                // a column's constraints alongside the column), so a later
+                // `DROP CONSTRAINT` of one is correctly unresolved.
+                tracker.forget_column_not_null(table, &name);
             }
             Ok(())
         }
@@ -2780,6 +3163,10 @@ fn replay_alter_op(
                 ),
             })?;
             columns.insert(new.clone(), info);
+            // A `NOT NULL` on the renamed column now targets its new name (its
+            // constraint NAME is unchanged by a column rename), so a later
+            // `DROP CONSTRAINT` still clears the right column.
+            tracker.rename_column(table, &old, &new);
             // A renamed column that is part of the primary key keeps its
             // membership under the new name, so the functional dependency
             // continues to resolve after the rename. `primary_keys` is a
@@ -2802,10 +3189,23 @@ fn replay_alter_op(
             match op {
                 AlterColumnOperation::SetNotNull => {
                     info.not_null = true;
+                    // `SET NOT NULL` establishes a droppable NOT NULL constraint
+                    // (PostgreSQL 17+), auto-named `<table>_<col>_not_null`.
+                    tracker.register(
+                        table,
+                        auto_not_null_name(table, &name),
+                        TrackedConstraint::NotNull {
+                            column: name.clone(),
+                        },
+                    );
                     Ok(())
                 }
                 AlterColumnOperation::DropNotNull => {
                     info.not_null = false;
+                    // The NOT NULL constraint is removed with the column's
+                    // nullability, so a later `DROP CONSTRAINT` of it is
+                    // correctly unresolved.
+                    tracker.forget_column_not_null(table, &name);
                     Ok(())
                 }
                 AlterColumnOperation::SetDataType { data_type, .. } => {
@@ -2830,7 +3230,7 @@ fn replay_alter_op(
         // recorded key. `primary_keys` is a field disjoint from the `columns`
         // borrow above.
         AlterTableOperation::AddConstraint { constraint, .. } => {
-            if let TableConstraint::PrimaryKey(pk) = constraint {
+            if let TableConstraint::PrimaryKey(pk) = &constraint {
                 let names = index_column_names(&pk.columns);
                 for name in &names {
                     if let Some(info) = columns.get_mut(name) {
@@ -2849,8 +3249,17 @@ fn replay_alter_op(
                             ),
                         });
                     }
+                    let name = or_auto_name(pk.name.as_ref().map(fold_ident), || {
+                        auto_pk_name(table)
+                    });
+                    tracker.register(table, name, TrackedConstraint::PrimaryKey);
                     catalog.primary_keys.insert(table.to_string(), key);
                 }
+            } else {
+                // A shape-irrelevant table-level constraint (UNIQUE / CHECK /
+                // FOREIGN KEY): register it under its name so a later
+                // `DROP CONSTRAINT` resolves.
+                register_table_constraint(tracker, table, &constraint);
             }
             Ok(())
         }
@@ -2890,25 +3299,82 @@ fn replay_alter_op(
             ),
         }),
 
+        // `DROP CONSTRAINT <name>` carries only the constraint NAME, not its
+        // kind, so this replay RESOLVES the name against the constraint tracker
+        // (every constraint a `CREATE TABLE` / `ADD CONSTRAINT` established is
+        // registered there under its PostgreSQL name) and UNDOES exactly what it
+        // constrained. A name that does NOT resolve is a LOUD fail-closed error
+        // (never a silent keep of a stale `NOT NULL` / `PRIMARY KEY`) — dropping
+        // a nonexistent constraint is itself a server error, so no VALID
+        // migration regresses; a `DROP CONSTRAINT IF EXISTS` of an unresolved
+        // name is the ONE sanctioned silent no-op (matching PostgreSQL's "does
+        // not exist, skipping").
+        AlterTableOperation::DropConstraint { if_exists, name, .. } => {
+            let cname = fold_ident(&name);
+            match tracker.resolve_drop(table, &cname) {
+                Some(TrackedConstraint::NotNull { column }) => {
+                    // The column becomes NULLABLE unless another `NOT NULL`
+                    // source keeps it non-null: a SECOND explicit constraint on
+                    // it (the tracker still holds one after the drop), or its
+                    // `PRIMARY KEY` membership (PostgreSQL keeps a PK column's
+                    // `attnotnull` even after the NOT NULL constraint is
+                    // dropped). `primary_keys` is a field disjoint from the
+                    // `columns` borrow above.
+                    let still_pk = catalog
+                        .primary_keys
+                        .get(table)
+                        .is_some_and(|pk| pk.contains(&column));
+                    let still_not_null = tracker.column_has_not_null(table, &column);
+                    if !still_pk
+                        && !still_not_null
+                        && let Some(info) = columns.get_mut(&column)
+                    {
+                        info.not_null = false;
+                    }
+                    Ok(())
+                }
+                Some(TrackedConstraint::PrimaryKey) => {
+                    // Remove the recorded key; the columns' `not_null` is
+                    // UNCHANGED — PostgreSQL keeps a column's `attnotnull` when
+                    // its primary key is dropped, so clearing it would
+                    // over-nullify. `primary_keys` is disjoint from `columns`.
+                    catalog.primary_keys.remove(table);
+                    Ok(())
+                }
+                Some(TrackedConstraint::Shapeless) => Ok(()),
+                None if if_exists => Ok(()),
+                None => Err(BuildError::Replay {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "ALTER TABLE `{table}` DROP CONSTRAINT `{cname}`: no \
+                         constraint of that name was established by an earlier \
+                         migration. PostgreSQL rejects dropping a nonexistent \
+                         constraint; if the constraint exists via a form this \
+                         replay does not model, use DROP CONSTRAINT IF EXISTS."
+                    ),
+                }),
+            }
+        }
+        // `RENAME CONSTRAINT old TO new` keeps the constraint's EFFECT and only
+        // changes its name, so the tracker re-keys the entry (a later
+        // `DROP CONSTRAINT new` still resolves); the catalog SHAPE is unchanged.
+        AlterTableOperation::RenameConstraint { old_name, new_name } => {
+            tracker.rename_constraint(table, &fold_ident(&old_name), fold_ident(&new_name));
+            Ok(())
+        }
+
         // ---- Genuinely shape-irrelevant operations: allowlist. ----
         // None of these change a tracked column's name, type, or
         // nullability, so they are correct no-ops for this catalog.
         // Listed explicitly (no `_` arm) so a new variant is a compile
         // error, never a silent pass.
         //
-        // Constraints / keys / indexes (other than PK add, handled above).
-        // `DROP CONSTRAINT <name>` carries only the constraint NAME, not its
-        // kind, so this replay cannot tell whether the dropped constraint is
-        // the primary key. It is treated as shape-irrelevant — the same
-        // name-blind boundary the catalog already applies to a column's
-        // NOT NULL flag, which a `DROP CONSTRAINT` on the primary key would
-        // likewise leave set. The primary key established by `CREATE TABLE`,
-        // `ALTER TABLE ADD PRIMARY KEY`, a `DROP COLUMN` of a key member, and
-        // a `RENAME COLUMN` of a key member are all tracked exactly; only the
-        // name-only `DROP CONSTRAINT` form sits outside that boundary.
-        AlterTableOperation::DropConstraint { .. }
-        | AlterTableOperation::ValidateConstraint { .. }
-        | AlterTableOperation::RenameConstraint { .. }
+        // `VALIDATE CONSTRAINT` only marks an existing constraint validated (no
+        // shape change). The MySQL `DROP FOREIGN KEY` / `DROP INDEX` forms drop
+        // shape-irrelevant objects; leaving a stale tracker entry for a form
+        // this replay does not model is harmless (its later `DROP CONSTRAINT`
+        // resolves to a no-op — never a wrong catalog).
+        AlterTableOperation::ValidateConstraint { .. }
         | AlterTableOperation::DropForeignKey { .. }
         | AlterTableOperation::DropIndex { .. }
         // Triggers / rules / row-level security (behaviour, not shape).
@@ -3371,11 +3837,24 @@ fn parse_flag(value: &str, line: usize, field: &'static str) -> Result<bool, Cat
 mod tests {
     use super::*;
 
+    /// Replay ONE migration file into `cat` with a throwaway constraint tracker
+    /// — for a single-file test that never drops a constraint declared in an
+    /// EARLIER call. A cross-file `DROP CONSTRAINT` test uses [`catalog_from`],
+    /// which threads ONE persistent tracker across the whole sequence.
+    fn replay_one(cat: &mut Catalog, path: &Path, sql: &str) -> Result<(), BuildError> {
+        let mut tracker = ConstraintTracker::default();
+        replay_file(cat, &mut tracker, path, sql)
+    }
+
     fn catalog_from(sqls: &[&str]) -> Catalog {
         let mut cat = Catalog::default();
+        // ONE tracker across the whole sequence, so a constraint declared in an
+        // earlier statement resolves when a later statement drops it (the peer
+        // of the production `catalog_from_walk`).
+        let mut tracker = ConstraintTracker::default();
         for (i, sql) in sqls.iter().enumerate() {
             let path = PathBuf::from(format!("test_{i}.sql"));
-            replay_file(&mut cat, &path, sql).expect("replay");
+            replay_file(&mut cat, &mut tracker, &path, sql).expect("replay");
         }
         cat
     }
@@ -3384,9 +3863,10 @@ mod tests {
     /// first statement that fails closed (panicking if none does).
     fn replay_err(sqls: &[&str]) -> String {
         let mut cat = Catalog::default();
+        let mut tracker = ConstraintTracker::default();
         for (i, sql) in sqls.iter().enumerate() {
             let path = PathBuf::from(format!("test_{i}.sql"));
-            if let Err(err) = replay_file(&mut cat, &path, sql) {
+            if let Err(err) = replay_file(&mut cat, &mut tracker, &path, sql) {
                 match err {
                     BuildError::Replay { message, .. } => return message,
                     other => panic!("expected a Replay error, got: {other:?}"),
@@ -3753,13 +4233,13 @@ mod tests {
         // model faithfully is a LOUD build error, never a silently-stale struct —
         // exactly the catalog boundary. This LOCKS that fail-closed behavior.
         let mut cat = Catalog::default();
-        replay_file(
+        replay_one(
             &mut cat,
             &PathBuf::from("t0.sql"),
             "CREATE TYPE addr AS (street text, zip int4)",
         )
         .expect("create composite");
-        let err = replay_file(
+        let err = replay_one(
             &mut cat,
             &PathBuf::from("t1.sql"),
             "ALTER TYPE addr ADD ATTRIBUTE country text",
@@ -3937,7 +4417,7 @@ mod tests {
     #[test]
     fn alter_unknown_table_is_error() {
         let mut cat = Catalog::default();
-        let err = replay_file(
+        let err = replay_one(
             &mut cat,
             Path::new("x.sql"),
             "ALTER TABLE nope ADD COLUMN c INT",
@@ -3952,10 +4432,10 @@ mod tests {
     #[test]
     fn drop_unknown_column_is_error() {
         let mut cat = Catalog::default();
-        replay_file(&mut cat, Path::new("a.sql"), "CREATE TABLE t (a INT)").expect("create");
+        replay_one(&mut cat, Path::new("a.sql"), "CREATE TABLE t (a INT)").expect("create");
         // Acknowledged, so the gate passes and the replay reaches the
         // fail-closed "no such column" error this test pins.
-        let err = replay_file(&mut cat, Path::new("b.sql"), &acked("ALTER TABLE t DROP COLUMN gone"))
+        let err = replay_one(&mut cat, Path::new("b.sql"), &acked("ALTER TABLE t DROP COLUMN gone"))
             .expect_err("must fail closed");
         match err {
             BuildError::Replay { message, .. } => assert!(message.contains("no such column")),
@@ -3969,7 +4449,7 @@ mod tests {
     /// error (panicking if it unexpectedly succeeds).
     fn gate_err(sql: &str) -> BuildError {
         let mut cat = Catalog::default();
-        replay_file(&mut cat, Path::new("m.sql"), sql).expect_err("expected a fail-closed error")
+        replay_one(&mut cat, Path::new("m.sql"), sql).expect_err("expected a fail-closed error")
     }
 
     /// Replay one migration file's SQL into a fresh catalog (panicking on any
@@ -3977,7 +4457,7 @@ mod tests {
     /// destructive statement's effect on the schema.
     fn gate_ok(sql: &str) -> Catalog {
         let mut cat = Catalog::default();
-        replay_file(&mut cat, Path::new("m.sql"), sql).expect("replay");
+        replay_one(&mut cat, Path::new("m.sql"), sql).expect("replay");
         cat
     }
 
@@ -4186,7 +4666,7 @@ mod tests {
             "DROP INDEX idx;",
         ] {
             let mut cat = Catalog::default();
-            replay_file(&mut cat, Path::new("m.sql"), sql)
+            replay_one(&mut cat, Path::new("m.sql"), sql)
                 .expect("excluded drop needs no acknowledgement");
         }
     }
@@ -4251,7 +4731,7 @@ mod tests {
     #[test]
     fn parse_error_is_fatal() {
         let mut cat = Catalog::default();
-        let err = replay_file(&mut cat, Path::new("bad.sql"), "CREATE TABLE (((")
+        let err = replay_one(&mut cat, Path::new("bad.sql"), "CREATE TABLE (((")
             .expect_err("must fail closed");
         assert!(matches!(err, BuildError::Parse { .. }));
     }
@@ -4503,6 +4983,258 @@ mod tests {
         let t = cat.tables.get("t").expect("t");
         assert!(t.contains_key("a"));
         assert!(!t["a"].not_null, "UNIQUE does not imply NOT NULL");
+    }
+
+    // ── DROP CONSTRAINT resolves BY NAME (not the former name-blind no-op) ──
+    //
+    // Every constraint a CREATE TABLE / ALTER TABLE ADD CONSTRAINT establishes
+    // is tracked under its PostgreSQL name (explicit or synthesized), so a
+    // DROP CONSTRAINT undoes exactly what it constrained. A name that does not
+    // resolve is a LOUD fail-closed error (except DROP CONSTRAINT IF EXISTS).
+
+    #[test]
+    fn drop_named_not_null_makes_the_column_nullable() {
+        // BUG #1 (top severity, PostgreSQL 17+): a NAMED column NOT NULL that a
+        // later migration drops leaves the column NULLABLE. The former
+        // name-blind no-op kept `not_null == true`, so a `query!` decoded a real
+        // server NULL into a non-`Option` `T` — a SILENT under-nullable
+        // mis-decode. Now the drop RESOLVES `nn` and clears the flag.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int CONSTRAINT nn NOT NULL)",
+            "ALTER TABLE t DROP CONSTRAINT nn",
+        ]);
+        assert!(
+            !cat.tables["t"]["a"].not_null,
+            "a named NOT NULL that was dropped must leave the column NULLABLE"
+        );
+    }
+
+    #[test]
+    fn drop_unnamed_not_null_by_auto_name_makes_the_column_nullable() {
+        // The PostgreSQL 17 default name for an unnamed inline NOT NULL is
+        // `<table>_<col>_not_null`; dropping it by that auto-name resolves.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int NOT NULL)",
+            "ALTER TABLE t DROP CONSTRAINT t_a_not_null",
+        ]);
+        assert!(
+            !cat.tables["t"]["a"].not_null,
+            "an auto-named NOT NULL drop must leave the column NULLABLE"
+        );
+    }
+
+    #[test]
+    fn drop_set_not_null_constraint_makes_the_column_nullable() {
+        // `SET NOT NULL` establishes the same auto-named droppable constraint.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int)",
+            "ALTER TABLE t ALTER COLUMN a SET NOT NULL",
+            "ALTER TABLE t DROP CONSTRAINT t_a_not_null",
+        ]);
+        assert!(
+            !cat.tables["t"]["a"].not_null,
+            "a dropped SET NOT NULL constraint must leave the column NULLABLE"
+        );
+    }
+
+    #[test]
+    fn dropping_not_null_on_a_pk_column_keeps_it_not_null() {
+        // The column is still in the PRIMARY KEY, which keeps it NOT NULL
+        // (PostgreSQL would refuse the drop while the PK exists); the catalog
+        // must NOT under-nullify.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int CONSTRAINT nn NOT NULL PRIMARY KEY)",
+            "ALTER TABLE t DROP CONSTRAINT nn",
+        ]);
+        assert!(
+            cat.tables["t"]["a"].not_null,
+            "a PK column stays NOT NULL even when a redundant NOT NULL is dropped"
+        );
+    }
+
+    #[test]
+    fn dropping_the_pk_after_its_not_null_keeps_the_column_not_null() {
+        // Drop the PK first (the column's `attnotnull` persists — PostgreSQL
+        // keeps it), so a following explicit-NOT-NULL drop then correctly makes
+        // it nullable. This walks the full former-PK-column recompute.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int CONSTRAINT nn NOT NULL PRIMARY KEY)",
+            "ALTER TABLE t DROP CONSTRAINT t_pkey",
+        ]);
+        assert!(
+            cat.tables["t"]["a"].not_null,
+            "dropping the PK keeps the column NOT NULL (attnotnull persists)"
+        );
+        assert!(
+            !cat.primary_keys.contains_key("t"),
+            "dropping the PK removes the recorded key"
+        );
+        let cat2 = catalog_from(&[
+            "CREATE TABLE t (a int CONSTRAINT nn NOT NULL PRIMARY KEY)",
+            "ALTER TABLE t DROP CONSTRAINT t_pkey",
+            "ALTER TABLE t DROP CONSTRAINT nn",
+        ]);
+        assert!(
+            !cat2.tables["t"]["a"].not_null,
+            "after both the PK and the NOT NULL are dropped, the column is NULLABLE"
+        );
+    }
+
+    #[test]
+    fn drop_added_pk_removes_the_stale_functional_dependency_key() {
+        // BUG #2 (all PostgreSQL versions): an ADDED-then-DROPPED PRIMARY KEY
+        // left `primary_keys[t] == {a}` stale, so `SELECT a, b FROM t GROUP BY
+        // a` was wrongly ACCEPTED via the functional-dependency rule. Now the
+        // drop RESOLVES `tpk` and removes the key, and the aggregate query is
+        // correctly REJECTED.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int, b int)",
+            "ALTER TABLE t ADD CONSTRAINT tpk PRIMARY KEY (a)",
+            "ALTER TABLE t DROP CONSTRAINT tpk",
+        ]);
+        assert!(
+            !cat.primary_keys.contains_key("t"),
+            "an added-then-dropped PRIMARY KEY must not leave a stale key"
+        );
+        // The functional-dependency accept is now correctly REJECTED: with no
+        // PK, `GROUP BY a` does not determine `b`.
+        let err = infer_query(&cat, "SELECT a, b FROM t GROUP BY a")
+            .expect_err("GROUP BY a must NOT cover b once the PK is dropped");
+        assert!(
+            matches!(err, InferError::UngroupedColumn { .. }),
+            "expected an ungrouped-column error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn drop_create_table_pk_by_auto_name_removes_the_key() {
+        // A `CREATE TABLE ... PRIMARY KEY` auto-names `<table>_pkey`.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int PRIMARY KEY, b int)",
+            "ALTER TABLE t DROP CONSTRAINT t_pkey",
+        ]);
+        assert!(
+            !cat.primary_keys.contains_key("t"),
+            "dropping the auto-named PK removes the recorded key"
+        );
+    }
+
+    #[test]
+    fn drop_nonexistent_constraint_is_loud() {
+        // A drop whose name resolves to NOTHING is fail-closed (never a silent
+        // keep) — dropping a nonexistent constraint is itself a server error.
+        let msg = replay_err(&[
+            "CREATE TABLE t (a int NOT NULL)",
+            "ALTER TABLE t DROP CONSTRAINT nonexistent",
+        ]);
+        assert!(
+            msg.contains("DROP CONSTRAINT `nonexistent`") && msg.contains("no constraint"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn drop_if_exists_nonexistent_constraint_is_a_silent_no_op() {
+        // `DROP CONSTRAINT IF EXISTS` of an unresolved name is the ONE
+        // sanctioned silent no-op (matching PostgreSQL's "does not exist,
+        // skipping") — the catalog is unchanged, no error.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int NOT NULL)",
+            "ALTER TABLE t DROP CONSTRAINT IF EXISTS nonexistent",
+        ]);
+        assert!(
+            cat.tables["t"]["a"].not_null,
+            "an IF EXISTS drop of an unrelated name changes nothing"
+        );
+    }
+
+    #[test]
+    fn drop_shapeless_constraint_by_name_is_a_no_op() {
+        // A normal named-constraint drop that SHOULD work still works: dropping
+        // a UNIQUE / CHECK / FOREIGN KEY (shape-irrelevant) resolves to a no-op
+        // and never fails closed.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int, b int)",
+            "ALTER TABLE t ADD CONSTRAINT t_uq UNIQUE (a)",
+            "ALTER TABLE t ADD CONSTRAINT t_ck CHECK (b > 0)",
+            "ALTER TABLE t DROP CONSTRAINT t_uq",
+            "ALTER TABLE t DROP CONSTRAINT t_ck",
+        ]);
+        // Neither column's shape changed; both drops resolved (no fail-closed).
+        assert!(cat.tables["t"].contains_key("a"));
+        assert!(!cat.tables["t"]["a"].not_null);
+        assert!(!cat.tables["t"]["b"].not_null);
+    }
+
+    #[test]
+    fn drop_shapeless_auto_named_constraint_resolves() {
+        // Unnamed UNIQUE / FOREIGN KEY drops resolve by their PostgreSQL
+        // auto-names (`<t>_<cols>_key`, `<t>_<col>_fkey`).
+        let cat = catalog_from(&[
+            "CREATE TABLE parent (id int PRIMARY KEY)",
+            "CREATE TABLE child (a int UNIQUE, b int REFERENCES parent (id))",
+            "ALTER TABLE child DROP CONSTRAINT child_a_key",
+            "ALTER TABLE child DROP CONSTRAINT child_b_fkey",
+        ]);
+        assert!(cat.tables["child"].contains_key("a"));
+    }
+
+    #[test]
+    fn drop_constraint_resolves_after_table_rename() {
+        // A tracked constraint follows a RENAME TABLE (its name is unchanged),
+        // so a drop under the NEW table name resolves.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int CONSTRAINT nn NOT NULL)",
+            "ALTER TABLE t RENAME TO t2",
+            "ALTER TABLE t2 DROP CONSTRAINT nn",
+        ]);
+        assert!(
+            !cat.tables["t2"]["a"].not_null,
+            "a NOT NULL drop resolves under the renamed table"
+        );
+    }
+
+    #[test]
+    fn drop_constraint_resolves_after_column_rename() {
+        // A NOT NULL follows a RENAME COLUMN (constraint name unchanged, target
+        // column moves), so the drop clears the RIGHT (renamed) column.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int CONSTRAINT nn NOT NULL)",
+            "ALTER TABLE t RENAME COLUMN a TO b",
+            "ALTER TABLE t DROP CONSTRAINT nn",
+        ]);
+        assert!(
+            !cat.tables["t"]["b"].not_null,
+            "the drop clears the renamed column's NOT NULL"
+        );
+    }
+
+    #[test]
+    fn drop_constraint_resolves_after_rename_constraint() {
+        // RENAME CONSTRAINT re-keys the tracker, so a drop by the NEW name
+        // resolves and undoes the effect.
+        let cat = catalog_from(&[
+            "CREATE TABLE t (a int CONSTRAINT nn NOT NULL)",
+            "ALTER TABLE t RENAME CONSTRAINT nn TO nn2",
+            "ALTER TABLE t DROP CONSTRAINT nn2",
+        ]);
+        assert!(
+            !cat.tables["t"]["a"].not_null,
+            "a renamed NOT NULL constraint drops by its new name"
+        );
+    }
+
+    #[test]
+    fn drop_constraint_on_a_recreated_table_does_not_inherit_a_stale_name() {
+        // A dropped-and-recreated table starts with a clean constraint registry:
+        // the second table's `a` never had `nn`, so dropping it is loud.
+        let msg = replay_err(&[
+            "CREATE TABLE t (a int CONSTRAINT nn NOT NULL)",
+            acked("DROP TABLE t").as_str(),
+            "CREATE TABLE t (a int)",
+            "ALTER TABLE t DROP CONSTRAINT nn",
+        ]);
+        assert!(msg.contains("no constraint"), "got: {msg}");
     }
 
     /// A unique scratch directory under the system temp dir, removed on

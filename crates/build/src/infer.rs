@@ -16429,10 +16429,17 @@ mod tests {
     /// itself and panics loudly with a message naming the offending DDL.
     fn shape(ddl: &[&str], sql: &str) -> Result<QueryShape, InferError> {
         let mut catalog = Catalog::default();
+        // ONE constraint tracker across the whole DDL sequence, matching the
+        // production replay (a constraint declared in one statement resolves
+        // when a later one drops it).
+        let mut tracker = crate::ConstraintTracker::default();
         for (i, stmt) in ddl.iter().enumerate() {
-            if let Err(err) =
-                replay_file_for_test(&mut catalog, &PathBuf::from(format!("ddl_{i}.sql")), stmt)
-            {
+            if let Err(err) = replay_file_for_test(
+                &mut catalog,
+                &mut tracker,
+                &PathBuf::from(format!("ddl_{i}.sql")),
+                stmt,
+            ) {
                 panic!("test DDL #{i} failed to replay: {err} (DDL: {stmt})");
             }
         }
@@ -16618,8 +16625,10 @@ mod tests {
         // The `UserCompositeId` a column projects with resolves back to the
         // composite's name and ordered field list through the SAME catalog.
         let mut catalog = Catalog::default();
+        let mut tracker = crate::ConstraintTracker::default();
         replay_file_for_test(
             &mut catalog,
+            &mut tracker,
             &PathBuf::from("ddl.sql"),
             "CREATE TYPE addr AS (street text, zip int4)",
         )
@@ -21499,10 +21508,14 @@ mod tests {
     /// divergence (nullability/structure) from leaf-type divergence.
     fn normalized_shape(schema: &[&str], sql: &str) -> Result<NormalizedShape, InferError> {
         let mut catalog = Catalog::default();
+        let mut tracker = crate::ConstraintTracker::default();
         for (i, stmt) in schema.iter().enumerate() {
-            if let Err(err) =
-                replay_file_for_test(&mut catalog, &PathBuf::from(format!("d_{i}.sql")), stmt)
-            {
+            if let Err(err) = replay_file_for_test(
+                &mut catalog,
+                &mut tracker,
+                &PathBuf::from(format!("d_{i}.sql")),
+                stmt,
+            ) {
                 panic!("falsifier DDL #{i} failed: {err}");
             }
         }
