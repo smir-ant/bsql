@@ -71,7 +71,18 @@ pub fn classify_ssl_response(
     use bsql_postgres_proto::wire::SslNegotiationOutcome;
     match bsql_postgres_proto::wire::classify_ssl_response_byte(response_byte) {
         SslNegotiationOutcome::Accepted => {
-            let server_name: rustls::pki_types::ServerName<'_> = config.host.as_str().try_into()
+            // Derive the rustls `ServerName` from the UNBRACKETED host: `from_dsn`
+            // stores an IPv6 literal in brackets (`[::1]`) because that is the form
+            // `ToSocketAddrs` dials, but rustls rejects the brackets (they are DSN
+            // syntax, not part of the address — `try_from("[::1]")` is an
+            // `InvalidDnsNameError`, whereas `"::1"` parses as a `ServerName::IpAddress`).
+            // `unbracket_host` is the single authority `host_is_loopback` also uses,
+            // so the loopback classifier and the TLS server-name derivation strip
+            // brackets identically. A DNS host has no brackets and is returned
+            // verbatim (a `ServerName::DnsName`, unchanged).
+            let unbracketed = crate::config::unbracket_host(config.host.as_str());
+            let server_name: rustls::pki_types::ServerName<'_> = unbracketed
+                .try_into()
                 .map_err(|_| DriverError::Config("invalid server name for TLS"))?;
             Ok(SslProbe::Accepted {
                 server_name: server_name.to_owned(),
@@ -126,6 +137,9 @@ mod tests {
 
     // The PG `SSLRequest` reply byte for "SSL refused" — the branch under test.
     const REFUSED: u8 = b'N';
+    // The PG `SSLRequest` reply byte for "SSL accepted" — drives the server-name
+    // derivation branch (the IPv6-bracket regression).
+    const ACCEPTED: u8 = b'S';
 
     #[test]
     fn refused_explicit_require_is_the_ssl_refused_class() {
@@ -203,5 +217,46 @@ mod tests {
             &["db.internal.example".to_string()],
             "the downgrade must route through the sink with the host",
         );
+    }
+
+    #[test]
+    fn accepted_bracketed_ipv6_host_derives_an_ip_server_name() {
+        // REGRESSION: a bracketed IPv6-literal host (`[::1]`, `[2001:db8::1]`) —
+        // the form `from_dsn` stores and `ToSocketAddrs` dials — must derive a
+        // rustls `ServerName::IpAddress`, NOT fail `try_into` on the DSN brackets.
+        // Before the shared `unbracket_host` fix this returned
+        // `DriverError::Config("invalid server name for TLS")`, making a
+        // TLS-required IPv6 server UNREACHABLE (a remote IPv6 host resolves to the
+        // threat-scoped default `Require`, which forces TLS). The `ssl_mode` /
+        // diagnostics arguments are irrelevant on the accepted branch.
+        use rustls::pki_types::ServerName;
+        for host in ["[::1]", "[2001:db8::1]"] {
+            let config = ConnectConfig::new(host, "u");
+            match classify_ssl_response(ACCEPTED, &config, SslMode::Require, &Diagnostics::new()) {
+                Ok(SslProbe::Accepted { server_name }) => match server_name {
+                    ServerName::IpAddress(_) => {}
+                    other => panic!("{host} must derive an IpAddress server name, got {other:?}"),
+                },
+                Ok(SslProbe::PlainTcp) => panic!("{host} accepted must not classify PlainTcp"),
+                Err(e) => panic!("{host} accepted must derive a server name, got Err: {e:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_dns_host_derives_a_dns_server_name() {
+        // A normal DNS host has NO brackets, so `unbracket_host` returns it verbatim
+        // and it derives a `ServerName::DnsName` exactly as before — the fix does not
+        // touch the hostname path (only the bracketed-IPv6 form changes).
+        use rustls::pki_types::ServerName;
+        let config = ConnectConfig::new("db.example.com", "u");
+        match classify_ssl_response(ACCEPTED, &config, SslMode::Require, &Diagnostics::new()) {
+            Ok(SslProbe::Accepted { server_name }) => match server_name {
+                ServerName::DnsName(_) => {}
+                other => panic!("a DNS host must derive a DnsName server name, got {other:?}"),
+            },
+            Ok(SslProbe::PlainTcp) => panic!("a DNS host accepted must not classify PlainTcp"),
+            Err(e) => panic!("a DNS host accepted must derive a server name, got Err: {e:?}"),
+        }
     }
 }

@@ -893,6 +893,39 @@ impl ConnectConfig {
     }
 }
 
+/// Strip the surrounding brackets from a DSN-style IPv6-literal host, returning
+/// the inner address; every other host is returned verbatim (borrow-preserving,
+/// no allocation).
+///
+/// A DSN authority carries an IPv6 literal in BRACKETS (`[::1]`, `[2001:db8::1]`)
+/// so the address's own colons do not collide with the `:port` delimiter, and
+/// [`ConnectConfig::from_dsn`] KEEPS those brackets on `host` because they are
+/// what `ToSocketAddrs` dials (`[::1]:5432`). Two consumers, however, need the
+/// BARE address: the loopback classifier (`host_is_loopback`) parses it as an
+/// [`IpAddr`](std::net::IpAddr), and the TLS path (`crate::ssl`) derives a rustls
+/// `ServerName` from it — and rustls REJECTS a bracketed literal (`[::1]` is
+/// neither a valid DNS name nor a parseable IP; the brackets are DSN syntax, not
+/// part of the address). This is the ONE authority both call through, so the
+/// unbracket rule cannot drift between the loopback classifier and the TLS
+/// server-name derivation.
+///
+/// Brackets are stripped ONLY when BOTH are present (a leading `[` AND a trailing
+/// `]`); a bare host, a DNS name, or a malformed half-bracketed string is
+/// returned untouched — fail-safe, so a malformed host fails loudly at its own
+/// downstream parse / derivation rather than being silently mangled here.
+#[must_use]
+pub(crate) fn unbracket_host(host: &str) -> &str {
+    // `.and_then(strip_suffix)` yields `Some(inner)` only when a leading `[` AND a
+    // trailing `]` are BOTH present; anything else keeps `host` intact. A `match`
+    // (not `.unwrap_or(host)`) because `unwrap_or` is on the crate's
+    // silent-fallback disallow list — here the fallback is total by construction,
+    // and the `match` keeps that visible rather than hidden behind a banned combinator.
+    match host.strip_prefix('[').and_then(|inner| inner.strip_suffix(']')) {
+        Some(inner) => inner,
+        None => host,
+    }
+}
+
 /// Whether `host` names a LOOPBACK network target — the syntactic classification
 /// (no DNS) the threat-scoped SSL default uses to treat an endpoint as local.
 ///
@@ -905,22 +938,18 @@ impl ConnectConfig {
 /// as remote (and defaults to `Require`).
 ///
 /// A DSN authority carries an IPv6 literal in BRACKETS (`[::1]`) so the colons
-/// do not collide with the `:port` delimiter; the brackets are stripped (only
-/// when BOTH are present) before parsing, so a genuinely-local `[::1]` is
-/// classified local rather than mis-parsed as a remote name. The host is not
-/// mutated — only the classification reads the unbracketed form (the bracketed
-/// form is what `ToSocketAddrs` dials). A non-loopback bracketed literal
-/// (`[2001:db8::1]`, or the IPv4-mapped `[::ffff:127.0.0.1]`, which is not `::1`)
-/// still classifies remote — fail-safe.
+/// do not collide with the `:port` delimiter; the brackets are stripped by the
+/// shared `unbracket_host` authority (only when BOTH are present) before parsing,
+/// so a genuinely-local `[::1]` is classified local rather than mis-parsed as a
+/// remote name. The host is not mutated — only the classification reads the
+/// unbracketed form (the bracketed form is what `ToSocketAddrs` dials). A
+/// non-loopback bracketed literal (`[2001:db8::1]`, or the IPv4-mapped
+/// `[::ffff:127.0.0.1]`, which is not `::1`) still classifies remote — fail-safe.
 fn host_is_loopback(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    let unbracketed = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        Some(inner) => inner,
-        None => host,
-    };
-    unbracketed.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    unbracket_host(host).parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// A resolved connection target derived from a [`ConnectConfig`]'s `host` +
@@ -1954,6 +1983,23 @@ mod tests {
             dsn_endpoint("postgres://u@localhost/app"),
             Ok(Endpoint::Tcp("localhost:5432".to_string())),
         );
+    }
+
+    #[test]
+    fn unbracket_host_strips_only_a_fully_bracketed_literal() {
+        // The single unbracket authority both `host_is_loopback` and the TLS
+        // `ServerName` derivation call through. A fully-bracketed IPv6 literal is
+        // unwrapped to the bare address; every other form — a DNS name, a bare IPv4,
+        // or a MALFORMED half-open bracket — is returned verbatim (fail-safe: a
+        // malformed host fails loudly at its own downstream parse, never mangled here).
+        assert_eq!(unbracket_host("[::1]"), "::1", "a bracketed IPv6 literal is unwrapped");
+        assert_eq!(unbracket_host("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(unbracket_host("db.example.com"), "db.example.com", "a DNS host is untouched");
+        assert_eq!(unbracket_host("127.0.0.1"), "127.0.0.1", "a bare IPv4 is untouched");
+        assert_eq!(unbracket_host("::1"), "::1", "an already-bare IPv6 is untouched");
+        assert_eq!(unbracket_host("[::1"), "[::1", "a leading-only bracket is not stripped");
+        assert_eq!(unbracket_host("::1]"), "::1]", "a trailing-only bracket is not stripped");
+        assert_eq!(unbracket_host(""), "", "the empty host is untouched");
     }
 
     #[test]
