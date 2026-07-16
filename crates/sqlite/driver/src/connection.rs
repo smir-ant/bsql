@@ -1474,11 +1474,26 @@ impl Connection {
         self.inner.execute_batch("BEGIN")?;
         let tx = Transaction { conn: self };
         let result = match f(&tx) {
-            Ok(val) => self
-                .inner
-                .execute_batch("COMMIT")
-                .map(|()| val)
-                .map_err(SqliteError::from),
+            Ok(val) => match self.inner.execute_batch("COMMIT") {
+                Ok(()) => Ok(val),
+                Err(commit_err) => {
+                    // COMMIT failed (e.g. BUSY on the RESERVED→EXCLUSIVE upgrade in
+                    // a rollback-journal mode, or an interrupt at COMMIT): the
+                    // transaction is still OPEN on the reused handle. Best-effort
+                    // ROLLBACK to a clean boundary (swallow its own error) so a
+                    // retry can BEGIN cleanly — matching PostgreSQL's `commit()`,
+                    // which recovers to idle — and return the ORIGINAL COMMIT error
+                    // UNCHANGED. It is DELIBERATELY not wrapped in
+                    // `TransactionRollbackFailed` (whose `primary_code()` is `None`,
+                    // which would declassify `is_busy()`/`is_disconnect()` to
+                    // `false` and destroy the caller's retry/reconnect signal); the
+                    // COMMIT is the meaningful cause, its SQLite code preserved.
+                    match self.inner.execute_batch("ROLLBACK") {
+                        Ok(()) | Err(_) => {}
+                    }
+                    Err(SqliteError::from(commit_err))
+                }
+            },
             Err(e) => match self.inner.execute_batch("ROLLBACK") {
                 // ROLLBACK undid the transaction: return the closure's error.
                 Ok(()) => Err(e),

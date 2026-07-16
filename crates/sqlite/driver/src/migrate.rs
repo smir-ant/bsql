@@ -219,10 +219,23 @@ impl Connection {
         // mid-transaction.
         self.inner.execute_batch("BEGIN IMMEDIATE").map_err(SqliteError::from)?;
         match self.apply_and_record(migration, ordinal, &checksum) {
-            Ok(ApplyOutcome::Applied) => {
-                self.inner.execute_batch("COMMIT").map_err(SqliteError::from)?;
-                Ok(true)
-            }
+            Ok(ApplyOutcome::Applied) => match self.inner.execute_batch("COMMIT") {
+                Ok(()) => Ok(true),
+                Err(commit_err) => {
+                    // COMMIT failed (e.g. BUSY on the RESERVED→EXCLUSIVE upgrade
+                    // blocked by a reader, or an interrupt at COMMIT): the
+                    // transaction is still OPEN on the reused handle. Best-effort
+                    // ROLLBACK to a clean boundary (swallow its own error) so a
+                    // later `run_migrations` can BEGIN cleanly — symmetric with the
+                    // Skipped/Err arms — and return the ORIGINAL COMMIT error
+                    // UNCHANGED, so its classification (is_busy / is_disconnect, via
+                    // the preserved SQLite code) survives as the retry signal.
+                    match self.inner.execute_batch("ROLLBACK") {
+                        Ok(()) | Err(_) => {}
+                    }
+                    Err(MigrationError::from(SqliteError::from(commit_err)))
+                }
+            },
             Ok(ApplyOutcome::Skipped) => {
                 // Nothing changed — a concurrent runner beat us. Release the lock.
                 self.inner.execute_batch("ROLLBACK").map_err(SqliteError::from)?;

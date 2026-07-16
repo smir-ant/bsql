@@ -111,13 +111,33 @@ fn deleting_an_applied_migration_is_drift() {
     let conn = Connection::open_in_memory().expect("open");
     conn.run_migrations(MigrationSource::embedded(&three())).expect("run");
 
+    // Dropping the FIRST migration while a LATER one (0002/0003) survives is a
+    // MIDDLE gap: an unambiguous deletion (`source_is_strict_prefix: false`).
     let without_first = [M2, M3];
     let err = conn
         .run_migrations(MigrationSource::embedded(&without_first))
         .expect_err("deleted applied migration must be drift");
     assert!(matches!(
         err,
-        MigrationError::Drift { migration, kind: DriftKind::MissingFromSource } if migration == "0001_users.sql"
+        MigrationError::Drift {
+            migration,
+            kind: DriftKind::MissingFromSource { source_is_strict_prefix: false }
+        } if migration == "0001_users.sql"
+    ));
+
+    // Dropping the LAST migration (source is a strict prefix of the applied set)
+    // is a TAIL extra: EITHER a tail deletion OR an older instance against a newer
+    // DB (`source_is_strict_prefix: true`) — the driver surfaces both cases.
+    let without_last = [M1, M2];
+    let err = conn
+        .run_migrations(MigrationSource::embedded(&without_last))
+        .expect_err("a strict-prefix source is drift");
+    assert!(matches!(
+        err,
+        MigrationError::Drift {
+            migration,
+            kind: DriftKind::MissingFromSource { source_is_strict_prefix: true }
+        } if migration == "0003_posts.sql"
     ));
 }
 

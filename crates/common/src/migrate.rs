@@ -149,12 +149,21 @@ pub struct Drift {
 /// already-applied migration deleted from the source.
 pub fn plan(applied: &[AppliedMigration], source: &[LoadedMigration]) -> Result<usize, Drift> {
     // Every applied migration must still exist in the source (by name); an
-    // absence is a deletion of an applied migration.
+    // absence is a deletion of an applied migration. Classify by POSITION: a
+    // missing migration whose name sorts AFTER the last source name (or an empty
+    // source) is a TAIL extra — the source is a strict prefix of the applied set,
+    // which a rolling deploy / rollback also produces — whereas one within the
+    // source name range is a MIDDLE gap (an unambiguous deletion). `source` is
+    // sorted by name (from `MigrationSource::load`), so `source.last()` is the max.
     for a in applied {
         if !source.iter().any(|s| s.name == a.name) {
+            let source_is_strict_prefix = match source.last() {
+                None => true,
+                Some(last) => a.name > last.name,
+            };
             return Err(Drift {
                 migration: a.name.clone(),
-                kind: DriftKind::MissingFromSource,
+                kind: DriftKind::MissingFromSource { source_is_strict_prefix },
             });
         }
     }
@@ -165,9 +174,12 @@ pub fn plan(applied: &[AppliedMigration], source: &[LoadedMigration]) -> Result<
     for (i, a) in applied.iter().enumerate() {
         match source.get(i) {
             None => {
+                // Unreachable given the loop above (every applied name is in the
+                // source, so `applied.len() <= source.len()`); if reached, the
+                // source is shorter than the applied set, i.e. a strict prefix.
                 return Err(Drift {
                     migration: a.name.clone(),
-                    kind: DriftKind::MissingFromSource,
+                    kind: DriftKind::MissingFromSource { source_is_strict_prefix: true },
                 });
             }
             Some(s) => {
@@ -433,9 +445,26 @@ pub enum DriftKind {
         /// The name the current source places at that ordinal instead.
         source_name_at_ordinal: String,
     },
-    /// An already-applied migration is absent from the current source — it was
-    /// deleted after being applied.
-    MissingFromSource,
+    /// An already-applied migration is absent from the current source.
+    ///
+    /// The `source_is_strict_prefix` flag distinguishes two causes that carry the
+    /// SAME data but demand DIFFERENT operator action:
+    ///
+    /// - `false` (a MIDDLE gap — a LATER applied migration is still present in the
+    ///   source): a genuine deletion of an applied migration. A rolling deploy
+    ///   cannot drop a middle migration while keeping a later one, so the
+    ///   diagnosis is unambiguous: restore it.
+    /// - `true` (a TAIL extra — the applied name sorts AFTER the last source name,
+    ///   or the source is empty, i.e. the source is a strict prefix of the applied
+    ///   set): EITHER a tail deletion OR this instance's migration set is OLDER
+    ///   than the database (a rolling deploy / rollback where an older binary
+    ///   restarted against a newer DB). The two states are indistinguishable from
+    ///   the data alone, so the message names both — it does not over-assert.
+    MissingFromSource {
+        /// `true` when the source is a strict prefix of the applied set (the
+        /// missing migration is a tail extra); `false` for a middle gap.
+        source_is_strict_prefix: bool,
+    },
 }
 
 impl fmt::Display for DriftKind {
@@ -456,10 +485,23 @@ impl fmt::Display for DriftKind {
                  `{source_name_at_ordinal}` there — a migration was inserted before or \
                  reordered around an applied one; the set must be append-only"
             ),
-            DriftKind::MissingFromSource => write!(
+            // MIDDLE gap: a later applied migration is still in the source, so a
+            // rolling deploy cannot explain it — the accurate, unambiguous
+            // "deleted, restore it".
+            DriftKind::MissingFromSource { source_is_strict_prefix: false } => write!(
                 f,
                 "is recorded as applied but is absent from the source — it was deleted \
                  after being applied; restore it (an applied migration must not be removed)"
+            ),
+            // TAIL extra: the source is a strict prefix of the applied set, which
+            // is EITHER a tail deletion OR an older instance restarted against a
+            // newer DB. Name both causes; do not over-assert either.
+            DriftKind::MissingFromSource { source_is_strict_prefix: true } => write!(
+                f,
+                "is recorded as applied but is absent from the current source — EITHER it \
+                 was deleted after being applied, OR this instance's migration set is OLDER \
+                 than the database (a rolling deploy / rollback). Verify the app version \
+                 before restoring the migration"
             ),
         }
     }
@@ -559,14 +601,69 @@ mod tests {
     }
 
     #[test]
-    fn plan_deleted_applied_migration_is_classified() {
+    fn plan_middle_gap_deletion_is_a_strict_deletion() {
+        // 0001 is missing but a LATER applied migration (0002) is still in the
+        // source — a rolling deploy cannot produce this, so it is an unambiguous
+        // deletion (source is NOT a strict prefix).
         let source = vec![loaded("0002", "b")];
         let done = vec![applied("0001", "a"), applied("0002", "b")];
         let err = plan(&done, &source).unwrap_err();
         assert!(matches!(
             err,
-            Drift { migration, kind: DriftKind::MissingFromSource } if migration == "0001"
+            Drift {
+                migration,
+                kind: DriftKind::MissingFromSource { source_is_strict_prefix: false }
+            } if migration == "0001"
         ));
+    }
+
+    #[test]
+    fn plan_tail_extra_is_ambiguous_deletion_or_older_instance() {
+        // 0002 is applied but the source stops at 0001 (a strict prefix) — EITHER
+        // a tail deletion OR an older instance restarted against a newer DB.
+        let source = vec![loaded("0001", "a")];
+        let done = vec![applied("0001", "a"), applied("0002", "b")];
+        let err = plan(&done, &source).unwrap_err();
+        assert!(matches!(
+            err,
+            Drift {
+                migration,
+                kind: DriftKind::MissingFromSource { source_is_strict_prefix: true }
+            } if migration == "0002"
+        ));
+    }
+
+    #[test]
+    fn plan_empty_source_against_a_populated_ledger_is_a_tail_extra() {
+        // The extreme strict prefix: an empty source can only mean the applied set
+        // is entirely ahead (a fresh checkout / older instance), never a deletion
+        // the operator should "restore".
+        let source: Vec<LoadedMigration> = vec![];
+        let done = vec![applied("0001", "a")];
+        let err = plan(&done, &source).unwrap_err();
+        assert!(matches!(
+            err,
+            Drift { kind: DriftKind::MissingFromSource { source_is_strict_prefix: true }, .. }
+        ));
+    }
+
+    #[test]
+    fn the_two_missing_from_source_messages_diagnose_differently() {
+        // The whole point of the split: a MIDDLE gap says "restore it"; a TAIL
+        // extra names BOTH causes and does NOT assert one over the other.
+        let middle = DriftKind::MissingFromSource { source_is_strict_prefix: false }.to_string();
+        let tail = DriftKind::MissingFromSource { source_is_strict_prefix: true }.to_string();
+        assert_ne!(middle, tail, "the two causes must not read identically");
+        assert!(middle.contains("restore it"), "middle gap keeps the restore directive");
+        assert!(!middle.contains("OLDER"), "middle gap must not raise the rolling-deploy reading");
+        assert!(
+            tail.contains("OLDER than the database"),
+            "tail extra must name the older-instance cause"
+        );
+        assert!(
+            tail.contains("Verify the app version"),
+            "tail extra must caution before restoring"
+        );
     }
 
     #[test]

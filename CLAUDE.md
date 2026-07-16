@@ -456,7 +456,17 @@ re-check; PG would fail on the ledger PK — now both fail loud identically);
 and the runner STOPS with a classified `MigrationError::MigrationFailed` naming
 it, later migrations untouched; (c) checksum DRIFT (an edited applied migration),
 a reorder / insert-before, and a deleted-from-source applied migration are each a
-classified `MigrationError::Drift` — never silently re-run or ignored. The
+classified `MigrationError::Drift` — never silently re-run or ignored. An
+applied-but-absent-from-source migration is classified by POSITION to avoid a
+WRONG DIAGNOSIS: a MIDDLE gap (a LATER applied migration is still in the source, so
+a rolling deploy cannot explain it) keeps the unambiguous "deleted, restore it"
+(`DriftKind::MissingFromSource { source_is_strict_prefix: false }`), while a TAIL
+extra (the source is a strict prefix of the applied set — including an empty
+source: `{ source_is_strict_prefix: true }`) names BOTH causes without asserting
+one — "deleted after being applied, OR this instance's migration set is OLDER than
+the database (a rolling deploy / rollback)" — since the two states are identical
+data (an older binary restarting against a newer DB looks exactly like a tail
+deletion). The
 checksum is EXACT-BYTES, so a git `autocrlf` checkout (CRLF line endings)
 re-checked against a ledger recorded from an LF apply spuriously drifts (the SAFE
 direction — a false drift error, never a silent mis-apply — but pin line endings
@@ -745,6 +755,28 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `BackendError::is_disconnect` witness.
 - `ConnectConfig` is `#[non_exhaustive]` — construct via `new()` + builder methods
   (`footprint_pin!`-ed at 152 bytes)
+- **The connect handshake is AGGREGATE-bounded by `connect_timeout` on BOTH
+  drivers.** The async driver wraps the whole `connect_inner` (dial + TLS + startup/
+  auth) in one `tokio::time::timeout`. The sync driver drives the WHOLE handshake
+  inside a single blocking `poll_once`, so it cannot interpose a wall-clock check
+  between the engine's individual reads — a per-read `SO_RCVTIMEO` alone does NOT
+  bound the total, because a hostile/broken server that DRIPS state-non-advancing
+  frames (`NoticeResponse` / `ParameterStatus`, valid in any handshaking state)
+  each within the per-read window keeps the connecting thread pumping forever (a few
+  such connects exhaust a blocking pool). So the sync socket carries a shared
+  connect-phase `ConnectDeadline` (`transport::ConnectDeadline`, an `Arc<AtomicU64>`
+  the driver arms with `connect_timeout` before the handshake and DISARMS the
+  instant it completes): the socket's own `read` re-arms `SO_RCVTIMEO` to the
+  REMAINING budget each read (so a blocked read cannot overshoot the deadline) and
+  SHORT-CIRCUITS to a classified `DriverError::Timeout` (`is_disconnect()`) once the
+  budget is spent (so an endless-frame flood cannot loop forever). ZERO steady-state
+  cost: a disarmed deadline is a single relaxed atomic load per read (branch
+  skipped, no `Instant::now`, no re-arm). It also bounds the TLS handshake reads
+  (the inner `SyncSocket` carries it) and the throwaway cancel dial. `SyncSocket`
+  grew 8 → 16 B (re-pinned) for the shared handle; the raw `SyncSock` enum stays
+  8 B. Witnessed by the offline `connect_handshake_deadline` drip test (a loopback
+  server that drips `NoticeResponse` past the budget → a bounded classified
+  `Timeout`, never a hang) + `transport::connect_deadline_tests`.
 - **Pool liveness — `get()` is BOUNDED even on a dead peer.** The pool
   health-gates every REUSED connection with a `reset_session` on checkout (the
   exactly-once liveness proof before the user's verb runs). That reset is a
@@ -1747,11 +1779,15 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   engine read buffer (`bsql_postgres_proto::READ_BUF_CAP`); a TLS connection adds
   the rustls record buffers boxed in `Wire::Tls` — a fixed ~32 KiB inbound
   ciphertext staging buffer (`STAGING_CAP = MAX_CIPHERTEXT_RECORD + RECV_CHUNK` in
-  `core::tls`) plus a fixed ~16 KiB encrypt scratch (`TLS_RECORD_SCRATCH`), both
-  allocated ONCE per connection, plus rustls's own connection state and two
-  transient plaintext/ciphertext vecs each bounded near one 16 KiB TLS record. So
-  a TLS connection costs on the order of ~64 KiB of driver-owned buffers vs ~4 KiB
-  plaintext — a 100-connection TLS pool ≈ ~6 MiB. Dropping `tls` removes it
+  `core::tls`) allocated ONCE per connection, plus rustls's own connection state
+  and two transient plaintext/ciphertext vecs each bounded near one 16 KiB TLS
+  record. There is NO resident encrypt scratch: each record is encrypted DIRECTLY
+  into the outbound queue's reserved tail (`out_buf`, sized `chunk +
+  TLS_RECORD_OVERHEAD` per record via `stage_into`, then truncated to the exact
+  length) — a proportional zero-fill replacing the former `memcpy` (CPU-neutral),
+  with the 16 KiB per-connection `TLS_RECORD_SCRATCH` Box deleted. So a TLS
+  connection costs on the order of ~48 KiB of driver-owned buffers vs ~4 KiB
+  plaintext — a 100-connection TLS pool ≈ ~4.8 MiB. Dropping `tls` removes it
   entirely. (The plaintext 4 KiB is pinned at compile time by the
   `READ_BUF_CAP == 4096` `const _: ()` assert in `bsql-postgres-proto`'s
   `frame.rs` — an `E0080` on drift, strictly stronger than the former

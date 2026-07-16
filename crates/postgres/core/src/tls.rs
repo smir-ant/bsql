@@ -37,9 +37,12 @@
 //! - **inbound plaintext** (`plaintext` + `plaintext_start`). Decrypted
 //!   payloads accumulate here and are copied out to the caller incrementally,
 //!   so a caller buffer smaller than a record loses no bytes.
-//! - **fixed encrypt/encode scratch** (`scratch`). One TLS record's worth,
-//!   reused across calls; `write` chunks plaintext into <=record pieces so the
-//!   scratch never needs to grow (0-alloc per `write`).
+//! - **no encrypt scratch** — each `rustls` `encrypt`/`encode` writes its one
+//!   record DIRECTLY into the outbound queue's reserved tail (`out_buf`), then the
+//!   queue is truncated to the exact record length; there is no resident
+//!   per-connection ciphertext staging buffer. `write` chunks plaintext into
+//!   `<=record` pieces so the reserved tail is bounded (0-alloc per `write` in
+//!   steady state — the queue's capacity is retained across flushes).
 //!
 //! # Cryptographic authority
 //!
@@ -79,12 +82,24 @@ use zeroize::Zeroize;
 #[cfg(feature = "tls")]
 const MAX_PLAINTEXT_PER_RECORD: usize = 16384;
 
-/// Fixed scratch capacity: one max-size plaintext record plus TLS framing
+/// One-record ciphertext bound: a max-size plaintext record plus TLS framing
 /// overhead (content-type byte, AEAD tag, record header, and headroom).
-/// A `<=16 KiB` plaintext chunk always encrypts within this bound, so the
-/// scratch never grows and `write` allocates nothing per call.
+/// A `<=16 KiB` plaintext chunk always encrypts within this bound. It is the tail
+/// reserved in `out_buf` for a handshake/control `encode` (which has no chunk to
+/// size against), and the ceiling above which an `InsufficientSize` is classified
+/// as [`TlsError::RecordOversize`].
 #[cfg(feature = "tls")]
 const TLS_RECORD_SCRATCH: usize = 16384 + 256;
+
+/// Per-record ciphertext OVERHEAD headroom — the amount a record's ciphertext can
+/// exceed its plaintext by (the TLS record header + content-type byte + AEAD tag,
+/// generously padded). Equal to `TLS_RECORD_SCRATCH - MAX_PLAINTEXT_PER_RECORD`,
+/// so `chunk.len() + TLS_RECORD_OVERHEAD` reserves exactly the bound a full 16 KiB
+/// chunk would (`TLS_RECORD_SCRATCH`) while a SMALL chunk reserves proportionally
+/// less — the zero-fill of the reserved tail is `~chunk + overhead`, replacing the
+/// old `memcpy` of the same size (CPU-neutral) with no 16 KiB resident buffer.
+#[cfg(feature = "tls")]
+const TLS_RECORD_OVERHEAD: usize = TLS_RECORD_SCRATCH - MAX_PLAINTEXT_PER_RECORD;
 
 /// Guaranteed minimum spare read window past the inbound watermark. The staging
 /// buffer is sized so every socket read gets at least this many initialized
@@ -147,11 +162,11 @@ pub enum TlsError<E> {
     /// is carried verbatim; nothing is reclassified or swallowed.
     #[cfg(feature = "tls")]
     Tls(rustls::Error),
-    /// A record's ciphertext did not fit the fixed encrypt scratch and
-    /// `rustls` requested a larger buffer than the bound permits. Structurally
-    /// unreachable for the `<=16 KiB` chunks `write` produces, but surfaced as
-    /// a classified error rather than an `unwrap`: a future `rustls` overhead
-    /// change is a loud failure, never silent corruption.
+    /// A record's ciphertext did not fit the reserved one-record tail and
+    /// `rustls` requested a larger buffer than the [`TLS_RECORD_SCRATCH`] bound
+    /// permits. Structurally unreachable for the `<=16 KiB` chunks `write`
+    /// produces, but surfaced as a classified error rather than an `unwrap`: a
+    /// future `rustls` overhead change is a loud failure, never silent corruption.
     #[cfg(feature = "tls")]
     RecordOversize {
         /// The output size `rustls` asked for, in bytes.
@@ -192,7 +207,7 @@ impl<E: fmt::Display> fmt::Display for TlsError<E> {
             #[cfg(feature = "tls")]
             Self::RecordOversize { required } => write!(
                 f,
-                "TLS record exceeds the fixed encrypt scratch (required {required} bytes)"
+                "TLS record exceeds the one-record ciphertext bound (required {required} bytes)"
             ),
             #[cfg(feature = "tls")]
             Self::EncryptExhausted => {
@@ -588,8 +603,6 @@ pub struct TlsTransport<Inner: Transport> {
     /// from the front are already delivered to the caller.
     plaintext: Vec<u8>,
     plaintext_start: usize,
-    /// Fixed one-record encrypt/encode scratch, reused across calls.
-    scratch: Box<[u8; TLS_RECORD_SCRATCH]>,
 }
 
 #[cfg(feature = "tls")]
@@ -677,7 +690,6 @@ impl<Inner: Transport> TlsTransport<Inner> {
             staging_filled: 0,
             plaintext: Vec::new(),
             plaintext_start: 0,
-            scratch: Box::new([0u8; TLS_RECORD_SCRATCH]),
         }
     }
 
@@ -723,11 +735,12 @@ impl<Inner: Transport> TlsTransport<Inner> {
     /// (length and spare capacity), then empties the buffer. A reallocation
     /// during growth frees the prior, smaller block unscrubbed; steady-state
     /// operation does not reallocate, so the live allocation at drop is cleared.
+    /// `out_buf` covers the outbound ciphertext (a record is now encrypted
+    /// directly into its reserved tail, so no separate encrypt scratch survives).
     fn scrub(&mut self) {
         self.plaintext.zeroize();
         self.staging.zeroize();
         self.out_buf.zeroize();
-        self.scratch[..].zeroize();
     }
 
     /// Drain the outbound ciphertext queue to the socket, advancing the
@@ -800,7 +813,6 @@ impl<Inner: Transport> TlsTransport<Inner> {
                 &mut self.staging_start,
                 &mut self.out_buf,
                 &mut self.plaintext,
-                &mut self.scratch[..],
             )?;
             // Emit any handshake records the step produced before blocking on
             // the peer's reply, and flush so they actually reach the socket.
@@ -862,7 +874,6 @@ impl<Inner: Transport> TlsTransport<Inner> {
                 &mut self.staging_start,
                 &mut self.out_buf,
                 &mut self.plaintext,
-                &mut self.scratch[..],
             )?;
             // 3. Drive any client output the step produced (a post-handshake
             //    key update or new-session-ticket acknowledgement) to the wire.
@@ -897,12 +908,7 @@ impl<Inner: Transport> TlsTransport<Inner> {
         // much the socket later accepts. No socket I/O happens here — a
         // cancelled `write` cannot half-send a record, because the bytes only
         // reach the socket in `flush`, behind the cancel-safe send cursor.
-        encrypt_app_data(
-            &mut self.conn,
-            plaintext,
-            &mut self.out_buf,
-            &mut self.scratch[..],
-        )?;
+        encrypt_app_data(&mut self.conn, plaintext, &mut self.out_buf)?;
         Ok(plaintext.len())
     }
 
@@ -910,7 +916,7 @@ impl<Inner: Transport> TlsTransport<Inner> {
         // Queue close_notify so the peer can tell a clean close from a
         // truncation attack, drain it to the socket, then shut the write half.
         self.reclaim_out();
-        queue_close_notify(&mut self.conn, &mut self.out_buf, &mut self.scratch[..])?;
+        queue_close_notify(&mut self.conn, &mut self.out_buf)?;
         self.flush_impl().await?;
         self.inner.shutdown().await.map_err(TlsError::Socket)?;
         Ok(())
@@ -1132,6 +1138,50 @@ impl<S: Transport> Transport for Wire<S> {
 // touch the socket: the async methods above own all I/O. No `rustls` borrow is
 // ever held across an `await`, which is what keeps the quartet futures `Send`.
 
+/// Encode/encrypt one TLS record DIRECTLY into `out_buf`'s reserved tail.
+///
+/// Reserves `reserve` zero-filled bytes at the end of `out_buf`, runs `emit` (a
+/// single `rustls` `encrypt` / `encode` / `queue_close_notify`) into that spare
+/// region, and truncates `out_buf` to the EXACT number of bytes written. This
+/// replaces the former resident per-connection 16 KiB scratch buffer + a `memcpy`
+/// per record: `rustls` writes the ciphertext straight into the outbound queue.
+///
+/// Invariant (leak-free): on a zero-write or ANY error return, `out_buf` is rolled
+/// back to its ORIGINAL length, so a zeroed placeholder can NEVER leak into the
+/// ciphertext stream (a partial/failed record). Returns the raw `rustls` result
+/// for the caller to classify — `Ok(())` already appended, `Err(e)` already rolled
+/// back — or a `TlsStepError` only on an internal length overflow.
+#[cfg(feature = "tls")]
+fn stage_into<E>(
+    out_buf: &mut Vec<u8>,
+    reserve: usize,
+    emit: impl FnOnce(&mut [u8]) -> Result<usize, E>,
+) -> Result<Result<(), E>, TlsStepError> {
+    let base = out_buf.len();
+    let end = base.checked_add(reserve).ok_or(TlsStepError::UnexpectedState)?;
+    out_buf.resize(end, 0);
+    // `get_mut(base..)`, never `&mut out_buf[base..]` — the crate `deny`s
+    // `indexing_slicing`.
+    let target = out_buf.get_mut(base..).ok_or(TlsStepError::UnexpectedState)?;
+    match emit(target) {
+        Ok(n) => {
+            let new_len = base.checked_add(n).ok_or(TlsStepError::UnexpectedState)?;
+            // `rustls` writes `<= reserve`, so `new_len <= end`; a contract break
+            // rolls back (never leaves a zeroed gap) and classifies loud.
+            if new_len > end {
+                out_buf.truncate(base);
+                return Err(TlsStepError::UnexpectedState);
+            }
+            out_buf.truncate(new_len);
+            Ok(Ok(()))
+        }
+        Err(e) => {
+            out_buf.truncate(base);
+            Ok(Err(e))
+        }
+    }
+}
+
 /// Drive the connection over the staged ciphertext: encode handshake output
 /// into `out_buf`, decrypt application records into `plaintext`, and advance
 /// the staging cursor by every discarded byte. Returns when the connection
@@ -1143,7 +1193,6 @@ fn pump_inbound(
     staging_start: &mut usize,
     out_buf: &mut Vec<u8>,
     plaintext: &mut Vec<u8>,
-    scratch: &mut [u8],
 ) -> Result<Pumped, TlsStepError> {
     loop {
         let status = conn.process_tls_records(
@@ -1155,15 +1204,12 @@ fn pump_inbound(
         let signal: Option<Pumped> = match status.state {
             Err(e) => return Err(TlsStepError::Tls(e)),
             Ok(ConnectionState::EncodeTlsData(mut enc)) => {
-                match enc.encode(scratch) {
-                    Ok(n) => out_buf
-                        .extend_from_slice(scratch.get(..n).ok_or(TlsStepError::UnexpectedState)?),
-                    Err(EncodeError::InsufficientSize(InsufficientSizeError {
-                        required_size,
-                    })) => {
-                        return Err(TlsStepError::RecordOversize {
-                            required: required_size,
-                        });
+                // A handshake/control record has no chunk to size against, so
+                // reserve the full one-record bound.
+                match stage_into(out_buf, TLS_RECORD_SCRATCH, |target| enc.encode(target))? {
+                    Ok(()) => {}
+                    Err(EncodeError::InsufficientSize(InsufficientSizeError { required_size })) => {
+                        return Err(TlsStepError::RecordOversize { required: required_size });
                     }
                     Err(EncodeError::AlreadyEncoded) => {}
                 }
@@ -1216,14 +1262,13 @@ fn pump_inbound(
 }
 
 /// Encrypt `plaintext` into `<=`one-record chunks, appending each ciphertext
-/// record to `out_buf`. The fixed `scratch` holds exactly one record, so it
-/// never grows.
+/// record DIRECTLY into `out_buf`'s reserved tail (via [`stage_into`]) — no
+/// resident scratch buffer.
 #[cfg(feature = "tls")]
 fn encrypt_app_data(
     conn: &mut UnbufferedClientConnection,
     plaintext: &[u8],
     out_buf: &mut Vec<u8>,
-    scratch: &mut [u8],
 ) -> Result<(), TlsStepError> {
     let mut off = 0;
     while off < plaintext.len() {
@@ -1234,41 +1279,44 @@ fn encrypt_app_data(
         let chunk = plaintext
             .get(off..end)
             .ok_or(TlsStepError::UnexpectedState)?;
+        // Reserve exactly one record's worth for THIS chunk (a proportional
+        // zero-fill, `~chunk + overhead`, replacing the old `memcpy` of the same
+        // size) — never the full 16 KiB for a small chunk. For a 16 KiB chunk this
+        // equals `TLS_RECORD_SCRATCH`, so the `InsufficientSize` boundary is
+        // identical to the old fixed scratch's.
+        let reserve = chunk
+            .len()
+            .checked_add(TLS_RECORD_OVERHEAD)
+            .ok_or(TlsStepError::UnexpectedState)?;
         let mut empty: [u8; 0] = [];
         loop {
             let status = conn.process_tls_records(&mut empty);
             match status.state {
                 Err(e) => return Err(TlsStepError::Tls(e)),
-                Ok(ConnectionState::WriteTraffic(mut wt)) => match wt.encrypt(chunk, scratch) {
-                    Ok(n) => {
-                        out_buf.extend_from_slice(
-                            scratch.get(..n).ok_or(TlsStepError::UnexpectedState)?,
-                        );
-                        break;
+                Ok(ConnectionState::WriteTraffic(mut wt)) => {
+                    match stage_into(out_buf, reserve, |target| wt.encrypt(chunk, target))? {
+                        Ok(()) => break,
+                        Err(EncryptError::InsufficientSize(InsufficientSizeError {
+                            required_size,
+                        })) => {
+                            return Err(TlsStepError::RecordOversize { required: required_size });
+                        }
+                        Err(EncryptError::EncryptExhausted) => {
+                            return Err(TlsStepError::EncryptExhausted);
+                        }
                     }
-                    Err(EncryptError::InsufficientSize(InsufficientSizeError {
-                        required_size,
-                    })) => {
-                        return Err(TlsStepError::RecordOversize {
-                            required: required_size,
-                        });
+                }
+                Ok(ConnectionState::EncodeTlsData(mut enc)) => {
+                    match stage_into(out_buf, TLS_RECORD_SCRATCH, |target| enc.encode(target))? {
+                        Ok(()) => {}
+                        Err(EncodeError::InsufficientSize(InsufficientSizeError {
+                            required_size,
+                        })) => {
+                            return Err(TlsStepError::RecordOversize { required: required_size });
+                        }
+                        Err(EncodeError::AlreadyEncoded) => {}
                     }
-                    Err(EncryptError::EncryptExhausted) => {
-                        return Err(TlsStepError::EncryptExhausted);
-                    }
-                },
-                Ok(ConnectionState::EncodeTlsData(mut enc)) => match enc.encode(scratch) {
-                    Ok(n) => out_buf
-                        .extend_from_slice(scratch.get(..n).ok_or(TlsStepError::UnexpectedState)?),
-                    Err(EncodeError::InsufficientSize(InsufficientSizeError {
-                        required_size,
-                    })) => {
-                        return Err(TlsStepError::RecordOversize {
-                            required: required_size,
-                        });
-                    }
-                    Err(EncodeError::AlreadyEncoded) => {}
-                },
+                }
                 Ok(ConnectionState::TransmitTlsData(t)) => t.done(),
                 // Post-handshake the write path reaches only the states above;
                 // anything else (a peer close, a blocked read) is unexpected.
@@ -1280,13 +1328,12 @@ fn encrypt_app_data(
     Ok(())
 }
 
-/// Queue a `close_notify` alert record into `out_buf`, driving past any
-/// residual handshake/key-update output first.
+/// Queue a `close_notify` alert record into `out_buf`'s reserved tail (via
+/// [`stage_into`]), driving past any residual handshake/key-update output first.
 #[cfg(feature = "tls")]
 fn queue_close_notify(
     conn: &mut UnbufferedClientConnection,
     out_buf: &mut Vec<u8>,
-    scratch: &mut [u8],
 ) -> Result<(), TlsStepError> {
     let mut empty: [u8; 0] = [];
     loop {
@@ -1294,35 +1341,29 @@ fn queue_close_notify(
         match status.state {
             Err(e) => return Err(TlsStepError::Tls(e)),
             Ok(ConnectionState::WriteTraffic(mut wt)) => {
-                match wt.queue_close_notify(scratch) {
-                    Ok(n) => {
-                        out_buf.extend_from_slice(
-                            scratch.get(..n).ok_or(TlsStepError::UnexpectedState)?,
-                        );
-                        return Ok(());
-                    }
+                match stage_into(out_buf, TLS_RECORD_SCRATCH, |target| {
+                    wt.queue_close_notify(target)
+                })? {
+                    Ok(()) => return Ok(()),
                     Err(EncryptError::InsufficientSize(InsufficientSizeError {
                         required_size,
                     })) => {
-                        return Err(TlsStepError::RecordOversize {
-                            required: required_size,
-                        });
+                        return Err(TlsStepError::RecordOversize { required: required_size });
                     }
                     Err(EncryptError::EncryptExhausted) => {
                         return Err(TlsStepError::EncryptExhausted);
                     }
                 }
             }
-            Ok(ConnectionState::EncodeTlsData(mut enc)) => match enc.encode(scratch) {
-                Ok(n) => out_buf
-                    .extend_from_slice(scratch.get(..n).ok_or(TlsStepError::UnexpectedState)?),
-                Err(EncodeError::InsufficientSize(InsufficientSizeError { required_size })) => {
-                    return Err(TlsStepError::RecordOversize {
-                        required: required_size,
-                    });
+            Ok(ConnectionState::EncodeTlsData(mut enc)) => {
+                match stage_into(out_buf, TLS_RECORD_SCRATCH, |target| enc.encode(target))? {
+                    Ok(()) => {}
+                    Err(EncodeError::InsufficientSize(InsufficientSizeError { required_size })) => {
+                        return Err(TlsStepError::RecordOversize { required: required_size });
+                    }
+                    Err(EncodeError::AlreadyEncoded) => {}
                 }
-                Err(EncodeError::AlreadyEncoded) => {}
-            },
+            }
             Ok(ConnectionState::TransmitTlsData(t)) => t.done(),
             Ok(_) => return Err(TlsStepError::UnexpectedState),
         }

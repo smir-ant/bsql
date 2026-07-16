@@ -10,7 +10,7 @@ use bsql_postgres_core::DriverError;
 use bsql_postgres_proto::engine::{self, SpuriousPending, Transport};
 
 use crate::connection::Connection;
-use crate::transport::SyncSocket;
+use crate::transport::{ConnectDeadline, SyncSocket};
 
 /// A detached capability to REQUEST cancellation of the query in flight on the
 /// blocking [`Connection`] it was minted from.
@@ -95,7 +95,13 @@ impl CancelToken {
         // A detached, throwaway cancel dial carries no diagnostics sink — an SSL
         // downgrade here keeps the historical stderr warning, never a wired event.
         let diagnostics = bsql_postgres_core::Diagnostics::default();
-        let mut wire = Connection::build_wire(sock, &config, ssl_mode, &diagnostics)?;
+        // Bound the cancel wire's SSL-probe + TLS handshake reads by the SAME
+        // aggregate budget (a hostile server cannot drip a TLS handshake to stall
+        // the cancelling thread). No disarm: the wire is thrown away after the
+        // 16-byte CancelRequest write, and `write` never consults the deadline.
+        let connect_deadline = ConnectDeadline::armed(budget);
+        let mut wire =
+            Connection::build_wire(sock, &config, ssl_mode, &diagnostics, &connect_deadline)?;
         send_cancel_packet(&mut wire, &self.key.request_bytes())
     }
 }

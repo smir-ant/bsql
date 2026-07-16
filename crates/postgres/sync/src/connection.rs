@@ -72,7 +72,7 @@ use bsql_postgres_core::{resolve_channel_binding, saslprep_password};
 #[cfg(feature = "scram")]
 use bsql_postgres_proto::Sensitive;
 
-use crate::transport::{SyncSock, SyncSocket};
+use crate::transport::{ConnectDeadline, SyncSock, SyncSocket};
 
 /// The prepared-statement handle (defined once in `bsql-postgres-core`, shared by
 /// both drivers). Re-exported so `bsql_postgres_sync::PreparedStatement` resolves.
@@ -367,7 +367,18 @@ impl Connection {
         // socket is moved into the wire / TLS layer.
         let socket_ctl = sock.try_clone()?;
 
-        let wire = Self::build_wire(sock, config, ssl_mode, diagnostics)?;
+        // Arm the connect-phase AGGREGATE deadline for the WHOLE handshake (TLS
+        // negotiation + startup/auth). The blocking handshake runs inside one
+        // `poll_once`, so this shared handle — enforced by the socket's own reads
+        // — is how the sync driver bounds the whole connect, the analogue of the
+        // async driver's `tokio::time::timeout(connect_timeout, connect_inner)`.
+        // Without it, a server that DRIPS state-non-advancing frames each within
+        // the per-read `SO_RCVTIMEO` window pins the connecting thread forever.
+        // Disarmed the instant the handshake completes (below), so steady reads
+        // are not bounded by it (the client-liveness window governs those).
+        let connect_deadline = ConnectDeadline::armed(connect_timeout);
+
+        let wire = Self::build_wire(sock, config, ssl_mode, diagnostics, &connect_deadline)?;
         // Snapshot the encryption state from the built wire BEFORE it is moved
         // into the engine.
         let encrypted = wire.is_encrypted();
@@ -423,7 +434,12 @@ impl Connection {
             engine::open_owned(wire, &user, database.as_ref(), &startup_params, credentials)
                 .map_err(lift_conn_fail)?;
         let live = flatten_poll(engine::poll_once(engine.connect(live)))?;
-        // Handshake complete: leave the connect-phase deadline and rest the socket
+        // Handshake complete: DISARM the connect-phase aggregate deadline so steady
+        // reads take the plain path (the socket's own `read` now loads `0` and skips
+        // the re-arm/short-circuit branch). Done BEFORE the steady `SO_RCVTIMEO` is
+        // set below, so no shrinking connect budget can leak into a steady read.
+        connect_deadline.disarm();
+        // Leave the connect-phase deadline and rest the socket
         // at its STEADY state. Writes block indefinitely (async-parity); reads rest
         // at the client-liveness window derived from a configured
         // `statement_timeout` (`None` = block indefinitely, the historical read),
@@ -595,9 +611,14 @@ impl Connection {
             )
         )]
         diagnostics: &Diagnostics,
+        // The connect-phase aggregate deadline the driver arms across the WHOLE
+        // handshake (SSL negotiation + startup/auth) and disarms after; every
+        // `SyncSocket` this builds shares it, so both the TLS handshake and the
+        // startup/auth handshake are bounded by it.
+        connect_deadline: &ConnectDeadline,
     ) -> Result<SyncWire, DriverError> {
         if sock.is_unix() || ssl_mode == SslMode::Disable {
-            return Ok(Wire::Plain(SyncSocket::new(sock)));
+            return Ok(Wire::Plain(SyncSocket::new(sock, connect_deadline.clone())));
         }
         // A TCP socket with `ssl_mode` == `Prefer` or `Require` here.
         //
@@ -622,7 +643,7 @@ impl Connection {
                      cannot be used — enable the `tls` feature",
                 ));
             }
-            Ok(Wire::Plain(SyncSocket::new(sock)))
+            Ok(Wire::Plain(SyncSocket::new(sock, connect_deadline.clone())))
         }
         #[cfg(feature = "tls")]
         {
@@ -658,7 +679,7 @@ impl Connection {
                             DriverError::Io(io::Error::other(format!("TLS config: {e}")))
                         })?,
                     };
-                    let socket = SyncSocket::new(tcp);
+                    let socket = SyncSocket::new(tcp, connect_deadline.clone());
                     let tls =
                         match engine::poll_once(TlsTransport::connect(socket, cfg, server_name)) {
                             Ok(Ok(transport)) => transport,
@@ -668,7 +689,7 @@ impl Connection {
                     Ok(Wire::Tls(Box::new(tls)))
                 }
                 bsql_postgres_core::ssl::SslProbe::PlainTcp => {
-                    Ok(Wire::Plain(SyncSocket::new(tcp)))
+                    Ok(Wire::Plain(SyncSocket::new(tcp, connect_deadline.clone())))
                 }
             }
         }

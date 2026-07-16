@@ -9,9 +9,11 @@
 //! proves only ALLOCATION claims:
 //!
 //! 1. **Outbound `write` is bounded and does not grow per record.** Our buffer
-//!    management contributes zero: the encrypt scratch is a fixed array, the
-//!    outbound queue is reused (capacity retained across flushes), and `write`
-//!    performs no socket I/O. `rustls` itself performs exactly one internal
+//!    management contributes zero: each record is encrypted DIRECTLY into the
+//!    outbound queue's reserved tail (no resident scratch buffer), and the queue
+//!    is reused (capacity retained across flushes), so a warm `write` performs
+//!    zero allocations and no socket I/O. `rustls` itself performs exactly one
+//!    internal
 //!    record-construction allocation per record (in its AEAD record layer),
 //!    outside this layer's control — `rustls` is the sole TLS authority and is
 //!    never forked. That residual is a per-record constant: an early write

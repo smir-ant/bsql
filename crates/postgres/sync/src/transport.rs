@@ -33,13 +33,140 @@ use std::net::{Shutdown, TcpStream};
 // below needs a non-unix `Unix` arm.
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 // Used only by the two `#[cfg(unix)]` footprint pins below (they capture the unix
 // fd layout); on a non-unix target there is no socket duality to pin.
 #[cfg(unix)]
 use bsql_postgres_core::footprint_pin;
 use bsql_postgres_proto::engine::Transport;
+
+/// Process-wide monotonic epoch for the connect-phase deadline.
+///
+/// A [`std::time::Instant`] cannot live in an atomic, so the shared connect
+/// deadline is stored as nanoseconds elapsed from this fixed epoch (captured
+/// once, on first use). Only DIFFERENCES from it are ever taken, so the absolute
+/// value is irrelevant — it exists solely to turn two `Instant`s into a
+/// comparable `u64`.
+static CONNECT_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// The smallest `SO_RCVTIMEO` the connect-phase re-arm sets while budget remains.
+///
+/// `std`'s `set_read_timeout(Some(Duration::ZERO))` ERRORS ("cannot set a 0
+/// duration timeout"), and a sub-`SO_RCVTIMEO`-granularity value can round to 0
+/// (which DISABLES the timeout — the very hang this guards against), so a
+/// remaining budget below this floor is armed AT this floor (an overshoot of at
+/// most 1 ms, negligible against `connect_timeout`). A budget that has actually
+/// reached zero short-circuits (never re-armed to a floor).
+const MIN_CONNECT_READ_BUDGET: Duration = Duration::from_millis(1);
+
+/// The classified read error a spent connect-phase budget yields. `TimedOut` is
+/// lifted to [`DriverError::Timeout`](bsql_postgres_core::DriverError::Timeout) —
+/// the SAME class a per-read `SO_RCVTIMEO` elapse produces, so the two are one
+/// classification.
+const CONNECT_DEADLINE_ELAPSED: &str =
+    "connect aggregate deadline (connect_timeout) elapsed during the startup/auth handshake";
+
+/// A connect-phase AGGREGATE wall-clock deadline, shared (by `Arc`) between the
+/// blocking driver and the engine-owned [`SyncSocket`].
+///
+/// # Why the socket enforces it
+///
+/// The blocking driver drives the WHOLE startup/auth handshake inside a single
+/// `poll_once` (every leaf read blocks, so the handshake future resolves in one
+/// poll), so the driver CANNOT interpose a wall-clock check between the engine's
+/// individual reads. Without an aggregate bound, a hostile or broken server that
+/// DRIPS endless state-non-advancing frames (`NoticeResponse` / `ParameterStatus`)
+/// each within the per-read `SO_RCVTIMEO` window pins the connecting thread
+/// forever — a few such connects exhaust a blocking pool. This handle lets the
+/// socket's own [`read`](Transport::read) enforce the budget: the driver arms it
+/// with `connect_timeout` before the handshake and DISARMS it the instant the
+/// handshake completes. It is the sync analogue of the async driver's
+/// `tokio::time::timeout(connect_timeout, connect_inner)`, which bounds the whole
+/// connect in one place.
+///
+/// # Zero steady-state cost
+///
+/// A disarmed deadline is a single relaxed `AtomicU64` load per steady read —
+/// value `0`, taken branch skipped, no `Instant::now`, no re-arm — so a
+/// connection's steady read path is byte-for-byte the historical one. Only the
+/// connect phase (armed) pays the clock read + the re-arm.
+///
+/// Stored as nanoseconds from [`CONNECT_EPOCH`]; `0` means disarmed.
+#[derive(Clone, Debug)]
+pub struct ConnectDeadline(Arc<AtomicU64>);
+
+/// What the connect-phase deadline dictates for the read about to happen.
+enum ConnectReadPhase {
+    /// Disarmed (steady state, or handshake complete): read normally.
+    Disarmed,
+    /// The aggregate budget is spent: fail the read NOW (never re-arm to zero).
+    Expired,
+    /// Budget remains: re-arm `SO_RCVTIMEO` to this (floored) value first.
+    Remaining(Duration),
+}
+
+impl ConnectDeadline {
+    /// Arm the deadline at `now + budget`, captured as nanoseconds from the
+    /// process epoch. A budget so large it would overflow the epoch offset is
+    /// clamped to the maximum (effectively unbounded within `u64` nanoseconds ≈
+    /// 584 years), never to `0` (which would read as disarmed).
+    #[must_use]
+    pub fn armed(budget: Duration) -> Self {
+        // Explicit `match` (not `unwrap_or`) — the workspace bans the
+        // silent-fallback `unwrap_or*` family; here the saturation to `u64::MAX`
+        // is a deliberate, documented overflow clamp, never a swallowed error.
+        let deadline_nanos = match Instant::now().checked_add(budget) {
+            Some(deadline) => {
+                let nanos = deadline.saturating_duration_since(*CONNECT_EPOCH).as_nanos();
+                match u64::try_from(nanos) {
+                    // `.max(1)` reserves `0` for disarmed.
+                    Ok(n) => n.max(1),
+                    Err(_) => u64::MAX,
+                }
+            }
+            None => u64::MAX,
+        };
+        Self(Arc::new(AtomicU64::new(deadline_nanos)))
+    }
+
+    /// Disarm: subsequent reads take the [`ConnectReadPhase::Disarmed`] fast path.
+    /// Called by the driver the instant the handshake completes.
+    pub fn disarm(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+
+    /// The read-time decision.
+    ///
+    /// `Relaxed` is sufficient: the arm-before-handshake and disarm-after-handshake
+    /// stores are ordered w.r.t. the socket's reads by the single-threaded connect
+    /// drive and the `Send` hand-off that publishes the connection to any later
+    /// thread, and the flag value is the only shared datum.
+    fn phase(&self) -> ConnectReadPhase {
+        let deadline = self.0.load(Ordering::Relaxed);
+        if deadline == 0 {
+            return ConnectReadPhase::Disarmed;
+        }
+        let now_nanos = Instant::now().saturating_duration_since(*CONNECT_EPOCH).as_nanos();
+        // Compare in `u128` (the `u64` deadline widens losslessly) so no `u128`→`u64`
+        // clamp on `now` is needed — avoiding both the banned `unwrap_or*` family and
+        // its `manual_unwrap_or` match shape.
+        match u128::from(deadline).checked_sub(now_nanos) {
+            None | Some(0) => ConnectReadPhase::Expired,
+            Some(remaining) => match u64::try_from(remaining) {
+                // `remaining <= deadline` (a `u64`), so it always fits `u64`.
+                Ok(nanos) => ConnectReadPhase::Remaining(
+                    Duration::from_nanos(nanos).max(MIN_CONNECT_READ_BUDGET),
+                ),
+                // Structurally unreachable; the SAFE fallback is Expired (a false
+                // deadline-spent, never a false Remaining that could hang).
+                Err(_) => ConnectReadPhase::Expired,
+            },
+        }
+    }
+}
 
 /// A blocking std stream that is EITHER a TCP socket or a unix-domain socket.
 ///
@@ -176,20 +303,31 @@ impl Write for SyncSock {
 /// and `shutdown` closes the write half so the peer sees a clean FIN.
 pub struct SyncSocket {
     stream: SyncSock,
+    /// The connect-phase aggregate deadline (see [`ConnectDeadline`]). Disarmed
+    /// (a single relaxed load) in steady state; armed only across the handshake,
+    /// where the blocking driver cannot check a wall clock between the engine's
+    /// individual reads.
+    connect_deadline: ConnectDeadline,
 }
 
-// The wrapper is exactly its inner `SyncSock` — the same 8 B — with no added
-// state. Pinned so the wrapper cannot silently grow past the socket it carries.
-// Unix-only, for the same reason as the `SyncSock` pin above (the std socket
-// layout it captures is the unix fd's).
+// `SyncSocket` = its inner `SyncSock` (8 B, align 4) + the shared connect-phase
+// deadline handle (`Arc<AtomicU64>`, one pointer, 8 B, align 8): 16 B, align 8.
+// The +8 B (over a bare `SyncSock`) buys the connect-liveness aggregate bound — a
+// hostile frame drip cannot pin the connecting thread forever (the MAJOR blind
+// zone), the sync analogue of the async driver's whole-connect `tokio::time::timeout`
+// — at one relaxed atomic load per steady read (disarmed → the branch is skipped).
+// Pinned so the wrapper cannot silently grow further. Unix-only, for the same
+// reason as the `SyncSock` pin above (the std socket layout it captures is the
+// unix fd's).
 #[cfg(unix)]
-footprint_pin!(SyncSocket, size = 8, align = 4);
+footprint_pin!(SyncSocket, size = 16, align = 8);
 
 impl SyncSocket {
-    /// Wrap an already-connected [`SyncSock`] (a TCP or unix stream).
+    /// Wrap an already-connected [`SyncSock`], carrying the connect-phase
+    /// [`ConnectDeadline`] the driver arms across the handshake and disarms after.
     #[must_use]
-    pub fn new(stream: SyncSock) -> Self {
-        Self { stream }
+    pub fn new(stream: SyncSock, connect_deadline: ConnectDeadline) -> Self {
+        Self { stream, connect_deadline }
     }
 }
 
@@ -213,6 +351,28 @@ impl Transport for SyncSocket {
         &'a mut self,
         buf: &'a mut [u8],
     ) -> impl core::future::Future<Output = Result<usize, io::Error>> + Send + 'a {
+        // Connect-phase aggregate-deadline enforcement (disarmed = the historical
+        // plain read below). The blocking driver cannot check a wall clock between
+        // the engine's handshake reads (they all run inside one `poll_once`), so
+        // the socket enforces the budget here: re-arm `SO_RCVTIMEO` to the
+        // remaining budget so a per-read block cannot overshoot the deadline (the
+        // drip case), and fail NOW once the budget is spent so an endless-frame
+        // flood cannot loop forever (the busy-flood case). Both surface as the
+        // classified `TimedOut`, lifted to `DriverError::Timeout`.
+        match self.connect_deadline.phase() {
+            ConnectReadPhase::Disarmed => {}
+            ConnectReadPhase::Expired => {
+                return core::future::ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    CONNECT_DEADLINE_ELAPSED,
+                )));
+            }
+            ConnectReadPhase::Remaining(budget) => {
+                if let Err(e) = self.stream.set_read_timeout(Some(budget)) {
+                    return core::future::ready(Err(e));
+                }
+            }
+        }
         // The blocking read happens here, eagerly; the future merely carries its
         // already-resolved result, so it is `Ready` on the first poll.
         core::future::ready(Read::read(&mut self.stream, buf))
@@ -242,5 +402,54 @@ impl Transport for SyncSocket {
         &'a mut self,
     ) -> impl core::future::Future<Output = Result<(), io::Error>> + Send + 'a {
         core::future::ready(self.stream.shutdown_write())
+    }
+}
+
+#[cfg(test)]
+mod connect_deadline_tests {
+    //! Offline unit coverage for the connect-phase aggregate deadline the socket's
+    //! own `read` enforces (see the `--test connect_handshake_deadline` regression
+    //! witness for the end-to-end drip proof over a real loopback server).
+
+    use super::{ConnectDeadline, ConnectReadPhase, MIN_CONNECT_READ_BUDGET};
+    use std::time::Duration;
+
+    #[test]
+    fn armed_far_future_leaves_almost_the_whole_budget_and_re_arms() {
+        let d = ConnectDeadline::armed(Duration::from_secs(3600));
+        let ConnectReadPhase::Remaining(budget) = d.phase() else {
+            panic!("a generous-budget deadline must be Remaining, not Expired/Disarmed");
+        };
+        assert!(budget >= MIN_CONNECT_READ_BUDGET, "never below the positive floor");
+        assert!(budget <= Duration::from_secs(3600), "never above the armed budget");
+        assert!(budget > Duration::from_secs(3599), "almost the whole budget remains");
+    }
+
+    #[test]
+    fn a_spent_budget_is_expired_never_re_armed_to_zero() {
+        // `now + 0` is already in the past by the time `phase()` reads the clock,
+        // so the read must short-circuit rather than re-arm `SO_RCVTIMEO` to zero
+        // (which `std` rejects).
+        let d = ConnectDeadline::armed(Duration::ZERO);
+        assert!(matches!(d.phase(), ConnectReadPhase::Expired));
+    }
+
+    #[test]
+    fn disarm_takes_the_plain_read_fast_path() {
+        let d = ConnectDeadline::armed(Duration::from_secs(3600));
+        d.disarm();
+        assert!(matches!(d.phase(), ConnectReadPhase::Disarmed));
+    }
+
+    #[test]
+    fn the_driver_and_socket_share_one_handle_so_disarm_is_observed() {
+        // The driver disarms via ITS clone the instant the handshake completes;
+        // the engine-owned socket's clone must observe it (else steady reads would
+        // keep enforcing a stale, shrinking budget — the catastrophic bug).
+        let driver = ConnectDeadline::armed(Duration::from_secs(3600));
+        let socket = driver.clone();
+        assert!(matches!(socket.phase(), ConnectReadPhase::Remaining(_)));
+        driver.disarm();
+        assert!(matches!(socket.phase(), ConnectReadPhase::Disarmed));
     }
 }

@@ -295,7 +295,7 @@ fn guard_locates_the_real_function_bodies() {
         ("recv_more", "compact_staging", "staging_filled"),
         ("compact_staging", "copy_within", "staging_start"),
         ("pump_inbound", "process_tls_records", "next_record"),
-        ("with_conn", "staging_start", "scratch"),
+        ("with_conn", "staging_start", "STAGING_CAP"),
     ];
     for &(name, a, b) in anchors {
         let body = fn_body(&code, name);
