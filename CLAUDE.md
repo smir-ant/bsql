@@ -139,6 +139,7 @@ cargo test -p bsql-query-fixture --test view_live_async -- --ignored  # live que
 cargo test -p bsql-query-fixture --test view_live_sync  -- --ignored  # live query!-against-a-VIEW (sync twin)
 cargo test -p bsql-query-fixture --test query_oid_guard_live -- --ignored  # live typed RESULT-schema OID guard (both drivers): a TEMP shadow of a DIFFERENT type is a classified ColumnOidMismatch on every typed verb (never a silent "AAAA"); a matching-typed shadow + varchar/bpchar columns decode correctly (no false positive). Per-connection TEMP shadows over the 0020_oidguard.sql table, so parallel-safe (run WITHOUT --test-threads=1)
 cargo test -p bsql-query-fixture --test pipeline_oid_guard_live -- --ignored  # live PER-COMMAND result-schema OID guard on the PIPELINE (both drivers): a drifted pipeline command is a classified DriverError::BatchColumnOidMismatch naming the command (batch_failed_index()), never a silent value, connection recovers; a matching shadow + varchar/bpchar + a user-type (domain) column decode correctly (no false positive). Per-connection TEMP shadows / per-test schema, so parallel-safe (run WITHOUT --test-threads=1)
+cargo test -p bsql-query-fixture --test pooled_typed_shadow_live -- --ignored  # TYPED cross-tenant leak regression (both drivers): the pool DROPS the compile-checked query! statement cache on checkout, so User 2 reading their identical-column CREATE TEMP TABLE shadow after User 1 promoted a query::<Q>() over the PERMANENT table gets the TEMP row (a MISS, re-Parsed fresh), never the prior user's rows. The typed twin of pooled_dynamic_plan_re_resolves_a_temp_shadow_across_users. Uses per-driver permanent tables (pts_async/pts_sync from 0024_typed_shadow.sql), so parallel-safe
 cargo test -p bsql-sqlite --test migrate                # migration runner (in-process, no PG)
 cargo test -p bsql-postgres-sync  --test migrate_live -- --ignored  # migration runner (sync PG, incl. concurrency + CONCURRENTLY)
 cargo test -p bsql-postgres-async --test migrate_live -- --ignored  # migration runner (async PG try-lock poll)
@@ -932,35 +933,51 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   once while the cache reclaims the stale statement and re-warms against the
   current schema — never a silently-stale result; the reuse path re-runs the
   fused query TRANSPARENTLY on stale detection, so a schema change costs one
-  re-parse, never a user-visible spurious error). **DROPPED on a pool checkout — a
-  CORRECTNESS requirement, not hygiene.** The single `Core::reset_session` (used by
-  both a direct consumer and the pool at checkout) CLEARS the dynamic cache in ONE
-  batched round trip (all cached statements `Close`d + a single `Sync`), so a
-  pooled connection behaves EXACTLY like a fresh one for the next logical user.
-  Keeping the dynamic cache WARM across a checkout (an earlier
-  optimization) was REVERTED because it is not airtight: a dynamic runtime-SQL plan
-  can resolve an UNQUALIFIED name (against the search path) or reference a SESSION
-  object, so a plan a prior logical user promoted (e.g. `SELECT … FROM orders …`
-  bound to `public.orders`, driven to a GENERIC plan) would survive into the next
-  user's checkout — and a next user who creates a shadowing `CREATE TEMP TABLE
-  orders` (with `pg_temp` already active, so the search-path OID list is unchanged)
-  would receive the PRIOR user's `public.orders` rows: a SILENT CROSS-USER WRONG
-  RESULT (a tenant-boundary leak, verified live). `DISCARD PLANS` cannot fix this
-  robustly — it invalidates a kept plan only ONCE at checkout, and PostgreSQL
-  re-validates it against the pre-shadow schema (any trailing reset statement, or a
-  user query before the shadow exists, re-resolves it back to `public`; verified
-  live), and a shadow created afterward is not seen — so DROPPING the statements
-  (a fresh `Parse` on next use, resolving against the current user's schema) is the
-  only airtight fix, at the cost of the pooled-reuse micro-optimization. The engine's
-  compile-checked (TYPED) cache is KEPT (the typed flagship's server-side plan reuse
-  is preserved) — safe NOT because a typed plan cannot bind a session object (it CAN:
-  a fresh typed `Parse` under a `CREATE TEMP TABLE` shadow DOES resolve to the temp),
-  but because a silent mis-decode is closed independently by the TYPED RESULT-SCHEMA
-  OID GUARD (see the typed-path guarantee-boundary bullet below) plus PostgreSQL's own
-  `0A000` refusal to change a reused plan's result type. A DIRECT (non-pooled)
-  connection never resets on its own, so its dynamic cache persists for the
-  connection's life. Witnessed by the `--ignored`
-  `pooled_dynamic_plan_re_resolves_a_temp_shadow_across_users` live test (both drivers).
+  re-parse, never a user-visible spurious error). **BOTH statement caches are
+  DROPPED on a pool checkout — a CORRECTNESS requirement, not hygiene. The ONE RULE:
+  a statement cache lives within a single connection LEASE, never across a checkout.**
+  The single `Core::reset_session` (used by both a direct consumer and the pool at
+  checkout) DROPS the dynamic AND the compile-checked (TYPED) cache, so a pooled
+  connection behaves EXACTLY like a fresh one for the next logical user. A prepared
+  plan resolves its relation NAMES once, at `Parse` — a dynamic plan against an
+  UNQUALIFIED name (the search path) or a SESSION object, a typed plan against its
+  migration table — so a plan a prior logical user promoted (e.g. `SELECT … FROM
+  orders …` bound to `public.orders`, driven GENERIC) must NOT survive into the next
+  user's checkout: a next user who creates a shadowing `CREATE TEMP TABLE orders`
+  (with `pg_temp` already active, so the search-path OID list is unchanged) would
+  receive the PRIOR user's `public.orders` rows on a cache HIT — a SILENT CROSS-USER
+  WRONG RESULT (a tenant-boundary leak, verified live for BOTH caches). The typed
+  cache had the SAME hole and was formerly (wrongly) KEPT warm: the RESULT-SCHEMA OID
+  GUARD + PostgreSQL's `0A000` do NOT rescue it here, because they catch a result-TYPE
+  divergence, while a temp shadow with columns MATCHING the migration table has the
+  SAME result type (no `0A000`) and a typed HIT reuses the plan with a bare
+  `Bind`+`Execute` that sends no `Describe` (so the guard never runs) — neither covers
+  this same-type / different-data-source case. `DISCARD PLANS` cannot fix it either —
+  it invalidates a kept plan only ONCE at checkout, and PostgreSQL re-validates it
+  against the pre-shadow schema (any trailing reset statement, or a user query before
+  the shadow exists, re-resolves it back to `public`; verified live), and a shadow
+  created afterward is not seen — so DROPPING the statement (a fresh `Parse` on next
+  use, resolving against the current user's schema, re-arming the guard) is the only
+  airtight fix, at the cost of the cross-checkout plan-reuse micro-optimization.
+  **Server-side hygiene at ZERO extra round trips:** clearing the CLIENT-side sets is
+  the airtight correctness fix and costs no wire; the dynamic cache's server-side
+  statements are `Close`d in ONE batched round trip whenever the dynamic cache is
+  non-empty, and the TYPED cache's server-side statements are FOLDED into that same
+  `Close`+`Sync` (via `close_statements_bytes`, since a `Close` names a statement by
+  raw bytes and the dynamic `_bsql_<n>` / typed `bsql_q_<hex>` names have disjoint
+  prefixes). In the pure-typed flagship case — an empty dynamic cache — no batch is
+  FORCED (preserving the flagship's zero-RTT checkout): the typed client cache is
+  cleared for correctness and its server-side statements are reclaimed lazily by the
+  next typed query's MISS-path leading `Close` (a bounded, non-growing footprint —
+  content-addressed names, at most one per distinct `query!`). A DIRECT (non-pooled)
+  connection never resets on its own, so BOTH its caches persist for the connection's
+  life. Witnessed by the `--ignored`
+  `pooled_dynamic_plan_re_resolves_a_temp_shadow_across_users` (dynamic cache, driver
+  suites) and `pooled_typed_plan_re_resolves_a_temp_shadow_across_users`
+  (`tools/query_fixture`, typed cache, both drivers) live tests — a plan a prior user
+  promoted against a PERMANENT table returns the next user's `TEMP TABLE` data after
+  checkout, never the permanent rows — plus the offline
+  `take_statement_cache_returns_the_names_and_clears`.
 
 - **Typed `query!` RESULT-schema OID guard — the last silent-wrong-result surface,
   closed.** The typed decode is POSITIONAL / const-offset, so a runtime result column

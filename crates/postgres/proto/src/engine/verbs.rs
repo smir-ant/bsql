@@ -1734,6 +1734,42 @@ impl<'b, T: Transport> Engine<'b, T> {
     where
         S: FnMut(Surface<'_>) -> ControlFlow<Never>,
     {
+        // Delegate to the byte-named core: a `Close` frame carries the statement
+        // name as raw bytes, so the two name forms (validated `StmtName`,
+        // `'static` cache names) share ONE staging + drive path — no drift.
+        let byte_names: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+        self.close_statements_bytes(live, &byte_names, sink).await
+    }
+
+    /// Close MANY statements named by RAW bytes in ONE round trip (`Close`×N +
+    /// a single `Sync`), draining every `CloseComplete` ack — the byte-named core
+    /// of [`close_statements`](Self::close_statements).
+    ///
+    /// A `Close` frame references a server-side statement purely by name bytes, so
+    /// this common form lets the pool reset's COMBINED cache-drop fold BOTH the
+    /// dynamic cache's validated [`StmtName`]s AND the typed cache's `'static`
+    /// content-addressed names (from [`take_statement_cache`](Self::take_statement_cache))
+    /// into ONE batch, closing every cached server-side statement without paying a
+    /// round trip per name. A `Close` of an already-dropped statement is a wire
+    /// no-op, so the batch is robust even after a mid-session `DISCARD`/`DEALLOCATE`.
+    /// `B = Never`.
+    ///
+    /// A zero-length `names` still sends a bare `Sync` (a liveness round trip); the
+    /// caller should skip the verb when there is nothing to close.
+    ///
+    /// # Errors
+    ///
+    /// As [`simple_query`](Self::simple_query) (`FrameTooLong` covers an oversize
+    /// statement name).
+    pub async fn close_statements_bytes<S>(
+        &mut self,
+        live: Live<'b>,
+        names: &[&[u8]],
+        sink: S,
+    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
+    where
+        S: FnMut(Surface<'_>) -> ControlFlow<Never>,
+    {
         let Self {
             transport,
             phase,
@@ -1744,7 +1780,7 @@ impl<'b, T: Transport> Engine<'b, T> {
         send_buf.reset();
         stage_prelude(active, send_buf)?;
         for name in names {
-            enqueue_frame(send_buf, |wb| frames::build_close_statement(wb, name.as_bytes()))?;
+            enqueue_frame(send_buf, |wb| frames::build_close_statement(wb, name))?;
         }
         send_buf.enqueue(&crate::wire::SYNC_WIRE_BYTES);
         active.begin_close_many();

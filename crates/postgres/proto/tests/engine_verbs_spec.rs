@@ -1278,6 +1278,55 @@ fn query_params_miss_close_parses_hit_reuses_and_reparses_after_clear() {
 }
 
 #[test]
+fn take_statement_cache_returns_the_names_and_clears() {
+    // take_statement_cache DRAINS the cache: it RETURNS the recorded
+    // content-addressed names (so the pool reset can Close their server-side
+    // statements in the SAME batch as the dynamic drain) AND empties the set (so
+    // the next typed query re-Parses fresh — the SAME correctness guarantee as
+    // clear_statement_cache). Sequence: call 1 (MISS) records the name;
+    // take_statement_cache() returns [name]; call 2 is a MISS AGAIN. The script
+    // provides CloseComplete+ParseComplete first for call 2, so a HIT's bare Bind
+    // (which the engine would send if take had NOT cleared the cache) would await
+    // BindComplete and desync — the session completing therefore PROVES the cache
+    // was cleared, and the returned Vec proves the name was yielded, not dropped.
+    let script = concat(&[
+        handshake(),
+        // call 1 (MISS): Close+Parse+Bind+Describe+Execute → the MISS reply chain.
+        close_complete(),
+        parse_complete(),
+        bind_complete(),
+        row_description(&[("id", 23), ("name", 25)]),
+        data_row(&[Some(b"42"), Some(b"alice")]),
+        command_complete("SELECT 1"),
+        rfq(b'I'),
+        // call 2 (MISS AGAIN, after take): the same MISS reply chain.
+        close_complete(),
+        parse_complete(),
+        bind_complete(),
+        row_description(&[("id", 23), ("name", 25)]),
+        data_row(&[Some(b"42"), Some(b"alice")]),
+        command_complete("SELECT 1"),
+        rfq(b'I'),
+    ]);
+    let taken = run(script, |e, live| {
+        let mut cap1 = Cap::default();
+        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap1.sink())))
+            .expect("call 1 (miss) records the name");
+        let taken = e.take_statement_cache();
+        let mut cap2 = Cap::default();
+        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap2.sink())))
+            .expect("call 2 is a MISS again — take cleared the cache");
+        let _ = live;
+        taken
+    });
+    assert_eq!(
+        taken,
+        vec![Q_DEMO.stmt_name()],
+        "take_statement_cache returns the ONE recorded content-addressed name",
+    );
+}
+
+#[test]
 fn query_params_reuse_error_evicts_so_next_use_reparses() {
     // EVICT-ON-REUSE-ServerErrored: a recorded statement dropped out of band
     // (DISCARD ALL) makes the next reuse (bare Bind) fail; the name is EVICTED so

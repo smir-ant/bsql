@@ -398,34 +398,36 @@ struct DynSlot {
 /// already-dropped statement is a wire no-op, so it is robust even after a
 /// mid-session `DISCARD` / `DEALLOCATE`) batched into ONE round trip.
 ///
-/// Clearing the DYNAMIC cache at the pool boundary is a CORRECTNESS requirement,
-/// not a hygiene nicety. A dynamic runtime-SQL plan can resolve an UNQUALIFIED name
-/// (against the search path) or reference a SESSION object, so a plan a prior
-/// logical user promoted (e.g. `SELECT … FROM orders …` bound to `public.orders`)
-/// must NOT survive into the next user's checkout: keeping it warm would let a next
-/// user who creates a shadowing `CREATE TEMP TABLE orders` (with `pg_temp` already
-/// active, so the search-path OID list is unchanged) receive the PRIOR user's
-/// `public.orders` rows — a silent cross-user wrong result. `DISCARD PLANS` cannot
-/// fix this robustly (it invalidates a kept plan only ONCE, and PostgreSQL
-/// re-validates it against the pre-shadow schema before the user's shadow exists —
-/// verified live), so the airtight fix is to DROP the statements: the next user's
-/// query re-`Parse`s fresh against their own schema, exactly as on a fresh
-/// connection. The engine's compile-checked (TYPED) cache is KEPT, preserving the
-/// typed flagship's server-side plan reuse — safe NOT because a typed plan cannot
-/// resolve to a session object (it CAN: a fresh typed `Parse` under a `CREATE TEMP
-/// TABLE` shadow DOES bind to the temp), but because every silent mis-decode is
-/// closed on TWO fronts: (a) `DISCARD TEMP` on checkout drops any prior user's temp
-/// so a kept plan that resolved to one fails LOUD on reuse (relation-not-exist /
-/// re-plan → `0A000`), never a silent cross-user leak; and (b) a fresh typed
-/// `Parse` (a cache MISS) appends a `Describe`(portal) and the driver's
-/// result-schema guard verifies each runtime column OID against the carrier's
-/// compile-time schema — a divergent runtime type (a temp shadow, or an out-of-band
-/// `ALTER COLUMN TYPE`) is a classified `DecodeError::ColumnOidMismatch`, and a HIT
-/// whose result type would change is refused by PostgreSQL itself as `0A000`
-/// ("cached plan must not change result type"). So a residual runtime/build-time
-/// result-type mismatch is FAIL-LOUD, never a silent mis-decode. A DIRECT
-/// (non-pooled) connection never resets on its own, so its dynamic cache persists
-/// for the connection's life.
+/// Clearing this cache at the pool boundary is a CORRECTNESS requirement, not a
+/// hygiene nicety — and the SAME rule applies to the engine's compile-checked
+/// (TYPED) cache, which the reset ALSO drops (the ONE RULE: a statement cache never
+/// crosses a checkout). A prepared plan resolves its relation NAMES once, at `Parse`
+/// — a dynamic plan against an UNQUALIFIED name (the search path) or a SESSION
+/// object, a typed plan against its migration table — so a plan a prior logical user
+/// promoted (e.g. `SELECT … FROM orders …` bound to `public.orders`) must NOT survive
+/// into the next user's checkout: keeping it warm would let a next user who creates a
+/// shadowing `CREATE TEMP TABLE orders` (with `pg_temp` already active, so the
+/// search-path OID list is unchanged) receive the PRIOR user's `public.orders` rows
+/// on a cache HIT — a silent cross-user wrong result (a tenant-boundary leak).
+/// `DISCARD PLANS` cannot fix this robustly (it invalidates a kept plan only ONCE,
+/// and PostgreSQL re-validates it against the pre-shadow schema before the user's
+/// shadow exists — verified live), so the airtight fix is to DROP the statements:
+/// the next user's query re-`Parse`s fresh against their own schema, exactly as on a
+/// fresh connection.
+///
+/// The typed result-schema guard + PostgreSQL's `0A000` do NOT rescue a kept typed
+/// plan here: they catch a result-TYPE divergence, but a temp shadow with columns
+/// matching the migration table has the SAME result type (no `0A000`), and a typed
+/// cache HIT reuses the plan with a bare `Bind`+`Execute` that sends no `Describe`
+/// (so the guard never runs). Only dropping the typed CLIENT cache — forcing the
+/// next typed query to re-`Parse` fresh (and re-arm the guard) — is airtight, exactly
+/// as for the dynamic cache. The typed cache's SERVER-side statements are FOLDED into
+/// this batch's `Close`+`Sync` when the dynamic cache is non-empty (zero extra round
+/// trip); when the dynamic cache is empty (the pure-typed flagship case) no batch is
+/// forced, and the typed statements are reclaimed lazily by the next typed query's
+/// MISS-path leading `Close` (a bounded, non-growing footprint). A DIRECT (non-pooled)
+/// connection never resets on its own, so BOTH its caches persist for the connection's
+/// life.
 #[derive(Debug)]
 struct DynStmtCache {
     /// Insertion-ordered slots (linear scan; `DYN_STMT_CACHE_CAP` is small, so a
@@ -1458,20 +1460,21 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         Ok(collector.affected())
     }
 
-    /// Close MANY dynamic-cache statements by NAME in ONE round trip — the
+    /// Close MANY cached statements by raw NAME BYTES in ONE round trip — the
     /// batched peer of [`close_statement`](Self::close_statement) that
-    /// [`reset_session`](Self::reset_session) uses to clear the cache without
-    /// paying a round trip per statement. Takes the names (not the owned handles),
-    /// so the caller keeps the [`PreparedStatement`]s and drops them after; a
-    /// `Close` of an already-dropped statement is a wire no-op. `#[doc(hidden)]`:
-    /// the pool-reset seam, not a public verb.
+    /// [`reset_session`](Self::reset_session) uses to drop BOTH prepared-statement
+    /// caches without paying a round trip per statement. Takes the name bytes
+    /// (dynamic-cache [`StmtName`]s AND the engine's typed `'static` names share the
+    /// one `&[u8]` `Close` form), so the caller keeps the [`PreparedStatement`]s and
+    /// drops them after; a `Close` of an already-dropped statement is a wire no-op.
+    /// `#[doc(hidden)]`: the pool-reset seam, not a public verb.
     #[doc(hidden)]
-    pub async fn close_dyn_statements(&mut self, names: &[&StmtName]) -> Result<(), DriverError> {
+    pub async fn close_cached_statements(&mut self, names: &[&[u8]]) -> Result<(), DriverError> {
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
-            .close_statements(
+            .close_statements_bytes(
                 live,
                 names,
                 capture_notify(&mut self.notifications, self.diag.sink(), |s| {
@@ -3240,41 +3243,37 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     }
 
     /// Reset all BLEEDABLE session state so this connection can be safely reused
-    /// by a different logical user, CLEARING the dynamic prepared-statement cache.
+    /// by a different logical user, DROPPING BOTH prepared-statement caches.
     ///
     /// Runs `DISCARD ALL` MINUS `DEALLOCATE ALL` in one simple-query round trip
     /// (prefixed with `ROLLBACK` only when inside a transaction, decided from the
     /// cached `ReadyForQuery` tx status so the common idle path costs no extra round
-    /// trip), then CLEARS the DYNAMIC prepared-statement cache in ONE batched round
-    /// trip (`Close`ing every cached server-side statement — `DISCARD` runs no
-    /// `DEALLOCATE`, so they otherwise survive), and clears the notification ledger
-    /// and the N+1 recency window. The engine's compile-checked (TYPED) statement
-    /// cache is deliberately KEPT, so the typed flagship's server-side plan reuse
-    /// survives — safe because a silent mis-decode is closed independently: a fresh
-    /// typed `Parse` (a cache MISS — which a temp shadow / out-of-band
-    /// `ALTER COLUMN TYPE` forces) appends a `Describe`(portal) and the driver's
-    /// result-schema guard classifies any runtime column-OID divergence as
-    /// `DecodeError::ColumnOidMismatch`, while a reused plan whose result type would
-    /// change is refused by PostgreSQL itself as `0A000` ("cached plan must not
-    /// change result type"). So keeping the typed cache never risks a silently-wrong
-    /// result — see the [`DynStmtCache`] doc for the full two-front argument.
+    /// trip), then DROPS both prepared-statement caches — the DYNAMIC (runtime-SQL)
+    /// cache AND the compile-checked TYPED (`query!`) cache — and clears the
+    /// notification ledger and the N+1 recency window.
     ///
     /// This is the SINGLE reset used both by a DIRECT consumer (an explicit clean
     /// slate) and by the POOL at checkout, so a pooled connection behaves EXACTLY
     /// like a fresh one for the next logical user.
     ///
-    /// # Why the DYNAMIC cache is DROPPED, not kept warm
+    /// # The ONE RULE: a statement cache never crosses a checkout
     ///
-    /// Dropping the dynamic cache on every reset is a CORRECTNESS requirement, not a
-    /// hygiene nicety. A dynamic `query_params` plan can resolve an UNQUALIFIED name
-    /// (against the search path) or reference a SESSION object, so a plan a prior
-    /// user PROMOTED (e.g. `SELECT … FROM orders …` bound to `public.orders`, driven
-    /// to a GENERIC plan) must NOT survive into the next user's checkout:
+    /// A prepared statement's relation NAMES are resolved once, at its `Parse`.
+    /// A plan a prior logical user promoted — dynamic or typed — that survived into
+    /// the next user's checkout would keep the prior user's name resolution, so it
+    /// is DROPPED unconditionally. This is a CORRECTNESS requirement, not a hygiene
+    /// nicety, and it holds identically for BOTH caches:
     ///
-    /// - Keeping it warm lets a NEXT user who creates a shadowing `CREATE TEMP TABLE
-    ///   orders` (with `pg_temp` already active, so the search-path OID list is
-    ///   unchanged) receive the PRIOR user's `public.orders` rows — a silent
-    ///   cross-user wrong result (a tenant-boundary leak, verified live).
+    /// - Keeping a plan warm lets a NEXT user who creates a shadowing `CREATE TEMP
+    ///   TABLE orders` (with `pg_temp` already active, so the search-path OID list is
+    ///   unchanged) receive the PRIOR user's `public.orders` rows on a cache HIT — a
+    ///   silent cross-user WRONG RESULT (a tenant-boundary leak, verified live for
+    ///   the dynamic cache). The typed cache had the SAME hole: a typed HIT reuses
+    ///   the kept plan with a bare `Bind`+`Execute` and sends no `Describe`, so the
+    ///   result-schema guard never runs; and because the shadow's columns match, the
+    ///   result type is unchanged, so PostgreSQL's own `0A000` ("cached plan must not
+    ///   change result type") never fires either. The guard + `0A000` cover a
+    ///   result-TYPE divergence, NOT this same-type / different-data-source case.
     /// - `DISCARD PLANS` cannot fix this robustly: it INVALIDATES a kept plan ONCE at
     ///   checkout, but PostgreSQL RE-VALIDATES an invalidated plan at its next use,
     ///   resolving against whatever schema exists AT THAT MOMENT. Any reset or user
@@ -3286,21 +3285,24 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ///   resolves against the current user's schema, exactly as on a fresh
     ///   connection) is airtight.
     ///
-    /// The TYPED cache is KEPT (its server-side plan reuse is the typed flagship's
-    /// speed) — NOT because a typed plan cannot bind a session object (it can: a
-    /// fresh typed `Parse` under a temp shadow resolves to the temp), but because a
-    /// silent mis-decode is closed by the result-schema guard (a typed cache MISS
-    /// appends a `Describe`(portal) and verifies each runtime column OID → a
-    /// classified `DecodeError::ColumnOidMismatch` on any divergence) plus
-    /// PostgreSQL's own `0A000` refusal to change a reused plan's result type. So a
-    /// kept typed plan is either correct or fail-loud, never silently wrong.
-    /// Witnessed by the `--ignored`
-    /// `pooled_dynamic_plan_re_resolves_a_temp_shadow_across_users` live test (both
-    /// drivers) for the DYNAMIC cache's drop, and by
-    /// `query_oid_guard_live.rs` for the TYPED cache's guard: a pooled plan a prior
-    /// user promoted against a PERMANENT table returns the next user's `TEMP TABLE`
-    /// data after checkout, never the permanent rows — because the dynamic cache is
-    /// dropped and the query re-`Parse`s fresh.
+    /// Dropping the CLIENT-side sets is the airtight fix and costs no wire (the next
+    /// query of each cache is a MISS re-`Parse`d fresh; a typed MISS re-arms the
+    /// result-schema guard too). For hygiene the SERVER-side statements are `Close`d:
+    /// `RESET`/`DISCARD` run no `DEALLOCATE`, so they otherwise survive. The dynamic
+    /// cache's statements are `Close`d in ONE batched round trip whenever the dynamic
+    /// cache is non-empty, and the TYPED cache's statements are FOLDED into that same
+    /// batch (zero extra round trip). In the pure-typed flagship case — an empty
+    /// dynamic cache — no batch is forced (so the flagship's zero-RTT checkout is
+    /// preserved): the typed client cache is cleared for correctness and its
+    /// server-side statements are reclaimed lazily by the next typed query's
+    /// MISS-path leading `Close` (a bounded, non-growing footprint — content-addressed
+    /// names, at most one per distinct `query!`). See the [`DynStmtCache`] doc for the
+    /// full argument. Witnessed by the `--ignored`
+    /// `pooled_dynamic_plan_re_resolves_a_temp_shadow_across_users` (dynamic cache)
+    /// and `pooled_typed_plan_re_resolves_a_temp_shadow_across_users` (typed cache)
+    /// live tests (both drivers): a pooled plan a prior user promoted against a
+    /// PERMANENT table returns the next user's `TEMP TABLE` data after checkout, never
+    /// the permanent rows — because the cache is dropped and the query re-`Parse`s fresh.
     pub async fn reset_session(&mut self) -> Result<(), DriverError> {
         self.reset_session_impl().await
     }
@@ -3323,24 +3325,49 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             RESET_WITH_ROLLBACK
         };
         self.simple_query(sql).await?;
-        // CLEAR the dynamic prepared-statement cache: neither a manual clean slate nor
-        // a pool checkout may reuse the prior plans. `RESET`/`DISCARD` run no
-        // `DEALLOCATE`, so the server-side statements SURVIVE the reset SQL above —
-        // Close them explicitly here so nothing is orphaned (a protocol `Close` of an
-        // already-dropped statement is a wire no-op, so this is robust even after a
-        // mid-session `DISCARD`/`DEALLOCATE`), BATCHED into ONE round trip (N `Close`
-        // + one `Sync`). Dropping the cache — rather than keeping it warm across a
-        // pool checkout — is what makes a pooled connection re-`Parse` a runtime SQL
-        // fresh against the CURRENT user's schema, so a kept plan can never return a
-        // prior user's name resolution (see `pool_reset_session` for the temp-shadow
-        // reasoning). The engine's TYPED cache is KEPT (its plans reference only
-        // permanent migration objects).
+        // DROP BOTH prepared-statement caches — the ONE RULE: a statement cache lives
+        // within a single connection LEASE, never across a pool checkout. Neither the
+        // DYNAMIC (runtime-SQL) cache nor the TYPED (compile-checked `query!`) cache
+        // may be reused by the next logical user, because a plan's relation names are
+        // resolved at its `Parse`: a plan a prior user promoted (e.g. `… FROM orders`
+        // bound to `public.orders`, driven generic) that survived would let the next
+        // user's `CREATE TEMP TABLE orders` shadow read the PRIOR user's rows through
+        // the kept plan on a cache HIT — a silent cross-user WRONG RESULT (a
+        // tenant-boundary leak; the result type is unchanged, so PG's `0A000` never
+        // fires, and a HIT sends no `Describe`, so the result-schema guard never runs).
+        // Dropping the CLIENT-side sets is the airtight correctness fix (the next
+        // query of each is a fresh `Parse` — a MISS — resolving against the CURRENT
+        // user's schema and re-arming the typed result-schema guard), and it costs no
+        // wire. `RESET`/`DISCARD` run no `DEALLOCATE`, so the SERVER-side statements
+        // survive the reset SQL above; Close them explicitly for hygiene (a protocol
+        // `Close` of an already-dropped statement is a wire no-op).
         {
             let stmts = self.dyn_cache.drain();
-            if !stmts.is_empty() {
-                let names: Vec<&StmtName> = stmts.iter().map(|s| s.inner.stmt_name()).collect();
-                self.close_dyn_statements(&names).await?;
-                // `stmts` drop here: the WireStatement name buffers free, and the
+            if stmts.is_empty() {
+                // No dynamic Close batch this checkout (the flagship's common case: a
+                // pure-typed workload has an empty dynamic cache). Clear the TYPED
+                // client cache — the airtight correctness fix, ZERO-wire; its
+                // server-side statements are reclaimed lazily by the next typed query's
+                // MISS-path leading `Close` (a bounded, non-growing footprint —
+                // content-addressed names, at most one per distinct `query!`). No
+                // round trip is FORCED, so the flagship's zero-RTT checkout is
+                // preserved.
+                self.engine.clear_statement_cache();
+            } else {
+                // The dynamic `Close`+`Sync` is already paid this checkout — FOLD the
+                // TYPED cache's server-side statements into the SAME batch (zero extra
+                // round trip), draining the typed CLIENT cache in lockstep. Both name
+                // families share the raw-bytes `Close` form: dynamic `_bsql_<n>`
+                // `StmtName`s and typed `bsql_q_<hex>` `'static` names have DISJOINT
+                // prefixes, so a typed `Close` can never touch a dynamic/explicit
+                // statement.
+                let typed_names = self.engine.take_statement_cache();
+                let mut names: Vec<&[u8]> =
+                    Vec::with_capacity(stmts.len().saturating_add(typed_names.len()));
+                names.extend(stmts.iter().map(|s| s.inner.stmt_name().as_bytes()));
+                names.extend(typed_names.iter().map(|n| n.as_bytes()));
+                self.close_cached_statements(&names).await?;
+                // `stmts` / `typed_names` drop here: the name buffers free, and the
                 // server-side statements were already closed by the batch above.
             }
         }

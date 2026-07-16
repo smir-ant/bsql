@@ -1,0 +1,23 @@
+-- Dedicated permanent tables for the pooled TYPED prepared-statement
+-- cross-tenant leak regression (`tests/pooled_typed_shadow_live.rs`) — the typed
+-- twin of the dynamic `pooled_dynamic_plan_re_resolves_a_temp_shadow_across_users`.
+--
+-- One table PER DRIVER (`pts_async` / `pts_sync`) so the async + sync witnesses,
+-- which run in ONE test binary IN PARALLEL, never race on a shared permanent
+-- table. The catalog entry here makes the `query!` carrier compile; the LIVE
+-- table is provisioned by the test at runtime (a DROP+CREATE, exactly like the
+-- outer-join `oj_*` tables), since the migration set is not auto-applied to the
+-- test database.
+--
+-- Scenario: User 1 promotes `query::<Pts*>()` over the PERMANENT table to a kept
+-- server-side plan whose relation name is resolved to `public.pts_*` at `Parse`;
+-- User 2 (the SAME pooled connection, size-1 pool) shadows it with an
+-- IDENTICAL-column `CREATE TEMP TABLE` and MUST read the TEMP row. Because the
+-- reset drops the typed statement cache on checkout, User 2's query is a MISS
+-- that re-`Parse`s fresh and resolves to the temp — never the prior user's rows.
+-- (The identical columns keep the result type unchanged, so PostgreSQL's `0A000`
+-- never fires and, on the OLD kept-warm behaviour, a cache HIT sent no `Describe`
+-- so the result-schema guard never ran — this is exactly the same-type /
+-- different-data-source leak neither the guard nor `0A000` covers.)
+CREATE TABLE pts_async (val TEXT NOT NULL);
+CREATE TABLE pts_sync  (val TEXT NOT NULL);

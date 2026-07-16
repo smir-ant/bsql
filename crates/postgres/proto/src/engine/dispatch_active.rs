@@ -826,11 +826,28 @@ impl ActiveEngine {
     }
 
     /// Forget every recorded prepared-statement name — the hook a session reset
-    /// (`DISCARD ALL` / `DEALLOCATE ALL`) drives so the cache cannot outlive the
-    /// server-side statements it names.
+    /// drives so a prior logical user's promoted typed plan cannot be reused across
+    /// a pool checkout. CLEARING it is a CORRECTNESS requirement, not a hygiene
+    /// nicety: the next typed query is then a cache MISS whose leading `Close` +
+    /// fresh `Parse` re-resolves against the CURRENT user's schema (exactly as on a
+    /// fresh connection). Retains the backing `Vec`'s capacity for the connection's
+    /// next use.
     #[inline]
     pub fn clear_statement_cache(&mut self) {
         self.parsed_statements.clear();
+    }
+
+    /// DRAIN the recorded prepared-statement names, returning them and leaving the
+    /// cache EMPTY. The reset's combined cache-drop calls this WHEN the dynamic
+    /// drain already pays for a `Close` round trip: draining CLEARS the client-side
+    /// set (the same correctness guarantee as
+    /// [`clear_statement_cache`](Self::clear_statement_cache)) AND yields the names
+    /// so the caller can FOLD their server-side `Close`s into that already-paid
+    /// batch (zero extra round trip). The names are bare `'static` fat pointers, so
+    /// this moves the backing `Vec` out without copying any string.
+    #[inline]
+    pub fn take_statement_cache(&mut self) -> Vec<&'static str> {
+        core::mem::take(&mut self.parsed_statements)
     }
 
     /// Drop one recorded name from the cache.

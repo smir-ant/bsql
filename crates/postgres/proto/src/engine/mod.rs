@@ -395,20 +395,40 @@ impl<'b, T> Engine<'b, T> {
     /// Forget the per-connection prepared-statement cache (a no-op unless the
     /// engine is active).
     ///
-    /// The cache records which content-addressed statements
-    /// [`query_params`](Self::query_params) has Parsed and that are durable on
-    /// this physical connection, so a repeat reuses the server-side plan with a
-    /// bare `Bind`+`Execute`. Drive this in lockstep with any session reset that
-    /// drops the server's prepared statements (`DISCARD ALL` / `DEALLOCATE ALL`):
-    /// without it a later reuse would `Bind` to a statement the server no longer
-    /// holds. The drivers' connection pool does NOT issue such a reset on return,
-    /// so the cache persists with the physical connection across pool checkouts —
-    /// which is the cross-checkout server-side plan reuse — and this hook serves
-    /// callers that manage statements out of band.
+    /// The cache records which content-addressed statements the compile-checked
+    /// `query!` verbs have Parsed and that are durable on this physical connection,
+    /// so a repeat reuses the server-side plan with a bare `Bind`+`Execute`. Drive
+    /// this on every session reset: the drivers' pool resets on checkout, and
+    /// dropping BOTH statement caches (this typed one AND the dynamic one) is a
+    /// CORRECTNESS requirement — a prior user's promoted plan, whose relation names
+    /// were resolved at its `Parse`, must NOT be reused by the next logical user
+    /// (whose `CREATE TEMP TABLE` shadow of the same name would otherwise read the
+    /// prior user's rows through the kept plan — a silent cross-user wrong result).
+    /// The next typed query is then a fresh `Parse` (a MISS) resolving against the
+    /// current user's schema. Use [`take_statement_cache`](Self::take_statement_cache)
+    /// instead when the caller also wants the names, to Close their server-side
+    /// statements in the same batch.
     #[inline]
     pub fn clear_statement_cache(&mut self) {
         if let Phase::Active(active) = &mut self.phase {
             active.clear_statement_cache();
+        }
+    }
+
+    /// DRAIN the per-connection typed prepared-statement cache, CLEARING it and
+    /// returning the recorded names (an empty `Vec`, allocation-free, unless the
+    /// engine is active). The reset drives this WHEN the dynamic drain already pays
+    /// for a `Close` round trip: the clear forces the next typed query to re-`Parse`
+    /// fresh (the [`clear_statement_cache`](Self::clear_statement_cache) correctness
+    /// guarantee), and the returned names let the caller FOLD their server-side
+    /// `Close`s into that already-paid batch (see
+    /// [`close_statements_bytes`](Self::close_statements_bytes)), so the drop of
+    /// both caches costs ZERO extra round trips.
+    #[inline]
+    pub fn take_statement_cache(&mut self) -> alloc::vec::Vec<&'static str> {
+        match &mut self.phase {
+            Phase::Active(active) => active.take_statement_cache(),
+            _ => alloc::vec::Vec::new(),
         }
     }
 

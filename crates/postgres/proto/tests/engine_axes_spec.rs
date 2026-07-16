@@ -456,7 +456,11 @@ const ENGINE_ERROR_VARIANTS: usize = 15;
 /// window has no `Sync` to drain) and the shared `run_pipeline_break_impl`
 /// (`run_pipeline_break` + `run_pipeline_break_guarded` differ only in the
 /// `const BAIL_ON_GUARD_MISMATCH` they thread into the pump; both delegate here).
-const ACTIVE_VERBS: usize = 27;
+/// 28 adds `close_statements_bytes`, the byte-named core of `close_statements`
+/// (which now delegates to it): a `Close` frame names a statement by raw bytes, so
+/// the pool reset's COMBINED cache-drop folds the dynamic cache's `StmtName`s AND
+/// the typed cache's `'static` names into ONE batch through this one verb.
+const ACTIVE_VERBS: usize = 28;
 /// `core::hint::cold_path()` classified-branch markers across `engine/`.
 /// Reproduce: `grep -rho 'core::hint::cold_path()' crates/postgres/proto/src/engine/*.rs | wc -l`
 /// (52 includes the COPY-in `write_all` `WriteZero`/`SendOverrun` branches,
