@@ -109,7 +109,7 @@ fn consume_agg(qr: &QueryResult) -> Result<(), DriverError> {
 fn bench_fetch_one(conn: &mut Connection) -> Result<(), DriverError> {
     let id = 42_i32;
     let read = |c: &mut Connection| -> Result<(), DriverError> {
-        c.query_each::<ByPkQuery, _, ()>((black_box(id),), |rec| {
+        c.query_each::<ByPk, _, ()>((black_box(id),), |rec| {
             black_box(rec.id);
             black_box(rec.name);
             black_box(rec.email);
@@ -128,7 +128,7 @@ fn bench_fetch_one(conn: &mut Connection) -> Result<(), DriverError> {
 
 fn bench_fetch_many(conn: &mut Connection, limit: i64) -> Result<(), DriverError> {
     let read = |c: &mut Connection| -> Result<(), DriverError> {
-        c.query_each::<FetchManyQuery, _, ()>((black_box(limit),), |rec| {
+        c.query_each::<FetchMany, _, ()>((black_box(limit),), |rec| {
             black_box(rec.id);
             black_box(rec.name);
             black_box(rec.email);
@@ -182,7 +182,7 @@ fn bench_insert_single(conn: &mut Connection) -> Result<(), DriverError> {
     conn.close_statement(stmt)
 }
 
-/// INSERT RETURNING via the TYPED `query!` path (`query_one::<InsertReturningQuery>`)
+/// INSERT RETURNING via the TYPED `query!` path (`query_one::<InsertReturning>`)
 /// — the path the ORIGINAL bsql runner used, and the rebuild's fastest INSERT
 /// RETURNING shape. Binary params + binary result, the engine's own statement
 /// cache (HIT after warm-up = Bind+Execute+Sync, no re-parse), and a
@@ -193,11 +193,11 @@ fn bench_insert_single_typed(conn: &mut Connection) -> Result<(), DriverError> {
     let name = "bench_insert";
     let email = "bench@example.com";
     // Warm up: primes the engine's statement cache so the timed loop is all HIT.
-    let rec = conn.query_one::<InsertReturningQuery>((name, email))?;
+    let rec = conn.query_one::<InsertReturning>((name, email))?;
     black_box(rec.id);
     let start = Instant::now();
     for _ in 0..ITERS_DEFAULT {
-        let rec = conn.query_one::<InsertReturningQuery>((black_box(name), black_box(email)))?;
+        let rec = conn.query_one::<InsertReturning>((black_box(name), black_box(email)))?;
         black_box(rec.id);
     }
     report("pg_insert_single_typed", start.elapsed(), ITERS_DEFAULT);
