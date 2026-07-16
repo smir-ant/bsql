@@ -2,13 +2,15 @@
 //! and RECOVERS the connection every time — under SUSTAINED load, on BOTH drivers,
 //! up to the widest wire column count possible (`i16::MAX`).
 //!
-//! [`overcap_recovery`](super) already proves ONE over-cap result
-//! (`MAX_ROW_COLUMNS + 1` columns) is a classified, recoverable
-//! [`DriverError::TooManyColumns`]. This gate locks the audit-5 teardown fix
-//! under REPETITION: it drains a wide result in a tight loop and asserts the
-//! connection recovers on EVERY iteration — the property a happy-path test can
-//! never observe, and the direct regression net for a teardown that leaks or
-//! poisons the connection only after the Nth over-cap.
+//! This gate locks the audit-5 teardown fix under REPETITION: it drains a wide
+//! result in a tight loop and asserts the connection recovers on EVERY iteration
+//! — the property a happy-path test can never observe, and the direct regression
+//! net for a teardown that leaks or poisons the connection only after the Nth
+//! over-cap. It also SUBSUMES the former `overcap_recovery` test (now deleted as
+//! a strict subset): its tight-boundary case (`MAX_ROW_COLUMNS + 1` columns — the
+//! SMALLEST width that over-caps) is ported below as
+//! `minimal_overcap_at_cap_plus_one_recovers_{async,sync}`, so every width and
+//! assertion that test carried lives here.
 //!
 //! A conforming PostgreSQL errors at `1665` before producing a result, so the
 //! client-side over-cap path is only reachable from a NONCONFORMING peer — which
@@ -173,5 +175,66 @@ fn wide_overcap_at_i16_max_columns_recovers_sync() {
     let ok = conn
         .query_sql("SELECT 1")
         .expect("connection recovered after the widest-possible over-cap");
+    assert_eq!(ok.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
+}
+
+/// The TIGHT boundary — exactly `MAX_ROW_COLUMNS + 1` columns, the SMALLEST
+/// width that over-caps (one column past the driver's cap) — is a classified,
+/// recoverable `TooManyColumns` on ONE async connection. Ported verbatim from the
+/// deleted `overcap_recovery` test so its minimal-over-cap width is not lost; a
+/// single row is enough (the point is the boundary width, not row count). The row
+/// is itself wider than the ingest buffer, so its `DataRow` exercises the
+/// oversize-Skip drain path too.
+#[tokio::test]
+async fn minimal_overcap_at_cap_plus_one_recovers_async() {
+    let over = MAX_ROW_COLUMNS.saturating_add(1);
+    let mut fake = FakePostgres::new();
+    fake.on("SELECT wide").returns(wide_reply(over, 1));
+    fake.on("SELECT 1").returns(rows![[1_i64]]);
+
+    let mut conn = fake.connect().await.expect("connect");
+
+    let err = conn
+        .query_sql("SELECT wide")
+        .await
+        .expect_err("a cap+1-column result must be a classified error");
+    match err {
+        bsql_postgres_async::DriverError::TooManyColumns { count, max } => {
+            assert_over_cap(count, max, over);
+        }
+        other => panic!("expected TooManyColumns at cap+1 width, got {other:?}"),
+    }
+
+    let ok = conn
+        .query_sql("SELECT 1")
+        .await
+        .expect("connection recovered after the minimal over-cap");
+    assert_eq!(ok.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
+}
+
+/// The tight-boundary (`MAX_ROW_COLUMNS + 1`) case — sync twin of
+/// [`minimal_overcap_at_cap_plus_one_recovers_async`].
+#[test]
+fn minimal_overcap_at_cap_plus_one_recovers_sync() {
+    let over = MAX_ROW_COLUMNS.saturating_add(1);
+    let mut fake = FakePostgres::new();
+    fake.on("SELECT wide").returns(wide_reply(over, 1));
+    fake.on("SELECT 1").returns(rows![[1_i64]]);
+
+    let mut conn = fake.connect_sync().expect("connect");
+
+    let err = conn
+        .query_sql("SELECT wide")
+        .expect_err("a cap+1-column result must be a classified error");
+    match err {
+        bsql_postgres_sync::DriverError::TooManyColumns { count, max } => {
+            assert_over_cap(count, max, over);
+        }
+        other => panic!("expected TooManyColumns at cap+1 width, got {other:?}"),
+    }
+
+    let ok = conn
+        .query_sql("SELECT 1")
+        .expect("connection recovered after the minimal over-cap");
     assert_eq!(ok.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
 }

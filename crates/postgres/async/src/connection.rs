@@ -381,6 +381,17 @@ impl Connection {
         // mode wins). Thread it down so nothing below re-reads the raw config —
         // one resolution point, no drift.
         let ssl_mode = config.resolve_ssl_mode(&endpoint);
+        // Fail LOUD before dialing: TLS cannot be required over a socket that will
+        // never do it. A local kernel socket is trusted by filesystem permissions,
+        // not TLS, and PostgreSQL does not offer TLS there. The rule lives ONCE in
+        // `core::config` (`Endpoint::reject_unix_tls_required`), so async/sync
+        // cannot drift. Gated `#[cfg(unix)]` because on a non-unix target the more
+        // fundamental `UNIX_SOCKET_UNSUPPORTED` fault (below) takes precedence — a
+        // unix endpoint can never be dialed there at all. (A defaulted unix
+        // endpoint resolves to Prefer, so this fires only for an EXPLICIT
+        // `SslMode::Require`.)
+        #[cfg(unix)]
+        endpoint.reject_unix_tls_required(ssl_mode)?;
         match endpoint {
             Endpoint::Tcp(addr) => {
                 let tcp = TcpStream::connect(&addr).await?;
@@ -397,19 +408,9 @@ impl Connection {
             }
             #[cfg(unix)]
             Endpoint::Unix(path) => {
-                // Fail LOUD: TLS cannot be required over a socket that will never
-                // do it. A local kernel socket is trusted by filesystem
-                // permissions, not TLS, and PostgreSQL does not offer TLS there.
-                // (A defaulted unix endpoint resolves to Prefer, so this fires
-                // only for an EXPLICIT `SslMode::Require`.)
-                if ssl_mode == SslMode::Require {
-                    return Err(DriverError::Config(
-                        "SslMode::Require cannot be honored over a unix-domain socket \
-                         (TLS is not available on a local socket)",
-                    ));
-                }
-                // `Prefer` over unix is plaintext with no probe and no downgrade
-                // warning — nothing was downgraded; TLS was never applicable.
+                // A required TLS was already rejected above. `Prefer` over unix is
+                // plaintext with no probe and no downgrade warning — nothing was
+                // downgraded; TLS was never applicable.
                 let unix = UnixStream::connect(&path).await?;
                 Ok(Wire::Plain(TokioSocket::new(
                     Sock::Unix(unix),

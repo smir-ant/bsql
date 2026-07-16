@@ -829,51 +829,62 @@ pub(crate) const EXECUTE_EMPTY_PORTAL_NO_LIMIT: [u8; 10] = [
     0, 0, 0, 0, // max_rows = 0
 ];
 
-// Compile-time pins for the static byte arrays.
-const _: () = assert!(BIND_RESULT_FORMATS_ALL_BINARY.len() == 4);
-const _: () = assert!(EXECUTE_EMPTY_PORTAL_NO_LIMIT.len() == 10);
-const _: () = assert!(EXECUTE_EMPTY_PORTAL_NO_LIMIT[0] == b'E');
-const _: () = assert!(EXECUTE_EMPTY_PORTAL_NO_LIMIT[4] == 9); // length field
+// Compile-time pins for the static byte arrays — the FULL content, an
+// `E0080` build failure on any drift. Strictly stronger than (and the
+// single home for) the former runtime `static_trailer_bytes_layout`
+// test: a runtime test only fails when RUN, this fails the BUILD.
+const _: () = assert!(matches!(BIND_RESULT_FORMATS_ALL_BINARY, [0, 1, 0, 1]));
+const _: () = assert!(matches!(
+    EXECUTE_EMPTY_PORTAL_NO_LIMIT,
+    [b'E', 0, 0, 0, 9, 0, 0, 0, 0, 0]
+));
+
+// ═════════════════════════════════════════════════════════════════════
+// Compile-time RowDecode tuple-shape pins.
+//
+// These pin the ARITY + per-column OIDS the macro-generated tuple impls
+// resolve to. A drifted tuple impl (wrong arity, a re-ordered/retyped
+// OID, or a missing impl at an arity — which is an `E0277` here) fails
+// the BUILD, an `E0080`/`E0277` strictly stronger than a runtime shape
+// test that only fails when RUN. These REPLACE the former runtime
+// `row_decode_unit_tuple` / `row_decode_singleton_tuple` /
+// `row_decode_pair_tuple` / `row_decode_max_arity_16` tests. The runtime
+// `decode` BEHAVIOUR (bytes → values, NULL classification) is exercised
+// by the `#[cfg(test)]` module below — only the pure static shape lives
+// here.
+// ═════════════════════════════════════════════════════════════════════
+const _: () = {
+    use crate::decode::oids;
+    type Sixteen = (
+        i32, i32, i32, i32, i32, i32, i32, i32, //
+        i32, i32, i32, i32, i32, i32, i32, i32,
+    );
+    // `()` — arity 0, empty OIDS.
+    assert!(<() as RowDecode>::ARITY == 0);
+    assert!(matches!(<() as RowDecode>::OIDS, []));
+    // Singleton — arity 1, one INT4 OID.
+    assert!(<(i32,) as RowDecode>::ARITY == 1);
+    assert!(matches!(<(i32,) as RowDecode>::OIDS, [oids::INT4]));
+    // Pair — arity 2, per-element OIDs in declared order.
+    assert!(<(i32, &'static str) as RowDecode>::ARITY == 2);
+    assert!(matches!(
+        <(i32, &'static str) as RowDecode>::OIDS,
+        [oids::INT4, oids::TEXT]
+    ));
+    // 16-tuple resolves (the impl EXISTS — else `E0277` here) with
+    // arity 16 and 16 OIDs.
+    assert!(<Sixteen as RowDecode>::ARITY == 16);
+    assert!(<Sixteen as RowDecode>::OIDS.len() == 16);
+};
 
 #[cfg(test)]
 mod tests {
-    //! Spec tests pinning the static byte literals + tuple impl
-    //! shape.
+    //! Runtime `decode` behaviour tests (bytes → values, NULL
+    //! classification). The pure static-shape asserts — tuple ARITY /
+    //! OIDS and the static byte-trailer content — live as `const _: ()`
+    //! compile-time pins above (`E0080`/`E0277` on drift), strictly
+    //! stronger than a runtime shape test.
     use super::*;
-    use crate::decode::oids;
-
-    /// `()` tuple has ARITY 0 and empty OIDS slice.
-    #[test]
-    fn row_decode_unit_tuple() {
-        assert_eq!(<() as RowDecode>::ARITY, 0);
-        assert_eq!(<() as RowDecode>::OIDS.len(), 0);
-    }
-
-    /// Single-column tuple has ARITY 1 and one OID.
-    #[test]
-    fn row_decode_singleton_tuple() {
-        assert_eq!(<(i32,) as RowDecode>::ARITY, 1);
-        assert_eq!(<(i32,) as RowDecode>::OIDS, &[oids::INT4]);
-    }
-
-    /// Two-column tuple matches per-element OIDs.
-    #[test]
-    fn row_decode_pair_tuple() {
-        assert_eq!(<(i32, &'static str) as RowDecode>::ARITY, 2);
-        assert_eq!(
-            <(i32, &'static str) as RowDecode>::OIDS,
-            &[oids::INT4, oids::TEXT],
-        );
-    }
-
-    /// 16-tuple resolves without macro errors.
-    #[test]
-    fn row_decode_max_arity_16() {
-        type Sixteen = (i32, i32, i32, i32, i32, i32, i32, i32,
-                        i32, i32, i32, i32, i32, i32, i32, i32);
-        assert_eq!(<Sixteen as RowDecode>::ARITY, 16);
-        assert_eq!(<Sixteen as RowDecode>::OIDS.len(), 16);
-    }
 
     /// Decode forwards to per-element `Cell<BinaryFmt>`. The
     /// GAT projection substitutes the input lifetime for `&'static str`.
@@ -895,15 +906,5 @@ mod tests {
         let formats: [FormatCode; 1] = [FormatCode::Binary];
         let result = <(i32,) as RowDecode>::decode(&bytes, &formats);
         assert!(matches!(result, Err(DecodeError::NullInNonNullColumn)));
-    }
-
-    /// Static byte trailers match expected layout.
-    #[test]
-    fn static_trailer_bytes_layout() {
-        assert_eq!(&BIND_RESULT_FORMATS_ALL_BINARY, &[0, 1, 0, 1]);
-        assert_eq!(
-            &EXECUTE_EMPTY_PORTAL_NO_LIMIT,
-            &[b'E', 0, 0, 0, 9, 0, 0, 0, 0, 0]
-        );
     }
 }

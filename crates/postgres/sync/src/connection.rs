@@ -527,20 +527,17 @@ impl Connection {
         // mode wins). Thread it down so nothing below re-reads the raw config —
         // one resolution point, no drift between the two drivers.
         let ssl_mode = config.resolve_ssl_mode(&endpoint);
-        // Fail LOUD: TLS cannot be required over a socket that will never do it.
-        // Rejected before the connect syscall — a wasted dial would tell us
-        // nothing, and this is a pre-connect configuration fault. (A defaulted
-        // unix endpoint resolves to Prefer, so this fires only for an EXPLICIT
-        // `SslMode::Require`.) Unix-only: on a non-unix target a unix endpoint can
-        // never be dialed at all, so the platform rejection below subsumes this
-        // (and takes precedence — the more fundamental fault wins).
+        // Fail LOUD before the connect syscall: TLS cannot be required over a
+        // socket that will never do it — a wasted dial would tell us nothing, and
+        // this is a pre-connect configuration fault. The rule lives ONCE in
+        // `core::config` (`Endpoint::reject_unix_tls_required`), so async/sync
+        // cannot drift. (A defaulted unix endpoint resolves to Prefer, so this
+        // fires only for an EXPLICIT `SslMode::Require`.) Gated `#[cfg(unix)]`
+        // because on a non-unix target a unix endpoint can never be dialed at all,
+        // so the platform rejection below subsumes this (and takes precedence —
+        // the more fundamental fault wins).
         #[cfg(unix)]
-        if endpoint.is_unix() && ssl_mode == SslMode::Require {
-            return Err(DriverError::Config(
-                "SslMode::Require cannot be honored over a unix-domain socket \
-                 (TLS is not available on a local socket)",
-            ));
-        }
+        endpoint.reject_unix_tls_required(ssl_mode)?;
         let sock = match endpoint {
             Endpoint::Tcp(addr) => {
                 // Bound the TCP connect (the SYN) by the connect-timeout budget so

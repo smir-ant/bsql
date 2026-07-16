@@ -267,27 +267,12 @@ fn slow_query_emits_with_the_threshold_set() {
     drop(c); // cleanup only; the witness assertions ran above
 }
 
-/// FAIL LOUD: `SslMode::Require` over a unix-domain socket is a classified
-/// `DriverError::Config` — never a silent plaintext downgrade (TLS is not
-/// available on a local socket, so an unsatisfiable requirement is rejected up
-/// front). Needs NO live PG: the rejection precedes the connect syscall.
-#[test]
-fn unix_socket_ssl_require_is_a_loud_config_error() {
-    let cfg = ConnectConfig::new("/var/run/postgresql", "u")
-        .ssl_mode(bsql_postgres_sync::SslMode::Require);
-    match Connection::connect(&cfg) {
-        Err(bsql_postgres_sync::DriverError::Config(msg)) => {
-            assert!(
-                msg.contains("unix-domain socket"),
-                "the error must name the unix-socket cause, got {msg:?}"
-            );
-        }
-        // `Connection` is not `Debug`, so the `Ok` arm cannot print it — the
-        // failure message is explicit instead.
-        Ok(_) => panic!("Require over a unix socket must fail, but a connection opened"),
-        Err(other) => panic!("Require over a unix socket must be a Config error, got {other:?}"),
-    }
-}
+// The `SslMode::Require`-over-unix rejection is now a single shared
+// `core::config` helper (`Endpoint::reject_unix_tls_required`) that BOTH drivers
+// call from their `#[cfg(unix)]` dial path, so async/sync parity is structural.
+// Its former per-driver live twin here (and the async twin) is replaced by ONE
+// offline unit test on the helper — `bsql-postgres-core`'s
+// `reject_unix_tls_required_is_a_loud_config_error_only_for_unix_plus_require`.
 
 /// WITNESS (query cancellation, blocking driver): start a long
 /// `SELECT pg_sleep(5)`, then from ANOTHER thread send an out-of-band cancel via

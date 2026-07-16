@@ -988,6 +988,19 @@ pub enum Endpoint {
 pub const UNIX_SOCKET_UNSUPPORTED: &str =
     "unix-domain sockets are not available on this platform; use a TCP host (host:port)";
 
+/// The classified `DriverError::Config` message for a unix-domain-socket host
+/// requested with [`SslMode::Require`].
+///
+/// A local kernel socket is trusted by filesystem permissions, not TLS, and
+/// PostgreSQL does not offer TLS there — so a required-TLS unix connection can
+/// never be honored. Both drivers reject it with this message via
+/// [`Endpoint::reject_unix_tls_required`]; defined once so they cannot drift in
+/// what they report (the `SslMode::Require`-over-unix peer of
+/// [`UNIX_SOCKET_UNSUPPORTED`]).
+pub const UNIX_SOCKET_TLS_REQUIRED: &str =
+    "SslMode::Require cannot be honored over a unix-domain socket \
+     (TLS is not available on a local socket)";
+
 impl Endpoint {
     /// Whether this endpoint is a unix-domain socket.
     ///
@@ -998,6 +1011,34 @@ impl Endpoint {
     #[inline]
     pub fn is_unix(&self) -> bool {
         matches!(self, Endpoint::Unix(_))
+    }
+
+    /// Reject the fail-loud unix-domain-socket + [`SslMode::Require`] combination.
+    ///
+    /// A local kernel socket never negotiates TLS, so a required-TLS unix
+    /// connection is a pre-connect configuration fault — a classified
+    /// [`DriverError::Config`](crate::DriverError::Config) carrying
+    /// [`UNIX_SOCKET_TLS_REQUIRED`], never a silent plaintext downgrade. Both
+    /// drivers call this from their unix-capable dial path, so the rule lives ONCE
+    /// and async/sync parity is a compiler fact — exactly as [`resolve_endpoint`]
+    /// centralizes the unix-vs-TCP rule and
+    /// [`resolve_ssl_mode`](ConnectConfig::resolve_ssl_mode) the SSL-mode rule.
+    ///
+    /// On a non-unix target the more fundamental [`UNIX_SOCKET_UNSUPPORTED`] fault
+    /// takes precedence (a unix endpoint can never be dialed there at all), so the
+    /// drivers gate their call behind `#[cfg(unix)]`.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::Config`](crate::DriverError::Config)`(`[`UNIX_SOCKET_TLS_REQUIRED`]`)`
+    /// when `self` is a unix socket and `ssl_mode` is [`SslMode::Require`];
+    /// `Ok(())` otherwise (a TCP endpoint, or any non-`Require` mode).
+    #[inline]
+    pub fn reject_unix_tls_required(&self, ssl_mode: SslMode) -> Result<(), crate::DriverError> {
+        if self.is_unix() && ssl_mode == SslMode::Require {
+            return Err(crate::DriverError::Config(UNIX_SOCKET_TLS_REQUIRED));
+        }
+        Ok(())
     }
 }
 
@@ -1915,6 +1956,37 @@ mod tests {
             Endpoint::Unix(std::path::PathBuf::from("/var/run/postgresql/.s.PGSQL.5432")),
         );
         assert!(resolve_endpoint("/", 5432).is_unix());
+    }
+
+    /// The shared unix + `SslMode::Require` rejection both drivers call (from
+    /// their `#[cfg(unix)]` dial path). This is the SINGLE source of the
+    /// async/sync parity that two hand-duplicated per-driver checks + two live
+    /// twin tests formerly pinned — a driver forgetting to reject is now
+    /// impossible via divergence because both call THIS one helper.
+    #[test]
+    fn reject_unix_tls_required_is_a_loud_config_error_only_for_unix_plus_require() {
+        let unix = resolve_endpoint("/var/run/postgresql", 5432);
+        assert!(unix.is_unix());
+        // Unix + Require → the classified Config error naming the unix cause,
+        // carrying the shared `UNIX_SOCKET_TLS_REQUIRED` message.
+        match unix.reject_unix_tls_required(SslMode::Require) {
+            Err(crate::DriverError::Config(msg)) => {
+                assert_eq!(msg, UNIX_SOCKET_TLS_REQUIRED);
+                assert!(
+                    msg.contains("unix-domain socket"),
+                    "the error must name the unix-socket cause, got {msg:?}"
+                );
+            }
+            other => panic!("unix + Require must be a Config error, got {other:?}"),
+        }
+        // Unix + a non-Require mode is fine (Prefer = plaintext, no downgrade;
+        // Disable = explicit plaintext).
+        assert!(unix.reject_unix_tls_required(SslMode::Prefer).is_ok());
+        assert!(unix.reject_unix_tls_required(SslMode::Disable).is_ok());
+        // A TCP endpoint accepts Require (TLS is available there).
+        let tcp = resolve_endpoint("db.example.com", 5432);
+        assert!(!tcp.is_unix());
+        assert!(tcp.reject_unix_tls_required(SslMode::Require).is_ok());
     }
 
     /// Resolve a parsed DSN's `host`/`port` the way a driver does at connect —

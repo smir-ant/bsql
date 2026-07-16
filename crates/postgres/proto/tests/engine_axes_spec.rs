@@ -113,24 +113,27 @@ const fn r(axis: u8, axis_name: &'static str, subpoint: &'static str, ev: Ev) ->
 }
 
 // Repo-relative evidence-file paths (kept as consts to make the table readable).
-const HOSTILE: &str = "crates/postgres/proto/tests/engine_hostile_spec.rs";
-const PUMP: &str = "crates/postgres/proto/tests/engine_pump_spec.rs";
-const ACTIVE: &str = "crates/postgres/proto/tests/engine_active_spec.rs";
+// Files under `tests/offline_specs/` are grouped into the single
+// `engine_offline_specs` umbrella binary (link-cost consolidation); their axis
+// coverage is unchanged — only the on-disk path moved one directory deeper.
+const HOSTILE: &str = "crates/postgres/proto/tests/offline_specs/engine_hostile_spec.rs";
+const PUMP: &str = "crates/postgres/proto/tests/offline_specs/engine_pump_spec.rs";
+const ACTIVE: &str = "crates/postgres/proto/tests/offline_specs/engine_active_spec.rs";
 const VERBS: &str = "crates/postgres/proto/tests/engine_verbs_spec.rs";
 const CONNECT: &str = "crates/postgres/proto/tests/engine_connect_spec.rs";
-const TERMINATE: &str = "crates/postgres/proto/tests/engine_terminate_spec.rs";
+const TERMINATE: &str = "crates/postgres/proto/tests/offline_specs/engine_terminate_spec.rs";
 const CONNECTING: &str = "crates/postgres/proto/tests/engine_connecting_spec.rs";
-const FLUSH_CANCEL: &str = "crates/postgres/proto/tests/engine_flush_cancel.rs";
+const FLUSH_CANCEL: &str = "crates/postgres/proto/tests/offline_specs/engine_flush_cancel.rs";
 const FLUSH_ALLOC: &str = "crates/postgres/proto/tests/engine_flush_alloc.rs";
 const INGEST_ALLOC: &str = "crates/postgres/proto/tests/engine_ingest_alloc.rs";
 const MEMSET_GUARD: &str = "crates/postgres/proto/tests/engine_ingest_memset_guard.rs";
-const PENDING_SENTINEL: &str = "crates/postgres/proto/tests/engine_pump_pending_sentinel.rs";
+const PENDING_SENTINEL: &str = "crates/postgres/proto/tests/offline_specs/engine_pump_pending_sentinel.rs";
 const LINEARITY_CF: &str = "crates/postgres/proto/tests/engine_linearity_compile_fail.rs";
 const INGEST_CF: &str = "crates/postgres/proto/tests/engine_ingest_compile_fail.rs";
 const ACTIVE_CF: &str = "crates/postgres/proto/tests/engine_active_compile_fail.rs";
 const VERBS_CF: &str = "crates/postgres/proto/tests/engine_verbs_compile_fail.rs";
 const FOOTPRINT_CF: &str = "crates/postgres/proto/tests/footprint_drift_compile_fail.rs";
-const FRAME: &str = "crates/postgres/proto/tests/frame_parse.rs";
+const FRAME: &str = "crates/postgres/proto/tests/offline_specs/frame_parse.rs";
 const ZEROIZE: &str = "crates/postgres/proto/tests/zeroize_coverage_spec.rs";
 const MIRI: &str = "crates/postgres/proto/tests/scram_zeroize_miri_spec.rs";
 // In-crate `#[cfg(test)]` modules (proven by the same `cargo test`).

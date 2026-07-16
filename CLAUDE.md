@@ -1721,8 +1721,12 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   transient plaintext/ciphertext vecs each bounded near one 16 KiB TLS record. So
   a TLS connection costs on the order of ~64 KiB of driver-owned buffers vs ~4 KiB
   plaintext — a 100-connection TLS pool ≈ ~6 MiB. Dropping `tls` removes it
-  entirely. (The plaintext 4 KiB is pinned by `footprint_baseline`'s
-  `per_connection_resident_estimate`.)
+  entirely. (The plaintext 4 KiB is pinned at compile time by the
+  `READ_BUF_CAP == 4096` `const _: ()` assert in `bsql-postgres-proto`'s
+  `frame.rs` — an `E0080` on drift, strictly stronger than the former
+  `footprint_baseline` runtime ledger, whose type-footprint + read-buffer
+  assertions were fully subsumed by the co-located `footprint_pin!` and
+  `READ_BUF_CAP` compile pins and deleted.)
 - The whole SCRAM-SHA-256 authentication capability is behind the default-on
   `scram` feature (proto → core → drivers → umbrella; proto keeps
   `default = ["scram"]` so the standard `cargo test` runs keep the full SCRAM
