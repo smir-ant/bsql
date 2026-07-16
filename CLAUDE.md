@@ -34,7 +34,49 @@ Load-bearing decisions for any new session:
   source of truth is the committed migration set, and any change to it (add,
   edit, delete, rename — at any directory depth) recompiles and re-validates. A
   DDL form the replay cannot model faithfully is a loud build error, never a
-  silently-wrong catalog.
+  silently-wrong catalog. **SQL VIEWS are compile-checked relations too** — a
+  capability no mainstream Rust SQL library has, because only bsql parses the
+  migration set at build time. On a `CREATE [OR REPLACE] [MATERIALIZED] VIEW`,
+  `bsql-build` INFERS the view's SELECT body against the catalog built so far
+  (replay is ORDERED, so the view's dependencies — including another view, so
+  view-over-view works — are already present) through the SAME public
+  `infer_query` pipeline a top-level `query!` runs, and registers the view in the
+  catalog's `tables` like any relation (marked in a parallel `views` set). So a
+  `query!` SELECTing from a view resolves its columns — and their NULLABILITY (a
+  `LEFT JOIN` column is `Option`, a `COALESCE(x,'default')` is non-null, a `MAX`
+  over a possibly-empty group is nullable) — through the SAME path a base table
+  uses, with NO new consumer API (`query!(Q, "SELECT … FROM my_view")` just
+  starts working). The nullability is the inference engine's own, so it is exactly
+  as good as (and no worse than) any `query!`. `DROP VIEW` / `DROP MATERIALIZED
+  VIEW` unregister; a `CREATE OR REPLACE VIEW` re-infers and REPLACES, so a column
+  it drops stops resolving (the drift guarantee, same as a table's). **Two honest
+  caveats.** (1) SKIP-ON-FAILURE: a view whose body the engine cannot type — a
+  `SELECT *` (deliberately un-typed: name the columns), an unsupported column
+  type, an uninferable expression (a bare `sum()` needs a `::cast`), a
+  TEMPORARY/`TO`-target view, or a name colliding with a base table — is left
+  UNMODELED (absent from `tables` AND `views`), so a `query!` against it is a loud
+  unknown-relation error exactly as before views were modeled, never a
+  silently-wrong catalog; crucially this NEVER breaks the build (unlike `CREATE
+  TABLE ... AS SELECT`, which IS a loud error because a later statement references
+  the un-modeled table — a view is a LEAF, nothing `ALTER`s its columns, so
+  skipping it is inert). A bare `ALTER VIEW … RENAME COLUMN` is NOT re-inferred
+  (change a view's shape via `CREATE OR REPLACE VIEW`); it fails SAFE (the catalog
+  keeps the last inferred shape). (2) WRITE-REJECTION: a view is generally not
+  writable, so a `query!` INSERT/UPDATE/DELETE targeting one is a loud
+  `InferError::WriteToView` compile error ("target the base table") — bsql cannot
+  reliably tell PostgreSQL's auto-updatable simple views apart, so it rejects ALL
+  view writes, closing what would otherwise be a build-passes / run-fails gap.
+  The serialized catalog carries a per-column `is_view` field (the format grew from
+  five tab-separated fields to six); `bsql-build`'s own tests are the format
+  golden. Witnessed by `bsql-build`'s view unit tests (registration, LEFT-JOIN /
+  COALESCE / aggregate nullability, skip-on-failure buildability, write-rejection,
+  view-over-view, DROP/REPLACE, materialized, enum/array/user-type round-trip,
+  serialize round-trip), the `tools/query_fixture` `0022_views.sql` migration + its
+  `ViewSummary`/`ViewProfile`/`ViewIds`/`ViewMat` build-time carriers, the
+  `query_write_to_view` / `query_view_dropped_column` trybuild goldens, and the
+  `--ignored` `view_live_{async,sync}` live round-trips (both drivers, TEMP-shadowed
+  for parallel safety: a projection view decodes, a LEFT JOIN column decodes
+  `Some`/`None`, a view-over-view decodes).
 - **Toolchain pinned** to rustc 1.96.0 (`rust-toolchain.toml`); trybuild/clippy
   goldens capture diagnostics verbatim, so the patch version is fixed.
 - **Converge, don't drift.** A prescriptive doc that contradicts the current
@@ -93,6 +135,8 @@ cargo test -p bsql-sqlite --test cancel              # SQLite interrupt witness 
 cargo test -p bsql-query-sqlite-fixture --features n1-detect --test n1_detect_sqlite  # SQLite N+1 witness (in-process)
 cargo test -p bsql-query-fixture --test query_live_async -- --ignored  # live query! (async, needs PG)
 cargo test -p bsql-query-fixture --test query_live_sync  -- --ignored  # live query! (sync, needs PG)
+cargo test -p bsql-query-fixture --test view_live_async -- --ignored  # live query!-against-a-VIEW (async): a projection view decodes, a LEFT JOIN view column decodes Some/None (nullability fidelity), a view-over-view decodes. TEMP-shadows the 0022_views.sql relations, so parallel-safe
+cargo test -p bsql-query-fixture --test view_live_sync  -- --ignored  # live query!-against-a-VIEW (sync twin)
 cargo test -p bsql-query-fixture --test query_oid_guard_live -- --ignored  # live typed RESULT-schema OID guard (both drivers): a TEMP shadow of a DIFFERENT type is a classified ColumnOidMismatch on every typed verb (never a silent "AAAA"); a matching-typed shadow + varchar/bpchar columns decode correctly (no false positive). Per-connection TEMP shadows over the 0020_oidguard.sql table, so parallel-safe (run WITHOUT --test-threads=1)
 cargo test -p bsql-query-fixture --test pipeline_oid_guard_live -- --ignored  # live PER-COMMAND result-schema OID guard on the PIPELINE (both drivers): a drifted pipeline command is a classified DriverError::BatchColumnOidMismatch naming the command (batch_failed_index()), never a silent value, connection recovers; a matching shadow + varchar/bpchar + a user-type (domain) column decode correctly (no false positive). Per-connection TEMP shadows / per-test schema, so parallel-safe (run WITHOUT --test-threads=1)
 cargo test -p bsql-sqlite --test migrate                # migration runner (in-process, no PG)

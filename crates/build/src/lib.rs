@@ -258,6 +258,29 @@ pub struct Catalog {
     /// resolve a column typed as one. `BTreeMap` keeps the serialized form
     /// byte-deterministic.
     pub user_types: BTreeMap<String, UserType>,
+    /// The subset of `tables` keys that are SQL VIEWS (a `CREATE VIEW` /
+    /// `CREATE MATERIALIZED VIEW`), not base tables. A view is registered in
+    /// `tables` like any relation — so a `query!` SELECTing from it resolves its
+    /// columns through the SAME path a base table uses, with NO new resolver
+    /// branch — and its NAME is additionally recorded here so the two places
+    /// that MUST tell a view from a table can:
+    ///
+    /// * the DML write-validator (`resolve_target_table` and the DELETE / UPDATE
+    ///   ONLY target paths) — a `query!` INSERT/UPDATE/DELETE targeting a view is
+    ///   a loud [`infer::InferError::WriteToView`], because a view is generally
+    ///   not writable and PostgreSQL would reject the write at RUN time (a
+    ///   build-passes / run-fails gap the compile-time guarantee exists to
+    ///   close); bsql cannot reliably tell PostgreSQL's auto-updatable simple
+    ///   views apart, so it rejects ALL view writes — "target the base table";
+    /// * serialization — a view column carries a `1` in the trailing `is_view`
+    ///   field so [`parse_catalog`] reconstructs this set.
+    ///
+    /// A view whose SELECT body the inference engine cannot type is NOT
+    /// registered at all (skip-on-failure): it is absent from BOTH `tables` and
+    /// this set, so a `query!` against it is a loud unknown-relation error
+    /// exactly as before views were modeled — never a silently-wrong catalog.
+    /// `BTreeSet` keeps the serialized form byte-deterministic.
+    pub views: BTreeSet<String>,
 }
 
 /// A build-time failure. Every variant is fatal: the consumer's
@@ -2173,6 +2196,19 @@ fn replay_statement(
 ) -> Result<(), BuildError> {
     match statement {
         Statement::CreateTable(create) => replay_create_table(catalog, tracker, path, create),
+        // `CREATE [OR REPLACE] [MATERIALIZED] VIEW name [(cols)] AS <select>` —
+        // model the view as a relation by INFERRING its SELECT body against the
+        // catalog built so far (replay is ordered, so the view's dependencies are
+        // already present). A view whose body infers cleanly is registered in
+        // `tables` (so a `query!` SELECTing from it resolves like any relation) and
+        // marked in `views` (so a `query!` WRITE through it is loud). A body the
+        // engine cannot type is SKIPPED — left unmodeled, so a `query!` against it
+        // is a loud unknown-relation error, never a silently-wrong catalog. Unlike
+        // `CREATE TABLE ... AS SELECT` (which is a loud error because a later
+        // `ALTER`/`INSERT` referencing the un-modeled table would spuriously fail),
+        // a view is a LEAF — nothing `ALTER`s its columns — so skipping it can
+        // never break a later migration.
+        Statement::CreateView(create) => replay_create_view(catalog, create),
         Statement::AlterTable(alter) => {
             let table = replay_relation_key(&alter.name, path)?;
             for op in alter.operations {
@@ -2192,9 +2228,37 @@ fn replay_statement(
                 // it is removed alongside the columns; leaving it would let a
                 // later same-named table inherit a stale key.
                 catalog.primary_keys.remove(&table);
+                // A `DROP TABLE` of a name that was actually a VIEW is a broken
+                // migration PostgreSQL rejects, but clearing the view marker here
+                // keeps the catalog self-consistent (a later same-named relation
+                // starts clean) rather than leaving a stale `views` entry.
+                catalog.views.remove(&table);
                 // The dropped table's tracked constraints go with it, so a later
                 // same-named table starts with a clean constraint registry.
                 tracker.forget_table(&table);
+            }
+            Ok(())
+        }
+        // `DROP VIEW` / `DROP MATERIALIZED VIEW` removes a modeled view relation
+        // (columns + its `views` marker), exactly as `DROP TABLE` removes a table,
+        // so a later same-named `CREATE VIEW`/`CREATE TABLE` does not inherit a
+        // stale entry and a `query!` referencing the dropped view resolves as a
+        // loud unknown relation. A name the catalog never modeled (a view whose
+        // body was skipped, or a plain view we never registered) is a faithful
+        // no-op. A view schema-qualifier the single-namespace catalog cannot model
+        // is a loud `Replay` error, symmetric with `DROP TABLE`. Neither drop is
+        // destructive (a view is virtual / a materialized view is derived), so the
+        // destructive-ack gate does not flag them.
+        Statement::Drop {
+            object_type: ObjectType::View | ObjectType::MaterializedView,
+            names,
+            ..
+        } => {
+            for name in names {
+                let view = replay_relation_key(&name, path)?;
+                catalog.tables.remove(&view);
+                catalog.primary_keys.remove(&view);
+                catalog.views.remove(&view);
             }
             Ok(())
         }
@@ -2389,12 +2453,140 @@ fn replay_statement(
             Ok(())
         }
         // Statements without base-table column-shape meaning (CREATE
-        // INDEX, seed INSERTs, CREATE/ALTER VIEW, COMMENT, GRANT, CREATE
-        // SCHEMA/SEQUENCE, SET, etc.) carry no change to a tracked
-        // table's columns, so passing them through is correct — not a
-        // silent skip of schema information this catalog models.
+        // INDEX, seed INSERTs, `ALTER VIEW`, COMMENT, GRANT, CREATE
+        // SCHEMA/SEQUENCE, SET, etc.) carry no change to a tracked table's
+        // columns, so passing them through is correct — not a silent skip of
+        // schema information this catalog models. (`CREATE VIEW` IS modeled
+        // above. A bare `ALTER VIEW … RENAME COLUMN` is NOT re-inferred — a
+        // view's column shape is changed via `CREATE OR REPLACE VIEW`, which
+        // is; this is a documented limitation, and it fails SAFE: the catalog
+        // keeps the last inferred shape. `REFRESH MATERIALIZED VIEW` recomputes
+        // ROWS not shape, but the pinned `sqlparser` does not parse it, so it
+        // must not appear in a migration file — a pre-existing parser limit,
+        // independent of view modeling.)
         _ => Ok(()),
     }
+}
+
+/// Replay a `CREATE [OR REPLACE] [MATERIALIZED] VIEW name [(cols)] AS <select>`
+/// by INFERRING the SELECT body's column shape against the catalog built so far
+/// and registering the view as a relation.
+///
+/// # Skip-on-failure is the safety contract
+///
+/// Every early `return Ok(())` below leaves the view UNMODELED — absent from
+/// both `tables` and `views` — so a later `query!` against it is a loud
+/// unknown-relation error, exactly as before views were modeled, NEVER a
+/// silently-wrong catalog. A `CREATE VIEW` therefore never fails the build from
+/// inference; it either models the view faithfully or leaves it absent. This is
+/// SOUND precisely because a view is a LEAF: nothing `ALTER`s a view's columns,
+/// so an unmodeled view can never make a later migration spuriously fail (the
+/// reason `CREATE TABLE ... AS SELECT` must instead be a loud error — a later
+/// statement references the table it would have created).
+///
+/// # Faithfulness
+///
+/// The body is inferred through the WHOLE public [`infer_query`] entry point —
+/// the same pipeline a top-level `query!` runs (placeholder scan, bare-alias
+/// scan, projection typing, nullability composition). So the view's inferred
+/// column shape is precisely the shape a `query!` selecting those columns is
+/// equivalent to, and its NULLABILITY (a `LEFT JOIN` column, a `COALESCE`, an
+/// aggregate) is the engine's, not a re-derivation. A drift guarantee comes for
+/// free: a base column a later migration renames / drops / retypes re-infers the
+/// view (via `CREATE OR REPLACE VIEW`) or leaves the old name resolving to a now
+/// non-existent column — code naming the changed shape stops compiling.
+fn replay_create_view(
+    catalog: &mut Catalog,
+    create: sqlparser::ast::CreateView,
+) -> Result<(), BuildError> {
+    // A TEMPORARY view is session-scoped and a ClickHouse `TO <table>` view
+    // writes into another relation — neither persists as a stable queryable
+    // relation the live DB exposes to a `query!`, so modeling it would create a
+    // build-vs-runtime gap. Leave unmodeled.
+    if create.temporary || create.to.is_some() {
+        return Ok(());
+    }
+    // Resolve the view NAME with the SAME public-or-bare rule the query-side
+    // relation resolver uses (`public.v` and bare `v` both key to `v`); any
+    // other schema names a namespace this single-namespace catalog cannot model,
+    // so the view is left unmodeled (a bare `query!` reference could not reach it
+    // anyway).
+    let Some(key) = infer::relation_catalog_key(&create.name) else {
+        return Ok(());
+    };
+    // A name already registered as a base TABLE (not a view) is a collision a
+    // real `CREATE VIEW` would reject ("relation already exists"). Do not model a
+    // view over a table — leave the table intact and the view unmodeled. A
+    // re-`CREATE`/`CREATE OR REPLACE` over an existing VIEW is allowed to replace
+    // it below.
+    if catalog.tables.contains_key(&key) && !catalog.views.contains(&key) {
+        return Ok(());
+    }
+    // Infer the view body against the PARTIAL catalog (replay is ordered, so the
+    // view's dependencies are already present). The body is rendered from its
+    // parsed AST via sqlparser's round-tripping `Display`. ANY inference failure
+    // — an unsupported column type, a `SELECT *` (which the engine deliberately
+    // refuses to type: `list the columns explicitly`), an unknown relation, an
+    // uninferable expression — leaves the view unmodeled.
+    let body_sql = create.query.to_string();
+    let Ok(shape) = infer_query(catalog, &body_sql) else {
+        return Ok(());
+    };
+    // A `CREATE VIEW v (c1, c2, ...) AS ...` renames the body's output columns
+    // POSITIONALLY. A count mismatch is a broken migration PostgreSQL rejects, so
+    // leave the view unmodeled rather than guess the pairing.
+    let mut columns = shape.columns;
+    if !create.columns.is_empty() {
+        if create.columns.len() != columns.len() {
+            return Ok(());
+        }
+        for (inferred, alias) in columns.iter_mut().zip(&create.columns) {
+            inferred.name = fold_ident(&alias.name);
+        }
+    }
+    // Convert each inferred column back into the catalog's canonical-`pg_type` +
+    // `not_null` shape, so the view becomes an ordinary relation the SELECT
+    // resolver reads identically to a base table. A `RustType` with no canonical
+    // spelling (never produced by a successful inference) leaves the view
+    // unmodeled — fail-closed.
+    let mut view_columns: BTreeMap<String, ColumnInfo> = BTreeMap::new();
+    for column in columns {
+        let Some(pg_type) = infer::canonical_pg_for_rust(&column.ty, catalog) else {
+            return Ok(());
+        };
+        // A duplicate output name would silently drop a column when flattened
+        // into the by-name map. `infer_query` already rejects duplicate output
+        // names, but an explicit rename list could introduce one — leave the view
+        // unmodeled rather than lose a column.
+        if view_columns
+            .insert(
+                column.name,
+                ColumnInfo {
+                    pg_type,
+                    not_null: !column.nullable,
+                },
+            )
+            .is_some()
+        {
+            return Ok(());
+        }
+    }
+    // A view with zero columns cannot round-trip through the per-column
+    // serialized format (it would emit no lines and vanish), and a real view
+    // always projects at least one column; leave a degenerate empty inference
+    // unmodeled.
+    if view_columns.is_empty() {
+        return Ok(());
+    }
+    // Register (or, for `CREATE OR REPLACE VIEW` / a re-created view, REPLACE) the
+    // view as a relation and mark it a view. `insert` replaces any prior entry
+    // for this key wholesale, so a dropped-then-recreated or replaced view never
+    // keeps a stale column. A view has no primary key, so clear any (a same-named
+    // dropped table could have left one).
+    catalog.tables.insert(key.clone(), view_columns);
+    catalog.primary_keys.remove(&key);
+    catalog.views.insert(key);
+    Ok(())
 }
 
 /// Replay an `ALTER TYPE name ...` into the catalog. A `RENAME TO` re-keys ANY
@@ -3756,7 +3948,7 @@ fn replay_relation_key(name: &ObjectName, path: &Path) -> Result<String, BuildEr
 /// proc-macro parses. One column per line:
 ///
 /// ```text
-/// <table>\t<column>\t<pg_type>\t<0|1 not_null>\t<0|1 primary_key>
+/// <table>\t<column>\t<pg_type>\t<0|1 not_null>\t<0|1 primary_key>\t<0|1 is_view>
 /// ```
 ///
 /// Sorted (via `BTreeMap`) so output is byte-deterministic. The format
@@ -3764,11 +3956,16 @@ fn replay_relation_key(name: &ObjectName, path: &Path) -> Result<String, BuildEr
 /// dependency, fully greppable, and stable across builds. The trailing
 /// primary-key field reconstructs each table's key SET as the columns
 /// whose flag is `1`; a reader that needs only table/column existence
-/// ignores it.
+/// ignores it. The sixth `is_view` field marks whether the relation is a
+/// VIEW (all columns of one relation carry the SAME flag — it is a
+/// per-RELATION property replicated per column), so [`parse_catalog`]
+/// reconstructs `catalog.views`; a view has no primary key, so its fifth
+/// field is always `0`.
 fn serialize(catalog: &Catalog) -> String {
     let mut out = String::new();
     for (table, columns) in &catalog.tables {
         let pk = catalog.primary_keys.get(table);
+        let is_view = catalog.views.contains(table);
         for (column, info) in columns {
             let is_pk = match pk {
                 Some(set) => set.contains(column),
@@ -3789,6 +3986,15 @@ fn serialize(catalog: &Catalog) -> String {
             // columns of each table.
             out.push('\t');
             out.push(if is_pk { '1' } else { '0' });
+            // A sixth field marks whether the RELATION is a VIEW (`1`) or a base
+            // table (`0`). It is a per-relation property, so every column line of
+            // one relation carries the same value; `parse_catalog` reconstructs
+            // `catalog.views` from the relations whose columns flag `1`. A view is
+            // registered in `tables` like any relation (the SELECT resolver is
+            // view-blind), so this flag is the ONLY thing distinguishing a view —
+            // the DML write-validator reads it to reject a write through a view.
+            out.push('\t');
+            out.push(if is_view { '1' } else { '0' });
             out.push('\n');
         }
     }
@@ -3807,9 +4013,9 @@ pub enum CatalogParseError {
     /// tab-separated fields. `line` is the 1-based line number;
     /// `fields` is how many were found.
     FieldCount { line: usize, fields: usize },
-    /// A boolean flag field (`not_null` or `primary_key`) held something
-    /// other than `0` or `1`. `line` is the 1-based line number; `field`
-    /// names which flag; `value` is the offending text.
+    /// A boolean flag field (`not_null`, `primary_key`, or `is_view`) held
+    /// something other than `0` or `1`. `line` is the 1-based line number;
+    /// `field` names which flag; `value` is the offending text.
     BoolFlag {
         line: usize,
         field: &'static str,
@@ -3823,9 +4029,9 @@ impl fmt::Display for CatalogParseError {
             CatalogParseError::FieldCount { line, fields } => write!(
                 f,
                 "schema catalog line {line} has {fields} tab-separated field(s), \
-                 expected exactly 5 (table, column, pg_type, not_null, primary_key). \
-                 The catalog is machine-generated; a malformed line means the \
-                 build-script channel is corrupt."
+                 expected exactly 6 (table, column, pg_type, not_null, primary_key, \
+                 is_view). The catalog is machine-generated; a malformed line means \
+                 the build-script channel is corrupt."
             ),
             CatalogParseError::BoolFlag { line, field, value } => write!(
                 f,
@@ -3845,15 +4051,17 @@ impl std::error::Error for CatalogParseError {}
 /// in-memory [`Catalog`] so it can call [`infer_query`].
 ///
 /// Each non-empty line is `table\tcolumn\tpg_type\t<0|1 not_null>\t<0|1
-/// primary_key>`. A blank line (a trailing newline yields one) is the
-/// only line that is skipped; every other line MUST be well-formed —
-/// a wrong field count or a non-`0|1` flag is a loud
+/// primary_key>\t<0|1 is_view>`. A blank line (a trailing newline yields
+/// one) is the only line that is skipped; every other line MUST be
+/// well-formed — a wrong field count or a non-`0|1` flag is a loud
 /// [`CatalogParseError`], never a silent skip (which would hide a table
-/// or column).
+/// or column). The reconstructed `user_types` are NOT in this file (they
+/// ride their own channel); this rebuilds `tables`, `primary_keys`, and
+/// `views`.
 ///
 /// # Errors
 ///
-/// [`CatalogParseError`] when a non-empty line does not have exactly five
+/// [`CatalogParseError`] when a non-empty line does not have exactly six
 /// tab-separated fields, or a flag field is not `0`/`1`.
 pub fn parse_catalog(text: &str) -> Result<Catalog, CatalogParseError> {
     let mut catalog = Catalog::default();
@@ -3866,11 +4074,11 @@ pub fn parse_catalog(text: &str) -> Result<Catalog, CatalogParseError> {
         }
         let number = idx.saturating_add(1);
         let fields: Vec<&str> = line.split('\t').collect();
-        // Bind the five fields by slice pattern (no indexing operation).
+        // Bind the six fields by slice pattern (no indexing operation).
         // Any other arity is a loud, classified error — never a silent
         // skip that would hide a table or column.
-        let [table, column, pg_type, not_null_flag, pk_flag] = match fields.as_slice() {
-            [a, b, c, d, e] => [*a, *b, *c, *d, *e],
+        let [table, column, pg_type, not_null_flag, pk_flag, view_flag] = match fields.as_slice() {
+            [a, b, c, d, e, g] => [*a, *b, *c, *d, *e, *g],
             other => {
                 return Err(CatalogParseError::FieldCount {
                     line: number,
@@ -3880,6 +4088,7 @@ pub fn parse_catalog(text: &str) -> Result<Catalog, CatalogParseError> {
         };
         let not_null = parse_flag(not_null_flag, number, "not_null")?;
         let is_pk = parse_flag(pk_flag, number, "primary_key")?;
+        let is_view = parse_flag(view_flag, number, "is_view")?;
         catalog
             .tables
             .entry(table.to_string())
@@ -3897,6 +4106,13 @@ pub fn parse_catalog(text: &str) -> Result<Catalog, CatalogParseError> {
                 .entry(table.to_string())
                 .or_default()
                 .insert(column.to_string());
+        }
+        // A view's every column line carries `is_view = 1` (a per-relation
+        // property replicated per column), so recording it on any column line
+        // reconstructs the relation-level `views` set; a `BTreeSet` de-dups the
+        // repetition.
+        if is_view {
+            catalog.views.insert(table.to_string());
         }
     }
     Ok(catalog)
@@ -4924,9 +5140,9 @@ mod tests {
     fn serialize_is_deterministic_and_tab_separated() {
         let cat = catalog_from(&["CREATE TABLE t (b INT, a TEXT NOT NULL)"]);
         let s = serialize(&cat);
-        // Columns sorted: a before b. No primary key, so the trailing
-        // PK field is `0` on every row.
-        assert_eq!(s, "t\ta\ttext\t1\t0\nt\tb\tint4\t0\t0\n");
+        // Columns sorted: a before b. No primary key, so the trailing PK field
+        // is `0`; a base table, so the trailing `is_view` field is `0` too.
+        assert_eq!(s, "t\ta\ttext\t1\t0\t0\nt\tb\tint4\t0\t0\t0\n");
     }
 
     #[test]
@@ -4939,13 +5155,14 @@ mod tests {
             "CREATE TABLE two (a INT, b INT, c TEXT, PRIMARY KEY (a, b))",
         ]);
         let s = serialize(&cat);
-        // `one`: id is the PK (1), name is not (0).
-        assert!(s.contains("one\tid\tint8\t1\t1\n"));
-        assert!(s.contains("one\tname\ttext\t1\t0\n"));
+        // `one`: id is the PK (1), name is not (0); both base-table rows carry
+        // the trailing `is_view` = 0.
+        assert!(s.contains("one\tid\tint8\t1\t1\t0\n"));
+        assert!(s.contains("one\tname\ttext\t1\t0\t0\n"));
         // `two`: a and b are the composite PK (1), c is not (0).
-        assert!(s.contains("two\ta\tint4\t1\t1\n"));
-        assert!(s.contains("two\tb\tint4\t1\t1\n"));
-        assert!(s.contains("two\tc\ttext\t0\t0\n"));
+        assert!(s.contains("two\ta\tint4\t1\t1\t0\n"));
+        assert!(s.contains("two\tb\tint4\t1\t1\t0\n"));
+        assert!(s.contains("two\tc\ttext\t0\t0\t0\n"));
     }
 
     #[test]
@@ -5636,18 +5853,364 @@ mod tests {
 
     #[test]
     fn parse_catalog_wrong_field_count_is_loud() {
-        // Three fields where five are required — never a silent skip.
+        // Three fields where six are required — never a silent skip.
         let err = parse_catalog("t\tcol\tint4\n").expect_err("must fail closed");
         assert!(matches!(err, CatalogParseError::FieldCount { fields: 3, .. }));
     }
 
     #[test]
     fn parse_catalog_bad_flag_is_loud() {
-        let err = parse_catalog("t\tcol\tint4\tyes\t0\n").expect_err("must fail closed");
+        // Six well-formed fields except the `not_null` flag is `yes`, not 0/1.
+        let err = parse_catalog("t\tcol\tint4\tyes\t0\t0\n").expect_err("must fail closed");
         assert!(matches!(
             err,
             CatalogParseError::BoolFlag { field: "not_null", .. }
         ));
+    }
+
+    #[test]
+    fn parse_catalog_bad_view_flag_is_loud() {
+        // The sixth `is_view` flag must be 0/1; anything else is loud, never a
+        // silent skip that would lose a relation's view-ness.
+        let err = parse_catalog("t\tcol\tint4\t1\t0\tmaybe\n").expect_err("must fail closed");
+        assert!(matches!(
+            err,
+            CatalogParseError::BoolFlag {
+                field: "is_view",
+                ..
+            }
+        ));
+    }
+
+    // ── SQL views modeled as compile-checked relations ──────────────────
+
+    /// A view whose body infers cleanly is registered in `tables` (so a `query!`
+    /// SELECTing named columns from it resolves like any relation) and marked in
+    /// `views`; the inferred column types + NOT-NULL flags round-trip.
+    #[test]
+    fn view_is_registered_and_selectable() {
+        let cat = catalog_from(&[
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL, bio TEXT)",
+            "CREATE VIEW named_users AS SELECT id, email FROM users",
+        ]);
+        assert!(cat.views.contains("named_users"), "view marked in `views`");
+        let cols = cat.tables.get("named_users").expect("view registered");
+        assert_eq!(cols.get("id").expect("id").pg_type, "int8");
+        assert!(cols.get("id").expect("id").not_null, "PK stays NOT NULL");
+        assert_eq!(cols.get("email").expect("email").pg_type, "text");
+        assert!(cols.get("email").expect("email").not_null);
+        // End-to-end: a SELECT from the view types exactly like a base table.
+        let shape = infer_query(&cat, "SELECT id, email FROM named_users").expect("selects");
+        assert_eq!(shape.columns.len(), 2);
+        assert_eq!(shape.columns[0].ty, RustType::I64);
+        assert!(!shape.columns[0].nullable);
+        assert_eq!(shape.columns[1].ty, RustType::Text);
+        assert!(!shape.columns[1].nullable);
+    }
+
+    /// NULLABILITY FIDELITY (the load-bearing risk): a `LEFT JOIN` right-side
+    /// column is nullable through the view, and a `NOT NULL` base column stays
+    /// non-null. The nullability is the inference engine's own, so it composes
+    /// exactly as a top-level `query!` would.
+    #[test]
+    fn view_left_join_column_is_nullable() {
+        let cat = catalog_from(&[
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+            "CREATE TABLE profiles (user_id BIGINT PRIMARY KEY, bio TEXT NOT NULL)",
+            "CREATE VIEW user_bios AS \
+             SELECT u.id AS id, u.email AS email, p.bio AS bio \
+             FROM users u LEFT JOIN profiles p ON p.user_id = u.id",
+        ]);
+        let cols = cat.tables.get("user_bios").expect("view registered");
+        // `p.bio` is NOT NULL in `profiles`, but the LEFT JOIN can null-extend
+        // it, so the view column MUST be nullable — an under-nullify here would
+        // hand a `query!` a `T` where a real NULL yields `UnexpectedNull`.
+        assert!(
+            !cols.get("bio").expect("bio").not_null,
+            "LEFT JOIN right column must be nullable"
+        );
+        // The preserved-side NOT NULL column stays non-null.
+        assert!(cols.get("email").expect("email").not_null);
+        // End-to-end.
+        let shape = infer_query(&cat, "SELECT bio FROM user_bios").expect("selects");
+        assert!(shape.columns[0].nullable, "view LEFT JOIN column is Option");
+    }
+
+    /// `COALESCE(nullable, non_null_default)` is non-null through the view.
+    #[test]
+    fn view_coalesce_is_not_null() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, note TEXT)",
+            "CREATE VIEW v AS SELECT id, COALESCE(note, 'none') AS note2 FROM t",
+        ]);
+        let cols = cat.tables.get("v").expect("view registered");
+        assert!(
+            cols.get("note2").expect("note2").not_null,
+            "COALESCE with a non-null default is NOT NULL through the view"
+        );
+    }
+
+    /// Aggregate nullability through a view: `count(*)` is NOT NULL; a `MAX`
+    /// over a column (NULL over an empty group) is nullable. (A bare `sum()` is
+    /// itself a `CastRequired` in this engine — a view using it is correctly
+    /// SKIPPED, exercised by `sum_view_is_skipped` below.)
+    #[test]
+    fn view_aggregate_nullability() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, amount INT NOT NULL)",
+            "CREATE VIEW v AS SELECT count(*) AS n, max(amount) AS hi FROM t",
+        ]);
+        let cols = cat.tables.get("v").expect("view registered");
+        assert!(cols.get("n").expect("n").not_null, "count(*) is NOT NULL");
+        assert!(
+            !cols.get("hi").expect("hi").not_null,
+            "MAX over a possibly-empty group is nullable, even a NOT NULL column"
+        );
+    }
+
+    /// A view whose body needs an inference the engine deliberately refuses
+    /// (a bare `sum()`, whose result type depends on the argument) is SKIPPED,
+    /// not mis-modeled and not a build failure — the skip-on-failure contract.
+    #[test]
+    fn sum_view_is_skipped() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, amount INT NOT NULL)",
+            "CREATE VIEW v AS SELECT sum(amount) AS total FROM t",
+        ]);
+        assert!(!cat.tables.contains_key("v"), "bare-sum view is unmodeled");
+        assert!(!cat.views.contains("v"));
+    }
+
+    /// SKIP-ON-FAILURE: a `SELECT *` view (which the engine refuses to type) is
+    /// left UNMODELED — the migration set still BUILDS, and a `query!` against
+    /// the unmodeled view is a loud unknown-relation error, never a
+    /// silently-wrong catalog.
+    #[test]
+    fn select_star_view_is_skipped_and_leaves_the_set_buildable() {
+        // `catalog_from` panics on a BuildError, so a green return here proves
+        // the un-inferable view did NOT fail the build.
+        let cat = catalog_from(&[
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+            "CREATE VIEW all_users AS SELECT * FROM users",
+        ]);
+        assert!(!cat.tables.contains_key("all_users"), "star view unmodeled");
+        assert!(!cat.views.contains("all_users"));
+        // A `query!` against it is a loud unknown relation (exactly today's
+        // pre-views behaviour), never a wrong shape.
+        let err = infer_query(&cat, "SELECT id FROM all_users").expect_err("loud");
+        assert!(matches!(err, InferError::UnknownRelation(ref r) if r == "all_users"));
+    }
+
+    /// SKIP-ON-FAILURE: a view whose body uses an unsupported column type is
+    /// left unmodeled and does not break the build.
+    #[test]
+    fn unsupported_type_view_is_skipped() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, addr INET)",
+            "CREATE VIEW v AS SELECT addr FROM t",
+        ]);
+        assert!(!cat.tables.contains_key("v"), "unsupported-type view unmodeled");
+        assert!(!cat.views.contains("v"));
+    }
+
+    /// A `query!` INSERT / UPDATE / DELETE targeting a view is a loud
+    /// `WriteToView` — the build-vs-runtime gap (PostgreSQL rejects a view write
+    /// at run time) closed at compile time. A `query!` write always carries
+    /// `RETURNING` (it produces a typed row), which is the form that reaches the
+    /// target-table resolver where the view check lives.
+    #[test]
+    fn write_through_a_view_is_rejected() {
+        let cat = catalog_from(&[
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+            "CREATE VIEW named_users AS SELECT id, email FROM users",
+        ]);
+        for sql in [
+            "INSERT INTO named_users (id, email) VALUES ($1, $2) RETURNING id",
+            "UPDATE named_users SET email = $1 WHERE id = $2 RETURNING id",
+            "DELETE FROM named_users WHERE id = $1 RETURNING id",
+            "UPDATE ONLY named_users SET email = $1 WHERE id = $2 RETURNING id",
+        ] {
+            let err = infer_query(&cat, sql).expect_err("write to view is loud");
+            assert!(
+                matches!(err, InferError::WriteToView { ref relation } if relation == "named_users"),
+                "expected WriteToView for `{sql}`, got {err:?}"
+            );
+        }
+        // No false positive: writing the BASE table still works, and READING
+        // (in a subquery) from the view is allowed.
+        infer_query(
+            &cat,
+            "INSERT INTO users (id, email) VALUES ($1, $2) RETURNING id",
+        )
+        .expect("base write ok");
+        infer_query(
+            &cat,
+            "UPDATE users SET email = $1 WHERE id IN (SELECT id FROM named_users) RETURNING id",
+        )
+        .expect("reading a view in a subquery of a base-table write is ok");
+    }
+
+    /// A view-over-view works because replay is ORDERED: the inner view is in
+    /// the catalog when the outer view's body is inferred.
+    #[test]
+    fn view_over_view_resolves() {
+        let cat = catalog_from(&[
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL, active BOOL NOT NULL)",
+            "CREATE VIEW active_users AS SELECT id, email FROM users WHERE active",
+            "CREATE VIEW active_ids AS SELECT id FROM active_users",
+        ]);
+        assert!(cat.views.contains("active_ids"));
+        let cols = cat.tables.get("active_ids").expect("view-over-view registered");
+        assert_eq!(cols.get("id").expect("id").pg_type, "int8");
+        let shape = infer_query(&cat, "SELECT id FROM active_ids").expect("selects");
+        assert_eq!(shape.columns[0].ty, RustType::I64);
+    }
+
+    /// `DROP VIEW` unregisters the relation (columns + `views` marker), so a
+    /// later `query!` against it is loud again.
+    #[test]
+    fn drop_view_unregisters() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (id BIGINT PRIMARY KEY)",
+            "CREATE VIEW v AS SELECT id FROM t",
+            "DROP VIEW v",
+        ]);
+        assert!(!cat.tables.contains_key("v"), "view columns removed");
+        assert!(!cat.views.contains("v"), "view marker removed");
+        let err = infer_query(&cat, "SELECT id FROM v").expect_err("loud after drop");
+        assert!(matches!(err, InferError::UnknownRelation(_)));
+    }
+
+    /// `DROP MATERIALIZED VIEW` unregisters the same way.
+    #[test]
+    fn drop_materialized_view_unregisters() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (id BIGINT PRIMARY KEY)",
+            "CREATE MATERIALIZED VIEW v AS SELECT id FROM t",
+            "DROP MATERIALIZED VIEW v",
+        ]);
+        assert!(!cat.tables.contains_key("v"));
+        assert!(!cat.views.contains("v"));
+    }
+
+    /// A MATERIALIZED view models its column shape identically to a plain view.
+    #[test]
+    fn materialized_view_is_registered() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, amount INT NOT NULL)",
+            "CREATE MATERIALIZED VIEW totals AS SELECT id, amount FROM t",
+        ]);
+        assert!(cat.views.contains("totals"));
+        let cols = cat.tables.get("totals").expect("matview registered");
+        assert_eq!(cols.get("amount").expect("amount").pg_type, "int4");
+        assert!(cols.get("amount").expect("amount").not_null);
+    }
+
+    /// `CREATE OR REPLACE VIEW` re-infers and REPLACES the entry: an old column
+    /// dropped from the new body is gone (drift → a `query!` naming it is loud).
+    #[test]
+    fn create_or_replace_view_replaces_columns() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, a INT, b TEXT)",
+            "CREATE VIEW v AS SELECT id, a, b FROM t",
+            "CREATE OR REPLACE VIEW v AS SELECT id, a FROM t",
+        ]);
+        let cols = cat.tables.get("v").expect("view registered");
+        assert!(cols.contains_key("id") && cols.contains_key("a"));
+        assert!(!cols.contains_key("b"), "replaced view no longer exposes `b`");
+        let err = infer_query(&cat, "SELECT b FROM v").expect_err("dropped column loud");
+        assert!(matches!(err, InferError::UnknownColumn { .. }));
+    }
+
+    /// A `CREATE VIEW v (x, y) AS SELECT a, b` renames the output columns
+    /// positionally; a count mismatch leaves the view unmodeled.
+    #[test]
+    fn view_explicit_column_list_renames_and_arity_mismatch_skips() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+            "CREATE VIEW v (ident, mail) AS SELECT id, email FROM t",
+            "CREATE VIEW bad (only_one) AS SELECT id, email FROM t",
+        ]);
+        let cols = cat.tables.get("v").expect("renamed view registered");
+        assert!(cols.contains_key("ident") && cols.contains_key("mail"));
+        assert!(!cols.contains_key("id"), "original name replaced by alias");
+        assert!(!cat.tables.contains_key("bad"), "arity-mismatch view skipped");
+    }
+
+    /// A `CREATE VIEW` over a name already registered as a base TABLE is a
+    /// collision PostgreSQL rejects; the view is left unmodeled and the table
+    /// intact.
+    #[test]
+    fn view_name_colliding_with_a_table_is_skipped() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+            "CREATE VIEW t AS SELECT id FROM t",
+        ]);
+        assert!(!cat.views.contains("t"), "not marked a view");
+        // The base table is intact (two columns), not overwritten by the view.
+        let cols = cat.tables.get("t").expect("table intact");
+        assert!(cols.contains_key("email"), "base table columns preserved");
+    }
+
+    /// A TEMPORARY view does not persist as a queryable relation, so it is not
+    /// modeled (avoids a build-vs-runtime gap).
+    #[test]
+    fn temporary_view_is_not_modeled() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (id BIGINT PRIMARY KEY)",
+            "CREATE TEMP VIEW v AS SELECT id FROM t",
+        ]);
+        assert!(!cat.tables.contains_key("v"));
+        assert!(!cat.views.contains("v"));
+    }
+
+    /// A view projecting a USER-ENUM column stores the enum's NAME (not its
+    /// volatile sorted-map index), so it re-resolves to the SAME `UserEnum`
+    /// against the final catalog — proving the `canonical_pg_for_rust`
+    /// user-type round-trip.
+    #[test]
+    fn view_over_a_user_enum_column_round_trips() {
+        let cat = catalog_from(&[
+            "CREATE TYPE mood AS ENUM ('happy', 'sad')",
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, m mood NOT NULL)",
+            "CREATE VIEW v AS SELECT id, m FROM t",
+        ]);
+        let cols = cat.tables.get("v").expect("view registered");
+        assert_eq!(cols.get("m").expect("m").pg_type, "mood");
+        let shape = infer_query(&cat, "SELECT m FROM v").expect("selects enum");
+        assert!(
+            matches!(shape.columns[0].ty, RustType::UserEnum(_)),
+            "enum column re-resolves through the view, got {:?}",
+            shape.columns[0].ty
+        );
+    }
+
+    /// A view projecting an ARRAY column stores the `T[]` canonical spelling and
+    /// re-resolves to the same `RustType::Array`.
+    #[test]
+    fn view_over_an_array_column_round_trips() {
+        let cat = catalog_from(&[
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, tags INT[])",
+            "CREATE VIEW v AS SELECT tags FROM t",
+        ]);
+        let cols = cat.tables.get("v").expect("view registered");
+        assert_eq!(cols.get("tags").expect("tags").pg_type, "int4[]");
+        let shape = infer_query(&cat, "SELECT tags FROM v").expect("selects array");
+        assert_eq!(shape.columns[0].ty, RustType::Array(ElemType::I32));
+    }
+
+    /// A catalog carrying a view round-trips through `serialize` / `parse_catalog`
+    /// with its `views` set preserved (the sixth `is_view` field reconstructs it).
+    #[test]
+    fn views_round_trip_through_serialize() {
+        let cat = catalog_from(&[
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+            "CREATE VIEW named_users AS SELECT id, email FROM users",
+        ]);
+        let text = serialize(&cat);
+        let parsed = parse_catalog(&text).expect("round-trip parse");
+        assert_eq!(parsed, cat, "views set survives serialize -> parse");
+        assert!(parsed.views.contains("named_users"));
     }
 
     // ─── External-type bridges ──────────────────────────────────────────

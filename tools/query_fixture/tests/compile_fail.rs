@@ -193,6 +193,16 @@ fn unknown_reference_is_compile_error() {
     // `Params` is a type error at the call — a bulk write cannot carry a mistyped set.
     t.compile_fail("tests/compile_fail/execute_batch_wrong_param.rs");
 
+    // SQL VIEWS (`0022_views.sql`):
+    //   * a `query!` INSERT/UPDATE/DELETE ... RETURNING targeting a VIEW is a loud
+    //     `WriteToView` — a view is not writable, so accepting the write at build
+    //     time would be a build-passes / run-fails gap ("target the base table").
+    t.compile_fail("tests/compile_fail/query_write_to_view.rs");
+    //   * a column the view does NOT project does not resolve, even though the base
+    //     table has it — the drift guarantee (a column a later `CREATE OR REPLACE
+    //     VIEW` drops from the view stops compiling), surfaced as `UnknownColumn`.
+    t.compile_fail("tests/compile_fail/query_view_dropped_column.rs");
+
     // Every valid dynamic form type-checks at macro expansion.
     t.pass("tests/compile_pass/query_dynamics_ok.rs");
     // The valid `copy!` + `copy_in_typed` happy path type-checks (GREEN peer of

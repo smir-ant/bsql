@@ -476,6 +476,77 @@ fn scalar_elem_for_pg(pg_type: &str) -> Option<ElemType> {
     }
 }
 
+/// The canonical PostgreSQL type NAME a native SCALAR [`RustType`] round-trips
+/// to — the inverse of [`scalar_elem_for_pg`] for the native set. `None` for a
+/// non-scalar (`Array` / `UserEnum` / `UserComposite`, which [`canonical_pg_
+/// for_rust`] handles). The `text` family collapses to `text` here (they share
+/// ONE decode), which re-resolves to [`RustType::Text`] — a harmless, exact
+/// round-trip for the decoded type.
+fn scalar_canonical_name(ty: RustType) -> Option<&'static str> {
+    let name = match ty {
+        RustType::I16 => "int2",
+        RustType::I32 => "int4",
+        RustType::I64 => "int8",
+        RustType::U32 => "oid",
+        RustType::Bool => "bool",
+        RustType::Text => "text",
+        RustType::F32 => "float4",
+        RustType::F64 => "float8",
+        RustType::Bytea => "bytea",
+        RustType::Uuid => "uuid",
+        RustType::Timestamptz => "timestamptz",
+        RustType::Timestamp => "timestamp",
+        RustType::Json => "json",
+        RustType::Jsonb => "jsonb",
+        RustType::Numeric => "numeric",
+        RustType::Date => "date",
+        RustType::Time => "time",
+        RustType::Interval => "interval",
+        // Non-scalar variants are handled by `canonical_pg_for_rust`.
+        RustType::Array(_) | RustType::UserEnum(_) | RustType::UserComposite(_) => return None,
+    };
+    Some(name)
+}
+
+/// The canonical PostgreSQL type NAME an inferred [`RustType`] round-trips to —
+/// the inverse of [`resolve_pg_type`] over the successfully-inferred set. It is
+/// used to register an inferred VIEW column back into the catalog's
+/// `pg_type`-keyed `tables`, so a view becomes an ordinary relation the SELECT
+/// resolver reads IDENTICALLY to a base table (no new resolver branch).
+///
+/// The round-trip is EXACT for the supported set —
+/// `resolve_pg_type(catalog, &canonical_pg_for_rust(ty, catalog)?) == Some(ty)`
+/// — with two deliberate, decode-preserving collapses:
+///
+/// * the `text` family (`varchar` / `bpchar` / `char`) maps back to `text`,
+///   which re-resolves to [`RustType::Text`] — the same one-wire-decode
+///   compatibility class the runtime result-OID guard treats as equal;
+/// * a user ENUM / COMPOSITE maps back to its declared NAME (resolved from the
+///   `Copy` id), which re-resolves to the SAME `UserEnum` / `UserComposite`
+///   against the FINAL catalog. Storing the NAME — not the volatile
+///   sorted-`user_types`-map INDEX the id carries — is what keeps this stable
+///   when a LATER migration inserts a user type that shifts the index.
+///
+/// `None` only when the id names no user type in this catalog (an out-of-range
+/// handle a successful inference never produces); the caller treats it as
+/// leave-the-view-unmodeled (fail-closed).
+pub(crate) fn canonical_pg_for_rust(ty: &RustType, catalog: &Catalog) -> Option<String> {
+    match ty {
+        RustType::UserEnum(id) => catalog.user_enum(*id).map(|(name, _)| name.to_string()),
+        RustType::UserComposite(id) => {
+            catalog.user_composite(*id).map(|(name, _)| name.to_string())
+        }
+        // An array's canonical spelling is `<element>[]` — the exact structural
+        // form `canonical_type` renders and `rust_type_for_pg` strips, so it
+        // re-resolves to the same `RustType::Array(element)`.
+        RustType::Array(elem) => {
+            let element = scalar_canonical_name(elem.as_scalar())?;
+            Some(format!("{element}[]"))
+        }
+        scalar => scalar_canonical_name(*scalar).map(str::to_string),
+    }
+}
+
 /// One projected output column: its name, Rust type, and nullability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferredColumn {
@@ -511,6 +582,14 @@ pub enum InferError {
     UnsupportedStatement(String),
     /// A referenced table or `FROM` alias is not in scope.
     UnknownRelation(String),
+    /// A `query!` INSERT / UPDATE / DELETE targets a SQL VIEW. A view is
+    /// generally not writable — PostgreSQL rejects the write at RUN time unless
+    /// the view is one of its narrow "auto-updatable" simple views, which bsql
+    /// cannot reliably tell apart — so accepting the write at BUILD time would
+    /// be a build-passes / run-fails gap the compile-time guarantee exists to
+    /// close. It is a loud, located rejection: target the base TABLE instead.
+    /// `relation` is the view name.
+    WriteToView { relation: String },
     /// A referenced column does not exist on the resolved relation.
     UnknownColumn { relation: String, column: String },
     /// An unqualified column reference matches columns in more than one
@@ -1016,6 +1095,13 @@ impl fmt::Display for InferError {
             InferError::UnknownRelation(name) => {
                 write!(f, "unknown table or alias `{name}` in this query")
             }
+            InferError::WriteToView { relation } => write!(
+                f,
+                "cannot INSERT/UPDATE/DELETE through the view `{relation}`: a view \
+                 is generally not writable and PostgreSQL would reject this at run \
+                 time (bsql cannot tell an auto-updatable view apart, so it rejects \
+                 all view writes). Target the base table instead."
+            ),
             InferError::UnknownColumn { relation, column } => {
                 write!(f, "relation `{relation}` has no column `{column}`")
             }
@@ -10242,7 +10328,7 @@ fn only_modifier_table<'a>(
 /// [`InferError::UnknownRelation`] naming the FULL path — never silently
 /// dropped to the bare table (which would accept `wrongschema.users` as plain
 /// `users`). A bare 1-part name folds to its leaf as usual.
-fn relation_catalog_key(name: &sqlparser::ast::ObjectName) -> Option<String> {
+pub(crate) fn relation_catalog_key(name: &sqlparser::ast::ObjectName) -> Option<String> {
     match name.0.as_slice() {
         [only] => only.as_ident().map(fold_ident),
         [schema, table] => {
@@ -13584,6 +13670,9 @@ fn update_scopes(
                 if !catalog.tables.contains_key(&key) {
                     return Err(InferError::UnknownRelation(key));
                 }
+                // `UPDATE ONLY <view>` is still a write through a view — reject it
+                // with the same check the normal target path applies.
+                reject_write_to_view(catalog, &key)?;
                 (key.clone(), key)
             } else {
                 let key = resolve_target_table(catalog, name)?;
@@ -14574,6 +14663,14 @@ fn delete_scope(
             ));
         }
     }
+    // The DELETE target is the first (and only) FROM relation, added above
+    // before any USING relation. A DELETE through a modeled VIEW is a loud
+    // rejection, the same check INSERT / UPDATE apply — a view is not a valid
+    // DELETE target, so accepting it at build time would be a build-passes /
+    // run-fails gap.
+    if let Some(target) = scope.relations.first() {
+        reject_write_to_view(catalog, &target.table_key)?;
+    }
     // A `DELETE ... USING <relations>` brings additional relations into scope,
     // exactly as an `UPDATE ... FROM` does — its relations' columns resolve in
     // the WHERE and RETURNING, and a cross-relation typo or a nonexistent USING
@@ -14670,7 +14767,27 @@ fn resolve_target_table(
     if !catalog.tables.contains_key(&key) {
         return Err(InferError::UnknownRelation(key));
     }
+    // A DML target that resolved to a modeled VIEW is a loud rejection: a view
+    // is generally not writable, so accepting it at build time would be a
+    // build-passes / run-fails gap. This choke point covers INSERT and the
+    // normal UPDATE target; the UPDATE `ONLY` and DELETE target paths (which do
+    // not route through here) apply the same `reject_write_to_view` check.
+    reject_write_to_view(catalog, &key)?;
     Ok(key)
+}
+
+/// Reject a DML write whose resolved target relation `key` is a modeled VIEW.
+/// A view is registered in `catalog.tables` like any relation (so it resolves
+/// for SELECT), and `catalog.views` is the ONLY thing marking it a view — this
+/// is the single check every DML write-target path funnels through so the
+/// rejection cannot drift between INSERT / UPDATE / DELETE.
+fn reject_write_to_view(catalog: &Catalog, key: &str) -> Result<(), InferError> {
+    if catalog.views.contains(key) {
+        return Err(InferError::WriteToView {
+            relation: key.to_string(),
+        });
+    }
+    Ok(())
 }
 
 // ─── parameter inference ───────────────────────────────────────────────────

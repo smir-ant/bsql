@@ -1,0 +1,5 @@
+error: query!: cannot INSERT/UPDATE/DELETE through the view `vaccount_summary`: a view is generally not writable and PostgreSQL would reject this at run time (bsql cannot tell an auto-updatable view apart, so it rejects all view writes). Target the base table instead.
+ --> tests/compile_fail/query_write_to_view.rs:9:9
+  |
+9 |         "INSERT INTO vaccount_summary (id, balance) VALUES ($1, $2) RETURNING id"
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

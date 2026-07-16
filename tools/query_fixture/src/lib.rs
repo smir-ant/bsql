@@ -35,6 +35,25 @@ bsql::query!(AccountsBalance, "SELECT balance FROM accounts");
 // folding end-to-end.
 bsql::query!(AuditEvent, "SELECT event FROM audit");
 
+// SQL VIEWS as compile-checked relations (`0022_views.sql`). `bsql-build`
+// inferred each view's SELECT body against the catalog and registered it like
+// any relation, so these `query!`s type their columns through the SAME path a
+// base table uses — a capability no mainstream Rust SQL library has, and the
+// consumer writes NO new API. That they compile at all is the build-time proof:
+//   * a simple projection view exposes its projected columns;
+bsql::query!(ViewSummary, "SELECT id, balance FROM vaccount_summary");
+//   * a LEFT JOIN view null-extends its right side — `nickname` is `NOT NULL`
+//     in `vprofile` but nullable through the view, so the record field is
+//     `Option<String>` (an under-nullify would be a runtime `UnexpectedNull`);
+bsql::query!(
+    ViewProfile,
+    "SELECT id, balance, nickname FROM vaccount_profile"
+);
+//   * a view OVER a view resolves (replay is ordered);
+bsql::query!(ViewIds, "SELECT id FROM vaccount_ids");
+//   * a MATERIALIZED view models its column shape identically.
+bsql::query!(ViewMat, "SELECT id, balance FROM vaccount_mat");
+
 // ONE-CRATE REACHABILITY PROOF.
 //
 // USER-DEFINED TYPES from the build catalog (the audit-4 flagship).

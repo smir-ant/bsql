@@ -1,0 +1,5 @@
+error: query!: relation `vaccount_summary` has no column `label`
+ --> tests/compile_fail/query_view_dropped_column.rs:7:23
+  |
+7 |     bsql::query!(Row, "SELECT label FROM vaccount_summary");
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

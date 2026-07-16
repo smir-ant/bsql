@@ -943,13 +943,14 @@ mod tests {
     fn cat() -> Catalog {
         // users(id int8 PK, email text NOT NULL); orders(id int8 PK,
         // user_id int8 NOT NULL, total int4). Catalog rows are
-        // `table\tcolumn\tpg_type\tnot_null\tprimary_key`.
+        // `table\tcolumn\tpg_type\tnot_null\tprimary_key\tis_view` (all base
+        // tables, so the trailing `is_view` flag is `0`).
         crate::parse_catalog(
-            "orders\tid\tint8\t1\t1\n\
-             orders\tuser_id\tint8\t1\t0\n\
-             orders\ttotal\tint4\t0\t0\n\
-             users\tid\tint8\t1\t1\n\
-             users\temail\ttext\t1\t0\n",
+            "orders\tid\tint8\t1\t1\t0\n\
+             orders\tuser_id\tint8\t1\t0\t0\n\
+             orders\ttotal\tint4\t0\t0\t0\n\
+             users\tid\tint8\t1\t1\t0\n\
+             users\temail\ttext\t1\t0\t0\n",
         )
         .expect("test catalog parses")
     }
