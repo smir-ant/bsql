@@ -86,21 +86,21 @@ Load-bearing decisions for any new session:
 
 ```
 crates/
-  bsql/              — umbrella facade + query! re-export + #[bsql::test] harness (bsql::pg, ::pg_sync, ::sqlite) + the ONE cross-backend bsql::N1Report  — 1650 LoC
+  bsql/              — umbrella facade + query! re-export + #[bsql::test] harness (bsql::pg, ::pg_sync, ::sqlite) + the ONE cross-backend bsql::N1Report  — 1660 LoC
   postgres/
-    proto/           — sans-IO wire protocol + session engine (no_std + alloc) + PGCOPY binary framing + TypedCopyIn  — 29678 LoC
-    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + SafeIdent guard + cancel key/redial + copy_in_typed + dynamic prepared-statement cache + migration RUNNER (PG I/O; pure logic in bsql-common) + N+1 re-export  — 13928 LoC
-    async/           — tokio async driver (plugs its socket into the shared Core<S>) + CancelToken + migration-runner try-lock poll  — 2651 LoC
-    sync/            — std::net blocking driver (plugs its socket into the shared Core<S>) + CancelToken + migration-runner try-lock poll  — 2558 LoC
+    proto/           — sans-IO wire protocol + session engine (no_std + alloc) + PGCOPY binary framing + TypedCopyIn  — 33083 LoC
+    core/            — transport-generic driver engine Core<S> + materializer + types + config + TLS + Rows + notify ledger + SafeIdent guard + cancel key/redial + copy_in_typed + pipeline/execute_batch/query_batch + connection-identity-bound prepared statements + dynamic prepared-statement cache + migration RUNNER (PG I/O; pure logic in bsql-common) + N+1 re-export  — 16872 LoC
+    async/           — tokio async driver (plugs its socket into the shared Core<S>) + CancelToken + migration-runner try-lock poll  — 4217 LoC
+    sync/            — std::net blocking driver (plugs its socket into the shared Core<S>) + CancelToken + migration-runner try-lock poll  — 3653 LoC
   sqlite/
-    driver/          — embedded SQLite driver (bundled rusqlite) + typed query! runtime + explicit prepared-statement handles + interrupt CancelToken + migration RUNNER (SQLite I/O; pure logic in bsql-common) + N+1 re-export  — 4059 LoC
+    driver/          — embedded SQLite driver (bundled rusqlite) + typed query! runtime + explicit prepared-statement handles + interrupt CancelToken + migration RUNNER (SQLite I/O; pure logic in bsql-common) + N+1 re-export  — 4475 LoC
   common/            — ZERO-DEP leaf: migration PURE logic (checksum/ordering/drift authority + source loader) + N+1 detector (feature `n1`) — ONE compiled source both PG core + SQLite depend on (was two hand-maintained copies)  — 1065 LoC
-  testkit/           — deterministic in-memory fake PostgreSQL for driver tests (no network)  — 1005 LoC
-  build/             — BUILD-DEP: migration DDL → schema catalog (+ SQLite template) + shared $N→?N placeholder authority + migration embed (emit_migrations)  — 36279 LoC
-  query-macros/      — PROC-MACRO: query! + copy! (types/validates against the catalog; emits the PostgreSQL + SQLite typed bridges) + #[bsql::test] (schema-per-test wrapper)  — 2507 LoC
+  testkit/           — deterministic in-memory fake PostgreSQL for driver tests (no network)  — 1022 LoC
+  build/             — BUILD-DEP: migration DDL → schema catalog (tables + user types + VIEWS) (+ SQLite template) + shared $N→?N placeholder authority + migration embed (emit_migrations)  — 38537 LoC
+  query-macros/      — PROC-MACRO: query! + copy! (types/validates against the catalog; emits the PostgreSQL + SQLite typed bridges) + #[bsql::test] (schema-per-test wrapper)  — 3231 LoC
 ```
 
-(src LoC measured per crate via `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by `src/infer.rs` (29563 lines: the schema/type-inference engine plus a ~13K-line inline `#[cfg(test)]` test module). Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync}`, `bsql-sqlite`, `bsql-common`, `bsql-testkit`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-bridge-fixture`, `bsql-query-sqlite-fixture`, `bsql-test-harness-fixture`, `bsql-corpus`.)
+(src LoC measured per crate via `find <crate>/src -name '*.rs' -exec cat {} + | wc -l` — counts inline `#[cfg(test)]` modules, so `build/`'s total is dominated by `src/infer.rs` (30183 lines: the schema/type-inference engine plus a ~13K-line inline `#[cfg(test)]` test module). Publishable package names: `bsql`, `bsql-postgres-{proto,core,async,sync}`, `bsql-sqlite`, `bsql-common`, `bsql-testkit`, `bsql-build`, `bsql-query-macros`. Non-shipped `publish = false` tools under `tools/`: `bsql-devgates`, `bsql-query-fixture`, `bsql-query-bridge-fixture`, `bsql-query-sqlite-fixture`, `bsql-test-harness-fixture`, `bsql-corpus`.)
 
 ## Build & test
 
