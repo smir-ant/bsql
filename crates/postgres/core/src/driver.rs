@@ -2755,6 +2755,422 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         }
     }
 
+    /// Run a HOMOGENEOUS ATOMIC bulk QUERY — ONE compile-checked `query!` carrier
+    /// `Q` against N runtime parameter sets, `Parse`d ONCE and re-bound for every
+    /// set, in ~ONE round trip, returning one typed [`Rows<Q>`](crate::Rows) per
+    /// command (KEEPING each command's rows). The typed-RETURNING peer of
+    /// [`execute_batch`](Self::execute_batch) and the batch peer of
+    /// [`query`](Self::query) — it closes the one gap the batch matrix leaves:
+    /// running N varying-parameter commands and KEEPING each command's typed
+    /// RETURNING rows (an `INSERT ... RETURNING id` bulk-insert wanting the N
+    /// generated keys back, typed, in one atomic batch). `pipeline` cannot express a
+    /// RUNTIME N (its arity is a fixed compile-time tuple), `execute_batch` DISCARDS
+    /// its RETURNING rows (it returns only the affected counts), and `copy_in_typed`
+    /// is INSERT-only with no RETURNING — so this verb is the only one that returns
+    /// N grouped typed results for a runtime N.
+    ///
+    /// # Grouped `Vec<Rows<Q>>` — one result per command
+    ///
+    /// The N commands map to N [`Rows<Q>`](crate::Rows), in order — SYMMETRIC with
+    /// [`execute_batch`](Self::execute_batch)'s `Vec<u64>` (one count per command).
+    /// A FLATTENED single `Rows<Q>` was rejected: it would silently lose which rows
+    /// came from which parameter set (unrecoverable for a multi-row-RETURNING
+    /// command). Memory is O(total rows) by nature — this is the EAGER peer of
+    /// [`query`](Self::query) (like `execute_batch` is eager); a constant-memory
+    /// streaming batch is a different, non-goal verb.
+    ///
+    /// # Airtight all-or-nothing (INHERITED from the pipeline core)
+    ///
+    /// The N commands ride ONE trailing `Sync`, forming a SINGLE implicit
+    /// transaction (PG §55.2.3): the whole batch commits and returns every
+    /// `Rows<Q>`, or it errors and returns ZERO (the `Vec<Rows<Q>>` is built ONLY
+    /// after the batch reaches its clean trailing `ReadyForQuery` — the server emits
+    /// that only if the whole implicit transaction COMMITTED; the provisional
+    /// per-command row prebuffers are DISCARDED on any failure). A mid-batch failure
+    /// is [`DriverError::BatchFailed`] naming the zero-based failing command
+    /// ([`batch_failed_index`](DriverError::batch_failed_index)); a COMMIT-TIME
+    /// failure (a `DEFERRABLE INITIALLY DEFERRED` constraint — every command
+    /// succeeded at `Execute`, the implicit COMMIT at the trailing `Sync` failed) is
+    /// [`DriverError::Db`] whose `batch_failed_index` is `None`. Like every verb it
+    /// does NOT auto-rollback — a mid-batch failure inside an EXPLICIT transaction
+    /// leaves it aborted (`'E'`) for its owner, so a subsequent in-guard verb is a
+    /// loud `25P02`, never a silent autocommit.
+    ///
+    /// # RESULT-schema OID guard — verified ONCE (the homogeneity optimization)
+    ///
+    /// Each command decodes into `Rows<Q>` POSITIONALLY, so — like the single typed
+    /// verbs and the heterogeneous [`pipeline`](Self::pipeline) — a runtime result
+    /// column whose type diverged from the migration schema `Q` was typed against
+    /// (an out-of-band `ALTER COLUMN TYPE`, a `TEMP` shadow) must be caught, not
+    /// silently mis-decoded. But UNLIKE the heterogeneous pipeline (which guards
+    /// per-command, since each element is a DIFFERENT carrier), `query_batch` runs
+    /// the SAME `Q` `Parse`d ONCE, so ALL N commands reuse ONE server-side plan with
+    /// ONE result descriptor — verifying command 0's runtime column OIDs against
+    /// `Q::row_oids` (via command 0's cache-MISS `Describe`(portal)) proves the
+    /// shared schema for the WHOLE batch. Every subsequent command is a BARE
+    /// `Bind`+`Execute` on that one statement (no `Describe`), so its rows conform to
+    /// the SAME verified descriptor — airtight, and cheaper than N `Describe`s. A
+    /// divergence is a classified [`DriverError::BatchColumnOidMismatch`] (the client
+    /// drains to a clean idle and returns ZERO results). A HIT command 0 (the
+    /// statement was already cached) sends no `Describe` and cannot silently
+    /// mis-decode — PostgreSQL itself refuses a reused plan's result-type change
+    /// (`0A000`, surfaced as a mid-batch `BatchFailed`), and all N reuse that plan.
+    ///
+    /// # Constant send memory, deadlock-free (the windowed batcher)
+    ///
+    /// Identical to [`execute_batch`](Self::execute_batch): the commands stream onto
+    /// the send buffer and flush at the [`BATCH_WINDOW_THRESHOLD`] threshold, each
+    /// window ending with a `Flush` (not a `Sync`, so all N stay ONE atomic
+    /// transaction under the single trailing `Sync`) whose responses are DRAINED
+    /// before the next window is staged — so a huge N never buffers all N `Bind`s and
+    /// never deadlocks. The one difference from `execute_batch`'s drive is the
+    /// GUARDED window drain ([`Engine::run_pipeline_break_guarded`](bsql_postgres_proto::engine::Engine::run_pipeline_break_guarded)):
+    /// command 0's MISS `Describe` can park a result-OID mismatch in an INTERMEDIATE
+    /// window (a `Flush`, no `Sync`), whose silent swallow-to-`ReadyForQuery` drain
+    /// would block forever, so the guarded drive BAILS on a parked mismatch and the
+    /// trailing `Sync` drains it (exactly the heterogeneous pipeline's windowed-guard
+    /// handling).
+    ///
+    /// # Boundary cases
+    ///
+    /// - `N == 0` → `Ok(vec![])` with NO wire I/O.
+    /// - `N == 1` → one window, `Parse`+`Bind`+`Describe`(MISS)+`Execute`+`Sync` —
+    ///   identical to a single [`query`](Self::query) (no regression).
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::BatchFailed`] / [`DriverError::Db`] (commit-time) /
+    /// [`DriverError::BatchColumnOidMismatch`] as above; a FATAL
+    /// transport/protocol/EOF fault (the connection is dead,
+    /// [`is_disconnect`](DriverError::is_disconnect) is `true`). A single parameter
+    /// set whose `Bind` frame exceeds the wire length field ([`DriverError::Io`] via
+    /// `FrameTooLong`) is a clean, connection-preserving error if it is the FIRST
+    /// window (nothing flushed — a consumed deferred `BEGIN` is preserved) and a
+    /// FATAL connection-kill (rolling back the open implicit transaction —
+    /// all-or-nothing preserved) if a window was already flushed.
+    pub async fn query_batch<'p, Q, I>(&mut self, params: I) -> Result<Vec<Rows<Q>>, DriverError>
+    where
+        Q: TypedQuery,
+        I: IntoIterator<Item = Q::Params<'p>>,
+    {
+        let mut slow = self.armed_slow_guard(Q::PREPARED.sql());
+        let result = self.query_batch_inner::<Q, I>(params).await;
+        Self::commit_slow(&mut slow, &result);
+        result
+    }
+
+    /// The guarded windowed drive behind [`query_batch`](Self::query_batch) — the
+    /// typed-RETURNING peer of [`execute_batch_inner`](Self::execute_batch_inner).
+    ///
+    /// Structurally identical to `execute_batch_inner` (Parse-once command 0 + BARE
+    /// subsequent commands + the windowed batcher + the pipeline settle) with exactly
+    /// three deltas, all reusing EXISTING engine seams (so `next_event` stays
+    /// byte-identical, no new dispatch state): (1) command 0 is staged via
+    /// [`stage_pipeline_command`](Core::stage_pipeline_command) (`guard = true` — a
+    /// MISS appends a `Describe`(portal) and arms the result-OID guard) instead of
+    /// `stage_execute_batch_command` (`guard = false`); (2) the window drain routes
+    /// each surface to its command's [`RowsBuilder`] (KEEP the typed rows) instead of
+    /// pushing a `u64` count, and uses the GUARDED break drive (bail on a parked
+    /// mismatch); (3) the settle first checks the parked result-OID mismatch (→
+    /// [`DriverError::BatchColumnOidMismatch`]) before the failure/`Ok` arms, and the
+    /// `Ok` arm builds the grouped `Vec<Rows<Q>>` from the per-command builders.
+    async fn query_batch_inner<'p, Q, I>(
+        &mut self,
+        params: I,
+    ) -> Result<Vec<Rows<Q>>, DriverError>
+    where
+        Q: TypedQuery,
+        I: IntoIterator<Item = Q::Params<'p>>,
+    {
+        let prepared = bsql_postgres_proto::prepared::prepared_at::<Q>();
+        let stmt_name = prepared.stmt_name();
+        let mut it = params.into_iter();
+
+        // Stage command 0 (Parse-once). An EMPTY batch does NO wire I/O.
+        let first = match it.next() {
+            None => return Ok(Vec::new()),
+            Some(p) => p,
+        };
+        // Command 0 with the RESULT-OID GUARD (`stage_pipeline_command`, guard=true):
+        // a MISS appends a `Describe`(portal) + arms the guard so the shared `Q`
+        // schema is verified ONCE (every subsequent command reuses this one
+        // server-side plan). This is the ONE staging delta from `execute_batch`,
+        // which stages command 0 guard-FALSE (it discards its RETURNING rows).
+        if let Err(e) = self.engine.stage_pipeline_command(&prepared, &first, true) {
+            core::hint::cold_path();
+            // Nothing flushed yet — discard the partial staging (preserving a
+            // consumed deferred `BEGIN`) and stay healthy.
+            self.engine.abort_pipeline_staging();
+            return Err(lift_engine_error(e));
+        }
+
+        // One row prebuffer per command, GROWN as each command is staged (a runtime
+        // N, unlike `pipeline`'s const-arity pre-allocation): a builder is pushed
+        // BEFORE its window is flushed, so `builders[current]` always exists when the
+        // drain routes that command's rows. `RowsBuilder::new()` allocates nothing
+        // until fed, so N empty builders cost only `N * size_of::<RowsBuilder>()`.
+        let (lower, _) = it.size_hint();
+        let mut builders: Vec<RowsBuilder> = Vec::with_capacity(lower.saturating_add(1));
+        builders.push(RowsBuilder::new()); // command 0
+        let mut current: usize = 0; // delivered commands (global, 0-based)
+        let mut db_error: Option<DbError> = None;
+        let mut failed_index: Option<usize> = None;
+        let mut total: usize = 1; // staged commands (command 0 staged above)
+        let mut flushed_any = false;
+
+        let mut live = self.take_live()?;
+
+        'windows: loop {
+            // Fill the current window: stage subsequent commands (BARE Bind+Execute,
+            // Parse-once, NO Describe — the shared schema was guarded on command 0)
+            // until the send buffer crosses the batcher threshold or the iterator is
+            // exhausted.
+            let mut window_full = false;
+            loop {
+                match it.next() {
+                    None => break,
+                    Some(p) => {
+                        if let Err(e) =
+                            self.engine.stage_execute_batch_command(&prepared, &p, false)
+                        {
+                            core::hint::cold_path();
+                            // A single `Bind` frame exceeded the wire length field.
+                            if flushed_any {
+                                // A window was already flushed: the implicit
+                                // transaction is OPEN with committed-nothing partial
+                                // commands. Sending a `Sync` would COMMIT the partial
+                                // (breaking all-or-nothing), so the connection MUST
+                                // die — returning WITHOUT restoring `self.live` leaves
+                                // it NotReady (the token `live` falls out of scope),
+                                // and its socket close rolls the open implicit
+                                // transaction back. All-or-nothing preserved at the
+                                // cost of the connection.
+                                return Err(lift_engine_error(e));
+                            }
+                            // First window, nothing flushed: clean abort (deferred
+                            // `BEGIN` preserved), restore the token, stay healthy.
+                            self.engine.abort_pipeline_staging();
+                            self.live = Some(live);
+                            return Err(lift_engine_error(e));
+                        }
+                        builders.push(RowsBuilder::new());
+                        total = total.saturating_add(1);
+                        if self.engine.pending_send_len() >= BATCH_WINDOW_THRESHOLD {
+                            window_full = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !window_full {
+                // The iterator is exhausted — this is the FINAL window; it is sent
+                // with the trailing `Sync` below, not a `Flush`.
+                break 'windows;
+            }
+
+            // INTERMEDIATE window: `Flush` + GUARDED drain (routing rows to builders).
+            // The sink breaks once every command staged so far has delivered. The
+            // GUARDED drive BAILS (returns `Failed`) if command 0's result-schema
+            // guard parked a mismatch in this window — an intermediate window has no
+            // `Sync`, so the silent swallow-to-`ReadyForQuery` drain would otherwise
+            // block forever; the trailing `Sync` below drains it.
+            self.engine.stage_flush();
+            flushed_any = true;
+            let window_target = total;
+            let outcome = self
+                .engine
+                .run_pipeline_break_guarded::<_, ()>(
+                    live,
+                    capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
+                        match surface {
+                            // Rows (whole or reassembled-oversize chunks) belong to
+                            // the CURRENT command; route them to its builder.
+                            Surface::Row(_) | Surface::RowChunk(_) | Surface::RowChunkEnd => {
+                                if let Some(b) = builders.get_mut(current) {
+                                    b.feed(surface);
+                                }
+                                ControlFlow::Continue(())
+                            }
+                            // A command completed: finalize its builder, advance, and
+                            // BREAK once the whole window has delivered.
+                            Surface::Deliver { .. } => {
+                                if let Some(b) = builders.get_mut(current) {
+                                    b.feed(surface);
+                                }
+                                current = current.saturating_add(1);
+                                if current >= window_target {
+                                    ControlFlow::Break(())
+                                } else {
+                                    ControlFlow::Continue(())
+                                }
+                            }
+                            // A server error: `current` is the failing command's
+                            // zero-based index. Park it + the cause once (FIRST Fail
+                            // wins); the trailing `Sync` + drain below recovers.
+                            Surface::Fail(body) if failed_index.is_none() => {
+                                failed_index = Some(current);
+                                db_error = Some(materialize::parse_error_response(body));
+                                ControlFlow::Continue(())
+                            }
+                            _ => ControlFlow::Continue(()),
+                        }
+                    }),
+                )
+                .await;
+            let (l, status) = match outcome {
+                Ok(Outcome { live, status }) => (live, status),
+                Err(other) => {
+                    core::hint::cold_path();
+                    return Err(lift_engine_error(other));
+                }
+            };
+            live = l;
+            match status {
+                // The window drained cleanly; stage the next window.
+                Boundary::Stopped(()) => {}
+                // A command in this window FAILED — a server `ErrorResponse` (parked
+                // in the sink) OR command 0's result-schema guard parked a mismatch
+                // (the guarded drive bailed). Stop staging; the trailing `Sync` +
+                // final drain recovers the connection and the settle classifies which.
+                Boundary::Failed => {
+                    core::hint::cold_path();
+                    break 'windows;
+                }
+                // A `Flush`-terminated window cannot reach a clean `Idle` (that needs
+                // the trailing `Sync`); a fatal boundary was already mapped to `Err`.
+                // `Boundary` is `#[non_exhaustive]`, so this arm is fail-closed against
+                // a future boundary — never a torn success.
+                _ => {
+                    core::hint::cold_path();
+                    break 'windows;
+                }
+            }
+        }
+
+        // FINAL DRIVE: the ONE trailing `Sync` closes the batch. Sent whether the loop
+        // ended cleanly (drive the final window's remaining commands + the batch RFQ)
+        // or aborted mid-batch (the server is skipping-to-`Sync` after an error, or
+        // draining a parked mismatch — the `Sync` produces the recovering RFQ the
+        // parked drain reads). Routes rows to builders (none arrive after a
+        // mismatch/error — all swallowed by the drain).
+        self.engine.stage_pipeline_seal();
+        let outcome = self
+            .engine
+            .run_pipeline(
+                live,
+                capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
+                    match surface {
+                        Surface::Row(_) | Surface::RowChunk(_) | Surface::RowChunkEnd => {
+                            if let Some(b) = builders.get_mut(current) {
+                                b.feed(surface);
+                            }
+                        }
+                        Surface::Deliver { .. } => {
+                            if let Some(b) = builders.get_mut(current) {
+                                b.feed(surface);
+                            }
+                            current = current.saturating_add(1);
+                        }
+                        Surface::Fail(body) if failed_index.is_none() => {
+                            failed_index = Some(current);
+                            db_error = Some(materialize::parse_error_response(body));
+                        }
+                        _ => {}
+                    }
+                    ControlFlow::Continue(())
+                }),
+            )
+            .await;
+        let live = match outcome {
+            Ok(Outcome { live, .. }) => live,
+            // FATAL: the verb consumed the token and the connection is dead.
+            Err(other) => {
+                core::hint::cold_path();
+                return Err(lift_engine_error(other));
+            }
+        };
+        self.live = Some(live);
+
+        // SETTLE — identical to `pipeline`'s: driven by the PARKED mismatch + failure,
+        // NOT the final boundary (which is `Idle` even after a mid-batch failure's
+        // recovery drain). Priority: a result-schema mismatch (a CLIENT-side rejection
+        // that may have committed server-side) first, then a server / commit-time
+        // failure, then the clean `Ok`. One statement is shared by all N commands, so
+        // record / evict it ONCE.
+        //
+        // TYPED RESULT-SCHEMA guard: command 0's cache-MISS `Describe` caught a runtime
+        // column type diverging from `Q`'s migration schema and the batch drained to a
+        // clean idle, so no garbage row reached a builder. Only command 0 `Describe`s
+        // (guard-once), so `current` is 0 here; the `current`-based index mirrors
+        // `pipeline` for symmetry. A MISS whose guard fired is NOT recorded in the cache
+        // (the mismatch check returns before the `(None, _)` record arm), so a repeat
+        // re-`Describe`s + re-guards.
+        if let Some((column, found, expected)) = self.engine.take_result_oid_mismatch() {
+            core::hint::cold_path();
+            // `current < total`, and a batch cannot exceed `u16::MAX` commands in
+            // practice; the `Err` arm is a total-conversion floor, never reached (no
+            // `as`, no `unwrap`). `unwrap_or` is banned by the silent-fallback ledger,
+            // so this explicit match is the sanctioned dead arm (as in `pipeline`).
+            #[expect(
+                clippy::manual_unwrap_or,
+                reason = "unwrap_or is a disallowed method; this explicit match is the \
+                          sanctioned dead-arm narrow — guard-once means `current` is 0 \
+                          here, so the `Err` view is unreachable, never a masked failure"
+            )]
+            let command = match u16::try_from(current) {
+                Ok(c) => c,
+                Err(_) => u16::MAX,
+            };
+            return Err(DriverError::BatchColumnOidMismatch {
+                command,
+                source: DecodeError::ColumnOidMismatch {
+                    index: column,
+                    expected,
+                    found,
+                },
+            });
+        }
+        match (failed_index, db_error) {
+            // No failure: the whole implicit transaction committed. THE ONLY `Ok`
+            // path — build the grouped `Vec<Rows<Q>>` from the per-command builders
+            // (in order). Record the statement for future HITs IF the batch left the
+            // connection at `Idle` (mirrors the serial cache rule; inside an explicit
+            // transaction it defers, since a rollback could drop it).
+            (None, _) => {
+                if matches!(self.engine.tx_status(), Ok(TxStatus::Idle)) {
+                    self.engine.record_pipeline_statement(stmt_name);
+                }
+                Ok(builders.into_iter().map(RowsBuilder::finish::<Q>).collect())
+            }
+            // A mid-batch / commit-time server failure. The N commands are ONE implicit
+            // transaction, so the server ROLLED BACK every command; the provisional
+            // builders are DISCARDED (never an `Ok`). The connection is left EXACTLY as
+            // a normal failed verb leaves it (no auto-rollback). Self-heal: evict the
+            // statement so a next attempt re-`Parse`s.
+            (Some(index), Some(db)) => {
+                core::hint::cold_path();
+                self.engine.evict_pipeline_statement(stmt_name);
+                if index >= total {
+                    // COMMIT-TIME failure: every command Executed, the implicit COMMIT
+                    // at the trailing `Sync` failed — belongs to no single command.
+                    Err(DriverError::Db(Box::new(db)))
+                } else {
+                    Err(DriverError::BatchFailed {
+                        index,
+                        source: Box::new(db),
+                    })
+                }
+            }
+            // A parked failure with no parsed cause is unreachable (a failure is reached
+            // ONLY via a surfaced `Fail`); fail-closed classified.
+            (Some(_), None) => {
+                core::hint::cold_path();
+                self.engine.evict_pipeline_statement(stmt_name);
+                Err(DriverError::UnclassifiedFailure)
+            }
+        }
+    }
+
     // ── Transaction / session boundary primitives ───────────────────────────
 
     /// Arm a DEFERRED `BEGIN`: it is not sent now, but fused into the flush of the

@@ -193,6 +193,10 @@ fn unknown_reference_is_compile_error() {
     // `Params` is a type error at the call — a bulk write cannot carry a mistyped set.
     t.compile_fail("tests/compile_fail/execute_batch_wrong_param.rs");
 
+    // The typed-RETURNING `query_batch` peer: a mistyped parameter set is the SAME
+    // E0271 at the call — a bulk QUERY cannot carry a mistyped set either.
+    t.compile_fail("tests/compile_fail/query_batch_wrong_param.rs");
+
     // SQL VIEWS (`0022_views.sql`):
     //   * a `query!` INSERT/UPDATE/DELETE ... RETURNING targeting a VIEW is a loud
     //     `WriteToView` — a view is not writable, so accepting the write at build

@@ -1,0 +1,18 @@
+error[E0271]: type mismatch resolving `<Vec<(&str,)> as IntoIterator>::Item == (i64,)`
+  --> tests/compile_fail/query_batch_wrong_param.rs:18:49
+   |
+18 |     let _ = c.query_batch::<QbMismatchQuery, _>(vec![("hostile",)]);
+   |               -----------                       ^^^^^^^^^^^^^^^^^^ expected `(i64,)`, found `(&str,)`
+   |               |
+   |               required by a bound introduced by this call
+   |
+   = note: expected tuple `(i64,)`
+              found tuple `(&str,)`
+note: required by a bound in `Connection::query_batch`
+  --> $WORKSPACE/crates/postgres/sync/src/connection.rs
+   |
+   |     pub fn query_batch<'p, Q, I>(&mut self, params: I) -> Result<Vec<Rows<Q>>, DriverError>
+   |            ----------- required by a bound in this associated function
+...
+   |         I: IntoIterator<Item = Q::Params<'p>>,
+   |                         ^^^^^^^^^^^^^^^^^^^^ required by this bound in `Connection::query_batch`

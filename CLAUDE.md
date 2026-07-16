@@ -154,6 +154,9 @@ cargo test -p bsql-postgres-proto --test engine_pipeline_windowed_guard # window
 cargo test -p bsql-query-sqlite-fixture --test execute_batch_sqlite    # SQLite typed execute_batch twin (in-process, read-only-scoped)
 cargo test -p bsql-query-fixture --test execute_batch_live_async -- --ignored  # live execute_batch (async: N counts + all-or-nothing bulk-write rollback + commit-time-None + no-auto-rollback + 20k-command windowed deadlock-free run; needs PG)
 cargo test -p bsql-query-fixture --test execute_batch_live_sync  -- --ignored  # live execute_batch (sync twin; needs PG)
+cargo test -p bsql-query-sqlite-fixture --test query_batch_sqlite      # SQLite typed-RETURNING query_batch twin (in-process, read-only-scoped: grouped Vec<TypedRows<Q>> + per-command grouping)
+cargo test -p bsql-query-fixture --test query_batch_live_async -- --ignored  # live query_batch (async: N grouped Rows<Q> with decoded RETURNING values + per-command grouping + all-or-nothing zero-results rollback at small AND large N + N=0/N=1 + 20k windowed + OID-guard drift + cancel; needs PG)
+cargo test -p bsql-query-fixture --test query_batch_live_sync  -- --ignored  # live query_batch (sync twin; needs PG)
 cargo test -p bsql-postgres-async --test sq_live query_each -- --ignored    # dynamic streaming witnesses (async, needs PG)
 cargo test -p bsql-postgres-sync  --test sync_live query_each -- --ignored  # dynamic streaming witnesses (sync, needs PG)
 cargo clippy -p bsql --features test-harness --all-targets              # lint the (non-default) #[bsql::test] harness
@@ -1312,6 +1315,74 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   (the staged-bytes high-water is IDENTICAL for a small-N and a 100×-larger batch, and
   bounded under 2× the threshold — driving 400 000 windowed commands), the SQLite
   `execute_batch_sqlite`, and the `execute_batch_wrong_param` trybuild golden.
+- **Homogeneous atomic bulk QUERY — `conn.query_batch::<Q>(params_iter)`**
+  (both PG drivers + the `Transaction` guard; a SQLite sequential twin). The
+  typed-RETURNING PEER of `execute_batch::<Q>` and the batch peer of `query::<Q>` —
+  it KEEPS each command's typed rows where `execute_batch` discards them: ONE
+  compile-checked `query!` carrier `Q` against N runtime parameter sets, `Parse`d
+  ONCE and re-bound per set, ONE trailing `Sync` (one implicit transaction),
+  returning a GROUPED `Vec<Rows<Q>>` — one typed result PER COMMAND, in order. This
+  is the ONLY verb that returns N grouped typed results for a RUNTIME N (a bulk
+  `INSERT ... RETURNING id` wanting the N generated keys back, typed, atomically):
+  `pipeline((…))` is a FIXED-ARITY compile-time tuple (cannot express a runtime N of
+  1000), `execute_batch` returns only `Vec<u64>` COUNTS (discards the RETURNING
+  rows), and `copy_in_typed` is INSERT-only with no RETURNING. **Return type =
+  grouped `Vec<Rows<Q>>`** (SYMMETRIC with `execute_batch`'s `Vec<u64>`, one result
+  per command): a FLATTENED single `Rows<Q>` was rejected (it silently loses which
+  rows came from which parameter set — unrecoverable for a multi-row-RETURNING
+  command), as was `Vec<Vec<Q::Record>>` (redundant with `Rows<Q>`). Memory is
+  O(total rows) BY NATURE — the EAGER peer of `query` (as `execute_batch` is eager);
+  a constant-memory streaming batch is a different, non-goal verb. **It COMPOSES
+  `execute_batch`'s Parse-once staging + `pipeline`'s guard/decode**, adding NO new
+  engine method (so `next_event` is BYTE-IDENTICAL, no new dispatch state): command 0
+  is staged via the pipeline's guard=true seam (`stage_pipeline_command` — a MISS
+  appends a `Describe`(portal) + arms the result-OID guard), every SUBSEQUENT command
+  is `execute_batch`'s BARE `Bind`+`Execute` (`stage_execute_batch_command`, Parse-once,
+  NO `Describe`), the window drive is `pipeline`'s GUARDED windowed batcher
+  (`run_pipeline_break_guarded` at the 64 KiB `BATCH_WINDOW_THRESHOLD` — command 0's
+  mismatch can park in an INTERMEDIATE window, so the BAIL is required, unlike
+  `execute_batch`'s unguarded `run_pipeline_break`), the sink routes each surface to
+  its command's `RowsBuilder` (KEEP the rows), and the SETTLE is `pipeline`'s verbatim
+  (mismatch → `BatchColumnOidMismatch`, then failure → `BatchFailed` / commit-time `Db`
+  with `batch_failed_index` `None`, then the `Ok` grouped `Vec<Rows<Q>>`). **RESULT-OID
+  guard verified ONCE — the homogeneity optimization, and it is AIRTIGHT.** Unlike the
+  heterogeneous `pipeline` (which guards per-command, each element a DIFFERENT carrier),
+  all N commands run the SAME `Q` `Parse`d ONCE → ONE server-side plan → ONE result
+  descriptor, so verifying command 0's runtime column OIDs against `Q::row_oids` (via
+  its MISS `Describe`) proves the shared schema for the WHOLE batch; every subsequent
+  bare `Bind`+`Execute` reuses that one plan, so its rows conform to the SAME verified
+  descriptor (no re-`Describe` — cheaper than N of them). A HIT command 0 sends no
+  `Describe` and cannot silently mis-decode (PG's own `0A000` refuses a reused plan's
+  result-type change, surfaced as a mid-batch `BatchFailed`), and all N reuse it. A
+  divergence is a classified `DriverError::BatchColumnOidMismatch { command: 0 }` (the
+  client drains to a clean idle and returns ZERO results). **Airtight all-or-nothing,
+  inherited from the pipeline core:** the whole batch commits and returns every
+  `Rows<Q>` or it errors and returns ZERO (the `Vec` is built ONLY after the batch's
+  clean trailing `ReadyForQuery`); NO auto-rollback (a mid-batch failure inside an
+  explicit transaction leaves it aborted `'E'` for its owner — a next in-guard verb is a
+  loud `25P02`). Constant SEND memory + deadlock-free (the windowed batcher). `N == 0`
+  does NO wire I/O (`Ok(vec![])`); `N == 1` equals a single `query` (no regression).
+  Cancellation (`57014`, connection recovers) + mid-batch transport death (classified
+  disconnect, bounded) honored. Footprints UNCHANGED (`DriverError` 24 / `ConnectConfig`
+  152 / `ActiveEngine` 432 — no new variant or field; `BatchFailed` /
+  `BatchColumnOidMismatch` are the pipeline's); `deps_pin` unchanged. **SQLite twin:**
+  `sqlite_conn.query_batch::<Q>(…)` runs the commands SEQUENTIALLY inside the standard
+  `transaction` guard, returning the SAME grouped `Vec<TypedRows<Q>>` + the IDENTICAL
+  all-or-nothing contract (no RTT win, in-process); the tx guard routes each command
+  through the NON-recording typed collect (like `execute_batch`'s
+  `exec_typed_for_changes`), so a deliberate N-command batch never looks like an N+1
+  anti-pattern under `n1-detect`. READ-ONLY under a conformance build (every SQLite
+  carrier is a SELECT — a typed WRITE batch is PostgreSQL-only). Witnessed by
+  `tools/query_fixture`'s `query_batch_live_{async,sync}` (N grouped `Rows<Q>` with the
+  DECODED RETURNING values + per-command grouping preserved for a multi-row-per-command
+  SELECT batch; the all-or-nothing ZERO-results rollback at both small AND LARGE N; N=0
+  no-I/O + N=1; the LARGE-N 20 000-command windowed deadlock-free run; the OID-guard
+  drift → `BatchColumnOidMismatch { command: 0 }` + a matching-shadow no-false-positive;
+  the cancel), the SQLite `query_batch_sqlite` (grouped `Vec<TypedRows<Q>>` + per-command
+  grouping + N=0 + in-guard), the `query_batch_wrong_param` trybuild golden (a mistyped
+  param set is the SAME E0271 as `execute_batch`), and the REUSED offline
+  `engine_execute_batch_alloc` / `engine_pipeline_windowed_guard` / `engine_hotpath_codegen`
+  gates (unchanged — `query_batch` adds no engine code).
 - **Query cancellation** — `conn.cancel_token()` mints a DETACHED
   `CancelToken` (`Send + Sync + 'static`, borrowing NOTHING from the connection)
   that can be obtained BEFORE a long query and moved to another task/thread that

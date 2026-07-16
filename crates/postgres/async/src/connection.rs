@@ -1067,6 +1067,46 @@ impl Connection {
         self.core.execute_batch::<Q, I>(params)
     }
 
+    /// Run a HOMOGENEOUS ATOMIC bulk QUERY — ONE compile-checked `query!` carrier `Q`
+    /// against N runtime parameter sets, `Parse`d ONCE and re-bound per set, in ~ONE
+    /// round trip as ONE implicit transaction, returning one typed [`Rows<Q>`] per
+    /// command (KEEPING each command's rows). The typed-RETURNING peer of
+    /// [`execute_batch`](Self::execute_batch) and the batch peer of
+    /// [`query`](Self::query) — the only verb that returns N GROUPED typed results
+    /// for a RUNTIME N (a bulk `INSERT ... RETURNING id` wanting the N generated keys
+    /// back, typed, atomically): [`pipeline`](Self::pipeline) is a fixed-arity tuple,
+    /// [`execute_batch`](Self::execute_batch) discards its RETURNING rows, and
+    /// `copy_in_typed` is INSERT-only with no RETURNING.
+    ///
+    /// # Airtight all-or-nothing
+    ///
+    /// The N commands ride ONE trailing `Sync` (a single implicit transaction): the
+    /// whole batch commits and returns every `Rows<Q>`, or it errors and returns ZERO.
+    /// A mid-batch failure is [`DriverError::BatchFailed`] naming the failing command's
+    /// zero-based index; a COMMIT-TIME failure (a deferred constraint) is
+    /// [`DriverError::Db`] with [`batch_failed_index`](DriverError::batch_failed_index)
+    /// `None`. A runtime result column whose type diverged from the migration schema is
+    /// a classified [`DriverError::BatchColumnOidMismatch`] (the shared `Q` schema is
+    /// verified ONCE, on command 0 — every command reuses that one server-side plan).
+    /// Like every verb it does NOT auto-rollback — a failure inside an explicit
+    /// transaction leaves it aborted (`'E'`) for its owner, so a next in-guard verb
+    /// fails loudly (`25P02`), never a silent autocommit. Constant send memory
+    /// regardless of N (the windowed batcher); memory is O(total rows) by nature (the
+    /// eager peer of [`query`](Self::query)). `N == 0` does no wire I/O; `N == 1`
+    /// equals a single [`query`](Self::query). See
+    /// [`Core::query_batch`](bsql_postgres_core::Core::query_batch) for the full
+    /// contract.
+    pub fn query_batch<'a, Q, I>(
+        &'a mut self,
+        params: I,
+    ) -> impl core::future::Future<Output = Result<Vec<Rows<Q>>, DriverError>> + 'a
+    where
+        Q: TypedQuery + 'a,
+        I: IntoIterator<Item = Q::Params<'a>> + 'a,
+    {
+        self.core.query_batch::<Q, I>(params)
+    }
+
     // ── Transaction / session boundary primitives ───────────────────────────
 
     /// Apply every pending migration from `source` to the database, exactly
@@ -2098,6 +2138,26 @@ impl Transaction<'_> {
         I: IntoIterator<Item = Q::Params<'a>> + 'a,
     {
         self.armed(move |c| c.execute_batch::<Q, I>(params))
+    }
+
+    /// Run a HOMOGENEOUS ATOMIC bulk QUERY inside this transaction — the guard peer of
+    /// [`Connection::query_batch`].
+    ///
+    /// The batch's OWN `Sync` does NOT close this explicit transaction (the guard owns
+    /// commit/rollback), so it composes with the surrounding scope: a mid-batch failure
+    /// rolls back the batch's commands AND leaves the transaction aborted, so the
+    /// closure returns the classified error and the guard rolls the whole transaction
+    /// back. When the batch is the FIRST statement in the body it fuses the deferred
+    /// `BEGIN` (one round trip).
+    pub fn query_batch<'a, Q, I>(
+        &'a mut self,
+        params: I,
+    ) -> impl Future<Output = Result<Vec<Rows<Q>>, DriverError>> + 'a
+    where
+        Q: TypedQuery + 'a,
+        I: IntoIterator<Item = Q::Params<'a>> + 'a,
+    {
+        self.armed(move |c| c.query_batch::<Q, I>(params))
     }
 
     // ── COPY (bulk load / unload — legal + atomic inside a transaction) ─────
