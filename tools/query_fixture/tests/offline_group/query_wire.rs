@@ -28,7 +28,7 @@ fn parse_template_is_deterministic_one_param() {
     // baked exactly those bytes — pinning the const wire bytes as
     // deterministic: `b'P' | len_i32_be | stmt_name | NUL | sql | NUL |
     // n_params_i16_be | oid_i32_be × n`.
-    let q = UserByIdQuery::PREPARED;
+    let q = UserById::PREPARED;
     let sql = q.sql();
     let stmt = q.stmt_name();
     let length = (4 + stmt.len() + 1 + sql.len() + 1 + 2 + 4) as u32;
@@ -49,7 +49,7 @@ fn parse_template_is_deterministic_one_param() {
 
 #[test]
 fn parse_template_is_deterministic_zero_params() {
-    let q = OrderKeyQuery::PREPARED;
+    let q = OrderKey::PREPARED;
     let sql = q.sql();
     let stmt = q.stmt_name();
     let length = (4 + stmt.len() + 1 + sql.len() + 1 + 2) as u32;
@@ -69,19 +69,19 @@ fn parse_template_is_deterministic_zero_params() {
 
 #[test]
 fn param_and_row_oids_track_the_inferred_types() {
-    let q = UserByIdQuery::PREPARED;
+    let q = UserById::PREPARED;
     // `$1` binds the `int8` PK; the projection is `int8` + `text`.
     assert_eq!(q.param_oids(), &[oids::INT8]);
     assert_eq!(q.row_oids(), &[oids::INT8, oids::TEXT]);
 
-    let q0 = OrderKeyQuery::PREPARED;
+    let q0 = OrderKey::PREPARED;
     assert!(q0.param_oids().is_empty());
     assert_eq!(q0.row_oids(), &[oids::INT8, oids::INT8]);
 }
 
 #[test]
 fn stmt_name_is_content_addressed_and_baked() {
-    let q = UserByIdQuery::PREPARED;
+    let q = UserById::PREPARED;
     let stmt_name = q.stmt_name();
     assert!(
         stmt_name.starts_with("bsql_q_"),
@@ -96,12 +96,12 @@ fn stmt_name_is_content_addressed_and_baked() {
         "the content-addressed stmt_name must appear in the Parse template",
     );
     // Two distinct queries content-address to distinct names.
-    assert_ne!(UserByIdQuery::PREPARED.stmt_name(), OrderKeyQuery::PREPARED.stmt_name());
+    assert_ne!(UserById::PREPARED.stmt_name(), OrderKey::PREPARED.stmt_name());
 }
 
 #[test]
 fn bind_prefix_is_portal_and_stmt_name_only() {
-    let q = UserByIdQuery::PREPARED;
+    let q = UserById::PREPARED;
     let stmt_name = q.stmt_name();
     let mut expected = vec![0u8]; // empty portal NUL
     expected.extend_from_slice(stmt_name.as_bytes());
@@ -109,13 +109,17 @@ fn bind_prefix_is_portal_and_stmt_name_only() {
     assert_eq!(q.bind_execute_prefix_for_test(), expected.as_slice());
 }
 
-// ── the carrier is a zero-size, value-less marker ───────────────────────
+// ── the plain-query carrier IS the record (one user-facing name) ────────
 //
-// Mirrors the `wire_pin!` the macro emits in every expansion. The wire
-// data lives in `.rodata`; the carrier itself is 0 bytes.
+// A plain `query!` no longer emits a separate uninhabited `{Name}Query` ZST
+// carrier: the RECORD `{Name}` is itself the carrier (it implements
+// `TypedQuery`), so `conn.query::<UserById>(..)` runs the query. The record
+// therefore has the row's real size (its columns), NOT the former ZST — the
+// wire data still lives in `.rodata`, but the carrier is the row type. A
+// runtime `ORDER BY` query keeps its separate uninhabited `{Name}{Variant}Query`
+// ZST carriers (still `wire_pin!`-ed by the macro).
 const _: () = {
-    use core::mem::{align_of, size_of};
-    assert!(size_of::<UserByIdQuery>() == 0);
-    assert!(align_of::<UserByIdQuery>() == 1);
-    assert!(size_of::<OrderKeyQuery>() == 0);
+    const fn is_carrier<Q: bsql::TypedQuery>() {}
+    is_carrier::<UserById>();
+    is_carrier::<OrderKey>();
 };

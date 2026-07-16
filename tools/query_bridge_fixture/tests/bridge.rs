@@ -48,13 +48,13 @@ bsql::query!(Dated, "SELECT day FROM events");
 // target — no `.0`, no `.into()`, no annotation at any `query!` site.
 
 #[allow(dead_code, reason = "compile-time type witnesses; never called")]
-fn _field_types_two_fixed(r: TwoFixedOwned) {
+fn _field_types_two_fixed(r: TwoFixed) {
     let _id: uuid::Uuid = r.id;
     let _created: MyTs = r.created;
 }
 
 #[allow(dead_code, reason = "compile-time type witnesses; never called")]
-fn _field_types_full_row(r: FullRowOwned) {
+fn _field_types_full_row(r: FullRow) {
     let _id: uuid::Uuid = r.id;
     let _created: MyTs = r.created;
     let _updated: Option<MyTs> = r.updated;
@@ -63,14 +63,14 @@ fn _field_types_full_row(r: FullRowOwned) {
 }
 
 #[allow(dead_code, reason = "compile-time type witnesses; never called")]
-fn _field_types_decimals(r: DecimalsOwned) {
+fn _field_types_decimals(r: Decimals) {
     let _amount: MyDecimal = r.amount;
     let _refund: Option<MyDecimal> = r.refund;
     let _rates: Vec<Option<MyDecimal>> = r.rates;
 }
 
 #[allow(dead_code, reason = "compile-time type witnesses; never called")]
-fn _field_types_dated(r: DatedOwned) {
+fn _field_types_dated(r: Dated) {
     // The `date` column decodes DIRECTLY into the consumer's `MyDate` — no
     // `.0`, no `.into()`, no annotation at the `query!` site.
     let _day: MyDate = r.day;
@@ -144,7 +144,7 @@ fn full_row() -> Vec<u8> {
 
 #[test]
 fn two_fixed_decodes_into_the_bridged_targets_on_the_fast_path() {
-    let row = TwoFixedOwned::decode(&two_fixed_row()).expect("decodes");
+    let row = TwoFixed::decode(&two_fixed_row()).expect("decodes");
     // The BARE target types, values reshaped by the converters.
     assert_eq!(row.id, uuid::Uuid::from_bytes(UUID_BYTES));
     assert_eq!(row.created, MyTs(CREATED_MICROS));
@@ -161,7 +161,7 @@ fn two_fixed_borrowed_twin_also_decodes() {
 
 #[test]
 fn full_row_decodes_scalar_nullable_array_and_native() {
-    let row = FullRowOwned::decode(&full_row()).expect("decodes");
+    let row = FullRow::decode(&full_row()).expect("decodes");
     assert_eq!(row.id, uuid::Uuid::from_bytes(UUID_BYTES));
     assert_eq!(row.created, MyTs(CREATED_MICROS));
     // Nullable bridged column: SQL NULL -> None (never a defaulted target).
@@ -181,7 +181,7 @@ fn null_in_not_null_bridged_column_is_still_classified() {
     body.extend_from_slice(&(2i16).to_be_bytes());
     body.extend_from_slice(&cell(&UUID_BYTES)); // id
     body.extend_from_slice(&i32be(-1)); // created = NULL (NOT NULL column)
-    let err = TwoFixedOwned::decode(&body).expect_err("NULL in NOT NULL is loud");
+    let err = TwoFixed::decode(&body).expect_err("NULL in NOT NULL is loud");
     assert!(matches!(
         err,
         bsql_postgres_proto::DecodeError::NullInNonNullColumn
@@ -200,9 +200,9 @@ fn null_in_not_null_bridged_column_is_still_classified() {
 
 #[test]
 fn oid_validator_runs_with_bridges_present() {
-    let _two = TwoFixedQuery::PREPARED;
-    let _full = FullRowQuery::PREPARED;
-    let _dec = DecimalsQuery::PREPARED;
+    let _two = TwoFixed::PREPARED;
+    let _full = FullRow::PREPARED;
+    let _dec = Decimals::PREPARED;
 }
 
 // ── numeric bridge witnesses ─────────────────────────────────────────────
@@ -252,7 +252,7 @@ fn numeric_columns_decode_into_the_bridged_decimal() {
     body.extend_from_slice(&i32be(-1)); // refund = SQL NULL
     body.extend_from_slice(&cell(&rates)); // rates
 
-    let row = DecimalsOwned::decode(&body).expect("decodes");
+    let row = Decimals::decode(&body).expect("decodes");
     // The BARE target type, exact decimal text reshaped by the converter.
     assert_eq!(row.amount, MyDecimal("1.50".to_string()));
     // Nullable bridged column: SQL NULL -> None.
@@ -277,7 +277,7 @@ fn date_column_decodes_into_the_bridged_calendar_type() {
     body.extend_from_slice(&(1i16).to_be_bytes()); // 1 column
     body.extend_from_slice(&cell(&59i32.to_be_bytes())); // day = 59 -> 2000-02-29
 
-    let row = DatedOwned::decode(&body).expect("decodes");
+    let row = Dated::decode(&body).expect("decodes");
     assert_eq!(
         row.day,
         MyDate {

@@ -241,7 +241,7 @@ pub struct Rows<Q: TypedQuery> {
     /// Affected-row count from the command tag.
     affected: u64,
     /// Pins the row type without owning a `Q`. `fn() -> Q` is covariant in `Q`
-    /// and imposes no auto-trait bound on the uninhabited carrier.
+    /// and imposes no auto-trait bound (the carrier `Q` may be the record type itself).
     _q: PhantomData<fn() -> Q>,
 }
 
@@ -332,8 +332,9 @@ impl<Q: TypedQuery> Rows<Q> {
 
 impl<Q: TypedQuery> std::fmt::Debug for Rows<Q> {
     /// Hand-written (not derived): the derive would demand `Q: Debug`, but the
-    /// carrier `Q` is an uninhabited marker that implements nothing. The
-    /// `PhantomData<fn() -> Q>` needs no `Q: Debug`, so the impl is bound-free.
+    /// `PhantomData<fn() -> Q>` needs no `Q: Debug`, so this impl is bound-free —
+    /// `Rows<Q>` is `Debug` regardless of the carrier `Q` (which, for a plain
+    /// query, is the record type itself).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Rows")
             .field("rows", &self.slots.len())

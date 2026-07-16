@@ -9,6 +9,6 @@
 bsql::query!(SealStmtNameRead, "SELECT id FROM users");
 
 fn main() {
-    let _hostile: &str = SealStmtNameReadQuery::PREPARED.stmt_name;
+    let _hostile: &str = SealStmtNameRead::PREPARED.stmt_name;
     let _ = _hostile;
 }

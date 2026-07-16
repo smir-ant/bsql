@@ -2,11 +2,12 @@
 //!
 //! This is the SQLite half of the flagship's execution surface. The build-time
 //! half (schema catalog + real-SQLite conformance cross-check) already ships; a
-//! `query!(Foo, "<SQL>")` emits the record twins (`Foo` / `FooOwned`) and — when
-//! the SQLite runtime is enabled AND the query is SQLite-decodable — a
-//! [`SqliteTypedQuery`] impl on the `FooQuery` carrier. A driver's typed verbs
-//! (`Connection::query::<FooQuery>` and friends) run it and decode into the
-//! typed records.
+//! `query!(Foo, "<SQL>")` emits the OWNED record `Foo` — which is ITSELF the
+//! carrier — plus the borrowed VIEW `FooRef<'q>` for a borrowing query, and —
+//! when the SQLite runtime is enabled AND the query is SQLite-decodable — a
+//! [`SqliteTypedQuery`] impl on `Foo`. A driver's typed verbs
+//! (`Connection::query::<Foo>` and friends) run it and decode into the typed
+//! records — the SAME one-name surface as the PostgreSQL bridge.
 //!
 //! # SQLite reality: verify, never coerce
 //!
@@ -48,8 +49,8 @@ pub trait ColumnSource<'a> {
 
 /// The compile-checked `query!` carrier's SQLite execution bridge.
 ///
-/// The `query!` macro emits an impl of this on the query's carrier
-/// (`FooQuery`) WHENEVER the SQLite runtime is enabled (the umbrella `sqlite`
+/// The `query!` macro emits an impl of this on the query's carrier — the record
+/// `Foo` itself — WHENEVER the SQLite runtime is enabled (the umbrella `sqlite`
 /// feature) AND the query is SQLite-decodable — every projected column is a
 /// SQLite storage class (INTEGER / REAL / TEXT / BLOB), unbridged, and the query
 /// uses no PostgreSQL-only dynamic sugar (`OPTIONAL(...)`, `= ANY(...)`, a
@@ -86,12 +87,12 @@ pub trait SqliteTypedQuery {
     /// `Params<'p>` for the caller's `'p` — a RUNTIME `&str` binds, not only a
     /// `&'static` literal. A scalar / param-free query is `'p`-invariant.
     type Params<'p>;
-    /// The borrowed record at lifetime `'q` — the macro's `Foo<'q>` (text
+    /// The borrowed record at lifetime `'q` — the macro's `FooRef<'q>` (text
     /// columns are `&'q str`, aliasing the source) or `Foo` for an all-scalar
     /// row (the `'q` is then unused).
     type Record<'q>;
-    /// The owned record twin (the macro's `FooOwned`; text is `String`),
-    /// `'static` so a decoded row outlives the result arena.
+    /// The owned record (the macro's `Foo` — the carrier itself; text is
+    /// `String`), `'static` so a decoded row outlives the result arena.
     type Owned: 'static;
     /// The SQLite-preparable SQL text — the portable form with `$N` positional
     /// parameters (which SQLite binds by index), baked at expansion.

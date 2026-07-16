@@ -54,7 +54,7 @@ fn setup_ddl(schema: &str) -> String {
 // ─────────────────────────────── sync ────────────────────────────────
 
 mod sync_driver {
-    use super::{setup_ddl, AddrOfIdQuery, PlaceByIdQuery, TaggedRowQuery, Mood};
+    use super::{setup_ddl, AddrOfId, PlaceById, TaggedRow, Mood};
     use bsql::DecodeError;
     use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, SslMode};
 
@@ -78,7 +78,7 @@ mod sync_driver {
         )
         .expect("insert 1");
 
-        let row = c.query_one::<PlaceByIdQuery>((1,)).expect("select 1");
+        let row = c.query_one::<PlaceById>((1,)).expect("select 1");
         let a = row.a.expect("column a present");
         assert_eq!(a.street.as_deref(), Some("main st"));
         assert_eq!(a.zip, Some(5));
@@ -91,7 +91,7 @@ mod sync_driver {
         // A NULL composite FIELD (`street` NULL) decodes to None inside the struct.
         c.simple_query("INSERT INTO places (id, a) VALUES (2, ROW(NULL, 9))")
             .expect("insert 2");
-        let row2 = c.query_one::<PlaceByIdQuery>((2,)).expect("select 2");
+        let row2 = c.query_one::<PlaceById>((2,)).expect("select 2");
         let a2 = row2.a.expect("column a present");
         assert_eq!(a2.street, None, "a NULL composite field decodes to None");
         assert_eq!(a2.zip, Some(9));
@@ -100,11 +100,11 @@ mod sync_driver {
         // A whole-column NULL composite decodes to None.
         c.simple_query("INSERT INTO places (id) VALUES (3)")
             .expect("insert 3");
-        let row3 = c.query_one::<PlaceByIdQuery>((3,)).expect("select 3");
+        let row3 = c.query_one::<PlaceById>((3,)).expect("select 3");
         assert_eq!(row3.a, None, "a NULL composite column is None");
 
         // An ENUM composite field recurses into the label reshape.
-        let tagged = c.query_one::<TaggedRowQuery>(()).expect("tagged");
+        let tagged = c.query_one::<TaggedRow>(()).expect("tagged");
         let tv = tagged.t.expect("tagged value");
         assert_eq!(tv.label.as_deref(), Some("note"));
         assert_eq!(tv.feeling, Some(Mood::Happy), "ENUM composite field recurses");
@@ -115,7 +115,7 @@ mod sync_driver {
         // never a panic or a silently-wrong record.
         c.simple_query("ALTER TYPE addr ADD ATTRIBUTE country text CASCADE")
             .expect("add out-of-band attribute");
-        let drifted = c.query_one::<AddrOfIdQuery>((1,));
+        let drifted = c.query_one::<AddrOfId>((1,));
         match drifted {
             Err(DriverError::Decode(DecodeError::CompositeArityMismatch {
                 expected: 2,
@@ -132,7 +132,7 @@ mod sync_driver {
 // ─────────────────────────────── async ───────────────────────────────
 
 mod async_driver {
-    use super::{setup_ddl, PlaceByIdQuery, TaggedRowQuery, Mood};
+    use super::{setup_ddl, PlaceById, TaggedRow, Mood};
     use bsql_postgres_async::{ConnectConfig, Connection, SslMode};
 
     fn config() -> ConnectConfig {
@@ -156,7 +156,7 @@ mod async_driver {
         .await
         .expect("insert 1");
 
-        let row = c.query_one::<PlaceByIdQuery>((1,)).await.expect("select 1");
+        let row = c.query_one::<PlaceById>((1,)).await.expect("select 1");
         let a = row.a.expect("a present");
         assert_eq!(a.street.as_deref(), Some("oak st"));
         assert_eq!(a.zip, Some(3));
@@ -164,7 +164,7 @@ mod async_driver {
         assert_eq!(seat.street.as_deref(), Some("fir st"), "nested recurses (async)");
         assert_eq!(seat.zip, Some(8));
 
-        let tagged = c.query_one::<TaggedRowQuery>(()).await.expect("tagged");
+        let tagged = c.query_one::<TaggedRow>(()).await.expect("tagged");
         let tv = tagged.t.expect("tagged value");
         assert_eq!(tv.feeling, Some(Mood::Happy), "enum field recurses (async)");
 

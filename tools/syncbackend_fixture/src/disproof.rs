@@ -31,7 +31,7 @@ use bsql::{RunsOn, SyncBackend, SyncQueries};
 // The naive unification bounds a method `Q: TypedQuery + SqliteTypedQuery` and
 // names `Q::Owned`. Because a carrier implements BOTH traits and each declares
 // its own `Owned` associated type, `Q::Owned` is AMBIGUOUS — even though the
-// macro makes both the SAME concrete `FooOwned`, the trait solver does not know
+// macro makes both the SAME concrete `Foo`, the trait solver does not know
 // that. Verbatim:
 //
 //   error[E0221]: ambiguous associated type `Owned` in bounds of `Q`
@@ -55,17 +55,17 @@ pub fn ambiguous_owned<Q: bsql::TypedQuery + sqlite::SqliteTypedQuery>(x: Q::Own
 // clean (`wipe_in_tx` in `lib.rs`). But running a generic TYPED `fetch_*` on the
 // guard needs a higher-ranked bound over the guard's lifetime:
 //
-//   for<'t> UserRowQuery: RunsOn<B::Tx<'t>, Params = (), Owned = UserRowOwned>
+//   for<'t> UserRow: RunsOn<B::Tx<'t>, Params = (), Owned = UserRow>
 //
 // This bound is provable when ASSUMED — the generic function DEFINITION below
 // type-checks. But at a CALL site the trait solver cannot INFER `B` through the
 // higher-ranked bound, so it fails to discharge it. Verbatim (calling
 // `load_users_in_tx` with a concrete `sqlite::Connection`, no turbofish):
 //
-//   error[E0277]: the trait bound `for<'t> UserRowQuery: RunsOn<<_ as SyncBackend>::Tx<'t>>` is not satisfied
+//   error[E0277]: the trait bound `for<'t> UserRow: RunsOn<<_ as SyncBackend>::Tx<'t>>` is not satisfied
 //    --> tools/syncbackend_fixture/src/disproof.rs
 //     |     let _ = load_users_in_tx(&mut conn);
-//     |             ---------------- ^^^^^^^^^ the trait `for<'t> RunsOn<<_ as SyncBackend>::Tx<'t>>` is not implemented for `UserRowQuery`
+//     |             ---------------- ^^^^^^^^^ the trait `for<'t> RunsOn<<_ as SyncBackend>::Tx<'t>>` is not implemented for `UserRow`
 //     |             |
 //     |             required by a bound introduced by this call
 //     |
@@ -80,15 +80,15 @@ pub fn ambiguous_owned<Q: bsql::TypedQuery + sqlite::SqliteTypedQuery>(x: Q::Own
 // carries the raw-SQL grouping. This is the tx-guard's honest scope limit.
 
 // The DEFINITION type-checks (the bound is assumed here).
-pub fn load_users_in_tx<B>(conn: &mut B) -> Result<Vec<super::UserRowOwned>, B::Error>
+pub fn load_users_in_tx<B>(conn: &mut B) -> Result<Vec<super::UserRow>, B::Error>
 where
     B: SyncBackend,
-    for<'t> super::UserRowQuery: RunsOn<B::Tx<'t>, Params = (), Owned = super::UserRowOwned>,
+    for<'t> super::UserRow: RunsOn<B::Tx<'t>, Params = (), Owned = super::UserRow>,
 {
-    conn.transaction(|tx| tx.fetch_all::<super::UserRowQuery>(()))
+    conn.transaction(|tx| tx.fetch_all::<super::UserRow>(()))
 }
 
 // The CALL is where it fails (E0277 above) — the solver cannot infer `B`.
-pub fn force_the_e0277(conn: &mut sqlite::Connection) -> Result<Vec<super::UserRowOwned>, sqlite::SqliteError> {
+pub fn force_the_e0277(conn: &mut sqlite::Connection) -> Result<Vec<super::UserRow>, sqlite::SqliteError> {
     load_users_in_tx(conn)
 }

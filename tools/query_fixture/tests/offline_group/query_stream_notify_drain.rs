@@ -49,7 +49,7 @@ async fn notification_in_drained_tail_is_captured_async() {
     // drained remainder the reclaim reads.
     let mut seen = 0usize;
     let out = conn
-        .query_each::<StreamUsersQuery, _, _>((), |_row| {
+        .query_each::<StreamUsers, _, _>((), |_row| {
             seen += 1;
             ControlFlow::<()>::Break(())
         })
@@ -82,7 +82,7 @@ fn notification_in_drained_tail_is_captured_sync() {
 
     let mut seen = 0usize;
     let out = conn
-        .query_each::<StreamUsersQuery, _, _>((), |_row| {
+        .query_each::<StreamUsers, _, _>((), |_row| {
             seen += 1;
             ControlFlow::<()>::Break(())
         })

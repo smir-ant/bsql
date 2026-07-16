@@ -102,7 +102,7 @@ fn build_pool(config: ConnectConfig) -> Pool {
 /// fresh checkout; a genuine query error propagates unchanged.
 async fn find_user_by_email(pool: &Pool, email: &str) -> Result<Option<(i64, String)>, DriverError> {
     let mut pooled = pool.get().await?;
-    let first = pooled.conn_mut()?.query_opt::<UserByEmailQuery>((email,)).await;
+    let first = pooled.conn_mut()?.query_opt::<UserByEmail>((email,)).await;
     let found = match first {
         Ok(found) => found,
         // Connection dead mid-query → drop it (the pool evicts it) and retry once
@@ -110,7 +110,7 @@ async fn find_user_by_email(pool: &Pool, email: &str) -> Result<Option<(i64, Str
         Err(e) if e.is_disconnect() => {
             drop(pooled);
             let mut fresh = pool.get().await?;
-            fresh.conn_mut()?.query_opt::<UserByEmailQuery>((email,)).await?
+            fresh.conn_mut()?.query_opt::<UserByEmail>((email,)).await?
         }
         // A per-query error the connection SURVIVED (bad param, etc.) — surface it.
         Err(e) => return Err(e),
@@ -124,7 +124,7 @@ async fn find_user_by_email(pool: &Pool, email: &str) -> Result<Option<(i64, Str
 /// `DriverError` via `?` (never a silent skip).
 async fn orders_for_user(pool: &Pool, user_id: i64) -> Result<Vec<(i64, Option<i32>)>, DriverError> {
     let mut pooled = pool.get().await?;
-    let rows = pooled.conn_mut()?.query::<OrdersForUserQuery>((user_id,)).await?;
+    let rows = pooled.conn_mut()?.query::<OrdersForUser>((user_id,)).await?;
     let mut out = Vec::new();
     for row in rows.iter() {
         let row = row?; // classified DecodeError -> DriverError
@@ -142,14 +142,14 @@ async fn create_user_with_order(pool: &Pool, new_user: &NewUser) -> Result<i64, 
         .conn_mut()?
         .transaction(async |tx| {
             let user = tx
-                .query_one::<InsertUserQuery>((
+                .query_one::<InsertUser>((
                     new_user.id,
                     new_user.email.as_str(),
                     new_user.bio.as_str(),
                     new_user.name.as_str(),
                 ))
                 .await?;
-            tx.query_one::<InsertOrderQuery>((new_user.first_order_id, new_user.id)).await?;
+            tx.query_one::<InsertOrder>((new_user.first_order_id, new_user.id)).await?;
             Ok(user.id) // -> COMMIT (the returned user id); any Err above -> ROLLBACK
         })
         .await

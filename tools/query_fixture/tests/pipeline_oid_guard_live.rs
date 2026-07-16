@@ -67,7 +67,7 @@ fn ut_setup(schema: &str) -> String {
 }
 
 mod sync_driver {
-    use super::{BindExt, OID_INT4, OID_TEXT, PgAgeQuery, PgBpQuery, PgNQuery, PgTagQuery, PgVcQuery};
+    use super::{BindExt, OID_INT4, OID_TEXT, PgAge, PgBp, PgN, PgTag, PgVc};
     use bsql::DecodeError;
     use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, SslMode};
 
@@ -101,7 +101,7 @@ mod sync_driver {
         shadow_drift(&mut c);
         // Command #0 (`n` int4) matches; command #1 (`tag`, typed text, is int4 in
         // the shadow) drifts. The guard fires on command #1's RowDescription.
-        match c.pipeline((PgNQuery::bind(()), PgTagQuery::bind(()))) {
+        match c.pipeline((PgN::bind(()), PgTag::bind(()))) {
             Err(e @ DriverError::BatchColumnOidMismatch { .. }) => {
                 assert_eq!(
                     e.batch_failed_index(),
@@ -135,7 +135,7 @@ mod sync_driver {
         let mut c = Connection::connect(&config()).expect("connect");
         shadow_match(&mut c);
         let (n, tag) = c
-            .pipeline((PgNQuery::bind(()), PgTagQuery::bind(())))
+            .pipeline((PgN::bind(()), PgTag::bind(())))
             .expect("matching pipeline runs");
         assert_eq!(n.iter().next().expect("row").expect("decode").n, 42);
         assert_eq!(tag.iter().next().expect("row").expect("decode").tag, "hello");
@@ -150,7 +150,7 @@ mod sync_driver {
         // `vc` (varchar, native OID 1043) and `bp` (bpchar, 1042) both marker-type to
         // the `text` (25) class — one wire decode, so NEITHER is a false mismatch.
         let (vc, bp) = c
-            .pipeline((PgVcQuery::bind(()), PgBpQuery::bind(())))
+            .pipeline((PgVc::bind(()), PgBp::bind(())))
             .expect("varchar/bpchar pipeline runs");
         assert_eq!(vc.iter().next().expect("row").expect("decode").vc, "vv");
         let bp_val = bp.iter().next().expect("row").expect("decode").bp;
@@ -172,7 +172,7 @@ mod sync_driver {
         c.simple_query("INSERT INTO members (id, a) VALUES (1, 30)")
             .expect("insert member");
         let (age,) = c
-            .pipeline((PgAgeQuery::bind((1,)),))
+            .pipeline((PgAge::bind((1,)),))
             .expect("domain-column pipeline runs");
         assert_eq!(age.iter().next().expect("row").expect("decode").a, 30);
         c.simple_query(&format!("DROP SCHEMA {schema} CASCADE"))
@@ -182,7 +182,7 @@ mod sync_driver {
 }
 
 mod async_driver {
-    use super::{BindExt, OID_INT4, OID_TEXT, PgAgeQuery, PgBpQuery, PgNQuery, PgTagQuery, PgVcQuery};
+    use super::{BindExt, OID_INT4, OID_TEXT, PgAge, PgBp, PgN, PgTag, PgVc};
     use bsql::DecodeError;
     use bsql_postgres_async::{ConnectConfig, Connection, DriverError, SslMode};
 
@@ -215,7 +215,7 @@ mod async_driver {
     async fn a_drifted_pipeline_command_is_a_classified_batch_column_oid_mismatch() {
         let mut c = Connection::connect(&config()).await.expect("connect");
         shadow_drift(&mut c).await;
-        match c.pipeline((PgNQuery::bind(()), PgTagQuery::bind(()))).await {
+        match c.pipeline((PgN::bind(()), PgTag::bind(()))).await {
             Err(e @ DriverError::BatchColumnOidMismatch { .. }) => {
                 assert_eq!(e.batch_failed_index(), Some(1), "drift attributed to command #1");
                 assert!(!e.is_disconnect(), "a schema drift is not a disconnect");
@@ -246,7 +246,7 @@ mod async_driver {
         let mut c = Connection::connect(&config()).await.expect("connect");
         shadow_match(&mut c).await;
         let (n, tag) = c
-            .pipeline((PgNQuery::bind(()), PgTagQuery::bind(())))
+            .pipeline((PgN::bind(()), PgTag::bind(())))
             .await
             .expect("matching pipeline runs");
         assert_eq!(n.iter().next().expect("row").expect("decode").n, 42);
@@ -260,7 +260,7 @@ mod async_driver {
         let mut c = Connection::connect(&config()).await.expect("connect");
         shadow_match(&mut c).await;
         let (vc, bp) = c
-            .pipeline((PgVcQuery::bind(()), PgBpQuery::bind(())))
+            .pipeline((PgVc::bind(()), PgBp::bind(())))
             .await
             .expect("varchar/bpchar pipeline runs");
         assert_eq!(vc.iter().next().expect("row").expect("decode").vc, "vv");
@@ -281,7 +281,7 @@ mod async_driver {
             .await
             .expect("insert member");
         let (age,) = c
-            .pipeline((PgAgeQuery::bind((1,)),))
+            .pipeline((PgAge::bind((1,)),))
             .await
             .expect("domain-column pipeline runs");
         assert_eq!(age.iter().next().expect("row").expect("decode").a, 30);

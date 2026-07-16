@@ -55,22 +55,22 @@ fn sync_bridged_columns_round_trip() {
     let mut c = Connection::connect(&config).expect("connect");
 
     // `timestamptz` -> the dep-free stand-in target.
-    let ts = c.query_one::<LiveTsQuery>(()).expect("query_one LiveTs");
+    let ts = c.query_one::<LiveTs>(()).expect("query_one LiveTs");
     let created: MyTs = ts.created;
     assert_eq!(created, MyTs(0), "PG-epoch timestamptz -> MyTs(0)");
 
     // `uuid` -> the real external `uuid::Uuid` target.
-    let id_row = c.query_one::<LiveUuidQuery>(()).expect("query_one LiveUuid");
+    let id_row = c.query_one::<LiveUuid>(()).expect("query_one LiveUuid");
     let id: uuid::Uuid = id_row.id;
     assert_eq!(id, uuid::Uuid::from_bytes(EXPECTED_UUID));
 
     // `numeric` -> the dep-free `MyDecimal` target, exact decimal text.
-    let amt = c.query_one::<LiveNumericQuery>(()).expect("query_one LiveNumeric");
+    let amt = c.query_one::<LiveNumeric>(()).expect("query_one LiveNumeric");
     let amount: MyDecimal = amt.amount;
     assert_eq!(amount, MyDecimal("1234.5600".to_string()), "numeric -> exact MyDecimal");
 
     // `date` -> the dep-free `MyDate` target via the civil conversion.
-    let dt = c.query_one::<LiveDateQuery>(()).expect("query_one LiveDate");
+    let dt = c.query_one::<LiveDate>(()).expect("query_one LiveDate");
     let day: MyDate = dt.day;
     assert_eq!(
         day,
@@ -92,28 +92,28 @@ async fn async_bridged_columns_round_trip() {
     let mut c = Connection::connect(&config).await.expect("connect");
 
     let ts = c
-        .query_one::<LiveTsQuery>(())
+        .query_one::<LiveTs>(())
         .await
         .expect("query_one LiveTs");
     let created: MyTs = ts.created;
     assert_eq!(created, MyTs(0), "PG-epoch timestamptz -> MyTs(0)");
 
     let id_row = c
-        .query_one::<LiveUuidQuery>(())
+        .query_one::<LiveUuid>(())
         .await
         .expect("query_one LiveUuid");
     let id: uuid::Uuid = id_row.id;
     assert_eq!(id, uuid::Uuid::from_bytes(EXPECTED_UUID));
 
     let amt = c
-        .query_one::<LiveNumericQuery>(())
+        .query_one::<LiveNumeric>(())
         .await
         .expect("query_one LiveNumeric");
     let amount: MyDecimal = amt.amount;
     assert_eq!(amount, MyDecimal("1234.5600".to_string()), "numeric -> exact MyDecimal");
 
     let dt = c
-        .query_one::<LiveDateQuery>(())
+        .query_one::<LiveDate>(())
         .await
         .expect("query_one LiveDate");
     let day: MyDate = dt.day;

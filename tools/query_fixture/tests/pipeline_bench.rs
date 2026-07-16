@@ -57,8 +57,8 @@ async fn pipeline_vs_sequential_wall_clock() {
     // Warm the per-connection statement cache so both sides measure the steady
     // state (one Parse, then plan reuse) — the fair comparison.
     for _ in 0..3 {
-        c.query_one::<BQuery>(()).await.expect("warm");
-        drop(c.pipeline((BQuery::bind(()), BQuery::bind(()))).await.expect("warm pipe"));
+        c.query_one::<B>(()).await.expect("warm");
+        drop(c.pipeline((B::bind(()), B::bind(()))).await.expect("warm pipe"));
     }
 
     println!("\n  K | sequential (K× query_one) | pipeline (1 round trip) | speedup");
@@ -67,12 +67,12 @@ async fn pipeline_vs_sequential_wall_clock() {
     // K = 2
     let seq = time_it(iters, async || {
         for _ in 0..2 {
-            c.query_one::<BQuery>(()).await.expect("seq");
+            c.query_one::<B>(()).await.expect("seq");
         }
     })
     .await;
     let pipe = time_it(iters, async || {
-        drop(c.pipeline((BQuery::bind(()), BQuery::bind(()))).await.expect("pipe"));
+        drop(c.pipeline((B::bind(()), B::bind(()))).await.expect("pipe"));
     })
     .await;
     report(2, seq, pipe);
@@ -80,14 +80,14 @@ async fn pipeline_vs_sequential_wall_clock() {
     // K = 4
     let seq = time_it(iters, async || {
         for _ in 0..4 {
-            c.query_one::<BQuery>(()).await.expect("seq");
+            c.query_one::<B>(()).await.expect("seq");
         }
     })
     .await;
     let pipe = time_it(iters, async || {
         drop(
             c.pipeline((
-                BQuery::bind(()), BQuery::bind(()), BQuery::bind(()), BQuery::bind(()),
+                B::bind(()), B::bind(()), B::bind(()), B::bind(()),
             ))
             .await
             .expect("pipe"),
@@ -99,15 +99,15 @@ async fn pipeline_vs_sequential_wall_clock() {
     // K = 8
     let seq = time_it(iters, async || {
         for _ in 0..8 {
-            c.query_one::<BQuery>(()).await.expect("seq");
+            c.query_one::<B>(()).await.expect("seq");
         }
     })
     .await;
     let pipe = time_it(iters, async || {
         drop(
             c.pipeline((
-                BQuery::bind(()), BQuery::bind(()), BQuery::bind(()), BQuery::bind(()),
-                BQuery::bind(()), BQuery::bind(()), BQuery::bind(()), BQuery::bind(()),
+                B::bind(()), B::bind(()), B::bind(()), B::bind(()),
+                B::bind(()), B::bind(()), B::bind(()), B::bind(()),
             ))
             .await
             .expect("pipe"),
@@ -119,17 +119,17 @@ async fn pipeline_vs_sequential_wall_clock() {
     // K = 16
     let seq = time_it(iters, async || {
         for _ in 0..16 {
-            c.query_one::<BQuery>(()).await.expect("seq");
+            c.query_one::<B>(()).await.expect("seq");
         }
     })
     .await;
     let pipe = time_it(iters, async || {
         drop(
             c.pipeline((
-                BQuery::bind(()), BQuery::bind(()), BQuery::bind(()), BQuery::bind(()),
-                BQuery::bind(()), BQuery::bind(()), BQuery::bind(()), BQuery::bind(()),
-                BQuery::bind(()), BQuery::bind(()), BQuery::bind(()), BQuery::bind(()),
-                BQuery::bind(()), BQuery::bind(()), BQuery::bind(()), BQuery::bind(()),
+                B::bind(()), B::bind(()), B::bind(()), B::bind(()),
+                B::bind(()), B::bind(()), B::bind(()), B::bind(()),
+                B::bind(()), B::bind(()), B::bind(()), B::bind(()),
+                B::bind(()), B::bind(()), B::bind(()), B::bind(()),
             ))
             .await
             .expect("pipe"),

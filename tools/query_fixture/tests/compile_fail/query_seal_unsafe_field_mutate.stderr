@@ -2,7 +2,7 @@ error: usage of an `unsafe` block
   --> tests/compile_fail/query_seal_unsafe_field_mutate.rs:13:5
    |
 13 | /     unsafe {
-14 | |         let sql_ptr = &SealUnsafeMutateQuery::PREPARED.sql as *const &str as *mut &str;
+14 | |         let sql_ptr = &SealUnsafeMutate::PREPARED.sql as *const &str as *mut &str;
 15 | |         sql_ptr.write("DROP TABLE users; --");
 16 | |     }
    | |_____^
@@ -14,12 +14,12 @@ note: the lint level is defined here
    |           ^^^^^^^^^^^
 
 error[E0616]: field `sql` of struct `PreparedQuery` is private
-  --> tests/compile_fail/query_seal_unsafe_field_mutate.rs:14:56
+  --> tests/compile_fail/query_seal_unsafe_field_mutate.rs:14:51
    |
-14 |         let sql_ptr = &SealUnsafeMutateQuery::PREPARED.sql as *const &str as *mut &str;
-   |                                                        ^^^ private field
+14 |         let sql_ptr = &SealUnsafeMutate::PREPARED.sql as *const &str as *mut &str;
+   |                                                   ^^^ private field
    |
 help: a method `sql` also exists, call it with parentheses
    |
-14 |         let sql_ptr = &SealUnsafeMutateQuery::PREPARED.sql() as *const &str as *mut &str;
-   |                                                           ++
+14 |         let sql_ptr = &SealUnsafeMutate::PREPARED.sql() as *const &str as *mut &str;
+   |                                                      ++

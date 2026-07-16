@@ -184,7 +184,7 @@ fn drive_base() -> (usize, i64) {
             let before = ALLOC.snapshot();
             let outcome = poll_once(engine.query_params_break(
                 live,
-                &OneAllocQuery::PREPARED,
+                &OneAlloc::PREPARED,
                 (),
                 |s| {
                     builder.feed(s);
@@ -198,7 +198,7 @@ fn drive_base() -> (usize, i64) {
                 }
                 other => panic!("base drive failed: {other:?}"),
             };
-            let rows: Rows<OneAllocQuery> = builder.finish::<OneAllocQuery>();
+            let rows: Rows<OneAlloc> = builder.finish::<OneAlloc>();
             let owned = rows
                 .into_owned()
                 .expect("row decodes")
@@ -230,12 +230,12 @@ fn drive_direct() -> (usize, i64) {
                 Ok(Ok(live)) => live,
                 other => panic!("handshake must reach active, got {other:?}"),
             };
-            let mut row: Option<<OneAllocQuery as TypedQuery>::Owned> = None;
+            let mut row: Option<<OneAlloc as TypedQuery>::Owned> = None;
             let mut seen_first = false;
             let before = ALLOC.snapshot();
             let outcome = poll_once(engine.query_params_break(
                 live,
-                &OneAllocQuery::PREPARED,
+                &OneAlloc::PREPARED,
                 (),
                 |s| match s {
                     Surface::Row(body) => {
@@ -243,7 +243,7 @@ fn drive_direct() -> (usize, i64) {
                             return ControlFlow::Break(());
                         }
                         seen_first = true;
-                        if let Ok(owned) = OneAllocQuery::decode_owned(body) {
+                        if let Ok(owned) = OneAlloc::decode_owned(body) {
                             row = Some(owned);
                         }
                         ControlFlow::Continue(())

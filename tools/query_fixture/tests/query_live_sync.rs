@@ -242,7 +242,7 @@ fn sync_config() -> ConnectConfig {
 fn typed_literal_select_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    let rows = c.query::<OneQuery>(()).expect("query One");
+    let rows = c.query::<One>(()).expect("query One");
     assert_eq!(rows.len(), 1, "exactly one row");
     let rec = rows
         .iter()
@@ -253,7 +253,7 @@ fn typed_literal_select_round_trip() {
 
     // `query_one` returns the OWNED twin (outlives the buffer). Distinct
     // carrier (`Seven`) so its statement name does not collide with `One`.
-    let owned = c.query_one::<SevenQuery>(()).expect("query_one Seven");
+    let owned = c.query_one::<Seven>(()).expect("query_one Seven");
     assert_eq!(owned.n, 7, "SELECT 7::int4 must decode to n == 7");
 
     c.close().expect("close");
@@ -266,7 +266,7 @@ fn typed_literal_select_round_trip() {
 fn typed_text_column_borrows_zero_copy() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    let rows = c.query::<HiQuery>(()).expect("query Hi");
+    let rows = c.query::<Hi>(()).expect("query Hi");
     assert_eq!(rows.len(), 1);
     let rec = rows
         .iter()
@@ -286,7 +286,7 @@ fn typed_text_column_borrows_zero_copy() {
 fn typed_multi_row_iter_and_into_owned() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    let rows = c.query::<NumsQuery>(()).expect("query Nums");
+    let rows = c.query::<Nums>(()).expect("query Nums");
     assert_eq!(rows.len(), 3, "three VALUES rows");
 
     // iter() yields all three, in order.
@@ -312,13 +312,13 @@ fn typed_multi_row_iter_and_into_owned() {
 fn query_one_classifies_zero_and_many() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    let none = c.query_one::<NoneRowQuery>(());
+    let none = c.query_one::<NoneRow>(());
     assert!(
         matches!(none, Err(DriverError::NoRows)),
         "zero rows must be NoRows, got {none:?}"
     );
 
-    let many = c.query_one::<ManyQuery>(());
+    let many = c.query_one::<Many>(());
     assert!(
         matches!(many, Err(DriverError::TooManyRows)),
         "two rows must be TooManyRows, got {many:?}"
@@ -339,15 +339,15 @@ fn query_opt_classifies_zero_one_and_many() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
     // Zero rows -> Ok(None) (NOT NoRows — the whole point of the opt shape).
-    let none = c.query_opt::<NoneRowQuery>(()).expect("query_opt runs");
+    let none = c.query_opt::<NoneRow>(()).expect("query_opt runs");
     assert!(none.is_none(), "zero rows must be Ok(None), got {none:?}");
 
     // Exactly one row -> Ok(Some(owned record)).
-    let one = c.query_opt::<OneQuery>(()).expect("query_opt runs");
+    let one = c.query_opt::<One>(()).expect("query_opt runs");
     assert_eq!(one.expect("one row present").n, 1, "the single row decodes");
 
     // Two rows -> TooManyRows (loud, same as query_one — never a silent first row).
-    let many = c.query_opt::<ManyQuery>(());
+    let many = c.query_opt::<Many>(());
     assert!(
         matches!(many, Err(DriverError::TooManyRows)),
         "two rows must be TooManyRows, got {many:?}"
@@ -365,13 +365,13 @@ fn typed_params_int_and_text_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
     let n = c
-        .query_one::<EchoQuery>((42,))
+        .query_one::<Echo>((42,))
         .expect("query_one Echo(42)");
     assert_eq!(n.n, 42, "int4 param 42 must round-trip");
 
     // A `&'static str` literal binds through the text-param path.
     let s = c
-        .query_one::<EchoSQuery>(("hi",))
+        .query_one::<EchoS>(("hi",))
         .expect("query_one EchoS(\"hi\")");
     assert_eq!(s.s, "hi", "text param \"hi\" must round-trip");
 
@@ -403,7 +403,7 @@ fn param_type_fidelity_three_path_parity() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
     // Path 1 (TYPED) and path 2 (DYNAMIC) AGREE on the correct int4 → 42.
-    let typed = c.query_one::<EchoQuery>((42,)).expect("typed int4 round-trips");
+    let typed = c.query_one::<Echo>((42,)).expect("typed int4 round-trips");
     assert_eq!(typed.n, 42);
     let dynamic = c
         .query_params_one("SELECT $1::int4 AS n", &(42_i32,))
@@ -424,11 +424,11 @@ fn param_type_fidelity_three_path_parity() {
         ),
         other => panic!("the dynamic wrong-typed bind must be DriverError::Db, got {other:?}"),
     }
-    // Path 1 (TYPED) rejects the SAME wrong bind at COMPILE — `c.query_one::<EchoQuery>(("AAAA",))`
-    // does not compile (the `EchoQuery::Params<'p>` is `(i32,)`), pinned by the
+    // Path 1 (TYPED) rejects the SAME wrong bind at COMPILE — `c.query_one::<Echo>(("AAAA",))`
+    // does not compile (the `Echo::Params<'p>` is `(i32,)`), pinned by the
     // `compile_fail/query_arg_type_mismatch.rs` trybuild golden. The connection is
     // still usable after the dynamic error (drained to idle):
-    let recovered = c.query_one::<EchoQuery>((7,)).expect("typed path recovers");
+    let recovered = c.query_one::<Echo>((7,)).expect("typed path recovers");
     assert_eq!(recovered.n, 7);
 
     // Path 3 (EXPLICIT PREPARED) agrees, and is STRICTER than the dynamic path: a
@@ -458,12 +458,12 @@ fn typed_nullable_column_decodes_none_and_some() {
 
     // `NULL::int4` is nullable -> the field is `Option<i32>`; the value is None.
     let only_null = c
-        .query_one::<WithNullQuery>(())
+        .query_one::<WithNull>(())
         .expect("query_one WithNull");
     assert_eq!(only_null.n, None, "NULL::int4 must decode to None");
 
     // A VALUES column with a NULL row carries Some(7) then None.
-    let rows = c.query::<MaybeNumQuery>(()).expect("query MaybeNum");
+    let rows = c.query::<MaybeNum>(()).expect("query MaybeNum");
     let vals: Vec<Option<i32>> = rows.iter().map(|r| r.expect("decodes").n).collect();
     assert_eq!(vals, vec![Some(7), None], "Some(value) then None on an Option column");
 
@@ -480,7 +480,7 @@ fn same_carrier_loops_without_42p05() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     for i in 0..100 {
         let r = c
-            .query::<RepeatLitQuery>(())
+            .query::<RepeatLit>(())
             .unwrap_or_else(|e| panic!("iteration {i} must succeed, got {e:?}"));
         assert_eq!(r.len(), 1, "iteration {i}: one row");
         let rec = r.iter().next().expect("row").expect("decodes");
@@ -501,7 +501,7 @@ fn same_carrier_loops_without_42p05() {
 fn plan_is_parsed_once_and_persists() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     for _ in 0..5 {
-        assert_eq!(c.query::<RepeatLitQuery>(()).expect("run").len(), 1);
+        assert_eq!(c.query::<RepeatLit>(()).expect("run").len(), 1);
     }
     let result = c
         .query_sql("SELECT count(*)::int4 FROM pg_prepared_statements")
@@ -544,7 +544,7 @@ fn pooled_connection_reset_keeps_parsed_plan() {
         let r = c
             .conn_mut()
             .expect("live")
-            .query::<RepeatLitQuery>(())
+            .query::<RepeatLit>(())
             .unwrap_or_else(|e| panic!("checkout {i}: {e:?}"));
         assert_eq!(r.len(), 1, "checkout {i}: one row");
         // The targeted reset KEEPS statements: the server holds it exactly once,
@@ -578,7 +578,7 @@ fn pooled_reset_rolls_back_open_tx_and_keeps_plan() {
         let pid = conn.backend_pid();
         // Cache the statement durably (autocommit), THEN open a transaction and
         // leave it open, so the connection is returned with tx_status = 'T'.
-        assert_eq!(conn.query::<RepeatLitQuery>(()).expect("first use caches").len(), 1);
+        assert_eq!(conn.query::<RepeatLit>(()).expect("first use caches").len(), 1);
         conn.begin().expect("begin (leaves the tx open)");
         pid
     }; // dropped mid-transaction -> returned to the pool with an OPEN transaction
@@ -590,7 +590,7 @@ fn pooled_reset_rolls_back_open_tx_and_keeps_plan() {
     assert_eq!(conn.backend_pid(), pid, "max_size=1 must reuse the same physical connection");
     // Reuse the cached statement: must succeed (the ROLLBACK-reset kept it, no 42P05).
     assert_eq!(
-        conn.query::<RepeatLitQuery>(()).expect("reuse after rollback-reset").len(),
+        conn.query::<RepeatLit>(()).expect("reuse after rollback-reset").len(),
         1
     );
     // The server still holds it exactly once (kept across the ROLLBACK-prefixed reset).
@@ -612,13 +612,13 @@ fn pooled_reset_rolls_back_open_tx_and_keeps_plan() {
 fn query_inside_committed_transaction_then_idle_succeeds() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     let n = c
-        .transaction(|tx| Ok(tx.query::<TxLitQuery>(())?.len()))
+        .transaction(|tx| Ok(tx.query::<TxLit>(())?.len()))
         .expect("transaction commits");
     assert_eq!(n, 1, "the in-transaction query! runs");
     // The SAME carrier at Idle after the commit — Close-before-Parse re-creates
     // the (still-present) statement, so this succeeds instead of a 42P05.
     let again = c
-        .query::<TxLitQuery>(())
+        .query::<TxLit>(())
         .expect("same carrier after commit must succeed (was 42P05)");
     assert_eq!(again.len(), 1);
     c.close().expect("close");
@@ -632,7 +632,7 @@ fn same_carrier_across_many_transactions_succeeds() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     for i in 0..20 {
         let n = c
-            .transaction(|tx| Ok(tx.query::<MultiTxLitQuery>(())?.len()))
+            .transaction(|tx| Ok(tx.query::<MultiTxLit>(())?.len()))
             .unwrap_or_else(|e| panic!("transaction {i} must commit, got {e:?}"));
         assert_eq!(n, 1, "transaction {i}: one row");
     }
@@ -649,7 +649,7 @@ fn query_each_streams_all_returns_none() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     let mut collected = Vec::new();
     let done = c
-        .query_each::<StreamAllQuery, _, _>((), |rec| {
+        .query_each::<StreamAll, _, _>((), |rec| {
             collected.push(rec.n);
             ControlFlow::<()>::Continue(())
         })
@@ -669,7 +669,7 @@ fn query_each_break_early_drains_and_reuses() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     let mut collected = Vec::new();
     let stopped = c
-        .query_each::<StreamAllQuery, _, _>((), |rec| {
+        .query_each::<StreamAll, _, _>((), |rec| {
             collected.push(rec.n);
             if rec.n == 3 {
                 ControlFlow::Break(rec.n)
@@ -686,7 +686,7 @@ fn query_each_break_early_drains_and_reuses() {
     );
     // The drain left the connection clean: a follow-up typed query works.
     let owned = c
-        .query_one::<OneQuery>(())
+        .query_one::<One>(())
         .expect("follow-up query on the reused connection");
     assert_eq!(owned.n, 1, "the reused connection returns correct data");
     c.close().expect("close");
@@ -704,7 +704,7 @@ fn query_each_inside_transaction_and_repeated() {
         let sum = c
             .transaction(|tx| {
                 let mut total = 0i64;
-                tx.query_each::<StreamTxQuery, _, _>((), |rec| {
+                tx.query_each::<StreamTx, _, _>((), |rec| {
                     total += i64::from(rec.n);
                     ControlFlow::<()>::Continue(())
                 })?;
@@ -724,7 +724,7 @@ fn query_each_with_param_streams_filtered() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     let mut collected = Vec::new();
     let done = c
-        .query_each::<StreamParamQuery, _, _>((3,), |rec| {
+        .query_each::<StreamParam, _, _>((3,), |rec| {
             collected.push(rec.n);
             ControlFlow::<()>::Continue(())
         })
@@ -740,7 +740,7 @@ fn query_each_with_param_streams_filtered() {
 #[ignore = "requires local PG"]
 fn typed_float_columns_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    let owned = c.query_one::<FlQuery>(()).expect("query_one Fl");
+    let owned = c.query_one::<Fl>(()).expect("query_one Fl");
     assert_eq!(owned.x, 1.5_f64, "float8 1.5 must round-trip exactly");
     assert_eq!(owned.y, 2.5_f32, "float4 2.5 must round-trip exactly");
     c.close().expect("close");
@@ -752,7 +752,7 @@ fn typed_float_columns_round_trip() {
 fn typed_nullable_float_decodes_none() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     let owned = c
-        .query_one::<NullFloatQuery>(())
+        .query_one::<NullFloat>(())
         .expect("query_one NullFloat");
     assert_eq!(owned.x, None, "NULL::float8 must decode to None");
     c.close().expect("close");
@@ -765,7 +765,7 @@ fn typed_nullable_float_decodes_none() {
 fn typed_bytea_column_borrowed_and_owned() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    let rows = c.query::<BytesQuery>(()).expect("query Bytes");
+    let rows = c.query::<Bytes>(()).expect("query Bytes");
     let rec = rows.iter().next().expect("one row").expect("row decodes");
     assert_eq!(
         rec.b,
@@ -773,7 +773,7 @@ fn typed_bytea_column_borrowed_and_owned() {
         "borrowed &[u8] aliases the 4 payload bytes"
     );
 
-    let owned = c.query_one::<BytesQuery>(()).expect("query_one Bytes");
+    let owned = c.query_one::<Bytes>(()).expect("query_one Bytes");
     assert_eq!(
         owned.b,
         vec![0xDE, 0xAD, 0xBE, 0xEF],
@@ -790,12 +790,12 @@ fn typed_float_and_bytea_params_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
     let f = c
-        .query_one::<EchoFQuery>((1.25_f64,))
+        .query_one::<EchoF>((1.25_f64,))
         .expect("query_one EchoF(1.25)");
     assert_eq!(f.x, 1.25_f64, "float8 param 1.25 must round-trip");
 
     let b = c
-        .query_one::<EchoBQuery>((&[1u8, 2, 3][..],))
+        .query_one::<EchoB>((&[1u8, 2, 3][..],))
         .expect("query_one EchoB([1,2,3])");
     assert_eq!(b.b, vec![1u8, 2, 3], "bytea param [1,2,3] must round-trip");
     c.close().expect("close");
@@ -807,7 +807,7 @@ fn typed_float_and_bytea_params_round_trip() {
 #[ignore = "requires local PG"]
 fn typed_mixed_fixed_and_variable_row() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    let rows = c.query::<MixedQuery>(()).expect("query Mixed");
+    let rows = c.query::<Mixed>(()).expect("query Mixed");
     let rec = rows.iter().next().expect("one row").expect("row decodes");
     assert_eq!(rec.i, 7, "int column");
     assert_eq!(rec.f, 2.5_f32, "float4 column");
@@ -825,7 +825,7 @@ fn typed_mixed_fixed_and_variable_row() {
 fn float8_array_any_bind_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     let rows = c
-        .query::<FloatAnyQuery>((&[1.5_f64, 3.5][..],))
+        .query::<FloatAny>((&[1.5_f64, 3.5][..],))
         .expect("query FloatAny");
     let mut got: Vec<f64> = rows.iter().map(|r| r.expect("row decodes").x).collect();
     got.sort_by(f64::total_cmp);
@@ -840,7 +840,7 @@ fn float8_array_any_bind_round_trip() {
 fn float4_array_any_bind_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     let rows = c
-        .query::<Float4AnyQuery>((&[2.5_f32, 3.5][..],))
+        .query::<Float4Any>((&[2.5_f32, 3.5][..],))
         .expect("query Float4Any");
     let mut got: Vec<f32> = rows.iter().map(|r| r.expect("row decodes").x).collect();
     got.sort_by(f32::total_cmp);
@@ -855,7 +855,7 @@ fn float4_array_any_bind_round_trip() {
 fn int8_array_any_bind_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     let rows = c
-        .query::<IntAnyQuery>((&[10i64, 30][..],))
+        .query::<IntAny>((&[10i64, 30][..],))
         .expect("query IntAny");
     let mut got: Vec<i64> = rows.iter().map(|r| r.expect("row decodes").n).collect();
     got.sort_unstable();
@@ -871,7 +871,7 @@ fn bytea_array_any_bind_round_trip() {
     const BYTEA_ARG: &[&[u8]] = &[b"\x01", b"\x03"];
     let mut c = Connection::connect(&sync_config()).expect("connect");
     let rows = c
-        .query::<ByteaAnyQuery>((BYTEA_ARG,))
+        .query::<ByteaAny>((BYTEA_ARG,))
         .expect("query ByteaAny");
     let mut got: Vec<Vec<u8>> = rows.iter().map(|r| r.expect("row decodes").b.to_vec()).collect();
     got.sort_unstable();
@@ -930,7 +930,7 @@ fn big_params_stream_past_the_old_bind_cap() {
     //     param, returning its length (a tiny reply row).
     const BIG_BYTEA: &[u8] = &[0xCDu8; 4096];
     let n = c
-        .query_one::<BigByteaLenQuery>((BIG_BYTEA,))
+        .query_one::<BigByteaLen>((BIG_BYTEA,))
         .expect("query_one BigByteaLen(4 KiB) — was FrameTooLong before streaming");
     assert_eq!(n.n, Some(4096), "typed query! binds a 4 KiB bytea param");
 
@@ -946,11 +946,11 @@ fn big_params_stream_past_the_old_bind_cap() {
 fn discard_all_then_reuse_errors_once_then_self_heals() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     // Record the statement (autocommit MISS completes at Idle -> recorded).
-    assert_eq!(c.query::<HealLitQuery>(()).expect("first use records").len(), 1);
+    assert_eq!(c.query::<HealLit>(()).expect("first use records").len(), 1);
     // Drop ALL prepared statements out of band (a non-row command).
     c.execute_sql("DISCARD ALL").expect("discard all");
     // The next reuse hits the now-missing statement: ONE loud classified error.
-    let poisoned = c.query::<HealLitQuery>(());
+    let poisoned = c.query::<HealLit>(());
     assert!(
         matches!(poisoned, Err(DriverError::Db(_))),
         "reuse over a dropped statement must be a loud Db error, got {poisoned:?}"
@@ -958,7 +958,7 @@ fn discard_all_then_reuse_errors_once_then_self_heals() {
     assert!(c.is_healthy(), "connection stays healthy (recoverable error)");
     // The call AFTER that is a MISS (the name was evicted) -> re-created -> works.
     let healed = c
-        .query::<HealLitQuery>(())
+        .query::<HealLit>(())
         .expect("self-heal: the next use re-creates the statement and succeeds");
     assert_eq!(healed.len(), 1);
     c.close().expect("close");
@@ -970,7 +970,7 @@ fn discard_all_then_reuse_errors_once_then_self_heals() {
 #[ignore = "requires local PG"]
 fn typed_uuid_column_round_trips() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    let row = c.query_one::<UuidLitQuery>(()).expect("query_one UuidLit");
+    let row = c.query_one::<UuidLit>(()).expect("query_one UuidLit");
     assert_eq!(
         row.u.to_string(),
         "550e8400-e29b-41d4-a716-446655440000",
@@ -986,14 +986,14 @@ fn typed_uuid_column_round_trips() {
 fn typed_timestamp_columns_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     // 2000-01-01 00:00:01 UTC = 1 s after the PG epoch = Unix 946_684_801 s.
-    let tz = c.query_one::<TsLitQuery>(()).expect("query_one TsLit");
+    let tz = c.query_one::<TsLit>(()).expect("query_one TsLit");
     assert_eq!(
         tz.t.to_unix_micros(),
         Some(946_684_801_000_000),
         "timestamptz decodes to the exact UTC instant"
     );
     // Naive `timestamp` 2000-01-01 00:00:02 = 2 s after the epoch, zone-less.
-    let naive = c.query_one::<TsNaiveLitQuery>(()).expect("query_one TsNaiveLit");
+    let naive = c.query_one::<TsNaiveLit>(()).expect("query_one TsNaiveLit");
     assert_eq!(naive.t.as_micros(), 2_000_000, "naive timestamp is raw micros");
     c.close().expect("close");
 }
@@ -1008,11 +1008,11 @@ fn typed_uuid_and_timestamptz_params_round_trip() {
         0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00,
         0x00,
     ]);
-    let echoed = c.query_one::<EchoUuidQuery>((u,)).expect("query_one EchoUuid");
+    let echoed = c.query_one::<EchoUuid>((u,)).expect("query_one EchoUuid");
     assert_eq!(echoed.u, u, "uuid param round-trips");
 
     let ts = Timestamptz::from_micros(1_000_000);
-    let echoed_ts = c.query_one::<EchoTsQuery>((ts,)).expect("query_one EchoTs");
+    let echoed_ts = c.query_one::<EchoTs>((ts,)).expect("query_one EchoTs");
     assert_eq!(echoed_ts.t, ts, "timestamptz param round-trips");
     assert_eq!(echoed_ts.t.to_unix_micros(), Some(946_684_801_000_000));
     c.close().expect("close");
@@ -1026,10 +1026,10 @@ fn typed_uuid_and_timestamptz_params_round_trip() {
 #[ignore = "requires local PG"]
 fn typed_json_and_jsonb_columns_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    let j = c.query_one::<JsonLitQuery>(()).expect("query_one JsonLit");
+    let j = c.query_one::<JsonLit>(()).expect("query_one JsonLit");
     assert_eq!(j.j.as_str(), r#"{"k":1}"#, "json text is surfaced verbatim");
 
-    let jb = c.query_one::<JsonbLitQuery>(()).expect("query_one JsonbLit");
+    let jb = c.query_one::<JsonbLit>(()).expect("query_one JsonbLit");
     // jsonb round-trips through PG's canonical spacing: `[1, 2, 3]`.
     assert_eq!(jb.j.as_str(), "[1, 2, 3]", "jsonb decodes past the version byte");
     c.close().expect("close");
@@ -1065,9 +1065,9 @@ fn typed_numeric_precision_battery() {
         "NaN",
     ] {
         let n = Numeric::from_str(s).expect("battery value parses");
-        let echoed = c.query_one::<EchoNumQuery>((n.clone(),)).expect("echo numeric");
+        let echoed = c.query_one::<EchoNum>((n.clone(),)).expect("echo numeric");
         let oracle = c
-            .query_one::<EchoNumTextQuery>((n.clone(),))
+            .query_one::<EchoNumText>((n.clone(),))
             .expect("pg ::text oracle");
         assert_eq!(echoed.n.to_string(), s, "decode Display == expected for `{s}`");
         assert_eq!(
@@ -1092,12 +1092,12 @@ fn typed_numeric_infinity_round_trip() {
         (Numeric::infinity(), "Infinity"),
         (Numeric::neg_infinity(), "-Infinity"),
     ] {
-        match c.query_one::<EchoNumQuery>((value.clone(),)) {
+        match c.query_one::<EchoNum>((value.clone(),)) {
             Ok(echoed) => {
                 assert_eq!(echoed.n, value, "{text} round-trips exactly");
                 assert_eq!(echoed.n.to_string(), text);
                 let oracle = c
-                    .query_one::<EchoNumTextQuery>((value.clone(),))
+                    .query_one::<EchoNumText>((value.clone(),))
                     .expect("pg ::text oracle");
                 assert_eq!(oracle.t, text, "PG ::text renders {text}");
             }
@@ -1120,7 +1120,7 @@ fn typed_numeric_infinity_round_trip() {
 #[ignore = "requires local PG"]
 fn typed_numeric_array_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    let row = c.query_one::<NumArrayLitQuery>(()).expect("query_one NumArrayLit");
+    let row = c.query_one::<NumArrayLit>(()).expect("query_one NumArrayLit");
     let rendered: Vec<Option<String>> = row
         .xs
         .iter()
@@ -1150,22 +1150,22 @@ fn typed_array_columns_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
     // int4[] with a NULL element -> the `Vec` carries an honest `None`.
-    let ints = c.query_one::<IntArrayLitQuery>(()).expect("query_one IntArrayLit");
+    let ints = c.query_one::<IntArrayLit>(()).expect("query_one IntArrayLit");
     assert_eq!(ints.xs, Some(vec![Some(10), None, Some(30)]));
 
     // text[] with a NULL element -> owned `String`s with a `None`.
-    let labels = c.query_one::<TextArrayLitQuery>(()).expect("query_one TextArrayLit");
+    let labels = c.query_one::<TextArrayLit>(()).expect("query_one TextArrayLit");
     assert_eq!(
         labels.xs,
         Some(vec![Some(String::from("a")), None, Some(String::from("c"))])
     );
 
     // A NULL WHOLE array -> None.
-    let none = c.query_one::<NullArrayLitQuery>(()).expect("query_one NullArrayLit");
+    let none = c.query_one::<NullArrayLit>(()).expect("query_one NullArrayLit");
     assert_eq!(none.xs, None);
 
     // An empty array (PG ndim = 0) -> an empty `Vec`.
-    let empty = c.query_one::<EmptyArrayLitQuery>(()).expect("query_one EmptyArrayLit");
+    let empty = c.query_one::<EmptyArrayLit>(()).expect("query_one EmptyArrayLit");
     assert_eq!(empty.xs, Some(Vec::<Option<i32>>::new()));
 
     c.close().expect("close");
@@ -1181,13 +1181,13 @@ fn typed_int2_and_bool_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
     // FAST path: two fixed-width, NOT-NULL columns (`int2` = 2 B, `bool` = 1 B).
-    let sb = c.query_one::<SmallBoolQuery>(()).expect("query_one SmallBool");
+    let sb = c.query_one::<SmallBool>(()).expect("query_one SmallBool");
     assert_eq!(sb.a, 1_i16);
     assert!(sb.b);
 
     // Per-cell path: `int2[]` and `bool[]`, each with an honest `None` element.
     let arr = c
-        .query_one::<SmallBoolArraysQuery>(())
+        .query_one::<SmallBoolArrays>(())
         .expect("query_one SmallBoolArrays");
     assert_eq!(arr.c, Some(vec![Some(1_i16), None, Some(2_i16)]));
     assert_eq!(arr.d, Some(vec![Some(true), None, Some(false)]));
@@ -1209,8 +1209,8 @@ fn typed_date_precision_battery() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     for s in ["2000-01-01", "2000-02-29", "1999-12-31", "0001-01-01", "9999-12-31"] {
         let d = Date::from_str(s).expect("date parses");
-        let echoed = c.query_one::<EchoDateQuery>((d,)).expect("echo date");
-        let oracle = c.query_one::<EchoDateTextQuery>((d,)).expect("pg ::text oracle");
+        let echoed = c.query_one::<EchoDate>((d,)).expect("echo date");
+        let oracle = c.query_one::<EchoDateText>((d,)).expect("pg ::text oracle");
         assert_eq!(echoed.d.to_string(), s, "decode Display == expected for `{s}`");
         assert_eq!(echoed.d.to_string(), oracle.t, "decode Display == PG ::text for `{s}`");
         assert_eq!(echoed.d, d, "decoded value equals the bound value for `{s}`");
@@ -1218,8 +1218,8 @@ fn typed_date_precision_battery() {
     // The ±infinity sentinels bind and round-trip exactly (date infinity is not
     // version-gated, unlike numeric).
     for (value, text) in [(Date::infinity(), "infinity"), (Date::neg_infinity(), "-infinity")] {
-        let echoed = c.query_one::<EchoDateQuery>((value,)).expect("echo date infinity");
-        let oracle = c.query_one::<EchoDateTextQuery>((value,)).expect("oracle");
+        let echoed = c.query_one::<EchoDate>((value,)).expect("echo date infinity");
+        let oracle = c.query_one::<EchoDateText>((value,)).expect("oracle");
         assert_eq!(echoed.d, value, "{text} round-trips exactly");
         assert_eq!(echoed.d.to_string(), text);
         assert_eq!(oracle.t, text, "PG ::text renders {text}");
@@ -1236,8 +1236,8 @@ fn typed_time_precision_battery() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     for s in ["00:00:00", "12:34:56.789012", "23:59:59.999999", "01:02:03"] {
         let t = Time::from_str(s).expect("time parses");
-        let echoed = c.query_one::<EchoTimeQuery>((t,)).expect("echo time");
-        let oracle = c.query_one::<EchoTimeTextQuery>((t,)).expect("pg ::text oracle");
+        let echoed = c.query_one::<EchoTime>((t,)).expect("echo time");
+        let oracle = c.query_one::<EchoTimeText>((t,)).expect("pg ::text oracle");
         assert_eq!(echoed.x.to_string(), s, "decode Display == expected for `{s}`");
         assert_eq!(echoed.x.to_string(), oracle.t, "decode Display == PG ::text for `{s}`");
         assert_eq!(echoed.x, t, "decoded value equals the bound value for `{s}`");
@@ -1269,8 +1269,8 @@ fn typed_interval_precision_battery() {
         (Interval::new(1, -2, 0), "1 mon -2 days"),
         (Interval::new(-1, -2, 10_800_000_000), "-1 mons -2 days +03:00:00"),
     ] {
-        let echoed = c.query_one::<EchoIntervalQuery>((value,)).expect("echo interval");
-        let oracle = c.query_one::<EchoIntervalTextQuery>((value,)).expect("pg ::text oracle");
+        let echoed = c.query_one::<EchoInterval>((value,)).expect("echo interval");
+        let oracle = c.query_one::<EchoIntervalText>((value,)).expect("pg ::text oracle");
         assert_eq!(echoed.i.to_string(), text, "decode Display == expected for `{text}`");
         assert_eq!(echoed.i.to_string(), oracle.t, "decode Display == PG ::text for `{text}`");
         assert_eq!(echoed.i, value, "decoded fields equal the bound fields for `{text}`");
@@ -1287,7 +1287,7 @@ fn typed_interval_precision_battery() {
 fn typed_temporal_arrays_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    let dates = c.query_one::<DateArrayLitQuery>(()).expect("date[]");
+    let dates = c.query_one::<DateArrayLit>(()).expect("date[]");
     let d: Vec<Option<String>> =
         dates.xs.iter().map(|e| e.as_ref().map(ToString::to_string)).collect();
     assert_eq!(
@@ -1295,7 +1295,7 @@ fn typed_temporal_arrays_round_trip() {
         vec![Some("2000-01-01".to_string()), None, Some("2000-02-29".to_string())]
     );
 
-    let times = c.query_one::<TimeArrayLitQuery>(()).expect("time[]");
+    let times = c.query_one::<TimeArrayLit>(()).expect("time[]");
     let t: Vec<Option<String>> =
         times.xs.iter().map(|e| e.as_ref().map(ToString::to_string)).collect();
     assert_eq!(
@@ -1303,7 +1303,7 @@ fn typed_temporal_arrays_round_trip() {
         vec![Some("00:00:00".to_string()), None, Some("23:59:59.999999".to_string())]
     );
 
-    let spans = c.query_one::<IntervalArrayLitQuery>(()).expect("interval[]");
+    let spans = c.query_one::<IntervalArrayLit>(()).expect("interval[]");
     let i: Vec<Option<String>> =
         spans.xs.iter().map(|e| e.as_ref().map(ToString::to_string)).collect();
     assert_eq!(
@@ -1326,7 +1326,7 @@ fn date_array_any_bind_round_trip() {
     // `Date::from_days` (a const fn) is `'static`. Day 0 = 2000-01-01,
     // day 2_921_939 = 9999-12-31.
     const WANTED: [Date; 2] = [Date::from_days(0), Date::from_days(2_921_939)];
-    let rows = c.query::<DateAnyQuery>((&WANTED[..],)).expect("query DateAny");
+    let rows = c.query::<DateAny>((&WANTED[..],)).expect("query DateAny");
     let mut got: Vec<i32> = rows.iter().map(|r| r.expect("row decodes").d.to_days()).collect();
     got.sort_unstable();
     assert_eq!(got, vec![0, 2_921_939], "date[] ANY($1) returns the matching rows");
@@ -1352,7 +1352,7 @@ fn merged_outer_join_null_round_trips_as_none() {
     c.execute_sql("INSERT INTO oj_b (j, bk, y) VALUES (2, 42, 7)").expect("ins b");
     c.execute_sql("INSERT INTO oj_c (bk, z) VALUES (42, 9)").expect("ins c");
 
-    let rows = c.query::<OuterUsingNullQuery>(()).expect("query OuterUsingNull");
+    let rows = c.query::<OuterUsingNull>(()).expect("query OuterUsingNull");
     let got: Vec<Option<i32>> = rows.iter().map(|r| r.expect("row decodes").bk).collect();
     assert_eq!(
         got,
@@ -1375,7 +1375,7 @@ fn oversize_typed_text_row_reassembles() {
 
     // The borrowed record aliases `rows`, so it is scoped closed before
     // `into_owned` (the documented E0505 escape wall).
-    let rows = c.query::<OvBigTextQuery>(()).expect("query OvBigText");
+    let rows = c.query::<OvBigText>(()).expect("query OvBigText");
     assert_eq!(rows.len(), 1, "the oversize result is one row");
     {
         let rec = rows.iter().next().expect("one row").expect("row decodes");
@@ -1388,7 +1388,7 @@ fn oversize_typed_text_row_reassembles() {
     assert_eq!(s_owned.len(), 5000, "owned reassembled text length");
     assert!(s_owned.bytes().all(|b| b == b'x'), "owned bytes intact");
 
-    let one = c.query_one::<OvBigTextQuery>(()).expect("query_one OvBigText");
+    let one = c.query_one::<OvBigText>(()).expect("query_one OvBigText");
     let s = one.s.expect("query_one text present");
     assert_eq!(s.len(), 5000, "query_one reassembles the oversize row");
     assert!(s.bytes().all(|b| b == b'x'));
@@ -1403,13 +1403,13 @@ fn oversize_typed_text_row_reassembles() {
 fn oversize_typed_jsonb_and_bytea_reassemble() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
 
-    let jb = c.query_one::<OvBigJsonbQuery>(()).expect("query_one OvBigJsonb");
+    let jb = c.query_one::<OvBigJsonb>(()).expect("query_one OvBigJsonb");
     let j = jb.j.expect("jsonb present");
     assert_eq!(j.as_str().len(), 6002, "> 4 KiB jsonb reassembled");
     assert!(j.as_str().starts_with('"') && j.as_str().ends_with('"'));
     assert!(j.as_str()[1..6001].bytes().all(|b| b == b'z'), "jsonb payload intact");
 
-    let bt = c.query_one::<OvBigByteaQuery>(()).expect("query_one OvBigBytea");
+    let bt = c.query_one::<OvBigBytea>(()).expect("query_one OvBigBytea");
     let bytes = bt.b.expect("bytea present");
     assert_eq!(bytes.len(), 5000, "> 4 KiB bytea reassembled");
     assert!(bytes.iter().all(|&x| x == 0xCD), "every bytea byte survived reassembly");
@@ -1423,7 +1423,7 @@ fn oversize_typed_jsonb_and_bytea_reassemble() {
 #[ignore = "requires local PG"]
 fn oversize_typed_wide_many_columns_reassembles() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    let r = c.query_one::<OvWideColsQuery>(()).expect("query_one OvWideCols");
+    let r = c.query_one::<OvWideCols>(()).expect("query_one OvWideCols");
     for (field, ch) in [
         (r.c1, b'a'), (r.c2, b'b'), (r.c3, b'c'), (r.c4, b'd'),
         (r.c5, b'e'), (r.c6, b'f'), (r.c7, b'g'), (r.c8, b'h'),
@@ -1454,7 +1454,7 @@ fn oversize_typed_multirow_reassembly_over_table() {
     // Scenario A — oversize (k=1) THEN small (k=2): the accumulator must reset.
     c.execute_sql("INSERT INTO ov_rows (k, body) VALUES (1, repeat('x', 5000)), (2, 'small')")
         .expect("insert oversize-then-small");
-    let rows = c.query::<OvRowsQuery>(()).expect("query OvRows (A)");
+    let rows = c.query::<OvRows>(()).expect("query OvRows (A)");
     let lens: Vec<usize> = rows.iter().map(|r| r.expect("decodes").body.len()).collect();
     assert_eq!(lens, vec![5000, 5], "oversize row then small row; buffer reset");
     let owned = rows.into_owned().expect("into_owned (A)");
@@ -1462,7 +1462,7 @@ fn oversize_typed_multirow_reassembly_over_table() {
     assert_eq!(owned[1].body, "small", "the small row after an oversize row is clean");
 
     let mut streamed: Vec<usize> = Vec::new();
-    c.query_each::<OvRowsQuery, _, ()>((), |rec| {
+    c.query_each::<OvRows, _, ()>((), |rec| {
         streamed.push(rec.body.len());
         ControlFlow::Continue(())
     })
@@ -1474,7 +1474,7 @@ fn oversize_typed_multirow_reassembly_over_table() {
     c.execute_sql("INSERT INTO ov_rows (k, body) VALUES (1, repeat('x', 5000)), (2, repeat('y', 6000))")
         .expect("insert two oversize");
     let owned = c
-        .query::<OvRowsQuery>(())
+        .query::<OvRows>(())
         .expect("query OvRows (B)")
         .into_owned()
         .expect("into_owned (B)");
@@ -1490,13 +1490,13 @@ fn oversize_typed_multirow_reassembly_over_table() {
     c.execute_sql("TRUNCATE ov_rows").expect("truncate C");
     c.execute_sql("INSERT INTO ov_rows (k, body) VALUES (1, repeat('x', 5000)), (2, 'small')")
         .expect("insert oversize-then-small (C)");
-    let too_many = c.query_one::<OvRowsQuery>(());
+    let too_many = c.query_one::<OvRows>(());
     assert!(
         matches!(too_many, Err(DriverError::TooManyRows)),
         "oversize first + small second must be TooManyRows, got {too_many:?}",
     );
     assert_eq!(
-        c.query_one::<OneQuery>(()).expect("probe after C drain").n,
+        c.query_one::<One>(()).expect("probe after C drain").n,
         1,
         "connection drained healthy after the oversize-first too-many break",
     );
@@ -1507,13 +1507,13 @@ fn oversize_typed_multirow_reassembly_over_table() {
     c.execute_sql("TRUNCATE ov_rows").expect("truncate D");
     c.execute_sql("INSERT INTO ov_rows (k, body) VALUES (1, 'small'), (2, repeat('x', 5000))")
         .expect("insert small-then-oversize (D)");
-    let too_many = c.query_one::<OvRowsQuery>(());
+    let too_many = c.query_one::<OvRows>(());
     assert!(
         matches!(too_many, Err(DriverError::TooManyRows)),
         "small first + oversize second must be TooManyRows, got {too_many:?}",
     );
     assert_eq!(
-        c.query_one::<OneQuery>(()).expect("probe after D drain").n,
+        c.query_one::<One>(()).expect("probe after D drain").n,
         1,
         "connection drained healthy after the mid-oversize-frame too-many break",
     );
@@ -1543,7 +1543,7 @@ fn typed_slow_query_emits_slow_query() {
         });
     let mut c = Connection::connect_with(&sync_config(), &diag).expect("connect_with");
 
-    let rows = c.query::<SlowSleepQuery>(()).expect("slow typed query");
+    let rows = c.query::<SlowSleep>(()).expect("slow typed query");
     assert_eq!(rows.len(), 1);
 
     let got = slow.lock().expect("lock").clone();

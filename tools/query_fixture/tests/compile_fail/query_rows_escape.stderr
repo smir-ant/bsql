@@ -1,7 +1,7 @@
 error[E0505]: cannot move out of `rows` because it is borrowed
   --> tests/compile_fail/query_rows_escape.rs:21:10
    |
-16 | fn escape(rows: Rows<EscapeQuery>) {
+16 | fn escape(rows: Rows<Escape>) {
    |           ---- binding `rows` declared here
 17 |     // `held` borrows `rows` (its `s` field aliases the prebuffer).
 18 |     let held = rows.iter().next();

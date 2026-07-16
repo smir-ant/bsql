@@ -47,7 +47,7 @@ fn same_width_columns_decode_per_declared_type() {
 
     // The owned twin decodes identically (both columns are self-owning value
     // types, so the owned/borrowed twins carry the same fields).
-    let owned = SameWidthOwned::decode(SAME_WIDTH_ROW).expect("owned row decodes");
+    let owned = SameWidth::decode(SAME_WIDTH_ROW).expect("owned row decodes");
     assert_eq!(owned.as_oid, u32::MAX);
     assert_eq!(owned.as_int, -1_i32);
 }

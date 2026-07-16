@@ -43,7 +43,7 @@ bsql::query!(
 
 #[test]
 fn optional_filter_param_is_scalar_oid_and_sql_expands() {
-    let q = OptUserQuery::PREPARED;
+    let q = OptUser::PREPARED;
     assert_eq!(
         q.param_oids(),
         &[oids::INT8],
@@ -72,7 +72,7 @@ fn optional_filter_decodes_like_a_plain_row() {
 
 #[test]
 fn any_in_list_param_is_array_oid() {
-    let q = AnyOrdersQuery::PREPARED;
+    let q = AnyOrders::PREPARED;
     assert_eq!(
         q.param_oids(),
         &[oids::INT8_ARRAY],
@@ -87,7 +87,7 @@ fn any_in_list_param_is_array_oid() {
 
 #[test]
 fn any_in_list_over_text_is_text_array() {
-    let q = AnyEmailsQuery::PREPARED;
+    let q = AnyEmails::PREPARED;
     assert_eq!(q.param_oids(), &[oids::TEXT_ARRAY]);
 }
 

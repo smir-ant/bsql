@@ -61,17 +61,18 @@ fn borrowed_decode_is_zero_alloc_owned_text_allocates() {
     black_box(&fixed);
     let fixed_allocs = after.delta(before).allocs;
 
-    // (2) Borrowed text decode — borrows the bytes as `&str`, zero allocs.
+    // (2) Borrowed text decode — the borrowed VIEW `UserNamesRef` borrows the
+    // bytes as `&str`, zero allocs.
     let before = ALLOC.snapshot();
-    let borrowed_text = UserNames::decode(black_box(USER_NAMES_ROW));
+    let borrowed_text = UserNamesRef::decode(black_box(USER_NAMES_ROW));
     let after = ALLOC.snapshot();
     black_box(&borrowed_text);
     let borrowed_text_allocs = after.delta(before).allocs;
 
-    // (3) Owned text decode — copies the `text` cell into a `String`, so
-    // it must allocate. The deliberate contrast with (2).
+    // (3) Owned text decode — the owned record `UserNames` copies the `text` cell
+    // into a `String`, so it must allocate. The deliberate contrast with (2).
     let before = ALLOC.snapshot();
-    let owned_text = UserNamesOwned::decode(black_box(USER_NAMES_ROW));
+    let owned_text = UserNames::decode(black_box(USER_NAMES_ROW));
     let after = ALLOC.snapshot();
     black_box(&owned_text);
     let owned_text_allocs = after.delta(before).allocs;
@@ -81,7 +82,7 @@ fn borrowed_decode_is_zero_alloc_owned_text_allocates() {
     // `<Name>Query::PREPARED` borrows `&'static` slices and allocates
     // nothing. (The `const` is materialised at compile time.)
     let before = ALLOC.snapshot();
-    let q = black_box(OrderKeyQuery::PREPARED);
+    let q = black_box(OrderKey::PREPARED);
     let wire_len = q.parse_template_for_test().len()
         + q.bind_execute_prefix_for_test().len()
         + q.param_oids().len()
@@ -94,8 +95,8 @@ fn borrowed_decode_is_zero_alloc_owned_text_allocates() {
     // `= ANY($1)`, and ORDER BY-selected prepared queries off `.rodata`
     // allocates nothing.
     let before = ALLOC.snapshot();
-    let dyn_len = black_box(OptUserQuery::PREPARED).param_oids().len()
-        + black_box(AnyOrdersQuery::PREPARED).param_oids().len()
+    let dyn_len = black_box(OptUser::PREPARED).param_oids().len()
+        + black_box(AnyOrders::PREPARED).param_oids().len()
         + black_box(SortedOrdersOrderBy::IdAsc.prepared())
             .parse_template_for_test()
             .len()

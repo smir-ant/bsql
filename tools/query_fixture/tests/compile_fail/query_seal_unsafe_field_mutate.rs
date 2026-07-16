@@ -11,7 +11,7 @@ bsql::query!(SealUnsafeMutate, "SELECT id FROM users");
 
 fn main() {
     unsafe {
-        let sql_ptr = &SealUnsafeMutateQuery::PREPARED.sql as *const &str as *mut &str;
+        let sql_ptr = &SealUnsafeMutate::PREPARED.sql as *const &str as *mut &str;
         sql_ptr.write("DROP TABLE users; --");
     }
 }

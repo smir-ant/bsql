@@ -699,9 +699,11 @@ const fn parse_template_oid_section_matches(
 
 /// Per-query fingerprint carrier.
 ///
-/// A query-generating macro emits ONE uninhabited carrier type per
-/// query (a zero-size, value-less marker) together with one
-/// `impl QueryFingerprint` for it. The impl carries the `const` wire
+/// A query-generating macro emits ONE carrier type per query together with one
+/// `impl QueryFingerprint` for it. For a plain `query!` that carrier is the
+/// RECORD type itself (so `query::<Foo>()` runs it — one user-facing name); for a
+/// runtime `ORDER BY` query it is a separate uninhabited zero-size marker per
+/// ordering. The impl carries the `const` wire
 /// artifact — the SQL text, its content-addressed statement name, and
 /// the pre-baked `Parse` / `Bind`-prefix byte templates — plus the
 /// parameter and row tuple types at the type level. The parameter / row

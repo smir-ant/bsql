@@ -11,7 +11,7 @@ bsql::query!(
 
 fn main() {
     // Touch the generated artifacts so the expansion is fully exercised.
-    let _ = OptUserQuery::PREPARED.param_oids();
-    let _ = AnyOrdersQuery::PREPARED.param_oids();
+    let _ = OptUser::PREPARED.param_oids();
+    let _ = AnyOrders::PREPARED.param_oids();
     let _ = SortedOrderBy::IdAsc.prepared().stmt_name();
 }

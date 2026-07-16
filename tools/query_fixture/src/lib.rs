@@ -118,14 +118,14 @@ bsql::query!(TaskById, "SELECT id, p, size FROM tasks WHERE id = $1");
 const _: () = {
     const fn assert_typed_query<Q: bsql::TypedQuery>() {}
     const fn assert_fingerprint<Q: bsql::QueryFingerprint>() {}
-    assert_typed_query::<UsersIdQuery>();
-    assert_fingerprint::<UsersIdQuery>();
+    assert_typed_query::<UsersId>();
+    assert_fingerprint::<UsersId>();
 };
 
 /// The bounded typed result container for the `UsersId` query, named through
 /// `bsql` alone (`bsql::Rows` over a `query!`-generated carrier).
 #[doc(hidden)]
-pub type _RowsReachableThroughBsql = bsql::Rows<UsersIdQuery>;
+pub type _RowsReachableThroughBsql = bsql::Rows<UsersId>;
 
 /// The const-checked prepared query type for `UsersId`, spelled through the
 /// umbrella crate's `bsql::PreparedQuery` re-export.
@@ -134,8 +134,8 @@ pub type _PreparedReachableThroughBsql = bsql::PreparedQuery<
     // `PREPARED` is `PreparedQuery<Self::Params<'static>, _>` (the const validator
     // rides the `'static` param marker), so this alias names the `'static`
     // instantiation of the parameter GAT.
-    <UsersIdQuery as bsql::TypedQuery>::Params<'static>,
-    <UsersIdQuery as bsql::TypedQuery>::Row,
+    <UsersId as bsql::TypedQuery>::Params<'static>,
+    <UsersId as bsql::TypedQuery>::Row,
 >;
 
 /// The typed decoder for `UsersId`, returning a `bsql::DecodeError` on a
@@ -147,7 +147,7 @@ pub type _DecodeReachableThroughBsql = fn(&[u8]) -> ::core::result::Result<Users
 /// an associated const of the umbrella's re-exported trait.
 #[doc(hidden)]
 pub const _PREPARED_THROUGH_BSQL: _PreparedReachableThroughBsql =
-    <UsersIdQuery as bsql::TypedQuery>::PREPARED;
+    <UsersId as bsql::TypedQuery>::PREPARED;
 
 /// The typed decoder value, reachable through `bsql` alone.
 #[doc(hidden)]

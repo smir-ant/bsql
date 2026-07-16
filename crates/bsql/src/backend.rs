@@ -29,17 +29,19 @@
 //! # The consumer signature
 //!
 //! ```ignore
-//! fn load_user<B>(conn: &mut B, id: i64) -> Result<UserByIdOwned, B::Error>
+//! fn load_user<B>(conn: &mut B, id: i64) -> Result<UserById, B::Error>
 //! where
 //!     B: SyncBackend,
-//!     UserByIdQuery: RunsOn<B, Params = (i64,), Owned = UserByIdOwned>,
+//!     UserById: RunsOn<B, Params = (i64,), Owned = UserById>,
 //! {
-//!     conn.fetch_one::<UserByIdQuery>((id,))
+//!     conn.fetch_one::<UserById>((id,))
 //! }
 //! ```
 //!
 //! `B: SyncBackend` names the backend; ONE `RunsOn<B, …>` bound per distinct
-//! `query!` the function runs names the carrier's params + owned record. No
+//! `query!` the function runs names the carrier's params + owned record. Because
+//! a plain `query!(UserById, …)` makes the record `UserById` ITSELF the carrier
+//! (the owned record is `Owned = UserById`), the function names ONE type. No
 //! `dyn`, no HRTB soup, no unnameable lifetimes — the container GAT is hidden by
 //! routing owned records through `Vec<Q::Owned>`.
 

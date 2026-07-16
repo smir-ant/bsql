@@ -125,7 +125,7 @@ fn array_row_decodes_with_null_element_and_null_whole_array() {
     assert_eq!(r.tags, None);
 
     // The owned twin is structurally identical (arrays are self-owning).
-    let owned = ArrayRowOwned::decode(&row).expect("owned decodes");
+    let owned = ArrayRow::decode(&row).expect("owned decodes");
     assert_eq!(owned.ints, vec![Some(10), None, Some(30)]);
     assert_eq!(owned.tags, None);
 }

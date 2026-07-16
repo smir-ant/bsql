@@ -1,10 +1,10 @@
-error[E0277]: `OptUserQuery` is not a SQLite-runnable `query!` carrier
+error[E0277]: `OptUser` is not a SQLite-runnable `query!` carrier
   --> tests/compile_fail/typed_pg_only_on_sqlite.rs:20:18
    |
-20 |     let _ = conn.query::<OptUserQuery>(());
+20 |     let _ = conn.query::<OptUser>(());
    |                  ^^^^^ unsatisfied trait bound
    |
-help: the trait `SqliteTypedQuery` is not implemented for `OptUserQuery`
+help: the trait `SqliteTypedQuery` is not implemented for `OptUser`
   --> tests/compile_fail/typed_pg_only_on_sqlite.rs:11:1
    |
 11 | / bsql::query!(

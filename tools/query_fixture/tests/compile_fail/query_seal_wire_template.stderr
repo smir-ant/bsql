@@ -2,7 +2,7 @@ error: usage of an `unsafe` block
   --> tests/compile_fail/query_seal_wire_template.rs:16:5
    |
 16 | /     unsafe {
-17 | |         let ptr = &SealWireTemplateQuery::PREPARED.parse_template as *const &[u8] as *mut &[u8];
+17 | |         let ptr = &SealWireTemplate::PREPARED.parse_template as *const &[u8] as *mut &[u8];
 18 | |         ptr.write(b"hostile bytes");
 19 | |     }
    | |_____^
@@ -14,13 +14,13 @@ note: the lint level is defined here
    |           ^^^^^^^^^^^
 
 error[E0616]: field `parse_template` of struct `PreparedQuery` is private
-  --> tests/compile_fail/query_seal_wire_template.rs:14:65
+  --> tests/compile_fail/query_seal_wire_template.rs:14:60
    |
-14 |     let _hostile_bytes: &[u8] = SealWireTemplateQuery::PREPARED.parse_template;
-   |                                                                 ^^^^^^^^^^^^^^ private field
+14 |     let _hostile_bytes: &[u8] = SealWireTemplate::PREPARED.parse_template;
+   |                                                            ^^^^^^^^^^^^^^ private field
 
 error[E0616]: field `parse_template` of struct `PreparedQuery` is private
-  --> tests/compile_fail/query_seal_wire_template.rs:17:52
+  --> tests/compile_fail/query_seal_wire_template.rs:17:47
    |
-17 |         let ptr = &SealWireTemplateQuery::PREPARED.parse_template as *const &[u8] as *mut &[u8];
-   |                                                    ^^^^^^^^^^^^^^ private field
+17 |         let ptr = &SealWireTemplate::PREPARED.parse_template as *const &[u8] as *mut &[u8];
+   |                                               ^^^^^^^^^^^^^^ private field

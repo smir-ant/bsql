@@ -62,7 +62,7 @@ fn n_inserts_return_grouped_decoded_rows_and_all_apply() {
     fresh(&mut c);
     let labels = ["alpha", "beta", "gamma", "delta"];
     let grouped = c
-        .query_batch::<QbsInsQuery, _>(labels.iter().enumerate().map(|(i, l)| ((i as i64) + 1, *l)))
+        .query_batch::<QbsIns, _>(labels.iter().enumerate().map(|(i, l)| ((i as i64) + 1, *l)))
         .expect("insert batch");
     assert_eq!(grouped.len(), labels.len(), "one Rows<Q> per command");
     for (i, rows) in grouped.iter().enumerate() {
@@ -82,9 +82,9 @@ fn n_inserts_return_grouped_decoded_rows_and_all_apply() {
 fn grouping_is_preserved_per_command() {
     let mut c = Connection::connect(&cfg()).expect("connect");
     fresh(&mut c);
-    c.query_batch::<QbsInsQuery, _>((1..=5).map(|i| (i, "x"))).expect("seed 5");
+    c.query_batch::<QbsIns, _>((1..=5).map(|i| (i, "x"))).expect("seed 5");
     let grouped = c
-        .query_batch::<QbsSelQuery, _>(vec![(1_i64,), (3,), (5,)])
+        .query_batch::<QbsSel, _>(vec![(1_i64,), (3,), (5,)])
         .expect("select batch");
     assert_eq!(grouped.len(), 3, "one Rows<Q> per command");
     assert_eq!(grouped[0].len(), 1, "id <= 1 → 1 row");
@@ -102,7 +102,7 @@ fn grouping_is_preserved_per_command() {
 fn mid_batch_failure_returns_zero_results_and_applies_nothing() {
     let mut c = Connection::connect(&cfg()).expect("connect");
     fresh(&mut c);
-    let result = c.query_batch::<QbsInsQuery, _>(vec![
+    let result = c.query_batch::<QbsIns, _>(vec![
         (10_i64, "a"),
         (11, "b"),
         (12, "c"),
@@ -120,7 +120,7 @@ fn mid_batch_failure_returns_zero_results_and_applies_nothing() {
     assert_eq!(err.batch_failed_index(), Some(3));
     assert!(!err.is_disconnect());
     assert_eq!(row_count(&mut c), 0, "a mid-batch failure applied NOTHING");
-    assert_eq!(c.query_one::<QbsSevenQuery>(()).expect("reuse").n, 7);
+    assert_eq!(c.query_one::<QbsSeven>(()).expect("reuse").n, 7);
     c.close().expect("close");
 }
 
@@ -131,10 +131,10 @@ fn zero_and_one() {
     let mut c = Connection::connect(&cfg()).expect("connect");
     fresh(&mut c);
     let empty = c
-        .query_batch::<QbsInsQuery, _>(Vec::<(i64, &str)>::new())
+        .query_batch::<QbsIns, _>(Vec::<(i64, &str)>::new())
         .expect("N=0");
     assert!(empty.is_empty(), "N=0 → empty Vec, no I/O");
-    let one = c.query_batch::<QbsInsQuery, _>(vec![(1_i64, "solo")]).expect("N=1");
+    let one = c.query_batch::<QbsIns, _>(vec![(1_i64, "solo")]).expect("N=1");
     assert_eq!(one.len(), 1);
     let rec = one[0].iter().next().expect("row").expect("decode");
     assert_eq!((rec.id, rec.label), (1, "solo"));
@@ -151,7 +151,7 @@ fn large_n_windowed_is_correct_and_deadlock_free() {
     fresh(&mut c);
     const N: i64 = 20_000;
     let grouped = c
-        .query_batch::<QbsInsQuery, _>((0..N).map(|i| (i, "bulk")))
+        .query_batch::<QbsIns, _>((0..N).map(|i| (i, "bulk")))
         .expect("large batch");
     assert_eq!(grouped.len(), N as usize, "one grouped result per command");
     for (i, rows) in grouped.iter().enumerate() {
@@ -161,7 +161,7 @@ fn large_n_windowed_is_correct_and_deadlock_free() {
     c.execute_sql("TRUNCATE qb_rows").expect("truncate");
     let mut sets: Vec<(i64, &str)> = (0..N).map(|i| (i, "x")).collect();
     sets.push((5_000, "dup"));
-    let result = c.query_batch::<QbsInsQuery, _>(sets);
+    let result = c.query_batch::<QbsIns, _>(sets);
     assert!(matches!(result, Err(DriverError::BatchFailed { index, .. }) if index == N as usize));
     assert_eq!(row_count(&mut c), 0, "large mid-batch failure applied NOTHING");
     c.close().expect("close");
@@ -176,7 +176,7 @@ fn oid_guard_drift_is_a_classified_batch_column_oid_mismatch() {
         .expect("create drift shadow");
     c.execute_sql("INSERT INTO oidguard (tag, vc, bp, n) VALUES (1094795585, 'v', 'b', 1)")
         .expect("seed drift");
-    match c.query_batch::<QbsTagQuery, _>(vec![(), ()]) {
+    match c.query_batch::<QbsTag, _>(vec![(), ()]) {
         Err(e @ DriverError::BatchColumnOidMismatch { .. }) => {
             assert_eq!(e.batch_failed_index(), Some(0), "verified ONCE on command 0");
             assert!(!e.is_disconnect());
@@ -195,7 +195,7 @@ fn oid_guard_drift_is_a_classified_batch_column_oid_mismatch() {
         }
         other => panic!("expected BatchColumnOidMismatch, got {other:?}"),
     }
-    assert_eq!(c.query_one::<QbsSevenQuery>(()).expect("recovers").n, 7);
+    assert_eq!(c.query_one::<QbsSeven>(()).expect("recovers").n, 7);
     c.close().expect("close");
 }
 
@@ -208,7 +208,7 @@ fn oid_guard_matching_shadow_decodes_correctly() {
         .expect("create match shadow");
     c.execute_sql("INSERT INTO oidguard (tag, vc, bp, n) VALUES ('hello', 'v', 'b', 1)")
         .expect("seed match");
-    let grouped = c.query_batch::<QbsTagQuery, _>(vec![(), ()]).expect("matching batch runs");
+    let grouped = c.query_batch::<QbsTag, _>(vec![(), ()]).expect("matching batch runs");
     assert_eq!(grouped.len(), 2);
     for rows in &grouped {
         assert_eq!(rows.iter().next().expect("row").expect("decode").tag, "hello");
@@ -227,7 +227,7 @@ fn cancel_mid_batch_is_57014_and_connection_recovers() {
         drop(token.cancel());
     });
     let started = Instant::now();
-    let result = c.query_batch::<QbsSleepQuery, _>(vec![(), ()]);
+    let result = c.query_batch::<QbsSleep, _>(vec![(), ()]);
     let elapsed = started.elapsed();
     drop(canceller.join());
     assert!(elapsed < Duration::from_secs(2), "cancel bounded the batch ({elapsed:?})");
@@ -238,6 +238,6 @@ fn cancel_mid_batch_is_57014_and_connection_recovers() {
         other => panic!("expected a 57014 BatchFailed, got {other:?}"),
     }
     assert!(c.is_healthy(), "a cancel is NOT a disconnect — connection reusable");
-    assert_eq!(c.query_one::<QbsSevenQuery>(()).expect("reuse after cancel").n, 7);
+    assert_eq!(c.query_one::<QbsSeven>(()).expect("reuse after cancel").n, 7);
     c.close().expect("close");
 }

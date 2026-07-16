@@ -4,7 +4,7 @@
 //! Each `query!` below is typed AT COMPILE TIME against the catalog that
 //! `build.rs` -> `bsql-build` replays from `migrations/`. The macro emits
 //! a borrowed record (`Name`, with `&'q str` text cells) and an owned twin
-//! (`NameOwned`, with `String`), plus a `decode` fn over a raw `DataRow`
+//! (`Name`, with `String`), plus a `decode` fn over a raw `DataRow`
 //! payload — the wire bytes AFTER the 5-byte frame header, beginning with
 //! the 2-byte column-count.
 //!
@@ -91,20 +91,20 @@ fn all_fixed_fast_path_borrowed_and_owned() {
     let borrowed = OrderKey::decode(ORDER_KEY_ROW).expect("fast-path decode");
     assert_eq!(borrowed, OrderKey { id: 42, user_id: 7 });
     // Owned twin decodes identically (no text -> structurally identical).
-    let owned = OrderKeyOwned::decode(ORDER_KEY_ROW).expect("owned fast-path decode");
-    assert_eq!(owned, OrderKeyOwned { id: 42, user_id: 7 });
+    let owned = OrderKey::decode(ORDER_KEY_ROW).expect("owned fast-path decode");
+    assert_eq!(owned, OrderKey { id: 42, user_id: 7 });
 }
 
 #[test]
 fn nullable_column_becomes_option() {
     // A NULL in the nullable `total` column decodes to `None`; the
     // present `status` decodes to `Some`.
-    let borrowed = OrderRow::decode(ORDER_ROW_TOTAL_NULL).expect("decode");
+    let borrowed = OrderRowRef::decode(ORDER_ROW_TOTAL_NULL).expect("decode");
     assert_eq!(borrowed.id, 100);
     assert_eq!(borrowed.total, None);
     assert_eq!(borrowed.status, Some("open"));
 
-    let owned = OrderRowOwned::decode(ORDER_ROW_TOTAL_NULL).expect("decode owned");
+    let owned = OrderRow::decode(ORDER_ROW_TOTAL_NULL).expect("decode owned");
     assert_eq!(owned.id, 100);
     assert_eq!(owned.total, None);
     assert_eq!(owned.status, Some("open".to_string()));
@@ -112,11 +112,11 @@ fn nullable_column_becomes_option() {
 
 #[test]
 fn present_nullable_values_decode() {
-    let borrowed = OrderRow::decode(ORDER_ROW_FULL).expect("decode");
+    let borrowed = OrderRowRef::decode(ORDER_ROW_FULL).expect("decode");
     assert_eq!(borrowed.total, Some(55));
     assert_eq!(borrowed.status, Some("paid"));
 
-    let owned = OrderRowOwned::decode(ORDER_ROW_FULL).expect("decode owned");
+    let owned = OrderRow::decode(ORDER_ROW_FULL).expect("decode owned");
     assert_eq!(owned.total, Some(55));
     assert_eq!(owned.status, Some("paid".to_string()));
 }
@@ -126,10 +126,10 @@ fn null_in_not_null_column_is_tier3_per_cell_path() {
     // A NULL in the NOT-NULL `id` column on the per-cell path is a
     // classified error on BOTH the borrowed and owned decoders — never a
     // silent default or panic.
-    let borrowed = OrderRow::decode(ORDER_ROW_ID_NULL);
+    let borrowed = OrderRowRef::decode(ORDER_ROW_ID_NULL);
     assert!(matches!(borrowed, Err(DecodeError::NullInNonNullColumn)));
 
-    let owned = OrderRowOwned::decode(ORDER_ROW_ID_NULL);
+    let owned = OrderRow::decode(ORDER_ROW_ID_NULL);
     assert!(matches!(owned, Err(DecodeError::NullInNonNullColumn)));
 }
 
@@ -141,17 +141,17 @@ fn null_in_not_null_column_is_tier3_fast_path_fallback() {
     let borrowed = OrderKey::decode(ORDER_KEY_ID_NULL);
     assert!(matches!(borrowed, Err(DecodeError::NullInNonNullColumn)));
 
-    let owned = OrderKeyOwned::decode(ORDER_KEY_ID_NULL);
+    let owned = OrderKey::decode(ORDER_KEY_ID_NULL);
     assert!(matches!(owned, Err(DecodeError::NullInNonNullColumn)));
 }
 
 #[test]
 fn not_null_text_borrows_zero_copy() {
-    let borrowed = UserNames::decode(USER_NAMES_ROW).expect("decode");
+    let borrowed = UserNamesRef::decode(USER_NAMES_ROW).expect("decode");
     assert_eq!(borrowed.id, 1);
     assert_eq!(borrowed.email, "a@b.co");
 
-    let owned = UserNamesOwned::decode(USER_NAMES_ROW).expect("decode owned");
+    let owned = UserNames::decode(USER_NAMES_ROW).expect("decode owned");
     assert_eq!(owned.email, "a@b.co".to_string());
 }
 
@@ -176,13 +176,13 @@ const _: () = {
     use core::mem::size_of;
     // All-fixed twins: two `i64` = 16 B.
     assert!(size_of::<OrderKey>() == 16);
-    assert!(size_of::<OrderKeyOwned>() == 16);
+    assert!(size_of::<OrderKey>() == 16);
     // Borrowed mixed: i64(8) + Option<i32>(8) + Option<&str>(16) = 32 B.
-    assert!(size_of::<OrderRow<'static>>() == 32);
+    assert!(size_of::<OrderRowRef<'static>>() == 32);
     // Owned mixed: i64(8) + Option<i32>(8) + Option<String>(24) = 40 B.
-    assert!(size_of::<OrderRowOwned>() == 40);
+    assert!(size_of::<OrderRow>() == 40);
     // Borrowed text: i64(8) + &str(16) = 24 B.
-    assert!(size_of::<UserNames<'static>>() == 24);
+    assert!(size_of::<UserNamesRef<'static>>() == 24);
     // Owned text: i64(8) + String(24) = 32 B.
-    assert!(size_of::<UserNamesOwned>() == 32);
+    assert!(size_of::<UserNames>() == 32);
 };

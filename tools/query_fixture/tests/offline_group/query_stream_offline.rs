@@ -166,7 +166,7 @@ fn malformed_row_mid_stream_is_loud_decode_err_and_connection_survives() {
     // Stream: the good row reaches `on_row`, the malformed one stops with a LOUD
     // classified decode error.
     let mut seen = 0usize;
-    let result = c.query_each::<MalStreamQuery, _, _>((), |_row| {
+    let result = c.query_each::<MalStream, _, _>((), |_row| {
         seen += 1;
         ControlFlow::<()>::Continue(())
     });

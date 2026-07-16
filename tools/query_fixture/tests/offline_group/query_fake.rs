@@ -98,7 +98,7 @@ async fn query_macro_decodes_the_fakes_binary_rows() {
     let mut conn = fake.connect().await.expect("connect over the fake");
 
     let result = conn
-        .query::<UsersByNameQuery>(())
+        .query::<UsersByName>(())
         .await
         .expect("run query! over the fake");
     assert_eq!(result.len(), 2);
@@ -135,7 +135,7 @@ async fn query_macro_query_one_over_the_fake() {
 
     let mut conn = fake.connect().await.expect("connect over the fake");
     let one = conn
-        .query_one::<UsersByNameQuery>(())
+        .query_one::<UsersByName>(())
         .await
         .expect("query_one over the fake");
     assert_eq!(one.id, 7);
@@ -153,7 +153,7 @@ async fn query_one_zero_rows_is_no_rows_over_the_fake() {
 
     let mut conn = fake.connect().await.expect("connect over the fake");
     let err = conn
-        .query_one::<UsersByNameQuery>(())
+        .query_one::<UsersByName>(())
         .await
         .expect_err("zero rows must be a loud NoRows");
     assert!(matches!(err, DriverError::NoRows), "got: {err:?}");
@@ -173,7 +173,7 @@ async fn query_one_two_rows_is_too_many_then_reclaims_over_the_fake() {
 
     let mut conn = fake.connect().await.expect("connect over the fake");
     let err = conn
-        .query_one::<UsersByNameQuery>(())
+        .query_one::<UsersByName>(())
         .await
         .expect_err("two rows must be a loud TooManyRows");
     assert!(matches!(err, DriverError::TooManyRows), "got: {err:?}");
@@ -182,7 +182,7 @@ async fn query_one_two_rows_is_too_many_then_reclaims_over_the_fake() {
     // The drain reclaimed it: a following query on the SAME connection returns
     // BOTH scripted rows.
     let rows = conn
-        .query::<UsersByNameQuery>(())
+        .query::<UsersByName>(())
         .await
         .expect("the reclaimed connection runs the next query!");
     assert_eq!(rows.len(), 2, "both scripted rows come back after reclaim");
@@ -201,7 +201,7 @@ async fn unscripted_query_macro_is_a_loud_error_then_reuse_works() {
 
     // The unscripted extended query is a loud server error, not empty rows.
     let err = conn
-        .query::<UnscriptedByIdQuery>(())
+        .query::<UnscriptedById>(())
         .await
         .expect_err("an unscripted query! must be a loud error, never empty");
     assert!(matches!(err, DriverError::Db(_)), "got: {err:?}");
@@ -213,7 +213,7 @@ async fn unscripted_query_macro_is_a_loud_error_then_reuse_works() {
 
     // The SAME connection returns the scripted rows.
     let one = conn
-        .query_one::<UsersByNameQuery>(())
+        .query_one::<UsersByName>(())
         .await
         .expect("the reused connection runs the scripted query!");
     assert_eq!(one.id, 1);
@@ -232,13 +232,13 @@ async fn repeated_query_macro_on_one_connection_hits_the_cache() {
     let mut conn = fake.connect().await.expect("connect over the fake");
 
     let first = conn
-        .query_one::<UsersByNameQuery>(())
+        .query_one::<UsersByName>(())
         .await
         .expect("first run (cache miss)");
     assert_eq!(first.name, "alice");
 
     let second = conn
-        .query_one::<UsersByNameQuery>(())
+        .query_one::<UsersByName>(())
         .await
         .expect("second run (cache hit)");
     assert_eq!(second.name, "alice");
@@ -258,7 +258,7 @@ fn query_macro_decodes_the_fakes_binary_rows_sync() {
     let mut conn = fake.connect_sync().expect("connect over the fake (sync)");
 
     let result = conn
-        .query::<UsersByNameQuery>(())
+        .query::<UsersByName>(())
         .expect("run query! over the fake (sync)");
     assert_eq!(result.len(), 2);
 
@@ -291,7 +291,7 @@ fn unscripted_query_macro_is_a_loud_error_then_reuse_works_sync() {
     let mut conn = fake.connect_sync().expect("connect over the fake (sync)");
 
     let err = conn
-        .query::<UnscriptedByIdQuery>(())
+        .query::<UnscriptedById>(())
         .expect_err("an unscripted query! must be a loud error, never empty");
     assert!(matches!(err, DriverError::Db(_)), "got: {err:?}");
     assert!(
@@ -301,7 +301,7 @@ fn unscripted_query_macro_is_a_loud_error_then_reuse_works_sync() {
     assert!(conn.is_healthy(), "the connection recovers after the error");
 
     let one = conn
-        .query_one::<UsersByNameQuery>(())
+        .query_one::<UsersByName>(())
         .expect("the reused connection runs the scripted query!");
     assert_eq!(one.id, 42);
     assert_eq!(one.name, "solo");
@@ -313,12 +313,12 @@ fn unscripted_query_macro_is_a_loud_error_then_reuse_works_sync() {
 /// `PREPARED.sql()` (rather than re-typing the literal) guarantees the fake's
 /// match key equals the driver's query byte-for-byte.
 fn all_types_sql() -> &'static str {
-    <AllTypesQuery as bsql::TypedQuery>::PREPARED.sql()
+    <AllTypes as bsql::TypedQuery>::PREPARED.sql()
 }
 
 /// Assert every field of the OWNED full-surface record equals the scripted
 /// value — shared by the async + sync witnesses.
-fn assert_all_types_owned(r: &AllTypesOwned) {
+fn assert_all_types_owned(r: &AllTypes) {
     assert_eq!(r.u, Uuid::from_bytes(WITNESS_UUID));
     assert_eq!(r.n.to_string(), "3.14");
     assert_eq!(r.tstz, Timestamptz::from_micros(1_000_000));
@@ -344,7 +344,7 @@ async fn query_macro_decodes_the_full_type_surface_over_the_fake() {
 
     let mut conn = fake.connect().await.expect("connect over the fake");
     let result = conn
-        .query::<AllTypesQuery>(())
+        .query::<AllTypes>(())
         .await
         .expect("run the full-surface query! over the fake");
     assert_eq!(result.len(), 1);
@@ -378,7 +378,7 @@ fn query_macro_decodes_the_full_type_surface_over_the_fake_sync() {
 
     let mut conn = fake.connect_sync().expect("connect over the fake (sync)");
     let result = conn
-        .query::<AllTypesQuery>(())
+        .query::<AllTypes>(())
         .expect("run the full-surface query! over the fake (sync)");
     assert_eq!(result.len(), 1);
 
@@ -400,7 +400,7 @@ const ARRAY_UUID_B: [u8; 16] = [
 /// The exact SQL the driver puts in the `Parse` message for the array query —
 /// referenced (not re-typed) so the fake's match key equals it byte-for-byte.
 fn array_cols_sql() -> &'static str {
-    <ArrayColsQuery as bsql::TypedQuery>::PREPARED.sql()
+    <ArrayCols as bsql::TypedQuery>::PREPARED.sql()
 }
 
 /// Two scripted `array_rows` rows covering every array shape the decoder reads:
@@ -430,7 +430,7 @@ fn array_cols_script() -> bsql_testkit::ScriptedRows {
 /// array bytes: a populated array with a NULL element (`None` in the `Vec`), an
 /// EMPTY array (an empty `Vec`), a NULL whole array (`None`), and a present
 /// nullable array.
-fn assert_array_cols_owned(rows: &[ArrayColsOwned]) {
+fn assert_array_cols_owned(rows: &[ArrayCols]) {
     // Row 1 — populated arrays, interior NULL element, NULL whole `tags`.
     assert_eq!(rows[0].id, 1);
     assert_eq!(rows[0].ints, vec![Some(10), None, Some(30)]);
@@ -463,7 +463,7 @@ async fn query_macro_decodes_array_columns_over_the_fake() {
 
     let mut conn = fake.connect().await.expect("connect over the fake");
     let result = conn
-        .query::<ArrayColsQuery>(())
+        .query::<ArrayCols>(())
         .await
         .expect("run the array query! over the fake");
     assert_eq!(result.len(), 2);
@@ -490,7 +490,7 @@ fn query_macro_decodes_array_columns_over_the_fake_sync() {
 
     let mut conn = fake.connect_sync().expect("connect over the fake (sync)");
     let result = conn
-        .query::<ArrayColsQuery>(())
+        .query::<ArrayCols>(())
         .expect("run the array query! over the fake (sync)");
     assert_eq!(result.len(), 2);
 

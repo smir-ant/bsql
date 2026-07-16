@@ -56,7 +56,7 @@ fn prepare(c: &mut Connection, lo: i64, hi: i64) {
 }
 
 fn account_exists(c: &mut Connection, id: i64) -> bool {
-    !c.query::<PlSelAccountSQuery>((id,)).expect("select account").is_empty()
+    !c.query::<PlSelAccountS>((id,)).expect("select account").is_empty()
 }
 
 /// (a) heterogeneous read + read + write in one batch, all correct + committed.
@@ -69,9 +69,9 @@ fn heterogeneous_read_read_write_all_correct_and_committed() {
 
     let (one, hi, ins) = c
         .pipeline((
-            PlOneSQuery::bind(()),
-            PlHiSQuery::bind(()),
-            PlInsAccountSQuery::bind((id, 500)),
+            PlOneS::bind(()),
+            PlHiS::bind(()),
+            PlInsAccountS::bind((id, 500)),
         ))
         .expect("pipeline runs");
     assert_eq!(one.iter().next().expect("row").expect("decode").n, 1);
@@ -91,8 +91,8 @@ fn mid_batch_failure_rolls_back_the_whole_batch() {
     prepare(&mut c, 9_100_000, 9_100_099);
 
     let result = c.pipeline((
-        PlInsAccountSQuery::bind((id, 100)),
-        PlInsAccountSQuery::bind((id, 200)),
+        PlInsAccountS::bind((id, 100)),
+        PlInsAccountS::bind((id, 200)),
     ));
     match result {
         Err(DriverError::BatchFailed { index, source }) => {
@@ -106,7 +106,7 @@ fn mid_batch_failure_rolls_back_the_whole_batch() {
         "command #0's write MUST be rolled back — zero rows after a mid-batch failure",
     );
     assert!(c.is_healthy(), "connection healthy after a batch failure");
-    assert_eq!(c.query_one::<PlSevenSQuery>(()).expect("reuse works").n, 7);
+    assert_eq!(c.query_one::<PlSevenS>(()).expect("reuse works").n, 7);
     c.close().expect("close");
 }
 
@@ -119,9 +119,9 @@ fn batch_failed_index_accessor_names_the_command() {
     prepare(&mut c, 9_150_000, 9_150_099);
     let err = c
         .pipeline((
-            PlOneSQuery::bind(()),
-            PlInsAccountSQuery::bind((id, 1)),
-            PlInsAccountSQuery::bind((id, 2)),
+            PlOneS::bind(()),
+            PlInsAccountS::bind((id, 1)),
+            PlInsAccountS::bind((id, 2)),
         ))
         .expect_err("batch fails");
     assert_eq!(err.batch_failed_index(), Some(2), "the third command failed");
@@ -144,7 +144,7 @@ fn commit_time_deferred_constraint_failure_is_honest_not_out_of_range_index() {
     )
     .expect("create pl_deferred");
 
-    let result = c.pipeline((PlDeferInsSQuery::bind((1, 77)), PlDeferInsSQuery::bind((2, 77))));
+    let result = c.pipeline((PlDeferInsS::bind((1, 77)), PlDeferInsS::bind((2, 77))));
 
     match result {
         Err(DriverError::Db(ref e)) => {
@@ -171,7 +171,7 @@ fn commit_time_deferred_constraint_failure_is_honest_not_out_of_range_index() {
         0,
         "the commit-time failure rolled the whole batch back — zero rows persisted",
     );
-    assert_eq!(c.query_one::<PlSevenSQuery>(()).expect("reuse after commit failure").n, 7);
+    assert_eq!(c.query_one::<PlSevenS>(()).expect("reuse after commit failure").n, 7);
     c.close().expect("close");
 }
 
@@ -187,7 +187,7 @@ fn cancel_mid_batch_is_57014_and_connection_recovers() {
     });
 
     let started = Instant::now();
-    let result = c.pipeline((PlSleepSQuery::bind(()), PlOneSQuery::bind(())));
+    let result = c.pipeline((PlSleepS::bind(()), PlOneS::bind(())));
     let elapsed = started.elapsed();
     drop(canceller.join());
 
@@ -199,7 +199,7 @@ fn cancel_mid_batch_is_57014_and_connection_recovers() {
         other => panic!("expected a 57014 BatchFailed, got {other:?}"),
     }
     assert!(c.is_healthy(), "a cancel is NOT a disconnect — connection reusable");
-    assert_eq!(c.query_one::<PlSevenSQuery>(()).expect("reuse after cancel").n, 7);
+    assert_eq!(c.query_one::<PlSevenS>(()).expect("reuse after cancel").n, 7);
     c.close().expect("close");
 }
 
@@ -218,7 +218,7 @@ fn transport_death_mid_batch_is_a_classified_disconnect() {
     });
 
     let started = Instant::now();
-    let result = c.pipeline((PlSleepSQuery::bind(()), PlOneSQuery::bind(())));
+    let result = c.pipeline((PlSleepS::bind(()), PlOneS::bind(())));
     let elapsed = started.elapsed();
     drop(killer.join());
 
@@ -239,7 +239,7 @@ fn pipeline_inside_a_transaction_guard_commits() {
 
     let (a, b) = c
         .transaction(|tx| {
-            let (one, ins) = tx.pipeline((PlOneSQuery::bind(()), PlInsAccountSQuery::bind((id, 42))))?;
+            let (one, ins) = tx.pipeline((PlOneS::bind(()), PlInsAccountS::bind((id, 42))))?;
             Ok((
                 one.iter().next().expect("row").expect("decode").n,
                 ins.iter().next().expect("row").expect("decode").id,
@@ -265,15 +265,15 @@ fn explicit_begin_then_failing_batch_leaves_aborted_tx_until_rollback() {
 
     c.execute_sql("BEGIN").expect("open explicit tx");
     let result = c.pipeline((
-        PlInsAccountSQuery::bind((id, 1)),
-        PlInsAccountSQuery::bind((id, 2)),
+        PlInsAccountS::bind((id, 1)),
+        PlInsAccountS::bind((id, 2)),
     ));
     assert!(
         matches!(result, Err(DriverError::BatchFailed { index: 1, .. })),
         "the batch fails at index 1, got {result:?}",
     );
     // Left ABORTED: a follow-up verb is a LOUD 25P02, not a silent autocommit.
-    match c.query_one::<PlSevenSQuery>(()) {
+    match c.query_one::<PlSevenS>(()) {
         Err(DriverError::Db(e)) => assert_eq!(
             e.code(), "25P02",
             "an in-aborted-tx verb must be a loud 25P02, never a silent autocommit; got {e:?}",
@@ -282,7 +282,7 @@ fn explicit_begin_then_failing_batch_leaves_aborted_tx_until_rollback() {
     }
     assert!(c.is_healthy(), "the connection is alive (25P02 is recoverable)");
     c.rollback().expect("rollback restores clean state");
-    assert_eq!(c.query_one::<PlSevenSQuery>(()).expect("clean + reusable after rollback").n, 7);
+    assert_eq!(c.query_one::<PlSevenS>(()).expect("clean + reusable after rollback").n, 7);
     assert!(!account_exists(&mut c, id), "the failed batch's writes are rolled back");
     c.close().expect("close");
 }
@@ -301,12 +301,12 @@ fn ignored_in_guard_pipeline_error_does_not_autocommit_later_verbs() {
 
     let d_is_25p02 = c
         .transaction(|tx| {
-            let _a = tx.query::<PlInsAccountSQuery>((a_id, 1))?;
+            let _a = tx.query::<PlInsAccountS>((a_id, 1))?;
             drop(tx.pipeline((
-                PlInsAccountSQuery::bind((p_id, 1)),
-                PlInsAccountSQuery::bind((p_id, 2)),
+                PlInsAccountS::bind((p_id, 1)),
+                PlInsAccountS::bind((p_id, 2)),
             )));
-            let d = tx.query::<PlInsAccountSQuery>((d_id, 1));
+            let d = tx.query::<PlInsAccountS>((d_id, 1));
             Ok(matches!(&d, Err(DriverError::Db(e)) if e.code() == "25P02"))
         })
         .expect("the guard resolves (COMMIT of an aborted tx rolls back cleanly)");
@@ -363,13 +363,13 @@ fn windowed_large_result_plus_large_params_does_not_deadlock() {
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = thread::spawn(move || {
         let out = c.pipeline((
-            PlBigResultSQuery::bind(()),
-            PlBulkInsSQuery::bind((base + 1, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 2, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 3, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 4, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 5, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 6, payload.as_str())),
+            PlBigResultS::bind(()),
+            PlBulkInsS::bind((base + 1, payload.as_str())),
+            PlBulkInsS::bind((base + 2, payload.as_str())),
+            PlBulkInsS::bind((base + 3, payload.as_str())),
+            PlBulkInsS::bind((base + 4, payload.as_str())),
+            PlBulkInsS::bind((base + 5, payload.as_str())),
+            PlBulkInsS::bind((base + 6, payload.as_str())),
         ));
         // Extract owned primitives INSIDE the worker (the borrowed records alias the
         // per-command `Rows`), then hand the connection + data back to the test.
@@ -420,15 +420,15 @@ fn windowed_all_or_nothing_rollback_at_large_payload() {
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = thread::spawn(move || {
         let out = c.pipeline((
-            PlBulkInsSQuery::bind((base + 1, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 2, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 3, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 4, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 5, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 6, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 7, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 8, payload.as_str())),
-            PlBulkInsSQuery::bind((base + 1, payload.as_str())), // DUPLICATE id → 23505
+            PlBulkInsS::bind((base + 1, payload.as_str())),
+            PlBulkInsS::bind((base + 2, payload.as_str())),
+            PlBulkInsS::bind((base + 3, payload.as_str())),
+            PlBulkInsS::bind((base + 4, payload.as_str())),
+            PlBulkInsS::bind((base + 5, payload.as_str())),
+            PlBulkInsS::bind((base + 6, payload.as_str())),
+            PlBulkInsS::bind((base + 7, payload.as_str())),
+            PlBulkInsS::bind((base + 8, payload.as_str())),
+            PlBulkInsS::bind((base + 1, payload.as_str())), // DUPLICATE id → 23505
         ));
         let classified: Result<(usize, String), String> = match out {
             Err(DriverError::BatchFailed { index, source }) => Ok((index, source.code().to_string())),
@@ -452,6 +452,6 @@ fn windowed_all_or_nothing_rollback_at_large_payload() {
         "a mid-batch failure rolled back every windowed write — zero rows persisted",
     );
     assert!(c.is_healthy(), "connection stays healthy after a windowed batch failure");
-    assert_eq!(c.query_one::<PlSevenSQuery>(()).expect("reuse").n, 7);
+    assert_eq!(c.query_one::<PlSevenS>(()).expect("reuse").n, 7);
     c.close().expect("close");
 }

@@ -1,17 +1,23 @@
-// The single most common `query!` misuse: passing the generated RECORD type
-// (`User`) where a runnable CARRIER (`UserQuery`) is required. `query!(User, ..)`
-// emits `User` — a decoded-row struct that holds values but CANNOT be run — and
-// `UserQuery`, the carrier the driver's `query` / `query_one` / `query_opt` verbs
-// take. Passing the record is a `TypedQuery` unsatisfied-bound error; the
-// `#[diagnostic::on_unimplemented]` on `TypedQuery` names the exact fix (use the
-// `…Query` carrier) instead of a raw trait-bound wall.
+// After the one-name collapse, a PLAIN `query!(Foo, "…")` makes the record `Foo`
+// ITSELF the runnable carrier, so `conn.query::<Foo>()` is CORRECT (proven in
+// `compile_pass/query_one_name_ok.rs`) — the former "record vs `FooQuery` carrier"
+// footgun is now unrepresentable for a plain query.
+//
+// The residual misuse the `#[diagnostic::on_unimplemented]` on `TypedQuery` still
+// guards is a runtime `ORDER BY { ... }` query: its RECORD is NOT a carrier,
+// because one record cannot carry N orderings' distinct prepared plans. Each
+// ordering is a separate `Foo...Query` carrier, picked via the `FooOrderBy`
+// selector — turbofishing the bare record `Foo` is the mistake, and the
+// diagnostic names the fix.
 use bsql_postgres_sync::Connection;
 
-bsql::query!(User, "SELECT id FROM users");
+bsql::query!(SortedUsers, "SELECT id FROM users ORDER BY { id ASC | id DESC }");
 
 fn run(conn: &mut Connection) {
-    // Mistake: `User` is the record, not the carrier `UserQuery`.
-    let _ = conn.query::<User>(());
+    // Mistake: `SortedUsers` is the record; a runtime-ORDER-BY query is run
+    // per-ordering via its `SortedUsers...Query` carriers / the
+    // `SortedUsersOrderBy` selector, not by turbofishing the record.
+    let _ = conn.query::<SortedUsers>(());
 }
 
 fn main() {}

@@ -77,7 +77,7 @@ async fn prepare(c: &mut Connection, lo: i64, hi: i64) {
 
 async fn account_exists(c: &mut Connection, id: i64) -> bool {
     let rows = c
-        .query::<PlSelAccountQuery>((id,))
+        .query::<PlSelAccount>((id,))
         .await
         .expect("select account");
     !rows.is_empty()
@@ -95,9 +95,9 @@ async fn heterogeneous_read_read_write_all_correct_and_committed() {
 
     let (one, hi, ins) = c
         .pipeline((
-            PlOneQuery::bind(()),
-            PlHiQuery::bind(()),
-            PlInsAccountQuery::bind((id, 500)),
+            PlOne::bind(()),
+            PlHi::bind(()),
+            PlInsAccount::bind((id, 500)),
         ))
         .await
         .expect("pipeline runs");
@@ -127,8 +127,8 @@ async fn mid_batch_failure_rolls_back_the_whole_batch() {
     // Command #0 inserts id, command #1 inserts the SAME id → duplicate-key 23505.
     let result = c
         .pipeline((
-            PlInsAccountQuery::bind((id, 100)),
-            PlInsAccountQuery::bind((id, 200)),
+            PlInsAccount::bind((id, 100)),
+            PlInsAccount::bind((id, 200)),
         ))
         .await;
 
@@ -155,7 +155,7 @@ async fn mid_batch_failure_rolls_back_the_whole_batch() {
 
     // The connection survived the recoverable failure and is reusable.
     assert!(c.is_healthy(), "connection stays healthy after a batch failure");
-    let one = c.query_one::<PlSevenQuery>(()).await.expect("reuse works");
+    let one = c.query_one::<PlSeven>(()).await.expect("reuse works");
     assert_eq!(one.n, 7);
 
     c.close().await.expect("close");
@@ -174,9 +174,9 @@ async fn batch_failed_index_accessor_names_the_command() {
     // instead: #0 insert id, #1 insert id (dup) → index 1.
     let err = c
         .pipeline((
-            PlOneQuery::bind(()),
-            PlInsAccountQuery::bind((id, 1)),
-            PlInsAccountQuery::bind((id, 2)),
+            PlOne::bind(()),
+            PlInsAccount::bind((id, 1)),
+            PlInsAccount::bind((id, 2)),
         ))
         .await
         .expect_err("batch fails");
@@ -210,7 +210,7 @@ async fn commit_time_deferred_constraint_failure_is_honest_not_out_of_range_inde
     // Execute succeed (the UNIQUE check is deferred), then the implicit COMMIT at
     // the batch's single trailing Sync fires the deferred check → 23505 at commit.
     let result = c
-        .pipeline((PlDeferInsQuery::bind((1, 77)), PlDeferInsQuery::bind((2, 77))))
+        .pipeline((PlDeferIns::bind((1, 77)), PlDeferIns::bind((2, 77))))
         .await;
 
     match result {
@@ -244,7 +244,7 @@ async fn commit_time_deferred_constraint_failure_is_honest_not_out_of_range_inde
     );
 
     // The connection survived the recoverable failure.
-    let seven = c.query_one::<PlSevenQuery>(()).await.expect("reuse after commit failure");
+    let seven = c.query_one::<PlSeven>(()).await.expect("reuse after commit failure");
     assert_eq!(seven.n, 7);
     c.close().await.expect("close");
 }
@@ -264,7 +264,7 @@ async fn cancel_mid_batch_is_57014_and_connection_recovers() {
 
     // Command #0 sleeps 3s; the cancel fires at ~300ms.
     let started = Instant::now();
-    let result = c.pipeline((PlSleepQuery::bind(()), PlOneQuery::bind(()))).await;
+    let result = c.pipeline((PlSleep::bind(()), PlOne::bind(()))).await;
     let elapsed = started.elapsed();
     drop(canceller.await);
 
@@ -279,7 +279,7 @@ async fn cancel_mid_batch_is_57014_and_connection_recovers() {
         !result_is_disconnect(&c),
         "a cancel is NOT a disconnect — the connection is reusable",
     );
-    let seven = c.query_one::<PlSevenQuery>(()).await.expect("reuse after cancel");
+    let seven = c.query_one::<PlSeven>(()).await.expect("reuse after cancel");
     assert_eq!(seven.n, 7);
     c.close().await.expect("close");
 }
@@ -306,7 +306,7 @@ async fn transport_death_mid_batch_is_a_classified_disconnect() {
     });
 
     let started = Instant::now();
-    let result = c.pipeline((PlSleepQuery::bind(()), PlOneQuery::bind(()))).await;
+    let result = c.pipeline((PlSleep::bind(()), PlOne::bind(()))).await;
     let elapsed = started.elapsed();
     drop(killer.await);
 
@@ -334,7 +334,7 @@ async fn pipeline_inside_a_transaction_guard_commits() {
     let (a, b) = c
         .transaction(async |tx| {
             let (one, ins) = tx
-                .pipeline((PlOneQuery::bind(()), PlInsAccountQuery::bind((id, 42))))
+                .pipeline((PlOne::bind(()), PlInsAccount::bind((id, 42))))
                 .await?;
             Ok((
                 one.iter().next().expect("row").expect("decode").n,
@@ -365,8 +365,8 @@ async fn explicit_begin_then_failing_batch_leaves_aborted_tx_until_rollback() {
     c.execute_sql("BEGIN").await.expect("open explicit tx");
     let result = c
         .pipeline((
-            PlInsAccountQuery::bind((id, 1)),
-            PlInsAccountQuery::bind((id, 2)),
+            PlInsAccount::bind((id, 1)),
+            PlInsAccount::bind((id, 2)),
         ))
         .await;
     assert!(
@@ -377,7 +377,7 @@ async fn explicit_begin_then_failing_batch_leaves_aborted_tx_until_rollback() {
     // The explicit transaction is left ABORTED — a follow-up verb is a LOUD `25P02`,
     // exactly as it would be after `conn.begin(); conn.query(fails)`. NOT a silent
     // autocommit (which is what an auto-ROLLBACK inside `pipeline` would have caused).
-    let blocked = c.query_one::<PlSevenQuery>(()).await;
+    let blocked = c.query_one::<PlSeven>(()).await;
     match blocked {
         Err(DriverError::Db(e)) => assert_eq!(
             e.code(), "25P02",
@@ -389,7 +389,7 @@ async fn explicit_begin_then_failing_batch_leaves_aborted_tx_until_rollback() {
 
     // The OWNER rolls it back → clean + reusable.
     c.rollback().await.expect("rollback restores clean state");
-    let seven = c.query_one::<PlSevenQuery>(()).await.expect("clean + reusable after rollback");
+    let seven = c.query_one::<PlSeven>(()).await.expect("clean + reusable after rollback");
     assert_eq!(seven.n, 7);
     assert!(!account_exists(&mut c, id).await, "the failed batch's writes are rolled back");
 
@@ -413,19 +413,19 @@ async fn ignored_in_guard_pipeline_error_does_not_autocommit_later_verbs() {
     let d_is_25p02 = c
         .transaction(async |tx| {
             // A: a real typed write (opens the transaction, succeeds).
-            let _a = tx.query::<PlInsAccountQuery>((a_id, 1)).await?;
+            let _a = tx.query::<PlInsAccount>((a_id, 1)).await?;
             // B, C: a failing batch (C dups p_id) — the caller IGNORES the error.
             drop(
                 tx.pipeline((
-                    PlInsAccountQuery::bind((p_id, 1)),
-                    PlInsAccountQuery::bind((p_id, 2)),
+                    PlInsAccount::bind((p_id, 1)),
+                    PlInsAccount::bind((p_id, 2)),
                 ))
                 .await,
             );
             // D: a verb AFTER the ignored pipeline error. In an aborted transaction it
             // MUST fail loudly with 25P02 — NOT silently autocommit (which is exactly
             // what an auto-ROLLBACK inside `pipeline` would have allowed).
-            let d = tx.query::<PlInsAccountQuery>((d_id, 1)).await;
+            let d = tx.query::<PlInsAccount>((d_id, 1)).await;
             Ok(matches!(&d, Err(DriverError::Db(e)) if e.code() == "25P02"))
         })
         .await
@@ -498,13 +498,13 @@ async fn windowed_large_result_plus_large_params_does_not_deadlock() {
     let out = tokio::time::timeout(
         Duration::from_secs(60),
         c.pipeline((
-            PlBigResultQuery::bind(()),
-            PlBulkInsQuery::bind((base + 1, payload.as_str())),
-            PlBulkInsQuery::bind((base + 2, payload.as_str())),
-            PlBulkInsQuery::bind((base + 3, payload.as_str())),
-            PlBulkInsQuery::bind((base + 4, payload.as_str())),
-            PlBulkInsQuery::bind((base + 5, payload.as_str())),
-            PlBulkInsQuery::bind((base + 6, payload.as_str())),
+            PlBigResult::bind(()),
+            PlBulkIns::bind((base + 1, payload.as_str())),
+            PlBulkIns::bind((base + 2, payload.as_str())),
+            PlBulkIns::bind((base + 3, payload.as_str())),
+            PlBulkIns::bind((base + 4, payload.as_str())),
+            PlBulkIns::bind((base + 5, payload.as_str())),
+            PlBulkIns::bind((base + 6, payload.as_str())),
         )),
     )
     .await
@@ -569,15 +569,15 @@ async fn windowed_all_or_nothing_rollback_at_large_payload() {
     let result = tokio::time::timeout(
         Duration::from_secs(60),
         c.pipeline((
-            PlBulkInsQuery::bind((base + 1, payload.as_str())),
-            PlBulkInsQuery::bind((base + 2, payload.as_str())),
-            PlBulkInsQuery::bind((base + 3, payload.as_str())),
-            PlBulkInsQuery::bind((base + 4, payload.as_str())),
-            PlBulkInsQuery::bind((base + 5, payload.as_str())),
-            PlBulkInsQuery::bind((base + 6, payload.as_str())),
-            PlBulkInsQuery::bind((base + 7, payload.as_str())),
-            PlBulkInsQuery::bind((base + 8, payload.as_str())),
-            PlBulkInsQuery::bind((base + 1, payload.as_str())), // DUPLICATE id → 23505
+            PlBulkIns::bind((base + 1, payload.as_str())),
+            PlBulkIns::bind((base + 2, payload.as_str())),
+            PlBulkIns::bind((base + 3, payload.as_str())),
+            PlBulkIns::bind((base + 4, payload.as_str())),
+            PlBulkIns::bind((base + 5, payload.as_str())),
+            PlBulkIns::bind((base + 6, payload.as_str())),
+            PlBulkIns::bind((base + 7, payload.as_str())),
+            PlBulkIns::bind((base + 8, payload.as_str())),
+            PlBulkIns::bind((base + 1, payload.as_str())), // DUPLICATE id → 23505
         )),
     )
     .await
@@ -599,6 +599,6 @@ async fn windowed_all_or_nothing_rollback_at_large_payload() {
     );
     // The connection survived the recoverable failure and is reusable.
     assert!(c.is_healthy(), "connection stays healthy after a windowed batch failure");
-    assert_eq!(c.query_one::<PlSevenQuery>(()).await.expect("reuse").n, 7);
+    assert_eq!(c.query_one::<PlSeven>(()).await.expect("reuse").n, 7);
     c.close().await.expect("close");
 }

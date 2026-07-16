@@ -14,5 +14,5 @@ bsql::query!(PipeMismatch, "SELECT id FROM users WHERE id = $1");
 
 fn main() {
     // Bind a `(&str,)` to a carrier expecting `(i64,)`: E0308.
-    let _bound = PipeMismatchQuery::bind(("hostile",));
+    let _bound = PipeMismatch::bind(("hostile",));
 }

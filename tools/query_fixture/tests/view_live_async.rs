@@ -66,7 +66,7 @@ async fn select_from_a_view_round_trips() {
     let mut c = Connection::connect(&async_config()).await.expect("connect");
     setup(&mut c).await;
 
-    let rows = c.query::<VSummaryQuery>(()).await.expect("view summary");
+    let rows = c.query::<VSummary>(()).await.expect("view summary");
     let got: Vec<(i64, i32)> = rows
         .iter()
         .map(|r| {
@@ -88,7 +88,7 @@ async fn left_join_view_column_is_nullable() {
     let mut c = Connection::connect(&async_config()).await.expect("connect");
     setup(&mut c).await;
 
-    let rows = c.query::<VProfileQuery>(()).await.expect("view profile");
+    let rows = c.query::<VProfile>(()).await.expect("view profile");
     let got: Vec<(i64, Option<String>)> = rows
         .iter()
         .map(|r| {
@@ -112,7 +112,7 @@ async fn view_over_view_round_trips() {
     let mut c = Connection::connect(&async_config()).await.expect("connect");
     setup(&mut c).await;
 
-    let rows = c.query::<VIdsQuery>(()).await.expect("view over view");
+    let rows = c.query::<VIds>(()).await.expect("view over view");
     let got: Vec<i64> = rows
         .iter()
         .map(|r| r.expect("row decodes").id)

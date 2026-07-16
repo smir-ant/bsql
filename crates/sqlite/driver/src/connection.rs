@@ -1049,7 +1049,7 @@ impl Connection {
     /// Run a compile-checked `query!` and collect its TYPED rows — the flagship
     /// query over SQLite.
     ///
-    /// `Q` is a `query!` carrier (`FooQuery`); the projected column types and
+    /// `Q` is a `query!` carrier — the record `Foo` itself; the projected column types and
     /// nullability were fixed at build time against the migration-replayed
     /// schema, so this returns typed records, not a dynamic row. `params` is the
     /// TYPED `Q::Params` tuple — the SAME tuple the PostgreSQL `query::<Q>` takes
@@ -1377,7 +1377,7 @@ impl Connection {
     /// [`SqliteTypedStatement`] handle — the TYPED flagship peer of the dynamic
     /// [`prepare_sql`](Self::prepare_sql).
     ///
-    /// `Q` is a `query!` carrier (`FooQuery`); the handle's verbs
+    /// `Q` is a `query!` carrier — the record `Foo` itself; the handle's verbs
     /// ([`query`](SqliteTypedStatement::query) /
     /// [`query_one`](SqliteTypedStatement::query_one) /
     /// [`query_opt`](SqliteTypedStatement::query_opt) /
@@ -1861,7 +1861,7 @@ pub struct TypedRows<Q: SqliteTypedQuery> {
     /// so the lazy arena shape cannot be bypassed.
     result: QueryResult,
     /// Pins the row type without owning a `Q`. `fn() -> Q` is covariant in `Q`
-    /// and imposes no auto-trait bound on the uninhabited carrier.
+    /// and imposes no auto-trait bound (the carrier `Q` may be the record type itself).
     _q: PhantomData<fn() -> Q>,
 }
 
@@ -1908,7 +1908,7 @@ impl<Q: SqliteTypedQuery> TypedRows<Q> {
 
 impl<Q: SqliteTypedQuery> core::fmt::Debug for TypedRows<Q> {
     /// Hand-written (not derived): the derive would demand `Q: Debug`, but the
-    /// carrier `Q` is an uninhabited marker. `PhantomData<fn() -> Q>` needs no
+    /// carrier `Q` may be the record type itself. `PhantomData<fn() -> Q>` needs no
     /// `Q: Debug`, so the impl is bound-free.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TypedRows").field("rows", &self.result.len()).finish()
@@ -2080,7 +2080,7 @@ pub struct SqliteTypedStatement<'conn, Q: SqliteTypedQuery> {
     /// The compiled statement borrowing the connection. Plain (non-persistent).
     stmt: rusqlite::Statement<'conn>,
     /// Pins the carrier type without owning a `Q`. `fn() -> Q` is covariant and
-    /// imposes no auto-trait bound on the uninhabited marker.
+    /// imposes no auto-trait bound (the carrier `Q` may be the record type itself).
     _q: PhantomData<fn() -> Q>,
     /// The connection, held ONLY to record N+1 detections through it. Present
     /// solely under `n1-detect`; a shared reborrow of the same `&self` the

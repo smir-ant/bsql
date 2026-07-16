@@ -42,7 +42,7 @@ const OID_TEXT: u32 = 25;
 const OID_INT4: u32 = 23;
 
 mod sync_driver {
-    use super::{ControlFlow, OgBpQuery, OgTagQuery, OgVcQuery, OID_INT4, OID_TEXT};
+    use super::{ControlFlow, OgBp, OgTag, OgVc, OID_INT4, OID_TEXT};
     use bsql::DecodeError;
     use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, SslMode};
 
@@ -66,7 +66,7 @@ mod sync_driver {
 
         // (1) query (collect): the guard drains the result before any row is
         // decoded, so it is a classified error, not an empty `Rows`.
-        match c.query::<OgTagQuery>(()) {
+        match c.query::<OgTag>(()) {
             Err(DriverError::Decode(DecodeError::ColumnOidMismatch { index, expected, found })) => {
                 assert_eq!(index, 0, "the diverging column is result column 0");
                 assert_eq!(expected, OID_TEXT, "the migration typed `tag` as text (25)");
@@ -75,7 +75,7 @@ mod sync_driver {
             other => panic!("query(): expected ColumnOidMismatch, got {other:?}"),
         }
         // (2) query_one: same classified error, NOT a mis-decoded "AAAA" row.
-        match c.query_one::<OgTagQuery>(()) {
+        match c.query_one::<OgTag>(()) {
             Err(DriverError::Decode(DecodeError::ColumnOidMismatch { found, .. })) => {
                 assert_eq!(found, OID_INT4);
             }
@@ -84,7 +84,7 @@ mod sync_driver {
         // (3) query_each: the drain swallows the row, so `on_row` NEVER sees a
         // garbage record — the error dominates.
         let mut seen = 0usize;
-        let each = c.query_each::<OgTagQuery, _, _>((), |_rec| {
+        let each = c.query_each::<OgTag, _, _>((), |_rec| {
             seen += 1;
             ControlFlow::<()>::Continue(())
         });
@@ -109,7 +109,7 @@ mod sync_driver {
             .expect("create temp");
         c.simple_query("INSERT INTO oidguard (tag) VALUES ('hello')")
             .expect("insert");
-        let row = c.query_one::<OgTagQuery>(()).expect("matching shadow decodes");
+        let row = c.query_one::<OgTag>(()).expect("matching shadow decodes");
         assert_eq!(row.tag, "hello", "a matching-typed shadow decodes the real value");
     }
 
@@ -121,7 +121,7 @@ mod sync_driver {
             .expect("create temp");
         c.simple_query("INSERT INTO oidguard (vc) VALUES ('world')")
             .expect("insert");
-        match c.query_one::<OgVcQuery>(()) {
+        match c.query_one::<OgVc>(()) {
             Ok(row) => assert_eq!(row.vc, "world", "varchar decodes as text (family compat)"),
             Err(e) => panic!("varchar column falsely rejected: {e:?}"),
         }
@@ -135,7 +135,7 @@ mod sync_driver {
             .expect("create temp");
         c.simple_query("INSERT INTO oidguard (bp) VALUES ('bb')")
             .expect("insert");
-        match c.query_one::<OgBpQuery>(()) {
+        match c.query_one::<OgBp>(()) {
             // char(8) blank-pads to 8; the family class accepts bpchar as text.
             Ok(row) => assert_eq!(row.bp.trim_end(), "bb", "bpchar decodes as text (family compat)"),
             Err(e) => panic!("bpchar column falsely rejected: {e:?}"),
@@ -144,7 +144,7 @@ mod sync_driver {
 }
 
 mod async_driver {
-    use super::{ControlFlow, OgBpQuery, OgTagQuery, OgVcQuery, OID_INT4, OID_TEXT};
+    use super::{ControlFlow, OgBp, OgTag, OgVc, OID_INT4, OID_TEXT};
     use bsql::DecodeError;
     use bsql_postgres_async::{ConnectConfig, Connection, DriverError, SslMode};
 
@@ -165,7 +165,7 @@ mod async_driver {
             .await
             .expect("insert");
 
-        match c.query::<OgTagQuery>(()).await {
+        match c.query::<OgTag>(()).await {
             Err(DriverError::Decode(DecodeError::ColumnOidMismatch { index, expected, found })) => {
                 assert_eq!(index, 0);
                 assert_eq!(expected, OID_TEXT, "the migration typed `tag` as text (25)");
@@ -173,7 +173,7 @@ mod async_driver {
             }
             other => panic!("query(): expected ColumnOidMismatch, got {other:?}"),
         }
-        match c.query_one::<OgTagQuery>(()).await {
+        match c.query_one::<OgTag>(()).await {
             Err(DriverError::Decode(DecodeError::ColumnOidMismatch { found, .. })) => {
                 assert_eq!(found, OID_INT4);
             }
@@ -181,7 +181,7 @@ mod async_driver {
         }
         let mut seen = 0usize;
         let each = c
-            .query_each::<OgTagQuery, _, _>((), |_rec| {
+            .query_each::<OgTag, _, _>((), |_rec| {
                 seen += 1;
                 ControlFlow::<()>::Continue(())
             })
@@ -207,7 +207,7 @@ mod async_driver {
         c.simple_query("INSERT INTO oidguard (tag) VALUES ('hello')")
             .await
             .expect("insert");
-        let row = c.query_one::<OgTagQuery>(()).await.expect("matching shadow decodes");
+        let row = c.query_one::<OgTag>(()).await.expect("matching shadow decodes");
         assert_eq!(row.tag, "hello");
     }
 
@@ -221,7 +221,7 @@ mod async_driver {
         c.simple_query("INSERT INTO oidguard (vc) VALUES ('world')")
             .await
             .expect("insert");
-        match c.query_one::<OgVcQuery>(()).await {
+        match c.query_one::<OgVc>(()).await {
             Ok(row) => assert_eq!(row.vc, "world", "varchar decodes as text (family compat)"),
             Err(e) => panic!("varchar column falsely rejected: {e:?}"),
         }
@@ -237,7 +237,7 @@ mod async_driver {
         c.simple_query("INSERT INTO oidguard (bp) VALUES ('bb')")
             .await
             .expect("insert");
-        match c.query_one::<OgBpQuery>(()).await {
+        match c.query_one::<OgBp>(()).await {
             Ok(row) => assert_eq!(row.bp.trim_end(), "bb", "bpchar decodes as text (family compat)"),
             Err(e) => panic!("bpchar column falsely rejected: {e:?}"),
         }

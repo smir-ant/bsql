@@ -1,8 +1,8 @@
 error[E0271]: type mismatch resolving `<Vec<(&str,)> as IntoIterator>::Item == (i64,)`
-  --> tests/compile_fail/query_batch_wrong_param.rs:18:49
+  --> tests/compile_fail/query_batch_wrong_param.rs:18:44
    |
-18 |     let _ = c.query_batch::<QbMismatchQuery, _>(vec![("hostile",)]);
-   |               -----------                       ^^^^^^^^^^^^^^^^^^ expected `(i64,)`, found `(&str,)`
+18 |     let _ = c.query_batch::<QbMismatch, _>(vec![("hostile",)]);
+   |               -----------                  ^^^^^^^^^^^^^^^^^^ expected `(i64,)`, found `(&str,)`
    |               |
    |               required by a bound introduced by this call
    |

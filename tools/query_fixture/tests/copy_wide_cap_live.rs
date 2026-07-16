@@ -76,7 +76,7 @@ fn twenty_column_copy_and_twenty_param_query_round_trip() {
 
     // The 20-PARAM query round-trips: sum of params 1..20 = 210.
     let total = c
-        .query_one::<Sum20Query>((1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20))
+        .query_one::<Sum20>((1i32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20))
         .expect("20-param query_one");
     assert_eq!(total.total, Some(210), "sum of $1..$20 (1..20) = 210");
 

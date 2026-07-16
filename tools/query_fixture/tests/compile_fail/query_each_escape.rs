@@ -19,7 +19,7 @@ fn escape(conn: &mut Connection) {
     // `v` outlives the closure. Pushing the borrowed record into it would let the
     // record escape the `for<'q>` bound — the borrow violation.
     let mut v = Vec::new();
-    let _ = conn.query_each::<EscapeQuery, _, _>((), |row| {
+    let _ = conn.query_each::<Escape, _, _>((), |row| {
         v.push(row);
         ControlFlow::<()>::Continue(())
     });

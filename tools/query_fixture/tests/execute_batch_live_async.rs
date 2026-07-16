@@ -89,12 +89,12 @@ async fn n_updates_return_correct_counts_and_all_apply() {
     let mut c = Connection::connect(&cfg()).await.expect("connect");
     fresh(&mut c).await;
     // Seed ids 1..=5 with balance 0.
-    c.execute_batch::<EbInsQuery, _>((1..=5).map(|i| (i, 0_i64)))
+    c.execute_batch::<EbIns, _>((1..=5).map(|i| (i, 0_i64)))
         .await
         .expect("seed");
     // Update ids 1,2,3 (exist → 1 each) and id 99 (absent → 0).
     let counts = c
-        .execute_batch::<EbUpdQuery, _>(vec![(1_i64, 10_i64), (2, 20), (3, 30), (99, 40)])
+        .execute_batch::<EbUpd, _>(vec![(1_i64, 10_i64), (2, 20), (3, 30), (99, 40)])
         .await
         .expect("update batch");
     assert_eq!(counts, vec![1, 1, 1, 0], "per-command affected counts");
@@ -112,7 +112,7 @@ async fn mid_batch_failure_applies_nothing() {
     fresh(&mut c).await;
     // Batch: ids 10,11,12,11(dup!),13 — command #3 violates the PK.
     let result = c
-        .execute_batch::<EbInsQuery, _>(vec![
+        .execute_batch::<EbIns, _>(vec![
             (10_i64, 1_i64),
             (11, 1),
             (12, 1),
@@ -133,7 +133,7 @@ async fn mid_batch_failure_applies_nothing() {
     // ALL-OR-NOTHING: the whole implicit transaction rolled back — ZERO rows.
     assert_eq!(row_count(&mut c).await, 0, "a mid-batch failure applied NOTHING");
     // The connection survived.
-    assert_eq!(c.query_one::<EbSevenQuery>(()).await.expect("reuse").n, 7);
+    assert_eq!(c.query_one::<EbSeven>(()).await.expect("reuse").n, 7);
     c.close().await.expect("close");
 }
 
@@ -154,7 +154,7 @@ async fn commit_time_deferred_failure_is_db_none_index() {
     // Distinct ids, SAME tag → both Execute OK, the implicit COMMIT at the trailing
     // Sync fires the deferred UNIQUE (23505 attributable to no single command).
     let result = c
-        .execute_batch::<EbDeferInsQuery, _>(vec![(1_i32, 77_i32), (2, 77)])
+        .execute_batch::<EbDeferIns, _>(vec![(1_i32, 77_i32), (2, 77)])
         .await;
     match result {
         Err(DriverError::Db(ref e)) => assert_eq!(e.code(), "23505"),
@@ -190,11 +190,11 @@ async fn ignored_in_guard_batch_error_does_not_autocommit() {
         .transaction(async |tx| {
             // A mid-batch failure inside the guard.
             let _ignored = tx
-                .execute_batch::<EbInsQuery, _>(vec![(1_i64, 1_i64), (1, 1)])
+                .execute_batch::<EbIns, _>(vec![(1_i64, 1_i64), (1, 1)])
                 .await; // duplicate PK → BatchFailed, IGNORED
             // The next verb must fail loudly with 25P02 (aborted transaction), never
             // run in silent autocommit.
-            tx.execute_batch::<EbInsQuery, _>(vec![(2_i64, 2_i64)]).await?;
+            tx.execute_batch::<EbIns, _>(vec![(2_i64, 2_i64)]).await?;
             Ok(())
         })
         .await;
@@ -220,12 +220,12 @@ async fn zero_and_one() {
     let mut c = Connection::connect(&cfg()).await.expect("connect");
     fresh(&mut c).await;
     let empty = c
-        .execute_batch::<EbInsQuery, _>(Vec::<(i64, i64)>::new())
+        .execute_batch::<EbIns, _>(Vec::<(i64, i64)>::new())
         .await
         .expect("N=0");
     assert_eq!(empty, Vec::<u64>::new(), "N=0 → empty, no I/O");
     let one = c
-        .execute_batch::<EbInsQuery, _>(vec![(1_i64, 5_i64)])
+        .execute_batch::<EbIns, _>(vec![(1_i64, 5_i64)])
         .await
         .expect("N=1");
     assert_eq!(one, vec![1], "N=1 → one count");
@@ -244,7 +244,7 @@ async fn large_n_windowed_is_correct_and_deadlock_free() {
     fresh(&mut c).await;
     const N: i64 = 20_000;
     let counts = c
-        .execute_batch::<EbInsQuery, _>((0..N).map(|i| (i, i * 10)))
+        .execute_batch::<EbIns, _>((0..N).map(|i| (i, i * 10)))
         .await
         .expect("large batch");
     assert_eq!(counts.len(), N as usize, "one count per command");
@@ -260,7 +260,7 @@ async fn large_n_windowed_is_correct_and_deadlock_free() {
     c.execute_sql("TRUNCATE eb_rows").await.expect("truncate");
     let mut sets: Vec<(i64, i64)> = (0..N).map(|i| (i, 1)).collect();
     sets.push((5_000, 1)); // duplicate PK late in the run
-    let result = c.execute_batch::<EbInsQuery, _>(sets).await;
+    let result = c.execute_batch::<EbIns, _>(sets).await;
     assert!(matches!(result, Err(DriverError::BatchFailed { index, .. }) if index == N as usize));
     assert_eq!(row_count(&mut c).await, 0, "large mid-batch failure applied NOTHING");
     c.close().await.expect("close");
@@ -275,12 +275,12 @@ async fn typed_execute_returns_the_affected_count() {
     let mut c = Connection::connect(&cfg()).await.expect("connect");
     fresh(&mut c).await;
     // INSERT one row → 1 affected (RETURNING rows are read-and-ignored).
-    let inserted = c.execute::<EbInsQuery>((1_i64, 100_i64)).await.expect("insert");
+    let inserted = c.execute::<EbIns>((1_i64, 100_i64)).await.expect("insert");
     assert_eq!(inserted, 1, "one INSERT affected 1 row");
     // UPDATE the existing row → 1; an absent id → 0.
-    let updated = c.execute::<EbUpdQuery>((1_i64, 5_i64)).await.expect("update");
+    let updated = c.execute::<EbUpd>((1_i64, 5_i64)).await.expect("update");
     assert_eq!(updated, 1, "the UPDATE affected 1 row");
-    let missed = c.execute::<EbUpdQuery>((999_i64, 5_i64)).await.expect("update-absent");
+    let missed = c.execute::<EbUpd>((999_i64, 5_i64)).await.expect("update-absent");
     assert_eq!(missed, 0, "an absent id affects 0 rows");
     // The writes landed: balance 100 + 5 = 105.
     assert_eq!(balance_sum(&mut c).await, 105, "INSERT + UPDATE applied");

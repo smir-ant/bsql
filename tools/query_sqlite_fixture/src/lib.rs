@@ -60,7 +60,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0, 9, // user_id = 9
             0xFF, 0xFF, 0xFF, 0xFF, // total = NULL
         ];
-        let row = OrderRowOwned::decode(body).expect("decode an order row");
+        let row = OrderRow::decode(body).expect("decode an order row");
         assert_eq!(row.id, 5);
         assert_eq!(row.user_id, 9);
         assert_eq!(row.total, None);
@@ -70,7 +70,7 @@ mod tests {
     fn acknowledged_toggle_query_prepared_exists() {
         // The acknowledged OPTIONAL(...) query still emits its baked
         // prepared-query artifact.
-        let prepared = OptUserQuery::PREPARED;
+        let prepared = OptUser::PREPARED;
         assert!(!prepared.param_oids().is_empty());
     }
 }

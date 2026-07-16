@@ -43,7 +43,7 @@ async fn n_plus_one_is_flagged_with_source_and_count(conn: &mut Connection) {
     let mut call_line = 0u32;
     for i in 0..LOOP {
         call_line = line!() + 1;
-        let rows = conn.query::<EchoQuery>((i,)).await.unwrap();
+        let rows = conn.query::<Echo>((i,)).await.unwrap();
         // DIAGNOSTICS-ONLY: the detector altered nothing — each query returns
         // its own echoed value.
         let owned = rows.into_owned().unwrap();
@@ -71,9 +71,9 @@ async fn n_plus_one_is_flagged_with_source_and_count(conn: &mut Connection) {
 #[bsql::test]
 #[ignore = "live: needs PostgreSQL at BSQL_TEST_DSN"]
 async fn a_single_query_is_not_flagged(conn: &mut Connection) {
-    let a = conn.query::<EchoQuery>((7,)).await.unwrap();
+    let a = conn.query::<Echo>((7,)).await.unwrap();
     assert_eq!(a.into_owned().unwrap()[0].n, 7);
-    let b = conn.query::<PingQuery>(()).await.unwrap();
+    let b = conn.query::<Ping>(()).await.unwrap();
     assert_eq!(b.into_owned().unwrap()[0].n, 1);
 
     assert!(
@@ -94,11 +94,11 @@ async fn a_single_query_is_not_flagged(conn: &mut Connection) {
 async fn distinct_call_sites_are_not_conflated(conn: &mut Connection) {
     // 20 + 20 = 40 (> 25 threshold) but split across two lines: 20 each.
     for i in 0..20 {
-        let a = conn.query::<EchoQuery>((i,)).await.unwrap(); // site A
+        let a = conn.query::<Echo>((i,)).await.unwrap(); // site A
         assert_eq!(a.into_owned().unwrap()[0].n, i);
     }
     for i in 0..20 {
-        let b = conn.query::<EchoQuery>((i,)).await.unwrap(); // site B (distinct line)
+        let b = conn.query::<Echo>((i,)).await.unwrap(); // site B (distinct line)
         assert_eq!(b.into_owned().unwrap()[0].n, i);
     }
     assert!(
@@ -118,7 +118,7 @@ async fn query_one_loop_is_flagged_once(conn: &mut Connection) {
     let mut call_line = 0u32;
     for i in 0..LOOP {
         call_line = line!() + 1;
-        let one = conn.query_one::<EchoQuery>((i,)).await.unwrap();
+        let one = conn.query_one::<Echo>((i,)).await.unwrap();
         assert_eq!(one.n, i, "iteration {i}: echoed value unchanged");
     }
     let report = conn.n1_report();
@@ -146,7 +146,7 @@ async fn n_plus_one_through_the_transaction_guard_is_flagged_at_the_consumer_lin
     conn.transaction(async |tx| {
         for i in 0..LOOP {
             call_line = line!() + 1;
-            let rows = tx.query::<EchoQuery>((i,)).await?;
+            let rows = tx.query::<Echo>((i,)).await?;
             // DIAGNOSTICS-ONLY through the guard too: each query is unaltered.
             let owned = rows.into_owned()?;
             assert_eq!(owned.len(), 1, "iteration {i}: one row");

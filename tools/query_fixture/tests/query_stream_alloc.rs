@@ -177,7 +177,7 @@ fn stream_rows(n: usize) -> (usize, usize) {
             let before = ALLOC.snapshot();
             let outcome = poll_once(engine.query_params_break(
                 live,
-                &StreamQuery::PREPARED,
+                &Stream::PREPARED,
                 (),
                 |s| {
                     if let Surface::Row(body) = s {

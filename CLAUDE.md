@@ -183,14 +183,28 @@ fn main() -> Result<(), bsql_build::BuildError> {
 ```
 
 Then `bsql::query!(Name, "<SQL>")` types the SQL at build time against that
-catalog and emits the `Name` record + the `NameQuery` carrier (which
-implements the umbrella's re-exported `bsql::TypedQuery`); an unknown
-column is a `compile_error!`. Passing the RECORD type (`conn.query::<Name>()`)
-where the runnable CARRIER (`NameQuery`) is required — the single most common
-`query!` mistake — is a `TypedQuery` `#[diagnostic::on_unimplemented]`: the error
-reads `` `Name` is not a runnable `query!` carrier `` and names the fix (use the
-`…Query` carrier; the bare record holds a decoded row and is not runnable),
-the PostgreSQL peer of the SQLite driver's `SqliteTypedQuery` diagnostic. The macro's expansion names only
+catalog and emits — for a plain query — the OWNED record `Name` (`text` columns
+are `String`), which is ITSELF the runnable carrier (it implements the umbrella's
+re-exported `bsql::TypedQuery`), so `conn.query::<Name>(params)` runs it: ONE
+user-facing name, no separate `…Query` marker. A BORROWING query additionally
+emits the ZERO-COPY borrowed VIEW `NameRef<'q>` (`text` columns are `&'q str`),
+served as the eager `Rows<Name>::iter()` / `query_each` item; an all-scalar query
+has no borrowed twin (`Name` self-owns and serves both roles). This ONE-name
+collapse is possible because only a lifetime-free type can be a `TypedQuery`
+carrier and only the OWNED record is lifetime-free (a borrowed `NameRef<'q>`
+carries a lifetime and cannot be a turbofish marker); making the owned record the
+carrier ELIMINATES the former "record vs `NameQuery` carrier" footgun BY
+CONSTRUCTION — `query::<Name>()` is now correct, and `query_one` / `query_opt`
+return the owned `Name`. An unknown column is a `compile_error!`. The `TypedQuery`
+`#[diagnostic::on_unimplemented]` now guards only the RESIDUAL misuse: turbofishing
+the borrowed VIEW `NameRef` (not runnable), or a runtime `ORDER BY { ... }` query's
+RECORD — a runtime-ORDER-BY query keeps SEPARATE uninhabited `Name…Query` carriers
+(one per ordering, picked via the `NameOrderBy` selector, since one record cannot
+carry N orderings' distinct prepared plans), so turbofishing its record reads
+`` `Name` is not a runnable `query!` carrier `` and rustc even lists the actual
+`Name…Query` carriers — the PostgreSQL peer of the SQLite driver's
+`SqliteTypedQuery` diagnostic (the SQLite bridge also attaches to `Name`, the same
+one-name surface). The macro's expansion names only
 `::bsql::__rt::…` paths (a `#[doc(hidden)]` internal module), so no other
 dependency is needed at compile time — `bsql-query-macros` is a host-only
 proc-macro and never enters the runtime binary. `emit` also emits the

@@ -33,9 +33,9 @@ bsql::query!(
 
 fn main() {
     // Touch the generated artifacts so the expansion is fully exercised.
-    let _ = Ok1Query::PREPARED.param_oids();
-    let _ = Ok2Query::PREPARED.param_oids();
-    let _ = Ok3Query::PREPARED.param_oids();
-    let _ = Ok4Query::PREPARED.param_oids();
-    let _ = Ok5Query::PREPARED.param_oids();
+    let _ = Ok1::PREPARED.param_oids();
+    let _ = Ok2::PREPARED.param_oids();
+    let _ = Ok3::PREPARED.param_oids();
+    let _ = Ok4::PREPARED.param_oids();
+    let _ = Ok5::PREPARED.param_oids();
 }

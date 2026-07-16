@@ -10,14 +10,14 @@
 //!
 //! * [`load_users`] — a PARAM-FREE typed `query!`, generic over the backend, with
 //!   the clean flagship signature: `B: SyncBackend` + ONE
-//!   `RunsOn<B, Params<'e> = (), Owned = UserRowOwned>` bound.
+//!   `RunsOn<B, Params<'e> = (), Owned = UserRow>` bound.
 //! * [`user_by_id`] — a SCALAR-PARAM typed `query!`, generic over the backend
-//!   (`RunsOn<B, Params<'e> = (i64,), Owned = UserByIdOwned>`). The SAME typed
+//!   (`RunsOn<B, Params<'e> = (i64,), Owned = UserById>`). The SAME typed
 //!   `Q::Params` tuple binds on BOTH backends — the SQLite `$N` param-bridge
 //!   unlocked the cross-backend tuple; before it, a uniform parameterized verb
 //!   across the two backends was unexpressible (see `disproof.rs`).
 //! * [`find_user_by_email`] — a BORROWED-PARAM typed `query!` taking a RUNTIME
-//!   `&str` (`RunsOn<B, Params<'e> = (&'e str, ), Owned = UserByEmailOwned>`). The
+//!   `&str` (`RunsOn<B, Params<'e> = (&'e str, ), Owned = UserByEmail>`). The
 //!   canonical `find_by_email` data-layer function, which the `'static`-params
 //!   wall used to make INEXPRESSIBLE on the typed path; the `Params` lifetime GAT
 //!   closes it — one explicit lifetime, no HRTB. `sqlx` expresses exactly this.
@@ -87,21 +87,21 @@ bsql::query!(UserByEmail, "SELECT id, email, name FROM users WHERE email = $1");
 /// Load every user, generic over the backend — the FLAGSHIP shape.
 ///
 /// The whole ergonomic question lives in this signature: `B: SyncBackend`
-/// (names the backend) + ONE `RunsOn<B, Params<'e> = (), Owned = UserRowOwned>`
+/// (names the backend) + ONE `RunsOn<B, Params<'e> = (), Owned = UserRow>`
 /// bound (names the carrier's params + owned record) + one explicit lifetime `'e`
 /// (the parameter GAT lifetime — unused here). The `Params<'e>`/`Owned` equalities
-/// let the argument be `()` and the return the CONCRETE `Vec<UserRowOwned>`
+/// let the argument be `()` and the return the CONCRETE `Vec<UserRow>`
 /// rather than an opaque projection. No `dyn`, no HRTB, no unnameable lifetimes.
 ///
 /// # Errors
 ///
 /// The backend's classified error on a SQL / server / decode failure.
-pub fn load_users<'e, B>(conn: &mut B) -> Result<Vec<UserRowOwned>, B::Error>
+pub fn load_users<'e, B>(conn: &mut B) -> Result<Vec<UserRow>, B::Error>
 where
     B: SyncBackend,
-    UserRowQuery: RunsOn<B, Params<'e> = (), Owned = UserRowOwned>,
+    UserRow: RunsOn<B, Params<'e> = (), Owned = UserRow>,
 {
-    conn.fetch_all::<UserRowQuery>(())
+    conn.fetch_all::<UserRow>(())
 }
 
 /// Load one user by primary key, generic over the backend — the PARAMETERIZED
@@ -111,18 +111,18 @@ where
 /// verb took the compile-checked `Q::Params` tuple while SQLite took an untyped
 /// `&[ValueRef]` slice, so a uniform parameterized verb across the two was
 /// unexpressible generically. Now one signature — `RunsOn<B, Params<'e> = (i64,),
-/// Owned = UserByIdOwned>` — serves both.
+/// Owned = UserById>` — serves both.
 ///
 /// # Errors
 ///
 /// The backend's classified error; a too-many-rows error if the PK is not unique
 /// (it is, so this is unreachable in practice).
-pub fn user_by_id<'e, B>(conn: &mut B, id: i64) -> Result<Option<UserByIdOwned>, B::Error>
+pub fn user_by_id<'e, B>(conn: &mut B, id: i64) -> Result<Option<UserById>, B::Error>
 where
     B: SyncBackend,
-    UserByIdQuery: RunsOn<B, Params<'e> = (i64,), Owned = UserByIdOwned>,
+    UserById: RunsOn<B, Params<'e> = (i64,), Owned = UserById>,
 {
-    conn.fetch_opt::<UserByIdQuery>((id,))
+    conn.fetch_opt::<UserById>((id,))
 }
 
 /// Load one user by primary key, REQUIRING it to exist — generic over the
@@ -137,12 +137,12 @@ where
 ///
 /// The backend's classified error for any failure OTHER than no-rows (a no-rows
 /// error is folded into `Ok(None)` by the `is_no_rows` check).
-pub fn user_by_id_required<'e, B>(conn: &mut B, id: i64) -> Result<Option<UserByIdOwned>, B::Error>
+pub fn user_by_id_required<'e, B>(conn: &mut B, id: i64) -> Result<Option<UserById>, B::Error>
 where
     B: SyncBackend,
-    UserByIdQuery: RunsOn<B, Params<'e> = (i64,), Owned = UserByIdOwned>,
+    UserById: RunsOn<B, Params<'e> = (i64,), Owned = UserById>,
 {
-    match conn.fetch_one::<UserByIdQuery>((id,)) {
+    match conn.fetch_one::<UserById>((id,)) {
         Ok(user) => Ok(Some(user)),
         // The cross-backend no-rows classification: identical on PG and SQLite.
         Err(e) if e.is_no_rows() => Ok(None),
@@ -169,12 +169,12 @@ where
 pub fn find_user_by_email<'e, B>(
     conn: &mut B,
     email: &'e str,
-) -> Result<Option<UserByEmailOwned>, B::Error>
+) -> Result<Option<UserByEmail>, B::Error>
 where
     B: SyncBackend,
-    UserByEmailQuery: RunsOn<B, Params<'e> = (&'e str,), Owned = UserByEmailOwned>,
+    UserByEmail: RunsOn<B, Params<'e> = (&'e str,), Owned = UserByEmail>,
 {
-    conn.fetch_opt::<UserByEmailQuery>((email,))
+    conn.fetch_opt::<UserByEmail>((email,))
 }
 
 /// The honest ergonomic COST: a data-layer function running N distinct `query!`s
@@ -188,14 +188,14 @@ where
 /// The backend's classified error on either query.
 pub fn load_users_and_orders<'e, B>(
     conn: &mut B,
-) -> Result<(Vec<UserRowOwned>, Vec<OrderRowOwned>), B::Error>
+) -> Result<(Vec<UserRow>, Vec<OrderRow>), B::Error>
 where
     B: SyncBackend,
-    UserRowQuery: RunsOn<B, Params<'e> = (), Owned = UserRowOwned>,
-    OrderRowQuery: RunsOn<B, Params<'e> = (), Owned = OrderRowOwned>,
+    UserRow: RunsOn<B, Params<'e> = (), Owned = UserRow>,
+    OrderRow: RunsOn<B, Params<'e> = (), Owned = OrderRow>,
 {
-    let users = conn.fetch_all::<UserRowQuery>(())?;
-    let orders = conn.fetch_all::<OrderRowQuery>(())?;
+    let users = conn.fetch_all::<UserRow>(())?;
+    let orders = conn.fetch_all::<OrderRow>(())?;
     Ok((users, orders))
 }
 
@@ -227,7 +227,7 @@ pub fn wipe_in_tx<B: SyncBackend>(conn: &mut B) -> Result<u64, B::Error> {
 }
 
 // NOTE: a generic TYPED fetch INSIDE a generic transaction body — the shape
-// `fn load_users_in_tx<B: SyncBackend>(..) where for<'t> UserRowQuery:
+// `fn load_users_in_tx<B: SyncBackend>(..) where for<'t> UserRow:
 // RunsOn<B::Tx<'t>, ..>` — is deliberately ABSENT. It is the tx-guard scope
 // limit: the higher-ranked bound over the guard lifetime is provable when
 // assumed (the fn body type-checks) but the solver cannot infer `B` at a call
@@ -250,7 +250,7 @@ pub fn wipe_in_tx<B: SyncBackend>(conn: &mut B) -> Result<u64, B::Error> {
 /// The PG driver's classified error.
 pub fn proof_load_users_pg(
     conn: &mut pg_sync::Connection,
-) -> Result<Vec<UserRowOwned>, pg_sync::DriverError> {
+) -> Result<Vec<UserRow>, pg_sync::DriverError> {
     load_users(conn)
 }
 
@@ -261,7 +261,7 @@ pub fn proof_load_users_pg(
 /// The SQLite driver's classified error.
 pub fn proof_load_users_sqlite(
     conn: &mut sqlite::Connection,
-) -> Result<Vec<UserRowOwned>, sqlite::SqliteError> {
+) -> Result<Vec<UserRow>, sqlite::SqliteError> {
     load_users(conn)
 }
 
@@ -273,7 +273,7 @@ pub fn proof_load_users_sqlite(
 pub fn proof_user_by_id_pg(
     conn: &mut pg_sync::Connection,
     id: i64,
-) -> Result<Option<UserByIdOwned>, pg_sync::DriverError> {
+) -> Result<Option<UserById>, pg_sync::DriverError> {
     user_by_id(conn, id)
 }
 
@@ -285,7 +285,7 @@ pub fn proof_user_by_id_pg(
 pub fn proof_user_by_id_sqlite(
     conn: &mut sqlite::Connection,
     id: i64,
-) -> Result<Option<UserByIdOwned>, sqlite::SqliteError> {
+) -> Result<Option<UserById>, sqlite::SqliteError> {
     user_by_id(conn, id)
 }
 
@@ -298,7 +298,7 @@ pub fn proof_user_by_id_sqlite(
 pub fn proof_find_user_by_email_pg(
     conn: &mut pg_sync::Connection,
     email: &str,
-) -> Result<Option<UserByEmailOwned>, pg_sync::DriverError> {
+) -> Result<Option<UserByEmail>, pg_sync::DriverError> {
     find_user_by_email(conn, email)
 }
 
@@ -310,7 +310,7 @@ pub fn proof_find_user_by_email_pg(
 pub fn proof_find_user_by_email_sqlite(
     conn: &mut sqlite::Connection,
     email: &str,
-) -> Result<Option<UserByEmailOwned>, sqlite::SqliteError> {
+) -> Result<Option<UserByEmail>, sqlite::SqliteError> {
     find_user_by_email(conn, email)
 }
 

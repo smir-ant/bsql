@@ -1,5 +1,5 @@
 error[E0308]: mismatched types
-  --> tests/compile_fail/query_arg_type_mismatch.rs:67:81
+  --> tests/compile_fail/query_arg_type_mismatch.rs:67:76
    |
-67 |         let _ = block_on(e.query_params(live, &SealArgMismatchQuery::PREPARED, ("hostile",), sink));
-   |                                                                                 ^^^^^^^^^ expected `i64`, found `&str`
+67 |         let _ = block_on(e.query_params(live, &SealArgMismatch::PREPARED, ("hostile",), sink));
+   |                                                                            ^^^^^^^^^ expected `i64`, found `&str`

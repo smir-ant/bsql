@@ -57,11 +57,15 @@ fn unknown_reference_is_compile_error() {
     t.compile_fail("tests/compile_fail/query_uncast_param.rs");
     t.compile_fail("tests/compile_fail/query_wrong_field.rs");
     t.compile_fail("tests/compile_fail/query_type_mismatch.rs");
-    // Passing the generated RECORD type (`User`) where a runnable CARRIER
-    // (`UserQuery`) is required — the single most common `query!` misuse. The
-    // `#[diagnostic::on_unimplemented]` on `TypedQuery` names the exact fix
-    // (use the `…Query` carrier; the record is not runnable) rather than a raw
-    // unsatisfied-trait-bound wall.
+    // The one-name collapse: a PLAIN `query!(Foo, "…")` makes the record `Foo`
+    // itself the runnable carrier, so `conn.query::<Foo>()` is CORRECT (proven by
+    // `compile_pass/query_one_name_ok.rs` below) and the former "record vs carrier"
+    // footgun is unrepresentable. The `#[diagnostic::on_unimplemented]` on
+    // `TypedQuery` now guards the residual misuse: a runtime `ORDER BY { ... }`
+    // query's RECORD is not a carrier (each ordering is a separate `Foo...Query`
+    // carrier picked via the `FooOrderBy` selector — one record cannot carry N
+    // orderings' distinct prepared plans), so turbofishing it names the fix rather
+    // than a raw unsatisfied-trait-bound wall.
     t.compile_fail("tests/compile_fail/query_not_a_carrier.rs");
     // The widened `{f32, f64, bytea}` types keep the wrong-type wall: a
     // `float4` column's record field is `f32`, and using it where an `f64`
@@ -207,6 +211,10 @@ fn unknown_reference_is_compile_error() {
     //     VIEW` drops from the view stops compiling), surfaced as `UnknownColumn`.
     t.compile_fail("tests/compile_fail/query_view_dropped_column.rs");
 
+    // The one-name collapse type-checks: `conn.query::<User>()` runs the record
+    // directly (record IS carrier), and `query_one`/`query_opt` return the OWNED
+    // `User` — the GREEN peer of the `query_not_a_carrier` residual-misuse golden.
+    t.pass("tests/compile_pass/query_one_name_ok.rs");
     // Every valid dynamic form type-checks at macro expansion.
     t.pass("tests/compile_pass/query_dynamics_ok.rs");
     // The valid `copy!` + `copy_in_typed` happy path type-checks (GREEN peer of

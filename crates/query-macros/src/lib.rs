@@ -86,14 +86,19 @@ const BRIDGES_ENV_VAR: &str = "BSQL_TYPE_BRIDGES";
 /// `query!(Name, "<SQL>")` parses the SQL string literal at expansion,
 /// infers its output row shape and parameter types against the schema
 /// replayed from the consumer's migration DDL (via the build-generated
-/// catalog), and emits two typed-record types plus their decoders:
+/// catalog), and emits the typed record plus its decoders:
 ///
-/// * `Name` — the borrowed, zero-copy record: one field per projected
-///   output column, where a `text` column borrows the input bytes as
-///   `&str` (so the borrowed decode allocates nothing). It carries a
-///   `<'q>` lifetime only when it has a borrowing (`text`) field.
-/// * `NameOwned` — the owned twin: the same fields, but `text` columns
-///   are `String`.
+/// * `Name` — the OWNED, `'static + Send` record: one field per projected
+///   output column (a `text` column is `String`). It is BOTH the row type a
+///   consumer names in a signature (`fn find() -> Name`) AND the runnable
+///   carrier itself — `conn.query::<Name>(params)` — so there is ONE
+///   user-facing name (only a lifetime-free type can be a `TypedQuery`
+///   carrier, and only the owned record is lifetime-free).
+/// * `NameRef<'q>` — the ZERO-COPY borrowed VIEW, emitted ONLY when a column
+///   borrows (a `text` / `bytea` column is `&'q str` / `&'q [u8]`, so the
+///   borrowed decode allocates nothing). It is served as `Rows::iter`'s /
+///   `query_each`'s item (`TypedQuery::Record<'q>`); an all-scalar query has
+///   no borrowed twin (`Name` self-owns and serves both roles).
 ///
 /// A `NOT NULL` column maps to `T`; a nullable column maps to
 /// `Option<T>`. Each type has a `decode` associated fn that turns a raw
@@ -247,7 +252,8 @@ fn query_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     #[cfg(not(feature = "sqlite"))]
     let _ = scan_acknowledged;
 
-    // The SQLite typed-runtime bridge (`impl SqliteTypedQuery for {Name}Query`),
+    // The SQLite typed-runtime bridge (`impl SqliteTypedQuery for {Name}` — the
+    // record IS the carrier, the same one-name surface as the PostgreSQL bridge),
     // emitted ONLY when the umbrella's `sqlite` runtime driver is present (the
     // `sqlite-runtime` macro feature) AND the query is SQLite-decodable — every
     // projected column a SQLite storage class, unbridged, and no PostgreSQL-only
@@ -1814,7 +1820,7 @@ fn emit_records(
     bridges: &Bridges,
     enums: &EnumTypes,
 ) -> syn::Result<TokenStream2> {
-    let owned_name = format_ident!("{}Owned", name);
+    let ref_name = format_ident!("{}Ref", name);
 
     // One field identifier per output column. A duplicate output column
     // name is already a loud `InferError::DuplicateOutputColumn` from the
@@ -1857,45 +1863,11 @@ fn emit_records(
     // variable-width column would shift every later column's offset, so
     // const offsets only hold under both conditions. A bridge does NOT
     // change the wire shape (the native pivot is decoded, then reshaped), so
-    // eligibility keys on the NATIVE fixed width exactly as before.
+    // eligibility keys on the NATIVE fixed width exactly as before. A
+    // fixed-width column never borrows, so this always implies `!has_borrowed`.
     let all_fixed_not_null = columns
         .iter()
         .all(|c| !c.nullable && fixed_width(c.ty).is_some());
-
-    let borrowed_fields = field_idents
-        .iter()
-        .zip(columns)
-        .map(|(id, col)| {
-            let ty = field_type_bridged(col.ty, col.nullable, false, bridges, enums)?;
-            // `pub`: a record is DATA (the query's output row), not an invariant —
-            // no encapsulation is load-bearing. Public fields let a generic /
-            // cross-module data layer (e.g. `SyncBackend`) READ a `Vec<Q::Owned>`
-            // returned across the module boundary; module-private fields made an
-            // owned record opaque outside its defining module.
-            Ok(quote! { pub #id: #ty })
-        })
-        .collect::<syn::Result<Vec<_>>>()?;
-
-    // The borrowed record carries `<'q>` ONLY when it has a borrowing
-    // (text / bytea) field — otherwise the lifetime would be unused, which
-    // the workspace `unused_lifetimes` floor forbids.
-    let borrowed_generics = if has_borrowed { quote!(<'q>) } else { quote!() };
-    let borrowed_input = if has_borrowed {
-        quote!(body: &'q [u8])
-    } else {
-        quote!(body: &[u8])
-    };
-
-    let cx = Codegen { bridges, enums };
-    let borrowed_body = decode_body(
-        &field_idents,
-        columns,
-        &col_idx_u16,
-        n_i16,
-        all_fixed_not_null,
-        false,
-        &cx,
-    )?;
 
     let allow_reason = "generated typed-record fields are the query's output row shape; a consumer may read any subset of the columns";
 
@@ -1914,80 +1886,105 @@ fn emit_records(
         quote!(Debug, Clone, PartialEq)
     };
 
-    // The owned twin. When the query projects a borrowing (`text` / `bytea`)
-    // column, the owned record genuinely DIFFERS from the borrowed one
-    // (`String` / `Vec<u8>` vs `&'q str` / `&'q [u8]`), so it is a distinct
-    // struct with its own `decode`. When NO column borrows (the common
-    // all-scalar case — integers/float/bool/uuid/temporal/numeric/arrays, and
-    // BRIDGED columns, all self-owning), the owned fields, the owned decode
-    // body, AND the borrowed record's spelling (lifetime-free in this branch)
-    // are byte-identical, so the owned twin is a plain type ALIAS instead of a
-    // duplicate struct + four derives + a ~45-line `decode` monomorphization.
-    // `#name` is `'static + Send` here, satisfying `TypedQuery::Owned: Send +
-    // 'static`, and both `#owned_name::decode` and `type Owned = #owned_name`
-    // (in `emit_dynamic_wire`) resolve straight through the alias.
-    let owned_items = if has_borrowed {
-        let owned_fields = field_idents
-            .iter()
-            .zip(columns)
-            .map(|(id, col)| {
-                let ty = field_type_bridged(col.ty, col.nullable, true, bridges, enums)?;
-                // `pub` — see the borrowed-twin note above (a record is data, not
-                // an invariant; a returned `Vec<Q::Owned>` must be readable).
-                Ok(quote! { pub #id: #ty })
-            })
-            .collect::<syn::Result<Vec<_>>>()?;
-        let owned_body = decode_body(
-            &field_idents,
-            columns,
-            &col_idx_u16,
-            n_i16,
-            all_fixed_not_null,
-            true,
-            &cx,
-        )?;
-        quote! {
-            #[derive(#derives)]
-            #[allow(dead_code, reason = #allow_reason)]
-            pub struct #owned_name {
-                #(#owned_fields),*
-            }
+    let cx = Codegen { bridges, enums };
 
-            impl #owned_name {
-                /// Decode one raw `DataRow` payload (the wire bytes after the
-                /// field-count header) into the owned record.
-                pub fn decode(body: &[u8])
-                    -> ::core::result::Result<Self, ::bsql::__rt::DecodeError>
-                {
-                    #owned_body
-                }
-            }
+    // The OWNED record carries the BARE `#name` — it is the canonical, `'static +
+    // Send` row a consumer names in a signature (`fn find() -> #name`) AND the
+    // turbofish carrier itself (`conn.query::<#name>(..)`), because only a
+    // lifetime-free type can be a `Q: TypedQuery` marker (a borrowed record carries
+    // `<'q>` and cannot). `text` / `bytea` columns are `String` / `Vec<u8>`.
+    // `pub` fields: a record is DATA (the query's output row), not an invariant —
+    // a generic / cross-module data layer (e.g. `SyncBackend`) READs the returned
+    // record's columns across the module boundary.
+    let owned_fields = field_idents
+        .iter()
+        .zip(columns)
+        .map(|(id, col)| {
+            let ty = field_type_bridged(col.ty, col.nullable, true, bridges, enums)?;
+            Ok(quote! { pub #id: #ty })
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
+    let owned_body = decode_body(
+        &field_idents,
+        columns,
+        &col_idx_u16,
+        n_i16,
+        all_fixed_not_null,
+        true,
+        &cx,
+    )?;
+
+    let owned_struct = quote! {
+        #[derive(#derives)]
+        #[allow(dead_code, reason = #allow_reason)]
+        pub struct #name {
+            #(#owned_fields),*
         }
-    } else {
-        quote! {
-            pub type #owned_name = #name;
+
+        impl #name {
+            /// Decode one raw `DataRow` payload (the wire bytes after the
+            /// field-count header) into the owned record (`text` / `bytea`
+            /// copied into `String` / `Vec<u8>`).
+            pub fn decode(body: &[u8])
+                -> ::core::result::Result<Self, ::bsql::__rt::DecodeError>
+            {
+                #owned_body
+            }
         }
     };
 
+    // A query with NO borrowing (`text` / `bytea`) column has an owned record that
+    // IS its own borrowed record (every field self-owns — integers / float / bool /
+    // uuid / temporal / numeric / arrays / BRIDGED columns), so `#name` alone serves
+    // both roles: the `TypedQuery::Record<'q>` GAT points straight at it (the `'q`
+    // is harmlessly unused) and no borrowed twin is emitted. This is the common case.
+    if !has_borrowed {
+        return Ok(owned_struct);
+    }
+
+    // A borrowing query additionally emits the ZERO-COPY borrowed VIEW `#nameRef<'q>`
+    // (`text` / `bytea` alias the input bytes as `&'q str` / `&'q [u8]`, so the
+    // borrowed decode allocates nothing). It is served as `TypedQuery::Record<'q>`
+    // from `Rows::iter` / `query_each` — the escape from an owning per-row copy —
+    // and is the SECONDARY name (a consumer names the bare `#name` in signatures and
+    // rarely spells this view; a `for row in rows.iter()` loop infers it).
+    let borrowed_fields = field_idents
+        .iter()
+        .zip(columns)
+        .map(|(id, col)| {
+            let ty = field_type_bridged(col.ty, col.nullable, false, bridges, enums)?;
+            Ok(quote! { pub #id: #ty })
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
+    let borrowed_body = decode_body(
+        &field_idents,
+        columns,
+        &col_idx_u16,
+        n_i16,
+        all_fixed_not_null,
+        false,
+        &cx,
+    )?;
+
     Ok(quote! {
+        #owned_struct
+
         #[derive(#derives)]
         #[allow(dead_code, reason = #allow_reason)]
-        pub struct #name #borrowed_generics {
+        pub struct #ref_name<'q> {
             #(#borrowed_fields),*
         }
 
-        impl #borrowed_generics #name #borrowed_generics {
+        impl<'q> #ref_name<'q> {
             /// Decode one raw `DataRow` payload (the wire bytes after the
-            /// field-count header) into the borrowed record. Borrowed
-            /// `text` columns alias the input bytes — zero allocation.
-            pub fn decode(#borrowed_input)
+            /// field-count header) into the borrowed record. `text` / `bytea`
+            /// columns alias the input bytes — zero allocation.
+            pub fn decode(body: &'q [u8])
                 -> ::core::result::Result<Self, ::bsql::__rt::DecodeError>
             {
                 #borrowed_body
             }
         }
-
-        #owned_items
     })
 }
 
@@ -2564,31 +2561,36 @@ fn emit_dynamic_wire(
     };
 
     match &shape.order_by {
-        // No runtime ORDER BY allow-set: one carrier named `{Name}Query`
-        // (identical to the non-dynamic path).
+        // No runtime ORDER BY allow-set: the RECORD `#name` IS the carrier
+        // (`carrier_is_record`), so `conn.query::<#name>(..)` runs it directly —
+        // ONE user-facing name, no separate `{Name}Query` marker.
         None => {
             let variant = shape.variants.first().ok_or_else(|| {
                 syn::Error::new(name.span(), "query!: internal error — no wire variant")
             })?;
-            let carrier = format_ident!("{}Query", name);
             let one = emit_carrier(
-                &carrier,
+                name,
                 name,
                 &variant.wire_sql,
                 &shape.params,
                 &shape.columns,
                 &tuples,
                 bridges,
+                
             )?;
             Ok(quote! {
                 #budget
                 #one
             })
         }
-        // A runtime ORDER BY allow-set: one carrier per ordering plus a
-        // closed selector enum. The caller picks a variant at runtime; an
-        // ordering outside the set cannot be named (the enum has only the
-        // declared variants), and no SQL string is built.
+        // A runtime ORDER BY allow-set: one SEPARATE uninhabited carrier per
+        // ordering (`{Name}{Variant}Query`) plus a closed selector enum. A single
+        // record shape `#name` cannot impl `TypedQuery` N times (one per ordering's
+        // distinct `PREPARED`), so here the carriers stay DISTINCT from the record
+        // `#name` (`carrier_is_record = false`) and each decodes into the shared
+        // `#name` / `#nameRef` twins. The caller picks a variant at runtime; an
+        // ordering outside the set cannot be named (the enum has only the declared
+        // variants), and no SQL string is built.
         Some(orderings) => {
             let mut carriers: Vec<TokenStream2> = Vec::with_capacity(orderings.len());
             let mut variant_idents: Vec<Ident> = Vec::with_capacity(orderings.len());
@@ -2604,6 +2606,7 @@ fn emit_dynamic_wire(
                     &shape.columns,
                     &tuples,
                     bridges,
+                    
                 )?;
                 carriers.push(emitted);
                 variant_idents.push(variant_ident);
@@ -2653,11 +2656,20 @@ fn emit_dynamic_wire(
     }
 }
 
-/// Emit ONE const wire artifact: the uninhabited carrier type, its
-/// `QueryFingerprint` impl (baked Parse / Bind-prefix templates + OID
-/// lists, derived from the lowered shape), the validated `PreparedQuery`
-/// const minted through the proto-owned `run` boundary, and the
-/// `wire_pin!` footprint guard.
+/// Emit ONE query's const wire artifact + its execution bridge: the
+/// `QueryFingerprint` impl (baked Parse / Bind-prefix templates + OID lists), the
+/// validated `PreparedQuery` const minted through the proto-owned `run` boundary,
+/// and the `TypedQuery` decode bridge.
+///
+/// `carrier_is_record` picks WHERE those impls land. For a PLAIN query the RECORD
+/// `#name` IS the carrier (`carrier == name`), so the impls land DIRECTLY on
+/// `#name` — no separate marker type, no `wire_pin!` (`#name` is a real record with
+/// fields, not a ZST) — giving the ONE-name turbofish surface `query::<#name>()`.
+/// For a runtime `ORDER BY` query the carrier is a SEPARATE uninhabited
+/// `{Name}{Variant}Query` marker (one per ordering — a single `#name` cannot impl
+/// `TypedQuery` N times), so this additionally emits `pub enum #carrier {}` + its
+/// ZST `wire_pin!`; the marker's `TypedQuery` decodes into the shared
+/// `#name` / `#nameRef` twins.
 fn emit_carrier(
     carrier: &Ident,
     name: &Ident,
@@ -2667,6 +2679,11 @@ fn emit_carrier(
     tuples: &TypeTuples,
     bridges: &Bridges,
 ) -> syn::Result<TokenStream2> {
+    // The plain (`None`-order-by) caller passes the record ident as BOTH `carrier`
+    // and `name` (the record IS the carrier); the runtime-ORDER-BY caller passes a
+    // distinct `{Name}{Variant}Query` marker. So carrier-is-record ⟺ the two idents
+    // are equal — no separate flag, keeping the argument list within the lint floor.
+    let carrier_is_record = carrier == name;
     let params_tuple = &tuples.params;
     let params_tuple_p = &tuples.params_p;
     let row_tuple = &tuples.row;
@@ -2685,13 +2702,6 @@ fn emit_carrier(
     let parse_template_lit = byte_array_literal(&parse_template_bytes);
     let bind_prefix_lit = byte_array_literal(&bind_prefix_bytes);
 
-    let carrier_doc = format!(
-        "Uninhabited fingerprint carrier for the `{name}` query. Its \
-         [`QueryFingerprint`](::bsql::QueryFingerprint) \
-         impl holds the const wire artifact; \
-         [`{carrier}::PREPARED`](Self::PREPARED) is the validated \
-         prepared query minted through the proto-owned `run` boundary."
-    );
     let prepared_doc = format!(
         "The validated, content-addressed prepared query for `{name}`, \
          minted at compile time through the proto-owned `run` boundary. \
@@ -2701,25 +2711,47 @@ fn emit_carrier(
     let allow_reason =
         "the generated prepared-query artifact is part of the query's public surface; a consumer may use any subset of it";
 
-    // The borrowed record's GAT projection. A query that projects a
-    // borrowing (`text` / `bytea`) column makes the borrowed record carry
-    // `<'q>` (it borrows the input bytes); a query with no borrowing column
-    // makes the record lifetime-free, so the `TypedQuery::Record<'q>` GAT
-    // leaves `'q` unused (verified to compile). A bridged `text` / `bytea`
-    // column decodes into an owned target, so it does NOT borrow — the same
-    // rule `emit_records` applies, so both agree on whether `<'q>` appears.
-    let owned_name = format_ident!("{}Owned", name);
+    // The borrowed-view GAT projection + the borrowed / owned decode targets. A
+    // borrowing (`text` / `bytea`) query has a distinct `#nameRef<'q>` view; an
+    // all-scalar query reuses `#name` (the `'q` is unused). A bridged `text` /
+    // `bytea` column decodes into an owned target (does NOT borrow), so this keys on
+    // the SAME `column_borrows` rule `emit_records` uses — both agree.
+    let ref_name = format_ident!("{}Ref", name);
     let has_borrowed = columns.iter().any(|c| column_borrows(c.ty, bridges));
-    let record_ty = if has_borrowed {
-        quote!(#name<'q>)
+    let (record_ty, borrowed_decode) = if has_borrowed {
+        (quote!(#ref_name<'q>), quote!(#ref_name))
     } else {
-        quote!(#name)
+        (quote!(#name), quote!(#name))
+    };
+
+    // The carrier TYPE itself is emitted only for a runtime-ORDER-BY ordering (a
+    // separate uninhabited marker); for a plain query the record `#name` — already
+    // emitted by `emit_records` — is the carrier, so no new type (and no ZST pin) is
+    // emitted here.
+    let carrier_type = if carrier_is_record {
+        quote!()
+    } else {
+        let carrier_doc = format!(
+            "Uninhabited fingerprint carrier for one ordering of the `{name}` \
+             runtime `ORDER BY` query. Its \
+             [`QueryFingerprint`](::bsql::QueryFingerprint) impl holds the const \
+             wire artifact; [`{carrier}::PREPARED`](Self::PREPARED) is the \
+             validated prepared query minted through the proto-owned `run` \
+             boundary. It decodes into the shared `{name}` record."
+        );
+        quote! {
+            #[doc = #carrier_doc]
+            #[allow(dead_code, reason = #allow_reason)]
+            pub enum #carrier {}
+
+            // Footprint guard: the marker is a zero-size, value-less carrier; the
+            // wire data lives in `.rodata`.
+            ::bsql::__rt::wire_pin!(#carrier, size = 0, align = 1);
+        }
     };
 
     Ok(quote! {
-        #[doc = #carrier_doc]
-        #[allow(dead_code, reason = #allow_reason)]
-        pub enum #carrier {}
+        #carrier_type
 
         impl ::bsql::__rt::QueryFingerprint for #carrier {
             type Params = #params_tuple;
@@ -2748,24 +2780,20 @@ fn emit_carrier(
             type Params<'p> = #params_tuple_p;
             type Row = #row_tuple;
             type Record<'q> = #record_ty;
-            type Owned = #owned_name;
+            type Owned = #name;
             const PREPARED: ::bsql::__rt::PreparedQuery<#params_tuple, #row_tuple> =
                 ::bsql::__rt::prepared::run::<#carrier>();
             fn decode_borrowed(body: &[u8])
                 -> ::core::result::Result<Self::Record<'_>, ::bsql::__rt::DecodeError>
             {
-                #name::decode(body)
+                #borrowed_decode::decode(body)
             }
             fn decode_owned(body: &[u8])
                 -> ::core::result::Result<Self::Owned, ::bsql::__rt::DecodeError>
             {
-                #owned_name::decode(body)
+                #name::decode(body)
             }
         }
-
-        // Footprint guard on the artifact: the carrier is a zero-size,
-        // value-less marker; the wire data lives in `.rodata`.
-        ::bsql::__rt::wire_pin!(#carrier, size = 0, align = 1);
     })
 }
 
@@ -2970,7 +2998,8 @@ fn sqlite_field_decode(
     })
 }
 
-/// Emit the SQLite typed-runtime bridge `impl SqliteTypedQuery for {Name}Query`,
+/// Emit the SQLite typed-runtime bridge `impl SqliteTypedQuery for {Name}` (the
+/// record IS the carrier — the same one-name surface as the PostgreSQL bridge),
 /// or NOTHING (`quote!()`) when the query is not SQLite-decodable — a
 /// PostgreSQL-only dynamic form (`OPTIONAL(...)`, `= ANY(...)`, a runtime
 /// `ORDER BY` allow-set), a bridged column, or a column type SQLite cannot
@@ -3044,35 +3073,37 @@ fn emit_sqlite_typed(
         .infer_sql;
     let sqlite_sql = bsql_build::sqlite_placeholder_form(infer_sql);
 
-    let carrier = format_ident!("{}Query", name);
-    let owned_name = format_ident!("{}Owned", name);
-    // Mirror `emit_records`: the borrowed record carries `<'q>` iff a column
-    // borrows the input (`text` / `bytea`, unbridged), so the GAT projection
-    // agrees with the emitted struct.
+    // `emit_sqlite_typed` is called only for the PLAIN (no runtime ORDER BY) case,
+    // so the RECORD `#name` IS the carrier — the SAME one-name surface as the
+    // PostgreSQL `TypedQuery` bridge (`emit_carrier` with `carrier_is_record`).
+    let ref_name = format_ident!("{}Ref", name);
+    // Mirror `emit_records`: the borrowed VIEW is `#nameRef<'q>` iff a column
+    // borrows the input (`text` / `bytea`, unbridged); an all-scalar query reuses
+    // `#name` (the `'q` is unused), so the GAT projection agrees with the structs.
     let has_borrowed = shape.columns.iter().any(|c| column_borrows(c.ty, bridges));
-    let record_ty = if has_borrowed {
-        quote!(#name<'q>)
+    let (record_ty, borrowed_ctor) = if has_borrowed {
+        (quote!(#ref_name<'q>), quote!(#ref_name))
     } else {
-        quote!(#name)
+        (quote!(#name), quote!(#name))
     };
 
     Ok(quote! {
-        impl ::bsql::__rt_sqlite::SqliteTypedQuery for #carrier {
+        impl ::bsql::__rt_sqlite::SqliteTypedQuery for #name {
             type Params<'p> = #params_tuple_p;
             type Record<'q> = #record_ty;
-            type Owned = #owned_name;
+            type Owned = #name;
             const SQL: &'static str = #sqlite_sql;
 
             fn decode_row<'q, __S: ::bsql::__rt_sqlite::ColumnSource<'q>>(
                 __src: &__S,
             ) -> ::core::result::Result<Self::Record<'q>, ::bsql::__rt_sqlite::SqliteError> {
-                ::core::result::Result::Ok(#name { #(#borrowed_inits),* })
+                ::core::result::Result::Ok(#borrowed_ctor { #(#borrowed_inits),* })
             }
 
             fn decode_row_owned<'__a, __S: ::bsql::__rt_sqlite::ColumnSource<'__a>>(
                 __src: &__S,
             ) -> ::core::result::Result<Self::Owned, ::bsql::__rt_sqlite::SqliteError> {
-                ::core::result::Result::Ok(#owned_name { #(#owned_inits),* })
+                ::core::result::Result::Ok(#name { #(#owned_inits),* })
             }
         }
     })

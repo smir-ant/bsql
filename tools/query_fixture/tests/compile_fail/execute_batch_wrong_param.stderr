@@ -1,8 +1,8 @@
 error[E0271]: type mismatch resolving `<Vec<(&str, i64)> as IntoIterator>::Item == (i64, i64)`
-  --> tests/compile_fail/execute_batch_wrong_param.rs:21:51
+  --> tests/compile_fail/execute_batch_wrong_param.rs:21:46
    |
-21 |     let _ = c.execute_batch::<EbMismatchQuery, _>(vec![("hostile", 1_i64)]);
-   |               -------------                       ^^^^^^^^^^^^^^^^^^^^^^^^ expected `(i64, i64)`, found `(&str, i64)`
+21 |     let _ = c.execute_batch::<EbMismatch, _>(vec![("hostile", 1_i64)]);
+   |               -------------                  ^^^^^^^^^^^^^^^^^^^^^^^^ expected `(i64, i64)`, found `(&str, i64)`
    |               |
    |               required by a bound introduced by this call
    |

@@ -128,6 +128,6 @@ fn baked_param_oid_matches_array_wire() {
     // The `query!`-baked param OID for `id = ANY($1)` is the int8[] array
     // OID — the SAME OID the array body declares as its element type's
     // array, so the Parse-frame type and the Bind bytes cannot drift.
-    assert_eq!(AnyIntsQuery::PREPARED.param_oids(), &[oids::INT8_ARRAY]);
+    assert_eq!(AnyInts::PREPARED.param_oids(), &[oids::INT8_ARRAY]);
     assert_eq!(oids::INT8_ARRAY, 1016);
 }

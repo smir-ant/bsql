@@ -51,9 +51,9 @@ fn heterogeneous_typed_batch_decodes_per_element() {
     let conn = seed();
     let (w, label, count) = conn
         .pipeline((
-            PlWeightByIdQuery::bind((1,)),
-            PlLabelByIdQuery::bind((2,)),
-            PlCountAllQuery::bind(()),
+            PlWeightById::bind((1,)),
+            PlLabelById::bind((2,)),
+            PlCountAll::bind(()),
         ))
         .expect("pipeline runs");
 
@@ -61,7 +61,7 @@ fn heterogeneous_typed_batch_decodes_per_element() {
     assert_eq!(label.iter().next().expect("row").expect("decode").label, "two");
     assert_eq!(count.iter().next().expect("row").expect("decode").c, 2);
     // The connection is reusable after a committed batch.
-    assert_eq!(conn.query::<PlCountAllQuery>(()).expect("reuse").len(), 1);
+    assert_eq!(conn.query::<PlCountAll>(()).expect("reuse").len(), 1);
 }
 
 /// A one-command pipeline is the degenerate (still-atomic) case, same typed tuple.
@@ -69,7 +69,7 @@ fn heterogeneous_typed_batch_decodes_per_element() {
 fn single_command_pipeline() {
     let conn = seed();
     let (w,) = conn
-        .pipeline((PlWeightByIdQuery::bind((1,)),))
+        .pipeline((PlWeightById::bind((1,)),))
         .expect("single-command pipeline");
     assert_eq!(w.len(), 1);
 }

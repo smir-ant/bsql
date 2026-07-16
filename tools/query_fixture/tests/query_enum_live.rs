@@ -61,7 +61,7 @@ fn setup_ddl(schema: &str) -> String {
 
 mod sync_driver {
     use super::{
-        setup_ddl, FeelingByIdQuery, FeelingsByMoodQuery, InsertFeelingQuery, Mood, MoodOfIdQuery,
+        setup_ddl, FeelingById, FeelingsByMood, InsertFeeling, Mood, MoodOfId,
     };
     use bsql::DecodeError;
     use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, SslMode};
@@ -82,7 +82,7 @@ mod sync_driver {
         // ENCODE an enum param + RETURNING decode: insert (1, sad, NULL) and
         // (2, in_progress, happy), reading the enum straight back.
         let one = c
-            .query_one::<InsertFeelingQuery>((1, Mood::Sad.as_label(), Mood::Happy.as_label()))
+            .query_one::<InsertFeeling>((1, Mood::Sad.as_label(), Mood::Happy.as_label()))
             .expect("insert 1");
         assert_eq!(one.id, 1);
         assert_eq!(one.m, Mood::Sad, "RETURNING m decodes the bound enum back");
@@ -91,12 +91,12 @@ mod sync_driver {
         // A second row exercising the snake_case -> PascalCase label mapping
         // (`in_progress` -> `InProgress`).
         let two = c
-            .query_one::<InsertFeelingQuery>((2, Mood::InProgress.as_label(), Mood::Ok.as_label()))
+            .query_one::<InsertFeeling>((2, Mood::InProgress.as_label(), Mood::Ok.as_label()))
             .expect("insert 2");
         assert_eq!(two.m, Mood::InProgress, "in_progress -> InProgress");
 
         // DECODE both twins: NOT NULL `m` -> `Mood`, nullable `note` -> Option.
-        let row1 = c.query_one::<FeelingByIdQuery>((1,)).expect("select 1");
+        let row1 = c.query_one::<FeelingById>((1,)).expect("select 1");
         assert_eq!(row1.m, Mood::Sad);
         assert_eq!(row1.note, Some(Mood::Happy));
 
@@ -104,13 +104,13 @@ mod sync_driver {
         // leaving `note` NULL via the default).
         c.simple_query("INSERT INTO feelings (id, m) VALUES (3, 'ok')")
             .expect("insert 3");
-        let row3 = c.query_one::<FeelingByIdQuery>((3,)).expect("select 3");
+        let row3 = c.query_one::<FeelingById>((3,)).expect("select 3");
         assert_eq!(row3.m, Mood::Ok);
         assert_eq!(row3.note, None, "an actual NULL enum decodes to None");
 
         // ENCODE an enum param in a WHERE filter: only row 2 has `m = 'in_progress'`.
         let matches = c
-            .query::<FeelingsByMoodQuery>((Mood::InProgress.as_label(),))
+            .query::<FeelingsByMood>((Mood::InProgress.as_label(),))
             .expect("filter by enum param");
         let ids: Vec<i32> = matches.iter().map(|r| r.expect("decode").id).collect();
         assert_eq!(ids, vec![2], "the enum param filters to the matching row");
@@ -128,7 +128,7 @@ mod sync_driver {
             .expect("add out-of-band label");
         c.simple_query("INSERT INTO feelings (id, m) VALUES (99, 'ecstatic')")
             .expect("insert ecstatic");
-        let unknown = c.query_one::<MoodOfIdQuery>((99,));
+        let unknown = c.query_one::<MoodOfId>((99,));
         match unknown {
             Err(DriverError::Decode(DecodeError::UnknownEnumLabel)) => {}
             other => panic!("expected a classified UnknownEnumLabel, got: {other:?}"),
@@ -142,7 +142,7 @@ mod sync_driver {
 // ─────────────────────────────── async ───────────────────────────────
 
 mod async_driver {
-    use super::{setup_ddl, FeelingByIdQuery, InsertFeelingQuery, Mood, MoodOfIdQuery};
+    use super::{setup_ddl, FeelingById, InsertFeeling, Mood, MoodOfId};
     use bsql::DecodeError;
     use bsql_postgres_async::{ConnectConfig, Connection, DriverError, SslMode};
 
@@ -161,13 +161,13 @@ mod async_driver {
             .expect("setup DDL");
 
         let one = c
-            .query_one::<InsertFeelingQuery>((1, Mood::Ok.as_label(), Mood::Sad.as_label()))
+            .query_one::<InsertFeeling>((1, Mood::Ok.as_label(), Mood::Sad.as_label()))
             .await
             .expect("insert 1");
         assert_eq!(one.m, Mood::Ok, "RETURNING decodes the bound enum (async)");
         assert_eq!(one.note, Some(Mood::Sad));
 
-        let row = c.query_one::<FeelingByIdQuery>((1,)).await.expect("select 1");
+        let row = c.query_one::<FeelingById>((1,)).await.expect("select 1");
         assert_eq!(row.m, Mood::Ok);
         assert_eq!(row.note, Some(Mood::Sad));
 
@@ -177,7 +177,7 @@ mod async_driver {
         c.simple_query("INSERT INTO feelings (id, m) VALUES (99, 'ecstatic')")
             .await
             .expect("insert ecstatic");
-        match c.query_one::<MoodOfIdQuery>((99,)).await {
+        match c.query_one::<MoodOfId>((99,)).await {
             Err(DriverError::Decode(DecodeError::UnknownEnumLabel)) => {}
             other => panic!("expected a classified UnknownEnumLabel (async), got: {other:?}"),
         }

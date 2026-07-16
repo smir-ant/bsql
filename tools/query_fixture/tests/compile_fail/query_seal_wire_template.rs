@@ -11,10 +11,10 @@
 bsql::query!(SealWireTemplate, "SELECT id FROM users");
 
 fn main() {
-    let _hostile_bytes: &[u8] = SealWireTemplateQuery::PREPARED.parse_template;
+    let _hostile_bytes: &[u8] = SealWireTemplate::PREPARED.parse_template;
     let _ = _hostile_bytes;
     unsafe {
-        let ptr = &SealWireTemplateQuery::PREPARED.parse_template as *const &[u8] as *mut &[u8];
+        let ptr = &SealWireTemplate::PREPARED.parse_template as *const &[u8] as *mut &[u8];
         ptr.write(b"hostile bytes");
     }
 }

@@ -8,6 +8,6 @@
 bsql::query!(SealFieldRead, "SELECT id FROM users");
 
 fn main() {
-    let _hostile: &str = SealFieldReadQuery::PREPARED.sql;
+    let _hostile: &str = SealFieldRead::PREPARED.sql;
     let _ = _hostile;
 }

@@ -18,7 +18,7 @@ bsql::query!(
 
 fn probe(c: &mut Connection) {
     // Feed `(&str, i64)` to a carrier expecting `(i64, i64)`: E0271.
-    let _ = c.execute_batch::<EbMismatchQuery, _>(vec![("hostile", 1_i64)]);
+    let _ = c.execute_batch::<EbMismatch, _>(vec![("hostile", 1_i64)]);
 }
 
 fn main() {}

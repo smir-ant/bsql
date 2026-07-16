@@ -1,28 +1,36 @@
 //! [`TypedQuery`] — the bridge from a compile-checked `query!` artifact to
 //! its execution over the engine and back to its TYPED records.
 //!
-//! A `query!(Foo, "<SQL>")` invocation emits, in the consumer crate, an
-//! uninhabited carrier `FooQuery` carrying the const wire artifact (its
+//! A `query!(Foo, "<SQL>")` invocation emits, in the consumer crate, the OWNED
+//! record `Foo` (text columns are `String`) — which is ITSELF the carrier: it
+//! carries the const wire artifact (its
 //! [`QueryFingerprint`](crate::QueryFingerprint) impl + the validated
-//! [`PreparedQuery`] minted through the proto-owned `run` boundary), plus two
-//! typed records — a borrowed `Foo<'q>` (text columns are `&'q str`, so the
-//! borrowed decode allocates nothing) and an owned twin `FooOwned` (text is
-//! `String`). [`TypedQuery`] ties those four artifacts together into one trait
-//! a driver can monomorphise over: given `Q::PREPARED` it runs the query, and
-//! given [`Q::decode_borrowed`](TypedQuery::decode_borrowed) /
+//! [`PreparedQuery`] minted through the proto-owned `run` boundary) AND
+//! implements [`TypedQuery`]. A borrowing query additionally emits the zero-copy
+//! borrowed VIEW `FooRef<'q>` (text columns are `&'q str`, so the borrowed decode
+//! allocates nothing); an all-scalar query has no borrowed twin (`Foo` self-owns
+//! and serves both roles). So there is ONE user-facing name `Foo`:
+//! `conn.query::<Foo>(params)` runs it (only a lifetime-free type can be a
+//! `TypedQuery` carrier, and only the owned record is lifetime-free — a borrowed
+//! `FooRef<'q>` carries a lifetime and cannot). [`TypedQuery`] ties the artifacts
+//! together into one trait a driver can monomorphise over: given `Q::PREPARED` it
+//! runs the query, and given
+//! [`Q::decode_borrowed`](TypedQuery::decode_borrowed) /
 //! [`Q::decode_owned`](TypedQuery::decode_owned) it turns each raw `DataRow`
 //! payload into the record.
 //!
 //! # The canonical typed-row story
 //!
-//! The borrowed record [`Q::Record<'q>`](TypedQuery::Record) is the canonical
-//! result row: it is served from an owned prebuffer the driver collects (so the
-//! borrow is into a buffer the caller owns, not the transient engine ingest
-//! buffer), and a per-row decode failure is a `Result` *item*, never a
-//! connection-killing fault. The owned [`Q::Owned`](TypedQuery::Owned) is the
-//! explicit `'static + Send` escape for a row that must outlive the prebuffer.
-//! There is no type-erased row on this path — the column types are pinned at
-//! compile time by the macro.
+//! The owned [`Q::Owned`](TypedQuery::Owned) (= the carrier `Foo` itself) is the
+//! canonical row a consumer names in a signature — `'static + Send`, so a row
+//! decoded from it outlives the prebuffer and crosses a task boundary;
+//! `query_one` / `into_owned` return it. The borrowed
+//! [`Q::Record<'q>`](TypedQuery::Record) (`FooRef<'q>`) is the ZERO-COPY view
+//! served from an owned prebuffer the driver collects (so the borrow is into a
+//! buffer the caller owns, not the transient engine ingest buffer) by
+//! `Rows::iter` / `query_each`; a per-row decode failure is a `Result` *item*,
+//! never a connection-killing fault. There is no type-erased row on this path —
+//! the column types are pinned at compile time by the macro.
 //!
 //! # Why this trait is NOT sealed
 //!
@@ -42,7 +50,9 @@ use crate::prepared::{PreparedQuery, RowDecode};
 /// Ties a compile-checked `query!` carrier to its prepared query and its typed
 /// record decoders.
 ///
-/// Implemented by the macro for each `query!` carrier (`FooQuery`). A driver's
+/// Implemented by the macro for each `query!` carrier — the record `Foo` itself
+/// for a plain query (so `query::<Foo>()` runs it), or a separate `Foo…Query`
+/// marker per ordering for a runtime `ORDER BY` query. A driver's
 /// typed `query` method is generic over `Q: TypedQuery`: it runs
 /// [`Q::PREPARED`](Self::PREPARED) over the engine, collects each `DataRow`
 /// payload into an owned prebuffer, and later decodes rows lazily through
@@ -55,24 +65,27 @@ use crate::prepared::{PreparedQuery, RowDecode};
 ///   tuple marker types the macro pins, carrying the wire OIDs / formats. They
 ///   are the exact `P` / `R` of [`PREPARED`](Self::PREPARED).
 /// - [`Record<'q>`](Self::Record) — the borrowed record GAT. For a query with a
-///   text column it is `Foo<'q>` (the `'q` borrows the prebuffer); for a query
+///   text column it is `FooRef<'q>` (the `'q` borrows the prebuffer); for a query
 ///   with no text column it is `Foo` (the `'q` is harmlessly unused).
-/// - [`Owned`](Self::Owned) — the owned twin `FooOwned`, `Send + 'static` so a
-///   row can outlive the prebuffer.
+/// - [`Owned`](Self::Owned) — the owned record `Foo` itself (`= Self` for a plain
+///   query), `Send + 'static` so a row can outlive the prebuffer.
 ///
 /// # Misuse diagnostic
 ///
-/// The single most common `query!` mistake is passing the generated RECORD type
-/// (`Foo`) where a runnable CARRIER (`FooQuery`) is required — `conn.query::<Foo>()`
-/// instead of `conn.query::<FooQuery>()`. The `#[diagnostic::on_unimplemented]`
-/// below names that fix in the query author's own vocabulary (use the `…Query`
-/// carrier; the bare record holds a decoded row and is not runnable) rather than a
-/// raw "`Foo: TypedQuery` is not satisfied" wall — the PostgreSQL peer of the
-/// SQLite driver's `SqliteTypedQuery` on-unimplemented message.
+/// For a PLAIN `query!(Foo, "…")` the record `Foo` IS the carrier, so
+/// `conn.query::<Foo>()` is CORRECT — the former "record vs `FooQuery` carrier"
+/// footgun is now unrepresentable. The remaining unsatisfied cases are: a type
+/// that is not a `query!` record at all; the borrowed VIEW `FooRef` (a decoded
+/// row's borrow, not runnable); and a runtime `ORDER BY { … }` query's record
+/// (each ordering is a separate `Foo…Query` carrier picked via the `FooOrderBy`
+/// selector — one `Foo` cannot carry N orderings' distinct prepared plans). The
+/// `#[diagnostic::on_unimplemented]` below names those fixes in the query author's
+/// own vocabulary rather than a raw "`Foo: TypedQuery` is not satisfied" wall —
+/// the PostgreSQL peer of the SQLite driver's `SqliteTypedQuery` message.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a runnable `query!` carrier",
-    label = "not a `query!` carrier",
-    note = "run a compile-checked query through the CARRIER the `query!` macro emits: for `query!(Foo, \"…\")` that is `FooQuery` — pass it to `query` / `query_one` / `query_opt`. The bare `Foo` is the decoded-row RECORD type (it holds a row's values), not a runnable query."
+    label = "not a runnable `query!` query",
+    note = "run a compile-checked query by turbofishing the type `query!` names: `query!(Foo, \"…\")` makes `Foo` runnable via `query` / `query_one` / `query_opt`. A `FooRef` is the borrowed row VIEW (it holds a decoded row's borrow), not a runnable query. A runtime `ORDER BY {{ … }}` query is run per-ordering through its `Foo…Query` carriers — pick one via the `FooOrderBy` selector."
 )]
 pub trait TypedQuery {
     /// The parameter tuple marker — the `$N` Rust types, supplying the wire
@@ -103,17 +116,19 @@ pub trait TypedQuery {
     /// The row tuple marker — the projected column Rust types, supplying the
     /// wire row OIDs.
     type Row: RowDecode;
-    /// The borrowed record at lifetime `'q` (the macro's `Foo<'q>`; or `Foo`
+    /// The borrowed record at lifetime `'q` (the macro's `FooRef<'q>`; or `Foo`
     /// with `'q` unused for a query that projects no text column). Text columns
     /// borrow the prebuffer as `&'q str`, so the borrowed decode allocates
     /// nothing.
     type Record<'q>;
-    /// The owned record twin (the macro's `FooOwned`). `Send + 'static` so a
-    /// row decoded from it outlives the prebuffer and crosses a task boundary.
+    /// The owned record (the macro's `Foo` — the carrier itself for a plain
+    /// query). `Send + 'static` so a row decoded from it outlives the prebuffer
+    /// and crosses a task boundary.
     type Owned: Send + 'static;
 
     /// The validated, content-addressed prepared query — exactly
-    /// `FooQuery::PREPARED`, minted at compile time through the proto-owned
+    /// `Foo::PREPARED` (or `Foo…Query::PREPARED` for a runtime-`ORDER BY`
+    /// ordering), minted at compile time through the proto-owned
     /// `run` boundary. Its wire bytes are const-checked against
     /// [`Params`](Self::Params) / [`Row`](Self::Row); a drift is a build error.
     ///

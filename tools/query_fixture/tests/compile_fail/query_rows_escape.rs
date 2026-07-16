@@ -13,7 +13,7 @@ use bsql_postgres_sync::Rows;
 
 bsql::query!(Escape, "SELECT 'x'::text AS s");
 
-fn escape(rows: Rows<EscapeQuery>) {
+fn escape(rows: Rows<Escape>) {
     // `held` borrows `rows` (its `s` field aliases the prebuffer).
     let held = rows.iter().next();
     // Moving `rows` out (here, dropping it) while `held` still borrows it is the

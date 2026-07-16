@@ -49,7 +49,7 @@ fn malformed_row_is_a_per_row_err_item_not_a_panic() {
     builder.feed(Surface::Row(GOOD));
     builder.feed(Surface::Row(BAD));
     builder.feed(Surface::Row(GOOD));
-    let rows = builder.finish::<MalQuery>();
+    let rows = builder.finish::<Mal>();
     assert_eq!(rows.len(), 3, "three rows buffered");
 
     // Decoding lazily over the prebuffer: the malformed row is an `Err` ITEM, the
@@ -74,7 +74,7 @@ fn into_owned_surfaces_the_malformed_row_as_err_not_partial() {
     let mut builder = RowsBuilder::new();
     builder.feed(Surface::Row(GOOD));
     builder.feed(Surface::Row(BAD));
-    let rows = builder.finish::<MalQuery>();
+    let rows = builder.finish::<Mal>();
     assert!(
         rows.into_owned().is_err(),
         "a malformed row makes into_owned fail closed, not return a partial Vec"

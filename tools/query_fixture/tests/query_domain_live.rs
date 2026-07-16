@@ -35,7 +35,7 @@ fn setup_ddl(schema: &str) -> String {
 }
 
 mod sync_driver {
-    use super::{setup_ddl, MemberByIdQuery};
+    use super::{setup_ddl, MemberById};
     use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, SslMode};
 
     fn config() -> ConnectConfig {
@@ -55,7 +55,7 @@ mod sync_driver {
         // CHECK; the domain columns decode as their BASE Rust types.
         c.simple_query("INSERT INTO members (id, a, h) VALUES (1, 25, 'alice')")
             .expect("insert valid");
-        let row = c.query_one::<MemberByIdQuery>((1,)).expect("select 1");
+        let row = c.query_one::<MemberById>((1,)).expect("select 1");
         assert_eq!(row.id, 1);
         assert_eq!(row.a, 25, "domain-over-domain `adult_age` decodes as its `int` base");
         assert_eq!(
@@ -67,7 +67,7 @@ mod sync_driver {
         // A NULL nullable-domain column decodes to `None`.
         c.simple_query("INSERT INTO members (id, a) VALUES (2, 40)")
             .expect("insert without handle");
-        let row2 = c.query_one::<MemberByIdQuery>((2,)).expect("select 2");
+        let row2 = c.query_one::<MemberById>((2,)).expect("select 2");
         assert_eq!(row2.h, None);
 
         // The CHECK is SERVER-enforced: an under-18 value violates `adult_age`.
@@ -86,7 +86,7 @@ mod sync_driver {
 }
 
 mod async_driver {
-    use super::{setup_ddl, MemberByIdQuery};
+    use super::{setup_ddl, MemberById};
     use bsql_postgres_async::{ConnectConfig, Connection, DriverError, SslMode};
 
     fn config() -> ConnectConfig {
@@ -106,7 +106,7 @@ mod async_driver {
         c.simple_query("INSERT INTO members (id, a, h) VALUES (1, 30, 'bob')")
             .await
             .expect("insert valid");
-        let row = c.query_one::<MemberByIdQuery>((1,)).await.expect("select 1");
+        let row = c.query_one::<MemberById>((1,)).await.expect("select 1");
         assert_eq!(row.a, 30, "domain decodes as base (async)");
         assert_eq!(row.h.as_deref(), Some("bob"));
 

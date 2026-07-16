@@ -64,6 +64,6 @@ fn main() {
         let live = block_on(e.connect(live)).unwrap();
         // Bind a `(&str,)` to a query expecting `(i64,)`: E0308, tuple types
         // are nominally distinct.
-        let _ = block_on(e.query_params(live, &SealArgMismatchQuery::PREPARED, ("hostile",), sink));
+        let _ = block_on(e.query_params(live, &SealArgMismatch::PREPARED, ("hostile",), sink));
     });
 }

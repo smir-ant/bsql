@@ -59,7 +59,7 @@ async fn typed_binary_copy_round_trips_hostile_null_and_large_batch() {
         .expect("typed binary COPY");
     assert_eq!(affected as usize, BULK + 2, "COPY reports every streamed row loaded");
 
-    let back = c.query::<BulkBackQuery>(()).await.expect("read back");
+    let back = c.query::<BulkBack>(()).await.expect("read back");
     let collected: Vec<(i64, String, Option<String>, Option<i32>)> = back
         .iter()
         .map(|r| {

@@ -12,7 +12,7 @@
 //!   it at zero allocations, this pins its ns.
 //! - `per_cell_borrowed` — `UserNames::decode` over an `(int8, text)` row. The
 //!   per-cell path (borrows the `text` as `&str`), still zero-alloc.
-//! - `per_cell_owned` — `UserNamesOwned::decode` over the same row. Copies the
+//! - `per_cell_owned` — `UserNames::decode` over the same row. Copies the
 //!   `text` cell into a `String`; the deliberate allocating contrast.
 //!
 //! Post-LTO codegen is inspected with the `asm-linked-diff` tooling on the
@@ -72,7 +72,7 @@ fn bench_per_cell_borrowed(c: &mut Criterion) {
 fn bench_per_cell_owned(c: &mut Criterion) {
     c.bench_function("decode/per_cell_owned", |b| {
         b.iter(|| {
-            let row = UserNamesOwned::decode(black_box(USER_NAMES_ROW)).expect("well-formed row");
+            let row = UserNames::decode(black_box(USER_NAMES_ROW)).expect("well-formed row");
             black_box(row)
         });
     });

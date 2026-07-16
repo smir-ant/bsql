@@ -15,7 +15,7 @@ bsql::query!(QbMismatch, "SELECT id FROM accounts WHERE id = $1");
 
 fn probe(c: &mut Connection) {
     // Feed `(&str,)` to a carrier expecting `(i64,)`: E0271.
-    let _ = c.query_batch::<QbMismatchQuery, _>(vec![("hostile",)]);
+    let _ = c.query_batch::<QbMismatch, _>(vec![("hostile",)]);
 }
 
 fn main() {}

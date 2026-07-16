@@ -98,7 +98,7 @@ fn uuid_and_timestamptz_fast_path() {
     assert_eq!(borrowed.id, Uuid::from_bytes(UUID_BYTES));
     assert_eq!(borrowed.occurred_at, Timestamptz::from_micros(1_000_000));
     // The owned twin is structurally identical (no borrowing field).
-    let owned = EventKeyOwned::decode(EVENT_KEY_ROW).expect("owned fast-path decode");
+    let owned = EventKey::decode(EVENT_KEY_ROW).expect("owned fast-path decode");
     assert_eq!(owned.id, Uuid::from_bytes(UUID_BYTES));
     // The timestamptz's exact instant: 2000-01-01 00:00:01 UTC.
     assert_eq!(owned.occurred_at.to_unix_micros(), Some(946_684_801_000_000));
@@ -125,7 +125,7 @@ fn nullable_semantic_columns_become_option() {
 fn null_in_not_null_uuid_is_classified() {
     let borrowed = Event::decode(EVENT_ROW_ID_NULL);
     assert!(matches!(borrowed, Err(DecodeError::NullInNonNullColumn)));
-    let owned = EventOwned::decode(EVENT_ROW_ID_NULL);
+    let owned = Event::decode(EVENT_ROW_ID_NULL);
     assert!(matches!(owned, Err(DecodeError::NullInNonNullColumn)));
 }
 
@@ -193,7 +193,7 @@ fn jsonb_and_json_columns_decode_text() {
     assert_eq!(row.payload.as_str(), r#"{"k":1}"#);
     assert_eq!(row.meta, Some(Json::new(String::from("[1,2]"))));
     // The owned twin is identical (json/jsonb always own their text).
-    let owned = DocOwned::decode(DOC_ROW).expect("decode owned");
+    let owned = Doc::decode(DOC_ROW).expect("decode owned");
     assert_eq!(owned.payload, Jsonb::new(String::from(r#"{"k":1}"#)));
 }
 
@@ -219,5 +219,5 @@ const _: () = {
     use core::mem::size_of;
     // uuid(16) + timestamptz(8) = 24, all by-value, no lifetime.
     assert!(size_of::<EventKey>() == 24);
-    assert!(size_of::<EventKeyOwned>() == 24);
+    assert!(size_of::<EventKey>() == 24);
 };

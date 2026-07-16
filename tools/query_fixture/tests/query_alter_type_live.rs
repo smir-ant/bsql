@@ -39,7 +39,7 @@ fn setup_ddl(schema: &str) -> String {
 }
 
 mod sync_driver {
-    use super::{setup_ddl, GarmentSize, Priority, TaskByIdQuery};
+    use super::{setup_ddl, GarmentSize, Priority, TaskById};
     use bsql_postgres_sync::{ConnectConfig, Connection, SslMode};
 
     fn config() -> ConnectConfig {
@@ -58,14 +58,14 @@ mod sync_driver {
         // A row using the ADD VALUE'd label and the RENAME TO'd type.
         c.simple_query("INSERT INTO tasks (id, p, size) VALUES (1, 'medium', 'm')")
             .expect("insert medium");
-        let row = c.query_one::<TaskByIdQuery>((1,)).expect("select 1");
+        let row = c.query_one::<TaskById>((1,)).expect("select 1");
         assert_eq!(row.p, Priority::Medium, "the ADD VALUE'd label decodes");
         assert_eq!(row.size, Some(GarmentSize::M), "the RENAME TO'd type decodes");
 
         // A row using the RENAME VALUE'd label.
         c.simple_query("INSERT INTO tasks (id, p) VALUES (2, 'critical')")
             .expect("insert critical");
-        let row2 = c.query_one::<TaskByIdQuery>((2,)).expect("select 2");
+        let row2 = c.query_one::<TaskById>((2,)).expect("select 2");
         assert_eq!(row2.p, Priority::Critical, "the RENAME VALUE'd label decodes");
 
         c.simple_query("DROP SCHEMA bsql_alter_test_sync CASCADE")
@@ -74,7 +74,7 @@ mod sync_driver {
 }
 
 mod async_driver {
-    use super::{setup_ddl, Priority, TaskByIdQuery};
+    use super::{setup_ddl, Priority, TaskById};
     use bsql_postgres_async::{ConnectConfig, Connection, SslMode};
 
     fn config() -> ConnectConfig {
@@ -94,13 +94,13 @@ mod async_driver {
         c.simple_query("INSERT INTO tasks (id, p) VALUES (1, 'medium')")
             .await
             .expect("insert medium");
-        let row = c.query_one::<TaskByIdQuery>((1,)).await.expect("select 1");
+        let row = c.query_one::<TaskById>((1,)).await.expect("select 1");
         assert_eq!(row.p, Priority::Medium, "ADD VALUE'd label decodes (async)");
 
         c.simple_query("INSERT INTO tasks (id, p) VALUES (2, 'critical')")
             .await
             .expect("insert critical");
-        let row2 = c.query_one::<TaskByIdQuery>((2,)).await.expect("select 2");
+        let row2 = c.query_one::<TaskById>((2,)).await.expect("select 2");
         assert_eq!(row2.p, Priority::Critical, "RENAME VALUE'd label decodes (async)");
 
         c.simple_query("DROP SCHEMA bsql_alter_test_async CASCADE")

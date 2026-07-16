@@ -26,7 +26,7 @@
 
 use bsql::SyncQueries;
 use bsql::sqlite::Connection;
-use bsql_syncbackend_fixture::UserByIdQuery;
+use bsql_syncbackend_fixture::UserById;
 
 // The detector's default threshold is 25; loop clearly past it.
 const LOOP: i32 = 30;
@@ -44,7 +44,7 @@ fn n1_through_generic_layer_reports_consumer_line_not_backend() {
     let mut call_line = 0u32;
     for _ in 0..LOOP {
         call_line = line!() + 1;
-        let got = conn.fetch_opt::<UserByIdQuery>((1i64,)).unwrap();
+        let got = conn.fetch_opt::<UserById>((1i64,)).unwrap();
         // Diagnostics-only: the row is still returned unchanged.
         assert!(got.is_some(), "the seeded row is returned every iteration");
     }

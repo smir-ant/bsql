@@ -75,7 +75,7 @@ fn typed_binary_copy_round_trips_hostile_null_and_large_batch() {
 
     // Read the rows back through the typed flagship and collect owned copies so
     // the assertions do not interleave prebuffer borrows.
-    let back = c.query::<BulkBackQuery>(()).expect("read back");
+    let back = c.query::<BulkBack>(()).expect("read back");
     let collected: Vec<(i64, String, Option<String>, Option<i32>)> = back
         .iter()
         .map(|r| {
