@@ -450,6 +450,40 @@ pub enum DriverError {
         /// Number of parameters the caller's tuple supplied.
         found: usize,
     },
+    /// A [`PreparedStatement`](crate::PreparedStatement) minted by ONE connection
+    /// was executed (`query_prepared` / `execute_prepared` / `close_statement`) on
+    /// a DIFFERENT connection.
+    ///
+    /// A `PreparedStatement` is a free owned `'static` value naming a server-side
+    /// statement (`_bsql_<n>`) whose plan lives ONLY on the connection that
+    /// `prepare`d it — the name is minted from a PER-CONNECTION counter, so
+    /// `_bsql_0` exists on EVERY connection's first prepare, each bound to a
+    /// DIFFERENT plan. Binding connection A's statement handle against connection
+    /// B would therefore hit B's like-named statement — a SILENT WRONG RESULT (B's
+    /// `_bsql_0` is a different query) or a server `26000` if B has none. This is
+    /// closed BY CONSTRUCTION: each connection mints a process-unique identity at
+    /// connect (a monotonic `u64`, distinct for every live connection in the
+    /// process), stamped onto every statement it prepares; each prepared verb
+    /// checks the handle's origin against the connection's identity FIRST — before
+    /// `verify_params`, before any wire I/O — and rejects a cross-connection use
+    /// here. No wire round trip is spent and the connection is UNTOUCHED (fix the
+    /// call to use the connection that prepared the statement, and retry) — so this
+    /// is NOT a disconnect ([`is_disconnect`](Self::is_disconnect) is `false`).
+    ///
+    /// Compile-time prevention is not cleanly achievable for this shape: a PG
+    /// prepared verb needs exclusive `&mut conn` AT CALL TIME
+    /// (`conn.query_prepared(&stmt, …)`), so the handle canNOT hold the connection
+    /// borrow the way SQLite's connection-scoped `SqliteStatement<'conn>` does
+    /// (whose verbs are ON the handle). Tying an owned `'static` handle statically
+    /// to a specific runtime connection VALUE would require a generative lifetime
+    /// brand on every `Connection` / verb signature — rejected as pervasive
+    /// complexity. A loud, classified, zero-wire runtime rejection is the best
+    /// achievable, and strictly better than a silent wrong result.
+    ///
+    /// Fieldless: the two connection ids are opaque process-local counters carrying
+    /// no actionable information, so the classification and its message are the
+    /// whole signal. Zero-size payload, so the 24 B footprint pin is UNTOUCHED.
+    WrongConnection,
     /// A HETEROGENEOUS pipeline (`pipeline((...))`) failed at a SPECIFIC command.
     ///
     /// The N commands of a pipeline are sent with ONE trailing `Sync`, so they form
@@ -638,6 +672,10 @@ impl DriverError {
             // Bind, so the connection is untouched — fix the parameter and retry.
             | Self::ParamTypeMismatch { .. }
             | Self::ParamCountMismatch { .. }
+            // A cross-connection prepared-statement use, caught BEFORE any wire
+            // I/O: the connection is untouched — fix the call to use the
+            // connection that prepared the statement.
+            | Self::WrongConnection
             // A pipeline command's result-schema drift is a client-side decode guard;
             // the connection was drained to a clean idle and is reusable (fix the
             // schema drift, not the connection).
@@ -754,6 +792,10 @@ impl fmt::Display for DriverError {
                 f,
                 "prepared statement declares {expected} parameter(s) but {found} were bound"
             ),
+            Self::WrongConnection => write!(
+                f,
+                "prepared statement used on a different connection than the one that prepared it; a prepared statement's plan lives only on its originating connection — run it on that connection (or re-prepare on this one)"
+            ),
             Self::BatchFailed { index, source } => write!(
                 f,
                 "pipeline command #{index} failed (the whole batch rolled back — all-or-nothing): {source}"
@@ -802,7 +844,8 @@ impl std::error::Error for DriverError {
             | Self::PoolTimeout
             | Self::PayloadParse(_)
             | Self::ParamTypeMismatch { .. }
-            | Self::ParamCountMismatch { .. } => None,
+            | Self::ParamCountMismatch { .. }
+            | Self::WrongConnection => None,
         }
     }
 }
@@ -948,10 +991,33 @@ mod tests {
             DriverError::TooManyRows,
             DriverError::TooManyColumns { count: 2000, max: 1664 },
             DriverError::PoolTimeout,
+            DriverError::WrongConnection,
         ];
         for e in &usable {
             assert!(!e.is_disconnect(), "{e:?} must NOT classify as a disconnect");
         }
+    }
+
+    /// A cross-connection prepared-statement use is a CLIENT-side rejection caught
+    /// before any wire I/O: matchable, `is_disconnect()` false (the connection is
+    /// untouched — fix the call, not the transport), NOT a config error, and its
+    /// message names the problem and the fix.
+    #[test]
+    fn wrong_connection_is_a_classified_untouched_connection_error() {
+        let err = DriverError::WrongConnection;
+        assert!(matches!(err, DriverError::WrongConnection));
+        assert!(!err.is_disconnect(), "the connection is untouched — not a disconnect");
+        assert!(!err.is_config(), "a runtime handle misuse is not a pre-connect config error");
+        assert!(err.batch_failed_index().is_none(), "not a pipeline failure");
+        assert!(
+            std::error::Error::source(&err).is_none(),
+            "a fieldless client rejection carries no source"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("different connection"),
+            "the message must name the cross-connection misuse, got {msg:?}"
+        );
     }
 
     /// A runtime-message config error (a DSN / env parse failure) is a classified

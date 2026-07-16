@@ -62,9 +62,7 @@ use bsql_postgres_core::{
 use bsql_postgres_core::UNIX_SOCKET_UNSUPPORTED;
 use bsql_postgres_proto::engine::{self, EngineError, SpuriousPending};
 use bsql_postgres_proto::params::ParamsWriter;
-use bsql_postgres_proto::{
-    Credentials, DatabaseName, Ident, PreparedQuery, RowDecode, TypedCopyIn, TypedQuery,
-};
+use bsql_postgres_proto::{Credentials, DatabaseName, Ident, TypedCopyIn, TypedQuery};
 // `saslprep_password` SASLpreps (RFC 4013) the config password and builds the
 // zeroize-on-drop `Password`; `Sensitive` wraps it into a
 // `Credentials::ScramPassword`; `resolve_channel_binding` computes its channel
@@ -914,21 +912,15 @@ impl Connection {
     // argument is cfg-removed and there is no `#[track_caller]` ABI cost.
 
     /// Execute a compile-checked `query!` for its side effect, returning the
-    /// affected-row count (binary-uniform params). Parses the content-addressed
-    /// statement once per connection, then reuses the server-side plan. The
-    /// runtime-SQL escape hatch is [`execute_sql`](Self::execute_sql).
+    /// affected-row count (binary-uniform params). SYMMETRIC with
+    /// [`query`](Self::query): everything is derived from the carrier type `Q`
+    /// (`conn.execute::<Q>(params)`), no hand-passed `&Q::PREPARED`. Parses the
+    /// content-addressed statement once per connection, then reuses the
+    /// server-side plan. The runtime-SQL escape hatch is
+    /// [`execute_sql`](Self::execute_sql).
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn execute<P, R>(
-        &mut self,
-        q: &'static PreparedQuery<P, R>,
-        params: P,
-    ) -> Result<u64, DriverError>
-    where
-        P: ParamsWriter + 'static,
-        R: RowDecode + 'static,
-    {
-        drive_sync(engine::poll_once(self.core.execute(
-            q,
+    pub fn execute<'p, Q: TypedQuery>(&mut self, params: Q::Params<'p>) -> Result<u64, DriverError> {
+        drive_sync(engine::poll_once(self.core.execute::<Q>(
             params,
             #[cfg(feature = "n1-detect")]
             core::panic::Location::caller(),
@@ -1949,20 +1941,13 @@ impl Transaction<'_> {
     // threads it to the shared `Core` verb (identical to the `Connection` methods).
 
     /// Execute a compile-checked `query!` for its side effect, returning the
-    /// affected-row count (binary-uniform params).
+    /// affected-row count (binary-uniform params). SYMMETRIC with
+    /// [`query`](Self::query) — derived from the carrier type `Q`
+    /// (`tx.execute::<Q>(params)`).
     #[cfg_attr(feature = "n1-detect", track_caller)]
-    pub fn execute<P, R>(
-        &mut self,
-        q: &'static PreparedQuery<P, R>,
-        params: P,
-    ) -> Result<u64, DriverError>
-    where
-        P: ParamsWriter + 'static,
-        R: RowDecode + 'static,
-    {
+    pub fn execute<'p, Q: TypedQuery>(&mut self, params: Q::Params<'p>) -> Result<u64, DriverError> {
         self.arm_begin();
-        drive_sync(engine::poll_once(self.core.execute(
-            q,
+        drive_sync(engine::poll_once(self.core.execute::<Q>(
             params,
             #[cfg(feature = "n1-detect")]
             core::panic::Location::caller(),

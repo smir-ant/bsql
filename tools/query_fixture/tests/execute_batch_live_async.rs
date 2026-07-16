@@ -265,3 +265,24 @@ async fn large_n_windowed_is_correct_and_deadlock_free() {
     assert_eq!(row_count(&mut c).await, 0, "large mid-batch failure applied NOTHING");
     c.close().await.expect("close");
 }
+
+/// (Part B) The typed FLAGSHIP `execute::<Q>(params)` — SYMMETRIC with `query`,
+/// derived from the carrier (no hand-passed `&Q::PREPARED`) and the N=1 sibling of
+/// `execute_batch::<Q>`. An INSERT and an UPDATE return the correct affected count.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_execute_returns_the_affected_count() {
+    let mut c = Connection::connect(&cfg()).await.expect("connect");
+    fresh(&mut c).await;
+    // INSERT one row → 1 affected (RETURNING rows are read-and-ignored).
+    let inserted = c.execute::<EbInsQuery>((1_i64, 100_i64)).await.expect("insert");
+    assert_eq!(inserted, 1, "one INSERT affected 1 row");
+    // UPDATE the existing row → 1; an absent id → 0.
+    let updated = c.execute::<EbUpdQuery>((1_i64, 5_i64)).await.expect("update");
+    assert_eq!(updated, 1, "the UPDATE affected 1 row");
+    let missed = c.execute::<EbUpdQuery>((999_i64, 5_i64)).await.expect("update-absent");
+    assert_eq!(missed, 0, "an absent id affects 0 rows");
+    // The writes landed: balance 100 + 5 = 105.
+    assert_eq!(balance_sum(&mut c).await, 105, "INSERT + UPDATE applied");
+    c.close().await.expect("close");
+}

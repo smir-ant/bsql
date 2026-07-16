@@ -187,3 +187,27 @@ fn large_n_windowed_is_correct_and_deadlock_free() {
     assert_eq!(row_count(&mut c), 0, "large mid-batch failure applied NOTHING");
     c.close().expect("close");
 }
+
+/// (Part B) The typed FLAGSHIP `execute::<Q>(params)` — SYMMETRIC with `query`,
+/// derived from the carrier and the N=1 sibling of `execute_batch::<Q>`. An INSERT
+/// and an UPDATE return the correct affected count (sync twin).
+#[test]
+#[ignore = "requires local PG"]
+fn typed_execute_returns_the_affected_count() {
+    let mut c = Connection::connect(&cfg()).expect("connect");
+    fresh(&mut c);
+    let inserted = c.execute::<EbsInsQuery>((1_i64, 100_i64)).expect("insert");
+    assert_eq!(inserted, 1, "one INSERT affected 1 row");
+    let updated = c.execute::<EbsUpdQuery>((1_i64, 5_i64)).expect("update");
+    assert_eq!(updated, 1, "the UPDATE affected 1 row");
+    let missed = c.execute::<EbsUpdQuery>((999_i64, 5_i64)).expect("update-absent");
+    assert_eq!(missed, 0, "an absent id affects 0 rows");
+    let balance = c
+        .query_one_sql("SELECT coalesce(sum(balance),0)::int8 AS s FROM eb_rows")
+        .expect("sum")
+        .get_i64(0)
+        .expect("decode")
+        .unwrap_or(-1);
+    assert_eq!(balance, 105, "INSERT + UPDATE applied");
+    c.close().expect("close");
+}

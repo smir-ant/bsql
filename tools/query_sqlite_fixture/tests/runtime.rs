@@ -57,7 +57,7 @@ const SCHEMA: &str = "CREATE TABLE measurements ( \
 
 fn seed() -> Connection {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute_batch(SCHEMA).expect("schema");
+    conn.execute_batch_sql(SCHEMA).expect("schema");
     // Row 1: every column present.
     conn.execute_params(
         "INSERT INTO measurements VALUES ($1, $2, $3, $4, $5, $6)",

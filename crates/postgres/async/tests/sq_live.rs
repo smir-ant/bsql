@@ -2631,3 +2631,60 @@ async fn uncontended_checkout_leaves_waiters_high_water_zero() {
     );
     drop(c);
 }
+
+/// WITNESS (Part A — cross-connection prepared-statement safety): a
+/// [`PreparedStatement`] minted by connection A, used on connection B, is a LOUD
+/// classified [`DriverError::WrongConnection`] — NEVER a silent wrong result (B's
+/// like-named `_bsql_0` is a DIFFERENT plan) and NEVER a panic. The connection is
+/// untouched (no wire I/O), so B stays usable and A's handle still runs on A.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn prepared_statement_used_on_a_foreign_connection_is_rejected() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut a = Connection::connect(&config).await.expect("connect A");
+    let mut b = Connection::connect(&config).await.expect("connect B");
+
+    // Both connections prepare their FIRST statement, so BOTH now hold a server-side
+    // `_bsql_0` — bound to DIFFERENT plans. This is the exact collision: without the
+    // origin guard, A's handle on B would bind B's `_bsql_0` (a silent wrong result).
+    let stmt_a = a.prepare("SELECT 111::int4 AS n").await.expect("prepare on A");
+    let stmt_b = b.prepare("SELECT 222::int4 AS n").await.expect("prepare on B");
+
+    // A's handle on B: a LOUD reject, not B's 222.
+    let err = b
+        .query_prepared(&stmt_a, &())
+        .await
+        .expect_err("A's statement run on B must be rejected");
+    assert!(matches!(err, DriverError::WrongConnection), "got {err:?}");
+    assert!(!err.is_disconnect(), "wrong-connection is NOT a disconnect");
+    assert!(!err.is_config(), "wrong-connection is NOT a config error");
+
+    // `execute_prepared` rejects identically (same origin guard, before any Bind).
+    let err2 = b
+        .execute_prepared(&stmt_a, &())
+        .await
+        .expect_err("execute_prepared of A's statement on B must be rejected");
+    assert!(matches!(err2, DriverError::WrongConnection), "got {err2:?}");
+
+    // B is UNTOUCHED — its OWN statement still returns 222.
+    let ok_b = b.query_prepared(&stmt_b, &()).await.expect("B's own stmt works");
+    assert_eq!(ok_b.get(0).expect("row").get_i32(0), Ok(Some(222)));
+
+    // And A's handle STILL runs correctly on A (the connection that minted it).
+    let ok_a = a.query_prepared(&stmt_a, &()).await.expect("A's stmt on A works");
+    assert_eq!(ok_a.get(0).expect("row").get_i32(0), Ok(Some(111)));
+
+    // `close_statement` guards the SAME way: closing A's handle on B would tear down
+    // B's like-named live statement, so it is rejected too (the handle is consumed).
+    let stmt_a2 = a.prepare("SELECT 333::int4 AS n").await.expect("prepare A2");
+    let err3 = b
+        .close_statement(stmt_a2)
+        .await
+        .expect_err("close_statement of A's handle on B must be rejected");
+    assert!(matches!(err3, DriverError::WrongConnection), "got {err3:?}");
+    // Closing A's OWN handle on A still works.
+    a.close_statement(stmt_a).await.expect("close A's stmt on A");
+
+    a.close().await.expect("close A");
+    b.close().await.expect("close B");
+}

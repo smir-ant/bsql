@@ -354,9 +354,9 @@ fn typed_get_generic() {
 }
 
 #[test]
-fn execute_batch_multi_statement() {
+fn execute_batch_sql_multi_statement() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute_batch(
+    conn.execute_batch_sql(
         "
         CREATE TABLE a(v int);
         CREATE TABLE b(v int);
@@ -641,7 +641,7 @@ fn query_each_classified_error_mid_stream() {
 fn full_lifecycle_integration() {
     let conn = Connection::open_in_memory().expect("open");
 
-    conn.execute_batch("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, score REAL);")
+    conn.execute_batch_sql("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, score REAL);")
         .expect("create");
 
     conn.transaction(|tx| {

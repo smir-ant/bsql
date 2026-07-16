@@ -51,6 +51,7 @@ use core::fmt::Write as _;
 use core::ops::ControlFlow;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bsql_postgres_proto::engine::{
@@ -59,8 +60,8 @@ use bsql_postgres_proto::engine::{
 };
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{
-    DecodeError, PreparedQuery, RowDecode, Sensitive, StmtName, TxStatus, TypedCopyIn, TypedQuery,
-    PGCOPY_BINARY_HEADER, PGCOPY_BINARY_TRAILER,
+    DecodeError, Sensitive, StmtName, TxStatus, TypedCopyIn, TypedQuery, PGCOPY_BINARY_HEADER,
+    PGCOPY_BINARY_TRAILER,
 };
 
 use crate::cancel::CancelKey;
@@ -246,6 +247,14 @@ pub struct PreparedStatement {
     /// Server-inferred parameter-type OIDs (`$1..$n` order), retained for the
     /// pre-`Bind` type verification. Empty when the server reported none.
     param_oids: Box<[u32]>,
+    /// The process-unique identity ([`Core::conn_id`]) of the connection that
+    /// minted this statement. A `PreparedStatement` names a server-side statement
+    /// (`_bsql_<n>`) whose plan lives ONLY on that connection, so every prepared
+    /// verb checks this against the connection's own id BEFORE any wire I/O — a
+    /// mismatch is [`DriverError::WrongConnection`], never a silent bind against a
+    /// like-named statement on a foreign connection. Stamped in
+    /// [`prepare_with_oids`](Core::prepare_with_oids).
+    origin: u64,
 }
 
 impl PreparedStatement {
@@ -290,6 +299,18 @@ impl PreparedStatement {
 /// plan-reuse for the overflow. 32 covers the common handful of hot dynamic
 /// queries with headroom.
 const DYN_STMT_CACHE_CAP: usize = 32;
+
+/// Process-global monotonic source of per-connection identity ids.
+///
+/// [`Core::new`] mints one id per connection with a single relaxed `fetch_add`,
+/// stamping it onto every [`PreparedStatement`] the connection prepares. A `u64`
+/// incremented ONCE per connection cannot realistically wrap (2^64 connections),
+/// so every live `Core` in the process holds a DISTINCT id — the structural basis
+/// for [`DriverError::WrongConnection`], rejecting a statement handle used on a
+/// connection other than the one that minted it. Relaxed is sufficient: the RMW
+/// is atomic (each caller reads a unique value from the single modification
+/// order); no cross-thread ordering of other memory is implied or needed.
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(0);
 
 /// The `execute_batch` send-window batcher threshold, in bytes.
 ///
@@ -635,6 +656,14 @@ pub struct Core<S: Transport<Error = io::Error>> {
     secret_key: Sensitive<i32>,
     /// Monotonic counter for generating fresh prepared-statement names.
     stmt_counter: u32,
+    /// This connection's PROCESS-UNIQUE identity, minted once at construction from
+    /// [`NEXT_CONN_ID`]. Stamped onto every [`PreparedStatement`] this connection
+    /// prepares ([`PreparedStatement::origin`]); every prepared verb rejects a
+    /// handle whose origin differs (a cross-connection use) with
+    /// [`DriverError::WrongConnection`] before any wire I/O — closing the
+    /// silent-wrong-result hole a like-named `_bsql_<n>` on a foreign connection
+    /// would otherwise open. Never read on a hot path.
+    conn_id: u64,
     /// The bounded per-connection cache of DYNAMIC prepared statements, keyed on
     /// SQL text (see [`DynStmtCache`]) — plan reuse for the runtime
     /// `query_params` / `execute_params` family. Off the compile-checked typed
@@ -691,6 +720,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             backend_pid,
             secret_key: Sensitive::new(secret_key),
             stmt_counter: 0,
+            conn_id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
             dyn_cache: DynStmtCache::new(),
             notifications: NotificationLedger::new(),
             diag: crate::diag::Diagnostics::default(),
@@ -1071,7 +1101,29 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             inner: WireStatement::new(stmt_name, result_oids),
             column_names,
             param_oids,
+            // Stamp this connection's identity so a later prepared verb rejects a
+            // cross-connection use of the handle (see [`check_stmt_origin`]).
+            origin: self.conn_id,
         })
+    }
+
+    /// Reject a [`PreparedStatement`] minted by a DIFFERENT connection.
+    ///
+    /// A statement handle names a server-side statement (`_bsql_<n>`) whose plan
+    /// lives ONLY on its originating connection; the per-connection name counter
+    /// makes `_bsql_0` exist on every connection, each a different plan. So a
+    /// cross-connection use would bind against a LIKE-NAMED but UNRELATED statement
+    /// — a silent wrong result. Checked FIRST (before `verify_params`, before any
+    /// wire I/O): a mismatch is [`DriverError::WrongConnection`], the connection is
+    /// untouched, and the statement's own connection is still the place to run it.
+    #[inline]
+    fn check_stmt_origin(&self, stmt: &PreparedStatement) -> Result<(), DriverError> {
+        if stmt.origin == self.conn_id {
+            Ok(())
+        } else {
+            core::hint::cold_path();
+            Err(DriverError::WrongConnection)
+        }
     }
 
     /// Execute a prepared statement returning rows. Params are borrowed all the
@@ -1081,6 +1133,10 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         stmt: &PreparedStatement,
         params: &P,
     ) -> Result<QueryResult, DriverError> {
+        // Reject a handle minted by a DIFFERENT connection FIRST — its server-side
+        // name would bind a like-named but unrelated statement here (a silent wrong
+        // result). No wire I/O, connection untouched.
+        self.check_stmt_origin(stmt)?;
         // Verify the caller's encoded parameter types against the statement's
         // fixed (server-inferred) parameter types BEFORE binding — a mismatch is
         // rejected here with no wire round trip, closing the silent-reinterpret
@@ -1111,6 +1167,9 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         stmt: &PreparedStatement,
         params: &P,
     ) -> Result<u64, DriverError> {
+        // Reject a cross-connection handle FIRST (see
+        // [`query_prepared`](Self::query_prepared)).
+        self.check_stmt_origin(stmt)?;
         // Verify parameter types against the fixed plan before binding (see
         // [`query_prepared`](Self::query_prepared)).
         stmt.verify_params::<P>()?;
@@ -1425,7 +1484,14 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     }
 
     /// Close a prepared statement, consuming it (use-after-close is a move error).
+    ///
+    /// A handle minted by a DIFFERENT connection is [`DriverError::WrongConnection`]
+    /// (checked BEFORE any wire I/O): closing it here would send a `Close` for a
+    /// like-named statement on THIS connection, tearing down an unrelated live plan.
+    /// The rejected handle is consumed (dropped); its own connection reclaims the
+    /// server-side statement at that connection's `reset_session` / disconnect.
     pub async fn close_statement(&mut self, stmt: PreparedStatement) -> Result<(), DriverError> {
+        self.check_stmt_origin(&stmt)?;
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let outcome = self
@@ -1447,29 +1513,31 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// Execute a compile-checked `query!` query for its side effect, returning
     /// the affected-row count (binary-uniform params).
     ///
+    /// Everything is derived from the carrier type `Q` — SYMMETRIC with
+    /// [`query`](Self::query) (`conn.execute::<Q>(params)`), not a hand-passed
+    /// `&Q::PREPARED`. `Q` is a row-shaped `query!` carrier (a SELECT or a
+    /// `… RETURNING` write); any RETURNING rows are read-and-ignored (only the
+    /// affected count, from the `CommandComplete` tag, is returned) — the batch
+    /// peer of this is [`execute_batch`](Self::execute_batch).
+    ///
     /// Under `n1-detect` the `caller` the driver captured at the USER call site is
     /// recorded against the query for N+1 detection (diagnostics-only — the
     /// recording never alters the result).
-    pub async fn execute<P, R>(
+    pub async fn execute<'p, Q: TypedQuery>(
         &mut self,
-        q: &'static PreparedQuery<P, R>,
-        params: P,
+        params: Q::Params<'p>,
         #[cfg(feature = "n1-detect")] caller: &'static core::panic::Location<'static>,
-    ) -> Result<u64, DriverError>
-    where
-        P: ParamsWriter + 'static,
-        R: RowDecode + 'static,
-    {
+    ) -> Result<u64, DriverError> {
         #[cfg(feature = "n1-detect")]
-        self.n1_record(q.sql(), caller);
-        let mut slow = self.armed_slow_guard(q.sql());
+        self.n1_record(Q::PREPARED.sql(), caller);
+        let mut slow = self.armed_slow_guard(Q::PREPARED.sql());
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
         let outcome = self
             .engine
             .query_params(
                 live,
-                q,
+                &bsql_postgres_proto::prepared::prepared_at::<Q>(),
                 params,
                 capture_notify(&mut self.notifications, self.diag.sink(), |s| {
                     collector.feed(s);
@@ -1478,6 +1546,14 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             )
             .await;
         self.settle(outcome, &mut collector)?;
+        // Same RESULT-schema guard `query`/`query_collect` runs: a typed cache MISS
+        // appended a `Describe`(portal), so fail loud if the fresh Parse's
+        // RowDescription revealed a runtime column type diverging from the migration
+        // schema — AND drain the parked mismatch so it cannot leak into the next
+        // verb's guard (the old `execute<P, R>` armed the guard via `query_params`
+        // but never drained it). A drift the caller's RETURNING model no longer
+        // matches is a classified `DriverError::Decode`, never a silent success.
+        self.take_typed_schema_error()?;
         let result = Ok(collector.affected());
         Self::commit_slow(&mut slow, &result);
         result
@@ -3422,6 +3498,9 @@ mod dyn_cache_tests {
             inner: WireStatement::new(stmt_name, Vec::new()),
             column_names: Arc::from(Vec::<String>::new().into_boxed_slice()),
             param_oids: Box::from([]),
+            // These cache tests never route the handle through a connection's origin
+            // check (they exercise `DynStmtCache` directly), so any id is fine.
+            origin: 0,
         }
     }
 

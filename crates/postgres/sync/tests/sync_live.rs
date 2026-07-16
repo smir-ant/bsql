@@ -1806,84 +1806,21 @@ fn connection_resilience_marathon() {
     c.close().expect("close");
 }
 
-/// Re-derive the PG `Parse`-frame template bytes for a statement:
-/// `b'P' | len_i32_be | stmt\0 | sql\0 | n_params_i16_be | oid_i32_be × n`.
-/// The length field is self-inclusive (covers everything after the tag byte).
-const fn build_parse_template<const N: usize>(stmt: &str, sql: &str, oids: &[u32]) -> [u8; N] {
-    let mut buf = [0u8; N];
-    let stmt_b = stmt.as_bytes();
-    let sql_b = sql.as_bytes();
-    let len_be = ((N - 1) as u32).to_be_bytes();
-    buf[0] = b'P';
-    buf[1] = len_be[0];
-    buf[2] = len_be[1];
-    buf[3] = len_be[2];
-    buf[4] = len_be[3];
-    let mut i = 5;
-    let mut j = 0;
-    while j < stmt_b.len() {
-        buf[i] = stmt_b[j];
-        i += 1;
-        j += 1;
-    }
-    buf[i] = 0;
-    i += 1;
-    j = 0;
-    while j < sql_b.len() {
-        buf[i] = sql_b[j];
-        i += 1;
-        j += 1;
-    }
-    buf[i] = 0;
-    i += 1;
-    let n_be = (oids.len() as u16).to_be_bytes();
-    buf[i] = n_be[0];
-    i += 1;
-    buf[i] = n_be[1];
-    i += 1;
-    j = 0;
-    while j < oids.len() {
-        let ob = oids[j].to_be_bytes();
-        buf[i] = ob[0];
-        buf[i + 1] = ob[1];
-        buf[i + 2] = ob[2];
-        buf[i + 3] = ob[3];
-        i += 4;
-        j += 1;
-    }
-    buf
-}
-
-/// Re-derive the `Bind`-frame prefix bytes: `empty_portal_NUL | stmt\0`. The
-/// param format block, values, and result-format trailer are appended by the
-/// engine at frame-build time from the argument tuple's `ParamsWriter`.
-const fn build_bind_prefix<const N: usize>(stmt: &str) -> [u8; N] {
-    let mut buf = [0u8; N];
-    let stmt_b = stmt.as_bytes();
-    // buf[0] is the empty-portal NUL (already 0).
-    let mut i = 1;
-    let mut j = 0;
-    while j < stmt_b.len() {
-        buf[i] = stmt_b[j];
-        i += 1;
-        j += 1;
-    }
-    // Final byte is the stmt-name NUL (already 0).
-    buf
-}
-
 // ═══════════════════════════════════════════════════════════
-// PreparedQuery execute path — binary-uniform Bind frame.
+// Binary-uniform Bind frame — parameterized INSERT round-trip.
 //
-// REGRESSION GATE: before the binary-uniform fix, this path declared
-// param format = Text in the Bind frame while encoding the value as
-// binary. PostgreSQL then rejected any non-string param (e.g. an i32
-// sent as 4 binary bytes interpreted as ASCII decimal) with `invalid
-// input syntax for type integer`. This test prepares an INSERT carrying
-// i32 / i64 / bool params through `execute` and asserts: (1) the write
-// succeeds, (2) the affected-row count is correct, (3) the stored values
-// read back exactly. Post-fix it passes; pre-fix the INSERT errors at
-// the server.
+// REGRESSION GATE: before the binary-uniform fix, the extended-query path
+// declared param format = Text in the Bind frame while encoding the value as
+// binary. PostgreSQL then rejected any non-string param (e.g. an i32 sent as 4
+// binary bytes interpreted as ASCII decimal) with `invalid input syntax for type
+// integer`. This test runs an INSERT carrying i32 / i64 / bool params through the
+// dynamic parameterized `execute_params` verb (the public verb that exercises the
+// binary-uniform Bind machinery — `build_bind_prepared` + `ParamsWriter` — shared
+// with the typed `execute::<Q>` / `query!` path) and asserts: (1) the write
+// succeeds, (2) the affected-row count is correct, (3) the stored values read back
+// exactly. (The TYPED path's binary Bind is covered live by the `query_fixture`
+// `execute::<Q>` / `query::<Q>` tests, which have a build catalog this driver crate
+// deliberately does not.) Post-fix it passes; pre-fix the INSERT errors at the server.
 // ═══════════════════════════════════════════════════════════
 
 #[test]
@@ -1908,47 +1845,24 @@ fn prepared_query_insert_binary_params_round_trip() {
     )
     .expect("create table");
 
-    // Fixed, content-addressed prepared INSERT. Params: i32, i64, bool.
-    // R = () — no RETURNING, so this routes through the DML post-install
-    // and yields an affected-row count. The unqualified `prep_target`
-    // resolves via `search_path` to this process's schema.
-    //
-    // Built through `new_prepared_query`, the sole validating constructor
-    // for a `PreparedQuery` (the compile-checked `query!` macro routes
-    // through it in consumer crates with a migration catalog; this driver
-    // test has no catalog, so it hands the constructor the wire bytes
-    // directly). The bytes are a real PG Parse/Bind frame that PostgreSQL
-    // parses on the wire; the constructor's const validator rejects any OID
-    // drift between the baked template and the declared parameter tuple.
+    // A parameterized INSERT carrying i32 / i64 / bool. `$N::type` casts pin the
+    // parameter types; the unqualified `prep_target` resolves via `search_path` to
+    // this process's schema. `execute_params` declares each param's encoded OID
+    // (`ParamsWriter::OIDS`) and binds binary-uniform — the exact frame that
+    // carried the declared-Text / encoded-Binary bug.
     const INSERT_SQL: &str =
         "INSERT INTO prep_target (n, big, flag) VALUES ($1::int4, $2::int8, $3::bool)";
-    const INSERT_STMT: &str = "bsql_p_df4cc122f1840fe04c5a6ed3";
-    // int4 = 23, int8 = 20, bool = 16.
-    const INSERT_PARAM_OIDS: &[u32] = &[23, 20, 16];
-    const INSERT_PARSE_LEN: usize =
-        1 + 4 + INSERT_STMT.len() + 1 + INSERT_SQL.len() + 1 + 2 + 4 * INSERT_PARAM_OIDS.len();
-    const INSERT_PARSE: [u8; INSERT_PARSE_LEN] =
-        build_parse_template::<INSERT_PARSE_LEN>(INSERT_STMT, INSERT_SQL, INSERT_PARAM_OIDS);
-    const INSERT_BIND_LEN: usize = 1 + INSERT_STMT.len() + 1;
-    const INSERT_BIND: [u8; INSERT_BIND_LEN] = build_bind_prefix::<INSERT_BIND_LEN>(INSERT_STMT);
-    const Q_INSERT: bsql_postgres_proto::PreparedQuery<(i32, i64, bool), ()> =
-        bsql_postgres_proto::prepared::new_prepared_query::<(i32, i64, bool), ()>(
-            INSERT_SQL,
-            INSERT_STMT,
-            &INSERT_PARSE,
-            &INSERT_BIND,
-        );
 
     let sent_n: i32 = 42;
     let sent_big: i64 = 9_000_000_000;
     let sent_flag: bool = true;
 
-    // EXECUTE via the macro path — the exact wire path that carried the
-    // declared-Text / encoded-Binary bug. Pre-fix this errors at the
-    // server with `invalid input syntax for type integer`.
+    // EXECUTE via the dynamic parameterized path — the exact wire path that carried
+    // the declared-Text / encoded-Binary bug. Pre-fix this errors at the server with
+    // `invalid input syntax for type integer`.
     let affected = c
-        .execute(&Q_INSERT, (sent_n, sent_big, sent_flag))
-        .expect("prepared macro INSERT must succeed (binary-uniform Bind)");
+        .execute_params(INSERT_SQL, &(sent_n, sent_big, sent_flag))
+        .expect("parameterized INSERT must succeed (binary-uniform Bind)");
     assert_eq!(affected, 1, "INSERT must affect exactly one row");
 
     // Read the row back via the simple-query text path to confirm the
@@ -2375,4 +2289,53 @@ fn uncontended_checkout_leaves_waiters_high_water_zero() {
         "an uncontended checkout must not register a blocked waiter",
     );
     drop(c);
+}
+
+/// WITNESS (Part A — cross-connection prepared-statement safety, sync twin): a
+/// `PreparedStatement` minted by connection A, used on connection B, is a LOUD
+/// classified `DriverError::WrongConnection` — never a silent wrong result and
+/// never a panic; B stays usable and A's handle still runs on A.
+#[test]
+#[ignore = "requires local PG"]
+fn prepared_statement_used_on_a_foreign_connection_is_rejected() {
+    use bsql_postgres_sync::DriverError;
+    let mut a = Connection::connect(&sync_config()).expect("connect A");
+    let mut b = Connection::connect(&sync_config()).expect("connect B");
+
+    // Both prepare their FIRST statement → both hold `_bsql_0` for DIFFERENT plans.
+    let stmt_a = a.prepare("SELECT 111::int4 AS n").expect("prepare on A");
+    let stmt_b = b.prepare("SELECT 222::int4 AS n").expect("prepare on B");
+
+    // A's handle on B: a LOUD reject, not B's 222.
+    let err = b
+        .query_prepared(&stmt_a, &())
+        .expect_err("A's statement run on B must be rejected");
+    assert!(matches!(err, DriverError::WrongConnection), "got {err:?}");
+    assert!(!err.is_disconnect(), "wrong-connection is NOT a disconnect");
+    assert!(!err.is_config(), "wrong-connection is NOT a config error");
+
+    // `execute_prepared` rejects identically.
+    let err2 = b
+        .execute_prepared(&stmt_a, &())
+        .expect_err("execute_prepared of A's statement on B must be rejected");
+    assert!(matches!(err2, DriverError::WrongConnection), "got {err2:?}");
+
+    // B is UNTOUCHED — its OWN statement still returns 222.
+    let ok_b = b.query_prepared(&stmt_b, &()).expect("B's own stmt works");
+    assert_eq!(ok_b.get(0).expect("row").get_i32(0), Ok(Some(222)));
+
+    // A's handle STILL runs on A.
+    let ok_a = a.query_prepared(&stmt_a, &()).expect("A's stmt on A works");
+    assert_eq!(ok_a.get(0).expect("row").get_i32(0), Ok(Some(111)));
+
+    // `close_statement` guards the SAME way (the handle is consumed on reject).
+    let stmt_a2 = a.prepare("SELECT 333::int4 AS n").expect("prepare A2");
+    let err3 = b
+        .close_statement(stmt_a2)
+        .expect_err("close_statement of A's handle on B must be rejected");
+    assert!(matches!(err3, DriverError::WrongConnection), "got {err3:?}");
+    a.close_statement(stmt_a).expect("close A's stmt on A");
+
+    a.close().expect("close A");
+    b.close().expect("close B");
 }

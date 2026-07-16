@@ -1,12 +1,14 @@
-//! Homogeneous `execute_batch_typed` over the SQLite driver — the SEQUENTIAL twin of
-//! the PostgreSQL `execute_batch`. In-process (no server), default suite.
+//! Homogeneous typed `execute_batch::<Q>` over the SQLite driver — the SEQUENTIAL twin
+//! of the PostgreSQL `execute_batch` (SAME method name on BOTH backends; the SQLite-only
+//! DYNAMIC raw-SQL script executor is the disambiguated `execute_batch_sql`). In-process
+//! (no server), default suite.
 //!
 //! # Scope note (honest): typed carriers are READ-ONLY here
 //!
 //! SQLite's build-time conformance oracle (feature `macros-sqlite`, on in this
 //! fixture) validates each `query!` through a DENY-ALL-BUT-READONLY authorizer, so a
 //! typed WRITE carrier (`INSERT`/`UPDATE`/`DELETE ... RETURNING`) does NOT compile
-//! here — the SQLite typed flagship is read-only. So `execute_batch_typed` is a
+//! here — the SQLite typed flagship is read-only. So typed `execute_batch::<Q>` is a
 //! read-only ATOMIC batch: N reads inside ONE transaction, returning `Vec<u64>`
 //! affected counts (0 for a SELECT). Its all-or-nothing rollback is inherited VERBATIM
 //! from [`Connection::transaction`] (the method is literally
@@ -33,7 +35,7 @@ const SCHEMA: &str = "CREATE TABLE measurements ( \
 
 fn seed() -> Connection {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute_batch(SCHEMA).expect("schema"); // the dynamic multi-statement executor
+    conn.execute_batch_sql(SCHEMA).expect("schema"); // the dynamic multi-statement executor
     conn.execute_sql("INSERT INTO measurements (id, label, weight) VALUES (1, 'one', 1.5)")
         .expect("seed 1");
     conn.execute_sql("INSERT INTO measurements (id, label, weight) VALUES (2, 'two', 2.5)")
@@ -47,7 +49,7 @@ fn seed() -> Connection {
 fn n_reads_return_a_count_vec_and_commit() {
     let conn = seed();
     let counts = conn
-        .execute_batch_typed::<EbWeightByIdQuery, _>(vec![(1_i64,), (2,), (1,)])
+        .execute_batch::<EbWeightByIdQuery, _>(vec![(1_i64,), (2,), (1,)])
         .expect("batch runs");
     assert_eq!(counts, vec![0, 0, 0], "a read affects no rows (read-only twin)");
     // Reusable after a committed batch.
@@ -59,7 +61,7 @@ fn n_reads_return_a_count_vec_and_commit() {
 fn zero_is_empty() {
     let conn = seed();
     let counts = conn
-        .execute_batch_typed::<EbWeightByIdQuery, _>(Vec::<(i64,)>::new())
+        .execute_batch::<EbWeightByIdQuery, _>(Vec::<(i64,)>::new())
         .expect("N=0");
     assert_eq!(counts, Vec::<u64>::new());
 }
@@ -70,7 +72,7 @@ fn zero_is_empty() {
 fn inside_a_transaction_guard() {
     let conn = seed();
     let counts = conn
-        .transaction(|tx| tx.execute_batch_typed::<EbWeightByIdQuery, _>(vec![(1_i64,), (2,)]))
+        .transaction(|tx| tx.execute_batch::<EbWeightByIdQuery, _>(vec![(1_i64,), (2,)]))
         .expect("guard commits");
     assert_eq!(counts, vec![0, 0]);
 }

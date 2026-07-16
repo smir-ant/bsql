@@ -1140,18 +1140,23 @@ impl Connection {
     /// batch. (A hand-written writing [`SqliteTypedQuery`] returns its real change
     /// counts.)
     ///
+    /// Named `execute_batch` to MATCH the PostgreSQL typed flagship; the DYNAMIC
+    /// multi-statement raw-SQL executor is [`execute_batch_sql`](Self::execute_batch_sql)
+    /// (SQLite-only — the `_sql` suffix disambiguates, exactly as `copy_in` /
+    /// `copy_in_typed` do).
+    ///
     /// # Errors
     ///
     /// The first failing command's classified [`SqliteError`] (the transaction is
     /// rolled back); or [`SqliteError::TransactionRollbackFailed`] if the rollback
     /// itself fails.
-    pub fn execute_batch_typed<'p, Q, I>(&self, params: I) -> Result<Vec<u64>, SqliteError>
+    pub fn execute_batch<'p, Q, I>(&self, params: I) -> Result<Vec<u64>, SqliteError>
     where
         Q: SqliteTypedQuery,
         I: IntoIterator<Item = Q::Params<'p>>,
         Q::Params<'p>: SqliteBindParams,
     {
-        self.transaction(|tx| tx.execute_batch_typed::<Q, I>(params))
+        self.transaction(|tx| tx.execute_batch::<Q, I>(params))
     }
 
     /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
@@ -1460,8 +1465,16 @@ impl Connection {
         result
     }
 
-    /// Execute multiple SQL statements separated by semicolons.
-    pub fn execute_batch(&self, sql: &str) -> Result<(), SqliteError> {
+    /// Execute multiple DYNAMIC raw-SQL statements separated by semicolons
+    /// (rusqlite's multi-statement executor).
+    ///
+    /// The `_sql` suffix marks this as the runtime raw-SQL verb (like
+    /// `query_sql` / `execute_sql`), DISTINCT from the compile-checked typed
+    /// [`execute_batch`](Self::execute_batch) (the homogeneous atomic bulk-write
+    /// flagship that MATCHES the PostgreSQL `execute_batch`). A cross-backend
+    /// consumer uses `execute_batch::<Q>` for a typed batch on BOTH backends and
+    /// this SQLite-only `execute_batch_sql` for a raw multi-statement script.
+    pub fn execute_batch_sql(&self, sql: &str) -> Result<(), SqliteError> {
         self.inner.execute_batch(sql).map_err(SqliteError::from)
     }
 
@@ -1552,9 +1565,11 @@ impl Transaction<'_> {
         self.conn.execute_params(sql, params)
     }
 
-    /// Execute multiple SQL statements separated by semicolons.
-    pub fn execute_batch(&self, sql: &str) -> Result<(), SqliteError> {
-        self.conn.execute_batch(sql)
+    /// Execute multiple DYNAMIC raw-SQL statements separated by semicolons. The
+    /// guard peer of [`Connection::execute_batch_sql`]; the typed batch flagship
+    /// is [`execute_batch`](Self::execute_batch).
+    pub fn execute_batch_sql(&self, sql: &str) -> Result<(), SqliteError> {
+        self.conn.execute_batch_sql(sql)
     }
 
     /// Run `sql` and eagerly materialize every row.
@@ -1642,12 +1657,12 @@ impl Transaction<'_> {
     /// Run ONE `query!` carrier against N parameter sets SEQUENTIALLY — inside the
     /// EXISTING transaction (no nested transaction; a mid-batch failure short-circuits
     /// so the guard rolls the whole scope back). The guard peer of
-    /// [`Connection::execute_batch_typed`]; READ-ONLY under a conformance build (see it).
+    /// [`Connection::execute_batch`]; READ-ONLY under a conformance build (see it).
     ///
     /// # Errors
     ///
     /// The first failing command's classified [`SqliteError`].
-    pub fn execute_batch_typed<'p, Q, I>(&self, params: I) -> Result<Vec<u64>, SqliteError>
+    pub fn execute_batch<'p, Q, I>(&self, params: I) -> Result<Vec<u64>, SqliteError>
     where
         Q: SqliteTypedQuery,
         I: IntoIterator<Item = Q::Params<'p>>,

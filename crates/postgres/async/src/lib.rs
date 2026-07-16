@@ -147,12 +147,12 @@ const _: () = {
     fn _is_send<T: Send>(_: &T) {}
 
     // The five leaf typed verbs on the bare `Connection`, each pinned in its OWN
-    // helper. Because the parameter is now a lifetime GAT (`Q::Params<'p>`) and a
+    // helper. Because the parameter is a lifetime GAT (`Q::Params<'p>`) and a
     // GAT is INVARIANT in a generic context, the verb's own `'a` cannot narrow
     // below the param `'p`; tying the `&'p mut Connection` borrow to that same
     // `'p` keeps the single borrow well-formed (a shared helper calling all five
-    // would need five simultaneous `&mut` borrows). The `execute` verb takes a
-    // plain `P: ParamsWriter` (no GAT), so it keeps the multi-borrow-free shape.
+    // would need five simultaneous `&mut` borrows). `execute` is now SYMMETRIC
+    // with `query` — carrier-derived `Q::Params<'p>`, the SAME GAT-borrow shape.
     fn _conn_query<'p, Q>(conn: &'p mut Connection, p: Q::Params<'p>)
     where
         Q: bsql_postgres_proto::TypedQuery + 'p,
@@ -185,15 +185,13 @@ const _: () = {
     {
         _is_send(&conn.query_each::<Q, _, ()>(p, |_row| core::ops::ControlFlow::Continue(())));
     }
-    fn _conn_execute<P, R>(
-        conn: &mut Connection,
-        q: &'static bsql_postgres_proto::PreparedQuery<P, R>,
-        p_exec: P,
-    ) where
-        P: ParamsWriter + Send + 'static,
-        R: bsql_postgres_proto::RowDecode + 'static,
+    fn _conn_execute<'p, Q>(conn: &'p mut Connection, p: Q::Params<'p>)
+    where
+        Q: bsql_postgres_proto::TypedQuery + 'p,
+        Q::Params<'p>: 'p,
+        for<'x> Q::Params<'x>: Send,
     {
-        _is_send(&conn.execute::<P, R>(q, p_exec));
+        _is_send(&conn.execute::<Q>(p));
     }
 
     // The same typed verbs on the transaction guard.
@@ -229,15 +227,13 @@ const _: () = {
     {
         _is_send(&tx.query_each::<Q, _, ()>(p, |_row| core::ops::ControlFlow::Continue(())));
     }
-    fn _tx_execute<P, R>(
-        tx: &mut Transaction<'_>,
-        q: &'static bsql_postgres_proto::PreparedQuery<P, R>,
-        p_exec: P,
-    ) where
-        P: ParamsWriter + Send + 'static,
-        R: bsql_postgres_proto::RowDecode + 'static,
+    fn _tx_execute<'p, Q>(tx: &'p mut Transaction<'_>, p: Q::Params<'p>)
+    where
+        Q: bsql_postgres_proto::TypedQuery + 'p,
+        Q::Params<'p>: 'p,
+        for<'x> Q::Params<'x>: Send,
     {
-        _is_send(&tx.execute::<P, R>(q, p_exec));
+        _is_send(&tx.execute::<Q>(p));
     }
 
     // The `transaction` combinator itself, given a trivial `Send` body: proves
