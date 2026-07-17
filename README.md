@@ -19,7 +19,8 @@ don't have to trust the tables — [reproduce them](#reproduce-it-yourself).
 
 ## Where it was measured
 
-- **Device:** Apple-silicon laptop (M-series), macOS, `aarch64-apple-darwin`.
+- **Device:** MacBook Pro 14″ (Apple **M1 Pro**), macOS **26.0.1**,
+  `aarch64-apple-darwin`.
 - **Servers:** PostgreSQL **15.14** (Homebrew), loopback TCP, trust auth; SQLite via
   the **bundled amalgamation** (one file DB), one connection per client.
 - **Toolchains:** rustc **1.97.0** (stable; this bench is an independent `git`-dep
@@ -44,8 +45,12 @@ don't have to trust the tables — [reproduce them](#reproduce-it-yourself).
 
 ## PostgreSQL
 
-Latency is microseconds per operation (median of 3 warmed 7-rep runs), lower is
-better. **Bold** = fastest in the row; the `<kbd>xN</kbd>` factor is relative to it.
+Microseconds per operation (median of 3 warmed 7-rep runs), lower is better. **Bold**
+is the fastest client in the row; the <kbd>×N</kbd> chip on every other cell is how
+many times slower it is than that fastest. **bsql (sync)** and **bsql** are the *same
+driver* in two modes — a blocking build and an async (tokio) build of one shared core,
+not two libraries — shown side by side so each is compared like-for-like (see the notes
+under the tables).
 
 ### PostgreSQL — latency (µs, lower better)
 | scenario | bsql (sync) | bsql | C/libpq | sqlx | tokio-pg | diesel | Go/pgx |
@@ -69,17 +74,24 @@ Bytes from [`results/pg_rss.log`](results/pg_rss.log) ÷ 10⁶ (decimal MB).
 | C/libpq | 13.25 MB <kbd>x7.9</kbd> |
 | Go/pgx | 16.81 MB <kbd>x10.0</kbd> |
 
-**Read it right.** C/libpq and bsql (sync) are *blocking* clients; Go/pgx blocks a
-goroutine; the async Rust clients run on a tokio **current-thread** runtime (equally).
-The true apples-to-apples comparison is **blocking-vs-blocking — bsql (sync) vs C —
-and bsql wins every read** (ties INSERT). bsql (async) is within ~1 µs of C on point
-reads (the reactor poll/park/wake an async runtime pays over a would-block read, which
-a blocking client does not) and *faster* on larger results — and it is the fastest
-*async* driver here by a wide margin. On memory bsql is the **leanest in the PostgreSQL
-field** — a committed `rss_ceiling` gate fails if its peak exceeds 2 MiB, so the sub-2 MB
-figure is enforced, not aspirational. (Beating C's RSS is real: libpq links its full client
-dependency set — TLS, ICU — while bsql holds a fixed ~4 KiB engine buffer + 16-byte
-row handles.)
+**How to read the two tables** — each note answers *"then why isn't bsql simply first
+everywhere?"*
+
+- **The fair blocking fight — bsql (sync) vs C/libpq.** Both are plain synchronous
+  clients, so this is the true apples-to-apples row. bsql **wins every read** and ties
+  INSERT — its safe, typed, zero-per-row-alloc decode costs essentially nothing over raw
+  libpq.
+- **The fair async fight — bsql vs tokio-postgres / sqlx.** bsql is the **fastest async
+  driver here by a wide margin**. It runs ~1 µs behind *blocking* C on point reads — that
+  gap is the reactor poll/park/wake every async runtime pays on a would-block read (a
+  blocking client skips it) — and pulls **ahead** of C on larger results.
+- **Compare within an execution model.** C/libpq and bsql (sync) block a thread; Go/pgx
+  blocks a goroutine; the async Rust clients (bsql, tokio-postgres, sqlx) all run on a
+  tokio **current-thread** runtime, equally — nobody is handicapped by the harness.
+- **Memory — bsql is the leanest in this field.** A committed `rss_ceiling` gate fails the
+  build if bsql's peak exceeds 2 MiB, so the figure is enforced, not aspirational. Beating
+  even C is real: libpq links its whole client stack (TLS, ICU) while bsql holds a fixed
+  ~4 KiB engine buffer + 16-byte row handles.
 
 ---
 
