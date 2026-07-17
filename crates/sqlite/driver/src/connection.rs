@@ -503,12 +503,29 @@ impl<'r> BorrowedRow<'r> {
     /// A zero-copy borrowed view of column `col`, valid for the row step
     /// (`'r`), or [`SqliteError::ColumnIndexOutOfBounds`] if `col` is past the
     /// row.
+    ///
+    /// The bounds check is DEFERRED to rusqlite's `get_ref`, which performs the
+    /// IDENTICAL `col < column_count()` check internally (via its `RowIndex::idx`).
+    /// A redundant bsql-side pre-check would be a genuine per-cell cost, not a free
+    /// branch: rusqlite's `RawStatement::column_count` is a live `sqlite3_column_count`
+    /// FFI call (deliberately UN-cached — a schema `ALTER` can change it), so a
+    /// pre-check plus `get_ref`'s own check would call it TWICE per column on the
+    /// hot typed/streaming decode. Deferring folds the two into one. On the cold
+    /// out-of-bounds path rusqlite reports [`rusqlite::Error::InvalidColumnIndex`],
+    /// which is re-shaped here into bsql's richer
+    /// [`SqliteError::ColumnIndexOutOfBounds`] (the `count` computed ONLY here, off
+    /// the hot path), so the classified error is byte-identical to the former
+    /// pre-check. `get_ref` on a `usize` index can fail ONLY with
+    /// `InvalidColumnIndex`, so the trailing arm is the architecturally unreachable
+    /// dead path (routed through the shared `From`, never a panic).
     pub fn value_ref(&self, col: usize) -> Result<ValueRef<'r>, SqliteError> {
-        let count = self.column_count();
-        if col >= count {
-            return Err(SqliteError::ColumnIndexOutOfBounds { index: col, count });
+        match self.row.get_ref(col) {
+            Ok(v) => Ok(v.into()),
+            Err(rusqlite::Error::InvalidColumnIndex(index)) => {
+                Err(SqliteError::ColumnIndexOutOfBounds { index, count: self.column_count() })
+            }
+            Err(e) => Err(SqliteError::from(e)),
         }
-        Ok(self.row.get_ref(col)?.into())
     }
 
     /// Read column `col` as `T`, classifying any failure. Borrowed targets

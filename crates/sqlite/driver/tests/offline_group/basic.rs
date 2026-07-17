@@ -543,6 +543,32 @@ fn column_index_out_of_bounds_is_classified() {
     }
 }
 
+#[test]
+fn streaming_column_index_out_of_bounds_is_classified() {
+    // The STREAMING `BorrowedRow::value_ref` defers its bounds check to rusqlite's
+    // `get_ref` (to drop a redundant per-cell `sqlite3_column_count` FFI on the hot
+    // read) and RE-SHAPES rusqlite's `InvalidColumnIndex` into the SAME classified
+    // `ColumnIndexOutOfBounds { index, count }` the eager `Row` path returns. This
+    // pins that the cold error path is byte-identical to the former pre-check —
+    // same variant, same `index`, same `count` — so the optimization changed only
+    // the hot-path cost, never the observable error.
+    let conn = Connection::open_in_memory().expect("open");
+    let mut hit = false;
+    conn.query_each_sql("SELECT 1", |row| {
+        match row.value_ref(5) {
+            Err(SqliteError::ColumnIndexOutOfBounds { index, count }) => {
+                assert_eq!(index, 5);
+                assert_eq!(count, 1);
+                hit = true;
+            }
+            other => panic!("expected ColumnIndexOutOfBounds, got {other:?}"),
+        }
+        ControlFlow::<()>::Continue(())
+    })
+    .expect("stream");
+    assert!(hit, "callback must have observed the out-of-bounds read");
+}
+
 // ─────────────────────── streaming lending path ───────────────────────
 
 #[test]
