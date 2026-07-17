@@ -2,19 +2,23 @@
 #
 # bsql runs its test/lint/gate wall LOCALLY via `cargo` + the `bsql-devgates`
 # crate (see CLAUDE.md "Build & test" / "Verification"); there is deliberately no
-# CI that builds or tests on push. This workflow does ONE thing: when a GitHub
-# Release is published, it publishes every shippable crate to crates.io in
-# dependency (topological) order.
+# CI that builds or tests on push. This workflow does ONE thing: publish every
+# shippable crate to crates.io in dependency (topological) order — on a published
+# GitHub Release, or on manual dispatch (to resume a rate-limited run).
 #
-# Requires the repository secret CRATES_IO_TOKEN (a crates.io API token with
-# publish scope). It is idempotent: a crate whose exact version is already on
-# crates.io is skipped, so a manual first publish followed by a Release (or a
-# re-run after a mid-sequence failure) never double-publishes.
+# Requires the repository secret CRATES_IO_TOKEN (a crates.io API token scoped to
+# publish-new + publish-update). It is idempotent AND rate-limit-aware:
+#   - a crate whose exact version is already on crates.io is skipped (so a resume
+#     or re-run never double-publishes);
+#   - crates.io throttles NEW crate names (burst then ~1 / window); on a 429 the
+#     job parses the "try again after" time, sleeps to it, and retries the SAME
+#     crate — so a fresh multi-crate first publish completes in one run.
 name: publish
 
 on:
   release:
     types: [published]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -23,6 +27,7 @@ jobs:
   crates-io:
     name: publish to crates.io
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -48,17 +53,37 @@ jobs:
             bsql-testkit
             bsql
           "
+
+          publish_one() {
+            local crate="$1" attempt
+            for attempt in 1 2 3 4 5 6 7 8; do
+              if cargo publish -p "$crate" 2>&1 | tee /tmp/pub_out.txt; then
+                echo "published $crate"; return 0
+              fi
+              if grep -qiE "already (been )?(uploaded|published)|is already uploaded|already exists" /tmp/pub_out.txt; then
+                echo "$crate: this version is already on crates.io — skipping"; return 0
+              fi
+              if grep -qiE "429 Too Many Requests|too many new crates|rate.?limit" /tmp/pub_out.txt; then
+                # crates.io tells us exactly when a slot frees up — sleep to it (+30s margin).
+                after=$(sed -n 's/.*try again after \(.*\) and see.*/\1/p' /tmp/pub_out.txt | head -1)
+                target=$(date -u -d "$after" +%s 2>/dev/null || echo "")
+                now=$(date -u +%s)
+                if [ -n "$target" ] && [ "$target" -gt "$now" ]; then
+                  wait=$(( target - now + 30 ))
+                else
+                  wait=660   # fallback: comfortably over one refill window
+                fi
+                echo "::notice::$crate rate-limited; sleeping ${wait}s then retrying (attempt $attempt)"
+                sleep "$wait"
+                continue
+              fi
+              echo "::error::publish failed for $crate (not a rate limit)"; return 1
+            done
+            echo "::error::gave up on $crate after repeated rate limits"; return 1
+          }
+
           for crate in $crates; do
             echo "::group::publish $crate"
-            # `cargo publish` waits for the crate to appear in the index before
-            # returning (default since cargo 1.66), so the next crate resolves it.
-            if cargo publish -p "$crate" 2>&1 | tee /tmp/pub_out.txt; then
-              echo "published $crate"
-            elif grep -qiE "already (been )?(uploaded|published)|is already uploaded|already exists" /tmp/pub_out.txt; then
-              echo "$crate: this version is already on crates.io — skipping"
-            else
-              echo "::error::publish failed for $crate"
-              exit 1
-            fi
+            publish_one "$crate" || exit 1
             echo "::endgroup::"
           done
