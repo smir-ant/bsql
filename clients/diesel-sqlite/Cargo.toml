@@ -1,0 +1,29 @@
+# Standalone crate (empty [workspace] so it builds isolated from the bench root
+# workspace, like the other competitor clients).
+[workspace]
+
+[package]
+name = "diesel_sqlite_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "diesel_sqlite_bench"
+path = "src/main.rs"
+
+[dependencies]
+# diesel's SQLite backend is SYNCHRONOUS (no async peer for sqlite) — the honest
+# diesel model. `returning_clauses_for_sqlite_3_35` unlocks typed INSERT ...
+# RETURNING (needs SQLite >= 3.35).
+diesel = { version = "2.2", default-features = false, features = ["sqlite", "returning_clauses_for_sqlite_3_35"] }
+# Force the SAME bundled SQLite bsql + the C client use (libsqlite3-sys 0.35 =
+# SQLite 3.50.2) so diesel is engine-comparable, not confounded by a different
+# SQLite build. diesel accepts libsqlite3-sys `>=0.17.2, <0.36.0`.
+libsqlite3-sys = { version = "0.35", features = ["bundled"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

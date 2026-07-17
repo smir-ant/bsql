@@ -1,0 +1,5 @@
+# Vendored amalgamation (copied from the cargo registry by build.sh) + binary.
+sqlite3.c
+sqlite3.h
+sqlite_bench
+*.o

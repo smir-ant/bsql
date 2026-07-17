@@ -39,6 +39,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -103,7 +109,6 @@ dependencies = [
 [[package]]
 name = "bsql"
 version = "1.0.0-alpha.0"
-source = "git+https://github.com/smir-ant/bsql?branch=main#8c343baf16ac0daf3725275d527c04cd303781a6"
 dependencies = [
  "bsql-postgres-async",
  "bsql-postgres-core",
@@ -131,7 +136,6 @@ dependencies = [
 [[package]]
 name = "bsql-build"
 version = "1.0.0-alpha.0"
-source = "git+https://github.com/smir-ant/bsql?branch=main#8c343baf16ac0daf3725275d527c04cd303781a6"
 dependencies = [
  "sqlparser",
 ]
@@ -139,12 +143,10 @@ dependencies = [
 [[package]]
 name = "bsql-common"
 version = "1.0.0-alpha.0"
-source = "git+https://github.com/smir-ant/bsql?branch=main#8c343baf16ac0daf3725275d527c04cd303781a6"
 
 [[package]]
 name = "bsql-postgres-async"
 version = "1.0.0-alpha.0"
-source = "git+https://github.com/smir-ant/bsql?branch=main#8c343baf16ac0daf3725275d527c04cd303781a6"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
@@ -155,7 +157,6 @@ dependencies = [
 [[package]]
 name = "bsql-postgres-core"
 version = "1.0.0-alpha.0"
-source = "git+https://github.com/smir-ant/bsql?branch=main#8c343baf16ac0daf3725275d527c04cd303781a6"
 dependencies = [
  "bsql-common",
  "bsql-postgres-proto",
@@ -165,11 +166,10 @@ dependencies = [
 [[package]]
 name = "bsql-postgres-proto"
 version = "1.0.0-alpha.0"
-source = "git+https://github.com/smir-ant/bsql?branch=main#8c343baf16ac0daf3725275d527c04cd303781a6"
 dependencies = [
+ "arrayvec",
  "base64ct",
  "getrandom 0.2.17",
- "heapless",
  "hmac 0.12.1",
  "md-5 0.10.6",
  "pbkdf2",
@@ -182,7 +182,6 @@ dependencies = [
 [[package]]
 name = "bsql-postgres-sync"
 version = "1.0.0-alpha.0"
-source = "git+https://github.com/smir-ant/bsql?branch=main#8c343baf16ac0daf3725275d527c04cd303781a6"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
@@ -192,7 +191,6 @@ dependencies = [
 [[package]]
 name = "bsql-query-macros"
 version = "1.0.0-alpha.0"
-source = "git+https://github.com/smir-ant/bsql?branch=main#8c343baf16ac0daf3725275d527c04cd303781a6"
 dependencies = [
  "bsql-build",
  "proc-macro2",
@@ -204,7 +202,6 @@ dependencies = [
 [[package]]
 name = "bsql-sqlite"
 version = "1.0.0-alpha.0"
-source = "git+https://github.com/smir-ant/bsql?branch=main#8c343baf16ac0daf3725275d527c04cd303781a6"
 dependencies = [
  "bsql-common",
  "rusqlite",
@@ -733,15 +730,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hash32"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -765,16 +753,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
 dependencies = [
  "hashbrown 0.15.5",
-]
-
-[[package]]
-name = "heapless"
-version = "0.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
-dependencies = [
- "hash32",
- "stable_deref_trait",
 ]
 
 [[package]]

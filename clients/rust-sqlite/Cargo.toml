@@ -1,0 +1,31 @@
+# Standalone crate (empty [workspace] so it builds isolated from the bench root
+# workspace, like the other competitor clients).
+[workspace]
+
+[package]
+name = "sqlx_sqlite_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "sqlx_sqlite_bench"
+path = "src/main.rs"
+
+[dependencies]
+# sqlx with the sqlite backend. `sqlite` pulls libsqlite3-sys (bundled), so no
+# system SQLite is needed; the exact bundled version is printed at runtime.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+# current-thread runtime — the realistic single-connection choice, applied
+# equally to every async Rust client (matches the PG fairness fix). NB sqlx-sqlite
+# itself runs SQLite on a dedicated background worker thread + channel regardless
+# (its architecture), so a query still crosses a thread boundary — the honest
+# sqlx cost.
+tokio = { version = "1", features = ["rt", "macros"] }
+futures = "0.3"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

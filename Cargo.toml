@@ -141,3 +141,7 @@ path = "src/bin/rss_tokio_postgres.rs"
 [[bin]]
 name = "rss_sqlx"
 path = "src/bin/rss_sqlx.rs"
+
+[[bin]]
+name = "rss_bsql_sqlite"
+path = "src/bin/rss_bsql_sqlite.rs"
