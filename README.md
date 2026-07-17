@@ -17,7 +17,7 @@ correct.** No DSL, no method chains, no runtime "column not found".
 // `SELECT nope FROM users` would be a compile error, not a runtime surprise.
 bsql::query!(UserById, "SELECT id, email FROM users WHERE id = $1");
 
-let user = conn.query_one::<UserByIdQuery>((42_i32,)).await?;
+let user = conn.query_one::<UserById>((42_i32,)).await?;
 // user.id: i32   user.email: String     (a nullable column would be Option<T>)
 ```
 
@@ -41,9 +41,9 @@ let user = conn.query_one::<UserByIdQuery>((42_i32,)).await?;
   wrapper: the same `query!` carrier runs on both, decoding into the same typed
   records — and SQLite verifies each value's storage class at runtime (a mismatch
   is a classified error, never a silent coercion).
-- **Tiny footprint.** ~1.7 MB peak memory for a real workload — **the leanest
-  client measured**, leaner than a C/libpq client (~7×) and Go/pgx (~9×), and
-  ~3.7× under the Rust field — and the whole TLS/SCRAM stack is feature-gated, so a
+- **Tiny footprint.** ~1.6–1.8 MB peak memory for a real workload — **the leanest
+  client measured**, leaner than a C/libpq client (~7.5×) and Go/pgx (~10×), and
+  ~3.6× under the Rust field — and the whole TLS/SCRAM stack is feature-gated, so a
   localhost / trust-auth build is a handful of crates.
 - **`#![forbid(unsafe_code)]` on every shipped crate.** No `unwrap`/`expect` in
   production code. NULL is `Option<NonZeroU32>`, not a sentinel. The hot decode
@@ -60,10 +60,16 @@ let user = conn.query_one::<UserByIdQuery>((42_i32,)).await?;
 sqlx, diesel), PostgreSQL over loopback TCP, full methodology and captured logs so
 you don't have to trust the table.
 
-The short version, measured on a MacBook Pro 14" (M1 Pro): bsql is **on par with
-hand-written C over libpq** on latency and ahead of every other client, and it is
-the **leanest of all** — ~1.7 MB peak memory, ~7× under a C/libpq client and ~9×
-under Go/pgx. Don't take our word for it — `git switch bench && cargo bench`.
+The short version, measured on an Apple-silicon laptop over the same PostgreSQL:
+the **blocking** driver `bsql::pg_sync` is the fastest of the whole field — it
+**beats C/libpq** on every read (the true apples-to-apples comparison, both
+synchronous). The **async** driver is on par with C on point reads (within the
+~1 µs an async runtime spends parking a would-block read, which a blocking client
+does not) and faster on larger results — and it is by a wide margin the fastest
+*async* driver (tokio-postgres ~1.5×, sqlx, diesel, Go/pgx behind it). On memory
+bsql is the **leanest of all** — ~1.6–1.8 MB peak, ~3.6× under the Rust field,
+~7.5× under a C/libpq client, ~10× under Go/pgx. Don't take our word for it —
+`git switch bench && cargo bench`.
 
 ## Quick start
 
@@ -96,7 +102,7 @@ async fn main() -> Result<(), bsql::pg::DriverError> {
     let cfg = pg::ConnectConfig::from_dsn("postgres://user@localhost/mydb")?;
     let mut conn = pg::Connection::connect(cfg).await?;
 
-    let user = conn.query_one::<UserByIdQuery>((42_i32,)).await?;
+    let user = conn.query_one::<UserById>((42_i32,)).await?;
     println!("{} <{}>", user.id, user.email);
     Ok(())
 }
@@ -210,6 +216,32 @@ sink is installed.
 supply one infallible free-function converter. The orphan-proof seam.
 </details>
 
+## How it compares
+
+Speed is half the story; the other half is what the driver lets you *do*. An honest
+side-by-side with the Rust field — competitors get credit for what they have (✅ full,
+◐ partial, ❌ none).
+
+<details>
+<summary><b>Capability matrix — bsql vs tokio-postgres / sqlx / diesel</b></summary>
+
+| capability | bsql | tokio-postgres | sqlx | diesel |
+|---|:---:|:---:|:---:|:---:|
+| Compile-time SQL check vs real schema | ✅ `query!` replays migrations | ❌ unchecked string | ✅ `query!` | ◐ typed DSL only |
+| …with **no live DB / cache** at build | ✅ offline from migration files | — | ❌ needs DB or committed cache | ◐ `schema.rs` usually from a DB |
+| Plain SQL text (not a DSL) | ✅ | ✅ (unchecked) | ✅ | ❌ query-builder DSL |
+| **N+1 query detection** | ✅ `conn.n1_report()`, zero-cost off | ❌ | ❌ | ❌ |
+| Typed/safe **binary COPY** | ✅ `copy_in_typed`, compile-checked | ◐ hand-wired binary | ◐ text COPY only | ❌ no COPY |
+| Build-time **migration safety** gate | ✅ destructive-op ack + checksum drift | ❌ | ◐ checksum drift | ◐ up/down by version |
+| First-class **sync AND async**, one API | ✅ shared `Core<S>` | ❌ async only | ❌ async only | ❌ sync only |
+| **Zero-per-row-alloc** streaming | ✅ `query_each`, O(1) RAM, 0 alloc/row | ◐ streams, allocs/row | ◐ streams, allocs/row | ◐ default materializes |
+| Out-of-band query cancellation | ✅ detached `CancelToken` | ✅ `cancel_token()` | ◐ cancel-on-drop | ❌ |
+| `#![forbid(unsafe_code)]` (shipped crates) | ✅ every crate | ◐ some `unsafe` | ◐ some `unsafe` | ❌ links libpq (C FFI) |
+| Unix-domain socket transport | ✅ (~2.4–2.9× faster than TCP locally) | ✅ | ✅ | ✅ (libpq) |
+| Same `query!` on **PostgreSQL and SQLite** | ✅ one carrier, both backends | ❌ PG only | ◐ separate `Sqlite`/`Pg` types | ◐ separate backends |
+
+</details>
+
 ## Safety floor
 
 - `#![forbid(unsafe_code)]` on every shipped crate; `deny(unwrap_used, expect_used)`.
@@ -251,7 +283,7 @@ adversarially before it landed.
 ~2,400 tests across the workspace — unit, integration, compile-fail (`trybuild`),
 live-database, dependency-free fuzz, and machine-checked codegen gates. Not just
 tests that the code works, but tests that *broken* code is rejected at compile
-time. The whole thing went through eight successive deep audits and a real-load
+time. The whole thing went through nine successive deep audits and a real-load
 fault-injection pass (TLS byte-fragmentation, mid-stream faults, million-row
 streams, concurrency) — the sort of thing that catches what green unit tests hide.
 
