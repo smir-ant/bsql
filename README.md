@@ -2,12 +2,13 @@
 
 **Compile-time-safe SQL for Rust — PostgreSQL and SQLite, async and sync.**
 
-Write real SQL. It is checked against your actual schema during `cargo build` —
-table names, column names, types, nullability. **If it compiles, the query is
-correct.** No DSL, no method chains, no runtime "column not found".
+Write real SQL. It is checked at `cargo build` against the schema your migration
+files define — table names, column names, types, nullability. **If it compiles,
+the query is correct.** No DSL, no method chains, no runtime "column not found".
 
 > **1.0.0-alpha** — stable in shape, early in life; expect a few more alpha
-> iterations before a full 1.0. Built with [Claude Code](https://claude.com/claude-code)
+> iterations before a full 1.0. Not yet on crates.io — install from `git` (see
+> [Quick start](#quick-start)). Built with [Claude Code](https://claude.com/claude-code)
 > (design first, review second, implementation third).
 
 ```rust
@@ -26,25 +27,28 @@ let user = conn.query_one::<UserById>((42_i32,)).await?;
 - **If it compiles, the SQL is correct.** Every query is validated at build time
   against the schema your migration `*.sql` files describe — names, types, and
   nullability. Wrong column, wrong type, typo → the build fails.
-- **One query function, and it always checks.** There is no unchecked escape
-  hatch. In sqlx a missing `!` (`query()` vs `query!()`) silently skips
-  validation; in bsql the unchecked version *does not exist*, so you cannot write
-  it by accident.
+- **One query function, and it always checks — no *accidental* unchecked path.**
+  In sqlx a missing `!` (`query()` vs `query!()`) silently skips validation. bsql
+  has a raw-SQL escape hatch too, but it is deliberate and loud: it carries a
+  `_sql` suffix (`query_sql`, `query_params`), so you opt into unchecked SQL on
+  purpose — never by forgetting a `!`.
 - **Pure SQL text — no builder.** CTEs, JOINs, window functions, subqueries. The
   `.filter().eq()` combinator paradigm was tried during the rebuild and
   deliberately reverted. If PostgreSQL or SQLite supports it, you just write it.
 - **Async and sync are both first-class.** Both drivers plug the same socket into
   ONE transport-generic core, so parity is a *compiler guarantee*, not
   hand-maintained twins. The sync driver drops tokio entirely — pure `fn`, no
-  async runtime. Switch backends with one line in `Cargo.toml`.
+  async runtime. Switch async↔sync by swapping one feature line (and dropping
+  `.await`).
 - **PostgreSQL and SQLite, same macro.** SQLite is a full peer, not a text
   wrapper: the same `query!` carrier runs on both, decoding into the same typed
   records — and SQLite verifies each value's storage class at runtime (a mismatch
   is a classified error, never a silent coercion).
-- **Tiny footprint.** ~1.6–1.8 MB peak memory for a real workload — **the leanest
-  client measured**, leaner than a C/libpq client (~7.5×) and Go/pgx (~10×), and
-  ~3.6× under the Rust field — and the whole TLS/SCRAM stack is feature-gated, so a
-  localhost / trust-auth build is a handful of crates.
+- **Tiny footprint.** ~1.7–1.8 MB peak memory for a real PostgreSQL workload —
+  **the leanest client measured there** (and a near-tie with raw C on SQLite), ~8×
+  under a C/libpq client, ~10× under Go/pgx, and ~3.6× under the nearest Rust
+  client — and the whole TLS/SCRAM stack is feature-gated, so a localhost /
+  trust-auth build is a handful of crates.
 - **`#![forbid(unsafe_code)]` on every shipped crate.** No `unwrap`/`expect` in
   production code. NULL is `Option<NonZeroU32>`, not a sentinel. The hot decode
   path is proven panic-free and byte-stable by a machine-checked codegen gate.
@@ -61,14 +65,14 @@ sqlx, diesel), PostgreSQL over loopback TCP, full methodology and captured logs 
 you don't have to trust the table.
 
 The short version, measured on an Apple-silicon laptop over the same PostgreSQL:
-the **blocking** driver `bsql::pg_sync` is the fastest of the whole field — it
-**beats C/libpq** on every read (the true apples-to-apples comparison, both
-synchronous). The **async** driver is on par with C on point reads (within the
-~1 µs an async runtime spends parking a would-block read, which a blocking client
-does not) and faster on larger results — and it is by a wide margin the fastest
-*async* driver (tokio-postgres ~1.5×, sqlx, diesel, Go/pgx behind it). On memory
-bsql is the **leanest of all** — ~1.6–1.8 MB peak, ~3.6× under the Rust field,
-~7.5× under a C/libpq client, ~10× under Go/pgx. Don't take our word for it —
+the **blocking** driver `bsql::pg_sync` **beats C/libpq on every read** and ties it
+on INSERT (the true apples-to-apples comparison, both synchronous). The **async**
+driver is on par with C on point reads (within the ~1 µs an async runtime spends
+parking a would-block read, which a blocking client does not) and faster on larger
+results — and it is by a wide margin the fastest *async* driver (tokio-postgres
+~1.5×, sqlx, diesel, Go/pgx behind it). On memory bsql is the **leanest in the
+PostgreSQL field** — ~1.7–1.8 MB peak, ~3.6× under the nearest Rust client, ~8×
+under a C/libpq client, ~10× under Go/pgx. Don't take our word for it —
 `git switch bench && cargo bench`.
 
 ## Quick start
@@ -231,9 +235,10 @@ side-by-side with the Rust field — competitors get credit for what they have (
 | …with **no live DB / cache** at build | ✅ offline from migration files | — | ❌ needs DB or committed cache | ◐ `schema.rs` usually from a DB |
 | Plain SQL text (not a DSL) | ✅ | ✅ (unchecked) | ✅ | ❌ query-builder DSL |
 | **N+1 query detection** | ✅ `conn.n1_report()`, zero-cost off | ❌ | ❌ | ❌ |
-| Typed/safe **binary COPY** | ✅ `copy_in_typed`, compile-checked | ◐ hand-wired binary | ◐ text COPY only | ❌ no COPY |
+| Typed/safe **binary COPY** | ✅ `copy_in_typed`, compile-checked | ◐ hand-wired binary | ◐ text COPY only | ◐ `copy_from`, not compile-checked |
+| Atomic typed **pipelining / bulk batch** | ✅ `pipeline` / `execute_batch`, all-or-nothing, ~1 RTT | ◐ untyped pipelining | ❌ | ❌ |
 | Build-time **migration safety** gate | ✅ destructive-op ack + checksum drift | ❌ | ◐ checksum drift | ◐ up/down by version |
-| First-class **sync AND async**, one API | ✅ shared `Core<S>` | ❌ async only | ❌ async only | ❌ sync only |
+| First-class **sync AND async**, one API | ✅ shared `Core<S>` | ❌ async only | ❌ async only | ◐ separate `diesel` + `diesel-async` |
 | **Zero-per-row-alloc** streaming | ✅ `query_each`, O(1) RAM, 0 alloc/row | ◐ streams, allocs/row | ◐ streams, allocs/row | ◐ default materializes |
 | Out-of-band query cancellation | ✅ detached `CancelToken` | ✅ `cancel_token()` | ◐ cancel-on-drop | ❌ |
 | `#![forbid(unsafe_code)]` (shipped crates) | ✅ every crate | ◐ some `unsafe` | ◐ some `unsafe` | ❌ links libpq (C FFI) |
@@ -250,10 +255,18 @@ side-by-side with the Rust field — competitors get credit for what they have (
   rejected loudly on **every** binding surface (typed at compile, dynamic at the
   server, prepared at the client, SQLite by storage class) — never a silent
   byte-for-byte reinterpretation.
+- **The build-time check is against your committed migration files** (the
+  version-controlled source of truth), not a live-DB introspection that can go
+  stale. An out-of-band `ALTER TABLE` applied by hand with no migration file is
+  invisible at build time — but a runtime OID guard catches such drift as a
+  classified error on the wire, never a silent wrong value.
 - The wire decoders are proven total (no panic on *any* input) by a dep-free
   fuzz gate; the inbound hot dispatch is proven panic-free and byte-stable by a
   codegen gate. NULL is `Option<NonZeroU32>`; SQL identifiers spliced into DDL go
   through a validate-only `SafeIdent` newtype.
+- Over TLS, SCRAM-SHA-256-**PLUS** channel binding (opt-in-strict) anchors auth to
+  the server's certificate, closing the valid-cert relay/MITM gap that cert +
+  hostname verification alone leaves.
 - 64-bit Linux / macOS / Windows. TCP everywhere; unix sockets on unix.
 
 ## Verification
