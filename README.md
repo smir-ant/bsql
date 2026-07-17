@@ -6,10 +6,12 @@ Write real SQL. It is checked at `cargo build` against the schema your migration
 files define — table names, column names, types, nullability. **If it compiles,
 the query is correct.** No DSL, no method chains, no runtime "column not found".
 
-> **1.0.0-alpha** — stable in shape, early in life; expect a few more alpha
-> iterations before a full 1.0. Not yet on crates.io — install from `git` (see
-> [Quick start](#quick-start)). Built with [Claude Code](https://claude.com/claude-code)
-> (design first, review second, implementation third).
+> **1.0.0-alpha.1** — stable in shape, early in life; expect a few more alpha
+> iterations before a full 1.0. On crates.io as a **pre-release**: pin
+> `bsql = "1.0.0-alpha.1"` (a bare `cargo add bsql` resolves the older stable
+> `0.27`, a different, pre-rebuild library). Built with
+> [Claude Code](https://claude.com/claude-code) (design first, review second,
+> implementation third).
 
 ```rust
 // migrations/0001_init.sql →  CREATE TABLE users (id int PRIMARY KEY, email text NOT NULL);
@@ -81,12 +83,12 @@ under a C/libpq client, ~10× under Go/pgx. Don't take our word for it —
 <summary><b>PostgreSQL</b></summary>
 
 ```toml
-# Cargo.toml
+# Cargo.toml  (alpha is a pre-release, so pin the exact version)
 [dependencies]
-bsql = { git = "https://github.com/smir-ant/bsql", features = ["macros", "postgres-async"] }
+bsql = { version = "1.0.0-alpha.1", features = ["macros", "postgres-async"] }
 
 [build-dependencies]
-bsql-build = { git = "https://github.com/smir-ant/bsql" }
+bsql-build = "1.0.0-alpha.1"
 ```
 
 ```rust
