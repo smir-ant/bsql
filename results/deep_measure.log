@@ -1,0 +1,19 @@
+### machine: load averages: 2.96 2.18 2.87
+===== CONCURRENCY (QPS + p50/p99/p999, hold-one-connection-per-worker) =====
+CONC bsql workers=8 threads=8 qps=95139 p50_us=78.46 p99_us=167.88 p999_us=213.58 ops=475693 secs=5.0
+CONC tokio_postgres workers=8 threads=8 qps=90290 p50_us=82.46 p99_us=173.96 p999_us=224.54 ops=451452 secs=5.0
+CONC sqlx workers=8 threads=8 qps=92152 p50_us=81.58 p99_us=170.42 p999_us=212.46 ops=460759 secs=5.0
+CONC bsql workers=32 threads=8 qps=118276 p50_us=264.62 p99_us=409.71 p999_us=715.25 ops=591378 secs=5.0
+CONC tokio_postgres workers=32 threads=8 qps=119210 p50_us=262.83 p99_us=466.21 p999_us=896.71 ops=596051 secs=5.0
+CONC sqlx workers=32 threads=8 qps=119036 p50_us=262.58 p99_us=486.17 p999_us=941.79 ops=595178 secs=5.0
+CONC bsql workers=128 threads=8 qps=124270 p50_us=1032.75 p99_us=1632.38 p999_us=2358.75 ops=621348 secs=5.0
+CONC tokio_postgres workers=128 threads=8 qps=125059 p50_us=1011.67 p99_us=1914.50 p999_us=3348.62 ops=625293 secs=5.0
+CONC sqlx workers=128 threads=8 qps=125401 p50_us=1004.67 p99_us=2037.17 p999_us=3194.88 ops=627007 secs=5.0
+===== STREAMING (peak RSS, one process per client per row-count) =====
+STREAM bsql rows=1000000 rss_bytes=1769472 rows_read=1000000 stream_allocs=9 stream_alloc_bytes=164 alloc_per_row=0.000009
+STREAM tokio rows=1000000 rss_bytes=197787648 rows_read=1000000
+STREAM libpq rows=1000000 rss_bytes=105480192 rows_read=1000000
+STREAM bsql rows=5000000 rss_bytes=1769472 rows_read=5000000 stream_allocs=9 stream_alloc_bytes=164 alloc_per_row=0.000002
+STREAM tokio rows=5000000 rss_bytes=962281472 rows_read=5000000
+STREAM libpq rows=5000000 rss_bytes=466370560 rows_read=5000000
+===== MEASURE_DONE =====

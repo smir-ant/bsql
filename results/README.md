@@ -10,17 +10,7 @@ stdout of the corresponding `scripts/*.sh` run on the machine described in the R
 | [`pg_latency.log`](pg_latency.log) | `scripts/xlang_measure.sh latency` (3 consecutive passes) | **PostgreSQL — latency** (the table shows the median of the 3 passes) |
 | [`pg_rss.log`](pg_rss.log) | `scripts/xlang_measure.sh` (one full pass, latency + RSS) | **PostgreSQL — peak memory** (its `RSS`/`PEAK_RSS_BYTES` bytes ÷ 10⁶ = the MB column) |
 | [`sqlite.log`](sqlite.log) | `scripts/xlang_measure_sqlite.sh all` (3 passes + one RSS block) | **SQLite — latency** (median of 3) and **SQLite — peak memory** |
-| `concurrency.log` *(generated on run)* | `scripts/xlang_measure_deep.sh concurrency` | **Concurrency throughput** — the `CONC <client> workers=… qps=… p99_us=…` lines |
-| `streaming.log` *(generated on run)* | `scripts/xlang_measure_deep.sh streaming` | **Constant-memory streaming** — the `STREAM <client> rows=… rss_bytes=… alloc_per_row=…` lines |
-
-> **The two deep logs do not exist yet — they are produced on a quiet-machine run.**
-> The deep-benchmark *harness* is committed and runnable (`scripts/xlang_measure_deep.sh`
-> + the `concurrency_pg` / `stream_bsql` / `stream_tokio` clients and the C `stream_rss`
-> mode), but their numbers are deliberately deferred to a run under no other load — a
-> concurrency/RSS benchmark taken under contention is meaningless. On that run, capture
-> stdout to `results/concurrency.log` / `results/streaming.log` (e.g.
-> `scripts/xlang_measure_deep.sh concurrency | tee results/concurrency.log`) and fill the
-> **Deeper benchmarks** tables in the top-level README from the `CONC` / `STREAM` lines.
+| [`deep_measure.log`](deep_measure.log) | `scripts/xlang_measure_deep.sh all` | **Deeper benchmarks** — the `CONC <client> workers=… qps=… p99_us=…` (concurrency) and `STREAM <client> rows=… rss_bytes=… alloc_per_row=…` (streaming) lines |
 
 ## Re-deriving a table cell
 
@@ -33,6 +23,9 @@ stdout of the corresponding `scripts/*.sh` run on the machine described in the R
 - **SKIP** lines in `sqlite.log` mark a scenario a competitor cannot express as the
   bsql variant (it points at the equivalent apples-to-apples cell) — never an
   invented number.
+- **Deep** cells come from `deep_measure.log`: a `CONC` line's `qps=` (÷1000 → the
+  `k` QPS column) and `p99_us=` (the p99 µs table); a `STREAM` line's `rss_bytes` ÷ 10⁶
+  → the peak-RSS MB, and bsql's `stream_allocs` / `alloc_per_row` back the streaming note.
 
 To regenerate all three from scratch, follow the README's
 [Reproduce it yourself](../README.md#reproduce-it-yourself).

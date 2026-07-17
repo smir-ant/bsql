@@ -1,3 +1,4 @@
 /target
 bench.db
 *.db
+deep_run.log

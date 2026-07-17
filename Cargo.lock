@@ -108,7 +108,8 @@ dependencies = [
 
 [[package]]
 name = "bsql"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.1"
+source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
 dependencies = [
  "bsql-postgres-async",
  "bsql-postgres-core",
@@ -135,18 +136,21 @@ dependencies = [
 
 [[package]]
 name = "bsql-build"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.1"
+source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
 dependencies = [
  "sqlparser",
 ]
 
 [[package]]
 name = "bsql-common"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.1"
+source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
 
 [[package]]
 name = "bsql-postgres-async"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.1"
+source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
@@ -156,7 +160,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-core"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.1"
+source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
 dependencies = [
  "bsql-common",
  "bsql-postgres-proto",
@@ -165,7 +170,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-proto"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.1"
+source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
 dependencies = [
  "arrayvec",
  "base64ct",
@@ -181,7 +187,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-sync"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.1"
+source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
@@ -190,7 +197,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-query-macros"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.1"
+source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
 dependencies = [
  "bsql-build",
  "proc-macro2",
@@ -201,7 +209,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-sqlite"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.1"
+source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
 dependencies = [
  "bsql-common",
  "rusqlite",

@@ -199,75 +199,61 @@ tables are built from. The exact outputs of the runs behind the tables above are
 committed under [`results/`](results/) (see [`results/README.md`](results/README.md) for
 which log backs which table, and how to re-derive any cell).
 
-## Deeper benchmarks (implemented — numbers pending a quiet-machine run)
+## Deeper benchmarks
 
-The single-op latency + memory matrix is the foundation. Two deeper benchmarks probe a
-regime and a property that single-op numbers cannot: they are **implemented and runnable
-today** (real committed clients + a sweep script — [`scripts/xlang_measure_deep.sh`](scripts/xlang_measure_deep.sh)),
-not designs. The measured tables are intentionally left to a **quiet-machine run** (the
-numbers below are placeholders on purpose — this harness fabricates nothing, and a
-benchmark taken under load is worse than none). Running either command fills its table and
-drops a raw log under [`results/`](results/).
+Two benchmarks that probe a regime and a property the single-op matrix cannot. Both stand up
+their **own dedicated ephemeral PostgreSQL 15** (own port + socket dir, `max_connections`
+raised to 300, torn down on exit) — same version / machine / loopback TCP as the tables above,
+so a deep run neither disturbs nor is disturbed by the shared server. Raw log:
+[`results/deep_measure.log`](results/deep_measure.log). Reproduce:
+`scripts/xlang_measure_deep.sh all` (or `concurrency` / `streaming`); pass `DEEP_PG_EXISTING=1`
+to target a server you manage. Counts are env-tunable (`DEEP_WORKERS`, `DEEP_STREAM_ROWS`,
+`CONC_WARMUP_MS`, `CONC_MEASURE_MS`).
 
-Both stand up their **own dedicated ephemeral PostgreSQL 15** (its own port + socket dir,
-`max_connections` raised to 300, torn down on exit): 128 *held* connections exceed a stock
-server's `max_connections`, and the isolation means the deep run neither disturbs nor is
-disturbed by anything on the shared server — same version / machine / loopback TCP as the
-tables above. Pass `DEEP_PG_EXISTING=1` (with `PGHOST`/`PGPORT`/…) to target a server you
-manage instead.
-
-### Concurrency throughput — the async-tax answer
+### Concurrency — throughput and tail latency
 
 The single-op table "penalises" bsql-async ~1 µs for the reactor poll/park/wake a blocking
-client skips. Under concurrency that reactor **pays for itself**: one runtime multiplexes
-many in-flight queries, so aggregate throughput scales with concurrency, not with serial
-latency. This benchmark runs **8 / 32 / 128 concurrent workers**, each holding one dedicated
-connection (the pgbench `-c` model — so the number reflects the driver + runtime, not
-pool-checkout policy), all looping the by-PK read on a multi-thread tokio runtime, and
-reports **sustained QPS** and **p50 / p99 / p999** latency for **bsql-async (its `Pool`)**
-vs **tokio-postgres** vs **sqlx**. bsql uses its pool to hand out the connections (mandated);
-because its *per-op* latency already leads the async field in the single-op table, its
-*concurrent* QPS is expected to lead too — the point the run will confirm.
+client skips. Under concurrency that reactor **pays for itself**: one runtime multiplexes many
+in-flight queries. **8 / 32 / 128 workers**, each holding one dedicated connection (the pgbench
+`-c` model, so the figure reflects the driver + runtime, not pool-checkout policy), all looping
+the by-PK read on a multi-thread tokio runtime — **bsql-async** (its `Pool`) vs **tokio-postgres**
+vs **sqlx**.
 
-```bash
-scripts/xlang_measure_deep.sh concurrency      # stands up PG, sweeps 8/32/128 × 3 clients
-```
+**Raw throughput is a wash** — all three saturate the same loopback PostgreSQL, so aggregate
+QPS lands within ~1 % of each other at 32 and 128 workers (bsql leads at 8). The real
+separation is **tail latency**: bsql has the **lowest p99 at every level**, and the lowest p999
+at 32 and 128 workers (within a microsecond of sqlx at 8) — its tighter per-op path is less
+jitter under load.
 
-Each run prints one machine-parseable line per (client, workers), e.g.
-`CONC bsql workers=32 threads=8 qps=… p50_us=… p99_us=… p999_us=… ops=… secs=…`. The table
-to fill (bold = row winner, `<kbd>xN</kbd>` factor vs it):
+#### Throughput — sustained QPS (higher better)
+| workers | bsql-async | tokio-postgres | sqlx |
+|---|---|---|---|
+| 8 | **95.1k** <kbd>x1</kbd> | 90.3k <kbd>x1.05</kbd> | 92.2k <kbd>x1.03</kbd> |
+| 32 | 118.3k <kbd>x1.01</kbd> | **119.2k** <kbd>x1</kbd> | 119.0k <kbd>x1.00</kbd> |
+| 128 | 124.3k <kbd>x1.01</kbd> | 125.1k <kbd>x1.00</kbd> | **125.4k** <kbd>x1</kbd> |
 
-| workers | metric | bsql-async | tokio-postgres | sqlx |
-|---|---|---|---|---|
-| 8 | QPS / p99 µs | *pending* | *pending* | *pending* |
-| 32 | QPS / p99 µs | *pending* | *pending* | *pending* |
-| 128 | QPS / p99 µs | *pending* | *pending* | *pending* |
+#### Tail latency — p99 µs (lower better)
+| workers | bsql-async | tokio-postgres | sqlx |
+|---|---|---|---|
+| 8 | **168** <kbd>x1</kbd> | 174 <kbd>x1.04</kbd> | 170 <kbd>x1.01</kbd> |
+| 32 | **410** <kbd>x1</kbd> | 466 <kbd>x1.14</kbd> | 486 <kbd>x1.19</kbd> |
+| 128 | **1632** <kbd>x1</kbd> | 1915 <kbd>x1.17</kbd> | 2037 <kbd>x1.25</kbd> |
 
 ### Constant-memory streaming — a property competitors structurally lack
 
-bsql's `query_each` streams a colossal result in **O(1) resident memory with ~0 allocations
-per row** (each row is a zero-copy `BorrowedRow`, nothing accumulates). A materialising
-client — libpq's `PQexec`, tokio-postgres's `query()` — buffers the **whole** result first,
-so its RSS grows **O(rows)**. This benchmark consumes a **≥ 1 M-row** result (the sweep does
-1 M and 5 M) and records **peak RSS** per client — flat for bsql, rising for the materialisers
-— plus, for bsql, the **total allocations during the stream** (via a counting global
-allocator), which is a small constant *independent of the row count*, so **allocations/row → 0**.
+bsql's `query_each` streams a colossal result in **O(1) resident memory with ~0 allocations per
+row** (each row is a zero-copy `BorrowedRow`, nothing accumulates). A materialising client —
+libpq's `PQexec`, tokio-postgres's `query()` — buffers the **whole** result first, so its RSS
+grows **O(rows)**. Peak RSS reading a 1 M- and a 5 M-row result:
 
-```bash
-scripts/xlang_measure_deep.sh streaming        # stands up PG, sweeps 1M/5M × 3 clients
-```
-
-Lines look like `STREAM bsql rows=5000000 rss_bytes=… stream_allocs=… alloc_per_row=…` and
-`STREAM tokio rows=5000000 rss_bytes=…` / `STREAM libpq rows=5000000 rss_bytes=…`. The table
-to fill (peak RSS; bold = lowest):
-
-| rows | bsql (`query_each`, O(1)) | tokio-postgres (`query`, O(rows)) | libpq (`PQexec`, O(rows)) |
+#### Peak RSS (lower better)
+| rows | bsql `query_each` | tokio-postgres `query` | libpq `PQexec` |
 |---|---|---|---|
-| 1 M | *pending* | *pending* | *pending* |
-| 5 M | *pending* | *pending* | *pending* |
+| 1 M | **1.77 MB** <kbd>x1</kbd> | 197.8 MB <kbd>x112</kbd> | 105.5 MB <kbd>x60</kbd> |
+| 5 M | **1.77 MB** <kbd>x1</kbd> | 962.3 MB <kbd>x544</kbd> | 466.4 MB <kbd>x264</kbd> |
 
-…plus a bsql-only line: **total allocations to stream 5 M rows** (expected: a handful) and
-**allocations/row** (expected: ≈ 0).
-
-Run both with `scripts/xlang_measure_deep.sh all`. Windows/counts are env-tunable
-(`DEEP_WORKERS`, `DEEP_STREAM_ROWS`, `CONC_WARMUP_MS`, `CONC_MEASURE_MS`).
+**bsql's RSS is identical at 1 M and 5 M** — flat in row count — because it holds nothing:
+streaming 5 M rows made **9 total heap allocations** (164 bytes), i.e. **0.000002
+allocations/row**. The materialisers grow with the result — to ~962 MB (tokio-postgres) and
+~466 MB (libpq) at 5 M rows, **~540×** and **~260×** bsql's footprint. This is the report over
+tens of millions of rows that never grows memory — the thing `query_sql` / `PQexec` cannot do.
