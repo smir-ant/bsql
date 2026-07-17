@@ -132,43 +132,100 @@ not implement the SQLite trait, so running it on SQLite is a *compile* error.
 <details>
 <summary><b>N+1 detection, for free</b> (feature <code>n1-detect</code>)</summary>
 
-The classic anti-pattern — the same `query!` run once per row of a prior result,
-from the same source line — is detected and surfaced through `conn.n1_report()`
-with the offending SQL, file, line, and count. Diagnostics-only (never batches,
-blocks, or alters a result) and **zero-cost when off**: a production build
-compiles no detector field, no branch, no `#[track_caller]` overhead. Same on
-PostgreSQL and SQLite.
+The bug ORMs quietly encourage — one query per row of a previous result. bsql
+catches it *for* you:
+
+```rust
+let authors = conn.query::<AllAuthors>(()).await?;
+for a in authors.iter() {
+    // one query per author, from the same source line — the anti-pattern
+    let books = conn.query::<BooksByAuthor>((a.id,)).await?;
+}
+
+if let Some(n1) = conn.n1_report() {
+    // N1Report { sql: "SELECT … FROM books WHERE author_id = $1",
+    //            file: "src/catalog.rs", line: 42, count: 250 }
+    eprintln!("N+1 at {}:{} ran {}×", n1.file, n1.line, n1.count);
+}
+```
+
+The same `query!` run 25+ times from the same call site *within one logical
+operation* is flagged and attributed to the exact source line (via
+`#[track_caller]`), with the SQL and repeat count. **Diagnostics-only** — it never
+batches, blocks, or alters a result, so a false positive is at most a spurious log.
+**Zero-cost when off** (the default): a production build compiles no detector field,
+no branch, no `#[track_caller]` cost — the query verbs stay byte-identical. One
+shared detector across PostgreSQL *and* SQLite.
 </details>
 
 <details>
 <summary><b>A migration that destroys data won't compile silently</b></summary>
 
-`DROP TABLE`, `ALTER TABLE … DROP COLUMN`, `DROP SCHEMA … CASCADE`, `TRUNCATE`,
-`DROP DATABASE` in a migration are a **build error** unless a co-located
-`-- bsql:ack-destructive` comment acknowledges the loss. Accidental data
-destruction is caught at compile time, not in production.
+A `DROP TABLE`, `ALTER TABLE … DROP COLUMN`, `DROP SCHEMA … CASCADE`, `TRUNCATE`, or
+`DROP DATABASE` in a migration is a **build error** — refused unless you acknowledge
+the data loss on the line above it:
+
+```sql
+-- migrations/0007_drop_legacy.sql
+-- bsql:ack-destructive
+DROP TABLE legacy_sessions;   -- compiles ONLY because of the ack line above
+```
+
+Without the `-- bsql:ack-destructive` line, `cargo build` fails and names the
+offending statement. So a `DROP` that slipped in during a rebase can't reach
+production silently — you either meant it (and said so) or you find out at build
+time. The check runs on the same migration AST the schema catalog is built from, and
+covers both directory migrations and a set baked into the binary with
+`embed_migrations!()`.
 </details>
 
 <details>
 <summary><b>Rust types generated from your migrations</b></summary>
 
-`CREATE TYPE mood AS ENUM ('happy','sad')` in a migration plus `bsql::user_types!()`
-generates `enum Mood { Happy, Sad }` — no derives, no hand-maintained name. Rename
-or delete a variant in a later migration and any code that named the old one stops
-compiling. Composites (`CREATE TYPE addr AS (...)`) generate a struct; domains are
-transparent to their base type. Drift is a build error, by construction — a
-capability no other Rust SQL library offers, because only bsql parses your
-migration set at build time.
+Declare a type in SQL, get a Rust type for it — no derive, no hand-written name, no
+drift:
+
+```sql
+-- migrations/0003_types.sql
+CREATE TYPE mood AS ENUM ('happy', 'sad');
+```
+```rust
+bsql::user_types!();   // generates:  pub enum Mood { Happy, Sad }
+
+bsql::query!(GetMood, "SELECT mood FROM users WHERE id = $1");
+let m: Mood = conn.query_one::<GetMood>((1_i32,)).await?.mood;
+```
+
+Rename or delete a variant in a later migration and **every use of the old name
+stops compiling** — drift is a build error, by construction. Enum evolution
+(`ALTER TYPE … ADD VALUE` / `RENAME VALUE`) is replayed so the generated enum always
+matches the files, and variant order mirrors PostgreSQL's, so the derived `Ord`
+matches the server's sort. Composites (`CREATE TYPE addr AS (...)`) generate a
+`struct`; domains are transparent to their base type. No other Rust SQL library does
+this — only bsql parses your migration set at build time.
 </details>
 
 <details>
 <summary><b>Safe-by-construction bulk load — typed binary <code>COPY</code></b></summary>
 
-`copy!(Ins, "table", (cols))` validates the target table + columns + types against
-the same catalog `query!` reads, then `copy_in_typed::<Ins>(rows)` streams each row
-as a *binary* `COPY` in constant memory. No text to mis-escape (the classic `COPY`
-footgun), injection-safe by construction, and faster than the text path on both
-sides. The raw text `copy_in` stays as the escape hatch.
+The raw text `COPY` path is the classic footgun: you hand-format the data, and one
+mis-escaped tab or newline silently corrupts a row. `copy!` removes the text
+entirely:
+
+```rust
+copy!(LoadUsers, "users", (id, email));    // validated against the catalog
+
+conn.copy_in_typed::<LoadUsers>(
+    people.iter().map(|p| (p.id, p.email.as_str()))    // one typed tuple per row
+).await?;
+```
+
+`copy!` checks the target table, columns and their types against the same catalog
+`query!` reads; `copy_in_typed` then streams each row as a *binary* `COPY` in
+constant memory. A wrong column type or arity is a **compile error**; an embedded
+tab / newline / quote rides the binary field verbatim (nothing to mis-escape); and
+it is faster than the text path on both client and server. The raw `copy_in` stays
+as the escape hatch for pre-formatted data.
 </details>
 
 <details>
@@ -181,53 +238,98 @@ async fn creates_a_user(conn: &mut bsql::pg::Connection) {
 }   // schema auto-dropped, even if the test panics
 ```
 
-Each test runs in its own freshly-created PostgreSQL schema (a `CREATE SCHEMA`, not
-a whole database), so `cargo test`'s default parallelism never leaks state — and
-teardown runs even on panic. Works over the async *and* the blocking driver (the
-attribute picks by `async`-ness).
+Each test runs in its own freshly-created PostgreSQL schema (a `CREATE SCHEMA`, not a
+whole database — so it's sub-millisecond, not a per-test database spin-up), so
+`cargo test`'s default parallelism never leaks state between tests. The isolation
+rides the connect-time `search_path`, which survives a pool's `RESET ALL`, so a
+pooled connection can't escape its schema. Teardown runs even if the test panics
+(the schema is dropped in a `catch_unwind`, then the panic re-raised, so
+`#[should_panic]` still works). Write a plain `fn` taking `&mut bsql::pg_sync::Connection`
+and the same attribute gives you the blocking driver — it picks by `async`-ness.
 </details>
 
 <details>
 <summary><b>Migrations, applied at runtime — atomic, ordered, exactly-once</b></summary>
 
-`conn.run_migrations(source)` applies your set to a live database on all three
-drivers, exactly once and in order, tracked in a `_bsql_migrations` ledger. Each
-migration + its ledger row is one transaction; a failure rolls back and stops with
-a classified error. An edited-after-apply migration (checksum drift), a reorder, or
-a delete is a classified error — never silently re-run. Concurrent boots serialize
-(PostgreSQL via a non-blocking advisory-lock poll that stays deadlock-free even with
-`CREATE INDEX CONCURRENTLY`; SQLite via `BEGIN IMMEDIATE` + a re-check).
+```rust
+let report = conn.run_migrations(
+    bsql::MigrationSource::directory("migrations")
+).await?;
+// report.applied — the migrations newly applied this run, in order
+```
+
+Applies your set to a live database on all three drivers, exactly once and in
+lexicographic order, tracked in a `_bsql_migrations` ledger. Each migration + its
+ledger row is **one transaction** — a failure rolls back and stops with a classified
+error naming it, later migrations untouched. An edited-after-apply migration
+(checksum drift), a reorder, or a deletion is a classified error, never silently
+re-run. Concurrent boots serialize: PostgreSQL via a non-blocking advisory-lock poll
+that stays deadlock-free even with `CREATE INDEX CONCURRENTLY`; SQLite via
+`BEGIN IMMEDIATE` + an in-transaction re-check. Or bake the set into the binary with
+`embed_migrations!()` — no filesystem at run time.
 </details>
 
 <details>
 <summary><b>Production-grade connection lifecycle</b></summary>
 
-Pooling with health-gated checkout, graceful shutdown (`Pool::close`), TCP
-keepalive, `max_lifetime` / `idle_timeout` reaping, `is_disconnect()`
-reconnect-vs-retry classification, server-side `statement_timeout`, and a
-client-side liveness window so a black-holed in-flight query is *bounded*, not a
-15-minute hang. Structured diagnostics via a dep-free `DiagEvent` sink (surface
-`RAISE NOTICE`, slow queries, pool stats, migration progress) — zero-cost when no
-sink is installed.
+```rust
+let pool = pg::Pool::builder(cfg, 16)
+    .max_lifetime(Some(Duration::from_secs(1800)))
+    .idle_timeout(Some(Duration::from_secs(300)))
+    .slow_query_threshold(Some(Duration::from_millis(100)))
+    .on_diagnostic(|ev| tracing::info!(?ev))   // RAISE NOTICE, slow queries, pool stats…
+    .build();
+
+match conn.query_one::<GetUser>((id,)).await {
+    Err(e) if e.is_disconnect() => reconnect(),  // connection died → reconnect
+    Err(e) => return Err(e),                      // query error → the connection is fine
+    Ok(u)  => u,
+}
+```
+
+Health-gated checkout (a peer that died while idle is swapped transparently, and
+`get()` stays *bounded* even on a half-open socket, never the ~15-minute kernel
+hang), graceful shutdown (`Pool::close` sends a clean `Terminate` — no server
+error-log flood), TCP keepalive, `max_lifetime` / `idle_timeout` reaping,
+`is_disconnect()` reconnect-vs-retry classification, server-side `statement_timeout`,
+and a client-side liveness window so a black-holed in-flight query is bounded too.
+Diagnostics ride a dep-free `DiagEvent` sink — **zero-cost when none is installed**
+(no clock read, no event built, hot path untouched).
 </details>
 
 <details>
 <summary><b>Bring your own types — external-crate bridges</b></summary>
 
-`query!` can decode a column straight into `chrono::DateTime`, `uuid::Uuid`,
-`serde_json::Value`, or any type you like, with bsql depending on and forcing
-*nothing*: your `build.rs` registers `.bridge(pg_type, target, converter)` and you
-supply one infallible free-function converter. The orphan-proof seam.
+Decode a column straight into a foreign crate's type, with bsql depending on and
+forcing *nothing*:
+
+```rust
+// build.rs
+bsql_build::Catalog::from_migrations("migrations")
+    .bridge("timestamptz", "chrono::DateTime<chrono::Utc>", "crate::to_chrono")
+    .emit()?;
+```
+```rust
+// your one infallible converter — the orphan-proof seam
+pub fn to_chrono(ts: bsql::Timestamptz) -> chrono::DateTime<chrono::Utc> { /* … */ }
+```
+
+Now a `timestamptz` column in any `query!` decodes as `chrono::DateTime<Utc>`. The
+target type and converter travel as *strings*, so `bsql-build` gains no dependency on
+`chrono`. You can't `impl bsql::Cell for chrono::DateTime` (both are foreign — E0117),
+but a free function compiles for any foreign target — so this works for `uuid::Uuid`,
+`serde_json::Value`, `rust_decimal`, anything.
 </details>
 
 ## How it compares
 
 Speed is half the story; the other half is what the driver lets you *do*. An honest
-side-by-side with the Rust field — competitors get credit for what they have (✅ full,
-◐ partial, ❌ none).
+side-by-side with the Rust field — competitors get credit for what they have.
 
 <details>
 <summary><b>Capability matrix — bsql vs tokio-postgres / sqlx / diesel</b></summary>
+
+Legend: ✅ full · ◐ partial · ❌ none.
 
 | capability | bsql | tokio-postgres | sqlx | diesel |
 |---|:---:|:---:|:---:|:---:|
