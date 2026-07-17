@@ -22,7 +22,9 @@ don't have to trust the tables — [reproduce them](#reproduce-it-yourself).
 - **Device:** Apple-silicon laptop (M-series), macOS, `aarch64-apple-darwin`.
 - **Servers:** PostgreSQL **15.14** (Homebrew), loopback TCP, trust auth; SQLite via
   the **bundled amalgamation** (one file DB), one connection per client.
-- **Toolchains:** rustc **1.97.0**, Go **1.26.5**, Apple clang.
+- **Toolchains:** rustc **1.97.0** (stable; this bench is an independent `git`-dep
+  project — the library itself pins **1.96.0** for its diagnostic goldens), Go
+  **1.26.5**, Apple clang.
 - **Max-performance build flags** (every client, so nobody is handicapped):
 
   | language | flags |
@@ -56,15 +58,16 @@ better. **Bold** = fastest in the row; the `<kbd>xN</kbd>` factor is relative to
 | JOIN + GROUP BY | **2.99 ms** <kbd>x1</kbd> | 3.01 ms <kbd>x1.0</kbd> | 3.04 ms <kbd>x1.0</kbd> | 3.03 ms <kbd>x1.0</kbd> | 3.05 ms <kbd>x1.0</kbd> | 3.03 ms <kbd>x1.0</kbd> | 3.05 ms <kbd>x1.0</kbd> |
 
 ### PostgreSQL — peak memory
+Bytes from [`results/pg_rss.log`](results/pg_rss.log) ÷ 10⁶ (decimal MB).
 | client | peak RSS |
 |---|---|
-| bsql (sync) | **1.56 MB** <kbd>x1</kbd> |
-| bsql | 1.78 MB <kbd>x1.1</kbd> |
-| tokio-postgres | 6.22 MB <kbd>x4.0</kbd> |
-| sqlx | 6.41 MB <kbd>x4.1</kbd> |
-| diesel | 6.98 MB <kbd>x4.5</kbd> |
-| C/libpq | 13.27 MB <kbd>x8.5</kbd> |
-| Go/pgx | 17.43 MB <kbd>x11.2</kbd> |
+| bsql (sync) | **1.69 MB** <kbd>x1</kbd> |
+| bsql | 1.80 MB <kbd>x1.1</kbd> |
+| tokio-postgres | 6.50 MB <kbd>x3.9</kbd> |
+| sqlx | 6.73 MB <kbd>x4.0</kbd> |
+| diesel | 7.01 MB <kbd>x4.2</kbd> |
+| C/libpq | 13.25 MB <kbd>x7.9</kbd> |
+| Go/pgx | 16.81 MB <kbd>x10.0</kbd> |
 
 **Read it right.** C/libpq and bsql (sync) are *blocking* clients; Go/pgx blocks a
 goroutine; the async Rust clients run on a tokio **current-thread** runtime (equally).
@@ -72,9 +75,9 @@ The true apples-to-apples comparison is **blocking-vs-blocking — bsql (sync) v
 and bsql wins every read** (ties INSERT). bsql (async) is within ~1 µs of C on point
 reads (the reactor poll/park/wake an async runtime pays over a would-block read, which
 a blocking client does not) and *faster* on larger results — and it is the fastest
-*async* driver here by a wide margin. On memory bsql is the **leanest, period** — a
-committed `rss_ceiling` gate fails if its peak exceeds 2 MiB, so the sub-2 MB figure is
-enforced, not aspirational. (Beating C's RSS is real: libpq links its full client
+*async* driver here by a wide margin. On memory bsql is the **leanest in the PostgreSQL
+field** — a committed `rss_ceiling` gate fails if its peak exceeds 2 MiB, so the sub-2 MB
+figure is enforced, not aspirational. (Beating C's RSS is real: libpq links its full client
 dependency set — TLS, ICU — while bsql holds a fixed ~4 KiB engine buffer + 16-byte
 row handles.)
 
@@ -155,15 +158,21 @@ the gap amortizes as N grows).
 
 ## Reproduce it yourself
 
+Prerequisites: a Rust toolchain, Go, a C compiler with `pg_config` on `PATH`, and (for
+the PostgreSQL half) a local PostgreSQL you can reach. Both scripts use only paths
+**relative to this repo** — no machine-specific editing needed; override the PG
+connection with the standard `PGHOST` / `PGUSER` / `PGDATABASE` / `PGPORT` env vars.
+
 ```bash
 git switch bench
 
-# --- PostgreSQL (needs a local PG; user/db in scripts/xlang_measure.sh) ---
+# --- PostgreSQL (needs a local PG reachable at $PGHOST) ---
 psql -h 127.0.0.1 -U "$USER" -d postgres -f setup/pg_setup.sql   # seed once
-scripts/xlang_measure.sh                                          # all 7 clients, latency + RSS
+scripts/xlang_measure.sh all         # build all 7 clients + latency + RSS
+# (or: scripts/xlang_measure.sh build | latency | rss  — one phase at a time)
 
 # --- SQLite (self-contained; seeds a local bench.db) ---
-scripts/xlang_measure_sqlite.sh all                               # build + latency + RSS
+scripts/xlang_measure_sqlite.sh all  # build + latency + RSS
 
 # --- or just the bsql side under criterion ---
 cargo bench --bench e2e
@@ -171,7 +180,9 @@ cargo bench --bench e2e
 
 Each `scripts/*_measure*.sh` builds every client with the max-perf flags above, runs
 one client at a time (quiet machine), and prints the `LAT` / `SKIP` / `RSS` lines the
-tables are built from.
+tables are built from. The exact outputs of the runs behind the tables above are
+committed under [`results/`](results/) (see [`results/README.md`](results/README.md) for
+which log backs which table, and how to re-derive any cell).
 
 ## Further measurements (designed, being added)
 
@@ -185,7 +196,8 @@ competitor structurally lacks:
   bsql's `query_each` holds O(1) RAM with **0 alloc/row**; diesel's `load()` and libpq's
   `PQexec` are O(rows); even the streaming competitors pay a per-row allocation bsql does
   not.
-- **Typed binary COPY — 1M rows** — rows/s + MB/s + peak RSS (diesel has no COPY at all).
+- **Typed binary COPY — 1M rows** — rows/s + MB/s + peak RSS (diesel 2.2 has `copy_from`
+  incl. binary, but not a *compile-checked, typed* COPY like bsql's `copy!`).
 - **Transaction round-trip fusion** — RTTs per small transaction (loopback-relay counted)
   + txns/s, paired with an honest **pipelining control** where tokio-postgres's real
   pipelining is reported as the winner.
