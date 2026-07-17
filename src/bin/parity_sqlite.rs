@@ -93,14 +93,21 @@ fn bench_fetch_one_eager(conn: &Connection) -> Result<(), SqliteError> {
     Ok(())
 }
 
+/// N-row scan through the EXPLICIT reusable prepared handle — one compiled
+/// statement reused across the loop, matching every competitor's idiom (they all
+/// prepare-once-and-reuse) and the "prepared once and reused" the methodology
+/// states. This is the apples-to-apples cell; bsql's separate zero-copy STREAMING
+/// path (per-call-prepare, `sqlite_fetch_one`) and its constant-memory property
+/// are shown elsewhere (the deep-benchmark streaming section).
 fn bench_fetch_many(conn: &Connection, limit: i64) -> Result<(), SqliteError> {
     let sql = "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT ?1";
     let p = [ValueRef::Integer(limit)];
-    conn.query_each_params(sql, &p, |r| touch_all(&r))?; // warm up
+    let mut stmt = conn.prepare_sql(sql)?;
+    stmt.query_each(&p, |r| touch_all(&r))?; // warm up
     let iters = if limit >= 10_000 { ITERS_BIG } else { ITERS_DEFAULT };
     let start = Instant::now();
     for _ in 0..iters {
-        if let Some(e) = conn.query_each_params(black_box(sql), &p, |r| touch_all(&r))? {
+        if let Some(e) = stmt.query_each(black_box(&p), |r| touch_all(&r))? {
             return Err(e);
         }
     }
@@ -158,10 +165,11 @@ fn bench_insert_single(conn: &Connection) -> Result<(), SqliteError> {
         ValueRef::Text(b"bench_insert"),
         ValueRef::Text(b"bench@example.com"),
     ];
-    conn.query_each_params(sql, &p, |r| touch_all(&r))?; // warm up (reads id)
+    let mut stmt = conn.prepare_sql(sql)?; // reuse one compiled INSERT … RETURNING
+    stmt.query_each(&p, |r| touch_all(&r))?; // warm up (reads id)
     let start = Instant::now();
     for _ in 0..ITERS_DEFAULT {
-        if let Some(e) = conn.query_each_params(black_box(sql), &p, |r| touch_all(&r))? {
+        if let Some(e) = stmt.query_each(black_box(&p), |r| touch_all(&r))? {
             return Err(e);
         }
     }
@@ -219,10 +227,11 @@ fn bench_join_aggregate(conn: &Connection) -> Result<(), SqliteError> {
 fn bench_subquery(conn: &Connection) -> Result<(), SqliteError> {
     let sql = "SELECT id, name, email FROM bench_users \
                WHERE id IN (SELECT user_id FROM bench_orders WHERE amount > 500 LIMIT 100)";
-    conn.query_each_sql(sql, |r| touch_all(&r))?; // warm up
+    let mut stmt = conn.prepare_sql(sql)?; // reuse one compiled statement (parameterless)
+    stmt.query_each(&[], |r| touch_all(&r))?; // warm up
     let start = Instant::now();
     for _ in 0..ITERS_SUBQUERY {
-        if let Some(e) = conn.query_each_sql(black_box(sql), |r| touch_all(&r))? {
+        if let Some(e) = stmt.query_each(&[], |r| touch_all(&r))? {
             return Err(e);
         }
     }

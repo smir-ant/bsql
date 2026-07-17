@@ -98,23 +98,25 @@ everywhere?"*
 ## SQLite
 
 bsql's SQLite driver wraps the **same bundled engine** C links (3.50.2), so C is the
-*engine-identical* reference — any C↔bsql gap is pure wrapper cost. Competitors that
-can't express a bsql-only API variant emit a `SKIP` (never an invented number); the
-apples-to-apples cells are the **prepared-reuse** rows (both sides reuse one compiled
-statement).
+*engine-identical* reference — any C↔bsql gap is pure wrapper cost. Every read reuses
+**one compiled prepared statement** (the "prepared once and reused" the methodology
+states — bsql through its explicit `prepare_sql` handle, matching every competitor's
+idiom), so all cells are apples-to-apples. bsql's separate zero-copy *streaming* path and
+its constant-memory property are measured under [Deeper benchmarks](#deeper-benchmarks),
+not here.
 
-### SQLite — latency (µs, lower better)
+### SQLite — latency (µs, median of 3, lower better)
 | scenario | bsql | C/sqlite3 | diesel | Go/mattn | sqlx |
 |---|---|---|---|---|---|
-| by-PK (prepared) | 1.56 <kbd>x1.0</kbd> | **1.53** <kbd>x1</kbd> | 1.89 <kbd>x1.2</kbd> | 3.20 <kbd>x2.1</kbd> | 5.96 <kbd>x3.9</kbd> |
-| 10 rows (prepared) | **4.78** <kbd>x1</kbd> | 5.81 <kbd>x1.2</kbd> | 9.92 <kbd>x2.1</kbd> | 9.65 <kbd>x2.0</kbd> | 13.4 <kbd>x2.8</kbd> |
-| 100 rows | 15.7 <kbd>x1.1</kbd> | **14.3** <kbd>x1</kbd> | 30.0 <kbd>x2.1</kbd> | 69.3 <kbd>x4.8</kbd> | 104.4 <kbd>x7.3</kbd> |
-| 1000 rows | 107.8 <kbd>x1.1</kbd> | **97.5** <kbd>x1</kbd> | 225.5 <kbd>x2.3</kbd> | 656.5 <kbd>x6.7</kbd> | 1.42 ms <kbd>x14.5</kbd> |
-| 10000 rows | 1.02 ms <kbd>x1.1</kbd> | **938.1** <kbd>x1</kbd> | 2.21 ms <kbd>x2.4</kbd> | 6.67 ms <kbd>x7.1</kbd> | 14.53 ms <kbd>x15.5</kbd> |
-| INSERT single | 22.6 <kbd>x1.2</kbd> | **19.0** <kbd>x1</kbd> | 21.3 <kbd>x1.1</kbd> | 23.8 <kbd>x1.3</kbd> | 27.4 <kbd>x1.4</kbd> |
-| INSERT batch (100) | **900.8** <kbd>x1</kbd> | 1.07 ms <kbd>x1.2</kbd> | 1.09 ms <kbd>x1.2</kbd> | 1.14 ms <kbd>x1.3</kbd> | 1.60 ms <kbd>x1.8</kbd> |
-| Subquery | 29.6 <kbd>x1.1</kbd> | **26.4** <kbd>x1</kbd> | 42.1 <kbd>x1.6</kbd> | 66.3 <kbd>x2.5</kbd> | 109.5 <kbd>x4.1</kbd> |
-| JOIN + aggregate | 33.34 ms <kbd>x1.0</kbd> | 33.62 ms <kbd>x1.0</kbd> | 33.42 ms <kbd>x1.0</kbd> | **33.27 ms** <kbd>x1</kbd> | 33.45 ms <kbd>x1.0</kbd> |
+| by-PK (prepared) | 1.6 <kbd>x1.1</kbd> | **1.5** <kbd>x1</kbd> | 1.9 <kbd>x1.3</kbd> | 3.3 <kbd>x2.2</kbd> | 6.3 <kbd>x4.2</kbd> |
+| 10 rows (prepared) | **4.8** <kbd>x1</kbd> | 6.0 <kbd>x1.3</kbd> | 10.0 <kbd>x2.1</kbd> | 10.0 <kbd>x2.1</kbd> | 13.9 <kbd>x2.9</kbd> |
+| 100 rows (prepared) | **13.9** <kbd>x1</kbd> | 14.6 <kbd>x1.1</kbd> | 30.0 <kbd>x2.2</kbd> | 71.7 <kbd>x5.2</kbd> | 110.4 <kbd>x7.9</kbd> |
+| 1000 rows (prepared) | 104.5 <kbd>x1.1</kbd> | **98.4** <kbd>x1</kbd> | 226.5 <kbd>x2.3</kbd> | 676.3 <kbd>x6.9</kbd> | 1.43 ms <kbd>x14.5</kbd> |
+| 10000 rows (prepared) | 1.04 ms <kbd>x1.1</kbd> | **948** <kbd>x1</kbd> | 2.22 ms <kbd>x2.3</kbd> | 6.88 ms <kbd>x7.3</kbd> | 14.51 ms <kbd>x15.3</kbd> |
+| INSERT single (prepared) | 20.0 <kbd>x1.0</kbd> | **19.4** <kbd>x1</kbd> | 21.4 <kbd>x1.1</kbd> | 23.9 <kbd>x1.2</kbd> | 28.4 <kbd>x1.5</kbd> |
+| INSERT batch (100) | **980** <kbd>x1</kbd> | 1.09 ms <kbd>x1.1</kbd> | 1.19 ms <kbd>x1.2</kbd> | 1.21 ms <kbd>x1.2</kbd> | 1.68 ms <kbd>x1.7</kbd> |
+| Subquery (prepared) | 28.0 <kbd>x1.0</kbd> | **27.7** <kbd>x1</kbd> | 43.8 <kbd>x1.6</kbd> | 70.2 <kbd>x2.5</kbd> | 113.9 <kbd>x4.1</kbd> |
+| JOIN + aggregate | 35.40 ms <kbd>x1.0</kbd> | 35.29 ms <kbd>x1.0</kbd> | 35.27 ms <kbd>x1.0</kbd> | **34.71 ms** <kbd>x1</kbd> | 35.07 ms <kbd>x1.0</kbd> |
 
 ### SQLite — peak memory
 | client | peak RSS |
@@ -125,21 +127,23 @@ statement).
 | sqlx | 4.88 MB <kbd>x1.2</kbd> |
 | Go/mattn | 17.45 MB <kbd>x4.4</kbd> |
 
-**Read it right.** bsql rides at the **engine-identical C reference** (~1.0–1.2×
-across the board, *faster* than C on the 10-row and batch-insert cells) — its safe,
-typed, zero-per-row-alloc decode adds essentially nothing over raw `sqlite3_*` C. It
-is far ahead of the other Rust/Go options: **diesel** ~2× (query-builder + materialize),
-**Go/mattn** 2–7× (every column crosses the cgo boundary), **sqlx** 3–15× (it runs
-SQLite on a dedicated background thread + channel, so every query crosses a thread
-hop). RSS is a near-tie with C; only Go's runtime stands out (~17 MB).
+**Read it right.** bsql rides at the **engine-identical C reference** — it **ties or
+beats raw C** on all but two cells: *faster* than C on the 10-row, 100-row and batch-insert
+scenarios; within ~1–3 % on by-PK, INSERT and subquery; and only ~1.06–1.09× behind on the
+1000- and 10000-row scans, where the residual is **rusqlite's own per-cell safe-binding
+check** — the floor for a safe wrapper, unreachable without `unsafe` FFI. Its safe, typed,
+zero-per-row-alloc decode adds essentially nothing over raw `sqlite3_*` C. Far ahead of the
+other options: **diesel** ~2× (query-builder + materialize), **Go/mattn** 2–7× (every column
+crosses the cgo boundary), **sqlx** 3–15× (SQLite on a dedicated background thread + channel,
+so every query crosses a thread hop). RSS is a near-tie with C; only Go's runtime stands out
+(~17 MB).
 
 †Footnotes: sqlx's compile-time SQL check needs a live DB or a committed offline cache
 (bsql validates offline from migration files); diesel is a query-builder **DSL** (the
-aggregate/subquery drop to raw `sql_query`) and its default `load()` materializes into
-a `Vec` (no zero-per-row-alloc streaming). The `fetch_many/{100,1000,10000}` cells have
-competitors reuse a prepared statement while bsql's *streaming* path per-call-prepares
-(the honest prepared-vs-prepared cells are `by-PK (prepared)` and `10 rows (prepared)`;
-the gap amortizes as N grows).
+aggregate/subquery drop to raw `sql_query`) and its default `load()` materializes into a
+`Vec` (no zero-per-row-alloc streaming). Every read cell reuses one compiled statement on
+both sides (bsql via its `prepare_sql` handle), so the comparison is prepared-vs-prepared
+throughout.
 
 ---
 

@@ -1,217 +1,256 @@
-bsql === rebuild bsql (bundled SQLite) Benchmarks ===
-bsql path=/Users/smir-ant/Code/bsql-bench-wt/bench.db
-bsql 
-bsql sqlite_fetch_one: 3819 ns/op  (10000 iters)	KV	sqlite_fetch_one	3819	10000
-bsql sqlite_fetch_one_eager: 2202 ns/op  (10000 iters)	KV	sqlite_fetch_one_eager	2202	10000
-bsql by_pk_prepared: 1561 ns/op  (10000 iters)	KV	by_pk_prepared	1561	10000
-bsql sqlite_fetch_many/10: 6681 ns/op  (10000 iters)	KV	sqlite_fetch_many/10	6681	10000
-bsql 10row_prepared: 7400 ns/op  (10000 iters)	KV	10row_prepared	7400	10000
-bsql sqlite_fetch_many/100: 15943 ns/op  (10000 iters)	KV	sqlite_fetch_many/100	15943	10000
-bsql sqlite_fetch_many/1000: 107757 ns/op  (10000 iters)	KV	sqlite_fetch_many/1000	107757	10000
-bsql sqlite_fetch_many/10000: 1022011 ns/op  (1000 iters)	KV	sqlite_fetch_many/10000	1022011	1000
-bsql sqlite_join_aggregate: 35029827 ns/op  (300 iters)	KV	sqlite_join_aggregate	35029827	300
-bsql sqlite_subquery: 30144 ns/op  (5000 iters)	KV	sqlite_subquery	30144	5000
-bsql sqlite_insert_single: 23703 ns/op  (10000 iters)	KV	sqlite_insert_single	23703	10000
-bsql sqlite_insert_batch/100: 900798 ns/op  (1000 iters)	KV	sqlite_insert_batch/100	900798	1000
-c VERSION sqlite3 3.50.2
-c SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-c SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-c SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
-c LAT by_pk_prepared 1552
-c LAT 10row_prepared 5888
-c LAT sqlite_fetch_many/100 14451
-c LAT sqlite_fetch_many/1000 97619
-c LAT sqlite_fetch_many/10000 935613
-c LAT sqlite_join_aggregate 33844130
-c LAT sqlite_subquery 26400
-c LAT sqlite_insert_single 19081
-c LAT sqlite_insert_batch/100 1038360
-go VERSION mattn/go-sqlite3 v1.14.24
-go VERSION sqlite 3.46.1
-go SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-go SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-go SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
-go LAT by_pk_prepared 3216
-go LAT 10row_prepared 9646
-go LAT sqlite_fetch_many/100 69187
-go LAT sqlite_fetch_many/1000 655730
-go LAT sqlite_fetch_many/10000 6639354
-go LAT sqlite_join_aggregate 33264774
-go LAT sqlite_subquery 66158
-go LAT sqlite_insert_single 23517
-go LAT sqlite_insert_batch/100 1083385
-sqlx VERSION sqlx-sqlite 0.8
-sqlx VERSION sqlite 3.46.0
-sqlx SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-sqlx SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-sqlx SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
-sqlx LAT by_pk_prepared 6005
-sqlx LAT 10row_prepared 13502
-sqlx LAT sqlite_fetch_many/100 104800
-sqlx LAT sqlite_fetch_many/1000 1412711
-sqlx LAT sqlite_fetch_many/10000 14546410
-sqlx LAT sqlite_join_aggregate 33422042
-sqlx LAT sqlite_subquery 109875
-sqlx LAT sqlite_insert_single 27446
-sqlx LAT sqlite_insert_batch/100 1594649
-diesel VERSION diesel-sqlite 2.2
-diesel VERSION sqlite 3.50.2
-diesel SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-diesel SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-diesel SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
-diesel LAT by_pk_prepared 1870
-diesel LAT 10row_prepared 9823
-diesel LAT sqlite_fetch_many/100 29690
-diesel LAT sqlite_fetch_many/1000 224565
-diesel LAT sqlite_fetch_many/10000 2171949
-diesel LAT sqlite_join_aggregate 33422654
-diesel LAT sqlite_subquery 42016
-diesel LAT sqlite_insert_single 21676
-diesel LAT sqlite_insert_batch/100 1069295
-bsql === rebuild bsql (bundled SQLite) Benchmarks ===
-bsql path=/Users/smir-ant/Code/bsql-bench-wt/bench.db
-bsql 
-bsql sqlite_fetch_one: 2751 ns/op  (10000 iters)	KV	sqlite_fetch_one	2751	10000
-bsql sqlite_fetch_one_eager: 1996 ns/op  (10000 iters)	KV	sqlite_fetch_one_eager	1996	10000
-bsql by_pk_prepared: 1533 ns/op  (10000 iters)	KV	by_pk_prepared	1533	10000
-bsql sqlite_fetch_many/10: 6601 ns/op  (10000 iters)	KV	sqlite_fetch_many/10	6601	10000
-bsql 10row_prepared: 4684 ns/op  (10000 iters)	KV	10row_prepared	4684	10000
-bsql sqlite_fetch_many/100: 15691 ns/op  (10000 iters)	KV	sqlite_fetch_many/100	15691	10000
-bsql sqlite_fetch_many/1000: 106994 ns/op  (10000 iters)	KV	sqlite_fetch_many/1000	106994	10000
-bsql sqlite_fetch_many/10000: 1015823 ns/op  (1000 iters)	KV	sqlite_fetch_many/10000	1015823	1000
-bsql sqlite_join_aggregate: 33326009 ns/op  (300 iters)	KV	sqlite_join_aggregate	33326009	300
-bsql sqlite_subquery: 29524 ns/op  (5000 iters)	KV	sqlite_subquery	29524	5000
-bsql sqlite_insert_single: 22453 ns/op  (10000 iters)	KV	sqlite_insert_single	22453	10000
-bsql sqlite_insert_batch/100: 900142 ns/op  (1000 iters)	KV	sqlite_insert_batch/100	900142	1000
-c VERSION sqlite3 3.50.2
-c SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-c SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-c SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
-c LAT by_pk_prepared 1514
-c LAT 10row_prepared 5800
-c LAT sqlite_fetch_many/100 14244
-c LAT sqlite_fetch_many/1000 96785
-c LAT sqlite_fetch_many/10000 941746
-c LAT sqlite_join_aggregate 33619190
-c LAT sqlite_subquery 26316
-c LAT sqlite_insert_single 18885
-c LAT sqlite_insert_batch/100 1070456
-go VERSION mattn/go-sqlite3 v1.14.24
-go VERSION sqlite 3.46.1
-go SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-go SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-go SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
-go LAT by_pk_prepared 3143
-go LAT 10row_prepared 9609
-go LAT sqlite_fetch_many/100 69326
-go LAT sqlite_fetch_many/1000 656481
-go LAT sqlite_fetch_many/10000 6667130
-go LAT sqlite_join_aggregate 33274955
-go LAT sqlite_subquery 66536
-go LAT sqlite_insert_single 23844
-go LAT sqlite_insert_batch/100 1147693
-sqlx VERSION sqlx-sqlite 0.8
-sqlx VERSION sqlite 3.46.0
-sqlx SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-sqlx SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-sqlx SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
-sqlx LAT by_pk_prepared 5886
-sqlx LAT 10row_prepared 13439
-sqlx LAT sqlite_fetch_many/100 103504
-sqlx LAT sqlite_fetch_many/1000 1414862
-sqlx LAT sqlite_fetch_many/10000 14502347
-sqlx LAT sqlite_join_aggregate 33454335
-sqlx LAT sqlite_subquery 109110
-sqlx LAT sqlite_insert_single 27282
-sqlx LAT sqlite_insert_batch/100 1650875
-diesel VERSION diesel-sqlite 2.2
-diesel VERSION sqlite 3.50.2
-diesel SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-diesel SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-diesel SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
-diesel LAT by_pk_prepared 1891
-diesel LAT 10row_prepared 9916
-diesel LAT sqlite_fetch_many/100 30002
-diesel LAT sqlite_fetch_many/1000 225497
-diesel LAT sqlite_fetch_many/10000 2207975
-diesel LAT sqlite_join_aggregate 33337590
-diesel LAT sqlite_subquery 42767
-diesel LAT sqlite_insert_single 21104
-diesel LAT sqlite_insert_batch/100 1094089
-bsql === rebuild bsql (bundled SQLite) Benchmarks ===
-bsql path=/Users/smir-ant/Code/bsql-bench-wt/bench.db
-bsql 
-bsql sqlite_fetch_one: 2725 ns/op  (10000 iters)	KV	sqlite_fetch_one	2725	10000
-bsql sqlite_fetch_one_eager: 2043 ns/op  (10000 iters)	KV	sqlite_fetch_one_eager	2043	10000
-bsql by_pk_prepared: 1558 ns/op  (10000 iters)	KV	by_pk_prepared	1558	10000
-bsql sqlite_fetch_many/10: 6690 ns/op  (10000 iters)	KV	sqlite_fetch_many/10	6690	10000
-bsql 10row_prepared: 4775 ns/op  (10000 iters)	KV	10row_prepared	4775	10000
-bsql sqlite_fetch_many/100: 15693 ns/op  (10000 iters)	KV	sqlite_fetch_many/100	15693	10000
-bsql sqlite_fetch_many/1000: 107823 ns/op  (10000 iters)	KV	sqlite_fetch_many/1000	107823	10000
-bsql sqlite_fetch_many/10000: 1021922 ns/op  (1000 iters)	KV	sqlite_fetch_many/10000	1021922	1000
-bsql sqlite_join_aggregate: 33343785 ns/op  (300 iters)	KV	sqlite_join_aggregate	33343785	300
-bsql sqlite_subquery: 29592 ns/op  (5000 iters)	KV	sqlite_subquery	29592	5000
-bsql sqlite_insert_single: 22647 ns/op  (10000 iters)	KV	sqlite_insert_single	22647	10000
-bsql sqlite_insert_batch/100: 928339 ns/op  (1000 iters)	KV	sqlite_insert_batch/100	928339	1000
-c VERSION sqlite3 3.50.2
-c SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-c SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-c SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
-c LAT by_pk_prepared 1526
-c LAT 10row_prepared 5812
-c LAT sqlite_fetch_many/100 14265
-c LAT sqlite_fetch_many/1000 97527
-c LAT sqlite_fetch_many/10000 938126
-c LAT sqlite_join_aggregate 33588150
-c LAT sqlite_subquery 26446
-c LAT sqlite_insert_single 19002
-c LAT sqlite_insert_batch/100 1086893
-go VERSION mattn/go-sqlite3 v1.14.24
-go VERSION sqlite 3.46.1
-go SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-go SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-go SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
-go LAT by_pk_prepared 3201
-go LAT 10row_prepared 9768
-go LAT sqlite_fetch_many/100 69886
-go LAT sqlite_fetch_many/1000 660267
-go LAT sqlite_fetch_many/10000 6678425
-go LAT sqlite_join_aggregate 33194602
-go LAT sqlite_subquery 66271
-go LAT sqlite_insert_single 24024
-go LAT sqlite_insert_batch/100 1142030
-sqlx VERSION sqlx-sqlite 0.8
-sqlx VERSION sqlite 3.46.0
-sqlx SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-sqlx SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-sqlx SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
-sqlx LAT by_pk_prepared 5955
-sqlx LAT 10row_prepared 13421
-sqlx LAT sqlite_fetch_many/100 104407
-sqlx LAT sqlite_fetch_many/1000 1429932
-sqlx LAT sqlite_fetch_many/10000 14529950
-sqlx LAT sqlite_join_aggregate 33601166
-sqlx LAT sqlite_subquery 109456
-sqlx LAT sqlite_insert_single 27505
-sqlx LAT sqlite_insert_batch/100 1603902
-diesel VERSION diesel-sqlite 2.2
-diesel VERSION sqlite 3.50.2
-diesel SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-diesel SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
-diesel SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
-diesel LAT by_pk_prepared 1910
-diesel LAT 10row_prepared 9987
-diesel LAT sqlite_fetch_many/100 29967
-diesel LAT sqlite_fetch_many/1000 226311
-diesel LAT sqlite_fetch_many/10000 2215827
-diesel LAT sqlite_join_aggregate 33426501
-diesel LAT sqlite_subquery 42119
-diesel LAT sqlite_insert_single 21252
-diesel LAT sqlite_insert_batch/100 1125144
-### RSS ###
-bsql PEAK_RSS_BYTES 4014080
-c RSS 3948544
-go RSS 17448960
-sqlx RSS 4882432
-diesel RSS 4259840
-SQLITE2_DONE
+########## PASS 1 ##########
+===== SQLite LATENCY (ns/op, 7-rep median) =====
+--- bsql (parity_sqlite) ---
+=== rebuild bsql (bundled SQLite) Benchmarks ===
+path=/Users/smir-ant/Code/bsql-bench-sq/bench.db
+
+sqlite_fetch_one: 4581 ns/op  (10000 iters)	KV	sqlite_fetch_one	4581	10000
+sqlite_fetch_one_eager: 2337 ns/op  (10000 iters)	KV	sqlite_fetch_one_eager	2337	10000
+by_pk_prepared: 1574 ns/op  (10000 iters)	KV	by_pk_prepared	1574	10000
+sqlite_fetch_many/10: 4650 ns/op  (10000 iters)	KV	sqlite_fetch_many/10	4650	10000
+10row_prepared: 4680 ns/op  (10000 iters)	KV	10row_prepared	4680	10000
+sqlite_fetch_many/100: 13709 ns/op  (10000 iters)	KV	sqlite_fetch_many/100	13709	10000
+sqlite_fetch_many/1000: 102784 ns/op  (10000 iters)	KV	sqlite_fetch_many/1000	102784	10000
+sqlite_fetch_many/10000: 996876 ns/op  (1000 iters)	KV	sqlite_fetch_many/10000	996876	1000
+sqlite_join_aggregate: 34005090 ns/op  (300 iters)	KV	sqlite_join_aggregate	34005090	300
+sqlite_subquery: 27789 ns/op  (5000 iters)	KV	sqlite_subquery	27789	5000
+sqlite_insert_single: 19276 ns/op  (10000 iters)	KV	sqlite_insert_single	19276	10000
+sqlite_insert_batch/100: 710682 ns/op  (1000 iters)	KV	sqlite_insert_batch/100	710682	1000
+--- C / sqlite3 (bundled 3.50.2) ---
+VERSION sqlite3 3.50.2
+SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
+LAT by_pk_prepared 1535
+LAT 10row_prepared 5906
+LAT sqlite_fetch_many/100 14283
+LAT sqlite_fetch_many/1000 96615
+LAT sqlite_fetch_many/10000 930036
+LAT sqlite_join_aggregate 33732670
+LAT sqlite_subquery 27455
+LAT sqlite_insert_single 19157
+LAT sqlite_insert_batch/100 931720
+--- Go / mattn ---
+VERSION mattn/go-sqlite3 v1.14.24
+VERSION sqlite 3.46.1
+SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
+LAT by_pk_prepared 3148
+LAT 10row_prepared 9647
+LAT sqlite_fetch_many/100 69466
+LAT sqlite_fetch_many/1000 655443
+LAT sqlite_fetch_many/10000 6674789
+LAT sqlite_join_aggregate 33431914
+LAT sqlite_subquery 67853
+LAT sqlite_insert_single 23492
+LAT sqlite_insert_batch/100 1093218
+--- Rust / sqlx ---
+VERSION sqlx-sqlite 0.8
+VERSION sqlite 3.46.0
+SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
+LAT by_pk_prepared 6360
+LAT 10row_prepared 13977
+LAT sqlite_fetch_many/100 110393
+LAT sqlite_fetch_many/1000 1431965
+LAT sqlite_fetch_many/10000 14512444
+LAT sqlite_join_aggregate 33673777
+LAT sqlite_subquery 111985
+LAT sqlite_insert_single 27850
+LAT sqlite_insert_batch/100 1538529
+--- Rust / diesel ---
+VERSION diesel-sqlite 2.2
+VERSION sqlite 3.50.2
+SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
+LAT by_pk_prepared 1913
+LAT 10row_prepared 10008
+LAT sqlite_fetch_many/100 29615
+LAT sqlite_fetch_many/1000 224185
+LAT sqlite_fetch_many/10000 2199028
+LAT sqlite_join_aggregate 35160169
+LAT sqlite_subquery 42986
+LAT sqlite_insert_single 20953
+LAT sqlite_insert_batch/100 1160800
+===== SQLite PEAK RSS (separate process per client) =====
+########## PASS 2 ##########
+===== SQLite LATENCY (ns/op, 7-rep median) =====
+--- bsql (parity_sqlite) ---
+=== rebuild bsql (bundled SQLite) Benchmarks ===
+path=/Users/smir-ant/Code/bsql-bench-sq/bench.db
+
+sqlite_fetch_one: 2816 ns/op  (10000 iters)	KV	sqlite_fetch_one	2816	10000
+sqlite_fetch_one_eager: 2023 ns/op  (10000 iters)	KV	sqlite_fetch_one_eager	2023	10000
+by_pk_prepared: 1530 ns/op  (10000 iters)	KV	by_pk_prepared	1530	10000
+sqlite_fetch_many/10: 4793 ns/op  (10000 iters)	KV	sqlite_fetch_many/10	4793	10000
+10row_prepared: 4769 ns/op  (10000 iters)	KV	10row_prepared	4769	10000
+sqlite_fetch_many/100: 13880 ns/op  (10000 iters)	KV	sqlite_fetch_many/100	13880	10000
+sqlite_fetch_many/1000: 105225 ns/op  (10000 iters)	KV	sqlite_fetch_many/1000	105225	10000
+sqlite_fetch_many/10000: 1076843 ns/op  (1000 iters)	KV	sqlite_fetch_many/10000	1076843	1000
+sqlite_join_aggregate: 35676474 ns/op  (300 iters)	KV	sqlite_join_aggregate	35676474	300
+sqlite_subquery: 28172 ns/op  (5000 iters)	KV	sqlite_subquery	28172	5000
+sqlite_insert_single: 19952 ns/op  (10000 iters)	KV	sqlite_insert_single	19952	10000
+sqlite_insert_batch/100: 979665 ns/op  (1000 iters)	KV	sqlite_insert_batch/100	979665	1000
+--- C / sqlite3 (bundled 3.50.2) ---
+VERSION sqlite3 3.50.2
+SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
+LAT by_pk_prepared 1530
+LAT 10row_prepared 5974
+LAT sqlite_fetch_many/100 14593
+LAT sqlite_fetch_many/1000 98426
+LAT sqlite_fetch_many/10000 947856
+LAT sqlite_join_aggregate 35285140
+LAT sqlite_subquery 27722
+LAT sqlite_insert_single 19428
+LAT sqlite_insert_batch/100 1087996
+--- Go / mattn ---
+VERSION mattn/go-sqlite3 v1.14.24
+VERSION sqlite 3.46.1
+SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
+LAT by_pk_prepared 3277
+LAT 10row_prepared 9979
+LAT sqlite_fetch_many/100 71660
+LAT sqlite_fetch_many/1000 676311
+LAT sqlite_fetch_many/10000 6878081
+LAT sqlite_join_aggregate 34714253
+LAT sqlite_subquery 70235
+LAT sqlite_insert_single 23854
+LAT sqlite_insert_batch/100 1210494
+--- Rust / sqlx ---
+VERSION sqlx-sqlite 0.8
+VERSION sqlite 3.46.0
+SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
+LAT by_pk_prepared 6110
+LAT 10row_prepared 13713
+LAT sqlite_fetch_many/100 107057
+LAT sqlite_fetch_many/1000 1412715
+LAT sqlite_fetch_many/10000 14498695
+LAT sqlite_join_aggregate 35070016
+LAT sqlite_subquery 113896
+LAT sqlite_insert_single 28383
+LAT sqlite_insert_batch/100 1678434
+--- Rust / diesel ---
+VERSION diesel-sqlite 2.2
+VERSION sqlite 3.50.2
+SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
+LAT by_pk_prepared 1878
+LAT 10row_prepared 9992
+LAT sqlite_fetch_many/100 29954
+LAT sqlite_fetch_many/1000 226455
+LAT sqlite_fetch_many/10000 2215771
+LAT sqlite_join_aggregate 35272625
+LAT sqlite_subquery 43783
+LAT sqlite_insert_single 21409
+LAT sqlite_insert_batch/100 1186195
+########## PASS 3 ##########
+===== SQLite LATENCY (ns/op, 7-rep median) =====
+--- bsql (parity_sqlite) ---
+=== rebuild bsql (bundled SQLite) Benchmarks ===
+path=/Users/smir-ant/Code/bsql-bench-sq/bench.db
+
+sqlite_fetch_one: 2787 ns/op  (10000 iters)	KV	sqlite_fetch_one	2787	10000
+sqlite_fetch_one_eager: 2033 ns/op  (10000 iters)	KV	sqlite_fetch_one_eager	2033	10000
+by_pk_prepared: 1550 ns/op  (10000 iters)	KV	by_pk_prepared	1550	10000
+sqlite_fetch_many/10: 4761 ns/op  (10000 iters)	KV	sqlite_fetch_many/10	4761	10000
+10row_prepared: 4800 ns/op  (10000 iters)	KV	10row_prepared	4800	10000
+sqlite_fetch_many/100: 13883 ns/op  (10000 iters)	KV	sqlite_fetch_many/100	13883	10000
+sqlite_fetch_many/1000: 104461 ns/op  (10000 iters)	KV	sqlite_fetch_many/1000	104461	10000
+sqlite_fetch_many/10000: 1037198 ns/op  (1000 iters)	KV	sqlite_fetch_many/10000	1037198	1000
+sqlite_join_aggregate: 35400613 ns/op  (300 iters)	KV	sqlite_join_aggregate	35400613	300
+sqlite_subquery: 27993 ns/op  (5000 iters)	KV	sqlite_subquery	27993	5000
+sqlite_insert_single: 22258 ns/op  (10000 iters)	KV	sqlite_insert_single	22258	10000
+sqlite_insert_batch/100: 984851 ns/op  (1000 iters)	KV	sqlite_insert_batch/100	984851	1000
+--- C / sqlite3 (bundled 3.50.2) ---
+VERSION sqlite3 3.50.2
+SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
+LAT by_pk_prepared 1544
+LAT 10row_prepared 5964
+LAT sqlite_fetch_many/100 14563
+LAT sqlite_fetch_many/1000 98402
+LAT sqlite_fetch_many/10000 950380
+LAT sqlite_join_aggregate 35663000
+LAT sqlite_subquery 27972
+LAT sqlite_insert_single 19728
+LAT sqlite_insert_batch/100 1121726
+--- Go / mattn ---
+VERSION mattn/go-sqlite3 v1.14.24
+VERSION sqlite 3.46.1
+SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
+LAT by_pk_prepared 3351
+LAT 10row_prepared 10053
+LAT sqlite_fetch_many/100 72973
+LAT sqlite_fetch_many/1000 685788
+LAT sqlite_fetch_many/10000 6933712
+LAT sqlite_join_aggregate 35089537
+LAT sqlite_subquery 70362
+LAT sqlite_insert_single 24561
+LAT sqlite_insert_batch/100 1264141
+--- Rust / sqlx ---
+VERSION sqlx-sqlite 0.8
+VERSION sqlite 3.46.0
+SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
+LAT by_pk_prepared 6303
+LAT 10row_prepared 13947
+LAT sqlite_fetch_many/100 123818
+LAT sqlite_fetch_many/1000 1457389
+LAT sqlite_fetch_many/10000 14801632
+LAT sqlite_join_aggregate 38427157
+LAT sqlite_subquery 154089
+LAT sqlite_insert_single 31658
+LAT sqlite_insert_batch/100 1961070
+--- Rust / diesel ---
+VERSION diesel-sqlite 2.2
+VERSION sqlite 3.50.2
+SKIP sqlite_fetch_one bsql_streaming_per-call-prepare_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_one_eager bsql_eager-cached_variant_of_by-PK;competitor_prepared-reuse=by_pk_prepared
+SKIP sqlite_fetch_many/10 bsql_per-call-prepare_streaming_10-row;competitor_prepared-reuse=10row_prepared
+LAT by_pk_prepared 2005
+LAT 10row_prepared 10413
+LAT sqlite_fetch_many/100 31561
+LAT sqlite_fetch_many/1000 264350
+LAT sqlite_fetch_many/10000 2234326
+LAT sqlite_join_aggregate 36810904
+LAT sqlite_subquery 44941
+LAT sqlite_insert_single 28207
+LAT sqlite_insert_batch/100 1795734
+########## PEAK RSS (pass 1) ##########
+===== SQLite PEAK RSS (separate process per client) =====
+--- bsql (parity_sqlite) ---
+SKIP bsql-sqlite-rss parity_sqlite_has_no_rss_mode(add_a_bsql_rss_binary_like_the_PG_side)
+--- C / sqlite3 (bundled 3.50.2) ---
+VERSION sqlite3 3.50.2
+RSS 3964928
+PEAK_RSS 3.78
+--- Go / mattn ---
+VERSION mattn/go-sqlite3 v1.14.24
+VERSION sqlite 3.46.1
+RSS 17809408
+PEAK_RSS 16.98
+--- Rust / sqlx ---
+VERSION sqlx-sqlite 0.8
+VERSION sqlite 3.46.0
+RSS 4849664
+PEAK_RSS 4.62
+--- Rust / diesel ---
+VERSION diesel-sqlite 2.2
+VERSION sqlite 3.50.2
+RSS 4259840
+PEAK_RSS 4.06
+===== MEASURE_DONE =====
