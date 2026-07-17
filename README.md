@@ -398,9 +398,9 @@ adversarially before it landed.
 ~2,400 tests across the workspace — unit, integration, compile-fail (`trybuild`),
 live-database, dependency-free fuzz, and machine-checked codegen gates. Not just
 tests that the code works, but tests that *broken* code is rejected at compile
-time. The whole thing went through nine successive deep audits and a real-load
-fault-injection pass (TLS byte-fragmentation, mid-stream faults, million-row
-streams, concurrency) — the sort of thing that catches what green unit tests hide.
+time. Hardened by a real-load fault-injection pass (TLS byte-fragmentation,
+mid-stream faults, million-row streams, concurrency) — the sort of thing that
+catches what green unit tests hide.
 
 Don't follow the author's name. Don't assume an older library is automatically the
 safer bet. Run the benchmarks yourself, read the tests, check the code.

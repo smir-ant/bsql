@@ -34,7 +34,7 @@ rusqlite = { workspace = true }
 # lean and `runtime_graph_pin` stays green. The `BEGIN IMMEDIATE` apply loop
 # (SQLite-only I/O) and this crate's own `MigrationError` stay here, bridged
 # through the shared `migrate::plan()` seam + a local `From<migrate::Drift>`.
-bsql-common = { path = "../../common" }
+bsql-common = { version = "1.0.0-alpha.1", path = "../../common" }
 
 [dev-dependencies]
 # `trybuild` — pins the EXACT compiler diagnostic for the streaming

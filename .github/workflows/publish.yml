@@ -1,0 +1,64 @@
+# Publish-only release automation — NOT test CI.
+#
+# bsql runs its test/lint/gate wall LOCALLY via `cargo` + the `bsql-devgates`
+# crate (see CLAUDE.md "Build & test" / "Verification"); there is deliberately no
+# CI that builds or tests on push. This workflow does ONE thing: when a GitHub
+# Release is published, it publishes every shippable crate to crates.io in
+# dependency (topological) order.
+#
+# Requires the repository secret CRATES_IO_TOKEN (a crates.io API token with
+# publish scope). It is idempotent: a crate whose exact version is already on
+# crates.io is skipped, so a manual first publish followed by a Release (or a
+# re-run after a mid-sequence failure) never double-publishes.
+name: publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  crates-io:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the version; the first cargo call auto-installs it.
+      - name: Show toolchain
+        run: rustup show
+
+      - name: Publish shippable crates in topological order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -uo pipefail
+          # Dependency order: a crate appears only after everything it depends on.
+          crates="
+            bsql-common
+            bsql-postgres-proto
+            bsql-build
+            bsql-postgres-core
+            bsql-postgres-async
+            bsql-postgres-sync
+            bsql-sqlite
+            bsql-query-macros
+            bsql-testkit
+            bsql
+          "
+          for crate in $crates; do
+            echo "::group::publish $crate"
+            # `cargo publish` waits for the crate to appear in the index before
+            # returning (default since cargo 1.66), so the next crate resolves it.
+            if cargo publish -p "$crate" 2>&1 | tee /tmp/pub_out.txt; then
+              echo "published $crate"
+            elif grep -qiE "already (been )?(uploaded|published)|is already uploaded|already exists" /tmp/pub_out.txt; then
+              echo "$crate: this version is already on crates.io — skipping"
+            else
+              echo "::error::publish failed for $crate"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
