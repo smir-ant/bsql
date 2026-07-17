@@ -163,7 +163,7 @@ macro_rules! bench {
     }};
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
 

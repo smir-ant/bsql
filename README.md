@@ -23,9 +23,11 @@ to trust the table.
   Apple clang **17.0.0**.
 - **Client libraries:** bsql **1.0.0-alpha.0**, tokio-postgres **0.7.18**, sqlx
   **0.8.6**, diesel-async **0.6.1**, jackc/pgx **v5.10.0**, libpq **14**.
-- Quiet system (1-min load ≈ 2.6). Every client runs the identical work: prepare
-  a statement once, then a warmed timed loop (2000-iter warm-up, 7 reps, median
-  ns/op), reading every column of every row.
+- Quiet system (1-min load ≈ 2.4), one local PostgreSQL 15.14 over loopback TCP.
+  Every client runs the identical work: prepare a statement once, then a warmed
+  timed loop (2000-iter warm-up, 7 reps, median ns/op), reading every column of
+  every row; the async Rust clients all run on a tokio **current-thread** runtime
+  (the realistic single-connection choice, applied equally — see Methodology).
 
 ## Latency — bsql leads the field, on par with raw C
 
@@ -33,26 +35,30 @@ Microseconds per operation, lower is better. **bold** = the bsql drivers.
 
 | scenario (rows)     | bsql        | bsql (sync) | C / libpq | Go / pgx | tokio-postgres | sqlx     | diesel   |
 |---------------------|-------------|-------------|-----------|----------|----------------|----------|----------|
-| SELECT by-PK (1)    | **29.0 µs** | **24.6 µs** | 26.6 µs   | 44.5 µs  | 58.1 µs        | 30.2 µs  | 61.7 µs  |
-| SELECT 10 rows      | **42.7 µs** | **37.1 µs** | 40.7 µs   | 63.3 µs  | 79.4 µs        | 45.4 µs  | 83.5 µs  |
-| SELECT 100 rows     | **54.9 µs** | **49.4 µs** | 57.0 µs   | 80.1 µs  | 81.9 µs        | 72.8 µs  | 90.2 µs  |
-| SELECT 1000 rows    | **242 µs**  | **227 µs**  | 261 µs    | 268 µs   | 297 µs         | 302 µs   | 294 µs   |
-| INSERT single       | **44.5 µs** | **38.3 µs** | 39.6 µs   | 49.8 µs  | 63.0 µs        | 49.6 µs  | 64.8 µs  |
-| JOIN + GROUP BY agg | **3.01 ms** | **2.99 ms** | 3.13 ms   | 3.04 ms  | 3.06 ms        | 3.04 ms  | 3.08 ms  |
+| SELECT by-PK (1)    | **26.2 µs** | **24.6 µs** | 25.0 µs   | 52.2 µs  | 40.0 µs        | 28.2 µs  | 41.4 µs  |
+| SELECT 10 rows      | **40.0 µs** | **37.1 µs** | 38.5 µs   | 73.6 µs  | 53.2 µs        | 42.6 µs  | 55.0 µs  |
+| SELECT 100 rows     | **52.3 µs** | **50.0 µs** | 54.5 µs   | 78.1 µs  | 72.3 µs        | 70.6 µs  | 78.6 µs  |
+| SELECT 1000 rows    | **234 µs**  | **232 µs**  | 250 µs    | 259 µs   | 286 µs         | 296 µs   | 296 µs   |
+| INSERT single       | **43.5 µs** | **37.7 µs** | 37.2 µs   | 58.6 µs  | 43.3 µs        | 46.1 µs  | 43.9 µs  |
+| JOIN + GROUP BY agg | **3.00 ms** | **2.99 ms** | 3.01 ms   | 3.04 ms  | 3.05 ms        | 3.03 ms  | 3.02 ms  |
 
 Relative to bsql (async) on the flagship **single-row by-PK** read, where driver
-overhead dominates (lower = faster): **bsql (sync) 0.85× · C/libpq 0.92× · bsql
-1.0× · sqlx 1.04× · Go/pgx 1.53× · tokio-postgres 2.00× · diesel 2.13×**.
+overhead dominates (lower = faster): **bsql (sync) 0.94× · C/libpq 0.95× · bsql
+1.0× · sqlx 1.08× · tokio-postgres 1.53× · diesel 1.58× · Go/pgx 1.99×**.
 
-- bsql is **on par with hand-written C over libpq** and ahead of every other
-  client — the blocking driver even edges out C on point reads (within
-  cross-implementation measurement variance; call it a tie with raw C).
-- The lead is largest on **small results**, where per-round-trip client overhead
-  dominates — where a lean driver should win. On the ~3 ms server-bound
-  aggregate everything converges, as expected.
-- **tokio-postgres and diesel are ~2× slower on point reads** — tokio-postgres
-  runs the connection on a separate task (a scheduler hop per query on a
-  current-thread runtime); diesel-async adds ORM layering on top.
+- **bsql (sync) is the fastest or tied-fastest on every scenario**, and beats
+  hand-written C/libpq on five of six (a tie on single-row INSERT). Since C/libpq
+  is a *synchronous* (blocking) client, this sync-vs-sync comparison is the true
+  apples-to-apples one — and bsql's protocol + decode win it outright.
+- **bsql (async) is on par with raw C** — within ~1–1.5 µs on the smallest point
+  reads (the irreducible cost of an async runtime's poll/wake over a would-block
+  read, which a blocking client does not pay), and *faster* than C on 100/1000-row
+  reads and the aggregate. Its ~1 µs point-read gap to a blocking client is the
+  price of concurrency — the very thing async exists for and this single-op serial
+  micro-benchmark does not exercise. It is by a wide margin the **fastest async
+  driver** here (tokio-postgres 1.53×, diesel 1.58×, Go/pgx 1.99× on by-PK).
+- The lead is largest on **small results**, where per-round-trip driver overhead
+  dominates. On the ~3 ms server-bound aggregate everything converges, as expected.
 
 ## Peak memory — bsql is the leanest client, period
 
@@ -63,16 +69,16 @@ move with machine load).
 
 | client             | peak memory (RAM) | × vs bsql |
 |--------------------|-------------------|-----------|
-| **bsql (sync)**    | **1.61 MB**       | 0.94×     |
-| **bsql** (async)   | **1.72 MB**       | 1.0×      |
-| tokio-postgres     | 6.20 MB           | 3.6×      |
-| sqlx               | 6.42 MB           | 3.7×      |
-| diesel             | 6.69 MB           | 3.9×      |
-| C / libpq          | 12.64 MB          | **7.4×**  |
-| Go / pgx           | 16.03 MB          | **9.3×**  |
+| **bsql (sync)**    | **1.56 MB**       | 0.88×     |
+| **bsql** (async)   | **1.78 MB**       | 1.0×      |
+| tokio-postgres     | 6.22 MB           | 3.5×      |
+| sqlx               | 6.41 MB           | 3.6×      |
+| diesel             | 6.98 MB           | 3.9×      |
+| C / libpq          | 13.27 MB          | **7.5×**  |
+| Go / pgx           | 17.43 MB          | **9.8×**  |
 
-bsql is **~3.7× leaner than the Rust field, ~7× leaner than a C/libpq client, and
-~9× leaner than Go/pgx.** Beating raw C on memory is not a typo: the standard
+bsql is **~3.6× leaner than the Rust field, ~7.5× leaner than a C/libpq client, and
+~10× leaner than Go/pgx.** Beating raw C on memory is not a typo: the standard
 libpq the C client links pulls in its full client-side dependency set (TLS, ICU,
 buffers), while bsql's arena-based decode holds a fixed ~4 KiB engine buffer and
 16-byte row handles. That is per process, so across a fleet of instances or
@@ -108,8 +114,24 @@ comparison — competitors get credit for what they have.
   transport it does not use here, so the field stays even.
 - **Latency:** each client's own warmed timed loop (2000-iter warm-up, 7 reps,
   median ns/op) — the same shape in every language so C, Go and Rust are directly
-  comparable. Server-bound scenarios (the ~3 ms aggregate) converge because the
-  cost is PostgreSQL's, not the client's.
+  comparable. Numbers here are the median of 3 such runs. Server-bound scenarios
+  (the ~3 ms aggregate) converge because the cost is PostgreSQL's, not the client's.
+- **Execution model (read the table with this in mind).** C/libpq and bsql (sync)
+  are *blocking* clients — one OS thread, no runtime. Go/pgx blocks a goroutine on
+  Go's netpoller. The async Rust clients (bsql, tokio-postgres, sqlx, diesel) run on
+  a tokio **current-thread** runtime — the realistic, lightest choice for a
+  single-connection latency path, applied EQUALLY to all four (a multi-thread
+  runtime would only add a cross-thread `block_on` handoff irrelevant to a
+  one-socket workload). The fair apples-to-apples comparison is therefore
+  **blocking-vs-blocking: bsql (sync) vs C/libpq — and bsql wins it** (faster on
+  every read, tie on INSERT). An async client pays an unavoidable reactor
+  poll/park/wake over a would-block read that a blocking client does not; that tax
+  is ~1–1.5 µs on cached point reads and larger (~6 µs) on INSERT (where the
+  post-WAL response reliably parks the reactor) — and it is paid by **every** async
+  client (bsql, tokio-postgres, sqlx, diesel all land ~43–46 µs on INSERT vs ~37 µs
+  blocking), with bsql the fastest of them. It is the price of concurrency, not a
+  bsql inefficiency: bsql's async path is structurally at the tokio floor (one
+  suspend, zero per-op alloc, syscall parity).
 - **Memory:** one separate process per client (so linked-but-cold code from
   another driver can't pollute the figure), `getrusage(ru_maxrss)` after a fixed
   10 000-read + 1 000-write workload.

@@ -123,8 +123,7 @@ mod bsql_async {
 
     pub fn run(mode: &str) {
         println!("VERSION bsql-postgres-async {}", BSQL_VERSION);
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap_or_else(|e| err_exit("connect", e));
@@ -135,7 +134,7 @@ mod bsql_async {
             // Correctness spot-check: by_pk id=1 → name_1, val=2.
             {
                 let rows = c
-                    .query::<ByPkQuery>((1i32,))
+                    .query::<ByPk>((1i32,))
                     .await
                     .unwrap_or_else(|e| err_exit("by_pk", e));
                 let rec = rows
@@ -158,7 +157,7 @@ mod bsql_async {
                 let mut sink: u64 = 0;
                 for id in 1..=10_000i32 {
                     let rows = c
-                        .query::<ByPkQuery>((id,))
+                        .query::<ByPk>((id,))
                         .await
                         .unwrap_or_else(|e| err_exit("by_pk", e));
                     for r in rows.iter() {
@@ -226,7 +225,7 @@ mod bsql_async {
             "by_pk" => {
                 *pk = (*pk % 10_000) + 1;
                 let rows = c
-                    .query::<ByPkQuery>((*pk,))
+                    .query::<ByPk>((*pk,))
                     .await
                     .unwrap_or_else(|e| err_exit("by_pk", e));
                 for r in rows.iter() {
@@ -241,7 +240,7 @@ mod bsql_async {
                     _ => 1000,
                 };
                 let rows = c
-                    .query::<RowsNQuery>((lim,))
+                    .query::<RowsN>((lim,))
                     .await
                     .unwrap_or_else(|e| err_exit(scen, e));
                 for r in rows.iter() {
@@ -258,7 +257,7 @@ mod bsql_async {
             }
             "join_agg" => {
                 let rows = c
-                    .query::<JoinAggQuery>((10_000i32,))
+                    .query::<JoinAgg>((10_000i32,))
                     .await
                     .unwrap_or_else(|e| err_exit("join_agg", e));
                 for r in rows.iter() {
@@ -298,7 +297,7 @@ mod bsql_sync_client {
         let mut c = Connection::connect(&config()).unwrap_or_else(|e| err_exit("connect", e));
         {
             let rows = c
-                .query::<ByPkQuery>((1i32,))
+                .query::<ByPk>((1i32,))
                 .unwrap_or_else(|e| err_exit("by_pk", e));
             let rec = rows
                 .iter()
@@ -315,7 +314,7 @@ mod bsql_sync_client {
             let mut sink: u64 = 0;
             for id in 1..=10_000i32 {
                 let rows = c
-                    .query::<ByPkQuery>((id,))
+                    .query::<ByPk>((id,))
                     .unwrap_or_else(|e| err_exit("by_pk", e));
                 for r in rows.iter() {
                     let r = r.unwrap_or_else(|e| err_exit("by_pk", e));
@@ -373,7 +372,7 @@ mod bsql_sync_client {
             "by_pk" => {
                 *pk = (*pk % 10_000) + 1;
                 let rows = c
-                    .query::<ByPkQuery>((*pk,))
+                    .query::<ByPk>((*pk,))
                     .unwrap_or_else(|e| err_exit("by_pk", e));
                 for r in rows.iter() {
                     let r = r.unwrap_or_else(|e| err_exit("by_pk", e));
@@ -387,7 +386,7 @@ mod bsql_sync_client {
                     _ => 1000,
                 };
                 let rows = c
-                    .query::<RowsNQuery>((lim,))
+                    .query::<RowsN>((lim,))
                     .unwrap_or_else(|e| err_exit(scen, e));
                 for r in rows.iter() {
                     let r = r.unwrap_or_else(|e| err_exit(scen, e));
@@ -402,7 +401,7 @@ mod bsql_sync_client {
             }
             "join_agg" => {
                 let rows = c
-                    .query::<JoinAggQuery>((10_000i32,))
+                    .query::<JoinAgg>((10_000i32,))
                     .unwrap_or_else(|e| err_exit("join_agg", e));
                 for r in rows.iter() {
                     let r = r.unwrap_or_else(|e| err_exit("join_agg", e));
@@ -425,8 +424,7 @@ mod tokio_pg {
 
     pub fn run(mode: &str) {
         println!("VERSION tokio-postgres 0.7.18");
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap_or_else(|e| err_exit("connect", e));
@@ -602,8 +600,7 @@ mod sqlx_client {
 
     pub fn run(mode: &str) {
         println!("VERSION sqlx 0.8.6");
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap_or_else(|e| err_exit("connect", e));
