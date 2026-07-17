@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 description = "Sync PostgreSQL driver built on bsql-pg-proto sans-IO state machine"
 license = "MIT OR Apache-2.0"
+repository.workspace = true
 
 [features]
 # DEFAULT-ON. Forwards the core's `tls` + baked-Mozilla-roots defaults; a

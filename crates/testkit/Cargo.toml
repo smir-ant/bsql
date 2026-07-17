@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 description = "Deterministic in-memory fake PostgreSQL for testing bsql driver code with no network"
 license = "MIT OR Apache-2.0"
+repository.workspace = true
 
 [dependencies]
 # The testkit turns on the `testkit` feature of both drivers (for the

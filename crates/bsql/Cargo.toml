@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 description = "Multi-backend SQL toolkit — PostgreSQL and SQLite"
 license = "MIT OR Apache-2.0"
+repository.workspace = true
 
 [features]
 default = ["postgres-async", "postgres-sync", "sqlite", "tls", "webpki-roots", "scram", "md5-auth"]

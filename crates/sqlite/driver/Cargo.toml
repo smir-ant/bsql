@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.95"
 description = "Lightweight SQLite driver with API-compatible Row type"
 license = "MIT OR Apache-2.0"
+repository.workspace = true
 
 [features]
 # `n1-detect` — the diagnostics-only N+1 query detector (`conn.n1_report()`),
