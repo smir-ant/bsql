@@ -154,3 +154,112 @@ pub fn insert_id_base() -> i64 {
 pub const RSS_SELECT_ITERS: i32 = 10_000;
 /// INSERT iterations for the peak-RSS workload (see [`RSS_SELECT_ITERS`]).
 pub const RSS_INSERT_ITERS: i64 = 1_000;
+
+// ─── Environment-overridable connection coordinates ─────────────────────────
+//
+// The single-op latency / RSS matrix runs against the SHARED local PostgreSQL
+// on the fixed [`PG_HOST`]/[`PG_PORT`] above. The DEEP benchmarks (concurrency
+// throughput, constant-memory streaming) instead point every client at a
+// server named by the standard `PG*` env vars, because `scripts/xlang_measure_deep.sh`
+// stands up a DEDICATED ephemeral PostgreSQL on its own port (max_connections
+// raised so 128 held connections fit, and isolated so it neither disturbs nor is
+// disturbed by any concurrent use of the shared server). The helpers below read
+// those env vars with the shared-server constants as the fallback, so a client
+// with no env set still targets the shared server. `match` (not `unwrap_or*`) is
+// deliberate — the crate's clippy floor bans the silent-fallback combinator; a
+// bench-config default is a legitimate, VISIBLE fallback.
+
+/// Read env `key`, or fall back to `default`.
+#[must_use]
+pub fn env_or(key: &str, default: &str) -> String {
+    match std::env::var(key) {
+        Ok(v) => v,
+        Err(_) => default.to_owned(),
+    }
+}
+
+/// PostgreSQL host from `PGHOST` (default [`PG_HOST`]).
+#[must_use]
+pub fn pg_host_env() -> String {
+    env_or("PGHOST", PG_HOST)
+}
+
+/// PostgreSQL port from `PGPORT` (default [`PG_PORT`]); an unparseable value
+/// falls back to the default rather than aborting a benchmark on a typo.
+#[must_use]
+pub fn pg_port_env() -> u16 {
+    match std::env::var("PGPORT") {
+        Ok(v) => match v.parse::<u16>() {
+            Ok(p) => p,
+            Err(_) => PG_PORT,
+        },
+        Err(_) => PG_PORT,
+    }
+}
+
+/// PostgreSQL user from `PGUSER` (default [`PG_USER`]).
+#[must_use]
+pub fn pg_user_env() -> String {
+    env_or("PGUSER", PG_USER)
+}
+
+/// PostgreSQL database from `PGDATABASE` (default [`PG_DB`]).
+#[must_use]
+pub fn pg_db_env() -> String {
+    env_or("PGDATABASE", PG_DB)
+}
+
+/// A `bsql` `ConnectConfig` from the `PG*` env (loopback TCP, TLS disabled) —
+/// the env-driven peer of [`bsql_config`] used by the deep benchmarks.
+#[must_use]
+pub fn bsql_config_env() -> bsql::pg::ConnectConfig {
+    bsql::pg::ConnectConfig::new(pg_host_env(), pg_user_env())
+        .port(pg_port_env())
+        .database(pg_db_env())
+        .ssl_mode(bsql::pg::SslMode::Disable)
+}
+
+/// A `libpq`-style connection string from the `PG*` env (for tokio-postgres).
+#[must_use]
+pub fn pg_conn_string_env() -> String {
+    format!(
+        "host={} port={} user={} dbname={} sslmode=disable",
+        pg_host_env(),
+        pg_port_env(),
+        pg_user_env(),
+        pg_db_env(),
+    )
+}
+
+/// A `postgres://` URL from the `PG*` env (for sqlx).
+#[must_use]
+pub fn pg_url_env() -> String {
+    format!(
+        "postgres://{}@{}:{}/{}?sslmode=disable",
+        pg_user_env(),
+        pg_host_env(),
+        pg_port_env(),
+        pg_db_env(),
+    )
+}
+
+/// The by-PK SELECT the CONCURRENCY benchmark runs on every client — one row,
+/// three columns, every column read (identical work regardless of driver). It
+/// is the SAME shape as [`SQL_SELECT_BY_PK`] but against a small `bench_items`
+/// table seeded into the ephemeral server; bsql runs it through the typed
+/// compile-checked `query!` flagship (see `src/bin/concurrency_pg.rs`).
+pub const SQL_CONC_BY_PK: &str = "SELECT id, name, val FROM bench_items WHERE id = $1";
+
+/// The SQL the STREAMING benchmark runs on every client: a synthetic result of
+/// `rows` rows, three columns (int4 / text / int4), produced entirely on the
+/// server by `generate_series` — so no seed data is needed and the row count is
+/// a free parameter. bsql streams it in O(1) memory via `query_each_sql`; a
+/// materialising client (libpq `PQexec`, tokio-postgres `query`) buffers all
+/// `rows` at once. `g` ≤ 5·10⁶ and `g*2` ≤ 10⁷ both fit `int4`.
+#[must_use]
+pub fn stream_sql(rows: u64) -> String {
+    format!(
+        "SELECT (g)::int4 AS id, ('row_' || g) AS name, (g * 2)::int4 AS val \
+         FROM generate_series(1, {rows}) AS g"
+    )
+}

@@ -139,6 +139,47 @@ static void verify(void) {
     PQclear(r);
 }
 
+/* Build a conninfo from the standard PG* env vars, falling back to the shared
+   local server's coordinates when a var is unset. libpq's own conninfo ignores
+   the PG* env once host= is given, so we read them ourselves — this lets the
+   deep-benchmark script point the client at its dedicated ephemeral server
+   (different port) while the existing latency/rss modes stay byte-identical when
+   the env matches the historical 127.0.0.1:5432 defaults. Caller frees. */
+static char *build_conninfo(void) {
+    const char *host = getenv("PGHOST");     if (!host || !*host) host = "127.0.0.1";
+    const char *port = getenv("PGPORT");     if (!port || !*port) port = "5432";
+    const char *user = getenv("PGUSER");     if (!user || !*user) user = "smir-ant";
+    const char *db   = getenv("PGDATABASE"); if (!db   || !*db)   db   = "postgres";
+    char *s = malloc(512);
+    if (!s) die("connect", "oom");
+    snprintf(s, 512, "host=%s port=%s user=%s dbname=%s sslmode=disable", host, port, user, db);
+    return s;
+}
+
+/* O(rows) MATERIALISING stream — the canonical libpq contrast to bsql's O(1)
+   query_each. PQexec buffers the ENTIRE result in the client (PGresult holds
+   every row), so peak RSS grows with the row count. Every value is touched, then
+   RSS is read while the whole result is still resident, then it is freed. */
+static void run_stream_rss(long rows) {
+    char sql[256];
+    snprintf(sql, sizeof sql,
+        "SELECT (g)::int4 AS id, ('row_' || g) AS name, (g * 2)::int4 AS val "
+        "FROM generate_series(1, %ld) AS g", rows);
+    PGresult *r = PQexec(CONN, sql);
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) die("stream_rss", PQerrorMessage(CONN));
+    long got = PQntuples(r);
+    g_sink += consume(r);                 /* touch every value */
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);          /* peak while the whole result is resident */
+    PQclear(r);
+    if (got != rows) die("stream_rss", "row count mismatch");
+    /* macOS: ru_maxrss is bytes */
+    printf("STREAM libpq rows=%ld rss_bytes=%lld rows_read=%ld\n",
+           rows, (long long)ru.ru_maxrss, got);
+    printf("PEAK_RSS %.2f MB\n", (double)ru.ru_maxrss / 1048576.0);
+    fflush(stdout);
+}
+
 /* median-of-7-reps latency runner */
 static uint64_t bench_lat(const char *name, int N,
                           void (*body)(int iter, void *ctx), void *ctx) {
@@ -175,11 +216,10 @@ static void body_insert(int iter, void *ctx) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: pg_bench latency|rss\n"); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: pg_bench latency|rss|stream_rss [rows]\n"); return 2; }
     const char *mode = argv[1];
 
-    const char *conninfo =
-        "host=127.0.0.1 port=5432 user=smir-ant dbname=postgres sslmode=disable";
+    char *conninfo = build_conninfo();
     CONN = PQconnectdb(conninfo);
     if (PQstatus(CONN) != CONNECTION_OK) die("connect", PQerrorMessage(CONN));
 
@@ -187,6 +227,17 @@ int main(int argc, char **argv) {
 
     printf("VERSION libpq %d\n", PQlibVersion());
     fflush(stdout);
+
+    /* The streaming contrast uses generate_series (no seed table), so it does
+       NOT prepare the bench_items statements — that keeps it runnable against an
+       ephemeral server that carries no seed data. */
+    if (strcmp(mode, "stream_rss") == 0) {
+        long rows = (argc >= 3) ? atol(argv[2]) : 1000000L;
+        run_stream_rss(rows);
+        PQfinish(CONN);
+        free(conninfo);
+        return 0;
+    }
 
     prepare_all();
     verify();
@@ -235,5 +286,6 @@ int main(int argc, char **argv) {
     }
 
     PQfinish(CONN);
+    free(conninfo);
     return 0;
 }

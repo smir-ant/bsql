@@ -186,6 +186,9 @@ scripts/xlang_measure.sh all         # build all 7 clients + latency + RSS
 # --- SQLite (self-contained; seeds a local bench.db) ---
 scripts/xlang_measure_sqlite.sh all  # build + latency + RSS
 
+# --- Deep benchmarks (self-contained; stands up its own ephemeral PG 15) ---
+scripts/xlang_measure_deep.sh all    # concurrency throughput + constant-memory streaming
+
 # --- or just the bsql side under criterion ---
 cargo bench --bench e2e
 ```
@@ -196,23 +199,75 @@ tables are built from. The exact outputs of the runs behind the tables above are
 committed under [`results/`](results/) (see [`results/README.md`](results/README.md) for
 which log backs which table, and how to re-derive any cell).
 
-## Further measurements (designed, being added)
+## Deeper benchmarks (implemented — numbers pending a quiet-machine run)
 
-The single-op latency + memory matrix is the foundation. These deeper benchmarks are
-specified and will be measured with the same rigor — several probe a capability a
-competitor structurally lacks:
+The single-op latency + memory matrix is the foundation. Two deeper benchmarks probe a
+regime and a property that single-op numbers cannot: they are **implemented and runnable
+today** (real committed clients + a sweep script — [`scripts/xlang_measure_deep.sh`](scripts/xlang_measure_deep.sh)),
+not designs. The measured tables are intentionally left to a **quiet-machine run** (the
+numbers below are placeholders on purpose — this harness fabricates nothing, and a
+benchmark taken under load is worse than none). Running either command fills its table and
+drops a raw log under [`results/`](results/).
 
-- **Concurrency throughput** — sustained QPS + p99 under 8 / 32 / 128 workers on a fixed
-  pool (the regime where async's per-op tax pays for itself).
-- **Constant-memory streaming of 5M rows** — RSS high-water *and* allocations/row.
-  bsql's `query_each` holds O(1) RAM with **0 alloc/row**; diesel's `load()` and libpq's
-  `PQexec` are O(rows); even the streaming competitors pay a per-row allocation bsql does
-  not.
-- **Typed binary COPY — 1M rows** — rows/s + MB/s + peak RSS (diesel 2.2 has `copy_from`
-  incl. binary, but not a *compile-checked, typed* COPY like bsql's `copy!`).
-- **Transaction round-trip fusion** — RTTs per small transaction (loopback-relay counted)
-  + txns/s, paired with an honest **pipelining control** where tokio-postgres's real
-  pipelining is reported as the winner.
-- **Connection establishment cost**, **unix-socket vs loopback TCP**, and the
-  **detection/observability overhead** of `n1-detect` / the diagnostics sink (on vs the
-  proven zero cost when off).
+Both stand up their **own dedicated ephemeral PostgreSQL 15** (its own port + socket dir,
+`max_connections` raised to 300, torn down on exit): 128 *held* connections exceed a stock
+server's `max_connections`, and the isolation means the deep run neither disturbs nor is
+disturbed by anything on the shared server — same version / machine / loopback TCP as the
+tables above. Pass `DEEP_PG_EXISTING=1` (with `PGHOST`/`PGPORT`/…) to target a server you
+manage instead.
+
+### Concurrency throughput — the async-tax answer
+
+The single-op table "penalises" bsql-async ~1 µs for the reactor poll/park/wake a blocking
+client skips. Under concurrency that reactor **pays for itself**: one runtime multiplexes
+many in-flight queries, so aggregate throughput scales with concurrency, not with serial
+latency. This benchmark runs **8 / 32 / 128 concurrent workers**, each holding one dedicated
+connection (the pgbench `-c` model — so the number reflects the driver + runtime, not
+pool-checkout policy), all looping the by-PK read on a multi-thread tokio runtime, and
+reports **sustained QPS** and **p50 / p99 / p999** latency for **bsql-async (its `Pool`)**
+vs **tokio-postgres** vs **sqlx**. bsql uses its pool to hand out the connections (mandated);
+because its *per-op* latency already leads the async field in the single-op table, its
+*concurrent* QPS is expected to lead too — the point the run will confirm.
+
+```bash
+scripts/xlang_measure_deep.sh concurrency      # stands up PG, sweeps 8/32/128 × 3 clients
+```
+
+Each run prints one machine-parseable line per (client, workers), e.g.
+`CONC bsql workers=32 threads=8 qps=… p50_us=… p99_us=… p999_us=… ops=… secs=…`. The table
+to fill (bold = row winner, `<kbd>xN</kbd>` factor vs it):
+
+| workers | metric | bsql-async | tokio-postgres | sqlx |
+|---|---|---|---|---|
+| 8 | QPS / p99 µs | *pending* | *pending* | *pending* |
+| 32 | QPS / p99 µs | *pending* | *pending* | *pending* |
+| 128 | QPS / p99 µs | *pending* | *pending* | *pending* |
+
+### Constant-memory streaming — a property competitors structurally lack
+
+bsql's `query_each` streams a colossal result in **O(1) resident memory with ~0 allocations
+per row** (each row is a zero-copy `BorrowedRow`, nothing accumulates). A materialising
+client — libpq's `PQexec`, tokio-postgres's `query()` — buffers the **whole** result first,
+so its RSS grows **O(rows)**. This benchmark consumes a **≥ 1 M-row** result (the sweep does
+1 M and 5 M) and records **peak RSS** per client — flat for bsql, rising for the materialisers
+— plus, for bsql, the **total allocations during the stream** (via a counting global
+allocator), which is a small constant *independent of the row count*, so **allocations/row → 0**.
+
+```bash
+scripts/xlang_measure_deep.sh streaming        # stands up PG, sweeps 1M/5M × 3 clients
+```
+
+Lines look like `STREAM bsql rows=5000000 rss_bytes=… stream_allocs=… alloc_per_row=…` and
+`STREAM tokio rows=5000000 rss_bytes=…` / `STREAM libpq rows=5000000 rss_bytes=…`. The table
+to fill (peak RSS; bold = lowest):
+
+| rows | bsql (`query_each`, O(1)) | tokio-postgres (`query`, O(rows)) | libpq (`PQexec`, O(rows)) |
+|---|---|---|---|
+| 1 M | *pending* | *pending* | *pending* |
+| 5 M | *pending* | *pending* | *pending* |
+
+…plus a bsql-only line: **total allocations to stream 5 M rows** (expected: a handful) and
+**allocations/row** (expected: ≈ 0).
+
+Run both with `scripts/xlang_measure_deep.sh all`. Windows/counts are env-tunable
+(`DEEP_WORKERS`, `DEEP_STREAM_ROWS`, `CONC_WARMUP_MS`, `CONC_MEASURE_MS`).

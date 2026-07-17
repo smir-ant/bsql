@@ -37,7 +37,10 @@ bsql = { git = "https://github.com/smir-ant/bsql", branch = "main", default-feat
 # Async runtime. current-thread flavour is what the single-connection benches
 # use (a multi-thread pool would only add scheduler noise + RSS to a one-socket
 # workload).
-tokio = { version = "1", features = ["rt", "net", "macros", "time"] }
+# `rt-multi-thread` is for the CONCURRENCY benchmark only (many workers over a
+# multi-thread runtime); the single-op / RSS / streaming harnesses stay
+# current-thread.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros", "time"] }
 futures = "0.3"
 
 # The Rust competitors the owner cares about most. C-libpq and Go-pgx are a
@@ -145,3 +148,19 @@ path = "src/bin/rss_sqlx.rs"
 [[bin]]
 name = "rss_bsql_sqlite"
 path = "src/bin/rss_bsql_sqlite.rs"
+
+# ── DEEP benchmarks (concurrency + constant-memory streaming) ──
+# Concurrency throughput: bsql-async pool vs tokio-postgres vs sqlx, N workers.
+[[bin]]
+name = "concurrency_pg"
+path = "src/bin/concurrency_pg.rs"
+
+# Constant-memory streaming: bsql query_each (O(1) RAM, 0 alloc/row) …
+[[bin]]
+name = "stream_bsql"
+path = "src/bin/stream_bsql.rs"
+
+# … vs tokio-postgres query() (O(rows) materialise) — the RSS-curve contrast.
+[[bin]]
+name = "stream_tokio"
+path = "src/bin/stream_tokio.rs"
