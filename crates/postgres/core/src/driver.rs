@@ -2513,13 +2513,15 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// error if it is the FIRST window (nothing flushed — a consumed deferred `BEGIN`
     /// is preserved) and a FATAL connection-kill (rolling back the open implicit
     /// transaction — all-or-nothing preserved) if a window was already flushed.
-    pub async fn execute_batch<'p, Q, I>(&mut self, params: I) -> Result<Vec<u64>, DriverError>
+    pub async fn execute_batch<'p, Q>(
+        &mut self,
+        params: impl IntoIterator<Item = Q::Params<'p>>,
+    ) -> Result<Vec<u64>, DriverError>
     where
         Q: TypedQuery,
-        I: IntoIterator<Item = Q::Params<'p>>,
     {
         let mut slow = self.armed_slow_guard(Q::PREPARED.sql());
-        let result = self.execute_batch_inner::<Q, I>(params).await;
+        let result = self.execute_batch_inner::<Q, _>(params).await;
         Self::commit_slow(&mut slow, &result);
         result
     }
@@ -2851,13 +2853,15 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// window (nothing flushed — a consumed deferred `BEGIN` is preserved) and a
     /// FATAL connection-kill (rolling back the open implicit transaction —
     /// all-or-nothing preserved) if a window was already flushed.
-    pub async fn query_batch<'p, Q, I>(&mut self, params: I) -> Result<Vec<Rows<Q>>, DriverError>
+    pub async fn query_batch<'p, Q>(
+        &mut self,
+        params: impl IntoIterator<Item = Q::Params<'p>>,
+    ) -> Result<Vec<Rows<Q>>, DriverError>
     where
         Q: TypedQuery,
-        I: IntoIterator<Item = Q::Params<'p>>,
     {
         let mut slow = self.armed_slow_guard(Q::PREPARED.sql());
-        let result = self.query_batch_inner::<Q, I>(params).await;
+        let result = self.query_batch_inner::<Q, _>(params).await;
         Self::commit_slow(&mut slow, &result);
         result
     }

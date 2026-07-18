@@ -49,7 +49,7 @@ fn seed() -> Connection {
 fn n_reads_return_a_count_vec_and_commit() {
     let conn = seed();
     let counts = conn
-        .execute_batch::<EbWeightById, _>(vec![(1_i64,), (2,), (1,)])
+        .execute_batch::<EbWeightById>(vec![(1_i64,), (2,), (1,)])
         .expect("batch runs");
     assert_eq!(counts, vec![0, 0, 0], "a read affects no rows (read-only twin)");
     // Reusable after a committed batch.
@@ -61,7 +61,7 @@ fn n_reads_return_a_count_vec_and_commit() {
 fn zero_is_empty() {
     let conn = seed();
     let counts = conn
-        .execute_batch::<EbWeightById, _>(Vec::<(i64,)>::new())
+        .execute_batch::<EbWeightById>(Vec::<(i64,)>::new())
         .expect("N=0");
     assert_eq!(counts, Vec::<u64>::new());
 }
@@ -72,7 +72,7 @@ fn zero_is_empty() {
 fn inside_a_transaction_guard() {
     let conn = seed();
     let counts = conn
-        .transaction(|tx| tx.execute_batch::<EbWeightById, _>(vec![(1_i64,), (2,)]))
+        .transaction(|tx| tx.execute_batch::<EbWeightById>(vec![(1_i64,), (2,)]))
         .expect("guard commits");
     assert_eq!(counts, vec![0, 0]);
 }

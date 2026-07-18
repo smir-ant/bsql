@@ -59,10 +59,10 @@ fn row_count(c: &mut Connection) -> i64 {
 fn n_updates_return_correct_counts_and_all_apply() {
     let mut c = Connection::connect(&cfg()).expect("connect");
     fresh(&mut c);
-    c.execute_batch::<EbsIns, _>((1..=5).map(|i| (i, 0_i64)))
+    c.execute_batch::<EbsIns>((1..=5).map(|i| (i, 0_i64)))
         .expect("seed");
     let counts = c
-        .execute_batch::<EbsUpd, _>(vec![(1_i64, 10_i64), (2, 20), (3, 30), (99, 40)])
+        .execute_batch::<EbsUpd>(vec![(1_i64, 10_i64), (2, 20), (3, 30), (99, 40)])
         .expect("update batch");
     assert_eq!(counts, vec![1, 1, 1, 0]);
     let sum = c
@@ -81,7 +81,7 @@ fn n_updates_return_correct_counts_and_all_apply() {
 fn mid_batch_failure_applies_nothing() {
     let mut c = Connection::connect(&cfg()).expect("connect");
     fresh(&mut c);
-    let result = c.execute_batch::<EbsIns, _>(vec![
+    let result = c.execute_batch::<EbsIns>(vec![
         (10_i64, 1_i64),
         (11, 1),
         (12, 1),
@@ -113,7 +113,7 @@ fn commit_time_deferred_failure_is_db_none_index() {
          CONSTRAINT eb_uniq_tag_uniq UNIQUE (tag) DEFERRABLE INITIALLY DEFERRED)",
     )
     .expect("create temp");
-    let result = c.execute_batch::<EbsDeferIns, _>(vec![(1_i32, 77_i32), (2, 77)]);
+    let result = c.execute_batch::<EbsDeferIns>(vec![(1_i32, 77_i32), (2, 77)]);
     match result {
         Err(DriverError::Db(ref e)) => assert_eq!(e.code(), "23505"),
         other => panic!("expected Db(23505), got {other:?}"),
@@ -131,8 +131,8 @@ fn ignored_in_guard_batch_error_does_not_autocommit() {
     fresh(&mut c);
     let code = c
         .transaction(|tx| {
-            drop(tx.execute_batch::<EbsIns, _>(vec![(1_i64, 1_i64), (1, 1)]));
-            let d = tx.execute_batch::<EbsIns, _>(vec![(2_i64, 2_i64)]);
+            drop(tx.execute_batch::<EbsIns>(vec![(1_i64, 1_i64), (1, 1)]));
+            let d = tx.execute_batch::<EbsIns>(vec![(2_i64, 2_i64)]);
             Ok(match &d {
                 Err(DriverError::Db(e)) => e.code().to_string(),
                 Err(DriverError::BatchFailed { source, .. }) => source.code().to_string(),
@@ -152,12 +152,12 @@ fn zero_and_one() {
     let mut c = Connection::connect(&cfg()).expect("connect");
     fresh(&mut c);
     assert_eq!(
-        c.execute_batch::<EbsIns, _>(Vec::<(i64, i64)>::new())
+        c.execute_batch::<EbsIns>(Vec::<(i64, i64)>::new())
             .expect("N=0"),
         Vec::<u64>::new(),
     );
     assert_eq!(
-        c.execute_batch::<EbsIns, _>(vec![(1_i64, 5_i64)]).expect("N=1"),
+        c.execute_batch::<EbsIns>(vec![(1_i64, 5_i64)]).expect("N=1"),
         vec![1],
     );
     assert_eq!(row_count(&mut c), 1);
@@ -172,7 +172,7 @@ fn large_n_windowed_is_correct_and_deadlock_free() {
     fresh(&mut c);
     const N: i64 = 20_000;
     let counts = c
-        .execute_batch::<EbsIns, _>((0..N).map(|i| (i, i * 10)))
+        .execute_batch::<EbsIns>((0..N).map(|i| (i, i * 10)))
         .expect("large batch");
     assert_eq!(counts.len(), N as usize);
     assert!(counts.iter().all(|&r| r == 1));
@@ -182,7 +182,7 @@ fn large_n_windowed_is_correct_and_deadlock_free() {
     c.execute_raw("TRUNCATE eb_rows").expect("truncate");
     let mut sets: Vec<(i64, i64)> = (0..N).map(|i| (i, 1)).collect();
     sets.push((5_000, 1));
-    let result = c.execute_batch::<EbsIns, _>(sets);
+    let result = c.execute_batch::<EbsIns>(sets);
     assert!(matches!(result, Err(DriverError::BatchFailed { index, .. }) if index == N as usize));
     assert_eq!(row_count(&mut c), 0, "large mid-batch failure applied NOTHING");
     c.close().expect("close");

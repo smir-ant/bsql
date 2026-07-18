@@ -1,8 +1,8 @@
 error[E0271]: type mismatch resolving `<Vec<(&str, i64)> as IntoIterator>::Item == (i64, i64)`
-  --> tests/compile_fail/execute_batch_wrong_param.rs:21:46
+  --> tests/compile_fail/execute_batch_wrong_param.rs:22:43
    |
-21 |     let _ = c.execute_batch::<EbMismatch, _>(vec![("hostile", 1_i64)]);
-   |               -------------                  ^^^^^^^^^^^^^^^^^^^^^^^^ expected `(i64, i64)`, found `(&str, i64)`
+22 |     let _ = c.execute_batch::<EbMismatch>(vec![("hostile", 1_i64)]);
+   |               -------------               ^^^^^^^^^^^^^^^^^^^^^^^^ expected `(i64, i64)`, found `(&str, i64)`
    |               |
    |               required by a bound introduced by this call
    |
@@ -11,8 +11,8 @@ error[E0271]: type mismatch resolving `<Vec<(&str, i64)> as IntoIterator>::Item 
 note: required by a bound in `Connection::execute_batch`
   --> $WORKSPACE/crates/postgres/sync/src/connection.rs
    |
-   |     pub fn execute_batch<'p, Q, I>(&mut self, params: I) -> Result<Vec<u64>, DriverError>
+   |     pub fn execute_batch<'p, Q>(
    |            ------------- required by a bound in this associated function
-...
-   |         I: IntoIterator<Item = Q::Params<'p>>,
-   |                         ^^^^^^^^^^^^^^^^^^^^ required by this bound in `Connection::execute_batch`
+   |         &mut self,
+   |         params: impl IntoIterator<Item = Q::Params<'p>>,
+   |                                   ^^^^^^^^^^^^^^^^^^^^ required by this bound in `Connection::execute_batch`

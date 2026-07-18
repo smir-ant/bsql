@@ -1000,12 +1000,14 @@ impl Connection {
     /// [`execute`](Self::execute). See
     /// [`Core::execute_batch`](bsql_postgres_core::Core::execute_batch) for the full
     /// contract.
-    pub fn execute_batch<'p, Q, I>(&mut self, params: I) -> Result<Vec<u64>, DriverError>
+    pub fn execute_batch<'p, Q>(
+        &mut self,
+        params: impl IntoIterator<Item = Q::Params<'p>>,
+    ) -> Result<Vec<u64>, DriverError>
     where
         Q: TypedQuery,
-        I: IntoIterator<Item = Q::Params<'p>>,
     {
-        drive_sync(engine::poll_once(self.core.execute_batch::<Q, I>(params)))
+        drive_sync(engine::poll_once(self.core.execute_batch::<Q>(params)))
     }
 
     /// Run a HOMOGENEOUS ATOMIC bulk QUERY — ONE compile-checked `query!` carrier `Q`
@@ -1032,12 +1034,14 @@ impl Connection {
     /// [`query`](Self::query). See
     /// [`Core::query_batch`](bsql_postgres_core::Core::query_batch) for the full
     /// contract.
-    pub fn query_batch<'p, Q, I>(&mut self, params: I) -> Result<Vec<Rows<Q>>, DriverError>
+    pub fn query_batch<'p, Q>(
+        &mut self,
+        params: impl IntoIterator<Item = Q::Params<'p>>,
+    ) -> Result<Vec<Rows<Q>>, DriverError>
     where
         Q: TypedQuery,
-        I: IntoIterator<Item = Q::Params<'p>>,
     {
-        drive_sync(engine::poll_once(self.core.query_batch::<Q, I>(params)))
+        drive_sync(engine::poll_once(self.core.query_batch::<Q>(params)))
     }
 
     /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
@@ -2031,13 +2035,15 @@ impl Transaction<'_> {
     /// explicit transaction (the guard owns commit/rollback), so a mid-batch failure
     /// leaves the transaction aborted and the guard rolls the whole scope back. When
     /// the batch is the FIRST statement in the body it fuses the deferred `BEGIN`.
-    pub fn execute_batch<'p, Q, I>(&mut self, params: I) -> Result<Vec<u64>, DriverError>
+    pub fn execute_batch<'p, Q>(
+        &mut self,
+        params: impl IntoIterator<Item = Q::Params<'p>>,
+    ) -> Result<Vec<u64>, DriverError>
     where
         Q: TypedQuery,
-        I: IntoIterator<Item = Q::Params<'p>>,
     {
         self.arm_begin();
-        drive_sync(engine::poll_once(self.core.execute_batch::<Q, I>(params)))
+        drive_sync(engine::poll_once(self.core.execute_batch::<Q>(params)))
     }
 
     /// Run a HOMOGENEOUS ATOMIC bulk QUERY inside this transaction — the guard peer of
@@ -2045,13 +2051,15 @@ impl Transaction<'_> {
     /// transaction (the guard owns commit/rollback), so a mid-batch failure leaves the
     /// transaction aborted and the guard rolls the whole scope back. When the batch is
     /// the FIRST statement in the body it fuses the deferred `BEGIN`.
-    pub fn query_batch<'p, Q, I>(&mut self, params: I) -> Result<Vec<Rows<Q>>, DriverError>
+    pub fn query_batch<'p, Q>(
+        &mut self,
+        params: impl IntoIterator<Item = Q::Params<'p>>,
+    ) -> Result<Vec<Rows<Q>>, DriverError>
     where
         Q: TypedQuery,
-        I: IntoIterator<Item = Q::Params<'p>>,
     {
         self.arm_begin();
-        drive_sync(engine::poll_once(self.core.query_batch::<Q, I>(params)))
+        drive_sync(engine::poll_once(self.core.query_batch::<Q>(params)))
     }
 
     /// Run a compile-checked `query!` expecting EXACTLY one row, returning the

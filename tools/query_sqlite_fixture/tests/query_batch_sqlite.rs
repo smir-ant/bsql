@@ -55,7 +55,7 @@ fn seed() -> Connection {
 fn n_reads_return_grouped_decoded_typed_rows() {
     let conn = seed();
     let grouped = conn
-        .query_batch::<QbWeightById, _>(vec![(1_i64,), (2,), (3,)])
+        .query_batch::<QbWeightById>(vec![(1_i64,), (2,), (3,)])
         .expect("batch runs");
     assert_eq!(grouped.len(), 3, "one TypedRows<Q> per command, in order");
     let weights: Vec<f64> = grouped
@@ -75,7 +75,7 @@ fn n_reads_return_grouped_decoded_typed_rows() {
 fn grouping_is_preserved_per_command() {
     let conn = seed();
     let grouped = conn
-        .query_batch::<QbUpToId, _>(vec![(1_i64,), (2,), (3,)])
+        .query_batch::<QbUpToId>(vec![(1_i64,), (2,), (3,)])
         .expect("batch runs");
     assert_eq!(grouped.len(), 3);
     assert_eq!(grouped[0].len(), 1, "id <= 1 → 1 row (grouping intact)");
@@ -90,7 +90,7 @@ fn grouping_is_preserved_per_command() {
 fn zero_is_empty() {
     let conn = seed();
     let grouped = conn
-        .query_batch::<QbWeightById, _>(Vec::<(i64,)>::new())
+        .query_batch::<QbWeightById>(Vec::<(i64,)>::new())
         .expect("N=0");
     assert!(grouped.is_empty());
 }
@@ -101,7 +101,7 @@ fn zero_is_empty() {
 fn inside_a_transaction_guard() {
     let conn = seed();
     let grouped = conn
-        .transaction(|tx| tx.query_batch::<QbWeightById, _>(vec![(1_i64,), (2,)]))
+        .transaction(|tx| tx.query_batch::<QbWeightById>(vec![(1_i64,), (2,)]))
         .expect("guard commits");
     assert_eq!(grouped.len(), 2);
 }

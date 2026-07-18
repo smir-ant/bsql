@@ -1057,15 +1057,14 @@ impl Connection {
     /// 1` equals a single [`execute`](Self::execute). See
     /// [`Core::execute_batch`](bsql_postgres_core::Core::execute_batch) for the full
     /// contract.
-    pub fn execute_batch<'a, Q, I>(
+    pub fn execute_batch<'a, Q>(
         &'a mut self,
-        params: I,
+        params: impl IntoIterator<Item = Q::Params<'a>> + 'a,
     ) -> impl core::future::Future<Output = Result<Vec<u64>, DriverError>> + 'a
     where
         Q: TypedQuery + 'a,
-        I: IntoIterator<Item = Q::Params<'a>> + 'a,
     {
-        self.core.execute_batch::<Q, I>(params)
+        self.core.execute_batch::<Q>(params)
     }
 
     /// Run a HOMOGENEOUS ATOMIC bulk QUERY — ONE compile-checked `query!` carrier `Q`
@@ -1097,15 +1096,14 @@ impl Connection {
     /// equals a single [`query`](Self::query). See
     /// [`Core::query_batch`](bsql_postgres_core::Core::query_batch) for the full
     /// contract.
-    pub fn query_batch<'a, Q, I>(
+    pub fn query_batch<'a, Q>(
         &'a mut self,
-        params: I,
+        params: impl IntoIterator<Item = Q::Params<'a>> + 'a,
     ) -> impl core::future::Future<Output = Result<Vec<Rows<Q>>, DriverError>> + 'a
     where
         Q: TypedQuery + 'a,
-        I: IntoIterator<Item = Q::Params<'a>> + 'a,
     {
-        self.core.query_batch::<Q, I>(params)
+        self.core.query_batch::<Q>(params)
     }
 
     // ── Transaction / session boundary primitives ───────────────────────────
@@ -2130,15 +2128,14 @@ impl Transaction<'_> {
     /// the closure returns the classified [`DriverError::BatchFailed`] and the guard
     /// rolls the whole transaction back. When the batch is the FIRST statement in the
     /// body it fuses the deferred `BEGIN` (one round trip).
-    pub fn execute_batch<'a, Q, I>(
+    pub fn execute_batch<'a, Q>(
         &'a mut self,
-        params: I,
+        params: impl IntoIterator<Item = Q::Params<'a>> + 'a,
     ) -> impl Future<Output = Result<Vec<u64>, DriverError>> + 'a
     where
         Q: TypedQuery + 'a,
-        I: IntoIterator<Item = Q::Params<'a>> + 'a,
     {
-        self.armed(move |c| c.execute_batch::<Q, I>(params))
+        self.armed(move |c| c.execute_batch::<Q>(params))
     }
 
     /// Run a HOMOGENEOUS ATOMIC bulk QUERY inside this transaction — the guard peer of
@@ -2150,15 +2147,14 @@ impl Transaction<'_> {
     /// closure returns the classified error and the guard rolls the whole transaction
     /// back. When the batch is the FIRST statement in the body it fuses the deferred
     /// `BEGIN` (one round trip).
-    pub fn query_batch<'a, Q, I>(
+    pub fn query_batch<'a, Q>(
         &'a mut self,
-        params: I,
+        params: impl IntoIterator<Item = Q::Params<'a>> + 'a,
     ) -> impl Future<Output = Result<Vec<Rows<Q>>, DriverError>> + 'a
     where
         Q: TypedQuery + 'a,
-        I: IntoIterator<Item = Q::Params<'a>> + 'a,
     {
-        self.armed(move |c| c.query_batch::<Q, I>(params))
+        self.armed(move |c| c.query_batch::<Q>(params))
     }
 
     // ── COPY (bulk load / unload — legal + atomic inside a transaction) ─────

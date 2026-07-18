@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── execute_batch: ONE carrier, N parameter sets, per-command counts ─────
     // The `_` lets `I` (the iterator type) be inferred from the argument.
     let counts = conn
-        .execute_batch::<InsertOrder, _>([
+        .execute_batch::<InsertOrder>([
             (2i64, 42i64, 20i32, "pending"),
             (3i64, 42i64, 30i32, "pending"),
         ])
@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── query_batch: like execute_batch, but KEEP the RETURNING rows ─────────
     let grouped = conn
-        .query_batch::<InsertOrder, _>([
+        .query_batch::<InsertOrder>([
             (4i64, 42i64, 40i32, "pending"),
             (5i64, 42i64, 50i32, "pending"),
         ])

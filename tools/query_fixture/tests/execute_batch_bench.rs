@@ -42,7 +42,7 @@ async fn batch_vs_serial() {
     for &n in &[2_usize, 8, 32, 128, 512, 2000] {
         // Seed n rows.
         c.execute_raw("TRUNCATE eb_rows").await.expect("truncate");
-        c.execute_batch::<EbbUpd, _>((0..n as i64).map(|_| (0_i64, 0_i64)))
+        c.execute_batch::<EbbUpd>((0..n as i64).map(|_| (0_i64, 0_i64)))
             .await
             .ok(); // ignore (rows absent) — just to warm
         for i in 0..n as i64 {
@@ -53,13 +53,13 @@ async fn batch_vs_serial() {
 
         // Warm both paths once.
         let sets: Vec<(i64, i64)> = (0..n as i64).map(|i| (i, 1)).collect();
-        c.execute_batch::<EbbUpd, _>(sets.clone()).await.expect("warm batch");
+        c.execute_batch::<EbbUpd>(sets.clone()).await.expect("warm batch");
 
         // Time execute_batch (best of 5).
         let mut batch_ns = u128::MAX;
         for _ in 0..5 {
             let t = Instant::now();
-            c.execute_batch::<EbbUpd, _>(sets.clone()).await.expect("batch");
+            c.execute_batch::<EbbUpd>(sets.clone()).await.expect("batch");
             batch_ns = batch_ns.min(t.elapsed().as_nanos());
         }
 
@@ -69,7 +69,7 @@ async fn batch_vs_serial() {
         for _ in 0..5 {
             let t = Instant::now();
             for &(id, inc) in &sets {
-                c.execute_batch::<EbbUpd, _>(vec![(id, inc)]).await.expect("serial");
+                c.execute_batch::<EbbUpd>(vec![(id, inc)]).await.expect("serial");
             }
             serial_ns = serial_ns.min(t.elapsed().as_nanos());
         }

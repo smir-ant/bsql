@@ -94,7 +94,7 @@ async fn n_inserts_return_grouped_decoded_rows_and_all_apply() {
     fresh(&mut c).await;
     let labels = ["alpha", "beta", "gamma", "delta"];
     let grouped = c
-        .query_batch::<QbIns, _>(
+        .query_batch::<QbIns>(
             labels.iter().enumerate().map(|(i, l)| ((i as i64) + 1, *l)),
         )
         .await
@@ -120,12 +120,12 @@ async fn n_inserts_return_grouped_decoded_rows_and_all_apply() {
 async fn grouping_is_preserved_per_command() {
     let mut c = Connection::connect(&cfg()).await.expect("connect");
     fresh(&mut c).await;
-    c.query_batch::<QbIns, _>((1..=5).map(|i| (i, "x")))
+    c.query_batch::<QbIns>((1..=5).map(|i| (i, "x")))
         .await
         .expect("seed 5");
     // Three SELECT commands with $1 = 1, 3, 5 → row counts 1, 3, 5 respectively.
     let grouped = c
-        .query_batch::<QbSel, _>(vec![(1_i64,), (3,), (5,)])
+        .query_batch::<QbSel>(vec![(1_i64,), (3,), (5,)])
         .await
         .expect("select batch");
     assert_eq!(grouped.len(), 3, "one Rows<Q> per command");
@@ -147,7 +147,7 @@ async fn mid_batch_failure_returns_zero_results_and_applies_nothing() {
     fresh(&mut c).await;
     // ids 10,11,12,11(dup!),13 — command #3 violates the PK.
     let result = c
-        .query_batch::<QbIns, _>(vec![
+        .query_batch::<QbIns>(vec![
             (10_i64, "a"),
             (11, "b"),
             (12, "c"),
@@ -181,12 +181,12 @@ async fn zero_and_one() {
     let mut c = Connection::connect(&cfg()).await.expect("connect");
     fresh(&mut c).await;
     let empty = c
-        .query_batch::<QbIns, _>(Vec::<(i64, &str)>::new())
+        .query_batch::<QbIns>(Vec::<(i64, &str)>::new())
         .await
         .expect("N=0");
     assert!(empty.is_empty(), "N=0 → empty Vec, no I/O");
     let one = c
-        .query_batch::<QbIns, _>(vec![(1_i64, "solo")])
+        .query_batch::<QbIns>(vec![(1_i64, "solo")])
         .await
         .expect("N=1");
     assert_eq!(one.len(), 1, "N=1 → one grouped result");
@@ -208,7 +208,7 @@ async fn large_n_windowed_is_correct_and_deadlock_free() {
     fresh(&mut c).await;
     const N: i64 = 20_000;
     let grouped = c
-        .query_batch::<QbIns, _>((0..N).map(|i| (i, "bulk")))
+        .query_batch::<QbIns>((0..N).map(|i| (i, "bulk")))
         .await
         .expect("large batch");
     assert_eq!(grouped.len(), N as usize, "one grouped result per command");
@@ -223,7 +223,7 @@ async fn large_n_windowed_is_correct_and_deadlock_free() {
     c.execute_raw("TRUNCATE qb_rows").await.expect("truncate");
     let mut sets: Vec<(i64, &str)> = (0..N).map(|i| (i, "x")).collect();
     sets.push((5_000, "dup")); // duplicate PK late in the run
-    let result = c.query_batch::<QbIns, _>(sets).await;
+    let result = c.query_batch::<QbIns>(sets).await;
     assert!(matches!(result, Err(DriverError::BatchFailed { index, .. }) if index == N as usize));
     assert_eq!(row_count(&mut c).await, 0, "large mid-batch failure applied NOTHING");
     c.close().await.expect("close");
@@ -247,7 +247,7 @@ async fn oid_guard_drift_is_a_classified_batch_column_oid_mismatch() {
         .expect("seed drift");
     // A homogeneous batch of the SAME carrier — the guard fires on command 0's MISS
     // Describe, before ANY row decodes.
-    match c.query_batch::<QbTag, _>(vec![(), ()]).await {
+    match c.query_batch::<QbTag>(vec![(), ()]).await {
         Err(e @ DriverError::BatchColumnOidMismatch { .. }) => {
             assert_eq!(e.batch_failed_index(), Some(0), "verified ONCE on command 0");
             assert!(!e.is_disconnect(), "a schema drift is not a disconnect");
@@ -282,7 +282,7 @@ async fn oid_guard_matching_shadow_decodes_correctly() {
     c.execute_raw("INSERT INTO oidguard (tag, vc, bp, n) VALUES ('hello', 'v', 'b', 1)")
         .await
         .expect("seed match");
-    let grouped = c.query_batch::<QbTag, _>(vec![(), ()]).await.expect("matching batch runs");
+    let grouped = c.query_batch::<QbTag>(vec![(), ()]).await.expect("matching batch runs");
     assert_eq!(grouped.len(), 2);
     for rows in &grouped {
         assert_eq!(rows.iter().next().expect("row").expect("decode").tag, "hello");
@@ -304,7 +304,7 @@ async fn cancel_mid_batch_is_57014_and_connection_recovers() {
     });
     // Command #0 sleeps 3s; the cancel fires at ~300ms.
     let started = Instant::now();
-    let result = c.query_batch::<QbSleep, _>(vec![(), ()]).await;
+    let result = c.query_batch::<QbSleep>(vec![(), ()]).await;
     let elapsed = started.elapsed();
     drop(canceller.await);
     assert!(elapsed < Duration::from_secs(2), "cancel bounded the batch, took {elapsed:?}");

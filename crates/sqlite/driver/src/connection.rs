@@ -1167,13 +1167,15 @@ impl Connection {
     /// The first failing command's classified [`SqliteError`] (the transaction is
     /// rolled back); or [`SqliteError::TransactionRollbackFailed`] if the rollback
     /// itself fails.
-    pub fn execute_batch<'p, Q, I>(&self, params: I) -> Result<Vec<u64>, SqliteError>
+    pub fn execute_batch<'p, Q>(
+        &self,
+        params: impl IntoIterator<Item = Q::Params<'p>>,
+    ) -> Result<Vec<u64>, SqliteError>
     where
         Q: SqliteTypedQuery,
-        I: IntoIterator<Item = Q::Params<'p>>,
         Q::Params<'p>: SqliteBindParams,
     {
-        self.transaction(|tx| tx.execute_batch::<Q, I>(params))
+        self.transaction(|tx| tx.execute_batch::<Q>(params))
     }
 
     /// Run ONE compile-checked `query!` carrier `Q` against N parameter sets
@@ -1201,13 +1203,15 @@ impl Connection {
     /// The first failing command's classified [`SqliteError`] (the transaction is
     /// rolled back); or [`SqliteError::TransactionRollbackFailed`] if the rollback
     /// itself fails.
-    pub fn query_batch<'p, Q, I>(&self, params: I) -> Result<Vec<TypedRows<Q>>, SqliteError>
+    pub fn query_batch<'p, Q>(
+        &self,
+        params: impl IntoIterator<Item = Q::Params<'p>>,
+    ) -> Result<Vec<TypedRows<Q>>, SqliteError>
     where
         Q: SqliteTypedQuery,
-        I: IntoIterator<Item = Q::Params<'p>>,
         Q::Params<'p>: SqliteBindParams,
     {
-        self.transaction(|tx| tx.query_batch::<Q, I>(params))
+        self.transaction(|tx| tx.query_batch::<Q>(params))
     }
 
     /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
@@ -1728,10 +1732,12 @@ impl Transaction<'_> {
     /// # Errors
     ///
     /// The first failing command's classified [`SqliteError`].
-    pub fn execute_batch<'p, Q, I>(&self, params: I) -> Result<Vec<u64>, SqliteError>
+    pub fn execute_batch<'p, Q>(
+        &self,
+        params: impl IntoIterator<Item = Q::Params<'p>>,
+    ) -> Result<Vec<u64>, SqliteError>
     where
         Q: SqliteTypedQuery,
-        I: IntoIterator<Item = Q::Params<'p>>,
         Q::Params<'p>: SqliteBindParams,
     {
         let mut affected = Vec::new();
@@ -1755,10 +1761,12 @@ impl Transaction<'_> {
     /// # Errors
     ///
     /// The first failing command's classified [`SqliteError`].
-    pub fn query_batch<'p, Q, I>(&self, params: I) -> Result<Vec<TypedRows<Q>>, SqliteError>
+    pub fn query_batch<'p, Q>(
+        &self,
+        params: impl IntoIterator<Item = Q::Params<'p>>,
+    ) -> Result<Vec<TypedRows<Q>>, SqliteError>
     where
         Q: SqliteTypedQuery,
-        I: IntoIterator<Item = Q::Params<'p>>,
         Q::Params<'p>: SqliteBindParams,
     {
         let mut out = Vec::new();
