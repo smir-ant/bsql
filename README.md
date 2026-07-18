@@ -23,9 +23,8 @@ don't have to trust the tables — [reproduce them](#reproduce-it-yourself).
   `aarch64-apple-darwin`.
 - **Servers:** PostgreSQL **15.14** (Homebrew), loopback TCP, trust auth; SQLite via
   the **bundled amalgamation** (one file DB), one connection per client.
-- **Toolchains:** rustc **1.97.0** (stable; this bench is an independent `git`-dep
-  project — the library itself pins **1.96.0** for its diagnostic goldens), Go
-  **1.26.5**, Apple clang.
+- **Toolchains:** rustc **1.97.0** (stable — this bench is an independent project
+  built on current stable), Go **1.26.5**, Apple clang.
 - **Max-performance build flags** (every client, so nobody is handicapped):
 
   | language | flags |
