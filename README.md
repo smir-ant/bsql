@@ -130,6 +130,13 @@ same typed records. A PostgreSQL-only query (a `uuid` column, say) simply does
 not implement the SQLite trait, so running it on SQLite is a *compile* error.
 </details>
 
+**Runnable examples.** The [`examples/`](examples/) directory is a heavily-commented
+tour that doubles as a usage guide — one focused program per feature (basic CRUD,
+cross-backend, `params` vs `raw`, joins/aggregates, migrations, generated types,
+external-type bridges, N+1 detection, typed COPY, pipelining/batch, streaming,
+transactions, pooling, schema-per-test). The SQLite ones run with zero setup:
+`cargo run -p bsql-examples --bin basic_sqlite`.
+
 ## What makes it different
 
 <details>
