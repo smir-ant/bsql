@@ -165,7 +165,7 @@ mod bsql_async {
                         sink = sink.wrapping_add(r.id as u64 + r.name.len() as u64 + r.val as u64);
                     }
                 }
-                c.execute_sql("TRUNCATE bench_ins")
+                c.execute_raw("TRUNCATE bench_ins")
                     .await
                     .unwrap_or_else(|e| err_exit("insert", e));
                 for id in 1..=1000i64 {
@@ -186,7 +186,7 @@ mod bsql_async {
                 let mut pk: i32 = 0;
                 let mut ins_id: i64 = 0;
                 if scen == "insert" {
-                    c.execute_sql("TRUNCATE bench_ins")
+                    c.execute_raw("TRUNCATE bench_ins")
                         .await
                         .unwrap_or_else(|e| err_exit("insert", e));
                 }
@@ -321,7 +321,7 @@ mod bsql_sync_client {
                     sink = sink.wrapping_add(r.id as u64 + r.name.len() as u64 + r.val as u64);
                 }
             }
-            c.execute_sql("TRUNCATE bench_ins")
+            c.execute_raw("TRUNCATE bench_ins")
                 .unwrap_or_else(|e| err_exit("insert", e));
             for id in 1..=1000i64 {
                 c.execute_prepared::<(i64, &str, i32)>(&ins_stmt, &(id, "x", 1))
@@ -339,7 +339,7 @@ mod bsql_sync_client {
             let mut pk: i32 = 0;
             let mut ins_id: i64 = 0;
             if scen == "insert" {
-                c.execute_sql("TRUNCATE bench_ins")
+                c.execute_raw("TRUNCATE bench_ins")
                     .unwrap_or_else(|e| err_exit("insert", e));
             }
             for _ in 0..WARMUP {

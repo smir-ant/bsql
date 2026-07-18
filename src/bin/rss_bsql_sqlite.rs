@@ -44,7 +44,7 @@ fn run() -> Result<(), SqliteError> {
     let conn = Connection::open(&path)?;
 
     // Reads — a reused prepared handle (no per-call recompile), every column touched.
-    let mut stmt = conn.prepare_sql("SELECT id, name, email FROM bench_users WHERE id = ?1")?;
+    let mut stmt = conn.prepare_raw("SELECT id, name, email FROM bench_users WHERE id = ?1")?;
     for i in 0..h::RSS_SELECT_ITERS {
         let id = i64::from((i % h::SEED_ROWS) + 1);
         let p = [ValueRef::Integer(id)];

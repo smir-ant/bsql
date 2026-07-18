@@ -102,7 +102,7 @@ fn bench_fetch_one_eager(conn: &Connection) -> Result<(), SqliteError> {
 fn bench_fetch_many(conn: &Connection, limit: i64) -> Result<(), SqliteError> {
     let sql = "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT ?1";
     let p = [ValueRef::Integer(limit)];
-    let mut stmt = conn.prepare_sql(sql)?;
+    let mut stmt = conn.prepare_raw(sql)?;
     stmt.query_each(&p, |r| touch_all(&r))?; // warm up
     let iters = if limit >= 10_000 { ITERS_BIG } else { ITERS_DEFAULT };
     let start = Instant::now();
@@ -115,7 +115,7 @@ fn bench_fetch_many(conn: &Connection, limit: i64) -> Result<(), SqliteError> {
     Ok(())
 }
 
-/// By-PK through an EXPLICIT reusable prepared handle (`conn.prepare_sql` +
+/// By-PK through an EXPLICIT reusable prepared handle (`conn.prepare_raw` +
 /// `stmt.query_each`), the third path that closes the parity gap: the compiled
 /// statement is reused across the loop (a PLAIN, non-persistent prepare that
 /// keeps SQLite's lookaside pool live), so NO per-call `sqlite3_prepare_v2`
@@ -126,7 +126,7 @@ fn bench_fetch_many(conn: &Connection, limit: i64) -> Result<(), SqliteError> {
 fn bench_fetch_one_prepared(conn: &Connection) -> Result<(), SqliteError> {
     let sql = "SELECT id, name, email FROM bench_users WHERE id = ?1";
     let p = [ValueRef::Integer(42)];
-    let mut stmt = conn.prepare_sql(sql)?;
+    let mut stmt = conn.prepare_raw(sql)?;
     stmt.query_each(&p, |r| touch_all(&r))?; // warm up
     let start = Instant::now();
     for _ in 0..ITERS_DEFAULT {
@@ -146,7 +146,7 @@ fn bench_fetch_one_prepared(conn: &Connection) -> Result<(), SqliteError> {
 fn bench_fetch_many_prepared(conn: &Connection, limit: i64) -> Result<(), SqliteError> {
     let sql = "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT ?1";
     let p = [ValueRef::Integer(limit)];
-    let mut stmt = conn.prepare_sql(sql)?;
+    let mut stmt = conn.prepare_raw(sql)?;
     stmt.query_each(&p, |r| touch_all(&r))?; // warm up
     let start = Instant::now();
     for _ in 0..ITERS_DEFAULT {
@@ -165,7 +165,7 @@ fn bench_insert_single(conn: &Connection) -> Result<(), SqliteError> {
         ValueRef::Text(b"bench_insert"),
         ValueRef::Text(b"bench@example.com"),
     ];
-    let mut stmt = conn.prepare_sql(sql)?; // reuse one compiled INSERT … RETURNING
+    let mut stmt = conn.prepare_raw(sql)?; // reuse one compiled INSERT … RETURNING
     stmt.query_each(&p, |r| touch_all(&r))?; // warm up (reads id)
     let start = Instant::now();
     for _ in 0..ITERS_DEFAULT {
@@ -213,10 +213,10 @@ fn bench_join_aggregate(conn: &Connection) -> Result<(), SqliteError> {
                GROUP BY u.name \
                ORDER BY SUM(o.amount) DESC \
                LIMIT 100";
-    conn.query_each_sql(sql, |r| touch_all(&r))?; // warm up
+    conn.query_each_raw(sql, |r| touch_all(&r))?; // warm up
     let start = Instant::now();
     for _ in 0..ITERS_JOIN {
-        if let Some(e) = conn.query_each_sql(black_box(sql), |r| touch_all(&r))? {
+        if let Some(e) = conn.query_each_raw(black_box(sql), |r| touch_all(&r))? {
             return Err(e);
         }
     }
@@ -227,7 +227,7 @@ fn bench_join_aggregate(conn: &Connection) -> Result<(), SqliteError> {
 fn bench_subquery(conn: &Connection) -> Result<(), SqliteError> {
     let sql = "SELECT id, name, email FROM bench_users \
                WHERE id IN (SELECT user_id FROM bench_orders WHERE amount > 500 LIMIT 100)";
-    let mut stmt = conn.prepare_sql(sql)?; // reuse one compiled statement (parameterless)
+    let mut stmt = conn.prepare_raw(sql)?; // reuse one compiled statement (parameterless)
     stmt.query_each(&[], |r| touch_all(&r))?; // warm up
     let start = Instant::now();
     for _ in 0..ITERS_SUBQUERY {
@@ -243,7 +243,7 @@ fn run() -> Result<(), SqliteError> {
     let path = std::env::var("BENCH_SQLITE_PATH")
         .map_err(|_| SqliteError::Open("BENCH_SQLITE_PATH must be set".to_owned()))?;
     let conn = Connection::open(&path)?;
-    conn.execute_sql("PRAGMA synchronous=NORMAL")?;
+    conn.execute_raw("PRAGMA synchronous=NORMAL")?;
     println!("=== rebuild bsql (bundled SQLite) Benchmarks ===");
     println!("path={path}\n");
 

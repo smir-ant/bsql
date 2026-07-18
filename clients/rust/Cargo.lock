@@ -87,7 +87,8 @@ dependencies = [
 
 [[package]]
 name = "bsql"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "bsql-postgres-async",
  "bsql-postgres-core",
@@ -98,18 +99,21 @@ dependencies = [
 
 [[package]]
 name = "bsql-build"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "sqlparser",
 ]
 
 [[package]]
 name = "bsql-common"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 
 [[package]]
 name = "bsql-postgres-async"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
@@ -119,7 +123,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-core"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "bsql-common",
  "bsql-postgres-proto",
@@ -128,7 +133,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-proto"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "arrayvec",
  "base64ct",
@@ -144,7 +150,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-sync"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
@@ -153,7 +160,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-query-macros"
-version = "1.0.0-alpha.0"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "bsql-build",
  "proc-macro2",

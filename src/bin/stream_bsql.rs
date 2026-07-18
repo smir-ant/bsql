@@ -3,7 +3,7 @@
 //! Usage: `stream_bsql <rows>`  (the sweep uses 1_000_000 and 5_000_000)
 //!
 //! Streams a synthetic `rows`-row result (see [`bsql_bench::stream_sql`]) through
-//! bsql's dynamic `query_each_sql`, which lends each row as a zero-copy
+//! bsql's dynamic `query_each_raw`, which lends each row as a zero-copy
 //! `BorrowedRow` and accumulates NOTHING — O(1) resident memory regardless of the
 //! row count. Every column is decoded (the real work). It reports two things a
 //! materialising client structurally cannot match:
@@ -150,7 +150,7 @@ async fn consume_stream(conn: &mut bsql::pg::Connection, sql: &str) -> Result<(u
     let mut count: u64 = 0;
     let mut sink: u64 = 0;
     let outcome = conn
-        .query_each_sql(sql, |row| {
+        .query_each_raw(sql, |row| {
             match (row.get_i32(0), row.get_str(1), row.get_i32(2)) {
                 (Ok(id), Ok(name), Ok(val)) => {
                     if let Some(v) = id {

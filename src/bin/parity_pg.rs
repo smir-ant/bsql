@@ -155,8 +155,8 @@ fn bench_fetch_many(conn: &mut Connection, limit: i64) -> Result<(), DriverError
 /// pending checkpoint could fire mid-measurement. Each insert cell thus measures
 /// on a comparably-clean table.
 fn reset_insert_rows(conn: &mut Connection) -> Result<(), DriverError> {
-    conn.execute_sql("DELETE FROM bench_users WHERE name = 'bench_insert'")?;
-    conn.execute_sql("CHECKPOINT")?;
+    conn.execute_raw("DELETE FROM bench_users WHERE name = 'bench_insert'")?;
+    conn.execute_raw("CHECKPOINT")?;
     Ok(())
 }
 
@@ -236,11 +236,11 @@ fn bench_insert_batch(conn: &mut Connection) -> Result<(), DriverError> {
 /// a discrete-INSERT comparable — reported separately, into a purpose-built sink
 /// of exactly the (name, email, active, score) shape.
 fn bench_insert_batch_copy(conn: &mut Connection) -> Result<(), DriverError> {
-    conn.execute_sql(
+    conn.execute_raw(
         "CREATE UNLOGGED TABLE IF NOT EXISTS bench_copy_sink \
          (name text, email text, active boolean, score double precision)",
     )?;
-    conn.execute_sql("TRUNCATE bench_copy_sink")?;
+    conn.execute_raw("TRUNCATE bench_copy_sink")?;
     let run_copy = |c: &mut Connection| -> Result<(), DriverError> {
         c.copy_in_with("bench_copy_sink", |w| {
             for j in 0..100_i32 {

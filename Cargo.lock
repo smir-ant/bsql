@@ -108,8 +108,8 @@ dependencies = [
 
 [[package]]
 name = "bsql"
-version = "1.0.0-alpha.1"
-source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "bsql-postgres-async",
  "bsql-postgres-core",
@@ -136,21 +136,21 @@ dependencies = [
 
 [[package]]
 name = "bsql-build"
-version = "1.0.0-alpha.1"
-source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "sqlparser",
 ]
 
 [[package]]
 name = "bsql-common"
-version = "1.0.0-alpha.1"
-source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 
 [[package]]
 name = "bsql-postgres-async"
-version = "1.0.0-alpha.1"
-source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
@@ -160,8 +160,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-core"
-version = "1.0.0-alpha.1"
-source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "bsql-common",
  "bsql-postgres-proto",
@@ -170,8 +170,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-proto"
-version = "1.0.0-alpha.1"
-source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "arrayvec",
  "base64ct",
@@ -187,8 +187,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-postgres-sync"
-version = "1.0.0-alpha.1"
-source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "bsql-postgres-core",
  "bsql-postgres-proto",
@@ -197,8 +197,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-query-macros"
-version = "1.0.0-alpha.1"
-source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "bsql-build",
  "proc-macro2",
@@ -209,8 +209,8 @@ dependencies = [
 
 [[package]]
 name = "bsql-sqlite"
-version = "1.0.0-alpha.1"
-source = "git+https://github.com/smir-ant/bsql?branch=main#e6998e1fb67ef2f9f9dc7d4b8b1b4f08d00bb59f"
+version = "1.0.0-alpha.2"
+source = "git+https://github.com/smir-ant/bsql?branch=main#d74cd2ad74eab8641f96949e5d76e69c1e5efc23"
 dependencies = [
  "bsql-common",
  "rusqlite",
@@ -2125,7 +2125,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

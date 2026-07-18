@@ -5,7 +5,7 @@
 //! Runs the SAME synthetic `rows`-row query as `stream_bsql`, but through
 //! tokio-postgres's ordinary `Client::query`, which BUFFERS the entire result
 //! into a `Vec<Row>` before returning — so its peak RSS grows with the row count
-//! (O(rows)), the structural opposite of bsql's `query_each_sql` O(1) stream.
+//! (O(rows)), the structural opposite of bsql's `query_each_raw` O(1) stream.
 //! This is the Rust peer of the libpq `PQexec` O(rows) contrast in the C client;
 //! together they make the RSS curve concrete.
 //!

@@ -253,7 +253,7 @@ pub const SQL_CONC_BY_PK: &str = "SELECT id, name, val FROM bench_items WHERE id
 /// The SQL the STREAMING benchmark runs on every client: a synthetic result of
 /// `rows` rows, three columns (int4 / text / int4), produced entirely on the
 /// server by `generate_series` — so no seed data is needed and the row count is
-/// a free parameter. bsql streams it in O(1) memory via `query_each_sql`; a
+/// a free parameter. bsql streams it in O(1) memory via `query_each_raw`; a
 /// materialising client (libpq `PQexec`, tokio-postgres `query`) buffers all
 /// `rows` at once. `g` ≤ 5·10⁶ and `g*2` ≤ 10⁷ both fit `int4`.
 #[must_use]

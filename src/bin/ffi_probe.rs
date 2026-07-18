@@ -508,7 +508,7 @@ fn run() -> Result<(), String> {
 
     // REBUILD (rusqlite) in the SAME process, SAME engine.
     let conn = Connection::open(&path).map_err(|e| format!("rebuild open: {e}"))?;
-    conn.execute_sql("PRAGMA synchronous=NORMAL")
+    conn.execute_raw("PRAGMA synchronous=NORMAL")
         .map_err(|e| format!("rebuild sync: {e}"))?;
     rebuild_fetch_one_stream(&conn).map_err(|e| format!("rebuild_fetch_one_stream: {e}"))?;
     rebuild_fetch_one_eager(&conn).map_err(|e| format!("rebuild_fetch_one_eager: {e}"))?;
