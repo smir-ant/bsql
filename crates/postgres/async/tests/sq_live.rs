@@ -2289,6 +2289,125 @@ async fn copy_round_trip_in_then_out() {
     c.close().await.expect("close");
 }
 
+/// DATA-CORRECTNESS regression (COPY OUT): an OVERSIZE row — one `CopyData`
+/// frame larger than the engine's bounded read buffer — must reach `on_chunk`
+/// BYTE-FOR-BYTE, never truncated to the internal 8 KiB oversize prefix. The
+/// former Sub-B path surfaced only the first 8192 bytes of a wide row and
+/// counted-and-skipped the rest, so any row wider than ~8 KiB (routine for
+/// `text`/`json`/`bytea`) silently lost its tail. Two rows here — one over the
+/// 8 KiB prefix, one over the 64 KiB read buffer's several fills — must both
+/// round-trip byte-exact.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn copy_out_oversize_rows_are_byte_exact() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+    c.execute_raw("CREATE TEMP TABLE cp_wide(tag text, payload text)")
+        .await
+        .expect("create");
+
+    // Row A: a payload well over the 8 KiB oversize prefix (the truncation site).
+    // Row B: a payload over 64 KiB, so its one CopyData spans many buffer fills.
+    const WIDE: usize = 50_000; // > 8192
+    const HUGE: usize = 70_000; // > 65536
+    c.execute_raw(
+        "INSERT INTO cp_wide(tag, payload) \
+         VALUES ('A', repeat('x', 50000)), ('B', repeat('y', 70000))",
+    )
+    .await
+    .expect("insert wide rows");
+
+    // Stream the unload, concatenating every chunk exactly as a byte-stream
+    // consumer does (a text-COPY line is `tag \t payload \n`).
+    let mut received: Vec<u8> = Vec::new();
+    let broke: Option<core::convert::Infallible> = c
+        .copy_out("cp_wide", |chunk| {
+            received.extend_from_slice(chunk);
+            core::ops::ControlFlow::Continue(())
+        })
+        .await
+        .expect("copy_out");
+    assert!(broke.is_none(), "streamed to completion");
+
+    // Every byte must be delivered: 'A\t'(2) + 50000 + '\n'(1) + 'B\t'(2) + 70000 + '\n'(1).
+    let expected_total = WIDE + HUGE + 6;
+    assert_eq!(
+        received.len(),
+        expected_total,
+        "every COPY-OUT byte delivered (no 8 KiB truncation): got {}, expected {expected_total}",
+        received.len(),
+    );
+
+    // Content is byte-exact: each line's payload is a uniform run of its letter,
+    // full length (a truncation-splice would break both the run and the length).
+    let text = String::from_utf8(received).expect("utf8 copy stream");
+    let mut rows: Vec<(char, usize, u8)> = Vec::new();
+    for line in text.lines() {
+        let (tag, payload) = line.split_once('\t').expect("tab-separated COPY line");
+        let first = payload.bytes().next().expect("non-empty payload");
+        assert!(
+            payload.bytes().all(|b| b == first),
+            "payload for tag {tag} is a uniform run — no spliced truncation boundary",
+        );
+        let tag_char = tag.chars().next().expect("non-empty tag");
+        rows.push((tag_char, payload.len(), first));
+    }
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![('A', WIDE, b'x'), ('B', HUGE, b'y')],
+        "both oversize rows round-trip byte-exact (full length, correct bytes)",
+    );
+
+    // The connection is clean and reusable after the oversize unload.
+    assert!(c.is_healthy(), "connection reusable after oversize COPY OUT");
+    assert_eq!(
+        c.query_raw("SELECT count(*) FROM cp_wide").await.expect("count").get(0).expect("row 0").get_i64(0),
+        Ok(Some(2)),
+    );
+    c.close().await.expect("close");
+}
+
+/// The lossless streaming path hands an oversize row to `on_chunk` as SEVERAL
+/// chunks, so a `Break` can now land MID-ROW (impossible before the fix, when an
+/// oversize `CopyData` was one truncated event). The connection must still drain
+/// the REST of the oversize frame — plus the remaining rows — back to a clean
+/// idle and stay reusable.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn copy_out_break_mid_oversize_row_recovers() {
+    let config = ConnectConfig::new("127.0.0.1", "smir-ant").database("postgres".to_string());
+    let mut c = Connection::connect(&config).await.expect("connect");
+    c.execute_raw("CREATE TEMP TABLE cp_brk_ov(payload text)").await.expect("create");
+    c.execute_raw("INSERT INTO cp_brk_ov(payload) VALUES (repeat('z', 60000)), (repeat('z', 60000))")
+        .await
+        .expect("insert wide rows");
+
+    // Break on the VERY FIRST chunk — a partial piece of the first 60 KB row.
+    let mut seen = 0usize;
+    let broke: Option<&'static str> = c
+        .copy_out("cp_brk_ov", |chunk| {
+            seen += chunk.len();
+            core::ops::ControlFlow::Break("stopped mid-row")
+        })
+        .await
+        .expect("copy_out");
+    assert_eq!(broke, Some("stopped mid-row"), "on_chunk broke early");
+    assert!(
+        seen > 0 && seen < 60_000,
+        "broke after a PARTIAL first chunk (mid-row), saw {seen} bytes",
+    );
+
+    // The connection drained the rest of the oversize frame + the second row to a
+    // clean idle and is reusable.
+    assert!(c.is_healthy(), "connection reusable after a mid-oversize-row break");
+    assert_eq!(
+        c.query_raw("SELECT count(*) FROM cp_brk_ov").await.expect("count").get(0).expect("row 0").get_i64(0),
+        Ok(Some(2)),
+    );
+    c.close().await.expect("close");
+}
+
 #[tokio::test]
 #[ignore = "requires local PG"]
 async fn copy_in_large_chunk_passthrough() {

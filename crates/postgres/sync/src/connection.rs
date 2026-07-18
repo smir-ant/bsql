@@ -1631,10 +1631,16 @@ impl Connection {
     /// `COPY <table> TO STDOUT`, streaming each row to `on_chunk` in CONSTANT
     /// memory — the bulk-unload peer of [`copy_in`](Self::copy_in).
     ///
-    /// Each server `CopyData` frame is handed to `on_chunk` as a borrowed slice into
-    /// the transient ingest buffer; nothing is accumulated. The borrowed chunk
-    /// CANNOT escape the closure (the `for<'q>` bound is the escape wall).
-    /// `on_chunk` returns [`ControlFlow`]. `table` is validated as an identifier.
+    /// `on_chunk` is a BYTE-STREAM sink: each server `CopyData` frame is handed
+    /// to it as a borrowed slice into the transient ingest buffer, and the
+    /// consumer concatenates (or incrementally parses) the successive chunks —
+    /// nothing is accumulated driver-side. The chunk boundaries are NOT
+    /// semantically meaningful: a row WIDER than the internal read buffer is
+    /// delivered as SEVERAL `on_chunk` calls whose bytes concatenate to the whole
+    /// row (so a colossal single row streams byte-exact in constant memory, never
+    /// truncated). The borrowed chunk CANNOT escape the closure (the `for<'q>`
+    /// bound is the escape wall). `on_chunk` returns [`ControlFlow`]. `table` is
+    /// validated as an identifier.
     ///
     /// # Returns
     ///

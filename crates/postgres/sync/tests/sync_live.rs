@@ -1904,6 +1904,70 @@ fn copy_round_trip_in_then_out() {
     c.close().expect("close");
 }
 
+/// DATA-CORRECTNESS regression (COPY OUT), sync twin of
+/// `copy_out_oversize_rows_are_byte_exact`: an OVERSIZE row (one `CopyData`
+/// frame larger than the engine's bounded read buffer) reaches `on_chunk`
+/// byte-for-byte, never truncated to the internal 8 KiB oversize prefix. Both
+/// drivers share `Core<S>` + the proto engine, so this witnesses the SAME fix
+/// over the blocking transport.
+#[test]
+#[ignore = "requires local PG"]
+fn copy_out_oversize_rows_are_byte_exact() {
+    let mut c = Connection::connect(&sync_config()).expect("connect");
+    c.execute_raw("CREATE TEMP TABLE cp_wide(tag text, payload text)").expect("create");
+
+    const WIDE: usize = 50_000; // > 8192
+    const HUGE: usize = 70_000; // > 65536
+    c.execute_raw(
+        "INSERT INTO cp_wide(tag, payload) \
+         VALUES ('A', repeat('x', 50000)), ('B', repeat('y', 70000))",
+    )
+    .expect("insert wide rows");
+
+    let mut received: Vec<u8> = Vec::new();
+    let broke: Option<core::convert::Infallible> = c
+        .copy_out("cp_wide", |chunk| {
+            received.extend_from_slice(chunk);
+            core::ops::ControlFlow::Continue(())
+        })
+        .expect("copy_out");
+    assert!(broke.is_none(), "streamed to completion");
+
+    let expected_total = WIDE + HUGE + 6; // 'A\t'+50000+'\n' + 'B\t'+70000+'\n'
+    assert_eq!(
+        received.len(),
+        expected_total,
+        "every COPY-OUT byte delivered (no 8 KiB truncation): got {}, expected {expected_total}",
+        received.len(),
+    );
+
+    let text = String::from_utf8(received).expect("utf8 copy stream");
+    let mut rows: Vec<(char, usize, u8)> = Vec::new();
+    for line in text.lines() {
+        let (tag, payload) = line.split_once('\t').expect("tab-separated COPY line");
+        let first = payload.bytes().next().expect("non-empty payload");
+        assert!(
+            payload.bytes().all(|b| b == first),
+            "payload for tag {tag} is a uniform run — no spliced truncation boundary",
+        );
+        let tag_char = tag.chars().next().expect("non-empty tag");
+        rows.push((tag_char, payload.len(), first));
+    }
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![('A', WIDE, b'x'), ('B', HUGE, b'y')],
+        "both oversize rows round-trip byte-exact (full length, correct bytes)",
+    );
+
+    assert!(c.is_healthy(), "connection reusable after oversize COPY OUT");
+    assert_eq!(
+        c.query_raw("SELECT count(*) FROM cp_wide").expect("count").get(0).expect("row 0").get_i64(0),
+        Ok(Some(2)),
+    );
+    c.close().expect("close");
+}
+
 #[test]
 #[ignore = "requires local PG"]
 fn copy_in_large_chunk_passthrough() {

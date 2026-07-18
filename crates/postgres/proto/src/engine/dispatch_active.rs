@@ -77,9 +77,19 @@
 //!
 //! - **Sub-A** — an oversize `DataRow` streams as [`Event::RowChunk`] chunks
 //!   (each ≤ one buffer fill) terminated by [`Event::RowChunkEnd`].
-//! - **Sub-B** — an oversize streaming-eligible non-`D` frame keeps a bounded
-//!   8 KiB prefix and counts-and-skips the tail, then surfaces the truncated
-//!   prefix as its classified event.
+//! - **CopyStream** — an oversize `CopyData` (a COPY-OUT row wider than the
+//!   buffer) streams as successive [`Event::CopyData`] chunks (each ≤ one
+//!   buffer fill), with NO reassembly terminator: a COPY consumer concatenates
+//!   the chunk byte-stream exactly as it concatenates whole `CopyData` frames,
+//!   so a colossal row is delivered BYTE-EXACT in constant memory. This is the
+//!   `CopyData` twin of Sub-A; it deliberately does NOT take the truncating
+//!   Sub-B path, which would silently drop the row's tail (a data-loss bug).
+//! - **Sub-B** — an oversize streaming-eligible CONTROL/async frame
+//!   (`NoticeResponse` / `NotificationResponse` / `ParameterStatus` /
+//!   `ErrorResponse` / `CommandComplete`) keeps a bounded 8 KiB prefix and
+//!   counts-and-skips the tail, then surfaces the truncated prefix as its
+//!   classified event — safe because these are diagnostic/control text whose
+//!   tail past 8 KiB is not load-bearing (unlike a `CopyData` row's bytes).
 //!
 //! Any other oversize tag is a classified teardown.
 
@@ -334,12 +344,23 @@ enum ActiveOutcome {
     CopyData(Lend, usize, usize),
 }
 
-/// Sub-A (`DataRow`) vs Sub-B (streaming-eligible non-`D`) vs Sub-C
-/// (parse-whole control frame) oversize handling.
+/// Sub-A (`DataRow`) vs CopyStream (`CopyData` row) vs Sub-B (streaming-eligible
+/// control/async non-`D`) vs Sub-C (parse-whole control frame) oversize handling.
 #[derive(Debug, Clone, Copy)]
 enum OversizeMode {
     /// Stream the row body as `RowChunk` / `RowChunkEnd`.
     SubA,
+    /// Stream an oversize `CopyData` body as successive `CopyData` chunks (each
+    /// ≤ one buffer fill), surfacing NO reassembly terminator — a COPY-OUT
+    /// consumer concatenates the chunk byte-stream exactly as it concatenates
+    /// across whole `CopyData` frames, so the whole (possibly multi-GB) row is
+    /// delivered byte-exact in CONSTANT memory. The `CopyData` twin of `SubA`
+    /// (which streams a `DataRow`): the difference is only the surfaced event
+    /// (`CopyData` vs `RowChunk`) and that no `…End` terminator is owed — the
+    /// driver reassembles nothing, it lends each chunk straight to `on_chunk`.
+    /// This EXISTS precisely so an oversize row is never routed to the truncating
+    /// `SubB` (which would silently drop its tail).
+    CopyStream,
     /// Keep a bounded prefix, count-and-skip the tail, then surface the
     /// truncated event classified by `surfaced_tag`.
     SubB,
@@ -2461,6 +2482,31 @@ impl ActiveEngine {
                 prefix_len: 0,
             });
             ActiveOutcome::Silent
+        } else if tag == T_COPY_DATA {
+            // An oversize `CopyData` is a COPY-OUT row wider than the buffer. It
+            // must NOT take the truncating Sub-B path (which surfaces only the
+            // first 8 KiB and counts-and-skips the tail — silent data loss for any
+            // row over ~8 KiB). Stream it LOSSLESSLY as `CopyData` chunks instead,
+            // in constant memory, exactly as Sub-A streams a `DataRow`.
+            //
+            // Phase-gated to `CopyOut`, mirroring the in-buffer `step_copy_out`:
+            // a `CopyData` out of phase (reachable only from a hostile /
+            // non-compliant server) is a classified teardown, never a spurious
+            // out-of-phase `CopyData` surfaced. Gating HERE (at begin) — rather
+            // than after buffering, as the old Sub-B path did in
+            // `deliver_oversize_prefix` — means an out-of-phase oversize
+            // `CopyData` tears down before any streaming begins.
+            if matches!(self.state, ActiveState::CopyOut) {
+                self.oversize = Some(OversizeStream {
+                    mode: OversizeMode::CopyStream,
+                    body_remaining: body_len,
+                    surfaced_tag: tag,
+                    prefix_len: 0,
+                });
+                ActiveOutcome::Silent
+            } else {
+                self.teardown()
+            }
         } else if is_streaming_eligible(tag) {
             if self.prefix.is_none() {
                 self.prefix = Some(Box::new([0u8; OVERSIZE_PREFIX_CAP]));
@@ -2503,6 +2549,27 @@ impl ActiveEngine {
                         os.body_remaining = os.body_remaining.saturating_sub(took);
                         self.oversize = Some(os);
                         ActiveOutcome::RowChunk(Lend::Ingest, start, end)
+                    }
+                }
+            }
+            OversizeMode::CopyStream => {
+                if os.body_remaining == 0 {
+                    // Whole row streamed — clear the stream and resume framing.
+                    // NO terminator event (unlike Sub-A's `RowChunkEnd`): a COPY
+                    // consumer reassembles nothing, so the next `CopyData` /
+                    // `CopyDone` frame simply follows in the byte-stream.
+                    self.oversize = None;
+                    return ActiveOutcome::Silent;
+                }
+                match self.ingest.take_chunk(os.body_remaining) {
+                    None => ActiveOutcome::NeedMore,
+                    Some((start, end)) => {
+                        let took = end.saturating_sub(start);
+                        os.body_remaining = os.body_remaining.saturating_sub(took);
+                        self.oversize = Some(os);
+                        // Lend this chunk straight through as one more `CopyData`
+                        // piece of the row — byte-lossless, in constant memory.
+                        ActiveOutcome::CopyData(Lend::Ingest, start, end)
                     }
                 }
             }
@@ -2567,28 +2634,19 @@ impl ActiveEngine {
     ///
     /// The phase-independent async frames (`Notice`, `Notify`, `ParameterStatus`)
     /// do not advance the command state machine — their truncated prefix IS the
-    /// observable, legal in any phase. `CopyData` is a COPY-OUT data frame, so it
-    /// is phase-gated to the `CopyOut` state exactly as the in-buffer
-    /// `step_copy_out` gates it; out of phase it is a classified teardown, never a
-    /// spurious surfaced event. The state-advancing control frames
-    /// (`ErrorResponse`, `CommandComplete`) must still run their command-state
-    /// transition when oversize, exactly as the in-buffer path does; otherwise
-    /// the trailing `ReadyForQuery` lands in the wrong phase and tears down.
+    /// observable, legal in any phase. (`CopyData` is NOT handled here — an
+    /// oversize COPY-OUT row takes the LOSSLESS [`CopyStream`](OversizeMode::CopyStream)
+    /// path, never Sub-B truncation; `begin_oversize` phase-gates and routes it
+    /// there, so a `CopyData` tag can never reach this Sub-B completion.) The
+    /// state-advancing control frames (`ErrorResponse`, `CommandComplete`) must
+    /// still run their command-state transition when oversize, exactly as the
+    /// in-buffer path does; otherwise the trailing `ReadyForQuery` lands in the
+    /// wrong phase and tears down.
     fn deliver_oversize_prefix(&mut self, tag: u8, n: usize) -> ActiveOutcome {
         match tag {
             T_NOTICE => ActiveOutcome::Notice(Lend::Prefix, 0, n),
             T_NOTIFY => ActiveOutcome::Notify(Lend::Prefix, 0, n),
             T_PARAM_STATUS => ActiveOutcome::ParamStatus(Lend::Prefix, 0, n),
-            // Phase-gated: a CopyData is legal only during COPY OUT, mirroring the
-            // in-buffer `step_copy_out`. In phase, surface the truncated prefix.
-            T_COPY_DATA if matches!(self.state, ActiveState::CopyOut) => {
-                ActiveOutcome::CopyData(Lend::Prefix, 0, n)
-            }
-            // An oversize CopyData outside COPY OUT (reachable only from a
-            // hostile / non-compliant server) is out of phase: teardown, never a
-            // spurious out-of-phase CopyData event. The body was already
-            // bounded-absorbed into the prefix, so this is bounded and crash-free.
-            T_COPY_DATA => self.teardown(),
             T_ERROR => {
                 // Mirror `fail_recoverable`: park the drain so the trailing RFQ
                 // recovers the connection (a query-level error is recoverable).
@@ -2722,15 +2780,20 @@ fn parse_row_desc_owned(
     Ok((oids, names))
 }
 
-/// Is `tag` a payload-bearing non-`DataRow` frame whose oversize is absorbed
-/// via the Sub-B prefix-and-truncate path? Control frames (whose oversize is a
-/// protocol impossibility) are excluded — those tear the connection down.
+/// Is `tag` a payload-bearing control/async frame whose oversize is absorbed
+/// via the Sub-B prefix-and-truncate path? Deliberately EXCLUDES `CopyData` —
+/// an oversize COPY-OUT row must be delivered byte-exact, so it takes the
+/// LOSSLESS [`CopyStream`](OversizeMode::CopyStream) path instead of being
+/// truncated (its tag is classified before this in `begin_oversize`). The
+/// remaining tags carry diagnostic/control text whose tail past the 8 KiB
+/// prefix is not load-bearing. Other control frames (whose oversize is a
+/// protocol impossibility) are excluded too — those tear the connection down.
 #[inline]
 #[must_use]
 fn is_streaming_eligible(tag: u8) -> bool {
     matches!(
         tag,
-        T_NOTICE | T_ERROR | T_NOTIFY | T_COPY_DATA | T_COMMAND_COMPLETE | T_PARAM_STATUS
+        T_NOTICE | T_ERROR | T_NOTIFY | T_COMMAND_COMPLETE | T_PARAM_STATUS
     )
 }
 

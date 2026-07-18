@@ -588,13 +588,13 @@ fn oversize_control_frame_tears_down() {
 }
 
 /// An OVERSIZE `CopyData` OUTSIDE the COPY-OUT phase is out of phase: it must
-/// tear down (`Close`), never surface a spurious truncated `CopyData` event.
-/// The in-buffer path already tears a stray `CopyData` down in `step_idle`; the
-/// oversize Sub-B path must mirror that phase gate — `CopyData` is
-/// streaming-eligible, so WITHOUT the gate it is absorbed into the prefix and
-/// surfaced out of phase. Reachable only from a hostile / non-compliant server;
-/// bounded, no crash (the body is absorbed into the bounded prefix, then torn
-/// down).
+/// tear down (`Close`), never surface a spurious `CopyData` event. The in-buffer
+/// path already tears a stray `CopyData` down in `step_idle`; the oversize
+/// `CopyStream` path mirrors that phase gate at `begin_oversize` — an
+/// out-of-phase oversize `CopyData` tears down BEFORE any chunk is streamed
+/// (never entering the lossless in-phase stream). Reachable only from a hostile /
+/// non-compliant server; bounded, no crash (the teardown consumes nothing, and
+/// the connection is dead).
 #[test]
 fn oversize_copy_data_outside_copy_out_tears_down() {
     let mut engine = active_engine();
@@ -615,31 +615,57 @@ fn oversize_copy_data_outside_copy_out_tears_down() {
     );
 }
 
-/// The in-phase companion: an oversize `CopyData` DURING COPY OUT still surfaces
-/// its truncated Sub-B prefix, then the engine resumes — proving the phase gate
-/// preserves the legitimate path and rejects only the out-of-phase case.
+/// DATA-CORRECTNESS: an oversize `CopyData` DURING COPY OUT streams its WHOLE
+/// body BYTE-EXACT via the lossless `CopyStream` path — NOT truncated to the
+/// former 8 KiB Sub-B prefix. This is the inverse of the old blessing test
+/// (`…surfaces_truncated_prefix`), which asserted the 8 KiB truncation was
+/// "correct" and thereby encoded the data-loss bug: PostgreSQL sends one
+/// `CopyData` per row in a text/CSV COPY OUT, so any row wider than ~8 KiB
+/// (routine for `text`/`json`/`bytea`) silently lost its tail. The fix streams a
+/// wide row as SUCCESSIVE `CopyData` chunks (each ≤ one buffer fill, constant
+/// memory) that concatenate to the full body — the exact bytes a COPY-OUT
+/// consumer receives and reassembles — then the engine resumes and completes the
+/// COPY. The out-of-phase teardown gate is proven by
+/// [`oversize_copy_data_outside_copy_out_tears_down`].
 #[test]
-fn oversize_copy_data_in_copy_out_surfaces_truncated_prefix() {
-    /// Mirror of the engine-private Sub-B prefix cap.
-    const PREFIX_CAP: usize = 8192;
+fn oversize_copy_data_in_copy_out_streams_the_full_row_byte_exact() {
     let mut engine = active_engine();
     // Open COPY OUT so a CopyData is in phase.
     feed(&mut engine, &copy_out_response(1));
     assert!(matches!(engine.next_event(), Event::NeedMore));
 
-    let body_len = PREFIX_CAP * 2 + 7; // exceeds both READ_BUF_CAP and the prefix
+    // A row far larger than BOTH the read buffer and the old 8 KiB prefix, so it
+    // MUST stream as several chunks (the truncating path dropped everything past
+    // 8192). Filled with a single byte value so any splice/loss is visible.
+    let body_len = READ_BUF_CAP * 3 + 137;
     let declared = u32::try_from(body_len + 4).expect("declared fits u32");
     let oversize = frame_declared(TAG_COPY_DATA.byte(), declared, &vec![b'd'; body_len]);
     let tail = concat(&[copy_done(), command_complete("COPY 1"), ready_for_query(b'I')]);
     let wire = concat(&[oversize, tail]);
 
     let events = drive(&mut engine, &wire, 1000);
-    match events.first() {
-        Some(Ev::CopyData(prefix)) => {
-            assert_eq!(prefix.len(), PREFIX_CAP, "Sub-B prefix truncated to the cap");
+
+    // Concatenate every CopyData chunk: the WHOLE row is delivered, byte-exact.
+    let mut body = Vec::new();
+    for e in &events {
+        if let Ev::CopyData(chunk) = e {
+            assert!(
+                chunk.len() <= READ_BUF_CAP,
+                "each streamed chunk is bounded by one buffer fill (constant memory)",
+            );
+            body.extend_from_slice(chunk);
         }
-        other => panic!("expected a truncated in-phase CopyData, got {other:?}"),
     }
+    assert_eq!(
+        body.len(),
+        body_len,
+        "the whole oversize row is delivered (no 8 KiB truncation), got {} of {body_len}",
+        body.len(),
+    );
+    assert!(
+        body.iter().all(|&b| b == b'd'),
+        "every delivered byte is exact — no truncation-splice",
+    );
     assert_eq!(
         events.last(),
         Some(&Ev::Idle),
