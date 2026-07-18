@@ -38,7 +38,7 @@ syn = { workspace = true }
 # runtime graph, because no shipped crate depends on `bsql-query-macros`.
 # The emitted code references ONLY the shipped runtime decode primitives
 # in `bsql-postgres-proto`, never this crate or `bsql-build`.
-bsql-build = { version = "1.0.0-alpha.1", path = "../build" }
+bsql-build = { version = "1.0.0-alpha.2", path = "../build" }
 
 # `sha2` — content-addresses each `query!` SQL into its prepared
 # statement name (a SHA-256 truncated to 96 bits). Already a workspace

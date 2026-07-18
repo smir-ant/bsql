@@ -15,9 +15,9 @@ repository.workspace = true
 # `bsql-testkit` package itself. Both drivers are pulled so one fake backs
 # either driver (the twin-driver discipline: `connect` for async,
 # `connect_sync` for sync).
-bsql-postgres-async = { version = "1.0.0-alpha.1", path = "../postgres/async", features = ["testkit"] }
-bsql-postgres-sync = { version = "1.0.0-alpha.1", path = "../postgres/sync", features = ["testkit"] }
-bsql-postgres-core = { version = "1.0.0-alpha.1", path = "../postgres/core", features = ["testkit"] }
+bsql-postgres-async = { version = "1.0.0-alpha.2", path = "../postgres/async", features = ["testkit"] }
+bsql-postgres-sync = { version = "1.0.0-alpha.2", path = "../postgres/sync", features = ["testkit"] }
+bsql-postgres-core = { version = "1.0.0-alpha.2", path = "../postgres/core", features = ["testkit"] }
 
 # The sans-IO wire crate — a DIRECT edge purely to NAME the dep-free bsql-native
 # PG types (`Uuid`, `Numeric`, `Timestamptz`, `Date`, `Interval`, `Json`, …) in
@@ -27,7 +27,7 @@ bsql-postgres-core = { version = "1.0.0-alpha.1", path = "../postgres/core", fea
 # (via core + both drivers), so this direct edge adds NO package to the lockfile
 # (`deps_pin` unchanged) and no forbidden runtime edge (proto is not sqlparser /
 # bsql-build — `runtime_graph_pin` unchanged).
-bsql-postgres-proto = { version = "1.0.0-alpha.1", path = "../postgres/proto" }
+bsql-postgres-proto = { version = "1.0.0-alpha.2", path = "../postgres/proto" }
 
 # Inherit the workspace FORBID floor (the two-tier lint wall).
 [lints]
