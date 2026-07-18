@@ -83,6 +83,16 @@ members = [
     # backend. `publish = false`; adds no external package (only `bsql`, a
     # resolved member).
     "tools/syncbackend_fixture",
+    # Teaching-quality, runnable EXAMPLE suite doubling as the usage guide: one
+    # heavily-commented program per feature (basic CRUD, cross-backend, params
+    # vs raw, joins/aggregates, migrations, generated types, external-type
+    # bridges, N+1 detection, typed COPY, pipelining/batch, streaming,
+    # transactions, pooling, schema-per-test). `publish = false`. It is the ONLY
+    # member that depends on `chrono` (for the external-bridge example) — a
+    # non-shipped edge, so it never enters any shipped crate's runtime graph
+    # (`runtime_graph_pin` unaffected); `deps_pin` gains `chrono` + its minimal
+    # transitive set (`num-traits`), eyeballed on the golden regen.
+    "examples",
 ]
 
 [workspace.package]
@@ -481,6 +491,20 @@ simdutf8 = { version = "0.1", default-features = false, features = ["aarch64_neo
 # lockfile with zero transitive deps. This is the "no forced crate" proof: bsql
 # ships zero new external dependency; only the test fixture gains this edge.
 uuid = { version = "1", default-features = false }
+
+# `chrono` — EXAMPLES-ONLY, non-shipped. Used solely by the `bsql-examples`
+# member (`publish = false`) to demonstrate the external-type bridge against a
+# REAL, widely-used foreign crate: a `query!` `timestamptz` column decodes
+# directly into `chrono::DateTime<Utc>` via an infallible free-fn converter,
+# with bsql depending on and forcing NOTHING (the bridge target/converter travel
+# as strings). It is NOT a dependency of any shipped crate — no shipped
+# `Cargo.toml` names it, so it stays out of every runtime graph
+# (`runtime_graph_pin` unaffected). `default-features = false` drops the `clock`
+# / `std` / `iana-time-zone` / `wasmbind` machinery the example does not need,
+# keeping the added lockfile footprint minimal (chrono + `num-traits`); `alloc`
+# re-enables the `to_rfc3339` rendering the example prints. This is the same
+# "no forced crate" proof as `uuid`: only a `publish = false` example gains the edge.
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 
 # `criterion` — benchmark harness. Dev-only dependency;
 # benches compile with std enabled (criterion requires std) while

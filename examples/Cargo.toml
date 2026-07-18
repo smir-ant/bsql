@@ -1,0 +1,74 @@
+[package]
+name = "bsql-examples"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Runnable, heavily-commented examples for bsql that double as a usage guide — one program per feature (basic CRUD, cross-backend, params vs raw, joins/aggregates, migrations, generated types, external-type bridges, N+1 detection, typed COPY, pipelining/batch, streaming, transactions, pooling, schema-per-test). Never published."
+
+# Not a shipped crate — a teaching/usage-guide suite. Cargo auto-discovers every
+# `src/bin/*.rs` as a runnable example, so there are no `[[bin]]` entries.
+publish = false
+
+[features]
+# `n1-detect` (NON-default) — turn on bsql's diagnostics-only N+1 detector
+# (`conn.n1_report()`), needed only by the `n1_detection` example bin. Kept OFF
+# by default, mirroring the fixtures, so a plain `cargo {check,clippy,test}
+# --workspace` builds the drivers feature-OFF (Cargo feature unification would
+# otherwise force the detector on for the whole workspace, perturbing the
+# feature-off codegen/alloc gates). The `n1_detection` bin compiles either way (a
+# `#[cfg]` fallback `main` prints how to enable it); run it with
+# `cargo run -p bsql-examples --features n1-detect --bin n1_detection`.
+n1-detect = ["bsql/n1-detect"]
+
+[dependencies]
+# The umbrella crate — the SINGLE runtime dependency a real consumer needs. The
+# feature set is everything the example suite demonstrates:
+#   * `macros`          — the compile-checked `query!` / `copy!` / `user_types!`.
+#   * `postgres-async`  — the tokio PostgreSQL driver (`bsql::pg`).
+#   * `postgres-sync`   — the std::net blocking PostgreSQL driver (`bsql::pg_sync`).
+#   * `sqlite`          — the embedded SQLite driver (`bsql::sqlite`) AND the
+#                         macro's SQLite typed-runtime emission, so a `query!`
+#                         carrier over a SQLite-portable query runs on SQLite too.
+#   * `test-harness`    — the `#[bsql::test]` schema-per-test isolation attribute.
+# NOTE: `macros-sqlite` (the build-time SQLite conformance ORACLE) is deliberately
+# NOT enabled: the shared migration set uses PostgreSQL-only DDL (`CREATE TYPE`
+# enum/composite/domain, `timestamptz`, `uuid`) that a SQLite template replay
+# cannot model. The `sqlite` RUNTIME feature is orthogonal to `macros-sqlite`
+# (verified in bsql's own docs), so the SQLite typed flagship still works without
+# the build-time oracle.
+bsql = { path = "../crates/bsql", default-features = false, features = [
+    "macros",
+    "postgres-async",
+    "postgres-sync",
+    "sqlite",
+    "test-harness",
+] }
+
+# `tokio` — the async runtime the `#[tokio::main]` example bins run on. Its
+# `rt-multi-thread` + `macros` features are exactly what the async driver's own
+# test suite uses, so feature unification adds no package to the lockfile.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+# `uuid` / `chrono` — the REAL external crates the `external_bridges` example
+# bridges a `uuid` / `timestamptz` column into, proving bsql forces NO dependency
+# (the bridge target type + converter travel to the macro as strings). `uuid` is
+# already a resolved workspace member (the bridge fixture uses it); `chrono` is
+# this suite's one genuinely-new dependency. Both are non-shipped edges — they
+# never enter any shipped crate's runtime graph.
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[build-dependencies]
+# BUILD-DEPENDENCY ONLY — the exact placement a real consumer uses. It replays
+# `migrations/` into the compile-time catalog `query!` types against, registers
+# the external-type bridges (chrono / uuid), and bakes the migration set for
+# `embed_migrations!()`. Living in `[build-dependencies]` keeps `sqlparser` (and
+# `bsql-build` itself) out of this crate's runtime closure. NO `sqlite` feature:
+# the terminal `.emit_catalog()` never emits a SQLite template, so the PG-only
+# `CREATE TYPE` migrations never reach the SQLite conformance oracle.
+bsql-build = { path = "../crates/build" }
+
+# Inherit the workspace FORBID floor / lint wall like every other member.
+[lints]
+workspace = true

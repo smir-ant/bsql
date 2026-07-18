@@ -12,6 +12,7 @@ bsql-build 1.0.0-alpha.1
 bsql-common 1.0.0-alpha.1
 bsql-corpus 0.0.0
 bsql-devgates 0.0.0
+bsql-examples 0.0.0
 bsql-postgres-async 1.0.0-alpha.1
 bsql-postgres-core 1.0.0-alpha.1
 bsql-postgres-proto 1.0.0-alpha.1
@@ -28,6 +29,7 @@ bytes 1.11.1
 cast 0.3.0
 cc 1.2.62
 cfg-if 1.0.4
+chrono 0.4.45
 ciborium 0.2.2
 ciborium-io 0.2.2
 ciborium-ll 0.2.2
