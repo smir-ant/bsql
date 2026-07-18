@@ -63,11 +63,11 @@ md5-auth = ["bsql-postgres-core/md5-auth"]
 # `default-features = false` so the umbrella (and any consumer) can drop core's
 # default-on `webpki-roots` (the baked Mozilla CA blob); the driver re-exposes it
 # through its own default-on `webpki-roots` feature above.
-bsql-postgres-core = { version = "1.0.0-alpha.2", path = "../core", default-features = false }
+bsql-postgres-core = { version = "1.0.0-alpha.3", path = "../core", default-features = false }
 # `default-features = false` so proto's default-on `scram` is droppable through
 # the chain (re-enabled via the `scram` feature above); without it proto's default
 # would force SCRAM on for the whole graph.
-bsql-postgres-proto = { version = "1.0.0-alpha.2", path = "../proto", default-features = false }
+bsql-postgres-proto = { version = "1.0.0-alpha.3", path = "../proto", default-features = false }
 # `socket2` — SAFE borrowed-fd access to enable TCP keepalive on the connected
 # `std::net::TcpStream` (dead-peer detection for IDLE pooled connections), the
 # blocking twin of the async driver's use. Already resolved in the workspace
