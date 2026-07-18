@@ -354,7 +354,7 @@ Legend: ✅ full · ◐ partial · ❌ none.
 | **Zero-per-row-alloc** streaming | ✅ `query_each`, O(1) RAM, 0 alloc/row | ◐ streams, allocs/row | ◐ streams, allocs/row | ◐ default materializes |
 | Out-of-band query cancellation | ✅ detached `CancelToken` | ✅ `cancel_token()` | ◐ cancel-on-drop | ❌ |
 | `#![forbid(unsafe_code)]` (shipped crates) | ✅ every crate | ◐ some `unsafe` | ◐ some `unsafe` | ❌ links libpq (C FFI) |
-| Unix-domain socket (a local file-based pipe — no TCP/IP, so faster same-host) | ✅ ~2.4–2.9× vs loopback TCP | ✅ | ✅ | ✅ (libpq) |
+| Unix-domain socket — connect to a same-machine DB without the network layer (faster than `localhost`) | ✅ ~2.4–2.9× vs loopback TCP | ✅ | ✅ | ✅ (libpq) |
 | Same `query!` on **PostgreSQL and SQLite** | ✅ one carrier, both backends | ❌ PG only | ◐ separate `Sqlite`/`Pg` types | ◐ separate backends |
 
 </details>
