@@ -9,7 +9,7 @@ the query is correct.** No DSL, no method chains, no runtime "column not found".
 > **1.0.0-alpha.1** — stable in shape, early in life; expect a few more alpha
 > iterations before a full 1.0. On crates.io as a **pre-release**: pin
 > `bsql = "1.0.0-alpha.1"` (a bare `cargo add bsql` resolves the older stable
-> `0.27`, a different, pre-rebuild library). Built with
+> `0.27` — a different, unrelated library). Built with
 > [Claude Code](https://claude.com/claude-code) (design first, review second,
 > implementation third).
 
@@ -31,12 +31,13 @@ let user = conn.query_one::<UserById>((42_i32,)).await?;
   nullability. Wrong column, wrong type, typo → the build fails.
 - **One query function, and it always checks — no *accidental* unchecked path.**
   In sqlx a missing `!` (`query()` vs `query!()`) silently skips validation. bsql
-  has a raw-SQL escape hatch too, but it is deliberate and loud: it carries a
-  `_sql` suffix (`query_sql`, `query_params`), so you opt into unchecked SQL on
-  purpose — never by forgetting a `!`.
-- **Pure SQL text — no builder.** CTEs, JOINs, window functions, subqueries. The
-  `.filter().eq()` combinator paradigm was tried during the rebuild and
-  deliberately reverted. If PostgreSQL or SQLite supports it, you just write it.
+  has a raw-SQL escape hatch too, but it is deliberate and named apart: the
+  unchecked verbs carry a distinct suffix (`query_sql` for raw text, `query_params`
+  for raw text plus runtime parameters), so you opt into unchecked SQL on purpose —
+  never by forgetting a `!`.
+- **Pure SQL text — no builder.** CTEs, JOINs, window functions, subqueries — no
+  `.filter().eq()` method chains to learn. If PostgreSQL or SQLite supports it, you
+  just write it.
 - **Async and sync are both first-class.** Both drivers plug the same socket into
   ONE transport-generic core, so parity is a *compiler guarantee*, not
   hand-maintained twins. The sync driver drops tokio entirely — pure `fn`, no
@@ -346,7 +347,7 @@ Legend: ✅ full · ◐ partial · ❌ none.
 | **Zero-per-row-alloc** streaming | ✅ `query_each`, O(1) RAM, 0 alloc/row | ◐ streams, allocs/row | ◐ streams, allocs/row | ◐ default materializes |
 | Out-of-band query cancellation | ✅ detached `CancelToken` | ✅ `cancel_token()` | ◐ cancel-on-drop | ❌ |
 | `#![forbid(unsafe_code)]` (shipped crates) | ✅ every crate | ◐ some `unsafe` | ◐ some `unsafe` | ❌ links libpq (C FFI) |
-| Unix-domain socket transport | ✅ (~2.4–2.9× faster than TCP locally) | ✅ | ✅ | ✅ (libpq) |
+| Unix-domain socket (a local file-based pipe — no TCP/IP, so faster same-host) | ✅ ~2.4–2.9× vs loopback TCP | ✅ | ✅ | ✅ (libpq) |
 | Same `query!` on **PostgreSQL and SQLite** | ✅ one carrier, both backends | ❌ PG only | ◐ separate `Sqlite`/`Pg` types | ◐ separate backends |
 
 </details>
