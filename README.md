@@ -43,10 +43,12 @@ let user = conn.query_one::<UserById>((42_i32,)).await?;
   hand-maintained twins. The sync driver drops tokio entirely — pure `fn`, no
   async runtime. Switch async↔sync by swapping one feature line (and dropping
   `.await`).
-- **PostgreSQL and SQLite, same macro.** SQLite is a full peer, not a text
-  wrapper: the same `query!` carrier runs on both, decoding into the same typed
-  records — and SQLite verifies each value's storage class at runtime (a mismatch
-  is a classified error, never a silent coercion).
+- **PostgreSQL and SQLite, same macro.** The same `query!` carrier runs on both
+  for typed *reads*, decoding into the same records — and SQLite verifies each
+  value's storage class at runtime (a mismatch is a classified error, never a
+  silent coercion). Typed *writes* through `query!` (`execute` / `execute_batch` /
+  `query_batch`) are a PostgreSQL capability; on SQLite the typed flagship is
+  read-only, and dynamic writes (`execute_raw` / `execute_params`) work on both.
 - **Tiny footprint.** ~1.7–1.8 MB peak memory for a real PostgreSQL workload —
   **the leanest client measured there** (and a near-tie with raw C on SQLite), ~8×
   under a C/libpq client, ~10× under Go/pgx, and ~3.6× under the nearest Rust
@@ -68,14 +70,16 @@ sqlx, diesel), PostgreSQL over loopback TCP, full methodology and captured logs 
 you don't have to trust the table.
 
 The short version, measured on an Apple-silicon laptop over the same PostgreSQL:
-the **blocking** driver `bsql::pg_sync` **beats C/libpq on every read** and ties it
-on INSERT (the true apples-to-apples comparison, both synchronous). The **async**
+the **blocking** driver `bsql::pg_sync` is **on par with C/libpq** — a few percent
+ahead on reads, a few percent behind on INSERT, i.e. effectively a wash on the same
+machine (the true apples-to-apples comparison, both synchronous). The **async**
 driver is on par with C on point reads (within the ~1 µs an async runtime spends
 parking a would-block read, which a blocking client does not) and faster on larger
-results — and it is by a wide margin the fastest *async* driver (tokio-postgres
-~1.5×, sqlx, diesel, Go/pgx behind it). On memory bsql is the **leanest in the
-PostgreSQL field** — ~1.7–1.8 MB peak, ~3.6× under the nearest Rust client, ~8×
-under a C/libpq client, ~10× under Go/pgx. Don't take our word for it —
+results — and it is the **fastest *async* driver** here: clearly ahead of
+tokio-postgres (~1.5× on point reads) and of diesel / Go/pgx, with sqlx close behind
+(within ~6% on point reads, further back as results grow). On memory bsql is the
+**leanest in the PostgreSQL field** — ~1.7–1.8 MB peak, ~3.6× under the nearest Rust
+client, ~8× under a C/libpq client, ~10× under Go/pgx. Don't take our word for it —
 `git switch bench && cargo bench`.
 
 ## Quick start
@@ -372,6 +376,12 @@ Legend: ✅ full · ◐ partial · ❌ none.
   stale. An out-of-band `ALTER TABLE` applied by hand with no migration file is
   invisible at build time — but a runtime OID guard catches such drift as a
   classified error on the wire, never a silent wrong value.
+- **What the checker asks of you in return:** name your result columns (`SELECT *`
+  is rejected — the shape must be explicit), and add a cast where an expression's
+  type is genuinely ambiguous (a bare `SUM(x)` → `SUM(x)::int8`, an uninferable
+  expression → `expr::type`). This is the ergonomic price of typing every column;
+  a plain column, a join, `COALESCE`, and a cast-annotated aggregate all infer
+  with no annotation.
 - The wire decoders are proven total (no panic on *any* input) by a dep-free
   fuzz gate; the inbound hot dispatch is proven panic-free and byte-stable by a
   codegen gate. NULL is `Option<NonZeroU32>`; SQL identifiers spliced into DDL go
