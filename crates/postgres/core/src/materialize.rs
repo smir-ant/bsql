@@ -141,14 +141,14 @@ impl ResultCollector {
                 // result-column type OIDs are read at EXACTLY ONE site — the cold
                 // `prepare_with_oids`, which captures them into its own owned Vec
                 // in its pump closure. Every dynamic ROW-RETURNING verb
-                // (`query_sql` / `query_params` / `simple_query`) fed this
+                // (`query_raw` / `query_params` / `simple_query`) fed this
                 // collector but never reads its OIDs, so storing them charged
                 // that hot path one heap `Vec<u32>` per `Deliver` for a value
                 // nobody read. Not capturing them here is that allocation gone.
                 //
                 // `column_names` stays `= to_vec()`: it flows into
                 // `build_query_result`'s `Arc::from(_.into_boxed_slice())` on the
-                // HOT `query_sql` path, and `into_boxed_slice()` is free only when
+                // HOT `query_raw` path, and `into_boxed_slice()` is free only when
                 // cap == len — which `to_vec` guarantees but an `extend`'s
                 // amortized growth (cap 4 for 2 names) does not.
                 self.column_names = names.to_vec();

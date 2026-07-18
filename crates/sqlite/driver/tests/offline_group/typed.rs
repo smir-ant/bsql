@@ -72,7 +72,7 @@ impl SqliteTypedQuery for CellQuery {
 }
 
 fn seed_cells(conn: &Connection) {
-    conn.execute_sql("CREATE TABLE cells (i INTEGER, r REAL, t TEXT, b BLOB, n INTEGER)")
+    conn.execute_raw("CREATE TABLE cells (i INTEGER, r REAL, t TEXT, b BLOB, n INTEGER)")
         .expect("create");
     conn.execute_params(
         "INSERT INTO cells VALUES ($1, $2, $3, $4, $5)",
@@ -238,7 +238,7 @@ impl SqliteTypedQuery for IntRowQuery {
 #[test]
 fn storage_class_mismatch_is_classified() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute_sql("CREATE TABLE t (v)").expect("create"); // no affinity — stores what it gets
+    conn.execute_raw("CREATE TABLE t (v)").expect("create"); // no affinity — stores what it gets
     conn.execute_params("INSERT INTO t VALUES ($1)", &[ValueRef::Text(b"not an int")])
         .expect("insert text");
 
@@ -262,8 +262,8 @@ fn storage_class_mismatch_is_classified() {
 #[test]
 fn null_in_non_null_field_is_classified() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute_sql("CREATE TABLE t (v)").expect("create");
-    conn.execute_sql("INSERT INTO t VALUES (NULL)").expect("insert null");
+    conn.execute_raw("CREATE TABLE t (v)").expect("create");
+    conn.execute_raw("INSERT INTO t VALUES (NULL)").expect("insert null");
 
     // The record declares `v: i64` (non-Option), but the value is NULL — a
     // classified UnexpectedNull, distinct from a type mismatch.
@@ -333,7 +333,7 @@ impl SqliteTypedQuery for InsertRetQuery {
 #[test]
 fn typed_multi_param_insert_returning_binds_and_decodes() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute_sql("CREATE TABLE cells (i INTEGER, r REAL, t TEXT, b BLOB, n INTEGER)")
+    conn.execute_raw("CREATE TABLE cells (i INTEGER, r REAL, t TEXT, b BLOB, n INTEGER)")
         .expect("create");
 
     // Two typed params bind positionally; RETURNING decodes the new key.
@@ -341,7 +341,7 @@ fn typed_multi_param_insert_returning_binds_and_decodes() {
     assert_eq!(ret.v, 42);
 
     // The `&str` param really persisted in its TEXT storage class (read it back).
-    let back = conn.query_one_sql("SELECT t FROM cells WHERE i = 42").expect("read back");
+    let back = conn.query_one_raw("SELECT t FROM cells WHERE i = 42").expect("read back");
     assert_eq!(back.get::<&str>(0).expect("text"), "gamma");
 }
 

@@ -3137,12 +3137,12 @@ fn emit_sqlite_typed(
 /// ```rust,ignore
 /// #[bsql::test]
 /// async fn creates_a_user(conn: &mut bsql::pg::Connection) {
-///     conn.execute_sql("CREATE TABLE users (id int)").await.unwrap();
+///     conn.execute_raw("CREATE TABLE users (id int)").await.unwrap();
 /// }   // schema auto-dropped, even on panic
 ///
 /// #[bsql::test]
 /// fn creates_a_user_sync(conn: &mut bsql::pg_sync::Connection) {
-///     conn.execute_sql("CREATE TABLE users (id int)").unwrap();
+///     conn.execute_raw("CREATE TABLE users (id int)").unwrap();
 /// }   // same isolation + teardown, over the blocking driver
 /// ```
 ///

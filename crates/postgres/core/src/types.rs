@@ -531,8 +531,8 @@ impl RowSet {
     ///
     /// A 16-byte [`Row`] handle built on demand — O(1), exactly one `Arc`
     /// refcount bump, never a per-row allocation and never dependent on the row
-    /// count. This is the single-row read the driver's `query_one_sql` /
-    /// `query_opt_sql` route through, so a one-row fetch clones the `Arc` ONCE.
+    /// count. This is the single-row read the driver's `query_one_raw` /
+    /// `query_opt_raw` route through, so a one-row fetch clones the `Arc` ONCE.
     #[must_use]
     pub fn get(&self, i: usize) -> Option<Row> {
         // A `usize` index past `u32::MAX` cannot address a `u32`-bounded arena,
@@ -856,7 +856,7 @@ pub(crate) fn fill_row_slots(body: &[u8], slots: &mut Vec<ColSlot>) -> Result<()
 }
 
 /// A zero-copy borrowed view of ONE streamed result row — the row type the
-/// constant-memory dynamic streaming verbs (`query_each_sql` / `query_each_params`)
+/// constant-memory dynamic streaming verbs (`query_each_raw` / `query_each_params`)
 /// lend to their callback.
 ///
 /// It borrows the transient wire buffer (`'r`) directly and holds NO `Arc` — so a

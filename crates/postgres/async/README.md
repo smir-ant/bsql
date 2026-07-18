@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::connect(&config).await?;
 
     // Execute DDL/DML
-    conn.execute_sql("CREATE TABLE users (id serial, name text, score float8)").await?;
+    conn.execute_raw("CREATE TABLE users (id serial, name text, score float8)").await?;
     let inserted = conn.execute(
         "INSERT INTO users (name, score) VALUES ('alice', 9.5), ('bob', 7.2)"
     ).await?;
@@ -49,9 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("total: {count}");
 
     // Transactions
-    conn.execute_sql("BEGIN").await?;
-    conn.execute_sql("UPDATE users SET score = score + 1").await?;
-    conn.execute_sql("COMMIT").await?;
+    conn.execute_raw("BEGIN").await?;
+    conn.execute_raw("UPDATE users SET score = score + 1").await?;
+    conn.execute_raw("COMMIT").await?;
 
     conn.close().await?;
     Ok(())

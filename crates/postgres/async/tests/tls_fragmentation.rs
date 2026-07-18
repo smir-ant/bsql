@@ -18,7 +18,7 @@
 //! - a large MULTI-RECORD result (hundreds of rows x 200-char strings);
 //! - a 300 KB single value that SPANS many TLS records (the double-reassembly:
 //!   an oversize PG frame reassembled WHILE each TLS record is fragmented);
-//! - a streamed run (`query_each_sql`, thousands of rows, strict in-order).
+//! - a streamed run (`query_each_raw`, thousands of rows, strict in-order).
 //!
 //! Every result must be byte-exact, in order, with `is_encrypted() == true` and
 //! zero panics.
@@ -503,7 +503,7 @@ async fn tls_record_fragmentation_reassembles_byte_exact() {
         // reply is well past one 16 KiB TLS record, so it spans many records,
         // each fragmented across tiny reads.
         let rows = conn
-            .query_sql("SELECT g AS n, repeat('x', 200) AS s FROM generate_series(1, 400) AS g")
+            .query_raw("SELECT g AS n, repeat('x', 200) AS s FROM generate_series(1, 400) AS g")
             .await
             .expect("large multi-record result must reassemble, not panic/hang");
         assert_eq!(rows.len(), 400, "chunk={chunk}: every row must arrive");
@@ -520,20 +520,20 @@ async fn tls_record_fragmentation_reassembles_byte_exact() {
         // reassembly (an oversize PG frame rebuilt WHILE each TLS record is
         // fragmented). The exact byte-length is the strong check.
         let big = conn
-            .query_one_sql("SELECT repeat('y', 300000)")
+            .query_one_raw("SELECT repeat('y', 300000)")
             .await
             .expect("record-spanning 300 KB value must reassemble byte-exact");
         let s = big.get_str(0).expect("big decodes").expect("big present");
         assert_eq!(s.len(), 300_000, "chunk={chunk}: 300 KB value length byte-exact");
         assert!(s.bytes().all(|b| b == b'y'), "chunk={chunk}: 300 KB value content intact");
 
-        // (c) A streamed run: 2000 rows via `query_each_sql`, strict in-order,
+        // (c) A streamed run: 2000 rows via `query_each_raw`, strict in-order,
         // accumulating nothing — the constant-memory streaming reassembly.
         use core::ops::ControlFlow;
         let mut next: i64 = 1;
         let mut streamed: i64 = 0;
         let outcome = conn
-            .query_each_sql::<_, String>("SELECT generate_series(1, 2000)::int8 AS n", |row| {
+            .query_each_raw::<_, String>("SELECT generate_series(1, 2000)::int8 AS n", |row| {
                 let got = match row.get_i64(0) {
                     Ok(Some(v)) => v,
                     other => return ControlFlow::Break(format!("bad streamed cell: {other:?}")),
@@ -553,7 +553,7 @@ async fn tls_record_fragmentation_reassembles_byte_exact() {
         // Still encrypted, still usable after the fragmented workload.
         assert!(conn.is_encrypted(), "chunk={chunk}: still TLS after the workload");
         let follow = conn
-            .query_one_sql("SELECT 42::int4")
+            .query_one_raw("SELECT 42::int4")
             .await
             .expect("connection reusable after the fragmented workload");
         assert_eq!(follow.get_i32(0), Ok(Some(42)));

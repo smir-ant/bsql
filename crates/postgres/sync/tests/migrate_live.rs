@@ -84,8 +84,8 @@ fn fresh_schema_applies_all_in_order_and_records_them() {
     assert_eq!(names, vec!["0001_users.sql", "0002_email.sql", "0003_posts.sql"]);
     assert!(status.pending.is_empty());
     // The migrations really ran (the columns/tables exist).
-    conn.execute_sql("INSERT INTO users (id, name, email) VALUES (1, 'a', 'a@x')").expect("users ok");
-    conn.execute_sql("INSERT INTO posts (id, user_id) VALUES (1, 1)").expect("posts ok");
+    conn.execute_raw("INSERT INTO users (id, name, email) VALUES (1, 'a', 'a@x')").expect("users ok");
+    conn.execute_raw("INSERT INTO posts (id, user_id) VALUES (1, 1)").expect("posts ok");
 
     drop_schema(&mut conn, &schema);
 }
@@ -141,7 +141,7 @@ fn a_failing_migration_rolls_back_and_stops_naming_it() {
     let applied: Vec<&str> = status.applied.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(applied, vec!["0001_users.sql"]);
     let after = conn
-        .query_sql("SELECT to_regclass('after_marker') IS NOT NULL AS exists")
+        .query_raw("SELECT to_regclass('after_marker') IS NOT NULL AS exists")
         .expect("q");
     assert_eq!(after.get(0).expect("row").get_bool(0).expect("bool"), Some(false), "0003 must not have run");
     // The connection is still usable (0002's transaction rolled back cleanly).
@@ -223,7 +223,7 @@ fn duplicate_named_migration_is_loud_not_a_silent_skip() {
     ));
     // Nothing applied.
     let a = conn
-        .query_sql("SELECT to_regclass('a') IS NULL AS absent")
+        .query_raw("SELECT to_regclass('a') IS NULL AS absent")
         .expect("q");
     assert_eq!(a.get(0).expect("row").get_bool(0).expect("bool"), Some(true));
     drop_schema(&mut conn, &schema);

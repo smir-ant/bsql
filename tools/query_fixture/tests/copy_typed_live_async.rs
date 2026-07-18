@@ -36,7 +36,7 @@ const HOSTILE: &str = "a\tb\nc\"d\\e";
 #[ignore = "requires local PG"]
 async fn typed_binary_copy_round_trips_hostile_null_and_large_batch() {
     let mut c = Connection::connect(&async_config()).await.expect("connect");
-    c.execute_sql(
+    c.execute_raw(
         "CREATE TEMP TABLE copy_bulk (\
          id BIGINT NOT NULL, label TEXT NOT NULL, note TEXT, amount INTEGER)",
     )
@@ -97,7 +97,7 @@ async fn typed_binary_copy_round_trips_hostile_null_and_large_batch() {
 #[ignore = "requires local PG"]
 async fn a_rejected_row_recovers_the_connection() {
     let mut c = Connection::connect(&async_config()).await.expect("connect");
-    c.execute_sql(
+    c.execute_raw(
         "CREATE TEMP TABLE copy_bulk (\
          id BIGINT PRIMARY KEY, label TEXT NOT NULL, note TEXT, amount INTEGER)",
     )
@@ -116,7 +116,7 @@ async fn a_rejected_row_recovers_the_connection() {
     );
 
     let alive = c
-        .query_one_sql("SELECT 1::int4")
+        .query_one_raw("SELECT 1::int4")
         .await
         .expect("connection recovered after the rejected COPY");
     assert_eq!(alive.get::<i32>(0).expect("column present"), Some(1));

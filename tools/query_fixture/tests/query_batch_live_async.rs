@@ -72,13 +72,13 @@ fn cfg() -> ConnectConfig {
 /// migration's permanent table — same columns the carrier was validated against —
 /// so each test on its OWN connection never interferes under cargo parallelism.
 async fn fresh(c: &mut Connection) {
-    c.execute_sql("CREATE TEMP TABLE qb_rows (id BIGINT PRIMARY KEY, label TEXT NOT NULL)")
+    c.execute_raw("CREATE TEMP TABLE qb_rows (id BIGINT PRIMARY KEY, label TEXT NOT NULL)")
         .await
         .expect("create temp");
 }
 
 async fn row_count(c: &mut Connection) -> i64 {
-    c.query_one_sql("SELECT count(*)::int8 AS n FROM qb_rows")
+    c.query_one_raw("SELECT count(*)::int8 AS n FROM qb_rows")
         .await
         .expect("count")
         .get_i64(0)
@@ -220,7 +220,7 @@ async fn large_n_windowed_is_correct_and_deadlock_free() {
     assert_eq!(row_count(&mut c).await, N, "all N rows persisted");
     // A LARGE mid-batch failure still rolls the WHOLE thing back. The TEMP `qb_rows`
     // already exists on this connection, so CLEAR it (not re-create).
-    c.execute_sql("TRUNCATE qb_rows").await.expect("truncate");
+    c.execute_raw("TRUNCATE qb_rows").await.expect("truncate");
     let mut sets: Vec<(i64, &str)> = (0..N).map(|i| (i, "x")).collect();
     sets.push((5_000, "dup")); // duplicate PK late in the run
     let result = c.query_batch::<QbIns, _>(sets).await;
@@ -239,10 +239,10 @@ async fn large_n_windowed_is_correct_and_deadlock_free() {
 async fn oid_guard_drift_is_a_classified_batch_column_oid_mismatch() {
     let mut c = Connection::connect(&cfg()).await.expect("connect");
     // Drift shadow: `tag` retyped to int4.
-    c.execute_sql("CREATE TEMP TABLE oidguard (tag int4 NOT NULL, vc varchar NOT NULL, bp bpchar NOT NULL, n int4 NOT NULL)")
+    c.execute_raw("CREATE TEMP TABLE oidguard (tag int4 NOT NULL, vc varchar NOT NULL, bp bpchar NOT NULL, n int4 NOT NULL)")
         .await
         .expect("create drift shadow");
-    c.execute_sql("INSERT INTO oidguard (tag, vc, bp, n) VALUES (1094795585, 'v', 'b', 1)")
+    c.execute_raw("INSERT INTO oidguard (tag, vc, bp, n) VALUES (1094795585, 'v', 'b', 1)")
         .await
         .expect("seed drift");
     // A homogeneous batch of the SAME carrier — the guard fires on command 0's MISS
@@ -276,10 +276,10 @@ async fn oid_guard_drift_is_a_classified_batch_column_oid_mismatch() {
 #[ignore = "requires local PG"]
 async fn oid_guard_matching_shadow_decodes_correctly() {
     let mut c = Connection::connect(&cfg()).await.expect("connect");
-    c.execute_sql("CREATE TEMP TABLE oidguard (tag text NOT NULL, vc varchar NOT NULL, bp bpchar NOT NULL, n int4 NOT NULL)")
+    c.execute_raw("CREATE TEMP TABLE oidguard (tag text NOT NULL, vc varchar NOT NULL, bp bpchar NOT NULL, n int4 NOT NULL)")
         .await
         .expect("create match shadow");
-    c.execute_sql("INSERT INTO oidguard (tag, vc, bp, n) VALUES ('hello', 'v', 'b', 1)")
+    c.execute_raw("INSERT INTO oidguard (tag, vc, bp, n) VALUES ('hello', 'v', 'b', 1)")
         .await
         .expect("seed match");
     let grouped = c.query_batch::<QbTag, _>(vec![(), ()]).await.expect("matching batch runs");

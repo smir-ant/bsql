@@ -439,7 +439,7 @@ const ENGINE_ERROR_VARIANTS: usize = 15;
 /// through `simple_query`, so the injection-safe type is the sole splice currency.)
 /// 23 adds the two BREAKABLE dynamic streaming verbs — `query_break` (the
 /// simple-query peer of `query`) and `query_params_fused_break` (the fused peer
-/// of `query_params_fused`) — behind the driver's `query_each_sql` /
+/// of `query_params_fused`) — behind the driver's `query_each_raw` /
 /// `query_each_params` constant-memory streaming.
 /// 24 adds `run_pipeline`, the drive verb for a HETEROGENEOUS pipelined batch (N
 /// compile-checked commands under ONE trailing Sync — one implicit transaction).

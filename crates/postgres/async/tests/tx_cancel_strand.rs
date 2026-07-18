@@ -93,7 +93,7 @@ async fn a_transaction_dropped_before_its_first_verb_leaves_no_armed_begin() {
     {
         let mut fut = pin!(conn.transaction(async |tx| {
             core::future::pending::<()>().await; // never resolves; no verb runs
-            tx.query_sql("SELECT 1").await.map(|_| ())
+            tx.query_raw("SELECT 1").await.map(|_| ())
         }));
         let mut cx = Context::from_waker(Waker::noop());
         assert!(
@@ -105,7 +105,7 @@ async fn a_transaction_dropped_before_its_first_verb_leaves_no_armed_begin() {
     // The reused bare connection must run a BARE verb, not a fused BEGIN. Under
     // the strand bug the unscripted fused BEGIN would kill the connection here.
     let result = conn
-        .query_sql("SELECT 1")
+        .query_raw("SELECT 1")
         .await
         .expect("the reused connection must run a BARE verb, not a fused BEGIN");
     assert_eq!(result.len(), 1, "the bare SELECT returns its one row");

@@ -49,8 +49,8 @@ fn fresh_database_applies_all_in_order() {
     assert!(status.pending.is_empty());
 
     // The migrations really ran: the tables exist.
-    conn.execute_sql("INSERT INTO users (id, name, email) VALUES (1, 'a', 'a@x')").expect("users exists");
-    conn.execute_sql("INSERT INTO posts (id, user_id) VALUES (1, 1)").expect("posts exists");
+    conn.execute_raw("INSERT INTO users (id, name, email) VALUES (1, 'a', 'a@x')").expect("users exists");
+    conn.execute_raw("INSERT INTO posts (id, user_id) VALUES (1, 1)").expect("posts exists");
 }
 
 /// WITNESS: re-running is a no-op — each migration runs EXACTLY once.
@@ -168,10 +168,10 @@ fn a_failing_migration_rolls_back_and_stops() {
     let applied: Vec<&str> = status.applied.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(applied, vec!["0001_users.sql"]);
     // 0003's table must NOT exist — the runner stopped at 0002.
-    let after = conn.query_sql("SELECT 1 FROM sqlite_master WHERE type='table' AND name='after_marker'").expect("q");
+    let after = conn.query_raw("SELECT 1 FROM sqlite_master WHERE type='table' AND name='after_marker'").expect("q");
     assert!(after.is_empty(), "0003 must not have run after 0002 failed");
     // The connection is still usable (0002 rolled back cleanly).
-    conn.execute_sql("INSERT INTO users (id, name) VALUES (7, 'g')").expect("connection reusable");
+    conn.execute_raw("INSERT INTO users (id, name) VALUES (7, 'g')").expect("connection reusable");
 }
 
 /// WITNESS: `migration_status` on a fresh database shows everything pending;
@@ -206,8 +206,8 @@ fn directory_source_applies_in_order() {
     let report = conn.run_migrations(MigrationSource::directory(&dir)).expect("run dir");
     // Applied in lexicographic name order regardless of write order.
     assert_eq!(report.applied, vec!["0001_a.sql", "0002_b.sql"]);
-    conn.execute_sql("INSERT INTO a (x) VALUES (1)").expect("a exists");
-    conn.execute_sql("INSERT INTO b (x) VALUES (1)").expect("b exists");
+    conn.execute_raw("INSERT INTO a (x) VALUES (1)").expect("a exists");
+    conn.execute_raw("INSERT INTO b (x) VALUES (1)").expect("b exists");
 }
 
 /// WITNESS (ordering authority): a nested prefix collision (`a.sql` + `a/b.sql`)
@@ -289,7 +289,7 @@ fn two_concurrent_runners_apply_exactly_once() {
     assert!(status.pending.is_empty());
     for t in ["a", "b", "c", "d"] {
         let sql = format!("SELECT 1 FROM sqlite_master WHERE type='table' AND name='{t}'");
-        assert!(!conn.query_sql(&sql).expect("q").is_empty(), "table {t} exists");
+        assert!(!conn.query_raw(&sql).expect("q").is_empty(), "table {t} exists");
     }
 }
 
@@ -312,7 +312,7 @@ fn duplicate_named_migration_is_loud_not_a_silent_skip() {
         MigrationError::Source(MigrationSourceError::DuplicateName { name }) if name == "0001.sql"
     ));
     // Nothing was applied (the check is pre-flight).
-    let a = conn.query_sql("SELECT 1 FROM sqlite_master WHERE type='table' AND name='a'").expect("q");
+    let a = conn.query_raw("SELECT 1 FROM sqlite_master WHERE type='table' AND name='a'").expect("q");
     assert!(a.is_empty(), "no migration applied on a duplicate-name error");
 }
 

@@ -34,9 +34,9 @@ const LOOP: i32 = 30;
 #[test]
 fn n1_through_generic_layer_reports_consumer_line_not_backend() {
     let mut conn = Connection::open_in_memory().expect("open");
-    conn.execute_sql("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL, name TEXT)")
+    conn.execute_raw("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL, name TEXT)")
         .expect("create");
-    conn.execute_sql("INSERT INTO users VALUES (1, 'a@b', 'Alice')")
+    conn.execute_raw("INSERT INTO users VALUES (1, 'a@b', 'Alice')")
         .expect("insert");
 
     // The N+1: the SAME typed query, N times, from ONE source line — but reached

@@ -27,7 +27,7 @@ use crate::transport::{ConnectDeadline, SyncSocket};
 ///     std::thread::sleep(std::time::Duration::from_millis(300));
 ///     let _ = token.cancel();                  // from another thread, mid-query
 /// });
-/// let _ = conn.query_sql("SELECT pg_sleep(5)"); // returns ~early, canceled
+/// let _ = conn.query_raw("SELECT pg_sleep(5)"); // returns ~early, canceled
 /// canceller.join().ok();
 /// # Ok(())
 /// # }

@@ -42,12 +42,12 @@ fn cfg() -> ConnectConfig {
 }
 
 fn fresh(c: &mut Connection) {
-    c.execute_sql("CREATE TEMP TABLE qb_rows (id BIGINT PRIMARY KEY, label TEXT NOT NULL)")
+    c.execute_raw("CREATE TEMP TABLE qb_rows (id BIGINT PRIMARY KEY, label TEXT NOT NULL)")
         .expect("create temp");
 }
 
 fn row_count(c: &mut Connection) -> i64 {
-    c.query_one_sql("SELECT count(*)::int8 AS n FROM qb_rows")
+    c.query_one_raw("SELECT count(*)::int8 AS n FROM qb_rows")
         .expect("count")
         .get_i64(0)
         .expect("decode")
@@ -158,7 +158,7 @@ fn large_n_windowed_is_correct_and_deadlock_free() {
         assert_eq!(rows.iter().next().expect("row").expect("decode").id, i as i64);
     }
     assert_eq!(row_count(&mut c), N, "all N rows persisted");
-    c.execute_sql("TRUNCATE qb_rows").expect("truncate");
+    c.execute_raw("TRUNCATE qb_rows").expect("truncate");
     let mut sets: Vec<(i64, &str)> = (0..N).map(|i| (i, "x")).collect();
     sets.push((5_000, "dup"));
     let result = c.query_batch::<QbsIns, _>(sets);
@@ -172,9 +172,9 @@ fn large_n_windowed_is_correct_and_deadlock_free() {
 #[ignore = "requires local PG"]
 fn oid_guard_drift_is_a_classified_batch_column_oid_mismatch() {
     let mut c = Connection::connect(&cfg()).expect("connect");
-    c.execute_sql("CREATE TEMP TABLE oidguard (tag int4 NOT NULL, vc varchar NOT NULL, bp bpchar NOT NULL, n int4 NOT NULL)")
+    c.execute_raw("CREATE TEMP TABLE oidguard (tag int4 NOT NULL, vc varchar NOT NULL, bp bpchar NOT NULL, n int4 NOT NULL)")
         .expect("create drift shadow");
-    c.execute_sql("INSERT INTO oidguard (tag, vc, bp, n) VALUES (1094795585, 'v', 'b', 1)")
+    c.execute_raw("INSERT INTO oidguard (tag, vc, bp, n) VALUES (1094795585, 'v', 'b', 1)")
         .expect("seed drift");
     match c.query_batch::<QbsTag, _>(vec![(), ()]) {
         Err(e @ DriverError::BatchColumnOidMismatch { .. }) => {
@@ -204,9 +204,9 @@ fn oid_guard_drift_is_a_classified_batch_column_oid_mismatch() {
 #[ignore = "requires local PG"]
 fn oid_guard_matching_shadow_decodes_correctly() {
     let mut c = Connection::connect(&cfg()).expect("connect");
-    c.execute_sql("CREATE TEMP TABLE oidguard (tag text NOT NULL, vc varchar NOT NULL, bp bpchar NOT NULL, n int4 NOT NULL)")
+    c.execute_raw("CREATE TEMP TABLE oidguard (tag text NOT NULL, vc varchar NOT NULL, bp bpchar NOT NULL, n int4 NOT NULL)")
         .expect("create match shadow");
-    c.execute_sql("INSERT INTO oidguard (tag, vc, bp, n) VALUES ('hello', 'v', 'b', 1)")
+    c.execute_raw("INSERT INTO oidguard (tag, vc, bp, n) VALUES ('hello', 'v', 'b', 1)")
         .expect("seed match");
     let grouped = c.query_batch::<QbsTag, _>(vec![(), ()]).expect("matching batch runs");
     assert_eq!(grouped.len(), 2);

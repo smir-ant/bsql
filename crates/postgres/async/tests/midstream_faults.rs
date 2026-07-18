@@ -51,7 +51,7 @@ async fn server_error_mid_stream_is_err_and_connection_recovers() {
     let mut conn = Connection::connect(&direct()).await.expect("connect");
 
     let outcome = conn
-        .query_each_sql::<_, ()>(ERRORING_STREAM, |_row| ControlFlow::Continue(()))
+        .query_each_raw::<_, ()>(ERRORING_STREAM, |_row| ControlFlow::Continue(()))
         .await;
 
     // The WHOLE verb is Err — rows before the fault are never a success. A server
@@ -72,7 +72,7 @@ async fn server_error_mid_stream_is_err_and_connection_recovers() {
     assert!(conn.is_healthy(), "the connection must drain to a clean idle");
 
     let row = conn
-        .query_one_sql("SELECT 42::int4")
+        .query_one_raw("SELECT 42::int4")
         .await
         .expect("connection reusable after a mid-stream server error");
     assert_eq!(row.get_i32(0), Ok(Some(42)));
@@ -94,7 +94,7 @@ async fn cancel_mid_stream_classifies_57014_and_recovers() {
 
     let start = Instant::now();
     let outcome = conn
-        .query_each_sql::<_, ()>(SLOW_STREAM, |_row| ControlFlow::Continue(()))
+        .query_each_raw::<_, ()>(SLOW_STREAM, |_row| ControlFlow::Continue(()))
         .await;
     let elapsed = start.elapsed();
     canceller.await.expect("cancel task join").expect("cancel packet delivered");
@@ -115,7 +115,7 @@ async fn cancel_mid_stream_classifies_57014_and_recovers() {
     assert!(!err.is_disconnect(), "a cancel is not a disconnect");
     assert!(elapsed < Duration::from_secs(5), "cancel must be bounded, took {elapsed:?}");
     assert!(conn.is_healthy(), "reusable after a cancel");
-    let row = conn.query_one_sql("SELECT 7::int4").await.expect("reusable after cancel");
+    let row = conn.query_one_raw("SELECT 7::int4").await.expect("reusable after cancel");
     assert_eq!(row.get_i32(0), Ok(Some(7)));
 }
 
@@ -131,11 +131,11 @@ async fn terminated_backend_mid_stream_is_a_disconnect() {
     let pid = victim.backend_pid();
     assert!(pid > 0, "victim backend pid");
 
-    let streaming = victim.query_each_sql::<_, ()>(SLOW_STREAM, |_row| ControlFlow::Continue(()));
+    let streaming = victim.query_each_raw::<_, ()>(SLOW_STREAM, |_row| ControlFlow::Continue(()));
     let terminating = async {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let t = killer
-            .query_one_sql(&format!("SELECT pg_terminate_backend({pid})"))
+            .query_one_raw(&format!("SELECT pg_terminate_backend({pid})"))
             .await
             .expect("terminate the victim backend");
         assert_eq!(t.get_str(0), Ok(Some("t")), "pg_terminate_backend returned true");
@@ -151,7 +151,7 @@ async fn terminated_backend_mid_stream_is_a_disconnect() {
         "a terminated backend mid-stream must classify as a disconnect, got {err:?}",
     );
     // The killer connection (untouched) still works — no global corruption.
-    let row = killer.query_one_sql("SELECT 1::int4").await.expect("killer healthy");
+    let row = killer.query_one_raw("SELECT 1::int4").await.expect("killer healthy");
     assert_eq!(row.get_i32(0), Ok(Some(1)));
 }
 
@@ -174,7 +174,7 @@ async fn transport_death_mid_stream_is_classified_not_a_hang() {
 
     let start = Instant::now();
     let outcome = conn
-        .query_each_sql::<_, ()>(
+        .query_each_raw::<_, ()>(
             "SELECT n FROM generate_series(1, 500000) AS t(n)",
             |_row| ControlFlow::Continue(()),
         )
@@ -208,14 +208,14 @@ async fn dropped_stream_future_poisons_connection_but_not_the_world() {
     // restored, so the connection is cleanly NotReady, NOT a panic.
     let timed = tokio::time::timeout(
         Duration::from_millis(150),
-        conn.query_each_sql::<_, ()>(SLOW_STREAM, |_row| ControlFlow::Continue(())),
+        conn.query_each_raw::<_, ()>(SLOW_STREAM, |_row| ControlFlow::Continue(())),
     )
     .await;
     assert!(timed.is_err(), "the stream must still be running when we drop it");
 
     // The poisoned connection fails loudly (never a silent success / hang), and
     // classifies as a disconnect (evictable) — the token is gone.
-    let poisoned = conn.query_one_sql("SELECT 1::int4").await;
+    let poisoned = conn.query_one_raw("SELECT 1::int4").await;
     let err = match poisoned {
         Err(e) => e,
         Ok(_) => panic!("a connection whose stream future was dropped must not report success"),
@@ -224,7 +224,7 @@ async fn dropped_stream_future_poisons_connection_but_not_the_world() {
 
     // A brand-new connection is unaffected — the poisoning is local, not global.
     let mut fresh = Connection::connect(&direct()).await.expect("a fresh connection is unaffected");
-    let row = fresh.query_one_sql("SELECT 99::int4").await.expect("fresh connection works");
+    let row = fresh.query_one_raw("SELECT 99::int4").await.expect("fresh connection works");
     assert_eq!(row.get_i32(0), Ok(Some(99)));
 }
 
@@ -242,10 +242,10 @@ async fn no_leak_under_repeated_mid_stream_faults() {
     for i in 0..100 {
         let mut conn = Connection::connect(&direct()).await.expect("connect");
         let outcome = conn
-            .query_each_sql::<_, ()>(ERRORING_STREAM, |_row| ControlFlow::Continue(()))
+            .query_each_raw::<_, ()>(ERRORING_STREAM, |_row| ControlFlow::Continue(()))
             .await;
         assert!(outcome.is_err(), "round {i}: the erroring stream must fail");
-        let row = match conn.query_one_sql("SELECT 1::int4").await {
+        let row = match conn.query_one_raw("SELECT 1::int4").await {
             Ok(r) => r,
             Err(e) => panic!("round {i}: connection must recover after the fault: {e:?}"),
         };

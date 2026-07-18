@@ -1,4 +1,4 @@
-//! GATE (audit-8, --ignored live): `query_each_sql` streams in CONSTANT memory —
+//! GATE (audit-8, --ignored live): `query_each_raw` streams in CONSTANT memory —
 //! its resident set is O(1) in the ROW COUNT, not O(N). The offline
 //! `engine_query_break_alloc` gate already proves the ALLOCATION COUNT is
 //! row-count-independent; this is its LIVE peer: it streams a real 5-million-row
@@ -63,7 +63,7 @@ async fn stream_series(conn: &mut Connection, n: i64) -> Result<(u64, i128), Dri
     let mut expected: i64 = 1;
     let mut order_ok = true;
     let broke = conn
-        .query_each_sql::<_, ()>(&sql, |row| {
+        .query_each_raw::<_, ()>(&sql, |row| {
             match row.get_i64(0) {
                 Ok(Some(v)) => {
                     if v != expected {
@@ -127,6 +127,6 @@ async fn streaming_rss_is_constant_in_row_count() {
     }
 
     // Reusable after the 5M-row stream.
-    let row = conn.query_one_sql("SELECT 1::int4").await.expect("reusable after a 5M-row stream");
+    let row = conn.query_one_raw("SELECT 1::int4").await.expect("reusable after a 5M-row stream");
     assert_eq!(row.get_i32(0), Ok(Some(1)));
 }

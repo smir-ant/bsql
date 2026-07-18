@@ -32,8 +32,8 @@ fn cfg() -> ConnectConfig {
 #[ignore = "requires local PG; timing bench"]
 async fn batch_vs_serial() {
     let mut c = Connection::connect(&cfg()).await.expect("connect");
-    c.execute_sql("DROP TABLE IF EXISTS eb_rows").await.expect("drop");
-    c.execute_sql("CREATE TABLE eb_rows (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
+    c.execute_raw("DROP TABLE IF EXISTS eb_rows").await.expect("drop");
+    c.execute_raw("CREATE TABLE eb_rows (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
         .await
         .expect("create");
 
@@ -41,12 +41,12 @@ async fn batch_vs_serial() {
     println!("----+---------------+-------------------+--------");
     for &n in &[2_usize, 8, 32, 128, 512, 2000] {
         // Seed n rows.
-        c.execute_sql("TRUNCATE eb_rows").await.expect("truncate");
+        c.execute_raw("TRUNCATE eb_rows").await.expect("truncate");
         c.execute_batch::<EbbUpd, _>((0..n as i64).map(|_| (0_i64, 0_i64)))
             .await
             .ok(); // ignore (rows absent) — just to warm
         for i in 0..n as i64 {
-            c.execute_sql(&format!("INSERT INTO eb_rows VALUES ({i}, 0)"))
+            c.execute_raw(&format!("INSERT INTO eb_rows VALUES ({i}, 0)"))
                 .await
                 .expect("seed");
         }

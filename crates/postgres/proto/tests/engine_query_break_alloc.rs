@@ -1,11 +1,11 @@
 //! Constant-memory gate for the DYNAMIC streaming path
-//! (`query_each_sql` / `query_each_params`): a warm `query_break` drive that
+//! (`query_each_raw` / `query_each_params`): a warm `query_break` drive that
 //! streams rows through a REUSED per-row buffer allocates ZERO — regardless of
 //! row count.
 //!
 //! This is the streaming peer of `engine_query_alloc`'s "warm cache-HIT is
 //! zero-alloc": it drives the REAL breakable simple-query engine verb
-//! (`query_break`, the primitive behind the driver's `query_each_sql`) over an
+//! (`query_break`, the primitive behind the driver's `query_each_raw`) over an
 //! in-process scripted transport, with a sink that REPRODUCES the driver's
 //! `stream_dynamic_row` decode — parsing each `DataRow` into a REUSED slot table
 //! via the public [`DataRowRef`] walker (the exact parser the driver's private

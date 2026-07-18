@@ -1,11 +1,11 @@
 //! Allocation gates for the eager result-materialisation path: the per-call
-//! `query_sql()` prebuffer and the pool `reset_session()` round-trip.
+//! `query_raw()` prebuffer and the pool `reset_session()` round-trip.
 //!
 //! Each window reproduces the WHOLE literal driver path, so the pinned number is
 //! the real per-call allocation cost a later unification / collector-pooling
 //! slice will drive down (a valid RED→GREEN witness), not a synthetic subset:
 //!
-//! - **eager `query_sql`** — the driver runs `engine.query(sql, feed)` +
+//! - **eager `query_raw`** — the driver runs `engine.query(sql, feed)` +
 //!   `settle` + `build_query_result(collector, None)`. `build_query_result` is
 //!   `collector.finish()` PLUS `Arc::from(column_names.into_boxed_slice())` and
 //!   the `QueryResult` construction. The gate reproduces all of it (the
@@ -218,7 +218,7 @@ fn no_op_sink<'s>(
 
 // ─────────────────────────── the gate ───────────────────────────
 
-/// PINNED baseline: allocations charged to the WHOLE warm eager `query_sql()`
+/// PINNED baseline: allocations charged to the WHOLE warm eager `query_raw()`
 /// path — fresh `ResultCollector`, `feed` over a 3-row result, then the full
 /// `build_query_result` finalization (`finish` into the lazy [`RowSet`] PLUS the
 /// `Arc::from(column_names.into_boxed_slice())` and `QueryResult` construction).
@@ -316,7 +316,7 @@ fn eager_query_and_reset_prebuffer_allocs_are_pinned() {
     );
 }
 
-/// Drive one eager `query` exactly as the drivers' `query_sql` does: fresh
+/// Drive one eager `query` exactly as the drivers' `query_raw` does: fresh
 /// collector, `feed` every surface, then the WHOLE `build_query_result`
 /// finalization — `finish` PLUS the `Arc::from(column_names.into_boxed_slice())`
 /// and the `QueryResult` construction. (`build_query_result` is a driver-private

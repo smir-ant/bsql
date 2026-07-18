@@ -27,16 +27,16 @@ use bsql::pg_sync::Connection;
 #[bsql::test]
 #[ignore = "live: needs PostgreSQL at BSQL_TEST_DSN"]
 fn sync_isolation_a_sees_only_its_own_row(conn: &mut Connection) {
-    conn.execute_sql("CREATE TABLE shared_name (v int)").unwrap();
-    conn.execute_sql("INSERT INTO shared_name (v) VALUES (111)").unwrap();
+    conn.execute_raw("CREATE TABLE shared_name (v int)").unwrap();
+    conn.execute_raw("INSERT INTO shared_name (v) VALUES (111)").unwrap();
 
-    let only = conn.query_one_sql("SELECT v FROM shared_name").unwrap();
+    let only = conn.query_one_raw("SELECT v FROM shared_name").unwrap();
     assert_eq!(only.get_i32(0), Ok(Some(111)), "must see only its own row");
 
-    let count = conn.query_one_sql("SELECT count(*) FROM shared_name").unwrap();
+    let count = conn.query_one_raw("SELECT count(*) FROM shared_name").unwrap();
     assert_eq!(count.get_i64(0), Ok(Some(1)), "isolation: exactly one row visible");
 
-    let schema = conn.query_one_sql("SELECT current_schema()::text").unwrap();
+    let schema = conn.query_one_raw("SELECT current_schema()::text").unwrap();
     let name = schema.get_str(0).unwrap().unwrap();
     assert!(name.starts_with("bsql_t_"), "runs in a harness schema, got {name:?}");
 }
@@ -44,13 +44,13 @@ fn sync_isolation_a_sees_only_its_own_row(conn: &mut Connection) {
 #[bsql::test]
 #[ignore = "live: needs PostgreSQL at BSQL_TEST_DSN"]
 fn sync_isolation_b_sees_only_its_own_row(conn: &mut Connection) {
-    conn.execute_sql("CREATE TABLE shared_name (v int)").unwrap();
-    conn.execute_sql("INSERT INTO shared_name (v) VALUES (222)").unwrap();
+    conn.execute_raw("CREATE TABLE shared_name (v int)").unwrap();
+    conn.execute_raw("INSERT INTO shared_name (v) VALUES (222)").unwrap();
 
-    let only = conn.query_one_sql("SELECT v FROM shared_name").unwrap();
+    let only = conn.query_one_raw("SELECT v FROM shared_name").unwrap();
     assert_eq!(only.get_i32(0), Ok(Some(222)), "must see only its own row");
 
-    let count = conn.query_one_sql("SELECT count(*) FROM shared_name").unwrap();
+    let count = conn.query_one_raw("SELECT count(*) FROM shared_name").unwrap();
     assert_eq!(count.get_i64(0), Ok(Some(1)), "isolation: exactly one row visible");
 }
 
@@ -71,9 +71,9 @@ fn sync_isolation_b_sees_only_its_own_row(conn: &mut Connection) {
               it; an unwrap/panic here IS the loud test-failure signal"
 )]
 fn capture_schema_then(conn: &mut Connection, sink: Arc<Mutex<Option<String>>>, then_panic: bool) {
-    let row = conn.query_one_sql("SELECT current_schema()::text").unwrap();
+    let row = conn.query_one_raw("SELECT current_schema()::text").unwrap();
     let schema = row.get_str(0).unwrap().unwrap().to_string();
-    conn.execute_sql("CREATE TABLE probe (v int)").unwrap();
+    conn.execute_raw("CREATE TABLE probe (v int)").unwrap();
     match sink.lock() {
         Ok(mut guard) => *guard = Some(schema),
         Err(_) => panic!("schema-capture mutex was poisoned"),

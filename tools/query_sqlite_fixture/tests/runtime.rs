@@ -57,7 +57,7 @@ const SCHEMA: &str = "CREATE TABLE measurements ( \
 
 fn seed() -> Connection {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute_batch_sql(SCHEMA).expect("schema");
+    conn.execute_batch_raw(SCHEMA).expect("schema");
     // Row 1: every column present.
     conn.execute_params(
         "INSERT INTO measurements VALUES ($1, $2, $3, $4, $5, $6)",
@@ -162,7 +162,7 @@ fn typed_query_one_and_opt_enforce_at_most_one() {
     // `Measurement` selects both rows, so the TYPED at-most-one verbs reject it
     // with the classified TooManyRows — the SAME contract the PostgreSQL typed
     // `query_one` / `query_opt` enforce, so a query ported PostgreSQL→SQLite keeps
-    // its multi-row semantics (the dynamic `*_sql` verbs stay first-row).
+    // its multi-row semantics (the dynamic `*_raw` verbs stay first-row).
     match conn.query_one::<Measurement>(()) {
         Err(bsql::sqlite::SqliteError::TooManyRows) => {}
         other => panic!("expected TooManyRows from query_one, got {other:?}"),

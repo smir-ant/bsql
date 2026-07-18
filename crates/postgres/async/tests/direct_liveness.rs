@@ -244,7 +244,7 @@ async fn direct_black_hole_query_is_bounded_with_statement_timeout() {
         .await
         .expect("connect through the relay");
     let warm = conn
-        .query_one_sql("SELECT 'warm'")
+        .query_one_raw("SELECT 'warm'")
         .await
         .expect("warm query works");
     assert_eq!(warm.get_str(0), Ok(Some("warm")));
@@ -253,7 +253,7 @@ async fn direct_black_hole_query_is_bounded_with_statement_timeout() {
     // server's own `57014` abort are both black-holed, so nothing arrives.
     proxy.freeze_existing();
     let start = Instant::now();
-    let got = conn.query_one_sql("SELECT 42").await;
+    let got = conn.query_one_raw("SELECT 42").await;
     let elapsed = start.elapsed();
 
     match got {
@@ -284,14 +284,14 @@ async fn pooled_inflight_black_hole_query_is_bounded_with_statement_timeout() {
     let mut c = pool.get().await.expect("check out a pooled connection");
     let conn = c.conn_mut().expect("borrow the checked-out connection");
     let warm = conn
-        .query_one_sql("SELECT 'warm'")
+        .query_one_raw("SELECT 'warm'")
         .await
         .expect("warm query works");
     assert_eq!(warm.get_str(0), Ok(Some("warm")));
 
     proxy.freeze_existing();
     let start = Instant::now();
-    let got = conn.query_one_sql("SELECT 42").await;
+    let got = conn.query_one_raw("SELECT 42").await;
     let elapsed = start.elapsed();
 
     assert!(
@@ -324,7 +324,7 @@ async fn direct_query_recovers_bounded_on_mid_query_fin() {
         .await
         .expect("connect through the relay");
     let warm = conn
-        .query_one_sql("SELECT 'warm'")
+        .query_one_raw("SELECT 'warm'")
         .await
         .expect("warm query works");
     assert_eq!(warm.get_str(0), Ok(Some("warm")));
@@ -332,7 +332,7 @@ async fn direct_query_recovers_bounded_on_mid_query_fin() {
     // The peer closes mid-query: the client's read returns EOF at once.
     proxy.kill_existing();
     let start = Instant::now();
-    let got = conn.query_one_sql("SELECT 42").await;
+    let got = conn.query_one_raw("SELECT 42").await;
     let elapsed = start.elapsed();
 
     let err = got.expect_err("a peer that closed mid-query must be an error, not a torn success");
@@ -377,7 +377,7 @@ async fn under_budget_query_is_not_cut() {
         .await
         .expect("connect");
     let row = conn
-        .query_one_sql("SELECT pg_sleep(1), 7::int4")
+        .query_one_raw("SELECT pg_sleep(1), 7::int4")
         .await
         .expect("an under-budget query must RETURN, never be client-cut");
     assert_eq!(row.get_i32(1), Ok(Some(7)));
@@ -395,7 +395,7 @@ async fn over_budget_query_hits_server_not_client_window() {
         .expect("connect");
     let start = Instant::now();
     let err = conn
-        .query_one_sql("SELECT pg_sleep(3)")
+        .query_one_raw("SELECT pg_sleep(3)")
         .await
         .expect_err("an over-budget query must be the SERVER's 57014, not a success");
     let elapsed = start.elapsed();
@@ -410,7 +410,7 @@ async fn over_budget_query_hits_server_not_client_window() {
         "the server's 57014 must arrive first, took {elapsed:?}",
     );
     // The connection SURVIVES a statement_timeout abort — still usable.
-    let row = conn.query_one_sql("SELECT 5::int4").await.expect("connection recovers");
+    let row = conn.query_one_raw("SELECT 5::int4").await.expect("connection recovers");
     assert_eq!(row.get_i32(0), Ok(Some(5)));
 }
 
@@ -425,11 +425,11 @@ async fn runtime_set_raising_the_budget_is_not_falsely_cut() {
         .await
         .expect("connect");
     // Raise the server budget to 30 s at runtime — the window must follow.
-    conn.execute_sql("SET statement_timeout = '30s'").await.expect("raise the budget");
+    conn.execute_raw("SET statement_timeout = '30s'").await.expect("raise the budget");
     // A 3 s query the server now allows; the stale 2.3 s window WOULD have cut it.
     let start = Instant::now();
     let row = conn
-        .query_one_sql("SELECT pg_sleep(3), 9::int4")
+        .query_one_raw("SELECT pg_sleep(3), 9::int4")
         .await
         .expect("a runtime-raised budget must NOT be falsely client-cut");
     let elapsed = start.elapsed();
@@ -455,11 +455,11 @@ async fn tx_guard_set_raising_the_budget_is_not_falsely_cut() {
     let elapsed = conn
         .transaction(async |tx| {
             // Raise the server budget to 30 s INSIDE the transaction.
-            tx.execute_sql("SET statement_timeout = '30s'").await?;
+            tx.execute_raw("SET statement_timeout = '30s'").await?;
             // A 3 s query the server now allows; the stale 2.3 s connect-time window
             // WOULD have client-cut it if the tx-guard did not observe the SET.
             let start = Instant::now();
-            let row = tx.query_one_sql("SELECT pg_sleep(3), 9::int4").await?;
+            let row = tx.query_one_raw("SELECT pg_sleep(3), 9::int4").await?;
             assert_eq!(row.get_i32(1), Ok(Some(9)));
             Ok(start.elapsed())
         })
@@ -483,16 +483,16 @@ async fn set_config_raising_the_budget_is_not_falsely_cut() {
         .await
         .expect("connect");
     // Raise the server budget to 30 s via `set_config` (read back through
-    // `query_one_sql`, a verb that also observes) — the window must DISARM.
+    // `query_one_raw`, a verb that also observes) — the window must DISARM.
     let raised = conn
-        .query_one_sql("SELECT set_config('statement_timeout', '30s', false)")
+        .query_one_raw("SELECT set_config('statement_timeout', '30s', false)")
         .await
         .expect("set_config raises the budget");
     assert_eq!(raised.get_str(0), Ok(Some("30s")));
     // A 3 s query the server now allows; a stale 2.3 s window WOULD have cut it.
     let start = Instant::now();
     let row = conn
-        .query_one_sql("SELECT pg_sleep(3), 9::int4")
+        .query_one_raw("SELECT pg_sleep(3), 9::int4")
         .await
         .expect("a set_config-raised budget must NOT be falsely client-cut");
     let elapsed = start.elapsed();
@@ -518,7 +518,7 @@ async fn migration_long_op_is_not_client_cut() {
     let mut mon = Connection::connect(&healthy_config(Duration::from_secs(30), 5))
         .await
         .expect("monitor connect");
-    mon.execute_sql(&format!("CREATE SCHEMA {schema}")).await.expect("create schema");
+    mon.execute_raw(&format!("CREATE SCHEMA {schema}")).await.expect("create schema");
 
     let config = healthy_config(Duration::from_millis(300), 2).with_search_path(&schema);
     let mut conn = Connection::connect(&config).await.expect("connect");
@@ -538,8 +538,8 @@ async fn migration_long_op_is_not_client_cut() {
     );
 
     // After the run, the steady window is restored — a normal query still works.
-    let row = conn.query_one_sql("SELECT 1::int4").await.expect("post-migration query");
+    let row = conn.query_one_raw("SELECT 1::int4").await.expect("post-migration query");
     assert_eq!(row.get_i32(0), Ok(Some(1)));
 
-    mon.execute_sql(&format!("DROP SCHEMA {schema} CASCADE")).await.expect("drop schema");
+    mon.execute_raw(&format!("DROP SCHEMA {schema} CASCADE")).await.expect("drop schema");
 }

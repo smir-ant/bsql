@@ -182,7 +182,7 @@ impl DbError {
 
 /// Why reading a typed value from a dynamic [`Row`](crate::Row) column failed.
 ///
-/// A dynamic (`query_sql`) result carries no compile-time schema, so a single
+/// A dynamic (`query_raw`) result carries no compile-time schema, so a single
 /// column read has several MUTUALLY-EXCLUSIVE outcomes. This type keeps each one
 /// distinct — none is ever collapsed into another:
 ///
@@ -294,7 +294,7 @@ pub enum DriverError {
     /// never occur and is not present.
     #[cfg(feature = "tls")]
     SslRefused,
-    /// A query that required at least one row (e.g. `query_one_sql`) matched none.
+    /// A query that required at least one row (e.g. `query_one_raw`) matched none.
     NoRows,
     /// A pre-connect configuration / validation error; the `&'static str` names
     /// the specific problem and the fix.
@@ -318,7 +318,7 @@ pub enum DriverError {
     /// offset, or cell length than `u32`/`u16` can address). Never silently
     /// truncated — the row is rejected so no corrupted bytes are surfaced.
     RowTooLarge,
-    /// A single `simple_query` / `query_sql` batch contained multiple
+    /// A single `simple_query` / `query_raw` batch contained multiple
     /// statements whose result rows had DIFFERENT column counts. A single
     /// result set has one uniform row shape whose fixed stride addresses every
     /// cell; a batch mixing widths cannot be represented as one result set
@@ -373,7 +373,7 @@ pub enum DriverError {
     /// first row (which would mask a query that is not as selective as the
     /// caller assumed).
     TooManyRows,
-    /// A dynamic (`query_sql` / `query_params`) result declared more columns than
+    /// A dynamic (`query_raw` / `query_params`) result declared more columns than
     /// the driver's supported maximum ([`bsql_postgres_proto::MAX_ROW_COLUMNS`] =
     /// 1664, PostgreSQL's own `MaxTupleAttributeNumber` target-list limit). Unlike
     /// a torn-down connection, this is RECOVERABLE: the verb drained the in-flight
@@ -401,7 +401,7 @@ pub enum DriverError {
     /// Carries the classified [`ColumnError`] — SQL NULL, out-of-range,
     /// unknown-name, or a decode failure — so a bad dynamic read surfaces as a
     /// distinct, inspectable value and never a silently-swallowed `None`. This is
-    /// the dynamic (`query_sql`) counterpart to [`Decode`](Self::Decode), which
+    /// the dynamic (`query_raw`) counterpart to [`Decode`](Self::Decode), which
     /// classifies the compile-checked `query!` path.
     Column(ColumnError),
     /// A typed notification's payload did not parse into the requested type via
@@ -584,7 +584,7 @@ impl DriverError {
     /// on an established connection):
     ///
     /// ```ignore
-    /// match conn.query_sql(sql).await {
+    /// match conn.query_raw(sql).await {
     ///     Ok(rows) => rows,
     ///     Err(e) if e.is_disconnect() => reconnect_and_retry().await?, // connection dead
     ///     Err(e) => return Err(e),                                     // query at fault

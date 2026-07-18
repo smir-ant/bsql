@@ -31,7 +31,7 @@
 ///     token.cancel();                          // from another thread, mid-query
 /// });
 /// // A long/compute-bound query returns `Err(SqliteError::Interrupted)`.
-/// let _ = conn.query_sql("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c");
+/// let _ = conn.query_raw("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c");
 /// canceller.join().ok();
 /// # }
 /// ```

@@ -7,7 +7,7 @@
 //! A [`FakePostgres`] scripts query replies; [`FakePostgres::connect`] hands
 //! back a REAL [`bsql_postgres_async::Connection`] — the same concrete type a
 //! socket `connect` returns — backed by an in-memory fake. Driver code under
-//! test then runs unchanged (`query_sql`, transactions, the whole decode path)
+//! test then runs unchanged (`query_raw`, transactions, the whole decode path)
 //! against the fake, with **no network, no socket, no PostgreSQL** — fully
 //! deterministic.
 //!
@@ -24,7 +24,7 @@
 //! fake.on("SELECT id FROM users").returns(rows![[1_i64], [2_i64]]);
 //!
 //! let mut conn = fake.connect().await?;
-//! let result = conn.query_sql("SELECT id FROM users").await?;
+//! let result = conn.query_raw("SELECT id FROM users").await?;
 //!
 //! assert_eq!(result.len(), 2);
 //! # Ok(())
@@ -34,7 +34,7 @@
 //! # Scope
 //!
 //! Handles the trust-auth handshake, scripted queries over BOTH the simple
-//! protocol ([`query_sql`](bsql_postgres_async::Connection::query_sql)) and the
+//! protocol ([`query_raw`](bsql_postgres_async::Connection::query_raw)) and the
 //! compile-checked `query!` extended protocol — one
 //! [`fake.on(sql)`](FakePostgres::on)`.returns(...)` script answers both — plus
 //! scripted errors. A query reply can also carry interleaved asynchronous
@@ -72,14 +72,14 @@
 //! `int4[]` / `text[]` / `numeric[]` / `uuid[]` decodes byte-for-byte back into
 //! the record — an empty array to an empty `Vec`, a NULL element to a `None`.
 //!
-//! The SIMPLE-query (`query_sql`, text) path is FAIL-CLOSED for any type whose
+//! The SIMPLE-query (`query_raw`, text) path is FAIL-CLOSED for any type whose
 //! text form cannot be rendered byte-faithfully to what a real server sends:
 //! `timestamptz` / `timestamp` (binary-only bsql types, no PostgreSQL-ISO text
 //! form), `float4` / `float8` (Rust's `Display` diverges from PostgreSQL's
 //! `float ::text` for large / small magnitudes and `±Infinity`), and EVERY
 //! array (PostgreSQL's `{a,b,NULL}` array text has involved quoting / escaping
 //! and its elements can themselves be unfaithful — and arrays are decoded from
-//! the binary wire anyway). A `query_sql`
+//! the binary wire anyway). A `query_raw`
 //! over such a cell is a loud, classified `DriverError::Db` naming the faithful
 //! routes — never plausible-but-wrong bytes a consumer could bake into a green
 //! `get_str` assertion (the testkit proves genuine behaviour, not a mock). The
@@ -385,7 +385,7 @@ impl FakeValue {
     }
 
     /// The value in PostgreSQL TEXT wire format, or `None` for a SQL `NULL`.
-    /// Used by the simple-query (`query_sql`) reply path.
+    /// Used by the simple-query (`query_raw`) reply path.
     ///
     /// FAIL-CLOSED for any type whose text form the testkit cannot render
     /// byte-faithfully to what a real PostgreSQL server emits. The testkit's
@@ -522,7 +522,7 @@ impl FakeValue {
 
 /// PostgreSQL `bytea` TEXT output (the default `hex` format): the two-byte `\x`
 /// prefix followed by the bytes as lowercase hex — the canonical text a
-/// simple-query (`query_sql`) result carries for a `bytea` column, so a
+/// simple-query (`query_raw`) result carries for a `bytea` column, so a
 /// `get_str` over the scripted value reads exactly what a real server sends.
 fn bytea_text_body(bytes: &[u8]) -> Vec<u8> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -616,9 +616,9 @@ pub enum TestkitError {
     /// handshake, surfaced by the real engine).
     Driver(DriverError),
     /// A cell's type has no PostgreSQL-faithful SIMPLE-query (text) wire form,
-    /// so the `query_sql` reply path fails closed rather than serve bytes a real
+    /// so the `query_raw` reply path fails closed rather than serve bytes a real
     /// server never sends. The `query!` (binary) reply for the SAME script is
-    /// byte-exact and unaffected; this only fails a `query_sql` over the cell.
+    /// byte-exact and unaffected; this only fails a `query_raw` over the cell.
     /// Surfaced to the driver as a classified `DriverError::Db` when the
     /// simple-query protocol serves the row (so a `query!` over the same script
     /// stays green). `type_name` is the offending PostgreSQL type.
@@ -642,7 +642,7 @@ impl core::fmt::Display for TestkitError {
                 f,
                 "bsql-testkit: a `{type_name}` column has no PostgreSQL-faithful \
                  simple-query (text) form — a real server's text bytes cannot be \
-                 reproduced from the value alone, so the query_sql (text) path \
+                 reproduced from the value alone, so the query_raw (text) path \
                  fails closed rather than serve bytes PostgreSQL never sends. Use \
                  the compile-checked query! (binary) protocol (byte-exact), or \
                  script a Text cell carrying the exact text your PostgreSQL emits."
@@ -781,7 +781,7 @@ impl FakePostgres {
             "ERROR",
             "0A000",
             "bsql-testkit: this in-memory fake supports the simple-query \
-             (query_sql) and compile-checked query! protocols; the runtime \
+             (query_raw) and compile-checked query! protocols; the runtime \
              prepare / describe extended path is not supported.",
         )?;
         let ready_for_query = wire::ready_for_query(TX_IDLE)?;
@@ -908,12 +908,12 @@ fn notification_frames(
 /// Wraps [`encode_rows_simple`]: if any cell's type has no PostgreSQL-faithful
 /// text form ([`TestkitError::UnfaithfulTextRender`] — `timestamptz` /
 /// `timestamp` / `float4` / `float8`), the simple-query reply becomes a
-/// classified `ErrorResponse` naming the faithful routes, so a `query_sql` over
+/// classified `ErrorResponse` naming the faithful routes, so a `query_raw` over
 /// the cell is a loud `DriverError::Db`, never silently-wrong text bytes. The
 /// substitution happens HERE (not at [`build_script`](FakePostgres::build_script)
 /// return) on PURPOSE: the EXTENDED (`query!`) reply for the same script is
 /// byte-exact and unaffected, so a `query!` over a scripted `timestamptz` /
-/// `float8` stays green while a `query_sql` over it fails closed. Any OTHER
+/// `float8` stays green while a `query_raw` over it fails closed. Any OTHER
 /// encode failure (a genuinely oversized value, ragged rows) still propagates.
 fn encode_rows_simple_faithful(
     rows: &ScriptedRows,
@@ -922,7 +922,7 @@ fn encode_rows_simple_faithful(
     match encode_rows_simple(rows, notifications) {
         Ok(bytes) => Ok(bytes),
         Err(e @ TestkitError::UnfaithfulTextRender { .. }) => {
-            // Fail the SIMPLE (query_sql) path closed with a classified server
+            // Fail the SIMPLE (query_raw) path closed with a classified server
             // error carrying the guidance message. `0A000` = feature_not_supported.
             encode_error_simple("0A000", &e.to_string())
         }

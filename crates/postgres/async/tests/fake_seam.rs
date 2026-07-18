@@ -2,7 +2,7 @@
 //!
 //! A genuine [`Connection`] — the same concrete type `connect` returns — is
 //! built over an in-memory [`FakeTransport`] and driven through the real
-//! startup handshake and a real `query_sql` round trip. The bytes the fake
+//! startup handshake and a real `query_raw` round trip. The bytes the fake
 //! serves are parsed by the real sans-IO engine, so a passing decode proves
 //! both that the injection works and that the fake's bytes are wire-correct.
 //!
@@ -101,7 +101,7 @@ async fn connect_and_query_over_the_fake_with_no_socket() {
     assert!(!conn.is_encrypted(), "the plaintext fake wire must report unencrypted");
 
     let result = conn
-        .query_sql("SELECT id FROM users")
+        .query_raw("SELECT id FROM users")
         .await
         .expect("query the fake");
 
@@ -123,7 +123,7 @@ async fn scripted_error_surfaces_as_a_db_error() {
         .expect("connect over the in-memory fake");
 
     let err = conn
-        .query_sql("SELECT boom")
+        .query_raw("SELECT boom")
         .await
         .expect_err("scripted error must surface");
     let text = format!("{err}");
@@ -137,7 +137,7 @@ async fn unmatched_query_is_a_loud_error_not_empty_rows() {
         .expect("connect over the in-memory fake");
 
     let err = conn
-        .query_sql("SELECT something_unscripted")
+        .query_raw("SELECT something_unscripted")
         .await
         .expect_err("an unscripted query must be a loud error, never empty rows");
     let text = format!("{err}");
@@ -170,7 +170,7 @@ async fn a_query_after_a_failed_extended_op_returns_its_rows_on_the_same_connect
     // The SAME connection is clean: the scripted simple query returns ITS rows,
     // not the stale error from the failed extended batch.
     let result = conn
-        .query_sql("SELECT id FROM users")
+        .query_raw("SELECT id FROM users")
         .await
         .expect("the reused connection must return the scripted rows");
     assert_eq!(result.len(), 2);

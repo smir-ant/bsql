@@ -74,10 +74,10 @@ fn embedded_set_applies_live_and_is_idempotent() {
 
     // The migrations really ran: app_items has the added `qty` column, and the
     // acked-destructive migration dropped app_scratch.
-    conn.execute_sql("INSERT INTO app_items (id, label, qty) VALUES (1, 'x', 5)")
+    conn.execute_raw("INSERT INTO app_items (id, label, qty) VALUES (1, 'x', 5)")
         .expect("app_items with qty exists");
     let scratch = conn
-        .query_sql("SELECT to_regclass('app_scratch') IS NULL AS dropped")
+        .query_raw("SELECT to_regclass('app_scratch') IS NULL AS dropped")
         .expect("q");
     assert_eq!(
         scratch.get(0).expect("row").get_bool(0).expect("bool"),

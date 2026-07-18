@@ -207,7 +207,7 @@ where
 ///
 /// The backend's classified error on a SQL / server failure.
 pub fn wipe_scratch<B: SyncBackend>(conn: &mut B) -> Result<u64, B::Error> {
-    conn.execute_sql("DELETE FROM users WHERE email = ''")
+    conn.execute_raw("DELETE FROM users WHERE email = ''")
 }
 
 /// The transaction combinator, generic over the backend: an ATOMIC group of
@@ -221,8 +221,8 @@ pub fn wipe_scratch<B: SyncBackend>(conn: &mut B) -> Result<u64, B::Error> {
 /// BEGIN / COMMIT itself.
 pub fn wipe_in_tx<B: SyncBackend>(conn: &mut B) -> Result<u64, B::Error> {
     conn.transaction(|tx| {
-        tx.execute_sql("DELETE FROM orders")?;
-        tx.execute_sql("DELETE FROM users WHERE email = ''")
+        tx.execute_raw("DELETE FROM orders")?;
+        tx.execute_raw("DELETE FROM users WHERE email = ''")
     })
 }
 
@@ -332,15 +332,15 @@ mod tests {
     where
         B::Error: core::fmt::Debug,
     {
-        conn.execute_sql(
+        conn.execute_raw(
             "CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL, name TEXT)",
         )
         .expect("create users");
-        conn.execute_sql("CREATE TABLE orders (id BIGINT PRIMARY KEY, ref_no TEXT NOT NULL)")
+        conn.execute_raw("CREATE TABLE orders (id BIGINT PRIMARY KEY, ref_no TEXT NOT NULL)")
             .expect("create orders");
-        conn.execute_sql("INSERT INTO users VALUES (1, 'a@b', 'Alice'), (2, 'c@d', NULL)")
+        conn.execute_raw("INSERT INTO users VALUES (1, 'a@b', 'Alice'), (2, 'c@d', NULL)")
             .expect("insert users");
-        conn.execute_sql("INSERT INTO orders VALUES (10, 'R-1'), (20, 'R-2')")
+        conn.execute_raw("INSERT INTO orders VALUES (10, 'R-1'), (20, 'R-2')")
             .expect("insert orders");
     }
 
@@ -450,13 +450,13 @@ mod tests {
         let mut conn = sqlite::Connection::open_in_memory().expect("open in-memory db");
         seed(&mut conn);
         // Add an empty-email row so the tx wipe has something to delete.
-        conn.execute_sql("INSERT INTO users VALUES (3, '', 'ghost')")
+        conn.execute_raw("INSERT INTO users VALUES (3, '', 'ghost')")
             .expect("insert ghost");
 
         // The generic transaction combinator: atomic raw-SQL group. Deletes both
         // orders and the one empty-email user, committed as a unit. This proves
         // the guard `B::Tx` implements `SyncQueries` generically (its
-        // `execute_sql` is a `SyncQueries` verb).
+        // `execute_raw` is a `SyncQueries` verb).
         let affected = wipe_in_tx(&mut conn).expect("wipe_in_tx runs on sqlite");
         assert_eq!(affected, 1); // the one empty-email user
 

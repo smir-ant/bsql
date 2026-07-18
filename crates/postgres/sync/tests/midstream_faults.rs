@@ -48,7 +48,7 @@ const ERRORING_STREAM: &str = "SELECT 1 / (n - 5) FROM generate_series(1, 10) AS
 fn server_error_mid_stream_is_err_and_connection_recovers() {
     let mut conn = Connection::connect(&direct()).expect("connect");
 
-    let outcome = conn.query_each_sql::<_, ()>(ERRORING_STREAM, |_row| ControlFlow::Continue(()));
+    let outcome = conn.query_each_raw::<_, ()>(ERRORING_STREAM, |_row| ControlFlow::Continue(()));
 
     let err = match outcome {
         Err(e) => e,
@@ -66,7 +66,7 @@ fn server_error_mid_stream_is_err_and_connection_recovers() {
     assert!(conn.is_healthy(), "the connection must drain to a clean idle");
 
     let row = conn
-        .query_one_sql("SELECT 42::int4")
+        .query_one_raw("SELECT 42::int4")
         .expect("connection reusable after a mid-stream server error");
     assert_eq!(row.get_i32(0), Ok(Some(42)));
 }
@@ -86,7 +86,7 @@ fn cancel_mid_stream_classifies_57014_and_recovers() {
     });
 
     let start = Instant::now();
-    let outcome = conn.query_each_sql::<_, ()>(SLOW_STREAM, |_row| ControlFlow::Continue(()));
+    let outcome = conn.query_each_raw::<_, ()>(SLOW_STREAM, |_row| ControlFlow::Continue(()));
     let elapsed = start.elapsed();
     canceller.join().expect("cancel thread join").expect("cancel packet delivered");
 
@@ -105,7 +105,7 @@ fn cancel_mid_stream_classifies_57014_and_recovers() {
     assert!(!err.is_disconnect(), "a cancel is not a disconnect");
     assert!(elapsed < Duration::from_secs(5), "cancel must be bounded, took {elapsed:?}");
     assert!(conn.is_healthy(), "reusable after a cancel");
-    let row = conn.query_one_sql("SELECT 7::int4").expect("reusable after cancel");
+    let row = conn.query_one_raw("SELECT 7::int4").expect("reusable after cancel");
     assert_eq!(row.get_i32(0), Ok(Some(7)));
 }
 
@@ -127,12 +127,12 @@ fn terminated_backend_mid_stream_is_a_disconnect() {
         thread::sleep(Duration::from_millis(200));
         let mut killer = killer;
         let t = killer
-            .query_one_sql(&format!("SELECT pg_terminate_backend({pid})"))
+            .query_one_raw(&format!("SELECT pg_terminate_backend({pid})"))
             .expect("terminate the victim backend");
         assert_eq!(t.get_str(0), Ok(Some("t")), "pg_terminate_backend returned true");
         killer
     });
-    let victim_res = victim.query_each_sql::<_, ()>(SLOW_STREAM, |_row| ControlFlow::Continue(()));
+    let victim_res = victim.query_each_raw::<_, ()>(SLOW_STREAM, |_row| ControlFlow::Continue(()));
     let mut killer = terminator.join().expect("terminator thread joins");
 
     let err = match victim_res {
@@ -143,7 +143,7 @@ fn terminated_backend_mid_stream_is_a_disconnect() {
         err.is_disconnect(),
         "a terminated backend mid-stream must classify as a disconnect, got {err:?}",
     );
-    let row = killer.query_one_sql("SELECT 1::int4").expect("killer healthy");
+    let row = killer.query_one_raw("SELECT 1::int4").expect("killer healthy");
     assert_eq!(row.get_i32(0), Ok(Some(1)));
 }
 
@@ -163,7 +163,7 @@ fn transport_death_mid_stream_is_classified_not_a_hang() {
     let mut conn = Connection::connect(&cfg).expect("connect through relay");
 
     let start = Instant::now();
-    let outcome = conn.query_each_sql::<_, ()>(
+    let outcome = conn.query_each_raw::<_, ()>(
         "SELECT n FROM generate_series(1, 500000) AS t(n)",
         |_row| ControlFlow::Continue(()),
     );
@@ -191,9 +191,9 @@ fn transport_death_mid_stream_is_classified_not_a_hang() {
 fn no_leak_under_repeated_mid_stream_faults() {
     for i in 0..100 {
         let mut conn = Connection::connect(&direct()).expect("connect");
-        let outcome = conn.query_each_sql::<_, ()>(ERRORING_STREAM, |_row| ControlFlow::Continue(()));
+        let outcome = conn.query_each_raw::<_, ()>(ERRORING_STREAM, |_row| ControlFlow::Continue(()));
         assert!(outcome.is_err(), "round {i}: the erroring stream must fail");
-        let row = match conn.query_one_sql("SELECT 1::int4") {
+        let row = match conn.query_one_raw("SELECT 1::int4") {
             Ok(r) => r,
             Err(e) => panic!("round {i}: connection must recover after the fault: {e:?}"),
         };

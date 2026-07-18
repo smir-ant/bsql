@@ -35,6 +35,6 @@ workspace = true
 
 [dev-dependencies]
 # The demo test uses `#[tokio::test]`. Like the async driver, the LIBRARY needs
-# no runtime (`connect`/`query_sql` only `.await`, never spawn), so tokio is a
+# no runtime (`connect`/`query_raw` only `.await`, never spawn), so tokio is a
 # dev-only edge — a consumer of the testkit brings its own runtime.
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

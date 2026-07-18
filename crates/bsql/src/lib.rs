@@ -18,7 +18,7 @@
 //! let mut conn = Connection::connect(&config).await?;
 //!
 //! // Runtime-SQL query (the typed flagship is `query::<Q>` with `query!`)
-//! let result = conn.query_sql("SELECT id, name FROM users").await?;
+//! let result = conn.query_raw("SELECT id, name FROM users").await?;
 //! for row in result.iter() {
 //!     // Each getter returns `Result<Option<T>, ColumnError>`: `?` propagates a
 //!     // classified decode/out-of-range error, the inner `Option` is SQL NULL.
@@ -41,8 +41,8 @@
 //!
 //! // Transactions (tier-1 safety: closure scope = transaction boundary)
 //! conn.transaction(async |tx| {
-//!     tx.execute_sql("INSERT INTO log VALUES ('start')").await?;
-//!     tx.execute_sql("UPDATE counter SET n = n + 1").await?;
+//!     tx.execute_raw("INSERT INTO log VALUES ('start')").await?;
+//!     tx.execute_raw("UPDATE counter SET n = n + 1").await?;
 //!     Ok(()) // → COMMIT. Err → ROLLBACK.
 //! }).await?;
 //! # Ok(())
@@ -60,7 +60,7 @@
 //!     .ssl_mode(SslMode::Disable);
 //!
 //! let mut conn = Connection::connect(&config)?;
-//! let result = conn.query_sql("SELECT 1 + 1 AS answer")?;
+//! let result = conn.query_raw("SELECT 1 + 1 AS answer")?;
 //! assert_eq!(result.get(0).expect("one row").get_i32(0), Ok(Some(2)));
 //! conn.close()?;
 //! # Ok(())
@@ -74,13 +74,13 @@
 //! use bsql::sqlite::Connection;
 //!
 //! let conn = Connection::open_in_memory()?;
-//! conn.execute_sql("CREATE TABLE t(v INTEGER)")?;
+//! conn.execute_raw("CREATE TABLE t(v INTEGER)")?;
 //! conn.transaction(|tx| {
-//!     tx.execute_sql("INSERT INTO t VALUES (42)")?;
+//!     tx.execute_raw("INSERT INTO t VALUES (42)")?;
 //!     Ok(())
 //! })?;
-//! // Dynamic (raw-SQL) verbs carry the `_sql` suffix; reads are classified.
-//! let row = conn.query_one_sql("SELECT v FROM t")?;
+//! // Dynamic (raw-SQL) verbs carry the `_raw` suffix; reads are classified.
+//! let row = conn.query_one_raw("SELECT v FROM t")?;
 //! assert_eq!(row.get::<i64>(0)?, 42);
 //! # Ok(())
 //! # }
@@ -619,7 +619,7 @@ pub mod __rt_sqlite {
 /// ```rust,ignore
 /// #[bsql::test]
 /// async fn creates_a_user(conn: &mut bsql::pg::Connection) {
-///     conn.execute_sql("CREATE TABLE users (id int)").await.unwrap();
+///     conn.execute_raw("CREATE TABLE users (id int)").await.unwrap();
 ///     // ... assertions, all inside an isolated schema ...
 /// }   // schema auto-dropped, even if the test panics
 /// ```
@@ -630,7 +630,7 @@ pub mod __rt_sqlite {
 /// ```rust,ignore
 /// #[bsql::test]
 /// fn creates_a_user(conn: &mut bsql::pg_sync::Connection) {
-///     conn.execute_sql("CREATE TABLE users (id int)").unwrap();
+///     conn.execute_raw("CREATE TABLE users (id int)").unwrap();
 /// }   // schema auto-dropped, even if the test panics
 /// ```
 ///

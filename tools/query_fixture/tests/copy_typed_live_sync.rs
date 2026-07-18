@@ -43,7 +43,7 @@ fn typed_binary_copy_round_trips_hostile_null_and_large_batch() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     // A session-scoped table matching the catalog shape — auto-dropped at close,
     // never touches a persistent schema.
-    c.execute_sql(
+    c.execute_raw(
         "CREATE TEMP TABLE copy_bulk (\
          id BIGINT NOT NULL, label TEXT NOT NULL, note TEXT, amount INTEGER)",
     )
@@ -121,7 +121,7 @@ fn a_rejected_row_recovers_the_connection() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
     // A PRIMARY KEY on `id` makes two rows with the same id a unique violation
     // the server detects while ingesting the streamed COPY.
-    c.execute_sql(
+    c.execute_raw(
         "CREATE TEMP TABLE copy_bulk (\
          id BIGINT PRIMARY KEY, label TEXT NOT NULL, note TEXT, amount INTEGER)",
     )
@@ -140,7 +140,7 @@ fn a_rejected_row_recovers_the_connection() {
 
     // The connection RECOVERED: a plain query succeeds on the same connection.
     let alive = c
-        .query_one_sql("SELECT 1::int4")
+        .query_one_raw("SELECT 1::int4")
         .expect("connection recovered after the rejected COPY");
     assert_eq!(alive.get::<i32>(0).expect("column present"), Some(1));
 

@@ -67,10 +67,10 @@ fn cfg() -> ConnectConfig {
 
 /// Ensure the `accounts` table exists and this test's id range is clear.
 async fn prepare(c: &mut Connection, lo: i64, hi: i64) {
-    c.execute_sql("CREATE TABLE IF NOT EXISTS accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
+    c.execute_raw("CREATE TABLE IF NOT EXISTS accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
         .await
         .expect("create accounts");
-    c.execute_sql(&format!("DELETE FROM accounts WHERE id BETWEEN {lo} AND {hi}"))
+    c.execute_raw(&format!("DELETE FROM accounts WHERE id BETWEEN {lo} AND {hi}"))
         .await
         .expect("clear id range");
 }
@@ -198,8 +198,8 @@ async fn commit_time_deferred_constraint_failure_is_honest_not_out_of_range_inde
     let mut c = Connection::connect(&cfg()).await.expect("connect");
     // Recreate the deferred-constraint table fresh (the deferrable UNIQUE is a
     // runtime property; the migration only feeds the carrier's catalog columns).
-    c.execute_sql("DROP TABLE IF EXISTS pl_deferred").await.expect("drop");
-    c.execute_sql(
+    c.execute_raw("DROP TABLE IF EXISTS pl_deferred").await.expect("drop");
+    c.execute_raw(
         "CREATE TABLE pl_deferred (id INTEGER PRIMARY KEY, tag INTEGER NOT NULL, \
          CONSTRAINT pl_deferred_tag_uniq UNIQUE (tag) DEFERRABLE INITIALLY DEFERRED)",
     )
@@ -234,7 +234,7 @@ async fn commit_time_deferred_constraint_failure_is_honest_not_out_of_range_inde
 
     // ALL-OR-NOTHING: the whole implicit transaction rolled back — zero rows.
     let count = c
-        .query_one_sql("SELECT count(*)::int8 AS n FROM pl_deferred")
+        .query_one_raw("SELECT count(*)::int8 AS n FROM pl_deferred")
         .await
         .expect("count");
     assert_eq!(
@@ -301,7 +301,7 @@ async fn transport_death_mid_batch_is_a_classified_disconnect() {
     let killer = tokio::spawn(async move {
         let mut k = Connection::connect(&cfg()).await.expect("killer connect");
         tokio::time::sleep(Duration::from_millis(300)).await;
-        drop(k.execute_sql(&format!("SELECT pg_terminate_backend({pid})")).await);
+        drop(k.execute_raw(&format!("SELECT pg_terminate_backend({pid})")).await);
         drop(k.close().await);
     });
 
@@ -362,7 +362,7 @@ async fn explicit_begin_then_failing_batch_leaves_aborted_tx_until_rollback() {
     let id = 8_300_001i64;
     prepare(&mut c, 8_300_000, 8_300_099).await;
 
-    c.execute_sql("BEGIN").await.expect("open explicit tx");
+    c.execute_raw("BEGIN").await.expect("open explicit tx");
     let result = c
         .pipeline((
             PlInsAccount::bind((id, 1)),
@@ -452,19 +452,19 @@ async fn prepare_bulk(c: &mut Connection, lo: i64, hi: i64) {
     // tolerate that race — on a duplicate error the table now exists (a failed
     // autocommit `CREATE` leaves the connection idle + reusable for the `DELETE`).
     if let Err(e) = c
-        .execute_sql("CREATE TABLE IF NOT EXISTS pl_bulk (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)")
+        .execute_raw("CREATE TABLE IF NOT EXISTS pl_bulk (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)")
         .await
     {
         let raced = matches!(&e, DriverError::Db(db) if db.code() == "23505" || db.code() == "42P07");
         assert!(raced, "create pl_bulk failed for a non-race reason: {e:?}");
     }
-    c.execute_sql(&format!("DELETE FROM pl_bulk WHERE id BETWEEN {lo} AND {hi}"))
+    c.execute_raw(&format!("DELETE FROM pl_bulk WHERE id BETWEEN {lo} AND {hi}"))
         .await
         .expect("clear id range");
 }
 
 async fn bulk_count(c: &mut Connection, lo: i64, hi: i64) -> i64 {
-    c.query_one_sql(&format!(
+    c.query_one_raw(&format!(
         "SELECT count(*)::int8 AS n FROM pl_bulk WHERE id BETWEEN {lo} AND {hi}"
     ))
     .await
@@ -540,7 +540,7 @@ async fn windowed_large_result_plus_large_params_does_not_deadlock() {
     assert_eq!(bulk_count(&mut c, base + 1, base + 6).await, 6, "all six writes committed");
     // The payloads round-tripped byte-exact (no window boundary corrupted a param).
     let got = c
-        .query_one_sql(&format!("SELECT length(payload)::int8 AS n FROM pl_bulk WHERE id = {}", base + 3))
+        .query_one_raw(&format!("SELECT length(payload)::int8 AS n FROM pl_bulk WHERE id = {}", base + 3))
         .await
         .expect("length")
         .get_i64(0)

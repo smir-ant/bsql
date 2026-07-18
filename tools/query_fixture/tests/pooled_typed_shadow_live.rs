@@ -60,12 +60,12 @@ mod sync_driver {
         // A PERMANENT `public.pts_sync` with User 1's distinguishable row.
         {
             let mut setup = Connection::connect(&cfg).expect("setup connect");
-            setup.execute_sql("DROP TABLE IF EXISTS public.pts_sync").expect("drop");
+            setup.execute_raw("DROP TABLE IF EXISTS public.pts_sync").expect("drop");
             setup
-                .execute_sql("CREATE TABLE public.pts_sync (val text NOT NULL)")
+                .execute_raw("CREATE TABLE public.pts_sync (val text NOT NULL)")
                 .expect("create permanent");
             setup
-                .execute_sql("INSERT INTO public.pts_sync (val) VALUES ('PERMANENT')")
+                .execute_raw("INSERT INTO public.pts_sync (val) VALUES ('PERMANENT')")
                 .expect("seed permanent");
             setup.close().expect("setup close");
         }
@@ -80,7 +80,7 @@ mod sync_driver {
         {
             let mut g = pool.get().expect("user1 checkout");
             let c = g.conn_mut().expect("user1 conn");
-            c.execute_sql("CREATE TEMP TABLE _pgtemp_activate (x int4)")
+            c.execute_raw("CREATE TEMP TABLE _pgtemp_activate (x int4)")
                 .expect("activate pg_temp for the connection's lifetime");
             for _ in 0..12 {
                 let row = c.query_one::<PtsSync>(()).expect("user1 typed query");
@@ -96,9 +96,9 @@ mod sync_driver {
         {
             let mut g = pool.get().expect("user2 checkout");
             let c = g.conn_mut().expect("user2 conn");
-            c.execute_sql("CREATE TEMP TABLE pts_sync (val text NOT NULL)")
+            c.execute_raw("CREATE TEMP TABLE pts_sync (val text NOT NULL)")
                 .expect("user2 temp table");
-            c.execute_sql("INSERT INTO pts_sync (val) VALUES ('TEMP-USER-2')")
+            c.execute_raw("INSERT INTO pts_sync (val) VALUES ('TEMP-USER-2')")
                 .expect("user2 temp seed");
 
             let row = c.query_one::<PtsSync>(()).expect("user2 typed query");
@@ -112,7 +112,7 @@ mod sync_driver {
         // Cleanup the permanent table.
         {
             let mut cleanup = Connection::connect(&cfg).expect("cleanup connect");
-            cleanup.execute_sql("DROP TABLE IF EXISTS public.pts_sync").expect("cleanup drop");
+            cleanup.execute_raw("DROP TABLE IF EXISTS public.pts_sync").expect("cleanup drop");
             cleanup.close().expect("cleanup close");
         }
     }
@@ -136,13 +136,13 @@ mod async_driver {
         // A PERMANENT `public.pts_async` with User 1's distinguishable row.
         {
             let mut setup = Connection::connect(&cfg).await.expect("setup connect");
-            setup.execute_sql("DROP TABLE IF EXISTS public.pts_async").await.expect("drop");
+            setup.execute_raw("DROP TABLE IF EXISTS public.pts_async").await.expect("drop");
             setup
-                .execute_sql("CREATE TABLE public.pts_async (val text NOT NULL)")
+                .execute_raw("CREATE TABLE public.pts_async (val text NOT NULL)")
                 .await
                 .expect("create permanent");
             setup
-                .execute_sql("INSERT INTO public.pts_async (val) VALUES ('PERMANENT')")
+                .execute_raw("INSERT INTO public.pts_async (val) VALUES ('PERMANENT')")
                 .await
                 .expect("seed permanent");
             setup.close().await.expect("setup close");
@@ -157,7 +157,7 @@ mod async_driver {
         {
             let mut g = pool.get().await.expect("user1 checkout");
             let c = g.conn_mut().expect("user1 conn");
-            c.execute_sql("CREATE TEMP TABLE _pgtemp_activate (x int4)")
+            c.execute_raw("CREATE TEMP TABLE _pgtemp_activate (x int4)")
                 .await
                 .expect("activate pg_temp for the connection's lifetime");
             for _ in 0..12 {
@@ -172,10 +172,10 @@ mod async_driver {
         {
             let mut g = pool.get().await.expect("user2 checkout");
             let c = g.conn_mut().expect("user2 conn");
-            c.execute_sql("CREATE TEMP TABLE pts_async (val text NOT NULL)")
+            c.execute_raw("CREATE TEMP TABLE pts_async (val text NOT NULL)")
                 .await
                 .expect("user2 temp table");
-            c.execute_sql("INSERT INTO pts_async (val) VALUES ('TEMP-USER-2')")
+            c.execute_raw("INSERT INTO pts_async (val) VALUES ('TEMP-USER-2')")
                 .await
                 .expect("user2 temp seed");
 
@@ -190,7 +190,7 @@ mod async_driver {
         // Cleanup the permanent table.
         {
             let mut cleanup = Connection::connect(&cfg).await.expect("cleanup connect");
-            cleanup.execute_sql("DROP TABLE IF EXISTS public.pts_async").await.expect("cleanup drop");
+            cleanup.execute_raw("DROP TABLE IF EXISTS public.pts_async").await.expect("cleanup drop");
             cleanup.close().await.expect("cleanup close");
         }
     }

@@ -41,7 +41,7 @@ async fn async_runner_applies_then_is_idempotent() {
     assert_eq!(report.already_applied, 0);
 
     // The migrations really ran.
-    conn.execute_sql("INSERT INTO users (id, name, email) VALUES (1, 'a', 'a@x')")
+    conn.execute_raw("INSERT INTO users (id, name, email) VALUES (1, 'a', 'a@x')")
         .await
         .expect("table + column exist");
 

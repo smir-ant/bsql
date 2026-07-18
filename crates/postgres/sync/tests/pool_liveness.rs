@@ -224,7 +224,7 @@ fn pool_get_recovers_a_fresh_connection_when_a_pooled_peer_vanishes() {
         let one = c
             .conn_mut()
             .expect("borrow warm connection")
-            .query_one_sql("SELECT 'warm'")
+            .query_one_raw("SELECT 'warm'")
             .expect("warm connection is a real, working PG connection");
         assert_eq!(one.get_str(0), Ok(Some("warm")));
     } // dropped → generation-0 returns to the idle set
@@ -244,7 +244,7 @@ fn pool_get_recovers_a_fresh_connection_when_a_pooled_peer_vanishes() {
     let row = fresh
         .conn_mut()
         .expect("borrow fresh connection")
-        .query_one_sql("SELECT 'fresh'")
+        .query_one_raw("SELECT 'fresh'")
         .expect("the recovered connection is real and usable");
     assert_eq!(row.get_str(0), Ok(Some("fresh")));
 
@@ -275,7 +275,7 @@ fn pool_get_is_bounded_when_no_fresh_connection_can_open() {
         let one = c
             .conn_mut()
             .expect("borrow")
-            .query_one_sql("SELECT 'warm'")
+            .query_one_raw("SELECT 'warm'")
             .expect("warm connection works");
         assert_eq!(one.get_str(0), Ok(Some("warm")));
     } // generation 0 returns idle
@@ -318,7 +318,7 @@ fn live_backends(mon: &mut Connection, pids: &[i32]) -> usize {
     for &pid in pids {
         // `pid` is a trusted i32 from `pg_backend_pid()`, so splicing it is safe.
         let sql = format!("SELECT count(*)::int4 FROM pg_stat_activity WHERE pid = {pid}");
-        let row = mon.query_one_sql(&sql).expect("stat_activity probe");
+        let row = mon.query_one_raw(&sql).expect("stat_activity probe");
         if row.get_i32(0).ok().flatten() != Some(0) {
             alive += 1;
         }
@@ -342,7 +342,7 @@ fn pool_close_gracefully_terminates_idle_backends() {
         let pid = c
             .conn_mut()
             .expect("borrow")
-            .query_one_sql("SELECT pg_backend_pid()")
+            .query_one_raw("SELECT pg_backend_pid()")
             .expect("read backend pid")
             .get_i32(0)
             .expect("pid decode")
@@ -389,7 +389,7 @@ fn pool_close_is_bounded_when_a_pooled_peer_is_black_holed() {
         let one = c
             .conn_mut()
             .expect("borrow")
-            .query_one_sql("SELECT 'warm'")
+            .query_one_raw("SELECT 'warm'")
             .expect("warm connection works");
         assert_eq!(one.get_str(0), Ok(Some("warm")));
     }
@@ -416,7 +416,7 @@ fn pool_close_is_bounded_when_a_pooled_peer_is_black_holed() {
 fn pid_of(c: &mut PooledConnection) -> i32 {
     c.conn_mut()
         .expect("borrow")
-        .query_one_sql("SELECT pg_backend_pid()")
+        .query_one_raw("SELECT pg_backend_pid()")
         .expect("read backend pid")
         .get_i32(0)
         .expect("pid decode")

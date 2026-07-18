@@ -49,9 +49,9 @@ fn cfg() -> ConnectConfig {
 }
 
 fn prepare(c: &mut Connection, lo: i64, hi: i64) {
-    c.execute_sql("CREATE TABLE IF NOT EXISTS accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
+    c.execute_raw("CREATE TABLE IF NOT EXISTS accounts (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
         .expect("create accounts");
-    c.execute_sql(&format!("DELETE FROM accounts WHERE id BETWEEN {lo} AND {hi}"))
+    c.execute_raw(&format!("DELETE FROM accounts WHERE id BETWEEN {lo} AND {hi}"))
         .expect("clear id range");
 }
 
@@ -137,8 +137,8 @@ fn batch_failed_index_accessor_names_the_command() {
 #[ignore = "requires local PG"]
 fn commit_time_deferred_constraint_failure_is_honest_not_out_of_range_index() {
     let mut c = Connection::connect(&cfg()).expect("connect");
-    c.execute_sql("DROP TABLE IF EXISTS pl_deferred").expect("drop");
-    c.execute_sql(
+    c.execute_raw("DROP TABLE IF EXISTS pl_deferred").expect("drop");
+    c.execute_raw(
         "CREATE TABLE pl_deferred (id INTEGER PRIMARY KEY, tag INTEGER NOT NULL, \
          CONSTRAINT pl_deferred_tag_uniq UNIQUE (tag) DEFERRABLE INITIALLY DEFERRED)",
     )
@@ -164,7 +164,7 @@ fn commit_time_deferred_constraint_failure_is_honest_not_out_of_range_index() {
     assert!(!err.is_disconnect(), "a 23505 is a per-query error, not a disconnect");
 
     let count = c
-        .query_one_sql("SELECT count(*)::int8 AS n FROM pl_deferred")
+        .query_one_raw("SELECT count(*)::int8 AS n FROM pl_deferred")
         .expect("count");
     assert_eq!(
         count.get_i64(0).expect("decode").unwrap_or(-1),
@@ -213,7 +213,7 @@ fn transport_death_mid_batch_is_a_classified_disconnect() {
     let killer = thread::spawn(move || {
         let mut k = Connection::connect(&cfg()).expect("killer connect");
         thread::sleep(Duration::from_millis(300));
-        drop(k.execute_sql(&format!("SELECT pg_terminate_backend({pid})")));
+        drop(k.execute_raw(&format!("SELECT pg_terminate_backend({pid})")));
         drop(k.close());
     });
 
@@ -263,7 +263,7 @@ fn explicit_begin_then_failing_batch_leaves_aborted_tx_until_rollback() {
     let id = 9_300_001i64;
     prepare(&mut c, 9_300_000, 9_300_099);
 
-    c.execute_sql("BEGIN").expect("open explicit tx");
+    c.execute_raw("BEGIN").expect("open explicit tx");
     let result = c.pipeline((
         PlInsAccountS::bind((id, 1)),
         PlInsAccountS::bind((id, 2)),
@@ -327,17 +327,17 @@ fn prepare_bulk(c: &mut Connection, lo: i64, hi: i64) {
     // the `pg_type` unique index / `42P07`) between the parallel windowed tests — see
     // the async twin for the full note.
     if let Err(e) =
-        c.execute_sql("CREATE TABLE IF NOT EXISTS pl_bulk (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)")
+        c.execute_raw("CREATE TABLE IF NOT EXISTS pl_bulk (id BIGINT PRIMARY KEY, payload TEXT NOT NULL)")
     {
         let raced = matches!(&e, DriverError::Db(db) if db.code() == "23505" || db.code() == "42P07");
         assert!(raced, "create pl_bulk failed for a non-race reason: {e:?}");
     }
-    c.execute_sql(&format!("DELETE FROM pl_bulk WHERE id BETWEEN {lo} AND {hi}"))
+    c.execute_raw(&format!("DELETE FROM pl_bulk WHERE id BETWEEN {lo} AND {hi}"))
         .expect("clear id range");
 }
 
 fn bulk_count(c: &mut Connection, lo: i64, hi: i64) -> i64 {
-    c.query_one_sql(&format!(
+    c.query_one_raw(&format!(
         "SELECT count(*)::int8 AS n FROM pl_bulk WHERE id BETWEEN {lo} AND {hi}"
     ))
     .expect("count")

@@ -1,5 +1,5 @@
 //! Witnesses for the explicit, reusable prepared-statement handles —
-//! [`Connection::prepare_sql`] (dynamic) and [`Connection::prepare`]`::<Q>`
+//! [`Connection::prepare_raw`] (dynamic) and [`Connection::prepare`]`::<Q>`
 //! (typed).
 //!
 //! These pin the properties that make an EXPLICIT handle both correct and the
@@ -79,7 +79,7 @@ impl SqliteTypedQuery for AllUsers {
 }
 
 fn seed(conn: &Connection) {
-    conn.execute_sql("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+    conn.execute_raw("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
         .expect("create");
     for i in 1..=20_i64 {
         let name = format!("user-{i}");
@@ -91,7 +91,7 @@ fn seed(conn: &Connection) {
     }
 }
 
-// ── DYNAMIC handle (`prepare_sql`) ───────────────────────────────────────────
+// ── DYNAMIC handle (`prepare_raw`) ───────────────────────────────────────────
 
 /// The SAME handle re-run with DIFFERENT params returns each call's own row —
 /// proving the statement resets and clears prior bindings between reuses.
@@ -99,7 +99,7 @@ fn seed(conn: &Connection) {
 fn dynamic_reuse_stays_correct_across_params() {
     let conn = Connection::open_in_memory().expect("open");
     seed(&conn);
-    let mut stmt = conn.prepare_sql("SELECT id, name FROM users WHERE id = ?1").expect("prepare");
+    let mut stmt = conn.prepare_raw("SELECT id, name FROM users WHERE id = ?1").expect("prepare");
     assert_eq!(stmt.parameter_count(), 1);
     assert_eq!(stmt.column_count(), 2);
     // 200 reuses across the whole key range — a leaked binding would mismatch.
@@ -118,7 +118,7 @@ fn dynamic_reuse_stays_correct_across_params() {
 fn dynamic_query_one_opt_first_row_semantics() {
     let conn = Connection::open_in_memory().expect("open");
     seed(&conn);
-    let mut stmt = conn.prepare_sql("SELECT id, name FROM users WHERE id = ?1").expect("prepare");
+    let mut stmt = conn.prepare_raw("SELECT id, name FROM users WHERE id = ?1").expect("prepare");
 
     assert_eq!(stmt.query_one(&[ValueRef::Integer(7)]).expect("row").get::<i64>(0).expect("id"), 7);
     assert!(stmt.query_opt(&[ValueRef::Integer(7)]).expect("opt").is_some());
@@ -133,12 +133,12 @@ fn dynamic_query_one_opt_first_row_semantics() {
 #[test]
 fn dynamic_execute_and_query_reuse() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute_sql("CREATE TABLE t (v INTEGER NOT NULL)").expect("create");
-    let mut ins = conn.prepare_sql("INSERT INTO t (v) VALUES (?1)").expect("prepare ins");
+    conn.execute_raw("CREATE TABLE t (v INTEGER NOT NULL)").expect("create");
+    let mut ins = conn.prepare_raw("INSERT INTO t (v) VALUES (?1)").expect("prepare ins");
     for i in 0..100_i64 {
         assert_eq!(ins.execute(&[ValueRef::Integer(i)]).expect("insert"), 1);
     }
-    let mut count = conn.prepare_sql("SELECT COUNT(*) FROM t").expect("prepare count");
+    let mut count = conn.prepare_raw("SELECT COUNT(*) FROM t").expect("prepare count");
     // Reuse the eager `query` verb twice — both see the same table state.
     for _ in 0..2 {
         let qr = count.query(&[]).expect("query");
@@ -153,7 +153,7 @@ fn dynamic_query_each_streams_and_breaks() {
     let conn = Connection::open_in_memory().expect("open");
     seed(&conn);
     let mut stmt = conn
-        .prepare_sql("SELECT id, name FROM users ORDER BY id LIMIT ?1")
+        .prepare_raw("SELECT id, name FROM users ORDER BY id LIMIT ?1")
         .expect("prepare");
 
     // Full drain.
@@ -184,7 +184,7 @@ fn dynamic_query_each_streams_and_breaks() {
 fn dynamic_arity_mismatch_is_classified() {
     let conn = Connection::open_in_memory().expect("open");
     seed(&conn);
-    let mut stmt = conn.prepare_sql("SELECT id FROM users WHERE id = ?1").expect("prepare");
+    let mut stmt = conn.prepare_raw("SELECT id FROM users WHERE id = ?1").expect("prepare");
     // Two params for a one-placeholder statement.
     assert!(stmt.query(&[ValueRef::Integer(1), ValueRef::Integer(2)]).is_err());
 }
@@ -266,8 +266,8 @@ fn typed_query_each_streams() {
 #[test]
 fn conn_prepared_statement_runs_inside_transaction() {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute_sql("CREATE TABLE t (v INTEGER NOT NULL)").expect("create");
-    let mut ins = conn.prepare_sql("INSERT INTO t (v) VALUES (?1)").expect("prepare");
+    conn.execute_raw("CREATE TABLE t (v INTEGER NOT NULL)").expect("create");
+    let mut ins = conn.prepare_raw("INSERT INTO t (v) VALUES (?1)").expect("prepare");
 
     // Commit path: 10 inserts inside a committed transaction persist.
     conn.transaction(|_tx| {
@@ -278,7 +278,7 @@ fn conn_prepared_statement_runs_inside_transaction() {
     })
     .expect("committed tx");
     assert_eq!(
-        conn.query_one_sql("SELECT COUNT(*) FROM t").expect("count").get::<i64>(0).expect("n"),
+        conn.query_one_raw("SELECT COUNT(*) FROM t").expect("count").get::<i64>(0).expect("n"),
         10
     );
 
@@ -292,7 +292,7 @@ fn conn_prepared_statement_runs_inside_transaction() {
     });
     assert!(outcome.is_err());
     assert_eq!(
-        conn.query_one_sql("SELECT COUNT(*) FROM t").expect("count").get::<i64>(0).expect("n"),
+        conn.query_one_raw("SELECT COUNT(*) FROM t").expect("count").get::<i64>(0).expect("n"),
         10,
         "rolled-back inserts must not persist"
     );

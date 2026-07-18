@@ -240,7 +240,7 @@ impl<S: Transport<Error = std::io::Error>> Core<S> {
     pub async fn try_acquire_migration_lock(&mut self) -> Result<bool, DriverError> {
         let key = advisory_lock_key(LEDGER_TABLE);
         let result = self
-            .query_sql(&format!("SELECT pg_try_advisory_lock({key})"))
+            .query_raw(&format!("SELECT pg_try_advisory_lock({key})"))
             .await?;
         // `pg_try_advisory_lock` returns exactly one bool row; the `None` arm is
         // structurally unreachable but handled totally (never a panic).
@@ -389,7 +389,7 @@ impl<S: Transport<Error = std::io::Error>> Core<S> {
         &mut self,
         allow_missing: bool,
     ) -> Result<Vec<AppliedMigration>, MigrationError> {
-        let result = match self.query_sql(READ_LEDGER).await {
+        let result = match self.query_raw(READ_LEDGER).await {
             Ok(r) => r,
             Err(DriverError::Db(db)) if allow_missing && db.is_code(UNDEFINED_TABLE) => {
                 return Ok(Vec::new());

@@ -15,7 +15,7 @@ async fn consumer_runs_query_against_the_fake_with_no_network(
     fake.on("SELECT id FROM users").returns(rows![[1_i64], [2_i64]]);
 
     let mut conn = fake.connect().await?;
-    let result = conn.query_sql("SELECT id FROM users").await?;
+    let result = conn.query_raw("SELECT id FROM users").await?;
 
     assert_eq!(result.len(), 2);
     assert_eq!(result.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
@@ -30,7 +30,7 @@ async fn multiple_columns_and_types_decode() -> Result<(), Box<dyn std::error::E
         .returns(rows![[1_i64, "alice", true], [2_i64, "bob", false]]);
 
     let mut conn = fake.connect().await?;
-    let result = conn.query_sql("SELECT id, name, active FROM users").await?;
+    let result = conn.query_raw("SELECT id, name, active FROM users").await?;
 
     assert_eq!(result.len(), 2);
     assert_eq!(result.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
@@ -48,7 +48,7 @@ async fn null_cells_decode_as_none() -> Result<(), Box<dyn std::error::Error>> {
         .returns(rows![[Option::<&str>::None], ["yui"]]);
 
     let mut conn = fake.connect().await?;
-    let result = conn.query_sql("SELECT nickname FROM users").await?;
+    let result = conn.query_raw("SELECT nickname FROM users").await?;
 
     assert_eq!(result.len(), 2);
     assert!(result.get(0).expect("row 0").is_null(0));
@@ -64,7 +64,7 @@ async fn scripted_error_surfaces_as_a_db_error() {
 
     let mut conn = fake.connect().await.expect("connect");
     let err = conn
-        .query_sql("SELECT 1/0")
+        .query_raw("SELECT 1/0")
         .await
         .expect_err("scripted error must surface");
     assert!(format!("{err}").contains("division by zero"), "got: {err}");
@@ -77,7 +77,7 @@ async fn unscripted_query_is_a_loud_error_not_empty_rows() {
 
     let mut conn = fake.connect().await.expect("connect");
     let err = conn
-        .query_sql("SELECT 2")
+        .query_raw("SELECT 2")
         .await
         .expect_err("an unscripted query must be a loud error, never empty rows");
     assert!(

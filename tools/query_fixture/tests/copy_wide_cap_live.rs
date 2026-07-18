@@ -41,7 +41,7 @@ fn sync_config() -> ConnectConfig {
 #[ignore = "requires local PG"]
 fn twenty_column_copy_and_twenty_param_query_round_trip() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    c.execute_sql(
+    c.execute_raw(
         "CREATE TEMP TABLE copy_wide (\
          c01 INTEGER NOT NULL, c02 INTEGER NOT NULL, c03 INTEGER NOT NULL, c04 INTEGER NOT NULL, \
          c05 INTEGER NOT NULL, c06 INTEGER NOT NULL, c07 INTEGER NOT NULL, c08 INTEGER NOT NULL, \
@@ -68,7 +68,7 @@ fn twenty_column_copy_and_twenty_param_query_round_trip() {
     // result-column cap; the PARAM side is the raised axis under test). Check
     // the first and last column of each row + the row count.
     let sums = c
-        .query_one_sql("SELECT sum(c01)::int8 AS s1, sum(c20)::int8 AS s20, count(*)::int8 AS n FROM copy_wide")
+        .query_one_raw("SELECT sum(c01)::int8 AS s1, sum(c20)::int8 AS s20, count(*)::int8 AS n FROM copy_wide")
         .expect("aggregate read back");
     assert_eq!(sums.get::<i64>(0).expect("s1"), Some(101), "sum(c01) = 1 + 100");
     assert_eq!(sums.get::<i64>(1).expect("s20"), Some(139), "sum(c20) = 20 + 119");

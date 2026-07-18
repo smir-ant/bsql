@@ -6,7 +6,7 @@
 //! (startup, the simple query, and the extended-query
 //! `Parse`/`Bind`/`Execute`/`Close`/`Sync`), and queues the matching *backend*
 //! reply bytes for the driver to read — all synchronously, in memory, with no
-//! socket. So both `query_sql` (simple) and the compile-checked `query!`
+//! socket. So both `query_raw` (simple) and the compile-checked `query!`
 //! (extended) run against it unchanged. Because it implements the same
 //! [`Transport`] the real socket does,
 //! the real sans-IO engine drives it unchanged and parses its bytes exactly as
@@ -38,7 +38,7 @@ use bsql_postgres_proto::engine::Transport;
 
 /// The two pre-built replies for one scripted query — one per wire protocol.
 ///
-/// The SAME scripted query answers both `query_sql` (the simple protocol) and
+/// The SAME scripted query answers both `query_raw` (the simple protocol) and
 /// the compile-checked `query!` (the extended protocol), but the two protocols
 /// demand different reply bytes: the simple path wants a whole
 /// `RowDescription` + text `DataRow`s + `CommandComplete` + `ReadyForQuery`;

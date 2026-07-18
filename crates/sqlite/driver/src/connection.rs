@@ -24,7 +24,7 @@ const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// by the discriminant with no sentinel. The `u32` offset/len keep the slot at
 /// 16 bytes; a whole result whose text/blob bytes exceed `u32::MAX` (a `> 4 GiB`
 /// eager materialization) is rejected loudly at seal rather than mis-addressed
-/// (stream it via [`Connection::query_each_sql`] instead — that path has no cap).
+/// (stream it via [`Connection::query_each_raw`] instead — that path has no cap).
 #[derive(Debug, Clone, Copy)]
 enum CellSlot {
     Null,
@@ -347,7 +347,7 @@ crate::footprint_pin!(Row, size = 16, align = 8);
 // true auto-trait set, and asserting only what holds is the discipline; a future
 // change that added a `!Send` field (a raw pointer cached for a fast path, an
 // `Rc`-shared arena) would silently make `Connection` `!Send`, compile clean
-// here, and break only a downstream `spawn_blocking(move || conn.query_sql(..))`
+// here, and break only a downstream `spawn_blocking(move || conn.query_raw(..))`
 // — the tier-4 gap this closes. Holds in both feature states (`RefCell<T>` is
 // `Send` when `T: Send`, so the `n1-detect` field preserves Send). Type-checked,
 // never run.
@@ -478,7 +478,7 @@ fn slice_arena(data: &[u8], offset: u32, len: u32) -> Result<&[u8], SqliteError>
 }
 
 /// A borrowed view of a single row on the streaming path, valid only for the
-/// duration of the [`Connection::query_each_sql`] callback that receives it.
+/// duration of the [`Connection::query_each_raw`] callback that receives it.
 ///
 /// `Text`/`Blob` reads (`get::<&str>` / `get::<&[u8]>` / [`BorrowedRow::value_ref`])
 /// borrow SQLite's own column buffer with zero copy. The view's lifetime `'r`
@@ -592,7 +592,7 @@ impl<'r> ColumnSource<'r> for BorrowedRow<'r> {
 /// `&'static` const SQL and the dynamic verbs' arbitrary `&str` are valid keys
 /// (the dynamic path's LRU eviction bounds the retained set).
 ///
-/// The STREAMING verbs ([`query_each_sql`](Self::query_each_sql) /
+/// The STREAMING verbs ([`query_each_raw`](Self::query_each_raw) /
 /// [`query_each_params`](Self::query_each_params) / the typed
 /// [`query_each`](Self::query_each)) deliberately do NOT cache — they prepare
 /// with a plain (non-persistent) statement. rusqlite's cache forces the
@@ -800,11 +800,11 @@ impl Connection {
 
     /// Execute a statement, returning the number of rows changed.
     ///
-    /// The `_sql` suffix marks the DYNAMIC (raw-SQL-text) verb — the same naming
-    /// split the PostgreSQL driver uses (`execute_sql` dynamic), and the same the
-    /// other dynamic verbs here follow (`query_sql`, `query_one_sql`, …). It frees
+    /// The `_raw` suffix marks the DYNAMIC (raw-SQL-text) verb — the same naming
+    /// split the PostgreSQL driver uses (`execute_raw` dynamic), and the same the
+    /// other dynamic verbs here follow (`query_raw`, `query_one_raw`, …). It frees
     /// the bare `execute` name for a future symmetric typed `execute::<Q>`.
-    pub fn execute_sql(&self, sql: &str) -> Result<u64, SqliteError> {
+    pub fn execute_raw(&self, sql: &str) -> Result<u64, SqliteError> {
         let mut stmt = self.inner.prepare_cached(sql)?;
         Ok(changes_to_u64(stmt.execute([])?))
     }
@@ -827,11 +827,11 @@ impl Connection {
 
     /// Run `sql` and eagerly materialize every row.
     ///
-    /// The `_sql` suffix marks the DYNAMIC (raw-SQL-text) verb, distinct from the
+    /// The `_raw` suffix marks the DYNAMIC (raw-SQL-text) verb, distinct from the
     /// compile-checked typed flagship [`query`](Self::query)`::<Q>` that runs a
     /// `query!` carrier — the same naming split the PostgreSQL driver uses
-    /// (`query_sql` dynamic, `query` typed).
-    pub fn query_sql(&self, sql: &str) -> Result<QueryResult, SqliteError> {
+    /// (`query_raw` dynamic, `query` typed).
+    pub fn query_raw(&self, sql: &str) -> Result<QueryResult, SqliteError> {
         self.query_collect(sql, [])
     }
 
@@ -845,7 +845,7 @@ impl Connection {
         self.query_collect(sql, rusqlite::params_from_iter(params))
     }
 
-    /// Shared eager-collect core for [`Self::query_sql`] / [`Self::query_params`].
+    /// Shared eager-collect core for [`Self::query_raw`] / [`Self::query_params`].
     ///
     /// Materializes every row into ONE shared arena (a single `data`/`slots`
     /// pair) and a lazy [`RowSet`] over it — no per-row `Vec`, no per-cell owned
@@ -980,14 +980,14 @@ impl Connection {
     /// call: a `&str`/`&[u8]` borrowed from a row cannot be stashed in anything
     /// that outlives the callback (a compile error), so a streamed borrow can
     /// never dangle.
-    pub fn query_each_sql<F, E>(&self, sql: &str, on_row: F) -> Result<Option<E>, SqliteError>
+    pub fn query_each_raw<F, E>(&self, sql: &str, on_row: F) -> Result<Option<E>, SqliteError>
     where
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
     {
         self.query_each_collect(sql, [], on_row)
     }
 
-    /// Parameterized peer of [`Self::query_each_sql`].
+    /// Parameterized peer of [`Self::query_each_raw`].
     pub fn query_each_params<F, E>(
         &self,
         sql: &str,
@@ -1000,7 +1000,7 @@ impl Connection {
         self.query_each_collect(sql, rusqlite::params_from_iter(params), on_row)
     }
 
-    /// Shared streaming core for [`Self::query_each_sql`] / [`Self::query_each_params`].
+    /// Shared streaming core for [`Self::query_each_raw`] / [`Self::query_each_params`].
     fn query_each_collect<F, E>(
         &self,
         sql: &str,
@@ -1052,15 +1052,15 @@ impl Connection {
 
     /// Run a query and return exactly its first row, or [`SqliteError::Query`]
     /// if it produced none.
-    pub fn query_one_sql(&self, sql: &str) -> Result<Row, SqliteError> {
-        self.query_sql(sql)?
+    pub fn query_one_raw(&self, sql: &str) -> Result<Row, SqliteError> {
+        self.query_raw(sql)?
             .get(0)
             .ok_or(SqliteError::NoRows)
     }
 
     /// Run a query and return its first row, if any.
-    pub fn query_opt_sql(&self, sql: &str) -> Result<Option<Row>, SqliteError> {
-        Ok(self.query_sql(sql)?.get(0))
+    pub fn query_opt_raw(&self, sql: &str) -> Result<Option<Row>, SqliteError> {
+        Ok(self.query_raw(sql)?.get(0))
     }
 
     /// Run a compile-checked `query!` and collect its TYPED rows — the flagship
@@ -1158,8 +1158,8 @@ impl Connection {
     /// counts.)
     ///
     /// Named `execute_batch` to MATCH the PostgreSQL typed flagship; the DYNAMIC
-    /// multi-statement raw-SQL executor is [`execute_batch_sql`](Self::execute_batch_sql)
-    /// (SQLite-only — the `_sql` suffix disambiguates, exactly as `copy_in` /
+    /// multi-statement raw-SQL executor is [`execute_batch_raw`](Self::execute_batch_raw)
+    /// (SQLite-only — the `_raw` suffix disambiguates, exactly as `copy_in` /
     /// `copy_in_typed` do).
     ///
     /// # Errors
@@ -1219,7 +1219,7 @@ impl Connection {
     /// Streams and decodes ONLY the first row (no whole-result arena), then steps
     /// once more to reject a second — so a by-key lookup pays for one row plus one
     /// step, never a materialization. The dynamic
-    /// [`query_one_sql`](Self::query_one_sql) is the first-row variant.
+    /// [`query_one_raw`](Self::query_one_raw) is the first-row variant.
     ///
     /// # Errors
     ///
@@ -1246,7 +1246,7 @@ impl Connection {
     ///
     /// Streams and decodes ONLY the first row (no whole-result arena), then steps
     /// once more to reject a second. The dynamic
-    /// [`query_opt_sql`](Self::query_opt_sql) is the first-row variant.
+    /// [`query_opt_raw`](Self::query_opt_raw) is the first-row variant.
     ///
     /// # Errors
     ///
@@ -1277,8 +1277,8 @@ impl Connection {
     /// the typed flagship reads the same on both backends and a query ported
     /// PostgreSQL→SQLite keeps its multi-row semantics. The extra step is one
     /// `sqlite3_step`, never a materialization (the same cost model as the
-    /// PostgreSQL break-on-second-row path). The DYNAMIC `query_one_sql` /
-    /// `query_opt_sql` deliberately stay first-row.
+    /// PostgreSQL break-on-second-row path). The DYNAMIC `query_one_raw` /
+    /// `query_opt_raw` deliberately stay first-row.
     fn query_first_owned<'p, Q: SqliteTypedQuery>(
         &self,
         params: &Q::Params<'p>,
@@ -1356,7 +1356,7 @@ impl Connection {
     /// [`SqliteStatement`] handle bound to this connection — the DYNAMIC peer of
     /// the compile-checked typed [`prepare`](Self::prepare)`::<Q>`.
     ///
-    /// The verbs on the connection (`query_sql` / `query_params` / … ) prepare a
+    /// The verbs on the connection (`query_raw` / `query_params` / … ) prepare a
     /// fresh statement PER CALL; a query re-run in a loop through them pays a
     /// `sqlite3_prepare_v2` recompile every iteration (the eager/execute/typed
     /// verbs hide it behind a per-connection cache, but the zero-copy STREAMING
@@ -1386,13 +1386,13 @@ impl Connection {
     /// # Errors
     ///
     /// A classified [`SqliteError`] if the SQL fails to compile.
-    pub fn prepare_sql(&self, sql: &str) -> Result<SqliteStatement<'_>, SqliteError> {
+    pub fn prepare_raw(&self, sql: &str) -> Result<SqliteStatement<'_>, SqliteError> {
         Ok(SqliteStatement { stmt: self.inner.prepare(sql)? })
     }
 
     /// Prepare a compile-checked `query!` carrier into an explicit, reusable
     /// [`SqliteTypedStatement`] handle — the TYPED flagship peer of the dynamic
-    /// [`prepare_sql`](Self::prepare_sql).
+    /// [`prepare_raw`](Self::prepare_raw).
     ///
     /// `Q` is a `query!` carrier — the record `Foo` itself; the handle's verbs
     /// ([`query`](SqliteTypedStatement::query) /
@@ -1402,7 +1402,7 @@ impl Connection {
     /// `Q::Params` tuple and decode into the SAME typed records the connection's
     /// [`query`](Self::query) family produces (storage-class-verified per value —
     /// a mismatch is a classified [`SqliteError`], never a silent coercion). Like
-    /// [`prepare_sql`](Self::prepare_sql) it compiles the SQL ONCE (a plain,
+    /// [`prepare_raw`](Self::prepare_raw) it compiles the SQL ONCE (a plain,
     /// non-persistent statement) and reuses it on every call, so a typed by-key
     /// lookup re-run in a loop pays no per-call recompile.
     ///
@@ -1534,13 +1534,13 @@ impl Connection {
     /// Execute multiple DYNAMIC raw-SQL statements separated by semicolons
     /// (rusqlite's multi-statement executor).
     ///
-    /// The `_sql` suffix marks this as the runtime raw-SQL verb (like
-    /// `query_sql` / `execute_sql`), DISTINCT from the compile-checked typed
+    /// The `_raw` suffix marks this as the runtime raw-SQL verb (like
+    /// `query_raw` / `execute_raw`), DISTINCT from the compile-checked typed
     /// [`execute_batch`](Self::execute_batch) (the homogeneous atomic bulk-write
     /// flagship that MATCHES the PostgreSQL `execute_batch`). A cross-backend
     /// consumer uses `execute_batch::<Q>` for a typed batch on BOTH backends and
-    /// this SQLite-only `execute_batch_sql` for a raw multi-statement script.
-    pub fn execute_batch_sql(&self, sql: &str) -> Result<(), SqliteError> {
+    /// this SQLite-only `execute_batch_raw` for a raw multi-statement script.
+    pub fn execute_batch_raw(&self, sql: &str) -> Result<(), SqliteError> {
         self.inner.execute_batch(sql).map_err(SqliteError::from)
     }
 
@@ -1606,7 +1606,7 @@ fn ensure_param_count(stmt: &rusqlite::Statement<'_>, bound: usize) -> Result<()
 ///
 /// Residual (inherent, shared with the PostgreSQL guard): the guard closes the
 /// METHOD-level misuse, but raw SQL text cannot be typed away on any
-/// `execute_sql(&str)` surface — a body that runs `tx.execute_sql("COMMIT")` (or
+/// `execute_raw(&str)` surface — a body that runs `tx.execute_raw("COMMIT")` (or
 /// `"BEGIN"` / `"SAVEPOINT s"`) as a string still reaches the engine. That is a
 /// property of accepting arbitrary SQL text, not a gap in this guard; the
 /// compile-checked boundary is the set of METHODS the closure is handed.
@@ -1617,9 +1617,9 @@ pub struct Transaction<'c> {
 
 impl Transaction<'_> {
     /// Execute a statement, returning the number of rows changed. See
-    /// [`Connection::execute_sql`].
-    pub fn execute_sql(&self, sql: &str) -> Result<u64, SqliteError> {
-        self.conn.execute_sql(sql)
+    /// [`Connection::execute_raw`].
+    pub fn execute_raw(&self, sql: &str) -> Result<u64, SqliteError> {
+        self.conn.execute_raw(sql)
     }
 
     /// Execute a parameterized statement, returning the number of rows changed.
@@ -1632,15 +1632,15 @@ impl Transaction<'_> {
     }
 
     /// Execute multiple DYNAMIC raw-SQL statements separated by semicolons. The
-    /// guard peer of [`Connection::execute_batch_sql`]; the typed batch flagship
+    /// guard peer of [`Connection::execute_batch_raw`]; the typed batch flagship
     /// is [`execute_batch`](Self::execute_batch).
-    pub fn execute_batch_sql(&self, sql: &str) -> Result<(), SqliteError> {
-        self.conn.execute_batch_sql(sql)
+    pub fn execute_batch_raw(&self, sql: &str) -> Result<(), SqliteError> {
+        self.conn.execute_batch_raw(sql)
     }
 
     /// Run `sql` and eagerly materialize every row.
-    pub fn query_sql(&self, sql: &str) -> Result<QueryResult, SqliteError> {
-        self.conn.query_sql(sql)
+    pub fn query_raw(&self, sql: &str) -> Result<QueryResult, SqliteError> {
+        self.conn.query_raw(sql)
     }
 
     /// Run a parameterized `sql` and eagerly materialize every row.
@@ -1654,13 +1654,13 @@ impl Transaction<'_> {
 
     /// Run a query and return exactly its first row, or
     /// [`SqliteError::Query`] if it produced none.
-    pub fn query_one_sql(&self, sql: &str) -> Result<Row, SqliteError> {
-        self.conn.query_one_sql(sql)
+    pub fn query_one_raw(&self, sql: &str) -> Result<Row, SqliteError> {
+        self.conn.query_one_raw(sql)
     }
 
     /// Run a query and return its first row, if any.
-    pub fn query_opt_sql(&self, sql: &str) -> Result<Option<Row>, SqliteError> {
-        self.conn.query_opt_sql(sql)
+    pub fn query_opt_raw(&self, sql: &str) -> Result<Option<Row>, SqliteError> {
+        self.conn.query_opt_raw(sql)
     }
 
     /// Run a parameterized query and return exactly its first row, or
@@ -1683,14 +1683,14 @@ impl Transaction<'_> {
     }
 
     /// Stream a query's rows one at a time through `on_row`, zero-copy.
-    pub fn query_each_sql<F, E>(&self, sql: &str, on_row: F) -> Result<Option<E>, SqliteError>
+    pub fn query_each_raw<F, E>(&self, sql: &str, on_row: F) -> Result<Option<E>, SqliteError>
     where
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
     {
-        self.conn.query_each_sql(sql, on_row)
+        self.conn.query_each_raw(sql, on_row)
     }
 
-    /// Parameterized peer of [`Self::query_each_sql`].
+    /// Parameterized peer of [`Self::query_each_raw`].
     pub fn query_each_params<F, E>(
         &self,
         sql: &str,
@@ -1950,12 +1950,12 @@ impl<Q: SqliteTypedQuery> core::fmt::Debug for TypedRows<Q> {
 // ─── Explicit prepared-statement handles ─────────────────────────────────────
 
 /// An explicit, reusable DYNAMIC (raw-SQL) prepared statement — the handle
-/// [`Connection::prepare_sql`] returns.
+/// [`Connection::prepare_raw`] returns.
 ///
 /// Holds one `rusqlite::Statement<'conn>` (a PLAIN, non-persistent prepare, so
 /// its stepping keeps SQLite's lookaside pool live) borrowing the connection.
 /// The consumer keeps it on the stack beside the connection and calls its verbs
-/// repeatedly; the SQL is compiled ONCE at [`prepare_sql`](Connection::prepare_sql)
+/// repeatedly; the SQL is compiled ONCE at [`prepare_raw`](Connection::prepare_raw)
 /// and every execution reuses the compiled bytecode, so a hot loop pays no
 /// per-call `sqlite3_prepare_v2` recompile — the fast reuse shape a hand-rolled
 /// FFI layer achieves, with no `unsafe` and no self-referential hidden cache.

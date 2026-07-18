@@ -2,10 +2,10 @@
 //! over the in-memory fake PostgreSQL with NO network, and its binary
 //! `DataRow` bytes decode into the typed record.
 //!
-//! This is the moat proof for the FLAGSHIP. `query_sql` (the simple protocol)
+//! This is the moat proof for the FLAGSHIP. `query_raw` (the simple protocol)
 //! already ran against the fake; here the extended query protocol
 //! (Parse/Bind/Execute/Sync, binary result cells) does too. The same
-//! `fake.on(sql).returns(rows)` script that answers `query_sql` also answers
+//! `fake.on(sql).returns(rows)` script that answers `query_raw` also answers
 //! `query!` — the fake matches the `Parse` message's SQL text — so one script
 //! serves both. A passing decode proves the fake's binary bytes are exactly
 //! what the real engine + macro-emitted `Cell<BinaryFmt>` decoder expect.

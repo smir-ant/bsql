@@ -41,12 +41,12 @@ fn fresh(c: &mut Connection) {
     // A per-connection TEMP TABLE (session-private) shadows the migration's permanent
     // `eb_rows` so the tests, each on its OWN connection, never interfere under cargo's
     // default parallelism (no shared permanent table is dropped or truncated).
-    c.execute_sql("CREATE TEMP TABLE eb_rows (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
+    c.execute_raw("CREATE TEMP TABLE eb_rows (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
         .expect("create temp");
 }
 
 fn row_count(c: &mut Connection) -> i64 {
-    c.query_one_sql("SELECT count(*)::int8 AS n FROM eb_rows")
+    c.query_one_raw("SELECT count(*)::int8 AS n FROM eb_rows")
         .expect("count")
         .get_i64(0)
         .expect("decode")
@@ -66,7 +66,7 @@ fn n_updates_return_correct_counts_and_all_apply() {
         .expect("update batch");
     assert_eq!(counts, vec![1, 1, 1, 0]);
     let sum = c
-        .query_one_sql("SELECT coalesce(sum(balance),0)::int8 AS s FROM eb_rows")
+        .query_one_raw("SELECT coalesce(sum(balance),0)::int8 AS s FROM eb_rows")
         .expect("sum")
         .get_i64(0)
         .expect("decode")
@@ -108,7 +108,7 @@ fn commit_time_deferred_failure_is_db_none_index() {
     let mut c = Connection::connect(&cfg()).expect("connect");
     // Session-private TEMP TABLE (shadows the migration's permanent `eb_uniq`) so
     // parallel tests never interfere.
-    c.execute_sql(
+    c.execute_raw(
         "CREATE TEMP TABLE eb_uniq (id INTEGER PRIMARY KEY, tag INTEGER NOT NULL, \
          CONSTRAINT eb_uniq_tag_uniq UNIQUE (tag) DEFERRABLE INITIALLY DEFERRED)",
     )
@@ -179,7 +179,7 @@ fn large_n_windowed_is_correct_and_deadlock_free() {
     assert_eq!(row_count(&mut c), N);
     // Large mid-batch failure still rolls the whole thing back. The TEMP `eb_rows`
     // already exists on this connection, so CLEAR it (not re-create).
-    c.execute_sql("TRUNCATE eb_rows").expect("truncate");
+    c.execute_raw("TRUNCATE eb_rows").expect("truncate");
     let mut sets: Vec<(i64, i64)> = (0..N).map(|i| (i, 1)).collect();
     sets.push((5_000, 1));
     let result = c.execute_batch::<EbsIns, _>(sets);
@@ -203,7 +203,7 @@ fn typed_execute_returns_the_affected_count() {
     let missed = c.execute::<EbsUpd>((999_i64, 5_i64)).expect("update-absent");
     assert_eq!(missed, 0, "an absent id affects 0 rows");
     let balance = c
-        .query_one_sql("SELECT coalesce(sum(balance),0)::int8 AS s FROM eb_rows")
+        .query_one_raw("SELECT coalesce(sum(balance),0)::int8 AS s FROM eb_rows")
         .expect("sum")
         .get_i64(0)
         .expect("decode")

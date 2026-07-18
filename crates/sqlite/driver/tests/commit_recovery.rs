@@ -24,9 +24,9 @@ use bsql_sqlite::{Connection, SqliteError};
 #[test]
 fn a_commit_failure_rolls_back_and_preserves_the_classified_error() {
     let conn = Connection::open_in_memory().expect("open in-memory");
-    conn.execute_sql("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+    conn.execute_raw("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
         .expect("create parent");
-    conn.execute_sql(
+    conn.execute_raw(
         "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER \
          REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
     )
@@ -36,7 +36,7 @@ fn a_commit_failure_rolls_back_and_preserves_the_classified_error() {
     // the deferred FK check (parent 999 does not exist) and leaves the tx open.
     let err = conn
         .transaction(|tx| {
-            tx.execute_sql("INSERT INTO child (id, parent_id) VALUES (1, 999)")?;
+            tx.execute_raw("INSERT INTO child (id, parent_id) VALUES (1, 999)")?;
             Ok(())
         })
         .expect_err("a deferred-FK COMMIT must fail");
@@ -60,14 +60,14 @@ fn a_commit_failure_rolls_back_and_preserves_the_classified_error() {
     //     BEGINs and COMMITs cleanly (before the fix, the stale open tx failed this
     //     with "cannot start a transaction within a transaction").
     conn.transaction(|tx| {
-        tx.execute_sql("INSERT INTO parent (id) VALUES (1)")?;
+        tx.execute_raw("INSERT INTO parent (id) VALUES (1)")?;
         Ok(())
     })
     .expect("a follow-up transaction must BEGIN + COMMIT cleanly after the rolled-back COMMIT failure");
 
     // And a bare dynamic statement still works — the connection is fully reusable.
     let affected = conn
-        .execute_sql("INSERT INTO parent (id) VALUES (2)")
+        .execute_raw("INSERT INTO parent (id) VALUES (2)")
         .expect("a bare statement after recovery");
     assert_eq!(affected, 1, "the recovery transaction and the follow-up write both applied");
 }

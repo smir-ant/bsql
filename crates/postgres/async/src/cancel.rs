@@ -28,7 +28,7 @@ use crate::transport::ReadDeadline;
 ///     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 ///     let _ = token.cancel().await;            // from another task, mid-query
 /// });
-/// let _ = conn.query_sql("SELECT pg_sleep(5)").await;  // returns ~early, canceled
+/// let _ = conn.query_raw("SELECT pg_sleep(5)").await;  // returns ~early, canceled
 /// handle.await.ok();
 /// # Ok(())
 /// # }

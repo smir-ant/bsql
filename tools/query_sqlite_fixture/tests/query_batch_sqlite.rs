@@ -39,12 +39,12 @@ const SCHEMA: &str = "CREATE TABLE measurements ( \
 
 fn seed() -> Connection {
     let conn = Connection::open_in_memory().expect("open");
-    conn.execute_batch_sql(SCHEMA).expect("schema");
-    conn.execute_sql("INSERT INTO measurements (id, label, weight) VALUES (1, 'one', 1.5)")
+    conn.execute_batch_raw(SCHEMA).expect("schema");
+    conn.execute_raw("INSERT INTO measurements (id, label, weight) VALUES (1, 'one', 1.5)")
         .expect("seed 1");
-    conn.execute_sql("INSERT INTO measurements (id, label, weight) VALUES (2, 'two', 2.5)")
+    conn.execute_raw("INSERT INTO measurements (id, label, weight) VALUES (2, 'two', 2.5)")
         .expect("seed 2");
-    conn.execute_sql("INSERT INTO measurements (id, label, weight) VALUES (3, 'three', 3.5)")
+    conn.execute_raw("INSERT INTO measurements (id, label, weight) VALUES (3, 'three', 3.5)")
         .expect("seed 3");
     conn
 }

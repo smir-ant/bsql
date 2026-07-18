@@ -119,11 +119,11 @@ pub enum SqliteError {
         /// The column name that did not resolve.
         name: String,
     },
-    /// An eager [`query_sql`](crate::Connection::query_sql) result's text/blob
+    /// An eager [`query_raw`](crate::Connection::query_raw) result's text/blob
     /// bytes (or its column count) exceeded the 32-bit bounds of the shared
     /// arena's slot fields — a `> 4 GiB` eager materialization. Rejected loudly
     /// rather than returned with mis-addressed cells; stream the result with
-    /// [`query_each_sql`](crate::Connection::query_each_sql) (constant memory, no
+    /// [`query_each_raw`](crate::Connection::query_each_raw) (constant memory, no
     /// cap) instead.
     ResultTooLarge,
     /// A TYPED at-most-one verb ([`query_one`](crate::Connection::query_one) /
@@ -131,8 +131,8 @@ pub enum SqliteError {
     /// The typed flagship's `query_one` / `query_opt` are exactly-one /
     /// at-most-one — the SAME contract the PostgreSQL typed verbs enforce, so a
     /// query ported PostgreSQL→SQLite keeps its multi-row semantics. (The dynamic
-    /// [`query_one_sql`](crate::Connection::query_one_sql) /
-    /// [`query_opt_sql`](crate::Connection::query_opt_sql) stay first-row.)
+    /// [`query_one_raw`](crate::Connection::query_one_raw) /
+    /// [`query_opt_raw`](crate::Connection::query_opt_raw) stay first-row.)
     TooManyRows,
     /// An in-flight query was INTERRUPTED by a
     /// [`SqliteCancelToken`](crate::SqliteCancelToken) (`sqlite3_interrupt`) from
@@ -150,7 +150,7 @@ pub enum SqliteError {
     /// one `ValueRef` bind seam, so BOTH the typed and dynamic paths see it.
     NanBind,
     /// A one-row verb ([`query_one`](crate::Connection::query_one) /
-    /// `query_one_sql` / `query_params_one`) received ZERO rows. The classified
+    /// `query_one_raw` / `query_params_one`) received ZERO rows. The classified
     /// peer of PostgreSQL's `DriverError::NoRows`, so a generic cross-backend
     /// consumer classifies an empty one-row read identically on both backends
     /// (via `BackendError::is_no_rows` at the umbrella). Replaces the former
@@ -396,7 +396,7 @@ impl core::fmt::Display for SqliteError {
             Self::UnknownColumn { name } => write!(f, "unknown column {name:?}"),
             Self::ResultTooLarge => write!(
                 f,
-                "eager result exceeds the 4 GiB arena bound — stream it with query_each_sql instead",
+                "eager result exceeds the 4 GiB arena bound — stream it with query_each_raw instead",
             ),
             Self::TooManyRows => write!(
                 f,

@@ -418,14 +418,14 @@ async fn scram_sha_256_plus_authenticates_over_tls_and_fails_closed_on_plaintext
         );
         // Prove the authenticated session is fully usable.
         let row = conn
-            .query_one_sql("SELECT 1::int4")
+            .query_one_raw("SELECT 1::int4")
             .await
             .expect("a query on the -PLUS-authenticated connection must succeed");
         assert_eq!(row.get_i32(0), Ok(Some(1)), "the session round-trips a value");
         // Prove the server sees us as the SCRAM login role (not the trust
         // superuser) — the SCRAM+channel-binding path really authenticated.
         let who = conn
-            .query_one_sql("SELECT current_user::text")
+            .query_one_raw("SELECT current_user::text")
             .await
             .expect("current_user query must succeed");
         assert_eq!(
@@ -449,7 +449,7 @@ async fn scram_sha_256_plus_authenticates_over_tls_and_fails_closed_on_plaintext
         };
         assert!(conn.is_encrypted(), "the Prefer connection MUST be real TLS");
         let row = conn
-            .query_one_sql("SELECT 42::int4")
+            .query_one_raw("SELECT 42::int4")
             .await
             .expect("a query on the Prefer-authenticated connection must succeed");
         assert_eq!(row.get_i32(0), Ok(Some(42)));
@@ -532,7 +532,7 @@ async fn scram_sha_256_plus_survives_tls_session_resumption() {
         };
         assert!(warm.is_encrypted(), "the warm-up -PLUS connection MUST be real TLS");
         let r = warm
-            .query_one_sql("SELECT 1::int4")
+            .query_one_raw("SELECT 1::int4")
             .await
             .expect("warm-up query must succeed (and pull the session ticket)");
         assert_eq!(r.get_i32(0), Ok(Some(1)));
@@ -550,7 +550,7 @@ async fn scram_sha_256_plus_survives_tls_session_resumption() {
     };
     assert!(resumed.is_encrypted(), "the resumed -PLUS connection MUST be real TLS");
     let who = resumed
-        .query_one_sql("SELECT current_user::text")
+        .query_one_raw("SELECT current_user::text")
         .await
         .expect("current_user on the resumed -PLUS connection must succeed");
     assert_eq!(

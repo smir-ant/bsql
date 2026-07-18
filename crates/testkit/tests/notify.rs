@@ -32,7 +32,7 @@ async fn notify_during_query_is_captured_async() -> Result<(), Box<dyn std::erro
         .returns(rows![[1_i64], [2_i64]]);
 
     let mut conn = fake.connect().await?;
-    let result = conn.query_sql("SELECT id FROM users").await?;
+    let result = conn.query_raw("SELECT id FROM users").await?;
     // The query itself still returns its rows, unaffected.
     assert_eq!(result.len(), 2);
 
@@ -62,7 +62,7 @@ fn notify_during_query_is_captured_sync() -> Result<(), Box<dyn std::error::Erro
         .returns(rows![[1_i64], [2_i64]]);
 
     let mut conn = fake.connect_sync()?;
-    let result = conn.query_sql("SELECT id FROM users")?;
+    let result = conn.query_raw("SELECT id FROM users")?;
     assert_eq!(result.len(), 2);
 
     assert_eq!(conn.buffered_notifications(), 1, "the interleaved NOTIFY was captured, not dropped");
@@ -87,7 +87,7 @@ async fn multiple_interleaved_notifications_drain_in_order_async(
         .returns(rows![[1_i64]]);
 
     let mut conn = fake.connect().await?;
-    let _ = conn.query_sql("SELECT 1").await?;
+    let _ = conn.query_raw("SELECT 1").await?;
 
     assert_eq!(conn.buffered_notifications(), 3, "all three interleaved NOTIFYs captured");
     assert_eq!(conn.notifications_received(), 3);
@@ -119,7 +119,7 @@ async fn reset_session_clears_pending_notifications_async(
     fake.on(RESET_SQL).returns(rows![[1_i64]]);
 
     let mut conn = fake.connect().await?;
-    let _ = conn.query_sql("SELECT 1").await?;
+    let _ = conn.query_raw("SELECT 1").await?;
     assert_eq!(conn.buffered_notifications(), 1, "a prior user's NOTIFY is buffered");
 
     // A pooled connection is reset before the next user gets it. The ledger being
@@ -141,7 +141,7 @@ fn reset_session_clears_pending_notifications_sync() -> Result<(), Box<dyn std::
     fake.on(RESET_SQL).returns(rows![[1_i64]]);
 
     let mut conn = fake.connect_sync()?;
-    let _ = conn.query_sql("SELECT 1")?;
+    let _ = conn.query_raw("SELECT 1")?;
     assert_eq!(conn.buffered_notifications(), 1, "a prior user's NOTIFY is buffered");
 
     conn.reset_session()?;
@@ -179,7 +179,7 @@ async fn recv_notification_as_parses_a_typed_payload() -> Result<(), Box<dyn std
         .returns(rows![[1_i64]]);
 
     let mut conn = fake.connect().await?;
-    let _ = conn.query_sql("SELECT 1").await?;
+    let _ = conn.query_raw("SELECT 1").await?;
 
     let n = conn
         .recv_notification_as::<Job>(Duration::ZERO)
@@ -200,7 +200,7 @@ async fn recv_notification_as_classifies_a_parse_failure_not_a_silent_drop(
         .returns(rows![[1_i64]]);
 
     let mut conn = fake.connect().await?;
-    let _ = conn.query_sql("SELECT 1").await?;
+    let _ = conn.query_raw("SELECT 1").await?;
 
     // A payload that does not parse into the requested type is a LOUD classified
     // error carrying the raw payload — never a silent drop or a defaulted value.
@@ -225,7 +225,7 @@ fn recv_notification_as_parses_a_typed_payload_sync() -> Result<(), Box<dyn std:
         .returns(rows![[1_i64]]);
 
     let mut conn = fake.connect_sync()?;
-    let _ = conn.query_sql("SELECT 1")?;
+    let _ = conn.query_raw("SELECT 1")?;
 
     let n = conn
         .recv_notification_as::<i64>(Duration::ZERO)?

@@ -76,7 +76,7 @@ async fn wide_overcap_drains_and_recovers_under_load_async() {
 
     for i in 0..ITERS {
         let err = conn
-            .query_sql("SELECT wide")
+            .query_raw("SELECT wide")
             .await
             .expect_err("a too-wide result must be a classified error");
         match err {
@@ -88,7 +88,7 @@ async fn wide_overcap_drains_and_recovers_under_load_async() {
 
         // RECOVERED: a follow-up query on the SAME connection succeeds every
         // iteration — the connection drained to a clean idle, not torn down.
-        let ok = match conn.query_sql("SELECT 1").await {
+        let ok = match conn.query_raw("SELECT 1").await {
             Ok(r) => r,
             Err(e) => panic!("iter {i}: connection must recover after over-cap: {e:?}"),
         };
@@ -107,7 +107,7 @@ fn wide_overcap_drains_and_recovers_under_load_sync() {
 
     for i in 0..ITERS {
         let err = conn
-            .query_sql("SELECT wide")
+            .query_raw("SELECT wide")
             .expect_err("a too-wide result must be a classified error");
         match err {
             bsql_postgres_sync::DriverError::TooManyColumns { count, max } => {
@@ -116,7 +116,7 @@ fn wide_overcap_drains_and_recovers_under_load_sync() {
             other => panic!("iter {i}: expected TooManyColumns, got {other:?}"),
         }
 
-        let ok = match conn.query_sql("SELECT 1") {
+        let ok = match conn.query_raw("SELECT 1") {
             Ok(r) => r,
             Err(e) => panic!("iter {i}: connection must recover after over-cap: {e:?}"),
         };
@@ -135,7 +135,7 @@ async fn wide_overcap_at_i16_max_columns_recovers_async() {
     let mut conn = fake.connect().await.expect("connect");
 
     let err = conn
-        .query_sql("SELECT widest")
+        .query_raw("SELECT widest")
         .await
         .expect_err("an i16::MAX-column result must be a classified error");
     match err {
@@ -146,7 +146,7 @@ async fn wide_overcap_at_i16_max_columns_recovers_async() {
     }
 
     let ok = conn
-        .query_sql("SELECT 1")
+        .query_raw("SELECT 1")
         .await
         .expect("connection recovered after the widest-possible over-cap");
     assert_eq!(ok.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
@@ -163,7 +163,7 @@ fn wide_overcap_at_i16_max_columns_recovers_sync() {
     let mut conn = fake.connect_sync().expect("connect");
 
     let err = conn
-        .query_sql("SELECT widest")
+        .query_raw("SELECT widest")
         .expect_err("an i16::MAX-column result must be a classified error");
     match err {
         bsql_postgres_sync::DriverError::TooManyColumns { count, max } => {
@@ -173,7 +173,7 @@ fn wide_overcap_at_i16_max_columns_recovers_sync() {
     }
 
     let ok = conn
-        .query_sql("SELECT 1")
+        .query_raw("SELECT 1")
         .expect("connection recovered after the widest-possible over-cap");
     assert_eq!(ok.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
 }
@@ -195,7 +195,7 @@ async fn minimal_overcap_at_cap_plus_one_recovers_async() {
     let mut conn = fake.connect().await.expect("connect");
 
     let err = conn
-        .query_sql("SELECT wide")
+        .query_raw("SELECT wide")
         .await
         .expect_err("a cap+1-column result must be a classified error");
     match err {
@@ -206,7 +206,7 @@ async fn minimal_overcap_at_cap_plus_one_recovers_async() {
     }
 
     let ok = conn
-        .query_sql("SELECT 1")
+        .query_raw("SELECT 1")
         .await
         .expect("connection recovered after the minimal over-cap");
     assert_eq!(ok.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
@@ -224,7 +224,7 @@ fn minimal_overcap_at_cap_plus_one_recovers_sync() {
     let mut conn = fake.connect_sync().expect("connect");
 
     let err = conn
-        .query_sql("SELECT wide")
+        .query_raw("SELECT wide")
         .expect_err("a cap+1-column result must be a classified error");
     match err {
         bsql_postgres_sync::DriverError::TooManyColumns { count, max } => {
@@ -234,7 +234,7 @@ fn minimal_overcap_at_cap_plus_one_recovers_sync() {
     }
 
     let ok = conn
-        .query_sql("SELECT 1")
+        .query_raw("SELECT 1")
         .expect("connection recovered after the minimal over-cap");
     assert_eq!(ok.get(0).expect("row 0").get_i64(0), Ok(Some(1)));
 }

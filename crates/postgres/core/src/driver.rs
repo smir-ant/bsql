@@ -128,7 +128,7 @@ where
 }
 
 /// The shared per-surface sink body for BOTH dynamic streaming verbs
-/// ([`Core::query_each_sql`] / [`Core::query_each_params`]): lend each
+/// ([`Core::query_each_raw`] / [`Core::query_each_params`]): lend each
 /// `Surface::Row` (or a reassembled oversize row) to `on_row` as a zero-copy
 /// [`BorrowedRow`], capturing a mid-stream server error and swallowing async /
 /// COPY frames.
@@ -959,7 +959,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     }
 
     /// Execute a non-row runtime-SQL command, returning the affected-row count.
-    pub async fn execute_sql(&mut self, sql: &str) -> Result<u64, DriverError> {
+    pub async fn execute_raw(&mut self, sql: &str) -> Result<u64, DriverError> {
         let mut slow = self.armed_slow_guard(sql);
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
@@ -981,7 +981,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     }
 
     /// Run a row-returning runtime-SQL query (text result columns).
-    pub async fn query_sql(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
+    pub async fn query_raw(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
         let mut slow = self.armed_slow_guard(sql);
         let live = self.take_live()?;
         let mut collector = ResultCollector::new();
@@ -1006,18 +1006,18 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ///
     /// Mints EXACTLY one [`Row`](crate::Row) handle ([`QueryResult::get`]) — a
     /// single `Arc` refcount bump — never the whole result's worth of handles.
-    pub async fn query_one_sql(&mut self, sql: &str) -> Result<crate::Row, DriverError> {
-        self.query_sql(sql).await?.get(0).ok_or(DriverError::NoRows)
+    pub async fn query_one_raw(&mut self, sql: &str) -> Result<crate::Row, DriverError> {
+        self.query_raw(sql).await?.get(0).ok_or(DriverError::NoRows)
     }
 
     /// Run a runtime-SQL query returning the first row if any.
     ///
-    /// The `_sql` suffix marks the runtime (unchecked-string) source, matching its
-    /// [`query_sql`](Self::query_sql) / [`query_one_sql`](Self::query_one_sql)
+    /// The `_raw` suffix marks the runtime (unchecked-string) source, matching its
+    /// [`query_raw`](Self::query_raw) / [`query_one_raw`](Self::query_one_raw)
     /// siblings; the bare [`query_opt`](Self::query_opt) is the compile-checked
     /// typed peer.
-    pub async fn query_opt_sql(&mut self, sql: &str) -> Result<Option<crate::Row>, DriverError> {
-        Ok(self.query_sql(sql).await?.get(0))
+    pub async fn query_opt_raw(&mut self, sql: &str) -> Result<Option<crate::Row>, DriverError> {
+        Ok(self.query_raw(sql).await?.get(0))
     }
 
     /// Prepare a statement: `Parse` + `Describe` + `Sync`, recovering the result
@@ -1910,7 +1910,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
 
     /// The shared post-pump settle for EVERY streaming verb (typed
     /// [`query_each`](Self::query_each) and the dynamic
-    /// [`query_each_sql`](Self::query_each_sql) / [`query_each_params`](Self::query_each_params)):
+    /// [`query_each_raw`](Self::query_each_raw) / [`query_each_params`](Self::query_each_params)):
     /// classify the RAW [`Boundary`] the pump reached, draining a dirty
     /// connection back to a clean idle so it stays pooled, and map the outcome.
     ///
@@ -1978,14 +1978,14 @@ impl<S: Transport<Error = io::Error>> Core<S> {
 
     /// Stream a runtime raw-SQL query's rows one at a time to `on_row` in CONSTANT
     /// memory — the dynamic (untyped) streaming peer of
-    /// [`query_sql`](Self::query_sql), and the PostgreSQL peer of the SQLite
-    /// driver's `query_each_sql`.
+    /// [`query_raw`](Self::query_raw), and the PostgreSQL peer of the SQLite
+    /// driver's `query_each_raw`.
     ///
-    /// See each driver's `query_each_sql` for the full contract; the mechanism is
+    /// See each driver's `query_each_raw` for the full contract; the mechanism is
     /// the typed [`query_each`](Self::query_each)'s breakable cursor over the
     /// dynamic simple-query engine verb, lending a zero-copy [`BorrowedRow`] per
     /// row (nothing accumulated).
-    pub async fn query_each_sql<F, E>(
+    pub async fn query_each_raw<F, E>(
         &mut self,
         sql: &str,
         mut on_row: F,

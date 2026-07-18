@@ -16,7 +16,7 @@
 //! # The shape
 //!
 //! - [`SyncQueries`] is the data-verb surface shared by a connection AND a
-//!   transaction guard: `execute_sql` plus the compile-checked typed
+//!   transaction guard: `execute_raw` plus the compile-checked typed
 //!   `fetch_all` / `fetch_one` / `fetch_opt` (each taking the query's typed
 //!   `Q::Params` — the SAME tuple on both backends).
 //! - [`SyncBackend`] adds the transaction combinator over a `type Tx<'t>` guard
@@ -77,7 +77,7 @@ pub trait SyncQueries {
     /// # Errors
     ///
     /// The backend's classified [`Error`](Self::Error) on a SQL / server failure.
-    fn execute_sql(&mut self, sql: &str) -> Result<u64, Self::Error>;
+    fn execute_raw(&mut self, sql: &str) -> Result<u64, Self::Error>;
 
     /// Run a compile-checked `query!` and collect its rows as owned records.
     ///
@@ -150,7 +150,7 @@ pub trait SyncBackend: SyncQueries + Sized {
     ///
     /// # Ergonomics of a GENERIC transaction body
     ///
-    /// A generic body running the RAW-SQL verb ([`execute_sql`](SyncQueries::execute_sql))
+    /// A generic body running the RAW-SQL verb ([`execute_raw`](SyncQueries::execute_raw))
     /// is CLEAN — no extra bound. A generic body running a TYPED
     /// [`fetch_all`](SyncQueries::fetch_all) / `fetch_one` / `fetch_opt` on the
     /// guard is the SCOPE LIMIT: it needs a higher-ranked bound over the guard's
@@ -227,8 +227,8 @@ mod pg_impls {
 
     impl SyncQueries for Connection {
         type Error = DriverError;
-        fn execute_sql(&mut self, sql: &str) -> Result<u64, Self::Error> {
-            Connection::execute_sql(self, sql)
+        fn execute_raw(&mut self, sql: &str) -> Result<u64, Self::Error> {
+            Connection::execute_raw(self, sql)
         }
     }
 
@@ -244,8 +244,8 @@ mod pg_impls {
 
     impl SyncQueries for Transaction<'_> {
         type Error = DriverError;
-        fn execute_sql(&mut self, sql: &str) -> Result<u64, Self::Error> {
-            Transaction::execute_sql(self, sql)
+        fn execute_raw(&mut self, sql: &str) -> Result<u64, Self::Error> {
+            Transaction::execute_raw(self, sql)
         }
     }
 
@@ -303,10 +303,10 @@ mod sqlite_impls {
 
     impl SyncQueries for Connection {
         type Error = SqliteError;
-        fn execute_sql(&mut self, sql: &str) -> Result<u64, Self::Error> {
+        fn execute_raw(&mut self, sql: &str) -> Result<u64, Self::Error> {
             // SQLite's raw-SQL affected-count verb is `execute`; it takes `&self`,
             // satisfied by the `&mut self` reborrow.
-            Connection::execute_sql(self, sql)
+            Connection::execute_raw(self, sql)
         }
     }
 
@@ -325,8 +325,8 @@ mod sqlite_impls {
 
     impl SyncQueries for SqliteTx<'_> {
         type Error = SqliteError;
-        fn execute_sql(&mut self, sql: &str) -> Result<u64, Self::Error> {
-            self.0.execute_sql(sql)
+        fn execute_raw(&mut self, sql: &str) -> Result<u64, Self::Error> {
+            self.0.execute_raw(sql)
         }
     }
 

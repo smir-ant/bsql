@@ -231,15 +231,15 @@ pub fn resolve_base_config(var: Result<String, VarError>) -> Result<ConnectConfi
 /// after the old process died) is dropped first, so `CREATE` is idempotent.
 async fn create_isolated_schema(admin: &mut AsyncConnection, schema: &str) -> Result<(), HarnessError> {
     let schema = validate_schema_name(schema)?;
-    admin.execute_sql(&drop_schema_ddl(schema)).await?;
-    admin.execute_sql(&create_schema_ddl(schema)).await?;
+    admin.execute_raw(&drop_schema_ddl(schema)).await?;
+    admin.execute_raw(&create_schema_ddl(schema)).await?;
     Ok(())
 }
 
 /// Drop the isolated schema (and everything in it) on the admin connection.
 async fn drop_isolated_schema(admin: &mut AsyncConnection, schema: &str) -> Result<(), HarnessError> {
     let schema = validate_schema_name(schema)?;
-    admin.execute_sql(&drop_schema_ddl(schema)).await?;
+    admin.execute_raw(&drop_schema_ddl(schema)).await?;
     Ok(())
 }
 
@@ -390,8 +390,8 @@ pub fn schema_exists(schema: &str) -> bool {
 /// DDL; blocking calls instead of `.await`.
 fn create_isolated_schema_sync(admin: &mut SyncConnection, schema: &str) -> Result<(), HarnessError> {
     let schema = validate_schema_name(schema)?;
-    admin.execute_sql(&drop_schema_ddl(schema))?;
-    admin.execute_sql(&create_schema_ddl(schema))?;
+    admin.execute_raw(&drop_schema_ddl(schema))?;
+    admin.execute_raw(&create_schema_ddl(schema))?;
     Ok(())
 }
 
@@ -399,7 +399,7 @@ fn create_isolated_schema_sync(admin: &mut SyncConnection, schema: &str) -> Resu
 /// [`drop_isolated_schema`].
 fn drop_isolated_schema_sync(admin: &mut SyncConnection, schema: &str) -> Result<(), HarnessError> {
     let schema = validate_schema_name(schema)?;
-    admin.execute_sql(&drop_schema_ddl(schema))?;
+    admin.execute_raw(&drop_schema_ddl(schema))?;
     Ok(())
 }
 

@@ -347,7 +347,7 @@ async fn plan_is_parsed_once_and_persists() {
         assert_eq!(c.query::<RepeatLit>(()).await.expect("run").len(), 1);
     }
     let result = c
-        .query_sql("SELECT count(*)::int4 FROM pg_prepared_statements")
+        .query_raw("SELECT count(*)::int4 FROM pg_prepared_statements")
         .await
         .expect("count prepared statements");
     let count = result
@@ -394,7 +394,7 @@ async fn pooled_connection_reset_keeps_parsed_plan() {
         let count = c
             .conn_mut()
             .expect("live")
-            .query_sql("SELECT count(*)::int4 FROM pg_prepared_statements")
+            .query_raw("SELECT count(*)::int4 FROM pg_prepared_statements")
             .await
             .unwrap_or_else(|e| panic!("checkout {i} count: {e:?}"))
             .get(0)
@@ -438,7 +438,7 @@ async fn pooled_reset_rolls_back_open_tx_and_keeps_plan() {
     );
     // The server still holds it exactly once (kept across the ROLLBACK-prefixed reset).
     let count = conn
-        .query_sql("SELECT count(*)::int4 FROM pg_prepared_statements")
+        .query_raw("SELECT count(*)::int4 FROM pg_prepared_statements")
         .await
         .expect("count")
         .get(0)
@@ -489,7 +489,7 @@ async fn same_carrier_across_many_transactions_succeeds() {
 async fn discard_all_then_reuse_errors_once_then_self_heals() {
     let mut c = Connection::connect(&async_config()).await.expect("connect");
     assert_eq!(c.query::<HealLit>(()).await.expect("first use records").len(), 1);
-    c.execute_sql("DISCARD ALL").await.expect("discard all");
+    c.execute_raw("DISCARD ALL").await.expect("discard all");
     let poisoned = c.query::<HealLit>(()).await;
     assert!(
         matches!(poisoned, Err(DriverError::Db(_))),
@@ -1120,17 +1120,17 @@ async fn merged_outer_join_null_round_trips_as_none() {
     let mut c = Connection::connect(&async_config()).await.expect("connect");
 
     // Fresh tables (drop any residue from an aborted prior run, dependents last).
-    // `execute_sql` returns an affected-row count (no `#[must_use]` row handle).
-    c.execute_sql("DROP TABLE IF EXISTS oj_c, oj_b, oj_a").await.expect("drop");
-    c.execute_sql("CREATE TABLE oj_a (j INTEGER NOT NULL, x INTEGER)").await.expect("a");
-    c.execute_sql("CREATE TABLE oj_b (j INTEGER NOT NULL, bk INTEGER NOT NULL, y INTEGER)")
+    // `execute_raw` returns an affected-row count (no `#[must_use]` row handle).
+    c.execute_raw("DROP TABLE IF EXISTS oj_c, oj_b, oj_a").await.expect("drop");
+    c.execute_raw("CREATE TABLE oj_a (j INTEGER NOT NULL, x INTEGER)").await.expect("a");
+    c.execute_raw("CREATE TABLE oj_b (j INTEGER NOT NULL, bk INTEGER NOT NULL, y INTEGER)")
         .await
         .expect("b");
-    c.execute_sql("CREATE TABLE oj_c (bk INTEGER NOT NULL, z INTEGER)").await.expect("c");
+    c.execute_raw("CREATE TABLE oj_c (bk INTEGER NOT NULL, z INTEGER)").await.expect("c");
     // j=1: no matching oj_b -> merged bk is NULL. j=2: fully matched -> bk = 42.
-    c.execute_sql("INSERT INTO oj_a (j, x) VALUES (1, 100), (2, 200)").await.expect("ins a");
-    c.execute_sql("INSERT INTO oj_b (j, bk, y) VALUES (2, 42, 7)").await.expect("ins b");
-    c.execute_sql("INSERT INTO oj_c (bk, z) VALUES (42, 9)").await.expect("ins c");
+    c.execute_raw("INSERT INTO oj_a (j, x) VALUES (1, 100), (2, 200)").await.expect("ins a");
+    c.execute_raw("INSERT INTO oj_b (j, bk, y) VALUES (2, 42, 7)").await.expect("ins b");
+    c.execute_raw("INSERT INTO oj_c (bk, z) VALUES (42, 9)").await.expect("ins c");
 
     let rows = c.query::<OuterUsingNull>(()).await.expect("query OuterUsingNull");
     let got: Vec<Option<i32>> = rows.iter().map(|r| r.expect("row decodes").bk).collect();
@@ -1140,7 +1140,7 @@ async fn merged_outer_join_null_round_trips_as_none() {
         "the outer-join×USING merged key round-trips its real NULL as None",
     );
 
-    c.execute_sql("DROP TABLE oj_c, oj_b, oj_a").await.expect("cleanup");
+    c.execute_raw("DROP TABLE oj_c, oj_b, oj_a").await.expect("cleanup");
     c.close().await.expect("close");
 }
 
@@ -1233,14 +1233,14 @@ async fn oversize_typed_wide_many_columns_reassembles() {
 #[ignore = "requires local PG"]
 async fn oversize_typed_multirow_reassembly_over_table() {
     let mut c = Connection::connect(&async_config()).await.expect("connect");
-    c.execute_sql("DROP TABLE IF EXISTS ov_rows").await.expect("drop residue");
-    c.execute_sql("CREATE TABLE ov_rows (k INTEGER NOT NULL, body TEXT NOT NULL)")
+    c.execute_raw("DROP TABLE IF EXISTS ov_rows").await.expect("drop residue");
+    c.execute_raw("CREATE TABLE ov_rows (k INTEGER NOT NULL, body TEXT NOT NULL)")
         .await
         .expect("create ov_rows");
 
     // Scenario A — oversize (k=1) THEN small (k=2): the reassembly accumulator
     // must reset so the small row is not corrupted by the prior oversize row.
-    c.execute_sql("INSERT INTO ov_rows (k, body) VALUES (1, repeat('x', 5000)), (2, 'small')")
+    c.execute_raw("INSERT INTO ov_rows (k, body) VALUES (1, repeat('x', 5000)), (2, 'small')")
         .await
         .expect("insert oversize-then-small");
     let rows = c.query::<OvRows>(()).await.expect("query OvRows (A)");
@@ -1263,8 +1263,8 @@ async fn oversize_typed_multirow_reassembly_over_table() {
 
     // Scenario B — MULTIPLE oversize rows in one result; the accumulator resets
     // between them and each decodes to its own exact width.
-    c.execute_sql("TRUNCATE ov_rows").await.expect("truncate");
-    c.execute_sql("INSERT INTO ov_rows (k, body) VALUES (1, repeat('x', 5000)), (2, repeat('y', 6000))")
+    c.execute_raw("TRUNCATE ov_rows").await.expect("truncate");
+    c.execute_raw("INSERT INTO ov_rows (k, body) VALUES (1, repeat('x', 5000)), (2, repeat('y', 6000))")
         .await
         .expect("insert two oversize");
     let owned = c
@@ -1283,8 +1283,8 @@ async fn oversize_typed_multirow_reassembly_over_table() {
     // row reassembles + counts (seen_first set at RowChunkEnd), then the small
     // second row trips the Row-arm break. TooManyRows must dominate, and the
     // connection must drain from that whole-row boundary to a clean idle.
-    c.execute_sql("TRUNCATE ov_rows").await.expect("truncate C");
-    c.execute_sql("INSERT INTO ov_rows (k, body) VALUES (1, repeat('x', 5000)), (2, 'small')")
+    c.execute_raw("TRUNCATE ov_rows").await.expect("truncate C");
+    c.execute_raw("INSERT INTO ov_rows (k, body) VALUES (1, repeat('x', 5000)), (2, 'small')")
         .await
         .expect("insert oversize-then-small (C)");
     let too_many = c.query_one::<OvRows>(()).await;
@@ -1302,8 +1302,8 @@ async fn oversize_typed_multirow_reassembly_over_table() {
     // sets seen_first (Row arm), then the second row's FIRST RowChunk trips the
     // RowChunk-arm break MID-oversize-frame (the otherwise-unwitnessed branch).
     // The mid-frame drain must still reach a clean idle.
-    c.execute_sql("TRUNCATE ov_rows").await.expect("truncate D");
-    c.execute_sql("INSERT INTO ov_rows (k, body) VALUES (1, 'small'), (2, repeat('x', 5000))")
+    c.execute_raw("TRUNCATE ov_rows").await.expect("truncate D");
+    c.execute_raw("INSERT INTO ov_rows (k, body) VALUES (1, 'small'), (2, repeat('x', 5000))")
         .await
         .expect("insert small-then-oversize (D)");
     let too_many = c.query_one::<OvRows>(()).await;
@@ -1317,7 +1317,7 @@ async fn oversize_typed_multirow_reassembly_over_table() {
         "connection drained healthy after the mid-oversize-frame too-many break",
     );
 
-    c.execute_sql("DROP TABLE ov_rows").await.expect("cleanup");
+    c.execute_raw("DROP TABLE ov_rows").await.expect("cleanup");
     c.close().await.expect("close");
 }
 

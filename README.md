@@ -32,7 +32,7 @@ let user = conn.query_one::<UserById>((42_i32,)).await?;
 - **One query function, and it always checks — no *accidental* unchecked path.**
   In sqlx a missing `!` (`query()` vs `query!()`) silently skips validation. bsql
   has a raw-SQL escape hatch too, but it is deliberate and named apart: the
-  unchecked verbs carry a distinct suffix (`query_sql` for raw text, `query_params`
+  unchecked verbs carry a distinct suffix (`query_raw` for raw text, `query_params`
   for raw text plus runtime parameters), so you opt into unchecked SQL on purpose —
   never by forgetting a `!`.
 - **Pure SQL text — no builder.** CTEs, JOINs, window functions, subqueries — no
@@ -237,7 +237,7 @@ as the escape hatch for pre-formatted data.
 ```rust
 #[bsql::test]
 async fn creates_a_user(conn: &mut bsql::pg::Connection) {
-    conn.query_sql("CREATE TABLE users (id int)").await.unwrap();  // in an ISOLATED schema
+    conn.query_raw("CREATE TABLE users (id int)").await.unwrap();  // in an ISOLATED schema
 }   // schema auto-dropped, even if the test panics
 ```
 

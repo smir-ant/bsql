@@ -48,15 +48,15 @@ fn sync_config() -> ConnectConfig {
 /// Create the session-temporary schema (matching the migration catalog's column
 /// types) and seed it, driving the SAME generic raw-SQL verb the library uses.
 fn seed(conn: &mut Connection) {
-    conn.execute_sql(
+    conn.execute_raw(
         "CREATE TEMP TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL, name TEXT)",
     )
     .expect("create temp users");
-    conn.execute_sql("CREATE TEMP TABLE orders (id BIGINT PRIMARY KEY, ref_no TEXT NOT NULL)")
+    conn.execute_raw("CREATE TEMP TABLE orders (id BIGINT PRIMARY KEY, ref_no TEXT NOT NULL)")
         .expect("create temp orders");
-    conn.execute_sql("INSERT INTO users VALUES (1, 'a@b', 'Alice'), (2, 'c@d', NULL)")
+    conn.execute_raw("INSERT INTO users VALUES (1, 'a@b', 'Alice'), (2, 'c@d', NULL)")
         .expect("insert users");
-    conn.execute_sql("INSERT INTO orders VALUES (10, 'R-1'), (20, 'R-2')")
+    conn.execute_raw("INSERT INTO orders VALUES (10, 'R-1'), (20, 'R-2')")
         .expect("insert orders");
 }
 
@@ -148,7 +148,7 @@ fn parameterized_flagship_executes_on_live_pg() {
 fn transaction_combinator_executes_on_live_pg() {
     let mut conn = Connection::connect(&sync_config()).expect("connect");
     seed(&mut conn);
-    conn.execute_sql("INSERT INTO users VALUES (3, '', 'ghost')")
+    conn.execute_raw("INSERT INTO users VALUES (3, '', 'ghost')")
         .expect("insert ghost");
 
     // Atomic raw-SQL group: deletes both orders and the one empty-email user.

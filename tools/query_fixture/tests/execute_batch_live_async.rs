@@ -59,13 +59,13 @@ fn cfg() -> ConnectConfig {
 /// tests, EACH on its OWN connection, never interfere under cargo's default
 /// parallelism (no shared permanent table is dropped or truncated).
 async fn fresh(c: &mut Connection) {
-    c.execute_sql("CREATE TEMP TABLE eb_rows (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
+    c.execute_raw("CREATE TEMP TABLE eb_rows (id BIGINT PRIMARY KEY, balance BIGINT NOT NULL)")
         .await
         .expect("create temp");
 }
 
 async fn row_count(c: &mut Connection) -> i64 {
-    c.query_one_sql("SELECT count(*)::int8 AS n FROM eb_rows")
+    c.query_one_raw("SELECT count(*)::int8 AS n FROM eb_rows")
         .await
         .expect("count")
         .get_i64(0)
@@ -74,7 +74,7 @@ async fn row_count(c: &mut Connection) -> i64 {
 }
 
 async fn balance_sum(c: &mut Connection) -> i64 {
-    c.query_one_sql("SELECT coalesce(sum(balance),0)::int8 AS s FROM eb_rows")
+    c.query_one_raw("SELECT coalesce(sum(balance),0)::int8 AS s FROM eb_rows")
         .await
         .expect("sum")
         .get_i64(0)
@@ -145,7 +145,7 @@ async fn commit_time_deferred_failure_is_db_none_index() {
     let mut c = Connection::connect(&cfg()).await.expect("connect");
     // Session-private TEMP TABLE (shadows the migration's permanent `eb_uniq`) so
     // parallel tests never interfere.
-    c.execute_sql(
+    c.execute_raw(
         "CREATE TEMP TABLE eb_uniq (id INTEGER PRIMARY KEY, tag INTEGER NOT NULL, \
          CONSTRAINT eb_uniq_tag_uniq UNIQUE (tag) DEFERRABLE INITIALLY DEFERRED)",
     )
@@ -169,7 +169,7 @@ async fn commit_time_deferred_failure_is_db_none_index() {
         "commit-time → batch_failed_index None",
     );
     let n = c
-        .query_one_sql("SELECT count(*)::int8 AS n FROM eb_uniq")
+        .query_one_raw("SELECT count(*)::int8 AS n FROM eb_uniq")
         .await
         .expect("count")
         .get_i64(0)
@@ -257,7 +257,7 @@ async fn large_n_windowed_is_correct_and_deadlock_free() {
     assert_eq!(sum, expected, "sum of the balances");
     // A mid-batch failure at large N still rolls the WHOLE thing back. The TEMP
     // `eb_rows` already exists on this connection, so CLEAR it (not re-create).
-    c.execute_sql("TRUNCATE eb_rows").await.expect("truncate");
+    c.execute_raw("TRUNCATE eb_rows").await.expect("truncate");
     let mut sets: Vec<(i64, i64)> = (0..N).map(|i| (i, 1)).collect();
     sets.push((5_000, 1)); // duplicate PK late in the run
     let result = c.execute_batch::<EbIns, _>(sets).await;

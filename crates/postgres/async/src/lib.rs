@@ -272,10 +272,10 @@ const _: () = {
     fn _conn_dyn(conn: &mut Connection, sql: &str) {
         _is_send(&conn.ping());
         _is_send(&conn.simple_query(sql));
-        _is_send(&conn.execute_sql(sql));
-        _is_send(&conn.query_sql(sql));
-        _is_send(&conn.query_one_sql(sql));
-        _is_send(&conn.query_opt_sql(sql));
+        _is_send(&conn.execute_raw(sql));
+        _is_send(&conn.query_raw(sql));
+        _is_send(&conn.query_one_raw(sql));
+        _is_send(&conn.query_opt_raw(sql));
         _is_send(&conn.prepare(sql));
         _is_send(&conn.begin());
         _is_send(&conn.commit());
@@ -354,10 +354,10 @@ const _: () = {
     fn _tx_dyn(tx: &mut Transaction<'_>, sql: &str) {
         _is_send(&tx.ping());
         _is_send(&tx.simple_query(sql));
-        _is_send(&tx.execute_sql(sql));
-        _is_send(&tx.query_sql(sql));
-        _is_send(&tx.query_one_sql(sql));
-        _is_send(&tx.query_opt_sql(sql));
+        _is_send(&tx.execute_raw(sql));
+        _is_send(&tx.query_raw(sql));
+        _is_send(&tx.query_one_raw(sql));
+        _is_send(&tx.query_opt_raw(sql));
         _is_send(&tx.prepare(sql));
         _is_send(&tx.listen(sql));
         _is_send(&tx.unlisten(sql));

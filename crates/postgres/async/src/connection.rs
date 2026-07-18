@@ -657,11 +657,11 @@ impl Connection {
     ///
     /// A successful top-level `SET`/`RESET`/`set_config` of `statement_timeout` here
     /// RE-DERIVES the client-liveness window (see [`observed`](Self::observed)).
-    pub fn execute_sql<'a>(
+    pub fn execute_raw<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
-        self.observed(sql, move |c| c.execute_sql(sql))
+        self.observed(sql, move |c| c.execute_raw(sql))
     }
 
     /// Run a row-returning runtime-SQL query (text result columns). The
@@ -669,43 +669,43 @@ impl Connection {
     ///
     /// A successful top-level `SET`/`RESET`/`set_config` of `statement_timeout` here
     /// RE-DERIVES the client-liveness window (see [`observed`](Self::observed)).
-    pub fn query_sql<'a>(
+    pub fn query_raw<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
-        self.observed(sql, move |c| c.query_sql(sql))
+        self.observed(sql, move |c| c.query_raw(sql))
     }
 
     /// Run a runtime-SQL query returning the first row, or [`DriverError::NoRows`].
     /// The compile-checked counterpart is [`query_one`](Self::query_one). A
     /// `set_config('statement_timeout', …)` here RE-DERIVES the client-liveness
     /// window (see [`observed`](Self::observed)).
-    pub fn query_one_sql<'a>(
+    pub fn query_one_raw<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<Row, DriverError>> + 'a {
-        self.observed(sql, move |c| c.query_one_sql(sql))
+        self.observed(sql, move |c| c.query_one_raw(sql))
     }
 
     /// Run a runtime-SQL query returning the first row if any. The compile-checked
     /// typed counterpart is [`query_opt`](Self::query_opt). A
     /// `set_config('statement_timeout', …)` here RE-DERIVES the client-liveness
     /// window (see [`observed`](Self::observed)).
-    pub fn query_opt_sql<'a>(
+    pub fn query_opt_raw<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
-        self.observed(sql, move |c| c.query_opt_sql(sql))
+        self.observed(sql, move |c| c.query_opt_raw(sql))
     }
 
     /// Stream a runtime raw-SQL query's rows one at a time to `on_row` in CONSTANT
-    /// memory — the dynamic (untyped) streaming peer of [`query_sql`](Self::query_sql),
-    /// and the PostgreSQL peer of the SQLite driver's `query_each_sql` (so a
+    /// memory — the dynamic (untyped) streaming peer of [`query_raw`](Self::query_raw),
+    /// and the PostgreSQL peer of the SQLite driver's `query_each_raw` (so a
     /// dynamic stream reads the SAME on both backends).
     ///
     /// Each row is handed to `on_row` as a zero-copy [`BorrowedRow`] as it arrives,
     /// accumulating NOTHING — a colossal runtime SELECT streams without growing
-    /// memory (the escape from eager `query_sql`, which materialises the whole
+    /// memory (the escape from eager `query_raw`, which materialises the whole
     /// result). `on_row` returns [`ControlFlow`]: [`Continue`](ControlFlow::Continue)
     /// to keep streaming, or [`Break(e)`](ControlFlow::Break) to stop early. The
     /// borrowed row CANNOT escape the closure (the `for<'r>` bound is the escape
@@ -734,7 +734,7 @@ impl Connection {
     /// A [`Break`](ControlFlow::Break) of a colossal result still READS (and
     /// discards) the remaining rows to reach the clean idle boundary that makes the
     /// connection reusable — O(remaining rows).
-    pub fn query_each_sql<'a, F, E>(
+    pub fn query_each_raw<'a, F, E>(
         &'a mut self,
         sql: &'a str,
         on_row: F,
@@ -743,13 +743,13 @@ impl Connection {
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E> + 'a,
         E: 'a,
     {
-        self.observed(sql, move |c| c.query_each_sql(sql, on_row))
+        self.observed(sql, move |c| c.query_each_raw(sql, on_row))
     }
 
     /// Stream a runtime parameterised query's rows one at a time to `on_row` in
     /// CONSTANT memory — the dynamic streaming peer of
     /// [`query_params`](Self::query_params), and the PostgreSQL peer of the SQLite
-    /// driver's `query_each_params`. See [`query_each_sql`](Self::query_each_sql)
+    /// driver's `query_each_params`. See [`query_each_raw`](Self::query_each_raw)
     /// for the full contract; the params are borrowed all the way to the engine.
     pub fn query_each_params<'a, P: ParamsWriter, F, E>(
         &'a mut self,
@@ -774,7 +774,7 @@ impl Connection {
     /// prepared plan and run via [`query_prepared`](Self::query_prepared) is the
     /// documented theoretical floor; the SQL-level `PREPARE … AS … set_config` +
     /// `EXECUTE` path stays fail-safe because both ride the observed
-    /// [`execute_sql`](Self::execute_sql).
+    /// [`execute_raw`](Self::execute_raw).
     pub fn prepare<'a>(
         &'a mut self,
         sql: &'a str,
@@ -868,7 +868,7 @@ impl Connection {
     /// (`conn.execute::<Q>(params)`), no hand-passed `&Q::PREPARED`. Parses the
     /// content-addressed statement once per connection, then reuses the
     /// server-side plan. The runtime-SQL escape hatch is
-    /// [`execute_sql`](Self::execute_sql).
+    /// [`execute_raw`](Self::execute_raw).
     #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn execute<'a, Q: TypedQuery + 'a>(
         &'a mut self,
@@ -895,7 +895,7 @@ impl Connection {
     /// prebuffer and decodes identically to an inline one — no size cap. The
     /// statement is Parsed once per connection and the server-side plan reused
     /// thereafter (safe across pool checkouts and transactions). The runtime-SQL
-    /// escape hatch is [`query_sql`](Self::query_sql).
+    /// escape hatch is [`query_raw`](Self::query_raw).
     #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query<'a, Q: TypedQuery + 'a>(
         &'a mut self,
@@ -934,7 +934,7 @@ impl Connection {
     /// Zero rows is `Ok(None)`; more than one is [`DriverError::TooManyRows`]
     /// (loud, never a silently-taken first row). The zero-or-one peer of
     /// [`query_one`](Self::query_one); the runtime-SQL escape hatch is
-    /// [`query_opt_sql`](Self::query_opt_sql).
+    /// [`query_opt_raw`](Self::query_opt_raw).
     #[cfg_attr(feature = "n1-detect", track_caller)]
     pub fn query_opt<'a, Q: TypedQuery + 'a>(
         &'a mut self,
@@ -1719,7 +1719,7 @@ impl Connection {
 /// / `ROLLBACK`.
 ///
 /// EVERY other verb the body legitimately uses remains available: the runtime-SQL
-/// family (`query_sql` / `execute_sql` / `query_params*` / prepared statements),
+/// family (`query_raw` / `execute_raw` / `query_params*` / prepared statements),
 /// the compile-checked typed `query!` family (`query` / `query_one` /
 /// `query_opt` / `query_each` / `execute`), bulk [`COPY`](Self::copy_in_with) in
 /// and out, and `LISTEN` / `UNLISTEN`. COPY in particular is legal (and atomic)
@@ -1847,42 +1847,42 @@ impl Transaction<'_> {
     /// Execute a non-row runtime-SQL command, returning the affected-row count. A
     /// `SET`/`RESET`/`set_config` of `statement_timeout` here re-derives the
     /// client-liveness window.
-    pub fn execute_sql<'a>(
+    pub fn execute_raw<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<u64, DriverError>> + 'a {
-        self.observed(sql, move |c| c.execute_sql(sql))
+        self.observed(sql, move |c| c.execute_raw(sql))
     }
 
     /// Run a row-returning runtime-SQL query (text result columns). A `set_config`
     /// of `statement_timeout` here re-derives the client-liveness window.
-    pub fn query_sql<'a>(
+    pub fn query_raw<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<QueryResult, DriverError>> + 'a {
-        self.observed(sql, move |c| c.query_sql(sql))
+        self.observed(sql, move |c| c.query_raw(sql))
     }
 
     /// Run a runtime-SQL query returning the first row, or [`DriverError::NoRows`].
-    pub fn query_one_sql<'a>(
+    pub fn query_one_raw<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<Row, DriverError>> + 'a {
-        self.observed(sql, move |c| c.query_one_sql(sql))
+        self.observed(sql, move |c| c.query_one_raw(sql))
     }
 
     /// Run a runtime-SQL query returning the first row if any (typed peer:
     /// [`query_opt`](Self::query_opt)).
-    pub fn query_opt_sql<'a>(
+    pub fn query_opt_raw<'a>(
         &'a mut self,
         sql: &'a str,
     ) -> impl Future<Output = Result<Option<Row>, DriverError>> + 'a {
-        self.observed(sql, move |c| c.query_opt_sql(sql))
+        self.observed(sql, move |c| c.query_opt_raw(sql))
     }
 
     /// Stream a runtime raw-SQL query's rows in CONSTANT memory, inside the
-    /// transaction. See [`Connection::query_each_sql`] for the full contract.
-    pub fn query_each_sql<'a, F, E>(
+    /// transaction. See [`Connection::query_each_raw`] for the full contract.
+    pub fn query_each_raw<'a, F, E>(
         &'a mut self,
         sql: &'a str,
         on_row: F,
@@ -1891,7 +1891,7 @@ impl Transaction<'_> {
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E> + 'a,
         E: 'a,
     {
-        self.observed(sql, move |c| c.query_each_sql(sql, on_row))
+        self.observed(sql, move |c| c.query_each_raw(sql, on_row))
     }
 
     /// Stream a runtime parameterised query's rows in CONSTANT memory, inside the

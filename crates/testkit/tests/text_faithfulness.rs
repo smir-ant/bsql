@@ -1,4 +1,4 @@
-//! The moat's TEXT-path contract: the SIMPLE-query (`query_sql`) reply is either
+//! The moat's TEXT-path contract: the SIMPLE-query (`query_raw`) reply is either
 //! byte-faithful to what a real PostgreSQL server sends, or a LOUD classified
 //! error — never plausible-but-wrong text a consumer could bake into a green
 //! `get_str` assertion. The testkit exists to prove genuine end-to-end
@@ -8,7 +8,7 @@
 //! `timestamptz` / `timestamp` (binary-only bsql types, no ISO text form) and
 //! `float4` / `float8` (Rust's `Display` diverges from PostgreSQL's
 //! `float ::text` for large / small magnitudes and `±Infinity`) fail closed on
-//! the `query_sql` path. The `query!` (binary) path over the SAME script stays
+//! the `query_raw` path. The `query!` (binary) path over the SAME script stays
 //! byte-exact — proven in `tools/query_fixture/tests/query_fake.rs`.
 #![allow(
     clippy::expect_used,
@@ -22,10 +22,10 @@ use bsql_testkit::{rows, FakePostgres, ScriptedRows};
 
 /// Script one column, connect (which MUST succeed — the fail-close is scoped to
 /// the simple-query reply, so the extended `query!` reply stays intact), run
-/// `query_sql`, and assert it is a loud classified `DriverError::Db` naming the
+/// `query_raw`, and assert it is a loud classified `DriverError::Db` naming the
 /// faithful route (`query!`) and the offending type. RED before this slice: the
 /// unfaithful cell silently rendered a plausible-but-wrong string and
-/// `query_sql` returned `Ok`, so `expect_err` would panic.
+/// `query_raw` returned `Ok`, so `expect_err` would panic.
 async fn assert_query_sql_fails_closed(sql: &str, script: ScriptedRows, type_name: &str) {
     let mut fake = FakePostgres::new();
     fake.on(sql).returns(script);
@@ -37,9 +37,9 @@ async fn assert_query_sql_fails_closed(sql: &str, script: ScriptedRows, type_nam
         .expect("connect succeeds — the fail-close is scoped to the simple reply");
 
     let err = conn
-        .query_sql(sql)
+        .query_raw(sql)
         .await
-        .expect_err("query_sql over an unfaithful-text type must be loud, not fake text");
+        .expect_err("query_raw over an unfaithful-text type must be loud, not fake text");
     assert!(matches!(err, DriverError::Db(_)), "classified DbError, got: {err:?}");
     let msg = format!("{err}");
     assert!(msg.contains("query!"), "names the faithful route `query!`: {msg}");
@@ -111,8 +111,8 @@ fn query_sql_over_timestamptz_fails_closed_sync() {
         .returns(rows![[Timestamptz::from_micros(1_000_000)]]);
     let mut conn = fake.connect_sync().expect("connect (sync) succeeds");
     let err = conn
-        .query_sql("SELECT occurred_at FROM t")
-        .expect_err("query_sql (sync) over a timestamptz must be loud, not fake text");
+        .query_raw("SELECT occurred_at FROM t")
+        .expect_err("query_raw (sync) over a timestamptz must be loud, not fake text");
     assert!(matches!(err, DriverError::Db(_)), "classified DbError, got: {err:?}");
     let msg = format!("{err}");
     assert!(msg.contains("query!"), "names the faithful route: {msg}");
@@ -120,7 +120,7 @@ fn query_sql_over_timestamptz_fails_closed_sync() {
 }
 
 /// The positive control: a FAITHFUL new type (uuid — its `Display` IS PG's
-/// `uuid ::text`) still flows through `query_sql`, so the fail-close is scoped
+/// `uuid ::text`) still flows through `query_raw`, so the fail-close is scoped
 /// to the unfaithful types, not a blanket break of the new vocabulary.
 #[tokio::test]
 async fn query_sql_over_a_faithful_uuid_still_works() {
@@ -131,7 +131,7 @@ async fn query_sql_over_a_faithful_uuid_still_works() {
     let mut fake = FakePostgres::new();
     fake.on("SELECT id FROM t").returns(rows![[Uuid::from_bytes(raw)]]);
     let mut conn = fake.connect().await.expect("connect");
-    let result = conn.query_sql("SELECT id FROM t").await.expect("query_sql over a uuid works");
+    let result = conn.query_raw("SELECT id FROM t").await.expect("query_raw over a uuid works");
     assert_eq!(result.len(), 1);
     // The dynamic Row's text form is exactly PostgreSQL's `uuid ::text`.
     assert_eq!(
