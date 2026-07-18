@@ -196,7 +196,19 @@ carrier and only the OWNED record is lifetime-free (a borrowed `NameRef<'q>`
 carries a lifetime and cannot be a turbofish marker); making the owned record the
 carrier ELIMINATES the former "record vs `NameQuery` carrier" footgun BY
 CONSTRUCTION — `query::<Name>()` is now correct, and `query_one` / `query_opt`
-return the owned `Name`. An unknown column is a `compile_error!`. The `TypedQuery`
+return the owned `Name`. An unknown column is a `compile_error!`. A `$N`
+PARAMETER's type is inferred from its CONTEXT, and its NULLABILITY with it: a
+value bound as a BARE `$N` INTO a nullable column — an `INSERT ... VALUES ($N)`
+cell, an `UPDATE` / `ON CONFLICT DO UPDATE SET col = $N` value — is `Option<T>`
+(so `None` writes SQL NULL and `Some(x)` writes x, all through the typed path),
+while a NOT NULL target keeps the base `T`, and a `$N` in a COMPARISON / `WHERE`
+position (or an explicit `$N::cast`) always keeps `T` — the change never leaks
+`Option` into a filter param (a param used in ANY non-null context stays `T`,
+even if it also appears in a nullable target). This is the query! peer of the
+`copy!` rule (a `NOT NULL` column is `T`, a nullable column `Option<T>`). The
+wire OID is UNAFFECTED — a NULL is typed by its column, so `Option<T>` and `T`
+bind the SAME param OID — so this is purely the Rust surface type and the
+compile-time param-OID pin is byte-identical. The `TypedQuery`
 `#[diagnostic::on_unimplemented]` now guards only the RESIDUAL misuse: turbofishing
 the borrowed VIEW `NameRef` (not runnable), or a runtime `ORDER BY { ... }` query's
 RECORD — a runtime-ORDER-BY query keeps SEPARATE uninhabited `Name…Query` carriers

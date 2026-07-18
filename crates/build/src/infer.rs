@@ -567,6 +567,19 @@ pub struct QueryShape {
     pub columns: Vec<InferredColumn>,
     /// Parameter Rust types, `params[i]` is the type of `$(i + 1)`.
     pub params: Vec<RustType>,
+    /// Per-parameter nullability, PARALLEL to [`params`](Self::params)
+    /// (`param_nullable.len() == params.len()`, built together by
+    /// `ParamWalker::finish`). `param_nullable[i]` is `true` when `$(i + 1)`
+    /// binds as a BARE value into a NULLABLE assignment target (an
+    /// `INSERT ... VALUES` cell, or an `UPDATE` / `ON CONFLICT DO UPDATE` `SET`
+    /// value) — so the query macro types it `Option<T>` and a `None` bind writes
+    /// SQL NULL. It is `false` for a NOT NULL target and for every
+    /// COMPARISON / `WHERE` / cast / `LIMIT` position (which keep the base type
+    /// `T`): a param used in ANY non-null context is never nullable, even if it
+    /// also appears in a nullable target. The wire OID is UNAFFECTED — a NULL is
+    /// typed by its column, so `Option<T>` and `T` bind the same param OID — so
+    /// this bit changes only the Rust surface type, never the `Parse` template.
+    pub param_nullable: Vec<bool>,
 }
 
 /// A build-time inference failure. Every variant is fatal and descriptive
@@ -12359,8 +12372,8 @@ fn infer_select_query(
     let top = ScopeChain::empty();
     validate_query_refs(catalog, &ctes, query, &top)?;
     let columns = infer_set_expr_columns(catalog, &ctes, query.body.as_ref(), &top)?;
-    let params = infer_query_params(catalog, query, placeholders)?;
-    Ok(QueryShape { columns, params })
+    let (params, param_nullable) = infer_query_params(catalog, query, placeholders)?;
+    Ok(QueryShape { columns, params, param_nullable })
 }
 
 /// Infer a `WITH … <DML> … RETURNING` statement (a `Query` with a top-level
@@ -13079,8 +13092,9 @@ fn infer_insert(
     // INSERT params come from the leading WITH CTE bodies, the VALUES/source AND
     // the ON CONFLICT DO UPDATE assignment values / WHERE; typing them needs the
     // column list, the leading CTEs, and the EXCLUDED scope.
-    let params = infer_insert_params(catalog, insert, &table_key, &ref_name, ctes, with, placeholders)?;
-    Ok(QueryShape { columns, params })
+    let (params, param_nullable) =
+        infer_insert_params(catalog, insert, &table_key, &ref_name, ctes, with, placeholders)?;
+    Ok(QueryShape { columns, params, param_nullable })
 }
 
 /// A scope for an `ON CONFLICT DO UPDATE` clause: the target table (so a bare
@@ -13781,8 +13795,8 @@ fn infer_update(
     // Walk the leading `WITH` CTE bodies' parameters (a no-op for a bare UPDATE).
     walker.visit_with_cte_bodies(with)?;
     walker.visit_update_body_params(update, &target_scope, &full_chain)?;
-    let params = walker.finish()?;
-    Ok(QueryShape { columns, params })
+    let (params, param_nullable) = walker.finish()?;
+    Ok(QueryShape { columns, params, param_nullable })
 }
 
 /// A one-relation scope for the UPDATE target, keyed by its catalog table but
@@ -14745,8 +14759,8 @@ fn infer_delete(
     // siblings. A bare DELETE has `with == None`, so this is a no-op there.
     walker.visit_with_cte_bodies(with)?;
     walker.visit_delete_body_params(delete, ctes)?;
-    let params = walker.finish()?;
-    Ok(QueryShape { columns, params })
+    let (params, param_nullable) = walker.finish()?;
+    Ok(QueryShape { columns, params, param_nullable })
 }
 
 /// Resolve a DML target relation name (`INSERT INTO`, `UPDATE`, `DELETE`) to a
@@ -14810,7 +14824,7 @@ fn infer_query_params(
     catalog: &Catalog,
     query: &Query,
     placeholders: &PlaceholderScan,
-) -> Result<Vec<RustType>, InferError> {
+) -> Result<(Vec<RustType>, Vec<bool>), InferError> {
     let mut walker = ParamWalker::new(catalog, placeholders);
     // `visit_query_params` walks the body, every CTE body, and this query's own
     // trailing LIMIT/OFFSET/FETCH count (typing a `$N` there to I64). The only
@@ -14872,7 +14886,7 @@ fn infer_insert_params(
     ctes: &Ctes,
     with: Option<&sqlparser::ast::With>,
     placeholders: &PlaceholderScan,
-) -> Result<Vec<RustType>, InferError> {
+) -> Result<(Vec<RustType>, Vec<bool>), InferError> {
     let mut walker = ParamWalker::new(catalog, placeholders);
     // Walk the statement's leading `WITH` CTE bodies' parameters (a no-op for a
     // bare INSERT), so a `$N` inside a leading CTE body is typed, not dropped.
@@ -14881,15 +14895,17 @@ fn infer_insert_params(
     walker.finish()
 }
 
-/// The supported Rust type of the INSERT's target column at position
-/// `idx` in its column list. An INSERT without an explicit column list, or
-/// a position past the list, cannot bind a param type by position.
-fn insert_column_type(
+/// The supported Rust type AND nullability of the INSERT's target column at
+/// position `idx` in its column list (`(type, nullable)`, `nullable ==
+/// !NOT NULL`). A bare `$N` bound into a NULLABLE target types `Option<T>`; a
+/// NOT NULL target keeps `T`. An INSERT without an explicit column list, or a
+/// position past the list, cannot bind a param type by position (`Ok(None)`).
+fn insert_column_target(
     catalog: &Catalog,
     insert: &Insert,
     table_key: &str,
     idx: usize,
-) -> Result<Option<RustType>, InferError> {
+) -> Result<Option<(RustType, bool)>, InferError> {
     let column_name = match insert.columns.get(idx) {
         Some(name) => object_name_leaf(name),
         None => return Ok(None),
@@ -14913,7 +14929,7 @@ fn insert_column_type(
             context: format!("INSERT column `{table_key}.{column_name}`"),
         }
     })?;
-    Ok(Some(ty))
+    Ok(Some((ty, !info.not_null)))
 }
 
 /// Walks an expression tree collecting `$N` placeholder types from the
@@ -14941,6 +14957,16 @@ struct ParamWalker<'c> {
     /// the first cast-required param error, if any (deferred so the densest
     /// diagnostic wins).
     pending_error: Option<InferError>,
+    /// position (1-based `$N`) -> whether the param types as `Option<T>`.
+    /// `true` = a `$N` bound as a BARE value into a NULLABLE assignment target
+    /// (an `INSERT ... VALUES` cell, an `UPDATE` / `ON CONFLICT DO UPDATE` `SET`
+    /// value), so `None` writes SQL NULL. `false` (or absent) = a plain `T`: a
+    /// comparison, a cast, a `LIMIT`, or a NOT NULL target. `false` DOMINATES —
+    /// a position recorded in ANY non-null context can never flip back to
+    /// nullable (the marking uses `entry(..).or_insert(true)`, while every
+    /// non-null context `insert(.., false)`s unconditionally), so a param used
+    /// both in a nullable target and a comparison stays `T`, order-independently.
+    nullable_param: BTreeMap<usize, bool>,
 }
 
 impl<'c> ParamWalker<'c> {
@@ -14960,6 +14986,7 @@ impl<'c> ParamWalker<'c> {
             typed: BTreeMap::new(),
             seen,
             pending_error: None,
+            nullable_param: BTreeMap::new(),
         }
     }
 
@@ -14980,7 +15007,14 @@ impl<'c> ParamWalker<'c> {
     /// [`InferError::ParamTypeConflict`], never silently last-write-wins (which
     /// would make the inferred type order-dependent and silently wrong).
     /// Re-recording the SAME type is idempotent.
-    fn record(&mut self, position: usize, ty: RustType) -> Result<(), InferError> {
+    ///
+    /// This is the type-reconciliation CORE, nullability-blind. Callers choose
+    /// the nullability facet: [`record`](Self::record) (a comparison / cast /
+    /// `LIMIT` — a plain `T`, which DOMINATES) or
+    /// [`record_nullable_target`](Self::record_nullable_target) (a `$N` bound as
+    /// a bare value into an assignment target — `Option<T>` iff that target
+    /// column is nullable).
+    fn record_type(&mut self, position: usize, ty: RustType) -> Result<(), InferError> {
         self.seen.insert(position, ());
         // A `$N` inferred to be an array type (e.g. `WHERE arr_col = $1`) is a
         // loud rejection: an array-typed scalar parameter is not `Copy`, so
@@ -15016,6 +15050,43 @@ impl<'c> ParamWalker<'c> {
         Ok(())
     }
 
+    /// Record a `$N` seen in a context that requires a plain `T` — a comparison
+    /// (`WHERE col = $1`), a cast (`$1::int4`), a `LIMIT`/`OFFSET`, an
+    /// `ANY`/`ALL` element, or any other value position that is not a nullable
+    /// assignment target. Marks the position NON-null, which DOMINATES a
+    /// nullable-target marking: a param used in ANY such context is never
+    /// `Option<T>`, so this change never leaks into a `WHERE`/comparison param.
+    fn record(&mut self, position: usize, ty: RustType) -> Result<(), InferError> {
+        self.record_type(position, ty)?;
+        // Non-null is dominant: overwrite unconditionally (a prior nullable
+        // marking loses to any comparison / cast use).
+        self.nullable_param.insert(position, false);
+        Ok(())
+    }
+
+    /// Record a `$N` bound as a BARE value directly into an assignment TARGET
+    /// column — an `INSERT ... VALUES` cell or an `UPDATE` / `ON CONFLICT DO
+    /// UPDATE` `SET` value. A NULLABLE target types the param `Option<T>` (so a
+    /// `None` bind writes SQL NULL); a NOT NULL target keeps the base `T`. The
+    /// nullable marking uses `or_insert`, so it never OVERRIDES a prior non-null
+    /// decision (a comparison use of the same `$N` elsewhere still wins); a NOT
+    /// NULL target `insert`s `false` (dominant), so a param bound into both a
+    /// nullable and a NOT NULL target correctly stays `T`.
+    fn record_nullable_target(
+        &mut self,
+        position: usize,
+        ty: RustType,
+        target_nullable: bool,
+    ) -> Result<(), InferError> {
+        self.record_type(position, ty)?;
+        if target_nullable {
+            self.nullable_param.entry(position).or_insert(true);
+        } else {
+            self.nullable_param.insert(position, false);
+        }
+        Ok(())
+    }
+
     /// Note a placeholder seen but not yet typed (so an untyped one is
     /// caught at `finish`).
     fn note_seen(&mut self, position: usize) {
@@ -15038,8 +15109,8 @@ impl<'c> ParamWalker<'c> {
             sqlparser::ast::AssignmentTarget::ColumnName(name) => {
                 let column = object_name_leaf(name);
                 let target_chain = ScopeChain::root(target_scope);
-                let col_type = target_chain.resolve_unqualified_type(self.catalog, &column);
-                self.visit_value_expr(value_chain, &assignment.value, col_type)?;
+                let target = self.assignment_target(&target_chain, &column);
+                self.visit_assignment_value(value_chain, &assignment.value, target)?;
                 Ok(())
             }
             // A multi-column `SET (a, b) = <row source>` types each row-source
@@ -15090,8 +15161,8 @@ impl<'c> ParamWalker<'c> {
             Some(cells) if cells.len() == names.len() => {
                 for (name, cell) in names.iter().zip(cells.iter()) {
                     let column = object_name_leaf(name);
-                    let col_type = target_chain.resolve_unqualified_type(self.catalog, &column);
-                    self.visit_value_expr(value_chain, cell, col_type)?;
+                    let target = self.assignment_target(&target_chain, &column);
+                    self.visit_assignment_value(value_chain, cell, target)?;
                 }
                 Ok(())
             }
@@ -15196,6 +15267,78 @@ impl<'c> ParamWalker<'c> {
             Expr::Nested(inner) => self.visit_value_expr(chain, inner, expected),
             other => self.visit_expr(chain, other),
         }
+    }
+
+    /// Visit an INSERT `VALUES` cell / `UPDATE` or `ON CONFLICT DO UPDATE` `SET`
+    /// value — an ASSIGNMENT-TARGET position. A BARE `$N` here types from the
+    /// target column AND, when that column is NULLABLE, binds as `Option<T>`
+    /// (so `None` inserts SQL NULL) via [`record_nullable_target`](Self::record_nullable_target);
+    /// a NOT NULL target keeps the base `T`. Everything else — a cast
+    /// (`$N::type`, an explicit type choice), an arithmetic / function / other
+    /// computed value, or a subquery — is NOT a bare column-typed target, so it
+    /// routes to the COMPARISON-typed [`visit_value_expr`](Self::visit_value_expr)
+    /// (plain `T`). So `Option<T>` inference is scoped to the bare "the value IS
+    /// the column" position and never leaks into a computed value or a cast.
+    ///
+    /// `target` is the target column's `(type, nullable)`, or `None` when the
+    /// target's type is unresolvable/unsupported (the bare `$N` then fails closed
+    /// as cast-required, exactly as [`visit_value_expr`](Self::visit_value_expr)
+    /// does with a `None` expected type).
+    fn visit_assignment_value(
+        &mut self,
+        chain: &ScopeChain<'_>,
+        expr: &Expr,
+        target: Option<(RustType, bool)>,
+    ) -> Result<(), InferError> {
+        match expr {
+            // A bare `$N` directly in the target position: type from the target
+            // column, carrying its nullability. A non-placeholder `Value` (a
+            // literal) contributes no param, exactly as `visit_value_expr` does.
+            Expr::Value(value) => {
+                if let Some(position) = placeholder_position(&value.value)? {
+                    match target {
+                        Some((ty, nullable)) => {
+                            self.record_nullable_target(position, ty, nullable)?
+                        }
+                        None => {
+                            self.note_seen(position);
+                            self.set_cast_required(position);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            // A parenthesised bare `$N` — `(($1))` — keeps the target context.
+            Expr::Nested(inner) => self.visit_assignment_value(chain, inner, target),
+            // A cast / computed value / subquery is not a bare column-typed
+            // target: type it exactly as a comparison RHS would (plain `T`), so
+            // `Option<T>` inference never leaks into a value that is not the bare
+            // column.
+            other => self.visit_value_expr(chain, other, target.map(|(ty, _)| ty)),
+        }
+    }
+
+    /// Resolve an assignment TARGET column against `target_chain` to its
+    /// `(type, nullable)`, for typing a bare `$N` bound into it. `None` when the
+    /// target's type is unsupported / unresolvable (the bare `$N` then fails
+    /// closed, as before — the existence pass has already proven the column
+    /// exists). Nullability defaults to NON-null (`false`) when the scope cannot
+    /// decide it — biasing to the historical plain-`T` behaviour — though a
+    /// base-table assignment target (a single, non-joined relation) always
+    /// resolves to the column's declared `NOT NULL`.
+    fn assignment_target(
+        &self,
+        target_chain: &ScopeChain<'_>,
+        column: &str,
+    ) -> Option<(RustType, bool)> {
+        let ty = target_chain.resolve_unqualified_type(self.catalog, column)?;
+        // `Some(true)` is a definitively NULLABLE target -> `Option<T>`; a
+        // `Some(false)` NOT NULL target, or an undecidable `None` (which never
+        // happens for a base-table, non-joined assignment target), keeps the
+        // base `T` — biasing to the historical plain-`T` behaviour.
+        let nullable =
+            target_chain.resolve_unqualified_nullability(self.catalog, column) == Some(true);
+        Some((ty, nullable))
     }
 
     /// Type the parameters of an array-quantifier comparison `left <op>
@@ -16072,8 +16215,8 @@ impl<'c> ParamWalker<'c> {
                         // Map the VALUES position to the INSERT column at the
                         // same index, so `$1` in `VALUES ($1, $2)` types from
                         // the named columns.
-                        let column_type = insert_column_type(self.catalog, insert, table_key, idx)?;
-                        self.visit_value_expr(&chain, expr, column_type)?;
+                        let target = insert_column_target(self.catalog, insert, table_key, idx)?;
+                        self.visit_assignment_value(&chain, expr, target)?;
                     }
                 }
             } else {
@@ -16123,9 +16266,9 @@ impl<'c> ParamWalker<'c> {
             for assignment in &do_update.assignments {
                 match &assignment.target {
                     sqlparser::ast::AssignmentTarget::ColumnName(name) => {
-                        let col_type = target_chain
-                            .resolve_unqualified_type(self.catalog, &object_name_leaf(name));
-                        self.visit_value_expr(&conflict_chain, &assignment.value, col_type)?;
+                        let target =
+                            self.assignment_target(&target_chain, &object_name_leaf(name));
+                        self.visit_assignment_value(&conflict_chain, &assignment.value, target)?;
                     }
                     // A multi-column `SET (a, b) = <row source>` types each
                     // row-source cell from its corresponding TARGET column (the
@@ -16465,10 +16608,12 @@ impl<'c> ParamWalker<'c> {
         }
     }
 
-    /// Produce the dense `Vec<RustType>` indexed by `$N`. Fails closed if
-    /// any seen position is untyped, or if a cast-required error is
-    /// pending, or if the seen positions are not a contiguous `1..=max`.
-    fn finish(self) -> Result<Vec<RustType>, InferError> {
+    /// Produce the dense per-`$N` `(Vec<RustType>, Vec<bool>)` — the parameter
+    /// types AND their PARALLEL nullability (`Option<T>` iff the bit is `true`),
+    /// both indexed by position and always the SAME length (built in one loop).
+    /// Fails closed if any seen position is untyped, or if a cast-required error
+    /// is pending, or if the seen positions are not a contiguous `1..=max`.
+    fn finish(self) -> Result<(Vec<RustType>, Vec<bool>), InferError> {
         if let Some(err) = self.pending_error {
             return Err(err);
         }
@@ -16476,12 +16621,19 @@ impl<'c> ParamWalker<'c> {
         // An empty map means no parameters at all.
         let max = match self.seen.last_key_value() {
             Some((&position, ())) => position,
-            None => return Ok(Vec::new()),
+            None => return Ok((Vec::new(), Vec::new())),
         };
         let mut params = Vec::with_capacity(max);
+        let mut param_nullable = Vec::with_capacity(max);
         for position in 1..=max {
             match self.typed.get(&position) {
-                Some(ty) => params.push(*ty),
+                Some(ty) => {
+                    params.push(*ty);
+                    // A position never marked (absent) or marked non-null types
+                    // as the plain base `T`; only a nullable-target-exclusive
+                    // marking (`Some(true)`) is `Option<T>`.
+                    param_nullable.push(matches!(self.nullable_param.get(&position), Some(true)));
+                }
                 None => {
                     // Either a gap (`$1` and `$3` but no `$2`) or a seen
                     // but untyped position: both fail closed as cast-
@@ -16492,7 +16644,7 @@ impl<'c> ParamWalker<'c> {
                 }
             }
         }
-        Ok(params)
+        Ok((params, param_nullable))
     }
 }
 
@@ -26861,6 +27013,96 @@ mod tests {
             s.params,
             vec![RustType::I64, RustType::Text, RustType::Text, RustType::I32]
         );
+    }
+
+    // ── nullable assignment-target params -> Option<T> ─────────────────────
+    //
+    // A `$N` bound as a BARE value into a NULLABLE assignment target (an
+    // `INSERT ... VALUES` cell, an `UPDATE` / `ON CONFLICT DO UPDATE` `SET`
+    // value) types as `Option<T>` (`param_nullable` = `true`) so `None` writes
+    // SQL NULL; a NOT NULL target, a COMPARISON / `WHERE` operand, and an
+    // explicit `::cast` keep the base `T` (`false`). The `params` TYPES are
+    // unchanged (the wire OID of `Option<T>` equals `T`'s), so this is a
+    // parallel `param_nullable` fact only.
+
+    #[test]
+    fn insert_nullable_target_param_is_option_notnull_stays_base() {
+        // `bio` / `age` are NULLABLE columns -> their `VALUES` params are
+        // `Option<T>`; the NOT NULL `id` / `name` keep the base `T`.
+        let s = shape(
+            &[USERS],
+            "INSERT INTO users (id, name, bio, age) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .expect("ok");
+        assert_eq!(
+            s.params,
+            vec![RustType::I64, RustType::Text, RustType::Text, RustType::I32]
+        );
+        assert_eq!(s.param_nullable, vec![false, false, true, true]);
+    }
+
+    #[test]
+    fn update_set_nullable_target_is_option_where_operand_stays_base() {
+        // `SET bio = $1` (nullable target) -> `Option`; `SET name = $2` (NOT
+        // NULL target) -> base; the `WHERE id = $3` comparison NEVER leaks
+        // nullability into its param.
+        let s = shape(
+            &[USERS],
+            "UPDATE users SET bio = $1, name = $2 WHERE id = $3 RETURNING id",
+        )
+        .expect("ok");
+        assert_eq!(s.params, vec![RustType::Text, RustType::Text, RustType::I64]);
+        assert_eq!(s.param_nullable, vec![true, false, false]);
+    }
+
+    #[test]
+    fn where_comparison_against_a_nullable_column_never_makes_the_param_option() {
+        // `bio` is a NULLABLE column, but a `$1` COMPARED against it is a filter,
+        // not a value bound INTO it — so it stays the base `text`, never Option.
+        let s = shape(&[USERS], "SELECT id FROM users WHERE bio = $1").expect("ok");
+        assert_eq!(s.params, vec![RustType::Text]);
+        assert_eq!(s.param_nullable, vec![false]);
+    }
+
+    #[test]
+    fn param_bound_into_a_nullable_target_and_also_compared_stays_base() {
+        // `$1` is BOTH a nullable-target value (`SET bio = $1`) AND a comparison
+        // operand (`WHERE name = $1`): the non-null comparison context DOMINATES,
+        // so the single param is the base `text` (never a leaked `Option`).
+        let s = shape(
+            &[USERS],
+            "UPDATE users SET bio = $1 WHERE name = $1 RETURNING id",
+        )
+        .expect("ok");
+        assert_eq!(s.params, vec![RustType::Text]);
+        assert_eq!(s.param_nullable, vec![false]);
+    }
+
+    #[test]
+    fn explicit_cast_value_into_a_nullable_target_stays_base() {
+        // An explicit `$3::text` is the user pinning the exact type — not the
+        // bare "the value IS the column" position — so it stays the base `text`
+        // even though `bio` is nullable (bind the bare `$3` for `Option<T>`).
+        let s = shape(
+            &[USERS],
+            "INSERT INTO users (id, name, bio, age) VALUES ($1, $2, $3::text, $4) RETURNING id",
+        )
+        .expect("ok");
+        assert_eq!(s.param_nullable, vec![false, false, false, true]);
+    }
+
+    #[test]
+    fn on_conflict_do_update_nullable_target_param_is_option() {
+        // `DO UPDATE SET bio = $2` binds into the nullable `bio` column, so its
+        // param is `Option<T>`; the inserted NOT NULL `id` stays base.
+        let s = shape(
+            &[USERS],
+            "INSERT INTO users (id, name) VALUES ($1, 'x') \
+             ON CONFLICT (id) DO UPDATE SET bio = $2 RETURNING id",
+        )
+        .expect("ok");
+        assert_eq!(s.params, vec![RustType::I64, RustType::Text]);
+        assert_eq!(s.param_nullable, vec![false, true]);
     }
 
     // ── window inside an aggregate argument ────────────────────────────────

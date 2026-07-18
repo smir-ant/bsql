@@ -54,6 +54,18 @@ pub enum ParamShape {
     /// A toggled optional-filter `$N` — Rust type `Option<T>`; `None`
     /// disables the filter (a SQL NULL bind), the SQL form is unchanged.
     Optional(RustType),
+    /// A `$N` bound as a BARE value into a NULLABLE assignment target (an
+    /// `INSERT ... VALUES` cell, an `UPDATE` / `ON CONFLICT DO UPDATE` `SET`
+    /// value) — Rust type `Option<T>`; `None` writes SQL NULL, the SQL form is
+    /// unchanged. DISTINCT from [`Optional`](Self::Optional) (also `Option<T>`
+    /// but a runtime FILTER TOGGLE, budget-counted against `MAX_OPTIONAL_FILTERS`
+    /// and driving the `$N IS NULL OR ...` clause rewrite): a `Nullable` param is
+    /// just a plain bound value that happens to be nullable, so it counts against
+    /// no budget and leaves the SQL text untouched. The two cannot coincide — a
+    /// toggle / in-list param is a COMPARISON, never an assignment target. The
+    /// wire OID is the element's (a NULL is typed by its column), identical to
+    /// the base `T`, so this only changes the Rust surface type.
+    Nullable(RustType),
     /// A single array `$N` for a `col = ANY($N)` in-list — Rust type
     /// `&[T]`, encoded as one array parameter with the element type's
     /// array OID.
@@ -65,7 +77,10 @@ impl ParamShape {
     #[must_use]
     pub fn element(self) -> RustType {
         match self {
-            ParamShape::Scalar(ty) | ParamShape::Optional(ty) | ParamShape::Array(ty) => ty,
+            ParamShape::Scalar(ty)
+            | ParamShape::Optional(ty)
+            | ParamShape::Nullable(ty)
+            | ParamShape::Array(ty) => ty,
         }
     }
 }
@@ -167,6 +182,7 @@ pub fn infer_dynamic_query(catalog: &Catalog, sql: &str) -> Result<DynamicShape,
             let shape = infer_query(catalog, &pre.infer_base)?;
             let params = build_param_shapes(
                 &shape.params,
+                &shape.param_nullable,
                 &pre.optional_positions,
                 &pre.array_positions,
             )?;
@@ -195,6 +211,7 @@ pub fn infer_dynamic_query(catalog: &Catalog, sql: &str) -> Result<DynamicShape,
                 let shape = infer_query(catalog, &infer_sql)?;
                 let params = build_param_shapes(
                     &shape.params,
+                    &shape.param_nullable,
                     &pre.optional_positions,
                     &pre.array_positions,
                 )?;
@@ -242,9 +259,11 @@ pub fn infer_dynamic_query(catalog: &Catalog, sql: &str) -> Result<DynamicShape,
 }
 
 /// Combine the inferred per-position scalar types with the optional /
-/// array overrides discovered during lowering.
+/// array overrides discovered during lowering and the per-position
+/// nullability from inference (`param_nullable`, parallel to `scalar_params`).
 fn build_param_shapes(
     scalar_params: &[RustType],
+    param_nullable: &[bool],
     optional_positions: &[usize],
     array_positions: &[usize],
 ) -> Result<Vec<ParamShape>, DynamicError> {
@@ -255,6 +274,13 @@ fn build_param_shapes(
         let position = idx.saturating_add(1);
         let is_optional = optionals.contains(&position);
         let is_array = arrays.contains(&position);
+        // A NULLABLE assignment-target value binds `Option<T>`. It CANNOT
+        // coincide with a toggle / in-list (those are comparisons, never
+        // assignment targets), so the explicit sugar variants take precedence
+        // and the nullability bit is consulted only otherwise. A shorter
+        // `param_nullable` (never happens — it is built parallel to the params)
+        // is treated as non-null.
+        let is_nullable = matches!(param_nullable.get(idx), Some(true));
         if is_optional && is_array {
             return Err(DynamicError::Sugar(format!(
                 "parameter ${position} is used as BOTH an OPTIONAL(...) filter and a \
@@ -265,6 +291,8 @@ fn build_param_shapes(
             ParamShape::Array(*ty)
         } else if is_optional {
             ParamShape::Optional(*ty)
+        } else if is_nullable {
+            ParamShape::Nullable(*ty)
         } else {
             ParamShape::Scalar(*ty)
         };

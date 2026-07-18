@@ -53,13 +53,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── pipeline: a heterogeneous batch in ~ONE round trip ───────────────────
     // Two reads + one write, decoded against EACH carrier's own compile-time
     // shape. The insert commits atomically with the whole batch.
-    // (In a compile-checked `VALUES` insert, `total`'s parameter infers as its
-    // non-null base type `i32`.)
+    // (`total` is a NULLABLE column, so a compile-checked `VALUES` insert types
+    // its parameter as `Option<i32>`: `Some(x)` inserts x, `None` inserts SQL
+    // NULL. The NOT NULL columns `id` / `user_id` / `status` keep their base
+    // types `i64` / `i64` / `&str`.)
     let (one, hi, inserted) = conn
         .pipeline((
             Lit1::bind(()),
             LitHi::bind(()),
-            InsertOrder::bind((1i64, 42i64, 500i32, "pending")),
+            InsertOrder::bind((1i64, 42i64, Some(500i32), "pending")),
         ))
         .await?;
     println!(
@@ -70,11 +72,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ── execute_batch: ONE carrier, N parameter sets, per-command counts ─────
-    // The `_` lets `I` (the iterator type) be inferred from the argument.
+    // `total` is nullable, so its param is `Option<i32>`: the second row binds
+    // `None` to store SQL NULL. The turbofish names only the carrier
+    // (`::<InsertOrder>`); the iterator type is inferred from the argument.
     let counts = conn
         .execute_batch::<InsertOrder>([
-            (2i64, 42i64, 20i32, "pending"),
-            (3i64, 42i64, 30i32, "pending"),
+            (2i64, 42i64, Some(20i32), "pending"),
+            (3i64, 42i64, None, "pending"),
         ])
         .await?;
     println!("execute_batch -> affected counts {counts:?}"); // [1, 1]
@@ -82,8 +86,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── query_batch: like execute_batch, but KEEP the RETURNING rows ─────────
     let grouped = conn
         .query_batch::<InsertOrder>([
-            (4i64, 42i64, 40i32, "pending"),
-            (5i64, 42i64, 50i32, "pending"),
+            (4i64, 42i64, Some(40i32), "pending"),
+            (5i64, 42i64, Some(50i32), "pending"),
         ])
         .await?;
     let ids: Vec<i64> = grouped

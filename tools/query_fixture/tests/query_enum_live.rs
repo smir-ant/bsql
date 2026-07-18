@@ -79,10 +79,13 @@ mod sync_driver {
         c.simple_query(&setup_ddl("bsql_enum_test_sync"))
             .expect("setup DDL");
 
-        // ENCODE an enum param + RETURNING decode: insert (1, sad, NULL) and
-        // (2, in_progress, happy), reading the enum straight back.
+        // ENCODE an enum param + RETURNING decode: insert (1, sad, happy) and
+        // (2, in_progress, ok), reading the enum straight back. `note` is a
+        // NULLABLE enum column, so its `$3` param is `Option<EnumLabel<Mood>>`
+        // (`Some(..)` here; `None` would write SQL NULL); the NOT NULL `m` param
+        // stays a bare `EnumLabel<Mood>`.
         let one = c
-            .query_one::<InsertFeeling>((1, Mood::Sad.as_label(), Mood::Happy.as_label()))
+            .query_one::<InsertFeeling>((1, Mood::Sad.as_label(), Some(Mood::Happy.as_label())))
             .expect("insert 1");
         assert_eq!(one.id, 1);
         assert_eq!(one.m, Mood::Sad, "RETURNING m decodes the bound enum back");
@@ -91,7 +94,7 @@ mod sync_driver {
         // A second row exercising the snake_case -> PascalCase label mapping
         // (`in_progress` -> `InProgress`).
         let two = c
-            .query_one::<InsertFeeling>((2, Mood::InProgress.as_label(), Mood::Ok.as_label()))
+            .query_one::<InsertFeeling>((2, Mood::InProgress.as_label(), Some(Mood::Ok.as_label())))
             .expect("insert 2");
         assert_eq!(two.m, Mood::InProgress, "in_progress -> InProgress");
 
@@ -161,7 +164,7 @@ mod async_driver {
             .expect("setup DDL");
 
         let one = c
-            .query_one::<InsertFeeling>((1, Mood::Ok.as_label(), Mood::Sad.as_label()))
+            .query_one::<InsertFeeling>((1, Mood::Ok.as_label(), Some(Mood::Sad.as_label())))
             .await
             .expect("insert 1");
         assert_eq!(one.m, Mood::Ok, "RETURNING decodes the bound enum (async)");

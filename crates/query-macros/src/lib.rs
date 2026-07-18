@@ -2424,7 +2424,11 @@ fn param_tuple_marker(
     };
     match shape {
         ParamShape::Scalar(ty) => scalar(ty),
-        ParamShape::Optional(ty) => {
+        // A toggled `OPTIONAL(...)` filter and a NULLABLE assignment target both
+        // render `Option<T>` (a `None` binds SQL NULL either way); they differ
+        // only in the SQL rewrite / budget the macro applies elsewhere, not in
+        // the Rust surface type.
+        ParamShape::Optional(ty) | ParamShape::Nullable(ty) => {
             let inner = scalar(ty)?;
             Ok(quote!(::core::option::Option<#inner>))
         }
@@ -2445,18 +2449,21 @@ fn param_tuple_marker(
     }
 }
 
-/// The numeric OID baked into the Parse template for one parameter. A
-/// toggled `Option<T>` keeps the scalar OID (a SQL NULL is typed by its
-/// column); a `= ANY($N)` array uses the element type's array OID; a
-/// user-enum parameter is UNSPECIFIED (0) — the server infers the enum type
-/// from context (a PG enum has no implicit `text` cast).
+/// The numeric OID baked into the Parse template for one parameter. A toggled
+/// `Option<T>` OR a nullable-target `Option<T>` keeps the scalar OID (a SQL NULL
+/// is typed by its column, so `Option<T>` and `T` bind the SAME OID); a
+/// `= ANY($N)` array uses the element type's array OID; a user-enum parameter is
+/// UNSPECIFIED (0) — the server infers the enum type from context (a PG enum has
+/// no implicit `text` cast).
 fn param_oid_value(shape: bsql_build::ParamShape) -> u32 {
     use bsql_build::{ParamShape, RustType};
     match shape {
-        ParamShape::Scalar(RustType::UserEnum(_)) | ParamShape::Optional(RustType::UserEnum(_)) => {
-            0
+        ParamShape::Scalar(RustType::UserEnum(_))
+        | ParamShape::Optional(RustType::UserEnum(_))
+        | ParamShape::Nullable(RustType::UserEnum(_)) => 0,
+        ParamShape::Scalar(ty) | ParamShape::Optional(ty) | ParamShape::Nullable(ty) => {
+            rust_type_oid(ty)
         }
-        ParamShape::Scalar(ty) | ParamShape::Optional(ty) => rust_type_oid(ty),
         ParamShape::Array(ty) => array_oid(ty),
     }
 }
@@ -3014,12 +3021,18 @@ fn emit_sqlite_typed(
     enums: &EnumTypes,
 ) -> syn::Result<TokenStream2> {
     // A runtime `ORDER BY` allow-set or an `OPTIONAL(...)` / `= ANY(...)` param
-    // is PostgreSQL-runtime sugar with no SQLite lowering — skip the bridge.
+    // is PostgreSQL-runtime sugar with no SQLite lowering — skip the bridge. A
+    // `Nullable` param (a nullable assignment target → `Option<T>`) is NOT such
+    // sugar: it is a plain bound value SQLite binds via `Option<T>:
+    // SqliteBindValue` (`None` → NULL), so it stays bridge-eligible like a
+    // `Scalar`.
     if shape.order_by.is_some()
-        || shape
-            .params
-            .iter()
-            .any(|p| !matches!(p, bsql_build::ParamShape::Scalar(_)))
+        || shape.params.iter().any(|p| {
+            matches!(
+                p,
+                bsql_build::ParamShape::Optional(_) | bsql_build::ParamShape::Array(_)
+            )
+        })
     {
         return Ok(TokenStream2::new());
     }

@@ -201,6 +201,12 @@ fn unknown_reference_is_compile_error() {
     // E0271 at the call — a bulk QUERY cannot carry a mistyped set either.
     t.compile_fail("tests/compile_fail/query_batch_wrong_param.rs");
 
+    // Nullable-parameter inference is SCOPED to NULLABLE assignment targets: a
+    // `$N` bound into a NOT NULL column keeps the base type `T`, so binding
+    // `None` there is `error[E0308]` (`None` is an `Option`, not a `T`). This
+    // pins that the change never turns a NOT NULL target's param into `Option`.
+    t.compile_fail("tests/compile_fail/notnull_param_rejects_none.rs");
+
     // SQL VIEWS (`0022_views.sql`):
     //   * a `query!` INSERT/UPDATE/DELETE ... RETURNING targeting a VIEW is a loud
     //     `WriteToView` — a view is not writable, so accepting the write at build

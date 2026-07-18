@@ -54,11 +54,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // CREATE: insert and read the RETURNING row back. In a compile-checked
-    // `VALUES` insert, a nullable column's parameter infers as its non-null base
-    // type (`total` -> `i32`); to store SQL NULL, omit the column or use the
-    // dynamic `execute_params` verb.
+    // `VALUES` insert, a NULLABLE column's parameter infers as `Option<T>`, so
+    // `total` -> `Option<i32>`: bind `Some(x)` to store x or `None` to store SQL
+    // NULL — all through the typed path. The NOT NULL columns keep their base
+    // types (`id` -> `i64`, `status` -> `&str`).
     let created = conn
-        .query_one::<InsertOrder>((1i64, 42i64, 500i32, "pending"))
+        .query_one::<InsertOrder>((1i64, 42i64, Some(500i32), "pending"))
         .await?;
     println!("inserted order #{} with status {:?}", created.id, created.status);
 
