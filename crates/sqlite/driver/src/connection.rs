@@ -1488,44 +1488,88 @@ impl Connection {
     /// the outer `Connection` and re-enters `transaction` on it is out of scope —
     /// this closes the ergonomic nesting misuse, not a hand-rolled bypass, and
     /// matches the PostgreSQL driver's transaction guard exactly.)
+    ///
+    /// PANIC-SAFE: the COMMIT/ROLLBACK obligation is bound to SCOPE DESTRUCTION
+    /// (a hand-rolled RAII [`TxRollbackGuard`]), not to the closure's RETURN
+    /// VALUE. If the closure PANICS it yields no `Result`, so the explicit
+    /// COMMIT/ROLLBACK below is bypassed — but the still-ARMED guard's `Drop`
+    /// then runs a best-effort `ROLLBACK`, so the eagerly-issued `BEGIN` is NOT
+    /// left open on the reused in-process handle (SQLite has no pool `reset` to
+    /// launder a stranded transaction the way the pooled PostgreSQL drivers do).
+    /// The normal Ok/Err paths `disarm()` the guard before their explicit
+    /// terminator, so their precise classified [`SqliteError`] is unchanged.
+    ///
+    /// The `BEGIN` is DEFERRED (not `BEGIN IMMEDIATE`) BY DESIGN: a deferred
+    /// begin preserves read concurrency, and a read-then-write lock upgrade that
+    /// contends is already fail-loud (a classified [`SqliteError`] with
+    /// [`is_busy`](SqliteError::is_busy) `true`) and bounded by the 5 s
+    /// `busy_timeout` — so there is nothing to "fix" by upgrading to IMMEDIATE,
+    /// which would only cut read concurrency.
     pub fn transaction<R>(
         &self,
         f: impl FnOnce(&Transaction<'_>) -> Result<R, SqliteError>,
     ) -> Result<R, SqliteError> {
         self.inner.execute_batch("BEGIN")?;
-        let tx = Transaction { conn: self };
-        let result = match f(&tx) {
-            Ok(val) => match self.inner.execute_batch("COMMIT") {
-                Ok(()) => Ok(val),
-                Err(commit_err) => {
-                    // COMMIT failed (e.g. BUSY on the RESERVED→EXCLUSIVE upgrade in
-                    // a rollback-journal mode, or an interrupt at COMMIT): the
-                    // transaction is still OPEN on the reused handle. Best-effort
-                    // ROLLBACK to a clean boundary (swallow its own error) so a
-                    // retry can BEGIN cleanly — matching PostgreSQL's `commit()`,
-                    // which recovers to idle — and return the ORIGINAL COMMIT error
-                    // UNCHANGED. It is DELIBERATELY not wrapped in
-                    // `TransactionRollbackFailed` (whose `primary_code()` is `None`,
-                    // which would declassify `is_busy()`/`is_disconnect()` to
-                    // `false` and destroy the caller's retry/reconnect signal); the
-                    // COMMIT is the meaningful cause, its SQLite code preserved.
-                    match self.inner.execute_batch("ROLLBACK") {
-                        Ok(()) | Err(_) => {}
+        // ARM the rollback guard BEFORE running the closure: if `f` PANICS, the
+        // explicit COMMIT/ROLLBACK below is bypassed and the guard's `Drop` is the
+        // ONLY code that runs — it rolls the open `BEGIN` back. The Ok/Err paths
+        // `disarm()` it before their own terminator, so the guard never
+        // double-rolls-back a normally-completed transaction.
+        let mut guard = TxRollbackGuard { handle: &self.inner, armed: true };
+        // The closure runs in an INNER scope, so its `Transaction` — and any
+        // rusqlite `Statement`/`Rows` cursor a verb opened — is dropped/finalized
+        // before we terminate. On the panic path the verb's own frame unwinds
+        // FIRST (finalizing its cursor), THEN this frame unwinds and drops
+        // `guard`, so the panic-path ROLLBACK never contends with an open cursor.
+        let outcome = {
+            let tx = Transaction { conn: self };
+            f(&tx)
+        };
+        let result = match outcome {
+            Ok(val) => {
+                // Normal completion: cancel the panic-path rollback, then run the
+                // explicit COMMIT and surface its precise classified error.
+                guard.disarm();
+                match self.inner.execute_batch("COMMIT") {
+                    Ok(()) => Ok(val),
+                    Err(commit_err) => {
+                        // COMMIT failed (e.g. BUSY on the RESERVED→EXCLUSIVE upgrade
+                        // in a rollback-journal mode, or an interrupt at COMMIT): the
+                        // transaction is still OPEN on the reused handle. Best-effort
+                        // ROLLBACK to a clean boundary (swallow its own error) so a
+                        // retry can BEGIN cleanly — matching PostgreSQL's `commit()`,
+                        // which recovers to idle — and return the ORIGINAL COMMIT
+                        // error UNCHANGED. It is DELIBERATELY not wrapped in
+                        // `TransactionRollbackFailed` (whose `primary_code()` is
+                        // `None`, which would declassify `is_busy()`/`is_disconnect()`
+                        // to `false` and destroy the caller's retry/reconnect
+                        // signal); the COMMIT is the meaningful cause, its SQLite code
+                        // preserved.
+                        match self.inner.execute_batch("ROLLBACK") {
+                            Ok(()) | Err(_) => {}
+                        }
+                        Err(SqliteError::from(commit_err))
                     }
-                    Err(SqliteError::from(commit_err))
                 }
-            },
-            Err(e) => match self.inner.execute_batch("ROLLBACK") {
-                // ROLLBACK undid the transaction: return the closure's error.
-                Ok(()) => Err(e),
-                // ROLLBACK also failed: the connection is in an indeterminate
-                // transactional state. Preserve both causes rather than
-                // silently dropping the rollback failure.
-                Err(rb) => Err(SqliteError::TransactionRollbackFailed {
-                    original: Box::new(e),
-                    rollback: Box::new(SqliteError::from(rb)),
-                }),
-            },
+            }
+            Err(e) => {
+                // The closure returned an error: cancel the panic-path rollback,
+                // then run the explicit ROLLBACK ourselves so its precise
+                // classified error (including `TransactionRollbackFailed`) is
+                // surfaced UNCHANGED.
+                guard.disarm();
+                match self.inner.execute_batch("ROLLBACK") {
+                    // ROLLBACK undid the transaction: return the closure's error.
+                    Ok(()) => Err(e),
+                    // ROLLBACK also failed: the connection is in an indeterminate
+                    // transactional state. Preserve both causes rather than
+                    // silently dropping the rollback failure.
+                    Err(rb) => Err(SqliteError::TransactionRollbackFailed {
+                        original: Box::new(e),
+                        rollback: Box::new(SqliteError::from(rb)),
+                    }),
+                }
+            }
         };
         // Either terminator closes a logical operation: forget the N+1 recency
         // window so repetition ACROSS transactions is forgiven (a no-op with the
@@ -1589,6 +1633,55 @@ fn ensure_param_count(stmt: &rusqlite::Statement<'_>, bound: usize) -> Result<()
         Ok(())
     } else {
         Err(SqliteError::ParameterCountMismatch { expected, bound })
+    }
+}
+
+// ─── Transaction panic-safety guard ──────────────────────────────────────────
+
+/// A hand-rolled "disarmed-bomb" RAII guard that makes [`Connection::transaction`]
+/// PANIC-SAFE: if the closure PANICS, the explicit `COMMIT`/`ROLLBACK` is bypassed
+/// (an unwind yields no `Result`), so the eagerly-issued `BEGIN` would be left OPEN
+/// on the reused in-process handle. This guard is armed BEFORE the closure runs; if
+/// it is dropped while still armed (the unwind path), its [`Drop`] rolls the `BEGIN`
+/// back. The normal Ok/Err paths call [`disarm`](Self::disarm) before their own
+/// explicit terminator, so the guard NEVER double-terminates a normally-completed
+/// transaction (and their precise classified [`SqliteError`] is untouched).
+///
+/// This RAII form is legitimate here precisely BECAUSE SQLite is synchronous
+/// in-process: a blocking `ROLLBACK` in `Drop` is fine. (The pooled PostgreSQL
+/// drivers cannot use `Drop` — an async rollback cannot be `.await`ed there — and
+/// instead rely on begin-deferral + the pool's checkout `reset`; SQLite has no pool,
+/// hence no such net, hence this guard.) It holds ONLY the raw `rusqlite` handle it
+/// needs for the rollback — no `RefCell` / N+1 access — so its `Drop` cannot itself
+/// panic (see the swallow note in [`Drop::drop`](Self::drop)).
+struct TxRollbackGuard<'h> {
+    handle: &'h rusqlite::Connection,
+    armed: bool,
+}
+
+impl TxRollbackGuard<'_> {
+    /// Cancel the panic-path rollback: the caller is about to run the explicit
+    /// `COMMIT`/`ROLLBACK`, so the guard must not double-terminate.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TxRollbackGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // SWALLOW the result — this `Drop` fires DURING an unwind (the closure
+            // panicked), and a `ROLLBACK` error propagated OUT of a `Drop`
+            // mid-unwind is a double-panic → `abort`. Best-effort is the only
+            // correct behaviour: mirror the same `Ok(()) | Err(_) => {}` swallow the
+            // COMMIT-failure recovery arm uses. Any rusqlite `Statement`/`Rows` the
+            // panicking frame held is already finalized (its stack unwound before
+            // this outer guard drops), so the ROLLBACK does not contend with an open
+            // cursor.
+            match self.handle.execute_batch("ROLLBACK") {
+                Ok(()) | Err(_) => {}
+            }
+        }
     }
 }
 
