@@ -397,6 +397,27 @@ fn flatten<'b>(
     }
 }
 
+/// Strip the `args` the compiled-query verbs (`query_params` /
+/// `query_params_break`) now hand BACK alongside their result — the self-heal
+/// support that lets a stale-cached-plan re-run without a `Clone` bound — leaving
+/// just the polled result the tests match on.
+fn drop_args<T, E, P>(
+    polled: Result<(Result<T, E>, P), SpuriousPending>,
+) -> Result<Result<T, E>, SpuriousPending> {
+    polled.map(|(r, _args)| r)
+}
+
+/// [`flatten`] over a `query_params` poll that now hands `args` back.
+#[expect(
+    clippy::type_complexity,
+    reason = "the polled type is the engine's own Result-of-Result-plus-args threading; a test-local alias would only hide it"
+)]
+fn flatten_qp<'b, P>(
+    polled: Result<(Result<Outcome<'b, CommandStatus>, EngineError<Infallible>>, P), SpuriousPending>,
+) -> Result<Live<'b>, EngineError<Infallible>> {
+    flatten(drop_args(polled))
+}
+
 /// Reach an active engine over a scripted server, then run `body`, returning
 /// whatever it produces (owned).
 fn run<R: 'static>(
@@ -976,7 +997,7 @@ fn query_params_runs_the_macro_path() {
     ]);
     let cap = run(script, |e, live| {
         let mut cap = Cap::default();
-        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap.sink())))
+        let live = flatten_qp(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap.sink())))
             .expect("query_params");
         let _ = live;
         cap
@@ -1014,7 +1035,7 @@ fn query_params_break_streams_all_reaches_idle() {
             }
             ControlFlow::<()>::Continue(())
         }));
-        match outcome {
+        match drop_args(outcome) {
             Ok(Ok(Outcome { live, status })) => {
                 assert!(
                     matches!(status, Boundary::Idle),
@@ -1060,7 +1081,7 @@ fn query_params_break_stops_early_then_drain_reclaims_and_reuses() {
                 ControlFlow::Continue(())
             }
         }));
-        let live = match outcome {
+        let live = match drop_args(outcome) {
             Ok(Ok(Outcome { live, status })) => {
                 assert!(
                     matches!(status, Boundary::Stopped(())),
@@ -1213,13 +1234,13 @@ fn query_params_miss_close_parses_hit_reuses_and_reparses_after_clear() {
         // boundaries (the Bind+Execute+Sync tail is byte-identical every call).
         let base = len_written();
         let mut cap1 = Cap::default();
-        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap1.sink())))
+        let live = flatten_qp(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap1.sink())))
             .expect("call 1 (miss)");
         let after1 = len_written();
         let w1 = read_written(base);
 
         let mut cap2 = Cap::default();
-        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap2.sink())))
+        let live = flatten_qp(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap2.sink())))
             .expect("call 2 (reuse) must succeed");
         let w2 = read_written(after1);
         let after2 = len_written();
@@ -1227,7 +1248,7 @@ fn query_params_miss_close_parses_hit_reuses_and_reparses_after_clear() {
         // Invalidate the cache (the session-reset hook) — call 3 must miss again.
         e.clear_statement_cache();
         let mut cap3 = Cap::default();
-        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap3.sink())))
+        let live = flatten_qp(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap3.sink())))
             .expect("call 3 (after clear)");
         let w3 = read_written(after2);
         let _ = live;
@@ -1310,11 +1331,11 @@ fn take_statement_cache_returns_the_names_and_clears() {
     ]);
     let taken = run(script, |e, live| {
         let mut cap1 = Cap::default();
-        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap1.sink())))
+        let live = flatten_qp(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap1.sink())))
             .expect("call 1 (miss) records the name");
         let taken = e.take_statement_cache();
         let mut cap2 = Cap::default();
-        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap2.sink())))
+        let live = flatten_qp(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap2.sink())))
             .expect("call 2 is a MISS again — take cleared the cache");
         let _ = live;
         taken
@@ -1382,14 +1403,14 @@ fn query_params_reuse_error_evicts_so_next_use_reparses() {
         };
         let base = len_written();
         let mut cap1 = Cap::default();
-        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap1.sink())))
+        let live = flatten_qp(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap1.sink())))
             .expect("call 1 (miss) records");
         let after1 = len_written();
         let w1 = read_written(base);
 
         // call 2 (HIT) hits the dropped statement: a recoverable ServerErrored.
         let mut cap2 = Cap::default();
-        let (call2_errored, live) = match poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap2.sink())) {
+        let (call2_errored, live) = match drop_args(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap2.sink()))) {
             Ok(Ok(Outcome { live, status: CommandStatus::ServerErrored })) => (true, live),
             other => panic!("expected call 2 ServerErrored (dropped stmt), got {other:?}"),
         };
@@ -1397,7 +1418,7 @@ fn query_params_reuse_error_evicts_so_next_use_reparses() {
 
         // call 3 must be a MISS (Close+Parse) — the evict healed the cache.
         let mut cap3 = Cap::default();
-        let live = flatten(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap3.sink())))
+        let live = flatten_qp(poll_once(e.query_params(live, &Q_DEMO, (42_i32,), cap3.sink())))
             .expect("call 3 (miss, self-healed)");
         let w3 = read_written(after2);
         let _ = (after1, live);

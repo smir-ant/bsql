@@ -141,6 +141,64 @@ mod sync_driver {
             Err(e) => panic!("bpchar column falsely rejected: {e:?}"),
         }
     }
+
+    /// TYPED cache `0A000` self-heal + drift classification (the RESULT-TYPE-change
+    /// peer of the `26000` vanished-statement self-heal in `query_live_sync`).
+    /// After a recorded typed statement, an out-of-band `ALTER COLUMN TYPE` changes
+    /// the result type, so the next HIT reuse (bare `Bind`, no `Describe`) fails
+    /// PostgreSQL's `0A000` "cached plan must not change result type". The driver
+    /// SELF-HEALS on the forced MISS path, which sends a `Describe` and re-arms the
+    /// RESULT-OID guard:
+    ///   - a text-family shift (`text` -> `varchar`) STILL matches `OgTag`'s marker,
+    ///     so the guard passes and the CORRECT rows return (transparent self-heal);
+    ///   - a DIFFERING type (`text` -> `int4`) becomes a classified
+    ///     `ColumnOidMismatch` (the right error) — never a raw `0A000`.
+    ///
+    /// A STRICT improvement over the old typed fail-loud on `0A000`.
+    #[test]
+    #[ignore = "requires local PG"]
+    fn result_type_change_self_heals_or_classifies() {
+        // Case 1: a text-family shift (text -> varchar) still matches OgTag (text 25).
+        let mut c = Connection::connect(&config()).expect("connect");
+        c.simple_query("CREATE TEMP TABLE oidguard (tag text NOT NULL)")
+            .expect("temp shadow");
+        c.simple_query("INSERT INTO oidguard (tag) VALUES ('hello')")
+            .expect("insert");
+        // Record the statement (MISS at Idle -> recorded, HIT-eligible next).
+        assert_eq!(c.query_one::<OgTag>(()).expect("first records").tag, "hello");
+        // Change the result type: the next HIT reuse fails 0A000.
+        c.simple_query("ALTER TABLE oidguard ALTER COLUMN tag TYPE varchar")
+            .expect("alter text -> varchar");
+        // HIT -> 0A000 -> self-heal MISS -> Describe (varchar 1043) -> text-family
+        // compat passes -> the correct rows (transparent; no 0A000 surfaces).
+        let healed = c
+            .query_one::<OgTag>(())
+            .expect("0A000 self-heals to correct rows on a text-family match");
+        assert_eq!(healed.tag, "hello", "the self-healed query returns the correct value");
+        assert!(c.is_healthy(), "connection healthy after the self-heal");
+        c.close().expect("close");
+
+        // Case 2: a DIFFERING type (text -> int4) is a classified ColumnOidMismatch.
+        let mut c = Connection::connect(&config()).expect("connect");
+        c.simple_query("CREATE TEMP TABLE oidguard (tag text NOT NULL)")
+            .expect("temp shadow");
+        c.simple_query("INSERT INTO oidguard (tag) VALUES ('42')")
+            .expect("insert");
+        assert_eq!(c.query_one::<OgTag>(()).expect("first records").tag, "42");
+        c.simple_query("ALTER TABLE oidguard ALTER COLUMN tag TYPE int4 USING tag::int4")
+            .expect("alter text -> int4");
+        // HIT -> 0A000 -> self-heal MISS -> Describe (int4 23) -> guard classifies.
+        match c.query_one::<OgTag>(()) {
+            Err(DriverError::Decode(DecodeError::ColumnOidMismatch { index, expected, found })) => {
+                assert_eq!(index, 0, "the diverging column is result column 0");
+                assert_eq!(expected, OID_TEXT, "OgTag expects text (25)");
+                assert_eq!(found, OID_INT4, "the ALTERed column is int4 (23)");
+            }
+            other => panic!("a differing result type must self-heal to a classified ColumnOidMismatch, got {other:?}"),
+        }
+        assert!(c.is_healthy(), "connection recovers after the classified drift");
+        c.close().expect("close");
+    }
 }
 
 mod async_driver {
@@ -241,5 +299,56 @@ mod async_driver {
             Ok(row) => assert_eq!(row.bp.trim_end(), "bb", "bpchar decodes as text (family compat)"),
             Err(e) => panic!("bpchar column falsely rejected: {e:?}"),
         }
+    }
+
+    /// The async twin of the sync `result_type_change_self_heals_or_classifies`: a
+    /// `0A000` cached-plan result-type change self-heals to the correct rows on a
+    /// text-family match, and to a classified `ColumnOidMismatch` on a differing
+    /// type — never a raw `0A000`.
+    #[tokio::test]
+    #[ignore = "requires local PG"]
+    async fn result_type_change_self_heals_or_classifies() {
+        // Case 1: a text-family shift (text -> varchar) still matches OgTag (text 25).
+        let mut c = Connection::connect(&config()).await.expect("connect");
+        c.simple_query("CREATE TEMP TABLE oidguard (tag text NOT NULL)")
+            .await
+            .expect("temp shadow");
+        c.simple_query("INSERT INTO oidguard (tag) VALUES ('hello')")
+            .await
+            .expect("insert");
+        assert_eq!(c.query_one::<OgTag>(()).await.expect("first records").tag, "hello");
+        c.simple_query("ALTER TABLE oidguard ALTER COLUMN tag TYPE varchar")
+            .await
+            .expect("alter text -> varchar");
+        let healed = c
+            .query_one::<OgTag>(())
+            .await
+            .expect("0A000 self-heals to correct rows on a text-family match");
+        assert_eq!(healed.tag, "hello", "the self-healed query returns the correct value");
+        assert!(c.is_healthy(), "connection healthy after the self-heal");
+        c.close().await.expect("close");
+
+        // Case 2: a DIFFERING type (text -> int4) is a classified ColumnOidMismatch.
+        let mut c = Connection::connect(&config()).await.expect("connect");
+        c.simple_query("CREATE TEMP TABLE oidguard (tag text NOT NULL)")
+            .await
+            .expect("temp shadow");
+        c.simple_query("INSERT INTO oidguard (tag) VALUES ('42')")
+            .await
+            .expect("insert");
+        assert_eq!(c.query_one::<OgTag>(()).await.expect("first records").tag, "42");
+        c.simple_query("ALTER TABLE oidguard ALTER COLUMN tag TYPE int4 USING tag::int4")
+            .await
+            .expect("alter text -> int4");
+        match c.query_one::<OgTag>(()).await {
+            Err(DriverError::Decode(DecodeError::ColumnOidMismatch { index, expected, found })) => {
+                assert_eq!(index, 0, "the diverging column is result column 0");
+                assert_eq!(expected, OID_TEXT, "OgTag expects text (25)");
+                assert_eq!(found, OID_INT4, "the ALTERed column is int4 (23)");
+            }
+            other => panic!("a differing result type must self-heal to a classified ColumnOidMismatch, got {other:?}"),
+        }
+        assert!(c.is_healthy(), "connection recovers after the classified drift");
+        c.close().await.expect("close");
     }
 }

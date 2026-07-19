@@ -780,6 +780,19 @@ impl ConnectConfig {
     ///
     /// Chainable and order-preserving; setting the same parameter twice sends
     /// it twice (PostgreSQL applies the last).
+    ///
+    /// # Connection poolers (pgbouncer transaction pooling)
+    ///
+    /// A startup-packet GUC is SESSION state: it persists for the life of the
+    /// server session, which requires a DIRECT connection or a SESSION-level pool
+    /// (bsql's own driver `Pool`, or pgbouncer in `session` mode). Under
+    /// pgbouncer TRANSACTION pooling the client `StartupMessage` is consumed by the
+    /// pooler and never reaches the per-transaction backend (which the pooler may
+    /// reassign each transaction), so a connect-time GUC does NOT persist there — a
+    /// documented pgbouncer limitation, not a bsql behaviour. If you deploy behind
+    /// transaction pooling, do not rely on a connect-time `search_path` /
+    /// `statement_timeout` / `timezone`: qualify object names (`schema.table`), set
+    /// the GUC per statement, or use session-level pooling.
     #[must_use]
     pub fn with_startup_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.startup_params.push((name.into(), value.into()));
@@ -794,6 +807,11 @@ impl ConnectConfig {
     /// query, and it becomes the session's reset value — surviving a pooled
     /// connection's `RESET ALL` on checkout, so a pooled connection cannot
     /// silently escape its schema.
+    ///
+    /// Being a startup-packet GUC, it needs a direct connection or SESSION-level
+    /// pooling — under pgbouncer TRANSACTION pooling it does NOT persist (qualify
+    /// object names or set it per statement instead); see
+    /// [`with_startup_param`](Self::with_startup_param).
     #[must_use]
     pub fn with_search_path(self, search_path: impl Into<String>) -> Self {
         self.with_startup_param("search_path", search_path)
@@ -822,6 +840,11 @@ impl ConnectConfig {
     /// before the FIRST query, and — as a startup-packet GUC — becomes the
     /// session's reset value, so it SURVIVES a pooled connection's `RESET ALL` on
     /// checkout (the guardrail persists across checkouts).
+    ///
+    /// Being a startup-packet GUC, it needs a direct connection or SESSION-level
+    /// pooling — under pgbouncer TRANSACTION pooling it does NOT persist, so set
+    /// `statement_timeout` per statement there instead; see
+    /// [`with_startup_param`](Self::with_startup_param).
     ///
     /// # Duration mapping
     ///

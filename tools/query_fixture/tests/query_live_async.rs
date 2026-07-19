@@ -488,25 +488,30 @@ async fn same_carrier_across_many_transactions_succeeds() {
     c.close().await.expect("close");
 }
 
-/// DISCARD ALL self-heal: a dropped recorded statement makes the next reuse error
-/// ONCE (loud, connection healthy); the call after that re-creates it and succeeds.
+/// TYPED cache self-heal — pgbouncer transaction-pooling parity (the `26000`
+/// vanished-statement path), the async twin of the sync
+/// `typed_cache_self_heals_a_vanished_server_statement`. A recorded typed
+/// statement dropped out of band (`DISCARD ALL` = a transaction-pooling backend
+/// reassignment) makes the next typed reuse a bare `Bind` to a vanished statement
+/// (`26000`), which now SELF-HEALS TRANSPARENTLY (evict + MISS re-run) instead of
+/// surfacing the `26000`. RED without the self-heal arm: the reuse is
+/// `Err(DriverError::Db(26000))`.
 #[tokio::test]
 #[ignore = "requires local PG"]
-async fn discard_all_then_reuse_errors_once_then_self_heals() {
+async fn typed_cache_self_heals_a_vanished_server_statement() {
     let mut c = Connection::connect(&async_config()).await.expect("connect");
     assert_eq!(c.query::<HealLit>(()).await.expect("first use records").len(), 1);
     c.execute_raw("DISCARD ALL").await.expect("discard all");
-    let poisoned = c.query::<HealLit>(()).await;
-    assert!(
-        matches!(poisoned, Err(DriverError::Db(_))),
-        "reuse over a dropped statement must be a loud Db error, got {poisoned:?}"
-    );
-    assert!(c.is_healthy(), "connection stays healthy (recoverable error)");
+    // The next typed reuse transparently self-heals — no `26000` surfaces.
     let healed = c
         .query::<HealLit>(())
         .await
-        .expect("self-heal: the next use re-creates the statement and succeeds");
-    assert_eq!(healed.len(), 1);
+        .expect("typed reuse over a vanished statement self-heals transparently (no 26000)");
+    assert_eq!(healed.len(), 1, "the self-healed query returns the rows");
+    let rec = healed.iter().next().expect("row").expect("decodes");
+    assert_eq!(rec.n, 33, "the transparently self-healed query returns the correct value");
+    assert!(c.is_healthy(), "connection stays healthy");
+    assert_eq!(c.query::<HealLit>(()).await.expect("keeps working after the self-heal").len(), 1);
     c.close().await.expect("close");
 }
 

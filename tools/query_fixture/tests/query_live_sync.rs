@@ -943,30 +943,39 @@ fn big_params_stream_past_the_old_bind_cap() {
     c.close().expect("close");
 }
 
-/// DISCARD ALL self-heal: after a recorded statement is dropped out of band, the
-/// next reuse errors ONCE (loud, classified) and the connection stays healthy;
-/// the call after that re-creates the statement (cache MISS -> Close+Parse) and
-/// succeeds — a self-heal, never a persistent poison.
+/// TYPED cache self-heal — pgbouncer transaction-pooling parity (the `26000`
+/// vanished-statement path). A recorded typed statement dropped out of band
+/// (`DISCARD ALL` simulates a transaction-pooling backend reassignment, where the
+/// per-transaction server connection is a DIFFERENT backend that never saw the
+/// `Parse`) makes the NEXT typed reuse a bare `Bind` to a statement the server
+/// lacks — `26000` `invalid_sql_statement_name`. It now SELF-HEALS TRANSPARENTLY:
+/// the driver evicts the stale plan and re-runs on the forced MISS path, so the
+/// caller sees ONLY the correct rows — NEVER the `26000` (before this fix the
+/// TYPED path surfaced it, while the DYNAMIC path already self-healed; this closes
+/// that asymmetry). The RED proof: without the self-heal arm this second typed
+/// call is `Err(DriverError::Db(26000))` (it was, before the fix).
 #[test]
 #[ignore = "requires local PG"]
-fn discard_all_then_reuse_errors_once_then_self_heals() {
+fn typed_cache_self_heals_a_vanished_server_statement() {
     let mut c = Connection::connect(&sync_config()).expect("connect");
-    // Record the statement (autocommit MISS completes at Idle -> recorded).
+    // Record the statement (autocommit MISS completes at Idle -> recorded), then a
+    // HIT-eligible reuse.
     assert_eq!(c.query::<HealLit>(()).expect("first use records").len(), 1);
-    // Drop ALL prepared statements out of band (a non-row command).
+    // Drop ALL prepared statements out of band — the SAME server state a pgbouncer
+    // transaction-pooling reassignment produces (the cached plan is gone).
     c.execute_raw("DISCARD ALL").expect("discard all");
-    // The next reuse hits the now-missing statement: ONE loud classified error.
-    let poisoned = c.query::<HealLit>(());
-    assert!(
-        matches!(poisoned, Err(DriverError::Db(_))),
-        "reuse over a dropped statement must be a loud Db error, got {poisoned:?}"
-    );
-    assert!(c.is_healthy(), "connection stays healthy (recoverable error)");
-    // The call AFTER that is a MISS (the name was evicted) -> re-created -> works.
+    // The next typed reuse HITs the client cache (bare Bind) → the server has no
+    // such statement (`26000`) → the driver TRANSPARENTLY re-runs on the MISS path
+    // and returns the CORRECT rows. No `26000` surfaces (the fix).
     let healed = c
         .query::<HealLit>(())
-        .expect("self-heal: the next use re-creates the statement and succeeds");
-    assert_eq!(healed.len(), 1);
+        .expect("typed reuse over a vanished statement self-heals transparently (no 26000)");
+    assert_eq!(healed.len(), 1, "the self-healed query returns the rows");
+    let rec = healed.iter().next().expect("row").expect("decodes");
+    assert_eq!(rec.n, 33, "the transparently self-healed query returns the correct value");
+    assert!(c.is_healthy(), "connection stays healthy");
+    // The re-Parse re-recorded the statement, so it keeps working.
+    assert_eq!(c.query::<HealLit>(()).expect("keeps working after the self-heal").len(), 1);
     c.close().expect("close");
 }
 

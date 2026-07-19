@@ -324,11 +324,11 @@ fn handshake_budget_pinned_and_cache_hit_is_zero_alloc() {
     // grows the send buffer once and records the statement, so the measured HIT
     // runs entirely on warm buffers. ----
     let live = match poll_once(engine.query_params(live, &DEMO_QUERY, (0,), no_op_sink)) {
-        Ok(Ok(Outcome { live, .. })) => live,
+        Ok((Ok(Outcome { live, .. }), _)) => live,
         other => panic!("priming MISS must complete, got {other:?}"),
     };
     let live = match poll_once(engine.query_params(live, &DEMO_QUERY, (0,), no_op_sink)) {
-        Ok(Ok(Outcome { live, .. })) => live,
+        Ok((Ok(Outcome { live, .. }), _)) => live,
         other => panic!("warm-up HIT must complete, got {other:?}"),
     };
 
@@ -337,7 +337,7 @@ fn handshake_budget_pinned_and_cache_hit_is_zero_alloc() {
     let outcome = poll_once(engine.query_params(live, &DEMO_QUERY, (0,), no_op_sink));
     let hit_allocs = ALLOC.snapshot().delta(before).allocs;
     match outcome {
-        Ok(Ok(Outcome { live, .. })) => {
+        Ok((Ok(Outcome { live, .. }), _)) => {
             let _ = live;
         }
         other => panic!("measured HIT must complete, got {other:?}"),

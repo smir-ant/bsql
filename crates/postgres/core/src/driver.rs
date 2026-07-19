@@ -1993,6 +1993,63 @@ impl<S: Transport<Error = io::Error>> Core<S> {
 
     // ── Compile-checked typed verbs (the `query!` flagship) ─────────────────
 
+    /// TYPED prepared-statement cache self-heal decision — the compile-checked
+    /// peer of the dynamic [`query_params_inner`](Self::query_params_inner) /
+    /// [`execute_params_inner`](Self::execute_params_inner) self-heal.
+    ///
+    /// A TYPED cache HIT runs a BARE `Bind`+`Execute` over a server-side plan this
+    /// connection recorded (no `Describe`). If that statement VANISHED — `26000`
+    /// `invalid_sql_statement_name`: a pgbouncer TRANSACTION-pooling connection
+    /// reassigned the server backend, or an out-of-band `DEALLOCATE ALL` /
+    /// `DISCARD ALL` dropped it — or its result type CHANGED — `0A000`
+    /// `cached plan must not change result type`: an out-of-band
+    /// `ALTER TABLE … ALTER COLUMN … TYPE` — the bare `Bind` fails with a stale-plan
+    /// SQLSTATE. PostgreSQL raises BOTH before producing any `DataRow` (a `26000`
+    /// rejects the `Bind`; a `0A000` revalidates the cached plan up front), so NO
+    /// partial row reached the caller. The engine's `settle_statement_cache`
+    /// ALREADY EVICTED the statement on that HIT server-error, and the verb drained
+    /// the connection to a clean idle, so a RE-RUN is a forced cache MISS
+    /// (`Close`+`Parse`+`Describe`+`Bind`+`Execute`) that re-creates the
+    /// server-side statement, re-arms the RESULT-OID guard, and returns the correct
+    /// rows — the caller never sees the driver-internal staleness (pgbouncer
+    /// transaction-pooling parity with the dynamic path).
+    ///
+    /// Returns `true` (and emits the `PreparedCacheSelfHeal` diagnostic, symmetric
+    /// with the dynamic path) IFF `result` is one of the two stale-CACHED-plan
+    /// SQLSTATEs. This is NOT fallback error-masking: on the typed REUSE path those
+    /// two codes can arise ONLY from a stale cached plan — a genuine `0A000` /
+    /// `26000` would have failed the query's FIRST, uncached MISS sighting (which
+    /// sends a `Describe`) and so would never have been cached — and EVERY other
+    /// error (a constraint violation, a real
+    /// [`ColumnOidMismatch`](bsql_postgres_proto::DecodeError::ColumnOidMismatch)
+    /// from a MISS's `Describe`, a disconnect) surfaces UNCHANGED. The re-run is a
+    /// MISS that cannot itself be stale, so exactly ONE retry suffices (no loop) —
+    /// a second stale error would be a genuine anomaly and surfaces.
+    ///
+    /// HONEST NOTE (transaction scope, parity with the dynamic path): the stale
+    /// error is transparently healed only in AUTOCOMMIT. Inside an EXPLICIT
+    /// `transaction` guard the first attempt's `26000`/`0A000` already ABORTED the
+    /// transaction, so the MISS re-run runs against an aborted transaction and
+    /// surfaces `25P02` (`in_failed_sql_transaction`) instead — the transaction
+    /// fails and its owner rolls back (the engine EVICTED the statement, so the next
+    /// operation after the rollback re-`Parse`s cleanly). This matches
+    /// [`query_params_inner`](Self::query_params_inner) exactly — the self-heal never
+    /// clears a caller's aborted transaction.
+    fn typed_plan_went_stale<T>(
+        &self,
+        result: &Result<T, DriverError>,
+        sql: &'static str,
+    ) -> bool {
+        match result {
+            Err(e) if e.is_stale_prepared_plan() => {
+                self.diag
+                    .emit(&crate::diag::DiagEvent::PreparedCacheSelfHeal { sql });
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Execute a compile-checked `query!` query for its side effect, returning
     /// the affected-row count (binary-uniform params).
     ///
@@ -2006,6 +2063,11 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// Under `n1-detect` the `caller` the driver captured at the USER call site is
     /// recorded against the query for N+1 detection (diagnostics-only — the
     /// recording never alters the result).
+    ///
+    /// A stale/changed cached plan (a pgbouncer transaction-pooling reassignment,
+    /// an out-of-band `DEALLOCATE`, a result-type change) self-heals
+    /// TRANSPARENTLY via one MISS re-run — see
+    /// [`typed_plan_went_stale`](Self::typed_plan_went_stale).
     pub async fn execute<'p, Q: TypedQuery>(
         &mut self,
         params: Q::Params<'p>,
@@ -2014,12 +2076,50 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::PREPARED.sql(), caller);
         let mut slow = self.armed_slow_guard(Q::PREPARED.sql());
-        let live = self.begin_command().await?;
+        // First attempt; on a stale cached plan (26000 / 0A000 from a cache HIT)
+        // re-run ONCE on the forced MISS path — the engine already evicted the
+        // statement, so the re-run re-creates it. Parity with the dynamic
+        // `execute_params_inner`. The slow-query guard times the WHOLE logical op.
+        // `execute_once` OWNS `params` (held across its awaits ⇒ only `Send`, never
+        // `Sync`) and hands it back so this wrapper can re-run WITHOUT a `Clone`
+        // bound; on the non-stale path `params` is dropped at scope exit (used on
+        // the retry path, so never an unused binding).
+        let (mut result, params) = self.execute_once::<Q>(params).await;
+        if self.typed_plan_went_stale(&result, Q::PREPARED.sql()) {
+            result = self.execute_once::<Q>(params).await.0;
+        }
+        Self::commit_slow(&mut slow, &result);
+        result
+    }
+
+    /// One attempt of [`execute`](Self::execute) — the extracted body the
+    /// self-heal wrapper runs once, then re-runs on a stale cached plan. OWNS
+    /// `params` and RETURNS it (with the result) so the wrapper can retry without a
+    /// `Clone` bound: `params` is held BY VALUE across the awaits (so the verb's
+    /// future stays `Send` given only `Params: Send`, never `Sync` — a borrowed
+    /// `&Params` held across an `.await` would demand `Params: Sync`, which the
+    /// async driver's `_is_send` proof forbids). The engine's `query_params`
+    /// consumes `params` (staging only borrows it) and hands it back, so this
+    /// attempt threads it out. `begin_command` and `arm_scope` stay co-located
+    /// (drop-recovery safety is unchanged).
+    async fn execute_once<'p, Q: TypedQuery>(
+        &mut self,
+        params: Q::Params<'p>,
+    ) -> (Result<u64, DriverError>, Q::Params<'p>) {
+        let live = match self.begin_command().await {
+            Ok(live) => live,
+            // A dead connection before any wire I/O: hand `params` back unused (the
+            // caller will not retry a non-stale error).
+            Err(e) => return (Err(e), params),
+        };
         let scope = self.arm_scope(DIRTY_DRAIN);
-        let result = async move {
+        let (result, params) = async move {
             let this = self;
             let mut collector = ResultCollector::new();
-            let outcome = this
+            // The engine consumes `params` and hands it back so this attempt can
+            // return it for the self-heal retry (see `execute_once` / the engine's
+            // `query_params` `args` note).
+            let (outcome, params) = this
                 .engine
                 .query_params(
                     live,
@@ -2031,7 +2131,6 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                     }),
                 )
                 .await;
-            this.settle(outcome, &mut collector)?;
             // Same RESULT-schema guard `query`/`query_collect` runs: a typed cache
             // MISS appended a `Describe`(portal), so fail loud if the fresh Parse's
             // RowDescription revealed a runtime column type diverging from the
@@ -2039,18 +2138,29 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             // into the next verb's guard (the old `execute<P, R>` armed the guard
             // via `query_params` but never drained it). A drift the caller's
             // RETURNING model no longer matches is a classified `DriverError::Decode`,
-            // never a silent success.
-            this.take_typed_schema_error()?;
-            Ok(collector.affected())
+            // never a silent success. Computed WITHOUT `?` so `params` is threaded
+            // back on every path.
+            let r = match this.settle(outcome, &mut collector) {
+                Ok(()) => match this.take_typed_schema_error() {
+                    Ok(()) => Ok(collector.affected()),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            };
+            (r, params)
         }
         .await;
         scope.disarm();
-        Self::commit_slow(&mut slow, &result);
-        result
+        (result, params)
     }
 
     /// Run a compile-checked `query!` and collect its TYPED rows — the flagship
     /// parameterised query. Under `n1-detect` records the USER call site.
+    ///
+    /// A stale/changed cached plan (a pgbouncer transaction-pooling reassignment,
+    /// an out-of-band `DEALLOCATE`, a result-type change) self-heals
+    /// TRANSPARENTLY via one MISS re-run — see
+    /// [`typed_plan_went_stale`](Self::typed_plan_went_stale).
     pub async fn query<'p, Q: TypedQuery>(
         &mut self,
         params: Q::Params<'p>,
@@ -2062,7 +2172,16 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         // dynamic verbs): time the whole op, commit only on Ok, report the const
         // SQL (never the params — no PII).
         let mut slow = self.armed_slow_guard(Q::PREPARED.sql());
-        let result = self.query_collect::<Q>(params).await;
+        // First attempt; on a stale cached plan (26000 / 0A000 from a HIT) re-run
+        // ONCE on the forced MISS path (the engine already evicted the statement) —
+        // parity with the dynamic `query_params_inner`. `query_collect` OWNS
+        // `params` and hands it back so the retry needs no `Clone` bound (see
+        // `execute` for the `Send`-not-`Sync` rationale); the non-stale path drops
+        // it at scope exit.
+        let (mut result, params) = self.query_collect::<Q>(params).await;
+        if self.typed_plan_went_stale(&result, Q::PREPARED.sql()) {
+            result = self.query_collect::<Q>(params).await.0;
+        }
         Self::commit_slow(&mut slow, &result);
         result
     }
@@ -2074,16 +2193,24 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// Records nothing — the N+1 hook fires exactly once in the public verb that
     /// called this. ([`query_one`](Self::query_one) does NOT route through here:
     /// it decodes its single row directly off the wire, with no prebuffer.)
+    ///
+    /// OWNS `params` and RETURNS it (with the result) so [`query`](Self::query) can
+    /// self-heal retry without a `Clone` bound (see
+    /// [`execute_once`](Self::execute_once) for the `Send`-not-`Sync` rationale).
     async fn query_collect<'p, Q: TypedQuery>(
         &mut self,
         params: Q::Params<'p>,
-    ) -> Result<Rows<Q>, DriverError> {
-        let live = self.begin_command().await?;
+    ) -> (Result<Rows<Q>, DriverError>, Q::Params<'p>) {
+        let live = match self.begin_command().await {
+            Ok(live) => live,
+            Err(e) => return (Err(e), params),
+        };
         let scope = self.arm_scope(DIRTY_DRAIN);
-        let out = async move {
+        let (out, params) = async move {
             let this = self;
             let mut builder = RowsBuilder::new();
-            let outcome = this
+            // The engine consumes `params` and hands it back (see `execute_once`).
+            let (outcome, params) = this
                 .engine
                 .query_params(
                     live,
@@ -2095,19 +2222,25 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                     }),
                 )
                 .await;
-            this.settle(outcome, &mut builder)?;
             // The connection is now idle + pooled. Fail loud if the fresh Parse's
             // RowDescription revealed a runtime column type diverging from the
             // migration schema (the guard drained the result, so `builder` is empty).
-            this.take_typed_schema_error()?;
             // An oversize row was reassembled into the prebuffer's `wire` by
             // `RowsBuilder::feed` and is just another contiguous span, so it decodes
-            // exactly like an inline row — no cap.
-            Ok(builder.finish::<Q>())
+            // exactly like an inline row — no cap. Computed WITHOUT `?` so `params`
+            // is threaded back on every path.
+            let r = match this.settle(outcome, &mut builder) {
+                Ok(()) => match this.take_typed_schema_error() {
+                    Ok(()) => Ok(builder.finish::<Q>()),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            };
+            (r, params)
         }
         .await;
         scope.disarm();
-        out
+        (out, params)
     }
 
     /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
@@ -2161,12 +2294,35 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         result
     }
 
-    /// The shared zero-or-one decode-direct body behind
+    /// The shared zero-or-one body behind [`query_one`](Self::query_one) and
+    /// [`query_opt`](Self::query_opt), with the stale-plan self-heal: run
+    /// [`query_at_most_one_once`](Self::query_at_most_one_once), and on a stale
+    /// cached plan (`26000` / `0A000` from a cache HIT — the engine already evicted
+    /// the statement) re-run ONCE on the forced MISS path. Parity with the dynamic
+    /// path; see [`typed_plan_went_stale`](Self::typed_plan_went_stale). OWNS
+    /// `params` (the once-body hands it back) so the retry needs no `Clone` bound
+    /// (see [`execute_once`](Self::execute_once) for the `Send`-not-`Sync`
+    /// rationale); the non-stale path drops it at scope exit.
+    async fn query_at_most_one<'p, Q: TypedQuery>(
+        &mut self,
+        params: Q::Params<'p>,
+    ) -> Result<Option<Q::Owned>, DriverError> {
+        let (mut result, params) = self.query_at_most_one_once::<Q>(params).await;
+        if self.typed_plan_went_stale(&result, Q::PREPARED.sql()) {
+            result = self.query_at_most_one_once::<Q>(params).await.0;
+        }
+        result
+    }
+
+    /// One attempt of the zero-or-one decode-direct read behind
     /// [`query_one`](Self::query_one) and [`query_opt`](Self::query_opt): stream a
     /// compile-checked `query!` and return `Some(owned)` for exactly one row,
     /// `Ok(None)` for zero rows, or [`TooManyRows`](DriverError::TooManyRows) for
     /// two or more. Records NOTHING — the N+1 hook fires once in whichever public
-    /// verb called this.
+    /// verb called this. Wrapped by [`query_at_most_one`](Self::query_at_most_one)
+    /// for the stale-plan self-heal; OWNS `params` and RETURNS it so the wrapper
+    /// can retry (see [`execute_once`](Self::execute_once) for the `Send`-not-`Sync`
+    /// rationale).
     ///
     /// Decodes the single expected row DIRECTLY into its owned twin off the wire,
     /// with NO intermediate prebuffer: the [`query`](Self::query) collect path
@@ -2191,13 +2347,16 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// second row is still awaited); a lone malformed row is
     /// [`Decode`](DriverError::Decode); zero rows is `Ok(None)` (mapped to
     /// [`NoRows`](DriverError::NoRows) only by [`query_one`](Self::query_one)).
-    async fn query_at_most_one<'p, Q: TypedQuery>(
+    async fn query_at_most_one_once<'p, Q: TypedQuery>(
         &mut self,
         params: Q::Params<'p>,
-    ) -> Result<Option<Q::Owned>, DriverError> {
-        let live = self.begin_command().await?;
+    ) -> (Result<Option<Q::Owned>, DriverError>, Q::Params<'p>) {
+        let live = match self.begin_command().await {
+            Ok(live) => live,
+            Err(e) => return (Err(e), params),
+        };
         let scope = self.arm_scope(DIRTY_DRAIN);
-        let out = async move {
+        let (out, params) = async move {
         let this = self;
         // The single decoded row (owned, so it outlives the pump), plus the
         // read-after-settle flags the streaming sink parks.
@@ -2209,7 +2368,8 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         // UNALLOCATED for the common small single-row case (no chunk ever
         // arrives), so the zero-prebuffer fast path is unchanged.
         let mut oversize_scratch: Vec<u8> = Vec::new();
-        let outcome = this
+        // The engine consumes `params` and hands it back (see `execute_once`).
+        let (outcome, params) = this
             .engine
             .query_params_break(
                 live,
@@ -2269,54 +2429,62 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             )
             .await;
 
-        let (live, boundary) = match outcome {
-            Ok(Outcome { live, status }) => (live, status),
-            Err(other) => return Err(lift_engine_error(other)),
+        // Computed WITHOUT `?`/`return` so `params` is threaded back on every path.
+        let out: Result<Option<Q::Owned>, DriverError> = match outcome {
+            // Fatal: the verb consumed the token, no drain to do.
+            Err(other) => Err(lift_engine_error(other)),
+            Ok(Outcome { live, status }) => match status {
+                Boundary::Idle => {
+                    // Streamed to a clean idle — token restored, no drain needed.
+                    this.live = Some(live);
+                    // A typed result-schema mismatch (caught at the fresh Parse's
+                    // RowDescription) drained the rows before any reached the sink,
+                    // so it dominates the (empty) row/decode outcome — fail loud
+                    // rather than return `Ok(None)`.
+                    match this.take_typed_schema_error() {
+                        Err(e) => Err(e),
+                        Ok(()) => match (row, decode_err) {
+                            (Some(owned), _) => Ok(Some(owned)),
+                            (None, Some(de)) => Err(DriverError::Decode(de)),
+                            // Zero rows: `Ok(None)`. `query_one` maps this to
+                            // `NoRows`; `query_opt` returns it verbatim.
+                            (None, None) => Ok(None),
+                        },
+                    }
+                }
+                Boundary::Failed => {
+                    // Server error: drain the recovering `ReadyForQuery`, then
+                    // surface the parsed cause. Connection stays alive + pooled.
+                    match this.drain_to_idle(live).await {
+                        Err(e) => Err(e),
+                        Ok(()) => match db_error {
+                            Some(db) => Err(DriverError::Db(Box::new(db))),
+                            None => Err(DriverError::UnclassifiedFailure),
+                        },
+                    }
+                }
+                Boundary::Stopped(()) => {
+                    // Broke on the second row (inline or the first chunk of a second
+                    // oversize row): drain to reclaim, then classify as too-many.
+                    match this.drain_to_idle(live).await {
+                        Err(e) => Err(e),
+                        Ok(()) => Err(DriverError::TooManyRows),
+                    }
+                }
+                // `query_params_break` maps Closed/Suspended to a fatal `Err`, so
+                // they never ride an `Ok` outcome; `Boundary` is `#[non_exhaustive]`,
+                // so this classified arm also covers any future boundary. The token
+                // is dropped (not restored), leaving the connection dead + evictable.
+                _ => Err(DriverError::Io(io::Error::other(
+                    "unexpected protocol boundary from a single-row query",
+                ))),
+            },
         };
-        match boundary {
-            Boundary::Idle => {
-                // Streamed to a clean idle — token restored, no drain needed.
-                this.live = Some(live);
-                // A typed result-schema mismatch (caught at the fresh Parse's
-                // RowDescription) drained the rows before any reached the sink, so
-                // it dominates the (empty) row/decode outcome — fail loud rather
-                // than return `Ok(None)`.
-                this.take_typed_schema_error()?;
-                match (row, decode_err) {
-                    (Some(owned), _) => Ok(Some(owned)),
-                    (None, Some(de)) => Err(DriverError::Decode(de)),
-                    // Zero rows: `Ok(None)`. `query_one` maps this to `NoRows`;
-                    // `query_opt` returns it verbatim.
-                    (None, None) => Ok(None),
-                }
-            }
-            Boundary::Failed => {
-                // Server error: drain the recovering `ReadyForQuery`, then surface
-                // the parsed cause. Connection stays alive + pooled.
-                this.drain_to_idle(live).await?;
-                match db_error {
-                    Some(db) => Err(DriverError::Db(Box::new(db))),
-                    None => Err(DriverError::UnclassifiedFailure),
-                }
-            }
-            Boundary::Stopped(()) => {
-                // Broke on the second row (inline or the first chunk of a second
-                // oversize row): drain to reclaim, then classify as too-many.
-                this.drain_to_idle(live).await?;
-                Err(DriverError::TooManyRows)
-            }
-            // `query_params_break` maps Closed/Suspended to a fatal `Err`, so they
-            // never ride an `Ok` outcome; `Boundary` is `#[non_exhaustive]`, so
-            // this classified arm also covers any future boundary. The token is
-            // dropped (not restored), leaving the connection dead + evictable.
-            _ => Err(DriverError::Io(io::Error::other(
-                "unexpected protocol boundary from a single-row query",
-            ))),
-        }
+        (out, params)
         }
         .await;
         scope.disarm();
-        out
+        (out, params)
     }
 
     /// Stream a compile-checked `query!`'s rows one at a time to `on_row` in
@@ -2325,6 +2493,15 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     ///
     /// See each driver's `query_each` for the full contract (return values,
     /// early-abort cost, decode/oversize/server-error handling).
+    ///
+    /// A stale/changed cached plan (a pgbouncer transaction-pooling reassignment,
+    /// an out-of-band `DEALLOCATE`, a result-type change) self-heals TRANSPARENTLY
+    /// via one MISS re-run. This is SAFE for a streaming verb because a stale-plan
+    /// SQLSTATE (`26000` / `0A000`) on a cache HIT arrives BEFORE any `DataRow`
+    /// (PostgreSQL rejects the bare `Bind` / revalidates the plan up front), so NO
+    /// row reached `on_row` on the failed attempt — the same `on_row` is re-run on
+    /// the forced MISS path. See
+    /// [`typed_plan_went_stale`](Self::typed_plan_went_stale).
     pub async fn query_each<'p, Q, F, E>(
         &mut self,
         params: Q::Params<'p>,
@@ -2337,9 +2514,39 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::PREPARED.sql(), caller);
-        let live = self.begin_command().await?;
+        // First attempt; on a stale cached plan re-run ONCE on the forced MISS path
+        // (see the verb doc — no row reached `on_row` before the stale SQLSTATE).
+        // `query_each_once` OWNS `params` and hands it back (borrowing `&mut on_row`
+        // across both attempts), so the retry needs no `Clone` bound (see
+        // `execute_once` for the `Send`-not-`Sync` rationale).
+        let (mut result, params) = self.query_each_once::<Q, F, E>(params, &mut on_row).await;
+        if self.typed_plan_went_stale(&result, Q::PREPARED.sql()) {
+            result = self.query_each_once::<Q, F, E>(params, &mut on_row).await.0;
+        }
+        result
+    }
+
+    /// One attempt of [`query_each`](Self::query_each) — the extracted stream body
+    /// the self-heal wrapper runs once, then re-runs on a stale cached plan. OWNS
+    /// `params` and RETURNS it (borrowing `&mut on_row`) so the wrapper can retry
+    /// without a `Clone` bound (a stale SQLSTATE precedes any row, so the same
+    /// `on_row` is reusable; see [`execute_once`](Self::execute_once) for the
+    /// `Send`-not-`Sync` rationale).
+    async fn query_each_once<'p, Q, F, E>(
+        &mut self,
+        params: Q::Params<'p>,
+        on_row: &mut F,
+    ) -> (Result<Option<E>, DriverError>, Q::Params<'p>)
+    where
+        Q: TypedQuery,
+        F: for<'q> FnMut(Q::Record<'q>) -> ControlFlow<E>,
+    {
+        let live = match self.begin_command().await {
+            Ok(live) => live,
+            Err(e) => return (Err(e), params),
+        };
         let scope = self.arm_scope(DIRTY_DRAIN);
-        let stream_result = async move {
+        let (stream_result, params) = async move {
         let this = self;
         // Captured across the streaming sink; read after the verb settles.
         let mut db_error: Option<DbError> = None;
@@ -2348,7 +2555,8 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         // — bounded by the widest oversize row, not the whole result. Stays
         // unallocated while every row fits one buffer fill.
         let mut oversize_scratch: Vec<u8> = Vec::new();
-        let outcome = this
+        // The engine consumes `params` and hands it back (see `execute_once`).
+        let (outcome, params) = this
             .engine
             .query_params_break(
                 live,
@@ -2402,18 +2610,21 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 }),
             )
             .await;
-        let out = this.finish_stream(outcome, db_error).await?;
         // Fail loud if the fresh Parse's RowDescription revealed a runtime column
         // type diverging from the migration schema: the guard drained the rows
         // before any reached `on_row`, so `out` is `None` (no garbage row was
         // yielded) and the mismatch dominates. Checked HERE (not in the shared
         // `finish_stream`) because the carrier `Q` recovers the expected OID.
-        this.take_typed_schema_error()?;
-        Ok(out)
+        // Computed WITHOUT `?` so `params` is threaded back on every path.
+        let result = match this.finish_stream(outcome, db_error).await {
+            Ok(out) => this.take_typed_schema_error().map(|()| out),
+            Err(e) => Err(e),
+        };
+        (result, params)
         }
         .await;
         scope.disarm();
-        stream_result
+        (stream_result, params)
     }
 
     /// The shared post-pump settle for EVERY streaming verb (typed

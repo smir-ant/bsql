@@ -1165,7 +1165,8 @@ fn drive_verb_step<'b>(
         ClientRequest::SimpleQuery(sql) => flatten_verb(poll_once(engine.simple_query(live, sql, sink))),
         ClientRequest::Ping => flatten_verb(poll_once(engine.ping(live, sink))),
         ClientRequest::ExecutePreparedDemo(id) => {
-            flatten_verb(poll_once(engine.query_params(live, &Q_DEMO_VERB, (*id,), sink)))
+            // `query_params` now hands `args` back (self-heal support); drop it.
+            flatten_verb(poll_once(engine.query_params(live, &Q_DEMO_VERB, (*id,), sink)).map(|(r, _)| r))
         }
         // `run_verb` filters to the three kinds above; the rest are unreachable
         // here. Return the token untouched (a clean completion) rather than

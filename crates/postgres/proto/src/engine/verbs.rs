@@ -1237,13 +1237,25 @@ impl<'b, T: Transport> Engine<'b, T> {
     /// # Errors
     ///
     /// As [`query_prepared`](Self::query_prepared).
+    ///
+    /// # `args` is consumed and RETURNED
+    ///
+    /// `args` is taken BY VALUE and HANDED BACK alongside the result (the second
+    /// tuple element), on every path — Ok, server-error, and fatal. Staging only
+    /// BORROWS `args` (`stage_compiled_query`), so returning it is free. This lets a
+    /// caller re-run the SAME parameters (the typed statement-cache SELF-HEAL: a
+    /// vanished/changed cached plan `26000`/`0A000` re-runs on the forced MISS path)
+    /// WITHOUT a `Clone` bound, while `args` stays OWNED across the await — so the
+    /// verb's future is `Send` whenever `P: Send` (a borrowed `&P` held across the
+    /// await would instead demand `P: Sync`, which the async driver's `_is_send`
+    /// proof forbids).
     pub async fn query_params<P, R, S>(
         &mut self,
         live: Live<'b>,
         q: &PreparedQuery<P, R>,
         args: P,
         sink: S,
-    ) -> Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>
+    ) -> (Result<Outcome<'b, CommandStatus>, EngineError<T::Error>>, P)
     where
         P: ParamsWriter,
         R: RowDecode,
@@ -1255,9 +1267,19 @@ impl<'b, T: Transport> Engine<'b, T> {
             send_buf,
             ..
         } = self;
-        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        let reuse = stage_compiled_query(active, send_buf, q, &args)?;
-        let status = drive_to_outcome(active, transport, send_buf, sink).await?;
+        // Threaded WITHOUT `?` so `args` is handed back on every path (see doc).
+        let active = match phase.as_active_mut() {
+            Ok(active) => active,
+            Err(e) => return (Err(EngineError::WrongPhase(e)), args),
+        };
+        let reuse = match stage_compiled_query(active, send_buf, q, &args) {
+            Ok(reuse) => reuse,
+            Err(e) => return (Err(e), args),
+        };
+        let status = match drive_to_outcome(active, transport, send_buf, sink).await {
+            Ok(status) => status,
+            Err(e) => return (Err(e), args),
+        };
         settle_statement_cache(
             active,
             q,
@@ -1265,7 +1287,7 @@ impl<'b, T: Transport> Engine<'b, T> {
             matches!(status, CommandStatus::Completed),
             matches!(status, CommandStatus::ServerErrored),
         );
-        Ok(Outcome { live, status })
+        (Ok(Outcome { live, status }), args)
     }
 
     /// Run a compile-checked query with a BREAKABLE sink — the CONSTANT-MEMORY
@@ -1307,13 +1329,17 @@ impl<'b, T: Transport> Engine<'b, T> {
     ///   consumed.
     /// - As [`query_params`](Self::query_params) for the wire-building / transport
     ///   faults.
+    ///
+    /// `args` is consumed and HANDED BACK (the second tuple element) on every path,
+    /// exactly as [`query_params`](Self::query_params) — see its `args` note for the
+    /// self-heal + `Send`-not-`Sync` rationale.
     pub async fn query_params_break<P, R, S, B>(
         &mut self,
         live: Live<'b>,
         q: &PreparedQuery<P, R>,
         args: P,
         sink: S,
-    ) -> Result<Outcome<'b, Boundary<B>>, EngineError<T::Error>>
+    ) -> (Result<Outcome<'b, Boundary<B>>, EngineError<T::Error>>, P)
     where
         P: ParamsWriter,
         R: RowDecode,
@@ -1325,10 +1351,20 @@ impl<'b, T: Transport> Engine<'b, T> {
             send_buf,
             ..
         } = self;
-        let active = phase.as_active_mut().map_err(EngineError::WrongPhase)?;
-        let reuse = stage_compiled_query(active, send_buf, q, &args)?;
-        let boundary = pump_active_to_boundary(active, transport, send_buf, sink).await?;
-        match boundary {
+        // Threaded WITHOUT `?` so `args` is handed back on every path.
+        let active = match phase.as_active_mut() {
+            Ok(active) => active,
+            Err(e) => return (Err(EngineError::WrongPhase(e)), args),
+        };
+        let reuse = match stage_compiled_query(active, send_buf, q, &args) {
+            Ok(reuse) => reuse,
+            Err(e) => return (Err(e), args),
+        };
+        let boundary = match pump_active_to_boundary(active, transport, send_buf, sink).await {
+            Ok(boundary) => boundary,
+            Err(e) => return (Err(e), args),
+        };
+        let out = match boundary {
             Boundary::Idle => {
                 settle_statement_cache(active, q, reuse, true, false);
                 Ok(Outcome {
@@ -1360,7 +1396,8 @@ impl<'b, T: Transport> Engine<'b, T> {
                 core::hint::cold_path();
                 Err(EngineError::UnexpectedSuspend)
             }
-        }
+        };
+        (out, args)
     }
 
     /// Reclaim a connection left DIRTY by an early stop of

@@ -1078,9 +1078,43 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   state — a warm connection is all HITs): a HIT cannot silently mis-decode because
   PostgreSQL itself refuses to change a reused plan's result type
   (`ERROR: cached plan must not change result type`, SQLSTATE `0A000` — verified
-  live), so a result-type-changing DDL is fail-loud, and a temp shadow created after
-  the plan was recorded leaves it OID-pinned to the original table (correct rows) or
-  forces the `0A000`. **The dynamic-OID skip needs NO build/macro change:** `q.row_oids`
+  live), and a temp shadow created after the plan was recorded leaves it OID-pinned to
+  the original table (correct rows) or forces the `0A000`. **A typed HIT that hits
+  `0A000` (or `26000` `invalid_sql_statement_name` — a statement that VANISHED, e.g. an
+  out-of-band `DEALLOCATE`/`DISCARD ALL` or a pgbouncer TRANSACTION-pooling backend
+  reassignment) now SELF-HEALS TRANSPARENTLY**, exactly as the dynamic
+  `query_params_inner`/`execute_params_inner` path already did (this closes the
+  asymmetry where the TYPED path fail-loudly surfaced `26000`/`0A000` while the dynamic
+  one recovered). Both SQLSTATEs arise on a typed REUSE ONLY from a stale CACHED plan
+  (a genuine `0A000`/`26000` would have failed the query's FIRST, uncached MISS — which
+  sends a `Describe` — and so never cached), and both are raised BEFORE any `DataRow`
+  (`26000` rejects the `Bind`; `0A000` revalidates the plan up front), so NO partial row
+  reached the caller. The engine's `settle_statement_cache` already EVICTED the
+  statement on that HIT server-error and drained the connection to a clean idle, so
+  every typed cache-reusing verb (`query`/`query_one`/`query_opt`/`execute::<Q>`/
+  `query_each`) re-runs ONCE on the forced MISS path via `Core::typed_plan_went_stale`
+  (which emits `DiagEvent::PreparedCacheSelfHeal`, symmetric with the dynamic path): the
+  MISS re-`Parse`s, re-`Describe`s + re-arms the OID guard, and returns the CORRECT rows
+  — so a result-type-changing DDL is now a STRICT improvement over the old typed
+  fail-loud (`0A000`): the re-run's `Describe`-driven guard is the authority, turning a
+  genuine drift into a classified `DecodeError::ColumnOidMismatch` and a still-compatible
+  plan into a clean success. The re-run is a MISS that cannot itself be stale, so exactly
+  ONE retry (no loop). ENGINE MECHANICS: `Engine::query_params` / `query_params_break`
+  take `args` BY VALUE and HAND IT BACK (the second tuple element) — staging only borrows
+  it — so the driver re-runs the SAME parameters with NO `Clone` bound while `args` stays
+  OWNED across the await (the verb future is `Send` given only `Params: Send`, never
+  `Sync` — a borrowed `&args` held across the await would demand `Params: Sync`, which the
+  async driver's `_is_send` proof forbids). `next_event` is byte-identical (the self-heal
+  is a cold error-arm; no new engine state). The homogeneous/heterogeneous BATCH verbs
+  (`pipeline`/`execute_batch`/`query_batch`) are OUT of scope for the transparent self-heal
+  — their param source (an `IntoIterator` / a `Bound<Q>` tuple) is CONSUMED by the first
+  attempt, so re-supplying it would need buffering all N sets (breaking the windowed
+  constant-memory contract) or a new `Clone` bound; they already EVICT every referenced
+  statement on a mid-batch failure, so the caller-visible `BatchFailed` is retryable. The
+  live `typed_cache_self_heals_a_vanished_server_statement` (both drivers, `26000` via
+  `DISCARD ALL`) and `result_type_change_self_heals_or_classifies` (both drivers, `0A000`
+  via `ALTER COLUMN TYPE` — a text-family shift self-heals to correct rows, a differing
+  type classifies as `ColumnOidMismatch`) witness it. **The dynamic-OID skip needs NO build/macro change:** `q.row_oids`
   (already on `PreparedQuery`) equals the per-column marker OID (25/`text` for
   enum+composite, the base OID for a domain, the real native/bridged/array OID
   otherwise), and the guard SKIPS any column whose RUNTIME OID `>= FIRST_NORMAL_OID`
@@ -1542,7 +1576,19 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   the same map anyway). As a startup-packet GUC it applies from before the first
   query and becomes the session's reset value, so it SURVIVES a pooled
   connection's `RESET ALL` on checkout — the guardrail persists across checkouts.
-  The `Duration` maps to PostgreSQL's integer-millisecond GUC: `Duration::ZERO` →
+  **Connection-pooler caveat (honest, documented — not a bsql defect):** a
+  connect-time GUC is SESSION state, so it persists only over a DIRECT connection
+  or SESSION-level pooling (bsql's own `Pool`, or pgbouncer `session` mode). Under
+  pgbouncer TRANSACTION pooling the client `StartupMessage` is consumed by the
+  pooler and never reaches the per-transaction backend (reassigned each
+  transaction), so a connect-time `search_path` / `statement_timeout` / `timezone`
+  does NOT persist there — bsql CANNOT fix this without a per-query `SET` (a cost it
+  deliberately avoids) and cannot cheaply detect the topology, so it is DOCUMENTED,
+  not a config knob: behind transaction pooling, qualify object names, set the GUC
+  per statement, or use session-level pooling. (This is orthogonal to the typed
+  statement-cache SELF-HEAL above, which transparently handles the OTHER
+  transaction-pooling effect — a vanished cached plan.) The `Duration` maps to
+  PostgreSQL's integer-millisecond GUC: `Duration::ZERO` →
   `"0"` (PG's own convention: DISABLED — the explicit opt-out); a non-zero
   sub-millisecond duration rounds UP to `1` ms (never DOWN to `0`, which would
   silently weaken the guardrail into "disabled"); and a duration whose whole

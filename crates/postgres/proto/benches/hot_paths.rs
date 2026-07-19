@@ -64,7 +64,7 @@ fn bench_query_params_hit(c: &mut Criterion) {
                 match out {
                     // `Live` is a ZST linear token; black-box then drop it so the
                     // consumed round-trip is not optimized away.
-                    Ok(Ok(Outcome { live, .. })) => {
+                    Ok((Ok(Outcome { live, .. }), _)) => {
                         black_box(live);
                     }
                     other => panic!("cache-HIT query_params must complete, got {other:?}"),

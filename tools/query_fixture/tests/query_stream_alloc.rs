@@ -194,7 +194,8 @@ fn stream_rows(n: usize) -> (usize, usize) {
             let allocs = after.delta(before).allocs;
 
             match outcome {
-                Ok(Ok(Outcome { live, status })) => {
+                // `query_params_break` now hands `args` back (self-heal support).
+                Ok((Ok(Outcome { live, status }), _)) => {
                     assert!(
                         matches!(status, Boundary::Idle),
                         "the full stream reaches a clean Idle, got {status:?}"

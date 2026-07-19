@@ -192,7 +192,8 @@ fn drive_base() -> (usize, i64) {
                 },
             ));
             let live = match outcome {
-                Ok(Ok(Outcome { live, status })) => {
+                // `query_params_break` now hands `args` back (self-heal support).
+                Ok((Ok(Outcome { live, status }), _)) => {
                     assert!(matches!(status, Boundary::Idle), "reached Idle, got {status:?}");
                     live
                 }
@@ -252,7 +253,8 @@ fn drive_direct() -> (usize, i64) {
                 },
             ));
             let live = match outcome {
-                Ok(Ok(Outcome { live, status })) => {
+                // `query_params_break` now hands `args` back (self-heal support).
+                Ok((Ok(Outcome { live, status }), _)) => {
                     assert!(matches!(status, Boundary::Idle), "reached Idle, got {status:?}");
                     live
                 }

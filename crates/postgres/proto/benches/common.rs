@@ -296,7 +296,7 @@ pub fn primed_engine(hit_rows: usize) -> OwnedEngine {
 
     // Prime the cache with one MISS (Parse recorded), consuming the MISS reply.
     let live = match poll_once(engine.query_params(live, &DEMO_QUERY, (0,), sink)) {
-        Ok(Ok(Outcome { live, .. })) => live,
+        Ok((Ok(Outcome { live, .. }), _)) => live,
         other => panic!("priming MISS must complete, got {other:?}"),
     };
 
