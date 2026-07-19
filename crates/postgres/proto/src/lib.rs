@@ -238,7 +238,7 @@ pub use ident::{
     PortalName, SecretBoundedStr, Sql, StmtName,
 };
 pub use startup::{StartupParam, StartupParamError, RESERVED_NAMES};
-pub use password::{Credentials, Password, PasswordError};
+pub use password::{Credentials, Password, PasswordAuth, PasswordError};
 pub use sensitive::Sensitive;
 pub use prepared::{ColCellAt, PreparedQuery, QueryFingerprint, RowDecode};
 pub use typed_query::TypedQuery;

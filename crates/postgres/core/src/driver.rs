@@ -4405,6 +4405,11 @@ pub fn lift_conn_fail(cf: ConnFail) -> DriverError {
         ConnFail::UnsupportedAuthMethod => {
             DriverError::Config("server requested an unsupported authentication method")
         }
+        ConnFail::CleartextOverPlaintext => DriverError::Config(
+            "server requested a cleartext password over an unencrypted connection — refused \
+             (a cleartext password is sent only over TLS; use SslMode::Require, or a \
+             SCRAM/MD5-authenticated role)",
+        ),
         ConnFail::ServerError => {
             // Defensive: the connect flow routes a server `ErrorResponse` through
             // `EngineError::HandshakeServerError` (raw body → classified

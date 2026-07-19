@@ -1848,11 +1848,18 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   when `tls` is ALSO off; `md-5` rides its own default-on `md5-auth` feature
   (below). With BOTH `tls` and `scram` off the minimal build is 27 runtime crates
   (vs 41 default); dropping `md5-auth` too removes 7 more → 20. FAIL-LOUD
-  when off: password auth is SCRAM-only, so a driver given a password with `scram`
-  off is a classified `DriverError::Config` at connect naming the missing feature
-  (Trust auth still works; a Trust client hitting a SCRAM-demanding server already
-  fails with `ConnFail::UnsupportedAuthMethod`) — never a silent auth failure or
-  panic. `ConnFail` shrinks 8 B → 2 B when the SCRAM leaf class is gated out,
+  when off: password auth is server-driven (SCRAM / MD5 / cleartext-over-TLS), so
+  a password needs SOME mechanism compiled in — with BOTH `scram` AND `md5-auth`
+  off there is none, and a driver given a password is a classified
+  `DriverError::Config` at connect naming the missing features (with `scram` off
+  but `md5-auth` on a password still works for an MD5 / cleartext-over-TLS server;
+  a SASL challenge then fails loud with `ConnFail::UnsupportedAuthMethod`). Trust
+  auth always works; never a silent auth failure or panic. `ConnFail` shrinks
+  8 B → 2 B when the SCRAM leaf class is gated out (the always-present
+  `CleartextOverPlaintext` variant is a unit — no footprint change), cascading to
+  `HandshakeProgress` / `HandshakeOutcome` (feature-conditional
+  `wire_pin!` pairs; the engine census counts the cfg-blind source text). The
+  no-password-mechanism fail-loud is witnessed by `bsql-postgres-sync`'s
   cascading to `HandshakeProgress` / `HandshakeOutcome` (feature-conditional
   `wire_pin!` pairs; the engine census counts the cfg-blind source text). The
   `scram`-off fail-loud is witnessed by `bsql-postgres-sync`'s
@@ -1917,14 +1924,51 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   exactly SEVEN crates leave a `--no-default-features` runtime graph — `md-5` and
   its private `digest` / `block-buffer` / `generic-array` / `typenum` /
   `crypto-common` / `cfg-if` stack (none shared with the rest once SCRAM is also
-  off). FAIL-LOUD when off: `Credentials::Md5Password` is feature-gated (a client
-  cannot opt into MD5), and a server that DEMANDS MD5 is answered by the
+  off). FAIL-LOUD when off: the server-driven `Credentials::Password`'s MD5 arm is
+  `md5-auth`-gated, so with MD5 off a server that DEMANDS MD5 is answered by the
   always-present dispatch arms with `ConnFail::UnsupportedAuthMethod` — never a
   panic or a silent auth failure. The unconditional `AuthSubCode::Md5Password`
   wire classification stays (it is only a decode of a server sub-code; the
   fail-loud rides the dispatch, not the wire enum). Witnessed by
   `bsql-postgres-proto`'s `md5_off_fail_loud` test
   (`cargo test -p bsql-postgres-proto --no-default-features --test md5_off_fail_loud`).
-  The drivers themselves only ever build `Credentials::ScramPassword` / `Trust`,
-  so `md5-auth` gating leaves their code path untouched — MD5 is a proto-engine
-  capability, exercised by proto's own connect specs.
+- **Password auth is SERVER-DRIVEN — the drivers build a mechanism-agnostic
+  `Credentials::Password`.** PostgreSQL's `pg_hba.conf` decides the mechanism and
+  the client learns it only from the mid-handshake `Authentication*` frame, so the
+  drivers cannot commit to one mechanism at credential-construction time. A
+  password-bearing connection builds `Credentials::Password(Box<PasswordAuth>)` (in
+  `bsql_postgres_core::build_password_credentials`), which carries BOTH password
+  forms — the RAW bytes (for MD5 / cleartext, NEVER SASLprepped) AND the
+  `SASLprep(password)` form (for SCRAM, RFC 5802 / RFC 4013) — plus the resolved
+  channel binding + the encrypted flag; the sans-IO engine's `StartupPassword`
+  state answers whichever challenge arrives: SCRAM-SHA-256(-PLUS) (prepped form),
+  MD5 (raw, under `md5-auth`), or cleartext (raw, but ONLY over an encrypted
+  channel — a cleartext challenge over plaintext is the classified
+  `ConnFail::CleartextOverPlaintext` → `DriverError::Config`, never the password in
+  the clear; the DECIDED security default). An `AuthenticationOk` (the server chose
+  trust despite a password) proceeds like Trust — libpq parity. This ACTIVATES the
+  MD5 capability the driver could never reach before (it formerly built only
+  `Credentials::ScramPassword`, so a real `md5` / `password` pg_hba rule was
+  wrongly refused). The `PasswordAuth` carries TWO forms because SASLprep MUST NOT
+  be applied to the MD5/cleartext bytes — a NON-ASCII password whose SASLprep form
+  differs from its raw bytes (a non-breaking space that maps to a plain space)
+  would otherwise silently fail MD5/cleartext while authenticating fine under SCRAM
+  (a naive SASLprepped-only credential's bug). `PasswordAuth` is deliberately NOT
+  `Drop` (the dispatch unboxes it and MOVES the chosen form into the mechanism's
+  handshake state; each un-moved `Sensitive<Password>` still scrubs via field
+  drop-glue). The per-mechanism `Credentials::{ScramPassword,CleartextPassword,
+  Md5Password}` variants remain as the primitives the engine's own connect specs
+  exercise; the agnostic dispatch reuses their state transitions + message builders
+  (`scram_begin` / `md5_begin`), so there is no logic duplication. Footprints
+  untouched: `Credentials::Password` is one boxed pointer (the enum's widest inline
+  variant is still `ScramPassword`), `ConnectingState` stays 16 B (boxed
+  `StartupPassword`), `ConnFail`'s new unit variant rides the discriminant,
+  `next_event` is byte-identical (auth is the connecting phase). Witnessed OFFLINE
+  by `engine_connect_spec`'s `password_credential_*` tests (a byte differential
+  proving MD5/cleartext use the RAW password and SCRAM the prepped form, with a
+  NON-ASCII password whose two forms differ; the cleartext-over-plaintext refusal;
+  a trust server accepted) and LIVE by `bsql-postgres-async`'s `--ignored`
+  `md5_auth_live` (a self-contained ephemeral cluster: an MD5 login SUCCEEDS with a
+  non-ASCII password, the SAME password authenticates under SCRAM — proving each
+  mechanism selects the correct form — and a cleartext challenge over plaintext
+  fails closed; skips cleanly if `initdb`/`psql` absent or run as root).

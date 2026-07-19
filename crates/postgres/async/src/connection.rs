@@ -62,14 +62,14 @@ use bsql_postgres_core::UNIX_SOCKET_UNSUPPORTED;
 use bsql_postgres_proto::engine;
 use bsql_postgres_proto::params::ParamsWriter;
 use bsql_postgres_proto::{Credentials, DatabaseName, Ident, TypedCopyIn, TypedQuery};
-// `saslprep_password` SASLpreps (RFC 4013) the config password and builds the
-// zeroize-on-drop `Password`; `Sensitive` wraps it into a
-// `Credentials::ScramPassword`; `resolve_channel_binding` computes its channel
-// binding from the built wire. All SCRAM-only.
-#[cfg(feature = "scram")]
-use bsql_postgres_core::{resolve_channel_binding, saslprep_password};
-#[cfg(feature = "scram")]
-use bsql_postgres_proto::Sensitive;
+// The driver builds a server-driven `Credentials::Password` via the core
+// `build_password_credentials` helper — it carries BOTH password forms (the RAW
+// bytes for MD5/cleartext and the SASLprep form for SCRAM) plus the resolved
+// channel binding, so the engine answers whichever `Authentication*` challenge
+// the server sends. Present only under a build that can satisfy a password
+// challenge (`scram` or `md5-auth`).
+#[cfg(any(feature = "scram", feature = "md5-auth"))]
+use bsql_postgres_core::build_password_credentials;
 
 use crate::transport::{ReadDeadline, Sock, TokioSocket};
 
@@ -304,37 +304,33 @@ impl Connection {
             None => None,
         };
         let credentials = match config.password_str() {
-            // Password auth is SCRAM-SHA-256 only; with the `scram` feature off
-            // there is no client mechanism to satisfy it, so a supplied password
-            // is a FAIL-LOUD config error at connect — never a silent Trust
-            // attempt (which the server would reject anyway) or a panic.
-            #[cfg(feature = "scram")]
-            Some(pw) => {
-                // RFC 5802 SCRAM mandates RFC 4013 SASLprep of the password
-                // before PBKDF2 — a non-breaking space / soft hyphen /
-                // NFKC-normalisable codepoint set through psql/libpq is stored
-                // by the server in its SASLprep form, so the raw bytes would
-                // never match. Normalise here (a prohibited codepoint is a
-                // classified `DriverError::Config`) so proto sees the RFC form.
-                let password = saslprep_password(pw)?;
-                // Resolve SCRAM channel binding from the negotiated transport +
-                // the consumer's policy: over TLS this hashes the server's
-                // certificate into the `tls-server-end-point` binding data, so the
-                // engine can select SCRAM-SHA-256-PLUS. `channel_binding=require`
-                // over a plaintext channel fails closed here.
-                let channel_binding = resolve_channel_binding(
-                    encrypted,
-                    wire.peer_end_entity_cert(),
-                    config.channel_binding_mode(),
-                )?;
-                Credentials::ScramPassword(Sensitive::new(password), channel_binding)
-            }
-            #[cfg(not(feature = "scram"))]
+            // Server-driven password auth: build a `Credentials::Password`
+            // carrying BOTH password forms, so the engine answers whichever
+            // `Authentication*` challenge the server sends (SCRAM / MD5 /
+            // cleartext-over-TLS). With NEITHER `scram` nor `md5-auth` compiled
+            // in there is no password mechanism, so a supplied password is a
+            // FAIL-LOUD config error at connect — never a silent Trust attempt
+            // (which the server would reject anyway) or a panic.
+            #[cfg(any(feature = "scram", feature = "md5-auth"))]
+            Some(pw) => build_password_credentials(
+                pw,
+                &user,
+                encrypted,
+                // The SCRAM channel binding is resolved inside the helper from
+                // the negotiated transport + the consumer's policy (over TLS it
+                // hashes the server certificate for SCRAM-SHA-256-PLUS;
+                // `channel_binding=require` over plaintext fails closed).
+                #[cfg(feature = "scram")]
+                wire.peer_end_entity_cert(),
+                #[cfg(feature = "scram")]
+                config.channel_binding_mode(),
+            )?,
+            #[cfg(not(any(feature = "scram", feature = "md5-auth")))]
             Some(_) => {
                 return Err(DriverError::Config(
-                    "password authentication needs the `scram` feature \
-                     (SCRAM-SHA-256 support is not compiled in) — enable `scram`, \
-                     or use a trust/peer-authenticated connection",
+                    "password authentication needs the `scram` or `md5-auth` feature \
+                     (no SCRAM-SHA-256 or MD5 support is compiled in) — enable `scram` \
+                     and/or `md5-auth`, or use a trust/peer-authenticated connection",
                 ));
             }
             None => Credentials::Trust,

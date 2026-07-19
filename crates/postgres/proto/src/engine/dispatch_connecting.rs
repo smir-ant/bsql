@@ -62,7 +62,7 @@ use crate::ident::{DatabaseName, Ident};
 use crate::ident::PodBytes;
 #[cfg(feature = "md5-auth")]
 use crate::md5::Md5HandshakeState;
-use crate::password::{Credentials, Password};
+use crate::password::{Credentials, Password, PasswordAuth};
 use crate::startup::StartupParam;
 #[cfg(feature = "scram")]
 use crate::scram::channel_binding;
@@ -138,6 +138,16 @@ pub enum ConnFail {
     /// grows protocol options. A unit variant — no payload, so it rides the
     /// discriminant and does not widen the footprint.
     ProtocolNegotiationRejected,
+    /// The server requested CLEARTEXT password authentication over an
+    /// UNENCRYPTED channel. A cleartext password must never be sent in the
+    /// clear, so the mechanism-agnostic [`crate::password::Credentials::Password`]
+    /// path REFUSES it fail-closed here (the driver lifts this to
+    /// `DriverError::Config`); over TLS the same challenge is answered. A unit
+    /// variant — rides the discriminant, no footprint growth. (The per-mechanism
+    /// [`crate::password::Credentials::CleartextPassword`] primitive does NOT
+    /// gate — it is the "I explicitly want cleartext" building block used only by
+    /// the engine's own connect specs; the drivers never build it.)
+    CleartextOverPlaintext,
 }
 
 #[cfg(feature = "scram")]
@@ -404,6 +414,11 @@ impl ConnectingEngine {
         // and no reply id is threaded.
         let state = match credentials {
             Credentials::Trust => ConnectingState::StartupTrust,
+            // The server-driven password path the drivers build: the credential
+            // carries every form the server might ask for, and the dispatch picks
+            // the mechanism from the challenge. `user` inside the credential is
+            // the same value as the startup `user`.
+            Credentials::Password(auth) => ConnectingState::StartupPassword { auth },
             #[cfg(feature = "scram")]
             Credentials::ScramPassword(password, channel_binding) => {
                 ConnectingState::StartupScram {
@@ -944,6 +959,9 @@ fn dispatch_connecting(
 ) -> ConnDispatch {
     match state {
         ConnectingState::StartupTrust => dispatch_startup_trust(tag, payload),
+        ConnectingState::StartupPassword { auth } => {
+            dispatch_startup_password(auth, tag, payload, write)
+        }
         ConnectingState::StartupCleartext { password } => {
             dispatch_startup_cleartext(password, tag, payload, write)
         }
@@ -1006,6 +1024,90 @@ fn dispatch_startup_trust(tag: InboundTag, payload: &[u8]) -> ConnDispatch {
     }
 }
 
+/// Server-driven password dispatch — the drivers' single password path.
+///
+/// The credential carries every form the server might ask for; THIS answers
+/// whichever `Authentication*` challenge actually arrives, delegating to the
+/// SAME per-mechanism message builders + transition states the primitive
+/// `dispatch_startup_{cleartext,md5,scram}` arms use (no logic duplication):
+///
+/// - `Ok` — the server chose trust despite a configured password; proceed like a
+///   Trust client (libpq sends the password only when challenged).
+/// - `CleartextPassword` — answered ONLY over an encrypted channel; a cleartext
+///   password over plaintext is refused fail-closed
+///   ([`ConnFail::CleartextOverPlaintext`]).
+/// - `Md5Password` — the RAW password digest (under `md5-auth`).
+/// - `Sasl` — SCRAM-SHA-256(-PLUS) with the SASLprep form (under `scram`).
+///
+/// A challenge whose mechanism is not compiled in is a classified
+/// [`ConnFail::UnsupportedAuthMethod`] (never a panic, never a silent stall).
+fn dispatch_startup_password(
+    auth: Box<PasswordAuth>,
+    tag: InboundTag,
+    payload: &[u8],
+    write: &mut WriteBuf,
+) -> ConnDispatch {
+    if tag == TAG_AUTHENTICATION {
+        // Unbox onto the stack so the chosen mechanism can MOVE its form out of
+        // the credential (`PasswordAuth` is deliberately not `Drop`; every
+        // un-moved form still scrubs via its own `Sensitive` field drop-glue).
+        let auth = *auth;
+        match parse_auth_sub_code(payload) {
+            AuthCode::Known(AuthSubCode::Ok, _) => advance(ConnectingState::PostAuthAwaitingKey),
+            AuthCode::Known(AuthSubCode::CleartextPassword, _) => {
+                // NEVER send a cleartext password in the clear: refuse fail-closed
+                // over an unencrypted channel (the driver lifts this to a
+                // classified `DriverError::Config`). Over TLS it is answered.
+                if !auth.channel_encrypted {
+                    return fail(ConnFail::CleartextOverPlaintext);
+                }
+                match build_cleartext_password_message(write, &auth.raw) {
+                    Ok(()) => ConnDispatch {
+                        next: ConnPhase::Handshaking(ConnectingState::CleartextAwaitingAuthOk),
+                        event: ConnEvent::Cleartext,
+                    },
+                    Err(reason) => fail(reason),
+                }
+            }
+            #[cfg(feature = "md5-auth")]
+            AuthCode::Known(AuthSubCode::Md5Password, rest) => {
+                // The MD5 digest is built from the RAW (un-SASLprepped) password.
+                let handshake = Md5HandshakeState {
+                    password: auth.raw,
+                    user: auth.user,
+                };
+                md5_begin(&handshake, rest, write)
+            }
+            #[cfg(feature = "scram")]
+            AuthCode::Known(AuthSubCode::Sasl, rest) => {
+                // SCRAM feeds the SASLprep form to PBKDF2.
+                let scram =
+                    Box::new(ScramSession::from_password(auth.scram_prepped, auth.channel_binding));
+                scram_begin(scram, rest, write)
+            }
+            // A mechanism whose capability is compiled out: MD5 with `md5-auth`
+            // off, SASL with `scram` off — each is a classified fail-loud
+            // (the primitive dispatches classify the same way).
+            #[cfg(not(feature = "md5-auth"))]
+            AuthCode::Known(AuthSubCode::Md5Password, _) => {
+                fail(ConnFail::UnsupportedAuthMethod)
+            }
+            #[cfg(not(feature = "scram"))]
+            AuthCode::Known(AuthSubCode::Sasl, _) => fail(ConnFail::UnsupportedAuthMethod),
+            // A SASL continuation/final at startup is out of order.
+            AuthCode::Known(AuthSubCode::SaslContinue | AuthSubCode::SaslFinal, _) => {
+                fail(ConnFail::UnsupportedAuthMethod)
+            }
+            AuthCode::Unknown => fail(ConnFail::UnsupportedAuthMethod),
+            AuthCode::Malformed => fail(ConnFail::MalformedAuthentication),
+        }
+    } else if tag == TAG_ERROR_RESPONSE {
+        server_fail()
+    } else {
+        fail(ConnFail::UnexpectedFrame { tag: tag.byte() })
+    }
+}
+
 fn dispatch_startup_cleartext(
     password: Box<Sensitive<Password>>,
     tag: InboundTag,
@@ -1043,6 +1145,26 @@ fn dispatch_startup_cleartext(
     }
 }
 
+/// Answer an `AuthenticationMD5Password` challenge: parse the 4-byte salt,
+/// build the MD5 `PasswordMessage` from the handshake's RAW password + user, and
+/// transition to `Md5AwaitingAuthOk`. Shared by the primitive
+/// [`dispatch_startup_md5`] and the mechanism-agnostic
+/// [`dispatch_startup_password`].
+#[cfg(feature = "md5-auth")]
+fn md5_begin(handshake: &Md5HandshakeState, salt_bytes: &[u8], write: &mut WriteBuf) -> ConnDispatch {
+    let salt: [u8; 4] = match <[u8; 4]>::try_from(salt_bytes) {
+        Ok(bytes) => bytes,
+        Err(_) => return fail(ConnFail::MalformedAuthentication),
+    };
+    match build_md5_password_message(write, handshake, salt) {
+        Ok(()) => ConnDispatch {
+            next: ConnPhase::Handshaking(ConnectingState::Md5AwaitingAuthOk),
+            event: ConnEvent::Md5 { salt },
+        },
+        Err(reason) => fail(reason),
+    }
+}
+
 #[cfg(feature = "md5-auth")]
 fn dispatch_startup_md5(
     handshake: Box<Md5HandshakeState>,
@@ -1052,19 +1174,7 @@ fn dispatch_startup_md5(
 ) -> ConnDispatch {
     if tag == TAG_AUTHENTICATION {
         match parse_auth_sub_code(payload) {
-            AuthCode::Known(AuthSubCode::Md5Password, rest) => {
-                let salt: [u8; 4] = match <[u8; 4]>::try_from(rest) {
-                    Ok(bytes) => bytes,
-                    Err(_) => return fail(ConnFail::MalformedAuthentication),
-                };
-                match build_md5_password_message(write, &handshake, salt) {
-                    Ok(()) => ConnDispatch {
-                        next: ConnPhase::Handshaking(ConnectingState::Md5AwaitingAuthOk),
-                        event: ConnEvent::Md5 { salt },
-                    },
-                    Err(reason) => fail(reason),
-                }
-            }
+            AuthCode::Known(AuthSubCode::Md5Password, rest) => md5_begin(&handshake, rest, write),
             AuthCode::Known(
                 AuthSubCode::Ok
                 | AuthSubCode::CleartextPassword
@@ -1083,35 +1193,41 @@ fn dispatch_startup_md5(
     }
 }
 
+/// Answer a SASL mechanism offer: resolve the mechanism + gs2 flag from the
+/// server's offer and the transport-resolved channel binding, build the
+/// `SASLInitialResponse`, and transition to `ScramAwaitingServerFirst`. Shared
+/// by the primitive [`dispatch_startup_scram`] and the mechanism-agnostic
+/// [`dispatch_startup_password`] so the -PLUS negotiation is authored once.
+#[cfg(feature = "scram")]
+fn scram_begin(mut scram: Box<ScramSession>, offer_bytes: &[u8], write: &mut WriteBuf) -> ConnDispatch {
+    // SCRAM-SHA-256-PLUS when the server offers it over a bound channel, plain
+    // SCRAM-SHA-256 (`y,,` anti-downgrade over TLS, `n,,` otherwise) when it does
+    // not, or a classified refusal under `channel_binding=require`.
+    let offer = channel_binding::MechanismOffer::parse(offer_bytes);
+    let choice = match channel_binding::decide_sasl_choice(offer, &scram.channel_binding) {
+        Ok(choice) => choice,
+        Err(error) => return fail(ConnFail::scram(error)),
+    };
+    scram.sasl_choice = choice;
+    match build_sasl_initial_response(write, &mut scram) {
+        // Client-initiated SASL: the response is in the buffer; the surfaceable
+        // challenge is the server-first that follows, so this step is a silent
+        // intermediate.
+        Ok(()) => advance(ConnectingState::ScramAwaitingServerFirst { scram }),
+        Err(reason) => fail(reason),
+    }
+}
+
 #[cfg(feature = "scram")]
 fn dispatch_startup_scram(
-    mut scram: Box<ScramSession>,
+    scram: Box<ScramSession>,
     tag: InboundTag,
     payload: &[u8],
     write: &mut WriteBuf,
 ) -> ConnDispatch {
     if tag == TAG_AUTHENTICATION {
         match parse_auth_sub_code(payload) {
-            AuthCode::Known(AuthSubCode::Sasl, rest) => {
-                // Resolve the SASL mechanism + gs2 flag from the server's offer
-                // and the transport-resolved channel binding: SCRAM-SHA-256-PLUS
-                // when the server offers it over a bound channel, plain
-                // SCRAM-SHA-256 (`y,,` anti-downgrade over TLS, `n,,` otherwise)
-                // when it does not, or a classified refusal.
-                let offer = channel_binding::MechanismOffer::parse(rest);
-                let choice = match channel_binding::decide_sasl_choice(offer, &scram.channel_binding) {
-                    Ok(choice) => choice,
-                    Err(error) => return fail(ConnFail::scram(error)),
-                };
-                scram.sasl_choice = choice;
-                match build_sasl_initial_response(write, &mut scram) {
-                    // Client-initiated SASL: the response is in the buffer;
-                    // the surfaceable challenge is the server-first that
-                    // follows, so this step is a silent intermediate.
-                    Ok(()) => advance(ConnectingState::ScramAwaitingServerFirst { scram }),
-                    Err(reason) => fail(reason),
-                }
-            }
+            AuthCode::Known(AuthSubCode::Sasl, rest) => scram_begin(scram, rest, write),
             AuthCode::Known(
                 AuthSubCode::Ok
                 | AuthSubCode::CleartextPassword

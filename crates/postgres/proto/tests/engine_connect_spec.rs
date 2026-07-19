@@ -42,7 +42,7 @@ use bsql_postgres_proto::wire::{
     TAG_AUTHENTICATION, TAG_BACKEND_KEY_DATA, TAG_ERROR_RESPONSE, TAG_NOTICE_RESPONSE,
     TAG_PARAMETER_STATUS, TAG_READY_FOR_QUERY,
 };
-use bsql_postgres_proto::{Credentials, Ident, Password, Sensitive, TxStatus};
+use bsql_postgres_proto::{Credentials, Ident, Password, PasswordAuth, Sensitive, TxStatus};
 use bsql_postgres_proto::scram::channel_binding::{tls_server_end_point, ChannelBinding};
 use bsql_postgres_proto::scram::wire::ScramFailureClass;
 
@@ -154,6 +154,69 @@ impl Transport for StaticServer {
         &'a mut self,
         buf: &'a [u8],
     ) -> impl Future<Output = Result<usize, Infallible>> + Send + 'a {
+        ready(Ok(buf.len()))
+    }
+
+    fn flush<'a>(&'a mut self) -> impl Future<Output = Result<(), Infallible>> + Send + 'a {
+        ready(Ok(()))
+    }
+
+    fn shutdown<'a>(&'a mut self) -> impl Future<Output = Result<(), Infallible>> + Send + 'a {
+        ready(Ok(()))
+    }
+}
+
+// ─────────────────────────── capturing scripted server ───────────────────────────
+
+/// A [`StaticServer`] that ALSO records every client frame it is written, into a
+/// shared handle the test reads after the handshake. Used to prove the exact
+/// bytes the mechanism-agnostic password path emits (that MD5 / cleartext use the
+/// RAW password, not the SASLprep form) via a byte-for-byte differential against
+/// the per-mechanism primitive credentials.
+struct CapturingServer {
+    inbound: Vec<u8>,
+    cursor: usize,
+    frames: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+impl CapturingServer {
+    /// Returns the server plus a second handle onto its recorded client frames
+    /// (`[0]` = the StartupMessage, `[1]` = the first auth response, …).
+    fn new(inbound: Vec<u8>) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Self {
+                inbound,
+                cursor: 0,
+                frames: std::sync::Arc::clone(&frames),
+            },
+            frames,
+        )
+    }
+}
+
+impl Transport for CapturingServer {
+    type Error = Infallible;
+    fn is_would_block(err: &Self::Error) -> bool {
+        match *err {}
+    }
+
+    fn read<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+    ) -> impl Future<Output = Result<usize, Infallible>> + Send + 'a {
+        let n = (self.inbound.len() - self.cursor).min(buf.len());
+        buf[..n].copy_from_slice(&self.inbound[self.cursor..self.cursor + n]);
+        self.cursor += n;
+        ready(Ok(n))
+    }
+
+    fn write<'a>(
+        &'a mut self,
+        buf: &'a [u8],
+    ) -> impl Future<Output = Result<usize, Infallible>> + Send + 'a {
+        // Each flush hands one whole client frame; record it, then acknowledge.
+        self.frames.lock().expect("capture lock").push(buf.to_vec());
         ready(Ok(buf.len()))
     }
 
@@ -822,4 +885,186 @@ fn connect_when_already_active_is_wrong_phase() {
     })
     .expect("startup packet assembles");
     assert!(matches!(err, EngineError::WrongPhase(_)), "got {err:?}");
+}
+
+// ─────────── server-driven password credential (Credentials::Password) ───────────
+//
+// The drivers build `Credentials::Password`, which carries BOTH password forms
+// and answers whichever `Authentication*` challenge the server sends. A NON-ASCII
+// raw password whose SASLprep form differs from its raw bytes is the load-bearing
+// case: MD5 / cleartext MUST use the RAW bytes, SCRAM MUST use the SASLprep form.
+// Testing with ASCII (where the two coincide) would hide a raw-vs-prepped mix-up.
+
+/// A NON-ASCII raw password — the bytes MD5 / cleartext feed verbatim.
+const RAW_PW: &str = "pä55wörd";
+/// A DELIBERATELY DIFFERENT stand-in for the SASLprep form (fed to SCRAM). The
+/// engine has no SASLprep (that lives in the std driver), so the test supplies two
+/// distinct byte strings and proves each mechanism selects the RIGHT one.
+const PREPPED_PW: &str = "prepped-scram-form";
+
+/// Build the server-driven `Credentials::Password` the drivers build.
+fn password_creds(raw: &str, prepped: &str, cb: ChannelBinding, encrypted: bool) -> Credentials {
+    Credentials::Password(Box::new(PasswordAuth::new(
+        Sensitive::new(Password::try_from_str(raw).expect("raw password")),
+        Sensitive::new(Password::try_from_str(prepped).expect("prepped password")),
+        cb,
+        Ident::try_from_str("corpus").expect("ident"),
+        encrypted,
+    )))
+}
+
+/// SCRAM challenge: the agnostic credential feeds the SASLprep form to SCRAM. The
+/// `ScramServer` verifies the client proof against `PREPPED_PW`, so reaching
+/// active PROVES the prepped form (not the raw bytes) was used.
+#[test]
+fn password_credential_answers_scram_with_the_prepped_form() {
+    let creds = password_creds(RAW_PW, PREPPED_PW, ChannelBinding::Unbound, false);
+    let server = ScramServer::new(PREPPED_PW);
+    assert_eq!(connect_active(server, creds), (SCRAM_BACKEND_PID, TxStatus::Idle));
+}
+
+/// Negative control: a server verifying against the RAW password rejects the
+/// proof (the agnostic path used the PREPPED form), so the handshake FAILS on a
+/// classified SCRAM signature mismatch — never a silent success. Together with
+/// the positive above, this pins SCRAM to the SASLprep form.
+#[test]
+fn password_credential_does_not_feed_scram_the_raw_form() {
+    let creds = password_creds(RAW_PW, PREPPED_PW, ChannelBinding::Unbound, false);
+    let server = ScramServer::new(RAW_PW);
+    let err = connect_error(server, creds);
+    assert!(
+        matches!(
+            err,
+            EngineError::Handshake(ConnFail::Scram(ScramFailureClass::SignatureMismatch)),
+        ),
+        "SCRAM against the wrong (raw) password must fail classified, got {err:?}",
+    );
+}
+
+/// MD5 challenge: the agnostic credential's MD5 `PasswordMessage` must be
+/// byte-identical to the per-mechanism `Md5Password(RAW)` primitive's, and DIFFER
+/// from one computed over the (wrong) prepped form — proving MD5 digests the RAW
+/// password. A byte differential needs no MD5 reimplementation.
+#[test]
+fn password_credential_answers_md5_with_the_raw_form() {
+    let script = || {
+        concat(&[
+            auth(5, &[0xde, 0xad, 0xbe, 0xef]),
+            auth_ok(),
+            backend_key(77, 88),
+            ready_for_query(b'I'),
+        ])
+    };
+
+    let (server, frames) = CapturingServer::new(script());
+    assert_eq!(
+        connect_active(
+            server,
+            password_creds(RAW_PW, PREPPED_PW, ChannelBinding::Unbound, false),
+        ),
+        (77, TxStatus::Idle),
+    );
+    let agnostic = frames.lock().expect("frames").clone();
+
+    let (server, frames) = CapturingServer::new(script());
+    assert_eq!(
+        connect_active(server, Credentials::Md5Password(scram_password(RAW_PW))),
+        (77, TxStatus::Idle),
+    );
+    let primitive_raw = frames.lock().expect("frames").clone();
+
+    let (server, frames) = CapturingServer::new(script());
+    assert_eq!(
+        connect_active(server, Credentials::Md5Password(scram_password(PREPPED_PW))),
+        (77, TxStatus::Idle),
+    );
+    let primitive_prepped = frames.lock().expect("frames").clone();
+
+    // frames[1] is the MD5 PasswordMessage (frames[0] is the StartupMessage).
+    assert_eq!(
+        agnostic[1], primitive_raw[1],
+        "agnostic MD5 must digest the RAW password (byte-identical to Md5Password(raw))",
+    );
+    assert_ne!(
+        agnostic[1], primitive_prepped[1],
+        "agnostic MD5 must NOT digest the SASLprep form",
+    );
+}
+
+/// Cleartext challenge over an ENCRYPTED channel: answered with the RAW password.
+/// The agnostic cleartext `PasswordMessage` must byte-match the
+/// `CleartextPassword(RAW)` primitive's and carry the raw bytes verbatim.
+#[test]
+fn password_credential_answers_cleartext_over_tls_with_the_raw_form() {
+    let script = || {
+        concat(&[
+            auth(3, &[]),
+            auth_ok(),
+            backend_key(55, 66),
+            ready_for_query(b'I'),
+        ])
+    };
+
+    // channel_encrypted = true → cleartext is answered.
+    let (server, frames) = CapturingServer::new(script());
+    assert_eq!(
+        connect_active(
+            server,
+            password_creds(RAW_PW, PREPPED_PW, ChannelBinding::Unbound, true),
+        ),
+        (55, TxStatus::Idle),
+    );
+    let agnostic = frames.lock().expect("frames").clone();
+
+    let (server, frames) = CapturingServer::new(script());
+    assert_eq!(
+        connect_active(server, Credentials::CleartextPassword(scram_password(RAW_PW))),
+        (55, TxStatus::Idle),
+    );
+    let primitive = frames.lock().expect("frames").clone();
+
+    assert_eq!(
+        agnostic[1], primitive[1],
+        "agnostic cleartext must send the RAW password (byte-identical to the primitive)",
+    );
+    assert!(
+        agnostic[1]
+            .windows(RAW_PW.len())
+            .any(|w| w == RAW_PW.as_bytes()),
+        "the cleartext PasswordMessage must carry the raw (non-ASCII) password bytes verbatim",
+    );
+}
+
+/// Cleartext challenge over a PLAINTEXT channel: REFUSED fail-closed, never the
+/// password in the clear. Classified [`ConnFail::CleartextOverPlaintext`] (the
+/// driver lifts it to `DriverError::Config`).
+#[test]
+fn password_credential_refuses_cleartext_over_a_plaintext_channel() {
+    let server = StaticServer::new(concat(&[
+        auth(3, &[]),
+        auth_ok(),
+        backend_key(1, 2),
+        ready_for_query(b'I'),
+    ]));
+    // channel_encrypted = false.
+    let creds = password_creds(RAW_PW, PREPPED_PW, ChannelBinding::Unbound, false);
+    let err = connect_error(server, creds);
+    assert!(
+        matches!(err, EngineError::Handshake(ConnFail::CleartextOverPlaintext)),
+        "cleartext over a plaintext channel must be refused fail-closed, got {err:?}",
+    );
+}
+
+/// A server that sends `AuthenticationOk` (chose trust despite a configured
+/// password) is accepted — the agnostic credential proceeds like a Trust client,
+/// matching libpq (the password rides only an actual challenge).
+#[test]
+fn password_credential_accepts_a_trust_server() {
+    let server = StaticServer::new(concat(&[
+        auth_ok(),
+        backend_key(9, 10),
+        ready_for_query(b'I'),
+    ]));
+    let creds = password_creds(RAW_PW, PREPPED_PW, ChannelBinding::Unbound, false);
+    assert_eq!(connect_active(server, creds), (9, TxStatus::Idle));
 }

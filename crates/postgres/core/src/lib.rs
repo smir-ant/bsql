@@ -97,6 +97,11 @@ pub mod n1 {
 // The per-connection notification ledger (a bounded, counted no-drop buffer)
 // and the sink adapter that captures every surfaced notification into it.
 pub mod notify;
+// The driver-side password-credential builder — assembles the server-driven
+// `Credentials::Password` (both password forms) the drivers pass to the engine.
+// Present only under a build that can satisfy a password challenge.
+#[cfg(any(feature = "scram", feature = "md5-auth"))]
+pub mod credentials;
 // Heterogeneous atomic pipelining — `Bound<Q>` + the sealed `Pipeline` trait a
 // batch tuple satisfies; `Core::pipeline` is the driver verb.
 pub mod pipeline;
@@ -132,6 +137,8 @@ pub use config::{
 pub use diag::{DiagEvent, DiagSink, Diagnostics, PoolStats};
 #[cfg(feature = "scram")]
 pub use config::resolve_channel_binding;
+#[cfg(any(feature = "scram", feature = "md5-auth"))]
+pub use credentials::build_password_credentials;
 #[cfg(feature = "scram")]
 pub use scram_prep::saslprep_password;
 pub use driver::{Core, PreparedStatement};

@@ -21,9 +21,9 @@ use crate::scram::types::SecretDigest;
 
 /// State space reachable during the PostgreSQL connection handshake.
 ///
-/// 11 handshake variants + 1 transient `Errored` (entered when a classified
+/// 12 handshake variants + 1 transient `Errored` (entered when a classified
 /// failure fires mid-handshake). Secret-bearing variants box their SCRAM / MD5
-/// / cleartext payload so the enum stays compact; the current variant is
+/// / cleartext / server-driven payload so the enum stays compact; the current variant is
 /// itself the request/reply correlation (the handshake is strictly serial), so
 /// no id is threaded through them.
 ///
@@ -45,6 +45,13 @@ use crate::scram::types::SecretDigest;
 #[non_exhaustive]
 pub enum ConnectingState {
     StartupTrust,
+    /// Server-driven password auth (the drivers' path): the credential carries
+    /// BOTH password forms + the resolved channel binding + the encrypted flag,
+    /// and the dispatch answers whichever `Authentication*` challenge arrives.
+    /// Boxed, so this variant is one pointer — the enum stays 16 B.
+    StartupPassword {
+        auth: alloc::boxed::Box<crate::password::PasswordAuth>,
+    },
     StartupCleartext {
         password: alloc::boxed::Box<crate::sensitive::Sensitive<crate::password::Password>>,
     },
@@ -101,6 +108,9 @@ impl core::fmt::Debug for ConnectingState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::StartupTrust => write!(f, "StartupTrust"),
+            Self::StartupPassword { .. } => f
+                .debug_struct("StartupPassword")
+                .finish_non_exhaustive(),
             Self::StartupCleartext { .. } => f
                 .debug_struct("StartupCleartext")
                 .finish_non_exhaustive(),

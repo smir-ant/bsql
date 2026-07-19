@@ -742,9 +742,26 @@ impl ConnectConfig {
         Ok(Duration::from_secs(self.connect_timeout_secs))
     }
 
-    /// Set the password. Default auth is SCRAM-SHA-256.
-    /// Server chooses the actual method — SCRAM works for both
-    /// `scram-sha-256` and `md5` pg_hba rules (PG falls back).
+    /// Set the password.
+    ///
+    /// Authentication is **server-driven**: PostgreSQL's `pg_hba.conf` picks the
+    /// mechanism and the client answers whichever `Authentication*` challenge it
+    /// receives. bsql supports all three password mechanisms:
+    ///
+    /// - **SCRAM-SHA-256** (and **-PLUS** channel binding) — the modern default
+    ///   (PG 14+); needs the default-on `scram` feature. The password is
+    ///   SASLprepped (RFC 4013) before PBKDF2.
+    /// - **MD5** (`md5` pg_hba rule / `password_encryption=md5`) — legacy PG;
+    ///   needs the default-on `md5-auth` feature. Digests the RAW password.
+    /// - **cleartext** (`password` pg_hba rule) — sent ONLY over an encrypted
+    ///   (TLS) connection. A cleartext challenge over a plaintext channel is a
+    ///   fail-closed [`DriverError::Config`](crate::DriverError) refusal, never
+    ///   the password in the clear.
+    ///
+    /// So a `scram-sha-256`, `md5`, OR `password` `pg_hba.conf` rule all work,
+    /// each answered with its correct mechanism — NOT a SCRAM-only path with a
+    /// (non-existent) fallback. A challenge whose mechanism is compiled out is a
+    /// classified fail-loud error at connect, never a silent failure.
     pub fn password(mut self, pw: impl Into<String>) -> Self {
         self.password_inner = Some(zeroize::Zeroizing::new(pw.into()));
         self

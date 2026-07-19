@@ -182,11 +182,124 @@ impl fmt::Debug for Password {
     }
 }
 
+/// Server-driven password credential — carries BOTH password forms so the
+/// engine can answer whichever `Authentication*` challenge the server actually
+/// sends.
+///
+/// PostgreSQL chooses the auth mechanism (its `pg_hba.conf` decides), and the
+/// client learns which one only from the mid-handshake `Authentication*` frame.
+/// A single-form credential cannot serve every mechanism: SCRAM-SHA-256 feeds
+/// `SASLprep(password)` to PBKDF2 (RFC 5802 mandates RFC 4013 SASLprep), while
+/// MD5 and cleartext use the RAW password bytes VERBATIM — SASLprep MUST NOT be
+/// applied there (a non-ASCII password whose SASLprep form differs from its raw
+/// bytes would silently fail MD5/cleartext while authenticating fine under
+/// SCRAM). So this credential carries BOTH forms; the driver computes them once
+/// at connect (`bsql_postgres_core::build_password_credentials`) and the engine
+/// picks per challenge in [`crate::state::ConnectingState::StartupPassword`].
+///
+/// This is what the drivers build for a password-bearing connection — the
+/// mechanism-specific [`Credentials::ScramPassword`] /
+/// [`Credentials::CleartextPassword`] / [`Credentials::Md5Password`] variants
+/// remain the per-mechanism primitives exercised by the engine's own connect
+/// specs, and this dispatch reuses their state transitions + message builders.
+///
+/// # No `Drop` — partial-move by design
+///
+/// This type deliberately does NOT implement `Drop`: the connecting dispatch
+/// unboxes it and MOVES the chosen form into the mechanism's handshake state
+/// (the SCRAM prepped password into a [`crate::scram::session::ScramSession`],
+/// the raw password into an [`crate::md5::Md5HandshakeState`]), which a `Drop`
+/// type forbids (partial moves out of a `Drop` value are a compile error).
+/// Scrubbing stays tier-1 regardless: each secret field is a
+/// [`Sensitive<Password>`] (zero-on-drop in its own right), so field drop-glue
+/// scrubs every un-moved form and the moved-out form scrubs when its new owner
+/// drops. The non-secret fields (`channel_binding` / `user` /
+/// `channel_encrypted`) carry no plaintext, so eliding them from the (absent)
+/// Drop chain leaks nothing.
+pub struct PasswordAuth {
+    /// RAW password bytes — MD5 + cleartext. NEVER SASLprepped: PG stores no
+    /// SASLprep transform for MD5/cleartext, so the raw bytes are the ones the
+    /// server verifies.
+    pub(crate) raw: Sensitive<Password>,
+    /// `SASLprep(password)` — the SCRAM-SHA-256 PBKDF2 input (RFC 5802 §5.1).
+    /// Present only under the default-on `scram` feature.
+    #[cfg(feature = "scram")]
+    pub(crate) scram_prepped: Sensitive<Password>,
+    /// Resolved SCRAM channel binding (`Unbound` on a plaintext channel or under
+    /// `channel_binding=disable`, `Available` with the `tls-server-end-point`
+    /// cert hash over TLS). Present only under `scram`.
+    #[cfg(feature = "scram")]
+    pub(crate) channel_binding: crate::scram::channel_binding::ChannelBinding,
+    /// The StartupMessage user — the MD5 digest is
+    /// `md5(md5(password || user) || salt)` (PG §55.4). Carried alongside the
+    /// startup user (they are the same value) so the per-state dispatch, which
+    /// receives no `user`, can build the MD5 response.
+    #[cfg_attr(
+        not(feature = "md5-auth"),
+        expect(
+            dead_code,
+            reason = "user is the MD5 digest input; with md5-auth off no MD5 response is ever built, so the field is stored (by the always-present constructor) but unread — carrying it unconditionally avoids a four-way (scram × md5-auth) constructor signature"
+        )
+    )]
+    pub(crate) user: crate::ident::Ident,
+    /// Whether the negotiated transport is encrypted. Gates cleartext: a
+    /// cleartext challenge over an UNENCRYPTED channel is refused
+    /// ([`crate::engine::ConnFail::CleartextOverPlaintext`]) so a cleartext
+    /// password is never sent in the clear; over TLS it is answered.
+    pub(crate) channel_encrypted: bool,
+}
+
+impl PasswordAuth {
+    /// Assemble a mechanism-agnostic password credential.
+    ///
+    /// `raw` is the un-normalised password (MD5 / cleartext); `scram_prepped`
+    /// is `SASLprep(password)` (SCRAM); `channel_binding` is the
+    /// transport-resolved binding; `user` MUST equal the StartupMessage user
+    /// (it is the MD5 digest input); `channel_encrypted` reports whether the
+    /// transport negotiated TLS.
+    ///
+    /// The `scram_prepped` / `channel_binding` parameters exist only under the
+    /// `scram` feature — with SCRAM off there is no PBKDF2 form to carry.
+    #[inline]
+    #[must_use]
+    pub fn new(
+        raw: Sensitive<Password>,
+        #[cfg(feature = "scram")] scram_prepped: Sensitive<Password>,
+        #[cfg(feature = "scram")] channel_binding: crate::scram::channel_binding::ChannelBinding,
+        user: crate::ident::Ident,
+        channel_encrypted: bool,
+    ) -> Self {
+        Self {
+            raw,
+            #[cfg(feature = "scram")]
+            scram_prepped,
+            #[cfg(feature = "scram")]
+            channel_binding,
+            user,
+            channel_encrypted,
+        }
+    }
+}
+
+impl fmt::Debug for PasswordAuth {
+    /// Manual, secret-eliding impl: both password forms are redacted (the leaf
+    /// [`Sensitive`] would already redact them, but eliding the fields entirely
+    /// via `finish_non_exhaustive` keeps them off the formatted output). Only the
+    /// non-secret `channel_encrypted` flag is printed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasswordAuth")
+            .field("channel_encrypted", &self.channel_encrypted)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Authentication credentials for a PostgreSQL connection.
 ///
 /// `Trust` means no password is sent — the server is configured to
 /// accept the connection based on `pg_hba.conf` rules alone.
-/// `ScramPassword` carries a password for SCRAM-SHA-256 authentication.
+/// [`Password`](Self::Password) is the server-driven password credential the
+/// drivers build (it answers whichever `Authentication*` challenge arrives);
+/// `ScramPassword` carries a password committed to SCRAM-SHA-256.
 ///
 /// # Design: large enum variants are intentional
 ///
@@ -213,6 +326,15 @@ impl fmt::Debug for Password {
 pub enum Credentials {
     /// Trust authentication — no password required.
     Trust,
+    /// Server-driven password authentication — the credential the drivers
+    /// build. It carries BOTH password forms (see [`PasswordAuth`]) and answers
+    /// whichever `Authentication*` challenge the server sends: SCRAM-SHA-256(-PLUS)
+    /// (the `scram_prepped` form), MD5 (the `raw` form, under `md5-auth`), or
+    /// cleartext (the `raw` form, but ONLY over an encrypted channel — a
+    /// cleartext challenge over plaintext is refused). Boxed, so this variant is
+    /// one pointer wide and does not widen the enum past the inline
+    /// `ScramPassword` variant.
+    Password(alloc::boxed::Box<PasswordAuth>),
     /// Password-based authentication (SCRAM-SHA-256).
     ///
     /// The password is wrapped in [`Sensitive`] for zero-on-drop and
@@ -297,6 +419,7 @@ impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Trust => f.write_str("Credentials::Trust"),
+            Self::Password(_) => f.write_str("Credentials::Password(<REDACTED>)"),
             #[cfg(feature = "scram")]
             Self::ScramPassword(_, _) => f.write_str("Credentials::ScramPassword(<REDACTED>)"),
             Self::CleartextPassword(_) => {

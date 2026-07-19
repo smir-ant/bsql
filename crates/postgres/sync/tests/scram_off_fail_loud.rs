@@ -1,9 +1,11 @@
-// This witness proves the `scram`-OFF fail-loud contract, so it exists ONLY when
-// the `scram` feature is off. Under the default (scram-on) build it compiles to
-// an empty binary (no tests). Run it with:
+// This witness proves the NO-PASSWORD-MECHANISM fail-loud contract, so it exists
+// ONLY when BOTH the `scram` and `md5-auth` features are off — with either on the
+// driver can satisfy a password challenge (SCRAM, or MD5 / cleartext-over-TLS), so
+// a password is NOT fail-loud. Under the default (both on) build it compiles to an
+// empty binary (no tests). Run it with:
 //   cargo test -p bsql-postgres-sync --no-default-features --features tls,webpki-roots \
 //     --test scram_off_fail_loud
-#![cfg(not(feature = "scram"))]
+#![cfg(not(any(feature = "scram", feature = "md5-auth")))]
 #![forbid(unsafe_code)]
 #![allow(
     clippy::expect_used,
@@ -11,17 +13,18 @@
     reason = "offline loopback witness — expect/panic are the loud test-failure signal, not production fallbacks"
 )]
 
-//! Fail-loud witness for a build WITHOUT the `scram` feature.
+//! Fail-loud witness for a build with NO password mechanism (`scram` AND
+//! `md5-auth` both off).
 //!
-//! Password authentication is SCRAM-SHA-256 only, so with SCRAM compiled out the
-//! client has no mechanism to satisfy a supplied password. A connect that carries
-//! one must therefore fail LOUD — a classified [`DriverError::Config`] naming the
-//! missing feature — and must NEVER silently attempt a Trust handshake the server
-//! would reject, nor panic. This drives the real `std::net`
-//! [`Connection::connect`] path against a loopback listener (so the TCP connect
-//! succeeds and the driver reaches its credential decision) and asserts a
-//! password-bearing config is rejected, while a Trust config (no password) is NOT
-//! rejected at the credential step.
+//! With neither SCRAM nor MD5 compiled in, the client has no mechanism to satisfy
+//! a supplied password (cleartext-over-TLS alone is not a mechanism bsql advertises
+//! for this ultra-minimal build). A connect that carries a password must therefore
+//! fail LOUD — a classified [`DriverError::Config`] naming the missing features —
+//! and must NEVER silently attempt a Trust handshake the server would reject, nor
+//! panic. This drives the real `std::net` [`Connection::connect`] path against a
+//! loopback listener (so the TCP connect succeeds and the driver reaches its
+//! credential decision) and asserts a password-bearing config is rejected, while a
+//! Trust config (no password) is NOT rejected at the credential step.
 
 use std::net::TcpListener;
 use std::thread;
@@ -31,7 +34,7 @@ use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, SslMode};
 
 /// Bind a loopback listener and hold each accepted connection briefly, so the
 /// client's TCP `connect` succeeds and the driver reaches its credential decision
-/// (which, with `scram` off and a password present, is the fail-loud path).
+/// (which, with NO password mechanism and a password present, is the fail-loud path).
 fn spawn_accept_and_hold() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     let port = listener.local_addr().expect("loopback local addr").port();
@@ -47,10 +50,10 @@ fn spawn_accept_and_hold() -> u16 {
 }
 
 #[test]
-fn password_without_scram_is_a_loud_config_error() {
+fn password_without_a_mechanism_is_a_loud_config_error() {
     let port = spawn_accept_and_hold();
     // `SslMode::Disable` so the connect skips the SSLRequest probe against the
-    // dummy server and reaches the credential decision — the SCRAM-off fail-loud.
+    // dummy server and reaches the credential decision — the no-mechanism fail-loud.
     let config = ConnectConfig::new("127.0.0.1", "postgres")
         .port(port)
         .ssl_mode(SslMode::Disable)
@@ -60,21 +63,21 @@ fn password_without_scram_is_a_loud_config_error() {
         Err(DriverError::Config(msg)) => {
             assert!(
                 msg.contains("scram"),
-                "the fail-loud message must name the missing `scram` feature, got: {msg}"
+                "the fail-loud message must name the missing `scram`/`md5-auth` feature, got: {msg}"
             );
         }
         Err(other) => panic!(
-            "a password without `scram` must be a DriverError::Config, got: {other:?}"
+            "a password with no compiled mechanism must be a DriverError::Config, got: {other:?}"
         ),
         Ok(_) => panic!(
-            "a password without `scram` MUST NOT open a connection — there is no \
+            "a password with no compiled mechanism MUST NOT open a connection — there is no \
              client mechanism to satisfy it, and a silent Trust attempt is forbidden"
         ),
     }
 }
 
 #[test]
-fn trust_without_scram_is_not_rejected_at_the_credential_step() {
+fn trust_without_a_mechanism_is_not_rejected_at_the_credential_step() {
     // No password → Trust credentials, which need no SCRAM. The connect proceeds
     // past credential selection and only fails later on the loopback server's
     // non-Postgres bytes (never a `Config` error blaming a missing feature).
