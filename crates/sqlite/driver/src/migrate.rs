@@ -85,6 +85,20 @@ pub enum MigrationError {
         /// The classified SQLite cause.
         source: Box<SqliteError>,
     },
+    /// A migration BROKE the per-migration transaction boundary the runner owns:
+    /// after applying it, the connection was not in the state the runner requires
+    /// (a transactional migration left NO transaction open — a top-level
+    /// `COMMIT`/`ROLLBACK`, or an in-body `COMMIT`, closed the runner's
+    /// `BEGIN IMMEDIATE`; or a `-- bsql:no-transaction` migration opened a
+    /// transaction of its own and left it open). Detected via
+    /// `sqlite3_get_autocommit`. The runner STOPPED. The runtime peer of the
+    /// PostgreSQL runner's boundary backstop and of the build-time
+    /// transaction-control gate; fail-loud AFTER the boundary-breaking migration
+    /// already ran (the directory source parses nothing at load time).
+    TransactionBoundaryBroken {
+        /// The migration that broke the boundary.
+        migration: String,
+    },
     /// A ledger / transaction / connection operation failed.
     Backend(Box<SqliteError>),
 }
@@ -99,6 +113,12 @@ impl fmt::Display for MigrationError {
             MigrationError::MigrationFailed { migration, source } => {
                 write!(f, "migration `{migration}` failed to apply: {source}")
             }
+            MigrationError::TransactionBoundaryBroken { migration } => write!(
+                f,
+                "migration `{migration}` broke the per-migration transaction boundary — it \
+                 contains its own transaction control (a top-level or in-body \
+                 COMMIT/ROLLBACK/BEGIN); the runner owns the transaction, so remove it"
+            ),
             MigrationError::Backend(e) => write!(f, "migration runner backend error: {e}"),
         }
     }
@@ -211,6 +231,20 @@ impl Connection {
                     source: Box::new(e),
                 }
             })?;
+            // A `-- bsql:no-transaction` migration runs as autocommit statements,
+            // so the connection MUST be back at autocommit. If it is not, the
+            // migration opened a transaction of its own (a top-level `BEGIN`) and
+            // left it open — the ledger insert above landed inside that stray,
+            // uncommitted transaction. Fail loud, rolling the stray transaction
+            // back so the handle is reusable.
+            if !self.inner.is_autocommit() {
+                match self.inner.execute_batch("ROLLBACK") {
+                    Ok(()) | Err(_) => {}
+                }
+                return Err(MigrationError::TransactionBoundaryBroken {
+                    migration: migration.name.clone(),
+                });
+            }
             return Ok(true);
         }
 
@@ -219,23 +253,40 @@ impl Connection {
         // mid-transaction.
         self.inner.execute_batch("BEGIN IMMEDIATE").map_err(SqliteError::from)?;
         match self.apply_and_record(migration, ordinal, &checksum) {
-            Ok(ApplyOutcome::Applied) => match self.inner.execute_batch("COMMIT") {
-                Ok(()) => Ok(true),
-                Err(commit_err) => {
-                    // COMMIT failed (e.g. BUSY on the RESERVED→EXCLUSIVE upgrade
-                    // blocked by a reader, or an interrupt at COMMIT): the
-                    // transaction is still OPEN on the reused handle. Best-effort
-                    // ROLLBACK to a clean boundary (swallow its own error) so a
-                    // later `run_migrations` can BEGIN cleanly — symmetric with the
-                    // Skipped/Err arms — and return the ORIGINAL COMMIT error
-                    // UNCHANGED, so its classification (is_busy / is_disconnect, via
-                    // the preserved SQLite code) survives as the retry signal.
-                    match self.inner.execute_batch("ROLLBACK") {
-                        Ok(()) | Err(_) => {}
-                    }
-                    Err(MigrationError::from(SqliteError::from(commit_err)))
+            Ok(ApplyOutcome::Applied) => {
+                // The runner opened this migration's transaction (`BEGIN IMMEDIATE`)
+                // and owns its boundary. If the connection is ALREADY back at
+                // autocommit, a statement in the migration committed / rolled it
+                // back (a top-level or in-body `COMMIT`/`ROLLBACK`) — the
+                // per-migration atomicity the runner guarantees is broken, and the
+                // migration's earlier statements (plus the ledger row) committed
+                // piecemeal. Fail loud WITHOUT the runner's own `COMMIT` (which
+                // would itself error "cannot commit - no transaction is active").
+                // Nothing to roll back — autocommit means no open transaction. The
+                // NATIVE-status runtime peer of the PostgreSQL runner's backstop.
+                if self.inner.is_autocommit() {
+                    return Err(MigrationError::TransactionBoundaryBroken {
+                        migration: migration.name.clone(),
+                    });
                 }
-            },
+                match self.inner.execute_batch("COMMIT") {
+                    Ok(()) => Ok(true),
+                    Err(commit_err) => {
+                        // COMMIT failed (e.g. BUSY on the RESERVED→EXCLUSIVE upgrade
+                        // blocked by a reader, or an interrupt at COMMIT): the
+                        // transaction is still OPEN on the reused handle. Best-effort
+                        // ROLLBACK to a clean boundary (swallow its own error) so a
+                        // later `run_migrations` can BEGIN cleanly — symmetric with
+                        // the Skipped/Err arms — and return the ORIGINAL COMMIT error
+                        // UNCHANGED, so its classification (is_busy / is_disconnect,
+                        // via the preserved SQLite code) survives as the retry signal.
+                        match self.inner.execute_batch("ROLLBACK") {
+                            Ok(()) | Err(_) => {}
+                        }
+                        Err(MigrationError::from(SqliteError::from(commit_err)))
+                    }
+                }
+            }
             Ok(ApplyOutcome::Skipped) => {
                 // Nothing changed — a concurrent runner beat us. Release the lock.
                 self.inner.execute_batch("ROLLBACK").map_err(SqliteError::from)?;

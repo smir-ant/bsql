@@ -174,6 +174,81 @@ fn a_failing_migration_rolls_back_and_stops() {
     conn.execute_raw("INSERT INTO users (id, name) VALUES (7, 'g')").expect("connection reusable");
 }
 
+/// WITNESS (runtime backstop): a migration containing a top-level `COMMIT`
+/// commits the runner's `BEGIN IMMEDIATE` transaction mid-way — a broken
+/// per-migration boundary. `sqlite3_get_autocommit` catches it as the classified
+/// `TransactionBoundaryBroken` (naming the migration), never a silent piecemeal
+/// apply, and never the confusing "cannot commit - no transaction is active" the
+/// runner's own trailing COMMIT would otherwise raise. The runner STOPS: a later
+/// migration does not run. The ledger reflects the HONEST state — the boundary
+/// break already committed its statements + its own ledger row (fail-loud AFTER
+/// the fact, the documented trade-off for what the build-time gate cannot see in
+/// a directory source or a `DO`/procedure body).
+#[test]
+fn a_top_level_commit_in_a_migration_is_a_boundary_broken_error() {
+    let conn = Connection::open_in_memory().expect("open");
+    let set = [
+        M1,
+        ("0002_commit.sql", "CREATE TABLE mid (id INTEGER);\nCOMMIT;"),
+        ("0003_after.sql", "CREATE TABLE after_marker (id INTEGER)"),
+    ];
+    let err = conn
+        .run_migrations(MigrationSource::embedded(&set))
+        .expect_err("a top-level COMMIT must be a boundary-broken error");
+    match err {
+        MigrationError::TransactionBoundaryBroken { migration } => {
+            assert_eq!(migration, "0002_commit.sql");
+        }
+        other => panic!("expected TransactionBoundaryBroken naming 0002, got {other:?}"),
+    }
+
+    // 0003 never ran — the runner STOPPED at the boundary break.
+    let after = conn
+        .query_raw("SELECT 1 FROM sqlite_master WHERE type='table' AND name='after_marker'")
+        .expect("q");
+    assert!(after.is_empty(), "0003 must not run after the boundary break");
+
+    // The HONEST ledger state: 0001 (its own transaction) AND 0002 (whose stray
+    // COMMIT committed its DDL + ledger row before the check caught it) are both
+    // recorded — fail-loud AFTER the boundary already broke, not refuse-before.
+    let status = conn.migration_status(MigrationSource::embedded(&set)).expect("status");
+    let applied: Vec<&str> = status.applied.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(applied, vec!["0001_users.sql", "0002_commit.sql"]);
+
+    // The connection is still usable — autocommit means no stray transaction to
+    // clean up, so no rollback was needed.
+    conn.execute_raw("INSERT INTO users (id, name) VALUES (9, 'z')").expect("connection reusable");
+}
+
+/// WITNESS (runtime backstop, no-transaction path): a `-- bsql:no-transaction`
+/// migration runs as autocommit statements, so one that opens a `BEGIN` and
+/// leaves it open breaks the boundary (its ledger insert lands inside the stray,
+/// uncommitted transaction). `sqlite3_get_autocommit` catches it as
+/// `TransactionBoundaryBroken`; the stray transaction is rolled back so the
+/// connection stays reusable.
+#[test]
+fn a_no_transaction_migration_that_opens_a_transaction_is_boundary_broken() {
+    let conn = Connection::open_in_memory().expect("open");
+    let set = [(
+        "0001_open.sql",
+        "-- bsql:no-transaction\nCREATE TABLE opened (id INTEGER);\nBEGIN;",
+    )];
+    let err = conn
+        .run_migrations(MigrationSource::embedded(&set))
+        .expect_err("a no-transaction BEGIN must be boundary-broken");
+    match err {
+        MigrationError::TransactionBoundaryBroken { migration } => {
+            assert_eq!(migration, "0001_open.sql");
+        }
+        other => panic!("expected TransactionBoundaryBroken naming 0001, got {other:?}"),
+    }
+
+    // The stray transaction was rolled back (the ledger insert with it), so the
+    // connection is reusable — a fresh write succeeds, not "database is locked".
+    conn.execute_raw("CREATE TABLE probe (id INTEGER)")
+        .expect("connection reusable after the stray transaction is rolled back");
+}
+
 /// WITNESS: `migration_status` on a fresh database shows everything pending;
 /// `dry_run` reports what WOULD run without applying it.
 #[test]

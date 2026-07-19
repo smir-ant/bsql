@@ -3684,6 +3684,20 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         Ok(())
     }
 
+    /// The connection's current `ReadyForQuery` transaction-status indicator — the
+    /// sibling `migrate` module's per-migration boundary backstop reads it (the
+    /// engine field is private to this module). `None` only in the unreachable
+    /// pre-active phase (a settled verb has always driven the engine active), so a
+    /// caller after any completed query gets `Some(_)`.
+    ///
+    /// `#[doc(hidden)]`: an internal seam for the migration runner, not consumer
+    /// surface.
+    #[doc(hidden)]
+    #[inline]
+    pub(crate) fn tx_status(&self) -> Option<TxStatus> {
+        self.engine.tx_status().ok()
+    }
+
     /// Subscribe to a `LISTEN` channel. The name is validated into a
     /// [`SafeIdent`] — the injection-safe type the SQL is assembled from — so an
     /// injection-shaped name is a classified [`DriverError::Config`] and CANNOT

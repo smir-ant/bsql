@@ -14,7 +14,7 @@
     reason = "live test harness — the schema fixture expects a live PG and panics loudly on failure; not a production fallback path"
 )]
 
-use bsql_postgres_async::{ConnectConfig, Connection, MigrationSource};
+use bsql_postgres_async::{ConnectConfig, Connection, MigrationError, MigrationSource};
 
 fn config() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -104,4 +104,60 @@ async fn async_runner_emits_progress_events() {
     );
 
     conn.simple_query(&format!("DROP SCHEMA {schema} CASCADE")).await.expect("drop schema");
+}
+
+/// WITNESS (runtime backstop, async twin of the sync test): a migration with a
+/// top-level COMMIT commits the runner's own BEGIN mid-way — a broken
+/// per-migration boundary. PG's own trailing COMMIT is a silent no-op-warning, so
+/// only the native RFQ transaction-status backstop catches it: a classified
+/// `TransactionBoundaryBroken` naming the migration; the runner STOPS. Plus a
+/// no-false-positive half: a normal set still applies clean.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn a_top_level_commit_in_a_migration_is_a_boundary_broken_error() {
+    let mut conn = Connection::connect(&config()).await.expect("connect");
+    let schema = format!("bsql_migcommit_async_{}", std::process::id());
+    conn.simple_query(&format!("CREATE SCHEMA {schema}")).await.expect("create schema");
+    conn.simple_query(&format!("SET search_path TO {schema}")).await.expect("search_path");
+
+    let set = [
+        ("0001_t.sql", "CREATE TABLE t (a int)"),
+        ("0002_commit.sql", "CREATE TABLE mid (a int);\nCOMMIT;"),
+        ("0003_after.sql", "CREATE TABLE after_marker (a int)"),
+    ];
+    let err = conn
+        .run_migrations(MigrationSource::embedded(&set))
+        .await
+        .expect_err("a top-level COMMIT must be a boundary-broken error");
+    assert!(
+        matches!(&err, MigrationError::TransactionBoundaryBroken { migration } if migration == "0002_commit.sql"),
+        "expected TransactionBoundaryBroken naming 0002, got {err:?}"
+    );
+
+    // 0003 never ran; the connection is reusable (drained to a clean idle).
+    let result = conn
+        .query_raw("SELECT to_regclass('after_marker')::text")
+        .await
+        .expect("connection reusable after the boundary break");
+    let row = result.get(0).expect("one row");
+    assert!(
+        row.get_str(0).expect("text").is_none(),
+        "0003 must not run after the boundary break"
+    );
+
+    // NO FALSE POSITIVE: a normal set still applies clean under the backstop.
+    conn.simple_query(&format!("DROP SCHEMA {schema} CASCADE")).await.expect("drop schema");
+    let schema2 = format!("bsql_migclean_async_{}", std::process::id());
+    conn.simple_query(&format!("CREATE SCHEMA {schema2}")).await.expect("create schema");
+    conn.simple_query(&format!("SET search_path TO {schema2}")).await.expect("search_path");
+    let normal = [
+        ("0001_a.sql", "CREATE TABLE a (x int)"),
+        ("0002_b.sql", "ALTER TABLE a ADD COLUMN y int"),
+    ];
+    let report = conn
+        .run_migrations(MigrationSource::embedded(&normal))
+        .await
+        .expect("a normal migration set applies clean under the backstop");
+    assert_eq!(report.applied.len(), 2, "no false positive: a normal set applies");
+    conn.simple_query(&format!("DROP SCHEMA {schema2} CASCADE")).await.expect("drop schema");
 }

@@ -205,6 +205,51 @@ fn create_index_concurrently_without_the_marker_fails_loud() {
 
 #[test]
 #[ignore = "requires local PG"]
+fn a_top_level_commit_in_a_migration_is_a_boundary_broken_error() {
+    // A migration containing a top-level COMMIT commits the runner's own BEGIN
+    // mid-way — a broken per-migration boundary. On PostgreSQL the runner's own
+    // trailing COMMIT is then a SILENT no-op-warning (unlike SQLite, which would
+    // error), so ONLY the native RFQ transaction-status backstop catches it: a
+    // classified `TransactionBoundaryBroken` naming the migration, never a silent
+    // piecemeal apply. The runner STOPS — a later migration does not run.
+    let (mut conn, schema) = conn_in_fresh_schema();
+    let set = [
+        ("0001_t.sql", "CREATE TABLE t (a int)"),
+        ("0002_commit.sql", "CREATE TABLE mid (a int);\nCOMMIT;"),
+        ("0003_after.sql", "CREATE TABLE after_marker (a int)"),
+    ];
+    let err = conn
+        .run_migrations(MigrationSource::embedded(&set))
+        .expect_err("a top-level COMMIT must be a boundary-broken error");
+    assert!(
+        matches!(&err, MigrationError::TransactionBoundaryBroken { migration } if migration == "0002_commit.sql"),
+        "expected TransactionBoundaryBroken naming 0002, got {err:?}"
+    );
+
+    // 0003 never ran — the runner stopped at the boundary break. The connection is
+    // reusable (drained to a clean idle), so this read succeeds.
+    let result = conn
+        .query_raw("SELECT to_regclass('after_marker')::text")
+        .expect("connection reusable after the boundary break");
+    let row = result.get(0).expect("one row");
+    assert!(
+        row.get_str(0).expect("text").is_none(),
+        "0003 must not run after the boundary break"
+    );
+    drop_schema(&mut conn, &schema);
+
+    // NO FALSE POSITIVE: a normal migration set (no transaction control) still
+    // applies clean — the new backstop never fires on a well-formed migration.
+    let (mut conn2, schema2) = conn_in_fresh_schema();
+    let report = conn2
+        .run_migrations(MigrationSource::embedded(&three()))
+        .expect("a normal migration set applies clean under the backstop");
+    assert_eq!(report.applied.len(), 3, "no false positive: a normal set applies");
+    drop_schema(&mut conn2, &schema2);
+}
+
+#[test]
+#[ignore = "requires local PG"]
 fn duplicate_named_migration_is_loud_not_a_silent_skip() {
     // PG now fails loud at the pre-flight duplicate check (before the ledger PK
     // would), giving the SAME classified `Source(DuplicateName)` as SQLite — one

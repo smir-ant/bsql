@@ -772,7 +772,28 @@ fn parse_and_enforce_acks(file: &Path, sql: &str) -> Result<(), BuildError> {
     // The runner owns the transaction boundary; a migration must not contain its
     // own BEGIN/COMMIT/ROLLBACK/SAVEPOINT (which would break per-migration
     // atomicity). Reject in the SAME AST pass as the ack gate.
-    for statement in &statements {
+    enforce_no_transaction_control(file, &statements)?;
+    Ok(())
+}
+
+/// Reject a top-level transaction-control statement
+/// (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`/`RELEASE SAVEPOINT`) in a migration.
+///
+/// The runner owns each migration's transaction boundary (it wraps the migration
+/// in its own `BEGIN`/`COMMIT`), so a migration's OWN transaction control would
+/// break per-migration atomicity — its statements would commit piecemeal, and a
+/// later failure could not roll the earlier ones back. This is the ONE build-time
+/// authority for that rejection, shared by BOTH build paths so they cannot drift:
+/// the `emit_migrations` embed ([`parse_and_enforce_acks`]) AND the
+/// `query!`-catalog replay ([`replay_file`]). So a runner-only consumer
+/// (`embed_migrations!`) and a `query!` consumer both get the SAME
+/// refuse-before-apply guarantee — a top-level `COMMIT` is a loud
+/// [`BuildError::TransactionControlInMigration`] on every build path, never a
+/// silently-broken boundary caught only at run time. (A `COMMIT` hidden inside a
+/// `DO`/procedure body, which no parser can see, is caught instead by the
+/// runner's native transaction-status backstop at apply time.)
+fn enforce_no_transaction_control(file: &Path, statements: &[Statement]) -> Result<(), BuildError> {
+    for statement in statements {
         if let Some(keyword) = transaction_control_statement(statement) {
             return Err(BuildError::TransactionControlInMigration {
                 file: file.to_path_buf(),
@@ -1866,6 +1887,13 @@ fn replay_file(
     // catalog: a `DROP TABLE` / `DROP COLUMN` without a co-located
     // acknowledgement fails the build rather than silently discarding data.
     enforce_destructive_acks(path, sql, &statements)?;
+    // The runner owns each migration's transaction boundary, so a migration's own
+    // top-level `BEGIN`/`COMMIT`/... would break per-migration atomicity. Reject
+    // it on the `query!`-catalog build path too (not only the `emit_migrations`
+    // embed path — the SAME `enforce_no_transaction_control` authority), so a
+    // `query!` consumer's build fails exactly as an `embed_migrations!` build
+    // does, before any statement replays into the catalog.
+    enforce_no_transaction_control(path, &statements)?;
     for statement in statements {
         replay_statement(catalog, tracker, path, statement)?;
     }
@@ -5806,6 +5834,41 @@ mod tests {
                 "expected TransactionControlInMigration({kw}), got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn catalog_replay_rejects_a_top_level_transaction_control_statement() {
+        // The SAME rejection on the `query!`-catalog build path (`replay_file`),
+        // not only the `emit_migrations` embed path (`parse_and_enforce_acks`): a
+        // `query!` consumer whose migration contains its own BEGIN/COMMIT/... must
+        // fail the BUILD with `TransactionControlInMigration`, before any statement
+        // replays into the catalog — closing the former gap where the catalog
+        // replay silently ignored a StartTransaction/Commit.
+        for (sql, kw) in [
+            ("CREATE TABLE t (a int);\nCOMMIT;", "COMMIT"),
+            ("BEGIN;\nCREATE TABLE t (a int);", "BEGIN"),
+            ("CREATE TABLE t (a int);\nROLLBACK;", "ROLLBACK"),
+            ("SAVEPOINT s;\nCREATE TABLE t (a int);", "SAVEPOINT"),
+        ] {
+            let mut catalog = Catalog::default();
+            let mut tracker = ConstraintTracker::default();
+            let err = replay_file(&mut catalog, &mut tracker, Path::new("m.sql"), sql)
+                .expect_err("transaction control must fail the catalog build");
+            assert!(
+                matches!(err, BuildError::TransactionControlInMigration { statement, .. } if statement == kw),
+                "expected TransactionControlInMigration({kw}), got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_replay_accepts_a_normal_migration() {
+        // The catalog build path still replays a well-formed migration (the reject
+        // is scoped to transaction control, never a false positive on ordinary DDL).
+        let mut catalog = Catalog::default();
+        let mut tracker = ConstraintTracker::default();
+        replay_file(&mut catalog, &mut tracker, Path::new("0001.sql"), "CREATE TABLE t (a int)")
+            .expect("a normal migration replays into the catalog");
     }
 
     #[test]

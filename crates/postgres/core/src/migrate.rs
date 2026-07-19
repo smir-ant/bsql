@@ -53,6 +53,7 @@ use std::fmt;
 use std::time::Duration;
 
 use bsql_postgres_proto::engine::Transport;
+use bsql_postgres_proto::TxStatus;
 
 use crate::driver::Core;
 use crate::error::{ColumnError, DriverError};
@@ -161,6 +162,21 @@ pub enum MigrationError {
         /// The classified driver/server cause.
         source: Box<DriverError>,
     },
+    /// A migration BROKE the per-migration transaction boundary the runner owns:
+    /// after applying it, the connection was not in the state the runner requires
+    /// (a transactional migration left no transaction open — a top-level
+    /// `COMMIT`/`ROLLBACK`, or an in-procedure `COMMIT` no parser can see, closed
+    /// the runner's `BEGIN`; or a `-- bsql:no-transaction` migration opened a
+    /// transaction of its own and left it open). The runner STOPPED. This is the
+    /// runtime backstop for the boundary-break class the build-time
+    /// transaction-control gate catches at compile time for the embed / catalog
+    /// paths; the directory source and an in-procedure `COMMIT` are the residual
+    /// this catches (fail-loud AFTER the boundary-breaking migration already ran —
+    /// the statements before its stray commit are already committed).
+    TransactionBoundaryBroken {
+        /// The migration that broke the boundary.
+        migration: String,
+    },
     /// The migration advisory lock could not be acquired within
     /// [`LOCK_ACQUIRE_TIMEOUT`] — another runner has held it that long (it may
     /// be stuck). Distinct from a driver error so a caller can retry / alert.
@@ -180,6 +196,12 @@ impl fmt::Display for MigrationError {
             MigrationError::MigrationFailed { migration, source } => {
                 write!(f, "migration `{migration}` failed to apply: {source}")
             }
+            MigrationError::TransactionBoundaryBroken { migration } => write!(
+                f,
+                "migration `{migration}` broke the per-migration transaction boundary — it \
+                 contains its own transaction control (a top-level or in-procedure \
+                 COMMIT/ROLLBACK/BEGIN); the runner owns the transaction, so remove it"
+            ),
             MigrationError::LockTimeout => write!(
                 f,
                 "could not acquire the migration advisory lock within {LOCK_ACQUIRE_TIMEOUT:?} — \
@@ -339,6 +361,23 @@ impl<S: Transport<Error = std::io::Error>> Core<S> {
                 migration: migration.name.clone(),
                 source: Box::new(e),
             })?;
+            // A `-- bsql:no-transaction` migration runs as autocommit statements,
+            // so the connection MUST be back at `Idle`. If it is `InTransaction` /
+            // `Failed`, the migration opened a transaction of its own (a top-level
+            // `BEGIN`) and left it open — the ledger insert above landed inside
+            // that stray, uncommitted transaction. Fail loud, rolling the stray
+            // transaction back so the connection is reusable. (`None` — WrongPhase,
+            // unreachable after a settled verb — is treated as fine: no false
+            // positive.)
+            if matches!(self.tx_status(), Some(TxStatus::InTransaction | TxStatus::Failed)) {
+                core::hint::cold_path();
+                match self.rollback().await {
+                    Ok(()) | Err(_) => {}
+                }
+                return Err(MigrationError::TransactionBoundaryBroken {
+                    migration: migration.name.clone(),
+                });
+            }
             return Ok(());
         }
 
@@ -346,6 +385,32 @@ impl<S: Transport<Error = std::io::Error>> Core<S> {
         let outcome = self.apply_and_record(migration, ordinal, &checksum).await;
         match outcome {
             Ok(()) => {
+                // The runner opened this migration's transaction (`begin` above)
+                // and is the SOLE owner of its boundary. If the connection is no
+                // longer inside a transaction, a statement in the migration
+                // committed or rolled it back (a top-level `COMMIT`/`ROLLBACK`, or
+                // an in-procedure `COMMIT` no parser can see) — the per-migration
+                // atomicity the runner guarantees is broken, and the migration's
+                // earlier statements (plus the ledger row) committed piecemeal.
+                // This is the NATIVE-status runtime backstop for the boundary-break
+                // the build-time transaction-control gate catches at compile time
+                // for the embed / catalog paths; here it is fail-loud AFTER the
+                // fact (the stray commit already ran, so it is honest — not
+                // refuse-before-apply). `Idle` / `Failed` are the broken states;
+                // `None` (WrongPhase, unreachable after a settled verb) is treated
+                // as fine — no false positive.
+                if matches!(self.tx_status(), Some(TxStatus::Idle | TxStatus::Failed)) {
+                    core::hint::cold_path();
+                    // Best-effort return to a clean boundary (a broken migration
+                    // may have left no open transaction, or a stray `Failed` one);
+                    // the boundary-broken cause is the signal either way.
+                    match self.rollback().await {
+                        Ok(()) | Err(_) => {}
+                    }
+                    return Err(MigrationError::TransactionBoundaryBroken {
+                        migration: migration.name.clone(),
+                    });
+                }
                 self.commit().await?;
                 Ok(())
             }

@@ -516,17 +516,48 @@ transaction-control reject (a top-level `BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`
 is a loud `BuildError::TransactionControlInMigration` — the runner owns the
 transaction boundary, so an embedded `COMMIT` that would break atomicity is a
 BUILD error; a `-- bsql:no-transaction` migration is NOT exempt, it runs as
-autocommit statements). The runtime directory source parses nothing, so both
-build-time gates are authorship guarantees honestly scoped to the embed. The
+autocommit statements). That transaction-control reject is the ONE
+`enforce_no_transaction_control` authority (over the existing sqlparser
+classifier), run on BOTH build paths — the `emit_migrations` embed
+(`parse_and_enforce_acks`) AND the `query!`-catalog replay
+(`emit`/`emit_catalog`, in `replay_file`) — so a `query!` consumer and an
+`embed_migrations!` consumer get the SAME refuse-before-apply guarantee (a
+migration whose top-level `COMMIT` the catalog replay formerly ignored now fails
+the build). **Runtime boundary backstop (native transaction status).** The
+runtime directory source parses NOTHING, and a `COMMIT` hidden inside a
+`DO`/procedure body is invisible to any parser, so the build-time gate cannot be
+the whole story: after applying each migration, the runner VERIFIES the native
+transaction status and fails LOUD with a classified
+`MigrationError::TransactionBoundaryBroken { migration }` if the boundary was
+broken — PostgreSQL reads the RFQ tx-status via `Core::tx_status` (a transactional
+migration must leave the runner's `BEGIN` still open; a `-- bsql:no-transaction`
+one must be back at `Idle`), SQLite via `sqlite3_get_autocommit`
+(`Connection::is_autocommit`). This lives once over `Core<S>` (async/sync parity
+free) and catches the boundary-break class the parser cannot see (an in-procedure
+`COMMIT`) AND the directory path (a top-level `COMMIT`); on PostgreSQL it is the
+ONLY catch, since the runner's own trailing `COMMIT` after a stray commit is a
+silent no-op-warning. HONEST TRADE-OFF (documented, accepted): the backstop is
+fail-loud AFTER the boundary-breaking migration already ran (its statements
+committed piecemeal before the status check saw them) — NOT refuse-before-apply —
+which is correct for the "trust the operator, parses nothing" directory path and
+for an in-procedure `COMMIT` no parser can see; the build-time gate above still
+gives refuse-before-apply for the embed AND catalog paths. The
 `_bsql_migrations` identifier is a fixed compile-time literal (no injection
 surface); the migration NAME + checksum ride Bind PARAMETERS, never spliced. Runtime emission and the runner are ORTHOGONAL to `query!` — a
 runner-only consumer needs no catalog. Witnessed by
 `crates/sqlite/driver/tests/migrate.rs` (in-process: order, idempotent re-run,
 drift, fail-stop, status/dry-run, directory source, no-transaction, two
-concurrent runners over one FILE), `crates/postgres/{sync,async}/tests/migrate_live.rs`
+concurrent runners over one FILE, PLUS the runtime boundary backstop — a
+top-level `COMMIT` and a `-- bsql:no-transaction` stray `BEGIN` are each a
+classified `TransactionBoundaryBroken`), `crates/postgres/{sync,async}/tests/migrate_live.rs`
 (`--ignored`, per-test isolated schemas: the same set PLUS `CREATE INDEX
 CONCURRENTLY` via the marker AND its fail-loud counterpart AND the advisory-lock
-concurrency, all green in PARALLEL — the deadlock repro), and
+concurrency, all green in PARALLEL — the deadlock repro, PLUS the native-tx-status
+backstop: a top-level `COMMIT` → `TransactionBoundaryBroken` with a normal set
+still applying clean, no false positive), the `bsql-build`
+`catalog_replay_rejects_a_top_level_transaction_control_statement` /
+`embed_rejects_a_top_level_transaction_control_statement` unit tests (both build
+paths reject), and
 `tools/query_fixture`'s `runner_migrations/` + `tests/embed_migrations_live.rs`
 (the build.rs `emit_migrations` embed chain, including an acked-destructive
 migration that applies live).
