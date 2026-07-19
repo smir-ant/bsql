@@ -21,7 +21,7 @@
 use core::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
-use bsql_postgres_async::{ConnectConfig, Connection, Pool, SslMode};
+use bsql_postgres_async::{ConnectConfig, Connection, DriverError, Pool, SslMode};
 
 /// A direct plaintext config to local PG.
 fn direct() -> ConnectConfig {
@@ -70,6 +70,59 @@ async fn dropping_an_inflight_query_future_recovers_the_connection() {
     assert!(conn.is_healthy(), "the recovered connection is healthy");
     let again = conn.query_one_raw("SELECT 7::int4").await.expect("still healthy");
     assert_eq!(again.get_i32(0), Ok(Some(7)));
+    conn.close().await.expect("close");
+}
+
+/// A dropped TRANSACTION future recovers to a GENUINELY clean idle (status `I`),
+/// not merely to an RFQ still inside the leftover transaction. The fused `BEGIN`
+/// was sent and the drop skips the guard's async rollback (async `Drop` can't
+/// `.await`), so recovery must ROLL BACK the leftover transaction — otherwise the
+/// connection is "recovered" while stuck in `T`/`E`, and every subsequent verb
+/// returns `Db(25P02 "current transaction is aborted…")` forever (a regression:
+/// pre-fix a dropped-future connection was a clean `NotReady`/reconnect).
+///
+/// RED-proof: remove the `tx_status`-gated `ROLLBACK` from `recover_drain` and the
+/// `SELECT 55` below returns `25P02` instead of `Ok`.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn dropping_an_inflight_transaction_future_recovers_to_a_clean_idle() {
+    let mut conn = Connection::connect(&direct()).await.expect("connect");
+
+    // Start a transaction whose body runs a long sleep, then DROP its future when
+    // the 50 ms timeout fires — the `BEGIN` was sent, the body is mid-`pg_sleep`,
+    // and the guard's rollback is skipped.
+    let timed = tokio::time::timeout(
+        Duration::from_millis(50),
+        conn.transaction(async |tx| {
+            drop(tx.query_one_raw("SELECT pg_sleep(30)").await?);
+            Ok::<(), DriverError>(())
+        }),
+    )
+    .await;
+    assert!(
+        timed.is_err(),
+        "the transaction body must still be running when its future is dropped",
+    );
+
+    // THE ASSERTION: the next plain verb SUCCEEDS — recovery rolled the leftover
+    // transaction back to a clean idle. Without the rollback this is a permanent
+    // `25P02` with `is_disconnect() == false`.
+    let row = conn
+        .query_one_raw("SELECT 55::int4")
+        .await
+        .expect("the next verb must succeed on a connection recovered to a clean idle (not 25P02)");
+    assert_eq!(row.get_i32(0), Ok(Some(55)));
+    assert!(conn.is_healthy(), "the connection is at a genuine clean idle");
+
+    // A subsequent NEW transaction also works (no leftover-tx interference).
+    let n = conn
+        .transaction(async |tx| {
+            let r = tx.query_one_raw("SELECT 7::int4").await?;
+            Ok::<Option<i32>, DriverError>(r.get_i32(0).expect("decode i32"))
+        })
+        .await
+        .expect("a fresh transaction runs cleanly after recovery");
+    assert_eq!(n, Some(7));
     conn.close().await.expect("close");
 }
 

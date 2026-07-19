@@ -945,8 +945,10 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// - `live == None && dirty == DIRTY_DRAIN`: a command verb's future was
     ///   dropped, leaving the server owing a reply. Best-effort CANCEL the
     ///   abandoned query (so a long zombie stops fast), then re-mint + DRAIN the
-    ///   owed frames to a clean idle (bounded by the client-liveness window when a
-    ///   `statement_timeout` is set), then take the fresh token.
+    ///   owed frames to an RFQ (bounded by the client-liveness window when a
+    ///   `statement_timeout` is set), then ROLL BACK any leftover transaction the
+    ///   RFQ landed inside (a dropped `transaction` future) to a TRUE clean idle,
+    ///   then take the fresh token.
     /// - `live == None && dirty == DIRTY_RECLAIM`: a `recv_notification` wait was
     ///   dropped. It owed nothing (the engine sits at a clean idle), so just
     ///   re-mint — a drain here would block on frames that never come.
@@ -984,13 +986,36 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     }
 
     /// The `DIRTY_DRAIN` recovery body: best-effort cancel the abandoned query,
-    /// then re-mint the token and DRAIN the owed reply frames to a clean idle,
+    /// re-mint the token, DRAIN the owed reply frames to an RFQ, then ROLL BACK any
+    /// leftover transaction so the recovered connection is at a GENUINE clean idle —
     /// restoring `self.live` and clearing `dirty` on success.
     ///
-    /// On a FATAL drain (a torn wire, or a black-holed peer whose window elapsed)
-    /// the connection is truly dead: `dirty` is cleared (it is no longer
-    /// *recoverable* — it is dead) and the classified transport error is returned,
-    /// leaving `self.live == None` so the next use is a clean [`DriverError::NotReady`].
+    /// On a FATAL drain OR a failed rollback (a torn wire, or a black-holed peer
+    /// whose window elapsed) the connection is truly dead: `dirty` is cleared (it is
+    /// no longer *recoverable* — it is dead) and the classified transport error is
+    /// returned, leaving `self.live == None` so the next use is a clean
+    /// [`DriverError::NotReady`].
+    ///
+    /// # At-least-once for a mid-FLUSH drop (honest)
+    ///
+    /// If the future was dropped while the command was only PARTIALLY written, the
+    /// remainder is still queued in the engine's send buffer; the drain's entry
+    /// flush completes the send, so the abandoned query RUNS to completion
+    /// post-drop (the out-of-band cancel fired before the server had the full
+    /// command). This is within best-effort / AT-LEAST-ONCE semantics — a
+    /// NON-IDEMPOTENT write bound this way WILL apply. (A drop AFTER the command was
+    /// fully sent is instead cancelled; either way the connection recovers clean.)
+    ///
+    /// # Drain boundedness depends on `statement_timeout` (honest)
+    ///
+    /// The drain's socket reads are bounded by the client-liveness window ONLY when
+    /// a `statement_timeout` is configured (which derives that window); the cancel
+    /// normally makes the drain quick regardless, but in the narrow case of a drop
+    /// mid-INTERMEDIATE-window of a multi-window pipeline/batch (a `Flush`, no owed
+    /// `Sync`), the drain awaits an RFQ only the never-sent trailing `Sync` would
+    /// produce — so WITHOUT a `statement_timeout` that case can hang, and WITH one
+    /// it elapses to a bounded classified `Timeout` → truly dead. A single-window
+    /// batch and every ordinary command always owe an RFQ, so they recover.
     async fn recover_drain(&mut self) -> Result<(), DriverError> {
         // 1. Best-effort out-of-band cancel so a long-running zombie stops FAST and
         //    the drain below is quick. Absent hook (blocking driver / testkit) or a
@@ -1003,22 +1028,70 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         }
         // 2. Re-mint (sound: `self.live` is provably `None` and `dirty` was
         //    DIRTY_DRAIN, so the prior token was dropped — no other token exists)
-        //    and drain to a clean idle. `drain_to_idle` restores `self.live` on
-        //    success; the drain's socket reads are bounded by the client-liveness
-        //    window when a `statement_timeout` is configured.
+        //    and drain to an RFQ. `drain_to_idle` restores `self.live` on success.
         let live = self.engine.reclaim_live_after_drop();
-        match self.drain_to_idle(live).await {
-            Ok(()) => {
-                self.dirty.store(DIRTY_CLEAN, Ordering::Release);
-                Ok(())
-            }
-            Err(e) => {
-                core::hint::cold_path();
-                // Recovery failed: the connection is dead, not recoverable.
-                self.dirty.store(DIRTY_CLEAN, Ordering::Release);
-                Err(e)
-            }
+        if let Err(e) = self.drain_to_idle(live).await {
+            core::hint::cold_path();
+            // The drain failed: the connection is dead, not recoverable.
+            self.dirty.store(DIRTY_CLEAN, Ordering::Release);
+            return Err(e);
         }
+        // 3. The drain reached AN RFQ, but a dropped `transaction` future skipped the
+        //    guard's async rollback (async `Drop` cannot `.await`), so that RFQ may
+        //    sit INSIDE a leftover transaction (status `T`/`E`). Roll it back to a
+        //    TRUE clean idle — the `transaction` guard's own non-Ok contract (a
+        //    dropped/abandoned transaction MUST roll back, never commit) and exactly
+        //    what the pooled `reset_session` path does — so the recovered connection
+        //    is genuinely reusable, never left stuck in `25P02`.
+        if let Err(e) = self.rollback_leftover_transaction().await {
+            core::hint::cold_path();
+            // The rollback itself failed → the connection is dead, not recoverable.
+            self.dirty.store(DIRTY_CLEAN, Ordering::Release);
+            return Err(e);
+        }
+        self.dirty.store(DIRTY_CLEAN, Ordering::Release);
+        Ok(())
+    }
+
+    /// Roll back a leftover transaction the recovered RFQ landed inside (a dropped
+    /// `transaction` future skipped the guard's async rollback). A NO-OP when the
+    /// drain already reached a clean `Idle` (the common non-transaction case, so an
+    /// ordinary dropped-query recovery pays NO extra round trip). Reuses the token
+    /// [`drain_to_idle`](Self::drain_to_idle) just restored, and restores it again
+    /// on success.
+    async fn rollback_leftover_transaction(&mut self) -> Result<(), DriverError> {
+        // The last RFQ's tx-status byte. `Idle` → nothing to roll back. A
+        // `WrongPhase` (unreachable after a clean drain) is conservatively treated
+        // as "nothing to roll back" — the drain proved the connection idle.
+        if !matches!(
+            self.engine.tx_status(),
+            Ok(TxStatus::InTransaction | TxStatus::Failed)
+        ) {
+            return Ok(());
+        }
+        core::hint::cold_path();
+        // `drain_to_idle` restored the token; take it for the rollback. Its absence
+        // is unreachable (the drain succeeded above), classified defensively.
+        let Some(live) = self.live.take() else {
+            return Err(DriverError::NotReady);
+        };
+        let mut collector = ResultCollector::new();
+        // `ROLLBACK` is the ONE command an aborted (`E`) transaction accepts and is
+        // always valid in an open (`T`) one, so it reaches a clean `Idle`. `settle`
+        // restores `self.live` on the alive outcome; a FATAL transport error during
+        // the rollback leaves the token gone → the connection is dead.
+        let outcome = self
+            .engine
+            .simple_query(
+                live,
+                "ROLLBACK",
+                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
+                    collector.feed(s);
+                    ControlFlow::Continue(())
+                }),
+            )
+            .await;
+        self.settle(outcome, &mut collector)
     }
 
     /// Arm a [`CancelScope`] over a CLONE of this connection's `dirty` handle,
