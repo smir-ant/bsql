@@ -238,8 +238,13 @@ impl Connection {
         // Bound the ENTIRE connect sequence under ONE `connect_timeout` budget,
         // measured from the start. On elapse tokio drops the in-flight future;
         // nothing is stranded, since no `Connection` (and no reusable liveness
-        // token) exists yet.
-        let budget = Duration::from_secs(config.connect_timeout_secs);
+        // token) exists yet. `connect_budget` rejects a `0` budget HERE (before the
+        // doomed `timeout(Duration::ZERO)`, which fires instantly): a builder-set
+        // `connect_timeout(0)` is a classified `DriverError::Config`, not a spurious
+        // `Timeout`. The DSN / `PGCONNECT_TIMEOUT` parse guards reject `0` earlier;
+        // this is the builder-path backstop both drivers share (also covers pooled
+        // connects — the pool mints via `connect_with`).
+        let budget = config.connect_budget()?;
         let mut conn = match tokio::time::timeout(
             budget,
             Self::connect_inner(config, diagnostics),

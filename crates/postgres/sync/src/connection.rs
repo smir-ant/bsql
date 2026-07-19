@@ -353,14 +353,20 @@ impl Connection {
         config: &ConnectConfig,
         diagnostics: &Diagnostics,
     ) -> Result<Self, DriverError> {
+        // Validate the connect budget BEFORE dialing: `connect_budget` rejects a
+        // `0` budget (an already-expired `Duration::ZERO` timeout that fails the
+        // connect instantly) as a classified `DriverError::Config`, not a spurious
+        // `Timeout` — the builder-path backstop both drivers share (the pool mints
+        // via `connect_with` too). Placed ahead of `dial_socket`, which itself arms
+        // `Duration::from_secs(config.connect_timeout_secs)` for the dial, so a `0`
+        // never reaches an instant-timeout dial. `connect_timeout` bounds ONLY the
+        // connect phase — the SSL `SSLRequest` probe (TCP only) and the startup/auth
+        // handshake — armed as the socket read+write timeout below and DISARMED once
+        // the handshake completes: steady-state reads/writes then block indefinitely,
+        // matching the async driver, so a slow query can never turn a healthy
+        // connection into a fatal timeout.
+        let connect_timeout = config.connect_budget()?;
         let (sock, ssl_mode) = Self::dial_socket(config)?;
-        // `connect_timeout` bounds ONLY the connect phase — the SSL `SSLRequest`
-        // probe (TCP only) and the startup/auth handshake — armed as the socket
-        // read+write timeout here and DISARMED once the handshake completes
-        // (below): steady-state reads/writes then block indefinitely, matching the
-        // async driver, so a slow query can never turn a healthy connection into a
-        // fatal timeout.
-        let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
         sock.set_read_timeout(Some(connect_timeout))?;
         sock.set_write_timeout(Some(connect_timeout))?;
         // The dup'd control handle shares the kernel socket. Taken before the

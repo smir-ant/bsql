@@ -14,6 +14,52 @@ fn config_error(msg: impl Into<Box<str>>) -> crate::DriverError {
     crate::DriverError::ConfigDynamic(msg.into())
 }
 
+/// The classified [`DriverError::Config`](crate::DriverError) message for a
+/// `connect_timeout` of `0` seconds.
+///
+/// `connect_timeout_secs` is armed by both drivers as `Duration::from_secs(secs)`.
+/// A `0` there is NOT a "wait indefinitely" sentinel (libpq's meaning for
+/// `connect_timeout=0`): as a [`Duration::ZERO`] deadline it is ALREADY EXPIRED,
+/// so `tokio::time::timeout(Duration::ZERO, …)` (async) / a zero socket read+write
+/// timeout (sync) fires immediately and EVERY connect returns
+/// [`DriverError::Timeout`](crate::DriverError) after a zero-length wait — a silent
+/// footgun. bsql cannot reinterpret `0` as "infinite" either: three consumers
+/// derive their dead-peer read deadline FROM `connect_timeout` (the pool checkout
+/// reset / `Pool::close` / `recv_notification` liveness ceilings, the `cancel()`
+/// throwaway-dial timeout, and the connect/handshake drip-DoS defense), so an
+/// unbounded budget would un-bound a black-holed peer into the kernel's ~15-minute
+/// `tcp_retries2` hang — breaking the documented "get() is BOUNDED even on a dead
+/// peer" invariant. A finite budget is load-bearing, so `0` is REJECTED, never
+/// reinterpreted. A `&'static str` (the message names one fixed value, `0`, so
+/// nothing is interpolated) via [`DriverError::Config`](crate::DriverError) — zero-alloc
+/// and `is_config()`-true, holding the 24-byte `DriverError` pin. Defined ONCE so
+/// every reject site (the DSN `connect_timeout=` / `PGCONNECT_TIMEOUT` parse and the
+/// connect-time [`connect_budget`](ConnectConfig::connect_budget) backstop) reports
+/// identically and cannot drift — exactly as [`UNIX_SOCKET_UNSUPPORTED`] centralizes
+/// its message.
+pub const CONNECT_TIMEOUT_ZERO: &str =
+    "connect_timeout=0 (wait indefinitely) is unsupported — omit for the default, or set a value > 0";
+
+/// Parse a `connect_timeout` value string (the DSN `connect_timeout=` key or the
+/// `PGCONNECT_TIMEOUT` environment variable) into a validated POSITIVE seconds
+/// budget.
+///
+/// A non-numeric value is a classified [`DriverError::ConfigDynamic`](crate::DriverError)
+/// naming it; a `0` is the classified [`DriverError::Config`](crate::DriverError)
+/// carrying [`CONNECT_TIMEOUT_ZERO`] (see there for why `0` is rejected, not read as
+/// "infinite"). The ONE authority both [`from_dsn`](ConnectConfig::from_dsn) and
+/// [`from_env`](ConnectConfig::from_env) route their timeout value through, so the two
+/// parse paths cannot drift.
+fn parse_connect_timeout_secs(value: &str) -> Result<u64, crate::DriverError> {
+    let secs: u64 = value
+        .parse()
+        .map_err(|_| config_error(format!("invalid connect_timeout: {value}")))?;
+    if secs == 0 {
+        return Err(crate::DriverError::Config(CONNECT_TIMEOUT_ZERO));
+    }
+    Ok(secs)
+}
+
 /// SSL negotiation mode.
 ///
 /// # The default is threat-scoped, not a fixed value
@@ -399,7 +445,12 @@ impl ConnectConfig {
                         };
                     }
                     "connect_timeout" => {
-                        timeout = v.parse().map_err(|_| config_error(format!("invalid timeout: {v}")))?;
+                        // Shared authority with `from_env`'s `PGCONNECT_TIMEOUT`: a
+                        // non-numeric value is a classified error naming it, and `0`
+                        // (an already-expired `Duration::ZERO` deadline that fails
+                        // every connect instantly) is rejected loudly — never read as
+                        // libpq's "wait indefinitely" (see `CONNECT_TIMEOUT_ZERO`).
+                        timeout = parse_connect_timeout_secs(v)?;
                     }
                     "sslrootcert" => {
                         // Read the CA bundle from the given path NOW. libpq reads
@@ -458,7 +509,7 @@ impl ConnectConfig {
     /// Construct from environment variables.
     ///
     /// Reads: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`,
-    /// `PGSSLMODE`, `PGSSLROOTCERT`.
+    /// `PGSSLMODE`, `PGSSLROOTCERT`, `PGCHANNELBINDING`, `PGCONNECT_TIMEOUT`.
     ///
     /// A variable that is **absent** falls back to a documented default
     /// (host=localhost, port=5432, user=`$USER` then `postgres`,
@@ -556,13 +607,26 @@ impl ConnectConfig {
             }
         };
 
+        // `PGCONNECT_TIMEOUT` (libpq parity) — the connect budget in seconds.
+        // Absent → the documented `10` default; present-but-malformed / `0` is a
+        // loud classified error via the SAME `parse_connect_timeout_secs` authority
+        // the DSN `connect_timeout=` key uses, so the two parse paths cannot drift
+        // (a `0` is NOT libpq's "wait indefinitely" — see `CONNECT_TIMEOUT_ZERO`).
+        let connect_timeout_secs = match std::env::var("PGCONNECT_TIMEOUT") {
+            Ok(v) => parse_connect_timeout_secs(&v)?,
+            Err(VarError::NotPresent) => 10,
+            Err(VarError::NotUnicode(_)) => {
+                return Err(config_error("PGCONNECT_TIMEOUT is not valid UTF-8"))
+            }
+        };
+
         Ok(Self {
             host,
             port,
             user,
             database,
             password_inner: password.map(zeroize::Zeroizing::new),
-            connect_timeout_secs: 10,
+            connect_timeout_secs,
             ssl_mode,
             startup_params: Vec::new(),
             ca_roots_pem,
@@ -633,9 +697,49 @@ impl ConnectConfig {
     }
 
     /// Set connection timeout in seconds.
+    ///
+    /// Must be `> 0`: a `0` budget is an already-expired [`Duration::ZERO`]
+    /// deadline that fails every connect instantly (it is NOT libpq's "wait
+    /// indefinitely"). This builder cannot return a `Result`, so a `0` set here is
+    /// rejected at connect by [`connect_budget`](Self::connect_budget) as a
+    /// classified [`DriverError::Config`](crate::DriverError)
+    /// ([`CONNECT_TIMEOUT_ZERO`]) — before the doomed instant-timeout, never a
+    /// spurious [`DriverError::Timeout`](crate::DriverError).
     pub fn connect_timeout(mut self, secs: u64) -> Self {
         self.connect_timeout_secs = secs;
         self
+    }
+
+    /// The validated connect-timeout budget as a [`Duration`], rejecting a zero
+    /// budget at connect.
+    ///
+    /// [`connect_timeout_secs`](Self::connect_timeout_secs) is a raw `u64` that the
+    /// builder [`connect_timeout`](Self::connect_timeout) can set to `0` (a builder
+    /// cannot return a `Result`). A `0` is NOT a "wait indefinitely" sentinel — as a
+    /// [`Duration::ZERO`] deadline it is already expired, so every connect would time
+    /// out instantly. Both drivers resolve their connect budget through this ONE
+    /// method at the top of `connect_with` (before any dial), so a builder-set `0`
+    /// — or any `0` that slipped past the DSN / `PGCONNECT_TIMEOUT` parse guards — is
+    /// a classified [`DriverError::Config`](crate::DriverError) BEFORE the doomed
+    /// instant-timeout, never a spurious [`DriverError::Timeout`](crate::DriverError)
+    /// after a zero-length wait. Centralized here so the rule cannot drift between the
+    /// two drivers — exactly as [`resolve_endpoint`] centralizes the unix-vs-TCP rule.
+    ///
+    /// A successful connect therefore proves `connect_timeout_secs >= 1`, so every
+    /// downstream consumer that derives a finite budget from it (the `Redial`
+    /// snapshot's pool-reset / `cancel()`-dial / `recv_notification` liveness
+    /// ceilings, the client-liveness window) always sees a positive value — the
+    /// finite-budget invariant those depend on holds by construction.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::Config`](crate::DriverError)`(`[`CONNECT_TIMEOUT_ZERO`]`)` when
+    /// [`connect_timeout_secs`](Self::connect_timeout_secs) is `0`.
+    pub fn connect_budget(&self) -> Result<Duration, crate::DriverError> {
+        if self.connect_timeout_secs == 0 {
+            return Err(crate::DriverError::Config(CONNECT_TIMEOUT_ZERO));
+        }
+        Ok(Duration::from_secs(self.connect_timeout_secs))
     }
 
     /// Set the password. Default auth is SCRAM-SHA-256.
@@ -1450,6 +1554,79 @@ mod tests {
         assert_eq!(cfg.ssl_mode, Some(SslMode::Require));
         assert!(cfg.ssl_mode_is_explicit());
         assert_eq!(cfg.connect_timeout_secs, 3);
+    }
+
+    #[test]
+    fn dsn_rejects_connect_timeout_zero() {
+        // `connect_timeout=0` is an already-expired `Duration::ZERO` deadline that
+        // fails every connect instantly — a silent footgun, NOT libpq's "wait
+        // indefinitely". It must be a loud, classified config error at parse time,
+        // never accepted (the earliest, most precise reject site).
+        let err = match ConnectConfig::from_dsn("postgres://u@h?connect_timeout=0") {
+            Ok(_) => panic!("connect_timeout=0 must be rejected, not accepted"),
+            Err(e) => e,
+        };
+        assert!(err.is_config(), "connect_timeout=0 must be a classified config error");
+        assert_eq!(err.to_string(), format!("config error: {CONNECT_TIMEOUT_ZERO}"));
+        // A NON-zero value still parses (the guard rejects only `0`).
+        let cfg = match ConnectConfig::from_dsn("postgres://u@h?connect_timeout=5") {
+            Ok(c) => c,
+            Err(e) => panic!("connect_timeout=5 must parse: {e}"),
+        };
+        assert_eq!(cfg.connect_timeout_secs, 5);
+    }
+
+    #[test]
+    fn parse_connect_timeout_secs_covers_env_and_dsn_value_path() {
+        // The ONE authority `from_dsn`'s `connect_timeout=` key AND `from_env`'s
+        // `PGCONNECT_TIMEOUT` route their value through. Core is edition-2024 +
+        // `#![forbid(unsafe_code)]`, so `std::env::set_var` cannot be called in a
+        // unit test — this exercises the exact value-handling `from_env` runs for
+        // `PGCONNECT_TIMEOUT`, without mutating global process env.
+        // `0` → a classified `Config(CONNECT_TIMEOUT_ZERO)`.
+        let zero = match parse_connect_timeout_secs("0") {
+            Ok(_) => panic!("\"0\" must be rejected"),
+            Err(e) => e,
+        };
+        assert!(zero.is_config());
+        assert_eq!(zero.to_string(), format!("config error: {CONNECT_TIMEOUT_ZERO}"));
+        // A non-numeric value → a classified error naming it.
+        let bad = match parse_connect_timeout_secs("abc") {
+            Ok(_) => panic!("\"abc\" must be rejected"),
+            Err(e) => e,
+        };
+        assert!(bad.is_config());
+        // A positive value round-trips.
+        assert_eq!(parse_connect_timeout_secs("5").ok(), Some(5));
+    }
+
+    #[test]
+    fn builder_connect_timeout_zero_is_rejected_at_connect_budget() {
+        // The builder cannot return a `Result`, so `connect_timeout(0)` sets the
+        // field verbatim; the connect-time `connect_budget` backstop (which both
+        // drivers call before the doomed instant-timeout) rejects it as a
+        // classified `Config` error — NOT a `Timeout` after a zero-length wait.
+        let cfg = ConnectConfig::new("h", "u").connect_timeout(0);
+        let err = match cfg.connect_budget() {
+            Ok(_) => panic!("connect_budget must reject a 0 timeout"),
+            Err(e) => e,
+        };
+        assert!(err.is_config(), "a 0 builder timeout must be a classified config error");
+        assert!(
+            !matches!(err, crate::DriverError::Timeout),
+            "must be a Config error, never a spurious Timeout",
+        );
+        assert_eq!(err.to_string(), format!("config error: {CONNECT_TIMEOUT_ZERO}"));
+
+        // A positive builder value yields the expected budget.
+        let ok = ConnectConfig::new("h", "u").connect_timeout(5);
+        assert_eq!(ok.connect_budget().ok(), Some(std::time::Duration::from_secs(5)));
+
+        // The default (10) is unaffected — `connect_budget` accepts it.
+        assert_eq!(
+            ConnectConfig::new("h", "u").connect_budget().ok(),
+            Some(std::time::Duration::from_secs(10)),
+        );
     }
 
     #[test]
