@@ -2673,13 +2673,24 @@ fn decode_array_1d<T: ArrayElement>(
     let (elem_oid_bytes, rest) =
         rest.split_first_chunk::<4>().ok_or(DecodeError::ArrayTruncated)?;
     let elem_oid = u32::from_be_bytes(*elem_oid_bytes);
-    // The declared element OID must match the type the row tuple decodes as,
-    // so a `text[]` payload is never reinterpreted as `int4[]` bytes. Checked
-    // BEFORE the `ndim == 0` early return, so even an empty array enforces the
-    // element-type contract (defense-in-depth symmetry — an empty `text[]`
-    // header decoded as `int4[]` is a classified mismatch, not a silent
-    // `Ok(empty)`).
-    if elem_oid != <T as ArrayElement>::OID {
+    // The declared element OID must decode BYTE-IDENTICALLY to the type the row
+    // tuple decodes as, so a `text[]` payload is never reinterpreted as `int4[]`
+    // bytes. The check consults the SHARED [`wire_decode_class`] relation — the SAME
+    // authority the column-level result guard uses via [`result_oid_compatible`] —
+    // rather than strict equality: so a `varchar[]` payload (whose `array_send`
+    // header carries the real element `typelem` `varchar` 1043, NOT `text` 25) and a
+    // `bpchar[]` payload (element 1042) decode correctly into `Vec<Option<String>>`
+    // (its element marker is `text` 25), since varchar/bpchar/text are ONE
+    // wire-decode class (raw UTF-8) — exactly what the build-time inference already
+    // treats them as. Every other element OID stays EXACT equality (an `int4` 23
+    // element against a `String` marker is still a classified mismatch). DELIBERATELY
+    // the raw class fn, NOT `result_oid_compatible`, whose user-type
+    // `>= FIRST_NORMAL_OID` SKIP would accept a hostile array frame with a `>= 16384`
+    // element OID and feed arbitrary bytes to the scalar decoder. Checked BEFORE the
+    // `ndim == 0` early return, so even an empty array enforces the element-type
+    // contract (defense-in-depth symmetry — an empty `text[]` header decoded as
+    // `int4[]` is a classified mismatch, not a silent `Ok(empty)`).
+    if wire_decode_class(elem_oid) != wire_decode_class(<T as ArrayElement>::OID) {
         return Err(DecodeError::ArrayElemOidMismatch {
             expected: <T as ArrayElement>::OID,
             found: elem_oid,
@@ -3883,21 +3894,97 @@ pub(crate) fn result_oid_compatible(expected: u32, found: u32) -> bool {
     if found >= oids::FIRST_NORMAL_OID {
         return true;
     }
-    result_oid_class(expected) == result_oid_class(found)
+    wire_decode_class(expected) == wire_decode_class(found)
 }
 
-/// Canonicalize a built-in OID into its wire-decode equivalence class: the
-/// blank-padded / varying CHAR family (`varchar` 1043, `bpchar` 1042) collapses
-/// to `text` (25), and their arrays (`varchar[]` 1015, `bpchar[]` 1014) collapse
-/// to `text[]` (1009), since all decode identically (raw UTF-8). Every other OID
-/// is its own class (identity), so the guard is EXACT equality outside the CHAR
-/// family.
+/// Canonicalize a built-in OID into its wire-decode equivalence class — the ONE
+/// authoritative "these built-in OIDs decode byte-identically" relation, consulted
+/// by BOTH of bsql's runtime type checks so compile-time acceptance and runtime
+/// acceptance can never diverge:
+///
+/// - the COLUMN-level typed result-schema guard, via [`result_oid_compatible`]
+///   (`check_result_oids` in the engine), and
+/// - the ARRAY-element cross-check in [`decode_array_1d`].
+///
+/// The blank-padded / varying CHAR family (`varchar` 1043, `bpchar` 1042) collapses
+/// to `text` (25), and their arrays (`varchar[]` 1015, `bpchar[]` 1014) collapse to
+/// `text[]` (1009), since all decode identically (raw UTF-8) — the SAME class the
+/// build-time inference collapses them into (`scalar_elem_for_pg` maps the whole
+/// text family to `Vec<Option<String>>`). Every other OID is its own class
+/// (identity), INCLUDING any user-type OID `>= FIRST_NORMAL_OID`, so BOTH consulting
+/// sites are EXACT equality outside the CHAR family.
+///
+/// The user-type SKIP (`found >= FIRST_NORMAL_OID => accept`) lives ONLY in
+/// [`result_oid_compatible`], NOT here: the array element check consults this RAW
+/// class fn precisely so it does NOT inherit that skip — otherwise a hostile array
+/// frame declaring a `>= 16384` element OID would be accepted and feed arbitrary
+/// bytes to a scalar decoder.
 #[must_use]
-fn result_oid_class(oid: u32) -> u32 {
+fn wire_decode_class(oid: u32) -> u32 {
     match oid {
         oids::VARCHAR | oids::BPCHAR => oids::TEXT,
         oids::VARCHAR_ARRAY | oids::BPCHAR_ARRAY => oids::TEXT_ARRAY,
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod wire_decode_class_tests {
+    //! The ONE wire-decode equivalence relation both runtime type checks consult
+    //! (the column-level result guard via `result_oid_compatible`, and the array
+    //! element cross-check in `decode_array_1d`). Category (B) — tier-3 pin that
+    //! compile-time acceptance (`scalar_elem_for_pg` collapsing the text family) and
+    //! runtime acceptance are the SAME relation, and that the raw class fn does NOT
+    //! inherit the column guard's user-type SKIP (the hostile-array-frame guardrail).
+    use super::*;
+
+    /// The CHAR family (`varchar` / `bpchar` scalars AND their arrays) collapses to
+    /// the `text` / `text[]` class — they decode byte-identically (raw UTF-8).
+    #[test]
+    fn char_family_collapses_to_text() {
+        assert_eq!(wire_decode_class(oids::VARCHAR), oids::TEXT);
+        assert_eq!(wire_decode_class(oids::BPCHAR), oids::TEXT);
+        assert_eq!(wire_decode_class(oids::TEXT), oids::TEXT);
+        assert_eq!(wire_decode_class(oids::VARCHAR_ARRAY), oids::TEXT_ARRAY);
+        assert_eq!(wire_decode_class(oids::BPCHAR_ARRAY), oids::TEXT_ARRAY);
+        assert_eq!(wire_decode_class(oids::TEXT_ARRAY), oids::TEXT_ARRAY);
+    }
+
+    /// Every non-CHAR built-in OID is its own class (identity), so BOTH consulting
+    /// sites stay EXACT equality outside the text family.
+    #[test]
+    fn non_char_oids_are_identity() {
+        assert_eq!(wire_decode_class(oids::INT4), oids::INT4);
+        assert_eq!(wire_decode_class(oids::INT4_ARRAY), oids::INT4_ARRAY);
+        assert_eq!(wire_decode_class(oids::BOOL), oids::BOOL);
+        assert_eq!(wire_decode_class(oids::BYTEA_ARRAY), oids::BYTEA_ARRAY);
+    }
+
+    /// The RAW class fn must NOT inherit the column guard's user-type SKIP: a
+    /// `>= FIRST_NORMAL_OID` OID is its own class (identity), so the array element
+    /// check that consults this fn REJECTS a hostile `>= 16384` element OID (never
+    /// feeds arbitrary bytes to a scalar decoder). The skip lives only in
+    /// `result_oid_compatible`.
+    #[test]
+    fn user_type_oid_is_not_collapsed_by_the_raw_class_fn() {
+        let user = oids::FIRST_NORMAL_OID + 7;
+        assert_eq!(wire_decode_class(user), user);
+        assert_ne!(wire_decode_class(user), wire_decode_class(oids::TEXT));
+    }
+
+    /// TWIN scalar-hole confirmation: the COLUMN-level result guard
+    /// (`result_oid_compatible`) accepts a `varchar` / `bpchar` SCALAR column — and
+    /// a `varchar[]` / `bpchar[]` ARRAY column — against its `text` / `text[]`
+    /// marker (never a false `ColumnOidMismatch`), while a genuine `text`-vs-`int4`
+    /// divergence is still rejected. This is the SAME relation the array element
+    /// check now uses, so the scalar and array surfaces cannot diverge.
+    #[test]
+    fn column_guard_accepts_char_family_against_text_marker() {
+        assert!(result_oid_compatible(oids::TEXT, oids::VARCHAR));
+        assert!(result_oid_compatible(oids::TEXT, oids::BPCHAR));
+        assert!(result_oid_compatible(oids::TEXT_ARRAY, oids::VARCHAR_ARRAY));
+        assert!(result_oid_compatible(oids::TEXT_ARRAY, oids::BPCHAR_ARRAY));
+        assert!(!result_oid_compatible(oids::TEXT, oids::INT4));
     }
 }
 
@@ -6158,6 +6245,46 @@ mod array_decode_tests {
             got,
             Err(DecodeError::ArrayElemOidMismatch { expected, found })
                 if expected == oids::INT4 && found == oids::TEXT
+        ));
+    }
+
+    /// C2 fix: a `varchar[]` payload — whose `array_send` header carries the REAL
+    /// element `typelem` `varchar` (1043), NOT `text` (25) — decodes into
+    /// `Vec<Option<String>>`. Before the wire-decode-class fix the element check did
+    /// strict `elem_oid != 25` equality, so this was a classified `ArrayElemOidMismatch`
+    /// at runtime even though the column compiled. The catalog CANNOT emit a 1043
+    /// element header (inference bakes every text-family array as `text[]` element
+    /// 25), so this HAND-CRAFTS the frame to reproduce the live wire.
+    #[test]
+    fn varchar_array_decodes_as_text_family() {
+        let wire = build_array(1, oids::VARCHAR, &[Some(b"hi"), None, Some(b"z")]);
+        let got = <Vec<Option<String>> as Cell<BinaryFmt>>::decode(&wire);
+        let expected: Vec<Option<String>> =
+            alloc::vec![Some(String::from("hi")), None, Some(String::from("z"))];
+        assert!(matches!(got, Ok(ref v) if *v == expected));
+    }
+
+    /// C2 fix (twin): a `bpchar[]` payload (element `typelem` `bpchar` 1042) decodes
+    /// identically into `Vec<Option<String>>` — same wire-decode class as `text`.
+    #[test]
+    fn bpchar_array_decodes_as_text_family() {
+        let wire = build_array(1, oids::BPCHAR, &[Some(b"ab"), None]);
+        let got = <Vec<Option<String>> as Cell<BinaryFmt>>::decode(&wire);
+        let expected: Vec<Option<String>> = alloc::vec![Some(String::from("ab")), None];
+        assert!(matches!(got, Ok(ref v) if *v == expected));
+    }
+
+    /// STRICTNESS preserved OUTSIDE the text family: a genuinely-unrelated element
+    /// OID (`int4` 23) against a `String` element marker (25) is STILL a classified
+    /// mismatch — the fix widens acceptance to the CHAR family only, nothing else.
+    #[test]
+    fn unrelated_element_oid_against_string_is_rejected() {
+        let wire = build_array(1, oids::INT4, &[Some(b"x")]);
+        let got = <Vec<Option<String>> as Cell<BinaryFmt>>::decode(&wire);
+        assert!(matches!(
+            got,
+            Err(DecodeError::ArrayElemOidMismatch { expected, found })
+                if expected == oids::TEXT && found == oids::INT4
         ));
     }
 

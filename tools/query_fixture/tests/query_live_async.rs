@@ -104,6 +104,12 @@ bsql::query!(IntArrayLit, "SELECT ARRAY[10, NULL, 30]::int4[] AS xs");
 bsql::query!(TextArrayLit, "SELECT ARRAY['a', NULL, 'c']::text[] AS xs");
 bsql::query!(NullArrayLit, "SELECT NULL::int4[] AS xs");
 bsql::query!(EmptyArrayLit, "SELECT ARRAY[]::int4[] AS xs");
+// C2 regression: the text-FAMILY array columns whose runtime element `typelem`
+// is `varchar` (1043) / `bpchar` (1042), NOT `text` (25). They compile as
+// `Vec<Option<String>>` (one wire-decode class) and only fail live if the array
+// element cross-check strict-compares the element OID against 25.
+bsql::query!(VarcharArrayLit, "SELECT ARRAY['a', NULL, 'c']::varchar[] AS xs");
+bsql::query!(BpcharArrayLit, "SELECT ARRAY['a', NULL, 'c']::bpchar[] AS xs");
 
 // ── int2 (i16) + bool: the last two of the 18 scalar types without a
 //    decode-VALUE witness through the `ColCellAt::decode_at` seam. The scalar
@@ -969,6 +975,35 @@ async fn typed_array_columns_round_trip() {
 
     let empty = c.query_one::<EmptyArrayLit>(()).await.expect("query_one EmptyArrayLit");
     assert_eq!(empty.xs, Some(Vec::<Option<i32>>::new()));
+
+    c.close().await.expect("close");
+}
+
+/// C2 REGRESSION (text-family array element OID): a `varchar[]` / `bpchar[]` result
+/// column — whose live `array_send` header carries the REAL element `typelem`
+/// (`varchar` 1043 / `bpchar` 1042), NOT `text` 25 — decodes into
+/// `Vec<Option<String>>`. Before the wire-decode-class fix the array element check
+/// did strict `elem_oid != 25` equality, so a routine `tags varchar(50)[]` column
+/// compiled but every decode failed at runtime with `ArrayElemOidMismatch`. The
+/// genuine 1015/1014 array (1043/1042 element) OIDs are only observable live.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn typed_text_family_array_columns_round_trip() {
+    let mut c = Connection::connect(&async_config()).await.expect("connect");
+
+    let vc = c.query_one::<VarcharArrayLit>(()).await.expect("query_one VarcharArrayLit");
+    assert_eq!(
+        vc.xs,
+        Some(vec![Some(String::from("a")), None, Some(String::from("c"))])
+    );
+
+    let bp = c.query_one::<BpcharArrayLit>(()).await.expect("query_one BpcharArrayLit");
+    // Bare `bpchar` (no length modifier) does not blank-pad, so the width-1 literals
+    // round-trip unchanged.
+    assert_eq!(
+        bp.xs,
+        Some(vec![Some(String::from("a")), None, Some(String::from("c"))])
+    );
 
     c.close().await.expect("close");
 }
