@@ -58,6 +58,13 @@ bsql::query!(
     PlBulkIns,
     "INSERT INTO pl_bulk (id, payload) VALUES ($1, $2) RETURNING id"
 );
+// The DECISIVE co-window-deadlock carriers (no table): an EARLY command returning
+// a ~40 MB result, paired with a LATER command whose SINGLE `text` Bind param is
+// OVERSIZE (well past any socket send buffer). `PlEcho` echoes its huge param, so
+// its OWN Bind AND its result are both large. See
+// `co_window_oversize_param_does_not_deadlock`.
+bsql::query!(PlHugeResult, "SELECT repeat('x', 40000000)::text AS s");
+bsql::query!(PlEcho, "SELECT $1::text AS s");
 
 fn cfg() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -547,6 +554,55 @@ async fn windowed_large_result_plus_large_params_does_not_deadlock() {
         .expect("decode")
         .unwrap_or(-1);
     assert_eq!(got, 512 * 1024, "the 512 KiB payload round-tripped whole");
+    c.close().await.expect("close");
+}
+
+/// THE DECISIVE co-window write-path DEADLOCK witness. The 512 KiB witness above
+/// stays UNDER the socket send buffers, so it is a platform-dependent NON-proof of
+/// the deadlock. This one ENTERS the regime unambiguously: an EARLY command
+/// returning a ~40 MB result (`PlHugeResult`) paired with a LATER command whose
+/// SINGLE ~40 MiB `text` Bind param (`PlEcho`) is well past any socket send buffer.
+///
+/// Pre-fix (the co-window drive: stage cmd0 + cmd1 into one window, flush both) this
+/// DEADLOCKS: the client blocks WRITING the ~40 MiB Bind while the server blocks
+/// WRITING the ~40 MB early result — each end blocked on write, neither reading. The
+/// drain-before-oversize windowing ISOLATES the oversize command: it flushes +
+/// DRAINS the prefix (the big-result command) ALONE first, so the client reads the
+/// ~40 MB result before it can write-block on the ~40 MiB Bind, then the oversize
+/// command rides its own fresh window (a single command never self-deadlocks — the
+/// server reads its whole Bind before producing any result). The 90 s timeout is the
+/// regression net: a revert to the co-window drive HANGS here and elapses it.
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn co_window_oversize_param_does_not_deadlock() {
+    let mut c = Connection::connect(&cfg()).await.expect("connect");
+    // 40 MiB — one Bind frame well past any socket send buffer, so the client
+    // genuinely write-blocks (a 512 KiB param does not, hence this larger witness).
+    let huge = "z".repeat(40 * 1024 * 1024);
+    let out = tokio::time::timeout(
+        Duration::from_secs(90),
+        c.pipeline((PlHugeResult::bind(()), PlEcho::bind((huge.as_str(),)))),
+    )
+    .await
+    .expect("pipeline completed within 90 s — a co-window drive would DEADLOCK on the ~40 MiB Bind")
+    .expect("pipeline runs");
+    let (big, echo) = out;
+    // The ~40 MB early result decoded whole — it was drained (in the isolated prefix
+    // window) BEFORE the oversize Bind was written, which is exactly what breaks the
+    // deadlock.
+    assert_eq!(
+        big.iter().next().expect("row").expect("decode").s.expect("non-null").len(),
+        40_000_000,
+        "the ~40 MB early result decoded whole",
+    );
+    // The ~40 MiB echoed param round-tripped whole (the isolate relocated its WIRE
+    // bytes verbatim — no window boundary corrupted it).
+    assert_eq!(
+        echo.iter().next().expect("row").expect("decode").s.len(),
+        40 * 1024 * 1024,
+        "the ~40 MiB oversize param round-tripped whole",
+    );
+    assert!(c.is_healthy(), "connection is reusable after the oversize batch");
     c.close().await.expect("close");
 }
 

@@ -1272,7 +1272,17 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   the window's responses out WITHOUT ending the implicit transaction — only the single
   trailing `Sync` does) and DRAINS that window's responses (routing each command's rows
   to ITS `Rows<Qi>` builder) via `run_pipeline_break_guarded` before staging the next —
-  so the client always reads before it write-blocks. A batch fitting one window (the
+  so the client always reads before it write-blocks. A SINGLE command whose OWN `Bind`
+  alone crosses the threshold on a non-empty prefix is ISOLATED (`Core::isolate_prefix`:
+  the prefix is flushed + drained ALONE first, then the oversize command rides its own
+  window — the drain-before-oversize fix), so the deadlock-freedom covers the
+  single-oversize-command class (the UNBOUNDED case — one Bind tens of MiB past any send
+  buffer) AND the common single-window batch. HONEST RESIDUAL (pre-existing, intentional):
+  a window of MULTIPLE small commands cumulatively up to ~2×threshold co-windowed with an
+  early large-RESULT command can still deadlock ONLY on sub-128 KiB tuned socket buffers
+  (never default-autotuned Linux/loopback) — BOUNDED (capped at ~2×threshold, unlike the
+  unbounded single-Bind case) and inherent to threshold-windowed bidirectional pipelining
+  (fully closing it costs 1 RTT per command). A batch fitting one window (the
   common case) stages every command, sends NO intermediate `Flush`, and rides the single
   trailing `Sync` — exactly ~1 round trip, byte-identical to today's single-Sync
   pipeline; only a genuinely huge-param batch pays ~`N/window` round trips (the honest
@@ -1381,7 +1391,8 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   fix (a FIRST-window `FrameTooLong` reuses `abort_pipeline_staging`'s peek path — the
   consumed deferred `BEGIN` survives). `N == 0` does NO wire I/O (`Ok(vec![])`); `N == 1`
   equals a single `execute` (no regression). **Constant SEND memory, deadlock-free (the
-  windowed batcher).** A large N must NOT buffer all N `Bind`s: the commands stream and
+  windowed batcher — same drain-before-oversize isolate + the bounded multi-command
+  residual as `pipeline` above).** A large N must NOT buffer all N `Bind`s: the commands stream and
   flush at a 64 KiB threshold (`BATCH_WINDOW_THRESHOLD`, like `copy_in`), so the
   staged-bytes high-water is bounded regardless of N. UNLIKE COPY — where the server is
   silent while the client streams, so a write-ahead cannot deadlock — an extended-protocol
@@ -1466,7 +1477,9 @@ SCRAM test requires: user `bsql_test_scram` with password `test_password_123` in
   `Rows<Q>` or it errors and returns ZERO (the `Vec` is built ONLY after the batch's
   clean trailing `ReadyForQuery`); NO auto-rollback (a mid-batch failure inside an
   explicit transaction leaves it aborted `'E'` for its owner — a next in-guard verb is a
-  loud `25P02`). Constant SEND memory + deadlock-free (the windowed batcher). `N == 0`
+  loud `25P02`). Constant SEND memory + deadlock-free (the windowed batcher — same
+  drain-before-oversize isolate + the bounded multi-command residual as `pipeline`).
+  `N == 0`
   does NO wire I/O (`Ok(vec![])`); `N == 1` equals a single `query` (no regression).
   Cancellation (`57014`, connection recovers) + mid-batch transport death (classified
   disconnect, bounded) honored. Footprints UNCHANGED (`DriverError` 24 / `ConnectConfig`

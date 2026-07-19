@@ -15,12 +15,18 @@
     reason = "live test harness — expect/unwrap/panic surface failures loudly; not production fallbacks"
 )]
 
+use std::thread;
+use std::time::Duration;
+
 use bsql_postgres_sync::{ConnectConfig, Connection, DriverError, SslMode};
 
 bsql::query!(
     EbsIns,
     "INSERT INTO eb_rows (id, balance) VALUES ($1, $2) RETURNING id"
 );
+// The DECISIVE co-window-deadlock carrier (no table): a SELECT that ECHOES its huge
+// `text` param, so each command carries BOTH an oversize Bind AND a large result.
+bsql::query!(EbsEcho, "SELECT $1::text AS s");
 bsql::query!(
     EbsUpd,
     "UPDATE eb_rows SET balance = balance + $2::int8 WHERE id = $1 RETURNING id"
@@ -209,5 +215,37 @@ fn typed_execute_returns_the_affected_count() {
         .expect("decode")
         .unwrap_or(-1);
     assert_eq!(balance, 105, "INSERT + UPDATE applied");
+    c.close().expect("close");
+}
+
+/// THE DECISIVE co-window write-path DEADLOCK witness for `execute_batch` (sync twin).
+/// A homogeneous batch whose commands each carry an oversize ~40 MiB `text` param
+/// (past any socket send buffer) and echo it as a ~40 MiB result. Pre-fix (co-window
+/// drive) the blocking `execute_batch` DEADLOCKS — the client write-blocks on a later
+/// command's ~40 MiB Bind while the server write-blocks on an earlier command's
+/// ~40 MiB result. The drain-before-oversize windowing ISOLATES it. Run in a worker
+/// thread joined with `recv_timeout` so a regression fails LOUDLY at the timeout
+/// instead of hanging the test forever.
+#[test]
+#[ignore = "requires local PG"]
+fn co_window_oversize_param_does_not_deadlock() {
+    let c = Connection::connect(&cfg()).expect("connect");
+    let huge = "z".repeat(40 * 1024 * 1024); // 40 MiB — one Bind past the send buffer
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut c = c;
+        let counts = c.execute_batch::<EbsEcho>([(huge.as_str(),), (huge.as_str(),), (huge.as_str(),)]);
+        let _ = tx.send((c, counts));
+    });
+
+    let (mut c, counts) = rx.recv_timeout(Duration::from_secs(90)).expect(
+        "execute_batch completed within 90 s — a co-window drive would DEADLOCK on the ~40 MiB Bind",
+    );
+    worker.join().expect("worker thread");
+    let counts = counts.expect("batch runs");
+    assert_eq!(counts.len(), 3, "one count per command");
+    assert!(counts.iter().all(|&r| r == 1), "each SELECT reported one row, got {counts:?}");
+    assert!(c.is_healthy(), "connection reusable after the oversize batch");
     c.close().expect("close");
 }

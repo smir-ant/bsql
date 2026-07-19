@@ -31,6 +31,9 @@ bsql::query!(
 bsql::query!(QbsSeven, "SELECT 7::int4 AS n");
 bsql::query!(QbsTag, "SELECT tag FROM oidguard");
 bsql::query!(QbsSleep, "SELECT pg_sleep(3)::text AS s");
+// The DECISIVE co-window-deadlock carrier (no table): a SELECT that ECHOES its huge
+// `text` param, so each command carries BOTH an oversize Bind AND a large result.
+bsql::query!(QbsEcho, "SELECT $1::text AS s");
 
 const OID_TEXT: u32 = 25;
 const OID_INT4: u32 = 23;
@@ -239,5 +242,47 @@ fn cancel_mid_batch_is_57014_and_connection_recovers() {
     }
     assert!(c.is_healthy(), "a cancel is NOT a disconnect — connection reusable");
     assert_eq!(c.query_one::<QbsSeven>(()).expect("reuse after cancel").n, 7);
+    c.close().expect("close");
+}
+
+/// THE DECISIVE co-window write-path DEADLOCK witness for `query_batch` (sync twin).
+/// A homogeneous batch whose commands each carry an oversize ~40 MiB `text` param
+/// (past any socket send buffer) and echo it as a ~40 MiB result. Pre-fix (co-window
+/// drive) the blocking `query_batch` DEADLOCKS — the client write-blocks on a later
+/// command's ~40 MiB Bind while the server write-blocks on an earlier command's
+/// ~40 MiB result. The drain-before-oversize windowing ISOLATES it. Run in a worker
+/// thread joined with `recv_timeout` so a regression fails LOUDLY at the timeout
+/// instead of hanging the test forever.
+#[test]
+#[ignore = "requires local PG"]
+fn co_window_oversize_param_does_not_deadlock() {
+    let c = Connection::connect(&cfg()).expect("connect");
+    let huge = "z".repeat(40 * 1024 * 1024); // 40 MiB — one Bind past the send buffer
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut c = c;
+        let out = c.query_batch::<QbsEcho>([(huge.as_str(),), (huge.as_str(),), (huge.as_str(),)]);
+        // Extract owned lengths INSIDE the worker (borrowed records alias the `Rows`).
+        let extracted = out.map(|groups| {
+            groups
+                .iter()
+                .map(|g| g.iter().next().expect("row").expect("decode").s.len())
+                .collect::<Vec<usize>>()
+        });
+        let _ = tx.send((c, extracted));
+    });
+
+    let (mut c, extracted) = rx.recv_timeout(Duration::from_secs(90)).expect(
+        "query_batch completed within 90 s — a co-window drive would DEADLOCK on the ~40 MiB Bind",
+    );
+    worker.join().expect("worker thread");
+    let lens = extracted.expect("batch runs");
+    assert_eq!(lens.len(), 3, "one grouped result per command");
+    assert!(
+        lens.iter().all(|&l| l == 40 * 1024 * 1024),
+        "each command's ~40 MiB echoed result decoded whole, got {lens:?}",
+    );
+    assert!(c.is_healthy(), "connection reusable after the oversize batch");
     c.close().expect("close");
 }

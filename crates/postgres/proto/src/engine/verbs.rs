@@ -1576,6 +1576,52 @@ impl<'b, T: Transport> Engine<'b, T> {
         self.send_buf.pending_len()
     }
 
+    /// Lift the LAST `n` staged-but-unsent bytes off the send buffer, returning
+    /// them un-staged — the un-stage half of the windowed drive's OVERSIZE-command
+    /// ISOLATION (see the driver's `isolate_prefix` and
+    /// [`SendBuf::split_off_pending`]). The driver stages one command, measures its
+    /// own frame size, and — when that command would co-window with a large-result
+    /// prefix into a write-path deadlock — lifts its `n` frame bytes out (so the
+    /// prefix flushes + drains ALONE), then [`restage_bytes`](Self::restage_bytes)
+    /// them into a fresh, isolated window. Only WIRE BYTES move; the command's
+    /// engine-side seat / guard-OID FIFO push is UNTOUCHED. No token, no I/O.
+    #[inline]
+    #[must_use]
+    pub fn split_last_staged(&mut self, n: usize) -> Vec<u8> {
+        self.send_buf.split_off_pending(n)
+    }
+
+    /// Re-stage already-encoded frame bytes lifted by
+    /// [`split_last_staged`](Self::split_last_staged) back onto the send buffer —
+    /// the re-stage half of oversize-command isolation. Appends verbatim (the
+    /// bytes are already wire-framed), so the isolated command's frames are
+    /// byte-identical to their original staging. No token, no I/O.
+    #[inline]
+    pub fn restage_bytes(&mut self, bytes: &[u8]) {
+        self.send_buf.enqueue(bytes);
+    }
+
+    /// Compact the DRAINED send buffer between windows of a batch drive — drop the
+    /// already-sent prefix (retaining capacity), so a long batch's send buffer
+    /// stays bounded regardless of window count (the cross-window peer of the
+    /// per-window `pending_send_len` bound) instead of accumulating every window's
+    /// sent bytes for the batch's life.
+    ///
+    /// Only valid at a clean inter-window boundary, where the window's `Flush` was
+    /// fully written ([`SendBuf::is_drained`]); the driver calls it exactly there
+    /// (on a `Boundary::Stopped` window drain). A `debug_assert` pins the drained
+    /// precondition; `reset` is a no-op on a non-drained buffer's already-sent
+    /// prefix and preserves any unsent tail, so it is fail-safe regardless. No
+    /// token, no I/O.
+    #[inline]
+    pub fn compact_send_buf(&mut self) {
+        debug_assert!(
+            self.send_buf.is_drained(),
+            "compact_send_buf called with an unsent tail (not at a clean window boundary)",
+        );
+        self.send_buf.reset();
+    }
+
     /// Drive a staged `execute_batch` WINDOW to its boundary — the BREAKABLE peer of
     /// [`run_pipeline`](Self::run_pipeline). `sink` returns [`ControlFlow::Break`]
     /// once it has counted the window's expected deliveries, so the pump stops at

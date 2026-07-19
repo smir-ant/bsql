@@ -339,6 +339,48 @@ impl SendBuf {
         self.sent = 0;
     }
 
+    /// Split the LAST `n` pending (staged-but-unsent) bytes off the tail,
+    /// returning them and leaving them un-staged — the un-stage primitive the
+    /// windowed batch drive uses to ISOLATE an oversize command from a co-window
+    /// prefix (see the driver's `isolate_prefix`).
+    ///
+    /// The batch drive stages one command, then measures whether that command's
+    /// own frame (`n` bytes) would co-window with a large-result prefix into a
+    /// write-path deadlock. When it would, the command's bytes are the tail `n`
+    /// pending bytes (staging appends contiguously, so the just-staged command is
+    /// exactly the pending tail): this lifts them OUT of the buffer so the prefix
+    /// can be flushed + drained alone, then the returned bytes are re-staged (via
+    /// [`enqueue`](Self::enqueue)) into a FRESH window where the command is
+    /// isolated. The command's engine-side state (a pipeline MISS's guard-OID FIFO
+    /// push, its seat) is UNTOUCHED — only its already-encoded WIRE BYTES move —
+    /// so the receive FSM still guards / decodes it correctly when the isolated
+    /// window is drained.
+    ///
+    /// # Precondition
+    ///
+    /// `n <= pending_len()`: only UNSENT bytes may be lifted (splitting into the
+    /// already-`sent` prefix would push `sent` past the buffer end and corrupt the
+    /// cursor). A `debug_assert` pins it; in release the split point is clamped to
+    /// the send cursor so the invariant `sent <= buf.len()` holds unconditionally
+    /// (the sole caller always passes a just-measured `n <= pending_len()`, so the
+    /// clamp is never reached — a fail-safe, not a fallback path).
+    #[inline]
+    #[must_use]
+    pub fn split_off_pending(&mut self, n: usize) -> Vec<u8> {
+        debug_assert!(
+            n <= self.pending_len(),
+            "split_off_pending would lift already-sent bytes (n > pending_len)",
+        );
+        // `buf.len() - n`, clamped to never dip below `sent` (fail-safe for the
+        // debug-asserted precondition). `saturating_sub` keeps the forbid wall
+        // (`arithmetic_side_effects`) satisfied; `.max(sent)` guarantees the split
+        // point never lifts a sent byte, so `sent <= buf.len()` still holds.
+        let at = self.buf.len().saturating_sub(n).max(self.sent);
+        // `Vec::split_off` returns `buf[at..]` as a fresh Vec and truncates `buf`
+        // to `at` (never below `sent`, so the cursor stays valid).
+        self.buf.split_off(at)
+    }
+
     /// Empty the buffer, DISCARDING any not-yet-sent bytes, retaining the
     /// backing capacity for the next batch.
     ///
@@ -785,6 +827,57 @@ mod scrub_drained_tests {
         // The retained allocation accepts a follow-on batch.
         sb.enqueue(b"next-phase-frame");
         assert_eq!(sb.queued(), b"next-phase-frame");
+    }
+}
+
+#[cfg(test)]
+mod split_off_pending_tests {
+    //! Un-stage contract for [`SendBuf::split_off_pending`]: it lifts the LAST `n`
+    //! pending bytes off the tail (the oversize command's just-staged frame), leaves
+    //! the prefix pending, and NEVER touches the already-`sent` cursor — the driver's
+    //! `isolate_prefix` relies on all three to relocate an oversize command's bytes
+    //! into a fresh window while flushing the prefix alone.
+
+    use super::SendBuf;
+
+    #[test]
+    fn splits_the_pending_tail_and_leaves_the_prefix() {
+        let mut sb = SendBuf::new();
+        sb.enqueue(b"PREFIX"); // the co-window prefix (6 B)
+        sb.enqueue(b"OVERSIZE-COMMAND-FRAME"); // the just-staged oversize command (22 B)
+        assert_eq!(sb.pending_len(), 28);
+
+        // Lift the oversize command's 22 tail bytes back out (un-stage it).
+        let lifted = sb.split_off_pending(22);
+
+        assert_eq!(lifted, b"OVERSIZE-COMMAND-FRAME", "the tail bytes are returned");
+        assert_eq!(sb.pending(), b"PREFIX", "only the prefix remains pending");
+        assert_eq!(sb.pending_len(), 6);
+
+        // Re-stage the lifted bytes (the isolate's fresh window) — byte-identical.
+        sb.enqueue(&lifted);
+        assert_eq!(sb.pending(), b"PREFIXOVERSIZE-COMMAND-FRAME");
+    }
+
+    #[test]
+    fn never_lifts_already_sent_bytes_across_a_prior_window() {
+        // Mimic a MULTI-WINDOW batch: a prior window's bytes were flushed (sent), then
+        // this window staged a prefix + an oversize command onto the SAME buffer.
+        let mut sb = SendBuf::new();
+        sb.enqueue(b"WINDOW0"); // 7 B, already flushed below
+        assert!(sb.advance(7).is_ok(), "flush window 0");
+        assert!(sb.is_drained());
+        sb.enqueue(b"P1"); // window 1 prefix (2 B, unsent)
+        sb.enqueue(b"OVERSIZE1"); // window 1 oversize command (9 B, unsent)
+        assert_eq!(sb.pending_len(), 11, "only window 1 is pending");
+
+        let lifted = sb.split_off_pending(9);
+
+        assert_eq!(lifted, b"OVERSIZE1");
+        // The prefix is the ONLY pending remainder; the already-sent WINDOW0 prefix is
+        // untouched, so `pending()` (buf[sent..]) is exactly the window-1 prefix.
+        assert_eq!(sb.pending(), b"P1", "sent cursor preserved — no sent byte lifted");
+        assert_eq!(sb.pending_len(), 2);
     }
 }
 

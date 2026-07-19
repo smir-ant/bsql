@@ -52,6 +52,10 @@ bsql::query!(
     "SELECT id, label FROM qb_rows WHERE id <= $1 ORDER BY id"
 );
 bsql::query!(QbSeven, "SELECT 7::int4 AS n");
+// The DECISIVE co-window-deadlock carrier (no table): a SELECT that ECHOES its huge
+// `text` param, so each command carries BOTH an oversize Bind AND a large result.
+// See `co_window_oversize_param_does_not_deadlock`.
+bsql::query!(QbEcho, "SELECT $1::text AS s");
 // Over the shared `oidguard(tag text, …)` migration table — a TEMP shadow retyping
 // `tag` to int4 is the drift the result-OID guard catches.
 bsql::query!(QbTag, "SELECT tag FROM oidguard");
@@ -316,5 +320,41 @@ async fn cancel_mid_batch_is_57014_and_connection_recovers() {
     }
     // A cancel is NOT a disconnect — the connection is reusable.
     assert_eq!(c.query_one::<QbSeven>(()).await.expect("reuse after cancel").n, 7);
+    c.close().await.expect("close");
+}
+
+/// THE DECISIVE co-window write-path DEADLOCK witness for `query_batch`. It enters
+/// the true regime: a homogeneous batch whose commands each carry an oversize
+/// ~40 MiB `text` param (past any socket send buffer) AND echo it as a ~40 MiB
+/// result. Pre-fix (co-window drive) this DEADLOCKS — the client write-blocks on a
+/// later command's ~40 MiB Bind while the server write-blocks on an earlier
+/// command's ~40 MiB result (each blocked on write). The drain-before-oversize
+/// windowing ISOLATES the oversize command, so it completes with EVERY grouped
+/// result kept and correct. The 90 s timeout is the regression net (a revert HANGS).
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn co_window_oversize_param_does_not_deadlock() {
+    let mut c = Connection::connect(&cfg()).await.expect("connect");
+    // 40 MiB — one Bind well past any socket send buffer, so the client write-blocks.
+    let huge = "z".repeat(40 * 1024 * 1024);
+    let groups = tokio::time::timeout(
+        Duration::from_secs(90),
+        c.query_batch::<QbEcho>([(huge.as_str(),), (huge.as_str(),), (huge.as_str(),)]),
+    )
+    .await
+    .expect("query_batch completed within 90 s — a co-window drive would DEADLOCK on the ~40 MiB Bind")
+    .expect("batch runs");
+    // One grouped `Rows<QbEcho>` per command, in order, each keeping its echoed
+    // ~40 MiB result whole (the isolate relocated WIRE bytes verbatim — no window
+    // boundary corrupted a param or its result).
+    assert_eq!(groups.len(), 3, "one grouped result per command");
+    for g in &groups {
+        assert_eq!(
+            g.iter().next().expect("row").expect("decode").s.len(),
+            40 * 1024 * 1024,
+            "each command's ~40 MiB echoed result decoded whole",
+        );
+    }
+    assert!(c.is_healthy(), "connection reusable after the oversize batch");
     c.close().await.expect("close");
 }

@@ -41,6 +41,10 @@ bsql::query!(
     PlBulkInsS,
     "INSERT INTO pl_bulk (id, payload) VALUES ($1, $2) RETURNING id"
 );
+// The DECISIVE co-window-deadlock carriers (sync twins, no table): a ~40 MB result
+// paired with a SELECT echoing an OVERSIZE (~40 MiB, past any send buffer) param.
+bsql::query!(PlHugeResultS, "SELECT repeat('x', 40000000)::text AS s");
+bsql::query!(PlEchoS, "SELECT $1::text AS s");
 
 fn cfg() -> ConnectConfig {
     ConnectConfig::new("127.0.0.1", "smir-ant")
@@ -403,6 +407,45 @@ fn windowed_large_result_plus_large_params_does_not_deadlock() {
         "every windowed write returned its id, in order",
     );
     assert_eq!(bulk_count(&mut c, base + 1, base + 6), 6, "all six writes committed");
+    c.close().expect("close");
+}
+
+/// THE DECISIVE co-window write-path DEADLOCK witness (sync twin). The 512 KiB
+/// witness above stays UNDER the socket send buffers (a platform-dependent NON-proof);
+/// this ENTERS the regime: an EARLY ~40 MB result paired with a LATER command whose
+/// SINGLE ~40 MiB `text` Bind param exceeds the send buffer. Pre-fix (co-window
+/// drive) the blocking `pipeline` DEADLOCKS — the client write-blocks on the ~40 MiB
+/// Bind while the server write-blocks on the ~40 MB result. The drain-before-oversize
+/// windowing ISOLATES it. Run in a worker thread joined with `recv_timeout` so a
+/// regression fails LOUDLY at the timeout instead of hanging the test forever.
+#[test]
+#[ignore = "requires local PG"]
+fn co_window_oversize_param_does_not_deadlock() {
+    let c = Connection::connect(&cfg()).expect("connect");
+    let huge = "z".repeat(40 * 1024 * 1024); // 40 MiB — one Bind past the send buffer
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut c = c;
+        let out = c.pipeline((PlHugeResultS::bind(()), PlEchoS::bind((huge.as_str(),))));
+        // Extract owned lengths INSIDE the worker (the borrowed records alias the
+        // per-command `Rows`), then hand the connection + data back to the test.
+        let extracted = out.map(|(big, echo)| {
+            let big_len = big.iter().next().expect("row").expect("decode").s.expect("non-null").len();
+            let echo_len = echo.iter().next().expect("row").expect("decode").s.len();
+            (big_len, echo_len)
+        });
+        let _ = tx.send((c, extracted));
+    });
+
+    let (mut c, extracted) = rx.recv_timeout(Duration::from_secs(90)).expect(
+        "pipeline completed within 90 s — a co-window drive would DEADLOCK on the ~40 MiB Bind",
+    );
+    worker.join().expect("worker thread");
+    let (big_len, echo_len) = extracted.expect("pipeline runs");
+    assert_eq!(big_len, 40_000_000, "the ~40 MB early result decoded whole");
+    assert_eq!(echo_len, 40 * 1024 * 1024, "the ~40 MiB oversize param round-tripped whole");
+    assert!(c.is_healthy(), "connection reusable after the oversize batch");
     c.close().expect("close");
 }
 

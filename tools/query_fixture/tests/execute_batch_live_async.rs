@@ -28,6 +28,8 @@
     reason = "live test harness — expect/unwrap/panic surface failures loudly; not production fallbacks"
 )]
 
+use std::time::Duration;
+
 use bsql_postgres_async::{ConnectConfig, Connection, DriverError, SslMode};
 
 // A typed `query!` carrier requires a ROW SHAPE (SELECT or `… RETURNING`), exactly
@@ -37,6 +39,10 @@ bsql::query!(
     EbIns,
     "INSERT INTO eb_rows (id, balance) VALUES ($1, $2) RETURNING id"
 );
+// The DECISIVE co-window-deadlock carrier (no table): a SELECT that ECHOES its huge
+// `text` param, so each command carries BOTH an oversize Bind AND a large result.
+// See `co_window_oversize_param_does_not_deadlock`.
+bsql::query!(EbEcho, "SELECT $1::text AS s");
 bsql::query!(
     EbUpd,
     "UPDATE eb_rows SET balance = balance + $2::int8 WHERE id = $1 RETURNING id"
@@ -263,6 +269,36 @@ async fn large_n_windowed_is_correct_and_deadlock_free() {
     let result = c.execute_batch::<EbIns>(sets).await;
     assert!(matches!(result, Err(DriverError::BatchFailed { index, .. }) if index == N as usize));
     assert_eq!(row_count(&mut c).await, 0, "large mid-batch failure applied NOTHING");
+    c.close().await.expect("close");
+}
+
+/// THE DECISIVE co-window write-path DEADLOCK witness for `execute_batch`. The
+/// N=20_000 test above uses SMALL params (each Bind fits the send buffer); this one
+/// enters the true regime: a homogeneous batch whose FIRST command's ~40 MiB param
+/// produces a ~40 MiB (echoed) result, followed by commands whose OWN ~40 MiB Bind
+/// EXCEEDS the socket send buffer. Pre-fix (co-window drive) this DEADLOCKS — the
+/// client write-blocks on a later command's ~40 MiB Bind while the server
+/// write-blocks on the first command's ~40 MiB result (each blocked on write). The
+/// drain-before-oversize windowing ISOLATES the oversize command, so it completes.
+/// `execute_batch` DISCARDS its RETURNING rows, but the server still SENDS them, so
+/// the deadlock is real. The 90 s timeout is the regression net (a revert HANGS).
+#[tokio::test]
+#[ignore = "requires local PG"]
+async fn co_window_oversize_param_does_not_deadlock() {
+    let mut c = Connection::connect(&cfg()).await.expect("connect");
+    // 40 MiB — one Bind well past any socket send buffer, so the client write-blocks.
+    let huge = "z".repeat(40 * 1024 * 1024);
+    let counts = tokio::time::timeout(
+        Duration::from_secs(90),
+        c.execute_batch::<EbEcho>([(huge.as_str(),), (huge.as_str(),), (huge.as_str(),)]),
+    )
+    .await
+    .expect("execute_batch completed within 90 s — a co-window drive would DEADLOCK on the ~40 MiB Bind")
+    .expect("batch runs");
+    assert_eq!(counts.len(), 3, "one count per command");
+    // A SELECT's `CommandComplete` tag projects its row count (1) as the count.
+    assert!(counts.iter().all(|&r| r == 1), "each SELECT reported one row, got {counts:?}");
+    assert!(c.is_healthy(), "connection reusable after the oversize batch");
     c.close().await.expect("close");
 }
 

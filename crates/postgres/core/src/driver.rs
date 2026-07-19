@@ -326,6 +326,105 @@ static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(0);
 /// flush against a server that answers per command).
 const BATCH_WINDOW_THRESHOLD: usize = 64 * 1024;
 
+/// The outcome of driving ONE window of a batch to its boundary
+/// ([`Core::flush_window`]) — the shared, verb-agnostic classification the three
+/// windowed drives (`pipeline` / `execute_batch` / `query_batch`) match on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowStep {
+    /// The window drained cleanly to its inter-command boundary (the sink broke at
+    /// the window's delivery target). Continue staging the next window.
+    Drained,
+    /// The window did NOT drain cleanly — a server `ErrorResponse` was parked, or a
+    /// guarded window's result-OID mismatch BAILED (`Boundary::Failed`), or an
+    /// unexpected non-`Idle` boundary (fail-closed). Stop staging; the caller
+    /// breaks to the trailing `Sync` + final drain, and the settle classifies which.
+    Halt,
+}
+
+/// Route ONE drained surface of a TYPED-result window (`pipeline` / `query_batch`)
+/// to its command's [`RowsBuilder`], advancing the delivered-command cursor and
+/// BREAKING once the window's delivery `target` is reached — the SHARED window
+/// sink both the normal-window flush and the oversize-isolate prefix flush thread
+/// through (so the collector + break logic exists ONCE, not duplicated per flush
+/// call site). Rows (whole or reassembled-oversize chunks) feed the CURRENT
+/// command's builder; a `Deliver` finalizes it, advances `current`, and breaks at
+/// `target`; the FIRST `Fail` parks the failing command's zero-based index + cause
+/// (the trailing `Sync` recovers the connection, the settle classifies it). Break
+/// payload `()` — a breakable WINDOW drive (the final `Sync` drive keeps its own
+/// non-breaking `Never` sink).
+fn feed_typed_window(
+    surface: Surface<'_>,
+    current: &mut usize,
+    target: usize,
+    builders: &mut [RowsBuilder],
+    failed_index: &mut Option<usize>,
+    db_error: &mut Option<DbError>,
+) -> ControlFlow<()> {
+    match surface {
+        Surface::Row(_) | Surface::RowChunk(_) | Surface::RowChunkEnd => {
+            if let Some(b) = builders.get_mut(*current) {
+                b.feed(surface);
+            }
+            ControlFlow::Continue(())
+        }
+        Surface::Deliver { .. } => {
+            if let Some(b) = builders.get_mut(*current) {
+                b.feed(surface);
+            }
+            *current = current.saturating_add(1);
+            if *current >= target {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+        Surface::Fail(body) if failed_index.is_none() => {
+            *failed_index = Some(*current);
+            *db_error = Some(materialize::parse_error_response(body));
+            ControlFlow::Continue(())
+        }
+        _ => ControlFlow::Continue(()),
+    }
+}
+
+/// Route ONE drained surface of a COUNT-result window (`execute_batch`, which
+/// reads affected COUNTS and discards its RETURNING rows) — the count peer of
+/// [`feed_typed_window`]. A `Deliver` pushes the command tag's affected count,
+/// advances `current`, and breaks at the window's `target`; the FIRST `Fail`
+/// parks the failing index + cause. Break payload `()` (a breakable WINDOW drive).
+fn feed_count_window(
+    surface: Surface<'_>,
+    current: &mut usize,
+    target: usize,
+    affected: &mut Vec<u64>,
+    failed_index: &mut Option<usize>,
+    db_error: &mut Option<DbError>,
+) -> ControlFlow<()> {
+    match surface {
+        Surface::Deliver { tag, .. } => {
+            // A tagless extended-protocol boundary has no row count (0); a
+            // `CommandComplete` tag projects its own affected-row count.
+            let n = match tag {
+                Some(t) => t.rows_or_zero(),
+                None => 0,
+            };
+            affected.push(n);
+            *current = current.saturating_add(1);
+            if *current >= target {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+        Surface::Fail(body) if failed_index.is_none() => {
+            *failed_index = Some(*current);
+            *db_error = Some(materialize::parse_error_response(body));
+            ControlFlow::Continue(())
+        }
+        _ => ControlFlow::Continue(()),
+    }
+}
+
 /// One entry in the [`DynStmtCache`]: the (SQL text, parameter-type OIDs) key
 /// plus, once the query has been prepared, its server-side prepared statement.
 #[derive(Debug)]
@@ -2502,6 +2601,153 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         }
     }
 
+    // ── Shared windowed-batch drive (pipeline / execute_batch / query_batch) ──
+
+    /// Drive ONE window of a batch to its inter-command boundary — the SINGLE
+    /// shared flush + drain + compact all three windowed verbs (`pipeline`,
+    /// `execute_batch`, `query_batch`) route every window through, so the delicate
+    /// window boundary handling (and the co-window-deadlock fix's isolate flushes)
+    /// lives ONCE, not copy-pasted three times.
+    ///
+    /// Appends the window's trailing `Flush` (forcing the window's responses out
+    /// WITHOUT ending the implicit transaction — only the batch's single trailing
+    /// `Sync` does that, so all commands stay ONE atomic transaction), then drives
+    /// the (optionally result-OID-GUARDED) breakable pump with the caller's `sink`.
+    /// `sink` routes each surface to the verb's collector and BREAKS
+    /// ([`ControlFlow::Break`]) once the window's delivery target is reached
+    /// (leaving the engine at a clean `PipelineAwaitingNextOrRfq` boundary), or
+    /// parks a server error and continues (the trailing `Sync` recovers it).
+    ///
+    /// `guarded = true` (heterogeneous `pipeline` / `query_batch`) uses the BAILING
+    /// drive: a cache-MISS command whose result schema drifted parks a mismatch
+    /// whose silent swallow-to-`ReadyForQuery` has no RFQ in an intermediate window
+    /// (only a `Flush`), so the guard returns [`Boundary::Failed`] rather than
+    /// blocking forever — the caller stages the trailing `Sync` to drain it.
+    /// `guarded = false` (`execute_batch`, which discards its RETURNING rows and
+    /// cannot park a mismatch) uses the inert non-bailing drive, byte-identical to
+    /// the historical drive.
+    ///
+    /// On a clean drain ([`Boundary::Stopped`]) the send buffer is COMPACTED (the
+    /// already-sent window bytes are dropped, capacity retained) so a long batch's
+    /// send buffer stays bounded across windows, and returns [`WindowStep::Drained`];
+    /// any other alive boundary (a parked server error, a guard BAIL, or a
+    /// fail-closed unexpected boundary) returns [`WindowStep::Halt`] and the caller
+    /// breaks to the trailing `Sync`. A FATAL transport/protocol fault consumes the
+    /// token and is an `Err` (the connection is dead).
+    async fn flush_window(
+        &mut self,
+        live: Live<'static>,
+        guarded: bool,
+        sink: impl FnMut(Surface<'_>) -> ControlFlow<()>,
+    ) -> Result<(Live<'static>, WindowStep), DriverError> {
+        self.engine.stage_flush();
+        let notifying = capture_notify(&mut self.notifications, self.diag.sink(), sink);
+        // The GUARDED drive bails on a parked result-OID mismatch (an intermediate
+        // window has no `Sync` to reach); the unguarded one is inert (no mismatch is
+        // ever parked). `<_, ()>`: the sink's break payload is `()`.
+        let outcome = if guarded {
+            self.engine
+                .run_pipeline_break_guarded::<_, ()>(live, notifying)
+                .await
+        } else {
+            self.engine
+                .run_pipeline_break::<_, ()>(live, notifying)
+                .await
+        };
+        let (live, status) = match outcome {
+            Ok(Outcome { live, status }) => (live, status),
+            Err(other) => {
+                core::hint::cold_path();
+                return Err(lift_engine_error(other));
+            }
+        };
+        match status {
+            // The window drained cleanly to its inter-command boundary. Compact the
+            // (fully-sent) send buffer so it does not accumulate this window's bytes
+            // for the batch's life, then signal "stage the next window".
+            Boundary::Stopped(()) => {
+                self.engine.compact_send_buf();
+                Ok((live, WindowStep::Drained))
+            }
+            // A command in this window FAILED — a parked server `ErrorResponse`, OR a
+            // guarded window's result-OID mismatch BAIL — OR an unexpected non-`Idle`
+            // alive boundary (a `Flush`-terminated window cannot reach a clean `Idle`;
+            // `Boundary` is `#[non_exhaustive]`, so this is fail-closed against a
+            // future boundary, never a torn success). The caller breaks to the
+            // trailing `Sync` + final drain, and the settle classifies which.
+            _ => {
+                core::hint::cold_path();
+                Ok((live, WindowStep::Halt))
+            }
+        }
+    }
+
+    /// ISOLATE an OVERSIZE command from a co-window prefix — the shared fix for the
+    /// SINGLE-OVERSIZE-COMMAND class of the windowed batch write-path deadlock. When a
+    /// just-staged command's OWN `Bind` frame ALONE crosses the threshold (`k_size >=
+    /// BATCH_WINDOW_THRESHOLD`) AND a non-empty prefix precedes it, that command must
+    /// NOT share a flush with the prefix: an EARLY prefix command returning a LARGE
+    /// result blocks the server's send buffer while the client blocks writing the
+    /// oversize command's `Bind` — a bidirectional write-path deadlock (each end
+    /// blocked writing, neither reading). This is the SEVERE, UNBOUNDED case (one
+    /// command's Bind can be arbitrarily large, e.g. tens of MiB past any send
+    /// buffer), and it is the case this isolate fully eliminates.
+    ///
+    /// The just-staged oversize command's `k_size` frame bytes are the pending TAIL
+    /// (staging appends contiguously). This LIFTS them out (`split_last_staged`), so
+    /// the PREFIX flushes + drains ALONE via [`flush_window`](Self::flush_window)
+    /// (the client reads the prefix's large result before it can write-block on the
+    /// oversize command); on a clean prefix drain it RE-STAGES the lifted bytes
+    /// verbatim into the now-compacted, FRESH window (`restage_bytes`), where the
+    /// oversize command is ISOLATED — a single command never self-deadlocks (the
+    /// server reads its whole `Bind`, unblocking the client, before producing any
+    /// result). Only WIRE BYTES move; the command's engine-side seat / guard-OID
+    /// FIFO push established at its original staging is UNTOUCHED, so the receive FSM
+    /// guards / decodes it correctly when the isolated window is later drained.
+    ///
+    /// Returns [`WindowStep::Drained`] with the lifted bytes re-staged (the caller
+    /// then flushes the isolated command as its own window), or [`WindowStep::Halt`]
+    /// if the PREFIX drain failed (a server error / guard mismatch in the prefix) —
+    /// in which case the lifted bytes are DISCARDED (the command's frames are never
+    /// sent; the batch is failing and the settle reports the prefix's cause).
+    ///
+    /// BOUNDED RESIDUAL (pre-existing, intentional): the isolate triggers ONLY on a
+    /// single command whose OWN frame crosses the threshold. A window of MULTIPLE
+    /// commands each UNDER the threshold but cumulatively up to ~`2 ×
+    /// BATCH_WINDOW_THRESHOLD` (~126 KiB) is NOT isolated, so co-windowed with an
+    /// early large-RESULT command it can still deadlock IFF the combined client-send +
+    /// server-recv socket buffers are below ~126 KiB — narrow (needs sub-128 KiB tuned
+    /// buffers, never default-autotuned Linux/loopback), BOUNDED (the window is capped
+    /// at ~2×threshold, unlike the unbounded single-Bind case fixed here), and
+    /// PRE-EXISTING (the pre-fix window sizing was identical — this is a strict
+    /// improvement, not a regression). Fully closing it would require draining after
+    /// EVERY command (1 RTT each), defeating pipelining, so it is a documented limit.
+    async fn isolate_prefix(
+        &mut self,
+        live: Live<'static>,
+        guarded: bool,
+        k_size: usize,
+        sink: impl FnMut(Surface<'_>) -> ControlFlow<()>,
+    ) -> Result<(Live<'static>, WindowStep), DriverError> {
+        core::hint::cold_path();
+        // Lift the oversize command's frame bytes OUT of the buffer, leaving only the
+        // prefix pending. Its engine seat / guard-OID push stay (only bytes move).
+        let isolated = self.engine.split_last_staged(k_size);
+        // Flush + drain the PREFIX alone (window target = the prefix commands, set by
+        // the caller's `sink`). The client reads the prefix's response before it can
+        // write-block on the oversize command — the single-oversize-command deadlock
+        // cannot form (the bounded multi-command residual is documented above).
+        let (live, step) = self.flush_window(live, guarded, sink).await?;
+        if step == WindowStep::Drained {
+            // Prefix drained cleanly into a compacted buffer — re-stage the oversize
+            // command's frames verbatim into the FRESH window, where it is isolated.
+            self.engine.restage_bytes(&isolated);
+        }
+        // On `Halt` the lifted bytes are dropped (never sent): the batch is failing,
+        // and the caller breaks to the trailing `Sync` so the settle reports it.
+        Ok((live, step))
+    }
+
     // ── Heterogeneous atomic pipelining ─────────────────────────────────────
 
     /// Stage ONE pipelined command's frames onto the engine — the per-command seam
@@ -2613,24 +2859,31 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         let mut staged: usize = 1; // staged commands (command 0 above)
         let mut flushed_any = false;
 
-        // 2. WINDOWED DRIVE — the deadlock-free peer of `execute_batch`'s. A
-        //    heterogeneous batch (an early LARGE result + later LARGE params) would
-        //    DEADLOCK if the whole batch were staged and flushed before a single read
-        //    (the client blocks writing the tail while the server blocks writing the
-        //    early result). So the commands STREAM: stage until the send buffer
-        //    crosses the batcher threshold, then `Flush` (which forces the window's
-        //    responses out WITHOUT ending the implicit transaction — only the single
-        //    trailing `Sync` does) and DRAIN that window's responses (routing each
-        //    command's rows to ITS builder) before staging the next, so the client
-        //    always drains before it write-blocks. Constant send memory. The COMMON
-        //    batch (fits one window) stages every command, never flushes an
-        //    intermediate `Flush`, and rides the single trailing `Sync` below — ~1
-        //    round trip, byte-identical to a single fused query.
+        // 2. WINDOWED DRIVE — the deadlock-free peer of `execute_batch`'s, over the
+        //    ONE shared [`flush_window`](Self::flush_window) / [`isolate_prefix`](Self::isolate_prefix)
+        //    windowing helpers. A heterogeneous batch (an early LARGE result + later
+        //    LARGE params) would DEADLOCK if the whole batch were staged and flushed
+        //    before a single read (the client blocks writing the tail while the server
+        //    blocks writing the early result). So the commands STREAM: stage until the
+        //    send buffer crosses the batcher threshold, then `Flush` + DRAIN that
+        //    window's responses (routing each command's rows to ITS builder) before
+        //    staging the next. The COMMON batch (fits one window) stages every command,
+        //    never flushes an intermediate `Flush`, and rides the single trailing
+        //    `Sync` below — ~1 round trip, byte-identical to a single fused query.
+        //    An OVERSIZE command that alone crosses the threshold on top of a non-empty
+        //    prefix is ISOLATED (`isolate_prefix`): the prefix is flushed + drained
+        //    ALONE first, so the oversize command never shares a flush with a
+        //    large-result prefix — the SINGLE-OVERSIZE-COMMAND (unbounded) co-window
+        //    deadlock cannot form. A bounded multi-command residual (a window of small
+        //    commands up to ~2×threshold co-windowed with a large result, only on
+        //    sub-128 KiB tuned socket buffers) is pre-existing + documented on
+        //    [`isolate_prefix`](Self::isolate_prefix).
         'windows: loop {
             // Fill the current window: stage subsequent commands until the send
             // buffer crosses the batcher threshold or every command is staged.
             let mut window_full = false;
             while staged < arity {
+                let before = self.engine.pending_send_len();
                 if let Err(e) = batch.stage_nth(self, staged, &mut plan) {
                     core::hint::cold_path();
                     // A single command's `Bind` frame exceeded the wire length field.
@@ -2651,7 +2904,40 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                     return Err(e);
                 }
                 staged = staged.saturating_add(1);
-                if self.engine.pending_send_len() >= BATCH_WINDOW_THRESHOLD {
+                let after = self.engine.pending_send_len();
+                if after >= BATCH_WINDOW_THRESHOLD {
+                    let k_size = after.saturating_sub(before);
+                    if before > 0 && k_size >= BATCH_WINDOW_THRESHOLD {
+                        // OVERSIZE-command CO-WINDOW: this command's OWN frame alone
+                        // crossed the threshold on top of a non-empty prefix. Flushing
+                        // both together risks the write-path deadlock (an early prefix
+                        // command's large result blocks the server while the client
+                        // write-blocks on this command's Bind). ISOLATE it: flush +
+                        // drain the PREFIX alone, then this command rides its own fresh
+                        // window (below). The prefix target excludes this command.
+                        // `flushed_any` is set by the guaranteed intermediate flush
+                        // below (`window_full` forces it), not here: on `Halt` it is
+                        // not read (we break to the trailing `Sync`).
+                        let prefix_target = staged.saturating_sub(1);
+                        let (l, step) = self
+                            .isolate_prefix(live, true, k_size, |surface| {
+                                feed_typed_window(
+                                    surface,
+                                    &mut current,
+                                    prefix_target,
+                                    &mut builders,
+                                    &mut failed_index,
+                                    &mut db_error,
+                                )
+                            })
+                            .await?;
+                        live = l;
+                        if step == WindowStep::Halt {
+                            break 'windows;
+                        }
+                        // The oversize command is now re-staged ALONE in a fresh
+                        // window; flush it as its own window below (never co-windowed).
+                    }
                     window_full = true;
                     break;
                 }
@@ -2662,91 +2948,35 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 break 'windows;
             }
 
-            // INTERMEDIATE window: `Flush` + drain (routing rows to builders). The
-            // sink breaks once every command staged so far has delivered, leaving the
-            // engine at a clean inter-command boundary. The GUARDED drive also BAILS
-            // (returns `Failed`) if a MISS command's result-schema guard parks a
-            // mismatch — an intermediate window has no `Sync`, so the silent drain
-            // would otherwise block forever waiting for an RFQ that only the trailing
-            // `Sync` produces.
-            self.engine.stage_flush();
+            // INTERMEDIATE window: `Flush` + drain (routing rows to builders) via the
+            // shared `flush_window`. The sink breaks once every command staged so far
+            // has delivered, leaving the engine at a clean inter-command boundary; the
+            // GUARDED drive BAILS (`Halt`) on a MISS command's parked result-schema
+            // mismatch (an intermediate window has no `Sync` to reach, so the silent
+            // drain would otherwise block forever). On `Halt` (a parked server error,
+            // a guard bail, or a fail-closed unexpected boundary) stop staging; the
+            // trailing `Sync` + final drain recovers the connection and the settle
+            // classifies which. HONEST NOTE: on a mismatch this stops staging later
+            // windows, so the server commits only the windows flushed so far — but a
+            // mismatch returns ZERO results + the classified drift regardless.
             flushed_any = true;
             let window_target = staged;
-            let outcome = self
-                .engine
-                .run_pipeline_break_guarded::<_, ()>(
-                    live,
-                    capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
-                        match surface {
-                            // Rows (whole or reassembled-oversize chunks) belong to
-                            // the CURRENT command; route them to its builder.
-                            Surface::Row(_) | Surface::RowChunk(_) | Surface::RowChunkEnd => {
-                                if let Some(b) = builders.get_mut(current) {
-                                    b.feed(surface);
-                                }
-                                ControlFlow::Continue(())
-                            }
-                            // A command completed: finalize its builder, advance, and
-                            // BREAK once the whole window has delivered.
-                            Surface::Deliver { .. } => {
-                                if let Some(b) = builders.get_mut(current) {
-                                    b.feed(surface);
-                                }
-                                current = current.saturating_add(1);
-                                if current >= window_target {
-                                    ControlFlow::Break(())
-                                } else {
-                                    ControlFlow::Continue(())
-                                }
-                            }
-                            // A server error: `current` is the failing command's
-                            // zero-based index. Park it + the cause once (FIRST Fail
-                            // wins); the trailing `Sync` + drain below recovers.
-                            Surface::Fail(body) if failed_index.is_none() => {
-                                failed_index = Some(current);
-                                db_error = Some(materialize::parse_error_response(body));
-                                ControlFlow::Continue(())
-                            }
-                            _ => ControlFlow::Continue(()),
-                        }
-                    }),
-                )
-                .await;
-            let (l, status) = match outcome {
-                Ok(Outcome { live, status }) => (live, status),
-                Err(other) => {
-                    core::hint::cold_path();
-                    return Err(lift_engine_error(other));
-                }
-            };
+            let (l, step) = self
+                .flush_window(live, true, |surface| {
+                    feed_typed_window(
+                        surface,
+                        &mut current,
+                        window_target,
+                        &mut builders,
+                        &mut failed_index,
+                        &mut db_error,
+                    )
+                })
+                .await?;
             live = l;
-            match status {
-                // The window drained cleanly; stage the next window.
-                Boundary::Stopped(()) => {}
-                // A command in this window FAILED — a server `ErrorResponse` (parked
-                // in the sink) OR the result-schema guard parked a mismatch (the
-                // guarded drive bailed, since an intermediate window has no `Sync`).
-                // Stop staging; the trailing `Sync` + final drain recovers the
-                // connection and the settle classifies which. HONEST NOTE: on a
-                // mismatch this stops staging later windows, so the server commits
-                // only the windows flushed so far (vs the whole batch when it fits one
-                // window) — but BOTH return ZERO results + the classified drift, which
-                // is the honest client-side rejection of an already-drifted schema (a
-                // caller cannot trust ANY DB state under a schema drift). On a SERVER
-                // error the implicit transaction rolls back everything regardless.
-                Boundary::Failed => {
-                    core::hint::cold_path();
-                    break 'windows;
-                }
-                // A `Flush`-terminated window cannot reach a clean `Idle` (that needs
-                // the trailing `Sync`); a fatal boundary was already mapped to `Err`
-                // by `run_pipeline_break_guarded`. `Boundary` is `#[non_exhaustive]`,
-                // so this arm is fail-closed against a future boundary — never a torn
-                // success.
-                _ => {
-                    core::hint::cold_path();
-                    break 'windows;
-                }
+            if step == WindowStep::Halt {
+                core::hint::cold_path();
+                break 'windows;
             }
         }
 
@@ -3024,6 +3254,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             // buffer crosses the batcher threshold or the iterator is exhausted.
             let mut window_full = false;
             loop {
+                let before = self.engine.pending_send_len();
                 match it.next() {
                     None => break,
                     Some(p) => {
@@ -3051,7 +3282,41 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                             return Err(lift_engine_error(e));
                         }
                         total = total.saturating_add(1);
-                        if self.engine.pending_send_len() >= BATCH_WINDOW_THRESHOLD {
+                        let after = self.engine.pending_send_len();
+                        if after >= BATCH_WINDOW_THRESHOLD {
+                            let k_size = after.saturating_sub(before);
+                            if before > 0 && k_size >= BATCH_WINDOW_THRESHOLD {
+                                // OVERSIZE-command CO-WINDOW: this parameter set's OWN
+                                // Bind alone crossed the threshold on top of a non-empty
+                                // prefix — a large-RETURNING early command + this large
+                                // param would deadlock the write path if flushed
+                                // together. ISOLATE it: flush + drain the PREFIX alone
+                                // (via the shared `isolate_prefix`), then this command
+                                // rides its own fresh window below. `execute_batch` is
+                                // UNguarded (`false`): it discards RETURNING rows, so no
+                                // result-OID mismatch is ever parked. Prefix target
+                                // excludes this command. (`flushed_any` is set by the
+                                // guaranteed intermediate flush below, not here.)
+                                let prefix_target = total.saturating_sub(1);
+                                let (l, step) = self
+                                    .isolate_prefix(live, false, k_size, |surface| {
+                                        feed_count_window(
+                                            surface,
+                                            &mut current,
+                                            prefix_target,
+                                            &mut affected,
+                                            &mut failed_index,
+                                            &mut db_error,
+                                        )
+                                    })
+                                    .await?;
+                                live = l;
+                                if step == WindowStep::Halt {
+                                    break 'windows;
+                                }
+                                // The oversize command is now re-staged ALONE; flush it
+                                // as its own window below (never co-windowed).
+                            }
                             window_full = true;
                             break;
                         }
@@ -3064,69 +3329,31 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 break 'windows;
             }
 
-            // INTERMEDIATE window: `Flush` forces its responses out (without ending
-            // the implicit transaction), then DRAIN them so the next window cannot
-            // deadlock. The sink breaks once every command of this window has
-            // delivered, leaving the engine at a clean inter-command boundary.
-            self.engine.stage_flush();
+            // INTERMEDIATE window: `Flush` + drain via the shared `flush_window`.
+            // The sink breaks once every command of this window has delivered,
+            // leaving the engine at a clean inter-command boundary; `execute_batch`
+            // is UNguarded (`false`), so the drive is inert — byte-identical to the
+            // historical drive. On `Halt` (a parked server error, or a fail-closed
+            // unexpected boundary) stop staging; the trailing `Sync` + drain below
+            // recovers the connection and the settle classifies which.
             flushed_any = true;
             let window_target = total;
-            let outcome = self
-                .engine
-                .run_pipeline_break::<_, ()>(
-                    live,
-                    capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
-                        match surface {
-                            Surface::Deliver { tag, .. } => {
-                                // A tagless extended-protocol boundary has no row
-                                // count (0); a `CommandComplete` tag projects its own.
-                                let n = match tag {
-                                    Some(t) => t.rows_or_zero(),
-                                    None => 0,
-                                };
-                                affected.push(n);
-                                current = current.saturating_add(1);
-                                if current >= window_target {
-                                    return ControlFlow::Break(());
-                                }
-                                ControlFlow::Continue(())
-                            }
-                            Surface::Fail(body) if failed_index.is_none() => {
-                                failed_index = Some(current);
-                                db_error = Some(materialize::parse_error_response(body));
-                                ControlFlow::Continue(())
-                            }
-                            _ => ControlFlow::Continue(()),
-                        }
-                    }),
-                )
-                .await;
-            let (l, status) = match outcome {
-                Ok(Outcome { live, status }) => (live, status),
-                Err(other) => {
-                    core::hint::cold_path();
-                    return Err(lift_engine_error(other));
-                }
-            };
+            let (l, step) = self
+                .flush_window(live, false, |surface| {
+                    feed_count_window(
+                        surface,
+                        &mut current,
+                        window_target,
+                        &mut affected,
+                        &mut failed_index,
+                        &mut db_error,
+                    )
+                })
+                .await?;
             live = l;
-            match status {
-                // The window drained cleanly; stage the next window.
-                Boundary::Stopped(()) => {}
-                // A command in this window server-errored: the parked cause + index
-                // drive the settle. Stop staging; the trailing `Sync` + drain below
-                // recovers the connection.
-                Boundary::Failed => {
-                    core::hint::cold_path();
-                    break 'windows;
-                }
-                // A `Flush`-terminated window cannot reach a clean `Idle` (that needs
-                // the trailing `Sync`); a fatal boundary was already mapped to `Err`
-                // by `run_pipeline_break`. `Boundary` is `#[non_exhaustive]`, so this
-                // arm is fail-closed against a future boundary — never a torn success.
-                _ => {
-                    core::hint::cold_path();
-                    break 'windows;
-                }
+            if step == WindowStep::Halt {
+                core::hint::cold_path();
+                break 'windows;
             }
         }
 
@@ -3400,6 +3627,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             // exhausted.
             let mut window_full = false;
             loop {
+                let before = self.engine.pending_send_len();
                 match it.next() {
                     None => break,
                     Some(p) => {
@@ -3428,7 +3656,41 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                         }
                         builders.push(RowsBuilder::new());
                         total = total.saturating_add(1);
-                        if self.engine.pending_send_len() >= BATCH_WINDOW_THRESHOLD {
+                        let after = self.engine.pending_send_len();
+                        if after >= BATCH_WINDOW_THRESHOLD {
+                            let k_size = after.saturating_sub(before);
+                            if before > 0 && k_size >= BATCH_WINDOW_THRESHOLD {
+                                // OVERSIZE-command CO-WINDOW: this parameter set's OWN
+                                // Bind alone crossed the threshold on top of a non-empty
+                                // prefix — a large-RESULT early command + this large
+                                // param would deadlock the write path if flushed
+                                // together. ISOLATE it: flush + drain the PREFIX alone
+                                // (via the shared `isolate_prefix`, GUARDED — command 0's
+                                // result-OID guard can bail here), then this command
+                                // rides its own fresh window below. Prefix target
+                                // excludes this command; its builder (pushed above) is
+                                // fed when the isolated window drains. (`flushed_any` is
+                                // set by the guaranteed intermediate flush below.)
+                                let prefix_target = total.saturating_sub(1);
+                                let (l, step) = self
+                                    .isolate_prefix(live, true, k_size, |surface| {
+                                        feed_typed_window(
+                                            surface,
+                                            &mut current,
+                                            prefix_target,
+                                            &mut builders,
+                                            &mut failed_index,
+                                            &mut db_error,
+                                        )
+                                    })
+                                    .await?;
+                                live = l;
+                                if step == WindowStep::Halt {
+                                    break 'windows;
+                                }
+                                // The oversize command is now re-staged ALONE; flush it
+                                // as its own window below (never co-windowed).
+                            }
                             window_full = true;
                             break;
                         }
@@ -3441,82 +3703,33 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 break 'windows;
             }
 
-            // INTERMEDIATE window: `Flush` + GUARDED drain (routing rows to builders).
-            // The sink breaks once every command staged so far has delivered. The
-            // GUARDED drive BAILS (returns `Failed`) if command 0's result-schema
-            // guard parked a mismatch in this window — an intermediate window has no
-            // `Sync`, so the silent swallow-to-`ReadyForQuery` drain would otherwise
-            // block forever; the trailing `Sync` below drains it.
-            self.engine.stage_flush();
+            // INTERMEDIATE window: `Flush` + GUARDED drain (routing rows to builders)
+            // via the shared `flush_window`. The sink breaks once every command staged
+            // so far has delivered; the GUARDED drive BAILS (`Halt`) if command 0's
+            // result-schema guard parked a mismatch in this window (an intermediate
+            // window has no `Sync`, so the silent drain would otherwise block forever;
+            // the trailing `Sync` below drains it). On `Halt` (a parked server error, a
+            // guard bail, or a fail-closed unexpected boundary) stop staging; the
+            // trailing `Sync` + final drain recovers the connection and the settle
+            // classifies which.
             flushed_any = true;
             let window_target = total;
-            let outcome = self
-                .engine
-                .run_pipeline_break_guarded::<_, ()>(
-                    live,
-                    capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
-                        match surface {
-                            // Rows (whole or reassembled-oversize chunks) belong to
-                            // the CURRENT command; route them to its builder.
-                            Surface::Row(_) | Surface::RowChunk(_) | Surface::RowChunkEnd => {
-                                if let Some(b) = builders.get_mut(current) {
-                                    b.feed(surface);
-                                }
-                                ControlFlow::Continue(())
-                            }
-                            // A command completed: finalize its builder, advance, and
-                            // BREAK once the whole window has delivered.
-                            Surface::Deliver { .. } => {
-                                if let Some(b) = builders.get_mut(current) {
-                                    b.feed(surface);
-                                }
-                                current = current.saturating_add(1);
-                                if current >= window_target {
-                                    ControlFlow::Break(())
-                                } else {
-                                    ControlFlow::Continue(())
-                                }
-                            }
-                            // A server error: `current` is the failing command's
-                            // zero-based index. Park it + the cause once (FIRST Fail
-                            // wins); the trailing `Sync` + drain below recovers.
-                            Surface::Fail(body) if failed_index.is_none() => {
-                                failed_index = Some(current);
-                                db_error = Some(materialize::parse_error_response(body));
-                                ControlFlow::Continue(())
-                            }
-                            _ => ControlFlow::Continue(()),
-                        }
-                    }),
-                )
-                .await;
-            let (l, status) = match outcome {
-                Ok(Outcome { live, status }) => (live, status),
-                Err(other) => {
-                    core::hint::cold_path();
-                    return Err(lift_engine_error(other));
-                }
-            };
+            let (l, step) = self
+                .flush_window(live, true, |surface| {
+                    feed_typed_window(
+                        surface,
+                        &mut current,
+                        window_target,
+                        &mut builders,
+                        &mut failed_index,
+                        &mut db_error,
+                    )
+                })
+                .await?;
             live = l;
-            match status {
-                // The window drained cleanly; stage the next window.
-                Boundary::Stopped(()) => {}
-                // A command in this window FAILED — a server `ErrorResponse` (parked
-                // in the sink) OR command 0's result-schema guard parked a mismatch
-                // (the guarded drive bailed). Stop staging; the trailing `Sync` +
-                // final drain recovers the connection and the settle classifies which.
-                Boundary::Failed => {
-                    core::hint::cold_path();
-                    break 'windows;
-                }
-                // A `Flush`-terminated window cannot reach a clean `Idle` (that needs
-                // the trailing `Sync`); a fatal boundary was already mapped to `Err`.
-                // `Boundary` is `#[non_exhaustive]`, so this arm is fail-closed against
-                // a future boundary — never a torn success.
-                _ => {
-                    core::hint::cold_path();
-                    break 'windows;
-                }
+            if step == WindowStep::Halt {
+                core::hint::cold_path();
+                break 'windows;
             }
         }
 
