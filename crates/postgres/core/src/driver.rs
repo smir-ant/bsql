@@ -48,10 +48,12 @@
 //! methods orchestrate.
 
 use core::fmt::Write as _;
+use core::future::Future;
 use core::ops::ControlFlow;
+use core::pin::Pin;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::Instant;
 
 use bsql_postgres_proto::engine::{
@@ -623,6 +625,108 @@ impl Drop for SlowQueryGuard<'_> {
     }
 }
 
+// ── Dropped-future recovery (the linear-token un-brick) ─────────────────────
+//
+// Every active-phase verb MOVES the linear `Live` out of `Core::live` into its
+// future and returns it only on a clean boundary. If that future is DROPPED
+// mid-command — the caller lost a `tokio::time::timeout` / `select!` race, the
+// single most common async cancellation pattern — the token drops WITH the
+// future (a ZST, no `Drop` runs), `Core::live` stays `None`, and with no
+// re-mint the connection would be permanently unusable even though the socket is
+// fine. AND the server keeps executing the abandoned query (a zombie holding
+// locks). This recovers both transparently on the NEXT use.
+//
+// The mechanism: a per-connection `dirty` marker (an `Arc<AtomicU8>` so the
+// verb-scoped `CancelScope` can set it from its `Drop` AFTER the future is gone,
+// without borrowing `self` for the scope's life) carries WHAT recovery the next
+// use must run.
+
+/// `dirty` state: CLEAN — no dropped-future recovery is owed. A `Core::live` of
+/// `None` with this state is a genuinely dead connection (a prior fatal error),
+/// classified [`DriverError::NotReady`] as before.
+const DIRTY_CLEAN: u8 = 0;
+/// `dirty` state: a COMMAND verb's future was dropped mid-flight, so the server
+/// owes a reply the engine never drained. The next use must cancel the abandoned
+/// query (best-effort) then DRAIN the owed frames to a clean idle before
+/// re-minting.
+const DIRTY_DRAIN: u8 = 1;
+/// `dirty` state: a WAIT (`recv_notification`) future was dropped. The wait owed
+/// NO reply (it issued no command; the engine sits at a clean idle), so the next
+/// use only RE-MINTS the token — draining here would block on frames that never
+/// come.
+const DIRTY_RECLAIM: u8 = 2;
+
+/// A driver-provided capability to send an out-of-band `CancelRequest` on a
+/// THROWAWAY socket — the ONE recovery step that needs driver-specific dial I/O
+/// (a fresh socket to the same endpoint, honoring the original TLS decision),
+/// which the transport-generic [`Core`] cannot perform itself.
+///
+/// Only the async driver installs one (via [`Core::set_recovery_cancel`]): the
+/// blocking driver's verbs run to completion inside one `poll_once` and cannot be
+/// dropped mid-command, so it never reaches a `DIRTY_DRAIN` recovery and needs no
+/// hook (it leaves the field `None`). A testkit connection also leaves it `None`.
+///
+/// A `None` hook is not a bug: recovery still DRAINS the owed frames to idle
+/// (bounded by the client-liveness window when a `statement_timeout` is set); the
+/// cancel merely makes a long zombie stop FAST so the drain is quick. The
+/// returned future is best-effort — it swallows its own dial/write errors (a
+/// cancel that cannot be delivered is a documented no-op, never a recovery
+/// failure) and is bounded by the connection's own connect-timeout.
+pub trait RecoveryCancel: Send + Sync {
+    /// Dial a throwaway socket and write the 16-byte `CancelRequest` `packet`,
+    /// swallowing any error. Boxed because the dial is driver-specific `async`
+    /// I/O behind a `dyn` boundary; only ever awaited on the cold recovery path.
+    fn cancel<'a>(&'a self, packet: [u8; 16]) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+/// A verb-scoped RAII guard whose `Drop` marks the connection recoverable IFF the
+/// verb's future was DROPPED mid-command (never [`disarm`](Self::disarm)ed).
+///
+/// It owns a CLONE of the connection's `dirty` handle (not a borrow of `self`),
+/// so it borrows the connection only for the instant it is created and then
+/// coexists with the `&mut self` the verb body pumps through. Created right after
+/// the token is taken and disarmed once the verb's body future has been polled to
+/// completion (Ok OR Err — both are consistent terminal states the verb's own
+/// settle already recorded); reached-while-armed means, and ONLY means, the outer
+/// future was dropped before the body finished, which is the exact condition that
+/// stranded the token.
+struct CancelScope {
+    dirty: Arc<AtomicU8>,
+    /// The recovery mode to record on an armed drop (`DIRTY_DRAIN` for a command
+    /// verb, `DIRTY_RECLAIM` for a wait).
+    mode: u8,
+    armed: bool,
+}
+
+impl CancelScope {
+    /// Arm a scope over a clone of `dirty`, recording `mode` on an armed drop.
+    #[inline]
+    fn arm(dirty: Arc<AtomicU8>, mode: u8) -> Self {
+        Self { dirty, mode, armed: true }
+    }
+
+    /// Disarm: the verb's body future completed, so its terminal state is already
+    /// consistent and no dropped-future recovery is owed. Consumes the scope so a
+    /// double-disarm is impossible.
+    #[inline]
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelScope {
+    #[inline]
+    fn drop(&mut self) {
+        if self.armed {
+            // Reached armed ⇒ the verb's body future was dropped mid-command. The
+            // token is gone; record the recovery mode so the next use re-mints and
+            // recovers. `Release` pairs with the `Acquire` load in `begin_command`.
+            core::hint::cold_path();
+            self.dirty.store(self.mode, Ordering::Release);
+        }
+    }
+}
+
 /// The transport-generic driver engine: the shared owner of the sans-IO
 /// [`Engine`] + liveness token, defining every non-I/O verb once.
 ///
@@ -684,6 +788,19 @@ pub struct Core<S: Transport<Error = io::Error>> {
     ///
     /// [`DiagSink`]: crate::diag::DiagSink
     diag: crate::diag::Diagnostics,
+    /// The dropped-future recovery marker: `DIRTY_CLEAN` normally, or
+    /// `DIRTY_DRAIN` / `DIRTY_RECLAIM` after a verb's future was dropped
+    /// mid-command (see the recovery section above). An `Arc<AtomicU8>` so the
+    /// verb-scoped [`CancelScope`] can set it from its `Drop` — which runs AFTER
+    /// the dropped future (and the token) are gone — without borrowing `self` for
+    /// the scope's lifetime. Read once (a relaxed-cost `Acquire` load) at the head
+    /// of every verb via [`begin_command`](Self::begin_command); never on the hot
+    /// per-row path.
+    dirty: Arc<AtomicU8>,
+    /// The driver-provided out-of-band cancel dial for dropped-future recovery,
+    /// or `None` (the blocking driver + testkit, which never reach `DIRTY_DRAIN`).
+    /// Set once after construction by the async driver's `connect_with`.
+    recovery_cancel: Option<Arc<dyn RecoveryCancel>>,
     /// The diagnostics-only N+1 query detector. Present ONLY under the
     /// `n1-detect` feature — a default build has no such field, so the flagship
     /// typed verbs stay byte-identical and the footprint is unchanged.
@@ -726,9 +843,20 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             dyn_cache: DynStmtCache::new(),
             notifications: NotificationLedger::new(),
             diag: crate::diag::Diagnostics::default(),
+            dirty: Arc::new(AtomicU8::new(DIRTY_CLEAN)),
+            recovery_cancel: None,
             #[cfg(feature = "n1-detect")]
             n1_tracker: crate::N1Tracker::new(),
         }
+    }
+
+    /// Install the driver-provided out-of-band cancel dial used by dropped-future
+    /// recovery — called once by the async driver's `connect_with` after the
+    /// handshake. The blocking driver and testkit never call this (they cannot be
+    /// dropped mid-command, so they never reach a `DIRTY_DRAIN` recovery), leaving
+    /// the hook `None`; recovery then still drains, just without the fast cancel.
+    pub fn set_recovery_cancel(&mut self, hook: Arc<dyn RecoveryCancel>) {
+        self.recovery_cancel = Some(hook);
     }
 
     /// Install the structured-diagnostics configuration on this connection.
@@ -806,9 +934,115 @@ impl<S: Transport<Error = io::Error>> Core<S> {
 
     // ── Token + result plumbing (shared internals) ──────────────────────────
 
-    /// Take the liveness token, or classify a dead connection.
-    fn take_live(&mut self) -> Result<Live<'static>, DriverError> {
-        self.live.take().ok_or(DriverError::NotReady)
+    /// The verb prologue: obtain the liveness token, transparently RECOVERING a
+    /// connection whose PRIOR verb future was dropped mid-command.
+    ///
+    /// Three reachable states (see the recovery section on [`CancelScope`]):
+    ///
+    /// - `live == Some`: the normal fast path — take it and go. SYNCHRONOUS (no
+    ///   `.await`), so a healthy verb pays only one `Option::take` + one relaxed
+    ///   `Acquire` load, and no drop point exists before the scope is armed.
+    /// - `live == None && dirty == DIRTY_DRAIN`: a command verb's future was
+    ///   dropped, leaving the server owing a reply. Best-effort CANCEL the
+    ///   abandoned query (so a long zombie stops fast), then re-mint + DRAIN the
+    ///   owed frames to a clean idle (bounded by the client-liveness window when a
+    ///   `statement_timeout` is set), then take the fresh token.
+    /// - `live == None && dirty == DIRTY_RECLAIM`: a `recv_notification` wait was
+    ///   dropped. It owed nothing (the engine sits at a clean idle), so just
+    ///   re-mint — a drain here would block on frames that never come.
+    /// - `live == None && dirty == DIRTY_CLEAN`: a genuinely dead connection (a
+    ///   prior FATAL error consumed the token), classified [`DriverError::NotReady`]
+    ///   exactly as before this recovery existed.
+    ///
+    /// If recovery's drain does NOT reach a clean idle (a torn/black-holed wire),
+    /// it FAILS: the connection is truly dead ([`DriverError::NotReady`] / a
+    /// classified transport error, `is_disconnect()`), never a torn "recovered"
+    /// connection handed to a pool.
+    async fn begin_command(&mut self) -> Result<Live<'static>, DriverError> {
+        // Fast path: a live token is present. No `.await` here, so a drop cannot
+        // strand a half-taken state before the caller arms its scope.
+        if let Some(live) = self.live.take() {
+            return Ok(live);
+        }
+        match self.dirty.load(Ordering::Acquire) {
+            DIRTY_DRAIN => {
+                core::hint::cold_path();
+                self.recover_drain().await?;
+                // Recovery restored `self.live`; take it for the real verb.
+                self.live.take().ok_or(DriverError::NotReady)
+            }
+            DIRTY_RECLAIM => {
+                core::hint::cold_path();
+                // The wait owed nothing — re-mint directly, no cancel, no drain.
+                let live = self.engine.reclaim_live_after_drop();
+                self.dirty.store(DIRTY_CLEAN, Ordering::Release);
+                Ok(live)
+            }
+            // DIRTY_CLEAN (or any unexpected value): genuinely dead.
+            _ => Err(DriverError::NotReady),
+        }
+    }
+
+    /// The `DIRTY_DRAIN` recovery body: best-effort cancel the abandoned query,
+    /// then re-mint the token and DRAIN the owed reply frames to a clean idle,
+    /// restoring `self.live` and clearing `dirty` on success.
+    ///
+    /// On a FATAL drain (a torn wire, or a black-holed peer whose window elapsed)
+    /// the connection is truly dead: `dirty` is cleared (it is no longer
+    /// *recoverable* — it is dead) and the classified transport error is returned,
+    /// leaving `self.live == None` so the next use is a clean [`DriverError::NotReady`].
+    async fn recover_drain(&mut self) -> Result<(), DriverError> {
+        // 1. Best-effort out-of-band cancel so a long-running zombie stops FAST and
+        //    the drain below is quick. Absent hook (blocking driver / testkit) or a
+        //    failed dial is fine — the drain still reaches idle once the server's
+        //    own `statement_timeout` fires or the query finishes. Clone the `Arc`
+        //    so the hook's future does not borrow `self` across the drain below.
+        if let Some(hook) = self.recovery_cancel.clone() {
+            let packet = self.cancel_key().request_bytes();
+            hook.cancel(packet).await;
+        }
+        // 2. Re-mint (sound: `self.live` is provably `None` and `dirty` was
+        //    DIRTY_DRAIN, so the prior token was dropped — no other token exists)
+        //    and drain to a clean idle. `drain_to_idle` restores `self.live` on
+        //    success; the drain's socket reads are bounded by the client-liveness
+        //    window when a `statement_timeout` is configured.
+        let live = self.engine.reclaim_live_after_drop();
+        match self.drain_to_idle(live).await {
+            Ok(()) => {
+                self.dirty.store(DIRTY_CLEAN, Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                core::hint::cold_path();
+                // Recovery failed: the connection is dead, not recoverable.
+                self.dirty.store(DIRTY_CLEAN, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
+    /// Arm a [`CancelScope`] over a CLONE of this connection's `dirty` handle,
+    /// recording `mode` on an armed drop — the second half (with
+    /// [`begin_command`](Self::begin_command)) of every command verb's
+    /// dropped-future guard.
+    ///
+    /// Every token-taking verb follows the SAME shape (the ONE forget-proof
+    /// discipline): `begin_command().await?` to recover + take the token, then
+    /// `arm_scope(mode)`, then run the body inside an `async move { … }` block, then
+    /// `disarm`. The block is a plain async block (NOT an async closure): an async
+    /// closure taking `&mut Self` would trip rustc's "`AsyncFnOnce` not general
+    /// enough" wall when the driver requires the verb future to be `Send`, whereas an
+    /// inline block moves `self` in and stays `Send`. The scope owns the `Arc` clone
+    /// (not a borrow of `self`), so it coexists with the `&mut self` the block pumps
+    /// through; `disarm` runs the instant the block's future is polled to completion
+    /// (Ok OR Err), so only a DROP of the outer future mid-block leaves the scope
+    /// armed — the exact condition that stranded the token, which its `Drop` then
+    /// records (`mode`) for the next use to recover. `mode` is `DIRTY_DRAIN` for a
+    /// command verb, `DIRTY_RECLAIM` for a wait (`recv_notification`). Momentary
+    /// `&self` borrow.
+    #[inline]
+    fn arm_scope(&self, mode: u8) -> CancelScope {
+        CancelScope::arm(Arc::clone(&self.dirty), mode)
     }
 
     /// Classify a command verb's [`Outcome`] and manage the token.
@@ -920,40 +1154,53 @@ impl<S: Transport<Error = io::Error>> Core<S> {
 
     /// Round-trip a `Sync` to confirm the connection is live.
     pub async fn ping(&mut self) -> Result<(), DriverError> {
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let outcome = self
-            .engine
-            .ping(
-                live,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            let outcome = this
+                .engine
+                .ping(
+                    live,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Issue a simple query, returning the command tag string.
     pub async fn simple_query(&mut self, sql: &str) -> Result<String, DriverError> {
         let mut slow = self.armed_slow_guard(sql);
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let outcome = self
-            .engine
-            .simple_query(
-                live,
-                sql,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)?;
-        // Move the already-owned tag out — no clone (the collector is dropped).
-        let result = Ok(collector.into_command_tag());
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let result = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            let outcome = this
+                .engine
+                .simple_query(
+                    live,
+                    sql,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)?;
+            // Move the already-owned tag out — no clone (collector is dropped).
+            Ok(collector.into_command_tag())
+        }
+        .await;
+        scope.disarm();
         Self::commit_slow(&mut slow, &result);
         result
     }
@@ -961,21 +1208,27 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// Execute a non-row runtime-SQL command, returning the affected-row count.
     pub async fn execute_raw(&mut self, sql: &str) -> Result<u64, DriverError> {
         let mut slow = self.armed_slow_guard(sql);
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let outcome = self
-            .engine
-            .execute(
-                live,
-                sql,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)?;
-        let result = Ok(collector.affected());
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let result = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            let outcome = this
+                .engine
+                .execute(
+                    live,
+                    sql,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)?;
+            Ok(collector.affected())
+        }
+        .await;
+        scope.disarm();
         Self::commit_slow(&mut slow, &result);
         result
     }
@@ -983,21 +1236,27 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// Run a row-returning runtime-SQL query (text result columns).
     pub async fn query_raw(&mut self, sql: &str) -> Result<QueryResult, DriverError> {
         let mut slow = self.armed_slow_guard(sql);
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let outcome = self
-            .engine
-            .query(
-                live,
-                sql,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)?;
-        let result = Self::build_query_result(collector, None);
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let result = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            let outcome = this
+                .engine
+                .query(
+                    live,
+                    sql,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)?;
+            Self::build_query_result(collector, None)
+        }
+        .await;
+        scope.disarm();
         Self::commit_slow(&mut slow, &result);
         result
     }
@@ -1056,57 +1315,64 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         param_oids: &[u32],
     ) -> Result<PreparedStatement, DriverError> {
         let stmt_name = self.next_stmt_name()?;
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        // `prepare` is the ONLY reader of the result-column OIDs, so it captures
-        // them directly into this owned Vec in its pump closure — the shared
-        // `ResultCollector` no longer stores an `oids` Vec (which charged every
-        // dynamic row-returning verb one heap `Vec<u32>` per `Deliver` for a
-        // value only this cold path reads). `Surface` is `Copy`, so the peeked
-        // `s` still feeds the collector; `clear` + `extend` keeps the LAST
-        // delivery (a prepare emits one result `Deliver`).
-        let mut result_oids: Vec<u32> = Vec::new();
-        let outcome = self
-            .engine
-            .prepare(
-                live,
-                &stmt_name,
-                sql,
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            // `prepare` is the ONLY reader of the result-column OIDs, so it captures
+            // them directly into this owned Vec in its pump closure — the shared
+            // `ResultCollector` no longer stores an `oids` Vec (which charged every
+            // dynamic row-returning verb one heap `Vec<u32>` per `Deliver` for a
+            // value only this cold path reads). `Surface` is `Copy`, so the peeked
+            // `s` still feeds the collector; `clear` + `extend` keeps the LAST
+            // delivery (a prepare emits one result `Deliver`).
+            let mut result_oids: Vec<u32> = Vec::new();
+            let outcome = this
+                .engine
+                .prepare(
+                    live,
+                    &stmt_name,
+                    sql,
+                    param_oids,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        if let Surface::Deliver { oids, .. } = s {
+                            result_oids.clear();
+                            result_oids.extend_from_slice(oids);
+                        }
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)?;
+            let column_names: Arc<[String]> =
+                Arc::from(collector.column_names().to_vec().into_boxed_slice());
+            // The server-inferred parameter-type OIDs from the prepare's
+            // `ParameterDescription`, retained for the pre-`Bind` type check in
+            // `query_prepared` / `execute_prepared`. Read from the engine directly
+            // (stable post-settle state, like `tx_status`): a successful prepare left
+            // the engine active, so `current_param_oids` resolves; a `WrongPhase`
+            // (unreachable on this success path) degrades to empty = best-effort skip,
+            // never a panic.
+            let param_oids: Box<[u32]> = match this.engine.current_param_oids() {
+                Ok(oids) => Box::from(oids),
+                // Unreachable on this success path (a settled prepare left the engine
+                // active); empty = best-effort skip, never a panic.
+                Err(_) => Box::from([]),
+            };
+            Ok(PreparedStatement {
+                inner: WireStatement::new(stmt_name, result_oids),
+                column_names,
                 param_oids,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    if let Surface::Deliver { oids, .. } = s {
-                        result_oids.clear();
-                        result_oids.extend_from_slice(oids);
-                    }
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)?;
-        let column_names: Arc<[String]> =
-            Arc::from(collector.column_names().to_vec().into_boxed_slice());
-        // The server-inferred parameter-type OIDs from the prepare's
-        // `ParameterDescription`, retained for the pre-`Bind` type check in
-        // `query_prepared` / `execute_prepared`. Read from the engine directly
-        // (stable post-settle state, like `tx_status`): a successful prepare left
-        // the engine active, so `current_param_oids` resolves; a `WrongPhase`
-        // (unreachable on this success path) degrades to empty = best-effort skip,
-        // never a panic.
-        let param_oids: Box<[u32]> = match self.engine.current_param_oids() {
-            Ok(oids) => Box::from(oids),
-            // Unreachable on this success path (a settled prepare left the engine
-            // active); empty = best-effort skip, never a panic.
-            Err(_) => Box::from([]),
-        };
-        Ok(PreparedStatement {
-            inner: WireStatement::new(stmt_name, result_oids),
-            column_names,
-            param_oids,
-            // Stamp this connection's identity so a later prepared verb rejects a
-            // cross-connection use of the handle (see [`check_stmt_origin`]).
-            origin: self.conn_id,
-        })
+                // Stamp this connection's identity so a later prepared verb rejects a
+                // cross-connection use of the handle (see [`check_stmt_origin`]).
+                origin: this.conn_id,
+            })
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Reject a [`PreparedStatement`] minted by a DIFFERENT connection.
@@ -1144,22 +1410,29 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         // rejected here with no wire round trip, closing the silent-reinterpret
         // hole a same-width wrong-typed bind would open against the fixed plan.
         stmt.verify_params::<P>()?;
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let outcome = self
-            .engine
-            .query_prepared(
-                live,
-                &stmt.inner,
-                params,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)?;
-        Self::build_query_result(collector, Some(stmt.column_names.clone()))
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            let outcome = this
+                .engine
+                .query_prepared(
+                    live,
+                    &stmt.inner,
+                    params,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)?;
+            Self::build_query_result(collector, Some(stmt.column_names.clone()))
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Execute a prepared statement for its side effect, returning the affected
@@ -1175,22 +1448,29 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         // Verify parameter types against the fixed plan before binding (see
         // [`query_prepared`](Self::query_prepared)).
         stmt.verify_params::<P>()?;
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let outcome = self
-            .engine
-            .execute_prepared(
-                live,
-                &stmt.inner,
-                params,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)?;
-        Ok(collector.affected())
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            let outcome = this
+                .engine
+                .execute_prepared(
+                    live,
+                    &stmt.inner,
+                    params,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)?;
+            Ok(collector.affected())
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Run a runtime-SQL query with params, transparently reusing a cached
@@ -1328,24 +1608,31 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         sql: &str,
         params: &P,
     ) -> Result<QueryResult, DriverError> {
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let outcome = self
-            .engine
-            .query_params_fused(
-                live,
-                sql,
-                params,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)?;
-        // Names come from the collector (recovered from the inline
-        // `Describe`(portal) `RowDescription`), not a prepared-statement override.
-        Self::build_query_result(collector, None)
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            let outcome = this
+                .engine
+                .query_params_fused(
+                    live,
+                    sql,
+                    params,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)?;
+            // Names come from the collector (recovered from the inline
+            // `Describe`(portal) `RowDescription`), not a prepared-statement override.
+            Self::build_query_result(collector, None)
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Like [`query_params`](Self::query_params), returning the first row.
@@ -1442,22 +1729,29 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         sql: &str,
         params: &P,
     ) -> Result<u64, DriverError> {
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let outcome = self
-            .engine
-            .query_params_fused(
-                live,
-                sql,
-                params,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)?;
-        Ok(collector.affected())
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            let outcome = this
+                .engine
+                .query_params_fused(
+                    live,
+                    sql,
+                    params,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)?;
+            Ok(collector.affected())
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Close MANY cached statements by raw NAME BYTES in ONE round trip — the
@@ -1470,20 +1764,27 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// `#[doc(hidden)]`: the pool-reset seam, not a public verb.
     #[doc(hidden)]
     pub async fn close_cached_statements(&mut self, names: &[&[u8]]) -> Result<(), DriverError> {
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let outcome = self
-            .engine
-            .close_statements_bytes(
-                live,
-                names,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            let outcome = this
+                .engine
+                .close_statements_bytes(
+                    live,
+                    names,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Close a prepared statement, consuming it (use-after-close is a move error).
@@ -1495,20 +1796,27 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// server-side statement at that connection's `reset_session` / disconnect.
     pub async fn close_statement(&mut self, stmt: PreparedStatement) -> Result<(), DriverError> {
         self.check_stmt_origin(&stmt)?;
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let outcome = self
-            .engine
-            .close_statement(
-                live,
-                stmt.inner,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            let outcome = this
+                .engine
+                .close_statement(
+                    live,
+                    stmt.inner,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     // ── Compile-checked typed verbs (the `query!` flagship) ─────────────────
@@ -1534,30 +1842,37 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::PREPARED.sql(), caller);
         let mut slow = self.armed_slow_guard(Q::PREPARED.sql());
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let outcome = self
-            .engine
-            .query_params(
-                live,
-                &bsql_postgres_proto::prepared::prepared_at::<Q>(),
-                params,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)?;
-        // Same RESULT-schema guard `query`/`query_collect` runs: a typed cache MISS
-        // appended a `Describe`(portal), so fail loud if the fresh Parse's
-        // RowDescription revealed a runtime column type diverging from the migration
-        // schema — AND drain the parked mismatch so it cannot leak into the next
-        // verb's guard (the old `execute<P, R>` armed the guard via `query_params`
-        // but never drained it). A drift the caller's RETURNING model no longer
-        // matches is a classified `DriverError::Decode`, never a silent success.
-        self.take_typed_schema_error()?;
-        let result = Ok(collector.affected());
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let result = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            let outcome = this
+                .engine
+                .query_params(
+                    live,
+                    &bsql_postgres_proto::prepared::prepared_at::<Q>(),
+                    params,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)?;
+            // Same RESULT-schema guard `query`/`query_collect` runs: a typed cache
+            // MISS appended a `Describe`(portal), so fail loud if the fresh Parse's
+            // RowDescription revealed a runtime column type diverging from the
+            // migration schema — AND drain the parked mismatch so it cannot leak
+            // into the next verb's guard (the old `execute<P, R>` armed the guard
+            // via `query_params` but never drained it). A drift the caller's
+            // RETURNING model no longer matches is a classified `DriverError::Decode`,
+            // never a silent success.
+            this.take_typed_schema_error()?;
+            Ok(collector.affected())
+        }
+        .await;
+        scope.disarm();
         Self::commit_slow(&mut slow, &result);
         result
     }
@@ -1591,29 +1906,36 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         &mut self,
         params: Q::Params<'p>,
     ) -> Result<Rows<Q>, DriverError> {
-        let live = self.take_live()?;
-        let mut builder = RowsBuilder::new();
-        let outcome = self
-            .engine
-            .query_params(
-                live,
-                &bsql_postgres_proto::prepared::prepared_at::<Q>(),
-                params,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    builder.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut builder)?;
-        // The connection is now idle + pooled. Fail loud if the fresh Parse's
-        // RowDescription revealed a runtime column type diverging from the
-        // migration schema (the guard drained the result, so `builder` is empty).
-        self.take_typed_schema_error()?;
-        // An oversize row was reassembled into the prebuffer's `wire` by
-        // `RowsBuilder::feed` and is just another contiguous span, so it decodes
-        // exactly like an inline row — no cap.
-        Ok(builder.finish::<Q>())
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+            let this = self;
+            let mut builder = RowsBuilder::new();
+            let outcome = this
+                .engine
+                .query_params(
+                    live,
+                    &bsql_postgres_proto::prepared::prepared_at::<Q>(),
+                    params,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        builder.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut builder)?;
+            // The connection is now idle + pooled. Fail loud if the fresh Parse's
+            // RowDescription revealed a runtime column type diverging from the
+            // migration schema (the guard drained the result, so `builder` is empty).
+            this.take_typed_schema_error()?;
+            // An oversize row was reassembled into the prebuffer's `wire` by
+            // `RowsBuilder::feed` and is just another contiguous span, so it decodes
+            // exactly like an inline row — no cap.
+            Ok(builder.finish::<Q>())
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Run a compile-checked `query!` expecting EXACTLY one row, returning the
@@ -1701,7 +2023,10 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         &mut self,
         params: Q::Params<'p>,
     ) -> Result<Option<Q::Owned>, DriverError> {
-        let live = self.take_live()?;
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+        let this = self;
         // The single decoded row (owned, so it outlives the pump), plus the
         // read-after-settle flags the streaming sink parks.
         let mut row: Option<Q::Owned> = None;
@@ -1712,13 +2037,13 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         // UNALLOCATED for the common small single-row case (no chunk ever
         // arrives), so the zero-prebuffer fast path is unchanged.
         let mut oversize_scratch: Vec<u8> = Vec::new();
-        let outcome = self
+        let outcome = this
             .engine
             .query_params_break(
                 live,
                 &bsql_postgres_proto::prepared::prepared_at::<Q>(),
                 params,
-                capture_notify(&mut self.notifications, self.diag.sink(), |surface| match surface {
+                capture_notify(&mut this.notifications, this.diag.sink(), |surface| match surface {
                     Surface::Row(body) => {
                         if seen_first {
                             // A SECOND row: the caller asked for exactly one, so
@@ -1779,12 +2104,12 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         match boundary {
             Boundary::Idle => {
                 // Streamed to a clean idle — token restored, no drain needed.
-                self.live = Some(live);
+                this.live = Some(live);
                 // A typed result-schema mismatch (caught at the fresh Parse's
                 // RowDescription) drained the rows before any reached the sink, so
                 // it dominates the (empty) row/decode outcome — fail loud rather
                 // than return `Ok(None)`.
-                self.take_typed_schema_error()?;
+                this.take_typed_schema_error()?;
                 match (row, decode_err) {
                     (Some(owned), _) => Ok(Some(owned)),
                     (None, Some(de)) => Err(DriverError::Decode(de)),
@@ -1796,7 +2121,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             Boundary::Failed => {
                 // Server error: drain the recovering `ReadyForQuery`, then surface
                 // the parsed cause. Connection stays alive + pooled.
-                self.drain_to_idle(live).await?;
+                this.drain_to_idle(live).await?;
                 match db_error {
                     Some(db) => Err(DriverError::Db(Box::new(db))),
                     None => Err(DriverError::UnclassifiedFailure),
@@ -1805,7 +2130,7 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             Boundary::Stopped(()) => {
                 // Broke on the second row (inline or the first chunk of a second
                 // oversize row): drain to reclaim, then classify as too-many.
-                self.drain_to_idle(live).await?;
+                this.drain_to_idle(live).await?;
                 Err(DriverError::TooManyRows)
             }
             // `query_params_break` maps Closed/Suspended to a fatal `Err`, so they
@@ -1816,6 +2141,10 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 "unexpected protocol boundary from a single-row query",
             ))),
         }
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Stream a compile-checked `query!`'s rows one at a time to `on_row` in
@@ -1836,7 +2165,10 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     {
         #[cfg(feature = "n1-detect")]
         self.n1_record(Q::PREPARED.sql(), caller);
-        let live = self.take_live()?;
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let stream_result = async move {
+        let this = self;
         // Captured across the streaming sink; read after the verb settles.
         let mut db_error: Option<DbError> = None;
         // Reassembly scratch for an oversize row (chunk-streamed), REUSED across
@@ -1844,13 +2176,13 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         // — bounded by the widest oversize row, not the whole result. Stays
         // unallocated while every row fits one buffer fill.
         let mut oversize_scratch: Vec<u8> = Vec::new();
-        let outcome = self
+        let outcome = this
             .engine
             .query_params_break(
                 live,
                 &bsql_postgres_proto::prepared::prepared_at::<Q>(),
                 params,
-                capture_notify(&mut self.notifications, self.diag.sink(), |surface| match surface {
+                capture_notify(&mut this.notifications, this.diag.sink(), |surface| match surface {
                     Surface::Row(body) => match Q::decode_borrowed(body) {
                         // The record borrows the transient ingest buffer; `on_row`
                         // consumes it in-scope (the `for<'q>` wall forbids escape).
@@ -1898,14 +2230,18 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 }),
             )
             .await;
-        let out = self.finish_stream(outcome, db_error).await?;
+        let out = this.finish_stream(outcome, db_error).await?;
         // Fail loud if the fresh Parse's RowDescription revealed a runtime column
         // type diverging from the migration schema: the guard drained the rows
         // before any reached `on_row`, so `out` is `None` (no garbage row was
         // yielded) and the mismatch dominates. Checked HERE (not in the shared
         // `finish_stream`) because the carrier `Q` recovers the expected OID.
-        self.take_typed_schema_error()?;
+        this.take_typed_schema_error()?;
         Ok(out)
+        }
+        .await;
+        scope.disarm();
+        stream_result
     }
 
     /// The shared post-pump settle for EVERY streaming verb (typed
@@ -1993,25 +2329,32 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     where
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
     {
-        let live = self.take_live()?;
-        let mut db_error: Option<DbError> = None;
-        // Reused per-row scratch: the slot table (offsets into the row body) and
-        // the oversize-row reassembly buffer. Both retain their capacity across
-        // rows (cleared, never reallocated), so streaming a colossal result
-        // allocates NOTHING per row — the constant-memory invariant.
-        let mut slots: Vec<ColSlot> = Vec::new();
-        let mut oversize: Vec<u8> = Vec::new();
-        let outcome = self
-            .engine
-            .query_break(
-                live,
-                sql,
-                capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
-                    stream_dynamic_row(surface, &mut on_row, &mut slots, &mut oversize, &mut db_error)
-                }),
-            )
-            .await;
-        self.finish_stream(outcome, db_error).await
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+            let this = self;
+            let mut db_error: Option<DbError> = None;
+            // Reused per-row scratch: the slot table (offsets into the row body) and
+            // the oversize-row reassembly buffer. Both retain their capacity across
+            // rows (cleared, never reallocated), so streaming a colossal result
+            // allocates NOTHING per row — the constant-memory invariant.
+            let mut slots: Vec<ColSlot> = Vec::new();
+            let mut oversize: Vec<u8> = Vec::new();
+            let outcome = this
+                .engine
+                .query_break(
+                    live,
+                    sql,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |surface| {
+                        stream_dynamic_row(surface, &mut on_row, &mut slots, &mut oversize, &mut db_error)
+                    }),
+                )
+                .await;
+            this.finish_stream(outcome, db_error).await
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Stream a runtime parameterised query's rows one at a time to `on_row` in
@@ -2033,22 +2376,29 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         P: ParamsWriter,
         F: for<'r> FnMut(BorrowedRow<'r>) -> ControlFlow<E>,
     {
-        let live = self.take_live()?;
-        let mut db_error: Option<DbError> = None;
-        let mut slots: Vec<ColSlot> = Vec::new();
-        let mut oversize: Vec<u8> = Vec::new();
-        let outcome = self
-            .engine
-            .query_params_fused_break(
-                live,
-                sql,
-                params,
-                capture_notify(&mut self.notifications, self.diag.sink(), |surface| {
-                    stream_dynamic_row(surface, &mut on_row, &mut slots, &mut oversize, &mut db_error)
-                }),
-            )
-            .await;
-        self.finish_stream(outcome, db_error).await
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+            let this = self;
+            let mut db_error: Option<DbError> = None;
+            let mut slots: Vec<ColSlot> = Vec::new();
+            let mut oversize: Vec<u8> = Vec::new();
+            let outcome = this
+                .engine
+                .query_params_fused_break(
+                    live,
+                    sql,
+                    params,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |surface| {
+                        stream_dynamic_row(surface, &mut on_row, &mut slots, &mut oversize, &mut db_error)
+                    }),
+                )
+                .await;
+            this.finish_stream(outcome, db_error).await
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Drain a connection left DIRTY by an early stop of a streaming query/unload
@@ -2162,6 +2512,19 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         let mut db_error: Option<DbError> = None;
         let mut failed_index: Option<usize> = None;
 
+        // Recover a prior dropped-future connection + take the token FIRST — BEFORE
+        // staging command 0 onto the send buffer, so if this connection was left dirty
+        // by an EARLIER dropped future, `begin_command`'s recovery drain (which flushes
+        // the send buffer) never flushes command 0's staged bytes prematurely. The
+        // whole staging + windowed drive + settle then runs under the dropped-future
+        // guard: a batch future dropped mid-flight owes an owed-reply DRAIN on the next
+        // use; an early `return` inside the block resolves it normally (the scope
+        // disarms after), so only a DROP mid-block leaves the connection recoverable.
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let batch_result = async move {
+        let mut live = live;
+
         // 1. STAGE command 0 (`first = true`: reset the buffer + seat pipeline mode).
         //    A build overflow (a > 2 GiB frame) leaves NOTHING flushed, so the
         //    connection is healthy — discard the partial staging and restore a clean
@@ -2169,11 +2532,13 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         if let Err(e) = batch.stage_nth(self, 0, &mut plan) {
             core::hint::cold_path();
             self.engine.abort_pipeline_staging();
+            // We already hold the token — restore it so the connection stays healthy
+            // (nothing was flushed).
+            self.live = Some(live);
             return Err(e);
         }
         let mut staged: usize = 1; // staged commands (command 0 above)
         let mut flushed_any = false;
-        let mut live = self.take_live()?;
 
         // 2. WINDOWED DRIVE — the deadlock-free peer of `execute_batch`'s. A
         //    heterogeneous batch (an early LARGE result + later LARGE params) would
@@ -2448,6 +2813,12 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 Err(DriverError::UnclassifiedFailure)
             }
         }
+        }
+        .await;
+        // The body future completed (Ok or Err) — disarm so its `Drop` records no
+        // dropped-future recovery.
+        scope.disarm();
+        batch_result
     }
 
     /// Run a HOMOGENEOUS ATOMIC bulk write — ONE compile-checked `query!` write
@@ -2544,6 +2915,15 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             None => return Ok(Vec::new()),
             Some(p) => p,
         };
+        // N>=1: recover a prior dropped-future connection + take the token FIRST —
+        // BEFORE staging command 0 (so a recovery drain never flushes staged bytes),
+        // exactly as `pipeline`. The whole staging + windowed drive + settle then runs
+        // under the dropped-future guard (an owed-reply DRAIN on a dropped-mid-flight
+        // future); an early `return` inside the block disarms normally.
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let batch_result = async move {
+        let mut live = live;
         if let Err(e) = self
             .engine
             .stage_execute_batch_command(&prepared, &first, true)
@@ -2552,6 +2932,8 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             // Nothing flushed yet — discard the partial staging (preserving a
             // consumed deferred `BEGIN` for the next verb) and stay healthy.
             self.engine.abort_pipeline_staging();
+            // We already hold the token — restore it (nothing was flushed).
+            self.live = Some(live);
             return Err(lift_engine_error(e));
         }
 
@@ -2563,8 +2945,6 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         let mut failed_index: Option<usize> = None;
         let mut total: usize = 1; // staged commands (command 0 staged above)
         let mut flushed_any = false;
-
-        let mut live = self.take_live()?;
 
         'windows: loop {
             // Fill the current window: stage subsequent commands until the send
@@ -2758,6 +3138,10 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 Err(DriverError::UnclassifiedFailure)
             }
         }
+        }
+        .await;
+        scope.disarm();
+        batch_result
     }
 
     /// Run a HOMOGENEOUS ATOMIC bulk QUERY — ONE compile-checked `query!` carrier
@@ -2898,6 +3282,15 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             None => return Ok(Vec::new()),
             Some(p) => p,
         };
+        // N>=1: recover a prior dropped-future connection + take the token FIRST —
+        // BEFORE staging command 0 (so a recovery drain never flushes staged bytes),
+        // exactly as `pipeline` / `execute_batch`. The whole staging + windowed drive +
+        // settle runs under the dropped-future guard (an owed-reply DRAIN); an early
+        // `return` inside the block disarms normally.
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let batch_result = async move {
+        let mut live = live;
         // Command 0 with the RESULT-OID GUARD (`stage_pipeline_command`, guard=true):
         // a MISS appends a `Describe`(portal) + arms the guard so the shared `Q`
         // schema is verified ONCE (every subsequent command reuses this one
@@ -2908,6 +3301,8 @@ impl<S: Transport<Error = io::Error>> Core<S> {
             // Nothing flushed yet — discard the partial staging (preserving a
             // consumed deferred `BEGIN`) and stay healthy.
             self.engine.abort_pipeline_staging();
+            // We already hold the token — restore it (nothing was flushed).
+            self.live = Some(live);
             return Err(lift_engine_error(e));
         }
 
@@ -2924,8 +3319,6 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         let mut failed_index: Option<usize> = None;
         let mut total: usize = 1; // staged commands (command 0 staged above)
         let mut flushed_any = false;
-
-        let mut live = self.take_live()?;
 
         'windows: loop {
             // Fill the current window: stage subsequent commands (BARE Bind+Execute,
@@ -3176,6 +3569,10 @@ impl<S: Transport<Error = io::Error>> Core<S> {
                 Err(DriverError::UnclassifiedFailure)
             }
         }
+        }
+        .await;
+        scope.disarm();
+        batch_result
     }
 
     // ── Transaction / session boundary primitives ───────────────────────────
@@ -3222,20 +3619,27 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// is the proof.
     pub async fn listen(&mut self, channel: &str) -> Result<(), DriverError> {
         let sql = sql_ident::listen_sql(SafeIdent::validate(channel)?);
-        let live = self.take_live()?;
-        let mut collector = ResultCollector::new();
-        let outcome = self
-            .engine
-            .simple_query(
-                live,
-                &sql,
-                capture_notify(&mut self.notifications, self.diag.sink(), |s| {
-                    collector.feed(s);
-                    ControlFlow::Continue(())
-                }),
-            )
-            .await;
-        self.settle(outcome, &mut collector)
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+            let this = self;
+            let mut collector = ResultCollector::new();
+            let outcome = this
+                .engine
+                .simple_query(
+                    live,
+                    &sql,
+                    capture_notify(&mut this.notifications, this.diag.sink(), |s| {
+                        collector.feed(s);
+                        ControlFlow::Continue(())
+                    }),
+                )
+                .await;
+            this.settle(outcome, &mut collector)
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Unsubscribe from a `LISTEN` channel. The name is validated into a
@@ -3410,14 +3814,17 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         F: for<'q> FnMut(&'q [u8]) -> ControlFlow<E>,
     {
         let sql = sql_ident::copy_out_sql(SafeTable::validate(table)?);
-        let live = self.take_live()?;
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_DRAIN);
+        let out = async move {
+        let this = self;
         let mut db_error: Option<DbError> = None;
-        let outcome = self
+        let outcome = this
             .engine
             .copy_out(
                 live,
                 &sql,
-                capture_notify(&mut self.notifications, self.diag.sink(), |surface| match surface {
+                capture_notify(&mut this.notifications, this.diag.sink(), |surface| match surface {
                     // The chunk borrows the transient ingest buffer; `on_chunk`
                     // consumes it in-scope (the `for<'q>` wall forbids escape).
                     Surface::CopyData(body) => on_chunk(body),
@@ -3436,24 +3843,28 @@ impl<S: Transport<Error = io::Error>> Core<S> {
         };
         match boundary {
             Boundary::Idle => {
-                self.live = Some(live);
+                this.live = Some(live);
                 Ok(None)
             }
             Boundary::Failed => {
-                self.drain_to_idle(live).await?;
+                this.drain_to_idle(live).await?;
                 match db_error {
                     Some(db) => Err(DriverError::Db(Box::new(db))),
                     None => Err(DriverError::UnclassifiedFailure),
                 }
             }
             Boundary::Stopped(e) => {
-                self.drain_to_idle(live).await?;
+                this.drain_to_idle(live).await?;
                 Ok(Some(e))
             }
             _ => Err(DriverError::Io(io::Error::other(
                 "unexpected protocol boundary from a streaming COPY OUT",
             ))),
         }
+        }
+        .await;
+        scope.disarm();
+        out
     }
 
     // ── COPY IN seam (the per-driver `copy_in_with` orchestrates these) ──────
@@ -3481,9 +3892,27 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// (the table splice is the caller's responsibility via
     /// [`copy_in_begin_table`](Self::copy_in_begin_table), the single validated
     /// entry). `#[doc(hidden)]`.
+    ///
+    /// # Dropped-future recovery boundary (the ONE non-guarded verb)
+    ///
+    /// This is the single verb that HANDS the linear token OUT to the caller (a
+    /// `CopyInWriter` holds it across the streaming writes), rather than restoring
+    /// it to `self.live` on a clean boundary — so it cannot ride the
+    /// [`guarded`](Self::guarded) combinator. It DOES recover a connection whose
+    /// PRIOR verb was dropped ([`begin_command`](Self::begin_command) below), but it
+    /// arms NO dropped-future scope: a COPY-in session (`copy_in_begin` …
+    /// `copy_in_finish`) whose future is DROPPED mid-stream leaves the token gone
+    /// with no dirty marker — a DIRECT connection is then dead (reconnect), a POOLED
+    /// one is evicted + replaced on return (its socket close aborts the COPY
+    /// server-side). This is unchanged from before this recovery existed and
+    /// deliberately out of scope: a mid-COPY-in engine state needs a `CopyFail` +
+    /// drain to recover, distinct from the owed-reply drain the command verbs use.
     #[doc(hidden)]
     pub async fn copy_in_begin(&mut self, sql: &str) -> Result<Live<'static>, DriverError> {
-        let live = self.take_live()?;
+        // Recover a prior dropped-future connection before starting a COPY, but arm
+        // NO scope — the token is handed out, so a dropped COPY session is the
+        // documented residual above (never a guarded owed-reply drain).
+        let live = self.begin_command().await?;
         // Thread the capture adapter into the engine's fused-prelude drain (a
         // deferred BEGIN when this COPY is a transaction's FIRST statement): a
         // NOTIFY riding the prelude's reply is buffered into the ledger — the same
@@ -3665,29 +4094,41 @@ impl<S: Transport<Error = io::Error>> Core<S> {
     /// [`take_expected_notification`]: Self::take_expected_notification
     #[doc(hidden)]
     pub async fn recv_notification_inner(&mut self) -> Result<bool, DriverError> {
-        let live = self.take_live()?;
-        let ledger = &mut self.notifications;
-        let outcome = self
-            .engine
-            .recv_notification(live, |s| {
-                if let Surface::Notify(body) = s {
-                    // Capture into the ledger (the same buffer every verb feeds),
-                    // then stop the pump — the notification is what we waited for.
-                    ledger.capture(body);
-                    return ControlFlow::Break(());
+        // A WAIT verb: it issues NO command, so on a dropped future the engine sits
+        // at a clean idle owing nothing — `arm_scope(DIRTY_RECLAIM)` records it, so
+        // the next use only RE-MINTS the token (a drain here would block on frames
+        // that never come). This is the verb MOST likely to be dropped (it lives in
+        // `select!` / timeout loops waiting for a NOTIFY), so its recovery matters.
+        let live = self.begin_command().await?;
+        let scope = self.arm_scope(DIRTY_RECLAIM);
+        let out = async move {
+            let this = self;
+            let ledger = &mut this.notifications;
+            let outcome = this
+                .engine
+                .recv_notification(live, |s| {
+                    if let Surface::Notify(body) = s {
+                        // Capture into the ledger (the same buffer every verb feeds),
+                        // then stop the pump — the notification is what we waited for.
+                        ledger.capture(body);
+                        return ControlFlow::Break(());
+                    }
+                    ControlFlow::Continue(())
+                })
+                .await;
+            match outcome {
+                Ok(Outcome { live, status }) => {
+                    // Alive on either status — the would-block deadline is the Quiet
+                    // outcome, handled inside the engine, so the token rides back.
+                    this.live = Some(live);
+                    Ok(matches!(status, NotifyStatus::Received))
                 }
-                ControlFlow::Continue(())
-            })
-            .await;
-        match outcome {
-            Ok(Outcome { live, status }) => {
-                // Alive on either status — the would-block deadline is the Quiet
-                // outcome, handled inside the engine, so the token rides back.
-                self.live = Some(live);
-                Ok(matches!(status, NotifyStatus::Received))
+                Err(other) => Err(lift_engine_error(other)),
             }
-            Err(other) => Err(lift_engine_error(other)),
         }
+        .await;
+        scope.disarm();
+        out
     }
 
     /// Drain the notification the sink just buffered on a `Received` outcome.

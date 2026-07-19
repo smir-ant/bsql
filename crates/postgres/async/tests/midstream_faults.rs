@@ -2,10 +2,10 @@
 //! about success and never hangs. For each fault class — a server error, a
 //! `cancel_token` (57014), a transport death mid-result, a `pg_terminate_backend`,
 //! and a DROPPED streaming future — the verb resolves to a classified `Err` (or,
-//! for a drop, poisons the connection to `NotReady`) in BOUNDED time, the
-//! connection either drains to a clean idle and is reusable OR classifies as a
-//! disconnect and is evicted, and rows delivered before the fault are NEVER
-//! reported as a successful result. A repeat loop proves no leak accrues.
+//! for a drop mid-flight, the connection transparently RECOVERS on next use) in
+//! BOUNDED time, the connection either drains to a clean idle and is reusable OR
+//! classifies as a disconnect and is evicted, and rows delivered before the fault
+//! are NEVER reported as a successful result. A repeat loop proves no leak accrues.
 //!
 //! Ordinary tests exercise the happy stream; these fault paths are exactly what a
 //! happy-path suite never observes — a stream that dies partway is where a driver
@@ -195,17 +195,18 @@ async fn transport_death_mid_stream_is_classified_not_a_hang() {
 }
 
 // ---------------------------------------------------------------------------
-// (5) DROPPED streaming future: connection poisoned to NotReady; fresh works.
+// (5) DROPPED streaming future: connection RECOVERS transparently on next use.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore = "requires local PG"]
-async fn dropped_stream_future_poisons_connection_but_not_the_world() {
+async fn dropped_stream_future_recovers_the_connection() {
     let mut conn = Connection::connect(&direct()).await.expect("connect");
 
     // Poll the slow stream under a short timeout, then DROP the future (task
-    // cancellation at an await point) — the Live token was consumed and never
-    // restored, so the connection is cleanly NotReady, NOT a panic.
+    // cancellation at an await point) — the `Live` token was consumed and never
+    // restored, and the connection's `dirty` marker is set from the verb-scoped
+    // `CancelScope`'s Drop.
     let timed = tokio::time::timeout(
         Duration::from_millis(150),
         conn.query_each_raw::<_, ()>(SLOW_STREAM, |_row| ControlFlow::Continue(())),
@@ -213,16 +214,29 @@ async fn dropped_stream_future_poisons_connection_but_not_the_world() {
     .await;
     assert!(timed.is_err(), "the stream must still be running when we drop it");
 
-    // The poisoned connection fails loudly (never a silent success / hang), and
-    // classifies as a disconnect (evictable) — the token is gone.
-    let poisoned = conn.query_one_raw("SELECT 1::int4").await;
-    let err = match poisoned {
-        Err(e) => e,
-        Ok(_) => panic!("a connection whose stream future was dropped must not report success"),
-    };
-    assert!(err.is_disconnect(), "a dropped-future connection is NotReady/evictable, got {err:?}");
+    // The NEXT verb on the SAME connection transparently RECOVERS it (best-effort
+    // cancel of the abandoned query + drain to a clean idle + a re-minted token),
+    // and SUCCEEDS — the connection was NOT bricked to `NotReady`. This is the
+    // whole point of the fix: pre-fix this returned `DriverError::NotReady`.
+    let start = Instant::now();
+    let recovered = conn
+        .query_one_raw("SELECT 1::int4")
+        .await
+        .expect("the connection must transparently recover after a dropped-future");
+    assert_eq!(recovered.get_i32(0), Ok(Some(1)));
+    // Recovery is bounded — the cancel makes the abandoned stream stop fast.
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "recovery must be bounded, took {:?}",
+        start.elapsed(),
+    );
 
-    // A brand-new connection is unaffected — the poisoning is local, not global.
+    // The recovered connection is fully healthy for further work.
+    assert!(conn.is_healthy(), "recovered connection is healthy");
+    let again = conn.query_one_raw("SELECT 42::int4").await.expect("still healthy");
+    assert_eq!(again.get_i32(0), Ok(Some(42)));
+
+    // A brand-new connection is of course also unaffected.
     let mut fresh = Connection::connect(&direct()).await.expect("a fresh connection is unaffected");
     let row = fresh.query_one_raw("SELECT 99::int4").await.expect("fresh connection works");
     assert_eq!(row.get_i32(0), Ok(Some(99)));

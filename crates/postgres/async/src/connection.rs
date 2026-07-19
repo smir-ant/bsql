@@ -354,9 +354,16 @@ impl Connection {
             .map_err(|_| DriverError::NotReady)?
             .map(str::to_owned);
 
+        let redial = Redial::from_config(config);
+        let mut core = Core::new(engine, live, encrypted, server_version, backend_pid, secret_key);
+        // Install the dropped-future recovery cancel hook: if a verb future is
+        // dropped mid-command (a `tokio::time::timeout` / `select!` loss), the NEXT
+        // use best-effort cancels the abandoned query on a throwaway socket (so a
+        // zombie stops fast) before draining the connection back to a reusable idle.
+        core.set_recovery_cancel(Arc::new(crate::cancel::RecoveryCancelDial::new(redial.clone())));
         Ok(Self {
-            core: Core::new(engine, live, encrypted, server_version, backend_pid, secret_key),
-            redial: Redial::from_config(config),
+            core,
+            redial,
             read_deadline,
         })
     }

@@ -485,6 +485,51 @@ impl<'b, T> Engine<'b, T> {
         self.send_buf.reclaim_if_oversized();
     }
 
+    /// Re-mint the linear [`Live`] token AFTER a prior token was LOST to a dropped
+    /// future — the one recovery seam a driver needs to un-brick a connection whose
+    /// in-flight verb future was cancelled (`tokio::time::timeout` / `select!`).
+    ///
+    /// # The hole this closes
+    ///
+    /// Every active-phase verb MOVES the linear [`Live`] out of the driver's
+    /// `Option<Live>` slot into its future and returns it only on a clean protocol
+    /// boundary. If that future is DROPPED mid-command (the caller lost a `timeout`
+    /// race), the token is dropped WITH the future — it is a ZST with no `Drop`, so
+    /// nothing runs, but the token is simply GONE. The driver's slot stays `None`
+    /// and, with no way to re-mint, the connection is permanently unusable even
+    /// though the socket is fine. This seam re-mints one.
+    ///
+    /// # Soundness contract (CALLER-ENFORCED — the reason this is not [`session`])
+    ///
+    /// Minting a *second* live token for one engine would break the tier-1
+    /// at-most-one-command-in-flight invariant (two tokens could drive two
+    /// concurrent commands and tear the protocol). So the caller MUST guarantee, at
+    /// the call site, that **no other `Live` for this engine currently exists** —
+    /// i.e. the prior token was DROPPED, not returned. A driver proves this
+    /// structurally: it calls this ONLY when its own `Option<Live>` slot is `None`
+    /// AND its own dropped-future dirty marker is set, a state reachable only after
+    /// a future-drop consumed the previous token. This is the exact
+    /// tier-2-by-encapsulation posture [`open_owned`] already documents for the
+    /// `'static` brand: the driver keeps the token private and never mints a second
+    /// one while one is live.
+    ///
+    /// Re-minting is sound because a dropped future ABANDONS *driving* the engine
+    /// but never *corrupts* its state: [`Transport::write`]'s cancellation
+    /// atomicity means a drop mid-write tears no send cursor, and the ingest buffer
+    /// holds only whole, well-framed bytes. The engine's [`Phase`] and dispatch
+    /// state are exactly where the abandoned pump left them, so the re-minted token
+    /// can drive the owed reply frames to a clean idle (a driver's `drain`) and
+    /// resume, or — for a wait that owed nothing (`recv_notification`) — resume
+    /// directly.
+    ///
+    /// `#[doc(hidden)]`: a driver-facing recovery seam, not a consumer API.
+    #[doc(hidden)]
+    #[inline]
+    #[must_use = "the re-minted Live token is the connection's only handle; dropping it re-strands the connection"]
+    pub fn reclaim_live_after_drop(&mut self) -> Live<'b> {
+        Live::new_in_scope()
+    }
+
     /// Arm a fused simple-query PRELUDE to prepend to the NEXT command's flush.
     /// Today the ONE armed prelude is a deferred transaction `BEGIN`, fused with
     /// the transaction's first statement so it costs no standalone round trip.

@@ -1,11 +1,13 @@
 //! Out-of-band query cancellation for the async driver: [`CancelToken`].
 
+use core::future::Future;
+use core::pin::Pin;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bsql_postgres_core::cancel::{CancelKey, Redial};
-use bsql_postgres_core::driver::lift_tls_error;
+use bsql_postgres_core::driver::{lift_tls_error, RecoveryCancel};
 use bsql_postgres_core::DriverError;
 use bsql_postgres_proto::engine::Transport;
 
@@ -112,6 +114,55 @@ impl CancelToken {
         let mut wire = Connection::connect_wire(&config, &deadline, &diagnostics).await?;
         send_cancel_packet(&mut wire, &self.key.request_bytes()).await
     }
+}
+
+/// The async driver's DROPPED-FUTURE recovery cancel hook: dials a throwaway
+/// socket and sends the `CancelRequest` so a query abandoned by a dropped verb
+/// future stops FAST, letting the next use's recovery drain complete quickly
+/// instead of waiting for the zombie's natural end.
+///
+/// Installed on every [`Core`](bsql_postgres_core::driver::Core) the async driver
+/// mints (via [`Core::set_recovery_cancel`](bsql_postgres_core::driver::Core::set_recovery_cancel)).
+/// The blocking driver installs NONE — its verbs cannot be dropped mid-command, so
+/// it never reaches a drain-recovery. Holds only a credential-free [`Redial`]; the
+/// unforgeable cancel packet is built by the recovering connection and passed in.
+#[derive(Debug)]
+pub(crate) struct RecoveryCancelDial {
+    redial: Redial,
+}
+
+impl RecoveryCancelDial {
+    #[must_use]
+    pub(crate) fn new(redial: Redial) -> Self {
+        Self { redial }
+    }
+}
+
+impl RecoveryCancel for RecoveryCancelDial {
+    fn cancel<'a>(&'a self, packet: [u8; 16]) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let budget = Duration::from_secs(self.redial.connect_timeout_secs());
+            // Best-effort: swallow a dial/timeout/write failure — a cancel that
+            // cannot be delivered is a documented no-op (§55.4), NEVER a recovery
+            // failure (the drain still reaches idle once the server's own
+            // `statement_timeout` fires or the query finishes). `drop` — not the
+            // banned `let _ =` — discards the bounded result.
+            drop(tokio::time::timeout(budget, recovery_dial_and_send(&self.redial, packet)).await);
+        })
+    }
+}
+
+/// Rebuild a credential-free config, dial a throwaway wire (honoring the original
+/// TLS decision), and send `packet` — the recovery peer of
+/// [`CancelToken::cancel_inner`], factored so both share ONE dial + send authority.
+async fn recovery_dial_and_send(redial: &Redial, packet: [u8; 16]) -> Result<(), DriverError> {
+    let config = redial.rebuild_config();
+    // A throwaway dial: a fresh disarmed deadline with no steady window (it never
+    // reads a reply nor observes a runtime `SET`), exactly as `CancelToken`.
+    let deadline = Arc::new(ReadDeadline::new(None, config.connect_timeout_secs));
+    let diagnostics = bsql_postgres_core::Diagnostics::default();
+    let mut wire = Connection::connect_wire(&config, &deadline, &diagnostics).await?;
+    send_cancel_packet(&mut wire, &packet).await
 }
 
 /// Write the 16-byte `CancelRequest` through the (plaintext or TLS) wire, then
