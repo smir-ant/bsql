@@ -1,0 +1,179 @@
+# Regression CI — the automated peer of the LOCAL `bsql-devgates` wall.
+#
+# bsql's quality bar is enforced LOCALLY (clippy + tests + the `bsql-devgates`
+# gates; see CLAUDE.md "Build & test"). This workflow AUTOMATES that same wall on
+# every push/PR so a regression in the live/operational surface — the ~460
+# `#[ignore]` tests that need a real PostgreSQL, and which historically ran only
+# when the author remembered — can no longer land green unnoticed, and so it is
+# exercised across MULTIPLE PostgreSQL major versions (15–18) that one dev machine
+# cannot cover. It adds ZERO runtime dependency to any shipped crate — it only
+# runs the exact `cargo` commands a developer runs by hand.
+#
+# Two tiers:
+#   • offline — build + clippy(0 warnings) + workspace tests + doctests + the
+#     dependency/graph/doc/codegen/fuzz gates. No database; always runnable.
+#   • live    — the `--ignored` suites against a real PostgreSQL, matrixed over
+#     majors 15–18. The suites hardcode role `smir-ant`, database `postgres`, a
+#     unix socket at `/tmp`, and a SCRAM role `bsql_test_scram` (CLAUDE.md's
+#     documented test prerequisites), so the job RECREATES that environment
+#     rather than editing the tests. The TLS / channel-binding / md5 suites spin
+#     up their OWN ephemeral clusters (they only need `initdb`/`openssl`/`psql`
+#     on PATH) and skip cleanly if a tool is missing.
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  offline:
+    name: offline (build · clippy · tests · gates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins 1.96.0 + clippy; the first cargo call installs it.
+      - name: Show toolchain
+        run: rustup show
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: offline-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build (all targets)
+        run: cargo build --workspace --all-targets
+
+      - name: Clippy — the 0-warning lint wall
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests (offline / non-ignored)
+        run: cargo test --workspace
+
+      - name: Doctests
+        run: cargo test --workspace --doc
+
+      - name: devgates — dependency frontier + build/runtime boundary + doc links
+        run: |
+          cargo test -p bsql-devgates --test deps_pin
+          cargo test -p bsql-devgates --test runtime_graph_pin
+          cargo test -p bsql-devgates --test doc_links
+
+      - name: hot-path codegen + decoder fuzz gates
+        run: |
+          cargo test -p bsql-postgres-proto --test engine_hotpath_codegen
+          cargo test -p bsql-postgres-core --test decoder_fuzz
+
+      - name: Feature-matrix builds (TLS/SCRAM/MD5 gating stays fail-loud)
+        run: |
+          cargo check -p bsql-postgres-sync --no-default-features
+          cargo check -p bsql-postgres-async --no-default-features
+          cargo test  -p bsql-postgres-sync --no-default-features --test tls_off_fail_loud
+          cargo test  -p bsql-postgres-sync --no-default-features --test scram_off_fail_loud
+          cargo test  -p bsql-postgres-proto --no-default-features --test md5_off_fail_loud
+
+      - name: Non-default features compile + lint
+        run: |
+          cargo clippy -p bsql --features test-harness --all-targets -- -D warnings
+          cargo clippy --workspace --features n1-detect --all-targets -- -D warnings
+
+  live:
+    name: live (PostgreSQL ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ['15', '16', '17', '18']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ matrix.pg }} (PGDG) + openssl
+        run: |
+          set -euxo pipefail
+          # PGDG apt repo carries every supported major.
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          # Remove the runner's pre-installed PostgreSQL so ours owns port 5432.
+          sudo apt-get -y remove --purge 'postgresql-1*' 'postgresql-common' || true
+          sudo apt-get install -y postgresql-${{ matrix.pg }} openssl
+
+      - name: Configure the cluster to match the tests' local prerequisites
+        run: |
+          set -euxo pipefail
+          PG=${{ matrix.pg }}
+          # Fresh cluster on 5432 with local+host TRUST (the suites' default auth),
+          # a unix socket at /tmp (the "/tmp"-host suites), and a plaintext server
+          # (the TLS suites bring their own ephemeral SSL cluster).
+          sudo pg_dropcluster --stop "$PG" main || true
+          sudo pg_createcluster --start "$PG" main -p 5432 -- \
+            --auth-local=trust --auth-host=trust
+          CONF=/etc/postgresql/$PG/main
+          echo "unix_socket_directories = '/tmp,/var/run/postgresql'" | sudo tee -a "$CONF/conf.d/bsql.conf"
+          echo "password_encryption = 'scram-sha-256'"                | sudo tee -a "$CONF/conf.d/bsql.conf"
+          # SCRAM login role for the channel-binding / SCRAM suites (host + hostssl).
+          printf 'host    all    bsql_test_scram    127.0.0.1/32    scram-sha-256\n'   | sudo tee -a "$CONF/pg_hba.conf"
+          printf 'host    all    bsql_test_scram    ::1/128         scram-sha-256\n'   | sudo tee -a "$CONF/pg_hba.conf"
+          printf 'hostssl all    bsql_test_scram    all             scram-sha-256\n'   | sudo tee -a "$CONF/pg_hba.conf"
+          sudo pg_ctlcluster "$PG" main restart
+          # Roles: `smir-ant` superuser (the suites create/drop schemas), the SCRAM role.
+          sudo -u postgres createuser --superuser "smir-ant"
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE bsql_test_scram LOGIN PASSWORD 'test_password_123';"
+          # Smoke the socket + TCP the suites use.
+          psql -h /tmp -U "smir-ant" -d postgres -c 'SELECT version();'
+          psql -h 127.0.0.1 -U "smir-ant" -d postgres -c 'SELECT 1;'
+
+      - name: Show toolchain
+        run: rustup show
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: live-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      # Build the ignored tests first (fast-fail on a compile error before running).
+      - name: Build live tests
+        run: cargo test --workspace --no-run
+
+      - name: Live — driver suites (async + sync)
+        env:
+          BSQL_TEST_DSN: postgres://smir-ant@localhost/postgres
+        run: |
+          cargo test -p bsql-postgres-async --tests -- --ignored
+          cargo test -p bsql-postgres-sync  --tests -- --ignored
+
+      - name: Live — flagship query! + migrations + batch (query fixture)
+        env:
+          BSQL_TEST_DSN: postgres://smir-ant@localhost/postgres
+        run: |
+          cargo test -p bsql-query-fixture         --tests -- --ignored
+          cargo test -p bsql-query-bridge-fixture  --tests -- --ignored
+          cargo test -p bsql-test-harness-fixture  --tests -- --ignored
+
+      - name: Live — N+1 detection witness
+        env:
+          BSQL_TEST_DSN: postgres://smir-ant@localhost/postgres
+        run: cargo test -p bsql-query-fixture --features n1-detect --tests -- --ignored
