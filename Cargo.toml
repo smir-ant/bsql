@@ -96,7 +96,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0-alpha.3"
+version = "1.0.0-alpha.4"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -284,7 +284,7 @@ disallowed_methods = "deny"
 #
 # INTERNAL path members are declared directly on each consumer's `[dependencies]`
 # (not here), and each carries its own inline justification. The `deps_pin`
-# golden's ONE new line — `bsql-common 1.0.0-alpha.3` — is the zero-dependency
+# golden's ONE new line — `bsql-common 1.0.0-alpha.4` — is the zero-dependency
 # leaf member added in the `members` list above: it hosts the migration
 # pure-logic (checksum / ordering / drift authority) and the N+1 detector as ONE
 # compiled source both the PostgreSQL core and the embedded SQLite driver depend

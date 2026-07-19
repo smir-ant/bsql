@@ -64,11 +64,11 @@ md5-auth = ["bsql-postgres-core/md5-auth"]
 # `default-features = false` so the umbrella (and any consumer) can drop core's
 # default-on `webpki-roots` (the baked Mozilla CA blob); the driver re-exposes it
 # through its own default-on `webpki-roots` feature above.
-bsql-postgres-core = { version = "1.0.0-alpha.3", path = "../core", default-features = false }
+bsql-postgres-core = { version = "1.0.0-alpha.4", path = "../core", default-features = false }
 # `default-features = false` so proto's default-on `scram` is droppable through
 # the chain (re-enabled via the `scram` feature above); without it proto's default
 # would force SCRAM on for the whole graph.
-bsql-postgres-proto = { version = "1.0.0-alpha.3", path = "../proto", default-features = false }
+bsql-postgres-proto = { version = "1.0.0-alpha.4", path = "../proto", default-features = false }
 # LIB feature set is the minimal I/O surface the driver compiles against:
 # `net` (TcpStream), `io-util` (Async{Read,Write}Ext), `time` (timeouts +
 # the recv_notification read deadline), `sync` (the pool's Semaphore/Mutex).
