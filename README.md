@@ -382,6 +382,22 @@ Legend: ✅ full · ◐ partial · ❌ none.
   expression → `expr::type`). This is the ergonomic price of typing every column;
   a plain column, a join, `COALESCE`, and a cast-annotated aggregate all infer
   with no annotation.
+- **What "correct" means, precisely.** The compile check proves the query's
+  *shape*: relation and column names, result-column types, nullability, and the
+  parameter type OIDs. It does **not** type-check the SQL's operand / cast / value
+  semantics — a `WHERE bool_col = 5`, a nonsensical `CAST`, or a value-domain
+  violation is caught by **PostgreSQL itself at runtime**, loudly and classified
+  (`42883` / `42846` / `22P02`), never a silent wrong result. So "if it compiles,
+  the query is correct" means its *shape and types* are correct against your
+  schema; the server stays the authority on operand semantics.
+- **Non-UTF-8 text is a classified error, never a panic.** A `text` / `varchar`
+  column carrying non-UTF-8 bytes (e.g. a `SQL_ASCII` database) decodes to a loud
+  `DecodeError` (`NonUtf8`), not a panic and not a lossy substitution — read such
+  a column as `bytea` if it actually holds binary data.
+- **Large results are bounded and streamable.** An eager `query` / `query_raw`
+  reads the whole result into one arena bounded at 4 GiB (a larger one is the loud
+  `RowTooLarge`, never an unbounded OOM); for a colossal result, stream it
+  row-by-row in constant memory with `query_each` / `query_each_raw`.
 - The wire decoders are proven total (no panic on *any* input) by a dep-free
   fuzz gate; the inbound hot dispatch is proven panic-free and byte-stable by a
   codegen gate. NULL is `Option<NonZeroU32>`; SQL identifiers spliced into DDL go
