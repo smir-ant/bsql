@@ -48,6 +48,16 @@ jobs:
       - name: Show toolchain
         run: rustup show
 
+      # rust-src makes rustc render the FULL const-eval panic diagnostic (the
+      # `$RUST/core/src/panic.rs` source snippet + caret) that a couple of trybuild
+      # `compile_fail` goldens capture. The pinned toolchain is `profile = minimal`
+      # (no rust-src), and without it the compiler falls back to a terser
+      # `= note: the failure occurred here`, so those goldens (pinned on a dev host
+      # that has rust-src) would spuriously mismatch. Installing it makes CI's
+      # diagnostic rendering identical to the dev host — the goldens stay byte-exact.
+      - name: Add rust-src (match dev-host const-eval diagnostics)
+        run: rustup component add rust-src
+
       - name: Cache cargo + target
         uses: actions/cache@v4
         with:
@@ -63,7 +73,6 @@ jobs:
       - name: Clippy — the 0-warning lint wall
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # `--test-threads=1`: deterministic serial execution (avoids cross-test noise).
       # `--skip alloc`: the absolute zero-allocation gates count via a global
       # allocator and include std/allocator warm-up that differs by OS/arch
       # (x86_64-linux CI vs the aarch64-macOS the goldens were pinned on), so they
@@ -71,9 +80,11 @@ jobs:
       # instruction-ceiling (arch-gated in-test). They still run on the dev host;
       # CI covers the portable functional surface + the live PG matrix. (The
       # constant-memory *properties* they assert are code-structural and re-checked
-      # locally.)
+      # locally.) Run PARALLEL (the default): the trybuild `compile_fail` tests
+      # forward the build-emitted catalog to their child rustc and rely on the
+      # default parallel model — serializing them starves the catalog env channel.
       - name: Tests (offline / non-ignored)
-        run: cargo test --workspace -- --test-threads=1 --skip alloc
+        run: cargo test --workspace -- --skip alloc
 
       - name: Doctests
         run: cargo test --workspace --doc
